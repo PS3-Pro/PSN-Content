@@ -205,6 +205,12 @@
         display: block;
         color: #ffffff;
     }
+	
+	#letters a.active, #region-links a.active {
+        color: #66ccff;
+        text-decoration: underline;
+		font-weight: bold;
+    }
 
     #license-links {
         margin-top: 20px;
@@ -325,7 +331,7 @@
     <header>
         <a href="">PlayStation&trade; Network Database</a>
         <div id="count" aria-live="polite" role="status">Loading</div>
-        <form name="engine" onsubmit="location.hash=query.value;render();return false">
+        <form name="engine" onsubmit="setFilter('search', this.query.value, null); return false;">
             <input type="search" name="query" size="25" placeholder="Search">
             <input type="submit" name="send" value="Search" disabled>
             <input type="button" name="fetch" value="Reload DB" onclick="fetchDB()">
@@ -353,10 +359,11 @@
 			<div class="sidebar-right-top-border"></div>
 
 			<ul id="region-links">
-				<li><a href="#" onclick="location.hash='@US';render()">US</a></li>
-				<li><a href="#" onclick="location.hash='@EU';render()">EU</a></li>
-				<li><a href="#" onclick="location.hash='@JP';render()">JP</a></li>
-				<li><a href="#" onclick="location.hash='@ASIA';render()">ASIA</a></li>
+				<li><a href="#" class="active" onclick="setFilter('region', 'ALL', this); return false;">All</a></li>
+				<li><a href="#" onclick="setFilter('region', 'US', this); return false;">US</a></li>
+				<li><a href="#" onclick="setFilter('region', 'EU', this); return false;">EU</a></li>
+				<li><a href="#" onclick="setFilter('region', 'JP', this); return false;">JP</a></li>
+				<li><a href="#" onclick="setFilter('region', 'ASIA', this); return false;">ASIA</a></li>
 			</ul>
 			<ul id="license-links">
 				<li><a id="license-link-rainbow" href="https://github.com/PS3-Pro/License-Files/releases/download/Licenses/License_Pack_Bin.pkg">License Pack</a></li>
@@ -384,6 +391,9 @@ function sort(lines, algo) {
 }
 
 try {
+    var g_letterFilter = "";
+    var g_regionFilter = "ALL";
+
     var f = document.forms.engine;
 
     var dbPath = "https://ps3-pro.github.io/PSN-Content/resources/database/games.tsv";
@@ -442,49 +452,65 @@ try {
 		f.send.disabled = DB.length == 0;
 		f.query.placeholder = DB.length + " items found";
 	
-		var query = decodeURIComponent(location.hash.replace(/^#+/, '')) || "";
-		var startsWith = query.length && query[0] == '^'; // Filtro A-Z (ex: ^A)
-		var isRegion = query.length && query[0] == '@';   // NOVO: Filtro Região (ex: @EU)
-
-		var rule;
-		var filterType = "name"; // Padrão
-		var filterColumn = 2;    // Padrão (coluna do nome)
-
-		if (startsWith) {
-			rule = new RegExp("^" + query.substr(1), 'i'); // ex: /^A/i
-			filterType = "name";
-			filterColumn = 2; // Coluna do Nome
-		} else if (isRegion) {
-			// Match exato (ex: /^US$/i) para não pegar "US" em "RUSSIA"
-			rule = new RegExp("^" + query.substr(1) + "$", 'i'); 
-			filterType = "region";
-			filterColumn = 1; // Coluna da Região (índice 1 = segunda coluna)
+		// --- LÓGICA DE FILTRO COMBINADO ---
+		
+		// 1. Criar Regra de Região (baseado em g_regionFilter)
+		var regionRule;
+		if (g_regionFilter == "ALL" || g_regionFilter == "") {
+			regionRule = new RegExp(".*"); // Match tudo
 		} else {
-			rule = new RegExp(query, 'i'); // Search normal
-			filterType = "name";
-			filterColumn = 2; // Coluna do Nome
+			regionRule = new RegExp("^" + g_regionFilter + "$", 'i'); // Match exato (ex: /^US$/i)
 		}
 
-		var isSearch = !startsWith && !isRegion;
-		var maxResults = isSearch ? 99 : 999; // Limite baixo para search, alto para filtros
+		// 2. Criar Regra de Letra/Busca (baseado em g_letterFilter)
+		var letterRule;
+		var isSearch = (g_letterFilter.length > 0 && g_letterFilter[0] != '^');
+		
+		if (g_letterFilter == "") {
+			letterRule = new RegExp(".*"); // Match tudo
+		} else if (isSearch) {
+			letterRule = new RegExp(g_letterFilter, 'i'); // Regra de busca normal
+		} else {
+			letterRule = new RegExp(g_letterFilter, 'i'); // Regra de "Começa com" (ex: /^A/i)
+		}
 
+		// 3. Loop principal com FILTRO DUPLO
+		var maxResults = isSearch ? 99 : 999;
 		var matches = [];
 		for (var i = 0; i < DB.length && matches.length < maxResults; i++) {
 			var row = DB[i];
 			if (!row[2]) continue; // Pula se não tiver nome
 
-			if (filterType == "region") {
-				// Filtra SÓ pela coluna de região [1]
-				if (row[filterColumn] && rule.test(row[filterColumn])) {
-					matches.push(row);
+			// Variáveis de checagem
+			var nameMatches = false;
+			var regionMatches = false;
+
+			// Checa Região (Coluna 1)
+			if (g_regionFilter == "ALL" || (row[1] && regionRule.test(row[1]))) {
+				regionMatches = true;
+			}
+
+			// Checa Letra/Busca (Coluna 2 ou 0)
+			if (g_letterFilter == "") {
+				nameMatches = true; // Se filtro de letra/busca está vazio, passa direto
+			} else if (isSearch) {
+				// Se é busca, checa Nome (Col 2) OU ID (Col 0)
+				if ((row[2] && letterRule.test(row[2])) || row[0] == g_letterFilter) {
+					nameMatches = true;
 				}
 			} else {
-				// Filtro padrão (Nome [2] ou ID [0])
-				if ((row[filterColumn] && rule.test(row[filterColumn])) || row[0] == query) {
-					matches.push(row);
+				// Se é filtro de letra (ex: ^A), checa SÓ o Nome (Col 2)
+				if (row[2] && letterRule.test(row[2])) {
+					nameMatches = true;
 				}
 			}
+
+			// ADICIONA NA LISTA APENAS SE OS DOIS FILTROS BATEREM
+			if (nameMatches && regionMatches) {
+				matches.push(row);
+			}
 		}
+		// --- FIM DA LÓGICA DE FILTRO ---
 	
 		sort(matches, function(a, b) { return a[2] > b[2]; });
 	
@@ -503,11 +529,45 @@ try {
 		document.getElementById('list').innerHTML = html;
 		document.getElementById('count').textContent = "Displaying " + matches.length + " items";
 	}
+	
+	function setFilter(type, value, clickedElement) {
+		// 1. ATUALIZA AS VARIÁVEIS GLOBAIS
+		if (type == 'letter') {
+			g_letterFilter = value;
+			f.query.value = ""; // Limpa a barra de busca
+			
+			// Remove 'active' de todas as outras letras
+			var links = document.getElementById("letters").getElementsByTagName("a");
+			for(var i=0; i<links.length; i++) { links[i].className = ""; }
+	
+		} else if (type == 'region') {
+			g_regionFilter = value;
+			
+			// Remove 'active' de todas as outras regiões
+			var links = document.getElementById("region-links").getElementsByTagName("a");
+			for(var i=0; i<links.length; i++) { links[i].className = ""; }
+	
+		} else if (type == 'search') {
+			g_letterFilter = value; // Busca sobrescreve o filtro de letra
+			
+			// Remove 'active' de todas as letras
+			var links = document.getElementById("letters").getElementsByTagName("a");
+			for(var i=0; i<links.length; i++) { links[i].className = ""; }
+		}
+		
+		// 2. ADICIONA 'ACTIVE' NO LINK CLICADO
+		if (clickedElement) {
+			clickedElement.className = "active";
+		}
+		
+		// 3. RODA O RENDER
+		render();
+	}
 
     function createLetterLinks() {
-        var links = '<a href="#" onclick="location.hash=\'^[0-9]\';render()">[0-9]</a>';
+        var links = '<a href="#" onclick="setFilter(\'letter\', \'^[0-9]\', this); return false;">[0-9]</a>';
         for (var c = 65; c < 91; c++) {
-            links += '<a href="#" onclick="location.hash=\'^\'+this.innerHTML;render()">' + String.fromCharCode(c) + '</a>';
+            links += '<a href="#" onclick="setFilter(\'letter\', \'^\'+this.innerHTML, this); return false;">' + String.fromCharCode(c) + '</a>';
         }
         document.getElementById("letters").innerHTML = links;
     }
@@ -524,14 +584,26 @@ try {
 		}
 	
 		DB = [];
-		if (window.localStorage) localStorage.DB = "[]"; // <- Seu código original, sem cache por categoria
+		if (window.localStorage) localStorage.DB = "[]"; 
 	
-		location.hash = "";
-		f.query.value = "";
-	
-		var links = '<a href="#" onclick="location.hash=\'^[0-9]\';render()">[0-9]</a>';
+		// --- RESETAR FILTROS AO MUDAR DE ABA ---
+		g_letterFilter = ""; // Limpa filtro de letra/busca
+		g_regionFilter = "ALL"; // Reseta para ALL
+		f.query.value = ""; // Limpa texto da busca
+		
+		// Limpa destaques de letra da aba anterior
+		var letterLinks = document.getElementById("letters").getElementsByTagName("a");
+		for(var i=0; i<letterLinks.length; i++) { letterLinks[i].className = ""; }
+		
+		// Reseta destaques de região para "ALL"
+		var regionLinks = document.getElementById("region-links").getElementsByTagName("a");
+		for(var i=0; i<regionLinks.length; i++) { regionLinks[i].className = ""; }
+		if(regionLinks[0]) regionLinks[0].className = "active"; // Ativa o "ALL"
+		// --- FIM DO RESET ---
+
+		var links = '<a href="#" onclick="setFilter(\'letter\', \'^[0-9]\', this); return false;">[0-9]</a>';
 		for (var c = 65; c < 91; c++) {
-			links += '<a href="#" onclick="location.hash=\'^\'+this.innerHTML;render()">' + String.fromCharCode(c) + '</a>';
+			links += '<a href="#" onclick="setFilter(\'letter\', \'^\'+this.innerHTML, this); return false;">' + String.fromCharCode(c) + '</a>';
 		}
 		document.getElementById("letters").innerHTML = links;
 	
