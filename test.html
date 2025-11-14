@@ -355,136 +355,184 @@
         <button id="backToTop" onclick="scrollToTop()">&#8593; Top</button>
 
 <script>
-function scrollToTop() {
-    window.scrollTo(0, 0);
-}
+    function scrollToTop() {
+        window.scrollTo(0, 0);
+    }
 
-function sort(lines, algo) {
-    for (var i = 0; i < lines.length; i++) {
-        for (var j = 0; j < lines.length - i - 1; j++) {
-            if (algo(lines[j], lines[j + 1])) {
-                var temp = lines[j];
-                lines[j] = lines[j + 1];
-                lines[j + 1] = temp;
+    // *** NOVA FUNÇÃO ***
+    // Adicionei esta função para formatar o tamanho (que vem em bytes)
+    function formatBytes(bytes, decimals = 2) {
+        if (bytes == 0) return '(0 Bytes)';
+        if (isNaN(parseInt(bytes))) return ''; // Trata valores não numéricos
+        const k = 1024;
+        const dm = decimals < 0 ? 0 : decimals;
+        const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
+        const i = Math.floor(Math.log(bytes) / Math.log(k));
+        return '(' + parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i] + ')';
+    }
+
+    function sort(lines, algo) {
+        for (var i = 0; i < lines.length; i++) {
+            for (var j = 0; j < lines.length - i - 1; j++) {
+                if (algo(lines[j], lines[j + 1])) {
+                    var temp = lines[j];
+                    lines[j] = lines[j + 1];
+                    lines[j + 1] = temp;
+                }
             }
         }
+        return lines;
     }
-    return lines;
+
+    try {
+        var f = document.forms.engine;
+        var dbPath = "../resources/database/PS3_GAMES.tsv"; // Caminho inicial
+        var DB = window.localStorage ? JSON.parse(localStorage.DB || '[]') : [];
+
+        // *** FUNÇÃO ATUALIZADA ***
+        // Corrigida para usar as colunas do TSV
+        function makeRap(row) {
+            var hex = row[5];       // Coluna [4] é o zRIF
+            var contentID = row[5]; // Coluna [5] é o Content ID
+
+            // Adicionado "MISSING" na verificação
+            if (!hex || hex == 0 || hex === 'MISSING') return '<span> - Missing RAP</span>';
+            
+            // O nome correto do arquivo RAP é o Content ID
+            // Usando o link do yne.fr que é comum para isso
+            return '<a download="' + contentID + '.rap" href="http://yne.fr/psndl/' + hex + '.rap">RAP</a>';
+        }
+
+        // *** FUNÇÃO ATUALIZADA ***
+        // Agora pula a primeira linha (cabeçalho) do TSV
+        function fetchDB() {
+            f.fetch.disabled = true;
+            var xhr = new XMLHttpRequest();
+            xhr.onabort = xhr.ontimeout = xhr.onerror = function () {
+                alert("Error loading DB");
+                f.fetch.disabled = false;
+            };
+            xhr.onload = function () {
+                if (xhr.status != 200) {
+                    alert("Status " + xhr.status);
+                    f.fetch.disabled = false;
+                    return;
+                }
+
+                var lines = xhr.responseText.split("\n");
+
+                // Pula a primeira linha (cabeçalho) do TSV
+                if (lines.length > 0) {
+                    lines.shift();
+                }
+
+                // Transforma em array e filtra linhas vazias
+                DB = lines.map(function(line) {
+                    return line.split("\t");
+                }).filter(function(row) {
+                    return row.length > 7; // Garante que é uma linha de dados válida
+                });
+
+                if (window.localStorage) {
+                    try {
+                        localStorage.DB = JSON.stringify(DB);
+                    } catch (e) {
+                        console.error("Falha ao salvar no LocalStorage: ", e);
+                        localStorage.removeItem("DB"); // Limpa se estiver cheio
+                    }
+                }
+                f.fetch.disabled = false;
+                render();
+            };
+            xhr.open('GET', dbPath);
+            xhr.send();
+        }
+
+        // *** FUNÇÃO ATUALIZADA ***
+        // Mapeada para as colunas corretas do TSV
+        unction render() {
+    f.fetch.type = window.localStorage ? 'button' : 'hidden';
+    f.send.disabled = DB.length == 0;
+    f.query.placeholder = DB.length + " items found";
+
+    var query = decodeURIComponent(location.hash.replace(/^#+/, '')) || "";
+    var startsWith = query.length && query[0] == '^';
+    var rule = new RegExp(startsWith ? "^" + query.substr(1) : query, 'i');
+
+    var matches = [];
+    for (var i = 0; i < DB.length && matches.length < (startsWith ? 999 : 99); i++) {
+        var row = DB[i];
+        if (!row[2]) continue; // pular linhas sem nome
+        if (rule.test(row[2]) || row[0] == query) { // filtra pelo Name (coluna 2) ou Title ID
+            matches.push(row);
+        }
+    }
+
+    sort(matches, function(a, b) { return a[2] > b[2]; }); // ordenar por Name
+
+    var html = matches.map(function(a) {
+        var pkgLink = (a[3] && a[3] != "MISSING") ? a[3] : "#"; // PKG direct link (coluna 3)
+        return '<li><a href="' + pkgLink + '">' + a[2] + ' [' + a[0] + "]</a> " + makeRap(a) + "</li>";
+    }).join("");
+
+    document.getElementById('list').innerHTML = html;
+    document.getElementById('count').textContent = "Displaying " + matches.length + " items";
 }
-
-try {
-    var f = document.forms.engine;
-
-    // URLs dos TSVs online
-    const TSV_URLS = {
-        games: 'https://nopaystation.com/tsv/PS3_GAMES.tsv',
-        dlcs: 'https://nopaystation.com/tsv/PS3_DLCS.tsv',
-        themes: 'https://nopaystation.com/tsv/PS3_THEMES.tsv',
-        avatars: 'https://nopaystation.com/tsv/PS3_AVATARS.tsv',
-        demos: 'https://nopaystation.com/tsv/PS3_DEMOS.tsv'
-    };
-
-    var DB = [];
-
-    function makeRap(row) {
-        var hex = row.rap;
-        if (!hex) return "";
-        if (hex == 0) return '<span> - Missing RAP</span>';
-        return '<a download="' + row.name + '-' + row.id + '_00-' + hex + '.rap" href="' + hex + '.rap">RAP</a>';
-    }
-
-    async function fetchDB() {
-        f.fetch.disabled = true;
-        try {
-            const response = await fetch(dbPath);
-            if (!response.ok) throw new Error("HTTP " + response.status);
-            const tsvText = await response.text();
-            DB = parseTSV(tsvText);
-            f.fetch.disabled = false;
-            render();
-        } catch (err) {
-            alert("Error loading DB: " + err);
-            f.fetch.disabled = false;
         }
-    }
 
-    function parseTSV(tsv) {
-        const [headerLine, ...lines] = tsv.split('\n');
-        const headers = headerLine.split('\t');
-        return lines
-            .filter(line => line.trim())
-            .map(line => {
-                const values = line.split('\t');
-                let obj = {};
-                headers.forEach((h, i) => obj[h] = values[i] || '');
-                // Mapeia apenas os campos importantes
-                return {
-                    id: obj['Title ID'] || '',
-                    region: obj['Region'] || '',
-                    name: obj['Name'] || '',
-                    pkg: obj['PKG direct link'] || '',
-                    rap: obj['RAP'] || '',
-                    contentId: obj['Content ID'] || ''
-                };
-            });
-    }
-
-    function render() {
-        f.fetch.type = window.localStorage ? 'button' : 'hidden';
-        f.send.disabled = DB.length == 0;
-        f.query.placeholder = DB.length + " items found";
-        var query = decodeURIComponent(location.hash.replace(/^#+/, ''));
-        var startsWith = query.length && query[0] == '^';
-        var rule = new RegExp(query, 'i');
-        var matches = [];
-        for (var i = 0; i < DB.length && matches.length < (startsWith ? 999 : 99); i++) {
-            if (DB[i].name.match(rule) || (DB[i].id == query))
-                matches.push(DB[i]);
+        // Criar links laterais
+        var links = '<a href="#" onclick="location.hash=\'^[0-9]\';render()">[0-9]</a>';
+        for (var c = 65; c < 91; c++) {
+            links += '<a href="#" onclick="location.hash=\'^\'+this.innerHTML;render()">' + String.fromCharCode(c) + '</a>';
         }
-        sort(matches, function (a, b) { return a.name > b.name; });
-        for (var i = 0; i < matches.length; i++) {
-            var a = matches[i];
-            matches[i] = '<li><a href="' + a.pkg + '">' + a.name + ' [' + a.id + "]</a> " + makeRap(a) + "</li>";
+        document.getElementById("letters").innerHTML = links;
+
+        function selectCategory(cat) {
+            switch(cat) {
+                case "games": dbPath = "../resources/database/PS3_GAMES.tsv"; break;
+                case "avatars": dbPath = "../resources/database/PS3_AVATARS.tsv"; break;
+                case "demos": dbPath = "../resources/database/PS3_DEMOS.tsv"; break;
+                case "dlcs": dbPath = "../resources/database/PS3_DLCS.tsv"; break;
+                case "themes": dbPath = "../resources/database/PS3_THEMES.tsv"; break;
+            }
+
+            DB = [];
+            if (window.localStorage) localStorage.DB = "[]";
+
+            location.hash = "";
+            f.query.value = "";
+
+            // Atualiza links laterais
+            var links = '<a href="#" onclick="location.hash=\'^[0-9]\';render()">[0-9]</a>';
+            for (var c = 65; c < 91; c++) {
+                links += '<a href="#" onclick="location.hash=\'^\'+this.innerHTML;render()">' + String.fromCharCode(c) + '</a>';
+            }
+            document.getElementById("letters").innerHTML = links;
+
+            // Atualiza menu ativo
+            var menu = document.getElementById("selection-menu").getElementsByTagName("a");
+            for (var i = 0; i < menu.length; i++) {
+                menu[i].className = menu[i].className.replace("active", "");
+            }
+            var idMap = {games:"ln-game", avatars:"ln-avatar", demos:"ln-demos", dlcs:"ln-dlcs", themes:"ln-themes"};
+            document.getElementById(idMap[cat]).className += " active";
+
+            fetchDB();
         }
-        document.getElementById('list').innerHTML = matches.join('');
-        document.getElementById('count').textContent = "Displaying " + matches.length + " items";
+
+        // Adiciona os event handlers para os links do menu
+        // (Isso estava faltando no seu script anterior, pode causar bugs se não tiver)
+        document.getElementById("ln-avatar").onclick = function(e) { e.preventDefault(); selectCategory("avatars"); };
+        document.getElementById("ln-demos").onclick = function(e) { e.preventDefault(); selectCategory("demos"); };
+        document.getElementById("ln-dlcs").onclick = function(e) { e.preventDefault(); selectCategory("dlcs"); };
+        document.getElementById("ln-game").onclick = function(e) { e.preventDefault(); selectCategory("games"); };
+        document.getElementById("ln-themes").onclick = function(e) { e.preventDefault(); selectCategory("themes"); };
+
+        selectCategory("games"); // Inicia com games
+
+    } catch (a) {
+        alert(a);
     }
-
-    // Criar links laterais
-    var links = '<a href="#" onclick="location.hash=\'^[0-9]\';render()">[0-9]</a>';
-    for (var c = 65; c < 91; c++) {
-        links += '<a href="#" onclick="location.hash=\'^\'+this.innerHTML;render()">' + String.fromCharCode(c) + '</a>';
-    }
-    document.getElementById("letters").innerHTML = links;
-
-    function selectCategory(cat) {
-        dbPath = TSV_URLS[cat] || TSV_URLS.games;
-        DB = [];
-        location.hash = "";
-        f.query.value = "";
-        fetchDB();
-
-        // Ativar menu
-        var menu = document.getElementById("selection-menu").getElementsByTagName("a");
-        for (var i = 0; i < menu.length; i++) {
-            menu[i].className = menu[i].className.replace("active", "");
-        }
-        var idMap = {
-            games: "ln-game",
-            avatars: "ln-avatar",
-            demos: "ln-demos",
-            dlcs: "ln-dlcs",
-            themes: "ln-themes"
-        };
-        document.getElementById(idMap[cat]).className += " active";
-    }
-
-    selectCategory("games");
-
-} catch (a) {
-    alert(a);
-}
 </script>
-
     </body>
 </html>
