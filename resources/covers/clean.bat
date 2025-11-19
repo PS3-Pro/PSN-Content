@@ -1,12 +1,13 @@
 @echo off
-title Limpador de Capas PS3
+setlocal EnableDelayedExpansion
+title Limpador de Capas (Compressed e Uncompressed)
 color 0A
-echo ==========================================
-echo  INICIANDO PROCESSO DE LIMPEZA DE ARQUIVOS
-echo ==========================================
-echo.
 
-:: Cria uma lista temporaria com os nomes dos arquivos
+echo ======================================================
+echo  VERIFICANDO ARQUIVOS EM 'COMPRESSED' E 'UNCOMPRESSED'
+echo ======================================================
+
+:: 1. CRIA A LISTA TEMPORARIA
 (
 echo BCAS01252.JPG
 echo BCAS01741.JPG
@@ -18,6 +19,8 @@ echo BCES06099.JPG
 echo BCES30580.JPG
 echo BCES98119.JPG
 echo BCES98125.JPG
+echo BCET00027.JPG
+echo BCJB95007.JPG
 echo BCJX96005.JPG
 echo BCUN00001.JPG
 echo BCUS00511.JPG
@@ -44,6 +47,7 @@ echo BLES00096.JPG
 echo BLES00099.JPG
 echo BLES00393.JPG
 echo BLES00484.JPG
+echo BLES01253.JPG
 echo BLES01435.JPG
 echo BLES01806.JPG
 echo BLES01GTA.JPG
@@ -55,13 +59,9 @@ echo BLES30383.JPG
 echo BLES30538.JPG
 echo BLES30566.JPG
 echo BLES30645.JPG
-echo BCJB95007.JPG
-echo BLES01253.JPG
 echo BLES30682.JPG
 echo BLES30798.JPG
 echo BLES30810.JPG
-echo NPUA80788.JPG
-echo NPUB30384.JPG
 echo BLES30855.JPG
 echo BLES30927.JPG
 echo BLES30985.JPG
@@ -170,7 +170,6 @@ echo MONKEY200.JPG
 echo MRMJ00002.JPG
 echo NCUS19001.JPG
 echo NOCD00229.JPG
-echo NOID.JPG
 echo NPEA00057.JPG
 echo NPEA00135.JPG
 echo NPEA00309.JPG
@@ -200,6 +199,7 @@ echo NPEB01222.JPG
 echo NPEB01238.JPG
 echo NPEB01301.JPG
 echo NPEB01324.JPG
+echo NPEB01373.JPG
 echo NPEB01786.JPG
 echo NPEB90343.JPG
 echo NPEB90357.JPG
@@ -220,6 +220,7 @@ echo NPJB40002.JPG
 echo NPJB90632.JPG
 echo NPUA80132.JPG
 echo NPUA80133.JPG
+echo NPUA80788.JPG
 echo NPUA80864.JPG
 echo NPUB30009.JPG
 echo NPUB30053.JPG
@@ -229,6 +230,7 @@ echo NPUB30159.JPG
 echo NPUB30235.JPG
 echo NPUB30308.JPG
 echo NPUB30323.JPG
+echo NPUB30384.JPG
 echo NPUB30463.JPG
 echo NPUB30470.JPG
 echo NPUB30499.JPG
@@ -280,21 +282,63 @@ echo NPUZ00014.JPG
 echo NPUZ00125.JPG
 ) > lista_apagar.txt
 
-:: Loop para ler a lista e apagar os arquivos
+:: 2. CONTA O TOTAL DE ARQUIVOS NA LISTA
+set total=0
+for /f %%A in ('type lista_apagar.txt ^| find /c /v ""') do set total=%%A
+
+echo.
+echo Buscando em:
+echo  - .\compressed\
+echo  - .\uncompressed\
+echo.
+echo Total de NOMES para verificar: %total%
+echo ------------------------------------------------------
+
+:: 3. LOOP PARA APAGAR E CONTAR
+set atual=0
+set apagados_comp=0
+set apagados_uncomp=0
+
 for /f "delims=" %%i in (lista_apagar.txt) do (
-    if exist "%%i" (
-        del /f /q "%%i"
-        echo [APAGADO] %%i
+    set /a atual+=1
+    set "encontrou=0"
+    set "msg="
+    
+    :: Verifica pasta compressed
+    if exist "compressed\%%i" (
+        del /f /q "compressed\%%i"
+        set /a apagados_comp+=1
+        set "msg= [Apagado de COMPRESSED]"
+        set "encontrou=1"
+    )
+
+    :: Verifica pasta uncompressed
+    if exist "uncompressed\%%i" (
+        del /f /q "uncompressed\%%i"
+        set /a apagados_uncomp+=1
+        set "msg=!msg! [Apagado de UNCOMPRESSED]"
+        set "encontrou=1"
+    )
+
+    if "!encontrou!"=="1" (
+        echo [!atual!/%total%] %%i !msg!
     ) else (
-        echo [NAO ENCONTRADO] %%i
+        echo [!atual!/%total%] %%i - Nao encontrado
     )
 )
 
-:: Limpeza da lista temporaria
+:: 4. RELATORIO FINAL
 del lista_apagar.txt
+set /a total_geral=apagados_comp+apagados_uncomp
 
 echo.
 echo ==========================================
-echo              LIMPEZA CONCLUIDA
+echo            RELATORIO FINAL
 echo ==========================================
+echo.
+echo Arquivos apagados em 'compressed'  : !apagados_comp!
+echo Arquivos apagados em 'uncompressed': !apagados_uncomp!
+echo.
+echo TOTAL GERAL DE EXCLUSOES: !total_geral!
+echo.
 pause
