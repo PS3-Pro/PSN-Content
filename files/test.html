@@ -1141,12 +1141,14 @@ If this happens, right-click the game button, select 'Save link as', and manuall
         return data;
     }
     
-    function processData(tsvData) {
+   function processData(tsvData) {
         var lines = tsvData.split("\n");
         DB = [];
         for (var i = 0; i < lines.length; i++) {
-            if(lines[i].trim() !== "") {
-                DB.push(lines[i].split("\t"));
+            // SUBSTUIÇÃO DO .trim() POR REGEX (Compatível com PS3)
+            var line = lines[i].replace(/^\s+|\s+$/g, ''); 
+            if(line !== "") {
+                DB.push(line.split("\t"));
             }
         }
     }
@@ -1163,38 +1165,53 @@ If this happens, right-click the game button, select 'Save link as', and manuall
 
     try {
         function fetchDB() {
-            stopRendering();
-            f.fetch.disabled = true;
-            
-            // 1. Tenta CACHE (Só vai funcionar no PC)
-            var cachedData = loadFromCache(currentCategory);
-            if (cachedData) {
-                document.getElementById('list').innerHTML = '<li>Loading from Cache...</li>';
-                setTimeout(function(){
-                    processData(cachedData);
-                    f.fetch.disabled = false;
-                    render();
-                    checkStartupAlert();
-                }, 50);
-                return;
-            }
-
-            // 2. Baixa da REDE (Sempre acontece no PS3)
-            var xhr = new XMLHttpRequest();
-            xhr.onabort = xhr.ontimeout = xhr.onerror = function () { alert("Error loading DB"); f.fetch.disabled = false; };
-            xhr.onload = function () {
-                if (xhr.status != 200 && xhr.status != 0) { alert("Status " + xhr.status); f.fetch.disabled = false; return; }
-                var responseText = xhr.responseText;
-                saveToCache(currentCategory, responseText); // Tenta salvar (PC só)
-                processData(responseText);
+        stopRendering();
+        f.fetch.disabled = true;
+        
+        // 1. Tenta CACHE (Apenas no PC)
+        var cachedData = loadFromCache(currentCategory);
+        if (cachedData) {
+            document.getElementById('list').innerHTML = '<li>Loading from Cache...</li>';
+            setTimeout(function(){
+                processData(cachedData);
                 f.fetch.disabled = false;
                 render();
                 checkStartupAlert();
-            };
-            var urlWithBuster = dbPath + "?t=" + new Date().getTime();
-            xhr.open('GET', urlWithBuster);
-            xhr.send();
+            }, 50);
+            return;
         }
+
+        // 2. Baixa da REDE
+        var xhr = new XMLHttpRequest();
+        
+        // MUDANÇA IMPORTANTE: PS3 prefere onreadystatechange ao invés de onload
+        xhr.onreadystatechange = function() {
+            if (xhr.readyState == 4) { // 4 = Concluído
+                if (xhr.status == 200 || xhr.status == 0) {
+                    var responseText = xhr.responseText;
+                    saveToCache(currentCategory, responseText); // Tenta salvar (PC só)
+                    processData(responseText);
+                    f.fetch.disabled = false;
+                    render();
+                    checkStartupAlert();
+                } else {
+                    alert("Error loading DB: Status " + xhr.status);
+                    f.fetch.disabled = false;
+                }
+            }
+        };
+        
+        // Adiciona timestamp para evitar cache interno do navegador teimoso
+        var urlWithBuster = dbPath + "?t=" + new Date().getTime();
+        
+        try {
+            xhr.open('GET', urlWithBuster, true);
+            xhr.send();
+        } catch(e) {
+            alert("Net Error: " + e);
+            f.fetch.disabled = false;
+        }
+    }
 
         document.getElementById("cover-gui").onclick = function() {
             stopRendering();
