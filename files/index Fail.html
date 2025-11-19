@@ -939,25 +939,48 @@ If this happens, right-click the game button, select 'Save link as', and manuall
     }
 
     // ==============================================================
-    // 4. LAZY LOADING PS3
+    // 4. LAZY LOADING COM RECICLAGEM DE MEMÓRIA (ANTI-CRASH)
     // ==============================================================
     
     var g_scrollTimer = null;
+
     function checkPS3Visibility() {
-        var imgs = document.querySelectorAll('img.lazy-ps3');
-        var top = window.pageYOffset - 300; 
-        var bottom = window.pageYOffset + window.innerHeight + 300;
+        // Pega TODAS as imagens de jogos (não apenas as .lazy-ps3)
+        // Precisamos monitorar todas para saber quem saiu da tela
+        var imgs = document.querySelectorAll('.game-tile img');
+        
+        // Define a area visivel com uma margem de segurança (buffer)
+        // Aumentei para 600px para dar tempo de carregar antes de aparecer
+        var top = window.pageYOffset - 600; 
+        var bottom = window.pageYOffset + window.innerHeight + 600;
 
         for (var i = 0; i < imgs.length; i++) {
             var img = imgs[i];
-            var el = img;
+            
+            // Calculo simples de posição
             var yPos = 0;
+            var el = img;
+            // Otimização: Se o elemento já tiver offsetParent nulo (oculto), ignora
+            if (!el.offsetParent) continue; 
+            
             while(el) { yPos += el.offsetTop; el = el.offsetParent; }
 
+            // VERIFICAÇÃO DE VISIBILIDADE
             if (yPos >= top && yPos <= bottom) {
-                img.className = ""; 
-                var cid = img.getAttribute('data-cid');
-                loadCoverSequence("img_"+cid, cid);
+                // === ESTÁ NA TELA (OU PERTO) ===
+                // Se a imagem atual for a padrão (genérica), precisamos carregar a real
+                if (img.src === defaultCover) {
+                    var cid = img.getAttribute('data-cid');
+                    // Chama a função que busca no Cache ou na Web
+                    loadCoverSequence(img.id, cid);
+                }
+            } else {
+                // === SAIU DA TELA (Longe demais) ===
+                // Se a imagem NÃO for a padrão (ou seja, é uma capa pesada),
+                // vamos "apagar" ela da memória voltando para a padrão.
+                if (img.src !== defaultCover) {
+                    img.src = defaultCover;
+                }
             }
         }
     }
@@ -966,7 +989,8 @@ If this happens, right-click the game button, select 'Save link as', and manuall
         window.onscroll = function() {
             if (useCoverGUI) {
                 if (g_scrollTimer) clearTimeout(g_scrollTimer);
-                g_scrollTimer = setTimeout(checkPS3Visibility, 150); 
+                // Delay de 200ms para não travar a rolagem enquanto calcula
+                g_scrollTimer = setTimeout(checkPS3Visibility, 200); 
             }
         };
     }
@@ -1080,30 +1104,53 @@ If this happens, right-click the game button, select 'Save link as', and manuall
     }
 
     // ==============================================================
-    // 6. CACHE: BANCO DE DADOS (TEXTO BRUTO)
+    // 6. CACHE: BANCO DE DADOS (COM EXCEÇÃO PARA DLCS)
     // ==============================================================
     
     function saveToCache(cat, data) {
         if (!window.localStorage) return;
+
+        // REGRA DE EXCEÇÃO:
+        // Se a categoria for "dlcs", abortamos. Não salva nada no HD.
+        if (cat === "dlcs") {
+             return; 
+        }
+
         try {
             localStorage.setItem("psn_db_" + cat, data);
             localStorage.setItem("psn_time_" + cat, new Date().getTime().toString());
         } catch (e) {
-            // Quota Exceeded -> Limpa tudo e tenta salvar apenas o atual
+            // Se der erro de cota (Quota Exceeded) para Games/Themes/etc
             try {
-                localStorage.clear();
+                // Tenta limpar caches de outras categorias para salvar a atual
+                var cats = ["games", "avatars", "demos", "themes"];
+                for (var i = 0; i < cats.length; i++) {
+                    if (cats[i] !== cat) {
+                        localStorage.removeItem("psn_db_" + cats[i]);
+                        localStorage.removeItem("psn_time_" + cats[i]);
+                    }
+                }
+                // Tenta salvar de novo
                 localStorage.setItem("psn_db_" + cat, data);
                 localStorage.setItem("psn_time_" + cat, new Date().getTime().toString());
-            } catch (e2) {}
+            } catch (e2) {
+                // Se ainda assim não der, falha silenciosamente (não trava o script)
+            }
         }
     }
 
     function loadFromCache(cat) {
+        // REGRA DE EXCEÇÃO:
+        // Se for DLCs, minta e diga que não tem cache. Força o download.
+        if (cat === "dlcs") return null;
+
         if (!window.localStorage) return null;
         var data = localStorage.getItem("psn_db_" + cat);
         var time = localStorage.getItem("psn_time_" + cat);
         
         if (!data || !time) return null;
+        
+        // Verifica se o cache venceu (CACHE_TIME deve ser definido nas variáveis globais)
         if ((new Date().getTime() - parseInt(time)) > CACHE_TIME) return null;
 
         return data;
