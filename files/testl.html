@@ -876,72 +876,118 @@ If this happens, right-click on the game button and choose 'Save link as' to dow
         }
 
         function loadChunkCovers() {
-            var imgs = document.querySelectorAll('#list.grid img[data-src]');
-            for (var i = 0; i < imgs.length; i++) {
-                (function (img) {
-                    var url = img.getAttribute('data-src');
-                    if (!url) return;
-                    var temp = new Image();
-                    temp.onload = function () { img.src = url; img.removeAttribute('data-src'); };
-                    temp.onerror = function () { img.removeAttribute('data-src'); };
-                    temp.src = url;
-                })(imgs[i]);
-            }
+    var imgs = document.querySelectorAll('#list.grid img[data-src]');
+
+    for (var i = 0; i < imgs.length; i++) {
+        (function(img) {
+
+            var ghUrl = img.getAttribute('data-src');
+            var cid   = img.getAttribute('data-cid');
+
+            if (!ghUrl) return;
+
+            var testImg = new Image();
+
+            // TENTA GITHUB PRIMEIRO
+            testImg.onload = function () {
+                img.src = ghUrl;
+                img.removeAttribute('data-src');
+            };
+
+            testImg.onerror = function () {
+
+                // FALLBACK SONY
+                if (cid) {
+                    try {
+                        var hash = generateSonyHash(cid);
+                        var sonyUrl = "http://tmdb.np.dl.playstation.net/tmdb/" + hash + "/ICON0.PNG";
+
+                        // SE NÃO FOR PS3 → usa proxy seguro
+                        if (!isPS3) {
+                            var clean = sonyUrl.replace(/^http:\/\//i, '');
+                            sonyUrl = "https://images.weserv.nl/?url=" + clean + "&output=png";
+                        }
+
+                        var sonyTest = new Image();
+
+                        sonyTest.onload = function () {
+                            img.src = sonyUrl; // Funcionou → usa SONY
+                        };
+
+                        sonyTest.src = sonyUrl;
+
+                    } catch(e) {}
+                }
+
+                img.removeAttribute('data-src'); // evita loop
+            };
+
+            // INICIA teste de GitHub
+            testImg.src = ghUrl;
+
+        })(imgs[i]);
+    }
+}
+
+       function renderChunk() {
+    var list = document.getElementById('list');
+    var chunk = g_allMatches.slice(g_currentChunkIndex, g_currentChunkIndex + g_chunkSize);
+    var htmlChunk = "";
+
+    if (chunk.length === 0) {
+        if (g_currentChunkIndex === 0) {
+            list.innerHTML = useCoverGUI ? 
+                '<div style="color:#fff;font-size:20px;padding:100px;">No items found.</div>' : 
+                '<li>No items found.</li>';
         }
+        return;
+    }
 
-        function renderChunk() {
-            var list = document.getElementById('list');
-            var chunk = g_allMatches.slice(g_currentChunkIndex, g_currentChunkIndex + g_chunkSize);
-            var htmlChunk = "";
+    for (var i = 0; i < chunk.length; i++) {
+        var a = chunk[i];
+        if (!a[3] || a[3] === "MISSING") continue;
 
-            if (chunk.length === 0) {
-                if (g_currentChunkIndex === 0) {
-                    list.innerHTML = useCoverGUI ?
-                        '<div style="color:#fff;font-size:20px;padding:100px;">No items found.</div>' :
-                        '<li>No items found.</li>';
-                }
-                return;
-            }
+        var size = formatFileSize(a[a.length-1] || a[a.length-2] || "");
 
-            for (var i = 0; i < chunk.length; i++) {
-                var a = chunk[i];
-                if (!a[3] || a[3] === "MISSING") continue;
+        if (useCoverGUI) {
 
-                var size = formatFileSize(a[a.length - 1] || a[a.length - 2] || "");
+            var coverUrl = "https://ps3-pro.github.io/PSN-Content/resources/covers/PS3/" + a[0] + ".JPG";
 
-                if (useCoverGUI) {
-                    var coverUrl = "https://ps3-pro.github.io/PSN-Content/resources/covers/PS3/" + a[0] + ".JPG";
+            htmlChunk += '<div class="game-tile">' +
+                '<img src="'+defaultCover+'" ' +
+                    'data-src="'+coverUrl+'" ' +
+                    'data-cid="'+a[4]+'" ' + // ← NECESSÁRIO PRO SONY
+                    'name="cover_'+a[0]+'" ' +
+                    'style="width:120px;height:140px;border-radius:4px;">' +
+                '<div class="title">'+a[2]+'</div>' +
+                '<div class="title-id">['+a[0]+']</div>' +
+                '<div class="size">'+size+'</div>' +
+                '<div class="links"><a href="'+a[3]+'">PKG</a> '+makeRap(a)+'</div>' +
+                '</div>';
 
-                    htmlChunk += '<div class="game-tile">' +
-                        '<img src="' + defaultCover + '" data-src="' + coverUrl + '" name="cover_' + a[0] + '" style="width:120px;height:140px;border-radius:4px;">' +
-                        '<div class="title">' + a[2] + '</div>' +
-                        '<div class="title-id">[' + a[0] + ']</div>' +
-                        '<div class="size">' + size + '</div>' +
-                        '<div class="links"><a href="' + a[3] + '">PKG</a> ' + makeRap(a) + '</div>' +
-                        '</div>';
-                } else {
-                    var rawSize = a[a.length - 1];
-                    if (isNaN(parseFloat(rawSize)) && a.length > 1) rawSize = a[a.length - 2];
-                    var fileSize = formatFileSize(rawSize);
-                    var gameName = a[2];
-                    var contentIDHtml = '<span style="color: #ffff00;">[' + a[0] + ']</span>';
-                    var pkgButtonHtml = '<a href="' + a[3] + '">PKG</a>';
+        } else {
 
-                    htmlChunk += '<li>' +
-                        gameName +
-                        ' ' + contentIDHtml +
-                        ' ' + fileSize +
-                        ' ' + pkgButtonHtml +
-                        ' ' + makeRap(a) +
-                        '</li>';
-                }
-            }
+            var rawSize = a[a.length-1];
+            if (isNaN(parseFloat(rawSize)) && a.length > 1) rawSize = a[a.length-2];
+            var fileSize = formatFileSize(rawSize);
 
-            list.innerHTML += htmlChunk;
+            htmlChunk += '<li>' +
+                a[2] + 
+                ' <span style="color: #ffff00;">[' + a[0] + ']</span>' +
+                ' ' + fileSize + 
+                ' <a href="' + a[3] + '">PKG</a> ' +
+                makeRap(a) +
+                '</li>';
+        }
+    }
 
-            g_currentChunkIndex += g_chunkSize;
+    list.innerHTML += htmlChunk;
 
-            loadChunkCovers();
+    g_currentChunkIndex += g_chunkSize;
+
+    // CHAMAR O CARREGAMENTO DAS CAPAS AQUI
+    loadChunkCovers();
+
 
             if (g_currentChunkIndex < g_allMatches.length) {
                 setTimeout(renderChunk, 0);
