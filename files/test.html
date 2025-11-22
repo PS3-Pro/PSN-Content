@@ -879,77 +879,102 @@ If this happens, right-click the game button, select 'Save link as', and manuall
 
     // Funções para manipulação de Cookies (Melhor compatibilidade PS3)
     function setCookie(name, value, days) {
-        var expires = "";
-        if (days) {
-            var date = new Date();
-            // Configura o cookie para expirar em 1 ano (365 dias)
-            date.setTime(date.getTime() + (days * 24 * 60 * 60 * 1000));
-            expires = "; expires=" + date.toUTCString();
-        }
-        // O atributo "path=/" garante que o cookie esteja disponível em todo o site
-        document.cookie = name + "=" + (value || "") + expires + "; path=/";
+    var expires = "";
+    if (days) {
+        var date = new Date();
+        date.setTime(date.getTime() + (days * 24 * 60 * 60 * 1000));
+        expires = "; expires=" + date.toUTCString();
     }
+    document.cookie = name + "=" + (value || "") + expires + "; path=/";
+}
 
-    function getCookie(name) {
-        var nameEQ = name + "=";
-        var ca = document.cookie.split(';');
-        for(var i = 0; i < ca.length; i++) {
-            var c = ca[i];
-            while (c.charAt(0) == ' ') c = c.substring(1, c.length);
-            if (c.indexOf(nameEQ) == 0) return c.substring(nameEQ.length, c.length);
-        }
-        return null;
+function getCookie(name) {
+    var nameEQ = name + "=";
+    var ca = document.cookie.split(';');
+    for(var i = 0; i < ca.length; i++) {
+        var c = ca[i];
+        while (c.charAt(0) == ' ') c = c.substring(1, c.length);
+        if (c.indexOf(nameEQ) == 0) return c.substring(nameEQ.length, c.length);
     }
+    return null;
+}
 
-    // FUNÇÕES DE SAVE/LOAD DO ESTADO DA UI (USANDO COOKIES PARA TODOS)
-    function saveUIState() {
-        var coverChecked = document.getElementById("cover-gui").checked;
-        var audioChecked = document.getElementById("audio-toggle").checked;
-
-        // Salva o estado para todos os navegadores usando Cookies
-        setCookie(STORAGE_KEY_COVERS, coverChecked ? "1" : "0", 365);
-        setCookie(STORAGE_KEY_AUDIO, audioChecked ? "1" : "0", 365);
-    }
-
-    function loadUIState() {
-        var coverToggle = document.getElementById("cover-gui");
-        var audioToggle = document.getElementById("audio-toggle");
-
-        // 1. Carrega o estado das Capas/Grid (CHAVE: psn_db_covers_state)
-        var coverState = getCookie(STORAGE_KEY_COVERS);
-        if (coverState !== null) {
-            coverToggle.checked = (coverState === "1");
-        } else if (isPS3) {
-            // PS3: Padrão (sem cookie) é LISTA (false)
-            coverToggle.checked = false;
-        } else {
-            // PC/Outros: Padrão (sem cookie) é GRID (true)
-            coverToggle.checked = true;
-        }
-        
-        // Atualiza a variável global
-        useCoverGUI = coverToggle.checked;
-        
-        // 2. Carrega o estado do Áudio (CHAVE: psn_db_audio_state)
-        var audioState = getCookie(STORAGE_KEY_AUDIO);
-        if (audioState !== null) {
-            audioToggle.checked = (audioState === "1");
-        } else {
-            // Padrão (sem cookie) é LIGADO (true) para todos
-            audioToggle.checked = true;
-        }
-
-        // 3. Aplica o estado inicial do Áudio no PC/Mobile
-        if (!isPS3 && audioToggle.checked) {
-    var audioEl = document.getElementById('invisible-audio');
-    if (audioEl) {
-        // Remove .catch() e usa try/catch para a tentativa de play:
+// >> NOVO: Funções para salvar/carregar o estado (Agora com try/catch simples)
+function saveState(key, value) {
+    if (typeof window.localStorage !== 'undefined') { // Teste de suporte mais seguro
         try {
-            audioEl.play(); 
-        } catch(e) { /* Silently ignore autoplay failure on PC */ }
+            localStorage.setItem(key, value);
+        } catch (e) {
+            // Falha no localStorage: Salva como cookie
+            setCookie(key, value, 365);
+        }
+    } else {
+        // PS3 ou sem suporte: Usa cookie
+        setCookie(key, value, 365);
     }
 }
+
+function loadState(key) {
+    if (typeof window.localStorage !== 'undefined') { // Teste de suporte mais seguro
+        var lsValue = localStorage.getItem(key);
+        if (lsValue !== null) return lsValue;
     }
+    // Retorna o cookie como fallback ou para PS3
+    return getCookie(key);
+}
+
+
+// FUNÇÕES DE SAVE/LOAD DO ESTADO DA UI
+function saveUIState() {
+    var coverChecked = document.getElementById("cover-gui").checked;
+    var audioChecked = document.getElementById("audio-toggle").checked;
+
+    // Salva o estado usando a nova função
+    saveState(STORAGE_KEY_COVERS, coverChecked ? "1" : "0");
+    saveState(STORAGE_KEY_AUDIO, audioChecked ? "1" : "0");
+}
+
+function loadUIState() {
+    var coverToggle = document.getElementById("cover-gui");
+    var audioToggle = document.getElementById("audio-toggle");
+
+    // 1. Carrega o estado das Capas/Grid
+    var coverState = loadState(STORAGE_KEY_COVERS);
+    if (coverState !== null) {
+        coverToggle.checked = (coverState === "1");
+    } else if (isPS3) {
+        // PS3: Padrão (sem estado) é LISTA (false)
+        coverToggle.checked = false;
+    } else {
+        // PC/Outros: Padrão (sem estado) é GRID (true)
+        coverToggle.checked = true;
+    }
+    
+    // Atualiza a variável global
+    useCoverGUI = coverToggle.checked;
+    
+    // 2. Carrega o estado do Áudio
+    var audioState = loadState(STORAGE_KEY_AUDIO);
+    if (audioState !== null) {
+        audioToggle.checked = (audioState === "1");
+    } else {
+        // Padrão (sem estado) é LIGADO (true) para todos
+        audioToggle.checked = true;
+    }
+
+    // 3. Aplica o estado inicial do Áudio no PC/Mobile (REMOVIDO .catch() INCOMPATÍVEL)
+    if (!isPS3 && audioToggle.checked) {
+        var audioEl = document.getElementById('invisible-audio');
+        if (audioEl) {
+            try {
+                // Tentativa de play simples (sem Promises/catch)
+                audioEl.play(); 
+            } catch(e) {
+                // Ignore silent auto-play failures
+            }
+        }
+    }
+}
     
     // Funções originais de cache do DB (mantidas com localStorage por ser mais eficiente no PC)
     function saveToCache(cat, data) {
