@@ -1075,54 +1075,16 @@ function loadUIState() {
         return data;
     }
 
-   function processData(tsvData) {
-            var lines = tsvData.split("\n");
-            // Em vez de salvar direto no DB, salvamos num objeto temporário para comparar
-            var tempMap = {}; 
-            
-            for (var i = 0; i < lines.length; i++) {
-                var line = lines[i].replace(/^\s+|\s+$/g, '');
-                
-                if(line !== "") {
-                    var parts = line.split("\t");
-                    
-                    var cid = parts[0]; // ID
-                    var url = parts[3]; // Link
-                    var rap = parts[4]; // Status do RAP (coluna 4)
-                    
-                    // Chave Única: ID + Link
-                    var uniqueKey = cid + "|" + url;
-                    
-                    // 1. Se ainda não existe essa chave, salva.
-                    if (!tempMap[uniqueKey]) {
-                        tempMap[uniqueKey] = parts;
-                    } 
-                    // 2. Se JÁ existe, verificamos se o novo é melhor (tem RAP e o antigo não).
-                    else {
-                        var existingRap = tempMap[uniqueKey][4];
-                        
-                        // O que está salvo é ruim? (É "MISSING" ou vazio?)
-                        var oldIsBad = (!existingRap || existingRap === "MISSING");
-                        
-                        // O novo é bom? (Tem texto e NÃO é "MISSING")
-                        var newIsGood = (rap && rap !== "MISSING");
-                        
-                        // Se o antigo era ruim e o novo é bom -> SUBSTITUI
-                        if (oldIsBad && newIsGood) {
-                            tempMap[uniqueKey] = parts;
-                        }
-                    }
-                }
+    function processData(tsvData) {
+        var lines = tsvData.split("\n");
+        DB = [];
+        for (var i = 0; i < lines.length; i++) {
+            var line = lines[i].replace(/^\s+|\s+$/g, '');
+            if(line !== "") {
+                DB.push(line.split("\t"));
             }
-            
-            // Agora passamos os vencedores para a lista final DB
-            DB = [];
-            for (var key in tempMap) {
-                if (tempMap.hasOwnProperty(key)) {
-                    DB.push(tempMap[key]);
-                }
-            }
-         }
+        }
+    }
 
     // ==============================================================
     // 5. CARREGAMENTO UNIFICADO
@@ -1397,76 +1359,54 @@ function loadUIState() {
 
     try {
         function fetchDB() {
-               stopRendering();
-               if (window.localStorage) f.fetch.disabled = true;
-               
-               // 1. Tenta carregar CACHE
-               var cachedData = loadFromCache(currentCategory);
-               if (cachedData) {
-                  document.getElementById('list').innerHTML = '<li>Loading from cache... Please wait.</li>';
-                  setTimeout(function(){ 
-                      processData(cachedData); 
-                      if (window.localStorage) f.fetch.disabled = false; 
-                      render(); 
-                      checkStartupAlert(); 
-                      attachScrollListener(); 
-                  }, 50); 
-                  return;
-               }
+            stopRendering();
+            
+            if (window.localStorage) f.fetch.disabled = true;
 
-               // 2. Se não tem cache, baixa MÚLTIPLOS ARQUIVOS
-               var combinedData = ""; // Aqui vamos juntar todos os TSVs
-               var currentIndex = 0;  // Qual arquivo estamos baixando agora
-               
-               function loadNextFile() {
-                   // Se já baixou todos da lista
-                   if (currentIndex >= dbPaths.length) {
-                       // Salva tudo junto no cache
-                       saveToCache(currentCategory, combinedData);
-                       // Processa e Renderiza
-                       processData(combinedData);
-                       if (window.localStorage) f.fetch.disabled = false;
-                       render();
-                       checkStartupAlert();
-                       attachScrollListener();
-                       return;
-                   }
-                   
-                   // Configura o download atual
-                   var urlToLoad = dbPaths[currentIndex];
-                   if (window.localStorage) { urlToLoad += "?t=" + new Date().getTime(); }
-                   
-                   var xhr = new XMLHttpRequest();
-                   xhr.onreadystatechange = function() {
-                      if (xhr.readyState == 4) {
-                         if (xhr.status == 200 || xhr.status == 0) {
-                            // Adiciona o conteúdo deste arquivo na variável gigante, com uma quebra de linha
-                            combinedData += "\n" + xhr.responseText;
-                            
-                            // Passa para o próximo
-                            currentIndex++;
-                            // Atualiza o texto na tela para o usuário saber
-                            document.getElementById('count').textContent = "Loading part " + currentIndex + "/" + dbPaths.length + "...";
-                            loadNextFile(); 
-                         } else {
-                             alert("Error loading part " + (currentIndex+1));
-                             if (window.localStorage) f.fetch.disabled = false;
-                         }
-                      }
-                   };
-                   
-                   try { 
-                       xhr.open('GET', urlToLoad, true); 
-                       xhr.send(); 
-                   } catch(e) { 
-                       alert("Net Error: " + e); 
-                       if (window.localStorage) f.fetch.disabled = false; 
-                   }
-               }
-               
-               // Começa o download do primeiro
-               loadNextFile();
+            // 1. Tenta CACHE (loadFromCache já verifica suporte)
+            var cachedData = loadFromCache(currentCategory);
+            if (cachedData) {
+                document.getElementById('list').innerHTML = '<li>Loading from cache... Please wait.</li>';
+                setTimeout(function(){
+                    processData(cachedData);
+                    if (window.localStorage) f.fetch.disabled = false;
+                    render();
+                    checkStartupAlert();
+                }, 50);
+                return;
             }
+
+            // 2. Baixa da REDE
+            var urlToLoad = dbPath;
+            if (window.localStorage) {
+                urlToLoad += "?t=" + new Date().getTime();
+            }
+
+            var xhr = new XMLHttpRequest();
+            xhr.onreadystatechange = function() {
+                if (xhr.readyState == 4) {
+                    if (xhr.status == 200 || xhr.status == 0) {
+                        var responseText = xhr.responseText;
+                        saveToCache(currentCategory, responseText);
+                        processData(responseText);
+                        if (window.localStorage) f.fetch.disabled = false;
+                        render();
+                        checkStartupAlert();
+                    } else {
+                        alert("Error loading DB: Status " + xhr.status);
+                        if (window.localStorage) f.fetch.disabled = false;
+                    }
+                }
+            };
+            
+            try {
+                xhr.open('GET', urlToLoad, true);
+                xhr.send();
+            } catch(e) {
+                alert("Net Error: " + e);
+                if (window.localStorage) f.fetch.disabled = false;
+            }
+        }
 
         document.getElementById("cover-gui").onclick = function() {
             stopRendering();
@@ -1573,63 +1513,40 @@ function loadUIState() {
         }
         createLetterLinks();
 
-        var dbPaths = []; // Nova variável para guardar a lista de links
-
         function selectCategory(cat) {
             stopRendering();
             currentCategory = cat;
             
-            // AQUI VOCÊ DEFINE AS SUAS LISTAS
             switch(cat) {
-                case "games": 
-                    dbPaths = [
-                        //"https://ps3-pro.github.io/PSN-Content/resources/database/games.tsv",
-                        "https://PS2ClassicsVault.github.io/server/PS3/PKGi/ps3_games.tsv" 
-                    ]; 
-                    break;
-                case "avatars": 
-                    dbPaths = [
-					//"https://ps3-pro.github.io/PSN-Content/resources/database/avatars.tsv",
-					"https://PS2ClassicsVault.github.io/server/PS3/PKGi/ps3_avatars.tsv"
-					]; 
-                    break;
-                case "demos": 
-                    dbPaths = [
-					//"https://ps3-pro.github.io/PSN-Content/resources/database/demos.tsv",
-					"https://PS2ClassicsVault.github.io/server/PS3/PKGi/ps3_demos.tsv"
-					]; 
-                    break;
-                case "dlcs": 
-                    dbPaths = [
-					//"https://ps3-pro.github.io/PSN-Content/resources/database/dlcs.tsv",
-					"https://PS2ClassicsVault.github.io/server/PS3/PKGi/ps3_dlcs.tsv"
-					]; 
-                    break;
-                case "themes": 
-                    dbPaths = [
-					//"https://ps3-pro.github.io/PSN-Content/resources/database/themes.tsv",
-					"https://PS2ClassicsVault.github.io/server/PS3/PKGi/ps3_themes.tsv"
-					]; 
-                    break;
+                case "games": dbPath = "https://ps3-pro.github.io/PSN-Content/resources/database/games.tsv"; break;
+                case "avatars": dbPath = "https://ps3-pro.github.io/PSN-Content/resources/database/avatars.tsv"; break;
+                case "demos": dbPath = "https://ps3-pro.github.io/PSN-Content/resources/database/demos.tsv"; break;
+                case "dlcs": dbPath = "https://ps3-pro.github.io/PSN-Content/resources/database/dlcs.tsv"; break;
+                case "themes": dbPath = "https://ps3-pro.github.io/PSN-Content/resources/database/themes.tsv"; break;
             }
             
             DB = [];
             g_letterFilter = ""; g_regionFilter = "ALL"; f.query.value = "";
             if (g_defaultLetterFilter) g_letterFilter = g_defaultLetterFilter;
-            
-            var l = document.getElementById("letters").getElementsByTagName("a"); for (var i = 0; i < l.length; i++) l[i].className = "";
-            var r = document.getElementById("region-links").getElementsByTagName("a"); for (var i = 0; i < r.length; i++) r[i].className = ""; if (r[0]) r[0].className = "active";
-            
+            var l = document.getElementById("letters").getElementsByTagName("a");
+            for (var i = 0; i < l.length; i++) l[i].className = "";
+            var r = document.getElementById("region-links").getElementsByTagName("a");
+            for (var i = 0; i < r.length; i++) r[i].className = "";
+            if (r[0]) r[0].className = "active";
             createLetterLinks();
-            if (isPS3 && g_defaultLetterFilter == '^[0-9]') { var links = document.getElementById("letters").getElementsByTagName("a"); if (links.length > 0) links[0].className = "active"; }
-            
-            var menu = document.getElementById("selection-menu").getElementsByTagName("a"); for (i = 0; i < menu.length; i++) menu[i].className = menu[i].className.replace("active", "");
+            if (isPS3 && g_defaultLetterFilter == '^[0-9]') {
+                var links = document.getElementById("letters").getElementsByTagName("a");
+                if (links.length > 0) links[0].className = "active";
+            }
+            var menu = document.getElementById("selection-menu").getElementsByTagName("a");
+            for (i = 0; i < menu.length; i++) menu[i].className = menu[i].className.replace("active", "");
             var ids = {games:"ln-game", avatars:"ln-avatar", demos:"ln-demos", dlcs:"ln-dlcs", themes:"ln-themes"};
-            var el = document.getElementById(ids[cat]); if (el) el.className += " active";
+            var el = document.getElementById(ids[cat]);
+            if (el) el.className += " active";
             
-            document.getElementById('list').innerHTML = '<li>Downloading database... Please wait.</li>';
-            document.getElementById('count').textContent = "Loading...";
-            
+            // Exibe status correto
+			document.getElementById('list').innerHTML = '<li>Downloading database... Please wait.</li>';
+			document.getElementById('count').textContent = "Loading...";
             fetchDB(); scrollToTop();
         }
         
