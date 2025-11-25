@@ -1119,58 +1119,6 @@ If this happens, right-click the game button, select 'Save link as', and manuall
 
         return data;
     }
-
-   function processData(tsvData) {
-            var lines = tsvData.split("\n");
-            var tempMap = {}; 
-            
-            for (var i = 0; i < lines.length; i++) {
-                var line = lines[i].replace(/^\s+|\s+$/g, '');
-                
-                if(line !== "") {
-                    var parts = line.split("\t");
-                    
-                    // 1. FILTRO DE CABEÇALHO (Remove linhas de título do meio da lista)
-                    if (parts[0] && parts[0].toLowerCase().indexOf("title id") > -1) {
-                        continue; 
-                    }
-                    
-                    // 2. LIMPEZA DO NOME (Remove espaços extras)
-                    if (parts[2]) {
-                        parts[2] = parts[2].replace(/^\s+|\s+$/g, '');
-                    }
-                    
-                    var cid = parts[0]; 
-                    var url = parts[3]; 
-                    var rap = parts[4]; 
-                    
-                    // 3. LÓGICA DE UNICIDADE (ID + Link)
-                    var uniqueKey = cid + "|" + url;
-                    
-                    if (!tempMap[uniqueKey]) {
-                        tempMap[uniqueKey] = parts;
-                    } else {
-                        // 4. LÓGICA DE PRIORIDADE (Prioriza quem tem RAP)
-                        var existingRap = tempMap[uniqueKey][4];
-                        var oldIsBad = (!existingRap || existingRap === "MISSING");
-                        var newIsGood = (rap && rap !== "MISSING");
-                        
-                        if (oldIsBad && newIsGood) {
-                            tempMap[uniqueKey] = parts;
-                        }
-                    }
-                }
-            }
-            
-            // Passa a lista limpa e organizada para o DB
-            DB = [];
-            for (var key in tempMap) {
-                if (tempMap.hasOwnProperty(key)) {
-                    DB.push(tempMap[key]);
-                }
-            }
-         }
-
     // ==============================================================
     // 5. CARREGAMENTO UNIFICADO
     // ==============================================================
@@ -1482,77 +1430,156 @@ If this happens, right-click the game button, select 'Save link as', and manuall
 }
 
     try {
-        function fetchDB() {
-               stopRendering();
-               if (window.localStorage) f.fetch.disabled = true;
-               
-               // 1. Tenta carregar CACHE
-               var cachedData = loadFromCache(currentCategory);
-               if (cachedData) {
-                  document.getElementById('list').innerHTML = '<li>Loading from cache... Please wait.</li>';
-                  setTimeout(function(){ 
-                      processData(cachedData); 
-                      if (window.localStorage) f.fetch.disabled = false; 
-                      render(); 
-                      checkStartupAlert(); 
-                      attachScrollListener(); 
-                  }, 50); 
-                  return;
-               }
+        // Substitua toda a sua função fetchDB e processData antigas por estas novas:
 
-               // 2. Se não tem cache, baixa MÚLTIPLOS ARQUIVOS
-               var combinedData = ""; // Aqui vamos juntar todos os TSVs
-               var currentIndex = 0;  // Qual arquivo estamos baixando agora
-               
-               function loadNextFile() {
-                   // Se já baixou todos da lista
-                   if (currentIndex >= dbPaths.length) {
-                       // Salva tudo junto no cache
-                       saveToCache(currentCategory, combinedData);
-                       // Processa e Renderiza
-                       processData(combinedData);
-                       if (window.localStorage) f.fetch.disabled = false;
-                       render();
-                       checkStartupAlert();
-                       attachScrollListener();
-                       return;
-                   }
-                   
-                   // Configura o download atual
-                   var urlToLoad = dbPaths[currentIndex];
-                   if (window.localStorage) { urlToLoad += "?t=" + new Date().getTime(); }
-                   
-                   var xhr = new XMLHttpRequest();
-                   xhr.onreadystatechange = function() {
-                      if (xhr.readyState == 4) {
-                         if (xhr.status == 200 || xhr.status == 0) {
-                            // Adiciona o conteúdo deste arquivo na variável gigante, com uma quebra de linha
-                            combinedData += "\n" + xhr.responseText;
-                            
-                            // Passa para o próximo
-                            currentIndex++;
-                            // Atualiza o texto na tela para o usuário saber
-                            document.getElementById('count').textContent = "Loading part " + currentIndex + "/" + dbPaths.length + "...";
-                            loadNextFile(); 
-                         } else {
-                             alert("Error loading part " + (currentIndex+1));
-                             if (window.localStorage) f.fetch.disabled = false;
-                         }
-                      }
-                   };
-                   
-                   try { 
-                       xhr.open('GET', urlToLoad, true); 
-                       xhr.send(); 
-                   } catch(e) { 
-                       alert("Net Error: " + e); 
-                       if (window.localStorage) f.fetch.disabled = false; 
-                   }
-               }
-               
-               // Começa o download do primeiro
-               loadNextFile();
+// Variável temporária para deduplicação durante o download
+var g_tempMap = {}; 
+
+function processChunk(tsvData) {
+    // Processa APENAS o pedaço atual, sem segurar o texto todo na memória
+    var lines = tsvData.split("\n");
+    
+    // Otimização: remove o array 'lines' da memória o mais rápido possível processando linha a linha
+    for (var i = 0; i < lines.length; i++) {
+        var line = lines[i];
+        // Pequena otimização de string: se for vazia, pula logo
+        if(line.length < 5) continue; 
+        
+        // Remove espaços (trim manual é mais leve as vezes, mas regex serve)
+        line = line.replace(/^\s+|\s+$/g, '');
+        if(line === "") continue;
+
+        var parts = line.split("\t");
+        
+        // Filtros básicos
+        if (parts[0] && parts[0].indexOf("Title ID") > -1) continue; // Cabeçalho
+        if (parts[2]) parts[2] = parts[2].replace(/^\s+|\s+$/g, ''); // Nome
+
+        var cid = parts[0]; 
+        var url = parts[3]; 
+        var rap = parts[4]; 
+        
+        // Chave única
+        var uniqueKey = cid + "|" + url;
+        
+        // Lógica de prioridade (RAP)
+        if (!g_tempMap[uniqueKey]) {
+            g_tempMap[uniqueKey] = parts;
+        } else {
+            var existingRap = g_tempMap[uniqueKey][4];
+            var oldIsBad = (!existingRap || existingRap === "MISSING");
+            var newIsGood = (rap && rap !== "MISSING");
+            
+            if (oldIsBad && newIsGood) {
+                g_tempMap[uniqueKey] = parts;
             }
+        }
+    }
+    // O Garbage Collector do PS3 agora pode limpar a variável 'tsvData' e 'lines'
+    lines = null;
+}
+
+function finalizeDB() {
+    // Transforma o Map em Array final apenas no último momento
+    DB = [];
+    for (var key in g_tempMap) {
+        if (g_tempMap.hasOwnProperty(key)) {
+            DB.push(g_tempMap[key]);
+        }
+    }
+    // Limpa o mapa da memória para liberar espaço
+    g_tempMap = {}; 
+}
+
+function fetchDB() {
+   stopRendering();
+   if (window.localStorage) f.fetch.disabled = true;
+   
+   // Reseta o mapa temporário
+   g_tempMap = {};
+
+   // 1. Tenta carregar CACHE (Mantive sua lógica, só adaptei a chamada)
+   var cachedData = loadFromCache(currentCategory);
+   if (cachedData) {
+      document.getElementById('list').innerHTML = '<li>Loading from cache... Please wait.</li>';
+      setTimeout(function(){ 
+          // O Cache é salvo como string única, então processamos ele de uma vez
+          processChunk(cachedData); 
+          finalizeDB(); // Converte para DB
+          
+          if (window.localStorage) f.fetch.disabled = false; 
+          render(); 
+          checkStartupAlert(); 
+          attachScrollListener(); 
+      }, 50); 
+      return;
+   }
+
+   // 2. Download Múltiplo (OTIMIZADO)
+   var currentIndex = 0; 
+   // Variável para guardar tudo APENAS SE precisarmos salvar no cache depois
+   var cacheAccumulator = ""; 
+
+   function loadNextFile() {
+       if (currentIndex >= dbPaths.length) {
+           // Acabou tudo
+           finalizeDB(); // Converte o mapa acumulado para o DB final
+
+           // Salva no cache se possível (aqui ainda precisamos da string cheia, infelizmente)
+           if (cacheAccumulator.length > 0) {
+               saveToCache(currentCategory, cacheAccumulator);
+               cacheAccumulator = ""; // Limpa memória imediatamente
+           }
+
+           if (window.localStorage) f.fetch.disabled = false;
+           render();
+           checkStartupAlert();
+           attachScrollListener();
+           return;
+       }
+       
+       var urlToLoad = dbPaths[currentIndex];
+       if (window.localStorage) { urlToLoad += "?t=" + new Date().getTime(); }
+       
+       var xhr = new XMLHttpRequest();
+       xhr.onreadystatechange = function() {
+          if (xhr.readyState == 4) {
+             if (xhr.status == 200 || xhr.status == 0) {
+                
+                var content = xhr.responseText;
+                
+                // 1. Acumula para o Cache (se tiver RAM sobrando no PC, no PS3 pode falhar se for DLC, mas tentamos)
+                if (currentCategory !== 'dlcs') { // Evita acumular DLCs para cache no PS3
+                    cacheAccumulator += "\n" + content;
+                }
+
+                // 2. Processa IMEDIATAMENTE e esquece o texto bruto
+                processChunk(content);
+                
+                // Força limpeza da variavel
+                content = null; 
+
+                currentIndex++;
+                document.getElementById('count').textContent = "Processing part " + currentIndex + "/" + dbPaths.length + "...";
+                loadNextFile(); 
+             } else {
+                 alert("Error loading part " + (currentIndex+1));
+                 if (window.localStorage) f.fetch.disabled = false;
+             }
+          }
+       };
+       
+       try { 
+           xhr.open('GET', urlToLoad, true); 
+           xhr.send(); 
+       } catch(e) { 
+           alert("Net Error: " + e); 
+           if (window.localStorage) f.fetch.disabled = false; 
+       }
+   }
+   
+   loadNextFile();
+}
 
         document.getElementById("cover-gui").onclick = function() {
             stopRendering();
