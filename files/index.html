@@ -1238,69 +1238,90 @@ If this happens, right-click the game button, select 'Save link as', and manuall
     // ==============================================================
     // 6. LAZY LOADING (ANTI-CRASH) (Código inalterado)
     // ==============================================================
-    
-	var g_scrollTimer = null;
+		var g_scrollTimer = null;
 
-	function checkPS3Visibility() {
-        var imgs = document.querySelectorAll('.game-tile img');
-        
-        var scrollY = window.pageYOffset;
-        var viewH = window.innerHeight;
-
-        // --- CONFIGURAÇÃO DE DISTÂNCIAS (EM PIXELS) ---
-        
-        // Distância para CARREGAR
-		// 1200px é suficiente (são quase 2 telas inteiras adiantadas)
-		var loadBuffer = 1200;	
-		
-		// Distância para APAGAR CIMA
-		// 3000px ainda é muito bom (4 telas de histórico), mas economiza ~25% de memória
-		var unloadBufferTop = 3000;	
-		
-		// Distância para APAGAR BAIXO
-		// Como você raramente olha muito pra baixo e depois volta rápido, 1500px está ótimo
-		var unloadBufferBottom = 1500;
-
-        // -----------------------------------------------
-
-        // Calculando os limites matemáticos
-        var loadTop = scrollY - loadBuffer;
-        var loadBottom = scrollY + viewH + loadBuffer;
-
-        var keepTop = scrollY - unloadBufferTop;
-        var keepBottom = scrollY + viewH + unloadBufferBottom;
-
-        for (var i = 0; i < imgs.length; i++) {
-            var img = imgs[i];
+		function checkPS3Visibility() {
+            var imgs = document.querySelectorAll('.game-tile img');
             
-            // Otimização: Se o elemento está oculto, ignora
-            if (!img.offsetParent) continue;
+            // --- CORREÇÃO AQUI ---
+            // Descobre quem está rolando: A div .content (PC/PS3) ou a Janela (Mobile)
+            var scrollY = 0;
+            var contentDiv = document.querySelector('.content');
             
-            // Calcula posição Y atual da imagem
-            var yPos = 0;
-            var el = img;
-            while(el) { yPos += el.offsetTop; el = el.offsetParent; }
-
-            // 1. LÓGICA DE CARREGAMENTO (Prioridade)
-            // Se está perto da tela (Load Zone) E ainda é a capa padrão: CARREGA
-            if (yPos >= loadTop && yPos <= loadBottom) {
-                if (img.src === defaultCover) {
-                    var cid = img.getAttribute('data-cid');
-                    loadCoverSequence(img.id, cid);
-                }
-            }	
-            // 2. LÓGICA DE LIMPEZA (Só apaga se sair da zona segura extendida)
-            // Se está MUITO longe (fora do Keep Zone) E já tem imagem: LIMPA
-            else if (yPos < keepTop || yPos > keepBottom) {
-                if (img.src !== defaultCover) {
-                    img.src = defaultCover;
-                }
+            // Se estamos no modo App (PC/PS3), o scroll é interno
+            if (contentDiv && (isPS3 || document.body.className.indexOf('is-pc') !== -1)) {
+                 scrollY = contentDiv.scrollTop; 
+            } else {
+                 // Se estamos no celular, o scroll é da janela
+                 scrollY = window.pageYOffset;
             }
-            // 3. ZONA NEUTRA (Entre Load e Keep)
-            // Se a imagem estiver entre 1200px e 4000px de distância:
-            // O código não faz NADA. Se já estava carregada, mantém. Se não estava, não carrega.
-        }
-    }
+            // ---------------------
+            
+            var viewH = window.innerHeight;
+            
+            // Distâncias de segurança (Buffers)
+            var loadBuffer = 1200; 
+            var unloadBufferTop = 3000; 
+            var unloadBufferBottom = 1500;
+
+            // Calcula a área visível baseada no scroll correto
+            var loadTop = scrollY - loadBuffer;
+            var loadBottom = scrollY + viewH + loadBuffer;
+            var keepTop = scrollY - unloadBufferTop;
+            var keepBottom = scrollY + viewH + unloadBufferBottom;
+
+            for (var i = 0; i < imgs.length; i++) {
+               var img = imgs[i];
+               if (!img.offsetParent) continue;
+               
+               // Calcula a posição Y da imagem
+               var yPos = 0; 
+               var el = img;
+               
+               // Soma os offsets até chegar no container de rolagem ou no topo do documento
+               while(el && el !== contentDiv && el !== document.body) {
+                   yPos += el.offsetTop;
+                   el = el.offsetParent;
+               }
+               
+               // 1. Carregar se entrou na área
+               if (yPos >= loadTop && yPos <= loadBottom) {
+                  if (img.src === defaultCover) { 
+                      var cid = img.getAttribute('data-cid'); 
+                      loadCoverSequence(img.id, cid); 
+                  }
+               } 
+               // 2. Destruir se saiu muito da área (Economia de RAM)
+               else if (yPos < keepTop || yPos > keepBottom) {
+                  if (img.src !== defaultCover) { 
+                      img.src = defaultCover; 
+                  }
+               }
+            }
+         }
+         
+         function attachScrollListener() {
+             // Ouve o scroll da div de conteúdo (PC/PS3)
+             var contentDiv = document.querySelector('.content');
+             if(contentDiv) {
+                 contentDiv.onscroll = function() {
+                     if(useCoverGUI) {
+                         if (g_scrollTimer) clearTimeout(g_scrollTimer);
+                         g_scrollTimer = setTimeout(checkPS3Visibility, 200);
+                     }
+                 };
+             }
+             
+             // Ouve o scroll da janela (Mobile)
+             window.onscroll = function() {
+                 // Só executa se NÃO for o modo App (ou seja, se for mobile)
+                 if(useCoverGUI && !isPS3 && document.body.className.indexOf('is-pc') === -1) {
+                     if (g_scrollTimer) clearTimeout(g_scrollTimer);
+                     g_scrollTimer = setTimeout(checkPS3Visibility, 200);
+                 }
+             };
+         }
+		 
     if (isPS3) {
         window.onscroll = function() {
             if (useCoverGUI) {
