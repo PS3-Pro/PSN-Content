@@ -884,10 +884,11 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
 	
 	// CONFIGURAÇÃO DA FILA DE IMAGENS
 	var g_imgQueue = [];          // Fila de espera
+	var g_totalImagesQueued = 0;
 	var g_currentLoaders = []; //Lista dos "operários" baixando
 	var g_activeDownloads = 0;    // Quantos estão baixando agora
-	var MAX_PARALLEL_LOADS = 6;   // PS3
-	if (!isPS3) MAX_PARALLEL_LOADS = 24; // PC
+	var MAX_PARALLEL_LOADS = 24;   // PS3
+	if (!isPS3) MAX_PARALLEL_LOADS = 100; // PC
     
     // Cache Settings
     var CACHE_VERSION = "v1.0";
@@ -911,8 +912,10 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
     var isPS3 = /PS3|PlayStation 3|NetFront/i.test(navigator.userAgent) || window.location.search.indexOf("mode=ps3") > -1;
     
     var g_allMatches = [];
-    var g_chunkSize = 60;
+    var g_chunkSize = isPS3 ? 500 : 1000;
     var g_currentChunkIndex = 0;
+	
+	var g_renderingHTML = false;
 	
 	var g_pcRenderLimit = 1000; // Limite atual de renderização
 	var g_pcPageSize = 1000;    // Quantos adicionar por vez
@@ -1262,6 +1265,7 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
         if(el && el.getAttribute('data-queued') === 'true') return;
         if(el) el.setAttribute('data-queued', 'true');
         g_imgQueue.push({ imgID: imgID, cid: cid });
+		g_totalImagesQueued++;
         processImageQueue();
     }
 
@@ -1436,11 +1440,25 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
         document.documentElement.scrollTop = 0; // Para outros navegadores
     }
 	
+    // Função de Ordenar OTIMIZADA (Usa o motor nativo do navegador)
     function sort(lines, algo) {
-        for (var i=0; i<lines.length; i++) for (var j=0; j<lines.length-i-1; j++)
-            if (algo(lines[j], lines[j+1])) { var temp = lines[j]; lines[j] = lines[j+1]; lines[j+1] = temp; }
-        return lines;
+        // Se o navegador suporta ordenação nativa (PC e a maioria dos PS3 modernos)
+        if (Array.prototype.sort) {
+            return lines.sort(function(a, b) {
+                // Converte a lógica do seu 'algo' para o padrão do navegador (-1, 0, 1)
+                if (algo(a, b)) return 1; // a deve vir depois de b
+                if (algo(b, a)) return -1; // b deve vir depois de a
+                return 0; // são iguais
+            });
+        } 
+        // Fallback (Plano B) para navegadores muito, muito antigos (Bubble Sort)
+        else {
+            for (var i=0; i<lines.length; i++) for (var j=0; j<lines.length-i-1; j++)
+                if (algo(lines[j], lines[j+1])) { var temp = lines[j]; lines[j] = lines[j+1]; lines[j+1] = temp; }
+            return lines;
+        }
     }
+	
     function makeRap(row) {
         var hex = row[4];      // Coluna do HEX
         var contentID = row[5]; // Coluna do ContentID
@@ -1596,6 +1614,7 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
 				var btn = document.getElementById('btn-load-more');
 				if(btn) btn.style.display = 'none';
 			}
+			g_renderingHTML = false; // <--- ADICIONE ISSO: Avisa que o HTML acabou
 		}
 	}
 		
@@ -1613,47 +1632,72 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
 	}
 
     function render() {
-		stopRendering();
-		f.send.disabled = DB.length == 0;
-		f.query.placeholder = DB.length + " items found";
-		
-		// Reseta o limite de paginação do PC sempre que filtrar/buscar
-		g_pcRenderLimit = g_pcPageSize; 
-		document.getElementById('btn-load-more').style.display = 'none'; // Esconde botão ao reiniciar
+	stopRendering();
+	g_renderingHTML = true; // Flag para o monitor de tempo
+	f.send.disabled = DB.length == 0;
+	f.query.placeholder = DB.length + " items found";
 	
-		var regionRule = (g_regionFilter == "ALL") ? new RegExp(".*") : new RegExp("^"+g_regionFilter+"$", 'i');
-		var isSearch = (g_letterFilter.length > 0 && g_letterFilter[0] != '^');
-		var letterRule = g_letterFilter == "" ? new RegExp(".*") : new RegExp(g_letterFilter, 'i');
-		
-		// --- ALTERAÇÃO AQUI ---
-		// Se for PS3, mantém o limite estrito de memória (99 ou 1000).
-		// Se for PC, permitimos procurar TUDO (99999), pois faremos a paginação visual depois.
-		var maxResults = isPS3 ? (isSearch ? 99 : 1000) : 99999; 
-		
-		var matches = [];
-		for (var i = 0; i < DB.length && matches.length < maxResults; i++) {
-			var row = DB[i];
-			if (!row[2]) continue;
-			var nameMatches = (g_letterFilter == "" || (isSearch ? (row[2] && letterRule.test(row[2])) || row[0] == g_letterFilter : (row[2] && letterRule.test(row[2]))));
-			var regionMatches = (g_regionFilter == "ALL" || (row[1] && regionRule.test(row[1])));
-			if (nameMatches && regionMatches) matches.push(row);
+	// Reseta o limite de paginação do PC sempre que filtrar/buscar
+	g_pcRenderLimit = g_pcPageSize; 
+	document.getElementById('btn-load-more').style.display = 'none'; // Esconde botão ao reiniciar
+
+	var regionRule = (g_regionFilter == "ALL") ? new RegExp(".*") : new RegExp("^"+g_regionFilter+"$", 'i');
+	var isSearch = (g_letterFilter.length > 0 && g_letterFilter[0] != '^');
+	var letterRule = g_letterFilter == "" ? new RegExp(".*") : new RegExp(g_letterFilter, 'i');
+	
+	// Se for PS3, mantém o limite estrito de memória (99 ou 1000). Se for PC, busca tudo (99999).
+	var maxResults = isPS3 ? (isSearch ? 99 : 1000) : 99999; 
+	
+	var matches = [];
+	for (var i = 0; i < DB.length && matches.length < maxResults; i++) {
+		var row = DB[i];
+		if (!row[2]) continue;
+		var nameMatches = (g_letterFilter == "" || (isSearch ? (row[2] && letterRule.test(row[2])) || row[0] == g_letterFilter : (row[2] && letterRule.test(row[2]))));
+		var regionMatches = (g_regionFilter == "ALL" || (row[1] && regionRule.test(row[1])));
+		if (nameMatches && regionMatches) matches.push(row);
+	}
+	
+	// A função sort() foi corrigida para usar o método nativo do navegador, evitando travamentos no PC.
+	sort(matches, function(a, b) { return a[2] > b[2]; });
+	g_allMatches = matches;
+	
+	// =======================================================
+	// POSIÇÃO CORRETA: AJUSTE DINÂMICO DO CHUNK SIZE NO PS3
+	// =======================================================
+	if (isPS3) {
+	var totalItems = g_allMatches.length; 
+		var chunkSizeIdeal = 200; // O valor vencedor e mais estável (0.76s)
+		var dynamicChunkSize;
+	
+		if (totalItems <= 50) {
+			// Regra 1: Lista Pequena (<= 50). 
+			// Para evitar o overhead, processamos tudo de uma vez.
+			dynamicChunkSize = totalItems > 0 ? totalItems : 1; 
+		} else {
+			// Regra 2: Lista Média/Grande (> 50). 
+			// Usamos o chunk ideal de 200 para maximizar o carregamento e minimizar pausas.
+			// O teste de 453 itens provou que este é o ponto mais rápido.
+			dynamicChunkSize = Math.min(chunkSizeIdeal, totalItems); 
 		}
 		
-		sort(matches, function(a, b) { return a[2] > b[2]; });
-		g_allMatches = matches;
-		g_currentChunkIndex = 0;
-		
-		var list = document.getElementById('list');
-		list.innerHTML = '';
-		list.className = useCoverGUI ? "grid" : "";
-		list.style.cssText = useCoverGUI ? "padding:10px 110px;background:transparent;" : "";
-		
-		renderChunk();
-		
-		var regionText = (g_regionFilter == "ALL") ? "All Regions" : g_regionFilter;
-		// Mostra total real no PC vs limite no PS3
-		document.getElementById('count').textContent = "Displaying " + (isPS3 ? Math.min(matches.length, 1000) : matches.length) + " items | " + regionText;
+		// Aplica o valor dinâmico
+		g_chunkSize = dynamicChunkSize; 
 	}
+	// =======================================================
+
+	g_currentChunkIndex = 0;
+	
+	var list = document.getElementById('list');
+	list.innerHTML = '';
+	list.className = useCoverGUI ? "grid" : "";
+	list.style.cssText = useCoverGUI ? "padding:10px 110px;background:transparent;" : "";
+	
+	renderChunk();
+	
+	var regionText = (g_regionFilter == "ALL") ? "All Regions" : g_regionFilter;
+	// Mostra total real no PC vs limite no PS3
+	document.getElementById('count').textContent = "Displaying " + (isPS3 ? Math.min(matches.length, 1000) : matches.length) + " items | " + regionText;
+}
     
     function checkStartupAlert() {
     if (g_startupAlertMessage) {
@@ -2225,5 +2269,117 @@ function fetchDB() {
 				
 			});
 		</script>
+		
+		<div id="debug-panel" style="position:fixed; top:10px; right:10px; width: 150px; background:rgba(0,0,0,0.9); border:2px solid yellow; color:#fff; padding:8px; z-index:99999; font-size:11px; text-align:center; border-radius:4px; font-family:monospace; display: none;">
+    
+    <div style="font-weight:bold; color:yellow; margin-bottom:5px;">Status Monitor</div>
+    
+    <div style="width:100%; height:15px; background:#333; border:1px solid #fff; position:relative; margin-bottom:8px;">
+        <div id="cpu-bouncer" style="width:15px; height:100%; background:#ff0000; position:absolute; left:0; top:0;"></div>
+    </div>
+    
+    <div id="timer-display" style="font-size:14px; font-weight:bold; color:#fff; margin: 5px 0; border:1px solid #555; padding:2px;">
+        0.00s
+    </div>
+
+    <div style="text-align:left; padding-left:5px; margin-bottom:5px; border-bottom:1px solid #555; padding-bottom:5px;">
+        HTML: <span id="stat-html" style="color:#aaa">Idle</span><br>
+        Queue: <span id="stat-queue" style="color:#aaa">0</span><br>
+        Active DL: <span id="stat-active" style="color:#aaa">0</span>
+    </div>
+    
+    <div style="display:flex; justify-content:space-between; margin-bottom:8px;">
+        <div style="width:48%;">
+            <div style="font-size:9px; color:#aaa; margin-bottom:2px;">CHUNK</div>
+            <input type="number" id="inp-chunk" value="20" style="width:100%; text-align:center; font-weight:bold;">
+        </div>
+        <div style="width:48%;">
+            <div style="font-size:9px; color:#aaa; margin-bottom:2px;">PARALLEL</div>
+            <input type="number" id="inp-parallel" value="24" style="width:100%; text-align:center; font-weight:bold;">
+        </div>
+    </div>
+    
+    <button onclick="applyDebug()" style="width:100%; padding:5px; background:yellow; color:black; font-weight:bold; cursor:pointer; border:1px solid #fff;">START TEST</button>
+</div>
+
+<script>
+    // --- LÓGICA DE ATIVAÇÃO CONDICIONAL ---
+    function isDebugMode() {
+        // Verifica se a URL contém "?debug" ou "&debug"
+        return window.location.href.indexOf('debug') > -1;
+    }
+
+    if (isDebugMode()) {
+        // Se a tag 'debug' estiver na URL, mostra o painel.
+        document.getElementById('debug-panel').style.display = 'block';
+    }
+
+    // --- ANIMAÇÃO CPU (Bouncer) ---
+    var bouncer = document.getElementById('cpu-bouncer');
+    var bouncerPos = 0;
+    var bouncerDir = 3;
+    function animateBouncer() {
+        bouncerPos += bouncerDir;
+        if (bouncerPos > (135) || bouncerPos < 0) bouncerDir *= -1;
+        bouncer.style.left = bouncerPos + "px";
+        setTimeout(animateBouncer, 30);
+    }
+    animateBouncer();
+
+    // --- LÓGICA DO TIMER ---
+    // Preenche inputs com valores iniciais (Garante que se o modo debug for ligado, ele use as configs atuais)
+    document.getElementById('inp-chunk').value = window.g_chunkSize || 20;
+    document.getElementById('inp-parallel').value = window.MAX_PARALLEL_LOADS || 24;
+    
+    var benchInterval = null;
+    var startTime = 0;
+
+    function applyDebug() {
+        // 1. Aplica Configs
+        window.g_chunkSize = parseInt(document.getElementById('inp-chunk').value);
+        window.MAX_PARALLEL_LOADS = parseInt(document.getElementById('inp-parallel').value);
+        
+        // 2. Reseta tudo (usando as variáveis globais do seu script)
+        if (typeof cancelAllDownloads === 'function') cancelAllDownloads();
+        if (benchInterval) clearInterval(benchInterval);
+        
+        // 3. Inicia Renderização
+        if (typeof render === 'function') render(); 
+        
+        // 4. Inicia Monitoramento
+        startTime = new Date().getTime();
+        document.getElementById('timer-display').style.color = "yellow";
+        document.getElementById('timer-display').innerHTML = "Running...";
+        
+        benchInterval = setInterval(monitorLoop, 100);
+    }
+
+    function monitorLoop() {
+        // Pega o estado atual das variáveis globais do seu script
+        var isHTML = window.g_renderingHTML;
+        var queue = window.g_imgQueue ? window.g_imgQueue.length : 0;
+        var active = window.g_activeDownloads || 0;
+        
+        // Atualiza visual
+        document.getElementById('stat-html').innerHTML = isHTML ? "BUSY" : "Done";
+        document.getElementById('stat-html').style.color = isHTML ? "red" : "#00ff00";
+        
+        document.getElementById('stat-queue').innerHTML = queue;
+        document.getElementById('stat-active').innerHTML = active;
+        
+        // Atualiza tempo
+        var now = new Date().getTime();
+        var currentSec = ((now - startTime) / 1000).toFixed(2);
+        document.getElementById('timer-display').innerHTML = currentSec + "s";
+
+        // Condição de Vitória
+        if (!isHTML && queue === 0 && active === 0) {
+            clearInterval(benchInterval);
+            document.getElementById('timer-display').style.color = "#00ff00";
+            document.getElementById('timer-display').innerHTML = "DONE: " + currentSec + "s";
+        }
+    }
+</script>
+
    </body>
 </html>
