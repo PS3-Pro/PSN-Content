@@ -1428,7 +1428,7 @@ If this happens, right-click the game button, select 'Save link as', and manuall
         var list = document.getElementById('list');
         var chunk = g_allMatches.slice(g_currentChunkIndex, g_currentChunkIndex + g_chunkSize);
         
-        // 1. Prepara o Array (Mais rápido que String no PS3)
+        // 1. Prepara o Array
         var chunkArray = [];
         
         if (chunk.length === 0) { 
@@ -1438,19 +1438,23 @@ If this happens, right-click the game button, select 'Save link as', and manuall
             return; 
         }
         
-        // 2. Monta o HTML
-        for (var i = 0; i < chunk.length; i++) {
-            var a = chunk[i];
-            if (!a[3] || a[3] === "MISSING") continue;
+        // === OTIMIZAÇÃO: SEPARAÇÃO DE LOOPS ===
+        // Removemos a pergunta "if (useCoverGUI)" de dentro do loop.
+        // Agora o processador entra no trilho e corre sem parar.
+        
+        if (useCoverGUI) {
+            // --- LOOP ESPECÍFICO PARA GRID (CAPAS) ---
+            var lazyClass = isPS3 ? "lazy-ps3" : "";
             
-            var size = formatFileSize(a[a.length-1] || a[a.length-2] || "");
-            var cid = a[0], name = a[2];
-            
-            if (useCoverGUI) {
-                // Modo Grid (Capas)
+            for (var i = 0; i < chunk.length; i++) {
+                var a = chunk[i];
+                // Verificação rápida de erro/missing
+                if (!a[3] || a[3] === "MISSING") continue;
+                
+                var size = formatFileSize(a[a.length-1] || a[a.length-2] || "");
+                var cid = a[0], name = a[2];
                 var uniqueIndex = g_currentChunkIndex + i; 
                 var tileId = "img_" + cid + "_" + uniqueIndex; 
-                var lazyClass = isPS3 ? "lazy-ps3" : "";
                 
                 chunkArray.push(
                     '<div class="game-tile">',
@@ -1461,8 +1465,16 @@ If this happens, right-click the game button, select 'Save link as', and manuall
                         '<div class="links"><a href="', a[3], '" class="pkg-btn">PKG</a> ', makeRap(a), '</div>',
                     '</div>'
                 );
-            } else {
-                // Modo Lista (Texto)
+            }
+        } else {
+            // --- LOOP ESPECÍFICO PARA LISTA (TEXTO) ---
+            for (var i = 0; i < chunk.length; i++) {
+                var a = chunk[i];
+                if (!a[3] || a[3] === "MISSING") continue;
+                
+                var size = formatFileSize(a[a.length-1] || a[a.length-2] || "");
+                var cid = a[0], name = a[2];
+                
                 chunkArray.push(
                     '<li>',
                         name, ' <span style="color: #ffff00;">[', cid, ']</span> ', size, 
@@ -1472,25 +1484,30 @@ If this happens, right-click the game button, select 'Save link as', and manuall
             }
         }
         
-        // 3. Injeta na tela (Otimizado)
+        // 2. Injeta na tela
         if (chunkArray.length > 0) {
             list.insertAdjacentHTML('beforeend', chunkArray.join(''));
         }
         
-        // 4. Acorda o Carregador de Imagens
+        // OTIMIZAÇÃO DE MEMÓRIA: Avisa que pode limpar o array agora
+        chunkArray = null; 
+        
+        // 3. Acorda o Carregador de Imagens
         if (useCoverGUI) {
            if (isPS3) { 
-               // [PS3] Debounce para não travar enquanto a lista cresce
                if (g_scrollTimer) clearTimeout(g_scrollTimer);
                g_scrollTimer = setTimeout(checkVisibility, 300); 
            } else { 
-               // [PC] Carrega imediatamente (Multitarefa)
+               // No PC, carregamos direto no loop para ser instantâneo
+               // Precisamos refazer um loop pequeno aqui só para os IDs
                for(var i=0; i<chunk.length; i++) { 
                    var r = chunk[i]; 
                    if(r[3] && r[3] !== "MISSING") { 
                        var uniqueIndex = g_currentChunkIndex + i;
                        var uniqueTileId = "img_" + r[0] + "_" + uniqueIndex;
+                       // Pequeno closure para proteger o escopo
                        (function(tid, c){ 
+                           // setTimeout 0 tira da thread principal e evita travamento da UI
                            setTimeout(function(){ loadCoverSequence(tid, c); }, 0); 
                        })(uniqueTileId, r[0]); 
                    } 
@@ -1498,7 +1515,7 @@ If this happens, right-click the game button, select 'Save link as', and manuall
            }
         }
         
-        // 5. Continua o Loop para o próximo pedaço
+        // 4. Próximo pedaço
         g_currentChunkIndex += g_chunkSize;
         
         if (g_currentChunkIndex < g_allMatches.length) { 
