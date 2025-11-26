@@ -1202,128 +1202,122 @@ If this happens, right-click the game button, select 'Save link as', and manuall
     // ==============================================================
     // 6. LAZY LOADING (ANTI-CRASH) (Código inalterado)
     // ==============================================================
-		var g_scrollTimer = null;
-		
-		function processImageQueue() {
-		// Se já tem muita gente baixando ou a fila está vazia, pare.
-		if (g_activeDownloads >= MAX_PARALLEL_LOADS || g_imgQueue.length === 0) return;
-	
-		// Pega o próximo da fila
-		var nextItem = g_imgQueue.shift();
-		g_activeDownloads++;
-	
-		// Chama a função original de carregar a capa
-		// Mas precisamos injetar um callback para saber quando terminou
-		loadCoverSequenceInternal(nextItem.imgID, nextItem.cid, function() {
-			// Quando terminar (sucesso ou erro), libera a vaga
-			g_activeDownloads--;
-			processImageQueue(); // Chama o próximo
-		});
-		
-		// Tenta iniciar mais um slot se houver espaço
-		processImageQueue();
-	}
+	var g_scrollTimer = null;
+    
+    // Função que processa a fila de downloads (um por um ou em lotes)
+    function processImageQueue() {
+        // Se já tem muita gente baixando ou a fila está vazia, pare.
+        if (g_activeDownloads >= MAX_PARALLEL_LOADS || g_imgQueue.length === 0) return;
 
-		function checkPS3Visibility() {
-		var imgs = document.querySelectorAll('.game-tile img');
-		
-		// --- LÓGICA DE DETECÇÃO DE SCROLL ---
-		var scrollY = 0;
-		var contentDiv = document.querySelector('.content');
-		
-		// Roda tanto no PS3 quanto no PC
-		if (contentDiv && (isPS3 || document.body.className.indexOf('is-pc') !== -1)) {
-			scrollY = contentDiv.scrollTop; 
-		} else {
-			scrollY = window.pageYOffset;
-		}
-		// ----------------------------------
-		
-		var viewH = window.innerHeight;
-		
-		var loadBuffer = isPS3 ? 400 : 3000; 
-		
-		// 2. ONDE APAGAR? (Buffers de limpeza)
-		// Só usados no PS3. No PC isso será ignorado.
-		var unloadBufferTop = 1200; 
-		var unloadBufferBottom = 800;
-	
-		// Calcula área de carga
-		var loadTop = scrollY - loadBuffer;
-		var loadBottom = scrollY + viewH + loadBuffer;
-	
-		// Calcula área de limpeza (Apenas PS3)
-		var keepTop = scrollY - unloadBufferTop;
-		var keepBottom = scrollY + viewH + unloadBufferBottom;
-	
-		for (var i = 0; i < imgs.length; i++) {
-		var img = imgs[i];
-		if (!img.offsetParent) continue;
-		
-		var yPos = 0; 
-		var el = img;
-		
-		// Calcula posição real
-		while(el && el !== contentDiv && el !== document.body) {
-			yPos += el.offsetTop;
-			el = el.offsetParent;
-		}
-		
-		// === LÓGICA DE CARREGAMENTO (PC e PS3) ===
-		// No PC, como o buffer é 3000, isso acontece muito rápido e muito antes.
-		if (yPos >= loadTop && yPos <= loadBottom) {
-			if (img.src === defaultCover) { 
-				var cid = img.getAttribute('data-cid'); 
-				
-				// No PC, a fila é super rápida (10 downloads por vez).
-				// No PS3, a fila segura a onda (3 downloads por vez).
-				loadCoverSequence(img.id, cid); 
-			}
-		} 
-		
-		// === LÓGICA DE LIMPEZA (SÓ PS3!!!) ===
-		// O "&& isPS3" aqui garante que no PC a imagem NUNCA será apagada.
-		// Se você rolar para cima no PC, a imagem já estará lá instantaneamente.
-		else if (isPS3 && (yPos < keepTop || yPos > keepBottom)) {
-			if (img.src !== defaultCover) { 
-				img.removeAttribute('data-queued'); 
-				img.src = defaultCover; // Economiza memória RAM do PS3
-			}
-		}
-		}
-	}
-         
-         function attachScrollListener() {
-             // Ouve o scroll da div de conteúdo (PC/PS3)
-             var contentDiv = document.querySelector('.content');
-             if(contentDiv) {
-                 contentDiv.onscroll = function() {
-                     if(useCoverGUI) {
-                         if (g_scrollTimer) clearTimeout(g_scrollTimer);
-                         g_scrollTimer = setTimeout(checkPS3Visibility, 200);
-                     }
-                 };
-             }
-             
-             // Ouve o scroll da janela (Mobile)
-             window.onscroll = function() {
-                 // Só executa se NÃO for o modo App (ou seja, se for mobile)
-                 if(useCoverGUI && !isPS3 && document.body.className.indexOf('is-pc') === -1) {
-                     if (g_scrollTimer) clearTimeout(g_scrollTimer);
-                     g_scrollTimer = setTimeout(checkPS3Visibility, 200);
-                 }
-             };
-         }
-		 
-    if (isPS3) {
-        window.onscroll = function() {
-            if (useCoverGUI) {
-                if (g_scrollTimer) clearTimeout(g_scrollTimer);
-                g_scrollTimer = setTimeout(checkPS3Visibility, 200);	
-            }
-        };
+        // Pega o próximo da fila
+        var nextItem = g_imgQueue.shift();
+        g_activeDownloads++;
+
+        // Chama a função interna de carregar (que você já definiu antes)
+        loadCoverSequenceInternal(nextItem.imgID, nextItem.cid, function() {
+            // Callback: Quando terminar (sucesso ou erro), libera a vaga
+            g_activeDownloads--;
+            processImageQueue(); // Tenta puxar o próximo imediatamente
+        });
+        
+        // Tenta iniciar mais um slot paralelo se houver espaço (Multi-thread fake)
+        processImageQueue();
     }
 
+    // Função Principal: Decide o que carregar e o que apagar
+    function checkPS3Visibility() {
+        
+        // [OTIMIZAÇÃO DE SCROLL] 
+        // Se essa função rodou, é porque o usuário parou de rolar em um lugar novo.
+        // Jogamos fora qualquer pedido antigo que ainda não começou a baixar.
+        g_imgQueue = []; 
+        
+        var imgs = document.querySelectorAll('.game-tile img');
+        
+        // 1. Descobre onde estamos na página
+        var scrollY = 0;
+        var contentDiv = document.querySelector('.content');
+        
+        if (contentDiv && (isPS3 || document.body.className.indexOf('is-pc') !== -1)) {
+            scrollY = contentDiv.scrollTop; 
+        } else {
+            scrollY = window.pageYOffset;
+        }
+        
+        var viewH = window.innerHeight;
+        
+        // 2. Define as distâncias de visão
+        // PS3: Olha perto (400px) para economizar.
+        // PC: Olha longe (3000px) para deixar fluido.
+        var loadBuffer = isPS3 ? 400 : 3000; 
+        
+        // 3. Define as distâncias de limpeza (SÓ PS3)
+        var unloadBufferTop = 1200; 
+        var unloadBufferBottom = 800;
+
+        // Calcula as coordenadas
+        var loadTop = scrollY - loadBuffer;
+        var loadBottom = scrollY + viewH + loadBuffer;
+        var keepTop = scrollY - unloadBufferTop;
+        var keepBottom = scrollY + viewH + unloadBufferBottom;
+
+        for (var i = 0; i < imgs.length; i++) {
+            var img = imgs[i];
+            if (!img.offsetParent) continue;
+            
+            var yPos = 0; 
+            var el = img;
+            
+            // Calcula posição Y real do elemento
+            while(el && el !== contentDiv && el !== document.body) {
+                yPos += el.offsetTop;
+                el = el.offsetParent;
+            }
+            
+            // === A. CARREGAR (PC e PS3) ===
+            if (yPos >= loadTop && yPos <= loadBottom) {
+                if (img.src === defaultCover) { 
+                    var cid = img.getAttribute('data-cid'); 
+                    // Adiciona na fila (A fila decide a velocidade baseada no sistema)
+                    loadCoverSequence(img.id, cid); 
+                }
+            } 
+            
+            // === B. APAGAR (SÓ PS3!!!) ===
+            // O PC ignora isso completamente
+            else if (isPS3 && (yPos < keepTop || yPos > keepBottom)) {
+                if (img.src !== defaultCover) { 
+                    img.removeAttribute('data-queued'); 
+                    img.src = defaultCover; // Libera RAM
+                }
+            }
+        }
+    }
+         
+    // Listener inteligente que aguarda você parar de mexer
+    function attachScrollListener() {
+        var contentDiv = document.querySelector('.content');
+
+        var onScrollHandler = function() {
+            if (!useCoverGUI) return; 
+
+            // Reseta o timer se o usuário ainda está mexendo
+            if (g_scrollTimer) clearTimeout(g_scrollTimer);
+
+            // [DEBOUNCE]
+            // PC: 100ms (Reage rápido)
+            // PS3: 600ms (Espera você soltar o controle para não travar a CPU)
+            var delay = isPS3 ? 600 : 100;
+
+            g_scrollTimer = setTimeout(checkPS3Visibility, delay);
+        };
+
+        // Aplica no container correto
+        if (contentDiv) {
+            contentDiv.onscroll = onScrollHandler;
+        }
+        window.onscroll = onScrollHandler;
+    }
     // ==============================================================
     // 7. RENDERIZAÇÃO E UI
     // ==============================================================
