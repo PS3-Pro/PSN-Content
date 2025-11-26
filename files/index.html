@@ -839,8 +839,8 @@ If this happens, right-click the game button, select 'Save link as', and manuall
 	// CONFIGURAÇÃO DA FILA DE IMAGENS
 	var g_imgQueue = [];          // Fila de espera
 	var g_activeDownloads = 0;    // Quantos estão baixando agora
-	var MAX_PARALLEL_LOADS = 3;   // No PS3, 2 ou 3 é o ideal. No PC pode ser 10.
-	if (!isPS3) MAX_PARALLEL_LOADS = 10;
+	var MAX_PARALLEL_LOADS = 4;   // No PS3, 2 ou 3 é o ideal. No PC pode ser 10.
+	if (!isPS3) MAX_PARALLEL_LOADS = 24;
     
     // Cache Settings
     var CACHE_VERSION = "v1.0";
@@ -1225,64 +1225,73 @@ If this happens, right-click the game button, select 'Save link as', and manuall
 	}
 
 		function checkPS3Visibility() {
-            var imgs = document.querySelectorAll('.game-tile img');
-            
-            // --- CORREÇÃO AQUI ---
-            // Descobre quem está rolando: A div .content (PC/PS3) ou a Janela (Mobile)
-            var scrollY = 0;
-            var contentDiv = document.querySelector('.content');
-            
-            // Se estamos no modo App (PC/PS3), o scroll é interno
-            if (contentDiv && (isPS3 || document.body.className.indexOf('is-pc') !== -1)) {
-                 scrollY = contentDiv.scrollTop; 
-            } else {
-                 // Se estamos no celular, o scroll é da janela
-                 scrollY = window.pageYOffset;
-            }
-            // ---------------------
-            
-            var viewH = window.innerHeight;
-            
-            // Distâncias de segurança (Buffers)
-            var loadBuffer = 1200; 
-            var unloadBufferTop = 3000; 
-            var unloadBufferBottom = 1500;
-
-            // Calcula a área visível baseada no scroll correto
-            var loadTop = scrollY - loadBuffer;
-            var loadBottom = scrollY + viewH + loadBuffer;
-            var keepTop = scrollY - unloadBufferTop;
-            var keepBottom = scrollY + viewH + unloadBufferBottom;
-
-            for (var i = 0; i < imgs.length; i++) {
-               var img = imgs[i];
-               if (!img.offsetParent) continue;
-               
-               // Calcula a posição Y da imagem
-               var yPos = 0; 
-               var el = img;
-               
-               // Soma os offsets até chegar no container de rolagem ou no topo do documento
-               while(el && el !== contentDiv && el !== document.body) {
-                   yPos += el.offsetTop;
-                   el = el.offsetParent;
-               }
-               
-               // 1. Carregar se entrou na área
-               if (yPos >= loadTop && yPos <= loadBottom) {
-                  if (img.src === defaultCover) { 
-                      var cid = img.getAttribute('data-cid'); 
-                      loadCoverSequence(img.id, cid); 
-                  }
-               } 
-               // 2. Destruir se saiu muito da área (Economia de RAM)
-               else if (yPos < keepTop || yPos > keepBottom) {
-                  if (img.src !== defaultCover) { 
-                      img.src = defaultCover; 
-                  }
-               }
-            }
-         }
+		var imgs = document.querySelectorAll('.game-tile img');
+		
+		// --- LÓGICA DE DETECÇÃO DE SCROLL ---
+		var scrollY = 0;
+		var contentDiv = document.querySelector('.content');
+		
+		// Roda tanto no PS3 quanto no PC
+		if (contentDiv && (isPS3 || document.body.className.indexOf('is-pc') !== -1)) {
+			scrollY = contentDiv.scrollTop; 
+		} else {
+			scrollY = window.pageYOffset;
+		}
+		// ----------------------------------
+		
+		var viewH = window.innerHeight;
+		
+		var loadBuffer = isPS3 ? 400 : 3000; 
+		
+		// 2. ONDE APAGAR? (Buffers de limpeza)
+		// Só usados no PS3. No PC isso será ignorado.
+		var unloadBufferTop = 3000; 
+		var unloadBufferBottom = 1500;
+	
+		// Calcula área de carga
+		var loadTop = scrollY - loadBuffer;
+		var loadBottom = scrollY + viewH + loadBuffer;
+	
+		// Calcula área de limpeza (Apenas PS3)
+		var keepTop = scrollY - unloadBufferTop;
+		var keepBottom = scrollY + viewH + unloadBufferBottom;
+	
+		for (var i = 0; i < imgs.length; i++) {
+		var img = imgs[i];
+		if (!img.offsetParent) continue;
+		
+		var yPos = 0; 
+		var el = img;
+		
+		// Calcula posição real
+		while(el && el !== contentDiv && el !== document.body) {
+			yPos += el.offsetTop;
+			el = el.offsetParent;
+		}
+		
+		// === LÓGICA DE CARREGAMENTO (PC e PS3) ===
+		// No PC, como o buffer é 3000, isso acontece muito rápido e muito antes.
+		if (yPos >= loadTop && yPos <= loadBottom) {
+			if (img.src === defaultCover) { 
+				var cid = img.getAttribute('data-cid'); 
+				
+				// No PC, a fila é super rápida (10 downloads por vez).
+				// No PS3, a fila segura a onda (3 downloads por vez).
+				loadCoverSequence(img.id, cid); 
+			}
+		} 
+		
+		// === LÓGICA DE LIMPEZA (SÓ PS3!!!) ===
+		// O "&& isPS3" aqui garante que no PC a imagem NUNCA será apagada.
+		// Se você rolar para cima no PC, a imagem já estará lá instantaneamente.
+		else if (isPS3 && (yPos < keepTop || yPos > keepBottom)) {
+			if (img.src !== defaultCover) { 
+				img.removeAttribute('data-queued'); 
+				img.src = defaultCover; // Economiza memória RAM do PS3
+			}
+		}
+		}
+	}
          
          function attachScrollListener() {
              // Ouve o scroll da div de conteúdo (PC/PS3)
