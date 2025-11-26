@@ -912,7 +912,7 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
     var isPS3 = /PS3|PlayStation 3|NetFront/i.test(navigator.userAgent) || window.location.search.indexOf("mode=ps3") > -1;
     
     var g_allMatches = [];
-    var g_chunkSize = isPS3 ? 200 : 2000;
+    var g_chunkSize = isPS3 ? 200 : 1000;
     var g_currentChunkIndex = 0;
 	
 	var g_renderingHTML = false;
@@ -1614,7 +1614,7 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
 				var btn = document.getElementById('btn-load-more');
 				if(btn) btn.style.display = 'none';
 			}
-			g_renderingHTML = false; // <--- ADICIONE ISSO: Avisa que o HTML acabou
+			g_renderingHTML = false;
 		}
 	}
 		
@@ -1629,75 +1629,101 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
 		
 		// Continua a renderização de onde parou
 		renderChunk();
+		
+		// =======================================================
+		// >>> AJUSTE: ATUALIZAÇÃO DO CONTADOR APÓS CARREGAR MAIS <<<
+		// =======================================================
+		var totalMatches = g_allMatches.length;
+		
+		// O novo número de exibição é o mínimo entre o limite atual de renderização (g_pcRenderLimit) e o total
+		var newDisplayCount = Math.min(totalMatches, g_pcRenderLimit); 
+		
+		var regionText = (g_regionFilter == "ALL") ? "All Regions" : g_regionFilter;
+		
+		document.getElementById('count').textContent = "Displaying " + newDisplayCount + " items | " + regionText;
 	}
 
     function render() {
-	stopRendering();
-	g_renderingHTML = true; // Flag para o monitor de tempo
-	f.send.disabled = DB.length == 0;
-	f.query.placeholder = DB.length + " items found";
+		stopRendering();
+		g_renderingHTML = true; // Flag para o monitor de tempo
+		f.send.disabled = DB.length == 0;
+		f.query.placeholder = DB.length + " items found";
+		
+		// Reseta o limite de paginação do PC sempre que filtrar/buscar
+		g_pcRenderLimit = g_pcPageSize; 
+		document.getElementById('btn-load-more').style.display = 'none'; // Esconde botão ao reiniciar
 	
-	// Reseta o limite de paginação do PC sempre que filtrar/buscar
-	g_pcRenderLimit = g_pcPageSize; 
-	document.getElementById('btn-load-more').style.display = 'none'; // Esconde botão ao reiniciar
-
-	var regionRule = (g_regionFilter == "ALL") ? new RegExp(".*") : new RegExp("^"+g_regionFilter+"$", 'i');
-	var isSearch = (g_letterFilter.length > 0 && g_letterFilter[0] != '^');
-	var letterRule = g_letterFilter == "" ? new RegExp(".*") : new RegExp(g_letterFilter, 'i');
-	
-	// Se for PS3, mantém o limite estrito de memória (99 ou 1000). Se for PC, busca tudo (99999).
-	var maxResults = isPS3 ? (isSearch ? 99 : 1000) : 99999; 
-	
-	var matches = [];
-	for (var i = 0; i < DB.length && matches.length < maxResults; i++) {
-		var row = DB[i];
-		if (!row[2]) continue;
-		var nameMatches = (g_letterFilter == "" || (isSearch ? (row[2] && letterRule.test(row[2])) || row[0] == g_letterFilter : (row[2] && letterRule.test(row[2]))));
-		var regionMatches = (g_regionFilter == "ALL" || (row[1] && regionRule.test(row[1])));
-		if (nameMatches && regionMatches) matches.push(row);
-	}
-	
-	// A função sort() foi corrigida para usar o método nativo do navegador, evitando travamentos no PC.
-	sort(matches, function(a, b) { return a[2] > b[2]; });
-	g_allMatches = matches;
-	
-	// =======================================================
-	// POSIÇÃO CORRETA: AJUSTE DINÂMICO DO CHUNK SIZE NO PS3
-	// =======================================================
-	if (isPS3) {
-	var totalItems = g_allMatches.length; 
-		var chunkSizeIdeal = 200; // O valor vencedor e mais estável (0.76s)
-		var dynamicChunkSize;
-	
-		if (totalItems <= 50) {
-			// Regra 1: Lista Pequena (<= 50). 
-			// Para evitar o overhead, processamos tudo de uma vez.
-			dynamicChunkSize = totalItems > 0 ? totalItems : 1; 
-		} else {
-			// Regra 2: Lista Média/Grande (> 50). 
-			// Usamos o chunk ideal de 200 para maximizar o carregamento e minimizar pausas.
-			// O teste de 453 itens provou que este é o ponto mais rápido.
-			dynamicChunkSize = Math.min(chunkSizeIdeal, totalItems); 
+		var regionRule = (g_regionFilter == "ALL") ? new RegExp(".*") : new RegExp("^"+g_regionFilter+"$", 'i');
+		var isSearch = (g_letterFilter.length > 0 && g_letterFilter[0] != '^');
+		var letterRule = g_letterFilter == "" ? new RegExp(".*") : new RegExp(g_letterFilter, 'i');
+		
+		// Define o limite de quantos itens serão COLETADOS.
+		// PS3: Limite estrito de 99 ou 1000.
+		// PC: Coleta 99999 (virtualmente todos) para habilitar a paginação.
+		var maxCollectLimit = isPS3 ? (isSearch ? 99 : 1000) : 99999; 
+		
+		var matches = [];
+		for (var i = 0; i < DB.length && matches.length < maxCollectLimit; i++) {
+			var row = DB[i];
+			if (!row[2]) continue;
+			var nameMatches = (g_letterFilter == "" || (isSearch ? (row[2] && letterRule.test(row[2])) || row[0] == g_letterFilter : (row[2] && letterRule.test(row[2]))));
+			var regionMatches = (g_regionFilter == "ALL" || (row[1] && regionRule.test(row[1])));
+			if (nameMatches && regionMatches) matches.push(row);
 		}
 		
-		// Aplica o valor dinâmico
-		g_chunkSize = dynamicChunkSize; 
+		// A função sort() foi corrigida para usar o método nativo do navegador, evitando travamentos no PC.
+		sort(matches, function(a, b) { return a[2] > b[2]; });
+		g_allMatches = matches;
+		
+		// =======================================================
+		// POSIÇÃO CORRETA: AJUSTE DINÂMICO DO CHUNK SIZE NO PS3
+		// =======================================================
+		if (isPS3) {
+		var totalItems = g_allMatches.length; 
+			var chunkSizeIdeal = 200; // O valor vencedor e mais estável (0.76s)
+			var dynamicChunkSize;
+		
+			if (totalItems <= 50) {
+				// Regra 1: Lista Pequena (<= 50). 
+				// Para evitar o overhead, processamos tudo de uma vez.
+				dynamicChunkSize = totalItems > 0 ? totalItems : 1; 
+			} else {
+				// Regra 2: Lista Média/Grande (> 50). 
+				// Usamos o chunk ideal de 200 para maximizar o carregamento e minimizar pausas.
+				// O teste de 453 itens provou que este é o ponto mais rápido.
+				dynamicChunkSize = Math.min(chunkSizeIdeal, totalItems); 
+			}
+			
+			// Aplica o valor dinâmico
+			g_chunkSize = dynamicChunkSize; 
+		}
+		// =======================================================
+	
+		g_currentChunkIndex = 0;
+		
+		var list = document.getElementById('list');
+		list.innerHTML = '';
+		list.className = useCoverGUI ? "grid" : "";
+		list.style.cssText = useCoverGUI ? "padding:10px 110px;background:transparent;" : "";
+		
+		renderChunk();
+		
+		var regionText = (g_regionFilter == "ALL") ? "All Regions" : g_regionFilter;
+		
+		// === CÁLCULO PARA EXIBIÇÃO ===
+		var displayCount;
+	
+		if (isPS3) {
+			// PS3: Mostra o total coletado (máximo 1000)
+			displayCount = matches.length;
+		} else {
+			// PC: Mostra o mínimo entre o limite de renderização (1000) e o total da lista.
+			displayCount = Math.min(matches.length, g_pcRenderLimit);
+		}
+	
+		// Mostra o número de itens ATUALMENTE exibidos
+		document.getElementById('count').textContent = "Displaying " + displayCount + " items | " + regionText;
 	}
-	// =======================================================
-
-	g_currentChunkIndex = 0;
-	
-	var list = document.getElementById('list');
-	list.innerHTML = '';
-	list.className = useCoverGUI ? "grid" : "";
-	list.style.cssText = useCoverGUI ? "padding:10px 110px;background:transparent;" : "";
-	
-	renderChunk();
-	
-	var regionText = (g_regionFilter == "ALL") ? "All Regions" : g_regionFilter;
-	// Mostra total real no PC vs limite no PS3
-	document.getElementById('count').textContent = "Displaying " + (isPS3 ? Math.min(matches.length, 1000) : matches.length) + " items | " + regionText;
-}
     
     function checkStartupAlert() {
     if (g_startupAlertMessage) {
@@ -1815,6 +1841,8 @@ function fetchDB() {
                saveToCache(currentCategory, cacheAccumulator);
                cacheAccumulator = ""; // Limpa memória imediatamente
            }
+		   
+		   
 
            if (window.localStorage) f.fetch.disabled = false;
            render();
@@ -1869,15 +1897,11 @@ function fetchDB() {
         document.getElementById("cover-gui").onclick = function() {
 			stopRendering();
 			
-			// === OTIMIZAÇÃO NOVA ===
-			// Se estamos trocando de visualização, PARE TUDO imediatamente.
-			// Isso impede que o PS3 continue baixando imagens se você foi para o modo Lista.
 			if (isPS3) {
-				cancelAllDownloads(); // Corta a internet das imagens
-				g_imgQueue = [];      // Limpa a fila de espera
+				cancelAllDownloads();
+				g_imgQueue = [];
 			}
-			// =======================
-	
+
 			useCoverGUI = this.checked;
 			
 			saveUIState(); 
