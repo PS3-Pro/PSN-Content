@@ -838,8 +838,9 @@ If this happens, right-click the game button, select 'Save link as', and manuall
 	
 	// CONFIGURAÇÃO DA FILA DE IMAGENS
 	var g_imgQueue = [];          // Fila de espera
+	var g_currentLoaders = []; //Lista dos "operários" baixando
 	var g_activeDownloads = 0;    // Quantos estão baixando agora
-	var MAX_PARALLEL_LOADS = 5;   // PS3
+	var MAX_PARALLEL_LOADS = 6;   // PS3
 	if (!isPS3) MAX_PARALLEL_LOADS = 24; // PC
     
     // Cache Settings
@@ -1147,9 +1148,22 @@ If this happens, right-click the game button, select 'Save link as', and manuall
 		var primaryURL = isPS3 ? ghDirectPS3 : ghDirectPC;
 	
 		var att1 = new Image();
+        
+        // ADICIONA NA LISTA DE "ALVOS" PARA CANCELAR
+        g_currentLoaders.push(att1); 
 		
-		// Função auxiliar para finalizar e chamar o callback
+        // Função auxiliar para remover da lista e finalizar
 		function finish() {
+            // Remove este download específico da lista de ativos
+            var idx = g_currentLoaders.indexOf(att1);
+            if (idx > -1) g_currentLoaders.splice(idx, 1);
+            
+            // Remove também o loader secundário (att2) se existir
+            if (typeof att2 !== 'undefined') {
+                 var idx2 = g_currentLoaders.indexOf(att2);
+                 if (idx2 > -1) g_currentLoaders.splice(idx2, 1);
+            }
+
 			if(onComplete) onComplete();
 		}
 	
@@ -1158,18 +1172,23 @@ If this happens, right-click the game button, select 'Save link as', and manuall
 			var el = document.getElementById(imgID); 
 			if(el) {
 				el.src = primaryURL;
-				el.removeAttribute('data-queued'); // Marca como feito
+				el.removeAttribute('data-queued'); 
 			}
 			finish();
 		};
 	
 		att1.onerror = function() {
 			if (g_renderID != currentID) { finish(); return; }
-			// Tenta SONY
+			
+            // Tenta SONY
 			try {
 				var hash = generateSonyHash(cid);
 				var sonyDirect = "http://tmdb.np.dl.playstation.net/tmdb/" + hash + "/ICON0.PNG";
-				var att2 = new Image();
+				var att2 = new Image(); // Var local, mas acessível pelo finish()
+                
+                // Adiciona o segundo loader na lista também
+                g_currentLoaders.push(att2);
+
 				att2.onload = function() {
 					if (g_renderID != currentID) { finish(); return; }
 					var el = document.getElementById(imgID); 
@@ -1179,7 +1198,7 @@ If this happens, right-click the game button, select 'Save link as', and manuall
 					}
 					finish();
 				};
-				att2.onerror = function() { finish(); }; // Falhou nos dois
+				att2.onerror = function() { finish(); }; 
 				att2.src = sonyDirect;
 			} catch(e) { finish(); }
 		};
@@ -1190,19 +1209,37 @@ If this happens, right-click the game button, select 'Save link as', and manuall
 	// Esta função antiga agora apenas adiciona na fila!
 	function loadCoverSequence(imgID, cid) {
 		// Verifica se já está na fila ou baixando para não duplicar
-		var el = document.getElementById(imgID);
-		if(el && el.getAttribute('data-queued') === 'true') return;
-		
-		if(el) el.setAttribute('data-queued', 'true');
-	
-		g_imgQueue.push({ imgID: imgID, cid: cid });
-		processImageQueue();
-	}
+        var el = document.getElementById(imgID);
+        if(el && el.getAttribute('data-queued') === 'true') return;
+        if(el) el.setAttribute('data-queued', 'true');
+        g_imgQueue.push({ imgID: imgID, cid: cid });
+        processImageQueue();
+    }
 
     // ==============================================================
     // 6. LAZY LOADING (ANTI-CRASH) (Código inalterado)
     // ==============================================================
 	var g_scrollTimer = null;
+	
+	// Função para ABORTAR downloads em andamento (Kill Switch)
+    function cancelAllDownloads() {
+        // 1. Limpa a fila de espera
+        g_imgQueue = [];
+        
+        // 2. Mata os downloads ativos
+        for (var i = 0; i < g_currentLoaders.length; i++) {
+            try {
+                // Ao definir o src como vazio, o navegador cancela a rede
+                g_currentLoaders[i].src = ""; 
+                g_currentLoaders[i].onload = null;
+                g_currentLoaders[i].onerror = null;
+            } catch(e) {}
+        }
+        
+        // 3. Reseta as variáveis
+        g_currentLoaders = [];
+        g_activeDownloads = 0;
+    }
     
     // Função que processa a fila de downloads (um por um ou em lotes)
     function processImageQueue() {
@@ -1249,7 +1286,7 @@ If this happens, right-click the game button, select 'Save link as', and manuall
         // 2. Define as distâncias de visão
         // PS3: Olha perto (400px) para economizar.
         // PC: Olha longe (3000px) para deixar fluido.
-        var loadBuffer = isPS3 ? 400 : 3000; 
+        var loadBuffer = isPS3 ? 600 : 3000; 
         
         // 3. Define as distâncias de limpeza (SÓ PS3)
         var unloadBufferTop = 1200; 
@@ -1295,27 +1332,45 @@ If this happens, right-click the game button, select 'Save link as', and manuall
     }
          
     // Listener inteligente que aguarda você parar de mexer
+    var g_lastScrollY = 0; // Para lembrar onde estava antes
+
     function attachScrollListener() {
         var contentDiv = document.querySelector('.content');
 
         var onScrollHandler = function() {
             if (!useCoverGUI) return; 
 
-            // Reseta o timer se o usuário ainda está mexendo
+            // 1. Descobre a posição atual
+            var currentY = 0;
+            if (contentDiv && (isPS3 || document.body.className.indexOf('is-pc') !== -1)) {
+                currentY = contentDiv.scrollTop;
+            } else {
+                currentY = window.pageYOffset;
+            }
+
+            // 2. Calcula a diferença (o quanto mexeu)
+            var diff = Math.abs(currentY - g_lastScrollY);
+            g_lastScrollY = currentY;
+
+            // [KILL SWITCH INTELIGENTE] SÓ NO PS3
+            // Se mexeu mais de 50 pixels (scroll real), mata os downloads para evitar lag.
+            // Se mexeu pouquinho (ajuste fino), deixa os downloads continuarem.
+            if (isPS3 && diff > 50) {
+                cancelAllDownloads();
+            }
+
+            // Reseta o timer (Isso acontece em qualquer movimento para garantir que você parou)
             if (g_scrollTimer) clearTimeout(g_scrollTimer);
 
-            // [DEBOUNCE]
-            // PC: 100ms (Reage rápido)
-            // PS3: 600ms (Espera você soltar o controle para não travar a CPU)
-            var delay = isPS3 ? 600 : 100;
+            // [PACIÊNCIA / DEBOUNCE]
+            // PS3: 1200ms (1.2s parado)
+            // PC: 100ms
+            var delay = isPS3 ? 1200 : 100;
 
             g_scrollTimer = setTimeout(checkVisibility, delay);
         };
 
-        // Aplica no container correto
-        if (contentDiv) {
-            contentDiv.onscroll = onScrollHandler;
-        }
+        if (contentDiv) { contentDiv.onscroll = onScrollHandler; }
         window.onscroll = onScrollHandler;
     }
     // ==============================================================
