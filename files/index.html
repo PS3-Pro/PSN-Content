@@ -835,6 +835,12 @@ If this happens, right-click the game button, select 'Save link as', and manuall
     var g_letterFilter = "";
     var g_regionFilter = "ALL";
     var useCoverGUI = false;
+	
+	// CONFIGURAÇÃO DA FILA DE IMAGENS
+	var g_imgQueue = [];          // Fila de espera
+	var g_activeDownloads = 0;    // Quantos estão baixando agora
+	var MAX_PARALLEL_LOADS = 3;   // No PS3, 2 ou 3 é o ideal. No PC pode ser 10.
+	if (!isPS3) MAX_PARALLEL_LOADS = 10;
     
     // Cache Settings
     var CACHE_VERSION = "v1.0";
@@ -1128,65 +1134,95 @@ If this happens, right-click the game button, select 'Save link as', and manuall
         g_renderID++;
     }
 
-    function loadCoverSequence(imgID, cid) {
-        var currentID = g_renderID;
-        var img = document.getElementById(imgID);
-        if (!img) return;
-
-        // Definições de URL
-        var ghDirectPS3 = "https://ps3-pro.github.io/PSN-Content/resources/covers/compressed/" + cid + ".JPG";
-        var ghDirectPC = "https://ps3-pro.github.io/PSN-Content/resources/covers/uncompressed/" + cid + ".JPG";
-
-        if (isPS3) {
-            // === PS3 PATH ===
-            var att1 = new Image();
-            att1.onload = function() {
-                if (g_renderID != currentID) return;
-                var el = document.getElementById(imgID); if(el) el.src = ghDirectPS3;
-            };
-            att1.onerror = function() {
-                if (g_renderID != currentID) return;
-                try {
-                    var hash = generateSonyHash(cid);
-                    var sonyDirect = "http://tmdb.np.dl.playstation.net/tmdb/" + hash + "/ICON0.PNG";
-                    var att2 = new Image();
-                    att2.onload = function() {
-                        if (g_renderID != currentID) return;
-                        var el = document.getElementById(imgID); if(el) el.src = sonyDirect;
-                    };
-                    att2.src = sonyDirect;
-                } catch(e) {}
-            };
-            att1.src = ghDirectPS3;
-
-        } else {
-            // === PC PATH ===
-            var att1 = new Image();
-            att1.onload = function() {
-                if (g_renderID != currentID) return;
-                var el = document.getElementById(imgID); if(el) el.src = ghDirectPC;
-            };
-            att1.onerror = function() {
-                if (g_renderID != currentID) return;
-                try {
-                    var hash = generateSonyHash(cid);
-                    var sonyDirect = "http://tmdb.np.dl.playstation.net/tmdb/" + hash + "/ICON0.PNG";
-                    var att2 = new Image();
-                    att2.onload = function() {
-                        if (g_renderID != currentID) return;
-                        var el = document.getElementById(imgID); if(el) el.src = sonyDirect;
-                    };
-                    att2.src = sonyDirect;
-                } catch(e) {}
-            };
-            att1.src = ghDirectPC;
-        }
-    }
+    // Esta é a função que a fila vai chamar
+	function loadCoverSequenceInternal(imgID, cid, onComplete) {
+		var currentID = g_renderID;
+		var img = document.getElementById(imgID);
+		
+		if (!img) { if(onComplete) onComplete(); return; }
+	
+		var ghDirectPS3 = "https://ps3-pro.github.io/PSN-Content/resources/covers/compressed/" + cid + ".JPG";
+		var ghDirectPC = "https://ps3-pro.github.io/PSN-Content/resources/covers/uncompressed/" + cid + ".JPG";
+	
+		var primaryURL = isPS3 ? ghDirectPS3 : ghDirectPC;
+	
+		var att1 = new Image();
+		
+		// Função auxiliar para finalizar e chamar o callback
+		function finish() {
+			if(onComplete) onComplete();
+		}
+	
+		att1.onload = function() {
+			if (g_renderID != currentID) { finish(); return; }
+			var el = document.getElementById(imgID); 
+			if(el) {
+				el.src = primaryURL;
+				el.removeAttribute('data-queued'); // Marca como feito
+			}
+			finish();
+		};
+	
+		att1.onerror = function() {
+			if (g_renderID != currentID) { finish(); return; }
+			// Tenta SONY
+			try {
+				var hash = generateSonyHash(cid);
+				var sonyDirect = "http://tmdb.np.dl.playstation.net/tmdb/" + hash + "/ICON0.PNG";
+				var att2 = new Image();
+				att2.onload = function() {
+					if (g_renderID != currentID) { finish(); return; }
+					var el = document.getElementById(imgID); 
+					if(el) {
+						el.src = sonyDirect;
+						el.removeAttribute('data-queued');
+					}
+					finish();
+				};
+				att2.onerror = function() { finish(); }; // Falhou nos dois
+				att2.src = sonyDirect;
+			} catch(e) { finish(); }
+		};
+		
+		att1.src = primaryURL;
+	}
+	
+	// Esta função antiga agora apenas adiciona na fila!
+	function loadCoverSequence(imgID, cid) {
+		// Verifica se já está na fila ou baixando para não duplicar
+		var el = document.getElementById(imgID);
+		if(el && el.getAttribute('data-queued') === 'true') return;
+		
+		if(el) el.setAttribute('data-queued', 'true');
+	
+		g_imgQueue.push({ imgID: imgID, cid: cid });
+		processImageQueue();
+	}
 
     // ==============================================================
     // 6. LAZY LOADING (ANTI-CRASH) (Código inalterado)
     // ==============================================================
 		var g_scrollTimer = null;
+		
+		function processImageQueue() {
+		// Se já tem muita gente baixando ou a fila está vazia, pare.
+		if (g_activeDownloads >= MAX_PARALLEL_LOADS || g_imgQueue.length === 0) return;
+	
+		// Pega o próximo da fila
+		var nextItem = g_imgQueue.shift();
+		g_activeDownloads++;
+	
+		// Chama a função original de carregar a capa
+		// Mas precisamos injetar um callback para saber quando terminou
+		loadCoverSequenceInternal(nextItem.imgID, nextItem.cid, function() {
+			// Quando terminar (sucesso ou erro), libera a vaga
+			g_activeDownloads--;
+			processImageQueue(); // Chama o próximo
+		});
+		
+		// Tenta iniciar mais um slot se houver espaço
+		processImageQueue();
+	}
 
 		function checkPS3Visibility() {
             var imgs = document.querySelectorAll('.game-tile img');
