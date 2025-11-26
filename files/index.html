@@ -1425,60 +1425,89 @@ If this happens, right-click the game button, select 'Save link as', and manuall
     }
     
     function renderChunk() {
-            var list = document.getElementById('list');
-            var chunk = g_allMatches.slice(g_currentChunkIndex, g_currentChunkIndex + g_chunkSize);
-            var htmlChunk = "";
-            
-            if (chunk.length === 0) { 
-                if (g_currentChunkIndex === 0) list.innerHTML = useCoverGUI ? '<li>No items found.</li>' : '<li>No items found.</li>'; 
-                return; 
+        var list = document.getElementById('list');
+        
+        // Pega o próximo lote de jogos
+        var chunk = g_allMatches.slice(g_currentChunkIndex, g_currentChunkIndex + g_chunkSize);
+        
+        // OTIMIZAÇÃO 1: Usar Array em vez de String concatenada
+        // Navegadores antigos lidam melhor com Arrays na memória
+        var chunkArray = [];
+        
+        if (chunk.length === 0) { 
+            if (g_currentChunkIndex === 0) {
+                list.innerHTML = useCoverGUI ? '<li>No items found.</li>' : '<li>No items found.</li>'; 
             }
+            return; 
+        }
+        
+        for (var i = 0; i < chunk.length; i++) {
+            var a = chunk[i];
+            if (!a[3] || a[3] === "MISSING") continue;
             
-            for (var i = 0; i < chunk.length; i++) {
-               var a = chunk[i];
-               if (!a[3] || a[3] === "MISSING") continue;
-               
-               var size = formatFileSize(a[a.length-1] || a[a.length-2] || "");
-               var cid = a[0], name = a[2];
-               
-               if (useCoverGUI) {
-                  // --- CORREÇÃO DO ID ÚNICO AQUI ---
-                  var uniqueIndex = g_currentChunkIndex + i; 
-                  var tileId = "img_" + cid + "_" + uniqueIndex; 
-                  // --------------------------------
-                  
-                  var lazyClass = isPS3 ? "lazy-ps3" : "";
-                  
-                  htmlChunk += '<div class="game-tile"><img id="'+tileId+'" class="'+lazyClass+'" src="'+defaultCover+'" data-cid="'+cid+'"><div class="title">'+name+'</div><div class="title-id">['+cid+']</div><div class="size">'+size+'</div><div class="links"><a href="'+a[3]+'" class="pkg-btn">PKG</a> '+makeRap(a)+'</div></div>';
-               } else {
-                  htmlChunk += '<li>' + name + ' <span style="color: #ffff00;">[' + cid + ']</span> ' + formatFileSize(a[a.length-1] || a[a.length-2]) + ' <a href="' + a[3] + '" class="pkg-btn">PKG</a> ' + makeRap(a) + '</li>';
-               }
-            }
-            
-            list.innerHTML += htmlChunk;
+            var size = formatFileSize(a[a.length-1] || a[a.length-2] || "");
+            var cid = a[0], name = a[2];
             
             if (useCoverGUI) {
-               if (isPS3) { 
-                   setTimeout(checkVisibility, 100); 
-               } else { 
-                   for(var i=0; i<chunk.length; i++) { 
-                       var r = chunk[i]; 
-                       if(r[3] && r[3] !== "MISSING") { 
-                           // --- CORREÇÃO DO CARREGAMENTO NO PC AQUI ---
-                           var uniqueIndex = g_currentChunkIndex + i;
-                           var uniqueTileId = "img_" + r[0] + "_" + uniqueIndex;
-                           
-                           (function(tid, c){ 
-                               setTimeout(function(){ loadCoverSequence(tid, c); }, 0); 
-                           })(uniqueTileId, r[0]); 
-                           // -------------------------------------------
-                       } 
-                   } 
-               }
+                var uniqueIndex = g_currentChunkIndex + i; 
+                var tileId = "img_" + cid + "_" + uniqueIndex; 
+                
+                var lazyClass = isPS3 ? "lazy-ps3" : "";
+                
+                // Empurra para o Array
+                chunkArray.push(
+                    '<div class="game-tile">',
+                        '<img id="', tileId, '" class="', lazyClass, '" src="', defaultCover, '" data-cid="', cid, '">',
+                        '<div class="title">', name, '</div>',
+                        '<div class="title-id">[', cid, ']</div>',
+                        '<div class="size">', size, '</div>',
+                        '<div class="links"><a href="', a[3], '" class="pkg-btn">PKG</a> ', makeRap(a), '</div>',
+                    '</div>'
+                );
+            } else {
+                chunkArray.push(
+                    '<li>',
+                        name, ' <span style="color: #ffff00;">[', cid, ']</span> ', size, 
+                        ' <a href="', a[3], '" class="pkg-btn">PKG</a> ', makeRap(a),
+                    '</li>'
+                );
             }
-            g_currentChunkIndex += g_chunkSize;
-            if (g_currentChunkIndex < g_allMatches.length) { g_renderTimer = setTimeout(renderChunk, 50); }
-         }
+        }
+        
+        // OTIMIZAÇÃO 2: insertAdjacentHTML
+        // Isso insere o HTML no final da lista SEM recriar os elementos anteriores.
+        // É muito mais leve para a CPU do PS3.
+        if (chunkArray.length > 0) {
+            list.insertAdjacentHTML('beforeend', chunkArray.join(''));
+        }
+        
+        // Lógica de Visibilidade (Mantida)
+        if (useCoverGUI) {
+           if (isPS3) { 
+               // No PS3, não forçamos check imediato para não travar a renderização
+               // Deixa o scroll ou timer cuidar disso
+           } else { 
+               for(var i=0; i<chunk.length; i++) { 
+                   var r = chunk[i]; 
+                   if(r[3] && r[3] !== "MISSING") { 
+                       var uniqueIndex = g_currentChunkIndex + i;
+                       var uniqueTileId = "img_" + r[0] + "_" + uniqueIndex;
+                       
+                       (function(tid, c){ 
+                           setTimeout(function(){ loadCoverSequence(tid, c); }, 0); 
+                       })(uniqueTileId, r[0]); 
+                   } 
+               } 
+           }
+        }
+        
+        g_currentChunkIndex += g_chunkSize;
+        
+        // Pequena pausa para a UI não congelar enquanto processa
+        if (g_currentChunkIndex < g_allMatches.length) { 
+            g_renderTimer = setTimeout(renderChunk, 50); 
+        }
+    }
 
     function render() {
         stopRendering();
