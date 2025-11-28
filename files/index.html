@@ -972,7 +972,7 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
 	var g_totalImagesQueued = 0;
 	var g_currentLoaders = []; //Lista dos "operários" baixando
 	var g_activeDownloads = 0;    // Quantos estão baixando agora
-	var MAX_PARALLEL_LOADS = 32;   // PS3
+	var MAX_PARALLEL_LOADS = 24;   // PS3
 	if (!isPS3) MAX_PARALLEL_LOADS = 1000; // PC
     
     // Cache Settings
@@ -1402,67 +1402,108 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
 
     // Função Principal: Decide o que carregar e o que apagar
     function checkVisibility() {
+    
+    // [OTIMIZAÇÃO] Limpa fila antiga
+    g_imgQueue = []; 
+    
+    var imgs = document.querySelectorAll('.game-tile img');
+    
+    // 1. Dados de Scroll e Viewport
+    var scrollY = 0;
+    var contentDiv = document.querySelector('.content');
+    
+    if (contentDiv && (isPS3 || document.body.className.indexOf('is-pc') !== -1)) {
+        scrollY = contentDiv.scrollTop; 
+    } else {
+        scrollY = window.pageYOffset;
+    }
+    
+    var viewH = window.innerHeight;
+    
+    // 2. Limites VISUAIS EXATOS (O que está na tela AGORA)
+    var screenTop = scrollY;
+    var screenBottom = scrollY + viewH;
+
+    // 3. Limites de CARREGAMENTO (Inclui a gordura/buffer)
+    var loadBuffer = isPS3 ? 1600 : 10000; 
+    var unloadBufferTop = 3200; 
+    var unloadBufferBottom = 3200;
+
+    var loadTop = scrollY - loadBuffer;
+    var loadBottom = scrollY + viewH + loadBuffer;
+    var keepTop = scrollY - unloadBufferTop;
+    var keepBottom = scrollY + viewH + unloadBufferBottom;
+
+    var loadCandidates = [];
+
+    for (var i = 0; i < imgs.length; i++) {
+        var img = imgs[i];
+        if (!img.offsetParent) continue;
         
-        // [OTIMIZAÇÃO DE SCROLL] 
-        // Se essa função rodou, o usuário parou em um lugar novo.
-        // Limpamos a fila antiga.
-        g_imgQueue = []; 
-        
-        var imgs = document.querySelectorAll('.game-tile img');
-        
-        // 1. Descobre onde estamos na página
-        var scrollY = 0;
-        var contentDiv = document.querySelector('.content');
-        
-        if (contentDiv && (isPS3 || document.body.className.indexOf('is-pc') !== -1)) {
-            scrollY = contentDiv.scrollTop; 
-        } else {
-            scrollY = window.pageYOffset;
+        var yPos = 0; 
+        var el = img;
+        while(el && el !== contentDiv && el !== document.body) {
+            yPos += el.offsetTop;
+            el = el.offsetParent;
         }
         
-        var viewH = window.innerHeight;
-        
-        // 2. Define as distâncias
-        var loadBuffer = isPS3 ? 1600 : 10000; 
-        var unloadBufferTop = 3200; 
-        var unloadBufferBottom = 3200;
+        // Verifica se a imagem está VISÍVEL NA TELA (Zona VIP)
+        // Uma imagem é visível se o topo dela ou o fundo dela estiverem dentro da tela
+        var isVisibleOnScreen = (yPos < screenBottom) && ((yPos + img.height) > screenTop);
 
-        var loadTop = scrollY - loadBuffer;
-        var loadBottom = scrollY + viewH + loadBuffer;
-        var keepTop = scrollY - unloadBufferTop;
-        var keepBottom = scrollY + viewH + unloadBufferBottom;
+        // === A. CARREGAR ===
+        if (yPos >= loadTop && yPos <= loadBottom) {
+            if (img.src === defaultCover) { 
+                img.removeAttribute('data-queued'); 
+                var cid = img.getAttribute('data-cid'); 
+                
+                // Calcula distância do centro apenas para desempate dos buffers
+                var viewCenter = scrollY + (viewH / 2);
+                var imgCenter = yPos + (img.height / 2);
+                var distance = Math.abs(viewCenter - imgCenter);
 
-        for (var i = 0; i < imgs.length; i++) {
-            var img = imgs[i];
-            if (!img.offsetParent) continue;
-            
-            var yPos = 0; 
-            var el = img;
-            
-            while(el && el !== contentDiv && el !== document.body) {
-                yPos += el.offsetTop;
-                el = el.offsetParent;
+                loadCandidates.push({
+                    id: img.id,
+                    cid: cid,
+                    y: yPos,           // Posição Vertical (para ordenar Cima->Baixo)
+                    visible: isVisibleOnScreen, // Flag VIP
+                    dist: distance     // Distância (para ordenar os buffers)
+                });
             }
-            
-            // === A. CARREGAR (PC e PS3) ===
-            if (yPos >= loadTop && yPos <= loadBottom) {
-                if (img.src === defaultCover) { 
-                    img.removeAttribute('data-queued'); 
-                    
-                    var cid = img.getAttribute('data-cid'); 
-                    loadCoverSequence(img.id, cid); 
-                }
-            } 
-            
-            // === B. APAGAR (SÓ PS3!!!) ===
-            else if (isPS3 && (yPos < keepTop || yPos > keepBottom)) {
-                if (img.src !== defaultCover) { 
-                    img.removeAttribute('data-queued'); 
-                    img.src = defaultCover; 
-                }
+        } 
+        
+        // === B. APAGAR ===
+        else if (isPS3 && (yPos < keepTop || yPos > keepBottom)) {
+            if (img.src !== defaultCover) { 
+                img.removeAttribute('data-queued'); 
+                img.src = defaultCover; 
             }
         }
     }
+
+    // === ORDENAÇÃO INTELIGENTE ===
+    loadCandidates.sort(function(a, b) {
+        // Regra 1: Quem está VISÍVEL na tela ganha prioridade total sobre quem está escondido
+        if (a.visible && !b.visible) return -1; // A vem primeiro
+        if (!a.visible && b.visible) return 1;  // B vem primeiro
+
+        // Regra 2: Se AMBOS estão visíveis na tela...
+        if (a.visible && b.visible) {
+            // ...Carrega de CIMA (menor Y) para BAIXO (maior Y)
+            // Isso garante a leitura natural
+            return a.y - b.y; 
+        }
+
+        // Regra 3: Se AMBOS estão escondidos (Buffers)...
+        // ...Carrega o que estiver mais perto da tela primeiro
+        return a.dist - b.dist;
+    });
+
+    // Manda bala na fila ordenada
+    for (var k = 0; k < loadCandidates.length; k++) {
+        loadCoverSequence(loadCandidates[k].id, loadCandidates[k].cid);
+    }
+}
          
     // Listener inteligente que aguarda você parar de mexer
     var g_lastScrollY = 0; // Para lembrar onde estava antes
