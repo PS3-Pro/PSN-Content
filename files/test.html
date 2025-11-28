@@ -974,9 +974,14 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
 	var g_totalImagesQueued = 0;
 	var g_currentLoaders = []; //Lista dos "operários" baixando
 	var g_activeDownloads = 0;    // Quantos estão baixando agora
-	var MAX_PARALLEL_LOADS = 12;   // PS3
-	if (!isPS3) MAX_PARALLEL_LOADS = 1000; // PC
+	var MAX_PARALLEL_LOADS = 12;   // Padrão PS3
+    if (!isPS3) {
+        // Se for LazyLoad, usa 32 (saudável). Se for Bruto, usa 1000 (para tentar baixar tudo rápido).
+        MAX_PARALLEL_LOADS = g_lazyLoadPC ? 32 : 1000; 
+    }
     
+	var g_lazyLoadPC = true; // Ativa o carregamento seletivo, evita que toda as imagens da lista sejam mostradas de uma vez, carregando apenas as que estão sendo exebidas na tela
+	
     // Cache Settings
     var CACHE_VERSION = "v1.0";
     var CACHE_TIME = 1000 * 60 * 60 * 24; // 24 Horas
@@ -1512,9 +1517,19 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
     var screenBottom = scrollY + viewH;
 
     // 3. Limites de CARREGAMENTO (Inclui a gordura/buffer)
-    var loadBuffer = isPS3 ? 1600 : 10000; 
-    var unloadBufferTop = 3200; 
-    var unloadBufferBottom = 3200;
+    var loadBuffer;
+        
+        if (isPS3) {
+            loadBuffer = 1600; // Buffer fixo PS3
+        } else {
+            // PC: 
+            // Se g_lazyLoadPC for TRUE  -> Buffer de 2000px (carrega umas 3 telas)
+            // Se g_lazyLoadPC for FALSE -> Buffer GIGANTE (999999px) para carregar TUDO
+            loadBuffer = g_lazyLoadPC ? 3200 : 999999; 
+        }
+
+        var unloadBufferTop = 3200; 
+        var unloadBufferBottom = 3200;
 
     var loadTop = scrollY - loadBuffer;
     var loadBottom = scrollY + viewH + loadBuffer;
@@ -1784,26 +1799,33 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
 		chunkArray = null; // Limpa memória
 		
 		// 3. Acorda o Carregador de Imagens
-		if (useCoverGUI) {
-			if (isPS3) {
-				if (g_scrollTimer) clearTimeout(g_scrollTimer);
-				g_scrollTimer = setTimeout(checkVisibility, 300);
-			} else {
-				for(var i=0; i<chunk.length; i++) {
-					// Se passou do limite, não carrega imagem
-					if (!isPS3 && (g_currentChunkIndex + i) >= currentLimit) break;
-	
-					var r = chunk[i];
-					if(r[3] && r[3] !== "MISSING") {
-						var uniqueIndex = g_currentChunkIndex + i;
-						var uniqueTileId = "img_" + r[0] + "_" + uniqueIndex;
-						(function(tid, c){
-							setTimeout(function(){ loadCoverSequence(tid, c); }, 0);
-						})(uniqueTileId, r[0]);
-					}
-				}
-			}
-		}
+        if (useCoverGUI) {
+            
+            // LÓGICA HÍBRIDA (CONTROLADA PELA VARIÁVEL)
+            if (!isPS3 && !g_lazyLoadPC) {
+                // MODO BRUTO (g_lazyLoadPC = false)
+                // Comportamento ANTIGO: Loop forçado que baixa tudo agora.
+                for(var i=0; i<chunk.length; i++) {
+                    if ((g_currentChunkIndex + i) >= currentLimit) break;
+
+                    var r = chunk[i];
+                    if(r[3] && r[3] !== "MISSING") {
+                        var uniqueIndex = g_currentChunkIndex + i;
+                        var uniqueTileId = "img_" + r[0] + "_" + uniqueIndex;
+                        // Chama direto!
+                        (function(tid, c){
+                            setTimeout(function(){ loadCoverSequence(tid, c); }, 0);
+                        })(uniqueTileId, r[0]);
+                    }
+                }
+            } 
+            else {
+                // MODO INTELIGENTE (PS3 ou PC com LazyLoad=true)
+                // Comportamento NOVO: Usa o scroll e visibilidade.
+                if (g_scrollTimer) clearTimeout(g_scrollTimer);
+                g_scrollTimer = setTimeout(checkVisibility, 300);
+            }
+        }
 		
 		// 4. Próximo pedaço (Avança o índice)
 		g_currentChunkIndex += g_chunkSize;
