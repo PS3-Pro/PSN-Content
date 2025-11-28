@@ -980,11 +980,10 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
 	// CONFIGURAÇÃO DA FILA DE IMAGENS
 	var g_imgQueue = [];
 	var g_ps3FallbackQueue = [];
-	var g_failedIDs = {};
 	var g_totalImagesQueued = 0;
 	var g_currentLoaders = [];
 	var g_activeDownloads = 0;
-	var MAX_PARALLEL_LOADS = 6;
+	var MAX_PARALLEL_LOADS = 12;
     if (!isPS3) {
         MAX_PARALLEL_LOADS = g_lazyLoadPC ? 32 : 1000; 
     }
@@ -1262,156 +1261,111 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
     }
 
 	function loadCoverSequenceInternal(imgID, cid, onComplete, isSonyRetry) {
-		var currentID = g_renderID;
-		
-		// 1. Proteção Blacklist (Só PS3)
-		if (isPS3 && g_failedIDs[cid]) {
-			if(onComplete) onComplete();
-			return;
-		}
+        var currentID = g_renderID;
+        var img = document.getElementById(imgID);
+        
+        if (!img) { if(onComplete) onComplete(); return; }
+    
+        var ghDirectPS3 = "https://ps3-pro.github.io/PSN-Content/resources/covers/compressed/" + cid + ".JPG";
+        var ghDirectPC = "https://ps3-pro.github.io/PSN-Content/resources/covers/uncompressed/" + cid + ".JPG";
+    
+        var primaryURL = isPS3 ? ghDirectPS3 : ghDirectPC;
+    
+        function finish() {
+            if (typeof att1 !== 'undefined') {
+                 var idx = g_currentLoaders.indexOf(att1);
+                 if (idx > -1) g_currentLoaders.splice(idx, 1);
+            }
+            if (typeof att2 !== 'undefined') {
+                 var idx2 = g_currentLoaders.indexOf(att2);
+                 if (idx2 > -1) g_currentLoaders.splice(idx2, 1);
+            }
+            if(onComplete) onComplete();
+        }
 
-		var img = document.getElementById(imgID);
-		if (!img) { if(onComplete) onComplete(); return; }
+        if (isPS3) {
+            if (isSonyRetry) {
+                try {
+                    var hash = generateSonyHash(cid);
+                    var sonyDirect = "http://tmdb.np.dl.playstation.net/tmdb/" + hash + "/ICON0.PNG";
+                    var att2 = new Image();
+                    g_currentLoaders.push(att2);
 
-		var ghDirectPS3 = "https://ps3-pro.github.io/PSN-Content/resources/covers/compressed/" + cid + ".JPG";
-		var ghDirectPC = "https://ps3-pro.github.io/PSN-Content/resources/covers/uncompressed/" + cid + ".JPG";
-		var primaryURL = isPS3 ? ghDirectPS3 : ghDirectPC;
-		
-		var timeoutTimer = null;
-
-		// Função de limpeza unificada
-		function finish(loaderToRemove) {
-			if (timeoutTimer) clearTimeout(timeoutTimer);
-
-            // Remove o loader específico da lista global
-            if (loaderToRemove) {
-                var idx = g_currentLoaders.indexOf(loaderToRemove);
-                if (idx > -1) g_currentLoaders.splice(idx, 1);
+                    att2.onload = function() {
+                        if (g_renderID != currentID) { finish(); return; }
+                        var el = document.getElementById(imgID); 
+                        if(el) {
+                            el.src = sonyDirect;
+                            el.removeAttribute('data-queued');
+                        }
+                        finish();
+                    };
+                    att2.onerror = function() { finish(); }; 
+                    att2.src = sonyDirect;
+                } catch(e) { finish(); }
+                return;
             }
 
-			if(onComplete) onComplete();
-		}
+            var att1 = new Image();
+            g_currentLoaders.push(att1);
 
-		// ==========================================================
-		// ÁREA EXCLUSIVA DO PS3
-		// ==========================================================
-		if (isPS3) {
+            att1.onload = function() {
+                if (g_renderID != currentID) { finish(); return; }
+                var el = document.getElementById(imgID); 
+                if(el) {
+                    el.src = primaryURL;
+                    el.removeAttribute('data-queued'); 
+                }
+                finish();
+            };
+
+            att1.onerror = function() {
+                if (g_renderID != currentID) { finish(); return; }
+				g_ps3FallbackQueue.push({ imgID: imgID, cid: cid });
+                finish();
+            };
             
-            // --- FASE 2: SONY (TMDB) ---
-			if (isSonyRetry) {
-				try {
-					var hash = generateSonyHash(cid);
-					var sonyDirect = "http://tmdb.np.dl.playstation.net/tmdb/" + hash + "/ICON0.PNG";
-					
-                    // Nome de variável único para não confundir o NetFront
-                    var loaderSony = new Image();
-					g_currentLoaders.push(loaderSony);
+            att1.src = primaryURL;
+            return;
+        }
 
-					// Timeout Sony (10s - Sony costuma ser lenta mas responde)
-					timeoutTimer = setTimeout(function() {
-						loaderSony.src = ""; 
-						g_failedIDs[cid] = true; 
-						finish(loaderSony);
-					}, 10000);
-
-					loaderSony.onload = function() {
-						if (g_renderID != currentID) { finish(loaderSony); return; }
-						var el = document.getElementById(imgID); 
-						if(el) {
-							el.src = sonyDirect;
-							el.removeAttribute('data-queued');
-						}
-						finish(loaderSony);
-					};
-					
-                    loaderSony.onerror = function() { 
-						g_failedIDs[cid] = true; 
-						finish(loaderSony); 
-					}; 
-					
-                    loaderSony.src = sonyDirect;
-				} catch(e) { 
-					g_failedIDs[cid] = true;
-					finish(null); 
-				}
-				return;
-			}
-
-			// --- FASE 1: GITHUB ---
-			var loaderGH = new Image();
-			g_currentLoaders.push(loaderGH);
-
-			// Timeout GitHub (AUMENTADO PARA 15s)
-            // O PS3 demora no SSL Handshake, 4s era pouco.
-			timeoutTimer = setTimeout(function() {
-				loaderGH.src = "";
-				// Se estourou o tempo, joga para a fila da Sony
-				g_ps3FallbackQueue.push({ imgID: imgID, cid: cid });
-				finish(loaderGH);
-			}, 15000);
-
-			loaderGH.onload = function() {
-				if (g_renderID != currentID) { finish(loaderGH); return; }
-				var el = document.getElementById(imgID); 
-				if(el) {
-					el.src = primaryURL;
-					el.removeAttribute('data-queued'); 
-				}
-				finish(loaderGH);
-			};
-
-			loaderGH.onerror = function() {
-				if (g_renderID != currentID) { finish(loaderGH); return; }
-				// Erro no Github? Vai pra fila da Sony.
-				g_ps3FallbackQueue.push({ imgID: imgID, cid: cid });
-				finish(loaderGH);
-			};
-			
-			loaderGH.src = primaryURL;
-			return;
-		}
-
-		// ==========================================================
-		// ÁREA DO PC (Padrão)
-		// ==========================================================
-		var loaderPC = new Image();
-		g_currentLoaders.push(loaderPC); 
-		
-		loaderPC.onload = function() {
-			if (g_renderID != currentID) { finish(loaderPC); return; }
-			var el = document.getElementById(imgID); 
-			if(el) {
-				el.src = primaryURL;
-				el.removeAttribute('data-queued'); 
-			}
-			finish(loaderPC);
-		};
-	
-		loaderPC.onerror = function() {
-			if (g_renderID != currentID) { finish(loaderPC); return; }
+        var att1 = new Image();
+        g_currentLoaders.push(att1); 
+        
+        att1.onload = function() {
+            if (g_renderID != currentID) { finish(); return; }
+            var el = document.getElementById(imgID); 
+            if(el) {
+                el.src = primaryURL;
+                el.removeAttribute('data-queued'); 
+            }
+            finish();
+        };
+    
+        att1.onerror = function() {
+            if (g_renderID != currentID) { finish(); return; }
 			try {
-				var hash = generateSonyHash(cid);
-				var sonyDirect = "http://tmdb.np.dl.playstation.net/tmdb/" + hash + "/ICON0.PNG";
-				
-                var loaderPC2 = new Image();
-				g_currentLoaders.push(loaderPC2);
+                var hash = generateSonyHash(cid);
+                var sonyDirect = "http://tmdb.np.dl.playstation.net/tmdb/" + hash + "/ICON0.PNG";
+                var att2 = new Image();
+                g_currentLoaders.push(att2);
 
-				loaderPC2.onload = function() {
-					if (g_renderID != currentID) { finish(loaderPC2); return; }
-					var el = document.getElementById(imgID); 
-					if(el) {
-						el.src = sonyDirect;
-						el.removeAttribute('data-queued');
-					}
-					finish(loaderPC2);
-				};
-				loaderPC2.onerror = function() { finish(loaderPC2); }; 
-				loaderPC2.src = sonyDirect;
-			} catch(e) { finish(loaderPC); }
-		};
-		
-		loaderPC.src = primaryURL;
-	}
+                att2.onload = function() {
+                    if (g_renderID != currentID) { finish(); return; }
+                    var el = document.getElementById(imgID); 
+                    if(el) {
+                        el.src = sonyDirect;
+                        el.removeAttribute('data-queued');
+                    }
+                    finish();
+                };
+                att2.onerror = function() { finish(); }; 
+                att2.src = sonyDirect;
+            } catch(e) { finish(); }
+        };
+        
+        att1.src = primaryURL;
+    }
 	
 	function loadCoverSequence(imgID, cid) {
 		var el = document.getElementById(imgID);
@@ -1431,21 +1385,13 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
         g_imgQueue = [];
         g_ps3FallbackQueue = [];
         
-		if (g_currentLoaders && g_currentLoaders.length > 0) {
-            for (var i = g_currentLoaders.length - 1; i >= 0; i--) {
-                var imgObj = g_currentLoaders[i];
-                if (imgObj) {
-                    try {
-                        imgObj.onload = null;
-                        imgObj.onerror = null;
-                        imgObj.src = "";
-                        
-                       delete g_currentLoaders[i]; 
-                    } catch(e) {}
-                }
-            }
+		for (var i = 0; i < g_currentLoaders.length; i++) {
+            try {
+                g_currentLoaders[i].src = ""; 
+                g_currentLoaders[i].onload = null;
+                g_currentLoaders[i].onerror = null;
+            } catch(e) {}
         }
-        
         g_currentLoaders = [];
         g_activeDownloads = 0;
     }
@@ -1504,7 +1450,7 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
     var loadBuffer;
         
         if (isPS3) {
-            loadBuffer = 1000;
+            loadBuffer = 2000;
         } else {
             loadBuffer = g_lazyLoadPC ? 3200 : 999999; 
         }
@@ -1803,11 +1749,6 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
 
     function render() {
 		stopRendering();
-		
-		if (isPS3) {
-            cancelAllDownloads();
-        }
-		
 		f.send.disabled = DB.length == 0;
 		f.query.placeholder = DB.length + " items found";
 		document.getElementById('btn-load-more').style.display = 'none';
@@ -2067,12 +2008,7 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
 
         function setFilter(type, value, clickedElement) {
 		stopRendering();
-		
-		if (isPS3) {
-			cancelAllDownloads();
-            g_failedIDs = {};
-		}
-		
+	
 		if (type == 'search') {
 			var cleanValue = value.replace(/^\s+|\s+$/g, ''); 
 			
@@ -2187,10 +2123,6 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
         function selectCategory(cat) {
             stopRendering();
             currentCategory = cat;
-			
-			if (isPS3) {
-                g_failedIDs = {}; 
-            }
 			
 			g_isSearchActive = false;
             switch(cat) {
