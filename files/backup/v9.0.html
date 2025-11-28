@@ -964,11 +964,18 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
     var g_letterFilter = "";
     var g_regionFilter = "ALL";
     var useCoverGUI = false;
-	var g_preSearchState = null;
+	var g_preSearchState = null; // Variável para guardar o estado antes da pesquisa
 	var g_pendingScroll = null;
-	var g_isSearchActive = false;
 	
-    // Configurações de Cache
+	// CONFIGURAÇÃO DA FILA DE IMAGENS
+	var g_imgQueue = [];          // Fila de espera
+	var g_totalImagesQueued = 0;
+	var g_currentLoaders = []; //Lista dos "operários" baixando
+	var g_activeDownloads = 0;    // Quantos estão baixando agora
+	var MAX_PARALLEL_LOADS = 12;   // PS3
+	if (!isPS3) MAX_PARALLEL_LOADS = 1000; // PC
+    
+    // Cache Settings
     var CACHE_VERSION = "v1.0";
     var CACHE_TIME = 1000 * 60 * 60 * 24; // 24 Horas
     var currentCategory = "games";
@@ -1265,203 +1272,238 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
         if (g_renderTimer) { clearTimeout(g_renderTimer); g_renderTimer = null; }
         g_renderID++;
     }
-	var g_scrollTimer = null;
 
+    // Esta é a função que a fila vai chamar
+	function loadCoverSequenceInternal(imgID, cid, onComplete) {
+		var currentID = g_renderID;
+		var img = document.getElementById(imgID);
+		
+		if (!img) { if(onComplete) onComplete(); return; }
+	
+		var ghDirectPS3 = "https://ps3-pro.github.io/PSN-Content/resources/covers/compressed/" + cid + ".JPG";
+		var ghDirectPC = "https://ps3-pro.github.io/PSN-Content/resources/covers/uncompressed/" + cid + ".JPG";
+	
+		var primaryURL = isPS3 ? ghDirectPS3 : ghDirectPC;
+	
+		var att1 = new Image();
+        
+        // ADICIONA NA LISTA DE "ALVOS" PARA CANCELAR
+        g_currentLoaders.push(att1); 
+		
+        // Função auxiliar para remover da lista e finalizar
+		function finish() {
+            // Remove este download específico da lista de ativos
+            var idx = g_currentLoaders.indexOf(att1);
+            if (idx > -1) g_currentLoaders.splice(idx, 1);
+            
+            // Remove também o loader secundário (att2) se existir
+            if (typeof att2 !== 'undefined') {
+                 var idx2 = g_currentLoaders.indexOf(att2);
+                 if (idx2 > -1) g_currentLoaders.splice(idx2, 1);
+            }
 
-
-// === CONTROLE DE FILA (EXCLUSIVO PS3) ===
-var sonyPendingList = [];
-var sonyProcessTimer = null;
-var sonyWorker = null;
-
-// Helpers visuais
-function markAsLoaded(el) {
-    el.removeAttribute('data-queued');
-    el.removeAttribute('data-loading');
-    el.removeAttribute('data-failed');
-    el.setAttribute('data-loaded', 'true');
-}
-
-function markAsFailed(el) {
-    el.setAttribute('data-failed', 'true');
-    el.removeAttribute('data-loading');
-}
-
-// Avisa que o GitHub está trabalhando (Só usado no PS3)
-function signalActivity(isConsole) {
-    if (!isConsole) return; 
-
-    if (sonyWorker) {
-        clearInterval(sonyWorker);
-        sonyWorker = null;
-    }
-    if (sonyProcessTimer) {
-        clearTimeout(sonyProcessTimer);
-    }
-    // No PS3, espera 1.5s de silêncio para começar a baixar da Sony
-    sonyProcessTimer = setTimeout(startSonyPhase, 1500);
-}
-
-// O "Faxineiro" do PS3 (Baixa Sony devagar)
-function startSonyPhase() {
-    if (sonyPendingList.length === 0) return;
-
-    sonyWorker = setInterval(function() {
-        if (sonyPendingList.length === 0) {
-            clearInterval(sonyWorker);
-            sonyWorker = null;
-            return;
-        }
-
-        var item = sonyPendingList.shift();
-        var img = item.element;
-        var cid = item.cid;
-
-        // Verifica se ainda precisa carregar
-        if (img && !img.getAttribute('data-loaded')) {
-             if (typeof generateSonyHash === 'function') {
-                var hash = generateSonyHash(cid);
-                // IMPORTANTE: HTTP para PS3 (mais rápido/compatível)
-                var sonyUrl = "http://tmdb.np.dl.playstation.net/tmdb/" + hash + "/ICON0.PNG";
+			if(onComplete) onComplete();
+		}
+	
+		att1.onload = function() {
+			if (g_renderID != currentID) { finish(); return; }
+			var el = document.getElementById(imgID); 
+			if(el) {
+				el.src = primaryURL;
+				el.removeAttribute('data-queued'); 
+			}
+			finish();
+		};
+	
+		att1.onerror = function() {
+			if (g_renderID != currentID) { finish(); return; }
+			
+            // Tenta SONY
+			try {
+				var hash = generateSonyHash(cid);
+				var sonyDirect = "http://tmdb.np.dl.playstation.net/tmdb/" + hash + "/ICON0.PNG";
+				var att2 = new Image(); // Var local, mas acessível pelo finish()
                 
-                var tempSony = new Image();
-                tempSony.onload = function() {
-                    if (img) {
-                        img.src = this.src;
-                        markAsLoaded(img);
-                    }
-                };
-                tempSony.onerror = function() {
-                    if (img) markAsFailed(img);
-                };
-                tempSony.src = sonyUrl;
-            }
-        }
-    }, 200); // Intervalo suave para o PS3
-}
+                // Adiciona o segundo loader na lista também
+                g_currentLoaders.push(att2);
 
-function tryLoadImage(imgElement, mainUrl, cid, isConsole) {
-    
-    // ==============================================================
-    // ESTRATÉGIA PC: MODO INSTANTÂNEO (Igual ao seu código antigo)
-    // ==============================================================
-    if (!isConsole) {
-        // Criamos um loader temporário
-        var pcLoader = new Image();
-        
-        pcLoader.onload = function() {
-            // Se carregou (seja GitHub ou Sony), aplica na tela
-            if (imgElement) {
-                imgElement.src = this.src;
-                markAsLoaded(imgElement);
-            }
-        };
-        
-        pcLoader.onerror = function() {
-            // Se falhou, verificamos: Era o GitHub?
-            if (this.src.indexOf('ps3-pro.github.io') !== -1) {
-                // Sim, era GitHub. Então tenta SONY agora mesmo!
-                if (typeof generateSonyHash === 'function') {
-                    var hash = generateSonyHash(cid);
-                    var sonyUrl = "http://tmdb.np.dl.playstation.net/tmdb/" + hash + "/ICON0.PNG";
-                    
-                    // Truque do seu código antigo: Reutiliza o mesmo loader
-                    this.src = sonyUrl; 
-                }
-            } else {
-                // Se já era Sony (ou outra coisa) e falhou, então desistimos
-                if (imgElement) markAsFailed(imgElement);
-            }
-        };
-        
-        // Dispara a tentativa (GitHub)
-        pcLoader.src = mainUrl;
-        return; // Sai da função, PC resolvido
+				att2.onload = function() {
+					if (g_renderID != currentID) { finish(); return; }
+					var el = document.getElementById(imgID); 
+					if(el) {
+						el.src = sonyDirect;
+						el.removeAttribute('data-queued');
+					}
+					finish();
+				};
+				att2.onerror = function() { finish(); }; 
+				att2.src = sonyDirect;
+			} catch(e) { finish(); }
+		};
+		
+		att1.src = primaryURL;
+	}
+	
+	// Esta função antiga agora apenas adiciona na fila!
+	function loadCoverSequence(imgID, cid) {
+		// Verifica se já está na fila ou baixando para não duplicar
+        var el = document.getElementById(imgID);
+        if(el && el.getAttribute('data-queued') === 'true') return;
+        if(el) el.setAttribute('data-queued', 'true');
+        g_imgQueue.push({ imgID: imgID, cid: cid });
+		g_totalImagesQueued++;
+        processImageQueue();
     }
 
     // ==============================================================
-    // ESTRATÉGIA PS3: MODO FILA DE ESPERA (SAFE)
+    // 6. LAZY LOADING (ANTI-CRASH) (Código inalterado)
     // ==============================================================
-    var ps3Loader = new Image();
+	var g_scrollTimer = null;
+	
+	// Função para ABORTAR downloads em andamento (Kill Switch)
+    function cancelAllDownloads() {
+        // 1. Limpa a fila de espera
+        g_imgQueue = [];
+        
+        // 2. Mata os downloads ativos
+        for (var i = 0; i < g_currentLoaders.length; i++) {
+            try {
+                // Ao definir o src como vazio, o navegador cancela a rede
+                g_currentLoaders[i].src = ""; 
+                g_currentLoaders[i].onload = null;
+                g_currentLoaders[i].onerror = null;
+            } catch(e) {}
+        }
+        
+        // 3. Reseta as variáveis
+        g_currentLoaders = [];
+        g_activeDownloads = 0;
+    }
     
-    ps3Loader.onload = function() {
-        if (imgElement) {
-            imgElement.src = this.src;
-            markAsLoaded(imgElement);
+    // Função que processa a fila de downloads (um por um ou em lotes)
+    function processImageQueue() {
+        // Se já tem muita gente baixando ou a fila está vazia, pare.
+        if (g_activeDownloads >= MAX_PARALLEL_LOADS || g_imgQueue.length === 0) return;
+
+        // Pega o próximo da fila
+        var nextItem = g_imgQueue.shift();
+        g_activeDownloads++;
+
+        // Chama a função interna de carregar (que você já definiu antes)
+        loadCoverSequenceInternal(nextItem.imgID, nextItem.cid, function() {
+            // Callback: Quando terminar (sucesso ou erro), libera a vaga
+            g_activeDownloads--;
+            processImageQueue(); // Tenta puxar o próximo imediatamente
+        });
+        
+        // Tenta iniciar mais um slot paralelo se houver espaço (Multi-thread fake)
+        if (g_activeDownloads < MAX_PARALLEL_LOADS) {
+            processImageQueue();
         }
-        signalActivity(true); 
-    };
+    }
 
-    ps3Loader.onerror = function() {
-        if (imgElement) {
-            // PS3 não tenta Sony agora. Joga na fila para depois.
-            sonyPendingList.push({
-                element: imgElement,
-                cid: cid
-            });
-        }
-        signalActivity(true);
-    };
-
-    ps3Loader.src = mainUrl;
-}
-
-function checkVisibility() {
+    // Função Principal: Decide o que carregar e o que apagar
+    function checkVisibility() {
+    
+    // [OTIMIZAÇÃO] Limpa fila antiga
+    g_imgQueue = []; 
+    
     var imgs = document.querySelectorAll('.game-tile img');
     
+    // 1. Dados de Scroll e Viewport
     var scrollY = 0;
     var contentDiv = document.querySelector('.content');
     
-    var isPS3Local = (typeof isPS3 !== 'undefined') ? isPS3 : (navigator.userAgent.indexOf("PLAYSTATION 3") !== -1);
-
-    if (contentDiv && (isPS3Local || document.body.className.indexOf('is-pc') !== -1)) {
+    if (contentDiv && (isPS3 || document.body.className.indexOf('is-pc') !== -1)) {
         scrollY = contentDiv.scrollTop; 
     } else {
         scrollY = window.pageYOffset;
     }
     
     var viewH = window.innerHeight;
-    var loadBuffer = isPS3Local ? 800 : 2000; 
-    var unloadBuffer = 3000; 
+    
+    // 2. Limites VISUAIS EXATOS (O que está na tela AGORA)
+    var screenTop = scrollY;
+    var screenBottom = scrollY + viewH;
+
+    // 3. Limites de CARREGAMENTO (Inclui a gordura/buffer)
+    var loadBuffer = isPS3 ? 1600 : 10000; 
+    var unloadBufferTop = 3200; 
+    var unloadBufferBottom = 3200;
 
     var loadTop = scrollY - loadBuffer;
     var loadBottom = scrollY + viewH + loadBuffer;
-    var keepTop = scrollY - unloadBuffer;
-    var keepBottom = scrollY + viewH + unloadBuffer;
+    var keepTop = scrollY - unloadBufferTop;
+    var keepBottom = scrollY + viewH + unloadBufferBottom;
+
+    var loadCandidates = [];
 
     for (var i = 0; i < imgs.length; i++) {
         var img = imgs[i];
         if (!img.offsetParent) continue;
         
-        var yPos = img.getBoundingClientRect().top + scrollY; 
+        var yPos = 0; 
+        var el = img;
+        while(el && el !== contentDiv && el !== document.body) {
+            yPos += el.offsetTop;
+            el = el.offsetParent;
+        }
+        
+        // Verifica se a imagem está VISÍVEL NA TELA (Zona VIP)
+        // Uma imagem é visível se o topo dela ou o fundo dela estiverem dentro da tela
+        var isVisibleOnScreen = (yPos < screenBottom) && ((yPos + img.height) > screenTop);
 
-        // === CARREGAR ===
+        // === A. CARREGAR ===
         if (yPos >= loadTop && yPos <= loadBottom) {
-            
-            // Verifica se já não carregou (data-loaded) ou se falhou
-            if (img.src === defaultCover && !img.getAttribute('data-loading') && !img.getAttribute('data-failed') && !img.getAttribute('data-loaded')) { 
+            if (img.src === defaultCover) { 
+                img.removeAttribute('data-queued'); 
+                var cid = img.getAttribute('data-cid'); 
                 
-                img.setAttribute('data-loading', 'true');
-                var cid = img.getAttribute('data-cid');
-                
-                var ghDirectPS3 = "https://ps3-pro.github.io/PSN-Content/resources/covers/compressed/" + cid + ".JPG";
-                var ghDirectPC = "https://ps3-pro.github.io/PSN-Content/resources/covers/uncompressed/" + cid + ".JPG";
-                var url = isPS3Local ? ghDirectPS3 : ghDirectPC;
-                
-                // Chama a função Híbrida
-                tryLoadImage(img, url, cid, isPS3Local);
+                // Calcula distância do centro apenas para desempate dos buffers
+                var viewCenter = scrollY + (viewH / 2);
+                var imgCenter = yPos + (img.height / 2);
+                var distance = Math.abs(viewCenter - imgCenter);
+
+                loadCandidates.push({
+                    id: img.id,
+                    cid: cid,
+                    y: yPos,           // Posição Vertical (para ordenar Cima->Baixo)
+                    visible: isVisibleOnScreen, // Flag VIP
+                    dist: distance     // Distância (para ordenar os buffers)
+                });
             }
         } 
         
-        // === LIMPEZA (SÓ NO PS3) ===
-        else if (isPS3Local && (yPos < keepTop || yPos > keepBottom)) {
+        // === B. APAGAR ===
+        else if (isPS3 && (yPos < keepTop || yPos > keepBottom)) {
             if (img.src !== defaultCover) { 
+                img.removeAttribute('data-queued'); 
                 img.src = defaultCover; 
-                img.removeAttribute('data-loading');
-                img.removeAttribute('data-failed');
-                img.removeAttribute('data-loaded');
             }
         }
+    }
+
+    // === ORDENAÇÃO INTELIGENTE ===
+    loadCandidates.sort(function(a, b) {
+        // Regra 1: Quem está VISÍVEL na tela ganha prioridade total sobre quem está escondido
+        if (a.visible && !b.visible) return -1; // A vem primeiro
+        if (!a.visible && b.visible) return 1;  // B vem primeiro
+
+        // Regra 2: Se AMBOS estão visíveis na tela...
+        if (a.visible && b.visible) {
+            // ...Carrega de CIMA (menor Y) para BAIXO (maior Y)
+            // Isso garante a leitura natural
+            return a.y - b.y; 
+        }
+
+        // Regra 3: Se AMBOS estão escondidos (Buffers)...
+        // ...Carrega o que estiver mais perto da tela primeiro
+        return a.dist - b.dist;
+    });
+
+    // Manda bala na fila ordenada
+    for (var k = 0; k < loadCandidates.length; k++) {
+        loadCoverSequence(loadCandidates[k].id, loadCandidates[k].cid);
     }
 }
          
@@ -1469,30 +1511,44 @@ function checkVisibility() {
     var g_lastScrollY = 0; // Para lembrar onde estava antes
 
     function attachScrollListener() {
-        var contentDiv = document.querySelector('.content');
+        var contentDiv = document.querySelector('.content');
 
-        var onScrollHandler = function() {
-            if (!useCoverGUI) return; 
+        var onScrollHandler = function() {
+            if (!useCoverGUI) return; 
 
-            var currentY = 0;
-            if (contentDiv && (isPS3 || document.body.className.indexOf('is-pc') !== -1)) {
-                currentY = contentDiv.scrollTop; 
-            } else {
-                currentY = window.pageYOffset;
-            }
-            
-            // Só precisamos resetar o timer e chamar checkVisibility com delay
-            if (g_scrollTimer) clearTimeout(g_scrollTimer);
-            var delay = isPS3 ? 800 : 100;
-            g_scrollTimer = setTimeout(checkVisibility, delay);
-            
-            // Atualiza posição para a próxima vez (embora não estejamos usando g_lastScrollY para lógica crítica, pode manter se quiser)
-            g_lastScrollY = currentY; 
-        };
+            // 1. Descobre a posição atual
+            var currentY = 0;
+            if (contentDiv && (isPS3 || document.body.className.indexOf('is-pc') !== -1)) {
+                currentY = contentDiv.scrollTop;
+            } else {
+                currentY = window.pageYOffset;
+            }
 
-        if (contentDiv) { contentDiv.onscroll = onScrollHandler; }
-        window.onscroll = onScrollHandler;
-    }
+            // 2. Calcula a diferença (o quanto mexeu)
+            var diff = Math.abs(currentY - g_lastScrollY);
+            g_lastScrollY = currentY;
+
+            // [KILL SWITCH INTELIGENTE] SÓ NO PS3
+            // Se mexeu mais de 200 pixels (scroll real), mata os downloads para evitar lag.
+            // Se mexeu pouquinho (ajuste fino), deixa os downloads continuarem.
+            if (isPS3 && diff > 200) {
+                cancelAllDownloads();
+            }
+
+            // Reseta o timer (Isso acontece em qualquer movimento para garantir que você parou)
+            if (g_scrollTimer) clearTimeout(g_scrollTimer);
+
+            // [PACIÊNCIA / DEBOUNCE]
+            // PS3: 1200ms (1.2s parado)
+            // PC: 100ms
+            var delay = isPS3 ? 1200 : 100;
+
+            g_scrollTimer = setTimeout(checkVisibility, delay);
+        };
+
+        if (contentDiv) { contentDiv.onscroll = onScrollHandler; }
+        window.onscroll = onScrollHandler;
+    }
     // ==============================================================
     // 7. RENDERIZAÇÃO E UI
     // ==============================================================
@@ -1565,112 +1621,139 @@ function checkVisibility() {
     }
     
     function renderChunk() {
-    var list = document.getElementById('list');
-    var currentLimit = isPS3 ? g_allMatches.length : g_pcRenderLimit;
-    var chunk = g_allMatches.slice(g_currentChunkIndex, g_currentChunkIndex + g_chunkSize);
-    var chunkArray = [];
-    
-    if (chunk.length === 0) {
-        if (g_currentChunkIndex === 0) list.innerHTML = '<li>No items found.</li>';
-        var btn = document.getElementById('btn-load-more');
-        if(btn) btn.style.display = 'none';
-        g_renderingHTML = false;
-        return;
-    }
-    
-    // === CRIAÇÃO DO HTML ===
-    if (useCoverGUI) {
-        var lazyClass = isPS3 ? "lazy-ps3" : "";
-        for (var i = 0; i < chunk.length; i++) {
-            if (!isPS3 && (g_currentChunkIndex + i) >= currentLimit) break;
-            var a = chunk[i];
-            if (!a[3] || a[3] === "MISSING") continue;
-            
-            var size = formatFileSize(a[a.length-1] || a[a.length-2] || "");
-            var cid = a[0], name = a[2];
-            var uniqueIndex = g_currentChunkIndex + i;
-            var tileId = "img_" + cid + "_" + uniqueIndex;
-            
-            chunkArray.push(
-                '<div class="game-tile">',
-                    '<img id="', tileId, '" class="', lazyClass, '" src="', defaultCover, '" data-cid="', cid, '">',
-                    '<div class="title">', name, '</div>',
-                    '<div class="title-id">[', cid, ']</div>',
-                    '<div class="size">', size, '</div>',
-                    '<div class="links">', makeRap(a), ' <a href="', a[3], '" class="pkg-btn">PKG</a></div>',
-                '</div>'
-            );
-        }
-    } else {
-        // ... (Seu código de lista normal aqui) ...
-        for (var i = 0; i < chunk.length; i++) {
-            if (!isPS3 && (g_currentChunkIndex + i) >= currentLimit) break;
-            var a = chunk[i];
-            if (!a[3] || a[3] === "MISSING") continue;
-            var size = formatFileSize(a[a.length-1] || a[a.length-2] || "");
-            var cid = a[0], name = a[2];
-            chunkArray.push('<li>', name, ' <span style="color: #ffff00;">[', cid, ']</span> ', size, ' ', makeRap(a), ' <a href="', a[3], '" class="pkg-btn">PKG</a>', '</li>');
-        }
-    }
-    
-    // Injeta HTML
-    if (chunkArray.length > 0) list.insertAdjacentHTML('beforeend', chunkArray.join(''));
-    chunkArray = null; 
-    
-    // =================================================================
-    // 3. DISPARO DAS IMAGENS
-    // =================================================================
-    if (useCoverGUI) {
-        if (isPS3) {
-            // PS3: Espera um pouco (Safe Mode)
-            if (g_scrollTimer) clearTimeout(g_scrollTimer);
-            g_scrollTimer = setTimeout(checkVisibility, 300);
-        } else {
-            // PC: MODO TURBO - Dispara AGORA
-            for(var i=0; i<chunk.length; i++) {
-                if ((g_currentChunkIndex + i) >= currentLimit) break;
-
-                var r = chunk[i];
-                if(r[3] && r[3] !== "MISSING") {
-                    var uniqueIndex = g_currentChunkIndex + i;
-                    var uniqueTileId = "img_" + r[0] + "_" + uniqueIndex;
-                    var cid = r[0];
-                    
-                    // URL
-                    var ghDirectPC = "https://ps3-pro.github.io/PSN-Content/resources/covers/uncompressed/" + cid + ".JPG";
-                    var imgEl = document.getElementById(uniqueTileId);
-                    
-                    if (imgEl) {
-                        // Chama a função que acabamos de ajustar
-                        tryLoadImage(imgEl, ghDirectPC, cid, false); 
-                    }
-                }
-            }
-        }
-    }
-    
-    // Avança e continua renderizando se necessário...
-    g_currentChunkIndex += g_chunkSize;
-    if (g_currentChunkIndex < g_allMatches.length && g_currentChunkIndex < currentLimit) {
-        g_renderTimer = setTimeout(renderChunk, 0);
-    } else {
-        // Finalização (Botão load more, etc)
-        if (!isPS3 && g_allMatches.length > currentLimit) {
-            var btn = document.getElementById('btn-load-more');
-            var remaining = g_allMatches.length - currentLimit;
-            btn.innerHTML = "Load more " + (remaining > g_pcPageSize ? g_pcPageSize : remaining) + " items";
-            btn.style.display = 'block';
-        } else {
-            var btn = document.getElementById('btn-load-more');
-            if(btn) btn.style.display = 'none';
-        }
-        g_renderingHTML = false;
-        if (g_pendingScroll !== null) {
-            document.querySelector('.content').scrollTop = g_pendingScroll;
-            g_pendingScroll = null;
-        }
-    }
-}
+		var list = document.getElementById('list');
+		
+		// Define o limite atual (Se for PS3, o limite é o total encontrado. Se for PC, é o limite da paginação)
+		var currentLimit = isPS3 ? g_allMatches.length : g_pcRenderLimit;
+	
+		// Fatiar o array (slice)
+		var chunk = g_allMatches.slice(g_currentChunkIndex, g_currentChunkIndex + g_chunkSize);
+		
+		// 1. Prepara o Array
+		var chunkArray = [];
+		
+		if (chunk.length === 0) {
+			if (g_currentChunkIndex === 0) {
+				list.innerHTML = '<li>No items found.</li>';
+			}
+			// Se a lista está vazia, esconde o botão
+			var btn = document.getElementById('btn-load-more');
+			if(btn) btn.style.display = 'none';
+			g_renderingHTML = false;
+			return;
+		}
+		
+		// === LOOP ===
+		if (useCoverGUI) {
+			// --- LOOP GRID (CAPAS) ---
+			var lazyClass = isPS3 ? "lazy-ps3" : "";
+			
+			for (var i = 0; i < chunk.length; i++) {
+				// Se já passamos do limite da página no PC, pare de adicionar HTML
+				if (!isPS3 && (g_currentChunkIndex + i) >= currentLimit) break;
+	
+				var a = chunk[i];
+				if (!a[3] || a[3] === "MISSING") continue;
+				
+				var size = formatFileSize(a[a.length-1] || a[a.length-2] || "");
+				var cid = a[0], name = a[2];
+				var uniqueIndex = g_currentChunkIndex + i;
+				var tileId = "img_" + cid + "_" + uniqueIndex;
+				
+				chunkArray.push(
+					'<div class="game-tile">',
+						'<img id="', tileId, '" class="', lazyClass, '" src="', defaultCover, '" data-cid="', cid, '">',
+						'<div class="title">', name, '</div>',
+						'<div class="title-id">[', cid, ']</div>',
+						'<div class="size">', size, '</div>',
+						'<div class="links">', makeRap(a), ' <a href="', a[3], '" class="pkg-btn">PKG</a></div>',
+					'</div>'
+				);
+			}
+		} else {
+			// --- LOOP LISTA (TEXTO) ---
+			for (var i = 0; i < chunk.length; i++) {
+				// Se já passamos do limite da página no PC, pare de adicionar HTML
+				if (!isPS3 && (g_currentChunkIndex + i) >= currentLimit) break;
+	
+				var a = chunk[i];
+				if (!a[3] || a[3] === "MISSING") continue;
+				
+				var size = formatFileSize(a[a.length-1] || a[a.length-2] || "");
+				var cid = a[0], name = a[2];
+				
+				chunkArray.push(
+					'<li>',
+						name, ' <span style="color: #ffff00;">[', cid, ']</span> ', size,
+						' ', makeRap(a), ' <a href="', a[3], '" class="pkg-btn">PKG</a>',
+					'</li>'
+				);
+			}
+		}
+		
+		// 2. Injeta na tela
+		if (chunkArray.length > 0) {
+			list.insertAdjacentHTML('beforeend', chunkArray.join(''));
+		}
+		
+		chunkArray = null; // Limpa memória
+		
+		// 3. Acorda o Carregador de Imagens
+		if (useCoverGUI) {
+			if (isPS3) {
+				if (g_scrollTimer) clearTimeout(g_scrollTimer);
+				g_scrollTimer = setTimeout(checkVisibility, 300);
+			} else {
+				for(var i=0; i<chunk.length; i++) {
+					// Se passou do limite, não carrega imagem
+					if (!isPS3 && (g_currentChunkIndex + i) >= currentLimit) break;
+	
+					var r = chunk[i];
+					if(r[3] && r[3] !== "MISSING") {
+						var uniqueIndex = g_currentChunkIndex + i;
+						var uniqueTileId = "img_" + r[0] + "_" + uniqueIndex;
+						(function(tid, c){
+							setTimeout(function(){ loadCoverSequence(tid, c); }, 0);
+						})(uniqueTileId, r[0]);
+					}
+				}
+			}
+		}
+		
+		// 4. Próximo pedaço (Avança o índice)
+		g_currentChunkIndex += g_chunkSize;
+		
+		// === DECISÃO FINAL ===
+		if (g_currentChunkIndex < g_allMatches.length && g_currentChunkIndex < currentLimit) {
+			g_renderTimer = setTimeout(renderChunk, 0);
+		} else {
+			// === RENDERIZAR TERMINOU ===
+			
+			// 1. Lógica do Botão (Sua lógica original que funciona)
+			if (!isPS3 && g_allMatches.length > currentLimit) {
+				var btn = document.getElementById('btn-load-more');
+				var remaining = g_allMatches.length - currentLimit;
+				btn.innerHTML = "Load more " + (remaining > g_pcPageSize ? g_pcPageSize : remaining) + " items";
+				btn.style.display = 'block';
+			} else {
+				var btn = document.getElementById('btn-load-more');
+				if(btn) btn.style.display = 'none';
+			}
+			
+			g_renderingHTML = false;
+	
+			// 2. === AQUI ESTÁ A CORREÇÃO DO SCROLL ===
+			// Só roda se tivermos agendado um scroll na função de busca
+			if (g_pendingScroll !== null) {
+				var contentDiv = document.querySelector('.content');
+				if (contentDiv) {
+					// Força o navegador a ir para a posição salva
+					contentDiv.scrollTop = g_pendingScroll;
+				}
+				g_pendingScroll = null; // Limpa para não rolar de novo sem querer
+			}
+		}
+	}
 		
 	function loadMoreItems() {
 		if (isPS3) return; // Segurança
@@ -1704,7 +1787,7 @@ function checkVisibility() {
 		f.query.placeholder = DB.length + " items found";
 		
 		// Reseta o limite de paginação do PC sempre que filtrar/buscar
-		//g_pcRenderLimit = g_pcPageSize; 
+		//g_pcRenderLimit = g_pcPageSize; 
 		document.getElementById('btn-load-more').style.display = 'none'; // Esconde botão ao reiniciar
 	
 		var regionRule = (g_regionFilter == "ALL") ? new RegExp(".*") : new RegExp("^"+g_regionFilter+"$", 'i');
@@ -1733,23 +1816,23 @@ function checkVisibility() {
 		// POSIÇÃO CORRETA: AJUSTE DINÂMICO DO CHUNK SIZE NO PS3
 		// =======================================================
 		if (isPS3) {
-		var totalItems = g_allMatches.length; 
+		var totalItems = g_allMatches.length; 
 			var chunkSizeIdeal = 200; // O valor vencedor e mais estável (0.76s)
 			var dynamicChunkSize;
 		
 			if (totalItems <= 50) {
-				// Regra 1: Lista Pequena (<= 50). 
+				// Regra 1: Lista Pequena (<= 50). 
 				// Para evitar o overhead, processamos tudo de uma vez.
-				dynamicChunkSize = totalItems > 0 ? totalItems : 1; 
+				dynamicChunkSize = totalItems > 0 ? totalItems : 1; 
 			} else {
-				// Regra 2: Lista Média/Grande (> 50). 
+				// Regra 2: Lista Média/Grande (> 50). 
 				// Usamos o chunk ideal de 200 para maximizar o carregamento e minimizar pausas.
 				// O teste de 453 itens provou que este é o ponto mais rápido.
-				dynamicChunkSize = Math.min(chunkSizeIdeal, totalItems); 
+				dynamicChunkSize = Math.min(chunkSizeIdeal, totalItems); 
 			}
 			
 			// Aplica o valor dinâmico
-			g_chunkSize = dynamicChunkSize; 
+			g_chunkSize = dynamicChunkSize; 
 		}
 		// =======================================================
 	
@@ -1947,6 +2030,15 @@ function fetchDB() {
 
         document.getElementById("cover-gui").onclick = function() {
 			stopRendering();
+			
+			// === OTIMIZAÇÃO NOVA ===
+			// Se estamos trocando de visualização, PARE TUDO imediatamente.
+			// Isso impede que o PS3 continue baixando imagens se você foi para o modo Lista.
+			if (isPS3) {
+				cancelAllDownloads(); // Corta a internet das imagens
+				g_imgQueue = [];      // Limpa a fila de espera
+			}
+			// =======================
 	
 			useCoverGUI = this.checked;
 			
@@ -2022,86 +2114,78 @@ function fetchDB() {
 
         // 1. Função Principal de Filtro
 		function setFilter(type, value, clickedElement) {
-		stopRendering();
-	
-		if (type == 'search') {
-			// [CORREÇÃO PS3]
-			var cleanValue = value.replace(/^\s+|\s+$/g, ''); 
-			
-			if (cleanValue !== "" && g_preSearchState === null) {
-				var contentDiv = document.querySelector('.content');
-				g_preSearchState = {
-					letter: g_letterFilter,
-					region: g_regionFilter,
-					limit: g_pcRenderLimit,
-					scroll: contentDiv ? contentDiv.scrollTop : 0
-				};
+			stopRendering();
+		
+			// === LÓGICA DE MEMÓRIA ===
+			if (type == 'search') {
+				// [CORREÇÃO PS3] Trocamos .trim() por regex compatível
+				var cleanValue = value.replace(/^\s+|\s+$/g, ''); 
+				
+				if (cleanValue !== "" && g_preSearchState === null) {
+					var contentDiv = document.querySelector('.content');
+					g_preSearchState = {
+						letter: g_letterFilter,
+						region: g_regionFilter,
+						limit: g_pcRenderLimit,
+						scroll: contentDiv ? contentDiv.scrollTop : 0
+					};
+				}
+				g_letterFilter = value;
 			}
-			g_letterFilter = value;
-			
-			g_isSearchActive = true;
-		}
-		else if (type == 'letter') { 
-			g_letterFilter = value; 
-			f.query.value = ""; 
-			g_preSearchState = null;
-			g_pcRenderLimit = 1000;
-			g_isSearchActive = false;
-		}
-		else if (type == 'region') { 
-			g_regionFilter = value; 
-			if (f.query.value === "") {
+			else if (type == 'letter') { 
+				g_letterFilter = value; 
+				f.query.value = ""; 
 				g_preSearchState = null;
 				g_pcRenderLimit = 1000;
-				g_isSearchActive = false;
 			}
+			else if (type == 'region') { 
+				g_regionFilter = value; 
+				if (f.query.value === "") {
+					g_preSearchState = null;
+					g_pcRenderLimit = 1000;
+				}
+			}
+		
+			// Atualiza Visual
+			var links = (type == 'letter') ? document.getElementById("letters").getElementsByTagName("a") : document.getElementById("region-links").getElementsByTagName("a");
+			if (type !== 'search') {
+				for (var i = 0; i < links.length; i++) links[i].className = "";
+				if (clickedElement) clickedElement.className = "active";
+			}
+		
+			document.getElementById('list').innerHTML = '<li>Filtering database... Please wait.</li>';
+			document.getElementById('count').textContent = "Filtering | " + g_regionFilter;
+			
+			setTimeout(render, 300);
+			
+			if (type !== 'search') scrollToTop();
 		}
-	
-		var links = (type == 'letter') ? document.getElementById("letters").getElementsByTagName("a") : document.getElementById("region-links").getElementsByTagName("a");
-		if (type !== 'search') {
-			for (var i = 0; i < links.length; i++) links[i].className = "";
-			if (clickedElement) clickedElement.className = "active";
-		}
-	
-		document.getElementById('list').innerHTML = '<li>Filtering database... Please wait.</li>';
-		document.getElementById('count').textContent = "Filtering | " + g_regionFilter;
 		
-		setTimeout(render, 300);
-		
-		if (type !== 'search') scrollToTop();
-	}
-		
+		// 2. Input Handler (Digitação e Limpeza)
 		function onSearchInput(input) {
 			var val = input.value;
 		
-			// 1. SE LIMPOU A CAIXA
+			// Se limpou (X ou apagou tudo) -> RESTAURA
 			if (val === "") {
-				
-				// === A CORREÇÃO PARA O PS3 ===
-				// Se não havia pesquisa ativa (o usuário só digitou mas não buscou),
-				// não fazemos NADA. Evita o "piscar" da tela.
-				if (!g_isSearchActive) return; 
-		
 				if (g_preSearchState) {
 					g_letterFilter = g_preSearchState.letter;
 					g_regionFilter = g_preSearchState.region;
 					g_pcRenderLimit = g_preSearchState.limit;
 					
+					// Agenda scroll
 					g_pendingScroll = g_preSearchState.scroll;
 					
-					render(true);
+					render();
 					
 					g_preSearchState = null;
 				} else {
 					g_pcRenderLimit = 1000;
 					setFilter('letter', g_defaultLetterFilter || "", null);
 				}
-				
-				g_isSearchActive = false; // <--- Marca que a pesquisa acabou
 			} 
-			// 2. SE DIGITOU ALGO
+			// Se digitou algo
 			else {
-				// PC busca ao vivo. PS3 espera.
+				// PC busca ao vivo. PS3 não faz nada aqui (espera botão).
 				if (!isPS3) {
 					setFilter('search', val, null);
 				}
@@ -2159,8 +2243,6 @@ function fetchDB() {
             stopRendering();
             currentCategory = cat;
             
-			g_isSearchActive = false;
-			
             // === DEFINIÇÃO DOS ARQUIVOS ===
             switch(cat) {
                 case "games": 
@@ -2443,5 +2525,117 @@ function fetchDB() {
 				
 			});
 		</script>
+		
+		<div id="debug-panel" style="position:fixed; top:10px; right:10px; width: 150px; background:rgba(0,0,0,0.9); border:2px solid yellow; color:#fff; padding:8px; z-index:99999; font-size:11px; text-align:center; border-radius:4px; font-family:monospace; display: none;">
+    
+    <div style="font-weight:bold; color:yellow; margin-bottom:5px;">Status Monitor</div>
+    
+    <div style="width:100%; height:15px; background:#333; border:1px solid #fff; position:relative; margin-bottom:8px;">
+        <div id="cpu-bouncer" style="width:15px; height:100%; background:#ff0000; position:absolute; left:0; top:0;"></div>
+    </div>
+    
+    <div id="timer-display" style="font-size:14px; font-weight:bold; color:#fff; margin: 5px 0; border:1px solid #555; padding:2px;">
+        0.00s
+    </div>
+
+    <div style="text-align:left; padding-left:5px; margin-bottom:5px; border-bottom:1px solid #555; padding-bottom:5px;">
+        HTML: <span id="stat-html" style="color:#aaa">Idle</span><br>
+        Queue: <span id="stat-queue" style="color:#aaa">0</span><br>
+        Active DL: <span id="stat-active" style="color:#aaa">0</span>
+    </div>
+    
+    <div style="display:flex; justify-content:space-between; margin-bottom:8px;">
+        <div style="width:48%;">
+            <div style="font-size:9px; color:#aaa; margin-bottom:2px;">CHUNK</div>
+            <input type="number" id="inp-chunk" value="20" style="width:100%; text-align:center; font-weight:bold;">
+        </div>
+        <div style="width:48%;">
+            <div style="font-size:9px; color:#aaa; margin-bottom:2px;">PARALLEL</div>
+            <input type="number" id="inp-parallel" value="24" style="width:100%; text-align:center; font-weight:bold;">
+        </div>
+    </div>
+    
+    <button onclick="applyDebug()" style="width:100%; padding:5px; background:yellow; color:black; font-weight:bold; cursor:pointer; border:1px solid #fff;">START TEST</button>
+</div>
+
+<script>
+    // --- LÓGICA DE ATIVAÇÃO CONDICIONAL ---
+    function isDebugMode() {
+        // Verifica se a URL contém "?debug" ou "&debug"
+        return window.location.href.indexOf('debug') > -1;
+    }
+
+    if (isDebugMode()) {
+        // Se a tag 'debug' estiver na URL, mostra o painel.
+        document.getElementById('debug-panel').style.display = 'block';
+    }
+
+    // --- ANIMAÇÃO CPU (Bouncer) ---
+    var bouncer = document.getElementById('cpu-bouncer');
+    var bouncerPos = 0;
+    var bouncerDir = 3;
+    function animateBouncer() {
+        bouncerPos += bouncerDir;
+        if (bouncerPos > (135) || bouncerPos < 0) bouncerDir *= -1;
+        bouncer.style.left = bouncerPos + "px";
+        setTimeout(animateBouncer, 30);
+    }
+    animateBouncer();
+
+    // --- LÓGICA DO TIMER ---
+    // Preenche inputs com valores iniciais (Garante que se o modo debug for ligado, ele use as configs atuais)
+    document.getElementById('inp-chunk').value = window.g_chunkSize || 20;
+    document.getElementById('inp-parallel').value = window.MAX_PARALLEL_LOADS || 24;
+    
+    var benchInterval = null;
+    var startTime = 0;
+
+    function applyDebug() {
+        // 1. Aplica Configs
+        window.g_chunkSize = parseInt(document.getElementById('inp-chunk').value);
+        window.MAX_PARALLEL_LOADS = parseInt(document.getElementById('inp-parallel').value);
+        
+        // 2. Reseta tudo (usando as variáveis globais do seu script)
+        if (typeof cancelAllDownloads === 'function') cancelAllDownloads();
+        if (benchInterval) clearInterval(benchInterval);
+        
+        // 3. Inicia Renderização
+        if (typeof render === 'function') render(); 
+        
+        // 4. Inicia Monitoramento
+        startTime = new Date().getTime();
+        document.getElementById('timer-display').style.color = "yellow";
+        document.getElementById('timer-display').innerHTML = "Running...";
+        
+        benchInterval = setInterval(monitorLoop, 100);
+    }
+
+    function monitorLoop() {
+        // Pega o estado atual das variáveis globais do seu script
+        var isHTML = window.g_renderingHTML;
+        var queue = window.g_imgQueue ? window.g_imgQueue.length : 0;
+        var active = window.g_activeDownloads || 0;
+        
+        // Atualiza visual
+        document.getElementById('stat-html').innerHTML = isHTML ? "BUSY" : "Done";
+        document.getElementById('stat-html').style.color = isHTML ? "red" : "#00ff00";
+        
+        document.getElementById('stat-queue').innerHTML = queue;
+        document.getElementById('stat-active').innerHTML = active;
+        
+        // Atualiza tempo
+        var now = new Date().getTime();
+        var currentSec = ((now - startTime) / 1000).toFixed(2);
+        document.getElementById('timer-display').innerHTML = currentSec + "s";
+
+        // Condição de Vitória
+        if (!isHTML && queue === 0 && active === 0) {
+            clearInterval(benchInterval);
+            document.getElementById('timer-display').style.color = "#00ff00";
+            document.getElementById('timer-display').innerHTML = "DONE: " + currentSec + "s";
+        }
+    }
+</script>
+
    </body>
 </html>
