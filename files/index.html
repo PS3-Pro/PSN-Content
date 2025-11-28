@@ -204,6 +204,10 @@
             width: 160px;
             color: #fff;
         }
+		
+		.is-ps3 input[type="search"] {
+            color: #0056b3;
+        }
 
         button {
             margin: 2px;
@@ -852,9 +856,14 @@
          <a href="">PlayStation&trade; Network Database</a>
          <div id="count" aria-live="polite" role="status">Loading</div>
          <form name="engine" onsubmit="setFilter('search', this.query.value, null); return false;">
-            <div id="search-group">
-            <input type="search" name="query" size="25" placeholder="Search">
-            <input type="submit" name="send" value="Search" disabled>
+            <form name="engine" onsubmit="return false;">
+			<div id="search-group">
+				<input type="search" name="query" size="25" placeholder="Search" 
+					oninput="onSearchInput(this)" 
+					onkeydown="return checkEnter(event, this)">
+				
+				<input type="button" name="send" value="Search" 
+					onclick="forceSearch(this.form.query)">
 			</div>
 			
 			<div id="controls-group">
@@ -955,6 +964,8 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
     var g_letterFilter = "";
     var g_regionFilter = "ALL";
     var useCoverGUI = false;
+	var g_preSearchState = null; // Variável para guardar o estado antes da pesquisa
+	var g_pendingScroll = null;
 	
 	// CONFIGURAÇÃO DA FILA DE IMAGENS
 	var g_imgQueue = [];          // Fila de espera
@@ -1573,19 +1584,20 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
 		var currentLimit = isPS3 ? g_allMatches.length : g_pcRenderLimit;
 	
 		// Fatiar o array (slice)
-		// Nota: O slice lida bem mesmo se o indice passar do tamanho, mas é bom garantir
 		var chunk = g_allMatches.slice(g_currentChunkIndex, g_currentChunkIndex + g_chunkSize);
 		
 		// 1. Prepara o Array
 		var chunkArray = [];
 		
-		if (chunk.length === 0) { 
+		if (chunk.length === 0) {
 			if (g_currentChunkIndex === 0) {
-				list.innerHTML = '<li>No items found.</li>'; 
+				list.innerHTML = '<li>No items found.</li>';
 			}
-			// Se o chunk está vazio, não há nada a fazer, mas precisamos verificar se devemos mostrar o botão
-			// (Caso raro onde o limite bate exato com o final)
-			return; 
+			// Se a lista está vazia, esconde o botão
+			var btn = document.getElementById('btn-load-more');
+			if(btn) btn.style.display = 'none';
+			g_renderingHTML = false;
+			return;
 		}
 		
 		// === LOOP ===
@@ -1602,8 +1614,8 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
 				
 				var size = formatFileSize(a[a.length-1] || a[a.length-2] || "");
 				var cid = a[0], name = a[2];
-				var uniqueIndex = g_currentChunkIndex + i; 
-				var tileId = "img_" + cid + "_" + uniqueIndex; 
+				var uniqueIndex = g_currentChunkIndex + i;
+				var tileId = "img_" + cid + "_" + uniqueIndex;
 				
 				chunkArray.push(
 					'<div class="game-tile">',
@@ -1629,7 +1641,7 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
 				
 				chunkArray.push(
 					'<li>',
-						name, ' <span style="color: #ffff00;">[', cid, ']</span> ', size, 
+						name, ' <span style="color: #ffff00;">[', cid, ']</span> ', size,
 						' ', makeRap(a), ' <a href="', a[3], '" class="pkg-btn">PKG</a>',
 					'</li>'
 				);
@@ -1645,32 +1657,36 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
 		
 		// 3. Acorda o Carregador de Imagens
 		if (useCoverGUI) {
-		if (isPS3) { 
-			if (g_scrollTimer) clearTimeout(g_scrollTimer);
-			g_scrollTimer = setTimeout(checkVisibility, 300); 
-		} else { 
-			for(var i=0; i<chunk.length; i++) { 
+			if (isPS3) {
+				if (g_scrollTimer) clearTimeout(g_scrollTimer);
+				g_scrollTimer = setTimeout(checkVisibility, 300);
+			} else {
+				for(var i=0; i<chunk.length; i++) {
 					// Se passou do limite, não carrega imagem
 					if (!isPS3 && (g_currentChunkIndex + i) >= currentLimit) break;
 	
-				var r = chunk[i]; 
-				if(r[3] && r[3] !== "MISSING") { 
-					var uniqueIndex = g_currentChunkIndex + i;
-					var uniqueTileId = "img_" + r[0] + "_" + uniqueIndex;
-					(function(tid, c){ 
-						setTimeout(function(){ loadCoverSequence(tid, c); }, 0); 
-					})(uniqueTileId, r[0]); 
-				} 
-			} 
-		}
+					var r = chunk[i];
+					if(r[3] && r[3] !== "MISSING") {
+						var uniqueIndex = g_currentChunkIndex + i;
+						var uniqueTileId = "img_" + r[0] + "_" + uniqueIndex;
+						(function(tid, c){
+							setTimeout(function(){ loadCoverSequence(tid, c); }, 0);
+						})(uniqueTileId, r[0]);
+					}
+				}
+			}
 		}
 		
 		// 4. Próximo pedaço (Avança o índice)
 		g_currentChunkIndex += g_chunkSize;
 		
-		if (g_currentChunkIndex < g_allMatches.length && g_currentChunkIndex < currentLimit) { 
-			g_renderTimer = setTimeout(renderChunk, 0); 
+		// === DECISÃO FINAL ===
+		if (g_currentChunkIndex < g_allMatches.length && g_currentChunkIndex < currentLimit) {
+			g_renderTimer = setTimeout(renderChunk, 0);
 		} else {
+			// === RENDERIZAR TERMINOU ===
+			
+			// 1. Lógica do Botão (Sua lógica original que funciona)
 			if (!isPS3 && g_allMatches.length > currentLimit) {
 				var btn = document.getElementById('btn-load-more');
 				var remaining = g_allMatches.length - currentLimit;
@@ -1680,7 +1696,19 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
 				var btn = document.getElementById('btn-load-more');
 				if(btn) btn.style.display = 'none';
 			}
+			
 			g_renderingHTML = false;
+	
+			// 2. === AQUI ESTÁ A CORREÇÃO DO SCROLL ===
+			// Só roda se tivermos agendado um scroll na função de busca
+			if (g_pendingScroll !== null) {
+				var contentDiv = document.querySelector('.content');
+				if (contentDiv) {
+					// Força o navegador a ir para a posição salva
+					contentDiv.scrollTop = g_pendingScroll;
+				}
+				g_pendingScroll = null; // Limpa para não rolar de novo sem querer
+			}
 		}
 	}
 		
@@ -1716,7 +1744,7 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
 		f.query.placeholder = DB.length + " items found";
 		
 		// Reseta o limite de paginação do PC sempre que filtrar/buscar
-		g_pcRenderLimit = g_pcPageSize; 
+		//g_pcRenderLimit = g_pcPageSize; 
 		document.getElementById('btn-load-more').style.display = 'none'; // Esconde botão ao reiniciar
 	
 		var regionRule = (g_regionFilter == "ALL") ? new RegExp(".*") : new RegExp("^"+g_regionFilter+"$", 'i');
@@ -2041,19 +2069,113 @@ function fetchDB() {
             fetchDB();
         }
 
-        function setFilter(type, value, clickedElement) {
-            stopRendering();
-            if (type == 'letter') { g_letterFilter = value; f.query.value = ""; }
-            else if (type == 'region') { g_regionFilter = value; }
-            else if (type == 'search') { g_letterFilter = value; }
-            var links = (type == 'letter') ? document.getElementById("letters").getElementsByTagName("a") : document.getElementById("region-links").getElementsByTagName("a");
-            for (var i = 0; i < links.length; i++) links[i].className = "";
-            if (clickedElement) clickedElement.className = "active";
-            document.getElementById('list').innerHTML = '<li>Filtering database... Please wait.</li>';
-            document.getElementById('count').textContent = "Filtering | " + g_regionFilter;
-            setTimeout(render, 300);
-            scrollToTop();
-        }
+        // 1. Função Principal de Filtro
+		function setFilter(type, value, clickedElement) {
+			stopRendering();
+		
+			// === LÓGICA DE MEMÓRIA ===
+			if (type == 'search') {
+				// [CORREÇÃO PS3] Trocamos .trim() por regex compatível
+				var cleanValue = value.replace(/^\s+|\s+$/g, ''); 
+				
+				if (cleanValue !== "" && g_preSearchState === null) {
+					var contentDiv = document.querySelector('.content');
+					g_preSearchState = {
+						letter: g_letterFilter,
+						region: g_regionFilter,
+						limit: g_pcRenderLimit,
+						scroll: contentDiv ? contentDiv.scrollTop : 0
+					};
+				}
+				g_letterFilter = value;
+			}
+			else if (type == 'letter') { 
+				g_letterFilter = value; 
+				f.query.value = ""; 
+				g_preSearchState = null;
+				g_pcRenderLimit = 1000;
+			}
+			else if (type == 'region') { 
+				g_regionFilter = value; 
+				if (f.query.value === "") {
+					g_preSearchState = null;
+					g_pcRenderLimit = 1000;
+				}
+			}
+		
+			// Atualiza Visual
+			var links = (type == 'letter') ? document.getElementById("letters").getElementsByTagName("a") : document.getElementById("region-links").getElementsByTagName("a");
+			if (type !== 'search') {
+				for (var i = 0; i < links.length; i++) links[i].className = "";
+				if (clickedElement) clickedElement.className = "active";
+			}
+		
+			document.getElementById('list').innerHTML = '<li>Filtering database... Please wait.</li>';
+			document.getElementById('count').textContent = "Filtering | " + g_regionFilter;
+			
+			setTimeout(render, 300);
+			
+			if (type !== 'search') scrollToTop();
+		}
+		
+		// 2. Input Handler (Digitação e Limpeza)
+		function onSearchInput(input) {
+			var val = input.value;
+		
+			// Se limpou (X ou apagou tudo) -> RESTAURA
+			if (val === "") {
+				if (g_preSearchState) {
+					g_letterFilter = g_preSearchState.letter;
+					g_regionFilter = g_preSearchState.region;
+					g_pcRenderLimit = g_preSearchState.limit;
+					
+					// Agenda scroll
+					g_pendingScroll = g_preSearchState.scroll;
+					
+					render();
+					
+					g_preSearchState = null;
+				} else {
+					g_pcRenderLimit = 1000;
+					setFilter('letter', g_defaultLetterFilter || "", null);
+				}
+			} 
+			// Se digitou algo
+			else {
+				// PC busca ao vivo. PS3 não faz nada aqui (espera botão).
+				if (!isPS3) {
+					setFilter('search', val, null);
+				}
+			}
+		}
+		
+		// 3. Detecta ENTER (Para PS3)
+		function checkEnter(e, input) {
+			var key = e.which || e.keyCode;
+			if (key === 13) {
+				// [CORREÇÃO PS3] Blur tira o foco do input para fechar teclado
+				if(input) input.blur(); 
+				forceSearch(input);
+				return false; // Retorna false para garantir que não recarregue
+			}
+		}
+		
+		// 4. Executa a Busca Manual (Botão ou Enter)
+		function forceSearch(input) {
+			var val = input.value;
+			
+			// === NOVO: SE ESTIVER VAZIO, RESTAURA ===
+			if (val === "") {
+				// Chama a função principal que tem a lógica de memória/restaurar
+				onSearchInput(input); 
+				return;
+			}
+		
+			// SE TIVER TEXTO, PESQUISA
+			if (val && val.replace(/^\s+|\s+$/g, '') !== "") {
+				setFilter('search', val, null);
+			}
+		}
         
         function createLetterLinks() {
            // 1. Primeiro: Filtro Numérico [0-9]
