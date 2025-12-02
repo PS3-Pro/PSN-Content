@@ -1026,8 +1026,6 @@
 		.is-pc .content {
 			height: calc(111.15vh - 200px) !important;
 		}
-		
-		 </style>
     </style>
    <body>
       <header>
@@ -1509,7 +1507,7 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
 				loaderGH.src = "";
 				g_ps3FallbackQueue.push({ imgID: imgID, cid: cid });
 				finish(loaderGH);
-			}, 500);
+			}, 1500);
 
 			loaderGH.onload = function() {
 				if (g_renderID != currentID) { finish(loaderGH); return; }
@@ -1690,90 +1688,133 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
     function processImageQueue() {
         if (g_activeDownloads < 0) g_activeDownloads = 0;
         if (g_activeDownloads >= MAX_PARALLEL_LOADS) return;
-        
-        var delay = isPS3 ? 10 : 0;
-        
-        if (g_imgQueue.length > 0) {
-            var nextItem = g_imgQueue.shift();
-            g_activeDownloads++;
-            
-            loadCoverSequenceInternal(nextItem.imgID, nextItem.cid, function() {
-                g_activeDownloads--;
-                setTimeout(processImageQueue, delay);
-            });
-            
-            if (g_activeDownloads < MAX_PARALLEL_LOADS) {
-                setTimeout(processImageQueue, delay);
-            }
-        }
-    }
+		var delay = isPS3 ? 5 : 0; 
+		
+		if (g_imgQueue.length > 0) {
+			var nextItem = g_imgQueue.shift();
+			g_activeDownloads++;
+			
+			loadCoverSequenceInternal(nextItem.imgID, nextItem.cid, function() {
+				g_activeDownloads--;
+                setTimeout(processImageQueue, delay); 
+			}, false);
+			
+			if (g_activeDownloads < MAX_PARALLEL_LOADS) {
+				setTimeout(processImageQueue, delay);
+			}
+            return;
+		}
+
+        if (isPS3 && g_ps3FallbackQueue.length > 0) {
+			var fallbackItem = g_ps3FallbackQueue.shift();
+			g_activeDownloads++;
+				
+			loadCoverSequenceInternal(fallbackItem.imgID, fallbackItem.cid, function() {
+				g_activeDownloads--;
+				setTimeout(processImageQueue, delay); 
+			}, true);
+
+			if (g_activeDownloads < MAX_PARALLEL_LOADS) {
+				setTimeout(processImageQueue, delay);
+			}
+			return;
+		}
+	}
 
     function checkVisibility() {
-        g_imgQueue = [];
+    g_imgQueue = []; 
+    
+    var imgs = document.querySelectorAll('.game-tile img');
+    
+    var scrollY = 0;
+    var contentDiv = document.querySelector('.content');
+    
+    if (contentDiv && (isPS3 || document.body.className.indexOf('is-pc') !== -1)) {
+        scrollY = contentDiv.scrollTop; 
+    } else {
+        scrollY = window.pageYOffset;
+    }
+    
+    var viewH = window.innerHeight;
+    
+    var screenTop = scrollY;
+    var screenBottom = scrollY + viewH;
+
+    var loadBuffer;
         
-        var imgs = document.querySelectorAll('.game-tile img');
-        var scrollY = 0;
-        var contentDiv = document.querySelector('.content');
-        
-        if (contentDiv && (isPS3 || document.body.className.indexOf('is-pc') !== -1)) {
-            scrollY = contentDiv.scrollTop; 
+        if (isPS3) {
+            loadBuffer = 1000;
         } else {
-            scrollY = window.pageYOffset;
+            loadBuffer = g_lazyLoadPC ? 3200 : 999999; 
+        }
+
+        var unloadBufferTop = 3000; 
+        var unloadBufferBottom = 3000;
+
+    var loadTop = scrollY - loadBuffer;
+    var loadBottom = scrollY + viewH + loadBuffer;
+    var keepTop = scrollY - unloadBufferTop;
+    var keepBottom = scrollY + viewH + unloadBufferBottom;
+
+    var loadCandidates = [];
+
+    for (var i = 0; i < imgs.length; i++) {
+        var img = imgs[i];
+        if (!img.offsetParent) continue;
+        
+        var yPos = 0; 
+        var el = img;
+        while(el && el !== contentDiv && el !== document.body) {
+            yPos += el.offsetTop;
+            el = el.offsetParent;
         }
         
-        var viewH = window.innerHeight;
-        var loadBuffer = isPS3 ? 800 : (g_lazyLoadPC ? 3000 : 99999); 
-        
-        var loadTop = scrollY - loadBuffer;
-        var loadBottom = scrollY + viewH + loadBuffer;
+        var isVisibleOnScreen = (yPos < screenBottom) && ((yPos + img.height) > screenTop);
 
-        var loadCandidates = [];
+       if (yPos >= loadTop && yPos <= loadBottom) {
+            if (img.src === defaultCover) { 
+                img.removeAttribute('data-queued'); 
+                var cid = img.getAttribute('data-cid'); 
+                
+                var viewCenter = scrollY + (viewH / 2);
+                var imgCenter = yPos + (img.height / 2);
+                var distance = Math.abs(viewCenter - imgCenter);
 
-        for (var i = 0; i < imgs.length; i++) {
-            var img = imgs[i];
-            if (!img.offsetParent) continue;
-            
-            var yPos = 0;
-            var el = img;
-            while(el && el !== contentDiv && el !== document.body) {
-                yPos += el.offsetTop;
-                el = el.offsetParent;
+                loadCandidates.push({
+                    id: img.id,
+                    cid: cid,
+                    y: yPos,  
+                    visible: isVisibleOnScreen,
+                    dist: distance
+                });
             }
-            
-            var isVisibleOnScreen = (yPos < (scrollY + viewH)) && ((yPos + img.height) > scrollY);
-
-            if (yPos >= loadTop && yPos <= loadBottom) {
-                if (img.src === defaultCover) { 
-                    img.removeAttribute('data-queued'); 
-                    var cid = img.getAttribute('data-cid'); 
-                    
-                    loadCandidates.push({
-                        id: img.id,
-                        cid: cid,
-                        y: yPos,
-                        visible: isVisibleOnScreen
-                    });
-                }
-            } 
-            else if (isPS3 && (yPos < (scrollY - 3000) || yPos > (scrollY + 3000))) {
-                 if (img.src !== defaultCover) { 
-                    img.removeAttribute('data-queued'); 
-                    img.src = defaultCover; 
-                 }
-            }
-        }
+        } 
         
-        loadCandidates.sort(function(a, b) {
-            if (a.visible && !b.visible) return -1;
-            if (!a.visible && b.visible) return 1;
-            
-            return a.y - b.y;
-        });
-
-        for (var k = 0; k < loadCandidates.length; k++) {
-            loadCoverSequence(loadCandidates[k].id, loadCandidates[k].cid);
+        else if (isPS3 && (yPos < keepTop || yPos > keepBottom)) {
+            if (img.src !== defaultCover) { 
+                img.removeAttribute('data-queued'); 
+                img.src = defaultCover; 
+            }
         }
     }
+	
+	loadCandidates.sort(function(a, b) {
+		if (a.visible && !b.visible) return -1;
+        if (!a.visible && b.visible) return 1;
+
+        if (a.visible && b.visible) {
+			return a.y - b.y; 
+        }
+
+        return a.dist - b.dist;
+    });
+
+    for (var k = 0; k < loadCandidates.length; k++) {
+        loadCoverSequence(loadCandidates[k].id, loadCandidates[k].cid);
+    }
+	}
+	
+	var g_lastScrollY = 0;
     
     function attachScrollListener() {
         var contentDiv = document.querySelector('.content');
