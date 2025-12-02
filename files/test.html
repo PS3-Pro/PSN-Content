@@ -1132,6 +1132,7 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
     if (!isPS3) {
         MAX_PARALLEL_LOADS = g_lazyLoadPC ? 32 : 1000; 
     }
+	var TIMEOUT_MS = isPS3 ? 0 : 1500;
     
 	var g_lazyLoadPC = true; // Ativa o carregamento seletivo, evita que toda as imagens da lista sejam mostradas de uma vez, carregando apenas as que estão sendo exebidas na tela
 	
@@ -1405,161 +1406,80 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
         g_renderID++;
     }
 
-	function loadCoverSequenceInternal(imgID, cid, onComplete, isSonyRetry) {
+	function loadCoverSequenceInternal(imgID, cid, onComplete) {
 		var currentID = g_renderID;
 		
-		// 1. Proteção Blacklist (Só PS3)
 		if (isPS3 && g_failedIDs[cid]) {
 			if(onComplete) onComplete();
 			return;
 		}
-
+	
 		var img = document.getElementById(imgID);
 		if (!img) { if(onComplete) onComplete(); return; }
-
+	
 		var ghDirectPS3 = "https://ps3-pro.github.io/PSN-Content/resources/covers/compressed/" + cid + ".JPG";
 		var ghDirectPC = "https://ps3-pro.github.io/PSN-Content/resources/covers/uncompressed/" + cid + ".JPG";
+	
 		var primaryURL = isPS3 ? ghDirectPS3 : ghDirectPC;
-		
+		var fallbackURL = "";
+	
+		try {
+			var hash = generateSonyHash(cid);
+			fallbackURL = "http://tmdb.np.dl.playstation.net/tmdb/" + hash + "/ICON0.PNG";
+		} catch(e) {}
+	
+		var loader = new Image();
+		g_currentLoaders.push(loader);
+	
 		var timeoutTimer = null;
-
-		// Função de limpeza unificada
-		function finish(loaderToRemove) {
+		var hasFinished = false;
+		var isFallbackRunning = false;
+	
+		function finish() {
+			if (hasFinished) return;
+			hasFinished = true;
+	
 			if (timeoutTimer) clearTimeout(timeoutTimer);
-
-            // Remove o loader específico da lista global
-            if (loaderToRemove) {
-                var idx = g_currentLoaders.indexOf(loaderToRemove);
-                if (idx > -1) g_currentLoaders.splice(idx, 1);
-            }
-
+	
+			var idx = g_currentLoaders.indexOf(loader);
+			if (idx > -1) g_currentLoaders.splice(idx, 1);
+	
 			if(onComplete) onComplete();
 		}
-
-		// ==========================================================
-		// ÁREA EXCLUSIVA DO PS3
-		// ==========================================================
-		if (isPS3) {
-            
-            // --- FASE 2: SONY (TMDB) ---
-			if (isSonyRetry) {
-				try {
-					var hash = generateSonyHash(cid);
-					var sonyDirect = "http://tmdb.np.dl.playstation.net/tmdb/" + hash + "/ICON0.PNG";
-					
-                    // Nome de variável único para não confundir o NetFront
-                    var loaderSony = new Image();
-					g_currentLoaders.push(loaderSony);
-
-					// Timeout Sony (10s - Sony costuma ser lenta mas responde)
-					timeoutTimer = setTimeout(function() {
-						loaderSony.src = ""; 
-						g_failedIDs[cid] = true; 
-						finish(loaderSony);
-					}, 10000);
-
-					loaderSony.onload = function() {
-						if (g_renderID != currentID) { finish(loaderSony); return; }
-						var el = document.getElementById(imgID); 
-						if(el) {
-							el.src = sonyDirect;
-							el.removeAttribute('data-queued');
-						}
-						finish(loaderSony);
-					};
-					
-                    loaderSony.onerror = function() { 
-						g_failedIDs[cid] = true; 
-						finish(loaderSony); 
-					}; 
-					
-                    loaderSony.src = sonyDirect;
-				} catch(e) { 
-					g_failedIDs[cid] = true;
-					finish(null); 
-				}
+	
+		loader.onload = function() {
+			if (g_renderID != currentID) { finish(); return; }
+			
+			var el = document.getElementById(imgID);
+			if(el) {
+				el.src = loader.src;
+				el.removeAttribute('data-queued');
+			}
+			finish();
+		};
+	
+		loader.onerror = function() {
+			if (g_renderID != currentID) { finish(); return; }
+			
+			if (!isFallbackRunning) {
+				isFallbackRunning = true;
+				loader.src = fallbackURL; 
 				return;
 			}
-
-			var loaderGH = new Image();
-			g_currentLoaders.push(loaderGH);
-
-			timeoutTimer = setTimeout(function() {
-				loaderGH.src = "";
-				g_ps3FallbackQueue.push({ imgID: imgID, cid: cid });
-				finish(loaderGH);
-			}, 500);
-
-			loaderGH.onload = function() {
-				if (g_renderID != currentID) { finish(loaderGH); return; }
-				var el = document.getElementById(imgID); 
-				if(el) {
-					el.src = primaryURL;
-					el.removeAttribute('data-queued'); 
-				}
-				finish(loaderGH);
-			};
-
-			loaderGH.onerror = function() {
-				if (g_renderID != currentID) { finish(loaderGH); return; }
-				g_ps3FallbackQueue.push({ imgID: imgID, cid: cid });
-				finish(loaderGH);
-			};
 			
-			loaderGH.src = primaryURL;
-			return;
-		}
-
-		// ==========================================================
-		// ÁREA DO PC (Padrão)
-		// ==========================================================
-		var loaderPC = new Image();
-		g_currentLoaders.push(loaderPC); 
-		
-		loaderPC.onload = function() {
-			if (g_renderID != currentID) { finish(loaderPC); return; }
-			var el = document.getElementById(imgID); 
-			if(el) {
-				el.src = primaryURL;
-				el.removeAttribute('data-queued'); 
+			g_failedIDs[cid] = true;
+			finish();
+		};
+	
+		timeoutTimer = setTimeout(function() {
+			if (!hasFinished && !isFallbackRunning) {
+				isFallbackRunning = true;
+				loader.src = fallbackURL; 
 			}
-			finish(loaderPC);
-		};
+		}, TIMEOUT_MS);
 	
-		loaderPC.onerror = function() {
-			if (g_renderID != currentID) { finish(loaderPC); return; }
-			try {
-				var hash = generateSonyHash(cid);
-				var sonyDirect = "http://tmdb.np.dl.playstation.net/tmdb/" + hash + "/ICON0.PNG";
-				
-                var loaderPC2 = new Image();
-				g_currentLoaders.push(loaderPC2);
-
-				loaderPC2.onload = function() {
-					if (g_renderID != currentID) { finish(loaderPC2); return; }
-					var el = document.getElementById(imgID); 
-					if(el) {
-						el.src = sonyDirect;
-						el.removeAttribute('data-queued');
-					}
-					finish(loaderPC2);
-				};
-				loaderPC2.onerror = function() { finish(loaderPC2); }; 
-				loaderPC2.src = sonyDirect;
-			} catch(e) { finish(loaderPC); }
-		};
-		
-		loaderPC.src = primaryURL;
+		loader.src = primaryURL;
 	}
-	
-	function loadCoverSequence(imgID, cid) {
-		var el = document.getElementById(imgID);
-        if(el && el.getAttribute('data-queued') === 'true') return;
-        if(el) el.setAttribute('data-queued', 'true');
-        g_imgQueue.push({ imgID: imgID, cid: cid });
-		g_totalImagesQueued++;
-        processImageQueue();
-    }
 
     // ==============================================================
     // 6. LAZY LOADING (ANTI-CRASH)
@@ -1651,7 +1571,7 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
             if (!hasFinished) {
                 loader.src = fallbackURL; 
             }
-        }, isPS3 ? 4000 : 1000);
+        }, isPS3 ? 3000 : 1000);
 
         loader.src = primaryURL;
     }
@@ -1667,25 +1587,25 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
     }
 
     function processImageQueue() {
-        if (g_activeDownloads < 0) g_activeDownloads = 0;
-        if (g_activeDownloads >= MAX_PARALLEL_LOADS) return;
-        
-        var delay = isPS3 ? 10 : 0;
-        
-        if (g_imgQueue.length > 0) {
-            var nextItem = g_imgQueue.shift();
-            g_activeDownloads++;
-            
-            loadCoverSequenceInternal(nextItem.imgID, nextItem.cid, function() {
-                g_activeDownloads--;
-                setTimeout(processImageQueue, delay);
-            });
-            
-            if (g_activeDownloads < MAX_PARALLEL_LOADS) {
-                setTimeout(processImageQueue, delay);
-            }
-        }
-    }
+		if (g_activeDownloads < 0) g_activeDownloads = 0;
+		if (g_activeDownloads >= MAX_PARALLEL_LOADS) return;
+		
+		var delay = isPS3 ? 10 : 0;
+		
+		if (g_imgQueue.length > 0) {
+			var nextItem = g_imgQueue.shift();
+			g_activeDownloads++;
+			
+			loadCoverSequenceInternal(nextItem.imgID, nextItem.cid, function() {
+				g_activeDownloads--;
+				setTimeout(processImageQueue, delay);
+			});
+			
+			if (g_activeDownloads < MAX_PARALLEL_LOADS) {
+				setTimeout(processImageQueue, delay);
+			}
+		}
+	}
 
     function checkVisibility() {
         g_imgQueue = [];
