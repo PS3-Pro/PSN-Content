@@ -1197,15 +1197,18 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
         var msw = (x >> 16) + (y >> 16) + (lsw >> 16);
         return (msw << 16) | (lsw & 0xFFFF);
     }
+	
     function sha1_ft(t, b, c, d) {
         if (t < 20) return (b & c) | ((~b) & d);
         if (t < 40) return b ^ c ^ d;
         if (t < 60) return (b & c) | (b & d) | (c & d);
         return b ^ c ^ d;
     }
+	
     function sha1_kt(t) {
         return (t < 20) ? 1518500249 : (t < 40) ? 1859775393 : (t < 60) ? -1894007588 : -899497514;
     }
+	
     function core_sha1(x, len) {
         x[len >> 5] |= 0x80 << (24 - len % 32);
         x[((len + 64) >>> 9 << 4) + 15] = len;
@@ -1223,6 +1226,7 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
         }
         return [a, b, c, d, e];
     }
+	
     function str2binb(str) {
         var bin = [];
         var mask = (1 << 8) - 1;
@@ -1233,6 +1237,7 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
         }
         return bin;
     }
+	
     function binb2str(bin) {
         var str = "";
         var mask = (1 << 8) - 1;
@@ -1241,6 +1246,7 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
         }
         return str;
     }
+	
     function bin_sha1(str) { return binb2str(core_sha1(str2binb(str), str.length * 8)); }
     function bin_hmac_sha1(key, data) {
         var b = 64;
@@ -1254,9 +1260,16 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
         }
         return bin_sha1(o_pad + bin_sha1(i_pad + data));
     }
+	
     function toHex(num) { return ('00000000' + (num >>> 0).toString(16)).slice(-8).toUpperCase(); }
 
-    function generateSonyHash(cid){
+    var g_sonyHashCache = {};
+
+    function generateSonyHash(cid) {
+        if (g_sonyHashCache[cid]) {
+            return g_sonyHashCache[cid];
+        }
+
         var base = cid.substring(0,9) + "_00";
         var msg = base.substring(0,12);
         var h = bin_hmac_sha1(tmdb_hmac_key_str, msg);
@@ -1269,9 +1282,130 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
         var p2b = (hashBytes[12]<<24)|(hashBytes[13]<<16)|(hashBytes[14]<<8)|hashBytes[15];
         var p3  = (hashBytes[16]<<24)|(hashBytes[17]<<16)|(hashBytes[18]<<8)|hashBytes[19];
         
-        return base + "_" + toHex(p1a) + toHex(p1b) + toHex(p2a) + toHex(p2b) + toHex(p3);
+        var result = base + "_" + toHex(p1a) + toHex(p1b) + toHex(p2a) + toHex(p2b) + toHex(p3);
+        
+        g_sonyHashCache[cid] = result;
+        return result;
     }
     
+		// ==============================================================
+		// OTIMIZAÇÃO DE REGEX (PRÉ-COMPILADO PARA PS3)
+		// ==============================================================
+		
+		// Regex Gerais
+		var RX_TRIM = /^\s+|\s+$/g;
+		var RX_DEMO_CHK = /\b(demo|trial|beta)\b/i;
+		var RX_TITLE_ID = /Title ID/;
+		var RX_JUNK_CHARS = /　|"/g;
+		var RX_QUOTES = /'{2,}/g;
+		var RX_REGIONS = /(\(|\[)\s*(de|fr|eu|us|jp|uk|es|it|ru|au|italian|french|german|spanish|english|japanese)\s*(\)|\])/gi;
+		var RX_CLEAN_PARENS = /\(\s*\)|\[\s*\]|^[\s:,\-]+|-\s*$/g;
+		var RX_DBL_SPACE = /\s{2,}/g;
+		var RX_SINGLE_QUOTE = /^'+|'+$/g;
+		var RX_MID_QUOTE = /'(?![s])/g;
+		var RX_SPACE_DASH = /(\S)-(\S)/g;
+		var RX_DE_FIX = /\sDe\s/g;
+		var RX_DE_END = /\s+de$/i;
+		var RX_VOL_FIX = /([a-zA-Z])(vol)/gi;
+		var RX_VOL_NUM = /\bvol\.?\s*(\d+)/gi;
+		var RX_VER_FIX = /\bV\s+(\d+)/g;
+		var RX_VER_SPC = /\sV\s/g;
+		var RX_HYPHEN_FIX = /\b(\d+)\s+-\s+In\s+-\s+(\d+)\b/gi;
+		
+		// Regex Específicos de Categorias
+		var RX_THEME_TERMS = /\b(din[aá]mico|dynamique|dynamisches|est[aá]tico|statique|statisches|custom\s*theme|t[eé]ma|design|designs|complete)\b/gi;
+		var RX_THEME_JAP = /(カスタムテーマ|テーマ|特典)/g;
+		var RX_THEME_COMMON = /\b(for\s+download|tema\s+de|thèmes|themes|theme)\b/gi;
+		var RX_THEME_DYN = /\b(dynamic)\b/gi;
+		var RX_THEME_STAT = /\b(static)\b/gi;
+		var RX_PACK_TERMS = /\b(pack\s+de\s+temas|pack\s+de)\b/gi;
+		var RX_PACK_WORD = /\bPack\b/gi;
+		var RX_AVATAR_WORD = /\bAvatars?\b/gi;
+		var RX_DEMO_TERMS = /\b(full\s+game\s+trial|trial\s+to\s+full|demo\s+version|trial\s+ver|demo|trial|beta)\b/gi;
+		
+		// Regex de Formatação (Capitalização e Hardware)
+		var RX_CAPITALIZE = /(?:^|\s|[.,!?:;([{®™-])+[a-z0-9]/g;
+		var RX_ROMAN = /\b(ii|iii|iv|vi|vii|viii|ix|xi|xii|xiii|xiv|xv|xvi|xvii|xviii|xix|xx)\b/gi;
+		var RX_PS_TERMS = /\b(Ps\s*3|Ps\s*2|Ps\s*1|Ps\s*x|Psp|Vita|Hd|3\s*d|4\s*k)\b/gi;
+		var RX_RES_P = /\b(\d+)p\b/gi;
+		var RX_CAMEL = /([a-z])([A-Z])/g;
+		var RX_NUM_LOWER = /(\d)(?!(?:st|nd|rd|th|s|p|d|k)\b)([a-zA-Z])/gi;
+		var RX_LOWER_NUM = /([a-zA-Z])(\d)/g;
+		var RX_CHAR_NUM = /\b([a-zA-Z])\s+(\d+)/g;
+		
+		function cleanGameName(name, cat) {
+			name = name.replace(RX_JUNK_CHARS, " ").replace(RX_QUOTES, "").replace(RX_REGIONS, "");
+		
+			if (cat === "themes") {
+				name = name.replace(/\b(din[aá]mico|dynamique|dynamisches)\b/gi, "Dynamic");
+				name = name.replace(/\b(est[aá]tico|statique|statisches)\b/gi, "Static");
+				name = name.replace(RX_THEME_JAP, " ");
+			}
+		
+			name = name.replace(RX_THEME_COMMON, "");
+			
+			name = name.replace(RX_PACK_TERMS, "Pack");
+			var testPack = name.replace(RX_PACK_WORD, "").replace(RX_TRIM, '');
+			if (/[a-zA-Z]/.test(testPack)) {
+				name = name.replace(RX_PACK_WORD, "");
+			}
+		
+			if (cat === "avatars") {
+				var testAvatar = name.replace(RX_AVATAR_WORD, "").replace(RX_TRIM, '');
+				if (/[a-zA-Z]/.test(testAvatar)) {
+					name = name.replace(RX_AVATAR_WORD, "");
+				}
+			}
+		
+			name = name.replace(RX_VOL_FIX, "$1 $2").replace(RX_VOL_NUM, "Vol.$1");
+			name = name.replace(RX_SINGLE_QUOTE, "").replace(RX_MID_QUOTE, "");
+		
+			name = name.replace(RX_CAMEL, '$1 $2')
+					.replace(RX_NUM_LOWER, '$1 $2')
+					.replace(RX_LOWER_NUM, '$1 $2')
+					.replace(RX_CHAR_NUM, "$1$2")
+					.replace(RX_SPACE_DASH, '$1 - $2');
+		
+			name = name.replace(/Play\s*Station/gi, "PlayStation");
+		
+			name = name.toLowerCase().replace(RX_CAPITALIZE, function(m) { return m.toUpperCase(); });
+		
+			name = name.replace(RX_ROMAN, function(m) { return m.toUpperCase(); });
+			name = name.replace(RX_PS_TERMS, function(m) { 
+				return m.toUpperCase().replace(/\s/g, '');
+			});
+			name = name.replace(RX_RES_P, "$1P");
+		
+			name = name.replace(RX_DE_FIX, " de ").replace(RX_VER_FIX, "V$1")
+					.replace(RX_VER_SPC, " v ").replace(RX_VOL_NUM, "Vol.$1")
+					.replace(RX_DE_END, "").replace(RX_HYPHEN_FIX, "$1-in-$2");
+		
+			if (cat === "themes") {
+				name = name.replace(RX_THEME_DYN, "(Dynamic)").replace(RX_THEME_STAT, "(Static)");
+			}
+			
+			if (cat === "demos") {
+				name = name.replace(RX_DEMO_TERMS, "");
+			}
+		
+			name = name.replace(RX_CLEAN_PARENS, "").replace(RX_DBL_SPACE, " ");
+		
+			if (cat === "themes") {
+				var tagType = "";
+				if (name.indexOf("(Dynamic)") !== -1) tagType = "(Dynamic)";
+				else if (name.indexOf("(Static)") !== -1) tagType = "(Static)";
+		
+				if (tagType !== "") {
+					name = name.replace(tagType, "").replace(RX_CLEAN_PARENS, "").replace(RX_TRIM, '');
+					if (name === "") name = "Unknown";
+					name = name + " " + tagType;
+				} else {
+					if (name.replace(RX_TRIM, '') === "") name = "Unknown";
+				}
+			}
+		
+			return name.replace(RX_TRIM, '');
+		}
     
     // ==============================================================
     // 3. CONTROLE DE ZOOM (PC ONLY) (Código inalterado)
@@ -1414,22 +1548,11 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
         g_renderID++;
     }
 	
-	// Adicione ou substitua esta função
-function cancelAllDownloads() {
-    // 1. Mata o trabalhador da Sony imediatamente
-    if (sonyWorker) { 
-        clearInterval(sonyWorker); 
-        sonyWorker = null; 
-    }
-    // 2. Cancela timers pendentes
-    if (sonyProcessTimer) clearTimeout(sonyProcessTimer);
-    
-    // 3. Esvazia a fila de pendências (O MAIS IMPORTANTE)
-    sonyPendingList = [];
-    
-    // 4. Para qualquer timer de renderização
-    if (g_renderTimer) clearTimeout(g_renderTimer);
-}
+	function cancelAllDownloads() {
+		sonyPendingList = [];
+		if (sonyWorker) { clearInterval(sonyWorker); sonyWorker = null; }
+		if (sonyProcessTimer) { clearTimeout(sonyProcessTimer); }
+	}
 
 	var sonyPendingList = [];
 	var sonyProcessTimer = null;
@@ -1449,6 +1572,8 @@ function cancelAllDownloads() {
 
 	function startSonyPhase() {
     if (sonyPendingList.length === 0) return;
+
+    // Se já estiver rodando, não duplica
     if (sonyWorker) return;
 
     sonyWorker = setInterval(function() {
@@ -1458,141 +1583,147 @@ function cancelAllDownloads() {
             return;
         }
 
-        // Processa 2 imagens da Sony por vez (Melhor que 1 por 1)
-        for (var k = 0; k < 2; k++) {
-            if (sonyPendingList.length === 0) break;
+        var item = sonyPendingList.shift();
+        var img = item.element;
+        var cid = item.cid;
 
-            var item = sonyPendingList.shift();
-            var img = item.element;
-            var cid = item.cid;
-
-            // Só tenta se ainda não carregou (dupla verificação)
-            if (img && !img.getAttribute('data-loaded')) {
-                 if (typeof generateSonyHash === 'function') {
-                    var hash = generateSonyHash(cid);
-                    // Importante: HTTP direto
-                    var sonyUrl = "http://tmdb.np.dl.playstation.net/tmdb/" + hash + "/ICON0.PNG";
-                    
-                    var tempSony = new Image();
-                    tempSony.targetElement = img; // Vincula elemento
-                    
-                    tempSony.onload = function() {
-                        if (this.targetElement) {
-                            this.targetElement.src = this.src;
-                            markAsLoaded(this.targetElement);
-                        }
-                    };
-                    
-                    tempSony.onerror = function() {
-                        if (this.targetElement) markAsFailed(this.targetElement);
-                    };
-                    tempSony.src = sonyUrl;
-                }
+        // Verifica se ainda precisa carregar
+        if (img && !img.getAttribute('data-loaded')) {
+             if (typeof generateSonyHash === 'function') {
+                var hash = generateSonyHash(cid);
+                // HTTP para PS3 é crucial
+                var sonyUrl = "http://tmdb.np.dl.playstation.net/tmdb/" + hash + "/ICON0.PNG";
+                
+                var tempSony = new Image();
+                tempSony.onload = function() {
+                    if (img) {
+                        img.src = this.src;
+                        markAsLoaded(img);
+                    }
+                };
+                tempSony.onerror = function() {
+                    if (img) markAsFailed(img);
+                };
+                tempSony.src = sonyUrl;
             }
         }
-    }, 150); // Verifica a cada 150ms
+    }, 100); // <--- AQUI: 100ms (Rápido, mas seguro)
 }
 
-	function tryLoadImage(imgElement, mainUrl, cid) {
-    var requestRenderID = g_renderID; // Grava o ID da renderização atual
-
-    // === PS3 E PC ===
-    var loader = new Image();
+		function tryLoadImage(imgElement, mainUrl, cid) {
     
-    loader.onload = function() {
-        // SE TROCOU DE CATEGORIA, O RENDER ID MUDOU. ENTÃO ABORTA.
+    var requestRenderID = g_renderID;
+
+    // === LÓGICA PC (Mantida igual, pois é rápida) ===
+    if (!isPS3) {
+        var pcLoader = new Image();
+        pcLoader.onload = function() {
+            if (g_renderID !== requestRenderID) return;
+            if (imgElement) {
+                imgElement.src = this.src;
+                markAsLoaded(imgElement);
+            }
+        };
+        pcLoader.onerror = function() {
+            if (g_renderID !== requestRenderID) return;
+            if (this.src.indexOf('ps3-pro.github.io') !== -1) {
+                if (typeof generateSonyHash === 'function') {
+                    var hash = generateSonyHash(cid);
+                    var sonyUrl = "http://tmdb.np.dl.playstation.net/tmdb/" + hash + "/ICON0.PNG";
+                    this.src = sonyUrl; 
+                }
+            } else {
+                if (imgElement) markAsFailed(imgElement);
+            }
+        };
+        pcLoader.src = mainUrl;
+        return;
+    }
+
+    // === LÓGICA PS3 (CORRIGIDA PARA PERFORMANCE MAXIMA) ===
+    var ps3Loader = new Image();
+    
+    ps3Loader.onload = function() {
+        // Se a tela mudou (scrollou muito), cancela a operação
         if (g_renderID !== requestRenderID) return;
         
         if (imgElement) {
             imgElement.src = this.src;
             markAsLoaded(imgElement);
         }
+
+        // AQUI ESTÁ O SEGREDO DO ANTIGO:
+        // Se carregou com sucesso, EMPURRA a Sony para longe.
+        // Só vai tentar Sony se ficar 1.5 segundos sem carregar nada do GitHub.
+        if (sonyProcessTimer) clearTimeout(sonyProcessTimer);
+        if (sonyWorker) { clearInterval(sonyWorker); sonyWorker = null; } // Para o download da Sony se o GitHub voltar a funcionar
+        sonyProcessTimer = setTimeout(startSonyPhase, 1000);
     };
 
-    loader.onerror = function() {
-        // SE TROCOU DE CATEGORIA, ABORTA. NÃO JOGA NA FILA DA SONY.
+    ps3Loader.onerror = function() {
         if (g_renderID !== requestRenderID) return;
         
-        if (isPS3) {
-            // Só joga na fila da Sony se ainda estivermos na mesma tela
-            if (imgElement) {
-                sonyPendingList.push({ element: imgElement, cid: cid });
-            }
-            if (!sonyWorker) startSonyPhase();
-        } else {
-            // PC Fallback imediato
-             if (typeof generateSonyHash === 'function') {
-                var hash = generateSonyHash(cid);
-                imgElement.src = "http://tmdb.np.dl.playstation.net/tmdb/" + hash + "/ICON0.PNG";
-            }
+        if (imgElement) {
+            // Apenas joga na fila. NÃO INICIA O DOWNLOAD DA SONY AGORA.
+            sonyPendingList.push({ element: imgElement, cid: cid });
         }
+        
+        // No código novo, você tinha um "startSonyPhase()" aqui. 
+        // ISSO ERA O QUE TRAVAVA. Removi.
+        // Agora ele espera o timer do onload ou o fim do scroll.
     };
 
-    loader.src = mainUrl; // Dispara GitHub
+    ps3Loader.src = mainUrl;
 }
 
     // ==============================================================
     // 6. LAZY LOADING (ANTI-CRASH)
     // ==============================================================
 	function checkVisibility() {
-		if (!useCoverGUI) return;
+        if (!useCoverGUI) return;
 
-		var imgs = document.querySelectorAll('.game-tile img');
-		var contentDiv = document.querySelector('.content');
-		
-		var scrollY = 0;
-		if (contentDiv && (isPS3 || document.body.className.indexOf('is-pc') !== -1)) {
-			scrollY = contentDiv.scrollTop;
-		} else {
-			scrollY = window.pageYOffset;
-		}
-		
-		var viewH = window.innerHeight;
-		
-		var loadBuffer = (isPS3) ? 800 : (g_lazyLoadPC ? 3200 : 999999);
-		var unloadBuffer = 3000; 
+        var contentDiv = document.querySelector('.content');
+        var imgs = document.querySelectorAll('.game-tile img:not([data-loaded]):not([data-failed])');
+        
+        var scrollY = 0;
+        if (contentDiv && (isPS3 || document.body.className.indexOf('is-pc') !== -1)) {
+            scrollY = contentDiv.scrollTop;
+        } else {
+            scrollY = window.pageYOffset;
+        }
+        
+        var viewH = window.innerHeight;
+        
+        var loadBuffer = (isPS3) ? 800 : (g_lazyLoadPC ? 3000 : 99999);
+        var loadTop = scrollY - loadBuffer;
+        var loadBottom = scrollY + viewH + loadBuffer;
 
-		var loadTop = scrollY - loadBuffer;
-		var loadBottom = scrollY + viewH + loadBuffer;
-		
-		var keepTop = scrollY - unloadBuffer;
-		var keepBottom = scrollY + viewH + unloadBuffer;
+        var len = imgs.length;
 
-		var len = imgs.length;
+        for (var i = 0; i < len; i++) {
+            var img = imgs[i];
+            
+            if (img.getAttribute('data-loading')) continue;
 
-		for (var i = 0; i < len; i++) {
-			var img = imgs[i];
-			if (!img.offsetParent) continue;
-			
-			var rect = img.getBoundingClientRect();
-			var yPos = rect.top + scrollY;
+            var elTop = img.offsetTop; 
+            
+            var rect = img.getBoundingClientRect();
+            var yPos = rect.top + scrollY;
 
-			if (yPos >= loadTop && yPos <= loadBottom) {
-				if (img.src === defaultCover && !img.getAttribute('data-loading') && !img.getAttribute('data-failed') && !img.getAttribute('data-loaded')) { 
-					
-					img.setAttribute('data-loading', 'true');
-					var cid = img.getAttribute('data-cid');
-					
-					var ghDirectPS3 = "https://ps3-pro.github.io/PSN-Content/resources/covers/compressed/" + cid + ".JPG";
-					var ghDirectPC = "https://ps3-pro.github.io/PSN-Content/resources/covers/uncompressed/" + cid + ".JPG";
-					var url = isPS3 ? ghDirectPS3 : ghDirectPC;
-					
-					tryLoadImage(img, url, cid);
-				}
-			} 
-			
-			else if (isPS3) {
-				if (yPos < keepTop || yPos > keepBottom) {
-					if (img.src !== defaultCover) { 
-						img.src = defaultCover; 
-						img.removeAttribute('data-loading');
-						img.removeAttribute('data-failed');
-						img.removeAttribute('data-loaded');
-					}
-				}
-			}
-		}
-	}
+            if (yPos >= loadTop && yPos <= loadBottom) {
+                if (img.src === defaultCover) { 
+                    img.setAttribute('data-loading', 'true');
+                    var cid = img.getAttribute('data-cid');
+                    
+                    var ghDirectPS3 = "https://ps3-pro.github.io/PSN-Content/resources/covers/compressed/" + cid + ".JPG";
+                    var ghDirectPC = "https://ps3-pro.github.io/PSN-Content/resources/covers/uncompressed/" + cid + ".JPG";
+                    var url = isPS3 ? ghDirectPS3 : ghDirectPC;
+                    
+                    tryLoadImage(img, url, cid);
+                }
+            } 
+        }
+    }
 	
 	var g_scrollTimer = null;
 
@@ -1682,105 +1813,119 @@ function cancelAllDownloads() {
     }
     
     function renderChunk() {
-    var list = document.getElementById('list');
-    var currentLimit = isPS3 ? g_allMatches.length : g_pcRenderLimit;
-    var chunk = g_allMatches.slice(g_currentChunkIndex, g_currentChunkIndex + g_chunkSize);
-    var chunkArray = [];
-    
-    if (chunk.length === 0) {
-        if (g_currentChunkIndex === 0) list.innerHTML = '<li>No items found.</li>';
-        var btn = document.getElementById('btn-load-more');
-        if(btn) btn.style.display = 'none';
-        return;
-    }
-    
-    // 1. CONSTRUÇÃO DO HTML (RÁPIDO)
-    if (useCoverGUI) {
-        var lazyClass = isPS3 ? "lazy-ps3" : "";
-        for (var i = 0; i < chunk.length; i++) {
-            if (!isPS3 && (g_currentChunkIndex + i) >= currentLimit) break;
+		var list = document.getElementById('list');
+		if (!list) return;
 
-            var a = chunk[i];
-            if (!a[3] || a[3] === "MISSING") continue;
-            
-            var size = formatFileSize(a[a.length-1] || a[a.length-2] || "");
-            var cid = a[0], name = a[2];
-            var uniqueIndex = g_currentChunkIndex + i;
-            var tileId = "img_" + cid + "_" + uniqueIndex;
-            
-            chunkArray.push(
-                '<div class="game-tile">',
-                    '<img id="', tileId, '" class="', lazyClass, '" src="', defaultCover, '" data-cid="', cid, '">',
-                    '<div class="title">', name, '</div>',
-                    '<div class="title-id">[', cid, ']</div>',
-                    '<div class="size">', size, '</div>',
-                    '<div class="links">', makeRap(a), ' <a href="', a[3], '" class="pkg-btn">PKG</a></div>',
-                '</div>'
-            );
-        }
-    } else {
-        // (Código da lista texto mantém igual...)
-        for (var i = 0; i < chunk.length; i++) {
-             // ... seu código de lista texto ...
-             var a = chunk[i];
-             // ...
-             chunkArray.push('<li>...</li>'); // Simplificado para economizar espaço aqui
-        }
-    }
-    
-    // Injeta HTML na tela
-    if (chunkArray.length > 0) list.insertAdjacentHTML('beforeend', chunkArray.join(''));
-    chunkArray = null; 
-    
-    // 2. DISPARO IMEDIATO (AQUI ESTÁ A CORREÇÃO DE PERFORMANCE)
-    // Não esperamos scroll nem timer. Pegamos o que acabamos de criar e mandamos baixar.
-    if (useCoverGUI) {
-        for (var i = 0; i < chunk.length; i++) {
-            if (!isPS3 && (g_currentChunkIndex + i) >= currentLimit) break;
-
-            var r = chunk[i];
-            // Verifica se é item válido
-            if (r[0] && r[3] && r[3] !== "MISSING") {
-                var uniqueIndex = g_currentChunkIndex + i;
-                var uniqueTileId = "img_" + r[0] + "_" + uniqueIndex;
-                var imgEl = document.getElementById(uniqueTileId);
-                
-                if (imgEl) {
-                    var cid = r[0];
-                    // URLs diretas
-                    var ghDirectPS3 = "https://ps3-pro.github.io/PSN-Content/resources/covers/compressed/" + cid + ".JPG";
-                    var ghDirectPC = "https://ps3-pro.github.io/PSN-Content/resources/covers/uncompressed/" + cid + ".JPG";
-                    var url = isPS3 ? ghDirectPS3 : ghDirectPC;
-                    
-                    // CHAMA O LOAD IMEDIATAMENTE - SEM TIMERS
-                    tryLoadImage(imgEl, url, cid);
-                }
-            }
-        }
-    }
-    
-    // Continua renderizando o resto da página se necessário
-    g_currentChunkIndex += g_chunkSize;
-    if (g_currentChunkIndex < g_allMatches.length && g_currentChunkIndex < currentLimit) {
-        g_renderTimer = setTimeout(renderChunk, 0);
-    } else {
-        // ... (resto da lógica de botão load more)
-			if (!isPS3 && g_allMatches.length > currentLimit) {
-				var btn = document.getElementById('btn-load-more');
-				var remaining = g_allMatches.length - currentLimit;
-				btn.innerHTML = "Load more " + (remaining > g_pcPageSize ? g_pcPageSize : remaining) + " items";
-				btn.style.display = 'block';
-			} else {
-				var btn = document.getElementById('btn-load-more');
-				if(btn) btn.style.display = 'none';
+		var is_ps3 = isPS3; 
+		var totalMatches = g_allMatches.length;
+		var currentLimit = is_ps3 ? totalMatches : g_pcRenderLimit;
+		
+		var chunk = g_allMatches.slice(g_currentChunkIndex, g_currentChunkIndex + g_chunkSize);
+		
+		if (chunk.length === 0) {
+			if (g_currentChunkIndex === 0) {
+				list.innerHTML = '<li>No items found.</li>';
 			}
+			var btn = document.getElementById('btn-load-more');
+			if(btn) btn.style.display = 'none';
 			
 			if (g_pendingScroll !== null) {
 				var contentDiv = document.querySelector('.content');
-				if (contentDiv) {
-					contentDiv.scrollTop = g_pendingScroll;
-				}
+				if (contentDiv) contentDiv.scrollTop = g_pendingScroll;
 				g_pendingScroll = null;
+			}
+			return;
+		}
+		
+		var chunkArray = [];
+		var len = chunk.length;
+		
+		for (var i = 0; i < len; i++) {
+			if (!is_ps3 && (g_currentChunkIndex + i) >= currentLimit) break;
+
+			var row = chunk[i];
+			var url = row[3];
+
+			if (!url || url === "MISSING") continue;
+			
+			var sizeBytes = row[row.length-1] || row[row.length-2] || "";
+			var size = formatFileSize(sizeBytes);
+			if (size === "") size = "N/A";
+			
+			var cid = row[0];
+			var name = row[2];
+
+			if (useCoverGUI) {
+				var uniqueIndex = g_currentChunkIndex + i;
+				var lazyClass = is_ps3 ? "lazy-ps3" : "";
+				var tileId = "img_" + cid + "_" + uniqueIndex;
+				
+				chunkArray.push(
+					'<div class="game-tile">',
+						'<img id="', tileId, '" class="', lazyClass, '" src="', defaultCover, '" data-cid="', cid, '">',
+						'<div class="title">', name, '</div>',
+						'<div class="title-id">[', cid, ']</div>',
+						'<div class="size">', size, '</div>',
+						'<div class="links">', makeRap(row), ' <a href="', url, '" class="pkg-btn">PKG</a></div>',
+					'</div>'
+				);
+			} else {
+				chunkArray.push(
+				'<li>',
+					name, 
+					' <span class="id-text">[', cid, ']</span> ',
+					' <span class="size">', size, '</span>',				
+					' ', makeRap(row), 
+					' <a href="', url, '" class="pkg-btn">PKG</a>',
+				'</li>'
+				);
+			}
+		}
+		
+		if (chunkArray.length > 0) {
+			list.insertAdjacentHTML('beforeend', chunkArray.join(''));
+		}
+		chunkArray = null;
+		
+		if (useCoverGUI) {
+			if (is_ps3 || g_lazyLoadPC) {
+				if (g_scrollTimer) clearTimeout(g_scrollTimer);
+				g_scrollTimer = setTimeout(checkVisibility, is_ps3 ? 350 : 100);
+			} 
+			else {
+				for (var i = 0; i < len; i++) {
+					if ((g_currentChunkIndex + i) >= currentLimit) break;
+					
+					var r = chunk[i];
+					if (r[0] && r[3] && r[3] !== "MISSING") {
+						var uIdx = g_currentChunkIndex + i;
+						var uTileId = "img_" + r[0] + "_" + uIdx;
+						var imgEl = document.getElementById(uTileId); // Pesado, mas PC aguenta
+						
+						if (imgEl) {
+							var ghDirectPC = "https://ps3-pro.github.io/PSN-Content/resources/covers/uncompressed/" + r[0] + ".JPG";
+							tryLoadImage(imgEl, ghDirectPC, r[0]);
+						}
+					}
+				}
+			}
+		}
+		
+		g_currentChunkIndex += g_chunkSize;
+		
+		if (g_currentChunkIndex < totalMatches && g_currentChunkIndex < currentLimit) {
+			g_renderTimer = setTimeout(renderChunk, 0);
+		} else {
+			if (!is_ps3 && totalMatches > currentLimit) {
+				var btn = document.getElementById('btn-load-more');
+				var remaining = totalMatches - currentLimit;
+				if(btn) {
+					btn.innerHTML = "Load more " + (remaining > g_pcPageSize ? g_pcPageSize : remaining) + " items";
+					btn.style.display = 'block';
+				}
+			} else {
+				var btn = document.getElementById('btn-load-more');
+				if(btn) btn.style.display = 'none';
 			}
 		}
 	}
@@ -1800,9 +1945,9 @@ function cancelAllDownloads() {
 
     function render() {
 		stopRendering();
-		cancelAllDownloads();
 		g_activeDownloads = 0;
-		
+		cancelAllDownloads();
+
 		f.send.disabled = DB.length == 0;
 		f.query.placeholder = DB.length + " items found";
 		document.getElementById('btn-load-more').style.display = 'none';
@@ -1874,134 +2019,30 @@ function cancelAllDownloads() {
         var g_tempMap = {}; 
 		function processChunk(tsvData) {
 			var lines = tsvData.split("\n");
-			var demoRegex = /\b(demo|trial|beta)\b/i;
+			var len = lines.length;
 		
-			for (var i = 0; i < lines.length; i++) {
+			for (var i = 0; i < len; i++) {
 				var line = lines[i];
 				if (line.length < 5) continue;
-				line = line.replace(/^\s+|\s+$/g, '');
+				
+				line = line.replace(RX_TRIM, '');
 				if (line === "") continue;
 		
 				var parts = line.split("\t");
-				if (parts[0] && parts[0].indexOf("Title ID") > -1) continue;
-				if (parts[2]) parts[2] = parts[2].replace(/^\s+|\s+$/g, '');
-		
-				var name = parts[2];
-		
-				var isTestVersion = demoRegex.test(name);
-		
-				if (currentCategory === "games" && isTestVersion) {
-					continue;
-				}
-		
-				if (currentCategory === "demos" && !isTestVersion) {
-					continue;
-				}
-		
-				name = name.replace(/　/g, " ");
-				name = name.replace(/"/g, "");
-				name = name.replace(/'{2,}/g, ""); 
-		
-				name = name.replace(/(\(|\[)\s*(de|fr|eu|us|jp|uk|es|it|ru|au|italian|french|german|spanish|english|japanese)\s*(\)|\])/gi, "");
-		
-				if (currentCategory === "themes") {
-					name = name.replace(/\b(din[aá]mico|dynamique|dynamisches)\b/gi, "Dynamic");
-					name = name.replace(/\b(est[aá]tico|statique|statisches)\b/gi, "Static");
-					name = name.replace(/(カスタムテーマ|テーマ|特典)/g, " ");
-				}
-		
-				name = name.replace(/\b(for\s+download|tema\s+de|thèmes|themes|theme|tema|design|designs|complete)\b/gi, "");
 				
-				name = name.replace(/\b(pack\s+de\s+temas|pack\s+de)\b/gi, "Pack");
-				var testPack = name.replace(/\bPack\b/gi, "").replace(/^\s+|\s+$/g, '');
-				if (/[a-zA-Z]/.test(testPack)) {
-					name = name.replace(/\bPack\b/gi, "");
-				}
-		
-				if (currentCategory === "avatars") {
-					var testAvatar = name.replace(/\bAvatars?\b/gi, "").replace(/^\s+|\s+$/g, '');
-					if (/[a-zA-Z]/.test(testAvatar)) {
-						name = name.replace(/\bAvatars?\b/gi, "");
-					}
-				}
-		
-				name = name.replace(/([a-zA-Z])(vol)/gi, "$1 $2");
-				name = name.replace(/\bvol\.?\s*(\d+)/gi, "Vol.$1");
-		
-				name = name.replace(/^'+|'+$/g, ""); 
-				name = name.replace(/'(?![s])/g, "");
-		
-				name = name.replace(/([a-z])([A-Z])/g, '$1 $2');
-				name = name.replace(/(\d)(?!(?:st|nd|rd|th|s|p|d|k)\b)([a-zA-Z])/gi, '$1 $2');
-				name = name.replace(/([a-zA-Z])(\d)/g, '$1 $2');
-				name = name.replace(/\b([a-zA-Z])\s+(\d+)/g, "$1$2"); 
+				if (parts[0] && RX_TITLE_ID.test(parts[0])) continue;
 				
-				name = name.replace(/(\S)-(\S)/g, '$1 - $2');
+				var rawName = parts[2];
+				if (rawName) parts[2] = rawName.replace(RX_TRIM, '');
+				else continue;
 		
-				name = name.replace(/Play\s*Station/gi, "PlayStation");
+				var isTestVersion = RX_DEMO_CHK.test(parts[2]);
 		
-				name = name.toLowerCase().replace(/(?:^|\s|[.,!?:;([{®™-])+[a-z0-9]/g, function(match) {
-					return match.toUpperCase();
-				});
+				if (currentCategory === "games" && isTestVersion) continue;
+				if (currentCategory === "demos" && !isTestVersion) continue;
 		
-				name = name.replace(/\b(ii|iii|iv|vi|vii|viii|ix|xi|xii|xiii|xiv|xv|xvi|xvii|xviii|xix|xx)\b/gi, function(match) {
-					return match.toUpperCase();
-				});
-		
-				name = name.replace(/\bPs\s*3\b/gi, "PS3");
-				name = name.replace(/\bPs\s*2\b/gi, "PS2");
-				name = name.replace(/\bPs\s*1\b/gi, "PS1");
-				name = name.replace(/\bPs\s*x\b/gi, "PSX");
-				name = name.replace(/\bPsp\b/gi, "PSP");
-				name = name.replace(/\bVita\b/gi, "Vita");
-				name = name.replace(/\bHd\b/gi, "HD");
-				name = name.replace(/\b3\s*d\b/gi, "3D");
-				name = name.replace(/\b4\s*k\b/gi, "4K");
-				name = name.replace(/\b(\d+)p\b/gi, "$1P");
+				var name = cleanGameName(parts[2], currentCategory);
 				
-				name = name.replace(/\sDe\s/g, " de ");
-				
-				name = name.replace(/\bV\s+(\d+)/g, "V$1"); 
-				name = name.replace(/\sV\s/g, " v ");
-				name = name.replace(/\bVol\.\s+(\d+)/g, "Vol.$1");
-				name = name.replace(/\s+de$/i, "");
-		
-				name = name.replace(/\b(\d+)\s+-\s+In\s+-\s+(\d+)\b/gi, "$1-in-$2");
-		
-				if (currentCategory === "themes") {
-					name = name.replace(/\b(dynamic)\b/gi, "(Dynamic)");
-					name = name.replace(/\b(static)\b/gi, "(Static)");
-				}
-		
-				if (currentCategory === "demos") {
-					name = name.replace(/\b(full\s+game\s+trial|trial\s+to\s+full|demo\s+version|trial\s+ver)\b/gi, "");
-					name = name.replace(/\b(demo|trial|beta)\b/gi, "");
-				}
-		
-				name = name.replace(/\(\s*\)/g, "")   
-						.replace(/\[\s*\]/g, "")   
-						.replace(/^[\s:,\-]+/g, "")
-						.replace(/-\s*$/g, "")     
-						.replace(/\s{2,}/g, " ");
-		
-				if (currentCategory === "themes") {
-					var tagType = "";
-					if (name.indexOf("(Dynamic)") !== -1) tagType = "(Dynamic)";
-					else if (name.indexOf("(Static)") !== -1) tagType = "(Static)";
-		
-					if (tagType !== "") {
-						name = name.replace(tagType, "");
-						name = name.replace(/^\s*-\s*/, "").replace(/-\s*$/, "").replace(/^[\s:,\-]+/g, "").replace(/^\s+|\s+$/g, '');
-		
-						if (name === "") name = "Unknown";
-						
-						name = name + " " + tagType;
-					} else {
-						if (name.replace(/^\s+|\s+$/g, '') === "") name = "Unknown";
-					}
-				}
-		
-				name = name.replace(/^\s+|\s+$/g, '');
 				parts[2] = name;
 		
 				var cid = parts[0];
