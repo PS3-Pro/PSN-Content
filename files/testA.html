@@ -1472,53 +1472,70 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
 	}
 
 	function tryLoadImage(imgElement, mainUrl, cid) {
-		
-		var requestRenderID = g_renderID;
+    
+    var requestRenderID = g_renderID;
 
-	    if (!isPS3) {
-	        var pcLoader = new Image();
-	        pcLoader.onload = function() {
-				if (g_renderID !== requestRenderID) return;
-	            if (imgElement) {
-	                imgElement.src = this.src;
-	                markAsLoaded(imgElement);
-	            }
-	        };
-	        pcLoader.onerror = function() {
-				if (g_renderID !== requestRenderID) return;
-	            if (this.src.indexOf('ps3-pro.github.io') !== -1) {
-	                if (typeof generateSonyHash === 'function') {
-	                    var hash = generateSonyHash(cid);
-	                    var sonyUrl = "http://tmdb.np.dl.playstation.net/tmdb/" + hash + "/ICON0.PNG";
-	                    this.src = sonyUrl; 
-	                }
-	            } else {
-	                if (imgElement) markAsFailed(imgElement);
-	            }
-	        };
-	        pcLoader.src = mainUrl;
-	        return;
-	    }
+    // === LÓGICA PC (Mantida igual, pois é rápida) ===
+    if (!isPS3) {
+        var pcLoader = new Image();
+        pcLoader.onload = function() {
+            if (g_renderID !== requestRenderID) return;
+            if (imgElement) {
+                imgElement.src = this.src;
+                markAsLoaded(imgElement);
+            }
+        };
+        pcLoader.onerror = function() {
+            if (g_renderID !== requestRenderID) return;
+            if (this.src.indexOf('ps3-pro.github.io') !== -1) {
+                if (typeof generateSonyHash === 'function') {
+                    var hash = generateSonyHash(cid);
+                    var sonyUrl = "http://tmdb.np.dl.playstation.net/tmdb/" + hash + "/ICON0.PNG";
+                    this.src = sonyUrl; 
+                }
+            } else {
+                if (imgElement) markAsFailed(imgElement);
+            }
+        };
+        pcLoader.src = mainUrl;
+        return;
+    }
 
-        var ps3Loader = new Image();
-	    ps3Loader.onload = function() {
-			if (g_renderID !== requestRenderID) return;
-	        if (imgElement) {
-	            imgElement.src = this.src;
-	            markAsLoaded(imgElement);
-	        }
-			if (sonyProcessTimer) clearTimeout(sonyProcessTimer);
-			sonyProcessTimer = setTimeout(startSonyPhase, 1500);
-	    };
-	    ps3Loader.onerror = function() {
-			if (g_renderID !== requestRenderID) return;
-	        if (imgElement) {
-	            sonyPendingList.push({ element: imgElement, cid: cid });
-	        }
-			if (!sonyWorker) startSonyPhase();
-	    };
-	    ps3Loader.src = mainUrl;
-	}
+    // === LÓGICA PS3 (CORRIGIDA PARA PERFORMANCE MAXIMA) ===
+    var ps3Loader = new Image();
+    
+    ps3Loader.onload = function() {
+        // Se a tela mudou (scrollou muito), cancela a operação
+        if (g_renderID !== requestRenderID) return;
+        
+        if (imgElement) {
+            imgElement.src = this.src;
+            markAsLoaded(imgElement);
+        }
+
+        // AQUI ESTÁ O SEGREDO DO ANTIGO:
+        // Se carregou com sucesso, EMPURRA a Sony para longe.
+        // Só vai tentar Sony se ficar 1.5 segundos sem carregar nada do GitHub.
+        if (sonyProcessTimer) clearTimeout(sonyProcessTimer);
+        if (sonyWorker) { clearInterval(sonyWorker); sonyWorker = null; } // Para o download da Sony se o GitHub voltar a funcionar
+        sonyProcessTimer = setTimeout(startSonyPhase, 1500);
+    };
+
+    ps3Loader.onerror = function() {
+        if (g_renderID !== requestRenderID) return;
+        
+        if (imgElement) {
+            // Apenas joga na fila. NÃO INICIA O DOWNLOAD DA SONY AGORA.
+            sonyPendingList.push({ element: imgElement, cid: cid });
+        }
+        
+        // No código novo, você tinha um "startSonyPhase()" aqui. 
+        // ISSO ERA O QUE TRAVAVA. Removi.
+        // Agora ele espera o timer do onload ou o fim do scroll.
+    };
+
+    ps3Loader.src = mainUrl;
+}
 
     // ==============================================================
     // 6. LAZY LOADING (ANTI-CRASH)
