@@ -1580,10 +1580,10 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
 	}
 
 	function startSonyPhase() {
+    // Proteção PC
     if (!isPS3) { sonyPendingList = []; return; }
 
     if (sonyPendingList.length === 0) return;
-    // Se já está rodando, deixa quieto
     if (sonyWorker) return;
 
     sonyWorker = setInterval(function() {
@@ -1593,9 +1593,7 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
             return;
         }
 
-        // === MODO EQUILIBRADO: 2 IMAGENS ===
-        // 2 garante que a internet não fique saturada, 
-        // permitindo que o GitHub (tryLoadImage) fure a fila quando precisar.
+        // === LOTE DE 2: RÁPIDO E SEGURO ===
         for (var k = 0; k < 2; k++) {
             if (sonyPendingList.length === 0) break;
 
@@ -1603,18 +1601,21 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
             var img = item.element;
             var cid = item.cid;
 
-            if (img && !img.getAttribute('data-loaded')) {
+            // Só processa se a imagem ainda estiver com a capa cinza (não carregada)
+            if (img && img.src.indexOf('data:image') !== -1) {
                  if (typeof generateSonyHash === 'function') {
                     var hash = generateSonyHash(cid);
                     var sonyUrl = "http://tmdb.np.dl.playstation.net/tmdb/" + hash + "/ICON0.PNG";
                     
+                    // AQUI sim usamos o Loader Fantasma, porque a Sony é lenta e não queremos X na tela
                     var tempSony = new Image();
                     tempSony.targetElement = img;
                     
                     tempSony.onload = function() {
                         if (this.targetElement) {
                             this.targetElement.src = this.src;
-                            markAsLoaded(this.targetElement);
+                            // Marca como carregado
+                            this.targetElement.setAttribute('data-loaded', 'true');
                         }
                     };
                     
@@ -1622,66 +1623,41 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
                 }
             }
         }
-    }, 150); 
+    }, 150); // Intervalo de 150ms
 }
 
 	function tryLoadImage(imgElement, mainUrl, cid) {
-    
-    // === MUDANÇA CRUCIAL: PARAR A SONY AGORA ===
-    // Se vamos tentar baixar do GitHub, manda a Sony parar de gastar internet.
+    // Se o elemento não existe, tchau
+    if (!imgElement) return;
+
+    // === MUDANÇA CRUCIAL: PARAR A SONY ===
+    // Se o GitHub vai tentar carregar, a Sony tem que parar para não roubar internet
     if (sonyWorker) { 
         clearInterval(sonyWorker); 
         sonyWorker = null; 
     }
 
-    // === ESTRATÉGIA PC: INSTANTÂNEA COM PROTEÇÃO ===
-    if (!isPS3) {
-        imgElement.onerror = function() {
-            this.onerror = null; 
-            this.src = defaultCover; // Volta pro cinza
-            
-            if (typeof generateSonyHash === 'function') {
-                var hash = generateSonyHash(cid);
-                var sUrl = "http://tmdb.np.dl.playstation.net/tmdb/" + hash + "/ICON0.PNG";
-                var pcSony = new Image();
-                pcSony.onload = function() {
-                    if (imgElement) { imgElement.src = this.src; markAsLoaded(imgElement); }
-                };
-                pcSony.src = sUrl;
-            }
-        };
-        imgElement.src = mainUrl;
-        return; 
-    }
-
-    // === ESTRATÉGIA PS3: PRIORIDADE TOTAL AO GITHUB ===
-    var ps3Loader = new Image();
-    
-    ps3Loader.onload = function() {
-        if (imgElement) {
-            imgElement.src = this.src;
-            markAsLoaded(imgElement);
-        }
+    // Define o que fazer se der erro (ANTES de definir o src)
+    imgElement.onerror = function() {
+        // 1. Limpa o evento para não travar
+        this.onerror = null; 
         
-        // SUCESSO! Agora que terminamos o importante, agendamos a Sony para daqui a pouco
-        // O delay de 200ms garante que se tiver outra imagem do GitHub na fila, ela vai antes.
-        if (sonyPendingList.length > 0 && !sonyWorker) {
-            setTimeout(startSonyPhase, 200);
-        }
-    };
-
-    ps3Loader.onerror = function() {
-        // FALHOU. Joga na fila.
-        if (imgElement) {
-            sonyPendingList.push({ element: imgElement, cid: cid });
-        }
-        // Como falhou, libera a Sony para tentar salvar a pátria
+        // 2. Volta para a capa cinza IMEDIATAMENTE (para não ficar o X vermelho por muito tempo)
+        this.src = defaultCover; 
+        
+        // 3. Adiciona na fila da Sony para ser processado depois
+        sonyPendingList.push({ element: this, cid: cid });
+        
+        // 4. Se o trabalhador da Sony não estiver rodando, liga ele com um pequeno delay
+        // (Delay para dar chance de outras imagens do GitHub carregarem primeiro)
         if (!sonyWorker) {
-            setTimeout(startSonyPhase, 100);
+             setTimeout(startSonyPhase, 500);
         }
     };
 
-    ps3Loader.src = mainUrl;
+    // === AQUI ESTÁ A VELOCIDADE DO ANTIGO ===
+    // Sem "new Image()", sem espera. Manda o navegador baixar direto na tela.
+    imgElement.src = mainUrl;
 }
 
     // ==============================================================
