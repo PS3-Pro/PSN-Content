@@ -1580,6 +1580,7 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
 	}
 
 	function startSonyPhase() {
+    // Segurança: Se for PC, limpa e sai
     if (!isPS3) { sonyPendingList = []; return; }
 
     if (sonyPendingList.length === 0) return;
@@ -1592,18 +1593,25 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
             return;
         }
 
-        for (var i = 0; i < 2; i++) {
+        // === MODO TURBO: 4 IMAGENS POR VEZ ===
+        // Isso faz a fila da Sony andar 4x mais rápido
+        for (var k = 0; k < 4; k++) {
             if (sonyPendingList.length === 0) break;
 
             var item = sonyPendingList.shift();
+            
+            // --- RECUPERAÇÃO CORRETA DAS VARIÁVEIS ---
             var img = item.element;
             var cid = item.cid;
+            // -----------------------------------------
 
+            // Verifica se ainda precisa carregar
             if (img && !img.getAttribute('data-loaded')) {
                  if (typeof generateSonyHash === 'function') {
                     var hash = generateSonyHash(cid);
                     var sonyUrl = "http://tmdb.np.dl.playstation.net/tmdb/" + hash + "/ICON0.PNG";
                     
+                    // Loader fantasma (Evita X no PS3)
                     var tempSony = new Image();
                     tempSony.targetElement = img;
 
@@ -1613,58 +1621,65 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
                             markAsLoaded(this.targetElement);
                         }
                     };
+                    // Se der erro, mantém cinza (sem X)
+                    
                     tempSony.src = sonyUrl;
                 }
             }
         }
-    }, 100);
+    }, 150); // Intervalo de 150ms
 }
 
 	function tryLoadImage(imgElement, mainUrl, cid) {
+    
+    // === PC: INSTANTÂNEO COM PROTEÇÃO VISUAL ===
     if (!isPS3) {
         imgElement.onerror = function() {
-            this.onerror = null;
+            this.onerror = null; 
             
+            // 1. Volta para a capa cinza IMEDIATAMENTE (some com o quebrado)
             this.src = defaultCover; 
-            
+
+            // 2. Tenta Sony em segundo plano (Silent Fallback)
             if (typeof generateSonyHash === 'function') {
                 var hash = generateSonyHash(cid);
-                var sonyUrl = "http://tmdb.np.dl.playstation.net/tmdb/" + hash + "/ICON0.PNG";
+                var sUrl = "http://tmdb.np.dl.playstation.net/tmdb/" + hash + "/ICON0.PNG";
                 
-                var silentLoader = new Image();
-                silentLoader.onload = function() {
-                    if (imgElement) {
-                        imgElement.src = this.src;
-                        markAsLoaded(imgElement);
+                var pcSony = new Image();
+                pcSony.onload = function() {
+                    if (imgElement) { 
+                        imgElement.src = this.src; 
+                        markAsLoaded(imgElement); 
                     }
                 };
-                silentLoader.src = sonyUrl;
+                pcSony.src = sUrl;
             }
         };
-        
+        // Tenta GitHub direto
         imgElement.src = mainUrl;
-        return;
+        return; 
     }
 
+    // === PS3: DISPARA E ESQUECE (IGUAL O ANTIGO) ===
     var ps3Loader = new Image();
     
     ps3Loader.onload = function() {
+        // Sucesso GitHub
         if (imgElement) {
             imgElement.src = this.src;
             markAsLoaded(imgElement);
         }
-        if (sonyPendingList.length > 0 && !sonyWorker) {
-             startSonyPhase();
-        }
+        // Se GitHub funcionou, aproveita e acorda a fila da Sony se ela estiver dormindo
+        if (sonyPendingList.length > 0 && !sonyWorker) startSonyPhase();
     };
 
     ps3Loader.onerror = function() {
+        // Falha GitHub -> Manda para a fila (startSonyPhase vai pegar em grupos de 4)
         if (imgElement) {
             sonyPendingList.push({ element: imgElement, cid: cid });
         }
-        if (!sonyWorker) {
-            startSonyPhase();
-        }
+        // Acorda o trabalhador da Sony IMEDIATAMENTE
+        if (!sonyWorker) startSonyPhase();
     };
 
     ps3Loader.src = mainUrl;
