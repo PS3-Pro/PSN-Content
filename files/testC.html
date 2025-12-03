@@ -1694,13 +1694,16 @@ function cancelAllDownloads() {
         return;
     }
     
-    // 1. CONSTRUÇÃO DO HTML (RÁPIDO)
+    // === CONSTRUÇÃO DO HTML (SEPARADO E SEGURO) ===
+    
+    // CASO 1: MODO GRADE (CAPAS)
     if (useCoverGUI) {
         var lazyClass = isPS3 ? "lazy-ps3" : "";
         for (var i = 0; i < chunk.length; i++) {
             if (!isPS3 && (g_currentChunkIndex + i) >= currentLimit) break;
 
             var a = chunk[i];
+            // Filtro de segurança para itens inválidos
             if (!a[3] || a[3] === "MISSING") continue;
             
             var size = formatFileSize(a[a.length-1] || a[a.length-2] || "");
@@ -1708,6 +1711,7 @@ function cancelAllDownloads() {
             var uniqueIndex = g_currentChunkIndex + i;
             var tileId = "img_" + cid + "_" + uniqueIndex;
             
+            // NOTE: O src começa com defaultCover. Isso evita o "vazio" no PC.
             chunkArray.push(
                 '<div class="game-tile">',
                     '<img id="', tileId, '" class="', lazyClass, '" src="', defaultCover, '" data-cid="', cid, '">',
@@ -1718,72 +1722,60 @@ function cancelAllDownloads() {
                 '</div>'
             );
         }
-    } else {
-        // (Código da lista texto mantém igual...)
-        for (var i = 0; i < chunk.length; i++) {
-             // ... seu código de lista texto ...
-             var a = chunk[i];
-             // ...
-             chunkArray.push('<li>...</li>'); // Simplificado para economizar espaço aqui
-        }
-    }
-    
-    // Injeta HTML na tela
-    if (chunkArray.length > 0) list.insertAdjacentHTML('beforeend', chunkArray.join(''));
-    chunkArray = null; 
-    
-    // 2. DISPARO IMEDIATO (AQUI ESTÁ A CORREÇÃO DE PERFORMANCE)
-    // Não esperamos scroll nem timer. Pegamos o que acabamos de criar e mandamos baixar.
-    if (useCoverGUI) {
+    } 
+    // CASO 2: MODO LISTA (TEXTO) - RESTAURADO!
+    else {
         for (var i = 0; i < chunk.length; i++) {
             if (!isPS3 && (g_currentChunkIndex + i) >= currentLimit) break;
 
-            var r = chunk[i];
-            // Verifica se é item válido
-            if (r[0] && r[3] && r[3] !== "MISSING") {
-                var uniqueIndex = g_currentChunkIndex + i;
-                var uniqueTileId = "img_" + r[0] + "_" + uniqueIndex;
-                var imgEl = document.getElementById(uniqueTileId);
-                
-                if (imgEl) {
-                    var cid = r[0];
-                    // URLs diretas
-                    var ghDirectPS3 = "https://ps3-pro.github.io/PSN-Content/resources/covers/compressed/" + cid + ".JPG";
-                    var ghDirectPC = "https://ps3-pro.github.io/PSN-Content/resources/covers/uncompressed/" + cid + ".JPG";
-                    var url = isPS3 ? ghDirectPS3 : ghDirectPC;
-                    
-                    // CHAMA O LOAD IMEDIATAMENTE - SEM TIMERS
-                    tryLoadImage(imgEl, url, cid);
-                }
-            }
+            var a = chunk[i];
+            if (!a[3] || a[3] === "MISSING") continue;
+            
+            var size = formatFileSize(a[a.length-1] || a[a.length-2] || "");
+            var cid = a[0], name = a[2];
+            
+            chunkArray.push(
+                '<li>',
+                    name, 
+                    ' <span class="id-text">[', cid, ']</span> ',
+                    ' <span class="size">', size, '</span>',                
+                    ' ', makeRap(a), 
+                    ' <a href="', a[3], '" class="pkg-btn">PKG</a>',
+                '</li>'
+            );
         }
     }
     
-    // Continua renderizando o resto da página se necessário
+    // Injeta HTML
+    if (chunkArray.length > 0) list.insertAdjacentHTML('beforeend', chunkArray.join(''));
+    chunkArray = null; 
+    
+    // === DISPARO DE IMAGENS (SÓ RODA SE FOR MODO CAPAS) ===
+    if (useCoverGUI) {
+        // Truque de Velocidade do PS3:
+        // Usamos setTimeout 0 para deixar o navegador desenhar o HTML (Default Covers) primeiro.
+        // Assim a interface não trava. Logo em seguida, disparamos o GitHub.
+        setTimeout(function() {
+            processNewImages(chunk, g_currentChunkIndex);
+        }, 0);
+    }
+    
+    // Paginação / Continuação
     g_currentChunkIndex += g_chunkSize;
     if (g_currentChunkIndex < g_allMatches.length && g_currentChunkIndex < currentLimit) {
         g_renderTimer = setTimeout(renderChunk, 0);
     } else {
-        // ... (resto da lógica de botão load more)
-			if (!isPS3 && g_allMatches.length > currentLimit) {
-				var btn = document.getElementById('btn-load-more');
-				var remaining = g_allMatches.length - currentLimit;
-				btn.innerHTML = "Load more " + (remaining > g_pcPageSize ? g_pcPageSize : remaining) + " items";
-				btn.style.display = 'block';
-			} else {
-				var btn = document.getElementById('btn-load-more');
-				if(btn) btn.style.display = 'none';
-			}
-			
-			if (g_pendingScroll !== null) {
-				var contentDiv = document.querySelector('.content');
-				if (contentDiv) {
-					contentDiv.scrollTop = g_pendingScroll;
-				}
-				g_pendingScroll = null;
-			}
-		}
-	}
+        if (!isPS3 && g_allMatches.length > currentLimit) {
+            var btn = document.getElementById('btn-load-more');
+            var remaining = g_allMatches.length - currentLimit;
+            btn.innerHTML = "Load more " + (remaining > g_pcPageSize ? g_pcPageSize : remaining) + " items";
+            btn.style.display = 'block';
+        } else {
+            var btn = document.getElementById('btn-load-more');
+            if(btn) btn.style.display = 'none';
+        }
+    }
+}
 		
 	function loadMoreItems() {
 		if (isPS3) return;
@@ -1797,6 +1789,59 @@ function cancelAllDownloads() {
 		var regionText = (g_regionFilter == "ALL") ? "All Regions" : g_regionFilter;
 		document.getElementById('count').textContent = "Displaying " + newDisplayCount + " items | " + regionText;
 	}
+	
+	// ESSA FUNÇÃO DISPARA O GITHUB IMEDIATAMENTE (Igual ao código antigo)
+function processNewImages(chunk, startIndex) {
+    // Se trocou de categoria ou saiu do modo Grid, para tudo.
+    if (!useCoverGUI) return;
+
+    for (var i = 0; i < chunk.length; i++) {
+        var r = chunk[i];
+        if (r[0] && r[3] && r[3] !== "MISSING") {
+            var uniqueIndex = startIndex + i;
+            var tileId = "img_" + r[0] + "_" + uniqueIndex;
+            var img = document.getElementById(tileId);
+            
+            // Se a imagem existe e ainda está com a capa padrão
+            if (img && img.src.indexOf('data:image') !== -1) {
+                var cid = r[0];
+                
+                // URLs Diretas
+                var ghDirectPS3 = "https://ps3-pro.github.io/PSN-Content/resources/covers/compressed/" + cid + ".JPG";
+                var ghDirectPC = "https://ps3-pro.github.io/PSN-Content/resources/covers/uncompressed/" + cid + ".JPG";
+                var targetUrl = isPS3 ? ghDirectPS3 : ghDirectPC;
+
+                // --- O SEGREDO DO "PC VAZIO" ---
+                // No PC e PS3, definimos o evento de ERRO antes de mudar o SRC.
+                img.onerror = function() {
+                    // Se falhar no GitHub, chama o socorro da Sony
+                    handleImageError(this, this.getAttribute('data-cid'));
+                };
+
+                // --- O SEGREDO DA VELOCIDADE ---
+                // Aplica direto no elemento. Sem "new Image()". O navegador gerencia.
+                img.src = targetUrl;
+            }
+        }
+    }
+}
+
+// ESSA FUNÇÃO CUIDA SÓ DOS ERROS (Sony Backup)
+function handleImageError(img, cid) {
+    // Se já tentou carregar da Sony, desiste para não entrar em loop
+    if (img.getAttribute('data-sony-tried')) return;
+    
+    if (typeof generateSonyHash === 'function') {
+        var hash = generateSonyHash(cid);
+        // Marca que já tentamos Sony
+        img.setAttribute('data-sony-tried', 'true');
+        
+        // Tenta carregar da Sony
+        // No PS3, fazemos direto também para não perder tempo com filas complexas
+        // já que isso é um "backup" e não o carregamento principal.
+        img.src = "http://tmdb.np.dl.playstation.net/tmdb/" + hash + "/ICON0.PNG";
+    }
+}
 
     function render() {
 		stopRendering();
