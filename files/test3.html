@@ -1580,8 +1580,8 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
 	}
 
 	function startSonyPhase() {
+    // Segurança básica
     if (!isPS3) { sonyPendingList = []; return; }
-
     if (sonyPendingList.length === 0) return;
     if (sonyWorker) return;
 
@@ -1592,76 +1592,107 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
             return;
         }
 
-        for (var i = 0; i < 2; i++) {
+        // === PROCESSA 2 IMAGENS POR VEZ ===
+        // Isso resolve a lentidão "um por um"
+        for (var k = 0; k < 2; k++) {
             if (sonyPendingList.length === 0) break;
 
             var item = sonyPendingList.shift();
+            // Recupera as variáveis (IMPORTANTE)
             var img = item.element;
             var cid = item.cid;
 
+            // Só processa se a imagem ainda estiver com a capa padrão (cinza)
             if (img && !img.getAttribute('data-loaded')) {
                  if (typeof generateSonyHash === 'function') {
                     var hash = generateSonyHash(cid);
                     var sonyUrl = "http://tmdb.np.dl.playstation.net/tmdb/" + hash + "/ICON0.PNG";
                     
+                    // LOADER SILENCIOSO (Previne o X Vermelho)
                     var tempSony = new Image();
+                    
+                    // Guarda a referência para aplicar depois
                     tempSony.targetElement = img;
 
                     tempSony.onload = function() {
+                        // SUCESSO NA SONY: Troca a capa cinza pela real
                         if (this.targetElement) {
                             this.targetElement.src = this.src;
                             markAsLoaded(this.targetElement);
                         }
                     };
+                    
+                    // ERRO NA SONY: Não faz nada. Deixa o cinza lá.
+                    // Não damos markAsFailed aqui para não sujar a tela.
+                    
                     tempSony.src = sonyUrl;
                 }
             }
         }
-    }, 100);
+    }, 150); 
 }
 
 	function tryLoadImage(imgElement, mainUrl, cid) {
+    
+    // === ESTRATÉGIA PC: SILENCIOSA E LIMPA ===
     if (!isPS3) {
-        imgElement.onerror = function() {
-            this.onerror = null;
-            
-            this.src = defaultCover; 
-            
+        var pcLoader = new Image();
+        
+        pcLoader.onload = function() {
+            // Sucesso GitHub: Troca a imagem
+            if (imgElement) {
+                imgElement.src = this.src;
+                markAsLoaded(imgElement);
+            }
+        };
+
+        pcLoader.onerror = function() {
+            // Falha GitHub: Tenta Sony silenciosamente
             if (typeof generateSonyHash === 'function') {
                 var hash = generateSonyHash(cid);
                 var sonyUrl = "http://tmdb.np.dl.playstation.net/tmdb/" + hash + "/ICON0.PNG";
                 
-                var silentLoader = new Image();
-                silentLoader.onload = function() {
+                var sonyLoader = new Image();
+                sonyLoader.onload = function() {
+                    // Sucesso Sony: Troca a imagem
                     if (imgElement) {
                         imgElement.src = this.src;
                         markAsLoaded(imgElement);
                     }
                 };
-                silentLoader.src = sonyUrl;
+                // Se falhar na Sony, não faz nada. Fica a Default Cover.
+                sonyLoader.src = sonyUrl;
             }
         };
         
-        imgElement.src = mainUrl;
+        pcLoader.src = mainUrl;
         return;
     }
 
+    // === ESTRATÉGIA PS3: SILENCIOSA COM FILA ===
     var ps3Loader = new Image();
     
     ps3Loader.onload = function() {
+        // Sucesso GitHub: Aplica na tela
         if (imgElement) {
             imgElement.src = this.src;
             markAsLoaded(imgElement);
         }
+        
+        // Se a internet está boa (GitHub carregou), acordamos a fila da Sony
+        // para aproveitar a banda e baixar o resto em lote
         if (sonyPendingList.length > 0 && !sonyWorker) {
-             startSonyPhase();
+            startSonyPhase();
         }
     };
 
     ps3Loader.onerror = function() {
+        // Falha GitHub: Manda para a fila (NÃO TOCA NA TELA, MANTÉM CINZA)
         if (imgElement) {
             sonyPendingList.push({ element: imgElement, cid: cid });
         }
+        
+        // Liga o motor da Sony se estiver desligado
         if (!sonyWorker) {
             startSonyPhase();
         }
