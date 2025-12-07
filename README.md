@@ -3,8 +3,7 @@
 # PlayStation™ Network Database
 PlayStation™ Network content downloader for PS3™ Pro.
 
-<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/9ccf25e6-c77f-4239-96a3-08446b9f49fd" />
-
+<img width="1907" height="903" alt="image" src="https://github.com/user-attachments/assets/5fa979aa-4d11-4b80-83d6-248081e726b9" />
 
  # Credits
  @yne and [NoPayStation](https://nopaystation.com/) database.
