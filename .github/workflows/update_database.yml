@@ -1,0 +1,80 @@
+name: Update and Clean PSN™ Database
+
+on:
+  schedule:
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.x'
+
+      - name: Download and Process TSVs
+        run: |
+          python - <<EOF
+          import urllib.request
+          import re
+          import os
+
+          urls = {
+              "games.tsv": "https://nopaystation.com/tsv/PS3_GAMES.tsv",
+              "pending/games.tsv": "https://nopaystation.com/tsv/pending/PS3_GAMES.tsv",
+              "avatars.tsv": "https://nopaystation.com/tsv/PS3_AVATARS.tsv",
+              "pending/avatars.tsv": "https://nopaystation.com/tsv/pending/PS3_AVATARS.tsv",
+              "demos.tsv": "https://nopaystation.com/tsv/PS3_DEMOS.tsv",
+              "pending/demos.tsv": "https://nopaystation.com/tsv/pending/PS3_DEMOS.tsv",
+              "dlcs.tsv": "https://nopaystation.com/tsv/PS3_DLCS.tsv",
+              "pending/dlcs.tsv": "https://nopaystation.com/tsv/pending/PS3_DLCS.tsv",
+              "themes.tsv": "https://nopaystation.com/tsv/PS3_THEMES.tsv"
+          }
+          
+          base_dir = "resources/database"
+
+          def clean_name(name):
+              name = re.sub(r'\(.*?\)|\[.*?\]', '', name)
+              name = re.sub(r'\b(Full Game|Trial|Demo|Beta|Version)\b', '', name, flags=re.I)
+              name = re.sub(r'[™®©]', '', name)
+              name = re.sub(r'\s+', ' ', name).strip()
+              return name
+
+          for local_path, url in urls.items():
+              try:
+                  full_path = os.path.join(base_dir, local_path)
+                  os.makedirs(os.path.dirname(full_path), exist_ok=True)
+                  
+                  print(f"Baixando e limpando: {local_path}...")
+                  response = urllib.request.urlopen(url)
+                  content = response.read().decode('utf-8').splitlines()
+                  
+                  cleaned_lines = []
+                  for i, line in enumerate(content):
+                      if i == 0 or not line.strip():
+                          cleaned_lines.append(line)
+                          continue
+                      
+                      parts = line.split('\t')
+                      if len(parts) > 2:
+                          parts[2] = clean_name(parts[2])
+                          cleaned_lines.append('\t'.join(parts))
+                  
+                  with open(full_path, 'w', encoding='utf-8') as f:
+                      f.write('\n'.join(cleaned_lines))
+              except Exception as e:
+                  print(f"Erro ao processar {local_path}: {e}")
+          EOF
+
+      - name: Commit and Push
+        run: |
+          git config --global user.name "PS3-Pro Bot"
+          git config --global user.email "bot@ps3pro.com"
+          git add resources/database/*.tsv resources/database/pending/*.tsv
+          git diff-index --quiet HEAD || git commit -m "Auto-update: NPS Database Sync (Aligned with JS paths)"
+          git push
