@@ -1,76 +1,49 @@
-name: Update and Clean PSN™ Database
+name: Update PSN™ Database
 
 on:
+  # Automatically run every day at midnight (UTC)
   schedule:
     - cron: '0 0 * * *'
   workflow_dispatch:
 
 jobs:
-  update:
+  update-database:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v3
 
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.x'
-
-      - name: Download and Process TSVs
+      - name: Download Official TSV files from NoPayStation
         run: |
-          python - <<EOF
-          import urllib.request
-          import re
-          import os
-
-          urls = {
-              "games.tsv": "https://nopaystation.com/tsv/PS3_GAMES.tsv",
-              "pending/games.tsv": "https://nopaystation.com/tsv/pending/PS3_GAMES.tsv",
-              "avatars.tsv": "https://nopaystation.com/tsv/PS3_AVATARS.tsv",
-              "pending/avatars.tsv": "https://nopaystation.com/tsv/pending/PS3_AVATARS.tsv",
-              "demos.tsv": "https://nopaystation.com/tsv/PS3_DEMOS.tsv",
-              "pending/demos.tsv": "https://nopaystation.com/tsv/pending/PS3_DEMOS.tsv",
-              "dlcs.tsv": "https://nopaystation.com/tsv/PS3_DLCS.tsv",
-              "pending/dlcs.tsv": "https://nopaystation.com/tsv/pending/PS3_DLCS.tsv",
-              "themes.tsv": "https://nopaystation.com/tsv/PS3_THEMES.tsv"
-          }
+          # Set the base directory for official content
+          BASE_DIR="resources/database/official"
           
-          base_dir = "resources/database"
+          # Create the necessary folder structure
+          mkdir -p "$BASE_DIR/pending"
 
-          def clean_name(name):
-              return name
+          # --- Main Official Databases ---
+          curl -L "https://nopaystation.com/tsv/PS3_GAMES.tsv" -o "$BASE_DIR/games.tsv"
+          curl -L "https://nopaystation.com/tsv/PS3_AVATARS.tsv" -o "$BASE_DIR/avatars.tsv"
+          curl -L "https://nopaystation.com/tsv/PS3_DEMOS.tsv" -o "$BASE_DIR/demos.tsv"
+          curl -L "https://nopaystation.com/tsv/PS3_DLCS.tsv" -o "$BASE_DIR/dlcs.tsv"
+          curl -L "https://nopaystation.com/tsv/PS3_THEMES.tsv" -o "$BASE_DIR/themes.tsv"
 
-          for local_path, url in urls.items():
-              try:
-                  full_path = os.path.join(base_dir, local_path)
-                  os.makedirs(os.path.dirname(full_path), exist_ok=True)
-                  
-                  print(f"Baixando e limpando: {local_path}...")
-                  response = urllib.request.urlopen(url)
-                  content = response.read().decode('utf-8').splitlines()
-                  
-                  cleaned_lines = []
-                  for i, line in enumerate(content):
-                      if i == 0 or not line.strip():
-                          cleaned_lines.append(line)
-                          continue
-                      
-                      parts = line.split('\t')
-                      if len(parts) > 2:
-                          parts[2] = clean_name(parts[2])
-                          cleaned_lines.append('\t'.join(parts))
-                  
-                  with open(full_path, 'w', encoding='utf-8') as f:
-                      f.write('\n'.join(cleaned_lines))
-              except Exception as e:
-                  print(f"Erro ao processar {local_path}: {e}")
-          EOF
+          # --- Pending Databases ---
+          curl -L "https://nopaystation.com/tsv/pending/PS3_GAMES.tsv" -o "$BASE_DIR/pending/games.tsv"
+          curl -L "https://nopaystation.com/tsv/pending/PS3_AVATARS.tsv" -o "$BASE_DIR/pending/avatars.tsv"
+          curl -L "https://nopaystation.com/tsv/pending/PS3_DEMOS.tsv" -o "$BASE_DIR/pending/demos.tsv"
+          curl -L "https://nopaystation.com/tsv/pending/PS3_DLCS.tsv" -o "$BASE_DIR/pending/dlcs.tsv"
+          curl -L "https://nopaystation.com/tsv/pending/PS3_THEMES.tsv" -o "$BASE_DIR/pending/themes.tsv"
 
-      - name: Commit and Push
+      - name: Commit and Push changes
         run: |
           git config --global user.name "PS3-Pro Bot"
           git config --global user.email "bot@ps3pro.com"
-          git add resources/database/*.tsv resources/database/pending/*.tsv
-          git diff-index --quiet HEAD || git commit -m "Auto-update: NPS Database Sync (Aligned with JS paths)"
+          
+          # Add updated TSV files to the staging area
+          git add resources/database/official/*.tsv
+          git add resources/database/official/pending/*.tsv
+          
+          # Only commit if there are actual changes in the files
+          git diff-index --quiet HEAD || git commit -m "Auto-update: Synchronized with NoPayStation (Official & Pending)"
           git push
