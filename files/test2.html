@@ -2526,64 +2526,75 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
 	function loadDLCIndexBackground() {
     if (g_dlcIndexLoaded) return;
     
+    // Vamos usar o contador lá de cima para nos dizer o que está acontecendo
+    var debugLog = document.getElementById('count');
+    if(debugLog) debugLog.innerHTML = "<span style='color:yellow'>DEBUG: Iniciando download DLC...</span>";
+
+    // Garante a URL aqui dentro para não ter erro
+    var url = "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/database/official/dlcs.tsv";
+    
     var xhr = new XMLHttpRequest();
+    
     xhr.onreadystatechange = function() {
+        // Mostra o estado atual (1=conectando, 2=cabeçalho, 3=baixando, 4=concluido)
+        if(debugLog && xhr.readyState < 4) {
+            debugLog.innerHTML = "<span style='color:orange'>DEBUG: Carregando... Estado " + xhr.readyState + "</span>";
+        }
+
         if (xhr.readyState == 4) {
-            // Verifica se deu erro no download (status 0 ou 200 é OK no PS3)
             if (xhr.status == 200 || xhr.status == 0) {
-                var text = xhr.responseText;
-                if (!text) return;
-
-                // --- TÉCNICA DE BAIXA MEMÓRIA PARA PS3 ---
-                // Não usamos split('\n') para não estourar a RAM
-                var start = 0;
-                var end = text.indexOf('\n', start);
-                
-                while (end !== -1) {
-                    // Pega apenas a linha atual
-                    var line = text.substring(start, end);
+                try {
+                    if(debugLog) debugLog.innerHTML = "<span style='color:cyan'>DEBUG: Download OK! Processando...</span>";
                     
-                    // Lógica de processamento
-                    if (line.length > 9) {
-                        var tabIndex = line.indexOf('\t');
-                        if (tabIndex > -1) {
-                            var tid = line.substring(0, tabIndex).trim();
-                            if (tid.length === 9) {
-                                g_dlcMap[tid] = true;
-                            }
-                        }
+                    var text = xhr.responseText;
+                    
+                    if (!text) {
+                         if(debugLog) debugLog.innerHTML = "<span style='color:red'>DEBUG: Arquivo veio vazio!</span>";
+                         return;
+                    }
+
+                    // Tenta processar (aqui é onde o PS3 costuma travar por memória)
+                    var regex = /([A-Z]{4}[0-9]{5})/g;
+                    var match;
+                    var count = 0;
+                    
+                    while ((match = regex.exec(text)) !== null) {
+                        g_dlcMap[match[1]] = true;
+                        count++;
                     }
                     
-                    // Prepara para a próxima linha
-                    start = end + 1;
-                    end = text.indexOf('\n', start);
-                }
-                
-                // Processa a última linha se sobrar
-                if (start < text.length) {
-                    var line = text.substring(start);
-                     if (line.length > 9) {
-                        var tabIndex = line.indexOf('\t');
-                        if (tabIndex > -1) {
-                            var tid = line.substring(0, tabIndex).trim();
-                            if (tid.length === 9) g_dlcMap[tid] = true;
-                        }
+                    // Libera memória imediatamente
+                    text = null; 
+                    
+                    g_dlcIndexLoaded = true;
+                    
+                    if(debugLog) debugLog.innerHTML = "<span style='color:#00FF00'>DEBUG: Sucesso! " + count + " DLCs carregados.</span>";
+                    
+                    // Injeta os botões
+                    if (currentCategory === 'games') {
+                         injectExtraButtonsOnScreen();
                     }
-                }
-                // ------------------------------------------
+                    
+                    // Limpa a mensagem de debug depois de 3 segundos
+                    setTimeout(function(){
+                         if(debugLog) debugLog.innerHTML = "Done via Debug.";
+                    }, 3000);
 
-                g_dlcIndexLoaded = true;
-                
-                // Removemos console.log para evitar erros no PS3
-                // Atualiza a tela
-                if (currentCategory === 'games') {
-                     injectExtraButtonsOnScreen();
+                } catch (e) {
+                    if(debugLog) debugLog.innerHTML = "<span style='color:red'>ERRO DE MEMÓRIA: " + e + "</span>";
                 }
+            } else {
+                if(debugLog) debugLog.innerHTML = "<span style='color:red'>ERRO REDE: Status " + xhr.status + "</span>";
             }
         }
     };
-    xhr.open('GET', URL_DB_DLC, true);
-    xhr.send();
+    
+    try {
+        xhr.open('GET', url, true);
+        xhr.send();
+    } catch(e) {
+        if(debugLog) debugLog.innerHTML = "<span style='color:red'>ERRO AO INICIAR: " + e + "</span>";
+    }
 }
 	
 	// ==============================================================
