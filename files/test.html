@@ -2395,45 +2395,62 @@ function checkVisibility() {
     var scrollY = contentDiv ? contentDiv.scrollTop : window.pageYOffset;
     var viewH = window.innerHeight;
 
-    var loadTop = scrollY - 50; 
+    // Buffers de carregamento e limpeza
+    var loadTop = scrollY - 100; 
     var loadBottom = scrollY + viewH + 300; 
+    var unloadBuffer = 1500;
+    var keepTop = scrollY - unloadBuffer;
+    var keepBottom = scrollY + viewH + unloadBuffer;
 
     var queue = [];
 
     for (var i = 0; i < imgs.length; i++) {
         var img = imgs[i];
-        if (img.getAttribute('data-loading') || img.getAttribute('data-loaded')) continue;
-
         var rect = img.getBoundingClientRect();
         var yPos = rect.top + scrollY;
 
+        // 1. LÓGICA DE LIMPEZA (UNLOAD) - Essencial para não travar a RAM do PS3
+        if (isPS3 && (yPos < keepTop || yPos > keepBottom)) {
+            if (img.src !== defaultCover) {
+                img.onload = null;
+                img.onerror = null;
+                // Libera a memória da imagem
+                img.src = "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7";
+                img.src = defaultCover;
+                img.removeAttribute('data-loaded');
+                img.removeAttribute('data-loading');
+                img.removeAttribute('data-failed');
+            }
+            continue;
+        }
+
+        // 2. IDENTIFICA QUEM PRECISA ENTRAR NA FILA
         if (yPos >= loadTop && yPos <= loadBottom) {
-            queue.push(img);
+            if (img.getAttribute('data-loading') || img.getAttribute('data-loaded') || img.getAttribute('data-failed')) continue;
+            
+            if (img.src === defaultCover) {
+                queue.push(img);
+            }
         }
     }
 
+    // 3. DISPARO DAS VIAS PARALELAS
     if (queue.length > 0) {
-        g_queueIndex = 0; // Reinicia o índice
-        
-        // DISPARO PARALELO: Criamos 3 "vias" de carregamento no PS3
-        // No PC (se quiser) pode aumentar para 6 ou mais.
-        var concurrentLanes = isPS3 ? 12 : 24; 
+        g_queueIndex = 0; 
+        var concurrentLanes = isPS3 ? 12 : 24; // Modo Turbo ativado
         
         for (var l = 0; l < concurrentLanes; l++) {
-            // Pequeno atraso entre o início de cada via para não dar pico de CPU
             setTimeout(function() {
                 processQueue(queue);
-            }, l * 10); 
+            }, l * 10); // Escalonamento de 10ms
         }
     }
 }
 
 function processQueue(queue) {
-    // Pega o próximo item disponível na fila global e incrementa o índice
     var currentIndex = g_queueIndex;
     g_queueIndex++;
 
-    // Se acabou a fila, essa "via" para de trabalhar
     if (currentIndex >= queue.length) return;
 
     var realImg = queue[currentIndex];
@@ -2442,31 +2459,40 @@ function processQueue(queue) {
     realImg.setAttribute('data-loading', 'true');
     var ghost = new Image();
     
-    var urlJPG = isPS3 ? 
-        "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/covers/compressed/" + title_id + ".JPG" :
-        "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/covers/uncompressed/" + title_id + ".JPG";
+    // --- LÓGICA DO COVERMAP (O CÉREBRO) ---
+    var url;
+    // Se o índice carregou e o ID NÃO está no mapa, vai direto pro Hash
+    if (g_coverIndexLoaded && !g_coverMap[title_id] && typeof generateSonyHash === 'function') {
+        var hash = generateSonyHash(title_id);
+        url = "https://raw.githubusercontent.com/PS3-Pro/Recently-Played-Games/master/np/" + hash + "/ICON0.PNG";
+    } 
+    else {
+        // Se está no mapa ou o índice ainda não baixou, tenta o JPG oficial
+        var ghDirectPS3 = "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/covers/compressed/" + title_id + ".JPG";
+        var ghDirectPC = "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/covers/uncompressed/" + title_id + ".JPG";
+        url = isPS3 ? ghDirectPS3 : ghDirectPC;
+    }
 
     ghost.onload = function() {
         realImg.src = this.src;
         realImg.removeAttribute('data-loading');
         realImg.setAttribute('data-loaded', 'true');
-        // Assim que terminar este, chama o PRÓXIMO da fila global imediatamente
-        processQueue(queue);
+        processQueue(queue); // Puxa o próximo da fila
     };
 
     ghost.onerror = function() {
+        // Fallback: Se tentou o JPG e falhou (mesmo com o mapa), tenta o Hash como última chance
         if (this.src.indexOf('.JPG') !== -1 && typeof generateSonyHash === 'function') {
             var hash = generateSonyHash(title_id);
             this.src = "https://raw.githubusercontent.com/PS3-Pro/Recently-Played-Games/master/np/" + hash + "/ICON0.PNG";
         } else {
             realImg.removeAttribute('data-loading');
             realImg.setAttribute('data-failed', 'true');
-            // Mesmo falhando, essa "via" continua para o próximo
             processQueue(queue);
         }
     };
 
-    ghost.src = urlJPG;
+    ghost.src = url;
 }
 	
 	var g_scrollTimer = null;
