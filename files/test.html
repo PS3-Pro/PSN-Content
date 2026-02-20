@@ -2388,66 +2388,95 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
 
     var contentDiv = document.querySelector('.content');
     var imgs = document.querySelectorAll('.game-tile img');
-    var scrollY = (contentDiv && (isPS3 || document.body.className.indexOf('is-pc') !== -1)) 
-                  ? contentDiv.scrollTop : window.pageYOffset;
+    
+    // 1. RESTAURAÇÃO DO SCROLL (MANTIDO)
+    var scrollY = 0;
+    if (contentDiv && (isPS3 || document.body.className.indexOf('is-pc') !== -1)) {
+        scrollY = contentDiv.scrollTop;
+    } else {
+        scrollY = window.pageYOffset;
+    }
     
     var viewH = window.innerHeight;
-    var loadBuffer = isPS3 ? 500 : 5000;
-    var loadTop = scrollY - 100;
+
+    // 2. BUFFERS DINÂMICOS (MANTIDO)
+    var loadBuffer = (isPS3) ? 500 : (g_lazyLoadPC ? 5000 : 99999);
+    var loadTop = scrollY - loadBuffer;
     var loadBottom = scrollY + viewH + loadBuffer;
+
+    var unloadBuffer = (isPS3) ? 1500 : 8000; 
+    var keepTop = scrollY - unloadBuffer;
+    var keepBottom = scrollY + viewH + unloadBuffer;
+
+    // 3. CATEGORIAS (MANTIDO)
+    var unofficialCats = ["homebrew_apps", "backup_manager", "emulators", "homebrew_games", "launchers", "legacy", "ports", "tools"];
+    var isUnofficial = unofficialCats.indexOf(currentCategory) !== -1;
 
     for (var i = 0; i < imgs.length; i++) {
         var img = imgs[i];
         var rect = img.getBoundingClientRect();
         var yPos = rect.top + scrollY;
 
-        // Limpeza de RAM continua sendo obrigatória no PS3
-        if (isPS3 && (yPos < scrollY - 1500 || yPos > scrollY + viewH + 1500)) {
+        // 4. LIMPEZA DE RAM NO PS3 (MANTIDO)
+        if (isPS3 && (yPos < keepTop || yPos > keepBottom)) {
             if (img.src !== defaultCover) {
+                img.onload = null;
+                img.onerror = null;
                 img.src = "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7";
                 img.src = defaultCover;
                 img.removeAttribute('data-loaded');
+                img.removeAttribute('data-loading');
+                img.removeAttribute('data-failed');
             }
             continue;
         }
 
+        // 5. CARREGAMENTO (PS3 gerencia as conexões sozinho aqui)
         if (yPos >= loadTop && yPos <= loadBottom) {
             if (img.getAttribute('data-loading') || img.getAttribute('data-loaded') || img.getAttribute('data-failed')) continue;
             
-            // DISPARO DIRETO (O PS3 que lute para gerenciar)
-            loadNativeImage(img);
+            if (img.src === defaultCover) {
+                // Dispara o download sem fila controlada
+                loadFinalImage(img);
+            }
         }
     }
 }
 
-function loadNativeImage(realImg) {
+// Função de carga Universal (PC e PS3)
+function loadFinalImage(realImg) {
     var title_id = realImg.getAttribute('data-title_id');
     realImg.setAttribute('data-loading', 'true');
-
+    
     var ghost = new Image();
     var url;
 
-    // CoverMap continua sendo o nosso melhor amigo aqui
+    // 6. INTELIGÊNCIA DO COVERMAP (MANTIDO)
     if (g_coverIndexLoaded && !g_coverMap[title_id] && typeof generateSonyHash === 'function') {
         var hash = generateSonyHash(title_id);
         url = "https://raw.githubusercontent.com/PS3-Pro/Recently-Played-Games/master/np/" + hash + "/ICON0.PNG";
-    } else {
-        url = isPS3 ? 
-            "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/covers/compressed/" + title_id + ".JPG" :
-            "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/covers/uncompressed/" + title_id + ".JPG";
+    } 
+    else {
+        var ghDirectPS3 = "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/covers/compressed/" + title_id + ".JPG";
+        var ghDirectPC = "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/covers/uncompressed/" + title_id + ".JPG";
+        url = isPS3 ? ghDirectPS3 : ghDirectPC;
     }
 
+    // SUCESSO: Troca a imagem real (Default) pela carregada (Ghost)
     ghost.onload = function() {
         realImg.src = this.src;
         realImg.setAttribute('data-loaded', 'true');
         realImg.removeAttribute('data-loading');
     };
 
+    // ERRO: Fallback invisível (Sem o "X" quebrado no PC ou PS3)
     ghost.onerror = function() {
         if (this.src.indexOf('.JPG') !== -1 && typeof generateSonyHash === 'function') {
             var hash = generateSonyHash(title_id);
             this.src = "https://raw.githubusercontent.com/PS3-Pro/Recently-Played-Games/master/np/" + hash + "/ICON0.PNG";
         } else {
+            // Se tudo falhar, força o defaultCover para esconder o erro
+            realImg.src = defaultCover;
             realImg.setAttribute('data-failed', 'true');
             realImg.removeAttribute('data-loading');
         }
