@@ -2384,132 +2384,75 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
     // ==============================================================
     // 6. LAZY LOADING (ANTI-CRASH)
     // ==============================================================
-	var g_queueIndex = 0;
-	
 	function checkVisibility() {
 		if (!useCoverGUI) return;
 	
 		var contentDiv = document.querySelector('.content');
 		var imgs = document.querySelectorAll('.game-tile img');
 		
-		var scrollY = (contentDiv && (isPS3 || document.body.className.indexOf('is-pc') !== -1)) 
-					? contentDiv.scrollTop : window.pageYOffset;
+		var scrollY = 0;
+		if (contentDiv && (isPS3 || document.body.className.indexOf('is-pc') !== -1)) {
+			scrollY = contentDiv.scrollTop;
+		} else {
+			scrollY = window.pageYOffset;
+		}
 		
 		var viewH = window.innerHeight;
-		var loadBuffer = isPS3 ? 500 : (g_lazyLoadPC ? 5000 : 99999);
+		var loadBuffer = (isPS3) ? 500 : (g_lazyLoadPC ? 5000 : 99999);
 		var loadTop = scrollY - loadBuffer;
 		var loadBottom = scrollY + viewH + loadBuffer;
 	
-		var queue = [];
+		var unloadBuffer = 2000; 
+		var keepTop = scrollY - unloadBuffer;
+		var keepBottom = scrollY + viewH + unloadBuffer;
 	
-		for (var i = 0; i < imgs.length; i++) {
+		var len = imgs.length;
+	
+		var unofficialCats = ["homebrew_apps", "backup_manager", "emulators", "homebrew_games", "launchers", "legacy", "ports", "tools"];
+		var isUnofficial = unofficialCats.indexOf(currentCategory) !== -1;
+	
+		for (var i = 0; i < len; i++) {
 			var img = imgs[i];
 			var rect = img.getBoundingClientRect();
 			var yPos = rect.top + scrollY;
 	
-			if (isPS3 && (yPos < scrollY - 1500 || yPos > scrollY + viewH + 1500)) {
+			if (yPos > keepBottom) break; 
+			
+			if (yPos >= loadTop && yPos <= loadBottom) {
+				if (img.getAttribute('data-loading')) continue;
+	
+				if (img.src === defaultCover && !img.getAttribute('data-loaded') && !img.getAttribute('data-failed')) { 
+					img.setAttribute('data-loading', 'true');
+					var title_id = img.getAttribute('data-title_id');
+					
+					var url;
+					
+					if (g_coverIndexLoaded && !g_coverMap[title_id] && typeof generateSonyHash === 'function') {
+						var hash = generateSonyHash(title_id);
+						url = "https://raw.githubusercontent.com/PS3-Pro/Recently-Played-Games/master/np/" + hash + "/ICON0.PNG";
+					} 
+					else {
+						var ghDirectPS3 = "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/covers/compressed/" + title_id + ".JPG";
+						var ghDirectPC = "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/covers/uncompressed/" + title_id + ".JPG";
+						url = isPS3 ? ghDirectPS3 : ghDirectPC;
+					}
+					
+					tryLoadImage(img, url, title_id);
+				}
+			}
+			else if (isPS3 && (yPos < keepTop || yPos > keepBottom)) {
 				if (img.src !== defaultCover) {
+					img.onload = null;
+					img.onerror = null;
 					img.src = "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7";
 					img.src = defaultCover;
+					
 					img.removeAttribute('data-loaded');
 					img.removeAttribute('data-loading');
-				}
-				continue;
-			}
-	
-			if (yPos >= loadTop && yPos <= loadBottom) {
-				if (img.getAttribute('data-loading') || img.getAttribute('data-loaded') || img.getAttribute('data-failed')) continue;
-				
-				if (isPS3) {
-					queue.push(img);
-				} else {
-					loadPCImage(img);
+					img.removeAttribute('data-failed');
 				}
 			}
 		}
-	
-		if (isPS3 && queue.length > 0) {
-			g_queueIndex = 0;
-			var concurrentLanes = 12; 
-			for (var l = 0; l < concurrentLanes; l++) {
-				setTimeout(function() { processQueue(queue); }, l * 10);
-			}
-		}
-	}
-	
-	function loadPCImage(img) {
-		var title_id = img.getAttribute('data-title_id');
-		img.setAttribute('data-loading', 'true');
-		
-		var ghost = new Image();
-		var url;
-	
-		if (g_coverIndexLoaded && !g_coverMap[title_id] && typeof generateSonyHash === 'function') {
-			var hash = generateSonyHash(title_id);
-			url = "https://raw.githubusercontent.com/PS3-Pro/Recently-Played-Games/master/np/" + hash + "/ICON0.PNG";
-		} else {
-			url = "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/covers/uncompressed/" + title_id + ".JPG";
-		}
-		
-		ghost.onload = function() {
-			img.src = this.src;
-			img.setAttribute('data-loaded', 'true');
-			img.removeAttribute('data-loading');
-		};
-		
-		ghost.onerror = function() {
-			if (this.src.indexOf('.JPG') !== -1 && typeof generateSonyHash === 'function') {
-				var hash = generateSonyHash(title_id);
-				this.src = "https://raw.githubusercontent.com/PS3-Pro/Recently-Played-Games/master/np/" + hash + "/ICON0.PNG";
-			} else {
-				img.src = defaultCover; 
-				img.setAttribute('data-failed', 'true');
-				img.removeAttribute('data-loading');
-			}
-		};
-		
-		ghost.src = url;
-	}
-	
-	function processQueue(queue) {
-		var currentIndex = g_queueIndex;
-		g_queueIndex++;
-	
-		if (currentIndex >= queue.length) return;
-	
-		var realImg = queue[currentIndex];
-		var title_id = realImg.getAttribute('data-title_id');
-		realImg.setAttribute('data-loading', 'true');
-	
-		var ghost = new Image();
-		var url;
-	
-		if (g_coverIndexLoaded && !g_coverMap[title_id] && typeof generateSonyHash === 'function') {
-			var hash = generateSonyHash(title_id);
-			url = "https://raw.githubusercontent.com/PS3-Pro/Recently-Played-Games/master/np/" + hash + "/ICON0.PNG";
-		} else {
-			url = "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/covers/compressed/" + title_id + ".JPG";
-		}
-	
-		ghost.onload = function() {
-			realImg.src = this.src; 
-			realImg.setAttribute('data-loaded', 'true');
-			realImg.removeAttribute('data-loading');
-			processQueue(queue);
-		};
-	
-		ghost.onerror = function() {
-			if (this.src.indexOf('.JPG') !== -1 && typeof generateSonyHash === 'function') {
-				var hash = generateSonyHash(title_id);
-				this.src = "https://raw.githubusercontent.com/PS3-Pro/Recently-Played-Games/master/np/" + hash + "/ICON0.PNG";
-			} else {
-				realImg.setAttribute('data-failed', 'true');
-				realImg.removeAttribute('data-loading');
-				processQueue(queue);
-			}
-		};
-	
-		ghost.src = url;
 	}
 	
 	var g_scrollTimer = null;

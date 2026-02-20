@@ -1850,32 +1850,37 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
         return bin_sha1(o_pad + bin_sha1(i_pad + data));
     }
 	
-    function toHex(num) { return ('00000000' + (num >>> 0).toString(16)).slice(-8).toUpperCase(); }
-
-    var g_sonyHashCache = {};
-
-    function generateSonyHash(title_id) {
-        if (g_sonyHashCache[title_id]) {
-            return g_sonyHashCache[title_id];
-        }
-
-        var base = title_id.substring(0,9) + "_00";
-        var msg = base.substring(0,12);
-        var h = bin_hmac_sha1(tmdb_hmac_key_str, msg);
-        var hashBytes = [];
-        for (var i = 0; i < 20; i++) hashBytes[i] = h.charCodeAt(i);
-        
-        var p1a = (hashBytes[0]<<24)|(hashBytes[1]<<16)|(hashBytes[2]<<8)|hashBytes[3];
-        var p1b = (hashBytes[4]<<24)|(hashBytes[5]<<16)|(hashBytes[6]<<8)|hashBytes[7];
-        var p2a = (hashBytes[8]<<24)|(hashBytes[9]<<16)|(hashBytes[10]<<8)|hashBytes[11];
-        var p2b = (hashBytes[12]<<24)|(hashBytes[13]<<16)|(hashBytes[14]<<8)|hashBytes[15];
-        var p3  = (hashBytes[16]<<24)|(hashBytes[17]<<16)|(hashBytes[18]<<8)|hashBytes[19];
-        
-        var result = base + "_" + toHex(p1a) + toHex(p1b) + toHex(p2a) + toHex(p2b) + toHex(p3);
-        
-        g_sonyHashCache[title_id] = result;
-        return result;
-    }
+		var g_hexTable = [];
+		for (var i = 0; i < 256; i++) {
+			var s = i.toString(16).toUpperCase();
+			g_hexTable[i] = (s.length < 2 ? '0' : '') + s;
+		}
+		
+		function toHexFast(num) {
+			return g_hexTable[(num >>> 24) & 0xFF] +
+				g_hexTable[(num >>> 16) & 0xFF] +
+				g_hexTable[(num >>> 8) & 0xFF] +
+				g_hexTable[num & 0xFF];
+		}
+		
+		function generateSonyHash(title_id) {
+			if (g_sonyHashCache[title_id]) return g_sonyHashCache[title_id];
+		
+			var base = title_id.substring(0, 9) + "_00";
+			var h = bin_hmac_sha1(tmdb_hmac_key_str, base);
+			
+			var b = function(i) { return h.charCodeAt(i); };
+			
+			var result = base + "_" + 
+				toHexFast((b(0)<<24)|(b(1)<<16)|(b(2)<<8)|b(3)) +
+				toHexFast((b(4)<<24)|(b(5)<<16)|(b(6)<<8)|b(7)) +
+				toHexFast((b(8)<<24)|(b(9)<<16)|(b(10)<<8)|b(11)) +
+				toHexFast((b(12)<<24)|(b(13)<<16)|(b(14)<<8)|b(15)) +
+				toHexFast((b(16)<<24)|(b(17)<<16)|(b(18)<<8)|b(19));
+			
+			g_sonyHashCache[title_id] = result;
+			return result;
+		}   
     
 		// ==============================================================
 		// REGEX (PRE-COMPILED)
@@ -2241,235 +2246,220 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
         return data;
     }
     // ==============================================================
-    // 5. UNIFIED LOADING
+    // 5. CONTROL & CLEANUP
     // ==============================================================
-    function stopRendering() {
-        if (g_renderTimer) { clearTimeout(g_renderTimer); g_renderTimer = null; }
-        g_renderID++;
-    }
-	
-	var sonyPendingList = [];
-	var sonyWorker = null;
-	var g_renderTimer = null;
-	var g_scrollTimer = null;
-	
+	function stopRendering() {
+		if (g_renderTimer) { clearTimeout(g_renderTimer); g_renderTimer = null; }
+		g_renderID++;
+	}
+
 	function cancelAllDownloads() {
-		if (sonyWorker) { 
-			clearInterval(sonyWorker); 
-			sonyWorker = null; 
-		}
-		sonyPendingList = [];
 		if (g_renderTimer) clearTimeout(g_renderTimer);
 		if (g_scrollTimer) clearTimeout(g_scrollTimer);
-	}
-
-	var sonyPendingList = [];
-	var sonyProcessTimer = null;
-	var sonyWorker = null;
-
-	function markAsLoaded(el) {
-	    el.removeAttribute('data-queued');
-	    el.removeAttribute('data-loading');
-	    el.removeAttribute('data-failed');
-	    el.setAttribute('data-loaded', 'true');
-	}
-
-	function markAsFailed(el) {
-	    el.setAttribute('data-failed', 'true');
-	    el.removeAttribute('data-loading');
-	}
-
-	var isWorkerScheduled = false;
-	
-	function signalActivity() {
-		if (!isPS3) return; 
-	
-		if (sonyWorker) return;
-	
-		if (isWorkerScheduled) return;
-	
-		isWorkerScheduled = true;
-	
-		setTimeout(startSonyPhase, 20);
-	}
-	
-	function startSonyPhase() {
-		isWorkerScheduled = false;
-	
-		if (sonyPendingList.length === 0) return;
-		if (sonyWorker) return;
-	
-		sonyWorker = setInterval(function() {
-			if (sonyPendingList.length === 0) {
-				clearInterval(sonyWorker);
-				sonyWorker = null;
-				return;
-			}
-	
-			var item = sonyPendingList.shift();
-			
-			if (!item || !item.element) return;
-	
-			var img = item.element;
-			var title_id = item.title_id;
-	
-			if (!img.getAttribute('data-loaded')) {
-				if (typeof generateSonyHash === 'function') {
-					var hash = generateSonyHash(title_id);
-					var sonyUrl = "https://raw.githubusercontent.com/PS3-Pro/Recently-Played-Games/master/np/" + hash + "/ICON0.PNG";
-					
-					var tempSony = new Image();
-					
-					tempSony.onload = function() {
-						if (img) {
-							img.src = this.src;
-							markAsLoaded(img);
-						}
-					};
-					
-					tempSony.onerror = function() {
-						if (img) markAsFailed(img);
-					};
-					
-					tempSony.src = sonyUrl;
-				}
-			}
-		}, 20);
-	}
-	
-	function tryLoadImage(imgElement, mainUrl, title_id) {
-		var requestRenderID = g_renderID;
-	
-		if (!isPS3) {
-			var pcLoader = new Image();
-			pcLoader.onload = function() {
-				if (g_renderID !== requestRenderID) return;
-				if (imgElement) { imgElement.src = this.src; markAsLoaded(imgElement); }
-			};
-			pcLoader.onerror = function() {
-				if (g_renderID !== requestRenderID) return;
-				if (this.src.indexOf('PSN-Content') !== -1 && typeof generateSonyHash === 'function') {
-					var hash = generateSonyHash(title_id);
-					this.src = "https://raw.githubusercontent.com/PS3-Pro/Recently-Played-Games/master/np/" + hash + "/ICON0.PNG";
-				} else {
-					if (imgElement) markAsFailed(imgElement);
-				}
-			};
-			pcLoader.src = mainUrl;
-			return;
-		}
-	
-		var ps3Loader = new Image();
-		ps3Loader.onload = function() {
-			if (g_renderID !== requestRenderID) return;
-			if (imgElement) { imgElement.src = this.src; markAsLoaded(imgElement); }
-		};
-	
-		ps3Loader.onerror = function() {
-			if (g_renderID !== requestRenderID) return;
-			
-			if (mainUrl.indexOf('Recently-Played-Games') !== -1) {
-				if (imgElement) markAsFailed(imgElement);
-			} else {
-				if (imgElement) {
-					sonyPendingList.push({ element: imgElement, title_id: title_id });
-				}
-				signalActivity();
-			}
-		};
-	
-		ps3Loader.src = mainUrl;
+		
+		g_queueIndex = 999999; 
 	}
 
     // ==============================================================
     // 6. LAZY LOADING (ANTI-CRASH)
     // ==============================================================
+	var g_queueIndex = 0;
+	
 	function checkVisibility() {
 		if (!useCoverGUI) return;
 	
 		var contentDiv = document.querySelector('.content');
 		var imgs = document.querySelectorAll('.game-tile img');
 		
-		var scrollY = 0;
-		if (contentDiv && (isPS3 || document.body.className.indexOf('is-pc') !== -1)) {
-			scrollY = contentDiv.scrollTop;
-		} else {
-			scrollY = window.pageYOffset;
-		}
+		var scrollY = (contentDiv && (isPS3 || document.body.className.indexOf('is-pc') !== -1)) 
+					? contentDiv.scrollTop : window.pageYOffset;
 		
 		var viewH = window.innerHeight;
-		var loadBuffer = (isPS3) ? 500 : (g_lazyLoadPC ? 5000 : 99999);
+		var loadBuffer = isPS3 ? 500 : (g_lazyLoadPC ? 5000 : 99999);
 		var loadTop = scrollY - loadBuffer;
 		var loadBottom = scrollY + viewH + loadBuffer;
 	
-		var unloadBuffer = 2000; 
-		var keepTop = scrollY - unloadBuffer;
-		var keepBottom = scrollY + viewH + unloadBuffer;
+		var queue = [];
 	
-		var len = imgs.length;
-	
-		var unofficialCats = ["homebrew_apps", "backup_manager", "emulators", "homebrew_games", "launchers", "legacy", "ports", "tools"];
-		var isUnofficial = unofficialCats.indexOf(currentCategory) !== -1;
-	
-		for (var i = 0; i < len; i++) {
+		for (var i = 0; i < imgs.length; i++) {
 			var img = imgs[i];
 			var rect = img.getBoundingClientRect();
 			var yPos = rect.top + scrollY;
 	
-			if (yPos > keepBottom) break; 
-			
-			if (yPos >= loadTop && yPos <= loadBottom) {
-				if (img.getAttribute('data-loading')) continue;
-	
-				if (img.src === defaultCover && !img.getAttribute('data-loaded') && !img.getAttribute('data-failed')) { 
-					img.setAttribute('data-loading', 'true');
-					var title_id = img.getAttribute('data-title_id');
-					
-					var url;
-					
-					if (g_coverIndexLoaded && !g_coverMap[title_id] && typeof generateSonyHash === 'function') {
-						var hash = generateSonyHash(title_id);
-						url = "https://raw.githubusercontent.com/PS3-Pro/Recently-Played-Games/master/np/" + hash + "/ICON0.PNG";
-					} 
-					else {
-						var ghDirectPS3 = "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/covers/compressed/" + title_id + ".JPG";
-						var ghDirectPC = "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/covers/uncompressed/" + title_id + ".JPG";
-						url = isPS3 ? ghDirectPS3 : ghDirectPC;
-					}
-					
-					tryLoadImage(img, url, title_id);
-				}
-			}
-			else if (isPS3 && (yPos < keepTop || yPos > keepBottom)) {
+			if (isPS3 && (yPos < scrollY - 1500 || yPos > scrollY + viewH + 1500)) {
 				if (img.src !== defaultCover) {
-					img.onload = null;
-					img.onerror = null;
 					img.src = "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7";
 					img.src = defaultCover;
-					
 					img.removeAttribute('data-loaded');
 					img.removeAttribute('data-loading');
-					img.removeAttribute('data-failed');
 				}
+				continue;
+			}
+	
+			if (yPos >= loadTop && yPos <= loadBottom) {
+				if (img.getAttribute('data-loading') || img.getAttribute('data-loaded') || img.getAttribute('data-failed')) continue;
+				
+				if (isPS3) {
+					queue.push(img);
+				} else {
+					loadPCImage(img);
+				}
+			}
+		}
+	
+		if (isPS3 && queue.length > 0) {
+			g_queueIndex = 0;
+			var concurrentLanes = 12; 
+			for (var l = 0; l < concurrentLanes; l++) {
+				setTimeout(function() { processQueue(queue); }, l * 10);
 			}
 		}
 	}
 	
-	var g_scrollTimer = null;
+	function loadPCImage(img) {
+		var title_id = img.getAttribute('data-title_id');
+		img.setAttribute('data-loading', 'true');
+		
+		var ghost = new Image();
+		var url;
+	
+		if (g_coverIndexLoaded && !g_coverMap[title_id] && typeof generateSonyHash === 'function') {
+			var hash = generateSonyHash(title_id);
+			url = "https://raw.githubusercontent.com/PS3-Pro/Recently-Played-Games/master/np/" + hash + "/ICON0.PNG";
+		} else {
+			url = "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/covers/uncompressed/" + title_id + ".JPG";
+		}
+		
+		ghost.onload = function() {
+			img.src = this.src;
+			img.setAttribute('data-loaded', 'true');
+			img.removeAttribute('data-loading');
+		};
+		
+		ghost.onerror = function() {
+			if (this.src.indexOf('.JPG') !== -1 && typeof generateSonyHash === 'function') {
+				var hash = generateSonyHash(title_id);
+				this.src = "https://raw.githubusercontent.com/PS3-Pro/Recently-Played-Games/master/np/" + hash + "/ICON0.PNG";
+			} else {
+				img.src = defaultCover; 
+				img.setAttribute('data-failed', 'true');
+				img.removeAttribute('data-loading');
+			}
+		};
+		
+		ghost.src = url;
+	}
+	
+	function processQueue(queue) {
+		var currentIndex = g_queueIndex;
+		g_queueIndex++;
+	
+		if (currentIndex >= queue.length) return;
+	
+		var realImg = queue[currentIndex];
+		var title_id = realImg.getAttribute('data-title_id');
+		realImg.setAttribute('data-loading', 'true');
+	
+		var ghost = new Image();
+		var url;
+	
+		if (g_coverIndexLoaded && !g_coverMap[title_id] && typeof generateSonyHash === 'function') {
+			var hash = generateSonyHash(title_id);
+			url = "https://raw.githubusercontent.com/PS3-Pro/Recently-Played-Games/master/np/" + hash + "/ICON0.PNG";
+		} else {
+			url = "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/covers/compressed/" + title_id + ".JPG";
+		}
+	
+		ghost.onload = function() {
+			realImg.src = this.src;
+			realImg.setAttribute('data-loaded', 'true');
+			realImg.removeAttribute('data-loading');
+			processQueue(queue);
+		};
+	
+		ghost.onerror = function() {
+			if (this.src.indexOf('.JPG') !== -1 && typeof generateSonyHash === 'function') {
+				var hash = generateSonyHash(title_id);
+				this.src = "https://raw.githubusercontent.com/PS3-Pro/Recently-Played-Games/master/np/" + hash + "/ICON0.PNG";
+			} else {
+				realImg.src = defaultCover; 
+				realImg.removeAttribute('data-loading');
+				realImg.setAttribute('data-failed', 'true');
+				processQueue(queue);
+			}
+		};
+	
+		ghost.src = url;
+	}
+	
+	var g_isPreloading = false;
 
-    function attachScrollListener() {
+	function startSilentPreloader() {
+		if (!useCoverGUI || !isPS3 || g_isPreloading) return;
+	
 		var contentDiv = document.querySelector('.content');
+		var imgs = document.querySelectorAll('.game-tile img');
+		var scrollY = contentDiv ? contentDiv.scrollTop : window.pageYOffset;
+		var viewH = window.innerHeight;
+	
+		var preloadTop = scrollY + viewH + 500;
+		var preloadBottom = preloadTop + 1500;
+	
+		var preloadQueue = [];
+	
+		for (var i = 0; i < imgs.length; i++) {
+			var img = imgs[i];
+			var rect = img.getBoundingClientRect();
+			var yPos = rect.top + scrollY;
+	
+			if (yPos >= preloadTop && yPos <= preloadBottom) {
+				var title_id = img.getAttribute('data-title_id');
+				if (!g_sonyHashCache[title_id]) {
+					preloadQueue.push(title_id);
+				}
+			}
+			if (yPos > preloadBottom) break;
+		}
+	
+		if (preloadQueue.length > 0) {
+			g_isPreloading = true;
+			processPreload(preloadQueue, 0);
+		}
+	}
+	
+	function processPreload(queue, index) {
+		if (index >= queue.length) {
+			g_isPreloading = false;
+			return;
+		}
+		generateSonyHash(queue[index]);
+	
+		setTimeout(function() {
+			processPreload(queue, index + 1);
+		}, 150);
+	}
+	
+    var g_scrollTimer = null;
+	var g_preloadTimer = null;
 
+	function attachScrollListener() {
+		var contentDiv = document.querySelector('.content');
+	
 		var onScrollHandler = function() {
 			if (!useCoverGUI) return;
-
+	
 			if (g_scrollTimer) clearTimeout(g_scrollTimer);
-			
+			if (g_preloadTimer) clearTimeout(g_preloadTimer);
+	
 			var delay = isPS3 ? 300 : 50;
-
+	
 			g_scrollTimer = setTimeout(checkVisibility, delay);
+	
+			if (isPS3) {
+				g_preloadTimer = setTimeout(startSilentPreloader, 2000);
+			}
 		};
-
+	
 		if (contentDiv) { contentDiv.onscroll = onScrollHandler; }
 		window.onscroll = onScrollHandler;
 	}
@@ -2554,14 +2544,23 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
         return '<a download="'+contentID+'.rap" href="https://ps3-pro.github.io/License-Files/files/'+contentID+'.rap">RAP</a>';
     }
 	
-    function formatFileSize(bytes) {
-        var b = bytes * 1;        
-        if (isNaN(b) || b <= 0) return "";
-        if (b >= 1073741824) return (b / 1073741824).toFixed(2) + " GB";
-        if (b >= 1048576)    return (b / 1048576).toFixed(2) + " MB";
-        if (b >= 1024)       return (b / 1024).toFixed(2) + " KB";
-        return b + " B";
-    }
+    var g_sizeUnits = [" B", " KB", " MB", " GB"];
+
+	function formatFileSize(bytes) {
+		var b = parseInt(bytes, 10);
+		if (isNaN(b) || b <= 0) return "";
+		
+		var i = 0;
+		while (b >= 1024 && i < 3) {
+			b /= 1024;
+			i++;
+		}
+		
+		if (i === 0) return b + g_sizeUnits[0];
+		
+		var res = Math.round(b * 100) / 100;
+		return res + g_sizeUnits[i];
+	}
 	
 	// ==============================================================
 	// 8. COVERS, DLC & AVATAR SYSTEM
@@ -2874,14 +2873,13 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
 					if ((g_currentChunkIndex + i) >= currentLimit) break;
 					
 					var r = chunk[i];
-					if (r[0] && r[3] && r[3] !== "MISSING") {
+					if (r[0]) {
 						var uIdx = g_currentChunkIndex + i;
 						var uTileId = "img_" + r[0] + "_" + uIdx;
 						var imgEl = document.getElementById(uTileId);
 						
 						if (imgEl) {
-							var ghDirectPC = "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/covers/uncompressed/" + r[0] + ".JPG";
-							tryLoadImage(imgEl, ghDirectPC, r[0]);
+							loadPCImage(imgEl); 
 						}
 					}
 				}
@@ -2930,7 +2928,6 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
     function render() {
 		clearListMemory()
 		stopRendering();
-		g_activeDownloads = 0;
 		cancelAllDownloads();
 
         var categoryNames = {
@@ -3171,15 +3168,15 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
 					DB.push(g_tempMap[key]);
 				}
 			}
-			g_tempMap = {}; 
+			g_tempMap = null;
+			g_tempMap = {};
 		}
 		
 		function fetchDB() {
 		stopRendering();
 		
 		cancelAllDownloads(); 
-        g_activeDownloads = 0;
-			
+        	
 		if (window.localStorage) f.fetch.disabled = true;
 		
 		g_tempMap = {};
