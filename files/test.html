@@ -2384,7 +2384,10 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
     // ==============================================================
     // 6. LAZY LOADING (ANTI-CRASH)
     // ==============================================================
-	function checkVisibility() {
+	// Variável global para controlar a posição na fila
+var g_queueIndex = 0;
+
+function checkVisibility() {
     if (!useCoverGUI) return;
 
     var contentDiv = document.querySelector('.content');
@@ -2397,7 +2400,6 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
 
     var queue = [];
 
-    // Primeiro, apenas identificamos quem precisa ser baixado
     for (var i = 0; i < imgs.length; i++) {
         var img = imgs[i];
         if (img.getAttribute('data-loading') || img.getAttribute('data-loaded')) continue;
@@ -2410,57 +2412,61 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
         }
     }
 
-    // Agora, processamos a fila UM POR UM com um pequeno atraso
     if (queue.length > 0) {
-        processQueue(queue, 0);
+        g_queueIndex = 0; // Reinicia o índice
+        
+        // DISPARO PARALELO: Criamos 3 "vias" de carregamento no PS3
+        // No PC (se quiser) pode aumentar para 6 ou mais.
+        var concurrentLanes = isPS3 ? 3 : 6; 
+        
+        for (var l = 0; l < concurrentLanes; l++) {
+            // Pequeno atraso entre o início de cada via para não dar pico de CPU
+            setTimeout(function() {
+                processQueue(queue);
+            }, l * 50); 
+        }
     }
 }
 
-// Função auxiliar para criar o efeito "escadinha"
-function processQueue(queue, index) {
-    if (index >= queue.length) return;
+function processQueue(queue) {
+    // Pega o próximo item disponível na fila global e incrementa o índice
+    var currentIndex = g_queueIndex;
+    g_queueIndex++;
 
-    var realImg = queue[index];
+    // Se acabou a fila, essa "via" para de trabalhar
+    if (currentIndex >= queue.length) return;
+
+    var realImg = queue[currentIndex];
     var title_id = realImg.getAttribute('data-title_id');
     
-    // Criamos uma imagem na RAM (não está na tela)
+    realImg.setAttribute('data-loading', 'true');
     var ghost = new Image();
     
     var urlJPG = isPS3 ? 
         "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/covers/compressed/" + title_id + ".JPG" :
         "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/covers/uncompressed/" + title_id + ".JPG";
 
-    // SUCESSO: Só aqui a imagem da tela muda
     ghost.onload = function() {
-        realImg.src = this.src; // Troca instantânea, já está no cache da RAM
+        realImg.src = this.src;
         realImg.removeAttribute('data-loading');
         realImg.setAttribute('data-loaded', 'true');
+        // Assim que terminar este, chama o PRÓXIMO da fila global imediatamente
+        processQueue(queue);
     };
 
-    // ERRO: O fantasma lida com o Hash nos bastidores
     ghost.onerror = function() {
-        // Se falhou o JPG, o fantasma tenta o Hash
         if (this.src.indexOf('.JPG') !== -1 && typeof generateSonyHash === 'function') {
             var hash = generateSonyHash(title_id);
-            // O fantasma tenta o link de Hash agora
             this.src = "https://raw.githubusercontent.com/PS3-Pro/Recently-Played-Games/master/np/" + hash + "/ICON0.PNG";
-        } 
-        else {
-            // Se tudo falhou, a imagem real da tela CONTINUA sendo a defaultCover
-            // e apenas marcamos como falha para não tentar de novo.
+        } else {
             realImg.removeAttribute('data-loading');
             realImg.setAttribute('data-failed', 'true');
+            // Mesmo falhando, essa "via" continua para o próximo
+            processQueue(queue);
         }
     };
 
-    // O download começa no "fantasma"
     ghost.src = urlJPG;
-
-    // Próximo da fila
-    // Como o carregamento é em background, podemos diminuir o delay!
-    setTimeout(function() {
-        processQueue(queue, index + 1);
-    }, isPS3 ? 0 : 10); 
 }
 	
 	var g_scrollTimer = null;
