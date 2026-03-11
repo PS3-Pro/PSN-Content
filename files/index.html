@@ -2159,6 +2159,7 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
 	var g_nameCache = {};
 	var g_activeCovers = [];
 	var g_cacheParts = [];
+	var g_activeXHR = null;
 	var g_instantRender = false;
 	var g_lastOfficialCat = "games";
 	var g_lastUnofficialCat = "homebrew_games";
@@ -2763,7 +2764,7 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
 		stopRendering();
 		cancelAllDownloads();
 
-		g_masterQueue = []; 
+		if (g_masterQueue) g_masterQueue.length = 0; 
 		g_isProcessingQueue = false;
 		g_isPreloading = false;
 	
@@ -2791,6 +2792,14 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
 		var s_timer = g_scrollTimer;
 		if (r_timer) clearTimeout(r_timer);
 		if (s_timer) clearTimeout(s_timer);
+
+		if (typeof g_activeXHR !== 'undefined' && g_activeXHR !== null) {
+			try {
+				g_activeXHR.onreadystatechange = null;
+				g_activeXHR.abort(); 
+			} catch(e) {}
+			g_activeXHR = null;
+		}
 	}
 
     // ==============================================================
@@ -3082,7 +3091,7 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
 				if (typeof updateRAMMonitor === 'function') updateRAMMonitor();
 			}
 			
-			setTimeout(function() { processMasterQueue(batchID); }, 10);
+			setTimeout(function() { processMasterQueue(batchID); }, 0);
 			return;
 		}
 
@@ -3428,6 +3437,7 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
 		count_el.innerHTML = 'Searching<span class="anim-dots"><span>.</span><span>.</span><span>.</span></span>';
 
 		var xhr = new XMLHttpRequest();
+		g_activeXHR = xhr;
 		xhr.onreadystatechange = function() {
 			if (thisFetchID !== g_currentFetchID) return;
 
@@ -3437,20 +3447,30 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
 					if (!text_h) return;
 
 					var matches_h = []; 
-					var lines_h = text_h.split("\n");
 					var rx_cons_h = RX_CONSOLE_TAGS;
 					var f_size_h = formatFileSize;
 
-					for (var i = 0, len = lines_h.length; i < len; i++) {
-						var line = lines_h[i];
+					var start = 0;
+					var len = text_h.length;
+
+					while (start < len) {
+						var end = text_h.indexOf('\n', start);
+						if (end === -1) end = len;
+
+						var lineEnd = end;
+						if (lineEnd > start && text_h.charCodeAt(lineEnd - 1) === 13) lineEnd--;
+
+						var line = text_h.slice(start, lineEnd);
+						start = end + 1;
+
 						if (line.indexOf(title_id) === 0) {
 							var parts = line.split("\t");
 
 							var cName = parts[2].replace(rx_cons_h, "");
-							var start = 0, end = cName.length - 1;
-							while(start <= end && cName.charCodeAt(start) <= 32) start++;
-							while(end >= start && cName.charCodeAt(end) <= 32) end--;
-							parts.cleanName = (start > 0 || end < cName.length - 1) ? cName.substring(start, end + 1) : cName;
+							var s = 0, e = cName.length - 1;
+							while(s <= e && cName.charCodeAt(s) <= 32) s++;
+							while(e >= s && cName.charCodeAt(e) <= 32) e--;
+							parts.cleanName = (s > 0 || e < cName.length - 1) ? cName.substring(s, e + 1) : cName;
 
 							var sizeFound = "";
 							for (var j = parts.length - 1; j >= 3; j--) {
@@ -3480,6 +3500,8 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
 					if (activeTab) activeTab.className += " active";
 
 					matches_h.sort(function(a,b){ return a.cleanName < b.cleanName ? -1 : 1; }); 
+
+					if (g_allMatches) g_allMatches.length = 0;
 					g_allMatches = matches_h;
 
 					list_el.innerHTML = '';
@@ -3488,7 +3510,7 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
 
 					count_el.textContent = label + " Found: " + matches_h.length + " | " + title_id;
 
-					text_h = null; lines_h = null; matches_h = null;
+					text_h = null; matches_h = null;
 				}
 			}
 		};
@@ -3887,9 +3909,10 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
 		var chunkArray_h = [];
 		var isUpdateCat_h = (cat_h === 'updates');
 		var endLimit_h = Math.min(chunk_idx_h + chunk_size_h, totalMatches_h, currentLimit_h);
-		var hasUpd_h = typeof g_updateExists !== 'undefined';
-		var hasAva_h = typeof g_avatarExists !== 'undefined';
-		var hasDlc_h = typeof g_dlcExists !== 'undefined';
+		
+		var upd_map_h = typeof g_updateExists !== 'undefined' ? g_updateExists : null;
+		var ava_map_h = typeof g_avatarExists !== 'undefined' ? g_avatarExists : null;
+		var dlc_map_h = typeof g_dlcExists !== 'undefined' ? g_dlcExists : null;
 
 		for (var i = chunk_idx_h; i < endLimit_h; i++) {
 			var row = matches_h[i];
@@ -3912,26 +3935,27 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
 
 			var extraBtns_h = "";
 			if (!is_ps3_h) {
-				if ((cat_h === 'games' || cat_h === 'apps') && hasUpd_h && g_updateExists[tid_h]) extraBtns_h += ' <a href="#" class="upd-btn" onclick="openGameUpdates(\''+tid_h+'\');return false;">UPD</a>';
+				if ((cat_h === 'games' || cat_h === 'apps') && upd_map_h && upd_map_h[tid_h]) extraBtns_h += ' <a href="#" class="upd-btn" onclick="openGameUpdates(\''+tid_h+'\');return false;">UPD</a>';
 				if (cat_h === 'games') {
-					if (hasAva_h && g_avatarExists[tid_h]) extraBtns_h += ' <a href="#" class="avatar-btn" onclick="openGameAvatars(\''+tid_h+'\');return false;">AVT</a>';
-					if (hasDlc_h && g_dlcExists[tid_h]) extraBtns_h += ' <a href="#" class="dlc-btn" onclick="openGameDLCs(\''+tid_h+'\');return false;">DLC</a>';
+					if (ava_map_h && ava_map_h[tid_h]) extraBtns_h += ' <a href="#" class="avatar-btn" onclick="openGameAvatars(\''+tid_h+'\');return false;">AVT</a>';
+					if (dlc_map_h && dlc_map_h[tid_h]) extraBtns_h += ' <a href="#" class="dlc-btn" onclick="openGameDLCs(\''+tid_h+'\');return false;">DLC</a>';
 				}
 			}
+			
 			if (is_grid_h) {
 				var tileIdx_h = i % chunk_size_h;
 				var animClass_h = window.g_animCutoffFound ? ' no-anim' : '';
 				var animStyle_h = window.g_animCutoffFound ? '' : 'style="--tile-idx:' + tileIdx_h + ';"';
 
 				chunkArray_h.push(
-					'<div class="game-tile' + animClass_h + '" ' + animStyle_h + '>',
-						'<div class="tile-content">',
-							'<img id="img_' + tid_h + '_' + i + '" src="' + def_cover_h + '" data-title_id="' + tid_h + '" onclick="showGameDetails(' + i + ')" style="cursor:pointer;">',
-							'<div class="title">' + name_h + '</div>',
-							'<div class="title-id">[' + tid_h + ']</div>',
-							'<div class="size">' + size_h + '</div>',
-							'<div class="links">' + pkgHTML_h + extraBtns_h + makeRap(row) + '</div>',
-						'</div>',
+					'<div class="game-tile' + animClass_h + '" ' + animStyle_h + '>' +
+						'<div class="tile-content">' +
+							'<img id="img_' + tid_h + '_' + i + '" src="' + def_cover_h + '" data-title_id="' + tid_h + '" onclick="showGameDetails(' + i + ')" style="cursor:pointer;">' +
+							'<div class="title">' + name_h + '</div>' +
+							'<div class="title-id">[' + tid_h + ']</div>' +
+							'<div class="size">' + size_h + '</div>' +
+							'<div class="links">' + pkgHTML_h + extraBtns_h + makeRap(row) + '</div>' +
+						'</div>' +
 					'</div>'
 				);
 			} else {
@@ -3942,6 +3966,7 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
 				chunkArray_h.push('<li data-title_id="' + tid_h + '" ' + liStyle_h + '>' + name_h + ' <span class="id-text">[' + tid_h + ']</span>' + verTag_h + ' <span class="size">' + size_h + '</span> ' + pkgHTML_h + extraBtns_h + ' ' + makeRap(row) + '</li>');
 			}
 		}
+		
 		if (chunkArray_h.length > 0) {
 			list_el.insertAdjacentHTML('beforeend', chunkArray_h.join(''));
 		}
@@ -3976,7 +4001,7 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
 
 		g_currentChunkIndex = endLimit_h;
 		if (g_currentChunkIndex < totalMatches_h && g_currentChunkIndex < currentLimit_h) {
-			g_renderTimer = setTimeout(renderChunk, is_ps3_h ? 20 : 0);
+			g_renderTimer = setTimeout(renderChunk, is_ps3_h ? 10 : 0);
 		} else {
 			g_renderTimer = null;
 			g_instantRender = false;
@@ -4216,8 +4241,16 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
 		function processChunk(tsvData) {
 			var start = 0;
 			var len = tsvData.length;
+
 			var is_ps3_h = isPS3;
+
 			var cat_h = currentCategory;
+			var is_games = (cat_h === "games");
+			var is_apps = (cat_h === "apps");
+			var is_demos = (cat_h === "demos");
+			var is_games_or_apps = (is_games || is_apps);
+			var needs_tags = is_games_or_apps;
+			var is_ps3_dlc = (isPS3 && cat_h === "dlcs"); 
 
 			var f_formatSize = formatFileSize;
 			var f_cleanName = cleanGameName;
@@ -4245,49 +4278,58 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
 				if (!title_id || title_id.length !== 9) continue;
 				var url = parts[3];
 				if (!url || url === "MISSING") continue;
-
+	
 				var rawName = parts[2];
 				if (!rawName) continue;
-	
-				var upName = rawName.toUpperCase();
 
-				var isTestVersion = f_demo.test(rawName);
-				if ((cat_h === "games" || cat_h === "apps") && isTestVersion) continue;
-				if (cat_h === "demos" && !isTestVersion) continue;
-
-				var cTag = "ps3"; 
-				if (upName.indexOf("(") !== -1 || upName.indexOf("NEO") !== -1) {
-					if (upName.indexOf("PS2") !== -1) cTag = "ps2";
-					else if (upName.indexOf("PSX") !== -1 || upName.indexOf("PS1") !== -1) cTag = "psx";
-					else if (upName.indexOf("PSP") !== -1) cTag = "psp";
-					else if (title_id.indexOf("NPUX") === 0 || title_id.indexOf("NPUZ") === 0 || upName.indexOf("MINIS") !== -1) cTag = "minis";
-					else if (upName.indexOf("ENGINE") !== -1 || upName.indexOf("TURBO") !== -1) cTag = "pce";
-					else if (upName.indexOf("NEO") !== -1) cTag = "neogeo";
+				if (is_games_or_apps || is_demos) {
+					var isTestVersion = f_demo.test(rawName);
+					if (is_games_or_apps && isTestVersion) continue;
+					if (is_demos && !isTestVersion) continue;
 				}
-				parts.cTag = cTag;
-
+	
+				var cTag = "ps3"; 
 				var aTag = "media";
-				if (upName.indexOf("FIRSTPLAY") !== -1) aTag = "firstplay";
-				else if (upName.indexOf("QORE") !== -1) aTag = "qore";
+	
+				if (needs_tags) {
+					var upName = rawName.toUpperCase();
+					
+					if (is_games) {
+						if (upName.indexOf("(") !== -1 || upName.indexOf("NEO") !== -1) {
+							if (upName.indexOf("PS2") !== -1) cTag = "ps2";
+							else if (upName.indexOf("PSX") !== -1 || upName.indexOf("PS1") !== -1) cTag = "psx";
+							else if (upName.indexOf("PSP") !== -1) cTag = "psp";
+							else if (title_id.indexOf("NPUX") === 0 || title_id.indexOf("NPUZ") === 0 || upName.indexOf("MINIS") !== -1) cTag = "minis";
+							else if (upName.indexOf("ENGINE") !== -1 || upName.indexOf("TURBO") !== -1) cTag = "pce";
+							else if (upName.indexOf("NEO") !== -1) cTag = "neogeo";
+						}
+					}
+
+					if (is_apps) {
+						if (upName.indexOf("FIRSTPLAY") !== -1) aTag = "firstplay";
+						else if (upName.indexOf("QORE") !== -1) aTag = "qore";
+					}
+
+					var isAppItem = (dict_apps[title_id] === 1) || (aTag !== "media");
+					if (is_games && isAppItem) continue;
+					if (is_apps && !isAppItem) continue;
+				}
+				
+				parts.cTag = cTag;
 				parts.aTag = aTag;
 
-				if (cat_h === "games" || cat_h === "apps") {
-					var isAppItem = (dict_apps[title_id] === 1) || (aTag !== "media");
-					if (cat_h === "games" && isAppItem) continue;
-					if (cat_h === "apps" && !isAppItem) continue;
-				}
-
-				if (is_ps3_h && cat_h === "dlcs") {
-					parts.cleanName = rawName.replace(/^\s+|\s+$/g, '');
-				} else {
-					var cached = name_cache_h[rawName];
-					if (cached) {
-						parts.cleanName = cached;
-					} else {
-						parts.cleanName = f_cleanName(rawName, cat_h);
-						name_cache_h[rawName] = parts.cleanName;
+				if (isUnofficialMode || (is_ps3_h && (cat_h === 'dlcs' /* || g_safeMode */))) {
+						parts.cleanName = rawName;
+					} 
+					else {
+						var cached = name_cache_h[rawName];
+						if (cached) {
+							parts.cleanName = cached;
+						} else {
+							parts.cleanName = f_cleanName(rawName, cat_h);
+							name_cache_h[rawName] = parts.cleanName;
+						}
 					}
-				}
 
 				parts.sortName = (parts.cleanName || rawName).toLowerCase();
 				parts.searchName = parts.sortName.replace(/[\s\-:]/g, ''); 
@@ -4317,25 +4359,16 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
 		function finalizeDB() {
 			var db_local = [];
 			var temp_map = g_tempMap;
-			var keys = [];
 			var has_prop = Object.prototype.hasOwnProperty;
-
+	
 			for (var k in temp_map) {
 				if (has_prop.call(temp_map, k)) {
-					keys.push(k);
+					db_local.push(temp_map[k]);
 				}
 			}
-
-			var total = keys.length;
-			for (var i = 0; i < total; i++) {
-				var key = keys[i];
-				db_local.push(temp_map[key]);
-				temp_map[key] = null;
-			}
-
+	
 			DB = db_local;
 			g_tempMap = {}; 
-			keys = null;
 			g_isFetching = false;
 		}
 
@@ -4348,16 +4381,19 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
 			var f_obj_h = f;
 
 			stopRendering();
-			DB = []; 
+
+			if (DB) DB.length = 0;
+			if (g_allMatches) g_allMatches.length = 0;
+			if (g_cacheParts) g_cacheParts.length = 0;
 			g_tempMap = {};
-			g_cacheParts = [];
 
 			var list_el = doc_h.getElementById('list');
 			var count_el = doc_h.getElementById('count');
 			var btnMore_el = doc_h.getElementById('btn-load-more');
 
 			if (list_el) {
-				if (list_el.innerHTML.indexOf('Reloading') === -1) {
+				var currentText = list_el.textContent || "";
+				if (currentText.indexOf('Reloading') === -1) {
 					list_el.innerHTML = '<li class="no-results-msg">Downloading database<span class="anim-dots"><span>.</span><span>.</span><span>.</span></span></li>';
 				}
 			}
@@ -4374,7 +4410,7 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
 			var cachedData = (!is_ps3_h && storage_h) ? loadFromCache(cat_h) : null;
 			if (cachedData) {
 				if (list_el) list_el.innerHTML = '<li class="no-results-msg">Loading from cache<span class="anim-dots"><span>.</span><span>.</span><span>.</span></span></li>';
-				
+
 				setTimeout(function(){ 
 					if (thisFetchID !== g_currentFetchID) return;
 					processChunk(cachedData); 
@@ -4411,10 +4447,17 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
 				if (storage_h) { urlToLoad += "?t=" + new Date().getTime(); }
 
 				var xhr = new XMLHttpRequest();
+				g_activeXHR = xhr;
 				xhr.onreadystatechange = function() {
 					var xhr_state = xhr.readyState;
 					if (xhr_state == 4) {
-						if (thisFetchID !== g_currentFetchID) return;
+
+						xhr.onreadystatechange = null;
+
+						if (thisFetchID !== g_currentFetchID) {
+							xhr = null;
+							return;
+						}
 
 						var status_h = xhr.status;
 						if (status_h == 200 || status_h == 0) {
@@ -4428,12 +4471,16 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
 							if (count_el) {
 								count_el.textContent = "Processing part " + currentIndex + "/" + paths_h.length + "...";
 							}
+
 							content_h = null;
+							xhr = null;
+
 							setTimeout(loadNextFile, is_ps3_h ? 15 : 0); 
 						} else {
 							alert("Error loading part " + (currentIndex + 1));
 							if (storage_h && f_obj_h) f_obj_h.fetch.disabled = false;
 							g_isFetching = false;
+							xhr = null;
 						}
 					}
 				};
@@ -4724,13 +4771,23 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
 			g_lastOfficialCat = cat;
 		}
 
-		DB = [];
-		g_allMatches = [];
+		stopRendering();
+		cancelAllDownloads();
 		clearListMemory();
 
-		if (cat === 'games') g_gamesLoadCount++;
+		if (DB) DB.length = 0; 
+		if (g_allMatches) g_allMatches.length = 0;
+		if (g_masterQueue) g_masterQueue.length = 0;
+		if (g_cacheParts) g_cacheParts.length = 0;
 
-		g_safeMode = (is_ps3_h && g_gamesLoadCount > 1);
+		g_nameCache = {}; 
+		g_sonyHashCache = {};
+
+		if (cat === 'dlcs' || isUnofficialMode) {
+			g_gamesLoadCount++;
+		}
+
+		g_safeMode = (is_ps3_h && (g_gamesLoadCount > 1 || is_unoff_h || cat === 'dlcs'));
 
 		currentCategory = cat;
 		g_navHistory = null;
@@ -4789,7 +4846,10 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
 
 		if (cat === 'games' || cat === 'apps') {
 			setTimeout(function() {
-				if (!is_ps3_h && !g_updateIndexLoaded) loadUpdateIndexBackground();
+				if (!g_updateIndexLoaded) {
+					loadUpdateIndexBackground();
+				}
+		
 				if (cat === 'games') {
 					if (!g_dlcIndexLoaded) loadDLCIndexBackground();
 					if (!g_avatarIndexLoaded) loadAvatarIndexBackground();
@@ -5443,18 +5503,18 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
 
 		stopRendering();
 		cancelAllDownloads();
+		clearListMemory();
+
+		g_nameCache = {}; 
+		g_sonyHashCache = {};
+		g_allMatches = [];
+		DB = [];
+		g_tempMap = {};
 
 		isUnofficialMode = !isUnofficialMode;
 		var is_unoff_h = isUnofficialMode;
 
 		var list_el = doc.getElementById('list');
-		if (list_el) list_el.innerHTML = "";
-
-		DB = [];
-		g_allMatches = [];
-		g_tempMap = {};
-		g_sonyHashCache = {};
-
 		var body_el = doc.body;
 		var logo_el = doc.getElementById('main-logo');
 		var header_el = doc.getElementById('header-text');
@@ -5470,9 +5530,10 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
 
 			if (mode_el) mode_el.innerHTML = "&#8646; Switch to PSN&trade; Mode";
 			defaultCover = defaultCoverUnofficial;
+			
+			if(is_ps3_h) g_safeMode = true;
 
 			selectCategory(g_lastUnofficialCat); 
-
 		} else {
 			body_el.className = body_el.className.replace(/\s?unofficial-mode/g, "");
 
@@ -5533,24 +5594,38 @@ To bypass this restriction, right-click the PKG button, choose 'Save link as', a
 	}
 	</script>
 	<script>
-	// ==============================================================
-	// EMERGENCY RAM CLEAR FOR PS3 ON BROWSER CLOSE
-	// ==============================================================
 	window.addEventListener("unload", function() {
-		var is_ps3_h = isPS3;
-		if (is_ps3_h) {
-			if (typeof cancelAllDownloads === 'function') cancelAllDownloads();
-			if (typeof stopRendering === 'function') stopRendering();
+    if (isPS3) {
+        if (typeof stopRendering === 'function') stopRendering();
+        if (typeof cancelAllDownloads === 'function') cancelAllDownloads();
+        
+        if (g_masterQueue) g_masterQueue.length = 0;
+        if (g_activeCovers) g_activeCovers.length = 0;
+        
+        var list_el = document.getElementById('list');
+        if (list_el) {
+            while (list_el.firstChild) {
+                list_el.removeChild(list_el.firstChild);
+            }
+        }
 
-			var list_el = document.getElementById('list');
-			if (list_el) list_el.innerHTML = '';
+        g_nameCache = null;
+        g_sonyHashCache = null;
+        g_domCache = null;
 
-			DB = null;
-			g_allMatches = null;
-			g_sonyHashCache = null;
-			g_tempMap = null;
-		}
-	});
+        if (DB) {
+            DB.length = 0; 
+            DB = null;
+        }
+
+        g_allMatches = null;
+        g_tempMap = null;
+        g_cacheParts = null;
+
+        var _gc = new Array(1000);
+        _gc = null;
+    }
+});
 	</script>
 	</body>
 </html>
