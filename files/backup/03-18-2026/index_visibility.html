@@ -2247,9 +2247,7 @@
 	var g_defaultRenderLimit = 500;
 	var g_pcRenderLimit = g_defaultRenderLimit;
 	var g_pcPageSize = 500;
-	var g_ps3RenderLimit = 200;
-    var g_ps3PageSize = 200;
-	
+
 	var f = document.forms.engine;
 	var PROXY_URL = "https://proxy.ps3-pro.workers.dev/";
 	var URL_DB_DLC = "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/database/official/dlcs.tsv";
@@ -2876,14 +2874,18 @@
 
 	var g_domCache = { contentDiv: null, listEl: null, imgs: null };
 	var G_EMPTY_GIF = "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7";
-	
+
 	var g_checkTimeout = null;
 	var g_scrollStopTimer = null;
-
+	
 	function checkVisibility(f) {
-		var is_ps3_h = isPS3;
+		var is_ps3_h = isPS3; 
+
 		if (!f && g_checkTimeout) return;
-		if (f && g_checkTimeout) { clearTimeout(g_checkTimeout); g_checkTimeout = null; }
+		if (f && g_checkTimeout) { 
+			clearTimeout(g_checkTimeout); 
+			g_checkTimeout = null; 
+		}
 	
 		g_checkTimeout = setTimeout(function() {
 			var cache = g_domCache;
@@ -2904,10 +2906,10 @@
 			var cR = cnt.getBoundingClientRect();
 			var cT = cR.top, cB = cR.bottom;
 			var def = defaultCover;
-			
+
 			var qF = [], qP = [];
 			g_masterQueue = []; 
-	
+
 			for (var i = 0; i < len; i++) {
 				var img = imgs[i], r = img.getBoundingClientRect();
 				var rT = r.top, rB = r.bottom;
@@ -2926,31 +2928,39 @@
 					}
 					continue;
 				}
-
+	
 				var s = img.getAttribute('data-loaded') || img.getAttribute('data-loading') || img.getAttribute('data-failed');
 				if (s === 'true') continue;
 	
 				if (!is_ps3_h) {
 					loadPCImage(img);
 				} else {
-					if (rT >= cT - 20 && rB <= cB + 20) {
+					if (rT >= cT - 5 && rB <= cB + 5) {
 						qF.push(img);
 					} else {
 						qP.push(img);
 					}
 				}
 			}
-
+	
 			if (is_ps3_h) {
 				g_masterQueue = qF.concat(qP);
 				if (g_masterQueue.length > 0 && !g_isProcessingQueue) {
 					startQueueWorkers();
 				}
 			}
-
+			
 			if (g_debugMode) updateRAMMonitor();
 			g_checkTimeout = null;
 		}, f ? 0 : (is_ps3_h ? 25 : 0));
+	}
+
+	function handleScroll() {
+		checkVisibility(false);
+		if (g_scrollStopTimer) clearTimeout(g_scrollStopTimer);
+		g_scrollStopTimer = setTimeout(function() {
+			checkVisibility(true);
+		}, isPS3 ? 120 : 50);
 	}
 
 	var g_gcTimer = null;
@@ -3074,26 +3084,21 @@
 
 	function startQueueWorkers() {
 		var is_ps3_h = isPS3;
-		if (g_isProcessingQueue || !is_ps3_h) return; 
-	
+		var is_proc_q = g_isProcessingQueue;
+		if (is_proc_q || !is_ps3_h) return; 
+
 		g_isProcessingQueue = true;
-		var numWorkers = is_ps3_h ? 3 : 8;
-		var rid = g_renderID;
-	
-		for (var i = 0; i < numWorkers; i++) {
-			(function(idx) {
-				setTimeout(function() {
-					processMasterQueue(rid);
-				}, idx * 40);
-			})(i);
-		}
+
+		processMasterQueue(g_renderID);
+		setTimeout(function() { processMasterQueue(g_renderID); }, 40);
+		setTimeout(function() { processMasterQueue(g_renderID); }, 80);
+		setTimeout(function() { processMasterQueue(g_renderID); }, 120);
 	}
 
 	function processMasterQueue(batchID) {
-		var rid = g_renderID;
+		var render_id = g_renderID;
 		var q = g_masterQueue;
-
-		if (batchID !== rid || q.length === 0) {
+		if (batchID !== render_id || q.length === 0) {
 			g_isProcessingQueue = false;
 			return;
 		}
@@ -3103,77 +3108,83 @@
 			return;
 		}
 
-		var img = q.shift(); 
-		if (!img) {
+		var realImg = q.shift(); 
+		if (!realImg) {
 			processMasterQueue(batchID);
 			return;
 		}
 
-		var d_loading = img.getAttribute('data-loading');
-		var d_loaded = img.getAttribute('data-loaded');
-		if (d_loading === 'true' || d_loaded === 'true') {
+		if (realImg.getAttribute('data-loading') === 'true' || realImg.getAttribute('data-loaded') === 'true') {
 			processMasterQueue(batchID);
 			return;
 		}
 
-		var tid = img.getAttribute('data-title_id');
-		var def = defaultCover;
-		var is_ps3 = isPS3;
+		var title_id = realImg.getAttribute('data-title_id');
+		var def_cover = defaultCover;
+		var is_ps3_h = isPS3;
 
-		img.setAttribute('data-loading', 'true');
-		
-		if (img.src.indexOf('data:image') !== -1) img.src = def;
-		
-		if (g_noCoverIndexLoaded && g_noCoverMap[tid]) {
-			img.src = def;
-			img.setAttribute('data-loaded', 'true');
-			img.removeAttribute('data-loading');
-			if (typeof g_activeCovers !== 'undefined') g_activeCovers.push(img);
+		realImg.setAttribute('data-loading', 'true');
 
+		if (realImg.src.indexOf('data:image') !== -1) realImg.src = def_cover;
+
+		if (g_noCoverIndexLoaded && g_noCoverMap[title_id]) {
+			if (batchID === render_id) {
+				realImg.src = def_cover;
+				realImg.setAttribute('data-loaded', 'true');
+				realImg.removeAttribute('data-loading');
+	
+				if (typeof g_activeCovers !== 'undefined') g_activeCovers.push(realImg);
+				if (typeof updateRAMMonitor === 'function') updateRAMMonitor();
+			}
+			
 			setTimeout(function() { processMasterQueue(batchID); }, 0);
 			return;
 		}
 
-		var hash = generateSonyHash(tid) || "MISSING";
-		var urlJPG = "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/covers/" + (is_ps3 ? "compressed/" : "uncompressed/") + tid + ".JPG";
-		var urlPNG = "https://raw.githubusercontent.com/PS3-Pro/Recently-Played-Games/master/np/" + hash + "/ICON0.PNG";
-	
-		var targetUrl = urlJPG;
-		var isHashMode = false;
+		var hash_val = generateSonyHash(title_id) || "MISSING";
+		var primaryUrl = "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/covers/" + (is_ps3_h ? "compressed/" : "uncompressed/") + title_id + ".JPG";
+		var hashUrl = "https://raw.githubusercontent.com/PS3-Pro/Recently-Played-Games/master/np/" + hash_val + "/ICON0.PNG";
 
-		if (g_coverIndexLoaded && !g_coverMap[tid]) {
-			targetUrl = urlPNG;
-			isHashMode = true;
+		var targetUrl = primaryUrl;
+		var knownHash = false;
+
+		if (g_coverIndexLoaded && !g_coverMap[title_id]) {
+			targetUrl = hashUrl;
+			knownHash = true;
 		}
-	
-		img.onload = function() {
-			this.onload = this.onerror = null;
-			this.setAttribute('data-loaded', 'true');
-			this.removeAttribute('data-loading');
-	
-			if (typeof g_activeCovers !== 'undefined') g_activeCovers.push(this);
+
+		if (batchID === render_id) {
+			
+			realImg.onerror = function() {
+				this.onerror = null;
+				if (!knownHash && this.src.indexOf('.JPG') !== -1) {
+					this.onerror = function() {
+						this.onerror = null;
+						this.src = def_cover;
+					};
+					this.src = hashUrl;
+				} else {
+					this.src = def_cover;
+				}
+			};
+
+			realImg.onload = function() {
+				this.onload = null;
+				this.onerror = null;
+			};
+
+			realImg.src = targetUrl;
+			realImg.setAttribute('data-loaded', 'true');
+			realImg.removeAttribute('data-loading');
+
+			if (typeof g_activeCovers !== 'undefined') g_activeCovers.push(realImg);
 			if (typeof updateRAMMonitor === 'function') updateRAMMonitor();
 			
-			processMasterQueue(batchID);
-		};
-	
-		img.onerror = function() {
-			this.onload = this.onerror = null;
+			setTimeout(function() { processMasterQueue(batchID); }, 0);
 			
-			if (!isHashMode && this.src.indexOf('.JPG') !== -1) {
-				isHashMode = true;
-				this.src = urlPNG;
-				this.onload = img.onload;
-				this.onerror = img.onerror;
-			} else {
-				this.src = def;
-				this.setAttribute('data-failed', 'true');
-				this.removeAttribute('data-loading');
-				processMasterQueue(batchID);
-			}
-		};
-
-		img.src = targetUrl;
+		} else {
+			processMasterQueue(batchID);
+		}
 	}
 
 	function startSilentPreloader() {
@@ -3856,7 +3867,7 @@
 			if (warnHTML_h !== "") list_el.innerHTML = warnHTML_h;
 		}
 
-		var currentLimit_h = is_ps3_h ? g_ps3RenderLimit : g_pcRenderLimit;
+		var currentLimit_h = is_ps3_h ? totalMatches_h : g_pcRenderLimit;
 
 		if (chunk_idx_h >= totalMatches_h || chunk_idx_h >= currentLimit_h) {
 			var btn_el = doc_h.getElementById('btn-load-more');
@@ -4064,16 +4075,14 @@
 					btnF.style.display = 'block';
 					btnF.onclick = function() { f_obj_h.query.value = ""; onSearchInput(f_obj_h.query); return false; };
 				}
-			} else if (totalMatches_h > currentLimit_h) {
-                var pageSize_h = is_ps3_h ? g_ps3PageSize : g_pcPageSize;
-                var rem = totalMatches_h - currentLimit_h;
-                
-                if (btnF) {
-                    btnF.innerHTML = "&#8595; Load more " + (rem > pageSize_h ? pageSize_h : rem) + " items";
-                    btnF.style.display = 'block'; 
-                    btnF.onclick = loadMoreItems;
-                }
-            } else if (btnF) {
+			} else if (!is_ps3_h && totalMatches_h > currentLimit_h) {
+				var rem = totalMatches_h - currentLimit_h;
+				if (btnF) {
+					btnF.innerHTML = "&#8595; Load more " + (rem > g_pcPageSize ? g_pcPageSize : rem) + " items";
+					btnF.style.display = 'block'; 
+					btnF.onclick = loadMoreItems;
+				}
+			} else if (btnF) {
 				btnF.style.display = 'none'; 
 			}
 		}
@@ -4133,17 +4142,14 @@
 
 	function loadMoreItems() {
 		var is_ps3_h = isPS3;
+		if (is_ps3_h) return;
+
 		var doc = document;
 		var matches = g_allMatches;
 		var reg_f = g_regionFilter;
+		var pc_page_size = g_pcPageSize;
 
-		var pageSize = is_ps3_h ? g_ps3PageSize : g_pcPageSize;
-	
-		if (is_ps3_h) {
-			g_ps3RenderLimit += pageSize;
-		} else {
-			g_pcRenderLimit += pageSize;
-		}
+		g_pcRenderLimit += pc_page_size;
 
 		var btn = doc.getElementById('btn-load-more');
 		if (btn) btn.style.display = 'none';
@@ -4151,11 +4157,11 @@
 		renderChunk();
 
 		var totalMatches = matches.length;
-		var currentLimit = is_ps3_h ? g_ps3RenderLimit : g_pcRenderLimit;
-		var newDisplayCount = Math.min(totalMatches, currentLimit); 
+		var limit = g_pcRenderLimit;
+		var newDisplayCount = Math.min(totalMatches, limit); 
 		var regionText = (reg_f == "ALL") ? "All Regions" : reg_f;
-
 		var countMsg = "Displaying " + newDisplayCount;
+
 		if (totalMatches > newDisplayCount) {
 			countMsg += " of " + totalMatches;
 		}
@@ -4192,7 +4198,6 @@
 			var app_f_h = g_appFilter;
 			var local_db_h = DB;
 			var pc_limit_h = g_pcRenderLimit;
-			var ps3_limit_h = g_ps3RenderLimit;
 			var use_grid_h = useCoverGUI;
 
 			var categoryNames = {
@@ -4290,14 +4295,9 @@
 			}
 
 			if (count_el) {
-				var totalMatches = matches_h.length;
-				var currentLimit = is_ps3_h ? ps3_limit_h : pc_limit_h;
-				var displayCount = Math.min(totalMatches, currentLimit);
-
+				var displayCount = is_ps3_h ? matches_h.length : Math.min(matches_h.length, pc_limit_h);
 				var countMsg = "Displaying " + displayCount;
-				if (totalMatches > displayCount) {
-					countMsg += " of " + totalMatches;
-				}
+				if (matches_h.length > displayCount) countMsg += " of " + matches_h.length;
 				count_el.textContent = countMsg + " items | " + (reg_f_h == "ALL" ? "All Regions" : reg_f_h);
 			}
 		}, renderDelay);
