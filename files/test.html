@@ -636,10 +636,6 @@
 					</p>
 				</div>
 </div>
-		
-	
-				
-				
 
 			<div id="view-settings" class="view-section" style="display: none; padding: 40px;">
 				<h2 style="font-size: 28px; font-weight: 300; margin-top: 0; margin-bottom: 30px; border-bottom: 1px solid rgba(255,255,255,0.1); padding-bottom: 15px;">Settings</h2>
@@ -904,12 +900,12 @@
         }
 
         window.downloadAllParts = function(urls, safeName, version) {
-			window.addToDownloadManager(displayName);
             const parts = urls.split('|');
             const cleanVer = (version && version !== "N/A") ? version.replace(/v/gi, '').replace(/\s/g, '') : "";
             const isUpdateCat = document.getElementById('cat-select').value === 'updates';
             const versionSuffix = (isUpdateCat && cleanVer) ? "_-_Update_v" + cleanVer : "";
             const displayName = safeName.replace(/_/g, ' ');
+			window.addToDownloadManager(displayName);
 
             const confirmMsg = "Found " + parts.length + " package parts for: " + displayName + ".\n\n" +
                                "Do you want to start the download queue now?\n\n" +
@@ -1620,6 +1616,49 @@ if (game.url.includes('|')) {
                 document.getElementById('trailer-iframe').src = "";
             }
         }
+
+/* =========================================
+		STATE MANAGEMENT & SETTINGS LOGIC
+		========================================= */
+		const STORAGE_KEY_AUDIO = "psn_audio_state";
+		
+		function setCookie(name, value, days) {
+			let expires = "";
+			if (days) {
+				let date = new Date();
+				date.setTime(date.getTime() + (days * 24 * 60 * 60 * 1000));
+				expires = "; expires=" + date.toUTCString();
+			}
+			// IMPORTANTE: encodeURIComponent para não quebrar o cookie com o JSON
+			document.cookie = name + "=" + encodeURIComponent(value || "") + expires + "; path=/";
+		}
+		
+		function getCookie(name) {
+			let nameEQ = name + "=";
+			let ca = document.cookie.split(';');
+			for(let i = 0; i < ca.length; i++) {
+				let c = ca[i];
+				while (c.charAt(0) == ' ') c = c.substring(1, c.length);
+				if (c.indexOf(nameEQ) == 0) {
+					// IMPORTANTE: decodeURIComponent para ler o JSON de volta
+					return decodeURIComponent(c.substring(nameEQ.length, c.length));
+				}
+			}
+			return null;
+		}
+		
+		function saveState(key, value) {
+			try { window.localStorage.setItem(key, value); } 
+			catch (e) { setCookie(key, value, 365); }
+		}
+		
+		function loadState(key) {
+			try {
+				let lsValue = window.localStorage.getItem(key);
+				if (lsValue !== null) return lsValue;
+			} catch (e) {}
+			return getCookie(key);
+		}
 		
 		
 /* =========================================
@@ -1627,12 +1666,18 @@ if (game.url.includes('|')) {
    ========================================= */
 const COOKIE_NAME_HISTORY = "psn_dl_history";
 
-// Carrega o histórico do cookie ao iniciar
+// Carrega o histórico do cookie ao iniciar (com decode para não dar erro no JSON)
 let downloadHistory = [];
 try {
     let saved = getCookie(COOKIE_NAME_HISTORY);
-    if (saved) downloadHistory = JSON.parse(saved);
-} catch (e) { downloadHistory = []; }
+    if (saved) {
+        // Usamos o decodeURIComponent que está dentro do getCookie atualizado
+        downloadHistory = JSON.parse(saved);
+    }
+} catch (e) { 
+    console.error("Erro ao carregar histórico:", e);
+    downloadHistory = []; 
+}
 
 window.addToDownloadManager = function(fileName, sizeBytes) {
     const now = new Date();
@@ -1650,18 +1695,17 @@ window.addToDownloadManager = function(fileName, sizeBytes) {
 
     downloadHistory.unshift(entry);
     
-    // Cookies têm limite de tamanho (aprox 4KB). 
-    // Vamos limitar aos últimos 20 itens para não estourar o limite do navegador.
+    // Limite de 20 para caber nos 4KB do cookie
     if (downloadHistory.length > 20) downloadHistory.pop();
 
-    // Salva no Cookie (expira em 365 dias)
+    // Salva no Cookie convertido em string JSON
     setCookie(COOKIE_NAME_HISTORY, JSON.stringify(downloadHistory), 365);
     
     updateDownloadUI();
 };
 
 window.clearDownloadHistory = function() {
-    if (confirm("Reset download history and stats?")) {
+    if (confirm("Deseja limpar todo o histórico e estatísticas?")) {
         downloadHistory = [];
         setCookie(COOKIE_NAME_HISTORY, "", -1); // Deleta o cookie
         updateDownloadUI();
@@ -1677,14 +1721,15 @@ function updateDownloadUI() {
     if (!listContainer) return;
 
     if (downloadHistory.length === 0) {
-        listContainer.innerHTML = '<p style="color: var(--text-muted); text-align: center; margin-top: 50px;">History is empty.</p>';
+        listContainer.innerHTML = '<p style="color: var(--text-muted); text-align: center; margin-top: 50px;">Nenhum download registrado.</p>';
         if(statCount) statCount.innerText = "0";
         if(statSize) statSize.innerText = "0 KB";
         if(globalCount) globalCount.innerText = "(0 items)";
         return;
     }
 
-    const totalBytes = downloadHistory.reduce((acc, item) => acc + item.sizeBytes, 0);
+    // Soma o total acumulado em bytes
+    const totalBytes = downloadHistory.reduce((acc, item) => acc + (item.sizeBytes || 0), 0);
     
     if(statCount) statCount.innerText = downloadHistory.length;
     if(statSize) statSize.innerText = formatSizeFromBytes(totalBytes);
@@ -1703,44 +1748,6 @@ function updateDownloadUI() {
     `).join('');
 }
 		
-		/* =========================================
-		STATE MANAGEMENT & SETTINGS LOGIC
-		========================================= */
-		const STORAGE_KEY_AUDIO = "psn_audio_state";
-		
-		function setCookie(name, value, days) {
-			let expires = "";
-			if (days) {
-				let date = new Date();
-				date.setTime(date.getTime() + (days * 24 * 60 * 60 * 1000));
-				expires = "; expires=" + date.toUTCString();
-			}
-			document.cookie = name + "=" + (value || "") + expires + "; path=/";
-		}
-		
-		function getCookie(name) {
-			let nameEQ = name + "=";
-			let ca = document.cookie.split(';');
-			for(let i = 0; i < ca.length; i++) {
-				let c = ca[i];
-				while (c.charAt(0) == ' ') c = c.substring(1, c.length);
-				if (c.indexOf(nameEQ) == 0) return c.substring(nameEQ.length, c.length);
-			}
-			return null;
-		}
-		
-		function saveState(key, value) {
-			try { window.localStorage.setItem(key, value); } 
-			catch (e) { setCookie(key, value, 365); }
-		}
-		
-		function loadState(key) {
-			try {
-				let lsValue = window.localStorage.getItem(key);
-				if (lsValue !== null) return lsValue;
-			} catch (e) {}
-			return getCookie(key);
-		}
 		
 		window.switchView = function(viewId) {
 			document.getElementById('view-browse').style.display = 'none';
@@ -1843,6 +1850,7 @@ function updateDownloadUI() {
             loadBackgroundIndexes();
             renderLetterFilter();
 			initAudioSettings();
+			updateDownloadUI();
             fetchDatabase();
         });
 
