@@ -1292,6 +1292,7 @@
         const PROXY_URL = "https://proxy.ps3-pro.workers.dev/";
         const BASE_OFFICIAL = "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/database/official";
         const BASE_UNOFFICIAL = "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/database/unofficial";
+		const BASE_LATEST = "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/database/latest";
         const FALLBACK_IMG = "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/covers/uncompressed/NOCOVER00.JPG";
 
         const DB_PATHS = {
@@ -1352,104 +1353,106 @@
             });
         }
         
-       async function fetchLatestForExplore(cat, containerId) {
-		const container = document.getElementById(containerId);
-		if(!container) return;
-		
-		container.innerHTML = '<div style="color: var(--text-muted); padding: 10px;"><i class="fas fa-spinner fa-spin"></i> Loading latest...</div>';
-		
-		const paths = DB_PATHS[cat];
-		let allValidLines = [];
-		
-		try {
-			const responses = await Promise.all(paths.map(url => fetch(url).then(res => res.ok ? res.text() : "")));
-			for (const text of responses) {
-				if (!text) continue;
-				const lines = text.split('\n');
-				for (const line of lines) {
-					if (line.trim().length > 15 && !line.startsWith("Title ID")) {
-						allValidLines.push(line);
+		async function fetchLatestForExplore(cat, containerId) {
+			const container = document.getElementById(containerId);
+			if(!container) return;
+			
+			container.innerHTML = '<div style="color: var(--text-muted); padding: 10px;"><i class="fas fa-spinner fa-spin"></i> Loading latest...</div>';
+			
+			const url = `${BASE_LATEST}/latest_${cat}.tsv`;
+			let allValidLines = [];
+			
+			try {
+				const res = await fetch(url);
+				if (!res.ok) throw new Error("Latest file not found");
+				const text = await res.text();
+				
+				if (text) {
+					const lines = text.split('\n');
+					for (const line of lines) {
+						if (line.trim().length > 15 && !line.startsWith("Title ID")) {
+							allValidLines.push(line);
+						}
 					}
 				}
-			}
-			
-			const latestLines = allValidLines.slice(-200).reverse(); 
-			
-			let tempGroupMap = {};
-			for(const line of latestLines) {
-				const parts = line.split('\t');
-				const id = parts[0] ? parts[0].trim() : "";
-				const region = parts[1] ? parts[1].trim() : "";
-				let rawName = parts[2] ? parts[2].trim() : "";
-				const pkgUrl = parts[3] ? parts[3].trim() : "";
-				const addedDate = parts[11] ? parts[11].trim() : ""; 
 				
-				if (!id || id.length !== 9 || !pkgUrl || pkgUrl === "MISSING") continue;
+				const latestLines = allValidLines.reverse(); 
 				
-				if (cat === "games" && rawName.includes("Nostalgia Vault")) {
-					rawName = rawName.replace(/\s*\(Nostalgia Vault\)/gi, "").trim();
+				let tempGroupMap = {};
+				for(const line of latestLines) {
+					const parts = line.split('\t');
+					const id = parts[0] ? parts[0].trim() : "";
+					const region = parts[1] ? parts[1].trim() : "";
+					let rawName = parts[2] ? parts[2].trim() : "";
+					const pkgUrl = parts[3] ? parts[3].trim() : "";
+					const addedDate = parts[11] ? parts[11].trim() : ""; 
+					
+					if (!id || id.length !== 9 || !pkgUrl || pkgUrl === "MISSING") continue;
+					
+					if (cat === "games" && rawName.includes("Nostalgia Vault")) {
+						rawName = rawName.replace(/\s*\(Nostalgia Vault\)/gi, "").trim();
+					}
+		
+					const RX_DEMO_CHK = /\b(demo|trial|beta|bèta)\b|体験版/i;
+					const isTestVersion = RX_DEMO_CHK.test(rawName);
+		
+					if ((cat === "games" || cat === "apps") && isTestVersion) continue;
+					if (cat === "demos" && !isTestVersion) continue;
+		
+					const { cleanName, cTag, aTag } = processGameInfo(rawName, cat);
+					const isAppItem = (DICT_APPS_FILTER[id] === 1) || (aTag !== "media");
+		
+					if (cat === "games" && isAppItem) continue;
+					if (cat === "apps" && !isAppItem) continue;
+					
+					if (!tempGroupMap[id]) {
+						tempGroupMap[id] = { id, region, cleanName, cTag, url: pkgUrl, date: addedDate };
+					}
 				}
-	
-				const RX_DEMO_CHK = /\b(demo|trial|beta|bèta)\b|体験版/i;
-				const isTestVersion = RX_DEMO_CHK.test(rawName);
-	
-				if ((cat === "games" || cat === "apps") && isTestVersion) continue;
-				if (cat === "demos" && !isTestVersion) continue;
-	
-				const { cleanName, cTag, aTag } = processGameInfo(rawName, cat);
-				const isAppItem = (DICT_APPS_FILTER[id] === 1) || (aTag !== "media");
-	
-				if (cat === "games" && isAppItem) continue;
-				if (cat === "apps" && !isAppItem) continue;
 				
-				if (!tempGroupMap[id]) {
-					tempGroupMap[id] = { id, region, cleanName, cTag, url: pkgUrl, date: addedDate };
+				const latestItems = Object.values(tempGroupMap).slice(0, 15); 
+				
+				if(latestItems.length === 0) {
+					container.innerHTML = '<div style="color: var(--text-muted); padding: 10px;">No recent items found.</div>';
+					return;
 				}
-			}
-			
-			const latestItems = Object.values(tempGroupMap).slice(0, 15); 
-			
-			if(latestItems.length === 0) {
-				container.innerHTML = '<div style="color: var(--text-muted); padding: 10px;">No recent items found.</div>';
-				return;
-			}
-			
-			let html = '';
-			latestItems.forEach((game, idx) => {
-				const imgUrl = getOptimizedCover(game.id);
-				const consoleClasses = ['ps3', 'ps2', 'psx', 'psp', 'minis', 'pce', 'neogeo'];
-				const tagClass = consoleClasses.includes(game.cTag) ? `tag-${game.cTag}` : 'tag-default';
-				const consoleName = game.cTag.toUpperCase();
 				
-				const dateHtml = game.date ? `<div class="date-tag"><i class="far fa-clock"></i> ${game.date}</div>` : '';
-	
-				html += `
-					<div class="game-card anim-reveal" style="--tile-idx: ${idx};" onclick="switchView('view-browse'); switchAndSearch('${cat}', '${game.id}', true)" onmouseenter="this.classList.remove('anim-reveal'); this.classList.add('no-anim');">
-						<div class="game-img-container">
-							<div class="console-tag ${tagClass}">${consoleName}</div>
-							<div class="region-tag">${game.region}</div>
-							${dateHtml}
-							<img src="${imgUrl}" alt="Cover" class="game-img" loading="lazy" onerror="this.onerror=null; this.src='${FALLBACK_IMG}';">
-						</div>
-						<div class="game-info" style="padding: 10px;">
-							<div>
-								<h3 class="game-title" title="${game.cleanName}">${game.cleanName}</h3>
-								<div class="game-meta-info">
-									<span class="game-id">[${game.id}]</span>
+				let html = '';
+				latestItems.forEach((game, idx) => {
+					const imgUrl = getOptimizedCover(game.id);
+					const consoleClasses = ['ps3', 'ps2', 'psx', 'psp', 'minis', 'pce', 'neogeo'];
+					const tagClass = consoleClasses.includes(game.cTag) ? `tag-${game.cTag}` : 'tag-default';
+					const consoleName = game.cTag.toUpperCase();
+					
+					const dateHtml = game.date ? `<div class="date-tag"><i class="far fa-clock"></i> ${game.date}</div>` : '';
+		
+					html += `
+						<div class="game-card anim-reveal" style="--tile-idx: ${idx};" onclick="switchView('view-browse'); switchAndSearch('${cat}', '${game.id}', true)" onmouseenter="this.classList.remove('anim-reveal'); this.classList.add('no-anim');">
+							<div class="game-img-container">
+								<div class="console-tag ${tagClass}">${consoleName}</div>
+								<div class="region-tag">${game.region}</div>
+								${dateHtml}
+								<img src="${imgUrl}" alt="Cover" class="game-img" loading="lazy" onerror="this.onerror=null; this.src='${FALLBACK_IMG}';">
+							</div>
+							<div class="game-info" style="padding: 10px;">
+								<div>
+									<h3 class="game-title" title="${game.cleanName}">${game.cleanName}</h3>
+									<div class="game-meta-info">
+										<span class="game-id">[${game.id}]</span>
+									</div>
 								</div>
 							</div>
 						</div>
-					</div>
-				`;
-			});
-			
-			container.innerHTML = html;
-			
-		} catch(e) {
-			console.error("Explore fetch error:", e);
-			container.innerHTML = '<div style="color: red; padding: 10px;">Error loading data.</div>';
+					`;
+				});
+				
+				container.innerHTML = html;
+				
+			} catch(e) {
+				console.error("Explore fetch error:", e);
+				container.innerHTML = '<div style="color: red; padding: 10px;">Error loading data.</div>';
+			}
 		}
-	}
 
         async function populateExploreTab() {
             await Promise.all([

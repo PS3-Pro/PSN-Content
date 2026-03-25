@@ -17,48 +17,47 @@ jobs:
         with:
           python-version: '3.x'
 
-      - name: Update Database with Timestamps
+      - name: Sync NPS and Detect Changes
         run: |
           BASE_DIR="resources/database/official"
-          SCRIPT_PATH=".github/scripts/generate_latest_releases.py"
+          LATEST_DIR="resources/database/latest"
+          PY_SCRIPT=".github/scripts/update_latest.py"
           
           mkdir -p "$BASE_DIR/pending"
-          
+          mkdir -p "$LATEST_DIR"
+
           categories=("games" "avatars" "demos" "dlcs" "themes")
-          
+
           for cat in "${categories[@]}"; do
             echo "Processando $cat..."
             
-            curl -L "https://nopaystation.com/tsv/PS3_${cat^^}.tsv" -o "new_${cat}.tsv"
-            python "$SCRIPT_PATH" "$BASE_DIR/${cat}.tsv" "new_${cat}.tsv"
+            URL_OFFICIAL="https://nopaystation.com/tsv/PS3_${cat^^}.tsv"
+            curl -L "$URL_OFFICIAL" -o "nps_raw.tsv"
             
-            curl -L "https://nopaystation.com/tsv/pending/PS3_${cat^^}.tsv" -o "new_pending_${cat}.tsv"
-            python "$SCRIPT_PATH" "$BASE_DIR/pending/${cat}.tsv" "new_pending_${cat}.tsv"
+            awk -F'\t' 'NR==1 || ($4 != "MISSING" && $4 != "")' "nps_raw.tsv" > "nps_clean.tsv"
+            
+            python "$PY_SCRIPT" "$BASE_DIR/${cat}.tsv" "nps_clean.tsv" "$LATEST_DIR/latest_${cat}.tsv"
+            
+            mv "nps_clean.tsv" "$BASE_DIR/${cat}.tsv"
+            rm "nps_raw.tsv"
+
+            curl -L "https://nopaystation.com/tsv/pending/PS3_${cat^^}.tsv" -o "p_raw.tsv"
+            awk -F'\t' 'NR==1 || ($4 != "MISSING" && $4 != "")' "p_raw.tsv" > "p_clean.tsv"
+            
+            python "$PY_SCRIPT" "$BASE_DIR/pending/${cat}.tsv" "p_clean.tsv" "$LATEST_DIR/latest_${cat}.tsv"
+            mv "p_clean.tsv" "$BASE_DIR/pending/${cat}.tsv"
+            rm "p_raw.tsv"
           done
-
-      - name: Generate Latest Snippets
-        run: |
-          mkdir -p resources/database/latest
-          
-          generate_latest() {
-            SRC=$1
-            DEST=$2
-            if [ -f "$SRC" ]; then
-              head -n 1 "$SRC" > "$DEST"
-              # Pega as últimas 50 linhas, limpa vazias e salva as 25 finais (que agora já têm data)
-              tail -n 50 "$SRC" | grep -v "^$" | tail -n 25 >> "$DEST"
-            fi
-          }
-
-          generate_latest "resources/database/official/games.tsv" "resources/database/latest/latest_games.tsv"
-          generate_latest "resources/database/official/dlcs.tsv" "resources/database/latest/latest_dlcs.tsv"
-          generate_latest "resources/database/official/avatars.tsv" "resources/database/latest/latest_avatars.tsv"
-          generate_latest "resources/database/official/demos.tsv" "resources/database/latest/latest_demos.tsv"
 
       - name: Commit and Push changes
         run: |
           git config --global user.name "PS3-Pro Bot"
           git config --global user.email "bot@ps3pro.com"
-          git add resources/database/official/*.tsv resources/database/official/pending/*.tsv resources/database/latest/*.tsv
+          
+          git add resources/database/official/*.tsv
+          git add resources/database/official/pending/*.tsv
+          git add resources/database/latest/*.tsv
+          
+          # Só faz o commit se houver mudança real nos arquivos
           git diff-index --quiet HEAD || git commit -m "Auto-update: Synchronized with NoPayStation (Official & Pending)"
           git push
