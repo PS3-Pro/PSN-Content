@@ -12,42 +12,42 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v3
 
-      - name: Download Official TSV files from NoPayStation
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.x'
+
+      - name: Update Database with Timestamps
         run: |
           BASE_DIR="resources/database/official"
+          SCRIPT_PATH=".github/scripts/generate_latest_releases.py"
+          
           mkdir -p "$BASE_DIR/pending"
-          curl -L "https://nopaystation.com/tsv/PS3_GAMES.tsv" -o "$BASE_DIR/games.tsv"
-          curl -L "https://nopaystation.com/tsv/PS3_AVATARS.tsv" -o "$BASE_DIR/avatars.tsv"
-          curl -L "https://nopaystation.com/tsv/PS3_DEMOS.tsv" -o "$BASE_DIR/demos.tsv"
-          curl -L "https://nopaystation.com/tsv/PS3_DLCS.tsv" -o "$BASE_DIR/dlcs.tsv"
-          curl -L "https://nopaystation.com/tsv/PS3_THEMES.tsv" -o "$BASE_DIR/themes.tsv"
-          # Downloads dos pendentes
-          curl -L "https://nopaystation.com/tsv/pending/PS3_GAMES.tsv" -o "$BASE_DIR/pending/games.tsv"
-          curl -L "https://nopaystation.com/tsv/pending/PS3_AVATARS.tsv" -o "$BASE_DIR/pending/avatars.tsv"
-          curl -L "https://nopaystation.com/tsv/pending/PS3_DEMOS.tsv" -o "$BASE_DIR/pending/demos.tsv"
-          curl -L "https://nopaystation.com/tsv/pending/PS3_DLCS.tsv" -o "$BASE_DIR/pending/dlcs.tsv"
-          curl -L "https://nopaystation.com/tsv/pending/PS3_THEMES.tsv" -o "$BASE_DIR/pending/themes.tsv"
-
-      - name: Clean TSV files
-        run: |
-          for file in resources/database/official/*.tsv resources/database/official/pending/*.tsv; do
-            if [ -f "$file" ]; then
-              awk -F'\t' 'NR==1 || ($4 != "MISSING" && $4 != "")' "$file" > "${file}.tmp"
-              mv "${file}.tmp" "$file"
-            fi
+          
+          categories=("games" "avatars" "demos" "dlcs" "themes")
+          
+          for cat in "${categories[@]}"; do
+            echo "Processando $cat..."
+            
+            curl -L "https://nopaystation.com/tsv/PS3_${cat^^}.tsv" -o "new_${cat}.tsv"
+            python "$SCRIPT_PATH" "$BASE_DIR/${cat}.tsv" "new_${cat}.tsv"
+            
+            curl -L "https://nopaystation.com/tsv/pending/PS3_${cat^^}.tsv" -o "new_pending_${cat}.tsv"
+            python "$SCRIPT_PATH" "$BASE_DIR/pending/${cat}.tsv" "new_pending_${cat}.tsv"
           done
 
       - name: Generate Latest Snippets
         run: |
-          # Cria a pasta para os arquivos pequenos de "novidades"
           mkdir -p resources/database/latest
           
-          # Função para pegar o cabeçalho + as últimas 20 linhas (mais recentes no NPS)
           generate_latest() {
             SRC=$1
             DEST=$2
-            head -n 1 "$SRC" > "$DEST"
-            tail -n 25 "$SRC" >> "$DEST"
+            if [ -f "$SRC" ]; then
+              head -n 1 "$SRC" > "$DEST"
+              # Pega as últimas 50 linhas, limpa vazias e salva as 25 finais (que agora já têm data)
+              tail -n 50 "$SRC" | grep -v "^$" | tail -n 25 >> "$DEST"
+            fi
           }
 
           generate_latest "resources/database/official/games.tsv" "resources/database/latest/latest_games.tsv"
@@ -60,5 +60,5 @@ jobs:
           git config --global user.name "PS3-Pro Bot"
           git config --global user.email "bot@ps3pro.com"
           git add resources/database/official/*.tsv resources/database/official/pending/*.tsv resources/database/latest/*.tsv
-          git diff-index --quiet HEAD || git commit -m "Auto-update: Database & Latest Snippets"
+          git diff-index --quiet HEAD || git commit -m "Auto-update: Synchronized with NoPayStation (Official & Pending)"
           git push

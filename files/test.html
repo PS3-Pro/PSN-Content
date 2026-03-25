@@ -104,12 +104,13 @@
             display: flex; 
             flex-direction: column; 
             overflow-y: auto; 
-            overflow-x: hidden; /* CORREÇÃO 1: Evita rolagem horizontal geral */
+            overflow-x: hidden;
             position: relative; 
             scroll-behavior: smooth; 
             background-color: transparent; 
             scrollbar-width: thin;
-            scrollbar-color: var(--ps-blue) rgba(8, 18, 33, 0.5);
+            //scrollbar-color: var(--ps-blue) rgba(8, 18, 33, 0.5);
+			scrollbar-color: #fff rgba(8, 18, 33, 0.5);
             -webkit-overflow-scrolling: touch;
             contain: content;
         }
@@ -125,7 +126,7 @@
         }
         
         .main-content::-webkit-scrollbar-thumb {
-            background: var(--ps-blue); 
+            background: #Fff; 
             border-radius: 4px;
             border: 1px solid rgba(255, 255, 255, 0.05); 
         }
@@ -219,7 +220,7 @@
         .carousel-wrapper {
             position: relative;
             width: 100%;
-            min-width: 0; /* CORREÇÃO 2: Permite que o wrapper respeite o grid-template-columns */
+            min-width: 0;
         }
 
         .horizontal-scroll {
@@ -785,6 +786,24 @@
         .promo-card-dark .promo-icon { font-size: 80px; color: rgba(255,255,255,0.03); top: 50%; transform: translateY(-50%); right: -10px; }
         .promo-card-dark:hover .promo-icon { color: rgba(255,255,255,0.08); }
         
+		.date-tag { 
+			position: absolute; 
+			bottom: 8px; 
+			right: 8px; 
+			background: rgba(0, 0, 0, 0.7); 
+			color: var(--text-muted); 
+			font-size: 9px; 
+			padding: 3px 6px; 
+			border-radius: 4px; 
+			font-weight: bold; 
+			backdrop-filter: blur(4px);
+			z-index: 2;
+			display: flex;
+			align-items: center;
+			gap: 4px;
+			border: 1px solid rgba(255, 255, 255, 0.05);
+		}
+
         @media (max-width: 1024px) {
             .explore-split-layout { grid-template-columns: 1fr; gap: 30px; }
             .explore-left-col { padding-right: 0; }
@@ -1129,6 +1148,8 @@
     <script type="text/javascript" src="https://github.com/PS3-Pro/Pages/raw/main/resources/scripts/flash_objects.js"></script>
 
     <script>
+		let musicWasPlaying = false;
+
         window.toggleSidebar = function() {
             document.querySelector('.sidebar').classList.toggle('active');
             document.getElementById('sidebar-overlay').classList.toggle('active');
@@ -1331,96 +1352,104 @@
             });
         }
         
-        async function fetchLatestForExplore(cat, containerId) {
-            const container = document.getElementById(containerId);
-            if(!container) return;
-            
-            container.innerHTML = '<div style="color: var(--text-muted); padding: 10px;"><i class="fas fa-spinner fa-spin"></i> Loading latest...</div>';
-            
-            const paths = DB_PATHS[cat];
-            let allValidLines = [];
-            
-            try {
-                const responses = await Promise.all(paths.map(url => fetch(url).then(res => res.ok ? res.text() : "")));
-                for (const text of responses) {
-                    if (!text) continue;
-                    const lines = text.split('\n');
-                    for (const line of lines) {
-                        if (line.trim().length > 15 && !line.startsWith("Title ID")) {
-                            allValidLines.push(line);
-                        }
-                    }
-                }
-                
-                const latestLines = allValidLines.slice(-200).reverse(); 
-                
-                let tempGroupMap = {};
-                for(const line of latestLines) {
-                     const parts = line.split('\t');
-                     const id = parts[0] ? parts[0].trim() : "";
-                     const region = parts[1] ? parts[1].trim() : "";
-                     let rawName = parts[2] ? parts[2].trim() : "";
-                     const pkgUrl = parts[3] ? parts[3].trim() : "";
-                     
-                     if (!id || id.length !== 9 || !pkgUrl || pkgUrl === "MISSING") continue;
-                     
-                     const RX_DEMO_CHK = /\b(demo|trial|beta|bèta)\b|体験版/i;
-                     const isTestVersion = RX_DEMO_CHK.test(rawName);
-
-                     if ((cat === "games" || cat === "apps") && isTestVersion) continue;
-                     if (cat === "demos" && !isTestVersion) continue;
-
-                     const { cleanName, cTag, aTag } = processGameInfo(rawName, cat);
-                     const isAppItem = (DICT_APPS_FILTER[id] === 1) || (aTag !== "media");
-
-                     if (cat === "games" && isAppItem) continue;
-                     if (cat === "apps" && !isAppItem) continue;
-                     
-                     if (!tempGroupMap[id]) {
-                         tempGroupMap[id] = { id, region, cleanName, cTag, url: pkgUrl };
-                     }
-                }
-                
-                const latestItems = Object.values(tempGroupMap).slice(0, 15); 
-                
-                if(latestItems.length === 0) {
-                     container.innerHTML = '<div style="color: var(--text-muted); padding: 10px;">No recent items found.</div>';
-                     return;
-                }
-                
-                let html = '';
-                latestItems.forEach((game, idx) => {
-                     const imgUrl = getOptimizedCover(game.id);
-                     const consoleClasses = ['ps3', 'ps2', 'psx', 'psp', 'minis', 'pce', 'neogeo'];
-                     const tagClass = consoleClasses.includes(game.cTag) ? `tag-${game.cTag}` : 'tag-default';
-                     const consoleName = game.cTag.toUpperCase();
-                     
-                     html += `
-                        <div class="game-card anim-reveal" style="--tile-idx: ${idx};" onclick="switchView('view-browse'); switchAndSearch('${cat}', '${game.id}', true)" onmouseenter="this.classList.remove('anim-reveal'); this.classList.add('no-anim');">
-                            <div class="game-img-container">
-                                <div class="console-tag ${tagClass}">${consoleName}</div>
-                                <div class="region-tag">${game.region}</div>
-                                <img src="${imgUrl}" alt="Cover" class="game-img" loading="lazy" onerror="this.onerror=null; this.src='${FALLBACK_IMG}';">
-                            </div>
-                            <div class="game-info" style="padding: 10px;">
-                                <div>
-                                    <h3 class="game-title" title="${game.cleanName}">${game.cleanName}</h3>
-                                    <div class="game-meta-info">
-                                        <span class="game-id">[${game.id}]</span>
-                                    </div>
-                                </div>
-                            </div>
-                        </div>
-                     `;
-                });
-                
-                container.innerHTML = html;
-                
-            } catch(e) {
-                console.error("Explore fetch error:", e);
-                container.innerHTML = '<div style="color: red; padding: 10px;">Error loading data.</div>';
-            }
-        }
+       async function fetchLatestForExplore(cat, containerId) {
+		const container = document.getElementById(containerId);
+		if(!container) return;
+		
+		container.innerHTML = '<div style="color: var(--text-muted); padding: 10px;"><i class="fas fa-spinner fa-spin"></i> Loading latest...</div>';
+		
+		const paths = DB_PATHS[cat];
+		let allValidLines = [];
+		
+		try {
+			const responses = await Promise.all(paths.map(url => fetch(url).then(res => res.ok ? res.text() : "")));
+			for (const text of responses) {
+				if (!text) continue;
+				const lines = text.split('\n');
+				for (const line of lines) {
+					if (line.trim().length > 15 && !line.startsWith("Title ID")) {
+						allValidLines.push(line);
+					}
+				}
+			}
+			
+			const latestLines = allValidLines.slice(-200).reverse(); 
+			
+			let tempGroupMap = {};
+			for(const line of latestLines) {
+				const parts = line.split('\t');
+				const id = parts[0] ? parts[0].trim() : "";
+				const region = parts[1] ? parts[1].trim() : "";
+				let rawName = parts[2] ? parts[2].trim() : "";
+				const pkgUrl = parts[3] ? parts[3].trim() : "";
+				const addedDate = parts[11] ? parts[11].trim() : ""; 
+				
+				if (!id || id.length !== 9 || !pkgUrl || pkgUrl === "MISSING") continue;
+				
+				if (cat === "games" && rawName.includes("Nostalgia Vault")) {
+					rawName = rawName.replace(/\s*\(Nostalgia Vault\)/gi, "").trim();
+				}
+	
+				const RX_DEMO_CHK = /\b(demo|trial|beta|bèta)\b|体験版/i;
+				const isTestVersion = RX_DEMO_CHK.test(rawName);
+	
+				if ((cat === "games" || cat === "apps") && isTestVersion) continue;
+				if (cat === "demos" && !isTestVersion) continue;
+	
+				const { cleanName, cTag, aTag } = processGameInfo(rawName, cat);
+				const isAppItem = (DICT_APPS_FILTER[id] === 1) || (aTag !== "media");
+	
+				if (cat === "games" && isAppItem) continue;
+				if (cat === "apps" && !isAppItem) continue;
+				
+				if (!tempGroupMap[id]) {
+					tempGroupMap[id] = { id, region, cleanName, cTag, url: pkgUrl, date: addedDate };
+				}
+			}
+			
+			const latestItems = Object.values(tempGroupMap).slice(0, 15); 
+			
+			if(latestItems.length === 0) {
+				container.innerHTML = '<div style="color: var(--text-muted); padding: 10px;">No recent items found.</div>';
+				return;
+			}
+			
+			let html = '';
+			latestItems.forEach((game, idx) => {
+				const imgUrl = getOptimizedCover(game.id);
+				const consoleClasses = ['ps3', 'ps2', 'psx', 'psp', 'minis', 'pce', 'neogeo'];
+				const tagClass = consoleClasses.includes(game.cTag) ? `tag-${game.cTag}` : 'tag-default';
+				const consoleName = game.cTag.toUpperCase();
+				
+				const dateHtml = game.date ? `<div class="date-tag"><i class="far fa-clock"></i> ${game.date}</div>` : '';
+	
+				html += `
+					<div class="game-card anim-reveal" style="--tile-idx: ${idx};" onclick="switchView('view-browse'); switchAndSearch('${cat}', '${game.id}', true)" onmouseenter="this.classList.remove('anim-reveal'); this.classList.add('no-anim');">
+						<div class="game-img-container">
+							<div class="console-tag ${tagClass}">${consoleName}</div>
+							<div class="region-tag">${game.region}</div>
+							${dateHtml}
+							<img src="${imgUrl}" alt="Cover" class="game-img" loading="lazy" onerror="this.onerror=null; this.src='${FALLBACK_IMG}';">
+						</div>
+						<div class="game-info" style="padding: 10px;">
+							<div>
+								<h3 class="game-title" title="${game.cleanName}">${game.cleanName}</h3>
+								<div class="game-meta-info">
+									<span class="game-id">[${game.id}]</span>
+								</div>
+							</div>
+						</div>
+					</div>
+				`;
+			});
+			
+			container.innerHTML = html;
+			
+		} catch(e) {
+			console.error("Explore fetch error:", e);
+			container.innerHTML = '<div style="color: red; padding: 10px;">Error loading data.</div>';
+		}
+	}
 
         async function populateExploreTab() {
             await Promise.all([
@@ -2184,48 +2213,59 @@
         const YOUTUBE_API_KEY = "AIzaSyD0GuR-DWp_R0lK9Coek7IgUDZMsUgUHKY"; 
 
         window.playTrailer = async function(gameName) {
-            const searchQuery = gameName + " PS3 gameplay";
-            const encodedQuery = encodeURIComponent(searchQuery);
+			const audioEl = document.getElementById('invisible-audio');
 
-            document.getElementById('trailer-title').innerText = "Searching video...";
-            document.getElementById('trailer-iframe').src = ""; 
-            
-            const fallbackBtn = document.getElementById('fallback-yt-btn');
-            if(fallbackBtn) fallbackBtn.href = `https://www.youtube.com/results?search_query=${encodedQuery}`;
-            
-            document.getElementById('trailer-modal').style.display = 'flex';
-
-            if (YOUTUBE_API_KEY === "SUA_CHAVE_AQUI" || !YOUTUBE_API_KEY) {
-                document.getElementById('trailer-title').innerText = "Error: API Key not configured";
-                alert("Remember to set your API Key in the code!");
-                return;
-            }
-
-            try {
-                const apiUrl = `https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&maxResults=1&q=${encodedQuery}&key=${YOUTUBE_API_KEY}`;
-                
-                const response = await fetch(apiUrl);
-                const data = await response.json();
-
-                if (data.items && data.items.length > 0) {
-                    const videoId = data.items[0].id.videoId;
-                    document.getElementById('trailer-title').innerText = gameName + " - Gameplay";
-                    document.getElementById('trailer-iframe').src = `https://www.youtube.com/embed/${videoId}?autoplay=1`;
-                } else {
-                    document.getElementById('trailer-title').innerText = "No video found for this game";
-                }
-            } catch (error) {
-                console.error("Youtube API Error:", error);
-                document.getElementById('trailer-title').innerText = "Error connecting to YouTube";
-            }
-        }
-
-        window.closeTrailer = function(e) {
-            if (!e || e.target.id === 'trailer-modal' || e.target.classList.contains('modal-close')) {
-                document.getElementById('trailer-modal').style.display = 'none';
-                document.getElementById('trailer-iframe').src = "";
-            }
-        }
+			if (audioEl && !audioEl.paused) {
+				musicWasPlaying = true;
+				audioEl.pause();
+			} else {
+				musicWasPlaying = false;
+			}
+			
+			const searchQuery = gameName + " PS3 gameplay";
+			const encodedQuery = encodeURIComponent(searchQuery);
+		
+			document.getElementById('trailer-title').innerText = "Searching video...";
+			document.getElementById('trailer-iframe').src = ""; 
+			
+			document.getElementById('trailer-modal').style.display = 'flex';
+		
+			try {
+				const apiUrl = `https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&maxResults=1&q=${encodedQuery}&key=${YOUTUBE_API_KEY}`;
+				const response = await fetch(apiUrl);
+				const data = await response.json();
+		
+				if (data.items && data.items.length > 0) {
+					const videoId = data.items[0].id.videoId;
+					document.getElementById('trailer-title').innerText = gameName + " - Gameplay";
+					document.getElementById('trailer-iframe').src = `https://www.youtube.com/embed/${videoId}?autoplay=1`;
+				} else {
+					document.getElementById('trailer-title').innerText = "No video found for this game";
+				}
+			} catch (error) {
+				console.error("Youtube API Error:", error);
+				document.getElementById('trailer-title').innerText = "Error connecting to YouTube";
+			}
+		}
+		
+		window.closeTrailer = function(e) {
+				if (!e || e.target.id === 'trailer-modal' || e.target.classList.contains('modal-close')) {
+				
+				document.getElementById('trailer-modal').style.display = 'none';
+				document.getElementById('trailer-iframe').src = "";
+		
+				const audioToggle = document.getElementById('audio-toggle');
+				const audioEl = document.getElementById('invisible-audio');
+		
+				if (musicWasPlaying && audioToggle && audioToggle.checked) {
+					if (audioEl) {
+						audioEl.play().catch(err => console.log("Erro ao retomar áudio:", err));
+					}
+				}
+		
+				musicWasPlaying = false;
+			}
+		}
 
         const STORAGE_KEY_AUDIO = "psn_audio_state";
         
@@ -2477,7 +2517,8 @@
             updateDownloadUI();
             
             populateExploreTab();
-            
+            switchView('view-explore');
+	
             fetchDatabase();
         });
         
