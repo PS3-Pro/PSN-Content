@@ -606,6 +606,32 @@
         }
 
         .download-item:hover { background: rgba(255, 255, 255, 0.06); }
+		
+		.download-item.is-new {
+			position: relative;
+			overflow: hidden;
+			border: 1px solid rgba(255, 255, 255, 0.6) !important;
+			background: rgba(0, 112, 204, 0.05) !important;
+		}
+		
+		.download-item.is-new::before {
+			content: '';
+			position: absolute;
+			top: -50%;
+			left: -150%;
+			width: 60%;
+			height: 200%;
+			background: linear-gradient(
+				to right, 
+				rgba(255, 255, 255, 0) 0%, 
+				rgba(255, 255, 255, 0.2) 50%, 
+				rgba(255, 255, 255, 0) 100%
+			);
+			transform: rotate(25deg);
+			pointer-events: none;
+			z-index: 2;
+			animation: ps5Sweep 2s ease-out infinite; /* Executa o brilho repetidamente */
+		}
 
         .dl-main-info { display: flex; flex-direction: column; gap: 4px; }
         .dl-name { font-size: 14px; font-weight: 500; color: #fff; }
@@ -1182,6 +1208,7 @@
     <script type="text/javascript" src="https://github.com/PS3-Pro/Pages/raw/main/resources/scripts/flash_objects.js"></script>
 
     <script>
+		let dlAnimationTimer = null
 		let musicWasPlaying = false;
 
         window.toggleSidebar = function() {
@@ -2376,7 +2403,8 @@
 				name: fileName.replace(/_/g, ' '),
 				sizeBytes: sizeBytes || 0,
 				sizeText: formatSizeFromBytes(sizeBytes),
-				date: dateTime
+				date: dateTime,
+				isNew: true
 			};
 		
 			downloadHistory.unshift(entry);
@@ -2391,8 +2419,6 @@
 			if (dot && !isVisible) {
 				dot.style.display = 'block';
 			}
-			// --------------------------
-		
 			updateDownloadUI();
 		};
 
@@ -2405,50 +2431,60 @@
         };
 
         function updateDownloadUI() {
-            const listContainer = document.getElementById('downloads-list');
-            const statCount = document.getElementById('stat-total-count');
-            const statSize = document.getElementById('stat-total-size');
-            const globalCount = document.getElementById('dl-count');
-            
-            if (!listContainer) return;
-
-            if (downloadHistory.length === 0) {
-                listContainer.innerHTML = '<p style="color: var(--text-muted); text-align: center; margin-top: 50px;">No downloads found.</p>';
-                if(statCount) statCount.innerText = "0";
-                if(statSize) statSize.innerText = "0 KB";
-                if(globalCount) globalCount.innerText = "(0 items)";
-                return;
-            }
-
-            const totalBytes = downloadHistory.reduce((acc, item) => acc + (item.sizeBytes || 0), 0);
-            
-            if(statCount) statCount.innerText = downloadHistory.length;
-            if(statSize) statSize.innerText = formatSizeFromBytes(totalBytes);
-            if(globalCount) globalCount.innerText = `(${downloadHistory.length} items)`;
-            
-            listContainer.innerHTML = downloadHistory.map(dl => `
-            <div class="download-item" style="cursor: pointer;" 
-                onclick="switchView('view-browse'); switchAndSearch('${dl.category}', '${dl.titleId}')">
-                <div class="dl-main-info">
-                    <span class="dl-name">${dl.name}</span>
-                    <span class="dl-date"><i class="far fa-clock"></i> ${dl.date}</span>
-                </div>
-                <div class="dl-side-info">
-                    <span class="dl-size-tag">${dl.sizeText}</span>
-                    <div style="font-size: 9px; color: var(--ps-blue); margin-top: 4px;">SEARCH</div>
-                </div>
-            </div>
-        `).join(''); }
+			const listContainer = document.getElementById('downloads-list');
+			const statCount = document.getElementById('stat-total-count');
+			const statSize = document.getElementById('stat-total-size');
+			const globalCount = document.getElementById('dl-count');
+			
+			if (!listContainer) return;
+		
+			if (downloadHistory.length === 0) {
+				listContainer.innerHTML = '<p style="color: var(--text-muted); text-align: center; margin-top: 50px;">No downloads found.</p>';
+				if(statCount) statCount.innerText = "0";
+				if(statSize) statSize.innerText = "0 KB";
+				if(globalCount) globalCount.innerText = "(0 items)";
+				return;
+			}
+		
+			const now = Date.now(); // Hora atual para comparar
+			const totalBytes = downloadHistory.reduce((acc, item) => acc + (item.sizeBytes || 0), 0);
+			
+			if(statCount) statCount.innerText = downloadHistory.length;
+			if(statSize) statSize.innerText = formatSizeFromBytes(totalBytes);
+			if(globalCount) globalCount.innerText = `(${downloadHistory.length} items)`;
+			
+			listContainer.innerHTML = downloadHistory.map(dl => {
+				const newClass = dl.isNew ? 'is-new' : '';
+		
+				return `
+					<div class="download-item ${newClass}" style="cursor: pointer;" 
+						onclick="switchView('view-browse'); switchAndSearch('${dl.category}', '${dl.titleId}')">
+						<div class="dl-main-info">
+							<span class="dl-name">${dl.name}</span>
+							<span class="dl-date"><i class="far fa-clock"></i> ${dl.date}</span>
+						</div>
+						<div class="dl-side-info">
+							<span class="dl-size-tag">${dl.sizeText}</span>
+							<div style="font-size: 9px; color: var(--ps-blue); margin-top: 4px;">SEARCH</div>
+						</div>
+					</div>
+				`;
+			}).join(''); 
+		}
         
         window.switchView = function(viewId, forceReset = false) {
+			
+			if (dlAnimationTimer) {
+				clearTimeout(dlAnimationTimer);
+				dlAnimationTimer = null;
+			}
+			
 			document.querySelectorAll('.view-section').forEach(el => el.style.display = 'none');
-
+			
 			const targetView = document.getElementById(viewId);
 			if (targetView) targetView.style.display = 'block';
 			
-			
 			document.getElementById('scroll-area').scrollTop = 0;   
-			
 			document.querySelectorAll('.sidebar-menu li').forEach(li => li.classList.remove('active'));
 
 			const scrollBtns = document.querySelector('.scroll-buttons');
@@ -2456,10 +2492,19 @@
 			const searchBar = document.querySelector('.search-bar');
 			
 			if(viewId === 'view-downloads') {
-                const dot = document.getElementById('dl-dot');
-                if(dot) dot.style.display = 'none';
-            }
-			
+				const dot = document.getElementById('dl-dot');
+				if(dot) dot.style.display = 'none';
+
+				dlAnimationTimer = setTimeout(() => {
+					downloadHistory.forEach(item => item.isNew = false);
+
+					setCookie(COOKIE_NAME_HISTORY, JSON.stringify(downloadHistory), 365);
+
+					updateDownloadUI();
+				
+				}, 5000); 
+			}
+	
 			if (viewId === 'view-browse') {
 				document.getElementById('nav-browse').classList.add('active');
 				if (scrollBtns) scrollBtns.style.display = 'flex'; 
