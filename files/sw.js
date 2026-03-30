@@ -1,7 +1,12 @@
 self.addEventListener('install', function(event) {
-    console.log('PWA: Service Worker installed.');
     self.skipWaiting();
+    console.log("PWA: Service Worker installed.");
 });
 
 self.addEventListener('fetch', function(event) {
+    event.respondWith(
+        fetch(event.request).catch(function() {
+            return new Response("PWA Offline Mode");
+        })
+    );
 });
