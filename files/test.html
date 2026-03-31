@@ -1249,8 +1249,13 @@ input:checked + .slider:before { transform: translateX(20px); }
 							<span onclick="explorePath('/dev_hdd0')"><i class="fas fa-hdd"></i> dev_hdd0</span>
 						</div>
 						<div class="explorer-actions">
-							<button class="btn-mini-round" onclick="playUiBack(); goBackPath()"><i class="fas fa-arrow-left"></i></button>
-							<button class="btn-mini-round" onclick="refreshCurrentFolder()"><i class="fas fa-sync-alt"></i></button>
+							<button class="btn-mini-round" onclick="goBack()" title="Back">
+								<i class="fas fa-arrow-left"></i>
+							</button>
+						
+							<button class="btn-mini-round" onclick="refreshFiles()" title="Refresh">
+								<i class="fas fa-sync-alt"></i>
+							</button>
 						</div>
 					</div>
 		
@@ -4055,10 +4060,68 @@ function isValidIP(ip) {
 }
 
 // ─── FILE EXPLORER ────────────────────────────────────────────────────────────
-
-
 let currentPath = "/";
 
+// 🔄 REFRESH
+function refreshFiles() {
+    explorePath(currentPath);
+}
+
+function goBack() {
+    try {
+        const pathContainer = document.getElementById('current-path');
+
+        // pega todos os spans (Root + caminhos)
+        const spans = pathContainer.querySelectorAll('span');
+
+        if (spans.length <= 1) {
+            explorePath('/');
+            return;
+        }
+
+        // pega o penúltimo (igual clicar no breadcrumb)
+        const prevSpan = spans[spans.length - 2];
+
+        // pega o onclick original
+        const onclick = prevSpan.getAttribute('onclick');
+
+        if (onclick) {
+            eval(onclick); // executa exatamente o mesmo comando
+        }
+
+    } catch (e) {
+        console.error("goBack error:", e);
+    }
+}
+
+// 🗑 DELETE
+async function deleteFile(path) {
+    const ip = document.getElementById('ps3-ip').value;
+
+    if (!ip) {
+        alert("Please enter the PS3 IP address first!");
+        return;
+    }
+
+    const cleanPath = path.startsWith('/') ? path : `/${path}`;
+    const url = `http://${ip}/delete.ps3${encodeURI(cleanPath)}`;
+
+    if (!confirm(`Delete this file/folder?\n\n${cleanPath}`)) return;
+
+    try {
+        const response = await fetch(url, { cache: 'no-store' });
+
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+
+        explorePath(currentPath);
+
+    } catch (e) {
+        alert("Delete failed: " + e.message);
+        console.error("[deleteFile]", e);
+    }
+}
+
+// 📂 EXPLORER
 async function explorePath(path) {
     const ip = document.getElementById('ps3-ip').value;
     const status = document.getElementById('files-status');
@@ -4070,6 +4133,7 @@ async function explorePath(path) {
 
     const pathContainer = document.getElementById('current-path');
     pathContainer.innerHTML = `<span onclick="explorePath('/')"><i class="fas fa-hdd"></i> Root</span>`;
+    
     path.split('/').filter(p => p).reduce((acc, part) => {
         acc += '/' + part;
         pathContainer.innerHTML += ` <i class="fas fa-chevron-right" style="font-size:10px;opacity:0.3"></i> <span onclick="explorePath('${acc}')">${part}</span>`;
@@ -4088,12 +4152,16 @@ async function explorePath(path) {
         listContainer.innerHTML = "";
         if (status) { status.innerText = `(${path})`; status.style.color = "#4caf50"; }
 
+        // 📁 FOLDERS
         doc.querySelectorAll('a.d').forEach(link => {
             const name = link.innerText.trim();
             if (!name || name === '..') return;
+
             const href = link.getAttribute('href');
             if (!href) return;
+
             const fullPath = href.startsWith('/') ? href : `${basePath}/${href}`;
+
             const row = document.createElement('div');
             row.className = "file-row anim-reveal";
             row.innerHTML = `
@@ -4102,19 +4170,25 @@ async function explorePath(path) {
                 </div>
                 <div class="file-size">--</div>
                 <div class="col-actions">
-                    <button class="btn-mini" onclick="event.stopPropagation();deleteFile('${fullPath}')" title="Delete"><i class="fas fa-trash"></i></button>
+                    <button class="btn-mini" onclick="event.stopPropagation(); deleteFile('${fullPath}')" title="Delete">
+                        <i class="fas fa-trash"></i>
+                    </button>
                 </div>`;
             listContainer.appendChild(row);
         });
 
+        // 📄 FILES
         doc.querySelectorAll('table#files a.w').forEach(link => {
             const name = link.innerText.trim();
             if (!name) return;
+
             const href = link.getAttribute('href');
             if (!href) return;
+
             const fullPath = href.startsWith('/') ? href : `${basePath}/${href}`;
             const td = link.closest('td');
             const size = td?.nextElementSibling?.innerText.trim() || '--';
+
             const row = document.createElement('div');
             row.className = "file-row anim-reveal";
             row.innerHTML = `
@@ -4123,7 +4197,9 @@ async function explorePath(path) {
                 </div>
                 <div class="file-size">${size}</div>
                 <div class="col-actions">
-                    <button class="btn-mini" onclick="deleteFile('${fullPath}')" title="Delete"><i class="fas fa-trash"></i></button>
+                    <button class="btn-mini" onclick="deleteFile('${fullPath}')" title="Delete">
+                        <i class="fas fa-trash"></i>
+                    </button>
                 </div>`;
             listContainer.appendChild(row);
         });
@@ -4139,6 +4215,7 @@ async function explorePath(path) {
     } catch (e) {
         console.error("[explorePath]", e);
         if (status) { status.innerText = `(Erro: ${e.message})`; status.style.color = "#ff4444"; }
+
         listContainer.innerHTML = `
         <div style="text-align:center;color:#888;padding:100px 50px;">
             <i class="fas fa-unlink" style="font-size:50px;opacity:0.2;display:block;margin-bottom:20px;"></i>
