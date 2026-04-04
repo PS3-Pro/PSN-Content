@@ -2870,49 +2870,82 @@
 			summaryContainer.innerHTML = "Summary not available for this title.";
 		};
 
-        const YOUTUBE_API_KEY = "AIzaSyD0GuR-DWp_R0lK9Coek7IgUDZMsUgUHKY"; 
-
-        window.playTrailer = async function(gameName) {
+        const YOUTUBE_KEYS = [
+			"AIzaSyB7NcVLJbAiSlrUdHa75HFkGhA8xR4-afI",
+			"AIzaSyBaV-gjNDEXOl8tncV3eVtVNbzj5mvjfTI",
+			"AIzaSyDMWCqv9IdW5J_D-y7w4DQ71iO9M-OdJMM",
+			"AIzaSyANF2W6GmS1tI2zZRxuEaKiHBufMTwlAEw",
+			"AIzaSyDCNoJBo3omOd-TLjMKP1Z1OYM4zm6uju8",
+			"AIzaSyCEYoSDaqGYs7RC7BWDED7hsBjuzH1fUlU",
+			"AIzaSyBebjTpalv8Wzqfr_8WtZ2eWzroNSzoEBI",
+			"AIzaSyD0GuR-DWp_R0lK9Coek7IgUDZMsUgUHKY",
+			"AIzaSyBukkud9dDmSGf8aDwLs5DiZf1p1nWn28U"
+		];
 		
+		let currentKeyIndex = 0;
+		
+		window.playTrailer = async function(gameName) {
 			let watchedTrailers = parseInt(loadState('psn_trailers_watched') || '0') + 1;
-            saveState('psn_trailers_watched', watchedTrailers);
-            checkTrophyProgress('trailer_10', watchedTrailers);
-            checkTrophyProgress('trailer_50', watchedTrailers);
-			
-            const audioEl = document.getElementById('background_music');
-
-            if (audioEl && !audioEl.paused) {
-                musicWasPlaying = true;
-                audioEl.pause();
-            } else {
-                musicWasPlaying = false;
-            }
-            
-            const searchQuery = gameName + " PS3 gameplay";
-            const encodedQuery = encodeURIComponent(searchQuery);
-        
-            document.getElementById('trailer-title').innerText = "Searching video...";
-            document.getElementById('trailer-iframe').src = ""; 
-            
-            document.getElementById('trailer-modal').style.display = 'flex';
-        
-            try {
-                const apiUrl = `https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&maxResults=1&q=${encodedQuery}&key=${YOUTUBE_API_KEY}`;
-                const response = await fetch(apiUrl);
-                const data = await response.json();
-        
-                if (data.items && data.items.length > 0) {
-                    const videoId = data.items[0].id.videoId;
-                    document.getElementById('trailer-title').innerText = gameName + " - Gameplay";
-                    document.getElementById('trailer-iframe').src = `https://www.youtube.com/embed/${videoId}?autoplay=1`;
-                } else {
-                    document.getElementById('trailer-title').innerText = "No video found for this game";
-                }
-            } catch (error) {
-                console.error("Youtube API Error:", error);
-                document.getElementById('trailer-title').innerText = "Error connecting to YouTube";
-            }
-        }
+			saveState('psn_trailers_watched', watchedTrailers);
+			checkTrophyProgress('trailer_10', watchedTrailers);
+			checkTrophyProgress('trailer_50', watchedTrailers);
+		
+			const audioEl = document.getElementById('background_music');
+			if (audioEl && !audioEl.paused) {
+				musicWasPlaying = true;
+				audioEl.pause();
+			} else {
+				musicWasPlaying = false;
+			}
+		
+			const searchQuery = gameName + " PS3 gameplay";
+			const encodedQuery = encodeURIComponent(searchQuery);
+		
+			document.getElementById('trailer-title').innerText = "Searching video...";
+			document.getElementById('trailer-iframe').src = "";
+			document.getElementById('trailer-modal').style.display = 'flex';
+		
+			const videoId = await fetchYouTubeVideoId(encodedQuery);
+		
+			if (videoId) {
+				document.getElementById('trailer-title').innerText = gameName + " - Gameplay";
+				document.getElementById('trailer-iframe').src = `https://www.youtube.com/embed/${videoId}?autoplay=1`;
+			} else {
+				document.getElementById('trailer-title').innerText = "No video found or Quota exceeded";
+			}
+		}
+		
+		async function fetchYouTubeVideoId(query) {
+			if (currentKeyIndex >= YOUTUBE_KEYS.length) {
+				console.error("All YouTube API keys exceeded their quota..");
+				currentKeyIndex = 0;
+				return null;
+			}
+		
+			const apiKey = YOUTUBE_KEYS[currentKeyIndex];
+			const apiUrl = `https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&maxResults=1&q=${query}&key=${apiKey}`;
+		
+			try {
+				const response = await fetch(apiUrl);
+				
+				if (response.status === 403) {
+					console.warn(`Chave ${currentKeyIndex + 1} exceeded. Trying the next one...`);
+					currentKeyIndex++;
+					return await fetchYouTubeVideoId(query);
+				}
+		
+				const data = await response.json();
+				
+				if (data.items && data.items.length > 0) {
+					return data.items[0].id.videoId;
+				}
+				return null;
+		
+			} catch (error) {
+				console.error("Error during YouTube request:", error);
+				return null;
+			}
+		}
         
         window.closeTrailer = function(e) {
                 if (!e || e.target.id === 'trailer-modal' || e.target.classList.contains('modal-close')) {
