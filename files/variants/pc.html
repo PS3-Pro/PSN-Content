@@ -476,7 +476,10 @@
 	.trophy-progress-bar { margin-top: 10px; height: 4px; background: rgba(255, 255, 255, 0.1); border-radius: 2px; overflow: hidden; max-width: 300px; }
 	.trophy-progress-fill { height: 100%; width: 0%; transition: width 0.5s; }
 	.trophy-date { font-size: 13px; color: rgba(255, 255, 255, 0.5); text-align: right; min-width: 120px; }
-	#trophy-dot { display: block; position: absolute; right: 19px; top: 10px; background-color: var(--ps-blue); box-shadow: 0 0 10px var(--ps-blue); }
+	#trophy-dot { display: block; position: absolute; right: 19px; top: 10px; }
+	
+	#chat-dot { display: block; position: absolute; right: 19px; top: 10px; background-color: var(--ps-blue); box-shadow: 0 0 10px var(--ps-blue); }
+	
 	/* ========================================================================== LIBRARY SPECIFIC FIXES ========================================================================== */
 	.library-actions { display: flex; gap: 15px; align-items: center; }
 	#library-toolbar { justify-content: flex-end; }
@@ -553,6 +556,8 @@
 		.trophy-card-info { margin-left: 0; width: 100%; }
 		.trophy-date { text-align: left; min-width: auto; }
 		#trophy-dot {right: auto; left: 15px; top: 10px;}
+		
+		#chat-dot {right: auto; left: 15px; top: 10px;}
 	}
 	
 	/* ========================================================================== IMERSIVE APP ========================================================================== */
@@ -5204,24 +5209,33 @@
 	</script>
 	<script>
 	// ==========================================================================
-	// CHAT SYSTEM LOGIC - FIXED & COMPLETE
+	// CHAT SYSTEM LOGIC - FULL VERSION (TIMESTAMPS + F5 SURVIVAL)
 	// ==========================================================================
 	
 	const socketRenderUrl = "https://psn-content.onrender.com"; 
 	let socketChat;
 	
-	function appendMessageToChat(msg, isMe = false) {
+	function appendMessageToChat(msg, isMe = false, timestamp = null) {
 		const box = document.getElementById('chat-messages');
 		if (!box) return;
-	
+
+		const date = timestamp ? new Date(timestamp) : new Date();
+		const timeStr = date.getHours().toString().padStart(2, '0') + ':' + 
+						date.getMinutes().toString().padStart(2, '0');
+
 		const align = isMe ? 'flex-end' : 'flex-start';
-		const borderRadius = isMe ? '8px 8px 0px 8px' : '8px 8px 8px 0px';
+		const borderRadius = isMe ? '12px 12px 2px 12px' : '12px 12px 12px 2px';
 		const bgColor = isMe ? 'rgba(0, 112, 204, 0.4)' : 'rgba(255, 255, 255, 0.08)';
 		const borderColor = isMe ? 'var(--ps-blue)' : 'rgba(255, 255, 255, 0.2)';
-	
+
 		const msgHtml = `
-			<div style="background: ${bgColor}; border: 1px solid ${borderColor}; padding: 12px 18px; border-radius: ${borderRadius}; width: fit-content; max-width: 80%; align-self: ${align}; box-shadow: 0 4px 10px rgba(0,0,0,0.3); animation: fadeIn 0.3s ease;">
-				<div style="font-size: 13px; color: #fff; line-height: 1.4;">${msg}</div>
+			<div style="display: flex; flex-direction: column; align-self: ${align}; max-width: 85%; margin-bottom: 8px; animation: fadeIn 0.3s ease;">
+				<div style="background: ${bgColor}; border: 1px solid ${borderColor}; padding: 10px 15px; border-radius: ${borderRadius}; box-shadow: 0 4px 10px rgba(0,0,0,0.2);">
+					<div style="font-size: 13px; color: #fff; line-height: 1.4; word-wrap: break-word;">${msg}</div>
+				</div>
+				<div style="font-size: 9px; color: var(--text-muted); margin-top: 4px; align-self: ${align}; opacity: 0.7; font-weight: bold; letter-spacing: 0.5px; display: flex; align-items: center; gap: 4px;">
+					${timeStr} ${isMe ? '<i class="fas fa-check" style="font-size: 8px; color: var(--ps-blue);"></i>' : ''}
+				</div>
 			</div>
 		`;
 		
@@ -5238,8 +5252,10 @@
 				if (box) {
 					box.innerHTML = '<div style="text-align: center; margin-bottom: 15px;"><span style="background: rgba(255,255,255,0.05); padding: 5px 15px; border-radius: 20px; font-size: 11px; color: var(--text-muted);">Welcome to the PSN Database Global Chat</span></div>';
 					
-					history.forEach(msg => {
-						appendMessageToChat(msg, false); 
+					history.forEach(data => {
+						const text = data.text || data;
+						const time = data.time || null;
+						appendMessageToChat(text, false, time);
 					});
 				}
 			});
@@ -5251,11 +5267,13 @@
 					const dot = document.getElementById('chat-dot');
 					if (dot) {
 						dot.style.display = 'block';
-						saveState('psn_chat_dot', 'true');
+						saveState('psn_chat_dot', 'true'); // Salva estado para o F5
 					}
 				}
-	
-				appendMessageToChat(msg, false);
+				const text = msg.text || msg;
+				const time = msg.time || null;
+
+				appendMessageToChat(text, false, time);
 				playUiHover(); 
 			});
 	
@@ -5285,18 +5303,17 @@
 		
 		if (msg !== '') {
 			socketChat.emit('chat_message', msg);
-			appendMessageToChat(msg, true);
+			// Renderiza localmente com a hora do dispositivo
+			appendMessageToChat(msg, true, null); 
 			input.value = '';
 			playUiSuccess(); 
 		}
 	}
 
-    document.addEventListener('keydown', function(e) {
-        if (e.target.id === 'chat-input' && (e.key === "Enter" || e.keyCode === 13)) {
-            sendChatMessage();
-        }
-    });
-	
+	document.addEventListener('DOMContentLoaded', () => {
+		initChat();
+	});
+
 	document.addEventListener('DOMContentLoaded', () => {
 		const chatDot = document.getElementById('chat-dot');
 		const hasPendingMessage = loadState('psn_chat_dot') === 'true';
@@ -5307,6 +5324,12 @@
 				chatDot.style.display = 'block';
 				chatDot.style.background = 'var(--ps-blue)'; 
 			}
+		}
+	});
+
+	document.addEventListener('keydown', function(e) {
+		if (e.target.id === 'chat-input' && (e.key === "Enter" || e.keyCode === 13)) {
+			sendChatMessage();
 		}
 	});
     </script>
