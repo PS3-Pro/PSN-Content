@@ -13,18 +13,18 @@ const io = new Server(server, {
 });
 
 io.on('connection', (socket) => {
-  console.log('Um usuário conectou: ' + socket.id);
+  console.log('User connected: ' + socket.id);
 
-  socket.on('mensagem_chat', (msg) => {
-    io.emit('mensagem_chat', msg); 
+  socket.on('chat_message', (msg) => {
+    io.emit('chat_message', msg); 
   });
 
   socket.on('disconnect', () => {
-    console.log('Usuário desconectou');
+    console.log('User disconnected');
   });
 });
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-  console.log(`Chat sever running in ${PORT}`);
+  console.log(`Chat server running on port ${PORT}`);
 });
