@@ -19,7 +19,7 @@ io.on('connection', (socket) => {
   socket.on('chat_message', (msg) => {
     messageHistory.push(msg);
 
-    if (messageHistory.length > 100) {
+    if (messageHistory.length > 500) {
       messageHistory.shift(); 
     }
 
