@@ -21,7 +21,8 @@ setInterval(() => {
 }, 840000);
 
 const io = new Server(server, {
-  cors: { origin: "*", methods: ["GET", "POST"] }
+  cors: { origin: "*", methods: ["GET", "POST"] },
+  maxHttpBufferSize: 5e6
 });
 
 let messageHistory = []; 
@@ -32,10 +33,20 @@ io.on('connection', (socket) => {
   socket.emit('chat_history', messageHistory);
 
   socket.on('chat_message', (msg) => {
-    const messageData = {
-      text: msg,
-      time: new Date().toISOString()
-    };
+    let messageData;
+
+    if (typeof msg === 'object' && msg !== null) {
+      messageData = {
+        ...msg,
+        time: new Date().toISOString()
+      };
+    } else {
+      messageData = {
+        type: 'text',
+        text: msg,
+        time: new Date().toISOString()
+      };
+    }
 
     messageHistory.push(messageData);
 
