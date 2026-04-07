@@ -5458,11 +5458,14 @@ function renderTrophiesView() {
 </script>
 <script>
     // ==========================================================================
-    // CHAT LOGIC - SYNCED VERSION (WITH IMAGE UPLOAD, PASTE & LIGHTBOX)
+    // CHAT LOGIC - SYNCED VERSION (WITH IMAGE UPLOAD, PASTE, LIGHTBOX & REPLIES)
     // ==========================================================================
     
     const socketRenderUrl = "https://psn-content.onrender.com"; 
     let socketChat;
+    
+    // --- NOVO: Variável global para armazenar a resposta atual ---
+    let currentReply = null;
     
     function playMessageSound() {
         const sound = document.getElementById('sound-ui-message');
@@ -5562,6 +5565,43 @@ function renderTrophiesView() {
         document.body.appendChild(overlay);
     }
     
+    // --- NOVO: Funções para gerenciar as Respostas ---
+    function setReply(user, text) {
+        if (typeof playUiClick === 'function') playUiClick();
+        
+        currentReply = { user, text: text || "Imagem" };
+        
+        let preview = document.getElementById('reply-preview');
+        const chatInput = document.getElementById('chat-input');
+        
+        if (!preview && chatInput) {
+            preview = document.createElement('div');
+            preview.id = 'reply-preview';
+            preview.style.cssText = "font-size: 12px; background: rgba(0, 0, 0, 0.3); padding: 8px 12px; border-radius: 8px; margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center; color: #fff; border-left: 3px solid var(--ps-blue); backdrop-filter: blur(5px); animation: fadeIn 0.2s ease-out;";
+            chatInput.parentNode.insertBefore(preview, chatInput);
+        }
+        
+        if (preview) {
+            preview.innerHTML = `
+                <div style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 90%;">
+                    <i class="fas fa-reply" style="color: var(--ps-blue); margin-right: 5px;"></i>
+                    Respondendo <b>${user}</b>: <span style="color: #aaa;">${currentReply.text}</span>
+                </div>
+                <button onclick="cancelReply()" style="background: none; border: none; color: #ff4444; cursor: pointer; font-weight: bold; font-size: 16px; padding: 0 5px;" title="Cancelar resposta">&times;</button>
+            `;
+        }
+        
+        if (chatInput) chatInput.focus();
+    }
+
+    function cancelReply() {
+        if (typeof playUiBackspace === 'function') playUiBackspace();
+        currentReply = null;
+        const preview = document.getElementById('reply-preview');
+        if (preview) preview.remove();
+    }
+    // -------------------------------------------------
+
     function appendMessageToChat(msg, isMe = false, timestamp = null) {
         const box = document.getElementById('chat-messages');
         if (!box) return;
@@ -5569,6 +5609,9 @@ function renderTrophiesView() {
         const messageText = (typeof msg === 'object' && msg.text) ? msg.text : (typeof msg === 'string' ? msg : "");
         const userName = (typeof msg === 'object' && msg.user) ? msg.user : (isMe ? localStorage.getItem('psn_username') : "Guest");
         const isImage = (typeof msg === 'object' && msg.type === 'image');
+        
+        // NOVO: Verifica se a mensagem tem uma resposta anexada
+        const replyData = (typeof msg === 'object' && msg.replyTo) ? msg.replyTo : null;
     
         const userAvatar = (typeof msg === 'object' && msg.avatar) 
             ? msg.avatar 
@@ -5587,6 +5630,21 @@ function renderTrophiesView() {
         const nameColor = isMe ? '#00bcff' : '#ffcc00';
     
         let contentHtml = '';
+        
+        // NOVO: Monta a UI da citação (resposta) dentro do balãozinho
+        if (replyData) {
+            contentHtml += `
+                <div style="background: rgba(0, 0, 0, 0.25); border-left: 3px solid ${nameColor}; padding: 6px 10px; margin-bottom: 8px; border-radius: 4px; font-size: 11px;">
+                    <div style="font-weight: bold; color: ${nameColor}; margin-bottom: 3px;">
+                        <i class="fas fa-reply" style="font-size: 9px;"></i> ${replyData.user}
+                    </div>
+                    <div style="color: #ddd; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 220px;">
+                        ${replyData.text}
+                    </div>
+                </div>
+            `;
+        }
+
         if (isImage) {
             contentHtml += `<img src="${msg.content}" style="max-width: 100%; max-height: 250px; border-radius: 6px; cursor: zoom-in; display: block; margin: 0 auto;" onclick="openImageModal(this.src)">`;
 
@@ -5594,7 +5652,7 @@ function renderTrophiesView() {
                 contentHtml += `<div style="margin-top: 10px; padding: 0 2px;">${messageText}</div>`;
             }
         } else {
-            contentHtml = messageText;
+            contentHtml += messageText;
         }
     
         const msgHtml = `
@@ -5613,8 +5671,17 @@ function renderTrophiesView() {
                         </div>
                     </div>
     
-                    <div style="font-size: 9px; color: var(--text-muted); margin-top: 5px; display: flex; align-items: center; gap: 4px;">
-                        ${timeStr} ${isMe ? '<i class="fas fa-check-double" style="font-size: 8px; color: var(--ps-blue);"></i>' : ''}
+                    <div style="font-size: 9px; color: var(--text-muted); margin-top: 5px; display: flex; align-items: center; gap: 8px;">
+                        <span>${timeStr}</span>
+                        ${isMe ? '<i class="fas fa-check-double" style="font-size: 8px; color: var(--ps-blue);"></i>' : ''}
+                        
+                        <i class="fas fa-reply" style="cursor: pointer; opacity: 0.6; transition: 0.2s;" title="Responder" 
+                           data-user="${userName}" 
+                           data-text="${messageText.replace(/"/g, '&quot;')}" 
+                           onclick="setReply(this.dataset.user, this.dataset.text)" 
+                           onmouseover="this.style.opacity='1'; this.style.color='var(--ps-blue)'" 
+                           onmouseout="this.style.opacity='0.6'; this.style.color=''">
+                        </i>
                     </div>
                 </div>
             </div>
@@ -5624,7 +5691,7 @@ function renderTrophiesView() {
         if (box.children.length > 1001) box.removeChild(box.children[1]);
         box.scrollTop = box.scrollHeight;
     }
-		
+        
     function initChat() {
         if (!socketChat) {
             socketChat = io(socketRenderUrl);
@@ -5729,24 +5796,28 @@ function renderTrophiesView() {
     }
     
     function sendChatMessage() {
-		if (!socketChat) return;
-		const input = document.getElementById('chat-input');
-		const msg = input.value.trim();
-		const myName = localStorage.getItem('psn_username') || "Guest";
-		
-		const myAvatar = localStorage.getItem(`${myName}_psn_avatar`) || AVAILABLE_AVATARS[0];
-	
-		if (msg !== '') {
-			const data = { text: msg, user: myName, avatar: myAvatar };
-			socketChat.emit('chat_message', data);
-			
-			saveState('psn_last_chat_read', Date.now().toString());
-			
-			appendMessageToChat(data, true, null); 
-			input.value = '';
-			if (typeof playUiSuccess === 'function') playUiSuccess(); 
-		}
-	}
+        if (!socketChat) return;
+        const input = document.getElementById('chat-input');
+        const msg = input.value.trim();
+        const myName = localStorage.getItem('psn_username') || "Guest";
+        
+        const myAvatar = localStorage.getItem(`${myName}_psn_avatar`) || AVAILABLE_AVATARS[0];
+    
+        if (msg !== '') {
+            // NOVO: Adiciona a resposta atual no objeto da mensagem
+            const data = { text: msg, user: myName, avatar: myAvatar, replyTo: currentReply };
+            socketChat.emit('chat_message', data);
+            
+            saveState('psn_last_chat_read', Date.now().toString());
+            
+            appendMessageToChat(data, true, null); 
+            input.value = '';
+            
+            cancelReply(); // NOVO: Limpa o campo de resposta depois de enviar
+            
+            if (typeof playUiSuccess === 'function') playUiSuccess(); 
+        }
+    }
     
     function jumpToBottom() {
         if (typeof playUiClick === 'function') playUiClick();
@@ -5774,33 +5845,37 @@ function renderTrophiesView() {
     });
 
     function processAndSendImage(file) {
-		if (!file) return;
-	
-		if (file.size > 2 * 1024 * 1024) {
-			alert("The image is too large! Please choose one up to 2MB.");
-			return;
-		}
-	
-		const reader = new FileReader();
-		reader.onload = function(e) {
-			const base64Image = e.target.result;
-			const myName = localStorage.getItem('psn_username') || "Guest";
-			
-			const myAvatar = localStorage.getItem(`${myName}_psn_avatar`) || AVAILABLE_AVATARS[0];
-			
-			const chatInput = document.getElementById('chat-input');
-			const currentText = chatInput ? chatInput.value.trim() : "";
-			
-			const msgData = { type: 'image', content: base64Image, text: currentText, user: myName, avatar: myAvatar }; 
-			
-			socketChat.emit('chat_message', msgData);
-			appendMessageToChat(msgData, true, null);
-			if (typeof playUiSuccess === 'function') playUiSuccess();
-			if (chatInput) chatInput.value = '';
-		};
-		reader.readAsDataURL(file);
-	}
-	
+        if (!file) return;
+    
+        if (file.size > 2 * 1024 * 1024) {
+            alert("The image is too large! Please choose one up to 2MB.");
+            return;
+        }
+    
+        const reader = new FileReader();
+        reader.onload = function(e) {
+            const base64Image = e.target.result;
+            const myName = localStorage.getItem('psn_username') || "Guest";
+            
+            const myAvatar = localStorage.getItem(`${myName}_psn_avatar`) || AVAILABLE_AVATARS[0];
+            
+            const chatInput = document.getElementById('chat-input');
+            const currentText = chatInput ? chatInput.value.trim() : "";
+            
+            // NOVO: Adiciona o replyTo também nas imagens
+            const msgData = { type: 'image', content: base64Image, text: currentText, user: myName, avatar: myAvatar, replyTo: currentReply }; 
+            
+            socketChat.emit('chat_message', msgData);
+            appendMessageToChat(msgData, true, null);
+            
+            cancelReply(); // NOVO: Limpa a resposta
+            
+            if (typeof playUiSuccess === 'function') playUiSuccess();
+            if (chatInput) chatInput.value = '';
+        };
+        reader.readAsDataURL(file);
+    }
+    
     function handleImageUpload(event) {
         const file = event.target.files[0];
         processAndSendImage(file);
@@ -5840,6 +5915,8 @@ function renderTrophiesView() {
                 sendChatMessage();
             } else if (e.key === "Backspace" || e.key === "Delete") {
                 if (typeof playUiBackspace === 'function') playUiBackspace();
+            } else if (e.key === "Escape") {
+                cancelReply(); // NOVO: Cancela a resposta apertando ESC
             } else if (e.key.length === 1) {
                 if (typeof playUiInput === 'function') playUiInput();
             }
