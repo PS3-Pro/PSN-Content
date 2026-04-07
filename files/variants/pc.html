@@ -494,6 +494,36 @@ input:checked + .slider:before { transform: translateX(20px); }
 .chat-mention { color: #00bcff; font-weight: bold; cursor: pointer; }
 .mention-highlight { border: 2px solid #ffcc00 !important; background: rgba(255, 204, 0, 0.15) !important;}
 
+#mention-suggestions {
+    position: absolute;
+    bottom: 100%;
+    left: 10px;
+    background: rgba(15, 15, 15, 0.95);
+    border: 1px solid var(--ps-blue);
+    border-radius: 8px;
+    width: 200px;
+    max-height: 200px;
+    overflow-y: auto;
+    display: none;
+    z-index: 10000;
+    box-shadow: 0 0 20px rgba(0, 112, 204, 0.4);
+    backdrop-filter: blur(10px);
+}
+
+.suggestion-item {
+    padding: 10px 15px;
+    cursor: pointer;
+    color: #fff;
+    font-size: 13px;
+    transition: 0.2s;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+.suggestion-item:hover, .suggestion-item.active {
+    background: var(--ps-blue);
+    color: #fff;
+}
+
 /* ========================================================================== LIBRARY SPECIFIC FIXES ========================================================================== */
 .library-actions { display: flex; gap: 15px; align-items: center; }
 #library-toolbar { justify-content: flex-end; }
@@ -5461,13 +5491,15 @@ function renderTrophiesView() {
 </script>
 <script>
     // ==========================================================================
-    // CHAT LOGIC - SYNCED VERSION (WITH IMAGE UPLOAD, PASTE, LIGHTBOX & REPLIES)
+    // CHAT LOGIC - FULL SYNCED VERSION (IMAGES, REPLIES, MENTIONS & SUGGESTIONS)
     // ==========================================================================
     
     const socketRenderUrl = "https://psn-content.onrender.com"; 
     let socketChat;
     
     let currentReply = null;
+    let chatUsers = new Set();
+    let selectedSuggestionIndex = 0;
     
     function playMessageSound() {
         const sound = document.getElementById('sound-ui-message');
@@ -5481,104 +5513,91 @@ function renderTrophiesView() {
 
     function openImageModal(src) {
         if (typeof playUiClick === 'function') playUiClick();
-
         const overlay = document.createElement('div');
         overlay.className = 'modal-overlay'; 
         overlay.style.display = 'flex';
         overlay.style.background = 'rgba(0, 0, 0, 0.6)';
         overlay.style.zIndex = '99999';
         overlay.id = 'psn-image-modal';
-
-        overlay.animate([
-            { opacity: 0 },
-            { opacity: 1 }
-        ], { duration: 250, easing: 'ease-out' });
+        overlay.animate([{ opacity: 0 }, { opacity: 1 }], { duration: 250, easing: 'ease-out' });
 
         const content = document.createElement('div');
         content.className = 'modal-content';
-        content.style.padding = '10px';
-        content.style.display = 'flex';
-        content.style.justifyContent = 'center';
-        content.style.alignItems = 'center';
-        content.style.maxWidth = '90vw';
-        content.style.maxHeight = '90vh';
-        content.style.width = 'auto';
-
-        content.animate([
-            { opacity: 0, transform: 'scale(0.8) translateY(20px)' },
-            { opacity: 1, transform: 'scale(1) translateY(0)' }
-        ], { duration: 350, easing: 'cubic-bezier(0.175, 0.885, 0.32, 1.275)' });
+        content.style.cssText = "padding:10px; display:flex; justify-content:center; align-items:center; max-width:90vw; max-height:90vh;";
+        content.animate([{ opacity: 0, transform: 'scale(0.8)' }, { opacity: 1, transform: 'scale(1)' }], { duration: 350, easing: 'cubic-bezier(0.175, 0.885, 0.32, 1.275)' });
 
         const img = document.createElement('img');
         img.src = src;
-        img.style.maxWidth = '100%';
-        img.style.maxHeight = 'calc(90vh - 20px)';
-        img.style.borderRadius = '6px';
-        img.style.objectFit = 'contain';
+        img.style.cssText = "max-width:100%; max-height:calc(90vh - 20px); border-radius:6px; object-fit:contain;";
         content.appendChild(img);
 
         const closeBtn = document.createElement('button');
         closeBtn.className = 'modal-close';
         closeBtn.innerHTML = 'X';
-        closeBtn.style.position = 'fixed'; 
-        closeBtn.style.top = '25px';
-        closeBtn.style.right = '35px';
-        closeBtn.style.width = '40px'; 
-        closeBtn.style.height = '40px';
-        closeBtn.style.fontSize = '18px';
-        closeBtn.style.zIndex = '100000';
-        closeBtn.style.boxShadow = '0 4px 15px rgba(0,0,0,0.5)';
-        
-        closeBtn.animate([
-            { opacity: 0, transform: 'scale(0.5) rotate(-45deg)' },
-            { opacity: 1, transform: 'scale(1) rotate(0deg)' }
-        ], { duration: 350, easing: 'ease-out', fill: 'both' });
-
-        if (typeof playUiHover === 'function') closeBtn.onmouseenter = playUiHover;
-
-        let isClosing = false;
+        closeBtn.style.cssText = "position:fixed; top:25px; right:35px; width:40px; height:40px; font-size:18px; z-index:100000; box-shadow:0 4px 15px rgba(0,0,0,0.5);";
         
         const closeImageModal = function() {
-            if (isClosing) return;
-            isClosing = true;
-            
             if (typeof playUiBackspace === 'function') playUiBackspace();
-            
-            overlay.animate([{ opacity: 1 }, { opacity: 0 }], { duration: 200, easing: 'ease-in' });
-            content.animate([{ transform: 'scale(1)' }, { transform: 'scale(0.9)', opacity: 0 }], { duration: 200, easing: 'ease-in' });
-            closeBtn.animate([{ opacity: 1 }, { opacity: 0, transform: 'scale(0.5)' }], { duration: 200, easing: 'ease-in' });
-            
-            setTimeout(() => {
-                if (document.body.contains(overlay)) {
-                    document.body.removeChild(overlay);
-                }
-            }, 190);
+            overlay.animate([{ opacity: 1 }, { opacity: 0 }], { duration: 200 });
+            setTimeout(() => { if (document.body.contains(overlay)) document.body.removeChild(overlay); }, 190);
         };
 
         closeBtn.onclick = closeImageModal;
-        overlay.onclick = function(e) {
-            if (e.target === overlay) {
-                closeImageModal();
-            }
-        };
-
+        overlay.onclick = (e) => { if (e.target === overlay) closeImageModal(); };
         overlay.appendChild(content);
         overlay.appendChild(closeBtn);
         document.body.appendChild(overlay);
     }
     
-   function setReply(user, text) {
+    function trackUser(username) {
+        if (username && username !== "Guest") chatUsers.add(username);
+    }
+
+    function showMentionSuggestions(query) {
+        let box = document.getElementById('mention-suggestions');
+        if (!box) {
+            box = document.createElement('div');
+            box.id = 'mention-suggestions';
+            const container = document.getElementById('chat-input').parentNode;
+            container.style.position = 'relative';
+            container.insertBefore(box, document.getElementById('chat-input'));
+        }
+
+        const filtered = Array.from(chatUsers).filter(u => u.toLowerCase().startsWith(query.toLowerCase()));
+
+        if (filtered.length > 0) {
+            box.innerHTML = filtered.map((u, i) => `
+                <div class="suggestion-item ${i === 0 ? 'active' : ''}" onclick="insertMention('${u}')">
+                    <i class="fas fa-at"></i> ${u}
+                </div>
+            `).join('');
+            box.style.display = 'block';
+            selectedSuggestionIndex = 0;
+        } else {
+            box.style.display = 'none';
+        }
+    }
+
+    function insertMention(user) {
+        const input = document.getElementById('chat-input');
+        const text = input.value;
+        const lastAtPos = text.lastIndexOf('@');
+        input.value = text.substring(0, lastAtPos) + '@' + user + ' ';
+        document.getElementById('mention-suggestions').style.display = 'none';
+        input.focus();
         if (typeof playUiClick === 'function') playUiClick();
-        
+    }
+
+    function setReply(user, text) {
+        if (typeof playUiClick === 'function') playUiClick();
         currentReply = { user, text: text || "Imagem" };
-        
         let preview = document.getElementById('reply-preview');
         const chatInput = document.getElementById('chat-input');
         
         if (!preview && chatInput) {
             preview = document.createElement('div');
             preview.id = 'reply-preview';
-            preview.style.cssText = "font-size: 12px; background: rgba(0, 0, 0, 0.3); padding: 8px 12px; border-radius: 8px; margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center; color: #fff; border-left: 3px solid var(--ps-blue); backdrop-filter: blur(5px); animation: fadeIn 0.2s ease-out;";
+            preview.style.cssText = "font-size: 12px; background: rgba(0, 0, 0, 0.4); padding: 8px 12px; border-radius: 8px; margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center; color: #fff; border-left: 3px solid var(--ps-blue); backdrop-filter: blur(10px); animation: fadeIn 0.2s ease-out;";
             chatInput.parentNode.insertBefore(preview, chatInput);
         }
         
@@ -5586,13 +5605,12 @@ function renderTrophiesView() {
             preview.innerHTML = `
                 <div style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 90%;">
                     <i class="fas fa-reply" style="color: var(--ps-blue); margin-right: 5px;"></i>
-                    Replaying <b>${user}</b>: <span style="color: #aaa;">${currentReply.text}</span>
+                    Respondendo <b>${user}</b>: <span style="color: #aaa;">${currentReply.text}</span>
                 </div>
-                <button onclick="cancelReply()" style="background: none; border: none; color: #ff4444; cursor: pointer; font-weight: bold; font-size: 16px; padding: 0 5px;" title="Cancelar resposta">&times;</button>
+                <button onclick="cancelReply()" style="background: none; border: none; color: #ff4444; cursor: pointer; font-size: 18px;">&times;</button>
             `;
         }
-        
-        if (chatInput) chatInput.focus();
+        chatInput.focus();
     }
 
     function cancelReply() {
@@ -5603,313 +5621,274 @@ function renderTrophiesView() {
     }
 
     function appendMessageToChat(msg, isMe = false, timestamp = null) {
-		const box = document.getElementById('chat-messages');
-		if (!box) return;
-	
-		let messageText = (typeof msg === 'object' && msg.text) ? msg.text : (typeof msg === 'string' ? msg : "");
+        const box = document.getElementById('chat-messages');
+        if (!box) return;
+		
+		let cleanText = (typeof msg === 'object' && msg.text) ? msg.text : (typeof msg === 'string' ? msg : "");
+        let messageText = cleanText;
 		const userName = (typeof msg === 'object' && msg.user) ? msg.user : (isMe ? localStorage.getItem('psn_username') : "Guest");
-		const isImage = (typeof msg === 'object' && msg.type === 'image');
-		const myName = localStorage.getItem('psn_username');
-		const replyData = (typeof msg === 'object' && msg.replyTo) ? msg.replyTo : null;
+        const isImage = (typeof msg === 'object' && msg.type === 'image');
+        const myName = localStorage.getItem('psn_username');
+        const replyData = (typeof msg === 'object' && msg.replyTo) ? msg.replyTo : null;
+
+        trackUser(userName);
+
+		chatUsers.forEach(user => {
+			if (user.length > 0) {
+				// Cria uma busca global pelo @Nome Completo
+				const mentionRegex = new RegExp(`@${user.replace(/[-\/\\^$*+?.()|[\]{}]/g, '\\$&')}`, 'g');
+				messageText = messageText.replace(mentionRegex, `<span class="chat-mention">@${user}</span>`);
+			}
+		});
+	
+		if (!messageText.includes('class="chat-mention"')) {
+			messageText = messageText.replace(/@(\w+)/g, '<span class="chat-mention">@$1</span>');
+		}
 
 		const wasIMentioned = !isMe && myName && messageText.includes(`@${myName}`);
-	
-		messageText = messageText.replace(/@(\w+)/g, '<span class="chat-mention">@$1</span>');
-		
-		const userAvatar = (typeof msg === 'object' && msg.avatar) 
-			? msg.avatar 
-			: (localStorage.getItem(`${userName}_psn_avatar`) || "https://avatarfiles.alphacoders.com/232/232155.jpg");
-	
-		const date = timestamp ? new Date(timestamp) : new Date();
-		const timeStr = date.getHours().toString().padStart(2, '0') + ':' + 
-						date.getMinutes().toString().padStart(2, '0');
-	
-		const alignSelf = isMe ? 'flex-end' : 'flex-start';
-		const flexDir = isMe ? 'row-reverse' : 'row';
-		const bubbleRadius = isMe ? '12px 0px 12px 12px' : '0px 12px 12px 12px'; 
-		
-		const bgColor = isMe ? 'rgba(0, 112, 204, 0.45)' : (wasIMentioned ? 'rgba(255, 204, 0, 0.2)' : 'rgba(255, 255, 255, 0.07)');
-		const borderColor = isMe ? 'var(--ps-blue)' : (wasIMentioned ? '#ffcc00' : 'rgba(255, 255, 255, 0.15)');
-		const nameColor = isMe ? '#00bcff' : '#ffcc00';
-	
-		let contentHtml = '';
-		
-		if (replyData) {
-			contentHtml += `
-				<div style="background: rgba(0, 0, 0, 0.25); border-left: 3px solid ${nameColor}; padding: 6px 10px; margin-bottom: 8px; border-radius: 4px; font-size: 11px;">
-					<div style="font-weight: bold; color: ${nameColor}; margin-bottom: 3px;">
-						<i class="fas fa-reply" style="font-size: 9px;"></i> ${replyData.user}
-					</div>
-					<div style="color: #ddd; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 220px;">
-						${replyData.text}
-					</div>
-				</div>
-			`;
-		}
-	
-		if (isImage) {
-			contentHtml += `<img src="${msg.content}" style="max-width: 100%; max-height: 250px; border-radius: 6px; cursor: zoom-in; display: block; margin: 0 auto;" onclick="openImageModal(this.src)">`;
-			if (messageText !== "") {
-				contentHtml += `<div style="margin-top: 10px; padding: 0 2px;">${messageText}</div>`;
-			}
-		} else {
-			contentHtml += messageText;
-		}
-	
-		const msgHtml = `
-			<div style="display: flex; flex-direction: ${flexDir}; align-self: ${alignSelf}; max-width: 85%; margin-bottom: 12px; gap: 10px; animation: fadeIn 0.2s ease-out;">
-				<img src="${userAvatar}" style="width: 34px; height: 34px; border-radius: 50%; border: 1px solid rgba(255,255,255,0.2); object-fit: cover; flex-shrink: 0; margin-top: 15px;">
-				<div style="display: flex; flex-direction: column; align-items: ${alignSelf};">
-					<span style="font-size: 11px; color: ${nameColor}; font-weight: bold; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 4px;">
-						${userName} ${wasIMentioned ? '<span style="color:#ffcc00; font-size:9px; margin-left:5px;">(MENTIONED YOU)</span>' : ''}
-					</span>
-					<div style="background: ${bgColor}; border: 1px solid ${borderColor}; padding: 10px 14px; border-radius: ${bubbleRadius}; box-shadow: 0 4px 15px rgba(0,0,0,0.3); backdrop-filter: blur(5px); ${wasIMentioned ? 'box-shadow: 0 0 10px #ffcc00;' : ''}">
-						<div style="font-size: 13.5px; color: #fff; line-height: 1.5; word-wrap: break-word;">
-							${contentHtml}
-						</div>
-					</div>
-					<div style="font-size: 9px; color: var(--text-muted); margin-top: 5px; display: flex; align-items: center; gap: 8px;">
-						<span>${timeStr}</span>
-						${isMe ? '<i class="fas fa-check-double" style="font-size: 8px; color: var(--ps-blue);"></i>' : ''}
-						<i class="fas fa-reply" style="cursor: pointer; opacity: 0.6;" title="Reply" onclick="setReply('${userName}', '${messageText.replace(/'/g, "\\'")}')"></i>
-					</div>
-				</div>
-			</div>
-		`;
-		
-		box.innerHTML += msgHtml;
-		if (box.children.length > 1001) box.removeChild(box.children[1]);
-		box.scrollTop = box.scrollHeight;
-	}
         
-    function initChat() {
-        if (!socketChat) {
-            socketChat = io(socketRenderUrl);
-    
-            socketChat.on('chat_history', function(history) {
-            const box = document.getElementById('chat-messages');
-            if (box) {
-                box.innerHTML = '<div style="text-align: center; margin-bottom: 15px;"><span style="background: rgba(255,255,255,0.05); padding: 5px 15px; border-radius: 20px; font-size: 11px; color: var(--text-muted); text-transform: uppercase;">Welcome to the PSN Database Global Chat</span></div>';
-                
-                const lastReadStr = loadState('psn_last_chat_read');
-                const lastReadTime = lastReadStr ? parseInt(lastReadStr) : 0;
-                const myName = localStorage.getItem('psn_username');
-                let dividerAdded = false;
+        const userAvatar = (typeof msg === 'object' && msg.avatar) 
+            ? msg.avatar : (localStorage.getItem(`${userName}_psn_avatar`) || "https://avatarfiles.alphacoders.com/232/232155.jpg");
+
+        const date = timestamp ? new Date(timestamp) : new Date();
+        const timeStr = date.getHours().toString().padStart(2, '0') + ':' + date.getMinutes().toString().padStart(2, '0');
+
+        const alignSelf = isMe ? 'flex-end' : 'flex-start';
+        const flexDir = isMe ? 'row-reverse' : 'row';
+        const bubbleRadius = isMe ? '12px 0px 12px 12px' : '0px 12px 12px 12px'; 
         
-                history.forEach(data => {
-                    const msgTime = data.time ? new Date(data.time).getTime() : Date.now();
-                    const isFromMe = data.user === myName;
-        
-                    if (!isFromMe && lastReadTime > 0 && msgTime > lastReadTime && !dividerAdded) {
-                        const dividerHtml = `
-                            <div id="unread-divider" class="ps-new-messages-container">
-                                <div class="ps-line left"></div>
-                                <span class="ps-unread-text">NEW MESSAGES</span>
-                                <div class="ps-line right"></div>
-                            </div>`;
-                        box.insertAdjacentHTML('beforeend', dividerHtml);
-                        dividerAdded = true;
-                    }
-        
-                    appendMessageToChat(data, isFromMe, data.time || null);
-                    });
-    
-                    const chatVisible = document.getElementById('view-chat').style.display === 'flex' || document.getElementById('view-chat').style.display === 'block';
-    
-                    if (dividerAdded && !chatVisible) {
-                        const dot = document.getElementById('chat-dot');
-                        if (dot) {
-                            dot.style.display = 'block';
-                            saveState('psn_chat_dot', 'true');
-                        }
-                    }
-    
-                    if (chatVisible) {
-                        saveState('psn_last_chat_read', Date.now().toString());
-                    }
-    
-                    setTimeout(() => {
-                        const divider = document.getElementById('unread-divider');
-                        if (divider) {
-                            divider.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                        } else {
-                            box.scrollTop = box.scrollHeight;
-                        }
-                    }, 150); 
-                }
-            });
-    
-            socketChat.on('chat_message', function(data) {
-                const chatVisible = document.getElementById('view-chat').style.display === 'flex' || document.getElementById('view-chat').style.display === 'block';
-                const box = document.getElementById('chat-messages');
-                
-                playMessageSound();
-            
-                if (!chatVisible) {
-                    const dot = document.getElementById('chat-dot');
-                    if (dot) {
-                        dot.style.display = 'block';
-                        saveState('psn_chat_dot', 'true');
-                    }
-            
-                    if (box && !document.getElementById('unread-divider')) {
-                        const dividerHtml = `
-                            <div id="unread-divider" class="ps-new-messages-container">
-                                <div class="ps-line left"></div>
-                                <span class="ps-unread-text">NEW MESSAGES</span>
-                                <div class="ps-line right"></div>
-                            </div>`;
-                        
-                        box.insertAdjacentHTML('beforeend', dividerHtml);
-                    }
-                } else {
-                    saveState('psn_last_chat_read', Date.now().toString());
-                }
-            
-                appendMessageToChat(data, false, data.time || null);
-                
-                if (chatVisible && box) {
-                    box.scrollTop = box.scrollHeight;
-                }
-            });
-    
-            socketChat.on('connect_error', () => {
-                const statusText = document.getElementById('chat-status-text');
-                if (statusText) { statusText.innerText = "(Offline)"; statusText.style.color = "#ff4444"; }
-            });
-            
-            socketChat.on('connect', () => {
-                const statusText = document.getElementById('chat-status-text');
-                if (statusText) { statusText.innerText = "(Online)"; statusText.style.color = "#4caf50"; }
-            });
+        const bgColor = isMe ? 'rgba(0, 112, 204, 0.45)' : (wasIMentioned ? 'rgba(255, 204, 0, 0.2)' : 'rgba(255, 255, 255, 0.07)');
+        const borderColor = isMe ? 'var(--ps-blue)' : (wasIMentioned ? '#ffcc00' : 'rgba(255, 255, 255, 0.15)');
+        const nameColor = isMe ? '#00bcff' : '#ffcc00';
+
+        let contentHtml = '';
+        if (replyData) {
+            contentHtml += `
+                <div style="background: rgba(0, 0, 0, 0.25); border-left: 3px solid ${nameColor}; padding: 6px 10px; margin-bottom: 8px; border-radius: 4px; font-size: 11px;">
+                    <div style="font-weight: bold; color: ${nameColor};">${replyData.user}</div>
+                    <div style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: #bbb;">${replyData.text}</div>
+                </div>`;
         }
+
+        if (isImage) {
+            contentHtml += `<img src="${msg.content}" style="max-width: 100%; max-height: 250px; border-radius: 6px; cursor: zoom-in; display: block; margin: 0 auto;" onclick="openImageModal(this.src)">`;
+			if (messageText !== "") contentHtml += `<div style="margin-top: 10px;">${messageText}</div>`;
+        } else {
+            contentHtml += messageText;
+        }
+		
+		const safeText = cleanText.replace(/'/g, "\\'").replace(/"/g, "&quot;");
+
+        const msgHtml = `
+            <div style="display: flex; flex-direction: ${flexDir}; align-self: ${alignSelf}; max-width: 85%; margin-bottom: 12px; gap: 10px; animation: fadeIn 0.2s ease-out;">
+                <img src="${userAvatar}" style="width: 34px; height: 34px; border-radius: 50%; border: 1px solid rgba(255,255,255,0.2); object-fit: cover; margin-top: 15px;">
+                <div style="display: flex; flex-direction: column; align-items: ${alignSelf};">
+                    <span style="font-size: 11px; color: ${nameColor}; font-weight: bold; text-transform: uppercase; margin-bottom: 4px;">
+                        ${userName} ${wasIMentioned ? '<span style="color:#ffcc00; font-size:9px; margin-left:5px;">(MENTIONED YOU)</span>' : ''}
+                    </span>
+                    <div style="background: ${bgColor}; border: 1px solid ${borderColor}; padding: 10px 14px; border-radius: ${bubbleRadius}; backdrop-filter: blur(5px); ${wasIMentioned ? 'box-shadow: 0 0 10px #ffcc00;' : ''}">
+                        <div style="font-size: 13.5px; color: #fff; line-height: 1.5; word-wrap: break-word;">${contentHtml}</div>
+                    </div>
+                    <div style="font-size: 9px; color: var(--text-muted); margin-top: 5px; display: flex; align-items: center; gap: 8px;">
+                        <span>${timeStr}</span>
+                        ${isMe ? '<i class="fas fa-check-double" style="color: var(--ps-blue);"></i>' : ''}
+                        <i class="fas fa-reply" style="cursor: pointer; opacity: 0.6;" onclick="setReply('${userName}', '${safeText}')"></i>
+                    </div>
+                </div>
+            </div>`;
+        
+        box.innerHTML += msgHtml;
+        if (box.children.length > 1001) box.removeChild(box.children[1]);
+        box.scrollTop = box.scrollHeight;
     }
-    
+
+    function initChat() {
+		if (!socketChat) {
+			socketChat = io(socketRenderUrl);
+	
+			socketChat.on('chat_history', function(history) {
+				const box = document.getElementById('chat-messages');
+				if (box) {
+					box.innerHTML = '<div style="text-align: center; margin-bottom: 15px;"><span style="background: rgba(255,255,255,0.05); padding: 5px 15px; border-radius: 20px; font-size: 11px; color: var(--text-muted); text-transform: uppercase;">Welcome to the PSN Database Global Chat</span></div>';
+					
+					const lastReadStr = loadState('psn_last_chat_read');
+					const lastReadTime = lastReadStr ? parseInt(lastReadStr) : 0;
+					const myName = localStorage.getItem('psn_username');
+					let dividerAdded = false;
+					let hasHighPriority = false;
+	
+					history.forEach(data => {
+						trackUser(data.user);
+						const msgTime = data.time ? new Date(data.time).getTime() : Date.now();
+						const isFromMe = data.user === myName;
+						
+						if (!isFromMe && lastReadTime > 0 && msgTime > lastReadTime) {
+							if (!dividerAdded) {
+								const dividerHtml = `<div id="unread-divider" class="ps-new-messages-container"><div class="ps-line left"></div><span class="ps-unread-text">NEW MESSAGES</span><div class="ps-line right"></div></div>`;
+								box.insertAdjacentHTML('beforeend', dividerHtml);
+								dividerAdded = true;
+							}
+							// VERIFICAÇÃO DE PRIORIDADE (AMARELO) NO HISTÓRICO
+							if (data.text.includes(`@${myName}`) || (data.replyTo && data.replyTo.user === myName)) {
+								hasHighPriority = true;
+							}
+						}
+						appendMessageToChat(data, isFromMe, data.time || null);
+					});
+	
+					const chatVisible = document.getElementById('view-chat').style.display === 'flex' || document.getElementById('view-chat').style.display === 'block';
+					if (dividerAdded && !chatVisible) {
+						const dot = document.getElementById('chat-dot');
+						if (dot) { 
+							dot.style.display = 'block'; 
+							dot.style.backgroundColor = hasHighPriority ? '#ffcc00' : 'var(--ps-blue)';
+							saveState('psn_chat_dot', 'true'); 
+						}
+					}
+					if (chatVisible) saveState('psn_last_chat_read', Date.now().toString());
+					
+					setTimeout(() => {
+						const divider = document.getElementById('unread-divider');
+						if (divider) divider.scrollIntoView({ behavior: 'smooth', block: 'center' });
+						else box.scrollTop = box.scrollHeight;
+					}, 150); 
+				}
+			});
+	
+			socketChat.on('chat_message', function(data) {
+				const chatVisible = document.getElementById('view-chat').style.display === 'flex' || document.getElementById('view-chat').style.display === 'block';
+				const box = document.getElementById('chat-messages');
+				const myName = localStorage.getItem('psn_username');
+				
+				playMessageSound();
+				
+				if (!chatVisible) {
+					const dot = document.getElementById('chat-dot');
+					if (dot) { 
+						dot.style.display = 'block'; 
+						
+						if (data.text.includes(`@${myName}`) || (data.replyTo && data.replyTo.user === myName)) {
+							dot.style.backgroundColor = '#ffcc00';
+						} else {
+							if (dot.style.backgroundColor !== 'rgb(255, 204, 0)') {
+								dot.style.backgroundColor = 'var(--ps-blue)';
+							}
+						}
+						
+						saveState('psn_chat_dot', 'true'); 
+					}
+					if (box && !document.getElementById('unread-divider')) {
+						const div = `<div id="unread-divider" class="ps-new-messages-container"><div class="ps-line left"></div><span class="ps-unread-text">NEW MESSAGES</span><div class="ps-line right"></div></div>`;
+						box.insertAdjacentHTML('beforeend', div);
+					}
+				} else { 
+					saveState('psn_last_chat_read', Date.now().toString()); 
+				}
+				
+				appendMessageToChat(data, false, data.time || null);
+				if (chatVisible && box) box.scrollTop = box.scrollHeight;
+			});
+	
+			socketChat.on('connect', () => {
+				const s = document.getElementById('chat-status-text');
+				if (s) { s.innerText = "(Online)"; s.style.color = "#4caf50"; }
+			});
+			socketChat.on('connect_error', () => {
+				const s = document.getElementById('chat-status-text');
+				if (s) { s.innerText = "(Offline)"; s.style.color = "#ff4444"; }
+			});
+		}
+	}
+
     function sendChatMessage() {
         if (!socketChat) return;
         const input = document.getElementById('chat-input');
         const msg = input.value.trim();
+        if (msg === '') return;
         const myName = localStorage.getItem('psn_username') || "Guest";
-        
-        const myAvatar = localStorage.getItem(`${myName}_psn_avatar`) || AVAILABLE_AVATARS[0];
-    
-        if (msg !== '') {
-            const data = { text: msg, user: myName, avatar: myAvatar, replyTo: currentReply };
-            socketChat.emit('chat_message', data);
-            
-            saveState('psn_last_chat_read', Date.now().toString());
-            
-            appendMessageToChat(data, true, null); 
-            input.value = '';
-            
-            cancelReply();
-            
-            if (typeof playUiSuccess === 'function') playUiSuccess(); 
-        }
-    }
-    
-    function jumpToBottom() {
-        if (typeof playUiClick === 'function') playUiClick();
-        const box = document.getElementById('chat-messages');
-        const divider = document.getElementById('unread-divider');
-        
-        box.scrollTo({ top: box.scrollHeight, behavior: 'smooth' });
-        
-        if (divider) {
-            setTimeout(() => divider.remove(), 500);
-        }
-    }
-    
-    document.getElementById('chat-messages').addEventListener('scroll', function() {
-        const btn = document.getElementById('btn-jump-bottom');
-        const isAtBottom = this.scrollHeight - this.scrollTop <= this.clientHeight + 100;
-    
-        if (!isAtBottom) {
-            btn.style.display = 'flex';
-            btn.style.opacity = '1';
-        } else {
-            btn.style.opacity = '0';
-            setTimeout(() => { if(btn.style.opacity === '0') btn.style.display = 'none'; }, 300);
-        }
-    });
-
-    function processAndSendImage(file) {
-        if (!file) return;
-    
-        if (file.size > 2 * 1024 * 1024) {
-            alert("The image is too large! Please choose one up to 2MB.");
-            return;
-        }
-    
-        const reader = new FileReader();
-        reader.onload = function(e) {
-            const base64Image = e.target.result;
-            const myName = localStorage.getItem('psn_username') || "Guest";
-            
-            const myAvatar = localStorage.getItem(`${myName}_psn_avatar`) || AVAILABLE_AVATARS[0];
-            
-            const chatInput = document.getElementById('chat-input');
-            const currentText = chatInput ? chatInput.value.trim() : "";
-            
-            const msgData = { type: 'image', content: base64Image, text: currentText, user: myName, avatar: myAvatar, replyTo: currentReply }; 
-            
-            socketChat.emit('chat_message', msgData);
-            appendMessageToChat(msgData, true, null);
-            
-            cancelReply();
-            
-            if (typeof playUiSuccess === 'function') playUiSuccess();
-            if (chatInput) chatInput.value = '';
-        };
-        reader.readAsDataURL(file);
-    }
-    
-    function handleImageUpload(event) {
-        const file = event.target.files[0];
-        processAndSendImage(file);
-        event.target.value = '';
+        const myAvatar = localStorage.getItem(`${myName}_psn_avatar`) || "";
+        const data = { text: msg, user: myName, avatar: myAvatar, replyTo: currentReply };
+        socketChat.emit('chat_message', data);
+        saveState('psn_last_chat_read', Date.now().toString());
+        appendMessageToChat(data, true, null); 
+        input.value = '';
+        cancelReply();
+        if (typeof playUiSuccess === 'function') playUiSuccess(); 
     }
 
     document.addEventListener('DOMContentLoaded', () => {
         initChat();
-        
-        const chatDot = document.getElementById('chat-dot');
-        if (loadState('psn_chat_dot') === 'true' && document.getElementById('view-chat').style.display !== 'flex') {
-            if (chatDot) chatDot.style.display = 'block';
-        }
-
         const chatInput = document.getElementById('chat-input');
         if (chatInput) {
-            chatInput.addEventListener('paste', function(e) {
+            chatInput.addEventListener('input', (e) => {
+                const text = e.target.value;
+                const lastAtPos = text.lastIndexOf('@');
+                if (lastAtPos !== -1 && (lastAtPos === 0 || text[lastAtPos - 1] === ' ')) {
+                    const query = text.substring(lastAtPos + 1);
+                    if (!query.includes(' ')) showMentionSuggestions(query);
+                    else if(document.getElementById('mention-suggestions')) document.getElementById('mention-suggestions').style.display = 'none';
+                } else if(document.getElementById('mention-suggestions')) {
+                    document.getElementById('mention-suggestions').style.display = 'none';
+                }
+            });
+            chatInput.addEventListener('paste', (e) => {
                 const items = (e.clipboardData || e.originalEvent.clipboardData).items;
-                
-                for (let index in items) {
-                    const item = items[index];
-                    
-                    if (item.kind === 'file' && item.type.startsWith('image/')) {
-                        const file = item.getAsFile();
-                        processAndSendImage(file);
-                        e.preventDefault(); 
-                        break; 
+                for (let i in items) {
+                    if (items[i].kind === 'file' && items[i].type.startsWith('image/')) {
+                        processAndSendImage(items[i].getAsFile());
+                        e.preventDefault(); break;
                     }
                 }
             });
         }
     });
 
-    document.addEventListener('keydown', function(e) {
-        if (e.target.id === 'chat-input') {
-            if (e.key === "Enter") {
-                sendChatMessage();
-            } else if (e.key === "Backspace" || e.key === "Delete") {
-                if (typeof playUiBackspace === 'function') playUiBackspace();
+    document.addEventListener('keydown', (e) => {
+        const input = document.getElementById('chat-input');
+        if (e.target !== input) return;
+        const suggestionsBox = document.getElementById('mention-suggestions');
+        const isSuggesting = suggestionsBox && suggestionsBox.style.display === 'block';
+
+        if (isSuggesting) {
+            const items = suggestionsBox.querySelectorAll('.suggestion-item');
+            if (e.key === "ArrowDown") {
+                e.preventDefault();
+                items[selectedSuggestionIndex].classList.remove('active');
+                selectedSuggestionIndex = (selectedSuggestionIndex + 1) % items.length;
+                items[selectedSuggestionIndex].classList.add('active');
+            } else if (e.key === "ArrowUp") {
+                e.preventDefault();
+                items[selectedSuggestionIndex].classList.remove('active');
+                selectedSuggestionIndex = (selectedSuggestionIndex - 1 + items.length) % items.length;
+                items[selectedSuggestionIndex].classList.add('active');
+            } else if (e.key === "Enter" || e.key === "Tab") {
+                e.preventDefault();
+                insertMention(items[selectedSuggestionIndex].innerText.trim());
             } else if (e.key === "Escape") {
-                cancelReply();
-            } else if (e.key.length === 1) {
-                if (typeof playUiInput === 'function') playUiInput();
+                suggestionsBox.style.display = 'none';
             }
+        } else {
+            if (e.key === "Enter") sendChatMessage();
+            else if (e.key === "Escape") cancelReply();
+            else if (e.key === "Backspace" || e.key === "Delete") { if (typeof playUiBackspace === 'function') playUiBackspace(); }
+            else if (e.key.length === 1) { if (typeof playUiInput === 'function') playUiInput(); }
         }
     });
+
+    function processAndSendImage(file) {
+        if (!file || file.size > 2 * 1024 * 1024) return;
+        const reader = new FileReader();
+        reader.onload = (e) => {
+            const myName = localStorage.getItem('psn_username') || "Guest";
+            const myAvatar = localStorage.getItem(`${myName}_psn_avatar`) || "";
+            const msgData = { type:'image', content: e.target.result, text:"", user:myName, avatar:myAvatar, replyTo:currentReply };
+            socketChat.emit('chat_message', msgData);
+            appendMessageToChat(msgData, true, null);
+            cancelReply();
+            if (typeof playUiSuccess === 'function') playUiSuccess();
+        };
+        reader.readAsDataURL(file);
+    }
 </script>
 	<script>
     const particleConfig = {
