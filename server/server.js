@@ -31,6 +31,27 @@ io.on('connection', (socket) => {
   console.log('User connected: ' + socket.id);
 
   socket.emit('chat_history', messageHistory);
+  socket.on('message_reaction', (data) => {
+	  
+    const message = messageHistory.find(m => {
+        const mId = m.time ? new Date(m.time).getTime() : null;
+        return mId == data.msgId;
+    });
+
+    if (message) {
+        if (!message.reactions) message.reactions = [];
+
+        const existingReaction = message.reactions.find(r => r.emoji === data.emoji);
+        
+        if (existingReaction) {
+            existingReaction.count++;
+        } else {
+            message.reactions.push({ emoji: data.emoji, count: 1 });
+        }
+    }
+
+    io.emit('message_reaction', data); 
+  });
 
   socket.on('chat_message', (msg) => {
     let messageData;
