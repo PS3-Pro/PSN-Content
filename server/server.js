@@ -26,11 +26,19 @@ const io = new Server(server, {
 });
 
 let messageHistory = []; 
+let onlineUsers = {};
 
 io.on('connection', (socket) => {
   console.log('User connected: ' + socket.id);
 
   socket.emit('chat_history', messageHistory);
+
+  socket.on('register_user', (username) => {
+    if (username) {
+      onlineUsers[socket.id] = username;
+      io.emit('online_list', Object.values(onlineUsers));
+    }
+  });
 
   socket.on('message_reaction', (data) => {
     const message = messageHistory.find(m => {
@@ -40,12 +48,10 @@ io.on('connection', (socket) => {
 
     if (message) {
         if (!message.reactions) message.reactions = [];
-
         let existingReaction = message.reactions.find(r => r.emoji === data.emoji);
         
         if (existingReaction) {
             const userIndex = existingReaction.users.indexOf(data.user);
-            
             if (userIndex > -1) {
                 existingReaction.users.splice(userIndex, 1);
                 existingReaction.count--;
@@ -53,7 +59,6 @@ io.on('connection', (socket) => {
                 existingReaction.users.push(data.user);
                 existingReaction.count++;
             }
-            
             if (existingReaction.count <= 0) {
                 message.reactions = message.reactions.filter(r => r.emoji !== data.emoji);
             }
@@ -65,36 +70,32 @@ io.on('connection', (socket) => {
             });
         }
     }
-
     io.emit('message_reaction', data); 
   });
 
   socket.on('chat_message', (msg) => {
     let messageData;
-
     if (typeof msg === 'object' && msg !== null) {
-      messageData = {
-        ...msg,
-        time: new Date().toISOString()
-      };
+      messageData = { ...msg, time: new Date().toISOString() };
     } else {
-      messageData = {
-        type: 'text',
-        text: msg,
-        time: new Date().toISOString()
-      };
+      messageData = { type: 'text', text: msg, time: new Date().toISOString() };
     }
 
     messageHistory.push(messageData);
-
-    if (messageHistory.length > 1000) {
-      messageHistory.shift(); 
-    }
+    if (messageHistory.length > 1000) { messageHistory.shift(); }
 
     socket.broadcast.emit('chat_message', messageData); 
   });
 
   socket.on('disconnect', () => {
+    if (onlineUsers[socket.id]) {
+      const usernameSair = onlineUsers[socket.id];
+      console.log(`Usuário ${usernameSair} saiu.`);
+
+      delete onlineUsers[socket.id];
+
+      io.emit('online_list', Object.values(onlineUsers));
+    }
     console.log('User disconnected');
   });
 });
