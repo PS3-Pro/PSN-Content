@@ -41,7 +41,6 @@ io.on('connection', (socket) => {
   });
 
   socket.on('delete_message', (data) => {
-    // data = { msgId, user }
     const msgIndex = messageHistory.findIndex(m => {
         const mId = m.time ? new Date(m.time).getTime() : null;
         return mId == data.msgId;
@@ -91,7 +90,7 @@ io.on('connection', (socket) => {
   socket.on('chat_message', (msg) => {
     let messageData = {
       ...(typeof msg === 'object' ? msg : { text: msg }),
-      time: new Date().toISOString() // ID oficial gerado aqui
+      time: new Date().toISOString() // Carimbo oficial do servidor
     };
 
     messageHistory.push(messageData);
@@ -103,7 +102,6 @@ io.on('connection', (socket) => {
   socket.on('disconnect', () => {
     if (onlineUsers[socket.id]) {
       const usernameSair = onlineUsers[socket.id];
-      console.log(`Usuário ${usernameSair} saiu.`);
       delete onlineUsers[socket.id];
       io.emit('online_list', Object.values(onlineUsers));
     }
