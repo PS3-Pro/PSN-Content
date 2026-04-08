@@ -89,17 +89,15 @@ io.on('connection', (socket) => {
   });
 
   socket.on('chat_message', (msg) => {
-    let messageData;
-    if (typeof msg === 'object' && msg !== null) {
-      messageData = { ...msg, time: new Date().toISOString() };
-    } else {
-      messageData = { type: 'text', text: msg, time: new Date().toISOString() };
-    }
+    let messageData = {
+      ...(typeof msg === 'object' ? msg : { text: msg }),
+      time: new Date().toISOString() // ID oficial gerado aqui
+    };
 
     messageHistory.push(messageData);
-    if (messageHistory.length > 1000) { messageHistory.shift(); }
+    if (messageHistory.length > 1000) messageHistory.shift();
 
-    socket.broadcast.emit('chat_message', messageData); 
+    io.emit('chat_message', messageData); 
   });
 
   socket.on('disconnect', () => {
