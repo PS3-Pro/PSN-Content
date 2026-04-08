@@ -40,6 +40,21 @@ io.on('connection', (socket) => {
     }
   });
 
+  socket.on('delete_message', (data) => {
+    // data = { msgId, user }
+    const msgIndex = messageHistory.findIndex(m => {
+        const mId = m.time ? new Date(m.time).getTime() : null;
+        return mId == data.msgId;
+    });
+
+    if (msgIndex > -1) {
+        if (messageHistory[msgIndex].user === data.user) {
+            messageHistory.splice(msgIndex, 1);
+            io.emit('message_deleted', data.msgId);
+        }
+    }
+  });
+
   socket.on('message_reaction', (data) => {
     const message = messageHistory.find(m => {
         const mId = m.time ? new Date(m.time).getTime() : null;
@@ -91,9 +106,7 @@ io.on('connection', (socket) => {
     if (onlineUsers[socket.id]) {
       const usernameSair = onlineUsers[socket.id];
       console.log(`Usuário ${usernameSair} saiu.`);
-
       delete onlineUsers[socket.id];
-
       io.emit('online_list', Object.values(onlineUsers));
     }
     console.log('User disconnected');
