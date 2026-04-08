@@ -493,6 +493,7 @@ input:checked + .slider:before { transform: translateX(20px); }
 .chat-mention { color: #00bcff; font-weight: bold; cursor: pointer; }
 
 #chat-input { resize: none; overflow: hidden; min-height: 45px; line-height: 20px; padding: 12px 15px;}
+.chat-messages div { word-wrap: break-word; word-break: break-word; overflow-wrap: break-word; white-space: pre-wrap; }
 .mention-highlight { border: 2px solid #ffcc00 !important; background: rgba(255, 204, 0, 0.15) !important;}
 #mention-suggestions { position: absolute; bottom: 100%; left: 10px; background: rgba(15, 15, 15, 0.95); border: 1px solid var(--ps-blue); border-radius: 8px; width: 200px; max-height: 200px; overflow-y: auto; display: none; z-index: 10000; box-shadow: 0 0 20px rgba(0, 112, 204, 0.4); backdrop-filter: blur(10px); }
 .suggestion-item { padding: 10px 15px; cursor: pointer; color: #fff; font-size: 13px; transition: 0.2s; border-bottom: 1px solid rgba(255, 255, 255, 0.05); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -5641,14 +5642,45 @@ function renderTrophiesView() {
     }
 	
 	function openReactionPicker(event, msgId) {
-		event.stopPropagation(); if (typeof playUiClick === 'function') playUiClick();
-		const oldPicker = document.getElementById('active-reaction-picker'); if (oldPicker) oldPicker.remove();
-		const picker = document.createElement('div'); picker.id = 'active-reaction-picker'; picker.className = 'reaction-picker';
+		event.stopPropagation(); 
+		if (typeof playUiClick === 'function') playUiClick();
+		
+		const oldPicker = document.getElementById('active-reaction-picker'); 
+		if (oldPicker) oldPicker.remove();
+		
+		const picker = document.createElement('div'); 
+		picker.id = 'active-reaction-picker'; 
+		picker.className = 'reaction-picker';
+		
 		const emojis = ['👍', '❤️', '😂', '😮', '😢', '🔥'];
 		picker.innerHTML = emojis.map(e => `<span class="reaction-option" onclick="sendReaction('${msgId}', '${e}')">${e}</span>`).join('');
-		picker.style.top = (event.pageY - 50) + 'px'; picker.style.left = (event.pageX - 100) + 'px';
+		
 		document.body.appendChild(picker);
-		setTimeout(() => { window.onclick = () => { picker.remove(); window.onclick = null; }; }, 100);
+		
+		const pickerWidth = picker.offsetWidth;
+		const screenWidth = window.innerWidth;
+		
+		let topPos = event.pageY - 50;
+		
+		let leftPos = event.pageX - (pickerWidth / 2);
+		
+		if (leftPos + pickerWidth > screenWidth - 10) {
+			leftPos = screenWidth - pickerWidth - 15;
+		}
+		
+		if (leftPos < 10) {
+			leftPos = 10;
+		}
+		
+		picker.style.top = topPos + 'px'; 
+		picker.style.left = leftPos + 'px';
+		
+		setTimeout(() => { 
+			window.onclick = () => { 
+				if (document.body.contains(picker)) picker.remove(); 
+				window.onclick = null; 
+			}; 
+		}, 100);
 	}
 	
 	function sendReaction(msgId, emoji) {
@@ -5658,80 +5690,85 @@ function renderTrophiesView() {
 	}
 
     function appendMessageToChat(msg, isMe = false, timestamp = null) {
-	const box = document.getElementById('chat-messages');
-	if (!box) return;
+		const box = document.getElementById('chat-messages');
+		if (!box) return;
+		
+		let cleanText = (typeof msg === 'object' && msg.text) ? msg.text : (typeof msg === 'string' ? msg : "");
+		let messageText = cleanText;
+		const userName = (typeof msg === 'object' && msg.user) ? msg.user : (isMe ? localStorage.getItem('psn_username') : "Guest");
+		const isImage = (typeof msg === 'object' && msg.type === 'image');
+		const myName = localStorage.getItem('psn_username');
+		const replyData = (typeof msg === 'object' && msg.replyTo) ? msg.replyTo : null;
+		
+		const msgId = timestamp ? new Date(timestamp).getTime() : Date.now();
+		
+		trackUser(userName);
+		
+		const urlRegex = /(https?:\/\/[^\s]+)/g;
+		messageText = messageText.replace(urlRegex, function(url) {
+			return `<a href="${url}" target="_blank" style="color: #00bcff; text-decoration: underline; word-break: break-all;">${url}</a>`;
+		});
 	
-	let cleanText = (typeof msg === 'object' && msg.text) ? msg.text : (typeof msg === 'string' ? msg : "");
-	let messageText = cleanText;
-	const userName = (typeof msg === 'object' && msg.user) ? msg.user : (isMe ? localStorage.getItem('psn_username') : "Guest");
-	const isImage = (typeof msg === 'object' && msg.type === 'image');
-	const myName = localStorage.getItem('psn_username');
-	const replyData = (typeof msg === 'object' && msg.replyTo) ? msg.replyTo : null;
-	
-	const msgId = timestamp ? new Date(timestamp).getTime() : Date.now();
-	
-	trackUser(userName);
-	
-	chatUsers.forEach(user => {
-		if (user.length > 0) {
-			const mentionRegex = new RegExp(`@${user.replace(/[-\/\\^$*+?.()|[\]{}]/g, '\\$&')}`, 'g');
-			messageText = messageText.replace(mentionRegex, `<span class="chat-mention">@${user}</span>`);
+		chatUsers.forEach(user => {
+			if (user.length > 0) {
+				const mentionRegex = new RegExp(`@${user.replace(/[-\/\\^$*+?.()|[\]{}]/g, '\\$&')}`, 'g');
+				messageText = messageText.replace(mentionRegex, `<span class="chat-mention">@${user}</span>`);
+			}
+		});
+		
+		const wasIMentioned = !isMe && myName && cleanText.includes(`@${myName}`);
+		const userAvatar = (typeof msg === 'object' && msg.avatar) ? msg.avatar : (localStorage.getItem(`${userName}_psn_avatar`) || "https://avatarfiles.alphacoders.com/232/232155.jpg");
+		const date = timestamp ? new Date(timestamp) : new Date();
+		const timeStr = date.getHours().toString().padStart(2, '0') + ':' + date.getMinutes().toString().padStart(2, '0');
+		
+		const alignSelf = isMe ? 'flex-end' : 'flex-start';
+		const flexDir = isMe ? 'row-reverse' : 'row';
+		const bubbleRadius = isMe ? '12px 0px 12px 12px' : '0px 12px 12px 12px'; 
+		const bgColor = isMe ? 'rgba(0, 112, 204, 0.45)' : (wasIMentioned ? 'rgba(255, 204, 0, 0.2)' : 'rgba(255, 255, 255, 0.07)');
+		const borderColor = isMe ? 'var(--ps-blue)' : (wasIMentioned ? '#ffcc00' : 'rgba(255, 255, 255, 0.15)');
+		const nameColor = isMe ? '#00bcff' : '#ffcc00';
+		
+		let replyBlockHtml = '';
+		if (replyData) {
+			replyBlockHtml = `
+				<div style="background: rgba(0, 0, 0, 0.3); border-left: 3px solid ${nameColor}; padding: 4px 10px; margin-bottom: 8px; border-radius: 4px; font-size: 11px; line-height: 1.2; display: block; width: 100%; box-sizing: border-box;">
+					<div style="font-weight: bold; color: ${nameColor}; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-bottom: 2px;">${replyData.user}</div>
+					<div style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: #aaa;">${replyData.text}</div>
+				</div>`;
 		}
-	});
-	
-	const wasIMentioned = !isMe && myName && messageText.includes(`@${myName}`);
-	const userAvatar = (typeof msg === 'object' && msg.avatar) ? msg.avatar : (localStorage.getItem(`${userName}_psn_avatar`) || "https://avatarfiles.alphacoders.com/232/232155.jpg");
-	const date = timestamp ? new Date(timestamp) : new Date();
-	const timeStr = date.getHours().toString().padStart(2, '0') + ':' + date.getMinutes().toString().padStart(2, '0');
-	
-	const alignSelf = isMe ? 'flex-end' : 'flex-start';
-	const flexDir = isMe ? 'row-reverse' : 'row';
-	const bubbleRadius = isMe ? '12px 0px 12px 12px' : '0px 12px 12px 12px'; 
-	const bgColor = isMe ? 'rgba(0, 112, 204, 0.45)' : (wasIMentioned ? 'rgba(255, 204, 0, 0.2)' : 'rgba(255, 255, 255, 0.07)');
-	const borderColor = isMe ? 'var(--ps-blue)' : (wasIMentioned ? '#ffcc00' : 'rgba(255, 255, 255, 0.15)');
-	const nameColor = isMe ? '#00bcff' : '#ffcc00';
-	
-	let replyBlockHtml = '';
-	if (replyData) {
-		replyBlockHtml = `
-			<div style="background: rgba(0, 0, 0, 0.3); border-left: 3px solid ${nameColor}; padding: 4px 10px; margin-bottom: 8px; border-radius: 4px; font-size: 11px; line-height: 1.2; display: block; width: 100%; box-sizing: border-box;">
-				<div style="font-weight: bold; color: ${nameColor}; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-bottom: 2px;">${replyData.user}</div>
-				<div style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: #aaa;">${replyData.text}</div>
-			</div>`;
-	}
-	
-	let messageBodyHtml = '';
-	if (isImage) {
-		messageBodyHtml = `<img src="${msg.content}" style="max-width: 100%; max-height: 250px; border-radius: 6px; cursor: zoom-in; display: block; margin: 0 auto;" onclick="openImageModal(this.src)">`;
-		if (messageText !== "") {
-			messageBodyHtml += `<div style="margin-top: 10px; white-space: pre-wrap;">${messageText}</div>`;
+		
+		let messageBodyHtml = '';
+		if (isImage) {
+			messageBodyHtml = `<img src="${msg.content}" style="max-width: 100%; max-height: 250px; border-radius: 6px; cursor: zoom-in; display: block; margin: 0 auto;" onclick="openImageModal(this.src)">`;
+			if (messageText !== "") {
+				messageBodyHtml += `<div style="margin-top: 10px;">${messageText}</div>`;
+			}
+		} else {
+			messageBodyHtml = `<div>${messageText}</div>`;
 		}
-	} else {
-		messageBodyHtml = `<div style="white-space: pre-wrap;">${messageText}</div>`;
-	}
-	
-	const encodedText = encodeURIComponent(cleanText);
-	const encodedUser = encodeURIComponent(userName);
-	
-	let reactionsHtml = '';
-	if (msg.reactions && msg.reactions.length > 0) {
-		reactionsHtml = msg.reactions.map(r => `
-			<div class="reaction-pill" data-emoji="${r.emoji}" data-count="${r.count}">
-				${r.emoji} ${r.count}
-			</div>
-		`).join('');
-	}
-	
-	const msgHtml = `
-		<div style="display: flex; flex-direction: ${flexDir}; align-self: ${alignSelf}; max-width: 85%; margin-bottom: 12px; gap: 10px; animation: fadeIn 0.2s ease-out;">
-			<img src="${userAvatar}" style="width: 34px; height: 34px; border-radius: 50%; border: 1px solid rgba(255,255,255,0.2); object-fit: cover; margin-top: 15px;">
-			<div style="display: flex; flex-direction: column; align-items: ${alignSelf}; min-width: 60px;">
-				<span style="font-size: 11px; color: ${nameColor}; font-weight: bold; text-transform: uppercase; margin-bottom: 4px;">
-					${userName} ${wasIMentioned ? '<span style="color:#ffcc00; font-size:9px; margin-left:5px;">(MENTIONED YOU)</span>' : ''}
-				</span>
-				<div style="background: ${bgColor}; border: 1px solid ${borderColor}; padding: 10px 14px; border-radius: ${bubbleRadius}; backdrop-filter: blur(5px); ${wasIMentioned ? 'box-shadow: 0 0 10px #ffcc00;' : ''}">
-					${replyBlockHtml}
-						<div style="font-size: 13.5px; color: #fff; line-height: 1.4; word-wrap: break-word;">${messageBodyHtml}</div>
+		
+		const encodedText = encodeURIComponent(cleanText);
+		const encodedUser = encodeURIComponent(userName);
+		
+		let reactionsHtml = '';
+		if (msg.reactions && msg.reactions.length > 0) {
+			reactionsHtml = msg.reactions.map(r => `
+				<div class="reaction-pill" data-emoji="${r.emoji}" data-count="${r.count}">
+					${r.emoji} ${r.count}
+				</div>
+			`).join('');
+		}
+		
+		const msgHtml = `
+			<div style="display: flex; flex-direction: ${flexDir}; align-self: ${alignSelf}; max-width: 85%; margin-bottom: 12px; gap: 10px; animation: fadeIn 0.2s ease-out;">
+				<img src="${userAvatar}" style="width: 34px; height: 34px; border-radius: 50%; border: 1px solid rgba(255,255,255,0.2); object-fit: cover; margin-top: 15px;">
+				<div style="display: flex; flex-direction: column; align-items: ${alignSelf}; min-width: 60px; max-width: 100%;">
+					<span style="font-size: 11px; color: ${nameColor}; font-weight: bold; text-transform: uppercase; margin-bottom: 4px;">
+						${userName} ${wasIMentioned ? '<span style="color:#ffcc00; font-size:9px; margin-left:5px;">(MENTIONED YOU)</span>' : ''}
+					</span>
+					<div style="background: ${bgColor}; border: 1px solid ${borderColor}; padding: 10px 14px; border-radius: ${bubbleRadius}; backdrop-filter: blur(5px); ${wasIMentioned ? 'box-shadow: 0 0 10px #ffcc00;' : ''} width: fit-content; max-width: 100%; box-sizing: border-box;">
+						${replyBlockHtml}
+						<div style="font-size: 13.5px; color: #fff; line-height: 1.4;">${messageBodyHtml}</div>
 					</div>
 					
 					<div id="reactions-${msgId}" class="reactions-container" style="display: flex; flex-wrap: wrap; gap: 4px; margin-top: -5px; justify-content: ${isMe ? 'flex-end' : 'flex-start'}">
