@@ -525,6 +525,13 @@ input:checked + .slider:before { transform: translateX(20px); }
 #online-count-wrapper:hover { background: rgba(0, 188, 255, 0.25); border-color: var(--ps-blue); transform: translateY(-1px); }
 div[style*="display: flex"] { transition: opacity 0.3s ease, transform 0.3s ease; }
 
+.link-preview-card { background: rgba(0, 0, 0, 0.3); border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 8px; margin-top: 10px; overflow: hidden; display: flex; flex-direction: column; max-width: 280px; text-decoration: none !important; transition: all 0.2s ease; }
+.link-preview-card:hover { border-color: #ffffff; background: rgba(255, 255, 255, 0.05); }
+.link-preview-image { width: 100%; height: 120px; object-fit: cover; background: #111; }
+.link-preview-info { padding: 8px 12px; }
+.link-preview-title { color: #ffffff; font-size: 12px; font-weight: bold; margin-bottom: 4px; display: -webkit-box; -webkit-line-clamp: 1; -webkit-box-orient: vertical; overflow: hidden; }
+.link-preview-desc { color: #aaa; font-size: 10px; line-height: 1.3; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+
 /* ========================================================================== LIBRARY SPECIFIC FIXES ========================================================================== */
 .library-actions { display: flex; gap: 15px; align-items: center; }
 #library-toolbar { justify-content: flex-end; }
@@ -5909,7 +5916,6 @@ function renderTrophiesView() {
 		const userName = (typeof msg === 'object' && msg.user) ? msg.user : (isMe ? myName : "Guest");
 		const isImage = (typeof msg === 'object' && msg.type === 'image');
 		const replyData = (typeof msg === 'object' && msg.replyTo) ? msg.replyTo : null;
-	
 		const isAuthor = (userName === myName);
 	
 		const msgTimeValue = (msg.time) ? msg.time : (timestamp ? timestamp : Date.now());
@@ -5917,9 +5923,16 @@ function renderTrophiesView() {
 	
 		trackUser(userName);
 	
+		const firstLink = cleanText.match(/(https?:\/\/[^\s]+)/);
+		let previewPlaceholderHtml = '';
+		if (firstLink && !isImage) {
+			const previewId = `lp-${msgId}`;
+			previewPlaceholderHtml = `<div id="${previewId}"></div>`;
+		}
+	
 		const urlRegex = /(https?:\/\/[^\s]+)/g;
 		messageText = messageText.replace(urlRegex, function(url) {
-			return `<a href="${url}" target="_blank" style="color: #00bcff; text-decoration: underline; word-break: break-all;">${url}</a>`;
+			return `<a href="${url}" target="_blank" style="color: #ffffff; text-decoration: underline; word-break: break-all;">${url}</a>`;
 		});
 	
 		chatUsers.forEach(user => {
@@ -5977,7 +5990,6 @@ function renderTrophiesView() {
 			}).join('');
 		}
 	
-		// --- LÓGICA DE VISUALIZAÇÃO MELHORADA ---
 		const hasBeenSeen = (msg.seenBy && msg.seenBy.length > 0);
 		const seenList = hasBeenSeen ? msg.seenBy.join(', ') : '';
 		const seenColor = hasBeenSeen ? '#4caf50' : 'rgba(255, 255, 255, 0.3)';
@@ -5992,7 +6004,10 @@ function renderTrophiesView() {
 					</span>
 					<div style="background: ${bgColor}; border: 1px solid ${borderColor}; padding: 10px 14px; border-radius: ${bubbleRadius}; backdrop-filter: blur(5px); ${wasIMentioned ? 'box-shadow: 0 0 10px #ffcc00;' : ''} width: fit-content; max-width: 100%; box-sizing: border-box;">
 						${replyBlockHtml}
-						<div style="font-size: 13.5px; color: #fff; line-height: 1.4;">${messageBodyHtml}</div>
+						<div style="font-size: 13.5px; color: #fff; line-height: 1.4;">
+							${messageBodyHtml}
+							${previewPlaceholderHtml}
+						</div>
 					</div>
 					
 					<div id="reactions-${msgId}" class="reactions-container" style="display: flex; flex-wrap: wrap; gap: 4px; margin-top: -5px; justify-content: ${alignSelf}">
@@ -6020,6 +6035,13 @@ function renderTrophiesView() {
 			</div>`;
 	
 		box.innerHTML += msgHtml;
+	
+		// 3. AGORA que o placeholder existe no DOM, chama a busca do preview
+		if (firstLink && !isImage) {
+			const previewId = `lp-${msgId}`;
+			fetchLinkMetadata(firstLink[0], previewId);
+		}
+	
 		if (box.children.length > 1001) box.removeChild(box.children[1]);
 		box.scrollTop = box.scrollHeight;
 	
@@ -6385,6 +6407,35 @@ function renderTrophiesView() {
         };
         reader.readAsDataURL(file);
     }
+	
+	async function fetchLinkMetadata(url, elementId) {
+		if (url.match(/\.(jpeg|jpg|gif|png)$/) != null) return;
+	
+		try {
+			const container = document.getElementById(elementId);
+			if (!container) return;
+	
+			const apiKey = "257517a6951075145e262f7c7874fb8d";
+			const response = await fetch(`https://api.linkpreview.net/?key=${apiKey}&q=${encodeURIComponent(url)}`);
+			const data = await response.json();
+	
+			if (data && data.title) {
+				container.innerHTML = `
+					<a href="${data.url}" target="_blank" class="link-preview-card">
+						${data.image ? `<img src="${data.image}" class="link-preview-image">` : ''}
+						<div class="link-preview-info">
+							<div class="link-preview-title" style="color: #ffffff; font-weight: bold;">${data.title}</div>
+							<div class="link-preview-desc" style="color: #aaaaaa;">${data.description || 'No description available.'}</div>
+						</div>
+					</a>
+				`;
+				const chatBox = document.getElementById('chat-messages');
+				chatBox.scrollTop = chatBox.scrollHeight;
+			}
+		} catch (e) {
+			console.log("Error loading preview:", e);
+		}
+	}
 </script>
 	<script>
     const particleConfig = {
