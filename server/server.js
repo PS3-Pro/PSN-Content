@@ -43,37 +43,65 @@ io.on('connection', (socket) => {
   socket.on('delete_message', (data) => {
     const msgIndex = messageHistory.findIndex(m => {
         const mId = m.time ? new Date(m.time).getTime() : null;
-        return mId == data.msgId;
+        return String(mId) === String(data.msgId);
     });
 
     if (msgIndex > -1) {
         if (messageHistory[msgIndex].user === data.user) {
             messageHistory.splice(msgIndex, 1);
             io.emit('message_deleted', data.msgId);
+            console.log(`Message deleted: ID ${data.msgId} by ${data.user}`);
         }
     }
   });
 
   socket.on('edit_message', (data) => {
+    console.log(`Edit attempt: ID ${data.msgId} by ${data.user}`);
+
     const msgIndex = messageHistory.findIndex(m => {
         const mId = m.time ? new Date(m.time).getTime() : null;
-        return mId == data.msgId;
+        return String(mId) === String(data.msgId);
     });
 
     if (msgIndex > -1) {
-        if (messageHistory[msgIndex].user === data.user) {
+        const msgOwner = messageHistory[msgIndex].user;
+        if (msgOwner === data.user) {
+            console.log(`Message found! Updating: "${messageHistory[msgIndex].text}" to "${data.newText}"`);
+            
             messageHistory[msgIndex].text = data.newText;
             messageHistory[msgIndex].edited = true;
             
             io.emit('message_edited', { msgId: data.msgId, newText: data.newText });
+        } else {
+            console.log(`Warning: User ${data.user} tried to edit ${msgOwner}'s message`);
+        }
+    } else {
+        console.log(`Error: Message ID ${data.msgId} not found in history.`);
+    }
+  });
+
+  socket.on('mark_as_read', (data) => {
+    const msg = messageHistory.find(m => {
+        const mId = m.time ? new Date(m.time).getTime() : null;
+        return String(mId) === String(data.msgId);
+    });
+
+    if (msg && msg.user !== data.user) {
+        if (!msg.seenBy) msg.seenBy = [];
+        
+        if (!msg.seenBy.includes(data.user)) {
+            msg.seenBy.push(data.user);
+            console.log(`Message seen: ID ${data.msgId} by ${data.user}`);
+            
+            io.emit('message_seen', { msgId: data.msgId, seenBy: msg.seenBy });
         }
     }
   });
-  
+ 
   socket.on('message_reaction', (data) => {
     const message = messageHistory.find(m => {
         const mId = m.time ? new Date(m.time).getTime() : null;
-        return mId == data.msgId;
+        return String(mId) === String(data.msgId);
     });
 
     if (message) {
@@ -106,13 +134,15 @@ io.on('connection', (socket) => {
   socket.on('chat_message', (msg) => {
     let messageData = {
       ...(typeof msg === 'object' ? msg : { text: msg }),
-      time: new Date().toISOString()
+      time: new Date().toISOString(),
+      seenBy: []
     };
 
     messageHistory.push(messageData);
     if (messageHistory.length > 100) messageHistory.shift();
 
     io.emit('chat_message', messageData); 
+    console.log(`New message from ${messageData.user}`);
   });
 
   socket.on('disconnect', () => {
