@@ -54,6 +54,22 @@ io.on('connection', (socket) => {
     }
   });
 
+  socket.on('edit_message', (data) => {
+    const msgIndex = messageHistory.findIndex(m => {
+        const mId = m.time ? new Date(m.time).getTime() : null;
+        return mId == data.msgId;
+    });
+
+    if (msgIndex > -1) {
+        if (messageHistory[msgIndex].user === data.user) {
+            messageHistory[msgIndex].text = data.newText;
+            messageHistory[msgIndex].edited = true;
+            
+            io.emit('message_edited', { msgId: data.msgId, newText: data.newText });
+        }
+    }
+  });
+  
   socket.on('message_reaction', (data) => {
     const message = messageHistory.find(m => {
         const mId = m.time ? new Date(m.time).getTime() : null;
@@ -90,11 +106,11 @@ io.on('connection', (socket) => {
   socket.on('chat_message', (msg) => {
     let messageData = {
       ...(typeof msg === 'object' ? msg : { text: msg }),
-      time: new Date().toISOString() // Carimbo oficial do servidor
+      time: new Date().toISOString()
     };
 
     messageHistory.push(messageData);
-    if (messageHistory.length > 1000) messageHistory.shift();
+    if (messageHistory.length > 100) messageHistory.shift();
 
     io.emit('chat_message', messageData); 
   });
