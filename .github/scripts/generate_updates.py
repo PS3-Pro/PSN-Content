@@ -35,7 +35,7 @@ def run():
     repo = "PS3-Pro/Game-Updates"
     api_url = f"https://api.github.com/repos/{repo}/git/trees/main?recursive=1"
     raw_url = f"https://raw.githubusercontent.com/{repo}/main"
-    output_path = "resources/database/official/game_updates.tsv"
+    output_path = "resources/database/content/official/game_updates.tsv"
 
     try:
         response = requests.get(api_url)

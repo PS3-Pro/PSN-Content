@@ -16,10 +16,10 @@ function getSonyHash(titleId) {
     return base + "_" + hmac.digest('hex').toUpperCase();
 }
 
-const officialDbDir = 'resources/database/official'; 
-const coversDir = 'resources/covers/compressed';
+const officialDbDir = 'resources/database/content/official'; 
+const coversDir = 'resources/database/covers/compressed';
 const hashesDir = '../Recently-Played-Games/np';
-const outputPath = 'resources/covers/blacklist.tsv';
+const outputPath = 'resources/database/covers/blacklist.tsv';
 
 const missingCovers = [];
 
