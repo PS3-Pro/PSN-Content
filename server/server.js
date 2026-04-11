@@ -8,6 +8,9 @@ const server = http.createServer(app);
 
 const APP_URL = "https://psn-content.onrender.com/ping"; 
 
+const ADMIN_USERS = ["Luan Teles", "Admin"];
+const ADMIN_SECRET = process.env.ADMIN_SECRET || "311680"; 
+
 app.get('/ping', (req, res) => {
   res.send('Server is Awake!');
 });
@@ -47,10 +50,16 @@ io.on('connection', (socket) => {
     });
 
     if (msgIndex > -1) {
-        if (messageHistory[msgIndex].user === data.user) {
+        const isMessageOwner = messageHistory[msgIndex].user === data.user;
+        // VALIDAÇÃO NOVA: Verifica se o nome tá na lista E se a senha recebida é igual à do servidor
+        const isAdmin = ADMIN_USERS.includes(data.user) && data.secret === ADMIN_SECRET;
+
+        if (isMessageOwner || isAdmin) {
             messageHistory.splice(msgIndex, 1);
             io.emit('message_deleted', data.msgId);
-            console.log(`Message deleted: ID ${data.msgId} by ${data.user}`);
+            console.log(`Message deleted: ID ${data.msgId} by ${data.user} (Admin: ${isAdmin})`);
+        } else {
+            console.log(`BLOCKED: User ${data.user} tried to delete a message without permission or wrong secret.`);
         }
     }
   });
@@ -65,15 +74,23 @@ io.on('connection', (socket) => {
 
     if (msgIndex > -1) {
         const msgOwner = messageHistory[msgIndex].user;
-        if (msgOwner === data.user) {
+        const isMessageOwner = msgOwner === data.user;
+        // VALIDAÇÃO NOVA: Verifica se o nome tá na lista E se a senha recebida é igual à do servidor
+        const isAdmin = ADMIN_USERS.includes(data.user) && data.secret === ADMIN_SECRET;
+
+        if (isMessageOwner || isAdmin) {
             console.log(`Message found! Updating: "${messageHistory[msgIndex].text}" to "${data.newText}"`);
             
             messageHistory[msgIndex].text = data.newText;
             messageHistory[msgIndex].edited = true;
             
-            io.emit('message_edited', { msgId: data.msgId, newText: data.newText });
+            io.emit('message_edited', { 
+                msgId: data.msgId, 
+                newText: data.newText,
+                editedByAdmin: (isAdmin && !isMessageOwner) 
+            });
         } else {
-            console.log(`Warning: User ${data.user} tried to edit ${msgOwner}'s message`);
+            console.log(`BLOCKED: User ${data.user} tried to edit ${msgOwner}'s message (Wrong secret or not owner).`);
         }
     } else {
         console.log(`Error: Message ID ${data.msgId} not found in history.`);

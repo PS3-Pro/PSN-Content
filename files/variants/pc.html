@@ -1613,6 +1613,9 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 	<audio id="sound-ui-message" preload="auto">
 		<source src="https://raw.githubusercontent.com/PS3-Pro/PSN-Content/main/resources/ux/new_message.mp3" type="audio/mpeg">
 	</audio>
+	<audio id="sound-ui-logout" preload="auto">
+		<source src="https://raw.githubusercontent.com/PS3-Pro/PSN-Content/main/resources/ux/logout.mp3" type="audio/mpeg">
+	</audio>
 <script>
     /* ==========================================================================
        CORE DATA LOGIC - MULTI-USER SECURE VERSION (AVATAR UPDATE)
@@ -4633,6 +4636,7 @@ function playUiBackspace() { playSystemSound('sound-ui-backspace', 0.6); }
 function playUiSwitchOn() { playSystemSound('sound-ui-switch-on', 0.6); }
 function playUiSwitchOff() { playSystemSound('sound-ui-switch-off', 0.6); }
 function playUiArrow() { playSystemSound('sound-ui-arrow', 1); }
+function playUiLogout() { playSystemSound('sound-ui-logout', 1); }
 
 function initSettings() {
 initAudioSettings(); 
@@ -4684,6 +4688,7 @@ if (uxToggle) {
 
     function logOut() {
         if (confirm("Are you sure you want to log out?")) {
+			playUiLogout();
             localStorage.removeItem('psn_username');
             location.reload();
         }
@@ -6323,6 +6328,7 @@ function renderTrophiesView() {
 		const isImage = (typeof msg === 'object' && msg.type === 'image');
 		const replyData = (typeof msg === 'object' && msg.replyTo) ? msg.replyTo : null;
 		const isAuthor = (userName === myName);
+		const isAdmin = (myName === "Luan Teles" || myName === "Admin");
 	
 		const msgTimeValue = (msg.time) ? msg.time : (timestamp ? timestamp : Date.now());
 		const msgId = new Date(msgTimeValue).getTime();
@@ -6345,12 +6351,13 @@ function renderTrophiesView() {
 			if (user.length > 0) {
 				const mentionRegex = new RegExp(`@${user.replace(/[-\/\\^$*+?.()|[\]{}]/g, '\\$&')}`, 'g');
 				messageText = messageText.replace(mentionRegex, `<span class="chat-mention">@${user}</span>`);
+				messageText = messageText.replace(/@everyone/g, `<span class="chat-mention" style="background: #ff4444; color: white; padding: 2px 4px; border-radius: 4px; font-weight: bold; font-size: 10px;">@everyone</span>`);
 			}
 		});
 		
 		messageText = messageText.replace(/\n/g, '<br>');
 	
-		const wasIMentioned = !isAuthor && myName && cleanText.includes(`@${myName}`);
+		const wasIMentioned = !isAuthor && myName && (cleanText.includes(`@${myName}`) || cleanText.includes('@everyone'));
 		const userAvatar = (typeof msg === 'object' && msg.avatar) ? msg.avatar : (localStorage.getItem(`${userName}_psn_avatar`) || "https://avatarfiles.alphacoders.com/232/232155.jpg");
 		const date = new Date(msgTimeValue);
 		const timeStr = date.getHours().toString().padStart(2, '0') + ':' + date.getMinutes().toString().padStart(2, '0');
@@ -6432,7 +6439,7 @@ function renderTrophiesView() {
 						<i class="fas fa-reply" style="cursor: pointer; opacity: 0.5; color: #00bcff; font-size: 12px; transition: opacity 0.2s;" onmouseover="this.style.opacity='1'" onmouseout="this.style.opacity='0.5'" onclick="setReply(decodeURIComponent('${encodedUser}'), decodeURIComponent('${encodedText}'))"></i>
 						<i class="fas fa-smile" style="cursor: pointer; opacity: 0.5; color: #ffcc00; font-size: 12px; transition: opacity 0.2s;" onmouseover="this.style.opacity='1'" onmouseout="this.style.opacity='0.5'" onclick="openReactionPicker(event, '${msgId}')"></i>
 						
-						${isAuthor ? `
+						${(isAuthor || isAdmin) ? `
 							<i class="fas fa-edit" style="cursor: pointer; opacity: 0.5; color: #ff00ff; font-size: 12px; transition: opacity 0.2s; margin-left: 1px;" onmouseover="this.style.opacity='1'" onmouseout="this.style.opacity='0.5'" onclick="startEditMessage('${msgId}', decodeURIComponent('${encodedText}'))"></i>
 							<i class="fas fa-trash-alt" style="cursor: pointer; opacity: 0.5; color: #ff4444; font-size: 12px; transition: opacity 0.2s; margin-left: 1px;" onmouseover="this.style.opacity='1'" onmouseout="this.style.opacity='0.5'" onclick="deleteMyMessage('${msgId}')"></i>
 						` : ''}
@@ -6584,7 +6591,7 @@ function renderTrophiesView() {
 			playMessageSound();
 
 			if (!chatVisible && myName && data.user !== myName) {
-				const isMention = data.text && data.text.includes(`@${myName}`);
+				const isMention = data.text && (data.text.includes(`@${myName}`) || data.text.includes('@everyone'));
 				const isReply = data.replyTo && data.replyTo.user === myName;
 
 				if (isMention || isReply) {
@@ -6623,7 +6630,13 @@ function renderTrophiesView() {
 			const textContainer = document.getElementById(`msg-text-${data.msgId}`);
 			if (textContainer) {
 				let formattedText = data.newText.replace(/\n/g, '<br>');
-				textContainer.innerHTML = formattedText + ' <span style="font-size: 9px; opacity: 0.5; font-style: italic; margin-left: 5px;">(Edited)</span>';
+				
+				// Verifica se veio uma flag do backend informando que foi edição de admin
+				let editBadge = data.editedByAdmin 
+					? ' <span style="font-size: 9px; opacity: 0.8; color: #ff00ff; font-weight: bold; margin-left: 5px;">(Edited by Admin)</span>' 
+					: ' <span style="font-size: 9px; opacity: 0.5; font-style: italic; margin-left: 5px;">(Edited)</span>';
+					
+				textContainer.innerHTML = formattedText + editBadge;
 			}
 		});
 
@@ -6706,10 +6719,13 @@ function renderTrophiesView() {
 		const myAvatar = localStorage.getItem(`${myName}_psn_avatar`) || "";
 
 		if (editingMsgId) {
+			const mySecret = localStorage.getItem('psn_admin_secret');
+
 			socketChat.emit('edit_message', { 
 				msgId: editingMsgId, 
 				newText: msg, 
-				user: myName 
+				user: myName,
+				secret: mySecret
 			});
 			cancelEditMessage();
 			if (typeof playUiSuccess === 'function') playUiSuccess();
@@ -6742,8 +6758,9 @@ function renderTrophiesView() {
 	function deleteMyMessage(msgId) {
 		if (!confirm("Do you want to delete this message?")) return;
 		const myName = localStorage.getItem('psn_username');
+		const mySecret = localStorage.getItem('psn_admin_secret');
 		if (socketChat) {
-			socketChat.emit('delete_message', { msgId, user: myName });
+			socketChat.emit('delete_message', { msgId: msgId, user: myName, secret: mySecret });
 		}
 	}
 	
