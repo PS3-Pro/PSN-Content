@@ -51,7 +51,6 @@ io.on('connection', (socket) => {
 
     if (msgIndex > -1) {
         const isMessageOwner = messageHistory[msgIndex].user === data.user;
-        // VALIDAÇÃO NOVA: Verifica se o nome tá na lista E se a senha recebida é igual à do servidor
         const isAdmin = ADMIN_USERS.includes(data.user) && data.secret === ADMIN_SECRET;
 
         if (isMessageOwner || isAdmin) {
@@ -75,19 +74,21 @@ io.on('connection', (socket) => {
     if (msgIndex > -1) {
         const msgOwner = messageHistory[msgIndex].user;
         const isMessageOwner = msgOwner === data.user;
-        // VALIDAÇÃO NOVA: Verifica se o nome tá na lista E se a senha recebida é igual à do servidor
         const isAdmin = ADMIN_USERS.includes(data.user) && data.secret === ADMIN_SECRET;
 
         if (isMessageOwner || isAdmin) {
             console.log(`Message found! Updating: "${messageHistory[msgIndex].text}" to "${data.newText}"`);
             
+            const wasEditedByAdmin = (isAdmin && !isMessageOwner);
+            
             messageHistory[msgIndex].text = data.newText;
             messageHistory[msgIndex].edited = true;
+            messageHistory[msgIndex].editedByAdmin = wasEditedByAdmin;
             
             io.emit('message_edited', { 
                 msgId: data.msgId, 
                 newText: data.newText,
-                editedByAdmin: (isAdmin && !isMessageOwner) 
+                editedByAdmin: wasEditedByAdmin 
             });
         } else {
             console.log(`BLOCKED: User ${data.user} tried to edit ${msgOwner}'s message (Wrong secret or not owner).`);
