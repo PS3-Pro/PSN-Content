@@ -156,6 +156,20 @@ io.on('connection', (socket) => {
       seenBy: []
     };
 
+    const isAdmin = ADMIN_USERS.includes(messageData.user) && messageData.secret === ADMIN_SECRET;
+
+    if (messageData.text && messageData.text.includes('@everyone')) {
+        if (isAdmin) {
+            messageData.isGlobalPing = true;
+            console.log(`GLOBAL PING authorized for ${messageData.user}`);
+        } else {
+            messageData.isGlobalPing = false;
+            console.log(`GLOBAL PING denied for ${messageData.user}`);
+        }
+    }
+
+    delete messageData.secret;
+
     messageHistory.push(messageData);
     if (messageHistory.length > 100) messageHistory.shift();
 
