@@ -58,14 +58,12 @@ io.on('connection', (socket) => {
             io.emit('message_deleted', data.msgId);
             console.log(`Message deleted: ID ${data.msgId} by ${data.user} (Admin: ${isAdmin})`);
         } else {
-            console.log(`BLOCKED: User ${data.user} tried to delete a message without permission or wrong secret.`);
+            console.log(`BLOCKED: User ${data.user} tried to delete a message without permission.`);
         }
     }
   });
 
   socket.on('edit_message', (data) => {
-    console.log(`Edit attempt: ID ${data.msgId} by ${data.user}`);
-
     const msgIndex = messageHistory.findIndex(m => {
         const mId = m.time ? new Date(m.time).getTime() : null;
         return String(mId) === String(data.msgId);
@@ -77,24 +75,32 @@ io.on('connection', (socket) => {
         const isAdmin = ADMIN_USERS.includes(data.user) && data.secret === ADMIN_SECRET;
 
         if (isMessageOwner || isAdmin) {
-            console.log(`Message found! Updating: "${messageHistory[msgIndex].text}" to "${data.newText}"`);
+            let textToSave = data.newText;
+            let pingAtivo = false;
+
+            if (textToSave && textToSave.includes('@everyone')) {
+                if (isAdmin) {
+                    pingAtivo = true;
+                } else {
+                    textToSave = textToSave.replace(/@everyone/g, "everyone");
+                }
+            }
             
             const wasEditedByAdmin = (isAdmin && !isMessageOwner);
             
-            messageHistory[msgIndex].text = data.newText;
+            messageHistory[msgIndex].text = textToSave;
             messageHistory[msgIndex].edited = true;
             messageHistory[msgIndex].editedByAdmin = wasEditedByAdmin;
+            messageHistory[msgIndex].isGlobalPing = pingAtivo;
             
             io.emit('message_edited', { 
                 msgId: data.msgId, 
-                newText: data.newText,
-                editedByAdmin: wasEditedByAdmin 
+                newText: textToSave,
+                editedByAdmin: wasEditedByAdmin,
+                isGlobalPing: pingAtivo
             });
-        } else {
-            console.log(`BLOCKED: User ${data.user} tried to edit ${msgOwner}'s message (Wrong secret or not owner).`);
+            console.log(`Message edited: ID ${data.msgId} by ${data.user}`);
         }
-    } else {
-        console.log(`Error: Message ID ${data.msgId} not found in history.`);
     }
   });
 
@@ -106,11 +112,8 @@ io.on('connection', (socket) => {
 
     if (msg && msg.user !== data.user) {
         if (!msg.seenBy) msg.seenBy = [];
-        
         if (!msg.seenBy.includes(data.user)) {
             msg.seenBy.push(data.user);
-            console.log(`Message seen: ID ${data.msgId} by ${data.user}`);
-            
             io.emit('message_seen', { msgId: data.msgId, seenBy: msg.seenBy });
         }
     }
@@ -139,11 +142,7 @@ io.on('connection', (socket) => {
                 message.reactions = message.reactions.filter(r => r.emoji !== data.emoji);
             }
         } else {
-            message.reactions.push({ 
-                emoji: data.emoji, 
-                count: 1, 
-                users: [data.user] 
-            });
+            message.reactions.push({ emoji: data.emoji, count: 1, users: [data.user] });
         }
     }
     io.emit('message_reaction', data); 
@@ -157,14 +156,15 @@ io.on('connection', (socket) => {
     };
 
     const isAdmin = ADMIN_USERS.includes(messageData.user) && messageData.secret === ADMIN_SECRET;
-
-    if (messageData.text && messageData.text.includes('@everyone')) {
+	
+	if (messageData.text && messageData.text.includes('@everyone')) {
         if (isAdmin) {
             messageData.isGlobalPing = true;
             console.log(`GLOBAL PING authorized for ${messageData.user}`);
         } else {
             messageData.isGlobalPing = false;
-            console.log(`GLOBAL PING denied for ${messageData.user}`);
+            messageData.text = messageData.text.replace(/@everyone/g, "everyone");
+            console.log(`GLOBAL PING blocked for ${messageData.user}`);
         }
     }
 
@@ -179,7 +179,6 @@ io.on('connection', (socket) => {
 
   socket.on('disconnect', () => {
     if (onlineUsers[socket.id]) {
-      const usernameSair = onlineUsers[socket.id];
       delete onlineUsers[socket.id];
       io.emit('online_list', Object.values(onlineUsers));
     }
