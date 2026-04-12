@@ -6442,7 +6442,8 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 	
 	const ADMIN_COMMAND_LIST = [
 		{ cmd: 'clean', desc: 'Clear all chat history' },
-		{ cmd: 'reload', desc: 'Force all users to reload page' } // Comando novo
+		{ cmd: 'reload', desc: 'Force all users to reload page' },
+		{ cmd: 'kick', desc: 'Kick a user: /kick @Username' }
 	];
 
     function showCommandSuggestions(query) {
@@ -7056,89 +7057,110 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
     }
 
     function sendChatMessage() {
-        if (!socketChat) return;
-        const input = document.getElementById('chat-input');
-        let msg = input.value.trim();
-        
-        if (msg === '' && !pendingImageFile) return;
-    
-        const myName = localStorage.getItem('psn_username') || "Guest";
-        const myAvatar = localStorage.getItem(`${myName}_psn_avatar`) || "";
-        const mySecret = localStorage.getItem('psn_admin_secret');
-        const isAdmin = !!mySecret; 
-        
-        if (msg.toLowerCase() === '/clean') {
-            if (isAdmin) {
-                socketChat.emit('clear_chat', { user: myName, secret: mySecret });
-            } else {
-                alert("Only admins can use the /clean command.");
-            }
-            input.value = '';
-            input.style.height = '45px';
-            input.style.overflowY = 'hidden';
-            return; 
-        }
-
-        if (msg.toLowerCase() === '/reload') {
-            if (isAdmin) {
-                // Enviamos como chat_message, o servidor vai interceptar e dar o broadcast
-                socketChat.emit('chat_message', { text: msg, user: myName, secret: mySecret });
-            } else {
-                alert("Only admins can use the /reload command.");
-            }
-            input.value = '';
-            input.style.height = '45px';
-            input.style.overflowY = 'hidden';
-            return; 
-        }
-    
-        let globalPingActive = false;
-    
-        if (msg.includes('@everyone')) {
-            if (isAdmin) {
-                globalPingActive = true;
-            } else {
-                msg = msg.replace(/@everyone/g, "everyone");
-            }
-        }
-        
-        if (editingMsgId) {
-            socketChat.emit('edit_message', { 
-                msgId: editingMsgId, 
-                newText: msg, 
-                user: myName,
-                secret: mySecret
-            });
-            cancelEditMessage();
-            if (typeof playUiSuccess === 'function') playUiSuccess();
-            return;
-        }
-    
-        const data = { 
-            text: msg, 
-            user: myName, 
-            avatar: myAvatar, 
-            replyTo: currentReply,
-            type: pendingImageFile ? 'image' : 'text',
-            content: pendingImageFile || null,
-            secret: mySecret,
-            isGlobalPing: globalPingActive
-        };
-        
-        socketChat.emit('chat_message', data);
-        
-        saveState('psn_last_chat_read', Date.now().toString());
-        
-        input.value = '';
-        input.style.height = '45px';
-        input.style.overflowY = 'hidden';
-        input.scrollTop = 0;
-    
-        cancelReply();
-        cancelPendingImage();
-        
-        if (typeof playUiSuccess === 'function') playUiSuccess(); 
-    }
+		if (!socketChat) return;
+		const input = document.getElementById('chat-input');
+		let msg = input.value.trim();
+		
+		if (msg === '' && !pendingImageFile) return;
+	
+		const myName = localStorage.getItem('psn_username') || "Guest";
+		const myAvatar = localStorage.getItem(`${myName}_psn_avatar`) || "";
+		const mySecret = localStorage.getItem('psn_admin_secret');
+		const isAdmin = !!mySecret; 
+		
+		if (msg.toLowerCase() === '/clean') {
+			if (isAdmin) {
+				socketChat.emit('clear_chat', { user: myName, secret: mySecret });
+			} else {
+				alert("Only admins can use the /clean command.");
+			}
+			input.value = '';
+			input.style.height = '45px';
+			return; 
+		}
+	
+		if (msg.toLowerCase() === '/reload') {
+			if (isAdmin) {
+				socketChat.emit('chat_message', { text: msg, user: myName, secret: mySecret });
+			} else {
+				alert("Only admins can use the /reload command.");
+			}
+			input.value = '';
+			input.style.height = '45px';
+			return; 
+		}
+	
+		if (msg.toLowerCase().startsWith('/kick')) {
+			if (isAdmin) {
+				let targetName = msg.split(' ').slice(1).join(' ').replace('@', '').trim();
+				
+				const targetUser = currentOnlineList.find(u => (u.name || u).toLowerCase() === targetName.toLowerCase());
+	
+				if (targetUser && targetUser.id) {
+					if (confirm(`Kick ${targetUser.name}?`)) {
+						socketChat.emit('kick_user', { 
+							targetId: targetUser.id, 
+							adminUser: myName, 
+							secret: mySecret 
+						});
+					}
+				} else {
+					alert("User not found or offline.");
+				}
+			} else {
+				alert("Only admins can use the /kick command.");
+			}
+			input.value = '';
+			input.style.height = '45px';
+			return;
+		}
+	
+		let globalPingActive = false;
+	
+		if (msg.includes('@everyone')) {
+			if (isAdmin) {
+				globalPingActive = true;
+			} else {
+				msg = msg.replace(/@everyone/g, "everyone");
+			}
+		}
+		
+		if (editingMsgId) {
+			socketChat.emit('edit_message', { 
+				msgId: editingMsgId, 
+				newText: msg, 
+				user: myName,
+				secret: mySecret
+			});
+			cancelEditMessage();
+			if (typeof playUiSuccess === 'function') playUiSuccess();
+			return;
+		}
+	
+		const data = { 
+			text: msg, 
+			user: myName, 
+			avatar: myAvatar, 
+			replyTo: currentReply,
+			type: pendingImageFile ? 'image' : 'text',
+			content: pendingImageFile || null,
+			secret: mySecret,
+			isGlobalPing: globalPingActive
+		};
+		
+		socketChat.emit('chat_message', data);
+		saveState('psn_last_chat_read', Date.now().toString());
+		
+		input.value = '';
+		input.style.height = '45px';
+		input.style.overflowY = 'hidden';
+		input.scrollTop = 0;
+	
+		cancelReply();
+		cancelPendingImage();
+		
+		if (typeof playUiSuccess === 'function') playUiSuccess(); 
+	}
 
     function deleteMyMessage(msgId) {
         if (!confirm("Do you want to delete this message?")) return;
@@ -7375,7 +7397,7 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 		div.className = 'online-user-item';
 		div.style.display = 'flex';
 		div.style.alignItems = 'center';
-		div.style.justifyContent = 'space-between'; // Para o botão ir pro canto
+		div.style.justifyContent = 'space-between';
 		if (isMe) div.style.background = "rgba(0, 112, 204, 0.1)";
 		
 		div.onmouseenter = () => { if(typeof playUiHover === 'function') playUiHover(); };
