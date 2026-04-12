@@ -42,11 +42,23 @@ io.on('connection', (socket) => {
 
       if (name) {
         onlineUsers[socket.id] = { 
+          id: socket.id,
           name: name, 
           avatar: avatar 
         };
         io.emit('online_list', Object.values(onlineUsers));
       }
+    }
+  });
+
+  socket.on('kick_user', (data) => {
+    const isAdmin = ADMIN_USERS.includes(data.adminUser) && data.secret === ADMIN_SECRET;
+    
+    if (isAdmin && data.targetId) {
+        console.log(`[ADMIN] User kicked: ${data.targetId} by ${data.adminUser}`);
+        io.to(data.targetId).emit('user_kicked');
+    } else {
+        console.log(`[AUTH] Unauthorized kick attempt by: ${data.adminUser}`);
     }
   });
 
@@ -186,7 +198,7 @@ io.on('connection', (socket) => {
     
     if (messageData.text && messageData.text.trim() === '/reload') {
         if (isAdmin) {
-            console.log(`[ADMIN] Force Reload command triggered by: ${messageData.user}`);
+            console.log(`[ADMIN] Force Reload triggered by: ${messageData.user}`);
             socket.broadcast.emit('force_reload');
             return;
         }
