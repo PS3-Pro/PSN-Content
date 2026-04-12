@@ -303,6 +303,7 @@ select option { background-color: var(--bg-dark); }
 .player-stat-value { font-size: 22px; font-weight: bold; color: var(--ps-blue); margin-bottom: 5px; }
 .player-stat-label { font-size: 11px; color: var(--text-muted); text-transform: uppercase; }
 
+
 /* Online Users Modal Specifics */
 .online-users-list { display: flex; flex-direction: column; gap: 8px; max-height: 300px; overflow-y: auto; padding-right: 5px; scrollbar-width: thin; }
 .online-user-item { display: flex; align-items: center; gap: 12px; padding: 10px; background: rgba(255, 255, 255, 0.03); border-radius: 8px; border: 1px solid transparent; transition: 0.2s ease; }
@@ -597,6 +598,9 @@ div[style*="display: flex"] { transition: opacity 0.3s ease, transform 0.3s ease
 .seen-by-title { font-size: 9px; color: var(--ps-blue); font-weight: bold; text-transform: uppercase; margin-bottom: 2px; padding: 5px; position: sticky; top: 0; background: rgba(15, 15, 15, 0.98); z-index: 1; letter-spacing: 0.5px; border-bottom: 1px solid rgba(255,255,255,0.1); }
 
 @keyframes popIn { from { opacity: 0; transform: scale(0.9); } to { opacity: 1; transform: scale(1); } }
+
+.chat-avatar-clickable, .online-user-avatar, .seen-user-avatar { cursor: pointer; transition: filter 0.2s, transform 0.2s; }
+.chat-avatar-clickable:hover, .online-user-avatar:hover, .seen-user-avatar:hover { filter: brightness(1.2); transform: scale(1.05); }
 /* ========================================================================== LIBRARY SPECIFIC FIXES ========================================================================== */
 .library-actions { display: flex; gap: 15px; align-items: center; }
 #library-toolbar { justify-content: flex-end; }
@@ -4870,47 +4874,105 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
     }
 
     function closeSysModal(event, modalId) {
-        const modal = document.getElementById(modalId);
-        if (!event || event.target === modal) {
-            if (typeof playUiBack === 'function') playUiBack();
-            modal.classList.remove('show');
-            setTimeout(() => { modal.style.display = 'none'; }, 300);
-        }
-    }
+		const modal = document.getElementById(modalId);
+		if (!event || event.target === modal) {
+			if (typeof playUiBack === 'function') playUiBack();
+			
+			modal.classList.remove('show');
+			
+			setTimeout(() => { 
+				modal.style.display = 'none'; 
+				
+				if (modalId === 'modal-sys-profile' && modal.dataset.returnToOnline === "true") {
+					modal.dataset.returnToOnline = "false";
+					
+					if (typeof openOnlineModal === 'function') {
+						openOnlineModal(); 
+					}
+				}
+				
+			}, 300);
+		}
+	}
 
-    function openProfileModal() {
-        closeDropdownMenu();
-        
-        const username = localStorage.getItem('psn_username') || "Guest";
-        const avatarUrl = localStorage.getItem(`${username}_psn_avatar`) || AVAILABLE_AVATARS[0];
-        const joinedDate = localStorage.getItem(`${username}_joined_date`) || new Date().getFullYear(); 
-        
-        let totalXp = 0;
-        const xpMap = { bronze: 15, silver: 30, gold: 90, platinum: 300 };
-        
-        if (window.userTrophies && typeof TROPHY_DATA !== 'undefined') {
-            Object.keys(window.userTrophies).forEach(id => {
-                if (window.userTrophies[id].unlocked && TROPHY_DATA[id]) {
-                    totalXp += xpMap[TROPHY_DATA[id].type] || 0;
-                }
-            });
-        }
-        
-        const playerLevel = Math.floor(totalXp / 100) + 1;
-        
-        document.getElementById('card-username').innerText = username;
-        document.getElementById('card-avatar').src = avatarUrl;
-        document.getElementById('card-joined').innerText = `Joined: ${joinedDate}`;
-        document.getElementById('card-level').innerText = playerLevel;
-        
-        document.getElementById('card-downloads').innerText = window.downloadHistory ? window.downloadHistory.length : 0;
-        document.getElementById('card-wishlist').innerText = window.wishlist ? window.wishlist.length : 0;
-        document.getElementById('card-favs').innerText = window.favoritesLibrary ? window.favoritesLibrary.length : 0;
-
-        const modal = document.getElementById('modal-sys-profile');
-        modal.style.display = 'flex';
-        requestAnimationFrame(() => requestAnimationFrame(() => modal.classList.add('show')));
-    }
+    function openProfileModal(targetUser = null) {
+		closeDropdownMenu();
+		
+		const onlineModal = document.getElementById('modal-sys-online');
+		const profileModal = document.getElementById('modal-sys-profile');
+		
+		if (onlineModal && (onlineModal.style.display === 'flex' || onlineModal.style.display === 'block')) {
+			if (profileModal) {
+				profileModal.dataset.returnToOnline = "true";
+			}
+			
+			onlineModal.classList.remove('show');
+			setTimeout(() => { onlineModal.style.display = 'none'; }, 300);
+		} else {
+			if (profileModal) {
+				profileModal.dataset.returnToOnline = "false";
+			}
+		}
+		
+		const myName = localStorage.getItem('psn_username') || "Guest";
+		const username = targetUser || myName;
+		const isMe = (username === myName);
+		
+		const avatarUrl = localStorage.getItem(`${username}_psn_avatar`) || (isMe ? AVAILABLE_AVATARS[0] : "https://avatarfiles.alphacoders.com/232/232155.jpg");
+		
+		const joinedDate = localStorage.getItem(`${username}_psn_joined`) || (isMe ? (localStorage.getItem(`${myName}_joined_date`) || "2026") : "---");
+		
+		let playerLevel;
+		if (isMe) {
+			let totalXp = 0;
+			const xpMap = { bronze: 15, silver: 30, gold: 90, platinum: 300 };
+			if (window.userTrophies && typeof TROPHY_DATA !== 'undefined') {
+				Object.keys(window.userTrophies).forEach(id => {
+					if (window.userTrophies[id].unlocked && TROPHY_DATA[id]) {
+						totalXp += xpMap[TROPHY_DATA[id].type] || 0;
+					}
+				});
+			}
+			playerLevel = Math.floor(totalXp / 100) + 1;
+		} else {
+			playerLevel = localStorage.getItem(`${username}_psn_level`) || "1";
+		}
+		
+		const countDownloads = isMe ? (window.downloadHistory?.length || 0) : (localStorage.getItem(`${username}_psn_downloads`) || 0);
+		const countWishlist = isMe ? (window.wishlist?.length || 0) : (localStorage.getItem(`${username}_psn_wishlist`) || 0);
+		const countFavs = isMe ? (window.favoritesLibrary?.length || 0) : (localStorage.getItem(`${username}_psn_favs`) || 0);
+	
+		document.getElementById('card-username').innerText = username;
+		document.getElementById('card-avatar').src = avatarUrl;
+		document.getElementById('card-joined').innerText = `Joined: ${joinedDate}`;
+		document.getElementById('card-level').innerText = playerLevel;
+		
+		document.getElementById('card-downloads').innerText = countDownloads;
+		document.getElementById('card-wishlist').innerText = countWishlist;
+		document.getElementById('card-favs').innerText = countFavs;
+	
+		if (profileModal) {
+			profileModal.style.display = 'flex';
+			requestAnimationFrame(() => {
+				requestAnimationFrame(() => {
+					profileModal.classList.add('show');
+				});
+			});
+		}
+	}
+	
+	function calculateMyXp() {
+		let totalXp = 0;
+		const xpMap = { bronze: 15, silver: 30, gold: 90, platinum: 300 };
+		if (window.userTrophies) {
+			Object.keys(window.userTrophies).forEach(id => {
+				if (window.userTrophies[id].unlocked && TROPHY_DATA[id]) {
+					totalXp += xpMap[TROPHY_DATA[id].type] || 0;
+				}
+			});
+		}
+		return totalXp;
+	}
 
     function openThemeModal() {
         closeDropdownMenu();
@@ -6756,8 +6818,7 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 	
 		const msgHtml = `
 			<div id="msg-row-${msgId}" style="display: flex; flex-direction: ${flexDir}; align-self: ${alignSelf}; max-width: 85%; margin-bottom: 12px; gap: 10px; animation: fadeIn 0.2s ease-out; transition: all 0.3s ease;">
-				<img src="${userAvatar}" style="width: 34px; height: 34px; border-radius: 50%; border: 1px solid rgba(255,255,255,0.2); object-fit: cover; margin-top: 15px;">
-				<div style="display: flex; flex-direction: column; align-items: ${alignSelf}; min-width: 60px; max-width: 100%;">
+				<img src="${userAvatar}" class="chat-avatar-clickable" onclick="openProfileModal('${userName}')"  style="width: 34px; height: 34px; border-radius: 50%; border: 1px solid rgba(255,255,255,0.2); object-fit: cover; margin-top: 15px;"><div style="display: flex; flex-direction: column; align-items: ${alignSelf}; min-width: 60px; max-width: 100%;">
 					<span style="font-size: 11px; color: ${nameColor}; font-weight: bold; margin-bottom: 4px;">
 						${userName} ${mentionTagHtml}
 					</span>
@@ -6858,35 +6919,57 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
         socketChat = io(socketRenderUrl);
 
         socketChat.on('connect', () => {
-            const myName = localStorage.getItem('psn_username') || "Guest";
-            const myAvatar = localStorage.getItem(`${myName}_psn_avatar`) || AVAILABLE_AVATARS[0];
-            
-            socketChat.emit('register_user', { name: myName, avatar: myAvatar });
-            
-            const s = document.getElementById('chat-status-text');
-            if (s) { s.innerText = "(Connected)"; s.style.color = "#4caf50"; }
-        });
+			const myName = localStorage.getItem('psn_username') || "Guest";
+			const myAvatar = localStorage.getItem(`${myName}_psn_avatar`) || AVAILABLE_AVATARS[0];
+			
+			const myJoinedDate = localStorage.getItem(`${myName}_joined_date`) || "2026";
+			
+			let totalXp = 0;
+			const xpMap = { bronze: 15, silver: 30, gold: 90, platinum: 300 };
+			if (window.userTrophies) {
+				Object.keys(window.userTrophies).forEach(id => {
+					if (window.userTrophies[id].unlocked && TROPHY_DATA[id]) {
+						totalXp += xpMap[TROPHY_DATA[id].type] || 0;
+					}
+				});
+			}
+			const myLevel = Math.floor(totalXp / 100) + 1;
+		
+			socketChat.emit('register_user', { 
+				name: myName, 
+				avatar: myAvatar,
+				level: myLevel,
+				joined: myJoinedDate,
+				downloads: window.downloadHistory ? window.downloadHistory.length : 0,
+				wishlist: window.wishlist ? window.wishlist.length : 0,
+				favorites: window.favoritesLibrary ? window.favoritesLibrary.length : 0
+			});
+			
+			const s = document.getElementById('chat-status-text');
+			if (s) { s.innerText = "(Connected)"; s.style.color = "#4caf50"; }
+		});
 
         socketChat.on('online_list', function(users) {
-            const countElement = document.getElementById('online-count');
-            
-            if (users) {
-                currentOnlineList = users; 
-                
-                if (countElement) {
-                    countElement.innerText = `${currentOnlineList.length} Online`;
-                }
-                
-                currentOnlineList.forEach(u => {
-                    if (u.name && u.name !== "Guest") {
-                        chatUsers.add(u.name);
-                        if (u.avatar) {
-                            localStorage.setItem(`${u.name}_psn_avatar`, u.avatar);
-                        }
-                    }
-                });
-            }
-        });
+			const countElement = document.getElementById('online-count');
+			
+			if (users) {
+				currentOnlineList = users; 
+				
+				if (countElement) {
+					countElement.innerText = `${currentOnlineList.length} Online`;
+				}
+				
+				currentOnlineList.forEach(u => {
+					if (u.name && u.name !== "Guest") {
+						localStorage.setItem(`${u.name}_psn_avatar`, u.avatar);
+						localStorage.setItem(`${u.name}_psn_level`, u.level);
+						localStorage.setItem(`${u.name}_psn_downloads`, u.downloads || 0);
+						localStorage.setItem(`${u.name}_psn_wishlist`, u.wishlist || 0);
+						localStorage.setItem(`${u.name}_psn_favs`, u.favorites || 0);
+					}
+				});
+			}
+		});
 		
 		socketChat.on('force_reload', () => {
 			window.location.reload();
@@ -7266,66 +7349,79 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
         }
     });
 
-    document.addEventListener('keydown', (e) => {
-        const input = document.getElementById('chat-input');
-        if (e.target !== input) return;
-    
-        const suggestionsBox = document.getElementById('mention-suggestions');
-        const isSuggesting = suggestionsBox && suggestionsBox.style.display === 'block';
-    
-        if (isSuggesting) {
-            const items = suggestionsBox.querySelectorAll('.suggestion-item');
-            if (items.length === 0) return;
-
-            if (e.key === "ArrowDown") {
-                e.preventDefault();
-                items[selectedSuggestionIndex].classList.remove('active');
-                selectedSuggestionIndex = (selectedSuggestionIndex + 1) % items.length;
-                items[selectedSuggestionIndex].classList.add('active');
-            } else if (e.key === "ArrowUp") {
-                e.preventDefault();
-                items[selectedSuggestionIndex].classList.remove('active');
-                selectedSuggestionIndex = (selectedSuggestionIndex - 1 + items.length) % items.length;
-                items[selectedSuggestionIndex].classList.add('active');
-            } else if (e.key === "Enter" || e.key === "Tab") {
-                e.preventDefault();
-                const activeItem = items[selectedSuggestionIndex];
-                
-                const cmdValue = activeItem.getAttribute('data-command');
-                
-                if (cmdValue) {
-                    insertCommand(cmdValue);
-                } else {
-                    const nameValue = activeItem.innerText.split('\n')[0].replace('@', '').trim();
-                    insertMention(nameValue);
-                }
-            } else if (e.key === "Escape") {
-                suggestionsBox.style.display = 'none';
-            }
-        } else {
-            if (e.key === "Enter") {
-                const isMobile = window.innerWidth <= 768;
-                if (e.shiftKey || isMobile) {
-                    if (typeof playUiInput === 'function') playUiInput();
-                } else {
-                    e.preventDefault();
-                    sendChatMessage();
-                    input.style.height = '45px';
-                }
-            } 
-            else if (e.key === "Escape") {
-                if (typeof cancelReply === 'function') cancelReply();
-                if (typeof cancelPendingImage === 'function') cancelPendingImage();
-                if (typeof cancelEditMessage === 'function') cancelEditMessage(); 
-            }
-            else if (e.key === "Backspace" || e.key === "Delete") { 
-                if (typeof playUiBackspace === 'function') playUiBackspace(); 
-            }
-            else if (e.key.length === 1) { 
-                if (typeof playUiInput === 'function') playUiInput(); 
-            }
-        }
-    });
+   document.addEventListener('keydown', (e) => {
+		if (e.key === "Escape") {
+			const profileModal = document.getElementById('modal-sys-profile');
+			const onlineModal = document.getElementById('modal-sys-online');
+			
+			if (profileModal && profileModal.style.display === 'flex') {
+				closeSysModal(null, 'modal-sys-profile');
+				return; // Para a execução aqui para não cancelar o chat ao mesmo tempo
+			}
+			if (onlineModal && onlineModal.style.display === 'flex') {
+				closeSysModal(null, 'modal-sys-online');
+				return;
+			}
+		}
+	
+		const input = document.getElementById('chat-input');
+		if (e.target !== input) return;
+	
+		const suggestionsBox = document.getElementById('mention-suggestions');
+		const isSuggesting = suggestionsBox && suggestionsBox.style.display === 'block';
+	
+		if (isSuggesting) {
+			const items = suggestionsBox.querySelectorAll('.suggestion-item');
+			if (items.length === 0) return;
+	
+			if (e.key === "ArrowDown") {
+				e.preventDefault();
+				items[selectedSuggestionIndex].classList.remove('active');
+				selectedSuggestionIndex = (selectedSuggestionIndex + 1) % items.length;
+				items[selectedSuggestionIndex].classList.add('active');
+			} else if (e.key === "ArrowUp") {
+				e.preventDefault();
+				items[selectedSuggestionIndex].classList.remove('active');
+				selectedSuggestionIndex = (selectedSuggestionIndex - 1 + items.length) % items.length;
+				items[selectedSuggestionIndex].classList.add('active');
+			} else if (e.key === "Enter" || e.key === "Tab") {
+				e.preventDefault();
+				const activeItem = items[selectedSuggestionIndex];
+				const cmdValue = activeItem.getAttribute('data-command');
+				
+				if (cmdValue) {
+					insertCommand(cmdValue);
+				} else {
+					const nameValue = activeItem.innerText.split('\n')[0].replace('@', '').trim();
+					insertMention(nameValue);
+				}
+			} else if (e.key === "Escape") {
+				suggestionsBox.style.display = 'none';
+			}
+		} else {
+			if (e.key === "Enter") {
+				const isMobile = window.innerWidth <= 768;
+				if (e.shiftKey || isMobile) {
+					if (typeof playUiInput === 'function') playUiInput();
+				} else {
+					e.preventDefault();
+					sendChatMessage();
+					input.style.height = '45px';
+				}
+			} 
+			else if (e.key === "Escape") {
+				if (typeof cancelReply === 'function') cancelReply();
+				if (typeof cancelPendingImage === 'function') cancelPendingImage();
+				if (typeof cancelEditMessage === 'function') cancelEditMessage(); 
+			}
+			else if (e.key === "Backspace" || e.key === "Delete") { 
+				if (typeof playUiBackspace === 'function') playUiBackspace(); 
+			}
+			else if (e.key.length === 1) { 
+				if (typeof playUiInput === 'function') playUiInput(); 
+			}
+		}
+	});
 
     function processAndSendImage(file) {
         if (!file || file.size > 2 * 1024 * 1024) return;
@@ -7431,9 +7527,11 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 		
 		let contentHtml = `
 			<div style="display: flex; align-items: center; gap: 10px;">
-				<img src="${userAvatar || defaultAvatar}" class="online-user-avatar" 
-					style="border-color: ${isMe ? 'var(--ps-blue)' : '#4caf50'}" 
-					onerror="this.src='${defaultAvatar}'">
+				<img src="${userAvatar || defaultAvatar}" 
+				class="online-user-avatar" 
+				onclick="openProfileModal('${username}')"
+				style="border-color: ${isMe ? 'var(--ps-blue)' : '#4caf50'}; cursor:pointer;" 
+				onerror="this.src='${defaultAvatar}'">
 				<div class="online-user-info">
 					<span class="online-user-name" style="${isMe ? 'color: var(--ps-blue); font-weight: 900;' : ''}">
 						${username} ${isMe ? '(You)' : ''}
@@ -7522,7 +7620,7 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 		users.forEach(user => {
 			const avatar = localStorage.getItem(`${user}_psn_avatar`) || "https://www.shutterstock.com/image-vector/default-avatar-profile-icon-social-600nw-1906669723.jpg";
 			itemsHtml += `
-				<div class="seen-user-item">
+				<div class="seen-user-item" onclick="openProfileModal('${user}')" style="cursor:pointer;">
 					<img src="${avatar}" class="seen-user-avatar">
 					<span class="seen-user-name">${user}</span>
 				</div>`;

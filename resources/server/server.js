@@ -39,13 +39,27 @@ io.on('connection', (socket) => {
     if (userData) {
       const name = typeof userData === 'object' ? userData.name : userData;
       const avatar = typeof userData === 'object' ? userData.avatar : null;
+      
+      const level = typeof userData === 'object' ? (userData.level || 1) : 1;
+      const joined = typeof userData === 'object' ? (userData.joined || "2026") : "2026";
+      const xp = typeof userData === 'object' ? (userData.xp || 0) : 0;
+      const downloads = typeof userData === 'object' ? (userData.downloads || 0) : 0;
+      const wishlist = typeof userData === 'object' ? (userData.wishlist || 0) : 0;
+      const favorites = typeof userData === 'object' ? (userData.favorites || 0) : 0;
 
       if (name) {
         onlineUsers[socket.id] = { 
           id: socket.id,
           name: name, 
-          avatar: avatar 
+          avatar: avatar,
+          level: level,
+          joined: joined,
+          xp: xp,
+          downloads: downloads,
+          wishlist: wishlist,
+          favorites: favorites
         };
+        // Quando emitir a lista, todos esses dados vão junto!
         io.emit('online_list', Object.values(onlineUsers));
       }
     }
