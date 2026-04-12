@@ -56,34 +56,21 @@ io.on('connection', (socket) => {
 
     if (cleanCode === "PLATINUMCODE") {
         console.log(`[AUTH] GOD MODE Voucher used by: ${user}`);
-        return callback({ 
-            success: true, 
-            type: 'PLATINUM_UNLOCK' 
-        });
+        return callback({ success: true, type: 'PLATINUM_UNLOCK' });
     }
 
     if (cleanCode === "UNLOCKALLDB1") {
         console.log(`[AUTH] Special Trophy Voucher used by: ${user}`);
-        return callback({ 
-            success: true, 
-            type: 'SINGLE_TROPHY' 
-        });
+        return callback({ success: true, type: 'SINGLE_TROPHY' });
     }
 
     if (cleanCode === ADMIN_SECRET && ADMIN_USERS.includes(user)) {
         console.log(`[AUTH] ADMIN LOGIN successful for: ${user}`);
-        return callback({ 
-            success: true, 
-            type: 'ADMIN_LOGIN',
-            secret: ADMIN_SECRET 
-        });
+        return callback({ success: true, type: 'ADMIN_LOGIN', secret: ADMIN_SECRET });
     }
 
     console.log(`[AUTH] Invalid code attempt: ${cleanCode} by ${user}`);
-    callback({ 
-        success: false, 
-        message: "Invalid voucher code or unauthorized user." 
-    });
+    callback({ success: false, message: "Invalid voucher code or unauthorized user." });
   });
 
   socket.on('delete_message', (data) => {
@@ -197,6 +184,14 @@ io.on('connection', (socket) => {
 
     const isAdmin = ADMIN_USERS.includes(messageData.user) && messageData.secret === ADMIN_SECRET;
     
+    if (messageData.text && messageData.text.trim() === '/reload') {
+        if (isAdmin) {
+            console.log(`[ADMIN] Force Reload command triggered by: ${messageData.user}`);
+            socket.broadcast.emit('force_reload');
+            return;
+        }
+    }
+
     if (messageData.text && messageData.text.includes('@everyone')) {
         if (isAdmin) {
             messageData.isGlobalPing = true;
