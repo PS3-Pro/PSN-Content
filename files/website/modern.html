@@ -6421,6 +6421,202 @@ function renderTrophiesView() {
         if (typeof playUiSuccess === 'function') playUiSuccess();
     }
 
+    function appendMessageToChat(msg, isMe = false, timestamp = null) {
+		const box = document.getElementById('chat-messages');
+		if (!box) return;
+	
+		const myName = localStorage.getItem('psn_username');
+		const mySecret = localStorage.getItem('psn_admin_secret');
+		
+		let cleanText = (typeof msg === 'object' && msg.text) ? msg.text : (typeof msg === 'string' ? msg : "");
+		let messageText = cleanText;
+		const userName = (typeof msg === 'object' && msg.user) ? msg.user : (isMe ? myName : "Guest");
+		const isImage = (typeof msg === 'object' && msg.type === 'image');
+		const replyData = (typeof msg === 'object' && msg.replyTo) ? msg.replyTo : null;
+		const isAuthor = (userName === myName);
+		
+		const isAdmin = !!mySecret; 
+	
+		const msgTimeValue = (msg.time) ? msg.time : (timestamp ? timestamp : Date.now());
+		const msgId = new Date(msgTimeValue).getTime();
+	
+		trackUser(userName);
+	
+		const firstLink = cleanText.match(/(https?:\/\/[^\s]+)/);
+		let previewPlaceholderHtml = '';
+		if (firstLink && !isImage) {
+			const previewId = `lp-${msgId}`;
+			previewPlaceholderHtml = `<div id="${previewId}"></div>`;
+		}
+	
+		const urlRegex = /(https?:\/\/[^\s]+)/g;
+		messageText = messageText.replace(urlRegex, function(url) {
+			return `<a href="${url}" target="_blank" style="color: #ffffff; text-decoration: underline; word-break: break-all;">${url}</a>`;
+		});
+	
+		chatUsers.forEach(user => {
+			if (user.length > 0) {
+				const mentionRegex = new RegExp(`@${user.replace(/[-\/\\^$*+?.()|[\]{}]/g, '\\$&')}`, 'g');
+				messageText = messageText.replace(mentionRegex, `<span class="chat-mention">@${user}</span>`);
+			}
+		});
+	
+		if (msg.isGlobalPing) {
+			messageText = messageText.replace(/@everyone/g, `<span class="chat-mention" style="background: #ff4444; color: #fff; padding: 2px 4px; border-radius: 4px; font-weight: bold; font-size: 10px;">@everyone</span>`);
+		}
+		
+		messageText = messageText.replace(/\n/g, '<br>');
+	
+		const isGlobal = msg.isGlobalPing === true;
+		const isPersonalMention = !isAuthor && myName && (cleanText.includes(`@${myName}`) || (replyData && replyData.user === myName));
+		
+		const userAvatar = (typeof msg === 'object' && msg.avatar) ? msg.avatar : (localStorage.getItem(`${userName}_psn_avatar`) || "https://avatarfiles.alphacoders.com/232/232155.jpg");
+		const date = new Date(msgTimeValue);
+		const timeStr = date.getHours().toString().padStart(2, '0') + ':' + date.getMinutes().toString().padStart(2, '0');
+	
+		const alignSelf = isAuthor ? 'flex-end' : 'flex-start';
+		const flexDir = isAuthor ? 'row-reverse' : 'row';
+		const bubbleRadius = isAuthor ? '12px 0px 12px 12px' : '0px 12px 12px 12px'; 
+		const nameColor = isAuthor ? '#00bcff' : '#ffcc00';
+	
+		let bgColor = isAuthor ? 'rgba(0, 112, 204, 0.45)' : 'rgba(255, 255, 255, 0.07)';
+		let borderColor = isAuthor ? 'var(--ps-blue)' : 'rgba(255, 255, 255, 0.15)';
+		let glowStyle = '';
+		let mentionTagHtml = '';
+	
+		if (isGlobal) {
+			bgColor = 'rgba(255, 68, 68, 0.2)';
+			borderColor = '#ff4444';
+			glowStyle = 'box-shadow: 0 0 10px rgba(255, 68, 68, 0.5);';
+			mentionTagHtml = `<span style="color:#ff4444; font-size:9px; margin-left:5px; font-weight:bold;">(ADMIN ALERT)</span>`;
+		} else if (isPersonalMention) {
+			bgColor = 'rgba(255, 204, 0, 0.15)';
+			borderColor = '#ffcc00';
+			glowStyle = 'box-shadow: 0 0 10px rgba(255, 204, 0, 0.4);';
+			mentionTagHtml = `<span style="color:#ffcc00; font-size:9px; margin-left:5px; font-weight:bold;">(MENTIONED YOU)</span>`;
+		}
+	
+		let replyBlockHtml = '';
+		if (replyData) {
+			replyBlockHtml = `
+				<div style="background: rgba(0, 0, 0, 0.3); border-left: 3px solid ${nameColor}; padding: 4px 10px; margin-bottom: 8px; border-radius: 4px; font-size: 11px; line-height: 1.2; display: block; width: 100%; box-sizing: border-box;">
+					<div style="font-weight: bold; color: ${nameColor}; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-bottom: 2px;">${replyData.user}</div>
+					<div style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: #aaa;">${replyData.text}</div>
+				</div>`;
+		}
+	
+		let editedTag = '';
+		if (msg.edited) {
+			editedTag = msg.editedByAdmin 
+				? ' <span style="font-size: 9px; opacity: 0.9; color: #ff4444; font-style: italic; font-weight: bold; margin-left: 5px;">(Edited by Admin)</span>' 
+				: ' <span style="font-size: 9px; opacity: 0.5; font-style: italic; margin-left: 5px;">(Edited)</span>';
+		}
+		
+		let messageBodyHtml = isImage 
+			? `<img src="${msg.content}" style="max-width: 100%; max-height: 250px; border-radius: 6px; cursor: zoom-in; display: block; margin: 0 auto;" onclick="openImageModal(this.src)">` + (messageText !== "" ? `<div id="msg-text-${msgId}" style="margin-top: 10px;">${messageText}${editedTag}</div>` : "")
+			: `<div id="msg-text-${msgId}">${messageText}${editedTag}</div>`;
+	
+		const encodedText = encodeURIComponent(cleanText).replace(/'/g, "%27");
+		const encodedUser = encodeURIComponent(userName).replace(/'/g, "%27");
+	
+		let reactionsHtml = (msg.reactions && msg.reactions.length > 0) 
+			? msg.reactions.map(r => `<div class="reaction-pill" data-emoji="${r.emoji}" data-count="${r.count}" data-users="${r.users ? r.users.join(', ') : ''}">${r.emoji} ${r.count}</div>`).join('') 
+			: '';
+	
+		const hasBeenSeen = (msg.seenBy && msg.seenBy.length > 0);
+		const seenColor = hasBeenSeen ? '#4caf50' : 'rgba(255, 255, 255, 0.3)';
+		const seenTitle = hasBeenSeen ? `Seen by: ${msg.seenBy.join(', ')}` : 'Sent';
+	
+		const msgHtml = `
+			<div id="msg-row-${msgId}" style="display: flex; flex-direction: ${flexDir}; align-self: ${alignSelf}; max-width: 85%; margin-bottom: 12px; gap: 10px; animation: fadeIn 0.2s ease-out; transition: all 0.3s ease;">
+				<img src="${userAvatar}" style="width: 34px; height: 34px; border-radius: 50%; border: 1px solid rgba(255,255,255,0.2); object-fit: cover; margin-top: 15px;">
+				<div style="display: flex; flex-direction: column; align-items: ${alignSelf}; min-width: 60px; max-width: 100%;">
+					<span style="font-size: 11px; color: ${nameColor}; font-weight: bold; margin-bottom: 4px;">
+						${userName} ${mentionTagHtml}
+					</span>
+					<div style="background: ${bgColor}; border: 1px solid ${borderColor}; padding: 10px 14px; border-radius: ${bubbleRadius}; backdrop-filter: blur(5px); ${glowStyle} width: fit-content; max-width: 100%; box-sizing: border-box;">
+						${replyBlockHtml}
+						<div style="font-size: 13.5px; color: #fff; line-height: 1.4;">
+							${messageBodyHtml}
+							${previewPlaceholderHtml}
+						</div>
+					</div>
+					
+					<div id="reactions-${msgId}" class="reactions-container" style="display: flex; flex-wrap: wrap; gap: 4px; margin-top: -5px; justify-content: ${alignSelf}">
+						${reactionsHtml}
+					</div>
+					
+					<div style="font-size: 11px; color: var(--text-muted); margin-top: 5px; display: flex; align-items: center; gap: 7px;">
+						<span style="transform: translateY(-1px); display: inline-block;">${timeStr}</span>
+						${isAuthor ? `<div id="check-${msgId}" style="display: flex; align-items: center; width: 16px; position: relative; cursor: help;" title="${seenTitle}"><i class="fas fa-check" style="color: ${seenColor}; font-size: 12.5px; position: absolute; left: 0;"></i><i class="fas fa-check" style="color: ${seenColor}; font-size: 12.5px; position: absolute; left: 5px; ${!hasBeenSeen ? 'display:none;' : ''}"></i></div>` : ''}
+						<i class="fas fa-reply" style="cursor: pointer; opacity: 0.5; color: #00bcff; font-size: 12px;" onclick="setReply(decodeURIComponent('${encodedUser}'), decodeURIComponent('${encodedText}'))"></i>
+						<i class="fas fa-smile" style="cursor: pointer; opacity: 0.5; color: #ffcc00; font-size: 12px;" onclick="openReactionPicker(event, '${msgId}')"></i>
+						${(isAuthor || isAdmin) ? `
+							<i class="fas fa-edit" style="cursor: pointer; opacity: 0.5; color: #ff00ff; font-size: 12px; margin-left: 1px;" onclick="startEditMessage('${msgId}', decodeURIComponent('${encodedText}'))"></i>
+							<i class="fas fa-trash-alt" style="cursor: pointer; opacity: 0.5; color: #ff4444; font-size: 12px; margin-left: 1px;" onclick="deleteMyMessage('${msgId}')"></i>
+						` : ''}
+					</div>
+				</div>
+			</div>`;
+	
+		box.innerHTML += msgHtml;
+	
+		if (firstLink && !isImage) fetchLinkMetadata(firstLink[0], `lp-${msgId}`);
+	
+		if (box.children.length > 1001) box.removeChild(box.children[1]);
+		box.scrollTop = box.scrollHeight;
+	
+		if (!isMe && myName && myName !== "Guest" && socketChat) {
+			socketChat.emit('mark_as_read', { msgId: msgId, user: myName });
+		}
+	}
+
+    function showChatNotification(userName, isMention, isGlobalPing) {
+        const systemSound = document.getElementById('sound-ui-message');
+        if (systemSound) systemSound.play().catch(() => {});
+    
+        const container = document.getElementById('trophy-container');
+        if (!container) return;
+    
+        const notification = document.createElement('div');
+        notification.className = 'trophy-popup'; 
+    
+        let highlightColor = '#0070cc';
+        let titleText = 'NEW MESSAGE';
+        let bodyText = `<b>${userName}</b> replied to you`;
+    
+        if (isGlobalPing) {
+            highlightColor = '#ff4444';
+            titleText = 'ADMIN ALERT';
+            bodyText = `<b>${userName}</b> notified everyone`;
+        } else if (isMention) {
+            highlightColor = '#ffcc00';
+            titleText = 'NEW MENTION';
+            bodyText = `<b>${userName}</b> mentioned you`;
+        }
+    
+        notification.innerHTML = `
+            <i class="fas fa-comment-dots trophy-popup-icon" style="color: ${highlightColor}"></i>
+            <div class="trophy-popup-text">
+                <h4 style="color: ${highlightColor}">${titleText}</h4>
+                <p>${bodyText}</p>
+            </div>
+        `;
+    
+        container.appendChild(notification);
+        
+        requestAnimationFrame(() => { 
+            requestAnimationFrame(() => { 
+                notification.classList.add('show'); 
+            }); 
+        });
+    
+        setTimeout(() => {
+            notification.classList.remove('show');
+            setTimeout(() => notification.remove(), 500);
+        }, 4000);
+    }
+    
     function initChat() {
         if (socketChat) {
             socketChat.disconnect();
@@ -6545,13 +6741,12 @@ function renderTrophiesView() {
                 const dot = document.getElementById('chat-dot');
                 if (dot) { 
                     dot.style.display = 'block'; 
-                    
+
                     if (data.isGlobalPing) {
                         dot.style.backgroundColor = '#ff4444';
                     } else if (data.text && (data.text.includes(`@${myName}`) || (data.replyTo && data.replyTo.user === myName))) {
-                        // Só muda pra dourado se não estiver vermelha
                         if (dot.style.backgroundColor !== 'rgb(255, 68, 68)') {
-                            dot.style.backgroundColor = '#ffcc00'; 
+                            dot.style.backgroundColor = '#ffcc00';
                         }
                     } else {
                         if (dot.style.backgroundColor !== 'rgb(255, 68, 68)' && dot.style.backgroundColor !== 'rgb(255, 204, 0)') {
@@ -6580,11 +6775,9 @@ function renderTrophiesView() {
             const textContainer = document.getElementById(`msg-text-${data.msgId}`);
             if (textContainer) {
                 let formattedText = data.newText.replace(/\n/g, '<br>');
-                
                 let editBadge = data.editedByAdmin 
                     ? ' <span style="font-size: 9px; opacity: 0.8; font-weight: italic; color: #ffd700; margin-left: 5px;">(Edited by Admin)</span>' 
                     : ' <span style="font-size: 9px; opacity: 0.5; font-style: italic; margin-left: 5px;">(Edited)</span>';
-                    
                 textContainer.innerHTML = formattedText + editBadge;
             }
         });
@@ -6592,22 +6785,13 @@ function renderTrophiesView() {
         socketChat.on('message_reaction', function(data) {
             const container = document.getElementById(`reactions-${data.msgId}`);
             if (!container) return;
-
             let pill = container.querySelector(`[data-emoji="${data.emoji}"]`);
-            
             if (pill) {
                 let users = pill.getAttribute('data-users').split(', ').filter(u => u !== "");
                 let userIndex = users.indexOf(data.user);
-
-                if (userIndex > -1) {
-                    users.splice(userIndex, 1);
-                } else {
-                    users.push(data.user);
-                }
-
-                if (users.length <= 0) {
-                    pill.remove();
-                } else {
+                if (userIndex > -1) { users.splice(userIndex, 1); } else { users.push(data.user); }
+                if (users.length <= 0) { pill.remove(); } 
+                else {
                     pill.setAttribute('data-count', users.length);
                     pill.setAttribute('data-users', users.join(', '));
                     pill.innerHTML = `${data.emoji} ${users.length}`;
@@ -6623,12 +6807,7 @@ function renderTrophiesView() {
                 msgRow.style.opacity = '0';
                 msgRow.style.transform = 'scale(0.8) translateX(20px)';
                 msgRow.style.pointerEvents = 'none';
-                
-                setTimeout(() => {
-                    if (msgRow.parentNode) {
-                        msgRow.remove();
-                    }
-                }, 400);
+                setTimeout(() => { if (msgRow.parentNode) msgRow.remove(); }, 400);
             }
         });
 
@@ -6656,52 +6835,6 @@ function renderTrophiesView() {
         });
     }
 
-    function showChatNotification(userName, isMention, isGlobalPing) {
-        const systemSound = document.getElementById('sound-ui-message');
-        if (systemSound) systemSound.play().catch(() => {});
-    
-        const container = document.getElementById('trophy-container');
-        if (!container) return;
-    
-        const notification = document.createElement('div');
-        notification.className = 'trophy-popup'; 
-    
-        let highlightColor = '#0070cc';
-        let titleText = 'NEW MESSAGE';
-        let bodyText = `<b>${userName}</b> replied to you`;
-    
-        if (isGlobalPing) {
-            highlightColor = '#ff4444';
-            titleText = 'ADMIN ALERT';
-            bodyText = `<b>${userName}</b> notified everyone`;
-        } else if (isMention) {
-            highlightColor = '#ffcc00';
-            titleText = 'NEW MENTION';
-            bodyText = `<b>${userName}</b> mentioned you`;
-        }
-    
-        notification.innerHTML = `
-            <i class="fas fa-comment-dots trophy-popup-icon" style="color: ${highlightColor}"></i>
-            <div class="trophy-popup-text">
-                <h4 style="color: ${highlightColor}">${titleText}</h4>
-                <p>${bodyText}</p>
-            </div>
-        `;
-    
-        container.appendChild(notification);
-        
-        requestAnimationFrame(() => { 
-            requestAnimationFrame(() => { 
-                notification.classList.add('show'); 
-            }); 
-        });
-    
-        setTimeout(() => {
-            notification.classList.remove('show');
-            setTimeout(() => notification.remove(), 500);
-        }, 4000);
-    }
-
     function sendChatMessage() {
         if (!socketChat) return;
         const input = document.getElementById('chat-input');
@@ -6720,7 +6853,6 @@ function renderTrophiesView() {
             if (isAdmin) {
                 globalPingActive = true;
             } else {
-                // Se não for admin, mata o ping pra não spammar ninguém
                 msg = msg.replace(/@everyone/g, "everyone");
             }
         }
