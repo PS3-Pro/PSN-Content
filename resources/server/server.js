@@ -171,8 +171,8 @@ io.on('connection', (socket) => {
     };
 
     const isAdmin = ADMIN_USERS.includes(messageData.user) && messageData.secret === ADMIN_SECRET;
-	
-	if (messageData.text && messageData.text.includes('@everyone')) {
+    
+    if (messageData.text && messageData.text.includes('@everyone')) {
         if (isAdmin) {
             messageData.isGlobalPing = true;
         } else {
@@ -187,6 +187,18 @@ io.on('connection', (socket) => {
     if (messageHistory.length > 100) messageHistory.shift();
 
     io.emit('chat_message', messageData); 
+  });
+
+  socket.on('clear_chat', (data) => {
+    const isAdmin = ADMIN_USERS.includes(data.user) && data.secret === ADMIN_SECRET;
+    
+    if (isAdmin) {
+        messageHistory = []; 
+        io.emit('chat_cleared'); 
+        console.log(`[ADMIN] Chat entirely cleared by: ${data.user}`);
+    } else {
+        console.log(`[AUTH] Unauthorized /clean attempt by: ${data.user}`);
+    }
   });
 
   socket.on('disconnect', () => {
