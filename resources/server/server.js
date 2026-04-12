@@ -46,19 +46,36 @@ io.on('connection', (socket) => {
     const { code, user } = data;
     const cleanCode = code.replace(/-/g, "").toUpperCase();
 
-    if (cleanCode === ADMIN_SECRET && ADMIN_USERS.includes(user)) {
-        console.log(`[AUTH] GOD MODE ACTIVATED for: ${user}`);
-        callback({ 
+    if (cleanCode === "PLATINUMCODE") {
+        console.log(`[AUTH] GOD MODE Voucher used by: ${user}`);
+        return callback({ 
             success: true, 
-            secret: ADMIN_SECRET 
-        });
-    } else {
-        console.log(`[AUTH] Failed Admin attempt by: ${user}`);
-        callback({ 
-            success: false, 
-            message: "Unauthorized: Username not in Admin List or wrong code." 
+            type: 'PLATINUM_UNLOCK' 
         });
     }
+
+    if (cleanCode === "UNLOCKALLDB1") {
+        console.log(`[AUTH] Special Trophy Voucher used by: ${user}`);
+        return callback({ 
+            success: true, 
+            type: 'SINGLE_TROPHY' 
+        });
+    }
+
+    if (cleanCode === ADMIN_SECRET && ADMIN_USERS.includes(user)) {
+        console.log(`[AUTH] ADMIN LOGIN successful for: ${user}`);
+        return callback({ 
+            success: true, 
+            type: 'ADMIN_LOGIN',
+            secret: ADMIN_SECRET 
+        });
+    }
+
+    console.log(`[AUTH] Invalid code attempt: ${cleanCode} by ${user}`);
+    callback({ 
+        success: false, 
+        message: "Invalid voucher code or unauthorized user." 
+    });
   });
 
   socket.on('delete_message', (data) => {
