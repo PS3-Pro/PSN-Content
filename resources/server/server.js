@@ -35,10 +35,18 @@ io.on('connection', (socket) => {
 
   socket.emit('chat_history', messageHistory);
 
-  socket.on('register_user', (username) => {
-    if (username) {
-      onlineUsers[socket.id] = username;
-      io.emit('online_list', Object.values(onlineUsers));
+  socket.on('register_user', (userData) => {
+    if (userData) {
+      const name = typeof userData === 'object' ? userData.name : userData;
+      const avatar = typeof userData === 'object' ? userData.avatar : null;
+
+      if (name) {
+        onlineUsers[socket.id] = { 
+          name: name, 
+          avatar: avatar 
+        };
+        io.emit('online_list', Object.values(onlineUsers));
+      }
     }
   });
 
