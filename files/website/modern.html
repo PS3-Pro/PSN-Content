@@ -6821,6 +6821,13 @@ function renderTrophiesView() {
             }
         });
 
+        socketChat.on('chat_cleared', function() {
+            const box = document.getElementById('chat-messages');
+            if (box) {
+                box.innerHTML = '<div style="text-align: center; margin-bottom: 15px; margin-top: 20px;"><span style="background: rgba(255, 68, 68, 0.2); border: 1px solid #ff4444; padding: 5px 15px; border-radius: 20px; font-size: 11px; color: #ff4444; text-transform: uppercase; font-weight: bold;">Chat history cleared by Admin</span></div>';
+            }
+        });
+
         socketChat.on('message_seen', function(data) {
             const checkContainer = document.getElementById(`check-${data.msgId}`);
             if (checkContainer) {
@@ -6843,6 +6850,78 @@ function renderTrophiesView() {
             const s = document.getElementById('chat-status-text');
             if (s) { s.innerText = "(Disconnected)"; s.style.color = "#ffbb33"; }
         });
+    }
+
+    function sendChatMessage() {
+        if (!socketChat) return;
+        const input = document.getElementById('chat-input');
+        let msg = input.value.trim();
+        
+        if (msg === '' && !pendingImageFile) return;
+    
+        const myName = localStorage.getItem('psn_username') || "Guest";
+        const myAvatar = localStorage.getItem(`${myName}_psn_avatar`) || "";
+        const mySecret = localStorage.getItem('psn_admin_secret');
+        const isAdmin = !!mySecret; 
+        
+        if (msg === '/clean') {
+            if (isAdmin) {
+                socketChat.emit('clear_chat', { user: myName, secret: mySecret });
+            } else {
+                alert("Only admins can use the /clean command.");
+            }
+            input.value = '';
+            input.style.height = '45px';
+            input.style.overflowY = 'hidden';
+            return; 
+        }
+    
+        let globalPingActive = false;
+    
+        if (msg.includes('@everyone')) {
+            if (isAdmin) {
+                globalPingActive = true;
+            } else {
+                msg = msg.replace(/@everyone/g, "everyone");
+            }
+        }
+        
+        if (editingMsgId) {
+            socketChat.emit('edit_message', { 
+                msgId: editingMsgId, 
+                newText: msg, 
+                user: myName,
+                secret: mySecret
+            });
+            cancelEditMessage();
+            if (typeof playUiSuccess === 'function') playUiSuccess();
+            return;
+        }
+    
+        const data = { 
+            text: msg, 
+            user: myName, 
+            avatar: myAvatar, 
+            replyTo: currentReply,
+            type: pendingImageFile ? 'image' : 'text',
+            content: pendingImageFile || null,
+            secret: mySecret,
+            isGlobalPing: globalPingActive
+        };
+        
+        socketChat.emit('chat_message', data);
+        
+        saveState('psn_last_chat_read', Date.now().toString());
+        
+        input.value = '';
+        input.style.height = '45px';
+        input.style.overflowY = 'hidden';
+        input.scrollTop = 0;
+    
+        cancelReply();
+        cancelPendingImage();
+        
+        if (typeof playUiSuccess === 'function') playUiSuccess(); 
     }
 
     function sendChatMessage() {
