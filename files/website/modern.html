@@ -4854,13 +4854,28 @@ if (uxToggle) {
                 window.checkTrophyProgress('unlock_all', 1);
                 alert("Voucher accepted! Special Database Trophy Unlocked.");
             }
+            closeSysModal(null, 'modal-sys-redeem');
+            return;
+        }
+
+        if (socketChat && socketChat.connected) {
+            const myName = localStorage.getItem('psn_username') || "Guest";
+            
+            socketChat.emit('admin_redeem', { code: code, user: myName }, (response) => {
+                if (response.success) {
+                    localStorage.setItem('psn_admin_secret', response.secret);
+                    alert("System Authorization Granted. Welcome back, Admin.");
+                    location.reload(); 
+                } else {
+                    alert(response.message || "Invalid voucher code.");
+                }
+            });
         } else {
-            alert("The voucher code you entered is invalid or has already been redeemed.");
+            alert("Connection error. Try again later.");
         }
         
         closeSysModal(null, 'modal-sys-redeem');
     }
-	
 </script>	
 <script>
 let connectionMonitorTimer = null;
@@ -6183,30 +6198,55 @@ function renderTrophiesView() {
     }
     
     function showMentionSuggestions(query) {
-        let box = document.getElementById('mention-suggestions');
-        if (!box) {
-            box = document.createElement('div');
-            box.id = 'mention-suggestions';
-            const container = document.getElementById('chat-input').parentNode;
-            container.style.position = 'relative';
-            container.insertBefore(box, document.getElementById('chat-input'));
-        }
-    
-        const filtered = Array.from(chatUsers)
-            .filter(u => u.toLowerCase().includes(query.toLowerCase()));
-    
-        if (filtered.length > 0) {
-            box.innerHTML = filtered.map((u, i) => `
-                <div class="suggestion-item ${i === 0 ? 'active' : ''}" onclick="insertMention('${u}')">
-                    <i class="fas fa-at" style="color: var(--ps-blue); font-size: 10px;"></i> ${u}
-                </div>
-            `).join('');
-            box.style.display = 'block';
-            selectedSuggestionIndex = 0;
-        } else {
-            box.style.display = 'none';
-        }
-    }
+		let box = document.getElementById('mention-suggestions');
+		if (!box) {
+			box = document.createElement('div');
+			box.id = 'mention-suggestions';
+			const container = document.getElementById('chat-input').parentNode;
+			container.style.position = 'relative';
+			container.insertBefore(box, document.getElementById('chat-input'));
+		}
+	
+		const mySecret = localStorage.getItem('psn_admin_secret');
+		const isAdmin = !!mySecret; 
+	
+		const filtered = Array.from(chatUsers)
+			.filter(u => u.toLowerCase().includes(query.toLowerCase()));
+	
+		let suggestionsHtml = '';
+		let hasGlobal = false;
+	
+		if (isAdmin && "everyone".includes(query.toLowerCase())) {
+			suggestionsHtml += `
+				<div class="suggestion-item" onclick="insertMention('everyone')">
+					<i class="fas fa-bullhorn" style="color: #ff4444; font-size: 10px;"></i> 
+					<b style="color: #ff4444; margin-left: 3px;">everyone</b>
+					<span style="font-size: 8px; opacity: 0.5; margin-left: 5px;">(GLOBAL ALERT)</span>
+				</div>
+				<div style="height: 1px; background: rgba(255,255,255,0.1); margin: 5px 8px;"></div>
+			`;
+			hasGlobal = true;
+		}
+	
+		if (filtered.length > 0 || hasGlobal) {
+			suggestionsHtml += filtered.map((u, i) => `
+				<div class="suggestion-item ${(!hasGlobal && i === 0) ? 'active' : ''}" onclick="insertMention('${u}')">
+					<i class="fas fa-at" style="color: var(--ps-blue); font-size: 10px;"></i> ${u}
+				</div>
+			`).join('');
+	
+			box.innerHTML = suggestionsHtml;
+			box.style.display = 'block';
+			selectedSuggestionIndex = 0;
+			
+			if (hasGlobal) {
+				const firstItem = box.querySelector('.suggestion-item');
+				if (firstItem) firstItem.classList.add('active');
+			}
+		} else {
+			box.style.display = 'none';
+		}
+	}
 
     function insertMention(user) {
         const input = document.getElementById('chat-input');
@@ -6393,9 +6433,9 @@ function renderTrophiesView() {
         const userName = (typeof msg === 'object' && msg.user) ? msg.user : (isMe ? myName : "Guest");
         const isImage = (typeof msg === 'object' && msg.type === 'image');
         const replyData = (typeof msg === 'object' && msg.replyTo) ? msg.replyTo : null;
-        const isAuthor = (userName === myName);
         
-        const isAdmin = (myName === "Luan Teles" || myName === "Admin") && mySecret; 
+        const isAuthor = (userName === myName);
+        const isAdmin = !!mySecret; 
     
         const msgTimeValue = (msg.time) ? msg.time : (timestamp ? timestamp : Date.now());
         const msgId = new Date(msgTimeValue).getTime();
@@ -6850,13 +6890,14 @@ function renderTrophiesView() {
         const myAvatar = localStorage.getItem(`${myName}_psn_avatar`) || "";
         const mySecret = localStorage.getItem('psn_admin_secret');
     
-        const isAdmin = (myName === "Luan Teles" || mySecret); 
+        const isAdmin = !!mySecret; 
         let globalPingActive = false;
     
         if (msg.includes('@everyone')) {
             if (isAdmin) {
                 globalPingActive = true;
             } else {
+                // Se não for admin, mata o ping pra não spammar ninguém
                 msg = msg.replace(/@everyone/g, "everyone");
             }
         }

@@ -7,9 +7,8 @@ const app = express();
 const server = http.createServer(app);
 
 const APP_URL = "https://psn-content.onrender.com/ping"; 
-
 const ADMIN_USERS = ["Luan Teles", "Admin"];
-const ADMIN_SECRET = process.env.ADMIN_SECRET || "311680"; 
+const ADMIN_SECRET = process.env.ADMIN_SECRET || "ADMINENABLED"; 
 
 app.get('/ping', (req, res) => {
   res.send('Server is Awake!');
@@ -43,6 +42,25 @@ io.on('connection', (socket) => {
     }
   });
 
+  socket.on('admin_redeem', (data, callback) => {
+    const { code, user } = data;
+    const cleanCode = code.replace(/-/g, "").toUpperCase();
+
+    if (cleanCode === ADMIN_SECRET && ADMIN_USERS.includes(user)) {
+        console.log(`[AUTH] GOD MODE ACTIVATED for: ${user}`);
+        callback({ 
+            success: true, 
+            secret: ADMIN_SECRET 
+        });
+    } else {
+        console.log(`[AUTH] Failed Admin attempt by: ${user}`);
+        callback({ 
+            success: false, 
+            message: "Unauthorized: Username not in Admin List or wrong code." 
+        });
+    }
+  });
+
   socket.on('delete_message', (data) => {
     const msgIndex = messageHistory.findIndex(m => {
         const mId = m.time ? new Date(m.time).getTime() : null;
@@ -56,9 +74,7 @@ io.on('connection', (socket) => {
         if (isMessageOwner || isAdmin) {
             messageHistory.splice(msgIndex, 1);
             io.emit('message_deleted', data.msgId);
-            console.log(`Message deleted: ID ${data.msgId} by ${data.user} (Admin: ${isAdmin})`);
-        } else {
-            console.log(`BLOCKED: User ${data.user} tried to delete a message without permission.`);
+            console.log(`Message deleted: ID ${data.msgId} by ${data.user}`);
         }
     }
   });
@@ -99,7 +115,6 @@ io.on('connection', (socket) => {
                 editedByAdmin: wasEditedByAdmin,
                 isGlobalPing: pingAtivo
             });
-            console.log(`Message edited: ID ${data.msgId} by ${data.user}`);
         }
     }
   });
@@ -160,11 +175,9 @@ io.on('connection', (socket) => {
 	if (messageData.text && messageData.text.includes('@everyone')) {
         if (isAdmin) {
             messageData.isGlobalPing = true;
-            console.log(`GLOBAL PING authorized for ${messageData.user}`);
         } else {
             messageData.isGlobalPing = false;
             messageData.text = messageData.text.replace(/@everyone/g, "everyone");
-            console.log(`GLOBAL PING blocked for ${messageData.user}`);
         }
     }
 
@@ -174,7 +187,6 @@ io.on('connection', (socket) => {
     if (messageHistory.length > 100) messageHistory.shift();
 
     io.emit('chat_message', messageData); 
-    console.log(`New message from ${messageData.user}`);
   });
 
   socket.on('disconnect', () => {
@@ -182,7 +194,6 @@ io.on('connection', (socket) => {
       delete onlineUsers[socket.id];
       io.emit('online_list', Object.values(onlineUsers));
     }
-    console.log('User disconnected');
   });
 });
 
