@@ -773,19 +773,24 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
         </div>
 
         <div id="name-input-overlay">
-            <span class="glow-text">SET PROFILE AVATAR</span>
-            
-            <div class="avatar-selection-grid" id="avatar-picker">
-                </div>
-
-            <span class="glow-text">IDENTIFICATION:</span>
-            <input type="text" id="new-psn-id" class="ps5-input-box" placeholder="Enter your PSN ID" maxlength="15">
-            
-            <div style="display: flex; gap: 20px;">
-                <button class="action-btn confirm" onmouseenter="playUiHover()" onclick="confirmNewUser()">CONFIRM</button>
-                <button class="action-btn cancel" onmouseenter="playUiHover()" onclick="closeNewUserModal()">BACK</button>
-            </div>
-        </div>
+			<span class="glow-text">SET PROFILE AVATAR</span>
+			
+			<div class="avatar-selection-grid" id="avatar-picker"></div>
+		
+			<span class="glow-text">IDENTIFICATION:</span>
+			<input type="text" 
+				id="new-psn-id" 
+				class="ps5-input-box" 
+				placeholder="Enter your PSN ID" 
+				maxlength="15" 
+				autocomplete="off"
+				oninput="this.value = this.value.replace(/[^a-zA-Z0-9\s-_]/g, '')">
+			
+			<div style="display: flex; gap: 20px;">
+				<button class="action-btn confirm" onmouseenter="playUiHover()" onclick="confirmNewUser()">CONFIRM</button>
+				<button class="action-btn cancel" onmouseenter="playUiHover()" onclick="closeNewUserModal()">BACK</button>
+			</div>
+		</div>
     </section>
 	
 	<div class="trophy-notification-container" id="trophy-container"></div>
@@ -2071,27 +2076,39 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
     
     function confirmNewUser() {
 		const input = document.getElementById('new-psn-id');
-		const name = input.value.trim();
 		
-        if (name.length < 3) {
-            alert("Username is too short! Minimum 3 characters.");
-            return;
-        }
-        if (name.length > 16) {
-            alert("Username is too long! Maximum 16 characters.");
-            return;
-        }
-
+		let name = input.value.replace(/[^a-zA-Z0-9\s-_]/g, '').trim();
+		input.value = name; // Atualiza o campo visualmente
+	
+		if (name.length < 3) {
+			if (typeof playUiError === 'function') playUiError();
+			alert("Username is too short! Minimum 3 characters.");
+			return;
+		}
+		
+		if (name.length > 16) {
+			if (typeof playUiError === 'function') playUiError();
+			alert("Username is too long! Maximum 16 characters.");
+			return;
+		}
+	
+		let users = getAllUsers();
+		if (users.includes(name)) {
+			if (typeof playUiError === 'function') playUiError();
+			alert("This username already exists!");
+			return;
+		}
+	
 		if (name !== "" && saveUserToGlobalList(name)) {
 			const now = new Date();
 			
-			const datePart = now.toLocaleDateString('en-US', { 
-				month: 'short', 
-				day: 'numeric', 
-				year: 'numeric' 
+			const datePart = now.toLocaleDateString('en-US', { 
+				month: 'short', 
+				day: 'numeric', 
+				year: 'numeric' 
 			});
 	
-			const timePart = now.getHours().toString().padStart(2, '0') + ":" + 
+			const timePart = now.getHours().toString().padStart(2, '0') + ":" + 
 							now.getMinutes().toString().padStart(2, '0');
 	
 			const dateTime = `${datePart} - ${timePart}`;
@@ -2101,7 +2118,13 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 			
 			document.getElementById('name-input-overlay').style.display = 'none';
 			input.value = '';
+			
+			if (typeof playUiSuccess === 'function') playUiSuccess();
+			
 			finishBoot(name);
+		} else {
+			if (typeof playUiError === 'function') playUiError();
+			alert("Maximum number of profiles (3) reached!");
 		}
 	}
     
@@ -6479,7 +6502,10 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 		const mySecret = localStorage.getItem('psn_admin_secret');
 		const isAdmin = !!mySecret; 
 	
-		const filtered = Array.from(chatUsers)
+		const onlineNames = currentOnlineList.map(u => u.name || u);
+		const allPossibleUsers = Array.from(new Set([...onlineNames, ...chatUsers]));
+	
+		const filtered = allPossibleUsers
 			.filter(u => u.toLowerCase().includes(query.toLowerCase()) && u !== myName);
 	
 		let suggestionsHtml = '';
@@ -6487,7 +6513,7 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 	
 		if (isAdmin && "everyone".includes(query.toLowerCase())) {
 			suggestionsHtml += `
-				<div class="suggestion-item" onclick="insertMention('everyone')">
+				<div class="suggestion-item" data-value="everyone" onclick="insertMention('everyone')">
 					<i class="fas fa-bullhorn" style="color: #ff4444; font-size: 10px;"></i> 
 					<b style="color: #ff4444; margin-left: 3px;">everyone</b>
 					<span style="font-size: 8px; opacity: 0.5; margin-left: 5px;">(GLOBAL ALERT)</span>
@@ -6499,7 +6525,7 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 	
 		if (filtered.length > 0 || hasGlobal) {
 			suggestionsHtml += filtered.map((u, i) => `
-				<div class="suggestion-item ${(!hasGlobal && i === 0) ? 'active' : ''}" onclick="insertMention('${u}')">
+				<div class="suggestion-item ${(!hasGlobal && i === 0) ? 'active' : ''}" data-value="${u}" onclick="insertMention('${u}')">
 					<i class="fas fa-at" style="color: var(--ps-blue); font-size: 10px;"></i> ${u}
 				</div>
 			`).join('');
@@ -6831,7 +6857,7 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 	
 		const msgHtml = `
 			<div id="msg-row-${msgId}" style="display: flex; flex-direction: ${flexDir}; align-self: ${alignSelf}; max-width: 85%; margin-bottom: 12px; gap: 10px; animation: fadeIn 0.2s ease-out; transition: all 0.3s ease;">
-				<img src="${userAvatar}" class="chat-avatar-clickable" onclick="openProfileModal('${userName}')"  style="width: 34px; height: 34px; border-radius: 50%; border: 1px solid rgba(255,255,255,0.2); object-fit: cover; margin-top: 15px;"><div style="display: flex; flex-direction: column; align-items: ${alignSelf}; min-width: 60px; max-width: 100%;">
+				<img src="${userAvatar}" class="chat-avatar-clickable" onclick="openProfileModal('${encodeURIComponent(userName).replace(/'/g, "%27")}')"  style="width: 34px; height: 34px; border-radius: 50%; border: 1px solid rgba(255,255,255,0.2); object-fit: cover; margin-top: 15px;"><div style="display: flex; flex-direction: column; align-items: ${alignSelf}; min-width: 60px; max-width: 100%;">
 					<span style="font-size: 11px; color: ${nameColor}; font-weight: bold; margin-bottom: 4px;">
 						${userName} ${mentionTagHtml}
 					</span>
@@ -6856,12 +6882,12 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 							</div>` 
 						: ''}
 	
-						<i class="fas fa-reply" style="cursor: pointer; opacity: 0.5; color: #00bcff; font-size: 12px; transition: all 0.2s;" onmouseover="this.style.opacity='1'; this.style.transform='scale(1.2)'" onmouseout="this.style.opacity='0.5'; this.style.transform='scale(1)'" onclick="setReply('${encodeURIComponent(userName)}', '${encodeURIComponent(cleanText)}')"></i>
+						<i class="fas fa-reply" style="cursor: pointer; opacity: 0.5; color: #00bcff; font-size: 12px; transition: all 0.2s;" onmouseover="this.style.opacity='1'; this.style.transform='scale(1.2)'" onmouseout="this.style.opacity='0.5'; this.style.transform='scale(1)'" onclick="setReply('${encodeURIComponent(userName).replace(/'/g, "%27")}', '${encodeURIComponent(cleanText).replace(/'/g, "%27")}')"></i>
 						<i class="fas fa-smile" style="cursor: pointer; opacity: 0.5; color: #ffcc00; font-size: 12px; transition: all 0.2s;" onmouseover="this.style.opacity='1'; this.style.transform='scale(1.2)'" onmouseout="this.style.opacity='0.5'; this.style.transform='scale(1)'" onclick="openReactionPicker(event, '${msgId}')"></i>
 						
 						${(isAuthor || isAdmin) ? `
 							<i class="fas fa-edit" style="cursor: pointer; opacity: 0.5; color: #ff00ff; font-size: 12px; transition: all 0.2s; margin-left: 1px;" onmouseover="this.style.opacity='1'; this.style.transform='scale(1.2)'" onmouseout="this.style.opacity='0.5'; this.style.transform='scale(1)'" onclick="startEditMessage('${msgId}', '${encodeURIComponent(cleanText)}')"></i>
-							<i class="fas fa-trash-alt" style="cursor: pointer; opacity: 0.5; color: #ff4444; font-size: 12px; transition: all 0.2s; margin-left: 1px;" onmouseover="this.style.opacity='1'; this.style.transform='scale(1.2)'" onmouseout="this.style.opacity='0.5'; this.style.transform='scale(1)'" onclick="deleteMyMessage('${msgId}')"></i>
+							<i class="fas fa-trash-alt" style="cursor: pointer; opacity: 0.5; color: #ff4444; font-size: 12px; transition: all 0.2s; margin-left: 1px;" onmouseover="this.style.opacity='1'; this.style.transform='scale(1.2)'" onmouseout="this.style.opacity='0.5'; this.style.transform='scale(1)'" onclick="startEditMessage('${msgId}', '${encodeURIComponent(cleanText).replace(/'/g, "%27")}')"></i>
 						` : ''}
 					</div>
 				</div>
@@ -7010,6 +7036,14 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 
                 history.forEach(data => {
                     trackUser(data.user);
+					
+					if (data.text) {
+						try {
+							let decoded = decodeURIComponent(data.text);
+							data.text = decoded.replace(/</g, "&lt;").replace(/>/g, "&gt;");
+						} catch(e) { console.error(e); }
+					}
+	
                     const msgTime = data.time ? new Date(data.time).getTime() : Date.now();
                     const isFromMe = (data.user === myName);
                     
@@ -7275,8 +7309,8 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 		
 		if (editingMsgId) {
 			socketChat.emit('edit_message', { 
-				msgId: editingMsgId, 
-				newText: msg, 
+				msgId: editingMsgId,
+				newText: encodeURIComponent(msg),
 				user: myName,
 				secret: mySecret
 			});
@@ -7286,7 +7320,7 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 		}
 	
 		const data = { 
-			text: msg, 
+			text: encodeURIComponent(msg),
 			user: myName, 
 			avatar: myAvatar, 
 			replyTo: currentReply,
@@ -7567,7 +7601,7 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 			<div style="display: flex; align-items: center; gap: 10px;">
 				<img src="${userAvatar || defaultAvatar}" 
 				class="online-user-avatar" 
-				onclick="openProfileModal('${username}')"
+				onclick="openProfileModal('${encodeURIComponent(userName).replace(/'/g, "%27")}')"
 				style="border-color: ${isMe ? 'var(--ps-blue)' : '#4caf50'}; cursor:pointer;" 
 				onerror="this.src='${defaultAvatar}'">
 				<div class="online-user-info">
@@ -7655,7 +7689,7 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 		users.forEach(user => {
 			const avatar = localStorage.getItem(`${user}_psn_avatar`) || "https://www.shutterstock.com/image-vector/default-avatar-profile-icon-social-600nw-1906669723.jpg";
 			itemsHtml += `
-				<div class="seen-user-item" onclick="openProfileModal('${user}')" style="cursor:pointer;">
+				<div class="seen-user-item" onclick="openProfileModal('${encodeURIComponent(userName).replace(/'/g, "%27")}')" style="cursor:pointer;">
 					<img src="${avatar}" class="seen-user-avatar">
 					<span class="seen-user-name">${user}</span>
 				</div>`;
