@@ -59,9 +59,20 @@ io.on('connection', (socket) => {
           wishlist: wishlist,
           favorites: favorites
         };
-        // Quando emitir a lista, todos esses dados vão junto!
         io.emit('online_list', Object.values(onlineUsers));
       }
+    }
+  });
+
+  socket.on('update_profile', (userData) => {
+    if (onlineUsers[socket.id]) {
+      if (userData.level !== undefined) onlineUsers[socket.id].level = userData.level;
+      if (userData.xp !== undefined) onlineUsers[socket.id].xp = userData.xp;
+      if (userData.downloads !== undefined) onlineUsers[socket.id].downloads = userData.downloads;
+      if (userData.wishlist !== undefined) onlineUsers[socket.id].wishlist = userData.wishlist;
+      if (userData.favorites !== undefined) onlineUsers[socket.id].favorites = userData.favorites;
+
+      io.emit('online_list', Object.values(onlineUsers));
     }
   });
 
