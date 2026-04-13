@@ -6801,6 +6801,8 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 		if (!box) return;
 	
 		const myName = localStorage.getItem('psn_username');
+		const mySecret = localStorage.getItem('psn_admin_secret');
+		const isAdmin = !!mySecret;
 		
 		let cleanText = (typeof msg === 'object' && msg.text) ? msg.text : (typeof msg === 'string' ? msg : "");
 		let messageText = cleanText;
@@ -6808,24 +6810,18 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 		const isImage = (typeof msg === 'object' && msg.type === 'image');
 		const replyData = (typeof msg === 'object' && msg.replyTo) ? msg.replyTo : null;
 		const isAuthor = (userName === myName);
-		const isAdmin = (myName === "Luan Teles" || myName === "Admin");
-	
 		const msgTimeValue = (msg.time) ? msg.time : (timestamp ? timestamp : Date.now());
 		const msgId = new Date(msgTimeValue).getTime();
+	
+		const encodedText = encodeURIComponent(cleanText).replace(/'/g, "%27");
+		const encodedUser = encodeURIComponent(userName).replace(/'/g, "%27");
 	
 		trackUser(userName);
 	
 		const firstLink = cleanText.match(/(https?:\/\/[^\s]+)/);
-		let previewPlaceholderHtml = '';
-		if (firstLink && !isImage) {
-			const previewId = `lp-${msgId}`;
-			previewPlaceholderHtml = `<div id="${previewId}"></div>`;
-		}
-	
-		const urlRegex = /(https?:\/\/[^\s]+)/g;
-		messageText = messageText.replace(urlRegex, function(url) {
-			return `<a href="${url}" target="_blank" style="color: #ffffff; text-decoration: underline; word-break: break-all;">${url}</a>`;
-		});
+		messageText = messageText.replace(/(https?:\/\/[^\s]+)/g, url => 
+			`<a href="${url}" target="_blank" style="color: #ffffff; text-decoration: underline; word-break: break-all;">${url}</a>`
+		);
 	
 		chatUsers.forEach(user => {
 			if (user.length > 0) {
@@ -6840,112 +6836,81 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 		
 		messageText = messageText.replace(/\n/g, '<br>');
 	
-		const wasIMentioned = !isAuthor && myName && (cleanText.includes(`@${myName}`) || msg.isGlobalPing === true);
-		
-		const userAvatar = (typeof msg === 'object' && msg.avatar) ? msg.avatar : (localStorage.getItem(`${userName}_psn_avatar`) || "https://avatarfiles.alphacoders.com/232/232155.jpg");
+		const isGlobal = msg.isGlobalPing === true;
+		const isPersonalMention = !isAuthor && myName && (cleanText.includes(`@${myName}`) || (replyData && replyData.user === myName));
+		const userAvatar = (typeof msg === 'object' && msg.avatar) ? msg.avatar : (localStorage.getItem(`${userName}_psn_avatar`) || "https://www.shutterstock.com/image-vector/default-avatar-profile-icon-social-600nw-1906669723.jpg");
 		const date = new Date(msgTimeValue);
 		const timeStr = date.getHours().toString().padStart(2, '0') + ':' + date.getMinutes().toString().padStart(2, '0');
 	
 		const alignSelf = isAuthor ? 'flex-end' : 'flex-start';
 		const flexDir = isAuthor ? 'row-reverse' : 'row';
 		const bubbleRadius = isAuthor ? '12px 0px 12px 12px' : '0px 12px 12px 12px'; 
-		const bgColor = isAuthor ? 'rgba(0, 112, 204, 0.45)' : (wasIMentioned ? 'rgba(255, 68, 68, 0.2)' : 'rgba(255, 255, 255, 0.07)');
-		const borderColor = isAuthor ? 'var(--ps-blue)' : (wasIMentioned ? '#ff4444' : 'rgba(255, 255, 255, 0.15)');
 		const nameColor = isAuthor ? '#00bcff' : '#ffcc00';
 	
-		let replyBlockHtml = '';
-		if (replyData) {
-			replyBlockHtml = `
-				<div style="background: rgba(0, 0, 0, 0.3); border-left: 3px solid ${nameColor}; padding: 4px 10px; margin-bottom: 8px; border-radius: 4px; font-size: 11px; line-height: 1.2; display: block; width: 100%; box-sizing: border-box;">
-					<div style="font-weight: bold; color: ${nameColor}; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-bottom: 2px;">${replyData.user}</div>
-					<div style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: #aaa;">${replyData.text}</div>
-				</div>`;
-		}
+		let bgColor = isAuthor ? 'rgba(0, 112, 204, 0.45)' : (isPersonalMention ? 'rgba(255, 204, 0, 0.15)' : 'rgba(255, 255, 255, 0.07)');
+		let borderColor = isAuthor ? 'var(--ps-blue)' : (isPersonalMention ? '#ffcc00' : 'rgba(255, 255, 255, 0.15)');
+		let glowStyle = (isGlobal || isPersonalMention) ? `box-shadow: 0 0 10px ${isGlobal ? 'rgba(255, 68, 68, 0.5)' : 'rgba(255, 204, 0, 0.4)'};` : '';
+		let mentionTagHtml = isGlobal ? `<span style="color:#ff4444; font-size:9px; margin-left:5px; font-weight:bold;">(ADMIN ALERT)</span>` : (isPersonalMention ? `<span style="color:#ffcc00; font-size:9px; margin-left:5px; font-weight:bold;">(MENTIONED YOU)</span>` : '');
 	
-		let editedTag = '';
-		if (msg.edited) {
-			if (msg.editedByAdmin) {
-				editedTag = ' <span style="font-size: 9px; opacity: 0.9; color: #ff4444; font-style: italic; font-weight: bold; margin-left: 5px;">(Edited by Admin)</span>';
-			} else {
-				editedTag = ' <span style="font-size: 9px; opacity: 0.5; font-style: italic; margin-left: 5px;">(Edited)</span>';
-			}
-		}
+		let replyBlockHtml = replyData ? `
+			<div style="background: rgba(0, 0, 0, 0.3); border-left: 3px solid ${nameColor}; padding: 4px 10px; margin-bottom: 8px; border-radius: 4px; font-size: 11px; line-height: 1.2; display: block; width: 100%; box-sizing: border-box;">
+				<div style="font-weight: bold; color: ${nameColor}; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-bottom: 2px;">${replyData.user}</div>
+				<div style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: #aaa;">${replyData.text}</div>
+			</div>` : '';
+	
+		let editedTag = msg.edited ? (msg.editedByAdmin ? ' <span style="font-size: 9px; opacity: 0.9; color: #ff4444; font-style: italic; font-weight: bold; margin-left: 5px;">(Edited by Admin)</span>' : ' <span style="font-size: 9px; opacity: 0.5; font-style: italic; margin-left: 5px;">(Edited)</span>') : '';
 		
-		let messageBodyHtml = '';
-		if (isImage) {
-			messageBodyHtml = `<img src="${msg.content}" style="max-width: 100%; max-height: 250px; border-radius: 6px; cursor: zoom-in; display: block; margin: 0 auto;" onclick="openImageModal(this.src)">`;
-			if (messageText !== "") {
-				messageBodyHtml += `<div id="msg-text-${msgId}" style="margin-top: 10px;">${messageText}${editedTag}</div>`;
-			}
-		} else {
-			messageBodyHtml = `<div id="msg-text-${msgId}">${messageText}${editedTag}</div>`;
-		}
-	
-		const encodedText = encodeURIComponent(cleanText).replace(/'/g, "%27");
-		const encodedUser = encodeURIComponent(userName).replace(/'/g, "%27");
-	
-		let reactionsHtml = '';
-		if (msg.reactions && msg.reactions.length > 0) {
-			reactionsHtml = msg.reactions.map(r => {
-				const userList = r.users ? r.users.join(', ') : '';
-				return `<div class="reaction-pill" data-emoji="${r.emoji}" data-count="${r.count}" data-users="${userList}">
-					${r.emoji} ${r.count}
-				</div>`;
-			}).join('');
-		}
+		let reactionsHtml = (msg.reactions || []).map(r => 
+			`<div class="reaction-pill" data-emoji="${r.emoji}" data-count="${r.count}" data-users="${(r.users || []).join(', ')}">${r.emoji} ${r.count}</div>`
+		).join('');
 	
 		const hasBeenSeen = (msg.seenBy && msg.seenBy.length > 0);
-		const seenList = hasBeenSeen ? msg.seenBy.join(', ') : '';
+		const seenByList = hasBeenSeen ? msg.seenBy.join(', ') : ''; 
 		const seenColor = hasBeenSeen ? '#4caf50' : 'rgba(255, 255, 255, 0.3)';
-		const seenTitle = hasBeenSeen ? `Seen by: ${seenList}` : 'Sent';
 	
 		const msgHtml = `
 			<div id="msg-row-${msgId}" style="display: flex; flex-direction: ${flexDir}; align-self: ${alignSelf}; max-width: 85%; margin-bottom: 12px; gap: 10px; animation: fadeIn 0.2s ease-out; transition: all 0.3s ease;">
-				<img src="${userAvatar}" style="width: 34px; height: 34px; border-radius: 50%; border: 1px solid rgba(255,255,255,0.2); object-fit: cover; margin-top: 15px;">
+				<img src="${userAvatar}" class="chat-avatar-clickable" onclick="openProfileModal('${encodedUser}')" style="width: 34px; height: 34px; border-radius: 50%; border: 1px solid rgba(255,255,255,0.2); object-fit: cover; margin-top: 15px;">
 				<div style="display: flex; flex-direction: column; align-items: ${alignSelf}; min-width: 60px; max-width: 100%;">
 					<span style="font-size: 11px; color: ${nameColor}; font-weight: bold; margin-bottom: 4px;">
-						${userName} ${wasIMentioned ? `<span style="color:#ff4444; font-size:9px; margin-left:5px;">(${msg.isGlobalPing ? 'ADMIN ALERT' : 'MENTIONED YOU'})</span>` : ''}
+						${userName} ${mentionTagHtml}
 					</span>
-					<div style="background: ${bgColor}; border: 1px solid ${borderColor}; padding: 10px 14px; border-radius: ${bubbleRadius}; backdrop-filter: blur(5px); ${wasIMentioned ? 'box-shadow: 0 0 10px rgba(255, 68, 68, 0.5);' : ''} width: fit-content; max-width: 100%; box-sizing: border-box;">
+					<div style="background: ${bgColor}; border: 1px solid ${borderColor}; padding: 10px 14px; border-radius: ${bubbleRadius}; backdrop-filter: blur(5px); ${glowStyle} width: fit-content; max-width: 100%; box-sizing: border-box;">
 						${replyBlockHtml}
 						<div style="font-size: 13.5px; color: #fff; line-height: 1.4;">
-							${messageBodyHtml}
-							${previewPlaceholderHtml}
+							${isImage ? `<img src="${msg.content}" style="max-width: 100%; max-height: 250px; border-radius: 6px; cursor: zoom-in; display: block; margin: 0 auto;" onclick="openImageModal(this.src)">` + (messageText !== "" ? `<div id="msg-text-${msgId}" style="margin-top: 10px;">${messageText}${editedTag}</div>` : "") : `<div id="msg-text-${msgId}">${messageText}${editedTag}</div>`}
+							${(firstLink && !isImage) ? `<div id="lp-${msgId}"></div>` : ''}
 						</div>
 					</div>
-					
-					<div id="reactions-${msgId}" class="reactions-container" style="display: flex; flex-wrap: wrap; gap: 4px; margin-top: -5px; justify-content: ${alignSelf}">
-						${reactionsHtml}
-					</div>
-					
+					<div id="reactions-${msgId}" class="reactions-container" style="display: flex; flex-wrap: wrap; gap: 4px; margin-top: -5px; justify-content: ${alignSelf}">${reactionsHtml}</div>
 					<div style="font-size: 11px; color: var(--text-muted); margin-top: 5px; display: flex; align-items: center; gap: 7px;">
 						<span style="transform: translateY(-1px); display: inline-block;">${timeStr}</span>
 						
 						${isAuthor ? `
-						<div id="check-${msgId}" style="display: flex; align-items: center; width: 16px; position: relative; cursor: help; margin-right: 0px;" title="${seenTitle}">
-							<i class="fas fa-check" style="color: ${seenColor}; font-size: 12.5px; position: absolute; left: 0;"></i>
-							<i class="fas fa-check" style="color: ${seenColor}; font-size: 12.5px; position: absolute; left: 5px; ${!hasBeenSeen ? 'display:none;' : ''}"></i>
-						</div>` : ''}
-						
-						<i class="fas fa-reply" style="cursor: pointer; opacity: 0.5; color: #00bcff; font-size: 12px; transition: opacity 0.2s;" onmouseover="this.style.opacity='1'" onmouseout="this.style.opacity='0.5'" onclick="setReply(decodeURIComponent('${encodedUser}'), decodeURIComponent('${encodedText}'))"></i>
-						<i class="fas fa-smile" style="cursor: pointer; opacity: 0.5; color: #ffcc00; font-size: 12px; transition: opacity 0.2s;" onmouseover="this.style.opacity='1'" onmouseout="this.style.opacity='0.5'" onclick="openReactionPicker(event, '${msgId}')"></i>
+							<div id="check-${msgId}" 
+								style="display: flex; align-items: center; width: 16px; position: relative; cursor: pointer;" 
+								data-seen-list="${seenByList}" 
+								onclick="openSeenByPopup(event, '${msgId}')">
+								<i class="fas fa-check" style="color: ${seenColor}; font-size: 12.5px; position: absolute; left: 0;"></i>
+								<i class="fas fa-check" style="color: ${seenColor}; font-size: 12.5px; position: absolute; left: 5px; ${!hasBeenSeen ? 'display:none;' : ''}"></i>
+							</div>` 
+						: ''}
+	
+						<i class="fas fa-reply" style="cursor: pointer; opacity: 0.5; color: #00bcff; font-size: 12px; transition: all 0.2s;" onmouseover="this.style.opacity='1'; this.style.transform='scale(1.2)'" onmouseout="this.style.opacity='0.5'; this.style.transform='scale(1)'" onclick="setReply(decodeURIComponent('${encodedUser}'), decodeURIComponent('${encodedText}'))"></i>
+						<i class="fas fa-smile" style="cursor: pointer; opacity: 0.5; color: #ffcc00; font-size: 12px; transition: all 0.2s;" onmouseover="this.style.opacity='1'; this.style.transform='scale(1.2)'" onmouseout="this.style.opacity='0.5'; this.style.transform='scale(1)'" onclick="openReactionPicker(event, '${msgId}')"></i>
 						
 						${(isAuthor || isAdmin) ? `
-							<i class="fas fa-edit" style="cursor: pointer; opacity: 0.5; color: #ff00ff; font-size: 12px; transition: opacity 0.2s; margin-left: 1px;" onmouseover="this.style.opacity='1'" onmouseout="this.style.opacity='0.5'" onclick="startEditMessage('${msgId}', decodeURIComponent('${encodedText}'))"></i>
-							<i class="fas fa-trash-alt" style="cursor: pointer; opacity: 0.5; color: #ff4444; font-size: 12px; transition: opacity 0.2s; margin-left: 1px;" onmouseover="this.style.opacity='1'" onmouseout="this.style.opacity='0.5'" onclick="deleteMyMessage('${msgId}')"></i>
+							<i class="fas fa-edit" style="cursor: pointer; opacity: 0.5; color: #ff00ff; font-size: 12px; transition: all 0.2s; margin-left: 1px;" onmouseover="this.style.opacity='1'; this.style.transform='scale(1.2)'" onmouseout="this.style.opacity='0.5'; this.style.transform='scale(1)'" onclick="startEditMessage('${msgId}', decodeURIComponent('${encodedText}'))"></i>
+							<i class="fas fa-trash-alt" style="cursor: pointer; opacity: 0.5; color: #ff4444; font-size: 12px; transition: all 0.2s; margin-left: 1px;" onmouseover="this.style.opacity='1'; this.style.transform='scale(1.2)'" onmouseout="this.style.opacity='0.5'; this.style.transform='scale(1)'" onclick="deleteMyMessage('${msgId}')"></i>
 						` : ''}
 					</div>
 				</div>
 			</div>`;
 	
-		box.innerHTML += msgHtml;
+		box.insertAdjacentHTML('beforeend', msgHtml);
 	
-		if (firstLink && !isImage) {
-			const previewId = `lp-${msgId}`;
-			fetchLinkMetadata(firstLink[0], previewId);
-		}
-	
-		if (box.children.length > 1001) box.removeChild(box.children[1]);
+		if (firstLink && !isImage) fetchLinkMetadata(firstLink[0], `lp-${msgId}`);
+		if (box.children.length > 1000) box.removeChild(box.children[1]);
 		box.scrollTop = box.scrollHeight;
 	
 		if (!isMe && myName && myName !== "Guest" && socketChat) {
