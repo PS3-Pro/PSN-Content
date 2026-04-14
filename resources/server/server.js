@@ -46,6 +46,13 @@ io.on('connection', (socket) => {
       const downloads = typeof userData === 'object' ? (userData.downloads || 0) : 0;
       const wishlist = typeof userData === 'object' ? (userData.wishlist || 0) : 0;
       const favorites = typeof userData === 'object' ? (userData.favorites || 0) : 0;
+      const trophies = typeof userData === 'object' ? (userData.trophies || 0) : 0;
+      const library = typeof userData === 'object' ? (userData.library || 0) : 0;
+      const downloadsData = typeof userData === 'object' ? (userData.downloadsData || []) : [];
+      const wishlistData = typeof userData === 'object' ? (userData.wishlistData || []) : [];
+      const favoritesData = typeof userData === 'object' ? (userData.favoritesData || []) : [];
+      const libraryData = typeof userData === 'object' ? (userData.libraryData || []) : [];
+      const trophiesData = typeof userData === 'object' ? (userData.trophiesData || {}) : {};
 
       if (name) {
         onlineUsers[socket.id] = { 
@@ -57,7 +64,14 @@ io.on('connection', (socket) => {
           xp: xp,
           downloads: downloads,
           wishlist: wishlist,
-          favorites: favorites
+          favorites: favorites,
+          trophies: trophies,
+          library: library,
+          downloadsData: downloadsData,
+          wishlistData: wishlistData,
+          favoritesData: favoritesData,
+          libraryData: libraryData,
+          trophiesData: trophiesData
         };
         io.emit('online_list', Object.values(onlineUsers));
       }
@@ -71,6 +85,14 @@ io.on('connection', (socket) => {
       if (userData.downloads !== undefined) onlineUsers[socket.id].downloads = userData.downloads;
       if (userData.wishlist !== undefined) onlineUsers[socket.id].wishlist = userData.wishlist;
       if (userData.favorites !== undefined) onlineUsers[socket.id].favorites = userData.favorites;
+      if (userData.trophies !== undefined) onlineUsers[socket.id].trophies = userData.trophies;
+      if (userData.library !== undefined) onlineUsers[socket.id].library = userData.library;
+      
+      if (userData.downloadsData !== undefined) onlineUsers[socket.id].downloadsData = userData.downloadsData;
+      if (userData.wishlistData !== undefined) onlineUsers[socket.id].wishlistData = userData.wishlistData;
+      if (userData.favoritesData !== undefined) onlineUsers[socket.id].favoritesData = userData.favoritesData;
+      if (userData.libraryData !== undefined) onlineUsers[socket.id].libraryData = userData.libraryData;
+      if (userData.trophiesData !== undefined) onlineUsers[socket.id].trophiesData = userData.trophiesData;
 
       io.emit('online_list', Object.values(onlineUsers));
     }

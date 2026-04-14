@@ -1568,24 +1568,41 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 						<div style="font-size: 10px; color: #ffcc00; margin-top: 2px; font-weight: bold; letter-spacing: 1px;">LEVEL</div>
 					</div>
 				</div>
-				<div style="display: flex; gap: 10px;">
-					<div class="player-stat-box">
+				<div style="display: flex; gap: 10px; flex-wrap: wrap; justify-content: center;">
+					<div class="player-stat-box" style="cursor: pointer;" onclick="openPlayerList('downloads')" onmouseenter="playUiHover()">
 						<div id="card-downloads" class="player-stat-value">0</div>
 						<div class="player-stat-label">Downloads</div>
 					</div>
-					<div class="player-stat-box">
+					<div class="player-stat-box" style="cursor: pointer;" onclick="openPlayerList('wishlist')" onmouseenter="playUiHover()">
 						<div id="card-wishlist" class="player-stat-value">0</div>
 						<div class="player-stat-label">Wishlist</div>
 					</div>
-					<div class="player-stat-box">
+					<div class="player-stat-box" style="cursor: pointer;" onclick="openPlayerList('favs')" onmouseenter="playUiHover()">
 						<div id="card-favs" class="player-stat-value">0</div>
 						<div class="player-stat-label">Favorites</div>
+					</div>
+					<div class="player-stat-box" style="cursor: pointer;" onclick="openPlayerList('trophies')" onmouseenter="playUiHover()">
+						<div id="card-trophies" class="player-stat-value">0</div>
+						<div class="player-stat-label">Trophies</div>
+					</div>
+					<div class="player-stat-box" style="cursor: pointer;" onclick="openPlayerList('library')" onmouseenter="playUiHover()">
+						<div id="card-library" class="player-stat-value">0</div>
+						<div class="player-stat-label">Library</div>
 					</div>
 				</div>
 			</div>
 		</div>
 	</div>
-
+	<div id="modal-sys-list" class="sys-modal-overlay" onclick="closeSysModal(event, 'modal-sys-list')" style="z-index: 100000;">
+		<div class="sys-modal-content" style="max-width: 500px;">
+			<div class="sys-modal-header">
+				<h2 id="list-modal-title"><i class="fas fa-list"></i> Player Collection</h2>
+				<button class="sys-modal-close" onmouseenter="playUiHover()" onclick="closeSysModal(null, 'modal-sys-list')"><i class="fas fa-times"></i></button>
+			</div>
+			<div class="sys-modal-body" id="list-modal-body" style="max-height: 400px; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; padding: 15px;">
+				</div>
+		</div>
+	</div>
 	<div id="modal-sys-theme" class="sys-modal-overlay" onclick="closeSysModal(event, 'modal-sys-theme')">
 		<div class="sys-modal-content">
 			<div class="sys-modal-header">
@@ -4998,9 +5015,18 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 			playerLevel = localStorage.getItem(`${username}_psn_level`) || "1";
 		}
 		
+		let myTrophyCount = 0;
+		if (isMe && window.userTrophies) {
+			Object.keys(window.userTrophies).forEach(id => {
+				if (window.userTrophies[id].unlocked) myTrophyCount++;
+			});
+		}
+		
 		const countDownloads = isMe ? (window.downloadHistory?.length || 0) : (localStorage.getItem(`${username}_psn_downloads`) || 0);
 		const countWishlist = isMe ? (window.wishlist?.length || 0) : (localStorage.getItem(`${username}_psn_wishlist`) || 0);
 		const countFavs = isMe ? (window.favoritesLibrary?.length || 0) : (localStorage.getItem(`${username}_psn_favs`) || 0);
+		const countTrophies = isMe ? myTrophyCount : (localStorage.getItem(`${username}_psn_trophies`) || 0);
+		const countLibrary = isMe ? (typeof lastScannedGames !== 'undefined' ? lastScannedGames.length : 0) : (localStorage.getItem(`${username}_psn_library`) || 0);
 	
 		document.getElementById('card-username').innerText = username;
 		document.getElementById('card-avatar').src = avatarUrl;
@@ -5010,6 +5036,8 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 		document.getElementById('card-downloads').innerText = countDownloads;
 		document.getElementById('card-wishlist').innerText = countWishlist;
 		document.getElementById('card-favs').innerText = countFavs;
+		if (document.getElementById('card-trophies')) document.getElementById('card-trophies').innerText = countTrophies;
+		if (document.getElementById('card-library')) document.getElementById('card-library').innerText = countLibrary;
 	
 		if (profileModal) {
 			profileModal.style.display = 'flex';
@@ -5052,6 +5080,104 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 
         requestAnimationFrame(() => requestAnimationFrame(() => modal.classList.add('show')));
     }
+	
+	window.openPlayerList = function(listType) {
+		if (typeof playUiClick === 'function') playUiClick();
+		
+		const targetUser = document.getElementById('card-username').innerText;
+		const myName = localStorage.getItem('psn_username') || "Guest";
+		const isMe = (targetUser === myName);
+		
+		let rawData = null;
+		if (isMe) {
+			if (listType === 'wishlist') rawData = window.wishlist || [];
+			if (listType === 'downloads') rawData = window.downloadHistory || [];
+			if (listType === 'favs') rawData = window.favoritesLibrary || [];
+			if (listType === 'library') rawData = typeof lastScannedGames !== 'undefined' ? lastScannedGames : [];
+			if (listType === 'trophies') rawData = window.userTrophies || {}; // Troféus é Objeto, não Array
+		} else {
+			const savedData = localStorage.getItem(`${targetUser}_psn_${listType}_data`);
+			if (savedData) rawData = JSON.parse(savedData);
+		}
+		
+		let dataArray = [];
+		const isTrophyView = (listType === 'trophies');
+	
+		if (isTrophyView) {
+			const allTrophies = rawData || {};
+			Object.keys(allTrophies).forEach(id => {
+				if (allTrophies[id].unlocked && typeof TROPHY_DATA !== 'undefined' && TROPHY_DATA[id]) {
+					dataArray.push({
+						...TROPHY_DATA[id], 
+						unlockDate: allTrophies[id].unlockDate || "Unknown Date"
+					});
+				}
+			});
+			const weight = { platinum: 1, gold: 2, silver: 3, bronze: 4 };
+			dataArray.sort((a, b) => weight[a.type] - weight[b.type]);
+		} else {
+			dataArray = rawData || [];
+		}
+		
+		const titles = {
+			'wishlist': 'Wishlist',
+			'downloads': 'Download History',
+			'favs': 'Favorite Games',
+			'library': 'Installed Library',
+			'trophies': 'Earned Trophies'
+		};
+		
+		document.getElementById('list-modal-title').innerHTML = `<i class="fas ${isTrophyView ? 'fa-trophy' : 'fa-list'}"></i> ${targetUser}'s ${titles[listType]}`;
+		const body = document.getElementById('list-modal-body');
+		body.innerHTML = '';
+		
+		if (dataArray.length === 0) {
+			body.innerHTML = `<div style="text-align:center; padding: 30px; color: #888;">This list is empty.</div>`;
+		} else {
+			let html = '';
+			dataArray.forEach(item => {
+				if (isTrophyView) {
+					// RENDERIZANDO TROFÉU
+					const colors = { bronze: '#cd7f32', silver: '#c0c0c0', gold: '#ffcc00', platinum: '#00f0ff' };
+					const color = colors[item.type] || '#fff';
+					const iconClass = item.type === 'platinum' ? 'fas fa-award' : 'fas fa-trophy';
+					
+					html += `
+						<div style="display: flex; align-items: center; gap: 15px; background: rgba(255,255,255,0.05); padding: 10px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.05);">
+							<div style="width: 40px; text-align: center;"><i class="${iconClass}" style="color: ${color}; font-size: 24px;"></i></div>
+							<div style="flex: 1;">
+								<div style="color: #fff; font-weight: bold; font-size: 13px;">${item.title}</div>
+								<div style="color: #888; font-size: 11px;">${item.desc}</div>
+							</div>
+							<div style="color: var(--text-muted); font-size: 10px; text-align: right;"><i class="far fa-clock"></i><br>${item.unlockDate.split(' - ')[0]}</div>
+						</div>
+					`;
+				} else {
+					// RENDERIZANDO JOGO/DOWNLOAD
+					const itemName = item.cleanName || item.name || item.title || "Unknown File";
+					let itemCover = "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/main/resources/interface/modern/images/avatars/default.png";
+					
+					if (item.id) {
+						itemCover = typeof getOptimizedCover === 'function' ? getOptimizedCover(item.id) : `https://images.igdb.com/igdb/image/upload/t_cover_big/${item.id}.jpg`;
+					} else if (item.cover) {
+						itemCover = item.cover;
+					}
+					
+					html += `
+						<div style="display: flex; align-items: center; gap: 15px; background: rgba(255,255,255,0.05); padding: 10px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.05);">
+							<img src="${itemCover}" style="width: 40px; height: 40px; border-radius: 4px; object-fit: cover;" onerror="this.src='https://via.placeholder.com/40x40'">
+							<div style="color: #fff; font-weight: bold; font-size: 13px;">${itemName}</div>
+						</div>
+					`;
+				}
+			});
+			body.innerHTML = html;
+		}
+		
+		const modal = document.getElementById('modal-sys-list');
+		modal.style.display = 'flex';
+		requestAnimationFrame(() => modal.classList.add('show'));
+	};
 
     function setTheme(color, btnElement) {
         if (typeof playUiClick === 'function') playUiClick();
@@ -5344,6 +5470,10 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 			}).filter(game => game.path !== "");
 	
 			renderLocalLibrary(discoveredGames);
+			
+			if (typeof window.broadcastProfileUpdate === 'function') {
+                window.broadcastProfileUpdate();
+            }
 	
 			if (actions) actions.style.display = 'flex';
 			if (status) { status.innerText = `(${discoveredGames.length} items)`; status.style.color = "#4caf50"; }
@@ -7016,11 +7146,13 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 			const myJoinedDate = localStorage.getItem(`${myName}_joined_date`) || "2026";
 			
 			let totalXp = 0;
+			let totalTrophiesUnlocked = 0;
 			const xpMap = { bronze: 15, silver: 30, gold: 90, platinum: 300 };
 			if (window.userTrophies) {
 				Object.keys(window.userTrophies).forEach(id => {
 					if (window.userTrophies[id].unlocked && TROPHY_DATA[id]) {
 						totalXp += xpMap[TROPHY_DATA[id].type] || 0;
+						totalTrophiesUnlocked++;
 					}
 				});
 			}
@@ -7033,7 +7165,10 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 				joined: myJoinedDate,
 				downloads: window.downloadHistory ? window.downloadHistory.length : 0,
 				wishlist: window.wishlist ? window.wishlist.length : 0,
-				favorites: window.favoritesLibrary ? window.favoritesLibrary.length : 0
+				favorites: window.favoritesLibrary ? window.favoritesLibrary.length : 0,
+				trophies: totalTrophiesUnlocked,
+				library: typeof lastScannedGames !== 'undefined' ? lastScannedGames.length : 0,
+				trophiesData: window.userTrophies || {}
 			});
 			
 			
@@ -7059,6 +7194,9 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 						localStorage.setItem(`${u.name}_psn_downloads`, u.downloads || 0);
 						localStorage.setItem(`${u.name}_psn_wishlist`, u.wishlist || 0);
 						localStorage.setItem(`${u.name}_psn_favs`, u.favorites || 0);
+						localStorage.setItem(`${u.name}_psn_trophies`, u.trophies || 0); 
+						localStorage.setItem(`${u.name}_psn_library`, u.library || 0);
+						localStorage.setItem(`${u.name}_psn_trophies_data`, JSON.stringify(u.trophiesData || {}));
 					}
 				});
 			}
@@ -7263,11 +7401,14 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 		if (!socketChat || !socketChat.connected) return;
 	
 		let totalXp = 0;
+		let totalTrophies = 0; // Nova variável para contar troféus
 		const xpMap = { bronze: 15, silver: 30, gold: 90, platinum: 300 };
+		
 		if (window.userTrophies && typeof TROPHY_DATA !== 'undefined') {
 			Object.keys(window.userTrophies).forEach(id => {
 				if (window.userTrophies[id].unlocked && TROPHY_DATA[id]) {
 					totalXp += xpMap[TROPHY_DATA[id].type] || 0;
+					totalTrophies++; // Soma os troféus reais
 				}
 			});
 		}
@@ -7278,7 +7419,10 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 			xp: totalXp,
 			downloads: window.downloadHistory ? window.downloadHistory.length : 0,
 			wishlist: window.wishlist ? window.wishlist.length : 0,
-			favorites: window.favoritesLibrary ? window.favoritesLibrary.length : 0
+			favorites: window.favoritesLibrary ? window.favoritesLibrary.length : 0,
+			trophies: totalTrophies, // ENVIANDO PARA O SERVIDOR
+			library: typeof lastScannedGames !== 'undefined' ? lastScannedGames.length : 0,
+			trophiesData: window.userTrophies || {}
 		});
 	};
 
