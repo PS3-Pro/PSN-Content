@@ -1007,14 +1007,15 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 			</ul>
 	
 			<div class="user-profile" style="display: flex; flex-direction: column; padding: 20px; border-top: 1px solid rgba(255, 255, 255, 0.05);">
-    
 				<div id="user-profile-trigger" style="display: flex; align-items: center; gap: 15px; position: relative; cursor: pointer; padding: 8px; border-radius: 8px; transition: background 0.2s;" onclick="toggleProfileMenu(event)" onmouseenter="playUiHover()">
 					<div class="user-avatar"></div>
 					<div style="flex-grow: 1;">
 						<div style="font-size: 11px; color: var(--text-muted);">PSN ID:</div>
 						<div id="sidebar-user-name" style="font-size: 13px; font-weight: bold; color: #fff; margin-bottom: 2px;">User Name</div>
-						<div style="font-size: 11px; color: #4caf50; display: flex; align-items: center; gap: 4px;">
-							<i class="fas fa-circle" style="font-size: 8px;"></i> Online
+						
+						<div id="sidebar-status-container" style="font-size: 11px; color: #4caf50; display: flex; align-items: center; gap: 4px;">
+							<i id="sidebar-status-icon" class="fas fa-circle" style="font-size: 8px;"></i> 
+							<span id="sidebar-status-text">Online</span>
 						</div>
 					</div>
 					<i class="fas fa-angle-down elegant-breathe-icon"></i>
@@ -5214,9 +5215,11 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 		const statusContainer = document.getElementById('card-status-container');
 	
 		if (isMe) {
-			statusText.innerText = "Status: Online (You)";
-			statusContainer.style.color = "#4caf50";
+			const isConnected = socketChat && socketChat.connected;
+			statusText.innerText = isConnected ? "Status: Online" : "Status: Offline";
+			statusContainer.style.color = isConnected ? "#4caf50" : "#ff4444";
 			statusIcon.style.display = "block";
+			statusIcon.className = isConnected ? "fas fa-circle" : "fas fa-circle";
 		} else if (networkUser) {
 			if (networkUser.online) {
 				statusText.innerText = "Status: Online";
@@ -5294,6 +5297,39 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 		}
 		return totalXp;
 	}
+	
+	window.updateGlobalOnlineStatus = function(state) {
+		const sText = document.getElementById('sidebar-status-text');
+		const sIcon = document.getElementById('sidebar-status-icon');
+		const sCont = document.getElementById('sidebar-status-container');
+	
+		const mText = document.getElementById('card-status-text');
+		const mIcon = document.getElementById('card-status-icon');
+		const mCont = document.getElementById('card-status-container');
+		const myName = localStorage.getItem('psn_username');
+		const isMyProfileOpen = document.getElementById('card-username')?.innerText === myName;
+	
+		let config = { text: "Offline", color: "#ff4444", icon: "fas fa-circle" };
+	
+		if (state === 'online') {
+			config = { text: "Online", color: "#4caf50", icon: "fas fa-circle" };
+		} else if (state === 'connecting') {
+			config = { text: "Connecting...", color: "orange", icon: "fas fa-circle-notch fa-spin" };
+		}
+	
+		if (sText) sText.innerText = config.text;
+		if (sCont) sCont.style.color = config.color;
+		if (sIcon) sIcon.className = config.icon;
+	
+		if (isMyProfileOpen && mText) {
+			mText.innerText = `Status: ${config.text}`;
+			if (mCont) mCont.style.color = config.color;
+			if (mIcon) {
+				mIcon.className = config.icon;
+				mIcon.style.display = "block";
+			}
+		}
+	};
 
     function openThemeModal() {
         closeDropdownMenu();
@@ -7369,13 +7405,16 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
     }
     
     function initChat() {
-        if (socketChat) {
-            socketChat.disconnect();
-        }
-        
-        socketChat = io(socketRenderUrl);
+        if (socketChat) {
+            socketChat.disconnect();
+        }
+		
+		updateGlobalOnlineStatus('connecting');
+        
+        socketChat = io(socketRenderUrl);
 
-        socketChat.on('connect', () => {
+        socketChat.on('connect', () => {
+			updateGlobalOnlineStatus('online');
 			const myName = localStorage.getItem('psn_username') || "Guest";
 			const myAvatar = localStorage.getItem(`${myName}_psn_avatar`) || AVAILABLE_AVATARS[0];
 			
@@ -7394,8 +7433,8 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 			}
 			const myLevel = Math.floor(totalXp / 100) + 1;
 		
-			socketChat.emit('register_user', { 
-				name: myName, 
+			socketChat.emit('register_user', { 
+				name: myName, 
 				avatar: myAvatar,
 				level: myLevel,
 				joined: myJoinedDate,
@@ -7405,10 +7444,10 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 				trophies: totalTrophiesUnlocked,
 				library: typeof lastScannedGames !== 'undefined' ? lastScannedGames.length : 0,
 				trophiesData: window.userTrophies || {},
-                downloadsData: window.downloadHistory || [],
-                wishlistData: window.wishlist || [],
-                favoritesData: window.favoritesLibrary || [],
-                libraryData: typeof lastScannedGames !== 'undefined' ? lastScannedGames : []
+                downloadsData: window.downloadHistory || [],
+                wishlistData: window.wishlist || [],
+                favoritesData: window.favoritesLibrary || [],
+                libraryData: typeof lastScannedGames !== 'undefined' ? lastScannedGames : []
 			});
 			
 			
@@ -7417,58 +7456,58 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 		});
 
 		socketChat.on('online_list', function(users) {
-            const countElement = document.getElementById('online-count');
-            if (!users) return;
+            const countElement = document.getElementById('online-count');
+            if (!users) return;
 
-            const activeUsersCount = users.filter(u => u.online === true).length;
-            if (countElement) {
-                countElement.innerText = `${activeUsersCount} Online`;
-            }
+            const activeUsersCount = users.filter(u => u.online === true).length;
+            if (countElement) {
+                countElement.innerText = `${activeUsersCount} Online`;
+            }
 
-            const modal = document.getElementById('modal-sys-online');
-            const isVisible = modal && (modal.style.display === 'flex' || modal.classList.contains('show'));
-            
-            if (isVisible) {
-                currentOnlineList = users;
-            } else {
-                currentOnlineList = users;
-                
-                currentOnlineList.forEach(u => {
-                    if (u.name && u.name !== "Guest") {
-                        const prefix = `${u.name}_psn_`;
-                        localStorage.setItem(`${prefix}avatar`, u.avatar);
-                        localStorage.setItem(`${prefix}level`, u.level);
-                        localStorage.setItem(`${prefix}joined`, u.joined || "2026");
-                        localStorage.setItem(`${prefix}downloads`, u.downloads || 0);
-                        localStorage.setItem(`${prefix}wishlist`, u.wishlist || 0);
-                        localStorage.setItem(`${prefix}favs`, u.favorites || 0);
-                        localStorage.setItem(`${prefix}trophies`, u.trophies || 0); 
-                        localStorage.setItem(`${prefix}library`, u.library || 0);
-                        localStorage.setItem(`${prefix}trophies_data`, JSON.stringify(u.trophiesData || {}));
-                        localStorage.setItem(`${prefix}wishlist_data`, JSON.stringify(u.wishlistData || []));
-                        localStorage.setItem(`${prefix}downloads_data`, JSON.stringify(u.downloadsData || []));
-                        localStorage.setItem(`${prefix}favs_data`, JSON.stringify(u.favoritesData || []));
-                        localStorage.setItem(`${prefix}library_data`, JSON.stringify(u.libraryData || []));
-                    }
-                });
-            }
+            const modal = document.getElementById('modal-sys-online');
+            const isVisible = modal && (modal.style.display === 'flex' || modal.classList.contains('show'));
+            
+            if (isVisible) {
+                currentOnlineList = users;
+            } else {
+                currentOnlineList = users;
+                
+                currentOnlineList.forEach(u => {
+                    if (u.name && u.name !== "Guest") {
+                        const prefix = `${u.name}_psn_`;
+                        localStorage.setItem(`${prefix}avatar`, u.avatar);
+                        localStorage.setItem(`${prefix}level`, u.level);
+                        localStorage.setItem(`${prefix}joined`, u.joined || "2026");
+                        localStorage.setItem(`${prefix}downloads`, u.downloads || 0);
+                        localStorage.setItem(`${prefix}wishlist`, u.wishlist || 0);
+                        localStorage.setItem(`${prefix}favs`, u.favorites || 0);
+                        localStorage.setItem(`${prefix}trophies`, u.trophies || 0); 
+                        localStorage.setItem(`${prefix}library`, u.library || 0);
+                        localStorage.setItem(`${prefix}trophies_data`, JSON.stringify(u.trophiesData || {}));
+                        localStorage.setItem(`${prefix}wishlist_data`, JSON.stringify(u.wishlistData || []));
+                        localStorage.setItem(`${prefix}downloads_data`, JSON.stringify(u.downloadsData || []));
+                        localStorage.setItem(`${prefix}favs_data`, JSON.stringify(u.favoritesData || []));
+                        localStorage.setItem(`${prefix}library_data`, JSON.stringify(u.libraryData || []));
+                    }
+                });
+            }
 
-            if (window.friendsList && window.friendsList.length > 0) {
-                let changed = false;
-                window.friendsList.forEach(friend => {
-                    const netData = users.find(u => u.name === friend.name);
-                    if (netData && netData.lastSeen !== friend.lastSeen) {
-                        friend.lastSeen = netData.lastSeen;
-                        changed = true;
-                    }
-                });
-                if (changed) {
-                    saveState(STORAGE_KEY_FRIENDS, JSON.stringify(window.friendsList));
-                    const friendsView = document.getElementById('subview-friends');
-                    if (friendsView && friendsView.style.display !== 'none') renderFriendsList();
-                }
-            }
-        });
+            if (window.friendsList && window.friendsList.length > 0) {
+                let changed = false;
+                window.friendsList.forEach(friend => {
+                    const netData = users.find(u => u.name === friend.name);
+                    if (netData && netData.lastSeen !== friend.lastSeen) {
+                        friend.lastSeen = netData.lastSeen;
+                        changed = true;
+                    }
+                });
+                if (changed) {
+                    saveState(STORAGE_KEY_FRIENDS, JSON.stringify(window.friendsList));
+                    const friendsView = document.getElementById('subview-friends');
+                    if (friendsView && friendsView.style.display !== 'none') renderFriendsList();
+                }
+            }
+        });
 		socketChat.on('force_reload', () => {
 			window.location.reload();
 		});
@@ -7481,170 +7520,170 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 			window.location.href = "about:blank";
 		});
 
-        socketChat.on('chat_history', function(history) {
-            const box = document.getElementById('chat-messages');
-            if (box) {
-                box.innerHTML = '<div style="text-align: center; margin-bottom: 15px;"><span style="background: rgba(255,255,255,0.05); padding: 5px 15px; border-radius: 20px; font-size: 11px; color: var(--text-muted); text-transform: uppercase;">Welcome to the PSN Database Global Chat</span></div>';
-                
-                const lastReadStr = loadState('psn_last_chat_read');
-                const lastReadTime = lastReadStr ? parseInt(lastReadStr) : 0;
-                const myName = localStorage.getItem('psn_username') || "Guest";
-                let dividerAdded = false;
-                
-                let hasHighPriority = false;
-                let hasGlobalAlert = false;
+        socketChat.on('chat_history', function(history) {
+            const box = document.getElementById('chat-messages');
+            if (box) {
+                box.innerHTML = '<div style="text-align: center; margin-bottom: 15px;"><span style="background: rgba(255,255,255,0.05); padding: 5px 15px; border-radius: 20px; font-size: 11px; color: var(--text-muted); text-transform: uppercase;">Welcome to the PSN Database Global Chat</span></div>';
+                
+                const lastReadStr = loadState('psn_last_chat_read');
+                const lastReadTime = lastReadStr ? parseInt(lastReadStr) : 0;
+                const myName = localStorage.getItem('psn_username') || "Guest";
+                let dividerAdded = false;
+                
+                let hasHighPriority = false;
+                let hasGlobalAlert = false;
 
-                history.forEach(data => {
-                    trackUser(data.user);
-                    const msgTime = data.time ? new Date(data.time).getTime() : Date.now();
-                    const isFromMe = (data.user === myName);
-                    
-                    if (!isFromMe && lastReadTime > 0 && msgTime > lastReadTime) {
-                        if (!dividerAdded) {
-                            const dividerHtml = `<div id="unread-divider" class="ps-new-messages-container"><div class="ps-line left"></div><span class="ps-unread-text">NEW MESSAGES</span><div class="ps-line right"></div></div>`;
-                            box.insertAdjacentHTML('beforeend', dividerHtml);
-                            dividerAdded = true;
-                        }
-                        
-                        if (data.isGlobalPing) {
-                            hasGlobalAlert = true;
-                        } else if (data.text && (data.text.includes(`@${myName}`) || (data.replyTo && data.replyTo.user === myName))) {
-                            hasHighPriority = true;
-                        }
-                    }
-                    appendMessageToChat(data, isFromMe, data.time || null);
-                });
+                history.forEach(data => {
+                    trackUser(data.user);
+                    const msgTime = data.time ? new Date(data.time).getTime() : Date.now();
+                    const isFromMe = (data.user === myName);
+                    
+                    if (!isFromMe && lastReadTime > 0 && msgTime > lastReadTime) {
+                        if (!dividerAdded) {
+                            const dividerHtml = `<div id="unread-divider" class="ps-new-messages-container"><div class="ps-line left"></div><span class="ps-unread-text">NEW MESSAGES</span><div class="ps-line right"></div></div>`;
+                            box.insertAdjacentHTML('beforeend', dividerHtml);
+                            dividerAdded = true;
+                        }
+                        
+                        if (data.isGlobalPing) {
+                            hasGlobalAlert = true;
+                        } else if (data.text && (data.text.includes(`@${myName}`) || (data.replyTo && data.replyTo.user === myName))) {
+                            hasHighPriority = true;
+                        }
+                    }
+                    appendMessageToChat(data, isFromMe, data.time || null);
+                });
 
-                const chatVisible = document.getElementById('view-chat').style.display === 'flex' || document.getElementById('view-chat').style.display === 'block';
-                if (dividerAdded && !chatVisible) {
-                    const dot = document.getElementById('chat-dot');
-                    if (dot) { 
-                        dot.style.display = 'block'; 
-                        
-                        if (hasGlobalAlert) {
-                            dot.style.backgroundColor = '#ff4444';
-                        } else if (hasHighPriority) {
-                            dot.style.backgroundColor = '#ffcc00';
-                        } else {
-                            dot.style.backgroundColor = 'var(--ps-blue)';
-                        }
-                        saveState('psn_chat_dot', 'true'); 
-                    }
-                }
+                const chatVisible = document.getElementById('view-chat').style.display === 'flex' || document.getElementById('view-chat').style.display === 'block';
+                if (dividerAdded && !chatVisible) {
+                    const dot = document.getElementById('chat-dot');
+                    if (dot) { 
+                        dot.style.display = 'block'; 
+                        
+                        if (hasGlobalAlert) {
+                            dot.style.backgroundColor = '#ff4444';
+                        } else if (hasHighPriority) {
+                            dot.style.backgroundColor = '#ffcc00';
+                        } else {
+                            dot.style.backgroundColor = 'var(--ps-blue)';
+                        }
+                        saveState('psn_chat_dot', 'true'); 
+                    }
+                }
 
-                if (chatVisible) saveState('psn_last_chat_read', Date.now().toString());
-                
-                setTimeout(() => {
-                    const divider = document.getElementById('unread-divider');
-                    if (divider) {
-                        divider.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                        setupDividerAutoRemove();
-                    } else {
-                        box.scrollTop = box.scrollHeight;
-                    }
-                }, 150); 
-            }
-        });
+                if (chatVisible) saveState('psn_last_chat_read', Date.now().toString());
+                
+                setTimeout(() => {
+                    const divider = document.getElementById('unread-divider');
+                    if (divider) {
+                        divider.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                        setupDividerAutoRemove();
+                    } else {
+                        box.scrollTop = box.scrollHeight;
+                    }
+                }, 150); 
+            }
+        });
 
-        socketChat.on('chat_message', function(data) {
-            const chatVisible = document.getElementById('view-chat').style.display === 'flex' || document.getElementById('view-chat').style.display === 'block';
-            const box = document.getElementById('chat-messages');
-            const myName = localStorage.getItem('psn_username') || "Guest";
-            
-            playMessageSound();
+        socketChat.on('chat_message', function(data) {
+            const chatVisible = document.getElementById('view-chat').style.display === 'flex' || document.getElementById('view-chat').style.display === 'block';
+            const box = document.getElementById('chat-messages');
+            const myName = localStorage.getItem('psn_username') || "Guest";
+            
+            playMessageSound();
 
-            if (!chatVisible && myName && data.user !== myName) {
-                const isMention = data.text && data.text.includes(`@${myName}`);
-                const isReply = data.replyTo && data.replyTo.user === myName;
-                const isGlobal = data.isGlobalPing === true; 
-            
-                if (isMention || isReply || isGlobal) {
-                    showChatNotification(data.user, isMention, isGlobal);
-                }
-            }
-            
-            if (!chatVisible) {
-                const dot = document.getElementById('chat-dot');
-                if (dot) { 
-                    dot.style.display = 'block'; 
+            if (!chatVisible && myName && data.user !== myName) {
+                const isMention = data.text && data.text.includes(`@${myName}`);
+                const isReply = data.replyTo && data.replyTo.user === myName;
+                const isGlobal = data.isGlobalPing === true; 
+            
+                if (isMention || isReply || isGlobal) {
+                    showChatNotification(data.user, isMention, isGlobal);
+                }
+            }
+            
+            if (!chatVisible) {
+                const dot = document.getElementById('chat-dot');
+                if (dot) { 
+                    dot.style.display = 'block'; 
 
-                    if (data.isGlobalPing) {
-                        dot.style.backgroundColor = '#ff4444';
-                    } else if (data.text && (data.text.includes(`@${myName}`) || (data.replyTo && data.replyTo.user === myName))) {
-                        if (dot.style.backgroundColor !== 'rgb(255, 68, 68)') {
-                            dot.style.backgroundColor = '#ffcc00';
-                        }
-                    } else {
-                        if (dot.style.backgroundColor !== 'rgb(255, 68, 68)' && dot.style.backgroundColor !== 'rgb(255, 204, 0)') {
-                            dot.style.backgroundColor = 'var(--ps-blue)';
-                        }
-                    }
-                    saveState('psn_chat_dot', 'true'); 
-                }
-                
-                if (box && !document.getElementById('unread-divider')) {
-                    const div = `<div id="unread-divider" class="ps-new-messages-container"><div class="ps-line left"></div><span class="ps-unread-text">NEW MESSAGES</span><div class="ps-line right"></div></div>`;
-                    box.insertAdjacentHTML('beforeend', div);
-                    setTimeout(() => setupDividerAutoRemove(), 100);
-                }
-            } else { 
-                saveState('psn_last_chat_read', Date.now().toString()); 
-            }
-            
-            const isFromMe = (data.user === myName);
-            appendMessageToChat(data, isFromMe, data.time || null);
-            
-            if (chatVisible && box) box.scrollTop = box.scrollHeight;
-        });
+                    if (data.isGlobalPing) {
+                        dot.style.backgroundColor = '#ff4444';
+                    } else if (data.text && (data.text.includes(`@${myName}`) || (data.replyTo && data.replyTo.user === myName))) {
+                        if (dot.style.backgroundColor !== 'rgb(255, 68, 68)') {
+                            dot.style.backgroundColor = '#ffcc00';
+                        }
+                    } else {
+                        if (dot.style.backgroundColor !== 'rgb(255, 68, 68)' && dot.style.backgroundColor !== 'rgb(255, 204, 0)') {
+                            dot.style.backgroundColor = 'var(--ps-blue)';
+                        }
+                    }
+                    saveState('psn_chat_dot', 'true'); 
+                }
+                
+                if (box && !document.getElementById('unread-divider')) {
+                    const div = `<div id="unread-divider" class="ps-new-messages-container"><div class="ps-line left"></div><span class="ps-unread-text">NEW MESSAGES</span><div class="ps-line right"></div></div>`;
+                    box.insertAdjacentHTML('beforeend', div);
+                    setTimeout(() => setupDividerAutoRemove(), 100);
+                }
+            } else { 
+                saveState('psn_last_chat_read', Date.now().toString()); 
+            }
+            
+            const isFromMe = (data.user === myName);
+            appendMessageToChat(data, isFromMe, data.time || null);
+            
+            if (chatVisible && box) box.scrollTop = box.scrollHeight;
+        });
 
-        socketChat.on('message_edited', function(data) {
-            const textContainer = document.getElementById(`msg-text-${data.msgId}`);
-            if (textContainer) {
-                let formattedText = data.newText.replace(/\n/g, '<br>');
-                let editBadge = data.editedByAdmin 
-                    ? ' <span style="font-size: 9px; opacity: 0.8; font-weight: italic; color: #ffd700; margin-left: 5px;">(Edited by Admin)</span>' 
-                    : ' <span style="font-size: 9px; opacity: 0.5; font-style: italic; margin-left: 5px;">(Edited)</span>';
-                textContainer.innerHTML = formattedText + editBadge;
-            }
-        });
+        socketChat.on('message_edited', function(data) {
+            const textContainer = document.getElementById(`msg-text-${data.msgId}`);
+            if (textContainer) {
+                let formattedText = data.newText.replace(/\n/g, '<br>');
+                let editBadge = data.editedByAdmin 
+                    ? ' <span style="font-size: 9px; opacity: 0.8; font-weight: italic; color: #ffd700; margin-left: 5px;">(Edited by Admin)</span>' 
+                    : ' <span style="font-size: 9px; opacity: 0.5; font-style: italic; margin-left: 5px;">(Edited)</span>';
+                textContainer.innerHTML = formattedText + editBadge;
+            }
+        });
 
-        socketChat.on('message_reaction', function(data) {
-            const container = document.getElementById(`reactions-${data.msgId}`);
-            if (!container) return;
-            let pill = container.querySelector(`[data-emoji="${data.emoji}"]`);
-            if (pill) {
-                let users = pill.getAttribute('data-users').split(', ').filter(u => u !== "");
-                let userIndex = users.indexOf(data.user);
-                if (userIndex > -1) { users.splice(userIndex, 1); } else { users.push(data.user); }
-                if (users.length <= 0) { pill.remove(); } 
-                else {
-                    pill.setAttribute('data-count', users.length);
-                    pill.setAttribute('data-users', users.join(', '));
-                    pill.innerHTML = `${data.emoji} ${users.length}`;
-                }
-            } else {
-                container.innerHTML += `<div class="reaction-pill" data-emoji="${data.emoji}" data-count="1" data-users="${data.user}">${data.emoji} 1</div>`;
-            }
-        });
+        socketChat.on('message_reaction', function(data) {
+            const container = document.getElementById(`reactions-${data.msgId}`);
+            if (!container) return;
+            let pill = container.querySelector(`[data-emoji="${data.emoji}"]`);
+            if (pill) {
+                let users = pill.getAttribute('data-users').split(', ').filter(u => u !== "");
+                let userIndex = users.indexOf(data.user);
+                if (userIndex > -1) { users.splice(userIndex, 1); } else { users.push(data.user); }
+                if (users.length <= 0) { pill.remove(); } 
+                else {
+                    pill.setAttribute('data-count', users.length);
+                    pill.setAttribute('data-users', users.join(', '));
+                    pill.innerHTML = `${data.emoji} ${users.length}`;
+                }
+            } else {
+                container.innerHTML += `<div class="reaction-pill" data-emoji="${data.emoji}" data-count="1" data-users="${data.user}">${data.emoji} 1</div>`;
+            }
+        });
 
-        socketChat.on('message_deleted', function(msgId) {
-            const msgRow = document.getElementById(`msg-row-${msgId}`);
-            if (msgRow) {
-                msgRow.style.opacity = '0';
-                msgRow.style.transform = 'scale(0.8) translateX(20px)';
-                msgRow.style.pointerEvents = 'none';
-                setTimeout(() => { if (msgRow.parentNode) msgRow.remove(); }, 400);
-            }
-        });
+        socketChat.on('message_deleted', function(msgId) {
+            const msgRow = document.getElementById(`msg-row-${msgId}`);
+            if (msgRow) {
+                msgRow.style.opacity = '0';
+                msgRow.style.transform = 'scale(0.8) translateX(20px)';
+                msgRow.style.pointerEvents = 'none';
+                setTimeout(() => { if (msgRow.parentNode) msgRow.remove(); }, 400);
+            }
+        });
 
-        socketChat.on('chat_cleared', function() {
-            const box = document.getElementById('chat-messages');
-            if (box) {
-                box.innerHTML = '<div style="text-align: center; margin-bottom: 15px; margin-top: 20px;"><span style="background: rgba(255, 68, 68, 0.2); border: 1px solid #ff4444; padding: 5px 15px; border-radius: 20px; font-size: 11px; color: #ff4444; text-transform: uppercase; font-weight: bold;">Chat history cleared by Admin</span></div>';
-            }
-        });
+        socketChat.on('chat_cleared', function() {
+            const box = document.getElementById('chat-messages');
+            if (box) {
+                box.innerHTML = '<div style="text-align: center; margin-bottom: 15px; margin-top: 20px;"><span style="background: rgba(255, 68, 68, 0.2); border: 1px solid #ff4444; padding: 5px 15px; border-radius: 20px; font-size: 11px; color: #ff4444; text-transform: uppercase; font-weight: bold;">Chat history cleared by Admin</span></div>';
+            }
+        });
 
-        socketChat.on('message_seen', function(data) {
+        socketChat.on('message_seen', function(data) {
 			const checkContainer = document.getElementById(`check-${data.msgId}`);
 			if (checkContainer) {
 				const checks = checkContainer.querySelectorAll('i');
@@ -7655,17 +7694,19 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 				checkContainer.setAttribute('data-seen-list', data.seenBy.join(', '));
 			}
 		});
-        
-        socketChat.on('connect_error', () => {
-            const s = document.getElementById('chat-status-text');
-            if (s) { s.innerText = "(Offline)"; s.style.color = "#ff4444"; }
-        });
+        
+        socketChat.on('connect_error', () => {
+			updateGlobalOnlineStatus('offline');
+            const s = document.getElementById('chat-status-text');
+            if (s) { s.innerText = "(Offline)"; s.style.color = "#ff4444"; }
+        });
 
-        socketChat.on('disconnect', () => {
-            const s = document.getElementById('chat-status-text');
-            if (s) { s.innerText = "(Disconnected)"; s.style.color = "#ffbb33"; }
-        });
-    }
+        socketChat.on('disconnect', () => {
+			updateGlobalOnlineStatus('offline');
+            const s = document.getElementById('chat-status-text');
+            if (s) { s.innerText = "(Disconnected)"; s.style.color = "#ffbb33"; }
+        });
+    }
 	
 	window.broadcastProfileUpdate = function() {
 		if (!socketChat || !socketChat.connected) return;
