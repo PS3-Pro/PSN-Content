@@ -79,8 +79,21 @@ io.on('connection', (socket) => {
 
   socket.on('kick_user', (data) => {
     const isAdmin = ADMIN_USERS.includes(data.adminUser) && data.secret === ADMIN_SECRET;
+    
     if (isAdmin && data.targetId) {
-        io.to(data.targetId).emit('user_kicked');
+        const targetSocket = io.sockets.sockets.get(data.targetId);
+        
+        if (targetSocket) {
+            console.log(`[ADMIN] Kicking user: ${targetSocket.userName} (${data.targetId})`);
+            
+            targetSocket.emit('user_kicked');
+            
+            setTimeout(() => {
+                targetSocket.disconnect(true);
+            }, 500);
+        }
+    } else {
+        console.log(`[AUTH] Unauthorized kick attempt by: ${data.adminUser}`);
     }
   });
 
