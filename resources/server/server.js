@@ -52,7 +52,7 @@ setInterval(() => {
 
 const io = new Server(server, {
   cors: { origin: "*", methods: ["GET", "POST"] },
-  maxHttpBufferSize: 5e6
+  maxHttpBufferSize: 1e7
 });
 
 io.on('connection', (socket) => {
