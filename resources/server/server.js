@@ -28,7 +28,7 @@ const io = new Server(server, {
 });
 
 let messageHistory = []; 
-let onlineUsers = {};
+let userDatabase = {}; 
 
 io.on('connection', (socket) => {
   console.log('User connected: ' + socket.id);
@@ -36,100 +36,63 @@ io.on('connection', (socket) => {
   socket.emit('chat_history', messageHistory);
 
   socket.on('register_user', (userData) => {
-    if (userData) {
-      const name = typeof userData === 'object' ? userData.name : userData;
-      const avatar = typeof userData === 'object' ? userData.avatar : null;
+    if (userData && userData.name) {
+      const name = userData.name;
       
-      const level = typeof userData === 'object' ? (userData.level || 1) : 1;
-      const joined = typeof userData === 'object' ? (userData.joined || "2026") : "2026";
-      const xp = typeof userData === 'object' ? (userData.xp || 0) : 0;
-      const downloads = typeof userData === 'object' ? (userData.downloads || 0) : 0;
-      const wishlist = typeof userData === 'object' ? (userData.wishlist || 0) : 0;
-      const favorites = typeof userData === 'object' ? (userData.favorites || 0) : 0;
-      const trophies = typeof userData === 'object' ? (userData.trophies || 0) : 0;
-      const library = typeof userData === 'object' ? (userData.library || 0) : 0;
-      const downloadsData = typeof userData === 'object' ? (userData.downloadsData || []) : [];
-      const wishlistData = typeof userData === 'object' ? (userData.wishlistData || []) : [];
-      const favoritesData = typeof userData === 'object' ? (userData.favoritesData || []) : [];
-      const libraryData = typeof userData === 'object' ? (userData.libraryData || []) : [];
-      const trophiesData = typeof userData === 'object' ? (userData.trophiesData || {}) : {};
+      socket.userName = name;
 
-      if (name) {
-        onlineUsers[socket.id] = { 
-          id: socket.id,
-          name: name, 
-          avatar: avatar,
-          level: level,
-          joined: joined,
-          xp: xp,
-          downloads: downloads,
-          wishlist: wishlist,
-          favorites: favorites,
-          trophies: trophies,
-          library: library,
-          downloadsData: downloadsData,
-          wishlistData: wishlistData,
-          favoritesData: favoritesData,
-          libraryData: libraryData,
-          trophiesData: trophiesData
-        };
-        io.emit('online_list', Object.values(onlineUsers));
-      }
+      userDatabase[name] = {
+        id: socket.id,
+        name: name,
+        avatar: userData.avatar || null,
+        level: userData.level || 1,
+        joined: userData.joined || "2026",
+        xp: userData.xp || 0,
+        downloads: userData.downloads || 0,
+        wishlist: userData.wishlist || 0,
+        favorites: userData.favorites || 0,
+        trophies: userData.trophies || 0,
+        library: userData.library || 0,
+        downloadsData: userData.downloadsData || [],
+        wishlistData: userData.wishlistData || [],
+        favoritesData: userData.favoritesData || [],
+        libraryData: userData.libraryData || [],
+        trophiesData: userData.trophiesData || {},
+        online: true,
+        lastSeen: Date.now() 
+      };
+
+      console.log(`[NETWORK] ${name} is now Online.`);
+      io.emit('online_list', Object.values(userDatabase));
     }
   });
 
   socket.on('update_profile', (userData) => {
-    if (onlineUsers[socket.id]) {
-      if (userData.level !== undefined) onlineUsers[socket.id].level = userData.level;
-      if (userData.xp !== undefined) onlineUsers[socket.id].xp = userData.xp;
-      if (userData.downloads !== undefined) onlineUsers[socket.id].downloads = userData.downloads;
-      if (userData.wishlist !== undefined) onlineUsers[socket.id].wishlist = userData.wishlist;
-      if (userData.favorites !== undefined) onlineUsers[socket.id].favorites = userData.favorites;
-      if (userData.trophies !== undefined) onlineUsers[socket.id].trophies = userData.trophies;
-      if (userData.library !== undefined) onlineUsers[socket.id].library = userData.library;
+    const name = socket.userName;
+    if (name && userDatabase[name]) {
+      Object.assign(userDatabase[name], userData);
+      userDatabase[name].lastSeen = Date.now();
       
-      if (userData.downloadsData !== undefined) onlineUsers[socket.id].downloadsData = userData.downloadsData;
-      if (userData.wishlistData !== undefined) onlineUsers[socket.id].wishlistData = userData.wishlistData;
-      if (userData.favoritesData !== undefined) onlineUsers[socket.id].favoritesData = userData.favoritesData;
-      if (userData.libraryData !== undefined) onlineUsers[socket.id].libraryData = userData.libraryData;
-      if (userData.trophiesData !== undefined) onlineUsers[socket.id].trophiesData = userData.trophiesData;
-
-      io.emit('online_list', Object.values(onlineUsers));
+      io.emit('online_list', Object.values(userDatabase));
     }
   });
 
   socket.on('kick_user', (data) => {
     const isAdmin = ADMIN_USERS.includes(data.adminUser) && data.secret === ADMIN_SECRET;
-    
     if (isAdmin && data.targetId) {
-        console.log(`[ADMIN] User kicked: ${data.targetId} by ${data.adminUser}`);
         io.to(data.targetId).emit('user_kicked');
-    } else {
-        console.log(`[AUTH] Unauthorized kick attempt by: ${data.adminUser}`);
     }
   });
 
   socket.on('admin_redeem', (data, callback) => {
     const { code, user } = data;
     const cleanCode = code.replace(/-/g, "").toUpperCase();
-
-    if (cleanCode === "PLATINUMCODE") {
-        console.log(`[AUTH] GOD MODE Voucher used by: ${user}`);
-        return callback({ success: true, type: 'PLATINUM_UNLOCK' });
-    }
-
-    if (cleanCode === "UNLOCKALLDB1") {
-        console.log(`[AUTH] Special Trophy Voucher used by: ${user}`);
-        return callback({ success: true, type: 'SINGLE_TROPHY' });
-    }
-
+    if (cleanCode === "PLATINUMCODE") return callback({ success: true, type: 'PLATINUM_UNLOCK' });
+    if (cleanCode === "UNLOCKALLDB1") return callback({ success: true, type: 'SINGLE_TROPHY' });
     if (cleanCode === ADMIN_SECRET && ADMIN_USERS.includes(user)) {
-        console.log(`[AUTH] ADMIN LOGIN successful for: ${user}`);
         return callback({ success: true, type: 'ADMIN_LOGIN', secret: ADMIN_SECRET });
     }
-
-    console.log(`[AUTH] Invalid code attempt: ${cleanCode} by ${user}`);
-    callback({ success: false, message: "Invalid voucher code or unauthorized user." });
+    callback({ success: false, message: "Invalid code." });
   });
 
   socket.on('delete_message', (data) => {
@@ -137,15 +100,12 @@ io.on('connection', (socket) => {
         const mId = m.time ? new Date(m.time).getTime() : null;
         return String(mId) === String(data.msgId);
     });
-
     if (msgIndex > -1) {
-        const isMessageOwner = messageHistory[msgIndex].user === data.user;
+        const isOwner = messageHistory[msgIndex].user === data.user;
         const isAdmin = ADMIN_USERS.includes(data.user) && data.secret === ADMIN_SECRET;
-
-        if (isMessageOwner || isAdmin) {
+        if (isOwner || isAdmin) {
             messageHistory.splice(msgIndex, 1);
             io.emit('message_deleted', data.msgId);
-            console.log(`Message deleted: ID ${data.msgId} by ${data.user}`);
         }
     }
   });
@@ -155,47 +115,19 @@ io.on('connection', (socket) => {
         const mId = m.time ? new Date(m.time).getTime() : null;
         return String(mId) === String(data.msgId);
     });
-
     if (msgIndex > -1) {
-        const msgOwner = messageHistory[msgIndex].user;
-        const isMessageOwner = msgOwner === data.user;
+        const isOwner = messageHistory[msgIndex].user === data.user;
         const isAdmin = ADMIN_USERS.includes(data.user) && data.secret === ADMIN_SECRET;
-
-        if (isMessageOwner || isAdmin) {
-            let textToSave = data.newText;
-            let pingAtivo = false;
-
-            if (textToSave && textToSave.includes('@everyone')) {
-                if (isAdmin) {
-                    pingAtivo = true;
-                } else {
-                    textToSave = textToSave.replace(/@everyone/g, "everyone");
-                }
-            }
-            
-            const wasEditedByAdmin = (isAdmin && !isMessageOwner);
-            
-            messageHistory[msgIndex].text = textToSave;
+        if (isOwner || isAdmin) {
+            messageHistory[msgIndex].text = data.newText;
             messageHistory[msgIndex].edited = true;
-            messageHistory[msgIndex].editedByAdmin = wasEditedByAdmin;
-            messageHistory[msgIndex].isGlobalPing = pingAtivo;
-            
-            io.emit('message_edited', { 
-                msgId: data.msgId, 
-                newText: textToSave,
-                editedByAdmin: wasEditedByAdmin,
-                isGlobalPing: pingAtivo
-            });
+            io.emit('message_edited', { msgId: data.msgId, newText: data.newText });
         }
     }
   });
 
   socket.on('mark_as_read', (data) => {
-    const msg = messageHistory.find(m => {
-        const mId = m.time ? new Date(m.time).getTime() : null;
-        return String(mId) === String(data.msgId);
-    });
-
+    const msg = messageHistory.find(m => String(new Date(m.time).getTime()) === String(data.msgId));
     if (msg && msg.user !== data.user) {
         if (!msg.seenBy) msg.seenBy = [];
         if (!msg.seenBy.includes(data.user)) {
@@ -204,34 +136,22 @@ io.on('connection', (socket) => {
         }
     }
   });
- 
-  socket.on('message_reaction', (data) => {
-    const message = messageHistory.find(m => {
-        const mId = m.time ? new Date(m.time).getTime() : null;
-        return String(mId) === String(data.msgId);
-    });
 
-    if (message) {
-        if (!message.reactions) message.reactions = [];
-        let existingReaction = message.reactions.find(r => r.emoji === data.emoji);
-        
-        if (existingReaction) {
-            const userIndex = existingReaction.users.indexOf(data.user);
-            if (userIndex > -1) {
-                existingReaction.users.splice(userIndex, 1);
-                existingReaction.count--;
-            } else {
-                existingReaction.users.push(data.user);
-                existingReaction.count++;
-            }
-            if (existingReaction.count <= 0) {
-                message.reactions = message.reactions.filter(r => r.emoji !== data.emoji);
-            }
+  socket.on('message_reaction', (data) => {
+    const msg = messageHistory.find(m => String(new Date(m.time).getTime()) === String(data.msgId));
+    if (msg) {
+        if (!msg.reactions) msg.reactions = [];
+        let react = msg.reactions.find(r => r.emoji === data.emoji);
+        if (react) {
+            const idx = react.users.indexOf(data.user);
+            if (idx > -1) { react.users.splice(idx, 1); react.count--; }
+            else { react.users.push(data.user); react.count++; }
+            if (react.count <= 0) msg.reactions = msg.reactions.filter(r => r.emoji !== data.emoji);
         } else {
-            message.reactions.push({ emoji: data.emoji, count: 1, users: [data.user] });
+            msg.reactions.push({ emoji: data.emoji, count: 1, users: [data.user] });
         }
+        io.emit('message_reaction', data);
     }
-    io.emit('message_reaction', data); 
   });
 
   socket.on('chat_message', (msg) => {
@@ -240,50 +160,24 @@ io.on('connection', (socket) => {
       time: new Date().toISOString(),
       seenBy: []
     };
-
     const isAdmin = ADMIN_USERS.includes(messageData.user) && messageData.secret === ADMIN_SECRET;
+    if (messageData.text === '/reload' && isAdmin) return socket.broadcast.emit('force_reload');
     
-    if (messageData.text && messageData.text.trim() === '/reload') {
-        if (isAdmin) {
-            console.log(`[ADMIN] Force Reload triggered by: ${messageData.user}`);
-            socket.broadcast.emit('force_reload');
-            return;
-        }
-    }
-
-    if (messageData.text && messageData.text.includes('@everyone')) {
-        if (isAdmin) {
-            messageData.isGlobalPing = true;
-        } else {
-            messageData.isGlobalPing = false;
-            messageData.text = messageData.text.replace(/@everyone/g, "everyone");
-        }
-    }
-
     delete messageData.secret;
-
     messageHistory.push(messageData);
     if (messageHistory.length > 100) messageHistory.shift();
-
     io.emit('chat_message', messageData); 
   });
 
-  socket.on('clear_chat', (data) => {
-    const isAdmin = ADMIN_USERS.includes(data.user) && data.secret === ADMIN_SECRET;
-    
-    if (isAdmin) {
-        messageHistory = []; 
-        io.emit('chat_cleared'); 
-        console.log(`[ADMIN] Chat entirely cleared by: ${data.user}`);
-    } else {
-        console.log(`[AUTH] Unauthorized /clean attempt by: ${data.user}`);
-    }
-  });
-
   socket.on('disconnect', () => {
-    if (onlineUsers[socket.id]) {
-      delete onlineUsers[socket.id];
-      io.emit('online_list', Object.values(onlineUsers));
+    const name = socket.userName;
+    if (name && userDatabase[name]) {
+      userDatabase[name].online = false;
+      userDatabase[name].lastSeen = Date.now();
+      
+      console.log(`[NETWORK] ${name} is now Offline. Last seen updated.`);
+      
+      io.emit('online_list', Object.values(userDatabase));
     }
   });
 });
