@@ -7430,19 +7430,34 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 			const activeUsersCount = users.filter(u => u.online === true).length;
 			if (countElement) countElement.innerText = `${activeUsersCount} Online`;
 	
-			currentOnlineList = users;
-			if (!(document.getElementById('modal-sys-online')?.classList.contains('show'))) {
+			const modal = document.getElementById('modal-sys-online');
+			const isVisible = modal && (modal.style.display === 'flex' || modal.classList.contains('show'));
+			
+			if (isVisible) {
+				currentOnlineList = users;
+			} else {
+				currentOnlineList = users;
 				currentOnlineList.forEach(u => {
 					if (u.name && u.name !== "Guest") {
 						const prefix = `${u.name}_psn_`;
 						localStorage.setItem(`${prefix}avatar`, u.avatar);
 						localStorage.setItem(`${prefix}level`, u.level);
 						localStorage.setItem(`${prefix}joined`, u.joined || "2026");
+						localStorage.setItem(`${prefix}downloads`, u.downloads || 0);
+						localStorage.setItem(`${prefix}wishlist`, u.wishlist || 0);
+						localStorage.setItem(`${prefix}favs`, u.favorites || 0);
+						localStorage.setItem(`${prefix}trophies`, u.trophies || 0); 
+						localStorage.setItem(`${prefix}library`, u.library || 0);
+						localStorage.setItem(`${prefix}trophies_data`, JSON.stringify(u.trophiesData || {}));
+						localStorage.setItem(`${prefix}wishlist_data`, JSON.stringify(u.wishlistData || []));
+						localStorage.setItem(`${prefix}downloads_data`, JSON.stringify(u.downloadsData || []));
+						localStorage.setItem(`${prefix}favs_data`, JSON.stringify(u.favoritesData || []));
+						localStorage.setItem(`${prefix}library_data`, JSON.stringify(u.libraryData || []));
 					}
 				});
 			}
 	
-			if (window.friendsList?.length > 0) {
+			if (window.friendsList && window.friendsList.length > 0) {
 				let changed = false;
 				window.friendsList.forEach(friend => {
 					const netData = users.find(u => u.name === friend.name);
@@ -7453,7 +7468,8 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 				});
 				if (changed) {
 					saveState(STORAGE_KEY_FRIENDS, JSON.stringify(window.friendsList));
-					if (document.getElementById('subview-friends')?.style.display !== 'none') renderFriendsList();
+					const friendsView = document.getElementById('subview-friends');
+					if (friendsView && friendsView.style.display !== 'none') renderFriendsList();
 				}
 			}
 		});
@@ -7485,6 +7501,7 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 			const box = document.getElementById('chat-messages');
 			if (box) {
 				box.innerHTML = '<div style="text-align: center; margin-bottom: 15px;"><span style="background: rgba(255,255,255,0.05); padding: 5px 15px; border-radius: 20px; font-size: 11px; color: var(--text-muted); text-transform: uppercase;">Welcome to the PSN Database Global Chat</span></div>';
+				
 				const lastReadTime = parseInt(loadState('psn_last_chat_read') || 0);
 				const myName = localStorage.getItem('psn_username') || "Guest";
 				let dividerAdded = false;
@@ -7500,10 +7517,13 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 				});
 	
 				setTimeout(() => {
-					const div = document.getElementById('unread-divider');
-					if (div) div.scrollIntoView({ behavior: 'smooth', block: 'center' });
-					else box.scrollTop = box.scrollHeight;
+					const divider = document.getElementById('unread-divider');
+					if (divider) { 
+						divider.scrollIntoView({ behavior: 'smooth', block: 'center' });
+						setupDividerAutoRemove();
+					} else { box.scrollTop = box.scrollHeight; }
 				}, 150);
+	
 				if (typeof refreshChatNotificationDot === 'function') refreshChatNotificationDot();
 			}
 		});
@@ -7511,34 +7531,65 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 		socketChat.on('chat_message', function(data) {
 			if (!window.messageHistory) window.messageHistory = [];
 			window.messageHistory.push(data);
-			const chatVisible = document.getElementById('view-chat').style.display === 'block';
+			if (window.messageHistory.length > 100) window.messageHistory.shift();
+	
+			const chatVisible = document.getElementById('view-chat').style.display === 'flex' || document.getElementById('view-chat').style.display === 'block';
 			const myName = localStorage.getItem('psn_username') || "Guest";
+			
 			playMessageSound();
 			if (!chatVisible && data.user !== myName) {
-				const isMention = data.text?.includes(`@${myName}`);
-				const isReply = data.replyTo?.user === myName;
+				const isMention = data.text && data.text.includes(`@${myName}`);
+				const isReply = data.replyTo && data.replyTo.user === myName;
 				if (isMention || isReply || data.isGlobalPing) showChatNotification(data.user, isMention, data.isGlobalPing);
 			}
+			
 			appendMessageToChat(data, data.user === myName, data.time);
 			if (typeof refreshChatNotificationDot === 'function') refreshChatNotificationDot();
 		});
 	
 		socketChat.on('message_edited', function(data) {
+			if (window.messageHistory) {
+				const msg = window.messageHistory.find(m => String(new Date(m.time).getTime()) === String(data.msgId));
+				if (msg) {
+					msg.text = data.newText;
+					msg.edited = true;
+					msg.editedByAdmin = data.editedByAdmin;
+				}
+			}
 			const textContainer = document.getElementById(`msg-text-${data.msgId}`);
 			if (textContainer) {
+				let formatted = data.newText.replace(/\n/g, '<br>');
 				let badge = data.editedByAdmin ? ' <span style="font-size: 9px; opacity: 0.8; color: #ff4444; font-weight: bold;">(Edited by Admin)</span>' : ' <span style="font-size: 9px; opacity: 0.5; font-style: italic;">(Edited)</span>';
-				textContainer.innerHTML = data.newText.replace(/\n/g, '<br>') + badge;
+				textContainer.innerHTML = formatted + badge;
 			}
 			if (typeof refreshChatNotificationDot === 'function') refreshChatNotificationDot();
 		});
 	
 		socketChat.on('message_deleted', function(msgId) {
+			if (window.messageHistory) {
+				window.messageHistory = window.messageHistory.filter(m => String(new Date(m.time).getTime()) !== String(msgId));
+			}
 			const msgRow = document.getElementById(`msg-row-${msgId}`);
 			if (msgRow) {
 				msgRow.style.opacity = '0';
 				msgRow.style.transform = 'scale(0.8) translateX(20px)';
-				setTimeout(() => msgRow.remove(), 400);
+				setTimeout(() => { if (msgRow.parentNode) msgRow.remove(); }, 400);
 			}
+			if (typeof refreshChatNotificationDot === 'function') refreshChatNotificationDot();
+		});
+	
+		socketChat.on('user_kicked', () => {
+			if (socketChat) socketChat.disconnect();
+			alert("You have been kicked from the session by an Admin.");
+			window.location.href = "about:blank";
+		});
+	
+		socketChat.on('force_reload', () => window.location.reload());
+		
+		socketChat.on('chat_cleared', () => {
+			window.messageHistory = [];
+			const box = document.getElementById('chat-messages');
+			if (box) box.innerHTML = '<div style="text-align: center; margin-top: 20px;"><span style="background: rgba(255, 68, 68, 0.2); border: 1px solid #ff4444; padding: 5px 15px; border-radius: 20px; font-size: 11px; color: #ff4444; font-weight: bold;">CHAT CLEARED BY ADMIN</span></div>';
 			if (typeof refreshChatNotificationDot === 'function') refreshChatNotificationDot();
 		});
 	
@@ -7550,12 +7601,17 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 			}
 		});
 	
-		socketChat.on('user_kicked', () => { if (socketChat) socketChat.disconnect(); alert("Kicked by Admin."); window.location.href = "about:blank"; });
-		socketChat.on('force_reload', () => window.location.reload());
-		socketChat.on('chat_cleared', () => { window.messageHistory = []; document.getElementById('chat-messages').innerHTML = '<div style="text-align: center; margin-top: 20px;"><span style="color: #ff4444; font-weight: bold;">CHAT CLEARED</span></div>'; });
+		socketChat.on('connect_error', () => {
+			if (typeof updateGlobalOnlineStatus === 'function') updateGlobalOnlineStatus('offline');
+			const s = document.getElementById('chat-status-text');
+			if (s) { s.innerText = "(Offline)"; s.style.color = "#ff4444"; }
+		});
 	
-		socketChat.on('connect_error', () => { if (typeof updateGlobalOnlineStatus === 'function') updateGlobalOnlineStatus('offline'); });
-		socketChat.on('disconnect', () => { if (typeof updateGlobalOnlineStatus === 'function') updateGlobalOnlineStatus('offline'); });
+		socketChat.on('disconnect', () => {
+			if (typeof updateGlobalOnlineStatus === 'function') updateGlobalOnlineStatus('offline');
+			const s = document.getElementById('chat-status-text');
+			if (s) { s.innerText = "(Disconnected)"; s.style.color = "#ffbb33"; }
+		});
 	}
 
 	window.refreshChatNotificationDot = function() {
