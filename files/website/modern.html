@@ -3080,8 +3080,7 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 		
 		const searchBar = document.querySelector('.search-bar');
 		const searchInput = document.getElementById('search-input');
-		const displayTitle = document.getElementById('display-title');
-		
+	
 		if(btnChat) btnChat.classList.remove('active');
 		if(btnFriends) btnFriends.classList.remove('active');
 	
@@ -3092,6 +3091,12 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 			
 			if (searchBar) searchBar.style.display = 'none';
 			
+			// Reset do placeholder para o padrão do site
+			if (searchInput) {
+				searchInput.placeholder = "Search Title or ID";
+				searchInput.value = "";
+			}
+	
 			if (document.getElementById('view-chat').style.display !== 'block') {
 				switchView('view-chat');
 			}
@@ -3101,18 +3106,17 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 			if(btnFriends) btnFriends.classList.add('active');
 			
 			if (searchBar) searchBar.style.display = 'flex';
-			if (displayTitle) displayTitle.innerText = "Friends";
+			
 			if (searchInput) {
-				searchInput.placeholder = "Search friends or players online...";
-				// Limpa a busca ao trocar de aba para não bugar a lista
+				searchInput.placeholder = "Search players...";
 				searchInput.value = ""; 
 			}
 			
 			if (document.getElementById('view-chat').style.display !== 'block') {
 				switchView('view-chat');
 			}
-			
-			if (typeof renderFriendsList === 'function') renderFriendsList();
+
+			if (typeof renderFriendsList === 'function') renderFriendsList('');
 		}
 	};
 	
@@ -3814,14 +3818,12 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 	
 		if (isLibrary) {
 			applyLibraryFilters();
-		} 
-		else if (isSocial) {
+		} else if (isSocial) {
+			window.globalSearchResults = []; // Limpa os resultados globais
 			renderFriendsList('');
-		} 
-		else {
+		} else {
 			applyFilters();
 		}
-		
 		searchInput.focus();
 	};
 	
@@ -3829,7 +3831,7 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 		
 	document.getElementById('search-input').addEventListener('input', function(e) {
 		clearTimeout(searchDebounceTimer);
-		const val = e.target.value;
+		const val = e.target.value.trim();
 	
 		searchDebounceTimer = setTimeout(() => {
 			if (document.getElementById('view-library').style.display === 'block') {
@@ -3838,13 +3840,18 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 			else if (document.getElementById('view-chat').style.display === 'block') {
 				const friendsView = document.getElementById('subview-friends');
 				if (friendsView && friendsView.style.display !== 'none') {
-					renderFriendsList(val.trim());
+					if (val.length >= 2 && socketChat) {
+						socketChat.emit('search_users', val);
+					} else {
+						window.globalSearchResults = [];
+					}
+					renderFriendsList(val);
 				}
 			} 
 			else {
 				applyFilters();
 			}
-		}, 500); 
+		}, 500);
 	});
 
 	document.getElementById('search-input').addEventListener('keydown', function(e) {
@@ -4452,6 +4459,13 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 		}
 	
 		if (systemUtils.includes(viewId)) {
+			const chatGlobal = document.getElementById('nav-chat-global');
+			const chatFriends = document.getElementById('nav-chat-friends');
+			const trophies = document.getElementById('nav-trophies-sidebar');
+			if (chatGlobal) chatGlobal.classList.remove('active');
+			if (chatFriends) chatFriends.classList.remove('active');
+			if (trophies) trophies.classList.remove('active');
+
 			const directMatch = document.querySelector(`.sidebar-menu li[onclick*="${viewId}"]`);
 			if (directMatch) directMatch.classList.add('active');
 		} else {
@@ -6890,6 +6904,17 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
     let selectedSuggestionIndex = 0;
     let pendingImageFile = null;
     let editingMsgId = null;
+	let globalSearchResults = [];
+
+	if (socketChat) {
+		socketChat.on('global_search_results', function(results) {
+			window.globalSearchResults = results;
+			const term = document.getElementById('search-input').value;
+			if (document.getElementById('view-chat').style.display === 'block') {
+				renderFriendsList(term);
+			}
+		});
+	}
 
     function setupDividerAutoRemove() {
 		const divider = document.getElementById('unread-divider');
@@ -8348,6 +8373,7 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 		
 		if (!grid) return;
 	
+		// Atualiza o título lá no topo (Igual à Wishlist)
 		if (titleHeader) {
 			const totalFriends = window.friendsList ? window.friendsList.length : 0;
 			titleHeader.innerHTML = `Friends <span style="color: var(--ps-blue); font-size: 14px; margin-left: 10px; font-weight: normal; opacity: 0.8;">(${totalFriends} items)</span>`;
@@ -8365,11 +8391,11 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 				uName !== myName;
 		}) : [];
 	
-		const offlineOthers = isSearching ? Array.from(chatUsers).filter(uName => {
-			return uName.toLowerCase().includes(searchTerm) &&
-				uName !== myName &&
-				!window.friendsList.some(f => f.name === uName) &&
-				!currentOnlineList.some(u => (u.name || u) === uName);
+		const globalOffline = isSearching ? (window.globalSearchResults || []).filter(u => {
+			return u.name.toLowerCase().includes(searchTerm) &&
+				u.name !== myName &&
+				!window.friendsList.some(f => f.name === u.name) &&
+				!currentOnlineList.some(on => (on.name || on) === u.name);
 		}) : [];
 	
 		if (window.friendsList.length === 0 && !isSearching) {
@@ -8380,7 +8406,6 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 	
 		if (emptyMsg) emptyMsg.style.display = 'none';
 		if (container) container.style.display = 'block';
-		
 		grid.innerHTML = '';
 	
 		if (filteredFriends.length > 0) {
@@ -8403,21 +8428,20 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 			});
 		}
 	
-		if (offlineOthers.length > 0) {
+		if (globalOffline.length > 0) {
 			const extraStyle = (filteredFriends.length > 0 || onlineOthers.length > 0) ? '' : 'margin-top: -10px;';
-			grid.innerHTML += `<div class="search-divider" style="${extraStyle} color: #8b96a8;">RECENTLY SEEN (OFFLINE)</div>`;
-			offlineOthers.forEach((uName, i) => {
-				const cachedAvatar = localStorage.getItem(`${uName}_psn_avatar`) || AVAILABLE_AVATARS[0];
-				grid.innerHTML += renderUserCardHTML(uName, cachedAvatar, '#8b96a8', 'Offline', false, false, i + 500);
+			grid.innerHTML += `<div class="search-divider" style="${extraStyle} color: #8b96a8;">PSN DATABASE REGISTRY (OFFLINE)</div>`;
+			globalOffline.forEach((u, i) => {
+				grid.innerHTML += renderUserCardHTML(u.name, u.avatar || AVAILABLE_AVATARS[0], '#8b96a8', 'Offline', false, false, i + 500);
 			});
 		}
 	
-		if (isSearching && filteredFriends.length === 0 && onlineOthers.length === 0 && offlineOthers.length === 0) {
+		if (isSearching && filteredFriends.length === 0 && onlineOthers.length === 0 && globalOffline.length === 0) {
 			grid.innerHTML = `
 				<div style="grid-column: 1/-1; text-align: center; color: #888; padding: 60px; background: rgba(0,0,0,0.2); border-radius: 12px; border: 1px dashed rgba(255,255,255,0.05); margin-top: -10px; backdrop-filter: blur(5px); animation: fadeIn 0.3s ease-out;">
 					<i class="fas fa-search-minus" style="font-size: 50px; margin-bottom: 20px; opacity: 0.2;"></i>
 					<div style="font-size: 18px; color: #fff; font-weight: normal;">No players found</div>
-					<p style="font-size: 13px; color: var(--text-muted); margin-bottom: 20px;">We couldn't find anyone matching "${filter}".</p>
+					<p style="font-size: 13px; color: var(--text-muted); margin-bottom: 20px;">We couldn't find anyone registered with "${filter}".</p>
 					<button class="action-btn" style="margin: 0 auto;" onmouseenter="playUiHover()" onclick="clearGlobalSearch()">
 						<i class="fas fa-times"></i> Clear Search
 					</button>
