@@ -1,6 +1,7 @@
 const express = require('express');
 const http = require('http');
 const https = require('https');
+const fs = require('fs'); 
 const { Server } = require("socket.io");
 
 const app = express();
@@ -10,13 +11,40 @@ const APP_URL = "https://psn-content.onrender.com/ping";
 const ADMIN_USERS = ["Luan Teles", "Admin"];
 const ADMIN_SECRET = process.env.ADMIN_SECRET || "ADMINENABLED"; 
 
+const USER_DB_FILE = './userDatabase.json';
+const CHAT_DB_FILE = './chatHistory.json';
+
 app.get('/ping', (req, res) => {
   res.send('Server is Awake!');
 });
 
+
+function loadData(filePath, defaultData) {
+    try {
+        if (fs.existsSync(filePath)) {
+            const data = fs.readFileSync(filePath, 'utf8');
+            return JSON.parse(data);
+        }
+    } catch (err) {
+        console.error(`Erro ao carregar ${filePath}:`, err);
+    }
+    return defaultData;
+}
+
+function saveData(filePath, data) {
+    try {
+        fs.writeFileSync(filePath, JSON.stringify(data, null, 2), 'utf8');
+    } catch (err) {
+        console.error(`Erro ao salvar ${filePath}:`, err);
+    }
+}
+
+let userDatabase = loadData(USER_DB_FILE, {}); 
+let messageHistory = loadData(CHAT_DB_FILE, []); 
+
 setInterval(() => {
   https.get(APP_URL, (res) => {
-    console.log(`Auto-ping: Status ${res.statusCode} - Keeping the engine running!`);
+    console.log(`Auto-ping: Status ${res.statusCode} - Engine running!`);
   }).on('error', (err) => {
     console.error("Auto-ping error:", err.message);
   });
@@ -27,9 +55,6 @@ const io = new Server(server, {
   maxHttpBufferSize: 5e6
 });
 
-let messageHistory = []; 
-let userDatabase = {}; 
-
 io.on('connection', (socket) => {
   console.log('User connected: ' + socket.id);
 
@@ -38,7 +63,6 @@ io.on('connection', (socket) => {
   socket.on('register_user', (userData) => {
     if (userData && userData.name) {
       const name = userData.name;
-      
       socket.userName = name;
 
       userDatabase[name] = {
@@ -63,6 +87,7 @@ io.on('connection', (socket) => {
       };
 
       console.log(`[NETWORK] ${name} is now Online.`);
+      saveData(USER_DB_FILE, userDatabase);
       io.emit('online_list', Object.values(userDatabase));
     }
   });
@@ -72,55 +97,48 @@ io.on('connection', (socket) => {
     if (name && userDatabase[name]) {
       Object.assign(userDatabase[name], userData);
       userDatabase[name].lastSeen = Date.now();
-      
+      saveData(USER_DB_FILE, userDatabase);
       io.emit('online_list', Object.values(userDatabase));
     }
   });
 
-  socket.on('kick_user', (data) => {
-    const isAdmin = ADMIN_USERS.includes(data.adminUser) && data.secret === ADMIN_SECRET;
+  socket.on('search_users', (query) => {
+    if (!query || query.length < 2) return;
+    const searchTerm = query.toLowerCase();
+    const results = Object.values(userDatabase)
+      .filter(u => u.name.toLowerCase().includes(searchTerm))
+      .map(u => ({
+        name: u.name,
+        avatar: u.avatar,
+        online: u.online,
+        lastSeen: u.lastSeen,
+        level: u.level
+      }))
+      .slice(0, 15);
+    socket.emit('global_search_results', results);
+  });
+
+
+  socket.on('chat_message', (msg) => {
+    let messageData = {
+      ...(typeof msg === 'object' ? msg : { text: msg }),
+      time: new Date().toISOString(),
+      seenBy: []
+    };
     
-    if (isAdmin && data.targetId) {
-        const targetSocket = io.sockets.sockets.get(data.targetId);
-        
-        if (targetSocket) {
-            console.log(`[ADMIN] Kicking user: ${targetSocket.userName} (${data.targetId})`);
-            
-            targetSocket.emit('user_kicked');
-            
-            setTimeout(() => {
-                targetSocket.disconnect(true);
-            }, 500);
-        }
-    } else {
-        console.log(`[AUTH] Unauthorized kick attempt by: ${data.adminUser}`);
+    const isAdmin = ADMIN_USERS.includes(messageData.user) && messageData.secret === ADMIN_SECRET;
+    
+    if (messageData.text === '/reload' && isAdmin) {
+        return socket.broadcast.emit('force_reload');
     }
-  });
+    
+    delete messageData.secret;
+    messageHistory.push(messageData);
 
-  socket.on('admin_redeem', (data, callback) => {
-    const { code, user } = data;
-    const cleanCode = code.replace(/-/g, "").toUpperCase();
-    if (cleanCode === "PLATINUMCODE") return callback({ success: true, type: 'PLATINUM_UNLOCK' });
-    if (cleanCode === "UNLOCKALLDB1") return callback({ success: true, type: 'SINGLE_TROPHY' });
-    if (cleanCode === ADMIN_SECRET && ADMIN_USERS.includes(user)) {
-        return callback({ success: true, type: 'ADMIN_LOGIN', secret: ADMIN_SECRET });
-    }
-    callback({ success: false, message: "Invalid code." });
-  });
-
-  socket.on('delete_message', (data) => {
-    const msgIndex = messageHistory.findIndex(m => {
-        const mId = m.time ? new Date(m.time).getTime() : null;
-        return String(mId) === String(data.msgId);
-    });
-    if (msgIndex > -1) {
-        const isOwner = messageHistory[msgIndex].user === data.user;
-        const isAdmin = ADMIN_USERS.includes(data.user) && data.secret === ADMIN_SECRET;
-        if (isOwner || isAdmin) {
-            messageHistory.splice(msgIndex, 1);
-            io.emit('message_deleted', data.msgId);
-        }
-    }
+    if (messageHistory.length > 100) messageHistory.shift();
+    
+    saveData(CHAT_DB_FILE, messageHistory);
+    io.emit('chat_message', messageData); 
   });
 
   socket.on('edit_message', (data) => {
@@ -129,12 +147,47 @@ io.on('connection', (socket) => {
         return String(mId) === String(data.msgId);
     });
     if (msgIndex > -1) {
-        const isOwner = messageHistory[msgIndex].user === data.user;
         const isAdmin = ADMIN_USERS.includes(data.user) && data.secret === ADMIN_SECRET;
-        if (isOwner || isAdmin) {
+        if (messageHistory[msgIndex].user === data.user || isAdmin) {
             messageHistory[msgIndex].text = data.newText;
             messageHistory[msgIndex].edited = true;
+            saveData(CHAT_DB_FILE, messageHistory);
             io.emit('message_edited', { msgId: data.msgId, newText: data.newText });
+        }
+    }
+  });
+
+  socket.on('delete_message', (data) => {
+    const msgIndex = messageHistory.findIndex(m => {
+        const mId = m.time ? new Date(m.time).getTime() : null;
+        return String(mId) === String(data.msgId);
+    });
+    if (msgIndex > -1) {
+        const isAdmin = ADMIN_USERS.includes(data.user) && data.secret === ADMIN_SECRET;
+        if (messageHistory[msgIndex].user === data.user || isAdmin) {
+            messageHistory.splice(msgIndex, 1);
+            saveData(CHAT_DB_FILE, messageHistory);
+            io.emit('message_deleted', data.msgId);
+        }
+    }
+  });
+
+  socket.on('clear_chat', (data) => {
+    const isAdmin = ADMIN_USERS.includes(data.user) && data.secret === ADMIN_SECRET;
+    if (isAdmin) {
+        messageHistory = [];
+        saveData(CHAT_DB_FILE, messageHistory);
+        io.emit('chat_cleared');
+    }
+  });
+
+  socket.on('kick_user', (data) => {
+    const isAdmin = ADMIN_USERS.includes(data.adminUser) && data.secret === ADMIN_SECRET;
+    if (isAdmin && data.targetId) {
+        const targetSocket = io.sockets.sockets.get(data.targetId);
+        if (targetSocket) {
+            targetSocket.emit('user_kicked');
+            setTimeout(() => { targetSocket.disconnect(true); }, 500);
         }
     }
   });
@@ -145,6 +198,7 @@ io.on('connection', (socket) => {
         if (!msg.seenBy) msg.seenBy = [];
         if (!msg.seenBy.includes(data.user)) {
             msg.seenBy.push(data.user);
+            saveData(CHAT_DB_FILE, messageHistory); 
             io.emit('message_seen', { msgId: data.msgId, seenBy: msg.seenBy });
         }
     }
@@ -163,23 +217,20 @@ io.on('connection', (socket) => {
         } else {
             msg.reactions.push({ emoji: data.emoji, count: 1, users: [data.user] });
         }
+        saveData(CHAT_DB_FILE, messageHistory); 
         io.emit('message_reaction', data);
     }
   });
 
-  socket.on('chat_message', (msg) => {
-    let messageData = {
-      ...(typeof msg === 'object' ? msg : { text: msg }),
-      time: new Date().toISOString(),
-      seenBy: []
-    };
-    const isAdmin = ADMIN_USERS.includes(messageData.user) && messageData.secret === ADMIN_SECRET;
-    if (messageData.text === '/reload' && isAdmin) return socket.broadcast.emit('force_reload');
-    
-    delete messageData.secret;
-    messageHistory.push(messageData);
-    if (messageHistory.length > 100) messageHistory.shift();
-    io.emit('chat_message', messageData); 
+  socket.on('admin_redeem', (data, callback) => {
+    const { code, user } = data;
+    const cleanCode = code.replace(/-/g, "").toUpperCase();
+    if (cleanCode === "PLATINUMCODE") return callback({ success: true, type: 'PLATINUM_UNLOCK' });
+    if (cleanCode === "UNLOCKALLDB1") return callback({ success: true, type: 'SINGLE_TROPHY' });
+    if (cleanCode === ADMIN_SECRET && ADMIN_USERS.includes(user)) {
+        return callback({ success: true, type: 'ADMIN_LOGIN', secret: ADMIN_SECRET });
+    }
+    callback({ success: false, message: "Invalid code." });
   });
 
   socket.on('disconnect', () => {
@@ -187,9 +238,7 @@ io.on('connection', (socket) => {
     if (name && userDatabase[name]) {
       userDatabase[name].online = false;
       userDatabase[name].lastSeen = Date.now();
-      
-      console.log(`[NETWORK] ${name} is now Offline. Last seen updated.`);
-      
+      saveData(USER_DB_FILE, userDatabase);
       io.emit('online_list', Object.values(userDatabase));
     }
   });
