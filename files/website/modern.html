@@ -3091,7 +3091,6 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 			
 			if (searchBar) searchBar.style.display = 'none';
 			
-			// Reset do placeholder para o padrão do site
 			if (searchInput) {
 				searchInput.placeholder = "Search Title or ID";
 				searchInput.value = "";
@@ -3819,7 +3818,7 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 		if (isLibrary) {
 			applyLibraryFilters();
 		} else if (isSocial) {
-			window.globalSearchResults = []; // Limpa os resultados globais
+			window.globalSearchResults = [];
 			renderFriendsList('');
 		} else {
 			applyFilters();
@@ -4456,11 +4455,8 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 			const profileBtn = document.querySelector(`.profile-item[onclick*="${profileKey}"]`);
 			if (profileBtn) profileBtn.classList.add('active');
 			
-			// --- A SOLUÇÃO DO SEU BUG ESTÁ AQUI ---
 			if (viewId === 'view-chat') {
-				// Olha se a sub-tela de amigos está aberta
 				const isFriendsOpen = document.getElementById('subview-friends')?.style.display === 'flex';
-				// Se estiver, acende friends. Se não, acende global.
 				const sidebarId = isFriendsOpen ? 'nav-chat-friends' : 'nav-chat-global';
 				document.getElementById(sidebarId)?.classList.add('active');
 			} else {
@@ -7253,8 +7249,8 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
     }
 
     function showImagePreview(base64Data) {
-        if (typeof cancelReply === 'function') cancelReply();
-        if (typeof cancelEditMessage === 'function') cancelEditMessage();
+        if (currentReply) cancelReply();
+        if (editingMsgId) cancelEditMessage();
 
         pendingImageFile = base64Data;
         let container = document.getElementById('pending-image-preview');
@@ -8010,12 +8006,33 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 
             chatInput.addEventListener('paste', (e) => {
                 const items = (e.clipboardData || e.originalEvent.clipboardData).items;
-                for (let i in items) {
+                let hasImage = false;
+                let imageFile = null;
+            
+                for (let i = 0; i < items.length; i++) {
                     if (items[i].kind === 'file' && items[i].type.startsWith('image/')) {
-                        processAndSendImage(items[i].getAsFile());
-                        e.preventDefault(); 
+                        hasImage = true;
+                        imageFile = items[i].getAsFile();
                         break;
                     }
+                }
+            
+                if (hasImage) {
+                    e.preventDefault(); // Impede o navegador de bugar
+                    
+                    const pastedText = (e.clipboardData || e.originalEvent.clipboardData).getData('text') || '';
+                    
+                    // Pegar a posição do cursor e injetar o texto no meio, para ficar suave
+                    const start = chatInput.selectionStart;
+                    const end = chatInput.selectionEnd;
+                    const textBefore = chatInput.value.substring(0, start);
+                    const textAfter = chatInput.value.substring(end, chatInput.value.length);
+                    
+                    chatInput.value = textBefore + pastedText + textAfter;
+                    chatInput.selectionStart = chatInput.selectionEnd = start + pastedText.length;
+                    
+                    // Processa a imagem agora de forma segura
+                    processAndSendImage(imageFile);
                 }
             });
         }
@@ -8095,16 +8112,22 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 		}
 	});
 
-    function processAndSendImage(file) {
-        if (!file || file.size > 2 * 1024 * 1024) return;
-        
-        const reader = new FileReader();
-        reader.onload = (e) => {
-            showImagePreview(e.target.result);
-            if (typeof playUiSuccess === 'function') playUiSuccess();
-        };
-        reader.readAsDataURL(file);
-    }
+		function processAndSendImage(file) {
+		if (!file) return;
+		
+		if (file.size > 5 * 1024 * 1024) {
+			alert("Warning: Image too large (greater than 5MB). Try uploading a smaller file!");
+			if (typeof playUiError === 'function') playUiError();
+			return;
+		}
+		
+		const reader = new FileReader();
+		reader.onload = (e) => {
+			showImagePreview(e.target.result);
+			if (typeof playUiSuccess === 'function') playUiSuccess();
+		};
+		reader.readAsDataURL(file);
+	}
     
     async function fetchLinkMetadata(url, elementId) {
         if (url.match(/\.(jpeg|jpg|gif|png)$/) != null) return;
@@ -8383,7 +8406,6 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 		
 		if (!grid) return;
 	
-		// Atualiza o título lá no topo (Igual à Wishlist)
 		if (titleHeader) {
 			const totalFriends = window.friendsList ? window.friendsList.length : 0;
 			titleHeader.innerHTML = `Friends <span style="color: var(--ps-blue); font-size: 14px; margin-left: 10px; font-weight: normal; opacity: 0.8;">(${totalFriends} items)</span>`;
