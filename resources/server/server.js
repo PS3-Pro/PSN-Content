@@ -182,15 +182,16 @@ io.on('connection', (socket) => {
   });
 
   socket.on('kick_user', (data) => {
-    const isAdmin = ADMIN_USERS.includes(data.adminUser) && data.secret === ADMIN_SECRET;
-    if (isAdmin && data.targetId) {
-        const targetSocket = io.sockets.sockets.get(data.targetId);
-        if (targetSocket) {
-            targetSocket.emit('user_kicked');
-            setTimeout(() => { targetSocket.disconnect(true); }, 500);
-        }
-    }
-  });
+    const isAdmin = ADMIN_USERS.includes(data.adminUser) && data.secret === ADMIN_SECRET;
+    if (isAdmin && data.targetId) {
+        const targetSocket = io.sockets.sockets.get(data.targetId);
+        if (targetSocket) {
+            targetSocket.emit('user_kicked');
+            socket.emit('kick_success', { targetId: data.targetId });
+            setTimeout(() => { targetSocket.disconnect(true); }, 500);
+        }
+    }
+  });
 
   socket.on('mark_as_read', (data) => {
     const msg = messageHistory.find(m => String(new Date(m.time).getTime()) === String(data.msgId));
