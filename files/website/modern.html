@@ -3162,53 +3162,80 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 		if (typeof playUiBack === 'function') playUiBack();
 		if (!navHistory) return;
 		
-		if (typeof navHistory.fromExplore === 'string' && navHistory.fromExplore.indexOf('profile_') === 0) {
-			const data = navHistory.fromExplore.substring(8);
+		const from = navHistory.fromExplore;
+	
+		if (typeof from === 'string' && from.indexOf('profile_') === 0) {
+			const data = from.substring(8);
 			const lastUnderscore = data.lastIndexOf('_');
 			const username = data.substring(0, lastUnderscore);
-			const listType = data.substring(lastUnderscore + 1);
+			const originView = data.substring(lastUnderscore + 1);
 			
-			switchView('view-chat');
+			if (originView === 'chat' || originView === 'friends') {
+				switchView('view-chat');
+				if (typeof showSocialSection === 'function') showSocialSection(originView);
+			} else {
+				switchView('view-' + originView);
+			}
 			
 			setTimeout(() => {
 				if (typeof openProfileModal === 'function') {
 					openProfileModal(username);
-					setTimeout(() => {
-						if (typeof openPlayerList === 'function') {
-							openPlayerList(listType);
-						}
-					}, 100);
+					
+					const subLists = ['wishlist', 'downloads', 'favs', 'library', 'trophies'];
+					if (subLists.includes(originView)) {
+						setTimeout(() => {
+							if (typeof openPlayerList === 'function') openPlayerList(originView);
+						}, 100);
+					}
 				}
 			}, 150); 
 			
 			navHistory = null;
 			return;
 		}
+	
+		if (typeof from === 'string' && from.indexOf('online_modal_') === 0) {
+			const originView = from.substring(13);
+			
+			if (originView === 'chat' || originView === 'friends') {
+				switchView('view-chat');
+				if (typeof showSocialSection === 'function') showSocialSection(originView);
+			} else {
+				switchView('view-' + originView);
+			}
+	
+			setTimeout(() => {
+				if (typeof openOnlineModal === 'function') openOnlineModal();
+			}, 150);
+	
+			navHistory = null;
+			return;
+		}
 		
-		if (navHistory.fromExplore === true) {
+		if (from === true) {
 			document.querySelectorAll('.top-nav a').forEach(a => a.classList.remove('active'));
 			document.getElementById('top-nav-home')?.classList.add('active');
 			document.querySelector('.menu-group-home').style.display = 'block';
 			document.querySelector('.menu-group-store').style.display = 'none';
 			document.querySelector('.menu-group-library').style.display = 'none';
+			
 			if (typeof isTransitioning !== 'undefined') isTransitioning = false;
 			if (typeof autoSlideTimer !== 'undefined') clearInterval(autoSlideTimer);
+			
 			switchView('view-explore');
+			
 			setTimeout(() => {
 				if (typeof updateBanner === 'function') updateBanner(false);
 				if (typeof startAutoSlide === 'function') startAutoSlide();
 			}, 50);
+			
 			navHistory = null;
 			return;
 		}
 	
-		if (navHistory.fromExplore === 'downloads') {
-			switchView('view-downloads');
-			navHistory = null;
-			return;
-		}
-		if (navHistory.fromExplore === 'wishlist') {
-			switchView('view-wishlist');
+		const simpleViews = ['downloads', 'wishlist', 'library', 'browse'];
+		if (typeof from === 'string' && simpleViews.includes(from)) {
+			switchView('view-' + from);
 			navHistory = null;
 			return;
 		}
@@ -3216,12 +3243,16 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 		const savedScroll = navHistory.scroll;
 		const oldHistory = navHistory; 
 		navHistory = null; 
+	
 		const catSelect = document.getElementById('cat-select');
 		const searchInput = document.getElementById('search-input');
+		
 		if (catSelect) catSelect.value = oldHistory.category;
 		if (searchInput) searchInput.value = oldHistory.search;
 		if (typeof activeLetter !== 'undefined') activeLetter = oldHistory.letter;
-		if (document.getElementById('region-select')) document.getElementById('region-select').value = oldHistory.region;
+		
+		const regSelect = document.getElementById('region-select');
+		if (regSelect) regSelect.value = oldHistory.region;
 		
 		document.querySelectorAll('#console-filters input').forEach(cb => {
 			cb.checked = oldHistory.consoles.includes(cb.value);
@@ -5427,20 +5458,33 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 	}
 
 	window.searchGameOnSite = function(titleId) {
-		const activeModals = document.querySelectorAll('.sys-modal-overlay.show, .modal-overlay.show, .show');
-		activeModals.forEach(el => {
-			el.classList.remove('show');
-		});
+		const nameSpan = document.getElementById('profile-name-val');
+		const profileOpen = document.getElementById('modal-sys-profile')?.style.display === 'flex';
+		const onlineOpen = document.getElementById('modal-sys-online')?.style.display === 'flex';
 	
-		const overlays = document.querySelectorAll('.modal-overlay, .sys-modal-overlay');
-		overlays.forEach(modal => {
-			if (modal.style.display !== 'none') {
-				modal.style.display = 'none';
-			}
-		});
+		const activeView = document.querySelector('.view-section[style*="display: block"]')?.id || 'view-explore';
+		let viewKey = activeView.replace('view-', '');
+	
+		if (viewKey === 'chat') {
+			const isFriends = document.getElementById('subview-friends')?.style.display === 'flex';
+			viewKey = isFriends ? 'friends' : 'chat';
+		}
+	
+		let returnPath = true;
+	
+		if (profileOpen && nameSpan) {
+			returnPath = `profile_${nameSpan.innerText}_${viewKey}`;
+		} else if (onlineOpen) {
+			returnPath = `online_modal_${viewKey}`;
+		} else {
+			returnPath = viewKey === 'explore' ? true : viewKey;
+		}
+	
+		document.querySelectorAll('.sys-modal-overlay.show, .modal-overlay.show, .show').forEach(el => el.classList.remove('show'));
+		document.querySelectorAll('.modal-overlay, .sys-modal-overlay').forEach(modal => modal.style.display = 'none');
 	
 		if (typeof switchAndSearch === 'function') {
-			switchAndSearch('games', titleId, true);
+			switchAndSearch('games', titleId, returnPath);
 		}
 	};
 	
@@ -8076,7 +8120,7 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 			if (ps3.status === 'playing') {
 				playingStatusHtml = `
 					<span style="color: #00bcff; font-size: 9px; display: block; font-weight: bold; margin-top: 2px; letter-spacing: 0.5px;">
-						<i class="fas fa-gamepad" style="font-size: 8px;"></i> Playing: <a href="javascript:void(0)" onclick="event.stopPropagation(); searchGameOnSite('${ps3.titleId}')" class="playing-link" style="color:inherit; font-weight:bold; text-decoration: underline;">${ps3.title}</a>
+						<i class="fas fa-gamepad" style="font-size: 8px;"></i> Playing: ${ps3.title}
 					</span>`;
 			} else if (ps3.status === 'idle') {
 				playingStatusHtml = `
@@ -8370,7 +8414,7 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 		if (isOnline && netUser && netUser.ps3Status) {
 			if (netUser.ps3Status.status === 'playing') {
 				playingHtml = `<div style="color: #00bcff; font-size: 10px; font-weight: bold; margin-top: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 180px;">
-					<i class="fas fa-gamepad"></i> Playing: <a href="javascript:void(0)" onclick="event.stopPropagation(); searchGameOnSite('${netUser.ps3Status.titleId}')" class="playing-link" style="color:inherit; font-weight:bold; text-decoration: underline;">${netUser.ps3Status.title}</a>
+					<i class="fas fa-gamepad"></i> Playing: ${netUser.ps3Status.title}
 				</div>`;
 			} else if (netUser.ps3Status.status === 'idle') {
 				playingHtml = `<div style="color: #4caf50; font-size: 10px; margin-top: 4px; opacity: 0.8;">On XMB™</div>`;
