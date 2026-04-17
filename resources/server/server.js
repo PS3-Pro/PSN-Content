@@ -81,9 +81,7 @@ io.on('connection', (socket) => {
         favoritesData: userData.favoritesData || [],
         libraryData: userData.libraryData || [],
         trophiesData: userData.trophiesData || {},
-        
-        // --- NOVIDADE: PEGA O STATUS DO PS3 NO REGISTRO ---
-        ps3Status: userData.ps3Status || { status: 'idle' },
+        ps3Status: userData.ps3Status || null,
         
         online: true,
         lastSeen: Date.now() 
