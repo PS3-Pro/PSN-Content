@@ -8,7 +8,7 @@ const app = express();
 const server = http.createServer(app);
 
 const APP_URL = "https://psn-content.onrender.com/ping"; 
-const ADMIN_USERS = ["Luan Teles", "Admin"];
+const ADMIN_USERS = ["Luan Teles", "Goku Cheats", "Admin"];
 const ADMIN_SECRET = process.env.ADMIN_SECRET || "ADMINENABLED"; 
 
 const USER_DB_FILE = './userDatabase.json';
