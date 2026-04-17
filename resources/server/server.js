@@ -18,7 +18,6 @@ app.get('/ping', (req, res) => {
   res.send('Server is Awake!');
 });
 
-
 function loadData(filePath, defaultData) {
     try {
         if (fs.existsSync(filePath)) {
@@ -82,6 +81,10 @@ io.on('connection', (socket) => {
         favoritesData: userData.favoritesData || [],
         libraryData: userData.libraryData || [],
         trophiesData: userData.trophiesData || {},
+        
+        // --- NOVIDADE: PEGA O STATUS DO PS3 NO REGISTRO ---
+        ps3Status: userData.ps3Status || { status: 'idle' },
+        
         online: true,
         lastSeen: Date.now() 
       };
@@ -112,12 +115,12 @@ io.on('connection', (socket) => {
         avatar: u.avatar,
         online: u.online,
         lastSeen: u.lastSeen,
-        level: u.level
+        level: u.level,
+        ps3Status: u.ps3Status || null 
       }))
       .slice(0, 15);
     socket.emit('global_search_results', results);
   });
-
 
   socket.on('chat_message', (msg) => {
     let messageData = {
@@ -182,16 +185,16 @@ io.on('connection', (socket) => {
   });
 
   socket.on('kick_user', (data) => {
-    const isAdmin = ADMIN_USERS.includes(data.adminUser) && data.secret === ADMIN_SECRET;
-    if (isAdmin && data.targetId) {
-        const targetSocket = io.sockets.sockets.get(data.targetId);
-        if (targetSocket) {
-            targetSocket.emit('user_kicked');
+    const isAdmin = ADMIN_USERS.includes(data.adminUser) && data.secret === ADMIN_SECRET;
+    if (isAdmin && data.targetId) {
+        const targetSocket = io.sockets.sockets.get(data.targetId);
+        if (targetSocket) {
+            targetSocket.emit('user_kicked');
             socket.emit('kick_success', { targetId: data.targetId });
-            setTimeout(() => { targetSocket.disconnect(true); }, 500);
-        }
-    }
-  });
+            setTimeout(() => { targetSocket.disconnect(true); }, 500);
+        }
+    }
+  });
 
   socket.on('mark_as_read', (data) => {
     const msg = messageHistory.find(m => String(new Date(m.time).getTime()) === String(data.msgId));
