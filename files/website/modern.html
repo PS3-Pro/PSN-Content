@@ -1795,8 +1795,8 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 			</div>
 			<div class="sys-modal-body" style="text-align: center;">
 				<p style="color: var(--text-muted); margin-bottom: 20px; font-size: 14px;">Enter a 12-digit voucher code.</p>
-				<input type="text" id="redeem-input-field" class="redeem-input" maxlength="14" placeholder="XXXX-XXXX-XXXX" oninput="formatRedeemCode(this)">
-				<button class="action-btn" style="width: 100%; margin-top: 20px; display: flex; justify-content: center; align-items: center; gap: 8px;" onmouseenter="playUiHover()" onclick="processRedeemCode()">
+				<input type="text" id="redeem-input-field" class="redeem-input" maxlength="14" placeholder="XXXX-XXXX-XXXX" oninput="formatRedeemCode(this)" onfocus="if(typeof playUiTextField === 'function') playUiTextField()" onblur="if(typeof playUiBack === 'function') playUiBack()">
+				<button id="btn-redeem-action" class="action-btn" style="width: 100%; margin-top: 20px; display: flex; justify-content: center; align-items: center; gap: 8px;" onmouseenter="playUiHover()" onclick="processRedeemCode()">
 					<i class="fas fa-check"></i> 
 					<span>Continue</span>
 				</button>
@@ -1827,6 +1827,9 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
    </audio>
    <audio id="sound-ui-success" preload="auto">
       <source src="https://raw.githubusercontent.com/PS3-Pro/PSN-Content/main/resources/interface/modern/sounds/interface/success.mp3" type="audio/mpeg">
+   </audio>
+   <audio id="sound-ui-error" preload="auto">
+      <source src="https://raw.githubusercontent.com/PS3-Pro/PSN-Content/main/resources/interface/modern/sounds/interface/error.mp3" type="audio/mpeg">
    </audio>
    <audio id="sound-ui-remove" preload="auto">
       <source src="https://raw.githubusercontent.com/PS3-Pro/PSN-Content/main/resources/interface/modern/sounds/interface/error.mp3" type="audio/mpeg">
@@ -1943,6 +1946,7 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 	function playUiModal() { playSystemSound('sound-ui-modal', 0.6); }
 	function playUiRemove() { playSystemSound('sound-ui-remove', 1); }
 	function playUiSuccess() { playSystemSound('sound-ui-success', 0.6); }
+	function playUiError() { playSystemSound('sound-ui-error', 0.6); }
 	function playUiLetterFilter() { playSystemSound('sound-ui-letter', 1); }
 	function playUiDropdown() { playSystemSound('sound-ui-dropdown', 0.6); }
 	function playUiDropdownSelect() { playSystemSound('sound-ui-dropdown-select', 0.6); }
@@ -3109,6 +3113,9 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 			
 			navHistory = null;
 
+			if (typeof resetAllFilters === 'function') resetAllFilters();
+			switchView('view-browse');
+
 			const catSelect = document.getElementById('cat-select');
 			if (catSelect) catSelect.value = 'games';
 			
@@ -3116,9 +3123,6 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 			const appF = document.getElementById('app-filters');
 			if (consoleF) consoleF.style.display = 'flex';
 			if (appF) appF.style.display = 'none';
-
-			if (typeof resetAllFilters === 'function') resetAllFilters();
-			switchView('view-browse');
 			
 			const scrollArea = document.getElementById('scroll-area');
 			if (scrollArea) {
@@ -8851,13 +8855,11 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 	
 		if (isOnline && netUser && netUser.ps3Status) {
 			if (netUser.ps3Status.status === 'playing') {
-				// Corrigido: Azul pra você, Rosa pros amigos!
 				const accentColor = isMe ? "var(--ps-blue)" : "#FF1493";
 				playingHtml = `<div style="color: ${accentColor}; font-size: 10px; font-weight: bold; margin-top: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 180px;">
 					🎮 Playing: ${netUser.ps3Status.title}
 				</div>`;
 			} else if (netUser.ps3Status.status === 'idle') {
-				// Trocado para o Emoji e cor unificada
 				playingHtml = `<div style="color: #ffa500; font-size: 10px; margin-top: 4px; font-weight: bold; opacity: 0.9;">
 					📺 On XMB™
 				</div>`;
@@ -9329,56 +9331,113 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
         input.value = val;
     }
 
-    function processRedeemCode() {
+    window.processRedeemCode = function() {
 		if (typeof playUiClick === 'function') playUiClick();
+		
 		const input = document.getElementById('redeem-input-field');
+		const btn = document.getElementById('btn-redeem-action');
 		const code = input.value.replace(/-/g, '').toUpperCase();
 	
+		const targetBtn = btn || document.querySelector('#modal-sys-redeem button.action-btn'); 
+		
+		let originalHtml = "REDEEM";
+		let originalBg = "";
+		
+		if (targetBtn) {
+			originalHtml = targetBtn.innerHTML;
+			originalBg = targetBtn.style.background;
+			targetBtn.style.transition = 'all 0.3s ease'; 
+		}
+
+		const MIN_SPINNER_TIME = 1500; 
+		const FEEDBACK_PAUSE = 1800;   
+		const startTime = Date.now();
+	
+		const resetState = () => {
+			if (targetBtn) {
+				targetBtn.innerHTML = originalHtml;
+				targetBtn.style.background = originalBg;
+				targetBtn.disabled = false;
+			}
+			input.disabled = false;
+		};
+	
+		const showError = (msg) => {
+			if (targetBtn) {
+				const btnText = (msg && msg.length < 25) ? msg : 'Invalid';
+				targetBtn.innerHTML = `<i class="fas fa-times"></i> ${btnText}`;
+				targetBtn.style.background = '#ff4444';
+			}
+			if (typeof playUiError === 'function') playUiError();
+			
+			setTimeout(() => {
+				resetState();
+			}, FEEDBACK_PAUSE);
+		};
+	
+		const showSuccess = (callback) => {
+			if (targetBtn) {
+				targetBtn.innerHTML = '<i class="fas fa-check"></i> Accepted';
+				targetBtn.style.background = '#4caf50';
+			}
+			if (typeof playUiSuccess === 'function') playUiSuccess();
+			
+			setTimeout(() => {
+				callback();
+				resetState();
+				input.value = '';
+				closeSysModal(null, 'modal-sys-redeem');
+			}, FEEDBACK_PAUSE);
+		};
+	
 		if (code.length !== 12) {
-			alert("The code must contain exactly 12 characters.");
+			showError("Must be 12 characters");
 			return;
 		}
 	
-		if (socketChat && socketChat.connected) {
+		if (targetBtn) {
+			targetBtn.disabled = true;
+			targetBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Checking...';
+			targetBtn.style.background = '#ffa500'; 
+		}
+		input.disabled = true;
+	
+		if (typeof socketChat !== 'undefined' && socketChat && socketChat.connected) {
 			const myName = localStorage.getItem('psn_username') || "Guest";
 			
 			socketChat.emit('admin_redeem', { code: code, user: myName }, (response) => {
-				if (response.success) {
-					
-					if (response.type === 'PLATINUM_UNLOCK') {
-						if (typeof window.unlockAllTrophiesHacker === 'function') {
-							window.unlockAllTrophiesHacker();
-							alert("Voucher accepted! All trophies and Platinum earned.");
-						}
-					} 
-					
-					else if (response.type === 'SINGLE_TROPHY') {
-						if (typeof window.checkTrophyProgress === 'function') {
-							window.checkTrophyProgress('unlock_all', 1);
-							alert("Voucher accepted! Special Database Trophy Unlocked.");
-						}
+				const elapsed = Date.now() - startTime;
+				const remaining = Math.max(0, MIN_SPINNER_TIME - elapsed);
+
+				setTimeout(() => {
+					if (response.success) {
+						showSuccess(() => {
+							if (response.type === 'PLATINUM_UNLOCK') {
+								if (typeof window.unlockAllTrophiesHacker === 'function') window.unlockAllTrophiesHacker();
+							} 
+							else if (response.type === 'SINGLE_TROPHY') {
+								if (typeof window.checkTrophyProgress === 'function') window.checkTrophyProgress('unlock_all', 1);
+							} 
+							else if (response.type === 'ADMIN_LOGIN') {
+								localStorage.setItem('psn_admin_secret', response.secret);
+								const chatBox = document.getElementById('chat-messages');
+								if (chatBox) chatBox.innerHTML = '';
+								if (typeof initChat === 'function') initChat();
+							}
+						});
+					} else {
+						showError(response.message || "Invalid Code");
 					}
-					
-					else if (response.type === 'ADMIN_LOGIN') {
-						localStorage.setItem('psn_admin_secret', response.secret);
-						alert("System Authorization Granted. Welcome back, Admin.");
-						
-						const chatBox = document.getElementById('chat-messages');
-						if (chatBox) chatBox.innerHTML = '';
-						
-						initChat();
-					}
-				} else {
-					alert(response.message || "Invalid voucher code.");
-				}
+				}, remaining);
 			});
 		} else {
-			alert("Connection error. Try again later.");
+			const elapsed = Date.now() - startTime;
+			const remaining = Math.max(0, MIN_SPINNER_TIME - elapsed);
+			setTimeout(() => {
+				showError("Connection error");
+			}, remaining);
 		}
-		
-		if (input) input.value = '';
-		closeSysModal(null, 'modal-sys-redeem');
-	}
+	};
 </script>
 	<script>
     const particleConfig = {
