@@ -3005,17 +3005,32 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 	window.switchAndSearch = function(category, titleId, fromWhere = false) {
 		window.g_animCutoffFound = false;
 	
+		let bgView = document.querySelector('.view-section[style*="display: block"]')?.id.replace('view-', '') || 'explore';
+		if (bgView === 'chat') {
+			bgView = document.getElementById('subview-friends')?.style.display === 'flex' ? 'friends' : 'chat';
+		}
+	
+		let finalFromWhere = fromWhere;
+	
+		const gameModal = document.getElementById('game-modal');
+		if (gameModal && (gameModal.style.display === 'flex' || gameModal.classList.contains('show'))) {
+			finalFromWhere = `gamemodal|${titleId}|${bgView}`;
+			if (typeof closeModal === 'function') closeModal();
+		} else if (!fromWhere) {
+			finalFromWhere = bgView;
+		}
+
 		if (typeof resetAllFilters === 'function') resetAllFilters(); 
 	
 		navHistory = {
-			category: category || 'games',
-			search: titleId || '',
+			category: document.getElementById('cat-select') ? document.getElementById('cat-select').value : 'games',
+			search: document.getElementById('search-input') ? document.getElementById('search-input').value : '',
 			letter: typeof activeLetter !== 'undefined' ? activeLetter : "ALL",
 			region: document.getElementById('region-select') ? document.getElementById('region-select').value : 'ALL',
 			consoles: Array.from(document.querySelectorAll('#console-filters input:checked')).map(cb => cb.value),
 			appsFilters: Array.from(document.querySelectorAll('#app-filters input:checked')).map(cb => cb.value),
-			scroll: 0,
-			fromExplore: fromWhere
+			scroll: document.getElementById('scroll-area') ? document.getElementById('scroll-area').scrollTop : 0,
+			fromExplore: finalFromWhere
 		};
 	
 		document.querySelectorAll('.top-nav a').forEach(a => a.classList.remove('active'));
@@ -3088,7 +3103,11 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 			switchView('view-browse');
 			
 			const scrollArea = document.getElementById('scroll-area');
-			if (scrollArea) scrollArea.scrollTo({ top: 0 });
+			if (scrollArea) {
+				scrollArea.style.scrollBehavior = 'auto';
+				scrollArea.scrollTop = 0;
+				scrollArea.style.scrollBehavior = 'smooth';
+			}
 		}
 		else if (tab === 'chat') {
 			if(groups.chat) groups.chat.style.display = 'block';
@@ -3171,16 +3190,95 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 		if (!navHistory) return;
 		
 		const from = navHistory.fromExplore;
+
+		if (typeof from === 'string' && from.startsWith('gamemodal|')) {
+			const parts = from.split('|');
+			const gameId = parts[1];
+			const bgView = parts[2];
+			
+			const savedScroll = navHistory.scroll;
+			const oldHistory = navHistory; 
+			navHistory = null; 
+
+			if (bgView === 'chat' || bgView === 'friends') {
+				switchView('view-chat');
+				if (typeof showSocialSection === 'function') showSocialSection(bgView);
+			} else if (bgView === 'explore') {
+				document.querySelectorAll('.top-nav a').forEach(a => a.classList.remove('active'));
+				document.getElementById('top-nav-home')?.classList.add('active');
+				document.querySelector('.menu-group-home').style.display = 'block';
+				document.querySelector('.menu-group-store').style.display = 'none';
+				document.querySelector('.menu-group-library').style.display = 'none';
+				if (typeof isTransitioning !== 'undefined') isTransitioning = false;
+				if (typeof autoSlideTimer !== 'undefined') clearInterval(autoSlideTimer);
+				switchView('view-explore');
+				setTimeout(() => {
+					if (typeof updateBanner === 'function') updateBanner(false);
+					if (typeof startAutoSlide === 'function') startAutoSlide();
+				}, 50);
+			} else if (bgView !== 'browse') {
+				switchView('view-' + bgView);
+			}
+
+			if (bgView === 'browse') {
+				const catSelect = document.getElementById('cat-select');
+				const searchInput = document.getElementById('search-input');
+				
+				if (catSelect) catSelect.value = oldHistory.category;
+				if (searchInput) searchInput.value = oldHistory.search;
+				if (typeof activeLetter !== 'undefined') activeLetter = oldHistory.letter;
+				
+				const regSelect = document.getElementById('region-select');
+				if (regSelect) regSelect.value = oldHistory.region;
+				
+				document.querySelectorAll('#console-filters input').forEach(cb => {
+					cb.checked = oldHistory.consoles.includes(cb.value);
+				});
+				
+				switchView('view-browse');
+				
+				if (typeof fetchDatabase === 'function') {
+					fetchDatabase().then(() => {
+						setTimeout(() => {
+							const sa = document.getElementById('scroll-area');
+							if (sa) sa.scrollTop = savedScroll;
+
+							if (typeof filteredData !== 'undefined') {
+								const idx = filteredData.findIndex(g => g.id === gameId);
+								if (idx > -1 && typeof openModal === 'function') {
+									openModal(idx);
+								}
+							}
+						}, 100);
+					});
+				}
+			}
+			return;
+		}
 	
 		if (typeof from === 'string' && from.startsWith('profilelist|')) {
 			const parts = from.split('|');
 			const username = parts[1];
 			const listType = parts[2];
 			const bgView = parts[3];
+			const wasOnline = parts[4] === "true";
 	
 			if (bgView === 'chat' || bgView === 'friends') {
 				switchView('view-chat');
 				if (typeof showSocialSection === 'function') showSocialSection(bgView);
+			} else if (bgView === 'explore') {
+				document.querySelectorAll('.top-nav a').forEach(a => a.classList.remove('active'));
+				document.getElementById('top-nav-home')?.classList.add('active');
+				document.querySelector('.menu-group-home').style.display = 'block';
+				document.querySelector('.menu-group-store').style.display = 'none';
+				document.querySelector('.menu-group-library').style.display = 'none';
+				if (typeof isTransitioning !== 'undefined') isTransitioning = false;
+				if (typeof autoSlideTimer !== 'undefined') clearInterval(autoSlideTimer);
+				switchView('view-explore');
+				setTimeout(() => {
+					if (typeof updateBanner === 'function') updateBanner(false);
+					if (typeof startAutoSlide === 'function') startAutoSlide();
+				}, 50);
 			} else {
 				switchView('view-' + bgView);
 			}
@@ -3188,6 +3286,18 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 			setTimeout(() => {
 				if (typeof openProfileModal === 'function') {
 					openProfileModal(username);
+
+					if (wasOnline) {
+						const pModal = document.getElementById('modal-sys-profile');
+						if (pModal) pModal.dataset.returnToOnline = "true";
+						const oModal = document.getElementById('modal-sys-online');
+						if (oModal) {
+							oModal.style.display = 'flex';
+							oModal.style.opacity = '0';
+							oModal.style.pointerEvents = 'none';
+						}
+					}
+
 					setTimeout(() => {
 						if (typeof openPlayerList === 'function') openPlayerList(listType);
 					}, 100);
@@ -3199,7 +3309,10 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 		}
 	
 		if (typeof from === 'string' && from.indexOf('profile_') === 0) {
-			const data = from.substring(8);
+			const isFromOnline = from.endsWith('_fromOnline');
+			const rawData = isFromOnline ? from.replace('_fromOnline', '') : from;
+
+			const data = rawData.substring(8);
 			const lastUnderscore = data.lastIndexOf('_');
 			const username = data.substring(0, lastUnderscore);
 			const originView = data.substring(lastUnderscore + 1);
@@ -3207,12 +3320,38 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 			if (originView === 'chat' || originView === 'friends') {
 				switchView('view-chat');
 				if (typeof showSocialSection === 'function') showSocialSection(originView);
+			} else if (originView === 'explore') {
+				document.querySelectorAll('.top-nav a').forEach(a => a.classList.remove('active'));
+				document.getElementById('top-nav-home')?.classList.add('active');
+				document.querySelector('.menu-group-home').style.display = 'block';
+				document.querySelector('.menu-group-store').style.display = 'none';
+				document.querySelector('.menu-group-library').style.display = 'none';
+				if (typeof isTransitioning !== 'undefined') isTransitioning = false;
+				if (typeof autoSlideTimer !== 'undefined') clearInterval(autoSlideTimer);
+				switchView('view-explore');
+				setTimeout(() => {
+					if (typeof updateBanner === 'function') updateBanner(false);
+					if (typeof startAutoSlide === 'function') startAutoSlide();
+				}, 50);
 			} else {
 				switchView('view-' + originView);
 			}
 			
 			setTimeout(() => {
-				if (typeof openProfileModal === 'function') openProfileModal(username);
+				if (typeof openProfileModal === 'function') {
+					openProfileModal(username);
+
+					if (isFromOnline) {
+						const pModal = document.getElementById('modal-sys-profile');
+						if (pModal) pModal.dataset.returnToOnline = "true";
+						const oModal = document.getElementById('modal-sys-online');
+						if (oModal) {
+							oModal.style.display = 'flex';
+							oModal.style.opacity = '0';
+							oModal.style.pointerEvents = 'none';
+						}
+					}
+				}
 			}, 150); 
 			
 			navHistory = null;
@@ -3225,6 +3364,19 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 			if (originView === 'chat' || originView === 'friends') {
 				switchView('view-chat');
 				if (typeof showSocialSection === 'function') showSocialSection(originView);
+			} else if (originView === 'explore') {
+				document.querySelectorAll('.top-nav a').forEach(a => a.classList.remove('active'));
+				document.getElementById('top-nav-home')?.classList.add('active');
+				document.querySelector('.menu-group-home').style.display = 'block';
+				document.querySelector('.menu-group-store').style.display = 'none';
+				document.querySelector('.menu-group-library').style.display = 'none';
+				if (typeof isTransitioning !== 'undefined') isTransitioning = false;
+				if (typeof autoSlideTimer !== 'undefined') clearInterval(autoSlideTimer);
+				switchView('view-explore');
+				setTimeout(() => {
+					if (typeof updateBanner === 'function') updateBanner(false);
+					if (typeof startAutoSlide === 'function') startAutoSlide();
+				}, 50);
 			} else {
 				switchView('view-' + originView);
 			}
@@ -3237,7 +3389,7 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 			return;
 		}
 		
-		if (from === true) {
+		if (from === true || from === 'explore') {
 			document.querySelectorAll('.top-nav a').forEach(a => a.classList.remove('active'));
 			document.getElementById('top-nav-home')?.classList.add('active');
 			document.querySelector('.menu-group-home').style.display = 'block';
@@ -3258,7 +3410,7 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 			return;
 		}
 	
-		const simpleViews = ['downloads', 'wishlist', 'library', 'browse'];
+		const simpleViews = ['downloads', 'wishlist', 'library'];
 		if (typeof from === 'string' && simpleViews.includes(from)) {
 			switchView('view-' + from);
 			navHistory = null;
@@ -3283,6 +3435,8 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 			cb.checked = oldHistory.consoles.includes(cb.value);
 		});
 		
+		switchView('view-browse');
+
 		if (typeof fetchDatabase === 'function') {
 			fetchDatabase().then(() => {
 				setTimeout(() => {
@@ -4519,7 +4673,11 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 		if (target) target.style.display = 'block';
 	
 		const scrollArea = document.getElementById('scroll-area');
-		if (scrollArea) scrollArea.scrollTop = 0;
+		if (scrollArea) {
+			scrollArea.style.scrollBehavior = 'auto';
+			scrollArea.scrollTop = 0;
+			scrollArea.style.scrollBehavior = 'smooth';
+		}
 	
 		document.querySelectorAll('.sidebar-menu li:not(#nav-trophies-sidebar):not(#nav-chat-global)').forEach(el => el.classList.remove('active'));
 	
@@ -5498,9 +5656,12 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 
 	window.searchGameOnSite = function(titleId) {
 		const nameSpan = document.getElementById('profile-name-val');
-		const profileOpen = document.getElementById('modal-sys-profile')?.style.display === 'flex';
+		const profileModal = document.getElementById('modal-sys-profile');
+		const profileOpen = profileModal?.style.display === 'flex' || profileModal?.classList.contains('show');
 		const onlineOpen = document.getElementById('modal-sys-online')?.style.display === 'flex';
 	
+		const wasOnline = profileModal?.dataset.returnToOnline === "true";
+
 		const activeView = document.querySelector('.view-section[style*="display: block"]')?.id || 'view-explore';
 		let viewKey = activeView.replace('view-', '');
 	
@@ -5512,7 +5673,7 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 		let returnPath = true;
 	
 		if (profileOpen && nameSpan) {
-			returnPath = `profile_${nameSpan.innerText}_${viewKey}`;
+			returnPath = `profile_${nameSpan.innerText}_${viewKey}${wasOnline ? '_fromOnline' : ''}`;
 		} else if (onlineOpen) {
 			returnPath = `online_modal_${viewKey}`;
 		} else {
@@ -8992,6 +9153,9 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 		if (bgView === 'chat') {
 			bgView = document.getElementById('subview-friends')?.style.display === 'flex' ? 'friends' : 'chat';
 		}
+
+		const pModal = document.getElementById('modal-sys-profile');
+		const returnToOnline = (pModal && pModal.dataset.returnToOnline === "true") ? "true" : "false";
 		
 		let html = '';
 		dataArray.forEach(item => {
@@ -9021,7 +9185,7 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 				const itemCover = (typeof getOptimizedCover === 'function' && realId && isNaN(realId)) ? getOptimizedCover(realId) : FALLBACK_IMG;
 				const isSearchable = realId && isNaN(realId) && realId.length > 5;
 				
-				const clickAction = isSearchable ? `onclick="playUiClick(); const pModal = document.getElementById('modal-sys-profile'); if(pModal) pModal.dataset.returnToOnline = 'false'; closeSysModal(null, 'modal-sys-list'); closeSysModal(null, 'modal-sys-profile'); switchView('view-browse'); switchAndSearch('${item.category || 'games'}', '${realId}', 'profilelist|${targetUser}|${listType}|${bgView}')"` : '';
+				const clickAction = isSearchable ? `onclick="playUiClick(); const pModal = document.getElementById('modal-sys-profile'); if(pModal) pModal.dataset.returnToOnline = 'false'; closeSysModal(null, 'modal-sys-list'); closeSysModal(null, 'modal-sys-profile'); switchView('view-browse'); switchAndSearch('${item.category || 'games'}', '${realId}', 'profilelist|${targetUser}|${listType}|${bgView}|${returnToOnline}')"` : '';
 	
 				html += `
 					<div class="download-item social-list-item" ${clickAction}>
