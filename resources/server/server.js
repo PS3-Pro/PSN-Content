@@ -85,10 +85,15 @@ io.on('connection', (socket) => {
 
   socket.on('authenticate_user', async (data) => {
     try {
-        const { name, password, userData } = data;
+        const { name, password, userData, isNewAccount } = data;
         const user = userDatabase[name];
 
         if (user) {
+            if (isNewAccount) {
+                socket.emit('auth_error', 'This Online ID is already taken. Please choose another one.');
+                return;
+            }
+
             if (!user.passwordHash) {
                 socket.emit('auth_error', 'Legacy account detected! Please delete it from the Neon Database or create a new User ID.');
                 return;
