@@ -25,7 +25,7 @@ function loadData(filePath, defaultData) {
             return JSON.parse(data);
         }
     } catch (err) {
-        console.error(`Erro ao carregar ${filePath}:`, err);
+        console.error(`Error loading ${filePath}:`, err);
     }
     return defaultData;
 }
@@ -34,7 +34,7 @@ function saveData(filePath, data) {
     try {
         fs.writeFileSync(filePath, JSON.stringify(data, null, 2), 'utf8');
     } catch (err) {
-        console.error(`Erro ao salvar ${filePath}:`, err);
+        console.error(`Error saving ${filePath}:`, err);
     }
 }
 
@@ -120,6 +120,18 @@ io.on('connection', (socket) => {
     socket.emit('global_search_results', results);
   });
 
+  socket.on('typing_start', () => {
+    const name = socket.userName;
+    if (name && userDatabase[name]) {
+      socket.broadcast.emit('user_typing', { name: name, avatar: userDatabase[name].avatar });
+    }
+  });
+
+  socket.on('typing_stop', () => {
+    const name = socket.userName;
+    if (name) socket.broadcast.emit('user_stopped_typing', { name: name });
+  });
+
   socket.on('chat_message', (msg) => {
     let messageData = {
       ...(typeof msg === 'object' ? msg : { text: msg }),
@@ -143,15 +155,15 @@ io.on('connection', (socket) => {
   });
 
   socket.on('edit_message', (data) => {
-    const msgIndex = messageHistory.findIndex(m => {
-        const mId = m.time ? new Date(m.time).getTime() : null;
-        return String(mId) === String(data.msgId);
-    });
-    if (msgIndex > -1) {
-        const isAdmin = ADMIN_USERS.includes(data.user) && data.secret === ADMIN_SECRET;
-        if (messageHistory[msgIndex].user === data.user || isAdmin) {
-            messageHistory[msgIndex].text = data.newText;
-            messageHistory[msgIndex].edited = true;
+    const msgIndex = messageHistory.findIndex(m => {
+        const mId = m.time ? new Date(m.time).getTime() : null;
+        return String(mId) === String(data.msgId);
+    });
+    if (msgIndex > -1) {
+        const isAdmin = ADMIN_USERS.includes(data.user) && data.secret === ADMIN_SECRET;
+        if (messageHistory[msgIndex].user === data.user || isAdmin) {
+            messageHistory[msgIndex].text = data.newText;
+            messageHistory[msgIndex].edited = true;
             
             if (data.content) {
                 messageHistory[msgIndex].type = 'image';
@@ -160,7 +172,7 @@ io.on('connection', (socket) => {
 
             const wasEditedByAdmin = (isAdmin && messageHistory[msgIndex].user !== data.user);
 
-            saveData(CHAT_DB_FILE, messageHistory);
+            saveData(CHAT_DB_FILE, messageHistory);
             
             io.emit('message_edited', { 
                 msgId: data.msgId, 
@@ -169,9 +181,9 @@ io.on('connection', (socket) => {
                 content: data.content || messageHistory[msgIndex].content,
                 editedByAdmin: wasEditedByAdmin
             });
-        }
-    }
-  });
+        }
+    }
+  });
 
   socket.on('delete_message', (data) => {
     const msgIndex = messageHistory.findIndex(m => {
@@ -255,6 +267,9 @@ io.on('connection', (socket) => {
     if (name && userDatabase[name]) {
       userDatabase[name].online = false;
       userDatabase[name].lastSeen = Date.now();
+      
+      socket.broadcast.emit('user_stopped_typing', { name: name });
+
       saveData(USER_DB_FILE, userDatabase);
       io.emit('online_list', Object.values(userDatabase));
     }
