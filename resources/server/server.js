@@ -84,43 +84,53 @@ io.on('connection', (socket) => {
   socket.emit('chat_history', messageHistory);
 
   socket.on('authenticate_user', async (data) => {
-    const { name, password, userData } = data;
-    const user = userDatabase[name];
+    try {
+        const { name, password, userData } = data;
+        const user = userDatabase[name];
 
-    if (user) {
-        const match = await bcrypt.compare(password, user.passwordHash);
-        if (match) {
-            socket.userName = name;
-            userDatabase[name].online = true;
-            userDatabase[name].id = socket.id;
-            userDatabase[name].lastSeen = Date.now();
+        if (user) {
+            if (!user.passwordHash) {
+                socket.emit('auth_error', 'Legacy account detected! Please delete it from the Neon Database or create a new User ID.');
+                return;
+            }
+
+            const match = await bcrypt.compare(password, user.passwordHash);
+            if (match) {
+                socket.userName = name;
+                userDatabase[name].online = true;
+                userDatabase[name].id = socket.id;
+                userDatabase[name].lastSeen = Date.now();
+                
+                await pool.query('UPDATE users SET data = $1 WHERE name = $2', [userDatabase[name], name]);
+                
+                socket.emit('auth_success', { name, userData: userDatabase[name] });
+                io.emit('online_list', getSanitizedOnlineList());
+            } else {
+                socket.emit('auth_error', 'Incorrect password. Access denied.');
+            }
+        } else {
+            const hash = await bcrypt.hash(password, 10);
             
-            await pool.query('UPDATE users SET data = $1 WHERE name = $2', [userDatabase[name], name]);
+            socket.userName = name;
+            userDatabase[name] = {
+                ...userData,
+                passwordHash: hash,
+                id: socket.id,
+                online: true,
+                lastSeen: Date.now()
+            };
+
+            await pool.query(
+                'INSERT INTO users (name, data) VALUES ($1, $2) ON CONFLICT (name) DO UPDATE SET data = $2',
+                [name, userDatabase[name]]
+            );
             
             socket.emit('auth_success', { name, userData: userDatabase[name] });
             io.emit('online_list', getSanitizedOnlineList());
-        } else {
-            socket.emit('auth_error', 'Incorrect password. Access denied.');
         }
-    } else {
-        const hash = await bcrypt.hash(password, 10);
-        
-        socket.userName = name;
-        userDatabase[name] = {
-            ...userData,
-            passwordHash: hash,
-            id: socket.id,
-            online: true,
-            lastSeen: Date.now()
-        };
-
-        await pool.query(
-            'INSERT INTO users (name, data) VALUES ($1, $2) ON CONFLICT (name) DO UPDATE SET data = $2',
-            [name, userDatabase[name]]
-        );
-        
-        socket.emit('auth_success', { name, userData: userDatabase[name] });
-        io.emit('online_list', getSanitizedOnlineList());
+    } catch (error) {
+        console.error("[AUTH ERROR]:", error);
+        socket.emit('auth_error', 'Server Error: Something went wrong.');
     }
   });
 
