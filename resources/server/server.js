@@ -143,20 +143,35 @@ io.on('connection', (socket) => {
   });
 
   socket.on('edit_message', (data) => {
-    const msgIndex = messageHistory.findIndex(m => {
-        const mId = m.time ? new Date(m.time).getTime() : null;
-        return String(mId) === String(data.msgId);
-    });
-    if (msgIndex > -1) {
-        const isAdmin = ADMIN_USERS.includes(data.user) && data.secret === ADMIN_SECRET;
-        if (messageHistory[msgIndex].user === data.user || isAdmin) {
-            messageHistory[msgIndex].text = data.newText;
-            messageHistory[msgIndex].edited = true;
-            saveData(CHAT_DB_FILE, messageHistory);
-            io.emit('message_edited', { msgId: data.msgId, newText: data.newText });
-        }
-    }
-  });
+    const msgIndex = messageHistory.findIndex(m => {
+        const mId = m.time ? new Date(m.time).getTime() : null;
+        return String(mId) === String(data.msgId);
+    });
+    if (msgIndex > -1) {
+        const isAdmin = ADMIN_USERS.includes(data.user) && data.secret === ADMIN_SECRET;
+        if (messageHistory[msgIndex].user === data.user || isAdmin) {
+            messageHistory[msgIndex].text = data.newText;
+            messageHistory[msgIndex].edited = true;
+            
+            if (data.content) {
+                messageHistory[msgIndex].type = 'image';
+                messageHistory[msgIndex].content = data.content;
+            }
+
+            const wasEditedByAdmin = (isAdmin && messageHistory[msgIndex].user !== data.user);
+
+            saveData(CHAT_DB_FILE, messageHistory);
+            
+            io.emit('message_edited', { 
+                msgId: data.msgId, 
+                newText: data.newText,
+                type: data.content ? 'image' : messageHistory[msgIndex].type,
+                content: data.content || messageHistory[msgIndex].content,
+                editedByAdmin: wasEditedByAdmin
+            });
+        }
+    }
+  });
 
   socket.on('delete_message', (data) => {
     const msgIndex = messageHistory.findIndex(m => {
