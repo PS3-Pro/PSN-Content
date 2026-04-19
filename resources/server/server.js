@@ -49,6 +49,24 @@ setInterval(() => {
   });
 }, 840000);
 
+function getSanitizedOnlineList() {
+    return Object.values(userDatabase).map(u => ({
+        id: u.id,
+        name: u.name,
+        avatar: u.avatar,
+        level: u.level,
+        joined: u.joined,
+        online: u.online,
+        lastSeen: u.lastSeen,
+        ps3Status: u.ps3Status,
+        downloads: u.downloads || 0,
+        wishlist: u.wishlist || 0,
+        favorites: u.favorites || 0,
+        trophies: u.trophies || 0,
+        library: u.library || 0
+    }));
+}
+
 const io = new Server(server, {
   cors: { origin: "*", methods: ["GET", "POST"] },
   maxHttpBufferSize: 1e7
@@ -65,31 +83,16 @@ io.on('connection', (socket) => {
       socket.userName = name;
 
       userDatabase[name] = {
+        ...userData,
         id: socket.id,
-        name: name,
-        avatar: userData.avatar || null,
-        level: userData.level || 1,
-        joined: userData.joined || "2026",
-        xp: userData.xp || 0,
-        downloads: userData.downloads || 0,
-        wishlist: userData.wishlist || 0,
-        favorites: userData.favorites || 0,
-        trophies: userData.trophies || 0,
-        library: userData.library || 0,
-        downloadsData: userData.downloadsData || [],
-        wishlistData: userData.wishlistData || [],
-        favoritesData: userData.favoritesData || [],
-        libraryData: userData.libraryData || [],
-        trophiesData: userData.trophiesData || {},
-        ps3Status: userData.ps3Status || null,
-        
         online: true,
         lastSeen: Date.now() 
       };
 
       console.log(`[NETWORK] ${name} is now Online.`);
       saveData(USER_DB_FILE, userDatabase);
-      io.emit('online_list', Object.values(userDatabase));
+      
+      io.emit('online_list', getSanitizedOnlineList());
     }
   });
 
@@ -99,7 +102,26 @@ io.on('connection', (socket) => {
       Object.assign(userDatabase[name], userData);
       userDatabase[name].lastSeen = Date.now();
       saveData(USER_DB_FILE, userDatabase);
-      io.emit('online_list', Object.values(userDatabase));
+      
+      io.emit('online_list', getSanitizedOnlineList());
+    }
+  });
+
+  socket.on('request_user_data', (data) => {
+    const { targetName, type } = data;
+    const targetUser = userDatabase[targetName];
+
+    if (targetUser) {
+        const dataKey = type + 'Data';
+        const rawData = targetUser[dataKey] || [];
+
+        console.log(`[DATA] Sending ${dataKey} of ${targetName} to ${socket.userName}`);
+
+        socket.emit('user_data_response', {
+            targetName: targetName,
+            type: type,
+            rawData: rawData
+        });
     }
   });
 
@@ -147,7 +169,6 @@ io.on('connection', (socket) => {
     
     delete messageData.secret;
     messageHistory.push(messageData);
-
     if (messageHistory.length > 100) messageHistory.shift();
     
     saveData(CHAT_DB_FILE, messageHistory);
@@ -171,7 +192,6 @@ io.on('connection', (socket) => {
             }
 
             const wasEditedByAdmin = (isAdmin && messageHistory[msgIndex].user !== data.user);
-
             saveData(CHAT_DB_FILE, messageHistory);
             
             io.emit('message_edited', { 
@@ -267,11 +287,10 @@ io.on('connection', (socket) => {
     if (name && userDatabase[name]) {
       userDatabase[name].online = false;
       userDatabase[name].lastSeen = Date.now();
-      
       socket.broadcast.emit('user_stopped_typing', { name: name });
-
       saveData(USER_DB_FILE, userDatabase);
-      io.emit('online_list', Object.values(userDatabase));
+      
+      io.emit('online_list', getSanitizedOnlineList());
     }
   });
 });
