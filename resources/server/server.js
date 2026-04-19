@@ -3,6 +3,7 @@ const http = require('http');
 const https = require('https');
 const { Server } = require("socket.io");
 const { Pool } = require('pg');
+const bcrypt = require('bcrypt');
 
 const app = express();
 const server = http.createServer(app);
@@ -49,7 +50,7 @@ initDb().catch(console.error);
 
 setInterval(() => {
   https.get(APP_URL, (res) => {
-    console.log(`Auto-ping: Status ${res.statusCode} - Engine running!`);
+    console.log(`Auto-ping: Status ${res.statusCode}`);
   }).on('error', (err) => {
     console.error("Auto-ping error:", err.message);
   });
@@ -79,29 +80,47 @@ const io = new Server(server, {
 });
 
 io.on('connection', (socket) => {
-  console.log('User connected: ' + socket.id);
-
+  
   socket.emit('chat_history', messageHistory);
 
-  socket.on('register_user', async (userData) => {
-    if (userData && userData.name) {
-      const name = userData.name;
-      socket.userName = name;
+  socket.on('authenticate_user', async (data) => {
+    const { name, password, userData } = data;
+    const user = userDatabase[name];
 
-      userDatabase[name] = {
-        ...userData,
-        id: socket.id,
-        online: true,
-        lastSeen: Date.now() 
-      };
+    if (user) {
+        const match = await bcrypt.compare(password, user.passwordHash);
+        if (match) {
+            socket.userName = name;
+            userDatabase[name].online = true;
+            userDatabase[name].id = socket.id;
+            userDatabase[name].lastSeen = Date.now();
+            
+            await pool.query('UPDATE users SET data = $1 WHERE name = $2', [userDatabase[name], name]);
+            
+            socket.emit('auth_success', { name, userData: userDatabase[name] });
+            io.emit('online_list', getSanitizedOnlineList());
+        } else {
+            socket.emit('auth_error', 'Incorrect password. Access denied.');
+        }
+    } else {
+        const hash = await bcrypt.hash(password, 10);
+        
+        socket.userName = name;
+        userDatabase[name] = {
+            ...userData,
+            passwordHash: hash,
+            id: socket.id,
+            online: true,
+            lastSeen: Date.now()
+        };
 
-      await pool.query(
-        'INSERT INTO users (name, data) VALUES ($1, $2) ON CONFLICT (name) DO UPDATE SET data = $2',
-        [name, userDatabase[name]]
-      );
-
-      console.log(`[NETWORK] ${name} is now Online.`);
-      io.emit('online_list', getSanitizedOnlineList());
+        await pool.query(
+            'INSERT INTO users (name, data) VALUES ($1, $2) ON CONFLICT (name) DO UPDATE SET data = $2',
+            [name, userDatabase[name]]
+        );
+        
+        socket.emit('auth_success', { name, userData: userDatabase[name] });
+        io.emit('online_list', getSanitizedOnlineList());
     }
   });
 
