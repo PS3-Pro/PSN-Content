@@ -2191,7 +2191,8 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
             window.downloadHistory = JSON.parse(loadState(COOKIE_NAME_HISTORY) || "[]");
             window.favoritesLibrary = JSON.parse(loadState(STORAGE_KEY_FAVS) || "[]");
 			window.friendsList = JSON.parse(loadState(STORAGE_KEY_FRIENDS) || "[]");
-            
+            lastScannedGames = JSON.parse(loadState('psn_local_library') || "[]");
+
             const userImg = loadState('psn_avatar') || AVAILABLE_AVATARS[0];
             const sidebarAvatar = document.querySelector('.user-avatar');
             if (sidebarAvatar) sidebarAvatar.style.backgroundImage = `url('${userImg}')`;
@@ -5608,6 +5609,9 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 				const rawTitle = links[1].textContent.trim();
 				const cleanTitle = rawTitle.replace(/\s+v?\d{1,2}\.\d{1,2}$/i, '').trim();
 				currentStatus = { status: 'playing', titleId: titleId, title: cleanTitle };
+				
+				if (typeof updateLibraryLastPlayed === 'function') {
+					updateLibraryLastPlayed(cleanTitle, titleId);
 			}
 	
 			if (JSON.stringify(currentStatus) !== JSON.stringify(window.myCurrentPS3Status)) {
@@ -5836,7 +5840,10 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 		const grid = document.getElementById('ps3-local-grid');
 		grid.innerHTML = "";
 		
-		if (!isFiltering) lastScannedGames = games || [];
+		if (!isFiltering) {
+			lastScannedGames = games || [];
+			saveState('psn_local_library', JSON.stringify(lastScannedGames));
+		}
 	
 		if (isFiltering && games.length === 0 && lastScannedGames.length > 0) {
 			const activeConsoles = document.querySelectorAll('#library-console-filters input:checked').length;
@@ -5918,6 +5925,29 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 			grid.appendChild(card);
 		});
 	}
+	
+	window.updateLibraryLastPlayed = function(title, titleId) {
+		if (!lastScannedGames || lastScannedGames.length === 0) return;
+		
+		let updated = false;
+		const now = new Date();
+		const datePart = now.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+		const timePart = now.getHours().toString().padStart(2, '0') + ':' + now.getMinutes().toString().padStart(2, '0');
+		const dateTime = `${datePart} - ${timePart}`;
+
+		lastScannedGames.forEach(game => {
+			if (game.title.toLowerCase() === title.toLowerCase() || game.path.includes(titleId)) {
+				game.lastPlayed = dateTime;
+				game.titleId = titleId;
+				updated = true;
+			}
+		});
+
+		if (updated) {
+			saveState('psn_local_library', JSON.stringify(lastScannedGames));
+			if (typeof broadcastProfileUpdate === 'function') broadcastProfileUpdate();
+		}
+	};
 	
 	async function reloadLocalLibrary() {
 		if (typeof playUiClick === "function") playUiClick();
@@ -9467,20 +9497,28 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 						</div>
 					</div>`;
 			} else {
-				const realId = (listType === 'downloads') ? (item.titleId || item.id) : (item.id || item.titleId);
+				const realId = item.titleId || item.id;
 				const itemName = item.cleanName || item.name || item.title || "Unknown Game";
 				const itemCover = (typeof getOptimizedCover === 'function' && realId && isNaN(realId)) ? getOptimizedCover(realId) : FALLBACK_IMG;
-				const isSearchable = realId && isNaN(realId) && realId.length > 5;
+				
+				const isSearchable = realId && isNaN(realId) && realId.length >= 5;
 				
 				const clickAction = isSearchable ? `onclick="playUiClick(); const pModal = document.getElementById('modal-sys-profile'); if(pModal) pModal.dataset.returnToOnline = 'false'; closeSysModal(null, 'modal-sys-list'); closeSysModal(null, 'modal-sys-profile'); switchView('view-browse'); switchAndSearch('${item.category || 'games'}', '${realId}', 'profilelist|${targetUser}|${listType}|${bgView}|${returnToOnline}')"` : '';
 	
+				let dateDisplay = "";
+				if (listType === 'library') {
+					dateDisplay = item.lastPlayed ? `Last played: <span style="color:#fff;">${item.lastPlayed}</span>` : `Last played: Unknown`;
+				} else {
+					dateDisplay = `<i class="far fa-clock"></i> ${item.date || 'Recently'}`;
+				}
+
 				html += `
 					<div class="download-item social-list-item" onmouseenter="if(typeof playUiHover === 'function') playUiHover()" ${clickAction}>
 						<div style="display: flex; align-items: center; gap: 15px;">
 							<img src="${itemCover}" style="width: 40px; height: 46px; border-radius: 4px; object-fit: cover; border: 1px solid rgba(255,255,255,0.1);" onerror="this.src='${FALLBACK_IMG}'">
 							<div class="dl-main-info">
 								<span class="dl-name" style="font-size: 14px; color: #fff; font-weight: 500;">${itemName}</span>
-								<span class="dl-date" style="font-size: 11px; color: var(--text-muted);"><i class="far fa-clock"></i> ${item.date || 'Recently'}</span>
+								<span class="dl-date" style="font-size: 11px; color: var(--text-muted);">${dateDisplay}</span>
 							</div>
 						</div>
 						<div class="dl-side-info" style="text-align: right;">
