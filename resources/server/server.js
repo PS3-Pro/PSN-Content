@@ -1,45 +1,51 @@
 const express = require('express');
 const http = require('http');
 const https = require('https');
-const fs = require('fs'); 
 const { Server } = require("socket.io");
+const { Pool } = require('pg');
 
 const app = express();
 const server = http.createServer(app);
 
-const APP_URL = "https://psn-content.onrender.com/ping"; 
+const APP_URL = "https://psn-content.onrender.com/ping";
 const ADMIN_USERS = ["Luan Teles", "Goku Cheats", "Admin"];
-const ADMIN_SECRET = process.env.ADMIN_SECRET || "ADMINENABLED"; 
+const ADMIN_SECRET = process.env.ADMIN_SECRET || "ADMINENABLED";
 
-const USER_DB_FILE = './userDatabase.json';
-const CHAT_DB_FILE = './chatHistory.json';
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
+});
 
 app.get('/ping', (req, res) => {
   res.send('Server is Awake!');
 });
 
-function loadData(filePath, defaultData) {
-    try {
-        if (fs.existsSync(filePath)) {
-            const data = fs.readFileSync(filePath, 'utf8');
-            return JSON.parse(data);
-        }
-    } catch (err) {
-        console.error(`Error loading ${filePath}:`, err);
-    }
-    return defaultData;
+let userDatabase = {};
+let messageHistory = [];
+
+async function initDb() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS users (
+      name TEXT PRIMARY KEY,
+      data JSONB
+    );
+    CREATE TABLE IF NOT EXISTS chat (
+      id SERIAL PRIMARY KEY,
+      message JSONB
+    );
+  `);
+
+  const usersRes = await pool.query('SELECT * FROM users');
+  usersRes.rows.forEach(row => {
+    userDatabase[row.name] = row.data;
+    userDatabase[row.name].online = false;
+  });
+
+  const chatRes = await pool.query('SELECT message FROM chat ORDER BY id ASC LIMIT 100');
+  messageHistory = chatRes.rows.map(r => r.message);
 }
 
-function saveData(filePath, data) {
-    try {
-        fs.writeFileSync(filePath, JSON.stringify(data, null, 2), 'utf8');
-    } catch (err) {
-        console.error(`Error saving ${filePath}:`, err);
-    }
-}
-
-let userDatabase = loadData(USER_DB_FILE, {}); 
-let messageHistory = loadData(CHAT_DB_FILE, []); 
+initDb().catch(console.error);
 
 setInterval(() => {
   https.get(APP_URL, (res) => {
@@ -77,7 +83,7 @@ io.on('connection', (socket) => {
 
   socket.emit('chat_history', messageHistory);
 
-  socket.on('register_user', (userData) => {
+  socket.on('register_user', async (userData) => {
     if (userData && userData.name) {
       const name = userData.name;
       socket.userName = name;
@@ -89,20 +95,23 @@ io.on('connection', (socket) => {
         lastSeen: Date.now() 
       };
 
+      await pool.query(
+        'INSERT INTO users (name, data) VALUES ($1, $2) ON CONFLICT (name) DO UPDATE SET data = $2',
+        [name, userDatabase[name]]
+      );
+
       console.log(`[NETWORK] ${name} is now Online.`);
-      saveData(USER_DB_FILE, userDatabase);
-      
       io.emit('online_list', getSanitizedOnlineList());
     }
   });
 
-  socket.on('update_profile', (userData) => {
+  socket.on('update_profile', async (userData) => {
     const name = socket.userName;
     if (name && userDatabase[name]) {
       Object.assign(userDatabase[name], userData);
       userDatabase[name].lastSeen = Date.now();
-      saveData(USER_DB_FILE, userDatabase);
       
+      await pool.query('UPDATE users SET data = $1 WHERE name = $2', [userDatabase[name], name]);
       io.emit('online_list', getSanitizedOnlineList());
     }
   });
@@ -114,8 +123,6 @@ io.on('connection', (socket) => {
     if (targetUser) {
         const dataKey = type + 'Data';
         const rawData = targetUser[dataKey] || [];
-
-        console.log(`[DATA] Sending ${dataKey} of ${targetName} to ${socket.userName}`);
 
         socket.emit('user_data_response', {
             targetName: targetName,
@@ -154,7 +161,7 @@ io.on('connection', (socket) => {
     if (name) socket.broadcast.emit('user_stopped_typing', { name: name });
   });
 
-  socket.on('chat_message', (msg) => {
+  socket.on('chat_message', async (msg) => {
     let messageData = {
       ...(typeof msg === 'object' ? msg : { text: msg }),
       time: new Date().toISOString(),
@@ -171,11 +178,11 @@ io.on('connection', (socket) => {
     messageHistory.push(messageData);
     if (messageHistory.length > 100) messageHistory.shift();
     
-    saveData(CHAT_DB_FILE, messageHistory);
+    await pool.query('INSERT INTO chat (message) VALUES ($1)', [messageData]);
     io.emit('chat_message', messageData); 
   });
 
-  socket.on('edit_message', (data) => {
+  socket.on('edit_message', async (data) => {
     const msgIndex = messageHistory.findIndex(m => {
         const mId = m.time ? new Date(m.time).getTime() : null;
         return String(mId) === String(data.msgId);
@@ -192,7 +199,11 @@ io.on('connection', (socket) => {
             }
 
             const wasEditedByAdmin = (isAdmin && messageHistory[msgIndex].user !== data.user);
-            saveData(CHAT_DB_FILE, messageHistory);
+            
+            await pool.query('DELETE FROM chat');
+            for(const m of messageHistory) {
+                await pool.query('INSERT INTO chat (message) VALUES ($1)', [m]);
+            }
             
             io.emit('message_edited', { 
                 msgId: data.msgId, 
@@ -205,7 +216,7 @@ io.on('connection', (socket) => {
     }
   });
 
-  socket.on('delete_message', (data) => {
+  socket.on('delete_message', async (data) => {
     const msgIndex = messageHistory.findIndex(m => {
         const mId = m.time ? new Date(m.time).getTime() : null;
         return String(mId) === String(data.msgId);
@@ -214,17 +225,22 @@ io.on('connection', (socket) => {
         const isAdmin = ADMIN_USERS.includes(data.user) && data.secret === ADMIN_SECRET;
         if (messageHistory[msgIndex].user === data.user || isAdmin) {
             messageHistory.splice(msgIndex, 1);
-            saveData(CHAT_DB_FILE, messageHistory);
+            
+            await pool.query('DELETE FROM chat');
+            for(const m of messageHistory) {
+                await pool.query('INSERT INTO chat (message) VALUES ($1)', [m]);
+            }
+
             io.emit('message_deleted', data.msgId);
         }
     }
   });
 
-  socket.on('clear_chat', (data) => {
+  socket.on('clear_chat', async (data) => {
     const isAdmin = ADMIN_USERS.includes(data.user) && data.secret === ADMIN_SECRET;
     if (isAdmin) {
         messageHistory = [];
-        saveData(CHAT_DB_FILE, messageHistory);
+        await pool.query('TRUNCATE chat');
         io.emit('chat_cleared');
     }
   });
@@ -241,19 +257,24 @@ io.on('connection', (socket) => {
     }
   });
 
-  socket.on('mark_as_read', (data) => {
+  socket.on('mark_as_read', async (data) => {
     const msg = messageHistory.find(m => String(new Date(m.time).getTime()) === String(data.msgId));
     if (msg && msg.user !== data.user) {
         if (!msg.seenBy) msg.seenBy = [];
         if (!msg.seenBy.includes(data.user)) {
             msg.seenBy.push(data.user);
-            saveData(CHAT_DB_FILE, messageHistory); 
+            
+            await pool.query('DELETE FROM chat');
+            for(const m of messageHistory) {
+                await pool.query('INSERT INTO chat (message) VALUES ($1)', [m]);
+            }
+
             io.emit('message_seen', { msgId: data.msgId, seenBy: msg.seenBy });
         }
     }
   });
 
-  socket.on('message_reaction', (data) => {
+  socket.on('message_reaction', async (data) => {
     const msg = messageHistory.find(m => String(new Date(m.time).getTime()) === String(data.msgId));
     if (msg) {
         if (!msg.reactions) msg.reactions = [];
@@ -266,7 +287,12 @@ io.on('connection', (socket) => {
         } else {
             msg.reactions.push({ emoji: data.emoji, count: 1, users: [data.user] });
         }
-        saveData(CHAT_DB_FILE, messageHistory); 
+        
+        await pool.query('DELETE FROM chat');
+        for(const m of messageHistory) {
+            await pool.query('INSERT INTO chat (message) VALUES ($1)', [m]);
+        }
+
         io.emit('message_reaction', data);
     }
   });
@@ -282,14 +308,14 @@ io.on('connection', (socket) => {
     callback({ success: false, message: "Invalid code." });
   });
 
-  socket.on('disconnect', () => {
+  socket.on('disconnect', async () => {
     const name = socket.userName;
     if (name && userDatabase[name]) {
       userDatabase[name].online = false;
       userDatabase[name].lastSeen = Date.now();
       socket.broadcast.emit('user_stopped_typing', { name: name });
-      saveData(USER_DB_FILE, userDatabase);
       
+      await pool.query('UPDATE users SET data = $1 WHERE name = $2', [userDatabase[name], name]);
       io.emit('online_list', getSanitizedOnlineList());
     }
   });
