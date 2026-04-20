@@ -91,16 +91,18 @@ io.on('connection', (socket) => {
   socket.on('authenticate_user', async (data) => {
     try {
         const { name, password, userData, isNewAccount } = data;
-        const user = userDatabase[name];
+        
+        const res = await pool.query('SELECT data FROM users WHERE name = $1', [name]);
+        const user = res.rows.length > 0 ? res.rows[0].data : null;
 
         if (user) {
             if (isNewAccount) {
-                socket.emit('auth_error', 'This Online ID is already taken. Please choose another one.\n\nIf you are trying to login with an existing user, the password is incorrect.');
+                socket.emit('auth_error', 'This Online ID is already taken.');
                 return;
             }
 
             if (!user.passwordHash) {
-                socket.emit('auth_error', 'Legacy account detected! Please delete it or create a new ID.');
+                socket.emit('auth_error', 'Legacy account detected! Please recreate your ID.');
                 return;
             }
 
@@ -108,14 +110,18 @@ io.on('connection', (socket) => {
             
             if (match) {
                 socket.userName = name;
-                userDatabase[name].online = true;
-                userDatabase[name].id = socket.id;
-                userDatabase[name].lastSeen = Date.now();
-                userDatabase[name].name = name;
+                
+                userDatabase[name] = {
+                    ...user,
+                    online: true,
+                    id: socket.id,
+                    lastSeen: Date.now(),
+                    name: name
+                };
                 
                 await pool.query('UPDATE users SET data = $1 WHERE name = $2', [userDatabase[name], name]);
                 
-                console.log(`[NETWORK] ${name} logou.`);
+                console.log(`[NETWORK] ${name} logou com sucesso.`);
                 socket.emit('auth_success', { name, userData: userDatabase[name] });
                 io.emit('online_list', getSanitizedOnlineList());
             } else {
@@ -124,6 +130,7 @@ io.on('connection', (socket) => {
         } else {
             const hash = await bcrypt.hash(password, 10);
             socket.userName = name;
+            
             userDatabase[name] = {
                 ...userData,
                 name: name,
@@ -132,16 +139,11 @@ io.on('connection', (socket) => {
                 online: true,
                 lastSeen: Date.now(),
                 avatar: userData.avatar || DEFAULT_AVATAR,
-                joined: userData.joined || '2026',
-                trophiesData: userData.trophiesData || {},
-                wishlistData: userData.wishlistData || [],
-                favoritesData: userData.favoritesData || [],
-                downloadsData: userData.downloadsData || [],
-                libraryData: userData.libraryData || []
+                joined: userData.joined || '2026'
             };
 
             await pool.query(
-                'INSERT INTO users (name, data) VALUES ($1, $2) ON CONFLICT (name) DO UPDATE SET data = $2',
+                'INSERT INTO users (name, data) VALUES ($1, $2)',
                 [name, userDatabase[name]]
             );
             
