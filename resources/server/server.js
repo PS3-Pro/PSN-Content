@@ -161,16 +161,26 @@ io.on('connection', (socket) => {
     const targetUser = userDatabase[targetName];
 
     if (targetUser) {
-        const dataKey = type + 'Data';
+        const keyMap = {
+            'favs': 'favoritesData',
+            'wishlist': 'wishlistData',
+            'downloads': 'downloadsData',
+            'library': 'libraryData',
+            'trophies': 'trophiesData'
+        };
+
+        const dataKey = keyMap[type] || (type + 'Data');
         const rawData = targetUser[dataKey] || [];
 
+        console.log(`[NETWORK] Enviando ${type} de ${targetName} sob demanda.`);
+        
         socket.emit('user_data_response', {
             targetName: targetName,
             type: type,
             rawData: rawData
         });
     }
-  });
+});
 
   socket.on('search_users', (query) => {
     if (!query || query.length < 2) return;
