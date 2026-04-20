@@ -112,7 +112,7 @@ io.on('connection', (socket) => {
                 io.emit('online_list', getSanitizedOnlineList());
             } else {
                 if (isNewAccount) {
-                    socket.emit('auth_error', 'This Online ID is already taken. Please choose another one.');
+                    socket.emit('auth_error', 'This Online ID is already taken. Please choose another one.\n\nIf you are trying to login with an existing user, the password is incorrect.');
                 } else {
                     socket.emit('auth_error', 'Incorrect password. Access denied.');
                 }
