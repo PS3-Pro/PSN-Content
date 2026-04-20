@@ -61,12 +61,12 @@ function getSanitizedOnlineList() {
     return Object.entries(userDatabase).map(([username, u]) => ({
         id: u.id,
         name: username, 
-        avatar: u.avatar,
-        level: u.level,
-        joined: u.joined,
+        avatar: u.avatar || 'default_avatar.png', 
+        level: u.level || 1,
+        joined: u.joined || '2026',
         online: u.online,
         lastSeen: u.lastSeen,
-        ps3Status: u.ps3Status,
+        ps3Status: u.ps3Status || null,
         downloads: u.downloads || 0,
         wishlist: u.wishlist || 0,
         favorites: u.favorites || 0,
@@ -91,17 +91,13 @@ io.on('connection', (socket) => {
         const user = userDatabase[name];
 
         if (user) {
-            if (isNewAccount) {
-                socket.emit('auth_error', 'This Online ID is already taken. Please choose another one.');
-                return;
-            }
-
-            if (!user.passwordHash) {
-                socket.emit('auth_error', 'Legacy account detected! Please delete it from the Neon Database or create a new User ID.');
+           if (!user.passwordHash) {
+                socket.emit('auth_error', 'Legacy account detected! Please delete it or create a new ID.');
                 return;
             }
 
             const match = await bcrypt.compare(password, user.passwordHash);
+            
             if (match) {
                 socket.userName = name;
                 userDatabase[name].online = true;
@@ -111,11 +107,15 @@ io.on('connection', (socket) => {
                 
                 await pool.query('UPDATE users SET data = $1 WHERE name = $2', [userDatabase[name], name]);
                 
-                console.log(`[NETWORK] ${name} fez login com sucesso!`);
+                console.log(`[NETWORK] ${name} entrou (Redirecionado para Login).`);
                 socket.emit('auth_success', { name, userData: userDatabase[name] });
                 io.emit('online_list', getSanitizedOnlineList());
             } else {
-                socket.emit('auth_error', 'Incorrect password. Access denied.');
+                if (isNewAccount) {
+                    socket.emit('auth_error', 'This Online ID is already taken. Please choose another one.');
+                } else {
+                    socket.emit('auth_error', 'Incorrect password. Access denied.');
+                }
             }
         } else {
             const hash = await bcrypt.hash(password, 10);
@@ -127,7 +127,14 @@ io.on('connection', (socket) => {
                 passwordHash: hash,
                 id: socket.id,
                 online: true,
-                lastSeen: Date.now()
+                lastSeen: Date.now(),
+                avatar: userData.avatar || 'default_avatar.png',
+                joined: userData.joined || '2026',
+                trophiesData: userData.trophiesData || {},
+                wishlistData: userData.wishlistData || [],
+                favoritesData: userData.favoritesData || [],
+                downloadsData: userData.downloadsData || [],
+                libraryData: userData.libraryData || []
             };
 
             await pool.query(
@@ -135,7 +142,7 @@ io.on('connection', (socket) => {
                 [name, userDatabase[name]]
             );
             
-            console.log(`[NETWORK] ${name} criou uma conta nova e entrou!`);
+            console.log(`[NETWORK] ${name} criou uma conta nova.`);
             socket.emit('auth_success', { name, userData: userDatabase[name] });
             io.emit('online_list', getSanitizedOnlineList());
         }
@@ -148,6 +155,10 @@ io.on('connection', (socket) => {
   socket.on('update_profile', async (userData) => {
     const name = socket.userName;
     if (name && userDatabase[name]) {
+      if (userData.avatar === null || userData.avatar === undefined) {
+          delete userData.avatar;
+      }
+
       Object.assign(userDatabase[name], userData);
       userDatabase[name].lastSeen = Date.now();
       
@@ -172,15 +183,13 @@ io.on('connection', (socket) => {
         const dataKey = keyMap[type] || (type + 'Data');
         const rawData = targetUser[dataKey] || [];
 
-        console.log(`[NETWORK] Enviando ${type} de ${targetName} sob demanda.`);
-        
         socket.emit('user_data_response', {
             targetName: targetName,
             type: type,
             rawData: rawData
         });
     }
-});
+  });
 
   socket.on('search_users', (query) => {
     if (!query || query.length < 2) return;
@@ -233,62 +242,45 @@ io.on('connection', (socket) => {
   });
 
   socket.on('edit_message', async (data) => {
-    const msgIndex = messageHistory.findIndex(m => {
-        const mId = m.time ? new Date(m.time).getTime() : null;
-        return String(mId) === String(data.msgId);
-    });
+    const msgIndex = messageHistory.findIndex(m => String(new Date(m.time).getTime()) === String(data.msgId));
     if (msgIndex > -1) {
         const isAdmin = ADMIN_USERS.includes(data.user) && data.secret === ADMIN_SECRET;
         if (messageHistory[msgIndex].user === data.user || isAdmin) {
             messageHistory[msgIndex].text = data.newText;
             messageHistory[msgIndex].edited = true;
-            
             if (data.content) {
                 messageHistory[msgIndex].type = 'image';
                 messageHistory[msgIndex].content = data.content;
             }
-
-            const wasEditedByAdmin = (isAdmin && messageHistory[msgIndex].user !== data.user);
             
             await pool.query('DELETE FROM chat');
-            for(const m of messageHistory) {
-                await pool.query('INSERT INTO chat (message) VALUES ($1)', [m]);
-            }
+            for(const m of messageHistory) { await pool.query('INSERT INTO chat (message) VALUES ($1)', [m]); }
             
             io.emit('message_edited', { 
                 msgId: data.msgId, 
                 newText: data.newText,
                 type: data.content ? 'image' : messageHistory[msgIndex].type,
-                content: data.content || messageHistory[msgIndex].content,
-                editedByAdmin: wasEditedByAdmin
+                content: data.content || messageHistory[msgIndex].content
             });
         }
     }
   });
 
   socket.on('delete_message', async (data) => {
-    const msgIndex = messageHistory.findIndex(m => {
-        const mId = m.time ? new Date(m.time).getTime() : null;
-        return String(mId) === String(data.msgId);
-    });
+    const msgIndex = messageHistory.findIndex(m => String(new Date(m.time).getTime()) === String(data.msgId));
     if (msgIndex > -1) {
         const isAdmin = ADMIN_USERS.includes(data.user) && data.secret === ADMIN_SECRET;
         if (messageHistory[msgIndex].user === data.user || isAdmin) {
             messageHistory.splice(msgIndex, 1);
-            
             await pool.query('DELETE FROM chat');
-            for(const m of messageHistory) {
-                await pool.query('INSERT INTO chat (message) VALUES ($1)', [m]);
-            }
-
+            for(const m of messageHistory) { await pool.query('INSERT INTO chat (message) VALUES ($1)', [m]); }
             io.emit('message_deleted', data.msgId);
         }
     }
   });
 
   socket.on('clear_chat', async (data) => {
-    const isAdmin = ADMIN_USERS.includes(data.user) && data.secret === ADMIN_SECRET;
-    if (isAdmin) {
+    if (ADMIN_USERS.includes(data.user) && data.secret === ADMIN_SECRET) {
         messageHistory = [];
         await pool.query('TRUNCATE chat');
         io.emit('chat_cleared');
@@ -296,8 +288,7 @@ io.on('connection', (socket) => {
   });
 
   socket.on('kick_user', (data) => {
-    const isAdmin = ADMIN_USERS.includes(data.adminUser) && data.secret === ADMIN_SECRET;
-    if (isAdmin && data.targetId) {
+    if (ADMIN_USERS.includes(data.adminUser) && data.secret === ADMIN_SECRET) {
         const targetSocket = io.sockets.sockets.get(data.targetId);
         if (targetSocket) {
             targetSocket.emit('user_kicked');
@@ -305,57 +296,6 @@ io.on('connection', (socket) => {
             setTimeout(() => { targetSocket.disconnect(true); }, 500);
         }
     }
-  });
-
-  socket.on('mark_as_read', async (data) => {
-    const msg = messageHistory.find(m => String(new Date(m.time).getTime()) === String(data.msgId));
-    if (msg && msg.user !== data.user) {
-        if (!msg.seenBy) msg.seenBy = [];
-        if (!msg.seenBy.includes(data.user)) {
-            msg.seenBy.push(data.user);
-            
-            await pool.query('DELETE FROM chat');
-            for(const m of messageHistory) {
-                await pool.query('INSERT INTO chat (message) VALUES ($1)', [m]);
-            }
-
-            io.emit('message_seen', { msgId: data.msgId, seenBy: msg.seenBy });
-        }
-    }
-  });
-
-  socket.on('message_reaction', async (data) => {
-    const msg = messageHistory.find(m => String(new Date(m.time).getTime()) === String(data.msgId));
-    if (msg) {
-        if (!msg.reactions) msg.reactions = [];
-        let react = msg.reactions.find(r => r.emoji === data.emoji);
-        if (react) {
-            const idx = react.users.indexOf(data.user);
-            if (idx > -1) { react.users.splice(idx, 1); react.count--; }
-            else { react.users.push(data.user); react.count++; }
-            if (react.count <= 0) msg.reactions = msg.reactions.filter(r => r.emoji !== data.emoji);
-        } else {
-            msg.reactions.push({ emoji: data.emoji, count: 1, users: [data.user] });
-        }
-        
-        await pool.query('DELETE FROM chat');
-        for(const m of messageHistory) {
-            await pool.query('INSERT INTO chat (message) VALUES ($1)', [m]);
-        }
-
-        io.emit('message_reaction', data);
-    }
-  });
-
-  socket.on('admin_redeem', (data, callback) => {
-    const { code, user } = data;
-    const cleanCode = code.replace(/-/g, "").toUpperCase();
-    if (cleanCode === "PLATINUMCODE") return callback({ success: true, type: 'PLATINUM_UNLOCK' });
-    if (cleanCode === "UNLOCKALLDB1") return callback({ success: true, type: 'SINGLE_TROPHY' });
-    if (cleanCode === ADMIN_SECRET && ADMIN_USERS.includes(user)) {
-        return callback({ success: true, type: 'ADMIN_LOGIN', secret: ADMIN_SECRET });
-    }
-    callback({ success: false, message: "Invalid code." });
   });
 
   socket.on('disconnect', async () => {
@@ -373,5 +313,5 @@ io.on('connection', (socket) => {
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-  console.log(`Chat server running on port ${PORT}`);
+  console.log(`Neon Server running on port ${PORT}`);
 });

@@ -7045,7 +7045,6 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 	========================================================================== */
 	
 	if (!window.userTrophies) window.userTrophies = {};
-	window.isTrophySystemReady = false;
 
 	const TROPHY_DATA = {
 		connect_ps3: { id: 'connect_ps3', title: 'Connection Established', desc: 'Successfully connect the site to your PS3™.', type: 'bronze', max: 1 },
@@ -7141,7 +7140,7 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 		
 		if (window.userTrophies[trophyId].progress >= trophy.max) {
 			window.userTrophies[trophyId].unlocked = true;
-			window.userTrophies[trophyId].isNew = true; // Ativa o brilho de "Novo"
+			window.userTrophies[trophyId].isNew = true; 
 			
 			const now = new Date();
 			const datePart = now.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
@@ -7153,30 +7152,26 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 				window.broadcastProfileUpdate();
 			}
 	
-			if (window.isTrophySystemReady) {
-				setTimeout(() => {
-					if (typeof showTrophyPopup === 'function') showTrophyPopup(trophy);
-					
-					renderTrophiesView(); 
-					
-					saveState('psn_last_trophy_color', TROPHY_COLORS[trophy.type]);
-					
-					const isTrophyView = document.getElementById('view-trophies')?.style.display === 'block';
-					if (!isTrophyView) {
-						const dot = document.getElementById('trophy-dot');
-						if (dot) {
-							dot.style.display = 'block';
-							dot.style.background = TROPHY_COLORS[trophy.type];
-						}
-						saveState('psn_trophy_dot', 'true');
+			setTimeout(() => {
+				if (typeof showTrophyPopup === 'function') showTrophyPopup(trophy);
+				
+				renderTrophiesView(); 
+				
+				saveState('psn_last_trophy_color', TROPHY_COLORS[trophy.type]);
+				
+				const isTrophyView = document.getElementById('view-trophies')?.style.display === 'block';
+				if (!isTrophyView) {
+					const dot = document.getElementById('trophy-dot');
+					if (dot) {
+						dot.style.display = 'block';
+						dot.style.background = TROPHY_COLORS[trophy.type];
 					}
-					
-					if (typeof checkPlatinum === 'function') checkPlatinum();
-				}, 2000); 
-			} else {
-				renderTrophiesView();
+					saveState('psn_trophy_dot', 'true');
+				}
+				
 				if (typeof checkPlatinum === 'function') checkPlatinum();
-			}
+			}, 2000); 
+			
 		} else {
 			saveState('psn_user_trophies', JSON.stringify(window.userTrophies));
 		}
@@ -8305,8 +8300,6 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 		socketChat.on('auth_success', (data) => {
 			const { name, userData } = data;
 			
-			window.isTrophySystemReady = false;
-		
 			localStorage.setItem('psn_username', name);
 			saveUserToGlobalList(name); 
 			
@@ -8314,30 +8307,33 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 			if (userData.joined) localStorage.setItem(`${name}_joined_date`, userData.joined);
 			
 			if (userData.trophiesData) {
+				window.userTrophies = userData.trophiesData;
 				localStorage.setItem(`${name}_psn_user_trophies`, JSON.stringify(userData.trophiesData));
-				window.userTrophies = userData.trophiesData; 
 			}
 			if (userData.wishlistData) {
-				localStorage.setItem(`${name}_psn_wishlist_db`, JSON.stringify(userData.wishlistData));
 				window.wishlist = userData.wishlistData;
+				localStorage.setItem(`${name}_psn_wishlist_db`, JSON.stringify(userData.wishlistData));
 			}
 			if (userData.downloadsData) {
-				localStorage.setItem(`${name}_psn_dl_history`, JSON.stringify(userData.downloadsData));
 				window.downloadHistory = userData.downloadsData;
+				localStorage.setItem(`${name}_psn_dl_history`, JSON.stringify(userData.downloadsData));
 			}
 			if (userData.favoritesData) {
-				localStorage.setItem(`${name}_ps3_library_favs`, JSON.stringify(userData.favoritesData));
 				window.favoritesLibrary = userData.favoritesData;
+				localStorage.setItem(`${name}_ps3_library_favs`, JSON.stringify(userData.favoritesData));
 			}
 			if (userData.libraryData) {
-				localStorage.setItem(`${name}_psn_local_library`, JSON.stringify(userData.libraryData));
 				if (typeof lastScannedGames !== 'undefined') lastScannedGames = userData.libraryData;
+				localStorage.setItem(`${name}_psn_local_library`, JSON.stringify(userData.libraryData));
 			}
 		
-			setTimeout(() => {
-				window.isTrophySystemReady = true;
-				console.log("[System] Trophy system active. Popups unmuted.");
-			}, 2500);
+			if (typeof window.broadcastProfileUpdate === 'function') {
+				window.broadcastProfileUpdate();
+			}
+		
+			if (typeof checkDailyTrophies === 'function') {
+				checkDailyTrophies();
+			}
 		
 			const bootContainer = document.getElementById('ps5-boot-container');
 			if (bootContainer && bootContainer.style.display !== 'none') {
@@ -8777,6 +8773,7 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 	window.broadcastProfileUpdate = function() {
 		if (!socketChat || !socketChat.connected) return;
 	
+		const myName = localStorage.getItem('psn_username'); // Nome do usuário logado
 		let totalXp = 0;
 		let totalTrophies = 0;
 		const xpMap = { bronze: 15, silver: 30, gold: 90, platinum: 300 };
@@ -8791,7 +8788,13 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 		}
 		const myLevel = Math.floor(totalXp / 100) + 1;
 	
+		const myAvatar = localStorage.getItem(`${myName}_psn_avatar`) || (typeof AVAILABLE_AVATARS !== 'undefined' ? AVAILABLE_AVATARS[0] : 'default.png');
+		const myJoined = localStorage.getItem(`${myName}_joined_date`) || "2026";
+	
+		// Envia o pacote completo para o servidor atualizar a memória e o banco
 		socketChat.emit('update_profile', {
+			avatar: myAvatar,
+			joined: myJoined,
 			level: myLevel,
 			xp: totalXp,
 			downloads: window.downloadHistory ? window.downloadHistory.length : 0,
@@ -8800,8 +8803,9 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 			trophies: totalTrophies,
 			library: typeof lastScannedGames !== 'undefined' ? lastScannedGames.length : 0,
 			
-			ps3Status: _lastConnectionState ? (window.myCurrentPS3Status || { status: 'idle' }) : null,
+			ps3Status: (typeof _lastConnectionState !== 'undefined' && _lastConnectionState) ? (window.myCurrentPS3Status || { status: 'idle' }) : null,
 	
+			// Manda os dados crus para o servidor salvar no JSONB do PostgreSQL
 			trophiesData: window.userTrophies || {},
 			downloadsData: window.downloadHistory || [],
 			wishlistData: window.wishlist || [],
