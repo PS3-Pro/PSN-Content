@@ -5144,24 +5144,41 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 				if (typeof updateWishlistUI === 'function') updateWishlistUI();
 			} 
 			else if (viewId === 'view-trophies') {
-				const dot = document.getElementById('trophy-dot');
-				if (dot) dot.style.display = 'none';
-				saveState('psn_trophy_dot', 'false');
-				if (typeof renderTrophiesView === 'function') renderTrophiesView();
-	
-				setTimeout(() => {
-					const newTrophy = document.querySelector('#trophy-grid-container .is-new');
-					if (newTrophy) newTrophy.scrollIntoView({ behavior: 'smooth', block: 'center' });
-				}, 300);
+				 document.getElementById('nav-trophies')?.classList.add('active');
+                
+                const dot = document.getElementById('trophy-dot');
+                if (dot) dot.style.display = 'none';
+                saveState('psn_trophy_dot', 'false');
+    
+                renderTrophiesView();
+    
+                setTimeout(() => {
+                    const newTrophy = document.querySelector('#trophy-grid-container .is-new');
+                    if (newTrophy) {
+                        newTrophy.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                    }
+                }, 300);
 	
 				window.trophyAnimationTimer = setTimeout(() => {
 					let changed = false;
 					Object.keys(userTrophies).forEach(key => {
-						if (userTrophies[key]?.isNew) { userTrophies[key].isNew = false; changed = true; }
+						if (userTrophies[key]?.isNew) { 
+							userTrophies[key].isNew = false; 
+							changed = true; 
+						}
 					});
-					if (changed) { saveState('psn_user_trophies', JSON.stringify(userTrophies)); renderTrophiesView(); }
+					
+					if (changed) { 
+						saveState('psn_user_trophies', JSON.stringify(userTrophies)); 
+						
+						if (typeof broadcastProfileUpdate === 'function') {
+							broadcastProfileUpdate(); 
+						}
+						
+						renderTrophiesView(); 
+					}
 				}, 3000);
-			} 
+			}
 			else if (viewId === 'view-downloads') {
 				const dot = document.getElementById('dl-dot');
 				if (dot) dot.style.display = 'none';
@@ -7115,7 +7132,7 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 		if (!trophy) return;
 		
 		if (!window.userTrophies[trophyId]) {
-			window.userTrophies[trophyId] = { unlocked: false, progress: 0 };
+			window.userTrophies[trophyId] = { unlocked: false, progress: 0, isNew: false };
 		}
 		
 		if (window.userTrophies[trophyId].unlocked) return;
@@ -7124,21 +7141,24 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 		
 		if (window.userTrophies[trophyId].progress >= trophy.max) {
 			window.userTrophies[trophyId].unlocked = true;
-			window.userTrophies[trophyId].isNew = true;
+			window.userTrophies[trophyId].isNew = true; // Ativa o brilho de "Novo"
 			
 			const now = new Date();
 			const datePart = now.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
 			const timePart = now.getHours().toString().padStart(2, '0') + ':' + now.getMinutes().toString().padStart(2, '0');
-			
 			window.userTrophies[trophyId].unlockDate = `${datePart} - ${timePart}`;
 	
 			saveState('psn_user_trophies', JSON.stringify(window.userTrophies));
-			window.broadcastProfileUpdate();
+			if (typeof window.broadcastProfileUpdate === 'function') {
+				window.broadcastProfileUpdate();
+			}
 	
 			if (window.isTrophySystemReady) {
 				setTimeout(() => {
-					showTrophyPopup(trophy);
+					if (typeof showTrophyPopup === 'function') showTrophyPopup(trophy);
+					
 					renderTrophiesView(); 
+					
 					saveState('psn_last_trophy_color', TROPHY_COLORS[trophy.type]);
 					
 					const isTrophyView = document.getElementById('view-trophies')?.style.display === 'block';
@@ -7150,11 +7170,12 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 						}
 						saveState('psn_trophy_dot', 'true');
 					}
-					checkPlatinum();
+					
+					if (typeof checkPlatinum === 'function') checkPlatinum();
 				}, 2000); 
 			} else {
 				renderTrophiesView();
-				checkPlatinum();
+				if (typeof checkPlatinum === 'function') checkPlatinum();
 			}
 		} else {
 			saveState('psn_user_trophies', JSON.stringify(window.userTrophies));
@@ -7209,108 +7230,109 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 	};
 	
 	function renderTrophiesView() {
-			const grid = document.getElementById('trophy-grid-container');
-			if (!grid) return;
+		const grid = document.getElementById('trophy-grid-container');
+		if (!grid) return;
+		
+		if (!window.userTrophies) window.userTrophies = {};
+		
+		const allIds = Object.keys(TROPHY_DATA);
+		let counts = { bronze: 0, silver: 0, gold: 0, platinum: 0 };
+		let totalUnlocked = 0;
+		
+		const sortedIds = allIds.sort((a, b) => {
+			return (TROPHY_WEIGHT[TROPHY_DATA[a].type] || 0) - (TROPHY_WEIGHT[TROPHY_DATA[b].type] || 0);
+		});
+		
+		let html = '';
+		
+		sortedIds.forEach(id => {
+			const t = TROPHY_DATA[id];
+			const state = window.userTrophies[id] || { unlocked: false, progress: 0, isNew: false };
 			
-			const allIds = Object.keys(TROPHY_DATA);
-			let counts = { bronze: 0, silver: 0, gold: 0, platinum: 0 };
-			let totalUnlocked = 0;
+			if (state.unlocked) {
+				counts[t.type]++;
+				totalUnlocked++;
+			}
 			
-			const sortedIds = allIds.sort((a, b) => {
-				return TROPHY_WEIGHT[TROPHY_DATA[a].type] - TROPHY_WEIGHT[TROPHY_DATA[b].type];
-			});
+			const isLocked = !state.unlocked;
+			const lockClass = isLocked ? 'locked' : '';
 			
-			let html = '';
+			const newClass = (state.unlocked && state.isNew) ? 'is-new' : ''; 
 			
-			sortedIds.forEach(id => {
-				const t = TROPHY_DATA[id];
-				const state = window.userTrophies[id] || { unlocked: false, progress: 0 };
+			const progressPct = Math.min((state.progress / t.max) * 100, 100);
+			
+			const iconColor = isLocked ? 'rgba(255,255,255,0.2)' : (TROPHY_COLORS[t.type] || '#fff'); 
+			const iconClass = isLocked ? 'fas fa-lock' : (t.type === 'platinum' ? 'fas fa-award' : 'fas fa-trophy');
+			
+			const unlockDateText = state.unlockDate ? state.unlockDate : "";
+			
+			let rightSideHtml = `<div class="trophy-date" style="text-align: right; min-width: 120px; display: flex; flex-direction: column; align-items: flex-end; justify-content: center;">`;
+			
+			if (!isLocked) {
+				rightSideHtml += `<span style="font-size: 11px; color: #888; letter-spacing: 0.5px;"><i class="far fa-clock"></i> ${unlockDateText}</span>`;
+			}
+			
+			if (t.type === 'platinum') {
+				const rewardColor = isLocked ? 'rgba(255,255,255,0.3)' : '#00f0ff';
+				const rewardText = isLocked ? 'LOCKED' : 'UNLOCKED';
+				const topMargin = !isLocked ? '5px' : '0px'; 
 				
-				if (state.unlocked) {
-					counts[t.type]++;
-					totalUnlocked++;
-				}
-				
-				const isLocked = !state.unlocked;
-				const lockClass = isLocked ? 'locked' : '';
-				const newClass = (state.unlocked && state.isNew) ? 'is-new' : ''; 
-				
-				const progressPct = Math.min((state.progress / t.max) * 100, 100);
-				
-				const iconColor = isLocked ? 'rgba(255,255,255,0.2)' : TROPHY_COLORS[t.type]; 
-				const iconClass = isLocked ? 'fas fa-lock' : (t.type === 'platinum' ? 'fas fa-award' : 'fas fa-trophy');
-				
-				const unlockDateText = state.unlockDate ? state.unlockDate : "";
-				
-				let rightSideHtml = `<div class="trophy-date" style="text-align: right; min-width: 120px; display: flex; flex-direction: column; align-items: flex-end; justify-content: center;">`;
-		        
-		        if (!isLocked) {
-					rightSideHtml += `<span style="font-size: 12px; color: #888;"><i class="far fa-clock"></i> ${unlockDateText}</span>`;
-		        }
-		        
-		        if (t.type === 'platinum') {
-		            const rewardColor = isLocked ? '#ff4444' : '#4caf50';
-		            const rewardText = isLocked ? 'LOCKED' : 'UNLOCKED';
-		            const topMargin = !isLocked ? '5px' : '0px'; 
-		            
-					rightSideHtml += `<span style="color: #ccc; font-size: 11px; font-weight: bold; margin-top: ${topMargin}; text-transform: uppercase; letter-spacing: 0.5px;">SPECIAL REWARD: <span style="color: ${rewardColor};">${rewardText}</span></span>`;
-		        }
-		        
-		        rightSideHtml += `</div>`;
-		        
-				html += `
-					<div class="trophy-card ${lockClass} ${newClass}" 
-						style="display: flex; justify-content: space-between; align-items: center; width: 100%; padding: 15px; background: rgba(255,255,255,0.05); border-radius: 8px; cursor: default; transition: transform 0.2s ease, background 0.2s ease;" 
-						onmouseenter="playUiHover(); this.style.background='rgba(255,255,255,0.1)'; this.style.transform='scale(1.01)';" 
-						onmouseleave="this.style.background='rgba(255,255,255,0.05)'; this.style.transform='scale(1)';">
-						
-						<div style="display: flex; align-items: center; flex: 1;">
-							<div class="trophy-card-icon" style="min-width: 60px; text-align: center;">
-								<i class="${iconClass}" style="color: ${iconColor}; font-size: 24px;"></i>
-							</div>
-							<div class="trophy-card-info" style="margin-left: 15px; flex: 1;">
-								<h3 style="margin: 0; font-size: 16px;">${t.title}</h3>
-								<p style="margin: 5px 0 0 0; color: #aaa; font-size: 12px;">${t.desc}</p>
-								${isLocked ? `
-								<div class="trophy-progress-bar" style="margin-top: 8px; width: 100%; height: 4px; background: rgba(255,255,255,0.1); border-radius: 2px;">
-									<div class="trophy-progress-fill" style="width: ${progressPct}%; height: 100%; background: ${TROPHY_COLORS[t.type]}; border-radius: 2px; opacity: 0.5;"></div>
-								</div>
-								` : ''}
-							</div>
+				rightSideHtml += `<span style="color: rgba(255,255,255,0.5); font-size: 10px; font-weight: bold; margin-top: ${topMargin}; text-transform: uppercase; letter-spacing: 1px;">DATABASE STATUS: <span style="color: ${rewardColor};">${rewardText}</span></span>`;
+			}
+			
+			rightSideHtml += `</div>`;
+			
+			html += `
+				<div class="trophy-card ${lockClass} ${newClass}" 
+					style="display: flex; justify-content: space-between; align-items: center; width: 100%; padding: 15px; background: rgba(255,255,255,0.05); border-radius: 8px; cursor: default; transition: transform 0.2s ease, background 0.2s ease;" 
+					onmouseenter="playUiHover(); this.style.background='rgba(255,255,255,0.1)'; this.style.transform='scale(1.01)';" 
+					onmouseleave="this.style.background='rgba(255,255,255,0.05)'; this.style.transform='scale(1)';">
+					
+					<div style="display: flex; align-items: center; flex: 1;">
+						<div class="trophy-card-icon" style="min-width: 60px; text-align: center;">
+							<i class="${iconClass}" style="color: ${iconColor}; font-size: 24px; filter: ${!isLocked ? 'drop-shadow(0 0 8px '+iconColor+'44)' : 'none'};"></i>
 						</div>
-						${rightSideHtml}
+						<div class="trophy-card-info" style="margin-left: 15px; flex: 1;">
+							<h3 style="margin: 0; font-size: 15px; letter-spacing: 0.5px;">${t.title}</h3>
+							<p style="margin: 4px 0 0 0; color: #888; font-size: 12px; line-height: 1.3;">${t.desc}</p>
+							${(isLocked && state.progress > 0) ? `
+							<div class="trophy-progress-bar" style="margin-top: 10px; width: 100%; height: 4px; background: rgba(255,255,255,0.08); border-radius: 20px; overflow: hidden;">
+								<div class="trophy-progress-fill" style="width: ${progressPct}%; height: 100%; background: ${TROPHY_COLORS[t.type]}; border-radius: 20px; opacity: 0.6; box-shadow: 0 0 10px ${TROPHY_COLORS[t.type]}44;"></div>
+							</div>
+							` : ''}
+						</div>
 					</div>
-				`;
-			});
-		
+					${rightSideHtml}
+				</div>
+			`;
+		});
+	
 		grid.innerHTML = html;
+	
 		const totalTrophies = allIds.length;
-		const progressPct = Math.floor((totalUnlocked / totalTrophies) * 100);
+		const progressPct = totalTrophies > 0 ? Math.floor((totalUnlocked / totalTrophies) * 100) : 0;
 	
-		const elProgressPct = document.getElementById('trophy-progress-pct');
+		const updateEl = (id, val) => { const el = document.getElementById(id); if (el) el.innerText = val; };
+		
+		updateEl('trophy-progress-pct', progressPct + '%');
+		updateEl('trophy-earned-count', totalUnlocked + '/' + totalTrophies);
+		updateEl('count-gold', counts.gold);
+		updateEl('count-silver', counts.silver);
+		updateEl('count-bronze', counts.bronze);
+	
 		const elProgressFill = document.getElementById('trophy-progress-fill');
-		const elEarned = document.getElementById('trophy-earned-count');
-		
-		if (elProgressPct) elProgressPct.innerText = progressPct + '%';
 		if (elProgressFill) elProgressFill.style.width = progressPct + '%';
-		if (elEarned) elEarned.innerText = totalUnlocked + '/' + totalTrophies;
-	
-		const elGold = document.getElementById('count-gold');
-		const elSilv = document.getElementById('count-silver');
-		const elBron = document.getElementById('count-bronze');
-		
-		if (elGold) elGold.innerText = counts.gold;
-		if (elSilv) elSilv.innerText = counts.silver;
-		if (elBron) elBron.innerText = counts.bronze;
 	
 		const mainIcon = document.querySelector('.summary-plat-icon i');
 		if (mainIcon) {
 			if (window.userTrophies['platinum']?.unlocked) {
 				mainIcon.style.color = '#00f0ff';
 				mainIcon.style.filter = 'drop-shadow(0 0 15px rgba(0, 240, 255, 0.8))';
+				mainIcon.className = 'fas fa-award';
 			} else {
-				mainIcon.style.color = '#e5e4e2';
+				mainIcon.style.color = 'rgba(255,255,255,0.1)';
 				mainIcon.style.filter = 'none';
+				mainIcon.className = 'fas fa-lock';
 			}
 		}
 	}
@@ -8283,6 +8305,8 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 		socketChat.on('auth_success', (data) => {
 			const { name, userData } = data;
 			
+			window.isTrophySystemReady = false;
+		
 			localStorage.setItem('psn_username', name);
 			saveUserToGlobalList(name); 
 			
@@ -8291,8 +8315,7 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 			
 			if (userData.trophiesData) {
 				localStorage.setItem(`${name}_psn_user_trophies`, JSON.stringify(userData.trophiesData));
-				// SINCRONIZAÇÃO DA VARIÁVEL GLOBAL IMEDIATAMENTE
-				window.userTrophies = userData.trophiesData;
+				window.userTrophies = userData.trophiesData; 
 			}
 			if (userData.wishlistData) {
 				localStorage.setItem(`${name}_psn_wishlist_db`, JSON.stringify(userData.wishlistData));
@@ -8313,8 +8336,8 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 		
 			setTimeout(() => {
 				window.isTrophySystemReady = true;
-				console.log("[System] Trophy system ready and silenced during boot.");
-			}, 2000);
+				console.log("[System] Trophy system active. Popups unmuted.");
+			}, 2500);
 		
 			const bootContainer = document.getElementById('ps5-boot-container');
 			if (bootContainer && bootContainer.style.display !== 'none') {
