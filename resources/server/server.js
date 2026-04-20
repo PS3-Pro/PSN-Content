@@ -313,7 +313,12 @@ io.on('connection', (socket) => {
         if (targetSocket) {
             targetSocket.emit('user_kicked');
             socket.emit('kick_success', { targetId: data.targetId });
-            setTimeout(() => { targetSocket.disconnect(true); }, 500);
+            
+            setTimeout(() => { 
+                if (targetSocket.connected) {
+                    targetSocket.disconnect(true);
+                }
+            }, 2500);
         }
     }
   });
