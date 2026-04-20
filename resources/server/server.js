@@ -39,6 +39,7 @@ async function initDb() {
   const usersRes = await pool.query('SELECT * FROM users');
   usersRes.rows.forEach(row => {
     userDatabase[row.name] = row.data;
+    userDatabase[row.name].name = row.name; 
     userDatabase[row.name].online = false;
   });
 
@@ -57,9 +58,9 @@ setInterval(() => {
 }, 840000);
 
 function getSanitizedOnlineList() {
-    return Object.values(userDatabase).map(u => ({
+    return Object.entries(userDatabase).map(([username, u]) => ({
         id: u.id,
-        name: u.name,
+        name: username, 
         avatar: u.avatar,
         level: u.level,
         joined: u.joined,
@@ -106,6 +107,7 @@ io.on('connection', (socket) => {
                 userDatabase[name].online = true;
                 userDatabase[name].id = socket.id;
                 userDatabase[name].lastSeen = Date.now();
+                userDatabase[name].name = name;
                 
                 await pool.query('UPDATE users SET data = $1 WHERE name = $2', [userDatabase[name], name]);
                 
@@ -121,6 +123,7 @@ io.on('connection', (socket) => {
             socket.userName = name;
             userDatabase[name] = {
                 ...userData,
+                name: name,
                 passwordHash: hash,
                 id: socket.id,
                 online: true,
@@ -172,10 +175,10 @@ io.on('connection', (socket) => {
   socket.on('search_users', (query) => {
     if (!query || query.length < 2) return;
     const searchTerm = query.toLowerCase();
-    const results = Object.values(userDatabase)
-      .filter(u => u.name.toLowerCase().includes(searchTerm))
-      .map(u => ({
-        name: u.name,
+    const results = Object.entries(userDatabase)
+      .filter(([username, u]) => username.toLowerCase().includes(searchTerm))
+      .map(([username, u]) => ({
+        name: username,
         avatar: u.avatar,
         online: u.online,
         lastSeen: u.lastSeen,
