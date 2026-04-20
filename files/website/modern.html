@@ -1167,7 +1167,7 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 						<span id="trophy-dot" class="notification-dot" style="display: none; background: #4caf50;"></span>
 					</button>
 				</div>
-				<div style="display: flex; align-items: center; gap: 6px;  background: rgba(255,255,255,0.05); color: #fff; font-weight: bold; font-size: 10px; margin-top: 15px; margin-bottom: -30px; padding: 4px 8px; border-radius: 10px;">
+				<div style="display: flex; align-items: center; gap: 6px;  background: rgba(255,255,255,0.05); color: #fff; font-weight: bold; font-size: 9px; margin-top: 15px; margin-bottom: -30px; padding: 4px 8px; border-radius: 10px;">
 					<i class="far fa-clock" style="font-size: 8px; margin-top: 2px;"></i>
 					<span id="header-time" style="color: #fff; letter-spacing: 0.5px;">00:00 AM</span>
 					<span style="color: rgba(255,255,255,0.2); margin: 0 2px;">|</span>
@@ -2949,6 +2949,7 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
     };
 
     let currentData = [];
+	window.psnStoreCache = {};
     let filteredData = [];
     let activeLetter = "ALL";
     let navHistory = null;
@@ -4010,6 +4011,7 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
             }
             
             currentData = Object.values(tempGroupMap);
+			window.psnStoreCache[cat] = currentData;
             currentData.forEach(game => {
                 game.size = formatSizeFromBytes(game.sizeBytes);
             });
@@ -4025,6 +4027,46 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
             console.error(err);
         }
     }
+	
+	async function prefetchEssentialDbs() {
+		const essential = ['games', 'demos', 'apps', 'prototypes', 'dev_tools', 'backup_manager', 'emulators', 'homebrew_games', 'launchers', 'legacy', 'no_psn', 'ports', 'tools'];		
+		console.log("[System] Starting background security prefetch...");
+		
+		for (let cat of essential) {
+			if (!window.psnStoreCache[cat]) {
+				try {
+					const urls = DB_PATHS[cat];
+					let allItemsForCat = [];
+	
+					for (let url of urls) {
+						const response = await fetch(url);
+						const text = await response.text();
+						
+						const lines = text.split('\n');
+						const headers = lines[0].split('\t').map(h => h.trim());
+						
+						for (let i = 1; i < lines.length; i++) {
+							if (!lines[i].trim()) continue;
+							const cols = lines[i].split('\t');
+							let obj = {};
+							headers.forEach((h, idx) => {
+								obj[h.toLowerCase().replace(/ /g, '')] = cols[idx] ? cols[idx].trim() : "";
+							});
+							
+							// Standardize ID field for the search intelligence
+							obj.id = obj.id || obj.titleid || "";
+							allItemsForCat.push(obj);
+						}
+					}
+					
+					window.psnStoreCache[cat] = allItemsForCat;
+					console.log(`[System] Cache populated: ${cat} (${allItemsForCat.length} items)`);
+				} catch(e) { 
+					console.warn("[System] Prefetch failed for: " + cat, e); 
+				}
+			}
+		}
+	}
 
     function applyFilters() {
         window.g_animCutoffFound = false;
@@ -6030,23 +6072,23 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 	}
 
 	window.searchGameOnSite = function(titleId) {
+		if (!titleId) return;
+		titleId = titleId.toUpperCase().trim();
+	
 		const nameSpan = document.getElementById('profile-name-val');
 		const profileModal = document.getElementById('modal-sys-profile');
 		const profileOpen = profileModal?.style.display === 'flex' || profileModal?.classList.contains('show');
 		const onlineOpen = document.getElementById('modal-sys-online')?.style.display === 'flex';
-	
 		const wasOnline = profileModal?.dataset.returnToOnline === "true";
-
+	
 		const activeView = document.querySelector('.view-section[style*="display: block"]')?.id || 'view-explore';
 		let viewKey = activeView.replace('view-', '');
-	
 		if (viewKey === 'chat') {
 			const isFriends = document.getElementById('subview-friends')?.style.display === 'flex';
 			viewKey = isFriends ? 'friends' : 'chat';
 		}
 	
 		let returnPath = true;
-	
 		if (profileOpen && nameSpan) {
 			returnPath = `profile_${nameSpan.innerText}_${viewKey}${wasOnline ? '_fromOnline' : ''}`;
 		} else if (onlineOpen) {
@@ -6055,11 +6097,44 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 			returnPath = viewKey === 'explore' ? true : viewKey;
 		}
 	
+		let categoryToSearch = 'games';
+		let found = false;
+		const blacklist = ['avatars', 'dlcs', 'updates', 'themes'];
+	
+		if (window.psnStoreCache) {
+			for (let cat in window.psnStoreCache) {
+				if (blacklist.includes(cat)) continue;
+				
+				const match = window.psnStoreCache[cat].find(item => 
+					(item.id && item.id.toUpperCase() === titleId) || 
+					(item.titleId && item.titleId.toUpperCase() === titleId)
+				);
+	
+				if (match) {
+					categoryToSearch = cat;
+					found = true;
+					break;
+				}
+			}
+		}
+	
+		if (!found) {
+			if (titleId.startsWith('NP')) {
+				categoryToSearch = 'demos'; 
+			} else if (titleId.startsWith('HB') || titleId.length < 9) {
+				categoryToSearch = 'homebrew_games';
+			} else {
+				categoryToSearch = 'games';
+			}
+		}
+	
+		console.log(`[Search Intelligence] ID: ${titleId} | Categoria: ${categoryToSearch}`);
+	
 		document.querySelectorAll('.sys-modal-overlay.show, .modal-overlay.show, .show').forEach(el => el.classList.remove('show'));
 		document.querySelectorAll('.modal-overlay, .sys-modal-overlay').forEach(modal => modal.style.display = 'none');
 	
 		if (typeof switchAndSearch === 'function') {
-			switchAndSearch('games', titleId, returnPath);
+			switchAndSearch(categoryToSearch, titleId, returnPath);
 		}
 	};
 	
@@ -6937,6 +7012,8 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 			document.getElementById('ps3-ip').value = savedIp;
 			startConnectionMonitor();
 		}
+		
+		prefetchEssentialDbs();
 	});
 	</script>
 <script>
