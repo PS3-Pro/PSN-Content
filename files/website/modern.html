@@ -4029,7 +4029,7 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
     }
 	
 	async function prefetchEssentialDbs() {
-		const essential = ['games', 'demos', 'apps', 'prototypes', 'dev_tools', 'backup_manager', 'emulators', 'homebrew_games', 'launchers', 'legacy', 'no_psn', 'ports', 'tools'];		
+		const essential = ['demos', 'apps', 'prototypes', 'dev_tools', 'backup_manager', 'emulators', 'homebrew_games', 'launchers', 'legacy', 'no_psn', 'ports', 'tools', 'games'];		
 		console.log("[System] Starting background security prefetch...");
 		
 		for (let cat of essential) {
@@ -6071,64 +6071,62 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 		} catch (e) { return { status: 'offline' }; }
 	}
 
-	window.searchGameOnSite = function(titleId) {
+	window.searchGameOnSite = function(titleId, optionalReturnPath = null) {
 		if (!titleId) return;
 		titleId = titleId.toUpperCase().trim();
 	
-		const nameSpan = document.getElementById('profile-name-val');
-		const profileModal = document.getElementById('modal-sys-profile');
-		const profileOpen = profileModal?.style.display === 'flex' || profileModal?.classList.contains('show');
-		const onlineOpen = document.getElementById('modal-sys-online')?.style.display === 'flex';
-		const wasOnline = profileModal?.dataset.returnToOnline === "true";
+		let returnPath = optionalReturnPath;
+		if (!returnPath) {
+			const nameSpan = document.getElementById('profile-name-val');
+			const profileModal = document.getElementById('modal-sys-profile');
+			const profileOpen = profileModal?.style.display === 'flex' || profileModal?.classList.contains('show');
+			const onlineOpen = document.getElementById('modal-sys-online')?.style.display === 'flex';
+			const wasOnline = profileModal?.dataset.returnToOnline === "true";
 	
-		const activeView = document.querySelector('.view-section[style*="display: block"]')?.id || 'view-explore';
-		let viewKey = activeView.replace('view-', '');
-		if (viewKey === 'chat') {
-			const isFriends = document.getElementById('subview-friends')?.style.display === 'flex';
-			viewKey = isFriends ? 'friends' : 'chat';
+			const activeView = document.querySelector('.view-section[style*="display: block"]')?.id || 'view-explore';
+			let viewKey = activeView.replace('view-', '');
+			if (viewKey === 'chat') {
+				const isFriends = document.getElementById('subview-friends')?.style.display === 'flex';
+				viewKey = isFriends ? 'friends' : 'chat';
+			}
+	
+			if (profileOpen && nameSpan) {
+				returnPath = `profile_${nameSpan.innerText}_${viewKey}${wasOnline ? '_fromOnline' : ''}`;
+			} else if (onlineOpen) {
+				returnPath = `online_modal_${viewKey}`;
+			} else {
+				returnPath = viewKey === 'explore' ? true : viewKey;
+			}
 		}
 	
-		let returnPath = true;
-		if (profileOpen && nameSpan) {
-			returnPath = `profile_${nameSpan.innerText}_${viewKey}${wasOnline ? '_fromOnline' : ''}`;
-		} else if (onlineOpen) {
-			returnPath = `online_modal_${viewKey}`;
-		} else {
-			returnPath = viewKey === 'explore' ? true : viewKey;
-		}
-	
-		let categoryToSearch = 'games';
+		let categoryToSearch = 'games'; // Fallback padrão
 		let found = false;
 		const blacklist = ['avatars', 'dlcs', 'updates', 'themes'];
 	
 		if (window.psnStoreCache) {
-			for (let cat in window.psnStoreCache) {
+			const cats = Object.keys(window.psnStoreCache).sort((a, b) => {
+				if (a === 'games') return 1;
+				if (b === 'games') return -1;
+				return 0;
+			});
+	
+			for (let cat of cats) {
 				if (blacklist.includes(cat)) continue;
 				
 				const match = window.psnStoreCache[cat].find(item => 
 					(item.id && item.id.toUpperCase() === titleId) || 
+					(item.titleid && item.titleid.toUpperCase() === titleId) ||
 					(item.titleId && item.titleId.toUpperCase() === titleId)
 				);
 	
 				if (match) {
 					categoryToSearch = cat;
 					found = true;
+					console.log(`[Search Intelligence] Match found in category: ${cat}`);
 					break;
 				}
 			}
 		}
-	
-		if (!found) {
-			if (titleId.startsWith('NP')) {
-				categoryToSearch = 'demos'; 
-			} else if (titleId.startsWith('HB') || titleId.length < 9) {
-				categoryToSearch = 'homebrew_games';
-			} else {
-				categoryToSearch = 'games';
-			}
-		}
-	
-		console.log(`[Search Intelligence] ID: ${titleId} | Categoria: ${categoryToSearch}`);
 	
 		document.querySelectorAll('.sys-modal-overlay.show, .modal-overlay.show, .show').forEach(el => el.classList.remove('show'));
 		document.querySelectorAll('.modal-overlay, .sys-modal-overlay').forEach(modal => modal.style.display = 'none');
@@ -10058,9 +10056,9 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 				const itemName = item.cleanName || item.name || item.title || "Unknown Game";
 				const itemCover = (typeof getOptimizedCover === 'function' && realId && isNaN(realId)) ? getOptimizedCover(realId) : FALLBACK_IMG;
 				const isSearchable = realId && isNaN(realId) && realId.length >= 5;
-				const clickAction = isSearchable ? `onclick="playUiClick(); const pModal = document.getElementById('modal-sys-profile'); if(pModal) pModal.dataset.returnToOnline = 'false'; closeSysModal(null, 'modal-sys-list'); closeSysModal(null, 'modal-sys-profile'); switchView('view-browse'); switchAndSearch('${item.category || 'games'}', '${realId}', 'profilelist|${targetUser}|${listType}|${bgView}|${returnToOnline}')"` : '';
+				const clickAction = isSearchable ? `onclick="playUiClick(); searchGameOnSite('${realId}', 'profilelist|${targetUser}|${listType}|${bgView}|${returnToOnline}')"` : '';
 				let dateDisp = listType === 'library' ? (item.lastPlayed ? `Last played: <span style="color:#fff;">${item.lastPlayed}</span>` : `Last played: Unknown`) : `<i class="far fa-clock"></i> ${item.date || 'Recently'}`;
-	
+
 				html += `
 					<div class="download-item social-list-item" onmouseenter="if(typeof playUiHover === 'function') playUiHover()" ${clickAction}>
 						<div style="display: flex; align-items: center; gap: 15px;">
