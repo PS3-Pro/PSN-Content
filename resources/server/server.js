@@ -8,7 +8,7 @@ const bcrypt = require('bcrypt');
 const app = express();
 const server = http.createServer(app);
 
-const APP_URL = "https://psn-content.onrender.com/ping";
+const APP_URL = "https://psn-content-8o6c.onrender.com/ping";
 const ADMIN_USERS = ["Luan Teles", "Goku Cheats", "Admin"];
 const ADMIN_SECRET = process.env.ADMIN_SECRET || "ADMINENABLED";
 
@@ -80,6 +80,7 @@ const io = new Server(server, {
 });
 
 io.on('connection', (socket) => {
+  console.log('[NETWORK] Socket conectado. ID: ' + socket.id);
   
   socket.emit('chat_history', messageHistory);
 
@@ -108,6 +109,7 @@ io.on('connection', (socket) => {
                 
                 await pool.query('UPDATE users SET data = $1 WHERE name = $2', [userDatabase[name], name]);
                 
+                console.log(`[NETWORK] ${name} fez login com sucesso!`);
                 socket.emit('auth_success', { name, userData: userDatabase[name] });
                 io.emit('online_list', getSanitizedOnlineList());
             } else {
@@ -130,6 +132,7 @@ io.on('connection', (socket) => {
                 [name, userDatabase[name]]
             );
             
+            console.log(`[NETWORK] ${name} criou uma conta nova e entrou!`);
             socket.emit('auth_success', { name, userData: userDatabase[name] });
             io.emit('online_list', getSanitizedOnlineList());
         }
