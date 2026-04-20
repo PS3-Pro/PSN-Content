@@ -261,27 +261,27 @@ io.on('connection', (socket) => {
     if (msgIndex > -1) {
         const isAdmin = ADMIN_USERS.includes(data.user) && data.secret === ADMIN_SECRET;
         if (messageHistory[msgIndex].user === data.user || isAdmin) {
+            
+            const wasEditedByAdmin = (isAdmin && messageHistory[msgIndex].user !== data.user);
+            
             messageHistory[msgIndex].text = data.newText;
             messageHistory[msgIndex].edited = true;
-            
+            messageHistory[msgIndex].editedByAdmin = wasEditedByAdmin;
+
             if (data.content) {
                 messageHistory[msgIndex].type = 'image';
                 messageHistory[msgIndex].content = data.content;
             }
-
-            const wasEditedByAdmin = (isAdmin && messageHistory[msgIndex].user !== data.user);
             
             await pool.query('DELETE FROM chat');
-            for(const m of messageHistory) {
-                await pool.query('INSERT INTO chat (message) VALUES ($1)', [m]);
-            }
+            for(const m of messageHistory) { await pool.query('INSERT INTO chat (message) VALUES ($1)', [m]); }
             
             io.emit('message_edited', { 
                 msgId: data.msgId, 
-                newText: data.newText,
-                type: data.content ? 'image' : (messageHistory[msgIndex].type || 'text'),
-                content: data.content || messageHistory[msgIndex].content,
-                editedByAdmin: wasEditedByAdmin
+                newText: data.newText, 
+                type: data.content ? 'image' : (messageHistory[msgIndex].type || 'text'), 
+                content: data.content,
+                editedByAdmin: wasEditedByAdmin 
             });
         }
     }
