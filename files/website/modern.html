@@ -8380,472 +8380,490 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 		}
 	}
 
-    function initChat() {
-		if (socketChat) {
-			socketChat.disconnect();
+    // 1. Variável global de controle (deixe ela aqui fora, antes da função!)
+let isKicked = false;
+
+function initChat() {
+	if (socketChat) {
+		socketChat.disconnect();
+	}
+	
+	if (typeof updateGlobalOnlineStatus === 'function') updateGlobalOnlineStatus('connecting');
+	
+	socketChat = io(socketRenderUrl);
+
+	socketChat.on('connect', () => {
+		if (typeof updateGlobalOnlineStatus === 'function') updateGlobalOnlineStatus('online');
+	
+		const myName = localStorage.getItem('psn_username');
+		const myPass = localStorage.getItem(`${myName}_psn_password`);
+		
+		const bootContainer = document.getElementById('ps5-boot-container');
+		const isAlreadyBooted = bootContainer && bootContainer.style.display === 'none';
+	
+		if (myName && myPass && myName !== "null" && isAlreadyBooted) {
+			const myAvatar = localStorage.getItem(`${myName}_psn_avatar`) || AVAILABLE_AVATARS[0];
+			const myJoinedDate = localStorage.getItem(`${myName}_joined_date`) || "2026";
+			
+			let totalXp = typeof calculateMyXp === 'function' ? calculateMyXp() : 0;
+			let totalTrophiesUnlocked = Object.keys(window.userTrophies || {}).filter(id => window.userTrophies[id].unlocked).length;
+			const myLevel = Math.floor(totalXp / 100) + 1;
+		
+			socketChat.emit('authenticate_user', { 
+				name: myName,
+				password: myPass,
+				isNewAccount: false,
+				userData: {
+					avatar: myAvatar,
+					level: myLevel,
+					joined: myJoinedDate,
+					downloads: window.downloadHistory ? window.downloadHistory.length : 0,
+					wishlist: window.wishlist ? window.wishlist.length : 0,
+					favorites: window.favoritesLibrary ? window.favoritesLibrary.length : 0,
+					trophies: totalTrophiesUnlocked,
+					library: typeof lastScannedGames !== 'undefined' ? lastScannedGames.length : 0,
+					trophiesData: window.userTrophies || {},
+					downloadsData: window.downloadHistory || [],
+					wishlistData: window.wishlist || [],
+					favoritesData: window.favoritesLibrary || [],
+					libraryData: typeof lastScannedGames !== 'undefined' ? lastScannedGames : [],
+					ps3Status: window.myCurrentPS3Status || null
+				}
+			});
 		}
 		
-		if (typeof updateGlobalOnlineStatus === 'function') updateGlobalOnlineStatus('connecting');
+		const s = document.getElementById('chat-status-text');
+		if (s) { s.innerText = "(Connected)"; s.style.color = "#4caf50"; }
+	});
+	
+	socketChat.on('auth_success', (data) => {
+		const { name, userData } = data;
 		
-		socketChat = io(socketRenderUrl);
-	
-		socketChat.on('connect', () => {
-			if (typeof updateGlobalOnlineStatus === 'function') updateGlobalOnlineStatus('online');
+		localStorage.setItem('psn_username', name);
+		saveUserToGlobalList(name); 
 		
-			const myName = localStorage.getItem('psn_username');
-			const myPass = localStorage.getItem(`${myName}_psn_password`);
-			
-			const bootContainer = document.getElementById('ps5-boot-container');
-			const isAlreadyBooted = bootContainer && bootContainer.style.display === 'none';
+		if (userData.avatar) localStorage.setItem(`${name}_psn_avatar`, userData.avatar);
+		if (userData.joined) localStorage.setItem(`${name}_joined_date`, userData.joined);
 		
-			if (myName && myPass && myName !== "null" && isAlreadyBooted) {
-				const myAvatar = localStorage.getItem(`${myName}_psn_avatar`) || AVAILABLE_AVATARS[0];
-				const myJoinedDate = localStorage.getItem(`${myName}_joined_date`) || "2026";
-				
-				let totalXp = typeof calculateMyXp === 'function' ? calculateMyXp() : 0;
-				let totalTrophiesUnlocked = Object.keys(window.userTrophies || {}).filter(id => window.userTrophies[id].unlocked).length;
-				const myLevel = Math.floor(totalXp / 100) + 1;
-			
-				socketChat.emit('authenticate_user', { 
-					name: myName,
-					password: myPass,
-					isNewAccount: false,
-					userData: {
-						avatar: myAvatar,
-						level: myLevel,
-						joined: myJoinedDate,
-						downloads: window.downloadHistory ? window.downloadHistory.length : 0,
-						wishlist: window.wishlist ? window.wishlist.length : 0,
-						favorites: window.favoritesLibrary ? window.favoritesLibrary.length : 0,
-						trophies: totalTrophiesUnlocked,
-						library: typeof lastScannedGames !== 'undefined' ? lastScannedGames.length : 0,
-						trophiesData: window.userTrophies || {},
-						downloadsData: window.downloadHistory || [],
-						wishlistData: window.wishlist || [],
-						favoritesData: window.favoritesLibrary || [],
-						libraryData: typeof lastScannedGames !== 'undefined' ? lastScannedGames : [],
-						ps3Status: window.myCurrentPS3Status || null
-					}
-				});
-			}
-			
-			const s = document.getElementById('chat-status-text');
-			if (s) { s.innerText = "(Connected)"; s.style.color = "#4caf50"; }
-		});
-		
-		socketChat.on('auth_success', (data) => {
-			const { name, userData } = data;
-			
-			localStorage.setItem('psn_username', name);
-			saveUserToGlobalList(name); 
-			
-			if (userData.avatar) localStorage.setItem(`${name}_psn_avatar`, userData.avatar);
-			if (userData.joined) localStorage.setItem(`${name}_joined_date`, userData.joined);
-			
-			if (userData.trophiesData) {
-				window.userTrophies = userData.trophiesData;
-				localStorage.setItem(`${name}_psn_user_trophies`, JSON.stringify(userData.trophiesData));
-			}
-			if (userData.wishlistData) {
-				window.wishlist = userData.wishlistData;
-				localStorage.setItem(`${name}_psn_wishlist_db`, JSON.stringify(userData.wishlistData));
-			}
-			if (userData.downloadsData) {
-				window.downloadHistory = userData.downloadsData;
-				localStorage.setItem(`${name}_psn_dl_history`, JSON.stringify(userData.downloadsData));
-			}
-			if (userData.favoritesData) {
-				window.favoritesLibrary = userData.favoritesData;
-				localStorage.setItem(`${name}_ps3_library_favs`, JSON.stringify(userData.favoritesData));
-			}
-			if (userData.libraryData) {
-				if (typeof lastScannedGames !== 'undefined') lastScannedGames = userData.libraryData;
-				localStorage.setItem(`${name}_psn_local_library`, JSON.stringify(userData.libraryData));
-			}
-		
-			if (typeof window.broadcastProfileUpdate === 'function') {
-				window.broadcastProfileUpdate();
-			}
-		
-			if (typeof checkDailyTrophies === 'function') {
-				checkDailyTrophies();
-			}
-		
-			const bootContainer = document.getElementById('ps5-boot-container');
-			if (bootContainer && bootContainer.style.display !== 'none') {
-				const nameOverlay = document.getElementById('name-input-overlay');
-				const loginOverlay = document.getElementById('login-input-overlay');
-				if (nameOverlay) nameOverlay.style.display = 'none';
-				if (loginOverlay) loginOverlay.style.display = 'none';
-				
-				document.getElementById('user-select-screen').style.opacity = '1';
-				if (typeof playUiSuccess === 'function') playUiSuccess();
-				
-				finishBoot(name); 
-			}
-		});
+		if (userData.trophiesData) {
+			window.userTrophies = userData.trophiesData;
+			localStorage.setItem(`${name}_psn_user_trophies`, JSON.stringify(userData.trophiesData));
+		}
+		if (userData.wishlistData) {
+			window.wishlist = userData.wishlistData;
+			localStorage.setItem(`${name}_psn_wishlist_db`, JSON.stringify(userData.wishlistData));
+		}
+		if (userData.downloadsData) {
+			window.downloadHistory = userData.downloadsData;
+			localStorage.setItem(`${name}_psn_dl_history`, JSON.stringify(userData.downloadsData));
+		}
+		if (userData.favoritesData) {
+			window.favoritesLibrary = userData.favoritesData;
+			localStorage.setItem(`${name}_ps3_library_favs`, JSON.stringify(userData.favoritesData));
+		}
+		if (userData.libraryData) {
+			if (typeof lastScannedGames !== 'undefined') lastScannedGames = userData.libraryData;
+			localStorage.setItem(`${name}_psn_local_library`, JSON.stringify(userData.libraryData));
+		}
 	
-		socketChat.on('auth_error', (msg) => {
-			if (typeof playUiError === 'function') playUiError();
-			alert(msg);
+		if (typeof window.broadcastProfileUpdate === 'function') {
+			window.broadcastProfileUpdate();
+		}
+	
+		if (typeof checkDailyTrophies === 'function') {
+			checkDailyTrophies();
+		}
+	
+		const bootContainer = document.getElementById('ps5-boot-container');
+		if (bootContainer && bootContainer.style.display !== 'none') {
+			const nameOverlay = document.getElementById('name-input-overlay');
+			const loginOverlay = document.getElementById('login-input-overlay');
+			if (nameOverlay) nameOverlay.style.display = 'none';
+			if (loginOverlay) loginOverlay.style.display = 'none';
 			
-			const btnCreate = document.getElementById('btn-create-profile');
-			const btnLogin = document.getElementById('btn-login-profile');
-			const passInput = document.getElementById('login-psn-pass');
-			
-			if (btnCreate) { btnCreate.innerHTML = 'OK'; btnCreate.style.pointerEvents = 'auto'; btnCreate.style.opacity = '1'; }
-			if (btnLogin) { btnLogin.innerHTML = 'Log In'; btnLogin.style.pointerEvents = 'auto'; btnLogin.style.opacity = '1'; }
-			
-			if (passInput) {
-				passInput.style.borderColor = '#ff4444';
-				passInput.value = '';
-				passInput.focus();
-				setTimeout(() => passInput.style.borderColor = '', 1000);
-			}
-		});
-	
-		socketChat.on('online_list', function(users) {
-			const countElement = document.getElementById('online-count');
-			if (!users) return;
-	
-			const activeUsersCount = users.filter(u => u.online === true).length;
-			if (countElement) countElement.innerText = `${activeUsersCount} Online`;
-	
-			const modal = document.getElementById('modal-sys-online');
-			const isVisible = modal && (modal.style.display === 'flex' || modal.classList.contains('show'));
-			
-			if (isVisible) {
-				currentOnlineList = users;
-			} else {
-				currentOnlineList = users;
-				currentOnlineList.forEach(u => {
-					if (u.name && u.name !== "Guest") {
-						const prefix = `${u.name}_psn_`;
-						localStorage.setItem(`${prefix}avatar`, u.avatar);
-						localStorage.setItem(`${prefix}level`, u.level);
-						localStorage.setItem(`${prefix}joined`, u.joined || "2026");
-						localStorage.setItem(`${prefix}downloads`, u.downloads || 0);
-						localStorage.setItem(`${prefix}wishlist`, u.wishlist || 0);
-						localStorage.setItem(`${prefix}favs`, u.favorites || 0);
-						localStorage.setItem(`${prefix}trophies`, u.trophies || 0); 
-						localStorage.setItem(`${prefix}library`, u.library || 0);
-					}
-				});
-			}
-	
-			if (window.friendsList && window.friendsList.length > 0) {
-				let changed = false;
-				window.friendsList.forEach(friend => {
-					const netData = users.find(u => u.name === friend.name);
-					if (netData && netData.lastSeen !== friend.lastSeen) {
-						friend.lastSeen = netData.lastSeen;
-						changed = true;
-					}
-				});
-				if (changed) {
-					saveState(STORAGE_KEY_FRIENDS, JSON.stringify(window.friendsList));
-					const friendsView = document.getElementById('subview-friends');
-					if (friendsView && friendsView.style.display !== 'none') renderFriendsList();
-				}
-			}
-		});
-		
-		socketChat.on('global_search_results', function(results) {
-			window.globalSearchResults = results;
-			const term = document.getElementById('search-input').value;
-			if (document.getElementById('view-chat').style.display === 'block') {
-				renderFriendsList(term);
-			}
-		});
-	
-		socketChat.on('message_reaction', function(data) {
-			const container = document.getElementById(`reactions-${data.msgId}`);
-			if (!container) return;
-			
-			let pill = container.querySelector(`[data-emoji="${data.emoji}"]`);
-			if (pill) {
-				let users = pill.getAttribute('data-users').split(', ').filter(u => u !== "");
-				let userIndex = users.indexOf(data.user);
-				if (userIndex > -1) { users.splice(userIndex, 1); } else { users.push(data.user); }
-				
-				if (users.length <= 0) { 
-					pill.remove(); 
-				} else {
-					pill.setAttribute('data-count', users.length);
-					pill.setAttribute('data-users', users.join(', '));
-					pill.innerHTML = `${data.emoji} ${users.length}`;
-				}
-			} else {
-				container.innerHTML += `<div class="reaction-pill" data-emoji="${data.emoji}" data-count="1" data-users="${data.user}">${data.emoji} 1</div>`;
-			}
-		});
-	
-		socketChat.on('chat_history', function(history) {
-			window.messageHistory = history;
-			const box = document.getElementById('chat-messages');
-			if (box) {
-				box.innerHTML = '<div style="text-align: center; margin-bottom: 15px;"><span style="background: rgba(255,255,255,0.05); padding: 5px 15px; border-radius: 20px; font-size: 11px; color: var(--text-muted); text-transform: uppercase;">Welcome to the PSN Database Global Chat</span></div>';
-				
-				const lastReadTime = parseInt(loadState('psn_last_chat_read') || 0);
-				const myName = localStorage.getItem('psn_username') || "Guest";
-				let dividerAdded = false;
-	
-				history.forEach(data => {
-					trackUser(data.user);
-					const msgTime = new Date(data.time).getTime();
-					if (data.user !== myName && lastReadTime > 0 && msgTime > lastReadTime && !dividerAdded) {
-						box.insertAdjacentHTML('beforeend', `<div id="unread-divider" class="ps-new-messages-container"><div class="ps-line left"></div><span class="ps-unread-text">NEW MESSAGES</span><div class="ps-line right"></div></div>`);
-						dividerAdded = true;
-					}
-					appendMessageToChat(data, data.user === myName, data.time);
-				});
-	
-				setTimeout(() => {
-					const divider = document.getElementById('unread-divider');
-					if (divider) { 
-						divider.scrollIntoView({ behavior: 'smooth', block: 'center' });
-						setupDividerAutoRemove();
-					} else { box.scrollTop = box.scrollHeight; }
-				}, 150);
-	
-				if (typeof refreshChatNotificationDot === 'function') refreshChatNotificationDot();
-			}
-		});
-	
-		socketChat.on('chat_message', function(data) {
-			if (!window.messageHistory) window.messageHistory = [];
-			window.messageHistory.push(data);
-			if (window.messageHistory.length > 100) window.messageHistory.shift();
-	
-			const chatVisible = document.getElementById('view-chat').style.display === 'flex' || document.getElementById('view-chat').style.display === 'block';
-			const myName = localStorage.getItem('psn_username') || "Guest";
-			
-			playMessageSound();
-			if (!chatVisible && data.user !== myName) {
-				const isMention = data.text && data.text.includes(`@${myName}`);
-				const isReply = data.replyTo && data.replyTo.user === myName;
-				if (isMention || isReply || data.isGlobalPing) showChatNotification(data.user, isMention, data.isGlobalPing);
-			}
-			
-			appendMessageToChat(data, data.user === myName, data.time);
-			if (typeof refreshChatNotificationDot === 'function') refreshChatNotificationDot();
-		});
-	
-		socketChat.on('message_edited', function(data) {
-			if (window.messageHistory) {
-				const msg = window.messageHistory.find(m => String(new Date(m.time).getTime()) === String(data.msgId));
-				if (msg) {
-					msg.text = data.newText;
-					msg.edited = true;
-					msg.editedByAdmin = data.editedByAdmin;
-					if (data.content) {
-						msg.type = 'image';
-						msg.content = data.content;
-					}
-				}
-			}
-			
-			const textContainer = document.getElementById(`msg-text-${data.msgId}`);
-			if (textContainer) {
-				const parent = textContainer.parentNode;
-				let formatted = data.newText.replace(/\n/g, '<br>');
-				let badge = data.editedByAdmin ? ' <span style="font-size: 9px; opacity: 0.8; color: #ff4444; font-weight: bold;">(Edited by Admin)</span>' : ' <span style="font-size: 9px; opacity: 0.5; font-style: italic;">(Edited)</span>';
-				
-				let existingImg = parent.querySelector('img');
-				if (data.content && !existingImg) {
-					const imgEl = document.createElement('img');
-					imgEl.src = data.content;
-					imgEl.style.cssText = "max-width: 100%; max-height: 250px; border-radius: 6px; cursor: zoom-in; display: block; margin: 0 auto; margin-bottom: 10px;";
-					imgEl.onclick = function() { openImageModal(this.src); };
-					parent.insertBefore(imgEl, textContainer);
-				}
-				
-				textContainer.innerHTML = formatted + badge;
-			}
-			if (typeof refreshChatNotificationDot === 'function') refreshChatNotificationDot();
-		});
-	
-		socketChat.on('message_deleted', function(msgId) {
-			if (window.messageHistory) {
-				window.messageHistory = window.messageHistory.filter(m => String(new Date(m.time).getTime()) !== String(msgId));
-			}
-			const msgRow = document.getElementById(`msg-row-${msgId}`);
-			if (msgRow) {
-				msgRow.style.opacity = '0';
-				msgRow.style.transform = 'scale(0.8) translateX(20px)';
-				setTimeout(() => { if (msgRow.parentNode) msgRow.remove(); }, 400);
-			}
-			if (typeof refreshChatNotificationDot === 'function') refreshChatNotificationDot();
-		});
-	
-		socketChat.on('user_kicked', () => {
-			if (socketChat) socketChat.disconnect();
-			
-			kickScreen.style.cssText = "position:fixed; top:0; left:0; width:100vw; height:100vh; background:rgba(15,0,0,0.95); z-index:999999; display:flex; flex-direction:column; align-items:center; justify-content:center; text-align:center; padding:0 20px; box-sizing:border-box; color:#ff4444; font-family:sans-serif; backdrop-filter:blur(10px); animation: fadeIn 0.3s ease-out;";
-			kickScreen.innerHTML = `
-				<i class="fas fa-user-slash" style="font-size: 60px; margin-bottom: 20px;"></i>
-				<h1 style="margin:0; font-size: 24px; text-transform: uppercase; line-height: 1.2;">Access Revoked</h1>
-				<p style="color:#aaa; margin-top:10px; font-size: 14px; line-height: 1.4; max-width: 300px;">You have been kicked from the session by an Administrator.</p>
-			`;
-			document.body.appendChild(kickScreen);
-		
-			setTimeout(() => {
-				window.location.href = "about:blank";
-			}, 3000);
-		});
-		
-		socketChat.on('kick_success', function(data) {
-			const targetId = data.targetId || data; 
-			const row = document.getElementById(`user-row-${targetId}`);
-			
-			if (row) {
-				row.style.transition = 'all 0.4s cubic-bezier(0.25, 0.8, 0.25, 1)';
-				row.style.opacity = '0';
-				row.style.transform = 'translateX(50px) scale(0.9)';
-				
-				setTimeout(() => {
-					if (row.parentNode) row.remove();
-				}, 400); 
-			}
-		});
-		
-		socketChat.on('force_reload', () => {
+			document.getElementById('user-select-screen').style.opacity = '1';
 			if (typeof playUiSuccess === 'function') playUiSuccess();
+			
+			finishBoot(name); 
+		}
+	});
+
+	socketChat.on('auth_error', (msg) => {
+		if (typeof playUiError === 'function') playUiError();
+		alert(msg);
 		
-			const reloadScreen = document.createElement('div');
-			reloadScreen.style.cssText = `
-				position: fixed; 
-				top: 0; 
-				left: 0; 
-				width: 100vw; 
-				height: 100vh; 
-				background: rgba(0, 15, 40, 0.97); 
-				z-index: 1000000; 
-				display: flex; 
-				flex-direction: column; 
-				align-items: center; 
-				justify-content: center; 
-				text-align: center; 
-				padding: 0 20px; 
-				box-sizing: border-box; 
-				color: #00bcff; 
-				font-family: sans-serif; 
-				backdrop-filter: blur(15px); 
-				animation: fadeIn 0.4s ease-out;
-			`;
+		const btnCreate = document.getElementById('btn-create-profile');
+		const btnLogin = document.getElementById('btn-login-profile');
+		const passInput = document.getElementById('login-psn-pass');
 		
-			reloadScreen.innerHTML = `
-				<i class="fas fa-sync-alt fa-spin" style="font-size: 60px; margin-bottom: 25px; filter: drop-shadow(0 0 15px rgba(0, 188, 255, 0.4));"></i>
-				<h1 style="margin:0; font-size: 26px; text-transform: uppercase; letter-spacing: 2px; color: #fff;">Refreshing System</h1>
-				<p style="color: rgba(255,255,255,0.7); margin-top: 15px; font-size: 15px; line-height: 1.5; max-width: 350px;">
-					The administrator requested a session update. <br>Please wait while we refresh the database...
-				</p>
-				<div style="margin-top: 30px; width: 150px; height: 3px; background: rgba(255,255,255,0.1); border-radius: 10px; overflow: hidden;">
-					<div style="width: 100%; height: 100%; background: #00bcff; animation: psProgress 2s infinite linear;"></div>
-				</div>
-			`;
+		if (btnCreate) { btnCreate.innerHTML = 'OK'; btnCreate.style.pointerEvents = 'auto'; btnCreate.style.opacity = '1'; }
+		if (btnLogin) { btnLogin.innerHTML = 'Log In'; btnLogin.style.pointerEvents = 'auto'; btnLogin.style.opacity = '1'; }
 		
-			document.body.appendChild(reloadScreen);
+		if (passInput) {
+			passInput.style.borderColor = '#ff4444';
+			passInput.value = '';
+			passInput.focus();
+			setTimeout(() => passInput.style.borderColor = '', 1000);
+		}
+	});
+
+	socketChat.on('online_list', function(users) {
+		const countElement = document.getElementById('online-count');
+		if (!users) return;
+
+		const activeUsersCount = users.filter(u => u.online === true).length;
+		if (countElement) countElement.innerText = `${activeUsersCount} Online`;
+
+		const modal = document.getElementById('modal-sys-online');
+		const isVisible = modal && (modal.style.display === 'flex' || modal.classList.contains('show'));
 		
-			setTimeout(() => {
-				window.location.reload();
-			}, 3000);
-		});
-		
-		socketChat.on('chat_cleared', () => {
-			const isChatVisible = document.getElementById('view-chat').style.display === 'block';
-			const isAdmin = !!localStorage.getItem('psn_admin_secret');
-		
-			if (isChatVisible && !isAdmin) {
-				if (typeof playUiRemove === 'function') playUiRemove();
-		
-				const cleanScreen = document.createElement('div');
-				cleanScreen.style.cssText = `
-					position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; 
-					background: rgba(20, 15, 0, 0.96); z-index: 1000000; 
-					display: flex; flex-direction: column; align-items: center; 
-					justify-content: center; text-align: center; padding: 0 20px; 
-					box-sizing: border-box; color: #ffcc00; font-family: sans-serif; 
-					backdrop-filter: blur(15px); animation: fadeIn 0.4s ease-out;
-				`;
-		
-				cleanScreen.innerHTML = `
-					<div style="position: relative; margin-bottom: 25px;">
-						<i class="fas fa-broom" style="font-size: 60px; filter: drop-shadow(0 0 15px rgba(255, 204, 0, 0.5)); animation: sweepAction 1.5s infinite ease-in-out;"></i>
-					</div>
-					<h1 style="margin:0; font-size: 26px; text-transform: uppercase; letter-spacing: 2px; color: #fff;">History Purged</h1>
-					<p style="color: rgba(255,255,255,0.7); margin-top: 15px; font-size: 15px; line-height: 1.5; max-width: 350px;">
-						An administrator has performed a deep cleanup.
-					</p>
-				`;
-		
-				document.body.appendChild(cleanScreen);
-		
-				setTimeout(() => {
-					cleanScreen.style.transition = "opacity 0.6s ease-out";
-					cleanScreen.style.opacity = "0";
-					setTimeout(() => cleanScreen.remove(), 600);
-				}, 3000);
+		if (isVisible) {
+			currentOnlineList = users;
+		} else {
+			currentOnlineList = users;
+			currentOnlineList.forEach(u => {
+				if (u.name && u.name !== "Guest") {
+					const prefix = `${u.name}_psn_`;
+					localStorage.setItem(`${prefix}avatar`, u.avatar);
+					localStorage.setItem(`${prefix}level`, u.level);
+					localStorage.setItem(`${prefix}joined`, u.joined || "2026");
+					localStorage.setItem(`${prefix}downloads`, u.downloads || 0);
+					localStorage.setItem(`${prefix}wishlist`, u.wishlist || 0);
+					localStorage.setItem(`${prefix}favs`, u.favorites || 0);
+					localStorage.setItem(`${prefix}trophies`, u.trophies || 0); 
+					localStorage.setItem(`${prefix}library`, u.library || 0);
+				}
+			});
+		}
+
+		if (window.friendsList && window.friendsList.length > 0) {
+			let changed = false;
+			window.friendsList.forEach(friend => {
+				const netData = users.find(u => u.name === friend.name);
+				if (netData && netData.lastSeen !== friend.lastSeen) {
+					friend.lastSeen = netData.lastSeen;
+					changed = true;
+				}
+			});
+			if (changed) {
+				saveState(STORAGE_KEY_FRIENDS, JSON.stringify(window.friendsList));
+				const friendsView = document.getElementById('subview-friends');
+				if (friendsView && friendsView.style.display !== 'none') renderFriendsList();
 			}
+		}
+	});
+	
+	socketChat.on('global_search_results', function(results) {
+		window.globalSearchResults = results;
+		const term = document.getElementById('search-input').value;
+		if (document.getElementById('view-chat').style.display === 'block') {
+			renderFriendsList(term);
+		}
+	});
+
+	socketChat.on('message_reaction', function(data) {
+		const container = document.getElementById(`reactions-${data.msgId}`);
+		if (!container) return;
 		
-			window.messageHistory = [];
-			const box = document.getElementById('chat-messages');
-			if (box) {
-				box.innerHTML = `
-					<div style="text-align: center; margin-bottom: 15px;">
-						<span style="background: rgba(255, 204, 0, 0.1); border: 1px solid rgba(255, 204, 0, 0.2); padding: 5px 15px; border-radius: 20px; font-size: 11px; color: #ffcc00; font-weight: bold; text-transform: uppercase;">
-						Chat History Cleared by Admin
-						</span>
-					</div>`;
+		let pill = container.querySelector(`[data-emoji="${data.emoji}"]`);
+		if (pill) {
+			let users = pill.getAttribute('data-users').split(', ').filter(u => u !== "");
+			let userIndex = users.indexOf(data.user);
+			if (userIndex > -1) { users.splice(userIndex, 1); } else { users.push(data.user); }
+			
+			if (users.length <= 0) { 
+				pill.remove(); 
+			} else {
+				pill.setAttribute('data-count', users.length);
+				pill.setAttribute('data-users', users.join(', '));
+				pill.innerHTML = `${data.emoji} ${users.length}`;
+			}
+		} else {
+			container.innerHTML += `<div class="reaction-pill" data-emoji="${data.emoji}" data-count="1" data-users="${data.user}">${data.emoji} 1</div>`;
+		}
+	});
+
+	socketChat.on('chat_history', function(history) {
+		window.messageHistory = history;
+		const box = document.getElementById('chat-messages');
+		if (box) {
+			box.innerHTML = '<div style="text-align: center; margin-bottom: 15px;"><span style="background: rgba(255,255,255,0.05); padding: 5px 15px; border-radius: 20px; font-size: 11px; color: var(--text-muted); text-transform: uppercase;">Welcome to the PSN Database Global Chat</span></div>';
+			
+			const lastReadTime = parseInt(loadState('psn_last_chat_read') || 0);
+			const myName = localStorage.getItem('psn_username') || "Guest";
+			let dividerAdded = false;
+
+			history.forEach(data => {
+				trackUser(data.user);
+				const msgTime = new Date(data.time).getTime();
+				if (data.user !== myName && lastReadTime > 0 && msgTime > lastReadTime && !dividerAdded) {
+					box.insertAdjacentHTML('beforeend', `<div id="unread-divider" class="ps-new-messages-container"><div class="ps-line left"></div><span class="ps-unread-text">NEW MESSAGES</span><div class="ps-line right"></div></div>`);
+					dividerAdded = true;
+				}
+				appendMessageToChat(data, data.user === myName, data.time);
+			});
+
+			setTimeout(() => {
+				const divider = document.getElementById('unread-divider');
+				if (divider) { 
+					divider.scrollIntoView({ behavior: 'smooth', block: 'center' });
+					setupDividerAutoRemove();
+				} else { box.scrollTop = box.scrollHeight; }
+			}, 150);
+
+			if (typeof refreshChatNotificationDot === 'function') refreshChatNotificationDot();
+		}
+	});
+
+	socketChat.on('chat_message', function(data) {
+		if (!window.messageHistory) window.messageHistory = [];
+		window.messageHistory.push(data);
+		if (window.messageHistory.length > 100) window.messageHistory.shift();
+
+		const chatVisible = document.getElementById('view-chat').style.display === 'flex' || document.getElementById('view-chat').style.display === 'block';
+		const myName = localStorage.getItem('psn_username') || "Guest";
+		
+		playMessageSound();
+		if (!chatVisible && data.user !== myName) {
+			const isMention = data.text && data.text.includes(`@${myName}`);
+			const isReply = data.replyTo && data.replyTo.user === myName;
+			if (isMention || isReply || data.isGlobalPing) showChatNotification(data.user, isMention, data.isGlobalPing);
+		}
+		
+		appendMessageToChat(data, data.user === myName, data.time);
+		if (typeof refreshChatNotificationDot === 'function') refreshChatNotificationDot();
+	});
+
+	socketChat.on('message_edited', function(data) {
+		if (window.messageHistory) {
+			const msg = window.messageHistory.find(m => String(new Date(m.time).getTime()) === String(data.msgId));
+			if (msg) {
+				msg.text = data.newText;
+				msg.edited = true;
+				msg.editedByAdmin = data.editedByAdmin;
+				if (data.content) {
+					msg.type = 'image';
+					msg.content = data.content;
+				}
+			}
+		}
+		
+		const textContainer = document.getElementById(`msg-text-${data.msgId}`);
+		if (textContainer) {
+			const parent = textContainer.parentNode;
+			let formatted = data.newText.replace(/\n/g, '<br>');
+			let badge = data.editedByAdmin ? ' <span style="font-size: 9px; opacity: 0.8; color: #ff4444; font-weight: bold;">(Edited by Admin)</span>' : ' <span style="font-size: 9px; opacity: 0.5; font-style: italic;">(Edited)</span>';
+			
+			let existingImg = parent.querySelector('img');
+			if (data.content && !existingImg) {
+				const imgEl = document.createElement('img');
+				imgEl.src = data.content;
+				imgEl.style.cssText = "max-width: 100%; max-height: 250px; border-radius: 6px; cursor: zoom-in; display: block; margin: 0 auto; margin-bottom: 10px;";
+				imgEl.onclick = function() { openImageModal(this.src); };
+				parent.insertBefore(imgEl, textContainer);
 			}
 			
-			if (typeof refreshChatNotificationDot === 'function') refreshChatNotificationDot();
-		});
-	
-		socketChat.on('message_seen', function(data) {
-			const checkCont = document.getElementById(`check-${data.msgId}`);
-			if (checkCont) {
-				checkCont.querySelectorAll('i').forEach(c => { c.style.color = '#4caf50'; c.style.display = 'block'; });
-				checkCont.setAttribute('data-seen-list', data.seenBy.join(', '));
-			}
-			if (window.messageHistory) {
-				const msg = window.messageHistory.find(m => String(new Date(m.time).getTime()) === String(data.msgId));
-				if (msg) msg.seenBy = data.seenBy;
-			}
-		});
-		
-		socketChat.on('user_typing', (data) => {
-			if (typeof typingUsers !== 'undefined') {
-				typingUsers.set(data.name, data.avatar);
-				if (typeof renderTypingIndicator === 'function') renderTypingIndicator();
-			}
-		});
+			textContainer.innerHTML = formatted + badge;
+		}
+		if (typeof refreshChatNotificationDot === 'function') refreshChatNotificationDot();
+	});
 
-		socketChat.on('user_stopped_typing', (data) => {
-			if (typeof typingUsers !== 'undefined') {
-				typingUsers.delete(data.name);
-				if (typeof renderTypingIndicator === 'function') renderTypingIndicator();
-			}
-		});
+	socketChat.on('message_deleted', function(msgId) {
+		if (window.messageHistory) {
+			window.messageHistory = window.messageHistory.filter(m => String(new Date(m.time).getTime()) !== String(msgId));
+		}
+		const msgRow = document.getElementById(`msg-row-${msgId}`);
+		if (msgRow) {
+			msgRow.style.opacity = '0';
+			msgRow.style.transform = 'scale(0.8) translateX(20px)';
+			setTimeout(() => { if (msgRow.parentNode) msgRow.remove(); }, 400);
+		}
+		if (typeof refreshChatNotificationDot === 'function') refreshChatNotificationDot();
+	});
+
+	// ==========================================
+	// 2. O SEGREDO ESTÁ AQUI NO user_kicked
+	// ==========================================
+	socketChat.on('user_kicked', () => {
+		isKicked = true; // Ativa a trava!
 		
-		socketChat.on('user_data_response', (data) => {
-    		if (typeof renderFetchedList === 'function') {
-				renderFetchedList(data.targetName, data.type, data.rawData);
-			}
-		});
+		if (socketChat) socketChat.disconnect();
+		
+		// Criando a div aqui para não dar erro de JavaScript
+		const kickScreen = document.createElement('div');
+		
+		kickScreen.style.cssText = "position:fixed; top:0; left:0; width:100vw; height:100vh; background:rgba(15,0,0,0.95); z-index:999999; display:flex; flex-direction:column; align-items:center; justify-content:center; text-align:center; padding:0 20px; box-sizing:border-box; color:#ff4444; font-family:sans-serif; backdrop-filter:blur(10px); animation: fadeIn 0.3s ease-out;";
+		kickScreen.innerHTML = `
+			<i class="fas fa-user-slash" style="font-size: 60px; margin-bottom: 20px;"></i>
+			<h1 style="margin:0; font-size: 24px; text-transform: uppercase; line-height: 1.2;">Access Revoked</h1>
+			<p style="color:#aaa; margin-top:10px; font-size: 14px; line-height: 1.4; max-width: 300px;">You have been kicked from the session by an Administrator.</p>
+		`;
+		document.body.appendChild(kickScreen);
 	
-		socketChat.on('connect_error', () => {
-			if (typeof updateGlobalOnlineStatus === 'function') updateGlobalOnlineStatus('offline');
-			const s = document.getElementById('chat-status-text');
-			if (s) { s.innerText = "(Offline)"; s.style.color = "#ff4444"; }
-		});
+		setTimeout(() => {
+			window.location.href = "about:blank";
+		}, 3000);
+	});
 	
-		socketChat.on('disconnect', () => {
-			if (typeof updateGlobalOnlineStatus === 'function') updateGlobalOnlineStatus('offline');
-			const s = document.getElementById('chat-status-text');
-			if (s) { s.innerText = "(Disconnected)"; s.style.color = "#ffbb33"; }
-		});
-	}
+	socketChat.on('kick_success', function(data) {
+		const targetId = data.targetId || data; 
+		const row = document.getElementById(`user-row-${targetId}`);
+		
+		if (row) {
+			row.style.transition = 'all 0.4s cubic-bezier(0.25, 0.8, 0.25, 1)';
+			row.style.opacity = '0';
+			row.style.transform = 'translateX(50px) scale(0.9)';
+			
+			setTimeout(() => {
+				if (row.parentNode) row.remove();
+			}, 400); 
+		}
+	});
+	
+	socketChat.on('force_reload', () => {
+		if (typeof playUiSuccess === 'function') playUiSuccess();
+	
+		const reloadScreen = document.createElement('div');
+		reloadScreen.style.cssText = `
+			position: fixed; 
+			top: 0; 
+			left: 0; 
+			width: 100vw; 
+			height: 100vh; 
+			background: rgba(0, 15, 40, 0.97); 
+			z-index: 1000000; 
+			display: flex; 
+			flex-direction: column; 
+			align-items: center; 
+			justify-content: center; 
+			text-align: center; 
+			padding: 0 20px; 
+			box-sizing: border-box; 
+			color: #00bcff; 
+			font-family: sans-serif; 
+			backdrop-filter: blur(15px); 
+			animation: fadeIn 0.4s ease-out;
+		`;
+	
+		reloadScreen.innerHTML = `
+			<i class="fas fa-sync-alt fa-spin" style="font-size: 60px; margin-bottom: 25px; filter: drop-shadow(0 0 15px rgba(0, 188, 255, 0.4));"></i>
+			<h1 style="margin:0; font-size: 26px; text-transform: uppercase; letter-spacing: 2px; color: #fff;">Refreshing System</h1>
+			<p style="color: rgba(255,255,255,0.7); margin-top: 15px; font-size: 15px; line-height: 1.5; max-width: 350px;">
+				The administrator requested a session update. <br>Please wait while we refresh the database...
+			</p>
+			<div style="margin-top: 30px; width: 150px; height: 3px; background: rgba(255,255,255,0.1); border-radius: 10px; overflow: hidden;">
+				<div style="width: 100%; height: 100%; background: #00bcff; animation: psProgress 2s infinite linear;"></div>
+			</div>
+		`;
+	
+		document.body.appendChild(reloadScreen);
+	
+		setTimeout(() => {
+			window.location.reload();
+		}, 3000);
+	});
+	
+	socketChat.on('chat_cleared', () => {
+		const isChatVisible = document.getElementById('view-chat').style.display === 'block';
+		const isAdmin = !!localStorage.getItem('psn_admin_secret');
+	
+		if (isChatVisible && !isAdmin) {
+			if (typeof playUiRemove === 'function') playUiRemove();
+	
+			const cleanScreen = document.createElement('div');
+			cleanScreen.style.cssText = `
+				position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; 
+				background: rgba(20, 15, 0, 0.96); z-index: 1000000; 
+				display: flex; flex-direction: column; align-items: center; 
+				justify-content: center; text-align: center; padding: 0 20px; 
+				box-sizing: border-box; color: #ffcc00; font-family: sans-serif; 
+				backdrop-filter: blur(15px); animation: fadeIn 0.4s ease-out;
+			`;
+	
+			cleanScreen.innerHTML = `
+				<div style="position: relative; margin-bottom: 25px;">
+					<i class="fas fa-broom" style="font-size: 60px; filter: drop-shadow(0 0 15px rgba(255, 204, 0, 0.5)); animation: sweepAction 1.5s infinite ease-in-out;"></i>
+				</div>
+				<h1 style="margin:0; font-size: 26px; text-transform: uppercase; letter-spacing: 2px; color: #fff;">History Purged</h1>
+				<p style="color: rgba(255,255,255,0.7); margin-top: 15px; font-size: 15px; line-height: 1.5; max-width: 350px;">
+					An administrator has performed a deep cleanup.
+				</p>
+			`;
+	
+			document.body.appendChild(cleanScreen);
+	
+			setTimeout(() => {
+				cleanScreen.style.transition = "opacity 0.6s ease-out";
+				cleanScreen.style.opacity = "0";
+				setTimeout(() => cleanScreen.remove(), 600);
+			}, 3000);
+		}
+	
+		window.messageHistory = [];
+		const box = document.getElementById('chat-messages');
+		if (box) {
+			box.innerHTML = `
+				<div style="text-align: center; margin-bottom: 15px;">
+					<span style="background: rgba(255, 204, 0, 0.1); border: 1px solid rgba(255, 204, 0, 0.2); padding: 5px 15px; border-radius: 20px; font-size: 11px; color: #ffcc00; font-weight: bold; text-transform: uppercase;">
+					Chat History Cleared by Admin
+					</span>
+				</div>`;
+		}
+		
+		if (typeof refreshChatNotificationDot === 'function') refreshChatNotificationDot();
+	});
+
+	socketChat.on('message_seen', function(data) {
+		const checkCont = document.getElementById(`check-${data.msgId}`);
+		if (checkCont) {
+			checkCont.querySelectorAll('i').forEach(c => { c.style.color = '#4caf50'; c.style.display = 'block'; });
+			checkCont.setAttribute('data-seen-list', data.seenBy.join(', '));
+		}
+		if (window.messageHistory) {
+			const msg = window.messageHistory.find(m => String(new Date(m.time).getTime()) === String(data.msgId));
+			if (msg) msg.seenBy = data.seenBy;
+		}
+	});
+	
+	socketChat.on('user_typing', (data) => {
+		if (typeof typingUsers !== 'undefined') {
+			typingUsers.set(data.name, data.avatar);
+			if (typeof renderTypingIndicator === 'function') renderTypingIndicator();
+		}
+	});
+
+	socketChat.on('user_stopped_typing', (data) => {
+		if (typeof typingUsers !== 'undefined') {
+			typingUsers.delete(data.name);
+			if (typeof renderTypingIndicator === 'function') renderTypingIndicator();
+		}
+	});
+	
+	socketChat.on('user_data_response', (data) => {
+		if (typeof renderFetchedList === 'function') {
+			renderFetchedList(data.targetName, data.type, data.rawData);
+		}
+	});
+
+	// ==========================================
+	// 3. TRAVA NO CONNECT_ERROR E DISCONNECT
+	// ==========================================
+	socketChat.on('connect_error', () => {
+		if (isKicked) return; // Ignora se foi expulso
+		
+		if (typeof updateGlobalOnlineStatus === 'function') updateGlobalOnlineStatus('offline');
+		const s = document.getElementById('chat-status-text');
+		if (s) { s.innerText = "(Offline)"; s.style.color = "#ff4444"; }
+	});
+
+	socketChat.on('disconnect', () => {
+		if (isKicked) return; // Ignora se foi expulso (aqui que o problema morava!)
+		
+		if (typeof updateGlobalOnlineStatus === 'function') updateGlobalOnlineStatus('offline');
+		const s = document.getElementById('chat-status-text');
+		if (s) { s.innerText = "(Disconnected)"; s.style.color = "#ffbb33"; }
+	});
+}
 
 	window.refreshChatNotificationDot = function() {
 		const chatView = document.getElementById('view-chat');
