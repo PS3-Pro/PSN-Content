@@ -92,23 +92,15 @@ io.on('connection', (socket) => {
     try {
         const { name, password, userData, isNewAccount } = data;
         
-        // BUSCA DIRETO NO BANCO PARA EVITAR ERRO DE MEMÓRIA VAZIA
         const dbRes = await pool.query('SELECT data FROM users WHERE name = $1', [name]);
         const dbUser = dbRes.rows.length > 0 ? dbRes.rows[0].data : null;
 
         if (dbUser) {
-            // Se o usuário existe e tentou criar conta nova com o mesmo ID
-            if (isNewAccount) {
-                socket.emit('auth_error', 'This Online ID is already taken. Try logging in.');
-                return;
-            }
-
             if (!dbUser.passwordHash) {
                 socket.emit('auth_error', 'Legacy account detected! Please recreate your ID.');
                 return;
             }
 
-            // Validação de senha
             const match = await bcrypt.compare(password, dbUser.passwordHash);
             
             if (match) {
@@ -127,10 +119,13 @@ io.on('connection', (socket) => {
                 socket.emit('auth_success', { name, userData: userDatabase[name] });
                 io.emit('online_list', getSanitizedOnlineList());
             } else {
-                socket.emit('auth_error', 'Incorrect password. Access denied.');
+                if (isNewAccount) {
+                    socket.emit('auth_error', 'This Online ID is already taken. Please choose another one.\n\nIf you are trying to login with an existing user, the password is incorrect.');
+                } else {
+                    socket.emit('auth_error', 'Incorrect password. Access denied.');
+                }
             }
         } else {
-            // CRIAÇÃO DE CONTA NOVA
             const hash = await bcrypt.hash(password, 10);
             socket.userName = name;
             userDatabase[name] = {
