@@ -12,6 +12,8 @@ const APP_URL = "https://psn-content-8o6c.onrender.com/ping";
 const ADMIN_USERS = ["Luan Teles", "Goku Cheats", "Admin"];
 const ADMIN_SECRET = process.env.ADMIN_SECRET || "ADMINENABLED";
 
+const DEFAULT_AVATAR = "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/interface/modern/images/avatars/default.png";
+
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false }
@@ -62,7 +64,7 @@ function getSanitizedOnlineList() {
     return Object.entries(userDatabase).map(([username, u]) => ({
         id: u.id,
         name: username, 
-        avatar: u.avatar || 'default_avatar.png', 
+        avatar: u.avatar || DEFAULT_AVATAR,
         level: u.level || 1,
         joined: u.joined || '2026',
         online: u.online,
@@ -119,7 +121,7 @@ io.on('connection', (socket) => {
                 }
             }
         } else {
-           const hash = await bcrypt.hash(password, 10);
+            const hash = await bcrypt.hash(password, 10);
             socket.userName = name;
             userDatabase[name] = {
                 ...userData,
@@ -128,7 +130,7 @@ io.on('connection', (socket) => {
                 id: socket.id,
                 online: true,
                 lastSeen: Date.now(),
-                avatar: userData.avatar || 'default_avatar.png',
+                avatar: userData.avatar || DEFAULT_AVATAR,
                 joined: userData.joined || '2026',
                 trophiesData: userData.trophiesData || {},
                 wishlistData: userData.wishlistData || [],
@@ -148,7 +150,7 @@ io.on('connection', (socket) => {
         }
     } catch (error) {
         console.error("[AUTH ERROR]:", error);
-        socket.emit('auth_error', 'Server Error: Something went wrong.');
+        socket.emit('auth_error', 'Server Error.');
     }
   });
 
@@ -205,12 +207,10 @@ io.on('connection', (socket) => {
     callback({ success: false, message: "Invalid code." });
   });
 
-   socket.on('chat_message', async (msg) => {
+  socket.on('chat_message', async (msg) => {
     let messageData = { ...(typeof msg === 'object' ? msg : { text: msg }), time: new Date().toISOString(), seenBy: [] };
     const isAdmin = ADMIN_USERS.includes(messageData.user) && messageData.secret === ADMIN_SECRET;
-    
     if (messageData.text === '/reload' && isAdmin) return socket.broadcast.emit('force_reload');
-    
     delete messageData.secret;
     messageHistory.push(messageData);
     if (messageHistory.length > 100) messageHistory.shift();
@@ -281,7 +281,7 @@ io.on('connection', (socket) => {
     }
   });
 
-  socket.on('kick_user', (data) => {
+	socket.on('kick_user', (data) => {
     if (ADMIN_USERS.includes(data.adminUser) && data.secret === ADMIN_SECRET) {
         const targetSocket = io.sockets.sockets.get(data.targetId);
         if (targetSocket) {
