@@ -90,10 +90,14 @@ io.on('connection', (socket) => {
 
   socket.on('authenticate_user', async (data) => {
     try {
-        const { name, password, userData, isNewAccount } = data;
+        const { name, password, userData, isNewAccount, adminSecret } = data;
         
         const dbRes = await pool.query('SELECT data FROM users WHERE name = $1', [name]);
         const dbUser = dbRes.rows.length > 0 ? dbRes.rows[0].data : null;
+
+        const checkIsAdmin = (userName, secret) => {
+            return ADMIN_USERS.includes(userName) && secret === ADMIN_SECRET;
+        };
 
         if (dbUser) {
             if (!dbUser.passwordHash) {
@@ -116,11 +120,19 @@ io.on('connection', (socket) => {
                 await pool.query('UPDATE users SET data = $1 WHERE name = $2', [userDatabase[name], name]);
                 
                 console.log(`[NETWORK] ${name} logou.`);
-                socket.emit('auth_success', { name, userData: userDatabase[name] });
+
+                const isAdmin = checkIsAdmin(name, adminSecret);
+
+                socket.emit('auth_success', { 
+                    name, 
+                    userData: userDatabase[name],
+                    isAdmin: isAdmin 
+                });
+
                 io.emit('online_list', getSanitizedOnlineList());
             } else {
                 if (isNewAccount) {
-                    socket.emit('auth_error', 'This Online ID is already taken. Please choose another one.\n\nIf you are trying to login with an existing user, the password is incorrect.');
+                    socket.emit('auth_error', 'This Online ID is already taken...');
                 } else {
                     socket.emit('auth_error', 'Incorrect password. Access denied.');
                 }
@@ -150,14 +162,22 @@ io.on('connection', (socket) => {
             );
             
             console.log(`[NETWORK] ${name} criou uma conta nova.`);
-            socket.emit('auth_success', { name, userData: userDatabase[name] });
+
+            const isAdmin = checkIsAdmin(name, adminSecret);
+
+            socket.emit('auth_success', { 
+                name, 
+                userData: userDatabase[name],
+                isAdmin: isAdmin 
+            });
+
             io.emit('online_list', getSanitizedOnlineList());
         }
     } catch (error) {
         console.error("[AUTH ERROR]:", error);
         socket.emit('auth_error', 'Server Error: Auth failed.');
     }
-  });
+});
 
   socket.on('update_profile', async (userData) => {
     const name = socket.userName;
