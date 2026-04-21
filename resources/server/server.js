@@ -85,99 +85,101 @@ const io = new Server(server, {
 
 io.on('connection', (socket) => {
   console.log('[NETWORK] Socket conectado. ID: ' + socket.id);
-  
-  socket.emit('chat_history', messageHistory);
 
   socket.on('authenticate_user', async (data) => {
     try {
-        const { name, password, userData, isNewAccount, adminSecret } = data;
-        
-        const dbRes = await pool.query('SELECT data FROM users WHERE name = $1', [name]);
-        const dbUser = dbRes.rows.length > 0 ? dbRes.rows[0].data : null;
+      const { name, password, userData, isNewAccount, adminSecret } = data;
+      
+      const dbRes = await pool.query('SELECT data FROM users WHERE name = $1', [name]);
+      const dbUser = dbRes.rows.length > 0 ? dbRes.rows[0].data : null;
 
-        const checkIsAdmin = (userName, secret) => {
-            return ADMIN_USERS.includes(userName) && secret === ADMIN_SECRET;
+      const checkIsAdmin = (userName, secret) => {
+        return ADMIN_USERS.includes(userName) && secret === ADMIN_SECRET;
+      };
+
+      if (dbUser) {
+        if (!dbUser.passwordHash) {
+          socket.emit('auth_error', 'Legacy account detected! Please recreate your ID.');
+          return;
+        }
+
+        const match = await bcrypt.compare(password, dbUser.passwordHash);
+        
+        if (match) {
+          socket.userName = name;
+          userDatabase[name] = {
+            ...dbUser,
+            online: true,
+            id: socket.id,
+            lastSeen: Date.now(),
+            name: name
+          };
+          
+          await pool.query('UPDATE users SET data = $1 WHERE name = $2', [userDatabase[name], name]);
+          
+          console.log(`[NETWORK] ${name} logou.`);
+
+          const isAdmin = checkIsAdmin(name, adminSecret);
+
+          socket.emit('auth_success', { 
+            name, 
+            userData: userDatabase[name],
+            isAdmin: isAdmin 
+          });
+
+          socket.emit('chat_history', messageHistory);
+
+          io.emit('online_list', getSanitizedOnlineList());
+        } else {
+          if (isNewAccount) {
+            socket.emit('auth_error', 'This Online ID is already taken...');
+          } else {
+            socket.emit('auth_error', 'Incorrect password. Access denied.');
+          }
+        }
+      } else {
+        const hash = await bcrypt.hash(password, 10);
+        socket.userName = name;
+        userDatabase[name] = {
+          ...userData,
+          name: name,
+          passwordHash: hash,
+          id: socket.id,
+          online: true,
+          lastSeen: Date.now(),
+          avatar: userData.avatar || DEFAULT_AVATAR,
+          joined: userData.joined || '2026',
+          trophiesData: userData.trophiesData || {},
+          wishlistData: userData.wishlistData || [],
+          favoritesData: userData.favoritesData || [],
+          downloadsData: userData.downloadsData || [],
+          libraryData: userData.libraryData || []
         };
 
-        if (dbUser) {
-            if (!dbUser.passwordHash) {
-                socket.emit('auth_error', 'Legacy account detected! Please recreate your ID.');
-                return;
-            }
+        await pool.query(
+          'INSERT INTO users (name, data) VALUES ($1, $2)',
+          [name, userDatabase[name]]
+        );
+        
+        console.log(`[NETWORK] ${name} criou uma conta nova.`);
 
-            const match = await bcrypt.compare(password, dbUser.passwordHash);
-            
-            if (match) {
-                socket.userName = name;
-                userDatabase[name] = {
-                    ...dbUser,
-                    online: true,
-                    id: socket.id,
-                    lastSeen: Date.now(),
-                    name: name
-                };
-                
-                await pool.query('UPDATE users SET data = $1 WHERE name = $2', [userDatabase[name], name]);
-                
-                console.log(`[NETWORK] ${name} logou.`);
+        const isAdmin = checkIsAdmin(name, adminSecret);
 
-                const isAdmin = checkIsAdmin(name, adminSecret);
+        socket.emit('auth_success', { 
+          name, 
+          userData: userDatabase[name],
+          isAdmin: isAdmin 
+        });
 
-                socket.emit('auth_success', { 
-                    name, 
-                    userData: userDatabase[name],
-                    isAdmin: isAdmin 
-                });
+        socket.emit('chat_history', messageHistory);
 
-                io.emit('online_list', getSanitizedOnlineList());
-            } else {
-                if (isNewAccount) {
-                    socket.emit('auth_error', 'This Online ID is already taken...');
-                } else {
-                    socket.emit('auth_error', 'Incorrect password. Access denied.');
-                }
-            }
-        } else {
-            const hash = await bcrypt.hash(password, 10);
-            socket.userName = name;
-            userDatabase[name] = {
-                ...userData,
-                name: name,
-                passwordHash: hash,
-                id: socket.id,
-                online: true,
-                lastSeen: Date.now(),
-                avatar: userData.avatar || DEFAULT_AVATAR,
-                joined: userData.joined || '2026',
-                trophiesData: userData.trophiesData || {},
-                wishlistData: userData.wishlistData || [],
-                favoritesData: userData.favoritesData || [],
-                downloadsData: userData.downloadsData || [],
-                libraryData: userData.libraryData || []
-            };
-
-            await pool.query(
-                'INSERT INTO users (name, data) VALUES ($1, $2)',
-                [name, userDatabase[name]]
-            );
-            
-            console.log(`[NETWORK] ${name} criou uma conta nova.`);
-
-            const isAdmin = checkIsAdmin(name, adminSecret);
-
-            socket.emit('auth_success', { 
-                name, 
-                userData: userDatabase[name],
-                isAdmin: isAdmin 
-            });
-
-            io.emit('online_list', getSanitizedOnlineList());
-        }
+        io.emit('online_list', getSanitizedOnlineList());
+      }
     } catch (error) {
-        console.error("[AUTH ERROR]:", error);
-        socket.emit('auth_error', 'Server Error: Auth failed.');
+      console.error("[AUTH ERROR]:", error);
+      socket.emit('auth_error', 'Server Error: Auth failed.');
     }
-});
+  });
 
   socket.on('update_profile', async (userData) => {
     const name = socket.userName;
