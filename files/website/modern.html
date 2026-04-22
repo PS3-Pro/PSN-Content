@@ -752,8 +752,12 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 @keyframes btn-shine { 100% { left: 150%; } }
 
 /* === PAGE ENTRANCE (FADE-IN UP) === */
-@keyframes view-enter { 0% { opacity: 0; transform: translateY(15px) scale(0.99); filter: blur(4px); } 100% { opacity: 1; transform: translateY(0) scale(1); filter: blur(0px); } }
+/* === PAGE ENTRANCE (FADE-IN UP & EXCEPTIONS) === */
+@keyframes view-enter { 0% { opacity: 0; transform: scale(0.99); filter: blur(4px); } 100% { opacity: 1; transform: scale(1); filter: blur(0px); } }
 .anim-up { animation: view-enter 0.4s cubic-bezier(0.2, 0.8, 0.2, 1) forwards !important; }
+
+@keyframes explore-view-enter { 0% { opacity: 0; transform: translateY(15px) scale(0.99); filter: blur(4px); } 100% { opacity: 1; transform: translateY(0) scale(1); filter: blur(0px); } }
+#view-explore.anim-up { animation: explore-view-enter 0.4s cubic-bezier(0.2, 0.8, 0.2, 1) forwards !important; }
 
 /* === AVATAR BREATHE (PULSE) === */
 //@keyframes avatar-breathe { 0%, 100% { box-shadow: 0 0 5px 0px rgba(255, 255, 255, 0.1); transform: scale(1); } 50% { box-shadow: 0 0 15px 2px rgba(255, 255, 255, 0.3); transform: scale(1); } }
@@ -2541,18 +2545,29 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 			console.log("Remembered user! Logging in automatically...");
 			
 			const btnLogin = document.getElementById('btn-login-profile');
+			
+			if (btnLogin && btnLogin.classList.contains('is-loading')) return; 
+	
 			if (btnLogin) {
+				btnLogin.classList.add('is-loading');
 				btnLogin.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Loading...';
 				btnLogin.style.pointerEvents = 'none';
 			}
 	
-			if (typeof socketChat !== 'undefined' && socketChat && socketChat.connected) {
-				socketChat.emit('authenticate_user', {
-					name: username,
-					password: savedPass,
-					isNewAccount: false
-				});
-			}
+			const tryLogin = () => {
+				if (typeof socketChat !== 'undefined' && socketChat && socketChat.connected) {
+					socketChat.emit('authenticate_user', {
+						name: username,
+						password: savedPass,
+						isNewAccount: false
+					});
+				} else {
+					console.log("Waiting connection...");
+					setTimeout(tryLogin, 300);
+				}
+			};
+			
+			tryLogin();
 			return;
 		}
 	
@@ -3485,6 +3500,12 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 	};
     
 	window.switchTab = function(tab) {
+		const navItem = document.getElementById(`top-nav-${tab}`);
+		if (navItem && navItem.classList.contains('active')) return;
+		
+		const profileBtn = document.querySelector(`.profile-item[onclick*="${tab}"]`);
+		if (profileBtn && profileBtn.classList.contains('active')) return;
+
 		document.querySelectorAll('.top-nav a').forEach(a => a.classList.remove('active'));
 		
 		const groups = {
@@ -3558,6 +3579,15 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 	window.showSocialSection = function(section) {
 		const chatView = document.getElementById('subview-chat');
 		const friendsView = document.getElementById('subview-friends');
+		
+		const parentView = document.getElementById('view-chat');
+		const isParentVisible = parentView && (parentView.style.display === 'block' || parentView.style.display === 'flex');
+	
+		if (isParentVisible) {
+			if (section === 'chat' && chatView && chatView.style.display === 'flex') return;
+			if (section === 'friends' && friendsView && friendsView.style.display === 'flex') return;
+		}
+
 		const btnChat = document.getElementById('nav-chat-global');
 		const btnFriends = document.getElementById('nav-chat-friends');
 		
@@ -5141,8 +5171,10 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 			const mainViews = ['view-explore', 'view-browse', 'view-wishlist', 'view-downloads', 'view-library'];
 			const profileUtils = ['view-chat', 'view-trophies'];
 			const systemUtils = ['view-settings', 'view-guides'];
-		
+
 			const currentView = document.querySelector('.view-section[style*="display: block"]');
+			if (!forceReset && currentView && currentView.id === viewId) return;
+			
 			const searchBar = document.querySelector('.search-bar');
 			const searchInput = document.getElementById('search-input');
 			const libToolbar = document.getElementById('library-toolbar');
@@ -5998,6 +6030,7 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
     // PROFILE DROPDOWN MENU
     // =========================================================
     function switchUser() {
+		window.isBooting = false;
 		closeDropdownMenu();
 		const sidebar = document.querySelector('.sidebar');
 		const overlay = document.querySelector('.sidebar-overlay');
@@ -6076,6 +6109,7 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 
 	function logOut() {
 		if (confirm("Are you sure you want to log out?")) {
+			window.isBooting = false;
 			if (typeof playUiLogout === 'function') playUiLogout();
 			
 			if (typeof socketChat !== 'undefined' && socketChat) {
@@ -6903,20 +6937,28 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 		const searchBar = searchInput ? searchInput.closest('.search-bar') : null;
 	
 		[navFiles, navGames, navFavs].forEach(el => el?.classList.remove('active'));
-		[gamesView, filesView, favsView].forEach(el => el.style.display = 'none');
+		
+		[gamesView, filesView, favsView].forEach(el => {
+			if (el) {
+				el.style.display = 'none';
+				el.classList.remove('anim-up'); 
+			}
+		});
 	
 		if (searchInput && searchInput.value !== "") {
 			searchInput.value = "";
 		}
 	
+		let targetView = null;
+
 		if (type === 'files') {
-			filesView.style.display = 'block';
+			targetView = filesView;
 			navFiles?.classList.add('active');
 			if (searchBar) searchBar.style.display = 'none';
 			explorePath(currentPath || '/');
 		}
 		else if (type === 'favorites') {
-			favsView.style.display = 'block';
+			targetView = favsView;
 			navFavs?.classList.add('active');
 			if (searchBar) searchBar.style.display = 'none';
 			updateFavoritesLibraryUI();
@@ -6924,11 +6966,21 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 			saveState('psn_fav_dot', 'false');
 		}
 		else {
-			gamesView.style.display = 'block';
+			targetView = gamesView;
 			navGames?.classList.add('active');
 			if (searchBar) searchBar.style.display = 'flex';
 			applyLibraryFilters();
 			refreshPS3Library();
+		}
+
+		if (targetView) {
+			targetView.style.display = 'block';
+			void targetView.offsetWidth;
+			targetView.classList.add('anim-up');
+		}
+
+		if (typeof updateSidebarLight === 'function') {
+			setTimeout(updateSidebarLight, 50);
 		}
 	}
 	
@@ -8595,7 +8647,10 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 			}, 2000);
 		
 			const bootContainer = document.getElementById('ps5-boot-container');
-			if (bootContainer && bootContainer.style.display !== 'none') {
+			
+			if (bootContainer && bootContainer.style.display !== 'none' && !window.isBooting) {
+				window.isBooting = true;
+				
 				const nameOverlay = document.getElementById('name-input-overlay');
 				const loginOverlay = document.getElementById('login-input-overlay');
 				if (nameOverlay) nameOverlay.style.display = 'none';
@@ -8607,7 +8662,7 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 				finishBoot(name); 
 			}
 		});
-	
+		
 		socketChat.on('auth_error', (msg) => {
 			if (typeof playUiError === 'function') playUiError();
 			alert(msg);
