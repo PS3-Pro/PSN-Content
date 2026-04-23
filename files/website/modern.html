@@ -4943,19 +4943,19 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
     
     const RAWG_API_KEY = '01de0a7d61dd4b52a5247d9e8f74288e'; 
 
-    window.fetchGameSummary = async function(gameName, gameId) {
+   window.fetchGameSummary = async function(gameName, gameId) {
     const summaryContainer = document.getElementById('modal-summary');
     const screenshotsContainer = document.getElementById('modal-screenshots');
     
     summaryContainer.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Fetching details...';
     if (screenshotsContainer) screenshotsContainer.innerHTML = ''; 
 
+    // Pega o nome base pra busca inteligente
     let baseName = gameName.split(/[-:]/)[0].trim();
     const searchQueries = [...new Set([gameName, baseName, gameId])].filter(q => q);
-    
     let extraInfoHtml = '';
 
-    // 1. BUSCA FOTOS E METACRITIC NA RAWG
+    // 1. TENTA NA RAWG (DIRETO)
     for (let query of searchQueries) {
         try {
             const searchUrl = `https://api.rawg.io/api/games?key=${RAWG_API_KEY}&search=${encodeURIComponent(query)}&page_size=1`;
@@ -4967,17 +4967,14 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
             if (searchData.results && searchData.results.length > 0) {
                 const gameSlug = searchData.results[0].slug;
                 
-                // Busca Detalhes (Metacritic/Lançamento)
                 const detailsUrl = `https://api.rawg.io/api/games/${gameSlug}?key=${RAWG_API_KEY}`;
                 const detailsRes = await fetch(detailsUrl);
                 const detailsData = detailsRes.ok ? await detailsRes.json() : {};
 
-                // Busca Screenshots
                 const screensUrl = `https://api.rawg.io/api/games/${gameSlug}/screenshots?key=${RAWG_API_KEY}`;
                 const screensRes = await fetch(screensUrl);
                 const screensData = screensRes.ok ? await screensRes.json() : {};
 
-                // APLICA AS SCREENSHOTS NA TELA (Mesmo se não tiver texto)
                 if (screenshotsContainer && screensData.results && screensData.results.length > 0) {
                     let galleryHtml = '';
                     screensData.results.slice(0, 5).forEach(img => {
@@ -4986,7 +4983,6 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
                     screenshotsContainer.innerHTML = galleryHtml;
                 }
 
-                // GUARDA OS SELOS (Metacritic / Data)
                 if (detailsData.metacritic || detailsData.released) {
                     extraInfoHtml = `<div style="margin-top: 15px; font-size: 12px; color: var(--ps-blue); display: flex; gap: 15px; align-items: center;">`;
                     if (detailsData.metacritic) extraInfoHtml += `<span style="border: 1px solid var(--ps-blue); padding: 2px 6px; border-radius: 4px;">Metacritic: <b style="color: #fff;">${detailsData.metacritic}</b></span>`;
@@ -4994,22 +4990,22 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
                     extraInfoHtml += `</div>`;
                 }
 
-                // APLICA A DESCRIÇÃO SE EXISTIR NA RAWG
                 if (detailsData.description_raw && detailsData.description_raw.trim() !== '') {
+                    // O ESPIÃO DA RAWG AQUI!
+                    console.log(`%c[Origem] Texto carregado da RAWG! 🎮`, `color: #00ff00; font-weight: bold;`);
+                    
                     let textoFormatado = detailsData.description_raw.trim().replace(/\n+/g, '<br><br>');
                     summaryContainer.innerHTML = textoFormatado + extraInfoHtml;
-                    return; // Achou tudo com sucesso, pode parar!
+                    return; 
                 }
-                
-                // Se achou o jogo mas não tinha texto, quebra o loop pra ir buscar texto na Wiki
                 break; 
             }
         } catch (error) {
-            console.error(`RAWG attempt failed for "${query}":`, error);
+            console.log(`[RAWG] Falha ao buscar "${query}". Tentando próximo...`);
         }
     }
 
-    // 2. FALLBACK DA WIKIPEDIA (Se a RAWG não achou o texto)
+    // 2. FALLBACK DA WIKIPEDIA
     try {
         summaryContainer.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Fetching lore from archives...';
         
@@ -5028,8 +5024,10 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
             const page = extractData.query.pages[pageId];
 
             if (page && page.extract) {
+                // O ESPIÃO DA WIKIPEDIA AQUI!
+                console.log(`%c[Origem] RAWG falhou. Texto carregado da WIKIPEDIA! 📚`, `color: #ffaa00; font-weight: bold;`);
+                
                 let textoFormatado = page.extract.trim().replace(/\n+/g, '<br><br>');
-                // Coloca o texto da Wiki + os selos de Metacritic que pegamos na RAWG
                 summaryContainer.innerHTML = textoFormatado + extraInfoHtml;
                 return;
             }
@@ -5038,7 +5036,6 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
         console.error("Wikipedia fallback also failed:", error);
     }
 
-    // 3. SE NADA DEU CERTO
     summaryContainer.innerHTML = "Summary not available for this title." + extraInfoHtml;
 };
 
