@@ -5633,16 +5633,34 @@
 	}, true);
 	</script>
 	<script>
+	var RAWG_KEYS = [
+		'666e45b739d5401f84ea3595f64f6b0d',
+		'092c6f79440d4fdfb1eaae48983e6210',
+		'01de0a7d61dd4b52a5247d9e8f74288e',
+		'9066e0788ec94a74880e6ebe07c2ef38',
+		'e31615be130d4337b57d39457daeae0c',
+		'1ea9bbaa98944b0ea3c15ecbfe839322',
+		'016b8133614a4dc988df84106a054ed4',
+	];
+
 	function fetchGameSummary(gameName, gameId) {
 		var summaryContainer = document.getElementById('modal-summary');
 		if (!summaryContainer) return;
 	
 		summaryContainer.innerHTML = 'Fetching summary...';
-	
 		var cleanQuery = gameName.replace(/^\s+|\s+$/g, '');
-		var rawgKey = 'e31615be130d4337b57d39457daeae0c';
-		
-		var rawgSearchUrl = 'https://api.rawg.io/api/games?key=' + rawgKey + '&search=' + encodeURIComponent(cleanQuery) + '&page_size=1';
+		attemptRawgSearch(cleanQuery, 0);
+	}
+	
+	function attemptRawgSearch(cleanQuery, keyIndex) {
+		// Se já testou todas as chaves e falhou, tenta a Wikipedia
+		if (keyIndex >= RAWG_KEYS.length) {
+			fetchWikipediaSummary(cleanQuery);
+			return;
+		}
+
+		var currentKey = RAWG_KEYS[keyIndex];
+		var rawgSearchUrl = 'https://api.rawg.io/api/games?key=' + currentKey + '&search=' + encodeURIComponent(cleanQuery) + '&page_size=1';
 	
 		var xhr = new XMLHttpRequest();
 		xhr.open('GET', rawgSearchUrl, true);
@@ -5652,10 +5670,14 @@
 					var data = JSON.parse(xhr.responseText);
 					if (data.results && data.results.length > 0) {
 						var slug = data.results[0].slug;
-						fetchRawgDetails(slug, rawgKey, cleanQuery);
+						// Passa o index da chave que funcionou para a próxima etapa
+						fetchRawgDetails(slug, cleanQuery, keyIndex);
 					} else {
 						fetchWikipediaSummary(cleanQuery);
 					}
+				} else if (xhr.status === 401 || xhr.status === 403 || xhr.status === 429) {
+					// 401/403/429 = Erro de autenticação ou limite excedido. Tenta a próxima chave!
+					attemptRawgSearch(cleanQuery, keyIndex + 1);
 				} else {
 					fetchWikipediaSummary(cleanQuery);
 				}
@@ -5664,8 +5686,15 @@
 		xhr.send();
 	}
 	
-	function fetchRawgDetails(slug, key, originalName) {
-		var detailsUrl = 'https://api.rawg.io/api/games/' + slug + '?key=' + key;
+	function fetchRawgDetails(slug, originalName, keyIndex) {
+		if (keyIndex >= RAWG_KEYS.length) {
+			fetchWikipediaSummary(originalName);
+			return;
+		}
+
+		var currentKey = RAWG_KEYS[keyIndex];
+		var detailsUrl = 'https://api.rawg.io/api/games/' + slug + '?key=' + currentKey;
+		
 		var xhr = new XMLHttpRequest();
 		xhr.open('GET', detailsUrl, true);
 		xhr.onreadystatechange = function() {
@@ -5678,6 +5707,9 @@
 					} else {
 						fetchWikipediaSummary(originalName);
 					}
+				} else if (xhr.status === 401 || xhr.status === 403 || xhr.status === 429) {
+					// Se a chave esgotar bem no meio dessa segunda requisição, rotaciona também
+					fetchRawgDetails(slug, originalName, keyIndex + 1);
 				} else {
 					fetchWikipediaSummary(originalName);
 				}
