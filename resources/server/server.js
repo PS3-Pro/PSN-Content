@@ -234,15 +234,19 @@ io.on('connection', (socket) => {
   });
 
   socket.on('chat_message', async (msg) => {
-    let messageData = { ...(typeof msg === 'object' ? msg : { text: msg }), time: new Date().toISOString(), seenBy: [] };
-    const isAdmin = ADMIN_USERS.includes(messageData.user) && messageData.secret === ADMIN_SECRET;
+    let messageData = { ...(typeof msg === 'object' ? msg : { text: msg }), time: new Date().toISOString(), seenBy: [] };
+    const isAdmin = ADMIN_USERS.includes(messageData.user) && messageData.secret === ADMIN_SECRET;
+    
     if (messageData.text === '/reload' && isAdmin) return socket.broadcast.emit('force_reload');
-    delete messageData.secret;
-    messageHistory.push(messageData);
-    if (messageHistory.length > 100) messageHistory.shift();
-    await pool.query('INSERT INTO chat (message) VALUES ($1)', [messageData]);
-    io.emit('chat_message', messageData); 
-  });
+    delete messageData.secret;
+
+    messageData.isAdmin = isAdmin;
+
+    messageHistory.push(messageData);
+    if (messageHistory.length > 100) messageHistory.shift();
+    await pool.query('INSERT INTO chat (message) VALUES ($1)', [messageData]);
+    io.emit('chat_message', messageData); 
+  });
 
   socket.on('message_reaction', async (data) => {
     const msg = messageHistory.find(m => String(new Date(m.time).getTime()) === String(data.msgId));
