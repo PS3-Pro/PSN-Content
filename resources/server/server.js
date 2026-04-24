@@ -107,6 +107,9 @@ io.on('connection', (socket) => {
         
         if (match) {
           socket.userName = name;
+          const isAdmin = checkIsAdmin(name, adminSecret);
+          socket.isAdmin = isAdmin;
+
           userDatabase[name] = {
             ...dbUser,
             online: true,
@@ -117,9 +120,7 @@ io.on('connection', (socket) => {
           
           await pool.query('UPDATE users SET data = $1 WHERE name = $2', [userDatabase[name], name]);
           
-          console.log(`[NETWORK] ${name} logou.`);
-
-          const isAdmin = checkIsAdmin(name, adminSecret);
+          console.log(`[NETWORK] ${name} logged in. Admin: ${isAdmin}`);
 
           socket.emit('auth_success', { 
             name, 
@@ -140,6 +141,9 @@ io.on('connection', (socket) => {
       } else {
         const hash = await bcrypt.hash(password, 10);
         socket.userName = name;
+        const isAdmin = checkIsAdmin(name, adminSecret);
+        socket.isAdmin = isAdmin;
+
         userDatabase[name] = {
           ...userData,
           name: name,
@@ -161,9 +165,7 @@ io.on('connection', (socket) => {
           [name, userDatabase[name]]
         );
         
-        console.log(`[NETWORK] ${name} criou uma conta nova.`);
-
-        const isAdmin = checkIsAdmin(name, adminSecret);
+        console.log(`[NETWORK] ${name} criou uma conta nova. Admin: ${isAdmin}`);
 
         socket.emit('auth_success', { 
           name, 
@@ -225,6 +227,7 @@ io.on('connection', (socket) => {
     if (cleanCode === ADMIN_SECRET.toUpperCase()) {
         const isNameValid = user && ADMIN_USERS.some(admin => admin.toLowerCase() === user.toLowerCase());
         if (isNameValid) {
+            socket.isAdmin = true;
             return callback({ success: true, type: 'ADMIN_LOGIN', secret: ADMIN_SECRET });
         } else {
             return callback({ success: false, message: "Code valid, but your ID is not Admin." });
@@ -234,19 +237,19 @@ io.on('connection', (socket) => {
   });
 
   socket.on('chat_message', async (msg) => {
-    let messageData = { ...(typeof msg === 'object' ? msg : { text: msg }), time: new Date().toISOString(), seenBy: [] };
-    const isAdmin = ADMIN_USERS.includes(messageData.user) && messageData.secret === ADMIN_SECRET;
-    
+    let messageData = { ...(typeof msg === 'object' ? msg : { text: msg }), time: new Date().toISOString(), seenBy: [] };
+    const isAdmin = socket.isAdmin === true;
+    
     if (messageData.text === '/reload' && isAdmin) return socket.broadcast.emit('force_reload');
-    delete messageData.secret;
-
+    
     messageData.isAdmin = isAdmin;
-
-    messageHistory.push(messageData);
-    if (messageHistory.length > 100) messageHistory.shift();
-    await pool.query('INSERT INTO chat (message) VALUES ($1)', [messageData]);
-    io.emit('chat_message', messageData); 
-  });
+    messageData.user = socket.userName || messageData.user;
+    
+    messageHistory.push(messageData);
+    if (messageHistory.length > 100) messageHistory.shift();
+    await pool.query('INSERT INTO chat (message) VALUES ($1)', [messageData]);
+    io.emit('chat_message', messageData); 
+  });
 
   socket.on('message_reaction', async (data) => {
     const msg = messageHistory.find(m => String(new Date(m.time).getTime()) === String(data.msgId));
@@ -283,10 +286,11 @@ io.on('connection', (socket) => {
   socket.on('edit_message', async (data) => {
     const msgIndex = messageHistory.findIndex(m => String(new Date(m.time).getTime()) === String(data.msgId));
     if (msgIndex > -1) {
-        const isAdmin = ADMIN_USERS.includes(data.user) && data.secret === ADMIN_SECRET;
-        if (messageHistory[msgIndex].user === data.user || isAdmin) {
+        const isAdmin = socket.isAdmin === true;
+        
+        if (messageHistory[msgIndex].user === socket.userName || isAdmin) {
             
-            const wasEditedByAdmin = (isAdmin && messageHistory[msgIndex].user !== data.user);
+            const wasEditedByAdmin = (isAdmin && messageHistory[msgIndex].user !== socket.userName);
             
             messageHistory[msgIndex].text = data.newText;
             messageHistory[msgIndex].edited = true;
@@ -314,8 +318,8 @@ io.on('connection', (socket) => {
   socket.on('delete_message', async (data) => {
     const msgIndex = messageHistory.findIndex(m => String(new Date(m.time).getTime()) === String(data.msgId));
     if (msgIndex > -1) {
-        const isAdmin = ADMIN_USERS.includes(data.user) && data.secret === ADMIN_SECRET;
-        if (messageHistory[msgIndex].user === data.user || isAdmin) {
+        const isAdmin = socket.isAdmin === true;
+        if (messageHistory[msgIndex].user === socket.userName || isAdmin) {
             messageHistory.splice(msgIndex, 1);
             await pool.query('DELETE FROM chat');
             for(const m of messageHistory) { await pool.query('INSERT INTO chat (message) VALUES ($1)', [m]); }
@@ -324,9 +328,8 @@ io.on('connection', (socket) => {
     }
   });
 
-  socket.on('clear_chat', async (data) => {
-    const isAdmin = ADMIN_USERS.includes(data.user) && data.secret === ADMIN_SECRET;
-    if (isAdmin) {
+  socket.on('clear_chat', async () => {
+    if (socket.isAdmin === true) {
         messageHistory = [];
         await pool.query('TRUNCATE chat');
         io.emit('chat_cleared');
@@ -334,7 +337,7 @@ io.on('connection', (socket) => {
   });
 
   socket.on('kick_user', (data) => {
-    if (ADMIN_USERS.includes(data.adminUser) && data.secret === ADMIN_SECRET) {
+    if (socket.isAdmin === true) {
         const targetSocket = io.sockets.sockets.get(data.targetId);
         if (targetSocket) {
             targetSocket.emit('user_kicked');
