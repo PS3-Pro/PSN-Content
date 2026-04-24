@@ -93,8 +93,8 @@ io.on('connection', (socket) => {
       const dbRes = await pool.query('SELECT data FROM users WHERE name = $1', [name]);
       const dbUser = dbRes.rows.length > 0 ? dbRes.rows[0].data : null;
 
-      const checkIsAdmin = (userName, secret) => {
-        return ADMIN_USERS.includes(userName) && secret === ADMIN_SECRET;
+      const checkIsAdmin = (userName) => {
+        return ADMIN_USERS.includes(userName);
       };
 
       if (dbUser) {
@@ -107,7 +107,7 @@ io.on('connection', (socket) => {
         
         if (match) {
           socket.userName = name;
-          const isAdmin = checkIsAdmin(name, adminSecret);
+          const isAdmin = checkIsAdmin(name);
           socket.isAdmin = isAdmin;
 
           userDatabase[name] = {
@@ -141,7 +141,7 @@ io.on('connection', (socket) => {
       } else {
         const hash = await bcrypt.hash(password, 10);
         socket.userName = name;
-        const isAdmin = checkIsAdmin(name, adminSecret);
+        const isAdmin = checkIsAdmin(name);
         socket.isAdmin = isAdmin;
 
         userDatabase[name] = {
