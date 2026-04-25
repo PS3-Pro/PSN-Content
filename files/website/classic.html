@@ -4673,11 +4673,24 @@
 					rawName = rawName.replace(/\s*\(Nostalgia Vault\)/gi, "");
 				}
 
+				var url_lc = url.toLowerCase();
+				var isDropbox = (url_lc.indexOf("dropbox.com") !== -1);
+				
+				var partRegex = /\s*[\(\[\-]?\s*(?:Part|Pt\.?|Disco|Disc|Parte)\s*\d+\s*[\)\]\-]?/gi;
+				var isSplitGame = partRegex.test(rawName);
+
+				var uniqueKey = title_id + "|" + url; // Padrão: Separado
+
 				if (is_games) {
-					var partRegex = /\s*[\(\[\-]?\s*(?:Part|Pt\.?)\s*\d+\s*[\)\]\-]?/gi;
-					if (partRegex.test(rawName)) {
-						rawName = rawName.replace(partRegex, "").replace(/^\s+|\s+$/g, '');
-						parts[2] = rawName;
+					if (isSplitGame) {
+						if (!is_ps3_h || !isDropbox) {
+							uniqueKey = "group_" + title_id;
+							parts[2] = rawName.replace(partRegex, "").replace(/^\s+|\s+$/g, '');
+						} else {
+							uniqueKey = "line_" + start;
+						}
+					} else {
+						uniqueKey = "best_version_" + title_id;
 					}
 				}
 	
@@ -4721,7 +4734,6 @@
 								cTag = "ps2";
 								isClassifiedById = true;
 							} 
-							// TRAVA SONY DIGITAL COM RESGATE DE NEOGEO
 							else if (prefix2 === "NP") {
 								if (upName.indexOf("NEO") !== -1 || upName.indexOf("NEOGEO") !== -1) {
 									cTag = "neogeo";
@@ -4784,32 +4796,36 @@
 				var uniqueKey = title_id + "|" + url;
     
 				if (is_games) {
-					uniqueKey = "game_group_" + title_id;
+					if (!is_ps3_h || !isDropbox) {
+						uniqueKey = "game_group_" + title_id;
+					}
 				}
 			
 				if (!temp_map_h[uniqueKey]) {
 					temp_map_h[uniqueKey] = parts;
 				} else {
 					if (is_games) {
-						var existingUrl = temp_map_h[uniqueKey][3];
-						
-						if (existingUrl.indexOf(url) === -1) {
-							temp_map_h[uniqueKey][3] = existingUrl + "|" + url;
-			
-							var totalBytes = temp_map_h[uniqueKey].rawSize + parts.rawSize;
-							temp_map_h[uniqueKey].rawSize = totalBytes;
-							temp_map_h[uniqueKey].formattedSize = f_formatSize(totalBytes); 
+						if (isSplitGame) {
+							var existingUrl = temp_map_h[uniqueKey][3];
+							if (existingUrl.indexOf(url) === -1) {
+								temp_map_h[uniqueKey][3] = existingUrl + "|" + url;
+								var totalBytes = (temp_map_h[uniqueKey].rawSize || 0) + (parts.rawSize || 0);
+								temp_map_h[uniqueKey].rawSize = totalBytes;
+								temp_map_h[uniqueKey].formattedSize = f_formatSize(totalBytes); 
+							}
+						} else {
+							var incomingSize = parts.rawSize || 0;
+							var storedSize = temp_map_h[uniqueKey].rawSize || 0;
+
+							if (incomingSize > storedSize) {
+								temp_map_h[uniqueKey] = parts;
+							}
 						}
 						
 						var existingRap = temp_map_h[uniqueKey][4];
 						if ((!existingRap || existingRap === "MISSING") && (parts[4] && parts[4] !== "MISSING")) {
 							temp_map_h[uniqueKey][4] = parts[4]; 
 							temp_map_h[uniqueKey][5] = parts[5]; 
-						}
-					} else {
-						var existingRap = temp_map_h[uniqueKey][4];
-						if ((!existingRap || existingRap === "MISSING") && (parts[4] && parts[4] !== "MISSING")) {
-							temp_map_h[uniqueKey] = parts;
 						}
 					}
 				}
@@ -5692,7 +5708,6 @@
 	}
 	
 	function attemptRawgSearch(cleanQuery, keyIndex) {
-		// Se já testou todas as chaves e falhou, tenta a Wikipedia
 		if (keyIndex >= RAWG_KEYS.length) {
 			fetchWikipediaSummary(cleanQuery);
 			return;
@@ -5709,13 +5724,11 @@
 					var data = JSON.parse(xhr.responseText);
 					if (data.results && data.results.length > 0) {
 						var slug = data.results[0].slug;
-						// Passa o index da chave que funcionou para a próxima etapa
 						fetchRawgDetails(slug, cleanQuery, keyIndex);
 					} else {
 						fetchWikipediaSummary(cleanQuery);
 					}
 				} else if (xhr.status === 401 || xhr.status === 403 || xhr.status === 429) {
-					// 401/403/429 = Erro de autenticação ou limite excedido. Tenta a próxima chave!
 					attemptRawgSearch(cleanQuery, keyIndex + 1);
 				} else {
 					fetchWikipediaSummary(cleanQuery);
@@ -5747,7 +5760,6 @@
 						fetchWikipediaSummary(originalName);
 					}
 				} else if (xhr.status === 401 || xhr.status === 403 || xhr.status === 429) {
-					// Se a chave esgotar bem no meio dessa segunda requisição, rotaciona também
 					fetchRawgDetails(slug, originalName, keyIndex + 1);
 				} else {
 					fetchWikipediaSummary(originalName);
