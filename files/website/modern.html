@@ -709,6 +709,8 @@ div[style*="display: flex"] { transition: opacity 0.3s ease, transform 0.3s ease
 .chat-gallery.grid-multi img:first-child:nth-last-child(3) { grid-column: span 2; height: 150px !important; }
 .gallery-item { width: 100%; height: 100%; object-fit: cover; cursor: pointer; transition: opacity 0.2s; background: rgba(0,0,0,0.2); }
 .gallery-item:hover { opacity: 0.8; }
+.preview-item { cursor: move; transition: transform 0.2s, opacity 0.2s; position: relative; flex-shrink: 0; }
+.preview-item.dragging { opacity: 0.4; transform: scale(0.9); }
 
 /* ========================================================================== LIBRARY SPECIFIC FIXES ========================================================================== */
 .library-actions { display: flex; gap: 15px; align-items: center; }
@@ -8503,9 +8505,12 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 		updateJumpButtonPosition();
 	}
 
+	let draggedIndex = null;
+
 	function showImagePreview() {
 		let container = document.getElementById('pending-image-preview');
 		const chatInput = document.getElementById('chat-input');
+		
 		if (!container && chatInput) {
 			chatInput.parentNode.style.position = 'relative';
 			container = document.createElement('div');
@@ -8521,8 +8526,14 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 		}
 	
 		container.innerHTML = pendingImages.map((url, idx) => `
-			<div style="position: relative; flex-shrink: 0;">
-				<img src="${url}" style="width: 65px; height: 65px; border-radius: 6px; object-fit: cover; border: 1px solid rgba(255,255,255,0.1);">
+			<div class="preview-item" 
+				draggable="true" 
+				ondragstart="handleDragStart(${idx}, event)" 
+				ondragover="handleDragOver(event)" 
+				ondrop="handleDrop(${idx}, event)"
+				ondragend="this.classList.remove('dragging')"
+				style="position: relative; flex-shrink: 0;">
+				<img src="${url}" style="width: 65px; height: 65px; border-radius: 6px; object-fit: cover; border: 1px solid rgba(255,255,255,0.1); pointer-events: none;">
 				<button onclick="removeSelectedImage(${idx})" style="position: absolute; top: -6px; right: -6px; background: #ff4444; color: white; border: 1px solid #000; width: 18px; height: 18px; border-radius: 50%; cursor: pointer; font-size: 11px; display: flex; align-items: center; justify-content: center; box-shadow: 0 2px 5px rgba(0,0,0,0.5);">&times;</button>
 			</div>
 		`).join('');
@@ -8531,6 +8542,28 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 		document.getElementById('btn-attach-file')?.classList.add('is-active');
 		updateJumpButtonPosition();
 	}
+	
+	window.handleDragStart = function(index, e) {
+		draggedIndex = index;
+		e.currentTarget.classList.add('dragging');
+		e.dataTransfer.effectAllowed = 'move';
+	};
+	
+	window.handleDragOver = function(e) {
+		e.preventDefault();
+		e.dataTransfer.dropEffect = 'move';
+	};
+	
+	window.handleDrop = function(targetIdx, e) {
+		e.preventDefault();
+		if (draggedIndex === null || draggedIndex === targetIdx) return;
+		const movedItem = pendingImages.splice(draggedIndex, 1)[0];
+		pendingImages.splice(targetIdx, 0, movedItem);
+	
+		draggedIndex = null;
+		if (typeof playUiArrow === 'function') playUiArrow();
+		showImagePreview();
+	};
 	
 	window.removeSelectedImage = function(index) {
 		if (typeof playUiBackspace === 'function') playUiBackspace();
