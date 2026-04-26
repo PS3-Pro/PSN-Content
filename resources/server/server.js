@@ -186,10 +186,20 @@ io.on('connection', (socket) => {
   socket.on('update_profile', async (userData) => {
     const name = socket.userName;
     if (name && userDatabase[name]) {
-      if (userData.avatar === null || userData.avatar === undefined) delete userData.avatar;
+      if (userData.avatar === null || userData.avatar === undefined) {
+          delete userData.avatar;
+      }
+      
       Object.assign(userDatabase[name], userData);
       userDatabase[name].lastSeen = Date.now();
-      await pool.query('UPDATE users SET data = $1 WHERE name = $2', [userDatabase[name], name]);
+      
+      try {
+        await pool.query('UPDATE users SET data = $1 WHERE name = $2', [userDatabase[name], name]);
+        console.log(`[DATABASE] Profile for ${name} updated successfully.`);
+      } catch (err) {
+        console.error(`[DATABASE ERROR] Failed to save profile for ${name}:`, err);
+      }
+
       io.emit('online_list', getSanitizedOnlineList());
     }
   });
