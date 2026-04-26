@@ -9,7 +9,7 @@ const app = express();
 const server = http.createServer(app);
 
 const APP_URL = "https://psn-content-8o6c.onrender.com/ping";
-const ADMIN_USERS = ["Luan Teles", "Goku Cheats", "Admin"];
+const ADMIN_USERS = ["Luan Teles", "Goku Cheats"];
 const ADMIN_SECRET = process.env.ADMIN_SECRET || "ADMINENABLED";
 
 const DEFAULT_AVATAR = "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/interface/modern/images/avatars/default.png";
