@@ -266,6 +266,7 @@ io.on('connection', (socket) => {
     if (msg) {
         if (!msg.reactions) msg.reactions = [];
         let react = msg.reactions.find(r => r.emoji === data.emoji);
+        
         if (react) {
             const idx = react.users.indexOf(data.user);
             if (idx > -1) { react.users.splice(idx, 1); react.count--; }
@@ -274,9 +275,11 @@ io.on('connection', (socket) => {
         } else {
             msg.reactions.push({ emoji: data.emoji, count: 1, users: [data.user] });
         }
-        await pool.query('DELETE FROM chat');
-        for(const m of messageHistory) { await pool.query('INSERT INTO chat (message) VALUES ($1)', [m]); }
-        io.emit('message_reaction', data);
+
+        try {
+            await pool.query("UPDATE chat SET message = $1 WHERE message->>'time' = $2", [msg, msg.time]);
+            io.emit('message_reaction', data);
+        } catch (err) { console.error("Reaction Sync Error:", err); }
     }
   });
 
@@ -286,9 +289,11 @@ io.on('connection', (socket) => {
         if (!msg.seenBy) msg.seenBy = [];
         if (!msg.seenBy.includes(data.user)) {
             msg.seenBy.push(data.user);
-            await pool.query('DELETE FROM chat');
-            for(const m of messageHistory) { await pool.query('INSERT INTO chat (message) VALUES ($1)', [m]); }
-            io.emit('message_seen', { msgId: data.msgId, seenBy: msg.seenBy });
+            
+            try {
+                await pool.query("UPDATE chat SET message = $1 WHERE message->>'time' = $2", [msg, msg.time]);
+                io.emit('message_seen', { msgId: data.msgId, seenBy: msg.seenBy });
+            } catch (err) { console.error("Seen Mark Error:", err); }
         }
     }
   });
@@ -297,30 +302,30 @@ io.on('connection', (socket) => {
     const msgIndex = messageHistory.findIndex(m => String(new Date(m.time).getTime()) === String(data.msgId));
     if (msgIndex > -1) {
         const isAdmin = socket.isAdmin === true;
-        
-        if (messageHistory[msgIndex].user === socket.userName || isAdmin) {
+        const msg = messageHistory[msgIndex];
+
+        if (msg.user === socket.userName || isAdmin) {
+            const wasEditedByAdmin = (isAdmin && msg.user !== socket.userName);
             
-            const wasEditedByAdmin = (isAdmin && messageHistory[msgIndex].user !== socket.userName);
-            
-            messageHistory[msgIndex].text = data.newText;
-            messageHistory[msgIndex].edited = true;
-            messageHistory[msgIndex].editedByAdmin = wasEditedByAdmin;
+            msg.text = data.newText;
+            msg.edited = true;
+            msg.editedByAdmin = wasEditedByAdmin;
 
             if (data.content) {
-                messageHistory[msgIndex].type = 'image';
-                messageHistory[msgIndex].content = data.content;
+                msg.type = 'image';
+                msg.content = data.content;
             }
             
-            await pool.query('DELETE FROM chat');
-            for(const m of messageHistory) { await pool.query('INSERT INTO chat (message) VALUES ($1)', [m]); }
-            
-            io.emit('message_edited', { 
-                msgId: data.msgId, 
-                newText: data.newText, 
-                type: data.content ? 'image' : (messageHistory[msgIndex].type || 'text'), 
-                content: data.content,
-                editedByAdmin: wasEditedByAdmin 
-            });
+            try {
+                await pool.query("UPDATE chat SET message = $1 WHERE message->>'time' = $2", [msg, msg.time]);
+                io.emit('message_edited', { 
+                    msgId: data.msgId, 
+                    newText: data.newText, 
+                    type: msg.type, 
+                    content: msg.content,
+                    editedByAdmin: wasEditedByAdmin 
+                });
+            } catch (err) { console.error("Edit Sync Error:", err); }
         }
     }
   });

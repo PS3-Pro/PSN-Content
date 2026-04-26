@@ -372,10 +372,10 @@ body:has(.sys-modal-overlay.show)::after, body:has(.modal-overlay[style*="displa
 #list-modal-body::-webkit-scrollbar-thumb { background: #ffffff; border-radius: 10px; border: 1px solid rgba(255, 255, 255, 0.05); }
 #list-modal-body::-webkit-scrollbar-thumb:hover { background: #0088ff; }
 .social-list-item { width: 100% !important; margin-bottom: 8px !important; flex-shrink: 0 !important; box-sizing: border-box !important; padding: 18px 25px !important; display: flex !important; justify-content: space-between; align-items: center; }
-.social-list-item > div:first-child { flex: 1; min-width: 0; display: flex; align-items: center; gap: 15px; }
-.social-list-item .dl-main-info { flex: 1; min-width: 0; overflow: hidden; }
-.social-list-item .dl-name { white-space: nowrap !important; overflow: hidden !important; text-overflow: ellipsis !important; display: block !important; width: 100%; }
-.social-list-item .dl-side-info { flex-shrink: 0 !important; min-width: 110px; text-align: right; display: flex; flex-direction: column; align-items: flex-end; justify-content: center; }
+.download-item > div:first-child { flex: 1; min-width: 0; display: flex; align-items: center; gap: 15px; }
+.download-item .dl-main-info { flex: 1; min-width: 0; overflow: hidden; }
+.download-item .dl-name { white-space: nowrap !important; overflow: hidden !important; text-overflow: ellipsis !important; display: block !important; width: 100%; }
+.download-item .dl-side-info { flex-shrink: 0 !important; min-width: 110px; text-align: right; display: flex; flex-direction: column; align-items: flex-end; justify-content: center; }
 .dl-main-info { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 4px; padding-right: 20px; }
 .dl-name { font-size: 14px; color: #fff; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .dl-date { font-size: 11px; color: var(--text-muted); }
@@ -702,6 +702,13 @@ div[style*="display: flex"] { transition: opacity 0.3s ease, transform 0.3s ease
 
 #btn-emoji-picker.is-active { color: #ffcc00 !important; border-color: rgba(255, 204, 0, 0.5) !important; }
 #btn-attach-file.is-active { color: var(--ps-blue) !important; border-color: var(--ps-blue) !important; }
+
+.chat-gallery { display: grid; gap: 4px; margin-top: 5px; border-radius: 8px; overflow: hidden; max-width: 280px; }
+.chat-gallery.grid-2 { grid-template-columns: 1fr 1fr; }
+.chat-gallery.grid-multi { grid-template-columns: 1fr 1fr; grid-auto-rows: 100px; }
+.chat-gallery.grid-multi img:first-child:nth-last-child(3) { grid-column: span 2; height: 150px !important; }
+.gallery-item { width: 100%; height: 100%; object-fit: cover; cursor: pointer; transition: opacity 0.2s; background: rgba(0,0,0,0.2); }
+.gallery-item:hover { opacity: 0.8; }
 
 /* ========================================================================== LIBRARY SPECIFIC FIXES ========================================================================== */
 .library-actions { display: flex; gap: 15px; align-items: center; }
@@ -1760,7 +1767,7 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 						</button>
 			
 						<div style="background: rgba(255, 255, 255, 0.03); padding: 15px 25px; border-top: 1px solid rgba(255, 255, 255, 0.08); display: flex; gap: 15px; align-items: center; position: relative; z-index: 5;">
-							<input type="file" id="chat-image-input" accept="image/*" style="display: none;" onchange="handleImageUpload(event)">
+							<input type="file" id="chat-file-input" multiple accept="image/*" style="display:none" onchange="processAndSendImage(this.files)">
 							<button id="btn-attach-file" class="action-btn" onclick="playUiClick(); document.getElementById('chat-image-input').click()" style="margin: 0; padding: 13px 18px; background: rgba(0, 0, 0, 0.5); border: 1px solid rgba(255, 255, 255, 0.1); color: var(--text-muted); transition: 0.3s; box-shadow: inset 0 2px 4px rgba(0,0,0,0.3);" onmouseenter="playUiHover(); this.style.color='var(--ps-blue)'; this.style.borderColor='var(--ps-blue)'" onmouseleave="this.style.color='var(--text-muted)'; this.style.borderColor='rgba(255, 255, 255, 0.1)'">
 								<i class="fas fa-paperclip"></i>
 							</button>
@@ -8011,7 +8018,7 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
     let currentReply = null;
     let chatUsers = new Set();
     let selectedSuggestionIndex = 0;
-    let pendingImageFile = null;
+    let pendingImages = [];
     let editingMsgId = null;
 	let globalSearchResults = [];
 	
@@ -8496,27 +8503,43 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 		updateJumpButtonPosition();
 	}
 
-	function showImagePreview(base64Data) {
-		pendingImageFile = base64Data;
+	function showImagePreview() {
 		let container = document.getElementById('pending-image-preview');
 		const chatInput = document.getElementById('chat-input');
-
 		if (!container && chatInput) {
 			chatInput.parentNode.style.position = 'relative';
 			container = document.createElement('div');
 			container.id = 'pending-image-preview';
-			container.style.cssText = "position: absolute; bottom: 100%; left: 0; z-index: 100; display: inline-block; padding: 10px; background: rgba(10, 15, 25, 0.95); border: 1px solid var(--ps-blue); border-radius: 10px; margin-bottom: 8px; animation: fadeIn 0.3s ease-out; backdrop-filter: blur(10px); box-shadow: 0 -5px 15px rgba(0,0,0,0.5);";
+			container.style.cssText = "position: absolute; bottom: 100%; left: 0; z-index: 100; display: flex; gap: 8px; padding: 10px; background: rgba(10, 15, 25, 0.95); border: 1px solid var(--ps-blue); border-radius: 10px; margin-bottom: 8px; animation: fadeIn 0.3s ease-out; backdrop-filter: blur(10px); box-shadow: 0 -5px 15px rgba(0,0,0,0.5); overflow-x: auto; max-width: calc(100% - 20px); scrollbar-width: none;";
 			chatInput.parentNode.insertBefore(container, chatInput);
 		}
-
-		container.innerHTML = `
-			<img src="${base64Data}" style="max-width: 120px; max-height: 120px; border-radius: 6px; display: block; border: 1px solid rgba(255,255,255,0.1);">
-			<button onclick="cancelPendingImage()" style="position: absolute; top: -8px; right: -8px; background: #ff4444; color: white; border: none; width: 22px; height: 22px; border-radius: 50%; cursor: pointer; font-size: 14px; display: flex; align-items: center; justify-content: center; box-shadow: 0 2px 8px rgba(0,0,0,0.5);">&times;</button>
-		`;
+	
+		if (pendingImages.length === 0) {
+			if (container) container.remove();
+			updateJumpButtonPosition();
+			return;
+		}
+	
+		container.innerHTML = pendingImages.map((url, idx) => `
+			<div style="position: relative; flex-shrink: 0;">
+				<img src="${url}" style="width: 65px; height: 65px; border-radius: 6px; object-fit: cover; border: 1px solid rgba(255,255,255,0.1);">
+				<button onclick="removeSelectedImage(${idx})" style="position: absolute; top: -6px; right: -6px; background: #ff4444; color: white; border: 1px solid #000; width: 18px; height: 18px; border-radius: 50%; cursor: pointer; font-size: 11px; display: flex; align-items: center; justify-content: center; box-shadow: 0 2px 5px rgba(0,0,0,0.5);">&times;</button>
+			</div>
+		`).join('');
+	
 		chatInput.focus();
 		document.getElementById('btn-attach-file')?.classList.add('is-active');
 		updateJumpButtonPosition();
 	}
+	
+	window.removeSelectedImage = function(index) {
+		if (typeof playUiBackspace === 'function') playUiBackspace();
+		pendingImages.splice(index, 1);
+		showImagePreview();
+		if (pendingImages.length === 0) {
+			document.getElementById('btn-attach-file')?.classList.remove('is-active');
+		}
+	};
 
 	function cancelPendingImage() {
 		if (typeof playUiBackspace === 'function') playUiBackspace();
@@ -8752,6 +8775,24 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 		}
 		
 		messageText = messageText.replace(/\n/g, '<br>');
+		
+		let mediaHtml = '';
+		if (isImage && msg.content) {
+			const images = Array.isArray(msg.content) ? msg.content : [msg.content];
+			const count = images.length;
+			const imagesJson = JSON.stringify(images).replace(/"/g, '&quot;');
+	
+			if (count === 1) {
+				mediaHtml = `<img src="${images[0]}" style="max-width: 100%; max-height: 250px; border-radius: 6px; cursor: zoom-in; display: block; margin: 0 auto;" onclick="openImageModal(0, ${imagesJson})">`;
+			} else {
+				const gridClass = count === 2 ? 'grid-2' : 'grid-multi';
+				mediaHtml = `<div class="chat-gallery ${gridClass}">`;
+				images.forEach((src, idx) => {
+					mediaHtml += `<img src="${src}" class="gallery-item" onclick="openImageModal(${idx}, ${imagesJson})">`;
+				});
+				mediaHtml += `</div>`;
+			}
+		}
 	
 		const isGlobal = msg.isGlobalPing === true;
 		const senderIsAdmin = msg.isAdmin === true;
@@ -9768,8 +9809,8 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 			user: myName, 
 			avatar: myAvatar, 
 			replyTo: currentReply,
-			type: pendingImageFile ? 'image' : 'text',
-			content: pendingImageFile || null,
+			type: pendingImages.length > 0 ? 'image' : 'text',
+			content: pendingImages.length > 0 ? pendingImages : null, // Envia o array
 			isGlobalPing: globalPingActive
 		};
 		
@@ -10033,25 +10074,36 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 		}
 	});
 
-	async function processAndSendImage(file) {
-		if (!file) return;
+	async function processAndSendImage(files) {
+		if (!files || files.length === 0) return;
 		
-		if (file.size > 10 * 1024 * 1024) {
-			alert("Image too large! Max 10MB.");
-			return;
-		}
-	
 		const btnAttach = document.getElementById('btn-attach-file');
 		if (btnAttach) btnAttach.innerHTML = '<i class="fas fa-spinner fa-spin"></i>';
 	
-		const imageUrl = await uploadToCloudinary(file);
+		const validFiles = Array.from(files).filter(file => {
+			if (file.size > 10 * 1024 * 1024) {
+				alert(`File "${file.name}" is too large! Max 10MB.`);
+				return false;
+			}
+			return true;
+		});
 	
-		if (imageUrl) {
-			pendingImageFile = imageUrl; 
-			showImagePreview(imageUrl);
-			if (typeof playUiSuccess === 'function') playUiSuccess();
-		} else {
-			alert("Upload failed! Check your Cloudinary settings.");
+		try {
+			const uploadPromises = validFiles.map(file => uploadToCloudinary(file));
+			const urls = await Promise.all(uploadPromises);
+			
+			const successfulUrls = urls.filter(url => url !== null);
+	
+			if (successfulUrls.length > 0) {
+				pendingImages = [...pendingImages, ...successfulUrls];
+				
+				showImagePreview(); 
+				
+				if (typeof playUiSuccess === 'function') playUiSuccess();
+			}
+		} catch (err) {
+			console.error("Upload process error:", err);
+			alert("An error occurred during the upload.");
 		}
 	
 		if (btnAttach) btnAttach.innerHTML = '<i class="fas fa-paperclip"></i>';
