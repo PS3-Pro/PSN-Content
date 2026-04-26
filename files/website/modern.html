@@ -711,6 +711,11 @@ div[style*="display: flex"] { transition: opacity 0.3s ease, transform 0.3s ease
 .gallery-item:hover { opacity: 0.8; }
 .preview-item { cursor: move; transition: transform 0.2s, opacity 0.2s; position: relative; flex-shrink: 0; }
 .preview-item.dragging { opacity: 0.4; transform: scale(0.9); }
+.msg-bubble { position: relative; z-index: 1; }
+.chat-gallery { display: grid; gap: 4px; background: #000; border-radius: 8px; overflow: hidden; position: relative; }
+.gallery-item { width: 100%; height: 100%; object-fit: cover; transition: transform 0.4s ease, opacity 0.4s ease; }
+.gallery-item:hover { transform: scale(1); opacity: 1 !important; z-index: 2; }
+.chat-gallery:hover .gallery-item:not(:hover) { opacity: 0.1; }
 
 /* ========================================================================== LIBRARY SPECIFIC FIXES ========================================================================== */
 .library-actions { display: flex; gap: 15px; align-items: center; }
@@ -8453,7 +8458,7 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 		updateJumpButtonPosition();
 	}
 	
-	function startEditMessage(msgId, currentText) {
+	function startEditMessage(msgId, currentText, existingImages = []) {
 		if (typeof cancelReply === 'function') cancelReply();
 		if (typeof playUiClick === 'function') playUiClick();
 		
@@ -8464,6 +8469,9 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 		const decodedText = decodeURIComponent(currentText);
 		input.value = decodedText.replace(/<br\s*[\/]?>/gi, "\n");
 		input.dispatchEvent(new Event('input'));
+	
+		pendingImages = [...existingImages]; 
+		showImagePreview(); // Renderiza a galeria com Drag & Drop e botões de fechar
 	
 		let preview = document.getElementById('edit-preview');
 		if (!preview) {
@@ -8493,6 +8501,7 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 	function cancelEditMessage() {
 		if (typeof playUiBackspace === 'function') playUiBackspace();
 		editingMsgId = null;
+		
 		const input = document.getElementById('chat-input');
 		if (input) {
 			input.value = '';
@@ -8500,8 +8509,12 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 			input.style.overflowY = 'hidden';
 			input.scrollTop = 0;
 		}
+	
+		pendingImages = []; 
+		showImagePreview(); 
 		const preview = document.getElementById('edit-preview');
 		if (preview) preview.remove();
+		
 		updateJumpButtonPosition();
 	}
 
@@ -8808,18 +8821,18 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 		
 		messageText = messageText.replace(/\n/g, '<br>');
 		
+		const currentImages = isImage ? (Array.isArray(msg.content) ? msg.content : [msg.content]) : [];
+		const imagesJson = JSON.stringify(currentImages).replace(/"/g, '&quot;');
+		
 		let mediaHtml = '';
-		if (isImage && msg.content) {
-			const images = Array.isArray(msg.content) ? msg.content : [msg.content];
-			const count = images.length;
-			const imagesJson = JSON.stringify(images).replace(/"/g, '&quot;');
-	
+		if (isImage && currentImages.length > 0) {
+			const count = currentImages.length;
 			if (count === 1) {
-				mediaHtml = `<img src="${images[0]}" style="max-width: 100%; max-height: 250px; border-radius: 6px; cursor: zoom-in; display: block; margin: 0 auto;" onclick="openImageModal(0, ${imagesJson})">`;
+				mediaHtml = `<img src="${currentImages[0]}" style="max-width: 100%; max-height: 250px; border-radius: 6px; cursor: zoom-in; display: block; margin: 0 auto;" onclick="openImageModal(0, ${imagesJson})">`;
 			} else {
 				const gridClass = count === 2 ? 'grid-2' : 'grid-multi';
 				mediaHtml = `<div class="chat-gallery ${gridClass}">`;
-				images.forEach((src, idx) => {
+				currentImages.forEach((src, idx) => {
 					mediaHtml += `<img src="${src}" class="gallery-item" onclick="openImageModal(${idx}, ${imagesJson})">`;
 				});
 				mediaHtml += `</div>`;
@@ -8869,6 +8882,7 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 		let reactionsHtml = (msg.reactions || []).map(r => 
 			`<div class="reaction-pill" data-emoji="${r.emoji}" data-count="${r.count}" data-users="${(r.users || []).join(', ')}">${r.emoji} ${r.count}</div>`
 		).join('');
+		
 	
 		const hasBeenSeen = (msg.seenBy && msg.seenBy.length > 0);
 		const seenByList = hasBeenSeen ? msg.seenBy.join(', ') : ''; 
@@ -8908,7 +8922,7 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 					<span style="font-size: 11px; color: ${nameColor}; font-weight: bold; margin-bottom: 4px; display: flex; align-items: center; gap: 2px;">
 						${statusDotHtml}${userName} ${adminTagHtml} ${mentionTagHtml} </span>
 	
-					<div style="background: ${bgColor}; border: 1px solid ${borderColor}; padding: 10px 14px; border-radius: ${bubbleRadius}; backdrop-filter: blur(5px); ${glowStyle} width: fit-content; max-width: 100%; box-sizing: border-box;">
+					<div class="msg-bubble" style="background: ${bgColor}; border: 1px solid ${borderColor}; padding: 10px 14px; border-radius: ${bubbleRadius}; backdrop-filter: blur(5px); ${glowStyle} width: fit-content; max-width: 100%; box-sizing: border-box;">
 						${replyBlockHtml}
 						<div style="font-size: 13.5px; color: #fff; line-height: 1.4;">
 							${mediaHtml}  <div id="msg-text-${msgId}" style="${(isImage && messageText !== '') ? 'margin-top: 10px;' : ''}">
@@ -8936,7 +8950,7 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 						<i class="fas fa-smile" style="cursor: pointer; opacity: 0.5; color: #ffcc00; font-size: 12px; transition: all 0.2s;" onmouseover="this.style.opacity='1'; this.style.transform='scale(1.2)'" onmouseout="this.style.opacity='0.5'; this.style.transform='scale(1)'" onclick="openReactionPicker(event, '${msgId}')"></i>
 						
 						${(isAuthor || isAdmin) ? `
-							<i class="fas fa-edit" style="cursor: pointer; opacity: 0.5; color: #ff00ff; font-size: 12px; transition: all 0.2s; margin-left: 1px;" onmouseover="this.style.opacity='1'; this.style.transform='scale(1.2)'" onmouseout="this.style.opacity='0.5'; this.style.transform='scale(1)'" onclick="startEditMessage('${msgId}', decodeURIComponent('${encodedText}'))"></i>
+							<i class="fas fa-edit" style="cursor: pointer; opacity: 0.5; color: #ff00ff; font-size: 12px; transition: all 0.2s; margin-left: 1px;" onmouseover="this.style.opacity='1'; this.style.transform='scale(1.2)'" onmouseout="this.style.opacity='0.5'; this.style.transform='scale(1)'" onclick="startEditMessage('${msgId}', decodeURIComponent('${encodedText}'), ${imagesJson})"></i>
 							<i class="fas fa-trash-alt" style="cursor: pointer; opacity: 0.5; color: #ff4444; font-size: 12px; transition: all 0.2s; margin-left: 1px;" onmouseover="this.style.opacity='1'; this.style.transform='scale(1.2)'" onmouseout="this.style.opacity='0.5'; this.style.transform='scale(1)'" onclick="deleteMyMessage('${msgId}')"></i>
 						` : ''}
 					</div>
@@ -9361,7 +9375,7 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 					msg.editedByAdmin = data.editedByAdmin;
 					if (data.content) {
 						msg.type = 'image';
-						msg.content = data.content;
+						msg.content = data.content; // Aqui o array já vem reordenado do servidor
 					}
 				}
 			}
@@ -9369,7 +9383,32 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 			const textContainer = document.getElementById(`msg-text-${data.msgId}`);
 			if (textContainer) {
 				const parent = textContainer.parentNode;
-				
+		
+				if (data.content) {
+					const images = Array.isArray(data.content) ? data.content : [data.content];
+					const count = images.length;
+					const imagesJson = JSON.stringify(images).replace(/"/g, '&quot;');
+					
+					let newMediaHtml = '';
+					if (count === 1) {
+						newMediaHtml = `<img src="${images[0]}" style="max-width: 100%; max-height: 250px; border-radius: 6px; cursor: zoom-in; display: block; margin: 0 auto;" onclick="openImageModal(0, ${imagesJson})">`;
+					} else {
+						const gridClass = count === 2 ? 'grid-2' : 'grid-multi';
+						newMediaHtml = `<div class="chat-gallery ${gridClass}">`;
+						images.forEach((src, idx) => {
+							newMediaHtml += `<img src="${src}" class="gallery-item" onclick="openImageModal(${idx}, ${imagesJson})">`;
+						});
+						newMediaHtml += `</div>`;
+					}
+		
+					const oldGallery = parent.querySelector('.chat-gallery');
+					const oldImg = parent.querySelector('img:not(.chat-avatar-status)');
+					if (oldGallery) oldGallery.remove();
+					if (oldImg) oldImg.remove();
+		
+					parent.insertAdjacentHTML('afterbegin', newMediaHtml);
+				}
+		
 				let formatted = data.newText.replace(/\n/g, '<br>');
 				formatted = formatted.replace(/@everyone\b(?![^<]*>)/g, `<span class="chat-mention" style="background: #ff4444; color: #fff; padding: 2px 4px; border-radius: 4px; font-weight: bold; font-size: 10px;">@everyone</span>`);
 				formatted = formatted.replace(/(https?:\/\/[^\s]+)/g, url => 
@@ -9378,17 +9417,10 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 		
 				let badge = data.editedByAdmin ? ' <span style="font-size: 9px; opacity: 0.8; color: #ff4444; font-weight: bold;">(Edited by Admin)</span>' : ' <span style="font-size: 9px; opacity: 0.5; font-style: italic;">(Edited)</span>';
 				
-				let existingImg = parent.querySelector('img');
-				if (data.content && !existingImg) {
-					const imgEl = document.createElement('img');
-					imgEl.src = data.content;
-					imgEl.style.cssText = "max-width: 100%; max-height: 250px; border-radius: 6px; cursor: zoom-in; display: block; margin: 0 auto; margin-bottom: 10px;";
-					imgEl.onclick = function() { openImageModal(this.src); };
-					parent.insertBefore(imgEl, textContainer);
-				}
-				
 				textContainer.innerHTML = formatted + badge;
+				textContainer.style.marginTop = data.content ? "10px" : "0px";
 			}
+			
 			if (typeof refreshChatNotificationDot === 'function') refreshChatNotificationDot();
 		});
 	
