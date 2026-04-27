@@ -158,7 +158,9 @@ io.on('connection', (socket) => {
           wishlistData: userData.wishlistData || [],
           favoritesData: userData.favoritesData || [],
           downloadsData: userData.downloadsData || [],
-          libraryData: userData.libraryData || []
+          libraryData: userData.libraryData || [],
+          countersData: userData.countersData || {},
+          themeColor: userData.themeColor || '#0070cc'
         };
 
         await pool.query(
