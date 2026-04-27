@@ -65,6 +65,7 @@ function getSanitizedOnlineList() {
         id: u.id,
         name: username, 
         avatar: u.avatar || DEFAULT_AVATAR,
+        isAdmin: ADMIN_USERS.includes(username), 
         level: u.level || 1,
         joined: u.joined || '2026',
         online: u.online,
