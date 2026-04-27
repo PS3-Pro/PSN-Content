@@ -25,6 +25,7 @@ app.get('/ping', (req, res) => {
 
 let userDatabase = {};
 let messageHistory = [];
+let pinnedMessages = [];
 
 async function initDb() {
   await pool.query(`
@@ -35,6 +36,11 @@ async function initDb() {
     CREATE TABLE IF NOT EXISTS chat (
       id SERIAL PRIMARY KEY,
       message JSONB
+    );
+    CREATE TABLE IF NOT EXISTS pinned_messages (
+      id SERIAL PRIMARY KEY,
+      message_id TEXT UNIQUE,
+      data JSONB
     );
   `);
 
@@ -47,7 +53,11 @@ async function initDb() {
 
   const chatRes = await pool.query('SELECT message FROM chat ORDER BY id ASC LIMIT 100');
   messageHistory = chatRes.rows.map(r => r.message);
-  console.log("[DB] Database inicializada e usuários carregados.");
+  
+  const pinnedRes = await pool.query('SELECT data FROM pinned_messages ORDER BY id ASC');
+  pinnedMessages = pinnedRes.rows.map(r => r.data);
+
+  console.log(`[DB] Database inicializada. ${pinnedMessages.length} pins carregados.`);
 }
 
 initDb().catch(console.error);
@@ -130,6 +140,7 @@ io.on('connection', (socket) => {
           });
 
           socket.emit('chat_history', messageHistory);
+          socket.emit('pinned_list', pinnedMessages);
 
           io.emit('online_list', getSanitizedOnlineList());
         } else {
@@ -178,6 +189,7 @@ io.on('connection', (socket) => {
         });
 
         socket.emit('chat_history', messageHistory);
+        socket.emit('pinned_list', pinnedMessages);
 
         io.emit('online_list', getSanitizedOnlineList());
       }
@@ -329,6 +341,14 @@ io.on('connection', (socket) => {
                     content: msg.content,
                     editedByAdmin: wasEditedByAdmin 
                 });
+
+                const pinned = pinnedMessages.find(p => p.id === data.msgId);
+                if (pinned) {
+                    pinned.text = data.newText;
+                    pool.query('UPDATE pinned_messages SET data = $1 WHERE message_id = $2', [pinned, data.msgId]).catch(e => {});
+                    io.emit('pinned_list', pinnedMessages);
+                }
+
             } catch (err) { console.error("Edit Sync Error:", err); }
         }
     }
@@ -343,6 +363,13 @@ io.on('connection', (socket) => {
             await pool.query('DELETE FROM chat');
             for(const m of messageHistory) { await pool.query('INSERT INTO chat (message) VALUES ($1)', [m]); }
             io.emit('message_deleted', data.msgId);
+
+            const isPinned = pinnedMessages.find(p => p.id === data.msgId);
+            if (isPinned) {
+                pinnedMessages = pinnedMessages.filter(p => p.id !== data.msgId);
+                pool.query('DELETE FROM pinned_messages WHERE message_id = $1', [data.msgId]).catch(e => {});
+                io.emit('pinned_list', pinnedMessages);
+            }
         }
     }
   });
@@ -352,6 +379,10 @@ io.on('connection', (socket) => {
         messageHistory = [];
         await pool.query('TRUNCATE chat');
         io.emit('chat_cleared');
+
+        pinnedMessages = [];
+        await pool.query('TRUNCATE pinned_messages');
+        io.emit('pinned_list', pinnedMessages);
     }
   });
 
@@ -368,6 +399,34 @@ io.on('connection', (socket) => {
                 }
             }, 2500);
         }
+    }
+  });
+
+  socket.on('pin_message', async (data) => {
+    if (socket.isAdmin === true) {
+      const msg = messageHistory.find(m => String(new Date(m.time).getTime()) === String(data.msgId));
+      if (msg && !pinnedMessages.find(p => p.id === data.msgId)) {
+        const pinData = { id: data.msgId, text: msg.text, user: msg.user };
+        pinnedMessages.push(pinData);
+        
+        try {
+          await pool.query('INSERT INTO pinned_messages (message_id, data) VALUES ($1, $2) ON CONFLICT (message_id) DO NOTHING', [data.msgId, pinData]);
+        } catch (e) { console.error("Pin DB Error:", e); }
+
+        io.emit('pinned_list', pinnedMessages);
+      }
+    }
+  });
+
+  socket.on('unpin_message', async (data) => {
+    if (socket.isAdmin === true) {
+      pinnedMessages = pinnedMessages.filter(p => p.id !== data.msgId);
+      
+      try {
+        await pool.query('DELETE FROM pinned_messages WHERE message_id = $1', [data.msgId]);
+      } catch (e) { console.error("Unpin DB Error:", e); }
+
+      io.emit('pinned_list', pinnedMessages);
     }
   });
 

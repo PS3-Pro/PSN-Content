@@ -747,6 +747,14 @@ body.is-admin #btn-toolbar-cmd { display: flex !important; }
 .msg-highlight-ps5 .msg-bubble { animation: ps5-fluid-glow 3s cubic-bezier(0.4, 0, 0.2, 1) forwards !important; z-index: 1000 !important; position: relative !important; }
 @keyframes ps5-fluid-glow { 0% { transform: scale(1); box-shadow: 0 0 0px transparent; } 10% { transform: scale(1.02); background: var(--ps-blue) !important; border: 1.5px solid #ffffff !important; box-shadow: 0 0 15px rgba(255, 255, 255, 0.6), 0 0 30px var(--ps-blue), 0 0 60px rgba(0, 112, 204, 0.3) !important; } 30% { transform: scale(1.02); } 100% { transform: scale(1); box-shadow: 0 0 0px transparent; } }
 
+#pinned-bar:hover { background: rgba(255, 255, 255, 0.05); }
+.unpin-admin-btn:hover { transform: scale(1.2); }
+@keyframes pinSlideDown { from { transform: translateY(-100%); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
+.pin-active { animation: pinSlideDown 0.4s cubic-bezier(0.2, 0.8, 0.2, 1); }
+
+/* Ajuste o scroll do chat para não ficar atrás da barra */
+#chat-messages { transition: margin-top 0.3s ease; }
+
 /* ========================================================================== LIBRARY SPECIFIC FIXES ========================================================================== */
 .library-actions { display: flex; gap: 15px; align-items: center; }
 #library-toolbar { justify-content: flex-end; }
@@ -1789,6 +1797,22 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 					</h2>
 			
 					<div class="file-manager-container" style="flex-grow: 1; margin: 10px 40px 10px 40px; display: flex; flex-direction: column; background: rgba(0,0,0,0.25); border-radius: 8px; border: 1px solid rgba(255,255,255,0.08); overflow: hidden; backdrop-filter: blur(5px); position: relative;"> 
+						<div id="pinned-messages-container" style="display: none; position: relative; z-index: 10; background: rgba(15, 20, 30, 0.9); border-bottom: 1px solid var(--ps-blue); backdrop-filter: blur(10px);">
+							<div id="pinned-bar" style="display: flex; align-items: center; padding: 8px 15px; gap: 12px; cursor: pointer; transition: 0.2s;" onclick="jumpToCurrentPinned()">
+								<i class="fas fa-thumbtack" style="color: var(--ps-blue); font-size: 12px; transform: rotate(45deg);"></i>
+								<div style="flex-grow: 1; overflow: hidden;">
+									<div style="font-size: 10px; color: var(--ps-blue); font-weight: 800; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 2px;">Pinned Message <span id="pin-count"></span></div>
+									<div id="pin-preview-text" style="font-size: 12px; color: #fff; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; opacity: 0.9;"></div>
+								</div>
+								<div style="display: flex; gap: 10px; align-items: center;">
+									<div id="pin-nav-btns" style="display: flex; gap: 8px; border-right: 1px solid rgba(255,255,255,0.1); padding-right: 10px;">
+										<i class="fas fa-chevron-left" onclick="event.stopPropagation(); changePinnedIndex(-1)" style="font-size: 12px; color: #aaa; cursor: pointer;"></i>
+										<i class="fas fa-chevron-right" onclick="event.stopPropagation(); changePinnedIndex(1)" style="font-size: 12px; color: #aaa; cursor: pointer;"></i>
+									</div>
+									<i class="fas fa-times unpin-admin-btn" onclick="event.stopPropagation(); requestUnpin()" style="display: none; color: #ff4444; font-size: 14px; cursor: pointer;" title="Unpin (Admin)"></i>
+								</div>
+							</div>
+						</div>
 						<div id="chat-messages" style="flex-grow: 1; overflow-y: auto; padding: 25px; display: flex; flex-direction: column; gap: 15px; scrollbar-width: thin;">
 							<div style="text-align: center; margin-bottom: 10px;">
 								<span style="background: rgba(255,255,255,0.05); padding: 5px 15px; border-radius: 20px; font-size: 11px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 1px;">
@@ -8129,6 +8153,8 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
     const socketRenderUrl = "https://psn-content-8o6c.onrender.com"; 
     let socketChat;
 	let currentOnlineList = [];
+	let pinnedMessages = [];
+	let currentPinIndex = 0;
 	let typingUsers = new Map();
 	let myTypingTimeout = null;
     
@@ -9342,6 +9368,13 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 							onmouseover="this.style.opacity='1'; this.style.transform='scale(1.2)'" 
 							onmouseout="this.style.opacity='0.5'; this.style.transform='scale(1)'" 
 							onclick="startEditMessage('${msgId}', decodeURIComponent('${encodedText}'), ${imagesJson})"></i>
+											${isAdmin ? `
+							<i class="fas fa-thumbtack" style="cursor: pointer; opacity: 0.5; color: var(--ps-blue); font-size: 12px; transition: all 0.2s; margin-left: 1px; transform: rotate(45deg);" 
+								onmouseenter="if(typeof playUiArrow === 'function') playUiArrow()"
+								onmouseover="this.style.opacity='1'; this.style.transform='scale(1.2) rotate(45deg)'" 
+								onmouseout="this.style.opacity='0.5'; this.style.transform='scale(1) rotate(45deg)'" 
+								onclick="pinMyMessage('${msgId}')" title="Pin Message"></i>
+						` : ''}
 	
 						<i class="fas fa-trash-alt" style="cursor: pointer; opacity: 0.5; color: #ff4444; font-size: 12px; transition: all 0.2s; margin-left: 1px;" 
 							onmouseenter="if(typeof playUiArrow === 'function') playUiArrow()"
@@ -9359,6 +9392,63 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 		if (box.children.length > 1000) box.removeChild(box.children[1]);
 		box.scrollTop = box.scrollHeight;
 	}
+	
+	function renderPinnedBar() {
+    const container = document.getElementById('pinned-messages-container');
+    const preview = document.getElementById('pin-preview-text');
+    const count = document.getElementById('pin-count');
+    const unpinBtn = document.querySelector('.unpin-admin-btn');
+    const nav = document.getElementById('pin-nav-btns');
+    const isAdmin = document.body.classList.contains('is-admin');
+
+    if (!pinnedMessages || pinnedMessages.length === 0) {
+        container.style.display = 'none';
+        return;
+    }
+
+    container.style.display = 'block';
+    unpinBtn.style.display = isAdmin ? 'block' : 'none';
+    nav.style.display = pinnedMessages.length > 1 ? 'flex' : 'none';
+
+    const current = pinnedMessages[currentPinIndex];
+    // Removemos HTML e quebras de linha para o preview não quebrar a barra
+    preview.innerText = current.text.replace(/<[^>]*>?/gm, ' ').replace(/\n/g, ' '); 
+    count.innerText = pinnedMessages.length > 1 ? `(${currentPinIndex + 1}/${pinnedMessages.length})` : '';
+}
+
+function changePinnedIndex(dir) {
+    if (typeof playUiArrow === 'function') playUiArrow();
+    currentPinIndex += dir;
+    if (currentPinIndex >= pinnedMessages.length) currentPinIndex = 0;
+    if (currentPinIndex < 0) currentPinIndex = pinnedMessages.length - 1;
+    renderPinnedBar();
+}
+
+function jumpToCurrentPinned() {
+    const msg = pinnedMessages[currentPinIndex];
+    if (msg && msg.id) {
+        if (typeof playUiClick === 'function') playUiClick();
+        scrollToMessage(msg.id);
+    }
+}
+
+function pinMyMessage(msgId) {
+    if (socketChat && document.body.classList.contains('is-admin')) {
+        const myName = localStorage.getItem('psn_username');
+        socketChat.emit('pin_message', { msgId: msgId, user: myName });
+        if (typeof playUiSuccess === 'function') playUiSuccess();
+    }
+}
+
+function requestUnpin() {
+    if (!pinnedMessages[currentPinIndex]) return;
+    const msgId = pinnedMessages[currentPinIndex].id;
+    const myName = localStorage.getItem('psn_username');
+    if (confirm("Unpin this message for everyone?")) {
+        socketChat.emit('unpin_message', { msgId: msgId, user: myName });
+        if (typeof playUiRemove === 'function') playUiRemove();
+    }
+}
 
     function showChatNotification(userName, isMention, isGlobalPing) {
         const systemSound = document.getElementById('sound-ui-message');
@@ -9483,6 +9573,13 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 			
 			const s = document.getElementById('chat-status-text');
 			if (s) { s.innerText = "(Connected)"; s.style.color = "#4caf50"; }
+			
+			socketChat.on('pinned_list', (list) => {
+        pinnedMessages = list;
+        // Se entrou um pin novo, foca nele, senão mantém o índice se for apenas deleção
+        if (list.length > 0) currentPinIndex = list.length - 1; 
+        renderPinnedBar();
+    });
 		});
 		
 		socketChat.on('auth_success', (data) => {
