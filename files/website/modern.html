@@ -744,6 +744,11 @@ div[style*="display: flex"] { transition: opacity 0.3s ease, transform 0.3s ease
 body.is-admin #btn-toolbar-cmd { display: flex !important; }
 .tool-btn.active { color: #00bcff !important; text-shadow: 0 0 12px rgba(0, 188, 255, 0.8); transform: scale(1.15); opacity: 1 !important; }
 #btn-toolbar-cmd.active { color: #00bcff !important; text-shadow: 0 0 12px rgba(0, 255, 204, 0.8); }
+.message-highlight-flash { animation: flash-glow 2s ease-out; }
+@keyframes flash-glow {
+    0% { background-color: rgba(255, 255, 255, 0.3); box-shadow: 0 0 20px rgba(255, 255, 255, 0.5); transform: scale(1.02); }
+    100% { background-color: transparent; box-shadow: none; transform: scale(1); }
+}
 
 /* ========================================================================== LIBRARY SPECIFIC FIXES ========================================================================== */
 .library-actions { display: flex; gap: 15px; align-items: center; }
@@ -8631,7 +8636,7 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 		});
 	};
     
-	function setReply(user, text) {
+	function setReply(user, text, id) {
 		if (typeof cancelEditMessage === 'function') cancelEditMessage();
 		if (typeof playUiClick === 'function') playUiClick();
 		
@@ -8640,7 +8645,8 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 	
 		currentReply = { 
 			user: decodedUser, 
-			text: htmlText
+			text: htmlText,
+			id: id
 		};
 		
 		let preview = document.getElementById('reply-preview');
@@ -8683,6 +8689,23 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 			input.scrollTop = 0;
 		}
 		updateJumpButtonPosition();
+	}
+	
+	function scrollToMessage(msgId) {
+		const target = document.getElementById(`msg-${msgId}`);
+		if (target) {
+			if (typeof playUiClick === 'function') playUiClick();
+			
+			target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+			
+			target.classList.remove('message-highlight-flash');
+			void target.offsetWidth;
+			target.classList.add('message-highlight-flash');
+			
+			setTimeout(() => target.classList.remove('message-highlight-flash'), 2000);
+		} else {
+			console.warn("Message not found.");
+		}
 	}
 	
 	function startEditMessage(msgId, currentText, existingImages = []) {
@@ -9215,7 +9238,8 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 		}
 		
 		let replyBlockHtml = replyData ? `
-			<div style="background: rgba(0, 0, 0, 0.3); border-left: 3px solid ${nameColor}; padding: 4px 10px; margin-bottom: 8px; border-radius: 4px; font-size: 11px; line-height: 1.2; display: block; width: 100%; box-sizing: border-box;">
+			<div onclick="${replyData.id ? `scrollToMessage('${replyData.id}')` : ''}" 
+				 style="background: rgba(0, 0, 0, 0.3); border-left: 3px solid ${nameColor}; padding: 4px 10px; margin-bottom: 8px; border-radius: 4px; font-size: 11px; line-height: 1.2; display: block; width: 100%; box-sizing: border-box; ${replyData.id ? 'cursor: pointer;' : ''}">
 				<div style="font-weight: bold; color: ${nameColor}; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-bottom: 2px;">${replyData.user}</div>
 				<div style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: #aaa;">${replyData.text}</div>
 			</div>` : '';
@@ -9296,7 +9320,7 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 						onmouseenter="if(typeof playUiArrow === 'function') playUiArrow()"
 						onmouseover="this.style.opacity='1'; this.style.transform='scale(1.2)'" 
 						onmouseout="this.style.opacity='0.5'; this.style.transform='scale(1)'" 
-						onclick="setReply(decodeURIComponent('${encodedUser}'), decodeURIComponent('${encodedText}'))"></i>
+						onclick="setReply(decodeURIComponent('${encodedUser}'), decodeURIComponent('${encodedText}'), '${msgId}')"
 	
 					<i class="fas fa-smile" style="cursor: pointer; opacity: 0.5; color: #ffcc00; font-size: 12px; transition: all 0.2s;" 
 						onmouseenter="if(typeof playUiArrow === 'function') playUiArrow()"
@@ -9479,7 +9503,21 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 				if (typeof lastScannedGames !== 'undefined') lastScannedGames = userData.libraryData;
 				localStorage.setItem(`${name}_psn_local_library`, JSON.stringify(userData.libraryData));
 			}
-		
+
+			if (userData.countersData) {
+				localStorage.setItem('psn_chat_msgs_sent', userData.countersData.msgs || '0');
+				localStorage.setItem('psn_chat_imgs_sent', userData.countersData.imgs || '0');
+				localStorage.setItem('psn_chat_reactions_given', userData.countersData.reactions || '0');
+				localStorage.setItem('psn_trailers_watched', userData.countersData.trailers || '0');
+				localStorage.setItem('psn_accessed_days', userData.countersData.days || '[]');
+			}
+			
+			if (userData.themeColor) {
+				localStorage.setItem(`${name}_psn_theme_color`, userData.themeColor);
+				document.documentElement.style.setProperty('--ps-blue', userData.themeColor);
+				document.documentElement.style.setProperty('--ps-neon', userData.themeColor + '66');
+			}
+			
 			if (isAdmin) {
 				document.body.classList.add('is-admin');
 				const box = document.getElementById('chat-messages');
@@ -10099,12 +10137,19 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 			});
 		}
 		const myLevel = Math.floor(totalXp / 100) + 1;
-	
 		const DEFAULT_URL = "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/interface/modern/images/avatars/default.png";
 		
 		const myAvatar = localStorage.getItem(`${myName}_psn_avatar`) || (typeof AVAILABLE_AVATARS !== 'undefined' ? AVAILABLE_AVATARS[0] : DEFAULT_URL);
 		const myJoined = localStorage.getItem(`${myName}_joined_date`) || "2026";
 	
+		const myCounters = {
+			msgs: localStorage.getItem('psn_chat_msgs_sent') || '0',
+			imgs: localStorage.getItem('psn_chat_imgs_sent') || '0',
+			reactions: localStorage.getItem('psn_chat_reactions_given') || '0',
+			trailers: localStorage.getItem('psn_trailers_watched') || '0',
+			days: localStorage.getItem('psn_accessed_days') || '[]'
+		};
+		const myTheme = localStorage.getItem(`${myName}_psn_theme_color`) || '#0070cc';
 		socketChat.emit('update_profile', {
 			avatar: myAvatar,
 			joined: myJoined,
@@ -10122,7 +10167,9 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 			downloadsData: window.downloadHistory || [],
 			wishlistData: window.wishlist || [],
 			favoritesData: window.favoritesLibrary || [],
-			libraryData: typeof lastScannedGames !== 'undefined' ? lastScannedGames : []
+			libraryData: typeof lastScannedGames !== 'undefined' ? lastScannedGames : [],
+			countersData: myCounters, 
+			themeColor: myTheme
 		});
 	};
 	
@@ -10251,11 +10298,8 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 	
 		let globalPingActive = false;
 		if (plainText.includes('@everyone')) {
-			if (isAdmin) {
-				globalPingActive = true;
-			} else {
-				msg = msg.replace(/@everyone/g, "everyone");
-			}
+			if (isAdmin) globalPingActive = true;
+			else msg = msg.replace(/@everyone/g, "everyone");
 		}
 		
 		if (editingMsgId) {
@@ -10277,48 +10321,42 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 			text: msg,
 			user: myName, 
 			avatar: myAvatar, 
-			replyTo: currentReply,
+			replyTo: currentReply, 
 			type: pendingImages.length > 0 ? 'image' : 'text',
 			content: pendingImages.length > 0 ? pendingImages : null, 
 			isGlobalPing: globalPingActive
 		};
 		
 		socketChat.emit('chat_message', data);
-			let messagesSent = parseInt(localStorage.getItem('psn_chat_msgs_sent') || '0') + 1;
-			localStorage.setItem('psn_chat_msgs_sent', messagesSent);
-			checkTrophyProgress('chat_first', messagesSent);
-			checkTrophyProgress('chat_active', messagesSent);
-			
-			if (plainText.includes('@') && !globalPingActive) {
-				checkTrophyProgress('chat_mention', 1);
-			}
 	
-			if (pendingImages.length > 0) {
-				let imagesSent = parseInt(localStorage.getItem('psn_chat_imgs_sent') || '0') + pendingImages.length;
-				localStorage.setItem('psn_chat_imgs_sent', imagesSent);
-				checkTrophyProgress('chat_media', imagesSent);
-			}
-			
-			saveState('psn_last_chat_read', Date.now().toString());
-			
-			input.innerHTML = '';
-			document.execCommand('removeFormat', false, null);
-			
-			if (typeof updateToolbarStates === 'function') updateToolbarStates();
-			
-			input.focus();
+		let messagesSent = parseInt(localStorage.getItem('psn_chat_msgs_sent') || '0') + 1;
+		localStorage.setItem('psn_chat_msgs_sent', messagesSent);
+		checkTrophyProgress('chat_first', messagesSent);
+		checkTrophyProgress('chat_active', messagesSent);
 		
-			cancelReply();
-			pendingImages = []; 
-			showImagePreview(); 
-			
-			document.getElementById('btn-attach-file')?.classList.remove('is-active');
-			document.getElementById('btn-emoji-picker')?.classList.remove('is-active');
-			
-			const picker = document.getElementById('chat-input-emoji-picker');
-			if (picker) picker.style.display = 'none';
-			
-			if (typeof playUiSuccess === 'function') playUiSuccess(); 
+		if (plainText.includes('@') && !globalPingActive) checkTrophyProgress('chat_mention', 1);
+	
+		if (pendingImages.length > 0) {
+			let imagesSent = parseInt(localStorage.getItem('psn_chat_imgs_sent') || '0') + pendingImages.length;
+			localStorage.setItem('psn_chat_imgs_sent', imagesSent);
+			checkTrophyProgress('chat_media', imagesSent);
+		}
+		
+		saveState('psn_last_chat_read', Date.now().toString());
+		input.innerHTML = '';
+		document.execCommand('removeFormat', false, null);
+		if (typeof updateToolbarStates === 'function') updateToolbarStates();
+		input.focus();
+	
+		cancelReply();
+		pendingImages = []; 
+		showImagePreview(); 
+		
+		document.getElementById('btn-attach-file')?.classList.remove('is-active');
+		document.getElementById('btn-emoji-picker')?.classList.remove('is-active');
+		const picker = document.getElementById('chat-input-emoji-picker');
+		if (picker) picker.style.display = 'none';
+		if (typeof playUiSuccess === 'function') playUiSuccess(); 
 	}
 
     function deleteMyMessage(msgId) {
