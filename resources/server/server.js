@@ -159,6 +159,7 @@ io.on('connection', (socket) => {
           favoritesData: userData.favoritesData || [],
           downloadsData: userData.downloadsData || [],
           libraryData: userData.libraryData || [],
+          friendsData: userData.friendsData || [],
           countersData: userData.countersData || {},
           themeColor: userData.themeColor || '#0070cc'
         };
