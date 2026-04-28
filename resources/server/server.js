@@ -406,7 +406,13 @@ io.on('connection', (socket) => {
     if (socket.isAdmin === true) {
       const msg = messageHistory.find(m => String(new Date(m.time).getTime()) === String(data.msgId));
       if (msg && !pinnedMessages.find(p => p.id === data.msgId)) {
-        const pinData = { id: data.msgId, text: msg.text, user: msg.user };
+        const pinData = { 
+			id: data.msgId, 
+			text: msg.text, 
+			user: msg.user, 
+			type: msg.type, 
+			content: msg.content 
+		};
         pinnedMessages.push(pinData);
         
         try {
