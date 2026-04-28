@@ -345,7 +345,10 @@ io.on('connection', (socket) => {
                 const pinned = pinnedMessages.find(p => p.id === data.msgId);
                 if (pinned) {
                     pinned.text = data.newText;
-                    pool.query('UPDATE pinned_messages SET data = $1 WHERE message_id = $2', [pinned, data.msgId]).catch(e => {});
+                    pinned.type = msg.type || 'text';
+                    pinned.content = msg.content || null;
+                    
+                    await pool.query('UPDATE pinned_messages SET data = $1 WHERE message_id = $2', [pinned, data.msgId]);
                     io.emit('pinned_list', pinnedMessages);
                 }
 
@@ -407,19 +410,18 @@ io.on('connection', (socket) => {
       const msg = messageHistory.find(m => String(new Date(m.time).getTime()) === String(data.msgId));
       if (msg && !pinnedMessages.find(p => p.id === data.msgId)) {
         const pinData = { 
-			id: data.msgId, 
-			text: msg.text, 
-			user: msg.user, 
-			type: msg.type, 
-			content: msg.content 
-		};
+            id: data.msgId, 
+            text: msg.text || "", 
+            user: msg.user, 
+            type: msg.type || 'text', 
+            content: msg.content || null 
+        };
         pinnedMessages.push(pinData);
         
         try {
-          await pool.query('INSERT INTO pinned_messages (message_id, data) VALUES ($1, $2) ON CONFLICT (message_id) DO NOTHING', [data.msgId, pinData]);
+          await pool.query('INSERT INTO pinned_messages (message_id, data) VALUES ($1, $2) ON CONFLICT (message_id) DO UPDATE SET data = $2', [data.msgId, pinData]);
+          io.emit('pinned_list', pinnedMessages);
         } catch (e) { console.error("Pin DB Error:", e); }
-
-        io.emit('pinned_list', pinnedMessages);
       }
     }
   });
