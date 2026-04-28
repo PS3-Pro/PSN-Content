@@ -268,7 +268,7 @@ io.on('connection', (socket) => {
     messageData.user = socket.userName || messageData.user;
     
     messageHistory.push(messageData);
-    if (messageHistory.length > 100) messageHistory.shift();
+    //if (messageHistory.length > 100) messageHistory.shift();
     await pool.query('INSERT INTO chat (message) VALUES ($1)', [messageData]);
     io.emit('chat_message', messageData); 
   });
