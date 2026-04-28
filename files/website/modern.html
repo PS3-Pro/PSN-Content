@@ -3918,13 +3918,25 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 				switchView('view-chat');
 			} 
 	
+			// FIX DEFINITIVO: Blindagem para o scroll não tremer/ioiô
 			setTimeout(() => {
 				const chatBox = document.getElementById('chat-messages');
 				const divider = document.getElementById('unread-divider');
-				if (divider) {
-					divider.scrollIntoView({ behavior: 'auto', block: 'center' });
-				} else if (chatBox) {
+				
+				if (chatBox) {
+					chatBox.style.setProperty('scroll-behavior', 'auto', 'important');
+
+					if (divider) {
+						const topPos = divider.offsetTop - (chatBox.offsetHeight / 2);
+						chatBox.scrollTop = topPos;
+						
+						setTimeout(() => { chatBox.style.setProperty('scroll-behavior', 'smooth'); }, 100);
+						return; 
+					} 
+
 					chatBox.scrollTop = chatBox.scrollHeight;
+					
+					setTimeout(() => { chatBox.style.setProperty('scroll-behavior', 'smooth'); }, 100);
 				}
 			}, 50);
 	
@@ -5899,8 +5911,22 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 					setTimeout(() => {
 						const box = document.getElementById('chat-messages');
 						const divider = document.getElementById('unread-divider');
-						if (divider) divider.scrollIntoView({ behavior: 'auto', block: 'center' });
-						else if (box) box.scrollTop = box.scrollHeight;
+						
+						if (box) {
+							const originalSmooth = box.style.scrollBehavior;
+							box.style.setProperty('scroll-behavior', 'auto', 'important');
+
+							if (divider) {
+								const topPos = divider.offsetTop - (box.offsetHeight / 2);
+								box.scrollTop = topPos;
+							} else {
+								box.scrollTop = box.scrollHeight;
+							}
+
+							setTimeout(() => {
+								box.style.setProperty('scroll-behavior', originalSmooth || 'smooth');
+							}, 100);
+						}
 					}, 150);
 				}
 				else if (viewId === 'view-settings') {
@@ -9489,7 +9515,6 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 	
 				grid.innerHTML = htmlFormatado;
 	
-				// Salva no Cache para as próximas aberturas do painel (apenas se for Trending)
 				if (!query) {
 					cachedTrendingGifs = htmlFormatado;
 				}
@@ -9785,8 +9810,7 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 		box.insertAdjacentHTML('beforeend', msgHtml);
 	
 		if (firstLink && !isImage && !ytId) fetchLinkMetadata(firstLink[0], `lp-${msgId}`);
-		if (box.children.length > 1000) box.removeChild(box.children[1]);
-		box.scrollTop = box.scrollHeight;
+		//if (box.children.length > 1000) box.removeChild(box.children[1]);
 	}
 	
 	function renderPinnedBar() {
@@ -10322,6 +10346,9 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 			const box = document.getElementById('chat-messages');
 			if (!box) return;
 		
+			box.style.opacity = '0';
+			box.style.setProperty('scroll-behavior', 'auto', 'important');
+
 			box.innerHTML = `
 				<div id="welcome-banner-scroll" style="text-align: center; margin-bottom: -15px; margin-top: -5px;">
 					<span style="background: rgba(0, 188, 255, 0.05); padding: 6px 20px; border-radius: 20px; font-size: 9.5px; color: #fff; text-transform: uppercase; letter-spacing: 1.5px; border: 1px solid rgba(0, 188, 255, 0.1); font-weight: bold; white-space: nowrap;">
@@ -10333,47 +10360,50 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 			let unreadDividerAdded = false;
 			window.lastChatDateLabel = "";
 		
-			history.forEach((data, index) => {
+			history.forEach((data) => {
+				trackUser(data.user);
+	
+				const currentDateLabel = getChatDateLabel(data.time);
+				if (currentDateLabel !== window.lastChatDateLabel) {
+					const divider = document.createElement('div');
+					divider.className = 'date-divider'; 
+					divider.setAttribute('data-label', currentDateLabel);
+					divider.innerHTML = `<span>${currentDateLabel}</span>`;
+					box.appendChild(divider);
+					window.lastChatDateLabel = currentDateLabel;
+				}
+	
+				const msgTime = new Date(data.time).getTime();
+				if (data.user !== myName && lastReadTime > 0 && msgTime > lastReadTime && !unreadDividerAdded) {
+					box.insertAdjacentHTML('beforeend', `
+						<div id="unread-divider" class="ps-new-messages-container">
+							<div class="ps-line left"></div>
+							<span class="ps-unread-text">NEW MESSAGES</span>
+							<div class="ps-line right"></div>
+						</div>`);
+					unreadDividerAdded = true;
+				}
+	
+				appendMessageToChat(data, data.user === myName, data.time);
+			});
+	
+			initDateStickyLogic();
+			
+			const unread = document.getElementById('unread-divider');
+			if (unread) {
+				const topPos = unread.offsetTop - (box.offsetHeight / 2);
+				box.scrollTop = topPos;
+				if (typeof setupDividerAutoRemove === 'function') setupDividerAutoRemove();
+			} else {
+				box.scrollTop = box.scrollHeight;
+			}
+
+			requestAnimationFrame(() => {
+				box.style.transition = "opacity 0.4s ease-out";
+				box.style.opacity = '1';
 				setTimeout(() => {
-					trackUser(data.user);
-		
-					const currentDateLabel = getChatDateLabel(data.time);
-					if (currentDateLabel !== window.lastChatDateLabel) {
-						const divider = document.createElement('div');
-						divider.className = 'date-divider'; 
-						divider.setAttribute('data-label', currentDateLabel);
-						divider.innerHTML = `<span>${currentDateLabel}</span>`;
-						box.appendChild(divider);
-						window.lastChatDateLabel = currentDateLabel;
-					}
-		
-					const msgTime = new Date(data.time).getTime();
-					if (data.user !== myName && lastReadTime > 0 && msgTime > lastReadTime && !unreadDividerAdded) {
-						box.insertAdjacentHTML('beforeend', `
-							<div id="unread-divider" class="ps-new-messages-container">
-								<div class="ps-line left"></div>
-								<span class="ps-unread-text">NEW MESSAGES</span>
-								<div class="ps-line right"></div>
-							</div>`);
-						unreadDividerAdded = true;
-					}
-		
-					appendMessageToChat(data, data.user === myName, data.time);
-		
-					if (index === history.length - 1) {
-						initDateStickyLogic();
-						
-						setTimeout(() => {
-							const unread = document.getElementById('unread-divider');
-							if (unread) {
-								unread.scrollIntoView({ behavior: 'smooth', block: 'center' });
-								if (typeof setupDividerAutoRemove === 'function') setupDividerAutoRemove();
-							} else {
-								box.scrollTop = box.scrollHeight;
-							}
-						}, 100);
-					}
-				}, index * 30);
+					box.style.setProperty('scroll-behavior', 'smooth');
+				}, 100);
 			});
 		
 			if (typeof refreshChatNotificationDot === 'function') refreshChatNotificationDot();
@@ -10382,7 +10412,7 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 		socketChat.on('chat_message', function(data) {
 			if (!window.messageHistory) window.messageHistory = [];
 			window.messageHistory.push(data);
-			//if (window.messageHistory.length > 100) window.messageHistory.shift();
+			if (window.messageHistory.length > 500) window.messageHistory.shift();
 	
 			const chatVisible = document.getElementById('view-chat').style.display === 'flex' || document.getElementById('view-chat').style.display === 'block';
 			const myName = localStorage.getItem('psn_username') || "Guest";
@@ -10395,6 +10425,7 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 			}
 			
 			appendMessageToChat(data, data.user === myName, data.time);
+			if (typeof jumpToBottom === 'function') jumpToBottom();
 			if (typeof refreshChatNotificationDot === 'function') refreshChatNotificationDot();
 		});
 	
@@ -10993,18 +11024,21 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 		}
 	}
     
-    function jumpToBottom() {
-        if (typeof playUiClick === 'function') playUiClick();
+    function jumpToBottom(isManualClick = false) {
         const box = document.getElementById('chat-messages');
         const divider = document.getElementById('unread-divider');
-        
+        if (!box) return;
+
+        if (divider && !isManualClick) return; 
+
+        if (typeof playUiClick === 'function' && isManualClick) playUiClick();
         box.scrollTo({ top: box.scrollHeight, behavior: 'smooth' });
         
         if (divider) {
             divider.style.transition = "all 0.3s ease-out";
             divider.style.opacity = "0";
             divider.style.maxHeight = "0px";
-            setTimeout(() => divider.remove(), 300);
+            setTimeout(() => { if (divider.parentNode) divider.remove(); }, 300);
         }
     }
     
