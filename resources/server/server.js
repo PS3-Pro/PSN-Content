@@ -57,7 +57,7 @@ async function initDb() {
   const pinnedRes = await pool.query('SELECT data FROM pinned_messages ORDER BY id ASC');
   pinnedMessages = pinnedRes.rows.map(r => r.data);
 
-  console.log(`[DB] Database inicializada. ${pinnedMessages.length} pins carregados.`);
+  console.log(`[DB] Database initialized. ${pinnedMessages.length} pins loaded.`);
 }
 
 initDb().catch(console.error);
@@ -95,18 +95,16 @@ const io = new Server(server, {
 });
 
 io.on('connection', (socket) => {
-  console.log('[NETWORK] Socket conectado. ID: ' + socket.id);
+  console.log('[NETWORK] Socket connected. ID: ' + socket.id);
 
   socket.on('authenticate_user', async (data) => {
     try {
-      const { name, password, userData, isNewAccount, adminSecret } = data;
+      const { name, password, userData, isNewAccount } = data;
       
       const dbRes = await pool.query('SELECT data FROM users WHERE name = $1', [name]);
       const dbUser = dbRes.rows.length > 0 ? dbRes.rows[0].data : null;
 
-      const checkIsAdmin = (userName) => {
-        return ADMIN_USERS.includes(userName);
-      };
+      const isAdmin = ADMIN_USERS.includes(name);
 
       if (dbUser) {
         if (!dbUser.passwordHash) {
@@ -118,7 +116,6 @@ io.on('connection', (socket) => {
         
         if (match) {
           socket.userName = name;
-          const isAdmin = checkIsAdmin(name);
           socket.isAdmin = isAdmin;
 
           userDatabase[name] = {
@@ -153,7 +150,6 @@ io.on('connection', (socket) => {
       } else {
         const hash = await bcrypt.hash(password, 10);
         socket.userName = name;
-        const isAdmin = checkIsAdmin(name);
         socket.isAdmin = isAdmin;
 
         userDatabase[name] = {
@@ -180,7 +176,7 @@ io.on('connection', (socket) => {
           [name, userDatabase[name]]
         );
         
-        console.log(`[NETWORK] ${name} criou uma conta nova. Admin: ${isAdmin}`);
+        console.log(`[NETWORK] ${name} created a new account. Admin: ${isAdmin}`);
 
         socket.emit('auth_success', { 
           name, 
@@ -465,5 +461,5 @@ io.on('connection', (socket) => {
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-  console.log(`Neon Server rodando na porta ${PORT}`);
+  console.log(`PSN Database Server running on port ${PORT}`);
 });
