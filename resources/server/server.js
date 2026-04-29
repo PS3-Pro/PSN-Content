@@ -259,7 +259,7 @@ io.on('connection', (socket) => {
     const getTop = (countsObj) => {
         return Object.entries(countsObj)
             .sort((a, b) => b[1] - a[1])
-            .slice(0, 30)
+            .slice(0, 40)
             .map(entry => ({ id: entry[0], count: entry[1] }));
     };
 
