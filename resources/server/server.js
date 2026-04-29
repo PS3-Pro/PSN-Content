@@ -163,7 +163,7 @@ io.on('connection', (socket) => {
           lastSeen: Date.now(),
           avatar: userData.avatar || DEFAULT_AVATAR,
           joined: userData.joined || '2026',
-		  settingsData: userData.settingsData || { audio: "1", ux: "1", ps3Ip: "" },
+		  settingsData: userData.settingsData || { audio: "1", ux: "1", chatSound: "1", ps3Ip: "" },
           trophiesData: userData.trophiesData || {},
           wishlistData: userData.wishlistData || [],
           favoritesData: userData.favoritesData || [],
