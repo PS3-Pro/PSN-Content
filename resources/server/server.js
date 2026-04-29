@@ -163,6 +163,7 @@ io.on('connection', (socket) => {
           lastSeen: Date.now(),
           avatar: userData.avatar || DEFAULT_AVATAR,
           joined: userData.joined || '2026',
+		  settingsData: userData.settingsData || { audio: "1", ux: "1", ps3Ip: "" },
           trophiesData: userData.trophiesData || {},
           wishlistData: userData.wishlistData || [],
           favoritesData: userData.favoritesData || [],
@@ -200,23 +201,32 @@ io.on('connection', (socket) => {
   socket.on('update_profile', async (userData) => {
     const name = socket.userName;
     if (name && userDatabase[name]) {
-      if (userData.avatar === null || userData.avatar === undefined) {
-          delete userData.avatar;
-      }
-      
-      Object.assign(userDatabase[name], userData);
-      userDatabase[name].lastSeen = Date.now();
-      
-      try {
-        await pool.query('UPDATE users SET data = $1 WHERE name = $2', [userDatabase[name], name]);
-        console.log(`[DATABASE] Profile for ${name} updated successfully.`);
-      } catch (err) {
-        console.error(`[DATABASE ERROR] Failed to save profile for ${name}:`, err);
-      }
+        
+        if (userData.settingsData) {
+            userDatabase[name].settingsData = {
+                ...(userDatabase[name].settingsData || {}),
+                ...userData.settingsData
+            };
+            delete userData.settingsData;
+        }
 
-      io.emit('online_list', getSanitizedOnlineList());
+        if (userData.avatar === null || userData.avatar === undefined) {
+            delete userData.avatar;
+        }
+        
+        Object.assign(userDatabase[name], userData);
+        userDatabase[name].lastSeen = Date.now();
+        
+        try {
+            await pool.query('UPDATE users SET data = $1 WHERE name = $2', [userDatabase[name], name]);
+			 //console.log(`[DATABASE] Profile for ${name} updated.`);
+        } catch (err) {
+            console.error(`[DATABASE ERROR] Failed to save profile for ${name}:`, err);
+        }
+
+        io.emit('online_list', getSanitizedOnlineList());
     }
-  });
+});
 
   socket.on('request_user_data', (data) => {
     const { targetName, type } = data;
