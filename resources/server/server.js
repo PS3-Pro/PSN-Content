@@ -14,6 +14,8 @@ const ADMIN_SECRET = process.env.ADMIN_SECRET || "ADMINENABLED";
 
 const DEFAULT_AVATAR = "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/interface/modern/images/avatars/default.png";
 
+const MAX_CHAT_HISTORY = 1000; 
+
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false }
@@ -51,13 +53,13 @@ async function initDb() {
     userDatabase[row.name].online = false;
   });
 
-  const chatRes = await pool.query('SELECT message FROM chat ORDER BY id ASC LIMIT 100');
-  messageHistory = chatRes.rows.map(r => r.message);
+  const chatRes = await pool.query(`SELECT message FROM chat ORDER BY id DESC LIMIT ${MAX_CHAT_HISTORY}`);
+  messageHistory = chatRes.rows.map(r => r.message).reverse();
   
   const pinnedRes = await pool.query('SELECT data FROM pinned_messages ORDER BY id ASC');
   pinnedMessages = pinnedRes.rows.map(r => r.data);
 
-  console.log(`[DB] Database initialized. ${pinnedMessages.length} pins loaded.`);
+  console.log(`[DB] Database initialized. ${messageHistory.length} messages and ${pinnedMessages.length} pins loaded.`);
 }
 
 initDb().catch(console.error);
@@ -300,7 +302,9 @@ io.on('connection', (socket) => {
     messageData.user = socket.userName || messageData.user;
     
     messageHistory.push(messageData);
-    //if (messageHistory.length > 100) messageHistory.shift();
+    
+    if (messageHistory.length > MAX_CHAT_HISTORY) messageHistory.shift(); 
+    
     await pool.query('INSERT INTO chat (message) VALUES ($1)', [messageData]);
     io.emit('chat_message', messageData); 
   });
@@ -389,10 +393,16 @@ io.on('connection', (socket) => {
     const msgIndex = messageHistory.findIndex(m => String(new Date(m.time).getTime()) === String(data.msgId));
     if (msgIndex > -1) {
         const isAdmin = socket.isAdmin === true;
+        const msgTime = messageHistory[msgIndex].time;
+
         if (messageHistory[msgIndex].user === socket.userName || isAdmin) {
             messageHistory.splice(msgIndex, 1);
-            await pool.query('DELETE FROM chat');
-            for(const m of messageHistory) { await pool.query('INSERT INTO chat (message) VALUES ($1)', [m]); }
+            try {
+                await pool.query("DELETE FROM chat WHERE message->>'time' = $1", [msgTime]);
+            } catch (err) {
+                console.error("Erro ao deletar mensagem do banco:", err);
+            }
+
             io.emit('message_deleted', data.msgId);
 
             const isPinned = pinnedMessages.find(p => p.id === data.msgId);
