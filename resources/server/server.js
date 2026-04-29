@@ -236,6 +236,38 @@ io.on('connection', (socket) => {
       })).slice(0, 15);
     socket.emit('global_search_results', results);
   });
+  
+  socket.on('request_trending', () => {
+    let dlCounts = {};
+    let wishCounts = {};
+
+    Object.values(userDatabase).forEach(user => {
+        if (user.downloadsData) {
+            user.downloadsData.forEach(item => {
+                const id = item.titleId || item.id;
+                if (id) dlCounts[id] = (dlCounts[id] || 0) + 1;
+            });
+        }
+        if (user.wishlistData) {
+            user.wishlistData.forEach(item => {
+                const id = item.titleId || item.id;
+                if (id) wishCounts[id] = (wishCounts[id] || 0) + 1;
+            });
+        }
+    });
+
+    const getTop = (countsObj) => {
+        return Object.entries(countsObj)
+            .sort((a, b) => b[1] - a[1])
+            .slice(0, 30)
+            .map(entry => ({ id: entry[0], count: entry[1] }));
+    };
+
+    socket.emit('trending_data', {
+        topDownloads: getTop(dlCounts),
+        topWishlist: getTop(wishCounts)
+    });
+  });
 
   socket.on('admin_redeem', (data, callback) => {
     if (!data || typeof callback !== 'function') return;
