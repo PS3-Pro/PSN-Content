@@ -227,6 +227,38 @@ select option { background-color: var(--bg-dark); }
 .btn-rap:hover { background: #fff; }
 .loader { grid-column: 1 / -1; text-align: center; padding: 50px; color: var(--ps-blue); font-size: 18px; }
 
+.game-card.is-playing {
+    border: 2px solid var(--ps-blue) !important;
+    box-shadow: 0 0 20px var(--ps-neon), inset 0 0 10px rgba(0, 112, 204, 0.2) !important;
+    transform: scale(1.02);
+}
+
+.playing-now-badge {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    background: var(--ps-blue);
+    color: white;
+    padding: 5px 12px;
+    border-radius: 4px;
+    font-size: 10px;
+    font-weight: 900;
+    letter-spacing: 1px;
+    z-index: 5;
+    text-transform: uppercase;
+    box-shadow: 0 0 15px rgba(0, 112, 204, 0.8);
+    animation: pulse-dot 1.5s infinite;
+    pointer-events: none;
+}
+
+/* Ajuste para botões duplos no card da biblioteca */
+.btn-group-playing {
+    display: grid !important;
+    grid-template-columns: 1fr 1fr !important;
+    gap: 6px !important;
+}
+
 /* ========================================================================== BUTTONS (WISH & FAV) ========================================================================== */
 .wish-btn, .fav-btn { position: absolute; bottom: 8px; right: 8px; z-index: 10; width: 28px; height: 28px; background: rgba(0, 0, 0, 0.7); border-radius: 50%; display: grid; place-items: center; transition: all 0.2s ease; backdrop-filter: blur(4px); border: 1px solid rgba(255, 255, 255, 0.2); cursor: pointer; padding: 0; margin: 0; }
 .wish-btn i { display: block; margin: 0; padding: 0; line-height: 1; font-size: 14px; transform: translate(0.5px, 0.5px); transition: transform 0.2s ease; }
@@ -7065,6 +7097,12 @@ div[id^="msg-row-"] { transition: opacity 0.4s ease, transform 0.4s cubic-bezier
 		if (!ip) {
 			if (window.myCurrentPS3Status !== null) {
 				window.myCurrentPS3Status = null;
+				
+				const libraryView = document.getElementById('view-library');
+				if (libraryView && libraryView.style.display === 'block' && typeof lastScannedGames !== 'undefined') {
+					renderLocalLibrary(lastScannedGames, true, true);
+				}
+	
 				if (typeof broadcastProfileUpdate === 'function') broadcastProfileUpdate();
 				if (typeof socketChat !== 'undefined' && socketChat && socketChat.connected) {
 					if (typeof updateGlobalOnlineStatus === 'function') updateGlobalOnlineStatus('online');
@@ -7134,6 +7172,18 @@ div[id^="msg-row-"] { transition: opacity 0.4s ease, transform 0.4s cubic-bezier
 			if (JSON.stringify(currentStatus) !== JSON.stringify(window.myCurrentPS3Status)) {
 				window.myCurrentPS3Status = currentStatus;
 				_lastGameTitle = currentStatus.title;
+	
+				const libraryView = document.getElementById('view-library');
+				const gamesSubView = document.getElementById('subview-games');
+				
+				if (libraryView && libraryView.style.display === 'block' && 
+					gamesSubView && (gamesSubView.style.display === 'block' || gamesSubView.style.display === 'flex')) {
+					
+					if (typeof lastScannedGames !== 'undefined' && lastScannedGames.length > 0) {
+						renderLocalLibrary(lastScannedGames, true, true);
+					}
+				}
+	
 				if (typeof broadcastProfileUpdate === 'function') broadcastProfileUpdate();
 				
 				if (typeof socketChat !== 'undefined' && socketChat && socketChat.connected) {
@@ -7145,6 +7195,12 @@ div[id^="msg-row-"] { transition: opacity 0.4s ease, transform 0.4s cubic-bezier
 			if (window.myCurrentPS3Status !== null) {
 				window.myCurrentPS3Status = null;
 				_lastGameTitle = null;
+	
+				const libraryView = document.getElementById('view-library');
+				if (libraryView && libraryView.style.display === 'block' && typeof lastScannedGames !== 'undefined') {
+					renderLocalLibrary(lastScannedGames, true, true);
+				}
+	
 				if (typeof broadcastProfileUpdate === 'function') broadcastProfileUpdate();
 				
 				if (typeof socketChat !== 'undefined' && socketChat && socketChat.connected) {
@@ -7354,13 +7410,28 @@ div[id^="msg-row-"] { transition: opacity 0.4s ease, transform 0.4s cubic-bezier
 			return;
 		}
 	
+		if (typeof lastScannedGames !== 'undefined' && lastScannedGames.length > 0) {
+			renderLocalLibrary(lastScannedGames, true, false);
+		} else {
+			grid.innerHTML = "";
+			for (let i = 0; i < 12; i++) {
+				grid.innerHTML += `
+					<div class="skeleton-card">
+						<div class="skeleton-img"></div>
+						<div class="skeleton-text" style="margin-top: 15px;"></div>
+						<div class="skeleton-text short"></div>
+						<div class="skeleton-footer"></div>
+					</div>`;
+			}
+		}
+	
 		saveState('ps3_ip', ip);
 		
 		if (typeof socketChat !== 'undefined' && socketChat && socketChat.connected) {
-            socketChat.emit('update_profile', { ps3_ip: ip });
-        }
+			socketChat.emit('update_profile', { ps3_ip: ip });
+		}
 		
-		if (status) { status.innerText = "(Refreshing UI...)"; status.style.color = "orange"; }
+		if (status) { status.innerText = "(Syncing Library...)"; status.style.color = "orange"; }
 		if (libraryToolbar) libraryToolbar.style.display = 'flex'; 
 	
 		try {
@@ -7384,11 +7455,11 @@ div[id^="msg-row-"] { transition: opacity 0.4s ease, transform 0.4s cubic-bezier
 				};
 			}).filter(game => game.path !== "");
 	
-			renderLocalLibrary(discoveredGames);
+			renderLocalLibrary(discoveredGames, false, true);
 			
 			if (typeof window.broadcastProfileUpdate === 'function') {
-                window.broadcastProfileUpdate();
-            }
+				window.broadcastProfileUpdate();
+			}
 	
 			if (actions) actions.style.display = 'flex';
 			if (status) { status.innerText = `(${discoveredGames.length} items)`; status.style.color = "#4caf50"; }
@@ -7402,27 +7473,23 @@ div[id^="msg-row-"] { transition: opacity 0.4s ease, transform 0.4s cubic-bezier
 		} catch (err) {
 			console.error("Connection Error:", err);
 	
-			if (actions) actions.style.display = 'none';
-			if (status) { status.innerText = "(Failed to connect to PS3™)"; status.style.color = "#ff4444"; }
-			if (globalIcon) {
-				globalIcon.style.color = "#ff4444";
-				globalIcon.className = "fas fa-circle status-dot-base status-dot-disconnected";
+			if (status) { status.innerText = "(Failed to sync)"; status.style.color = "#ff4444"; }
+			
+			if (!lastScannedGames || lastScannedGames.length === 0) {
+				grid.innerHTML = `
+				<div style="grid-column: 1/-1; text-align: center; color: #888; padding: 100px 50px; background: rgba(0,0,0,0.2); border-radius: 12px; border: 1px dashed rgba(255,255,255,0.05); margin-top: 10px;">
+					<i class="fas fa-unlink" style="font-size: 50px; margin-bottom: 20px; opacity: 0.2;"></i>
+					<div style="font-size: 18px;">Connection failed.</div>
+					<p style="font-size: 13px; color: var(--text-muted);">Could not connect to PS3™. webMAN might be busy or the IP changed.</p>
+				</div>`;
 			}
-			if (libraryToolbar) libraryToolbar.style.display = 'none'; 
-			if (searchBar && canToggleSearch) searchBar.style.display = 'none';
-	
-			grid.innerHTML = `
-			<div style="grid-column: 1/-1; text-align: center; color: #888; padding: 100px 50px; background: rgba(0,0,0,0.2); border-radius: 12px; border: 1px dashed rgba(255,255,255,0.05); margin-top: 10px;">
-				<i class="fas fa-unlink" style="font-size: 50px; margin-bottom: 20px; opacity: 0.2;"></i>
-				<div style="font-size: 18px;">Connection failed.</div>
-				<p style="font-size: 13px; color: var(--text-muted);">Could not connect to PS3™. webMAN might be busy or the IP changed.</p>
-			</div>`;
 		}
 	}
-	
+
 	let lastScannedGames = [];
-	
-	function renderLocalLibrary(games, isFiltering = false) {
+	window.libCoverCache = window.libCoverCache || {};
+
+	function renderLocalLibrary(games, isFiltering = false, isSilent = false) {
 		const grid = document.getElementById('ps3-local-grid');
 		grid.innerHTML = "";
 		
@@ -7467,6 +7534,9 @@ div[id^="msg-row-"] { transition: opacity 0.4s ease, transform 0.4s cubic-bezier
 			return;
 		}
 	
+		const currentPlaying = window.myCurrentPS3Status || { status: 'idle' };
+		const ip = document.getElementById('ps3-ip').value;
+	
 		games.forEach((game, i) => {
 			const pathUpper = game.path.toUpperCase();
 			let consoleType = "PS3", tagClass = "tag-ps3", region = "HDD";
@@ -7475,25 +7545,62 @@ div[id^="msg-row-"] { transition: opacity 0.4s ease, transform 0.4s cubic-bezier
 			else if (pathUpper.includes("/PSXISO/")) { consoleType = "PS1"; tagClass = "tag-ps1"; }
 			else if (pathUpper.includes("/PSPISO/")) { consoleType = "PSP"; tagClass = "tag-psp"; }
 			else if (pathUpper.includes("/ROMS/")) { consoleType = "RETRO"; tagClass = "tag-retro"; }
-			else if (pathUpper.includes("/GAME/") || pathUpper.includes("/PS3ISO/") || pathUpper.includes("/GAMEI/") || pathUpper.includes("/GAMES/")) { consoleType = "PS3"; tagClass = "tag-ps3"; }
 	
 			if (pathUpper.includes("USB")) region = "USB";
 			else if (pathUpper.includes("NET")) region = "NET";
 	
+			if (!window.libCoverCache[game.path]) {
+				const matchId = game.path.match(/[A-Z]{4}\d{5}/);
+				const gameId = matchId ? matchId[0] : null;
+				window.libCoverCache[game.path] = {
+					id: gameId,
+					cover: (gameId && isNaN(gameId)) ? getOptimizedCover(gameId) : (game.cover || FALLBACK_IMG)
+				};
+			}
+			
+			const cachedData = window.libCoverCache[game.path];
 			const isFav = favoritesLibrary.some(fav => fav.path === game.path);
 			const starIcon = isFav ? 'fas fa-star' : 'far fa-star';
 			const starColor = isFav ? '#ffcc00' : 'rgba(255,255,255,0.6)';
 	
+			const isThisGamePlaying = (currentPlaying.status === 'playing' && 
+									(game.title === currentPlaying.title || (cachedData.id && cachedData.id === currentPlaying.titleId)));
+	
+			const activeClass = isThisGamePlaying ? "is-playing" : "";
+			const animClass = isSilent ? "no-anim" : "anim-reveal";
+			
+			let buttonsHtml = '';
+			if (isThisGamePlaying) {
+				buttonsHtml = `
+					<div class="btn-group" style="display: grid; grid-template-columns: 1fr 1fr; gap: 6px;">
+						<button class="btn-mini btn-upd" onclick="playUiClick(); fetch('http://${ip}/xmb.ps3$exit', {mode:'no-cors'})" title="Exit to XMB">
+							<i class="fas fa-sign-out-alt"></i> EXIT
+						</button>
+						<button class="btn-mini btn-multi" onclick="playUiClick(); fetch('http://${ip}/xmb.ps3$reloadgame', {mode:'no-cors'})" title="Relaunch Game">
+							<i class="fas fa-sync-alt"></i> RELOAD
+						</button>
+					</div>`;
+			} else {
+				buttonsHtml = `
+					<div class="btn-group">
+						<button class="btn-mini btn-multi" onclick="playUiClick(); mountGame('${game.path}')">
+							<i class="fas fa-play"></i> MOUNT
+						</button>
+					</div>`;
+			}
+	
 			const card = document.createElement('div');
-			card.className = "game-card anim-reveal";
+			card.className = `game-card ${animClass} ${activeClass}`;
 			card.dataset.console = consoleType.toLowerCase();
 			card.setAttribute("onmouseenter", "playUiHover(); this.classList.remove('anim-reveal'); this.classList.add('no-anim');");
-			card.style.setProperty('--tile-idx', i);
+			card.style.setProperty('--tile-idx', i % 50);
+	
 			card.innerHTML = `
 				<div class="game-img-container">
-					<img src="${game.cover || 'https://via.placeholder.com/155x178?text=PS3+GAME'}" 
+					${isThisGamePlaying ? '<div class="playing-now-badge">Playing Now</div>' : ''}
+					<img src="${cachedData.cover}" 
 						class="game-img" 
-						onerror="this.src='https://via.placeholder.com/155x178?text=NO+IMAGE'">
+						onerror="this.src='${FALLBACK_IMG}'">
 					<div class="console-tag ${tagClass}">${consoleType}</div>
 					<div class="region-tag">${region}</div>
 					<div class="fav-btn" onclick="toggleLocalFavorite(event, ${lastScannedGames.indexOf(game)})">
@@ -7502,14 +7609,14 @@ div[id^="msg-row-"] { transition: opacity 0.4s ease, transform 0.4s cubic-bezier
 				</div>
 				<div class="game-info">
 					<h3 class="game-title" title="${game.title}">${game.title}</h3>
-					<div class="btn-group">
-						<button class="btn-mini btn-multi" onclick="playUiClick(); mountGame('${game.path}')">
-							<i class="fas fa-play"></i> MOUNT
-						</button>
-					</div>
+					${buttonsHtml}
 				</div>`;
 			grid.appendChild(card);
 		});
+	
+		if (!isSilent) {
+			setupRevealAnimations('ps3-local-grid');
+		}
 	}
 	
 	window.updateLibraryLastPlayed = function(title, titleId) {
@@ -7890,7 +7997,7 @@ div[id^="msg-row-"] { transition: opacity 0.4s ease, transform 0.4s cubic-bezier
 			targetView = gamesView;
 			navGames?.classList.add('active');
 			if (searchBar) searchBar.style.display = 'flex';
-			applyLibraryFilters();
+			
 			refreshPS3Library();
 		}
 	
