@@ -7210,142 +7210,256 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 		}
 	}
 	
-	async function explorePath(path) {
-		const ip = document.getElementById('ps3-ip').value;
-		const status = document.getElementById('files-status');
-		const listContainer = document.getElementById('file-browser-list');
-		const globalIcon = document.getElementById('global-status-icon');
-		const offlineMsg = document.getElementById('fm-offline-msg');
-		const onlineContainer = document.getElementById('fm-online-container');
-	
-		if (!ip) {
-			if (status) { status.innerText = "(Disconnected)"; status.style.color = "#ff4444"; }
-			if (offlineMsg) {
-				offlineMsg.innerHTML = `
-					<i class="fas fa-folder-open" style="font-size: 50px; margin-bottom: 20px; opacity: 0.2;"></i>
-					<div style="font-size: 18px;">Console Not Connected</div>
-					<p style="font-size: 13px; color: var(--text-muted);">Please enter your PS3™ IP in the top header and click the connect icon to browse files.</p>`;
-				offlineMsg.style.display = 'block';
-			}
-			if (onlineContainer) onlineContainer.style.display = 'none';
-			return;
-		}
-	
-		const isConnected = globalIcon && (globalIcon.classList.contains('status-dot-connected') || globalIcon.style.color === "rgb(76, 175, 80)");
-		if (!isConnected) {
-			if (status) { status.innerText = "(Disconnected)"; status.style.color = "#ff4444"; }
-			if (offlineMsg) {
-				offlineMsg.innerHTML = `
-					<i class="fas fa-power-off" style="font-size: 50px; margin-bottom: 20px; opacity: 0.2;"></i>
-					<div style="font-size: 18px;">Console Offline</div>
-					<p style="font-size: 13px; color: var(--text-muted);">Please click the connect button in the header when the PS3™ is turned on.</p>`;
-				offlineMsg.style.display = 'block';
-			}
-			if (onlineContainer) onlineContainer.style.display = 'none';
-			return;
-		}
-	
-		if (offlineMsg) offlineMsg.style.display = 'none';
-		if (onlineContainer) onlineContainer.style.display = 'block';
-		if (status) { status.innerText = "(Reading files...)"; status.style.color = "orange"; }
-	
-		currentPath = path;
-	
-		const pathContainer = document.getElementById('current-path');
-		pathContainer.innerHTML = `<span onclick="explorePath('/')"><i class="fas fa-hdd"></i> Root</span>`;
-		path.split('/').filter(p => p).reduce((acc, part) => {
-			acc += '/' + part;
-			pathContainer.innerHTML += ` <i class="fas fa-chevron-right" style="font-size:10px;opacity:0.3"></i> <span onclick="explorePath('${acc}')">${part}</span>`;
-			return acc;
-		}, '');
-	
-		try {
-			const response = await fetch(`http://${ip}${path}`, { cache: 'no-store' });
-			if (!response.ok) throw new Error(`HTTP ${response.status}`);
-	
-			const html = await response.text();
-			const parser = new DOMParser();
-			const doc = parser.parseFromString(html, 'text/html');
-			const basePath = path === '/' ? '' : path.replace(/\/$/, '');
-	
-			listContainer.innerHTML = "";
-			if (status) { status.innerText = `(${path})`; status.style.color = "#4caf50"; }
-	
-			doc.querySelectorAll('a.d').forEach(link => {
-				const name = link.innerText.trim();
-				if (!name || name === '..' || name === 'Parent Directory') return;
-				const href = link.getAttribute('href');
-				const fullPath = href.startsWith('/') ? href : `${basePath}/${href}`;
-				const rowTd = link.closest('td');
-				const sizeTd = rowTd?.nextElementSibling;
-				let sizeText = "--";
-				if (sizeTd) {
-					const sizeLink = sizeTd.querySelector('a');
-					sizeText = sizeLink ? sizeLink.innerText.trim() : sizeTd.innerText.trim();
-				}
-				const row = document.createElement('div');
-				row.className = "file-row anim-reveal";
-				row.innerHTML = `
-					<div class="file-name" onclick="explorePath('${fullPath}')">
-						<i class="fas fa-folder folder-type"></i> ${name}
-					</div>
-					<div class="file-size">${sizeText}</div>
-					<div class="col-actions">
-						<button class="btn-mini" onclick="event.stopPropagation(); deleteFile('${fullPath}')" title="Delete">
-							<i class="fas fa-trash"></i>
-						</button>
-					</div>`;
-				listContainer.appendChild(row);
-			});
-	
-			doc.querySelectorAll('a.w').forEach(link => {
-				const name = link.innerText.trim();
-				if (!name) return;
-				const href = link.getAttribute('href');
-				const fullPath = href.startsWith('/') ? href : `${basePath}/${href}`;
-				const rowTd = link.closest('td');
-				const sizeTd = rowTd?.nextElementSibling;
-				let sizeText = "--";
-				if (sizeTd) {
-					const sizeLink = sizeTd.querySelector('a');
-					sizeText = sizeLink ? sizeLink.innerText.trim() : sizeTd.childNodes[0]?.textContent?.trim() || "--";
-				}
-				const row = document.createElement('div');
-				row.className = "file-row anim-reveal";
-				row.innerHTML = `
-					<div class="file-name">
-						<i class="far fa-file file-type"></i> ${name}
-					</div>
-					<div class="file-size">${sizeText}</div>
-					<div class="col-actions">
-						<button class="btn-mini" onclick="deleteFile('${fullPath}')" title="Delete">
-							<i class="fas fa-trash"></i>
-						</button>
-					</div>`;
-				listContainer.appendChild(row);
-			});
-	
-			if (listContainer.children.length === 0) {
-				listContainer.innerHTML = `
-				<div style="text-align:center;color:#888;padding:100px 50px;">
-					<i class="fas fa-folder-open" style="font-size:50px;opacity:0.2;display:block;margin-bottom:20px;"></i>
-					Empty folder.
-				</div>`;
-			}
-	
-		} catch (e) {
-			console.error("[explorePath]", e);
-			if (status) { status.innerText = `(Erro: ${e.message})`; status.style.color = "#ff4444"; }
-			if (offlineMsg) {
-				offlineMsg.innerHTML = `
-					<i class="fas fa-unlink" style="font-size: 50px; margin-bottom: 20px; opacity: 0.2;"></i>
-					<div style="font-size: 18px;">Connection failed.</div>
-					<p style="font-size: 13px; color: var(--text-muted);">Could not reach the console at ${ip}.</p>`;
-				offlineMsg.style.display = 'block';
-			}
-			if (onlineContainer) onlineContainer.style.display = 'none';
-		}
-	}
+async function explorePath(path) {
+    const ip = document.getElementById('ps3-ip').value;
+    const status = document.getElementById('files-status');
+    const listContainer = document.getElementById('file-browser-list');
+    const globalIcon = document.getElementById('global-status-icon');
+    const offlineMsg = document.getElementById('fm-offline-msg');
+    const onlineContainer = document.getElementById('fm-online-container');
+    const pathContainer = document.getElementById('current-path');
+
+    if (!ip) {
+        if (status) { status.innerText = "(Disconnected)"; status.style.color = "#ff4444"; }
+        if (offlineMsg) {
+            offlineMsg.innerHTML = `
+                <i class="fas fa-folder-open" style="font-size: 50px; margin-bottom: 20px; opacity: 0.2;"></i>
+                <div style="font-size: 18px;">Console Not Connected</div>
+                <p style="font-size: 13px; color: var(--text-muted);">Please enter your PS3™ IP in the top header and click the connect icon to browse files.</p>`;
+            offlineMsg.style.display = 'block';
+        }
+        if (onlineContainer) onlineContainer.style.display = 'none';
+        return;
+    }
+
+    const isConnected = globalIcon && (globalIcon.classList.contains('status-dot-connected') || globalIcon.style.color === "rgb(76, 175, 80)");
+    if (!isConnected) {
+        if (status) { status.innerText = "(Disconnected)"; status.style.color = "#ff4444"; }
+        if (offlineMsg) {
+            offlineMsg.innerHTML = `
+                <i class="fas fa-power-off" style="font-size: 50px; margin-bottom: 20px; opacity: 0.2;"></i>
+                <div style="font-size: 18px;">Console Offline</div>
+                <p style="font-size: 13px; color: var(--text-muted);">Please click the connect button in the header when the PS3™ is turned on.</p>`;
+            offlineMsg.style.display = 'block';
+        }
+        if (onlineContainer) onlineContainer.style.display = 'none';
+        return;
+    }
+
+    if (offlineMsg) offlineMsg.style.display = 'none';
+    if (onlineContainer) onlineContainer.style.display = 'block';
+    if (status) { status.innerText = "(Reading files...)"; status.style.color = "orange"; }
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 5000);
+
+    try {
+        const response = await fetch(`http://${ip}${path}`, { 
+            signal: controller.signal, 
+            cache: 'no-store' 
+        });
+        clearTimeout(timeoutId);
+
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+
+        const html = await response.text();
+        
+        currentPath = path;
+
+        const parser = new DOMParser();
+        const doc = parser.parseFromString(html, 'text/html');
+        const basePath = path === '/' ? '' : path.replace(/\/$/, '');
+
+        // Atualiza Breadcrumbs
+        pathContainer.innerHTML = `<span style="cursor:pointer" onclick="explorePath('/')"><i class="fas fa-hdd"></i> Root</span>`;
+        path.split('/').filter(p => p).reduce((acc, part) => {
+            acc += '/' + part;
+            pathContainer.innerHTML += ` <i class="fas fa-chevron-right" style="font-size:10px;opacity:0.3"></i> <span style="cursor:pointer" onclick="explorePath('${acc}')">${part}</span>`;
+            return acc;
+        }, '');
+
+        listContainer.innerHTML = "";
+        if (status) { status.innerText = `(${path})`; status.style.color = "#4caf50"; }
+
+        const isRootView = path === '/';
+
+        // Renderizar PASTAS
+        doc.querySelectorAll('a.d').forEach(link => {
+            const name = link.innerText.trim();
+            if (!name || name === '..' || name === 'Parent Directory') return;
+            const href = link.getAttribute('href');
+            const fullPath = href.startsWith('/') ? href : `${basePath}/${href}`;
+            const rowTd = link.closest('td');
+
+            // --- Lógica para pegar o tamanho das pastas (como espaço livre no HDD) ---
+            let sizeText = "--";
+            let nextTd = rowTd?.nextElementSibling;
+            
+            if (nextTd) {
+                let rawContent = nextTd.textContent.trim();
+                if (rawContent === "-" && nextTd.nextElementSibling) {
+                    rawContent = nextTd.nextElementSibling.textContent.trim();
+                }
+                if (rawContent && rawContent !== "-") {
+                    sizeText = rawContent;
+                }
+            }
+            
+            const row = document.createElement('div');
+            row.className = "file-row anim-reveal";
+            row.innerHTML = `
+                <div class="file-name" style="cursor:pointer; display: flex; align-items: center; gap: 10px;" onclick="explorePath('${fullPath}')">
+                    <i class="fas fa-folder folder-type"></i> <span class="name-text">${name}</span>
+                </div>
+                <div class="file-size" style="white-space: nowrap; font-size: 11px; color: #aaa;">${sizeText}</div>
+                <div class="col-actions" style="display: flex; gap: 10px; justify-content: flex-end; align-items: center;">
+                    ${!isRootView ? `
+                        <button onclick="event.stopPropagation(); startRename(this, '${fullPath}')" title="Rename" style="background:none; border:none; padding:0; cursor:pointer;">
+                            <i class="fas fa-edit" style="color: #aaa; font-size: 13px; transition: 0.2s;" onmouseover="this.style.color='#fff'" onmouseout="this.style.color='#aaa'"></i>
+                        </button>
+                        <button onclick="event.stopPropagation(); deleteFile('${fullPath}')" title="Delete" style="background:none; border:none; padding:0; cursor:pointer;">
+                            <i class="fas fa-trash" style="color: #ff4444; font-size: 13px; transition: 0.2s;" onmouseover="this.style.filter='drop-shadow(0 0 5px rgba(255,68,68,0.8))'" onmouseout="this.style.filter='none'"></i>
+                        </button>
+                    ` : ''}
+                </div>`;
+            listContainer.appendChild(row);
+        });
+
+        // Renderizar ARQUIVOS
+        doc.querySelectorAll('a.w').forEach(link => {
+            const name = link.innerText.trim();
+            if (!name) return;
+        
+            const href = link.getAttribute('href');
+            const fullPath = href.startsWith('/') ? href : `${basePath}/${href}`;
+            const rowTd = link.closest('td');
+            
+            let sizeText = "--";
+            let extraInfo = ""; 
+            let nextTd = rowTd?.nextElementSibling;
+        
+            if (nextTd) {
+                let rawContent = nextTd.textContent.trim();
+                
+                if (rawContent === "-" && nextTd.nextElementSibling) {
+                    rawContent = nextTd.nextElementSibling.textContent.trim();
+                }
+        
+                const match = rawContent.match(/^([\d,.]+\s*(?:KB|MB|GB|bytes|b))(.*)$/i);
+                
+                if (match) {
+                    sizeText = match[1].trim(); 
+                    let rawInfo = match[2].trim(); 
+                    extraInfo = rawInfo.replace(/\s*\[[A-Z0-9-]+\]$/i, '').trim(); 
+                } else {
+                    sizeText = rawContent;
+                }
+            }
+        
+            const isImage = /\.(png|jpg|jpeg|gif)$/i.test(name);
+            const isSfo = name.toUpperCase() === 'PARAM.SFO';
+            const isEboot = name.toUpperCase() === 'EBOOT.BIN';
+            const isSystemFile = isSfo || isEboot;
+        
+            const thumbUrl = `http://${ip}${fullPath}`;
+        
+            let iconHtml = `<i class="far fa-file file-type"></i>`;
+            if (isImage) {
+                iconHtml = `<img src="${thumbUrl}" class="file-thumb" onerror="this.onerror=null; this.outerHTML='<i class=\'far fa-file file-type\'></i>';">`;
+            } else if (isSfo) {
+                iconHtml = `<i class="fas fa-file-invoice file-type" style="color: #00a2ff;"></i>`;
+            } else if (isEboot) {
+                iconHtml = `<i class="fas fa-bolt file-type" style="color: #ff4444;"></i>`; 
+            }
+        
+            const row = document.createElement('div');
+            row.className = "file-row anim-reveal";
+            const nameColor = isSfo ? '#00a2ff' : (isEboot ? '#ff4444' : '');
+            
+            row.innerHTML = `
+                <div class="file-name" style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap;">
+                    ${iconHtml}
+                    <span class="name-text" style="${nameColor ? `color: ${nameColor}; font-weight: bold;` : ''}">${name}</span>
+                    
+                    ${extraInfo ? `<span style="font-size: 11px; color: #aaa; background: rgba(255,255,255,0.05); padding: 2px 6px; border-radius: 4px; margin-left: 5px;">${extraInfo}</span>` : ''}
+                    
+                    ${(isSystemFile && !extraInfo) ? `<span style="font-size: 9px; opacity: 0.5; margin-left: 5px; color: ${nameColor}">[SYSTEM]</span>` : ''}
+                </div>
+                <div class="file-size" style="white-space: nowrap; font-size: 11px; color: #aaa;">${sizeText}</div>
+                <div class="col-actions" style="display: flex; gap: 10px; justify-content: flex-end; align-items: center;">
+                    <button onclick="event.stopPropagation(); startRename(this, '${fullPath}')" title="Rename" style="background:none; border:none; padding:0; cursor:pointer;">
+                        <i class="fas fa-edit" style="color: #aaa; font-size: 13px; transition: 0.2s;" onmouseover="this.style.color='#fff'" onmouseout="this.style.color='#aaa'"></i>
+                    </button>
+                    <button onclick="event.stopPropagation(); deleteFile('${fullPath}')" title="Delete" style="background:none; border:none; padding:0; cursor:pointer;">
+                        <i class="fas fa-trash" style="color: #ff4444; font-size: 13px; transition: 0.2s;" onmouseover="this.style.filter='drop-shadow(0 0 5px rgba(255,68,68,0.8))'" onmouseout="this.style.filter='none'"></i>
+                    </button>
+                </div>`;
+            listContainer.appendChild(row);
+        });
+
+    } catch (e) {
+        clearTimeout(timeoutId);
+        console.error("[explorePath Error]", e);
+        
+        if (status) { 
+            status.innerText = `(Erro: Access Denied or Timeout)`; 
+            status.style.color = "#ff4444"; 
+        }
+        
+        alert("Could not open folder. The PS3™ might be busy or the path is restricted.");
+    }
+}
+
+function startRename(btnElement, oldPath) {
+    const row = btnElement.closest('.file-row');
+    const nameSpan = row.querySelector('.name-text');
+    if (!nameSpan) return;
+
+    const originalName = nameSpan.innerText.trim();
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.value = originalName;
+    
+    input.style = `
+        background: rgba(255,255,255,0.1);
+        border: 1px solid #00a2ff;
+        color: white;
+        border-radius: 4px;
+        padding: 2px 6px;
+        font-size: inherit;
+        font-family: inherit;
+        outline: none;
+        min-width: 150px;
+    `;
+    
+    nameSpan.replaceWith(input);
+    input.focus();
+    input.select();
+
+    const confirmRename = async () => {
+        const newName = input.value.trim();
+        if (newName && newName !== originalName) {
+            const pathParts = oldPath.split('/');
+            pathParts.pop();
+            const newPath = pathParts.join('/') + '/' + newName;
+            const ip = document.getElementById('ps3-ip').value;
+            try {
+                await fetch(`http://${ip}/rename.ps3${oldPath}|${newPath}`, { mode: 'no-cors' });
+                explorePath(currentPath);
+            } catch (e) { 
+                explorePath(currentPath); 
+            }
+        } else { 
+            input.replaceWith(nameSpan); 
+        }
+    };
+
+    input.onkeydown = (e) => {
+        if (e.key === 'Enter') confirmRename();
+        if (e.key === 'Escape') input.replaceWith(nameSpan);
+    };
+    input.onblur = confirmRename;
+}
 	
 	window.addEventListener('DOMContentLoaded', () => {
 		const savedIp = loadState('ps3_ip');
