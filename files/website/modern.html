@@ -8062,16 +8062,18 @@ div[id^="msg-row-"] { transition: opacity 0.4s ease, transform 0.4s cubic-bezier
 	
 			saveState('ps3_ip', ip);
 	
+			_lastConnectionState = true; 
+	
 			if (globalIcon) {
 				globalIcon.className = "fas fa-circle status-dot-base status-dot-connected";
 				globalIcon.style.color = "#4caf50";
 			}
 	
-			_lastConnectionState = true;
-			
 			playUiSuccess();
 			sendConnectionPopup(ip);
 			checkTrophyProgress('connect_ps3', 1);
+	
+			scanConsoleAndReload(true); 
 	
 			if (favoritesLibrary.length > 0) {
 				const favDot = document.getElementById('fav-dot');
@@ -8102,11 +8104,10 @@ div[id^="msg-row-"] { transition: opacity 0.4s ease, transform 0.4s cubic-bezier
 			updateFavoritesLibraryUI();
 	
 			const isFirefox = navigator.userAgent.toLowerCase().includes('firefox');
-			
 			if (isFirefox) {
-				alert(`Failed to connect to ${ip}!\n\nFirefox is blocking the connection to the PS3™ due to security rules (Mixed Content).\n\nTO FIX THIS:\n1. Click the Shield icon next to the URL bar.\n2. Click on the Padlock button inside that menu to disable protection.\n3. Click the connect button again.\n\nAlternatively, please use a Chromium-based browser (Chrome, Edge, Brave, etc.).`);
+				alert(`Failed to connect to ${ip}!\n\nFirefox is blocking the connection to the PS3™ due to security rules (Mixed Content).\n\nTO FIX THIS:\n1. Click the Shield icon next to the URL bar.\n2. Click on the Padlock button inside that menu to disable protection.\n3. Click the connect button again.`);
 			} else {
-				alert(`Failed to connect to ${ip}!\nPlease verify that the PS3™ is turned on and webMAN is running. Also, make sure the PS3™ is connected to the same network as this device.`);
+				alert(`Failed to connect to ${ip}!\nPlease verify that the PS3™ is turned on and webMAN is running.`);
 			}
 		}
 	}
@@ -8164,10 +8165,32 @@ div[id^="msg-row-"] { transition: opacity 0.4s ease, transform 0.4s cubic-bezier
 		if (confirm("Turn off the PS3™?")) {
 			if (typeof playUiClick === 'function') playUiClick();
 			
-			fetch(`http://${ip}/shutdown.ps3`, { mode: 'no-cors' }).catch(e => console.log("Command sent"));
+			fetch(`http://${ip}/shutdown.ps3`, { mode: 'no-cors' }).catch(e => console.log("Shutdown sent"));
 			
 			setTimeout(() => {
-				clearIPMemory();
+				if (connectionMonitorTimer) clearInterval(connectionMonitorTimer);
+				_lastConnectionState = false;
+				window.myCurrentPS3Status = null;
+	
+				const globalIcon = document.getElementById('global-status-icon');
+				if (globalIcon) {
+					globalIcon.className = "fas fa-circle status-dot-base status-dot-disconnected";
+					globalIcon.style.color = "#ff4444";
+				}
+				
+				const btnConnect = document.getElementById('btn-connect-ps3');
+				const btnShutdown = document.getElementById('btn-shutdown-ps3');
+				if (btnConnect) btnConnect.style.display = 'flex';
+				if (btnShutdown) btnShutdown.style.display = 'none';
+	
+				const favDot = document.getElementById('fav-dot');
+				if (favDot) favDot.style.display = 'none';
+	
+				if (typeof refreshPS3Library === 'function') refreshPS3Library();
+				if (typeof updateFavoritesLibraryUI === 'function') updateFavoritesLibraryUI();
+	
+				if (typeof broadcastProfileUpdate === 'function') broadcastProfileUpdate();
+
 			}, 2000);
 		} else {
 			if (typeof playUiBack === 'function') playUiBack();
@@ -9358,28 +9381,49 @@ div[id^="msg-row-"] { transition: opacity 0.4s ease, transform 0.4s cubic-bezier
 		const input = document.getElementById('chat-input');
 		if (!input) return;
 		
-		const text = input.innerText; 
-		const lastAtPos = text.lastIndexOf('@');
-		
-		if (lastAtPos !== -1) {
-			input.innerText = text.substring(0, lastAtPos) + '@' + user + ' ';
+		const selection = window.getSelection();
+		if (!selection.rangeCount) return;
+	
+		const range = selection.getRangeAt(0);
+		const textNode = range.startContainer;
+		const offset = range.startOffset;
+	
+		if (textNode.nodeType !== Node.TEXT_NODE) {
+			const mentionText = "@" + user + " ";
+			const newNode = document.createTextNode(mentionText);
+			range.insertNode(newNode);
+			range.setStartAfter(newNode);
+			range.setEndAfter(newNode);
+		} else {
+			const text = textNode.textContent;
+			const textBeforeCaret = text.substring(0, offset);
+			const atIndex = textBeforeCaret.lastIndexOf('@');
+	
+			if (atIndex !== -1) {
+				range.setStart(textNode, atIndex);
+				range.setEnd(textNode, offset);
+				range.deleteContents();
+	
+				const mentionText = "@" + user + " ";
+				const newNode = document.createTextNode(mentionText);
+				range.insertNode(newNode);
+	
+				range.setStartAfter(newNode);
+				range.setEndAfter(newNode);
+			}
 		}
-		
+	
+		selection.removeAllRanges();
+		selection.addRange(range);
+	
 		const suggestionsBox = document.getElementById('mention-suggestions');
 		if (suggestionsBox) suggestionsBox.style.display = 'none';
 		
 		input.focus();
 		
-		const range = document.createRange();
-		const sel = window.getSelection();
-		range.selectNodeContents(input);
-		range.collapse(false);
-		sel.removeAllRanges();
-		sel.addRange(range);
-		
 		if (typeof playUiClick === 'function') playUiClick();
 		if (typeof updateJumpButtonPosition === 'function') updateJumpButtonPosition();
-		}
+	}
 	
 	window.mentionUserInChat = function(username) {
 		switchTab('chat');
@@ -11950,24 +11994,34 @@ div[id^="msg-row-"] { transition: opacity 0.4s ease, transform 0.4s cubic-bezier
 					chatInput.innerHTML = '';
 				}
 			
-				const text = chatInput.innerText; 
-				const words = text.split(/\s/);
-				const lastWord = words[words.length - 1];
+				const selection = window.getSelection();
+				let currentWord = "";
+				let isFirstWord = false;
 			
-				if (lastWord.startsWith('@')) {
-					showMentionSuggestions(lastWord.substring(1));
+				if (selection.rangeCount > 0) {
+					const range = selection.getRangeAt(0);
+					const textBeforeCaret = range.startContainer.textContent ? range.startContainer.textContent.substring(0, range.startOffset) : "";
+					const wordsBefore = textBeforeCaret.split(/\s/);
+					currentWord = wordsBefore[wordsBefore.length - 1]; // Palavra que você está editando
+					
+					isFirstWord = wordsBefore.length === 1;
+				}
+			
+				if (currentWord.startsWith('@')) {
+					showMentionSuggestions(currentWord.substring(1));
 				} 
-				else if (lastWord.startsWith('/') && words.length === 1) {
-					showCommandSuggestions(lastWord.substring(1));
+				else if (currentWord.startsWith('/') && isFirstWord) {
+					showCommandSuggestions(currentWord.substring(1));
 				}
 				else {
 					const suggBox = document.getElementById('mention-suggestions');
 					if (suggBox) suggBox.style.display = 'none';
 				}
-			
+				
 				if (typeof updateToolbarStates === 'function') updateToolbarStates();
 				if (typeof updateJumpButtonPosition === 'function') updateJumpButtonPosition();
 			
+				const text = chatInput.innerText; 
 				if (text.trim() !== '') {
 					if (!myTypingTimeout) {
 						if (socketChat && socketChat.connected) socketChat.emit('typing_start'); 
