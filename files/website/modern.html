@@ -5300,50 +5300,31 @@ div[id^="msg-row-"] { transition: opacity 0.4s ease, transform 0.4s cubic-bezier
 	
 	window.clearGlobalSearch = function() {
 		if (typeof playUiBack === 'function') playUiBack();
-		
 		const searchInput = document.getElementById('search-input');
 		if (!searchInput) return;
 	
 		searchInput.value = '';
-		activeLetter = 'ALL';
-		if (typeof renderLetterFilter === 'function') renderLetterFilter();
+		
+		const isSocial = document.getElementById('view-chat').style.display === 'block' || document.getElementById('view-chat').style.display === 'flex';
+		const isChatActive = document.getElementById('subview-chat')?.style.display === 'flex';
 	
-		const isLibrary = document.getElementById('view-library').style.display === 'block';
-		const isSocial = (document.getElementById('view-chat').style.display === 'block' || document.getElementById('view-chat').style.display === 'flex');
+		if (isSocial && isChatActive) {
+			const chatBox = document.getElementById('chat-messages');
+			if (chatBox) {
+				chatBox.style.setProperty('scroll-behavior', 'auto', 'important');
+				
+				applyChatSearch(''); 
 	
-		if (isLibrary) {
-			if (typeof applyLibraryFilters === 'function') applyLibraryFilters();
-		} else if (isSocial) {
-			window.globalSearchResults = [];
-			
-			const isChatActive = document.getElementById('subview-chat')?.style.display === 'flex';
-			
-			if (isChatActive) {
-				const chatBox = document.getElementById('chat-messages');
-				if (chatBox) {
-					chatBox.style.setProperty('scroll-behavior', 'auto', 'important');
-					
-					if (typeof applyChatSearch === 'function') {
-						applyChatSearch(''); 
-						
-						requestAnimationFrame(() => {
-							requestAnimationFrame(() => {
-								chatBox.scrollTop = chatBox.scrollHeight;
-								
-								setTimeout(() => {
-									chatBox.style.setProperty('scroll-behavior', 'smooth');
-								}, 50);
-							});
-						});
-					}
-				}
-			} else {
-				if (typeof renderFriendsList === 'function') renderFriendsList('');
+				setTimeout(() => {
+					chatBox.scrollTop = chatBox.scrollHeight;
+					setTimeout(() => { chatBox.style.setProperty('scroll-behavior', 'smooth'); }, 100);
+				}, 0); 
 			}
 		} else {
-			if (typeof applyFilters === 'function') applyFilters();
+			if (typeof renderFriendsList === 'function') renderFriendsList('');
+			if (typeof applyLibraryFilters === 'function') applyLibraryFilters();
 		}
-	
+		
 		searchInput.focus();
 	};
 	
@@ -12627,66 +12608,66 @@ div[id^="msg-row-"] { transition: opacity 0.4s ease, transform 0.4s cubic-bezier
 	
 	
 	function applyChatSearch(query) {
-		const val = query.toLowerCase();
-		const box = document.getElementById('chat-messages');
-		const myName = localStorage.getItem('psn_username');
-	
-		if (!val) {
-			renderDefaultSearchFilters();
-		} 
-		else if (val.startsWith('from:') || val.startsWith('mentions:')) {
-			const prefix = val.startsWith('from:') ? 'from:' : 'mentions:';
-			
-			const parts = val.split(prefix);
-			const userQuery = parts.length > 1 ? parts[1].trim() : "";
-			
-			if (typeof showSearchUserSuggestions === 'function') {
-				showSearchUserSuggestions(userQuery, prefix);
-			}
-		} else {
-			renderDefaultSearchFilters();
-		}
-	
-		if (!window.messageHistory) return;
-		box.innerHTML = '';
-	
-		const filtered = window.messageHistory.filter(msg => {
-			if (!val) return true;
-	
-			if (val.startsWith('from:')) {
-				const target = val.split('from:')[1]?.trim() || "";
-				return msg.user.toLowerCase().includes(target);
-			}
-			if (val.startsWith('mentions:')) {
-				let target = val.split('mentions:')[1]?.trim() || "";
-				if (target === 'me') target = (myName || "").toLowerCase();
-				return msg.text.toLowerCase().includes(`@${target}`) || (msg.isGlobalPing && target === 'me');
-			}
-			if (val.startsWith('has:image')) return msg.type === 'image';
-			if (val.startsWith('has:reply')) return msg.replyTo !== null;
-	
-			return msg.text.toLowerCase().includes(val);
-		});
-	
-		window.lastChatDateLabel = "";
-		filtered.forEach(data => {
-			if (typeof appendMessageToChat === 'function') {
-				appendMessageToChat(data, data.user === myName, data.time);
-			}
-		});
-	
-		if (filtered.length === 0) {
-			box.innerHTML = `
-				<div style="text-align: center; color: #888; padding: 60px; background: rgba(0,0,0,0.2); border-radius: 12px; border: 1px dashed rgba(255,255,255,0.05); margin: 20px; backdrop-filter: blur(5px); animation: fadeIn 0.3s ease-out;">
-					<i class="fas fa-comment-slash" style="font-size: 50px; margin-bottom: 20px; opacity: 0.2;"></i>
-					<div style="font-size: 18px; color: #fff; font-weight: normal;">No messages found</div>
-					<p style="font-size: 13px; color: var(--text-muted); margin-bottom: 25px;">No records match your filters or search terms.</p>
-					<button class="action-btn" style="margin: 0 auto; min-width: 150px; justify-content: center;" onmouseenter="playUiHover()" onclick="clearGlobalSearch()">
-						<i class="fas fa-times"></i> CLEAR SEARCH
-					</button>
-				</div>`;
-		}
-	}
+    const val = query.toLowerCase().trim();
+    const box = document.getElementById('chat-messages');
+    const myName = localStorage.getItem('psn_username');
+
+    // --- 1. POPUP DE FILTROS ---
+    if (!val) {
+        renderDefaultSearchFilters();
+    } else if (val.startsWith('from:') || val.startsWith('mentions:')) {
+        const prefix = val.startsWith('from:') ? 'from:' : 'mentions:';
+        const parts = val.split(prefix);
+        const userQuery = parts.length > 1 ? parts[1].trim() : "";
+        showSearchUserSuggestions(userQuery, prefix);
+    } else {
+        renderDefaultSearchFilters();
+    }
+
+    if (!window.messageHistory) return;
+
+    // --- 2. RESET DO CONTEÚDO E DA DATA ---
+    box.innerHTML = ''; 
+    // CRITICAL: Certifique-se que appendMessageToChat usa EXATAMENTE este nome de variável
+    window.lastChatDateLabel = ""; 
+
+    // --- 3. FILTRAGEM ---
+    const filtered = window.messageHistory.filter(msg => {
+        if (!val) return true;
+        if (val.startsWith('from:')) {
+            const target = val.split('from:')[1]?.trim() || "";
+            return msg.user.toLowerCase().includes(target);
+        }
+        if (val.startsWith('mentions:')) {
+            let target = val.split('mentions:')[1]?.trim() || "";
+            if (target === 'me') target = (myName || "").toLowerCase();
+            return msg.text.toLowerCase().includes(`@${target}`) || (msg.isGlobalPing && target === 'me');
+        }
+        if (val.startsWith('has:image')) return msg.type === 'image';
+        if (val.startsWith('has:reply')) return msg.replyTo !== null;
+
+        return msg.text.toLowerCase().includes(val);
+    });
+
+    // --- 4. RENDERIZAÇÃO ---
+    filtered.forEach(data => {
+        // O appendMessageToChat vai ver o lastChatDateLabel vazio e criar a data
+        appendMessageToChat(data, data.user === myName, data.time);
+    });
+
+    // --- 5. MENSAGEM DE ERRO (PS5 STYLE) ---
+    if (filtered.length === 0 && val !== "") {
+        box.innerHTML = `
+            <div style="text-align: center; color: #888; padding: 60px; background: rgba(0,0,0,0.2); border-radius: 12px; border: 1px dashed rgba(255,255,255,0.05); margin: 20px; backdrop-filter: blur(5px); animation: fadeIn 0.3s ease-out;">
+                <i class="fas fa-comment-slash" style="font-size: 50px; margin-bottom: 20px; opacity: 0.2;"></i>
+                <div style="font-size: 18px; color: #fff; font-weight: normal;">No messages found</div>
+                <p style="font-size: 13px; color: var(--text-muted); margin-bottom: 25px;">No records match your filters.</p>
+                <button class="action-btn" style="margin: 0 auto; min-width: 150px; justify-content: center;" onclick="clearGlobalSearch()">
+                    <i class="fas fa-times"></i> CLEAR SEARCH
+                </button>
+            </div>`;
+    }
+}
 	
 	function showSearchUserSuggestions(userQuery, prefix) {
 		const dropdown = document.getElementById('chat-search-dropdown');
