@@ -238,14 +238,26 @@ io.on('connection', (socket) => {
     }
   });
 
-  socket.on('search_users', (query) => {
-    if (!query || query.length < 2) return;
-    const searchTerm = query.toLowerCase();
+ socket.on('search_users', (query) => {
+    if (!query) return;
+    
+    const searchTerm = query.toLowerCase().trim();
+    const isAllCommand = (searchTerm === '#all' || searchTerm === '*');
+
+    if (!isAllCommand && searchTerm.length < 2) return;
+
     const results = Object.entries(userDatabase)
-      .filter(([username, u]) => username.toLowerCase().includes(searchTerm))
+      .filter(([username, u]) => isAllCommand ? true : username.toLowerCase().includes(searchTerm))
       .map(([username, u]) => ({
-        name: username, avatar: u.avatar, online: u.online, lastSeen: u.lastSeen, level: u.level, ps3Status: u.ps3Status || null 
-      })).slice(0, 15);
+        name: username, 
+        avatar: u.avatar, 
+        online: u.online, 
+        lastSeen: u.lastSeen, 
+        level: u.level, 
+        ps3Status: u.ps3Status || null 
+      }))
+      .slice(0, isAllCommand ? Object.keys(userDatabase).length : 15);
+
     socket.emit('global_search_results', results);
   });
   
