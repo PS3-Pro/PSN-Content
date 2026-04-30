@@ -242,7 +242,7 @@ io.on('connection', (socket) => {
     if (!query) return;
     
     const searchTerm = query.toLowerCase().trim();
-    const isAllCommand = (searchTerm === '#all' || searchTerm === '*');
+    const isAllCommand = (searchTerm === '@all' || searchTerm === '*');
 
     if (!isAllCommand && searchTerm.length < 2) return;
 
