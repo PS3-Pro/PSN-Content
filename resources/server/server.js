@@ -163,7 +163,7 @@ io.on('connection', (socket) => {
           lastSeen: Date.now(),
           avatar: userData.avatar || DEFAULT_AVATAR,
           joined: userData.joined || '2026',
-		  settingsData: userData.settingsData || { audio: "1", ux: "1", chatSound: "1", ps3Ip: "" },
+          settingsData: userData.settingsData || { audio: "1", ux: "1", chatSound: "1", ps3Ip: "" },
           trophiesData: userData.trophiesData || {},
           wishlistData: userData.wishlistData || [],
           favoritesData: userData.favoritesData || [],
@@ -219,7 +219,6 @@ io.on('connection', (socket) => {
         
         try {
             await pool.query('UPDATE users SET data = $1 WHERE name = $2', [userDatabase[name], name]);
-			 //console.log(`[DATABASE] Profile for ${name} updated.`);
         } catch (err) {
             console.error(`[DATABASE ERROR] Failed to save profile for ${name}:`, err);
         }
@@ -353,6 +352,46 @@ io.on('connection', (socket) => {
     }
   });
 
+  socket.on('poll_vote', async (data) => {
+    const msgIndex = messageHistory.findIndex(m => String(new Date(m.time).getTime()) === String(data.msgId));
+    if (msgIndex > -1) {
+        const msg = messageHistory[msgIndex];
+        if (msg.type === 'poll' && msg.content) {
+            const poll = msg.content;
+            
+            poll.options.forEach(opt => {
+                if (opt.voters) {
+                    opt.voters = opt.voters.filter(u => u !== data.user);
+                }
+            });
+
+            if (!poll.options[data.optionIndex].voters) poll.options[data.optionIndex].voters = [];
+            poll.options[data.optionIndex].voters.push(data.user);
+            
+            poll.totalVotes = poll.options.reduce((sum, opt) => sum + (opt.voters ? opt.voters.length : 0), 0);
+
+            try {
+                await pool.query("UPDATE chat SET message = $1 WHERE message->>'time' = $2", [msg, msg.time]);
+                
+                io.emit('message_edited', { 
+                    msgId: data.msgId, 
+                    newText: msg.text, 
+                    type: 'poll', 
+                    content: poll,
+                    editedByAdmin: msg.editedByAdmin 
+                });
+                
+                const pinned = pinnedMessages.find(p => p.id === data.msgId);
+                if (pinned) {
+                    pinned.content = poll;
+                    await pool.query('UPDATE pinned_messages SET data = $1 WHERE message_id = $2', [pinned, data.msgId]);
+                    io.emit('pinned_list', pinnedMessages);
+                }
+            } catch (err) { console.error("Poll Sync Error:", err); }
+        }
+    }
+  });
+
   socket.on('mark_as_read', async (data) => {
     const msg = messageHistory.find(m => String(new Date(m.time).getTime()) === String(data.msgId));
     if (msg && msg.user !== data.user) {
@@ -382,7 +421,7 @@ io.on('connection', (socket) => {
             msg.editedByAdmin = wasEditedByAdmin;
 
             if (data.content) {
-                msg.type = 'image';
+                msg.type = data.type || 'image';
                 msg.content = data.content;
             }
             
