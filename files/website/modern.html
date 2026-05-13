@@ -9227,10 +9227,28 @@ div[id^="msg-row-"] { transition: opacity 0.4s ease, transform 0.4s cubic-bezier
 		}
 	};
 	
+	async function checkStoreAppInstalled(ip) {
+		try {
+			const controller = new AbortController();
+			const timeoutId = setTimeout(() => controller.abort(), 2000);
+			const res = await fetch(`http://${ip}/dev_hdd0/game/PSNDTBASE/`, { 
+				signal: controller.signal,
+				cache: 'no-store' 
+			});
+			clearTimeout(timeoutId);
+			return res.ok;
+		} catch (e) {
+			return false;
+		}
+	}
+
 	async function connectAndRefresh() {
 		const ip = document.getElementById('ps3-ip').value;
 		if (!ip) { alert("Please enter the PS3™ IP address first!"); return; }
 		if (!isValidIP(ip)) { alert("Invalid IP format. Please enter a valid IP (e.g. 192.168.1.100)."); return; }
+	
+		const savedIp = loadState('ps3_ip');
+		const isNewIp = !savedIp || (savedIp !== ip);
 	
 		const globalIcon = document.getElementById('global-status-icon');
 		if (globalIcon) {
@@ -9241,11 +9259,11 @@ div[id^="msg-row-"] { transition: opacity 0.4s ease, transform 0.4s cubic-bezier
 		try {
 			const controller = new AbortController();
 			const timeoutId = setTimeout(() => controller.abort(), 3000);
+			
 			await fetch(`http://${ip}/`, { mode: 'no-cors', signal: controller.signal });
 			clearTimeout(timeoutId);
 	
 			saveState('ps3_ip', ip);
-	
 			_lastConnectionState = true; 
 	
 			if (globalIcon) {
@@ -9255,14 +9273,38 @@ div[id^="msg-row-"] { transition: opacity 0.4s ease, transform 0.4s cubic-bezier
 	
 			playUiSuccess();
 			sendConnectionPopup(ip);
-
+	
+			if (isNewIp) {
+				setTimeout(async () => {
+					let appFound = false;
+					try {
+						const checkApp = await fetch(`http://${ip}/dev_hdd0/game/PSNDTBASE/PARAM.SFO`, { 
+							cache: 'no-store' 
+						});
+						if (checkApp.ok) appFound = true;
+					} catch (e) {
+						// Se der erro de rede aqui, o console está ON mas o arquivo não foi achado
+						appFound = false;
+					}
+	
+					if (!appFound) {
+						const installApp = confirm("New console detected!\n\nSystem found that 'PlayStation Network Database' is not installed on this PS3.\n\nWould you like to download and install the console version directly?");
+						
+						if (installApp) {
+							const pkgUrl = "https://github.com/PS3-Pro/PSN-Content/releases/download/Release/PlayStation_Network_Database.pkg";
+							fetch(`http://${ip}/install.ps3?url=${pkgUrl}`, { mode: 'no-cors' });
+							alert("Download command sent to PS3!\n\nLook at your XMB™ (TV Column).");
+						}
+					}
+				}, 1500);
+			}
+			
 			showToastNotification(
 				"Console Linked", 
 				"You can now download content directly to your console by clicking the download icon in the Store."
 			);
-
-			checkTrophyProgress('connect_ps3', 1);
 	
+			checkTrophyProgress('connect_ps3', 1);
 			scanConsoleAndReload(true); 
 	
 			if (favoritesLibrary.length > 0) {
@@ -9279,12 +9321,10 @@ div[id^="msg-row-"] { transition: opacity 0.4s ease, transform 0.4s cubic-bezier
 	
 		} catch (err) {
 			console.error("Connection failed:", err);
-	
 			if (globalIcon) {
 				globalIcon.className = "fas fa-circle status-dot-base status-dot-disconnected";
 				globalIcon.style.color = "#ff4444";
 			}
-	
 			_lastConnectionState = false;
 			
 			const favDot = document.getElementById('fav-dot');
@@ -9295,14 +9335,14 @@ div[id^="msg-row-"] { transition: opacity 0.4s ease, transform 0.4s cubic-bezier
 	
 			const isFirefox = navigator.userAgent.toLowerCase().includes('firefox');
 			if (isFirefox) {
-				alert(`Failed to connect to ${ip}!\n\nFirefox is blocking the connection to the PS3™ due to security rules (Mixed Content).\n\nTO FIX THIS:\n1. Click the Shield icon next to the URL bar.\n2. Click on the Padlock button inside that menu to disable protection.\n3. Click the connect button again.`);
+				alert(`Failed to connect to ${ip}!\n\nFirefox is blocking the connection to the PS3™ due to security rules (Mixed Content).`);
 			} else {
 				alert(`Failed to connect to ${ip}!\nPlease verify that the PS3™ is turned on and webMAN is running.`);
 			}
 		}
 	}
 	
-	window.showToastNotification = function(message) {
+	window.showToastNotification = function(title, description) {
 		const oldToast = document.getElementById('android-toast');
 		if (oldToast) oldToast.remove();
 	
@@ -9311,43 +9351,54 @@ div[id^="msg-row-"] { transition: opacity 0.4s ease, transform 0.4s cubic-bezier
 		
 		toast.style.cssText = `
 			position: fixed;
-			bottom: 30px;
+			bottom: 35px;
 			left: 50%;
-			transform: translateX(-50%);
+			transform: translateX(-50%) translateY(20px);
 			
-			background: rgba(20, 20, 25, 0.4); 
+			background: rgba(20, 20, 25, 0.7); 
 			backdrop-filter: blur(20px);
 			-webkit-backdrop-filter: blur(20px);
 			
 			color: #fff;
-			padding: 12px 25px;
+			padding: 12px 30px;
 			border-radius: 50px;
-			font-size: 13px;
-			font-weight: 500;
-			white-space: nowrap;
 			z-index: 999999;
 			pointer-events: none;
 			
 			border: 1px solid rgba(255, 255, 255, 0.1);
 			box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
 			
+			display: flex;
+			flex-direction: column;
+			align-items: center;
+			text-align: center;
+			max-width: 90%;
+			width: fit-content;
 			opacity: 0;
-			transition: opacity 0.3s ease-in-out, transform 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+			transition: opacity 0.3s ease, transform 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275);
 		`;
 	
-		toast.innerText = message;
+		if (description) {
+			toast.innerHTML = `
+				<div style="font-weight: 800; color: var(--ps-blue); font-size: 11px; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 2px;">${title}</div>
+				<div style="font-size: 12px; color: rgba(255, 255, 255, 0.9); font-weight: 500; line-height: 1.3;">${description}</div>
+			`;
+		} else {
+			toast.innerHTML = `<div style="font-size: 13px; font-weight: 500;">${title}</div>`;
+		}
+	
 		document.body.appendChild(toast);
 	
 		requestAnimationFrame(() => {
 			toast.style.opacity = '1';
-			toast.style.transform = 'translateX(-50%) translateY(-5px)';
+			toast.style.transform = 'translateX(-50%) translateY(0)';
 		});
 	
 		setTimeout(() => {
 			toast.style.opacity = '0';
-			toast.style.transform = 'translateX(-50%) translateY(0)';
-			setTimeout(() => toast.remove(), 300);
-		}, 5000);
+			toast.style.transform = 'translateX(-50%) translateY(10px)';
+			setTimeout(() => { if (toast.parentNode) toast.remove(); }, 400);
+		}, 6000);
 	};
 	
 	function clearIPMemory() {
