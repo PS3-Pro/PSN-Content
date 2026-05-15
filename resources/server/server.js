@@ -8,7 +8,7 @@ const bcrypt = require('bcrypt');
 const app = express();
 const server = http.createServer(app);
 
-const APP_URL = "https://psn-content-y7m9.onrender.com/ping";
+const APP_URL = "https://server-7lsr.onrender.com/ping";
 const ADMIN_USERS = ["Luan Teles", "Goku Cheats"];
 const ADMIN_SECRET = process.env.ADMIN_SECRET || "ADMINENABLED";
 
