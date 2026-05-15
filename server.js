@@ -1,6 +1,5 @@
 const express = require('express');
 const http = require('http');
-const https = require('https');
 const { Server } = require("socket.io");
 const { Pool } = require('pg');
 const bcrypt = require('bcrypt');
@@ -8,11 +7,12 @@ const bcrypt = require('bcrypt');
 const app = express();
 const server = http.createServer(app);
 
-const APP_URL = process.env.APP_URL || "https://psn-content-production.up.railway.app/ping";
 const ADMIN_USERS = ["Luan Teles", "Goku Cheats"];
 
 const ADMIN_SECRET = process.env.ADMIN_SECRET || "ADMINENABLED";
+
 const DEFAULT_AVATAR = "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/interface/modern/images/avatars/default.png";
+
 const MAX_CHAT_HISTORY = 1000;
 
 const pool = new Pool({
@@ -20,6 +20,10 @@ const pool = new Pool({
   ssl: process.env.DATABASE_URL
     ? { rejectUnauthorized: false }
     : false
+});
+
+app.get('/', (req, res) => {
+  res.send('PSN Database Server Online');
 });
 
 app.get('/ping', (req, res) => {
@@ -31,6 +35,7 @@ let messageHistory = [];
 let pinnedMessages = [];
 
 async function initDb() {
+
   try {
 
     await pool.query(`
@@ -89,19 +94,10 @@ async function initDb() {
     console.error("[DB ERROR]", err);
 
   }
+
 }
 
 initDb();
-
-setInterval(() => {
-
-  https.get(APP_URL, (res) => {
-    console.log(`Auto-ping: ${res.statusCode}`);
-  }).on('error', (err) => {
-    console.error("Ping error:", err.message);
-  });
-
-}, 840000);
 
 function getSanitizedOnlineList() {
 
@@ -130,7 +126,7 @@ const io = new Server(server, {
     methods: ["GET", "POST"]
   },
 
-  transports: ["websocket"],
+  transports: ["websocket", "polling"],
 
   maxHttpBufferSize: 1e7
 });
@@ -209,7 +205,6 @@ io.on('connection', (socket) => {
           name
         };
 
-        // NÃO ESPERA DB
         pool.query(
           'UPDATE users SET data = $1 WHERE name = $2',
           [userDatabase[name], name]
@@ -230,7 +225,6 @@ io.on('connection', (socket) => {
 
       } else {
 
-        // NOVA CONTA
         const hash = await bcrypt.hash(password, 10);
 
         socket.userName = name;
@@ -287,111 +281,10 @@ io.on('connection', (socket) => {
 
   });
 
-  socket.on('chat_message', (msg) => {
-
-    try {
-
-      const isAdmin = socket.isAdmin === true;
-
-      const messageData = {
-        ...(typeof msg === 'object'
-          ? msg
-          : { text: msg }),
-
-        time: new Date().toISOString(),
-
-        seenBy: [],
-
-        isAdmin,
-
-        user: socket.userName || msg.user
-      };
-
-      io.emit('chat_message', messageData);
-
-      messageHistory.push(messageData);
-
-      if (messageHistory.length > MAX_CHAT_HISTORY) {
-        messageHistory.shift();
-      }
-
-      pool.query(
-        'INSERT INTO chat (message) VALUES ($1)',
-        [messageData]
-      ).catch(console.error);
-
-    } catch (err) {
-
-      console.error("[CHAT ERROR]", err);
-
-    }
-
-  });
-
-  socket.on('delete_message', async (data) => {
-
-    try {
-
-      const msgIndex = messageHistory.findIndex(
-        m => String(new Date(m.time).getTime()) === String(data.msgId)
-      );
-
-      if (msgIndex === -1) return;
-
-      const isAdmin = socket.isAdmin === true;
-      const msg = messageHistory[msgIndex];
-
-      if (msg.user !== socket.userName && !isAdmin) {
-        return;
-      }
-
-      messageHistory.splice(msgIndex, 1);
-
-      io.emit('message_deleted', data.msgId);
-
-      pool.query(
-        "DELETE FROM chat WHERE message->>'time' = $1",
-        [msg.time]
-      ).catch(console.error);
-
-    } catch (err) {
-
-      console.error("[DELETE ERROR]", err);
-
-    }
-
-  });
-
-  socket.on('disconnect', () => {
-
-    try {
-
-      const name = socket.userName;
-
-      if (!name || !userDatabase[name]) return;
-
-      userDatabase[name].online = false;
-      userDatabase[name].lastSeen = Date.now();
-
-      io.emit('online_list', getSanitizedOnlineList());
-
-      pool.query(
-        'UPDATE users SET data = $1 WHERE name = $2',
-        [userDatabase[name], name]
-      ).catch(console.error);
-
-    } catch (err) {
-
-      console.error("[DISCONNECT ERROR]", err);
-
-    }
-
-  });
-
 });
 
 const PORT = process.env.PORT || 3000;
 
-server.listen(PORT, () => {
+server.listen(PORT, '0.0.0.0', () => {
   console.log(`PSN Database Server running on ${PORT}`);
 });
