@@ -10,6 +10,7 @@ const server = http.createServer(app);
 
 const APP_URL = "https://server-7lsr.onrender.com/ping";
 const ADMIN_USERS = ["Luan Teles", "Goku Cheats"];
+const ADMIN_SECRET = process.env.ADMIN_SECRET || "ADMINENABLED";
 
 const DEFAULT_AVATAR = "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/interface/modern/images/avatars/default.png";
 
@@ -197,7 +198,7 @@ io.on('connection', (socket) => {
     }
   });
 
-  socket.on('update_profile', (userData) => {
+  socket.on('update_profile', async (userData) => {
     const name = socket.userName;
     if (name && userDatabase[name]) {
         
@@ -216,12 +217,15 @@ io.on('connection', (socket) => {
         Object.assign(userDatabase[name], userData);
         userDatabase[name].lastSeen = Date.now();
         
-        io.emit('online_list', getSanitizedOnlineList());
+        try {
+            await pool.query('UPDATE users SET data = $1 WHERE name = $2', [userDatabase[name], name]);
+        } catch (err) {
+            console.error(`[DATABASE ERROR] Failed to save profile for ${name}:`, err);
+        }
 
-        pool.query('UPDATE users SET data = $1 WHERE name = $2', [userDatabase[name], name])
-            .catch(err => console.error(`[DATABASE ERROR] Failed to save profile for ${name}:`, err));
+        io.emit('online_list', getSanitizedOnlineList());
     }
-  });
+});
 
   socket.on('request_user_data', (data) => {
     const { targetName, type } = data;
@@ -297,10 +301,19 @@ io.on('connection', (socket) => {
     if (cleanCode === "PLATINUMCODE") return callback({ success: true, type: 'PLATINUM_UNLOCK' });
     if (cleanCode === "UNLOCKALLDB1") return callback({ success: true, type: 'SINGLE_TROPHY' });
 
+    if (cleanCode === ADMIN_SECRET.toUpperCase()) {
+        const isNameValid = user && ADMIN_USERS.some(admin => admin.toLowerCase() === user.toLowerCase());
+        if (isNameValid) {
+            socket.isAdmin = true;
+            return callback({ success: true, type: 'ADMIN_LOGIN', secret: ADMIN_SECRET });
+        } else {
+            return callback({ success: false, message: "Code valid, but your ID is not Admin." });
+        }
+    }
     callback({ success: false, message: "Invalid code." });
   });
 
-  socket.on('chat_message', (msg) => {
+  socket.on('chat_message', async (msg) => {
     let messageData = { ...(typeof msg === 'object' ? msg : { text: msg }), time: new Date().toISOString(), seenBy: [] };
     const isAdmin = socket.isAdmin === true;
     
@@ -313,13 +326,11 @@ io.on('connection', (socket) => {
     
     if (messageHistory.length > MAX_CHAT_HISTORY) messageHistory.shift(); 
     
+    await pool.query('INSERT INTO chat (message) VALUES ($1)', [messageData]);
     io.emit('chat_message', messageData); 
-    
-    pool.query('INSERT INTO chat (message) VALUES ($1)', [messageData])
-        .catch(err => console.error("Chat Insert Error:", err));
   });
 
-  socket.on('message_reaction', (data) => {
+  socket.on('message_reaction', async (data) => {
     const msg = messageHistory.find(m => String(new Date(m.time).getTime()) === String(data.msgId));
     if (msg) {
         if (!msg.reactions) msg.reactions = [];
@@ -334,14 +345,14 @@ io.on('connection', (socket) => {
             msg.reactions.push({ emoji: data.emoji, count: 1, users: [data.user] });
         }
 
-        io.emit('message_reaction', data);
-        
-        pool.query("UPDATE chat SET message = $1 WHERE message->>'time' = $2", [msg, msg.time])
-            .catch(err => console.error("Reaction Sync Error:", err));
+        try {
+            await pool.query("UPDATE chat SET message = $1 WHERE message->>'time' = $2", [msg, msg.time]);
+            io.emit('message_reaction', data);
+        } catch (err) { console.error("Reaction Sync Error:", err); }
     }
   });
 
-  socket.on('poll_vote', (data) => {
+  socket.on('poll_vote', async (data) => {
     const msgIndex = messageHistory.findIndex(m => String(new Date(m.time).getTime()) === String(data.msgId));
     if (msgIndex > -1) {
         const msg = messageHistory[msgIndex];
@@ -359,44 +370,44 @@ io.on('connection', (socket) => {
             
             poll.totalVotes = poll.options.reduce((sum, opt) => sum + (opt.voters ? opt.voters.length : 0), 0);
 
-            io.emit('message_edited', { 
-                msgId: data.msgId, 
-                newText: msg.text, 
-                type: 'poll', 
-                content: poll,
-                editedByAdmin: msg.editedByAdmin 
-            });
-            
-            pool.query("UPDATE chat SET message = $1 WHERE message->>'time' = $2", [msg, msg.time])
-                .catch(err => console.error("Poll Sync Error:", err));
-
-            const pinned = pinnedMessages.find(p => p.id === data.msgId);
-            if (pinned) {
-                pinned.content = poll;
-                io.emit('pinned_list', pinnedMessages);
-                pool.query('UPDATE pinned_messages SET data = $1 WHERE message_id = $2', [pinned, data.msgId])
-                    .catch(err => console.error("Poll Pin Update Error:", err));
-            }
+            try {
+                await pool.query("UPDATE chat SET message = $1 WHERE message->>'time' = $2", [msg, msg.time]);
+                
+                io.emit('message_edited', { 
+                    msgId: data.msgId, 
+                    newText: msg.text, 
+                    type: 'poll', 
+                    content: poll,
+                    editedByAdmin: msg.editedByAdmin 
+                });
+                
+                const pinned = pinnedMessages.find(p => p.id === data.msgId);
+                if (pinned) {
+                    pinned.content = poll;
+                    await pool.query('UPDATE pinned_messages SET data = $1 WHERE message_id = $2', [pinned, data.msgId]);
+                    io.emit('pinned_list', pinnedMessages);
+                }
+            } catch (err) { console.error("Poll Sync Error:", err); }
         }
     }
   });
 
-  socket.on('mark_as_read', (data) => {
+  socket.on('mark_as_read', async (data) => {
     const msg = messageHistory.find(m => String(new Date(m.time).getTime()) === String(data.msgId));
     if (msg && msg.user !== data.user) {
         if (!msg.seenBy) msg.seenBy = [];
         if (!msg.seenBy.includes(data.user)) {
             msg.seenBy.push(data.user);
             
-            io.emit('message_seen', { msgId: data.msgId, seenBy: msg.seenBy });
-
-            pool.query("UPDATE chat SET message = $1 WHERE message->>'time' = $2", [msg, msg.time])
-                .catch(err => console.error("Seen Mark Error:", err));
+            try {
+                await pool.query("UPDATE chat SET message = $1 WHERE message->>'time' = $2", [msg, msg.time]);
+                io.emit('message_seen', { msgId: data.msgId, seenBy: msg.seenBy });
+            } catch (err) { console.error("Seen Mark Error:", err); }
         }
     }
   });
 
-  socket.on('edit_message', (data) => { 
+  socket.on('edit_message', async (data) => {
     const msgIndex = messageHistory.findIndex(m => String(new Date(m.time).getTime()) === String(data.msgId));
     if (msgIndex > -1) {
         const isAdmin = socket.isAdmin === true;
@@ -414,32 +425,32 @@ io.on('connection', (socket) => {
                 msg.content = data.content;
             }
             
-            io.emit('message_edited', { 
-                msgId: data.msgId, 
-                newText: data.newText, 
-                type: msg.type, 
-                content: msg.content,
-                editedByAdmin: wasEditedByAdmin 
-            });
+            try {
+                await pool.query("UPDATE chat SET message = $1 WHERE message->>'time' = $2", [msg, msg.time]);
+                io.emit('message_edited', { 
+                    msgId: data.msgId, 
+                    newText: data.newText, 
+                    type: msg.type, 
+                    content: msg.content,
+                    editedByAdmin: wasEditedByAdmin 
+                });
 
-            pool.query("UPDATE chat SET message = $1 WHERE message->>'time' = $2", [msg, msg.time])
-                .catch(err => console.error("Edit Sync Error:", err));
+                const pinned = pinnedMessages.find(p => p.id === data.msgId);
+                if (pinned) {
+                    pinned.text = data.newText;
+                    pinned.type = msg.type || 'text';
+                    pinned.content = msg.content || null;
+                    
+                    await pool.query('UPDATE pinned_messages SET data = $1 WHERE message_id = $2', [pinned, data.msgId]);
+                    io.emit('pinned_list', pinnedMessages);
+                }
 
-            const pinned = pinnedMessages.find(p => p.id === data.msgId);
-            if (pinned) {
-                pinned.text = data.newText;
-                pinned.type = msg.type || 'text';
-                pinned.content = msg.content || null;
-                
-                io.emit('pinned_list', pinnedMessages);
-                pool.query('UPDATE pinned_messages SET data = $1 WHERE message_id = $2', [pinned, data.msgId])
-                    .catch(err => console.error("Pinned Edit Sync Error:", err));
-            }
+            } catch (err) { console.error("Edit Sync Error:", err); }
         }
     }
   });
 
-  socket.on('delete_message', (data) => {
+  socket.on('delete_message', async (data) => {
     const msgIndex = messageHistory.findIndex(m => String(new Date(m.time).getTime()) === String(data.msgId));
     if (msgIndex > -1) {
         const isAdmin = socket.isAdmin === true;
@@ -447,31 +458,33 @@ io.on('connection', (socket) => {
 
         if (messageHistory[msgIndex].user === socket.userName || isAdmin) {
             messageHistory.splice(msgIndex, 1);
-            
-            io.emit('message_deleted', data.msgId);
+            try {
+                await pool.query("DELETE FROM chat WHERE message->>'time' = $1", [msgTime]);
+            } catch (err) {
+                console.error("Erro ao deletar mensagem do banco:", err);
+            }
 
-            pool.query("DELETE FROM chat WHERE message->>'time' = $1", [msgTime])
-                .catch(err => console.error("Erro ao deletar mensagem do banco:", err));
+            io.emit('message_deleted', data.msgId);
 
             const isPinned = pinnedMessages.find(p => p.id === data.msgId);
             if (isPinned) {
                 pinnedMessages = pinnedMessages.filter(p => p.id !== data.msgId);
-                io.emit('pinned_list', pinnedMessages);
                 pool.query('DELETE FROM pinned_messages WHERE message_id = $1', [data.msgId]).catch(e => {});
+                io.emit('pinned_list', pinnedMessages);
             }
         }
     }
   });
 
-  socket.on('clear_chat', () => {
+  socket.on('clear_chat', async () => {
     if (socket.isAdmin === true) {
         messageHistory = [];
+        await pool.query('TRUNCATE chat');
         io.emit('chat_cleared');
-        pool.query('TRUNCATE chat').catch(err => console.error(err));
 
         pinnedMessages = [];
+        await pool.query('TRUNCATE pinned_messages');
         io.emit('pinned_list', pinnedMessages);
-        pool.query('TRUNCATE pinned_messages').catch(err => console.error(err));
     }
   });
 
@@ -491,7 +504,7 @@ io.on('connection', (socket) => {
     }
   });
 
-  socket.on('pin_message', (data) => {
+  socket.on('pin_message', async (data) => {
     if (socket.isAdmin === true) {
       const msg = messageHistory.find(m => String(new Date(m.time).getTime()) === String(data.msgId));
       if (msg && !pinnedMessages.find(p => p.id === data.msgId)) {
@@ -504,22 +517,23 @@ io.on('connection', (socket) => {
         };
         pinnedMessages.push(pinData);
         
-        io.emit('pinned_list', pinnedMessages);
-
-        pool.query('INSERT INTO pinned_messages (message_id, data) VALUES ($1, $2) ON CONFLICT (message_id) DO UPDATE SET data = $2', [data.msgId, pinData])
-            .catch(e => console.error("Pin DB Error:", e));
+        try {
+          await pool.query('INSERT INTO pinned_messages (message_id, data) VALUES ($1, $2) ON CONFLICT (message_id) DO UPDATE SET data = $2', [data.msgId, pinData]);
+          io.emit('pinned_list', pinnedMessages);
+        } catch (e) { console.error("Pin DB Error:", e); }
       }
     }
   });
 
-  socket.on('unpin_message', (data) => {
+  socket.on('unpin_message', async (data) => {
     if (socket.isAdmin === true) {
       pinnedMessages = pinnedMessages.filter(p => p.id !== data.msgId);
       
-      io.emit('pinned_list', pinnedMessages);
+      try {
+        await pool.query('DELETE FROM pinned_messages WHERE message_id = $1', [data.msgId]);
+      } catch (e) { console.error("Unpin DB Error:", e); }
 
-      pool.query('DELETE FROM pinned_messages WHERE message_id = $1', [data.msgId])
-        .catch(e => console.error("Unpin DB Error:", e));
+      io.emit('pinned_list', pinnedMessages);
     }
   });
 
@@ -535,17 +549,15 @@ io.on('connection', (socket) => {
     if (name) socket.broadcast.emit('user_stopped_typing', { name: name });
   });
 
-  socket.on('disconnect', () => {
+  socket.on('disconnect', async () => {
     const name = socket.userName;
     if (name && userDatabase[name]) {
       userDatabase[name].online = false;
       userDatabase[name].lastSeen = Date.now();
       socket.broadcast.emit('user_stopped_typing', { name: name });
       
+      await pool.query('UPDATE users SET data = $1 WHERE name = $2', [userDatabase[name], name]);
       io.emit('online_list', getSanitizedOnlineList());
-
-      pool.query('UPDATE users SET data = $1 WHERE name = $2', [userDatabase[name], name])
-        .catch(err => console.error("Disconnect DB Error:", err));
     }
   });
 });
