@@ -10,7 +10,6 @@ const server = http.createServer(app);
 
 const APP_URL = "https://server-7lsr.onrender.com/ping";
 const ADMIN_USERS = ["Luan Teles", "Goku Cheats"];
-const ADMIN_SECRET = process.env.ADMIN_SECRET || "ADMINENABLED";
 
 const DEFAULT_AVATAR = "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/interface/modern/images/avatars/default.png";
 
@@ -225,7 +224,7 @@ io.on('connection', (socket) => {
 
         io.emit('online_list', getSanitizedOnlineList());
     }
-});
+  });
 
   socket.on('request_user_data', (data) => {
     const { targetName, type } = data;
@@ -301,15 +300,6 @@ io.on('connection', (socket) => {
     if (cleanCode === "PLATINUMCODE") return callback({ success: true, type: 'PLATINUM_UNLOCK' });
     if (cleanCode === "UNLOCKALLDB1") return callback({ success: true, type: 'SINGLE_TROPHY' });
 
-    if (cleanCode === ADMIN_SECRET.toUpperCase()) {
-        const isNameValid = user && ADMIN_USERS.some(admin => admin.toLowerCase() === user.toLowerCase());
-        if (isNameValid) {
-            socket.isAdmin = true;
-            return callback({ success: true, type: 'ADMIN_LOGIN', secret: ADMIN_SECRET });
-        } else {
-            return callback({ success: false, message: "Code valid, but your ID is not Admin." });
-        }
-    }
     callback({ success: false, message: "Invalid code." });
   });
 
