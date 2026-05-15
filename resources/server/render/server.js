@@ -10,7 +10,7 @@ const server = http.createServer(app);
 
 
 const APP_URLS = [
-  "https://server-7lsr.onrender.com/ping",
+  "https://psn-content-7aa6.onrender.com/ping",
   "https://psn-content-61e2.onrender.com/ping",
   "https://psn-content-jm1q.onrender.com/ping"
 ];
