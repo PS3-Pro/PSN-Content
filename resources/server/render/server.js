@@ -8,7 +8,13 @@ const bcrypt = require('bcrypt');
 const app = express();
 const server = http.createServer(app);
 
-const APP_URL = "https://server-7lsr.onrender.com/ping";
+
+const APP_URLS = [
+  "https://server-7lsr.onrender.com/ping",
+  "https://psn-content-61e2.onrender.com/ping",
+  "https://psn-content-jm1q.onrender.com/ping"
+];
+
 const ADMIN_USERS = ["Luan Teles", "Goku Cheats"];
 
 const DEFAULT_AVATAR = "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/interface/modern/images/avatars/default.png";
@@ -63,11 +69,14 @@ async function initDb() {
 
 initDb().catch(console.error);
 
+// Pinga todos os servidores da lista para ninguém dormir
 setInterval(() => {
-  https.get(APP_URL, (res) => {
-    console.log(`Auto-ping: Status ${res.statusCode}`);
-  }).on('error', (err) => {
-    console.error("Auto-ping error:", err.message);
+  APP_URLS.forEach(url => {
+    https.get(url, (res) => {
+      console.log(`Auto-ping [${url}]: Status ${res.statusCode}`);
+    }).on('error', (err) => {
+      console.error(`Auto-ping error [${url}]:`, err.message);
+    });
   });
 }, 840000);
 
