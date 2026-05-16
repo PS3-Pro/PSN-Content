@@ -8,7 +8,6 @@ const bcrypt = require('bcrypt');
 const app = express();
 const server = http.createServer(app);
 
-
 const APP_URLS = [
   "https://psn-content-7aa6.onrender.com/ping",
   "https://psn-content-61e2.onrender.com/ping",
@@ -69,7 +68,6 @@ async function initDb() {
 
 initDb().catch(console.error);
 
-// Pinga todos os servidores da lista para ninguém dormir
 setInterval(() => {
   APP_URLS.forEach(url => {
     https.get(url, (res) => {
@@ -97,6 +95,32 @@ function getSanitizedOnlineList() {
         trophies: u.trophies || 0,
         library: u.library || 0
     }));
+}
+
+function calculateGlobalTrophyStats() {
+  const stats = {};
+  const users = Object.values(userDatabase);
+  const totalUsers = users.length;
+
+  if (totalUsers === 0) return stats;
+
+  const trophyCounts = {};
+
+  users.forEach(user => {
+    if (user.trophiesData) {
+      Object.keys(user.trophiesData).forEach(trophyId => {
+        if (user.trophiesData[trophyId] && user.trophiesData[trophyId].unlocked) {
+          trophyCounts[trophyId] = (trophyCounts[trophyId] || 0) + 1;
+        }
+      });
+    }
+  });
+
+  Object.keys(trophyCounts).forEach(trophyId => {
+    stats[trophyId] = (trophyCounts[trophyId] / totalUsers) * 100;
+  });
+
+  return stats;
 }
 
 const io = new Server(server, {
@@ -232,6 +256,10 @@ io.on('connection', (socket) => {
         }
 
         io.emit('online_list', getSanitizedOnlineList());
+
+        if (userData.trophiesData) {
+            io.emit('global_trophy_stats', calculateGlobalTrophyStats());
+        }
     }
   });
 
@@ -245,7 +273,7 @@ io.on('connection', (socket) => {
     }
   });
 
- socket.on('search_users', (query) => {
+  socket.on('search_users', (query) => {
     if (!query) return;
     
     const searchTerm = query.toLowerCase().trim();
@@ -268,6 +296,11 @@ io.on('connection', (socket) => {
     socket.emit('global_search_results', results);
   });
   
+  socket.on('request_trophy_stats', () => {
+    const stats = calculateGlobalTrophyStats();
+    socket.emit('global_trophy_stats', stats);
+  });
+
   socket.on('request_trending', () => {
     let dlCounts = {};
     let wishCounts = {};
