@@ -6620,9 +6620,18 @@ div[id^="msg-row-"] { transition: opacity 0.4s ease, transform 0.4s cubic-bezier
 				</div>
 			`;
 		}
-	
+		
+		const fetchWithTimeout = async (url, ms = 3500) => {
+			const controller = new AbortController();
+			const id = setTimeout(() => controller.abort(), ms);
+			const response = await fetch(url, { signal: controller.signal });
+			clearTimeout(id);
+			return response;
+		};
+
 		const scrContainer = document.getElementById('modal-screenshots');
 		let baseName = gameName.split(/[-:]/)[0].trim();
+		
 		const searchQueries = [...new Set([gameName, baseName, gameId])].filter(q => q);
 		let summaryTitleHtml = '<span style="font-size: 10px; color: var(--text-muted); font-weight: bold; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px; display: block;"><i class="fas fa-align-left" style="margin-right: 4px;"></i> Summary</span>';
 	
@@ -6631,28 +6640,34 @@ div[id^="msg-row-"] { transition: opacity 0.4s ease, transform 0.4s cubic-bezier
 			for (let attempt = 0; attempt < RAWG_KEYS.length; attempt++) {
 				let activeKey = RAWG_KEYS[currentRawgKeyIndex];
 				try {
-					const searchRes = await fetch(`https://api.rawg.io/api/games?key=${activeKey}&search=${encodeURIComponent(query)}&page_size=1`);
-					if (searchRes.status === 401 || searchRes.status === 403 || searchRes.status === 429) {
+					const searchRes = await fetchWithTimeout(`https://api.rawg.io/api/games?key=${activeKey}&search=${encodeURIComponent(query)}&page_size=1`, 4000);
+					const searchData = await searchRes.json();
+					
+					if (!searchRes.ok || searchData.error) {
 						currentRawgKeyIndex = (currentRawgKeyIndex + 1) % RAWG_KEYS.length;
 						localStorage.setItem('rawg_key_index', currentRawgKeyIndex);
-						continue;
+						continue; // Tenta a mesma query de novo usando a nova chave
 					}
-					const searchData = await searchRes.json();
+					
 					if (searchData.results && searchData.results.length > 0) {
 						const slug = searchData.results[0].slug;
 						const [detailsRes, screensRes] = await Promise.all([
-							fetch(`https://api.rawg.io/api/games/${slug}?key=${activeKey}`),
-							fetch(`https://api.rawg.io/api/games/${slug}/screenshots?key=${activeKey}`)
+							fetchWithTimeout(`https://api.rawg.io/api/games/${slug}?key=${activeKey}`, 3500),
+							fetchWithTimeout(`https://api.rawg.io/api/games/${slug}/screenshots?key=${activeKey}`, 3500)
 						]);
-						const detailsData = await detailsRes.json();
-						const screensData = await screensRes.json();
+						
+						const detailsData = detailsRes.ok ? await detailsRes.json() : {};
+						const screensData = screensRes.ok ? await screensRes.json() : {};
 	
-						if (scrContainer && screensData.results?.length > 0) {
-							const gameImages = screensData.results.slice(0, 8).map(img => img.image);
-							
-							scrContainer.innerHTML = gameImages.map((url, index) => 
-								`<img src="${url}" class="screenshot-item" onclick="openImageModal(${index}, ${JSON.stringify(gameImages).replace(/"/g, '&quot;')})">`
-							).join('');
+						if (scrContainer) {
+							if (screensData.results?.length > 0) {
+								const gameImages = screensData.results.slice(0, 8).map(img => img.image);
+								scrContainer.innerHTML = gameImages.map((url, index) => 
+									`<img src="${url}" class="screenshot-item" onclick="openImageModal(${index}, ${JSON.stringify(gameImages).replace(/"/g, '&quot;')})">`
+								).join('');
+							} else if (screenshotsWrapper) {
+								screenshotsWrapper.style.display = 'none';
+							}
 						}
 	
 						if (badgesContainer) {
@@ -6668,16 +6683,27 @@ div[id^="msg-row-"] { transition: opacity 0.4s ease, transform 0.4s cubic-bezier
 							badgesContainer.innerHTML = bHtml;
 						}
 	
-						if (detailsData.description_raw) {
-							summaryContainer.innerHTML = summaryTitleHtml + detailsData.description_raw.trim().replace(/\n+/g, '<br><br>');
-							return;
+						let finalDesc = "No description available.";
+						if (detailsData.description_raw && detailsData.description_raw.trim() !== "") {
+							finalDesc = detailsData.description_raw.trim().replace(/\n+/g, '<br><br>');
+						} else if (detailsData.description && detailsData.description.trim() !== "") {
+							finalDesc = detailsData.description.trim();
 						}
-						querySuccess = true; break;
+						
+						summaryContainer.innerHTML = summaryTitleHtml + finalDesc;
+						return; // Sucesso absoluto na RAWG, encerra por aqui.
+					} else {
+						break;
 					}
-				} catch (e) { break; }
+				} catch (e) { 
+					currentRawgKeyIndex = (currentRawgKeyIndex + 1) % RAWG_KEYS.length;
+					localStorage.setItem('rawg_key_index', currentRawgKeyIndex);
+					continue; 
+				}
 			}
 			if (querySuccess) break;
 		}
+		
 		try {
 			const wikiSearch = await fetch(`https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(baseName + " video game")}&format=json&origin=*`);
 			const wikiData = await wikiSearch.json();
@@ -6689,17 +6715,27 @@ div[id^="msg-row-"] { transition: opacity 0.4s ease, transform 0.4s cubic-bezier
 	
 				if (page && page.extract) {
 					summaryContainer.innerHTML = summaryTitleHtml + page.extract.trim().replace(/\n+/g, '<br><br>');
+					
 					if (badgesContainer.querySelector('.pulse-skeleton')) {
 						const yearMatch = page.extract.match(/\b(19|20)\d{2}\b/);
 						badgesContainer.innerHTML = yearMatch ? `<span style="background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); color:#ccc; padding:3px 8px; border-radius:4px; font-size:11px; font-weight:bold;"><i class="far fa-calendar-alt"></i> ${yearMatch[0]}</span>` : '';
 					}
-					if (page.thumbnail && (scrContainer.querySelector('.pulse-skeleton') || !scrContainer.innerHTML.trim())) {
-						scrContainer.innerHTML = `<img src="${page.thumbnail.source}" class="screenshot-item" style="width: 180px; height: 120px; object-fit: cover;" onclick="openImageModal(this.src)">`;
+					
+					if (page.thumbnail) {
+						if (scrContainer.querySelector('.pulse-skeleton') || !scrContainer.innerHTML.trim()) {
+							scrContainer.innerHTML = `<img src="${page.thumbnail.source}" class="screenshot-item" style="width: 180px; height: 120px; object-fit: cover;" onclick="openImageModal(this.src)">`;
+						}
+					} else if (screenshotsWrapper) {
+						screenshotsWrapper.style.display = 'none';
 					}
 					return;
 				}
 			}
 		} catch (e) {}
+
+		summaryContainer.innerHTML = summaryTitleHtml + "No description available.";
+		if (badgesContainer) badgesContainer.innerHTML = '';
+		if (screenshotsWrapper) screenshotsWrapper.style.display = 'none';
 	};
 	
 	window.moveModalScroll = function(direction) {
