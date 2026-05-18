@@ -11486,24 +11486,50 @@ div[id^="msg-row-"] { transition: opacity 0.4s ease, transform 0.4s cubic-bezier
 		if (!box) {
 			box = document.createElement('div');
 			box.id = 'mention-suggestions';
-			const container = document.getElementById('chat-input').parentNode;
+			const inputEl = document.getElementById('chat-input');
+			if (!inputEl) return;
+			const container = inputEl.parentNode;
 			container.style.position = 'relative';
-			container.insertBefore(box, document.getElementById('chat-input'));
+			container.insertBefore(box, inputEl);
 		}
 	
-		const myName = localStorage.getItem('psn_username');
+		const myName = localStorage.getItem('psn_username') || '';
 		const isAdmin = document.body.classList.contains('is-admin');
 	
-		const onlineNames = currentOnlineList.map(u => u.name || u);
-		const allPossibleUsers = Array.from(new Set([...onlineNames, ...chatUsers]));
+		const safeOnlineList = (typeof currentOnlineList !== 'undefined' && Array.isArray(currentOnlineList)) ? currentOnlineList : [];
+		const safeChatUsers = (typeof chatUsers !== 'undefined' && Array.isArray(chatUsers)) ? chatUsers : [];
 	
-		const filtered = allPossibleUsers
-			.filter(u => u.toLowerCase().includes(query.toLowerCase()) && u !== myName);
+		const onlineNames = safeOnlineList
+			.filter(u => u && u.online === true)
+			.map(u => u.name ? u.name : u);
+	
+		const allNamesFromList = safeOnlineList.map(u => u && u.name ? u.name : u);
+		const allPossibleUsers = Array.from(new Set([...allNamesFromList, ...safeChatUsers]));
+	
+		const onlineLower = onlineNames.map(u => String(u).toLowerCase());
+	
+		const onlineFiltered = [];
+		const offlineFiltered = [];
+	
+		allPossibleUsers.forEach(u => {
+			if (!u) return;
+			const strU = String(u);
+			
+			if (strU.toLowerCase().includes(String(query).toLowerCase()) && strU.toLowerCase() !== myName.toLowerCase()) {
+				if (onlineLower.includes(strU.toLowerCase())) {
+					onlineFiltered.push(strU);
+				} else {
+					offlineFiltered.push(strU);
+				}
+			}
+		});
+	
+		onlineFiltered.sort((a, b) => a.localeCompare(b));
+		offlineFiltered.sort((a, b) => a.localeCompare(b));
 	
 		let suggestionsHtml = '';
-		let hasGlobal = false;
 	
-		if (isAdmin && "everyone".includes(query.toLowerCase())) {
+		if (isAdmin && "everyone".includes(String(query).toLowerCase())) {
 			suggestionsHtml += `
 				<div class="suggestion-item" data-value="everyone" onmouseenter="if(typeof playUiHover === 'function') playUiHover()" onmousedown="event.preventDefault(); insertMention('everyone')">
 					<i class="fas fa-bullhorn" style="color: #ff4444; font-size: 10px;"></i> 
@@ -11512,19 +11538,36 @@ div[id^="msg-row-"] { transition: opacity 0.4s ease, transform 0.4s cubic-bezier
 				</div>
 				<div style="height: 1px; background: rgba(255,255,255,0.1); margin: 5px 8px;"></div>
 			`;
-			hasGlobal = true;
 		}
 	
-		if (filtered.length > 0 || hasGlobal) {
-			const usersHtml = filtered.map((u, i) => `
-				<div class="suggestion-item ${(!hasGlobal && i === 0) ? 'active' : ''}" data-value="${u}" onmouseenter="if(typeof playUiHover === 'function') playUiHover()" onmousedown="event.preventDefault(); insertMention('${u}')">
-					<i class="fas fa-at" style="color: var(--ps-blue); font-size: 10px;"></i> ${u}
+		if (onlineFiltered.length > 0) {
+			suggestionsHtml += `<div style="font-size: 9px; color: #4caf50; font-weight: bold; margin: 6px 12px 2px 12px; letter-spacing: 1px;">ONLINE</div>`;
+			suggestionsHtml += onlineFiltered.map(u => `
+				<div class="suggestion-item" data-value="${u}" onmouseenter="if(typeof playUiHover === 'function') playUiHover()" onmousedown="event.preventDefault(); insertMention('${u}')">
+					<i class="fas fa-circle status-pulsing-soft" style="color: #4caf50; font-size: 7px; margin-right: 5px; vertical-align: middle;"></i> ${u}
 				</div>
 			`).join('');
+		}
 	
-			box.innerHTML = suggestionsHtml + usersHtml;
+		if (offlineFiltered.length > 0) {
+			suggestionsHtml += `<div style="font-size: 9px; color: #8b96a8; font-weight: bold; margin: 6px 12px 2px 12px; letter-spacing: 1px;">OFFLINE</div>`;
+			suggestionsHtml += offlineFiltered.map(u => `
+				<div class="suggestion-item" data-value="${u}" onmouseenter="if(typeof playUiHover === 'function') playUiHover()" onmousedown="event.preventDefault(); insertMention('${u}')">
+					<i class="fas fa-circle" style="color: rgba(255,255,255,0.2); font-size: 7px; margin-right: 5px; vertical-align: middle;"></i> ${u}
+				</div>
+			`).join('');
+		}
+	
+		if (suggestionsHtml !== '') {
+			box.innerHTML = suggestionsHtml;
 			box.style.display = 'block';
+			
+			box.scrollTop = 0;
 			selectedSuggestionIndex = 0;
+			
+			const items = box.querySelectorAll('.suggestion-item');
+			items.forEach(item => item.classList.remove('active'));
+			if (items.length > 0) items[0].classList.add('active'); 
 	
 			const imgPrev = document.getElementById('pending-image-preview');
 			const replyPrev = document.getElementById('reply-preview');
@@ -11544,11 +11587,7 @@ div[id^="msg-row-"] { transition: opacity 0.4s ease, transform 0.4s cubic-bezier
 			}
 	
 			box.style.zIndex = '10001';
-
-			if (hasGlobal) {
-				const firstItem = box.querySelector('.suggestion-item');
-				if (firstItem) firstItem.classList.add('active');
-			}
+	
 		} else {
 			box.style.display = 'none';
 		}
@@ -11638,7 +11677,7 @@ div[id^="msg-row-"] { transition: opacity 0.4s ease, transform 0.4s cubic-bezier
 		sel.removeAllRanges();
 		sel.addRange(range);
 	
-		const text = input.innerText;
+		const text = input.innerText.replace(/[\n\r]+$/, '');
 		const words = text.split(/\s/);
 		const lastWord = words[words.length - 1];
 		
@@ -11771,7 +11810,7 @@ div[id^="msg-row-"] { transition: opacity 0.4s ease, transform 0.4s cubic-bezier
 		sel.removeAllRanges();
 		sel.addRange(range);
 	
-		const text = input.innerText;
+		const text = input.innerText.replace(/[\n\r]+$/, '');
 		const words = text.split(/\s/);
 		const lastWord = words[words.length - 1];
 	
@@ -16314,7 +16353,6 @@ div[id^="msg-row-"] { transition: opacity 0.4s ease, transform 0.4s cubic-bezier
 						clickAction = `onclick="playUiClick(); searchGameOnSite('${realId}', 'profilelist|${targetUser}|${listType}|${bgView}|${returnToOnline}', '${item.category || ''}')"`;
 						searchTagHtml = `<div style="color: var(--ps-blue); font-size: 9px; font-weight: 900; letter-spacing: 1px; margin-top: 5px;">SEARCH</div>`;
 					} else {
-						// Jogo de disco/não catalogado
 						searchTagHtml = `<div style="color: #ff4444; font-size: 9px; font-weight: 900; letter-spacing: 1px; margin-top: 5px;">${searchId} - NOT FOUND</div>`;
 						cursorStyle = 'style="cursor: default;"'; // Remove o ponteiro de clique
 					}
