@@ -14,6 +14,8 @@
     <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/chance/1.0.18/chance.min.js"></script>
 	<script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+	<link href="https://cdnjs.cloudflare.com/ajax/libs/cropperjs/1.5.13/cropper.min.css" rel="stylesheet">
+	<script src="https://cdnjs.cloudflare.com/ajax/libs/cropperjs/1.5.13/cropper.min.js"></script>
 	<meta name="theme-color" content="#0f1521">
 	<script>
 	const NEON_VERSION = "2.0"; 
@@ -2523,7 +2525,7 @@ div[id^="msg-row-"] { transition: opacity 0.4s ease, transform 0.4s cubic-bezier
 								<button id="btn-strike" class="tool-btn" onmouseenter="playUiHover();" onclick="wrapStyle('strikeThrough')" title="Strikethrough"><i class="fas fa-strikethrough"></i></button>
 							</div>
 							<div style="display: flex; gap: 15px; align-items: center; width: 100%;">
-								<input type="file" id="chat-file-input" multiple accept="image/*" style="display:none" onchange="processAndSendImage(this.files)">
+								<input type="file" id="chat-file-input" accept="image/*" style="display:none" onchange="if(this.files.length > 0) openCropModal(this.files[0]); this.value='';">
 								<button id="btn-attach-file" class="action-btn" onclick="playUiClick(); document.getElementById('chat-file-input').click()" style="margin: 0; padding: 13px 18px; background: rgba(0, 0, 0, 0.5); border: 1px solid rgba(255, 255, 255, 0.1); color: var(--text-muted); transition: 0.3s; box-shadow: inset 0 2px 4px rgba(0,0,0,0.3);" onmouseenter="playUiHover(); this.style.color='var(--ps-blue)'; this.style.borderColor='var(--ps-blue)'" onmouseleave="this.style.color='var(--text-muted)'; this.style.borderColor='rgba(255, 255, 255, 0.1)'">
 									<i class="fas fa-paperclip"></i>
 								</button>
@@ -2860,7 +2862,39 @@ div[id^="msg-row-"] { transition: opacity 0.4s ease, transform 0.4s cubic-bezier
 			</div>
 		</div>
 	</div>
-	
+	<div id="modal-sys-crop" class="sys-modal-overlay" onclick="closeSysModal(event, 'modal-sys-crop')" style="z-index: 100005;">
+		<div class="sys-modal-content" style="max-width: 500px;">
+			<div class="sys-modal-header">
+				<h2><i class="fas fa-crop-alt" style="color: var(--ps-blue);"></i> Edit Image</h2>
+				<button class="sys-modal-close" onmouseenter="if(typeof playUiHover === 'function') playUiHover()" onclick="closeSysModal(null, 'modal-sys-crop')">
+					<i class="fas fa-times"></i>
+				</button>
+			</div>
+			<div class="sys-modal-body" style="padding: 20px; text-align: center;">
+				<div style="width: 100%; max-height: 400px; background: #000; overflow: hidden; border-radius: 8px; margin-bottom: 15px;">
+					<img id="crop-image-target" src="" style="max-width: 100%; display: block;">
+				</div>
+				<div style="display: flex; gap: 10px; justify-content: center; margin-bottom: 15px;">
+					<button class="action-btn" onclick="cropperInstance.rotate(-90)" title="Rotate Left" style="background: rgba(255,255,255,0.1); border-color: rgba(255,255,255,0.2); padding: 8px 12px;">
+						<i class="fas fa-undo"></i>
+					</button>
+					<button class="action-btn" onclick="cropperInstance.rotate(90)" title="Rotate Right" style="background: rgba(255,255,255,0.1); border-color: rgba(255,255,255,0.2); padding: 8px 12px;">
+						<i class="fas fa-redo"></i>
+					</button>
+					<div style="width: 1px; background: rgba(255, 255, 255, 0.2); margin: 0 5px;"></div>
+					<button class="action-btn" onclick="cropperInstance.zoom(0.1)" title="Zoom In" style="background: rgba(255,255,255,0.1); border-color: rgba(255,255,255,0.2); padding: 8px 12px;">
+						<i class="fas fa-search-plus"></i>
+					</button>
+					<button class="action-btn" onclick="cropperInstance.zoom(-0.1)" title="Zoom Out" style="background: rgba(255,255,255,0.1); border-color: rgba(255,255,255,0.2); padding: 8px 12px;">
+						<i class="fas fa-search-minus"></i>
+					</button>
+				</div>
+				<button id="btn-confirm-crop" class="action-btn" style="width: 100%; justify-content: center; background: var(--ps-blue);">
+					<i class="fas fa-check"></i> CONFIRM & UPLOAD
+				</button>
+			</div>
+		</div>
+	</div>
 	<div id="modal-sys-poll" class="sys-modal-overlay" onclick="closeSysModal(event, 'modal-sys-poll')">
 		<div class="sys-modal-content" style="max-width: 450px;">
 			<div class="sys-modal-header">
@@ -14975,8 +15009,8 @@ div[id^="msg-row-"] { transition: opacity 0.4s ease, transform 0.4s cubic-bezier
 				}
 
 				if (hasImage) {
-					if (typeof processAndSendImage === 'function') {
-						processAndSendImage([imageFile]);
+					if (typeof openCropModal === 'function') {
+						openCropModal(imageFile);
 					}
 				}
 
@@ -15133,6 +15167,58 @@ div[id^="msg-row-"] { transition: opacity 0.4s ease, transform 0.4s cubic-bezier
 		}
 	
 		if (btnAttach) btnAttach.innerHTML = '<i class="fas fa-paperclip"></i>';
+	}
+	
+	let cropperInstance = null;
+
+	window.openCropModal = function(file) {
+		const modal = document.getElementById('modal-sys-crop');
+		const imgTarget = document.getElementById('crop-image-target');
+		
+		imgTarget.src = URL.createObjectURL(file);
+	
+		modal.style.display = 'flex';
+		requestAnimationFrame(() => modal.classList.add('show'));
+	
+		if (cropperInstance) {
+			cropperInstance.destroy();
+			cropperInstance = null;
+		}
+		
+		imgTarget.onload = () => {
+			cropperInstance = new Cropper(imgTarget, {
+				viewMode: 1,
+				dragMode: 'move',
+				autoCropArea: 0.9,
+				restore: false,
+				guides: true,
+				center: true,
+				highlight: false,
+				cropBoxMovable: false,
+				cropBoxResizable: true,
+				toggleDragModeOnDblclick: false,
+			});
+		};
+	
+		document.getElementById('btn-confirm-crop').onclick = () => {
+			if (!cropperInstance) return;
+			
+			if (typeof playUiClick === 'function') playUiClick();
+			const btn = document.getElementById('btn-confirm-crop');
+			btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> PREPARING...';
+			btn.style.pointerEvents = 'none';
+			
+			cropperInstance.getCroppedCanvas().toBlob((blob) => {
+				const croppedFile = new File([blob], file.name || "image.png", { type: "image/png" });
+				
+				btn.innerHTML = '<i class="fas fa-check"></i> CONFIRM & UPLOAD';
+				btn.style.pointerEvents = 'auto';
+				closeSysModal(null, 'modal-sys-crop');
+				
+				processAndSendImage([croppedFile]);
+				
+			}, 'image/png');
+		};
 	}
     
     async function fetchLinkMetadata(url, elementId) {
