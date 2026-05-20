@@ -9,9 +9,12 @@ const app = express();
 const server = http.createServer(app);
 
 const APP_URLS = [
-  "https://psn-content-7aa6.onrender.com/ping",
-  "https://psn-content-61e2.onrender.com/ping",
-  "https://psn-content-jm1q.onrender.com/ping"
+  "https://psn-content-cb4c.onrender.com/ping",
+  "https://psn-content-nnb8.onrender.com/ping",
+  "https://psn-content-fbni.onrender.com/ping"
+  "https://psn-content-4sof.onrender.com/ping"
+  "https://psn-content-0st4.onrender.com/ping"
+  "https://psn-content-mwp5.onrender.com/ping"
 ];
 
 const ADMIN_USERS = ["Luan Teles", "Goku Cheats"];

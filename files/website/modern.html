@@ -867,6 +867,13 @@ body.is-admin #btn-toolbar-cmd { display: flex !important; }
 .poll-option-percent { font-size: 11px; color: var(--text-muted); font-weight: bold; pointer-events: none; }
 .poll-footer { font-size: 10px; color: var(--text-muted); text-align: right; margin-top: 10px; border-top: 1px solid rgba(255,255,255,0.05); padding-top: 8px; }
 
+.cropper-view-box,
+.cropper-face { outline: 3px solid var(--ps-blue) !important; }
+.cropper-line { background-color: var(--ps-blue); }
+.cropper-point { width: 10px; height: 10px; background-color: var(--ps-blue); }
+.cropper-dashed { border-width: 2px !important; }
+.cropper-view-box { outline: 4px solid var(--ps-blue) !important; box-shadow: 0 0 10px rgba(0, 112, 204, 0.8); }
+
 /* ========================================================================== LIBRARY SPECIFIC FIXES ========================================================================== */
 .library-actions { display: flex; gap: 15px; align-items: center; }
 #library-toolbar { justify-content: flex-end; }
@@ -2875,12 +2882,17 @@ div[id^="msg-row-"] { transition: opacity 0.4s ease, transform 0.4s cubic-bezier
 					<img id="crop-image-target" src="" style="max-width: 100%; display: block;">
 				</div>
 				<div style="display: flex; gap: 10px; justify-content: center; margin-bottom: 15px;">
-					<button class="action-btn" onclick="cropperInstance.rotate(-90)" title="Rotate Left" style="background: rgba(255,255,255,0.1); border-color: rgba(255,255,255,0.2); padding: 8px 12px;">
+					<button class="action-btn" onclick="rotateAndAdjust(-90)" title="Rotate Left" style="background: rgba(255,255,255,0.1); border-color: rgba(255,255,255,0.2); padding: 8px 12px;">
 						<i class="fas fa-undo"></i>
 					</button>
-					<button class="action-btn" onclick="cropperInstance.rotate(90)" title="Rotate Right" style="background: rgba(255,255,255,0.1); border-color: rgba(255,255,255,0.2); padding: 8px 12px;">
+					<button class="action-btn" onclick="rotateAndAdjust(90)" title="Rotate Right" style="background: rgba(255,255,255,0.1); border-color: rgba(255,255,255,0.2); padding: 8px 12px;">
 						<i class="fas fa-redo"></i>
 					</button>
+					
+					<button class="action-btn" onclick="cropperInstance.reset()" title="Reset Image" style="background: rgba(255, 140, 0, 0.2); border-color: #ff8c00; padding: 8px 12px;">
+						<i class="fas fa-sync"></i>
+					</button>
+	
 					<div style="width: 1px; background: rgba(255, 255, 255, 0.2); margin: 0 5px;"></div>
 					<button class="action-btn" onclick="cropperInstance.zoom(0.1)" title="Zoom In" style="background: rgba(255,255,255,0.1); border-color: rgba(255,255,255,0.2); padding: 8px 12px;">
 						<i class="fas fa-search-plus"></i>
@@ -11606,9 +11618,12 @@ div[id^="msg-row-"] { transition: opacity 0.4s ease, transform 0.4s cubic-bezier
     // ==========================================================================
     const serverUrls = [
 		"https://psn-content-production.up.railway.app",
-		"https://psn-content-7aa6.onrender.com",
-		"https://psn-content-61e2.onrender.com",
-		"https://psn-content-jm1q.onrender.com",
+		"https://psn-content-cb4c.onrender.com",
+		"https://psn-content-nnb8.onrender.com",
+		"https://psn-content-fbni.onrender.com",
+		"https://psn-content-4sof.onrender.com",
+		"https://psn-content-0st4.onrender.com",
+		"https://psn-content-mwp5.onrender.com",
 	];
 	let currentServerIndex = 0;
 
@@ -15170,57 +15185,97 @@ div[id^="msg-row-"] { transition: opacity 0.4s ease, transform 0.4s cubic-bezier
 	}
 	
 	let cropperInstance = null;
-
+	let currentRotation = 0;
+	
 	window.openCropModal = function(file) {
+		currentRotation = 0;
 		const modal = document.getElementById('modal-sys-crop');
 		const imgTarget = document.getElementById('crop-image-target');
-		
 		imgTarget.src = URL.createObjectURL(file);
-	
 		modal.style.display = 'flex';
 		requestAnimationFrame(() => modal.classList.add('show'));
-	
-		if (cropperInstance) {
-			cropperInstance.destroy();
-			cropperInstance = null;
-		}
-		
+		if (cropperInstance) { cropperInstance.destroy(); cropperInstance = null; }
 		imgTarget.onload = () => {
 			cropperInstance = new Cropper(imgTarget, {
 				viewMode: 1,
 				dragMode: 'move',
-				autoCropArea: 0.9,
-				restore: false,
-				guides: true,
-				center: true,
-				highlight: false,
-				cropBoxMovable: false,
+				aspectRatio: NaN,
+				cropBoxMovable: true,
 				cropBoxResizable: true,
+				autoCropArea: 0.98,
+				zoomable: true,
+				background: false,
 				toggleDragModeOnDblclick: false,
 			});
 		};
-	
 		document.getElementById('btn-confirm-crop').onclick = () => {
 			if (!cropperInstance) return;
-			
 			if (typeof playUiClick === 'function') playUiClick();
 			const btn = document.getElementById('btn-confirm-crop');
 			btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> PREPARING...';
 			btn.style.pointerEvents = 'none';
-			
 			cropperInstance.getCroppedCanvas().toBlob((blob) => {
 				const croppedFile = new File([blob], file.name || "image.png", { type: "image/png" });
-				
 				btn.innerHTML = '<i class="fas fa-check"></i> CONFIRM & UPLOAD';
 				btn.style.pointerEvents = 'auto';
 				closeSysModal(null, 'modal-sys-crop');
-				
 				processAndSendImage([croppedFile]);
-				
 			}, 'image/png');
 		};
-	}
-    
+	};
+
+	window.rotateAndAdjust = function(degree) {
+		if (!cropperInstance) return;
+	
+		currentRotation = (currentRotation + degree + 360) % 360;
+	
+		if (currentRotation === 0) {
+			cropperInstance.reset();
+			return;
+		}
+	
+		if (currentRotation === 180) {
+			cropperInstance.reset();
+			cropperInstance.rotateTo(180);
+			return;
+		}
+	
+		const cropBoxData   = cropperInstance.getCropBoxData();
+		const containerData = cropperInstance.getContainerData();
+	
+		cropperInstance.rotateTo(currentRotation);
+	
+		let newWidth  = cropBoxData.height;
+		let newHeight = cropBoxData.width;
+	
+		const margin    = 10;
+		const maxWidth  = containerData.width  - (margin * 2);
+		const maxHeight = containerData.height - (margin * 2);
+	
+		const scale = Math.min(maxWidth / newWidth, maxHeight / newHeight);
+		newWidth  *= scale;
+		newHeight *= scale;
+	
+		cropperInstance.setCropBoxData({
+			left:   (containerData.width  - newWidth)  / 2,
+			top:    (containerData.height - newHeight) / 2,
+			width:  newWidth,
+			height: newHeight,
+		});
+	
+		cropperInstance.zoomTo(0);
+	
+		setTimeout(() => {
+			cropperInstance.zoomTo(0);
+			const canvas    = cropperInstance.getCanvasData();
+			const container = cropperInstance.getContainerData();
+			cropperInstance.setCanvasData({
+				left: (container.width  - canvas.width)  / 2,
+				top:  (container.height - canvas.height) / 2,
+			});
+		}, 50);
+	};
+
     async function fetchLinkMetadata(url, elementId) {
 		if (url.match(/\.(jpeg|jpg|gif|png|bmp|webp)$/) != null) return;
 	
