@@ -8563,85 +8563,110 @@ div[id^="msg-row-"] { transition: opacity 0.4s ease, transform 0.4s cubic-bezier
 		}
 	};
 	
+	async function getGameNameFromWiki(id) {
+    try {
+        // Busca o Title ID na Wikipedia para tentar achar o nome do jogo
+        const response = await fetch(`https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=${id}&format=json&origin=*`);
+        const data = await response.json();
+        if (data.query.search.length > 0) {
+            return data.query.search[0].title.replace(/\(video game\)/gi, '').trim();
+        }
+    } catch (e) { console.error("Wiki fetch error:", e); }
+    return id; // Retorna o próprio ID se não achar
+}
+	
 	window.renderServerGamesCards = function(containerId, idsArray, isSilent = false) {
-		const container = document.getElementById(containerId);
-		if (!container) return;
-		
-		const animClass = isSilent ? "no-anim" : "anim-reveal";
-		
-		const sortedIds = idsArray.map(id => {
-			let data = null;
-			
-			if (window.psnStoreCache && window.psnStoreCache['games']) {
-				data = window.psnStoreCache['games'].find(g => g.id === id || g.titleId === id);
-			}
-	
-			if (!data && window.psnStoreCache && window.psnStoreCache['updates']) {
-				const updateEntry = window.psnStoreCache['updates'].find(u => u.id === id);
-				if (updateEntry) {
-					const cleanName = updateEntry.cleanName 
-						.replace(/\s*v?\d+\.\d+(\.\d+)?/gi, '') 
-						.replace(/\s*-\s*Update/gi, '')
-						.trim();
-					
-					data = { ...updateEntry, cleanName: cleanName };
-				}
-			}
-			
-			const hasValidData = data && (data.category || data.url);
-			return { id, data, hasValidData };
-		}).sort((a, b) => {
-			if (a.hasValidData && !b.hasValidData) return -1;
-			if (!a.hasValidData && b.hasValidData) return 1;
-			
-			const nameA = a.data ? (a.data.cleanName || a.data.title) : a.id;
-			const nameB = b.data ? (b.data.cleanName || b.data.title) : b.id;
-			return nameA.localeCompare(nameB);
-		});
-	
-		let html = '';
-	
-		sortedIds.forEach((item, idx) => {
-			const id = item.id.trim();
-			const gameData = item.data;
-			
-			const isMissing = !item.hasValidData;
-	
-			const displayName = item.hasValidData ? (gameData.cleanName || gameData.title) : id;
-			const consoleTag = item.hasValidData ? (gameData.cTag || "ps3") : "ps3";
-			const imgUrl = getOptimizedCover(id);
-			const safeDisplayName = displayName.replace(/"/g, '&quot;');
-			
-			html += `
-				<div class="game-card ${animClass} ${isMissing ? 'is-missing' : ''}" style="--tile-idx: ${idx}; width: 160px;" 
-					onclick="searchGameOnSite('${id}')" 
-					onmouseenter="playUiHover(); this.classList.remove('anim-reveal'); this.classList.add('no-anim');">
-					<div class="game-img-container">
-						<img src="${imgUrl}" class="game-img" data-name="${safeDisplayName}" data-console="${consoleTag}" onload="this.setAttribute('data-loaded', 'true')" onerror="getOnlineCoverFallback(this)">
-					</div>
-					<div class="game-info" style="padding: 10px; min-height: 0;">
-						<div style="display: flex; flex-direction: column; justify-content: space-between; height: 100%;">
-							<div>
-								<h3 class="game-title" style="font-size: 11px;" title="${safeDisplayName}">${displayName}</h3>
-								<div class="game-id" style="color: #ffff00; font-size: 10px; font-weight: bold; margin-top: 2px;">[${id}]</div>
-							</div>
-							<div style="margin-top: 12px; display: flex; align-items: center; gap: 6px;">
-								<span style="font-size: 10px; font-weight: 800; color: ${isMissing ? '#888' : 'var(--ps-blue)'}; letter-spacing: 1.2px;">
-									${isMissing ? 'NOT IN STORE' : 'GO TO STORE'}
-								</span>
-								<i class="fas ${isMissing ? 'fa-ban' : 'fa-chevron-right'}" style="font-size: 8px; color: ${isMissing ? '#888' : 'var(--ps-blue)'};"></i>
-							</div>
-						</div>
-					</div>
-				</div>`;
-		});
-		
-		container.innerHTML = html;
-		
-		if (!isSilent && typeof setupRevealAnimations === 'function') {
-			setupRevealAnimations(containerId);
-		}
-	};
+    const container = document.getElementById(containerId);
+    if (!container) return;
+    
+    const animClass = isSilent ? "no-anim" : "anim-reveal";
+    
+    // 1. Mapeamento e identificação do que é "loja" vs "não encontrado"
+    const processedItems = idsArray.map(id => {
+        let gameData = null;
+        
+        // Busca em Games
+        if (window.psnStoreCache?.['games']) {
+            gameData = window.psnStoreCache['games'].find(g => g.id === id || g.titleId === id);
+        }
+
+        // Se não achou em Games, busca em Updates (limpando nome)
+        if (!gameData && window.psnStoreCache?.['updates']) {
+            const updateEntry = window.psnStoreCache['updates'].find(u => u.id === id);
+            if (updateEntry) {
+                const cleanName = updateEntry.cleanName 
+                    .replace(/\s*v?\d+\.\d+(\.\d+)?/gi, '') 
+                    .replace(/\s*-\s*Update/gi, '')
+                    .trim();
+                gameData = { ...updateEntry, cleanName: cleanName };
+            }
+        }
+        
+        // Validação real: só tem dados se tiver categoria ou URL
+        const hasValidData = gameData && (gameData.category || gameData.url);
+        
+        return { 
+            id, 
+            data: gameData, 
+            hasValidData,
+            displayName: hasValidData ? (gameData.cleanName || gameData.title) : "Title Not Found"
+        };
+    });
+
+    // 2. Ordenação: Quem tem dados válidos (da loja) primeiro, depois "Title Not Found"
+    sortedIds = processedItems.sort((a, b) => {
+        if (a.hasValidData && !b.hasValidData) return -1;
+        if (!a.hasValidData && b.hasValidData) return 1;
+        return a.displayName.localeCompare(b.displayName);
+    });
+
+    // 3. Renderização
+    let html = '';
+    sortedIds.forEach((item, idx) => {
+        const id = item.id.trim();
+        const isMissing = !item.hasValidData;
+        const consoleTag = item.hasValidData ? (item.data.cTag || "ps3") : "ps3";
+        const imgUrl = getOptimizedCover(id);
+        const safeDisplayName = item.displayName.replace(/"/g, '&quot;');
+        
+        html += `
+            <div class="game-card ${animClass} ${isMissing ? 'is-missing' : ''}" 
+                 style="--tile-idx: ${idx}; width: 160px; opacity: 0;" 
+                 onclick="searchGameOnSite('${id}')" 
+                 onmouseenter="playUiHover(); this.classList.remove('anim-reveal'); this.classList.add('no-anim');">
+                <div class="game-img-container">
+                    <img src="${imgUrl}" class="game-img" data-name="${safeDisplayName}" data-console="${consoleTag}" onload="this.setAttribute('data-loaded', 'true')" onerror="getOnlineCoverFallback(this)">
+                </div>
+                <div class="game-info" style="padding: 10px; min-height: 0;">
+                    <div style="display: flex; flex-direction: column; justify-content: space-between; height: 100%;">
+                        <div>
+                            <h3 class="game-title" style="font-size: 11px;" title="${safeDisplayName}">${item.displayName}</h3>
+                            <div class="game-id" style="color: #ffff00; font-size: 10px; font-weight: bold; margin-top: 2px;">[${id}]</div>
+                        </div>
+                        <div style="margin-top: 12px; display: flex; align-items: center; gap: 6px;">
+                            <span style="font-size: 10px; font-weight: 800; color: ${isMissing ? '#888' : 'var(--ps-blue)'}; letter-spacing: 1.2px;">
+                                ${isMissing ? 'NOT IN STORE' : 'GO TO STORE'}
+                            </span>
+                            <i class="fas ${isMissing ? 'fa-ban' : 'fa-chevron-right'}" style="font-size: 8px; color: ${isMissing ? '#888' : 'var(--ps-blue)'};"></i>
+                        </div>
+                    </div>
+                </div>
+            </div>`;
+    });
+    
+    container.innerHTML = html;
+    
+    // 4. Dispara animação
+    if (!isSilent) {
+        setTimeout(() => {
+            container.querySelectorAll('.game-card').forEach(card => {
+                card.style.opacity = '1';
+                card.classList.add('anim-reveal');
+            });
+            if (typeof setupRevealAnimations === 'function') setupRevealAnimations(containerId);
+        }, 50);
+    }
+};
 </script>
 <script>
 	// =========================================================
