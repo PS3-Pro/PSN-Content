@@ -8498,7 +8498,20 @@ div[id^="msg-row-"] { transition: opacity 0.4s ease, transform 0.4s cubic-bezier
 			targetView.classList.add('anim-up');
 			
 			const carousels = targetView.querySelectorAll('.horizontal-scroll');
-			carousels.forEach(c => c.scrollLeft = 0);
+			carousels.forEach(c => {
+				c.scrollLeft = 0;
+				const cards = c.querySelectorAll('.game-card');
+				
+				cards.forEach(card => card.style.opacity = '0');
+				cards.forEach(card => card.classList.remove('anim-reveal', 'no-anim'));
+				
+				void targetView.offsetWidth; 
+				
+				cards.forEach(card => {
+					card.style.opacity = ''; // Libera o CSS
+					card.classList.add('anim-reveal');
+				});
+			});
 		}
 		
 		setTimeout(updateSidebarLight, 50);
@@ -8513,13 +8526,39 @@ div[id^="msg-row-"] { transition: opacity 0.4s ease, transform 0.4s cubic-bezier
 		if (!container) return;
 	
 		const TSV_URL = "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/main/resources/database/content/online_servers.tsv";
-		container.innerHTML = '<div class="loader"><i class="fas fa-circle-notch fa-spin"></i> Loading Servers...</div>';
+		
+		const skeletonCards = `
+			<div class="skeleton-card"><div class="skeleton-img"></div><div class="skeleton-text"></div><div class="skeleton-text short"></div></div>
+			<div class="skeleton-card"><div class="skeleton-img"></div><div class="skeleton-text"></div><div class="skeleton-text short"></div></div>
+			<div class="skeleton-card"><div class="skeleton-img"></div><div class="skeleton-text"></div><div class="skeleton-text short"></div></div>
+			<div class="skeleton-card"><div class="skeleton-img"></div><div class="skeleton-text"></div><div class="skeleton-text short"></div></div>
+			<div class="skeleton-card"><div class="skeleton-img"></div><div class="skeleton-text"></div><div class="skeleton-text short"></div></div>
+			<div class="skeleton-card"><div class="skeleton-img"></div><div class="skeleton-text"></div><div class="skeleton-text short"></div></div>
+			<div class="skeleton-card"><div class="skeleton-img"></div><div class="skeleton-text"></div><div class="skeleton-text short"></div></div>
+			<div class="skeleton-card"><div class="skeleton-img"></div><div class="skeleton-text"></div><div class="skeleton-text short"></div></div>
+			<div class="skeleton-card"><div class="skeleton-img"></div><div class="skeleton-text"></div><div class="skeleton-text short"></div></div>
+			<div class="skeleton-card"><div class="skeleton-img"></div><div class="skeleton-text"></div><div class="skeleton-text short"></div></div>
+			
+		`;
+
+		container.innerHTML = `
+			<div class="explore-section" style="margin-bottom:40px;">
+				<div class="section-header"><div class="pulse-skeleton" style="width: 250px; height: 24px; border-radius: 4px;"></div></div>
+				<div class="carousel-wrapper"><div class="horizontal-scroll" style="overflow: hidden;">${skeletonCards}</div></div>
+			</div>
+			<div class="explore-section" style="margin-bottom:40px;">
+				<div class="section-header"><div class="pulse-skeleton" style="width: 200px; height: 24px; border-radius: 4px;"></div></div>
+				<div class="carousel-wrapper"><div class="horizontal-scroll" style="overflow: hidden;">${skeletonCards}</div></div>
+			</div>
+		`;
 	
 		try {
 			const response = await fetch(TSV_URL);
 			const text = await response.text();
 			const lines = text.split('\n');
 			container.innerHTML = '';
+	
+			const renderPromises = [];
 	
 			for (const [index, line] of lines.entries()) {
 				if (index === 0 || line.trim().length < 5) continue;
@@ -8561,13 +8600,17 @@ div[id^="msg-row-"] { transition: opacity 0.4s ease, transform 0.4s cubic-bezier
 						</div>
 						<div class="carousel-wrapper">
 							<button class="scroll-arrow left-arrow" onclick="scrollCarousel('${gridId}', -1)"><i class="fas fa-chevron-left"></i></button>
-							<div class="horizontal-scroll" id="${gridId}"></div>
+							<div class="horizontal-scroll" id="${gridId}">
+								${skeletonCards}
+							</div>
 							<button class="scroll-arrow right-arrow" onclick="scrollCarousel('${gridId}', 1)"><i class="fas fa-chevron-right"></i></button>
 						</div>
 					</div>`);
 	
-				await renderServerGamesCards(gridId, ids);
+				renderPromises.push(renderServerGamesCards(gridId, ids));
 			}
+	
+			await Promise.all(renderPromises);
 	
 			window.isRevivedLoaded = true;
 		} catch (error) {
@@ -8645,25 +8688,25 @@ div[id^="msg-row-"] { transition: opacity 0.4s ease, transform 0.4s cubic-bezier
 				}
 			}
 	
+			let displayName = gameData?.cleanName || gameData?.title || null;
+			if (!displayName && window.gameNameCache && window.gameNameCache[id]) {
+				displayName = window.gameNameCache[id];
+			}
+
 			processedItems.push({
 				id,
 				gameData,
 				isInStore,
-				displayName: gameData?.cleanName || gameData?.title || null
+				displayName: displayName,
+				needsFetch: !displayName
 			});
 		});
 	
-		await Promise.all(
-			processedItems
-				.filter(item => !item.displayName)
-				.map(async (item) => {
-					item.displayName = await getGameNameFromRPCS3Wiki(item.id);
-				})
-		);
-	
 		processedItems.sort((a, b) => {
 			if (a.isInStore !== b.isInStore) return a.isInStore ? -1 : 1;
-			return a.displayName.localeCompare(b.displayName);
+			const nameA = a.displayName || a.id;
+			const nameB = b.displayName || b.id;
+			return nameA.localeCompare(nameB);
 		});
 	
 		let html = '';
@@ -8673,7 +8716,9 @@ div[id^="msg-row-"] { transition: opacity 0.4s ease, transform 0.4s cubic-bezier
 			const isMissing      = !item.isInStore;
 			const consoleTag     = item.gameData?.cTag || "ps3";
 			const imgUrl         = getOptimizedCover(id);
-			const safeDisplayName = item.displayName.replace(/"/g, '&quot;');
+			
+			const tempName = item.displayName || "Loading Title...";
+			const safeDisplayName = tempName.replace(/"/g, '&quot;');
 	
 			html += `
 			<div class="game-card ${animClass} ${isMissing ? 'is-missing' : ''}"
@@ -8694,11 +8739,11 @@ div[id^="msg-row-"] { transition: opacity 0.4s ease, transform 0.4s cubic-bezier
 					<div style="display:flex; flex-direction:column; justify-content:space-between; height:100%;">
 	
 						<div>
-							<h3 id="title-${id}"
+							<h3 id="title-${id}-${containerId}"
 								class="game-title"
-								style="font-size:11px;"
+								style="font-size:11px; transition: color 0.3s ease;"
 								title="${safeDisplayName}">
-								${item.displayName}
+								${tempName}
 							</h3>
 							<div class="game-id" style="color:#ffff00; font-size:10px; font-weight:bold; margin-top:2px;">
 								[${id}]
@@ -8726,6 +8771,26 @@ div[id^="msg-row-"] { transition: opacity 0.4s ease, transform 0.4s cubic-bezier
 				setupRevealAnimations(containerId);
 			}
 		}, 50);
+
+		processedItems.filter(item => item.needsFetch).forEach(async (item) => {
+			const fetchedName = await getGameNameFromRPCS3Wiki(item.id);
+			const titleEl = document.getElementById(`title-${item.id}-${containerId}`);
+			
+			if (titleEl) {
+				if (fetchedName && fetchedName !== item.id) {
+					titleEl.style.color = 'var(--ps-blue)';
+					titleEl.innerText = fetchedName;
+					titleEl.title = fetchedName;
+					setTimeout(() => titleEl.style.color = '#fff', 500);
+
+					const imgEl = titleEl.closest('.game-card').querySelector('.game-img');
+					if (imgEl) imgEl.setAttribute('data-name', fetchedName.replace(/"/g, '&quot;'));
+				} else {
+					titleEl.innerText = `Unknown (${item.id})`;
+					titleEl.title = `Unknown (${item.id})`;
+				}
+			}
+		});
 	};
 </script>
 <script>
