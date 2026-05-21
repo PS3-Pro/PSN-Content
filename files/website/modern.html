@@ -8768,6 +8768,17 @@ div[id^="msg-row-"] { transition: opacity 0.4s ease, transform 0.4s cubic-bezier
 		}
 	};
 	
+	async function fetchTextWithEncodingFallback(url) {
+		const response = await fetch(url, { cache: 'no-store' });
+		const buffer = await response.arrayBuffer();
+	
+		try {
+			return new TextDecoder('utf-8', { fatal: true }).decode(buffer);
+		} catch (error) {
+			return new TextDecoder('windows-1252').decode(buffer);
+		}
+	}
+	
 	window.loadRevivedServersFromTSV = async function () {
 		if (window.isRevivedLoaded) return;
 	
@@ -8801,8 +8812,7 @@ div[id^="msg-row-"] { transition: opacity 0.4s ease, transform 0.4s cubic-bezier
 		`;
 	
 		try {
-			const response = await fetch(TSV_URL);
-			const text = await response.text();
+			const text = await fetchTextWithEncodingFallback(TSV_URL);
 			const lines = text.split('\n');
 			container.innerHTML = '';
 	
@@ -8830,10 +8840,12 @@ div[id^="msg-row-"] { transition: opacity 0.4s ease, transform 0.4s cubic-bezier
 				const ids    = gameIdsRaw.split(',').map(i => i.trim().toUpperCase()).filter(i => i.length > 0);
 				const gridId = `server-grid-${index}`;
 	
-				const safeServerName         = escapeForOnclick(serverName);
-				const safeServerDns          = escapeForOnclick(serverDns);
-				const safeInfoLink           = escapeForOnclick(infoLink);
-				const safeServerInstructions = escapeForOnclick(serverInstructions);
+				const safeServerName = escapeForOnclick(serverName);
+				const safeServerDns  = escapeForOnclick(serverDns);
+				const safeInfoLink   = escapeForOnclick(infoLink);
+				
+				const encodedServerName = encodeURIComponent(serverName || '');
+				const encodedServerInstructions = encodeURIComponent(serverInstructions || '')
 	
 				const dnsBadgeHtml = serverDns ? `
 				<div class="revived-network-row">
@@ -8848,8 +8860,10 @@ div[id^="msg-row-"] { transition: opacity 0.4s ease, transform 0.4s cubic-bezier
 							type="button"
 							class="revived-instructions-btn"
 							title="View DNS instructions"
+							data-server-name="${encodedServerName}"
+							data-instructions="${encodedServerInstructions}"
 							onmouseenter="playUiHover()"
-							onclick="event.stopPropagation(); playUiClick(); openRevivedInstructionsModal('${safeServerName}', '${safeServerInstructions}')">
+							onclick="event.stopPropagation(); playUiClick(); openRevivedInstructionsModalFromButton(this)">
 							<i class="fas fa-circle-info"></i>
 							<span>Instructions</span>
 						</button>
@@ -9089,10 +9103,19 @@ div[id^="msg-row-"] { transition: opacity 0.4s ease, transform 0.4s cubic-bezier
 		}, 50);
 	};
 	
-		window.openRevivedInstructionsModal = function(serverName, instructions) {
+	window.openRevivedInstructionsModalFromButton = function(button) {
+		const serverName = decodeURIComponent(button.dataset.serverName || '');
+		const instructions = decodeURIComponent(button.dataset.instructions || '');
+	
+		openRevivedInstructionsModal(serverName, instructions);
+	};
+	
+	window.openRevivedInstructionsModal = function(serverName, instructions) {
 		const cleanServerName = String(serverName || "Revived Server").trim();
+	
 		const cleanInstructions = String(instructions || "")
 			.replace(/\\n/g, "\n")
+			.replace(/&trade;|&#8482;|&#x2122;/gi, "™")
 			.trim();
 	
 		const escapeHtml = (value) => {
@@ -9115,14 +9138,14 @@ div[id^="msg-row-"] { transition: opacity 0.4s ease, transform 0.4s cubic-bezier
 		modal.innerHTML = `
 			<div class="sys-modal-content revived-instructions-modal-content">
 				<div class="sys-modal-header">
-					<h2><i class="fas fa-circle-info"></i> DNS Instructions</h2>
+					<h2><i class="fas fa-circle-info"></i> ${escapeHtml(cleanServerName)} Instructions</h2>
 					<button type="button" class="sys-modal-close revived-instructions-close" onclick="closeRevivedInstructionsModal()">
 						<i class="fas fa-times"></i>
 					</button>
 				</div>
 	
 				<div class="sys-modal-body">
-					<div class="revived-instructions-title">${escapeHtml(cleanServerName)}</div>
+					<!-- <div class="revived-instructions-title">${escapeHtml(cleanServerName)}</div> -->
 					<div class="revived-instructions-text">${formatRevivedInstructions(cleanInstructions)}</div>
 				</div>
 			</div>
