@@ -1,0 +1,12 @@
+Kiryu money in hand
+0
+Rambo9000
+0 2000C638 3B9AC9FF
+#
+Kiryu Lv.19 / experience value 162 599
+0
+Rambo9000
+0 00006A90 00000013
+0 20006A94 00027B27
+0 20006A98 00005559
+#
