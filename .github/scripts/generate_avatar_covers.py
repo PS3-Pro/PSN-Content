@@ -772,51 +772,107 @@ def download_external_image(repo: str, branch: str, path: str, output_path: Path
 
 
 
+def normalize_external_match_name(value: str) -> str:
+    value = (value or "").upper()
+    value = value.rsplit("/", 1)[-1]
+    value = re.sub(r"\.(PNG|JPG|JPEG|EDAT|UNEDAT|BIN|DAT)$", "", value, flags=re.IGNORECASE)
+    return normalize_lookup_text(value)
+
+
 def content_id_to_psna_name(content_id: str) -> str:
-    """Return the usual PSNA_ SHA1 filename stem for a PSN avatar Content ID."""
+    """Best-effort PSNA stem from Content ID.
+
+    Some PSNA files are named PSNA_<40 hex>. This may be SHA1(Content ID)
+    for some sets, but the most reliable value is the actual EDAT filename
+    extracted from the PKG, which we also pass to the fallback.
+    """
     if not content_id:
         return ""
     return "PSNA_" + hashlib.sha1(content_id.encode("ascii", errors="ignore")).hexdigest().upper()
 
 
-def external_path_matches_content_id(path: str, content_id: str) -> bool:
-    """Match by exact Content ID or by PSNA_SHA1(Content ID)."""
-    if not content_id:
-        return False
+def build_external_match_names(entry: AvatarEntry, failed_edat_names: Iterable[str] | None = None) -> list[str]:
+    """Build exact avatar names accepted by the external fallback.
 
-    path_upper = path.upper()
+    This intentionally does NOT include the game Title ID alone, because that
+    can pull a random/default avatar from the same game.
+    """
+    names: list[str] = []
+
+    if entry.content_id:
+        names.append(entry.content_id)
+        names.append(content_id_to_psna_name(entry.content_id))
+
+    for name in failed_edat_names or []:
+        clean = (name or "").strip()
+        if not clean:
+            continue
+        names.append(clean)
+        names.append(Path(clean).stem)
+
+    out: list[str] = []
+    seen: set[str] = set()
+
+    for name in names:
+        norm = normalize_external_match_name(name)
+        if not norm or norm in seen:
+            continue
+        seen.add(norm)
+        out.append(norm)
+
+    return out
+
+
+def external_path_match_score(path: str, match_names: Iterable[str], content_id: str, title_id: str) -> int:
+    """Return a score only for exact avatar matches.
+
+    Accepted matches:
+    - Content ID appears in path/name.
+    - Actual failed EDAT/UNEDAT PSNA stem appears in path/name.
+    - Best-effort PSNA_SHA1(Content ID) appears in path/name.
+
+    Rejected:
+    - Title ID-only matches.
+    """
     path_norm = normalize_lookup_text(path)
+    score = 0
 
-    exact_content = content_id.upper()
-    norm_content = normalize_lookup_text(content_id)
-    psna_name = content_id_to_psna_name(content_id)
+    for match_name in match_names:
+        if match_name and match_name in path_norm:
+            score = max(score, 100 + len(match_name))
 
-    if exact_content in path_upper:
-        return True
+    if not score:
+        return 0
 
-    if norm_content and norm_content in path_norm:
-        return True
+    # Tie-breakers only after exact avatar match.
+    title_norm = normalize_lookup_text(title_id)
+    if title_norm and title_norm in path_norm:
+        score += 10
 
-    if psna_name and psna_name in path_upper:
-        return True
+    content_norm = normalize_lookup_text(content_id)
+    if content_norm and content_norm in path_norm:
+        score += 20
 
-    return False
+    if path.lower().endswith(".png"):
+        score += 5
+
+    return score
 
 
 def find_external_avatar_cover(
     entry: AvatarEntry,
     output_path: Path,
     log: Callable[[str], None],
+    failed_edat_names: Iterable[str] | None = None,
 ) -> bool:
     content_id = entry.content_id or ""
     title_id = entry.title_id or ""
 
-    if not content_id:
+    match_names = build_external_match_names(entry, failed_edat_names)
+    if not match_names:
         return False
 
-    exact_content = content_id.upper()
-    norm_content = normalize_lookup_text(content_id)
-    norm_title = normalize_lookup_text(title_id)
+    log(f"[EXT ] Accepted external match names: {', '.join(match_names[:8])}")
 
     for repo_info in EXTERNAL_AVATAR_REPOS:
         label = repo_info["label"]
@@ -831,32 +887,15 @@ def find_external_avatar_cover(
         candidates: list[tuple[int, str]] = []
 
         for path in paths:
-            path_upper = path.upper()
+            score = external_path_match_score(
+                path=path,
+                match_names=match_names,
+                content_id=content_id,
+                title_id=title_id,
+            )
 
-            # External fallback must match this exact avatar:
-            # - Content ID in path/name, or
-            # - PSNA_SHA1(Content ID) in path/name.
-            # Never accept Title ID-only matches.
-            if not external_path_matches_content_id(path, content_id):
-                continue
-
-            score = 100
-
-            psna_name = content_id_to_psna_name(content_id)
-            if psna_name and psna_name in path_upper:
-                score += 20
-
-            if exact_content and exact_content in path_upper:
-                score += 15
-
-            # Title ID is only a tie-breaker after exact avatar match.
-            if norm_title and norm_title in normalize_lookup_text(path):
-                score += 10
-
-            if path.lower().endswith(".png"):
-                score += 5
-
-            candidates.append((score, path))
+            if score:
+                candidates.append((score, path))
 
         if not candidates:
             log(f"[EXT ] No external match in {label} for {content_id}")
@@ -937,16 +976,22 @@ def process_entry(
 
     saved = 0
     failed = 0
+    failed_edat_names: list[str] = []
+
     for index, edat_path in enumerate(edats, start=1):
         try:
             png_data, edat_content_id = PS3EdatDecryptor(edat_path, klic_map).decrypt_to_png()
         except Exception as exc:
             log(f"[FAIL] {edat_path.name}: {exc}")
+            failed_edat_names.append(edat_path.name)
+            failed_edat_names.append(edat_path.stem)
             failed += 1
             continue
 
         if not png_data:
             log(f"[FAIL] Could not find PNG in {edat_path.name}")
+            failed_edat_names.append(edat_path.name)
+            failed_edat_names.append(edat_path.stem)
             failed += 1
             continue
 
@@ -960,7 +1005,7 @@ def process_entry(
         saved += 1
 
     if saved == 0 and failed:
-        if find_external_avatar_cover(entry, expected_output, log):
+        if find_external_avatar_cover(entry, expected_output, log, failed_edat_names=failed_edat_names):
             saved += 1
             failed = 0
 
