@@ -648,98 +648,141 @@ EXTERNAL_AVATAR_REPOS = [
         "label": "MrJasonDEX/ModdingShop",
         "repo": "MrJasonDEX/ModdingShop",
         "branch": "main",
-        "prefix": "Avaters/PNG_files",
+        "png_prefix": "Avaters/PNG_files",
+        "list_path": "Avaters/png_file_list.txt",
         "folder_url": "https://github.com/MrJasonDEX/ModdingShop/tree/main/Avaters/PNG_files",
     },
 
     # Disabled for now:
     # This repository can cause wrong/default-looking matches for some avatars.
-    # Keep only MrJasonDEX/ModdingShop as the trusted external fallback.
     #
     # {
     #     "label": "lI-Isekai-Il/PS3-Avatars-Edat",
     #     "repo": "lI-Isekai-Il/PS3-Avatars-Edat",
     #     "branch": "main",
-    #     "prefix": "PS3 Avatars Packs",
+    #     "png_prefix": "PS3 Avatars Packs",
+    #     "list_path": "",
     #     "folder_url": "https://github.com/lI-Isekai-Il/PS3-Avatars-Edat/tree/main/PS3%20Avatars%20Packs",
     # },
 ]
 
-_EXTERNAL_TREE_CACHE: dict[str, list[str]] = {}
+_EXTERNAL_FILE_LIST_CACHE: dict[str, list[str]] = {}
 
 
 def normalize_lookup_text(value: str) -> str:
     return re.sub(r"[^A-Z0-9]+", "", (value or "").upper())
 
 
-def github_request_json(url: str) -> object:
+def github_raw_url(repo: str, branch: str, path: str) -> str:
+    return (
+        f"https://raw.githubusercontent.com/{repo}/"
+        f"{urllib.parse.quote(branch, safe='')}/"
+        f"{urllib.parse.quote(path, safe='/')}"
+    )
+
+
+def download_text(url: str) -> str:
     headers = {
         "User-Agent": "PS3-Pro-Avatar-Cover-Generator",
-        "Accept": "application/vnd.github+json",
+        "Accept": "text/plain,*/*",
     }
 
     token = os.environ.get("GITHUB_TOKEN")
-    if token:
+    if token and "api.github.com" in url:
         headers["Authorization"] = f"Bearer {token}"
 
     req = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(req, timeout=60) as response:
-        return json.loads(response.read().decode("utf-8"))
+    with urllib.request.urlopen(req, timeout=90) as response:
+        return response.read().decode("utf-8", errors="replace")
 
 
-def get_github_tree_paths(repo: str, branch: str, prefix: str, log: Callable[[str], None]) -> list[str]:
-    """List image files from the exact GitHub folder using the Contents API.
+def parse_external_png_list(text: str) -> list[str]:
+    names: list[str] = []
 
-    This avoids the recursive git tree API, which can be truncated on large repos
-    and miss files under Avaters/PNG_files.
-    """
-    cache_key = f"{repo}@{branch}:{prefix}"
-    if cache_key in _EXTERNAL_TREE_CACHE:
-        return _EXTERNAL_TREE_CACHE[cache_key]
-
-    paths: list[str] = []
-    stack = [prefix.strip("/")]
-
-    while stack:
-        current_prefix = stack.pop()
-        api_url = (
-            f"https://api.github.com/repos/{repo}/contents/"
-            f"{urllib.parse.quote(current_prefix, safe='/')}?ref={urllib.parse.quote(branch, safe='')}"
-        )
-
-        try:
-            payload = github_request_json(api_url)
-        except Exception as exc:
-            log(f"[EXT ] Could not read GitHub folder {repo}/{current_prefix}: {exc}")
+    for line in text.splitlines():
+        line = line.strip().strip(",").strip()
+        if not line:
             continue
 
-        if isinstance(payload, dict):
-            payload = [payload]
+        # list.txt format is usually:
+        # "PSNA_0002AFA0AA32398A10233F9D2BB4CE1EA6110219.png",
+        line = line.strip("'\"").strip()
+        if not line:
+            continue
 
-        for item in payload:
-            item_type = item.get("type")
-            path = item.get("path") or ""
+        if line.lower().endswith((".png", ".jpg", ".jpeg")):
+            names.append(line)
 
-            if item_type == "dir":
-                stack.append(path)
-                continue
+    return names
 
-            if item_type != "file":
-                continue
 
-            if path.lower().endswith((".png", ".jpg", ".jpeg")):
-                paths.append(path)
+def get_external_image_paths(repo_info: dict, log: Callable[[str], None]) -> list[str]:
+    """Return external image paths.
 
-    _EXTERNAL_TREE_CACHE[cache_key] = paths
-    log(f"[EXT ] Indexed {len(paths)} image(s) from {repo}/{prefix}")
+    MrJasonDEX stores an explicit Avaters/png_file_list.txt index containing
+    names like PSNA_XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX.png.
+    We use that list and build Avaters/PNG_files/<name> directly.
+    """
+    repo = repo_info["repo"]
+    branch = repo_info["branch"]
+    png_prefix = repo_info["png_prefix"].strip("/")
+    list_path = (repo_info.get("list_path") or "").strip("/")
+    cache_key = f"{repo}@{branch}:{png_prefix}:{list_path}"
+
+    if cache_key in _EXTERNAL_FILE_LIST_CACHE:
+        return _EXTERNAL_FILE_LIST_CACHE[cache_key]
+
+    paths: list[str] = []
+
+    if list_path:
+        list_url = github_raw_url(repo, branch, list_path)
+        try:
+            list_text = download_text(list_url)
+            names = parse_external_png_list(list_text)
+            for name in names:
+                clean_name = name.strip().strip("/")
+                if "/" in clean_name:
+                    paths.append(clean_name)
+                else:
+                    paths.append(f"{png_prefix}/{clean_name}")
+            log(f"[EXT ] Indexed {len(paths)} image(s) from {repo}/{list_path}")
+        except Exception as exc:
+            log(f"[EXT ] Could not read external list {list_url}: {exc}")
+
+    # Fallback only if the list could not be read. Keep it simple and exact-folder based.
+    if not paths:
+        api_url = (
+            f"https://api.github.com/repos/{repo}/contents/"
+            f"{urllib.parse.quote(png_prefix, safe='/')}?ref={urllib.parse.quote(branch, safe='')}"
+        )
+        try:
+            headers = {
+                "User-Agent": "PS3-Pro-Avatar-Cover-Generator",
+                "Accept": "application/vnd.github+json",
+            }
+            token = os.environ.get("GITHUB_TOKEN")
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
+            req = urllib.request.Request(api_url, headers=headers)
+            with urllib.request.urlopen(req, timeout=90) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            if isinstance(payload, dict):
+                payload = [payload]
+            for item in payload:
+                if item.get("type") == "file":
+                    path = item.get("path") or ""
+                    if path.lower().endswith((".png", ".jpg", ".jpeg")):
+                        paths.append(path)
+            log(f"[EXT ] Indexed {len(paths)} image(s) from {repo}/{png_prefix}")
+        except Exception as exc:
+            log(f"[EXT ] Could not read external folder {api_url}: {exc}")
+
+    _EXTERNAL_FILE_LIST_CACHE[cache_key] = paths
     return paths
 
 
 def download_external_image(repo: str, branch: str, path: str, output_path: Path, log: Callable[[str], None]) -> bool:
-    raw_url = (
-        f"https://raw.githubusercontent.com/{repo}/{urllib.parse.quote(branch, safe='')}/"
-        f"{urllib.parse.quote(path, safe='/')}"
-    )
+    raw_url = github_raw_url(repo, branch, path)
 
     try:
         req = urllib.request.Request(raw_url, headers={"User-Agent": "PS3-Pro-Avatar-Cover-Generator"})
@@ -771,7 +814,6 @@ def download_external_image(repo: str, branch: str, path: str, output_path: Path
     return False
 
 
-
 def normalize_external_match_name(value: str) -> str:
     value = (value or "").upper()
     value = value.rsplit("/", 1)[-1]
@@ -779,84 +821,30 @@ def normalize_external_match_name(value: str) -> str:
     return normalize_lookup_text(value)
 
 
-def content_id_to_psna_name(content_id: str) -> str:
-    """Best-effort PSNA stem from Content ID.
+def build_failed_psna_names(failed_edat_names: Iterable[str] | None = None) -> list[str]:
+    """Build PSNA names from the actual EDAT/UNEDAT files that failed.
 
-    Some PSNA files are named PSNA_<40 hex>. This may be SHA1(Content ID)
-    for some sets, but the most reliable value is the actual EDAT filename
-    extracted from the PKG, which we also pass to the fallback.
+    Example:
+      local failed EDAT: PSNA_0002AFA0AA32398A10233F9D2BB4CE1EA6110219.edat
+      external PNG:      PSNA_0002AFA0AA32398A10233F9D2BB4CE1EA6110219.png
     """
-    if not content_id:
-        return ""
-    return "PSNA_" + hashlib.sha1(content_id.encode("ascii", errors="ignore")).hexdigest().upper()
-
-
-def build_external_match_names(entry: AvatarEntry, failed_edat_names: Iterable[str] | None = None) -> list[str]:
-    """Build exact avatar names accepted by the external fallback.
-
-    This intentionally does NOT include the game Title ID alone, because that
-    can pull a random/default avatar from the same game.
-    """
-    names: list[str] = []
-
-    if entry.content_id:
-        names.append(entry.content_id)
-        names.append(content_id_to_psna_name(entry.content_id))
-
-    for name in failed_edat_names or []:
-        clean = (name or "").strip()
-        if not clean:
-            continue
-        names.append(clean)
-        names.append(Path(clean).stem)
-
     out: list[str] = []
     seen: set[str] = set()
 
-    for name in names:
-        norm = normalize_external_match_name(name)
-        if not norm or norm in seen:
+    for name in failed_edat_names or []:
+        stem = normalize_external_match_name(name)
+        if not stem:
             continue
-        seen.add(norm)
-        out.append(norm)
+
+        # Only accept actual PSNA stems from the extracted package.
+        if not stem.startswith("PSNA"):
+            continue
+
+        if stem not in seen:
+            seen.add(stem)
+            out.append(stem)
 
     return out
-
-
-def external_path_match_score(path: str, match_names: Iterable[str], content_id: str, title_id: str) -> int:
-    """Return a score only for exact avatar matches.
-
-    Accepted matches:
-    - Content ID appears in path/name.
-    - Actual failed EDAT/UNEDAT PSNA stem appears in path/name.
-    - Best-effort PSNA_SHA1(Content ID) appears in path/name.
-
-    Rejected:
-    - Title ID-only matches.
-    """
-    path_norm = normalize_lookup_text(path)
-    score = 0
-
-    for match_name in match_names:
-        if match_name and match_name in path_norm:
-            score = max(score, 100 + len(match_name))
-
-    if not score:
-        return 0
-
-    # Tie-breakers only after exact avatar match.
-    title_norm = normalize_lookup_text(title_id)
-    if title_norm and title_norm in path_norm:
-        score += 10
-
-    content_norm = normalize_lookup_text(content_id)
-    if content_norm and content_norm in path_norm:
-        score += 20
-
-    if path.lower().endswith(".png"):
-        score += 5
-
-    return score
 
 
 def find_external_avatar_cover(
@@ -865,40 +853,38 @@ def find_external_avatar_cover(
     log: Callable[[str], None],
     failed_edat_names: Iterable[str] | None = None,
 ) -> bool:
-    content_id = entry.content_id or ""
-    title_id = entry.title_id or ""
+    match_names = build_failed_psna_names(failed_edat_names)
 
-    match_names = build_external_match_names(entry, failed_edat_names)
     if not match_names:
+        log("[EXT ] No failed PSNA EDAT name available for external fallback")
         return False
 
-    log(f"[EXT ] Accepted external match names: {', '.join(match_names[:8])}")
+    log(f"[EXT ] Looking for external PSNA: {', '.join(match_names)}")
 
     for repo_info in EXTERNAL_AVATAR_REPOS:
         label = repo_info["label"]
         repo = repo_info["repo"]
         branch = repo_info["branch"]
-        prefix = repo_info["prefix"]
 
-        paths = get_github_tree_paths(repo, branch, prefix, log)
+        paths = get_external_image_paths(repo_info, log)
         if not paths:
             continue
 
         candidates: list[tuple[int, str]] = []
 
         for path in paths:
-            score = external_path_match_score(
-                path=path,
-                match_names=match_names,
-                content_id=content_id,
-                title_id=title_id,
-            )
+            external_stem = normalize_external_match_name(path)
 
-            if score:
-                candidates.append((score, path))
+            for match_name in match_names:
+                if external_stem == match_name:
+                    score = 1000
+                    if path.lower().endswith(".png"):
+                        score += 5
+                    candidates.append((score, path))
+                    break
 
         if not candidates:
-            log(f"[EXT ] No external match in {label} for {content_id}")
+            log(f"[EXT ] No external PSNA match in {label} for {', '.join(match_names)}")
             continue
 
         candidates.sort(key=lambda item: (-item[0], len(item[1])))
@@ -984,14 +970,12 @@ def process_entry(
         except Exception as exc:
             log(f"[FAIL] {edat_path.name}: {exc}")
             failed_edat_names.append(edat_path.name)
-            failed_edat_names.append(edat_path.stem)
             failed += 1
             continue
 
         if not png_data:
             log(f"[FAIL] Could not find PNG in {edat_path.name}")
             failed_edat_names.append(edat_path.name)
-            failed_edat_names.append(edat_path.stem)
             failed += 1
             continue
 
