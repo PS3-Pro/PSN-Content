@@ -19,12 +19,14 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
+import json
 import os
 import re
 import shutil
 import struct
 import sys
 import tempfile
+import urllib.parse
 import urllib.request
 import zlib
 from dataclasses import dataclass
@@ -637,6 +639,185 @@ def unique_output_path(path: Path, overwrite: bool) -> Path:
     raise RuntimeError(f"Could not create unique output path for {path}")
 
 
+# -----------------------------------------------------------------------------
+# External PNG fallback repositories.
+# -----------------------------------------------------------------------------
+
+EXTERNAL_AVATAR_REPOS = [
+    {
+        "label": "MrJasonDEX/ModdingShop",
+        "repo": "MrJasonDEX/ModdingShop",
+        "branch": "main",
+        "prefix": "Avaters/PNG_files",
+    },
+    {
+        "label": "lI-Isekai-Il/PS3-Avatars-Edat",
+        "repo": "lI-Isekai-Il/PS3-Avatars-Edat",
+        "branch": "main",
+        "prefix": "PS3 Avatars Packs",
+    },
+]
+
+_EXTERNAL_TREE_CACHE: dict[str, list[str]] = {}
+
+
+def normalize_lookup_text(value: str) -> str:
+    return re.sub(r"[^A-Z0-9]+", "", (value or "").upper())
+
+
+def github_request_json(url: str) -> object:
+    headers = {
+        "User-Agent": "PS3-Pro-Avatar-Cover-Generator",
+        "Accept": "application/vnd.github+json",
+    }
+
+    token = os.environ.get("GITHUB_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    req = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(req, timeout=60) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def get_github_tree_paths(repo: str, branch: str, prefix: str, log: Callable[[str], None]) -> list[str]:
+    cache_key = f"{repo}@{branch}:{prefix}"
+    if cache_key in _EXTERNAL_TREE_CACHE:
+        return _EXTERNAL_TREE_CACHE[cache_key]
+
+    api_url = f"https://api.github.com/repos/{repo}/git/trees/{urllib.parse.quote(branch, safe='')}?recursive=1"
+
+    try:
+        payload = github_request_json(api_url)
+    except Exception as exc:
+        log(f"[EXT ] Could not read GitHub tree {repo}: {exc}")
+        _EXTERNAL_TREE_CACHE[cache_key] = []
+        return []
+
+    prefix_norm = prefix.strip("/").lower()
+    paths: list[str] = []
+
+    for item in payload.get("tree", []):
+        if item.get("type") != "blob":
+            continue
+
+        path = item.get("path") or ""
+        path_lower = path.lower()
+
+        if prefix_norm and not path_lower.startswith(prefix_norm.lower() + "/"):
+            continue
+
+        if not path_lower.endswith((".png", ".jpg", ".jpeg")):
+            continue
+
+        paths.append(path)
+
+    _EXTERNAL_TREE_CACHE[cache_key] = paths
+    log(f"[EXT ] Indexed {len(paths)} image(s) from {repo}/{prefix}")
+    return paths
+
+
+def download_external_image(repo: str, branch: str, path: str, output_path: Path, log: Callable[[str], None]) -> bool:
+    raw_url = (
+        f"https://raw.githubusercontent.com/{repo}/{urllib.parse.quote(branch, safe='')}/"
+        f"{urllib.parse.quote(path, safe='/')}"
+    )
+
+    try:
+        req = urllib.request.Request(raw_url, headers={"User-Agent": "PS3-Pro-Avatar-Cover-Generator"})
+        with urllib.request.urlopen(req, timeout=90) as response:
+            data = response.read()
+    except Exception as exc:
+        log(f"[EXT ] Download failed: {raw_url} ({exc})")
+        return False
+
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(data)
+        return True
+
+    if data.startswith(b"\xff\xd8\xff"):
+        try:
+            from PIL import Image
+            import io
+
+            image = Image.open(io.BytesIO(data))
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            image.save(output_path, format="PNG")
+            return True
+        except Exception as exc:
+            log(f"[EXT ] JPG found but Pillow conversion failed: {exc}")
+            return False
+
+    log(f"[EXT ] Remote file is not PNG/JPG: {path}")
+    return False
+
+
+def find_external_avatar_cover(
+    entry: AvatarEntry,
+    output_path: Path,
+    log: Callable[[str], None],
+) -> bool:
+    if output_path.exists():
+        return True
+
+    content_id = entry.content_id or ""
+    title_id = entry.title_id or ""
+
+    if not content_id:
+        return False
+
+    exact_content = content_id.upper()
+    norm_content = normalize_lookup_text(content_id)
+    norm_title = normalize_lookup_text(title_id)
+
+    for repo_info in EXTERNAL_AVATAR_REPOS:
+        label = repo_info["label"]
+        repo = repo_info["repo"]
+        branch = repo_info["branch"]
+        prefix = repo_info["prefix"]
+
+        paths = get_github_tree_paths(repo, branch, prefix, log)
+        if not paths:
+            continue
+
+        candidates: list[tuple[int, str]] = []
+
+        for path in paths:
+            path_upper = path.upper()
+            path_norm = normalize_lookup_text(path)
+
+            score = 0
+
+            if exact_content in path_upper:
+                score += 100
+            elif norm_content and norm_content in path_norm:
+                score += 80
+
+            if norm_title and norm_title in path_norm:
+                score += 10
+
+            if path.lower().endswith(".png"):
+                score += 5
+
+            if score:
+                candidates.append((score, path))
+
+        if not candidates:
+            log(f"[EXT ] No external match in {label} for {content_id}")
+            continue
+
+        candidates.sort(key=lambda item: (-item[0], len(item[1])))
+
+        for score, path in candidates[:5]:
+            log(f"[EXT ] Trying {label}: {path}")
+            if download_external_image(repo, branch, path, output_path, log):
+                log(f"[EXT ] Saved external cover: {output_path}")
+                return True
+
+    return False
+
+
 def process_entry(
     entry: AvatarEntry,
     download_dir: Path,
@@ -686,6 +867,10 @@ def process_entry(
 
     if not edats:
         log(f"[MISS] No EDAT/UNEDAT found in {pkg_path.name}")
+        if find_external_avatar_cover(entry, expected_output, log):
+            if not keep_extracted:
+                shutil.rmtree(extract_base, ignore_errors=True)
+            return 1, 0
         if not keep_extracted:
             shutil.rmtree(extract_base, ignore_errors=True)
         return 0, 1
@@ -718,6 +903,14 @@ def process_entry(
         out_path.write_bytes(png_data)
         log(f"[SAVE] {out_path.relative_to(output_root)}")
         saved += 1
+
+    if saved == 0 and failed:
+        if find_external_avatar_cover(entry, expected_output, log):
+            saved += 1
+            failed = 0
+
+    if saved > 0:
+        failed = 0
 
     if not keep_extracted:
         shutil.rmtree(extract_base, ignore_errors=True)
@@ -812,6 +1005,7 @@ def main() -> int:
     total_saved = 0
     total_failed = 0
     total_errors = 0
+    failed_report_rows = []
 
     try:
         for number, entry in enumerate(entries, start=1):
@@ -829,11 +1023,29 @@ def main() -> int:
                 )
                 total_saved += saved
                 total_failed += failed
+
+                if failed:
+                    failed_report_rows.append([
+                        "failed_edat",
+                        entry.title_id,
+                        entry.content_id,
+                        entry.name,
+                        entry.pkg_url,
+                        f"{failed} EDAT(s) had no PNG",
+                    ])
             except KeyboardInterrupt:
                 raise
             except Exception as exc:
                 print(f"[ERROR] {entry.content_id or entry.pkg_url}: {exc}")
                 total_errors += 1
+                failed_report_rows.append([
+                    "entry_error",
+                    entry.title_id,
+                    entry.content_id,
+                    entry.name,
+                    entry.pkg_url,
+                    str(exc),
+                ])
     finally:
         if work_context is not None:
             work_context.cleanup()
@@ -842,7 +1054,20 @@ def main() -> int:
     print(f"Saved PNGs: {total_saved}")
     print(f"Failed EDATs: {total_failed}")
     print(f"Entry errors: {total_errors}")
-    return 1 if total_errors else 0
+
+    if failed_report_rows:
+        report_path = output_root / "_failed_avatar_covers.tsv"
+        with report_path.open("w", encoding="utf-8", newline="") as handle:
+            handle.write("type\ttitle_id\tcontent_id\tname\tpkg_url\treason\n")
+            for row in failed_report_rows:
+                safe_row = [str(cell).replace("\t", " ").replace("\r", " ").replace("\n", " ") for cell in row]
+                handle.write("\t".join(safe_row) + "\n")
+        print(f"Failure report: {report_path}")
+
+    if total_errors or total_failed:
+        print("WARNING: Some avatar entries failed, but generated PNGs will still be committed.")
+
+    return 0
 
 
 if __name__ == "__main__":
