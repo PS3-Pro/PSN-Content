@@ -1,0 +1,205 @@
+name: Generate Avatar Covers
+
+on:
+  schedule:
+    # Runs every night after the NPS database sync workflow.
+    - cron: '30 3 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Run even if avatars.tsv was already processed."
+        required: false
+        default: false
+        type: boolean
+      title_id:
+        description: "Optional Title ID filter. Example: BCUS98174 NPUB30114"
+        required: false
+        type: string
+      content_id:
+        description: "Optional Content ID filter."
+        required: false
+        type: string
+      include_pending:
+        description: "Also process resources/database/content/official/pending/avatars.tsv"
+        required: false
+        default: false
+        type: boolean
+      limit:
+        description: "Maximum number of matching avatar entries to process. Use 0 for all."
+        required: false
+        default: "0"
+        type: string
+      start:
+        description: "Skip the first N matching avatar entries. Useful to continue in chunks."
+        required: false
+        default: "0"
+        type: string
+      overwrite:
+        description: "Overwrite existing PNG files."
+        required: false
+        default: false
+        type: boolean
+      redownload:
+        description: "Download PKGs again during this run even if they exist in the temporary folder."
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: generate-avatar-covers
+  cancel-in-progress: false
+
+jobs:
+  generate-avatar-covers:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Prepare TSV state marker
+        id: tsv-state
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p .avatar-cover-state
+          : > .avatar-cover-state/avatars.sha256
+
+          if [[ -f resources/database/content/official/avatars.tsv ]]; then
+            sha256sum resources/database/content/official/avatars.tsv >> .avatar-cover-state/avatars.sha256
+          fi
+
+          if [[ -f resources/database/content/official/pending/avatars.tsv ]]; then
+            sha256sum resources/database/content/official/pending/avatars.tsv >> .avatar-cover-state/avatars.sha256
+          fi
+
+          echo "marker=.avatar-cover-state/avatars.sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Check if this avatars TSV was already processed
+        id: avatar-tsv-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .avatar-cover-state
+          key: avatar-covers-tsv-${{ hashFiles('resources/database/content/official/avatars.tsv', 'resources/database/content/official/pending/avatars.tsv') }}
+
+      - name: Decide whether to run
+        id: should-run
+        shell: bash
+        env:
+          CACHE_HIT: ${{ steps.avatar-tsv-cache.outputs.cache-hit }}
+          EVENT_NAME: ${{ github.event_name }}
+          FORCE: ${{ github.event.inputs.force }}
+        run: |
+          set -euo pipefail
+
+          if [[ "${FORCE:-false}" == "true" ]]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "Forced manual run."
+            exit 0
+          fi
+
+          if [[ "${CACHE_HIT:-false}" == "true" ]]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "avatars.tsv did not change since the last processed run. Skipping."
+            exit 0
+          fi
+
+          echo "run=true" >> "$GITHUB_OUTPUT"
+          echo "New avatars.tsv hash detected. Generating covers."
+
+      - name: Set up Python
+        if: steps.should-run.outputs.run == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Install dependencies
+        if: steps.should-run.outputs.run == 'true'
+        run: |
+          python -m pip install --upgrade pip
+          pip install pycryptodomex
+
+      - name: Generate avatar covers
+        if: steps.should-run.outputs.run == 'true'
+        env:
+          TITLE_ID: ${{ github.event.inputs.title_id }}
+          CONTENT_ID: ${{ github.event.inputs.content_id }}
+          INCLUDE_PENDING: ${{ github.event.inputs.include_pending }}
+          LIMIT: ${{ github.event.inputs.limit }}
+          START: ${{ github.event.inputs.start }}
+          OVERWRITE: ${{ github.event.inputs.overwrite }}
+          REDOWNLOAD: ${{ github.event.inputs.redownload }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          args=(
+            --repo .
+            --download-dir "$RUNNER_TEMP/avatar_pkgs"
+            --limit "${LIMIT:-0}"
+            --start "${START:-0}"
+          )
+
+          if [[ "${INCLUDE_PENDING:-false}" == "true" ]]; then
+            args+=(--include-pending)
+          fi
+
+          if [[ "${OVERWRITE:-false}" == "true" ]]; then
+            args+=(--overwrite)
+          fi
+
+          if [[ "${REDOWNLOAD:-false}" == "true" ]]; then
+            args+=(--redownload)
+          fi
+
+          for id in $(echo "${TITLE_ID:-}" | tr ',;' '  '); do
+            if [[ -n "$id" ]]; then
+              args+=(--title-id "$id")
+            fi
+          done
+
+          for id in $(echo "${CONTENT_ID:-}" | tr ',;' '  '); do
+            if [[ -n "$id" ]]; then
+              args+=(--content-id "$id")
+            fi
+          done
+
+          python .github/scripts/generate_avatar_covers.py "${args[@]}"
+
+      - name: Remove temporary PKGs and extracted files
+        if: always()
+        shell: bash
+        run: |
+          rm -rf "$RUNNER_TEMP/avatar_pkgs" "$RUNNER_TEMP/avatar_extract" || true
+
+      - name: Commit generated PNG covers only
+        if: steps.should-run.outputs.run == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config --global user.name "PS3-Pro Bot"
+          git config --global user.email "bot@ps3pro.com"
+
+          git add resources/database/covers/avatars
+
+          if git diff --cached --quiet; then
+            echo "No new avatar PNG covers to commit."
+          else
+            git commit -m "Auto-update: Generate avatar covers"
+            git push
+          fi
+
+      - name: Save processed TSV state
+        if: steps.should-run.outputs.run == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .avatar-cover-state
+          key: avatar-covers-tsv-${{ hashFiles('resources/database/content/official/avatars.tsv', 'resources/database/content/official/pending/avatars.tsv') }}
