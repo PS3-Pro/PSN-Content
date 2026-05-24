@@ -649,6 +649,7 @@ EXTERNAL_AVATAR_REPOS = [
         "repo": "MrJasonDEX/ModdingShop",
         "branch": "main",
         "prefix": "Avaters/PNG_files",
+        "folder_url": "https://github.com/MrJasonDEX/ModdingShop/tree/main/Avaters/PNG_files",
     },
 
     # Disabled for now:
@@ -660,6 +661,7 @@ EXTERNAL_AVATAR_REPOS = [
     #     "repo": "lI-Isekai-Il/PS3-Avatars-Edat",
     #     "branch": "main",
     #     "prefix": "PS3 Avatars Packs",
+    #     "folder_url": "https://github.com/lI-Isekai-Il/PS3-Avatars-Edat/tree/main/PS3%20Avatars%20Packs",
     # },
 ]
 
@@ -686,36 +688,47 @@ def github_request_json(url: str) -> object:
 
 
 def get_github_tree_paths(repo: str, branch: str, prefix: str, log: Callable[[str], None]) -> list[str]:
+    """List image files from the exact GitHub folder using the Contents API.
+
+    This avoids the recursive git tree API, which can be truncated on large repos
+    and miss files under Avaters/PNG_files.
+    """
     cache_key = f"{repo}@{branch}:{prefix}"
     if cache_key in _EXTERNAL_TREE_CACHE:
         return _EXTERNAL_TREE_CACHE[cache_key]
 
-    api_url = f"https://api.github.com/repos/{repo}/git/trees/{urllib.parse.quote(branch, safe='')}?recursive=1"
-
-    try:
-        payload = github_request_json(api_url)
-    except Exception as exc:
-        log(f"[EXT ] Could not read GitHub tree {repo}: {exc}")
-        _EXTERNAL_TREE_CACHE[cache_key] = []
-        return []
-
-    prefix_norm = prefix.strip("/").lower()
     paths: list[str] = []
+    stack = [prefix.strip("/")]
 
-    for item in payload.get("tree", []):
-        if item.get("type") != "blob":
+    while stack:
+        current_prefix = stack.pop()
+        api_url = (
+            f"https://api.github.com/repos/{repo}/contents/"
+            f"{urllib.parse.quote(current_prefix, safe='/')}?ref={urllib.parse.quote(branch, safe='')}"
+        )
+
+        try:
+            payload = github_request_json(api_url)
+        except Exception as exc:
+            log(f"[EXT ] Could not read GitHub folder {repo}/{current_prefix}: {exc}")
             continue
 
-        path = item.get("path") or ""
-        path_lower = path.lower()
+        if isinstance(payload, dict):
+            payload = [payload]
 
-        if prefix_norm and not path_lower.startswith(prefix_norm.lower() + "/"):
-            continue
+        for item in payload:
+            item_type = item.get("type")
+            path = item.get("path") or ""
 
-        if not path_lower.endswith((".png", ".jpg", ".jpeg")):
-            continue
+            if item_type == "dir":
+                stack.append(path)
+                continue
 
-        paths.append(path)
+            if item_type != "file":
+                continue
+
+            if path.lower().endswith((".png", ".jpg", ".jpeg")):
+                paths.append(path)
 
     _EXTERNAL_TREE_CACHE[cache_key] = paths
     log(f"[EXT ] Indexed {len(paths)} image(s) from {repo}/{prefix}")
@@ -758,6 +771,38 @@ def download_external_image(repo: str, branch: str, path: str, output_path: Path
     return False
 
 
+
+def content_id_to_psna_name(content_id: str) -> str:
+    """Return the usual PSNA_ SHA1 filename stem for a PSN avatar Content ID."""
+    if not content_id:
+        return ""
+    return "PSNA_" + hashlib.sha1(content_id.encode("ascii", errors="ignore")).hexdigest().upper()
+
+
+def external_path_matches_content_id(path: str, content_id: str) -> bool:
+    """Match by exact Content ID or by PSNA_SHA1(Content ID)."""
+    if not content_id:
+        return False
+
+    path_upper = path.upper()
+    path_norm = normalize_lookup_text(path)
+
+    exact_content = content_id.upper()
+    norm_content = normalize_lookup_text(content_id)
+    psna_name = content_id_to_psna_name(content_id)
+
+    if exact_content in path_upper:
+        return True
+
+    if norm_content and norm_content in path_norm:
+        return True
+
+    if psna_name and psna_name in path_upper:
+        return True
+
+    return False
+
+
 def find_external_avatar_cover(
     entry: AvatarEntry,
     output_path: Path,
@@ -787,26 +832,25 @@ def find_external_avatar_cover(
 
         for path in paths:
             path_upper = path.upper()
-            path_norm = normalize_lookup_text(path)
 
-            score = 0
-            content_matched = False
-
-            # External fallback must match the avatar Content ID.
-            # Do NOT accept Title ID-only matches, because that can pull a random
-            # avatar/default image from the same game.
-            if exact_content and exact_content in path_upper:
-                score += 100
-                content_matched = True
-            elif norm_content and norm_content in path_norm:
-                score += 80
-                content_matched = True
-
-            if not content_matched:
+            # External fallback must match this exact avatar:
+            # - Content ID in path/name, or
+            # - PSNA_SHA1(Content ID) in path/name.
+            # Never accept Title ID-only matches.
+            if not external_path_matches_content_id(path, content_id):
                 continue
 
-            # Title ID is only a tie-breaker after Content ID matched.
-            if norm_title and norm_title in path_norm:
+            score = 100
+
+            psna_name = content_id_to_psna_name(content_id)
+            if psna_name and psna_name in path_upper:
+                score += 20
+
+            if exact_content and exact_content in path_upper:
+                score += 15
+
+            # Title ID is only a tie-breaker after exact avatar match.
+            if norm_title and norm_title in normalize_lookup_text(path):
                 score += 10
 
             if path.lower().endswith(".png"):
