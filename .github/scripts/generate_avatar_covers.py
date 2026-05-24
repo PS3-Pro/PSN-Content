@@ -650,12 +650,17 @@ EXTERNAL_AVATAR_REPOS = [
         "branch": "main",
         "prefix": "Avaters/PNG_files",
     },
-    {
-        "label": "lI-Isekai-Il/PS3-Avatars-Edat",
-        "repo": "lI-Isekai-Il/PS3-Avatars-Edat",
-        "branch": "main",
-        "prefix": "PS3 Avatars Packs",
-    },
+
+    # Disabled for now:
+    # This repository can cause wrong/default-looking matches for some avatars.
+    # Keep only MrJasonDEX/ModdingShop as the trusted external fallback.
+    #
+    # {
+    #     "label": "lI-Isekai-Il/PS3-Avatars-Edat",
+    #     "repo": "lI-Isekai-Il/PS3-Avatars-Edat",
+    #     "branch": "main",
+    #     "prefix": "PS3 Avatars Packs",
+    # },
 ]
 
 _EXTERNAL_TREE_CACHE: dict[str, list[str]] = {}
