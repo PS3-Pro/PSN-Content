@@ -2,7 +2,7 @@
 """
 Extract PSN avatar PNGs from the avatar TSV and save them as:
 
-    resources/database/covers/avatars/<TITLE_ID>/<CONTENT_ID>.png
+    resources/database/avatars/<TITLE_ID>/<CONTENT_ID>.png
 
 The TITLE_ID folder comes from the avatar list, not from PARAM.SFO.
 
@@ -952,7 +952,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--redownload", action="store_true", help="Download PKGs again even when they already exist in cache.")
     parser.add_argument("--keep-extracted", action="store_true", help="Keep temporary extracted PKG files.")
     parser.add_argument("--download-dir", type=Path, help="PKG cache folder. Default: <repo>/.cache/avatar_pkgs")
-    parser.add_argument("--output", type=Path, help="Output folder. Default: <repo>/resources/database/covers/avatars")
+    parser.add_argument("--output", type=Path, help="Output folder. Default: <repo>/resources/database/avatars")
     return parser
 
 
@@ -974,7 +974,7 @@ def main() -> int:
 
         if source in ("pending", "all"):
             tsv_paths.append(pending_tsv)
-    output_root = (args.output or repo / "resources/database/covers/avatars").resolve()
+    output_root = (args.output or repo / "resources/database/avatars").resolve()
     download_dir = (args.download_dir or repo / ".cache/avatar_pkgs").resolve()
 
     print(f"Repo: {repo}")
