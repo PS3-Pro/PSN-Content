@@ -729,7 +729,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Extract avatar PNG covers from PS3 avatar PKGs listed in avatars.tsv.")
     parser.add_argument("--repo", type=Path, default=Path.cwd(), help="PSN-Content repository root. Default: current folder")
     parser.add_argument("--tsv", type=Path, action="append", help="Custom avatar TSV path. Can be used more than once.")
-    parser.add_argument("--include-pending", action="store_true", help="Also process resources/database/content/official/pending/avatars.tsv")
+    parser.add_argument(
+        "--source",
+        choices=["official", "pending", "all"],
+        default="official",
+        help="Avatar TSV source to process when --tsv is not used. Default: official.",
+    )
+    parser.add_argument(
+        "--include-pending",
+        action="store_true",
+        help="Backward-compatible alias that makes --source behave as all.",
+    )
     parser.add_argument("--title-id", action="append", help="Only process this Title ID/game ID. Can be used more than once.")
     parser.add_argument("--content-id", action="append", help="Only process this Content ID. Can be used more than once.")
     parser.add_argument("--limit", type=int, default=0, help="Limit how many entries are processed. 0 means no limit.")
@@ -746,11 +756,20 @@ def main() -> int:
     args = build_arg_parser().parse_args()
     repo = args.repo.resolve()
 
-    default_tsvs = [repo / "resources/database/content/official/avatars.tsv"]
-    if args.include_pending:
-        default_tsvs.append(repo / "resources/database/content/official/pending/avatars.tsv")
+    if args.tsv:
+        tsv_paths = args.tsv
+    else:
+        source = "all" if args.include_pending else args.source
+        tsv_paths = []
 
-    tsv_paths = args.tsv or default_tsvs
+        official_tsv = repo / "resources/database/content/official/avatars.tsv"
+        pending_tsv = repo / "resources/database/content/official/pending/avatars.tsv"
+
+        if source in ("official", "all"):
+            tsv_paths.append(official_tsv)
+
+        if source in ("pending", "all"):
+            tsv_paths.append(pending_tsv)
     output_root = (args.output or repo / "resources/database/covers/avatars").resolve()
     download_dir = (args.download_dir or repo / ".cache/avatar_pkgs").resolve()
 
