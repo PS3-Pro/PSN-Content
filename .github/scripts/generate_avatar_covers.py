@@ -503,6 +503,180 @@ def maybe_zlib_decompress(data: bytes) -> bytes:
 
 
 # -----------------------------------------------------------------------------
+# Secondary EDAT image extractor, based on the standalone avatar EDAT script.
+# -----------------------------------------------------------------------------
+
+EDAT_FLAG_0x10 = 0x00000010
+
+
+def find_png_end(data: bytes, start: int) -> int:
+    """Find the real PNG end by walking chunks."""
+    i = start + 8
+    while i + 12 <= len(data):
+        chunk_len = struct.unpack(">I", data[i:i + 4])[0]
+        chunk_type = data[i + 4:i + 8]
+        i += 4 + 4 + chunk_len + 4
+        if chunk_type == b"IEND":
+            return i
+    return -1
+
+
+def extract_image_from_buffer(buffer: bytes) -> tuple[bytes | None, str | None]:
+    png_header = b"\x89PNG\r\n\x1a\n"
+
+    png_off = buffer.find(png_header)
+    if png_off >= 0:
+        png_end = find_png_end(buffer, png_off)
+        return (buffer[png_off:png_end] if png_end > 0 else buffer[png_off:], "png")
+
+    ihdr_off = buffer.find(b"IHDR")
+    if ihdr_off >= 0:
+        reconstructed = png_header + b"\x00\x00\x00\r" + buffer[ihdr_off:]
+        png_end = find_png_end(reconstructed, 0)
+        return (reconstructed[:png_end] if png_end > 0 else reconstructed, "png")
+
+    jpg_off = buffer.find(b"\xff\xd8\xff")
+    if jpg_off >= 0:
+        jpg = buffer[jpg_off:]
+        jpg_end = jpg.find(b"\xff\xd9")
+        if jpg_end >= 0:
+            jpg = jpg[:jpg_end + 2]
+        return jpg, "jpg"
+
+    return None, None
+
+
+def convert_jpg_to_png_bytes(jpg_data: bytes, log: Callable[[str], None]) -> bytes | None:
+    try:
+        from PIL import Image
+        import io
+
+        image = Image.open(io.BytesIO(jpg_data))
+        output = io.BytesIO()
+        image.save(output, format="PNG")
+        return output.getvalue()
+    except Exception as exc:
+        log(f"[ALT ] JPG found but PNG conversion failed: {exc}")
+        return None
+
+
+def decrypt_edat_image_secondary(edat_path: Path, log: Callable[[str], None]) -> tuple[bytes | None, str | None, str | None]:
+    """Try KLIC_FREE + FLAG_0x10, based on the shared standalone extractor."""
+    data = edat_path.read_bytes()
+
+    if len(data) < 0x100 or not data.startswith(b"NPD"):
+        image, image_type = extract_image_from_buffer(data)
+        if image_type == "jpg" and image:
+            png = convert_jpg_to_png_bytes(image, log)
+            return png, None, "jpg" if png else None
+        return image, None, image_type
+
+    version = struct.unpack(">I", data[4:8])[0]
+    license_type = struct.unpack(">I", data[8:12])[0]
+    content_id = data[16:64].decode("ascii", errors="ignore").strip("\x00")
+    digest = data[0x40:0x50]
+    dev_hash = data[0x60:0x70]
+    flags = struct.unpack(">I", data[0x80:0x84])[0]
+    block_size = struct.unpack(">I", data[0x84:0x88])[0]
+    file_size = struct.unpack(">Q", data[0x88:0x90])[0]
+
+    if not block_size or not file_size:
+        return None, content_id, None
+
+    license_mask = license_type & 0x3
+    if license_mask not in (0x2, 0x3):
+        return None, content_id, None
+
+    edat_compressed_flag = 0x00000001
+    edat_flag_0x02 = 0x00000002
+    edat_encrypted_key_flag = 0x00000008
+    edat_flag_0x20 = 0x00000020
+
+    is_compressed = bool(flags & edat_compressed_flag)
+    has_0x20_flag = bool(flags & edat_flag_0x20)
+    has_encrypted_key = bool(flags & edat_encrypted_key_flag)
+    has_0x10 = bool(flags & EDAT_FLAG_0x10)
+    has_0x02 = bool(flags & edat_flag_0x02)
+
+    key_input = NP_KLIC_FREE
+    edat_key = EDAT_KEY_1 if version == 4 else EDAT_KEY_0
+    meta_size = 0x20 if (is_compressed or has_0x20_flag) else 0x10
+    metadata_offset = 0x100
+    dev_hash_12 = dev_hash[:12]
+    num_blocks = (file_size + block_size - 1) // block_size
+
+    output = bytearray()
+
+    for i in range(num_blocks):
+        is_last = i == num_blocks - 1
+        this_size = (file_size % block_size) if (is_last and file_size % block_size) else block_size
+        pad_len = (this_size + 15) & ~15
+
+        if is_compressed:
+            meta_pos = metadata_offset + (i * meta_size)
+            if meta_pos + meta_size > len(data):
+                break
+            metadata = data[meta_pos:meta_pos + meta_size]
+            if version <= 1:
+                data_offset = struct.unpack(">Q", metadata[0x10:0x18])[0]
+                chunk_len = struct.unpack(">I", metadata[0x18:0x1C])[0]
+            else:
+                data_offset, chunk_len, _ = PS3EdatDecryptor.dec_section(metadata)
+            read_len = (int(chunk_len) + 15) & ~15
+        elif has_0x20_flag:
+            data_offset = metadata_offset + i * (meta_size + block_size) + meta_size
+            chunk_len = this_size
+            read_len = pad_len
+        else:
+            data_offset = metadata_offset + i * block_size + num_blocks * meta_size
+            chunk_len = this_size
+            read_len = pad_len
+
+        if data_offset + read_len > len(data):
+            break
+
+        enc = data[int(data_offset):int(data_offset) + read_len]
+        if len(enc) < read_len:
+            enc += b"\x00" * (read_len - len(enc))
+
+        block_key = dev_hash_12 + struct.pack(">I", i)
+        key_result = AES.new(key_input, AES.MODE_ECB).encrypt(block_key)
+
+        if has_0x10:
+            key_result = AES.new(key_input, AES.MODE_ECB).encrypt(key_result)
+
+        if has_encrypted_key:
+            key_final = AES.new(edat_key, AES.MODE_CBC, iv=EDAT_IV).decrypt(key_result)
+            iv_final = digest
+        else:
+            key_final = key_result
+            iv_final = digest if version > 1 else EDAT_IV
+
+        if has_0x02:
+            dec_block = enc[:int(chunk_len)]
+        else:
+            dec_block = AES.new(key_final, AES.MODE_CBC, iv=iv_final).decrypt(enc)[:int(chunk_len)]
+
+        if is_compressed:
+            dec_block = maybe_zlib_decompress(dec_block)
+
+        output.extend(dec_block)
+
+    raw = bytes(output[:file_size])
+    image, image_type = extract_image_from_buffer(raw)
+
+    if not image:
+        return None, content_id, None
+
+    if image_type == "jpg":
+        png = convert_jpg_to_png_bytes(image, log)
+        return png, content_id, "jpg" if png else None
+
+    return image, content_id, image_type
+
+
+
+# -----------------------------------------------------------------------------
 # Avatar list handling and automation.
 # -----------------------------------------------------------------------------
 
@@ -965,16 +1139,26 @@ def process_entry(
     failed_edat_names: list[str] = []
 
     for index, edat_path in enumerate(edats, start=1):
+        png_data = None
+        edat_content_id = None
+
         try:
             png_data, edat_content_id = PS3EdatDecryptor(edat_path, klic_map).decrypt_to_png()
         except Exception as exc:
-            log(f"[FAIL] {edat_path.name}: {exc}")
-            failed_edat_names.append(edat_path.name)
-            failed += 1
-            continue
+            log(f"[FAIL] Primary extractor failed for {edat_path.name}: {exc}")
 
         if not png_data:
-            log(f"[FAIL] Could not find PNG in {edat_path.name}")
+            try:
+                alt_data, alt_content_id, alt_type = decrypt_edat_image_secondary(edat_path, log)
+                if alt_data:
+                    png_data = alt_data
+                    edat_content_id = edat_content_id or alt_content_id
+                    log(f"[ALT ] Secondary extractor recovered {edat_path.name} ({alt_type})")
+            except Exception as exc:
+                log(f"[ALT ] Secondary extractor failed for {edat_path.name}: {exc}")
+
+        if not png_data:
+            log(f"[FAIL] Could not find image in {edat_path.name}")
             failed_edat_names.append(edat_path.name)
             failed += 1
             continue
