@@ -763,9 +763,6 @@ def find_external_avatar_cover(
     output_path: Path,
     log: Callable[[str], None],
 ) -> bool:
-    if output_path.exists():
-        return True
-
     content_id = entry.content_id or ""
     title_id = entry.title_id or ""
 
@@ -793,20 +790,29 @@ def find_external_avatar_cover(
             path_norm = normalize_lookup_text(path)
 
             score = 0
+            content_matched = False
 
-            if exact_content in path_upper:
+            # External fallback must match the avatar Content ID.
+            # Do NOT accept Title ID-only matches, because that can pull a random
+            # avatar/default image from the same game.
+            if exact_content and exact_content in path_upper:
                 score += 100
+                content_matched = True
             elif norm_content and norm_content in path_norm:
                 score += 80
+                content_matched = True
 
+            if not content_matched:
+                continue
+
+            # Title ID is only a tie-breaker after Content ID matched.
             if norm_title and norm_title in path_norm:
                 score += 10
 
             if path.lower().endswith(".png"):
                 score += 5
 
-            if score:
-                candidates.append((score, path))
+            candidates.append((score, path))
 
         if not candidates:
             log(f"[EXT ] No external match in {label} for {content_id}")
