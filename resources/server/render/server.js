@@ -17,7 +17,7 @@ const APP_URLS = [
   "https://psn-content-mwp5.onrender.com/ping",
 ];
 
-const ADMIN_USERS = ["Luan Teles", "Goku Cheats"];
+const ADMIN_USERS = ["Luan Teles", "Goku Cheats", "JumpSuit"];
 
 const DEFAULT_AVATAR = "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/interface/modern/images/avatars/default.png";
 
