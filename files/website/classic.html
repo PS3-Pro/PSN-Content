@@ -2628,6 +2628,21 @@
 
 	var defaultCoverOfficial = isPS3 ? "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/database/covers/compressed/NOCOVER01.JPG" : "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/database/covers/uncompressed/NOCOVER01.JPG";
 	var defaultCover = defaultCoverOfficial;
+	var AVATAR_COVERS_BASE = "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/database/avatars";
+
+	function cleanAvatarPathPart(value) {
+		if (value === undefined || value === null) return "";
+		value = String(value).replace(/^\s+|\s+$/g, "");
+		if (!value || value === "MISSING") return "";
+		return encodeURIComponent(value);
+	}
+
+	function getAvatarCover(titleId, contentId) {
+		var titlePart = cleanAvatarPathPart(titleId);
+		var contentPart = cleanAvatarPathPart(contentId);
+		if (!titlePart || !contentPart) return defaultCover;
+		return AVATAR_COVERS_BASE + "/" + titlePart + "/" + contentPart + ".png";
+	}
 
 	// ==============================================================
 	// 2. KEY & SONY HASH SYSTEM
@@ -3395,10 +3410,28 @@
 
 	function loadPCImage(img) {
 		var title_id = img.getAttribute('data-title_id');
+		var cat_h = img.getAttribute('data-category') || currentCategory;
+		var content_id_h = img.getAttribute('data-content_id') || "";
 
 		img.removeAttribute('data-loaded');
 		img.removeAttribute('data-loading');
 		img.style.opacity = "0"; 
+
+		if (cat_h === 'avatars') {
+			img.onload = function() {
+				this.onload = null;
+				this.onerror = null;
+				this.setAttribute('data-loaded', 'true');
+			};
+			img.onerror = function() {
+				this.onload = null;
+				this.onerror = null;
+				this.src = defaultCover;
+				this.setAttribute('data-loaded', 'true');
+			};
+			img.src = getAvatarCover(title_id, content_id_h);
+			return;
+		}
 
 		if (g_noCoverIndexLoaded && g_noCoverMap[title_id]) {
 			img.src = defaultCover;
@@ -3475,7 +3508,14 @@
 			return;
 		}
 
-		if (!g_noCoverIndexLoaded || !g_coverIndexLoaded) {
+		var nextImg = q[0];
+		if (!nextImg) {
+			g_isProcessingQueue = false;
+			return;
+		}
+
+		var nextCat = nextImg.getAttribute('data-category') || currentCategory;
+		if (nextCat !== 'avatars' && (!g_noCoverIndexLoaded || !g_coverIndexLoaded)) {
 			setTimeout(function() { processMasterQueue(batchID); }, 200);
 			return;
 		}
@@ -3494,12 +3534,34 @@
 		}
 
 		var tid = img.getAttribute('data-title_id');
+		var cat_h = img.getAttribute('data-category') || currentCategory;
+		var content_id_h = img.getAttribute('data-content_id') || "";
 		var def = defaultCover;
 		var is_ps3 = isPS3;
 
 		img.setAttribute('data-loading', 'true');
 		
 		if (img.src.indexOf('data:image') !== -1) img.src = def;
+
+		if (cat_h === 'avatars') {
+			img.onload = function() {
+				this.onload = this.onerror = null;
+				this.setAttribute('data-loaded', 'true');
+				this.removeAttribute('data-loading');
+				if (typeof g_activeCovers !== 'undefined') g_activeCovers.push(this);
+				if (typeof updateRAMMonitor === 'function') updateRAMMonitor();
+				processMasterQueue(batchID);
+			};
+			img.onerror = function() {
+				this.onload = this.onerror = null;
+				this.src = def;
+				this.setAttribute('data-failed', 'true');
+				this.removeAttribute('data-loading');
+				processMasterQueue(batchID);
+			};
+			img.src = getAvatarCover(tid, content_id_h);
+			return;
+		}
 		
 		if (g_noCoverIndexLoaded && g_noCoverMap[tid]) {
 			img.src = def;
@@ -4394,7 +4456,7 @@
 						'<div class="tile-content" style="position: relative;">' +
 							'<div class="console-tag ' + tagClass + '">' + consoleName + '</div>' +
 							'<div class="region-tag">' + regionName + '</div>' +
-							'<img id="img_' + tid_h + '_' + i + '" src="' + def_cover_h + '" data-title_id="' + tid_h + '" onclick="showGameDetails(' + i + ')" style="cursor:pointer;">' +
+							'<img id="img_' + tid_h + '_' + i + '" src="' + def_cover_h + '" data-title_id="' + tid_h + '" data-category="' + cat_h + '" data-content_id="' + (row_h[5] || '') + '" onclick="showGameDetails(' + i + ')" style="cursor:pointer;">' +
 							'<div class="title">' + name_h + '</div>' +
 							'<div class="title-id">[' + tid_h + ']</div>' +
 							'<div class="size">' + size_h + '</div>' +
@@ -6585,8 +6647,16 @@
         
         if (sourceImg_el && sourceImg_el.src && sourceImg_el.src.indexOf('data:image') === -1 && sourceImg_el.getAttribute('data-loaded') === 'true') {
             modal_img_el.src = sourceImg_el.src;
-            if (isHashImg_h || !high_res_h) return; 
+            if (cat_h === 'avatars' || isHashImg_h || !high_res_h) return; 
         }
+
+		if (cat_h === 'avatars') {
+			var avatarGhost_h = new Image();
+			avatarGhost_h.onload = function() { modal_img_el.src = this.src; };
+			avatarGhost_h.onerror = function() { modal_img_el.src = defaultCover; };
+			avatarGhost_h.src = getAvatarCover(id_h, contentId_h);
+			return;
+		}
 
         var ghost_h = new Image();
         ghost_h.onload = function() { modal_img_el.src = this.src; };
