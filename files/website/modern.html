@@ -794,13 +794,22 @@ input:checked + .slider:before { transform: translateX(20px); }
 .chat-mode-status-tag.slow { min-width: 72px; justify-content: center; }
 .chat-mode-status-tag.bypass { min-width: 78px; justify-content: center; }
 .chat-mode-status-tag[data-stable="true"] { animation: none; }
+.admin-chat-control-status-wrap { display: inline-flex; align-items: center; gap: 8px; margin-left: auto; flex-wrap: wrap; justify-content: flex-end; }
+.admin-chat-control-tags { margin: 0; justify-content: flex-end; }
+.admin-chat-control-tags .chat-mode-status-tag { min-height: 23px; font-size: 9px; padding: 3px 9px; }
+.admin-chat-control-tags .chat-mode-status-tag.slow { min-width: 86px; }
+.admin-chat-control-sync { color: var(--text-muted); opacity: 0.78; font-size: 9px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.7px; display: inline-flex; align-items: center; gap: 5px; }
+.admin-chat-control-sync.is-live { color: #8be8ff; opacity: 1; }
+@media (max-width: 640px) { .admin-chat-control-status-wrap { width: 100%; justify-content: flex-start; margin-left: 0; } .admin-chat-control-tags { width: auto; padding-top: 0; } }
 #chat-input.chat-control-locked { border-color: rgba(255,68,68,0.58) !important; background: rgba(45,0,10,0.24) !important; box-shadow: inset 0 0 0 1px rgba(255,68,68,0.14), 0 0 14px rgba(255,68,68,0.12); }
 #chat-input.chat-control-slow { border-color: rgba(255,204,0,0.52) !important; background: rgba(45,35,0,0.20) !important; box-shadow: inset 0 0 0 1px rgba(255,204,0,0.10), 0 0 14px rgba(255,204,0,0.10); }
 #chat-input.chat-control-bypass { border-color: rgba(0,188,255,0.50) !important; background: rgba(0,188,255,0.06) !important; box-shadow: inset 0 0 0 1px rgba(0,188,255,0.10), 0 0 14px rgba(0,188,255,0.10); }
 #chat-input.chat-control-waiting, #chat-input.chat-control-locked[contenteditable="false"] { opacity: 0.72; filter: grayscale(0.25); cursor: not-allowed !important; }
 #chat-input.chat-control-waiting:empty::before { color: rgba(255,223,115,0.55) !important; }
 #chat-input.chat-control-locked:empty::before { color: rgba(255,133,133,0.55) !important; }
-.chat-control-disabled-btn { opacity: 0.35 !important; filter: grayscale(0.65); pointer-events: none !important; }
+.chat-control-disabled-btn { opacity: 0.35 !important; filter: grayscale(0.65); pointer-events: none !important; cursor: not-allowed !important; transform: none !important; box-shadow: none !important; }
+.chat-toolbar.chat-toolbar-locked .tool-btn { opacity: 0.35 !important; filter: grayscale(0.65); pointer-events: none !important; cursor: not-allowed !important; }
+.chat-toolbar.chat-toolbar-locked .tool-btn.active { background: rgba(255,255,255,0.04) !important; color: var(--text-muted) !important; border-color: rgba(255,255,255,0.1) !important; }
 @media (max-width: 640px) {
   .chat-mode-status-tags { width: 100%; justify-content: flex-start; margin-left: 0; padding-top: 2px; }
   .chat-mode-status-tag { font-size: 8.5px; padding: 3px 8px; min-height: 22px; }
@@ -3113,9 +3122,13 @@ body:not(.is-admin) #view-admin { display: none !important; }
 						</div>
 
 						<div class="admin-card">
-							<div class="admin-card-title">
+							<div class="admin-card-title admin-chat-controls-title">
 								<h3><i class="fas fa-comment-slash"></i> Chat Controls</h3>
-								<span id="admin-chat-controls-pill" class="admin-pill online">Open</span>
+								<div class="admin-chat-control-status-wrap">
+									<div id="admin-chat-controls-status-tags" class="admin-chat-control-tags chat-mode-status-tags" style="display:none;"></div>
+									<span id="admin-chat-controls-sync" class="admin-chat-control-sync"><i class="fas fa-cloud"></i> Local</span>
+									<span id="admin-chat-controls-pill" class="admin-pill online">Open</span>
+								</div>
 							</div>
 							<div class="admin-control-box">
 								<div class="admin-switch-line">
@@ -8347,7 +8360,10 @@ body:not(.is-admin) #view-admin { display: none !important; }
 		const adminTarget = document.getElementById('view-admin');
 		if (adminTarget) { adminTarget.classList.remove('admin-booting'); void adminTarget.offsetWidth; adminTarget.classList.add('admin-booting'); }
 		adminInstallSocketListeners();
-		if (typeof socketChat !== 'undefined' && socketChat && socketChat.connected) socketChat.emit('admin_request_moderation_log');
+		if (typeof socketChat !== 'undefined' && socketChat && socketChat.connected) {
+			socketChat.emit('admin_request_moderation_log');
+			if (typeof window.adminRequestChatControlsState === 'function') window.adminRequestChatControlsState();
+		}
 		adminRefreshHealth(false);
 		adminResetUsersPanelState();
 		renderAdminPanel();
@@ -9435,6 +9451,18 @@ body:not(.is-admin) #view-admin { display: none !important; }
 		return adminSafeParseJson(localStorage.getItem('psn_admin_chat_controls'), { locked: false, slowSeconds: 0, by: '', at: null });
 	};
 
+	window.adminRequestChatControlsState = function() {
+		if (!(typeof socketChat !== 'undefined' && socketChat && socketChat.connected)) return false;
+		try {
+			socketChat.emit('admin_request_chat_controls', { at: Date.now() });
+			socketChat.emit('admin_request_admin_state', { at: Date.now() });
+			window.adminChatControlsLastRequested = Date.now();
+			return true;
+		} catch (e) {
+			return false;
+		}
+	};
+
 	function adminIsChatScreenVisible() {
 		const view = document.getElementById('view-chat');
 		const chat = document.getElementById('subview-chat');
@@ -9488,13 +9516,18 @@ body:not(.is-admin) #view-admin { display: none !important; }
 			locked: !!state.locked,
 			slowSeconds: Math.max(0, Math.min(600, parseInt(state.slowSeconds || 0, 10) || 0)),
 			by: state.by || localStorage.getItem('psn_username') || 'Admin',
-			at: state.at || new Date().toISOString()
+			at: state.at || new Date().toISOString(),
+			source: state.source || (shouldEmit ? 'pending' : 'server')
 		};
 		localStorage.setItem('psn_admin_chat_controls', JSON.stringify(normalized));
+		if (!shouldEmit && (state.source === 'server' || state.serverSynced === true || state.at)) {
+			window.adminChatControlsLastSynced = Date.now();
+		}
 		if (shouldEmit && typeof socketChat !== 'undefined' && socketChat && socketChat.connected) {
 			socketChat.emit('admin_chat_controls', normalized);
 		}
 		adminUpdateChatControlsBanner();
+		if (typeof adminUpdateChatControlsPanelStatus === 'function') adminUpdateChatControlsPanelStatus();
 		adminShowChatControlToast(normalized, oldState);
 		return normalized;
 	}
@@ -9509,15 +9542,67 @@ body:not(.is-admin) #view-admin { display: none !important; }
 		return { ...controls, slowSeconds, canBypass, by, waitMs };
 	}
 
-	function adminSetChatComposerButtonState(isDisabledForUser, reasonText = 'Chat controls active') {
-		const ids = ['btn-attach-file', 'btn-gif-picker', 'btn-emoji-picker', 'btn-chat-send'];
-		ids.forEach(id => {
-			const btn = document.getElementById(id);
+
+	function adminIsChatLockedForCurrentUser() {
+		try {
+			const state = adminGetChatControlsUiState();
+			return !!(state && state.locked && !state.canBypass);
+		} catch (e) {
+			return false;
+		}
+	}
+
+	function adminBlockLockedToolbarAction() {
+		if (!adminIsChatLockedForCurrentUser()) return false;
+		if (typeof playUiError === 'function') playUiError();
+		if (typeof adminUpdateChatControlsBanner === 'function') adminUpdateChatControlsBanner();
+		return true;
+	}
+	function adminSetChatComposerButtonState(isDisabledForUser, reasonText = 'Chat controls active', lockToolbar = false) {
+		const actionIds = ['btn-attach-file', 'btn-gif-picker', 'btn-emoji-picker', 'btn-chat-send'];
+		const toolbarIds = ['btn-toolbar-at', 'btn-toolbar-cmd', 'btn-create-poll', 'btn-bold', 'btn-italic', 'btn-strike'];
+		const idsToManage = Array.from(new Set([...(lockToolbar ? toolbarIds : []), ...actionIds]));
+		const allKnownIds = Array.from(new Set([...toolbarIds, ...actionIds]));
+		
+		const applyButtonState = (btn, shouldDisable) => {
 			if (!btn) return;
-			btn.classList.toggle('chat-control-disabled-btn', !!isDisabledForUser);
-			btn.setAttribute('aria-disabled', isDisabledForUser ? 'true' : 'false');
-			btn.title = isDisabledForUser ? reasonText : (btn.getAttribute('data-original-title') || btn.title || '');
+			if (!btn.dataset.originalTitle) btn.dataset.originalTitle = btn.title || '';
+			if (btn.dataset.originalTabindex === undefined) btn.dataset.originalTabindex = btn.getAttribute('tabindex') || '';
+			
+			btn.classList.toggle('chat-control-disabled-btn', !!shouldDisable);
+			btn.setAttribute('aria-disabled', shouldDisable ? 'true' : 'false');
+			btn.disabled = !!shouldDisable;
+			
+			if (shouldDisable) {
+				btn.setAttribute('tabindex', '-1');
+				btn.title = reasonText;
+				btn.classList.remove('active', 'is-active');
+			} else {
+				if (btn.dataset.originalTabindex) btn.setAttribute('tabindex', btn.dataset.originalTabindex);
+				else btn.removeAttribute('tabindex');
+				btn.title = btn.dataset.originalTitle || '';
+			}
+		};
+
+		allKnownIds.forEach(id => {
+			const btn = document.getElementById(id);
+			const shouldDisable = idsToManage.includes(id) && !!isDisabledForUser;
+			applyButtonState(btn, shouldDisable);
 		});
+
+		const fileInput = document.getElementById('chat-file-input');
+		if (fileInput) fileInput.disabled = !!isDisabledForUser;
+
+		const toolbar = document.getElementById('chat-toolbar-container');
+		if (toolbar) toolbar.classList.toggle('chat-toolbar-locked', !!lockToolbar && !!isDisabledForUser);
+
+		if (isDisabledForUser) {
+			document.getElementById('mention-suggestions')?.style && (document.getElementById('mention-suggestions').style.display = 'none');
+			document.getElementById('chat-input-emoji-picker')?.classList.remove('show');
+			document.getElementById('chat-input-gif-picker')?.classList.remove('show');
+			document.getElementById('btn-emoji-picker')?.classList.remove('is-active');
+			document.getElementById('btn-gif-picker')?.classList.remove('is-active');
+		}
 	}
 
 	function adminChatControlTag(kind, icon, text) {
@@ -9552,6 +9637,26 @@ body:not(.is-admin) #view-admin { display: none !important; }
 		});
 
 		tagBox.style.display = tagList.length ? 'flex' : 'none';
+	}
+
+	function adminUpdateChatControlsPanelStatus() {
+		const state = adminGetChatControlsUiState();
+		const tagBox = document.getElementById('admin-chat-controls-status-tags');
+		const syncEl = document.getElementById('admin-chat-controls-sync');
+		if (tagBox) {
+			const tagList = [];
+			if (state.locked) tagList.push({ kind: 'locked', icon: 'fa-lock', text: `Locked by ${state.by || 'Admin'}` });
+			if (state.slowSeconds > 0) tagList.push({ kind: 'slow', icon: 'fa-clock', text: `Slow ${state.slowSeconds}s` });
+			adminSyncChatControlTags(tagBox, tagList);
+		}
+		if (syncEl) {
+			const isConnected = !!(typeof socketChat !== 'undefined' && socketChat && socketChat.connected);
+			const syncedRecently = window.adminChatControlsLastSynced && (Date.now() - window.adminChatControlsLastSynced < 120000);
+			syncEl.className = isConnected ? 'admin-chat-control-sync is-live' : 'admin-chat-control-sync';
+			syncEl.innerHTML = isConnected
+				? `<i class="fas fa-cloud"></i> ${syncedRecently ? 'Synced' : 'Live'}`
+				: '<i class="fas fa-cloud-slash"></i> Offline';
+		}
 	}
 
 	function adminUpdateChatControlsBanner() {
@@ -9601,7 +9706,7 @@ body:not(.is-admin) #view-admin { display: none !important; }
 			}
 		}
 
-		adminSetChatComposerButtonState(isDisabledForUser, isLockedForUser ? `Chat locked by ${state.by || 'Admin'}` : (isSlowWaitingForUser ? `Slow mode: wait ${wait}s` : 'Chat controls active'));
+		adminSetChatComposerButtonState(isDisabledForUser, isLockedForUser ? `Chat locked by ${state.by || 'Admin'}` : (isSlowWaitingForUser ? `Slow mode: wait ${wait}s` : 'Chat controls active'), isLockedForUser);
 
 		if (tagBox) {
 			const tagList = [];
@@ -9614,6 +9719,8 @@ body:not(.is-admin) #view-admin { display: none !important; }
 			adminSyncChatControlTags(tagBox, tagList);
 		}
 
+		if (typeof adminUpdateChatControlsPanelStatus === 'function') adminUpdateChatControlsPanelStatus();
+
 		if (inline) {
 			inline.className = 'chat-control-inline-banner';
 			inline.style.display = 'none';
@@ -9624,21 +9731,66 @@ body:not(.is-admin) #view-admin { display: none !important; }
 		if (hint) hint.remove();
 	}
 
+	function adminSendChatControlsToServer(nextState, localLogMessage = '') {
+		const optimistic = adminSetChatControls({ ...nextState, source: 'pending' }, false);
+		if (!(typeof socketChat !== 'undefined' && socketChat && socketChat.connected)) {
+			if (typeof playUiError === 'function') playUiError();
+			alert('Socket is offline. Chat controls were not synced to the server.');
+			renderAdminPanel();
+			return optimistic;
+		}
+
+		const payload = { ...optimistic, source: 'client' };
+		let acked = false;
+		const onAck = (response) => {
+			acked = true;
+			const res = response && response.success !== undefined ? response : null;
+			if (res && res.success === false) {
+				if (typeof playUiError === 'function') playUiError();
+				alert(res.message || 'Server refused chat controls update.');
+				if (typeof window.adminRequestChatControlsState === 'function') window.adminRequestChatControlsState();
+				return;
+			}
+			const serverState = (res && res.state) ? res.state : payload;
+			adminSetChatControls({ ...serverState, source: 'server', serverSynced: true }, false);
+			if (localLogMessage) adminAddLog('chat_controls', localLogMessage, serverState);
+			renderAdminPanel();
+			if (typeof playUiSuccess === 'function') playUiSuccess();
+		};
+
+		try {
+			if (typeof socketChat.timeout === 'function') {
+				socketChat.timeout(2500).emit('admin_chat_controls', payload, (err, response) => {
+					if (err) {
+						if (typeof playUiError === 'function') playUiError();
+						if (typeof window.adminRequestChatControlsState === 'function') window.adminRequestChatControlsState();
+						return;
+					}
+					onAck(response);
+				});
+			} else {
+				socketChat.emit('admin_chat_controls', payload, onAck);
+			}
+		} catch (e) {
+			socketChat.emit('admin_chat_controls', payload);
+		}
+		setTimeout(() => {
+			if (!acked && typeof window.adminRequestChatControlsState === 'function') window.adminRequestChatControlsState();
+		}, 2700);
+		renderAdminPanel();
+		return optimistic;
+	}
+
 	window.adminApplyChatControls = function() {
 		if (!adminGuard()) return;
 		const locked = !!document.getElementById('admin-chat-lock-toggle')?.checked;
 		const slowSeconds = parseInt(document.getElementById('admin-slowmode-seconds')?.value || '0', 10) || 0;
-		const state = adminSetChatControls({ locked, slowSeconds }, true);
-		adminAddLog('chat_controls', `Updated chat controls: ${state.locked ? 'locked' : 'open'}, slow ${state.slowSeconds}s`, state);
-		renderAdminPanel();
-		if (typeof playUiSuccess === 'function') playUiSuccess();
+		adminSendChatControlsToServer({ locked, slowSeconds }, `Updated chat controls: ${locked ? 'locked' : 'open'}, slow ${Math.max(0, Math.min(600, slowSeconds))}s`);
 	};
 
 	window.adminResetChatControls = function() {
 		if (!adminGuard()) return;
-		const state = adminSetChatControls({ locked: false, slowSeconds: 0 }, true);
-		adminAddLog('chat_controls', 'Reset chat controls', state);
-		renderAdminPanel();
+		adminSendChatControlsToServer({ locked: false, slowSeconds: 0 }, 'Reset chat controls');
 		if (typeof playUiRemove === 'function') playUiRemove();
 	};
 
@@ -9911,9 +10063,10 @@ body:not(.is-admin) #view-admin { display: none !important; }
 		const chatPill = document.getElementById('admin-chat-controls-pill');
 		if (chatPill) {
 			const active = controls.locked || controls.slowSeconds > 0;
-			chatPill.className = active ? 'admin-pill warning' : 'admin-pill online';
+			chatPill.className = controls.locked ? 'admin-pill danger' : (active ? 'admin-pill warning' : 'admin-pill online');
 			chatPill.innerHTML = controls.locked ? '<i class="fas fa-lock"></i> Locked' : (controls.slowSeconds > 0 ? `<i class="fas fa-clock"></i> Slow ${controls.slowSeconds}s` : '<i class="fas fa-lock-open"></i> Open');
 		}
+		if (typeof adminUpdateChatControlsPanelStatus === 'function') adminUpdateChatControlsPanelStatus();
 
 		const health = window.adminHealth || {};
 		const liveSocketState = health.socketState || adminGetRealtimeSocketState();
@@ -9985,15 +10138,22 @@ body:not(.is-admin) #view-admin { display: none !important; }
 			window.adminHealth.transport = socketChat?.io?.engine?.transport?.name || '-';
 			if (document.getElementById('view-admin')?.style.display === 'block') renderAdminPanel();
 		};
-		socketChat.on('connect', () => syncAdminHealth('online'));
+		socketChat.on('connect', () => { syncAdminHealth('online'); if (typeof window.adminRequestChatControlsState === 'function') window.adminRequestChatControlsState(); });
 		socketChat.on('disconnect', () => syncAdminHealth('offline'));
 		socketChat.on('connect_error', () => syncAdminHealth('connecting'));
 		socketChat.io?.on?.('reconnect_attempt', () => syncAdminHealth('connecting'));
 		socketChat.io?.on?.('reconnect', () => syncAdminHealth('online'));
 		socketChat.on('admin_maintenance_mode', data => { adminSetMaintenanceState(data || {}, false); renderAdminPanel(); });
 		socketChat.on('maintenance_mode', data => { adminSetMaintenanceState(data || {}, false); renderAdminPanel(); });
-		socketChat.on('admin_chat_controls', data => { adminSetChatControls(data || {}, false); renderAdminPanel(); });
-		socketChat.on('chat_controls', data => { adminSetChatControls(data || {}, false); renderAdminPanel(); });
+		socketChat.on('admin_chat_controls', data => { adminSetChatControls({ ...(data || {}), source: 'server', serverSynced: true }, false); renderAdminPanel(); });
+		socketChat.on('chat_controls', data => { adminSetChatControls({ ...(data || {}), source: 'server', serverSynced: true }, false); renderAdminPanel(); });
+		socketChat.on('admin_chat_controls_state', data => { adminSetChatControls({ ...(data || {}), source: 'server', serverSynced: true }, false); renderAdminPanel(); });
+		socketChat.on('admin_state', data => {
+			if (data && data.chatControls) adminSetChatControls({ ...data.chatControls, source: 'server', serverSynced: true }, false);
+			if (data && data.maintenance) adminSetMaintenanceState(data.maintenance, false);
+			if (data && data.pinnedAnnouncement !== undefined) adminSetPinnedAnnouncementState(data.pinnedAnnouncement && !data.pinnedAnnouncement.clear ? data.pinnedAnnouncement : null, false);
+			renderAdminPanel();
+		});
 		socketChat.on('admin_pinned_announcement', data => { adminSetPinnedAnnouncementState(data && !data.clear ? data : null, false); renderAdminPanel(); });
 		socketChat.on('reports_list', reports => { adminSetReports(Array.isArray(reports) ? reports : []); renderAdminPanel(); });
 		socketChat.on('admin_report_created', report => {
@@ -10018,6 +10178,7 @@ body:not(.is-admin) #view-admin { display: none !important; }
 		adminUpdateChatControlsBanner();
 		if (!window.adminChatControlsUiTimer) window.adminChatControlsUiTimer = setInterval(adminUpdateChatControlsBanner, 1000);
 		adminRefreshHealth(false);
+		setTimeout(() => { if (typeof window.adminRequestChatControlsState === 'function') window.adminRequestChatControlsState(); }, 900);
 		setInterval(() => {
 			adminInstallSocketListeners();
 			if (document.getElementById('view-admin')?.style.display === 'block') adminRefreshHealth(false);
@@ -15802,6 +15963,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 	};
 	
 	function triggerMentionBtn() {
+		if (typeof adminBlockLockedToolbarAction === 'function' && adminBlockLockedToolbarAction()) return;
 		const input = document.getElementById('chat-input');
 		if (!input) return;
 	
@@ -15938,6 +16100,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 	}
 	
 	function triggerCommandBtn() {
+		if (typeof adminBlockLockedToolbarAction === 'function' && adminBlockLockedToolbarAction()) return;
 		const input = document.getElementById('chat-input');
 		if (!input) return;
 	
@@ -16336,6 +16499,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 	}
 
 	async function handleImageUpload(event) {
+		if (typeof adminBlockLockedToolbarAction === 'function' && adminBlockLockedToolbarAction()) { if (event && event.target) event.target.value = ''; return; }
 		if (event.target.files && event.target.files[0]) {
 			await processAndSendImage(event.target.files[0]);
 			event.target.value = ''; 
@@ -16343,6 +16507,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 	}
     
 	function wrapStyle(command) {
+		if (typeof adminBlockLockedToolbarAction === 'function' && adminBlockLockedToolbarAction()) return;
 		if (typeof playUiArrow === 'function') playUiArrow();
 		document.execCommand(command, false, null);
 		document.getElementById('chat-input').focus();
@@ -16618,6 +16783,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 	};
 	
 	function toggleEmojiInputPicker(event) {
+		if (typeof adminBlockLockedToolbarAction === 'function' && adminBlockLockedToolbarAction()) return;
 		event.stopPropagation();
 		
 		if (!isEmojiPickerBuilt) {
@@ -16725,6 +16891,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 	}
 	
 	function toggleGifPicker(event) {
+		if (typeof adminBlockLockedToolbarAction === 'function' && adminBlockLockedToolbarAction()) return;
 		event.stopPropagation();
 		
 		let picker = document.getElementById('chat-input-gif-picker');
@@ -20124,6 +20291,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 
 	
 	window.openPollModal = function() {
+		if (typeof adminBlockLockedToolbarAction === 'function' && adminBlockLockedToolbarAction()) return;
 		if (typeof playUiClick === 'function') playUiClick();
 		editingMsgId = null;
 		

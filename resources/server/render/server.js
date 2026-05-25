@@ -17,7 +17,7 @@ const APP_URLS = [
   "https://psn-content-mwp5.onrender.com/ping",
 ];
 
-const ADMIN_USERS = ["Luan Teles", "Goku Cheats"];
+const ADMIN_USERS = ["Luan Teles", "Goku Cheats", "JumpSuit"];
 
 const DEFAULT_AVATAR = "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/interface/modern/images/avatars/default.png";
 
@@ -288,6 +288,13 @@ function emitAdminState(socket) {
   socket.emit('admin_pinned_announcement', adminState.pinnedAnnouncement || { clear: true });
 
   if (socket.isAdmin === true) {
+    socket.emit('admin_state', {
+      maintenance: adminState.maintenance,
+      chatControls: adminState.chatControls,
+      pinnedAnnouncement: adminState.pinnedAnnouncement || null,
+      reports: adminReports
+    });
+    socket.emit('admin_chat_controls_state', adminState.chatControls);
     socket.emit('reports_list', adminReports);
   }
 }
@@ -848,12 +855,36 @@ io.on('connection', (socket) => {
       await saveAdminState(ADMIN_STATE_KEYS.maintenance, adminState.maintenance);
       io.emit('maintenance_mode', adminState.maintenance);
       io.emit('admin_maintenance_mode', adminState.maintenance);
+      emitToAdmins('admin_state', {
+        maintenance: adminState.maintenance,
+        chatControls: adminState.chatControls,
+        pinnedAnnouncement: adminState.pinnedAnnouncement || null,
+        reports: adminReports
+      });
       await addModerationLog(adminState.maintenance.enabled ? 'maintenance_on' : 'maintenance_off', adminState.maintenance.enabled ? 'Enabled maintenance mode' : 'Disabled maintenance mode', adminState.maintenance, socket.userName || 'Admin');
       respond({ success: true, state: adminState.maintenance });
     } catch (err) {
       console.error('[ADMIN MAINTENANCE ERROR]:', err);
       respond({ success: false, message: "Server error while updating maintenance mode." });
     }
+  });
+
+  socket.on('admin_request_chat_controls', (data, callback) => {
+    const payload = adminState.chatControls || normalizeChatControls({});
+    socket.emit('chat_controls', payload);
+    if (socket.isAdmin === true) socket.emit('admin_chat_controls_state', payload);
+    if (typeof callback === 'function') callback({ success: true, state: payload });
+  });
+
+  socket.on('admin_request_admin_state', (data, callback) => {
+    const payload = {
+      maintenance: adminState.maintenance,
+      chatControls: adminState.chatControls,
+      pinnedAnnouncement: adminState.pinnedAnnouncement || null,
+      reports: socket.isAdmin === true ? adminReports : []
+    };
+    socket.emit('admin_state', payload);
+    if (typeof callback === 'function') callback({ success: true, state: payload });
   });
 
   socket.on('admin_chat_controls', async (data, callback) => {
@@ -870,6 +901,13 @@ io.on('connection', (socket) => {
       await saveAdminState(ADMIN_STATE_KEYS.chatControls, adminState.chatControls);
       io.emit('chat_controls', adminState.chatControls);
       io.emit('admin_chat_controls', adminState.chatControls);
+      emitToAdmins('admin_chat_controls_state', adminState.chatControls);
+      emitToAdmins('admin_state', {
+        maintenance: adminState.maintenance,
+        chatControls: adminState.chatControls,
+        pinnedAnnouncement: adminState.pinnedAnnouncement || null,
+        reports: adminReports
+      });
       await addModerationLog('chat_controls', `Updated chat controls: ${adminState.chatControls.locked ? 'locked' : 'open'}, slow ${adminState.chatControls.slowSeconds}s`, adminState.chatControls, socket.userName || 'Admin');
       respond({ success: true, state: adminState.chatControls });
     } catch (err) {
