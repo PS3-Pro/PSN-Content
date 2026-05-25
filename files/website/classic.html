@@ -155,6 +155,14 @@
 			padding: 0 12px !important;
 		}
 
+		header #bing-cover-toggle label {
+			color: #66ccff;
+		}
+
+		header #bing-cover-toggle input {
+			vertical-align: middle;
+		}
+
 		header .toggle-btn label {
 			margin: 0 !important;
 			cursor: pointer;
@@ -2270,6 +2278,7 @@
 				<input type="button" id="pkg-version" value="Installable Version" onclick="window.location.href='https://github.com/PS3-Pro/PSN-Content/releases/download/Release/PlayStation_Network_Database.pkg'">
 				<div id="audio-switch" class="toggle-btn"><label><input type="checkbox" id="audio-toggle" checked> Audio</label></div>
 				<div id="cover-toggle" class="toggle-btn"><label><input type="checkbox" id="cover-gui"> Covers</label></div>
+				<div id="bing-cover-toggle" class="toggle-btn"><label><input type="checkbox" id="bing-covers"> Bing Covers</label></div>
 				<div id="zoom-container">
 				<span style="font-size: 14px;">Size: </span>
 					<input type="range" id="zoom-slider" min="0" max="2" step="1" value="1" oninput="updateZoom(this.value)">
@@ -2560,6 +2569,7 @@
 	var g_letterFilter = "";
 	var g_regionFilter = "ALL";
 	var useCoverGUI = false;
+	var g_bingCoversEnabled = !isPS3;
 	var g_isFetching = false;
 	var g_preSearchState = null;
 	var g_pendingScroll = null;
@@ -2617,6 +2627,7 @@
 	var DB = [];
 
 	var STORAGE_KEY_COVERS = "psn_db_covers_state";
+	var STORAGE_KEY_BING_COVERS = "psn_db_bing_covers_state";
 	var STORAGE_KEY_AUDIO = "psn_db_audio_state";
 
 	var CACHE_TIME = 1000 * 60 * 60 * 24; 
@@ -2642,6 +2653,75 @@
 		var contentPart = cleanAvatarPathPart(contentId);
 		if (!titlePart || !contentPart) return defaultCover;
 		return AVATAR_COVERS_BASE + "/" + titlePart + "/" + contentPart + ".png";
+	}
+
+	function escapeAttr(value) {
+		if (value === undefined || value === null) return "";
+		return String(value)
+			.replace(/&/g, "&amp;")
+			.replace(/"/g, "&quot;")
+			.replace(/'/g, "&#39;")
+			.replace(/</g, "&lt;")
+			.replace(/>/g, "&gt;");
+	}
+
+	function normalizeBingConsoleTag(consoleTag) {
+		var tag = (consoleTag || "ps3").toUpperCase();
+		if (tag === "PSX") return "PS1";
+		if (tag === "PCE") return "PC Engine";
+		if (tag === "NEOGEO") return "Neo Geo";
+		if (tag === "MINIS") return "PSP Minis";
+		return tag;
+	}
+
+	function buildBingCoverUrl(gameName, consoleTag) {
+		gameName = (gameName || "").replace(/^\s+|\s+$/g, "");
+		if (!gameName) gameName = "PlayStation game";
+
+		var searchConsole = normalizeBingConsoleTag(consoleTag);
+		var query = gameName + " " + searchConsole + " high-quality official game front cover art";
+		var baseUrl = isPS3 ? "http://tse4.mm.bing.net/th?q=" : "https://tse4.mm.bing.net/th?q=";
+		return baseUrl + encodeURIComponent(query);
+	}
+
+	function buildBingCoverUrlFromElement(imgElement) {
+		if (!imgElement) return "";
+		return buildBingCoverUrl(imgElement.getAttribute('data-name') || "", imgElement.getAttribute('data-console') || "ps3");
+	}
+
+	function finishCoverFallback(imgElement, onFinish) {
+		if (!imgElement) return false;
+
+		if (g_bingCoversEnabled && imgElement.getAttribute('data-category') !== 'avatars' && imgElement.getAttribute('data-bing-tried') !== 'true') {
+			imgElement.setAttribute('data-bing-tried', 'true');
+			imgElement.onload = function() {
+				this.onload = null;
+				this.onerror = null;
+				this.setAttribute('data-loaded', 'true');
+				this.removeAttribute('data-loading');
+				if (onFinish) onFinish(this, true);
+			};
+			imgElement.onerror = function() {
+				this.onload = null;
+				this.onerror = null;
+				this.src = defaultCover;
+				this.setAttribute('data-failed', 'true');
+				this.setAttribute('data-loaded', 'true');
+				this.removeAttribute('data-loading');
+				if (onFinish) onFinish(this, false);
+			};
+			imgElement.src = buildBingCoverUrlFromElement(imgElement);
+			return true;
+		}
+
+		imgElement.onload = null;
+		imgElement.onerror = null;
+		imgElement.src = defaultCover;
+		imgElement.setAttribute('data-failed', 'true');
+		imgElement.setAttribute('data-loaded', 'true');
+		imgElement.removeAttribute('data-loading');
+		if (onFinish) onFinish(imgElement, false);
+		return false;
 	}
 
 	// ==============================================================
@@ -3042,10 +3122,10 @@
     // ==============================================================
     // 4. ZOOM CONTROL (PC ONLY)
     // ==============================================================
-	const zoomLevels = [0.905, 1.0, 1.24];
+	var zoomLevels = [0.905, 1.0, 1.24];
 
 	function updateZoom(index) {
-		const zoom = zoomLevels[index];
+		var zoom = zoomLevels[index];
 		updateGridScale(zoom);
 	}
 
@@ -3110,9 +3190,14 @@
 
 	function saveUIState() {
 		var doc = document;
-		var coverChecked = doc.getElementById("cover-gui").checked;
-		var audioChecked = doc.getElementById("audio-toggle").checked;
+		var coverEl = doc.getElementById("cover-gui");
+		var audioEl = doc.getElementById("audio-toggle");
+		var bingEl = doc.getElementById("bing-covers");
+		var coverChecked = coverEl ? coverEl.checked : false;
+		var audioChecked = audioEl ? audioEl.checked : false;
+		var bingChecked = bingEl ? bingEl.checked : false;
 		saveState(STORAGE_KEY_COVERS, coverChecked ? "1" : "0");
+		saveState(STORAGE_KEY_BING_COVERS, bingChecked ? "1" : "0");
 		saveState(STORAGE_KEY_AUDIO, audioChecked ? "1" : "0");
 	}
 
@@ -3121,6 +3206,7 @@
 		var is_ps3_h = isPS3;
 		var coverToggle = doc.getElementById("cover-gui");
 		var audioToggle = doc.getElementById("audio-toggle");
+		var bingToggle = doc.getElementById("bing-covers");
 
 		var coverState = loadState(STORAGE_KEY_COVERS);
 		if (coverToggle) {
@@ -3130,6 +3216,16 @@
 				coverToggle.checked = true;
 			}
 			useCoverGUI = coverToggle.checked;
+		}
+
+		var bingState = loadState(STORAGE_KEY_BING_COVERS);
+		if (bingToggle) {
+			if (bingState !== null) {
+				bingToggle.checked = (bingState === "1");
+			} else {
+				bingToggle.checked = !is_ps3_h;
+			}
+			g_bingCoversEnabled = bingToggle.checked;
 		}
 
 		var audioState = loadState(STORAGE_KEY_AUDIO);
@@ -3415,6 +3511,8 @@
 
 		img.removeAttribute('data-loaded');
 		img.removeAttribute('data-loading');
+		img.removeAttribute('data-failed');
+		img.removeAttribute('data-bing-tried');
 		img.style.opacity = "0"; 
 
 		if (cat_h === 'avatars') {
@@ -3434,8 +3532,7 @@
 		}
 
 		if (g_noCoverIndexLoaded && g_noCoverMap[title_id]) {
-			img.src = defaultCover;
-			setTimeout(function() { img.setAttribute('data-loaded', 'true'); }, 100);
+			finishCoverFallback(img);
 			return;
 		}
 
@@ -3463,8 +3560,7 @@
 				this.onerror = function() {
 					this.onerror = null;
 					this.onload = null;
-					this.src = defaultCover;
-					this.setAttribute('data-loaded', 'true');
+					finishCoverFallback(this);
 				};
 				this.onload = function() {
 					this.onload = null;
@@ -3474,8 +3570,7 @@
 				this.src = hashUrl;
 			} else {
 				this.onload = null;
-				this.src = defaultCover;
-				this.setAttribute('data-loaded', 'true');
+				finishCoverFallback(this);
 			}
 		};
 
@@ -3540,6 +3635,8 @@
 		var is_ps3 = isPS3;
 
 		img.setAttribute('data-loading', 'true');
+		img.removeAttribute('data-failed');
+		img.removeAttribute('data-bing-tried');
 		
 		if (img.src.indexOf('data:image') !== -1) img.src = def;
 
@@ -3564,12 +3661,11 @@
 		}
 		
 		if (g_noCoverIndexLoaded && g_noCoverMap[tid]) {
-			img.src = def;
-			img.setAttribute('data-loaded', 'true');
-			img.removeAttribute('data-loading');
-			if (typeof g_activeCovers !== 'undefined') g_activeCovers.push(img);
-
-			setTimeout(function() { processMasterQueue(batchID); }, 0);
+			finishCoverFallback(img, function(doneImg) {
+				if (typeof g_activeCovers !== 'undefined') g_activeCovers.push(doneImg);
+				if (typeof updateRAMMonitor === 'function') updateRAMMonitor();
+				setTimeout(function() { processMasterQueue(batchID); }, 0);
+			});
 			return;
 		}
 
@@ -3605,10 +3701,11 @@
 				this.onload = img.onload;
 				this.onerror = img.onerror;
 			} else {
-				this.src = def;
-				this.setAttribute('data-failed', 'true');
-				this.removeAttribute('data-loading');
-				processMasterQueue(batchID);
+				finishCoverFallback(this, function(doneImg) {
+					if (typeof g_activeCovers !== 'undefined') g_activeCovers.push(doneImg);
+					if (typeof updateRAMMonitor === 'function') updateRAMMonitor();
+					processMasterQueue(batchID);
+				});
 			}
 		};
 
@@ -4456,7 +4553,7 @@
 						'<div class="tile-content" style="position: relative;">' +
 							'<div class="console-tag ' + tagClass + '">' + consoleName + '</div>' +
 							'<div class="region-tag">' + regionName + '</div>' +
-							'<img id="img_' + tid_h + '_' + i + '" src="' + def_cover_h + '" data-title_id="' + tid_h + '" data-category="' + cat_h + '" data-content_id="' + (row_h[5] || '') + '" onclick="showGameDetails(' + i + ')" style="cursor:pointer;">' +
+							'<img id="img_' + tid_h + '_' + i + '" src="' + def_cover_h + '" data-title_id="' + tid_h + '" data-category="' + cat_h + '" data-content_id="' + escapeAttr(row_h[5] || '') + '" data-name="' + escapeAttr(name_h) + '" data-console="' + escapeAttr(row_h.cTag || 'ps3') + '" onclick="showGameDetails(' + i + ')" style="cursor:pointer;">' +
 							'<div class="title">' + name_h + '</div>' +
 							'<div class="title-id">[' + tid_h + ']</div>' +
 							'<div class="size">' + size_h + '</div>' +
@@ -5242,6 +5339,20 @@
 			scrollToTop();
 		};
 
+		var bingCoversToggle = document.getElementById("bing-covers");
+		if (bingCoversToggle) {
+			bingCoversToggle.onclick = function() {
+				g_bingCoversEnabled = this.checked;
+				saveUIState();
+
+				if (useCoverGUI) {
+					stopRendering();
+					cancelAllDownloads();
+					render();
+				}
+			};
+		}
+
 		document.getElementById("audio-toggle").onclick = function() {
 			var isChecked = this.checked;
 			saveUIState();
@@ -5741,6 +5852,9 @@
 
 		var coverGui_el = doc.getElementById('cover-gui');
 		if (coverGui_el) coverGui_el.checked = use_gui_h;
+
+		var bingCovers_el = doc.getElementById('bing-covers');
+		if (bingCovers_el) bingCovers_el.checked = g_bingCoversEnabled;
 
 		selectCategory("games");
 
@@ -6644,10 +6758,11 @@
 		openModal();
 
         var isHashImg_h = sourceImg_el && sourceImg_el.src && sourceImg_el.src.indexOf('Recently-Played-Games') !== -1;
+        var isBingImg_h = sourceImg_el && sourceImg_el.src && sourceImg_el.src.indexOf('bing.net') !== -1;
         
         if (sourceImg_el && sourceImg_el.src && sourceImg_el.src.indexOf('data:image') === -1 && sourceImg_el.getAttribute('data-loaded') === 'true') {
             modal_img_el.src = sourceImg_el.src;
-            if (cat_h === 'avatars' || isHashImg_h || !high_res_h) return; 
+            if (cat_h === 'avatars' || isHashImg_h || isBingImg_h || !high_res_h) return; 
         }
 
 		if (cat_h === 'avatars') {
@@ -6658,6 +6773,14 @@
 			return;
 		}
 
+        var modalBingFallback_h = function() {
+            if (g_bingCoversEnabled) {
+                modal_img_el.src = buildBingCoverUrl(displayName_h, row_h.cTag || 'ps3');
+            } else {
+                modal_img_el.src = defaultCover;
+            }
+        };
+
         var ghost_h = new Image();
         ghost_h.onload = function() { modal_img_el.src = this.src; };
         ghost_h.onerror = function() {
@@ -6665,13 +6788,16 @@
                 var hash_h = generateSonyHash(id_h);
                 var fallback_h = new Image();
                 fallback_h.onload = function() { modal_img_el.src = this.src; };
+                fallback_h.onerror = modalBingFallback_h;
                 fallback_h.src = "https://raw.githubusercontent.com/PS3-Pro/Recently-Played-Games/master/np/" + hash_h + "/ICON0.PNG";
+            } else {
+                modalBingFallback_h();
             }
         };
 
         var targetUrl_h = "";
         if (g_noCoverIndexLoaded && g_noCoverMap[id_h]) {
-            targetUrl_h = defaultCover;
+            targetUrl_h = g_bingCoversEnabled ? buildBingCoverUrl(displayName_h, row_h.cTag || 'ps3') : defaultCover;
         } else if (g_coverIndexLoaded && !g_coverMap[id_h]) {
             var hash_val_h = generateSonyHash(id_h);
             targetUrl_h = "https://raw.githubusercontent.com/PS3-Pro/Recently-Played-Games/master/np/" + hash_val_h + "/ICON0.PNG";
