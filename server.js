@@ -193,6 +193,31 @@ function isUserAdmin(name, userData = null) {
   return ADMIN_USERS.includes(name) || getUserRole(name, userData) === "admin";
 }
 
+function isUserModerator(name, userData = null) {
+  return getUserRole(name, userData) === "mod";
+}
+
+function canModerateSocket(socket) {
+  if (!socket || !socket.userName) return false;
+  if (socket.isAdmin === true) return true;
+  const user = userDatabase[socket.userName] || null;
+  return isUserModerator(socket.userName, user);
+}
+
+function canModerateTarget(socket, targetName = "") {
+  if (!canModerateSocket(socket)) return false;
+  if (socket.isAdmin === true) return true;
+  const targetUser = targetName ? (userDatabase[targetName] || null) : null;
+  const targetRole = targetName ? getUserRole(targetName, targetUser) : "user";
+  // Moderators can moderate regular/trusted/banned users, but not admins or other mods.
+  return !["admin", "mod"].includes(targetRole);
+}
+
+function getActorRole(socket) {
+  if (!socket || !socket.userName) return "user";
+  return socket.isAdmin === true ? "admin" : getUserRole(socket.userName, userDatabase[socket.userName] || null);
+}
+
 function isUserBanned(userData = null) {
   return !!(userData && (userData.banned === true || getUserRole(userData.name || "", userData) === "banned"));
 }
@@ -346,7 +371,8 @@ async function setUserRole(targetName, role, adminName) {
 
   getSocketsByUserName(targetName).forEach(client => {
     client.isAdmin = isUserAdmin(targetName, userDatabase[targetName]);
-    client.emit('role_updated', { role: normalizedRole, isAdmin: client.isAdmin });
+    client.role = getUserRole(targetName, userDatabase[targetName]);
+    client.emit('role_updated', { role: normalizedRole, isAdmin: client.isAdmin, isModerator: normalizedRole === 'mod' });
   });
 
   io.emit('online_list', getSanitizedOnlineList());
@@ -413,6 +439,7 @@ io.on('connection', (socket) => {
         if (match) {
           socket.userName = name;
           socket.isAdmin = isAdmin;
+          socket.role = getUserRole(name, dbUser);
 
           userDatabase[name] = {
             ...dbUser,
@@ -431,7 +458,9 @@ io.on('connection', (socket) => {
           socket.emit('auth_success', { 
             name, 
             userData: userDatabase[name],
-            isAdmin: isAdmin 
+            isAdmin: isAdmin,
+            role: getUserRole(name, userDatabase[name]),
+            isModerator: isUserModerator(name, userDatabase[name])
           });
 
           socket.emit('chat_history', messageHistory);
@@ -483,7 +512,9 @@ io.on('connection', (socket) => {
         socket.emit('auth_success', { 
           name, 
           userData: userDatabase[name],
-          isAdmin: isAdmin 
+          isAdmin: isAdmin,
+          role: getUserRole(name, userDatabase[name]),
+          isModerator: isUserModerator(name, userDatabase[name])
         });
 
         socket.emit('chat_history', messageHistory);
@@ -629,6 +660,8 @@ io.on('connection', (socket) => {
   socket.on('chat_message', async (msg) => {
     let messageData = { ...(typeof msg === 'object' ? msg : { text: msg }), time: new Date().toISOString(), seenBy: [] };
     const isAdmin = socket.isAdmin === true;
+    const canModerate = canModerateSocket(socket);
+    const actorRole = getActorRole(socket);
     const senderName = socket.userName || messageData.user;
 
     if (senderName && userDatabase[senderName] && isUserBanned(userDatabase[senderName]) && !isAdmin) {
@@ -637,6 +670,33 @@ io.on('connection', (socket) => {
     }
 
     const text = normalizeText(messageData.text, "");
+
+    if (text.toLowerCase().startsWith('/kick')) {
+      if (!canModerate) {
+        socket.emit('chat_blocked', { reason: 'permission', message: 'Only admins/moderators can use /kick.' });
+        return;
+      }
+
+      const targetName = text.split(' ').slice(1).join(' ').replace('@', '').trim();
+      const targetSocket = getSocketsByUserName(targetName)[0];
+      if (!targetName || !targetSocket) {
+        socket.emit('kick_error', { message: 'User not found or offline.' });
+        return;
+      }
+      if (!canModerateTarget(socket, targetName)) {
+        socket.emit('kick_error', { message: 'You cannot kick this user.' });
+        return;
+      }
+
+      targetSocket.emit('user_kicked', { by: senderName, role: actorRole });
+      socket.emit('kick_success', { targetId: targetSocket.id, targetName });
+      await addModerationLog('kick', `Kicked ${targetName} via chat command`, { targetName, targetId: targetSocket.id }, senderName || 'Moderator');
+      setTimeout(() => {
+        if (targetSocket.connected) targetSocket.disconnect(true);
+      }, 2500);
+      return;
+    }
+
     if ((text === '/reload' || text === '/force_reload') && isAdmin) {
       socket.broadcast.emit('force_reload');
       await addModerationLog('reload', 'Forced reload for connected users', {}, senderName || 'Admin');
@@ -651,7 +711,7 @@ io.on('connection', (socket) => {
       return;
     }
 
-    if (!isAdmin) {
+    if (!canModerate) {
       const controls = adminState.chatControls || {};
       if (controls.locked) {
         socket.emit('chat_blocked', { reason: 'locked', message: 'Chat is locked by admin.', controls });
@@ -671,6 +731,8 @@ io.on('connection', (socket) => {
     }
 
     messageData.isAdmin = isAdmin;
+    messageData.role = actorRole;
+    messageData.isModerator = actorRole === 'mod';
     messageData.user = senderName;
 
     messageHistory.push(messageData);
@@ -971,14 +1033,24 @@ io.on('connection', (socket) => {
     const msgIndex = messageHistory.findIndex(m => String(new Date(m.time).getTime()) === String(data.msgId));
     if (msgIndex > -1) {
         const isAdmin = socket.isAdmin === true;
+        const canModerate = canModerateSocket(socket);
+        const actorRole = getActorRole(socket);
         const msg = messageHistory[msgIndex];
+        const isOwner = msg.user === socket.userName;
+        const canEditTarget = isOwner || (canModerate && canModerateTarget(socket, msg.user));
 
-        if (msg.user === socket.userName || isAdmin) {
-            const wasEditedByAdmin = (isAdmin && msg.user !== socket.userName);
+        if (canEditTarget) {
+            const wasEditedByStaff = (!isOwner && canModerate);
+            const wasEditedByAdmin = (!isOwner && isAdmin);
             
             msg.text = data.newText;
             msg.edited = true;
             msg.editedByAdmin = wasEditedByAdmin;
+            msg.editedByMod = wasEditedByStaff && !wasEditedByAdmin;
+            if (wasEditedByStaff) {
+              msg.editedBy = socket.userName;
+              msg.editedByRole = actorRole;
+            }
 
             if (data.content) {
                 msg.type = data.type || 'image';
@@ -992,7 +1064,10 @@ io.on('connection', (socket) => {
                     newText: data.newText, 
                     type: msg.type, 
                     content: msg.content,
-                    editedByAdmin: wasEditedByAdmin 
+                    editedByAdmin: wasEditedByAdmin,
+                    editedByMod: msg.editedByMod === true,
+                    editedBy: msg.editedBy || null,
+                    editedByRole: msg.editedByRole || null 
                 });
 
                 const pinned = pinnedMessages.find(p => p.id === data.msgId);
@@ -1014,9 +1089,12 @@ io.on('connection', (socket) => {
     const msgIndex = messageHistory.findIndex(m => String(new Date(m.time).getTime()) === String(data.msgId));
     if (msgIndex > -1) {
         const isAdmin = socket.isAdmin === true;
-        const msgTime = messageHistory[msgIndex].time;
+        const canModerate = canModerateSocket(socket);
+        const msg = messageHistory[msgIndex];
+        const msgTime = msg.time;
+        const isOwner = msg.user === socket.userName;
 
-        if (messageHistory[msgIndex].user === socket.userName || isAdmin) {
+        if (isOwner || (canModerate && canModerateTarget(socket, msg.user))) {
             messageHistory.splice(msgIndex, 1);
             try {
                 await pool.query("DELETE FROM chat WHERE message->>'time' = $1", [msgTime]);
@@ -1025,6 +1103,9 @@ io.on('connection', (socket) => {
             }
 
             io.emit('message_deleted', data.msgId);
+            if (!isOwner) {
+                await addModerationLog('delete_message', `Deleted message from ${msg.user}`, { msgId: data.msgId, targetUser: msg.user }, socket.userName || 'Moderator');
+            }
 
             const isPinned = pinnedMessages.find(p => p.id === data.msgId);
             if (isPinned) {
@@ -1050,12 +1131,18 @@ io.on('connection', (socket) => {
     }
   });
 
-  socket.on('kick_user', (data) => {
-    if (socket.isAdmin === true) {
+  socket.on('kick_user', async (data) => {
+    if (canModerateSocket(socket)) {
         const targetSocket = io.sockets.sockets.get(data.targetId);
         if (targetSocket) {
-            targetSocket.emit('user_kicked');
-            socket.emit('kick_success', { targetId: data.targetId });
+            const targetName = targetSocket.userName || normalizeText(data.targetName, 'Unknown');
+            if (!canModerateTarget(socket, targetName)) {
+                socket.emit('kick_error', { targetId: data.targetId, targetName, message: 'You cannot kick this user.' });
+                return;
+            }
+            targetSocket.emit('user_kicked', { by: socket.userName, role: getActorRole(socket) });
+            socket.emit('kick_success', { targetId: data.targetId, targetName });
+            await addModerationLog('kick', `Kicked ${targetName}`, { targetId: data.targetId, targetName }, socket.userName || 'Moderator');
             
             setTimeout(() => { 
                 if (targetSocket.connected) {
@@ -1067,7 +1154,7 @@ io.on('connection', (socket) => {
   });
 
   socket.on('pin_message', async (data) => {
-    if (socket.isAdmin === true) {
+    if (canModerateSocket(socket)) {
       const msg = messageHistory.find(m => String(new Date(m.time).getTime()) === String(data.msgId));
       if (msg && !pinnedMessages.find(p => p.id === data.msgId)) {
         const pinData = { 
@@ -1082,13 +1169,14 @@ io.on('connection', (socket) => {
         try {
           await pool.query('INSERT INTO pinned_messages (message_id, data) VALUES ($1, $2) ON CONFLICT (message_id) DO UPDATE SET data = $2', [data.msgId, pinData]);
           io.emit('pinned_list', pinnedMessages);
+          await addModerationLog('pin_message', `Pinned message from ${msg.user}`, { msgId: data.msgId, targetUser: msg.user }, socket.userName || 'Moderator');
         } catch (e) { console.error("Pin DB Error:", e); }
       }
     }
   });
 
   socket.on('unpin_message', async (data) => {
-    if (socket.isAdmin === true) {
+    if (canModerateSocket(socket)) {
       pinnedMessages = pinnedMessages.filter(p => p.id !== data.msgId);
       
       try {
@@ -1096,6 +1184,7 @@ io.on('connection', (socket) => {
       } catch (e) { console.error("Unpin DB Error:", e); }
 
       io.emit('pinned_list', pinnedMessages);
+      await addModerationLog('unpin_message', 'Unpinned a chat message', { msgId: data.msgId }, socket.userName || 'Moderator');
     }
   });
 

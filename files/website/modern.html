@@ -882,7 +882,7 @@ div[style*="display: flex"] { transition: opacity 0.3s ease, transform 0.3s ease
 .tool-btn { background: none; border: none; color: var(--text-muted); cursor: pointer; transition: all 0.2s ease; padding: 5px; display: flex; align-items: center; justify-content: center; }
 .tool-btn.active { color: var(--ps-blue) !important; text-shadow: 0 0 8px rgba(0, 188, 255, 0.6); transform: scale(1.1); }
 #btn-toolbar-cmd { display: none !important; }
-body.is-admin #btn-toolbar-cmd { display: flex !important; }
+body.is-admin #btn-toolbar-cmd, body.is-mod #btn-toolbar-cmd { display: flex !important; }
 .tool-btn.active { color: #00bcff !important; text-shadow: 0 0 12px rgba(0, 188, 255, 0.8); transform: scale(1.15); opacity: 1 !important; }
 #btn-toolbar-cmd.active { color: #00bcff !important; text-shadow: 0 0 12px rgba(0, 255, 204, 0.8); }
 .msg-highlight-ps5 .msg-bubble { animation: ps5-fluid-glow 3s cubic-bezier(0.4, 0, 0.2, 1) forwards !important; z-index: 1000 !important; position: relative !important; }
@@ -1887,8 +1887,14 @@ body:not(.is-admin) #view-admin { display: none !important; }
 				<li class="active" id="nav-trophies-sidebar" onmouseenter="playUiHover()" onclick="playUiClick(); switchView('view-trophies'); toggleSidebar()">
 					<i class="fas fa-trophy"></i> My Trophies
 				</li>
+				<!-- NOVO BOTÃO DE REWARDS -->
 				<li id="nav-rewards-sidebar" onmouseenter="playUiHover()" onclick="playUiClick(); switchView('view-rewards'); toggleSidebar()">
 					<i class="fas fa-gift"></i> Rewards
+				</li>
+			</ul>
+			<ul class="sidebar-menu menu-group-admin" style="display: none;">
+				<li class="active" id="nav-admin-dashboard" onmouseenter="playUiHover()" onclick="playUiClick(); switchView('view-admin'); renderAdminPanel(); toggleSidebar()">
+					<i class="fas fa-tachometer-alt"></i> Dashboard
 				</li>
 			</ul>
 			<div class="sidebar-divider" style="height: 1px; background: rgba(255,255,255,0.05); margin: 10px 15px;"></div>
@@ -1898,7 +1904,7 @@ body:not(.is-admin) #view-admin { display: none !important; }
 					<i class="fas fa-book"></i> Help
 				</li>
 				<li id="nav-admin-footer" class="admin-sidebar-entry" onmouseenter="playUiHover()" onclick="playUiClick(); openAdminPanel('view-admin'); toggleSidebar()">
-					<i class="fas fa-shield-alt"></i> Panel
+					<i class="fas fa-shield-alt"></i> Admin
 				</li>
 				<li id="nav-settings" onmouseenter="playUiHover()" onclick="playUiClick(); switchView('view-settings'); toggleSidebar()">
 					<i class="fas fa-cog"></i> Settings
@@ -8037,6 +8043,14 @@ body:not(.is-admin) #view-admin { display: none !important; }
 		return document.body.classList.contains('is-admin');
 	};
 
+	window.isModSession = function() {
+		return document.body.classList.contains('is-mod');
+	};
+
+	window.canModerateSession = function() {
+		return document.body.classList.contains('is-admin') || document.body.classList.contains('is-mod');
+	};
+
 	function adminEscapeHtml(value) {
 		return String(value || '').replace(/[&<>'"]/g, function(ch) {
 			return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' })[ch];
@@ -9308,6 +9322,20 @@ body:not(.is-admin) #view-admin { display: none !important; }
 		if (!role && u && u.isAdmin) role = 'admin';
 		if (!role && localStorage.getItem(`${name}_psn_isAdmin`) === 'true') role = 'admin';
 		return ['admin', 'mod', 'trusted', 'banned', 'user'].includes(role) ? role : 'user';
+	};
+
+	window.getPsnSessionRole = function() {
+		const myName = localStorage.getItem('psn_username') || '';
+		return myName && typeof window.getPsnUserRole === 'function' ? window.getPsnUserRole(myName, window.findPsnUserByName(myName) || {}) : 'user';
+	};
+
+	window.canModerateChat = function(targetName = '', targetUser = null) {
+		const myRole = window.getPsnSessionRole ? window.getPsnSessionRole() : 'user';
+		if (myRole === 'admin') return true;
+		if (myRole !== 'mod') return false;
+		if (!targetName) return true;
+		const targetRole = window.getPsnUserRole ? window.getPsnUserRole(targetName, targetUser || window.findPsnUserByName(targetName) || {}) : 'user';
+		return !['admin', 'mod'].includes(targetRole);
 	};
 
 	window.getPsnRoleLabel = function(role) {
@@ -15465,9 +15493,9 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 	}
 	
 	const ADMIN_COMMAND_LIST = [
-		{ cmd: 'clean', desc: 'Clear all chat history' },
-		{ cmd: 'reload', desc: 'Force all users to reload page' },
-		{ cmd: 'kick', desc: 'Kick a user: /kick @Username' }
+		{ cmd: 'kick', desc: 'Kick a user: /kick @Username', mod: true },
+		{ cmd: 'clean', desc: 'Clear all chat history', adminOnly: true },
+		{ cmd: 'reload', desc: 'Force all users to reload page', adminOnly: true }
 	];
 
     function showCommandSuggestions(query) {
@@ -15484,12 +15512,15 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 		}
 	
 		const isAdmin = document.body.classList.contains('is-admin');
-		if (!isAdmin) { 
+		const canModerate = typeof window.canModerateSession === 'function' ? window.canModerateSession() : isAdmin;
+		if (!canModerate) { 
 			box.style.display = 'none'; 
 			return; 
 		}
 	
-		const filtered = ADMIN_COMMAND_LIST.filter(c => c.cmd.toLowerCase().includes(query.toLowerCase()));
+		const filtered = ADMIN_COMMAND_LIST
+			.filter(c => isAdmin || !c.adminOnly)
+			.filter(c => c.cmd.toLowerCase().includes(query.toLowerCase()));
 	
 		if (filtered.length > 0) {
 			box.innerHTML = filtered.map((c, i) => `
@@ -16460,6 +16491,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 	
 		const myName = localStorage.getItem('psn_username');
 		const isAdmin = document.body.classList.contains('is-admin');
+		const canModerateGlobal = typeof window.canModerateSession === 'function' ? window.canModerateSession() : isAdmin;
 		
 		let cleanText = (typeof msg === 'object' && msg.text) ? msg.text : (typeof msg === 'string' ? msg : "");
 		let messageText = cleanText;
@@ -16554,6 +16586,9 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 		const senderRole = typeof window.getPsnUserRole === 'function' ? window.getPsnUserRole(userName, senderRoleSource) : (msg.isAdmin ? 'admin' : 'user');
 		const senderIsAdmin = msg.isAdmin === true || senderRole === 'admin';
 		const senderIsBanned = senderRole === 'banned';
+		const canModerateMsg = !isAuthor && (typeof window.canModerateChat === 'function' ? window.canModerateChat(userName, senderRoleSource) : isAdmin);
+		const canEditOrDeleteMsg = isAuthor || canModerateMsg;
+		const canPinThisMsg = typeof window.canModerateChat === 'function' ? window.canModerateChat(userName, senderRoleSource) : isAdmin;
 		const senderRoleBadgeHtml = typeof window.buildPsnRoleBadge === 'function' ? window.buildPsnRoleBadge(userName, senderRoleSource, 'chat') : '';
 		const isPersonalMention = !isAuthor && myName && (cleanText.includes(`@${myName}`) || (replyData && replyData.user === myName));
 		const userAvatar = (typeof msg === 'object' && msg.avatar) ? msg.avatar : (localStorage.getItem(`${userName}_psn_avatar`) || "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/interface/modern/images/avatars/default.png");
@@ -16594,7 +16629,12 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 				<div style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: #aaa;">${replyData.text}</div>
 			</div>` : '';
 	
-		let editedTag = msg.edited ? (msg.editedByAdmin ? ' <span style="font-size: 9px; opacity: 0.9; color: #ff4444; font-style: italic; font-weight: bold; margin-left: 5px;">(Edited by Admin)</span>' : ' <span style="font-size: 9px; opacity: 0.5; font-style: italic; margin-left: 5px;">(Edited)</span>') : '';
+		let editedTag = '';
+		if (msg.edited) {
+			if (msg.editedByAdmin) editedTag = ' <span style="font-size: 9px; opacity: 0.9; color: #ff4444; font-style: italic; font-weight: bold; margin-left: 5px;">(Edited by Admin)</span>';
+			else if (msg.editedByMod) editedTag = ' <span style="font-size: 9px; opacity: 0.9; color: #ffcc00; font-style: italic; font-weight: bold; margin-left: 5px;">(Edited by Mod)</span>';
+			else editedTag = ' <span style="font-size: 9px; opacity: 0.5; font-style: italic; margin-left: 5px;">(Edited)</span>';
+		}
 		
 		let reactionsHtml = (msg.reactions || []).map(r => 
 			`<div class="reaction-pill" 
@@ -16684,14 +16724,14 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 						onmouseout="this.style.opacity='0.5'; this.style.transform='scale(1)'" 
 						onclick="openReactionPicker(event, '${msgId}')"></i>
 					
-					${(isAuthor || isAdmin) ? `
+					${canEditOrDeleteMsg ? `
 					<i class="fas fa-edit" style="cursor: pointer; opacity: 0.5; color: #ff00ff; font-size: 12px; transition: all 0.2s; margin-left: 1px;" 
 						onmouseenter="if(typeof playUiArrow === 'function') playUiArrow()"
 						onmouseover="this.style.opacity='1'; this.style.transform='scale(1.2)'" 
 						onmouseout="this.style.opacity='0.5'; this.style.transform='scale(1)'" 
 						onclick="startEditMessage('${msgId}', decodeURIComponent('${encodedText}'), ${imagesJson})"></i>
 						
-					${isAdmin ? `
+					${canPinThisMsg ? `
 					<i id="pin-icon-${msgId}" class="fas fa-thumbtack" 
 						style="cursor: pointer; opacity: ${pinnedMessages.some(p => p.id === String(msgId)) ? '1' : '0.4'}; color: #4caf50; font-size: 12.5px; transition: all 0.2s; margin-left: 2px; transform: rotate(45deg); filter: ${pinnedMessages.some(p => p.id === String(msgId)) ? 'drop-shadow(0 0 8px rgba(76, 175, 80, 0.9))' : 'none'};" 
 						onmouseenter="if(typeof playUiArrow === 'function') playUiArrow()"
@@ -16743,7 +16783,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 		const thumbnailWrapper = document.getElementById('pin-thumbnails-wrapper');
 		const myName = localStorage.getItem('psn_username');
 	
-		if (unpinBtn) unpinBtn.style.display = isAdmin ? 'block' : 'none';
+		if (unpinBtn) unpinBtn.style.display = (typeof window.canModerateSession === 'function' ? window.canModerateSession() : isAdmin) ? 'block' : 'none';
 		if (nav) nav.style.display = pinnedMessages.length > 1 ? 'flex' : 'none';
 		if (titleText) titleText.innerText = pinnedMessages.length > 1 ? "Pinned Messages" : "Pinned Message";
 	
@@ -16798,7 +16838,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 	}
 	
 	function togglePinMessage(msgId) {
-		if (!socketChat || !document.body.classList.contains('is-admin')) return;
+		if (!socketChat || !(typeof window.canModerateSession === 'function' ? window.canModerateSession() : document.body.classList.contains('is-admin'))) return;
 		
 		const myName = localStorage.getItem('psn_username');
 		const isPinned = pinnedMessages.find(p => p.id === String(msgId));
@@ -16908,6 +16948,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 
 	function initChat() {
 		document.body.classList.remove('is-admin');
+		document.body.classList.remove('is-mod');
 		if (typeof updateAdminVisibility === 'function') updateAdminVisibility();
 		const box = document.getElementById('chat-messages');
 		if (box) box.innerHTML = '';
@@ -16974,8 +17015,30 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 			});
 		});
 		
+		socketChat.on('role_updated', (data) => {
+			const myName = localStorage.getItem('psn_username') || '';
+			const role = String(data.role || (data.isAdmin ? 'admin' : 'user')).toLowerCase() === 'moderator' ? 'mod' : String(data.role || (data.isAdmin ? 'admin' : 'user')).toLowerCase();
+			if (myName) {
+				if (role && role !== 'user') localStorage.setItem(`${myName}_psn_role`, role);
+				else localStorage.removeItem(`${myName}_psn_role`);
+				if (data.isAdmin === true || role === 'admin') localStorage.setItem(`${myName}_psn_isAdmin`, 'true');
+				else localStorage.removeItem(`${myName}_psn_isAdmin`);
+			}
+			document.body.classList.toggle('is-admin', data.isAdmin === true || role === 'admin');
+			document.body.classList.toggle('is-mod', data.isModerator === true || role === 'mod');
+			if (typeof updateAdminVisibility === 'function') updateAdminVisibility();
+			if (window.messageHistory && window.messageHistory.length > 0) {
+				const box = document.getElementById('chat-messages');
+				if (box) {
+					box.innerHTML = '';
+					window.messageHistory.forEach(m => appendMessageToChat(m, m.user === myName));
+					box.scrollTop = box.scrollHeight;
+				}
+			}
+		});
+		
 		socketChat.on('auth_success', (data) => {
-			const { name, userData, isAdmin } = data;
+			const { name, userData, isAdmin, role, isModerator } = data;
 			
 			if (userData.trophiesData && Object.keys(userData.trophiesData).length > 0) {
 				window.userTrophies = userData.trophiesData;
@@ -17094,18 +17157,27 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 				}
 			}
 			
+			const sessionRole = String(role || userData.role || (isAdmin ? 'admin' : '') || '').toLowerCase() === 'moderator' ? 'mod' : String(role || userData.role || (isAdmin ? 'admin' : 'user')).toLowerCase();
+			if (sessionRole && sessionRole !== 'user') localStorage.setItem(`${name}_psn_role`, sessionRole);
+			else localStorage.removeItem(`${name}_psn_role`);
+			document.body.classList.toggle('is-mod', sessionRole === 'mod' || isModerator === true);
+			document.body.classList.toggle('is-banned-user', sessionRole === 'banned' || userData.banned === true || userData.isBanned === true);
+
 			if (isAdmin) {
 				document.body.classList.add('is-admin');
 				localStorage.setItem(`${name}_psn_isAdmin`, 'true');
+			} else {
+				document.body.classList.remove('is-admin');
+				localStorage.removeItem(`${name}_psn_isAdmin`);
+			}
+
+			if ((isAdmin || sessionRole === 'mod' || isModerator === true) && window.messageHistory && window.messageHistory.length > 0) {
 				const box = document.getElementById('chat-messages');
-				if (box && window.messageHistory && window.messageHistory.length > 0) {
+				if (box) {
 					box.innerHTML = '';
 					window.messageHistory.forEach(m => appendMessageToChat(m, m.user === name));
 					box.scrollTop = box.scrollHeight;
 				}
-			} else {
-				document.body.classList.remove('is-admin');
-				localStorage.removeItem(`${name}_psn_isAdmin`);
 			}
 
 			if (typeof updateAdminVisibility === 'function') updateAdminVisibility();
@@ -17650,7 +17722,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 					`<a href="${url}" target="_blank" style="color: #ffffff; text-decoration: underline; word-break: break-all;">${url}</a>`
 				);
 		
-				let badge = data.editedByAdmin ? ' <span style="font-size: 9px; opacity: 0.8; color: #ff4444; font-weight: bold;">(Edited by Admin)</span>' : ' <span style="font-size: 9px; opacity: 0.5; font-style: italic;">(Edited)</span>';
+				let badge = data.editedByAdmin ? ' <span style="font-size: 9px; opacity: 0.8; color: #ff4444; font-weight: bold;">(Edited by Admin)</span>' : (data.editedByMod ? ' <span style="font-size: 9px; opacity: 0.8; color: #ffcc00; font-weight: bold;">(Edited by Mod)</span>' : ' <span style="font-size: 9px; opacity: 0.5; font-style: italic;">(Edited)</span>');
 				
 				textContainer.innerHTML = formatted + badge;
 				textContainer.style.marginTop = (data.content || ytId) ? "10px" : "0px";
@@ -18142,8 +18214,9 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 		const myName = localStorage.getItem('psn_username') || "Guest";
 		const myAvatar = localStorage.getItem(`${myName}_psn_avatar`) || "";
 		const isAdmin = document.body.classList.contains('is-admin');
+		const canModerate = typeof window.canModerateSession === 'function' ? window.canModerateSession() : isAdmin;
 
-		if (!isAdmin && typeof window.adminGetChatControls === 'function') {
+		if (!canModerate && typeof window.adminGetChatControls === 'function') {
 			const controls = window.adminGetChatControls();
 			if (controls.locked) {
 				if (typeof playUiError === 'function') playUiError();
@@ -18199,13 +18272,17 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 		}
 	
 		if (plainText.toLowerCase().startsWith('/kick')) {
-			if (isAdmin) {
+			if (canModerate) {
 				let targetName = plainText.split(' ').slice(1).join(' ').replace('@', '').trim();
 				const targetUser = currentOnlineList.find(u => (u.name || u).toLowerCase() === targetName.toLowerCase());
 	
 				if (targetUser && targetUser.id) {
-					if (confirm(`Kick ${targetUser.name}?`)) {
-						socketChat.emit('kick_user', { targetId: targetUser.id, adminUser: myName });
+					const canKickTarget = typeof window.canModerateChat === 'function' ? window.canModerateChat(targetUser.name || targetName, targetUser) : isAdmin;
+					if (!canKickTarget) {
+						alert("You cannot kick this user.");
+						if (typeof playUiError === 'function') playUiError();
+					} else if (confirm(`Kick ${targetUser.name}?`)) {
+						socketChat.emit('kick_user', { targetId: targetUser.id, targetName: targetUser.name || targetName, adminUser: myName });
 						if (typeof playUiSuccess === 'function') playUiSuccess();
 					}
 				} else {
@@ -18213,7 +18290,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 					if (typeof playUiError === 'function') playUiError();
 				}
 			} else {
-				alert("Only admins can use the /kick command.");
+				alert("Only admins/moderators can use the /kick command.");
 				if (typeof playUiError === 'function') playUiError();
 			}
 			input.innerHTML = '';
@@ -18253,7 +18330,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 		};
 		
 		socketChat.emit('chat_message', data);
-		if (!isAdmin) localStorage.setItem('psn_chat_last_sent_at', String(Date.now()));
+		if (!canModerate) localStorage.setItem('psn_chat_last_sent_at', String(Date.now()));
 	
 		let messagesSent = parseInt(localStorage.getItem('psn_chat_msgs_sent') || '0') + 1;
 		localStorage.setItem('psn_chat_msgs_sent', messagesSent);
@@ -19227,7 +19304,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 							onclick="event.stopPropagation(); toggleFriend('${username}', '${userAvatar}'); updateSpecificUserRow('${targetSocketId}', '${username}');">
 						<i class="fas ${isFriend ? 'fa-user-minus' : 'fa-user-plus'}"></i>
 					</button>
-					${isAdmin ? `
+					${((typeof window.canModerateChat === 'function' ? window.canModerateChat(username, userObj) : isAdmin) && targetSocketId) ? `
 						<button class="btn-mini-round btn-kick-action" 
 								onmouseenter="if(typeof playUiArrow === 'function') playUiArrow()"
 								title="Kick User" 
@@ -19276,8 +19353,9 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 			}
 	
 			socketChat.emit('kick_user', { 
-				targetId: socketId, 
-				adminUser: myName, 
+				targetId: socketId,
+				targetName: name,
+				adminUser: myName 
 			});
 	
 			if (typeof playUiBackspace === 'function') playUiBackspace();
