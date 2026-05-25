@@ -17,7 +17,7 @@ const APP_URLS = [
   "https://psn-content-mwp5.onrender.com/ping",
 ];
 
-const ADMIN_USERS = ["Luan Teles"];
+const ADMIN_USERS = ["Luan Teles", "Goku Cheats"];
 
 const DEFAULT_AVATAR = "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/interface/modern/images/avatars/default.png";
 
@@ -899,6 +899,23 @@ io.on('connection', (socket) => {
       console.error('[ADMIN ANNOUNCEMENT ERROR]:', err);
       respond({ success: false, message: "Server error while updating announcement." });
     }
+  });
+
+  socket.on('admin_request_moderation_log', () => {
+    if (socket.isAdmin === true) {
+      socket.emit('admin_moderation_log_list', moderationLog);
+    }
+  });
+
+  socket.on('admin_clear_moderation_log', async () => {
+    if (socket.isAdmin !== true) return;
+    moderationLog = [];
+    try {
+      await pool.query('TRUNCATE moderation_log');
+    } catch (err) {
+      console.error('[ADMIN LOG CLEAR ERROR]:', err);
+    }
+    emitToAdmins('admin_moderation_log_list', moderationLog);
   });
 
   socket.on('admin_request_reports', () => {
