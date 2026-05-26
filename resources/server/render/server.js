@@ -853,7 +853,8 @@ io.on('connection', async (socket) => {
     callback({ success: false, message: "Invalid code." });
   });
 
-  socket.on('chat_message', async (msg) => {
+  socket.on('chat_message', async (msg, callback) => {
+    const respond = typeof callback === 'function' ? callback : () => {};
     let messageData = { ...(typeof msg === 'object' ? msg : { text: msg }), time: new Date().toISOString(), seenBy: [] };
     const isAdmin = socket.isAdmin === true;
     const canModerate = canModerateSocket(socket);
@@ -861,7 +862,9 @@ io.on('connection', async (socket) => {
     const senderName = socket.userName || messageData.user;
 
     if (senderName && userDatabase[senderName] && isUserBanned(userDatabase[senderName]) && !isAdmin) {
-      socket.emit('chat_blocked', { reason: 'banned', message: 'Your account is banned.' });
+      const blocked = { success: false, reason: 'banned', message: 'Your account is banned.' };
+      socket.emit('chat_blocked', blocked);
+      respond(blocked);
       return;
     }
 
@@ -910,7 +913,9 @@ io.on('connection', async (socket) => {
     if (!canModerate) {
       const controls = adminState.chatControls || {};
       if (controls.locked) {
-        socket.emit('chat_blocked', { reason: 'locked', message: 'Chat is locked by admin.', controls });
+        const blocked = { success: false, reason: 'locked', message: 'Chat is locked by admin.', controls };
+        socket.emit('chat_blocked', blocked);
+        respond(blocked);
         return;
       }
 
@@ -919,7 +924,9 @@ io.on('connection', async (socket) => {
         const elapsed = Date.now() - socket.lastChatAt;
         const waitMs = (slowSeconds * 1000) - elapsed;
         if (waitMs > 0) {
-          socket.emit('chat_blocked', { reason: 'slow_mode', waitSeconds: Math.ceil(waitMs / 1000), controls });
+          const blocked = { success: false, reason: 'slow_mode', waitSeconds: Math.ceil(waitMs / 1000), controls };
+          socket.emit('chat_blocked', blocked);
+          respond(blocked);
           return;
         }
       }
@@ -936,7 +943,8 @@ io.on('connection', async (socket) => {
     if (messageHistory.length > MAX_CHAT_HISTORY) messageHistory.shift(); 
 
     await pool.query('INSERT INTO chat (message) VALUES ($1)', [messageData]);
-    io.emit('chat_message', messageData); 
+    io.emit('chat_message', messageData);
+    respond({ success: true, message: messageData });
   });
 
 

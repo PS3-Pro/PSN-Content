@@ -9963,9 +9963,18 @@ body:not(.is-admin) #view-admin { display: none !important; }
 		}
 		try {
 			adminSetChatControlsSyncState('syncing');
-			socketChat.emit('admin_request_chat_controls', { at: Date.now() });
-			socketChat.emit('admin_request_admin_state', { at: Date.now() });
-				socketChat.emit('admin_request_server_log');
+			socketChat.emit('admin_request_chat_controls', { at: Date.now() }, response => {
+				if (response && response.state && typeof adminSetChatControls === 'function') {
+					adminSetChatControls({ ...response.state, source: 'server', serverSynced: true }, false);
+				}
+			});
+			socketChat.emit('admin_request_admin_state', { at: Date.now() }, response => {
+				const state = response && (response.state || response);
+				if (state && state.chatControls && typeof adminSetChatControls === 'function') {
+					adminSetChatControls({ ...state.chatControls, source: 'server', serverSynced: true }, false);
+				}
+			});
+			socketChat.emit('admin_request_server_log');
 			window.adminChatControlsLastRequested = Date.now();
 			setTimeout(() => {
 				if (window.adminChatControlsSyncState === 'syncing' && Date.now() - (window.adminChatControlsLastRequested || 0) > 2400) {
@@ -10294,14 +10303,20 @@ body:not(.is-admin) #view-admin { display: none !important; }
 	}
 
 	function adminStartChatControlsRealtimeSync() {
-		if (window.adminChatControlsRealtimeSyncTimer) return;
-		window.adminChatControlsRealtimeSyncTimer = setInterval(() => {
+		const requestVisualState = () => {
 			try {
 				if (typeof socketChat !== 'undefined' && socketChat && socketChat.connected) {
-					socketChat.emit('admin_request_chat_controls', { visualSync: true, at: Date.now() });
+					socketChat.emit('admin_request_chat_controls', { visualSync: true, at: Date.now() }, response => {
+						if (response && response.state && typeof adminSetChatControls === 'function') {
+							adminSetChatControls({ ...response.state, source: 'server', serverSynced: true }, false);
+						}
+					});
 				}
 			} catch (e) {}
-		}, 2500);
+		};
+		requestVisualState();
+		if (window.adminChatControlsRealtimeSyncTimer) return;
+		window.adminChatControlsRealtimeSyncTimer = setInterval(requestVisualState, 1000);
 	}
 
 	function adminStopChatControlsRealtimeSync() {
@@ -10789,6 +10804,12 @@ body:not(.is-admin) #view-admin { display: none !important; }
 		socketChat.on('admin_chat_controls_state', data => { adminSetChatControls({ ...(data || {}), source: 'server', serverSynced: true }, false); renderAdminPanel(); });
 		socketChat.on('chat_blocked', data => {
 			if (data && data.controls) adminSetChatControls({ ...data.controls, source: 'server', serverSynced: true }, false);
+			if (data && data.reason === 'slow_mode' && data.waitSeconds && data.controls && data.controls.slowSeconds) {
+				const slowMs = Math.max(0, parseInt(data.controls.slowSeconds || 0, 10) || 0) * 1000;
+				const waitMs = Math.max(0, parseInt(data.waitSeconds || 0, 10) || 0) * 1000;
+				localStorage.setItem('psn_chat_last_sent_at', String(Date.now() - Math.max(0, slowMs - waitMs)));
+			}
+			if (typeof playUiError === 'function') playUiError();
 			if (typeof adminUpdateChatControlsBanner === 'function') adminUpdateChatControlsBanner();
 		});
 		socketChat.on('admin_state', data => {
@@ -10813,6 +10834,14 @@ body:not(.is-admin) #view-admin { display: none !important; }
 			adminSetModerationLog(Array.isArray(list) ? list : []);
 			if (document.getElementById('view-admin')?.style.display === 'block') renderAdminPanel();
 		});
+
+		if (socketChat.connected) {
+			syncAdminHealth('online');
+			adminSetChatControlsSyncState('syncing');
+			if (typeof window.adminRequestChatControlsState === 'function') window.adminRequestChatControlsState();
+			if (typeof adminStartChatControlsRealtimeSync === 'function') adminStartChatControlsRealtimeSync();
+			if (typeof adminUpdateChatControlsBanner === 'function') setTimeout(adminUpdateChatControlsBanner, 60);
+		}
 	}
 
 	function adminBootExtras() {
@@ -18133,10 +18162,13 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 			}
 			socketChat = null;
 		}
+		window.adminSocketListenersInstalled = false;
+		window.adminSocketListenersSocket = null;
 		
 		if (typeof updateGlobalOnlineStatus === 'function') updateGlobalOnlineStatus('connecting');
 
-		socketChat = io(serverUrls[currentServerIndex], { forceNew: true })
+		socketChat = io(serverUrls[currentServerIndex], { forceNew: true });
+		if (typeof adminInstallSocketListeners === 'function') adminInstallSocketListeners();
 		
 		socketChat.on('connect', () => {
 			if (typeof updateGlobalOnlineStatus === 'function') updateGlobalOnlineStatus('online');
@@ -19520,7 +19552,27 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 			isGlobalPing: globalPingActive
 		};
 		
-		socketChat.emit('chat_message', data);
+		const sentDraftHtml = input.innerHTML;
+		const sentPendingImages = Array.isArray(pendingImages) ? [...pendingImages] : [];
+		socketChat.emit('chat_message', data, response => {
+			if (response && response.success === false) {
+				if (typeof playUiError === 'function') playUiError();
+				if (response.controls && typeof adminSetChatControls === 'function') {
+					adminSetChatControls({ ...response.controls, source: 'server', serverSynced: true }, false);
+				}
+				if (response.reason === 'slow_mode' && response.waitSeconds && response.controls && response.controls.slowSeconds) {
+					const slowMs = Math.max(0, parseInt(response.controls.slowSeconds || 0, 10) || 0) * 1000;
+					const waitMs = Math.max(0, parseInt(response.waitSeconds || 0, 10) || 0) * 1000;
+					localStorage.setItem('psn_chat_last_sent_at', String(Date.now() - Math.max(0, slowMs - waitMs)));
+				}
+				if (!input.innerHTML.trim() && sentDraftHtml) input.innerHTML = sentDraftHtml;
+				if (!pendingImages.length && sentPendingImages.length) {
+					pendingImages = sentPendingImages;
+					showImagePreview();
+				}
+				if (typeof adminUpdateChatControlsBanner === 'function') adminUpdateChatControlsBanner();
+			}
+		});
 		if (!canModerate) {
 			localStorage.setItem('psn_chat_last_sent_at', String(Date.now()));
 			if (typeof adminUpdateChatControlsBanner === 'function') setTimeout(adminUpdateChatControlsBanner, 0);
