@@ -1445,6 +1445,22 @@ div[id^="msg-row-"] { transition: opacity 0.4s ease, transform 0.4s cubic-bezier
 .artemis-loading-state i, .artemis-empty-state i { font-size: 26px; opacity: .8; }
 @media (max-width: 768px) { .artemis-game-head { flex-direction: column; align-items: stretch; } .artemis-actions { grid-template-columns: 1fr; } }
 
+/* ========================================================================== ARTEMIS CHEATS BUTTON STATES ========================================================================== */
+.btn-cheats { position: relative; overflow: hidden; isolation: isolate; white-space: nowrap; min-width: 0; line-height: 1; transition: all .22s ease, filter .22s ease; }
+.btn-cheats i, .btn-cheats span { position: relative; z-index: 2; flex: 0 0 auto; }
+.btn-cheats i { font-size: 8px; }
+.btn-cheats.cheat-searching { pointer-events: none; background: linear-gradient(135deg, #003d73, #0070cc, #00a8ff) !important; border-color: rgba(0, 212, 255, .85) !important; box-shadow: 0 0 16px rgba(0, 112, 204, .65), inset 0 0 18px rgba(255,255,255,.08) !important; color: #fff !important; }
+.btn-cheats.cheat-searching::before { content: ''; position: absolute; inset: 0; z-index: 1; background: linear-gradient(115deg, transparent 0%, transparent 28%, rgba(255,255,255,.26) 48%, transparent 68%, transparent 100%); transform: translateX(-120%); animation: artemisCheatScan 1.05s linear infinite; pointer-events: none; }
+.btn-cheats.cheat-searching::after { content: ''; position: absolute; left: 8px; right: 8px; bottom: 3px; height: 2px; z-index: 1; border-radius: 999px; background: linear-gradient(90deg, transparent, rgba(255,255,255,.95), transparent); animation: artemisCheatLine 1.05s ease-in-out infinite; pointer-events: none; }
+.btn-cheats.cheat-found { background: linear-gradient(135deg, #00695c, #00a878) !important; border-color: rgba(76, 255, 190, .75) !important; box-shadow: 0 0 14px rgba(0, 168, 120, .48) !important; }
+.btn-cheats.cheat-missing, .btn-cheats.cheat-error { background: linear-gradient(135deg, #5a1017, #c62828) !important; border-color: rgba(255, 68, 68, .9) !important; color: #fff !important; box-shadow: 0 0 15px rgba(255, 68, 68, .35) !important; }
+.btn-cheats.cheat-missing { animation: artemisCheatNope .34s ease; }
+.btn-cheats.cheat-error { animation: artemisCheatNope .34s ease; }
+@keyframes artemisCheatScan { 0% { transform: translateX(-120%); } 100% { transform: translateX(120%); } }
+@keyframes artemisCheatLine { 0%, 100% { opacity: .25; transform: scaleX(.55); } 50% { opacity: 1; transform: scaleX(1); } }
+@keyframes artemisCheatNope { 0%, 100% { transform: translateX(0); } 20% { transform: translateX(-3px); } 40% { transform: translateX(3px); } 60% { transform: translateX(-2px); } 80% { transform: translateX(2px); } }
+
+
 
 
 /* ========================================================================== ADMIN PANEL ========================================================================== */
@@ -13715,7 +13731,88 @@ body:not(.is-admin) #view-admin { display: none !important; }
 		}
 	};
 
-	window.openArtemisCheatsModal = async function(titleId, title, appVersion = '') {
+
+
+	function setArtemisCheatsButtonState(button, state = 'idle') {
+		if (!button) return;
+		if (!button.dataset.cheatsOriginalHtml) button.dataset.cheatsOriginalHtml = button.innerHTML;
+		button.classList.remove('cheat-searching', 'cheat-found', 'cheat-missing', 'cheat-error');
+		button.disabled = false;
+
+		if (state === 'loading') {
+			button.disabled = true;
+			button.classList.add('cheat-searching');
+			button.title = 'Searching compatible Artemis cheats...';
+			button.innerHTML = '<i class="fas fa-layer-group"></i> CHECK';
+			return;
+		}
+
+		if (state === 'found') {
+			button.classList.add('cheat-found');
+			button.title = 'Compatible cheats found.';
+			button.innerHTML = '<i class="fas fa-check-circle"></i> CHEATS';
+			return;
+		}
+
+		if (state === 'missing') {
+			button.classList.add('cheat-missing');
+			button.title = 'No compatible Artemis cheats found for this Title ID/version.';
+			button.innerHTML = '<i class="fas fa-times-circle"></i> CHEATS';
+			return;
+		}
+
+		if (state === 'error') {
+			button.classList.add('cheat-error');
+			button.title = 'Could not check the cheat database.';
+			button.innerHTML = '<i class="fas fa-wifi"></i> CHEATS';
+			return;
+		}
+
+		button.title = 'Check Artemis Cheats';
+		button.innerHTML = button.dataset.cheatsOriginalHtml || '<i class="fas fa-wand-magic-sparkles"></i> CHEATS';
+	}
+
+	window.checkAndOpenArtemisCheats = async function(button, titleId, title, appVersion = '') {
+		const cleanTitleId = String(titleId || window.myCurrentPS3Status?.titleId || '').toUpperCase().trim();
+		const cleanTitle = String(title || window.myCurrentPS3Status?.title || 'Current Game').trim();
+		const cleanVersion = normalizeGameVersion(appVersion || window.myCurrentPS3Status?.appVersion || '');
+
+		if (!cleanTitleId || !/^[A-Z]{4}\d{5}$/.test(cleanTitleId)) {
+			setArtemisCheatsButtonState(button, 'error');
+			if (typeof playUiError === 'function') playUiError();
+			alert('No valid PS3 Title ID was detected for the current game.');
+			return;
+		}
+
+		try {
+			if (typeof playUiClick === 'function') playUiClick();
+			setArtemisCheatsButtonState(button, 'loading');
+
+			const [index] = await Promise.all([
+				loadArtemisCheatsIndex(),
+				waitArtemis(450)
+			]);
+			const candidates = findArtemisCheatCandidates(index, cleanTitleId, cleanVersion);
+
+			if (!candidates.length) {
+				setArtemisCheatsButtonState(button, 'missing');
+				if (typeof playUiError === 'function') playUiError();
+				if (typeof showNotification === 'function') showNotification(`No Artemis cheats found for ${cleanTitleId}.`, 'warning');
+				return;
+			}
+
+			setArtemisCheatsButtonState(button, 'found');
+			await waitArtemis(180);
+			openArtemisCheatsModal(cleanTitleId, cleanTitle, cleanVersion, candidates);
+		} catch (err) {
+			console.error(err);
+			setArtemisCheatsButtonState(button, 'error');
+			if (typeof playUiError === 'function') playUiError();
+			if (typeof showNotification === 'function') showNotification('Could not check the Artemis cheat database.', 'error');
+		}
+	};
+
+	window.openArtemisCheatsModal = async function(titleId, title, appVersion = '', preloadedCandidates = null) {
 		const cleanTitleId = String(titleId || window.myCurrentPS3Status?.titleId || '').toUpperCase().trim();
 		const cleanTitle = String(title || window.myCurrentPS3Status?.title || 'Current Game').trim();
 		const cleanVersion = normalizeGameVersion(appVersion || window.myCurrentPS3Status?.appVersion || '');
@@ -13771,8 +13868,9 @@ body:not(.is-admin) #view-admin { display: none !important; }
 		if (typeof playUiModal === 'function') playUiModal();
 
 		try {
-			const index = await loadArtemisCheatsIndex();
-			const candidates = findArtemisCheatCandidates(index, cleanTitleId, cleanVersion);
+			const candidates = Array.isArray(preloadedCandidates)
+				? preloadedCandidates
+				: findArtemisCheatCandidates(await loadArtemisCheatsIndex(), cleanTitleId, cleanVersion);
 			window.currentArtemisCheatState = { titleId: cleanTitleId, title: cleanTitle, appVersion: cleanVersion, candidates, selectedFile: null, cheats: [], rawText: '' };
 
 			if (!candidates.length) {
@@ -14262,7 +14360,7 @@ body:not(.is-admin) #view-admin { display: none !important; }
 						<button class="btn-mini btn-upd" onmouseenter="playUiHover()" onclick="if(confirm('Are you sure you want to exit the game?')) { playUiClick(); fetch('http://${ip}/xmb.ps3$exit', {mode:'no-cors'}); }" title="Exit to XMB">
 							<i class="fas fa-sign-out-alt"></i> EXIT
 						</button>
-						<button class="btn-mini btn-multi" onmouseenter="playUiHover()" onclick="playUiClick(); openArtemisCheatsModal(decodeURIComponent('${cheatsTitleId}'), decodeURIComponent('${cheatsTitle}'), decodeURIComponent('${cheatsVersion}'))" title="Open Artemis Cheats">
+						<button class="btn-mini btn-multi btn-cheats" onmouseenter="playUiHover()" onclick="checkAndOpenArtemisCheats(this, decodeURIComponent('${cheatsTitleId}'), decodeURIComponent('${cheatsTitle}'), decodeURIComponent('${cheatsVersion}'))" title="Check Artemis Cheats">
 							<i class="fas fa-wand-magic-sparkles"></i> CHEATS
 						</button>
 					</div>`;
@@ -14778,7 +14876,7 @@ body:not(.is-admin) #view-admin { display: none !important; }
 						<button class="btn-mini btn-upd" onmouseenter="playUiHover()" onclick="if(confirm('Are you sure you want to exit the game?')) { playUiClick(); fetch('http://${ip}/xmb.ps3$exit', {mode:'no-cors'}); }" title="Exit to XMB">
 							<i class="fas fa-sign-out-alt"></i> EXIT
 						</button>
-						<button class="btn-mini btn-multi" onmouseenter="playUiHover()" onclick="playUiClick(); openArtemisCheatsModal(decodeURIComponent('${cheatsTitleId}'), decodeURIComponent('${cheatsTitle}'), decodeURIComponent('${cheatsVersion}'))" title="Open Artemis Cheats">
+						<button class="btn-mini btn-multi btn-cheats" onmouseenter="playUiHover()" onclick="checkAndOpenArtemisCheats(this, decodeURIComponent('${cheatsTitleId}'), decodeURIComponent('${cheatsTitle}'), decodeURIComponent('${cheatsVersion}'))" title="Check Artemis Cheats">
 							<i class="fas fa-wand-magic-sparkles"></i> CHEATS
 						</button>
 					</div>`;
