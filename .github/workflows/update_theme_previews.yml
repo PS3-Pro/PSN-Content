@@ -25,6 +25,11 @@ on:
         required: false
         default: false
         type: boolean
+      keep_extracted:
+        description: "Keep temporary extracted files for debugging"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -57,12 +62,17 @@ jobs:
           TITLE_ID: ${{ github.event.inputs.title_id }}
           CONTENT_ID: ${{ github.event.inputs.content_id }}
           OVERWRITE: ${{ github.event.inputs.overwrite }}
+          KEEP_EXTRACTED: ${{ github.event.inputs.keep_extracted }}
         shell: bash
         run: |
-          args=(--repo . --source "${SOURCE_TO_PROCESS:-all}" --download-dir "$RUNNER_TEMP/theme_pkgs" --tool-dir "$RUNNER_TEMP/theme_tools")
+          args=(--repo . --source "${SOURCE_TO_PROCESS:-all}" --download-dir "$RUNNER_TEMP/theme_pkgs")
 
           if [[ "${OVERWRITE:-false}" == "true" ]]; then
             args+=(--overwrite)
+          fi
+
+          if [[ "${KEEP_EXTRACTED:-false}" == "true" ]]; then
+            args+=(--keep-extracted)
           fi
 
           for id in $(echo "${TITLE_ID:-}" | tr ',;' '  '); do
@@ -83,9 +93,13 @@ jobs:
         if: always()
         shell: bash
         run: |
-          rm -rf "$RUNNER_TEMP/theme_pkgs" "$RUNNER_TEMP/theme_tools" || true
+          rm -rf "$RUNNER_TEMP/theme_pkgs" || true
+          rm -rf .cache/ps3theme-p3t-extract .cache/run_p3t_extract.php || true
+          if [[ "${{ github.event.inputs.keep_extracted }}" != "true" ]]; then
+            rm -rf .cache/theme_extract || true
+          fi
 
-      - name: Commit generated theme previews only
+      - name: Commit generated theme PNGs only
         shell: bash
         run: |
           git config --global user.name "PS3-Pro Bot"
@@ -94,7 +108,7 @@ jobs:
           git add resources/database/themes
 
           if git diff --cached --quiet; then
-            echo "No new theme preview PNGs to commit."
+            echo "No new theme previews to commit."
           else
             git commit -m "Auto-update: Generate theme previews"
             git push

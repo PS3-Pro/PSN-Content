@@ -1,23 +1,18 @@
 #!/usr/bin/env python3
 """
-Extract PS3 theme preview PNGs from theme TSV rows and save them as:
+Generate PS3 theme preview PNGs from PSN theme PKGs listed in themes.tsv.
 
+Output format:
     resources/database/themes/<TITLE_ID>/<CONTENT_ID>.png
 
-This follows the avatar-cover workflow style, but themes usually store the
-actual .p3t inside a .p3t.edat. The pipeline is:
-
-    TSV row -> PKG -> .p3t.edat -> decrypted .p3t -> preview.png -> repo PNG
-
-Dependencies:
-    pip install pycryptodomex pillow
-
-System dependencies for P3T/GIM conversion:
-    php-cli php-gd git unzip
-
-Optional, but recommended:
-    Run from the repository root:
-        python .github/scripts/generate_theme_previews.py --repo . --source pending --title-id BLES00354
+This script:
+  1. Reads theme entries from official/pending TSV files.
+  2. Downloads each PKG.
+  3. Extracts the PKG.
+  4. Finds .p3t.edat files.
+  5. Decrypts EDAT using RAP/free-key candidates and multiple EDAT layout variants.
+  6. Extracts the decrypted P3T with hoshadiq/ps3theme-p3t-extract.
+  7. Selects preview.png over icon.png and writes a normalized PNG.
 """
 
 from __future__ import annotations
@@ -35,6 +30,7 @@ import sys
 import tempfile
 import urllib.parse
 import urllib.request
+import zipfile
 import zlib
 from dataclasses import dataclass
 from pathlib import Path
@@ -75,11 +71,13 @@ def sha256_file(path: Path) -> str:
 def download_file(url: str, dest: Path, log: Callable[[str], None]) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_suffix(dest.suffix + ".part")
-    request = urllib.request.Request(
-        url,
-        headers={"User-Agent": "PS3-Pro-Theme-Preview-Generator/1.0"},
-    )
 
+    headers = {"User-Agent": "PS3-Pro-Theme-Preview-Generator/1.0"}
+    token = os.environ.get("GITHUB_TOKEN")
+    if token and "api.github.com" in url:
+        headers["Authorization"] = f"Bearer {token}"
+
+    request = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(request, timeout=120) as response, tmp.open("wb") as out:
         total = int(response.headers.get("Content-Length") or 0)
         downloaded = 0
@@ -88,37 +86,15 @@ def download_file(url: str, dest: Path, log: Callable[[str], None]) -> None:
             chunk = response.read(1024 * 1024)
             if not chunk:
                 break
-
             out.write(chunk)
             downloaded += len(chunk)
 
         if total:
-            log(f"    Downloaded {downloaded / 1024:.1f} KB / {total / 1024:.1f} KB")
+            log(f"    Downloaded {downloaded / 1024 / 1024:.2f} MB / {total / 1024 / 1024:.2f} MB")
         else:
-            log(f"    Downloaded {downloaded / 1024:.1f} KB")
+            log(f"    Downloaded {downloaded / 1024 / 1024:.2f} MB")
 
     tmp.replace(dest)
-
-
-def extract_title_id_from_content_id(content_id: str) -> str:
-    # Example: EP0002-BLES00354_00-CODWAWTHEME00001 -> BLES00354
-    match = re.search(r"([A-Z]{4}\d{5})", content_id or "", flags=re.I)
-    return match.group(1).upper() if match else ""
-
-
-def extract_title_id_from_pkg_url(pkg_url: str) -> str:
-    # Example: /EP0002/BLES00354_00/...pkg -> BLES00354
-    match = re.search(r"/([A-Z]{4}\d{5})_", pkg_url or "", flags=re.I)
-    return match.group(1).upper() if match else ""
-
-
-def resolved_title_id(row_title_id: str, content_id: str, pkg_url: str) -> str:
-    # Prefer IDs encoded in the Content ID / URL because they catch malformed TSV rows.
-    return (
-        extract_title_id_from_content_id(content_id)
-        or extract_title_id_from_pkg_url(pkg_url)
-        or (row_title_id or "").upper()
-    )
 
 
 # -----------------------------------------------------------------------------
@@ -139,15 +115,15 @@ class ThemeEntry:
 
 
 COLUMN_ALIASES = {
-    "title_id": ["Title ID", "TitleID", "TITLE_ID", "id"],
+    "title_id": ["Title ID", "TitleID", "TITLE_ID", "id", "ID"],
     "region": ["Region", "REGION"],
     "name": ["Name", "Title", "NAME"],
     "pkg_url": ["PKG direct link", "PKG", "URL", "pkgUrl"],
     "rap_hex": ["RAP", "rap"],
     "content_id": ["Content ID", "ContentID", "CONTENT_ID", "contentId"],
     "sha256": ["SHA256", "sha256", "SHA-256"],
-    "size": ["Size", "SIZE", "File Size"],
-    "date": ["Date", "DATE", "Modified", "Last Modified"],
+    "size": ["Size", "SIZE"],
+    "date": ["Date", "DATE"],
 }
 
 
@@ -158,25 +134,49 @@ def get_col(row: dict[str, str], key: str) -> str:
     return ""
 
 
+def entry_from_list(cols: list[str]) -> ThemeEntry | None:
+    def get(i: int, default: str = "") -> str:
+        return cols[i].strip() if i < len(cols) else default
+
+    title_id = get(0).upper()
+    pkg_url = get(3)
+    content_id = get(5)
+
+    if not title_id or not pkg_url or pkg_url.upper() == "MISSING" or not content_id:
+        return None
+
+    return ThemeEntry(
+        title_id=title_id,
+        region=get(1),
+        name=get(2),
+        pkg_url=pkg_url,
+        rap_hex=get(4),
+        content_id=content_id,
+        size=get(8),
+        date=get(11),
+    )
+
+
 def read_theme_tsv(path: Path) -> list[ThemeEntry]:
     entries: list[ThemeEntry] = []
+    if not path.exists():
+        return entries
 
     with path.open("r", encoding="utf-8-sig", newline="") as f:
-        sample = f.read(4096)
+        sample = f.readline()
         f.seek(0)
 
-        # Headered TSV is preferred. If the file has no recognized header, fall back to positional.
-        first_line = sample.splitlines()[0] if sample.splitlines() else ""
-        has_header = any(alias in first_line for aliases in COLUMN_ALIASES.values() for alias in aliases)
+        first_cols = next(csv.reader([sample], delimiter="\t"), [])
+        header_like = any(col in first_cols for col in COLUMN_ALIASES["pkg_url"] + COLUMN_ALIASES["content_id"])
 
-        if has_header:
+        if header_like:
             reader = csv.DictReader(f, delimiter="\t")
             for row in reader:
                 title_id = get_col(row, "title_id").upper()
                 pkg_url = get_col(row, "pkg_url")
                 content_id = get_col(row, "content_id")
 
-                if not title_id or not pkg_url or pkg_url.upper() == "MISSING":
+                if not title_id or not pkg_url or pkg_url.upper() == "MISSING" or not content_id:
                     continue
 
                 entries.append(
@@ -195,28 +195,9 @@ def read_theme_tsv(path: Path) -> list[ThemeEntry]:
         else:
             reader = csv.reader(f, delimiter="\t")
             for cols in reader:
-                if not cols or len(cols) < 6:
-                    continue
-
-                title_id = cols[0].strip().upper()
-                pkg_url = cols[3].strip()
-                content_id = cols[5].strip()
-
-                if not title_id or not pkg_url or pkg_url.upper() == "MISSING":
-                    continue
-
-                entries.append(
-                    ThemeEntry(
-                        title_id=title_id,
-                        region=cols[1].strip() if len(cols) > 1 else "",
-                        name=cols[2].strip() if len(cols) > 2 else "",
-                        pkg_url=pkg_url,
-                        rap_hex=cols[4].strip() if len(cols) > 4 else "",
-                        content_id=content_id,
-                        size=cols[8].strip() if len(cols) > 8 else "",
-                        date=cols[11].strip() if len(cols) > 11 else "",
-                    )
-                )
+                entry = entry_from_list(cols)
+                if entry:
+                    entries.append(entry)
 
     return entries
 
@@ -226,22 +207,88 @@ def read_all_entries(paths: Iterable[Path]) -> list[ThemeEntry]:
     seen: set[tuple[str, str, str]] = set()
 
     for path in paths:
-        if not path.exists():
-            continue
-
         for entry in read_theme_tsv(path):
             key = (entry.title_id, entry.content_id, entry.pkg_url)
             if key in seen:
                 continue
-
             seen.add(key)
             entries.append(entry)
 
     return entries
 
 
+def extract_title_id_from_content_id(content_id: str) -> str:
+    match = re.search(r"([A-Z]{4}\d{5})", content_id or "", flags=re.I)
+    return match.group(1).upper() if match else ""
+
+
+def extract_title_id_from_pkg_url(pkg_url: str) -> str:
+    match = re.search(r"/([A-Z]{4}\d{5})_", pkg_url or "", flags=re.I)
+    return match.group(1).upper() if match else ""
+
+
+def fixed_title_id(entry: ThemeEntry) -> str:
+    return (
+        extract_title_id_from_content_id(entry.content_id)
+        or extract_title_id_from_pkg_url(entry.pkg_url)
+        or entry.title_id
+    ).upper()
+
+
+def rap_hex_to_bytes(rap_hex: str) -> bytes | None:
+    rap_hex = (rap_hex or "").strip()
+    if not rap_hex or rap_hex.upper() == "MISSING":
+        return None
+    if not re.fullmatch(r"[0-9a-fA-F]{32}", rap_hex):
+        return None
+    return bytes.fromhex(rap_hex)
+
+
 # -----------------------------------------------------------------------------
-# PKG extractor core
+# RAP -> RIF/key candidates
+# -----------------------------------------------------------------------------
+
+def rap_to_rif(rap_data: bytes) -> bytes | None:
+    if not rap_data or len(rap_data) < 16:
+        return None
+
+    rap_key = b"\x86\x9F\x77\x45\xC1\x3F\xD8\x90\xCC\xF2\x91\x88\xE3\xCC\x3E\xDF"
+    rap_pbox = [0x0C, 0x03, 0x06, 0x04, 0x01, 0x0B, 0x0F, 0x08, 0x02, 0x07, 0x00, 0x05, 0x0A, 0x0E, 0x0D, 0x09]
+    rap_e1 = [0xA9, 0x3E, 0x1F, 0xD6, 0x7C, 0x55, 0xA3, 0x29, 0xB7, 0x5F, 0xDD, 0xA6, 0x2A, 0x95, 0xC7, 0xA5]
+    rap_e2 = [0x67, 0xD4, 0x5D, 0xA3, 0x29, 0x6D, 0x00, 0x6A, 0x4E, 0x7C, 0x53, 0x7B, 0xF5, 0x53, 0x8C, 0x74]
+
+    key = bytearray(16)
+    iv = bytearray(16)
+    cipher = AES.new(rap_key, AES.MODE_CBC, iv)
+    key[:] = cipher.decrypt(rap_data[:16])
+
+    for _round_num in range(5):
+        for i in range(16):
+            p = rap_pbox[i]
+            key[p] ^= rap_e1[p]
+
+        for i in range(15, 0, -1):
+            p = rap_pbox[i]
+            pp = rap_pbox[i - 1]
+            key[p] ^= key[pp]
+
+        carry = 0
+        for i in range(16):
+            p = rap_pbox[i]
+            kc = key[p] - carry
+            ec2 = rap_e2[p]
+
+            if carry != 1 or kc != 0xFF:
+                carry = 1 if kc < ec2 else 0
+                key[p] = (kc - ec2) & 0xFF
+            else:
+                key[p] = kc & 0xFF
+
+    return bytes(key)
+
+
+# -----------------------------------------------------------------------------
+# PKG extractor
 # -----------------------------------------------------------------------------
 
 PKG_MAGIC = b"\x7fPKG"
@@ -331,13 +378,11 @@ def decrypt_pkg_region(f, hdr: dict, stream_pos: int, size: int) -> bytes:
         qa_digest = hdr["qa_digest"]
         block_index = block_start // 16
         plaintext = bytearray()
-
         for i, offset in enumerate(range(0, len(enc), 16)):
-            chunk = enc[offset:offset + 16]
+            chunk = enc[offset : offset + 16]
             keystream = get_debug_keystream_block(qa_digest, block_index + i)
             plaintext.extend(a ^ b for a, b in zip(chunk, keystream))
-
-        return bytes(plaintext)[prefix_len:prefix_len + size]
+        return bytes(plaintext)[prefix_len : prefix_len + size]
 
     iv = hdr["iv"]
     iv_int = int.from_bytes(iv, "big")
@@ -345,7 +390,7 @@ def decrypt_pkg_region(f, hdr: dict, stream_pos: int, size: int) -> bytes:
     ctr = Counter.new(128, initial_value=ctr_val)
     cipher = AES.new(PS3_NPDRM_KEY, AES.MODE_CTR, counter=ctr)
     plaintext = cipher.decrypt(enc)
-    return plaintext[prefix_len:prefix_len + size]
+    return plaintext[prefix_len : prefix_len + size]
 
 
 def parse_sfo(data: bytes) -> dict | None:
@@ -360,15 +405,13 @@ def parse_sfo(data: bytes) -> dict | None:
     for i in range(entry_count):
         entry_off = 0x14 + i * 0x10
         key_off, _fmt, size, _max_size, data_off = struct.unpack_from("<HHIII", data, entry_off)
-
         key_start = key_table_start + key_off
         key_end = data.find(b"\0", key_start)
         if key_end == -1:
             continue
-
         key = data[key_start:key_end].decode("utf-8", errors="ignore")
         val_start = data_table_start + data_off
-        raw = data[val_start:val_start + size]
+        raw = data[val_start : val_start + size]
         value = raw.rstrip(b"\0").decode("utf-8", errors="ignore")
         result[key] = value
 
@@ -399,12 +442,10 @@ def resolve_path_pkg_dest(raw_name: str, dest_root: Path) -> Path | None:
         result.resolve().relative_to(dest_root.resolve())
     except ValueError:
         return None
-
     return result
 
 
 def extract_pkg(pkg_path: Path, dest_root: Path, fallback_folder: str, log: Callable[[str], None]) -> Path:
-    """Extract PKG and return the folder where the extracted files were written."""
     with pkg_path.open("rb") as f:
         hdr = read_pkg_header(f)
         item_count = hdr["item_count"]
@@ -414,9 +455,8 @@ def extract_pkg(pkg_path: Path, dest_root: Path, fallback_folder: str, log: Call
 
         table_raw = decrypt_pkg_region(f, hdr, 0, item_count * ITEM_RECORD_SIZE)
         items = []
-
         for i in range(item_count):
-            rec = table_raw[i * ITEM_RECORD_SIZE:(i + 1) * ITEM_RECORD_SIZE]
+            rec = table_raw[i * ITEM_RECORD_SIZE : (i + 1) * ITEM_RECORD_SIZE]
             name_off, name_size, item_data_off, item_data_size, flags, _ = struct.unpack(ITEM_FMT, rec)
             items.append((name_off, name_size, item_data_off, item_data_size, flags))
 
@@ -441,15 +481,11 @@ def extract_pkg(pkg_path: Path, dest_root: Path, fallback_folder: str, log: Call
         path_pkg = is_path_pkg(raw_names)
         output_root = dest_root if path_pkg else dest_root / safe_filename(pkg_title_id or fallback_folder)
 
-        if path_pkg:
-            log("    Detected path-traversal style PKG; using virtual root extraction.")
-
         for (name_off, name_size, item_data_off, item_data_size, flags), raw_name in zip(items, raw_names):
             if name_size <= 0 or not raw_name or raw_name in (".", ".."):
                 continue
 
             is_dir = bool(flags & FLAG_DIR)
-
             if path_pkg:
                 dest = resolve_path_pkg_dest(raw_name, dest_root)
                 if dest is None:
@@ -469,19 +505,16 @@ def extract_pkg(pkg_path: Path, dest_root: Path, fallback_folder: str, log: Call
 
             if dest.parent.exists() and dest.parent.is_file():
                 dest.parent.unlink()
-
             dest.parent.mkdir(parents=True, exist_ok=True)
+
             written = 0
             chunk_size = 512 * 1024
-
             with dest.open("wb") as out:
                 while written < item_data_size:
                     size = min(chunk_size, item_data_size - written)
                     data = decrypt_pkg_region(f, hdr, item_data_off + written, size)
-
                     if not data:
                         raise IOError("Unexpected EOF while decrypting PKG")
-
                     out.write(data)
                     written += len(data)
 
@@ -489,7 +522,7 @@ def extract_pkg(pkg_path: Path, dest_root: Path, fallback_folder: str, log: Call
 
 
 # -----------------------------------------------------------------------------
-# EDAT -> P3T decryptor
+# EDAT decryptor with multiple key/layout/IV attempts
 # -----------------------------------------------------------------------------
 
 NP_KLIC_FREE = b"\x72\xF9\x90\x78\x8F\x9C\xFF\x74\x57\x25\xF0\x8E\x4C\x12\x83\x87"
@@ -511,7 +544,6 @@ def maybe_zlib_decompress(data: bytes) -> bytes:
             return zlib.decompress(data, wbits)
         except zlib.error:
             pass
-
     return data
 
 
@@ -522,17 +554,14 @@ def dec_section(metadata: bytes) -> tuple[int, int, int]:
     dec[1] = metadata[0xD] ^ metadata[0x9] ^ metadata[0x11]
     dec[2] = metadata[0xE] ^ metadata[0xA] ^ metadata[0x12]
     dec[3] = metadata[0xF] ^ metadata[0xB] ^ metadata[0x13]
-
     dec[4] = metadata[0x4] ^ metadata[0x8] ^ metadata[0x14]
     dec[5] = metadata[0x5] ^ metadata[0x9] ^ metadata[0x15]
     dec[6] = metadata[0x6] ^ metadata[0xA] ^ metadata[0x16]
     dec[7] = metadata[0x7] ^ metadata[0xB] ^ metadata[0x17]
-
     dec[8] = metadata[0xC] ^ metadata[0x0] ^ metadata[0x18]
     dec[9] = metadata[0xD] ^ metadata[0x1] ^ metadata[0x19]
     dec[10] = metadata[0xE] ^ metadata[0x2] ^ metadata[0x1A]
     dec[11] = metadata[0xF] ^ metadata[0x3] ^ metadata[0x1B]
-
     dec[12] = metadata[0x4] ^ metadata[0x0] ^ metadata[0x1C]
     dec[13] = metadata[0x5] ^ metadata[0x1] ^ metadata[0x1D]
     dec[14] = metadata[0x6] ^ metadata[0x2] ^ metadata[0x1E]
@@ -544,24 +573,51 @@ def dec_section(metadata: bytes) -> tuple[int, int, int]:
     return offset, length, comp_end
 
 
-def decrypt_edat_to_bytes(edat_path: Path, log: Callable[[str], None]) -> bytes:
-    data = edat_path.read_bytes()
+def build_key_candidates(rap_hex: str, dev_hash: bytes | None = None) -> list[tuple[str, bytes]]:
+    candidates: list[tuple[str, bytes]] = []
+    rap = rap_hex_to_bytes(rap_hex)
 
-    if len(data) < 0x100 or not data.startswith(b"NPD"):
-        raise ValueError("Not an NPD/EDAT file")
+    if rap:
+        rif = rap_to_rif(rap)
+        if rif:
+            candidates.append(("rap_to_rif", rif))
+            if dev_hash and len(dev_hash) == 16:
+                try:
+                    candidates.append(("rap_to_rif_x_dev_hash", AES.new(rif, AES.MODE_ECB).encrypt(dev_hash)))
+                except Exception:
+                    pass
 
+        candidates.append(("rap_raw_klic", rap))
+        if dev_hash and len(dev_hash) == 16:
+            try:
+                candidates.append(("rap_raw_x_dev_hash", AES.new(rap, AES.MODE_ECB).encrypt(dev_hash)))
+            except Exception:
+                pass
+
+    candidates.append(("np_klic_free", NP_KLIC_FREE))
+
+    deduped: list[tuple[str, bytes]] = []
+    seen: set[bytes] = set()
+    for label, key in candidates:
+        if not key or len(key) != 16:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append((label, key))
+
+    return deduped
+
+
+def decrypt_edat_with_key(data: bytes, key_input: bytes, layout_mode: str, flag10_mode: str, iv_mode: str) -> tuple[bytes, str]:
     version = struct.unpack(">I", data[4:8])[0]
-    license_type = struct.unpack(">I", data[8:12])[0]
     content_id = data[16:64].decode("ascii", errors="ignore").strip("\x00")
     digest = data[0x40:0x50]
     dev_hash = data[0x60:0x70]
+
     flags = struct.unpack(">I", data[0x80:0x84])[0]
     block_size = struct.unpack(">I", data[0x84:0x88])[0]
     file_size = struct.unpack(">Q", data[0x88:0x90])[0]
-
-    log(f"    EDAT: {edat_path.name}")
-    log(f"      content_id={content_id} version={version} license={license_type} flags={flags:#x}")
-    log(f"      block_size={block_size} file_size={file_size}")
 
     if block_size <= 0 or file_size <= 0:
         raise ValueError("Invalid EDAT block_size/file_size")
@@ -576,15 +632,13 @@ def decrypt_edat_to_bytes(edat_path: Path, log: Callable[[str], None]) -> bytes:
     if is_sdat:
         sdat_key = b"\x0D\x65\x5E\xF8\xE6\x74\xA9\x8A\xB8\x50\x5C\xFA\x7D\x01\x29\x33"
         key_input = bytes(a ^ b for a, b in zip(dev_hash, sdat_key))
-    else:
-        # Free theme EDATs normally use NP_KLIC_FREE.
-        key_input = NP_KLIC_FREE
 
     edat_key = EDAT_KEY_1 if version == 4 else EDAT_KEY_0
     meta_size = 0x20 if (is_compressed or has_0x20) else 0x10
     metadata_offset = 0x100
     num_blocks = (file_size + block_size - 1) // block_size
     dev_hash_12 = dev_hash[:12]
+
     output = bytearray()
 
     for i in range(num_blocks):
@@ -594,8 +648,7 @@ def decrypt_edat_to_bytes(edat_path: Path, log: Callable[[str], None]) -> bytes:
 
         if is_compressed:
             meta_pos = metadata_offset + (i * meta_size)
-            metadata = data[meta_pos:meta_pos + meta_size]
-
+            metadata = data[meta_pos : meta_pos + meta_size]
             if len(metadata) < meta_size:
                 break
 
@@ -604,43 +657,47 @@ def decrypt_edat_to_bytes(edat_path: Path, log: Callable[[str], None]) -> bytes:
                 chunk_len = struct.unpack(">I", metadata[0x18:0x1C])[0]
             else:
                 data_offset, chunk_len, _ = dec_section(metadata)
-
             read_len = (int(chunk_len) + 15) & ~15
-        elif has_0x20:
+
+        elif has_0x20 and layout_mode == "inline_20":
             data_offset = metadata_offset + i * (meta_size + block_size) + meta_size
             chunk_len = this_size
             read_len = pad_len
+
+        elif has_0x20 and layout_mode == "table_20":
+            data_offset = metadata_offset + num_blocks * meta_size + i * block_size
+            chunk_len = this_size
+            read_len = pad_len
+
         else:
             data_offset = metadata_offset + num_blocks * meta_size + i * block_size
             chunk_len = this_size
             read_len = pad_len
 
         if data_offset + read_len > len(data):
-            log(f"      stopped: block {i} outside EDAT")
             break
 
-        enc = data[int(data_offset):int(data_offset) + int(read_len)]
-
+        enc = data[int(data_offset) : int(data_offset) + int(read_len)]
         if len(enc) < read_len:
             enc += b"\x00" * (int(read_len) - len(enc))
 
         block_key = dev_hash_12 + struct.pack(">I", i)
         key_result = AES.new(key_input, AES.MODE_ECB).encrypt(block_key)
 
-        if has_0x10:
+        if has_0x10 and flag10_mode == "respect_0x10":
             key_result = AES.new(key_input, AES.MODE_ECB).encrypt(key_result)
 
         if has_encrypted_key:
             key_final = AES.new(edat_key, AES.MODE_CBC, iv=EDAT_IV).decrypt(key_result)
-            iv_final = digest
         else:
             key_final = key_result
-            iv_final = digest if version > 1 else EDAT_IV
+
+        iv_final = digest if (iv_mode == "digest" and version > 1) else EDAT_IV
 
         if is_payload_plain:
-            dec_block = enc[:int(chunk_len)]
+            dec_block = enc[: int(chunk_len)]
         else:
-            dec_block = AES.new(key_final, AES.MODE_CBC, iv=iv_final).decrypt(enc)[:int(chunk_len)]
+            dec_block = AES.new(key_final, AES.MODE_CBC, iv=iv_final).decrypt(enc)[: int(chunk_len)]
 
         if is_compressed:
             dec_block = maybe_zlib_decompress(dec_block)
@@ -649,78 +706,87 @@ def decrypt_edat_to_bytes(edat_path: Path, log: Callable[[str], None]) -> bytes:
 
     raw = bytes(output)
     p3tf_pos = raw.find(b"P3TF")
-
     if p3tf_pos >= 0:
         raw = raw[p3tf_pos:]
-
-    return raw
-
-
-def find_edats(root: Path) -> list[Path]:
-    result: list[Path] = []
-
-    for dirpath, _dirs, files in os.walk(root):
-        for name in files:
-            if name.lower().endswith(".edat"):
-                result.append(Path(dirpath) / name)
-
-    return sorted(result)
+    return raw, content_id
 
 
-def find_direct_p3ts(root: Path) -> list[Path]:
-    result: list[Path] = []
+def decrypt_edat_to_p3t_bytes(edat_path: Path, rap_hex: str, log: Callable[[str], None]) -> tuple[bytes, str, str, list[tuple[str, int, int, str]]]:
+    data = edat_path.read_bytes()
+    if len(data) < 0x100 or not data.startswith(b"NPD"):
+        raise ValueError("Not an NPD/EDAT file")
 
-    for dirpath, _dirs, files in os.walk(root):
-        for name in files:
-            path = Path(dirpath) / name
-            if name.lower().endswith(".p3t"):
-                result.append(path)
-                continue
+    version = struct.unpack(">I", data[4:8])[0]
+    license_type = struct.unpack(">I", data[8:12])[0]
+    content_id = data[16:64].decode("ascii", errors="ignore").strip("\x00")
+    dev_hash = data[0x60:0x70]
+    flags = struct.unpack(">I", data[0x80:0x84])[0]
+    block_size = struct.unpack(">I", data[0x84:0x88])[0]
+    file_size = struct.unpack(">Q", data[0x88:0x90])[0]
 
-            try:
-                with path.open("rb") as f:
-                    if f.read(4) == b"P3TF":
-                        result.append(path)
-            except OSError:
-                pass
+    log(f"    EDAT: {edat_path.name}")
+    log(f"      version={version} license_type={license_type} flags={flags:#x} block_size={block_size} file_size={file_size}")
 
-    return sorted(result)
+    has_0x20 = bool(flags & EDAT_FLAG_0x20)
+    layout_modes = ["inline_20", "table_20"] if has_0x20 else ["normal"]
+    flag10_modes = ["respect_0x10", "ignore_0x10"]
+    iv_modes = ["digest", "zero"]
+    key_candidates = build_key_candidates(rap_hex, dev_hash)
+
+    attempts: list[tuple[str, int, int, str]] = []
+    last_raw = b""
+
+    for key_label, key_input in key_candidates:
+        for layout_mode in layout_modes:
+            for flag10_mode in flag10_modes:
+                for iv_mode in iv_modes:
+                    attempt_label = f"{key_label}|{layout_mode}|{flag10_mode}|iv_{iv_mode}"
+                    try:
+                        raw, inner_content_id = decrypt_edat_with_key(
+                            data=data,
+                            key_input=key_input,
+                            layout_mode=layout_mode,
+                            flag10_mode=flag10_mode,
+                            iv_mode=iv_mode,
+                        )
+                        last_raw = raw
+                        p3tf_pos = raw.find(b"P3TF")
+                        first16 = raw[:16].hex()
+                        attempts.append((attempt_label, len(raw), p3tf_pos, first16))
+
+                        if raw.startswith(b"P3TF") or p3tf_pos >= 0:
+                            log(f"      key OK: {attempt_label}")
+                            return raw, inner_content_id, attempt_label, attempts
+                    except Exception as exc:
+                        attempts.append((attempt_label, 0, -1, f"ERROR: {exc}"))
+
+    return last_raw, content_id, "failed_all_attempts", attempts
 
 
 # -----------------------------------------------------------------------------
-# Original PHP P3T extractor setup
+# P3T extraction with PHP project
 # -----------------------------------------------------------------------------
 
-def patch_file_text(path: Path, replacements: list[tuple[str, str]]) -> None:
-    text = path.read_text(encoding="utf-8", errors="replace")
-    for old, new in replacements:
-        text = text.replace(old, new)
-    path.write_text(text, encoding="utf-8")
-
-
-def setup_php_p3t_extractor(tool_root: Path, log: Callable[[str], None]) -> Path:
-    """Clone and patch hoshadiq/ps3theme-p3t-extract. Return runner path."""
-    extractor_dir = tool_root / "ps3theme-p3t-extract"
-    runner = tool_root / "run_p3t_extract.php"
+def ensure_php_extractor(repo: Path, log: Callable[[str], None]) -> Path:
+    extractor_dir = repo / ".cache" / "ps3theme-p3t-extract"
+    runner = repo / ".cache" / "run_p3t_extract.php"
 
     if not extractor_dir.exists():
-        log("[TOOL] Cloning ps3theme-p3t-extract")
-        subprocess.run(
-            [
-                "git",
-                "clone",
-                "--depth",
-                "1",
-                "https://github.com/hoshsadiq/ps3theme-p3t-extract.git",
-                str(extractor_dir),
-            ],
-            check=True,
-        )
+        extractor_dir.parent.mkdir(parents=True, exist_ok=True)
+        log("    Cloning ps3theme-p3t-extract...")
+        subprocess.check_call([
+            "git",
+            "clone",
+            "--depth",
+            "1",
+            "https://github.com/hoshsadiq/ps3theme-p3t-extract.git",
+            str(extractor_dir),
+        ])
 
-    (extractor_dir / "autoload_colab.php").write_text(
-        """<?php
+    autoload = extractor_dir / "autoload_colab.php"
+    autoload.write_text(r'''<?php
 spl_autoload_register(function ($class) {
-    $prefix = 'P3TExtractor\\\\';
+    $prefix = 'P3TExtractor\\';
     $base_dir = __DIR__ . '/src/P3TExtractor/';
 
     $len = strlen($prefix);
@@ -729,39 +795,25 @@ spl_autoload_register(function ($class) {
     }
 
     $relative_class = substr($class, $len);
-    $file = $base_dir . str_replace('\\\\', '/', $relative_class) . '.php';
+    $file = $base_dir . str_replace('\\', '/', $relative_class) . '.php';
 
     if (file_exists($file)) {
         require $file;
     }
 });
-""",
-        encoding="utf-8",
-    )
+''', encoding="utf-8")
 
     gim_file = extractor_dir / "src/P3TExtractor/Gim.php"
-    if gim_file.exists():
-        patch_file_text(
-            gim_file,
-            [
-                ("throw new Exception(", "throw new \\Exception("),
-            ],
-        )
+    gim_text = gim_file.read_text(encoding="utf-8", errors="replace")
+    gim_text = gim_text.replace("throw new Exception(", "throw new \\Exception(")
+    gim_file.write_text(gim_text, encoding="utf-8")
 
     element_file = extractor_dir / "src/P3TExtractor/Element.php"
-    if element_file.exists():
-        patch_file_text(
-            element_file,
-            [
-                (
-                    "substr($this->rgba, $pos, ( $pos+4 ) )",
-                    "substr($this->rgba, $pos, 4)",
-                ),
-            ],
-        )
+    element_text = element_file.read_text(encoding="utf-8", errors="replace")
+    element_text = element_text.replace("substr($this->rgba, $pos, ( $pos+4 ) )", "substr($this->rgba, $pos, 4)")
+    element_file.write_text(element_text, encoding="utf-8")
 
-    runner.write_text(
-        """<?php
+    runner.write_text(r'''<?php
 require __DIR__ . '/ps3theme-p3t-extract/autoload_colab.php';
 
 $input = $argv[1];
@@ -771,21 +823,16 @@ if (!is_dir($output)) {
     mkdir($output, 0777, true);
 }
 
-$p3t = new P3TExtractor\\Extractor($input, $output, true);
+$p3t = new P3TExtractor\Extractor($input, $output, true);
 $p3t->parse();
-
-// png = converted GIM files, gim = raw GIM, jpg = backgrounds, p3t = generated XML.
 $p3t->dump_files("png,gim,jpg,p3t");
-""",
-        encoding="utf-8",
-    )
+''', encoding="utf-8")
 
     return runner
 
 
-def extract_p3t_with_php(p3t_path: Path, out_dir: Path, runner: Path, log: Callable[[str], None]) -> bool:
+def extract_p3t_with_php(p3t_path: Path, out_dir: Path, runner: Path, log: Callable[[str], None]) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
-
     result = subprocess.run(
         ["php", str(runner), str(p3t_path), str(out_dir)],
         stdout=subprocess.PIPE,
@@ -793,22 +840,20 @@ def extract_p3t_with_php(p3t_path: Path, out_dir: Path, runner: Path, log: Calla
         text=True,
         check=False,
     )
-
+    if result.returncode != 0:
+        log(f"    PHP extractor returned {result.returncode} for {p3t_path.name}")
     if result.stdout.strip():
-        for line in result.stdout.splitlines():
+        for line in result.stdout.strip().splitlines()[-8:]:
             log(f"      {line}")
-
-    return result.returncode == 0
 
 
 # -----------------------------------------------------------------------------
-# Preview selector
+# Preview selection
 # -----------------------------------------------------------------------------
 
 def get_image_size(path: Path) -> tuple[int, int]:
     if Image is None:
         return (0, 0)
-
     try:
         with Image.open(path) as img:
             return img.size
@@ -822,9 +867,9 @@ def score_preview_candidate(path: Path) -> int:
     path_text = path.as_posix().lower()
     width, height = get_image_size(path)
     pixels = width * height
+
     score = 0
 
-    # Absolute priority: the actual P3T preview asset.
     if name == "preview.png":
         score += 1_000_000
     elif stem == "preview":
@@ -834,7 +879,6 @@ def score_preview_candidate(path: Path) -> int:
     elif "preview" in path_text:
         score += 700_000
 
-    # Avoid accidentally selecting icon.png, PS3LOGO, or notification images.
     if "icon" in name or "icon" in path_text:
         score -= 500_000
     if "logo" in name or "logo" in path_text:
@@ -842,13 +886,10 @@ def score_preview_candidate(path: Path) -> int:
     if "notification" in name or "notification" in path_text:
         score -= 300_000
 
-    # Fallback if filenames are weird: previews/backgrounds are usually larger/wider.
     if width and height:
         score += min(pixels, 2_000_000) // 100
-
         if width == height and pixels <= 512 * 512:
             score -= 100_000
-
         if width > height:
             score += 50_000
 
@@ -857,30 +898,27 @@ def score_preview_candidate(path: Path) -> int:
 
 def select_preview_image(root: Path) -> Path | None:
     candidates: list[Path] = []
-
     for ext in ("*.png", "*.jpg", "*.jpeg"):
-        candidates.extend(p for p in root.rglob(ext) if p.is_file())
-
-    candidates = [p for p in candidates if not p.name.lower().startswith("best_preview")]
+        for path in root.rglob(ext):
+            if path.name.lower().startswith("best_preview"):
+                continue
+            candidates.append(path)
 
     if not candidates:
         return None
 
-    candidates.sort(key=lambda p: (score_preview_candidate(p), p.stat().st_size), reverse=True)
+    candidates.sort(key=lambda p: score_preview_candidate(p), reverse=True)
     return candidates[0]
 
 
-def save_as_png(source: Path, dest: Path) -> None:
+def save_as_png(src: Path, dest: Path) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
-
-    if source.suffix.lower() == ".png":
-        shutil.copy2(source, dest)
+    if src.suffix.lower() == ".png":
+        shutil.copy2(src, dest)
         return
-
     if Image is None:
         raise RuntimeError("Pillow is required to convert JPG/JPEG previews to PNG")
-
-    image = Image.open(source).convert("RGBA")
+    image = Image.open(src).convert("RGBA")
     image.save(dest, format="PNG")
 
 
@@ -888,49 +926,50 @@ def save_as_png(source: Path, dest: Path) -> None:
 # Processing
 # -----------------------------------------------------------------------------
 
+def find_edat_files(root: Path) -> list[Path]:
+    return sorted([p for p in root.rglob("*") if p.is_file() and p.suffix.lower() == ".edat"])
+
+
 def unique_output_path(path: Path, overwrite: bool) -> Path:
     if overwrite or not path.exists():
         return path
-
     stem = path.stem
     suffix = path.suffix
-
     for i in range(2, 10_000):
         candidate = path.with_name(f"{stem}__{i}{suffix}")
         if not candidate.exists():
             return candidate
-
     raise RuntimeError(f"Could not create unique output path for {path}")
 
 
 def process_entry(
     entry: ThemeEntry,
+    repo: Path,
     download_dir: Path,
     output_root: Path,
     work_root: Path,
-    tool_runner: Path,
     overwrite: bool,
     redownload: bool,
     keep_extracted: bool,
+    php_runner: Path,
     log: Callable[[str], None],
-) -> tuple[int, str]:
-    fixed_title_id = safe_filename(resolved_title_id(entry.title_id, entry.content_id, entry.pkg_url))
-    content_name = safe_filename(entry.content_id or Path(urllib.parse.urlparse(entry.pkg_url).path).stem, fallback="theme")
-    title_folder = output_root / fixed_title_id
-    expected_output = title_folder / f"{content_name}.png"
+) -> tuple[int, list[list[str]]]:
+    title_id = fixed_title_id(entry)
+    title_folder = output_root / safe_filename(title_id)
+    output_path = title_folder / f"{safe_filename(entry.content_id)}.png"
 
-    if expected_output.exists() and not overwrite:
-        log(f"[SKIP] {fixed_title_id} / {entry.content_id}: PNG already exists")
-        return 0, ""
+    if output_path.exists() and not overwrite:
+        log(f"[SKIP] {title_id} / {entry.content_id}: preview already exists")
+        return 0, []
 
-    pkg_name = safe_filename(entry.content_id or Path(urllib.parse.urlparse(entry.pkg_url).path).stem, fallback="theme") + ".pkg"
+    pkg_name = safe_filename(entry.content_id or entry.title_id, "theme") + ".pkg"
     pkg_path = download_dir / pkg_name
 
     if redownload and pkg_path.exists():
         pkg_path.unlink()
 
     if not pkg_path.exists():
-        log(f"[GET ] {fixed_title_id} - {entry.name}")
+        log(f"[GET ] {title_id} - {entry.name}")
         download_file(entry.pkg_url, pkg_path, log)
     else:
         log(f"[CACHE] {pkg_path.name}")
@@ -940,89 +979,84 @@ def process_entry(
         if got_hash != entry.sha256.upper():
             raise ValueError(f"SHA256 mismatch for {pkg_path.name}: {got_hash} != {entry.sha256}")
 
-    extract_base = work_root / safe_filename(entry.content_id or fixed_title_id)
+    extract_base = work_root / safe_filename(entry.content_id or entry.title_id)
     if extract_base.exists():
         shutil.rmtree(extract_base)
     extract_base.mkdir(parents=True, exist_ok=True)
 
-    pkg_extract_dir = extract_base / "pkg"
-    decrypted_dir = extract_base / "p3t"
-    p3t_extract_dir = extract_base / "p3t_extract"
-    decrypted_dir.mkdir(parents=True, exist_ok=True)
-    p3t_extract_dir.mkdir(parents=True, exist_ok=True)
+    extracted_root = extract_pkg(pkg_path, extract_base, fallback_folder=entry.content_id or title_id, log=log)
+    edat_files = find_edat_files(extracted_root)
+    if not edat_files:
+        edat_files = find_edat_files(extract_base)
 
-    extracted_root = extract_pkg(pkg_path, pkg_extract_dir, fallback_folder=entry.content_id or fixed_title_id, log=log)
+    report_rows: list[list[str]] = []
+
+    if not edat_files:
+        log(f"[MISS] No EDAT found in {pkg_path.name}")
+        report_rows.append(["no_edat", title_id, entry.content_id, entry.name, entry.pkg_url, "No .edat found"])
+        if not keep_extracted:
+            shutil.rmtree(extract_base, ignore_errors=True)
+        return 0, report_rows
 
     p3t_files: list[Path] = []
+    decrypt_dir = extract_base / "_decrypted_p3t"
+    decrypt_dir.mkdir(parents=True, exist_ok=True)
 
-    for direct_p3t in find_direct_p3ts(extracted_root):
-        out_p3t = decrypted_dir / f"{safe_filename(direct_p3t.stem)}.p3t"
-        if direct_p3t.suffix.lower() == ".p3t" and direct_p3t.read_bytes()[:4] == b"P3TF":
-            shutil.copy2(direct_p3t, out_p3t)
-            p3t_files.append(out_p3t)
+    attempt_report = decrypt_dir / "theme_decrypt_attempts.tsv"
+    with attempt_report.open("w", encoding="utf-8", newline="") as attempt_handle:
+        attempt_handle.write("edat\tattempt\tdecrypted_size\tp3tf_position\tfirst16_or_error\n")
 
-    edats = find_edats(extracted_root)
-    if not edats:
-        edats = find_edats(pkg_extract_dir)
+        for index, edat_path in enumerate(edat_files, start=1):
+            raw, _edat_content_id, key_label, attempts = decrypt_edat_to_p3t_bytes(edat_path, entry.rap_hex, log)
+            debug_bin = decrypt_dir / f"{index:02d}_{safe_filename(edat_path.stem)}_{safe_filename(key_label)}.bin"
+            debug_bin.write_bytes(raw)
 
-    for idx, edat_path in enumerate(edats, start=1):
-        try:
-            raw_p3t = decrypt_edat_to_bytes(edat_path, log=log)
-        except Exception as exc:
-            log(f"[FAIL] EDAT decrypt failed for {edat_path.name}: {exc}")
-            continue
+            for attempt_label, size, p3tf_pos, first16 in attempts:
+                safe_first16 = str(first16).replace("\t", " ").replace("\n", " ")
+                attempt_handle.write(f"{edat_path.name}\t{attempt_label}\t{size}\t{p3tf_pos}\t{safe_first16}\n")
 
-        p3tf_pos = raw_p3t.find(b"P3TF")
-        if p3tf_pos >= 0:
-            raw_p3t = raw_p3t[p3tf_pos:]
-
-        if not raw_p3t.startswith(b"P3TF"):
-            log(f"[MISS] EDAT decrypted but no P3TF magic: {edat_path.name}")
-            continue
-
-        out_p3t = decrypted_dir / f"{idx:02d}_{safe_filename(edat_path.stem)}.p3t"
-        out_p3t.write_bytes(raw_p3t)
-        p3t_files.append(out_p3t)
-        log(f"[P3T ] {out_p3t.name} ({out_p3t.stat().st_size} bytes)")
+            p3tf_pos = raw.find(b"P3TF")
+            if raw.startswith(b"P3TF"):
+                p3t_path = decrypt_dir / f"{index:02d}_{safe_filename(edat_path.stem)}.p3t"
+                p3t_path.write_bytes(raw)
+                p3t_files.append(p3t_path)
+            elif p3tf_pos >= 0:
+                p3t_path = decrypt_dir / f"{index:02d}_{safe_filename(edat_path.stem)}_carved.p3t"
+                p3t_path.write_bytes(raw[p3tf_pos:])
+                p3t_files.append(p3t_path)
 
     if not p3t_files:
+        log(f"[FAIL] No P3T produced from EDAT(s) for {entry.content_id}")
+        report_rows.append(["decrypt_failed", title_id, entry.content_id, entry.name, entry.pkg_url, "No P3TF after EDAT decrypt attempts"])
         if not keep_extracted:
             shutil.rmtree(extract_base, ignore_errors=True)
-        return 0, "no_p3t_found"
+        return 0, report_rows
 
-    extracted_ok = False
-    for idx, p3t_path in enumerate(p3t_files, start=1):
-        out_dir = p3t_extract_dir / f"{idx:02d}_{safe_filename(p3t_path.stem)}"
-        if extract_p3t_with_php(p3t_path, out_dir, tool_runner, log=log):
-            extracted_ok = True
-
-    if not extracted_ok:
-        if not keep_extracted:
-            shutil.rmtree(extract_base, ignore_errors=True)
-        return 0, "p3t_extractor_failed"
+    p3t_extract_dir = extract_base / "_p3t_extracted"
+    for index, p3t_path in enumerate(p3t_files, start=1):
+        out_dir = p3t_extract_dir / f"{index:02d}_{safe_filename(p3t_path.stem)}"
+        extract_p3t_with_php(p3t_path, out_dir, php_runner, log)
 
     selected = select_preview_image(p3t_extract_dir)
     if not selected:
+        log(f"[FAIL] No PNG/JPG preview extracted for {entry.content_id}")
+        report_rows.append(["no_preview", title_id, entry.content_id, entry.name, entry.pkg_url, "No PNG/JPG preview extracted from P3T"])
         if not keep_extracted:
             shutil.rmtree(extract_base, ignore_errors=True)
-        return 0, "no_preview_image_extracted"
+        return 0, report_rows
 
-    final_out = unique_output_path(expected_output, overwrite=overwrite)
-    save_as_png(selected, final_out)
-    log(f"[SAVE] {final_out.relative_to(output_root)} <- {selected.name}")
+    out_path = unique_output_path(output_path, overwrite=overwrite)
+    save_as_png(selected, out_path)
+    log(f"[SAVE] {out_path.relative_to(output_root)}")
 
     if not keep_extracted:
         shutil.rmtree(extract_base, ignore_errors=True)
 
-    return 1, ""
+    return 1, report_rows
 
-
-# -----------------------------------------------------------------------------
-# CLI
-# -----------------------------------------------------------------------------
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Extract PS3 theme preview PNGs from themes.tsv PKG entries.")
+    parser = argparse.ArgumentParser(description="Extract PS3 theme preview PNGs from theme PKGs listed in themes.tsv.")
     parser.add_argument("--repo", type=Path, default=Path.cwd(), help="PSN-Content repository root. Default: current folder")
     parser.add_argument("--tsv", type=Path, action="append", help="Custom theme TSV path. Can be used more than once.")
     parser.add_argument(
@@ -1031,21 +1065,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="official",
         help="Theme TSV source to process when --tsv is not used. Default: official.",
     )
-    parser.add_argument(
-        "--include-pending",
-        action="store_true",
-        help="Backward-compatible alias that makes --source behave as all.",
-    )
+    parser.add_argument("--include-pending", action="store_true", help="Backward-compatible alias that makes --source behave as all.")
     parser.add_argument("--title-id", action="append", help="Only process this Title ID/game ID. Can be used more than once.")
     parser.add_argument("--content-id", action="append", help="Only process this Content ID. Can be used more than once.")
     parser.add_argument("--limit", type=int, default=0, help="Limit how many entries are processed. 0 means no limit.")
     parser.add_argument("--start", type=int, default=0, help="Skip the first N matching entries.")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing PNG files.")
     parser.add_argument("--redownload", action="store_true", help="Download PKGs again even when they already exist in cache.")
-    parser.add_argument("--keep-extracted", action="store_true", help="Keep temporary extracted PKG/P3T files.")
+    parser.add_argument("--keep-extracted", action="store_true", help="Keep temporary extracted PKG/P3T files for debugging.")
     parser.add_argument("--download-dir", type=Path, help="PKG cache folder. Default: <repo>/.cache/theme_pkgs")
     parser.add_argument("--output", type=Path, help="Output folder. Default: <repo>/resources/database/themes")
-    parser.add_argument("--tool-dir", type=Path, help="Tool cache folder. Default: <repo>/.cache/theme_tools")
     return parser
 
 
@@ -1053,28 +1082,30 @@ def main() -> int:
     args = build_arg_parser().parse_args()
     repo = args.repo.resolve()
 
+    if Image is None:
+        print("ERROR: Pillow is required. Install with: pip install pillow", file=sys.stderr)
+        return 2
+
     if args.tsv:
         tsv_paths = args.tsv
     else:
         source = "all" if args.include_pending else args.source
-        tsv_paths = []
+        tsv_paths: list[Path] = []
+
         official_tsv = repo / "resources/database/content/official/themes.tsv"
         pending_tsv = repo / "resources/database/content/official/pending/themes.tsv"
 
         if source in ("official", "all"):
             tsv_paths.append(official_tsv)
-
         if source in ("pending", "all"):
             tsv_paths.append(pending_tsv)
 
     output_root = (args.output or repo / "resources/database/themes").resolve()
     download_dir = (args.download_dir or repo / ".cache/theme_pkgs").resolve()
-    tool_dir = (args.tool_dir or repo / ".cache/theme_tools").resolve()
 
     print(f"Repo: {repo}")
     print(f"Output: {output_root}")
     print(f"Temporary PKG folder: {download_dir}")
-    print(f"Tool folder: {tool_dir}")
     print("TSV:")
     for path in tsv_paths:
         print(f"  - {path}")
@@ -1085,18 +1116,11 @@ def main() -> int:
     content_filter = {x.upper() for x in args.content_id or []}
 
     if title_filter:
-        entries = [
-            e for e in entries
-            if e.title_id.upper() in title_filter
-            or resolved_title_id(e.title_id, e.content_id, e.pkg_url).upper() in title_filter
-        ]
-
+        entries = [e for e in entries if e.title_id.upper() in title_filter or fixed_title_id(e).upper() in title_filter]
     if content_filter:
         entries = [e for e in entries if e.content_id.upper() in content_filter]
-
     if args.start > 0:
-        entries = entries[args.start:]
-
+        entries = entries[args.start :]
     if args.limit > 0:
         entries = entries[: args.limit]
 
@@ -1106,13 +1130,8 @@ def main() -> int:
 
     output_root.mkdir(parents=True, exist_ok=True)
     download_dir.mkdir(parents=True, exist_ok=True)
-    tool_dir.mkdir(parents=True, exist_ok=True)
 
-    try:
-        tool_runner = setup_php_p3t_extractor(tool_dir, log=print)
-    except Exception as exc:
-        print(f"[ERROR] Could not set up P3T extractor: {exc}")
-        return 1
+    php_runner = ensure_php_extractor(repo, print)
 
     if args.keep_extracted:
         work_context = None
@@ -1128,32 +1147,22 @@ def main() -> int:
 
     try:
         for number, entry in enumerate(entries, start=1):
-            fixed_title_id = resolved_title_id(entry.title_id, entry.content_id, entry.pkg_url)
-            print(f"\n[{number}/{len(entries)}] {fixed_title_id} | {entry.content_id} | {entry.name}")
-
+            print(f"\n[{number}/{len(entries)}] {fixed_title_id(entry)} | {entry.content_id} | {entry.name}")
             try:
-                saved, reason = process_entry(
+                saved, report_rows = process_entry(
                     entry=entry,
+                    repo=repo,
                     download_dir=download_dir,
                     output_root=output_root,
                     work_root=work_root,
-                    tool_runner=tool_runner,
                     overwrite=args.overwrite,
                     redownload=args.redownload,
                     keep_extracted=args.keep_extracted,
+                    php_runner=php_runner,
                     log=print,
                 )
                 total_saved += saved
-
-                if reason:
-                    failed_report_rows.append([
-                        "theme_preview_failed",
-                        fixed_title_id,
-                        entry.content_id,
-                        entry.name,
-                        entry.pkg_url,
-                        reason,
-                    ])
+                failed_report_rows.extend(report_rows)
             except KeyboardInterrupt:
                 raise
             except Exception as exc:
@@ -1161,7 +1170,7 @@ def main() -> int:
                 total_errors += 1
                 failed_report_rows.append([
                     "entry_error",
-                    fixed_title_id,
+                    fixed_title_id(entry),
                     entry.content_id,
                     entry.name,
                     entry.pkg_url,
@@ -1172,9 +1181,9 @@ def main() -> int:
             work_context.cleanup()
 
     print("\nDone.")
-    print(f"Saved PNGs: {total_saved}")
+    print(f"Saved theme previews: {total_saved}")
     print(f"Entry errors: {total_errors}")
-    print(f"Failures: {len(failed_report_rows)}")
+    print(f"Failed rows: {len(failed_report_rows)}")
 
     if failed_report_rows:
         report_path = output_root / "_failed_theme_previews.tsv"
@@ -1185,8 +1194,8 @@ def main() -> int:
                 handle.write("\t".join(safe_row) + "\n")
         print(f"Failure report: {report_path}")
 
-    if total_errors:
-        print("WARNING: Some theme entries had errors, but generated PNGs will still be committed.")
+    if total_errors or failed_report_rows:
+        print("WARNING: Some theme entries failed, but generated PNGs will still be committed.")
 
     return 0
 
