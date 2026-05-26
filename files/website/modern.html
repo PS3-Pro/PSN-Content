@@ -930,7 +930,21 @@ body.is-admin #btn-toolbar-cmd, body.is-mod #btn-toolbar-cmd { display: flex !im
 .msg-highlight-ps5 .msg-bubble { animation: ps5-fluid-glow 3s cubic-bezier(0.4, 0, 0.2, 1) forwards !important; z-index: 1000 !important; position: relative !important; }
 @keyframes ps5-fluid-glow { 0% { transform: scale(1); box-shadow: 0 0 0px transparent; } 10% { transform: scale(1.02); background: var(--ps-blue) !important; border: 1.5px solid #ffffff !important; box-shadow: 0 0 15px rgba(255, 255, 255, 0.6), 0 0 30px var(--ps-blue), 0 0 60px rgba(0, 112, 204, 0.3) !important; } 30% { transform: scale(1.02); } 100% { transform: scale(1); box-shadow: 0 0 0px transparent; } }
 
-#pinned-bar:hover { background: rgba(255, 255, 255, 0.05); }
+#subview-chat .file-manager-container {
+	backdrop-filter: none !important;
+	-webkit-backdrop-filter: none !important;
+}
+#pinned-messages-container {
+	background: rgba(18, 24, 36, 0.34) !important;
+	backdrop-filter: blur(16px) saturate(165%) !important;
+	-webkit-backdrop-filter: blur(16px) saturate(165%) !important;
+	box-shadow: 0 8px 24px rgba(0, 0, 0, 0.26) !important;
+	border-bottom: 1px solid rgba(255, 255, 255, 0.08) !important;
+}
+#pinned-bar {
+	background: rgba(255, 255, 255, 0.012) !important;
+}
+#pinned-bar:hover { background: rgba(255, 255, 255, 0.055) !important; }
 .unpin-admin-btn:hover { transform: scale(1.2); }
 @keyframes pinSlideDown { from { transform: translateY(-100%); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
 .pin-active { animation: pinSlideDown 0.4s cubic-bezier(0.2, 0.8, 0.2, 1); }
@@ -8621,6 +8635,7 @@ body:not(.is-admin) #view-admin { display: none !important; }
 		if (typeof socketChat !== 'undefined' && socketChat && socketChat.connected) {
 			socketChat.emit('admin_request_moderation_log');
 			if (typeof window.adminRequestChatControlsState === 'function') window.adminRequestChatControlsState();
+			if (typeof window.adminRequestReports === 'function') window.adminRequestReports(true);
 		}
 		adminRefreshHealth(false);
 		adminResetUsersPanelState();
@@ -10675,12 +10690,35 @@ body:not(.is-admin) #view-admin { display: none !important; }
 		localStorage.setItem('psn_admin_reports', JSON.stringify(window.adminReports));
 	}
 
-	window.adminRequestReports = function() {
-		if (!adminGuard()) return;
+	function adminReportKey(report) {
+		if (!report) return '';
+		return String(report.id || `${report.msgId || ''}:${report.reporter || ''}:${report.time || ''}`);
+	}
+
+	function adminAddIncomingReport(report, silent = false) {
+		if (!report) return;
+		const incoming = { ...(report || {}), time: (report && report.time) || new Date().toISOString() };
+		const incomingKey = adminReportKey(incoming);
+		const reports = adminGetReports().filter(r => adminReportKey(r) !== incomingKey);
+		reports.unshift(incoming);
+		adminSetReports(reports);
+
+		if (!silent && document.body.classList.contains('is-admin')) {
+			if (typeof showToastNotification === 'function') {
+				showToastNotification('New Report', `${incoming.reporter || 'Someone'} reported a message.`);
+			}
+			if (typeof playUiError === 'function') playUiError();
+		}
+		renderAdminPanel();
+	}
+
+	window.adminRequestReports = function(silent = false) {
+		if (!adminGuard(!silent)) return;
 		if (typeof socketChat !== 'undefined' && socketChat && socketChat.connected) {
+			window.adminLastReportsRequestAt = Date.now();
 			socketChat.emit('admin_request_reports');
-			if (typeof playUiSuccess === 'function') playUiSuccess();
-		} else {
+			if (!silent && typeof playUiSuccess === 'function') playUiSuccess();
+		} else if (!silent) {
 			if (typeof playUiError === 'function') playUiError();
 			alert('Socket is offline. Showing local reports only.');
 		}
@@ -10704,6 +10742,74 @@ body:not(.is-admin) #view-admin { display: none !important; }
 		if (typeof socketChat !== 'undefined' && socketChat && socketChat.connected) socketChat.emit('admin_resolve_report', { reportId });
 		adminAddLog('reports', 'Resolved report', { reportId });
 		renderAdminPanel();
+	};
+
+	function adminRenderFullChatHistoryForJump() {
+		const box = document.getElementById('chat-messages');
+		if (!box || !Array.isArray(window.messageHistory)) return false;
+		const myName = localStorage.getItem('psn_username') || 'Guest';
+		box.style.setProperty('scroll-behavior', 'auto', 'important');
+		box.innerHTML = `
+			<div id="welcome-banner-scroll" style="text-align: center; margin-bottom: -15px; margin-top: -5px;">
+				<span style="background: rgba(0, 188, 255, 0.05); padding: 6px 20px; border-radius: 20px; font-size: 9.5px; color: #fff; text-transform: uppercase; letter-spacing: 1.5px; border: 1px solid rgba(0, 188, 255, 0.1); font-weight: bold; white-space: nowrap;">
+					Welcome to the Chat
+				</span>
+			</div>`;
+		window.lastChatRawDate = '';
+		window.messageHistory.forEach(data => {
+			if (!data) return;
+			const msgRawDate = new Date(data.time).toDateString();
+			if (data.time && msgRawDate !== window.lastChatRawDate && typeof getChatDateLabel === 'function') {
+				const currentDateLabel = getChatDateLabel(data.time);
+				const divider = document.createElement('div');
+				divider.className = 'date-divider';
+				divider.setAttribute('data-label', currentDateLabel);
+				divider.innerHTML = `<span>${currentDateLabel}</span>`;
+				box.appendChild(divider);
+				window.lastChatRawDate = msgRawDate;
+			}
+			appendMessageToChat(data, data.user === myName, data.time);
+		});
+		if (typeof initDateStickyLogic === 'function') initDateStickyLogic();
+		setTimeout(() => box.style.setProperty('scroll-behavior', 'smooth'), 120);
+		return true;
+	}
+
+	window.adminJumpToReportedMessage = function(msgId) {
+		if (!msgId) return;
+		if (typeof playUiClick === 'function') playUiClick();
+		const searchInput = document.getElementById('search-input');
+		if (searchInput) searchInput.value = '';
+
+		if (typeof showSocialSection === 'function') {
+			showSocialSection('chat');
+		} else if (typeof switchView === 'function') {
+			switchView('view-chat', false, true);
+		}
+
+		const tryJump = (attempt = 0) => {
+			let target = document.getElementById(`msg-row-${msgId}`);
+			if (!target && attempt === 0) {
+				adminRenderFullChatHistoryForJump();
+				target = document.getElementById(`msg-row-${msgId}`);
+			}
+			if (target) {
+				scrollToMessage(msgId);
+				return;
+			}
+			if (attempt < 6) {
+				setTimeout(() => tryJump(attempt + 1), 220);
+				return;
+			}
+			if (typeof showToastNotification === 'function') {
+				showToastNotification('Report Center', 'That message is not in the loaded chat history anymore.');
+			} else {
+				alert('That message is not in the loaded chat history anymore.');
+			}
+			if (typeof playUiError === 'function') playUiError();
+		};
+
+		setTimeout(() => tryJump(0), 320);
 	};
 
 	window.adminRefreshHealth = function(playSound = false) {
@@ -10822,7 +10928,7 @@ body:not(.is-admin) #view-admin { display: none !important; }
 				reportsEl.innerHTML = reports.slice(0, 20).map((r, idx) => {
 					const id = r.id || r.time || idx;
 					const time = r.time ? new Date(r.time).toLocaleString() : 'Unknown time';
-					const jumpBtn = r.msgId ? `<button class="btn-mini-round report-jump" onclick="scrollToMessage('${adminEscapeAttr(r.msgId)}')" title="Jump to message"><i class="fas fa-location-arrow"></i></button>` : '';
+					const jumpBtn = r.msgId ? `<button class="btn-mini-round report-jump" onclick="adminJumpToReportedMessage('${adminEscapeAttr(r.msgId)}')" title="Jump to message"><i class="fas fa-location-arrow"></i></button>` : '';
 					return `<div class="admin-report-item"><i class="fas fa-flag"></i><div class="admin-report-body"><b>${adminEscapeHtml(r.reporter || 'Unknown')}</b> reported <b>${adminEscapeHtml(r.target || r.user || 'message')}</b><br>${adminEscapeHtml(r.reason || 'No reason provided.')}<br>${r.text ? `<span style="opacity:.82;">${adminEscapeHtml(String(r.text).slice(0, 140))}</span><br>` : ''}<span style="opacity:.65;">${adminEscapeHtml(time)}</span></div><div class="admin-report-actions">${jumpBtn}<button class="btn-mini-round report-resolve" onclick="adminResolveReport('${adminEscapeAttr(id)}')" title="Resolve"><i class="fas fa-check"></i></button></div></div>`;
 				}).join('');
 			}
@@ -10915,12 +11021,12 @@ body:not(.is-admin) #view-admin { display: none !important; }
 		});
 		socketChat.on('admin_pinned_announcement', data => { adminSetPinnedAnnouncementState(data && !data.clear ? data : null, false); renderAdminPanel(); });
 		socketChat.on('reports_list', reports => { adminSetReports(Array.isArray(reports) ? reports : []); renderAdminPanel(); });
-		socketChat.on('admin_report_created', report => {
-			const reports = adminGetReports();
-			reports.unshift({ ...(report || {}), time: (report && report.time) || new Date().toISOString() });
-			adminSetReports(reports);
-			renderAdminPanel();
-		});
+		const handleLiveReport = report => adminAddIncomingReport(report, false);
+		socketChat.on('admin_report_created', handleLiveReport);
+		socketChat.on('admin_new_report', handleLiveReport);
+		socketChat.on('admin_report', handleLiveReport);
+		socketChat.on('report_created', handleLiveReport);
+		socketChat.on('new_report', handleLiveReport);
 		socketChat.on('admin_moderation_log', item => {
 			if (item) adminAddLog(item.type || 'server', item.message || 'Server moderation event', item.detail || {}, item);
 		});
@@ -10941,7 +11047,13 @@ body:not(.is-admin) #view-admin { display: none !important; }
 		setTimeout(() => { if (typeof window.adminRequestChatControlsState === 'function') window.adminRequestChatControlsState(); }, 900);
 		setInterval(() => {
 			adminInstallSocketListeners();
-			if (document.getElementById('view-admin')?.style.display === 'block') adminRefreshHealth(false);
+			const adminVisible = document.getElementById('view-admin')?.style.display === 'block';
+			if (adminVisible) {
+				adminRefreshHealth(false);
+				if (typeof window.adminRequestReports === 'function' && (!window.adminLastReportsRequestAt || Date.now() - window.adminLastReportsRequestAt > 4500)) {
+					window.adminRequestReports(true);
+				}
+			}
 		}, 2500);
 	}
 
@@ -17328,14 +17440,20 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 	
 	function scrollToMessage(msgId) {
 		const target = document.getElementById(`msg-row-${msgId}`);
-		if (!target) return;
+		if (!target) return false;
 	
 		const bubble = target.querySelector('.msg-bubble');
-		if (!bubble) return;
+		if (!bubble) return false;
 	
 		if (typeof playUiClick === 'function') playUiClick();
 	
-		target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+		const chatBox = document.getElementById('chat-messages');
+		if (chatBox && chatBox.contains(target)) {
+			const top = Math.max(0, target.offsetTop - (chatBox.clientHeight / 2) + (target.offsetHeight / 2));
+			chatBox.scrollTo({ top, behavior: 'smooth' });
+		} else {
+			target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+		}
 	
 		setTimeout(() => {
 			target.classList.remove('msg-highlight-ps5');
@@ -17348,6 +17466,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 				if (target) target.classList.remove('msg-highlight-ps5');
 			}, 3000);
 		}, 550);
+		return true;
 	}
 	
 	function startEditMessage(msgId, oldTextParam, oldImagesParam = []) {
