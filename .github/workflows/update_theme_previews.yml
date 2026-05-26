@@ -1,0 +1,101 @@
+name: Update Theme Previews
+
+on:
+  workflow_dispatch:
+    inputs:
+      source:
+        description: "Which TSV source to process"
+        required: false
+        default: "all"
+        type: choice
+        options:
+          - official
+          - pending
+          - all
+      title_id:
+        description: "Optional Title ID filter"
+        required: false
+        type: string
+      content_id:
+        description: "Optional Content ID filter"
+        required: false
+        type: string
+      overwrite:
+        description: "Overwrite existing PNG files"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  generate-theme-previews:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq php-cli php-gd git unzip
+          python -m pip install --upgrade pip
+          pip install pycryptodomex pillow
+
+      - name: Generate theme previews
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          SOURCE_TO_PROCESS: ${{ github.event.inputs.source }}
+          TITLE_ID: ${{ github.event.inputs.title_id }}
+          CONTENT_ID: ${{ github.event.inputs.content_id }}
+          OVERWRITE: ${{ github.event.inputs.overwrite }}
+        shell: bash
+        run: |
+          args=(--repo . --source "${SOURCE_TO_PROCESS:-all}" --download-dir "$RUNNER_TEMP/theme_pkgs" --tool-dir "$RUNNER_TEMP/theme_tools")
+
+          if [[ "${OVERWRITE:-false}" == "true" ]]; then
+            args+=(--overwrite)
+          fi
+
+          for id in $(echo "${TITLE_ID:-}" | tr ',;' '  '); do
+            if [[ -n "$id" ]]; then
+              args+=(--title-id "$id")
+            fi
+          done
+
+          for id in $(echo "${CONTENT_ID:-}" | tr ',;' '  '); do
+            if [[ -n "$id" ]]; then
+              args+=(--content-id "$id")
+            fi
+          done
+
+          python .github/scripts/generate_theme_previews.py "${args[@]}"
+
+      - name: Remove temporary files
+        if: always()
+        shell: bash
+        run: |
+          rm -rf "$RUNNER_TEMP/theme_pkgs" "$RUNNER_TEMP/theme_tools" || true
+
+      - name: Commit generated theme previews only
+        shell: bash
+        run: |
+          git config --global user.name "PS3-Pro Bot"
+          git config --global user.email "bot@ps3pro.com"
+
+          git add resources/database/themes
+
+          if git diff --cached --quiet; then
+            echo "No new theme preview PNGs to commit."
+          else
+            git commit -m "Auto-update: Generate theme previews"
+            git push
+          fi
