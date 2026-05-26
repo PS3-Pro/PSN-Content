@@ -1759,17 +1759,6 @@ body:not(.is-admin) #view-admin { display: none !important; }
 .admin-time-arrows button i { font-size: 8px; color: #00d4ff; }
 .admin-time-arrows button:hover { background: rgba(0,112,204,0.22); border-color: rgba(0,212,255,0.42); transform: translateY(-1px); }
 .admin-server-log-type { color: #00d4ff; background: rgba(0,112,204,0.14); border: 1px solid rgba(0,212,255,.25); border-radius: 999px; padding: 2px 7px; margin-right: 6px; font-size: 9px; font-weight: 900; text-transform: uppercase; letter-spacing: .6px; }
-.admin-server-log-type.login,
-.admin-server-log-type.signin,
-.admin-server-log-type.connected { color: #79ff8a; background: rgba(76,175,80,.12); border-color: rgba(76,175,80,.42); box-shadow: 0 0 10px rgba(76,175,80,.12); }
-.admin-server-log-type.logout,
-.admin-server-log-type.disconnect,
-.admin-server-log-type.disconnected { color: #ff8f8f; background: rgba(255,68,68,.12); border-color: rgba(255,68,68,.42); box-shadow: 0 0 10px rgba(255,68,68,.12); }
-.admin-server-log-type.signup,
-.admin-server-log-type.register,
-.admin-server-log-type.created { color: #ffdf73; background: rgba(255,204,0,.12); border-color: rgba(255,204,0,.42); box-shadow: 0 0 10px rgba(255,204,0,.10); }
-.admin-server-log-type.role,
-.admin-server-log-type.admin { color: #d98cff; background: rgba(156,39,176,.12); border-color: rgba(216,140,255,.42); box-shadow: 0 0 10px rgba(156,39,176,.12); }
 
 @media (max-width: 640px) { .admin-maintenance-scheduler .admin-schedule-row { grid-template-columns: 1fr; } .admin-maintenance-days { grid-template-columns: repeat(7, 64px); overflow-x: auto; padding-bottom: 2px; scrollbar-width: none; } .admin-maintenance-days::-webkit-scrollbar { display: none; } }
 
@@ -6147,6 +6136,9 @@ body:not(.is-admin) #view-admin { display: none !important; }
 		if (typeof updateSidebarLight === 'function') {
 			setTimeout(updateSidebarLight, 50);
 		}
+		if (section === 'chat' && typeof adminUpdateChatControlsBanner === 'function') {
+			setTimeout(adminUpdateChatControlsBanner, 80);
+		}
 	};
 	
 	window.restorePreviousState = function() {
@@ -10055,6 +10047,7 @@ body:not(.is-admin) #view-admin { display: none !important; }
 		}
 		adminUpdateChatControlsBanner();
 		if (typeof adminUpdateChatControlsPanelStatus === 'function') adminUpdateChatControlsPanelStatus();
+		if (typeof adminEnsureChatControlsVisualTicker === 'function') adminEnsureChatControlsVisualTicker(normalized);
 		adminShowChatControlToast(normalized, oldState);
 		return normalized;
 	}
@@ -10150,20 +10143,23 @@ body:not(.is-admin) #view-admin { display: none !important; }
 
 	function adminSyncChatControlTags(tagBox, tagList) {
 		if (!tagBox) return;
+		const isChatStatusBox = tagBox.id === 'chat-mode-status-tags';
+		const tagSelector = isChatStatusBox ? '.chat-mode-status-tag[data-kind]' : '.admin-pill[data-kind]';
 		const desiredKinds = tagList.map(tag => tag.kind);
-		tagBox.querySelectorAll('.admin-pill[data-kind]').forEach(tag => {
+
+		tagBox.querySelectorAll(tagSelector).forEach(tag => {
 			if (!desiredKinds.includes(tag.dataset.kind)) tag.remove();
 		});
 
 		tagList.forEach((tag, index) => {
-			let el = tagBox.querySelector(`.admin-pill[data-kind="${tag.kind}"]`);
+			let el = tagBox.querySelector(`${tagSelector}[data-kind="${tag.kind}"]`);
 			if (!el) {
 				el = document.createElement('span');
 				el.dataset.kind = tag.kind;
 				el.innerHTML = '<i class="fas"></i> <span></span>';
 			}
 
-			const nextClass = adminChatControlPillClass(tag.kind);
+			const nextClass = isChatStatusBox ? `chat-mode-status-tag ${tag.kind}` : adminChatControlPillClass(tag.kind);
 			if (el.className !== nextClass) el.className = nextClass;
 			const icon = el.querySelector('i');
 			const label = el.querySelector('span');
@@ -10278,6 +10274,41 @@ body:not(.is-admin) #view-admin { display: none !important; }
 
 		const hint = document.getElementById('admin-chat-control-hint');
 		if (hint) hint.remove();
+	}
+
+	function adminEnsureChatControlsVisualTicker(state = null) {
+		const current = state || ((typeof window.adminGetChatControls === 'function') ? window.adminGetChatControls() : null);
+		const active = !!(current && (current.locked || (parseInt(current.slowSeconds || 0, 10) || 0) > 0));
+
+		if (window.adminChatControlsVisualTicker && !active) {
+			clearInterval(window.adminChatControlsVisualTicker);
+			window.adminChatControlsVisualTicker = null;
+			return;
+		}
+
+		if (!window.adminChatControlsVisualTicker && active) {
+			window.adminChatControlsVisualTicker = setInterval(() => {
+				if (typeof adminUpdateChatControlsBanner === 'function') adminUpdateChatControlsBanner();
+			}, 1000);
+		}
+	}
+
+	function adminStartChatControlsRealtimeSync() {
+		if (window.adminChatControlsRealtimeSyncTimer) return;
+		window.adminChatControlsRealtimeSyncTimer = setInterval(() => {
+			try {
+				if (typeof socketChat !== 'undefined' && socketChat && socketChat.connected) {
+					socketChat.emit('admin_request_chat_controls', { visualSync: true, at: Date.now() });
+				}
+			} catch (e) {}
+		}, 2500);
+	}
+
+	function adminStopChatControlsRealtimeSync() {
+		if (window.adminChatControlsRealtimeSyncTimer) {
+			clearInterval(window.adminChatControlsRealtimeSyncTimer);
+			window.adminChatControlsRealtimeSyncTimer = null;
+		}
 	}
 
 	function adminSendChatControlsToServer(nextState, localLogMessage = '') {
@@ -10691,9 +10722,7 @@ body:not(.is-admin) #view-admin { display: none !important; }
 			} else {
 				serverLogEl.innerHTML = log.slice(0, 35).map(item => {
 					const time = item.time ? new Date(item.time).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '--:--';
-					const typeRaw = String(item.type || 'server').toLowerCase();
-					const typeClass = typeRaw.replace(/[^a-z0-9_-]/g, '');
-					return `<div class="admin-log-item"><span class="admin-server-log-type ${adminEscapeAttr(typeClass)}">${adminEscapeHtml(item.type || 'server')}</span><b>${adminEscapeHtml(item.user || 'Server')}</b> <span style="opacity:.55;">${time}</span><br>${adminEscapeHtml(item.message || '')}</div>`;
+					return `<div class="admin-log-item"><span class="admin-server-log-type">${adminEscapeHtml(item.type || 'server')}</span><b>${adminEscapeHtml(item.user || 'Server')}</b> <span style="opacity:.55;">${time}</span><br>${adminEscapeHtml(item.message || '')}</div>`;
 				}).join('');
 			}
 		}
@@ -10731,8 +10760,18 @@ body:not(.is-admin) #view-admin { display: none !important; }
 			window.adminHealth.transport = socketChat?.io?.engine?.transport?.name || '-';
 			if (document.getElementById('view-admin')?.style.display === 'block') renderAdminPanel();
 		};
-		socketChat.on('connect', () => { syncAdminHealth('online'); adminSetChatControlsSyncState('syncing'); if (typeof window.adminRequestChatControlsState === 'function') window.adminRequestChatControlsState(); });
-		socketChat.on('disconnect', () => { adminSetChatControlsSyncState('offline'); syncAdminHealth('offline'); });
+		socketChat.on('connect', () => {
+			syncAdminHealth('online');
+			adminSetChatControlsSyncState('syncing');
+			if (typeof window.adminRequestChatControlsState === 'function') window.adminRequestChatControlsState();
+			if (typeof adminStartChatControlsRealtimeSync === 'function') adminStartChatControlsRealtimeSync();
+			if (typeof adminUpdateChatControlsBanner === 'function') setTimeout(adminUpdateChatControlsBanner, 80);
+		});
+		socketChat.on('disconnect', () => {
+			adminSetChatControlsSyncState('offline');
+			syncAdminHealth('offline');
+			if (typeof adminStopChatControlsRealtimeSync === 'function') adminStopChatControlsRealtimeSync();
+		});
 		socketChat.on('connect_error', () => { adminSetChatControlsSyncState('offline'); syncAdminHealth('connecting'); });
 		socketChat.io?.on?.('reconnect_attempt', () => syncAdminHealth('connecting'));
 		socketChat.io?.on?.('reconnect', () => syncAdminHealth('online'));
@@ -10748,6 +10787,10 @@ body:not(.is-admin) #view-admin { display: none !important; }
 		socketChat.on('admin_chat_controls', data => { adminSetChatControls({ ...(data || {}), source: 'server', serverSynced: true }, false); renderAdminPanel(); });
 		socketChat.on('chat_controls', data => { adminSetChatControls({ ...(data || {}), source: 'server', serverSynced: true }, false); renderAdminPanel(); });
 		socketChat.on('admin_chat_controls_state', data => { adminSetChatControls({ ...(data || {}), source: 'server', serverSynced: true }, false); renderAdminPanel(); });
+		socketChat.on('chat_blocked', data => {
+			if (data && data.controls) adminSetChatControls({ ...data.controls, source: 'server', serverSynced: true }, false);
+			if (typeof adminUpdateChatControlsBanner === 'function') adminUpdateChatControlsBanner();
+		});
 		socketChat.on('admin_state', data => {
 			if (data && data.chatControls) adminSetChatControls({ ...data.chatControls, source: 'server', serverSynced: true }, false);
 			if (data && data.maintenance) adminSetMaintenanceState(data.maintenance, false);
