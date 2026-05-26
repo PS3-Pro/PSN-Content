@@ -25,7 +25,7 @@ const MAX_CHAT_HISTORY = 1000;
 
 const SERVER_STARTED_AT = Date.now();
 const DEFAULT_MAINTENANCE_MESSAGE = "The service is under maintenance. Please try again soon.";
-const VALID_USER_ROLES = new Set(["user", "trusted", "mod", "admin", "banned"]);
+const VALID_USER_ROLES = new Set(["user", "trusted", "mod", "admin"]);
 const ADMIN_STATE_KEYS = {
   maintenance: "maintenance",
   chatControls: "chat_controls",
@@ -131,8 +131,7 @@ async function initDb() {
 
   const usersRes = await pool.query('SELECT * FROM users');
   usersRes.rows.forEach(row => {
-    userDatabase[row.name] = row.data;
-    userDatabase[row.name].name = row.name; 
+    userDatabase[row.name] = normalizeUserRecord(row.name, row.data || {});
     userDatabase[row.name].online = false;
   });
 
@@ -299,10 +298,16 @@ function getMaintenanceScheduleStatus(schedule = {}, now = new Date()) {
   return { active: true, activeUntil: new Date(now.getTime() + msLeft).toISOString() };
 }
 
+function getRawUserRole(userData = null) {
+  return normalizeText(userData && userData.role, "").toLowerCase();
+}
+
 function getUserRole(name, userData = null) {
-  const rawRole = normalizeText(userData && userData.role, ADMIN_USERS.includes(name) ? "admin" : "user").toLowerCase();
+  const fallbackRole = ADMIN_USERS.includes(name) ? "admin" : "user";
+  const rawRole = normalizeText(userData && userData.role, fallbackRole).toLowerCase();
   if (rawRole === "moderator") return "mod";
-  return VALID_USER_ROLES.has(rawRole) ? rawRole : (ADMIN_USERS.includes(name) ? "admin" : "user");
+  if (rawRole === "banned") return fallbackRole;
+  return VALID_USER_ROLES.has(rawRole) ? rawRole : fallbackRole;
 }
 
 function isUserAdmin(name, userData = null) {
@@ -325,7 +330,7 @@ function canModerateTarget(socket, targetName = "") {
   if (socket.isAdmin === true) return true;
   const targetUser = targetName ? (userDatabase[targetName] || null) : null;
   const targetRole = targetName ? getUserRole(targetName, targetUser) : "user";
-  // Moderators can moderate regular/trusted/banned users, but not admins or other mods.
+  // Moderators can moderate regular/trusted users, including banned accounts, but not admins or other mods.
   return !["admin", "mod"].includes(targetRole);
 }
 
@@ -335,7 +340,25 @@ function getActorRole(socket) {
 }
 
 function isUserBanned(userData = null) {
-  return !!(userData && (userData.banned === true || getUserRole(userData.name || "", userData) === "banned"));
+  return !!(userData && (userData.banned === true || getRawUserRole(userData) === "banned"));
+}
+
+function normalizeUserRecord(name, userData = {}) {
+  const legacyBannedRole = getRawUserRole(userData) === "banned";
+  const normalized = {
+    ...userData,
+    name,
+    role: getUserRole(name, userData),
+    banned: userData.banned === true || legacyBannedRole
+  };
+
+  if (!normalized.banned) {
+    delete normalized.banReason;
+    delete normalized.bannedBy;
+    delete normalized.bannedAt;
+  }
+
+  return normalized;
 }
 
 function normalizeMaintenanceState(data = {}) {
@@ -397,6 +420,7 @@ function getPublicUserData(username, user = {}, includeAdminFields = false) {
 
 async function saveUser(name) {
   if (!name || !userDatabase[name]) return;
+  userDatabase[name] = normalizeUserRecord(name, userDatabase[name]);
   await pool.query('UPDATE users SET data = $1 WHERE name = $2', [userDatabase[name], name]);
 }
 
@@ -503,38 +527,118 @@ async function setUserRole(targetName, role, adminName) {
 
   const normalizedRole = role === "moderator" ? "mod" : normalizeText(role, "user").toLowerCase();
   if (!VALID_USER_ROLES.has(normalizedRole)) {
-    return { success: false, message: "Invalid role." };
+    return { success: false, message: "Invalid role. Use user, trusted, mod, or admin." };
   }
 
   if (ADMIN_USERS.includes(targetName) && normalizedRole !== "admin") {
-    return { success: false, message: "Hardcoded admins cannot be demoted or banned from the panel." };
+    return { success: false, message: "Hardcoded admins cannot be demoted." };
   }
 
   userDatabase[targetName].role = normalizedRole;
   userDatabase[targetName].name = targetName;
-
-  if (normalizedRole === "banned") {
-    userDatabase[targetName].banned = true;
-    userDatabase[targetName].banReason = userDatabase[targetName].banReason || "Banned by administrator";
-    userDatabase[targetName].bannedBy = adminName;
-    userDatabase[targetName].bannedAt = new Date().toISOString();
-  } else {
-    userDatabase[targetName].banned = false;
-    delete userDatabase[targetName].banReason;
-    delete userDatabase[targetName].bannedBy;
-    delete userDatabase[targetName].bannedAt;
-  }
-
   await saveUser(targetName);
 
   getSocketsByUserName(targetName).forEach(client => {
     client.isAdmin = isUserAdmin(targetName, userDatabase[targetName]);
     client.role = getUserRole(targetName, userDatabase[targetName]);
-    client.emit('role_updated', { role: normalizedRole, isAdmin: client.isAdmin, isModerator: normalizedRole === 'mod' });
+    client.emit('role_updated', {
+      role: client.role,
+      isAdmin: client.isAdmin,
+      isModerator: client.role === 'mod',
+      banned: isUserBanned(userDatabase[targetName])
+    });
   });
 
   io.emit('online_list', getSanitizedOnlineList());
-  return { success: true, role: normalizedRole };
+  return { success: true, role: getUserRole(targetName, userDatabase[targetName]), banned: isUserBanned(userDatabase[targetName]) };
+}
+
+function generateTemporaryPassword() {
+  return `PSN-${Math.random().toString(36).slice(2, 8).toUpperCase()}`;
+}
+
+function resolveCommandTarget(rawArgs = "", options = {}) {
+  const args = normalizeText(rawArgs, "");
+  if (!args) return { targetName: "", rest: "" };
+
+  const allowOnlyBanned = options.onlyBanned === true;
+  const withoutAt = args.startsWith('@') ? args.slice(1).trim() : args;
+  const lowerArgs = withoutAt.toLowerCase();
+  const names = Object.keys(userDatabase)
+    .filter(name => !allowOnlyBanned || isUserBanned(userDatabase[name]))
+    .sort((a, b) => b.length - a.length);
+
+  for (const name of names) {
+    const lowerName = name.toLowerCase();
+    if (lowerArgs === lowerName || lowerArgs.startsWith(`${lowerName} `)) {
+      return {
+        targetName: name,
+        rest: withoutAt.slice(name.length).trim()
+      };
+    }
+  }
+
+  const firstToken = withoutAt.split(/\s+/)[0] || "";
+  const exact = names.find(name => name.toLowerCase() === firstToken.toLowerCase());
+  if (exact) {
+    return {
+      targetName: exact,
+      rest: withoutAt.slice(firstToken.length).trim()
+    };
+  }
+
+  return { targetName: "", rest: withoutAt };
+}
+
+async function banUser(targetName, reason, adminName) {
+  if (!targetName) return { success: false, message: "Missing target user." };
+  if (!userDatabase[targetName]) return { success: false, message: "User not found." };
+  if (ADMIN_USERS.includes(targetName)) return { success: false, message: "Hardcoded admins cannot be banned." };
+
+  userDatabase[targetName] = normalizeUserRecord(targetName, userDatabase[targetName]);
+  userDatabase[targetName].banned = true;
+  userDatabase[targetName].banReason = normalizeText(reason, "Banned by administrator") || "Banned by administrator";
+  userDatabase[targetName].bannedBy = adminName || "Admin";
+  userDatabase[targetName].bannedAt = new Date().toISOString();
+  await saveUser(targetName);
+
+  disconnectUserSessions(targetName, 'user_banned', { reason: userDatabase[targetName].banReason, by: adminName || 'Admin' });
+  io.emit('online_list', getSanitizedOnlineList());
+  return { success: true, targetName, reason: userDatabase[targetName].banReason };
+}
+
+async function unbanUser(targetName, adminName) {
+  if (!targetName) return { success: false, message: "Missing target user." };
+  if (!userDatabase[targetName]) return { success: false, message: "User not found." };
+
+  userDatabase[targetName] = normalizeUserRecord(targetName, userDatabase[targetName]);
+  if (!isUserBanned(userDatabase[targetName])) {
+    return { success: false, message: "User is not banned." };
+  }
+
+  userDatabase[targetName].banned = false;
+  delete userDatabase[targetName].banReason;
+  delete userDatabase[targetName].bannedBy;
+  delete userDatabase[targetName].bannedAt;
+  await saveUser(targetName);
+
+  io.emit('online_list', getSanitizedOnlineList());
+  return { success: true, targetName };
+}
+
+async function resetUserPassword(targetName, newPassword, adminName) {
+  if (!targetName) return { success: false, message: "Missing target user." };
+  if (!userDatabase[targetName]) return { success: false, message: "User not found." };
+
+  const temporaryPassword = normalizeText(newPassword, "") || generateTemporaryPassword();
+  const hash = await bcrypt.hash(temporaryPassword, 10);
+  userDatabase[targetName].passwordHash = hash;
+  userDatabase[targetName].passwordResetAt = new Date().toISOString();
+  userDatabase[targetName].passwordResetBy = adminName || "Admin";
+  await saveUser(targetName);
+
+  disconnectUserSessions(targetName, 'password_reset_by_admin', { by: adminName || 'Admin' });
+  return { success: true, targetName, temporaryPassword };
 }
 
 async function createReport(data = {}, reporterName = "Unknown") {
@@ -606,8 +710,9 @@ io.on('connection', async (socket) => {
       const { name, password, userData, isNewAccount, adminMaintenanceBypass } = data;
       
       const dbRes = await pool.query('SELECT data FROM users WHERE name = $1', [name]);
-      const dbUser = dbRes.rows.length > 0 ? dbRes.rows[0].data : null;
+      let dbUser = dbRes.rows.length > 0 ? normalizeUserRecord(name, dbRes.rows[0].data || {}) : null;
 
+      const isHardcodedAdmin = ADMIN_USERS.includes(name);
       const isAdmin = isUserAdmin(name, dbUser);
 
       if (adminMaintenanceBypass === true && !isAdmin) {
@@ -615,7 +720,7 @@ io.on('connection', async (socket) => {
         return;
       }
 
-      if (dbUser && isUserBanned({ ...dbUser, name }) && !isAdmin) {
+      if (dbUser && isUserBanned({ ...dbUser, name }) && !isHardcodedAdmin) {
         socket.emit('auth_error', dbUser.banReason ? `This account is banned: ${dbUser.banReason}` : 'This account is banned.');
         return;
       }
@@ -639,8 +744,8 @@ io.on('connection', async (socket) => {
             id: socket.id,
             lastSeen: Date.now(),
             name: name,
-            role: dbUser.role || (isAdmin ? "admin" : "user"),
-            banned: !!dbUser.banned
+            role: getUserRole(name, dbUser),
+            banned: isUserBanned(dbUser)
           };
           
           await pool.query('UPDATE users SET data = $1 WHERE name = $2', [userDatabase[name], name]);
@@ -752,7 +857,7 @@ io.on('connection', async (socket) => {
             delete userData.passwordResetBy;
         }
 
-        if (isUserBanned(userDatabase[name]) && socket.isAdmin !== true) {
+        if (isUserBanned(userDatabase[name]) && !ADMIN_USERS.includes(name)) {
             socket.emit('auth_error', 'This account is banned.');
             return;
         }
@@ -861,29 +966,36 @@ io.on('connection', async (socket) => {
     const actorRole = getActorRole(socket);
     const senderName = socket.userName || messageData.user;
 
-    if (senderName && userDatabase[senderName] && isUserBanned(userDatabase[senderName]) && !isAdmin) {
+    const text = normalizeText(messageData.text, "");
+    const lowerText = text.toLowerCase();
+
+    if (senderName && userDatabase[senderName] && isUserBanned(userDatabase[senderName]) && !ADMIN_USERS.includes(senderName)) {
       const blocked = { success: false, reason: 'banned', message: 'Your account is banned.' };
       socket.emit('chat_blocked', blocked);
       respond(blocked);
       return;
     }
 
-    const text = normalizeText(messageData.text, "");
-
-    if (text.toLowerCase().startsWith('/kick')) {
+    if (lowerText.startsWith('/kick')) {
       if (!canModerate) {
-        socket.emit('chat_blocked', { reason: 'permission', message: 'Only admins/moderators can use /kick.' });
+        const blocked = { success: false, reason: 'permission', message: 'Only admins/moderators can use /kick.' };
+        socket.emit('chat_blocked', blocked);
+        respond(blocked);
         return;
       }
 
-      const targetName = text.split(' ').slice(1).join(' ').replace('@', '').trim();
+      const { targetName } = resolveCommandTarget(text.slice('/kick'.length));
       const targetSocket = getSocketsByUserName(targetName)[0];
       if (!targetName || !targetSocket) {
-        socket.emit('kick_error', { message: 'User not found or offline.' });
+        const error = { success: false, message: 'User not found or offline.' };
+        socket.emit('kick_error', error);
+        respond(error);
         return;
       }
       if (!canModerateTarget(socket, targetName)) {
-        socket.emit('kick_error', { message: 'You cannot kick this user.' });
+        const error = { success: false, message: 'You cannot kick this user.' };
+        socket.emit('kick_error', error);
+        respond(error);
         return;
       }
 
@@ -893,20 +1005,106 @@ io.on('connection', async (socket) => {
       setTimeout(() => {
         if (targetSocket.connected) targetSocket.disconnect(true);
       }, 2500);
+      respond({ success: true, command: 'kick', targetName });
       return;
     }
 
-    if ((text === '/reload' || text === '/force_reload') && isAdmin) {
+    if (lowerText.startsWith('/ban')) {
+      if (socket.isAdmin !== true) {
+        const blocked = { success: false, reason: 'permission', message: 'Only admins can use /ban.' };
+        socket.emit('chat_blocked', blocked);
+        respond(blocked);
+        return;
+      }
+
+      const { targetName, rest } = resolveCommandTarget(text.slice('/ban'.length));
+      const reason = rest || 'Banned by administrator';
+      const result = await banUser(targetName, reason, senderName || 'Admin');
+      if (result.success) {
+        await addModerationLog('ban', `Banned ${targetName} via chat command`, { targetName, reason: result.reason }, senderName || 'Admin');
+        socket.emit('admin_command_result', { command: 'ban', ...result });
+      } else {
+        socket.emit('admin_command_error', { command: 'ban', ...result });
+      }
+      respond({ command: 'ban', ...result });
+      return;
+    }
+
+    if (lowerText.startsWith('/unban')) {
+      if (socket.isAdmin !== true) {
+        const blocked = { success: false, reason: 'permission', message: 'Only admins can use /unban.' };
+        socket.emit('chat_blocked', blocked);
+        respond(blocked);
+        return;
+      }
+
+      const { targetName } = resolveCommandTarget(text.slice('/unban'.length), { onlyBanned: true });
+      const result = await unbanUser(targetName, senderName || 'Admin');
+      if (result.success) {
+        await addModerationLog('unban', `Unbanned ${targetName} via chat command`, { targetName }, senderName || 'Admin');
+        socket.emit('admin_command_result', { command: 'unban', ...result });
+      } else {
+        socket.emit('admin_command_error', { command: 'unban', ...result });
+      }
+      respond({ command: 'unban', ...result });
+      return;
+    }
+
+    if (lowerText.startsWith('/role')) {
+      if (socket.isAdmin !== true) {
+        const blocked = { success: false, reason: 'permission', message: 'Only admins can use /role.' };
+        socket.emit('chat_blocked', blocked);
+        respond(blocked);
+        return;
+      }
+
+      const { targetName, rest } = resolveCommandTarget(text.slice('/role'.length));
+      const role = normalizeText(rest, '').toLowerCase();
+      const result = await setUserRole(targetName, role, senderName || 'Admin');
+      if (result.success) {
+        await addModerationLog('role', `Changed ${targetName}'s role to ${result.role} via chat command`, { targetName, role: result.role }, senderName || 'Admin');
+        socket.emit('admin_command_result', { command: 'role', targetName, ...result });
+      } else {
+        socket.emit('admin_command_error', { command: 'role', targetName, ...result });
+      }
+      respond({ command: 'role', targetName, ...result });
+      return;
+    }
+
+    if (lowerText.startsWith('/resetpassword') || lowerText.startsWith('/reset_password')) {
+      if (socket.isAdmin !== true) {
+        const blocked = { success: false, reason: 'permission', message: 'Only admins can use /resetpassword.' };
+        socket.emit('chat_blocked', blocked);
+        respond(blocked);
+        return;
+      }
+
+      const commandName = lowerText.startsWith('/reset_password') ? '/reset_password' : '/resetpassword';
+      const { targetName, rest } = resolveCommandTarget(text.slice(commandName.length));
+      const result = await resetUserPassword(targetName, rest, senderName || 'Admin');
+      if (result.success) {
+        await addModerationLog('reset_password', `Reset password for ${targetName} via chat command`, { targetName }, senderName || 'Admin');
+        socket.emit('admin_command_result', { command: 'resetpassword', ...result });
+      } else {
+        socket.emit('admin_command_error', { command: 'resetpassword', ...result });
+      }
+      respond({ command: 'resetpassword', ...result });
+      return;
+    }
+
+    if ((lowerText === '/reload' || lowerText === '/force_reload') && isAdmin) {
       socket.broadcast.emit('force_reload');
       await addModerationLog('reload', 'Forced reload for connected users', {}, senderName || 'Admin');
+      respond({ success: true, command: 'reload' });
       return;
     }
 
-    if ((text === '/clean' || text === '/clear_chat') && isAdmin) {
+    if ((lowerText === '/clean' || lowerText === '/clear_chat') && isAdmin) {
       messageHistory = [];
       await pool.query('TRUNCATE chat');
       io.emit('chat_cleared');
       await addModerationLog('clear_chat', 'Cleared global chat history via command', {}, senderName || 'Admin');
+      respond({ success: true, command: 'clear_chat' });
       return;
     }
 
@@ -967,21 +1165,13 @@ io.on('connection', async (socket) => {
 
       const targetName = normalizeText(data && data.targetName, "");
       const newPassword = normalizeText(data && data.newPassword, "");
-      if (!targetName || !newPassword) return respond({ success: false, message: "Missing target or password." });
-      if (!userDatabase[targetName]) return respond({ success: false, message: "User not found." });
+      const result = await resetUserPassword(targetName, newPassword, socket.userName || normalizeText(data && data.adminUser, "Admin"));
 
-      const hash = await bcrypt.hash(newPassword, 10);
-      userDatabase[targetName].passwordHash = hash;
-      userDatabase[targetName].passwordResetAt = new Date().toISOString();
-      userDatabase[targetName].passwordResetBy = socket.userName || normalizeText(data.adminUser, "Admin");
-      await saveUser(targetName);
+      if (result.success) {
+        await addModerationLog('reset_password', `Reset temporary password for ${targetName}`, { targetName }, socket.userName || 'Admin');
+      }
 
-      getSocketsByUserName(targetName).forEach(client => {
-        client.emit('password_reset_by_admin', { by: socket.userName || 'Admin' });
-      });
-
-      await addModerationLog('reset_password', `Reset temporary password for ${targetName}`, { targetName }, socket.userName || 'Admin');
-      respond({ success: true });
+      respond(result);
     } catch (err) {
       console.error('[ADMIN RESET PASSWORD ERROR]:', err);
       respond({ success: false, message: "Server error while resetting password." });
@@ -995,25 +1185,35 @@ io.on('connection', async (socket) => {
 
       const targetName = normalizeText(data && data.targetName, "");
       const reason = normalizeText(data && data.reason, "Banned by administrator");
-      if (!targetName) return respond({ success: false, message: "Missing target user." });
-      if (!userDatabase[targetName]) return respond({ success: false, message: "User not found." });
-      if (ADMIN_USERS.includes(targetName)) return respond({ success: false, message: "Hardcoded admins cannot be banned from the panel." });
+      const result = await banUser(targetName, reason, socket.userName || normalizeText(data && data.adminUser, "Admin"));
 
-      userDatabase[targetName].role = "banned";
-      userDatabase[targetName].banned = true;
-      userDatabase[targetName].banReason = reason;
-      userDatabase[targetName].bannedBy = socket.userName || normalizeText(data.adminUser, "Admin");
-      userDatabase[targetName].bannedAt = new Date().toISOString();
-      await saveUser(targetName);
+      if (result.success) {
+        await addModerationLog('ban', `Banned ${targetName}`, { targetName, reason: result.reason }, socket.userName || 'Admin');
+      }
 
-      disconnectUserSessions(targetName, 'user_banned', { reason });
-      io.emit('online_list', getSanitizedOnlineList());
-
-      await addModerationLog('ban', `Banned ${targetName}`, { targetName, reason }, socket.userName || 'Admin');
-      respond({ success: true });
+      respond(result);
     } catch (err) {
       console.error('[ADMIN BAN ERROR]:', err);
       respond({ success: false, message: "Server error while banning user." });
+    }
+  });
+
+  socket.on('admin_unban_user', async (data, callback) => {
+    const respond = typeof callback === 'function' ? callback : () => {};
+    try {
+      if (socket.isAdmin !== true) return respond({ success: false, message: "Admin only." });
+
+      const targetName = normalizeText(data && data.targetName, "");
+      const result = await unbanUser(targetName, socket.userName || normalizeText(data && data.adminUser, "Admin"));
+
+      if (result.success) {
+        await addModerationLog('unban', `Unbanned ${targetName}`, { targetName }, socket.userName || 'Admin');
+      }
+
+      respond(result);
+    } catch (err) {
+      console.error('[ADMIN UNBAN ERROR]:', err);
+      respond({ success: false, message: "Server error while unbanning user." });
     }
   });
 
@@ -1028,7 +1228,6 @@ io.on('connection', async (socket) => {
 
       if (result.success) {
         await addModerationLog('role', `Changed ${targetName}'s role to ${result.role}`, { targetName, role: result.role }, socket.userName || 'Admin');
-        if (result.role === "banned") disconnectUserSessions(targetName, 'user_banned', { reason: userDatabase[targetName].banReason || "Banned by administrator" });
       }
 
       respond(result);

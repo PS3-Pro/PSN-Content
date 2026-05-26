@@ -17483,8 +17483,10 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 
 	function getChatCommandUserPools() {
 		const pools = [];
+		if (typeof currentOnlineList !== 'undefined' && Array.isArray(currentOnlineList)) pools.push(...currentOnlineList);
 		if (Array.isArray(window.currentOnlineList)) pools.push(...window.currentOnlineList);
 		if (Array.isArray(window.adminAllUsers)) pools.push(...window.adminAllUsers);
+		if (typeof globalSearchResults !== 'undefined' && Array.isArray(globalSearchResults)) pools.push(...globalSearchResults);
 		if (Array.isArray(window.globalSearchResults)) pools.push(...window.globalSearchResults);
 		if (Array.isArray(window.friendsList)) pools.push(...window.friendsList);
 		if (typeof chatUsers !== 'undefined' && chatUsers && typeof chatUsers.forEach === 'function') chatUsers.forEach(name => pools.push({ name }));
@@ -17516,6 +17518,60 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 		if (!meta) return false;
 		if (meta.adminOnly) return isAdmin;
 		return canModerate;
+	}
+
+	function getAdminCommandMeta(command) {
+		return ADMIN_COMMAND_LIST.find(c => c.cmd === String(command || '').toLowerCase()) || null;
+	}
+
+	function setChatInputCommandText(text, keepSuggestions = false) {
+		const input = document.getElementById('chat-input');
+		if (!input) return null;
+		input.innerText = String(text || '');
+		input.focus();
+		const range = document.createRange();
+		const sel = window.getSelection();
+		range.selectNodeContents(input);
+		range.collapse(false);
+		sel.removeAllRanges();
+		sel.addRange(range);
+		if (!keepSuggestions) {
+			const suggBox = document.getElementById('mention-suggestions');
+			if (suggBox) suggBox.style.display = 'none';
+		}
+		input.dispatchEvent(new Event('input', { bubbles: true }));
+		if (typeof updateJumpButtonPosition === 'function') updateJumpButtonPosition();
+		return input;
+	}
+
+	function parseCommandTargetTail(command, rawTail) {
+		const tail = String(rawTail || '').replace(/^\s+/, '');
+		if (!tail.startsWith('@')) {
+			return { hasAt: false, query: tail, targetName: '', targetFinished: false, afterTarget: '' };
+		}
+
+		const afterAt = tail.slice(1);
+		const lowerAfterAt = afterAt.toLowerCase();
+		const candidates = getChatCommandKnownUsers()
+			.map(u => String(u.name || '').trim())
+			.filter(Boolean)
+			.sort((a, b) => b.length - a.length);
+
+		for (const name of candidates) {
+			const lowerName = name.toLowerCase();
+			if (lowerAfterAt === lowerName || lowerAfterAt.startsWith(lowerName + ' ')) {
+				const rest = afterAt.slice(name.length);
+				return {
+					hasAt: true,
+					query: name,
+					targetName: name,
+					targetFinished: /^\s/.test(rest),
+					afterTarget: rest.replace(/^\s+/, '')
+				};
+			}
+		}
+
+		return { hasAt: true, query: afterAt, targetName: '', targetFinished: false, afterTarget: '' };
 	}
 
 	function positionChatSuggestionBox(box) {
@@ -17607,37 +17663,23 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 	}
 
 	function insertCommandTarget(cmd, target) {
-		const input = document.getElementById('chat-input');
-		if (!input) return;
 		cmd = String(cmd || '').toLowerCase();
 		target = String(target || '').trim();
-		input.innerText = `/${cmd} @${target}${cmd === 'role' ? ' ' : ''}`;
-		const suggBox = document.getElementById('mention-suggestions');
-		if (suggBox) suggBox.style.display = 'none';
-		input.focus();
-		const range = document.createRange();
-		const sel = window.getSelection();
-		range.selectNodeContents(input);
-		range.collapse(false);
-		sel.removeAllRanges();
-		sel.addRange(range);
-		input.dispatchEvent(new Event('input', { bubbles: true }));
+		const shouldLeaveSpace = ['role', 'ban', 'resetpassword'].includes(cmd);
+		setChatInputCommandText(`/${cmd} @${target}${shouldLeaveSpace ? ' ' : ''}`, cmd === 'role');
+
+		if (cmd === 'role') {
+			showRoleValueSuggestions(target, '');
+		} else {
+			const suggBox = document.getElementById('mention-suggestions');
+			if (suggBox) suggBox.style.display = 'none';
+		}
+
 		if (typeof playUiClick === 'function') playUiClick();
 	}
 
 	function insertRoleCommandValue(target, role) {
-		const input = document.getElementById('chat-input');
-		if (!input) return;
-		input.innerText = `/role @${String(target || '').trim()} ${String(role || '').trim()} `;
-		const suggBox = document.getElementById('mention-suggestions');
-		if (suggBox) suggBox.style.display = 'none';
-		input.focus();
-		const range = document.createRange();
-		const sel = window.getSelection();
-		range.selectNodeContents(input);
-		range.collapse(false);
-		sel.removeAllRanges();
-		sel.addRange(range);
+		setChatInputCommandText(`/role @${String(target || '').trim()} ${String(role || '').trim()} `);
 		if (typeof playUiClick === 'function') playUiClick();
 	}
 
@@ -17647,23 +17689,39 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 		const parts = trimmedLeft.split(/\s+/);
 		const first = parts[0] || '';
 		const command = first.substring(1).toLowerCase();
-		const commandMeta = ADMIN_COMMAND_LIST.find(c => c.cmd === command);
+		const commandMeta = getAdminCommandMeta(command);
 		if (!commandMeta || !commandMeta.needsTarget) return false;
+
 		const afterCommand = trimmedLeft.slice(first.length);
+		const hasSeparatorAfterCommand = /^\s/.test(afterCommand);
+		if (!hasSeparatorAfterCommand) return false;
+
 		const afterNoLeading = afterCommand.replace(/^\s+/, '');
-		if (command === 'role') {
-			const roleParts = afterNoLeading.split(/\s+/).filter(Boolean);
-			const targetPart = roleParts[0] || '';
-			const hasTargetFinished = targetPart && (/\s$/.test(afterNoLeading) || roleParts.length > 1);
-			if (!hasTargetFinished) {
-				showCommandTargetSuggestions(command, targetPart.replace(/^@/, ''));
-			} else {
-				showRoleValueSuggestions(targetPart.replace(/^@/, ''), roleParts[1] || '');
-			}
+		if (!afterNoLeading) {
+			const suggBox = document.getElementById('mention-suggestions');
+			if (suggBox) suggBox.style.display = 'none';
 			return true;
 		}
-		const targetQuery = afterNoLeading.split(/\s+/)[0] || '';
-		showCommandTargetSuggestions(command, targetQuery.replace(/^@/, ''));
+
+		const parsed = parseCommandTargetTail(command, afterNoLeading);
+		if (!parsed.hasAt) {
+			const suggBox = document.getElementById('mention-suggestions');
+			if (suggBox) suggBox.style.display = 'none';
+			return true;
+		}
+
+		if (!parsed.targetFinished) {
+			showCommandTargetSuggestions(command, parsed.query);
+			return true;
+		}
+
+		if (command === 'role') {
+			showRoleValueSuggestions(parsed.targetName, parsed.afterTarget);
+			return true;
+		}
+
+		const suggBox = document.getElementById('mention-suggestions');
+		if (suggBox) suggBox.style.display = 'none';
 		return true;
 	}
 
@@ -17692,16 +17750,38 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 			.filter(c => c.cmd.toLowerCase().includes(query.toLowerCase()));
 	
 		if (filtered.length > 0) {
-			box.innerHTML = filtered.map((c, i) => `
-				<div class="suggestion-item ${i === 0 ? 'active' : ''}" 
-					data-command="${c.cmd}" 
-					onmouseenter="if(typeof playUiHover === 'function') playUiHover()"
-					onmousedown="event.preventDefault(); insertCommand('${c.cmd}')">
-					<i class="fas fa-terminal" style="color: #ffcc00; font-size: 10px;"></i> 
-					<b style="color: #fff; margin-left: 3px;">/${c.cmd}</b>
-					<span style="font-size: 8px; opacity: 0.5; margin-left: 5px;">${c.desc}</span>
-				</div>
-			`).join('');
+			const isChatAction = (cmd) => ['reload', 'clean'].includes(String(cmd || '').toLowerCase());
+			const groups = [
+				{ title: 'ADMIN ACTIONS', hint: 'user control', color: '#8be8ff', icon: 'fa-user-shield', items: filtered.filter(c => !isChatAction(c.cmd)) },
+				{ title: 'CHAT ACTIONS', hint: 'room control', color: '#00e5a8', icon: 'fa-comments', items: filtered.filter(c => isChatAction(c.cmd)) }
+			].filter(group => group.items.length > 0);
+
+			let activeIndex = 0;
+			box.innerHTML = groups.map((group, groupIndex) => {
+				const divider = groupIndex > 0 ? '<div style="height:1px; margin:6px 10px; background:linear-gradient(90deg, transparent, rgba(255,255,255,0.18), transparent);"></div>' : '';
+				const header = `
+					<div style="display:flex; align-items:center; gap:6px; margin:7px 12px 3px; font-size:9px; font-weight:900; letter-spacing:1px; color:${group.color}; text-transform:uppercase; opacity:.95;">
+						<i class="fas ${group.icon}" style="font-size:9px;"></i>
+						<span>${group.title}</span>
+						<span style="font-size:8px; color:rgba(255,255,255,.38); font-weight:700; letter-spacing:.4px; text-transform:none;">${group.hint}</span>
+					</div>`;
+				const items = group.items.map(c => {
+					const currentIndex = activeIndex++;
+					const cmdIcon = isChatAction(c.cmd) ? (c.cmd === 'reload' ? 'fa-sync-alt' : 'fa-broom') : 'fa-terminal';
+					const cmdColor = isChatAction(c.cmd) ? '#00e5a8' : '#ffcc00';
+					return `
+						<div class="suggestion-item ${currentIndex === 0 ? 'active' : ''}" 
+							data-command="${c.cmd}" 
+							onmouseenter="if(typeof playUiHover === 'function') playUiHover()"
+							onmousedown="event.preventDefault(); insertCommand('${c.cmd}')">
+							<i class="fas ${cmdIcon}" style="color: ${cmdColor}; font-size: 10px; width: 12px; text-align:center;"></i> 
+							<b style="color: #fff; margin-left: 3px;">/${c.cmd}</b>
+							<span style="font-size: 8px; opacity: 0.5; margin-left: 5px;">${c.desc}</span>
+						</div>
+					`;
+				}).join('');
+				return divider + header + items;
+			}).join('');
 			
 			box.style.display = 'block';
 			selectedSuggestionIndex = 0;
@@ -17731,28 +17811,18 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 	}
 
     function insertCommand(cmd) {
-		const input = document.getElementById('chat-input');
-		if (!input) return;
-	
-		input.innerText = '/' + cmd + ' ';
-		
-		const suggBox = document.getElementById('mention-suggestions');
-		if (suggBox) suggBox.style.display = 'none';
-		
-		input.focus();
-	
-		const range = document.createRange();
-		const sel = window.getSelection();
-		range.selectNodeContents(input);
-		range.collapse(false);
-		sel.removeAllRanges();
-		sel.addRange(range);
-	
-		if (typeof playUiClick === 'function') playUiClick();
-		
-		if (typeof updateJumpButtonPosition === 'function') {
-			updateJumpButtonPosition();
+		cmd = String(cmd || '').toLowerCase();
+		const meta = getAdminCommandMeta(cmd);
+		if (!meta) return;
+
+		if (meta.needsTarget) {
+			setChatInputCommandText('/' + cmd + ' @', true);
+			showCommandTargetSuggestions(cmd, '');
+		} else {
+			setChatInputCommandText('/' + cmd + ' ');
 		}
+
+		if (typeof playUiClick === 'function') playUiClick();
 	}
 	
 	function triggerCommandBtn() {
@@ -19546,6 +19616,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 			const isVisible = modal && (modal.style.display === 'flex' || modal.classList.contains('show'));
 			
 			currentOnlineList = users;
+			window.currentOnlineList = users;
 			if (typeof window.syncPsnUserMeta === 'function') users.forEach(u => window.syncPsnUserMeta(u));
 			if (document.getElementById('view-admin')?.style.display === 'block' && typeof renderAdminPanel === 'function') {
 				renderAdminPanel();
