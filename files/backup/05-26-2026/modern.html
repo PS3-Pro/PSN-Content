@@ -3022,22 +3022,6 @@ body:not(.is-admin) #view-admin { display: none !important; }
 				
 				<div class="setting-item" onmouseenter="playUiHover()">
 					<div>
-						<div style="font-size: 18px; color: #fff; font-weight: 500;">Companion Plugin</div>
-						<div style="font-size: 13px; color: var(--text-muted); margin-top: 6px;">
-							Automatically installs and loads the PS3™ companion plugin when the store connects.
-						</div>
-						<div id="companion-plugin-status" style="font-size: 11px; color: var(--ps-blue); margin-top: 8px; font-weight: bold; opacity: 0.85;">
-							<i class="fas fa-plug"></i> ENABLED
-						</div>
-					</div>
-					<label class="switch">
-						<input type="checkbox" id="companion-plugin-toggle" onchange="toggleCompanionPlugin()" checked>
-						<span class="slider"></span>
-					</label>
-				</div>
-
-				<div class="setting-item" onmouseenter="playUiHover()">
-					<div>
 						<div style="font-size: 18px; color: #fff; font-weight: 500;">Background Music</div>
 						<div style="font-size: 13px; color: var(--text-muted); margin-top: 6px;">
 							Set whether or not to play background music.
@@ -4005,10 +3989,6 @@ body:not(.is-admin) #view-admin { display: none !important; }
 		let chatState = loadState(STORAGE_KEY_CHAT_SOUND);
 		let chatToggle = document.getElementById('chat-sound-toggle');
 		if (chatToggle) chatToggle.checked = (chatState !== "0");
-
-		let companionToggle = document.getElementById('companion-plugin-toggle');
-		if (companionToggle) companionToggle.checked = (loadState(STORAGE_KEY_COMPANION_PLUGIN) !== "0");
-		if (typeof updateCompanionPluginStatus === 'function') updateCompanionPluginStatus();
 	}
 	
 	function initAudioSettings() {
@@ -4038,7 +4018,6 @@ body:not(.is-admin) #view-admin { display: none !important; }
     const STORAGE_KEY_AUDIO = "psn_audio_state";
 	const STORAGE_KEY_UX = "psn_ux_sounds_state";
 	const STORAGE_KEY_CHAT_SOUND = "psn_chat_sound_state";
-	const STORAGE_KEY_COMPANION_PLUGIN = "psn_companion_plugin_enabled";
     const STORAGE_KEY_FAVS = "ps3_library_favs";
     const GLOBAL_USERS_KEY = 'psn_global_users';
 	const STORAGE_KEY_FRIENDS = "psn_friends_list";
@@ -9984,9 +9963,18 @@ body:not(.is-admin) #view-admin { display: none !important; }
 		}
 		try {
 			adminSetChatControlsSyncState('syncing');
-			socketChat.emit('admin_request_chat_controls', { at: Date.now() });
-			socketChat.emit('admin_request_admin_state', { at: Date.now() });
-				socketChat.emit('admin_request_server_log');
+			socketChat.emit('admin_request_chat_controls', { at: Date.now() }, response => {
+				if (response && response.state && typeof adminSetChatControls === 'function') {
+					adminSetChatControls({ ...response.state, source: 'server', serverSynced: true }, false);
+				}
+			});
+			socketChat.emit('admin_request_admin_state', { at: Date.now() }, response => {
+				const state = response && (response.state || response);
+				if (state && state.chatControls && typeof adminSetChatControls === 'function') {
+					adminSetChatControls({ ...state.chatControls, source: 'server', serverSynced: true }, false);
+				}
+			});
+			socketChat.emit('admin_request_server_log');
 			window.adminChatControlsLastRequested = Date.now();
 			setTimeout(() => {
 				if (window.adminChatControlsSyncState === 'syncing' && Date.now() - (window.adminChatControlsLastRequested || 0) > 2400) {
@@ -10315,14 +10303,20 @@ body:not(.is-admin) #view-admin { display: none !important; }
 	}
 
 	function adminStartChatControlsRealtimeSync() {
-		if (window.adminChatControlsRealtimeSyncTimer) return;
-		window.adminChatControlsRealtimeSyncTimer = setInterval(() => {
+		const requestVisualState = () => {
 			try {
 				if (typeof socketChat !== 'undefined' && socketChat && socketChat.connected) {
-					socketChat.emit('admin_request_chat_controls', { visualSync: true, at: Date.now() });
+					socketChat.emit('admin_request_chat_controls', { visualSync: true, at: Date.now() }, response => {
+						if (response && response.state && typeof adminSetChatControls === 'function') {
+							adminSetChatControls({ ...response.state, source: 'server', serverSynced: true }, false);
+						}
+					});
 				}
 			} catch (e) {}
-		}, 2500);
+		};
+		requestVisualState();
+		if (window.adminChatControlsRealtimeSyncTimer) return;
+		window.adminChatControlsRealtimeSyncTimer = setInterval(requestVisualState, 1000);
 	}
 
 	function adminStopChatControlsRealtimeSync() {
@@ -10810,6 +10804,12 @@ body:not(.is-admin) #view-admin { display: none !important; }
 		socketChat.on('admin_chat_controls_state', data => { adminSetChatControls({ ...(data || {}), source: 'server', serverSynced: true }, false); renderAdminPanel(); });
 		socketChat.on('chat_blocked', data => {
 			if (data && data.controls) adminSetChatControls({ ...data.controls, source: 'server', serverSynced: true }, false);
+			if (data && data.reason === 'slow_mode' && data.waitSeconds && data.controls && data.controls.slowSeconds) {
+				const slowMs = Math.max(0, parseInt(data.controls.slowSeconds || 0, 10) || 0) * 1000;
+				const waitMs = Math.max(0, parseInt(data.waitSeconds || 0, 10) || 0) * 1000;
+				localStorage.setItem('psn_chat_last_sent_at', String(Date.now() - Math.max(0, slowMs - waitMs)));
+			}
+			if (typeof playUiError === 'function') playUiError();
 			if (typeof adminUpdateChatControlsBanner === 'function') adminUpdateChatControlsBanner();
 		});
 		socketChat.on('admin_state', data => {
@@ -10834,6 +10834,14 @@ body:not(.is-admin) #view-admin { display: none !important; }
 			adminSetModerationLog(Array.isArray(list) ? list : []);
 			if (document.getElementById('view-admin')?.style.display === 'block') renderAdminPanel();
 		});
+
+		if (socketChat.connected) {
+			syncAdminHealth('online');
+			adminSetChatControlsSyncState('syncing');
+			if (typeof window.adminRequestChatControlsState === 'function') window.adminRequestChatControlsState();
+			if (typeof adminStartChatControlsRealtimeSync === 'function') adminStartChatControlsRealtimeSync();
+			if (typeof adminUpdateChatControlsBanner === 'function') setTimeout(adminUpdateChatControlsBanner, 60);
+		}
 	}
 
 	function adminBootExtras() {
@@ -14622,131 +14630,6 @@ body:not(.is-admin) #view-admin { display: none !important; }
 		alert("Mount command sent to the console!");
 	}
 	
-
-	const COMPANION_PLUGIN_PATH = "/dev_hdd0/game/PSNDTBASE/companion.sprx";
-	const COMPANION_PLUGIN_PKG_URL = "https://github.com/PS3-Pro/PSN-Content/releases/download/Release/PlayStation_Network_Database.pkg";
-	let companionPluginBusy = false;
-
-	function getCurrentPs3Ip() {
-		return (document.getElementById('ps3-ip')?.value || '').trim();
-	}
-
-	function isCompanionPluginEnabled() {
-		return loadState(STORAGE_KEY_COMPANION_PLUGIN) !== "0";
-	}
-
-	function isPs3CurrentlyConnected() {
-		const globalIcon = document.getElementById('global-status-icon');
-		return !!(_lastConnectionState === true && globalIcon && globalIcon.classList.contains('status-dot-connected') && getCurrentPs3Ip());
-	}
-
-	function updateCompanionPluginStatus(text = null, color = null) {
-		const status = document.getElementById('companion-plugin-status');
-		if (!status) return;
-		if (text) {
-			status.innerHTML = text;
-			status.style.color = color || 'var(--ps-blue)';
-			return;
-		}
-		if (isCompanionPluginEnabled()) {
-			status.innerHTML = '<i class="fas fa-plug"></i> ENABLED';
-			status.style.color = 'var(--ps-blue)';
-		} else {
-			status.innerHTML = '<i class="fas fa-plug-circle-xmark"></i> DISABLED';
-			status.style.color = '#ff7777';
-		}
-	}
-
-	async function companionWebmanCommand(ip, commandPath) {
-		await fetch(`http://${ip}${commandPath}`, { mode: 'no-cors', cache: 'no-store' });
-	}
-
-	async function companionFileExists(ip, path) {
-		try {
-			const res = await fetch(`http://${ip}${path}?_=${Date.now()}`, { cache: 'no-store' });
-			return !!(res && res.ok);
-		} catch (err) {
-			return false;
-		}
-	}
-
-	async function ensureCompanionPluginInstalled(ip) {
-		const exists = await companionFileExists(ip, COMPANION_PLUGIN_PATH);
-		if (exists) return true;
-
-		updateCompanionPluginStatus('<i class="fas fa-circle-notch fa-spin"></i> INSTALLING COMPANION PLUGIN', '#ffcc00');
-		await companionWebmanCommand(ip, `/install.ps3?url=${encodeURIComponent(COMPANION_PLUGIN_PKG_URL)}`);
-
-		if (typeof showToastNotification === 'function') {
-			showToastNotification('Companion Plugin', 'Required plugin was missing. Installation command sent to PS3™.');
-		}
-		return false;
-	}
-
-	async function loadCompanionPlugin(ip, forceInstallCheck = true) {
-		if (!isCompanionPluginEnabled()) return false;
-		if (!ip) return false;
-		if (companionPluginBusy) return false;
-		companionPluginBusy = true;
-
-		try {
-			updateCompanionPluginStatus('<i class="fas fa-circle-notch fa-spin"></i> CHECKING COMPANION PLUGIN', '#ffcc00');
-			const installed = forceInstallCheck ? await ensureCompanionPluginInstalled(ip) : true;
-
-			await companionWebmanCommand(ip, `/loadprx.ps3${COMPANION_PLUGIN_PATH}`);
-			updateCompanionPluginStatus(installed ? '<i class="fas fa-check-circle"></i> LOADED ON PS3™' : '<i class="fas fa-download"></i> INSTALL SENT / LOAD REQUESTED', installed ? '#4caf50' : '#ffcc00');
-			return true;
-		} catch (err) {
-			console.warn('[Companion Plugin] Could not load plugin:', err);
-			updateCompanionPluginStatus('<i class="fas fa-exclamation-triangle"></i> COULD NOT LOAD', '#ff7777');
-			return false;
-		} finally {
-			companionPluginBusy = false;
-		}
-	}
-
-	async function unloadCompanionPlugin(ip = getCurrentPs3Ip()) {
-		if (!ip) return false;
-		try {
-			await companionWebmanCommand(ip, `/unloadprx.ps3${COMPANION_PLUGIN_PATH}`);
-			updateCompanionPluginStatus('<i class="fas fa-power-off"></i> UNLOADED / DISABLED', '#ff7777');
-			if (typeof showToastNotification === 'function') {
-				showToastNotification('Companion Plugin', 'Plugin unload command sent to PS3™.');
-			}
-			return true;
-		} catch (err) {
-			console.warn('[Companion Plugin] Could not unload plugin:', err);
-			updateCompanionPluginStatus('<i class="fas fa-exclamation-triangle"></i> UNLOAD FAILED', '#ff7777');
-			return false;
-		}
-	}
-
-	async function syncCompanionPluginOnConnect(ip) {
-		if (!isCompanionPluginEnabled()) {
-			updateCompanionPluginStatus('<i class="fas fa-plug-circle-xmark"></i> DISABLED', '#ff7777');
-			return;
-		}
-		await loadCompanionPlugin(ip, true);
-	}
-
-	window.toggleCompanionPlugin = async function() {
-		const toggle = document.getElementById('companion-plugin-toggle');
-		const enabled = !!(toggle && toggle.checked);
-		saveState(STORAGE_KEY_COMPANION_PLUGIN, enabled ? "1" : "0");
-		if (typeof playUiToggle === 'function') playUiToggle();
-
-		if (!isPs3CurrentlyConnected()) {
-			updateCompanionPluginStatus(enabled ? '<i class="fas fa-plug"></i> ENABLED' : '<i class="fas fa-plug-circle-xmark"></i> DISABLED', enabled ? 'var(--ps-blue)' : '#ff7777');
-			return;
-		}
-
-		if (enabled) {
-			await loadCompanionPlugin(getCurrentPs3Ip(), true);
-		} else {
-			await unloadCompanionPlugin(getCurrentPs3Ip());
-		}
-	};
-
 window.showLibrarySection = function(type, noScrollToTop = false) {
 	const targetNavId = (type === 'files') ? 'nav-lib-explorer' : (type === 'favorites') ? 'nav-lib-favs' : 'nav-lib-games';
 	const targetNavItem = document.getElementById(targetNavId);
@@ -14889,11 +14772,29 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 			playUiSuccess();
 			sendConnectionPopup(ip);
 	
-			setTimeout(() => {
-				if (typeof syncCompanionPluginOnConnect === 'function') {
-					syncCompanionPluginOnConnect(ip);
-				}
-			}, 1200);
+			if (isNewIp) {
+				setTimeout(async () => {
+					let appFound = false;
+					try {
+						const checkApp = await fetch(`http://${ip}/dev_hdd0/game/PSNDTBASE/PARAM.SFO`, { 
+							cache: 'no-store' 
+						});
+						if (checkApp.ok) appFound = true;
+					} catch (e) {
+						appFound = false;
+					}
+	
+					if (!appFound) {
+						const installApp = confirm("New console detected!\n\nThe system found that 'PlayStation Network Database' is not installed on your PS3™.\n\nWould you like to download and install the console version directly?");
+						
+						if (installApp) {
+							const pkgUrl = "https://github.com/PS3-Pro/PSN-Content/releases/download/Release/PlayStation_Network_Database.pkg";
+							fetch(`http://${ip}/install.ps3?url=${pkgUrl}`, { mode: 'no-cors' });
+							alert("Download command sent to PS3!\n\nLook at your XMB™ (TV Column).");
+						}
+					}
+				}, 1500);
+			}
 			
 			showToastNotification(
 				"Console Linked", 
@@ -18261,10 +18162,13 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 			}
 			socketChat = null;
 		}
+		window.adminSocketListenersInstalled = false;
+		window.adminSocketListenersSocket = null;
 		
 		if (typeof updateGlobalOnlineStatus === 'function') updateGlobalOnlineStatus('connecting');
 
-		socketChat = io(serverUrls[currentServerIndex], { forceNew: true })
+		socketChat = io(serverUrls[currentServerIndex], { forceNew: true });
+		if (typeof adminInstallSocketListeners === 'function') adminInstallSocketListeners();
 		
 		socketChat.on('connect', () => {
 			if (typeof updateGlobalOnlineStatus === 'function') updateGlobalOnlineStatus('online');
@@ -19648,7 +19552,27 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 			isGlobalPing: globalPingActive
 		};
 		
-		socketChat.emit('chat_message', data);
+		const sentDraftHtml = input.innerHTML;
+		const sentPendingImages = Array.isArray(pendingImages) ? [...pendingImages] : [];
+		socketChat.emit('chat_message', data, response => {
+			if (response && response.success === false) {
+				if (typeof playUiError === 'function') playUiError();
+				if (response.controls && typeof adminSetChatControls === 'function') {
+					adminSetChatControls({ ...response.controls, source: 'server', serverSynced: true }, false);
+				}
+				if (response.reason === 'slow_mode' && response.waitSeconds && response.controls && response.controls.slowSeconds) {
+					const slowMs = Math.max(0, parseInt(response.controls.slowSeconds || 0, 10) || 0) * 1000;
+					const waitMs = Math.max(0, parseInt(response.waitSeconds || 0, 10) || 0) * 1000;
+					localStorage.setItem('psn_chat_last_sent_at', String(Date.now() - Math.max(0, slowMs - waitMs)));
+				}
+				if (!input.innerHTML.trim() && sentDraftHtml) input.innerHTML = sentDraftHtml;
+				if (!pendingImages.length && sentPendingImages.length) {
+					pendingImages = sentPendingImages;
+					showImagePreview();
+				}
+				if (typeof adminUpdateChatControlsBanner === 'function') adminUpdateChatControlsBanner();
+			}
+		});
 		if (!canModerate) {
 			localStorage.setItem('psn_chat_last_sent_at', String(Date.now()));
 			if (typeof adminUpdateChatControlsBanner === 'function') setTimeout(adminUpdateChatControlsBanner, 0);
