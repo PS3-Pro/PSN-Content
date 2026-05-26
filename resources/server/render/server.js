@@ -51,7 +51,46 @@ let adminState = {
   pinnedAnnouncement: null
 };
 let moderationLog = [];
+let serverLog = [];
 let adminReports = [];
+
+async function refreshAdminStateFromDb() {
+  try {
+    const stateRes = await pool.query('SELECT state_key, data FROM admin_state');
+    stateRes.rows.forEach(row => {
+      if (row.state_key === ADMIN_STATE_KEYS.maintenance) {
+        adminState.maintenance = normalizeMaintenanceState(row.data || {});
+      } else if (row.state_key === ADMIN_STATE_KEYS.chatControls) {
+        adminState.chatControls = normalizeChatControls(row.data || {});
+      } else if (row.state_key === ADMIN_STATE_KEYS.pinnedAnnouncement) {
+        adminState.pinnedAnnouncement = row.data && row.data.text ? row.data : null;
+      }
+    });
+  } catch (err) {
+    console.error('[ADMIN STATE REFRESH ERROR]:', err);
+  }
+  return adminState;
+}
+
+async function refreshModerationLogFromDb() {
+  try {
+    const modLogRes = await pool.query('SELECT entry FROM moderation_log ORDER BY created_at DESC LIMIT 100');
+    moderationLog = modLogRes.rows.map(r => r.entry);
+  } catch (err) {
+    console.error('[ADMIN LOG REFRESH ERROR]:', err);
+  }
+  return moderationLog;
+}
+
+async function refreshServerLogFromDb() {
+  try {
+    const logRes = await pool.query('SELECT entry FROM server_log ORDER BY created_at DESC LIMIT 120');
+    serverLog = logRes.rows.map(r => r.entry);
+  } catch (err) {
+    console.error('[SERVER LOG REFRESH ERROR]:', err);
+  }
+  return serverLog;
+}
 
 async function initDb() {
   await pool.query(`
@@ -77,6 +116,11 @@ async function initDb() {
       entry JSONB,
       created_at TIMESTAMPTZ DEFAULT NOW()
     );
+    CREATE TABLE IF NOT EXISTS server_log (
+      id SERIAL PRIMARY KEY,
+      entry JSONB,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
     CREATE TABLE IF NOT EXISTS reports (
       id TEXT PRIMARY KEY,
       data JSONB,
@@ -98,22 +142,16 @@ async function initDb() {
   const pinnedRes = await pool.query('SELECT data FROM pinned_messages ORDER BY id ASC');
   pinnedMessages = pinnedRes.rows.map(r => r.data);
 
-  const stateRes = await pool.query('SELECT state_key, data FROM admin_state');
-  stateRes.rows.forEach(row => {
-    if (row.state_key === ADMIN_STATE_KEYS.maintenance) {
-      adminState.maintenance = normalizeMaintenanceState(row.data || {});
-    } else if (row.state_key === ADMIN_STATE_KEYS.chatControls) {
-      adminState.chatControls = normalizeChatControls(row.data || {});
-    } else if (row.state_key === ADMIN_STATE_KEYS.pinnedAnnouncement) {
-      adminState.pinnedAnnouncement = row.data && row.data.text ? row.data : null;
-    }
-  });
+  await refreshAdminStateFromDb();
 
   const reportsRes = await pool.query('SELECT data FROM reports WHERE resolved = false ORDER BY created_at DESC LIMIT 100');
   adminReports = reportsRes.rows.map(r => r.data);
 
   const modLogRes = await pool.query('SELECT entry FROM moderation_log ORDER BY created_at DESC LIMIT 100');
   moderationLog = modLogRes.rows.map(r => r.entry);
+
+  const serverLogRes = await pool.query('SELECT entry FROM server_log ORDER BY created_at DESC LIMIT 120');
+  serverLog = serverLogRes.rows.map(r => r.entry);
 
   console.log(`[DB] Database initialized. ${messageHistory.length} messages, ${pinnedMessages.length} pins, ${Object.keys(userDatabase).length} users loaded.`);
 }
@@ -183,6 +221,84 @@ function normalizeText(value, fallback = "") {
   return String(value === undefined || value === null ? fallback : value).trim();
 }
 
+function normalizeTimeValue(value, fallback = "00:00") {
+  const text = normalizeText(value, fallback);
+  const match = text.match(/^(\d{1,2}):(\d{2})$/);
+  if (!match) return fallback;
+  const hour = Math.max(0, Math.min(23, parseInt(match[1], 10) || 0));
+  const minute = Math.max(0, Math.min(59, parseInt(match[2], 10) || 0));
+  return `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
+}
+
+function parseTimeToMinutes(value) {
+  const safe = normalizeTimeValue(value, "00:00");
+  const [hour, minute] = safe.split(':').map(n => parseInt(n, 10) || 0);
+  return hour * 60 + minute;
+}
+
+function normalizeMaintenanceSchedule(data = {}) {
+  const rawDays = Array.isArray(data.days) ? data.days : [];
+  const days = [...new Set(rawDays.map(day => parseInt(day, 10)).filter(day => day >= 0 && day <= 6))].sort((a, b) => a - b);
+  return {
+    enabled: !!data.enabled,
+    days,
+    startTime: normalizeTimeValue(data.startTime, "02:00"),
+    endTime: normalizeTimeValue(data.endTime, "03:00"),
+    timezone: normalizeText(data.timezone, "America/Sao_Paulo") || "America/Sao_Paulo"
+  };
+}
+
+function getZonedNowParts(date = new Date(), timezone = "America/Sao_Paulo") {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: timezone || "America/Sao_Paulo",
+    weekday: 'short',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hourCycle: 'h23'
+  }).formatToParts(date);
+  const get = type => (parts.find(part => part.type === type) || {}).value || '';
+  const dayMap = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
+  const hour = parseInt(get('hour'), 10) || 0;
+  const minute = parseInt(get('minute'), 10) || 0;
+  const second = parseInt(get('second'), 10) || 0;
+  return {
+    day: dayMap[get('weekday')] ?? 0,
+    minutes: hour * 60 + minute,
+    seconds: second
+  };
+}
+
+function getMaintenanceScheduleStatus(schedule = {}, now = new Date()) {
+  const normalized = normalizeMaintenanceSchedule(schedule);
+  if (!normalized.enabled || !normalized.days.length) {
+    return { active: false, activeUntil: null };
+  }
+
+  const start = parseTimeToMinutes(normalized.startTime);
+  const end = parseTimeToMinutes(normalized.endTime);
+  if (start === end) return { active: false, activeUntil: null };
+
+  const current = getZonedNowParts(now, normalized.timezone);
+  const previousDay = (current.day + 6) % 7;
+  let active = false;
+  let minutesLeft = 0;
+
+  if (start < end) {
+    active = normalized.days.includes(current.day) && current.minutes >= start && current.minutes < end;
+    minutesLeft = active ? end - current.minutes : 0;
+  } else {
+    const activeFromToday = normalized.days.includes(current.day) && current.minutes >= start;
+    const activeFromYesterday = normalized.days.includes(previousDay) && current.minutes < end;
+    active = activeFromToday || activeFromYesterday;
+    minutesLeft = activeFromToday ? (1440 - current.minutes + end) : (activeFromYesterday ? end - current.minutes : 0);
+  }
+
+  if (!active) return { active: false, activeUntil: null };
+  const msLeft = Math.max(0, (minutesLeft * 60 - current.seconds) * 1000);
+  return { active: true, activeUntil: new Date(now.getTime() + msLeft).toISOString() };
+}
+
 function getUserRole(name, userData = null) {
   const rawRole = normalizeText(userData && userData.role, ADMIN_USERS.includes(name) ? "admin" : "user").toLowerCase();
   if (rawRole === "moderator") return "mod";
@@ -223,11 +339,20 @@ function isUserBanned(userData = null) {
 }
 
 function normalizeMaintenanceState(data = {}) {
+  const schedule = normalizeMaintenanceSchedule(data.schedule || {});
+  const scheduled = getMaintenanceScheduleStatus(schedule);
+  const manualEnabled = data.manualEnabled === undefined ? !!data.enabled : !!data.manualEnabled;
+  const enabled = manualEnabled || scheduled.active;
+
   return {
-    enabled: !!data.enabled,
+    enabled,
+    manualEnabled,
+    scheduledActive: scheduled.active,
+    activeUntil: scheduled.activeUntil || data.activeUntil || null,
     message: normalizeText(data.message, DEFAULT_MAINTENANCE_MESSAGE) || DEFAULT_MAINTENANCE_MESSAGE,
     by: normalizeText(data.by, ""),
-    at: data.at || (data.enabled ? new Date().toISOString() : null)
+    at: data.at || (enabled ? new Date().toISOString() : null),
+    schedule
   };
 }
 
@@ -292,10 +417,12 @@ function emitAdminState(socket) {
       maintenance: adminState.maintenance,
       chatControls: adminState.chatControls,
       pinnedAnnouncement: adminState.pinnedAnnouncement || null,
-      reports: adminReports
+      reports: adminReports,
+      serverLog
     });
     socket.emit('admin_chat_controls_state', adminState.chatControls);
     socket.emit('reports_list', adminReports);
+    socket.emit('admin_server_log_list', serverLog);
   }
 }
 
@@ -325,6 +452,30 @@ async function addModerationLog(type, message, detail = {}, admin = "System") {
   }
 
   emitToAdmins('admin_moderation_log', entry);
+  return entry;
+}
+
+
+async function addServerLog(type, message, detail = {}, user = "Server") {
+  const entry = {
+    id: `server-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    type,
+    message,
+    detail,
+    user,
+    time: new Date().toISOString()
+  };
+
+  serverLog.unshift(entry);
+  serverLog = serverLog.slice(0, 120);
+
+  try {
+    await pool.query('INSERT INTO server_log (entry) VALUES ($1)', [entry]);
+  } catch (err) {
+    console.error('[SERVER LOG ERROR]:', err);
+  }
+
+  emitToAdmins('admin_server_log', entry);
   return entry;
 }
 
@@ -417,18 +568,52 @@ const io = new Server(server, {
   maxHttpBufferSize: 1e7
 });
 
-io.on('connection', (socket) => {
+async function syncAdminStateAcrossInstances() {
+  const previous = JSON.stringify(adminState);
+  const previousServerLog = JSON.stringify(serverLog);
+  await refreshAdminStateFromDb();
+  await refreshServerLogFromDb();
+
+  if (JSON.stringify(serverLog) !== previousServerLog) {
+    emitToAdmins('admin_server_log_list', serverLog);
+  }
+
+  if (JSON.stringify(adminState) === previous) return;
+
+  io.emit('maintenance_mode', adminState.maintenance);
+  io.emit('chat_controls', adminState.chatControls);
+  io.emit('admin_pinned_announcement', adminState.pinnedAnnouncement || { clear: true });
+  emitToAdmins('admin_state', {
+    maintenance: adminState.maintenance,
+    chatControls: adminState.chatControls,
+    pinnedAnnouncement: adminState.pinnedAnnouncement || null,
+    reports: adminReports,
+    serverLog
+  });
+}
+
+setInterval(() => {
+  syncAdminStateAcrossInstances().catch(err => console.error('[ADMIN STATE SYNC ERROR]:', err));
+}, 15000);
+
+io.on('connection', async (socket) => {
   console.log('[NETWORK] Socket connected. ID: ' + socket.id);
+  await refreshAdminStateFromDb();
   emitAdminState(socket);
 
   socket.on('authenticate_user', async (data) => {
     try {
-      const { name, password, userData, isNewAccount } = data;
+      const { name, password, userData, isNewAccount, adminMaintenanceBypass } = data;
       
       const dbRes = await pool.query('SELECT data FROM users WHERE name = $1', [name]);
       const dbUser = dbRes.rows.length > 0 ? dbRes.rows[0].data : null;
 
       const isAdmin = isUserAdmin(name, dbUser);
+
+      if (adminMaintenanceBypass === true && !isAdmin) {
+        socket.emit('auth_error', 'Maintenance admin login rejected. This account is not an administrator.');
+        return;
+      }
 
       if (dbUser && isUserBanned({ ...dbUser, name }) && !isAdmin) {
         socket.emit('auth_error', dbUser.banReason ? `This account is banned: ${dbUser.banReason}` : 'This account is banned.');
@@ -461,6 +646,7 @@ io.on('connection', (socket) => {
           await pool.query('UPDATE users SET data = $1 WHERE name = $2', [userDatabase[name], name]);
           
           console.log(`[NETWORK] ${name} logged in. Admin: ${isAdmin}`);
+          await addServerLog('login', `${name} signed in${isAdmin ? ' as admin' : ''}`, { socketId: socket.id, role: getUserRole(name, userDatabase[name]) }, name);
 
           socket.emit('auth_success', { 
             name, 
@@ -476,7 +662,9 @@ io.on('connection', (socket) => {
 
           io.emit('online_list', getSanitizedOnlineList());
         } else {
-          if (isNewAccount) {
+          if (adminMaintenanceBypass === true) {
+            socket.emit('auth_error', 'Incorrect admin password. Access denied.');
+          } else if (isNewAccount) {
             socket.emit('auth_error', 'This Online ID is already taken...');
           } else {
             socket.emit('auth_error', 'Incorrect password. Access denied.');
@@ -515,6 +703,7 @@ io.on('connection', (socket) => {
         );
         
         console.log(`[NETWORK] ${name} created a new account. Admin: ${isAdmin}`);
+        await addServerLog('signup', `${name} created an account${isAdmin ? ' as admin' : ''}`, { socketId: socket.id, role: getUserRole(name, userDatabase[name]) }, name);
 
         socket.emit('auth_success', { 
           name, 
@@ -859,7 +1048,8 @@ io.on('connection', (socket) => {
         maintenance: adminState.maintenance,
         chatControls: adminState.chatControls,
         pinnedAnnouncement: adminState.pinnedAnnouncement || null,
-        reports: adminReports
+        reports: adminReports,
+        serverLog
       });
       await addModerationLog(adminState.maintenance.enabled ? 'maintenance_on' : 'maintenance_off', adminState.maintenance.enabled ? 'Enabled maintenance mode' : 'Disabled maintenance mode', adminState.maintenance, socket.userName || 'Admin');
       respond({ success: true, state: adminState.maintenance });
@@ -869,21 +1059,28 @@ io.on('connection', (socket) => {
     }
   });
 
-  socket.on('admin_request_chat_controls', (data, callback) => {
+  socket.on('admin_request_chat_controls', async (data, callback) => {
+    await refreshAdminStateFromDb();
     const payload = adminState.chatControls || normalizeChatControls({});
     socket.emit('chat_controls', payload);
     if (socket.isAdmin === true) socket.emit('admin_chat_controls_state', payload);
     if (typeof callback === 'function') callback({ success: true, state: payload });
   });
 
-  socket.on('admin_request_admin_state', (data, callback) => {
+  socket.on('admin_request_admin_state', async (data, callback) => {
+    await refreshAdminStateFromDb();
+    if (socket.isAdmin === true) await refreshServerLogFromDb();
     const payload = {
       maintenance: adminState.maintenance,
       chatControls: adminState.chatControls,
       pinnedAnnouncement: adminState.pinnedAnnouncement || null,
-      reports: socket.isAdmin === true ? adminReports : []
+      reports: socket.isAdmin === true ? adminReports : [],
+      serverLog: socket.isAdmin === true ? serverLog : []
     };
     socket.emit('admin_state', payload);
+    socket.emit('maintenance_mode', adminState.maintenance);
+    socket.emit('chat_controls', adminState.chatControls);
+    socket.emit('admin_pinned_announcement', adminState.pinnedAnnouncement || { clear: true });
     if (typeof callback === 'function') callback({ success: true, state: payload });
   });
 
@@ -906,7 +1103,8 @@ io.on('connection', (socket) => {
         maintenance: adminState.maintenance,
         chatControls: adminState.chatControls,
         pinnedAnnouncement: adminState.pinnedAnnouncement || null,
-        reports: adminReports
+        reports: adminReports,
+        serverLog
       });
       await addModerationLog('chat_controls', `Updated chat controls: ${adminState.chatControls.locked ? 'locked' : 'open'}, slow ${adminState.chatControls.slowSeconds}s`, adminState.chatControls, socket.userName || 'Admin');
       respond({ success: true, state: adminState.chatControls });
@@ -939,8 +1137,9 @@ io.on('connection', (socket) => {
     }
   });
 
-  socket.on('admin_request_moderation_log', () => {
+  socket.on('admin_request_moderation_log', async () => {
     if (socket.isAdmin === true) {
+      await refreshModerationLogFromDb();
       socket.emit('admin_moderation_log_list', moderationLog);
     }
   });
@@ -954,6 +1153,24 @@ io.on('connection', (socket) => {
       console.error('[ADMIN LOG CLEAR ERROR]:', err);
     }
     emitToAdmins('admin_moderation_log_list', moderationLog);
+  });
+
+  socket.on('admin_request_server_log', async () => {
+    if (socket.isAdmin === true) {
+      await refreshServerLogFromDb();
+      socket.emit('admin_server_log_list', serverLog);
+    }
+  });
+
+  socket.on('admin_clear_server_log', async () => {
+    if (socket.isAdmin !== true) return;
+    serverLog = [];
+    try {
+      await pool.query('TRUNCATE server_log');
+    } catch (err) {
+      console.error('[SERVER LOG CLEAR ERROR]:', err);
+    }
+    emitToAdmins('admin_server_log_list', serverLog);
   });
 
   socket.on('admin_request_reports', () => {
@@ -1263,6 +1480,7 @@ io.on('connection', (socket) => {
       socket.broadcast.emit('user_stopped_typing', { name: name });
       
       await pool.query('UPDATE users SET data = $1 WHERE name = $2', [userDatabase[name], name]);
+      await addServerLog('logout', `${name} disconnected`, { socketId: socket.id }, name);
       io.emit('online_list', getSanitizedOnlineList());
     }
   });
