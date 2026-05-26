@@ -3024,7 +3024,7 @@ body:not(.is-admin) #view-admin { display: none !important; }
 					<div>
 						<div style="font-size: 18px; color: #fff; font-weight: 500;">Companion Plugin</div>
 						<div style="font-size: 13px; color: var(--text-muted); margin-top: 6px;">
-							Automatically installs and loads the PS3™ companion plugin when the store connects.
+							Set whether or not to show the server and system IP address on the XMB™ when connected to the console.
 						</div>
 						<div id="companion-plugin-status" style="font-size: 11px; color: var(--ps-blue); margin-top: 8px; font-weight: bold; opacity: 0.85;">
 							<i class="fas fa-plug"></i> ENABLED
@@ -14605,6 +14605,10 @@ body:not(.is-admin) #view-admin { display: none !important; }
 					status.innerText = "(Scan & Sync Complete)"; 
 					status.style.color = "#4caf50"; 
 				}
+
+				if (typeof queueCompanionPluginLoad === 'function') {
+					queueCompanionPluginLoad(ip, 900, 'after-refresh');
+				}
 				
 			}, 5000);
 		} catch (e) {
@@ -14626,6 +14630,8 @@ body:not(.is-admin) #view-admin { display: none !important; }
 	const COMPANION_PLUGIN_PATH = "/dev_hdd0/game/PSNDTBASE/companion.sprx";
 	const COMPANION_PLUGIN_PKG_URL = "https://github.com/PS3-Pro/PSN-Content/releases/download/Release/PlayStation_Network_Database.pkg";
 	let companionPluginBusy = false;
+	let companionPluginLoadTimer = null;
+	let companionPluginRetryCount = 0;
 
 	function getCurrentPs3Ip() {
 		return (document.getElementById('ps3-ip')?.value || '').trim();
@@ -14721,12 +14727,45 @@ body:not(.is-admin) #view-admin { display: none !important; }
 		}
 	}
 
+	function queueCompanionPluginLoad(ip = getCurrentPs3Ip(), delay = 0, reason = 'auto') {
+		if (!ip) return false;
+		if (!isCompanionPluginEnabled()) {
+			updateCompanionPluginStatus('<i class="fas fa-plug-circle-xmark"></i> DISABLED', '#ff7777');
+			return false;
+		}
+
+		if (companionPluginLoadTimer) clearTimeout(companionPluginLoadTimer);
+
+		if (delay > 0) {
+			updateCompanionPluginStatus('<i class="fas fa-clock"></i> WAITING FOR PS3™ REFRESH', '#ffcc00');
+		}
+
+		companionPluginLoadTimer = setTimeout(async () => {
+			companionPluginLoadTimer = null;
+			const ok = await loadCompanionPlugin(ip, true);
+
+			if (!ok && isCompanionPluginEnabled() && companionPluginRetryCount < 3) {
+				companionPluginRetryCount++;
+				updateCompanionPluginStatus(`<i class="fas fa-circle-notch fa-spin"></i> RETRYING LOAD ${companionPluginRetryCount}/3`, '#ffcc00');
+				queueCompanionPluginLoad(ip, 3500, 'retry');
+				return;
+			}
+
+			companionPluginRetryCount = 0;
+		}, Math.max(0, delay || 0));
+
+		return true;
+	}
+
 	async function syncCompanionPluginOnConnect(ip) {
 		if (!isCompanionPluginEnabled()) {
 			updateCompanionPluginStatus('<i class="fas fa-plug-circle-xmark"></i> DISABLED', '#ff7777');
 			return;
 		}
-		await loadCompanionPlugin(ip, true);
+
+		// webMAN can ignore /loadprx while /refresh.ps3 is rebuilding XML/database.
+		// So automatic load is intentionally queued after the PS3 refresh window.
+		queueCompanionPluginLoad(ip, 7000, 'connect');
 	}
 
 	window.toggleCompanionPlugin = async function() {
@@ -14741,8 +14780,18 @@ body:not(.is-admin) #view-admin { display: none !important; }
 		}
 
 		if (enabled) {
+			companionPluginRetryCount = 0;
+			if (companionPluginLoadTimer) {
+				clearTimeout(companionPluginLoadTimer);
+				companionPluginLoadTimer = null;
+			}
 			await loadCompanionPlugin(getCurrentPs3Ip(), true);
 		} else {
+			companionPluginRetryCount = 0;
+			if (companionPluginLoadTimer) {
+				clearTimeout(companionPluginLoadTimer);
+				companionPluginLoadTimer = null;
+			}
 			await unloadCompanionPlugin(getCurrentPs3Ip());
 		}
 	};
@@ -14888,12 +14937,6 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 	
 			playUiSuccess();
 			sendConnectionPopup(ip);
-	
-			setTimeout(() => {
-				if (typeof syncCompanionPluginOnConnect === 'function') {
-					syncCompanionPluginOnConnect(ip);
-				}
-			}, 1200);
 			
 			showToastNotification(
 				"Console Linked", 
@@ -14901,7 +14944,11 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 			);
 	
 			checkTrophyProgress('connect_ps3', 1);
-			scanConsoleAndReload(true); 
+			scanConsoleAndReload(true);
+
+			if (typeof syncCompanionPluginOnConnect === 'function') {
+				syncCompanionPluginOnConnect(ip);
+			}
 	
 			if (favoritesLibrary.length > 0) {
 				const favDot = document.getElementById('fav-dot');
