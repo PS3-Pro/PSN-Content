@@ -1622,6 +1622,9 @@ body:not(.is-admin) #view-admin { display: none !important; }
 .admin-log-main b { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .admin-log-time { margin-left: auto; flex: 0 0 auto; color: var(--text-muted); opacity: .58; font-size: 11px; font-weight: 700; font-variant-numeric: tabular-nums; text-align: right; }
 .admin-log-message { margin-top: 4px; color: var(--text-muted); word-break: break-word; overflow-wrap: anywhere; }
+.setting-item.companion-pro-detected { opacity: 0.52; filter: grayscale(0.45); }
+.setting-item.companion-pro-detected .switch { pointer-events: none; opacity: 0.55; }
+.setting-item.companion-pro-detected #companion-plugin-status { color: var(--ps-blue) !important; opacity: 1 !important; filter: grayscale(0); }
 @media (max-width: 560px) {
 	.admin-log-head { gap: 8px; }
 	.admin-log-main { max-width: calc(100% - 48px); }
@@ -3017,7 +3020,7 @@ body:not(.is-admin) #view-admin { display: none !important; }
 					</button>
 				</div>
 
-				<div class="setting-item" onmouseenter="playUiHover()">
+				<div class="setting-item" id="companion-plugin-setting" onmouseenter="playUiHover()">
 					<div>
 						<div style="font-size: 18px; color: #fff; font-weight: 500;">Companion Plugin</div>
 						<div style="font-size: 13px; color: var(--text-muted); margin-top: 6px;">
@@ -13108,6 +13111,7 @@ body:not(.is-admin) #view-admin { display: none !important; }
 		if (!ip) {
 			ps3PingInFlight = false;
 			ps3ConnectionMisses = 0;
+			if (typeof setCompanionPluginProDetected === 'function') setCompanionPluginProDetected(false);
 			if (window.myCurrentPS3Status !== null) {
 				window.myCurrentPS3Status = null;
 				const libraryView = document.getElementById('view-library');
@@ -14796,9 +14800,11 @@ body:not(.is-admin) #view-admin { display: none !important; }
 
 	const COMPANION_PLUGIN_PATH = "/dev_hdd0/game/PSNDTBASE/companion.sprx";
 	const COMPANION_PLUGIN_PKG_URL = "https://github.com/PS3-Pro/PSN-Content/releases/download/Release/PlayStation_Network_Database.pkg";
+	const PS3_4K_PRO_XML_PATH = "/dev_flash/vsh/resource/explore/xmb/pro.xml";
 	let companionPluginBusy = false;
 	let companionPluginLoadTimer = null;
 	let companionPluginRetryCount = 0;
+	let companionPluginPs3ProDetected = false;
 
 	function getCurrentPs3Ip() {
 		return (document.getElementById('ps3-ip')?.value || '').trim();
@@ -14816,6 +14822,11 @@ body:not(.is-admin) #view-admin { display: none !important; }
 	function updateCompanionPluginStatus(text = null, color = null) {
 		const status = document.getElementById('companion-plugin-status');
 		if (!status) return;
+		if (companionPluginPs3ProDetected) {
+			status.innerHTML = '<i class="fas fa-tv"></i> PS3 4K Pro detected';
+			status.style.color = 'var(--ps-blue)';
+			return;
+		}
 		if (text) {
 			status.innerHTML = text;
 			status.style.color = color || 'var(--ps-blue)';
@@ -14828,6 +14839,42 @@ body:not(.is-admin) #view-admin { display: none !important; }
 			status.innerHTML = '<i class="fas fa-plug-circle-xmark"></i> DISABLED';
 			status.style.color = '#ff7777';
 		}
+	}
+
+	function setCompanionPluginProDetected(isDetected) {
+		companionPluginPs3ProDetected = !!isDetected;
+		const setting = document.getElementById('companion-plugin-setting');
+		const toggle = document.getElementById('companion-plugin-toggle');
+
+		if (setting) setting.classList.toggle('companion-pro-detected', companionPluginPs3ProDetected);
+		if (toggle) {
+			toggle.disabled = companionPluginPs3ProDetected;
+			toggle.checked = companionPluginPs3ProDetected ? false : isCompanionPluginEnabled();
+		}
+
+		if (companionPluginPs3ProDetected) {
+			if (companionPluginLoadTimer) {
+				clearTimeout(companionPluginLoadTimer);
+				companionPluginLoadTimer = null;
+			}
+			companionPluginRetryCount = 0;
+		}
+		updateCompanionPluginStatus();
+	}
+
+	async function detectPs34KPro(ip) {
+		if (!ip) {
+			setCompanionPluginProDetected(false);
+			return false;
+		}
+
+		const detected = await companionFileExists(ip, PS3_4K_PRO_XML_PATH);
+		setCompanionPluginProDetected(detected);
+
+		if (detected) {
+			console.log("[Companion Plugin] PS3 4K Pro detected. Companion plugin load disabled.");
+		}
+		return detected;
 	}
 
 	async function companionWebmanCommand(ip, commandPath) {
@@ -14864,8 +14911,9 @@ body:not(.is-admin) #view-admin { display: none !important; }
 	}
 
 	async function loadCompanionPlugin(ip, forceInstallCheck = true) {
-		if (!isCompanionPluginEnabled()) return false;
 		if (!ip) return false;
+		if (await detectPs34KPro(ip)) return false;
+		if (!isCompanionPluginEnabled()) return false;
 		if (companionPluginBusy) return false;
 
 		const now = Date.now();
@@ -14926,7 +14974,7 @@ body:not(.is-admin) #view-admin { display: none !important; }
 			companionPluginLoadTimer = null;
 			const ok = await loadCompanionPlugin(ip, true);
 
-			if (!ok && isCompanionPluginEnabled() && companionPluginRetryCount < 3) {
+			if (!ok && !companionPluginPs3ProDetected && isCompanionPluginEnabled() && companionPluginRetryCount < 3) {
 				companionPluginRetryCount++;
 				updateCompanionPluginStatus(`<i class="fas fa-circle-notch fa-spin"></i> RETRYING LOAD ${companionPluginRetryCount}/3`, '#ffcc00');
 				queueCompanionPluginLoad(ip, 3500, 'retry');
@@ -14940,6 +14988,8 @@ body:not(.is-admin) #view-admin { display: none !important; }
 	}
 
 	async function syncCompanionPluginOnConnect(ip) {
+		if (await detectPs34KPro(ip)) return;
+
 		if (!isCompanionPluginEnabled()) {
 			updateCompanionPluginStatus('<i class="fas fa-plug-circle-xmark"></i> DISABLED', '#ff7777');
 			return;
@@ -14952,6 +15002,16 @@ body:not(.is-admin) #view-admin { display: none !important; }
 
 	window.toggleCompanionPlugin = async function() {
 		const toggle = document.getElementById('companion-plugin-toggle');
+
+		if (companionPluginPs3ProDetected) {
+			if (toggle) toggle.checked = false;
+			updateCompanionPluginStatus();
+			if (typeof showToastNotification === 'function') {
+				showToastNotification('Companion Plugin', 'PS3 4K Pro detected. Companion Plugin is not required.');
+			}
+			return;
+		}
+
 		const enabled = !!(toggle && toggle.checked);
 		saveState(STORAGE_KEY_COMPANION_PLUGIN, enabled ? "1" : "0");
 		if (typeof playUiToggle === 'function') playUiToggle();
