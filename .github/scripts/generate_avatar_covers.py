@@ -677,6 +677,247 @@ def decrypt_edat_image_secondary(edat_path: Path, log: Callable[[str], None]) ->
 
 
 # -----------------------------------------------------------------------------
+# Enhanced EDAT image extractor.
+#
+# This keeps the old primary/secondary extractors intact, but adds the same
+# multi-key path used by the theme preview extractor:
+#   - RAP -> RIF
+#   - RAP -> RIF encrypted with dev_hash
+#   - raw RAP as KLIC
+#   - raw RAP encrypted with dev_hash
+#   - NP_KLIC_FREE fallback
+# It also tries both 0x20 layouts and digest/zero IV variants. This helps EDATs
+# that have license type 2 and flags such as 0x3c.
+# -----------------------------------------------------------------------------
+
+EDAT_FLAG_COMPRESSED = 0x00000001
+EDAT_FLAG_PLAIN_PAYLOAD = 0x00000002
+EDAT_FLAG_ENCRYPTED_KEY = 0x00000008
+EDAT_FLAG_0x20 = 0x00000020
+EDAT_FLAG_SDAT = 0x01000000
+
+
+def _dedupe_key_candidates(candidates: list[tuple[str, bytes | None]]) -> list[tuple[str, bytes]]:
+    out: list[tuple[str, bytes]] = []
+    seen: set[bytes] = set()
+
+    for label, key in candidates:
+        if not key or len(key) != 16:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((label, key))
+
+    return out
+
+
+def build_enhanced_key_candidates(rap_hex: str, dev_hash: bytes) -> list[tuple[str, bytes]]:
+    candidates: list[tuple[str, bytes | None]] = []
+    rap = rap_hex_to_bytes(rap_hex)
+
+    if rap:
+        rif = PS3Crypto.rap_to_rif(rap)
+
+        if rif:
+            candidates.append(("rap_to_rif", rif))
+            try:
+                candidates.append(("rap_to_rif_x_dev_hash", AES.new(rif, AES.MODE_ECB).encrypt(dev_hash)))
+            except Exception:
+                pass
+
+        candidates.append(("rap_raw_klic", rap))
+        try:
+            candidates.append(("rap_raw_x_dev_hash", AES.new(rap, AES.MODE_ECB).encrypt(dev_hash)))
+        except Exception:
+            pass
+
+    candidates.append(("np_klic_free", NP_KLIC_FREE))
+    return _dedupe_key_candidates(candidates)
+
+
+def decrypt_edat_payload_variant(
+    data: bytes,
+    key_input: bytes,
+    layout_mode: str,
+    flag10_mode: str,
+    iv_mode: str,
+) -> tuple[bytes, str | None]:
+    version = struct.unpack(">I", data[4:8])[0]
+    content_id = data[16:64].decode("ascii", errors="ignore").strip("\x00")
+    digest = data[0x40:0x50]
+    dev_hash = data[0x60:0x70]
+    flags = struct.unpack(">I", data[0x80:0x84])[0]
+    block_size = struct.unpack(">I", data[0x84:0x88])[0]
+    file_size = struct.unpack(">Q", data[0x88:0x90])[0]
+
+    if block_size <= 0 or file_size <= 0:
+        raise ValueError("Invalid EDAT block_size/file_size")
+
+    is_compressed = bool(flags & EDAT_FLAG_COMPRESSED)
+    is_payload_plain = bool(flags & EDAT_FLAG_PLAIN_PAYLOAD)
+    has_encrypted_key = bool(flags & EDAT_FLAG_ENCRYPTED_KEY)
+    has_0x10 = bool(flags & EDAT_FLAG_0x10)
+    has_0x20 = bool(flags & EDAT_FLAG_0x20)
+    is_sdat = bool(flags & EDAT_FLAG_SDAT)
+
+    if is_sdat:
+        sdat_key = b"\x0D\x65\x5E\xF8\xE6\x74\xA9\x8A\xB8\x50\x5C\xFA\x7D\x01\x29\x33"
+        key_input = bytes(a ^ b for a, b in zip(dev_hash, sdat_key))
+
+    edat_key = EDAT_KEY_1 if version == 4 else EDAT_KEY_0
+    meta_size = 0x20 if (is_compressed or has_0x20) else 0x10
+    metadata_offset = 0x100
+    num_blocks = (file_size + block_size - 1) // block_size
+    dev_hash_12 = dev_hash[:12]
+
+    output = bytearray()
+
+    for i in range(num_blocks):
+        is_last = i == num_blocks - 1
+        this_size = (file_size % block_size) if (is_last and file_size % block_size) else block_size
+        pad_len = (this_size + 15) & ~15
+
+        if is_compressed:
+            meta_pos = metadata_offset + (i * meta_size)
+            metadata = data[meta_pos:meta_pos + meta_size]
+            if len(metadata) < meta_size:
+                break
+
+            if version <= 1:
+                data_offset = struct.unpack(">Q", metadata[0x10:0x18])[0]
+                chunk_len = struct.unpack(">I", metadata[0x18:0x1C])[0]
+            else:
+                data_offset, chunk_len, _ = PS3EdatDecryptor.dec_section(metadata)
+
+            read_len = (int(chunk_len) + 15) & ~15
+
+        elif has_0x20 and layout_mode == "inline_20":
+            data_offset = metadata_offset + i * (meta_size + block_size) + meta_size
+            chunk_len = this_size
+            read_len = pad_len
+
+        elif has_0x20 and layout_mode == "table_20":
+            data_offset = metadata_offset + num_blocks * meta_size + i * block_size
+            chunk_len = this_size
+            read_len = pad_len
+
+        else:
+            data_offset = metadata_offset + num_blocks * meta_size + i * block_size
+            chunk_len = this_size
+            read_len = pad_len
+
+        if data_offset + read_len > len(data):
+            break
+
+        enc = data[int(data_offset):int(data_offset) + int(read_len)]
+        if len(enc) < read_len:
+            enc += b"\x00" * (int(read_len) - len(enc))
+
+        block_key = dev_hash_12 + struct.pack(">I", i)
+        key_result = AES.new(key_input, AES.MODE_ECB).encrypt(block_key)
+
+        if has_0x10 and flag10_mode == "respect_0x10":
+            key_result = AES.new(key_input, AES.MODE_ECB).encrypt(key_result)
+
+        if has_encrypted_key:
+            key_final = AES.new(edat_key, AES.MODE_CBC, iv=EDAT_IV).decrypt(key_result)
+        else:
+            key_final = key_result
+
+        if iv_mode == "digest":
+            iv_final = digest if version > 1 else EDAT_IV
+        else:
+            iv_final = EDAT_IV
+
+        if is_payload_plain:
+            dec_block = enc[:int(chunk_len)]
+        else:
+            dec_block = AES.new(key_final, AES.MODE_CBC, iv=iv_final).decrypt(enc)[:int(chunk_len)]
+
+        if is_compressed:
+            dec_block = maybe_zlib_decompress(dec_block)
+
+        output.extend(dec_block)
+
+    return bytes(output[:file_size]), content_id or None
+
+
+def decrypt_edat_image_enhanced(
+    edat_path: Path,
+    rap_hex: str,
+    log: Callable[[str], None],
+) -> tuple[bytes | None, str | None, str | None]:
+    data = edat_path.read_bytes()
+
+    if len(data) < 0x100 or not data.startswith(b"NPD"):
+        image, image_type = extract_image_from_buffer(data)
+        if image_type == "jpg" and image:
+            png = convert_jpg_to_png_bytes(image, log)
+            return png, None, "raw_jpg" if png else None
+        return image, None, "raw_png" if image else None
+
+    version = struct.unpack(">I", data[4:8])[0]
+    license_type = struct.unpack(">I", data[8:12])[0]
+    content_id = data[16:64].decode("ascii", errors="ignore").strip("\x00")
+    dev_hash = data[0x60:0x70]
+    flags = struct.unpack(">I", data[0x80:0x84])[0]
+    block_size = struct.unpack(">I", data[0x84:0x88])[0]
+    file_size = struct.unpack(">Q", data[0x88:0x90])[0]
+
+    if not block_size or not file_size:
+        return None, content_id, None
+
+    has_0x20 = bool(flags & EDAT_FLAG_0x20)
+    layout_modes = ["inline_20", "table_20"] if has_0x20 else ["normal"]
+    flag10_modes = ["respect_0x10", "ignore_0x10"]
+    iv_modes = ["digest", "zero"]
+    key_candidates = build_enhanced_key_candidates(rap_hex, dev_hash)
+    debug = os.environ.get("AVATAR_EDAT_DEBUG", "").lower() in ("1", "true", "yes")
+
+    if debug:
+        log(
+            f"[ENH ] {edat_path.name}: version={version} license={license_type} "
+            f"flags={flags:#x} block={block_size} file={file_size} candidates={len(key_candidates)}"
+        )
+
+    for key_label, key_input in key_candidates:
+        for layout_mode in layout_modes:
+            for flag10_mode in flag10_modes:
+                for iv_mode in iv_modes:
+                    attempt_label = f"{key_label}|{layout_mode}|{flag10_mode}|iv_{iv_mode}"
+                    try:
+                        raw, edat_content_id = decrypt_edat_payload_variant(
+                            data=data,
+                            key_input=key_input,
+                            layout_mode=layout_mode,
+                            flag10_mode=flag10_mode,
+                            iv_mode=iv_mode,
+                        )
+                    except Exception as exc:
+                        if debug:
+                            log(f"[ENH ] {edat_path.name}: {attempt_label} error: {exc}")
+                        continue
+
+                    image, image_type = extract_image_from_buffer(raw)
+                    if not image:
+                        if debug:
+                            log(f"[ENH ] {edat_path.name}: {attempt_label} no image first16={raw[:16].hex()}")
+                        continue
+
+                    if image_type == "jpg":
+                        png = convert_jpg_to_png_bytes(image, log)
+                        if not png:
+                            continue
+                        image = png
+
+                    log(f"[ENH ] Enhanced extractor recovered {edat_path.name} ({attempt_label}, {image_type})")
+                    return image, edat_content_id or content_id, attempt_label
+
+    return None, content_id, None
+
+
+# -----------------------------------------------------------------------------
 # Avatar list handling and automation.
 # -----------------------------------------------------------------------------
 
@@ -1146,6 +1387,15 @@ def process_entry(
             png_data, edat_content_id = PS3EdatDecryptor(edat_path, klic_map).decrypt_to_png()
         except Exception as exc:
             log(f"[FAIL] Primary extractor failed for {edat_path.name}: {exc}")
+
+        if not png_data:
+            try:
+                enhanced_data, enhanced_content_id, enhanced_label = decrypt_edat_image_enhanced(edat_path, entry.rap_hex, log)
+                if enhanced_data:
+                    png_data = enhanced_data
+                    edat_content_id = edat_content_id or enhanced_content_id
+            except Exception as exc:
+                log(f"[ENH ] Enhanced extractor failed for {edat_path.name}: {exc}")
 
         if not png_data:
             try:
