@@ -3705,6 +3705,75 @@ body.is-ps3 #game-modal:not(.compact-no-summary):not(.help-modal-active) .modal-
 		return buildBingCoverUrl(imgElement.getAttribute('data-name') || "", imgElement.getAttribute('data-console') || "ps3");
 	}
 
+	function copyCoverImageAttributes(fromImg, toImg) {
+		if (!fromImg || !toImg) return toImg;
+
+		for (var i = 0; i < fromImg.attributes.length; i++) {
+			var attr = fromImg.attributes[i];
+			if (!attr || attr.name === 'src') continue;
+			toImg.setAttribute(attr.name, attr.value);
+		}
+
+		toImg.onload = null;
+		toImg.onerror = null;
+		return toImg;
+	}
+
+	function replaceCoverWithLoadedImage(oldImg, loadedImg, finalUrl) {
+		if (!oldImg || !loadedImg) return oldImg;
+
+		if (!isPS3 || !oldImg.parentNode) {
+			oldImg.onload = null;
+			oldImg.onerror = null;
+			oldImg.src = finalUrl || loadedImg.src;
+			oldImg.setAttribute('data-loaded', 'true');
+			oldImg.removeAttribute('data-loading');
+			oldImg.removeAttribute('data-failed');
+			return oldImg;
+		}
+
+		copyCoverImageAttributes(oldImg, loadedImg);
+		loadedImg.setAttribute('data-loaded', 'true');
+		loadedImg.removeAttribute('data-loading');
+		loadedImg.removeAttribute('data-failed');
+
+		oldImg.onload = null;
+		oldImg.onerror = null;
+		oldImg.parentNode.replaceChild(loadedImg, oldImg);
+		return loadedImg;
+	}
+
+	function preloadPS3CoverBeforeSwap(imgElement, targetUrl, onLoad, onError) {
+		if (!imgElement || !targetUrl) {
+			if (onError) onError(imgElement);
+			return false;
+		}
+
+		/* NetFront shows the broken-image X when a visible <img> points to a
+		   missing PNG/JPG. Keep the visible cover safe and test risky URLs in
+		   a detached Image first. */
+		imgElement.onload = null;
+		imgElement.onerror = null;
+		if (!imgElement.src || imgElement.src.indexOf(defaultCover) === -1) {
+			imgElement.src = defaultCover;
+		}
+
+		var ghostImg = new Image();
+		ghostImg.onload = function() {
+			ghostImg.onload = null;
+			ghostImg.onerror = null;
+			var doneImg = replaceCoverWithLoadedImage(imgElement, ghostImg, targetUrl);
+			if (onLoad) onLoad(doneImg);
+		};
+		ghostImg.onerror = function() {
+			ghostImg.onload = null;
+			ghostImg.onerror = null;
+			if (onError) onError(imgElement);
+		};
+		ghostImg.src = targetUrl;
+		return true;
+	}
+
 	function finishCoverFallback(imgElement, onFinish) {
 		if (!imgElement) return false;
 
@@ -3712,11 +3781,12 @@ body.is-ps3 #game-modal:not(.compact-no-summary):not(.help-modal-active) .modal-
 			var bingUrl = buildBingCoverUrlFromElement(imgElement);
 			imgElement.setAttribute('data-bing-tried', 'true');
 
-			/* Keep the current placeholder visible while Bing loads.
-			   This avoids the browser showing the broken-image X on PS3/NetFront. */
+			/* PS3/NetFront can show the broken-image X when the visible <img>
+			   changes to a remote Bing URL. Keep the visible cover on the safe
+			   placeholder and only swap in an already-loaded image node. */
 			imgElement.onload = null;
 			imgElement.onerror = null;
-			imgElement.src = defaultCover;
+			if (!imgElement.src || imgElement.src.indexOf(defaultCover) === -1) imgElement.src = defaultCover;
 			imgElement.setAttribute('data-loaded', 'true');
 			imgElement.setAttribute('data-loading', 'true');
 
@@ -3724,12 +3794,8 @@ body.is-ps3 #game-modal:not(.compact-no-summary):not(.help-modal-active) .modal-
 			bingPreload.onload = function() {
 				bingPreload.onload = null;
 				bingPreload.onerror = null;
-				imgElement.onload = null;
-				imgElement.onerror = null;
-				imgElement.src = bingUrl;
-				imgElement.setAttribute('data-loaded', 'true');
-				imgElement.removeAttribute('data-loading');
-				if (onFinish) onFinish(imgElement, true);
+				var doneImg = replaceCoverWithLoadedImage(imgElement, bingPreload, bingUrl);
+				if (onFinish) onFinish(doneImg, true);
 			};
 			bingPreload.onerror = function() {
 				bingPreload.onload = null;
@@ -4700,12 +4766,29 @@ body.is-ps3 #game-modal:not(.compact-no-summary):not(.help-modal-active) .modal-
 			targetUrl = urlPNG;
 			isHashMode = true;
 		}
+
+		if (is_ps3 && isHashMode) {
+			preloadPS3CoverBeforeSwap(img, targetUrl, function(doneImg) {
+				doneImg.setAttribute('data-loaded', 'true');
+				doneImg.removeAttribute('data-loading');
+				if (typeof g_activeCovers !== 'undefined') g_activeCovers.push(doneImg);
+				if (typeof updateRAMMonitor === 'function') updateRAMMonitor();
+				processMasterQueue(batchID);
+			}, function(failedImg) {
+				finishCoverFallback(failedImg, function(doneImg) {
+					if (typeof g_activeCovers !== 'undefined') g_activeCovers.push(doneImg);
+					if (typeof updateRAMMonitor === 'function') updateRAMMonitor();
+					processMasterQueue(batchID);
+				});
+			});
+			return;
+		}
 	
 		img.onload = function() {
 			this.onload = this.onerror = null;
 			this.setAttribute('data-loaded', 'true');
 			this.removeAttribute('data-loading');
-	
+
 			if (typeof g_activeCovers !== 'undefined') g_activeCovers.push(this);
 			if (typeof updateRAMMonitor === 'function') updateRAMMonitor();
 			
@@ -4717,9 +4800,21 @@ body.is-ps3 #game-modal:not(.compact-no-summary):not(.help-modal-active) .modal-
 			
 			if (!isHashMode && this.src.indexOf('.JPG') !== -1) {
 				isHashMode = true;
-				this.src = urlPNG;
-				this.onload = img.onload;
-				this.onerror = img.onerror;
+				var failedVisibleImg = this;
+				failedVisibleImg.src = defaultCover;
+				preloadPS3CoverBeforeSwap(failedVisibleImg, urlPNG, function(doneImg) {
+					doneImg.setAttribute('data-loaded', 'true');
+					doneImg.removeAttribute('data-loading');
+					if (typeof g_activeCovers !== 'undefined') g_activeCovers.push(doneImg);
+					if (typeof updateRAMMonitor === 'function') updateRAMMonitor();
+					processMasterQueue(batchID);
+				}, function(failedImg) {
+					finishCoverFallback(failedImg, function(doneImg) {
+						if (typeof g_activeCovers !== 'undefined') g_activeCovers.push(doneImg);
+						if (typeof updateRAMMonitor === 'function') updateRAMMonitor();
+						processMasterQueue(batchID);
+					});
+				});
 			} else {
 				finishCoverFallback(this, function(doneImg) {
 					if (typeof g_activeCovers !== 'undefined') g_activeCovers.push(doneImg);
@@ -8255,8 +8350,16 @@ body.is-ps3 #game-modal:not(.compact-no-summary):not(.help-modal-active) .modal-
 
 		if (cat_h === 'avatars' || cat_h === 'themes') {
 			var localCoverGhost_h = new Image();
-			localCoverGhost_h.onload = function() { modal_img_el.src = this.src; };
-			localCoverGhost_h.onerror = function() { modal_img_el.src = defaultCover; };
+			localCoverGhost_h.onload = function() {
+				localCoverGhost_h.onload = null;
+				localCoverGhost_h.onerror = null;
+				replaceCoverWithLoadedImage(modal_img_el, localCoverGhost_h, this.src);
+			};
+			localCoverGhost_h.onerror = function() {
+				localCoverGhost_h.onload = null;
+				localCoverGhost_h.onerror = null;
+				modal_img_el.src = defaultCover;
+			};
 			localCoverGhost_h.src = getLocalContentCover(cat_h, id_h, contentId_h);
 			return;
 		}
@@ -8267,7 +8370,7 @@ body.is-ps3 #game-modal:not(.compact-no-summary):not(.help-modal-active) .modal-
             modalBingGhost_h.onload = function() {
                 modalBingGhost_h.onload = null;
                 modalBingGhost_h.onerror = null;
-                modal_img_el.src = modalBingUrl_h;
+                replaceCoverWithLoadedImage(modal_img_el, modalBingGhost_h, modalBingUrl_h);
             };
             modalBingGhost_h.onerror = function() {
                 modalBingGhost_h.onload = null;
@@ -8278,12 +8381,22 @@ body.is-ps3 #game-modal:not(.compact-no-summary):not(.help-modal-active) .modal-
         };
 
         var ghost_h = new Image();
-        ghost_h.onload = function() { modal_img_el.src = this.src; };
+        ghost_h.onload = function() {
+            ghost_h.onload = null;
+            ghost_h.onerror = null;
+            replaceCoverWithLoadedImage(modal_img_el, ghost_h, this.src);
+        };
         ghost_h.onerror = function() {
+            ghost_h.onload = null;
+            ghost_h.onerror = null;
             if (this.src.indexOf('.JPG') !== -1 && typeof generateSonyHash === 'function') {
                 var hash_h = generateSonyHash(id_h);
                 var fallback_h = new Image();
-                fallback_h.onload = function() { modal_img_el.src = this.src; };
+                fallback_h.onload = function() {
+                    fallback_h.onload = null;
+                    fallback_h.onerror = null;
+                    replaceCoverWithLoadedImage(modal_img_el, fallback_h, this.src);
+                };
                 fallback_h.onerror = modalBingFallback_h;
                 fallback_h.src = "https://raw.githubusercontent.com/PS3-Pro/Recently-Played-Games/master/np/" + hash_h + "/ICON0.PNG";
             } else {
