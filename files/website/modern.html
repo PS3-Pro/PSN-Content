@@ -27274,12 +27274,17 @@ body.ps3-pad-force-launcher.ps3-pad-user-logged #ps3-pad-launch-btn {
     function markMobilePadCapability() {
         const params = new URLSearchParams(window.location.search);
         const forceLauncher = params.has('padbtn') || params.has('controlbtn');
+        const padSessionActive = document.body.classList.contains('ps3-pad-page-active') || manualPadOpen || padHistoryActive;
+        const userLogged = padSessionActive || isPadUserLoggedIn();
 
         document.body.classList.toggle('ps3-pad-mobile-capable', isMobileTouchDevice());
         document.body.classList.toggle('ps3-pad-force-launcher', forceLauncher);
-        document.body.classList.toggle('ps3-pad-user-logged', isPadUserLoggedIn());
+        document.body.classList.toggle('ps3-pad-user-logged', userLogged);
 
-        if (!isPadUserLoggedIn() && document.body.classList.contains('ps3-pad-page-active')) {
+        // When the pad is open, the main header/layout are intentionally hidden.
+        // Do not re-check isPadUserLoggedIn() here, or orientation/fullscreen events
+        // close the controller and leave only the rotated fullscreen site visible.
+        if (!userLogged && document.body.classList.contains('ps3-pad-page-active')) {
             manualPadOpen = false;
             padOpenedByButton = false;
             setPadPageOpen(false);
@@ -27314,16 +27319,14 @@ body.ps3-pad-force-launcher.ps3-pad-user-logged #ps3-pad-launch-btn {
     }
 
     function shouldOpenPadPage() {
-        if (manualCloseUntilPortrait && isLandscapeNow()) return false;
-
         const params = new URLSearchParams(window.location.search);
         const forcePad = params.has('pad') || params.has('testpad');
 
-        // Test mode:
-        // - Mobile/touch + landscape opens automatically.
-        // - The floating button opens it manually and tries to rotate/lock landscape.
-        // - ?pad=1 or ?testpad=1 forces it for quick desktop/F12 testing too.
-        return manualPadOpen || (isMobileTouchDevice() && isLandscapeNow()) || forcePad;
+        // Button-only mode:
+        // - Rotating the phone no longer opens the virtual controller by itself.
+        // - The floating button opens the controller and then asks fullscreen/landscape.
+        // - ?pad=1 or ?testpad=1 still forces it for quick desktop/F12 testing.
+        return manualPadOpen || forcePad;
     }
 
     function setPadPageOpen(open) {
@@ -27554,12 +27557,21 @@ body.ps3-pad-force-launcher.ps3-pad-user-logged #ps3-pad-launch-btn {
 
     async function enterControllerOrientation() {
         const page = document.getElementById('ps3-pad-page');
+        const root = document.documentElement;
 
         try {
-            if (!document.fullscreenElement && document.documentElement.requestFullscreen) {
-                await document.documentElement.requestFullscreen();
+            if (!document.fullscreenElement && !document.webkitFullscreenElement) {
+                if (root.requestFullscreen) {
+                    await root.requestFullscreen();
+                } else if (root.webkitRequestFullscreen) {
+                    root.webkitRequestFullscreen();
+                }
             }
         } catch (err) {}
+
+        // Re-assert the controller after the fullscreen request, because some mobile browsers
+        // fire resize/orientation events during the request.
+        if (manualPadOpen) setPadPageOpen(true);
 
         try {
             if (screen.orientation && screen.orientation.lock) {
@@ -27569,6 +27581,8 @@ body.ps3-pad-force-launcher.ps3-pad-user-logged #ps3-pad-launch-btn {
         } catch (err) {
             if (page) page.classList.add('landscape-lock-failed');
         }
+
+        if (manualPadOpen) setPadPageOpen(true);
     }
 
     async function restorePreviousOrientation() {
@@ -27597,6 +27611,8 @@ body.ps3-pad-force-launcher.ps3-pad-user-logged #ps3-pad-launch-btn {
             try {
                 if (document.fullscreenElement && document.exitFullscreen) {
                     await document.exitFullscreen();
+                } else if (document.webkitFullscreenElement && document.webkitExitFullscreen) {
+                    document.webkitExitFullscreen();
                 }
             } catch (err) {}
         }, 250);
@@ -27713,22 +27729,28 @@ body.ps3-pad-force-launcher.ps3-pad-user-logged #ps3-pad-launch-btn {
                 padOpenedByButton = true;
                 pushPadHistory();
                 setPadPageOpen(true);
+                refreshPadPage();
                 await enterControllerOrientation();
-                setTimeout(refreshPadPage, 150);
+                setPadPageOpen(true);
+                setTimeout(refreshPadPage, 80);
+                setTimeout(refreshPadPage, 220);
                 setTimeout(refreshPadPage, 650);
             }, { passive: false });
         }
 
         ['resize', 'orientationchange'].forEach(function (eventName) {
             window.addEventListener(eventName, function () {
+                // Keep launcher/login state updated, but do not auto-open or auto-close the pad just because the phone rotated.
                 markMobilePadCapability();
 
                 if (!isLandscapeNow() && manualCloseUntilPortrait) {
                     manualCloseUntilPortrait = false;
                 }
 
-                setTimeout(refreshPadPage, 120);
-                setTimeout(refreshPadPage, 450);
+                if (document.body.classList.contains('ps3-pad-page-active') || manualPadOpen || padHistoryActive) {
+                    setTimeout(refreshPadPage, 120);
+                    setTimeout(refreshPadPage, 450);
+                }
             }, { passive: true });
         });
 
