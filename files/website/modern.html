@@ -26829,11 +26829,6 @@ body.ps3-pad-page-active #ps3-pad-page {
     box-shadow: 0 0 12px rgba(40,231,111,.85);
 }
 
-.ps3-pad-page-status.test-mode::before {
-    background: #ffb020;
-    box-shadow: 0 0 12px rgba(255,176,32,.85);
-}
-
 .ps3-pad-page-hint {
     justify-self: end;
     font-size: clamp(10px, 2.1vmin, 12px);
@@ -27123,13 +27118,12 @@ body.ps3-pad-page-active #ps3-pad-launch-btn {
     display: none !important;
 }
 
-body.ps3-pad-mobile-capable.ps3-pad-user-logged #ps3-pad-launch-btn,
-body.ps3-pad-force-launcher.ps3-pad-user-logged #ps3-pad-launch-btn {
+body.ps3-pad-mobile-capable.ps3-pad-user-logged.ps3-pad-console-connected #ps3-pad-launch-btn {
     display: flex;
 }
 
 @media (hover: none) and (pointer: coarse) {
-    body.ps3-pad-user-logged #ps3-pad-launch-btn {
+    body.ps3-pad-user-logged.ps3-pad-console-connected #ps3-pad-launch-btn {
         display: flex;
     }
 }
@@ -27512,14 +27506,20 @@ body.ps3-pad-force-launcher.ps3-pad-user-logged #ps3-pad-launch-btn {
     }
 
     function markMobilePadCapability() {
-        const params = new URLSearchParams(window.location.search);
-        const forceLauncher = params.has('padbtn') || params.has('controlbtn');
         const padSessionActive = document.body.classList.contains('ps3-pad-page-active') || manualPadOpen || padHistoryActive;
         const userLogged = padSessionActive || isPadUserLoggedIn();
+        const consoleConnected = isPs3LinkedForPad();
 
         document.body.classList.toggle('ps3-pad-mobile-capable', isMobileTouchDevice());
-        document.body.classList.toggle('ps3-pad-force-launcher', forceLauncher);
         document.body.classList.toggle('ps3-pad-user-logged', userLogged);
+        document.body.classList.toggle('ps3-pad-console-connected', consoleConnected);
+
+        // The virtual controller is now a real-console-only feature.
+        // No test URL, no fake mode, and no launcher when the PS3™ connection is down.
+        if (!consoleConnected && (document.body.classList.contains('ps3-pad-page-active') || manualPadOpen || padHistoryActive)) {
+            closePadDueToDisconnect();
+            return;
+        }
 
         // When the pad is open, the main header/layout are intentionally hidden.
         // Do not re-check isPadUserLoggedIn() here, or orientation/fullscreen events
@@ -27527,6 +27527,7 @@ body.ps3-pad-force-launcher.ps3-pad-user-logged #ps3-pad-launch-btn {
         if (!userLogged && document.body.classList.contains('ps3-pad-page-active')) {
             manualPadOpen = false;
             padOpenedByButton = false;
+            releaseHold();
             setPadPageOpen(false);
         }
     }
@@ -27559,18 +27560,21 @@ body.ps3-pad-force-launcher.ps3-pad-user-logged #ps3-pad-launch-btn {
     }
 
     function shouldOpenPadPage() {
-        const params = new URLSearchParams(window.location.search);
-        const forcePad = params.has('pad') || params.has('testpad');
-
-        // Button-only mode:
-        // - Rotating the phone no longer opens the virtual controller by itself.
-        // - The floating button opens the controller and then asks fullscreen/landscape.
-        // - ?pad=1 or ?testpad=1 still forces it for quick desktop/F12 testing.
-        return manualPadOpen || forcePad;
+        // Button-only + connected-only mode:
+        // - Rotating the phone never opens the controller by itself.
+        // - URL forcing was removed so there is no fake controller mode.
+        // - If the PS3™ connection drops, the controller closes and the site returns normally.
+        return manualPadOpen && isPs3LinkedForPad();
     }
 
     function setPadPageOpen(open) {
         const page = document.getElementById('ps3-pad-page');
+
+        if (open && !isPs3LinkedForPad()) {
+            manualPadOpen = false;
+            padOpenedByButton = false;
+            open = false;
+        }
 
         if (open && !document.body.classList.contains('ps3-pad-page-active')) {
             previousOverflow = document.body.style.overflow || '';
@@ -27589,20 +27593,10 @@ body.ps3-pad-force-launcher.ps3-pad-user-logged #ps3-pad-launch-btn {
 
         if (open) {
             const ip = getPadPs3Ip();
-            const linked = isPs3LinkedForPad();
             const status = document.getElementById('ps3-pad-page-status');
 
             if (status) {
-                if (linked && ip) {
-                    status.textContent = `Connected • ${ip}`;
-                    status.classList.remove('test-mode');
-                } else if (ip) {
-                    status.textContent = `Test mode • ${ip}`;
-                    status.classList.add('test-mode');
-                } else {
-                    status.textContent = 'Test mode • No PS3';
-                    status.classList.add('test-mode');
-                }
+                status.textContent = ip ? `Connected • ${ip}` : 'Connected';
             }
 
             if (!padRefreshTimer) {
@@ -27615,6 +27609,15 @@ body.ps3-pad-force-launcher.ps3-pad-user-logged #ps3-pad-launch-btn {
     }
 
     function refreshPadPage() {
+        if (!isPs3LinkedForPad()) {
+            if (document.body.classList.contains('ps3-pad-page-active') || manualPadOpen || padHistoryActive) {
+                closePadDueToDisconnect();
+            } else {
+                setPadPageOpen(false);
+            }
+            return;
+        }
+
         if (!isLandscapeNow()) {
             manualCloseUntilPortrait = false;
 
@@ -27653,17 +27656,20 @@ body.ps3-pad-force-launcher.ps3-pad-user-logged #ps3-pad-launch-btn {
         return String(direction).split('_').filter(Boolean);
     }
 
+    const ANALOG_TURBO_REPEAT_MS = 42;
+    const ANALOG_TURBO_DIAGONAL_GAP_MS = 7;
+
     function sendAnalogBurst(stick, direction) {
         const parts = splitPadDirection(direction);
         if (!parts.length) return;
 
         // webMAN's /pad.ps3 endpoint repeats normal D-pad hold commands reliably.
-        // Some builds treat AnalogL/AnalogR commands as a single nudge, so the
-        // virtual analog intentionally mimics repeated D-pad input for navigation.
+        // Some builds treat AnalogL/AnalogR commands as a single nudge, so diagonal
+        // analog movement is emulated with a very fast alternating D-pad pulse.
         parts.forEach(function (part, index) {
             setTimeout(function () {
                 sendPadPath(`/pad.ps3?${encodeURIComponent(part)}`);
-            }, index * 18);
+            }, index * ANALOG_TURBO_DIAGONAL_GAP_MS);
         });
     }
 
@@ -27702,6 +27708,7 @@ body.ps3-pad-force-launcher.ps3-pad-user-logged #ps3-pad-launch-btn {
         let pointerId = null;
         let currentDir = null;
         let analogRepeatTimer = null;
+        let analogDpadHoldActive = false;
 
         function maxRadius() {
             return (analog.clientWidth / 2) - (knob.clientWidth / 2) - 8;
@@ -27712,6 +27719,11 @@ body.ps3-pad-force-launcher.ps3-pad-user-logged #ps3-pad-launch-btn {
                 clearInterval(analogRepeatTimer);
                 analogRepeatTimer = null;
             }
+
+            if (analogDpadHoldActive) {
+                releaseHold();
+                analogDpadHoldActive = false;
+            }
         }
 
         function startAnalogRepeat(direction) {
@@ -27720,20 +27732,27 @@ body.ps3-pad-force-launcher.ps3-pad-user-logged #ps3-pad-launch-btn {
             if (!direction) return;
 
             const stick = analog.getAttribute('data-ps3-pad-stick') || 'left';
+            const parts = splitPadDirection(direction);
+
+            // Single direction now uses the same _hold path as the arrow buttons,
+            // so holding the analog is as responsive as holding the D-pad.
+            if (parts.length === 1 && HOLDABLE.has(parts[0])) {
+                analogDpadHoldActive = true;
+                sendHold(parts[0]);
+                return;
+            }
+
+            // Diagonal cannot be held as a real two-direction webMAN command,
+            // so keep it as a fast alternating pulse.
             sendAnalogBurst(stick, direction);
             analogRepeatTimer = setInterval(function () {
                 sendAnalogBurst(stick, direction);
-            }, 92);
+            }, ANALOG_TURBO_REPEAT_MS);
         }
 
         function reset() {
             knob.style.transform = 'translate(-50%, -50%)';
             stopAnalogRepeat();
-
-            if (currentDir) {
-                releaseHold();
-            }
-
             currentDir = null;
         }
 
@@ -27827,6 +27846,16 @@ body.ps3-pad-force-launcher.ps3-pad-user-logged #ps3-pad-launch-btn {
         }
 
         closePadFromBackGesture();
+    }
+
+    function closePadDueToDisconnect() {
+        manualCloseUntilPortrait = false;
+        manualPadOpen = false;
+        padOpenedByButton = false;
+        padHistoryActive = false;
+        releaseHold();
+        setPadPageOpen(false);
+        restorePreviousOrientation();
     }
 
     async function enterControllerOrientation() {
@@ -27996,7 +28025,7 @@ body.ps3-pad-force-launcher.ps3-pad-user-logged #ps3-pad-launch-btn {
                     return;
                 }
 
-                if (!isPadUserLoggedIn()) return;
+                if (!isPadUserLoggedIn() || !isPs3LinkedForPad()) return;
 
                 manualCloseUntilPortrait = false;
                 manualPadOpen = true;
@@ -28034,12 +28063,21 @@ body.ps3-pad-force-launcher.ps3-pad-user-logged #ps3-pad-launch-btn {
             }
         });
 
+        const globalStatusIcon = document.getElementById('global-status-icon');
+        if (globalStatusIcon && window.MutationObserver) {
+            const connectionObserver = new MutationObserver(function () {
+                markMobilePadCapability();
+                refreshPadPage();
+            });
+            connectionObserver.observe(globalStatusIcon, { attributes: true, attributeFilter: ['class', 'style'] });
+        }
+
         document.addEventListener('visibilitychange', refreshPadPage);
         markMobilePadCapability();
         setInterval(function () {
             markMobilePadCapability();
             refreshPadPage();
-        }, 1800);
+        }, 700);
         setTimeout(refreshPadPage, 800);
     }
 
