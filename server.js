@@ -705,9 +705,10 @@ io.on('connection', async (socket) => {
   await refreshAdminStateFromDb();
   emitAdminState(socket);
 
-  socket.on('authenticate_user', async (data) => {
+  socket.on('authenticate_user', async (data = {}) => {
     try {
-      const { name, password, userData, isNewAccount, adminMaintenanceBypass } = data;
+      const { name, password, isNewAccount, adminMaintenanceBypass } = data;
+      const safeUserData = (data.userData && typeof data.userData === 'object') ? data.userData : {};
       
       const dbRes = await pool.query('SELECT data FROM users WHERE name = $1', [name]);
       let dbUser = dbRes.rows.length > 0 ? normalizeUserRecord(name, dbRes.rows[0].data || {}) : null;
@@ -780,27 +781,30 @@ io.on('connection', async (socket) => {
         socket.userName = name;
         socket.isAdmin = isAdmin;
 
-        userDatabase[name] = {
-          ...userData,
+        userDatabase[name] = normalizeUserRecord(name, {
+          ...safeUserData,
           name: name,
           passwordHash: hash,
           id: socket.id,
           online: true,
           lastSeen: Date.now(),
-          avatar: userData.avatar || DEFAULT_AVATAR,
-          joined: userData.joined || '2026',
-          settingsData: userData.settingsData || { audio: "1", ux: "1", chatSound: "1", ps3Ip: "" },
-          trophiesData: userData.trophiesData || {},
-          wishlistData: userData.wishlistData || [],
-          favoritesData: userData.favoritesData || [],
-          downloadsData: userData.downloadsData || [],
-          libraryData: userData.libraryData || [],
-          friendsData: userData.friendsData || [],
-          countersData: userData.countersData || {},
-          themeColor: userData.themeColor || '#0070cc',
+          avatar: safeUserData.avatar || DEFAULT_AVATAR,
+          joined: safeUserData.joined || '2026',
+          settingsData: safeUserData.settingsData || { audio: "1", ux: "1", chatSound: "1", ps3Ip: "", companionPlugin: "1", fpsCounterPlugin: "0", consoleFanMode: "dynamic", consoleFanSpeed: "35", consoleFanTarget: "68", performanceMode: "balanced", performanceRsx: "650", performanceVram: "850" },
+          trophiesData: safeUserData.trophiesData || {},
+          wishlistData: safeUserData.wishlistData || [],
+          favoritesData: safeUserData.favoritesData || [],
+          downloadsData: safeUserData.downloadsData || [],
+          libraryData: safeUserData.libraryData || [],
+          friendsData: safeUserData.friendsData || [],
+          countersData: safeUserData.countersData || {},
+          themeColor: safeUserData.themeColor || '#0070cc',
           role: isAdmin ? "admin" : "user",
-          banned: false
-        };
+          banned: false,
+          migratedFromLocalProfile: isNewAccount !== true,
+          migratedAt: new Date().toISOString()
+        });
+        socket.role = getUserRole(name, userDatabase[name]);
 
         await pool.query(
           'INSERT INTO users (name, data) VALUES ($1, $2)',
