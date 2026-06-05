@@ -127,6 +127,11 @@ async function initDb() {
       resolved BOOLEAN DEFAULT FALSE,
       created_at TIMESTAMPTZ DEFAULT NOW()
     );
+    CREATE TABLE IF NOT EXISTS deleted_accounts (
+      name TEXT PRIMARY KEY,
+      data JSONB,
+      deleted_at TIMESTAMPTZ DEFAULT NOW()
+    );
   `);
 
   const usersRes = await pool.query('SELECT * FROM users');
@@ -641,6 +646,33 @@ async function resetUserPassword(targetName, newPassword, adminName) {
   return { success: true, targetName, temporaryPassword };
 }
 
+async function deleteUserAccount(targetName, reason, adminName) {
+  if (!targetName) return { success: false, message: "Missing target user." };
+  if (!userDatabase[targetName]) return { success: false, message: "User not found." };
+  if (ADMIN_USERS.includes(targetName)) return { success: false, message: "Hardcoded admins cannot be deleted." };
+
+  const deletedAt = new Date().toISOString();
+  const deleteReason = normalizeText(reason, "Account deleted by administrator.") || "Account deleted by administrator.";
+  const deletedData = {
+    name: targetName,
+    reason: deleteReason,
+    deletedBy: adminName || "Admin",
+    deletedAt
+  };
+
+  await pool.query(
+    'INSERT INTO deleted_accounts (name, data, deleted_at) VALUES ($1, $2, NOW()) ON CONFLICT (name) DO UPDATE SET data = $2, deleted_at = NOW()',
+    [targetName, deletedData]
+  );
+  await pool.query('DELETE FROM users WHERE name = $1', [targetName]);
+
+  delete userDatabase[targetName];
+  disconnectUserSessions(targetName, 'account_deleted', { reason: deleteReason, by: adminName || 'Admin' });
+  io.emit('online_list', getSanitizedOnlineList());
+
+  return { success: true, targetName, reason: deleteReason };
+}
+
 async function createReport(data = {}, reporterName = "Unknown") {
   const report = {
     id: normalizeText(data.id, `report-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`),
@@ -712,9 +744,23 @@ io.on('connection', async (socket) => {
       
       const dbRes = await pool.query('SELECT data FROM users WHERE name = $1', [name]);
       let dbUser = dbRes.rows.length > 0 ? normalizeUserRecord(name, dbRes.rows[0].data || {}) : null;
+      let wasDeletedAccount = false;
 
       const isHardcodedAdmin = ADMIN_USERS.includes(name);
       const isAdmin = isUserAdmin(name, dbUser);
+
+      if (!dbUser && !isHardcodedAdmin) {
+        const deletedRes = await pool.query('SELECT data FROM deleted_accounts WHERE name = $1', [name]);
+        if (deletedRes.rows.length > 0) {
+          wasDeletedAccount = true;
+          if (isNewAccount !== true) {
+            const deletedData = deletedRes.rows[0].data || {};
+            const reason = normalizeText(deletedData.reason, 'This account was deleted by an administrator.');
+            socket.emit('auth_error', `${reason} Use Create New Account again or choose another Online ID.`);
+            return;
+          }
+        }
+      }
 
       if (adminMaintenanceBypass === true && !isAdmin) {
         socket.emit('auth_error', 'Maintenance admin login rejected. This account is not an administrator.');
@@ -810,6 +856,9 @@ io.on('connection', async (socket) => {
           'INSERT INTO users (name, data) VALUES ($1, $2)',
           [name, userDatabase[name]]
         );
+        if (wasDeletedAccount) {
+          await pool.query('DELETE FROM deleted_accounts WHERE name = $1', [name]);
+        }
         
         console.log(`[NETWORK] ${name} created a new account. Admin: ${isAdmin}`);
         await addServerLog('signup', `${name} created an account${isAdmin ? ' as admin' : ''}`, { socketId: socket.id, role: getUserRole(name, userDatabase[name]) }, name);
@@ -1179,6 +1228,29 @@ io.on('connection', async (socket) => {
     } catch (err) {
       console.error('[ADMIN RESET PASSWORD ERROR]:', err);
       respond({ success: false, message: "Server error while resetting password." });
+    }
+  });
+
+  socket.on('admin_delete_account', async (data, callback) => {
+    const respond = typeof callback === 'function' ? callback : () => {};
+    try {
+      if (socket.isAdmin !== true) return respond({ success: false, message: "Admin only." });
+
+      const targetName = normalizeText(data && data.targetName, "");
+      if (targetName === socket.userName) return respond({ success: false, message: "You cannot delete your own account while logged in." });
+
+      const reason = normalizeText(data && data.reason, "Account deleted by administrator.");
+      const result = await deleteUserAccount(targetName, reason, socket.userName || normalizeText(data && data.adminUser, "Admin"));
+
+      if (result.success) {
+        await addModerationLog('delete_account', `Deleted account ${targetName}`, { targetName, reason: result.reason }, socket.userName || 'Admin');
+        await addServerLog('account_deleted', `${targetName} account deleted`, { targetName, reason: result.reason }, socket.userName || 'Admin');
+      }
+
+      respond(result);
+    } catch (err) {
+      console.error('[ADMIN DELETE ACCOUNT ERROR]:', err);
+      respond({ success: false, message: "Server error while deleting account." });
     }
   });
 
