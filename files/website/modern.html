@@ -4804,6 +4804,116 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 		};
 	}
 
+
+	function parseLocalJsonForAuth(rawValue, fallback) {
+		if (rawValue === undefined || rawValue === null || rawValue === "") return fallback;
+		try {
+			const parsed = JSON.parse(rawValue);
+			return parsed === null || parsed === undefined ? fallback : parsed;
+		} catch (err) {
+			return fallback;
+		}
+	}
+
+	function readLocalUserValueForAuth(username, key, fallback = null) {
+		if (!username || username === "null") return fallback;
+		const directKey = `${username}_${key}`;
+		const directValue = localStorage.getItem(directKey);
+		if (directValue !== null && directValue !== undefined) return directValue;
+		const activeUser = localStorage.getItem('psn_username');
+		if (activeUser === username) {
+			const activeValue = localStorage.getItem(key);
+			if (activeValue !== null && activeValue !== undefined) return activeValue;
+		}
+		return fallback;
+	}
+
+	function readLocalArrayForAuth(username, key, runtimeValue = null) {
+		const activeUser = localStorage.getItem('psn_username');
+		if (activeUser === username && Array.isArray(runtimeValue) && runtimeValue.length > 0) return runtimeValue;
+		const parsed = parseLocalJsonForAuth(readLocalUserValueForAuth(username, key, null), []);
+		return Array.isArray(parsed) ? parsed : [];
+	}
+
+	function readLocalObjectForAuth(username, key, runtimeValue = null) {
+		const activeUser = localStorage.getItem('psn_username');
+		if (activeUser === username && runtimeValue && typeof runtimeValue === 'object' && !Array.isArray(runtimeValue) && Object.keys(runtimeValue).length > 0) return runtimeValue;
+		const parsed = parseLocalJsonForAuth(readLocalUserValueForAuth(username, key, null), {});
+		return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+	}
+
+	function calculateLocalTrophyPayloadForAuth(trophiesData) {
+		let totalXp = 0;
+		let totalTrophies = 0;
+		const xpMap = { bronze: 15, silver: 30, gold: 90, platinum: 300 };
+		Object.keys(trophiesData || {}).forEach(id => {
+			const state = trophiesData[id];
+			if (!state || !state.unlocked) return;
+			totalTrophies++;
+			try {
+				if (typeof TROPHY_DATA !== 'undefined' && TROPHY_DATA[id]) {
+					totalXp += xpMap[TROPHY_DATA[id].type] || 0;
+				}
+			} catch (err) {}
+		});
+		return { totalXp, totalTrophies, level: Math.floor(totalXp / 100) + 1 };
+	}
+
+	function buildLocalUserDataForAuth(username) {
+		const activeUser = localStorage.getItem('psn_username');
+		const DEFAULT_URL = "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/interface/modern/images/avatars/default.png";
+		const fallbackAvatar = (typeof AVAILABLE_AVATARS !== 'undefined' && AVAILABLE_AVATARS[0]) ? AVAILABLE_AVATARS[0] : DEFAULT_URL;
+		const localAvatar = readLocalUserValueForAuth(username, 'psn_avatar', null) || fallbackAvatar;
+		const trophiesData = readLocalObjectForAuth(username, 'psn_user_trophies', activeUser === username ? window.userTrophies : null);
+		const trophyPayload = calculateLocalTrophyPayloadForAuth(trophiesData);
+		const downloadsData = readLocalArrayForAuth(username, COOKIE_NAME_HISTORY, activeUser === username ? window.downloadHistory : null);
+		const wishlistData = readLocalArrayForAuth(username, STORAGE_KEY_WISHLIST, activeUser === username ? window.wishlist : null);
+		const favoritesData = readLocalArrayForAuth(username, STORAGE_KEY_FAVS, activeUser === username ? window.favoritesLibrary : null);
+		const libraryData = readLocalArrayForAuth(username, 'psn_local_library', activeUser === username && typeof lastScannedGames !== 'undefined' ? lastScannedGames : null);
+		const friendsData = readLocalArrayForAuth(username, STORAGE_KEY_FRIENDS, activeUser === username ? window.friendsList : null);
+		return {
+			avatar: localAvatar,
+			joined: readLocalUserValueForAuth(username, 'joined_date', '2026') || '2026',
+			level: trophyPayload.level,
+			xp: trophyPayload.totalXp,
+			downloads: downloadsData.length,
+			wishlist: wishlistData.length,
+			favorites: favoritesData.length,
+			trophies: trophyPayload.totalTrophies,
+			library: libraryData.length,
+			trophiesData,
+			downloadsData,
+			wishlistData,
+			favoritesData,
+			libraryData,
+			friendsData,
+			countersData: {
+				msgs: localStorage.getItem(`${username}_psn_chat_msgs_sent`) || '0',
+				imgs: localStorage.getItem(`${username}_psn_chat_imgs_sent`) || '0',
+				reactions: localStorage.getItem(`${username}_psn_chat_reactions_given`) || '0',
+				trailers: localStorage.getItem(`${username}_psn_trailers_watched`) || '0',
+				days: localStorage.getItem(`${username}_psn_accessed_days`) || '[]',
+				lastChatRead: localStorage.getItem(`${username}_psn_last_chat_read`) || '0'
+			},
+			themeColor: readLocalUserValueForAuth(username, 'psn_theme_color', '#0070cc') || '#0070cc',
+			settingsData: {
+				audio: readLocalUserValueForAuth(username, STORAGE_KEY_AUDIO, '1') || '1',
+				ux: readLocalUserValueForAuth(username, STORAGE_KEY_UX, '1') || '1',
+				chatSound: readLocalUserValueForAuth(username, STORAGE_KEY_CHAT_SOUND, '1') || '1',
+				ps3Ip: readLocalUserValueForAuth(username, 'ps3_ip', '') || '',
+				companionPlugin: readLocalUserValueForAuth(username, STORAGE_KEY_COMPANION_PLUGIN, '1') !== '0' ? '1' : '0',
+				fpsCounterPlugin: readLocalUserValueForAuth(username, STORAGE_KEY_FPS_COUNTER, '0') === '1' ? '1' : '0',
+				consoleFanMode: readLocalUserValueForAuth(username, STORAGE_KEY_CONSOLE_FAN_MODE, 'dynamic') || 'dynamic',
+				consoleFanSpeed: readLocalUserValueForAuth(username, STORAGE_KEY_CONSOLE_FAN_SPEED, '35') || '35',
+				consoleFanTarget: readLocalUserValueForAuth(username, STORAGE_KEY_CONSOLE_FAN_TARGET, '68') || '68',
+				performanceMode: readLocalUserValueForAuth(username, STORAGE_KEY_PERFORMANCE_MODE, 'balanced') || 'balanced',
+				performanceRsx: readLocalUserValueForAuth(username, STORAGE_KEY_PERFORMANCE_RSX, '650') || '650',
+				performanceVram: readLocalUserValueForAuth(username, STORAGE_KEY_PERFORMANCE_VRAM, '850') || '850'
+			},
+			ps3Status: activeUser === username ? (window.myCurrentPS3Status || null) : null
+		};
+	}
+
 	function syncRuntimePluginPreferencesToServer() {
 		try {
 			if (typeof socketChat === 'undefined' || !socketChat || !socketChat.connected) return false;
@@ -5202,7 +5312,8 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 							name: username,
 							password: savedPass,
 							isNewAccount: false,
-							adminMaintenanceBypass: document.body.classList.contains('admin-maintenance-login-bypass')
+							adminMaintenanceBypass: document.body.classList.contains('admin-maintenance-login-bypass'),
+							userData: buildLocalUserDataForAuth(username)
 						});
 					} else {
 						setTimeout(tryLogin, 300);
@@ -5319,7 +5430,8 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 					name: currentLoginUser,
 					password: pass,
 					isNewAccount: false,
-					adminMaintenanceBypass: document.body.classList.contains('admin-maintenance-login-bypass')
+					adminMaintenanceBypass: document.body.classList.contains('admin-maintenance-login-bypass'),
+						userData: buildLocalUserDataForAuth(currentLoginUser)
 				});
 			} else {
 				if (typeof playUiError === 'function') playUiError();
@@ -22131,33 +22243,11 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 			const isAlreadyBooted = bootContainer && bootContainer.style.display === 'none';
 		
 			if (myName && myPass && myName !== "null" && isAlreadyBooted) {
-				const myAvatar = localStorage.getItem(`${myName}_psn_avatar`) || AVAILABLE_AVATARS[0];
-				const myJoinedDate = localStorage.getItem(`${myName}_joined_date`) || "2026";
-				
-				let totalXp = typeof calculateMyXp === 'function' ? calculateMyXp() : 0;
-				let totalTrophiesUnlocked = Object.keys(window.userTrophies || {}).filter(id => window.userTrophies[id].unlocked).length;
-				const myLevel = Math.floor(totalXp / 100) + 1;
-			
 				socketChat.emit('authenticate_user', { 
 					name: myName,
 					password: myPass,
 					isNewAccount: false,
-					userData: {
-						avatar: myAvatar,
-						level: myLevel,
-						joined: myJoinedDate,
-						downloads: window.downloadHistory ? window.downloadHistory.length : 0,
-						wishlist: window.wishlist ? window.wishlist.length : 0,
-						favorites: window.favoritesLibrary ? window.favoritesLibrary.length : 0,
-						trophies: totalTrophiesUnlocked,
-						library: typeof lastScannedGames !== 'undefined' ? lastScannedGames.length : 0,
-						trophiesData: window.userTrophies || {},
-						downloadsData: window.downloadHistory || [],
-						wishlistData: window.wishlist || [],
-						favoritesData: window.favoritesLibrary || [],
-						libraryData: typeof lastScannedGames !== 'undefined' ? lastScannedGames : [],
-						ps3Status: window.myCurrentPS3Status || null
-					}
+					userData: buildLocalUserDataForAuth(myName)
 				});
 			}
 			
@@ -22406,7 +22496,15 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 			
 			localStorage.setItem('psn_username', name);
 			saveUserToGlobalList(name); 
-			if (userData.avatar) localStorage.setItem(`${name}_psn_avatar`, userData.avatar);
+			const defaultAvatarForCompare = "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/interface/modern/images/avatars/default.png";
+			const isDefaultServerAvatar = !userData.avatar || userData.avatar === defaultAvatarForCompare || /\/avatars\/default\.png(?:$|\?)/.test(String(userData.avatar));
+			const existingLocalAvatar = localStorage.getItem(`${name}_psn_avatar`);
+			const shouldKeepLocalAvatar = isDefaultServerAvatar && existingLocalAvatar && !/\/avatars\/default\.png(?:$|\?)/.test(existingLocalAvatar);
+			if (shouldKeepLocalAvatar) {
+				userData.avatar = existingLocalAvatar;
+			} else if (userData.avatar) {
+				localStorage.setItem(`${name}_psn_avatar`, userData.avatar);
+			}
 			if (userData.joined) localStorage.setItem(`${name}_joined_date`, userData.joined);
 		
 			window.isProfileLoaded = true; 

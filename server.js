@@ -366,6 +366,58 @@ function normalizeUserRecord(name, userData = {}) {
   return normalized;
 }
 
+
+
+function hasObjectPayload(value) {
+  return !!(value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).length > 0);
+}
+
+function hasArrayPayload(value) {
+  return Array.isArray(value) && value.length > 0;
+}
+
+function isDefaultAvatarValue(value) {
+  const text = normalizeText(value, "");
+  return !text || text === DEFAULT_AVATAR || /\/avatars\/default\.png(?:$|\?)/.test(text);
+}
+
+function preferLocalArrayPayload(currentValue, localValue) {
+  const currentLength = Array.isArray(currentValue) ? currentValue.length : 0;
+  const localLength = Array.isArray(localValue) ? localValue.length : 0;
+  return localLength > currentLength ? localValue : currentValue;
+}
+
+function preferLocalObjectPayload(currentValue, localValue) {
+  const currentSize = hasObjectPayload(currentValue) ? Object.keys(currentValue).length : 0;
+  const localSize = hasObjectPayload(localValue) ? Object.keys(localValue).length : 0;
+  return localSize > currentSize ? localValue : currentValue;
+}
+
+function mergeLocalRecoveryData(dbUser = {}, localData = {}) {
+  if (!hasObjectPayload(localData)) return dbUser;
+  const merged = { ...dbUser };
+  if (localData.avatar && isDefaultAvatarValue(merged.avatar) && !isDefaultAvatarValue(localData.avatar)) merged.avatar = localData.avatar;
+  if ((!merged.joined || merged.joined === '2026') && localData.joined) merged.joined = localData.joined;
+  if ((!merged.themeColor || merged.themeColor === '#0070cc') && localData.themeColor) merged.themeColor = localData.themeColor;
+  ['trophiesData', 'countersData'].forEach(key => {
+    const preferred = preferLocalObjectPayload(merged[key], localData[key]);
+    if (preferred !== merged[key]) merged[key] = preferred;
+  });
+  ['downloadsData', 'wishlistData', 'favoritesData', 'libraryData', 'friendsData'].forEach(key => {
+    const preferred = preferLocalArrayPayload(merged[key], localData[key]);
+    if (preferred !== merged[key]) merged[key] = preferred;
+  });
+  if (hasObjectPayload(localData.settingsData)) {
+    merged.settingsData = { ...(merged.settingsData || {}), ...localData.settingsData };
+  }
+  ['downloads', 'wishlist', 'favorites', 'trophies', 'library', 'level', 'xp'].forEach(key => {
+    const current = Number(merged[key] || 0);
+    const incoming = Number(localData[key] || 0);
+    if (incoming > current) merged[key] = incoming;
+  });
+  return merged;
+}
+
 function normalizeMaintenanceState(data = {}) {
   const schedule = normalizeMaintenanceSchedule(data.schedule || {});
   const scheduled = getMaintenanceScheduleStatus(schedule);
@@ -785,14 +837,16 @@ io.on('connection', async (socket) => {
           socket.isAdmin = isAdmin;
           socket.role = getUserRole(name, dbUser);
 
+          const recoveredDbUser = mergeLocalRecoveryData(dbUser, safeUserData);
+
           userDatabase[name] = {
-            ...dbUser,
+            ...recoveredDbUser,
             online: true,
             id: socket.id,
             lastSeen: Date.now(),
             name: name,
-            role: getUserRole(name, dbUser),
-            banned: isUserBanned(dbUser)
+            role: getUserRole(name, recoveredDbUser),
+            banned: isUserBanned(recoveredDbUser)
           };
           
           await pool.query('UPDATE users SET data = $1 WHERE name = $2', [userDatabase[name], name]);
