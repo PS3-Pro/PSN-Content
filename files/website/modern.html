@@ -2196,13 +2196,13 @@ button[onclick="sendChatMessage()"] { padding: 0 15px !important; height: 38px !
 @media (hover: none) and (pointer: coarse), (max-width: 768px) {
 #ps5-boot-container { justify-content: center !important; align-items: center !important; padding: max(18px, env(safe-area-inset-top, 0px)) 18px max(22px, env(safe-area-inset-bottom, 0px)) 18px !important; box-sizing: border-box !important; }
 	#user-select-screen { width: 100% !important; max-width: 430px !important; margin: 0 auto !important; align-items: center !important; justify-content: center !important; transform: none !important; }
-	#welcome-msg { width: 100% !important; max-width: 390px !important; text-align: center !important; justify-content: center !important; font-size: clamp(20px, 5.4vw, 28px) !important; line-height: 1.18 !important; margin: 0 0 8px 0 !important; }
+	#welcome-msg { width: 100% !important; max-width: 390px !important; min-height: 66px !important; text-align: center !important; justify-content: center !important; font-size: clamp(20px, 5.4vw, 28px) !important; line-height: 1.18 !important; margin: 0 0 8px 0 !important; }
 	#user-select-screen > p { width: 100% !important; max-width: 340px !important; text-align: center !important; margin-left: auto !important; margin-right: auto !important; }
 	.user-grid-ps5 { width: 100% !important; max-width: 390px !important; justify-content: center !important; align-items: center !important; gap: 24px 22px !important; margin: 32px auto 0 auto !important; }
 	.user-profile-card { transform-origin: center center !important; }
 	.user-profile-card.logging-in { transform: translateX(var(--move-x, 0)) scale(1.1) !important; }
+	.user-profile-card.logging-in .user-avatar-ps5, .user-avatar-ps5.loading-spin { transform: none !important; }
 	.user-profile-card.fade-out { transform: scale(0.6) !important; }
-	.user-avatar-ps5.loading-spin { transform: none !important; }
 #ps5-user-grid.user-grid-ps5 { align-items: flex-start !important; }
 	#ps5-user-grid .user-profile-card { align-self: flex-start !important; }
 	#ps5-user-grid:has(.user-profile-card:not(.new-user-card)) .new-user-card .new-user-label.hover-only { line-height: 0 !important; height: 0 !important; margin: 0 !important; overflow: hidden !important; }
@@ -5661,17 +5661,12 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 				const rect = card.getBoundingClientRect();
 				
 				const targetX = window.innerWidth / 2;
-				const targetY = (window.innerHeight / 2) - 80;
-				
 				const diffX = targetX - (rect.left + rect.width / 2);
-				const diffY = targetY - (rect.top + rect.height / 2);
 				
 				card.style.setProperty('--move-x', '0px');
-				card.style.setProperty('--move-y', '0px');
 				void card.offsetWidth; 
 				
 				card.style.setProperty('--move-x', `${diffX}px`);
-				card.style.setProperty('--move-y', `${diffY}px`);
 				card.classList.add('logging-in');
 				
 				const nameText = card.querySelector('p');
@@ -9400,9 +9395,61 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 	}
 
 
+	window.normalizeContentCategoryKey = function(category, fallback = 'games') {
+		const normalized = String(category || fallback || 'games').trim().toLowerCase().replace(/\s+/g, '_');
+		const aliases = {
+			game: 'games', app: 'apps', application: 'apps', apps: 'apps',
+			dlc: 'dlcs', dlcs: 'dlcs', addon: 'dlcs', add_on: 'dlcs', 'add-on': 'dlcs',
+			update: 'updates', patch: 'updates', avatar: 'avatars', theme: 'themes', demo: 'demos',
+			homebrew: 'homebrew_games', homebrew_game: 'homebrew_games', port: 'ports',
+			prototype: 'prototypes', proto: 'prototypes', tool: 'tools',
+			dev: 'dev_tools', dev_tool: 'dev_tools', emu: 'emulators', emulator: 'emulators',
+			launcher: 'launchers', manager: 'backup_manager', backup_manager: 'backup_manager'
+		};
+		return aliases[normalized] || normalized || fallback || 'games';
+	};
+
+	window.inferContentCategoryKey = function(item = {}, fallback = 'games') {
+		const ignoredDirect = ['favorite', 'favorites', 'fav', 'favs', 'library', 'download', 'downloads', 'wishlist'];
+		const normalize = (value, def = 'games') => (typeof window.normalizeContentCategoryKey === 'function')
+			? window.normalizeContentCategoryKey(value, def)
+			: String(value || def || 'games').trim().toLowerCase().replace(/\s+/g, '_');
+
+		const directRaw = item.category || item.contentCategory || item.contentType || item.type || '';
+		let direct = directRaw ? normalize(directRaw, '') : '';
+		if (ignoredDirect.includes(direct)) direct = '';
+
+		const fallbackKey = normalize(fallback || 'games', 'games');
+		const safeFallback = ignoredDirect.includes(fallbackKey) ? 'games' : fallbackKey;
+
+		const id = String(item.id || item.titleId || item.titleID || '').trim();
+		const aTag = String(item.aTag || item.appTag || '').trim().toLowerCase();
+		const text = `${item.cleanName || ''} ${item.name || ''} ${item.title || ''} ${item.rawName || ''} ${id}`.toLowerCase();
+
+		if (direct && !['games', 'apps'].includes(direct)) return direct;
+
+		const appById = !!(id && typeof DICT_APPS_FILTER !== 'undefined' && DICT_APPS_FILTER[id] === 1);
+		const appByTag = !!(aTag && ['media', 'firstplay', 'qore'].includes(aTag));
+		const appByText = /\b(app|application|youtube|netflix|hulu|spotify|vidzone|qore|firstplay|life\s+with\s+playstation|music\s+unlimited|video\s+unlimited|photo\s+gallery|store|manager|launcher|emulator|\bemu\b|tool)\b/.test(text);
+
+		if (direct === 'apps' || safeFallback === 'apps' || appById || appByTag || appByText) return 'apps';
+
+		if (direct === 'games' || safeFallback === 'games') {
+			if (/\bdlc\b|add[- ]?on|expansion|pack/.test(text)) return 'dlcs';
+			if (/\b(update|patch)\b/.test(text)) return 'updates';
+			if (/\bavatar\b/.test(text)) return 'avatars';
+			if (/\btheme\b/.test(text)) return 'themes';
+			if (/\bdemo\b|trial/.test(text)) return 'demos';
+			if (/\bhomebrew\b/.test(text)) return 'homebrew_games';
+			if (/\bport\b/.test(text)) return 'ports';
+			return 'games';
+		}
+
+		return direct || safeFallback || 'games';
+	};
+
 	window.getDownloadTypeMeta = function(category, item = {}) {
-		const rawCategory = String(category || item.category || '').trim().toLowerCase();
-		const normalized = rawCategory.replace(/\s+/g, '_');
+		const resolved = window.inferContentCategoryKey(item, category || item.category || 'games');
 		const map = {
 			games: { label: 'GAME', icon: 'fas fa-gamepad', cls: 'game' },
 			apps: { label: 'APP', icon: 'fas fa-cube', cls: 'app' },
@@ -9423,31 +9470,7 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 			tools: { label: 'TOOL', icon: 'fas fa-toolbox', cls: 'tool' }
 		};
 
-		const aliases = {
-			game: 'games',
-			app: 'apps',
-			application: 'apps',
-			dlc: 'dlcs',
-			addon: 'dlcs',
-			add_on: 'dlcs',
-			update: 'updates',
-			patch: 'updates',
-			avatar: 'avatars',
-			theme: 'themes',
-			demo: 'demos',
-			homebrew: 'homebrew_games',
-			homebrew_game: 'homebrew_games',
-			port: 'ports',
-			prototype: 'prototypes',
-			proto: 'prototypes',
-			tool: 'tools',
-			dev: 'dev_tools',
-			emu: 'emulators',
-			emulator: 'emulators',
-			launcher: 'launchers'
-		};
-
-		return map[normalized] || map[aliases[normalized]] || { label: normalized ? normalized.replace(/_/g, ' ').toUpperCase() : 'CONTENT', icon: 'fas fa-box', cls: 'default' };
+		return map[resolved] || { label: resolved ? resolved.replace(/_/g, ' ').toUpperCase() : 'CONTENT', icon: 'fas fa-box', cls: 'default' };
 	};
 
 	window.getDownloadTypeTagHtml = function(category, item = {}) {
@@ -9456,23 +9479,11 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 	};
 
 	window.getProfileListItemCategory = function(item = {}, listType = '') {
-		const direct = item.category || item.contentCategory || item.contentType || item.type;
-		if (direct && !['favorite', 'favorites', 'library', 'download', 'downloads', 'wishlist'].includes(String(direct).toLowerCase())) {
-			return direct;
-		}
-
-		const text = `${item.cleanName || ''} ${item.name || ''} ${item.title || ''} ${item.titleId || ''} ${item.id || ''}`.toLowerCase();
-		if (/\bdlc\b|add[- ]?on|expansion|pack/.test(text)) return 'dlcs';
-		if (/\b(update|patch)\b/.test(text)) return 'updates';
-		if (/\bavatar\b/.test(text)) return 'avatars';
-		if (/\btheme\b/.test(text)) return 'themes';
-		if (/\bdemo\b|trial/.test(text)) return 'demos';
-		if (/\bhomebrew\b/.test(text)) return 'homebrew_games';
-		if (/\bport\b/.test(text)) return 'ports';
-		if (/\btool\b|manager|launcher|emulator|\bemu\b/.test(text)) return 'apps';
-
-		return 'games';
+		const listFallbacks = { wishlist: 'games', downloads: 'games', download: 'games', library: 'games', favs: 'games', favorites: 'games' };
+		const fallback = item.category || listFallbacks[String(listType || '').toLowerCase()] || 'games';
+		return window.inferContentCategoryKey(item, fallback);
 	};
+
 
     window.addToDownloadManager = function(fileName, sizeBytes, titleId, category) {
         const now = new Date();
@@ -9491,7 +9502,8 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
         const entry = {
             id: Date.now(),
             titleId: titleId, 
-            category: category, 
+            category: (typeof window.getProfileListItemCategory === 'function' ? window.getProfileListItemCategory({ id: titleId, titleId, name: fileName, category }, 'downloads') : category), 
+            rawCategory: category,
             name: fileName.replace(/_/g, ' '),
             sizeBytes: sizeBytes || 0,
             sizeText: formatSizeFromBytes(sizeBytes),
@@ -9619,15 +9631,16 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 		
 		listContainer.innerHTML = window.downloadHistory.map((dl, index) => {
 			const newClass = dl.isNew ? 'is-new' : '';
-			const coverImg = getOptimizedCover(dl.titleId);
-			const typeMeta = window.getDownloadTypeMeta(dl.category, dl);
-			const typeTagHtml = window.getDownloadTypeTagHtml(dl.category, dl);
+			const resolvedDlCategory = (typeof window.getProfileListItemCategory === 'function') ? window.getProfileListItemCategory(dl, 'downloads') : (dl.category || 'games');
+			const coverImg = getItemCover({ id: dl.titleId, titleId: dl.titleId, contentId: dl.contentId }, resolvedDlCategory);
+			const typeMeta = window.getDownloadTypeMeta(resolvedDlCategory, dl);
+			const typeTagHtml = window.getDownloadTypeTagHtml(resolvedDlCategory, dl);
 			const typeClass = `dl-kind-${typeMeta.cls || 'default'}`;
 	
 			return `
 				<div class="download-item ${newClass} ${typeClass} anim-reveal" style="--tile-idx: ${index}; cursor: pointer; display: flex; align-items: center; gap: 15px;" 
 					onmouseenter="playUiHover(); this.classList.remove('anim-reveal');" 
-					onclick="playUiClick(); switchAndSearch('${dl.category}', '${dl.titleId}', 'downloads')">
+					onclick="playUiClick(); switchAndSearch('${resolvedDlCategory}', '${dl.titleId}', 'downloads')">
 					
 					<div class="dl-cover-wrap dl-cover-main">
 						<img src="${coverImg}" class="dl-mini-cover" onerror="this.src='${FALLBACK_IMG}'">
@@ -13539,7 +13552,8 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 	
 			const itemToAdd = { 
 				...gameData,
-				category: gameData.category || currentCat
+				category: (typeof window.getProfileListItemCategory === 'function' ? window.getProfileListItemCategory({ ...gameData, category: gameData.category || currentCat }, 'wishlist') : (gameData.category || currentCat)),
+				rawCategory: gameData.category || currentCat
 			};
 	
 			if (!itemToAdd.date) {
@@ -13576,32 +13590,9 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 			? window.getProfileListItemCategory(item, 'wishlist')
 			: (item.category || 'games');
 
-		const normalized = String(category || 'games').trim().toLowerCase().replace(/\s+/g, '_');
-		const aliases = {
-			game: 'games',
-			app: 'apps',
-			application: 'apps',
-			dlc: 'dlcs',
-			addon: 'dlcs',
-			add_on: 'dlcs',
-			update: 'updates',
-			patch: 'updates',
-			avatar: 'avatars',
-			theme: 'themes',
-			demo: 'demos',
-			homebrew: 'homebrew_games',
-			homebrew_game: 'homebrew_games',
-			port: 'ports',
-			prototype: 'prototypes',
-			proto: 'prototypes',
-			tool: 'tools',
-			dev: 'dev_tools',
-			emu: 'emulators',
-			emulator: 'emulators',
-			launcher: 'launchers'
-		};
-
-		return aliases[normalized] || normalized || 'games';
+		return (typeof window.normalizeContentCategoryKey === 'function')
+			? window.normalizeContentCategoryKey(category, 'games')
+			: String(category || 'games').trim().toLowerCase().replace(/\s+/g, '_');
 	};
 
 	window.updateWishlistTypeFilterAvailability = function() {
@@ -13787,14 +13778,15 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 		let html = '';
 	
 		filteredWishlist.forEach((game, i) => {
-			const imgUrl = getItemCover(game, game.category);
+			const resolvedWishCategory = (typeof window.getWishlistItemCategoryKey === 'function') ? window.getWishlistItemCategoryKey(game) : (game.category || 'games');
+			const imgUrl = getItemCover(game, resolvedWishCategory);
 			const tagClass = `tag-${game.cTag}`;
 			
 			const shouldShowWishTypeTag = catFilter === 'ALL';
-			const wishTypeCategory = shouldShowWishTypeTag ? ((typeof window.getWishlistItemCategoryKey === 'function') ? window.getWishlistItemCategoryKey(game) : (game.category || 'games')) : '';
+			const wishTypeCategory = shouldShowWishTypeTag ? resolvedWishCategory : '';
 			const wishTypeTagHtml = shouldShowWishTypeTag && typeof window.getDownloadTypeTagHtml === 'function' ? window.getDownloadTypeTagHtml(wishTypeCategory, game).replace('dl-type-chip', 'dl-type-chip wish-type-chip-cover') : '';
 			html += `
-			<div class="game-card ${animClass} is-wishlisted" data-content-id="${game.contentId || ''}" style="--tile-idx: ${i % 50}; cursor: pointer;" onmouseenter="const __hoverTarget = document.elementFromPoint(event.clientX, event.clientY); if(!__hoverTarget || !__hoverTarget.closest('.btn-mini,.btn-mini-round,.fav-btn,.wish-btn,.action-btn,button,a')) playUiHover(); this.classList.remove('anim-reveal'); this.classList.add('no-anim');" onclick="playUiClick(); searchGameOnSite('${game.id}', 'wishlist', '${game.category || 'games'}')">
+			<div class="game-card ${animClass} is-wishlisted" data-content-id="${game.contentId || ''}" style="--tile-idx: ${i % 50}; cursor: pointer;" onmouseenter="const __hoverTarget = document.elementFromPoint(event.clientX, event.clientY); if(!__hoverTarget || !__hoverTarget.closest('.btn-mini,.btn-mini-round,.fav-btn,.wish-btn,.action-btn,button,a')) playUiHover(); this.classList.remove('anim-reveal'); this.classList.add('no-anim');" onclick="playUiClick(); searchGameOnSite('${game.id}', 'wishlist', '${resolvedWishCategory}')">
 				<div class="game-img-container">
 					<div class="console-tag ${tagClass}">${game.cTag.toUpperCase()}</div>
 					<div class="region-tag">${game.region}</div>
@@ -13802,7 +13794,7 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 					<div class="wish-btn" title="Remove from Wishlist" onclick="toggleWishlist(event, '${game.id}')">
 						<i class="fas fa-heart" style="color: #ff4444; font-size: 14px;"></i>
 					</div>
-					<img src="${imgUrl}" class="game-img" loading="lazy" data-name="${(game.cleanName || '').replace(/"/g, '&quot;')}" data-console="${game.cTag}" onload="this.setAttribute('data-loaded', 'true')" onerror="handleCoverError(this, '${game.category || 'games'}')">
+					<img src="${imgUrl}" class="game-img" loading="lazy" data-name="${(game.cleanName || '').replace(/"/g, '&quot;')}" data-console="${game.cTag}" onload="this.setAttribute('data-loaded', 'true')" onerror="handleCoverError(this, '${resolvedWishCategory}')">
 				</div>
 				<div class="game-info" style="padding: 10px; min-height: 0;">
 					<div style="display: flex; flex-direction: column; justify-content: space-between; height: 100%;">
