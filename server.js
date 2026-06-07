@@ -24,6 +24,10 @@ const DEFAULT_AVATAR = "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/ma
 const MAX_CHAT_HISTORY = 1000; 
 
 const SERVER_STARTED_AT = Date.now();
+const INSTANCE_ID = process.env.RENDER_INSTANCE_ID || process.env.RAILWAY_REPLICA_ID || process.env.HOSTNAME || `instance-${Math.random().toString(36).slice(2, 10)}`;
+const PRESENCE_TTL_SECONDS = 90;
+const PRESENCE_HEARTBEAT_MS = 25000;
+const CHAT_SYNC_INTERVAL_MS = 3000;
 const DEFAULT_MAINTENANCE_MESSAGE = "The service is under maintenance. Please try again soon.";
 const VALID_USER_ROLES = new Set(["user", "trusted", "mod", "admin"]);
 const ADMIN_STATE_KEYS = {
@@ -43,6 +47,7 @@ app.get('/ping', (req, res) => {
 
 let userDatabase = {};
 let messageHistory = [];
+let lastChatDbId = 0;
 let pinnedMessages = [];
 
 let adminState = {
@@ -132,7 +137,26 @@ async function initDb() {
       data JSONB,
       deleted_at TIMESTAMPTZ DEFAULT NOW()
     );
+    CREATE TABLE IF NOT EXISTS presence_sessions (
+      socket_id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      instance_id TEXT,
+      connected_at TIMESTAMPTZ DEFAULT NOW(),
+      last_seen TIMESTAMPTZ DEFAULT NOW(),
+      data JSONB DEFAULT '{}'::jsonb
+    );
+    CREATE INDEX IF NOT EXISTS idx_presence_sessions_name ON presence_sessions(name);
+    CREATE INDEX IF NOT EXISTS idx_presence_sessions_last_seen ON presence_sessions(last_seen);
+    CREATE TABLE IF NOT EXISTS chat_backups (
+      id SERIAL PRIMARY KEY,
+      by_user TEXT,
+      reason TEXT,
+      messages JSONB,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
   `);
+
+  await pool.query('DELETE FROM presence_sessions WHERE instance_id = $1 OR last_seen < NOW() - INTERVAL \'90 seconds\'', [INSTANCE_ID]);
 
   const usersRes = await pool.query('SELECT * FROM users');
   usersRes.rows.forEach(row => {
@@ -140,8 +164,7 @@ async function initDb() {
     userDatabase[row.name].online = false;
   });
 
-  const chatRes = await pool.query(`SELECT message FROM chat ORDER BY id DESC LIMIT ${MAX_CHAT_HISTORY}`);
-  messageHistory = chatRes.rows.map(r => r.message).reverse();
+  await refreshChatHistoryFromDb();
   
   const pinnedRes = await pool.query('SELECT data FROM pinned_messages ORDER BY id ASC');
   pinnedMessages = pinnedRes.rows.map(r => r.data);
@@ -488,6 +511,83 @@ async function saveAdminState(key, data) {
   );
 }
 
+function cleanChatMessage(message = {}) {
+  const clean = { ...(message || {}) };
+  delete clean._dbId;
+  return clean;
+}
+
+function getPublicChatHistory() {
+  return messageHistory.map(cleanChatMessage);
+}
+
+async function refreshChatHistoryFromDb() {
+  const chatRes = await pool.query('SELECT id, message FROM chat ORDER BY id DESC LIMIT $1', [MAX_CHAT_HISTORY]);
+  const rows = chatRes.rows.reverse();
+  messageHistory = rows.map(row => ({ ...(row.message || {}), _dbId: row.id }));
+  lastChatDbId = rows.length ? Math.max(...rows.map(row => Number(row.id) || 0)) : 0;
+  return messageHistory;
+}
+
+async function backupChatHistory(byUser = "Admin", reason = "manual clear") {
+  const snapshot = getPublicChatHistory();
+  await pool.query(
+    'INSERT INTO chat_backups (by_user, reason, messages) VALUES ($1, $2, $3)',
+    [byUser, reason, snapshot]
+  );
+  return snapshot.length;
+}
+
+async function clearChatHistorySafely(byUser = "Admin", reason = "manual clear") {
+  await refreshChatHistoryFromDb();
+  const backedUpCount = await backupChatHistory(byUser, reason);
+  messageHistory = [];
+  lastChatDbId = 0;
+  await pool.query('TRUNCATE chat RESTART IDENTITY');
+  return backedUpCount;
+}
+
+async function syncChatAcrossInstances() {
+  try {
+    const newRows = await pool.query(
+      'SELECT id, message FROM chat WHERE id > $1 ORDER BY id ASC LIMIT $2',
+      [lastChatDbId, MAX_CHAT_HISTORY]
+    );
+
+    if (newRows.rows.length > 0) {
+      for (const row of newRows.rows) {
+        const dbId = Number(row.id) || 0;
+        if (messageHistory.some(m => Number(m._dbId) === dbId || (m.time && row.message && m.time === row.message.time))) {
+          lastChatDbId = Math.max(lastChatDbId, dbId);
+          continue;
+        }
+        const message = { ...(row.message || {}), _dbId: dbId };
+        messageHistory.push(message);
+        if (messageHistory.length > MAX_CHAT_HISTORY) messageHistory.shift();
+        lastChatDbId = Math.max(lastChatDbId, dbId);
+        io.emit('chat_message', cleanChatMessage(message));
+      }
+      return;
+    }
+
+    if (messageHistory.length > 0) {
+      const meta = await pool.query('SELECT COUNT(*)::int AS total, COALESCE(MAX(id), 0)::int AS max_id FROM chat');
+      const total = Number(meta.rows[0]?.total || 0);
+      const maxId = Number(meta.rows[0]?.max_id || 0);
+      if (total === 0) {
+        messageHistory = [];
+        lastChatDbId = 0;
+        io.emit('chat_cleared', { by: 'Server Sync' });
+      } else if (maxId < lastChatDbId) {
+        await refreshChatHistoryFromDb();
+        io.emit('chat_history', getPublicChatHistory());
+      }
+    }
+  } catch (err) {
+    console.error('[CHAT SYNC ERROR]:', err);
+  }
+}
+
 function emitAdminState(socket) {
   socket.emit('maintenance_mode', adminState.maintenance);
   socket.emit('chat_controls', adminState.chatControls);
@@ -577,6 +677,73 @@ function disconnectUserSessions(name, eventName = 'user_kicked', payload = {}) {
   });
 }
 
+async function upsertPresenceForSocket(socket, name) {
+  if (!socket || !name) return;
+  await pool.query(
+    `INSERT INTO presence_sessions (socket_id, name, instance_id, connected_at, last_seen, data)
+     VALUES ($1, $2, $3, NOW(), NOW(), $4)
+     ON CONFLICT (socket_id) DO UPDATE SET name = $2, instance_id = $3, last_seen = NOW(), data = $4`,
+    [socket.id, name, INSTANCE_ID, { role: getUserRole(name, userDatabase[name] || null) }]
+  );
+}
+
+async function removePresenceForSocket(socket) {
+  if (!socket || !socket.id) return;
+  await pool.query('DELETE FROM presence_sessions WHERE socket_id = $1', [socket.id]);
+}
+
+async function syncPresenceOnlineFromDb() {
+  await pool.query(`DELETE FROM presence_sessions WHERE last_seen < NOW() - INTERVAL '90 seconds'`);
+
+  const presenceRes = await pool.query(`
+    SELECT name,
+           MAX(last_seen) AS last_seen,
+           (ARRAY_AGG(socket_id ORDER BY last_seen DESC))[1] AS socket_id
+    FROM presence_sessions
+    GROUP BY name
+  `);
+
+  Object.entries(userDatabase).forEach(([username, user]) => {
+    user.online = false;
+    if (!user.lastSeen) user.lastSeen = null;
+  });
+
+  presenceRes.rows.forEach(row => {
+    const username = row.name;
+    if (!userDatabase[username]) return;
+    userDatabase[username].online = true;
+    userDatabase[username].id = row.socket_id || userDatabase[username].id;
+    userDatabase[username].lastSeen = row.last_seen ? new Date(row.last_seen).getTime() : Date.now();
+  });
+
+  return userDatabase;
+}
+
+async function emitOnlineList(targetSocket = null) {
+  try {
+    await syncPresenceOnlineFromDb();
+  } catch (err) {
+    console.error('[PRESENCE SYNC ERROR]:', err);
+  }
+  const list = getSanitizedOnlineList();
+  if (targetSocket) targetSocket.emit('online_list', list);
+  else io.emit('online_list', list);
+  return list;
+}
+
+async function heartbeatPresenceSessions() {
+  const activeSockets = [];
+  io.sockets.sockets.forEach(client => {
+    if (client.connected && client.userName) activeSockets.push(client);
+  });
+
+  for (const client of activeSockets) {
+    await upsertPresenceForSocket(client, client.userName);
+  }
+
+  await emitOnlineList();
+}
+
 async function setUserRole(targetName, role, adminName) {
   if (!targetName || !userDatabase[targetName]) {
     return { success: false, message: "User not found." };
@@ -606,7 +773,7 @@ async function setUserRole(targetName, role, adminName) {
     });
   });
 
-  io.emit('online_list', getSanitizedOnlineList());
+  await emitOnlineList();
   return { success: true, role: getUserRole(targetName, userDatabase[targetName]), banned: isUserBanned(userDatabase[targetName]) };
 }
 
@@ -660,7 +827,7 @@ async function banUser(targetName, reason, adminName) {
   await saveUser(targetName);
 
   disconnectUserSessions(targetName, 'user_banned', { reason: userDatabase[targetName].banReason, by: adminName || 'Admin' });
-  io.emit('online_list', getSanitizedOnlineList());
+  await emitOnlineList();
   return { success: true, targetName, reason: userDatabase[targetName].banReason };
 }
 
@@ -679,7 +846,7 @@ async function unbanUser(targetName, adminName) {
   delete userDatabase[targetName].bannedAt;
   await saveUser(targetName);
 
-  io.emit('online_list', getSanitizedOnlineList());
+  await emitOnlineList();
   return { success: true, targetName };
 }
 
@@ -720,7 +887,7 @@ async function deleteUserAccount(targetName, reason, adminName) {
 
   delete userDatabase[targetName];
   disconnectUserSessions(targetName, 'account_deleted', { reason: deleteReason, by: adminName || 'Admin' });
-  io.emit('online_list', getSanitizedOnlineList());
+  await emitOnlineList();
 
   return { success: true, targetName, reason: deleteReason };
 }
@@ -783,6 +950,14 @@ async function syncAdminStateAcrossInstances() {
 setInterval(() => {
   syncAdminStateAcrossInstances().catch(err => console.error('[ADMIN STATE SYNC ERROR]:', err));
 }, 15000);
+
+setInterval(() => {
+  heartbeatPresenceSessions().catch(err => console.error('[PRESENCE HEARTBEAT ERROR]:', err));
+}, PRESENCE_HEARTBEAT_MS);
+
+setInterval(() => {
+  syncChatAcrossInstances().catch(err => console.error('[CHAT POLL ERROR]:', err));
+}, CHAT_SYNC_INTERVAL_MS);
 
 io.on('connection', async (socket) => {
   console.log('[NETWORK] Socket connected. ID: ' + socket.id);
@@ -850,7 +1025,9 @@ io.on('connection', async (socket) => {
           };
           
           await pool.query('UPDATE users SET data = $1 WHERE name = $2', [userDatabase[name], name]);
-          
+          await upsertPresenceForSocket(socket, name);
+          await refreshChatHistoryFromDb();
+
           console.log(`[NETWORK] ${name} logged in. Admin: ${isAdmin}`);
           await addServerLog('login', `${name} signed in${isAdmin ? ' as admin' : ''}`, { socketId: socket.id, role: getUserRole(name, userDatabase[name]) }, name);
 
@@ -862,11 +1039,11 @@ io.on('connection', async (socket) => {
             isModerator: isUserModerator(name, userDatabase[name])
           });
 
-          socket.emit('chat_history', messageHistory);
+          socket.emit('chat_history', getPublicChatHistory());
           socket.emit('pinned_list', pinnedMessages);
           emitAdminState(socket);
 
-          io.emit('online_list', getSanitizedOnlineList());
+          await emitOnlineList();
         } else {
           if (adminMaintenanceBypass === true) {
             socket.emit('auth_error', 'Incorrect admin password. Access denied.');
@@ -910,6 +1087,8 @@ io.on('connection', async (socket) => {
           'INSERT INTO users (name, data) VALUES ($1, $2)',
           [name, userDatabase[name]]
         );
+        await upsertPresenceForSocket(socket, name);
+        await refreshChatHistoryFromDb();
         if (wasDeletedAccount) {
           await pool.query('DELETE FROM deleted_accounts WHERE name = $1', [name]);
         }
@@ -925,11 +1104,11 @@ io.on('connection', async (socket) => {
           isModerator: isUserModerator(name, userDatabase[name])
         });
 
-        socket.emit('chat_history', messageHistory);
+        socket.emit('chat_history', getPublicChatHistory());
         socket.emit('pinned_list', pinnedMessages);
         emitAdminState(socket);
 
-        io.emit('online_list', getSanitizedOnlineList());
+        await emitOnlineList();
       }
     } catch (error) {
       console.error("[AUTH ERROR]:", error);
@@ -978,7 +1157,7 @@ io.on('connection', async (socket) => {
             console.error(`[DATABASE ERROR] Failed to save profile for ${name}:`, err);
         }
 
-        io.emit('online_list', getSanitizedOnlineList());
+        await emitOnlineList();
 
         if (userData.trophiesData) {
             io.emit('global_trophy_stats', calculateGlobalTrophyStats());
@@ -996,8 +1175,8 @@ io.on('connection', async (socket) => {
     }
   });
 
-  socket.on('request_online_list', () => {
-    socket.emit('online_list', getSanitizedOnlineList());
+  socket.on('request_online_list', async () => {
+    await emitOnlineList(socket);
   });
 
   socket.on('search_users', (query) => {
@@ -1206,12 +1385,19 @@ io.on('connection', async (socket) => {
       return;
     }
 
-    if ((lowerText === '/clean' || lowerText === '/clear_chat') && isAdmin) {
-      messageHistory = [];
-      await pool.query('TRUNCATE chat');
-      io.emit('chat_cleared');
-      await addModerationLog('clear_chat', 'Cleared global chat history via command', {}, senderName || 'Admin');
-      respond({ success: true, command: 'clear_chat' });
+    if ((lowerText === '/clean' || lowerText === '/clear_chat' || lowerText === '/clean confirm' || lowerText === '/clear_chat confirm') && isAdmin) {
+      const confirmed = lowerText.endsWith(' confirm');
+      if (!confirmed) {
+        const warning = { success: false, command: 'clear_chat', message: 'Type /clean confirm to permanently clear the chat. A backup will be saved first.' };
+        socket.emit('chat_blocked', warning);
+        respond(warning);
+        return;
+      }
+
+      const backedUpCount = await clearChatHistorySafely(senderName || 'Admin', 'chat command');
+      io.emit('chat_cleared', { by: senderName || 'Admin', backedUpCount });
+      await addModerationLog('clear_chat', `Cleared global chat history via command (${backedUpCount} messages backed up)`, { backedUpCount }, senderName || 'Admin');
+      respond({ success: true, command: 'clear_chat', backedUpCount });
       return;
     }
 
@@ -1243,13 +1429,24 @@ io.on('connection', async (socket) => {
     messageData.isModerator = actorRole === 'mod';
     messageData.user = senderName;
 
-    messageHistory.push(messageData);
+    try {
+      const savedMessage = cleanChatMessage(messageData);
+      const savedRes = await pool.query('INSERT INTO chat (message) VALUES ($1) RETURNING id', [savedMessage]);
+      messageData._dbId = Number(savedRes.rows[0]?.id || 0);
+      lastChatDbId = Math.max(lastChatDbId, messageData._dbId || 0);
 
-    if (messageHistory.length > MAX_CHAT_HISTORY) messageHistory.shift(); 
+      messageHistory.push(messageData);
+      if (messageHistory.length > MAX_CHAT_HISTORY) messageHistory.shift();
 
-    await pool.query('INSERT INTO chat (message) VALUES ($1)', [messageData]);
-    io.emit('chat_message', messageData);
-    respond({ success: true, message: messageData });
+      const publicMessage = cleanChatMessage(messageData);
+      io.emit('chat_message', publicMessage);
+      respond({ success: true, message: publicMessage });
+    } catch (err) {
+      console.error('[CHAT SAVE ERROR]:', err);
+      const failed = { success: false, reason: 'database', message: 'Message was not saved. Please try again.' };
+      socket.emit('chat_blocked', failed);
+      respond(failed);
+    }
   });
 
 
@@ -1577,7 +1774,7 @@ io.on('connection', async (socket) => {
         }
 
         try {
-            await pool.query("UPDATE chat SET message = $1 WHERE message->>'time' = $2", [msg, msg.time]);
+            await pool.query("UPDATE chat SET message = $1 WHERE message->>'time' = $2", [cleanChatMessage(msg), msg.time]);
             io.emit('message_reaction', data);
         } catch (err) { console.error("Reaction Sync Error:", err); }
     }
@@ -1602,7 +1799,7 @@ io.on('connection', async (socket) => {
             poll.totalVotes = poll.options.reduce((sum, opt) => sum + (opt.voters ? opt.voters.length : 0), 0);
 
             try {
-                await pool.query("UPDATE chat SET message = $1 WHERE message->>'time' = $2", [msg, msg.time]);
+                await pool.query("UPDATE chat SET message = $1 WHERE message->>'time' = $2", [cleanChatMessage(msg), msg.time]);
                 
                 io.emit('message_edited', { 
                     msgId: data.msgId, 
@@ -1631,7 +1828,7 @@ io.on('connection', async (socket) => {
             msg.seenBy.push(data.user);
             
             try {
-                await pool.query("UPDATE chat SET message = $1 WHERE message->>'time' = $2", [msg, msg.time]);
+                await pool.query("UPDATE chat SET message = $1 WHERE message->>'time' = $2", [cleanChatMessage(msg), msg.time]);
                 io.emit('message_seen', { msgId: data.msgId, seenBy: msg.seenBy });
             } catch (err) { console.error("Seen Mark Error:", err); }
         }
@@ -1667,7 +1864,7 @@ io.on('connection', async (socket) => {
             }
             
             try {
-                await pool.query("UPDATE chat SET message = $1 WHERE message->>'time' = $2", [msg, msg.time]);
+                await pool.query("UPDATE chat SET message = $1 WHERE message->>'time' = $2", [cleanChatMessage(msg), msg.time]);
                 io.emit('message_edited', { 
                     msgId: data.msgId, 
                     newText: data.newText, 
@@ -1726,18 +1923,20 @@ io.on('connection', async (socket) => {
     }
   });
 
-  socket.on('clear_chat', async () => {
-    if (socket.isAdmin === true) {
-        messageHistory = [];
-        await pool.query('TRUNCATE chat');
-        io.emit('chat_cleared');
+  socket.on('clear_chat', async (data = {}, callback) => {
+    const respond = typeof callback === 'function' ? callback : () => {};
+    if (socket.isAdmin !== true) return respond({ success: false, message: 'Admin only.' });
 
-        pinnedMessages = [];
-        await pool.query('TRUNCATE pinned_messages');
-        io.emit('pinned_list', pinnedMessages);
+    const byUser = socket.userName || data.user || data.adminUser || 'Admin';
+    const backedUpCount = await clearChatHistorySafely(byUser, 'admin clear button');
+    io.emit('chat_cleared', { by: byUser, user: byUser, backedUpCount });
 
-        await addModerationLog('clear_chat', 'Cleared global chat history', {}, socket.userName || 'Admin');
-    }
+    pinnedMessages = [];
+    await pool.query('TRUNCATE pinned_messages');
+    io.emit('pinned_list', pinnedMessages);
+
+    await addModerationLog('clear_chat', `Cleared global chat history (${backedUpCount} messages backed up)`, { backedUpCount }, byUser);
+    respond({ success: true, backedUpCount });
   });
 
   socket.on('kick_user', async (data) => {
@@ -1812,13 +2011,19 @@ io.on('connection', async (socket) => {
   socket.on('disconnect', async () => {
     const name = socket.userName;
     if (name && userDatabase[name]) {
-      userDatabase[name].online = false;
+      await removePresenceForSocket(socket);
       userDatabase[name].lastSeen = Date.now();
       socket.broadcast.emit('user_stopped_typing', { name: name });
-      
-      await pool.query('UPDATE users SET data = $1 WHERE name = $2', [userDatabase[name], name]);
-      await addServerLog('logout', `${name} disconnected`, { socketId: socket.id }, name);
-      io.emit('online_list', getSanitizedOnlineList());
+
+      await syncPresenceOnlineFromDb();
+      const stillOnline = userDatabase[name].online === true;
+      if (!stillOnline) {
+        userDatabase[name].online = false;
+        await pool.query('UPDATE users SET data = $1 WHERE name = $2', [userDatabase[name], name]);
+        await addServerLog('logout', `${name} disconnected`, { socketId: socket.id }, name);
+      }
+
+      await emitOnlineList();
     }
   });
 });

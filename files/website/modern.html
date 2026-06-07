@@ -10803,10 +10803,16 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 		}
 		if (typeof socketChat !== 'undefined' && socketChat && socketChat.connected) {
 			const myName = localStorage.getItem('psn_username') || 'Admin';
-			socketChat.emit('clear_chat', { user: myName });
-			if (typeof playUiSuccess === 'function') playUiSuccess();
-			adminAddLog('clear_chat', 'Cleared global chat history');
-			setTimeout(renderAdminPanel, 500);
+			socketChat.emit('clear_chat', { user: myName }, (response) => {
+				if (response && response.success === false) {
+					if (typeof playUiError === 'function') playUiError();
+					alert(response.message || 'The server refused to clear the chat.');
+					return;
+				}
+				if (typeof playUiSuccess === 'function') playUiSuccess();
+				adminAddLog('clear_chat', `Cleared global chat history${response && response.backedUpCount !== undefined ? ` (${response.backedUpCount} messages backed up)` : ''}`);
+				setTimeout(renderAdminPanel, 500);
+			});
 		} else {
 			if (typeof playUiError === 'function') playUiError();
 			alert('Socket is offline. Cannot clear chat.');
@@ -23400,7 +23406,14 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 		});
 	
 		socketChat.on('chat_history', function(history) {
-			window.messageHistory = history;
+			const seenMessages = new Set();
+			window.messageHistory = (Array.isArray(history) ? history : []).filter(msg => {
+				const key = String(new Date(msg && msg.time).getTime() || msg?.time || Math.random());
+				if (seenMessages.has(key)) return false;
+				seenMessages.add(key);
+				return true;
+			});
+			history = window.messageHistory;
 			const box = document.getElementById('chat-messages');
 			if (!box) return;
 		
@@ -23470,6 +23483,9 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 	
 		socketChat.on('chat_message', function(data) {
 			if (!window.messageHistory) window.messageHistory = [];
+			const incomingKey = String(new Date(data && data.time).getTime() || data?.time || '');
+			const alreadyRendered = incomingKey && window.messageHistory.some(m => String(new Date(m && m.time).getTime() || m?.time || '') === incomingKey);
+			if (alreadyRendered) return;
 			window.messageHistory.push(data);
 			if (window.messageHistory.length > MAX_CHAT_HISTORY) window.messageHistory.shift();
 		
@@ -24433,24 +24449,30 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 			clearTimeout(myTypingTimeout);
 			myTypingTimeout = null;
 		}
-		
-		if (plainText.toLowerCase() === '/clean') {
-			if (isAdmin) {
-				if (confirm("🚨 WARNING: Are you sure you want to PERMANENTLY CLEAR the entire chat history? This action cannot be undone.")) {
-					socketChat.emit('clear_chat', { user: myName });
-					if (typeof playUiSuccess === 'function') playUiSuccess();
+
+			if (plainText.toLowerCase() === '/clean') {
+				if (isAdmin) {
+					if (confirm("🚨 WARNING: This will clear the global chat history. A server backup will be saved first. Continue?")) {
+						socketChat.emit('clear_chat', { user: myName }, (response) => {
+							if (response && response.success === false) {
+								if (typeof playUiError === 'function') playUiError();
+								alert(response.message || 'The server refused to clear the chat.');
+								return;
+							}
+							if (typeof playUiSuccess === 'function') playUiSuccess();
+						});
+					} else {
+						if (typeof playUiBack === 'function') playUiBack();
+					}
 				} else {
-					if (typeof playUiBack === 'function') playUiBack();
+					alert("Only admins can use the /clean command.");
+					if (typeof playUiError === 'function') playUiError();
 				}
-			} else {
-				alert("Only admins can use the /clean command.");
-				if (typeof playUiError === 'function') playUiError();
+				input.innerHTML = '';
+				return; 
 			}
-			input.innerHTML = '';
-			return; 
-		}
-	
-		if (plainText.toLowerCase() === '/reload') {
+
+			if (plainText.toLowerCase() === '/reload') {
 			if (isAdmin) {
 				socketChat.emit('chat_message', { text: plainText, user: myName });
 				
