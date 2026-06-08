@@ -5952,6 +5952,68 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 		});
 	}
 
+	function replayExploreCardsReveal(options = {}) {
+		const exploreView = document.getElementById('view-explore');
+		if (!exploreView || exploreView.style.display === 'none') return;
+		if (window.__exploreBootRevealActive && !options.allowDuringBoot) return;
+		hideExploreBootSkeletons(exploreView);
+
+		const containers = Array.from(exploreView.querySelectorAll('.horizontal-scroll')).filter(container => container.querySelector('.game-card'));
+		if (!containers.length) return;
+
+		if (window.__exploreRevealReplayTimer) clearTimeout(window.__exploreRevealReplayTimer);
+		if (window.__exploreRevealReplayFrame) cancelAnimationFrame(window.__exploreRevealReplayFrame);
+
+		containers.forEach(container => {
+			Array.from(container.querySelectorAll('.game-card')).forEach((card, index) => {
+				card.classList.remove('anim-reveal', 'no-anim');
+				card.style.animation = 'none';
+				card.style.opacity = '0';
+				card.style.setProperty('--tile-idx', index);
+			});
+		});
+
+		void exploreView.offsetWidth;
+
+		window.__exploreRevealReplayFrame = requestAnimationFrame(() => {
+			window.__exploreRevealReplayFrame = requestAnimationFrame(() => {
+				if (!exploreView || exploreView.style.display === 'none') {
+					containers.forEach(container => {
+						container.querySelectorAll('.game-card').forEach(card => {
+							card.style.animation = '';
+							card.style.opacity = '';
+							card.classList.remove('anim-reveal');
+							card.classList.add('no-anim');
+						});
+					});
+					return;
+				}
+
+				containers.forEach(container => {
+					Array.from(container.querySelectorAll('.game-card')).forEach(card => {
+						card.style.animation = '';
+						card.style.opacity = '';
+						card.classList.add('anim-reveal');
+						card.addEventListener('animationend', function(e) {
+							if (e.animationName === 'tileReveal') {
+								this.classList.remove('anim-reveal');
+								this.classList.add('no-anim');
+							}
+						}, { once: true });
+					});
+				});
+
+				window.__exploreRevealReplayTimer = setTimeout(() => {
+					if (!exploreView || exploreView.style.display === 'none') return;
+					exploreView.querySelectorAll('.horizontal-scroll .game-card.anim-reveal').forEach(card => {
+						card.classList.remove('anim-reveal');
+						card.classList.add('no-anim');
+					});
+				}, 2600);
+			});
+		});
+	}
+
 	function finishBoot(username) {
 		isLoggingIn = false;
 		const lastUser = localStorage.getItem('psn_username');
@@ -6024,6 +6086,7 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 	
 		const exploreView = document.getElementById('view-explore');
 		if (exploreView) {
+			window.__exploreBootRevealActive = true;
 			showExploreBootSkeletons(exploreView);
 			const cards = exploreView.querySelectorAll('.horizontal-scroll .game-card');
 			cards.forEach(card => {
@@ -6116,6 +6179,7 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 								}
 							}, { once: true });
 						});
+						setTimeout(() => { window.__exploreBootRevealActive = false; }, 2600);
 					}
 				}, 150);
 	
@@ -6468,7 +6532,7 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
         console.log("[System] Cover indexes loaded. Ready to render cards.");
     }
     
-    async function fetchLatestForExplore(cat, containerId) {
+    async function fetchLatestForExplore(cat, containerId, options = {}) {
 		const container = document.getElementById(containerId);
 		if (!container) return;
 	
@@ -6561,6 +6625,7 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 			return;
 		}
 	
+		const animateCards = options.animateCards !== false && window.__explorePopulateAnimateCards !== false;
 		let html = '';
 		latestItems.forEach((game, idx) => {
 			const imgUrl = getItemCover(game, cat);
@@ -6570,7 +6635,7 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 			const dateHtml = game.date ? `<div class="date-tag"><i class="far fa-clock"></i> ${game.date}</div>` : '';
 	
 			html += `
-				<div class="game-card anim-reveal" style="--tile-idx: ${idx};" onclick="playUiClick(); switchAndSearch('${cat}', '${game.id}', true)" onmouseenter="const __hoverTarget = document.elementFromPoint(event.clientX, event.clientY); if(!__hoverTarget || !__hoverTarget.closest('.btn-mini,.btn-mini-round,.fav-btn,.wish-btn,.action-btn,button,a')) playUiHover(); this.classList.remove('anim-reveal'); this.classList.add('no-anim');">
+				<div class="game-card ${animateCards ? 'anim-reveal' : 'no-anim'}" style="--tile-idx: ${idx};" onclick="playUiClick(); switchAndSearch('${cat}', '${game.id}', true)" onmouseenter="const __hoverTarget = document.elementFromPoint(event.clientX, event.clientY); if(!__hoverTarget || !__hoverTarget.closest('.btn-mini,.btn-mini-round,.fav-btn,.wish-btn,.action-btn,button,a')) playUiHover(); this.classList.remove('anim-reveal'); this.classList.add('no-anim');">
 					<div class="game-img-container">
 						<div class="console-tag ${tagClass}">${consoleName}</div>
 						<div class="region-tag">${game.region}</div>
@@ -6596,16 +6661,22 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 		});
 	
 		container.innerHTML = html;
-		setupRevealAnimations(containerId);
+		if (animateCards) setupRevealAnimations(containerId);
 	}
 
-    async function populateExploreTab() {
-        await Promise.all([
-            fetchLatestForExplore('games', 'latest-games-grid'),
-            fetchLatestForExplore('dlcs', 'latest-dlcs-grid'),
-            fetchLatestForExplore('avatars', 'latest-avatars-grid'),
-            fetchLatestForExplore('demos', 'latest-demos-grid')
-        ]);
+    async function populateExploreTab(options = {}) {
+		const previousExplorePopulateAnimate = window.__explorePopulateAnimateCards;
+		window.__explorePopulateAnimateCards = options.animateCards !== false;
+		try {
+			await Promise.all([
+				fetchLatestForExplore('games', 'latest-games-grid', options),
+				fetchLatestForExplore('dlcs', 'latest-dlcs-grid', options),
+				fetchLatestForExplore('avatars', 'latest-avatars-grid', options),
+				fetchLatestForExplore('demos', 'latest-demos-grid', options)
+			]);
+		} finally {
+			window.__explorePopulateAnimateCards = previousExplorePopulateAnimate;
+		}
     }
 	
 	window.openTrendingTab = function() {
@@ -13055,7 +13126,17 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 			if (searchBar) searchBar.style.display = 'none';
 	
 			if (viewId === 'view-explore') {
-				if (typeof populateExploreTab === 'function') populateExploreTab();
+				if (typeof populateExploreTab === 'function') {
+					const exploreLoad = populateExploreTab({ animateCards: false });
+					if (exploreLoad && typeof exploreLoad.then === 'function') {
+						exploreLoad.then(() => {
+							const exploreTarget = document.getElementById('view-explore');
+							if (exploreTarget && exploreTarget.style.display !== 'none' && typeof replayExploreCardsReveal === 'function') {
+								replayExploreCardsReveal();
+							}
+						}).catch(err => console.warn('Explore refresh failed:', err));
+					}
+				}
 				if (typeof updateBanner === 'function') { updateBanner(false); startAutoSlide(); }
 			} 
 			else if (viewId === 'view-online') {
