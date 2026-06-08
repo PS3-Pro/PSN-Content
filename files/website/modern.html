@@ -7435,6 +7435,7 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 					if (divider) {
 						const topPos = divider.offsetTop - (chatBox.offsetHeight / 2);
 						chatBox.scrollTop = topPos;
+						if (typeof setupDividerAutoRemove === 'function') setupDividerAutoRemove();
 						
 						setTimeout(() => { chatBox.style.setProperty('scroll-behavior', 'smooth'); }, 100);
 						return; 
@@ -20787,6 +20788,110 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 
 	window.currentCloudinaryIndex = parseInt(localStorage.getItem('cloudinary_key_index') || '0');
 
+
+	function isChatScreenVisibleForRead() {
+		const parentView = document.getElementById('view-chat');
+		const chatView = document.getElementById('subview-chat');
+		const parentVisible = !!(parentView && (parentView.style.display === 'block' || parentView.style.display === 'flex'));
+		const chatVisible = !!(chatView && (chatView.style.display === 'block' || chatView.style.display === 'flex' || chatView.style.display === ''));
+		return parentVisible && chatVisible;
+	}
+
+	function insertUnreadDividerIfNeeded() {
+		const box = document.getElementById('chat-messages');
+		if (!box || document.getElementById('unread-divider')) return;
+		box.insertAdjacentHTML('beforeend', `
+			<div id="unread-divider" class="ps-new-messages-container">
+				<div class="ps-line left"></div>
+				<span class="ps-unread-text">UNREAD MESSAGES</span>
+				<div class="ps-line right"></div>
+			</div>`);
+		if (typeof setupDividerAutoRemove === 'function') setupDividerAutoRemove();
+	}
+
+	function markVisibleChatAsRead() {
+		const myName = localStorage.getItem('psn_username') || "Guest";
+		const latestTime = (window.messageHistory || []).reduce((latest, msg) => {
+			const msgTime = new Date(msg && msg.time).getTime();
+			return Number.isFinite(msgTime) ? Math.max(latest, msgTime) : latest;
+		}, Date.now());
+		saveState('psn_last_chat_read', String(Math.max(Date.now(), latestTime)));
+		saveState('psn_chat_dot', 'false');
+
+		const dot = document.getElementById('chat-dot');
+		if (dot) dot.style.display = 'none';
+
+		if (typeof broadcastProfileUpdate === 'function') broadcastProfileUpdate();
+
+		if (window.messageHistory && typeof socketChat !== 'undefined' && socketChat && socketChat.connected) {
+			window.messageHistory.forEach(m => {
+				if (m && m.user !== myName) {
+					const hasSeen = m.seenBy && m.seenBy.includes(myName);
+					if (!hasSeen) {
+						const msgId = new Date(m.time).getTime();
+						if (Number.isFinite(msgId)) socketChat.emit('mark_as_read', { msgId: msgId, user: myName });
+					}
+				}
+			});
+		}
+	}
+
+    function getChatHistoryRenderSignature(history) {
+        return (Array.isArray(history) ? history : []).map(msg => {
+            const timeKey = String(new Date(msg && msg.time).getTime() || (msg && msg.time) || '');
+            const textKey = String((msg && msg.text) || '').length;
+            const editKey = msg && msg.edited ? '1' : '0';
+            const typeKey = String((msg && msg.type) || 'text');
+            const contentKey = Array.isArray(msg && msg.content) ? msg.content.length : ((msg && msg.content) ? '1' : '0');
+            return `${timeKey}:${textKey}:${editKey}:${typeKey}:${contentKey}`;
+        }).join('|');
+    }
+
+    function updateChatHistoryRenderSignature() {
+        window.__chatHistoryRenderSignature = getChatHistoryRenderSignature(window.messageHistory || []);
+    }
+
+    function scheduleChatHistorySoftRerender(reason = 'sync', forceBottom = false) {
+        if (!Array.isArray(window.messageHistory) || window.messageHistory.length === 0) return;
+        if (window.__chatSoftRerenderTimer) clearTimeout(window.__chatSoftRerenderTimer);
+        window.__chatSoftRerenderTimer = setTimeout(() => {
+            const box = document.getElementById('chat-messages');
+            if (!box) return;
+            const myName = localStorage.getItem('psn_username') || 'Guest';
+            const wasNearBottom = typeof isChatNearBottom === 'function' ? isChatNearBottom(box, 120) : ((box.scrollHeight - box.scrollTop - box.clientHeight) < 120);
+            const oldScrollTop = box.scrollTop;
+            const oldScrollHeight = box.scrollHeight;
+            box.style.setProperty('scroll-behavior', 'auto', 'important');
+            box.innerHTML = '';
+            window.lastChatRawDate = '';
+            window.messageHistory.forEach(msg => {
+                if (!msg) return;
+                const msgRawDate = new Date(msg.time).toDateString();
+                if (msg.time && msgRawDate !== window.lastChatRawDate && typeof getChatDateLabel === 'function') {
+                    const currentDateLabel = getChatDateLabel(msg.time);
+                    const divider = document.createElement('div');
+                    divider.className = 'date-divider';
+                    divider.setAttribute('data-label', currentDateLabel);
+                    divider.innerHTML = `<span>${currentDateLabel}</span>`;
+                    box.appendChild(divider);
+                    window.lastChatRawDate = msgRawDate;
+                }
+                appendMessageToChat(msg, msg.user === myName, msg.time);
+            });
+            if (forceBottom || wasNearBottom) {
+                box.scrollTop = box.scrollHeight;
+            } else {
+                const delta = box.scrollHeight - oldScrollHeight;
+                box.scrollTop = Math.max(0, oldScrollTop + delta);
+            }
+            setTimeout(() => box.style.setProperty('scroll-behavior', 'smooth'), 80);
+            updateChatHistoryRenderSignature();
+            if (typeof refreshMentionJumpButton === 'function') refreshMentionJumpButton();
+            if (typeof refreshChatNotificationDot === 'function') refreshChatNotificationDot();
+        }, 80);
+    }
+
+
     function setupDividerAutoRemove() {
 		const divider = document.getElementById('unread-divider');
 		if (!divider || divider.dataset.observed === "true") return;
@@ -20811,6 +20916,9 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 						
 						setTimeout(() => {
 							if (divider.parentNode) divider.remove();
+							if (typeof markVisibleChatAsRead === 'function' && typeof isChatScreenVisibleForRead === 'function' && isChatScreenVisibleForRead()) {
+								markVisibleChatAsRead();
+							}
 						}, 550);
 					}
 				}, 3000);
@@ -22535,6 +22643,30 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 		}
 	}
 
+	function formatChatUserMentionsForDisplay(messageText) {
+		const allPossibleNames = new Set([
+			...((typeof chatUsers !== 'undefined' && chatUsers) ? Array.from(chatUsers) : []),
+			...((typeof currentOnlineList !== 'undefined' && Array.isArray(currentOnlineList)) ? currentOnlineList.map(u => u.name || u) : []),
+			...((window.friendsList && Array.isArray(window.friendsList)) ? window.friendsList.map(f => f.name) : [])
+		]);
+
+		const sortedNames = Array.from(allPossibleNames)
+			.filter(n => n && n !== "Guest")
+			.sort((a, b) => b.length - a.length);
+
+		sortedNames.forEach(name => {
+			const escapedName = name.replace(/[-\/\\^$*+?.()|[\]{}]/g, '\\$&');
+			const mentionRegex = new RegExp(`@${escapedName}\\b(?![^<]*>)`, 'g');
+			if (messageText.includes(`@${name}`)) {
+				messageText = messageText.replace(mentionRegex, match => {
+					return `<span class="chat-mention" style="cursor: pointer; text-decoration: underline;" onclick="openProfileModal('${encodeURIComponent(name)}')">${match}</span>`;
+				});
+			}
+		});
+
+		return messageText;
+	}
+
 	function appendMessageToChat(msg, isMe = false, timestamp = null) {
 		const box = document.getElementById('chat-messages');
 		if (!box) return;
@@ -23070,14 +23202,8 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 			if (roleTargetName && roleTargetName !== myName) {
 					if (typeof window.syncPsnUserMeta === 'function') window.syncPsnUserMeta({ name: roleTargetName, role, isAdmin: data.isAdmin === true, isBanned: banSignal ? true : (explicitUnbanSignal ? false : undefined) });
 					if (document.getElementById('view-admin')?.style.display === 'block' && typeof renderAdminPanel === 'function') renderAdminPanel();
-					if (window.messageHistory && window.messageHistory.length > 0 && typeof appendMessageToChat === 'function') {
-						const box = document.getElementById('chat-messages');
-						if (box) {
-							const oldScroll = box.scrollTop;
-							box.innerHTML = '';
-							window.messageHistory.forEach(m => appendMessageToChat(m, m.user === myName));
-							box.scrollTop = oldScroll;
-						}
+					if (window.messageHistory && window.messageHistory.length > 0 && typeof scheduleChatHistorySoftRerender === 'function') {
+						scheduleChatHistorySoftRerender('role-updated-target', false);
 					}
 					return;
 				}
@@ -23092,13 +23218,8 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 			if (typeof updateAdminVisibility === 'function') updateAdminVisibility();
 			document.body.classList.remove('admin-maintenance-login-bypass');
 			if (typeof adminUpdateMaintenanceOverlay === 'function') setTimeout(adminUpdateMaintenanceOverlay, 0);
-			if (window.messageHistory && window.messageHistory.length > 0) {
-				const box = document.getElementById('chat-messages');
-				if (box) {
-					box.innerHTML = '';
-					window.messageHistory.forEach(m => appendMessageToChat(m, m.user === myName));
-					box.scrollTop = box.scrollHeight;
-				}
+			if (window.messageHistory && window.messageHistory.length > 0 && typeof scheduleChatHistorySoftRerender === 'function') {
+				scheduleChatHistorySoftRerender('role-updated-self', true);
 			}
 		});
 		
@@ -23286,13 +23407,8 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 			document.body.classList.remove('admin-maintenance-login-bypass');
 			if (typeof adminUpdateMaintenanceOverlay === 'function') setTimeout(adminUpdateMaintenanceOverlay, 0);
 
-			if ((isAdmin || sessionRole === 'mod' || isModerator === true) && window.messageHistory && window.messageHistory.length > 0) {
-				const box = document.getElementById('chat-messages');
-				if (box) {
-					box.innerHTML = '';
-					window.messageHistory.forEach(m => appendMessageToChat(m, m.user === name));
-					box.scrollTop = box.scrollHeight;
-				}
+			if ((isAdmin || sessionRole === 'mod' || isModerator === true) && window.messageHistory && window.messageHistory.length > 0 && typeof scheduleChatHistorySoftRerender === 'function') {
+				scheduleChatHistorySoftRerender('auth-role-controls', true);
 			}
 
 			if (typeof updateAdminVisibility === 'function') updateAdminVisibility();
@@ -23621,15 +23737,23 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 	
 		socketChat.on('chat_history', function(history) {
 			const seenMessages = new Set();
-			window.messageHistory = (Array.isArray(history) ? history : []).filter(msg => {
+			const normalizedHistory = (Array.isArray(history) ? history : []).filter(msg => {
 				const key = String(new Date(msg && msg.time).getTime() || msg?.time || Math.random());
 				if (seenMessages.has(key)) return false;
 				seenMessages.add(key);
 				return true;
 			});
-			history = window.messageHistory;
+			const incomingSignature = getChatHistoryRenderSignature(normalizedHistory);
 			const box = document.getElementById('chat-messages');
 			if (!box) return;
+			if (window.__chatHistoryRenderSignature === incomingSignature && box.querySelector('[id^="msg-row-"]')) {
+				window.messageHistory = normalizedHistory;
+				if (typeof refreshChatNotificationDot === 'function') refreshChatNotificationDot();
+				if (typeof refreshMentionJumpButton === 'function') refreshMentionJumpButton();
+				return;
+			}
+			window.messageHistory = normalizedHistory;
+			history = window.messageHistory;
 		
 			box.style.opacity = '0';
 			box.style.setProperty('scroll-behavior', 'auto', 'important');
@@ -23684,6 +23808,8 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 				box.scrollTop = box.scrollHeight;
 			}
 
+			updateChatHistoryRenderSignature();
+
 			requestAnimationFrame(() => {
 				box.style.transition = "opacity 0.4s ease-out";
 				box.style.opacity = '1';
@@ -23705,7 +23831,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 		
 			if (typeof trackUser === 'function') trackUser(data.user);
 		
-			const chatVisible = document.getElementById('view-chat').style.display === 'flex' || document.getElementById('view-chat').style.display === 'block';
+			const chatVisible = typeof isChatScreenVisibleForRead === 'function' ? isChatScreenVisibleForRead() : (document.getElementById('view-chat').style.display === 'flex' || document.getElementById('view-chat').style.display === 'block');
 			const myName = localStorage.getItem('psn_username') || "Guest";
 			
 			playMessageSound();
@@ -23733,10 +23859,23 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 				}
 			};
 		
+			const maybeInsertUnreadDivider = (shouldAutoScroll) => {
+				if (data.user !== myName && !shouldAutoScroll && typeof insertUnreadDividerIfNeeded === 'function') {
+					insertUnreadDividerIfNeeded();
+				}
+			};
+
 			if (!query) {
+				const box = document.getElementById('chat-messages');
+				const shouldAutoScroll = data.user === myName || (chatVisible && (typeof isChatNearBottom === 'function' ? isChatNearBottom(box, 120) : true));
 				checkAndInsertDivider();
+				maybeInsertUnreadDivider(shouldAutoScroll);
 				appendMessageToChat(data, data.user === myName, data.time);
-				if (typeof jumpToBottom === 'function') jumpToBottom();
+				if (shouldAutoScroll && typeof jumpToBottom === 'function') {
+					jumpToBottom();
+				} else if (typeof setJumpBottomButtonVisible === 'function') {
+					setJumpBottomButtonVisible(true);
+				}
 			} else {
 				let matches = false;
 				const lowerMyName = myName.toLowerCase();
@@ -23764,12 +23903,20 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 				}
 		
 				if (matches) {
+					const box = document.getElementById('chat-messages');
+					const shouldAutoScroll = data.user === myName || (chatVisible && (typeof isChatNearBottom === 'function' ? isChatNearBottom(box, 120) : true));
 					checkAndInsertDivider();
+					maybeInsertUnreadDivider(shouldAutoScroll);
 					appendMessageToChat(data, data.user === myName, data.time);
-					if (typeof jumpToBottom === 'function') jumpToBottom();
+					if (shouldAutoScroll && typeof jumpToBottom === 'function') {
+						jumpToBottom();
+					} else if (typeof setJumpBottomButtonVisible === 'function') {
+						setJumpBottomButtonVisible(true);
+					}
 				}
 			}
 		
+			updateChatHistoryRenderSignature();
 			if (typeof refreshChatNotificationDot === 'function') refreshChatNotificationDot();
 		});
 	
@@ -23870,6 +24017,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 				formatted = formatted.replace(/(https?:\/\/[^\s]+)/g, url => 
 					`<a href="${url}" target="_blank" style="color: #ffffff; text-decoration: underline; word-break: break-all;">${url}</a>`
 				);
+				formatted = formatChatUserMentionsForDisplay(formatted);
 		
 				let badge = data.editedByAdmin ? ' <span style="font-size: 9px; opacity: 0.8; color: #ff4444; font-weight: bold;">(Edited by Admin)</span>' : (data.editedByMod ? ' <span style="font-size: 9px; opacity: 0.8; color: #ffcc00; font-weight: bold;">(Edited by Mod)</span>' : ' <span style="font-size: 9px; opacity: 0.5; font-style: italic;">(Edited)</span>');
 				
@@ -23882,6 +24030,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 				}
 			}
 			
+			updateChatHistoryRenderSignature();
 			if (typeof refreshChatNotificationDot === 'function') refreshChatNotificationDot();
 			if (typeof refreshMentionJumpButton === 'function') refreshMentionJumpButton();
 		});
@@ -23914,10 +24063,13 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 				}, 400);
 			}
 		
+			updateChatHistoryRenderSignature();
 			if (typeof refreshChatNotificationDot === 'function') {
 				refreshChatNotificationDot();
 			}
-			if (typeof refreshMentionJumpButton === 'function') refreshMentionJumpButton();
+			if (typeof refreshMentionJumpButton === 'function') {
+				refreshMentionJumpButton();
+			}
 		});
 	
 		socketChat.on('user_kicked', (data = {}) => {
@@ -24137,41 +24289,25 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 	}
 
 	window.refreshChatNotificationDot = function() {
-		const chatView = document.getElementById('view-chat');
-		const chatVisible = chatView && (chatView.style.display === 'block' || chatView.style.display === 'flex');
 		const myName = localStorage.getItem('psn_username') || "Guest";
-		
-		if (chatVisible) {
-			const dot = document.getElementById('chat-dot');
-			if (dot) dot.style.display = 'none';
-			saveState('psn_chat_dot', 'false');
-			saveState('psn_last_chat_read', Date.now().toString()); 
-			
-			if (typeof broadcastProfileUpdate === 'function') broadcastProfileUpdate();
-			
-			if (window.messageHistory && typeof socketChat !== 'undefined' && socketChat && socketChat.connected) {
-				window.messageHistory.forEach(m => {
-					if (m.user !== myName) {
-						const hasSeen = m.seenBy && m.seenBy.includes(myName);
-						if (!hasSeen) {
-							const msgId = new Date(m.time).getTime();
-							socketChat.emit('mark_as_read', { msgId: msgId, user: myName });
-						}
-					}
-				});
-			}
+		const dot = document.getElementById('chat-dot');
+		const box = document.getElementById('chat-messages');
+		const chatReadable = typeof isChatScreenVisibleForRead === 'function' && isChatScreenVisibleForRead();
+		const divider = document.getElementById('unread-divider');
+
+		if (chatReadable && !divider && (typeof isChatNearBottom !== 'function' || isChatNearBottom(box, 100))) {
+			if (typeof markVisibleChatAsRead === 'function') markVisibleChatAsRead();
 			return;
 		}
 	
 		const lastReadStr = loadState('psn_last_chat_read');
 		const lastReadTime = lastReadStr ? parseInt(lastReadStr) : 0;
 		
-		const newMessages = messageHistory.filter(m => {
-			const msgTime = new Date(m.time).getTime();
-			return msgTime > lastReadTime && m.user !== myName;
+		const newMessages = (window.messageHistory || messageHistory || []).filter(m => {
+			const msgTime = new Date(m && m.time).getTime();
+			return Number.isFinite(msgTime) && msgTime > lastReadTime && m.user !== myName;
 		});
 	
-		const dot = document.getElementById('chat-dot');
 		if (!dot) return;
 	
 		if (newMessages.length === 0) {
@@ -24196,7 +24332,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 			}
 		}
 	};
-	
+
 	window.broadcastProfileUpdate = function() {
 		if (!window.isProfileLoaded || !socketChat || !socketChat.connected) return;
 	
@@ -25035,6 +25171,24 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
         setTimeout(() => target.classList.remove('msg-highlight-ps5'), 3200);
     }
 
+    function isChatNearBottom(box, threshold = 120) {
+        if (!box) return true;
+        return (box.scrollHeight - box.scrollTop - box.clientHeight) <= threshold;
+    }
+
+    function setJumpBottomButtonVisible(show) {
+        const btn = document.getElementById('btn-jump-bottom');
+        if (!btn) return;
+
+        if (show) {
+            btn.style.display = 'flex';
+            btn.style.opacity = '1';
+        } else {
+            btn.style.opacity = '0';
+            setTimeout(() => { if (btn.style.opacity === '0') btn.style.display = 'none'; }, 300);
+        }
+    }
+
     function jumpToBottom(isManualClick = false) {
         const box = document.getElementById('chat-messages');
         const divider = document.getElementById('unread-divider');
@@ -25044,25 +25198,27 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 
         if (typeof playUiClick === 'function' && isManualClick) playUiClick();
         box.scrollTo({ top: box.scrollHeight, behavior: 'smooth' });
+        setJumpBottomButtonVisible(false);
         
         if (divider) {
             divider.style.transition = "all 0.3s ease-out";
             divider.style.opacity = "0";
             divider.style.maxHeight = "0px";
-            setTimeout(() => { if (divider.parentNode) divider.remove(); }, 300);
+            setTimeout(() => {
+                if (divider.parentNode) divider.remove();
+                if (typeof markVisibleChatAsRead === 'function') markVisibleChatAsRead();
+            }, 300);
+        } else {
+            setTimeout(() => { if (typeof refreshChatNotificationDot === 'function') refreshChatNotificationDot(); }, 350);
         }
     }
     
     document.getElementById('chat-messages').addEventListener('scroll', function() {
-        const btn = document.getElementById('btn-jump-bottom');
-        const isAtBottom = this.scrollHeight - this.scrollTop <= this.clientHeight + 100;
-    
-        if (!isAtBottom) {
-            btn.style.display = 'flex';
-            btn.style.opacity = '1';
-        } else {
-            btn.style.opacity = '0';
-            setTimeout(() => { if(btn.style.opacity === '0') btn.style.display = 'none'; }, 300);
+        const nearBottom = isChatNearBottom(this, 100);
+        setJumpBottomButtonVisible(!nearBottom);
+
+        if (nearBottom && !document.getElementById('unread-divider') && typeof refreshChatNotificationDot === 'function') {
+            refreshChatNotificationDot();
         }
 
         if (typeof refreshMentionJumpButton === 'function') refreshMentionJumpButton();
