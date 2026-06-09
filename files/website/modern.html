@@ -5099,7 +5099,7 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 				'psn_user_trophies', COOKIE_NAME_HISTORY, STORAGE_KEY_WISHLIST, 
 				'psn_accessed_days', STORAGE_KEY_FAVS, 'psn_trailers_watched', STORAGE_KEY_AUDIO, 
 				'psn_ux_sounds_state', 'psn_last_chat_read', 
-				'psn_chat_dot', 'psn_dl_dot', 'psn_wish_dot', 'psn_trophy_dot', 'psn_fav_dot',
+				'psn_chat_dot', 'psn_dl_dot', 'psn_wish_dot', 'psn_wish_dot_items', 'psn_trophy_dot', 'psn_fav_dot', 'psn_fav_dot_items',
 				'psn_avatar'
 			];
 			
@@ -5492,6 +5492,17 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 			window.friendsList = JSON.parse(loadState(STORAGE_KEY_FRIENDS) || "[]");
             lastScannedGames = JSON.parse(loadState('psn_local_library') || "[]");
 
+            if (typeof writeCategoryDotPending === 'function') {
+                const dotSchemaKey = 'psn_category_dot_pending_schema';
+                if (loadState(dotSchemaKey) !== '2') {
+                    writeCategoryDotPending('wishlist', []);
+                    writeCategoryDotPending('favorites', []);
+                    saveState('psn_wish_dot', 'false');
+                    saveState('psn_fav_dot', 'false');
+                    saveState(dotSchemaKey, '2');
+                }
+            }
+
             const userImg = loadState('psn_avatar') || AVAILABLE_AVATARS[0];
             const sidebarAvatar = document.querySelector('.user-avatar');
             if (sidebarAvatar) sidebarAvatar.style.backgroundImage = `url('${userImg}')`;
@@ -5515,6 +5526,11 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
                     }
                 }
             });
+
+            if (typeof window.refreshCategoryDot === 'function') {
+                window.refreshCategoryDot('wishlist');
+                window.refreshCategoryDot('favorites');
+            }
 
         } catch (e) { console.error("Erro no Sync:", e); }
         
@@ -13097,9 +13113,13 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 			}
 			
 			if (viewId === 'view-wishlist') {
-				const dot = document.getElementById('wish-dot');
-				if (dot) dot.style.display = 'none';
-				saveState('psn_wish_dot', 'false');
+				if (typeof window.clearCategoryDotPending === 'function') {
+					window.clearCategoryDotPending('wishlist');
+				} else {
+					const dot = document.getElementById('wish-dot');
+					if (dot) dot.style.display = 'none';
+					saveState('psn_wish_dot', 'false');
+				}
 				
 				const wishCatSelect = document.getElementById('wish-cat-select');
 				if (wishCatSelect) wishCatSelect.value = 'ALL';
@@ -13759,6 +13779,86 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
         }, 0);
     }
     
+
+	const WISHLIST_DOT_PENDING_KEY = 'psn_wish_dot_items';
+	const FAVORITES_DOT_PENDING_KEY = 'psn_fav_dot_items';
+
+	function readCategoryDotPending(type) {
+		const storageKey = type === 'favorites' ? FAVORITES_DOT_PENDING_KEY : WISHLIST_DOT_PENDING_KEY;
+		try {
+			const raw = loadState(storageKey) || '[]';
+			const parsed = JSON.parse(raw);
+			return Array.isArray(parsed) ? parsed.map(String).filter(Boolean) : [];
+		} catch (e) {
+			return [];
+		}
+	}
+
+	function writeCategoryDotPending(type, keys) {
+		const storageKey = type === 'favorites' ? FAVORITES_DOT_PENDING_KEY : WISHLIST_DOT_PENDING_KEY;
+		const cleanKeys = Array.from(new Set((keys || []).map(String).filter(Boolean)));
+		saveState(storageKey, JSON.stringify(cleanKeys));
+		return cleanKeys;
+	}
+
+	function getWishlistDotKey(item = {}) {
+		return String(item.contentId || item.id || '').trim();
+	}
+
+	function getFavoriteDotKey(item = {}) {
+		return String(item.path || item.title || '').trim();
+	}
+
+	function pruneCategoryDotPending(type) {
+		let pendingKeys = readCategoryDotPending(type);
+		if (type === 'favorites') {
+			const activeKeys = new Set((window.favoritesLibrary || []).map(getFavoriteDotKey).filter(Boolean));
+			pendingKeys = pendingKeys.filter(key => activeKeys.has(key));
+		} else {
+			const activeKeys = new Set((window.wishlist || []).map(getWishlistDotKey).filter(Boolean));
+			pendingKeys = pendingKeys.filter(key => activeKeys.has(key));
+		}
+		return writeCategoryDotPending(type, pendingKeys);
+	}
+
+	window.refreshCategoryDot = function(type) {
+		const isFavorites = type === 'favorites';
+		const dot = document.getElementById(isFavorites ? 'fav-dot' : 'wish-dot');
+		const boolKey = isFavorites ? 'psn_fav_dot' : 'psn_wish_dot';
+		const isViewActive = isFavorites
+			? (document.getElementById('subview-favs')?.style.display === 'block')
+			: (document.getElementById('view-wishlist')?.style.display === 'block');
+		const pendingKeys = pruneCategoryDotPending(type);
+		const shouldShow = pendingKeys.length > 0 && !isViewActive;
+
+		saveState(boolKey, shouldShow ? 'true' : 'false');
+		if (dot) dot.style.display = shouldShow ? 'block' : 'none';
+		return shouldShow;
+	};
+
+	window.addCategoryDotPending = function(type, key) {
+		if (!key) return;
+		const pendingKeys = readCategoryDotPending(type);
+		if (!pendingKeys.includes(String(key))) pendingKeys.push(String(key));
+		writeCategoryDotPending(type, pendingKeys);
+		window.refreshCategoryDot(type);
+	};
+
+	window.removeCategoryDotPending = function(type, key) {
+		if (!key) return;
+		const pendingKeys = readCategoryDotPending(type).filter(itemKey => itemKey !== String(key));
+		writeCategoryDotPending(type, pendingKeys);
+		window.refreshCategoryDot(type);
+	};
+
+	window.clearCategoryDotPending = function(type) {
+		writeCategoryDotPending(type, []);
+		const isFavorites = type === 'favorites';
+		saveState(isFavorites ? 'psn_fav_dot' : 'psn_wish_dot', 'false');
+		const dot = document.getElementById(isFavorites ? 'fav-dot' : 'wish-dot');
+		if (dot) dot.style.display = 'none';
+	};
+
 	window.toggleWishlist = function(event, gameId) {
 		if (event) event.stopPropagation();
 		
@@ -13792,6 +13892,7 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 				if (wishlist.length === 0) {
 					thanosSnapEffect(card, () => {
 						updateWishlistUI();
+						if (typeof window.clearCategoryDotPending === 'function') window.clearCategoryDotPending('wishlist');
 						document.getElementById('wish-dot').style.display = 'none';
 					});
 				} else {
@@ -13812,6 +13913,7 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 				icon.className = 'far fa-heart';
 				icon.style.color = 'rgba(255,255,255,0.6)';
 				btn.title = "Add to Wishlist"; 
+				if (typeof window.removeCategoryDotPending === 'function') window.removeCategoryDotPending('wishlist', itemKey);
 				updateWishlistUI();
 			}
 		} else {
@@ -13839,9 +13941,13 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 			btn.title = "Remove from Wishlist"; 
 			
 			if (!isWishlistView) {
-				const dot = document.getElementById('wish-dot');
-				if (dot) dot.style.display = 'block';
-				saveState('psn_wish_dot', 'true');
+				if (typeof window.addCategoryDotPending === 'function') {
+					window.addCategoryDotPending('wishlist', itemKey);
+				} else {
+					const dot = document.getElementById('wish-dot');
+					if (dot) dot.style.display = 'block';
+					saveState('psn_wish_dot', 'true');
+				}
 			}
 			updateWishlistUI();
 		}
@@ -13920,13 +14026,20 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 			if (countSpan) countSpan.innerText = "(0 items)";
 			if (dot) dot.style.display = 'none';
 			
-			if (activeUser && activeUser !== "null") saveState('psn_wish_dot', 'false');
+			if (activeUser && activeUser !== "null") {
+				if (typeof window.clearCategoryDotPending === 'function') window.clearCategoryDotPending('wishlist');
+				else saveState('psn_wish_dot', 'false');
+			}
 			return;
 		}
 	
 		if (toolbar) toolbar.style.display = 'flex';
 		if (letterContainer) letterContainer.style.display = 'flex';
 	
+		if (document.getElementById('view-wishlist')?.style.display === 'block' && typeof window.clearCategoryDotPending === 'function') {
+			window.clearCategoryDotPending('wishlist');
+		}
+
 		const term = document.getElementById('search-input').value.toLowerCase().trim();
 		if (typeof window.updateWishlistTypeFilterAvailability === 'function') window.updateWishlistTypeFilterAvailability();
 		const catFilter = document.getElementById('wish-cat-select')?.value || "ALL";
@@ -13981,7 +14094,9 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 		
 		if (countSpan) countSpan.innerText = `(${filteredWishlist.length} items)`;
 	
-		if (loadState('psn_wish_dot') === 'true' && document.getElementById('view-wishlist').style.display !== 'block') {
+		if (typeof window.refreshCategoryDot === 'function') {
+			window.refreshCategoryDot('wishlist');
+		} else if (loadState('psn_wish_dot') === 'true' && document.getElementById('view-wishlist').style.display !== 'block') {
 			if (dot) dot.style.display = 'block';
 		}
 	
@@ -15154,9 +15269,13 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 					scanConsoleAndReload(true);
 				}
 
-				const isFavView = document.getElementById('subview-favs')?.style.display === 'block';
-				if (favDot && loadState('psn_fav_dot') === 'true' && !isFavView) {
-					favDot.style.display = 'block';
+				if (typeof window.refreshCategoryDot === 'function') {
+					window.refreshCategoryDot('favorites');
+				} else {
+					const isFavView = document.getElementById('subview-favs')?.style.display === 'block';
+					if (favDot && loadState('psn_fav_dot') === 'true' && !isFavView) {
+						favDot.style.display = 'block';
+					}
 				}
 				onConnectionChanged(true);
 				if (typeof syncFpsCounterOnConnect === 'function') {
@@ -16411,6 +16530,7 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 			if (card) card.classList.remove('is-favorited');
 			icon.className = 'far fa-star';
 			icon.style.color = 'rgba(255,255,255,0.6)';
+			if (typeof window.removeCategoryDotPending === 'function') window.removeCategoryDotPending('favorites', getFavoriteDotKey(game));
 			
 			btn.title = "Add to Favorites"; 
 		} else {
@@ -16429,10 +16549,14 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 			
 			btn.title = "Remove from Favorites"; 
 	
-			const dot = document.getElementById('fav-dot');
-			if (dot && document.getElementById('subview-favs').style.display !== 'block') {
-				dot.style.display = 'block';
-				saveState('psn_fav_dot', 'true');
+			if (document.getElementById('subview-favs').style.display !== 'block') {
+				if (typeof window.addCategoryDotPending === 'function') {
+					window.addCategoryDotPending('favorites', getFavoriteDotKey(itemToAdd));
+				} else {
+					const dot = document.getElementById('fav-dot');
+					if (dot) dot.style.display = 'block';
+					saveState('psn_fav_dot', 'true');
+				}
 			}
 		}
 	
@@ -16445,9 +16569,13 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 		);
 		
 		if (activeFavs.length === 0) {
-			const dot = document.getElementById('fav-dot');
-			if (dot) dot.style.display = 'none';
-			saveState('psn_fav_dot', 'false');
+			if (typeof window.clearCategoryDotPending === 'function') {
+				window.clearCategoryDotPending('favorites');
+			} else {
+				const dot = document.getElementById('fav-dot');
+				if (dot) dot.style.display = 'none';
+				saveState('psn_fav_dot', 'false');
+			}
 		}
 	
 		updateFavoritesLibraryUI();
@@ -16508,7 +16636,11 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 		
 		if (!grid) return;
 	
-		const shouldKeepDot = loadState('psn_fav_dot') === 'true';
+		if (document.getElementById('subview-favs')?.style.display === 'block' && typeof window.clearCategoryDotPending === 'function') {
+			window.clearCategoryDotPending('favorites');
+		}
+
+		const shouldKeepDot = (typeof window.refreshCategoryDot === 'function') ? window.refreshCategoryDot('favorites') : (loadState('psn_fav_dot') === 'true');
 		const isConnected = globalIcon && (globalIcon.classList.contains('status-dot-connected') || globalIcon.style.color === "rgb(76, 175, 80)");
 	
 		if (!ip) {
@@ -16605,7 +16737,9 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 	
 		const isFavTabActive = document.getElementById('subview-favs').style.display === 'block';
 		
-		if (shouldKeepDot && !isFavTabActive) {
+		if (typeof window.refreshCategoryDot === 'function') {
+			window.refreshCategoryDot('favorites');
+		} else if (shouldKeepDot && !isFavTabActive) {
 			if (dot) dot.style.display = 'block';
 		} else {
 			if (dot) dot.style.display = 'none';
@@ -19213,9 +19347,13 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 		
 		updateFavoritesLibraryUI();
 		
-		const favDot = document.getElementById('fav-dot');
-		if (favDot) favDot.style.display = 'none';
-		saveState('psn_fav_dot', 'false');
+		if (typeof window.clearCategoryDotPending === 'function') {
+			window.clearCategoryDotPending('favorites');
+		} else {
+			const favDot = document.getElementById('fav-dot');
+			if (favDot) favDot.style.display = 'none';
+			saveState('psn_fav_dot', 'false');
+		}
 	}
 	else {
 		nextView = gamesView;
@@ -19325,7 +19463,9 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 				syncFpsCounterOnConnect(ip);
 			}
 	
-			if (favoritesLibrary.length > 0) {
+			if (typeof window.refreshCategoryDot === 'function') {
+				window.refreshCategoryDot('favorites');
+			} else if (favoritesLibrary.length > 0) {
 				const favDot = document.getElementById('fav-dot');
 				if (favDot) favDot.style.display = 'block';
 			}
