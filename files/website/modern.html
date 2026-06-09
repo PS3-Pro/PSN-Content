@@ -248,6 +248,7 @@ select option { background-color: var(--bg-dark); }
 .game-card { background-color: rgba(30, 35, 45, 0.7); border: 1px solid rgba(255, 255, 255, 0.03); border-radius: 10px; overflow: hidden; cursor: pointer; display: flex; flex-direction: column; transform: translateY(0) translateZ(0); backface-visibility: hidden; transition: transform 0.3s ease-out, box-shadow 0.3s ease-out; backdrop-filter: blur(3px); }
 .game-card.anim-reveal { opacity: 0; animation: tileReveal 0.4s ease-out forwards; animation-delay: calc(var(--tile-idx, 0) * 0.04s); }
 .game-card.no-anim { opacity: 1; animation: none; transform: none; }
+.game-card.no-img-fade .game-img { opacity: 1 !important; transition: transform 0.3s ease, filter 0.3s ease !important; }
 .game-card:hover { opacity: 1 !important; transform: scale(1.03); background-image: linear-gradient(rgba(26, 34, 50, 1.0), rgba(26, 34, 50, 1.0)), conic-gradient(from var(--angle), transparent 70%, #ffffff 100%) !important; background-origin: padding-box, border-box; background-clip: padding-box, border-box; animation: rotate-border 2s linear infinite; border: 1px solid transparent; box-shadow: 0 10px 25px rgba(0, 0, 0, 0.6); z-index: 10; }
 .game-card:hover::before { content: ""; position: absolute; inset: 0; border-radius: 8px; background-image: linear-gradient(120deg, transparent 30%, rgba(255, 255, 255, 0.1) 50%, transparent 70%); background-size: 200% 100%; animation: shine-move 2s infinite linear; pointer-events: none; z-index: 2; }
 .game-img-container { width: 100%; height: 178px; background-color: #050a14; overflow: hidden; position: relative; display: flex; align-items: center; justify-content: center; }
@@ -330,6 +331,10 @@ select option { background-color: var(--bg-dark); }
 .game-card.is-favorited:hover { background-image: linear-gradient(rgba(26, 34, 50, 1.0), rgba(26, 34, 50, 1.0)), conic-gradient(from var(--angle), transparent 70%, #ffcc00 100%) !important; animation: rotate-border 1.5s linear infinite !important; }
 .game-card.is-favorited .game-img-container, .game-card.is-favorited .game-info { position: relative; z-index: 1; }
 .game-card.fav-effect, .game-card.fav-effect:hover { animation: shake 0.35s ease !important; }
+@keyframes categoryNewItemPulse { 0%, 100% { outline-color: rgba(0,112,204,.45); box-shadow: 0 0 0 rgba(0,112,204,0), 0 0 10px rgba(0,112,204,.22); filter: brightness(1); } 45% { outline-color: #fff; box-shadow: 0 0 0 2px rgba(255,255,255,.55), 0 0 24px var(--ps-neon), 0 0 48px rgba(0,112,204,.35); filter: brightness(1.2); } }
+.game-card.category-new-highlight { position: relative; opacity: 1 !important; transform: none !important; outline: 2px solid var(--ps-blue) !important; outline-offset: 3px; box-shadow: 0 0 0 2px rgba(255,255,255,.35), 0 0 28px var(--ps-neon), 0 0 55px rgba(0,112,204,.32) !important; filter: brightness(1.16); animation: categoryNewItemPulse 1.15s ease-in-out 5 !important; z-index: 25; }
+.game-card.category-new-highlight::before { content: ""; position: absolute; inset: 0; border-radius: 10px; pointer-events: none; z-index: 30; background: linear-gradient(120deg, transparent 18%, rgba(255,255,255,.18) 45%, transparent 72%); background-size: 220% 100%; animation: shine-move 1.2s linear infinite; }
+
 
 /* ========================================================================== MODALS & TRAILER ========================================================================== */
 .modal-overlay { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; backdrop-filter: blur(10px); z-index: 1000; justify-content: center; align-items: center; }
@@ -6657,7 +6662,7 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 						<div class="console-tag ${tagClass}">${consoleName}</div>
 						<div class="region-tag">${game.region}</div>
 						${dateHtml}
-						<img src="${imgUrl}" alt="Cover" class="game-img" loading="lazy" data-name="${game.cleanName.replace(/"/g, '&quot;')}" data-console="${game.cTag}" onload="this.setAttribute('data-loaded', 'true')" onerror="handleCoverError(this, '${cat}')">
+						<img src="${imgUrl}" alt="Cover" class="game-img" loading="lazy" data-name="${game.cleanName.replace(/"/g, '&quot;')}" data-console="${game.cTag}" onload="markCoverLoaded(this)" onerror="handleCoverError(this, '${cat}')">
 					</div>
 					<div class="game-info" style="padding: 10px; min-height: 0;">
 						<div style="display: flex; flex-direction: column; justify-content: space-between; height: 100%;">
@@ -6825,7 +6830,7 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 								${fireIcon} #${displayRank + 1}
 							</div>
 	
-							<img src="${imgUrl}" class="game-img" data-name="${(gameData.cleanName || gameData.title).replace(/"/g, '&quot;')}" data-console="${gameData.cTag}" onload="this.setAttribute('data-loaded', 'true')" onerror="getOnlineCoverFallback(this)">
+							<img src="${imgUrl}" class="game-img" data-name="${(gameData.cleanName || gameData.title).replace(/"/g, '&quot;')}" data-console="${gameData.cTag}" onload="markCoverLoaded(this)" onerror="getOnlineCoverFallback(this)">
 						</div>
 						<div class="game-info" style="padding: 10px; min-height: 0;">
 							<div style="display: flex; flex-direction: column; justify-content: space-between; height: 100%;">
@@ -8111,6 +8116,59 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 		return getOptimizedCover(item?.id || item?.titleId || item);
 	}
 
+	window.__cardCoverSrcCache = window.__cardCoverSrcCache || {};
+
+	function normalizeCoverSrcForCache(src) {
+		src = String(src || '').trim();
+		if (!src) return '';
+		if (src === 'data:image/png;base64,BING') return '';
+		return src;
+	}
+
+	window.rememberCardCoverSrc = function(key, src) {
+		key = String(key || '').trim();
+		src = normalizeCoverSrcForCache(src);
+		if (!key || !src) return;
+		window.__cardCoverSrcCache[key] = src;
+	};
+
+	window.getCachedCardCoverSrc = function(key) {
+		key = String(key || '').trim();
+		if (!key || !window.__cardCoverSrcCache) return '';
+		return normalizeCoverSrcForCache(window.__cardCoverSrcCache[key]);
+	};
+
+	window.markCoverLoaded = function(imgElement) {
+		if (!imgElement) return;
+		imgElement.setAttribute('data-loaded', 'true');
+		const src = normalizeCoverSrcForCache(imgElement.currentSrc || imgElement.src);
+		if (!src) return;
+
+		const card = imgElement.closest ? imgElement.closest('.game-card') : null;
+		const key = imgElement.getAttribute('data-cover-key') || card?.getAttribute('data-category-dot-key') || '';
+		if (key) window.rememberCardCoverSrc(key, src);
+
+		const libPath = imgElement.getAttribute('data-lib-path') || '';
+		if (libPath && window.libCoverCache && window.libCoverCache[libPath]) {
+			window.libCoverCache[libPath].cover = src;
+		}
+	};
+
+	window.captureGridCoverCache = function(grid) {
+		if (!grid) return;
+		grid.querySelectorAll('.game-card').forEach(card => {
+			const img = card.querySelector('.game-img');
+			if (!img) return;
+			const key = img.getAttribute('data-cover-key') || card.getAttribute('data-category-dot-key') || '';
+			const src = normalizeCoverSrcForCache(img.currentSrc || img.src);
+			if (key && src) window.rememberCardCoverSrc(key, src);
+			const libPath = img.getAttribute('data-lib-path') || '';
+			if (libPath && src && window.libCoverCache && window.libCoverCache[libPath]) {
+				window.libCoverCache[libPath].cover = src;
+			}
+		});
+	};
+
 	window.handleCoverError = function(imgElement, category) {
 		if (category === "avatars" || category === "themes") {
 			imgElement.onerror = null;
@@ -8710,7 +8768,7 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 					<div class="wish-btn" title="Add to Wishlist" onclick="toggleWishlist(event, '${game.id}')">
 						<i class="${heartIcon}" style="color: ${heartColor}; font-size: 14px;"></i>
 					</div>
-					<img src="${imgUrl}" alt="Cover" class="game-img" loading="lazy" data-name="${game.cleanName.replace(/"/g, '&quot;')}" data-console="${game.cTag}" onload="this.setAttribute('data-loaded', 'true')" onerror="handleCoverError(this, '${currentCat}')">
+					<img src="${imgUrl}" alt="Cover" class="game-img" loading="lazy" data-name="${game.cleanName.replace(/"/g, '&quot;')}" data-console="${game.cTag}" onload="markCoverLoaded(this)" onerror="handleCoverError(this, '${currentCat}')">
 				</div>
 				<div class="game-info">
 					<div>
@@ -8773,12 +8831,13 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
         const animatedCards = container.getElementsByClassName('anim-reveal');
         
         Array.from(animatedCards).forEach(card => {
-            card.addEventListener('animationend', function(e) {
-                if (e.animationName === 'tileReveal') {
-                    this.classList.remove('anim-reveal');
-                    this.classList.add('no-anim');
-                }
-            }, { once: true });
+            const onRevealEnd = function(e) {
+                if (e.target !== this || e.animationName !== 'tileReveal') return;
+                this.classList.remove('anim-reveal');
+                this.classList.add('no-anim');
+                this.removeEventListener('animationend', onRevealEnd);
+            };
+            card.addEventListener('animationend', onRevealEnd);
         });
     };
     
@@ -13113,6 +13172,9 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 			}
 			
 			if (viewId === 'view-wishlist') {
+				if (typeof window.captureCategoryPendingReveal === 'function') {
+					window.captureCategoryPendingReveal('wishlist');
+				}
 				if (typeof window.clearCategoryDotPending === 'function') {
 					window.clearCategoryDotPending('wishlist');
 				} else {
@@ -13859,6 +13921,73 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 		if (dot) dot.style.display = 'none';
 	};
 
+	window.captureCategoryPendingReveal = function(type) {
+		const keys = (typeof pruneCategoryDotPending === 'function') ? pruneCategoryDotPending(type) : readCategoryDotPending(type);
+		if (!keys || !keys.length) return [];
+		window.__categoryPendingRevealKeys = window.__categoryPendingRevealKeys || {};
+		window.__categoryPendingRevealKeys[type] = keys.slice();
+		return keys;
+	};
+
+	window.consumeCategoryPendingReveal = function(type, allowDirectRead = false) {
+		window.__categoryPendingRevealKeys = window.__categoryPendingRevealKeys || {};
+		let keys = window.__categoryPendingRevealKeys[type];
+		if (Array.isArray(keys) && keys.length) {
+			delete window.__categoryPendingRevealKeys[type];
+			return keys.map(String).filter(Boolean);
+		}
+		if (!allowDirectRead) return [];
+		keys = (typeof pruneCategoryDotPending === 'function') ? pruneCategoryDotPending(type) : readCategoryDotPending(type);
+		return Array.isArray(keys) ? keys.map(String).filter(Boolean) : [];
+	};
+
+	function escapeCategoryDotAttr(value) {
+		return String(value || '').replace(/[&<>"]/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[ch]);
+	}
+
+	window.revealCategoryPendingCards = function(type, keys) {
+		const cleanKeys = Array.from(new Set((keys || []).map(String).filter(Boolean)));
+		if (!cleanKeys.length) return;
+		const gridId = type === 'favorites' ? 'ps3-favs-grid' : 'wishlist-grid';
+		const signature = `${type}:${cleanKeys.join('|')}`;
+		window.__lastCategoryRevealSignature = window.__lastCategoryRevealSignature || {};
+		const lastRun = window.__lastCategoryRevealSignature[type] || {};
+		if (lastRun.signature === signature && Date.now() - lastRun.time < 2500) return;
+		window.__lastCategoryRevealSignature[type] = { signature, time: Date.now() };
+
+		setTimeout(() => {
+			const grid = document.getElementById(gridId);
+			if (!grid) return;
+			const keySet = new Set(cleanKeys);
+			const cards = Array.from(grid.querySelectorAll('.game-card')).filter(card => keySet.has(String(card.getAttribute('data-category-dot-key') || '')));
+			if (!cards.length) return;
+
+			cards.forEach(card => {
+				card.classList.remove('category-new-highlight', 'anim-reveal');
+				card.classList.add('no-anim', 'no-img-fade');
+				card.style.opacity = '';
+				card.style.transform = '';
+				void card.offsetWidth;
+				card.classList.add('category-new-highlight');
+			});
+
+			const firstCard = cards[0];
+			const scrollArea = document.getElementById('scroll-area');
+			if (firstCard && scrollArea) {
+				const areaRect = scrollArea.getBoundingClientRect();
+				const cardRect = firstCard.getBoundingClientRect();
+				const targetTop = scrollArea.scrollTop + cardRect.top - areaRect.top - Math.max(70, (scrollArea.clientHeight - cardRect.height) / 2);
+				scrollArea.scrollTo({ top: Math.max(0, targetTop), behavior: 'smooth' });
+			} else if (firstCard) {
+				firstCard.scrollIntoView({ behavior: 'smooth', block: 'center' });
+			}
+
+			setTimeout(() => {
+				cards.forEach(card => card.classList.remove('category-new-highlight'));
+			}, 6500);
+		}, 280);
+	};
+
 	window.toggleWishlist = function(event, gameId) {
 		if (event) event.stopPropagation();
 		
@@ -13906,7 +14035,7 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 						if (typeof window.updateWishlistTypeFilterAvailability === 'function') {
 							window.updateWishlistTypeFilterAvailability();
 						}
-						updateWishlistUI();
+						updateWishlistUI(true);
 					}, card ? 220 : 0);
 				}
 			} else {
@@ -13914,7 +14043,7 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 				icon.style.color = 'rgba(255,255,255,0.6)';
 				btn.title = "Add to Wishlist"; 
 				if (typeof window.removeCategoryDotPending === 'function') window.removeCategoryDotPending('wishlist', itemKey);
-				updateWishlistUI();
+				updateWishlistUI(true);
 			}
 		} else {
 			playUiSuccess();
@@ -14012,6 +14141,7 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 		const activeUser = localStorage.getItem('psn_username');
 		
 		if (!grid) return;
+		if (isSilent && typeof window.captureGridCoverCache === 'function') window.captureGridCoverCache(grid);
 	
 		if (window.wishlist.length === 0) {
 			if (letterContainer) letterContainer.style.display = 'none';
@@ -14036,7 +14166,12 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 		if (toolbar) toolbar.style.display = 'flex';
 		if (letterContainer) letterContainer.style.display = 'flex';
 	
-		if (document.getElementById('view-wishlist')?.style.display === 'block' && typeof window.clearCategoryDotPending === 'function') {
+		const wishlistViewIsActive = document.getElementById('view-wishlist')?.style.display === 'block';
+		const pendingWishlistRevealKeys = (wishlistViewIsActive && typeof window.consumeCategoryPendingReveal === 'function')
+			? window.consumeCategoryPendingReveal('wishlist', true)
+			: [];
+
+		if (wishlistViewIsActive && typeof window.clearCategoryDotPending === 'function') {
 			window.clearCategoryDotPending('wishlist');
 		}
 
@@ -14162,15 +14297,16 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 		let html = '';
 	
 		filteredWishlist.forEach((game, i) => {
+			const wishDotKey = (typeof getWishlistDotKey === 'function') ? getWishlistDotKey(game) : (game.contentId || game.id || '');
 			const resolvedWishCategory = (typeof window.getWishlistItemCategoryKey === 'function') ? window.getWishlistItemCategoryKey(game) : (game.category || 'games');
-			const imgUrl = getItemCover(game, resolvedWishCategory);
+			const imgUrl = (typeof window.getCachedCardCoverSrc === 'function' ? window.getCachedCardCoverSrc(wishDotKey) : '') || getItemCover(game, resolvedWishCategory);
 			const tagClass = `tag-${game.cTag}`;
 			
 			const shouldShowWishTypeTag = catFilter === 'ALL';
 			const wishTypeCategory = shouldShowWishTypeTag ? resolvedWishCategory : '';
 			const wishTypeTagHtml = shouldShowWishTypeTag && typeof window.getDownloadTypeTagHtml === 'function' ? window.getDownloadTypeTagHtml(wishTypeCategory, { ...game, category: wishTypeCategory }).replace('dl-type-chip', 'dl-type-chip wish-type-chip-cover') : '';
 			html += `
-			<div class="game-card ${animClass} is-wishlisted" data-content-id="${game.contentId || ''}" style="--tile-idx: ${i % 50}; cursor: pointer;" onmouseenter="const __hoverTarget = document.elementFromPoint(event.clientX, event.clientY); if(!__hoverTarget || !__hoverTarget.closest('.btn-mini,.btn-mini-round,.fav-btn,.wish-btn,.action-btn,button,a')) playUiHover(); this.classList.remove('anim-reveal'); this.classList.add('no-anim');" onclick="playUiClick(); searchGameOnSite('${game.id}', 'wishlist', '${resolvedWishCategory}')">
+			<div class="game-card ${animClass} ${isSilent ? 'no-img-fade' : ''} is-wishlisted" data-content-id="${game.contentId || ''}" data-category-dot-key="${escapeCategoryDotAttr(wishDotKey)}" style="--tile-idx: ${i % 50}; cursor: pointer;" onmouseenter="const __hoverTarget = document.elementFromPoint(event.clientX, event.clientY); if(!__hoverTarget || !__hoverTarget.closest('.btn-mini,.btn-mini-round,.fav-btn,.wish-btn,.action-btn,button,a')) playUiHover(); this.classList.remove('anim-reveal'); this.classList.add('no-anim');" onclick="playUiClick(); searchGameOnSite('${game.id}', 'wishlist', '${resolvedWishCategory}')">
 				<div class="game-img-container">
 					<div class="console-tag ${tagClass}">${game.cTag.toUpperCase()}</div>
 					<div class="region-tag">${game.region}</div>
@@ -14178,7 +14314,7 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 					<div class="wish-btn" title="Remove from Wishlist" onclick="toggleWishlist(event, '${game.id}')">
 						<i class="fas fa-heart" style="color: #ff4444; font-size: 14px;"></i>
 					</div>
-					<img src="${imgUrl}" class="game-img" loading="lazy" data-name="${(game.cleanName || '').replace(/"/g, '&quot;')}" data-console="${game.cTag}" onload="this.setAttribute('data-loaded', 'true')" onerror="handleCoverError(this, '${resolvedWishCategory}')">
+					<img src="${imgUrl}" class="game-img" loading="lazy" data-cover-key="${escapeCategoryDotAttr(wishDotKey)}" data-name="${(game.cleanName || '').replace(/"/g, '&quot;')}" data-console="${game.cTag}" onload="markCoverLoaded(this)" onerror="handleCoverError(this, '${resolvedWishCategory}')">
 				</div>
 				<div class="game-info" style="padding: 10px; min-height: 0;">
 					<div style="display: flex; flex-direction: column; justify-content: space-between; height: 100%;">
@@ -14206,6 +14342,9 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 	
 		if (!isSilent) {
 			setupRevealAnimations('wishlist-grid');
+		}
+		if (pendingWishlistRevealKeys && pendingWishlistRevealKeys.length && typeof window.revealCategoryPendingCards === 'function') {
+			window.revealCategoryPendingCards('wishlist', pendingWishlistRevealKeys);
 		}
 	};
 	
@@ -14681,7 +14820,7 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 						class="game-img"
 						data-name="${safeDisplayName}"
 						data-console="${consoleTag}"
-						onload="this.setAttribute('data-loaded','true')"
+						onload="markCoverLoaded(this)"
 						onerror="getOnlineCoverFallback(this)">
 				</div>
 	
@@ -16373,6 +16512,8 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 					</div>`;
 			}
 	
+			const localCoverKey = game.path || cachedData.id || game.title || '';
+			const displayCover = (typeof window.getCachedCardCoverSrc === 'function' ? window.getCachedCardCoverSrc(localCoverKey) : '') || cachedData.cover;
 			const card = document.createElement('div');
 			card.className = `game-card ${animClass} ${activeClass} ${favClass}`
 			card.dataset.console = consoleType.toLowerCase();
@@ -16388,7 +16529,7 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 						<span class="char">N</span><span class="char">O</span><span class="char">W</span>
 						<span class="dot">.</span><span class="dot">.</span><span class="dot">.</span>
 					</div>` : ''}
-					<img src="${cachedData.cover}" class="game-img" data-name="${game.title.replace(/"/g, '&quot;')}" data-console="${consoleType}" onload="this.setAttribute('data-loaded', 'true')" onerror="getOnlineCoverFallback(this)">
+					<img src="${displayCover}" class="game-img" data-cover-key="${escapeCategoryDotAttr(localCoverKey)}" data-lib-path="${game.path.replace(/"/g, '&quot;')}" data-name="${game.title.replace(/"/g, '&quot;')}" data-console="${consoleType}" onload="markCoverLoaded(this)" onerror="getOnlineCoverFallback(this)">
 					<div class="console-tag ${tagClass}">${consoleType}</div>
 					<div class="region-tag">${region}</div>
 					<div class="fav-btn" style="cursor: pointer;" title="${starTooltip}" onclick="toggleLocalFavorite(event, ${lastScannedGames.indexOf(game)})">
@@ -16578,7 +16719,7 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 			}
 		}
 	
-		updateFavoritesLibraryUI();
+		updateFavoritesLibraryUI(true);
 		window.broadcastProfileUpdate();
 	};
 	
@@ -16635,8 +16776,14 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 		const favToolbar = document.getElementById('fav-toolbar');
 		
 		if (!grid) return;
+		if (isSilent && typeof window.captureGridCoverCache === 'function') window.captureGridCoverCache(grid);
 	
-		if (document.getElementById('subview-favs')?.style.display === 'block' && typeof window.clearCategoryDotPending === 'function') {
+		const favViewIsActive = document.getElementById('subview-favs')?.style.display === 'block';
+		const pendingFavoritesRevealKeys = (typeof window.consumeCategoryPendingReveal === 'function')
+			? window.consumeCategoryPendingReveal('favorites', favViewIsActive)
+			: [];
+
+		if (favViewIsActive && typeof window.clearCategoryDotPending === 'function') {
 			window.clearCategoryDotPending('favorites');
 		}
 
@@ -16780,6 +16927,7 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 			return;
 		}
 
+		const pendingFavoritesRevealSet = new Set((pendingFavoritesRevealKeys || []).map(String));
 		const currentPlaying = window.myCurrentPS3Status || { status: 'idle' };
 
 		filteredFavs.forEach((game, i) => {
@@ -16905,8 +17053,11 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 			}
 
 			const card = document.createElement('div');
-			card.className = `game-card ${animClass} ${activeClass} is-favorited`;
+			const favDotKey = (typeof getFavoriteDotKey === 'function') ? getFavoriteDotKey(game) : (game.path || game.title || '');
+			const displayCover = (typeof window.getCachedCardCoverSrc === 'function' ? window.getCachedCardCoverSrc(favDotKey) : '') || cachedData.cover;
+			card.className = `game-card ${animClass} ${isSilent ? "no-img-fade" : ""} ${activeClass} is-favorited`;
 			card.style.setProperty('--tile-idx', i % 50);
+			card.setAttribute('data-category-dot-key', favDotKey);
 			card.setAttribute("onmouseenter", "const __hoverTarget = document.elementFromPoint(event.clientX, event.clientY); if(!__hoverTarget || !__hoverTarget.closest('.btn-mini,.btn-mini-round,.fav-btn,.wish-btn,.action-btn,button,a')) playUiHover(); this.classList.remove('anim-reveal'); this.classList.add('no-anim');");
 			
 			card.innerHTML = `
@@ -16918,7 +17069,7 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 						<span class="char">N</span><span class="char">O</span><span class="char">W</span>
 						<span class="dot">.</span><span class="dot">.</span><span class="dot">.</span>
 					</div>` : ''}
-					<img src="${cachedData.cover}" class="game-img" data-name="${game.title.replace(/"/g, '&quot;')}" data-console="${consoleType}" onload="this.setAttribute('data-loaded', 'true')" onerror="getOnlineCoverFallback(this)">
+					<img src="${displayCover}" class="game-img" data-cover-key="${escapeCategoryDotAttr(favDotKey)}" data-lib-path="${game.path.replace(/"/g, '&quot;')}" data-name="${game.title.replace(/"/g, '&quot;')}" data-console="${consoleType}" onload="markCoverLoaded(this)" onerror="getOnlineCoverFallback(this)">
 					<div class="console-tag ${tagClass}">${consoleType}</div>
 					<div class="region-tag">${region}</div>
 					<div class="fav-btn active" style="cursor: pointer;" title="Remove from Favorites" onclick="removeFromFavsOnly(event, ${i})">
@@ -16940,6 +17091,9 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 	
 		if (!isSilent) {
 			setupRevealAnimations('ps3-favs-grid');
+		}
+		if (pendingFavoritesRevealKeys && pendingFavoritesRevealKeys.length && typeof window.revealCategoryPendingCards === 'function') {
+			window.revealCategoryPendingCards('favorites', pendingFavoritesRevealKeys);
 		}
 	};
 	
@@ -19345,6 +19499,9 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 			searchBar.style.display = isConnected ? 'flex' : 'none';
 		}
 		
+		if (typeof window.captureCategoryPendingReveal === 'function') {
+			window.captureCategoryPendingReveal('favorites');
+		}
 		updateFavoritesLibraryUI();
 		
 		if (typeof window.clearCategoryDotPending === 'function') {
