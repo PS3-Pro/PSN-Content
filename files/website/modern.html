@@ -27238,7 +27238,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 				`;
 				
 				const chatBox = document.getElementById('chat-messages');
-				if (chatBox) chatBox.scrollTop = chatBox.scrollHeight;
+				if (chatBox && !window.__chatSearchActive) chatBox.scrollTop = chatBox.scrollHeight;
 			} else {
 				console.warn("Link preview failed for:", url);
 			}
@@ -27521,7 +27521,50 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 		}, 100);
 	}
 	
+	function preserveChatSearchScrollSnapshot() {
+		const chatBox = document.getElementById('chat-messages');
+		const scrollArea = document.getElementById('scroll-area');
+		return {
+			chatBox,
+			scrollArea,
+			chatTop: chatBox ? chatBox.scrollTop : null,
+			areaTop: scrollArea ? scrollArea.scrollTop : null
+		};
+	}
+
+	function restoreChatSearchScrollSnapshot(snapshot) {
+		if (!snapshot) return;
+		const restore = () => {
+			if (snapshot.chatBox && snapshot.chatTop !== null) snapshot.chatBox.scrollTop = snapshot.chatTop;
+			if (snapshot.scrollArea && snapshot.areaTop !== null) snapshot.scrollArea.scrollTop = snapshot.areaTop;
+		};
+		restore();
+		requestAnimationFrame(restore);
+		setTimeout(restore, 0);
+	}
+
+	function keepChatSearchResultsAtTop() {
+		const box = document.getElementById('chat-messages');
+		if (!box) return;
+		const previousBehavior = box.style.scrollBehavior;
+		box.style.setProperty('scroll-behavior', 'auto', 'important');
+		const lockTop = () => { box.scrollTop = 0; };
+		lockTop();
+		requestAnimationFrame(lockTop);
+		setTimeout(lockTop, 0);
+		setTimeout(lockTop, 80);
+		setTimeout(() => { box.style.setProperty('scroll-behavior', previousBehavior || 'smooth'); }, 120);
+	}
+
+	function focusSearchInputWithoutScroll(input) {
+		if (!input) return;
+		const snapshot = preserveChatSearchScrollSnapshot();
+		try { input.focus({ preventScroll: true }); } catch (e) { input.focus(); }
+		restoreChatSearchScrollSnapshot(snapshot);
+	}
+
 	function handleSearchFocus() {
+		const snapshot = preserveChatSearchScrollSnapshot();
 		playUiTextField();
 		const chatView = document.getElementById('view-chat');
 		const subviewChat = document.getElementById('subview-chat');
@@ -27529,6 +27572,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 		if (chatView.style.display === 'block' && subviewChat.style.display === 'flex') {
 			document.getElementById('chat-search-dropdown').style.display = 'flex';
 		}
+		restoreChatSearchScrollSnapshot(snapshot);
 	}
 	
 	function hideChatSearchMenu(force = false) {
@@ -27558,15 +27602,26 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 		const input = document.getElementById('search-input');
 		if (!input) return;
 	
+		const snapshot = preserveChatSearchScrollSnapshot();
 		input.value = filter; 
-		input.focus();
+		focusSearchInputWithoutScroll(input);
 		
 		if (typeof playUiClick === 'function') playUiClick();
 		
+		if (filter === 'from:' || filter === 'mentions:') {
+			const prefix = filter === 'from:' ? 'from:' : 'mentions:';
+			if (typeof showSearchUserSuggestions === 'function') showSearchUserSuggestions('', prefix);
+			restoreChatSearchScrollSnapshot(snapshot);
+			return;
+		}
+
 		if (typeof applyChatSearch === 'function') applyChatSearch(filter);
 	
 		if (!filter.includes('from:') && !filter.includes('mentions:')) {
 			hideChatSearchMenu(true);
+			keepChatSearchResultsAtTop();
+		} else {
+			restoreChatSearchScrollSnapshot(snapshot);
 		}
 	}
 	
@@ -27575,6 +27630,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 		const val = query.toLowerCase().trim();
 		const box = document.getElementById('chat-messages');
 		const myName = localStorage.getItem('psn_username');
+		window.__chatSearchActive = val !== '';
 	
 		if (!val) {
 			renderDefaultSearchFilters();
@@ -27638,6 +27694,8 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 					</button>
 				</div>`;
 		}
+
+		if (val !== "") keepChatSearchResultsAtTop();
 	}
 	
 	function showSearchUserSuggestions(userQuery, prefix) {
@@ -27709,11 +27767,12 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 		if (event) event.preventDefault();
 		const input = document.getElementById('search-input');
 		input.value = prefix + username;
-		input.focus();
+		focusSearchInputWithoutScroll(input);
 		
 		playUiClick();
 		applyChatSearch(input.value);
 		hideChatSearchMenu(true);
+		keepChatSearchResultsAtTop();
 	}
 	
 	window.buildPollHtml = function(poll, msgId, currentView = 'options') {
