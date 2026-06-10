@@ -24817,6 +24817,11 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 						friend.lastSeen = netData.lastSeen;
 						changed = true;
 					}
+					const resolvedFriendAvatar = (typeof getResolvedUserAvatar === 'function') ? getResolvedUserAvatar(friend.name, netData?.avatar || friend.avatar) : (netData?.avatar || friend.avatar);
+					if (resolvedFriendAvatar && friend.avatar !== resolvedFriendAvatar) {
+						friend.avatar = resolvedFriendAvatar;
+						changed = true;
+					}
 				});
 				if (changed) {
 					saveState(STORAGE_KEY_FRIENDS, JSON.stringify(window.friendsList));
@@ -27319,7 +27324,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 		const isTargetBanned = typeof window.isPsnUserBanned === 'function' ? window.isPsnUserBanned(username, userObj) : (userObj.isBanned === true || userRole === 'banned');
 	
 		const cachedAvatar = localStorage.getItem(`${username}_psn_avatar`);
-		const userAvatar = userObj.avatar || cachedAvatar || AVAILABLE_AVATARS[0];
+		const userAvatar = (typeof getResolvedUserAvatar === 'function') ? getResolvedUserAvatar(username, userObj.avatar || cachedAvatar) : (userObj.avatar || cachedAvatar || AVAILABLE_AVATARS[0]);
 		const isFriend = window.friendsList && window.friendsList.some(f => f.name === username);
 	
 		const ps3 = userObj.ps3Status || null;
@@ -27973,7 +27978,29 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 	// ==========================================================================
     // FRIENDS LOGIC
     // ==========================================================================
+	function getResolvedUserAvatar(name, preferredAvatar = '') {
+		const DEFAULT_AVATAR = "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/main/resources/interface/modern/images/avatars/default.png";
+		const netUser = typeof currentOnlineList !== 'undefined' ? currentOnlineList.find(u => (u.name || u) === name) : null;
+		const searchUser = window.globalSearchResults ? window.globalSearchResults.find(u => (u.name || u) === name) : null;
+		const friendData = window.friendsList ? window.friendsList.find(f => (f.name || f) === name) : null;
+		const savedAvatar = localStorage.getItem(`${name}_psn_avatar`);
+		const firstAvatar = (typeof AVAILABLE_AVATARS !== 'undefined' && AVAILABLE_AVATARS[0]) ? AVAILABLE_AVATARS[0] : DEFAULT_AVATAR;
+
+		return [
+			netUser?.avatar,
+			searchUser?.avatar,
+			savedAvatar,
+			preferredAvatar,
+			friendData?.avatar,
+			firstAvatar,
+			DEFAULT_AVATAR
+		].find(src => typeof src === 'string' && src.trim() !== '') || DEFAULT_AVATAR;
+	}
+
+	window.getResolvedUserAvatar = getResolvedUserAvatar;
+
 	window.toggleFriend = function(name, avatar) {
+		const resolvedAvatar = getResolvedUserAvatar(name, avatar);
 		const index = window.friendsList.findIndex(f => f.name === name);
 		
 		if (index > -1) {
@@ -27982,7 +28009,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 		} else {
 			window.friendsList.push({
 				name: name,
-				avatar: avatar || "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/main/resources/interface/modern/images/avatars/default.png",
+				avatar: resolvedAvatar,
 				dateAdded: new Date().toLocaleDateString()
 			});
 			if (typeof playUiSuccess === 'function') playUiSuccess();
@@ -28120,7 +28147,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 				const fName = f.name || f;
 				const net = currentOnlineList.find(u => (u.name || u) === fName);
 				const isOn = net && net.online === true;
-				const card = createUserCardElement(fName, f.avatar || AVAILABLE_AVATARS[0], isOn ? '#4caf50' : '#8b96a8', isOn ? 'Online' : `Last seen: ${formatLastSeen(net?.lastSeen || f.lastSeen)}`, isOn, true, i, isSilent);
+				const card = createUserCardElement(fName, getResolvedUserAvatar(fName, f.avatar), isOn ? '#4caf50' : '#8b96a8', isOn ? 'Online' : `Last seen: ${formatLastSeen(net?.lastSeen || f.lastSeen)}`, isOn, true, i, isSilent);
 				grid.appendChild(card);
 			});
 		}
@@ -28130,7 +28157,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 			grid.insertAdjacentHTML('beforeend', `<div class="search-divider online-header" style="${extraStyle}">PLAYERS ONLINE (${onlineOthers.length})</div>`);
 			onlineOthers.forEach((u, i) => {
 				const uName = u.name || u;
-				const card = createUserCardElement(uName, u.avatar || AVAILABLE_AVATARS[0], '#4caf50', 'Online Now', true, false, i + 100, isSilent);
+				const card = createUserCardElement(uName, getResolvedUserAvatar(uName, u.avatar), '#4caf50', 'Online Now', true, false, i + 100, isSilent);
 				grid.appendChild(card);
 			});
 		}
@@ -28140,7 +28167,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 			grid.insertAdjacentHTML('beforeend', `<div class="search-divider" style="${extraStyle} color: #8b96a8;">PLAYERS OFFLINE (${globalOffline.length})</div>`);
 			globalOffline.forEach((u, i) => {
 				const uName = u.name || u;
-				const card = createUserCardElement(uName, u.avatar || AVAILABLE_AVATARS[0], '#8b96a8', 'Offline', false, false, i + 500, isSilent);
+				const card = createUserCardElement(uName, getResolvedUserAvatar(uName, u.avatar), '#8b96a8', 'Offline', false, false, i + 500, isSilent);
 				grid.appendChild(card);
 			});
 		}
@@ -28167,6 +28194,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 	};
 	
 	function createUserCardElement(name, avatar, statusColor, statusText, isOnline, isFriend, idx, isSilent = false) {
+		avatar = getResolvedUserAvatar(name, avatar);
 		const myName = localStorage.getItem('psn_username');
 		const isMe = (name === myName);
 		const netUser = typeof currentOnlineList !== 'undefined' ? currentOnlineList.find(u => (u.name || u) === name) : null;
@@ -28358,7 +28386,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 		const isTargetAdmin = (networkUser && networkUser.isAdmin === true) || profileRole === 'admin' || (localStorage.getItem(`${username}_psn_isAdmin`) === 'true');
 		const isTargetBanned = typeof window.isPsnUserBanned === 'function' ? window.isPsnUserBanned(username, roleSource) : ((roleSource && roleSource.isBanned === true) || profileRole === 'banned' || (localStorage.getItem(`${username}_psn_isBanned`) === 'true'));
         const adminTagHtml = typeof window.buildPsnRoleBadge === 'function' ? window.buildPsnRoleBadge(username, roleSource, 'profile') : (isTargetAdmin ? ` <span style="color:#ff4444; font-size:12px; font-weight:bold; font-style: italic; text-shadow: 0 0 8px rgba(255, 68, 68, 0.4); margin-left: 5px;">(Admin)</span>` : '');
-		const avatarUrl = localStorage.getItem(`${username}_psn_avatar`) || (isMe ? AVAILABLE_AVATARS[0] : "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/main/resources/interface/modern/images/avatars/default.png");
+		const avatarUrl = (typeof getResolvedUserAvatar === 'function') ? getResolvedUserAvatar(username) : (localStorage.getItem(`${username}_psn_avatar`) || (isMe ? AVAILABLE_AVATARS[0] : "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/main/resources/interface/modern/images/avatars/default.png"));
 		const joinedDate = localStorage.getItem(`${username}_psn_joined`) || (isMe ? (localStorage.getItem(`${myName}_joined_date`) || "2026") : "---");
 		
 		const isFriend = window.friendsList && window.friendsList.some(f => f.name === username);
