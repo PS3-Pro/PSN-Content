@@ -16528,10 +16528,12 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 			return;
 		}
 	
+		const hasRenderedLocalCards = !!(grid && grid.querySelector('.game-card'));
 		if (typeof lastScannedGames !== 'undefined' && lastScannedGames.length > 0) {
-			renderLocalLibrary(lastScannedGames, true, false);
+			if (!hasRenderedLocalCards) renderLocalLibrary(lastScannedGames, true, true);
 		} else {
 			grid.innerHTML = "";
+			grid.dataset.localLibraryRenderSignature = '';
 			for (let i = 0; i < 12; i++) {
 				grid.innerHTML += `
 					<div class="skeleton-card">
@@ -16584,7 +16586,9 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 				};
 			}).filter(game => game.path !== "");
 	
+			let shouldRepaintLocalLibrary = false;
 			if (typeof lastScannedGames !== 'undefined') {
+				const previousSignature = getLocalLibraryDataSignature(lastScannedGames);
 				const mergedGames = discoveredGames.map(newGame => {
 					const oldGame = lastScannedGames.find(og => og.path === newGame.path);
 					if (oldGame) {
@@ -16599,9 +16603,14 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 	
 				lastScannedGames = mergedGames;
 				window.lastScannedGames = lastScannedGames;
+				shouldRepaintLocalLibrary = previousSignature !== getLocalLibraryDataSignature(lastScannedGames);
 			}
 	
-			renderLocalLibrary(lastScannedGames, false, true);
+			if (shouldRepaintLocalLibrary || !grid.querySelector('.game-card')) {
+				renderLocalLibrary(lastScannedGames, false, true);
+			} else if (typeof updateConsoleLibraryStatusUI === 'function') {
+				updateConsoleLibraryStatusUI(lastScannedGames);
+			}
 			
 			if (typeof window.broadcastProfileUpdate === 'function') {
 				window.broadcastProfileUpdate();
@@ -16644,9 +16653,52 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 	window.lastScannedGames = lastScannedGames;
 	window.libCoverCache = window.libCoverCache || {};
 	
+	function getLocalLibraryDataSignature(games) {
+		return JSON.stringify((games || []).map(g => ({
+			path: g.path || '',
+			title: g.title || '',
+			id: g.id || '',
+			cover: g.cover || '',
+			lastPlayed: g.lastPlayed || '',
+			titleId: g.titleId || ''
+		})));
+	}
+	
+	function getLocalLibraryPlayingSignature() {
+		const s = window.myCurrentPS3Status || { status: 'idle' };
+		return [
+			s.status || 'idle',
+			s.titleId || '',
+			s.title || '',
+			s.appVersion || ''
+		].join('|');
+	}
+	
+	function getLocalLibraryFavoritesSignature() {
+		return (favoritesLibrary || []).map(f => f.path || '').sort().join('|');
+	}
+	
+	function getLocalLibraryRenderSignature(games) {
+		return [
+			getLocalLibraryDataSignature(games),
+			getLocalLibraryPlayingSignature(),
+			getLocalLibraryFavoritesSignature()
+		].join('::');
+	}
+	
 	function renderLocalLibrary(games, isFiltering = false, isSilent = false) {
 		const grid = document.getElementById('ps3-local-grid');
+		if (!grid) return;
+		
+		const renderSignature = getLocalLibraryRenderSignature(games || []);
+		const hasRenderedCards = !!grid.querySelector('.game-card');
+		if (hasRenderedCards && grid.dataset.localLibraryRenderSignature === renderSignature) {
+			if (typeof updateConsoleLibraryStatusUI === 'function') updateConsoleLibraryStatusUI(lastScannedGames);
+			return;
+		}
+		
 		grid.innerHTML = "";
+		grid.dataset.localLibraryRenderSignature = renderSignature;
 		
 		if (!isFiltering) {
 			lastScannedGames = games || [];
@@ -16736,7 +16788,7 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 									(game.title === currentPlaying.title || (cachedData.id && cachedData.id === currentPlaying.titleId)));
 	
 			const activeClass = isThisGamePlaying ? "is-playing" : "";
-			const animClass = isSilent ? "no-anim" : "anim-reveal";
+			const animClass = isSilent ? "no-anim no-img-fade" : "anim-reveal";
 			
 			let existsInStore = false;
 			let targetCategory = 'games';
