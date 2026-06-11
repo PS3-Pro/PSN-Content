@@ -28,6 +28,7 @@ const INSTANCE_ID = process.env.RENDER_INSTANCE_ID || process.env.RAILWAY_REPLIC
 const PRESENCE_TTL_SECONDS = 90;
 const PRESENCE_HEARTBEAT_MS = 25000;
 const CHAT_SYNC_INTERVAL_MS = 3000;
+const PROFILE_SYNC_INTERVAL_MS = 5000;
 const DEFAULT_MAINTENANCE_MESSAGE = "The service is under maintenance. Please try again soon.";
 const VALID_USER_ROLES = new Set(["user", "trusted", "mod", "admin"]);
 const ADMIN_STATE_KEYS = {
@@ -668,6 +669,78 @@ function getSocketsByUserName(name) {
   return sockets;
 }
 
+
+function buildFullProfileSyncPayload(name, user = {}, sourceSocketId = null) {
+  const safe = normalizeUserRecord(name, user || {});
+  return {
+    name,
+    sourceSocketId,
+    profileUpdatedAt: safe.profileUpdatedAt || Date.now(),
+    userData: {
+      id: safe.id || null,
+      name,
+      avatar: safe.avatar || DEFAULT_AVATAR,
+      joined: safe.joined || '2026',
+      role: getUserRole(name, safe),
+      isAdmin: isUserAdmin(name, safe),
+      isModerator: isUserModerator(name, safe),
+      banned: isUserBanned(safe),
+      lastSeen: safe.lastSeen || null,
+      ps3Status: safe.ps3Status || null,
+      level: safe.level || 1,
+      xp: safe.xp || 0,
+      downloads: Array.isArray(safe.downloadsData) ? safe.downloadsData.length : (safe.downloads || 0),
+      wishlist: Array.isArray(safe.wishlistData) ? safe.wishlistData.length : (safe.wishlist || 0),
+      favorites: Array.isArray(safe.favoritesData) ? safe.favoritesData.length : (safe.favorites || 0),
+      trophies: safe.trophies || 0,
+      library: Array.isArray(safe.libraryData) ? safe.libraryData.length : (safe.library || 0),
+      trophiesData: safe.trophiesData || {},
+      downloadsData: Array.isArray(safe.downloadsData) ? safe.downloadsData : [],
+      wishlistData: Array.isArray(safe.wishlistData) ? safe.wishlistData : [],
+      favoritesData: Array.isArray(safe.favoritesData) ? safe.favoritesData : [],
+      libraryData: Array.isArray(safe.libraryData) ? safe.libraryData : [],
+      friendsData: Array.isArray(safe.friendsData) ? safe.friendsData : [],
+      countersData: safe.countersData || {},
+      themeColor: safe.themeColor || '#0070cc',
+      settingsData: safe.settingsData || {}
+    }
+  };
+}
+
+function emitProfileSync(name, sourceSocketId = null) {
+  if (!name || !userDatabase[name]) return;
+  const payload = buildFullProfileSyncPayload(name, userDatabase[name], sourceSocketId);
+  getSocketsByUserName(name).forEach(client => client.emit('profile_sync', payload));
+}
+
+async function syncActiveProfilesAcrossInstances() {
+  const activeNames = [...new Set(Array.from(io.sockets.sockets.values())
+    .filter(client => client.connected && client.userName)
+    .map(client => client.userName))];
+
+  if (!activeNames.length) return;
+
+  const dbRes = await pool.query('SELECT name, data FROM users WHERE name = ANY($1)', [activeNames]);
+  dbRes.rows.forEach(row => {
+    const name = row.name;
+    const dbUser = normalizeUserRecord(name, row.data || {});
+    const localUser = userDatabase[name] || {};
+    const dbVersion = Number(dbUser.profileUpdatedAt || 0);
+    const localVersion = Number(localUser.profileUpdatedAt || 0);
+
+    if (!dbVersion || dbVersion <= localVersion) return;
+
+    userDatabase[name] = {
+      ...dbUser,
+      online: localUser.online === true,
+      id: localUser.id || dbUser.id,
+      lastSeen: localUser.lastSeen || dbUser.lastSeen || Date.now()
+    };
+
+    emitProfileSync(name, null);
+  });
+}
+
 function disconnectUserSessions(name, eventName = 'user_kicked', payload = {}) {
   getSocketsByUserName(name).forEach(client => {
     client.emit(eventName, payload);
@@ -959,6 +1032,10 @@ setInterval(() => {
   syncChatAcrossInstances().catch(err => console.error('[CHAT POLL ERROR]:', err));
 }, CHAT_SYNC_INTERVAL_MS);
 
+setInterval(() => {
+  syncActiveProfilesAcrossInstances().catch(err => console.error('[PROFILE SYNC ERROR]:', err));
+}, PROFILE_SYNC_INTERVAL_MS);
+
 io.on('connection', async (socket) => {
   console.log('[NETWORK] Socket connected. ID: ' + socket.id);
   await refreshAdminStateFromDb();
@@ -1021,7 +1098,8 @@ io.on('connection', async (socket) => {
             lastSeen: Date.now(),
             name: name,
             role: getUserRole(name, recoveredDbUser),
-            banned: isUserBanned(recoveredDbUser)
+            banned: isUserBanned(recoveredDbUser),
+            profileUpdatedAt: recoveredDbUser.profileUpdatedAt || Date.now()
           };
           
           await pool.query('UPDATE users SET data = $1 WHERE name = $2', [userDatabase[name], name]);
@@ -1079,7 +1157,8 @@ io.on('connection', async (socket) => {
           role: isAdmin ? "admin" : "user",
           banned: false,
           migratedFromLocalProfile: isNewAccount !== true,
-          migratedAt: new Date().toISOString()
+          migratedAt: new Date().toISOString(),
+          profileUpdatedAt: Date.now()
         });
         socket.role = getUserRole(name, userDatabase[name]);
 
@@ -1150,6 +1229,7 @@ io.on('connection', async (socket) => {
         
         Object.assign(userDatabase[name], userData);
         userDatabase[name].lastSeen = Date.now();
+        userDatabase[name].profileUpdatedAt = Date.now();
         
         try {
             await pool.query('UPDATE users SET data = $1 WHERE name = $2', [userDatabase[name], name]);
@@ -1158,6 +1238,7 @@ io.on('connection', async (socket) => {
         }
 
         await emitOnlineList();
+        emitProfileSync(name, socket.id);
 
         if (userData.trophiesData) {
             io.emit('global_trophy_stats', calculateGlobalTrophyStats());
