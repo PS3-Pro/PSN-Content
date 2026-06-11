@@ -22274,6 +22274,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
     let currentReply = null;
     let chatUsers = new Set();
     let selectedSuggestionIndex = 0;
+    let suggestionKeyboardMode = false;
     let pendingImages = [];
     let editingMsgId = null;
 	let globalSearchResults = [];
@@ -22639,6 +22640,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 	
 		const myName = localStorage.getItem('psn_username') || '';
 		const isAdmin = document.body.classList.contains('is-admin');
+		const canModerate = typeof window.canModerateSession === 'function' ? window.canModerateSession() : isAdmin;
 	
 		const safeOnlineList = (typeof currentOnlineList !== 'undefined' && Array.isArray(currentOnlineList)) ? currentOnlineList : [];
 		const safeChatUsers = (typeof chatUsers !== 'undefined' && Array.isArray(chatUsers)) ? chatUsers : [];
@@ -22673,9 +22675,9 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 	
 		let suggestionsHtml = '';
 	
-		if (isAdmin && "everyone".includes(String(query).toLowerCase())) {
+		if (canModerate && "everyone".includes(String(query).toLowerCase())) {
 			suggestionsHtml += `
-				<div class="suggestion-item" data-value="everyone" onmouseenter="if(typeof playUiHover === 'function') playUiHover()" onmousedown="event.preventDefault(); insertMention('everyone')">
+				<div class="suggestion-item" data-value="everyone" onmouseenter="clearChatSuggestionKeyboardActive(this)" onmousedown="event.preventDefault(); insertMention('everyone')">
 					<i class="fas fa-bullhorn" style="color: #ff4444; font-size: 10px;"></i> 
 					<b style="color: #ff4444; margin-left: 3px;">everyone</b>
 					<span style="font-size: 8px; opacity: 0.5; margin-left: 5px;">(GLOBAL ALERT)</span>
@@ -22687,7 +22689,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 		if (onlineFiltered.length > 0) {
 			suggestionsHtml += `<div style="font-size: 9px; color: #4caf50; font-weight: bold; margin: 6px 12px 2px 12px; letter-spacing: 1px;">ONLINE</div>`;
 			suggestionsHtml += onlineFiltered.map(u => `
-				<div class="suggestion-item" data-value="${u}" onmouseenter="if(typeof playUiHover === 'function') playUiHover()" onmousedown="event.preventDefault(); insertMention('${u}')">
+				<div class="suggestion-item" data-value="${u}" onmouseenter="clearChatSuggestionKeyboardActive(this)" onmousedown="event.preventDefault(); insertMention('${u}')">
 					<i class="fas fa-circle status-pulsing-soft" style="color: #4caf50; font-size: 7px; margin-right: 5px; vertical-align: middle;"></i> ${u}
 				</div>
 			`).join('');
@@ -22696,7 +22698,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 		if (offlineFiltered.length > 0) {
 			suggestionsHtml += `<div style="font-size: 9px; color: #8b96a8; font-weight: bold; margin: 6px 12px 2px 12px; letter-spacing: 1px;">OFFLINE</div>`;
 			suggestionsHtml += offlineFiltered.map(u => `
-				<div class="suggestion-item" data-value="${u}" onmouseenter="if(typeof playUiHover === 'function') playUiHover()" onmousedown="event.preventDefault(); insertMention('${u}')">
+				<div class="suggestion-item" data-value="${u}" onmouseenter="clearChatSuggestionKeyboardActive(this)" onmousedown="event.preventDefault(); insertMention('${u}')">
 					<i class="fas fa-circle" style="color: rgba(255,255,255,0.2); font-size: 7px; margin-right: 5px; vertical-align: middle;"></i> ${u}
 				</div>
 			`).join('');
@@ -22709,9 +22711,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 			box.scrollTop = 0;
 			selectedSuggestionIndex = 0;
 			
-			const items = box.querySelectorAll('.suggestion-item');
-			items.forEach(item => item.classList.remove('active'));
-			if (items.length > 0) items[0].classList.add('active'); 
+			resetChatSuggestionKeyboardMode(box); 
 	
 			const imgPrev = document.getElementById('pending-image-preview');
 			const replyPrev = document.getElementById('reply-preview');
@@ -23016,10 +23016,59 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 	}
 
 
+	function getActionableSuggestionItems(box) {
+		box = box || document.getElementById('mention-suggestions');
+		if (!box) return [];
+		return Array.from(box.querySelectorAll('.suggestion-item')).filter(item =>
+			item.hasAttribute('data-value') ||
+			item.hasAttribute('data-command') ||
+			item.hasAttribute('data-command-target') ||
+			item.hasAttribute('data-role-value')
+		);
+	}
+
+	function resetChatSuggestionKeyboardMode(box, resetScroll = true) {
+		box = box || document.getElementById('mention-suggestions');
+		suggestionKeyboardMode = false;
+		selectedSuggestionIndex = 0;
+		if (box) {
+			box.querySelectorAll('.suggestion-item.active').forEach(item => item.classList.remove('active'));
+			if (resetScroll) box.scrollTop = 0;
+		}
+	}
+
+	function activateChatSuggestionByIndex(box, index) {
+		box = box || document.getElementById('mention-suggestions');
+		const items = getActionableSuggestionItems(box);
+		if (!box || !items.length) return null;
+		box.querySelectorAll('.suggestion-item.active').forEach(item => item.classList.remove('active'));
+		selectedSuggestionIndex = (index + items.length) % items.length;
+		const activeItem = items[selectedSuggestionIndex];
+		activeItem.classList.add('active');
+		suggestionKeyboardMode = true;
+		activeItem.scrollIntoView({ block: 'nearest' });
+		return activeItem;
+	}
+
+	function clearChatSuggestionKeyboardActive(item) {
+		const box = item && item.closest ? item.closest('#mention-suggestions') : document.getElementById('mention-suggestions');
+		if (!box) return;
+		box.querySelectorAll('.suggestion-item.active').forEach(active => active.classList.remove('active'));
+		const items = getActionableSuggestionItems(box);
+		const idx = items.indexOf(item);
+		selectedSuggestionIndex = idx >= 0 ? idx : 0;
+		suggestionKeyboardMode = false;
+		if (typeof playUiHover === 'function') playUiHover();
+	}
+
 	function hideChatSuggestions() {
 		const suggBox = document.getElementById('mention-suggestions');
-		if (suggBox) suggBox.style.display = 'none';
+		if (suggBox) {
+			suggBox.style.display = 'none';
+			resetChatSuggestionKeyboardMode(suggBox);
+		}
 		selectedSuggestionIndex = 0;
+		suggestionKeyboardMode = false;
 		if (typeof updateJumpButtonPosition === 'function') updateJumpButtonPosition();
 	}
 
@@ -23132,16 +23181,17 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 		if (users.length === 0) {
 			box.innerHTML = `<div class="suggestion-item" style="opacity:.65;"><i class="fas fa-search"></i> No matching users</div>`;
 			box.style.display = 'block';
+			resetChatSuggestionKeyboardMode(box);
 			positionChatSuggestionBox(box);
 			return;
 		}
 		const label = command === 'unban' ? 'BANNED USERS' : (command === 'kick' ? 'ONLINE USERS' : 'USERS');
 		box.innerHTML = `<div style="font-size:9px;color:${command === 'unban' ? '#ff7777' : '#8b96a8'};font-weight:bold;margin:6px 12px 2px;letter-spacing:1px;">${label}</div>` + users.map((u, i) => `
-			<div class="suggestion-item ${i === 0 ? 'active' : ''}" data-command-target="${command}" data-value="${String(u.name).replace(/&/g, '&amp;').replace(/"/g, '&quot;')}" onmouseenter="if(typeof playUiHover === 'function') playUiHover()" onmousedown="event.preventDefault(); insertCommandTarget('${command}', this.getAttribute('data-value'))">
+			<div class="suggestion-item" data-command-target="${command}" data-value="${String(u.name).replace(/&/g, '&amp;').replace(/"/g, '&quot;')}" onmouseenter="clearChatSuggestionKeyboardActive(this)" onmousedown="event.preventDefault(); insertCommandTarget('${command}', this.getAttribute('data-value'))">
 				${commandUserIcon(command, u)}<b>${String(u.name).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</b>
 			</div>`).join('');
 		box.style.display = 'block';
-		selectedSuggestionIndex = 0;
+		resetChatSuggestionKeyboardMode(box);
 		positionChatSuggestionBox(box);
 	}
 
@@ -23159,11 +23209,11 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 		const filtered = roles.filter(r => r.role.includes(q));
 		if (filtered.length === 0) { box.style.display = 'none'; return; }
 		box.innerHTML = `<div style="font-size:9px;color:#ce93d8;font-weight:bold;margin:6px 12px 2px;letter-spacing:1px;">ROLE FOR @${String(targetName || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</div>` + filtered.map((r, i) => `
-			<div class="suggestion-item ${i === 0 ? 'active' : ''}" data-role-value="${r.role}" data-role-target="${String(targetName || '').replace(/&/g, '&amp;').replace(/"/g, '&quot;')}" onmouseenter="if(typeof playUiHover === 'function') playUiHover()" onmousedown="event.preventDefault(); insertRoleCommandValue(this.getAttribute('data-role-target'), this.getAttribute('data-role-value'))">
+			<div class="suggestion-item" data-role-value="${r.role}" data-role-target="${String(targetName || '').replace(/&/g, '&amp;').replace(/"/g, '&quot;')}" onmouseenter="clearChatSuggestionKeyboardActive(this)" onmousedown="event.preventDefault(); insertRoleCommandValue(this.getAttribute('data-role-target'), this.getAttribute('data-role-value'))">
 				<i class="fas ${r.icon}" style="color:${r.color}; font-size:10px; margin-right:6px;"></i><b style="color:#fff;">${r.role}</b><span style="font-size:8px; opacity:.55; margin-left:5px;">${r.desc}</span>
 			</div>`).join('');
 		box.style.display = 'block';
-		selectedSuggestionIndex = 0;
+		resetChatSuggestionKeyboardMode(box);
 		positionChatSuggestionBox(box);
 	}
 
@@ -23256,12 +23306,14 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 	
 		if (filtered.length > 0) {
 			const isChatCommand = (cmd) => ['clean', 'reload'].includes(String(cmd || '').toLowerCase());
+			const actionGroup = isAdmin
+				? { title: 'ADMIN ACTIONS', color: '#ff4444', icon: 'fa-user-shield' }
+				: { title: 'MODERATOR ACTIONS', color: '#8be8ff', icon: 'fa-shield-alt' };
 			const groups = [
-				{ title: 'ADMIN ACTIONS', color: '#ff4444', icon: 'fa-user-shield', items: filtered.filter(c => !isChatCommand(c.cmd)) },
+				{ ...actionGroup, items: filtered.filter(c => !isChatCommand(c.cmd)) },
 				{ title: 'CHAT ACTIONS', color: '#00e5a8', icon: 'fa-comments', items: filtered.filter(c => isChatCommand(c.cmd)) }
 			].filter(group => group.items.length > 0);
 
-			let activeIndex = 0;
 			box.innerHTML = groups.map((group, groupIndex) => {
 				const divider = groupIndex > 0 ? '<div style="height:1px; margin:7px 12px 6px; background:rgba(255,255,255,0.08);"></div>' : '';
 				const header = `
@@ -23270,13 +23322,12 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 						<span>${group.title}</span>
 					</div>`;
 				const items = group.items.map(c => {
-					const currentIndex = activeIndex++;
 					const icon = isChatCommand(c.cmd) ? (c.cmd === 'clean' ? 'fa-broom' : 'fa-sync-alt') : 'fa-terminal';
 					const iconColor = isChatCommand(c.cmd) ? '#00e5a8' : '#ffcc00';
 					return `
-						<div class="suggestion-item ${currentIndex === 0 ? 'active' : ''}" 
+						<div class="suggestion-item" 
 							data-command="${c.cmd}" 
-							onmouseenter="if(typeof playUiHover === 'function') playUiHover()"
+							onmouseenter="clearChatSuggestionKeyboardActive(this)"
 							onmousedown="event.preventDefault(); insertCommand('${c.cmd}')">
 							<i class="fas ${icon}" style="color: ${iconColor}; font-size: 10px; width:12px; text-align:center;"></i> 
 							<b style="color: #fff; margin-left: 3px;">/${c.cmd}</b>
@@ -23288,7 +23339,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 			}).join('');
 			
 			box.style.display = 'block';
-			selectedSuggestionIndex = 0;
+			resetChatSuggestionKeyboardMode(box);
 	
 			const imgPrev = document.getElementById('pending-image-preview');
 			const replyPrev = document.getElementById('reply-preview');
@@ -27458,23 +27509,19 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 		const isSuggesting = suggestionsBox && suggestionsBox.style.display === 'block';
 	
 		if (isSuggesting) {
-			const items = suggestionsBox.querySelectorAll('.suggestion-item');
+			const items = getActionableSuggestionItems(suggestionsBox);
 			if (items.length > 0) {
 				if (e.key === "ArrowDown") {
 					e.preventDefault();
-					items[selectedSuggestionIndex].classList.remove('active');
-					selectedSuggestionIndex = (selectedSuggestionIndex + 1) % items.length;
-					items[selectedSuggestionIndex].classList.add('active');
+					activateChatSuggestionByIndex(suggestionsBox, suggestionKeyboardMode ? selectedSuggestionIndex + 1 : 0);
 					return;
 				} else if (e.key === "ArrowUp") {
 					e.preventDefault();
-					items[selectedSuggestionIndex].classList.remove('active');
-					selectedSuggestionIndex = (selectedSuggestionIndex - 1 + items.length) % items.length;
-					items[selectedSuggestionIndex].classList.add('active');
+					activateChatSuggestionByIndex(suggestionsBox, suggestionKeyboardMode ? selectedSuggestionIndex - 1 : items.length - 1);
 					return;
 				} else if (e.key === "Enter" || e.key === "Tab") {
 					e.preventDefault();
-					const activeItem = items[selectedSuggestionIndex];
+					const activeItem = suggestionsBox.querySelector('.suggestion-item.active') || items[selectedSuggestionIndex] || items[0];
 					const cmdValue = activeItem.getAttribute('data-command');
 					const targetCommand = activeItem.getAttribute('data-command-target');
 					const roleValue = activeItem.getAttribute('data-role-value');
@@ -27492,6 +27539,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 					return;
 				} else if (e.key === "Escape") {
 					suggestionsBox.style.display = 'none';
+					resetChatSuggestionKeyboardMode(suggestionsBox);
 					return;
 				}
 			}
