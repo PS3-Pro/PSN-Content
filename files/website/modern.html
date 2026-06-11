@@ -4519,7 +4519,7 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 						</button>
 						<div style="background: rgba(255, 255, 255, 0.03); padding: 10px 25px 15px 25px; border-top: 1px solid rgba(255, 255, 255, 0.08); display: flex; flex-direction: column; gap: 5px; position: relative; z-index: 5;">
 							<div id="chat-toolbar-container" class="chat-toolbar" style="display: flex; align-items: center; gap: 15px; padding: 0 5px 5px 5px; margin-bottom: 2px;">
-								<button id="btn-toolbar-at" class="tool-btn" onmouseenter="playUiHover();" onclick="triggerMentionBtn()" title="Mention User" style="font-size: 13px;"><i class="fas fa-at"></i></button>
+								<button id="btn-toolbar-at" class="tool-btn" onmouseenter="playUiHover();" onmousedown="event.preventDefault(); if(typeof saveChatInputRange === 'function') saveChatInputRange();" ontouchstart="if(typeof saveChatInputRange === 'function') saveChatInputRange();" onclick="triggerMentionBtn()" title="Mention User" style="font-size: 13px;"><i class="fas fa-at"></i></button>
 								<button id="btn-toolbar-cmd" class="tool-btn" onmouseenter="playUiHover();" onclick="triggerCommandBtn()" title="Commands" style="font-size: 12px;"><i class="fas fa-terminal"></i></button>
 								<button id="btn-create-poll" class="tool-btn" onmouseenter="playUiHover();" onclick="openPollModal()" title="Create Poll" style="font-size: 14px;"><i class="fas fa-poll-h"></i></button>
 								<div style="width: 1px; height: 14px; background: rgba(255, 255, 255, 0.15); margin: 0 5px; box-shadow: 0 0 5px rgba(0, 188, 255, 0.2);"></div>
@@ -22234,9 +22234,10 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
             const timeKey = String(new Date(msg && msg.time).getTime() || (msg && msg.time) || '');
             const textKey = String((msg && msg.text) || '').length;
             const editKey = msg && msg.edited ? '1' : '0';
+            const globalKey = msg && (msg.isGlobalPing === true || (typeof isChatGlobalPingMessage === 'function' && isChatGlobalPingMessage(msg, msg.user))) ? '1' : '0';
             const typeKey = String((msg && msg.type) || 'text');
             const contentKey = Array.isArray(msg && msg.content) ? msg.content.length : ((msg && msg.content) ? '1' : '0');
-            return `${timeKey}:${textKey}:${editKey}:${typeKey}:${contentKey}`;
+            return `${timeKey}:${textKey}:${editKey}:${globalKey}:${typeKey}:${contentKey}`;
         }).join('|');
     }
 
@@ -22629,50 +22630,169 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 		}
 	}
 
-   function insertMention(user) {
+	let chatInputSavedRange = null;
+
+	function isChatRangeInsideInput(range, input) {
+		if (!range || !input) return false;
+		const container = range.commonAncestorContainer;
+		return container === input || input.contains(container);
+	}
+
+	function saveChatInputRange() {
 		const input = document.getElementById('chat-input');
-		if (!input) return;
-		
 		const selection = window.getSelection();
-		if (!selection.rangeCount) return;
-	
+		if (!input || !selection || !selection.rangeCount) return;
 		const range = selection.getRangeAt(0);
-		const textNode = range.startContainer;
-		const offset = range.startOffset;
-	
-		if (textNode.nodeType !== Node.TEXT_NODE) {
-			const mentionText = "@" + user + " ";
-			const newNode = document.createTextNode(mentionText);
-			range.insertNode(newNode);
-			range.setStartAfter(newNode);
-			range.setEndAfter(newNode);
-		} else {
-			const text = textNode.textContent;
-			const textBeforeCaret = text.substring(0, offset);
-			const atIndex = textBeforeCaret.lastIndexOf('@');
-	
-			if (atIndex !== -1) {
-				range.setStart(textNode, atIndex);
-				range.setEnd(textNode, offset);
-				range.deleteContents();
-	
-				const mentionText = "@" + user + " ";
-				const newNode = document.createTextNode(mentionText);
-				range.insertNode(newNode);
-	
-				range.setStartAfter(newNode);
-				range.setEndAfter(newNode);
-			}
+		if (isChatRangeInsideInput(range, input)) {
+			chatInputSavedRange = range.cloneRange();
 		}
-	
+	}
+
+	function moveChatCaretToEnd(input) {
+		const range = document.createRange();
+		const selection = window.getSelection();
+		range.selectNodeContents(input);
+		range.collapse(false);
 		selection.removeAllRanges();
 		selection.addRange(range);
-	
+		chatInputSavedRange = range.cloneRange();
+		return range;
+	}
+
+	function restoreChatInputRange() {
+		const input = document.getElementById('chat-input');
+		const selection = window.getSelection();
+		if (!input || !selection) return null;
+		input.focus();
+
+		if (selection.rangeCount && isChatRangeInsideInput(selection.getRangeAt(0), input)) {
+			chatInputSavedRange = selection.getRangeAt(0).cloneRange();
+			return selection.getRangeAt(0);
+		}
+
+		if (chatInputSavedRange && isChatRangeInsideInput(chatInputSavedRange, input)) {
+			selection.removeAllRanges();
+			selection.addRange(chatInputSavedRange.cloneRange());
+			return selection.getRangeAt(0);
+		}
+
+		return moveChatCaretToEnd(input);
+	}
+
+	function getChatTextBeforeCaret(input) {
+		const selection = window.getSelection();
+		if (!input || !selection || !selection.rangeCount || !isChatRangeInsideInput(selection.getRangeAt(0), input)) return '';
+		const activeRange = selection.getRangeAt(0);
+		const preRange = document.createRange();
+		preRange.selectNodeContents(input);
+		try {
+			preRange.setEnd(activeRange.startContainer, activeRange.startOffset);
+			return preRange.toString();
+		} catch (e) {
+			return '';
+		}
+	}
+
+	function getChatCaretTextOffset(input) {
+		return getChatTextBeforeCaret(input).length;
+	}
+
+	function createChatRangeFromTextOffsets(root, startOffset, endOffset) {
+		const range = document.createRange();
+		const walker = document.createTreeWalker(root, 4, null);
+		let node;
+		let count = 0;
+		let startSet = false;
+		let endSet = false;
+		startOffset = Math.max(0, startOffset);
+		endOffset = Math.max(startOffset, endOffset);
+
+		while ((node = walker.nextNode())) {
+			const nextCount = count + node.textContent.length;
+
+			if (!startSet && startOffset <= nextCount) {
+				range.setStart(node, Math.max(0, startOffset - count));
+				startSet = true;
+			}
+
+			if (!endSet && endOffset <= nextCount) {
+				range.setEnd(node, Math.max(0, endOffset - count));
+				endSet = true;
+				break;
+			}
+
+			count = nextCount;
+		}
+
+		if (!startSet) range.setStart(root, root.childNodes.length);
+		if (!endSet) range.setEnd(root, root.childNodes.length);
+		return range;
+	}
+
+	function replaceChatTextRange(input, startOffset, endOffset, text) {
+		const selection = window.getSelection();
+		if (!input || !selection) return;
+
+		const range = createChatRangeFromTextOffsets(input, startOffset, endOffset);
+		input.focus();
+		selection.removeAllRanges();
+		selection.addRange(range);
+
+		let insertedWithNativeUndo = false;
+		try {
+			insertedWithNativeUndo = document.execCommand('insertText', false, text);
+		} catch (e) {
+			insertedWithNativeUndo = false;
+		}
+
+		if (!insertedWithNativeUndo) {
+			const fallbackRange = createChatRangeFromTextOffsets(input, startOffset, endOffset);
+			fallbackRange.deleteContents();
+
+			const newNode = document.createTextNode(text);
+			fallbackRange.insertNode(newNode);
+
+			fallbackRange.setStart(newNode, newNode.textContent.length);
+			fallbackRange.setEnd(newNode, newNode.textContent.length);
+			selection.removeAllRanges();
+			selection.addRange(fallbackRange);
+		}
+
+		saveChatInputRange();
+	}
+
+	function insertPlainTextAtChatCaret(input, text) {
+		restoreChatInputRange();
+		document.execCommand('insertText', false, text);
+		saveChatInputRange();
+	}
+
+	function insertMention(user) {
+		const input = document.getElementById('chat-input');
+		if (!input) return;
+
+		restoreChatInputRange();
+
+		const mentionText = "@" + user + " ";
+		const caretOffset = getChatCaretTextOffset(input);
+		const inputText = input.textContent || input.innerText || '';
+		const textBeforeCaret = inputText.substring(0, caretOffset);
+		const atIndex = textBeforeCaret.lastIndexOf('@');
+		const typedMentionQuery = atIndex !== -1 ? textBeforeCaret.substring(atIndex + 1) : '';
+
+		if (atIndex !== -1 && !/\s/.test(typedMentionQuery)) {
+			replaceChatTextRange(input, atIndex, caretOffset, mentionText);
+		} else {
+			insertPlainTextAtChatCaret(input, mentionText);
+		}
+
 		const suggestionsBox = document.getElementById('mention-suggestions');
 		if (suggestionsBox) suggestionsBox.style.display = 'none';
-		
+
 		input.focus();
-		
+		input.dispatchEvent(new Event('input', { bubbles: true }));
+		saveChatInputRange();
+
 		if (typeof playUiClick === 'function') playUiClick();
 		if (typeof updateJumpButtonPosition === 'function') updateJumpButtonPosition();
 	}
@@ -22704,42 +22824,34 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 		if (typeof adminBlockLockedToolbarAction === 'function' && adminBlockLockedToolbarAction()) return;
 		const input = document.getElementById('chat-input');
 		if (!input) return;
-	
-		input.focus();
-		
-		const range = document.createRange();
-		const sel = window.getSelection();
-		range.selectNodeContents(input);
-		range.collapse(false);
-		sel.removeAllRanges();
-		sel.addRange(range);
-	
-		const text = input.innerText.replace(/[\n\r]+$/, '');
-		const words = text.split(/\s/);
-		const lastWord = words[words.length - 1];
-		
+
+		restoreChatInputRange();
+
 		const suggestionsBox = document.getElementById('mention-suggestions');
 		const isBoxOpen = suggestionsBox && suggestionsBox.style.display === 'block';
-	
-		if (isBoxOpen && lastWord === '@') {
+		const textBeforeCaret = getChatTextBeforeCaret(input);
+		const currentWord = (textBeforeCaret.split(/\s/).pop() || '');
+
+		if (isBoxOpen && currentWord === '@') {
 			document.execCommand('delete', false, null);
 			input.dispatchEvent(new Event('input', { bubbles: true }));
+			saveChatInputRange();
 			if (typeof playUiClick === 'function') playUiClick();
 			return;
 		}
-	
-		if (text.length > 0 && !text.endsWith(' ') && !text.endsWith('\n')) {
-			document.execCommand('insertText', false, ' ');
+
+		if (textBeforeCaret.length > 0 && !/[\s\n\r]$/.test(textBeforeCaret)) {
+			insertPlainTextAtChatCaret(input, ' ');
 		}
-	
-		document.execCommand('insertText', false, '@');
+
+		insertPlainTextAtChatCaret(input, '@');
 		input.dispatchEvent(new Event('input', { bubbles: true }));
-		
+
 		if (typeof showMentionSuggestions === 'function') {
 			showMentionSuggestions("");
 			setTimeout(updateJumpButtonPosition, 10); 
 		}
-		
+
 		if (typeof playUiClick === 'function') playUiClick();
 	}
 	
@@ -24050,6 +24162,48 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 		return messageText;
 	}
 
+
+	function chatTextHasEveryoneMention(text) {
+		return /@everyone\b/i.test(String(text || ''));
+	}
+
+	function getChatGlobalPingRole(msg, fallbackUserName = '') {
+		const msgObj = (msg && typeof msg === 'object') ? msg : {};
+		const senderName = fallbackUserName || msgObj.user || '';
+		const explicitRole = String(msgObj.globalPingRole || msgObj.globalAlertRole || msgObj.alertRole || '').toLowerCase();
+		if (explicitRole === 'moderator') return 'mod';
+		if (explicitRole === 'admin' || explicitRole === 'mod') return explicitRole;
+
+		const senderRoleSource = Object.assign({}, msgObj, (window.findPsnUserByName && senderName) ? (window.findPsnUserByName(senderName) || {}) : {});
+		const senderRole = typeof window.getPsnUserRole === 'function' ? window.getPsnUserRole(senderName, senderRoleSource) : (msgObj.isAdmin ? 'admin' : (msgObj.isModerator ? 'mod' : 'user'));
+		const currentUser = localStorage.getItem('psn_username') || '';
+		const isCurrentSender = senderName && senderName === currentUser;
+
+		if (msgObj.isAdmin === true || senderRole === 'admin' || (isCurrentSender && document.body.classList.contains('is-admin'))) return 'admin';
+		if (msgObj.isModerator === true || senderRole === 'mod' || (isCurrentSender && document.body.classList.contains('is-mod'))) return 'mod';
+		return msgObj.isGlobalPing === true ? 'admin' : '';
+	}
+
+	function getChatGlobalPingVisual(role = 'admin') {
+		const normalized = String(role || 'admin').toLowerCase() === 'mod' ? 'mod' : 'admin';
+		return normalized === 'mod'
+			? { role: 'mod', label: 'Moderator Alert', title: 'MODERATOR ALERT', color: '#8be8ff', glow: 'rgba(139, 232, 255, 0.5)' }
+			: { role: 'admin', label: 'Admin Alert', title: 'ADMIN ALERT', color: '#ff4444', glow: 'rgba(255, 68, 68, 0.5)' };
+	}
+
+	function isChatGlobalPingMessage(msg, fallbackUserName = '') {
+		const msgObj = (msg && typeof msg === 'object') ? msg : {};
+		const text = String(msgObj.text || (typeof msg === 'string' ? msg : '') || '');
+		if (msgObj.isGlobalPing === true) return true;
+		if (!chatTextHasEveryoneMention(text)) return false;
+		return !!getChatGlobalPingRole(msgObj, fallbackUserName || msgObj.user || '');
+	}
+
+	function formatEveryoneMentionForDisplay(messageText, role = 'admin') {
+		const visual = getChatGlobalPingVisual(role);
+		return String(messageText || '').replace(/@everyone\b(?![^<]*>)/gi, `<span class="chat-mention" style="background: ${visual.color}; color: #fff; padding: 2px 4px; border-radius: 4px; font-weight: bold; font-size: 10px;">@everyone</span>`);
+	}
+
 	function appendMessageToChat(msg, isMe = false, timestamp = null) {
 		const box = document.getElementById('chat-messages');
 		if (!box) return;
@@ -24071,6 +24225,18 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 		const encodedUser = encodeURIComponent(userName).replace(/'/g, "%27");
 	
 		trackUser(userName);
+	
+		const senderRoleSource = Object.assign({}, (typeof msg === 'object' ? msg : {}), window.findPsnUserByName ? (window.findPsnUserByName(userName) || {}) : {});
+		const senderRole = typeof window.getPsnUserRole === 'function' ? window.getPsnUserRole(userName, senderRoleSource) : (msg.isAdmin ? 'admin' : (msg.isModerator ? 'mod' : 'user'));
+		const senderIsAdmin = msg.isAdmin === true || senderRole === 'admin';
+		const senderIsBanned = typeof window.isPsnUserBanned === 'function' ? window.isPsnUserBanned(userName, senderRoleSource) : (senderRoleSource.isBanned === true || senderRoleSource.banned === true);
+		const isGlobal = typeof isChatGlobalPingMessage === 'function' ? isChatGlobalPingMessage(msg, userName) : (msg.isGlobalPing === true);
+		const globalPingRole = isGlobal && typeof getChatGlobalPingRole === 'function' ? getChatGlobalPingRole(msg, userName) : 'admin';
+		const globalPingVisual = typeof getChatGlobalPingVisual === 'function' ? getChatGlobalPingVisual(globalPingRole) : { role: 'admin', label: 'Admin Alert', title: 'ADMIN ALERT', color: '#ff4444', glow: 'rgba(255, 68, 68, 0.5)' };
+		if (isGlobal && msg && typeof msg === 'object') {
+			msg.isGlobalPing = true;
+			msg.globalPingRole = globalPingVisual.role;
+		}
 	
 		const firstLink = cleanText.match(/(https?:\/\/[^\s]+)/);
 		messageText = messageText.replace(/(https?:\/\/[^\s]+)/g, url => 
@@ -24097,8 +24263,8 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 			}
 		});
 	
-		if (msg.isGlobalPing) {
-			messageText = messageText.replace(/@everyone\b(?![^<]*>)/g, `<span class="chat-mention" style="background: #ff4444; color: #fff; padding: 2px 4px; border-radius: 4px; font-weight: bold; font-size: 10px;">@everyone</span>`);
+		if (isGlobal) {
+			messageText = formatEveryoneMentionForDisplay(messageText, globalPingVisual.role);
 		}
 		
 		messageText = messageText
@@ -24146,11 +24312,6 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 			messageText = ""; 
 		}
 	
-		const isGlobal = msg.isGlobalPing === true;
-		const senderRoleSource = Object.assign({}, (typeof msg === 'object' ? msg : {}), window.findPsnUserByName ? (window.findPsnUserByName(userName) || {}) : {});
-		const senderRole = typeof window.getPsnUserRole === 'function' ? window.getPsnUserRole(userName, senderRoleSource) : (msg.isAdmin ? 'admin' : 'user');
-		const senderIsAdmin = msg.isAdmin === true || senderRole === 'admin';
-		const senderIsBanned = typeof window.isPsnUserBanned === 'function' ? window.isPsnUserBanned(userName, senderRoleSource) : (senderRoleSource.isBanned === true || senderRoleSource.banned === true);
 		const canModerateMsg = !isAuthor && (typeof window.canModerateChat === 'function' ? window.canModerateChat(userName, senderRoleSource) : isAdmin);
 		const canEditOrDeleteMsg = isAuthor || canModerateMsg;
 		const canPinThisMsg = typeof window.canModerateChat === 'function' ? window.canModerateChat(userName, senderRoleSource) : isAdmin;
@@ -24167,13 +24328,13 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 	
 		let bgColor = isAuthor ? 'rgba(0, 112, 204, 0.45)' : (isPersonalMention ? 'rgba(255, 204, 0, 0.15)' : 'rgba(255, 255, 255, 0.07)');
 		let borderColor = isAuthor ? 'var(--ps-blue)' : (isPersonalMention ? '#ffcc00' : (senderIsBanned ? 'rgba(255, 68, 68, 0.45)' : 'rgba(255, 255, 255, 0.15)'));
-		let glowStyle = (isGlobal || isPersonalMention) ? `box-shadow: 0 0 10px ${isGlobal ? 'rgba(255, 68, 68, 0.5)' : 'rgba(255, 204, 0, 0.4)'};` : (senderIsBanned ? 'box-shadow: 0 0 10px rgba(255, 68, 68, 0.18);' : '');
+		let glowStyle = (isGlobal || isPersonalMention) ? `box-shadow: 0 0 10px ${isGlobal ? globalPingVisual.glow : 'rgba(255, 204, 0, 0.4)'};` : (senderIsBanned ? 'box-shadow: 0 0 10px rgba(255, 68, 68, 0.18);' : '');
 		
 		let mentionTagHtml = '';
 		let adminTagHtml = '';
 
 		if (isGlobal) {
-			mentionTagHtml = `<span style="color:#ff4444; font-size:9px; margin-left:5px; font-weight:bold; font-style: italic; text-shadow: 0 0 5px rgba(255, 68, 68, 0.4);">(Admin Alert)</span>`;
+			mentionTagHtml = `<span style="color:${globalPingVisual.color}; font-size:9px; margin-left:5px; font-weight:bold; font-style: italic; text-shadow: 0 0 5px ${globalPingVisual.glow};">(${globalPingVisual.label})</span>`;
 		} else if (senderIsAdmin && isPersonalMention) {
 			mentionTagHtml = `<span style="color:#ff4444; font-size:9px; margin-left:5px; margin-top:1px; font-weight:bold; font-style: italic; text-shadow: 0 0 5px rgba(255, 68, 68, 0.4);">(Admin Mentioned You)</span>`;
 		} else {
@@ -24439,7 +24600,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 		}
 	}
 
-    function showChatNotification(userName, isMention, isGlobalPing) {
+    function showChatNotification(userName, isMention, isGlobalPing, globalPingRole = '') {
         const systemSound = document.getElementById('sound-ui-message');
         if (systemSound) systemSound.play().catch(() => {});
     
@@ -24454,8 +24615,9 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
         let bodyText = `<b>${userName}</b> replied to you`;
     
         if (isGlobalPing) {
-            highlightColor = '#ff4444';
-            titleText = 'ADMIN ALERT';
+            const visual = typeof getChatGlobalPingVisual === 'function' ? getChatGlobalPingVisual(globalPingRole || (typeof getChatGlobalPingRole === 'function' ? getChatGlobalPingRole({ user: userName, isGlobalPing: true }, userName) : 'admin')) : { title: 'ADMIN ALERT', color: '#ff4444' };
+            highlightColor = visual.color;
+            titleText = visual.title;
             bodyText = `<b>${userName}</b> notified everyone`;
         } else if (isMention) {
             highlightColor = '#ffcc00';
@@ -25392,7 +25554,12 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 	
 		socketChat.on('chat_history', function(history) {
 			const seenMessages = new Set();
-			const normalizedHistory = (Array.isArray(history) ? history : []).filter(msg => {
+			const normalizedHistory = (Array.isArray(history) ? history : []).map(msg => {
+				if (msg && typeof msg === 'object' && typeof isChatGlobalPingMessage === 'function' && isChatGlobalPingMessage(msg, msg.user)) {
+					return Object.assign({}, msg, { isGlobalPing: true });
+				}
+				return msg;
+			}).filter(msg => {
 				const key = String(new Date(msg && msg.time).getTime() || msg?.time || Math.random());
 				if (seenMessages.has(key)) return false;
 				seenMessages.add(key);
@@ -25496,7 +25663,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 			if (!chatVisible && data.user !== myName) {
 				const isMention = data.text && data.text.includes(`@${myName}`);
 				const isReply = data.replyTo && data.replyTo.user === myName;
-				if (isMention || isReply || data.isGlobalPing) showChatNotification(data.user, isMention, data.isGlobalPing);
+				if (isMention || isReply || data.isGlobalPing) showChatNotification(data.user, isMention, data.isGlobalPing, data.globalPingRole);
 			}
 			
 			const searchInput = document.getElementById('search-input');
@@ -25604,17 +25771,57 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 				return;
 			}
 
+			let editedHistoryMsg = null;
+			let wasGlobalBeforeEdit = false;
+			let globalRoleBeforeEdit = '';
+			let isGlobalAfterEdit = data.isGlobalPing === true;
+			let globalRoleAfterEdit = String(data.globalPingRole || data.globalAlertRole || '').toLowerCase();
+			if (globalRoleAfterEdit === 'moderator') globalRoleAfterEdit = 'mod';
+
 			if (window.messageHistory) {
 				const msg = window.messageHistory.find(m => String(new Date(m.time).getTime()) === String(data.msgId));
 				if (msg) {
+					wasGlobalBeforeEdit = typeof isChatGlobalPingMessage === 'function' ? isChatGlobalPingMessage(msg, msg.user) : msg.isGlobalPing === true;
+					globalRoleBeforeEdit = wasGlobalBeforeEdit && typeof getChatGlobalPingRole === 'function' ? getChatGlobalPingRole(msg, msg.user) : '';
 					msg.text = data.newText;
 					msg.edited = true;
 					msg.editedByAdmin = data.editedByAdmin;
+					msg.editedByMod = data.editedByMod;
 					if (data.content) {
 						msg.type = data.type || 'image';
 						msg.content = data.content;
 					}
+					isGlobalAfterEdit = data.isGlobalPing === true || (typeof isChatGlobalPingMessage === 'function' && isChatGlobalPingMessage(msg, msg.user));
+					if (isGlobalAfterEdit) {
+						globalRoleAfterEdit = globalRoleAfterEdit || (typeof getChatGlobalPingRole === 'function' ? getChatGlobalPingRole(msg, msg.user) : 'admin') || 'admin';
+						msg.isGlobalPing = true;
+						msg.globalPingRole = globalRoleAfterEdit;
+					} else {
+						msg.isGlobalPing = false;
+						delete msg.globalPingRole;
+					}
+					editedHistoryMsg = msg;
 				}
+			}
+
+			if (wasGlobalBeforeEdit !== isGlobalAfterEdit || (isGlobalAfterEdit && globalRoleBeforeEdit && globalRoleBeforeEdit !== globalRoleAfterEdit)) {
+				if (!wasGlobalBeforeEdit && isGlobalAfterEdit && editedHistoryMsg) {
+					const myNameForEditPing = localStorage.getItem('psn_username') || 'Guest';
+					const chatVisibleForEditPing = typeof isChatScreenVisibleForRead === 'function' ? isChatScreenVisibleForRead() : (document.getElementById('view-chat')?.style.display === 'flex' || document.getElementById('view-chat')?.style.display === 'block');
+					if (editedHistoryMsg.user !== myNameForEditPing) {
+						if (typeof playMessageSound === 'function') playMessageSound();
+						if (!chatVisibleForEditPing && typeof showChatNotification === 'function') {
+							showChatNotification(editedHistoryMsg.user, false, true, globalRoleAfterEdit);
+						}
+					}
+				}
+				if (typeof scheduleChatHistorySoftRerender === 'function') {
+					scheduleChatHistorySoftRerender('message_edited_global_ping', false);
+				}
+				updateChatHistoryRenderSignature();
+				if (typeof refreshChatNotificationDot === 'function') refreshChatNotificationDot();
+				if (typeof refreshMentionJumpButton === 'function') refreshMentionJumpButton();
+				return;
 			}
 			
 			const textContainer = document.getElementById(`msg-text-${data.msgId}`);
@@ -25672,7 +25879,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 					.replace(/(?<!\w)_(.*?)_(?!\w)/g, '<i>$1</i>')
 					.replace(/~~(.*?)~~/g, '<s>$1</s>');
 		
-				formatted = formatted.replace(/@everyone\b(?![^<]*>)/g, `<span class="chat-mention" style="background: #ff4444; color: #fff; padding: 2px 4px; border-radius: 4px; font-weight: bold; font-size: 10px;">@everyone</span>`);
+				if (isGlobalAfterEdit) formatted = formatEveryoneMentionForDisplay(formatted, globalRoleAfterEdit);
 				formatted = formatted.replace(/(https?:\/\/[^\s]+)/g, url => 
 					`<a href="${url}" target="_blank" style="color: #ffffff; text-decoration: underline; word-break: break-all;">${url}</a>`
 				);
@@ -26614,9 +26821,14 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 		}
 
 		let globalPingActive = false;
+		let globalPingRole = '';
 		if (plainText.includes('@everyone')) {
-			if (isAdmin) globalPingActive = true;
-			else msg = msg.replace(/@everyone/g, "everyone");
+			if (canModerate) {
+				globalPingActive = true;
+				globalPingRole = isAdmin ? 'admin' : 'mod';
+			} else {
+				msg = msg.replace(/@everyone/g, "everyone");
+			}
 		}
 		
 		if (editingMsgId) {
@@ -26626,7 +26838,9 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 				user: myName,
 				type: pendingImages.length > 0 ? 'image' : 'text',
 				content: pendingImages.length > 0 ? pendingImages : null,
-				isGlobalPing: globalPingActive
+				isGlobalPing: globalPingActive,
+				globalPingRole: globalPingActive ? globalPingRole : '',
+				notifyGlobalPingOnEdit: globalPingActive
 			});
 			cancelEditMessage();
 			pendingImages = [];
@@ -26642,7 +26856,8 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 			replyTo: currentReply, 
 			type: pendingImages.length > 0 ? 'image' : 'text',
 			content: pendingImages.length > 0 ? pendingImages : null, 
-			isGlobalPing: globalPingActive
+			isGlobalPing: globalPingActive,
+			globalPingRole: globalPingActive ? globalPingRole : ''
 		};
 		
 		socketChat.emit('chat_message', data);
@@ -26967,8 +27182,17 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 		}
 		
 		if (chatInput) {
-			chatInput.addEventListener('keyup', updateToolbarStates);
-			chatInput.addEventListener('mouseup', updateToolbarStates);
+			const saveChatRangeAndToolbarState = () => {
+				if (typeof saveChatInputRange === 'function') saveChatInputRange();
+				updateToolbarStates();
+			};
+			chatInput.addEventListener('keyup', saveChatRangeAndToolbarState);
+			chatInput.addEventListener('mouseup', saveChatRangeAndToolbarState);
+			chatInput.addEventListener('click', saveChatRangeAndToolbarState);
+			document.addEventListener('selectionchange', () => {
+				const selection = window.getSelection();
+				if (selection && selection.rangeCount && isChatRangeInsideInput(selection.getRangeAt(0), chatInput)) saveChatInputRange();
+			});
 		
 			chatInput.addEventListener('input', (e) => {
 				if (chatInput.innerHTML === '<br>' || chatInput.innerHTML === '<div><br></div>') {
