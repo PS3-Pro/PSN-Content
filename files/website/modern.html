@@ -7454,6 +7454,7 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 
 		const missingRapToggle = document.getElementById('show-missing-rap-toggle');
 		if (missingRapToggle) missingRapToggle.checked = false;
+		window.__browseAutoRestoredMissingRapToggle = false;
     };
 
 	window.switchAndSearch = function(category, titleId, fromWhere = false, focusContentId = '') {
@@ -8872,20 +8873,21 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 		if (label) label.title = '';
 	}
 
-	function updateMissingRapFilterVisibility(availableCount, hiddenCount, showMissingRap, categoryOverride = null) {
+	function updateMissingRapFilterVisibility(availableCount, hiddenCount, showMissingRap, categoryOverride = null, searchIncludesMissingRap = false) {
 		const wrap = document.getElementById('missing-rap-filter');
 		const toggle = document.getElementById('show-missing-rap-toggle');
 		if (!wrap) return;
 
 		const hasMissingLicenses = Number(availableCount || 0) > 0;
-		const needsSeparator = hasMissingLicenses && hasVisibleBrowseFilterGroupBeforeLicense(categoryOverride);
+		const bypassedBySearch = !!searchIncludesMissingRap;
+		const needsSeparator = hasMissingLicenses && !bypassedBySearch && hasVisibleBrowseFilterGroupBeforeLicense(categoryOverride);
 
 		wrap.classList.remove('has-filter-separator');
 
-		if (!hasMissingLicenses) {
+		if (!hasMissingLicenses || bypassedBySearch) {
 			wrap.classList.add('is-hidden');
 			wrap.setAttribute('aria-hidden', 'true');
-			if (toggle && toggle.checked) toggle.checked = false;
+			if (!bypassedBySearch && toggle && toggle.checked) toggle.checked = false;
 		} else {
 			wrap.classList.remove('is-hidden');
 			if (needsSeparator) wrap.classList.add('has-filter-separator');
@@ -8901,7 +8903,7 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 		if (icon) icon.className = 'fas fa-key';
 		if (label) {
 			label.title = hasMissingLicenses
-				? (showMissingRap ? `Hide ${count} item${count === 1 ? '' : 's'} missing license files.` : `Show ${count} item${count === 1 ? '' : 's'} missing license files.`)
+				? (bypassedBySearch ? `Search includes ${count} item${count === 1 ? '' : 's'} missing license files automatically.` : (showMissingRap ? `Hide ${count} item${count === 1 ? '' : 's'} missing license files.` : `Show ${count} item${count === 1 ? '' : 's'} missing license files.`))
 				: '';
 		}
 	}
@@ -8914,17 +8916,61 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 		return compact ? `(${visible} items • ${hidden} hidden)` : `(${visible} items • ${hidden} missing license${hidden === 1 ? '' : 's'} hidden)`;
 	}
 
+	window.dismissBrowseNavigation = function(event) {
+		if (event) {
+			event.preventDefault();
+			event.stopPropagation();
+		}
+		if (typeof playUiClick === 'function') playUiClick();
+
+		navHistory = null;
+
+		const backBar = document.querySelector('.browse-nav-return-bar');
+		if (backBar) backBar.remove();
+
+		const searchInput = document.getElementById('search-input');
+		const missingRapToggle = document.getElementById('show-missing-rap-toggle');
+		const currentCatEl = document.getElementById('cat-select');
+		const hasSearch = !!(searchInput && searchInput.value.trim());
+		const hasMissingLicenses = Number(window.__browseAvailableMissingRapCount || 0) > 0;
+
+		if (hasSearch && hasMissingLicenses && missingRapToggle) {
+			missingRapToggle.checked = true;
+			window.__browseAutoRestoredMissingRapToggle = true;
+		}
+
+		if (typeof updateMissingRapFilterVisibility === 'function') {
+			updateMissingRapFilterVisibility(
+				window.__browseAvailableMissingRapCount || 0,
+				window.__browseHiddenMissingRapCount || 0,
+				!!(missingRapToggle && missingRapToggle.checked),
+				currentCatEl ? currentCatEl.value : null,
+				false
+			);
+		}
+	};
+
     function applyFilters() {
 		window.g_animCutoffFound = false;
 
-		const term = document.getElementById('search-input').value.toLowerCase().trim();
+		const searchInputEl = document.getElementById('search-input');
+		const term = searchInputEl ? searchInputEl.value.toLowerCase().trim() : '';
 		const termNormalized = term.replace(/[^a-z0-9]/g, '').replace(/(.)\1+/g, '$1'); 
 
 		const regionFilter = document.getElementById('region-select').value;
 		const activeConsolesNodes = document.querySelectorAll('#console-filters input:checked');
 		const activeConsoles = activeConsolesNodes ? Array.from(activeConsolesNodes).map(cb => cb.value) : [];
 		const currentCat = document.getElementById('cat-select').value;
-		const showMissingRap = document.getElementById('show-missing-rap-toggle') ? document.getElementById('show-missing-rap-toggle').checked : false;
+		const missingRapToggleEl = document.getElementById('show-missing-rap-toggle');
+		if (!term && window.__browseAutoRestoredMissingRapToggle && missingRapToggleEl) {
+			missingRapToggleEl.checked = false;
+			window.__browseAutoRestoredMissingRapToggle = false;
+		}
+		const showMissingRap = missingRapToggleEl ? missingRapToggleEl.checked : false;
+		const searchHasText = !!term;
+		const searchIncludesMissingRap = searchHasText && !showMissingRap;
+		const effectiveShowMissingRap = showMissingRap || searchHasText;
+		window.__browseSearchIncludesMissingRap = searchIncludesMissingRap;
 		window.__browseHiddenMissingRapCount = 0;
 		window.__browseAvailableMissingRapCount = 0;
 		const isGamesCat = currentCat === 'games';
@@ -8960,7 +9006,7 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 			const missingRap = isMissingRapItem(game);
 			if (missingRap) {
 				window.__browseAvailableMissingRapCount++;
-				if (!showMissingRap) {
+				if (!effectiveShowMissingRap) {
 					window.__browseHiddenMissingRapCount++;
 					return false;
 				}
@@ -8970,7 +9016,7 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 		});
 
 		if (typeof updateMissingRapFilterVisibility === 'function') {
-			updateMissingRapFilterVisibility(window.__browseAvailableMissingRapCount, window.__browseHiddenMissingRapCount, showMissingRap, currentCat);
+			updateMissingRapFilterVisibility(window.__browseAvailableMissingRapCount, window.__browseHiddenMissingRapCount, effectiveShowMissingRap, currentCat, searchIncludesMissingRap);
 		}
 
 		if (term && filteredData.length > 0) {
@@ -9106,11 +9152,11 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 				}
 				
 				backButtonHtml = `
-					<div style="grid-column: 1/-1; margin-bottom: 15px; display: flex; align-items: center; justify-content: space-between; background: rgba(255,255,255,0.03); border-radius: 8px; padding: 6px 12px 6px 0px;">
-						<button class="back-btn" onmouseenter="playUiHover()" onclick="restorePreviousState()" style="margin: 0;">
+					<div class="browse-nav-return-bar" style="grid-column: 1/-1; margin-bottom: 15px; display: flex; align-items: center; justify-content: space-between; background: rgba(255,255,255,0.03); border-radius: 8px; padding: 6px 12px 6px 0px;">
+						<button type="button" class="back-btn" onmouseenter="playUiHover()" onclick="restorePreviousState()" style="margin: 0;">
 							<i class="fas fa-arrow-left"></i> Go back to ${prevLabel}
 						</button>
-						<button title="Dismiss navigation" onmouseenter="playUiHover()" onclick="playUiClick(); navHistory = null; renderGrid();" style="background: transparent; border: none; color: rgba(255,255,255,0.4); cursor: pointer; font-size: 18px; padding: 5px 10px; transition: all 0.2s ease;" onmouseover="this.style.color='#ff4444'; this.style.transform='scale(1.1)';" onmouseout="this.style.color='rgba(255,255,255,0.4)'; this.style.transform='scale(1)';">
+						<button type="button" title="Dismiss navigation" onmouseenter="playUiHover()" onclick="dismissBrowseNavigation(event); return false;" style="background: transparent; border: none; color: rgba(255,255,255,0.4); cursor: pointer; font-size: 18px; padding: 5px 10px; transition: all 0.2s ease;" onmouseover="this.style.color='#ff4444'; this.style.transform='scale(1.1)';" onmouseout="this.style.color='rgba(255,255,255,0.4)'; this.style.transform='scale(1)';">
 							<i class="fas fa-times"></i>
 						</button>
 					</div>`;
@@ -9372,6 +9418,7 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
         document.getElementById('region-select').value = "ALL";
 		const missingRapToggle = document.getElementById('show-missing-rap-toggle');
 		if (missingRapToggle) missingRapToggle.checked = false;
+		window.__browseAutoRestoredMissingRapToggle = false;
 		if (typeof primeMissingRapFilterShell === 'function') primeMissingRapFilterShell(cat, true);
         activeLetter = "ALL";
         renderLetterFilter();
