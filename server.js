@@ -2,7 +2,7 @@ const express = require('express');
 const http = require('http');
 const https = require('https');
 const { Server } = require("socket.io");
-const { Pool } = require('pg');
+const { Pool, Client } = require('pg');
 const bcrypt = require('bcrypt');
 
 const app = express();
@@ -37,10 +37,13 @@ const ADMIN_STATE_KEYS = {
   pinnedAnnouncement: "pinned_announcement"
 };
 
-const pool = new Pool({
+const pgConnectionOptions = {
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false }
-});
+};
+
+const pool = new Pool(pgConnectionOptions);
+let profileSyncNotifyClient = null;
 
 app.get('/ping', (req, res) => {
   res.send('Server is Awake!');
@@ -184,7 +187,10 @@ async function initDb() {
   console.log(`[DB] Database initialized. ${messageHistory.length} messages, ${pinnedMessages.length} pins, ${Object.keys(userDatabase).length} users loaded.`);
 }
 
-initDb().catch(console.error);
+initDb()
+  .then(() => initProfileSyncNotifications())
+  .catch(console.error);
+
 
 setInterval(() => {
   APP_URLS.forEach(url => {
@@ -686,6 +692,7 @@ function buildFullProfileSyncPayload(name, user = {}, sourceSocketId = null) {
       isModerator: isUserModerator(name, safe),
       banned: isUserBanned(safe),
       lastSeen: safe.lastSeen || null,
+      profileUpdatedAt: safe.profileUpdatedAt || 0,
       ps3Status: safe.ps3Status || null,
       level: safe.level || 1,
       xp: safe.xp || 0,
@@ -739,6 +746,82 @@ async function syncActiveProfilesAcrossInstances() {
 
     emitProfileSync(name, null);
   });
+}
+
+
+async function notifyProfileSyncAcrossInstances(name, sourceSocketId = null, profileUpdatedAt = Date.now()) {
+  if (!name) return;
+  const payload = {
+    name,
+    sourceSocketId,
+    profileUpdatedAt,
+    instanceId: INSTANCE_ID
+  };
+
+  try {
+    await pool.query('SELECT pg_notify($1, $2)', ['profile_sync', JSON.stringify(payload)]);
+  } catch (err) {
+    console.error('[PROFILE NOTIFY ERROR]:', err);
+  }
+}
+
+async function initProfileSyncNotifications() {
+  if (profileSyncNotifyClient) return;
+
+  const client = new Client(pgConnectionOptions);
+  profileSyncNotifyClient = client;
+
+  client.on('notification', async (message) => {
+    if (!message || message.channel !== 'profile_sync') return;
+
+    try {
+      const data = JSON.parse(message.payload || '{}');
+      const name = normalizeText(data.name, '');
+      if (!name || data.instanceId === INSTANCE_ID) return;
+
+      const hasLocalSession = Array.from(io.sockets.sockets.values()).some(activeSocket => (
+        activeSocket.connected && activeSocket.userName === name
+      ));
+      if (!hasLocalSession) return;
+
+      const dbRes = await pool.query('SELECT data FROM users WHERE name = $1', [name]);
+      if (!dbRes.rows.length) return;
+
+      const dbUser = normalizeUserRecord(name, dbRes.rows[0].data || {});
+      const localUser = userDatabase[name] || {};
+      const dbVersion = Number(dbUser.profileUpdatedAt || data.profileUpdatedAt || 0);
+      const localVersion = Number(localUser.profileUpdatedAt || 0);
+      if (dbVersion && localVersion && dbVersion <= localVersion) return;
+
+      userDatabase[name] = {
+        ...dbUser,
+        online: localUser.online === true,
+        id: localUser.id || dbUser.id,
+        lastSeen: localUser.lastSeen || dbUser.lastSeen || Date.now()
+      };
+
+      emitProfileSync(name, data.sourceSocketId || null);
+      await emitOnlineList();
+    } catch (err) {
+      console.error('[PROFILE LISTEN ERROR]:', err);
+    }
+  });
+
+  client.on('error', (err) => {
+    console.error('[PROFILE LISTEN CONNECTION ERROR]:', err);
+    profileSyncNotifyClient = null;
+    setTimeout(() => initProfileSyncNotifications().catch(e => console.error('[PROFILE LISTEN RECONNECT ERROR]:', e)), 5000);
+  });
+
+  try {
+    await client.connect();
+    await client.query('LISTEN profile_sync');
+    console.log('[PROFILE SYNC] Postgres LISTEN enabled.');
+  } catch (err) {
+    profileSyncNotifyClient = null;
+    console.error('[PROFILE LISTEN INIT ERROR]:', err);
+    setTimeout(() => initProfileSyncNotifications().catch(e => console.error('[PROFILE LISTEN RECONNECT ERROR]:', e)), 5000);
+  }
 }
 
 function disconnectUserSessions(name, eventName = 'user_kicked', payload = {}) {
@@ -1239,6 +1322,7 @@ io.on('connection', async (socket) => {
 
         await emitOnlineList();
         emitProfileSync(name, socket.id);
+        await notifyProfileSyncAcrossInstances(name, socket.id, userDatabase[name].profileUpdatedAt);
 
         if (userData.trophiesData) {
             io.emit('global_trophy_stats', calculateGlobalTrophyStats());

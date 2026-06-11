@@ -24522,6 +24522,141 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 	};
 
 
+
+	window.getProfileSyncWishlistKey = function(item = {}) {
+		if (typeof window.getWishlistDotKey === 'function') return window.getWishlistDotKey(item);
+		return String(item.contentId || item.id || item.titleId || '').trim();
+	};
+
+	window.getProfileSyncFavoriteKey = function(item = {}) {
+		if (typeof window.getFavoriteDotKey === 'function') return window.getFavoriteDotKey(item);
+		return String(item.path || item.title || item.id || item.titleId || '').trim();
+	};
+
+	window.makeProfileSyncKeySet = function(list = [], type = 'wishlist', expanded = false) {
+		const keys = new Set();
+		(Array.isArray(list) ? list : []).forEach(item => {
+			if (!item || typeof item !== 'object') return;
+			const primary = type === 'favorites' ? window.getProfileSyncFavoriteKey(item) : window.getProfileSyncWishlistKey(item);
+			if (primary) keys.add(String(primary));
+			if (expanded) {
+				['contentId', 'id', 'titleId', 'path', 'title', 'cleanName', 'name'].forEach(field => {
+					if (item[field]) keys.add(String(item[field]).trim());
+				});
+			}
+		});
+		return keys;
+	};
+
+	window.diffProfileSyncKeys = function(newKeys, oldKeys) {
+		const added = [];
+		newKeys.forEach(key => { if (key && !oldKeys.has(key)) added.push(key); });
+		return added;
+	};
+
+	window.applyProfileSyncNotificationDots = function(previousState = {}, userData = {}) {
+		try {
+			if (Array.isArray(userData.wishlistData)) {
+				const oldKeys = window.makeProfileSyncKeySet(previousState.wishlist || [], 'wishlist', false);
+				const newKeys = window.makeProfileSyncKeySet(window.wishlist || [], 'wishlist', false);
+				const addedKeys = window.diffProfileSyncKeys(newKeys, oldKeys);
+				const isWishlistView = document.getElementById('view-wishlist')?.style.display === 'block';
+				if (!isWishlistView && typeof window.addCategoryDotPending === 'function') {
+					addedKeys.forEach(key => window.addCategoryDotPending('wishlist', key));
+				}
+				if (typeof window.refreshCategoryDot === 'function') window.refreshCategoryDot('wishlist');
+			}
+
+			if (Array.isArray(userData.favoritesData)) {
+				const oldKeys = window.makeProfileSyncKeySet(previousState.favorites || [], 'favorites', false);
+				const newKeys = window.makeProfileSyncKeySet(window.favoritesLibrary || [], 'favorites', false);
+				const addedKeys = window.diffProfileSyncKeys(newKeys, oldKeys);
+				const isFavView = document.getElementById('subview-favs')?.style.display === 'block';
+				if (!isFavView && typeof window.addCategoryDotPending === 'function') {
+					addedKeys.forEach(key => window.addCategoryDotPending('favorites', key));
+				}
+				if (typeof window.refreshCategoryDot === 'function') window.refreshCategoryDot('favorites');
+			}
+
+			if (Array.isArray(userData.downloadsData)) {
+				const oldLen = Array.isArray(previousState.downloads) ? previousState.downloads.length : 0;
+				const newLen = Array.isArray(window.downloadHistory) ? window.downloadHistory.length : 0;
+				const isDownloadsView = document.getElementById('view-downloads')?.style.display === 'block';
+				const dot = document.getElementById('dl-dot');
+				if (newLen === 0) {
+					saveState('psn_dl_dot', 'false');
+					if (dot) dot.style.display = 'none';
+				} else if (newLen > oldLen && !isDownloadsView) {
+					saveState('psn_dl_dot', 'true');
+					if (dot) dot.style.display = 'block';
+				}
+			}
+
+			if (userData.trophiesData && typeof userData.trophiesData === 'object' && !Array.isArray(userData.trophiesData)) {
+				const oldTrophies = previousState.trophies || {};
+				const hasNewUnlock = Object.keys(userData.trophiesData).some(id => userData.trophiesData[id]?.unlocked && !oldTrophies[id]?.unlocked);
+				const isTrophyView = document.getElementById('view-trophies')?.style.display === 'block';
+				if (hasNewUnlock && !isTrophyView) {
+					const dot = document.getElementById('trophy-dot');
+					saveState('psn_trophy_dot', 'true');
+					if (dot) { dot.style.display = 'block'; dot.style.background = '#4caf50'; }
+				}
+			}
+		} catch (err) {
+			console.warn('[PROFILE SYNC] Could not update notification dots:', err);
+		}
+	};
+
+	window.refreshVisibleWishlistCardsFromProfileSync = function() {
+		try {
+			const wishlistKeys = window.makeProfileSyncKeySet(window.wishlist || [], 'wishlist', true);
+			document.querySelectorAll('#database-grid .game-card[data-title-id], .horizontal-scroll .game-card[data-title-id]').forEach(card => {
+				const titleId = String(card.getAttribute('data-title-id') || '').trim();
+				const contentId = String(card.getAttribute('data-content-id') || '').trim();
+				const isWished = (!!contentId && wishlistKeys.has(contentId)) || (!!titleId && wishlistKeys.has(titleId));
+				card.classList.toggle('is-wishlisted', isWished);
+				const btn = card.querySelector('.wish-btn');
+				const icon = btn ? btn.querySelector('i') : null;
+				if (btn) btn.title = isWished ? 'Remove from Wishlist' : 'Add to Wishlist';
+				if (icon) {
+					icon.className = isWished ? 'fas fa-heart' : 'far fa-heart';
+					icon.style.color = isWished ? '#ff4444' : 'rgba(255,255,255,0.6)';
+				}
+			});
+		} catch (err) {
+			console.warn('[PROFILE SYNC] Could not refresh visible wishlist cards:', err);
+		}
+	};
+
+	window.refreshVisibleFavoriteCardsFromProfileSync = function() {
+		try {
+			const favoriteKeys = window.makeProfileSyncKeySet(window.favoritesLibrary || [], 'favorites', true);
+			document.querySelectorAll('#ps3-local-grid .game-card').forEach(card => {
+				const img = card.querySelector('img[data-lib-path]');
+				const path = String(img?.getAttribute('data-lib-path') || '').trim();
+				const title = String(img?.getAttribute('data-name') || card.querySelector('.game-title')?.getAttribute('title') || card.querySelector('.game-title')?.textContent || '').trim();
+				const titleId = String(card.querySelector('.game-id')?.textContent || '').trim();
+				const isFav = (!!path && favoriteKeys.has(path)) || (!!title && favoriteKeys.has(title)) || (!!titleId && favoriteKeys.has(titleId));
+				card.classList.toggle('is-favorited', isFav);
+				const btn = card.querySelector('.fav-btn');
+				const icon = btn ? btn.querySelector('i') : null;
+				if (btn) btn.title = isFav ? 'Remove from Favorites' : 'Add to Favorites';
+				if (icon) {
+					icon.className = isFav ? 'fas fa-star' : 'far fa-star';
+					icon.style.color = isFav ? '#ffcc00' : 'rgba(255,255,255,0.6)';
+				}
+			});
+		} catch (err) {
+			console.warn('[PROFILE SYNC] Could not refresh visible favorite cards:', err);
+		}
+	};
+
+	window.refreshProfileSyncVisibleUI = function(userData = {}, previousState = {}) {
+		if (typeof window.refreshVisibleWishlistCardsFromProfileSync === 'function') window.refreshVisibleWishlistCardsFromProfileSync();
+		if (typeof window.refreshVisibleFavoriteCardsFromProfileSync === 'function') window.refreshVisibleFavoriteCardsFromProfileSync();
+		if (typeof window.applyProfileSyncNotificationDots === 'function') window.applyProfileSyncNotificationDots(previousState, userData);
+	};
+
 	window.applyRemoteProfileSync = function(payload = {}) {
 		const name = String(payload.name || payload.targetName || '').trim();
 		const userData = payload.userData || payload.data || {};
@@ -24529,8 +24664,24 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 		if (!name || name !== myName || !userData || typeof userData !== 'object') return;
 		if (!window.isProfileLoaded) return;
 
+		const incomingProfileUpdatedAt = Number(userData.profileUpdatedAt || payload.profileUpdatedAt || 0);
+		const lastAppliedProfileUpdatedAt = Number(window.__lastAppliedProfileUpdatedAt || localStorage.getItem(`${name}_psn_profile_updated_at`) || 0);
+		if (incomingProfileUpdatedAt && lastAppliedProfileUpdatedAt && incomingProfileUpdatedAt <= lastAppliedProfileUpdatedAt) return;
+
+		const previousProfileSyncState = {
+			trophies: (window.userTrophies && typeof window.userTrophies === 'object') ? JSON.parse(JSON.stringify(window.userTrophies)) : {},
+			wishlist: Array.isArray(window.wishlist) ? window.wishlist.slice() : [],
+			downloads: Array.isArray(window.downloadHistory) ? window.downloadHistory.slice() : [],
+			favorites: Array.isArray(window.favoritesLibrary) ? window.favoritesLibrary.slice() : [],
+			library: Array.isArray(window.lastScannedGames || lastScannedGames) ? (window.lastScannedGames || lastScannedGames).slice() : []
+		};
+
 		window.__applyingRemoteProfileSync = true;
 		try {
+			if (incomingProfileUpdatedAt) {
+				window.__lastAppliedProfileUpdatedAt = incomingProfileUpdatedAt;
+				localStorage.setItem(`${name}_psn_profile_updated_at`, String(incomingProfileUpdatedAt));
+			}
 			if (userData.trophiesData && typeof userData.trophiesData === 'object' && !Array.isArray(userData.trophiesData)) { window.userTrophies = userData.trophiesData; localStorage.setItem(`${name}_psn_user_trophies`, JSON.stringify(userData.trophiesData)); }
 			if (Array.isArray(userData.wishlistData)) { window.wishlist = userData.wishlistData; localStorage.setItem(`${name}_psn_wishlist_db`, JSON.stringify(userData.wishlistData)); }
 			if (Array.isArray(userData.downloadsData)) { window.downloadHistory = userData.downloadsData; localStorage.setItem(`${name}_psn_dl_history`, JSON.stringify(userData.downloadsData)); }
@@ -24586,6 +24737,8 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 				if (typeof updateConsoleDashboardUI === 'function') updateConsoleDashboardUI();
 			}
 
+			if (typeof window.refreshProfileSyncVisibleUI === 'function') window.refreshProfileSyncVisibleUI(userData, previousProfileSyncState);
+
 			const incomingRole = String(userData.role || (userData.isAdmin ? 'admin' : '')).toLowerCase();
 			if (incomingRole && incomingRole !== 'user') localStorage.setItem(`${name}_psn_role`, incomingRole === 'moderator' ? 'mod' : incomingRole);
 			else localStorage.removeItem(`${name}_psn_role`);
@@ -24599,6 +24752,12 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 			if (typeof updateFavoritesLibraryUI === 'function') updateFavoritesLibraryUI(true);
 			if (typeof renderFriendsList === 'function') renderFriendsList(document.getElementById('search-input')?.value || '', true);
 			if (typeof updateAdminVisibility === 'function') updateAdminVisibility();
+			if (typeof window.refreshCategoryDot === 'function') {
+				window.refreshCategoryDot('wishlist');
+				window.refreshCategoryDot('favorites');
+			}
+			if (typeof window.refreshVisibleWishlistCardsFromProfileSync === 'function') window.refreshVisibleWishlistCardsFromProfileSync();
+			if (typeof window.refreshVisibleFavoriteCardsFromProfileSync === 'function') window.refreshVisibleFavoriteCardsFromProfileSync();
 		} catch (err) {
 			console.warn('[PROFILE SYNC] Could not apply remote profile data:', err);
 		} finally {
