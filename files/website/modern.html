@@ -1395,6 +1395,9 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 .ps5-auth-input { background: rgba(20, 20, 20, 0.8); border: 2px solid rgba(255, 255, 255, 0.15); border-radius: 8px; color: #ffffff; padding: 15px 20px; font-size: 16px; outline: none; transition: all 0.2s ease; width: 100%; box-sizing: border-box; }
 .ps5-auth-input:focus { border-color: #ffffff; background: rgba(0, 0, 0, 0.9); box-shadow: 0 0 15px rgba(255, 255, 255, 0.1); }
 .ps5-auth-input::placeholder { color: rgba(255, 255, 255, 0.3); }
+.psn-id-rules-hint { margin: 8px 5px 0; font-size: 11px; line-height: 1.35; color: rgba(255,255,255,.42); letter-spacing: .2px; }
+.psn-id-rules-hint strong { color: rgba(255,255,255,.72); font-weight: 700; }
+.ps5-auth-input.psn-id-invalid { border-color: #ff4444 !important; box-shadow: 0 0 14px rgba(255, 68, 68, .22) !important; }
 .ps5-avatar-showcase { display: flex; flex-direction: column; align-items: center; margin-bottom: 25px; width: 100%; }
 .ps5-avatar-selector-row { display: flex; align-items: center; justify-content: center; gap: 25px; }
 .ps5-avatar-selected-preview { width: 110px; height: 110px; border-radius: 50%; border: 3px solid #ffffff; box-shadow: 0 10px 25px rgba(0,0,0,0.5), 0 0 20px rgba(255,255,255,0.2); object-fit: cover; transition: transform 0.3s ease; }
@@ -2796,7 +2799,8 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 				
 				<div class="ps5-form-group">
 					<label class="ps5-form-label">PSN™ ID</label>
-					<input type="text" id="new-psn-id" class="ps5-auth-input" placeholder="Enter your PSN™ ID" maxlength="15">                                    
+					<input type="text" id="new-psn-id" class="ps5-auth-input" placeholder="Enter your PSN™ ID" maxlength="16" autocapitalize="none" autocomplete="off" spellcheck="false" pattern="[A-Za-z][A-Za-z0-9_-]{2,15}" title="3-16 characters. Start with a letter. Use letters, numbers, hyphens, and underscores only.">
+					<div id="psn-id-rules-hint" class="psn-id-rules-hint"><strong>Hint:</strong> 3-16 chars, starts with a letter, A-Z, 0-9, _ or - only.</div>                                    
 				</div>
 		
 				<div class="ps5-form-group">
@@ -5822,6 +5826,53 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 		loadUserGrid();
 	}
 
+
+	function sanitizePsnOnlineIdInput(value) {
+		return String(value || '').replace(/[^A-Za-z0-9_-]/g, '').slice(0, 16);
+	}
+
+	function getPsnOnlineIdValidationError(name, password = '') {
+		name = String(name || '').trim();
+		password = String(password || '').trim();
+		if (!name) return 'Enter your PSN™ ID.';
+		if (name.length < 3 || name.length > 16) return 'Online ID must be 3 to 16 characters.';
+		if (!/^[A-Za-z]/.test(name)) return 'Online ID must start with a letter.';
+		if (!/^[A-Za-z][A-Za-z0-9_-]{2,15}$/.test(name)) return 'Use only letters, numbers, hyphens (-), and underscores (_). No spaces, accents, or symbols.';
+		if (password && name.toLowerCase() === password.toLowerCase()) return 'Online ID cannot be the same as your password.';
+		return '';
+	}
+
+	function setPsnOnlineIdInputState(input, message = '') {
+		if (!input) return;
+		input.classList.toggle('psn-id-invalid', !!message);
+		input.title = message || '3-16 characters. Start with a letter. Use letters, numbers, hyphens, and underscores only.';
+	}
+
+	function wirePsnOnlineIdInput() {
+		const input = document.getElementById('new-psn-id');
+		const passInput = document.getElementById('new-psn-pass');
+		if (!input || input.dataset.psnRulesReady) return;
+		input.addEventListener('input', () => {
+			const before = input.value;
+			const clean = sanitizePsnOnlineIdInput(before);
+			if (before !== clean) input.value = clean;
+			const message = input.value ? getPsnOnlineIdValidationError(input.value, passInput ? passInput.value : '') : '';
+			setPsnOnlineIdInputState(input, message);
+		});
+		input.addEventListener('blur', () => {
+			const message = getPsnOnlineIdValidationError(input.value, passInput ? passInput.value : '');
+			setPsnOnlineIdInputState(input, input.value ? message : '');
+		});
+		if (passInput && !passInput.dataset.psnRulesReady) {
+			passInput.addEventListener('input', () => {
+				if (!input.value) return;
+				setPsnOnlineIdInputState(input, getPsnOnlineIdValidationError(input.value, passInput.value));
+			});
+			passInput.dataset.psnRulesReady = 'true';
+		}
+		input.dataset.psnRulesReady = 'true';
+	}
+
    function promptNewUser() { 
         const maintenanceBypass = document.body.classList.contains('admin-maintenance-login-bypass');
         const allowUrlAdminLogin = maintenanceBypass && typeof adminMaintenanceUrlBypassEnabled === 'function' && adminMaintenanceUrlBypassEnabled() && (!adminGetLocalAdminUsers || adminGetLocalAdminUsers().length === 0);
@@ -5844,9 +5895,11 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
         
         const inputId = document.getElementById('new-psn-id');
         const inputPass = document.getElementById('new-psn-pass');
+        wirePsnOnlineIdInput();
         
         inputId.value = '';
         inputPass.value = '';
+        setPsnOnlineIdInputState(inputId, '');
         inputId.focus(); 
 
         [inputId, inputPass].forEach(input => {
@@ -5887,13 +5940,15 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 		const inputPass = document.getElementById('new-psn-pass');
 		const rememberMe = document.getElementById('remember-me-create').checked;
 		
-		let name = inputId.value.replace(/[^a-zA-Z0-9\s\-_À-ÿ]/g, '').trim();
+		let name = sanitizePsnOnlineIdInput(inputId.value.trim());
 		let pass = inputPass.value.trim();
 		inputId.value = name;
+		const psnIdError = getPsnOnlineIdValidationError(name, pass);
 	
-		if (name.length < 3) {
+		if (psnIdError) {
 			if (typeof playUiError === 'function') playUiError();
-			alert("Online ID is too short. Minimum 3 characters.");
+			setPsnOnlineIdInputState(inputId, psnIdError);
+			alert(psnIdError);
 			inputId.focus();
 			return;
 		}
@@ -5906,9 +5961,10 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 		}
 		
 		let users = getAllUsers();
-		if (users.includes(name)) {
+		if (users.some(user => String(user).toLowerCase() === name.toLowerCase())) {
 			if (typeof playUiError === 'function') playUiError();
 			alert("This Online ID already exists in this device.");
+			inputId.focus();
 			return;
 		}
 	
