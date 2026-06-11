@@ -24545,12 +24545,15 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 			if (typeof updateGlobalOnlineStatus === 'function') updateGlobalOnlineStatus('online');
 		
 			const myName = localStorage.getItem('psn_username');
-			const myPass = localStorage.getItem(`${myName}_psn_password`);
+			const myPass = myName ? localStorage.getItem(`${myName}_psn_password`) : null;
 			
 			const bootContainer = document.getElementById('ps5-boot-container');
 			const isAlreadyBooted = bootContainer && bootContainer.style.display === 'none';
+			const hasUsableSavedPass = myPass && myPass !== "null" && myPass !== "undefined";
 		
-			if (myName && myPass && myName !== "null" && isAlreadyBooted) {
+			if (myName && hasUsableSavedPass && myName !== "null" && myName !== "undefined" && isAlreadyBooted) {
+				window.__psnAutoReauthInProgress = true;
+				window.__psnAutoReauthUser = myName;
 				socketChat.emit('authenticate_user', { 
 					name: myName,
 					password: myPass,
@@ -24607,6 +24610,8 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 		});
 		
 		socketChat.on('auth_success', (data) => {
+			window.__psnAutoReauthInProgress = false;
+			window.__psnAutoReauthUser = null;
 			const { name, userData, isAdmin, role, isModerator } = data;
 			const adminBypassLogin = document.body.classList.contains('admin-maintenance-login-bypass');
 			const earlyRole = String(role || (userData && userData.role) || (isAdmin ? 'admin' : 'user')).toLowerCase() === 'moderator' ? 'mod' : String(role || (userData && userData.role) || (isAdmin ? 'admin' : 'user')).toLowerCase();
@@ -24846,6 +24851,17 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 			const userGrid = document.getElementById('ps5-user-grid');
 			if (userGrid) userGrid.style.pointerEvents = 'auto';
 			const authMessage = String(msg || '');
+			const isAutoReauth = window.__psnAutoReauthInProgress === true;
+			const isTransientAuthError = /(server error|auth failed|database|timeout|temporar|network|failed to fetch)/i.test(authMessage);
+			if (isAutoReauth && isTransientAuthError) {
+				window.__psnAutoReauthInProgress = false;
+				window.__psnAutoReauthUser = null;
+				console.warn('[NETWORK] Silent auto re-auth retry skipped after temporary error:', authMessage);
+				if (typeof updateGlobalOnlineStatus === 'function') updateGlobalOnlineStatus(socketChat && socketChat.connected ? 'online' : 'connecting');
+				return;
+			}
+			window.__psnAutoReauthInProgress = false;
+			window.__psnAutoReauthUser = null;
 			if (/\b(banned|suspended|blocked)\b/i.test(authMessage)) {
 				if (typeof window.psnResetLoginUiState === 'function') window.psnResetLoginUiState(currentLoginUser || localStorage.getItem('psn_username') || '');
 				if (typeof handleCurrentUserBanned === 'function') handleCurrentUserBanned({ targetName: currentLoginUser || localStorage.getItem('psn_username') || '', reason: authMessage });
@@ -24858,7 +24874,12 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 			}
 			
 			if (typeof playUiError === 'function') playUiError();
-			alert(msg);
+			if (isTransientAuthError) {
+				if (typeof showToastNotification === 'function') showToastNotification('Network', 'Temporary login sync failed. Your saved session was kept.');
+				else console.warn('[NETWORK]', authMessage);
+			} else {
+				alert(msg);
+			}
 			
 			const btnCreate = document.getElementById('btn-create-profile');
 			const btnLogin = document.getElementById('btn-login-profile');
@@ -24883,7 +24904,8 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 				setTimeout(() => passInput.style.borderColor = '', 1000);
 			}
 
-			if (currentLoginUser) {
+			const shouldClearSavedPassword = /(incorrect password|access denied|legacy account|already taken)/i.test(authMessage) && !isTransientAuthError;
+			if (currentLoginUser && shouldClearSavedPassword) {
 				localStorage.removeItem(`${currentLoginUser}_psn_password`);
 			}
 
@@ -24917,7 +24939,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 
 			const loginOverlay = document.getElementById('login-input-overlay');
 			const selectScreen = document.getElementById('user-select-screen');
-			if (loginOverlay && loginOverlay.style.display !== 'flex') {
+			if (!isTransientAuthError && loginOverlay && loginOverlay.style.display !== 'flex') {
 				if (selectScreen) selectScreen.style.opacity = '0';
 				loginOverlay.style.display = 'flex';
 				
