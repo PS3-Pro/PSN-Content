@@ -7455,6 +7455,10 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 		const missingRapToggle = document.getElementById('show-missing-rap-toggle');
 		if (missingRapToggle) missingRapToggle.checked = false;
 		window.__browseAutoRestoredMissingRapToggle = false;
+		window.__browseLastMissingRapSearchKey = '';
+		window.__browseHadMissingRapSearch = false;
+		window.__browseMissingRapSearchCandidateCount = 0;
+		window.__browseCanFilterMissingRap = false;
     };
 
 	window.switchAndSearch = function(category, titleId, fromWhere = false, focusContentId = '') {
@@ -8879,15 +8883,18 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 		if (!wrap) return;
 
 		const hasMissingLicenses = Number(availableCount || 0) > 0;
-		const bypassedBySearch = !!searchIncludesMissingRap;
-		const needsSeparator = hasMissingLicenses && !bypassedBySearch && hasVisibleBrowseFilterGroupBeforeLicense(categoryOverride);
+		const searchInput = document.getElementById('search-input');
+		const isSearching = !!(searchInput && searchInput.value.trim());
+		const searchCanUseMissingFilter = !!window.__browseCanFilterMissingRap;
+		const canShowFilter = hasMissingLicenses && (!isSearching || searchCanUseMissingFilter);
+		const needsSeparator = canShowFilter && hasVisibleBrowseFilterGroupBeforeLicense(categoryOverride);
 
 		wrap.classList.remove('has-filter-separator');
 
-		if (!hasMissingLicenses || bypassedBySearch) {
+		if (!canShowFilter) {
 			wrap.classList.add('is-hidden');
 			wrap.setAttribute('aria-hidden', 'true');
-			if (!bypassedBySearch && toggle && toggle.checked) toggle.checked = false;
+			if (toggle && toggle.checked && !searchCanUseMissingFilter) toggle.checked = false;
 		} else {
 			wrap.classList.remove('is-hidden');
 			if (needsSeparator) wrap.classList.add('has-filter-separator');
@@ -8902,8 +8909,8 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 		if (text) text.textContent = 'Missing Licenses';
 		if (icon) icon.className = 'fas fa-key';
 		if (label) {
-			label.title = hasMissingLicenses
-				? (bypassedBySearch ? `Search includes ${count} item${count === 1 ? '' : 's'} missing license files automatically.` : (showMissingRap ? `Hide ${count} item${count === 1 ? '' : 's'} missing license files.` : `Show ${count} item${count === 1 ? '' : 's'} missing license files.`))
+			label.title = canShowFilter
+				? (showMissingRap ? `Hide ${count} item${count === 1 ? '' : 's'} missing license files.` : `Show ${count} item${count === 1 ? '' : 's'} missing license files.`)
 				: '';
 		}
 	}
@@ -8931,13 +8938,7 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 		const searchInput = document.getElementById('search-input');
 		const missingRapToggle = document.getElementById('show-missing-rap-toggle');
 		const currentCatEl = document.getElementById('cat-select');
-		const hasSearch = !!(searchInput && searchInput.value.trim());
 		const hasMissingLicenses = Number(window.__browseAvailableMissingRapCount || 0) > 0;
-
-		if (hasSearch && hasMissingLicenses && missingRapToggle) {
-			missingRapToggle.checked = true;
-			window.__browseAutoRestoredMissingRapToggle = true;
-		}
 
 		if (typeof updateMissingRapFilterVisibility === 'function') {
 			updateMissingRapFilterVisibility(
@@ -8962,17 +8963,8 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 		const activeConsoles = activeConsolesNodes ? Array.from(activeConsolesNodes).map(cb => cb.value) : [];
 		const currentCat = document.getElementById('cat-select').value;
 		const missingRapToggleEl = document.getElementById('show-missing-rap-toggle');
-		if (!term && window.__browseAutoRestoredMissingRapToggle && missingRapToggleEl) {
-			missingRapToggleEl.checked = false;
-			window.__browseAutoRestoredMissingRapToggle = false;
-		}
-		const showMissingRap = missingRapToggleEl ? missingRapToggleEl.checked : false;
 		const searchHasText = !!term;
-		const searchIncludesMissingRap = searchHasText && !showMissingRap;
-		const effectiveShowMissingRap = showMissingRap || searchHasText;
-		window.__browseSearchIncludesMissingRap = searchIncludesMissingRap;
-		window.__browseHiddenMissingRapCount = 0;
-		window.__browseAvailableMissingRapCount = 0;
+		const missingRapSearchKey = searchHasText ? `${currentCat}|${term}` : '';
 		const isGamesCat = currentCat === 'games';
 		const isAppsCat = currentCat === 'apps';
 
@@ -8980,7 +8972,7 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 		const showQore = document.querySelector('#app-filters input[value="qore"]').checked;
 		const showMedia = document.querySelector('#app-filters input[value="media"]').checked;
 
-		filteredData = currentData.filter(game => {
+		const passesBrowseFiltersBeforeMissingRap = (game) => {
 			if (term) {
 				const nameNormalized = game.cleanName.toLowerCase().replace(/[^a-z0-9]/g, '').replace(/(.)\1+/g, '$1');
 				const idMatch = game.id.toLowerCase().includes(term);
@@ -9003,6 +8995,54 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 				if (!showMedia && game.aTag === "media") return false;
 			}
 
+			return true;
+		};
+
+		let searchCandidateCount = 0;
+		let searchCandidateMissingRapCount = 0;
+		if (searchHasText) {
+			currentData.forEach(game => {
+				if (!passesBrowseFiltersBeforeMissingRap(game)) return;
+				searchCandidateCount++;
+				if (isMissingRapItem(game)) searchCandidateMissingRapCount++;
+			});
+		}
+
+		const searchCanUseMissingRapToggle = searchHasText && searchCandidateCount > 1 && searchCandidateMissingRapCount > 0;
+		window.__browseMissingRapSearchCandidateCount = searchCandidateCount;
+		window.__browseCanFilterMissingRap = searchHasText ? searchCanUseMissingRapToggle : true;
+
+		if (missingRapToggleEl) {
+			if (searchHasText) {
+				if (searchCanUseMissingRapToggle) {
+					if (window.__browseLastMissingRapSearchKey !== missingRapSearchKey) {
+						missingRapToggleEl.checked = true;
+						window.__browseLastMissingRapSearchKey = missingRapSearchKey;
+					}
+					window.__browseHadMissingRapSearch = true;
+				} else {
+					missingRapToggleEl.checked = false;
+					window.__browseLastMissingRapSearchKey = missingRapSearchKey;
+					window.__browseHadMissingRapSearch = false;
+				}
+			} else if (window.__browseHadMissingRapSearch || window.__browseAutoRestoredMissingRapToggle || window.__browseLastMissingRapSearchKey) {
+				missingRapToggleEl.checked = false;
+				window.__browseHadMissingRapSearch = false;
+				window.__browseLastMissingRapSearchKey = '';
+				window.__browseAutoRestoredMissingRapToggle = false;
+			}
+		}
+
+		const showMissingRap = missingRapToggleEl ? missingRapToggleEl.checked : false;
+		const searchIncludesMissingRap = false;
+		const effectiveShowMissingRap = showMissingRap;
+		window.__browseSearchIncludesMissingRap = searchIncludesMissingRap;
+		window.__browseHiddenMissingRapCount = 0;
+		window.__browseAvailableMissingRapCount = 0;
+
+		filteredData = currentData.filter(game => {
+			if (!passesBrowseFiltersBeforeMissingRap(game)) return false;
+
 			const missingRap = isMissingRapItem(game);
 			if (missingRap) {
 				window.__browseAvailableMissingRapCount++;
@@ -9015,6 +9055,9 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 			return true;
 		});
 
+		if (!searchHasText) {
+			window.__browseCanFilterMissingRap = window.__browseAvailableMissingRapCount > 0;
+		}
 		if (typeof updateMissingRapFilterVisibility === 'function') {
 			updateMissingRapFilterVisibility(window.__browseAvailableMissingRapCount, window.__browseHiddenMissingRapCount, effectiveShowMissingRap, currentCat, searchIncludesMissingRap);
 		}
@@ -9165,7 +9208,8 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 		
 		if (!isAppending) {
 			const missingRapToggleForCount = document.getElementById('show-missing-rap-toggle');
-			const hiddenMissingRapCount = (!missingRapToggleForCount || !missingRapToggleForCount.checked) && window.__browseHiddenMissingRapCount ? window.__browseHiddenMissingRapCount : 0;
+			const canFilterMissingRapForCount = window.__browseCanFilterMissingRap !== false;
+			const hiddenMissingRapCount = canFilterMissingRapForCount && (!missingRapToggleForCount || !missingRapToggleForCount.checked) && window.__browseHiddenMissingRapCount ? window.__browseHiddenMissingRapCount : 0;
 			document.getElementById('item-count').innerText = formatBrowseItemCount(filteredData.length, hiddenMissingRapCount);
 			
 			if (window.isRestoringHistory) {
@@ -9190,7 +9234,8 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 				const activeConsoles = document.querySelectorAll('#console-filters input:checked').length;
 				const activeApps = document.querySelectorAll('#app-filters input:checked').length;
 				const missingRapToggleForEmpty = document.getElementById('show-missing-rap-toggle');
-				const hiddenMissingRapCount = (!missingRapToggleForEmpty || !missingRapToggleForEmpty.checked) && window.__browseHiddenMissingRapCount ? window.__browseHiddenMissingRapCount : 0;
+				const canFilterMissingRapForEmpty = window.__browseCanFilterMissingRap !== false;
+				const hiddenMissingRapCount = canFilterMissingRapForEmpty && (!missingRapToggleForEmpty || !missingRapToggleForEmpty.checked) && window.__browseHiddenMissingRapCount ? window.__browseHiddenMissingRapCount : 0;
 			
 				if (hiddenMissingRapCount > 0) {
 					emptyTitle = 'Missing Licenses Are Hidden';
@@ -9419,6 +9464,10 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 		const missingRapToggle = document.getElementById('show-missing-rap-toggle');
 		if (missingRapToggle) missingRapToggle.checked = false;
 		window.__browseAutoRestoredMissingRapToggle = false;
+		window.__browseLastMissingRapSearchKey = '';
+		window.__browseHadMissingRapSearch = false;
+		window.__browseMissingRapSearchCandidateCount = 0;
+		window.__browseCanFilterMissingRap = false;
 		if (typeof primeMissingRapFilterShell === 'function') primeMissingRapFilterShell(cat, true);
         activeLetter = "ALL";
         renderLetterFilter();
@@ -9579,6 +9628,13 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 	if (showMissingRapToggle) {
 		showMissingRapToggle.addEventListener('change', () => {
 			if (typeof playUiArrow === 'function') playUiArrow();
+			const searchInputEl = document.getElementById('search-input');
+			const catSelectEl = document.getElementById('cat-select');
+			const term = searchInputEl ? searchInputEl.value.toLowerCase().trim() : '';
+			if (term && catSelectEl) {
+				window.__browseLastMissingRapSearchKey = `${catSelectEl.value}|${term}`;
+				window.__browseHadMissingRapSearch = true;
+			}
 			applyFilters();
 		});
 	}
