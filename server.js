@@ -423,9 +423,54 @@ function preferLocalObjectPayload(currentValue, localValue) {
   return localSize > currentSize ? localValue : currentValue;
 }
 
+function normalizeTimestampValue(value) {
+  const timestamp = Number(value || 0);
+  return Number.isFinite(timestamp) && timestamp > 0 ? timestamp : 0;
+}
+
+function applyDownloadsClearedState(target = {}, clearAt = 0) {
+  const normalizedClearAt = normalizeTimestampValue(clearAt);
+  if (!normalizedClearAt) return target;
+  target.downloadsClearedAt = normalizedClearAt;
+  target.downloadsData = [];
+  target.downloads = 0;
+  return target;
+}
+
+function reconcileIncomingDownloads(currentUser = {}, incomingUser = {}) {
+  const currentClearAt = normalizeTimestampValue(currentUser.downloadsClearedAt);
+  const incomingClearAt = normalizeTimestampValue(incomingUser.downloadsClearedAt);
+  const hasIncomingDownloadsData = Object.prototype.hasOwnProperty.call(incomingUser, 'downloadsData');
+  const hasIncomingDownloadsCount = Object.prototype.hasOwnProperty.call(incomingUser, 'downloads');
+
+  if (incomingClearAt > currentClearAt) {
+    applyDownloadsClearedState(currentUser, incomingClearAt);
+    incomingUser.downloadsClearedAt = incomingClearAt;
+    incomingUser.downloadsData = [];
+    incomingUser.downloads = 0;
+    return incomingUser;
+  }
+
+  if (currentClearAt > incomingClearAt && (hasIncomingDownloadsData || hasIncomingDownloadsCount)) {
+    delete incomingUser.downloadsData;
+    delete incomingUser.downloads;
+    incomingUser.downloadsClearedAt = currentClearAt;
+    return incomingUser;
+  }
+
+  if (incomingClearAt === currentClearAt && hasIncomingDownloadsData && Array.isArray(incomingUser.downloadsData)) {
+    incomingUser.downloads = incomingUser.downloadsData.length;
+  }
+
+  return incomingUser;
+}
+
 function mergeLocalRecoveryData(dbUser = {}, localData = {}) {
   if (!hasObjectPayload(localData)) return dbUser;
   const merged = { ...dbUser };
+  const dbDownloadsClearedAt = normalizeTimestampValue(merged.downloadsClearedAt);
+  const localDownloadsClearedAt = normalizeTimestampValue(localData.downloadsClearedAt);
+
   if (localData.avatar && isDefaultAvatarValue(merged.avatar) && !isDefaultAvatarValue(localData.avatar)) merged.avatar = localData.avatar;
   if ((!merged.joined || merged.joined === '2026') && localData.joined) merged.joined = localData.joined;
   if ((!merged.themeColor || merged.themeColor === '#0070cc') && localData.themeColor) merged.themeColor = localData.themeColor;
@@ -433,18 +478,34 @@ function mergeLocalRecoveryData(dbUser = {}, localData = {}) {
     const preferred = preferLocalObjectPayload(merged[key], localData[key]);
     if (preferred !== merged[key]) merged[key] = preferred;
   });
-  ['downloadsData', 'wishlistData', 'favoritesData', 'libraryData', 'friendsData'].forEach(key => {
+
+  if (localDownloadsClearedAt > dbDownloadsClearedAt) {
+    applyDownloadsClearedState(merged, localDownloadsClearedAt);
+  } else if (localDownloadsClearedAt === dbDownloadsClearedAt) {
+    const preferredDownloads = preferLocalArrayPayload(merged.downloadsData, localData.downloadsData);
+    if (preferredDownloads !== merged.downloadsData) merged.downloadsData = preferredDownloads;
+  } else if (dbDownloadsClearedAt > localDownloadsClearedAt) {
+    merged.downloadsClearedAt = dbDownloadsClearedAt;
+  }
+
+  ['wishlistData', 'favoritesData', 'libraryData', 'friendsData'].forEach(key => {
     const preferred = preferLocalArrayPayload(merged[key], localData[key]);
     if (preferred !== merged[key]) merged[key] = preferred;
   });
   if (hasObjectPayload(localData.settingsData)) {
     merged.settingsData = { ...(merged.settingsData || {}), ...localData.settingsData };
   }
-  ['downloads', 'wishlist', 'favorites', 'trophies', 'library', 'level', 'xp'].forEach(key => {
+  ['wishlist', 'favorites', 'trophies', 'library', 'level', 'xp'].forEach(key => {
     const current = Number(merged[key] || 0);
     const incoming = Number(localData[key] || 0);
     if (incoming > current) merged[key] = incoming;
   });
+  if (localDownloadsClearedAt === dbDownloadsClearedAt) {
+    const currentDownloads = Number(merged.downloads || 0);
+    const incomingDownloads = Number(localData.downloads || 0);
+    if (incomingDownloads > currentDownloads) merged.downloads = incomingDownloads;
+  }
+  if (Array.isArray(merged.downloadsData)) merged.downloads = merged.downloadsData.length;
   return merged;
 }
 
@@ -703,6 +764,7 @@ function buildFullProfileSyncPayload(name, user = {}, sourceSocketId = null) {
       library: Array.isArray(safe.libraryData) ? safe.libraryData.length : (safe.library || 0),
       trophiesData: safe.trophiesData || {},
       downloadsData: Array.isArray(safe.downloadsData) ? safe.downloadsData : [],
+      downloadsClearedAt: normalizeTimestampValue(safe.downloadsClearedAt),
       wishlistData: Array.isArray(safe.wishlistData) ? safe.wishlistData : [],
       favoritesData: Array.isArray(safe.favoritesData) ? safe.favoritesData : [],
       libraryData: Array.isArray(safe.libraryData) ? safe.libraryData : [],
@@ -1232,7 +1294,8 @@ io.on('connection', async (socket) => {
           trophiesData: safeUserData.trophiesData || {},
           wishlistData: safeUserData.wishlistData || [],
           favoritesData: safeUserData.favoritesData || [],
-          downloadsData: safeUserData.downloadsData || [],
+          downloadsData: normalizeTimestampValue(safeUserData.downloadsClearedAt) ? [] : (safeUserData.downloadsData || []),
+          downloadsClearedAt: normalizeTimestampValue(safeUserData.downloadsClearedAt),
           libraryData: safeUserData.libraryData || [],
           friendsData: safeUserData.friendsData || [],
           countersData: safeUserData.countersData || {},
@@ -1309,8 +1372,12 @@ io.on('connection', async (socket) => {
             socket.emit('auth_error', 'This account is banned.');
             return;
         }
+
+        userData = reconcileIncomingDownloads(userDatabase[name], userData || {});
         
         Object.assign(userDatabase[name], userData);
+        if (Array.isArray(userDatabase[name].downloadsData)) userDatabase[name].downloads = userDatabase[name].downloadsData.length;
+        userDatabase[name].downloadsClearedAt = normalizeTimestampValue(userDatabase[name].downloadsClearedAt);
         userDatabase[name].lastSeen = Date.now();
         userDatabase[name].profileUpdatedAt = Date.now();
         

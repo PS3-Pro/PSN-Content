@@ -5420,6 +5420,7 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
     const STORAGE_KEY_AUDIO = "psn_audio_state";
 	const STORAGE_KEY_UX = "psn_ux_sounds_state";
 	const STORAGE_KEY_CHAT_SOUND = "psn_chat_sound_state";
+	const STORAGE_KEY_DOWNLOAD_CLEAR_PENDING = "psn_dl_history_cleared_at";
 	const STORAGE_KEY_COMPANION_PLUGIN = "psn_companion_plugin_enabled";
 	const STORAGE_KEY_FPS_COUNTER = "psn_fps_counter_enabled";
 	const STORAGE_KEY_FPS_COUNTER_DEFAULT_OFF_MIGRATION = "psn_fps_counter_default_off_v1";
@@ -5703,6 +5704,58 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 		return Array.isArray(parsed) ? parsed : [];
 	}
 
+	function getDownloadHistoryClearPendingAt(username = localStorage.getItem('psn_username')) {
+		if (!username || username === "null") return 0;
+		const activeUser = localStorage.getItem('psn_username');
+		const direct = Number(localStorage.getItem(`${username}_${STORAGE_KEY_DOWNLOAD_CLEAR_PENDING}`) || 0);
+		const active = activeUser === username ? Number(localStorage.getItem(STORAGE_KEY_DOWNLOAD_CLEAR_PENDING) || 0) : 0;
+		return Math.max(direct, active) || 0;
+	}
+
+	function markDownloadHistoryClearPending() {
+		const stamp = String(Date.now());
+		saveState(STORAGE_KEY_DOWNLOAD_CLEAR_PENDING, stamp);
+		return stamp;
+	}
+
+	function clearDownloadHistoryPendingFlag(username = localStorage.getItem('psn_username')) {
+		if (username && username !== "null") localStorage.removeItem(`${username}_${STORAGE_KEY_DOWNLOAD_CLEAR_PENDING}`);
+		const activeUser = localStorage.getItem('psn_username');
+		if (!username || activeUser === username) localStorage.removeItem(STORAGE_KEY_DOWNLOAD_CLEAR_PENDING);
+	}
+
+	function getLocalDownloadHistoryForProfile(username) {
+		const activeUser = localStorage.getItem('psn_username');
+		if (activeUser === username && Array.isArray(window.downloadHistory)) return window.downloadHistory;
+		const parsed = parseLocalJsonForAuth(localStorage.getItem(`${username}_${COOKIE_NAME_HISTORY}`), []);
+		return Array.isArray(parsed) ? parsed : [];
+	}
+
+	function shouldRejectStaleIncomingDownloadHistory(username, userData = {}, payload = {}) {
+		const clearAt = getDownloadHistoryClearPendingAt(username);
+		if (!clearAt || !Array.isArray(userData.downloadsData) || userData.downloadsData.length === 0) return false;
+		const incomingProfileUpdatedAt = Number(userData.profileUpdatedAt || payload.profileUpdatedAt || 0);
+		const incomingDownloadsClearedAt = Number(userData.downloadsClearedAt || payload.downloadsClearedAt || 0);
+		if (incomingDownloadsClearedAt && incomingDownloadsClearedAt >= clearAt) return false;
+		if (incomingProfileUpdatedAt && incomingProfileUpdatedAt > clearAt) return false;
+		return true;
+	}
+
+	function applyIncomingDownloadHistoryForProfile(username, userData = {}, payload = {}) {
+		if (!Array.isArray(userData.downloadsData)) return false;
+		if (shouldRejectStaleIncomingDownloadHistory(username, userData, payload)) {
+			const localDownloads = getLocalDownloadHistoryForProfile(username);
+			if (localStorage.getItem('psn_username') === username) window.downloadHistory = localDownloads;
+			localStorage.setItem(`${username}_${COOKIE_NAME_HISTORY}`, JSON.stringify(localDownloads));
+			return true;
+		}
+		if (localStorage.getItem('psn_username') === username) window.downloadHistory = userData.downloadsData;
+		localStorage.setItem(`${username}_${COOKIE_NAME_HISTORY}`, JSON.stringify(userData.downloadsData));
+		const incomingDownloadsClearedAt = Number(userData.downloadsClearedAt || payload.downloadsClearedAt || 0);
+		if (userData.downloadsData.length === 0 || incomingDownloadsClearedAt >= getDownloadHistoryClearPendingAt(username)) clearDownloadHistoryPendingFlag(username);
+		return true;
+	}
+
 	function readLocalObjectForAuth(username, key, runtimeValue = null) {
 		const activeUser = localStorage.getItem('psn_username');
 		if (activeUser === username && runtimeValue && typeof runtimeValue === 'object' && !Array.isArray(runtimeValue) && Object.keys(runtimeValue).length > 0) return runtimeValue;
@@ -5751,6 +5804,7 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 			library: libraryData.length,
 			trophiesData,
 			downloadsData,
+			downloadsClearedAt: getDownloadHistoryClearPendingAt(username) || 0,
 			wishlistData,
 			favoritesData,
 			libraryData,
@@ -10872,8 +10926,10 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
     
     window.clearDownloadHistory = function() {
         if (confirm("Do you want to clear all history and statistics?")) {
-            downloadHistory = [];
+            window.downloadHistory = [];
             saveState(COOKIE_NAME_HISTORY, JSON.stringify([]));
+            saveState('psn_dl_dot', 'false');
+            markDownloadHistoryClearPending();
             updateDownloadUI();
             if (typeof playUiRemove === "function") playUiRemove();
 			window.broadcastProfileUpdate();
@@ -25254,7 +25310,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 			}
 			if (userData.trophiesData && typeof userData.trophiesData === 'object' && !Array.isArray(userData.trophiesData)) { window.userTrophies = userData.trophiesData; localStorage.setItem(`${name}_psn_user_trophies`, JSON.stringify(userData.trophiesData)); }
 			if (Array.isArray(userData.wishlistData)) { window.wishlist = userData.wishlistData; localStorage.setItem(`${name}_psn_wishlist_db`, JSON.stringify(userData.wishlistData)); }
-			if (Array.isArray(userData.downloadsData)) { window.downloadHistory = userData.downloadsData; localStorage.setItem(`${name}_psn_dl_history`, JSON.stringify(userData.downloadsData)); }
+			if (Array.isArray(userData.downloadsData)) { applyIncomingDownloadHistoryForProfile(name, userData, payload); }
 			if (Array.isArray(userData.favoritesData)) { window.favoritesLibrary = userData.favoritesData; localStorage.setItem(`${name}_ps3_library_favs`, JSON.stringify(userData.favoritesData)); }
 			if (Array.isArray(userData.libraryData)) { if (typeof lastScannedGames !== 'undefined') { lastScannedGames = userData.libraryData; window.lastScannedGames = lastScannedGames; } localStorage.setItem(`${name}_psn_local_library`, JSON.stringify(userData.libraryData)); }
 			if (Array.isArray(userData.friendsData)) { window.friendsList = userData.friendsData; localStorage.setItem(`${name}_psn_friends_list`, JSON.stringify(userData.friendsData)); }
@@ -25465,8 +25521,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 			}
 
 			if (Array.isArray(userData.downloadsData)) {
-				window.downloadHistory = userData.downloadsData;
-				localStorage.setItem(`${name}_psn_dl_history`, JSON.stringify(userData.downloadsData));
+				applyIncomingDownloadHistoryForProfile(name, userData, data || {});
 			} else {
 				const localDl = localStorage.getItem(`${name}_psn_dl_history`);
 				window.downloadHistory = localDl ? JSON.parse(localDl) : [];
@@ -26681,6 +26736,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 			ps3Status: (typeof _lastConnectionState !== 'undefined' && _lastConnectionState) ? (window.myCurrentPS3Status || { status: 'idle' }) : null,
 			trophiesData: window.userTrophies || {},
 			downloadsData: window.downloadHistory || [],
+			downloadsClearedAt: Number(loadState(STORAGE_KEY_DOWNLOAD_CLEAR_PENDING) || 0) || 0,
 			wishlistData: window.wishlist || [],
 			favoritesData: window.favoritesLibrary || [],
 			libraryData: typeof lastScannedGames !== 'undefined' ? lastScannedGames : [],
