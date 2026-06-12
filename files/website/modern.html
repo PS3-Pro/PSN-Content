@@ -5669,7 +5669,8 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 			consoleFanTarget: loadState(STORAGE_KEY_CONSOLE_FAN_TARGET) || "68",
 			performanceMode: loadState(STORAGE_KEY_PERFORMANCE_MODE) || "balanced",
 			performanceRsx: loadState(STORAGE_KEY_PERFORMANCE_RSX) || "650",
-			performanceVram: loadState(STORAGE_KEY_PERFORMANCE_VRAM) || "850"
+			performanceVram: loadState(STORAGE_KEY_PERFORMANCE_VRAM) || "850",
+			siteDisclaimerSkipToday: (typeof getStoredSiteDisclaimerSkipToday === 'function') ? getStoredSiteDisclaimerSkipToday(localStorage.getItem('psn_username')) : ""
 		};
 	}
 
@@ -5830,7 +5831,8 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 				consoleFanTarget: readLocalUserValueForAuth(username, STORAGE_KEY_CONSOLE_FAN_TARGET, '68') || '68',
 				performanceMode: readLocalUserValueForAuth(username, STORAGE_KEY_PERFORMANCE_MODE, 'balanced') || 'balanced',
 				performanceRsx: readLocalUserValueForAuth(username, STORAGE_KEY_PERFORMANCE_RSX, '650') || '650',
-				performanceVram: readLocalUserValueForAuth(username, STORAGE_KEY_PERFORMANCE_VRAM, '850') || '850'
+				performanceVram: readLocalUserValueForAuth(username, STORAGE_KEY_PERFORMANCE_VRAM, '850') || '850',
+				siteDisclaimerSkipToday: (typeof getStoredSiteDisclaimerSkipToday === 'function') ? getStoredSiteDisclaimerSkipToday(username) : ''
 			},
 			ps3Status: activeUser === username ? (window.myCurrentPS3Status || null) : null
 		};
@@ -6547,6 +6549,42 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 		const day = String(d.getDate()).padStart(2, '0');
 		return `${y}-${m}-${day}`;
 	}
+	function getSiteDisclaimerDailyKey(username) {
+		return SITE_DISCLAIMER_DAILY_PREFIX + String(username || localStorage.getItem('psn_username') || 'guest');
+	}
+	function getStoredSiteDisclaimerSkipToday(username) {
+		try { return localStorage.getItem(getSiteDisclaimerDailyKey(username)) || ''; } catch(e) { return ''; }
+	}
+	function setStoredSiteDisclaimerSkipToday(username, stamp) {
+		const safeName = String(username || localStorage.getItem('psn_username') || 'guest');
+		const safeStamp = String(stamp || getSiteDisclaimerTodayStamp());
+		try { localStorage.setItem(getSiteDisclaimerDailyKey(safeName), safeStamp); } catch(e) {}
+	}
+	function hideSiteDisclaimerModalSilently() {
+		const modal = document.getElementById('site-disclaimer-modal');
+		clearTimeout(window.__siteDisclaimerOpenTimer);
+		clearTimeout(window.__siteDisclaimerTimer);
+		window.__siteDisclaimerOpening = false;
+		if (!modal) return;
+		modal.classList.remove('show', 'is-visible', 'closing');
+		modal.setAttribute('aria-hidden', 'true');
+	}
+	function applySiteDisclaimerSkipTodayFromSettings(username, stamp) {
+		const safeStamp = String(stamp || '').trim();
+		if (!/^\d{4}-\d{2}-\d{2}$/.test(safeStamp)) return false;
+		setStoredSiteDisclaimerSkipToday(username, safeStamp);
+		if (safeStamp === getSiteDisclaimerTodayStamp()) hideSiteDisclaimerModalSilently();
+		return true;
+	}
+	function syncSiteDisclaimerSkipTodayToServer(username, stamp) {
+		try {
+			if (!window.isProfileLoaded || typeof socketChat === 'undefined' || !socketChat || !socketChat.connected) return false;
+			const settingsPayload = (typeof getRuntimePluginSettingsPayload === 'function') ? getRuntimePluginSettingsPayload() : {};
+			settingsPayload.siteDisclaimerSkipToday = String(stamp || getSiteDisclaimerTodayStamp());
+			socketChat.emit('update_profile', { settingsData: settingsPayload });
+			return true;
+		} catch(e) { return false; }
+	}
 	function isSiteDisclaimerOpenOrOpening() {
 		const modal = document.getElementById('site-disclaimer-modal');
 		return !!(modal && (modal.classList.contains('show') || (modal.classList.contains('is-visible') && !modal.classList.contains('closing')) || window.__siteDisclaimerOpening));
@@ -6557,13 +6595,14 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 		if (isSiteDisclaimerOpenOrOpening()) return;
 		const safeName = String(username || localStorage.getItem('psn_username') || 'guest');
 		const sessionKey = SITE_DISCLAIMER_SESSION_PREFIX + safeName;
-		const dailyKey = SITE_DISCLAIMER_DAILY_PREFIX + safeName;
+		const dailyKey = getSiteDisclaimerDailyKey(safeName);
 		const todayStamp = getSiteDisclaimerTodayStamp();
-		try { if (localStorage.getItem(dailyKey) === todayStamp) return; } catch(e) {}
+		if (getStoredSiteDisclaimerSkipToday(safeName) === todayStamp) return;
 		try { if (sessionStorage.getItem(sessionKey) === '1') return; } catch(e) {}
 		window.__pendingSiteDisclaimerKey = sessionKey;
 		window.__pendingSiteDisclaimerDailyKey = dailyKey;
 		window.__pendingSiteDisclaimerDailyStamp = todayStamp;
+		window.__pendingSiteDisclaimerUser = safeName;
 		window.__siteDisclaimerOpening = true;
 		clearTimeout(window.__siteDisclaimerOpenTimer);
 		modal.classList.remove('show', 'closing');
@@ -6602,7 +6641,10 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 		try { if (window.__pendingSiteDisclaimerKey) sessionStorage.setItem(window.__pendingSiteDisclaimerKey, '1'); } catch(e) {}
 		const skipTodayCheckbox = document.getElementById('site-disclaimer-skip-today');
 		if (skipTodayCheckbox && skipTodayCheckbox.checked) {
-			try { localStorage.setItem(window.__pendingSiteDisclaimerDailyKey || (SITE_DISCLAIMER_DAILY_PREFIX + String(localStorage.getItem('psn_username') || 'guest')), window.__pendingSiteDisclaimerDailyStamp || getSiteDisclaimerTodayStamp()); } catch(e) {}
+			const activeName = String(window.__pendingSiteDisclaimerUser || localStorage.getItem('psn_username') || 'guest');
+			const activeStamp = window.__pendingSiteDisclaimerDailyStamp || getSiteDisclaimerTodayStamp();
+			setStoredSiteDisclaimerSkipToday(activeName, activeStamp);
+			syncSiteDisclaimerSkipTodayToServer(activeName, activeStamp);
 		}
 		clearTimeout(window.__siteDisclaimerOpenTimer);
 		clearTimeout(window.__siteDisclaimerTimer);
@@ -6620,6 +6662,8 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 	window.showSiteDisclaimerModal = showSiteDisclaimerModal;
 	window.queueSiteDisclaimerModal = queueSiteDisclaimerModal;
 	window.closeSiteDisclaimerModal = closeSiteDisclaimerModal;
+	window.getStoredSiteDisclaimerSkipToday = getStoredSiteDisclaimerSkipToday;
+	window.applySiteDisclaimerSkipTodayFromSettings = applySiteDisclaimerSkipTodayFromSettings;
 
 	function finishBoot(username) {
 		isLoggingIn = false;
@@ -25347,6 +25391,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 
 			if (userData.settingsData) {
 				const settings = userData.settingsData;
+				if (typeof applySiteDisclaimerSkipTodayFromSettings === 'function') applySiteDisclaimerSkipTodayFromSettings(name, settings.siteDisclaimerSkipToday);
 				localStorage.setItem(`${name}_psn_audio_state`, settings.audio !== undefined ? settings.audio : '1');
 				localStorage.setItem(`${name}_psn_ux_sounds_state`, settings.ux !== undefined ? settings.ux : '1');
 				localStorage.setItem(`${name}_psn_chat_sound_state`, settings.chatSound !== undefined ? settings.chatSound : '1');
@@ -25574,6 +25619,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 			}
 			
 			if (userData.settingsData) {
+				if (typeof applySiteDisclaimerSkipTodayFromSettings === 'function') applySiteDisclaimerSkipTodayFromSettings(name, userData.settingsData.siteDisclaimerSkipToday);
 				localStorage.setItem(`${name}_psn_audio_state`, userData.settingsData.audio);
 				localStorage.setItem(`${name}_psn_ux_sounds_state`, userData.settingsData.ux);
 				localStorage.setItem(`${name}_psn_chat_sound_state`, userData.settingsData.chatSound || "1");
@@ -26755,7 +26801,8 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 				consoleFanTarget: loadState(STORAGE_KEY_CONSOLE_FAN_TARGET) || "68",
 				performanceMode: loadState(STORAGE_KEY_PERFORMANCE_MODE) || "balanced",
 				performanceRsx: loadState(STORAGE_KEY_PERFORMANCE_RSX) || "650",
-				performanceVram: loadState(STORAGE_KEY_PERFORMANCE_VRAM) || "850"
+				performanceVram: loadState(STORAGE_KEY_PERFORMANCE_VRAM) || "850",
+				siteDisclaimerSkipToday: (typeof getStoredSiteDisclaimerSkipToday === 'function') ? getStoredSiteDisclaimerSkipToday(myName) : ""
 			}
 		});
 	};
