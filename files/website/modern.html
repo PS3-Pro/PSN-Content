@@ -1036,6 +1036,11 @@ div[style*="display: flex"] { transition: opacity 0.3s ease, transform 0.3s ease
 #btn-jump-bottom { bottom: 120px !important; position: absolute; right: 33.5px; z-index: 101; transition: transform 0.15s ease-out; }
 #edit-preview, #reply-preview, #pending-image-preview, #typing-indicator-container { position: absolute; left: 0; right: 5px !important; box-sizing: border-box; z-index: 100; width: auto !important; }
 #pending-image-preview { width: fit-content !important; }
+#pending-image-preview .pending-upload-skeleton { width: 65px; height: 65px; border-radius: 6px; border: 1px solid rgba(255,255,255,.12); background: linear-gradient(90deg, rgba(255,255,255,.055), rgba(255,255,255,.16), rgba(255,255,255,.055)); background-size: 220% 100%; animation: chatUploadSkeleton 1s ease-in-out infinite; display: grid; place-items: center; color: rgba(255,255,255,.72); }
+#pending-image-preview .pending-upload-skeleton i { font-size: 15px; filter: drop-shadow(0 0 6px rgba(255,255,255,.22)); }
+#btn-chat-send.chat-upload-waiting { opacity: .55 !important; filter: grayscale(.35); pointer-events: none !important; }
+#chat-input.chat-upload-waiting { border-color: rgba(255,255,255,.28) !important; }
+@keyframes chatUploadSkeleton { 0% { background-position: 120% 0; opacity: .55; } 50% { opacity: 1; } 100% { background-position: -120% 0; opacity: .55; } }
 .tool-btn { background: none; border: none; color: var(--text-muted); cursor: pointer; transition: all 0.2s ease; padding: 5px; display: flex; align-items: center; justify-content: center; }
 #btn-toolbar-cmd { display: none !important; }
 body.is-admin #btn-toolbar-cmd, body.is-mod #btn-toolbar-cmd { display: flex !important; }
@@ -23555,7 +23560,50 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
     let selectedSuggestionIndex = 0;
     let suggestionKeyboardMode = false;
     let pendingImages = [];
+	let pendingImageUploads = 0;
     let editingMsgId = null;
+
+	function isChatImageUploadPending() {
+		return pendingImageUploads > 0;
+	}
+
+	window.isChatImageUploadPending = isChatImageUploadPending;
+
+	function updateChatUploadPendingUi() {
+		const isPending = pendingImageUploads > 0;
+		const sendBtn = document.getElementById('btn-chat-send');
+		const attachBtn = document.getElementById('btn-attach-file');
+		const input = document.getElementById('chat-input');
+
+		if (sendBtn) {
+			sendBtn.classList.toggle('chat-upload-waiting', isPending);
+			sendBtn.setAttribute('aria-disabled', isPending ? 'true' : 'false');
+			sendBtn.title = isPending ? 'Wait for the image upload to finish' : '';
+		}
+
+		if (input) input.classList.toggle('chat-upload-waiting', isPending);
+
+		if (attachBtn) {
+			attachBtn.classList.toggle('is-active', isPending || pendingImages.length > 0);
+			attachBtn.innerHTML = '<i class="fas fa-paperclip"></i>';
+		}
+	}
+
+	function setChatImageUploadPending(delta) {
+		pendingImageUploads = Math.max(0, pendingImageUploads + Number(delta || 0));
+		updateChatUploadPendingUi();
+		if (typeof showImagePreview === 'function') showImagePreview();
+	}
+
+	function blockChatSendWhileUploading() {
+		if (!isChatImageUploadPending()) return false;
+		if (typeof playUiError === 'function') playUiError();
+		const input = document.getElementById('chat-input');
+		if (input) input.focus();
+		updateChatUploadPendingUi();
+		return true;
+	}
+
 	let globalSearchResults = [];
 	let isKicked = false;
 
@@ -25026,7 +25074,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 	function showImagePreview() {
 		let container = document.getElementById('pending-image-preview');
 		const chatInput = document.getElementById('chat-input');
-		
+
 		if (!container && chatInput) {
 			chatInput.parentNode.style.position = 'relative';
 			container = document.createElement('div');
@@ -25034,13 +25082,20 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 			container.style.cssText = "position: absolute; bottom: 100%; left: 0; z-index: 100; display: flex; gap: 8px; padding: 10px; background: rgba(10, 15, 25, 0.95); border: 1px solid var(--ps-blue); border-radius: 10px; margin-bottom: 8px; animation: fadeIn 0.3s ease-out; backdrop-filter: blur(10px); box-shadow: 0 -5px 15px rgba(0,0,0,0.5); overflow-x: auto; max-width: calc(100% - 20px); scrollbar-width: none;";
 			chatInput.parentNode.insertBefore(container, chatInput);
 		}
-	
-		if (pendingImages.length === 0) {
+
+		if (pendingImages.length === 0 && pendingImageUploads === 0) {
 			if (container) container.remove();
+			if (typeof updateChatUploadPendingUi === 'function') updateChatUploadPendingUi();
 			updateJumpButtonPosition();
 			return;
 		}
-	
+
+		const uploadSkeletons = Array.from({ length: pendingImageUploads }).map(() => `
+			<div class="preview-item pending-upload-item" style="position: relative; flex-shrink: 0;">
+				<div class="pending-upload-skeleton"><i class="fas fa-spinner fa-spin"></i></div>
+			</div>
+		`).join('');
+
 		container.innerHTML = pendingImages.map((url, idx) => `
 			<div class="preview-item" 
 				draggable="true" 
@@ -25052,12 +25107,14 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 				<img src="${url}" style="width: 65px; height: 65px; border-radius: 6px; object-fit: cover; border: 1px solid rgba(255,255,255,0.1); pointer-events: none;">
 				<button onclick="removeSelectedImage(${idx})" style="position: absolute; top: -6px; right: -6px; background: #ff4444; color: white; border: 1px solid #000; width: 18px; height: 18px; border-radius: 50%; cursor: pointer; font-size: 11px; display: flex; align-items: center; justify-content: center; box-shadow: 0 2px 5px rgba(0,0,0,0.5);">&times;</button>
 			</div>
-		`).join('');
-	
+		`).join('') + uploadSkeletons;
+
 		chatInput.focus();
 		document.getElementById('btn-attach-file')?.classList.add('is-active');
+		if (typeof updateChatUploadPendingUi === 'function') updateChatUploadPendingUi();
 		updateJumpButtonPosition();
 	}
+
 	
 	window.handleDragStart = function(index, e) {
 		draggedIndex = index;
@@ -25085,18 +25142,22 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 		if (typeof playUiBackspace === 'function') playUiBackspace();
 		pendingImages.splice(index, 1);
 		showImagePreview();
-		if (pendingImages.length === 0) {
+		if (pendingImages.length === 0 && pendingImageUploads === 0) {
 			document.getElementById('btn-attach-file')?.classList.remove('is-active');
 		}
+		if (typeof updateChatUploadPendingUi === 'function') updateChatUploadPendingUi();
 	};
 
 	function cancelPendingImage() {
 		if (typeof playUiBackspace === 'function') playUiBackspace();
 		pendingImages = []; 
+		pendingImageUploads = 0;
 		showImagePreview(); 
 		document.getElementById('btn-attach-file')?.classList.remove('is-active');
+		if (typeof updateChatUploadPendingUi === 'function') updateChatUploadPendingUi();
 		updateJumpButtonPosition();
 	}
+
 
 	async function handleImageUpload(event) {
 		if (typeof adminBlockLockedToolbarAction === 'function' && adminBlockLockedToolbarAction()) { if (event && event.target) event.target.value = ''; return; }
@@ -28123,6 +28184,8 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
     function sendChatMessage() {
 		if (!socketChat) return;
 		const input = document.getElementById('chat-input');
+
+		if (typeof blockChatSendWhileUploading === 'function' && blockChatSendWhileUploading()) return;
 		
 		let msg = input.innerHTML.trim();
 		let plainText = input.innerText.trim();
@@ -28322,7 +28385,9 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 			});
 			cancelEditMessage();
 			pendingImages = [];
+			pendingImageUploads = 0;
 			showImagePreview();
+			if (typeof updateChatUploadPendingUi === 'function') updateChatUploadPendingUi();
 			if (typeof playUiSuccess === 'function') playUiSuccess();
 			return;
 		}
@@ -28828,6 +28893,14 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 			}
 		}
 	
+		if (e.key === "Enter" && window.isMediaEditorModalOpen && window.isMediaEditorModalOpen()) {
+			if (window.confirmMediaEditorFromKeyboard && window.confirmMediaEditorFromKeyboard()) {
+				e.preventDefault();
+				e.stopPropagation();
+				return;
+			}
+		}
+
 		const input = document.getElementById('chat-input');
 		if (e.target !== input) return;
 	
@@ -28877,6 +28950,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 				if (typeof playUiInput === 'function') playUiInput();
 			} else {
 				e.preventDefault();
+				if (typeof blockChatSendWhileUploading === 'function' && blockChatSendWhileUploading()) return;
 				sendChatMessage();
 			}
 		}
@@ -28895,10 +28969,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 
 	async function processAndSendImage(files) {
 		if (!files || files.length === 0) return;
-		
-		const btnAttach = document.getElementById('btn-attach-file');
-		if (btnAttach) btnAttach.innerHTML = '<i class="fas fa-spinner fa-spin"></i>';
-	
+
 		const validFiles = Array.from(files).filter(file => {
 			if (file.size > 10 * 1024 * 1024) {
 				alert(`File "${file.name}" is too large! Max 10MB.`);
@@ -28906,27 +28977,34 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 			}
 			return true;
 		});
-	
+
+		if (validFiles.length === 0) {
+			if (typeof updateChatUploadPendingUi === 'function') updateChatUploadPendingUi();
+			return;
+		}
+
+		setChatImageUploadPending(validFiles.length);
+
 		try {
 			const uploadPromises = validFiles.map(file => uploadToCloudinary(file));
 			const urls = await Promise.all(uploadPromises);
-			
+
 			const successfulUrls = urls.filter(url => url !== null);
-	
+
 			if (successfulUrls.length > 0) {
 				pendingImages = [...pendingImages, ...successfulUrls];
-				
-				showImagePreview(); 
-				
 				if (typeof playUiSuccess === 'function') playUiSuccess();
 			}
 		} catch (err) {
 			console.error("Upload process error:", err);
 			alert("An error occurred during the upload.");
+		} finally {
+			setChatImageUploadPending(-validFiles.length);
+			showImagePreview();
+			if (typeof updateChatUploadPendingUi === 'function') updateChatUploadPendingUi();
 		}
-	
-		if (btnAttach) btnAttach.innerHTML = '<i class="fas fa-paperclip"></i>';
 	}
+
 	
 	let cropperInstance = null;
 	let currentRotation = 0;
@@ -29368,6 +29446,43 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 			}
 		});
 	};
+
+	window.isMediaEditorModalOpen = function() {
+		const modal = document.getElementById('modal-sys-crop');
+		if (!modal) return false;
+		const style = window.getComputedStyle ? window.getComputedStyle(modal) : null;
+		return modal.style.display === 'flex' || modal.classList.contains('show') || (style && style.display !== 'none');
+	};
+
+	window.confirmMediaEditorFromKeyboard = function() {
+		if (!window.isMediaEditorModalOpen || !window.isMediaEditorModalOpen()) return false;
+
+		const activeObj = activeEditorCanvas && typeof activeEditorCanvas.getActiveObject === 'function'
+			? activeEditorCanvas.getActiveObject()
+			: null;
+
+		if (activeObj && activeObj.isEditing) return false;
+
+		const btn = document.getElementById('btn-confirm-crop');
+		if (!btn || btn.style.pointerEvents === 'none' || btn.disabled) return true;
+
+		btn.click();
+		return true;
+	};
+
+	document.addEventListener('keydown', function(e) {
+		if (!e || e.key !== 'Enter') return;
+		if (e.shiftKey || e.ctrlKey || e.metaKey || e.altKey) return;
+		if (!window.isMediaEditorModalOpen || !window.isMediaEditorModalOpen()) return;
+
+		if (window.confirmMediaEditorFromKeyboard && window.confirmMediaEditorFromKeyboard()) {
+			e.preventDefault();
+			e.stopPropagation();
+			if (typeof e.stopImmediatePropagation === 'function') e.stopImmediatePropagation();
+		}
+	}, true);
+
+
 
     async function fetchLinkMetadata(url, elementId) {
 		if (url.match(/\.(jpeg|jpg|gif|png|bmp|webp)$/) != null) return;
