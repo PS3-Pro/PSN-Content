@@ -281,6 +281,12 @@ select option { background-color: var(--bg-dark); }
 .game-info { padding: 12px; flex-grow: 1; display: flex; flex-direction: column; justify-content: space-between; gap: 10px; }
 .game-title { font-size: 13px; font-weight: 600; margin: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: #fff; line-height: 1.4; }
 .game-meta-info { display: flex; justify-content: space-between; align-items: center; margin-top: 4px; }
+.game-id.base-game-link { cursor: pointer; transition: box-shadow .2s ease, transform .2s ease, filter .2s ease; }
+.game-id.base-game-link:hover { box-shadow: 0 0 8px rgba(255,255,0,.24); transform: translateY(-1px); filter: brightness(1.12); }
+.game-id.base-game-link i { font-size: 8px; margin-left: 4px; opacity: .75; color: inherit; }
+.modal-base-game-id-link { color: #ffff00; font-weight: bold; cursor: pointer; transition: filter .2s ease, text-shadow .2s ease; }
+.modal-base-game-id-link:hover { filter: brightness(1.15); text-shadow: 0 0 8px rgba(255,255,0,.22); }
+.modal-base-game-id-link i { font-size: 8px; margin-left: 4px; opacity: .75; }
 .game-id { font-size: 10px; color: #ffff00; background: rgba(255, 255, 0, 0.1); padding: 2px 3px; border-radius: 3px; display: inline-block; font-family: inherit !important; font-weight: 400 !important; letter-spacing: normal !important; line-height: normal; border: 0 !important; white-space: nowrap; vertical-align: top; }
 .game-size { font-size: 11px; color: var(--text-muted); font-weight: 500; }
 .btn-group { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-top: 8px; }
@@ -291,6 +297,13 @@ select option { background-color: var(--bg-dark); }
 .btn-avt { order: 3; background: linear-gradient(135deg, #00695c, #00897b); color: #fff; }
 .btn-dlc { order: 4; background: linear-gradient(135deg, #6a1b9a, #8e24aa); color: #fff; }
 .btn-rap { order: 5; background: linear-gradient(135deg, #e0e0e0, #ffffff); color: #000; }
+.btn-group.loop-child-removed > .btn-pkg,
+.btn-group.loop-child-removed > .btn-multi { order: 1 !important; grid-column: auto !important; padding: 6px 2px !important; }
+.btn-group.loop-child-removed > .btn-rap { order: 2 !important; grid-column: auto !important; padding: 6px 2px !important; }
+.btn-group.loop-child-removed > .btn-pkg:only-child,
+.btn-group.loop-child-removed > .btn-multi:only-child { order: 1 !important; grid-column: 1 / -1 !important; padding: 8px 4px !important; }
+.btn-group.loop-child-removed, .btn-group.loop-child-removed > .btn-mini { transition: none !important; }
+
 .btn-group:has(> :nth-child(4)) .btn-upd, .btn-group:has(> :nth-child(4)) .btn-avt { order: 10; }
 .btn-group:has(> :nth-child(4)) .btn-dlc { order: 20; }
 .btn-group:has(> :nth-child(4)) .btn-pkg, .btn-group:has(> :nth-child(4)) .btn-multi { order: 30; }
@@ -9488,7 +9501,8 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 			});
 		}
 
-		const searchCanUseMissingRapToggle = searchHasText && searchCandidateCount > 1 && searchCandidateMissingRapCount > 0;
+		const searchLooksLikeTitleId = /^[a-z]{4}\d{5}$/i.test(term.replace(/[^a-z0-9]/g, ''));
+		const searchCanUseMissingRapToggle = searchHasText && searchCandidateMissingRapCount > 0 && (searchCandidateCount > 1 || searchLooksLikeTitleId || searchCandidateCount === 1);
 		window.__browseMissingRapSearchCandidateCount = searchCandidateCount;
 		window.__browseCanFilterMissingRap = searchHasText ? searchCanUseMissingRapToggle : true;
 
@@ -33054,6 +33068,365 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
     } else {
         bootPadPage();
     }
+})();
+</script>
+
+
+<script>
+(function(){
+	'use strict';
+
+	if (window.__baseGameTitleIdLinkSafePatch) return;
+	window.__baseGameTitleIdLinkSafePatch = true;
+
+	window.__relatedContentListSource = null;
+	window.__baseGameFromRelatedContent = null;
+
+	function getCurrentCategory(){
+		var sel = document.getElementById('cat-select');
+		return sel ? String(sel.value || '').trim() : '';
+	}
+
+	function getCurrentSearchValue(){
+		var input = document.getElementById('search-input') || document.querySelector('.search-bar input');
+		return cleanId(input ? input.value : '');
+	}
+
+	function cleanId(value){
+		return String(value || '').toUpperCase().trim();
+	}
+
+	function getItemId(item){
+		return cleanId(item && (item.id || item.titleId || item.titleID || item.titleid));
+	}
+
+	function findRelatedBaseGame(titleId){
+		var id = cleanId(titleId);
+		if (!id || !window.psnStoreCache) return null;
+
+		var cats = ['games', 'apps', 'demos'];
+		for (var c = 0; c < cats.length; c++) {
+			var cat = cats[c];
+			var bucket = window.psnStoreCache[cat];
+			if (!Array.isArray(bucket)) continue;
+
+			for (var i = 0; i < bucket.length; i++) {
+				var item = bucket[i];
+				if (getItemId(item) === id) return { category: cat, item: item };
+			}
+		}
+
+		return null;
+	}
+
+	function getRelatedName(related, fallbackId){
+		if (!related || !related.item) return fallbackId || 'Related Game';
+		return related.item.cleanName || related.item.name || related.item.title || related.item.rawName || fallbackId || 'Related Game';
+	}
+
+	function cameFromBaseGameToRelatedList(titleId, cat){
+		var state = window.__relatedContentListSource;
+		if (!state) return false;
+
+		if (Date.now() - Number(state.time || 0) > 10 * 60 * 1000) {
+			window.__relatedContentListSource = null;
+			return false;
+		}
+
+		return cleanId(state.baseGameId) === cleanId(titleId) && String(state.targetCategory || '') === String(cat || '');
+	}
+
+
+	function clearRelatedNavigationState(){
+		window.__relatedContentListSource = null;
+		window.__baseGameFromRelatedContent = null;
+	}
+
+	function cleanupStaleRelatedNavigation(){
+		var relatedState = window.__relatedContentListSource;
+		if (relatedState) {
+			var currentCat = getCurrentCategory();
+			var targetCat = String(relatedState.targetCategory || '');
+			var age = Date.now() - Number(relatedState.time || 0);
+
+			if (currentCat && targetCat && currentCat !== targetCat && age > 200) {
+				window.__relatedContentListSource = null;
+			}
+		}
+
+		var baseState = window.__baseGameFromRelatedContent;
+		if (baseState) {
+			var searchValue = getCurrentSearchValue();
+			var targetId = cleanId(baseState.targetId);
+
+			if (searchValue && searchValue !== targetId) {
+				window.__baseGameFromRelatedContent = null;
+			}
+		}
+	}
+
+	function openBaseGameFromTitleId(titleId, sourceCategory){
+		var id = cleanId(titleId);
+		if (!id) return;
+
+		var related = findRelatedBaseGame(id);
+		if (!related) return;
+
+		window.__baseGameFromRelatedContent = {
+			fromCategory: sourceCategory || getCurrentCategory(),
+			targetId: id,
+			time: Date.now()
+		};
+		window.__relatedContentListSource = null;
+
+		var label = getRelatedName(related, id);
+
+		if (typeof window.searchGameOnSite === 'function') {
+			window.searchGameOnSite(id, null, related.category || null, label);
+		} else if (typeof window.switchAndSearch === 'function') {
+			window.switchAndSearch(related.category || 'games', id);
+		}
+	}
+
+	function shouldHideChildShortcut(card, childCategory){
+		var state = window.__baseGameFromRelatedContent;
+		if (!state) return false;
+
+		if (Date.now() - Number(state.time || 0) > 10 * 60 * 1000) {
+			window.__baseGameFromRelatedContent = null;
+			return false;
+		}
+
+		var currentSearch = getCurrentSearchValue();
+		var targetId = cleanId(state.targetId);
+
+		if (currentSearch && currentSearch !== targetId) {
+			window.__baseGameFromRelatedContent = null;
+			return false;
+		}
+
+		return cleanId(card && card.getAttribute('data-title-id')) === targetId &&
+			   String(state.fromCategory || '') === String(childCategory || '');
+	}
+
+	function undecorateGameId(span, id){
+		if (!span) return;
+		if (span.__baseGameClickHandler) {
+			span.removeEventListener('click', span.__baseGameClickHandler);
+			span.__baseGameClickHandler = null;
+		}
+		span.classList.remove('base-game-link');
+		span.title = '';
+		span.innerHTML = id || span.textContent || '';
+		span.dataset.baseGameDecorated = '0';
+	}
+
+	function decorateCards(){
+		var cards = document.querySelectorAll('.game-card[data-title-id]');
+		for (var i = 0; i < cards.length; i++) {
+			var card = cards[i];
+			var cat = String(card.getAttribute('data-store-category') || getCurrentCategory() || '').trim();
+			var id = cleanId(card.getAttribute('data-title-id'));
+			if (!id) continue;
+
+			var updBtn = card.querySelector('.btn-upd');
+			var dlcBtn = card.querySelector('.btn-dlc');
+
+			if (updBtn && shouldHideChildShortcut(card, 'updates')) { updBtn.parentElement?.classList.add('loop-child-removed'); updBtn.remove(); }
+			if (dlcBtn && shouldHideChildShortcut(card, 'dlcs')) { dlcBtn.parentElement?.classList.add('loop-child-removed'); dlcBtn.remove(); }
+
+			if (cat !== 'dlcs' && cat !== 'updates') continue;
+
+			var span = card.querySelector('.game-meta-info .game-id');
+			if (!span) continue;
+
+			var related = findRelatedBaseGame(id);
+			var suppressLink = cameFromBaseGameToRelatedList(id, cat);
+
+			if (!related || suppressLink) {
+				if (span.dataset.baseGameDecorated === '1') undecorateGameId(span, id);
+				continue;
+			}
+
+			if (span.dataset.baseGameDecorated === '1' && span.dataset.baseGameId === id) continue;
+
+			undecorateGameId(span, id);
+			span.classList.add('base-game-link');
+			span.dataset.baseGameDecorated = '1';
+			span.dataset.baseGameId = id;
+			span.title = 'Open related base game';
+			span.innerHTML = id + '<i class="fas fa-arrow-up-right-from-square"></i>';
+
+			span.__baseGameClickHandler = function(ev){
+				ev.stopPropagation();
+				ev.preventDefault();
+				if (typeof window.playUiClick === 'function') window.playUiClick();
+				var currentId = cleanId(this.dataset.baseGameId || this.textContent);
+				var currentCat = String(this.closest('.game-card')?.getAttribute('data-store-category') || getCurrentCategory() || '').trim();
+				openBaseGameFromTitleId(currentId, currentCat);
+			};
+
+			span.addEventListener('click', span.__baseGameClickHandler);
+		}
+	}
+
+	function getModalGameId(){
+		var modal = document.getElementById('game-modal');
+		if (!modal) return '';
+
+		var lines = modal.querySelectorAll('.modal-info-text');
+		for (var i = 0; i < lines.length; i++) {
+			var txt = (lines[i].textContent || '').trim();
+			if (txt.indexOf('ID:') === 0) {
+				return cleanId(txt.replace(/^ID:\s*/i, '').replace(/[^A-Z0-9_-].*$/, ''));
+			}
+		}
+		return '';
+	}
+
+	function decorateModal(){
+		var modal = document.getElementById('game-modal');
+		if (!modal) return;
+
+		var cat = getCurrentCategory();
+		var id = getModalGameId();
+		if (!id) return;
+
+		var state = window.__baseGameFromRelatedContent;
+		var currentSearch = getCurrentSearchValue();
+		var canHideChildShortcut = !currentSearch || currentSearch === id;
+		var shouldHideUpdate = state && canHideChildShortcut && cleanId(state.targetId) === id && state.fromCategory === 'updates';
+		var shouldHideDlc = state && canHideChildShortcut && cleanId(state.targetId) === id && state.fromCategory === 'dlcs';
+
+		var updBtn = modal.querySelector('.btn-upd');
+		var dlcBtn = modal.querySelector('.btn-dlc');
+		if (updBtn && shouldHideUpdate) updBtn.remove();
+		if (dlcBtn && shouldHideDlc) dlcBtn.remove();
+
+		if (cat !== 'dlcs' && cat !== 'updates') return;
+		if (cameFromBaseGameToRelatedList(id, cat)) return;
+
+		var related = findRelatedBaseGame(id);
+		if (!related) return;
+
+		var lines = modal.querySelectorAll('.modal-info-text');
+		for (var i = 0; i < lines.length; i++) {
+			var line = lines[i];
+			if ((line.textContent || '').trim().indexOf('ID:') !== 0) continue;
+
+			if (line.dataset.baseGameDecorated === '1') return;
+
+			line.dataset.baseGameDecorated = '1';
+			line.innerHTML = 'ID: <span class="modal-base-game-id-link" style="float: right;" title="Open related base game">' + id + '<i class="fas fa-arrow-up-right-from-square"></i></span>';
+
+			var link = line.querySelector('.modal-base-game-id-link');
+			if (link) {
+				link.addEventListener('click', function(ev){
+					ev.stopPropagation();
+					ev.preventDefault();
+					if (typeof window.playUiClick === 'function') window.playUiClick();
+					if (typeof window.closeModal === 'function') window.closeModal();
+					openBaseGameFromTitleId(id, cat);
+				});
+			}
+			return;
+		}
+	}
+
+	function processUiSoon(){
+		if (window.__baseGameTitleIdLinkSafePending) return;
+		window.__baseGameTitleIdLinkSafePending = true;
+
+		var runner = function(){
+			window.__baseGameTitleIdLinkSafePending = false;
+			try {
+				cleanupStaleRelatedNavigation();
+				decorateCards();
+				decorateModal();
+			} catch (err) {
+				console.warn('[BaseGameTitleIdLink] skipped:', err);
+			}
+		};
+
+		if (typeof queueMicrotask === 'function') {
+			queueMicrotask(runner);
+		} else if (typeof Promise !== 'undefined') {
+			Promise.resolve().then(runner);
+		} else {
+			setTimeout(runner, 0);
+		}
+	}
+
+	document.addEventListener('input', function(ev){
+		var input = ev.target;
+		if (!input || input.id !== 'search-input') return;
+
+		var state = window.__baseGameFromRelatedContent;
+		if (!state) return;
+
+		var value = cleanId(input.value);
+		var targetId = cleanId(state.targetId);
+
+		if (!value || value !== targetId) window.__baseGameFromRelatedContent = null;
+		if (!value) window.__relatedContentListSource = null;
+	}, true);
+
+
+	document.addEventListener('click', function(ev){
+		var target = ev.target;
+		if (!target || !target.closest) return;
+
+		var relatedBtn = target.closest('.btn-upd,.btn-dlc');
+		if (relatedBtn) return;
+
+		var backLike = target.closest('.back-btn, .top-nav a, .sidebar-menu li, .letter-btn, #related-origin-back-btn');
+		if (backLike) clearRelatedNavigationState();
+	}, true);
+
+	document.addEventListener('change', function(ev){
+		var target = ev.target;
+		if (!target) return;
+
+		if (target.id === 'cat-select' || target.id === 'filter-type' || target.id === 'filter-region') {
+			cleanupStaleRelatedNavigation();
+		}
+	}, true);
+
+	document.addEventListener('click', function(ev){
+		var btn = ev.target && ev.target.closest ? ev.target.closest('.btn-upd,.btn-dlc') : null;
+		if (!btn) return;
+
+		var targetCategory = btn.classList.contains('btn-dlc') ? 'dlcs' : 'updates';
+		var card = btn.closest('.game-card[data-title-id]');
+		var baseId = card ? cleanId(card.getAttribute('data-title-id')) : getModalGameId();
+
+		if (!baseId) return;
+
+		window.__relatedContentListSource = {
+			fromCategory: card ? String(card.getAttribute('data-store-category') || getCurrentCategory() || '') : getCurrentCategory(),
+			targetCategory: targetCategory,
+			baseGameId: baseId,
+			time: Date.now()
+		};
+		window.__baseGameFromRelatedContent = null;
+	}, true);
+
+	if (document.readyState === 'loading') {
+		document.addEventListener('DOMContentLoaded', processUiSoon);
+	} else {
+		processUiSoon();
+	}
+
+	if (window.MutationObserver) {
+		var root = document.getElementById('database-grid') || document.body;
+		var observer = new MutationObserver(processUiSoon);
+		observer.observe(root, { childList: true, subtree: true });
+
+		var modal = document.getElementById('game-modal');
+		if (modal) observer.observe(modal, { childList: true, subtree: true });
+	}
+
+	window.addEventListener('load', processUiSoon);
 })();
 </script>
 
