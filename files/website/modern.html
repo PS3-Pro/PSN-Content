@@ -8470,14 +8470,15 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 		if (typeof from === 'string' && from.startsWith('gamemodal|')) {
 			const parts = from.split('|');
 			const gameId = parts[1];
-			const bgView = parts[2];
+			const bgView = parts[2] || 'browse';
+			const modalContentId = parts.length > 3 ? decodeURIComponent(parts.slice(3).join('|') || '') : '';
 			const savedScroll = oldHistory.scroll;
 			navHistory = currentParent;
 	
 			const actualView = bgView.startsWith('library_') ? 'library' : (bgView.startsWith('online_') ? 'online' : bgView);
 			
 			if (actualView === 'browse') {
-				restoreBrowseState(oldHistory, savedScroll, gameId);
+				restoreBrowseState(oldHistory, savedScroll, gameId, modalContentId);
 			} else {
 				switchView('view-' + actualView);
 				autoSyncUI(bgView);
@@ -8688,7 +8689,7 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 		navHistory = currentParent;
 		restoreBrowseState(oldHistory, savedScroll);
 	
-		function restoreBrowseState(history, scroll, openId = null) {
+		function restoreBrowseState(history, scroll, openId = null, openContentId = '') {
 			const catSelect = document.getElementById('cat-select');
 			const searchInput = document.getElementById('search-input');
 			const regionSelect = document.getElementById('region-select');
@@ -8746,7 +8747,17 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 						window.isRestoringHistory = false;
 						
 						if (openId && typeof filteredData !== 'undefined') {
-							const idx = filteredData.findIndex(g => g.id === openId);
+							const wantedId = String(openId || '').toUpperCase().trim();
+							const wantedContentId = String(openContentId || '').toUpperCase().trim();
+							let idx = -1;
+							if (wantedContentId) {
+								idx = filteredData.findIndex(g => {
+									const gid = String(g.id || g.titleId || '').toUpperCase().trim();
+									const cid = String(g.contentId || '').toUpperCase().trim();
+									return gid === wantedId && cid === wantedContentId;
+								});
+							}
+							if (idx < 0) idx = filteredData.findIndex(g => String(g.id || g.titleId || '').toUpperCase().trim() === wantedId);
 							if (idx > -1 && typeof openModal === 'function') openModal(idx);
 						}
 					}, 250);
@@ -10436,6 +10447,13 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 		const modal = document.getElementById('game-modal');
 		const modalBody = modal.querySelector('.sys-modal-body');
 		const modalHeader = modal.querySelector('.sys-modal-header h2');
+		
+		if (modal && game) {
+			modal.dataset.titleId = game.id || '';
+			modal.dataset.contentId = game.contentId || '';
+			modal.dataset.storeCategory = currentCat || '';
+			modal.dataset.modalIndex = String(index);
+		}
 		
 		let iconClass = 'fas fa-gamepad';
 		let headerText = 'Game Details';
@@ -33183,7 +33201,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 		}
 	}
 
-	function openBaseGameFromTitleId(titleId, sourceCategory){
+	function openBaseGameFromTitleId(titleId, sourceCategory, returnPath){
 		var id = cleanId(titleId);
 		if (!id) return;
 
@@ -33200,9 +33218,9 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 		var label = getRelatedName(related, id);
 
 		if (typeof window.searchGameOnSite === 'function') {
-			window.searchGameOnSite(id, null, related.category || null, label);
+			window.searchGameOnSite(id, returnPath || null, related.category || null, label);
 		} else if (typeof window.switchAndSearch === 'function') {
-			window.switchAndSearch(related.category || 'games', id);
+			window.switchAndSearch(related.category || 'games', id, returnPath || false);
 		}
 	}
 
@@ -33249,11 +33267,13 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 
 			var updBtn = card.querySelector('.btn-upd');
 			var dlcBtn = card.querySelector('.btn-dlc');
+			var avtBtn = card.querySelector('.btn-avt');
 
 			if (updBtn && shouldHideChildShortcut(card, 'updates')) { updBtn.parentElement?.classList.add('loop-child-removed'); updBtn.remove(); }
 			if (dlcBtn && shouldHideChildShortcut(card, 'dlcs')) { dlcBtn.parentElement?.classList.add('loop-child-removed'); dlcBtn.remove(); }
+			if (avtBtn && shouldHideChildShortcut(card, 'avatars')) { avtBtn.parentElement?.classList.add('loop-child-removed'); avtBtn.remove(); }
 
-			if (cat !== 'dlcs' && cat !== 'updates') continue;
+			if (cat !== 'dlcs' && cat !== 'updates' && cat !== 'avatars' && cat !== 'themes') continue;
 
 			var span = card.querySelector('.game-meta-info .game-id');
 			if (!span) continue;
@@ -33291,6 +33311,8 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 	function getModalGameId(){
 		var modal = document.getElementById('game-modal');
 		if (!modal) return '';
+		var datasetId = cleanId(modal.dataset.titleId || '');
+		if (datasetId) return datasetId;
 
 		var lines = modal.querySelectorAll('.modal-info-text');
 		for (var i = 0; i < lines.length; i++) {
@@ -33300,6 +33322,11 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 			}
 		}
 		return '';
+	}
+
+	function getModalContentId(){
+		var modal = document.getElementById('game-modal');
+		return modal ? String(modal.dataset.contentId || '').trim() : '';
 	}
 
 	function decorateModal(){
@@ -33315,13 +33342,16 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 		var canHideChildShortcut = !currentSearch || currentSearch === id;
 		var shouldHideUpdate = state && canHideChildShortcut && cleanId(state.targetId) === id && state.fromCategory === 'updates';
 		var shouldHideDlc = state && canHideChildShortcut && cleanId(state.targetId) === id && state.fromCategory === 'dlcs';
+		var shouldHideAvatar = state && canHideChildShortcut && cleanId(state.targetId) === id && state.fromCategory === 'avatars';
 
 		var updBtn = modal.querySelector('.btn-upd');
 		var dlcBtn = modal.querySelector('.btn-dlc');
+		var avtBtn = modal.querySelector('.btn-avt');
 		if (updBtn && shouldHideUpdate) updBtn.remove();
 		if (dlcBtn && shouldHideDlc) dlcBtn.remove();
+		if (avtBtn && shouldHideAvatar) avtBtn.remove();
 
-		if (cat !== 'dlcs' && cat !== 'updates') return;
+		if (cat !== 'dlcs' && cat !== 'updates' && cat !== 'avatars' && cat !== 'themes') return;
 		if (cameFromBaseGameToRelatedList(id, cat)) return;
 
 		var related = findRelatedBaseGame(id);
@@ -33343,8 +33373,10 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 					ev.stopPropagation();
 					ev.preventDefault();
 					if (typeof window.playUiClick === 'function') window.playUiClick();
+					var modalContentId = getModalContentId();
+					var returnPath = 'gamemodal|' + id + '|browse' + (modalContentId ? '|' + encodeURIComponent(modalContentId) : '');
 					if (typeof window.closeModal === 'function') window.closeModal();
-					openBaseGameFromTitleId(id, cat);
+					openBaseGameFromTitleId(id, cat, returnPath);
 				});
 			}
 			return;
@@ -33394,7 +33426,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 		var target = ev.target;
 		if (!target || !target.closest) return;
 
-		var relatedBtn = target.closest('.btn-upd,.btn-dlc');
+		var relatedBtn = target.closest('.btn-upd,.btn-dlc,.btn-avt');
 		if (relatedBtn) return;
 
 		var backLike = target.closest('.back-btn, .top-nav a, .sidebar-menu li, .letter-btn, #related-origin-back-btn');
@@ -33411,10 +33443,10 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 	}, true);
 
 	document.addEventListener('click', function(ev){
-		var btn = ev.target && ev.target.closest ? ev.target.closest('.btn-upd,.btn-dlc') : null;
+		var btn = ev.target && ev.target.closest ? ev.target.closest('.btn-upd,.btn-dlc,.btn-avt') : null;
 		if (!btn) return;
 
-		var targetCategory = btn.classList.contains('btn-dlc') ? 'dlcs' : 'updates';
+		var targetCategory = btn.classList.contains('btn-dlc') ? 'dlcs' : (btn.classList.contains('btn-avt') ? 'avatars' : 'updates');
 		var card = btn.closest('.game-card[data-title-id]');
 		var baseId = card ? cleanId(card.getAttribute('data-title-id')) : getModalGameId();
 

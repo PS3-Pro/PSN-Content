@@ -15,8 +15,6 @@
 	window.resizeTo(screen.width, screen.height);
 
 	document.addEventListener("DOMContentLoaded", function() {
-		if (typeof updateMissingLicenseFilterButton === 'function') updateMissingLicenseFilterButton();
-
 		var isReleased = window.location.search.indexOf("released") > -1;
 		if (isReleased) {
 			var pkgBtn = document.getElementById('pkg-version');
@@ -211,57 +209,6 @@
 		.is-ps3 .game-tile .title { font-size: 13px; line-height: 13px; height: 28px; display: -webkit-box; -webkit-box-pack: center; -webkit-box-align: center; }
 		.game-tile:hover .title { border-color: transparent !important; }
 		.game-tile .title-id { color: #ffff00 !important; font-size: 11px; margin-bottom: 8px; }
-		.classic-title-id-link,
-.id-text.classic-title-id-link {
-	font-size: 10px;
-	color: #ffff00 !important;
-	background: rgba(255, 255, 0, 0.1);
-	padding: 2px 3px;
-	border-radius: 3px;
-	display: inline-block;
-	font-family: inherit !important;
-	font-weight: 400 !important;
-	letter-spacing: normal !important;
-	line-height: normal;
-	border: 0 !important;
-	white-space: nowrap;
-	vertical-align: top;
-	text-decoration: none !important;
-	cursor: pointer;
-	transition: box-shadow .2s ease, transform .2s ease, filter .2s ease;
-}
-.classic-title-id-link:hover,
-.id-text.classic-title-id-link:hover {
-	color: #ffff00 !important;
-	text-decoration: none !important;
-	box-shadow: 0 0 8px rgba(255,255,0,.24);
-	transform: translateY(-1px);
-	filter: brightness(1.12);
-}
-.classic-title-id-link i {
-	font-size: 8px;
-	margin-left: 4px;
-	opacity: .75;
-	color: inherit;
-}
-.id-text {
-	font-size: 10px;
-	color: #ffff00 !important;
-	background: rgba(255, 255, 0, 0.1);
-	padding: 2px 3px;
-	border-radius: 3px;
-	display: inline-block;
-	font-family: inherit !important;
-	font-weight: 400 !important;
-	letter-spacing: normal !important;
-	line-height: normal;
-	border: 0 !important;
-	white-space: nowrap;
-	vertical-align: top;
-}
-#missing-license-switch.active { color: #ffe162 !important; border-color: #ffe162 !important; background: rgba(255, 204, 0, 0.18) !important; }
-#missing-license-switch.is-hidden { display: none !important; }
-
 		.game-tile .size { color: #aaa; font-size: 11px; margin-bottom: 8px; }
 		.game-tile .links { margin-top: 4px; font-size: 10px; }
 		.game-tile .links a { padding: 3px 3px; color: #fff; margin: 0 !important; text-decoration: none; }
@@ -873,7 +820,6 @@
 				<input type="button" id="pkg-version" value="Installable Version" onclick="window.location.href='https://github.com/PS3-Pro/PSN-Content/releases/download/Release/PlayStation_Network_Database.pkg'">
 				<div id="audio-switch" class="toggle-btn"><label><input type="checkbox" id="audio-toggle" checked> Audio</label></div>
 				<div id="cover-toggle" class="toggle-btn"><label><input type="checkbox" id="cover-gui"> Covers</label></div>
-				<div id="missing-license-switch" class="toggle-btn"><label><input type="checkbox" id="missing-license-toggle" onclick="toggleMissingLicenseFilter(this.checked)"> Missing Licenses</label></div>
 				<div id="zoom-container">
 				<span style="font-size: 14px;">Size: </span>
 					<input type="range" id="zoom-slider" min="0" max="2" step="1" value="1" oninput="updateZoom(this.value)">
@@ -2631,404 +2577,6 @@
 		return '<a class="rap-btn" download="'+contentID+'.rap" href="https://ps3-pro.github.io/License-Files/files/'+contentID+'.rap">RAP</a>';
 	}
 
-	var g_classicShowMissingLicenses = false;
-	var g_classicMissingLicenseSearchKey = "";
-	var g_classicMissingLicenseSearchActive = false;
-	var g_classicRelatedFromGame = null;
-	var g_classicBaseFromRelated = null;
-	var g_classicInternalBaseOpen = false;
-	var g_classicPendingCategorySearch = null;
-	var g_classicBaseLookupFallback = null;
-	var g_classicBaseGameIndex = {};
-	var g_classicBaseGameIndexLoaded = false;
-	var g_classicBaseGameIndexLoading = false;
-
-	function classicCleanTitleId(value) {
-		return String(value || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
-	}
-
-	function classicIsChildContentCategory(category) {
-		var cat = String(category || currentCategory || '');
-		return cat === 'dlcs' || cat === 'updates' || cat === 'avatars' || cat === 'themes';
-	}
-
-	function classicIsMissingLicenseRow(row) {
-		if (!row) return false;
-
-		var rapHex = row[4];
-		var contentId = row[5];
-
-		if (!contentId || contentId === "MISSING") return false;
-		if (rapHex === "NOT REQUIRED") return false;
-		if (rapHex && rapHex !== "MISSING" && rapHex.length === 32) return false;
-
-		return true;
-	}
-
-	function updateMissingLicenseFilterButton() {
-		var chk = document.getElementById('missing-license-toggle');
-		var wrap = document.getElementById('missing-license-switch');
-
-		if (chk) {
-			chk.checked = !!g_classicShowMissingLicenses;
-			chk.title = g_classicShowMissingLicenses ? 'Including items without license/RAP' : 'Show items without license/RAP too';
-		}
-
-		if (wrap) {
-			wrap.className = (wrap.className || '').replace(/\s*active/g, '');
-			if (g_classicShowMissingLicenses) wrap.className += ' active';
-			wrap.title = g_classicShowMissingLicenses ? 'Including items without license/RAP' : 'Show items without license/RAP too';
-		}
-	}
-
-
-	function updateMissingLicenseFilterVisibility(availableCount, isSearching, forceHideOnly) {
-		var wrap = document.getElementById('missing-license-switch');
-		var chk = document.getElementById('missing-license-toggle');
-		var count = Number(availableCount || 0);
-		var forceHide = !!forceHideOnly;
-
-		if (!wrap) return;
-
-		wrap.className = (wrap.className || '').replace(/\s*is-hidden/g, '');
-		wrap.setAttribute('aria-hidden', 'false');
-
-		if (count <= 0 || forceHide) {
-			wrap.className += ' is-hidden';
-			wrap.setAttribute('aria-hidden', 'true');
-
-			if (count <= 0) {
-				if (chk && chk.checked) chk.checked = false;
-				g_classicShowMissingLicenses = false;
-			}
-		}
-
-		updateMissingLicenseFilterButton();
-	}
-
-
-	function toggleMissingLicenseFilter(checked) {
-		if (typeof checked === 'undefined') {
-			g_classicShowMissingLicenses = !g_classicShowMissingLicenses;
-		} else {
-			g_classicShowMissingLicenses = !!checked;
-		}
-
-		g_classicMissingLicenseSearchActive = false;
-
-		updateMissingLicenseFilterButton();
-
-		g_pcRenderLimit = g_defaultRenderLimit;
-		g_ps3RenderLimit = g_ps3PageSize || 200;
-
-		var btnMore = document.getElementById('btn-load-more');
-		if (btnMore) btnMore.style.display = 'none';
-
-		render();
-		return false;
-	}
-
-	
-	function classicBaseCategoryPriority(cat) {
-		if (cat === 'games') return 3;
-		if (cat === 'apps') return 2;
-		if (cat === 'demos') return 1;
-		return 0;
-	}
-
-	function classicMarkBaseGameId(titleId, category) {
-		var id = classicCleanTitleId(titleId);
-		var cat = String(category || currentCategory || 'games');
-
-		if (!id || id.length !== 9) return;
-
-		var oldCat = g_classicBaseGameIndex[id];
-		if (!oldCat || classicBaseCategoryPriority(cat) > classicBaseCategoryPriority(oldCat)) {
-			g_classicBaseGameIndex[id] = cat;
-		}
-	}
-
-	function classicIndexBaseGameText(tsvText, category) {
-		if (!tsvText) return;
-
-		var start = 0;
-		var len = tsvText.length;
-
-		while (start < len) {
-			var end = tsvText.indexOf('\n', start);
-			if (end === -1) end = len;
-
-			var lineEnd = end;
-			if (lineEnd > start && tsvText.charCodeAt(lineEnd - 1) === 13) lineEnd--;
-
-			var line = tsvText.slice(start, lineEnd);
-			start = end + 1;
-
-			if (line.length < 9) continue;
-
-			var tab = line.indexOf('\t');
-			var id = tab === -1 ? line : line.slice(0, tab);
-			classicMarkBaseGameId(id, category);
-		}
-	}
-
-	function classicGetRelatedBaseCategory(titleId) {
-		var id = classicCleanTitleId(titleId);
-		if (!id) return '';
-		return g_classicBaseGameIndex[id] || '';
-	}
-
-	function classicHasRelatedBaseGame(titleId) {
-		return !!classicGetRelatedBaseCategory(titleId);
-	}
-
-
-	function classicReplaceFirstIdText(parentNode, htmlText) {
-		if (!parentNode) return;
-
-		var oldNodes = parentNode.getElementsByClassName ? parentNode.getElementsByClassName('id-text') : [];
-		if (!oldNodes || oldNodes.length < 1) return;
-
-		var oldNode = oldNodes[0];
-		var holder = document.createElement('span');
-		holder.innerHTML = htmlText;
-
-		if (holder.firstChild && oldNode.parentNode) {
-			oldNode.parentNode.replaceChild(holder.firstChild, oldNode);
-		}
-	}
-
-	function classicRefreshVisibleTitleIdLinks() {
-		if (!classicIsChildContentCategory(currentCategory)) return;
-		if (!g_classicBaseGameIndexLoaded) return;
-
-		var i, node, tid, cat, htmlText;
-
-		var tiles = document.getElementsByClassName ? document.getElementsByClassName('game-tile') : [];
-		for (i = 0; i < tiles.length; i++) {
-			node = tiles[i];
-			tid = node.getAttribute('data-title_id');
-			cat = node.getAttribute('data-category') || currentCategory;
-
-			if (!tid || !classicIsChildContentCategory(cat)) continue;
-
-			htmlText = classicBuildTitleIdHtml(tid, cat, true);
-
-			var titleBoxes = node.getElementsByClassName ? node.getElementsByClassName('title-id') : [];
-			if (titleBoxes && titleBoxes.length > 0) {
-				titleBoxes[0].innerHTML = htmlText;
-			}
-		}
-
-		var list = document.getElementById('list');
-		if (!list) return;
-
-		var items = list.getElementsByTagName('li');
-		for (i = 0; i < items.length; i++) {
-			node = items[i];
-			tid = node.getAttribute('data-title_id');
-			cat = node.getAttribute('data-category') || currentCategory;
-
-			if (!tid || !classicIsChildContentCategory(cat)) continue;
-
-			htmlText = classicBuildTitleIdHtml(tid, cat, true);
-			classicReplaceFirstIdText(node, htmlText);
-		}
-	}
-
-
-	function classicEnsureBaseGameIndex() {
-		if (g_classicBaseGameIndexLoaded || g_classicBaseGameIndexLoading) return;
-
-		g_classicBaseGameIndexLoading = true;
-
-		var baseUrl = "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/database/content/official";
-		var paths = [
-			{ url: baseUrl + "/games.tsv", category: 'games' },
-			{ url: baseUrl + "/pending/games.tsv", category: 'games' },
-			{ url: baseUrl + "/apps.tsv", category: 'apps' },
-			{ url: baseUrl + "/pending/apps.tsv", category: 'apps' },
-			{ url: baseUrl + "/demos.tsv", category: 'demos' },
-			{ url: baseUrl + "/pending/demos.tsv", category: 'demos' }
-		];
-
-		var idx = 0;
-
-		function done() {
-			g_classicBaseGameIndexLoaded = true;
-			g_classicBaseGameIndexLoading = false;
-
-			if (classicIsChildContentCategory(currentCategory)) {
-				classicRefreshVisibleTitleIdLinks();
-			}
-		}
-
-		function loadNext() {
-			if (idx >= paths.length) {
-				done();
-				return;
-			}
-
-			var item = paths[idx];
-			var url = item.url;
-			var indexCategory = item.category;
-
-			try {
-				var xhr = new XMLHttpRequest();
-				xhr.onreadystatechange = function() {
-					if (xhr.readyState !== 4) return;
-
-					if (xhr.status === 200 || xhr.status === 0) {
-						classicIndexBaseGameText(xhr.responseText || "", indexCategory);
-					}
-
-					idx++;
-					setTimeout(loadNext, isPS3 ? 20 : 0);
-				};
-
-				xhr.open('GET', url, true);
-				xhr.send();
-			} catch (e) {
-				idx++;
-				setTimeout(loadNext, isPS3 ? 20 : 0);
-			}
-		}
-
-		loadNext();
-	}
-
-
-function classicIsGameToRelatedLoop(titleId, category) {
-		var st = g_classicRelatedFromGame;
-		if (!st) return false;
-
-		var id = classicCleanTitleId(titleId);
-		var targetId = classicCleanTitleId(st.baseGameId);
-		var cat = String(category || currentCategory || '');
-
-		if (!id || !targetId || id !== targetId || cat !== st.targetCategory) return false;
-
-		if (f && f.query) {
-			var q = classicCleanTitleId(f.query.value);
-			if (q && q !== targetId) {
-				g_classicRelatedFromGame = null;
-				return false;
-			}
-		}
-
-		return true;
-	}
-
-	function classicShouldHideChildShortcut(titleId, childCategory) {
-		var st = g_classicBaseFromRelated;
-		if (!st) return false;
-
-		var id = classicCleanTitleId(titleId);
-		var targetId = classicCleanTitleId(st.targetId);
-		if (!id || !targetId || id !== targetId) return false;
-
-		if (String(st.sourceCategory || '') !== String(childCategory || '')) return false;
-
-		if (f && f.query) {
-			var q = classicCleanTitleId(f.query.value);
-			if (q && q !== targetId) {
-				g_classicBaseFromRelated = null;
-				return false;
-			}
-		}
-
-		return true;
-	}
-
-	function classicBuildTitleIdHtml(titleId, category, withBrackets) {
-		var id = classicCleanTitleId(titleId);
-		if (!id) return '';
-
-		var label = id;
-		var cat = String(category || currentCategory || '');
-
-		if (classicIsChildContentCategory(cat)) {
-			classicEnsureBaseGameIndex();
-
-			if (classicHasRelatedBaseGame(id) && !classicIsGameToRelatedLoop(id, cat)) {
-				return '<a href="#" class="classic-title-id-link id-text" title="Open base game" onclick="return classicOpenBaseGameFromTitleId(\'' + id + '\', \'' + cat + '\');">' + label + '<i class="fas fa-arrow-up-right-from-square"></i></a>';
-			}
-		}
-
-		return '<span class="id-text">' + label + '</span>';
-	}
-
-	function classicOpenBaseGameFromTitleId(titleId, sourceCategory) {
-		var id = classicCleanTitleId(titleId);
-		if (!id) return false;
-
-		var doc = document;
-		var modalEl = doc.getElementById('game-modal');
-		var wasModalOpen = modalEl && modalEl.style.display !== 'none';
-
-		if (wasModalOpen && typeof closeModal === 'function') {
-			closeModal();
-		}
-
-		var contentDiv = doc.querySelector ? doc.querySelector('.content') : null;
-
-		var previousState = {
-			category: currentCategory,
-			letter: g_letterFilter,
-			region: g_regionFilter,
-			query: (f && f.query) ? f.query.value : '',
-			limit: g_pcRenderLimit,
-			scroll: contentDiv ? contentDiv.scrollTop : 0
-		};
-
-		g_classicBaseFromRelated = {
-			sourceCategory: sourceCategory || currentCategory,
-			targetId: id
-		};
-		g_classicRelatedFromGame = null;
-
-		var targetCategory = classicGetRelatedBaseCategory(id) || 'games';
-		var fallbackCats = [targetCategory];
-
-		if (targetCategory !== 'games') fallbackCats.push('games');
-		if (targetCategory !== 'apps') fallbackCats.push('apps');
-		if (targetCategory !== 'demos') fallbackCats.push('demos');
-
-		g_classicBaseLookupFallback = {
-			id: id,
-			categories: fallbackCats,
-			index: 0
-		};
-		g_classicPendingCategorySearch = {
-			category: targetCategory,
-			query: id
-		};
-
-		g_classicInternalBaseOpen = true;
-		selectCategory(targetCategory);
-		g_classicInternalBaseOpen = false;
-
-		g_navHistory = previousState;
-
-		return false;
-	}
-
-	function classicWaitAndSearchBaseGame(titleId, attempts) {
-		var id = classicCleanTitleId(titleId);
-
-		if (currentCategory === 'games' && !g_isFetching && DB && DB.length > 0) {
-			if (f && f.query) f.query.value = id;
-			setFilter('search', id, null);
-			return;
-		}
-
-		if (attempts < 80) {
-			setTimeout(function() {
-				classicWaitAndSearchBaseGame(id, attempts + 1);
-			}, 150);
-		}
-	}
-
 	var g_sizeUnits = [" B", " KB", " MB", " GB"];
 
 	function formatFileSize(bytes) {
@@ -3069,13 +2617,6 @@ function classicIsGameToRelatedLoop(titleId, category) {
 		var doc = document;
 		var is_ps3_h = isPS3;
 		var f_obj = f;
-
-		g_classicRelatedFromGame = {
-			fromCategory: currentCategory,
-			targetCategory: cat,
-			baseGameId: title_id
-		};
-		g_classicBaseFromRelated = null;
 
 		g_currentFetchID++;
 		var thisFetchID = g_currentFetchID;
@@ -3170,21 +2711,6 @@ function classicIsGameToRelatedLoop(titleId, category) {
 					if (g_allMatches) g_allMatches.length = 0;
 					g_allMatches = matches_h;
 
-					var directMissingCount = 0;
-					for (var dm = 0; dm < matches_h.length; dm++) {
-						if (classicIsMissingLicenseRow(matches_h[dm])) directMissingCount++;
-					}
-
-					var directInternalLookup = g_classicBaseLookupFallback && classicCleanTitleId(g_classicBaseLookupFallback.id) === classicCleanTitleId(title_id);
-					var hideDirectMissingShell = !!(directInternalLookup && matches_h.length <= 1);
-
-					if (directMissingCount > 0) {
-						g_classicShowMissingLicenses = true;
-						g_classicMissingLicenseSearchKey = cat + "|" + title_id;
-						g_classicMissingLicenseSearchActive = true;
-					}
-					updateMissingLicenseFilterVisibility(directMissingCount, true, hideDirectMissingShell);
-
 					list_el.innerHTML = '';
 					g_currentChunkIndex = 0; 
 					renderChunk();
@@ -3198,60 +2724,17 @@ function classicIsGameToRelatedLoop(titleId, category) {
 		xhr.open('GET', url, true); xhr.send();
 	}
 
-	
-	function classicGetDbPathsForCategory(cat) {
-		var base_url = "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/database/content";
-		var off_url = base_url + "/official";
-		var unoff_url = base_url + "/unofficial";
-		var paths = [];
-
-		switch(cat) {
-			case "apps":           paths = [off_url + "/games.tsv", off_url + "/pending/games.tsv"]; break;
-			case "avatars":        paths = [off_url + "/avatars.tsv", off_url + "/pending/avatars.tsv"]; break;
-			case "demos":          paths = [off_url + "/demos.tsv", off_url + "/pending/demos.tsv", off_url + "/games.tsv", off_url + "/pending/games.tsv"]; break;
-			case "dlcs":           paths = [off_url + "/dlcs.tsv", off_url + "/pending/dlcs.tsv"]; break;
-			case "games":          paths = [off_url + "/games.tsv", off_url + "/pending/games.tsv"]; paths.push(base_url + "/external/nostalgia_vault.tsv"); break;
-			case "updates":        paths = [off_url + "/game_updates.tsv"]; break;
-			case "prototypes":     paths = [off_url + "/prototypes.tsv"]; break;
-			case "themes":         paths = [off_url + "/themes.tsv"]; break;
-			case "dev_tools":      paths = [off_url + "/tools.tsv"]; break;
-			case "backup_manager": paths = [unoff_url + "/backup_managers.tsv"]; break;
-			case "emulators":      paths = [unoff_url + "/emulators.tsv"]; break;
-			case "homebrew_games": paths = [unoff_url + "/games.tsv"]; break;
-			case "launchers":      paths = [unoff_url + "/launchers.tsv"]; break;
-			case "legacy":         paths = [unoff_url + "/legacy.tsv"]; break;
-			case "homebrew_apps":  paths = [unoff_url + "/apps.tsv"]; break;
-			case "ports":          paths = [unoff_url + "/ports.tsv"]; break;
-			case "tools":          paths = [unoff_url + "/tools.tsv"]; break;
-		}
-
-		return paths;
-	}
-
-
-function restorePreviousState() {
+	function restorePreviousState() {
 		var doc = document;
 		var h = g_navHistory;
 		if (!h) return;
 		g_navHistory = null;
-		g_classicRelatedFromGame = null;
-		g_classicBaseFromRelated = null;
-		g_classicBaseLookupFallback = null;
-		g_classicPendingCategorySearch = null;
 
 		clearListMemory();
 		
 		g_instantRender = true;
 
 		currentCategory = h.category;
-		dbPaths = classicGetDbPathsForCategory(currentCategory);
-
-		if (!isUnofficialMode) {
-			g_lastOfficialCat = currentCategory;
-		} else {
-			g_lastUnofficialCat = currentCategory;
-		}
-
 		g_pcRenderLimit = h.limit;
 		g_letterFilter = h.letter;
 		g_regionFilter = h.region;
@@ -3684,13 +3167,13 @@ function restorePreviousState() {
 				btnsObj.pkg = '<a href="' + finalLink_h + '" class="pkg-btn">PKG</a>';
 			}
 
-			if (!classicShouldHideChildShortcut(tid_h, 'updates') && !is_ps3_h && (cat_h === 'games' || cat_h === 'apps') && upd_map_h && upd_map_h[tid_h]) {
+			if (!is_ps3_h && (cat_h === 'games' || cat_h === 'apps') && upd_map_h && upd_map_h[tid_h]) {
 				btnsObj.upd = '<a href="#" class="upd-btn" onclick="openGameUpdates(\''+tid_h+'\');return false;">UPD</a>';
 			}
 
 			if (cat_h === 'games') {
-				if (!classicShouldHideChildShortcut(tid_h, 'avatars') && ava_map_h && ava_map_h[tid_h]) btnsObj.avt = '<a href="#" class="avatar-btn" onclick="openGameAvatars(\''+tid_h+'\');return false;">AVT</a>';
-				if (!classicShouldHideChildShortcut(tid_h, 'dlcs') && dlc_map_h && dlc_map_h[tid_h]) btnsObj.dlc = '<a href="#" class="dlc-btn" onclick="openGameDLCs(\''+tid_h+'\');return false;">DLC</a>';
+				if (ava_map_h && ava_map_h[tid_h]) btnsObj.avt = '<a href="#" class="avatar-btn" onclick="openGameAvatars(\''+tid_h+'\');return false;">AVT</a>';
+				if (dlc_map_h && dlc_map_h[tid_h]) btnsObj.dlc = '<a href="#" class="dlc-btn" onclick="openGameDLCs(\''+tid_h+'\');return false;">DLC</a>';
 			}
 
 			var rapStr = makeRap(row_h);
@@ -3710,13 +3193,13 @@ function restorePreviousState() {
 				var regionName = row_h[1] || 'ALL';
 
 				chunkArray_h.push(
-					'<div class="game-tile' + animClass_h + '" ' + animStyle_h + ' data-title_id="' + tid_h + '" data-category="' + cat_h + '">' +
+					'<div class="game-tile' + animClass_h + '" ' + animStyle_h + '>' +
 						'<div class="tile-content" style="position: relative;">' +
 							'<div class="console-tag ' + tagClass + '">' + consoleName + '</div>' +
 							'<div class="region-tag">' + regionName + '</div>' +
 							'<img id="img_' + tid_h + '_' + i + '" src="' + def_cover_h + '" data-title_id="' + tid_h + '" data-category="' + cat_h + '" data-content_id="' + escapeAttr(row_h[5] || '') + '" data-name="' + escapeAttr(name_h) + '" data-console="' + escapeAttr(row_h.cTag || 'ps3') + '" onclick="showGameDetails(' + i + ')" style="cursor:pointer;">' +
 							'<div class="title">' + name_h + '</div>' +
-							'<div class="title-id">' + classicBuildTitleIdHtml(tid_h, cat_h, true) + '</div>' +
+							'<div class="title-id">[' + tid_h + ']</div>' +
 							'<div class="size">' + size_h + '</div>' +
 							'<div class="links" style="height: auto;">' + finalButtonGrid + '</div>' +
 						'</div>' +
@@ -3727,13 +3210,12 @@ function restorePreviousState() {
 				var verTag_h = (isUpdateCat_h && row_h[10]) ? ' <span class="ver-tag" style="color:#FFE162;font-weight:bold;font-size:0.9em;">[' + row_h[10] + ']</span>' : "";
 				var liStyle_h = window.g_animCutoffFound ? 'style="animation: none !important; opacity: 1 !important; filter: blur(0) !important;"' : 'style="--li-idx:' + liIdx_h + ';"';
 	
-				chunkArray_h.push('<li data-title_id="' + tid_h + '" data-category="' + cat_h + '" ' + liStyle_h + '>' + name_h + ' ' + classicBuildTitleIdHtml(tid_h, cat_h, true) + verTag_h + ' <span class="size">' + size_h + '</span> ' + listButtonsHTML + '</li>');
+				chunkArray_h.push('<li data-title_id="' + tid_h + '" ' + liStyle_h + '>' + name_h + ' <span class="id-text">[' + tid_h + ']</span>' + verTag_h + ' <span class="size">' + size_h + '</span> ' + listButtonsHTML + '</li>');
 			}
 		}
 
 		if (chunkArray_h.length > 0) {
 			list_el.insertAdjacentHTML('beforeend', chunkArray_h.join(''));
-			if (g_classicBaseGameIndexLoaded && classicIsChildContentCategory(currentCategory)) classicRefreshVisibleTitleIdLinks();
 		}
 		chunkArray_h = null;
 
@@ -3774,21 +3256,7 @@ function restorePreviousState() {
 			if (g_navHistory) {
 				list_el.style.minHeight = 'auto';
 				if (btnF) {
-					var catNames = {
-						games: 'Games',
-						apps: 'Apps',
-						updates: 'Updates',
-						dlcs: 'DLCs',
-						avatars: 'Avatars',
-						themes: 'Themes',
-						demos: 'Demos',
-						prototypes: 'Prototypes',
-						homebrew_games: 'Homebrew',
-						homebrew_apps: 'Homebrew Apps',
-						homebrew_emulators: 'Emulators',
-						homebrew_ports: 'Ports'
-					};
-					var catN = catNames[g_navHistory.category] || 'Previous';
+					var catN = (g_navHistory.category === 'games') ? 'Games' : (g_navHistory.category === 'apps' ? 'Apps' : 'Previous');
 					btnF.innerHTML = "&#8592; Back to " + catN; 
 					btnF.style.display = 'block';
 					btnF.onclick = function() { restorePreviousState(); return false; };
@@ -3941,56 +3409,6 @@ function restorePreviousState() {
 		if (countEl) countEl.textContent = countMsg;
 	}
 
-
-	function classicTryNextBaseLookupCategory(currentCat, matchesCount) {
-		var st = g_classicBaseLookupFallback;
-		if (!st) return false;
-
-		var id = classicCleanTitleId(st.id);
-		var current = String(currentCat || currentCategory || '');
-		var queryNow = (f && f.query) ? classicCleanTitleId(f.query.value) : '';
-
-		if (!id || queryNow !== id) {
-			g_classicBaseLookupFallback = null;
-			return false;
-		}
-
-		if (matchesCount > 0) {
-			g_classicBaseLookupFallback = null;
-			return false;
-		}
-
-		var cats = st.categories || [];
-		var idx = Number(st.index || 0);
-
-		if (cats[idx] !== current) {
-			for (var i = 0; i < cats.length; i++) {
-				if (cats[i] === current) {
-					idx = i;
-					break;
-				}
-			}
-		}
-
-		idx++;
-
-		if (idx >= cats.length) {
-			g_classicBaseLookupFallback = null;
-			return false;
-		}
-
-		st.index = idx;
-		g_classicBaseLookupFallback = st;
-		g_classicPendingCategorySearch = {
-			category: cats[idx],
-			query: id
-		};
-
-		selectCategory(cats[idx]);
-		return true;
-	}
-
-
 	function render() {
 		var doc = document;
 		var is_ps3_h = isPS3;
@@ -4031,7 +3449,6 @@ function restorePreviousState() {
 			};
 
 			var displayName = categoryNames[cat_h] || cat_h;
-			updateMissingLicenseFilterButton();
 			if (f) {
 				f.send.disabled = (local_db_h.length === 0);
 				f.query.placeholder = "Search " + displayName;
@@ -4047,13 +3464,11 @@ function restorePreviousState() {
 			var targetLetter_h = isFilterLetter_h ? letter_f_h.substring(1).toUpperCase() : "";
 
 			var maxCollectLimit = is_ps3_h ? (isSearch_h ? 99 : 1500) : 99999;
-			var normalMatches_h = [];
-			var missingMatches_h = [];
-			var availableMissingLicenses_h = 0;
+			var matches_h = [];
 			var dbLen = local_db_h.length;
 
 			for (var i = 0; i < dbLen; i++) {
-				if ((normalMatches_h.length + missingMatches_h.length) >= maxCollectLimit) break;
+				if (matches_h.length >= maxCollectLimit) break;
 
 				var row = local_db_h[i];
 				if (!row || !row[2] || !row[3] || row[3] === "MISSING") continue;
@@ -4074,7 +3489,7 @@ function restorePreviousState() {
 					} else if (isFilterLetter_h) {
 						var nameToComp = (row.cleanName || row[2]);
 						var firstChar = nameToComp.charAt(0).toUpperCase();
-
+						
 						if (letter_f_h === "^[0-9]") {
 							if (firstChar < '0' || firstChar > '9') continue;
 						} else if (letter_f_h === "^[^0-9A-Z]") {
@@ -4084,53 +3499,7 @@ function restorePreviousState() {
 						}
 					}
 				}
-
-				if (classicIsMissingLicenseRow(row)) {
-					availableMissingLicenses_h++;
-					missingMatches_h.push(row);
-				} else {
-					normalMatches_h.push(row);
-				}
-			}
-
-			var totalCandidateCount_h = normalMatches_h.length + missingMatches_h.length;
-			var internalLookup_h = g_classicBaseLookupFallback && classicCleanTitleId(g_classicBaseLookupFallback.id) === classicCleanTitleId(searchValRaw_h);
-			var hideMissingShellForSingleInternalLookup_h = !!(internalLookup_h && totalCandidateCount_h <= 1);
-
-			var missingSearchKey_h = cat_h + "|" + reg_f_h + "|" + letter_f_h + "|" + searchValRaw_h;
-			if (isSearch_h && searchValRaw_h.length > 0) {
-				if (availableMissingLicenses_h > 0) {
-					if (hideMissingShellForSingleInternalLookup_h) {
-						g_classicShowMissingLicenses = true;
-						g_classicMissingLicenseSearchKey = missingSearchKey_h;
-						g_classicMissingLicenseSearchActive = true;
-					} else if (g_classicMissingLicenseSearchKey !== missingSearchKey_h) {
-						g_classicShowMissingLicenses = true;
-						g_classicMissingLicenseSearchKey = missingSearchKey_h;
-						g_classicMissingLicenseSearchActive = true;
-					} else {
-						g_classicMissingLicenseSearchActive = true;
-					}
-				} else {
-					g_classicShowMissingLicenses = false;
-					g_classicMissingLicenseSearchKey = missingSearchKey_h;
-					g_classicMissingLicenseSearchActive = false;
-				}
-			} else if (g_classicMissingLicenseSearchActive || g_classicMissingLicenseSearchKey) {
-				g_classicShowMissingLicenses = false;
-				g_classicMissingLicenseSearchKey = "";
-				g_classicMissingLicenseSearchActive = false;
-			}
-
-			updateMissingLicenseFilterVisibility(availableMissingLicenses_h, isSearch_h, hideMissingShellForSingleInternalLookup_h);
-
-			var matches_h = normalMatches_h;
-			if ((g_classicShowMissingLicenses || hideMissingShellForSingleInternalLookup_h) && missingMatches_h.length > 0) {
-				matches_h = normalMatches_h.concat(missingMatches_h);
-			}
-
-			if (classicTryNextBaseLookupCategory(cat_h, matches_h.length)) {
-				return;
+				matches_h.push(row);
 			}
 
 			matches_h.sort(function(a, b) {
@@ -4270,8 +3639,6 @@ function restorePreviousState() {
 				var title_id = parts[0];
 
 				if (!title_id || title_id.length !== 9) continue;
-
-				if (is_games || is_apps || is_demos) classicMarkBaseGameId(title_id, cat_h);
 				var url = parts[3];
 				if (!url || url === "MISSING") continue;
 	
@@ -4490,11 +3857,7 @@ function restorePreviousState() {
 			if (list_el) {
 				var currentText = list_el.textContent || "";
 				if (currentText.indexOf('Reloading') === -1) {
-					if (g_isSearchActive && f_obj_h && f_obj_h.query && f_obj_h.query.value) {
-						list_el.innerHTML = '<li class="no-results-msg">Searching ' + f_obj_h.query.value + '<span class="anim-dots"><span>.</span><span>.</span><span>.</span></span></li>';
-					} else {
-						list_el.innerHTML = '<li class="no-results-msg">Downloading database<span class="anim-dots"><span>.</span><span>.</span><span>.</span></span></li>';
-					}
+					list_el.innerHTML = '<li class="no-results-msg">Downloading database<span class="anim-dots"><span>.</span><span>.</span><span>.</span></span></li>';
 				}
 			}
 			if (btnMore_el) btnMore_el.style.display = 'none';
@@ -4672,8 +4035,6 @@ function restorePreviousState() {
 			var doc = document;
 			var is_ps3_h = isPS3;
 			var f_obj = f;
-
-			if (type === 'search' || type === 'letter' || type === 'region') g_classicBaseLookupFallback = null;
 
 			clearListMemory();
 
@@ -4878,12 +4239,6 @@ function restorePreviousState() {
 		var doc = document;
 		var is_ps3_h = isPS3;
 		var is_unoff_h = isUnofficialMode;
-		var pendingSearch = null;
-
-		if (g_classicPendingCategorySearch && g_classicPendingCategorySearch.category === cat) {
-			pendingSearch = classicCleanTitleId(g_classicPendingCategorySearch.query);
-			g_classicPendingCategorySearch = null;
-		}
 
 		if (is_unoff_h) {
 			g_lastUnofficialCat = cat;
@@ -4910,14 +4265,7 @@ function restorePreviousState() {
 		g_safeMode = (is_ps3_h && (g_gamesLoadCount > 1 || is_unoff_h || cat === 'dlcs'));
 
 		currentCategory = cat;
-
-		if (classicIsChildContentCategory(cat)) classicEnsureBaseGameIndex();
-
 		g_navHistory = null;
-		if (!g_classicInternalBaseOpen) {
-			g_classicRelatedFromGame = null;
-			g_classicBaseFromRelated = null;
-		}
 		g_pcRenderLimit = g_defaultRenderLimit;
 		g_isSearchActive = false;
 
@@ -4999,15 +4347,7 @@ function restorePreviousState() {
 			g_defaultLetterFilter = (smallCats.indexOf(cat) > -1) ? "" : "^[0-9]";
 		}
 
-		if (g_defaultLetterFilter && !pendingSearch) g_letterFilter = g_defaultLetterFilter;
-
-		if (pendingSearch) {
-			g_letterFilter = pendingSearch;
-			g_isSearchActive = true;
-			g_preSearchState = null;
-			g_pcRenderLimit = g_defaultRenderLimit;
-			if (f && f.query) f.query.value = pendingSearch;
-		}
+		if (g_defaultLetterFilter) g_letterFilter = g_defaultLetterFilter;
 
 		var letter_links = doc.getElementById("letters").getElementsByTagName("a"); 
 		for (var i = 0, len_l = letter_links.length; i < len_l; i++) letter_links[i].className = "";
@@ -5018,7 +4358,7 @@ function restorePreviousState() {
 
 		createLetterLinks();
 
-		if (!pendingSearch && g_defaultLetterFilter == '^[0-9]') {
+		if (g_defaultLetterFilter == '^[0-9]') {
 			var links_l = doc.getElementById("letters").getElementsByTagName("a");
 			for(var i = 0, len_ll = links_l.length; i < len_ll; i++) {
 				if (links_l[i].innerHTML === '[0-9]') {
@@ -5026,7 +4366,7 @@ function restorePreviousState() {
 					break;
 				}
 			}
-		} else if (!pendingSearch && !isPS3 && g_defaultLetterFilter === "") {
+		} else if (!isPS3 && g_defaultLetterFilter === "") {
 			var links_l = doc.getElementById("letters").getElementsByTagName("a");
 			for(var i = 0, len_ll = links_l.length; i < len_ll; i++) {
 				if (links_l[i].innerHTML === 'All') {
@@ -6581,7 +5921,7 @@ function restorePreviousState() {
 
 		var modal_id_el = doc.getElementById('modal-id');
 		if (modal_id_el) {
-			modal_id_el.innerHTML = classicBuildTitleIdHtml(id_h, cat_h, false);
+			modal_id_el.innerHTML = '<span style="color: #ffff00; font-weight: bold;">' + id_h + '</span>';
 		}
 
 		var modal_region_el = doc.getElementById('modal-region');
@@ -6633,17 +5973,17 @@ function restorePreviousState() {
 			btnsObj.pkg = '<a href="' + finalLink_h + '" class="pkg-btn">PKG</a>';
 		}
 		
-		if (!classicShouldHideChildShortcut(id_h, 'updates') && (cat_h === 'games' || cat_h === 'apps') && !is_ps3_h) {
+		if ((cat_h === 'games' || cat_h === 'apps') && !is_ps3_h) {
 			if (typeof g_updateExists !== 'undefined' && g_updateExists[id_h]) {
 				btnsObj.upd = '<a href="#" class="upd-btn" onclick="closeModal(); openGameUpdates(\'' + id_h + '\'); return false;">UPD</a>';
 			}
 		}
 
 		if (cat_h === 'games' && !is_unoff_h) {
-			if (!classicShouldHideChildShortcut(id_h, 'avatars') && typeof g_avatarExists !== 'undefined' && g_avatarExists[id_h]) {
+			if (typeof g_avatarExists !== 'undefined' && g_avatarExists[id_h]) {
 				btnsObj.avt = '<a href="#" class="avatar-btn" onclick="closeModal(); openGameAvatars(\'' + id_h + '\'); return false;">AVT</a>';
 			}
-			if (!classicShouldHideChildShortcut(id_h, 'dlcs') && typeof g_dlcExists !== 'undefined' && g_dlcExists[id_h]) {
+			if (typeof g_dlcExists !== 'undefined' && g_dlcExists[id_h]) {
 				btnsObj.dlc = '<a href="#" class="dlc-btn" onclick="closeModal(); openGameDLCs(\'' + id_h + '\'); return false;">DLC</a>';
 			}
 		}
