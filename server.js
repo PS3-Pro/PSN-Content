@@ -423,9 +423,109 @@ function preferLocalObjectPayload(currentValue, localValue) {
   return localSize > currentSize ? localValue : currentValue;
 }
 
+const PROFILE_ARRAY_SYNC_KEYS = {
+  wishlistData: { versionKey: 'wishlistUpdatedAt', countKey: 'wishlist' },
+  favoritesData: { versionKey: 'favoritesUpdatedAt', countKey: 'favorites' },
+  libraryData: { versionKey: 'libraryUpdatedAt', countKey: 'library' },
+  friendsData: { versionKey: 'friendsUpdatedAt', countKey: 'friends' }
+};
+
 function normalizeTimestampValue(value) {
   const timestamp = Number(value || 0);
   return Number.isFinite(timestamp) && timestamp > 0 ? timestamp : 0;
+}
+
+function getProfileArrayPayload(value) {
+  return Array.isArray(value) ? value : [];
+}
+
+function hasOwnPayload(target = {}, key = '') {
+  return Object.prototype.hasOwnProperty.call(target || {}, key);
+}
+
+function setProfileArrayPayload(target = {}, key = '', list = [], version = 0) {
+  const sync = PROFILE_ARRAY_SYNC_KEYS[key];
+  if (!sync) return target;
+  const safeList = Array.isArray(list) ? list : [];
+  target[key] = safeList;
+  target[sync.countKey] = safeList.length;
+  const safeVersion = normalizeTimestampValue(version);
+  if (safeVersion) target[sync.versionKey] = safeVersion;
+  else target[sync.versionKey] = normalizeTimestampValue(target[sync.versionKey]);
+  return target;
+}
+
+function normalizeProfileArrayPayloads(target = {}) {
+  Object.keys(PROFILE_ARRAY_SYNC_KEYS).forEach(key => {
+    const sync = PROFILE_ARRAY_SYNC_KEYS[key];
+    const list = Array.isArray(target[key]) ? target[key] : [];
+    target[key] = list;
+    target[sync.countKey] = list.length;
+    target[sync.versionKey] = normalizeTimestampValue(target[sync.versionKey]);
+  });
+  return target;
+}
+
+function reconcileIncomingProfileArrays(currentUser = {}, incomingUser = {}) {
+  Object.keys(PROFILE_ARRAY_SYNC_KEYS).forEach(key => {
+    const sync = PROFILE_ARRAY_SYNC_KEYS[key];
+    const hasIncomingArray = hasOwnPayload(incomingUser, key);
+    const hasIncomingCount = hasOwnPayload(incomingUser, sync.countKey);
+    const hasIncomingVersion = hasOwnPayload(incomingUser, sync.versionKey);
+    if (!hasIncomingArray && !hasIncomingCount && !hasIncomingVersion) return;
+
+    const currentList = getProfileArrayPayload(currentUser[key]);
+    const incomingList = getProfileArrayPayload(incomingUser[key]);
+    const currentVersion = normalizeTimestampValue(currentUser[sync.versionKey]);
+    const incomingVersion = normalizeTimestampValue(incomingUser[sync.versionKey]);
+    const currentHasItems = currentList.length > 0;
+    const incomingHasItems = incomingList.length > 0;
+
+    let acceptIncoming = false;
+
+    if (incomingVersion && (!currentVersion || incomingVersion >= currentVersion)) {
+      acceptIncoming = hasIncomingArray;
+    } else if (!currentVersion && !currentHasItems && incomingHasItems && hasIncomingArray) {
+      // One-time migration/recovery path: old localStorage can seed an empty DB.
+      acceptIncoming = true;
+    } else if (!currentVersion && !incomingVersion && !currentHasItems && hasIncomingArray) {
+      acceptIncoming = true;
+    }
+
+    if (acceptIncoming) {
+      incomingUser[key] = incomingList;
+      incomingUser[sync.countKey] = incomingList.length;
+      incomingUser[sync.versionKey] = incomingVersion || normalizeTimestampValue(incomingUser.profileUpdatedAt) || Date.now();
+    } else {
+      delete incomingUser[key];
+      delete incomingUser[sync.countKey];
+      delete incomingUser[sync.versionKey];
+    }
+  });
+
+  return incomingUser;
+}
+
+function applyLocalRecoveryArrayPayload(merged = {}, localData = {}, key = '') {
+  const sync = PROFILE_ARRAY_SYNC_KEYS[key];
+  if (!sync) return merged;
+
+  const dbList = getProfileArrayPayload(merged[key]);
+  const localList = getProfileArrayPayload(localData[key]);
+  const dbVersion = normalizeTimestampValue(merged[sync.versionKey]);
+  const localVersion = normalizeTimestampValue(localData[sync.versionKey]);
+  const dbHasItems = dbList.length > 0;
+  const localHasItems = localList.length > 0;
+
+  if (localVersion && (!dbVersion || localVersion > dbVersion)) {
+    return setProfileArrayPayload(merged, key, localList, localVersion);
+  }
+
+  if (!dbVersion && !dbHasItems && localHasItems) {
+    return setProfileArrayPayload(merged, key, localList, localVersion || normalizeTimestampValue(localData.profileUpdatedAt) || Date.now());
+  }
+
+  return setProfileArrayPayload(merged, key, dbList, dbVersion);
 }
 
 function applyDownloadsClearedState(target = {}, clearAt = 0) {
@@ -488,14 +588,11 @@ function mergeLocalRecoveryData(dbUser = {}, localData = {}) {
     merged.downloadsClearedAt = dbDownloadsClearedAt;
   }
 
-  ['wishlistData', 'favoritesData', 'libraryData', 'friendsData'].forEach(key => {
-    const preferred = preferLocalArrayPayload(merged[key], localData[key]);
-    if (preferred !== merged[key]) merged[key] = preferred;
-  });
+  Object.keys(PROFILE_ARRAY_SYNC_KEYS).forEach(key => applyLocalRecoveryArrayPayload(merged, localData, key));
   if (hasObjectPayload(localData.settingsData)) {
     merged.settingsData = { ...(merged.settingsData || {}), ...localData.settingsData };
   }
-  ['wishlist', 'favorites', 'trophies', 'library', 'level', 'xp'].forEach(key => {
+  ['trophies', 'level', 'xp'].forEach(key => {
     const current = Number(merged[key] || 0);
     const incoming = Number(localData[key] || 0);
     if (incoming > current) merged[key] = incoming;
@@ -506,6 +603,7 @@ function mergeLocalRecoveryData(dbUser = {}, localData = {}) {
     if (incomingDownloads > currentDownloads) merged.downloads = incomingDownloads;
   }
   if (Array.isArray(merged.downloadsData)) merged.downloads = merged.downloadsData.length;
+  normalizeProfileArrayPayloads(merged);
   return merged;
 }
 
@@ -766,9 +864,13 @@ function buildFullProfileSyncPayload(name, user = {}, sourceSocketId = null) {
       downloadsData: Array.isArray(safe.downloadsData) ? safe.downloadsData : [],
       downloadsClearedAt: normalizeTimestampValue(safe.downloadsClearedAt),
       wishlistData: Array.isArray(safe.wishlistData) ? safe.wishlistData : [],
+      wishlistUpdatedAt: normalizeTimestampValue(safe.wishlistUpdatedAt),
       favoritesData: Array.isArray(safe.favoritesData) ? safe.favoritesData : [],
+      favoritesUpdatedAt: normalizeTimestampValue(safe.favoritesUpdatedAt),
       libraryData: Array.isArray(safe.libraryData) ? safe.libraryData : [],
+      libraryUpdatedAt: normalizeTimestampValue(safe.libraryUpdatedAt),
       friendsData: Array.isArray(safe.friendsData) ? safe.friendsData : [],
+      friendsUpdatedAt: normalizeTimestampValue(safe.friendsUpdatedAt),
       countersData: safe.countersData || {},
       themeColor: safe.themeColor || '#0070cc',
       settingsData: safe.settingsData || {}
@@ -1246,6 +1348,7 @@ io.on('connection', async (socket) => {
             banned: isUserBanned(recoveredDbUser),
             profileUpdatedAt: recoveredDbUser.profileUpdatedAt || Date.now()
           };
+          normalizeProfileArrayPayloads(userDatabase[name]);
           
           await pool.query('UPDATE users SET data = $1 WHERE name = $2', [userDatabase[name], name]);
           await upsertPresenceForSocket(socket, name);
@@ -1307,6 +1410,7 @@ io.on('connection', async (socket) => {
           profileUpdatedAt: Date.now()
         });
         socket.role = getUserRole(name, userDatabase[name]);
+        normalizeProfileArrayPayloads(userDatabase[name]);
 
         await pool.query(
           'INSERT INTO users (name, data) VALUES ($1, $2)',
@@ -1374,10 +1478,12 @@ io.on('connection', async (socket) => {
         }
 
         userData = reconcileIncomingDownloads(userDatabase[name], userData || {});
+        userData = reconcileIncomingProfileArrays(userDatabase[name], userData || {});
         
         Object.assign(userDatabase[name], userData);
         if (Array.isArray(userDatabase[name].downloadsData)) userDatabase[name].downloads = userDatabase[name].downloadsData.length;
         userDatabase[name].downloadsClearedAt = normalizeTimestampValue(userDatabase[name].downloadsClearedAt);
+        normalizeProfileArrayPayloads(userDatabase[name]);
         userDatabase[name].lastSeen = Date.now();
         userDatabase[name].profileUpdatedAt = Date.now();
         

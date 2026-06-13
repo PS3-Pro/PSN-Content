@@ -5622,6 +5622,12 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
     const STORAGE_KEY_FAVS = "ps3_library_favs";
     const GLOBAL_USERS_KEY = 'psn_global_users';
 	const STORAGE_KEY_FRIENDS = "psn_friends_list";
+	const PROFILE_LIST_SYNC_TIMESTAMP_KEYS = {
+		wishlist: "psn_wishlist_updated_at",
+		favorites: "psn_favorites_updated_at",
+		library: "psn_library_updated_at",
+		friends: "psn_friends_updated_at"
+	};
 	if (!window.friendsList) window.friendsList = [];
 	
     
@@ -5823,6 +5829,40 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
         return window.localStorage.getItem(finalKey);
     }
 
+	function getProfileListTimestampStorageKey(type) {
+		return PROFILE_LIST_SYNC_TIMESTAMP_KEYS[type] || `psn_${type}_updated_at`;
+	}
+
+	function normalizeProfileListTimestamp(value) {
+		const timestamp = Number(value || 0);
+		return Number.isFinite(timestamp) && timestamp > 0 ? timestamp : 0;
+	}
+
+	function getProfileListUpdatedAtForAuth(username, type) {
+		const key = getProfileListTimestampStorageKey(type);
+		return normalizeProfileListTimestamp(readLocalUserValueForAuth(username, key, 0));
+	}
+
+	function setProfileListUpdatedAtForUser(username, type, value) {
+		const timestamp = normalizeProfileListTimestamp(value);
+		if (!username || username === "null" || !timestamp) return 0;
+		localStorage.setItem(`${username}_${getProfileListTimestampStorageKey(type)}`, String(timestamp));
+		return timestamp;
+	}
+
+	function applyProfileListUpdatedAtFromServer(username, type, value) {
+		return setProfileListUpdatedAtForUser(username, type, value);
+	}
+
+	function markProfileListChanged(type, stamp = Date.now()) {
+		const key = getProfileListTimestampStorageKey(type);
+		const timestamp = normalizeProfileListTimestamp(stamp) || Date.now();
+		saveState(key, String(timestamp));
+		return timestamp;
+	}
+
+	window.markProfileListChanged = markProfileListChanged;
+
 	function ensureFpsCounterDefaultOff() {
 		if (typeof STORAGE_KEY_FPS_COUNTER === 'undefined' || typeof STORAGE_KEY_FPS_COUNTER_DEFAULT_OFF_MIGRATION === 'undefined') return false;
 
@@ -5995,9 +6035,13 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 			downloadsData,
 			downloadsClearedAt: getDownloadHistoryClearPendingAt(username) || 0,
 			wishlistData,
+			wishlistUpdatedAt: getProfileListUpdatedAtForAuth(username, 'wishlist'),
 			favoritesData,
+			favoritesUpdatedAt: getProfileListUpdatedAtForAuth(username, 'favorites'),
 			libraryData,
+			libraryUpdatedAt: getProfileListUpdatedAtForAuth(username, 'library'),
 			friendsData,
+			friendsUpdatedAt: getProfileListUpdatedAtForAuth(username, 'friends'),
 			countersData: {
 				msgs: localStorage.getItem(`${username}_psn_chat_msgs_sent`) || '0',
 				imgs: localStorage.getItem(`${username}_psn_chat_imgs_sent`) || '0',
@@ -15720,6 +15764,7 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 		}
 		
 		saveState(STORAGE_KEY_WISHLIST, JSON.stringify(wishlist));
+		markProfileListChanged('wishlist');
 		checkTrophyProgress('wishlist_1', wishlist.length);
 		checkTrophyProgress('wishlist_10', wishlist.length);
 		checkTrophyProgress('wishlist_50', wishlist.length);
@@ -18467,6 +18512,7 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 				lastScannedGames = mergedGames;
 				window.lastScannedGames = lastScannedGames;
 				shouldRepaintLocalLibrary = previousSignature !== getLocalLibraryDataSignature(lastScannedGames);
+				if (shouldRepaintLocalLibrary) markProfileListChanged('library');
 			}
 	
 			if (shouldRepaintLocalLibrary || !grid.querySelector('.game-card')) {
@@ -18814,6 +18860,7 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 	
 		if (updated) {
 			saveState('psn_local_library', JSON.stringify(lastScannedGames));
+			markProfileListChanged('library');
 			
 			if (typeof broadcastProfileUpdate === 'function') {
 				broadcastProfileUpdate();
@@ -18952,6 +18999,7 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 		}
 	
 		saveState(STORAGE_KEY_FAVS, JSON.stringify(favoritesLibrary));
+		markProfileListChanged('favorites');
 		checkTrophyProgress('fav_1', favoritesLibrary.length);
 		checkTrophyProgress('fav_10', favoritesLibrary.length);
 	
@@ -18988,6 +19036,7 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 		
 		favoritesLibrary.splice(realIndex, 1);
 		saveState(STORAGE_KEY_FAVS, JSON.stringify(favoritesLibrary));
+		markProfileListChanged('favorites');
 		
 		const remaining = favoritesLibrary.filter(fav =>
 			lastScannedGames.some(installed => installed.path === fav.path)
@@ -26403,11 +26452,11 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 				localStorage.setItem(`${name}_psn_profile_updated_at`, String(incomingProfileUpdatedAt));
 			}
 			if (userData.trophiesData && typeof userData.trophiesData === 'object' && !Array.isArray(userData.trophiesData)) { window.userTrophies = userData.trophiesData; localStorage.setItem(`${name}_psn_user_trophies`, JSON.stringify(userData.trophiesData)); }
-			if (Array.isArray(userData.wishlistData)) { window.wishlist = userData.wishlistData; localStorage.setItem(`${name}_psn_wishlist_db`, JSON.stringify(userData.wishlistData)); }
+			if (Array.isArray(userData.wishlistData)) { window.wishlist = userData.wishlistData; localStorage.setItem(`${name}_psn_wishlist_db`, JSON.stringify(userData.wishlistData)); applyProfileListUpdatedAtFromServer(name, 'wishlist', userData.wishlistUpdatedAt); }
 			if (Array.isArray(userData.downloadsData)) { applyIncomingDownloadHistoryForProfile(name, userData, payload); }
-			if (Array.isArray(userData.favoritesData)) { window.favoritesLibrary = userData.favoritesData; localStorage.setItem(`${name}_ps3_library_favs`, JSON.stringify(userData.favoritesData)); }
-			if (Array.isArray(userData.libraryData)) { if (typeof lastScannedGames !== 'undefined') { lastScannedGames = userData.libraryData; window.lastScannedGames = lastScannedGames; } localStorage.setItem(`${name}_psn_local_library`, JSON.stringify(userData.libraryData)); }
-			if (Array.isArray(userData.friendsData)) { window.friendsList = userData.friendsData; localStorage.setItem(`${name}_psn_friends_list`, JSON.stringify(userData.friendsData)); }
+			if (Array.isArray(userData.favoritesData)) { window.favoritesLibrary = userData.favoritesData; localStorage.setItem(`${name}_ps3_library_favs`, JSON.stringify(userData.favoritesData)); applyProfileListUpdatedAtFromServer(name, 'favorites', userData.favoritesUpdatedAt); }
+			if (Array.isArray(userData.libraryData)) { if (typeof lastScannedGames !== 'undefined') { lastScannedGames = userData.libraryData; window.lastScannedGames = lastScannedGames; } localStorage.setItem(`${name}_psn_local_library`, JSON.stringify(userData.libraryData)); applyProfileListUpdatedAtFromServer(name, 'library', userData.libraryUpdatedAt); }
+			if (Array.isArray(userData.friendsData)) { window.friendsList = userData.friendsData; localStorage.setItem(`${name}_psn_friends_list`, JSON.stringify(userData.friendsData)); applyProfileListUpdatedAtFromServer(name, 'friends', userData.friendsUpdatedAt); }
 
 			if (userData.avatar) { localStorage.setItem(`${name}_psn_avatar`, userData.avatar); const sidebarAvatar = document.querySelector('.user-avatar'); if (sidebarAvatar) sidebarAvatar.style.backgroundImage = `url('${userData.avatar}')`; }
 			if (userData.joined) localStorage.setItem(`${name}_joined_date`, userData.joined);
@@ -26610,6 +26659,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 			if (Array.isArray(userData.wishlistData)) {
 				window.wishlist = userData.wishlistData;
 				localStorage.setItem(`${name}_psn_wishlist_db`, JSON.stringify(userData.wishlistData));
+				applyProfileListUpdatedAtFromServer(name, 'wishlist', userData.wishlistUpdatedAt);
 			} else {
 				const localWishlist = localStorage.getItem(`${name}_psn_wishlist_db`);
 				window.wishlist = localWishlist ? JSON.parse(localWishlist) : [];
@@ -26625,6 +26675,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 			if (Array.isArray(userData.favoritesData)) {
 				window.favoritesLibrary = userData.favoritesData;
 				localStorage.setItem(`${name}_ps3_library_favs`, JSON.stringify(userData.favoritesData));
+				applyProfileListUpdatedAtFromServer(name, 'favorites', userData.favoritesUpdatedAt);
 			} else {
 				const localFavs = localStorage.getItem(`${name}_ps3_library_favs`);
 				window.favoritesLibrary = localFavs ? JSON.parse(localFavs) : [];
@@ -26633,6 +26684,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 			if (Array.isArray(userData.libraryData)) {
 				if (typeof lastScannedGames !== 'undefined') { lastScannedGames = userData.libraryData; window.lastScannedGames = lastScannedGames; }
 				localStorage.setItem(`${name}_psn_local_library`, JSON.stringify(userData.libraryData));
+				applyProfileListUpdatedAtFromServer(name, 'library', userData.libraryUpdatedAt);
 			} else {
 				const localLib = localStorage.getItem(`${name}_psn_local_library`);
 				if (typeof lastScannedGames !== 'undefined') { lastScannedGames = localLib ? JSON.parse(localLib) : []; window.lastScannedGames = lastScannedGames; }
@@ -26642,6 +26694,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 			if (Array.isArray(userData.friendsData)) {
 				window.friendsList = userData.friendsData;
 				localStorage.setItem(`${name}_psn_friends_list`, JSON.stringify(userData.friendsData));
+				applyProfileListUpdatedAtFromServer(name, 'friends', userData.friendsUpdatedAt);
 			} else {
 				const localFriends = localStorage.getItem(`${name}_psn_friends_list`);
 				window.friendsList = localFriends ? JSON.parse(localFriends) : [];
@@ -27834,9 +27887,13 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 			downloadsData: window.downloadHistory || [],
 			downloadsClearedAt: Number(loadState(STORAGE_KEY_DOWNLOAD_CLEAR_PENDING) || 0) || 0,
 			wishlistData: window.wishlist || [],
+			wishlistUpdatedAt: normalizeProfileListTimestamp(loadState(getProfileListTimestampStorageKey('wishlist'))),
 			favoritesData: window.favoritesLibrary || [],
+			favoritesUpdatedAt: normalizeProfileListTimestamp(loadState(getProfileListTimestampStorageKey('favorites'))),
 			libraryData: typeof lastScannedGames !== 'undefined' ? lastScannedGames : [],
+			libraryUpdatedAt: normalizeProfileListTimestamp(loadState(getProfileListTimestampStorageKey('library'))),
 			friendsData: window.friendsList || [],
+			friendsUpdatedAt: normalizeProfileListTimestamp(loadState(getProfileListTimestampStorageKey('friends'))),
 			countersData: myCounters, 
 			themeColor: myTheme,
 			settingsData: {
@@ -30394,6 +30451,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 		}
 		
 		saveState(STORAGE_KEY_FRIENDS, JSON.stringify(window.friendsList));
+		markProfileListChanged('friends');
 		
 		checkTrophyProgress('friend_1', window.friendsList.length);
 		checkTrophyProgress('friend_10', window.friendsList.length);
