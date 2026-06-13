@@ -2655,14 +2655,9 @@
 	function classicIsMissingLicenseRow(row) {
 		if (!row) return false;
 
-		var rapHex = row[4];
-		var contentId = row[5];
+		var rapHex = String(row[4] || '').replace(/^\s+|\s+$/g, '').toUpperCase();
 
-		if (!contentId || contentId === "MISSING") return false;
-		if (rapHex === "NOT REQUIRED") return false;
-		if (rapHex && rapHex !== "MISSING" && rapHex.length === 32) return false;
-
-		return true;
+		return rapHex === "MISSING";
 	}
 
 	function updateMissingLicenseFilterButton() {
@@ -3208,7 +3203,7 @@ function classicIsGameToRelatedLoop(titleId, category) {
 		switch(cat) {
 			case "apps":           paths = [off_url + "/games.tsv", off_url + "/pending/games.tsv"]; break;
 			case "avatars":        paths = [off_url + "/avatars.tsv", off_url + "/pending/avatars.tsv"]; break;
-			case "demos":          paths = [off_url + "/demos.tsv", off_url + "/pending/demos.tsv", off_url + "/games.tsv", off_url + "/pending/games.tsv"]; break;
+			case "demos":          paths = [off_url + "/games.tsv", off_url + "/pending/games.tsv", off_url + "/demos.tsv", off_url + "/pending/demos.tsv"]; break;
 			case "dlcs":           paths = [off_url + "/dlcs.tsv", off_url + "/pending/dlcs.tsv"]; break;
 			case "games":          paths = [off_url + "/games.tsv", off_url + "/pending/games.tsv"]; paths.push(base_url + "/external/nostalgia_vault.tsv"); break;
 			case "updates":        paths = [off_url + "/game_updates.tsv"]; break;
@@ -4050,11 +4045,12 @@ function restorePreviousState() {
 			var normalMatches_h = [];
 			var missingMatches_h = [];
 			var availableMissingLicenses_h = 0;
+			var totalCandidateCount_h = 0;
+			var searchCandidateMissingLicenseCount_h = 0;
+			var collectedCount_h = 0;
 			var dbLen = local_db_h.length;
 
 			for (var i = 0; i < dbLen; i++) {
-				if ((normalMatches_h.length + missingMatches_h.length) >= maxCollectLimit) break;
-
 				var row = local_db_h[i];
 				if (!row || !row[2] || !row[3] || row[3] === "MISSING") continue;
 
@@ -4085,32 +4081,39 @@ function restorePreviousState() {
 					}
 				}
 
-				if (classicIsMissingLicenseRow(row)) {
+				totalCandidateCount_h++;
+
+				var isMissingLicense_h = classicIsMissingLicenseRow(row);
+				if (isMissingLicense_h) {
 					availableMissingLicenses_h++;
-					missingMatches_h.push(row);
+					if (isSearch_h && searchValRaw_h.length > 0) searchCandidateMissingLicenseCount_h++;
+
+					if (collectedCount_h < maxCollectLimit) {
+						missingMatches_h.push(row);
+						collectedCount_h++;
+					}
 				} else {
-					normalMatches_h.push(row);
+					if (collectedCount_h < maxCollectLimit) {
+						normalMatches_h.push(row);
+						collectedCount_h++;
+					}
 				}
 			}
 
-			var totalCandidateCount_h = normalMatches_h.length + missingMatches_h.length;
+			var searchLooksLikeTitleId_h = /^[a-z]{4}\d{5}$/i.test(searchValRaw_h);
+			var searchCanUseMissingLicenseFilter_h = !!(isSearch_h && searchValRaw_h.length > 0 && searchCandidateMissingLicenseCount_h > 0 && (totalCandidateCount_h > 1 || searchLooksLikeTitleId_h || totalCandidateCount_h === 1));
+
 			var internalLookup_h = g_classicBaseLookupFallback && classicCleanTitleId(g_classicBaseLookupFallback.id) === classicCleanTitleId(searchValRaw_h);
 			var hideMissingShellForSingleInternalLookup_h = !!(internalLookup_h && totalCandidateCount_h <= 1);
 
 			var missingSearchKey_h = cat_h + "|" + reg_f_h + "|" + letter_f_h + "|" + searchValRaw_h;
 			if (isSearch_h && searchValRaw_h.length > 0) {
-				if (availableMissingLicenses_h > 0) {
-					if (hideMissingShellForSingleInternalLookup_h) {
+				if (searchCanUseMissingLicenseFilter_h) {
+					if (g_classicMissingLicenseSearchKey !== missingSearchKey_h) {
 						g_classicShowMissingLicenses = true;
 						g_classicMissingLicenseSearchKey = missingSearchKey_h;
-						g_classicMissingLicenseSearchActive = true;
-					} else if (g_classicMissingLicenseSearchKey !== missingSearchKey_h) {
-						g_classicShowMissingLicenses = true;
-						g_classicMissingLicenseSearchKey = missingSearchKey_h;
-						g_classicMissingLicenseSearchActive = true;
-					} else {
-						g_classicMissingLicenseSearchActive = true;
 					}
+					g_classicMissingLicenseSearchActive = true;
 				} else {
 					g_classicShowMissingLicenses = false;
 					g_classicMissingLicenseSearchKey = missingSearchKey_h;
@@ -4122,7 +4125,7 @@ function restorePreviousState() {
 				g_classicMissingLicenseSearchActive = false;
 			}
 
-			updateMissingLicenseFilterVisibility(availableMissingLicenses_h, isSearch_h, hideMissingShellForSingleInternalLookup_h);
+			updateMissingLicenseFilterVisibility(availableMissingLicenses_h, isSearch_h, hideMissingShellForSingleInternalLookup_h || (isSearch_h && !searchCanUseMissingLicenseFilter_h));
 
 			var matches_h = normalMatches_h;
 			if ((g_classicShowMissingLicenses || hideMissingShellForSingleInternalLookup_h) && missingMatches_h.length > 0) {
@@ -4943,7 +4946,7 @@ function restorePreviousState() {
 		switch(cat) {
 			case "apps":           paths = [off_url + "/games.tsv", off_url + "/pending/games.tsv"]; break;
 			case "avatars":        paths = [off_url + "/avatars.tsv", off_url + "/pending/avatars.tsv"]; break;
-			case "demos":          paths = [off_url + "/demos.tsv", off_url + "/pending/demos.tsv", off_url + "/games.tsv", off_url + "/pending/games.tsv"]; break;
+			case "demos":          paths = [off_url + "/games.tsv", off_url + "/pending/games.tsv", off_url + "/demos.tsv", off_url + "/pending/demos.tsv"]; break;
 			case "dlcs":           paths = [off_url + "/dlcs.tsv", off_url + "/pending/dlcs.tsv"]; break;
 			case "games":		   paths = [off_url + "/games.tsv", off_url + "/pending/games.tsv"]; paths.push(base_url + "/external/nostalgia_vault.tsv"); break;
 			case "updates":        paths = [off_url + "/game_updates.tsv"]; break;
