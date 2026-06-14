@@ -8944,7 +8944,7 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 			} else if (prefix4 === "NPUF" || (prefix4 === "NPJJ" && tid.charAt(4) === '3')) {
 				cTag = "pce";
 				isClassifiedById = true;
-			} else if (prefix4 === "NPEF" || char3 === 'J' || char3 === 'I' || char3 === 'E' || char3 === 'F') {
+			} else if (prefix2 === "NP" && (prefix4 === "NPEF" || char3 === 'J' || char3 === 'I' || char3 === 'E' || char3 === 'F')) {
 				cTag = "psx";
 				isClassifiedById = true;
 			} else if (prefix2 === "UC" || prefix2 === "UL" || (prefix2 === "NP" && (char3 === 'G' || char3 === 'H'))) {
@@ -9107,6 +9107,15 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 		getOnlineCoverFallback(imgElement);
 	};
 	
+	window.getBingCoverFallbackUrl = function(gameName, consoleTag) {
+		gameName = String(gameName || '').trim();
+		let searchConsole = String(consoleTag || 'ps3').trim().toUpperCase();
+		if (searchConsole === 'PSX') searchConsole = 'PS1';
+		if (!gameName) gameName = 'PlayStation game';
+		const query = encodeURIComponent(`${gameName} ${searchConsole} high-quality official game front cover art`);
+		return `https://tse4.mm.bing.net/th?q=${query}`;
+	};
+
 	window.getOnlineCoverFallback = function(imgElement) {
 	    if (imgElement.getAttribute('data-bing-tried') === 'true') {
 	        imgElement.onerror = null;
@@ -9118,10 +9127,7 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 	    imgElement.setAttribute('data-bing-tried', 'true');
 	    let gameName = imgElement.getAttribute('data-name') || '';
 	    let consoleTag = imgElement.getAttribute('data-console') || 'ps3';
-	    let searchConsole = consoleTag.toUpperCase();
-	    if (searchConsole === 'PSX') searchConsole = 'PS1';
-	    const query = encodeURIComponent(`${gameName} ${searchConsole} high-quality official game front cover art`);
-	    imgElement.src = `https://tse4.mm.bing.net/th?q=${query}`;
+	    imgElement.src = window.getBingCoverFallbackUrl(gameName, consoleTag);
 	};
 	
 	window.sortOrders = {
@@ -11145,6 +11151,34 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 		return direct || safeFallback || 'games';
 	};
 
+	window.getSafeConsoleTagForItem = function(item = {}, category = '') {
+		const normalize = (value, fallback = '') => (typeof window.normalizeContentCategoryKey === 'function')
+			? window.normalizeContentCategoryKey(value, fallback)
+			: String(value || fallback || '').trim().toLowerCase().replace(/\s+/g, '_');
+
+		const cat = normalize(category || item.category || item.contentCategory || item.contentType || '', '');
+		const ps3NativeContent = new Set(['ports', 'homebrew_games', 'no_psn', 'tools', 'dev_tools', 'backup_manager', 'emulators', 'launchers', 'legacy']);
+		const pathUpper = String(item.path || '').toUpperCase();
+		const id = String(item.id || item.titleId || item.titleID || item.titleid || '').trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
+		const text = `${item.cleanName || ''} ${item.name || ''} ${item.title || ''} ${item.rawName || ''}`.toLowerCase();
+		let tag = String(item.cTag || item.console || item.consoleType || '').trim().toLowerCase().replace(/^ps1$/, 'psx');
+
+		if (pathUpper.includes('/PS2ISO/')) return 'ps2';
+		if (pathUpper.includes('/PSXISO/')) return 'psx';
+		if (pathUpper.includes('/PSPISO/')) return 'psp';
+
+		if (ps3NativeContent.has(cat)) return 'ps3';
+
+		const validTags = new Set(['ps3', 'ps2', 'psx', 'psp', 'minis', 'pce', 'neogeo']);
+		if (!validTags.has(tag)) tag = 'ps3';
+
+		const hasPs1Text = /\bps(?:x|1)\b|playstation\s*1/.test(text);
+		const looksLikeOfficialPsnId = id.indexOf('NP') === 0;
+		if (tag === 'psx' && id && !looksLikeOfficialPsnId && !hasPs1Text) return 'ps3';
+
+		return tag;
+	};
+
 
 	window.findCachedStoreCategoryForItem = function(item = {}) {
 		if (!item || !window.psnStoreCache) return '';
@@ -11311,13 +11345,18 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 		}
 
 		finalCategory = (matched && matched.category) ? matched.category : matchedCat || resolvedCategory;
+		const rawConsoleTag = item.cTag || item.console || (matched ? matched.cTag : '') || 'ps3';
+		const safeConsoleTag = (typeof window.getSafeConsoleTagForItem === 'function')
+			? window.getSafeConsoleTagForItem(Object.assign({}, matched || {}, item, { category: finalCategory, cTag: rawConsoleTag, console: rawConsoleTag }), finalCategory)
+			: rawConsoleTag;
 
 		return Object.assign({}, matched || {}, item, {
 			id: titleId || (matched ? matched.id : ''),
 			titleId: titleId || (matched ? matched.id : ''),
 			contentId: currentContentId || (matched ? (matched.contentId || '') : ''),
 			cleanName: item.cleanName || (matched ? matched.cleanName : '') || item.name || item.title || '',
-			cTag: item.cTag || item.console || (matched ? matched.cTag : '') || 'ps3',
+			cTag: safeConsoleTag,
+			console: safeConsoleTag,
 			category: finalCategory
 		});
 	};
@@ -11331,16 +11370,52 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 		return cat === 'themes' || cat === 'avatars';
 	};
 
+
+	window.isPrivateOrLocalCoverUrl = function(src) {
+		const s = String(src || '').trim().toLowerCase();
+		if (!s) return false;
+		return s.charAt(0) === '/' || /^https?:\/\/(?:localhost|127\.|10\.|192\.168\.|169\.254\.|172\.(?:1[6-9]|2\d|3[0-1])\.)/i.test(s);
+	};
+
+	window.getProfileListSafeCover = function({ item = {}, listType = '', itemCoverData = {}, itemFinalCategory = '', itemCoverId = '', isMe = false } = {}) {
+		const normalizedList = String(listType || '').toLowerCase();
+		const smartCoverLists = ['downloads', 'wishlist', 'library', 'favs', 'favorites'];
+		const cat = itemFinalCategory || itemCoverData.category || item.category || 'games';
+		const savedCover = String(itemCoverData.cover || item.cover || '').trim();
+
+		if (!smartCoverLists.includes(normalizedList)) {
+			return (typeof getOptimizedCover === 'function' && itemCoverId && isNaN(itemCoverId)) ? getOptimizedCover(itemCoverId) : (savedCover || FALLBACK_IMG);
+		}
+
+		if (typeof getItemCover === 'function' && itemCoverId && isNaN(itemCoverId)) {
+			return getItemCover({ ...itemCoverData, id: itemCoverId, titleId: itemCoverId }, cat);
+		}
+
+		const canUseSavedCover = !!savedCover && savedCover !== FALLBACK_IMG && (!window.isPrivateOrLocalCoverUrl(savedCover) || isMe);
+		if (canUseSavedCover) return savedCover;
+
+		const name = String(itemCoverData.cleanName || item.cleanName || item.name || item.title || '').trim();
+		if (name && name !== 'Unknown Game' && !(window.isThemeAvatarCategory && window.isThemeAvatarCategory(cat))) {
+			return 'data:image/png;base64,BING';
+		}
+
+		return savedCover || FALLBACK_IMG;
+	};
+
 	window.sanitizeDownloadCoverRecord = function(item = {}, listType = 'downloads') {
 		const baseCategory = (typeof window.getProfileListItemCategory === 'function') ? window.getProfileListItemCategory(item, listType) : (item.category || 'games');
 		const coverData = (typeof window.getDownloadCoverData === 'function') ? window.getDownloadCoverData(item, baseCategory) : item;
 		const finalCategory = coverData.category || baseCategory || item.category || 'games';
+		const rawConsoleTag = coverData.cTag || item.cTag || item.console || 'ps3';
+		const safeConsoleTag = (typeof window.getSafeConsoleTagForItem === 'function')
+			? window.getSafeConsoleTagForItem(Object.assign({}, item, coverData, { category: finalCategory, cTag: rawConsoleTag, console: rawConsoleTag }), finalCategory)
+			: rawConsoleTag;
 		const fixed = Object.assign({}, item, {
 			category: finalCategory,
 			contentId: coverData.contentId || item.contentId || item.contentID || '',
 			cleanName: coverData.cleanName || item.cleanName || item.name || item.title || '',
-			cTag: coverData.cTag || item.cTag || item.console || 'ps3',
-			console: coverData.cTag || item.cTag || item.console || 'ps3'
+			cTag: safeConsoleTag,
+			console: safeConsoleTag
 		});
 
 		if (window.isThemeAvatarCategory(finalCategory)) {
@@ -11379,7 +11454,7 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 	window.refreshOpenProfileListCovers = function() {
 		const modal = document.getElementById('modal-sys-list');
 		const last = window.__lastProfileListRender;
-		if (!modal || !last || !['downloads', 'wishlist'].includes(last.listType)) return;
+		if (!modal || !last || !['downloads', 'wishlist', 'library', 'favs', 'favorites'].includes(last.listType)) return;
 		if (modal.style.display !== 'flex' && modal.style.display !== 'block') return;
 
 		const body = document.getElementById('list-modal-body');
@@ -18694,9 +18769,14 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 	
 			if (!window.libCoverCache[game.path]) {
 				const gameId = game.id || (game.path.match(/[A-Z]{4}\d{5}/) ? game.path.match(/[A-Z]{4}\d{5}/)[0] : null);
+				const localCover = String(game.cover || '').trim();
+				const hasUsableLocalCover = !!localCover && localCover !== FALLBACK_IMG && !/NOCOVER00\.JPG/i.test(localCover);
+				const smartCover = (gameId && isNaN(gameId))
+					? getOptimizedCover(gameId)
+					: (hasUsableLocalCover ? localCover : 'data:image/png;base64,BING');
 				window.libCoverCache[game.path] = {
 					id: gameId,
-					cover: (gameId && isNaN(gameId)) ? getOptimizedCover(gameId) : (game.cover || FALLBACK_IMG)
+					cover: smartCover
 				};
 			}
 			
@@ -18809,7 +18889,10 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 			}
 	
 			const localCoverKey = game.path || cachedData.id || game.title || '';
-			const displayCover = (typeof window.getCachedCardCoverSrc === 'function' ? window.getCachedCardCoverSrc(localCoverKey) : '') || cachedData.cover;
+			let displayCover = (typeof window.getCachedCardCoverSrc === 'function' ? window.getCachedCardCoverSrc(localCoverKey) : '') || cachedData.cover;
+			if ((!displayCover || displayCover === FALLBACK_IMG || /NOCOVER00\.JPG/i.test(String(displayCover))) && game.title) {
+				displayCover = 'data:image/png;base64,BING';
+			}
 			const card = document.createElement('div');
 			card.className = `game-card ${animClass} ${activeClass} ${favClass}`
 			card.dataset.console = consoleType.toLowerCase();
@@ -19365,7 +19448,10 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 
 			const card = document.createElement('div');
 			const favDotKey = (typeof getFavoriteDotKey === 'function') ? getFavoriteDotKey(game) : (game.path || game.title || '');
-			const displayCover = (typeof window.getCachedCardCoverSrc === 'function' ? window.getCachedCardCoverSrc(favDotKey) : '') || cachedData.cover;
+			let displayCover = (typeof window.getCachedCardCoverSrc === 'function' ? window.getCachedCardCoverSrc(favDotKey) : '') || cachedData.cover;
+			if ((!displayCover || displayCover === FALLBACK_IMG || /NOCOVER00\.JPG/i.test(String(displayCover))) && game.title) {
+				displayCover = 'data:image/png;base64,BING';
+			}
 			card.className = `game-card ${animClass} ${isSilent ? "no-img-fade" : ""} ${activeClass} is-favorited`;
 			card.style.setProperty('--tile-idx', i % 50);
 			card.setAttribute('data-category-dot-key', favDotKey);
@@ -31457,27 +31543,31 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 						<div class="trophy-date"><div style="color: ${color}; font-weight: bold; font-size: 10px; margin-bottom: 5px;">${(item.type || 'trophy').toUpperCase()}</div><i class="far fa-clock"></i> ${trophyDate}</div>
 					</div>`;
 			} else {
-				if ((listType === 'downloads' || listType === 'wishlist') && typeof window.sanitizeDownloadCoverRecord === 'function') item = window.sanitizeDownloadCoverRecord(item, listType);
+				if (['downloads', 'wishlist', 'library', 'favs', 'favorites'].includes(listType) && typeof window.sanitizeDownloadCoverRecord === 'function') item = window.sanitizeDownloadCoverRecord(item, listType);
 				const realId = item.titleId || item.id;
 				const itemName = item.cleanName || item.name || item.title || "Unknown Game";
 				const itemTypeCategory = (typeof window.getProfileListItemCategory === 'function') ? window.getProfileListItemCategory(item, listType) : (item.category || 'games');
 				const itemPathUpper = String(item.path || '').toUpperCase();
-				const profileUsesBingCover = (listType === 'downloads' || listType === 'wishlist');
+				const profileUsesBingCover = ['downloads', 'wishlist', 'library', 'favs', 'favorites'].includes(listType);
 				const itemCoverData = (typeof window.getDownloadCoverData === 'function') ? window.getDownloadCoverData(item, itemTypeCategory) : { id: realId, titleId: realId, contentId: item.contentId, cleanName: itemName, cTag: item.cTag || item.console || 'ps3', category: itemTypeCategory };
 				const itemFinalCategory = itemCoverData.category || itemTypeCategory;
-				const itemConsoleTag = itemCoverData.cTag || item.cTag || item.console || (itemPathUpper.includes('/PS2ISO/') ? 'ps2' : (itemPathUpper.includes('/PSXISO/') ? 'psx' : (itemPathUpper.includes('/PSPISO/') ? 'psp' : 'ps3')));
-				const itemCover = profileUsesBingCover
-					? ((typeof getItemCover === 'function' && realId && isNaN(realId)) ? getItemCover(itemCoverData, itemFinalCategory) : (item.cover || FALLBACK_IMG))
-					: ((typeof getOptimizedCover === 'function' && realId && isNaN(realId)) ? getOptimizedCover(realId) : FALLBACK_IMG);
+				const itemCoverId = realId || itemCoverData.titleId || itemCoverData.id || '';
+				const rawItemConsoleTag = itemCoverData.cTag || item.cTag || item.console || (itemPathUpper.includes('/PS2ISO/') ? 'ps2' : (itemPathUpper.includes('/PSXISO/') ? 'psx' : (itemPathUpper.includes('/PSPISO/') ? 'psp' : 'ps3')));
+				const itemConsoleTag = (typeof window.getSafeConsoleTagForItem === 'function')
+					? window.getSafeConsoleTagForItem(Object.assign({}, item, itemCoverData, { category: itemFinalCategory, cTag: rawItemConsoleTag, console: rawItemConsoleTag }), itemFinalCategory)
+					: rawItemConsoleTag;
+				const itemCover = (typeof window.getProfileListSafeCover === 'function')
+					? window.getProfileListSafeCover({ item, listType, itemCoverData, itemFinalCategory, itemCoverId, isMe })
+					: (profileUsesBingCover ? ((typeof getItemCover === 'function' && itemCoverId && isNaN(itemCoverId)) ? getItemCover(itemCoverData, itemFinalCategory) : (item.cover || FALLBACK_IMG)) : ((typeof getOptimizedCover === 'function' && itemCoverId && isNaN(itemCoverId)) ? getOptimizedCover(itemCoverId) : FALLBACK_IMG));
 				const itemCoverName = window.escapePlayerListText(itemCoverData.cleanName || itemName);
 				const itemCoverConsole = window.escapePlayerListText(itemConsoleTag);
 				const itemCoverCategoryRaw = String(itemFinalCategory || itemTypeCategory || 'games');
 				const itemCoverCategory = itemCoverCategoryRaw.replace(/"/g, '&quot;');
 				const itemNoBingCover = (itemCoverCategoryRaw === 'avatars' || itemCoverCategoryRaw === 'themes') ? 'true' : 'false';
-				const isSearchable = realId && isNaN(realId) && realId.length >= 5;
+				const isSearchable = itemCoverId && isNaN(itemCoverId) && itemCoverId.length >= 5;
 				
 				let existsInStore = false;
-				let searchId = realId ? realId.toUpperCase() : "";
+				let searchId = itemCoverId ? itemCoverId.toUpperCase() : "";
 				let searchTitle = itemName ? itemName.toLowerCase().replace(/[^a-z0-9]/g, '') : "";
 
 				if (listType === 'downloads' || listType === 'wishlist') {
@@ -31509,7 +31599,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 
 				if (isSearchable) {
 					if (existsInStore) {
-						clickAction = `onclick="playUiClick(); searchGameFromProfileList('${realId}', '${targetUser}', '${listType}', '${bgView}', '${returnToOnline}', '${itemSearchCategory}', '${itemSearchContentId}')"`;
+						clickAction = `onclick="playUiClick(); searchGameFromProfileList('${itemCoverId}', '${targetUser}', '${listType}', '${bgView}', '${returnToOnline}', '${itemSearchCategory}', '${itemSearchContentId}')"`;
 						searchTagHtml = `<div style="color: var(--ps-blue); font-size: 9px; font-weight: 900; letter-spacing: 1px; margin-top: 5px;">SEARCH</div>`;
 					} else {
 						searchTagHtml = `<div style="color: #ff4444; font-size: 9px; font-weight: 900; letter-spacing: 1px; margin-top: 5px;">${searchId} - NOT FOUND</div>`;
@@ -31523,7 +31613,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 				const typeClass = `dl-kind-${typeMeta.cls || 'default'}`;
 				const profileCoverImgHtml = profileUsesBingCover
 					? `<img src="${itemCover}" data-name="${itemCoverName}" data-console="${itemCoverConsole}" data-cover-category="${itemCoverCategory}" data-no-bing="${itemNoBingCover}" onerror="handleCoverError(this, this.getAttribute('data-cover-category'))">`
-					: `<img src="${itemCover}" onerror="this.src='${FALLBACK_IMG}'">`;
+					: `<img src="${itemCover}" data-name="${itemCoverName}" data-console="${itemCoverConsole}" data-cover-category="${itemCoverCategory}" onerror="handleCoverError(this, this.getAttribute('data-cover-category'))">`;
 
 				html += `
 					<div class="download-item social-list-item ${typeClass}" onmouseenter="if(typeof playUiHover === 'function') playUiHover()" ${clickAction} ${cursorStyle}>
