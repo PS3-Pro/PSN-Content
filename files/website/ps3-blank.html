@@ -12,7 +12,44 @@
     var isPS3 = /PS3|PlayStation 3|NetFront/i.test(navigator.userAgent) || window.location.search.indexOf("mode=ps3") > -1;
 	document.documentElement.className += (isPS3 ? " is-ps3" : " is-pc");
 
-	window.resizeTo(screen.width, screen.height);
+	var PS3_FORCE_FULLSCREEN_ENABLED = true;
+	var PS3_FORCE_FULLSCREEN_INTERVAL_MS = 3000;
+	var g_ps3FullscreenWatchdog = null;
+
+	function classicPs3ForceWindowFullscreen() {
+		if (!isPS3 || !PS3_FORCE_FULLSCREEN_ENABLED) return;
+		try { window.moveTo(0, 0); } catch(e1) {}
+		try {
+			if (screen && screen.width && screen.height) {
+				window.resizeTo(screen.width, screen.height);
+			}
+		} catch(e2) {}
+		try { window.focus(); } catch(e3) {}
+	}
+
+	function classicPs3PulseFullscreen() {
+		if (!isPS3 || !PS3_FORCE_FULLSCREEN_ENABLED) return;
+		classicPs3ForceWindowFullscreen();
+		try { setTimeout(classicPs3ForceWindowFullscreen, 90); } catch(e1) {}
+		try { setTimeout(classicPs3ForceWindowFullscreen, 350); } catch(e2) {}
+		try { setTimeout(classicPs3ForceWindowFullscreen, 900); } catch(e3) {}
+	}
+
+	function classicPs3StartFullscreenWatchdog() {
+		if (!isPS3 || !PS3_FORCE_FULLSCREEN_ENABLED) return;
+		classicPs3PulseFullscreen();
+		try { if (g_ps3FullscreenWatchdog) clearInterval(g_ps3FullscreenWatchdog); } catch(e1) {}
+		try { g_ps3FullscreenWatchdog = setInterval(classicPs3ForceWindowFullscreen, PS3_FORCE_FULLSCREEN_INTERVAL_MS || 3000); } catch(e2) {}
+	}
+
+	if (isPS3) {
+		classicPs3StartFullscreenWatchdog();
+		try { window.onload = classicPs3PulseFullscreen; } catch(e1) {}
+		try { window.onfocus = classicPs3PulseFullscreen; } catch(e2) {}
+		try { window.onresize = classicPs3PulseFullscreen; } catch(e3) {}
+		try { document.onclick = classicPs3PulseFullscreen; } catch(e4) {}
+		try { document.onkeydown = classicPs3PulseFullscreen; } catch(e5) {}
+	}
 
 	document.addEventListener("DOMContentLoaded", function() {
 		if (typeof updateMissingLicenseFilterButton === 'function') updateMissingLicenseFilterButton();
@@ -741,17 +778,8 @@
 		#trailer-title { margin: 0 40px 15px 40px; text-align: center; color: #fff; font-size: 20px; line-height: 24px; }
 		#trailer-modal .trailer-modal-content { width: 800px; max-width: 95%; flex-direction: column; padding: 20px; align-items: center; position: relative; box-sizing: border-box; text-align: center; }
 		body.is-pc #trailer-modal { justify-content: center; align-items: center; }
-		body.is-pc #trailer-modal .modal_wrap_ps3 { display: flex; justify-content: center; align-items: center; width: 100%; height: 100%; padding: 24px; box-sizing: border-box; }
-		body.is-pc #trailer-modal .trailer-modal-content { display: block !important; width: 1000px !important; max-width: calc(100vw - 96px) !important; height: auto !important; min-height: 0 !important; padding: 16px !important; box-sizing: border-box !important; overflow: visible !important; text-align: center !important; }
-		body.is-pc #trailer-title { width: auto !important; margin: 0 44px 14px 44px !important; padding: 0 !important; font-size: 22px !important; line-height: 26px !important; text-align: center !important; }
-		body.is-pc #trailer-video-box { position: relative !important; width: 100% !important; height: 0 !important; padding-bottom: 56.25% !important; margin: 0 auto !important; background: #000000 !important; border-radius: 8px !important; overflow: hidden !important; box-shadow: 0 5px 15px rgba(0,0,0,0.5) !important; border: 1px solid rgba(255,255,255,0.1) !important; box-sizing: border-box !important; }
-		body.is-pc #trailer-iframe { position: absolute !important; top: 0 !important; left: 0 !important; width: 100% !important; height: 100% !important; border: 0 !important; display: block !important; }
+		body.is-pc #trailer-modal .modal_wrap_ps3 { display: flex; justify-content: center; align-items: center; width: 100%; height: 100%; }
 		body.is-pc #trailer-flash-player { display: none !important; }
-		@media screen and (max-width: 900px) {
-			body.is-pc #trailer-modal .modal_wrap_ps3 { padding: 14px !important; }
-			body.is-pc #trailer-modal .trailer-modal-content { max-width: calc(100vw - 40px) !important; padding: 12px !important; }
-			body.is-pc #trailer-title { font-size: 18px !important; line-height: 22px !important; margin: 0 38px 10px 38px !important; }
-		}
 
 		body.is-ps3 #trailer-modal { text-align: center !important; box-sizing: border-box !important; background: rgba(0, 0, 0, 0.9) !important; }
 		body.is-ps3 #trailer-modal .modal_wrap_ps3 { display: table-cell !important; vertical-align: middle !important; width: 100% !important; height: 100% !important; text-align: center !important; }
@@ -6264,6 +6292,9 @@ function restorePreviousState() {
 	var YOUTUBE_PS3_PLAYER_SWF = "https://github.com/PS3-Pro/Pages/raw/main/resources/swf/video_player/video_player_27.swf";
 	var YOUTUBE_PS3_PREVIEW = "https://ps3-pro.github.io/Pages/resources/media/visualizer_preview.png";
 
+	// PS3 trailer mode: "tab" = player page in new tab/window, "modal" = old Flash modal inside this page.
+	var PS3_TRAILER_OPEN_MODE = "tab";
+
 	function classicIsTrailerAllowed(cat) {
 		return cat === 'games' || cat === 'demos' || cat === 'updates' || cat === 'ports' || cat === 'homebrew_games' || cat === 'prototypes';
 	}
@@ -6321,139 +6352,6 @@ function restorePreviousState() {
 		try { localStorage.setItem('yt_key_index', String(index)); } catch(e) {}
 	}
 
-	function classicFetchRawgTrailer(gameName, callback) {
-		var cleanQuery = String(gameName || '').replace(/^\s+|\s+$/g, '');
-		if (!cleanQuery) {
-			callback(null);
-			return;
-		}
-
-		function trySearchKey(keyIndex) {
-			if (keyIndex >= RAWG_KEYS.length) {
-				callback(null);
-				return;
-			}
-
-			var currentKey = RAWG_KEYS[keyIndex];
-			var rawgSearchUrl = 'https://api.rawg.io/api/games?key=' + currentKey + '&search=' + encodeURIComponent(cleanQuery) + '&page_size=1';
-			var xhr = new XMLHttpRequest();
-
-			xhr.onreadystatechange = function() {
-				if (xhr.readyState !== 4) return;
-
-				if (xhr.status === 200 || xhr.status === 0) {
-					try {
-						var data = JSON.parse(xhr.responseText || '{}');
-						if (data.results && data.results.length > 0 && data.results[0].slug) {
-							classicFetchRawgMovie(data.results[0].slug, keyIndex, callback);
-							return;
-						}
-					} catch(e) {}
-					callback(null);
-					return;
-				}
-
-				if (xhr.status === 401 || xhr.status === 403 || xhr.status === 429) {
-					trySearchKey(keyIndex + 1);
-					return;
-				}
-
-				callback(null);
-			};
-
-			xhr.onerror = function() {
-				callback(null);
-			};
-
-			try {
-				xhr.open('GET', rawgSearchUrl, true);
-				xhr.send(null);
-			} catch(e) {
-				callback(null);
-			}
-		}
-
-		trySearchKey(0);
-	}
-
-	function classicFetchRawgMovie(slug, keyIndex, callback) {
-		if (keyIndex >= RAWG_KEYS.length) {
-			callback(null);
-			return;
-		}
-
-		var apiKey = RAWG_KEYS[keyIndex];
-		var moviesUrl = 'https://api.rawg.io/api/games/' + encodeURIComponent(slug) + '/movies?key=' + apiKey;
-		var xhr = new XMLHttpRequest();
-
-		xhr.onreadystatechange = function() {
-			if (xhr.readyState !== 4) return;
-
-			if (xhr.status === 200 || xhr.status === 0) {
-				try {
-					var data = JSON.parse(xhr.responseText || '{}');
-					var movie = classicPickRawgMovie(data);
-					if (movie && movie.url) {
-						callback(movie);
-						return;
-					}
-				} catch(e) {}
-				callback(null);
-				return;
-			}
-
-			if (xhr.status === 401 || xhr.status === 403 || xhr.status === 429) {
-				classicFetchRawgMovie(slug, keyIndex + 1, callback);
-				return;
-			}
-
-			callback(null);
-		};
-
-		xhr.onerror = function() {
-			callback(null);
-		};
-
-		try {
-			xhr.open('GET', moviesUrl, true);
-			xhr.send(null);
-		} catch(e) {
-			callback(null);
-		}
-	}
-
-	function classicPickRawgMovie(data) {
-		var results = data && data.results ? data.results : [];
-		if (!results || !results.length) return null;
-
-		for (var i = 0; i < results.length; i++) {
-			var item = results[i] || {};
-			var movieData = item.data || {};
-			var candidates = [
-				movieData['480'],
-				movieData.max,
-				movieData['720'],
-				movieData['1080'],
-				item.preview
-			];
-
-			for (var c = 0; c < candidates.length; c++) {
-				var url = String(candidates[c] || '').replace(/^\s+|\s+$/g, '');
-				if (url && /^https?:\/\//i.test(url)) {
-					return {
-						source: 'rawg',
-						url: url,
-						name: item.name || 'RAWG Trailer',
-						preview: item.preview || '',
-						quality: c === 0 ? '480' : (c === 1 ? 'max' : '')
-					};
-				}
-			}
-		}
-
-		return null;
-	}
-
 	function classicFetchYoutubeVideoId(gameName, callback) {
 		var keys = YOUTUBE_KEYS;
 		var query = encodeURIComponent((gameName || '') + ' PS3 gameplay trailer');
@@ -6504,18 +6402,95 @@ function restorePreviousState() {
 		tryKey(startIndex);
 	}
 
-	function classicSetTrailerTitleHtml(html) {
-		var titleEl = document.getElementById('trailer-title');
-		if (titleEl) titleEl.innerHTML = html || 'Gameplay';
+	function classicPs3TrailerEscapeAttr(value) {
+		return String(value == null ? '' : value)
+			.replace(/&/g, '&amp;')
+			.replace(/</g, '&lt;')
+			.replace(/>/g, '&gt;')
+			.replace(/"/g, '&quot;')
+			.replace(/'/g, '&#39;');
 	}
 
-	var classicCurrentTrailerGameName = '';
-
-	function classicBuildTrailerFallbackLink() {
-		return ' <a href="#" onclick="classicPlayYoutubeTrailer(); return false;" style="display:inline-block;margin-left:8px;padding:2px 7px;background:#202a44;border:1px solid #66ccff;border-radius:4px;color:#fff;text-decoration:none;font-size:11px;line-height:15px;vertical-align:middle;">YouTube</a>';
+	function classicBuildPs3FlashPlayerUrl(videoId, title, state) {
+		var href = String(window.location.href || '');
+		var hashIndex = href.indexOf('#');
+		if (hashIndex >= 0) href = href.substring(0, hashIndex);
+		var queryIndex = href.indexOf('?');
+		if (queryIndex >= 0) href = href.substring(0, queryIndex);
+		var slashIndex = href.lastIndexOf('/');
+		var base = slashIndex >= 0 ? href.substring(0, slashIndex + 1) : '';
+		var cleanVideo = String(videoId || '').replace(/[^A-Za-z0-9_-]/g, '');
+		var cleanTitle = String(title || 'Gameplay');
+		var cleanState = state || (cleanVideo ? 'video' : 'loading');
+		var returnUrl = String(window.location.href || '');
+		return 'https://ps3-pro.github.io/PSN-Content/resources/interface/classic/html/trailer.html?type=video&state=' + encodeURIComponent(cleanState) + '&video=' + encodeURIComponent(cleanVideo) + '&title=' + encodeURIComponent(cleanTitle) + '&return=' + encodeURIComponent(returnUrl) + '&cb=' + (new Date().getTime()) + '_' + Math.floor(Math.random() * 999999);
 	}
 
-	function classicMountPs3TrailerPlayer(videoId) {
+	function classicPs3TrailerPopupFeatures() {
+		var w = 960;
+		var h = 540;
+		try { if (screen && screen.width) w = screen.width; } catch(e1) {}
+		try { if (screen && screen.height) h = screen.height; } catch(e2) {}
+		return 'width=' + w + ',height=' + h + ',left=0,top=0,screenX=0,screenY=0,menubar=no,toolbar=no,location=no,status=no,scrollbars=no,resizable=yes,fullscreen=yes';
+	}
+
+	function classicPs3TrailerUsesNewTab() {
+		try {
+			return String(PS3_TRAILER_OPEN_MODE || 'tab').toLowerCase() !== 'modal';
+		} catch(e) {
+			return true;
+		}
+	}
+
+	function classicOpenPs3TrailerPopupShell(title) {
+		var popup = null;
+		var name = 'ps3_trailer_' + (new Date().getTime()) + '_' + Math.floor(Math.random() * 999999);
+		var url = classicBuildPs3FlashPlayerUrl('', title || 'Gameplay', 'loading');
+		try {
+			popup = window.open(url, name, classicPs3TrailerPopupFeatures());
+			try { if (popup && popup.moveTo) popup.moveTo(0, 0); } catch(e1) {}
+			try { if (popup && popup.resizeTo && screen) popup.resizeTo(screen.width || 960, screen.height || 540); } catch(e2) {}
+			try { if (popup && popup.focus) popup.focus(); } catch(e3) {}
+		} catch(e4) {
+			popup = null;
+		}
+		return popup;
+	}
+
+	function classicNavigatePs3TrailerPopup(popup, videoId, title) {
+		var url = classicBuildPs3FlashPlayerUrl(videoId, title || 'Gameplay', 'video');
+		try {
+			if (popup && !popup.closed) {
+				popup.location.href = url;
+				try { if (popup.moveTo) popup.moveTo(0, 0); } catch(e1) {}
+				try { if (popup.resizeTo && screen) popup.resizeTo(screen.width || 960, screen.height || 540); } catch(e2) {}
+				try { if (popup.focus) popup.focus(); } catch(e3) {}
+				return true;
+			}
+		} catch(e4) {}
+
+		try {
+			var fallbackName = 'ps3_trailer_' + (new Date().getTime()) + '_' + Math.floor(Math.random() * 999999);
+			var fallbackPopup = window.open(url, fallbackName, classicPs3TrailerPopupFeatures());
+			try { if (fallbackPopup && fallbackPopup.moveTo) fallbackPopup.moveTo(0, 0); } catch(e5) {}
+			try { if (fallbackPopup && fallbackPopup.resizeTo && screen) fallbackPopup.resizeTo(screen.width || 960, screen.height || 540); } catch(e6) {}
+			try { if (fallbackPopup && fallbackPopup.focus) fallbackPopup.focus(); } catch(e7) {}
+			return !!fallbackPopup;
+		} catch(e8) {}
+
+		return false;
+	}
+
+	function classicShowPs3TrailerExternalLink(videoId, title) {
+		classicOpenTrailerModal();
+		classicSetTrailerTitle(title || 'Gameplay');
+		var flashEl = document.getElementById('trailer-flash-player');
+		if (!flashEl) return;
+		var url = classicBuildPs3FlashPlayerUrl(videoId, title || 'Gameplay', 'video');
+		flashEl.innerHTML = '<div style="width:960px;height:540px;background:#000;color:#fff;text-align:center;font-family:Arial,sans-serif;box-sizing:border-box;padding-top:205px;"><div style="font-size:20px;font-weight:bold;margin-bottom:18px;color:#66ccff;">Trailer player ready</div><a href="' + classicPs3TrailerEscapeAttr(url) + '" target="_blank" style="display:inline-block;background:#b31217;color:#fff;border:1px solid #e52d27;border-radius:5px;padding:12px 22px;font-size:18px;font-weight:bold;text-decoration:none;">Open Trailer Player</a><div style="font-size:13px;color:#aaa;margin-top:18px;">Automatic new tab was blocked. Open it manually here.</div></div>';
+	}
+
+	function classicMountPs3TrailerPlayerModal(videoId) {
 		var flashEl = document.getElementById('trailer-flash-player');
 		if (!flashEl) return;
 
@@ -6540,47 +6515,34 @@ function restorePreviousState() {
 		}
 	}
 
-	function classicMountPs3RawgTrailerPlayer(rawgUrl) {
-		var flashEl = document.getElementById('trailer-flash-player');
-		if (!flashEl) return;
-
-		flashEl.innerHTML = '';
-
-		var flashvars_936 = {};
-		var params_936 = {
-			quality: 'low',
-			wmode: 'transparent',
-			bgcolor: '#000000',
-			allowScriptAccess: 'always',
-			allowFullScreen: 'false',
-			flashvars: 'fichier=' + encodeURIComponent(rawgUrl) + '&auto_play=true&apercu='
-		};
-		var attributes_936 = {};
-
-		try {
-			flashObject(YOUTUBE_PS3_PLAYER_SWF, 'trailer-flash-player', '960', '540', '8', false, flashvars_936, params_936, attributes_936);
-		} catch(e) {
-			flashEl.innerHTML = '<div style="padding-top:280px;color:#ff6666;font-size:18px;font-weight:bold;">Flash player error</div>';
-		}
-	}
-
-	function classicPlayRawgTrailer(rawgMovie, gameName) {
-		var safeName = gameName || classicCurrentTrailerGameName || 'Game';
-		var label = safeName + ' - RAWG Trailer';
-		classicSetTrailerTitleHtml(modalSafeText(label) + classicBuildTrailerFallbackLink());
-
-		if (typeof isPS3 !== 'undefined' && isPS3) {
-			classicMountPs3RawgTrailerPlayer(rawgMovie.url);
+	function classicMountPs3TrailerPlayer(videoId, title, popup) {
+		if (classicPs3TrailerUsesNewTab()) {
+			if (classicNavigatePs3TrailerPopup(popup, videoId, title || 'Gameplay')) return;
+			classicShowPs3TrailerExternalLink(videoId, title || 'Gameplay');
 			return;
 		}
-
-		var iframeEl = document.getElementById('trailer-iframe');
-		if (iframeEl) iframeEl.src = rawgMovie.url;
+		classicMountPs3TrailerPlayerModal(videoId);
 	}
+	
+	window.playTrailer = function(gameName) {
+		var safeName = gameName || 'Game';
 
-	window.classicPlayYoutubeTrailer = function() {
-		var safeName = classicCurrentTrailerGameName || 'Game';
-		classicSetTrailerTitle('Searching YouTube...');
+		if (typeof isPS3 !== 'undefined' && isPS3 && classicPs3TrailerUsesNewTab()) {
+			var ps3Popup = classicOpenPs3TrailerPopupShell(safeName);
+			classicFetchYoutubeVideoId(safeName, function(videoId) {
+				if (!videoId) {
+					try {
+						if (ps3Popup && !ps3Popup.closed) ps3Popup.location.href = classicBuildPs3FlashPlayerUrl('', safeName, 'error');
+					} catch(e0) {}
+					return;
+				}
+				classicMountPs3TrailerPlayer(videoId, safeName, ps3Popup);
+			});
+			return false;
+		}
+
+		classicOpenTrailerModal();
+		classicSetTrailerTitle('Searching video...');
 
 		classicFetchYoutubeVideoId(safeName, function(videoId) {
 			if (!videoId) {
@@ -6588,10 +6550,10 @@ function restorePreviousState() {
 				return;
 			}
 
-			classicSetTrailerTitle(safeName + ' - YouTube Gameplay');
+			classicSetTrailerTitle(safeName + ' - Gameplay');
 
 			if (typeof isPS3 !== 'undefined' && isPS3) {
-				classicMountPs3TrailerPlayer(videoId);
+				classicMountPs3TrailerPlayer(videoId, safeName, null);
 				return;
 			}
 
@@ -6599,23 +6561,6 @@ function restorePreviousState() {
 			if (iframeEl) iframeEl.src = 'https://www.youtube.com/embed/' + videoId + '?autoplay=1';
 		});
 	};
-	
-	window.playTrailer = function(gameName) {
-		var safeName = gameName || 'Game';
-		classicCurrentTrailerGameName = safeName;
-		classicOpenTrailerModal();
-		classicSetTrailerTitle('Searching RAWG trailer...');
-
-		classicFetchRawgTrailer(safeName, function(rawgMovie) {
-			if (rawgMovie && rawgMovie.url) {
-				classicPlayRawgTrailer(rawgMovie, safeName);
-				return;
-			}
-
-			classicPlayYoutubeTrailer();
-		});
-	};
-
 	
 	window.closeTrailer = function(e) {
 		var shouldClose = false;
@@ -6633,6 +6578,7 @@ function restorePreviousState() {
 			var modalEl = document.getElementById('trailer-modal');
 			if (modalEl) modalEl.style.display = 'none';
 			classicClearTrailerPlayers();
+			if (typeof classicPs3PulseFullscreen === 'function') classicPs3PulseFullscreen();
 		}
 	};
 
@@ -6887,6 +6833,8 @@ function restorePreviousState() {
 		if (typeof g_currentGallery !== 'undefined') {
 			g_currentGallery = [];
 		}
+
+		if (typeof classicPs3PulseFullscreen === 'function') classicPs3PulseFullscreen();
 	}
 
 	function showGameDetails(gameIndex) {
