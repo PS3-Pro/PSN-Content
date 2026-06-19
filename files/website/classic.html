@@ -6321,19 +6321,62 @@ function restorePreviousState() {
 		try { localStorage.setItem('yt_key_index', String(index)); } catch(e) {}
 	}
 
-	function classicFetchYoutubeVideoId(gameName, callback) {
+	var classicTrailerResults = [];
+	var classicTrailerIndex = 0;
+	var classicTrailerGameName = '';
+	var classicTrailerNextPageToken = '';
+	var classicTrailerLoadingMore = false;
+	var classicTrailerNoMoreResults = false;
+	var classicTrailerLastQuery = '';
+	var CLASSIC_TRAILER_PAGE_SIZE = 10;
+
+	function classicGetTrailerVideoTitle(item) {
+		try {
+			if (item && item.snippet && item.snippet.title) return item.snippet.title;
+		} catch(e) {}
+		return 'YouTube video';
+	}
+
+	function classicBuildYoutubeSearchUrl(gameName, pageToken) {
 		var keys = YOUTUBE_KEYS;
+		var keyIndex = classicGetStoredYoutubeKeyIndex();
+		if (keyIndex < 0 || keyIndex >= keys.length) keyIndex = 0;
+
 		var query = encodeURIComponent((gameName || '') + ' PS3 gameplay trailer');
+		var apiUrl = 'https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&maxResults=' + CLASSIC_TRAILER_PAGE_SIZE + '&q=' + query + '&key=' + keys[keyIndex];
+
+		if (pageToken) {
+			apiUrl += '&pageToken=' + encodeURIComponent(pageToken);
+		}
+
+		return {
+			url: apiUrl,
+			keyIndex: keyIndex
+		};
+	}
+
+	function classicFetchYoutubeVideoPage(gameName, pageToken, callback) {
+		var keys = YOUTUBE_KEYS;
 		var startIndex = classicGetStoredYoutubeKeyIndex();
 		if (startIndex < 0 || startIndex >= keys.length) startIndex = 0;
 
 		function tryKey(index) {
 			if (index >= keys.length) {
-				callback(null);
+				callback({
+					videos: [],
+					nextPageToken: '',
+					error: 'No YouTube API key available'
+				});
 				return;
 			}
 
-			var apiUrl = 'https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&maxResults=1&q=' + query + '&key=' + keys[index];
+			var query = encodeURIComponent((gameName || '') + ' PS3 gameplay trailer');
+			var apiUrl = 'https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&maxResults=' + CLASSIC_TRAILER_PAGE_SIZE + '&q=' + query + '&key=' + keys[index];
+
+			if (pageToken) {
+				apiUrl += '&pageToken=' + encodeURIComponent(pageToken);
+			}
+
 			var xhr = new XMLHttpRequest();
 
 			xhr.onreadystatechange = function() {
@@ -6347,29 +6390,219 @@ function restorePreviousState() {
 
 				if (xhr.status === 200 || xhr.status === 0) {
 					try {
-						var data = JSON.parse(xhr.responseText);
-						if (data.items && data.items.length > 0 && data.items[0].id && data.items[0].id.videoId) {
-							callback(data.items[0].id.videoId);
-							return;
+						var data = JSON.parse(xhr.responseText || '{}');
+						var items = data.items || [];
+						var videos = [];
+						var used = {};
+
+						for (var i = 0; i < items.length; i++) {
+							if (items[i] && items[i].id && items[i].id.videoId) {
+								var id = items[i].id.videoId;
+								if (!used[id]) {
+									used[id] = true;
+									videos.push({
+										videoId: id,
+										title: classicGetTrailerVideoTitle(items[i])
+									});
+								}
+							}
 						}
-					} catch(e) {}
+
+						callback({
+							videos: videos,
+							nextPageToken: data.nextPageToken || '',
+							error: ''
+						});
+						return;
+					} catch(e) {
+						callback({
+							videos: [],
+							nextPageToken: '',
+							error: 'Invalid YouTube response'
+						});
+						return;
+					}
 				}
 
-				callback(null);
+				callback({
+					videos: [],
+					nextPageToken: '',
+					error: 'YouTube search failed'
+				});
 			};
 
-			xhr.onerror = function() { callback(null); };
+			xhr.onerror = function() {
+				callback({
+					videos: [],
+					nextPageToken: '',
+					error: 'YouTube search error'
+				});
+			};
 
 			try {
 				xhr.open('GET', apiUrl, true);
 				xhr.send(null);
 			} catch(e) {
-				callback(null);
+				callback({
+					videos: [],
+					nextPageToken: '',
+					error: 'YouTube search blocked'
+				});
 			}
 		}
 
 		tryKey(startIndex);
 	}
+
+	function classicAppendTrailerResults(videos) {
+		var used = {};
+		var i;
+
+		for (i = 0; i < classicTrailerResults.length; i++) {
+			if (classicTrailerResults[i] && classicTrailerResults[i].videoId) {
+				used[classicTrailerResults[i].videoId] = true;
+			}
+		}
+
+		for (i = 0; i < videos.length; i++) {
+			if (videos[i] && videos[i].videoId && !used[videos[i].videoId]) {
+				used[videos[i].videoId] = true;
+				classicTrailerResults.push(videos[i]);
+			}
+		}
+	}
+
+	function classicFetchMoreTrailers(callback) {
+		if (classicTrailerLoadingMore) return;
+		if (classicTrailerNoMoreResults) return;
+
+		classicTrailerLoadingMore = true;
+		classicRenderTrailerTitle('Loading more...');
+
+		classicFetchYoutubeVideoPage(classicTrailerLastQuery, classicTrailerNextPageToken, function(result) {
+			classicTrailerLoadingMore = false;
+
+			if (!result || result.error) {
+				classicTrailerNoMoreResults = true;
+				classicRenderTrailerTitle();
+				if (callback) callback(false);
+				return;
+			}
+
+			classicAppendTrailerResults(result.videos || []);
+			classicTrailerNextPageToken = result.nextPageToken || '';
+
+			if (!classicTrailerNextPageToken) {
+				classicTrailerNoMoreResults = true;
+			}
+
+			classicRenderTrailerTitle();
+			if (callback) callback((result.videos || []).length > 0);
+		});
+	}
+
+	// Compatibilidade com chamadas antigas que esperam só 1 ID.
+	function classicFetchYoutubeVideoId(gameName, callback) {
+		classicFetchYoutubeVideoPage(gameName, '', function(result) {
+			var videos = result && result.videos ? result.videos : [];
+			if (videos.length && videos[0].videoId) {
+				callback(videos[0].videoId);
+				return;
+			}
+			callback(null);
+		});
+	}
+
+	function classicTrailerButtonHtml(label, actionName) {
+		return '<a href="#" onclick="' + actionName + '(); return false;" style="display:inline-block;vertical-align:top;margin:0 4px;padding:2px 8px;background:#111;border:1px solid #66ccff;border-radius:4px;color:#fff;text-decoration:none;font-size:12px;line-height:16px;font-weight:bold;">' + modalSafeText(label) + '</a>';
+	}
+
+	function classicRenderTrailerTitle(statusText) {
+		var item = classicTrailerResults[classicTrailerIndex];
+		var total = classicTrailerResults.length || 0;
+		var current = classicTrailerIndex + 1;
+		var title = classicTrailerGameName || 'Gameplay';
+		var hasMore = !!classicTrailerNextPageToken && !classicTrailerNoMoreResults;
+		var html = modalSafeText(title) + ' - Trailer';
+
+		if (total > 0) {
+			html += ' ' + current + '/' + total + (hasMore ? '+' : '');
+		}
+
+		if (item && item.videoId) {
+			html += '<div style="font-size:11px;line-height:14px;color:#aaa;margin-top:4px;font-weight:normal;">';
+			html += 'ID: <span style="color:#ffff00;">' + modalSafeText(item.videoId) + '</span>';
+			if (item.title) html += ' &nbsp; ' + modalSafeText(item.title);
+			html += '</div>';
+		}
+
+		if (statusText) {
+			html += '<div style="font-size:11px;line-height:14px;color:#66ccff;margin-top:4px;font-weight:bold;">' + modalSafeText(statusText) + '</div>';
+		}
+
+		if (total > 1 || hasMore) {
+			html += '<div style="font-size:0;margin-top:6px;white-space:nowrap;">';
+			html += classicTrailerButtonHtml('◀ Prev', 'classicPrevTrailer');
+			html += classicTrailerButtonHtml(hasMore && current >= total ? 'Next + ▶' : 'Next ▶', 'classicNextTrailer');
+			html += '</div>';
+		}
+
+		var titleEl = document.getElementById('trailer-title');
+		if (titleEl) titleEl.innerHTML = html;
+	}
+
+	function classicPlayTrailerAt(index) {
+		if (!classicTrailerResults || !classicTrailerResults.length) {
+			classicSetTrailerTitle('No video found');
+			return;
+		}
+
+		if (index < 0) index = classicTrailerResults.length - 1;
+		if (index >= classicTrailerResults.length) index = 0;
+
+		classicTrailerIndex = index;
+		classicRenderTrailerTitle();
+
+		var item = classicTrailerResults[classicTrailerIndex];
+		if (!item || !item.videoId) return;
+
+		if (typeof isPS3 !== 'undefined' && isPS3) {
+			classicMountPs3TrailerPlayer(item.videoId);
+			return;
+		}
+
+		var iframeEl = document.getElementById('trailer-iframe');
+		if (iframeEl) iframeEl.src = 'https://www.youtube.com/embed/' + item.videoId + '?autoplay=1';
+	}
+
+	window.classicNextTrailer = function() {
+		if (classicTrailerLoadingMore) return false;
+
+		if (classicTrailerIndex < classicTrailerResults.length - 1) {
+			classicPlayTrailerAt(classicTrailerIndex + 1);
+			return false;
+		}
+
+		if (classicTrailerNextPageToken && !classicTrailerNoMoreResults) {
+			classicFetchMoreTrailers(function(ok) {
+				if (ok && classicTrailerIndex < classicTrailerResults.length - 1) {
+					classicPlayTrailerAt(classicTrailerIndex + 1);
+				} else {
+					classicRenderTrailerTitle(classicTrailerNoMoreResults ? 'No more results' : '');
+				}
+			});
+			return false;
+		}
+
+		classicPlayTrailerAt(0);
+		return false;
+	};
+
+	window.classicPrevTrailer = function() {
+		if (classicTrailerLoadingMore) return false;
+		classicPlayTrailerAt(classicTrailerIndex - 1);
+		return false;
+	};
 
 	function classicMountPs3TrailerPlayer(videoId) {
 		var flashEl = document.getElementById('trailer-flash-player');
@@ -6377,7 +6610,10 @@ function restorePreviousState() {
 
 		flashEl.innerHTML = '';
 
-		var videoUrl = YOUTUBE_PS3_WORKER + '/video/' + videoId + '.mp4';
+		// Força mode=ps3 no Worker. Antes a loja usava /video/ID.mp4 puro.
+		// Com query, precisa codificar o fichier para o &mode=ps3 não quebrar os flashvars.
+		var videoUrl = YOUTUBE_PS3_WORKER + '/video/' + videoId + '.mp4?mode=ps3';
+		var flashFile = encodeURIComponent(videoUrl);
 		var flashvars_936 = {};
 		var params_936 = {
 			quality: 'low',
@@ -6385,7 +6621,7 @@ function restorePreviousState() {
 			bgcolor: '#000000',
 			allowScriptAccess: 'always',
 			allowFullScreen: 'false',
-			flashvars: 'fichier=' + videoUrl + '&auto_play=true&apercu=' //+ YOUTUBE_PS3_PREVIEW
+			flashvars: 'fichier=' + flashFile + '&auto_play=true&apercu=' //+ YOUTUBE_PS3_PREVIEW
 		};
 		var attributes_936 = {};
 
@@ -6395,27 +6631,32 @@ function restorePreviousState() {
 			flashEl.innerHTML = '<div style="padding-top:280px;color:#ff6666;font-size:18px;font-weight:bold;">Flash player error</div>';
 		}
 	}
-	
+
 	window.playTrailer = function(gameName) {
 		var safeName = gameName || 'Game';
 		classicOpenTrailerModal();
 		classicSetTrailerTitle('Searching video...');
 
-		classicFetchYoutubeVideoId(safeName, function(videoId) {
-			if (!videoId) {
+		classicTrailerResults = [];
+		classicTrailerIndex = 0;
+		classicTrailerGameName = safeName;
+		classicTrailerLastQuery = safeName;
+		classicTrailerNextPageToken = '';
+		classicTrailerLoadingMore = false;
+		classicTrailerNoMoreResults = false;
+
+		classicFetchYoutubeVideoPage(safeName, '', function(result) {
+			if (!result || result.error || !result.videos || !result.videos.length) {
 				classicSetTrailerTitle('No video found');
 				return;
 			}
 
-			classicSetTrailerTitle(safeName + ' - Gameplay');
-
-			if (typeof isPS3 !== 'undefined' && isPS3) {
-				classicMountPs3TrailerPlayer(videoId);
-				return;
-			}
-
-			var iframeEl = document.getElementById('trailer-iframe');
-			if (iframeEl) iframeEl.src = 'https://www.youtube.com/embed/' + videoId + '?autoplay=1';
+			classicTrailerResults = [];
+			classicAppendTrailerResults(result.videos || []);
+			classicTrailerNextPageToken = result.nextPageToken || '';
+			classicTrailerNoMoreResults = !classicTrailerNextPageToken;
+			classicTrailerIndex = 0;
+			classicPlayTrailerAt(0);
 		});
 	};
 	
