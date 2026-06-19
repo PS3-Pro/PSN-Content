@@ -12,7 +12,77 @@
     var isPS3 = /PS3|PlayStation 3|NetFront/i.test(navigator.userAgent) || window.location.search.indexOf("mode=ps3") > -1;
 	document.documentElement.className += (isPS3 ? " is-ps3" : " is-pc");
 
-	window.resizeTo(screen.width, screen.height);
+	function classicForcePS3SiteFullscreen() {
+		if (!isPS3) return;
+
+		try { window.moveTo(0, 0); } catch(e) {}
+
+		try {
+			if (screen && screen.width && screen.height) {
+				window.resizeTo(screen.width, screen.height);
+			}
+		} catch(e) {}
+
+		try {
+			var docEl = document.documentElement;
+			var bodyEl = document.body;
+
+			if (docEl) {
+				docEl.style.width = '100%';
+				docEl.style.height = '100%';
+				docEl.style.margin = '0';
+				docEl.style.padding = '0';
+			}
+
+			if (bodyEl) {
+				bodyEl.style.width = '100%';
+				bodyEl.style.height = '100%';
+				bodyEl.style.margin = '0';
+				bodyEl.style.padding = '0';
+			}
+		} catch(e) {}
+	}
+
+	function classicTryBrowserFullscreen() {
+		if (!isPS3) return;
+
+		try {
+			var el = document.documentElement;
+
+			if (el.requestFullscreen) {
+				el.requestFullscreen();
+			} else if (el.webkitRequestFullscreen) {
+				el.webkitRequestFullscreen();
+			} else if (el.mozRequestFullScreen) {
+				el.mozRequestFullScreen();
+			} else if (el.msRequestFullscreen) {
+				el.msRequestFullscreen();
+			}
+		} catch(e) {}
+	}
+
+	classicForcePS3SiteFullscreen();
+
+	if (isPS3) {
+		try { window.setInterval(classicForcePS3SiteFullscreen, 1500); } catch(e) {}
+
+		try {
+			window.addEventListener('resize', classicForcePS3SiteFullscreen, false);
+			window.addEventListener('focus', classicForcePS3SiteFullscreen, false);
+			window.addEventListener('pageshow', classicForcePS3SiteFullscreen, false);
+
+			document.addEventListener('DOMContentLoaded', classicForcePS3SiteFullscreen, false);
+			document.addEventListener('click', function() {
+				classicForcePS3SiteFullscreen();
+				classicTryBrowserFullscreen();
+			}, false);
+			document.addEventListener('keydown', function() {
+				classicForcePS3SiteFullscreen();
+				classicTryBrowserFullscreen();
+			}, false);
+		} catch(e) {}
+	}
+
 
 	document.addEventListener("DOMContentLoaded", function() {
 		if (typeof updateMissingLicenseFilterButton === 'function') updateMissingLicenseFilterButton();
@@ -6290,6 +6360,86 @@ function restorePreviousState() {
 	}
 
 	
+	var classicTrailerAudioState = {
+		htmlAudioWasPlaying: false,
+		flashAudioWasPlaying: false
+	};
+
+	function classicIsAudioToggleEnabled() {
+		var audioToggle = document.getElementById('audio-toggle');
+		return !audioToggle || audioToggle.checked;
+	}
+
+	function classicPauseBackgroundMusicForTrailer() {
+		var doc = document;
+		var audioEl = doc.getElementById('invisible-audio');
+		var playerEl = doc.getElementById('player_9428');
+
+		classicTrailerAudioState.htmlAudioWasPlaying = false;
+		classicTrailerAudioState.flashAudioWasPlaying = false;
+
+		// PC: áudio HTML.
+		if (audioEl) {
+			try {
+				if (!audioEl.paused) {
+					classicTrailerAudioState.htmlAudioWasPlaying = true;
+					audioEl.pause();
+				}
+			} catch(e) {}
+		}
+
+		// PS3: música de fundo em Flash dentro do player_9428.
+		if (playerEl && playerEl.children && playerEl.children.length > 0) {
+			classicTrailerAudioState.flashAudioWasPlaying = true;
+
+			try {
+				if (typeof stopFlashPlayer === 'function') {
+					stopFlashPlayer();
+				} else {
+					while (playerEl.firstChild) playerEl.removeChild(playerEl.firstChild);
+				}
+			} catch(e) {}
+		}
+	}
+
+	function classicRestoreBackgroundMusicAfterTrailer() {
+		var doc = document;
+		var audioEl = doc.getElementById('invisible-audio');
+
+		if (!classicIsAudioToggleEnabled()) {
+			classicTrailerAudioState.htmlAudioWasPlaying = false;
+			classicTrailerAudioState.flashAudioWasPlaying = false;
+			return;
+		}
+
+		// PC: só volta se estava tocando antes do trailer.
+		if (classicTrailerAudioState.htmlAudioWasPlaying && audioEl) {
+			try {
+				var playPromise = audioEl.play();
+
+				if (playPromise !== undefined && typeof playPromise.then === 'function') {
+					playPromise.then(function() {
+						if (typeof audioStarted !== 'undefined') audioStarted = true;
+					}).catch(function(){});
+				} else {
+					if (typeof audioStarted !== 'undefined') audioStarted = true;
+				}
+			} catch(e) {}
+		}
+
+		// PS3: só recria o Flash music player se ele existia antes do trailer.
+		if (classicTrailerAudioState.flashAudioWasPlaying) {
+			try {
+				if (typeof startFlashPlayer === 'function') {
+					startFlashPlayer();
+				}
+			} catch(e) {}
+		}
+
+		classicTrailerAudioState.htmlAudioWasPlaying = false;
+		classicTrailerAudioState.flashAudioWasPlaying = false;
+	}
+
 	function classicStopTrailerEvent(e) {
 		if (!e) e = window.event;
 		if (e) {
@@ -6607,6 +6757,7 @@ function restorePreviousState() {
 
 		if (typeof isPS3 !== 'undefined' && isPS3) {
 			classicMountPs3TrailerPlayer(item.videoId);
+			classicForcePS3SiteFullscreen();
 			return;
 		}
 
@@ -6923,7 +7074,9 @@ function restorePreviousState() {
 
 	window.playTrailer = function(gameName) {
 		var safeName = gameName || 'Game';
+		classicPauseBackgroundMusicForTrailer();
 		classicOpenTrailerModal();
+		classicForcePS3SiteFullscreen();
 		classicSetTrailerTitle('Searching video...');
 		classicSetTrailerQuality('Preparing trailer...', true);
 
@@ -6966,6 +7119,8 @@ function restorePreviousState() {
 			var modalEl = document.getElementById('trailer-modal');
 			if (modalEl) modalEl.style.display = 'none';
 			classicClearTrailerPlayers();
+			classicRestoreBackgroundMusicAfterTrailer();
+			classicForcePS3SiteFullscreen();
 		}
 	};
 
