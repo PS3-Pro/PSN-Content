@@ -1032,7 +1032,7 @@
 			<a href="#" id="ln-tools">Tools</a>
 		</div>
 
-		<div id="game-modal" class="modal-overlay">
+		<div id="game-modal" class="modal-overlay" tabindex="-1">
 					<div class="modal_wrap_ps3"> 
 						<div class="modal-content">
 							<button class="modal-close" onclick="closeModal()">X</button>
@@ -1071,7 +1071,7 @@
 					</div>
 				</div>
 		
-				<div id="ps3-lightbox" class="modal-overlay" onclick="closePs3Lightbox()">
+				<div id="ps3-lightbox" class="modal-overlay" tabindex="-1" onclick="closePs3Lightbox()">
 					<div class="lb-table-wrap">
 						<div class="lb-cell-wrap">
 							<div class="lb-content-box" onclick="event.stopPropagation()">
@@ -1157,13 +1157,13 @@
 			</div>
 		</div>
 		
-		<div class="modal-overlay" id="trailer-modal" onclick="closeTrailer(event)" style="z-index: 20000; display: none;">
+		<div class="modal-overlay" id="trailer-modal" tabindex="-1" onclick="closeTrailer(event)" style="z-index: 20000; display: none;">
 			<div class="modal_wrap_ps3">
 				<div class="modal-content trailer-modal-content" onclick="classicStopTrailerEvent(event); return false;">
 					<button class="modal-close" onclick="closeTrailer(event); return false;">X</button>
 					<h2 id="trailer-title">Gameplay</h2>
 					<div id="trailer-video-box">
-						<iframe id="trailer-iframe" allowfullscreen></iframe>
+						<iframe id="trailer-iframe" allowfullscreen tabindex="-1"></iframe>
 						<div id="trailer-flash-player"></div>
 					</div>
 					<div id="trailer-info">&nbsp;</div>
@@ -6257,8 +6257,9 @@ function restorePreviousState() {
 		img.src = g_currentGallery[index];
 		counter.innerHTML = (index + 1) + " / " + g_currentGallery.length;
 		
-		lb.style.display = isPS3 ? 'table' : 'flex'; 
-	}
+		lb.style.display = isPS3 ? 'table' : 'flex';
+		try { lb.focus(); } catch(e) {}
+		}
 
 	function closePs3Lightbox() {
 		var lb = document.getElementById('ps3-lightbox');
@@ -6280,6 +6281,195 @@ function restorePreviousState() {
 		openPs3Lightbox(g_lightboxIndex);
 	}
 	
+
+	function classicIsModalVisible(el) {
+		return !!(el && el.style && el.style.display && el.style.display !== 'none');
+	}
+
+	function classicIsTypingTarget(target) {
+		var tag = target && target.tagName ? String(target.tagName).toLowerCase() : '';
+		return tag === 'input' || tag === 'textarea' || tag === 'select' || (target && target.isContentEditable);
+	}
+
+	function classicRefocusTrailerModal() {
+		var modalEl = document.getElementById('trailer-modal');
+		if (modalEl && classicIsModalVisible(modalEl)) {
+			try { modalEl.focus(); } catch(e) {}
+		}
+	}
+
+	function classicModalHasCloseButton(el) {
+		if (!el) return false;
+
+		try {
+			if (el.getElementsByClassName && el.getElementsByClassName('modal-close').length > 0) return true;
+		} catch(e1) {}
+
+		try {
+			if (el.querySelector && el.querySelector('.modal-close')) return true;
+		} catch(e2) {}
+
+		return false;
+	}
+
+	function classicGetTopEscClosableModal() {
+		var orderedIds = [
+			'trailer-modal',
+			'ps3-lightbox',
+			'game-modal'
+		];
+
+		for (var i = 0; i < orderedIds.length; i++) {
+			var el = document.getElementById(orderedIds[i]);
+			if (classicIsModalVisible(el) && classicModalHasCloseButton(el)) {
+				return el;
+			}
+		}
+
+		// Generic fallback: any visible overlay/modal with an X button.
+		try {
+			var all = document.getElementsByTagName('div');
+			for (var j = all.length - 1; j >= 0; j--) {
+				var node = all[j];
+				if (!node || !node.id) continue;
+				if (!classicIsModalVisible(node)) continue;
+				if (!classicModalHasCloseButton(node)) continue;
+
+				var cls = node.className || '';
+				if (String(cls).indexOf('modal') !== -1 || String(cls).indexOf('overlay') !== -1 || String(node.id).indexOf('modal') !== -1 || String(node.id).indexOf('lightbox') !== -1) {
+					return node;
+				}
+			}
+		} catch(e3) {}
+
+		return null;
+	}
+
+	function classicCloseEscModal(modalEl) {
+		if (!modalEl) return false;
+
+		if (modalEl.id === 'ps3-lightbox' && typeof closePs3Lightbox === 'function') {
+			closePs3Lightbox();
+			return true;
+		}
+
+		if (modalEl.id === 'trailer-modal' && typeof closeTrailer === 'function') {
+			closeTrailer();
+			return true;
+		}
+
+		if (modalEl.id === 'game-modal' && typeof closeModal === 'function') {
+			closeModal();
+			return true;
+		}
+
+		try {
+			var btn = modalEl.querySelector ? modalEl.querySelector('.modal-close') : null;
+			if (btn && btn.click) {
+				btn.click();
+				return true;
+			}
+		} catch(e1) {}
+
+		try {
+			modalEl.style.display = 'none';
+			return true;
+		} catch(e2) {}
+
+		return false;
+	}
+
+	function classicHandlePcModalKeys(e) {
+		if (!e) e = window.event;
+
+		var key = e.key || e.code || '';
+		var code = e.which || e.keyCode || 0;
+
+		var trailerModal = document.getElementById('trailer-modal');
+		var lightbox = document.getElementById('ps3-lightbox');
+
+		var trailerOpen = classicIsModalVisible(trailerModal);
+		var lightboxOpen = classicIsModalVisible(lightbox);
+		var escClosableModal = classicGetTopEscClosableModal();
+
+		if (!trailerOpen && !lightboxOpen && !escClosableModal) return true;
+
+		var target = e.target || e.srcElement;
+		if (classicIsTypingTarget(target)) return true;
+
+		if (code === 37 || key === 'ArrowLeft' || key === 'Left') {
+			if (!trailerOpen && !lightboxOpen) return true;
+
+			if (e.preventDefault) e.preventDefault();
+			if (e.stopPropagation) e.stopPropagation();
+			e.cancelBubble = true;
+			e.returnValue = false;
+
+			if (lightboxOpen) {
+				prevLightboxImg(e);
+			} else if (trailerOpen && typeof classicPrevTrailer === 'function') {
+				classicPrevTrailer();
+				classicRefocusTrailerModal();
+			}
+
+			return false;
+		}
+
+		if (code === 39 || key === 'ArrowRight' || key === 'Right') {
+			if (!trailerOpen && !lightboxOpen) return true;
+
+			if (e.preventDefault) e.preventDefault();
+			if (e.stopPropagation) e.stopPropagation();
+			e.cancelBubble = true;
+			e.returnValue = false;
+
+			if (lightboxOpen) {
+				nextLightboxImg(e);
+			} else if (trailerOpen && typeof classicNextTrailer === 'function') {
+				classicNextTrailer();
+				classicRefocusTrailerModal();
+			}
+
+			return false;
+		}
+
+		if (code === 27 || key === 'Escape' || key === 'Esc') {
+			if (!escClosableModal) return true;
+
+			if (e.preventDefault) e.preventDefault();
+			if (e.stopPropagation) e.stopPropagation();
+			e.cancelBubble = true;
+			e.returnValue = false;
+
+			classicCloseEscModal(escClosableModal);
+
+			return false;
+		}
+
+		return true;
+	}
+
+	if (!window.__classicPcModalKeyboardBound) {
+		if (document.addEventListener) {
+			document.addEventListener('keydown', classicHandlePcModalKeys, true);
+		} else {
+			var oldClassicDocKeydown = document.onkeydown;
+			document.onkeydown = function(e) {
+				var handled = classicHandlePcModalKeys(e);
+				if (handled === false) return false;
+				if (typeof oldClassicDocKeydown === 'function') return oldClassicDocKeydown(e);
+				return true;
+			};
+		}
+
+		if (window.addEventListener) {
+			window.addEventListener('keydown', classicHandlePcModalKeys, true);
+		}
+
+		window.__classicPcModalKeyboardBound = true;
+	}
+
+
 	function fetchWikipediaSummary(gameName) {
 		var metaEl = document.getElementById('modal-rawg-meta');
 		if (metaEl && metaEl.className && metaEl.className.indexOf('rawg-meta-loading') !== -1) hideRawgMeta();
@@ -6428,6 +6618,7 @@ function restorePreviousState() {
 
 		if (modalEl) {
 			modalEl.style.display = isPS3 ? 'table' : 'flex';
+			try { modalEl.focus(); } catch(e) {}
 		}
 	}
 
@@ -6936,6 +7127,8 @@ function restorePreviousState() {
 				classicSetTrailerQuality('N/A', true);
 			}
 		});
+		classicRefocusTrailerModal();
+
 	}
 
 	function classicUpdateTrailerQuality(videoId) {

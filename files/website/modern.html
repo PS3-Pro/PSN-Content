@@ -1038,6 +1038,12 @@ input:checked + .slider:before { transform: translateX(20px); }
 .chat-toolbar.chat-toolbar-locked .tool-btn.active { background: rgba(255,255,255,0.04) !important; color: var(--text-muted) !important; border-color: rgba(255,255,255,0.1) !important; }
 .chat-messages div { word-wrap: break-word; word-break: break-word; overflow-wrap: break-word; white-space: pre-wrap; }
 .mention-highlight { border: 2px solid #ffcc00 !important; background: rgba(255, 204, 0, 0.15) !important; }
+
+#mention-suggestions.chat-align-toolbar { }
+
+#mention-suggestions.chat-side-image { max-width: calc(100% - 132px); }
+@media (max-width: 768px) { #mention-suggestions.chat-side-image { max-width: calc(100% - 104px); } }
+
 #mention-suggestions { position: absolute; bottom: 100%; left: 0px; margin-bottom: 10px !important; background: rgba(15, 15, 15, 0.95); border: 1px solid var(--ps-blue); border-radius: 8px; width: 200px; max-height: 200px; overflow-y: auto; display: none; z-index: 10000; box-shadow: 0 0 20px rgba(0, 112, 204, 0.4); backdrop-filter: blur(10px); }
 #mention-suggestions.command-suggestions { width: min(395px, calc(100vw - 36px)); max-height: 200px; }
 #mention-suggestions.command-suggestions .suggestion-section-header { display: flex; align-items: center; gap: 8px; margin: 0; padding: 10px 15px 8px; font-size: 9px; font-weight: 900; letter-spacing: 1.2px; text-transform: uppercase; border-bottom: 1px solid rgba(255,255,255,0.07); opacity: .96; }
@@ -2986,6 +2992,7 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 
 /* ========================================================================== SITE DISCLAIMER MODAL - disclaimer-welcome ========================================================================== */
 .site-disclaimer-overlay { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; padding: 22px; background: rgba(0,0,0,0); backdrop-filter: blur(0); -webkit-backdrop-filter: blur(0); z-index: 12000; opacity: 0; visibility: hidden; pointer-events: none; }
+body.site-disclaimer-input-lock::after { content: ''; position: fixed; inset: 0; z-index: 11990; background: rgba(0,0,0,0); pointer-events: auto; touch-action: none; cursor: default; }
 .site-disclaimer-overlay.is-visible { visibility: hidden; opacity: 0; pointer-events: none; }
 .site-disclaimer-overlay.show, .site-disclaimer-overlay.closing { visibility: visible; }
 .site-disclaimer-overlay.show { pointer-events: auto; animation: siteDisclaimerOverlayIn .52s ease both; }
@@ -6986,6 +6993,12 @@ html.samsung-browser .particle-core-mark,html.samsung-browser .particle-core-mar
 
 	const SITE_DISCLAIMER_SESSION_PREFIX = 'psn_site_disclaimer_seen_session_v5_2_';
 	const SITE_DISCLAIMER_DAILY_PREFIX = 'psn_site_disclaimer_skip_today_v1_';
+	function lockSiteDisclaimerInput() {
+		try { if (document.body) document.body.classList.add('site-disclaimer-input-lock'); } catch(e) {}
+	}
+	function unlockSiteDisclaimerInput() {
+		try { if (document.body) document.body.classList.remove('site-disclaimer-input-lock'); } catch(e) {}
+	}
 	function getSiteDisclaimerTodayStamp() {
 		const d = new Date();
 		const y = d.getFullYear();
@@ -6999,6 +7012,14 @@ html.samsung-browser .particle-core-mark,html.samsung-browser .particle-core-mar
 	function getStoredSiteDisclaimerSkipToday(username) {
 		try { return localStorage.getItem(getSiteDisclaimerDailyKey(username)) || ''; } catch(e) { return ''; }
 	}
+	function shouldShowSiteDisclaimerForUser(username) {
+		const safeName = String(username || localStorage.getItem('psn_username') || '');
+		if (!safeName || safeName === 'null' || safeName === 'undefined') return false;
+		try { if (document.body && document.body.classList.contains('is-banned-user')) return false; } catch(e) {}
+		if (getStoredSiteDisclaimerSkipToday(safeName) === getSiteDisclaimerTodayStamp()) return false;
+		try { if (sessionStorage.getItem(SITE_DISCLAIMER_SESSION_PREFIX + safeName) === '1') return false; } catch(e) {}
+		return true;
+	}
 	function setStoredSiteDisclaimerSkipToday(username, stamp) {
 		const safeName = String(username || localStorage.getItem('psn_username') || 'guest');
 		const safeStamp = String(stamp || getSiteDisclaimerTodayStamp());
@@ -7009,6 +7030,7 @@ html.samsung-browser .particle-core-mark,html.samsung-browser .particle-core-mar
 		clearTimeout(window.__siteDisclaimerOpenTimer);
 		clearTimeout(window.__siteDisclaimerTimer);
 		window.__siteDisclaimerOpening = false;
+		unlockSiteDisclaimerInput();
 		if (!modal) return;
 		modal.classList.remove('show', 'is-visible', 'closing');
 		modal.setAttribute('aria-hidden', 'true');
@@ -7035,14 +7057,14 @@ html.samsung-browser .particle-core-mark,html.samsung-browser .particle-core-mar
 	}
 	function showSiteDisclaimerModal(username) {
 		const modal = document.getElementById('site-disclaimer-modal');
-		if (!modal) return;
+		if (!modal) { unlockSiteDisclaimerInput(); return; }
 		if (isSiteDisclaimerOpenOrOpening()) return;
 		const safeName = String(username || localStorage.getItem('psn_username') || 'guest');
 		const sessionKey = SITE_DISCLAIMER_SESSION_PREFIX + safeName;
 		const dailyKey = getSiteDisclaimerDailyKey(safeName);
 		const todayStamp = getSiteDisclaimerTodayStamp();
-		if (getStoredSiteDisclaimerSkipToday(safeName) === todayStamp) return;
-		try { if (sessionStorage.getItem(sessionKey) === '1') return; } catch(e) {}
+		if (!shouldShowSiteDisclaimerForUser(safeName)) { unlockSiteDisclaimerInput(); return; }
+		lockSiteDisclaimerInput();
 		window.__pendingSiteDisclaimerKey = sessionKey;
 		window.__pendingSiteDisclaimerDailyKey = dailyKey;
 		window.__pendingSiteDisclaimerDailyStamp = todayStamp;
@@ -7070,18 +7092,21 @@ html.samsung-browser .particle-core-mark,html.samsung-browser .particle-core-mar
 	}
 	function queueSiteDisclaimerModal(username, delay = 900) {
 		if (isSiteDisclaimerOpenOrOpening()) return;
+		const queuedUser = String(username || localStorage.getItem('psn_username') || '');
+		if (!shouldShowSiteDisclaimerForUser(queuedUser)) { unlockSiteDisclaimerInput(); return; }
+		lockSiteDisclaimerInput();
 		clearTimeout(window.__siteDisclaimerTimer);
 		window.__siteDisclaimerTimer = setTimeout(() => {
 			if (isSiteDisclaimerOpenOrOpening()) return;
 			const activeUser = String(username || localStorage.getItem('psn_username') || '');
-			if (!activeUser || activeUser === 'null' || activeUser === 'undefined') return;
-			if (document.body.classList.contains('is-banned-user')) return;
+			if (!shouldShowSiteDisclaimerForUser(activeUser)) { unlockSiteDisclaimerInput(); return; }
 			showSiteDisclaimerModal(activeUser);
 		}, delay);
 	}
 	function closeSiteDisclaimerModal() {
 		const modal = document.getElementById('site-disclaimer-modal');
-		if (!modal) return;
+		if (!modal) { unlockSiteDisclaimerInput(); return; }
+		lockSiteDisclaimerInput();
 		try { if (window.__pendingSiteDisclaimerKey) sessionStorage.setItem(window.__pendingSiteDisclaimerKey, '1'); } catch(e) {}
 		const skipTodayCheckbox = document.getElementById('site-disclaimer-skip-today');
 		if (skipTodayCheckbox && skipTodayCheckbox.checked) {
@@ -7100,12 +7125,16 @@ html.samsung-browser .particle-core-mark,html.samsung-browser .particle-core-mar
 		setTimeout(() => {
 			if (!modal.classList.contains('show')) {
 				modal.classList.remove('is-visible', 'closing');
+				unlockSiteDisclaimerInput();
 			}
 		}, 260);
 	}
 	window.showSiteDisclaimerModal = showSiteDisclaimerModal;
 	window.queueSiteDisclaimerModal = queueSiteDisclaimerModal;
 	window.closeSiteDisclaimerModal = closeSiteDisclaimerModal;
+	window.lockSiteDisclaimerInput = lockSiteDisclaimerInput;
+	window.unlockSiteDisclaimerInput = unlockSiteDisclaimerInput;
+	window.shouldShowSiteDisclaimerForUser = shouldShowSiteDisclaimerForUser;
 	window.getStoredSiteDisclaimerSkipToday = getStoredSiteDisclaimerSkipToday;
 	window.applySiteDisclaimerSkipTodayFromSettings = applySiteDisclaimerSkipTodayFromSettings;
 
@@ -7276,9 +7305,13 @@ html.samsung-browser .particle-core-mark,html.samsung-browser .particle-core-mar
 						});
 						
 
+							if (typeof shouldShowSiteDisclaimerForUser === 'function' && shouldShowSiteDisclaimerForUser(username) && typeof lockSiteDisclaimerInput === 'function') lockSiteDisclaimerInput();
 							clearTimeout(window.__siteDisclaimerAfterExploreTimer);
 							window.__siteDisclaimerAfterExploreTimer = setTimeout(() => {
-								if (!exploreView || exploreView.style.display === 'none') return;
+								if (!exploreView || exploreView.style.display === 'none') {
+									if (typeof unlockSiteDisclaimerInput === 'function') unlockSiteDisclaimerInput();
+									return;
+								}
 								if (typeof queueSiteDisclaimerModal === 'function') queueSiteDisclaimerModal(username, 0);
 							}, 220);
 
@@ -11267,6 +11300,11 @@ html.samsung-browser .particle-core-mark,html.samsung-browser .particle-core-mar
    window.trailerResults = [];
 	window.trailerIndex = 0;
 	window.trailerCurrentGameName = '';
+	window.trailerNextPageToken = '';
+	window.trailerLoadingMore = false;
+	window.trailerNoMoreResults = false;
+	window.trailerLastQuery = '';
+	const TRAILER_PAGE_SIZE = 10;
 
 	function trailerNormalizeResult(item, fallbackTitle) {
 		if (!item) return null;
@@ -11280,6 +11318,22 @@ html.samsung-browser .particle-core-mark,html.samsung-browser .particle-core-mar
 			videoId: String(rawId),
 			title: item.title || snippet.title || fallbackTitle || 'YouTube Video'
 		};
+	}
+
+	function trailerAppendResults(results) {
+		const used = {};
+
+		window.trailerResults.forEach(item => {
+			if (item && item.videoId) used[item.videoId] = true;
+		});
+
+		(results || []).forEach(item => {
+			const normalized = trailerNormalizeResult(item, window.trailerCurrentGameName || 'YouTube Video');
+			if (normalized && normalized.videoId && !used[normalized.videoId]) {
+				used[normalized.videoId] = true;
+				window.trailerResults.push(normalized);
+			}
+		});
 	}
 
 	function trailerGetNodes() {
@@ -11301,9 +11355,10 @@ html.samsung-browser .particle-core-mark,html.samsung-browser .particle-core-mar
 		if (nodes.titleEl) nodes.titleEl.innerText = window.trailerCurrentGameName || 'Media Player';
 		if (nodes.metaTitle) nodes.metaTitle.innerText = result && result.title ? result.title : '--';
 		if (nodes.metaId) nodes.metaId.innerText = result && result.videoId ? result.videoId : '--';
-		if (nodes.metaResult) nodes.metaResult.innerText = window.trailerResults.length ? `${window.trailerIndex + 1}/${window.trailerResults.length}` : '--';
+		if (nodes.metaResult) nodes.metaResult.innerText = window.trailerResults.length ? String(window.trailerIndex + 1) : '--';
 
-		const showNav = window.trailerResults.length > 1;
+		const hasMore = !!window.trailerNextPageToken && !window.trailerNoMoreResults;
+		const showNav = window.trailerResults.length > 1 || hasMore;
 		if (nodes.prevBtn) nodes.prevBtn.style.display = showNav ? 'flex' : 'none';
 		if (nodes.nextBtn) nodes.nextBtn.style.display = showNav ? 'flex' : 'none';
 	}
@@ -11331,6 +11386,61 @@ html.samsung-browser .particle-core-mark,html.samsung-browser .particle-core-mar
 		}
 	}
 
+	async function trailerFetchMoreResults() {
+		if (window.trailerLoadingMore) return false;
+		if (window.trailerNoMoreResults) return false;
+		if (!window.trailerNextPageToken) return false;
+
+		window.trailerLoadingMore = true;
+		trailerSetInfo({ title: 'Loading more...', videoId: '--' });
+
+		const beforeCount = window.trailerResults.length;
+		const page = await fetchYouTubeVideoPage(window.trailerLastQuery, TRAILER_PAGE_SIZE, window.trailerNextPageToken);
+
+		window.trailerLoadingMore = false;
+
+		if (!page || page.error) {
+			window.trailerNoMoreResults = true;
+			trailerSetInfo(window.trailerResults[window.trailerIndex] || null);
+			return false;
+		}
+
+		trailerAppendResults(page.videos || []);
+		window.trailerNextPageToken = page.nextPageToken || '';
+
+		if (!window.trailerNextPageToken) {
+			window.trailerNoMoreResults = true;
+		}
+
+		trailerSetInfo(window.trailerResults[window.trailerIndex] || null);
+		return window.trailerResults.length > beforeCount;
+	}
+
+	async function trailerStep(step) {
+		if (!window.trailerResults.length || window.trailerLoadingMore) return false;
+
+		if (step < 0) {
+			trailerLoadIndex(window.trailerIndex - 1);
+			return false;
+		}
+
+		if (window.trailerIndex < window.trailerResults.length - 1) {
+			trailerLoadIndex(window.trailerIndex + 1);
+			return false;
+		}
+
+		if (window.trailerNextPageToken && !window.trailerNoMoreResults) {
+			const loaded = await trailerFetchMoreResults();
+			if (loaded && window.trailerIndex < window.trailerResults.length - 1) {
+				trailerLoadIndex(window.trailerIndex + 1);
+				return false;
+			}
+		}
+
+		trailerLoadIndex(0);
+		return false;
+	}
+
 	function trailerKeyboardHandler(e) {
 		const modal = document.getElementById('trailer-modal');
 		if (!modal || !modal.classList.contains('show')) return;
@@ -11341,7 +11451,7 @@ html.samsung-browser .particle-core-mark,html.samsung-browser .particle-core-mar
 		if (key === 'ArrowLeft' || keyCode === 37) {
 			e.preventDefault();
 			e.stopPropagation();
-			trailerLoadIndex(window.trailerIndex - 1);
+			trailerStep(-1);
 			if (typeof playUiArrow === 'function') playUiArrow();
 			return false;
 		}
@@ -11349,7 +11459,7 @@ html.samsung-browser .particle-core-mark,html.samsung-browser .particle-core-mar
 		if (key === 'ArrowRight' || keyCode === 39) {
 			e.preventDefault();
 			e.stopPropagation();
-			trailerLoadIndex(window.trailerIndex + 1);
+			trailerStep(1);
 			if (typeof playUiArrow === 'function') playUiArrow();
 			return false;
 		}
@@ -11374,7 +11484,7 @@ html.samsung-browser .particle-core-mark,html.samsung-browser .particle-core-mar
 			e.stopPropagation();
 		}
 
-		trailerLoadIndex(window.trailerIndex + step);
+		trailerStep(step);
 
 		if (typeof playUiArrow === 'function') playUiArrow();
 
@@ -11421,39 +11531,20 @@ html.samsung-browser .particle-core-mark,html.samsung-browser .particle-core-mar
 		checkTrophyProgress('trailer_10', watchedTrailers);
 		checkTrophyProgress('trailer_50', watchedTrailers);
 
-		trailerOpenShell(gameName);
+		const safeName = gameName || 'Game';
+		trailerOpenShell(safeName);
 
-		const cacheKey = `multi:${gameName}`;
-		let results = [];
-
-		try {
-			const cachedMulti = JSON.parse(localStorage.getItem('psn_video_multi_cache') || '{}');
-			if (cachedMulti && Array.isArray(cachedMulti[cacheKey])) {
-				results = cachedMulti[cacheKey];
-			}
-		} catch(e) {}
-
-		if (!results.length) {
-			console.log(`Fetching from API for: ${gameName}`);
-			const searchQuery = gameName + ' PS3 Trailer';
-			const encodedQuery = encodeURIComponent(searchQuery);
-			results = await fetchYouTubeVideoResults(encodedQuery, 10);
-
-			if (results.length) {
-				try {
-					const cachedMulti = JSON.parse(localStorage.getItem('psn_video_multi_cache') || '{}');
-					cachedMulti[cacheKey] = results;
-					localStorage.setItem('psn_video_multi_cache', JSON.stringify(cachedMulti));
-				} catch(e) {}
-			}
-		}
-
-		window.trailerResults = results.map(item => trailerNormalizeResult(item, gameName)).filter(Boolean);
+		window.trailerResults = [];
 		window.trailerIndex = 0;
+		window.trailerCurrentGameName = safeName;
+		window.trailerNextPageToken = '';
+		window.trailerLoadingMore = false;
+		window.trailerNoMoreResults = false;
+		window.trailerLastQuery = encodeURIComponent(safeName + ' PS3 gameplay trailer');
 
-		if (window.trailerResults.length) {
-			trailerLoadIndex(0);
-		} else {
+		const page = await fetchYouTubeVideoPage(window.trailerLastQuery, TRAILER_PAGE_SIZE, '');
+
+		if (!page || page.error || !page.videos || !page.videos.length) {
 			const nodes = trailerGetNodes();
 
 			if (nodes.titleEl) nodes.titleEl.innerText = 'No video found';
@@ -11465,17 +11556,29 @@ html.samsung-browser .particle-core-mark,html.samsung-browser .particle-core-mar
 					closeTrailer();
 				}
 			}, 1000);
+			return;
 		}
+
+		trailerAppendResults(page.videos || []);
+		window.trailerNextPageToken = page.nextPageToken || '';
+		window.trailerNoMoreResults = !window.trailerNextPageToken;
+		window.trailerIndex = 0;
+
+		trailerLoadIndex(0);
 	};
 
-	async function fetchYouTubeVideoResults(query, maxResults = 10) {
+	async function fetchYouTubeVideoPage(query, maxResults = 10, pageToken = '') {
 		if (currentKeyIndex >= YOUTUBE_KEYS.length) {
 			console.error('All YouTube API keys exceeded their quota.');
-			return [];
+			return { videos: [], nextPageToken: '', error: 'All YouTube API keys exceeded their quota.' };
 		}
 
 		const apiKey = YOUTUBE_KEYS[currentKeyIndex];
-		const apiUrl = `https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&maxResults=${maxResults}&q=${query}&key=${apiKey}`;
+		let apiUrl = `https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&maxResults=${maxResults}&q=${query}&key=${apiKey}`;
+
+		if (pageToken) {
+			apiUrl += `&pageToken=${encodeURIComponent(pageToken)}`;
+		}
 
 		try {
 			const response = await fetch(apiUrl);
@@ -11484,21 +11587,29 @@ html.samsung-browser .particle-core-mark,html.samsung-browser .particle-core-mar
 				console.warn(`Key ${currentKeyIndex + 1} exceeded. Rotating...`);
 				currentKeyIndex++;
 				localStorage.setItem('yt_key_index', currentKeyIndex);
-				return await fetchYouTubeVideoResults(query, maxResults);
+				return await fetchYouTubeVideoPage(query, maxResults, pageToken);
 			}
 
 			const data = await response.json();
+			const videos = (data.items || [])
+				.map(item => trailerNormalizeResult(item, 'YouTube Video'))
+				.filter(Boolean);
 
-			if (data.items && data.items.length > 0) {
-				return data.items.map(item => trailerNormalizeResult(item, 'YouTube Video')).filter(Boolean);
-			}
-
-			return [];
+			return {
+				videos: videos,
+				nextPageToken: data.nextPageToken || '',
+				error: ''
+			};
 
 		} catch (error) {
 			console.error('Error during YouTube request:', error);
-			return [];
+			return { videos: [], nextPageToken: '', error: 'YouTube request failed' };
 		}
+	}
+
+	async function fetchYouTubeVideoResults(query, maxResults = 10) {
+		const page = await fetchYouTubeVideoPage(query, maxResults, '');
+		return page && page.videos ? page.videos : [];
 	}
 
 	async function fetchYouTubeVideoId(query) {
@@ -11511,6 +11622,10 @@ html.samsung-browser .particle-core-mark,html.samsung-browser .particle-core-mar
 
 		window.trailerResults = [{ videoId: videoId, title: 'Youtube Video' }];
 		window.trailerIndex = 0;
+		window.trailerNextPageToken = '';
+		window.trailerLoadingMore = false;
+		window.trailerNoMoreResults = true;
+		window.trailerLastQuery = '';
 
 		trailerLoadIndex(0);
 	};
@@ -24585,6 +24700,79 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
         if (username && username !== "Guest") chatUsers.add(username);
     }
     
+
+
+
+
+	function getVisibleChatStackEl(id) {
+		const el = document.getElementById(id);
+		if (!el) return null;
+
+		const style = window.getComputedStyle ? window.getComputedStyle(el) : null;
+		if (style && (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0')) return null;
+
+		return el;
+	}
+
+	function getChatStackBottoms() {
+		const typingInd = getVisibleChatStackEl('typing-indicator-container');
+		const replyPrev = getVisibleChatStackEl('reply-preview');
+		const editPrev = getVisibleChatStackEl('edit-preview');
+		const imgPrev = getVisibleChatStackEl('pending-image-preview');
+
+		let stackOffset = 50;
+		const margin = 8;
+
+		if (typingInd && typingInd.style.opacity === '1') {
+			stackOffset += typingInd.offsetHeight + margin;
+		}
+
+		const replyBottom = stackOffset;
+		if (replyPrev) stackOffset += replyPrev.offsetHeight + margin;
+
+		const editBottom = stackOffset;
+		if (editPrev) stackOffset += editPrev.offsetHeight + margin;
+
+		const imageBottom = stackOffset;
+		if (imgPrev) stackOffset += imgPrev.offsetHeight + margin;
+
+		return {
+			replyBottom,
+			editBottom,
+			imageBottom,
+			topBottom: stackOffset,
+			imgPrev,
+			replyPrev,
+			editPrev
+		};
+	}
+
+	function positionChatSuggestionBox(box, mode) {
+		if (!box) return;
+
+		const layout = getChatStackBottoms();
+		const imgPrev = layout.imgPrev;
+
+		if (imgPrev) {
+			box.classList.add('chat-side-image');
+
+			const leftOffset = Math.max(0, imgPrev.offsetWidth + 12);
+			box.style.left = leftOffset + "px";
+
+			// Align with image preview stack position.
+			box.style.bottom = `calc(100% + ${layout.imageBottom}px)`;
+		} else {
+			box.classList.remove('chat-side-image');
+			box.style.left = "0px";
+
+			// No image: stay above reply/edit/typing stack.
+			box.style.bottom = `calc(100% + ${layout.topBottom}px)`;
+		}
+
+		box.style.zIndex = "10001";
+	}
+
+
 	function showMentionSuggestions(query) {
 		let box = document.getElementById('mention-suggestions');
 		if (!box) {
@@ -24597,6 +24785,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 			container.insertBefore(box, inputEl);
 		}
 		box.classList.remove('command-suggestions');
+		box.classList.add('chat-align-toolbar');
 	
 		const myName = localStorage.getItem('psn_username') || '';
 		const isAdmin = document.body.classList.contains('is-admin');
@@ -24672,24 +24861,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 			
 			resetChatSuggestionKeyboardMode(box); 
 	
-			const imgPrev = document.getElementById('pending-image-preview');
-			const replyPrev = document.getElementById('reply-preview');
-			const editPrev = document.getElementById('edit-preview');
-			
-			let verticalOffset = 30; 
-	
-			if (replyPrev) verticalOffset += replyPrev.offsetHeight + 8;
-			if (editPrev) verticalOffset += editPrev.offsetHeight + 8;
-	
-			if (imgPrev) {
-				box.style.left = (imgPrev.offsetWidth + 12) + "px";
-				box.style.bottom = `calc(100% + ${verticalOffset}px)`;
-			} else {
-				box.style.left = "0px";
-				box.style.bottom = `calc(100% + ${verticalOffset}px)`;
-			}
-	
-			box.style.zIndex = '10001';
+			positionChatSuggestionBox(box, 'mention');
 	
 		} else {
 			box.style.display = 'none';
@@ -25114,22 +25286,6 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 		return { hasAt: true, query: afterAt, targetName: '', targetFinished: false, afterTarget: '' };
 	}
 
-	function positionChatSuggestionBox(box) {
-		const imgPrev = document.getElementById('pending-image-preview');
-		const replyPrev = document.getElementById('reply-preview');
-		const editPrev = document.getElementById('edit-preview');
-		let verticalOffset = 8;
-		if (replyPrev) verticalOffset += replyPrev.offsetHeight + 8;
-		if (editPrev) verticalOffset += editPrev.offsetHeight + 8;
-		if (imgPrev) {
-			box.style.left = (imgPrev.offsetWidth + 12) + 'px';
-			box.style.bottom = `calc(100% + ${verticalOffset}px)`;
-		} else {
-			box.style.left = '0px';
-			box.style.bottom = `calc(100% + ${verticalOffset}px)`;
-		}
-		box.style.zIndex = '10001';
-	}
 
 	function ensureChatSuggestionBox() {
 		let box = document.getElementById('mention-suggestions');
@@ -25281,6 +25437,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 			container.insertBefore(box, inputEl);
 		}
 		box.classList.add('command-suggestions');
+		box.classList.add('chat-align-toolbar');
 	
 		const isAdmin = document.body.classList.contains('is-admin');
 		const canModerate = typeof window.canModerateSession === 'function' ? window.canModerateSession() : isAdmin;
@@ -25330,27 +25487,20 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 			box.style.display = 'block';
 			resetChatSuggestionKeyboardMode(box);
 	
-			const imgPrev = document.getElementById('pending-image-preview');
-			const replyPrev = document.getElementById('reply-preview');
-			const editPrev = document.getElementById('edit-preview');
-			
-			let verticalOffset = 8; 
-	
-			if (replyPrev) verticalOffset += replyPrev.offsetHeight + 8;
-			if (editPrev) verticalOffset += editPrev.offsetHeight + 8;
-	
-			if (imgPrev) {
-				box.style.left = (imgPrev.offsetWidth + 12) + "px";
-				box.style.bottom = `calc(100% + ${verticalOffset}px)`;
-			} else {
-				box.style.left = "0px";
-				box.style.bottom = `calc(100% + ${verticalOffset}px)`;
-			}
-	
-			box.style.zIndex = "10001";
+			positionChatSuggestionBox(box, 'command');
 
 		} else {
 			box.style.display = 'none';
+		}
+	}
+
+	function suppressChatInputSuggestions(ms = 1200) {
+		window.__psnSuppressChatSuggestionsUntil = Date.now() + Number(ms || 1200);
+		const suggBox = document.getElementById('mention-suggestions');
+		if (typeof hideChatSuggestions === 'function') {
+			hideChatSuggestions();
+		} else if (suggBox) {
+			suggBox.style.display = 'none';
 		}
 	}
 
@@ -25455,7 +25605,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 			}
 	
 			if (mentionBox && mentionBox.style.display === 'block') {
-				mentionBox.style.bottom = `calc(100% + ${stackOffset}px)`;
+				positionChatSuggestionBox(mentionBox, mentionBox.classList.contains('command-suggestions') ? 'command' : 'mention');
 			}
 	
 			if (chatInput) {
@@ -25704,6 +25854,9 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 	let draggedIndex = null;
 
 	function showImagePreview() {
+		if ((pendingImages && pendingImages.length) || pendingImageUploads > 0) {
+			if (typeof suppressChatInputSuggestions === 'function') suppressChatInputSuggestions(900);
+		}
 		let container = document.getElementById('pending-image-preview');
 		const chatInput = document.getElementById('chat-input');
 
@@ -29458,18 +29611,25 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 				const selection = window.getSelection();
 				let currentWord = "";
 				let isFirstWord = false;
+				let textBeforeCaretFull = chatInput.innerText || '';
+				let selectionInsideChatInput = false;
 			
-				if (selection.rangeCount > 0) {
+				if (selection && selection.rangeCount > 0) {
 					const range = selection.getRangeAt(0);
-					const textBeforeCaret = range.startContainer.textContent ? range.startContainer.textContent.substring(0, range.startOffset) : "";
-					const wordsBefore = textBeforeCaret.split(/\s/);
-					currentWord = wordsBefore[wordsBefore.length - 1];
-					
-					isFirstWord = wordsBefore.length === 1;
+					selectionInsideChatInput = (typeof isChatRangeInsideInput === 'function') ? isChatRangeInsideInput(range, chatInput) : chatInput.contains(range.startContainer);
+					if (selectionInsideChatInput) {
+						const caretInfo = (typeof getChatCurrentWordBeforeCaret === 'function') ? getChatCurrentWordBeforeCaret(chatInput) : null;
+						textBeforeCaretFull = caretInfo ? caretInfo.textBeforeCaret : (range.startContainer.textContent ? range.startContainer.textContent.substring(0, range.startOffset) : '');
+						currentWord = caretInfo ? (caretInfo.currentWord || '') : ((textBeforeCaretFull.split(/\s/).pop()) || '');
+						isFirstWord = textBeforeCaretFull.trim().split(/\s+/).length === 1 && !/^\s/.test(textBeforeCaretFull);
+					}
 				}
 			
-				const textBeforeCaretFull = (selection.rangeCount > 0 && selection.getRangeAt(0).startContainer.textContent) ? selection.getRangeAt(0).startContainer.textContent.substring(0, selection.getRangeAt(0).startOffset) : chatInput.innerText;
-				if (typeof handleCommandSmartSuggestions === 'function' && handleCommandSmartSuggestions(textBeforeCaretFull)) {
+				const suppressSuggestions = window.__psnSuppressChatSuggestionsUntil && Date.now() < window.__psnSuppressChatSuggestionsUntil;
+				if (!selectionInsideChatInput || suppressSuggestions) {
+					hideChatSuggestions();
+				}
+				else if (typeof handleCommandSmartSuggestions === 'function' && handleCommandSmartSuggestions(textBeforeCaretFull)) {
 				}
 				else if (currentWord.startsWith('@')) {
 					showMentionSuggestions(currentWord.substring(1));
@@ -29484,8 +29644,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 					}
 				}
 				else {
-					const suggBox = document.getElementById('mention-suggestions');
-					if (suggBox) suggBox.style.display = 'none';
+					hideChatSuggestions();
 				}
 				
 				if (typeof updateToolbarStates === 'function') updateToolbarStates();
@@ -29513,7 +29672,8 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 				e.preventDefault();
 
 				const clipboardData = (e.clipboardData || e.originalEvent.clipboardData);
-				const items = clipboardData.items;
+				if (!clipboardData) return;
+				const items = clipboardData.items || [];
 				
 				const pastedText = clipboardData.getData('text/plain') || '';
 				
@@ -29527,18 +29687,30 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 						break;
 					}
 				}
+
+				if (hasImage) {
+					suppressChatInputSuggestions(1600);
+				}
 			
 				if (pastedText) {
 					document.execCommand('insertText', false, pastedText);
 				}
 
 				if (hasImage) {
+					hideChatSuggestions();
 					if (typeof openCropModal === 'function') {
 						openCropModal(imageFile);
 					}
+					setTimeout(hideChatSuggestions, 0);
+					setTimeout(hideChatSuggestions, 250);
 				}
 
-				chatInput.dispatchEvent(new Event('input'));
+				if (pastedText || !hasImage) {
+					chatInput.dispatchEvent(new Event('input', { bubbles: true }));
+				} else {
+					if (typeof updateToolbarStates === 'function') updateToolbarStates();
+					if (typeof updateJumpButtonPosition === 'function') updateJumpButtonPosition();
+				}
 			});
 		}
 	});
@@ -29733,6 +29905,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 	};
 
 	window.openCropModal = function(file) {
+		if ((window.__mediaEditorTarget || 'chat') === 'chat' && typeof suppressChatInputSuggestions === 'function') suppressChatInputSuggestions(1600);
 		if (typeof playUiClick === 'function') playUiClick();
 		
 		currentPreviewFile = file;
