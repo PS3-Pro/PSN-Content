@@ -49,39 +49,6 @@ app.get('/ping', (req, res) => {
   res.send('Server is Awake!');
 });
 
-app.get('/debug-db', async (req, res) => {
-  try {
-    const info = await pool.query(`
-      SELECT
-        current_database() AS database,
-        current_schema() AS schema,
-        current_user AS user,
-        current_setting('search_path') AS search_path,
-        to_regclass('chat') AS active_chat_table,
-        to_regclass('public.chat') AS public_chat_table
-    `);
-
-    const chat = await pool.query(`
-      SELECT COUNT(*)::int AS total, COALESCE(MAX(id), 0)::int AS max_id
-      FROM chat
-    `);
-
-    res.json({
-      instance: INSTANCE_ID,
-      startedAt: new Date(SERVER_STARTED_AT).toISOString(),
-      db: info.rows[0],
-      chat: chat.rows[0],
-      memoryMessages: messageHistory.length,
-      lastChatDbId
-    });
-  } catch (err) {
-    res.status(500).json({
-      error: err.message,
-      instance: INSTANCE_ID
-    });
-  }
-});
-
 let userDatabase = {};
 let messageHistory = [];
 let lastChatDbId = 0;
