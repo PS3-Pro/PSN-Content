@@ -12,54 +12,7 @@
     var isPS3 = /PS3|PlayStation 3|NetFront/i.test(navigator.userAgent) || window.location.search.indexOf("mode=ps3") > -1;
 	document.documentElement.className += (isPS3 ? " is-ps3" : " is-pc");
 
-	function classicForcePS3SiteFullscreen() {
-		if (!isPS3) return;
-
-		try { window.moveTo(0, 0); } catch(e) {}
-
-		try {
-			if (screen && screen.width && screen.height) {
-				window.resizeTo(screen.width, screen.height);
-			}
-		} catch(e) {}
-
-		try {
-			var docEl = document.documentElement;
-			var bodyEl = document.body;
-
-			if (docEl) {
-				docEl.style.width = '100%';
-				docEl.style.height = '100%';
-				docEl.style.margin = '0';
-				docEl.style.padding = '0';
-			}
-
-			if (bodyEl) {
-				bodyEl.style.width = '100%';
-				bodyEl.style.height = '100%';
-				bodyEl.style.margin = '0';
-				bodyEl.style.padding = '0';
-			}
-		} catch(e) {}
-	}
-
-	classicForcePS3SiteFullscreen();
-
-	if (isPS3) {
-		try { window.setInterval(classicForcePS3SiteFullscreen, 2500); } catch(e) {}
-
-		try {
-			if (window.addEventListener) {
-				window.addEventListener('resize', classicForcePS3SiteFullscreen, false);
-				window.addEventListener('focus', classicForcePS3SiteFullscreen, false);
-				window.addEventListener('pageshow', classicForcePS3SiteFullscreen, false);
-			}
-
-			if (document.addEventListener) {
-				document.addEventListener('DOMContentLoaded', classicForcePS3SiteFullscreen, false);
-			}
-		} catch(e) {}
-	}
+	window.resizeTo(screen.width, screen.height);
 
 	document.addEventListener("DOMContentLoaded", function() {
 		if (typeof updateMissingLicenseFilterButton === 'function') updateMissingLicenseFilterButton();
@@ -6337,80 +6290,58 @@ function restorePreviousState() {
 	}
 
 	
-	var classicTrailerAudioState = {
-		htmlAudioWasPlaying: false,
-		flashAudioWasPlaying: false
-	};
+	var classicTrailerMusicPausedByTrailer = false;
 
-	function classicIsAudioToggleEnabled() {
-		var audioToggle = document.getElementById('audio-toggle');
-		return !audioToggle || audioToggle.checked;
-	}
-
-	function classicPauseBackgroundMusicForTrailer() {
+	function classicPauseMusicAfterTrailerOpen() {
 		var doc = document;
-		var audioEl = doc.getElementById('invisible-audio');
 		var playerEl = doc.getElementById('player_9428');
+		var audioEl = doc.getElementById('invisible-audio');
 
-		classicTrailerAudioState.htmlAudioWasPlaying = false;
-		classicTrailerAudioState.flashAudioWasPlaying = false;
+		classicTrailerMusicPausedByTrailer = false;
 
-		if (audioEl) {
-			try {
-				if (!audioEl.paused) {
-					classicTrailerAudioState.htmlAudioWasPlaying = true;
-					audioEl.pause();
-				}
-			} catch(e) {}
-		}
-
-		if (playerEl && ((playerEl.children && playerEl.children.length > 0) || playerEl.firstChild)) {
-			classicTrailerAudioState.flashAudioWasPlaying = true;
-
-			try {
+		// PS3: música de fundo é Flash no player_9428.
+		// Usa só firstChild para evitar incompatibilidade com .children no NetFront.
+		try {
+			if (playerEl && playerEl.firstChild) {
+				classicTrailerMusicPausedByTrailer = true;
 				if (typeof stopFlashPlayer === 'function') {
 					stopFlashPlayer();
-				} else {
-					while (playerEl.firstChild) playerEl.removeChild(playerEl.firstChild);
 				}
-			} catch(e) {}
-		}
+			}
+		} catch(e) {}
+
+		// PC: áudio HTML. Não usa Promise/catch aqui para não afetar parser antigo.
+		try {
+			if (audioEl && !audioEl.paused) {
+				classicTrailerMusicPausedByTrailer = true;
+				audioEl.pause();
+				if (typeof audioStarted !== 'undefined') audioStarted = false;
+			}
+		} catch(e) {}
 	}
 
-	function classicRestoreBackgroundMusicAfterTrailer() {
+	function classicRestoreMusicAfterTrailerClose() {
 		var doc = document;
-		var audioEl = doc.getElementById('invisible-audio');
+		var audioToggle = doc.getElementById('audio-toggle');
 
-		if (!classicIsAudioToggleEnabled()) {
-			classicTrailerAudioState.htmlAudioWasPlaying = false;
-			classicTrailerAudioState.flashAudioWasPlaying = false;
-			return;
-		}
+		if (!classicTrailerMusicPausedByTrailer) return;
 
-		if (classicTrailerAudioState.htmlAudioWasPlaying && audioEl) {
-			try {
-				var playPromise = audioEl.play();
+		classicTrailerMusicPausedByTrailer = false;
 
-				if (playPromise !== undefined && typeof playPromise.then === 'function') {
-					playPromise.then(function() {
-						if (typeof audioStarted !== 'undefined') audioStarted = true;
-					}).catch(function(){});
-				} else {
-					if (typeof audioStarted !== 'undefined') audioStarted = true;
-				}
-			} catch(e) {}
-		}
+		if (audioToggle && !audioToggle.checked) return;
 
-		if (classicTrailerAudioState.flashAudioWasPlaying) {
-			try {
-				if (typeof startFlashPlayer === 'function') {
-					startFlashPlayer();
-				}
-			} catch(e) {}
-		}
+		// PS3: recria o Flash music player.
+		try {
+			if (typeof isPS3 !== 'undefined' && isPS3) {
+				if (typeof startFlashPlayer === 'function') startFlashPlayer();
+				return;
+			}
+		} catch(e) {}
 
-		classicTrailerAudioState.htmlAudioWasPlaying = false;
-		classicTrailerAudioState.flashAudioWasPlaying = false;
+		// PC: usa a função original do site.
+		try {
+			if (typeof startAudio === 'function') startAudio();
+		} catch(e) {}
 	}
 
 	function classicStopTrailerEvent(e) {
@@ -6648,6 +6579,7 @@ function restorePreviousState() {
 		});
 	}
 
+	// Compatibilidade com chamadas antigas que esperam só 1 ID.
 	function classicFetchYoutubeVideoId(gameName, callback) {
 		classicFetchYoutubeVideoPage(gameName, '', function(result) {
 			var videos = result && result.videos ? result.videos : [];
@@ -6729,7 +6661,6 @@ function restorePreviousState() {
 
 		if (typeof isPS3 !== 'undefined' && isPS3) {
 			classicMountPs3TrailerPlayer(item.videoId);
-			classicForcePS3SiteFullscreen();
 			return;
 		}
 
@@ -6975,6 +6906,7 @@ function restorePreviousState() {
 			return;
 		}
 
+		// No PC a qualidade real vem do YouTube IFrame API depois que o player começa.
 		classicSetTrailerQuality('Checking...', true);
 	}
 
@@ -7021,6 +6953,8 @@ function restorePreviousState() {
 
 		flashEl.innerHTML = '';
 
+		// Força mode=ps3 no Worker. Antes a loja usava /video/ID.mp4 puro.
+		// Com query, precisa codificar o fichier para o &mode=ps3 não quebrar os flashvars.
 		var videoUrl = YOUTUBE_PS3_WORKER + '/video/' + videoId + '.mp4?mode=ps3&quality=auto-ps3';
 		var flashFile = encodeURIComponent(videoUrl);
 		var flashvars_936 = {};
@@ -7043,9 +6977,8 @@ function restorePreviousState() {
 
 	window.playTrailer = function(gameName) {
 		var safeName = gameName || 'Game';
-		classicPauseBackgroundMusicForTrailer();
 		classicOpenTrailerModal();
-		classicForcePS3SiteFullscreen();
+		setTimeout(classicPauseMusicAfterTrailerOpen, 80);
 		classicSetTrailerTitle('Searching video...');
 		classicSetTrailerQuality('Preparing trailer...', true);
 
@@ -7088,8 +7021,7 @@ function restorePreviousState() {
 			var modalEl = document.getElementById('trailer-modal');
 			if (modalEl) modalEl.style.display = 'none';
 			classicClearTrailerPlayers();
-			classicRestoreBackgroundMusicAfterTrailer();
-			classicForcePS3SiteFullscreen();
+			classicRestoreMusicAfterTrailerClose();
 		}
 	};
 
