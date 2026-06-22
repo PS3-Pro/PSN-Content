@@ -24957,7 +24957,50 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 
 
 
-	function getVisibleChatStackEl(id) {
+	
+	function extractChatMentionNamesFromText(text) {
+		const names = [];
+		const source = String(text || '').replace(/<[^>]+>/g, ' ');
+		source.replace(/@([A-Za-z0-9][A-Za-z0-9_.-]{1,31})\b/g, function(match, name) {
+			if (!name) return match;
+			if (String(name).toLowerCase() === 'everyone') return match;
+			if (String(name).toLowerCase() === 'guest') return match;
+			names.push(name);
+			return match;
+		});
+		return Array.from(new Set(names));
+	}
+
+	function registerChatMentionsFromText(text) {
+		if (typeof chatUsers === 'undefined' || !chatUsers) return;
+		extractChatMentionNamesFromText(text).forEach(name => trackUser(name));
+	}
+
+	function registerChatUsersFromHistory(history) {
+		if (!Array.isArray(history)) return;
+		history.forEach(msg => {
+			if (!msg) return;
+			if (msg.user) trackUser(msg.user);
+			if (msg.replyTo && msg.replyTo.user) trackUser(msg.replyTo.user);
+			registerChatMentionsFromText(msg.text || '');
+		});
+	}
+
+	function chatTextMentionsUser(text, username) {
+		const user = String(username || '').trim();
+		if (!user) return false;
+		const escapedUser = user.replace(/[-\/\\^$*+?.()|[\]{}]/g, '\\$&');
+		const mentionRegex = new RegExp('(^|[^A-Za-z0-9_.-])@' + escapedUser + '(?=$|[^A-Za-z0-9_.-])', 'i');
+		return mentionRegex.test(String(text || ''));
+	}
+
+	function replaceChatMentionsOutsideHtmlTags(value, replacer) {
+		return String(value || '').split(/(<[^>]+>)/g).map(part => {
+			if (!part || part.charAt(0) === '<') return part;
+			return part.replace(/(^|[^A-Za-z0-9_@.-])@([A-Za-z0-9][A-Za-z0-9_.-]{1,31})(?=$|[^A-Za-z0-9_.-])/g, replacer);
+		}).join('');
+	}
+function getVisibleChatStackEl(id) {
 		const el = document.getElementById(id);
 		if (!el) return null;
 
@@ -25045,7 +25088,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 		const canModerate = typeof window.canModerateSession === 'function' ? window.canModerateSession() : isAdmin;
 	
 		const safeOnlineList = (typeof currentOnlineList !== 'undefined' && Array.isArray(currentOnlineList)) ? currentOnlineList : [];
-		const safeChatUsers = (typeof chatUsers !== 'undefined' && Array.isArray(chatUsers)) ? chatUsers : [];
+		const safeChatUsers = (typeof chatUsers !== 'undefined' && chatUsers) ? Array.from(chatUsers) : [];
 	
 		const onlineNames = safeOnlineList
 			.filter(u => u && u.online === true)
@@ -26778,27 +26821,14 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 	}
 
 	function formatChatUserMentionsForDisplay(messageText) {
-		const allPossibleNames = new Set([
-			...((typeof chatUsers !== 'undefined' && chatUsers) ? Array.from(chatUsers) : []),
-			...((typeof currentOnlineList !== 'undefined' && Array.isArray(currentOnlineList)) ? currentOnlineList.map(u => u.name || u) : []),
-			...((window.friendsList && Array.isArray(window.friendsList)) ? window.friendsList.map(f => f.name) : [])
-		]);
+		return replaceChatMentionsOutsideHtmlTags(messageText, function(match, prefix, name) {
+			if (!name) return match;
+			if (String(name).toLowerCase() === 'everyone') return match;
+			if (String(name).toLowerCase() === 'guest') return match;
 
-		const sortedNames = Array.from(allPossibleNames)
-			.filter(n => n && n !== "Guest")
-			.sort((a, b) => b.length - a.length);
-
-		sortedNames.forEach(name => {
-			const escapedName = name.replace(/[-\/\\^$*+?.()|[\]{}]/g, '\\$&');
-			const mentionRegex = new RegExp(`@${escapedName}\\b(?![^<]*>)`, 'g');
-			if (messageText.includes(`@${name}`)) {
-				messageText = messageText.replace(mentionRegex, match => {
-					return `<span class="chat-mention" style="cursor: pointer; text-decoration: underline;" onclick="openProfileModal('${encodeURIComponent(name)}')">${match}</span>`;
-				});
-			}
+			trackUser(name);
+			return `${prefix}<span class="chat-mention" style="cursor: pointer; text-decoration: underline;" onclick="openProfileModal('${encodeURIComponent(name)}')">@${name}</span>`;
 		});
-
-		return messageText;
 	}
 
 
@@ -27478,25 +27508,8 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 			`<a href="${url}" target="_blank" style="color: #ffffff; text-decoration: underline; word-break: break-all;">${url}</a>`
 		);
 	
-		const allPossibleNames = new Set([
-			...Array.from(chatUsers), 
-			...currentOnlineList.map(u => u.name || u),
-			...(window.friendsList ? window.friendsList.map(f => f.name) : [])
-		]);
-	
-		const sortedNames = Array.from(allPossibleNames)
-			.filter(n => n && n !== "Guest")
-			.sort((a, b) => b.length - a.length);
-	
-		sortedNames.forEach(name => {
-			const escapedName = name.replace(/[-\/\\^$*+?.()|[\]{}]/g, '\\$&');
-			const mentionRegex = new RegExp(`@${escapedName}\\b(?![^<]*>)`, 'g');
-			if (messageText.includes(`@${name}`)) {
-				messageText = messageText.replace(mentionRegex, (match) => {
-					return `<span class="chat-mention" style="cursor: pointer; text-decoration: underline;" onclick="openProfileModal('${encodeURIComponent(name)}')">${match}</span>`;
-				});
-			}
-		});
+		registerChatMentionsFromText(cleanText);
+		messageText = formatChatUserMentionsForDisplay(messageText);
 	
 		if (isGlobal) {
 			messageText = formatEveryoneMentionForDisplay(messageText, globalPingVisual.role);
@@ -27551,7 +27564,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 		const canEditOrDeleteMsg = isAuthor || canModerateMsg;
 		const canPinThisMsg = typeof window.canModerateChat === 'function' ? window.canModerateChat(userName, senderRoleSource) : isAdmin;
 		const senderRoleBadgeHtml = typeof window.buildPsnRoleBadge === 'function' ? window.buildPsnRoleBadge(userName, senderRoleSource, 'chat') : '';
-		const isPersonalMention = !isAuthor && myName && (cleanText.includes(`@${myName}`) || (replyData && replyData.user === myName));
+		const isPersonalMention = !isAuthor && myName && ((typeof chatTextMentionsUser === 'function' ? chatTextMentionsUser(cleanText, myName) : cleanText.includes(`@${myName}`)) || (replyData && replyData.user === myName));
 		const userAvatar = (typeof msg === 'object' && msg.avatar) ? msg.avatar : (localStorage.getItem(`${userName}_psn_avatar`) || "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/interface/modern/images/avatars/default.png");
 		const date = new Date(msgTimeValue);
 		const timeStr = date.getHours().toString().padStart(2, '0') + ':' + date.getMinutes().toString().padStart(2, '0');
@@ -28839,6 +28852,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 			if (!box) return;
 			if (window.__chatHistoryRenderSignature === incomingSignature && box.querySelector('[id^="msg-row-"]')) {
 				window.messageHistory = normalizedHistory;
+				if (typeof registerChatUsersFromHistory === 'function') registerChatUsersFromHistory(window.messageHistory);
 				if (typeof refreshChatNotificationDot === 'function') refreshChatNotificationDot();
 				if (typeof refreshMentionJumpButton === 'function') refreshMentionJumpButton();
 				return;
@@ -28930,7 +28944,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 			
 			playMessageSound();
 			if (!chatVisible && data.user !== myName) {
-				const isMention = data.text && data.text.includes(`@${myName}`);
+				const isMention = data.text && (typeof chatTextMentionsUser === 'function' ? chatTextMentionsUser(data.text, myName) : data.text.includes(`@${myName}`));
 				const isReply = data.replyTo && data.replyTo.user === myName;
 				if (isMention || isReply || data.isGlobalPing) showChatNotification(data.user, isMention, data.isGlobalPing, data.globalPingRole);
 			}
@@ -29462,7 +29476,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 	
 			const hasGlobal = newMessages.some(m => m.isGlobalPing);
 			const hasMention = newMessages.some(m => 
-				(m.text && m.text.includes(`@${myName}`)) || 
+				(m.text && (typeof chatTextMentionsUser === 'function' ? chatTextMentionsUser(m.text, myName) : m.text.includes(`@${myName}`))) || 
 				(m.replyTo && m.replyTo.user === myName)
 			);
 	
@@ -30276,7 +30290,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 
                 const textNode = row.querySelector('[id^="msg-text-"]');
                 const text = msg && typeof msg.text === 'string' ? msg.text : (textNode ? textNode.textContent : row.textContent || '');
-                return text.includes(`@${myName}`) || (msg && msg.isGlobalPing === true) || /@everyone\b/.test(text);
+                return (typeof chatTextMentionsUser === 'function' ? chatTextMentionsUser(text, myName) : text.includes(`@${myName}`)) || (msg && msg.isGlobalPing === true) || /@everyone\b/.test(text);
             })
             .sort((a, b) => a.offsetTop - b.offsetTop);
     }
