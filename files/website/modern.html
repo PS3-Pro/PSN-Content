@@ -15355,6 +15355,7 @@ body.chat-auto-translate-enabled .msg-bubble.has-translate { padding-right:14px 
 		};
 		socketChat.on('connect', () => {
 			syncAdminHealth('online');
+			if (typeof requestChatMentionDatabaseUsers === 'function') setTimeout(() => requestChatMentionDatabaseUsers('*'), 800);
 			adminSetChatControlsSyncState('syncing');
 			if (typeof window.adminRequestChatControlsState === 'function') window.adminRequestChatControlsState();
 			if (typeof adminStartChatControlsRealtimeSync === 'function') adminStartChatControlsRealtimeSync();
@@ -24958,6 +24959,10 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 
 
 	
+	window.chatMentionDatabaseUsers = window.chatMentionDatabaseUsers || [];
+	window.chatMentionSearchCache = window.chatMentionSearchCache || {};
+	window.chatMentionPendingSearch = window.chatMentionPendingSearch || {};
+
 	function extractChatMentionNamesFromText(text) {
 		const names = [];
 		const source = String(text || '').replace(/<[^>]+>/g, ' ');
@@ -24970,10 +24975,6 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 		});
 		return Array.from(new Set(names));
 	}
-
-	window.chatMentionDatabaseUsers = window.chatMentionDatabaseUsers || [];
-	window.chatMentionSearchCache = window.chatMentionSearchCache || {};
-	window.chatMentionPendingSearch = window.chatMentionPendingSearch || {};
 
 	function getChatMentionUserName(user) {
 		return String((user && (user.name || user.username || user.user || user.onlineId)) || user || '').trim();
@@ -24996,6 +24997,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 			const key = name.toLowerCase();
 			const oldValue = map.get(key) || {};
 			const nextValue = Object.assign({}, oldValue, typeof user === 'object' ? user : { name }, { name });
+
 			if (!map.has(key)) changed = true;
 			map.set(key, nextValue);
 
@@ -25013,50 +25015,13 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 
 		const key = term.toLowerCase();
 		const now = Date.now();
-		if (window.chatMentionSearchCache[key] && (now - window.chatMentionSearchCache[key] < 30000)) return;
-		if (window.chatMentionPendingSearch[key] && (now - window.chatMentionPendingSearch[key] < 5000)) return;
+
+		if (window.chatMentionSearchCache[key] && (now - window.chatMentionSearchCache[key] < 45000)) return;
+		if (window.chatMentionPendingSearch[key] && (now - window.chatMentionPendingSearch[key] < 7000)) return;
 
 		window.chatMentionPendingSearch[key] = now;
 		window.chatMentionSearchCache[key] = now;
 		socketChat.emit('search_users', term);
-	}
-
-	function requestChatMentionDatabaseUsersFromText(text) {
-		extractChatMentionNamesFromText(text).forEach(name => {
-			if (!isKnownChatMentionName(name)) requestChatMentionDatabaseUsers(name);
-		});
-	}
-
-	function requestChatMentionDatabaseUsersFromHistory(history) {
-		if (!Array.isArray(history)) return;
-		const requested = new Set();
-		history.forEach(msg => {
-			if (!msg) return;
-			extractChatMentionNamesFromText(msg.text || '').forEach(name => {
-				const key = String(name || '').toLowerCase();
-				if (!key || requested.has(key) || isKnownChatMentionName(name)) return;
-				requested.add(key);
-				requestChatMentionDatabaseUsers(name);
-			});
-		});
-	}
-
-	function registerChatMentionsFromText(text) {
-		if (typeof chatUsers === 'undefined' || !chatUsers) return;
-		extractChatMentionNamesFromText(text).forEach(name => {
-			if (isKnownChatMentionName(name)) trackUser(getCanonicalChatMentionName(name));
-			else requestChatMentionDatabaseUsers(name);
-		});
-	}
-
-	function registerChatUsersFromHistory(history) {
-		if (!Array.isArray(history)) return;
-		history.forEach(msg => {
-			if (!msg) return;
-			if (msg.user) trackUser(msg.user);
-			if (msg.replyTo && msg.replyTo.user) trackUser(msg.replyTo.user);
-		});
-		requestChatMentionDatabaseUsersFromHistory(history);
 	}
 
 	function getKnownChatMentionNames() {
@@ -25070,9 +25035,12 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 		if (Array.isArray(window.chatMentionDatabaseUsers)) window.chatMentionDatabaseUsers.forEach(addName);
 		if (Array.isArray(window.adminAllUsers)) window.adminAllUsers.forEach(addName);
 		if (Array.isArray(window.globalSearchResults)) window.globalSearchResults.forEach(addName);
+
 		if (typeof currentOnlineList !== 'undefined' && Array.isArray(currentOnlineList)) currentOnlineList.forEach(addName);
 		if (Array.isArray(window.currentOnlineList)) window.currentOnlineList.forEach(addName);
+
 		if (window.friendsList && Array.isArray(window.friendsList)) window.friendsList.forEach(addName);
+
 		if (typeof chatUsers !== 'undefined' && chatUsers) Array.from(chatUsers).forEach(addName);
 
 		if (typeof getAllUsers === 'function') {
@@ -25101,6 +25069,53 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 		const value = String(name || '').trim().toLowerCase();
 		const found = getKnownChatMentionNames().find(existing => String(existing || '').trim().toLowerCase() === value);
 		return found || name;
+	}
+
+	function requestChatMentionDatabaseUsersFromText(text) {
+		extractChatMentionNamesFromText(text).forEach(name => {
+			if (!isKnownChatMentionName(name)) requestChatMentionDatabaseUsers(name);
+		});
+	}
+
+	function requestChatMentionDatabaseUsersFromHistory(history) {
+		if (!Array.isArray(history)) return;
+
+		const requested = new Set();
+		history.forEach(msg => {
+			if (!msg) return;
+
+			extractChatMentionNamesFromText(msg.text || '').forEach(name => {
+				const key = String(name || '').toLowerCase();
+				if (!key || requested.has(key) || isKnownChatMentionName(name)) return;
+
+				requested.add(key);
+				requestChatMentionDatabaseUsers(name);
+			});
+		});
+	}
+
+	function registerChatMentionsFromText(text) {
+		if (typeof chatUsers === 'undefined' || !chatUsers) return;
+
+		extractChatMentionNamesFromText(text).forEach(name => {
+			if (isKnownChatMentionName(name)) {
+				trackUser(getCanonicalChatMentionName(name));
+			} else {
+				requestChatMentionDatabaseUsers(name);
+			}
+		});
+	}
+
+	function registerChatUsersFromHistory(history) {
+		if (!Array.isArray(history)) return;
+
+		history.forEach(msg => {
+			if (!msg) return;
+			if (msg.user) trackUser(msg.user);
+			if (msg.replyTo && msg.replyTo.user) trackUser(msg.replyTo.user);
+		});
+
+		requestChatMentionDatabaseUsersFromHistory(history);
 	}
 
 	function chatTextMentionsUser(text, username) {
@@ -28316,7 +28331,6 @@ function getVisibleChatStackEl(id) {
 			if (typeof updateFavoritesLibraryUI === 'function') updateFavoritesLibraryUI(true);
 			if (typeof renderFriendsList === 'function') renderFriendsList(document.getElementById('search-input')?.value || '', true);
 			if (typeof updateAdminVisibility === 'function') updateAdminVisibility();
-			if (typeof requestChatMentionDatabaseUsers === 'function') setTimeout(() => requestChatMentionDatabaseUsers('*'), 600);
 			if (typeof window.refreshCategoryDot === 'function') {
 				window.refreshCategoryDot('wishlist');
 				window.refreshCategoryDot('favorites');
