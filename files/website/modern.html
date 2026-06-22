@@ -2379,8 +2379,13 @@ body.ps3-pad-user-logged.ps3-pad-console-connected:not(.ps3-pad-page-active) #ps
 #view-library .browse-toolbar { justify-content: flex-start !important; }
 .explore-toolbar, .guides-toolbar, .download-toolbar, .wis-toolbar { padding: 10px 15px !important; flex-direction: column !important; align-items: stretch !important; gap: 10px !important; width: 100%; }
 .search-bar { width: 100% !important; min-width: 180px !important; flex-shrink: 0 !important; margin: 0 !important; }
-.dl-stats-header { flex-direction: column !important; align-items: stretch !important; gap: 15px !important; }
-.dl-stats-header button { width: 100%; justify-content: center; }
+.dl-stats-header { display: grid !important; grid-template-columns: minmax(0, .75fr) minmax(0, 1.25fr) !important; align-items: stretch !important; gap: 14px 16px !important; padding: 15px 18px !important; }
+.dl-stats-header .stat-box { min-width: 0 !important; }
+.dl-stats-header .stat-box:nth-of-type(1) { order: 1 !important; text-align: left !important; }
+.dl-stats-header .stat-box:nth-of-type(2) { order: 2 !important; text-align: right !important; }
+.dl-stats-header .stat-label { font-size: 10px !important; letter-spacing: 1.6px !important; line-height: 1.25 !important; white-space: normal !important; }
+.dl-stats-header .stat-value { font-size: 19px !important; line-height: 1.15 !important; white-space: nowrap !important; overflow: hidden !important; text-overflow: ellipsis !important; }
+.dl-stats-header button { grid-column: 1 / -1 !important; order: 3 !important; width: 100%; justify-content: center; margin-top: 2px; }
 .file-list-header, .file-row { grid-template-columns: 1fr auto !important; padding: 10px 15px !important; }
 .col-size, .file-size { display: none !important; }
 .library-actions { display: none; }
@@ -28235,6 +28240,67 @@ function getVisibleChatStackEl(id) {
 		if (typeof window.applyProfileSyncNotificationDots === 'function') window.applyProfileSyncNotificationDots(previousState, userData);
 	};
 
+
+	window.normalizeProfileSyncComparableValue = function(value) {
+		if (Array.isArray(value)) {
+			return value.map(item => window.normalizeProfileSyncComparableValue(item));
+		}
+
+		if (value && typeof value === 'object') {
+			const out = {};
+			Object.keys(value).sort().forEach(key => {
+				if (key === 'profileUpdatedAt') return;
+				if (key === 'wishlistUpdatedAt') return;
+				if (key === 'downloadsUpdatedAt') return;
+				if (key === 'downloadsClearedAt') return;
+				if (key === 'favoritesUpdatedAt') return;
+				if (key === 'libraryUpdatedAt') return;
+				if (key === 'friendsUpdatedAt') return;
+				out[key] = window.normalizeProfileSyncComparableValue(value[key]);
+			});
+			return out;
+		}
+
+		if (value === undefined) return null;
+		return value;
+	};
+
+	window.getProfileSyncComparableSignature = function(value) {
+		try {
+			return JSON.stringify(window.normalizeProfileSyncComparableValue(value));
+		} catch (err) {
+			try {
+				return JSON.stringify(value);
+			} catch (err2) {
+				return String(value);
+			}
+		}
+	};
+
+	window.areProfileSyncValuesEqual = function(a, b) {
+		return window.getProfileSyncComparableSignature(a) === window.getProfileSyncComparableSignature(b);
+	};
+
+	window.getProfileSyncChanges = function(previousState = {}, userData = {}, username = '', payload = {}) {
+		const rejectDownloads = Array.isArray(userData.downloadsData)
+			&& typeof shouldRejectStaleIncomingDownloadHistory === 'function'
+			&& shouldRejectStaleIncomingDownloadHistory(username, userData, payload);
+
+		return {
+			trophies: !!(userData.trophiesData && typeof userData.trophiesData === 'object' && !Array.isArray(userData.trophiesData) && !window.areProfileSyncValuesEqual(previousState.trophies || {}, userData.trophiesData || {})),
+			wishlist: !!(Array.isArray(userData.wishlistData) && !window.areProfileSyncValuesEqual(previousState.wishlist || [], userData.wishlistData || [])),
+			downloads: !!(Array.isArray(userData.downloadsData) && !rejectDownloads && !window.areProfileSyncValuesEqual(previousState.downloads || [], userData.downloadsData || [])),
+			favorites: !!(Array.isArray(userData.favoritesData) && !window.areProfileSyncValuesEqual(previousState.favorites || [], userData.favoritesData || [])),
+			library: !!(Array.isArray(userData.libraryData) && !window.areProfileSyncValuesEqual(previousState.library || [], userData.libraryData || [])),
+			friends: !!(Array.isArray(userData.friendsData) && !window.areProfileSyncValuesEqual(previousState.friends || [], userData.friendsData || []))
+		};
+	};
+
+	window.hasProfileSyncListChanges = function(changes = {}) {
+		return !!(changes.trophies || changes.wishlist || changes.downloads || changes.favorites || changes.library || changes.friends);
+	};
+
+
 	window.applyRemoteProfileSync = function(payload = {}) {
 		const name = String(payload.name || payload.targetName || '').trim();
 		const userData = payload.userData || payload.data || {};
@@ -28251,8 +28317,12 @@ function getVisibleChatStackEl(id) {
 			wishlist: Array.isArray(window.wishlist) ? window.wishlist.slice() : [],
 			downloads: Array.isArray(window.downloadHistory) ? window.downloadHistory.slice() : [],
 			favorites: Array.isArray(window.favoritesLibrary) ? window.favoritesLibrary.slice() : [],
-			library: Array.isArray(window.lastScannedGames || lastScannedGames) ? (window.lastScannedGames || lastScannedGames).slice() : []
+			library: Array.isArray(window.lastScannedGames || lastScannedGames) ? (window.lastScannedGames || lastScannedGames).slice() : [],
+			friends: Array.isArray(window.friendsList) ? window.friendsList.slice() : []
 		};
+
+		const profileSyncChanges = (typeof window.getProfileSyncChanges === 'function') ? window.getProfileSyncChanges(previousProfileSyncState, userData, name, payload) : {};
+		const hasProfileDataChanges = (typeof window.hasProfileSyncListChanges === 'function') ? window.hasProfileSyncListChanges(profileSyncChanges) : true;
 
 		window.__applyingRemoteProfileSync = true;
 		try {
@@ -28329,7 +28399,7 @@ function getVisibleChatStackEl(id) {
 				if (typeof updateConsoleDashboardUI === 'function') updateConsoleDashboardUI();
 			}
 
-			if (typeof window.refreshProfileSyncVisibleUI === 'function') window.refreshProfileSyncVisibleUI(userData, previousProfileSyncState);
+			if (hasProfileDataChanges && typeof window.refreshProfileSyncVisibleUI === 'function') window.refreshProfileSyncVisibleUI(userData, previousProfileSyncState);
 
 			const incomingRole = String(userData.role || (userData.isAdmin ? 'admin' : '')).toLowerCase();
 			if (incomingRole && incomingRole !== 'user') localStorage.setItem(`${name}_psn_role`, incomingRole === 'moderator' ? 'mod' : incomingRole);
@@ -28337,19 +28407,19 @@ function getVisibleChatStackEl(id) {
 			document.body.classList.toggle('is-admin', userData.isAdmin === true || incomingRole === 'admin');
 			document.body.classList.toggle('is-mod', userData.isModerator === true || incomingRole === 'mod' || incomingRole === 'moderator');
 
-			if (typeof updateConsoleLibraryStatusUI === 'function') updateConsoleLibraryStatusUI(window.lastScannedGames || []);
-			if (typeof renderTrophiesView === 'function') renderTrophiesView(true);
-			if (typeof updateWishlistUI === 'function') updateWishlistUI(true);
-			if (typeof updateDownloadUI === 'function') updateDownloadUI();
-			if (typeof updateFavoritesLibraryUI === 'function') updateFavoritesLibraryUI(true);
-			if (typeof renderFriendsList === 'function') renderFriendsList(document.getElementById('search-input')?.value || '', true);
+			if (profileSyncChanges.library && typeof updateConsoleLibraryStatusUI === 'function') updateConsoleLibraryStatusUI(window.lastScannedGames || []);
+			if (profileSyncChanges.trophies && typeof renderTrophiesView === 'function') renderTrophiesView(true);
+			if (profileSyncChanges.wishlist && typeof updateWishlistUI === 'function') updateWishlistUI(true);
+			if (profileSyncChanges.downloads && typeof updateDownloadUI === 'function') updateDownloadUI();
+			if (profileSyncChanges.favorites && typeof updateFavoritesLibraryUI === 'function') updateFavoritesLibraryUI(true);
+			if (profileSyncChanges.friends && typeof renderFriendsList === 'function') renderFriendsList(document.getElementById('search-input')?.value || '', true);
 			if (typeof updateAdminVisibility === 'function') updateAdminVisibility();
 			if (typeof window.refreshCategoryDot === 'function') {
-				window.refreshCategoryDot('wishlist');
-				window.refreshCategoryDot('favorites');
+				if (profileSyncChanges.wishlist) window.refreshCategoryDot('wishlist');
+				if (profileSyncChanges.favorites) window.refreshCategoryDot('favorites');
 			}
-			if (typeof window.refreshVisibleWishlistCardsFromProfileSync === 'function') window.refreshVisibleWishlistCardsFromProfileSync();
-			if (typeof window.refreshVisibleFavoriteCardsFromProfileSync === 'function') window.refreshVisibleFavoriteCardsFromProfileSync();
+			if (profileSyncChanges.wishlist && typeof window.refreshVisibleWishlistCardsFromProfileSync === 'function') window.refreshVisibleWishlistCardsFromProfileSync();
+			if (profileSyncChanges.favorites && typeof window.refreshVisibleFavoriteCardsFromProfileSync === 'function') window.refreshVisibleFavoriteCardsFromProfileSync();
 		} catch (err) {
 			console.warn('[PROFILE SYNC] Could not apply remote profile data:', err);
 		} finally {
@@ -33212,7 +33282,18 @@ function getVisibleChatStackEl(id) {
 		const titleEl = document.getElementById('list-modal-title');
 		const myName = localStorage.getItem('psn_username') || "Guest";
 		const isMe = (targetUser === myName);
-		window.__lastProfileListRender = { targetUser, listType, rawData };
+		const profileListRenderSignature = (typeof window.getProfileSyncComparableSignature === 'function') ? window.getProfileSyncComparableSignature(rawData || []) : JSON.stringify(rawData || []);
+		const lastProfileListRender = window.__lastProfileListRender;
+		if (lastProfileListRender
+			&& lastProfileListRender.targetUser === targetUser
+			&& lastProfileListRender.listType === listType
+			&& lastProfileListRender.signature === profileListRenderSignature
+			&& body
+			&& body.innerHTML
+			&& !window.pendingProfileListScroll) {
+			return;
+		}
+		window.__lastProfileListRender = { targetUser, listType, rawData, signature: profileListRenderSignature };
 	
 		const listMeta = window.getPlayerListMeta(listType);
 		const safeTargetUser = window.escapePlayerListText(targetUser || 'Player');
