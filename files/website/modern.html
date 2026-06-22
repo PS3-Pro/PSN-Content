@@ -11876,7 +11876,37 @@ body.chat-auto-translate-enabled .msg-bubble.has-translate { padding-right:14px 
 		return ['games', 'demos', 'updates', 'ports', 'homebrew_games', 'prototypes'].includes(key);
 	};
 
-	window.inferContentCategoryKey = function(item = {}, fallback = 'games') {
+	window.getLibraryBlockedContentCategories = function() {
+		return ['dlcs', 'updates', 'avatars', 'themes'];
+	};
+
+	window.isLibraryBlockedContentCategory = function(category) {
+		const normalize = (typeof window.normalizeContentCategoryKey === 'function')
+			? window.normalizeContentCategoryKey
+			: (value, def = '') => String(value || def || '').trim().toLowerCase().replace(/\s+/g, '_');
+
+		return window.getLibraryBlockedContentCategories().includes(normalize(category, ''));
+	};
+
+	window.isWebmanBackedProfileList = function(listType = '') {
+		const key = String(listType || '').trim().toLowerCase();
+		return ['library', 'favorite', 'favorites', 'fav', 'favs'].includes(key);
+	};
+
+	window.getLibraryStoreCategoryPriority = function() {
+		return ['games', 'apps', 'demos', 'prototypes', 'homebrew_games', 'ports', 'no_psn', 'tools', 'dev_tools', 'backup_manager', 'emulators', 'launchers', 'legacy'];
+	};
+
+	window.normalizeLibraryContentCategory = function(item = {}, fallback = 'games') {
+		const inferred = (typeof window.inferContentCategoryKey === 'function')
+			? window.inferContentCategoryKey(item, fallback || 'games')
+			: (fallback || 'games');
+
+		if (window.isLibraryBlockedContentCategory(inferred)) return 'games';
+		return inferred || 'games';
+	};
+
+	window.inferContentCategoryKey = function(item = {}, fallback = 'games', options = {}) {
 		const ignoredDirect = ['favorite', 'favorites', 'fav', 'favs', 'library', 'download', 'downloads', 'wishlist'];
 		const normalize = (value, def = 'games') => (typeof window.normalizeContentCategoryKey === 'function')
 			? window.normalizeContentCategoryKey(value, def)
@@ -11893,6 +11923,11 @@ body.chat-auto-translate-enabled .msg-bubble.has-translate { padding-right:14px 
 		const aTag = String(item.aTag || item.appTag || '').trim().toLowerCase();
 		const text = `${item.cleanName || ''} ${item.name || ''} ${item.title || ''} ${item.rawName || ''} ${id}`.toLowerCase();
 
+		const blockedForLibrary = !!(options && options.library === true);
+		const libraryBlockedCategories = ['dlcs', 'updates', 'avatars', 'themes'];
+
+		if (blockedForLibrary && libraryBlockedCategories.includes(direct)) direct = '';
+
 		if (direct && !['games', 'apps'].includes(direct)) return direct;
 
 		const appById = !!(id && typeof DICT_APPS_FILTER !== 'undefined' && DICT_APPS_FILTER[id] === 1);
@@ -11902,10 +11937,12 @@ body.chat-auto-translate-enabled .msg-bubble.has-translate { padding-right:14px 
 		if (direct === 'apps' || safeFallback === 'apps' || appById || appByTag || appByText) return 'apps';
 
 		if (direct === 'games' || safeFallback === 'games') {
-			if (/\bdlc\b|add[- ]?on|expansion|pack/.test(text)) return 'dlcs';
-			if (/\b(update|patch)\b/.test(text)) return 'updates';
-			if (/\bavatar\b/.test(text)) return 'avatars';
-			if (/\btheme\b/.test(text)) return 'themes';
+			if (!blockedForLibrary) {
+				if (/\bdlc\b|add[- ]?on|expansion|pack/.test(text)) return 'dlcs';
+				if (/\b(update|patch)\b/.test(text)) return 'updates';
+				if (/\bavatar\b/.test(text)) return 'avatars';
+				if (/\btheme\b/.test(text)) return 'themes';
+			}
 			if (/\bdemo\b|trial/.test(text)) return 'demos';
 			if (/\bhomebrew\b/.test(text)) return 'homebrew_games';
 			if (/\bport\b/.test(text)) return 'ports';
@@ -11944,7 +11981,7 @@ body.chat-auto-translate-enabled .msg-bubble.has-translate { padding-right:14px 
 	};
 
 
-	window.findCachedStoreCategoryForItem = function(item = {}) {
+	window.findCachedStoreCategoryForItem = function(item = {}, options = {}) {
 		if (!item || !window.psnStoreCache) return '';
 
 		const normalizeText = value => String(value || '').trim().toLowerCase().replace(/[^a-z0-9]/g, '');
@@ -11953,7 +11990,9 @@ body.chat-auto-translate-enabled .msg-bubble.has-translate { padding-right:14px 
 			.filter(Boolean);
 		const contentId = String(item.contentId || item.contentID || '').trim().toUpperCase();
 		const nameKey = normalizeText(item.cleanName || item.name || item.title || item.rawName);
-		const categoryPriority = ['games', 'apps', 'demos', 'dlcs', 'updates', 'avatars', 'themes', 'prototypes', 'homebrew_games', 'ports', 'no_psn', 'tools', 'dev_tools', 'backup_manager', 'emulators', 'launchers', 'legacy'];
+		const categoryPriority = (options && options.library === true && typeof window.getLibraryStoreCategoryPriority === 'function')
+			? window.getLibraryStoreCategoryPriority()
+			: ['games', 'apps', 'demos', 'dlcs', 'updates', 'avatars', 'themes', 'prototypes', 'homebrew_games', 'ports', 'no_psn', 'tools', 'dev_tools', 'backup_manager', 'emulators', 'launchers', 'legacy'];
 
 		for (const cat of categoryPriority) {
 			const bucket = window.psnStoreCache[cat];
@@ -12036,13 +12075,23 @@ body.chat-auto-translate-enabled .msg-bubble.has-translate { padding-right:14px 
 	};
 
 	window.getProfileListItemCategory = function(item = {}, listType = '') {
+		const normalizedListType = String(listType || '').toLowerCase();
 		const listFallbacks = { wishlist: 'games', downloads: 'games', download: 'games', library: 'games', favs: 'games', favorites: 'games' };
-		const fallback = item.category || listFallbacks[String(listType || '').toLowerCase()] || 'games';
+		const fallback = item.category || listFallbacks[normalizedListType] || 'games';
+
+		if (typeof window.isWebmanBackedProfileList === 'function' && window.isWebmanBackedProfileList(normalizedListType)) {
+			return (typeof window.normalizeLibraryContentCategory === 'function')
+				? window.normalizeLibraryContentCategory(item, fallback)
+				: window.inferContentCategoryKey(item, fallback, { library: true });
+		}
+
 		return window.inferContentCategoryKey(item, fallback);
 	};
 
-	window.getDownloadCoverData = function(item = {}, category = '') {
-		const resolvedCategory = (typeof window.getProfileListItemCategory === 'function') ? window.getProfileListItemCategory(item, category || 'downloads') : (category || item.category || 'games');
+	window.getDownloadCoverData = function(item = {}, category = '', listType = '') {
+		const normalizedListType = String(listType || '').toLowerCase();
+		const isLibraryList = (typeof window.isWebmanBackedProfileList === 'function') ? window.isWebmanBackedProfileList(normalizedListType) : (normalizedListType === 'library');
+		const resolvedCategory = (typeof window.getProfileListItemCategory === 'function') ? window.getProfileListItemCategory(item, isLibraryList ? 'library' : (category || 'downloads')) : (category || item.category || 'games');
 		let finalCategory = resolvedCategory;
 		const titleId = item.titleId || item.id || item.titleid || '';
 		const currentContentId = item.contentId || item.contentID || '';
@@ -12050,8 +12099,8 @@ body.chat-auto-translate-enabled .msg-bubble.has-translate { padding-right:14px 
 		const itemNameKey = normalizeName(item.cleanName || item.name || item.title || '');
 		const pools = [];
 		if (Array.isArray(window.currentData)) pools.push({ cat: resolvedCategory, items: window.currentData });
-		if (window.psnStoreCache && Array.isArray(window.psnStoreCache[resolvedCategory])) pools.push({ cat: resolvedCategory, items: window.psnStoreCache[resolvedCategory] });
-		if ((resolvedCategory === 'dlcs' || resolvedCategory === 'updates') && window.psnStoreCache && Array.isArray(window.psnStoreCache.games)) pools.push({ cat: 'games', items: window.psnStoreCache.games });
+		if (window.psnStoreCache && Array.isArray(window.psnStoreCache[resolvedCategory]) && !(isLibraryList && window.isLibraryBlockedContentCategory(resolvedCategory))) pools.push({ cat: resolvedCategory, items: window.psnStoreCache[resolvedCategory] });
+		if (!isLibraryList && (resolvedCategory === 'dlcs' || resolvedCategory === 'updates') && window.psnStoreCache && Array.isArray(window.psnStoreCache.games)) pools.push({ cat: 'games', items: window.psnStoreCache.games });
 
 		const candidates = [];
 		pools.forEach(pool => pool.items.forEach(game => {
@@ -12076,13 +12125,17 @@ body.chat-auto-translate-enabled .msg-bubble.has-translate { padding-right:14px 
 		if (!matched && window.psnStoreCache) {
 			const text = `${item.cleanName || ''} ${item.name || ''} ${item.title || ''} ${item.rawName || ''}`.toLowerCase();
 			const preferred = [];
-			if (/\btheme\b/.test(text)) preferred.push('themes');
-			if (/\bavatar\b/.test(text)) preferred.push('avatars');
-			if (/\bdlc\b|add[- ]?on|expansion|pack/.test(text)) preferred.push('dlcs');
-			if (/\b(update|patch)\b/.test(text)) preferred.push('updates');
+			if (!isLibraryList) {
+				if (/\btheme\b/.test(text)) preferred.push('themes');
+				if (/\bavatar\b/.test(text)) preferred.push('avatars');
+				if (/\bdlc\b|add[- ]?on|expansion|pack/.test(text)) preferred.push('dlcs');
+				if (/\b(update|patch)\b/.test(text)) preferred.push('updates');
+			}
 			preferred.push(resolvedCategory);
 
-			const categoryPriority = [...new Set([...preferred, 'themes', 'avatars', 'dlcs', 'updates', 'games', 'apps', 'demos', 'prototypes', 'homebrew_games', 'ports', 'no_psn', 'tools', 'dev_tools', 'backup_manager', 'emulators', 'launchers', 'legacy'])];
+			const categoryPriority = isLibraryList
+				? [...new Set([...preferred, ...window.getLibraryStoreCategoryPriority()])].filter(cat => !window.isLibraryBlockedContentCategory(cat))
+				: [...new Set([...preferred, 'themes', 'avatars', 'dlcs', 'updates', 'games', 'apps', 'demos', 'prototypes', 'homebrew_games', 'ports', 'no_psn', 'tools', 'dev_tools', 'backup_manager', 'emulators', 'launchers', 'legacy'])];
 			for (const cat of categoryPriority) {
 				const bucket = window.psnStoreCache[cat];
 				if (!Array.isArray(bucket) || !bucket.length) continue;
@@ -12109,6 +12162,7 @@ body.chat-auto-translate-enabled .msg-bubble.has-translate { padding-right:14px 
 		}
 
 		finalCategory = (matched && matched.category) ? matched.category : matchedCat || resolvedCategory;
+		if (isLibraryList && window.isLibraryBlockedContentCategory(finalCategory)) finalCategory = resolvedCategory || 'games';
 		const rawConsoleTag = item.cTag || item.console || (matched ? matched.cTag : '') || 'ps3';
 		const safeConsoleTag = (typeof window.getSafeConsoleTagForItem === 'function')
 			? window.getSafeConsoleTagForItem(Object.assign({}, matched || {}, item, { category: finalCategory, cTag: rawConsoleTag, console: rawConsoleTag }), finalCategory)
@@ -12168,7 +12222,7 @@ body.chat-auto-translate-enabled .msg-bubble.has-translate { padding-right:14px 
 
 	window.sanitizeDownloadCoverRecord = function(item = {}, listType = 'downloads') {
 		const baseCategory = (typeof window.getProfileListItemCategory === 'function') ? window.getProfileListItemCategory(item, listType) : (item.category || 'games');
-		const coverData = (typeof window.getDownloadCoverData === 'function') ? window.getDownloadCoverData(item, baseCategory) : item;
+		const coverData = (typeof window.getDownloadCoverData === 'function') ? window.getDownloadCoverData(item, baseCategory, listType) : item;
 		const finalCategory = coverData.category || baseCategory || item.category || 'games';
 		const rawConsoleTag = coverData.cTag || item.cTag || item.console || 'ps3';
 		const safeConsoleTag = (typeof window.getSafeConsoleTagForItem === 'function')
@@ -12245,7 +12299,7 @@ body.chat-auto-translate-enabled .msg-bubble.has-translate { padding-right:14px 
         const dateTime = `${datePart} - ${timePart}`;
     
         const resolvedCategory = (typeof window.getProfileListItemCategory === 'function' ? window.getProfileListItemCategory({ id: titleId, titleId, name: fileName, category, contentId }, 'downloads') : category);
-        const storeItem = (typeof window.getDownloadCoverData === 'function') ? window.getDownloadCoverData({ id: titleId, titleId, name: fileName, category: resolvedCategory, contentId }, resolvedCategory) : null;
+        const storeItem = (typeof window.getDownloadCoverData === 'function') ? window.getDownloadCoverData({ id: titleId, titleId, name: fileName, category: resolvedCategory, contentId }, resolvedCategory, 'downloads') : null;
         const entry = {
             id: Date.now(),
             titleId: titleId,
@@ -33064,8 +33118,9 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 				const itemTypeCategory = (typeof window.getProfileListItemCategory === 'function') ? window.getProfileListItemCategory(item, listType) : (item.category || 'games');
 				const itemPathUpper = String(item.path || '').toUpperCase();
 				const profileUsesBingCover = ['downloads', 'wishlist', 'library', 'favs', 'favorites'].includes(listType);
-				const itemCoverData = (typeof window.getDownloadCoverData === 'function') ? window.getDownloadCoverData(item, itemTypeCategory) : { id: realId, titleId: realId, contentId: item.contentId, cleanName: itemName, cTag: item.cTag || item.console || 'ps3', category: itemTypeCategory };
-				const itemFinalCategory = itemCoverData.category || itemTypeCategory;
+				const itemCoverData = (typeof window.getDownloadCoverData === 'function') ? window.getDownloadCoverData(item, itemTypeCategory, listType) : { id: realId, titleId: realId, contentId: item.contentId, cleanName: itemName, cTag: item.cTag || item.console || 'ps3', category: itemTypeCategory };
+				let itemFinalCategory = itemCoverData.category || itemTypeCategory;
+				if (typeof window.isWebmanBackedProfileList === 'function' && window.isWebmanBackedProfileList(listType) && typeof window.isLibraryBlockedContentCategory === 'function' && window.isLibraryBlockedContentCategory(itemFinalCategory)) itemFinalCategory = itemTypeCategory || 'games';
 				const itemCoverId = realId || itemCoverData.titleId || itemCoverData.id || '';
 				const rawItemConsoleTag = itemCoverData.cTag || item.cTag || item.console || (itemPathUpper.includes('/PS2ISO/') ? 'ps2' : (itemPathUpper.includes('/PSXISO/') ? 'psx' : (itemPathUpper.includes('/PSPISO/') ? 'psp' : 'ps3')));
 				const itemConsoleTag = (typeof window.getSafeConsoleTagForItem === 'function')
@@ -33090,7 +33145,14 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 				} 
 				
 				else if (isSearchable && window.psnStoreCache) {
-					for (let cat in window.psnStoreCache) {
+					const isWebmanList = (typeof window.isWebmanBackedProfileList === 'function') ? window.isWebmanBackedProfileList(listType) : (listType === 'library');
+					const searchableStoreCategories = (isWebmanList && typeof window.getLibraryStoreCategoryPriority === 'function')
+						? window.getLibraryStoreCategoryPriority()
+						: Object.keys(window.psnStoreCache);
+
+					for (let cat of searchableStoreCategories) {
+						if (isWebmanList && typeof window.isLibraryBlockedContentCategory === 'function' && window.isLibraryBlockedContentCategory(cat)) continue;
+						if (!Array.isArray(window.psnStoreCache[cat])) continue;
 						if (window.psnStoreCache[cat].some(g => {
 							const gId = (g.id || g.titleId || g.titleid || "").toUpperCase();
 							if (searchId && gId === searchId) return true;
