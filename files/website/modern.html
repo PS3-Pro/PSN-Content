@@ -57,6 +57,7 @@ input,textarea,[contenteditable="true"],[contenteditable="true"] * { cursor: tex
 
 .chat-toolbar-divider { width: 1px; height: 18px; background: rgba(255,255,255,.16); margin: 0 3px; flex: 0 0 auto; border-radius: 2px; opacity: .85; }
 @media (max-width: 768px) { .chat-toolbar-divider { height: 16px; margin: 0 2px; } }
+.chat-translated-tag { display: inline-block; margin-left: 0; font-size: 10px; color: rgba(255,255,255,.48); font-style: italic; font-weight: 400; white-space: nowrap; vertical-align: baseline; }
 #chat-input ul, #chat-input ol, [id^="msg-text-"] ul, [id^="msg-text-"] ol { margin: 0 !important; margin-block-start: 0 !important; margin-block-end: 0 !important; padding-left: 22px; }
 #chat-input li, [id^="msg-text-"] li { margin: 0 !important; padding-left: 2px; line-height: inherit; }
 .message-content ul, .message-content ol,
@@ -26882,6 +26883,29 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 		return '';
 	}
 
+	function getChatLanguageName(code) {
+		const lang = String(code || '').toLowerCase().split('-')[0];
+		const names = { af: 'Afrikaans', ar: 'Arabic', bg: 'Bulgarian', ca: 'Catalan', cs: 'Czech', da: 'Danish', de: 'German', el: 'Greek', en: 'English', es: 'Spanish', fi: 'Finnish', fr: 'French', he: 'Hebrew', hi: 'Hindi', hr: 'Croatian', hu: 'Hungarian', id: 'Indonesian', it: 'Italian', ja: 'Japanese', ko: 'Korean', nl: 'Dutch', no: 'Norwegian', pl: 'Polish', pt: 'Portuguese', ro: 'Romanian', ru: 'Russian', sk: 'Slovak', sv: 'Swedish', th: 'Thai', tr: 'Turkish', uk: 'Ukrainian', vi: 'Vietnamese', zh: 'Chinese' };
+		return names[lang] || (lang ? lang.toUpperCase() : 'Auto');
+	}
+
+	function normalizeChatLanguageCode(code) {
+		return String(code || '').toLowerCase().split('-')[0];
+	}
+
+	function getChatTranslatedTagHtml(sourceLang, targetLang) {
+		const source = normalizeChatLanguageCode(sourceLang);
+		const target = normalizeChatLanguageCode(targetLang);
+		if (!source || source === 'auto' || source === target) return '';
+		return ' <span class="chat-translated-tag" data-no-translate="true" translate="no">(Translated from ' + getChatLanguageName(source) + ')</span>';
+	}
+
+	function appendChatTranslatedTagToHtml(translatedHtml, sourceLang, targetLang) {
+		const tag = getChatTranslatedTagHtml(sourceLang, targetLang);
+		if (!tag) return translatedHtml;
+		return String(translatedHtml || '').replace(/\s*<span[^>]*class=["'][^"']*chat-translated-tag[^"']*["'][\s\S]*?<\/span>\s*$/i, '') + tag;
+	}
+
 	function requestChatTranslation(text, targetLang) {
 		return new Promise((resolve, reject) => {
 			const query = String(text || '').trim();
@@ -26991,6 +27015,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 		if (el.classList && (
 			el.classList.contains('chat-mention') ||
 			el.classList.contains('gt-translate-mark') ||
+			el.classList.contains('chat-translated-tag') ||
 			el.classList.contains('chat-translated-note') ||
 			el.classList.contains('chat-translate-error')
 		)) return true;
@@ -27055,6 +27080,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 
 			let pending = nodes.length;
 			let failed = 0;
+			let detectedLang = '';
 
 			nodes.forEach(function(node) {
 				const originalValue = node.nodeValue || '';
@@ -27064,6 +27090,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 				const protectedData = protectChatTranslateTokens(core);
 
 				requestChatTranslation(protectedData.text, targetLang).then(function(result) {
+					if (!detectedLang && result && result.detected) detectedLang = result.detected;
 					const translated = restoreChatTranslateTokens(result.text, protectedData.tokens);
 					node.nodeValue = leading + translated + trailing;
 				}).catch(function() {
@@ -27072,7 +27099,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 					pending--;
 					if (pending <= 0) {
 						if (failed >= nodes.length) reject(new Error('all-failed'));
-						else resolve(wrapper.innerHTML);
+						else resolve({ html: wrapper.innerHTML, detected: detectedLang || 'auto' });
 					}
 				});
 			});
@@ -27124,10 +27151,10 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 
 	function translateChatPollTextValue(value, targetLang) {
 		const core = String(value || '').trim();
-		if (!core) return Promise.resolve(value || '');
+		if (!core) return Promise.resolve({ text: value || '', detected: 'auto' });
 		const protectedData = protectChatTranslateTokens(core);
 		return requestChatTranslation(protectedData.text, targetLang).then(function(result) {
-			return restoreChatTranslateTokens(result.text, protectedData.tokens);
+			return { text: restoreChatTranslateTokens(result.text, protectedData.tokens), detected: result.detected || 'auto' };
 		});
 	}
 
@@ -27156,14 +27183,16 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 		const translatedPoll = cloneChatPollContentForTranslate(msg.content);
 		const jobs = [];
 
-		jobs.push(translateChatPollTextValue(msg.content.question || '', targetLang).then(function(text) {
-			translatedPoll.question = text;
+		jobs.push(translateChatPollTextValue(msg.content.question || '', targetLang).then(function(result) {
+			if (!cache.pollDetectedLang && result && result.detected) cache.pollDetectedLang = result.detected;
+			translatedPoll.question = result.text;
 		}));
 
 		if (Array.isArray(msg.content.options)) {
 			msg.content.options.forEach(function(opt, idx) {
-				jobs.push(translateChatPollTextValue(opt && opt.text ? opt.text : '', targetLang).then(function(text) {
-					if (translatedPoll.options[idx]) translatedPoll.options[idx].text = text;
+				jobs.push(translateChatPollTextValue(opt && opt.text ? opt.text : '', targetLang).then(function(result) {
+					if (!cache.pollDetectedLang && result && result.detected) cache.pollDetectedLang = result.detected;
+					if (translatedPoll.options[idx]) translatedPoll.options[idx].text = result.text;
 				}));
 			});
 		}
@@ -27242,7 +27271,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 		}
 
 		if (cache.autoTranslatedHtml) {
-			textEl.innerHTML = cache.autoTranslatedHtml;
+			textEl.innerHTML = appendChatTranslatedTagToHtml(cache.autoTranslatedHtml, cache.autoDetectedLang, getChatTranslateTargetLang());
 			textEl.setAttribute('data-translated', 'true');
 			textEl.setAttribute('data-auto-translated', 'true');
 			restoreActiveChatMediaAnchorForTranslate();
@@ -27252,11 +27281,12 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 		textEl.setAttribute('data-translate-pending', 'true');
 		const targetLang = getChatTranslateTargetLang();
 
-		translateChatHtmlPreservingFormatting(textEl, targetLang, cache).then(function(translatedHtml) {
+		translateChatHtmlPreservingFormatting(textEl, targetLang, cache).then(function(result) {
 			textEl.removeAttribute('data-translate-pending');
 			if (!isChatAutoTranslateEnabled()) return;
-			cache.autoTranslatedHtml = translatedHtml;
-			textEl.innerHTML = cache.autoTranslatedHtml;
+			cache.autoDetectedLang = result.detected || 'auto';
+			cache.autoTranslatedHtml = result.html;
+			textEl.innerHTML = appendChatTranslatedTagToHtml(cache.autoTranslatedHtml, cache.autoDetectedLang, targetLang);
 			textEl.setAttribute('data-translated', 'true');
 			textEl.setAttribute('data-auto-translated', 'true');
 			restoreActiveChatMediaAnchorForTranslate();
@@ -27331,7 +27361,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 		}
 
 		if (cache.translatedHtml) {
-			textEl.innerHTML = cache.translatedHtml;
+			textEl.innerHTML = appendChatTranslatedTagToHtml(cache.translatedHtml, cache.detectedLang, getChatTranslateTargetLang());
 			textEl.setAttribute('data-translated', 'true');
 			restoreActiveChatMediaAnchorForTranslate();
 			if (btn) {
@@ -27351,9 +27381,10 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 		}
 
 		const targetLang = getChatTranslateTargetLang();
-		translateChatHtmlPreservingFormatting(textEl, targetLang, cache).then(function(translatedHtml) {
-			cache.translatedHtml = translatedHtml;
-			textEl.innerHTML = cache.translatedHtml;
+		translateChatHtmlPreservingFormatting(textEl, targetLang, cache).then(function(result) {
+			cache.detectedLang = result.detected || 'auto';
+			cache.translatedHtml = result.html;
+			textEl.innerHTML = appendChatTranslatedTagToHtml(cache.translatedHtml, cache.detectedLang, targetLang);
 			textEl.setAttribute('data-translated', 'true');
 			restoreActiveChatMediaAnchorForTranslate();
 			if (btn) {
@@ -31810,7 +31841,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 	
 		let html = `
 		<div class="poll-container" id="poll-container-${msgId}" data-view="${currentView}" style="text-align: left;">
-			<div class="poll-question"><i class="fas fa-poll-h" style="color: var(--ps-blue);"></i> ${poll.question}</div>
+			<div class="poll-question"><i class="fas fa-poll-h" style="color: var(--ps-blue);"></i> ${poll.question}${window.chatTranslationCache && window.chatTranslationCache[String(msgId)] ? getChatTranslatedTagHtml(window.chatTranslationCache[String(msgId)].pollDetectedLang, getChatTranslateTargetLang()) : ''}</div>
 			
 			<div id="poll-dynamic-content-${msgId}" style="animation: fadeIn 0.3s ease-out; width: 100%;">
 				${contentHtml}
