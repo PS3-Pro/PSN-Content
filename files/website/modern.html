@@ -12150,7 +12150,7 @@ body.chat-auto-translate-enabled .msg-bubble.has-translate { padding-right:14px 
 	};
 
 	window.getLibraryStoreCategoryPriority = function() {
-		return ['games', 'apps', 'demos', 'prototypes', 'homebrew_games', 'ports', 'no_psn', 'tools', 'dev_tools', 'backup_manager', 'emulators', 'launchers', 'legacy'];
+		return ['prototypes', 'homebrew_games', 'emulators', 'ports', 'legacy', 'no_psn', 'tools', 'dev_tools', 'backup_manager', 'launchers', 'apps', 'demos', 'games'];
 	};
 
 	window.normalizeLibraryContentCategory = function(item = {}, fallback = 'games') {
@@ -12201,7 +12201,6 @@ body.chat-auto-translate-enabled .msg-bubble.has-translate { padding-right:14px 
 			}
 			if (/\bdemo\b|trial/.test(text)) return 'demos';
 			if (/\bhomebrew\b/.test(text)) return 'homebrew_games';
-			if (/\bport\b/.test(text)) return 'ports';
 			return 'games';
 		}
 
@@ -12236,6 +12235,86 @@ body.chat-auto-translate-enabled .msg-bubble.has-translate { padding-right:14px 
 		return tag;
 	};
 
+
+
+	window.resolveLibraryStoreMatchCategory = function(category = 'games', foundItem = {}, fallbackItem = {}) {
+		let finalCategory = String(category || 'games').trim().toLowerCase().replace(/\s+/g, '_') || 'games';
+
+		if (finalCategory === 'games' || finalCategory === 'apps' || finalCategory === 'demos') {
+			let rawName = foundItem.title || foundItem.name || foundItem.cleanName || fallbackItem.title || fallbackItem.name || fallbackItem.cleanName || "";
+			const RX_DEMO_CHK = /\b(demo|trial|beta|bèta|network\s+test|test\s*ver|testver|testversie)\b|体験版|체험판/gi;
+			const isTestVersion = RX_DEMO_CHK.test(rawName);
+
+			const upName = String(rawName || '').toUpperCase();
+			let aTag = String(foundItem.aTag || foundItem.appTag || fallbackItem.aTag || fallbackItem.appTag || 'media').trim().toLowerCase() || 'media';
+			if (upName.includes("FIRSTPLAY") || upName.includes("FIRST PLAY")) aTag = "firstplay";
+			else if (upName.includes("QORE")) aTag = "qore";
+
+			const actualId = String(foundItem.id || foundItem.titleId || foundItem.titleID || foundItem.titleid || fallbackItem.id || fallbackItem.titleId || fallbackItem.titleID || '').trim().toUpperCase();
+			const isAppItem = (typeof DICT_APPS_FILTER !== 'undefined' && DICT_APPS_FILTER[actualId] === 1) || (aTag !== "media");
+
+			if (isTestVersion) finalCategory = 'demos';
+			else if (isAppItem) finalCategory = 'apps';
+			else finalCategory = 'games';
+		}
+
+		return finalCategory;
+	};
+
+	window.findExactLibraryStoreMatchForItem = function(item = {}, cachedData = {}) {
+		if (!item || !window.psnStoreCache) return null;
+
+		const normalizeId = value => String(value || '').trim().toUpperCase();
+		const idCandidates = [
+			cachedData.id,
+			cachedData.titleId,
+			cachedData.titleID,
+			item.id,
+			item.titleId,
+			item.titleID,
+			item.titleid
+		]
+			.map(normalizeId)
+			.filter(Boolean);
+
+		const contentIdCandidates = [
+			cachedData.contentId,
+			cachedData.contentID,
+			item.contentId,
+			item.contentID
+		]
+			.map(normalizeId)
+			.filter(Boolean);
+
+		const categories = (typeof window.getLibraryStoreCategoryPriority === 'function')
+			? window.getLibraryStoreCategoryPriority()
+			: ['prototypes', 'homebrew_games', 'emulators', 'ports', 'legacy', 'no_psn', 'tools', 'dev_tools', 'backup_manager', 'launchers', 'apps', 'demos', 'games'];
+
+		for (const cat of categories) {
+			if (typeof window.isLibraryBlockedContentCategory === 'function' && window.isLibraryBlockedContentCategory(cat)) continue;
+			const bucket = window.psnStoreCache[cat];
+			if (!Array.isArray(bucket) || !bucket.length) continue;
+
+			const found = bucket.find(entry => {
+				const entryContentIds = [entry.contentId, entry.contentID].map(normalizeId).filter(Boolean);
+				if (contentIdCandidates.length && entryContentIds.some(value => contentIdCandidates.includes(value))) return true;
+
+				const entryIds = [entry.id, entry.titleId, entry.titleID, entry.titleid].map(normalizeId).filter(Boolean);
+				if (idCandidates.length && entryIds.some(value => idCandidates.includes(value))) return true;
+
+				return false;
+			});
+
+			if (found) {
+				const resolvedCategory = (typeof window.resolveLibraryStoreMatchCategory === 'function')
+					? window.resolveLibraryStoreMatchCategory(cat, found, Object.assign({}, item, cachedData))
+					: cat;
+				return { category: resolvedCategory, rawCategory: cat, item: found };
+			}
+		}
+
+		return null;
+	};
 
 	window.findCachedStoreCategoryForItem = function(item = {}, options = {}) {
 		if (!item || !window.psnStoreCache) return '';
@@ -19880,54 +19959,13 @@ body.chat-auto-translate-enabled .msg-bubble.has-translate { padding-right:14px 
 			let existsInStore = false;
 			let targetCategory = 'games';
 			const searchId = cachedData.id ? cachedData.id.toUpperCase() : "";
-			const searchTitle = game.title.toLowerCase().replace(/[^a-z0-9]/g, '');
+			const exactStoreMatch = (typeof window.findExactLibraryStoreMatchForItem === 'function')
+				? window.findExactLibraryStoreMatchForItem(game, cachedData)
+				: null;
 
-			if (window.psnStoreCache) {
-				const priorityCats = ['prototypes', 'homebrew_games', 'emulators', 'ports', 'legacy', 'no_psn', 'tools', 'dev_tools', 'backup_manager', 'launchers', 'apps', 'demos', 'games'];
-				
-				for (let cat of priorityCats) {
-					if (!window.psnStoreCache[cat]) continue;
-					
-					let foundItem = window.psnStoreCache[cat].find(g => {
-						const gId = (g.id || "").toUpperCase();
-						if (searchId && gId === searchId) return true;
-						
-						if (!searchId && g.cleanName) {
-							const gName = g.cleanName.toLowerCase().replace(/[^a-z0-9]/g, '');
-							if (gName.length > 3 && (gName === searchTitle || searchTitle.includes(gName))) return true;
-						}
-						return false;
-					});
-
-					if (foundItem) {
-						if (cat === 'games' || cat === 'apps' || cat === 'demos') {
-							let rawName = foundItem.title || foundItem.name || game.title || "";
-							const RX_DEMO_CHK = /\b(demo|trial|beta|bèta|network\s+test|test\s*ver|testver|testversie)\b|体験版|체험판/gi;
-							const isTestVersion = RX_DEMO_CHK.test(rawName);
-							
-							const upName = rawName.toUpperCase();
-							let aTag = "media";
-							if (upName.includes("FIRSTPLAY") || upName.includes("FIRST PLAY")) aTag = "firstplay";
-							else if (upName.includes("QORE")) aTag = "qore";
-							
-							const actualId = searchId || foundItem.id;
-							const isAppItem = (typeof DICT_APPS_FILTER !== 'undefined' && DICT_APPS_FILTER[actualId] === 1) || (aTag !== "media");
-
-							if (isTestVersion) {
-								targetCategory = 'demos';
-							} else if (isAppItem) {
-								targetCategory = 'apps';
-							} else {
-								targetCategory = 'games';
-							}
-						} else {
-							targetCategory = cat;
-						}
-
-						existsInStore = true;
-						break; 
-					}
-				}
+			if (exactStoreMatch) {
+				existsInStore = true;
+				targetCategory = exactStoreMatch.category || 'games';
 			}
 
 			const cheatsTitleId = encodeURIComponent(currentPlaying.titleId || cachedData.id || '');
@@ -19951,14 +19989,16 @@ body.chat-auto-translate-enabled .msg-bubble.has-translate { padding-right:14px 
 				
 				let storeBtnHtml = '';
 				if (existsInStore) {
-					const safeTitle = game.title.replace(/'/g, "\\'");
-					const searchAction = searchId 
-					? `searchGameOnSite('${searchId}', null, '${targetCategory}')` 
-					: `switchAndSearch('${targetCategory}', '${safeTitle}', 'library_games')`;
+					const searchAction = `searchGameOnSite('${searchId}', null, '${targetCategory}')`;
 
 					storeBtnHtml = `
 					<button class="btn-mini btn-pkg" style="background: rgba(0, 112, 204, 0.3); border-color: var(--ps-blue);" title="Find in Store" onmouseenter="playUiArrow()" onclick="playUiClick(); ${searchAction}">
 						<i class="fas fa-search"></i> STORE
+					</button>`;
+				} else if (searchId) {
+					storeBtnHtml = `
+					<button class="btn-mini btn-upd" style="background: rgba(255, 68, 68, 0.14); border-color: rgba(255, 68, 68, 0.45); color: #ff7777; cursor: default;" title="Not found in database" disabled>
+						<i class="fas fa-ban"></i> NOT FOUND
 					</button>`;
 				}
 
@@ -20438,54 +20478,13 @@ body.chat-auto-translate-enabled .msg-bubble.has-translate { padding-right:14px 
 			let existsInStore = false;
 			let targetCategory = 'games';
 			const searchId = cachedData.id ? cachedData.id.toUpperCase() : "";
-			const searchTitle = game.title.toLowerCase().replace(/[^a-z0-9]/g, '');
+			const exactStoreMatch = (typeof window.findExactLibraryStoreMatchForItem === 'function')
+				? window.findExactLibraryStoreMatchForItem(game, cachedData)
+				: null;
 
-			if (window.psnStoreCache) {
-				const priorityCats = ['prototypes', 'homebrew_games', 'emulators', 'ports', 'legacy', 'no_psn', 'tools', 'dev_tools', 'backup_manager', 'launchers', 'apps', 'demos', 'games'];
-				
-				for (let cat of priorityCats) {
-					if (!window.psnStoreCache[cat]) continue;
-					
-					let foundItem = window.psnStoreCache[cat].find(g => {
-						const gId = (g.id || "").toUpperCase();
-						if (searchId && gId === searchId) return true;
-						
-						if (!searchId && g.cleanName) {
-							const gName = g.cleanName.toLowerCase().replace(/[^a-z0-9]/g, '');
-							if (gName.length > 3 && (gName === searchTitle || searchTitle.includes(gName))) return true;
-						}
-						return false;
-					});
-
-					if (foundItem) {
-						if (cat === 'games' || cat === 'apps' || cat === 'demos') {
-							let rawName = foundItem.title || foundItem.name || game.title || "";
-							const RX_DEMO_CHK = /\b(demo|trial|beta|bèta|network\s+test|test\s*ver|testver|testversie)\b|体験版|체험판/gi;
-							const isTestVersion = RX_DEMO_CHK.test(rawName);
-							
-							const upName = rawName.toUpperCase();
-							let aTag = "media";
-							if (upName.includes("FIRSTPLAY") || upName.includes("FIRST PLAY")) aTag = "firstplay";
-							else if (upName.includes("QORE")) aTag = "qore";
-							
-							const actualId = searchId || foundItem.id;
-							const isAppItem = (typeof DICT_APPS_FILTER !== 'undefined' && DICT_APPS_FILTER[actualId] === 1) || (aTag !== "media");
-
-							if (isTestVersion) {
-								targetCategory = 'demos';
-							} else if (isAppItem) {
-								targetCategory = 'apps';
-							} else {
-								targetCategory = 'games';
-							}
-						} else {
-							targetCategory = cat;
-						}
-
-						existsInStore = true;
-						break; 
-					}
-				}
+			if (exactStoreMatch) {
+				existsInStore = true;
+				targetCategory = exactStoreMatch.category || 'games';
 			}
 
 			const cheatsTitleId = encodeURIComponent(currentPlaying.titleId || cachedData.id || '');
@@ -20509,14 +20508,16 @@ body.chat-auto-translate-enabled .msg-bubble.has-translate { padding-right:14px 
 				
 				let storeBtnHtml = '';
 				if (existsInStore) {
-					const safeTitle = game.title.replace(/'/g, "\\'");
-					const searchAction = searchId 
-					? `searchGameOnSite('${searchId}', null, '${targetCategory}')` 
-					: `switchAndSearch('${targetCategory}', '${safeTitle}', 'library_favs')`;
+					const searchAction = `searchGameOnSite('${searchId}', null, '${targetCategory}')`;
 
 					storeBtnHtml = `
 					<button class="btn-mini btn-pkg" style="background: rgba(0, 112, 204, 0.3); border-color: var(--ps-blue);" title="Find in Store" onmouseenter="playUiArrow()" onclick="playUiClick(); ${searchAction}">
 						<i class="fas fa-search"></i> STORE
+					</button>`;
+				} else if (searchId) {
+					storeBtnHtml = `
+					<button class="btn-mini btn-upd" style="background: rgba(255, 68, 68, 0.14); border-color: rgba(255, 68, 68, 0.45); color: #ff7777; cursor: default;" title="Not found in database" disabled>
+						<i class="fas fa-ban"></i> NOT FOUND
 					</button>`;
 				}
 
@@ -33849,11 +33850,13 @@ function getVisibleChatStackEl(id) {
 				const isSearchable = itemCoverId && isNaN(itemCoverId) && itemCoverId.length >= 5;
 				
 				let existsInStore = false;
+				let matchedStoreCategory = '';
 				let searchId = itemCoverId ? itemCoverId.toUpperCase() : "";
 				let searchTitle = itemName ? itemName.toLowerCase().replace(/[^a-z0-9]/g, '') : "";
 
 				if (listType === 'downloads' || listType === 'wishlist') {
 					existsInStore = true;
+					matchedStoreCategory = itemFinalCategory || itemTypeCategory || item.category || 'games';
 				} 
 				
 				else if (isSearchable && window.psnStoreCache) {
@@ -33861,20 +33864,32 @@ function getVisibleChatStackEl(id) {
 					const searchableStoreCategories = (isWebmanList && typeof window.getLibraryStoreCategoryPriority === 'function')
 						? window.getLibraryStoreCategoryPriority()
 						: Object.keys(window.psnStoreCache);
+					const searchContentId = String(itemCoverData.contentId || item.contentId || item.contentID || '').trim().toUpperCase();
 
 					for (let cat of searchableStoreCategories) {
 						if (isWebmanList && typeof window.isLibraryBlockedContentCategory === 'function' && window.isLibraryBlockedContentCategory(cat)) continue;
 						if (!Array.isArray(window.psnStoreCache[cat])) continue;
-						if (window.psnStoreCache[cat].some(g => {
-							const gId = (g.id || g.titleId || g.titleid || "").toUpperCase();
-							if (searchId && gId === searchId) return true;
-							if (g.cleanName) {
+						const foundStoreItem = window.psnStoreCache[cat].find(g => {
+							const gContentId = String(g.contentId || g.contentID || '').trim().toUpperCase();
+							if (searchContentId && gContentId && gContentId === searchContentId) return true;
+
+							const gIds = [g.id, g.titleId, g.titleID, g.titleid]
+								.map(value => String(value || '').trim().toUpperCase())
+								.filter(Boolean);
+							if (searchId && gIds.includes(searchId)) return true;
+
+							if (!isWebmanList && g.cleanName) {
 								const gName = g.cleanName.toLowerCase().replace(/[^a-z0-9]/g, '');
 								if (gName.length > 3 && (gName === searchTitle || searchTitle.includes(gName))) return true;
 							}
 							return false;
-						})) {
+						});
+
+						if (foundStoreItem) {
 							existsInStore = true;
+							matchedStoreCategory = (isWebmanList && typeof window.resolveLibraryStoreMatchCategory === 'function')
+								? window.resolveLibraryStoreMatchCategory(cat, foundStoreItem, item)
+								: cat;
 							break;
 						}
 					}
@@ -33883,7 +33898,7 @@ function getVisibleChatStackEl(id) {
 				let clickAction = '';
 				let searchTagHtml = '';
 				let cursorStyle = '';
-				const itemSearchCategory = String(itemFinalCategory || item.category || '').replace(/'/g, "\'");
+				const itemSearchCategory = String(matchedStoreCategory || itemFinalCategory || item.category || '').replace(/'/g, "\'");
 				const itemSearchContentId = String(itemCoverData.contentId || item.contentId || '').replace(/'/g, "\'");
 
 				if (isSearchable) {
