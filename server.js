@@ -235,49 +235,91 @@ setInterval(() => {
   });
 }, 840000);
 
-function getSanitizedOnlineList() {
-    return Object.entries(userDatabase).map(([username, u]) => ({
-        id: u.id,
-        name: username, 
-        avatar: u.avatar || DEFAULT_AVATAR,
-        isAdmin: isUserAdmin(username, u),
-        role: getUserRole(username, u),
-        banned: isUserBanned(u),
-        banReason: u.banReason || "", 
-        level: u.level || 1,
-        joined: u.joined || '2026',
-        online: u.online,
-        lastSeen: u.lastSeen,
-        ps3Status: u.ps3Status || null,
-        downloads: u.downloads || 0,
-        wishlist: u.wishlist || 0,
-        favorites: u.favorites || 0,
-        trophies: u.trophies || 0,
-        library: u.library || 0
-    }));
+async function getSanitizedOnlineListFromDb() {
+  await pool.query(`DELETE FROM presence_sessions WHERE last_seen < NOW() - INTERVAL '90 seconds'`);
+
+  const usersRes = await pool.query(`
+    SELECT
+      u.name,
+      u.data,
+      MAX(p.last_seen) AS last_seen,
+      (ARRAY_AGG(p.socket_id ORDER BY p.last_seen DESC))[1] AS socket_id,
+      COUNT(p.socket_id)::int AS active_sessions
+    FROM users u
+    LEFT JOIN presence_sessions p
+      ON p.name = u.name
+     AND p.last_seen > NOW() - INTERVAL '90 seconds'
+    GROUP BY u.name, u.data
+    ORDER BY LOWER(u.name) ASC
+  `);
+
+  return usersRes.rows.map(row => {
+    const username = row.name;
+    const dbUser = normalizeUserRecord(username, row.data || {});
+    const online = Number(row.active_sessions || 0) > 0;
+    const lastSeen = row.last_seen ? new Date(row.last_seen).getTime() : (dbUser.lastSeen || null);
+    const hydratedUser = {
+      ...dbUser,
+      online,
+      id: row.socket_id || dbUser.id || null,
+      lastSeen
+    };
+
+    userDatabase[username] = hydratedUser;
+
+    return {
+      id: hydratedUser.id,
+      name: username,
+      avatar: hydratedUser.avatar || DEFAULT_AVATAR,
+      isAdmin: isUserAdmin(username, hydratedUser),
+      role: getUserRole(username, hydratedUser),
+      banned: isUserBanned(hydratedUser),
+      banReason: hydratedUser.banReason || "",
+      level: hydratedUser.level || 1,
+      joined: hydratedUser.joined || '2026',
+      online: hydratedUser.online,
+      lastSeen: hydratedUser.lastSeen,
+      ps3Status: hydratedUser.ps3Status || null,
+      downloads: Array.isArray(hydratedUser.downloadsData) ? hydratedUser.downloadsData.length : (hydratedUser.downloads || 0),
+      wishlist: Array.isArray(hydratedUser.wishlistData) ? hydratedUser.wishlistData.length : (hydratedUser.wishlist || 0),
+      favorites: Array.isArray(hydratedUser.favoritesData) ? hydratedUser.favoritesData.length : (hydratedUser.favorites || 0),
+      trophies: hydratedUser.trophies || 0,
+      library: Array.isArray(hydratedUser.libraryData) ? hydratedUser.libraryData.length : (hydratedUser.library || 0)
+    };
+  });
 }
 
-function calculateGlobalTrophyStats() {
+async function calculateGlobalTrophyStatsFromDb() {
   const stats = {};
-  const users = Object.values(userDatabase);
-  const totalUsers = users.length;
 
-  if (totalUsers === 0) return stats;
+  const trophyRes = await pool.query(`
+    WITH total_users AS (
+      SELECT COUNT(*)::numeric AS total FROM users
+    ), unlocked_trophies AS (
+      SELECT
+        trophy.key AS trophy_id,
+        COUNT(*)::numeric AS unlocked_count
+      FROM users u
+      CROSS JOIN LATERAL jsonb_each(
+        CASE
+          WHEN jsonb_typeof(u.data->'trophiesData') = 'object' THEN u.data->'trophiesData'
+          ELSE '{}'::jsonb
+        END
+      ) AS trophy(key, value)
+      WHERE LOWER(COALESCE(trophy.value->>'unlocked', 'false')) IN ('true', '1', 'yes')
+      GROUP BY trophy.key
+    )
+    SELECT
+      unlocked_trophies.trophy_id,
+      CASE
+        WHEN total_users.total > 0 THEN (unlocked_trophies.unlocked_count / total_users.total) * 100
+        ELSE 0
+      END AS percentage
+    FROM unlocked_trophies, total_users
+  `);
 
-  const trophyCounts = {};
-
-  users.forEach(user => {
-    if (user.trophiesData) {
-      Object.keys(user.trophiesData).forEach(trophyId => {
-        if (user.trophiesData[trophyId] && user.trophiesData[trophyId].unlocked) {
-          trophyCounts[trophyId] = (trophyCounts[trophyId] || 0) + 1;
-        }
-      });
-    }
-  });
-
-  Object.keys(trophyCounts).forEach(trophyId => {
-    stats[trophyId] = (trophyCounts[trophyId] / totalUsers) * 100;
+  trophyRes.rows.forEach(row => {
+    if (row.trophy_id) stats[row.trophy_id] = Number(row.percentage) || 0;
   });
 
   return stats;
@@ -697,6 +739,76 @@ function getPublicUserData(username, user = {}, includeAdminFields = false) {
   return safe;
 }
 
+async function getUserFromDb(name) {
+  const safeName = normalizeText(name, "");
+  if (!safeName) return null;
+
+  const userRes = await pool.query('SELECT data FROM users WHERE name = $1', [safeName]);
+  if (!userRes.rows.length) return null;
+
+  const dbUser = normalizeUserRecord(safeName, userRes.rows[0].data || {});
+  const localUser = userDatabase[safeName] || {};
+  userDatabase[safeName] = {
+    ...dbUser,
+    online: localUser.online === true,
+    id: localUser.id || dbUser.id || null,
+    lastSeen: localUser.lastSeen || dbUser.lastSeen || null
+  };
+
+  return userDatabase[safeName];
+}
+
+async function refreshReportsFromDb() {
+  const reportsRes = await pool.query('SELECT data FROM reports WHERE resolved = false ORDER BY created_at DESC LIMIT 100');
+  adminReports = reportsRes.rows.map(r => r.data);
+  return adminReports;
+}
+
+async function searchUsersFromDb(query, includeAdminFields = false) {
+  const searchTerm = normalizeText(query, "").toLowerCase();
+  const isAllCommand = (searchTerm === '@all' || searchTerm === '*');
+  if (!isAllCommand && searchTerm.length < 2) return [];
+
+  const sql = isAllCommand
+    ? 'SELECT name, data FROM users ORDER BY LOWER(name) ASC'
+    : 'SELECT name, data FROM users WHERE LOWER(name) LIKE $1 ORDER BY LOWER(name) ASC LIMIT 15';
+  const params = isAllCommand ? [] : [`%${searchTerm}%`];
+  const usersRes = await pool.query(sql, params);
+
+  return usersRes.rows.map(row => {
+    const username = row.name;
+    const dbUser = normalizeUserRecord(username, row.data || {});
+    const localUser = userDatabase[username] || {};
+    const hydratedUser = {
+      ...dbUser,
+      online: localUser.online === true,
+      id: localUser.id || dbUser.id || null,
+      lastSeen: localUser.lastSeen || dbUser.lastSeen || null
+    };
+    userDatabase[username] = hydratedUser;
+    return getPublicUserData(username, hydratedUser, includeAdminFields);
+  });
+}
+
+async function getUserDataPayloadFromDb(targetName, type) {
+  const safeTargetName = normalizeText(targetName, "");
+  if (!safeTargetName) return null;
+
+  const targetUser = await getUserFromDb(safeTargetName);
+  if (!targetUser) return null;
+
+  const keyMap = {
+    favs: 'favoritesData',
+    favorites: 'favoritesData',
+    wishlist: 'wishlistData',
+    downloads: 'downloadsData',
+    library: 'libraryData',
+    trophies: 'trophiesData'
+  };
+  const dataKey = keyMap[type] || `${type}Data`;
+  return targetUser[dataKey] || (dataKey === 'trophiesData' ? {} : []);
+}
+
 async function saveUser(name) {
   if (!name || !userDatabase[name]) return;
   userDatabase[name] = normalizeUserRecord(name, userDatabase[name]);
@@ -787,12 +899,14 @@ async function syncChatAcrossInstances() {
   }
 }
 
-function emitAdminState(socket) {
+async function emitAdminState(socket) {
   socket.emit('maintenance_mode', adminState.maintenance);
   socket.emit('chat_controls', adminState.chatControls);
   socket.emit('admin_pinned_announcement', adminState.pinnedAnnouncement || { clear: true });
 
   if (socket.isAdmin === true) {
+    await refreshReportsFromDb();
+    await refreshServerLogFromDb();
     socket.emit('admin_state', {
       maintenance: adminState.maintenance,
       chatControls: adminState.chatControls,
@@ -1074,14 +1188,17 @@ async function syncPresenceOnlineFromDb() {
 
 async function emitOnlineList(targetSocket = null) {
   try {
-    await syncPresenceOnlineFromDb();
+    const list = await getSanitizedOnlineListFromDb();
+    if (targetSocket) targetSocket.emit('online_list', list);
+    else io.emit('online_list', list);
+    return list;
   } catch (err) {
     console.error('[PRESENCE SYNC ERROR]:', err);
+    const list = [];
+    if (targetSocket) targetSocket.emit('online_list', list);
+    else io.emit('online_list', list);
+    return list;
   }
-  const list = getSanitizedOnlineList();
-  if (targetSocket) targetSocket.emit('online_list', list);
-  else io.emit('online_list', list);
-  return list;
 }
 
 async function heartbeatPresenceSessions() {
@@ -1098,7 +1215,12 @@ async function heartbeatPresenceSessions() {
 }
 
 async function setUserRole(targetName, role, adminName) {
-  if (!targetName || !userDatabase[targetName]) {
+  if (!targetName) {
+    return { success: false, message: "User not found." };
+  }
+
+  await getUserFromDb(targetName);
+  if (!userDatabase[targetName]) {
     return { success: false, message: "User not found." };
   }
 
@@ -1169,6 +1291,7 @@ function resolveCommandTarget(rawArgs = "", options = {}) {
 
 async function banUser(targetName, reason, adminName) {
   if (!targetName) return { success: false, message: "Missing target user." };
+  await getUserFromDb(targetName);
   if (!userDatabase[targetName]) return { success: false, message: "User not found." };
   if (ADMIN_USERS.includes(targetName)) return { success: false, message: "Hardcoded admins cannot be banned." };
 
@@ -1186,6 +1309,7 @@ async function banUser(targetName, reason, adminName) {
 
 async function unbanUser(targetName, adminName) {
   if (!targetName) return { success: false, message: "Missing target user." };
+  await getUserFromDb(targetName);
   if (!userDatabase[targetName]) return { success: false, message: "User not found." };
 
   userDatabase[targetName] = normalizeUserRecord(targetName, userDatabase[targetName]);
@@ -1205,6 +1329,7 @@ async function unbanUser(targetName, adminName) {
 
 async function resetUserPassword(targetName, newPassword, adminName) {
   if (!targetName) return { success: false, message: "Missing target user." };
+  await getUserFromDb(targetName);
   if (!userDatabase[targetName]) return { success: false, message: "User not found." };
 
   const temporaryPassword = normalizeText(newPassword, "") || generateTemporaryPassword();
@@ -1220,6 +1345,7 @@ async function resetUserPassword(targetName, newPassword, adminName) {
 
 async function deleteUserAccount(targetName, reason, adminName) {
   if (!targetName) return { success: false, message: "Missing target user." };
+  await getUserFromDb(targetName);
   if (!userDatabase[targetName]) return { success: false, message: "User not found." };
   if (ADMIN_USERS.includes(targetName)) return { success: false, message: "Hardcoded admins cannot be deleted." };
 
@@ -1319,7 +1445,7 @@ setInterval(() => {
 io.on('connection', async (socket) => {
   console.log('[NETWORK] Socket connected. ID: ' + socket.id);
   await refreshAdminStateFromDb();
-  emitAdminState(socket);
+  await emitAdminState(socket);
 
   socket.on('authenticate_user', async (data = {}) => {
     try {
@@ -1400,7 +1526,7 @@ io.on('connection', async (socket) => {
 
           socket.emit('chat_history', getPublicChatHistory());
           socket.emit('pinned_list', pinnedMessages);
-          emitAdminState(socket);
+          await emitAdminState(socket);
 
           await emitOnlineList();
         } else {
@@ -1468,7 +1594,7 @@ io.on('connection', async (socket) => {
 
         socket.emit('chat_history', getPublicChatHistory());
         socket.emit('pinned_list', pinnedMessages);
-        emitAdminState(socket);
+        await emitAdminState(socket);
 
         await emitOnlineList();
       }
@@ -1531,18 +1657,24 @@ io.on('connection', async (socket) => {
         await notifyProfileSyncAcrossInstances(name, socket.id, userDatabase[name].profileUpdatedAt);
 
         if (userData.trophiesData) {
-            io.emit('global_trophy_stats', calculateGlobalTrophyStats());
+            try {
+                io.emit('global_trophy_stats', await calculateGlobalTrophyStatsFromDb());
+            } catch (err) {
+                console.error('[TROPHY STATS DB ERROR]:', err);
+            }
         }
     }
   });
 
-  socket.on('request_user_data', (data) => {
+  socket.on('request_user_data', async (data = {}) => {
     const { targetName, type } = data;
-    const targetUser = userDatabase[targetName];
-    if (targetUser) {
-        const keyMap = { 'favs': 'favoritesData', 'wishlist': 'wishlistData', 'downloads': 'downloadsData', 'library': 'libraryData', 'trophies': 'trophiesData' };
-        const dataKey = keyMap[type] || (type + 'Data');
-        socket.emit('user_data_response', { targetName, type, rawData: targetUser[dataKey] || [] });
+    try {
+      const rawData = await getUserDataPayloadFromDb(targetName, type);
+      if (rawData !== null) {
+        socket.emit('user_data_response', { targetName, type, rawData });
+      }
+    } catch (err) {
+      console.error('[REQUEST USER DATA DB ERROR]:', err);
     }
   });
 
@@ -1550,25 +1682,26 @@ io.on('connection', async (socket) => {
     await emitOnlineList(socket);
   });
 
-  socket.on('search_users', (query) => {
+  socket.on('search_users', async (query) => {
     if (!query) return;
-    
-    const searchTerm = query.toLowerCase().trim();
-    const isAllCommand = (searchTerm === '@all' || searchTerm === '*');
 
-    if (!isAllCommand && searchTerm.length < 2) return;
-
-    const results = Object.entries(userDatabase)
-      .filter(([username, u]) => isAllCommand ? true : username.toLowerCase().includes(searchTerm))
-      .map(([username, u]) => getPublicUserData(username, u, socket.isAdmin === true))
-      .slice(0, isAllCommand ? Object.keys(userDatabase).length : 15);
-
-    socket.emit('global_search_results', results);
+    try {
+      const results = await searchUsersFromDb(query, socket.isAdmin === true);
+      socket.emit('global_search_results', results);
+    } catch (err) {
+      console.error('[SEARCH USERS DB ERROR]:', err);
+      socket.emit('global_search_results', []);
+    }
   });
   
-  socket.on('request_trophy_stats', () => {
-    const stats = calculateGlobalTrophyStats();
-    socket.emit('global_trophy_stats', stats);
+  socket.on('request_trophy_stats', async () => {
+    try {
+      const stats = await calculateGlobalTrophyStatsFromDb();
+      socket.emit('global_trophy_stats', stats);
+    } catch (err) {
+      console.error('[TROPHY STATS DB ERROR]:', err);
+      socket.emit('global_trophy_stats', {});
+    }
   });
 
   socket.on('request_trending', async () => {
@@ -2001,7 +2134,10 @@ io.on('connection', async (socket) => {
 
   socket.on('admin_request_admin_state', async (data, callback) => {
     await refreshAdminStateFromDb();
-    if (socket.isAdmin === true) await refreshServerLogFromDb();
+    if (socket.isAdmin === true) {
+      await refreshReportsFromDb();
+      await refreshServerLogFromDb();
+    }
     const payload = {
       maintenance: adminState.maintenance,
       chatControls: adminState.chatControls,
@@ -2105,8 +2241,11 @@ io.on('connection', async (socket) => {
     emitToAdmins('admin_server_log_list', serverLog);
   });
 
-  socket.on('admin_request_reports', () => {
-    if (socket.isAdmin === true) socket.emit('reports_list', adminReports);
+  socket.on('admin_request_reports', async () => {
+    if (socket.isAdmin === true) {
+      await refreshReportsFromDb();
+      socket.emit('reports_list', adminReports);
+    }
   });
 
   socket.on('admin_clear_reports', async (data, callback) => {
