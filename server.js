@@ -285,6 +285,8 @@ async function getSanitizedOnlineListFromDb() {
         online: hydratedUser.online === true,
         lastSeen: hydratedUser.lastSeen || null,
         ps3Status: hydratedUser.ps3Status || null,
+        profileUpdatedAt: normalizeTimestampValue(hydratedUser.profileUpdatedAt),
+        downloadsClearedAt: normalizeTimestampValue(hydratedUser.downloadsClearedAt),
         downloads: Array.isArray(hydratedUser.downloadsData) ? hydratedUser.downloadsData.length : (hydratedUser.downloads || 0),
         wishlist: Array.isArray(hydratedUser.wishlistData) ? hydratedUser.wishlistData.length : (hydratedUser.wishlist || 0),
         favorites: Array.isArray(hydratedUser.favoritesData) ? hydratedUser.favoritesData.length : (hydratedUser.favorites || 0),
@@ -758,13 +760,18 @@ async function refreshAllUsersCacheFromDb(options = {}) {
       const username = row.name;
       const dbUser = normalizeUserRecord(username, row.data || {});
       const localUser = userDatabase[username] || {};
+      const dbVersion = normalizeTimestampValue(dbUser.profileUpdatedAt);
+      const localVersion = normalizeTimestampValue(localUser.profileUpdatedAt);
+      const keepLocalProfile = !!(localVersion && (!dbVersion || localVersion > dbVersion));
+      const baseUser = keepLocalProfile ? normalizeUserRecord(username, localUser) : dbUser;
+
       nextDatabase[username] = {
-        ...dbUser,
+        ...baseUser,
         online: preserveOnline ? localUser.online === true : false,
-        id: preserveOnline ? (localUser.id || dbUser.id || null) : (dbUser.id || null),
-        lastSeen: preserveOnline ? (localUser.lastSeen || dbUser.lastSeen || null) : (dbUser.lastSeen || null)
+        id: preserveOnline ? (localUser.id || baseUser.id || null) : (baseUser.id || null),
+        lastSeen: preserveOnline ? (localUser.lastSeen || baseUser.lastSeen || null) : (baseUser.lastSeen || null)
       };
-      nextMeta[username] = now;
+      nextMeta[username] = keepLocalProfile ? (userCacheMeta[username] || now) : now;
     });
 
     userDatabase = nextDatabase;
@@ -796,14 +803,18 @@ async function refreshSingleUserCacheFromDb(name, options = {}) {
   const dbUser = normalizeUserRecord(safeName, userRes.rows[0].data || {});
   const localUser = userDatabase[safeName] || {};
   const preserveOnline = options.preserveOnline !== false;
+  const dbVersion = normalizeTimestampValue(dbUser.profileUpdatedAt);
+  const localVersion = normalizeTimestampValue(localUser.profileUpdatedAt);
+  const keepLocalProfile = !options.force && !!(localVersion && (!dbVersion || localVersion > dbVersion));
+  const baseUser = keepLocalProfile ? normalizeUserRecord(safeName, localUser) : dbUser;
 
   userDatabase[safeName] = {
-    ...dbUser,
+    ...baseUser,
     online: preserveOnline ? localUser.online === true : false,
-    id: preserveOnline ? (localUser.id || dbUser.id || null) : (dbUser.id || null),
-    lastSeen: preserveOnline ? (localUser.lastSeen || dbUser.lastSeen || null) : (dbUser.lastSeen || null)
+    id: preserveOnline ? (localUser.id || baseUser.id || null) : (baseUser.id || null),
+    lastSeen: preserveOnline ? (localUser.lastSeen || baseUser.lastSeen || null) : (baseUser.lastSeen || null)
   };
-  userCacheMeta[safeName] = Date.now();
+  userCacheMeta[safeName] = keepLocalProfile ? (userCacheMeta[safeName] || Date.now()) : Date.now();
   return userDatabase[safeName];
 }
 
