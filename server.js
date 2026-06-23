@@ -29,6 +29,8 @@ const PRESENCE_TTL_SECONDS = 90;
 const PRESENCE_HEARTBEAT_MS = 25000;
 const CHAT_SYNC_INTERVAL_MS = 3000;
 const PROFILE_SYNC_INTERVAL_MS = 5000;
+const USER_CACHE_REFRESH_INTERVAL_MS = 30000;
+const USER_CACHE_WARMUP_INTERVAL_MS = 120000;
 const DEFAULT_MAINTENANCE_MESSAGE = "The service is under maintenance. Please try again soon.";
 const VALID_USER_ROLES = new Set(["user", "trusted", "mod", "admin"]);
 const ADMIN_STATE_KEYS = {
@@ -72,6 +74,8 @@ app.get('/debug-db', async (req, res) => {
       db: info.rows[0],
       chat: chat.rows[0],
       memoryMessages: messageHistory.length,
+      cachedUsers: Object.keys(userDatabase).length,
+      userCacheLastFullRefresh: userCacheLastFullRefresh ? new Date(userCacheLastFullRefresh).toISOString() : null,
       lastChatDbId
     });
   } catch (err) {
@@ -83,6 +87,9 @@ app.get('/debug-db', async (req, res) => {
 });
 
 let userDatabase = {};
+let userCacheMeta = {};
+let userCacheLastFullRefresh = 0;
+let userCacheRefreshInFlight = null;
 let messageHistory = [];
 let lastChatDbId = 0;
 let pinnedMessages = [];
@@ -195,11 +202,7 @@ async function initDb() {
 
   await pool.query('DELETE FROM presence_sessions WHERE instance_id = $1 OR last_seen < NOW() - INTERVAL \'90 seconds\'', [INSTANCE_ID]);
 
-  const usersRes = await pool.query('SELECT * FROM users');
-  usersRes.rows.forEach(row => {
-    userDatabase[row.name] = normalizeUserRecord(row.name, row.data || {});
-    userDatabase[row.name].online = false;
-  });
+  await refreshAllUsersCacheFromDb({ preserveOnline: false });
 
   await refreshChatHistoryFromDb();
   
@@ -221,7 +224,10 @@ async function initDb() {
 }
 
 initDb()
-  .then(() => initProfileSyncNotifications())
+  .then(async () => {
+    await initProfileSyncNotifications();
+    startUserCacheWarmup();
+  })
   .catch(console.error);
 
 
@@ -236,59 +242,57 @@ setInterval(() => {
 }, 840000);
 
 async function getSanitizedOnlineListFromDb() {
+  await ensureUserCacheReady();
   await pool.query(`DELETE FROM presence_sessions WHERE last_seen < NOW() - INTERVAL '90 seconds'`);
 
-  const usersRes = await pool.query(`
-    SELECT
-      u.name,
-      u.data,
-      MAX(p.last_seen) AS last_seen,
-      (ARRAY_AGG(p.socket_id ORDER BY p.last_seen DESC))[1] AS socket_id,
-      COUNT(p.socket_id)::int AS active_sessions
-    FROM users u
-    LEFT JOIN presence_sessions p
-      ON p.name = u.name
-     AND p.last_seen > NOW() - INTERVAL '90 seconds'
-    GROUP BY u.name, u.data
-    ORDER BY LOWER(u.name) ASC
+  const presenceRes = await pool.query(`
+    SELECT name,
+           MAX(last_seen) AS last_seen,
+           (ARRAY_AGG(socket_id ORDER BY last_seen DESC))[1] AS socket_id,
+           COUNT(socket_id)::int AS active_sessions
+    FROM presence_sessions
+    WHERE last_seen > NOW() - INTERVAL '90 seconds'
+    GROUP BY name
   `);
 
-  return usersRes.rows.map(row => {
-    const username = row.name;
-    const dbUser = normalizeUserRecord(username, row.data || {});
-    const online = Number(row.active_sessions || 0) > 0;
-    const lastSeen = row.last_seen ? new Date(row.last_seen).getTime() : (dbUser.lastSeen || null);
-    const hydratedUser = {
-      ...dbUser,
-      online,
-      id: row.socket_id || dbUser.id || null,
-      lastSeen
-    };
-
-    userDatabase[username] = hydratedUser;
-
-    return {
-      id: hydratedUser.id,
-      name: username,
-      avatar: hydratedUser.avatar || DEFAULT_AVATAR,
-      isAdmin: isUserAdmin(username, hydratedUser),
-      role: getUserRole(username, hydratedUser),
-      banned: isUserBanned(hydratedUser),
-      banReason: hydratedUser.banReason || "",
-      level: hydratedUser.level || 1,
-      joined: hydratedUser.joined || '2026',
-      online: hydratedUser.online,
-      lastSeen: hydratedUser.lastSeen,
-      ps3Status: hydratedUser.ps3Status || null,
-      downloads: Array.isArray(hydratedUser.downloadsData) ? hydratedUser.downloadsData.length : (hydratedUser.downloads || 0),
-      wishlist: Array.isArray(hydratedUser.wishlistData) ? hydratedUser.wishlistData.length : (hydratedUser.wishlist || 0),
-      favorites: Array.isArray(hydratedUser.favoritesData) ? hydratedUser.favoritesData.length : (hydratedUser.favorites || 0),
-      trophies: hydratedUser.trophies || 0,
-      library: Array.isArray(hydratedUser.libraryData) ? hydratedUser.libraryData.length : (hydratedUser.library || 0)
-    };
+  Object.values(userDatabase).forEach(user => {
+    user.online = false;
+    if (!user.lastSeen) user.lastSeen = null;
   });
-}
 
+  presenceRes.rows.forEach(row => {
+    const username = row.name;
+    if (!userDatabase[username]) return;
+    userDatabase[username].online = Number(row.active_sessions || 0) > 0;
+    userDatabase[username].id = row.socket_id || userDatabase[username].id || null;
+    userDatabase[username].lastSeen = row.last_seen ? new Date(row.last_seen).getTime() : (userDatabase[username].lastSeen || Date.now());
+  });
+
+  return Object.keys(userDatabase)
+    .sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()))
+    .map(username => {
+      const hydratedUser = userDatabase[username] || {};
+      return {
+        id: hydratedUser.id,
+        name: username,
+        avatar: hydratedUser.avatar || DEFAULT_AVATAR,
+        isAdmin: isUserAdmin(username, hydratedUser),
+        role: getUserRole(username, hydratedUser),
+        banned: isUserBanned(hydratedUser),
+        banReason: hydratedUser.banReason || "",
+        level: hydratedUser.level || 1,
+        joined: hydratedUser.joined || '2026',
+        online: hydratedUser.online === true,
+        lastSeen: hydratedUser.lastSeen || null,
+        ps3Status: hydratedUser.ps3Status || null,
+        downloads: Array.isArray(hydratedUser.downloadsData) ? hydratedUser.downloadsData.length : (hydratedUser.downloads || 0),
+        wishlist: Array.isArray(hydratedUser.wishlistData) ? hydratedUser.wishlistData.length : (hydratedUser.wishlist || 0),
+        favorites: Array.isArray(hydratedUser.favoritesData) ? hydratedUser.favoritesData.length : (hydratedUser.favorites || 0),
+        trophies: hydratedUser.trophies || 0,
+        library: Array.isArray(hydratedUser.libraryData) ? hydratedUser.libraryData.length : (hydratedUser.library || 0)
+      };
+    });
+}
 async function calculateGlobalTrophyStatsFromDb() {
   const stats = {};
 
@@ -739,64 +743,112 @@ function getPublicUserData(username, user = {}, includeAdminFields = false) {
   return safe;
 }
 
-async function getUserFromDb(name) {
+
+async function refreshAllUsersCacheFromDb(options = {}) {
+  if (userCacheRefreshInFlight) return userCacheRefreshInFlight;
+
+  const preserveOnline = options.preserveOnline !== false;
+  userCacheRefreshInFlight = (async () => {
+    const now = Date.now();
+    const usersRes = await pool.query('SELECT name, data FROM users ORDER BY LOWER(name) ASC');
+    const nextDatabase = {};
+    const nextMeta = {};
+
+    usersRes.rows.forEach(row => {
+      const username = row.name;
+      const dbUser = normalizeUserRecord(username, row.data || {});
+      const localUser = userDatabase[username] || {};
+      nextDatabase[username] = {
+        ...dbUser,
+        online: preserveOnline ? localUser.online === true : false,
+        id: preserveOnline ? (localUser.id || dbUser.id || null) : (dbUser.id || null),
+        lastSeen: preserveOnline ? (localUser.lastSeen || dbUser.lastSeen || null) : (dbUser.lastSeen || null)
+      };
+      nextMeta[username] = now;
+    });
+
+    userDatabase = nextDatabase;
+    userCacheMeta = nextMeta;
+    userCacheLastFullRefresh = now;
+    await syncPresenceOnlineFromDb();
+    console.log(`[USER CACHE] ${Object.keys(userDatabase).length} users loaded from DB into RAM on ${INSTANCE_ID}.`);
+    return userDatabase;
+  })();
+
+  try {
+    return await userCacheRefreshInFlight;
+  } finally {
+    userCacheRefreshInFlight = null;
+  }
+}
+
+async function refreshSingleUserCacheFromDb(name, options = {}) {
   const safeName = normalizeText(name, "");
   if (!safeName) return null;
 
   const userRes = await pool.query('SELECT data FROM users WHERE name = $1', [safeName]);
-  if (!userRes.rows.length) return null;
+  if (!userRes.rows.length) {
+    delete userDatabase[safeName];
+    delete userCacheMeta[safeName];
+    return null;
+  }
 
   const dbUser = normalizeUserRecord(safeName, userRes.rows[0].data || {});
   const localUser = userDatabase[safeName] || {};
+  const preserveOnline = options.preserveOnline !== false;
+
   userDatabase[safeName] = {
     ...dbUser,
-    online: localUser.online === true,
-    id: localUser.id || dbUser.id || null,
-    lastSeen: localUser.lastSeen || dbUser.lastSeen || null
+    online: preserveOnline ? localUser.online === true : false,
+    id: preserveOnline ? (localUser.id || dbUser.id || null) : (dbUser.id || null),
+    lastSeen: preserveOnline ? (localUser.lastSeen || dbUser.lastSeen || null) : (dbUser.lastSeen || null)
   };
-
+  userCacheMeta[safeName] = Date.now();
   return userDatabase[safeName];
 }
 
-async function refreshReportsFromDb() {
-  const reportsRes = await pool.query('SELECT data FROM reports WHERE resolved = false ORDER BY created_at DESC LIMIT 100');
-  adminReports = reportsRes.rows.map(r => r.data);
-  return adminReports;
+async function ensureUserCacheReady() {
+  if (!Object.keys(userDatabase).length) {
+    await refreshAllUsersCacheFromDb();
+  }
+  return userDatabase;
 }
 
-async function searchUsersFromDb(query, includeAdminFields = false) {
-  const searchTerm = normalizeText(query, "").toLowerCase();
-  const isAllCommand = (searchTerm === '@all' || searchTerm === '*');
-  if (!isAllCommand && searchTerm.length < 2) return [];
+async function getUserCached(name) {
+  const safeName = normalizeText(name, "");
+  if (!safeName) return null;
 
-  const sql = isAllCommand
-    ? 'SELECT name, data FROM users ORDER BY LOWER(name) ASC'
-    : 'SELECT name, data FROM users WHERE LOWER(name) LIKE $1 ORDER BY LOWER(name) ASC LIMIT 15';
-  const params = isAllCommand ? [] : [`%${searchTerm}%`];
-  const usersRes = await pool.query(sql, params);
+  if (userDatabase[safeName]) {
+    return userDatabase[safeName];
+  }
 
-  return usersRes.rows.map(row => {
-    const username = row.name;
-    const dbUser = normalizeUserRecord(username, row.data || {});
-    const localUser = userDatabase[username] || {};
-    const hydratedUser = {
-      ...dbUser,
-      online: localUser.online === true,
-      id: localUser.id || dbUser.id || null,
-      lastSeen: localUser.lastSeen || dbUser.lastSeen || null
-    };
-    userDatabase[username] = hydratedUser;
-    return getPublicUserData(username, hydratedUser, includeAdminFields);
-  });
+  return await refreshSingleUserCacheFromDb(safeName);
 }
 
-async function getUserDataPayloadFromDb(targetName, type) {
+function startUserCacheWarmup() {
+  setInterval(() => {
+    refreshAllUsersCacheFromDb()
+      .catch(err => console.error('[USER CACHE REFRESH ERROR]:', err));
+  }, USER_CACHE_REFRESH_INTERVAL_MS);
+
+  setInterval(() => {
+    const age = Date.now() - userCacheLastFullRefresh;
+    if (!userCacheLastFullRefresh || age > USER_CACHE_WARMUP_INTERVAL_MS) {
+      refreshAllUsersCacheFromDb()
+        .catch(err => console.error('[USER CACHE WARMUP ERROR]:', err));
+    }
+  }, USER_CACHE_WARMUP_INTERVAL_MS);
+}
+
+function getEmptyUserDataPayload(type) {
+  return (type === 'trophies') ? {} : [];
+}
+
+function getUserDataPayloadFromCache(targetName, type) {
   const safeTargetName = normalizeText(targetName, "");
-  if (!safeTargetName) return null;
+  if (!safeTargetName || !userDatabase[safeTargetName]) return null;
 
-  const targetUser = await getUserFromDb(safeTargetName);
-  if (!targetUser) return null;
-
+  const targetUser = userDatabase[safeTargetName];
   const keyMap = {
     favs: 'favoritesData',
     favorites: 'favoritesData',
@@ -809,10 +861,109 @@ async function getUserDataPayloadFromDb(targetName, type) {
   return targetUser[dataKey] || (dataKey === 'trophiesData' ? {} : []);
 }
 
-async function saveUser(name) {
+function searchUsersFromCache(query, includeAdminFields = false) {
+  const searchTerm = normalizeText(query, "").toLowerCase();
+  const isAllCommand = (searchTerm === '@all' || searchTerm === '*');
+  if (!isAllCommand && searchTerm.length < 2) return [];
+
+  return Object.keys(userDatabase)
+    .filter(username => isAllCommand || username.toLowerCase().includes(searchTerm))
+    .sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()))
+    .slice(0, isAllCommand ? Object.keys(userDatabase).length : 15)
+    .map(username => getPublicUserData(username, userDatabase[username], includeAdminFields));
+}
+
+function calculateGlobalTrophyStatsFromCache() {
+  const users = Object.values(userDatabase);
+  const totalUsers = users.length;
+  const unlockedCounts = {};
+
+  if (!totalUsers) return {};
+
+  users.forEach(user => {
+    const trophiesData = user && typeof user.trophiesData === 'object' && !Array.isArray(user.trophiesData)
+      ? user.trophiesData
+      : {};
+
+    Object.entries(trophiesData).forEach(([trophyId, trophy]) => {
+      const unlocked = trophy && String(trophy.unlocked || '').toLowerCase();
+      if (unlocked === 'true' || unlocked === '1' || unlocked === 'yes') {
+        unlockedCounts[trophyId] = (unlockedCounts[trophyId] || 0) + 1;
+      }
+    });
+  });
+
+  const stats = {};
+  Object.entries(unlockedCounts).forEach(([trophyId, count]) => {
+    stats[trophyId] = (Number(count) / totalUsers) * 100;
+  });
+  return stats;
+}
+
+function calculateTrendingFromCache() {
+  const dlCounts = {};
+  const wishCounts = {};
+
+  Object.values(userDatabase).forEach(user => {
+    const downloads = Array.isArray(user.downloadsData) ? user.downloadsData : [];
+    const wishlist = Array.isArray(user.wishlistData) ? user.wishlistData : [];
+
+    downloads.forEach(item => {
+      const id = item && (item.titleId || item.id);
+      if (id) dlCounts[id] = (dlCounts[id] || 0) + 1;
+    });
+
+    wishlist.forEach(item => {
+      const id = item && (item.titleId || item.id);
+      if (id) wishCounts[id] = (wishCounts[id] || 0) + 1;
+    });
+  });
+
+  const sortTop = counts => Object.entries(counts)
+    .map(([id, count]) => ({ id, count: Number(count) || 0 }))
+    .sort((a, b) => b.count - a.count || String(a.id).localeCompare(String(b.id)))
+    .slice(0, 50);
+
+  return {
+    topDownloads: sortTop(dlCounts),
+    topWishlist: sortTop(wishCounts)
+  };
+}
+
+async function getUserFromDb(name) {
+  return await refreshSingleUserCacheFromDb(name);
+}
+
+async function refreshReportsFromDb() {
+  const reportsRes = await pool.query('SELECT data FROM reports WHERE resolved = false ORDER BY created_at DESC LIMIT 100');
+  adminReports = reportsRes.rows.map(r => r.data);
+  return adminReports;
+}
+
+async function searchUsersFromDb(query, includeAdminFields = false) {
+  await ensureUserCacheReady();
+  return searchUsersFromCache(query, includeAdminFields);
+}
+
+async function getUserDataPayloadFromDb(targetName, type) {
+  const safeTargetName = normalizeText(targetName, "");
+  if (!safeTargetName) return null;
+
+  let targetUser = await getUserCached(safeTargetName);
+  if (!targetUser) return null;
+
+  return getUserDataPayloadFromCache(safeTargetName, type);
+}
+
+async function saveUser(name, options = {}) {
   if (!name || !userDatabase[name]) return;
   userDatabase[name] = normalizeUserRecord(name, userDatabase[name]);
+  userDatabase[name].profileUpdatedAt = userDatabase[name].profileUpdatedAt || Date.now();
+  userCacheMeta[name] = Date.now();
   await pool.query('UPDATE users SET data = $1 WHERE name = $2', [userDatabase[name], name]);
+  if (options.notify !== false) {
+    await notifyProfileSyncAcrossInstances(name, options.sourceSocketId || null, userDatabase[name].profileUpdatedAt);
+  }
 }
 
 async function saveAdminState(key, data) {
@@ -1093,25 +1244,13 @@ async function initProfileSyncNotifications() {
       const hasLocalSession = Array.from(io.sockets.sockets.values()).some(activeSocket => (
         activeSocket.connected && activeSocket.userName === name
       ));
-      if (!hasLocalSession) return;
 
-      const dbRes = await pool.query('SELECT data FROM users WHERE name = $1', [name]);
-      if (!dbRes.rows.length) return;
+      const refreshedUser = await refreshSingleUserCacheFromDb(name);
+      if (!refreshedUser) return;
 
-      const dbUser = normalizeUserRecord(name, dbRes.rows[0].data || {});
-      const localUser = userDatabase[name] || {};
-      const dbVersion = Number(dbUser.profileUpdatedAt || data.profileUpdatedAt || 0);
-      const localVersion = Number(localUser.profileUpdatedAt || 0);
-      if (dbVersion && localVersion && dbVersion <= localVersion) return;
-
-      userDatabase[name] = {
-        ...dbUser,
-        online: localUser.online === true,
-        id: localUser.id || dbUser.id,
-        lastSeen: localUser.lastSeen || dbUser.lastSeen || Date.now()
-      };
-
-      emitProfileSync(name, data.sourceSocketId || null);
+      if (hasLocalSession) {
+        emitProfileSync(name, data.sourceSocketId || null);
+      }
       await emitOnlineList();
     } catch (err) {
       console.error('[PROFILE LISTEN ERROR]:', err);
@@ -1363,8 +1502,10 @@ async function deleteUserAccount(targetName, reason, adminName) {
     [targetName, deletedData]
   );
   await pool.query('DELETE FROM users WHERE name = $1', [targetName]);
+  await notifyProfileSyncAcrossInstances(targetName, null, Date.now());
 
   delete userDatabase[targetName];
+  delete userCacheMeta[targetName];
   disconnectUserSessions(targetName, 'account_deleted', { reason: deleteReason, by: adminName || 'Admin' });
   await emitOnlineList();
 
@@ -1508,8 +1649,10 @@ io.on('connection', async (socket) => {
             profileUpdatedAt: recoveredDbUser.profileUpdatedAt || Date.now()
           };
           normalizeProfileArrayPayloads(userDatabase[name]);
+          userCacheMeta[name] = Date.now();
           
           await pool.query('UPDATE users SET data = $1 WHERE name = $2', [userDatabase[name], name]);
+          await notifyProfileSyncAcrossInstances(name, socket.id, userDatabase[name].profileUpdatedAt);
           await upsertPresenceForSocket(socket, name);
           await refreshChatHistoryFromDb();
 
@@ -1570,11 +1713,13 @@ io.on('connection', async (socket) => {
         });
         socket.role = getUserRole(name, userDatabase[name]);
         normalizeProfileArrayPayloads(userDatabase[name]);
+        userCacheMeta[name] = Date.now();
 
         await pool.query(
           'INSERT INTO users (name, data) VALUES ($1, $2)',
           [name, userDatabase[name]]
         );
+        await notifyProfileSyncAcrossInstances(name, socket.id, userDatabase[name].profileUpdatedAt);
         await upsertPresenceForSocket(socket, name);
         await refreshChatHistoryFromDb();
         if (wasDeletedAccount) {
@@ -1647,6 +1792,7 @@ io.on('connection', async (socket) => {
         userDatabase[name].profileUpdatedAt = Date.now();
         
         try {
+            userCacheMeta[name] = Date.now();
             await pool.query('UPDATE users SET data = $1 WHERE name = $2', [userDatabase[name], name]);
         } catch (err) {
             console.error(`[DATABASE ERROR] Failed to save profile for ${name}:`, err);
@@ -1658,23 +1804,35 @@ io.on('connection', async (socket) => {
 
         if (userData.trophiesData) {
             try {
-                io.emit('global_trophy_stats', await calculateGlobalTrophyStatsFromDb());
+                io.emit('global_trophy_stats', calculateGlobalTrophyStatsFromCache());
             } catch (err) {
-                console.error('[TROPHY STATS DB ERROR]:', err);
+                console.error('[TROPHY STATS CACHE ERROR]:', err);
             }
         }
     }
   });
 
   socket.on('request_user_data', async (data = {}) => {
-    const { targetName, type } = data;
+    const { targetName, type, requestId } = data;
     try {
-      const rawData = await getUserDataPayloadFromDb(targetName, type);
-      if (rawData !== null) {
-        socket.emit('user_data_response', { targetName, type, rawData });
+      await ensureUserCacheReady();
+      let rawData = getUserDataPayloadFromCache(targetName, type);
+
+      if (rawData === null) {
+        const refreshedUser = await refreshSingleUserCacheFromDb(targetName);
+        rawData = refreshedUser ? getUserDataPayloadFromCache(targetName, type) : getEmptyUserDataPayload(type);
       }
+
+      socket.emit('user_data_response', { targetName, type, requestId, rawData });
     } catch (err) {
-      console.error('[REQUEST USER DATA DB ERROR]:', err);
+      console.error('[REQUEST USER DATA CACHE ERROR]:', err);
+      socket.emit('user_data_response', {
+        targetName,
+        type,
+        requestId,
+        rawData: getEmptyUserDataPayload(type),
+        error: err.message || 'Unable to load user data.'
+      });
     }
   });
 
@@ -1696,44 +1854,20 @@ io.on('connection', async (socket) => {
   
   socket.on('request_trophy_stats', async () => {
     try {
-      const stats = await calculateGlobalTrophyStatsFromDb();
-      socket.emit('global_trophy_stats', stats);
+      await ensureUserCacheReady();
+      socket.emit('global_trophy_stats', calculateGlobalTrophyStatsFromCache());
     } catch (err) {
-      console.error('[TROPHY STATS DB ERROR]:', err);
+      console.error('[TROPHY STATS CACHE ERROR]:', err);
       socket.emit('global_trophy_stats', {});
     }
   });
 
   socket.on('request_trending', async () => {
     try {
-      const trendingSql = (payloadKey) => `
-        SELECT
-          COALESCE(NULLIF(item->>'titleId', ''), NULLIF(item->>'id', '')) AS id,
-          COUNT(*)::int AS count
-        FROM users
-        CROSS JOIN LATERAL jsonb_array_elements(
-          CASE
-            WHEN jsonb_typeof(data->'${payloadKey}') = 'array' THEN data->'${payloadKey}'
-            ELSE '[]'::jsonb
-          END
-        ) AS item
-        WHERE COALESCE(NULLIF(item->>'titleId', ''), NULLIF(item->>'id', '')) IS NOT NULL
-        GROUP BY id
-        ORDER BY count DESC, id ASC
-        LIMIT 50
-      `;
-
-      const [topDownloadsRes, topWishlistRes] = await Promise.all([
-        pool.query(trendingSql('downloadsData')),
-        pool.query(trendingSql('wishlistData'))
-      ]);
-
-      socket.emit('trending_data', {
-        topDownloads: topDownloadsRes.rows.map(row => ({ id: row.id, count: Number(row.count) || 0 })),
-        topWishlist: topWishlistRes.rows.map(row => ({ id: row.id, count: Number(row.count) || 0 }))
-      });
+      await ensureUserCacheReady();
+      socket.emit('trending_data', calculateTrendingFromCache());
     } catch (err) {
-      console.error('[TRENDING DB ERROR]:', err);
+      console.error('[TRENDING CACHE ERROR]:', err);
       socket.emit('trending_data', {
         topDownloads: [],
         topWishlist: []
