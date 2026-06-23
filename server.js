@@ -941,6 +941,46 @@ function calculateTrendingFromCache() {
   };
 }
 
+function emitTrendingFromCache(targetSocket = null) {
+  try {
+    const payload = calculateTrendingFromCache();
+    if (targetSocket && targetSocket.connected) targetSocket.emit('trending_data', payload);
+    else io.emit('trending_data', payload);
+    return payload;
+  } catch (err) {
+    console.error('[TRENDING CACHE EMIT ERROR]:', err);
+    const emptyPayload = { topDownloads: [], topWishlist: [] };
+    if (targetSocket && targetSocket.connected) targetSocket.emit('trending_data', emptyPayload);
+    else io.emit('trending_data', emptyPayload);
+    return emptyPayload;
+  }
+}
+
+function profileUpdateTouchesTrending(userData = {}) {
+  return !!(userData && (
+    Object.prototype.hasOwnProperty.call(userData, 'downloadsData') ||
+    Object.prototype.hasOwnProperty.call(userData, 'downloads') ||
+    Object.prototype.hasOwnProperty.call(userData, 'downloadsClearedAt') ||
+    Object.prototype.hasOwnProperty.call(userData, 'wishlistData') ||
+    Object.prototype.hasOwnProperty.call(userData, 'wishlist') ||
+    Object.prototype.hasOwnProperty.call(userData, 'wishlistUpdatedAt')
+  ));
+}
+
+function withTimeout(promise, ms, fallbackValue) {
+  let timeoutId = null;
+  const timeoutPromise = new Promise(resolve => {
+    timeoutId = setTimeout(() => resolve(fallbackValue), ms);
+  });
+  return Promise.race([
+    Promise.resolve(promise).finally(() => {
+      if (timeoutId) clearTimeout(timeoutId);
+    }),
+    timeoutPromise
+  ]);
+}
+
+
 async function getUserFromDb(name) {
   return await refreshSingleUserCacheFromDb(name);
 }
@@ -1258,6 +1298,8 @@ async function initProfileSyncNotifications() {
 
       const refreshedUser = await refreshSingleUserCacheFromDb(name);
       if (!refreshedUser) return;
+
+      emitTrendingFromCache();
 
       if (hasLocalSession) {
         emitProfileSync(name, data.sourceSocketId || null);
@@ -1762,6 +1804,7 @@ io.on('connection', async (socket) => {
 
   socket.on('update_profile', async (userData) => {
     const name = socket.userName;
+    const shouldEmitTrendingUpdate = profileUpdateTouchesTrending(userData || {});
     if (name && userDatabase[name]) {
         
         if (userData.settingsData) {
@@ -1809,6 +1852,10 @@ io.on('connection', async (socket) => {
             console.error(`[DATABASE ERROR] Failed to save profile for ${name}:`, err);
         }
 
+        if (shouldEmitTrendingUpdate) {
+            emitTrendingFromCache();
+        }
+
         await emitOnlineList();
         emitProfileSync(name, socket.id);
         await notifyProfileSyncAcrossInstances(name, socket.id, userDatabase[name].profileUpdatedAt);
@@ -1826,11 +1873,14 @@ io.on('connection', async (socket) => {
   socket.on('request_user_data', async (data = {}) => {
     const { targetName, type, requestId } = data;
     try {
-      await ensureUserCacheReady();
       let rawData = getUserDataPayloadFromCache(targetName, type);
 
       if (rawData === null) {
-        const refreshedUser = await refreshSingleUserCacheFromDb(targetName);
+        const refreshedUser = await withTimeout(
+          refreshSingleUserCacheFromDb(targetName),
+          4500,
+          null
+        );
         rawData = refreshedUser ? getUserDataPayloadFromCache(targetName, type) : getEmptyUserDataPayload(type);
       }
 
@@ -1842,7 +1892,7 @@ io.on('connection', async (socket) => {
         type,
         requestId,
         rawData: getEmptyUserDataPayload(type),
-        error: err.message || 'Unable to load user data.'
+        error: 'Unable to load this list from the server cache.'
       });
     }
   });
@@ -1875,8 +1925,10 @@ io.on('connection', async (socket) => {
 
   socket.on('request_trending', async () => {
     try {
-      await ensureUserCacheReady();
-      socket.emit('trending_data', calculateTrendingFromCache());
+      if (!Object.keys(userDatabase).length) {
+        await withTimeout(ensureUserCacheReady(), 2000, null);
+      }
+      emitTrendingFromCache(socket);
     } catch (err) {
       console.error('[TRENDING CACHE ERROR]:', err);
       socket.emit('trending_data', {
