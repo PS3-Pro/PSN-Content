@@ -1571,36 +1571,41 @@ io.on('connection', async (socket) => {
     socket.emit('global_trophy_stats', stats);
   });
 
-  socket.on('request_trending', () => {
-    let dlCounts = {};
-    let wishCounts = {};
+  socket.on('request_trending', async () => {
+    try {
+      const trendingSql = (payloadKey) => `
+        SELECT
+          COALESCE(NULLIF(item->>'titleId', ''), NULLIF(item->>'id', '')) AS id,
+          COUNT(*)::int AS count
+        FROM users
+        CROSS JOIN LATERAL jsonb_array_elements(
+          CASE
+            WHEN jsonb_typeof(data->'${payloadKey}') = 'array' THEN data->'${payloadKey}'
+            ELSE '[]'::jsonb
+          END
+        ) AS item
+        WHERE COALESCE(NULLIF(item->>'titleId', ''), NULLIF(item->>'id', '')) IS NOT NULL
+        GROUP BY id
+        ORDER BY count DESC, id ASC
+        LIMIT 50
+      `;
 
-    Object.values(userDatabase).forEach(user => {
-        if (user.downloadsData) {
-            user.downloadsData.forEach(item => {
-                const id = item.titleId || item.id;
-                if (id) dlCounts[id] = (dlCounts[id] || 0) + 1;
-            });
-        }
-        if (user.wishlistData) {
-            user.wishlistData.forEach(item => {
-                const id = item.titleId || item.id;
-                if (id) wishCounts[id] = (wishCounts[id] || 0) + 1;
-            });
-        }
-    });
+      const [topDownloadsRes, topWishlistRes] = await Promise.all([
+        pool.query(trendingSql('downloadsData')),
+        pool.query(trendingSql('wishlistData'))
+      ]);
 
-    const getTop = (countsObj) => {
-        return Object.entries(countsObj)
-            .sort((a, b) => b[1] - a[1])
-            .slice(0, 50)
-            .map(entry => ({ id: entry[0], count: entry[1] }));
-    };
-
-    socket.emit('trending_data', {
-        topDownloads: getTop(dlCounts),
-        topWishlist: getTop(wishCounts)
-    });
+      socket.emit('trending_data', {
+        topDownloads: topDownloadsRes.rows.map(row => ({ id: row.id, count: Number(row.count) || 0 })),
+        topWishlist: topWishlistRes.rows.map(row => ({ id: row.id, count: Number(row.count) || 0 }))
+      });
+    } catch (err) {
+      console.error('[TRENDING DB ERROR]:', err);
+      socket.emit('trending_data', {
+        topDownloads: [],
+        topWishlist: []
+      });
+    }
   });
 
   socket.on('admin_redeem', (data, callback) => {
