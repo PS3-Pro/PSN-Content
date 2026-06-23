@@ -1821,14 +1821,36 @@ io.on('connection', async (socket) => {
   });
 
 
-  socket.on('admin_ping' , (data, callback) => {
-    if (typeof callback === 'function') {
-      callback({
+  socket.on('admin_ping' , async (data, callback) => {
+    const respond = typeof callback === 'function' ? callback : () => {};
+
+    try {
+      await pool.query(`DELETE FROM presence_sessions WHERE last_seen < NOW() - INTERVAL '90 seconds'`);
+
+      const statsRes = await pool.query(`
+        SELECT
+          (SELECT COUNT(*)::int FROM users) AS users,
+          (SELECT COUNT(DISTINCT name)::int FROM presence_sessions WHERE last_seen > NOW() - INTERVAL '90 seconds') AS online
+      `);
+
+      const stats = statsRes.rows[0] || {};
+
+      respond({
         success: true,
         serverTime: new Date().toISOString(),
         uptimeSeconds: Math.floor((Date.now() - SERVER_STARTED_AT) / 1000),
-        users: Object.keys(userDatabase).length,
-        online: Object.values(userDatabase).filter(u => u.online).length
+        users: Number(stats.users || 0),
+        online: Number(stats.online || 0)
+      });
+    } catch (err) {
+      console.error('[ADMIN PING ERROR]:', err);
+      respond({
+        success: false,
+        message: 'Database error while loading server stats.',
+        serverTime: new Date().toISOString(),
+        uptimeSeconds: Math.floor((Date.now() - SERVER_STARTED_AT) / 1000),
+        users: 0,
+        online: 0
       });
     }
   });
