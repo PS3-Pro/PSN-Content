@@ -286,6 +286,9 @@ async function getSanitizedOnlineListFromDb() {
         lastSeen: hydratedUser.lastSeen || null,
         ps3Status: hydratedUser.ps3Status || null,
         profileUpdatedAt: normalizeTimestampValue(hydratedUser.profileUpdatedAt),
+        profileCardStyle: getUserProfileCardStyle(hydratedUser),
+        profileCardEffect: getUserProfileCardStyle(hydratedUser),
+        settingsData: getPublicProfileSettings(hydratedUser),
         downloadsClearedAt: normalizeTimestampValue(hydratedUser.downloadsClearedAt),
         downloads: Array.isArray(hydratedUser.downloadsData) ? hydratedUser.downloadsData.length : (hydratedUser.downloads || 0),
         wishlist: Array.isArray(hydratedUser.wishlistData) ? hydratedUser.wishlistData.length : (hydratedUser.wishlist || 0),
@@ -516,6 +519,54 @@ function normalizeTimestampValue(value) {
   return Number.isFinite(timestamp) && timestamp > 0 ? timestamp : 0;
 }
 
+const VALID_PROFILE_CARD_STYLES = new Set(["default", "neon", "galaxy", "sunset", "ghost", "royal", "matrix", "lovely", "wave", "scan", "nightgrid", "glass", "nebula", "spotlight"]);
+
+function normalizeProfileCardStyleServer(value, fallback = "default") {
+  const style = normalizeText(value, fallback).toLowerCase();
+  if (style === "xmb") return "lovely";
+  return VALID_PROFILE_CARD_STYLES.has(style) ? style : fallback;
+}
+
+function getUserProfileCardStyle(user = {}) {
+  const settings = user && user.settingsData && typeof user.settingsData === "object" ? user.settingsData : {};
+  return normalizeProfileCardStyleServer(settings.profileCardStyle || settings.profileCardEffect || settings.profileCardTheme || user.profileCardStyle || user.profileCardEffect || "default");
+}
+
+function getPublicProfileSettings(user = {}) {
+  const profileCardStyle = getUserProfileCardStyle(user);
+  return {
+    profileCardStyle,
+    profileCardEffect: profileCardStyle
+  };
+}
+
+function normalizeProfileBannerSettings(settings = {}) {
+  const clean = settings && typeof settings === "object" ? { ...settings } : {};
+  if (
+    Object.prototype.hasOwnProperty.call(clean, "profileCardStyle") ||
+    Object.prototype.hasOwnProperty.call(clean, "profileCardEffect") ||
+    Object.prototype.hasOwnProperty.call(clean, "profileCardTheme")
+  ) {
+    const style = normalizeProfileCardStyleServer(clean.profileCardStyle || clean.profileCardEffect || clean.profileCardTheme || "default");
+    clean.profileCardStyle = style;
+    clean.profileCardEffect = style;
+    delete clean.profileCardTheme;
+  }
+  return clean;
+}
+
+function emitPublicProfileBannerUpdate(name, user = null) {
+  if (!name || !user) return;
+  const settingsData = getPublicProfileSettings(user);
+  io.emit("profile_public_update", {
+    name,
+    profileUpdatedAt: normalizeTimestampValue(user.profileUpdatedAt) || Date.now(),
+    settingsData,
+    profileCardStyle: settingsData.profileCardStyle,
+    profileCardEffect: settingsData.profileCardEffect
+  });
+}
+
 function getProfileArrayPayload(value) {
   return Array.isArray(value) ? value : [];
 }
@@ -671,7 +722,7 @@ function mergeLocalRecoveryData(dbUser = {}, localData = {}) {
 
   Object.keys(PROFILE_ARRAY_SYNC_KEYS).forEach(key => applyLocalRecoveryArrayPayload(merged, localData, key));
   if (hasObjectPayload(localData.settingsData)) {
-    merged.settingsData = { ...(merged.settingsData || {}), ...localData.settingsData };
+    merged.settingsData = { ...(merged.settingsData || {}), ...normalizeProfileBannerSettings(localData.settingsData) };
   }
   ['trophies', 'level', 'xp'].forEach(key => {
     const current = Number(merged[key] || 0);
@@ -727,6 +778,9 @@ function getPublicUserData(username, user = {}, includeAdminFields = false) {
     online: !!user.online,
     lastSeen: user.lastSeen || null,
     ps3Status: user.ps3Status || null,
+    profileCardStyle: getUserProfileCardStyle(user),
+    profileCardEffect: getUserProfileCardStyle(user),
+    settingsData: getPublicProfileSettings(user),
     downloads: Array.isArray(user.downloadsData) ? user.downloadsData.length : (user.downloads || 0),
     wishlist: Array.isArray(user.wishlistData) ? user.wishlistData.length : (user.wishlist || 0),
     favorites: Array.isArray(user.favoritesData) ? user.favoritesData.length : (user.favorites || 0),
@@ -1222,7 +1276,7 @@ function buildFullProfileSyncPayload(name, user = {}, sourceSocketId = null) {
       friendsUpdatedAt: normalizeTimestampValue(safe.friendsUpdatedAt),
       countersData: safe.countersData || {},
       themeColor: safe.themeColor || '#0070cc',
-      settingsData: safe.settingsData || {}
+      settingsData: { ...(safe.settingsData || {}), ...getPublicProfileSettings(safe) }
     }
   };
 }
@@ -1258,6 +1312,7 @@ async function syncActiveProfilesAcrossInstances() {
     };
 
     emitProfileSync(name, null);
+    emitPublicProfileBannerUpdate(name, userDatabase[name]);
   });
 }
 
@@ -1304,6 +1359,7 @@ async function initProfileSyncNotifications() {
       if (hasLocalSession) {
         emitProfileSync(name, data.sourceSocketId || null);
       }
+      emitPublicProfileBannerUpdate(name, refreshedUser);
       await emitOnlineList();
     } catch (err) {
       console.error('[PROFILE LISTEN ERROR]:', err);
@@ -1748,7 +1804,7 @@ io.on('connection', async (socket) => {
           lastSeen: Date.now(),
           avatar: safeUserData.avatar || DEFAULT_AVATAR,
           joined: safeUserData.joined || '2026',
-          settingsData: safeUserData.settingsData || { audio: "1", ux: "1", chatSound: "1", ps3Ip: "", companionPlugin: "1", fpsCounterPlugin: "0", consoleFanMode: "dynamic", consoleFanSpeed: "35", consoleFanTarget: "68", performanceMode: "balanced", performanceRsx: "650", performanceVram: "850" },
+          settingsData: normalizeProfileBannerSettings(safeUserData.settingsData || { audio: "1", ux: "1", chatSound: "1", profileCardStyle: "default", profileCardEffect: "default", ps3Ip: "", companionPlugin: "1", fpsCounterPlugin: "0", consoleFanMode: "dynamic", consoleFanSpeed: "35", consoleFanTarget: "68", performanceMode: "balanced", performanceRsx: "650", performanceVram: "850" }),
           trophiesData: safeUserData.trophiesData || {},
           wishlistData: safeUserData.wishlistData || [],
           favoritesData: safeUserData.favoritesData || [],
@@ -1804,13 +1860,19 @@ io.on('connection', async (socket) => {
 
   socket.on('update_profile', async (userData) => {
     const name = socket.userName;
+    const incomingSettingsData = (userData && userData.settingsData && typeof userData.settingsData === "object") ? userData.settingsData : null;
+    const shouldBroadcastProfileBanner = !!(incomingSettingsData && (
+        Object.prototype.hasOwnProperty.call(incomingSettingsData, "profileCardStyle") ||
+        Object.prototype.hasOwnProperty.call(incomingSettingsData, "profileCardEffect") ||
+        Object.prototype.hasOwnProperty.call(incomingSettingsData, "profileCardTheme")
+    ));
     const shouldEmitTrendingUpdate = profileUpdateTouchesTrending(userData || {});
     if (name && userDatabase[name]) {
         
         if (userData.settingsData) {
             userDatabase[name].settingsData = {
                 ...(userDatabase[name].settingsData || {}),
-                ...userData.settingsData
+                ...normalizeProfileBannerSettings(userData.settingsData)
             };
             delete userData.settingsData;
         }
@@ -1857,6 +1919,9 @@ io.on('connection', async (socket) => {
         }
 
         await emitOnlineList();
+        if (shouldBroadcastProfileBanner) {
+            emitPublicProfileBannerUpdate(name, userDatabase[name]);
+        }
         emitProfileSync(name, socket.id);
         await notifyProfileSyncAcrossInstances(name, socket.id, userDatabase[name].profileUpdatedAt);
 
