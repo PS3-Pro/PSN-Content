@@ -1429,8 +1429,40 @@
 		return toImg;
 	}
 
+	function classicGetEmptyGif() {
+		return (typeof G_EMPTY_GIF !== 'undefined' && G_EMPTY_GIF)
+			? G_EMPTY_GIF
+			: "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7";
+	}
+
+	function classicReleaseCoverImage(img) {
+		if (!img) return;
+		try { img.onload = null; img.onerror = null; } catch(e1) {}
+		try { img.setAttribute('data-classic-released', '1'); } catch(e2) {}
+		try { img.removeAttribute('data-loading'); } catch(e3) {}
+		try { img.removeAttribute('data-render-id'); } catch(e4) {}
+		try { img.src = classicGetEmptyGif(); } catch(e5) {}
+	}
+
+	function classicIsLiveCoverElement(img, batchID) {
+		if (!img || !img.parentNode) return false;
+		if (img.getAttribute && img.getAttribute('data-classic-released') === '1') return false;
+		if (typeof batchID !== 'undefined' && batchID !== null) {
+			if (batchID !== g_renderID) return false;
+			var attr = img.getAttribute ? img.getAttribute('data-render-id') : null;
+			if (attr && attr !== String(batchID)) return false;
+		}
+		return true;
+	}
+
 	function replaceCoverWithLoadedImage(oldImg, loadedImg, finalUrl) {
 		if (!oldImg || !loadedImg) return oldImg;
+
+		if (isPS3 && !oldImg.parentNode) {
+			classicReleaseCoverImage(oldImg);
+			try { loadedImg.onload = null; loadedImg.onerror = null; } catch(e0) {}
+			return oldImg;
+		}
 
 		if (!isPS3 || !oldImg.parentNode) {
 			oldImg.onload = null;
@@ -1450,12 +1482,12 @@
 		oldImg.onload = null;
 		oldImg.onerror = null;
 		oldImg.parentNode.replaceChild(loadedImg, oldImg);
+		classicReleaseCoverImage(oldImg);
 		return loadedImg;
 	}
 
-	function preloadPS3CoverBeforeSwap(imgElement, targetUrl, onLoad, onError) {
-		if (!imgElement || !targetUrl) {
-			if (onError) onError(imgElement);
+	function preloadPS3CoverBeforeSwap(imgElement, targetUrl, onLoad, onError, batchID) {
+		if (!imgElement || !targetUrl || !classicIsLiveCoverElement(imgElement, batchID)) {
 			return false;
 		}
 
@@ -1472,20 +1504,25 @@
 		ghostImg.onload = function() {
 			ghostImg.onload = null;
 			ghostImg.onerror = null;
+			if (!classicIsLiveCoverElement(imgElement, batchID)) {
+				try { ghostImg.src = classicGetEmptyGif(); } catch(e0) {}
+				return;
+			}
 			var doneImg = replaceCoverWithLoadedImage(imgElement, ghostImg, targetUrl);
-			if (onLoad) onLoad(doneImg);
+			if (onLoad && classicIsLiveCoverElement(doneImg, batchID)) onLoad(doneImg);
 		};
 		ghostImg.onerror = function() {
 			ghostImg.onload = null;
 			ghostImg.onerror = null;
+			if (!classicIsLiveCoverElement(imgElement, batchID)) return;
 			if (onError) onError(imgElement);
 		};
 		ghostImg.src = targetUrl;
 		return true;
 	}
 
-	function finishCoverFallback(imgElement, onFinish) {
-		if (!imgElement) return false;
+	function finishCoverFallback(imgElement, onFinish, batchID) {
+		if (!imgElement || !classicIsLiveCoverElement(imgElement, batchID)) return false;
 
 		if (g_bingCoversEnabled && !isLocalContentCoverCategory(imgElement.getAttribute('data-category')) && imgElement.getAttribute('data-bing-tried') !== 'true') {
 			var bingUrl = buildBingCoverUrlFromElement(imgElement);
@@ -1504,12 +1541,17 @@
 			bingPreload.onload = function() {
 				bingPreload.onload = null;
 				bingPreload.onerror = null;
+				if (!classicIsLiveCoverElement(imgElement, batchID)) {
+					try { bingPreload.src = classicGetEmptyGif(); } catch(e0) {}
+					return;
+				}
 				var doneImg = replaceCoverWithLoadedImage(imgElement, bingPreload, bingUrl);
-				if (onFinish) onFinish(doneImg, true);
+				if (onFinish && classicIsLiveCoverElement(doneImg, batchID)) onFinish(doneImg, true);
 			};
 			bingPreload.onerror = function() {
 				bingPreload.onload = null;
 				bingPreload.onerror = null;
+				if (!classicIsLiveCoverElement(imgElement, batchID)) return;
 				imgElement.onload = null;
 				imgElement.onerror = null;
 				imgElement.src = defaultCover;
@@ -2022,8 +2064,6 @@
 			useCoverGUI = coverToggle.checked;
 		}
 
-		g_bingCoversEnabled = true;
-
 		var audioState = loadState(STORAGE_KEY_AUDIO);
 		if (audioToggle) {
 			if (audioState !== null) {
@@ -2106,8 +2146,6 @@
 
 		var btnMore = doc.getElementById('btn-load-more');
 		if (btnMore) btnMore.style.display = 'none';
-	
-		if (!list) return;
 
 		stopRendering();
 		cancelAllDownloads();
@@ -2116,17 +2154,20 @@
 		g_isProcessingQueue = false;
 		g_isPreloading = false;
 	
-		if (typeof g_activeCovers !== 'undefined') {
-			g_activeCovers = [];
+		if (typeof g_activeCovers !== 'undefined' && g_activeCovers) {
+			for (var ac = g_activeCovers.length - 1; ac >= 0; ac--) {
+				classicReleaseCoverImage(g_activeCovers[ac]);
+			}
+			g_activeCovers.length = 0;
 		}
 
-		var empty = G_EMPTY_GIF;
+		if (!list) return;
+
 		while (list.firstChild) {
 			var item = list.firstChild;
-			var img = item.getElementsByTagName('img')[0];
-			if (img) {
-				img.src = empty; 
-				img.onload = img.onerror = null;
+			var imgs = item.getElementsByTagName ? item.getElementsByTagName('img') : [];
+			for (var im = 0; im < imgs.length; im++) {
+				classicReleaseCoverImage(imgs[im]);
 			}
 			list.removeChild(item);
 		}
@@ -2140,10 +2181,17 @@
 		var s_timer = g_scrollTimer;
 		if (r_timer) clearTimeout(r_timer);
 		if (s_timer) clearTimeout(s_timer);
+		if (g_checkTimeout) { clearTimeout(g_checkTimeout); g_checkTimeout = null; }
+		if (g_scrollStopTimer) { clearTimeout(g_scrollStopTimer); g_scrollStopTimer = null; }
+		if (g_preloadTimer) { clearTimeout(g_preloadTimer); g_preloadTimer = null; }
+		if (g_gcTimer) { clearTimeout(g_gcTimer); g_gcTimer = null; }
+		g_renderTimer = null;
+		g_scrollTimer = null;
 
 		if (typeof g_activeXHR !== 'undefined' && g_activeXHR !== null) {
 			try {
 				g_activeXHR.onreadystatechange = null;
+				g_activeXHR.onerror = null;
 				g_activeXHR.abort(); 
 			} catch(e) {}
 			g_activeXHR = null;
@@ -2407,12 +2455,19 @@
 
 		var nextCat = nextImg.getAttribute('data-category') || currentCategory;
 		if (!isLocalContentCoverCategory(nextCat) && (!g_noCoverIndexLoaded || !g_coverIndexLoaded)) {
-			setTimeout(function() { processMasterQueue(batchID); }, 200);
+			setTimeout(function() {
+				if (batchID === g_renderID) processMasterQueue(batchID);
+			}, 200);
 			return;
 		}
 
 		var img = q.shift(); 
 		if (!img) {
+			processMasterQueue(batchID);
+			return;
+		}
+
+		if (!classicIsLiveCoverElement(img, batchID)) {
 			processMasterQueue(batchID);
 			return;
 		}
@@ -2430,38 +2485,52 @@
 		var def = defaultCover;
 		var is_ps3 = isPS3;
 
+		img.setAttribute('data-render-id', String(batchID));
+		img.removeAttribute('data-classic-released');
 		img.setAttribute('data-loading', 'true');
 		img.removeAttribute('data-failed');
 		img.removeAttribute('data-bing-tried');
-		
+
 		if (img.src.indexOf('data:image') !== -1) img.src = def;
+
+		function continueQueue() {
+			if (batchID === g_renderID) processMasterQueue(batchID);
+		}
+
+		function markCoverDone(doneImg) {
+			if (!classicIsLiveCoverElement(doneImg, batchID)) return false;
+			doneImg.setAttribute('data-loaded', 'true');
+			doneImg.removeAttribute('data-loading');
+			if (typeof g_activeCovers !== 'undefined') g_activeCovers.push(doneImg);
+			if (typeof updateRAMMonitor === 'function') updateRAMMonitor();
+			return true;
+		}
 
 		if (isLocalContentCoverCategory(cat_h)) {
 			img.onload = function() {
 				this.onload = this.onerror = null;
-				this.setAttribute('data-loaded', 'true');
-				this.removeAttribute('data-loading');
-				if (typeof g_activeCovers !== 'undefined') g_activeCovers.push(this);
-				if (typeof updateRAMMonitor === 'function') updateRAMMonitor();
-				processMasterQueue(batchID);
+				if (markCoverDone(this)) continueQueue();
 			};
 			img.onerror = function() {
 				this.onload = this.onerror = null;
+				if (!classicIsLiveCoverElement(this, batchID)) return;
 				this.src = def;
 				this.setAttribute('data-failed', 'true');
 				this.removeAttribute('data-loading');
-				processMasterQueue(batchID);
+				continueQueue();
 			};
 			img.src = getLocalContentCover(cat_h, tid, content_id_h);
 			return;
 		}
-		
+
 		if (g_noCoverIndexLoaded && g_noCoverMap[tid]) {
 			finishCoverFallback(img, function(doneImg) {
-				if (typeof g_activeCovers !== 'undefined') g_activeCovers.push(doneImg);
-				if (typeof updateRAMMonitor === 'function') updateRAMMonitor();
-				setTimeout(function() { processMasterQueue(batchID); }, 0);
-			});
+				if (markCoverDone(doneImg)) {
+					setTimeout(function() {
+						if (batchID === g_renderID) processMasterQueue(batchID);
+					}, 0);
+				}
+			}, batchID);
 			return;
 		}
 
@@ -2469,7 +2538,7 @@
 		var urlJPG = "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/database/covers/" + (is_ps3 ? "uncompressed/" : "uncompressed/") + tid + ".JPG";
 		//var urlJPG = "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/database/covers/" + (is_ps3 ? "compressed/" : "uncompressed/") + tid + ".JPG";
 		var urlPNG = "https://raw.githubusercontent.com/PS3-Pro/Recently-Played-Games/master/np/" + hash + "/ICON0.PNG";
-	
+
 		var targetUrl = urlJPG;
 		var isHashMode = false;
 
@@ -2480,58 +2549,41 @@
 
 		if (is_ps3 && isHashMode) {
 			preloadPS3CoverBeforeSwap(img, targetUrl, function(doneImg) {
-				doneImg.setAttribute('data-loaded', 'true');
-				doneImg.removeAttribute('data-loading');
-				if (typeof g_activeCovers !== 'undefined') g_activeCovers.push(doneImg);
-				if (typeof updateRAMMonitor === 'function') updateRAMMonitor();
-				processMasterQueue(batchID);
+				if (markCoverDone(doneImg)) continueQueue();
 			}, function(failedImg) {
+				if (!classicIsLiveCoverElement(failedImg, batchID)) return;
 				finishCoverFallback(failedImg, function(doneImg) {
-					if (typeof g_activeCovers !== 'undefined') g_activeCovers.push(doneImg);
-					if (typeof updateRAMMonitor === 'function') updateRAMMonitor();
-					processMasterQueue(batchID);
-				});
-			});
+					if (markCoverDone(doneImg)) continueQueue();
+				}, batchID);
+			}, batchID);
 			return;
 		}
-	
+
 		img.onload = function() {
 			this.onload = this.onerror = null;
-			this.setAttribute('data-loaded', 'true');
-			this.removeAttribute('data-loading');
-
-			if (typeof g_activeCovers !== 'undefined') g_activeCovers.push(this);
-			if (typeof updateRAMMonitor === 'function') updateRAMMonitor();
-			
-			processMasterQueue(batchID);
+			if (markCoverDone(this)) continueQueue();
 		};
-	
+
 		img.onerror = function() {
 			this.onload = this.onerror = null;
-			
+			if (!classicIsLiveCoverElement(this, batchID)) return;
+
 			if (!isHashMode && this.src.indexOf('.JPG') !== -1) {
 				isHashMode = true;
 				var failedVisibleImg = this;
 				failedVisibleImg.src = defaultCover;
 				preloadPS3CoverBeforeSwap(failedVisibleImg, urlPNG, function(doneImg) {
-					doneImg.setAttribute('data-loaded', 'true');
-					doneImg.removeAttribute('data-loading');
-					if (typeof g_activeCovers !== 'undefined') g_activeCovers.push(doneImg);
-					if (typeof updateRAMMonitor === 'function') updateRAMMonitor();
-					processMasterQueue(batchID);
+					if (markCoverDone(doneImg)) continueQueue();
 				}, function(failedImg) {
+					if (!classicIsLiveCoverElement(failedImg, batchID)) return;
 					finishCoverFallback(failedImg, function(doneImg) {
-						if (typeof g_activeCovers !== 'undefined') g_activeCovers.push(doneImg);
-						if (typeof updateRAMMonitor === 'function') updateRAMMonitor();
-						processMasterQueue(batchID);
-					});
-				});
+						if (markCoverDone(doneImg)) continueQueue();
+					}, batchID);
+				}, batchID);
 			} else {
 				finishCoverFallback(this, function(doneImg) {
-					if (typeof g_activeCovers !== 'undefined') g_activeCovers.push(doneImg);
-					if (typeof updateRAMMonitor === 'function') updateRAMMonitor();
-					processMasterQueue(batchID);
-				});
+					if (markCoverDone(doneImg)) continueQueue();
+				}, batchID);
 			}
 		};
 
@@ -3889,7 +3941,10 @@ function restorePreviousState() {
 
 		g_currentChunkIndex = endLimit_h;
 		if (g_currentChunkIndex < totalMatches_h && g_currentChunkIndex < currentLimit_h) {
-			g_renderTimer = setTimeout(renderChunk, is_ps3_h ? 10 : 0);
+			var chunkRenderID_h = g_renderID;
+			g_renderTimer = setTimeout(function() {
+				if (chunkRenderID_h === g_renderID) renderChunk();
+			}, is_ps3_h ? 10 : 0);
 		} else {
 			g_renderTimer = null;
 			g_instantRender = false;
@@ -4133,8 +4188,10 @@ function restorePreviousState() {
 		}
 
 		var renderDelay = is_ps3_h ? 30 : 0;
+		var renderToken = g_renderID;
 
 		setTimeout(function() {
+			if (renderToken !== g_renderID) return;
 			var cat_h = currentCategory;
 			var letter_f_h = g_letterFilter;
 			var reg_f_h = g_regionFilter;
@@ -4872,7 +4929,12 @@ function restorePreviousState() {
 			if (countEl) {
 				countEl.textContent = "Filtering | " + current_reg;
 			}
-			setTimeout(render, 300);
+			if (g_renderTimer) clearTimeout(g_renderTimer);
+			var filterRenderID = g_renderID;
+			g_renderTimer = setTimeout(function() {
+				g_renderTimer = null;
+				if (filterRenderID === g_renderID) render();
+			}, is_ps3_h ? 180 : 300);
 		}
 
 		function onSearchInput(input) {
@@ -6615,24 +6677,71 @@ function restorePreviousState() {
 
 	function classicClearTrailerPlayers() {
 		classicStopYoutubeQualityWatch();
+
+		try {
+			if (classicYoutubeIframePlayer && classicYoutubeIframePlayer.destroy) {
+				classicYoutubeIframePlayer.destroy();
+			}
+		} catch(e0) {}
+		classicYoutubeIframePlayer = null;
+
 		var iframeEl = document.getElementById('trailer-iframe');
 		var flashEl = document.getElementById('trailer-flash-player');
-		if (iframeEl) iframeEl.src = '';
-		if (flashEl) flashEl.innerHTML = '';
+
+		if (iframeEl) {
+			try { iframeEl.src = 'about:blank'; } catch(e1) {}
+			try { iframeEl.removeAttribute('src'); } catch(e2) {}
+			if (isPS3) {
+				try { iframeEl.parentNode.removeChild(iframeEl); } catch(e3) {}
+			}
+		}
+
+		if (flashEl) {
+			try {
+				var objs = flashEl.getElementsByTagName('object');
+				for (var oi = 0; oi < objs.length; oi++) {
+					try { objs[oi].data = ''; } catch(e4) {}
+				}
+				var embeds = flashEl.getElementsByTagName('embed');
+				for (var ei = 0; ei < embeds.length; ei++) {
+					try { embeds[ei].src = ''; } catch(e5) {}
+				}
+			} catch(e6) {}
+			try { flashEl.innerHTML = ''; } catch(e7) {}
+			try { flashEl.style.display = 'none'; } catch(e8) {}
+
+			if (isPS3) {
+				try {
+					var clone = flashEl.cloneNode(false);
+					clone.innerHTML = '';
+					clone.style.display = 'none';
+					flashEl.parentNode.replaceChild(clone, flashEl);
+				} catch(e9) {}
+			}
+		}
+
 		var infoEl = document.getElementById('trailer-info');
 		if (infoEl) {
 			infoEl.setAttribute('data-quality', '');
 			infoEl.innerHTML = '&nbsp;';
 		}
 		classicUpdateTrailerNav();
+
+		if (isPS3) {
+			try { setTimeout(function(){ window.scrollTo(0, 0); }, 50); } catch(e10) {}
+		}
 	}
 
 	function classicOpenTrailerModal() {
+		classicTrailerModalOpen = true;
+		classicTrailerSessionID++;
+		classicAbortTrailerXHRs();
+
+		classicClearTrailerPlayers();
+
 		var modalEl = document.getElementById('trailer-modal');
 		var iframeEl = document.getElementById('trailer-iframe');
 		var flashEl = document.getElementById('trailer-flash-player');
-
-		classicClearTrailerPlayers();
 
 		if (iframeEl) iframeEl.style.display = isPS3 ? 'none' : 'block';
 		if (flashEl) flashEl.style.display = isPS3 ? 'block' : 'none';
@@ -6664,6 +6773,44 @@ function restorePreviousState() {
 	var classicTrailerLastQuery = '';
 	var CLASSIC_TRAILER_PAGE_SIZE = 10;
 
+	var classicTrailerSessionID = 0;
+	var classicTrailerModalOpen = false;
+	var classicTrailerSearchXHR = null;
+	var classicTrailerQualityXHR = null;
+
+	function classicIsTrailerSessionActive(sessionID) {
+		return classicTrailerModalOpen && sessionID === classicTrailerSessionID;
+	}
+
+	function classicAbortTrailerXHRs() {
+		if (classicTrailerSearchXHR) {
+			try {
+				classicTrailerSearchXHR.onreadystatechange = null;
+				classicTrailerSearchXHR.onerror = null;
+				classicTrailerSearchXHR.abort();
+			} catch(e1) {}
+			classicTrailerSearchXHR = null;
+		}
+		if (classicTrailerQualityXHR) {
+			try {
+				classicTrailerQualityXHR.onreadystatechange = null;
+				classicTrailerQualityXHR.onerror = null;
+				classicTrailerQualityXHR.abort();
+			} catch(e2) {}
+			classicTrailerQualityXHR = null;
+		}
+	}
+
+	function classicResetTrailerState() {
+		classicTrailerResults = [];
+		classicTrailerIndex = 0;
+		classicTrailerGameName = '';
+		classicTrailerNextPageToken = '';
+		classicTrailerLoadingMore = false;
+		classicTrailerNoMoreResults = false;
+		classicTrailerLastQuery = '';
+	}
+
 	function classicGetTrailerVideoTitle(item) {
 		try {
 			if (item && item.snippet && item.snippet.title) return item.snippet.title;
@@ -6689,14 +6836,21 @@ function restorePreviousState() {
 		};
 	}
 
-	function classicFetchYoutubeVideoPage(gameName, pageToken, callback) {
+	function classicFetchYoutubeVideoPage(gameName, pageToken, callback, sessionID) {
 		var keys = YOUTUBE_KEYS;
 		var startIndex = classicGetStoredYoutubeKeyIndex();
 		if (startIndex < 0 || startIndex >= keys.length) startIndex = 0;
 
+		function done(result) {
+			if (sessionID && !classicIsTrailerSessionActive(sessionID)) return;
+			if (callback) callback(result);
+		}
+
 		function tryKey(index) {
+			if (sessionID && !classicIsTrailerSessionActive(sessionID)) return;
+
 			if (index >= keys.length) {
-				callback({
+				done({
 					videos: [],
 					nextPageToken: '',
 					error: 'No YouTube API key available'
@@ -6711,10 +6865,24 @@ function restorePreviousState() {
 				apiUrl += '&pageToken=' + encodeURIComponent(pageToken);
 			}
 
+			try {
+				if (classicTrailerSearchXHR) {
+					classicTrailerSearchXHR.onreadystatechange = null;
+					classicTrailerSearchXHR.onerror = null;
+					classicTrailerSearchXHR.abort();
+				}
+			} catch(e0) {}
+
 			var xhr = new XMLHttpRequest();
+			classicTrailerSearchXHR = xhr;
 
 			xhr.onreadystatechange = function() {
 				if (xhr.readyState !== 4) return;
+				if (classicTrailerSearchXHR === xhr) classicTrailerSearchXHR = null;
+				xhr.onreadystatechange = null;
+				xhr.onerror = null;
+
+				if (sessionID && !classicIsTrailerSessionActive(sessionID)) return;
 
 				if (xhr.status === 403) {
 					classicSetStoredYoutubeKeyIndex(index + 1);
@@ -6742,14 +6910,14 @@ function restorePreviousState() {
 							}
 						}
 
-						callback({
+						done({
 							videos: videos,
 							nextPageToken: data.nextPageToken || '',
 							error: ''
 						});
 						return;
 					} catch(e) {
-						callback({
+						done({
 							videos: [],
 							nextPageToken: '',
 							error: 'Invalid YouTube response'
@@ -6758,7 +6926,7 @@ function restorePreviousState() {
 					}
 				}
 
-				callback({
+				done({
 					videos: [],
 					nextPageToken: '',
 					error: 'YouTube search failed'
@@ -6766,7 +6934,10 @@ function restorePreviousState() {
 			};
 
 			xhr.onerror = function() {
-				callback({
+				if (classicTrailerSearchXHR === xhr) classicTrailerSearchXHR = null;
+				xhr.onreadystatechange = null;
+				xhr.onerror = null;
+				done({
 					videos: [],
 					nextPageToken: '',
 					error: 'YouTube search error'
@@ -6777,7 +6948,8 @@ function restorePreviousState() {
 				xhr.open('GET', apiUrl, true);
 				xhr.send(null);
 			} catch(e) {
-				callback({
+				if (classicTrailerSearchXHR === xhr) classicTrailerSearchXHR = null;
+				done({
 					videos: [],
 					nextPageToken: '',
 					error: 'YouTube search blocked'
@@ -6812,8 +6984,10 @@ function restorePreviousState() {
 
 		classicTrailerLoadingMore = true;
 		classicRenderTrailerTitle('Loading more...');
+		var trailerSessionID = classicTrailerSessionID;
 
 		classicFetchYoutubeVideoPage(classicTrailerLastQuery, classicTrailerNextPageToken, function(result) {
+			if (!classicIsTrailerSessionActive(trailerSessionID)) return;
 			classicTrailerLoadingMore = false;
 
 			if (!result || result.error) {
@@ -6832,7 +7006,7 @@ function restorePreviousState() {
 
 			classicRenderTrailerTitle();
 			if (callback) callback((result.videos || []).length > 0);
-		});
+		}, trailerSessionID);
 	}
 
 	// Compatibilidade com chamadas antigas que esperam só 1 ID.
@@ -6899,6 +7073,8 @@ function restorePreviousState() {
 		classicUpdateTrailerNav();
 	}
 	function classicPlayTrailerAt(index) {
+		if (!classicTrailerModalOpen) return;
+		var trailerSessionID = classicTrailerSessionID;
 		if (!classicTrailerResults || !classicTrailerResults.length) {
 			classicSetTrailerTitle('No video found');
 			return;
@@ -6913,14 +7089,14 @@ function restorePreviousState() {
 		var item = classicTrailerResults[classicTrailerIndex];
 		if (!item || !item.videoId) return;
 
-		classicUpdateTrailerQuality(item.videoId);
+		classicUpdateTrailerQuality(item.videoId, trailerSessionID);
 
 		if (typeof isPS3 !== 'undefined' && isPS3) {
-			classicMountPs3TrailerPlayer(item.videoId);
+			classicMountPs3TrailerPlayer(item.videoId, trailerSessionID);
 			return;
 		}
 
-		classicStartPcTrailerPlayer(item.videoId);
+		classicStartPcTrailerPlayer(item.videoId, trailerSessionID);
 	}
 
 	window.classicNextTrailer = function() {
@@ -7099,12 +7275,16 @@ function restorePreviousState() {
 		return false;
 	}
 
-	function classicStartYoutubeQualityWatch(player) {
+	function classicStartYoutubeQualityWatch(player, sessionID) {
 		classicStopYoutubeQualityWatch();
 
-		classicApplyYoutubePlaybackQuality(player);
+		if (!sessionID || classicIsTrailerSessionActive(sessionID)) classicApplyYoutubePlaybackQuality(player);
 
 		classicYoutubeQualityTimer = setInterval(function() {
+			if (sessionID && !classicIsTrailerSessionActive(sessionID)) {
+				classicStopYoutubeQualityWatch();
+				return;
+			}
 			if (!classicApplyYoutubePlaybackQuality(player)) {
 				var infoEl = document.getElementById('trailer-info');
 				if (infoEl && !infoEl.getAttribute('data-quality')) {
@@ -7114,7 +7294,7 @@ function restorePreviousState() {
 		}, 700);
 	}
 
-	function classicStartPcTrailerPlayer(videoId) {
+	function classicStartPcTrailerPlayer(videoId, sessionID) {
 		var iframeEl = document.getElementById('trailer-iframe');
 		if (!iframeEl) return;
 
@@ -7129,38 +7309,41 @@ function restorePreviousState() {
 		iframeEl.src = 'https://www.youtube.com/embed/' + videoId + '?autoplay=1&enablejsapi=1' + origin;
 
 		classicLoadYoutubeIframeApi(function() {
+			if (sessionID && !classicIsTrailerSessionActive(sessionID)) return;
 			try {
 				classicYoutubeIframePlayer = new YT.Player('trailer-iframe', {
 					events: {
 						'onReady': function(ev) {
-							classicStartYoutubeQualityWatch(ev.target);
+							if (!sessionID || classicIsTrailerSessionActive(sessionID)) classicStartYoutubeQualityWatch(ev.target, sessionID);
 						},
 						'onStateChange': function(ev) {
-							classicApplyYoutubePlaybackQuality(ev.target);
+							if (!sessionID || classicIsTrailerSessionActive(sessionID)) classicApplyYoutubePlaybackQuality(ev.target);
 						},
 						'onPlaybackQualityChange': function(ev) {
+							if (sessionID && !classicIsTrailerSessionActive(sessionID)) return;
 							var mapped = classicMapYoutubePlaybackQuality(ev.data);
 							if (mapped) classicSetTrailerQualityHtml(modalSafeText(mapped));
 						}
 					}
 				});
 			} catch(e) {
-				classicSetTrailerQuality('N/A', true);
+				if (!sessionID || classicIsTrailerSessionActive(sessionID)) classicSetTrailerQuality('N/A', true);
 			}
 		});
 		classicRefocusTrailerModal();
 
 	}
 
-	function classicUpdateTrailerQuality(videoId) {
+	function classicUpdateTrailerQuality(videoId, sessionID) {
 		if (!videoId) {
 			classicSetTrailerQuality('');
 			return;
 		}
 
 		if (typeof isPS3 !== 'undefined' && isPS3) {
+			if (sessionID && !classicIsTrailerSessionActive(sessionID)) return;
 			classicSetTrailerQuality('Checking...', true);
-			classicFetchTrailerQuality(videoId, 'ps3');
+			classicFetchTrailerQuality(videoId, 'ps3', sessionID);
 			return;
 		}
 
@@ -7168,13 +7351,26 @@ function restorePreviousState() {
 		classicSetTrailerQuality('Checking...', true);
 	}
 
-	function classicFetchTrailerQuality(videoId, mode) {
+	function classicFetchTrailerQuality(videoId, mode, sessionID) {
+		if (sessionID && !classicIsTrailerSessionActive(sessionID)) return;
+		try {
+			if (classicTrailerQualityXHR) {
+				classicTrailerQualityXHR.onreadystatechange = null;
+				classicTrailerQualityXHR.onerror = null;
+				classicTrailerQualityXHR.abort();
+			}
+		} catch(e0) {}
 		var xhr = new XMLHttpRequest();
+		classicTrailerQualityXHR = xhr;
 		var q = (mode === 'ps3') ? 'auto-ps3' : 'best';
 		var url = YOUTUBE_PS3_WORKER + '/debug?v=' + encodeURIComponent(videoId) + '&mode=' + encodeURIComponent(mode || 'ps3') + '&quality=' + encodeURIComponent(q) + '&_=' + new Date().getTime();
 
 		xhr.onreadystatechange = function() {
 			if (xhr.readyState !== 4) return;
+			if (classicTrailerQualityXHR === xhr) classicTrailerQualityXHR = null;
+			xhr.onreadystatechange = null;
+			xhr.onerror = null;
+			if (sessionID && !classicIsTrailerSessionActive(sessionID)) return;
 
 			if (xhr.status === 200 || xhr.status === 0) {
 				try {
@@ -7194,22 +7390,28 @@ function restorePreviousState() {
 		};
 
 		xhr.onerror = function() {
-			classicSetTrailerQuality('N/A', true);
+			if (classicTrailerQualityXHR === xhr) classicTrailerQualityXHR = null;
+			xhr.onreadystatechange = null;
+			xhr.onerror = null;
+			if (!sessionID || classicIsTrailerSessionActive(sessionID)) classicSetTrailerQuality('N/A', true);
 		};
 
 		try {
 			xhr.open('GET', url, true);
 			xhr.send(null);
 		} catch(e) {
-			classicSetTrailerQuality('N/A', true);
+			if (classicTrailerQualityXHR === xhr) classicTrailerQualityXHR = null;
+			if (!sessionID || classicIsTrailerSessionActive(sessionID)) classicSetTrailerQuality('N/A', true);
 		}
 	}
 
-	function classicMountPs3TrailerPlayer(videoId) {
+	function classicMountPs3TrailerPlayer(videoId, sessionID) {
+		if (sessionID && !classicIsTrailerSessionActive(sessionID)) return;
 		var flashEl = document.getElementById('trailer-flash-player');
 		if (!flashEl) return;
 
 		flashEl.innerHTML = '';
+		flashEl.style.display = 'block';
 
 		// Força mode=ps3 no Worker. Antes a loja usava /video/ID.mp4 puro.
 		// Com query, precisa codificar o fichier para o &mode=ps3 não quebrar os flashvars.
@@ -7227,7 +7429,7 @@ function restorePreviousState() {
 		var attributes_936 = {};
 
 		try {
-			flashObject(YOUTUBE_PS3_PLAYER_SWF, 'trailer-flash-player', '960', '540', '8', false, flashvars_936, params_936, attributes_936);
+			flashObject(YOUTUBE_PS3_PLAYER_SWF, 'trailer-flash-player', '640', '360', '8', false, flashvars_936, params_936, attributes_936);
 		} catch(e) {
 			flashEl.innerHTML = '<div style="padding-top:280px;color:#ff6666;font-size:18px;font-weight:bold;">Flash player error</div>';
 		}
@@ -7236,7 +7438,10 @@ function restorePreviousState() {
 	window.playTrailer = function(gameName) {
 		var safeName = gameName || 'Game';
 		classicOpenTrailerModal();
-		setTimeout(classicPauseMusicAfterTrailerOpen, 80);
+		var trailerSessionID = classicTrailerSessionID;
+		setTimeout(function() {
+			if (classicIsTrailerSessionActive(trailerSessionID)) classicPauseMusicAfterTrailerOpen();
+		}, 80);
 		classicSetTrailerTitle('Searching video...');
 		classicSetTrailerQuality('Preparing trailer...', true);
 
@@ -7249,6 +7454,7 @@ function restorePreviousState() {
 		classicTrailerNoMoreResults = false;
 
 		classicFetchYoutubeVideoPage(safeName, '', function(result) {
+			if (!classicIsTrailerSessionActive(trailerSessionID)) return;
 			if (!result || result.error || !result.videos || !result.videos.length) {
 				classicSetTrailerTitle('No video found');
 				return;
@@ -7260,7 +7466,7 @@ function restorePreviousState() {
 			classicTrailerNoMoreResults = !classicTrailerNextPageToken;
 			classicTrailerIndex = 0;
 			classicPlayTrailerAt(0);
-		});
+		}, trailerSessionID);
 	};
 	
 	window.closeTrailer = function(e) {
@@ -7276,6 +7482,11 @@ function restorePreviousState() {
 		}
 
 		if (shouldClose) {
+			classicTrailerModalOpen = false;
+			classicTrailerSessionID++;
+			classicAbortTrailerXHRs();
+			classicResetTrailerState();
+
 			var modalEl = document.getElementById('trailer-modal');
 			if (modalEl) modalEl.style.display = 'none';
 			classicClearTrailerPlayers();
@@ -7906,6 +8117,8 @@ function restorePreviousState() {
     if (isPS3) {
         if (typeof stopRendering === 'function') stopRendering();
         if (typeof cancelAllDownloads === 'function') cancelAllDownloads();
+        if (typeof classicAbortTrailerXHRs === 'function') classicAbortTrailerXHRs();
+        if (typeof classicClearTrailerPlayers === 'function') classicClearTrailerPlayers();
         
         if (g_masterQueue) g_masterQueue.length = 0;
         if (g_activeCovers) g_activeCovers.length = 0;
