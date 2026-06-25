@@ -398,6 +398,9 @@ select option { background-color: var(--bg-dark); }
 .wish-btn i { display: block; margin: 0; padding: 0; line-height: 1; font-size: 14px; transform: translate(0.5px, 0.5px); transition: transform 0.2s ease; }
 .wish-btn:hover { background: rgba(0, 0, 0, 0.9); border-color: rgba(255, 255, 255, 0.4); }
 .wish-btn:hover i { color: #ff4444 !important; animation: heartPop 0.3s forwards; transform-origin: center center; }
+#game-modal .modal-title-wish-btn { position: relative !important; bottom: auto !important; right: auto !important; flex: 0 0 28px; display: inline-grid !important; place-items: center !important; margin-left: 2px !important; vertical-align: middle; background: transparent !important; border-color: transparent !important; box-shadow: none !important; backdrop-filter: none !important; -webkit-backdrop-filter: none !important; transform-origin: center center !important; }
+#game-modal .modal-title-wish-btn:hover { background: transparent !important; border-color: transparent !important; box-shadow: none !important; }
+#game-modal .modal-title-wish-btn i { pointer-events: none; display: block; transform-origin: center center !important; }
 .wish-effect { animation: heartbeat 0.35s ease !important; z-index: 50; }
 .game-card.is-wishlisted { border: 1px solid transparent !important; background-origin: padding-box, border-box; background-clip: padding-box, border-box; background-image: linear-gradient(rgba(15, 20, 30, 1), rgba(15, 20, 30, 1)), linear-gradient(135deg, #ff0080 0%, #ff8cdf 50%, #ff00bd 100%) !important; box-shadow: 0 0 10px rgba(255, 0, 128, 0.3); position: relative; }
 .game-card.is-wishlisted::after { content: ""; position: absolute; inset: 0; pointer-events: none; background: linear-gradient(to top, rgba(255, 0, 128, 0.15) 0%, transparent 40%); z-index: 0; }
@@ -8286,7 +8289,10 @@ body.chat-auto-translate-enabled .msg-bubble.has-translate { padding-right:14px 
 			<div class="sys-modal-content" style="max-width: 820px;">
 				<div class="sys-modal-header">
 					<h2 style="display: flex !important; align-items: center !important; gap: 10px; margin: 0 !important;">
-						<i class="fas fa-gamepad"></i> Game Details
+						<i class="fas fa-gamepad"></i><span>Game Details</span>
+						<button type="button" id="modal-title-wish-btn" class="wish-btn modal-title-wish-btn" title="Add to Wishlist" onmouseenter="playUiHover()" onclick="toggleWishlist(event, '')">
+							<i class="far fa-heart" style="color: rgba(255,255,255,0.6); font-size: 14px;"></i>
+						</button>
 					</h2>
 					<button class="sys-modal-close" onmouseenter="playUiHover()" onclick="closeSysModal(null, 'game-modal')">
 						<i class="fas fa-times"></i>
@@ -15017,6 +15023,7 @@ P
 		const catSelect = document.getElementById('cat-select');
 		const currentCat = catSelect.value;
 		const modal = document.getElementById('game-modal');
+		if (modal) setGameModalNoScreenshots(modal, false);
 		const modalBody = modal.querySelector('.sys-modal-body');
 		const modalHeader = modal.querySelector('.sys-modal-header h2');
 		
@@ -15043,9 +15050,17 @@ P
 		else if (currentCat === 'legacy') { iconClass = 'fas fa-archive'; headerText = 'Legacy Details'; }
 		else if (currentCat === 'prototypes') { iconClass = 'fas fa-flask'; headerText = 'Prototype Details'; }
 		
+		const modalWishlistKey = game.contentId || game.id;
+		const modalIsWishlisted = wishlist.findIndex(item => (item.contentId || item.id) === modalWishlistKey) > -1;
+		const modalWishIcon = modalIsWishlisted ? 'fas fa-heart' : 'far fa-heart';
+		const modalWishColor = modalIsWishlisted ? '#ff4444' : 'rgba(255,255,255,0.6)';
+		const modalWishTitle = modalIsWishlisted ? 'Remove from Wishlist' : 'Add to Wishlist';
+		const modalSafeGameId = escapeGameTrophyJs(game.id || '');
+		const modalSafeContentId = escapeCategoryDotAttr(game.contentId || '');
+
 		if (modalHeader) {
 			modalHeader.style.cssText = "display: flex !important; align-items: center !important; gap: 10px; margin: 0 !important;";
-			modalHeader.innerHTML = `<i class="${iconClass}"></i> ${headerText}`;
+			modalHeader.innerHTML = `<i class="${iconClass}"></i><span>${headerText}</span><button type="button" id="modal-title-wish-btn" class="wish-btn modal-title-wish-btn" title="${modalWishTitle}" data-content-id="${modalSafeContentId}" data-store-category="${currentCat}" onmouseenter="playUiHover()" onclick="toggleWishlist(event, '${modalSafeGameId}')"><i class="${modalWishIcon}" style="color: ${modalWishColor}; font-size: 14px;"></i></button>`;
 		}
 		
 		const coverImg = getItemCover(game, currentCat);
@@ -15189,6 +15204,7 @@ P
 	
 			setTimeout(() => {
 				modal.style.display = 'none';
+				setGameModalNoScreenshots(modal, false);
 				document.getElementById('modal-summary').innerHTML = "";
 				
 				const scrWrapper = document.getElementById('modal-screenshots-wrapper');
@@ -15218,12 +15234,85 @@ P
 	];
 	
 	let currentRawgKeyIndex = parseInt(localStorage.getItem('rawg_key_index') || '0');
+
+	function clearModalSummaryAlignedHeight() {
+		const summary = document.getElementById('modal-summary');
+		if (!summary) return;
+		summary.style.removeProperty('height');
+		summary.style.removeProperty('min-height');
+		summary.style.removeProperty('max-height');
+		summary.style.removeProperty('flex');
+	}
+
+	function isGameModalDesktopLayout() {
+		return window.matchMedia ? window.matchMedia('(min-width: 769px)').matches : window.innerWidth > 768;
+	}
+
+	function alignModalSummaryToInfoCard() {
+		const modalRoot = document.getElementById('game-modal');
+		if (!modalRoot || !modalRoot.classList.contains('modal-no-screenshots')) return;
+		if (!isGameModalDesktopLayout()) { clearModalSummaryAlignedHeight(); return; }
+
+		const summary = document.getElementById('modal-summary');
+		const infoCard = modalRoot.querySelector('.modal-left-col .modal-info-card');
+		if (!summary || !infoCard) return;
+
+		const summaryRect = summary.getBoundingClientRect();
+		const infoRect = infoCard.getBoundingClientRect();
+		const targetHeight = Math.floor(infoRect.bottom - summaryRect.top);
+		if (!targetHeight || targetHeight < 150) return;
+
+		summary.style.setProperty('height', targetHeight + 'px', 'important');
+		summary.style.setProperty('min-height', targetHeight + 'px', 'important');
+		summary.style.setProperty('max-height', targetHeight + 'px', 'important');
+		summary.style.setProperty('flex', '0 0 ' + targetHeight + 'px', 'important');
+	}
+
+	let modalSummaryResizeAlignTimer = null;
+	function scheduleModalSummaryAlignment() {
+		const modalRoot = document.getElementById('game-modal');
+		if (!modalRoot || !modalRoot.classList.contains('modal-no-screenshots')) return;
+
+		clearTimeout(modalSummaryResizeAlignTimer);
+		clearModalSummaryAlignedHeight();
+
+		if (!isGameModalDesktopLayout()) return;
+
+		const runAlignment = () => {
+			const currentModal = document.getElementById('game-modal');
+			if (!currentModal || !currentModal.classList.contains('modal-no-screenshots')) return;
+			if (!isGameModalDesktopLayout()) { clearModalSummaryAlignedHeight(); return; }
+
+			clearModalSummaryAlignedHeight();
+			requestAnimationFrame(() => {
+				if (!isGameModalDesktopLayout()) { clearModalSummaryAlignedHeight(); return; }
+				requestAnimationFrame(alignModalSummaryToInfoCard);
+			});
+		};
+
+		runAlignment();
+		modalSummaryResizeAlignTimer = setTimeout(runAlignment, 140);
+	}
+
+	function setGameModalNoScreenshots(modalRoot, enabled) {
+		if (!modalRoot) return;
+		if (!enabled) {
+			modalRoot.classList.remove('modal-no-screenshots');
+			clearModalSummaryAlignedHeight();
+			return;
+		}
+
+		modalRoot.classList.add('modal-no-screenshots');
+		scheduleModalSummaryAlignment();
+	}
 	
 	window.fetchGameSummary = async function(gameName, gameId) {
 		const summaryContainer = document.getElementById('modal-summary');
 		const screenshotsWrapper = document.getElementById('modal-screenshots-wrapper');
 		const badgesContainer = document.getElementById('modal-badges');
 		const screenshotsDivider = document.getElementById('modal-screenshots-divider');
+		const modalRoot = document.getElementById('game-modal');
+		if (modalRoot) setGameModalNoScreenshots(modalRoot, false);
 
 		const extraMetaContainer = document.getElementById('modal-extra-meta');
 		const modalSafeText = (value) => String(value === undefined || value === null ? '' : value).replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;' }[char]));
@@ -15313,6 +15402,7 @@ P
 		`;
 	
 		if (screenshotsWrapper) {
+			if (modalRoot) setGameModalNoScreenshots(modalRoot, false);
 			screenshotsWrapper.style.display = 'flex';
 			if (screenshotsDivider) screenshotsDivider.style.display = 'block';
 			
@@ -15372,12 +15462,15 @@ P
 	
 						if (scrContainer) {
 							if (screensData.results?.length > 0) {
+								if (modalRoot) setGameModalNoScreenshots(modalRoot, false);
+								if (screenshotsWrapper) screenshotsWrapper.style.display = 'flex';
 								const gameImages = screensData.results.slice(0, 8).map(img => img.image);
 								scrContainer.innerHTML = gameImages.map((url, index) => 
 									`<img src="${url}" class="screenshot-item" onmouseenter="if(typeof playUiHover === 'function') playUiHover()" onclick="openImageModal(${index}, ${JSON.stringify(gameImages).replace(/"/g, '&quot;')})">`
 								).join('');
 							} else if (screenshotsWrapper) {
 								screenshotsWrapper.style.display = 'none';
+								if (modalRoot) setGameModalNoScreenshots(modalRoot, true);
 							}
 						}
 	
@@ -15400,6 +15493,7 @@ P
 						}
 						
 						summaryContainer.innerHTML = summaryTitleHtml + finalDesc;
+						if (modalRoot && modalRoot.classList.contains('modal-no-screenshots')) scheduleModalSummaryAlignment();
 						return;
 					} else {
 						break;
@@ -15432,23 +15526,34 @@ P
 					}
 					
 					if (page.thumbnail) {
+						if (modalRoot) setGameModalNoScreenshots(modalRoot, false);
+						if (screenshotsWrapper) screenshotsWrapper.style.display = 'flex';
 						if (scrContainer.querySelector('.pulse-skeleton') || !scrContainer.innerHTML.trim()) {
 							scrContainer.innerHTML = `<img src="${page.thumbnail.source}" class="screenshot-item" onclick="openImageModal(this.src)">`;
 						}
 					} else if (screenshotsWrapper) {
 						screenshotsWrapper.style.display = 'none';
+						if (modalRoot) setGameModalNoScreenshots(modalRoot, true);
 					}
+					if (modalRoot && modalRoot.classList.contains('modal-no-screenshots')) scheduleModalSummaryAlignment();
 					return;
 				}
 			}
 		} catch (e) {}
 
 		summaryContainer.innerHTML = summaryTitleHtml + "No description available.";
+		if (modalRoot && modalRoot.classList.contains('modal-no-screenshots')) scheduleModalSummaryAlignment();
 		if (badgesContainer) { badgesContainer.innerHTML = ''; badgesContainer.classList.remove('rawg-badge-row'); }
 		if (extraMetaContainer) extraMetaContainer.innerHTML = '';
-		if (screenshotsWrapper) screenshotsWrapper.style.display = 'none';
+		if (screenshotsWrapper) {
+			screenshotsWrapper.style.display = 'none';
+			if (modalRoot) setGameModalNoScreenshots(modalRoot, true);
+		}
 	};
 	
+	window.addEventListener('resize', scheduleModalSummaryAlignment);
+	window.addEventListener('orientationchange', scheduleModalSummaryAlignment);
+
 	window.moveModalScroll = function(direction) {
 		const container = document.getElementById('modal-screenshots');
 		if (container) {
@@ -20658,32 +20763,89 @@ P
 
 	window.toggleWishlist = function(event, gameId) {
 		if (event) event.stopPropagation();
-		
-		const card = event.currentTarget.closest('.game-card');
-		const currentCat = document.getElementById('cat-select')?.value || 'games';
-		const clickedContentId = card?.getAttribute('data-content-id') || '';
-		const gameData = currentData.find(g => g.id === gameId && (!clickedContentId || g.contentId === clickedContentId)) || wishlist.find(g => g.id === gameId && (!clickedContentId || g.contentId === clickedContentId));
-		
-		if (!gameData) return;
-	
+
+		const btn = event ? event.currentTarget : null;
+		const modal = document.getElementById('game-modal');
+		const isModalTitleWishBtn = !!(btn && btn.classList && btn.classList.contains('modal-title-wish-btn'));
+		const modalWishAnimTarget = isModalTitleWishBtn ? btn.closest('.sys-modal-content') : null;
+		let card = btn ? btn.closest('.game-card') : null;
+		const currentCat = card?.getAttribute('data-store-category') || btn?.getAttribute('data-store-category') || (isModalTitleWishBtn ? modal?.dataset.storeCategory : '') || document.getElementById('cat-select')?.value || 'games';
+		const clickedContentId = card?.getAttribute('data-content-id') || btn?.getAttribute('data-content-id') || (isModalTitleWishBtn ? modal?.dataset.contentId : '') || '';
+		const targetGameId = gameId || modal?.dataset.titleId || '';
+		const gameData = currentData.find(g => g.id === targetGameId && (!clickedContentId || g.contentId === clickedContentId)) || wishlist.find(g => g.id === targetGameId && (!clickedContentId || g.contentId === clickedContentId));
+
+		if (!gameData || !btn) return;
+
 		const itemKey = gameData.contentId || gameData.id;
 		const index = wishlist.findIndex(item => (item.contentId || item.id) === itemKey);
-		const btn = event.currentTarget; 
+		if (!card) {
+			card = Array.from(document.querySelectorAll('.game-card')).find(el => {
+				const cardContentId = el.getAttribute('data-content-id') || '';
+				const cardTitleId = el.getAttribute('data-title-id') || '';
+				return (cardContentId && cardContentId === itemKey) || cardTitleId === gameData.id;
+			}) || null;
+		}
+
 		const icon = btn.querySelector('i');
-		const isWishlistView = document.getElementById('view-wishlist').style.display === 'block';
-	
+		const cardWishBtn = card ? card.querySelector('.wish-btn') : null;
+		const cardWishIcon = cardWishBtn ? cardWishBtn.querySelector('i') : null;
+		const wishlistView = document.getElementById('view-wishlist');
+		const isWishlistView = wishlistView && wishlistView.style.display === 'block';
+
+		const animateModalWishlist = (remove) => {
+			if (!modalWishAnimTarget) return;
+			modalWishAnimTarget.classList.remove('wish-effect', 'wish-remove-effect');
+			void modalWishAnimTarget.offsetWidth;
+			modalWishAnimTarget.classList.add('wish-effect');
+			if (remove) modalWishAnimTarget.classList.add('wish-remove-effect');
+			setTimeout(() => {
+				modalWishAnimTarget.classList.remove('wish-effect', 'wish-remove-effect');
+			}, remove ? 420 : 350);
+		};
+
+		const setWishButtonState = (active) => {
+			if (icon) {
+				icon.className = active ? 'fas fa-heart' : 'far fa-heart';
+				icon.style.color = active ? '#ff4444' : 'rgba(255,255,255,0.6)';
+			}
+			btn.title = active ? "Remove from Wishlist" : "Add to Wishlist";
+
+			if (cardWishIcon && cardWishIcon !== icon) {
+				cardWishIcon.className = active ? 'fas fa-heart' : 'far fa-heart';
+				cardWishIcon.style.color = active ? '#ff4444' : 'rgba(255,255,255,0.6)';
+			}
+			if (cardWishBtn && cardWishBtn !== btn) {
+				cardWishBtn.title = active ? "Remove from Wishlist" : "Add to Wishlist";
+			}
+		};
+
 		if (index > -1) {
 			playUiRemove();
 			wishlist.splice(index, 1);
-			
+
 			if (card) card.classList.remove('is-wishlisted');
-	
+			if (isModalTitleWishBtn) {
+				animateModalWishlist(true);
+				setWishButtonState(false);
+			}
+
 			if (isWishlistView) {
-				if (wishlist.length === 0) {
+				if (isModalTitleWishBtn) {
+					if (typeof window.updateWishlistTypeFilterAvailability === 'function') {
+						window.updateWishlistTypeFilterAvailability();
+					}
+					updateWishlistUI(true);
+					if (wishlist.length === 0) {
+						if (typeof window.clearCategoryDotPending === 'function') window.clearCategoryDotPending('wishlist');
+						const dot = document.getElementById('wish-dot');
+						if (dot) dot.style.display = 'none';
+					}
+				} else if (wishlist.length === 0) {
 					thanosSnapEffect(card, () => {
 						updateWishlistUI();
 						if (typeof window.clearCategoryDotPending === 'function') window.clearCategoryDotPending('wishlist');
-						document.getElementById('wish-dot').style.display = 'none';
+						const dot = document.getElementById('wish-dot');
+						if (dot) dot.style.display = 'none';
 					});
 				} else {
 					window.animateCategoryRemoveCard(card, () => {
@@ -20696,49 +20858,47 @@ P
 			} else {
 				if (card) {
 					card.classList.remove('wish-effect', 'wish-remove-effect');
-					void card.offsetWidth;
-					card.classList.add('wish-effect', 'wish-remove-effect');
-					setTimeout(() => {
-						card.classList.remove('wish-effect', 'wish-remove-effect');
-						card.classList.remove('is-wishlisted');
-					}, 420);
+					if (!isModalTitleWishBtn) {
+						void card.offsetWidth;
+						card.classList.add('wish-effect', 'wish-remove-effect');
+						setTimeout(() => {
+							card.classList.remove('wish-effect', 'wish-remove-effect');
+							card.classList.remove('is-wishlisted');
+						}, 420);
+					}
 				}
-				setTimeout(() => {
-					icon.className = 'far fa-heart';
-					icon.style.color = 'rgba(255,255,255,0.6)';
-				}, 420);
-				btn.title = "Add to Wishlist"; 
+				setTimeout(() => setWishButtonState(false), isModalTitleWishBtn ? 0 : 420);
 				if (typeof window.removeCategoryDotPending === 'function') window.removeCategoryDotPending('wishlist', itemKey);
 				updateWishlistUI(true);
 			}
 		} else {
 			playUiSuccess();
-			
+
 			if (card) {
-				card.classList.add('wish-effect');
-				setTimeout(() => card.classList.remove('wish-effect'), 350);
 				card.classList.add('is-wishlisted');
+				if (!isModalTitleWishBtn) {
+					card.classList.add('wish-effect');
+					setTimeout(() => card.classList.remove('wish-effect'), 350);
+				}
 			}
-	
+			if (isModalTitleWishBtn) animateModalWishlist(false);
+
 			const itemToAdd = { 
 				...gameData,
 				category: (typeof window.getProfileListItemCategory === 'function' ? window.getProfileListItemCategory({ ...gameData, category: gameData.category || currentCat }, 'wishlist') : (gameData.category || currentCat)),
 				rawCategory: gameData.category || currentCat
 			};
-	
+
 			if (!itemToAdd.date) {
 				const now = new Date();
 				const datePart = now.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
 				const timePart = now.getHours().toString().padStart(2, '0') + ':' + now.getMinutes().toString().padStart(2, '0');
 				itemToAdd.date = `${datePart} - ${timePart}`;
 			}
-	
+
 			wishlist.push(itemToAdd); 
-			icon.className = 'fas fa-heart';
-			icon.style.color = '#ff4444';
-			
-			btn.title = "Remove from Wishlist"; 
-			
+			setWishButtonState(true);
+
 			if (!isWishlistView) {
 				if (typeof window.addCategoryDotPending === 'function') {
 					window.addCategoryDotPending('wishlist', itemKey);
@@ -20750,7 +20910,7 @@ P
 			}
 			updateWishlistUI();
 		}
-		
+
 		saveState(STORAGE_KEY_WISHLIST, JSON.stringify(wishlist));
 		markProfileListChanged('wishlist');
 		checkTrophyProgress('wishlist_1', wishlist.length);
@@ -20758,7 +20918,7 @@ P
 		checkTrophyProgress('wishlist_50', wishlist.length);
 		window.broadcastProfileUpdate();
 	};
-    
+
 
 	window.getWishlistItemCategoryKey = function(item = {}) {
 		const category = (typeof window.getSafeWishlistCategoryForItem === 'function')
