@@ -9828,6 +9828,7 @@ P
 	const STORAGE_KEY_CHAT_SOUND = "psn_chat_sound_state";
 	const STORAGE_KEY_CHAT_AUTO_TRANSLATE = "psn_chat_auto_translate";
 	const STORAGE_KEY_PROFILE_CARD_STYLE = "psn_profile_card_effect";
+		const STORAGE_KEY_PROFILE_CARD_STYLE_UPDATED_AT = "psn_profile_card_effect_updated_at";
 	const STORAGE_KEY_DOWNLOAD_CLEAR_PENDING = "psn_dl_history_cleared_at";
 	const STORAGE_KEY_COMPANION_PLUGIN = "psn_companion_plugin_enabled";
 	const STORAGE_KEY_FPS_COUNTER = "psn_fps_counter_enabled";
@@ -10058,6 +10059,28 @@ P
 		return Number.isFinite(timestamp) && timestamp > 0 ? timestamp : 0;
 	}
 
+	function getProfileCardStyleUpdatedAtForUser(username) {
+		const activeUser = localStorage.getItem('psn_username') || '';
+		const safeUser = username || activeUser || '';
+		const scoped = safeUser ? normalizeProfileListTimestamp(localStorage.getItem(`${safeUser}_${STORAGE_KEY_PROFILE_CARD_STYLE_UPDATED_AT}`)) : 0;
+		const active = (!safeUser || safeUser === activeUser) ? normalizeProfileListTimestamp(localStorage.getItem(STORAGE_KEY_PROFILE_CARD_STYLE_UPDATED_AT)) : 0;
+		return Math.max(scoped, active) || 0;
+	}
+
+	function setProfileCardStyleUpdatedAtForUser(username, value) {
+		const timestamp = normalizeProfileListTimestamp(value);
+		if (!timestamp) return 0;
+		const activeUser = localStorage.getItem('psn_username') || '';
+		const safeUser = username || activeUser || '';
+		if (safeUser && safeUser !== "null") localStorage.setItem(`${safeUser}_${STORAGE_KEY_PROFILE_CARD_STYLE_UPDATED_AT}`, String(timestamp));
+		if (!safeUser || safeUser === activeUser) localStorage.setItem(STORAGE_KEY_PROFILE_CARD_STYLE_UPDATED_AT, String(timestamp));
+		return timestamp;
+	}
+
+	function markProfileCardStyleChanged(stamp = Date.now()) {
+		return setProfileCardStyleUpdatedAtForUser(localStorage.getItem('psn_username') || '', stamp) || Date.now();
+	}
+
 	function getProfileListUpdatedAtForAuth(username, type) {
 		const key = getProfileListTimestampStorageKey(type);
 		return normalizeProfileListTimestamp(readLocalUserValueForAuth(username, key, 0));
@@ -10112,6 +10135,7 @@ P
 			chatAutoTranslate: loadState(STORAGE_KEY_CHAT_AUTO_TRANSLATE) === "1" ? "1" : "0",
 			profileCardStyle: (typeof readProfileCardStyleLocalValue === 'function') ? readProfileCardStyleLocalValue(localStorage.getItem('psn_username'), "default") : ((typeof normalizeProfileCardStyle === 'function') ? normalizeProfileCardStyle(loadState(STORAGE_KEY_PROFILE_CARD_STYLE) || "default") : (loadState(STORAGE_KEY_PROFILE_CARD_STYLE) || "default")),
 			profileCardEffect: (typeof readProfileCardStyleLocalValue === 'function') ? readProfileCardStyleLocalValue(localStorage.getItem('psn_username'), "default") : ((typeof normalizeProfileCardStyle === 'function') ? normalizeProfileCardStyle(loadState(STORAGE_KEY_PROFILE_CARD_STYLE) || "default") : (loadState(STORAGE_KEY_PROFILE_CARD_STYLE) || "default")),
+			profileCardStyleUpdatedAt: (typeof getProfileCardStyleUpdatedAtForUser === 'function') ? getProfileCardStyleUpdatedAtForUser(localStorage.getItem('psn_username')) : 0,
 			ps3Ip: loadState('ps3_ip') || "",
 			companionPlugin: (loadState(STORAGE_KEY_COMPANION_PLUGIN) !== "0") ? "1" : "0",
 			fpsCounterPlugin: (loadState(STORAGE_KEY_FPS_COUNTER) === "1") ? "1" : "0",
@@ -10281,6 +10305,7 @@ P
 				chatAutoTranslate: readLocalUserValueForAuth(username, STORAGE_KEY_CHAT_AUTO_TRANSLATE, '0') === '1' ? '1' : '0',
 				profileCardStyle: (typeof normalizeProfileCardStyle === 'function') ? normalizeProfileCardStyle(readLocalUserValueForAuth(username, STORAGE_KEY_PROFILE_CARD_STYLE, 'neon') || 'neon') : (readLocalUserValueForAuth(username, STORAGE_KEY_PROFILE_CARD_STYLE, 'neon') || 'neon'),
 				profileCardEffect: (typeof normalizeProfileCardStyle === 'function') ? normalizeProfileCardStyle(readLocalUserValueForAuth(username, STORAGE_KEY_PROFILE_CARD_STYLE, 'neon') || 'neon') : (readLocalUserValueForAuth(username, STORAGE_KEY_PROFILE_CARD_STYLE, 'neon') || 'neon'),
+				profileCardStyleUpdatedAt: (typeof getProfileCardStyleUpdatedAtForUser === 'function') ? getProfileCardStyleUpdatedAtForUser(username) : 0,
 				ps3Ip: readLocalUserValueForAuth(username, 'ps3_ip', '') || '',
 				companionPlugin: readLocalUserValueForAuth(username, STORAGE_KEY_COMPANION_PLUGIN, '1') !== '0' ? '1' : '0',
 				fpsCounterPlugin: readLocalUserValueForAuth(username, STORAGE_KEY_FPS_COUNTER, '0') === '1' ? '1' : '0',
@@ -10804,6 +10829,7 @@ P
 						chatAutoTranslate: "0",
 						profileCardStyle: "neon",
 						profileCardEffect: "neon",
+						profileCardStyleUpdatedAt: Date.now(),
 						ps3Ip: "",
 						companionPlugin: "1",
 						fpsCounterPlugin: "0",
@@ -32857,8 +32883,17 @@ function getVisibleChatStackEl(id) {
 				localStorage.setItem(`${name}_${STORAGE_KEY_CHAT_AUTO_TRANSLATE}`, String(settings.chatAutoTranslate) === '1' ? '1' : '0');
 				if (typeof STORAGE_KEY_PROFILE_CARD_STYLE !== 'undefined') {
 					const incomingProfileCardStyle = (typeof normalizeProfileCardStyle === 'function') ? normalizeProfileCardStyle(settings.profileCardStyle || settings.profileCardEffect || 'neon') : (settings.profileCardStyle || settings.profileCardEffect || 'neon');
-					localStorage.setItem(`${name}_${STORAGE_KEY_PROFILE_CARD_STYLE}`, incomingProfileCardStyle);
-					if (name === localStorage.getItem('psn_username')) saveState(STORAGE_KEY_PROFILE_CARD_STYLE, incomingProfileCardStyle);
+					const incomingProfileCardStyleUpdatedAt = Number(settings.profileCardStyleUpdatedAt || settings.profileCardEffectUpdatedAt || settings.profileCardThemeUpdatedAt || userData.profileCardStyleUpdatedAt || payload.profileCardStyleUpdatedAt || incomingProfileUpdatedAt || 0);
+					if (typeof writeProfileCardStyleForUser === 'function') {
+						writeProfileCardStyleForUser(name, incomingProfileCardStyle, incomingProfileCardStyleUpdatedAt);
+					} else {
+						localStorage.setItem(`${name}_${STORAGE_KEY_PROFILE_CARD_STYLE}`, incomingProfileCardStyle);
+					}
+					if (incomingProfileCardStyleUpdatedAt && typeof setProfileCardStyleUpdatedAtForUser === 'function') setProfileCardStyleUpdatedAtForUser(name, incomingProfileCardStyleUpdatedAt);
+					if (name === localStorage.getItem('psn_username')) {
+						saveState(STORAGE_KEY_PROFILE_CARD_STYLE, incomingProfileCardStyle);
+						if (incomingProfileCardStyleUpdatedAt) localStorage.setItem(STORAGE_KEY_PROFILE_CARD_STYLE_UPDATED_AT, String(incomingProfileCardStyleUpdatedAt));
+					}
 					if (typeof refreshOpenProfileCardStyleForUser === 'function') refreshOpenProfileCardStyleForUser(name);
 				}
 				localStorage.setItem(`${name}_ps3_ip`, settings.ps3Ip || '');
@@ -33098,12 +33133,17 @@ function getVisibleChatStackEl(id) {
 				localStorage.setItem(`${name}_${STORAGE_KEY_CHAT_AUTO_TRANSLATE}`, String(userData.settingsData.chatAutoTranslate) === "1" ? "1" : "0");
 				if (typeof STORAGE_KEY_PROFILE_CARD_STYLE !== 'undefined') {
 					const incomingProfileCardStyle = (typeof normalizeProfileCardStyle === 'function') ? normalizeProfileCardStyle(userData.settingsData.profileCardStyle || userData.settingsData.profileCardEffect || 'default') : (userData.settingsData.profileCardStyle || userData.settingsData.profileCardEffect || 'default');
+					const incomingProfileCardStyleUpdatedAt = Number(userData.settingsData.profileCardStyleUpdatedAt || userData.settingsData.profileCardEffectUpdatedAt || userData.settingsData.profileCardThemeUpdatedAt || userData.profileCardStyleUpdatedAt || userData.profileUpdatedAt || 0);
 					if (typeof writeProfileCardStyleForUser === 'function') {
-						writeProfileCardStyleForUser(name, incomingProfileCardStyle);
+						writeProfileCardStyleForUser(name, incomingProfileCardStyle, incomingProfileCardStyleUpdatedAt);
 					} else {
 						localStorage.setItem(`${name}_${STORAGE_KEY_PROFILE_CARD_STYLE}`, incomingProfileCardStyle);
 					}
-					if (name === localStorage.getItem('psn_username')) saveState(STORAGE_KEY_PROFILE_CARD_STYLE, incomingProfileCardStyle);
+					if (incomingProfileCardStyleUpdatedAt && typeof setProfileCardStyleUpdatedAtForUser === 'function') setProfileCardStyleUpdatedAtForUser(name, incomingProfileCardStyleUpdatedAt);
+					if (name === localStorage.getItem('psn_username')) {
+						saveState(STORAGE_KEY_PROFILE_CARD_STYLE, incomingProfileCardStyle);
+						if (incomingProfileCardStyleUpdatedAt) localStorage.setItem(STORAGE_KEY_PROFILE_CARD_STYLE_UPDATED_AT, String(incomingProfileCardStyleUpdatedAt));
+					}
 				}
 
 				const incomingCompanionPlugin = (typeof userData.settingsData.companionPlugin !== 'undefined') ? userData.settingsData.companionPlugin : "1";
@@ -34142,13 +34182,15 @@ function getVisibleChatStackEl(id) {
 				const name = data.name || '';
 				if (!name) return;
 				const incomingStyle = (data.settingsData && (data.settingsData.profileCardStyle || data.settingsData.profileCardEffect)) || data.profileCardStyle || data.profileCardEffect || '';
-				if (incomingStyle && typeof writeProfileCardStyleForUser === 'function') writeProfileCardStyleForUser(name, incomingStyle);
+				const incomingStyleUpdatedAt = Number((data.settingsData && (data.settingsData.profileCardStyleUpdatedAt || data.settingsData.profileCardEffectUpdatedAt || data.settingsData.profileCardThemeUpdatedAt)) || data.profileCardStyleUpdatedAt || data.profileUpdatedAt || 0);
+				if (incomingStyle && typeof writeProfileCardStyleForUser === 'function') writeProfileCardStyleForUser(name, incomingStyle, incomingStyleUpdatedAt);
 				if (Array.isArray(window.currentOnlineList)) {
 					const user = window.currentOnlineList.find(u => (u.name || u) === name);
 					if (user) {
 						user.profileCardStyle = incomingStyle || user.profileCardStyle;
 						user.profileCardEffect = incomingStyle || user.profileCardEffect;
 						user.settingsData = { ...(user.settingsData || {}), ...(data.settingsData || {}) };
+						if (incomingStyleUpdatedAt) user.profileCardStyleUpdatedAt = incomingStyleUpdatedAt;
 						if (data.profileUpdatedAt) user.profileUpdatedAt = data.profileUpdatedAt;
 					}
 				}
@@ -34359,6 +34401,7 @@ function getVisibleChatStackEl(id) {
 				chatAutoTranslate: myChatAutoTranslate,
 				profileCardStyle: (typeof normalizeProfileCardStyle === 'function') ? normalizeProfileCardStyle(loadState(STORAGE_KEY_PROFILE_CARD_STYLE) || "neon") : (loadState(STORAGE_KEY_PROFILE_CARD_STYLE) || "neon"),
 				profileCardEffect: (typeof normalizeProfileCardStyle === 'function') ? normalizeProfileCardStyle(loadState(STORAGE_KEY_PROFILE_CARD_STYLE) || "neon") : (loadState(STORAGE_KEY_PROFILE_CARD_STYLE) || "neon"),
+				profileCardStyleUpdatedAt: (typeof getProfileCardStyleUpdatedAtForUser === 'function') ? getProfileCardStyleUpdatedAtForUser(myName) : 0,
 				ps3Ip: myIp,
 				companionPlugin: myCompanionPlugin,
 				fpsCounterPlugin: myFpsCounterPlugin,
@@ -37338,11 +37381,12 @@ function getVisibleChatStackEl(id) {
 		return normalizeProfileCardStyle(globalValue || fallback);
 	}
 
-	function writeProfileCardStyleForUser(username, style) {
+	function writeProfileCardStyleForUser(username, style, updatedAt = 0) {
 		const safeUser = username || localStorage.getItem('psn_username') || '';
 		const safeStyle = normalizeProfileCardStyle(style || 'default');
 		if (!safeUser) return safeStyle;
 		localStorage.setItem(`${safeUser}_${STORAGE_KEY_PROFILE_CARD_STYLE}`, safeStyle);
+		if (updatedAt && typeof setProfileCardStyleUpdatedAtForUser === 'function') setProfileCardStyleUpdatedAtForUser(safeUser, updatedAt);
 		window.profileCardStyleByUser = window.profileCardStyleByUser || {};
 		window.profileCardStyleByUser[safeUser] = safeStyle;
 		return safeStyle;
@@ -37356,7 +37400,7 @@ function getVisibleChatStackEl(id) {
 		}
 		const sourceSettings = (sourceUser && sourceUser.settingsData && typeof sourceUser.settingsData === 'object') ? sourceUser.settingsData : {};
 		if (sourceSettings.profileCardStyle || sourceSettings.profileCardEffect || sourceSettings.profileCardTheme) {
-			return writeProfileCardStyleForUser(safeUser, sourceSettings.profileCardStyle || sourceSettings.profileCardEffect || sourceSettings.profileCardTheme);
+			return writeProfileCardStyleForUser(safeUser, sourceSettings.profileCardStyle || sourceSettings.profileCardEffect || sourceSettings.profileCardTheme, Number(sourceSettings.profileCardStyleUpdatedAt || sourceSettings.profileCardEffectUpdatedAt || sourceSettings.profileCardThemeUpdatedAt || 0));
 		}
 		return readProfileCardStyleLocalValue(safeUser, 'default');
 	}
@@ -37490,8 +37534,10 @@ function getVisibleChatStackEl(id) {
 			}
 			return;
 		}
-		writeProfileCardStyleForUser(myName, safeStyle);
+		const styleUpdatedAt = (typeof markProfileCardStyleChanged === 'function') ? markProfileCardStyleChanged() : Date.now();
+		writeProfileCardStyleForUser(myName, safeStyle, styleUpdatedAt);
 		localStorage.setItem(STORAGE_KEY_PROFILE_CARD_STYLE, safeStyle);
+		localStorage.setItem(STORAGE_KEY_PROFILE_CARD_STYLE_UPDATED_AT, String(styleUpdatedAt));
 		saveState(STORAGE_KEY_PROFILE_CARD_STYLE, safeStyle);
 		applyProfileCardStyle(safeStyle);
 		renderProfileCardStyleOptions();
@@ -37503,6 +37549,7 @@ function getVisibleChatStackEl(id) {
 			const settingsPayload = (typeof getRuntimePluginSettingsPayload === 'function') ? getRuntimePluginSettingsPayload() : {};
 			settingsPayload.profileCardStyle = safeStyle;
 			settingsPayload.profileCardEffect = safeStyle;
+			settingsPayload.profileCardStyleUpdatedAt = styleUpdatedAt;
 			socketChat.emit('update_profile', { settingsData: settingsPayload });
 		}
 		if (typeof broadcastProfileUpdate === 'function') broadcastProfileUpdate();

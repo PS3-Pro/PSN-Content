@@ -520,11 +520,32 @@ function normalizeTimestampValue(value) {
 }
 
 const VALID_PROFILE_CARD_STYLES = new Set(["default", "neon", "galaxy", "sunset", "ghost", "royal", "matrix", "lovely", "wave", "scan", "nightgrid", "glass", "nebula", "spotlight"]);
+const PROFILE_CARD_STYLE_UPDATED_AT_KEY = "profileCardStyleUpdatedAt";
+const PROFILE_CARD_STYLE_TIMESTAMP_ALIASES = ["profileCardStyleUpdatedAt", "profileCardEffectUpdatedAt", "profileCardThemeUpdatedAt", "bannerUpdatedAt"];
 
 function normalizeProfileCardStyleServer(value, fallback = "default") {
   const style = normalizeText(value, fallback).toLowerCase();
   if (style === "xmb") return "lovely";
+  if (style === "inferno") return "spotlight";
   return VALID_PROFILE_CARD_STYLES.has(style) ? style : fallback;
+}
+
+function hasProfileBannerStylePayload(settings = {}) {
+  return !!(settings && typeof settings === "object" && (
+    Object.prototype.hasOwnProperty.call(settings, "profileCardStyle") ||
+    Object.prototype.hasOwnProperty.call(settings, "profileCardEffect") ||
+    Object.prototype.hasOwnProperty.call(settings, "profileCardTheme")
+  ));
+}
+
+function getProfileBannerUpdatedAt(settings = {}, fallback = 0) {
+  if (settings && typeof settings === "object") {
+    for (const key of PROFILE_CARD_STYLE_TIMESTAMP_ALIASES) {
+      const timestamp = normalizeTimestampValue(settings[key]);
+      if (timestamp) return timestamp;
+    }
+  }
+  return normalizeTimestampValue(fallback);
 }
 
 function getUserProfileCardStyle(user = {}) {
@@ -532,27 +553,82 @@ function getUserProfileCardStyle(user = {}) {
   return normalizeProfileCardStyleServer(settings.profileCardStyle || settings.profileCardEffect || settings.profileCardTheme || user.profileCardStyle || user.profileCardEffect || "default");
 }
 
+function getUserProfileCardStyleUpdatedAt(user = {}) {
+  const settings = user && user.settingsData && typeof user.settingsData === "object" ? user.settingsData : {};
+  return getProfileBannerUpdatedAt(settings, user.profileCardStyleUpdatedAt || user.profileCardEffectUpdatedAt || user.profileUpdatedAt);
+}
+
 function getPublicProfileSettings(user = {}) {
   const profileCardStyle = getUserProfileCardStyle(user);
+  const profileCardStyleUpdatedAt = getUserProfileCardStyleUpdatedAt(user) || normalizeTimestampValue(user.profileUpdatedAt) || Date.now();
   return {
     profileCardStyle,
-    profileCardEffect: profileCardStyle
+    profileCardEffect: profileCardStyle,
+    profileCardStyleUpdatedAt
   };
 }
 
 function normalizeProfileBannerSettings(settings = {}) {
   const clean = settings && typeof settings === "object" ? { ...settings } : {};
-  if (
-    Object.prototype.hasOwnProperty.call(clean, "profileCardStyle") ||
-    Object.prototype.hasOwnProperty.call(clean, "profileCardEffect") ||
-    Object.prototype.hasOwnProperty.call(clean, "profileCardTheme")
-  ) {
+  const hasStylePayload = hasProfileBannerStylePayload(clean);
+  const updatedAt = getProfileBannerUpdatedAt(clean);
+
+  if (hasStylePayload) {
     const style = normalizeProfileCardStyleServer(clean.profileCardStyle || clean.profileCardEffect || clean.profileCardTheme || "default");
     clean.profileCardStyle = style;
     clean.profileCardEffect = style;
     delete clean.profileCardTheme;
   }
+
+  if (updatedAt) clean[PROFILE_CARD_STYLE_UPDATED_AT_KEY] = updatedAt;
+  PROFILE_CARD_STYLE_TIMESTAMP_ALIASES.forEach(key => {
+    if (key !== PROFILE_CARD_STYLE_UPDATED_AT_KEY) delete clean[key];
+  });
+
   return clean;
+}
+
+function mergeProfileBannerSettingsByTimestamp(currentSettings = {}, incomingSettings = {}, options = {}) {
+  const current = normalizeProfileBannerSettings(currentSettings || {});
+  const incoming = normalizeProfileBannerSettings(incomingSettings || {});
+  const incomingHasBanner = hasProfileBannerStylePayload(incomingSettings);
+  const currentHasBanner = hasProfileBannerStylePayload(current) || !!(current.profileCardStyle || current.profileCardEffect);
+  const currentUpdatedAt = getProfileBannerUpdatedAt(current, options.currentFallback || 0);
+  const incomingUpdatedAt = getProfileBannerUpdatedAt(incoming, options.incomingFallback || 0);
+  const merged = { ...current, ...incoming };
+  let bannerAccepted = false;
+  let bannerRejected = false;
+
+  if (incomingHasBanner) {
+    const currentStyle = normalizeProfileCardStyleServer(current.profileCardStyle || current.profileCardEffect || current.profileCardTheme || "default");
+    const incomingStyle = normalizeProfileCardStyleServer(incoming.profileCardStyle || incoming.profileCardEffect || incoming.profileCardTheme || "default");
+    const acceptIncomingBanner = !!(
+      (incomingUpdatedAt && (!currentUpdatedAt || incomingUpdatedAt >= currentUpdatedAt)) ||
+      (!currentUpdatedAt && !incomingUpdatedAt) ||
+      !currentHasBanner
+    );
+
+    if (acceptIncomingBanner) {
+      merged.profileCardStyle = incomingStyle;
+      merged.profileCardEffect = incomingStyle;
+      if (incomingUpdatedAt) merged[PROFILE_CARD_STYLE_UPDATED_AT_KEY] = incomingUpdatedAt;
+      else if (currentUpdatedAt) merged[PROFILE_CARD_STYLE_UPDATED_AT_KEY] = currentUpdatedAt;
+      bannerAccepted = currentStyle !== incomingStyle || incomingUpdatedAt > currentUpdatedAt;
+    } else {
+      merged.profileCardStyle = currentStyle;
+      merged.profileCardEffect = currentStyle;
+      if (currentUpdatedAt) merged[PROFILE_CARD_STYLE_UPDATED_AT_KEY] = currentUpdatedAt;
+      bannerRejected = true;
+    }
+  } else if (currentHasBanner) {
+    const currentStyle = normalizeProfileCardStyleServer(current.profileCardStyle || current.profileCardEffect || current.profileCardTheme || "default");
+    merged.profileCardStyle = currentStyle;
+    merged.profileCardEffect = currentStyle;
+    if (currentUpdatedAt) merged[PROFILE_CARD_STYLE_UPDATED_AT_KEY] = currentUpdatedAt;
+  }
+
+  delete merged.profileCardTheme;
+  return { settingsData: merged, bannerAccepted, bannerRejected };
 }
 
 function emitPublicProfileBannerUpdate(name, user = null) {
@@ -563,7 +639,8 @@ function emitPublicProfileBannerUpdate(name, user = null) {
     profileUpdatedAt: normalizeTimestampValue(user.profileUpdatedAt) || Date.now(),
     settingsData,
     profileCardStyle: settingsData.profileCardStyle,
-    profileCardEffect: settingsData.profileCardEffect
+    profileCardEffect: settingsData.profileCardEffect,
+    profileCardStyleUpdatedAt: settingsData.profileCardStyleUpdatedAt
   });
 }
 
@@ -722,7 +799,11 @@ function mergeLocalRecoveryData(dbUser = {}, localData = {}) {
 
   Object.keys(PROFILE_ARRAY_SYNC_KEYS).forEach(key => applyLocalRecoveryArrayPayload(merged, localData, key));
   if (hasObjectPayload(localData.settingsData)) {
-    merged.settingsData = { ...(merged.settingsData || {}), ...normalizeProfileBannerSettings(localData.settingsData) };
+    const mergedSettings = mergeProfileBannerSettingsByTimestamp(merged.settingsData || {}, localData.settingsData, {
+      currentFallback: normalizeTimestampValue(merged.profileUpdatedAt),
+      incomingFallback: normalizeTimestampValue(localData.profileCardStyleUpdatedAt || localData.profileUpdatedAt)
+    });
+    merged.settingsData = mergedSettings.settingsData;
   }
   ['trophies', 'level', 'xp'].forEach(key => {
     const current = Number(merged[key] || 0);
@@ -1860,20 +1941,19 @@ io.on('connection', async (socket) => {
 
   socket.on('update_profile', async (userData) => {
     const name = socket.userName;
-    const incomingSettingsData = (userData && userData.settingsData && typeof userData.settingsData === "object") ? userData.settingsData : null;
-    const shouldBroadcastProfileBanner = !!(incomingSettingsData && (
-        Object.prototype.hasOwnProperty.call(incomingSettingsData, "profileCardStyle") ||
-        Object.prototype.hasOwnProperty.call(incomingSettingsData, "profileCardEffect") ||
-        Object.prototype.hasOwnProperty.call(incomingSettingsData, "profileCardTheme")
-    ));
+    userData = (userData && typeof userData === "object") ? userData : {};
+    const incomingSettingsData = (userData.settingsData && typeof userData.settingsData === "object") ? userData.settingsData : null;
+    let shouldBroadcastProfileBanner = false;
     const shouldEmitTrendingUpdate = profileUpdateTouchesTrending(userData || {});
     if (name && userDatabase[name]) {
         
-        if (userData.settingsData) {
-            userDatabase[name].settingsData = {
-                ...(userDatabase[name].settingsData || {}),
-                ...normalizeProfileBannerSettings(userData.settingsData)
-            };
+        if (incomingSettingsData) {
+            const mergedSettings = mergeProfileBannerSettingsByTimestamp(userDatabase[name].settingsData || {}, incomingSettingsData, {
+                currentFallback: normalizeTimestampValue(userDatabase[name].profileUpdatedAt),
+                incomingFallback: normalizeTimestampValue(userData.profileCardStyleUpdatedAt || userData.profileUpdatedAt)
+            });
+            userDatabase[name].settingsData = mergedSettings.settingsData;
+            shouldBroadcastProfileBanner = mergedSettings.bannerAccepted === true;
             delete userData.settingsData;
         }
 
