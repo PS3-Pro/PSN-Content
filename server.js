@@ -2017,7 +2017,7 @@ io.on('connection', async (socket) => {
 
   socket.on('chat_message', async (msg, callback) => {
     const respond = typeof callback === 'function' ? callback : () => {};
-    let messageData = { ...(typeof msg === 'object' ? msg : { text: msg }), time: new Date().toISOString(), seenBy: [] };
+    let messageData = { ...(typeof msg === 'object' ? msg : { text: msg }), time: new Date().toISOString(), seenBy: [], seenAt: {} };
     const isAdmin = socket.isAdmin === true;
     const canModerate = canModerateSocket(socket);
     const actorRole = getActorRole(socket);
@@ -2623,12 +2623,14 @@ io.on('connection', async (socket) => {
     const msg = messageHistory.find(m => String(new Date(m.time).getTime()) === String(data.msgId));
     if (msg && msg.user !== data.user) {
         if (!msg.seenBy) msg.seenBy = [];
+        if (!msg.seenAt || typeof msg.seenAt !== 'object' || Array.isArray(msg.seenAt)) msg.seenAt = {};
         if (!msg.seenBy.includes(data.user)) {
             msg.seenBy.push(data.user);
-            
+            msg.seenAt[data.user] = new Date().toISOString();
+
             try {
                 await pool.query("UPDATE chat SET message = $1 WHERE message->>'time' = $2", [cleanChatMessage(msg), msg.time]);
-                io.emit('message_seen', { msgId: data.msgId, seenBy: msg.seenBy });
+                io.emit('message_seen', { msgId: data.msgId, seenBy: msg.seenBy, seenAt: msg.seenAt });
             } catch (err) { console.error("Seen Mark Error:", err); }
         }
     }

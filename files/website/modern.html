@@ -9320,8 +9320,8 @@ P
 					<div id="profile-card-style-grid" class="profile-card-style-grid"></div>
 				</div>
 				<div class="profile-card-style-footer">
-					<button class="action-btn profile-card-style-ok-btn" onmouseenter="playUiHover()" onclick="playUiClick(); closeSysModal(null, 'modal-sys-profile-card-style')">
-						<i class="fas fa-check"></i> Apply
+					<button class="action-btn profile-card-style-ok-btn" onmouseenter="playUiHover()" onclick="confirmProfileCardStyleSelection()">
+						<i class="fas fa-check"></i> Confirm
 					</button>
 				</div>
 			</div>
@@ -9380,8 +9380,8 @@ P
 	
 				<button class="action-btn" 
 						style="width: 100%; margin-top: 30px; display: flex; justify-content: center; align-items: center; gap: 8px;" 
-						onmouseenter="playUiHover()" onclick="playUiClick(); closeSysModal(null, 'modal-sys-theme')">
-					<i class="fas fa-check"></i> OK
+						onmouseenter="playUiHover()" onclick="confirmThemeSelection()">
+					<i class="fas fa-check"></i> Confirm
 				</button>
 			</div>
 		</div>
@@ -28100,6 +28100,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 		sync_db: { id: 'sync_db', title: 'Always Updated', desc: 'Manually sync the database in settings.', type: 'bronze', max: 1, group: 'System & Usage' },
 		unlock_all: { id: 'unlock_all', title: "Gotta Unlock 'em All!", desc: 'Unlock all games by installing the License Pack.', type: 'gold', max: 1, group: 'System & Usage' },
 		avatar_premium: { id: 'avatar_premium', title: 'Premium Identity', desc: 'Equip an exclusive reward avatar.', type: 'silver', max: 1, group: 'System & Usage' },
+		banner_swap: { id: 'banner_swap', title: 'Fresh Look', desc: 'Change your profile banner for the first time.', type: 'bronze', max: 1, group: 'System & Usage' },
 
 		chat_first: { id: 'chat_first', title: 'Breaking the Ice', desc: 'Send your first message in the Global Chat.', type: 'bronze', max: 1, group: 'Social & Chat' },
 		chat_active: { id: 'chat_active', title: 'Chatterbox', desc: 'Send a total of 50 messages in the chat.', type: 'silver', max: 50, group: 'Social & Chat' },
@@ -31983,7 +31984,10 @@ function getVisibleChatStackEl(id) {
 		
 	
 		const hasBeenSeen = (msg.seenBy && msg.seenBy.length > 0);
-		const seenByList = hasBeenSeen ? msg.seenBy.join(', ') : ''; 
+		const seenByCount = hasBeenSeen ? msg.seenBy.length : 0;
+		const seenByList = hasBeenSeen ? msg.seenBy.join(', ') : '';
+		const seenAtMap = (msg.seenAt && typeof msg.seenAt === 'object') ? msg.seenAt : {};
+		const seenAtData = encodeURIComponent(JSON.stringify(seenAtMap));
 		const seenColor = hasBeenSeen ? '#4caf50' : 'rgba(255, 255, 255, 0.3)';
 	
 		const isUserCurrentlyOnline = isAuthor 
@@ -32047,14 +32051,17 @@ function getVisibleChatStackEl(id) {
 					<span style="transform: translateY(-1px); display: inline-block;">${timeStr}</span>
 					
 					${isAuthor ? `
-						<div id="check-${msgId}" 
-							style="display: flex; align-items: center; width: 16px; position: relative; cursor: pointer;" 
-							data-seen-list="${seenByList}" 
+						<div id="check-${msgId}"  
+							style="display: flex; align-items: center; width: 16px; position: relative; cursor: pointer;"  
+							data-seen-list="${seenByList}"
+							data-seen-count="${seenByCount}"
+							data-seen-at="${seenAtData}"
+							title="Seen by: ${seenByCount}"
 							onmouseenter="if(typeof playUiArrow === 'function') playUiArrow()"
 							onclick="openSeenByPopup(event, '${msgId}')">
 							<i class="fas fa-check" style="color: ${seenColor}; font-size: 12.5px; position: absolute; left: 0;"></i>
 							<i class="fas fa-check" style="color: ${seenColor}; font-size: 12.5px; position: absolute; left: 5px; ${!hasBeenSeen ? 'display:none;' : ''}"></i>
-						</div>` 
+						</div>`  
 					: ''}
 	
 					<i class="fas fa-reply" style="cursor: pointer; opacity: 0.5; color: #00bcff; font-size: 12px; transition: all 0.2s;" 
@@ -33812,13 +33819,21 @@ function getVisibleChatStackEl(id) {
 	
 		socketChat.on('message_seen', function(data) {
 			const checkCont = document.getElementById(`check-${data.msgId}`);
+			const seenList = Array.isArray(data.seenBy) ? data.seenBy : [];
+			const seenAtMap = (data.seenAt && typeof data.seenAt === 'object') ? data.seenAt : {};
 			if (checkCont) {
 				checkCont.querySelectorAll('i').forEach(c => { c.style.color = '#4caf50'; c.style.display = 'block'; });
-				checkCont.setAttribute('data-seen-list', data.seenBy.join(', '));
+				checkCont.setAttribute('data-seen-list', seenList.join(', '));
+				checkCont.setAttribute('data-seen-count', String(seenList.length));
+				checkCont.setAttribute('data-seen-at', encodeURIComponent(JSON.stringify(seenAtMap)));
+				checkCont.setAttribute('title', `Seen by: ${seenList.length}`);
 			}
 			if (window.messageHistory) {
 				const msg = window.messageHistory.find(m => String(new Date(m.time).getTime()) === String(data.msgId));
-				if (msg) msg.seenBy = data.seenBy;
+				if (msg) {
+					msg.seenBy = seenList;
+					msg.seenAt = seenAtMap;
+				}
 			}
 		});
 		
@@ -36022,17 +36037,31 @@ function getVisibleChatStackEl(id) {
 	function openSeenByPopup(event, msgId) {
 		event.stopPropagation();
 		if (typeof playUiClick === 'function') playUiClick();
-		
+
 		document.querySelectorAll('.seen-by-popover').forEach(p => p.remove());
-	
+
 		const checkContainer = document.getElementById(`check-${msgId}`);
 		const chatBox = document.getElementById('chat-messages');
 		if (!checkContainer || !chatBox) return;
-	
+
 		const seenByRaw = checkContainer.getAttribute('data-seen-list') || "";
 		const users = seenByRaw.split(', ').filter(u => u.trim() !== "");
 		if (users.length === 0) return;
-	
+
+		let seenAtMap = {};
+		try {
+			seenAtMap = JSON.parse(decodeURIComponent(checkContainer.getAttribute('data-seen-at') || "%7B%7D")) || {};
+		} catch (e) {
+			seenAtMap = {};
+		}
+
+		const formatSeenAt = (value) => {
+			if (!value) return "";
+			const date = new Date(value);
+			if (Number.isNaN(date.getTime())) return "";
+			return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+		};
+
 		const popover = document.createElement('div');
 		popover.className = 'seen-by-popover show';
 		popover.style.position = 'fixed';
@@ -36041,30 +36070,34 @@ function getVisibleChatStackEl(id) {
 		popover.style.right = 'auto';
 		popover.style.bottom = 'auto';
 		popover.style.zIndex = '2147483647';
-		
-		let itemsHtml = `<div class="seen-by-title">Seen by</div>`;
+
+		let itemsHtml = `<div class="seen-by-title">Seen by: ${users.length}</div>`;
 		users.forEach(user => {
 			const avatar = localStorage.getItem(`${user}_psn_avatar`) || "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/main/resources/interface/modern/images/avatars/default.png";
+			const seenTime = formatSeenAt(seenAtMap[user]);
 			itemsHtml += `
 				<div class="seen-user-item" onclick="openProfileModal('${user}')" style="cursor:pointer;">
 					<img src="${avatar}" class="seen-user-avatar">
-					<span class="seen-user-name">${user}</span>
+					<div style="min-width:0; flex:1; display:flex; flex-direction:column; gap:2px;">
+						<span class="seen-user-name">${user}</span>
+						${seenTime ? `<span style="font-size:9px; color:rgba(255,255,255,.48); line-height:1;">Seen ${seenTime}</span>` : ''}
+					</div>
 				</div>`;
 		});
-	
+
 		popover.innerHTML = itemsHtml;
 		document.body.appendChild(popover);
 		popover.addEventListener('click', e => e.stopPropagation());
-	
+
 		const checkRect = checkContainer.getBoundingClientRect();
 		const chatRect = chatBox.getBoundingClientRect();
 		const popRect = popover.getBoundingClientRect();
 		const padding = 8;
 		const isMyMsg = !!checkContainer.closest('[style*="flex-end"]');
-	
+
 		let left = isMyMsg ? (checkRect.right - popRect.width) : checkRect.left;
 		left = Math.max(chatRect.left + padding, Math.min(left, chatRect.right - popRect.width - padding));
-	
+
 		const spaceAbove = checkRect.top - chatRect.top;
 		const spaceBelow = chatRect.bottom - checkRect.bottom;
 		let top;
@@ -36074,10 +36107,10 @@ function getVisibleChatStackEl(id) {
 			top = checkRect.bottom + padding;
 		}
 		top = Math.max(chatRect.top + padding, Math.min(top, chatRect.bottom - popRect.height - padding));
-	
+
 		popover.style.left = `${Math.round(left)}px`;
 		popover.style.top = `${Math.round(top)}px`;
-	
+
 		setTimeout(() => {
 			const closeTrigger = () => {
 				if (document.body.contains(popover)) popover.remove();
@@ -36090,7 +36123,7 @@ function getVisibleChatStackEl(id) {
 			chatBox.addEventListener('scroll', closeTrigger, { once: true });
 		}, 100);
 	}
-	
+
 	function preserveChatSearchScrollSnapshot() {
 		const chatBox = document.getElementById('chat-messages');
 		const scrollArea = document.getElementById('scroll-area');
@@ -37086,13 +37119,14 @@ function getVisibleChatStackEl(id) {
 		if (!grid) return;
 		const myName = localStorage.getItem('psn_username') || '';
 		const current = readProfileCardStyleLocalValue(myName, 'default');
+		const pending = normalizeProfileCardStyle(window.pendingProfileCardStyleSelection || current);
 		grid.innerHTML = PROFILE_CARD_STYLE_OPTIONS.map(item => {
 			const unlocked = isProfileCardRewardUnlocked(item.id);
 			const isReward = !!item.rewardReq;
 			const premiumIcon = isReward ? '<span class="profile-card-style-premium-star" title="Premium reward"><i class="fas fa-star"></i></span>' : '';
 			const previewVfx = getProfileCardStylePreviewMarkup(item.id);
 			return `
-				<button type="button" class="profile-card-style-option ${item.id === current ? 'active' : ''} ${(!unlocked && isReward) ? 'is-locked' : ''}" data-style="${item.id}" onmouseenter="playUiArrow()" onclick="setProfileCardStyle('${item.id}')">
+				<button type="button" class="profile-card-style-option ${item.id === pending ? 'active' : ''} ${(!unlocked && isReward) ? 'is-locked' : ''}" data-style="${item.id}" onmouseenter="playUiArrow()" onclick="selectProfileCardStyle('${item.id}')">
 					<div class="profile-card-style-preview style-${item.id}">
 						${premiumIcon}
 						${previewVfx}
@@ -37116,16 +37150,58 @@ function getVisibleChatStackEl(id) {
 		const openedName = document.getElementById('profile-name-val')?.innerText;
 		if (!myName || openedName !== myName) return;
 		if (typeof playUiClick === 'function') playUiClick();
-		renderProfileCardStyleOptions();
 		const modal = document.getElementById('modal-sys-profile-card-style');
 		if (!modal) return;
+		const current = readProfileCardStyleLocalValue(myName, 'default');
+		window.pendingProfileCardStyleSelection = current;
+		modal.dataset.profileCardOriginal = current;
+		modal.dataset.profileCardPending = current;
+		modal.dataset.profileCardConfirmed = 'false';
+		renderProfileCardStyleOptions();
 		modal.style.display = 'flex';
 		requestAnimationFrame(() => requestAnimationFrame(() => modal.classList.add('show')));
+	}
+
+	function selectProfileCardStyle(style) {
+		const myName = localStorage.getItem('psn_username');
+		if (!myName) return;
+		const safeStyle = normalizeProfileCardStyle(style);
+		const styleMeta = getProfileCardStyleMeta(safeStyle);
+		if (styleMeta && styleMeta.rewardReq && !isProfileCardRewardUnlocked(safeStyle)) {
+			if (typeof playUiError === 'function') playUiError();
+			const reqLabel = getProfileCardRewardRequirementLabel(safeStyle);
+			if (typeof showToastNotification === 'function') {
+				showToastNotification('Banner Locked', `Earn the ${reqLabel} trophy to unlock the ${styleMeta.label} banner.`);
+			}
+			return;
+		}
+		window.pendingProfileCardStyleSelection = safeStyle;
+		const modal = document.getElementById('modal-sys-profile-card-style');
+		if (modal) modal.dataset.profileCardPending = safeStyle;
+		document.querySelectorAll('.profile-card-style-option').forEach(btn => {
+			btn.classList.toggle('active', btn.getAttribute('data-style') === safeStyle);
+		});
+		if (typeof playUiClick === 'function') playUiClick();
+	}
+
+	function cancelProfileCardStyleSelection() {
+		const modal = document.getElementById('modal-sys-profile-card-style');
+		const original = modal ? modal.dataset.profileCardOriginal : '';
+		window.pendingProfileCardStyleSelection = original || '';
+	}
+
+	function confirmProfileCardStyleSelection() {
+		const modal = document.getElementById('modal-sys-profile-card-style');
+		const pending = normalizeProfileCardStyle((modal && modal.dataset.profileCardPending) || window.pendingProfileCardStyleSelection || readProfileCardStyleLocalValue(localStorage.getItem('psn_username') || '', 'default'));
+		if (modal) modal.dataset.profileCardConfirmed = 'true';
+		setProfileCardStyle(pending);
+		closeSysModal(null, 'modal-sys-profile-card-style');
 	}
 
 	function setProfileCardStyle(style) {
 		const myName = localStorage.getItem('psn_username');
 		if (!myName) return;
+		const previousStyle = readProfileCardStyleLocalValue(myName, 'default');
 		const safeStyle = normalizeProfileCardStyle(style);
 		const styleMeta = getProfileCardStyleMeta(safeStyle);
 		if (styleMeta && styleMeta.rewardReq && !isProfileCardRewardUnlocked(safeStyle)) {
@@ -37142,6 +37218,9 @@ function getVisibleChatStackEl(id) {
 		applyProfileCardStyle(safeStyle);
 		renderProfileCardStyleOptions();
 		if (typeof playUiSuccess === 'function') playUiSuccess();
+		if (previousStyle !== safeStyle && typeof checkTrophyProgress === 'function') {
+			checkTrophyProgress('banner_swap', 1);
+		}
 		if (typeof socketChat !== 'undefined' && socketChat && socketChat.connected) {
 			const settingsPayload = (typeof getRuntimePluginSettingsPayload === 'function') ? getRuntimePluginSettingsPayload() : {};
 			settingsPayload.profileCardStyle = safeStyle;
@@ -37156,11 +37235,19 @@ function getVisibleChatStackEl(id) {
 	window.getStoredProfileCardStyle = getStoredProfileCardStyle;
 	window.writeProfileCardStyleForUser = writeProfileCardStyleForUser;
 	window.openProfileCardStyleModal = openProfileCardStyleModal;
+	window.selectProfileCardStyle = selectProfileCardStyle;
+	window.confirmProfileCardStyleSelection = confirmProfileCardStyleSelection;
 	window.setProfileCardStyle = setProfileCardStyle;
 
     function closeSysModal(event, modalId) {
 		const modal = document.getElementById(modalId);
 		if (!event || event.target === modal) {
+			if (modalId === 'modal-sys-theme' && modal && modal.dataset.themeConfirmed !== 'true' && typeof revertThemePreview === 'function') {
+				revertThemePreview();
+			}
+			if (modalId === 'modal-sys-profile-card-style' && modal && modal.dataset.profileCardConfirmed !== 'true' && typeof cancelProfileCardStyleSelection === 'function') {
+				cancelProfileCardStyleSelection();
+			}
 			if (typeof playUiBack === 'function') playUiBack();
 			
 			modal.style.opacity = ''; 
@@ -37168,8 +37255,18 @@ function getVisibleChatStackEl(id) {
 			modal.classList.remove('show');
 			
 			setTimeout(() => { 
-				modal.style.display = 'none'; 
-				
+				modal.style.display = 'none';
+				if (modalId === 'modal-sys-theme') {
+					delete modal.dataset.themeOriginal;
+					delete modal.dataset.themePending;
+					delete modal.dataset.themeConfirmed;
+				}
+				if (modalId === 'modal-sys-profile-card-style') {
+					delete modal.dataset.profileCardOriginal;
+					delete modal.dataset.profileCardPending;
+					delete modal.dataset.profileCardConfirmed;
+				}
+
 				if (modalId === 'modal-sys-profile' && modal.dataset.returnToOnline === "true") {
 					modal.dataset.returnToOnline = "false";
 					
@@ -37607,21 +37704,25 @@ function getVisibleChatStackEl(id) {
 
     function openThemeModal() {
 		closeDropdownMenu();
-		
+
 		const username = localStorage.getItem('psn_username');
-		const currentColor = (localStorage.getItem(`${username}_psn_theme_color`) || '#0070cc').toLowerCase();
-		
+		const currentColor = (localStorage.getItem(`${username}_psn_theme_color`) || localStorage.getItem('psn_theme_color') || '#0070cc').toLowerCase();
+
 		const modal = document.getElementById('modal-sys-theme');
+		if (!modal) return;
+		modal.dataset.themeOriginal = currentColor;
+		modal.dataset.themePending = currentColor;
+		modal.dataset.themeConfirmed = 'false';
 		modal.style.display = 'flex';
-		
+
 		document.querySelectorAll('.theme-btn').forEach(btn => {
 			const btnColor = (btn.getAttribute('data-color') || '').toLowerCase();
 			btn.classList.toggle('active', btnColor === currentColor);
 		});
-	
+
 		requestAnimationFrame(() => requestAnimationFrame(() => modal.classList.add('show')));
 	}
-	
+
 	window.searchGameFromProfileList = function(realId, targetUser, listType, bgView, returnToOnline, category = '', contentId = '') {
 			const body = document.getElementById('list-modal-body');
 			const savedScroll = body ? body.scrollTop : 0;
@@ -38043,33 +38144,64 @@ function getVisibleChatStackEl(id) {
 		}
 	};
 
-    function setTheme(color, btnElement) {
-		if (typeof playUiClick === 'function') playUiClick();
-		
-		const username = localStorage.getItem('psn_username');
-		
+    function applyThemeColorPreview(color) {
 		document.documentElement.style.setProperty('--ps-blue', color);
 		document.documentElement.style.setProperty('--ps-neon', color + '66');
-		
-		updateDynamicCursor(color);
-	
-		if (username) {
-			localStorage.setItem(`${username}_psn_theme_color`, color);
-		}
-		
-		localStorage.setItem('psn_theme_color', color);
-	
+		if (typeof updateDynamicCursor === 'function') updateDynamicCursor(color);
+	}
+
+	function setTheme(color, btnElement) {
+		if (typeof playUiClick === 'function') playUiClick();
+		const safeColor = String(color || '#0070cc').toLowerCase();
+		const modal = document.getElementById('modal-sys-theme');
+		if (modal) modal.dataset.themePending = safeColor;
+
+		applyThemeColorPreview(safeColor);
+
 		document.querySelectorAll('.theme-btn').forEach(b => b.classList.remove('active'));
-		
+
 		if (btnElement) {
 			btnElement.classList.add('active');
-			if (typeof playUiSuccess === 'function') playUiSuccess();
 		}
+	}
+
+	function revertThemePreview() {
+		const modal = document.getElementById('modal-sys-theme');
+		const originalColor = (modal && modal.dataset.themeOriginal) ? modal.dataset.themeOriginal : (localStorage.getItem('psn_theme_color') || '#0070cc');
+		applyThemeColorPreview(originalColor);
+		document.querySelectorAll('.theme-btn').forEach(btn => {
+			const btnColor = (btn.getAttribute('data-color') || '').toLowerCase();
+			btn.classList.toggle('active', btnColor === String(originalColor).toLowerCase());
+		});
+	}
+
+	function confirmThemeSelection() {
+		const modal = document.getElementById('modal-sys-theme');
+		const username = localStorage.getItem('psn_username');
+		const pendingColor = (modal && modal.dataset.themePending) ? modal.dataset.themePending : (localStorage.getItem('psn_theme_color') || '#0070cc');
+
+		applyThemeColorPreview(pendingColor);
+
+		if (username) {
+			localStorage.setItem(`${username}_psn_theme_color`, pendingColor);
+		}
+
+		localStorage.setItem('psn_theme_color', pendingColor);
+
+		if (modal) modal.dataset.themeConfirmed = 'true';
+
+		if (typeof playUiSuccess === 'function') playUiSuccess();
 
 		if (typeof broadcastProfileUpdate === 'function') {
 			broadcastProfileUpdate();
 		}
+
+		closeSysModal(null, 'modal-sys-theme');
 	}
+
+	window.setTheme = setTheme;
+	window.confirmThemeSelection = confirmThemeSelection;
+	window.revertThemePreview = revertThemePreview;
 
 	document.addEventListener('DOMContentLoaded', () => {
 		document.documentElement.style.setProperty('--ps-blue', '#0070cc');
