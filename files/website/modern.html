@@ -33085,42 +33085,57 @@ function getVisibleChatStackEl(id) {
 	};
 
 
-	window.countUnlockedProfileTrophies = function(trophiesData, fallback = 0) {
-		if (trophiesData && typeof trophiesData === 'object' && !Array.isArray(trophiesData)) {
-			return Object.keys(trophiesData).filter(id => trophiesData[id] && trophiesData[id].unlocked).length;
-		}
-		return Number(fallback || 0) || 0;
-	};
+	function getRuntimeLibraryForProfileStats() {
+		if (typeof lastScannedGames !== 'undefined' && Array.isArray(lastScannedGames)) return lastScannedGames;
+		return Array.isArray(window.lastScannedGames) ? window.lastScannedGames : [];
+	}
 
-	window.getOpenProfileStatsForUser = function(username, userData = {}) {
+	function getProfileStatsForUser(username, userData = {}) {
 		const myName = localStorage.getItem('psn_username') || '';
 		const isMe = username === myName;
-		const onlineUser = Array.isArray(window.currentOnlineList) ? window.currentOnlineList.find(u => (u.name || u) === username) : null;
+		const onlineList = (typeof currentOnlineList !== 'undefined' && Array.isArray(currentOnlineList)) ? currentOnlineList : [];
+		const onlineUser = onlineList.find(u => (u.name || u) === username) || null;
 		const source = userData && typeof userData === 'object' && Object.keys(userData).length ? userData : (onlineUser || {});
 		const countArray = (value, fallback = 0) => Array.isArray(value) ? value.length : (Number(fallback || 0) || 0);
 		const localNumber = (key) => Number(localStorage.getItem(`${username}_psn_${key}`) || 0) || 0;
-		const runtimeLibrary = (typeof lastScannedGames !== 'undefined') ? lastScannedGames : window.lastScannedGames;
 
-		if (isMe) {
+		if (isMe && typeof buildLocalUserDataForAuth === 'function') {
+			const localUser = buildLocalUserDataForAuth(username);
 			return {
-				downloads: countArray(window.downloadHistory, countArray(source.downloadsData, source.downloads)),
-				wishlist: countArray(window.wishlist, countArray(source.wishlistData, source.wishlist)),
-				favorites: countArray(window.favoritesLibrary, countArray(source.favoritesData, source.favorites)),
-				trophies: window.countUnlockedProfileTrophies(window.userTrophies, source.trophies),
-				library: countArray(runtimeLibrary, countArray(source.libraryData, source.library))
+				downloads: countArray(localUser.downloadsData, localUser.downloads),
+				wishlist: countArray(localUser.wishlistData, localUser.wishlist),
+				favorites: countArray(localUser.favoritesData, localUser.favorites),
+				trophies: Number(localUser.trophies || 0) || 0,
+				library: countArray(localUser.libraryData, localUser.library)
 			};
 		}
+
+		const trophyCount = (source.trophiesData && typeof source.trophiesData === 'object' && !Array.isArray(source.trophiesData) && typeof calculateLocalTrophyPayloadForAuth === 'function')
+			? calculateLocalTrophyPayloadForAuth(source.trophiesData).totalTrophies
+			: (Number(source.trophies ?? localNumber('trophies')) || 0);
 
 		return {
 			downloads: countArray(source.downloadsData, source.downloads ?? localNumber('downloads')),
 			wishlist: countArray(source.wishlistData, source.wishlist ?? localNumber('wishlist')),
 			favorites: countArray(source.favoritesData, source.favorites ?? localNumber('favs')),
-			trophies: window.countUnlockedProfileTrophies(source.trophiesData, source.trophies ?? localNumber('trophies')),
+			trophies: trophyCount,
 			library: countArray(source.libraryData, source.library ?? localNumber('library'))
 		};
-	};
+	}
 
-	window.updateOpenProfileStatCounters = function(username = '', userData = {}) {
+	function setProfileStatElements(stats = {}) {
+		const setText = (id, value) => {
+			const el = document.getElementById(id);
+			if (el) el.innerText = String(Number(value || 0) || 0);
+		};
+		setText('card-downloads', stats.downloads);
+		setText('card-wishlist', stats.wishlist);
+		setText('card-favs', stats.favorites);
+		setText('card-trophies', stats.trophies);
+		setText('card-library', stats.library);
+	}
+
+	function updateOpenProfileStatCounters(username = '', userData = {}) {
 		const profileModal = document.getElementById('modal-sys-profile');
 		const profileOpen = profileModal && (profileModal.style.display === 'flex' || profileModal.style.display === 'block' || profileModal.classList.contains('show'));
 		if (!profileOpen) return false;
@@ -33129,34 +33144,23 @@ function getVisibleChatStackEl(id) {
 		if (!openedUser) return false;
 		if (username && openedUser !== username) return false;
 
-		const stats = window.getOpenProfileStatsForUser(openedUser, userData || {});
-		const setText = (id, value) => {
-			const el = document.getElementById(id);
-			if (el) el.innerText = String(Number(value || 0) || 0);
-		};
-
-		setText('card-downloads', stats.downloads);
-		setText('card-wishlist', stats.wishlist);
-		setText('card-favs', stats.favorites);
-		setText('card-trophies', stats.trophies);
-		setText('card-library', stats.library);
+		setProfileStatElements(getProfileStatsForUser(openedUser, userData || {}));
 		return true;
-	};
+	}
 
-	window.getOpenProfileListDataFromSync = function(username, listType, userData = {}) {
+	function getProfileListDataForUser(username, listType, userData = {}) {
 		const myName = localStorage.getItem('psn_username') || '';
 		const isMe = username === myName;
-		const runtimeLibrary = (typeof lastScannedGames !== 'undefined') ? lastScannedGames : window.lastScannedGames;
 
 		if (listType === 'wishlist') return isMe ? (window.wishlist || []) : (Array.isArray(userData.wishlistData) ? userData.wishlistData : []);
 		if (listType === 'downloads') return isMe ? (window.downloadHistory || []) : (Array.isArray(userData.downloadsData) ? userData.downloadsData : []);
 		if (listType === 'favs') return isMe ? (window.favoritesLibrary || []) : (Array.isArray(userData.favoritesData) ? userData.favoritesData : []);
-		if (listType === 'library') return isMe ? (runtimeLibrary || []) : (Array.isArray(userData.libraryData) ? userData.libraryData : []);
+		if (listType === 'library') return isMe ? getRuntimeLibraryForProfileStats() : (Array.isArray(userData.libraryData) ? userData.libraryData : []);
 		if (listType === 'trophies') return isMe ? (window.userTrophies || {}) : (userData.trophiesData || {});
 		return [];
-	};
+	}
 
-	window.refreshOpenPlayerListFromProfileSync = function(username = '', userData = {}) {
+	function refreshOpenProfileListFromSync(username = '', userData = {}) {
 		const modal = document.getElementById('modal-sys-list');
 		const modalOpen = modal && (modal.style.display === 'flex' || modal.style.display === 'block' || modal.classList.contains('show'));
 		if (!modalOpen) return false;
@@ -33167,17 +33171,16 @@ function getVisibleChatStackEl(id) {
 		if (username && targetUser !== username) return false;
 		if (typeof renderFetchedList !== 'function') return false;
 
-		const nextData = window.getOpenProfileListDataFromSync(targetUser, listType, userData || {});
-		renderFetchedList(targetUser, listType, nextData);
+		renderFetchedList(targetUser, listType, getProfileListDataForUser(targetUser, listType, userData || {}));
 		return true;
-	};
+	}
 
 	window.refreshProfileSyncVisibleUI = function(userData = {}, previousState = {}) {
 		const syncedProfileUser = String((userData && userData.name) || localStorage.getItem('psn_username') || '').trim();
 		if (typeof window.refreshVisibleWishlistCardsFromProfileSync === 'function') window.refreshVisibleWishlistCardsFromProfileSync();
 		if (typeof window.refreshVisibleFavoriteCardsFromProfileSync === 'function') window.refreshVisibleFavoriteCardsFromProfileSync();
-		if (typeof window.updateOpenProfileStatCounters === 'function') window.updateOpenProfileStatCounters(syncedProfileUser, userData);
-		if (typeof window.refreshOpenPlayerListFromProfileSync === 'function') window.refreshOpenPlayerListFromProfileSync(syncedProfileUser, userData);
+		if (typeof updateOpenProfileStatCounters === 'function') updateOpenProfileStatCounters(syncedProfileUser, userData);
+		if (typeof refreshOpenProfileListFromSync === 'function') refreshOpenProfileListFromSync(syncedProfileUser, userData);
 		if (typeof window.applyProfileSyncNotificationDots === 'function') window.applyProfileSyncNotificationDots(previousState, userData);
 	};
 
@@ -33739,9 +33742,9 @@ function getVisibleChatStackEl(id) {
 			});
 			const openedProfileUserForBanner = document.getElementById('modal-sys-profile')?.dataset?.profileUsername || document.getElementById('profile-name-val')?.innerText || '';
 			if (openedProfileUserForBanner && typeof refreshOpenProfileCardStyleForUser === 'function') refreshOpenProfileCardStyleForUser(openedProfileUserForBanner);
-			if (openedProfileUserForBanner && typeof window.updateOpenProfileStatCounters === 'function') {
+			if (openedProfileUserForBanner && typeof updateOpenProfileStatCounters === 'function') {
 				const openedStatsUser = users.find(u => (u.name || u) === openedProfileUserForBanner) || {};
-				window.updateOpenProfileStatCounters(openedProfileUserForBanner, openedStatsUser);
+				updateOpenProfileStatCounters(openedProfileUserForBanner, openedStatsUser);
 			}
 			if (document.getElementById('view-admin')?.style.display === 'block' && typeof renderAdminPanel === 'function') {
 				renderAdminPanel();
@@ -33786,7 +33789,7 @@ function getVisibleChatStackEl(id) {
 				const openedUser = document.getElementById('profile-name-val')?.innerText;
 				const openedUserData = openedUser ? users.find(u => (u.name || u) === openedUser) : null;
 				if (openedUserData) {
-					if (typeof window.updateOpenProfileStatCounters === 'function') window.updateOpenProfileStatCounters(openedUser, openedUserData);
+					if (typeof updateOpenProfileStatCounters === 'function') updateOpenProfileStatCounters(openedUser, openedUserData);
 					const cardAvatar = document.getElementById('card-avatar');
 					const statusText = document.getElementById('card-status-text');
 					const statusIcon = document.getElementById('card-status-icon');
@@ -38120,17 +38123,7 @@ function getVisibleChatStackEl(id) {
 		}
 		document.getElementById('card-level').innerText = playerLevel;
 	
-		const countDownloads = isMe ? (window.downloadHistory?.length || 0) : (networkUser?.downloads || 0);
-		const countWishlist = isMe ? (window.wishlist?.length || 0) : (networkUser?.wishlist || 0);
-		const countFavs = isMe ? (typeof favoritesLibrary !== 'undefined' ? favoritesLibrary.length : 0) : (networkUser?.favorites || 0);
-		const countTrophies = isMe ? Object.keys(window.userTrophies || {}).filter(id => window.userTrophies[id].unlocked).length : (networkUser?.trophies || 0);
-		const countLibrary = isMe ? (typeof lastScannedGames !== 'undefined' ? lastScannedGames.length : 0) : (networkUser?.library || 0);
-	
-		document.getElementById('card-downloads').innerText = countDownloads;
-		document.getElementById('card-wishlist').innerText = countWishlist;
-		document.getElementById('card-favs').innerText = countFavs;
-		if (document.getElementById('card-trophies')) document.getElementById('card-trophies').innerText = countTrophies;
-		if (document.getElementById('card-library')) document.getElementById('card-library').innerText = countLibrary;
+		setProfileStatElements(getProfileStatsForUser(username, networkUser || roleSource));
 	
 		if (profileModal) {
 			profileModal.style.display = 'flex';
@@ -38558,14 +38551,7 @@ function getVisibleChatStackEl(id) {
 		setTimeout(() => modal.classList.add('show'), 10);
 	
 		if (isMe) {
-			let myData = null;
-			if (listType === 'wishlist') myData = window.wishlist || [];
-			if (listType === 'downloads') myData = window.downloadHistory || [];
-			if (listType === 'favs') myData = window.favoritesLibrary || [];
-			if (listType === 'library') myData = typeof lastScannedGames !== 'undefined' ? lastScannedGames : [];
-			if (listType === 'trophies') myData = window.userTrophies || {};
-			
-			renderFetchedList(targetUser, listType, myData);
+			renderFetchedList(targetUser, listType, getProfileListDataForUser(targetUser, listType));
 		} else {
 			const cachedDataStr = localStorage.getItem(`${targetUser}_psn_${listType}_data`);
 			let cachedData = null;
