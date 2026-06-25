@@ -522,6 +522,10 @@ function normalizeTimestampValue(value) {
 const VALID_PROFILE_CARD_STYLES = new Set(["default", "neon", "galaxy", "sunset", "ghost", "royal", "matrix", "lovely", "wave", "scan", "nightgrid", "glass", "nebula", "spotlight"]);
 const PROFILE_CARD_STYLE_UPDATED_AT_KEY = "profileCardStyleUpdatedAt";
 const PROFILE_CARD_STYLE_TIMESTAMP_ALIASES = ["profileCardStyleUpdatedAt", "profileCardEffectUpdatedAt", "profileCardThemeUpdatedAt", "bannerUpdatedAt"];
+const PROFILE_SETTINGS_UPDATED_AT_KEY = "settingsUpdatedAt";
+const PROFILE_SETTINGS_TIMESTAMP_ALIASES = ["settingsUpdatedAt", "settingsSyncedAt", "settingsVersion"];
+const PROFILE_BANNER_SETTING_KEYS = new Set(["profileCardStyle", "profileCardEffect", "profileCardTheme", ...PROFILE_CARD_STYLE_TIMESTAMP_ALIASES]);
+const PROFILE_SETTINGS_META_KEYS = new Set([...PROFILE_SETTINGS_TIMESTAMP_ALIASES, ...PROFILE_CARD_STYLE_TIMESTAMP_ALIASES]);
 
 function normalizeProfileCardStyleServer(value, fallback = "default") {
   const style = normalizeText(value, fallback).toLowerCase();
@@ -566,6 +570,31 @@ function getPublicProfileSettings(user = {}) {
     profileCardEffect: profileCardStyle,
     profileCardStyleUpdatedAt
   };
+}
+
+function getProfileSettingsUpdatedAt(settings = {}, fallback = 0) {
+  if (settings && typeof settings === "object") {
+    for (const key of PROFILE_SETTINGS_TIMESTAMP_ALIASES) {
+      const timestamp = normalizeTimestampValue(settings[key]);
+      if (timestamp) return timestamp;
+    }
+  }
+  return normalizeTimestampValue(fallback);
+}
+
+function hasRealtimeSettingsPayload(settings = {}) {
+  if (!settings || typeof settings !== "object" || Array.isArray(settings)) return false;
+  return Object.keys(settings).some(key => !PROFILE_BANNER_SETTING_KEYS.has(key) && !PROFILE_SETTINGS_META_KEYS.has(key));
+}
+
+function normalizeProfileRealtimeSettings(settings = {}) {
+  const clean = normalizeProfileBannerSettings(settings || {});
+  const updatedAt = getProfileSettingsUpdatedAt(settings || {});
+  if (updatedAt) clean[PROFILE_SETTINGS_UPDATED_AT_KEY] = updatedAt;
+  PROFILE_SETTINGS_TIMESTAMP_ALIASES.forEach(key => {
+    if (key !== PROFILE_SETTINGS_UPDATED_AT_KEY) delete clean[key];
+  });
+  return clean;
 }
 
 function normalizeProfileBannerSettings(settings = {}) {
@@ -629,6 +658,44 @@ function mergeProfileBannerSettingsByTimestamp(currentSettings = {}, incomingSet
 
   delete merged.profileCardTheme;
   return { settingsData: merged, bannerAccepted, bannerRejected };
+}
+
+function mergeProfileSettingsByTimestamp(currentSettings = {}, incomingSettings = {}, options = {}) {
+  const current = normalizeProfileRealtimeSettings(currentSettings || {});
+  const incoming = normalizeProfileRealtimeSettings(incomingSettings || {});
+  const bannerMerge = mergeProfileBannerSettingsByTimestamp(current, incoming, options);
+  const currentSettingsUpdatedAt = getProfileSettingsUpdatedAt(current);
+  const incomingSettingsUpdatedAt = getProfileSettingsUpdatedAt(incoming);
+  const incomingHasSettings = hasRealtimeSettingsPayload(incomingSettings);
+  const acceptIncomingSettings = !!(incomingHasSettings && (
+    (incomingSettingsUpdatedAt && (!currentSettingsUpdatedAt || incomingSettingsUpdatedAt >= currentSettingsUpdatedAt)) ||
+    (!currentSettingsUpdatedAt && !incomingSettingsUpdatedAt)
+  ));
+
+  const merged = { ...current };
+
+  if (acceptIncomingSettings) {
+    Object.keys(incoming).forEach(key => {
+      if (PROFILE_BANNER_SETTING_KEYS.has(key) || PROFILE_SETTINGS_META_KEYS.has(key)) return;
+      merged[key] = incoming[key];
+    });
+    if (incomingSettingsUpdatedAt) merged[PROFILE_SETTINGS_UPDATED_AT_KEY] = incomingSettingsUpdatedAt;
+  } else if (currentSettingsUpdatedAt) {
+    merged[PROFILE_SETTINGS_UPDATED_AT_KEY] = currentSettingsUpdatedAt;
+  }
+
+  ["profileCardStyle", "profileCardEffect", PROFILE_CARD_STYLE_UPDATED_AT_KEY].forEach(key => {
+    if (Object.prototype.hasOwnProperty.call(bannerMerge.settingsData, key)) merged[key] = bannerMerge.settingsData[key];
+  });
+  delete merged.profileCardTheme;
+
+  return {
+    settingsData: merged,
+    bannerAccepted: bannerMerge.bannerAccepted,
+    bannerRejected: bannerMerge.bannerRejected,
+    settingsAccepted: acceptIncomingSettings,
+    settingsRejected: incomingHasSettings && !acceptIncomingSettings
+  };
 }
 
 function emitPublicProfileBannerUpdate(name, user = null) {
@@ -799,7 +866,7 @@ function mergeLocalRecoveryData(dbUser = {}, localData = {}) {
 
   Object.keys(PROFILE_ARRAY_SYNC_KEYS).forEach(key => applyLocalRecoveryArrayPayload(merged, localData, key));
   if (hasObjectPayload(localData.settingsData)) {
-    const mergedSettings = mergeProfileBannerSettingsByTimestamp(merged.settingsData || {}, localData.settingsData, {
+    const mergedSettings = mergeProfileSettingsByTimestamp(merged.settingsData || {}, localData.settingsData, {
       currentFallback: normalizeTimestampValue(merged.profileUpdatedAt),
       incomingFallback: normalizeTimestampValue(localData.profileCardStyleUpdatedAt || localData.profileUpdatedAt)
     });
@@ -1357,7 +1424,7 @@ function buildFullProfileSyncPayload(name, user = {}, sourceSocketId = null) {
       friendsUpdatedAt: normalizeTimestampValue(safe.friendsUpdatedAt),
       countersData: safe.countersData || {},
       themeColor: safe.themeColor || '#0070cc',
-      settingsData: { ...(safe.settingsData || {}), ...getPublicProfileSettings(safe) }
+      settingsData: { ...normalizeProfileRealtimeSettings(safe.settingsData || {}), ...getPublicProfileSettings(safe) }
     }
   };
 }
@@ -1885,7 +1952,7 @@ io.on('connection', async (socket) => {
           lastSeen: Date.now(),
           avatar: safeUserData.avatar || DEFAULT_AVATAR,
           joined: safeUserData.joined || '2026',
-          settingsData: normalizeProfileBannerSettings(safeUserData.settingsData || { audio: "1", ux: "1", chatSound: "1", profileCardStyle: "default", profileCardEffect: "default", ps3Ip: "", companionPlugin: "1", fpsCounterPlugin: "0", consoleFanMode: "dynamic", consoleFanSpeed: "35", consoleFanTarget: "68", performanceMode: "balanced", performanceRsx: "650", performanceVram: "850" }),
+          settingsData: normalizeProfileRealtimeSettings(safeUserData.settingsData || { audio: "1", ux: "1", chatSound: "1", settingsUpdatedAt: Date.now(), profileCardStyle: "default", profileCardEffect: "default", ps3Ip: "", companionPlugin: "1", fpsCounterPlugin: "0", consoleFanMode: "dynamic", consoleFanSpeed: "35", consoleFanTarget: "68", performanceMode: "balanced", performanceRsx: "650", performanceVram: "850" }),
           trophiesData: safeUserData.trophiesData || {},
           wishlistData: safeUserData.wishlistData || [],
           favoritesData: safeUserData.favoritesData || [],
@@ -1944,16 +2011,18 @@ io.on('connection', async (socket) => {
     userData = (userData && typeof userData === "object") ? userData : {};
     const incomingSettingsData = (userData.settingsData && typeof userData.settingsData === "object") ? userData.settingsData : null;
     let shouldBroadcastProfileBanner = false;
+    let shouldForceProfileSyncToSource = false;
     const shouldEmitTrendingUpdate = profileUpdateTouchesTrending(userData || {});
     if (name && userDatabase[name]) {
         
         if (incomingSettingsData) {
-            const mergedSettings = mergeProfileBannerSettingsByTimestamp(userDatabase[name].settingsData || {}, incomingSettingsData, {
+            const mergedSettings = mergeProfileSettingsByTimestamp(userDatabase[name].settingsData || {}, incomingSettingsData, {
                 currentFallback: normalizeTimestampValue(userDatabase[name].profileUpdatedAt),
                 incomingFallback: normalizeTimestampValue(userData.profileCardStyleUpdatedAt || userData.profileUpdatedAt)
             });
             userDatabase[name].settingsData = mergedSettings.settingsData;
             shouldBroadcastProfileBanner = mergedSettings.bannerAccepted === true;
+            shouldForceProfileSyncToSource = mergedSettings.settingsRejected === true || mergedSettings.bannerRejected === true;
             delete userData.settingsData;
         }
 
@@ -2002,8 +2071,8 @@ io.on('connection', async (socket) => {
         if (shouldBroadcastProfileBanner) {
             emitPublicProfileBannerUpdate(name, userDatabase[name]);
         }
-        emitProfileSync(name, socket.id);
-        await notifyProfileSyncAcrossInstances(name, socket.id, userDatabase[name].profileUpdatedAt);
+        emitProfileSync(name, shouldForceProfileSyncToSource ? null : socket.id);
+        await notifyProfileSyncAcrossInstances(name, shouldForceProfileSyncToSource ? null : socket.id, userDatabase[name].profileUpdatedAt);
 
         if (userData.trophiesData) {
             try {
