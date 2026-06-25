@@ -29258,7 +29258,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 		const map = new Map();
 		(window.chatMentionDatabaseUsers || []).forEach(user => {
 			const name = getChatMentionUserName(user);
-			if (name && name !== 'Guest') map.set(name.toLowerCase(), typeof user === 'object' ? user : { name });
+			if (name && name !== 'Guest') map.set(name, typeof user === 'object' ? user : { name });
 		});
 
 		let changed = false;
@@ -29266,7 +29266,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 			const name = getChatMentionUserName(user);
 			if (!name || name === 'Guest') return;
 
-			const key = name.toLowerCase();
+			const key = name;
 			const oldValue = map.get(key) || {};
 			const nextValue = Object.assign({}, oldValue, typeof user === 'object' ? user : { name }, { name });
 
@@ -29331,16 +29331,37 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 		return Array.from(known);
 	}
 
+	function getChatMentionNameMatches(name) {
+		const value = String(name || '').trim();
+		if (!value) return [];
+		const lowerValue = value.toLowerCase();
+		const seen = new Set();
+		return getKnownChatMentionNames().filter(existing => {
+			const normalized = String(existing || '').trim();
+			if (!normalized || normalized.toLowerCase() !== lowerValue || seen.has(normalized)) return false;
+			seen.add(normalized);
+			return true;
+		});
+	}
+
+	function chatMentionHasCaseConflict(name) {
+		return getChatMentionNameMatches(name).length > 1;
+	}
+
 	function isKnownChatMentionName(name) {
-		const value = String(name || '').trim().toLowerCase();
-		if (!value || value === 'everyone' || value === 'guest') return false;
-		return getKnownChatMentionNames().some(existing => String(existing || '').trim().toLowerCase() === value);
+		const value = String(name || '').trim();
+		if (!value || value.toLowerCase() === 'everyone' || value.toLowerCase() === 'guest') return false;
+		return getChatMentionNameMatches(value).length > 0;
 	}
 
 	function getCanonicalChatMentionName(name) {
-		const value = String(name || '').trim().toLowerCase();
-		const found = getKnownChatMentionNames().find(existing => String(existing || '').trim().toLowerCase() === value);
-		return found || name;
+		const value = String(name || '').trim();
+		if (!value) return name;
+		const matches = getChatMentionNameMatches(value);
+		const exactMatch = matches.find(existing => String(existing || '').trim() === value);
+		if (exactMatch) return exactMatch;
+		if (matches.length === 1) return matches[0];
+		return name;
 	}
 
 	function requestChatMentionDatabaseUsersFromText(text) {
@@ -29357,7 +29378,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 			if (!msg) return;
 
 			extractChatMentionNamesFromText(msg.text || '').forEach(name => {
-				const key = String(name || '').toLowerCase();
+				const key = String(name || '').trim();
 				if (!key || requested.has(key) || isKnownChatMentionName(name)) return;
 
 				requested.add(key);
@@ -29394,7 +29415,8 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 		const user = String(username || '').trim();
 		if (!user) return false;
 		const escapedUser = user.replace(/[-\/\\^$*+?.()|[\]{}]/g, '\\$&');
-		const mentionRegex = new RegExp('(^|[^A-Za-z0-9_.-])@' + escapedUser + '(?=$|[^A-Za-z0-9_.-])', 'i');
+		const flags = (typeof chatMentionHasCaseConflict === 'function' && chatMentionHasCaseConflict(user)) ? '' : 'i';
+		const mentionRegex = new RegExp('(^|[^A-Za-z0-9_.-])@' + escapedUser + '(?=$|[^A-Za-z0-9_.-])', flags);
 		return mentionRegex.test(String(text || ''));
 	}
 
@@ -29506,6 +29528,7 @@ function getVisibleChatStackEl(id) {
 		const allNamesFromList = safeOnlineList.map(u => u && u.name ? u.name : u);
 		const allPossibleUsers = Array.from(new Set([...allNamesFromList, ...safeChatUsers]));
 	
+		const onlineExact = new Set(onlineNames.map(u => String(u)));
 		const onlineLower = onlineNames.map(u => String(u).toLowerCase());
 	
 		const onlineFiltered = [];
@@ -29515,8 +29538,10 @@ function getVisibleChatStackEl(id) {
 			if (!u) return;
 			const strU = String(u);
 			
-			if (strU.toLowerCase().includes(String(query).toLowerCase()) && strU.toLowerCase() !== myName.toLowerCase()) {
-				if (onlineLower.includes(strU.toLowerCase())) {
+			if (strU.toLowerCase().includes(String(query).toLowerCase()) && strU !== myName) {
+				const isOnlineExact = onlineExact.has(strU);
+				const isOnlineSafeFallback = !chatMentionHasCaseConflict(strU) && onlineLower.includes(strU.toLowerCase());
+				if (isOnlineExact || isOnlineSafeFallback) {
 					onlineFiltered.push(strU);
 				} else {
 					offlineFiltered.push(strU);
