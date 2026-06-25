@@ -508,6 +508,7 @@ function preferLocalObjectPayload(currentValue, localValue) {
 }
 
 const PROFILE_ARRAY_SYNC_KEYS = {
+  downloadsData: { versionKey: 'downloadsUpdatedAt', countKey: 'downloads' },
   wishlistData: { versionKey: 'wishlistUpdatedAt', countKey: 'wishlist' },
   favoritesData: { versionKey: 'favoritesUpdatedAt', countKey: 'favorites' },
   libraryData: { versionKey: 'libraryUpdatedAt', countKey: 'library' },
@@ -818,34 +819,24 @@ function reconcileIncomingDownloads(currentUser = {}, incomingUser = {}) {
   const incomingClearAt = normalizeTimestampValue(incomingUser.downloadsClearedAt);
   const hasIncomingDownloadsData = Object.prototype.hasOwnProperty.call(incomingUser, 'downloadsData');
   const hasIncomingDownloadsCount = Object.prototype.hasOwnProperty.call(incomingUser, 'downloads');
-  const incomingDownloads = Array.isArray(incomingUser.downloadsData) ? incomingUser.downloadsData : [];
-  const hasPostClearDownloads = hasIncomingDownloadsData && incomingDownloads.length > 0;
 
-  if (incomingClearAt > currentClearAt) {
-    if (hasPostClearDownloads) {
-      // A client can keep the local clear marker after clearing because the source socket is not echoed.
-      // If it later sends a non-empty history with that marker, it is the new post-clear history, not another clear command.
-      incomingUser.downloadsClearedAt = incomingClearAt;
-      incomingUser.downloadsData = incomingDownloads;
-      incomingUser.downloads = incomingDownloads.length;
-      return incomingUser;
-    }
-    applyDownloadsClearedState(currentUser, incomingClearAt);
+  if (hasIncomingDownloadsData && Array.isArray(incomingUser.downloadsData)) {
+    incomingUser.downloads = incomingUser.downloadsData.length;
+    incomingUser.downloadsUpdatedAt = normalizeTimestampValue(incomingUser.downloadsUpdatedAt || incomingUser.profileUpdatedAt) || Date.now();
+    if (incomingClearAt || currentClearAt) incomingUser.downloadsClearedAt = Math.max(incomingClearAt, currentClearAt);
+    return incomingUser;
+  }
+
+  if (incomingClearAt > currentClearAt && !hasIncomingDownloadsData) {
     incomingUser.downloadsClearedAt = incomingClearAt;
+    incomingUser.downloadsUpdatedAt = normalizeTimestampValue(incomingUser.downloadsUpdatedAt) || incomingClearAt;
     incomingUser.downloadsData = [];
     incomingUser.downloads = 0;
     return incomingUser;
   }
 
-  if (currentClearAt > incomingClearAt && (hasIncomingDownloadsData || hasIncomingDownloadsCount)) {
-    delete incomingUser.downloadsData;
-    delete incomingUser.downloads;
+  if (currentClearAt > incomingClearAt && (hasIncomingDownloadsCount || Object.prototype.hasOwnProperty.call(incomingUser, 'downloadsUpdatedAt'))) {
     incomingUser.downloadsClearedAt = currentClearAt;
-    return incomingUser;
-  }
-
-  if (incomingClearAt === currentClearAt && hasIncomingDownloadsData && Array.isArray(incomingUser.downloadsData)) {
-    incomingUser.downloads = incomingUser.downloadsData.length;
   }
 
   return incomingUser;
@@ -865,22 +856,17 @@ function mergeLocalRecoveryData(dbUser = {}, localData = {}) {
     if (preferred !== merged[key]) merged[key] = preferred;
   });
 
-  if (localDownloadsClearedAt > dbDownloadsClearedAt) {
-    if (Array.isArray(localData.downloadsData) && localData.downloadsData.length > 0) {
-      merged.downloadsClearedAt = localDownloadsClearedAt;
-      merged.downloadsData = localData.downloadsData;
-      merged.downloads = localData.downloadsData.length;
-    } else {
-      applyDownloadsClearedState(merged, localDownloadsClearedAt);
-    }
-  } else if (localDownloadsClearedAt === dbDownloadsClearedAt) {
-    const preferredDownloads = preferLocalArrayPayload(merged.downloadsData, localData.downloadsData);
-    if (preferredDownloads !== merged.downloadsData) merged.downloadsData = preferredDownloads;
-  } else if (dbDownloadsClearedAt > localDownloadsClearedAt) {
-    merged.downloadsClearedAt = dbDownloadsClearedAt;
-  }
+  merged.downloadsClearedAt = Math.max(dbDownloadsClearedAt, localDownloadsClearedAt) || 0;
 
   Object.keys(PROFILE_ARRAY_SYNC_KEYS).forEach(key => applyLocalRecoveryArrayPayload(merged, localData, key));
+
+  if (localDownloadsClearedAt > dbDownloadsClearedAt) {
+    const localDownloadsUpdatedAt = normalizeTimestampValue(localData.downloadsUpdatedAt || localData.profileUpdatedAt);
+    if (!Array.isArray(localData.downloadsData) || localData.downloadsData.length === 0 || !localDownloadsUpdatedAt || localDownloadsClearedAt >= localDownloadsUpdatedAt) {
+      applyDownloadsClearedState(merged, localDownloadsClearedAt);
+      merged.downloadsUpdatedAt = Math.max(normalizeTimestampValue(merged.downloadsUpdatedAt), localDownloadsClearedAt);
+    }
+  }
   if (hasObjectPayload(localData.settingsData)) {
     const mergedSettings = mergeProfileSettingsByTimestamp(merged.settingsData || {}, localData.settingsData, {
       currentFallback: normalizeTimestampValue(merged.profileUpdatedAt),
@@ -1179,6 +1165,7 @@ function profileUpdateTouchesTrending(userData = {}) {
     Object.prototype.hasOwnProperty.call(userData, 'downloadsData') ||
     Object.prototype.hasOwnProperty.call(userData, 'downloads') ||
     Object.prototype.hasOwnProperty.call(userData, 'downloadsClearedAt') ||
+    Object.prototype.hasOwnProperty.call(userData, 'downloadsUpdatedAt') ||
     Object.prototype.hasOwnProperty.call(userData, 'wishlistData') ||
     Object.prototype.hasOwnProperty.call(userData, 'wishlist') ||
     Object.prototype.hasOwnProperty.call(userData, 'wishlistUpdatedAt')
@@ -1430,6 +1417,7 @@ function buildFullProfileSyncPayload(name, user = {}, sourceSocketId = null) {
       trophiesData: safe.trophiesData || {},
       downloadsData: Array.isArray(safe.downloadsData) ? safe.downloadsData : [],
       downloadsClearedAt: normalizeTimestampValue(safe.downloadsClearedAt),
+      downloadsUpdatedAt: normalizeTimestampValue(safe.downloadsUpdatedAt),
       wishlistData: Array.isArray(safe.wishlistData) ? safe.wishlistData : [],
       wishlistUpdatedAt: normalizeTimestampValue(safe.wishlistUpdatedAt),
       favoritesData: Array.isArray(safe.favoritesData) ? safe.favoritesData : [],
@@ -1996,6 +1984,7 @@ io.on('connection', async (socket) => {
           favoritesData: safeUserData.favoritesData || [],
           downloadsData: Array.isArray(safeUserData.downloadsData) ? safeUserData.downloadsData : [],
           downloadsClearedAt: normalizeTimestampValue(safeUserData.downloadsClearedAt),
+          downloadsUpdatedAt: normalizeTimestampValue(safeUserData.downloadsUpdatedAt),
           libraryData: safeUserData.libraryData || [],
           friendsData: safeUserData.friendsData || [],
           countersData: safeUserData.countersData || {},

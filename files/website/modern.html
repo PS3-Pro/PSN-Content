@@ -9849,6 +9849,7 @@ P
     const GLOBAL_USERS_KEY = 'psn_global_users';
 	const STORAGE_KEY_FRIENDS = "psn_friends_list";
 	const PROFILE_LIST_SYNC_TIMESTAMP_KEYS = {
+		downloads: "psn_downloads_updated_at",
 		wishlist: "psn_wishlist_updated_at",
 		favorites: "psn_favorites_updated_at",
 		library: "psn_library_updated_at",
@@ -10537,12 +10538,16 @@ P
 	}
 
 	function shouldRejectStaleIncomingDownloadHistory(username, userData = {}, payload = {}) {
+		if (!Array.isArray(userData.downloadsData)) return false;
+		const localDownloadsUpdatedAt = getProfileListUpdatedAtForAuth(username, 'downloads');
+		const incomingDownloadsUpdatedAt = normalizeProfileListTimestamp(userData.downloadsUpdatedAt || payload.downloadsUpdatedAt || userData.profileUpdatedAt || payload.profileUpdatedAt || 0);
+		if (localDownloadsUpdatedAt && incomingDownloadsUpdatedAt && incomingDownloadsUpdatedAt < localDownloadsUpdatedAt) return true;
+
 		const clearAt = getDownloadHistoryClearPendingAt(username);
-		if (!clearAt || !Array.isArray(userData.downloadsData) || userData.downloadsData.length === 0) return false;
-		const incomingProfileUpdatedAt = Number(userData.profileUpdatedAt || payload.profileUpdatedAt || 0);
-		const incomingDownloadsClearedAt = Number(userData.downloadsClearedAt || payload.downloadsClearedAt || 0);
+		if (!clearAt || userData.downloadsData.length === 0) return false;
+		const incomingDownloadsClearedAt = normalizeProfileListTimestamp(userData.downloadsClearedAt || payload.downloadsClearedAt || 0);
 		if (incomingDownloadsClearedAt && incomingDownloadsClearedAt >= clearAt) return false;
-		if (incomingProfileUpdatedAt && incomingProfileUpdatedAt > clearAt) return false;
+		if (incomingDownloadsUpdatedAt && incomingDownloadsUpdatedAt > clearAt) return false;
 		return true;
 	}
 
@@ -10554,10 +10559,16 @@ P
 			localStorage.setItem(`${username}_${COOKIE_NAME_HISTORY}`, JSON.stringify(localDownloads));
 			return true;
 		}
-		if (localStorage.getItem('psn_username') === username) window.downloadHistory = userData.downloadsData;
-		localStorage.setItem(`${username}_${COOKIE_NAME_HISTORY}`, JSON.stringify(userData.downloadsData));
-		const incomingDownloadsClearedAt = Number(userData.downloadsClearedAt || payload.downloadsClearedAt || 0);
-		if (userData.downloadsData.length === 0 || incomingDownloadsClearedAt >= getDownloadHistoryClearPendingAt(username)) clearDownloadHistoryPendingFlag(username);
+
+		const incomingDownloads = userData.downloadsData;
+		const incomingDownloadsUpdatedAt = normalizeProfileListTimestamp(userData.downloadsUpdatedAt || payload.downloadsUpdatedAt || userData.profileUpdatedAt || payload.profileUpdatedAt || Date.now());
+		if (localStorage.getItem('psn_username') === username) window.downloadHistory = incomingDownloads;
+		localStorage.setItem(`${username}_${COOKIE_NAME_HISTORY}`, JSON.stringify(incomingDownloads));
+		applyProfileListUpdatedAtFromServer(username, 'downloads', incomingDownloadsUpdatedAt);
+
+		const incomingDownloadsClearedAt = normalizeProfileListTimestamp(userData.downloadsClearedAt || payload.downloadsClearedAt || 0);
+		const pendingClearAt = getDownloadHistoryClearPendingAt(username);
+		if (pendingClearAt && (incomingDownloads.length === 0 || incomingDownloadsUpdatedAt > pendingClearAt || incomingDownloadsClearedAt >= pendingClearAt)) clearDownloadHistoryPendingFlag(username);
 		return true;
 	}
 
@@ -10610,6 +10621,7 @@ P
 			trophiesData,
 			downloadsData,
 			downloadsClearedAt: getDownloadHistoryClearPendingAt(username) || 0,
+			downloadsUpdatedAt: getProfileListUpdatedAtForAuth(username, 'downloads'),
 			wishlistData,
 			wishlistUpdatedAt: getProfileListUpdatedAtForAuth(username, 'wishlist'),
 			favoritesData,
@@ -16848,6 +16860,7 @@ P
         //if (downloadHistory.length > 20) downloadHistory.pop();
         
         saveState(COOKIE_NAME_HISTORY, JSON.stringify(downloadHistory));
+        markProfileListChanged('downloads');
     
         const dot = document.getElementById('dl-dot');
         const viewDl = document.getElementById('view-downloads');
@@ -16915,7 +16928,8 @@ P
             window.downloadHistory = [];
             saveState(COOKIE_NAME_HISTORY, JSON.stringify([]));
             saveState('psn_dl_dot', 'false');
-            markDownloadHistoryClearPending();
+            const clearStamp = markDownloadHistoryClearPending();
+            markProfileListChanged('downloads', clearStamp);
             updateDownloadUI();
             if (typeof playUiRemove === "function") playUiRemove();
 			window.broadcastProfileUpdate();
@@ -34656,6 +34670,7 @@ function getVisibleChatStackEl(id) {
 			trophiesData: window.userTrophies || {},
 			downloadsData: window.downloadHistory || [],
 			downloadsClearedAt: Number(loadState(STORAGE_KEY_DOWNLOAD_CLEAR_PENDING) || 0) || 0,
+			downloadsUpdatedAt: normalizeProfileListTimestamp(loadState(getProfileListTimestampStorageKey('downloads'))),
 			wishlistData: window.wishlist || [],
 			wishlistUpdatedAt: normalizeProfileListTimestamp(loadState(getProfileListTimestampStorageKey('wishlist'))),
 			favoritesData: window.favoritesLibrary || [],
