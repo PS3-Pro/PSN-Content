@@ -10475,14 +10475,81 @@ P
 	}
 
 
+	const PSN_LEGACY_USERNAME_TRIGGER = 'allow_space';
+	let psnLegacyUsernameUnlock = false;
+
+	function getPsnOnlineIdDefaultMaxLength() {
+		return Math.max(16, PSN_LEGACY_USERNAME_TRIGGER.length);
+	}
+
+	function cleanPsnOnlineIdAllowedChars(value) {
+		return String(value || '').replace(/[^A-Za-z0-9_-]/g, '');
+	}
+
+	function enablePsnLegacyUsernameMode(input) {
+		psnLegacyUsernameUnlock = true;
+		if (!input) input = document.getElementById('new-psn-id');
+		if (input) {
+			input.value = '';
+			input.maxLength = 32;
+			input.removeAttribute('pattern');
+			input.placeholder = 'Legacy PSN™ ID enabled';
+			input.title = 'Legacy login enabled. Spaces are allowed only for existing old accounts.';
+			input.classList.remove('psn-id-invalid');
+		}
+		if (typeof playUiSuccess === 'function') playUiSuccess();
+	}
+
+	function resetPsnLegacyUsernameMode(input) {
+		psnLegacyUsernameUnlock = false;
+		if (!input) input = document.getElementById('new-psn-id');
+		if (input) {
+			input.maxLength = getPsnOnlineIdDefaultMaxLength();
+			input.setAttribute('pattern', '[A-Za-z][A-Za-z0-9_-]{2,15}');
+			input.placeholder = 'Enter your PSN™ ID';
+			input.title = '3-16 characters. Start with a letter. Use letters, numbers, hyphens, and underscores only.';
+			input.classList.remove('psn-id-invalid');
+		}
+	}
+
+	function isPsnLegacyTriggerInProgress(value) {
+		const clean = cleanPsnOnlineIdAllowedChars(value).toLowerCase();
+		return clean.length > 16 && PSN_LEGACY_USERNAME_TRIGGER.indexOf(clean) === 0;
+	}
+
 	function sanitizePsnOnlineIdInput(value) {
-		return String(value || '').replace(/[^A-Za-z0-9_-]/g, '').slice(0, 16);
+		value = String(value || '');
+
+		if (psnLegacyUsernameUnlock) {
+			return value.replace(/[<>]/g, '').slice(0, 32);
+		}
+
+		const clean = cleanPsnOnlineIdAllowedChars(value);
+		const cleanLower = clean.toLowerCase();
+
+		if (cleanLower === PSN_LEGACY_USERNAME_TRIGGER) {
+			enablePsnLegacyUsernameMode(document.getElementById('new-psn-id'));
+			return '';
+		}
+
+		if (clean.length > 16 && PSN_LEGACY_USERNAME_TRIGGER.indexOf(cleanLower) === 0) {
+			return clean.slice(0, PSN_LEGACY_USERNAME_TRIGGER.length);
+		}
+
+		return clean.slice(0, 16);
 	}
 
 	function getPsnOnlineIdValidationError(name, password = '') {
 		name = String(name || '').trim();
 		password = String(password || '').trim();
 		if (!name) return 'Enter your PSN™ ID.';
+		if (!psnLegacyUsernameUnlock && isPsnLegacyTriggerInProgress(name)) return '';
+		if (psnLegacyUsernameUnlock) {
+			if (name.length < 3 || name.length > 32) return 'Legacy Online ID must be 3 to 32 characters.';
+			if (/[<>]/.test(name)) return 'Invalid legacy Online ID.';
+			if (password && name.toLowerCase() === password.toLowerCase()) return 'Online ID cannot be the same as your password.';
+			return '';
+		}
 		if (name.length < 3 || name.length > 16) return 'Online ID must be 3 to 16 characters.';
 		if (!/^[A-Za-z]/.test(name)) return 'Online ID must start with a letter.';
 		if (!/^[A-Za-z][A-Za-z0-9_-]{2,15}$/.test(name)) return 'Use only letters, numbers, hyphens (-), and underscores (_). No spaces, accents, or symbols.';
@@ -10493,7 +10560,11 @@ P
 	function setPsnOnlineIdInputState(input, message = '') {
 		if (!input) return;
 		input.classList.toggle('psn-id-invalid', !!message);
-		input.title = message || '3-16 characters. Start with a letter. Use letters, numbers, hyphens, and underscores only.';
+		if (psnLegacyUsernameUnlock && !message) {
+			input.title = 'Legacy login enabled. Spaces are allowed only for existing old accounts.';
+		} else {
+			input.title = message || '3-16 characters. Start with a letter. Use letters, numbers, hyphens, and underscores only.';
+		}
 	}
 
 	function wirePsnOnlineIdInput() {
@@ -10614,6 +10685,7 @@ P
         const inputId = document.getElementById('new-psn-id');
         const inputPass = document.getElementById('new-psn-pass');
         wirePsnOnlineIdInput();
+        resetPsnLegacyUsernameMode(inputId);
         
         inputId.value = '';
         inputPass.value = '';
@@ -10644,6 +10716,7 @@ P
 
 	function closeNewUserModal() {
 		playUiBack();
+		resetPsnLegacyUsernameMode(document.getElementById('new-psn-id'));
 		const nameOverlay = document.getElementById('name-input-overlay');
 		hidePs5AuthOverlay(nameOverlay, function() {
 			setUserSelectAuthHidden(false);
@@ -10705,7 +10778,8 @@ P
 				socketChat.emit('authenticate_user', {
 				name: name,
 				password: pass,
-				isNewAccount: true,
+				isNewAccount: !psnLegacyUsernameUnlock,
+				legacyUsernameLogin: psnLegacyUsernameUnlock,
 				adminMaintenanceBypass: document.body.classList.contains('admin-maintenance-login-bypass'),
 				userData: {
 					avatar: selectedAvatarUrl,
