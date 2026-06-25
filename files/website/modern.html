@@ -33061,6 +33061,29 @@ function getVisibleChatStackEl(id) {
 		}
 	};
 
+	window.refreshGameModalWishlistButtonFromProfileSync = function() {
+		try {
+			const modal = document.getElementById('game-modal');
+			const btn = document.getElementById('modal-title-wish-btn');
+			if (!modal || !btn) return;
+			const isOpen = modal.style.display === 'flex' || modal.style.display === 'block' || modal.classList.contains('show');
+			if (!isOpen) return;
+			const titleId = String(modal.dataset.titleId || '').trim();
+			const contentId = String(modal.dataset.contentId || btn.getAttribute('data-content-id') || '').trim();
+			if (!titleId && !contentId) return;
+			const wishlistKeys = window.makeProfileSyncKeySet(window.wishlist || [], 'wishlist', true);
+			const isWished = (!!contentId && wishlistKeys.has(contentId)) || (!!titleId && wishlistKeys.has(titleId));
+			const icon = btn.querySelector('i');
+			btn.title = isWished ? 'Remove from Wishlist' : 'Add to Wishlist';
+			if (icon) {
+				icon.className = isWished ? 'fas fa-heart' : 'far fa-heart';
+				icon.style.color = isWished ? '#ff4444' : 'rgba(255,255,255,0.6)';
+			}
+		} catch (err) {
+			console.warn('[PROFILE SYNC] Could not refresh game modal wishlist button:', err);
+		}
+	};
+
 	window.refreshVisibleFavoriteCardsFromProfileSync = function() {
 		try {
 			const favoriteKeys = window.makeProfileSyncKeySet(window.favoritesLibrary || [], 'favorites', true);
@@ -33084,55 +33107,9 @@ function getVisibleChatStackEl(id) {
 		}
 	};
 
-
-	function updateOpenProfileCountersFromRealtimeSync(username = '', userData = {}) {
-		try {
-			const profileModal = document.getElementById('modal-sys-profile');
-			const isOpen = profileModal && (profileModal.style.display === 'flex' || profileModal.style.display === 'block' || profileModal.classList.contains('show'));
-			if (!isOpen) return false;
-
-			const openedUser = profileModal.dataset.profileUsername || document.getElementById('profile-name-val')?.innerText || '';
-			if (!openedUser) return false;
-			if (username && openedUser !== username) return false;
-
-			const myName = localStorage.getItem('psn_username') || '';
-			const isMe = openedUser === myName;
-			const source = (userData && typeof userData === 'object') ? userData : {};
-			const getLocalCount = (key) => Number(localStorage.getItem(`${openedUser}_psn_${key}`) || 0) || 0;
-			const countArray = (value, fallback = 0) => Array.isArray(value) ? value.length : (Number(fallback || 0) || 0);
-			const currentLibrary = (typeof lastScannedGames !== 'undefined' && Array.isArray(lastScannedGames)) ? lastScannedGames : (Array.isArray(window.lastScannedGames) ? window.lastScannedGames : []);
-			const currentFavorites = (typeof favoritesLibrary !== 'undefined' && Array.isArray(favoritesLibrary)) ? favoritesLibrary : (Array.isArray(window.favoritesLibrary) ? window.favoritesLibrary : []);
-			const trophySource = isMe ? (window.userTrophies || {}) : (source.trophiesData || {});
-			const trophyCount = (trophySource && typeof trophySource === 'object' && !Array.isArray(trophySource) && typeof calculateLocalTrophyPayloadForAuth === 'function')
-				? calculateLocalTrophyPayloadForAuth(trophySource).totalTrophies
-				: (Number(source.trophies ?? getLocalCount('trophies')) || 0);
-
-			const stats = {
-				downloads: isMe ? countArray(window.downloadHistory || []) : countArray(source.downloadsData, source.downloads ?? getLocalCount('downloads')),
-				wishlist: isMe ? countArray(window.wishlist || []) : countArray(source.wishlistData, source.wishlist ?? getLocalCount('wishlist')),
-				favorites: isMe ? countArray(currentFavorites) : countArray(source.favoritesData, source.favorites ?? getLocalCount('favs')),
-				trophies: trophyCount,
-				library: isMe ? countArray(currentLibrary) : countArray(source.libraryData, source.library ?? getLocalCount('library'))
-			};
-
-			const setText = (id, value) => {
-				const el = document.getElementById(id);
-				if (el) el.innerText = String(Number(value || 0) || 0);
-			};
-			setText('card-downloads', stats.downloads);
-			setText('card-wishlist', stats.wishlist);
-			setText('card-favs', stats.favorites);
-			setText('card-trophies', stats.trophies);
-			setText('card-library', stats.library);
-			return true;
-		} catch (err) {
-			console.warn('[PROFILE SYNC] Could not update open profile counters:', err);
-			return false;
-		}
-	}
-
 	window.refreshProfileSyncVisibleUI = function(userData = {}, previousState = {}) {
 		if (typeof window.refreshVisibleWishlistCardsFromProfileSync === 'function') window.refreshVisibleWishlistCardsFromProfileSync();
+		if (typeof window.refreshGameModalWishlistButtonFromProfileSync === 'function') window.refreshGameModalWishlistButtonFromProfileSync();
 		if (typeof window.refreshVisibleFavoriteCardsFromProfileSync === 'function') window.refreshVisibleFavoriteCardsFromProfileSync();
 		if (typeof window.applyProfileSyncNotificationDots === 'function') window.applyProfileSyncNotificationDots(previousState, userData);
 	};
@@ -33174,29 +33151,6 @@ function getVisibleChatStackEl(id) {
 		}
 	};
 
-	window.areProfileSyncValuesEqual = function(a, b) {
-		return window.getProfileSyncComparableSignature(a) === window.getProfileSyncComparableSignature(b);
-	};
-
-	window.getProfileSyncChanges = function(previousState = {}, userData = {}, username = '', payload = {}) {
-		const rejectDownloads = Array.isArray(userData.downloadsData)
-			&& typeof shouldRejectStaleIncomingDownloadHistory === 'function'
-			&& shouldRejectStaleIncomingDownloadHistory(username, userData, payload);
-
-		return {
-			trophies: !!(userData.trophiesData && typeof userData.trophiesData === 'object' && !Array.isArray(userData.trophiesData) && !window.areProfileSyncValuesEqual(previousState.trophies || {}, userData.trophiesData || {})),
-			wishlist: !!(Array.isArray(userData.wishlistData) && !window.areProfileSyncValuesEqual(previousState.wishlist || [], userData.wishlistData || [])),
-			downloads: !!(Array.isArray(userData.downloadsData) && !rejectDownloads && !window.areProfileSyncValuesEqual(previousState.downloads || [], userData.downloadsData || [])),
-			favorites: !!(Array.isArray(userData.favoritesData) && !window.areProfileSyncValuesEqual(previousState.favorites || [], userData.favoritesData || [])),
-			library: !!(Array.isArray(userData.libraryData) && !window.areProfileSyncValuesEqual(previousState.library || [], userData.libraryData || [])),
-			friends: !!(Array.isArray(userData.friendsData) && !window.areProfileSyncValuesEqual(previousState.friends || [], userData.friendsData || []))
-		};
-	};
-
-	window.hasProfileSyncListChanges = function(changes = {}) {
-		return !!(changes.trophies || changes.wishlist || changes.downloads || changes.favorites || changes.library || changes.friends);
-	};
-
 
 	window.applyRemoteProfileSync = function(payload = {}) {
 		const name = String(payload.name || payload.targetName || '').trim();
@@ -33220,8 +33174,6 @@ function getVisibleChatStackEl(id) {
 			friends: Array.isArray(window.friendsList) ? window.friendsList.slice() : []
 		};
 
-		const profileSyncChanges = (typeof window.getProfileSyncChanges === 'function') ? window.getProfileSyncChanges(previousProfileSyncState, userData, name, payload) : {};
-		const hasProfileDataChanges = (typeof window.hasProfileSyncListChanges === 'function') ? window.hasProfileSyncListChanges(profileSyncChanges) : true;
 
 		window.__applyingRemoteProfileSync = true;
 		try {
@@ -33278,7 +33230,7 @@ function getVisibleChatStackEl(id) {
 			}
 
 
-			if (hasProfileDataChanges && typeof window.refreshProfileSyncVisibleUI === 'function') window.refreshProfileSyncVisibleUI(userData, previousProfileSyncState);
+			if (typeof window.refreshProfileSyncVisibleUI === 'function') window.refreshProfileSyncVisibleUI(userData, previousProfileSyncState);
 
 			const incomingRole = String(userData.role || (userData.isAdmin ? 'admin' : '')).toLowerCase();
 			if (incomingRole && incomingRole !== 'user') localStorage.setItem(`${name}_psn_role`, incomingRole === 'moderator' ? 'mod' : incomingRole);
@@ -33286,20 +33238,36 @@ function getVisibleChatStackEl(id) {
 			document.body.classList.toggle('is-admin', userData.isAdmin === true || incomingRole === 'admin');
 			document.body.classList.toggle('is-mod', userData.isModerator === true || incomingRole === 'mod' || incomingRole === 'moderator');
 
-			if (profileSyncChanges.library && typeof updateConsoleLibraryStatusUI === 'function') updateConsoleLibraryStatusUI(window.lastScannedGames || []);
-			if (profileSyncChanges.trophies && typeof renderTrophiesView === 'function') renderTrophiesView(true);
-			if (profileSyncChanges.wishlist && typeof updateWishlistUI === 'function') updateWishlistUI(true);
-			if (profileSyncChanges.downloads && typeof updateDownloadUI === 'function') updateDownloadUI();
-			if (profileSyncChanges.favorites && typeof updateFavoritesLibraryUI === 'function') updateFavoritesLibraryUI(true);
-			if (profileSyncChanges.friends && typeof renderFriendsList === 'function') renderFriendsList(document.getElementById('search-input')?.value || '', true);
+			if (typeof updateConsoleLibraryStatusUI === 'function') updateConsoleLibraryStatusUI(window.lastScannedGames || []);
+			if (typeof renderTrophiesView === 'function') renderTrophiesView(true);
+			if (typeof updateWishlistUI === 'function') updateWishlistUI(true);
+			if (typeof updateDownloadUI === 'function') updateDownloadUI();
+			if (typeof updateFavoritesLibraryUI === 'function') updateFavoritesLibraryUI(true);
+			if (typeof renderFriendsList === 'function') renderFriendsList(document.getElementById('search-input')?.value || '', true);
 			if (typeof updateAdminVisibility === 'function') updateAdminVisibility();
 			if (typeof window.refreshCategoryDot === 'function') {
-				if (profileSyncChanges.wishlist) window.refreshCategoryDot('wishlist');
-				if (profileSyncChanges.favorites) window.refreshCategoryDot('favorites');
+				window.refreshCategoryDot('wishlist');
+				window.refreshCategoryDot('favorites');
 			}
-			if (profileSyncChanges.wishlist && typeof window.refreshVisibleWishlistCardsFromProfileSync === 'function') window.refreshVisibleWishlistCardsFromProfileSync();
-			if (profileSyncChanges.favorites && typeof window.refreshVisibleFavoriteCardsFromProfileSync === 'function') window.refreshVisibleFavoriteCardsFromProfileSync();
-			updateOpenProfileCountersFromRealtimeSync(name, userData);
+			if (typeof window.refreshVisibleWishlistCardsFromProfileSync === 'function') window.refreshVisibleWishlistCardsFromProfileSync();
+			if (typeof window.refreshVisibleFavoriteCardsFromProfileSync === 'function') window.refreshVisibleFavoriteCardsFromProfileSync();
+
+			const profileModal = document.getElementById('modal-sys-profile');
+			if (profileModal && profileModal.dataset.profileUsername === name && (profileModal.style.display === 'flex' || profileModal.style.display === 'block' || profileModal.classList.contains('show')) && typeof openProfileModal === 'function') {
+				openProfileModal(encodeURIComponent(name));
+			}
+
+			const listModal = document.getElementById('modal-sys-list');
+			if (listModal && listModal.dataset.profileTarget === name && (listModal.style.display === 'flex' || listModal.style.display === 'block' || listModal.classList.contains('show')) && typeof renderFetchedList === 'function') {
+				const listType = listModal.dataset.profileListType || '';
+				let rawData = null;
+				if (listType === 'wishlist') rawData = window.wishlist || [];
+				else if (listType === 'downloads') rawData = window.downloadHistory || [];
+				else if (listType === 'favs' || listType === 'favorites') rawData = window.favoritesLibrary || [];
+				else if (listType === 'library') rawData = (typeof lastScannedGames !== 'undefined') ? lastScannedGames : (window.lastScannedGames || []);
+				else if (listType === 'trophies') rawData = window.userTrophies || {};
+				if (rawData !== null) renderFetchedList(name, listType, rawData);
+			}
 		} catch (err) {
 			console.warn('[PROFILE SYNC] Could not apply remote profile data:', err);
 		} finally {
@@ -33712,7 +33680,7 @@ function getVisibleChatStackEl(id) {
 						localStorage.setItem(`${prefix}avatar`, u.avatar);
 						localStorage.setItem(`${prefix}level`, u.level);
 						localStorage.setItem(`${prefix}joined`, u.joined || "2026");
-						if (incomingProfileUpdatedAt && incomingProfileUpdatedAt >= storedProfileUpdatedAt) localStorage.setItem(`${prefix}profile_updated_at`, String(incomingProfileUpdatedAt));
+						if (incomingProfileUpdatedAt && incomingProfileUpdatedAt >= storedProfileUpdatedAt) localStorage.setItem(`${prefix}online_profile_updated_at`, String(incomingProfileUpdatedAt));
 						if (canUpdateProfileCounts) {
 							localStorage.setItem(`${prefix}downloads`, u.downloads || 0);
 							localStorage.setItem(`${prefix}wishlist`, u.wishlist || 0);
@@ -33758,7 +33726,6 @@ function getVisibleChatStackEl(id) {
 							statusIcon.classList.remove('status-pulsing-full');
 						}
 					}
-					updateOpenProfileCountersFromRealtimeSync(openedUser, openedUserData);
 				}
 			}
 		

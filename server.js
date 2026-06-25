@@ -818,8 +818,18 @@ function reconcileIncomingDownloads(currentUser = {}, incomingUser = {}) {
   const incomingClearAt = normalizeTimestampValue(incomingUser.downloadsClearedAt);
   const hasIncomingDownloadsData = Object.prototype.hasOwnProperty.call(incomingUser, 'downloadsData');
   const hasIncomingDownloadsCount = Object.prototype.hasOwnProperty.call(incomingUser, 'downloads');
+  const incomingDownloads = Array.isArray(incomingUser.downloadsData) ? incomingUser.downloadsData : [];
+  const hasPostClearDownloads = hasIncomingDownloadsData && incomingDownloads.length > 0;
 
   if (incomingClearAt > currentClearAt) {
+    if (hasPostClearDownloads) {
+      // A client can keep the local clear marker after clearing because the source socket is not echoed.
+      // If it later sends a non-empty history with that marker, it is the new post-clear history, not another clear command.
+      incomingUser.downloadsClearedAt = incomingClearAt;
+      incomingUser.downloadsData = incomingDownloads;
+      incomingUser.downloads = incomingDownloads.length;
+      return incomingUser;
+    }
     applyDownloadsClearedState(currentUser, incomingClearAt);
     incomingUser.downloadsClearedAt = incomingClearAt;
     incomingUser.downloadsData = [];
@@ -856,7 +866,13 @@ function mergeLocalRecoveryData(dbUser = {}, localData = {}) {
   });
 
   if (localDownloadsClearedAt > dbDownloadsClearedAt) {
-    applyDownloadsClearedState(merged, localDownloadsClearedAt);
+    if (Array.isArray(localData.downloadsData) && localData.downloadsData.length > 0) {
+      merged.downloadsClearedAt = localDownloadsClearedAt;
+      merged.downloadsData = localData.downloadsData;
+      merged.downloads = localData.downloadsData.length;
+    } else {
+      applyDownloadsClearedState(merged, localDownloadsClearedAt);
+    }
   } else if (localDownloadsClearedAt === dbDownloadsClearedAt) {
     const preferredDownloads = preferLocalArrayPayload(merged.downloadsData, localData.downloadsData);
     if (preferredDownloads !== merged.downloadsData) merged.downloadsData = preferredDownloads;
@@ -1978,7 +1994,7 @@ io.on('connection', async (socket) => {
           trophiesData: safeUserData.trophiesData || {},
           wishlistData: safeUserData.wishlistData || [],
           favoritesData: safeUserData.favoritesData || [],
-          downloadsData: normalizeTimestampValue(safeUserData.downloadsClearedAt) ? [] : (safeUserData.downloadsData || []),
+          downloadsData: Array.isArray(safeUserData.downloadsData) ? safeUserData.downloadsData : [],
           downloadsClearedAt: normalizeTimestampValue(safeUserData.downloadsClearedAt),
           libraryData: safeUserData.libraryData || [],
           friendsData: safeUserData.friendsData || [],
