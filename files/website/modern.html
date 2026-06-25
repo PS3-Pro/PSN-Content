@@ -10179,6 +10179,248 @@ P
 	}
 
 
+	function normalizeSyncedToggleValue(value, fallback = "1") {
+		if (value === undefined || value === null || value === "") return fallback === "0" ? "0" : "1";
+		return String(value) === "0" ? "0" : "1";
+	}
+
+	function normalizeSyncedTextValue(value, fallback = "") {
+		return String(value === undefined || value === null ? fallback : value).trim();
+	}
+
+	function normalizeSyncedConsoleFanMode(value) {
+		const mode = normalizeSyncedTextValue(value, "dynamic").toLowerCase();
+		return ["dynamic", "auto", "manual", "syscon"].includes(mode) ? mode : "dynamic";
+	}
+
+	function normalizeSyncedPerformanceMode(value) {
+		let mode = normalizeSyncedTextValue(value, "balanced").toLowerCase();
+		if (mode === "power") mode = "default";
+		return ["default", "balanced", "boost", "custom"].includes(mode) ? mode : "balanced";
+	}
+
+	function clampSyncedNumber(value, fallback, min, max) {
+		const parsed = Number(value === undefined || value === null || value === "" ? fallback : value);
+		const clean = Number.isFinite(parsed) ? parsed : Number(fallback);
+		if (typeof clampConsoleValue === 'function') return clampConsoleValue(clean, min, max);
+		return Math.min(max, Math.max(min, clean));
+	}
+
+	function writeSyncedSettingForUser(username, key, value) {
+		if (!username || username === "null" || typeof key === 'undefined') return;
+		localStorage.setItem(`${username}_${key}`, String(value));
+	}
+
+
+	function readSyncedSettingForUser(username, key, fallback = null) {
+		if (!username || username === "null" || typeof key === 'undefined') return fallback;
+		const scoped = localStorage.getItem(`${username}_${key}`);
+		if (scoped !== null && scoped !== undefined) return scoped;
+		if ((localStorage.getItem('psn_username') || '') === username) {
+			const active = loadState(key);
+			if (active !== null && active !== undefined) return active;
+		}
+		return fallback;
+	}
+
+	function applySyncedBackgroundMusic(enabled) {
+		const audioEl = document.getElementById('background_music');
+		if (!audioEl) return;
+		if (enabled) {
+			audioEl.volume = 0.35;
+			audioEl.play().catch(e => console.log("Play blocked by the browser until user interaction."));
+		} else {
+			audioEl.pause();
+		}
+	}
+
+	function applySyncedConsoleSettingsUi(next = {}) {
+		if (typeof updateConsoleFanUI === 'function') {
+			updateConsoleFanUI(next.consoleFanSpeed, next.consoleFanMode, next.consoleFanTarget);
+		}
+		if (typeof updateConsolePerformanceUI === 'function') {
+			updateConsolePerformanceUI(next.performanceMode);
+		}
+		const rsxInput = document.getElementById('console-custom-rsx');
+		const vramInput = document.getElementById('console-custom-vram');
+		if (rsxInput) rsxInput.value = next.performanceRsx;
+		if (vramInput) vramInput.value = next.performanceVram;
+		const perfStatus = document.getElementById('console-performance-status');
+		if (perfStatus && perfStatus.textContent !== 'Sent') perfStatus.textContent = 'Synced';
+	}
+
+	function runSyncedPluginActions(previous = {}, next = {}, options = {}) {
+		if (options.runPluginActions === false) return;
+		if (typeof isPs3CurrentlyConnected !== 'function' || !isPs3CurrentlyConnected()) return;
+
+		const companionChanged = previous.companionPlugin !== undefined && previous.companionPlugin !== next.companionPlugin;
+		const fpsChanged = previous.fpsCounterPlugin !== undefined && previous.fpsCounterPlugin !== next.fpsCounterPlugin;
+		if (!companionChanged && !fpsChanged) return;
+
+		const ip = (typeof getCurrentPs3Ip === 'function') ? getCurrentPs3Ip() : (document.getElementById('ps3-ip')?.value || '').trim();
+		if (!ip) return;
+
+		const actionStamp = Date.now();
+		window.__lastSyncedSettingsActionAt = actionStamp;
+		window.__applyingSyncedProfileSettings = true;
+
+		(async () => {
+			try {
+				if (companionChanged) {
+					const companionEnabled = next.companionPlugin !== "0";
+					try {
+						if (typeof companionPluginLoadTimer !== 'undefined' && companionPluginLoadTimer) {
+							clearTimeout(companionPluginLoadTimer);
+							companionPluginLoadTimer = null;
+						}
+						if (typeof companionPluginRetryCount !== 'undefined') companionPluginRetryCount = 0;
+						if (companionEnabled) {
+							if (typeof companionPluginPs3ProDetected !== 'undefined' && companionPluginPs3ProDetected) {
+								if (typeof updateCompanionPluginStatus === 'function') updateCompanionPluginStatus();
+							} else if (typeof loadCompanionPlugin === 'function') {
+								await loadCompanionPlugin(ip, true);
+							} else if (typeof queueCompanionPluginLoad === 'function') {
+								queueCompanionPluginLoad(ip, 0, 'profile-sync');
+							}
+						} else if (typeof unloadCompanionPlugin === 'function') {
+							await unloadCompanionPlugin(ip);
+						} else if (typeof updateCompanionPluginStatus === 'function') {
+							updateCompanionPluginStatus('<i class="fas fa-plug-circle-xmark"></i> DISABLED', '#ff7777');
+						}
+					} catch (err) {
+						console.warn('[PROFILE SYNC] Companion Plugin action failed:', err);
+						if (typeof updateCompanionPluginStatus === 'function') updateCompanionPluginStatus();
+					}
+				}
+
+				if (fpsChanged && typeof window.toggleFpsCounter === 'function') {
+					try {
+						const fpsToggle = document.getElementById('fps-counter-toggle');
+						if (fpsToggle) fpsToggle.checked = next.fpsCounterPlugin === "1";
+						await window.toggleFpsCounter(next.fpsCounterPlugin === "1");
+					} catch (err) {
+						console.warn('[PROFILE SYNC] FPS Counter action failed:', err);
+						if (typeof updateFpsCounterStatus === 'function') updateFpsCounterStatus();
+					}
+				}
+			} finally {
+				if (window.__lastSyncedSettingsActionAt === actionStamp) window.__applyingSyncedProfileSettings = false;
+			}
+		})();
+	}
+
+	window.applySyncedProfileSettings = function(username, incomingSettings = {}, options = {}) {
+		const name = normalizeSyncedTextValue(username || localStorage.getItem('psn_username'), "");
+		if (!name || name === "null" || !incomingSettings || typeof incomingSettings !== 'object') return null;
+
+		const previous = {
+			audio: readSyncedSettingForUser(name, STORAGE_KEY_AUDIO, "1") || "1",
+			ux: readSyncedSettingForUser(name, STORAGE_KEY_UX, "1") || "1",
+			chatSound: readSyncedSettingForUser(name, STORAGE_KEY_CHAT_SOUND, "1") || "1",
+			chatAutoTranslate: readSyncedSettingForUser(name, STORAGE_KEY_CHAT_AUTO_TRANSLATE, "0") === "1" ? "1" : "0",
+			companionPlugin: (readSyncedSettingForUser(name, STORAGE_KEY_COMPANION_PLUGIN, "1") !== "0") ? "1" : "0",
+			fpsCounterPlugin: (readSyncedSettingForUser(name, STORAGE_KEY_FPS_COUNTER, "0") === "1") ? "1" : "0",
+			consoleFanMode: readSyncedSettingForUser(name, STORAGE_KEY_CONSOLE_FAN_MODE, "dynamic") || "dynamic",
+			consoleFanSpeed: readSyncedSettingForUser(name, STORAGE_KEY_CONSOLE_FAN_SPEED, "35") || "35",
+			consoleFanTarget: readSyncedSettingForUser(name, STORAGE_KEY_CONSOLE_FAN_TARGET, "68") || "68",
+			performanceMode: readSyncedSettingForUser(name, STORAGE_KEY_PERFORMANCE_MODE, "balanced") || "balanced",
+			performanceRsx: readSyncedSettingForUser(name, STORAGE_KEY_PERFORMANCE_RSX, "650") || "650",
+			performanceVram: readSyncedSettingForUser(name, STORAGE_KEY_PERFORMANCE_VRAM, "850") || "850"
+		};
+
+		const next = {
+			audio: normalizeSyncedToggleValue(incomingSettings.audio, previous.audio || "1"),
+			ux: normalizeSyncedToggleValue(incomingSettings.ux, previous.ux || "1"),
+			chatSound: normalizeSyncedToggleValue(incomingSettings.chatSound, previous.chatSound || "1"),
+			chatAutoTranslate: String(incomingSettings.chatAutoTranslate) === "1" ? "1" : "0",
+			ps3Ip: normalizeSyncedTextValue(incomingSettings.ps3Ip, ""),
+			companionPlugin: normalizeSyncedToggleValue(incomingSettings.companionPlugin, previous.companionPlugin || "1"),
+			fpsCounterPlugin: normalizeSyncedToggleValue(incomingSettings.fpsCounterPlugin ?? incomingSettings.fpsCounter, previous.fpsCounterPlugin || "0"),
+			consoleFanMode: normalizeSyncedConsoleFanMode(incomingSettings.consoleFanMode || previous.consoleFanMode || "dynamic"),
+			consoleFanSpeed: String(Math.round(clampSyncedNumber(incomingSettings.consoleFanSpeed, previous.consoleFanSpeed || 35, 20, 95))),
+			consoleFanTarget: String(Math.round(clampSyncedNumber(incomingSettings.consoleFanTarget, previous.consoleFanTarget || 68, 50, 90))),
+			performanceMode: normalizeSyncedPerformanceMode(incomingSettings.performanceMode || previous.performanceMode || "balanced"),
+			performanceRsx: String(Math.round(clampSyncedNumber(incomingSettings.performanceRsx, previous.performanceRsx || 650, 300, 1200))),
+			performanceVram: String(Math.round(clampSyncedNumber(incomingSettings.performanceVram, previous.performanceVram || 850, 300, 1200)))
+		};
+
+		const incomingSettingsUpdatedAt = Number(incomingSettings.settingsUpdatedAt || incomingSettings.settingsSyncedAt || incomingSettings.settingsVersion || options.userData?.settingsUpdatedAt || options.payload?.settingsUpdatedAt || options.userData?.profileUpdatedAt || options.incomingProfileUpdatedAt || 0);
+		if (incomingSettingsUpdatedAt && typeof setProfileSettingsUpdatedAtForUser === 'function') setProfileSettingsUpdatedAtForUser(name, incomingSettingsUpdatedAt);
+		if (typeof applySiteDisclaimerSkipTodayFromSettings === 'function') applySiteDisclaimerSkipTodayFromSettings(name, incomingSettings.siteDisclaimerSkipToday);
+
+		writeSyncedSettingForUser(name, STORAGE_KEY_AUDIO, next.audio);
+		writeSyncedSettingForUser(name, STORAGE_KEY_UX, next.ux);
+		writeSyncedSettingForUser(name, STORAGE_KEY_CHAT_SOUND, next.chatSound);
+		writeSyncedSettingForUser(name, STORAGE_KEY_CHAT_AUTO_TRANSLATE, next.chatAutoTranslate);
+		writeSyncedSettingForUser(name, STORAGE_KEY_COMPANION_PLUGIN, next.companionPlugin);
+		writeSyncedSettingForUser(name, STORAGE_KEY_FPS_COUNTER, next.fpsCounterPlugin);
+		writeSyncedSettingForUser(name, STORAGE_KEY_FPS_COUNTER_DEFAULT_OFF_MIGRATION, "1");
+		writeSyncedSettingForUser(name, STORAGE_KEY_CONSOLE_FAN_MODE, next.consoleFanMode);
+		writeSyncedSettingForUser(name, STORAGE_KEY_CONSOLE_FAN_SPEED, next.consoleFanSpeed);
+		writeSyncedSettingForUser(name, STORAGE_KEY_CONSOLE_FAN_TARGET, next.consoleFanTarget);
+		writeSyncedSettingForUser(name, STORAGE_KEY_PERFORMANCE_MODE, next.performanceMode);
+		writeSyncedSettingForUser(name, STORAGE_KEY_PERFORMANCE_RSX, next.performanceRsx);
+		writeSyncedSettingForUser(name, STORAGE_KEY_PERFORMANCE_VRAM, next.performanceVram);
+		localStorage.setItem(`${name}_ps3_ip`, next.ps3Ip);
+		localStorage.setItem('ps3_ip', next.ps3Ip);
+
+		if (typeof STORAGE_KEY_PROFILE_CARD_STYLE !== 'undefined' && (incomingSettings.profileCardStyle || incomingSettings.profileCardEffect || incomingSettings.profileCardTheme)) {
+			const incomingProfileCardStyle = (typeof normalizeProfileCardStyle === 'function') ? normalizeProfileCardStyle(incomingSettings.profileCardStyle || incomingSettings.profileCardEffect || incomingSettings.profileCardTheme || 'default') : (incomingSettings.profileCardStyle || incomingSettings.profileCardEffect || incomingSettings.profileCardTheme || 'default');
+			const incomingProfileCardStyleUpdatedAt = Number(incomingSettings.profileCardStyleUpdatedAt || incomingSettings.profileCardEffectUpdatedAt || incomingSettings.profileCardThemeUpdatedAt || options.userData?.profileCardStyleUpdatedAt || options.payload?.profileCardStyleUpdatedAt || options.incomingProfileUpdatedAt || 0);
+			if (typeof writeProfileCardStyleForUser === 'function') writeProfileCardStyleForUser(name, incomingProfileCardStyle, incomingProfileCardStyleUpdatedAt);
+			else writeSyncedSettingForUser(name, STORAGE_KEY_PROFILE_CARD_STYLE, incomingProfileCardStyle);
+			if (incomingProfileCardStyleUpdatedAt && typeof setProfileCardStyleUpdatedAtForUser === 'function') setProfileCardStyleUpdatedAtForUser(name, incomingProfileCardStyleUpdatedAt);
+			if (name === localStorage.getItem('psn_username')) {
+				saveState(STORAGE_KEY_PROFILE_CARD_STYLE, incomingProfileCardStyle);
+				if (incomingProfileCardStyleUpdatedAt) localStorage.setItem(STORAGE_KEY_PROFILE_CARD_STYLE_UPDATED_AT, String(incomingProfileCardStyleUpdatedAt));
+			}
+			if (typeof refreshOpenProfileCardStyleForUser === 'function') refreshOpenProfileCardStyleForUser(name);
+		}
+
+		const audioToggle = document.getElementById('audio-toggle');
+		const uxToggle = document.getElementById('ux-sounds-toggle');
+		const chatToggle = document.getElementById('chat-sound-toggle');
+		const chatAutoTranslateToggle = document.getElementById('chat-auto-translate-toggle');
+		const companionToggle = document.getElementById('companion-plugin-toggle');
+		const fpsCounterToggle = document.getElementById('fps-counter-toggle');
+		const ipInput = document.getElementById('ps3-ip');
+
+		if (audioToggle) audioToggle.checked = next.audio !== "0";
+		if (uxToggle) uxToggle.checked = next.ux !== "0";
+		if (chatToggle) chatToggle.checked = next.chatSound !== "0";
+		if (chatAutoTranslateToggle) chatAutoTranslateToggle.checked = next.chatAutoTranslate === "1";
+		if (companionToggle) companionToggle.checked = next.companionPlugin !== "0";
+		if (fpsCounterToggle) fpsCounterToggle.checked = next.fpsCounterPlugin === "1";
+		if (ipInput) ipInput.value = next.ps3Ip;
+
+		applySyncedBackgroundMusic(next.audio !== "0");
+		if (typeof updateChatAutoTranslateUi === 'function') updateChatAutoTranslateUi();
+		if (typeof updateCompanionPluginStatus === 'function') updateCompanionPluginStatus();
+		if (typeof updateFpsCounterStatus === 'function') updateFpsCounterStatus();
+		applySyncedConsoleSettingsUi(next);
+		if (typeof updateConsoleDashboardUI === 'function') updateConsoleDashboardUI();
+
+		if (next.ps3Ip === "") {
+			try {
+				if (typeof _lastConnectionState !== 'undefined') _lastConnectionState = false;
+				if (typeof connectionMonitorTimer !== 'undefined' && connectionMonitorTimer) clearInterval(connectionMonitorTimer);
+				const globalIcon = document.getElementById('global-status-icon');
+				if (globalIcon) {
+					globalIcon.className = "fas fa-circle status-dot-base status-dot-disconnected";
+					globalIcon.style.color = "#ff4444";
+				}
+				const btnConnect = document.getElementById('btn-connect-ps3');
+				const btnShutdown = document.getElementById('btn-shutdown-ps3');
+				if (btnConnect) btnConnect.style.display = 'flex';
+				if (btnShutdown) btnShutdown.style.display = 'none';
+			} catch (err) {}
+		}
+
+		runSyncedPluginActions(previous, next, options);
+		return next;
+	};
+
+
 	function parseLocalJsonForAuth(rawValue, fallback) {
 		if (rawValue === undefined || rawValue === null || rawValue === "") return fallback;
 		try {
@@ -10353,6 +10595,7 @@ P
 
 	function syncRuntimePluginPreferencesToServer() {
 		try {
+			if (window.__applyingRemoteProfileSync || window.__applyingSyncedProfileSettings) return false;
 			if (typeof socketChat === 'undefined' || !socketChat || !socketChat.connected) return false;
 			const myName = localStorage.getItem('psn_username');
 			if (!myName || myName === "null") return false;
@@ -32915,53 +33158,15 @@ function getVisibleChatStackEl(id) {
 			}
 
 			if (userData.settingsData) {
-				const settings = userData.settingsData;
-				const incomingSettingsUpdatedAt = Number(settings.settingsUpdatedAt || settings.settingsSyncedAt || settings.settingsVersion || userData.settingsUpdatedAt || payload.settingsUpdatedAt || 0);
-				if (incomingSettingsUpdatedAt && typeof setProfileSettingsUpdatedAtForUser === 'function') setProfileSettingsUpdatedAtForUser(name, incomingSettingsUpdatedAt);
-				if (typeof applySiteDisclaimerSkipTodayFromSettings === 'function') applySiteDisclaimerSkipTodayFromSettings(name, settings.siteDisclaimerSkipToday);
-				localStorage.setItem(`${name}_psn_audio_state`, settings.audio !== undefined ? settings.audio : '1');
-				localStorage.setItem(`${name}_psn_ux_sounds_state`, settings.ux !== undefined ? settings.ux : '1');
-				localStorage.setItem(`${name}_psn_chat_sound_state`, settings.chatSound !== undefined ? settings.chatSound : '1');
-				localStorage.setItem(`${name}_${STORAGE_KEY_CHAT_AUTO_TRANSLATE}`, String(settings.chatAutoTranslate) === '1' ? '1' : '0');
-				if (typeof STORAGE_KEY_PROFILE_CARD_STYLE !== 'undefined') {
-					const incomingProfileCardStyle = (typeof normalizeProfileCardStyle === 'function') ? normalizeProfileCardStyle(settings.profileCardStyle || settings.profileCardEffect || 'neon') : (settings.profileCardStyle || settings.profileCardEffect || 'neon');
-					const incomingProfileCardStyleUpdatedAt = Number(settings.profileCardStyleUpdatedAt || settings.profileCardEffectUpdatedAt || settings.profileCardThemeUpdatedAt || userData.profileCardStyleUpdatedAt || payload.profileCardStyleUpdatedAt || incomingProfileUpdatedAt || 0);
-					if (typeof writeProfileCardStyleForUser === 'function') {
-						writeProfileCardStyleForUser(name, incomingProfileCardStyle, incomingProfileCardStyleUpdatedAt);
-					} else {
-						localStorage.setItem(`${name}_${STORAGE_KEY_PROFILE_CARD_STYLE}`, incomingProfileCardStyle);
-					}
-					if (incomingProfileCardStyleUpdatedAt && typeof setProfileCardStyleUpdatedAtForUser === 'function') setProfileCardStyleUpdatedAtForUser(name, incomingProfileCardStyleUpdatedAt);
-					if (name === localStorage.getItem('psn_username')) {
-						saveState(STORAGE_KEY_PROFILE_CARD_STYLE, incomingProfileCardStyle);
-						if (incomingProfileCardStyleUpdatedAt) localStorage.setItem(STORAGE_KEY_PROFILE_CARD_STYLE_UPDATED_AT, String(incomingProfileCardStyleUpdatedAt));
-					}
-					if (typeof refreshOpenProfileCardStyleForUser === 'function') refreshOpenProfileCardStyleForUser(name);
-				}
-				localStorage.setItem(`${name}_ps3_ip`, settings.ps3Ip || '');
-				localStorage.setItem('ps3_ip', settings.ps3Ip || '');
-				if (typeof STORAGE_KEY_COMPANION_PLUGIN !== 'undefined') localStorage.setItem(`${name}_${STORAGE_KEY_COMPANION_PLUGIN}`, String(settings.companionPlugin) !== '0' ? '1' : '0');
-				if (typeof STORAGE_KEY_FPS_COUNTER !== 'undefined') localStorage.setItem(`${name}_${STORAGE_KEY_FPS_COUNTER}`, String(settings.fpsCounterPlugin) === '1' ? '1' : '0');
-				if (typeof STORAGE_KEY_CONSOLE_FAN_MODE !== 'undefined') localStorage.setItem(`${name}_${STORAGE_KEY_CONSOLE_FAN_MODE}`, settings.consoleFanMode || 'dynamic');
-				if (typeof STORAGE_KEY_CONSOLE_FAN_SPEED !== 'undefined') localStorage.setItem(`${name}_${STORAGE_KEY_CONSOLE_FAN_SPEED}`, settings.consoleFanSpeed || '35');
-				if (typeof STORAGE_KEY_CONSOLE_FAN_TARGET !== 'undefined') localStorage.setItem(`${name}_${STORAGE_KEY_CONSOLE_FAN_TARGET}`, settings.consoleFanTarget || '68');
-				if (typeof STORAGE_KEY_PERFORMANCE_MODE !== 'undefined') localStorage.setItem(`${name}_${STORAGE_KEY_PERFORMANCE_MODE}`, settings.performanceMode || 'balanced');
-				if (typeof STORAGE_KEY_PERFORMANCE_RSX !== 'undefined') localStorage.setItem(`${name}_${STORAGE_KEY_PERFORMANCE_RSX}`, settings.performanceRsx || '650');
-				if (typeof STORAGE_KEY_PERFORMANCE_VRAM !== 'undefined') localStorage.setItem(`${name}_${STORAGE_KEY_PERFORMANCE_VRAM}`, settings.performanceVram || '850');
-
-				const audioToggle = document.getElementById('audio-toggle'); const uxToggle = document.getElementById('ux-sounds-toggle'); const chatToggle = document.getElementById('chat-sound-toggle'); const chatAutoTranslateToggle = document.getElementById('chat-auto-translate-toggle'); const companionToggle = document.getElementById('companion-plugin-toggle'); const fpsCounterToggle = document.getElementById('fps-counter-toggle'); const ipInput = document.getElementById('ps3-ip');
-				if (audioToggle) audioToggle.checked = (settings.audio !== '0');
-				if (uxToggle) uxToggle.checked = (settings.ux !== '0');
-				if (chatToggle) chatToggle.checked = (settings.chatSound !== '0');
-				if (chatAutoTranslateToggle) chatAutoTranslateToggle.checked = (String(settings.chatAutoTranslate) === '1');
-				if (companionToggle) companionToggle.checked = (String(settings.companionPlugin) !== '0');
-				if (fpsCounterToggle) fpsCounterToggle.checked = (String(settings.fpsCounterPlugin) === '1');
-				if (ipInput) ipInput.value = settings.ps3Ip || '';
-				if (typeof updateChatAutoTranslateUi === 'function') updateChatAutoTranslateUi();
-				if (typeof updateCompanionPluginStatus === 'function') updateCompanionPluginStatus();
-				if (typeof updateFpsCounterStatus === 'function') updateFpsCounterStatus();
-				if (typeof updateConsoleDashboardUI === 'function') updateConsoleDashboardUI();
+				applySyncedProfileSettings(name, userData.settingsData, {
+					userData,
+					payload,
+					incomingProfileUpdatedAt,
+					runPluginActions: true,
+					source: 'profile_sync'
+				});
 			}
+
 
 			if (hasProfileDataChanges && typeof window.refreshProfileSyncVisibleUI === 'function') window.refreshProfileSyncVisibleUI(userData, previousProfileSyncState);
 
@@ -33168,98 +33373,15 @@ function getVisibleChatStackEl(id) {
 			}
 			
 			if (userData.settingsData) {
-				if (typeof applySiteDisclaimerSkipTodayFromSettings === 'function') applySiteDisclaimerSkipTodayFromSettings(name, userData.settingsData.siteDisclaimerSkipToday);
-				const incomingSettingsUpdatedAt = Number(userData.settingsData.settingsUpdatedAt || userData.settingsData.settingsSyncedAt || userData.settingsData.settingsVersion || userData.settingsUpdatedAt || userData.profileUpdatedAt || 0);
-				if (incomingSettingsUpdatedAt && typeof setProfileSettingsUpdatedAtForUser === 'function') setProfileSettingsUpdatedAtForUser(name, incomingSettingsUpdatedAt);
-				localStorage.setItem(`${name}_psn_audio_state`, userData.settingsData.audio);
-				localStorage.setItem(`${name}_psn_ux_sounds_state`, userData.settingsData.ux);
-				localStorage.setItem(`${name}_psn_chat_sound_state`, userData.settingsData.chatSound || "1");
-				localStorage.setItem(`${name}_${STORAGE_KEY_CHAT_AUTO_TRANSLATE}`, String(userData.settingsData.chatAutoTranslate) === "1" ? "1" : "0");
-				if (typeof STORAGE_KEY_PROFILE_CARD_STYLE !== 'undefined') {
-					const incomingProfileCardStyle = (typeof normalizeProfileCardStyle === 'function') ? normalizeProfileCardStyle(userData.settingsData.profileCardStyle || userData.settingsData.profileCardEffect || 'default') : (userData.settingsData.profileCardStyle || userData.settingsData.profileCardEffect || 'default');
-					const incomingProfileCardStyleUpdatedAt = Number(userData.settingsData.profileCardStyleUpdatedAt || userData.settingsData.profileCardEffectUpdatedAt || userData.settingsData.profileCardThemeUpdatedAt || userData.profileCardStyleUpdatedAt || userData.profileUpdatedAt || 0);
-					if (typeof writeProfileCardStyleForUser === 'function') {
-						writeProfileCardStyleForUser(name, incomingProfileCardStyle, incomingProfileCardStyleUpdatedAt);
-					} else {
-						localStorage.setItem(`${name}_${STORAGE_KEY_PROFILE_CARD_STYLE}`, incomingProfileCardStyle);
-					}
-					if (incomingProfileCardStyleUpdatedAt && typeof setProfileCardStyleUpdatedAtForUser === 'function') setProfileCardStyleUpdatedAtForUser(name, incomingProfileCardStyleUpdatedAt);
-					if (name === localStorage.getItem('psn_username')) {
-						saveState(STORAGE_KEY_PROFILE_CARD_STYLE, incomingProfileCardStyle);
-						if (incomingProfileCardStyleUpdatedAt) localStorage.setItem(STORAGE_KEY_PROFILE_CARD_STYLE_UPDATED_AT, String(incomingProfileCardStyleUpdatedAt));
-					}
-				}
-
-				const incomingCompanionPlugin = (typeof userData.settingsData.companionPlugin !== 'undefined') ? userData.settingsData.companionPlugin : "1";
-				const incomingFpsCounterPlugin = (typeof userData.settingsData.fpsCounterPlugin !== 'undefined') ? userData.settingsData.fpsCounterPlugin : ((typeof userData.settingsData.fpsCounter !== 'undefined') ? userData.settingsData.fpsCounter : "0");
-				const incomingConsoleFanMode = userData.settingsData.consoleFanMode || "dynamic";
-				const incomingConsoleFanSpeed = userData.settingsData.consoleFanSpeed || "35";
-				const incomingConsoleFanTarget = userData.settingsData.consoleFanTarget || "68";
-				const incomingPerformanceMode = userData.settingsData.performanceMode || "balanced";
-				const incomingPerformanceRsx = userData.settingsData.performanceRsx || "650";
-				const incomingPerformanceVram = userData.settingsData.performanceVram || "850";
-				localStorage.setItem(`${name}_${STORAGE_KEY_COMPANION_PLUGIN}`, String(incomingCompanionPlugin) !== "0" ? "1" : "0");
-				localStorage.setItem(`${name}_${STORAGE_KEY_FPS_COUNTER}`, String(incomingFpsCounterPlugin) === "1" ? "1" : "0");
-				if (typeof ensureFpsCounterDefaultOff === 'function') ensureFpsCounterDefaultOff();
-				localStorage.setItem(`${name}_${STORAGE_KEY_CONSOLE_FAN_MODE}`, incomingConsoleFanMode);
-				localStorage.setItem(`${name}_${STORAGE_KEY_CONSOLE_FAN_SPEED}`, incomingConsoleFanSpeed);
-				localStorage.setItem(`${name}_${STORAGE_KEY_CONSOLE_FAN_TARGET}`, incomingConsoleFanTarget);
-				localStorage.setItem(`${name}_${STORAGE_KEY_PERFORMANCE_MODE}`, incomingPerformanceMode);
-				localStorage.setItem(`${name}_${STORAGE_KEY_PERFORMANCE_RSX}`, incomingPerformanceRsx);
-				localStorage.setItem(`${name}_${STORAGE_KEY_PERFORMANCE_VRAM}`, incomingPerformanceVram);
-				
-				const audioToggle = document.getElementById('audio-toggle');
-				const uxToggle = document.getElementById('ux-sounds-toggle');
-				const chatToggle = document.getElementById('chat-sound-toggle');
-				const chatAutoTranslateToggle = document.getElementById('chat-auto-translate-toggle');
-				const companionToggle = document.getElementById('companion-plugin-toggle');
-				const fpsCounterToggle = document.getElementById('fps-counter-toggle');
-				
-				if (audioToggle) audioToggle.checked = (userData.settingsData.audio !== "0");
-				if (uxToggle) uxToggle.checked = (userData.settingsData.ux !== "0");
-				if (chatToggle) chatToggle.checked = (userData.settingsData.chatSound !== "0");
-				if (chatAutoTranslateToggle) chatAutoTranslateToggle.checked = (String(userData.settingsData.chatAutoTranslate) === "1");
-				if (typeof updateChatAutoTranslateUi === 'function') updateChatAutoTranslateUi();
-				if (companionToggle) companionToggle.checked = (String(incomingCompanionPlugin) !== "0");
-				if (fpsCounterToggle) fpsCounterToggle.checked = (String(incomingFpsCounterPlugin) === "1");
-				if (typeof updateCompanionPluginStatus === 'function') updateCompanionPluginStatus();
-				if (typeof updateFpsCounterStatus === 'function') updateFpsCounterStatus();
-				if (typeof updateConsoleDashboardUI === 'function') updateConsoleDashboardUI();
-			
-				const audioEl = document.getElementById('background_music');
-				if (audioEl) {
-					if (userData.settingsData.audio !== "0") {
-						audioEl.volume = 0.35;
-						audioEl.play().catch(e => console.log("Play blocked by the browser until user interaction."));
-					} else {
-						audioEl.pause();
-					}
-				}
-			
-				const incomingIp = userData.settingsData.ps3Ip || ""; 
-				
-				localStorage.setItem(`${name}_ps3_ip`, incomingIp);
-				localStorage.setItem('ps3_ip', incomingIp);
-				
-				const ipInput = document.getElementById('ps3-ip');
-				if (ipInput) ipInput.value = incomingIp;
-			
-				if (incomingIp === "") {
-					_lastConnectionState = false;
-					if (connectionMonitorTimer) clearInterval(connectionMonitorTimer);
-					
-					const globalIcon = document.getElementById('global-status-icon');
-					if (globalIcon) {
-						globalIcon.className = "fas fa-circle status-dot-base status-dot-disconnected";
-						globalIcon.style.color = "#ff4444";
-					}
-					
-					const btnConnect = document.getElementById('btn-connect-ps3');
-					const btnShutdown = document.getElementById('btn-shutdown-ps3');
-					if (btnConnect) btnConnect.style.display = 'flex';
-					if (btnShutdown) btnShutdown.style.display = 'none';
-				}
+				applySyncedProfileSettings(name, userData.settingsData, {
+					userData,
+					payload: { profileUpdatedAt: userData.profileUpdatedAt || 0 },
+					incomingProfileUpdatedAt: Number(userData.profileUpdatedAt || 0),
+					runPluginActions: false,
+					source: 'auth_success'
+				});
 			}
+
 			
 			let sessionRole = String(role || userData.role || (isAdmin ? 'admin' : '') || '').toLowerCase() === 'moderator' ? 'mod' : String(role || userData.role || (isAdmin ? 'admin' : 'user')).toLowerCase();
 			const sessionIsBanned = sessionRole === 'banned' || userData.banned === true || userData.isBanned === true;
