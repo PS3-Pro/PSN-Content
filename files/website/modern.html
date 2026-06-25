@@ -10083,7 +10083,9 @@ P
 	}
 
 	function markProfileSettingsChanged(stamp = Date.now()) {
-		return setProfileSettingsUpdatedAtForUser(localStorage.getItem('psn_username') || '', stamp) || Date.now();
+		const appliedStamp = setProfileSettingsUpdatedAtForUser(localStorage.getItem('psn_username') || '', stamp) || Date.now();
+		if (typeof queueRealtimeSettingsUpdate === 'function') queueRealtimeSettingsUpdate('settings_changed');
+		return appliedStamp;
 	}
 	window.markProfileSettingsChanged = markProfileSettingsChanged;
 
@@ -10177,6 +10179,51 @@ P
 			siteDisclaimerSkipToday: (typeof getStoredSiteDisclaimerSkipToday === 'function') ? getStoredSiteDisclaimerSkipToday(localStorage.getItem('psn_username')) : ""
 		};
 	}
+
+
+	function getRuntimeSettingsThemeColor() {
+		try {
+			return loadState('psn_theme_color') || localStorage.getItem('psn_theme_color') || '#0070cc';
+		} catch (err) {
+			return '#0070cc';
+		}
+	}
+
+	function emitRealtimeSettingsUpdate(reason = 'settings') {
+		try {
+			if (window.__applyingRemoteProfileSync || window.__applyingRealtimeSettingsSync || window.__applyingSyncedProfileSettings) return false;
+			if (!window.isProfileLoaded || typeof socketChat === 'undefined' || !socketChat || !socketChat.connected) return false;
+			const myName = localStorage.getItem('psn_username');
+			if (!myName || myName === "null") return false;
+			if (typeof getRuntimePluginSettingsPayload !== 'function') return false;
+			const settingsData = getRuntimePluginSettingsPayload();
+			if (!Number(settingsData.settingsUpdatedAt || 0) && typeof getProfileSettingsUpdatedAtForUser === 'function') {
+				settingsData.settingsUpdatedAt = getProfileSettingsUpdatedAtForUser(myName) || Date.now();
+			}
+			socketChat.emit('settings_realtime_update', {
+				settingsData,
+				themeColor: getRuntimeSettingsThemeColor(),
+				reason,
+				clientSentAt: Date.now()
+			});
+			return true;
+		} catch (err) {
+			console.warn('[SETTINGS REALTIME] Could not emit realtime settings:', err);
+			return false;
+		}
+	}
+	window.emitRealtimeSettingsUpdate = emitRealtimeSettingsUpdate;
+
+	function queueRealtimeSettingsUpdate(reason = 'settings') {
+		if (window.__applyingRemoteProfileSync || window.__applyingRealtimeSettingsSync || window.__applyingSyncedProfileSettings) return false;
+		clearTimeout(window.__settingsRealtimeUpdateTimer);
+		window.__settingsRealtimeUpdateTimer = setTimeout(() => {
+			window.__settingsRealtimeUpdateTimer = null;
+			emitRealtimeSettingsUpdate(reason);
+		}, 25);
+		return true;
+	}
+	window.queueRealtimeSettingsUpdate = queueRealtimeSettingsUpdate;
 
 
 	function normalizeSyncedToggleValue(value, fallback = "1") {
@@ -10416,6 +10463,17 @@ P
 			} catch (err) {}
 		}
 
+		const incomingThemeColor = normalizeSyncedTextValue(options.themeColor || incomingSettings.themeColor || options.userData?.themeColor || options.payload?.themeColor || '', '');
+		if (incomingThemeColor) {
+			localStorage.setItem(`${name}_psn_theme_color`, incomingThemeColor);
+			if (name === localStorage.getItem('psn_username')) {
+				localStorage.setItem('psn_theme_color', incomingThemeColor);
+				document.documentElement.style.setProperty('--ps-blue', incomingThemeColor);
+				document.documentElement.style.setProperty('--ps-neon', incomingThemeColor + '66');
+				if (typeof updateDynamicCursor === 'function') updateDynamicCursor(incomingThemeColor);
+			}
+		}
+
 		runSyncedPluginActions(previous, next, options);
 		return next;
 	};
@@ -10595,11 +10653,13 @@ P
 
 	function syncRuntimePluginPreferencesToServer() {
 		try {
-			if (window.__applyingRemoteProfileSync || window.__applyingSyncedProfileSettings) return false;
+			if (window.__applyingRemoteProfileSync || window.__applyingRealtimeSettingsSync || window.__applyingSyncedProfileSettings) return false;
 			if (typeof socketChat === 'undefined' || !socketChat || !socketChat.connected) return false;
 			const myName = localStorage.getItem('psn_username');
 			if (!myName || myName === "null") return false;
-			socketChat.emit('update_profile', { settingsData: getRuntimePluginSettingsPayload() });
+			const settingsData = getRuntimePluginSettingsPayload();
+			socketChat.emit('settings_realtime_update', { settingsData, themeColor: getRuntimeSettingsThemeColor(), reason: 'runtime_preferences', clientSentAt: Date.now() });
+			socketChat.emit('update_profile', { settingsData });
 			return true;
 		} catch (err) {
 			console.warn('[Runtime Plugins] Could not sync plugin preferences to server:', err);
@@ -33100,7 +33160,9 @@ function getVisibleChatStackEl(id) {
 
 		const incomingProfileUpdatedAt = Number(userData.profileUpdatedAt || payload.profileUpdatedAt || 0);
 		const lastAppliedProfileUpdatedAt = Number(window.__lastAppliedProfileUpdatedAt || localStorage.getItem(`${name}_psn_profile_updated_at`) || 0);
-		if (incomingProfileUpdatedAt && lastAppliedProfileUpdatedAt && incomingProfileUpdatedAt <= lastAppliedProfileUpdatedAt) return;
+		const incomingSettingsUpdatedAt = Number((userData.settingsData && (userData.settingsData.settingsUpdatedAt || userData.settingsData.settingsSyncedAt || userData.settingsData.settingsVersion)) || payload.settingsUpdatedAt || 0);
+		const lastAppliedSettingsUpdatedAt = (typeof getProfileSettingsUpdatedAtForUser === 'function') ? Number(getProfileSettingsUpdatedAtForUser(name) || 0) : 0;
+		if (incomingProfileUpdatedAt && lastAppliedProfileUpdatedAt && incomingProfileUpdatedAt <= lastAppliedProfileUpdatedAt && (!incomingSettingsUpdatedAt || incomingSettingsUpdatedAt <= lastAppliedSettingsUpdatedAt)) return;
 
 		const previousProfileSyncState = {
 			trophies: (window.userTrophies && typeof window.userTrophies === 'object') ? JSON.parse(JSON.stringify(window.userTrophies)) : {},
@@ -33162,6 +33224,7 @@ function getVisibleChatStackEl(id) {
 					userData,
 					payload,
 					incomingProfileUpdatedAt,
+					themeColor: userData.themeColor || payload.themeColor || '',
 					runPluginActions: true,
 					source: 'profile_sync'
 				});
@@ -34372,6 +34435,33 @@ function getVisibleChatStackEl(id) {
 			if (payload.sourceSocketId && socketChat && payload.sourceSocketId === socketChat.id) return;
 			if (typeof window.applyRemoteProfileSync === 'function') window.applyRemoteProfileSync(payload);
 		});
+
+		socketChat.on('settings_realtime_sync', (payload = {}) => {
+			const myName = localStorage.getItem('psn_username') || '';
+			if (!payload || payload.name !== myName) return;
+			if (payload.sourceSocketId && socketChat && payload.sourceSocketId === socketChat.id) return;
+			const settingsData = payload.settingsData || (payload.userData && payload.userData.settingsData) || null;
+			if (!settingsData || typeof settingsData !== 'object') return;
+			if (typeof window.applySyncedProfileSettings !== 'function') return;
+			window.__applyingRealtimeSettingsSync = true;
+			window.__applyingRemoteProfileSync = true;
+			try {
+				window.applySyncedProfileSettings(myName, settingsData, {
+					payload,
+					userData: payload.userData || {},
+					incomingProfileUpdatedAt: Number(payload.profileUpdatedAt || 0),
+					themeColor: payload.themeColor || (payload.userData && payload.userData.themeColor) || '',
+					runPluginActions: true,
+					source: 'settings_realtime_sync'
+				});
+			} finally {
+				setTimeout(() => {
+					window.__applyingRealtimeSettingsSync = false;
+					window.__applyingRemoteProfileSync = false;
+				}, 80);
+			}
+		});
+
 		
 		socketChat.on('trending_data', (data) => {
 			if (typeof renderTrendingCarousel === 'function') {
@@ -38684,6 +38774,8 @@ function getVisibleChatStackEl(id) {
 
 		if (typeof playUiSuccess === 'function') playUiSuccess();
 
+		if (typeof markProfileSettingsChanged === 'function') markProfileSettingsChanged();
+		if (typeof emitRealtimeSettingsUpdate === 'function') emitRealtimeSettingsUpdate('theme');
 		if (typeof broadcastProfileUpdate === 'function') {
 			broadcastProfileUpdate();
 		}

@@ -1435,6 +1435,28 @@ function emitProfileSync(name, sourceSocketId = null) {
   getSocketsByUserName(name).forEach(client => client.emit('profile_sync', payload));
 }
 
+
+function emitSettingsRealtimeSync(name, sourceSocketId = null, extra = {}) {
+  if (!name || !userDatabase[name]) return;
+  const safe = normalizeUserRecord(name, userDatabase[name] || {});
+  const payload = {
+    name,
+    sourceSocketId,
+    profileUpdatedAt: normalizeTimestampValue(safe.profileUpdatedAt) || Date.now(),
+    settingsUpdatedAt: getProfileSettingsUpdatedAt(safe.settingsData || {}),
+    themeColor: safe.themeColor || '#0070cc',
+    settingsData: normalizeProfileRealtimeSettings(safe.settingsData || {}),
+    userData: {
+      profileUpdatedAt: normalizeTimestampValue(safe.profileUpdatedAt) || Date.now(),
+      themeColor: safe.themeColor || '#0070cc',
+      settingsData: normalizeProfileRealtimeSettings(safe.settingsData || {})
+    },
+    ...extra
+  };
+  getSocketsByUserName(name).forEach(client => client.emit('settings_realtime_sync', payload));
+}
+
+
 async function syncActiveProfilesAcrossInstances() {
   const activeNames = [...new Set(Array.from(io.sockets.sockets.values())
     .filter(client => client.connected && client.userName)
@@ -2004,6 +2026,54 @@ io.on('connection', async (socket) => {
       console.error("[AUTH ERROR]:", error);
       socket.emit('auth_error', 'Server Error: Auth failed.');
     }
+  });
+
+
+  socket.on('settings_realtime_update', async (payload = {}) => {
+    const name = socket.userName;
+    if (!name || !userDatabase[name]) return;
+
+    const incomingSettingsData = (payload && payload.settingsData && typeof payload.settingsData === "object")
+      ? { ...payload.settingsData }
+      : ((payload && typeof payload === "object") ? { ...payload } : null);
+    if (!incomingSettingsData || Array.isArray(incomingSettingsData)) return;
+
+    const incomingStamp = normalizeTimestampValue(
+      incomingSettingsData.settingsUpdatedAt ||
+      incomingSettingsData.settingsSyncedAt ||
+      incomingSettingsData.settingsVersion ||
+      payload.settingsUpdatedAt ||
+      payload.clientSentAt
+    ) || Date.now();
+    incomingSettingsData.settingsUpdatedAt = incomingStamp;
+
+    const mergedSettings = mergeProfileSettingsByTimestamp(userDatabase[name].settingsData || {}, incomingSettingsData, {
+      currentFallback: normalizeTimestampValue(userDatabase[name].profileUpdatedAt),
+      incomingFallback: incomingStamp
+    });
+
+    userDatabase[name].settingsData = mergedSettings.settingsData;
+    if (payload && typeof payload.themeColor === "string" && payload.themeColor.trim()) {
+      userDatabase[name].themeColor = payload.themeColor.trim();
+    }
+    userDatabase[name].lastSeen = Date.now();
+    userDatabase[name].profileUpdatedAt = Date.now();
+
+    try {
+      userCacheMeta[name] = Date.now();
+      await pool.query('UPDATE users SET data = $1 WHERE name = $2', [userDatabase[name], name]);
+    } catch (err) {
+      console.error(`[DATABASE ERROR] Failed to save realtime settings for ${name}:`, err);
+    }
+
+    const sourceSocketId = (mergedSettings.settingsRejected === true || mergedSettings.bannerRejected === true) ? null : socket.id;
+    emitSettingsRealtimeSync(name, sourceSocketId, { reason: payload.reason || 'settings_realtime' });
+
+    if (mergedSettings.bannerAccepted === true || (payload && typeof payload.themeColor === "string" && payload.themeColor.trim())) {
+      emitPublicProfileBannerUpdate(name, userDatabase[name]);
+    }
+
+    await notifyProfileSyncAcrossInstances(name, sourceSocketId, userDatabase[name].profileUpdatedAt);
   });
 
   socket.on('update_profile', async (userData) => {
