@@ -817,31 +817,49 @@ function applyDownloadsClearedState(target = {}, clearAt = 0) {
 function reconcileIncomingDownloads(currentUser = {}, incomingUser = {}) {
   const currentClearAt = normalizeTimestampValue(currentUser.downloadsClearedAt);
   const incomingClearAt = normalizeTimestampValue(incomingUser.downloadsClearedAt);
+  const currentDownloadsUpdatedAt = normalizeTimestampValue(currentUser.downloadsUpdatedAt || currentUser.profileUpdatedAt);
+  const incomingDownloadsUpdatedAt = normalizeTimestampValue(incomingUser.downloadsUpdatedAt || incomingUser.profileUpdatedAt);
   const hasIncomingDownloadsData = Object.prototype.hasOwnProperty.call(incomingUser, 'downloadsData');
   const hasIncomingDownloadsCount = Object.prototype.hasOwnProperty.call(incomingUser, 'downloads');
+  const hasIncomingDownloadsVersion = Object.prototype.hasOwnProperty.call(incomingUser, 'downloadsUpdatedAt');
 
-  if (hasIncomingDownloadsData && Array.isArray(incomingUser.downloadsData)) {
-    incomingUser.downloads = incomingUser.downloadsData.length;
-    incomingUser.downloadsUpdatedAt = normalizeTimestampValue(incomingUser.downloadsUpdatedAt || incomingUser.profileUpdatedAt) || Date.now();
-    if (incomingClearAt || currentClearAt) incomingUser.downloadsClearedAt = Math.max(incomingClearAt, currentClearAt);
-    return incomingUser;
-  }
-
-  if (incomingClearAt > currentClearAt && !hasIncomingDownloadsData) {
+  if (incomingClearAt > currentClearAt && (!hasIncomingDownloadsData || incomingClearAt >= incomingDownloadsUpdatedAt)) {
     incomingUser.downloadsClearedAt = incomingClearAt;
-    incomingUser.downloadsUpdatedAt = normalizeTimestampValue(incomingUser.downloadsUpdatedAt) || incomingClearAt;
+    incomingUser.downloadsUpdatedAt = incomingDownloadsUpdatedAt || incomingClearAt;
     incomingUser.downloadsData = [];
     incomingUser.downloads = 0;
     return incomingUser;
   }
 
-  if (currentClearAt > incomingClearAt && (hasIncomingDownloadsCount || Object.prototype.hasOwnProperty.call(incomingUser, 'downloadsUpdatedAt'))) {
+  if (hasIncomingDownloadsData && Array.isArray(incomingUser.downloadsData)) {
+    const incomingList = incomingUser.downloadsData;
+    const currentList = Array.isArray(currentUser.downloadsData) ? currentUser.downloadsData : [];
+    const currentHasItems = currentList.length > 0;
+    const incomingHasItems = incomingList.length > 0;
+    const acceptIncoming = !!(
+      (incomingDownloadsUpdatedAt && (!currentDownloadsUpdatedAt || incomingDownloadsUpdatedAt >= currentDownloadsUpdatedAt)) ||
+      (!currentDownloadsUpdatedAt && !currentHasItems && incomingHasItems) ||
+      (!currentDownloadsUpdatedAt && !incomingDownloadsUpdatedAt && !currentHasItems)
+    );
+
+    if (acceptIncoming) {
+      incomingUser.downloads = incomingList.length;
+      incomingUser.downloadsUpdatedAt = incomingDownloadsUpdatedAt || normalizeTimestampValue(incomingUser.profileUpdatedAt) || Date.now();
+      if (incomingClearAt || currentClearAt) incomingUser.downloadsClearedAt = Math.max(incomingClearAt, currentClearAt);
+      return incomingUser;
+    }
+
+    delete incomingUser.downloadsData;
+    delete incomingUser.downloads;
+    delete incomingUser.downloadsUpdatedAt;
+  }
+
+  if (currentClearAt > incomingClearAt && (hasIncomingDownloadsCount || hasIncomingDownloadsVersion)) {
     incomingUser.downloadsClearedAt = currentClearAt;
   }
 
   return incomingUser;
 }
-
 function mergeLocalRecoveryData(dbUser = {}, localData = {}) {
   if (!hasObjectPayload(localData)) return dbUser;
   const merged = { ...dbUser };
@@ -2183,6 +2201,21 @@ io.on('connection', async (socket) => {
         rawData: getEmptyUserDataPayload(type),
         error: 'Unable to load this list from the server cache.'
       });
+    }
+  });
+
+  socket.on('request_profile_sync', async (data = {}) => {
+    const name = socket.userName;
+    if (!name || !userDatabase[name]) return;
+
+    try {
+      if (data && data.forceRefresh === true) {
+        await refreshSingleUserCacheFromDb(name);
+      }
+
+      socket.emit('profile_sync', buildFullProfileSyncPayload(name, userDatabase[name], null));
+    } catch (err) {
+      console.error('[REQUEST PROFILE SYNC ERROR]:', err);
     }
   });
 
