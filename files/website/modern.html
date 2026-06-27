@@ -10778,7 +10778,7 @@ P
 
 	function readLocalArrayForAuth(username, key, runtimeValue = null) {
 		const activeUser = localStorage.getItem('psn_username');
-		if (activeUser === username && Array.isArray(runtimeValue) && runtimeValue.length > 0) return runtimeValue;
+		if (activeUser === username && Array.isArray(runtimeValue)) return runtimeValue;
 		const parsed = parseLocalJsonForAuth(readLocalUserValueForAuth(username, key, null), []);
 		return Array.isArray(parsed) ? parsed : [];
 	}
@@ -34309,6 +34309,56 @@ function getVisibleChatStackEl(id) {
 		}
 	};
 
+	function requestRealtimeStateAfterReconnect(reason = 'resume') {
+		try {
+			if (!(typeof socketChat !== 'undefined' && socketChat)) return false;
+			if (!socketChat.connected) {
+				try { socketChat.connect(); } catch (err) {}
+				return false;
+			}
+
+			const myName = localStorage.getItem('psn_username') || '';
+			if (!myName || myName === 'null' || myName === 'undefined') return false;
+
+			if (typeof socketChat.timeout === 'function') {
+				socketChat.timeout(2500).emit('presence_ping', { reason, at: Date.now() }, () => {});
+			} else {
+				socketChat.emit('presence_ping', { reason, at: Date.now() });
+			}
+
+			socketChat.emit('request_online_list');
+			if (window.isProfileLoaded) {
+				socketChat.emit('request_profile_sync', { forceRefresh: true, reason, at: Date.now() });
+				if (typeof window.broadcastProfileUpdate === 'function') window.broadcastProfileUpdate();
+			}
+			return true;
+		} catch (err) {
+			console.warn('[NETWORK] Could not refresh realtime state after reconnect:', err);
+			return false;
+		}
+	}
+	window.requestRealtimeStateAfterReconnect = requestRealtimeStateAfterReconnect;
+
+	function scheduleRealtimeStateRefresh(reason = 'resume') {
+		clearTimeout(window.__profileRealtimeRefreshTimer);
+		window.__profileRealtimeRefreshTimer = setTimeout(() => requestRealtimeStateAfterReconnect(reason), 250);
+		setTimeout(() => requestRealtimeStateAfterReconnect(`${reason}:retry`), 1600);
+	}
+	window.scheduleRealtimeStateRefresh = scheduleRealtimeStateRefresh;
+
+	function installRealtimeResumeHandlers() {
+		if (window.__profileRealtimeResumeHandlersInstalled) return;
+		window.__profileRealtimeResumeHandlersInstalled = true;
+		const refresh = reason => {
+			if (document.hidden) return;
+			scheduleRealtimeStateRefresh(reason);
+		};
+		document.addEventListener('visibilitychange', () => { if (!document.hidden) refresh('visibility'); });
+		window.addEventListener('pageshow', () => refresh('pageshow'));
+		window.addEventListener('focus', () => refresh('focus'));
+		window.addEventListener('online', () => refresh('online'));
+	}
+
 	function initChat() {
 		document.body.classList.remove('is-admin');
 		document.body.classList.remove('is-mod');
@@ -34327,7 +34377,15 @@ function getVisibleChatStackEl(id) {
 		
 		if (typeof updateGlobalOnlineStatus === 'function') updateGlobalOnlineStatus('connecting');
 
-		socketChat = io(serverUrls[currentServerIndex], { forceNew: true })
+		socketChat = io(serverUrls[currentServerIndex], {
+			forceNew: true,
+			reconnection: true,
+			reconnectionAttempts: Infinity,
+			reconnectionDelay: 700,
+			reconnectionDelayMax: 5000,
+			timeout: 12000,
+			closeOnBeforeunload: false
+		})
 		
 		socketChat.on('connect', () => {
 			if (typeof updateGlobalOnlineStatus === 'function') updateGlobalOnlineStatus('online');
@@ -34348,6 +34406,10 @@ function getVisibleChatStackEl(id) {
 					isNewAccount: false,
 					userData: buildLocalUserDataForAuth(myName)
 				});
+				setTimeout(() => requestRealtimeStateAfterReconnect('connect-auth'), 700);
+				setTimeout(() => requestRealtimeStateAfterReconnect('connect-auth-retry'), 2200);
+			} else {
+				setTimeout(() => requestRealtimeStateAfterReconnect('connect'), 500);
 			}
 			
 			const s = document.getElementById('chat-status-text');
@@ -34551,6 +34613,7 @@ function getVisibleChatStackEl(id) {
 			if (typeof window.broadcastProfileUpdate === 'function') {
 				window.broadcastProfileUpdate();
 			}
+			scheduleRealtimeStateRefresh('auth-success');
 		
 			window.dailyTrophyTimer = setTimeout(() => {
 				if (typeof checkDailyTrophies === 'function') {
@@ -34683,8 +34746,28 @@ function getVisibleChatStackEl(id) {
 	
 		socketChat.on('online_list', function(users) {
 			const countElement = document.getElementById('online-count');
-			if (!users) return;
-		
+			if (!Array.isArray(users)) return;
+
+			const myChatNameForPresence = localStorage.getItem('psn_username') || '';
+			const hasLoggedSocket = !!(window.isProfileLoaded && myChatNameForPresence && myChatNameForPresence !== 'null' && socketChat && socketChat.connected);
+			if (users.length === 0 && hasLoggedSocket) {
+				console.warn('[NETWORK] Ignored empty online_list while this client is connected. Requesting presence refresh.');
+				scheduleRealtimeStateRefresh('empty-online-list');
+				return;
+			}
+
+			if (hasLoggedSocket && !users.some(u => (u && (u.name || u)) === myChatNameForPresence)) {
+				users = users.concat([{
+					name: myChatNameForPresence,
+					id: socketChat.id || null,
+					avatar: localStorage.getItem(`${myChatNameForPresence}_psn_avatar`) || (typeof AVAILABLE_AVATARS !== 'undefined' ? AVAILABLE_AVATARS[0] : ''),
+					online: true,
+					lastSeen: Date.now(),
+					level: Number(localStorage.getItem(`${myChatNameForPresence}_psn_level`) || 1) || 1,
+					joined: localStorage.getItem(`${myChatNameForPresence}_joined_date`) || '2026'
+				}]);
+			}
+
 			const activeUsersCount = users.filter(u => u.online === true).length;
 			if (countElement) countElement.innerText = `${activeUsersCount} Online`;
 		
@@ -35592,6 +35675,18 @@ function getVisibleChatStackEl(id) {
 			const s = document.getElementById('chat-status-text');
 			if (s) { s.innerText = "(Disconnected)"; s.style.color = "#ffbb33"; }
 		});
+
+		if (socketChat.io) {
+			socketChat.io.on('reconnect_attempt', () => {
+				if (typeof updateGlobalOnlineStatus === 'function') updateGlobalOnlineStatus('connecting');
+			});
+			socketChat.io.on('reconnect', () => {
+				if (typeof updateGlobalOnlineStatus === 'function') updateGlobalOnlineStatus('online');
+				scheduleRealtimeStateRefresh('reconnect');
+			});
+		}
+
+		installRealtimeResumeHandlers();
 	}
 
 	window.refreshChatNotificationDot = function() {

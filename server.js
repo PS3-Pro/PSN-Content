@@ -102,6 +102,7 @@ let adminState = {
 let moderationLog = [];
 let serverLog = [];
 let adminReports = [];
+let lastKnownOnlineList = [];
 
 async function refreshAdminStateFromDb() {
   try {
@@ -1629,15 +1630,19 @@ async function syncPresenceOnlineFromDb() {
 async function emitOnlineList(targetSocket = null) {
   try {
     const list = await getSanitizedOnlineListFromDb();
+    if (Array.isArray(list) && list.length > 0) lastKnownOnlineList = list;
     if (targetSocket) targetSocket.emit('online_list', list);
     else io.emit('online_list', list);
     return list;
   } catch (err) {
     console.error('[PRESENCE SYNC ERROR]:', err);
-    const list = [];
-    if (targetSocket) targetSocket.emit('online_list', list);
-    else io.emit('online_list', list);
-    return list;
+    const fallback = Array.isArray(lastKnownOnlineList) ? lastKnownOnlineList : [];
+
+    // Never broadcast a fake empty presence list after a temporary DB/reconnect hiccup.
+    // Mobile browsers can resume before Postgres answers, and replacing everyone with
+    // [] is what made the UI show "0 Online" until the next good refresh.
+    if (targetSocket && fallback.length > 0) targetSocket.emit('online_list', fallback);
+    return fallback;
   }
 }
 
@@ -2081,6 +2086,7 @@ io.on('connection', async (socket) => {
     }
     userDatabase[name].lastSeen = Date.now();
     userDatabase[name].profileUpdatedAt = Date.now();
+    await upsertPresenceForSocket(socket, name);
 
     try {
       userCacheMeta[name] = Date.now();
@@ -2148,6 +2154,7 @@ io.on('connection', async (socket) => {
         normalizeProfileArrayPayloads(userDatabase[name]);
         userDatabase[name].lastSeen = Date.now();
         userDatabase[name].profileUpdatedAt = Date.now();
+        await upsertPresenceForSocket(socket, name);
         
         try {
             userCacheMeta[name] = Date.now();
@@ -2220,7 +2227,29 @@ io.on('connection', async (socket) => {
   });
 
   socket.on('request_online_list', async () => {
+    if (socket.userName && userDatabase[socket.userName]) {
+      await upsertPresenceForSocket(socket, socket.userName);
+      userDatabase[socket.userName].lastSeen = Date.now();
+    }
     await emitOnlineList(socket);
+  });
+
+  socket.on('presence_ping', async (data = {}, respond = () => {}) => {
+    try {
+      const name = socket.userName;
+      if (!name || !userDatabase[name]) {
+        respond({ success: false, authenticated: false });
+        return;
+      }
+
+      await upsertPresenceForSocket(socket, name);
+      userDatabase[name].lastSeen = Date.now();
+      const list = await emitOnlineList(socket);
+      respond({ success: true, authenticated: true, onlineCount: Array.isArray(list) ? list.filter(u => u && u.online === true).length : 0 });
+    } catch (err) {
+      console.error('[PRESENCE PING ERROR]:', err);
+      respond({ success: false, authenticated: !!socket.userName });
+    }
   });
 
   socket.on('search_users', async (query) => {
