@@ -11620,6 +11620,152 @@ P
 		});
 	}
 
+	const EXPLORE_VISIBLE_REVEAL_LIMIT = 36;
+	const EXPLORE_SCROLL_REVEAL_LIMIT = 18;
+
+	function cleanupExploreVisibleRevealWatcher() {
+		if (typeof window.__exploreVisibleRevealCleanup === 'function') {
+			try { window.__exploreVisibleRevealCleanup(); } catch(e) {}
+		}
+		window.__exploreVisibleRevealCleanup = null;
+	}
+
+	function getExploreRevealRootRect() {
+		const main = document.querySelector('.main-content');
+		if (main) return main.getBoundingClientRect();
+		return { top: 0, left: 0, right: window.innerWidth || document.documentElement.clientWidth || 0, bottom: window.innerHeight || document.documentElement.clientHeight || 0 };
+	}
+
+	function isExploreCardVisibleForReveal(card, container, margin = 80) {
+		if (!card || !container || !card.isConnected || !container.isConnected) return false;
+		const cardRect = card.getBoundingClientRect();
+		const containerRect = container.getBoundingClientRect();
+		const rootRect = getExploreRevealRootRect();
+
+		return (
+			cardRect.right > containerRect.left - margin &&
+			cardRect.left < containerRect.right + margin &&
+			cardRect.bottom > rootRect.top - margin &&
+			cardRect.top < rootRect.bottom + margin
+		);
+	}
+
+	function resetExploreRevealCard(card, markPending = false) {
+		if (!card) return;
+		card.classList.remove('anim-reveal');
+		card.classList.add('no-anim');
+		card.style.animation = '';
+		card.style.opacity = '';
+		card.style.removeProperty('--tile-idx');
+		if (markPending) card.dataset.exploreRevealPending = '1';
+		else delete card.dataset.exploreRevealPending;
+	}
+
+	function runExploreRevealBatch(cards) {
+		if (!cards || !cards.length) return;
+
+		cards.forEach((card, index) => {
+			if (!card || !card.isConnected) return;
+			delete card.dataset.exploreRevealPending;
+			card.classList.remove('anim-reveal', 'no-anim');
+			card.style.animation = 'none';
+			card.style.opacity = '0';
+			card.style.setProperty('--tile-idx', Math.min(index, 10));
+		});
+
+		requestAnimationFrame(() => {
+			cards.forEach(card => {
+				if (!card || !card.isConnected) return;
+				card.style.animation = '';
+				card.style.opacity = '';
+				card.classList.add('anim-reveal');
+				card.addEventListener('animationend', function(e) {
+					if (e.animationName === 'tileReveal') {
+						this.classList.remove('anim-reveal');
+						this.classList.add('no-anim');
+					}
+				}, { once: true });
+			});
+		});
+	}
+
+	function collectExploreVisibleRevealCards(containers, limit) {
+		const visibleCards = [];
+		containers.forEach(container => {
+			Array.from(container.querySelectorAll('.game-card[data-explore-reveal-pending="1"]')).forEach(card => {
+				if (!isExploreCardVisibleForReveal(card, container)) return;
+				if (visibleCards.length < limit) visibleCards.push(card);
+				else {
+					delete card.dataset.exploreRevealPending;
+					resetExploreRevealCard(card, false);
+				}
+			});
+		});
+		return visibleCards;
+	}
+
+	function setupExploreVisibleRevealWatcher(containers) {
+		cleanupExploreVisibleRevealWatcher();
+
+		const exploreView = document.getElementById('view-explore');
+		const main = document.querySelector('.main-content');
+		let rafId = 0;
+		let cleanupTimer = 0;
+
+		const hasPendingCards = () => containers.some(container => container && container.isConnected && container.querySelector('.game-card[data-explore-reveal-pending="1"]'));
+
+		const cleanup = () => {
+			if (rafId) cancelAnimationFrame(rafId);
+			if (cleanupTimer) clearTimeout(cleanupTimer);
+			containers.forEach(container => {
+				try { container.removeEventListener('scroll', scheduleCheck); } catch(e) {}
+			});
+			try { if (main) main.removeEventListener('scroll', scheduleCheck); } catch(e) {}
+			try { window.removeEventListener('resize', scheduleCheck); } catch(e) {}
+			window.__exploreVisibleRevealCleanup = null;
+		};
+
+		const check = () => {
+			rafId = 0;
+			if (!exploreView || exploreView.style.display === 'none') {
+				containers.forEach(container => {
+					if (!container || !container.isConnected) return;
+					container.querySelectorAll('.game-card[data-explore-reveal-pending="1"]').forEach(card => resetExploreRevealCard(card, false));
+				});
+				cleanup();
+				return;
+			}
+
+			const visibleCards = collectExploreVisibleRevealCards(containers, EXPLORE_SCROLL_REVEAL_LIMIT);
+			runExploreRevealBatch(visibleCards);
+
+			if (!hasPendingCards()) cleanup();
+		};
+
+		function scheduleCheck() {
+			if (!rafId) rafId = requestAnimationFrame(check);
+		}
+
+		if (!hasPendingCards()) return;
+		window.__exploreVisibleRevealCleanup = cleanup;
+
+		containers.forEach(container => {
+			try { container.addEventListener('scroll', scheduleCheck, { passive: true }); } catch(e) {}
+		});
+		try { if (main) main.addEventListener('scroll', scheduleCheck, { passive: true }); } catch(e) {}
+		try { window.addEventListener('resize', scheduleCheck, { passive: true }); } catch(e) {}
+
+		cleanupTimer = setTimeout(() => {
+			containers.forEach(container => {
+				if (!container || !container.isConnected) return;
+				container.querySelectorAll('.game-card[data-explore-reveal-pending="1"]').forEach(card => resetExploreRevealCard(card, false));
+			});
+			cleanup();
+		}, 12000);
+
+		scheduleCheck();
+	}
+
 	function replayExploreCardsReveal(options = {}) {
 		const exploreView = document.getElementById('view-explore');
 		if (!exploreView || exploreView.style.display === 'none') return;
@@ -11629,58 +11775,24 @@ P
 		const containers = Array.from(exploreView.querySelectorAll('.horizontal-scroll')).filter(container => container.querySelector('.game-card'));
 		if (!containers.length) return;
 
+		cleanupExploreVisibleRevealWatcher();
 		if (window.__exploreRevealReplayTimer) clearTimeout(window.__exploreRevealReplayTimer);
 		if (window.__exploreRevealReplayFrame) cancelAnimationFrame(window.__exploreRevealReplayFrame);
 
 		containers.forEach(container => {
-			Array.from(container.querySelectorAll('.game-card')).forEach((card, index) => {
-				card.classList.remove('anim-reveal', 'no-anim');
-				card.style.animation = 'none';
-				card.style.opacity = '0';
-				card.style.setProperty('--tile-idx', index);
-			});
+			Array.from(container.querySelectorAll('.game-card')).forEach(card => resetExploreRevealCard(card, true));
 		});
 
-		void exploreView.offsetWidth;
+		const firstVisibleCards = collectExploreVisibleRevealCards(containers, EXPLORE_VISIBLE_REVEAL_LIMIT);
+		runExploreRevealBatch(firstVisibleCards);
+		setupExploreVisibleRevealWatcher(containers);
 
-		window.__exploreRevealReplayFrame = requestAnimationFrame(() => {
-			window.__exploreRevealReplayFrame = requestAnimationFrame(() => {
-				if (!exploreView || exploreView.style.display === 'none') {
-					containers.forEach(container => {
-						container.querySelectorAll('.game-card').forEach(card => {
-							card.style.animation = '';
-							card.style.opacity = '';
-							card.classList.remove('anim-reveal');
-							card.classList.add('no-anim');
-						});
-					});
-					return;
-				}
-
-				containers.forEach(container => {
-					Array.from(container.querySelectorAll('.game-card')).forEach(card => {
-						card.style.animation = '';
-						card.style.opacity = '';
-						card.classList.add('anim-reveal');
-						card.addEventListener('animationend', function(e) {
-							if (e.animationName === 'tileReveal') {
-								this.classList.remove('anim-reveal');
-								this.classList.add('no-anim');
-							}
-						}, { once: true });
-					});
-				});
-
-				window.__exploreRevealReplayTimer = setTimeout(() => {
-					if (!exploreView || exploreView.style.display === 'none') return;
-					exploreView.querySelectorAll('.horizontal-scroll .game-card.anim-reveal').forEach(card => {
-						card.classList.remove('anim-reveal');
-						card.classList.add('no-anim');
-					});
-				}, 2600);
-			});
-		});
+		window.__exploreRevealReplayTimer = setTimeout(() => {
+			if (!exploreView || exploreView.style.display === 'none') return;
+			exploreView.querySelectorAll('.horizontal-scroll .game-card.anim-reveal').forEach(card => resetExploreRevealCard(card, false));
+		}, 1800);
 	}
+
 
 	const SITE_DISCLAIMER_SESSION_PREFIX = 'psn_site_disclaimer_seen_session_v5_2_';
 	const SITE_DISCLAIMER_DAILY_PREFIX = 'psn_site_disclaimer_skip_today_v1_';
