@@ -12910,9 +12910,12 @@ P
         window.__bootPreloadsReadyPromise = (async () => {
             await bootLowPriorityPause(120, 'high');
             const backgroundJob = loadBackgroundIndexes().catch(e => console.warn('[System] Background indexes failed', e));
+            const trophyJob = (typeof prefetchExternalTrophyDb === 'function')
+                ? prefetchExternalTrophyDb({ priority: 'high', reason }).catch(e => console.warn('[System] Trophy database warmup failed', e))
+                : Promise.resolve();
             await bootLowPriorityPause(120, 'high');
             const prefetchJob = prefetchEssentialDbs({ priority: 'high', reason }).catch(e => console.warn('[System] Prefetch failed', e));
-            await Promise.allSettled([backgroundJob, prefetchJob]);
+            await Promise.allSettled([backgroundJob, prefetchJob, trophyJob]);
             return window.psnStoreCache || {};
         })();
 
@@ -12920,9 +12923,9 @@ P
     }
 
     function waitBootPreloadsBeforeUserSelect() {
-        if (window.psnStorePrefetchReady) return Promise.resolve(window.psnStoreCache || {});
-        if (typeof startBootPreloads === 'function') startBootPreloads('starting-gate');
-        return window.__bootPreloadsReadyPromise || bootEssentialDbsPromise || Promise.resolve(window.psnStoreCache || {});
+        if (window.__bootPreloadsReadyPromise) return window.__bootPreloadsReadyPromise;
+        if (typeof startBootPreloads === 'function') return startBootPreloads('starting-gate');
+        return bootEssentialDbsPromise || Promise.resolve(window.psnStoreCache || {});
     }
     window.waitBootPreloadsBeforeUserSelect = waitBootPreloadsBeforeUserSelect;
 
@@ -15940,49 +15943,196 @@ P
 		};
 	}
 
+	async function loadExternalTrophyDbOnMainThread() {
+		const response = await fetch(EXTERNAL_TROPHY_DB_URL, { cache: 'force-cache' });
+		if (!response.ok) throw new Error('Failed to load trophy database');
+		const buffer = await response.arrayBuffer();
+		let text = '';
+
+		if ('DecompressionStream' in window) {
+			try {
+				const stream = new Blob([buffer]).stream().pipeThrough(new DecompressionStream('gzip'));
+				text = await new Response(stream).text();
+			} catch (err) {
+				text = '';
+			}
+		}
+
+		if (!text && 'TextDecoder' in window) {
+			text = new TextDecoder('utf-8').decode(buffer);
+		}
+
+		const data = JSON.parse(text);
+		externalTrophyDbGames = Object.keys(data || {}).map(id => normalizeExternalTrophyGame(id, data[id])).filter(game => game.title && game.trophies.length);
+		window.psnTrophyPrefetchReady = true;
+		return externalTrophyDbGames;
+	}
+
+	function loadExternalTrophyDbInWorker() {
+		if (!window.Worker || !window.Blob || !window.URL) return Promise.reject(new Error('Trophy worker unavailable'));
+
+		const workerSource = `
+			const EXTERNAL_TROPHY_DB_URL = ${JSON.stringify(EXTERNAL_TROPHY_DB_URL)};
+
+			function normalizeExternalTrophyGame(rawId, rawGame = {}) {
+				const platform = String(rawGame.pt || rawGame.platform || '');
+				const isPS5 = platform.toLowerCase().includes('ps5');
+				const trophies = Array.isArray(rawGame.tr) ? rawGame.tr : (Array.isArray(rawGame.trophies) ? rawGame.trophies : []);
+				return {
+					npCommunicationId: rawId,
+					title: rawGame.tt || rawGame.title || '',
+					platform,
+					trophySetVersion: rawGame.v || rawGame.trophySetVersion || '',
+					totalItemCount: Number(rawGame.c || rawGame.totalItemCount || trophies.length) || 0,
+					iconKey: rawGame.ik || rawGame.iconKey || '',
+					isPS5,
+					isSample: rawId === 'NPWR20790',
+					trophies
+				};
+			}
+
+			self.onmessage = async function(event) {
+				if (!event.data || event.data.type !== 'load') return;
+				try {
+					const response = await fetch(EXTERNAL_TROPHY_DB_URL, { cache: 'force-cache' });
+					if (!response.ok) throw new Error('Failed to load trophy database');
+					const buffer = await response.arrayBuffer();
+					let text = '';
+
+					if ('DecompressionStream' in self) {
+						try {
+							const stream = new Blob([buffer]).stream().pipeThrough(new DecompressionStream('gzip'));
+							text = await new Response(stream).text();
+						} catch (err) {
+							text = '';
+						}
+					}
+
+					if (!text && 'TextDecoder' in self) {
+						text = new TextDecoder('utf-8').decode(buffer);
+					}
+
+					const data = JSON.parse(text);
+					const keys = Object.keys(data || {});
+					let chunk = [];
+					for (let i = 0; i < keys.length; i++) {
+						const id = keys[i];
+						const game = normalizeExternalTrophyGame(id, data[id]);
+						if (game.title && game.trophies.length) chunk.push(game);
+						if (chunk.length >= 220) {
+							self.postMessage({ type: 'chunk', games: chunk });
+							chunk = [];
+							await new Promise(resolve => setTimeout(resolve, 0));
+						}
+					}
+					if (chunk.length) self.postMessage({ type: 'chunk', games: chunk });
+					self.postMessage({ type: 'done' });
+				} catch (err) {
+					self.postMessage({ type: 'error', message: err && err.message ? err.message : String(err) });
+				}
+			};
+		`;
+
+		return new Promise((resolve, reject) => {
+			let worker = null;
+			let objectUrl = '';
+			let settled = false;
+			const games = [];
+
+			const cleanup = () => {
+				try { if (worker) worker.terminate(); } catch(e) {}
+				try { if (objectUrl) URL.revokeObjectURL(objectUrl); } catch(e) {}
+			};
+
+			try {
+				objectUrl = URL.createObjectURL(new Blob([workerSource], { type: 'application/javascript' }));
+				worker = new Worker(objectUrl);
+			} catch (err) {
+				cleanup();
+				reject(err);
+				return;
+			}
+
+			const failTimer = setTimeout(() => {
+				if (settled) return;
+				settled = true;
+				cleanup();
+				reject(new Error('Trophy worker timeout'));
+			}, 45000);
+
+			worker.onmessage = event => {
+				const msg = event.data || {};
+				if (msg.type === 'chunk' && Array.isArray(msg.games)) {
+					for (let i = 0; i < msg.games.length; i++) games.push(msg.games[i]);
+					return;
+				}
+
+				if (msg.type === 'done') {
+					if (settled) return;
+					settled = true;
+					clearTimeout(failTimer);
+					cleanup();
+					externalTrophyDbGames = games;
+					window.psnTrophyPrefetchReady = true;
+					resolve(games);
+					return;
+				}
+
+				if (msg.type === 'error') {
+					if (settled) return;
+					settled = true;
+					clearTimeout(failTimer);
+					cleanup();
+					reject(new Error(msg.message || 'Trophy worker failed'));
+				}
+			};
+
+			worker.onerror = err => {
+				if (settled) return;
+				settled = true;
+				clearTimeout(failTimer);
+				cleanup();
+				reject(err);
+			};
+
+			worker.postMessage({ type: 'load' });
+		});
+	}
+
 	async function loadExternalTrophyDb() {
 		if (externalTrophyDbGames) return externalTrophyDbGames;
 		if (externalTrophyDbPromise) return externalTrophyDbPromise;
 
-		externalTrophyDbPromise = (async () => {
-			const response = await fetch(EXTERNAL_TROPHY_DB_URL, { cache: 'force-cache' });
-			if (!response.ok) throw new Error('Failed to load trophy database');
-			const buffer = await response.arrayBuffer();
-			let text = '';
-
-			if ('DecompressionStream' in window) {
-				try {
-					const stream = new Blob([buffer]).stream().pipeThrough(new DecompressionStream('gzip'));
-					text = await new Response(stream).text();
-				} catch (err) {
-					text = '';
-				}
-			}
-
-			if (!text && 'TextDecoder' in window) {
-				text = new TextDecoder('utf-8').decode(buffer);
-			}
-
-			const data = JSON.parse(text);
-			externalTrophyDbGames = Object.keys(data || {}).map(id => normalizeExternalTrophyGame(id, data[id])).filter(game => game.title && game.trophies.length);
-			return externalTrophyDbGames;
-		})();
+		externalTrophyDbPromise = loadExternalTrophyDbInWorker()
+			.catch(err => {
+				console.warn('[System] Trophy worker unavailable. Falling back to main thread.', err);
+				return loadExternalTrophyDbOnMainThread();
+			});
 
 		return externalTrophyDbPromise;
 	}
 
-	function prefetchExternalTrophyDb() {
-		if (externalTrophyDbGames || externalTrophyDbPromise) return;
-		const run = () => loadExternalTrophyDb().catch(() => {});
+	function prefetchExternalTrophyDb(options = {}) {
+		if (externalTrophyDbGames) return Promise.resolve(externalTrophyDbGames);
+		if (externalTrophyDbPromise) return externalTrophyDbPromise;
+
+		const highPriority = options.priority === 'high' || options.wait === true || options.immediate === true;
+		const run = () => loadExternalTrophyDb().catch(err => {
+			console.warn('[System] Trophy database prefetch failed', err);
+			return null;
+		});
+
+		if (highPriority) return run();
 		if ('requestIdleCallback' in window) {
 			window.requestIdleCallback(run, { timeout: 2500 });
 		} else {
 			setTimeout(run, 1200);
 		}
+		return Promise.resolve(null);
 	}
 
 	if (document.readyState === 'loading') {
-		document.addEventListener('DOMContentLoaded', prefetchExternalTrophyDb, { once: true });
+		document.addEventListener('DOMContentLoaded', () => prefetchExternalTrophyDb(), { once: true });
 	} else {
 		prefetchExternalTrophyDb();
 	}
