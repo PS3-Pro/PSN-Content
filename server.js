@@ -1,6 +1,5 @@
 const express = require('express');
 const http = require('http');
-const https = require('https');
 const { Server } = require("socket.io");
 const { Pool, Client } = require('pg');
 const bcrypt = require('bcrypt');
@@ -8,14 +7,6 @@ const bcrypt = require('bcrypt');
 const app = express();
 const server = http.createServer(app);
 
-const APP_URLS = [
-  "https://psn-content-cb4c.onrender.com/ping",
-  "https://psn-content-nnb8.onrender.com/ping",
-  "https://psn-content-fbni.onrender.com/ping",
-  "https://psn-content-4sof.onrender.com/ping",
-  "https://psn-content-0st4.onrender.com/ping",
-  "https://psn-content-mwp5.onrender.com/ping",
-];
 
 const ADMIN_USERS = ["Luan Teles", "Goku Cheats", "JumpSuit"];
 
@@ -39,13 +30,116 @@ const ADMIN_STATE_KEYS = {
   pinnedAnnouncement: "pinned_announcement"
 };
 
+const PG_POOL_MAX = Math.max(1, Math.min(5, parseInt(process.env.PG_POOL_MAX || process.env.DB_POOL_MAX || "3", 10) || 3));
+const PG_CONNECTION_TIMEOUT_MS = Math.max(1000, parseInt(process.env.PG_CONNECTION_TIMEOUT_MS || "5000", 10) || 5000);
+const PG_IDLE_TIMEOUT_MS = Math.max(5000, parseInt(process.env.PG_IDLE_TIMEOUT_MS || "10000", 10) || 10000);
+const PG_QUERY_TIMEOUT_MS = Math.max(5000, parseInt(process.env.PG_QUERY_TIMEOUT_MS || "20000", 10) || 20000);
+const PG_STATEMENT_TIMEOUT_MS = Math.max(5000, parseInt(process.env.PG_STATEMENT_TIMEOUT_MS || "15000", 10) || 15000);
+const PG_MAX_USES = Math.max(100, parseInt(process.env.PG_MAX_USES || "750", 10) || 750);
+const ONLINE_LIST_CACHE_MS = Math.max(250, parseInt(process.env.ONLINE_LIST_CACHE_MS || "1200", 10) || 1200);
+const ONLINE_LIST_UNCHANGED_SKIP_ENABLED = process.env.ONLINE_LIST_SKIP_UNCHANGED !== "0";
+
 const pgConnectionOptions = {
   connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false }
+  ssl: { rejectUnauthorized: false },
+  application_name: String(`psn-db-${INSTANCE_ID}`).slice(0, 63),
+  connectionTimeoutMillis: PG_CONNECTION_TIMEOUT_MS,
+  statement_timeout: PG_STATEMENT_TIMEOUT_MS,
+  query_timeout: PG_QUERY_TIMEOUT_MS
 };
 
-const pool = new Pool(pgConnectionOptions);
+const pool = new Pool({
+  ...pgConnectionOptions,
+  max: PG_POOL_MAX,
+  min: 0,
+  idleTimeoutMillis: PG_IDLE_TIMEOUT_MS,
+  maxUses: PG_MAX_USES,
+  allowExitOnIdle: false
+});
 let profileSyncNotifyClient = null;
+let profileSyncReconnectTimer = null;
+
+let onlineListCache = null;
+let onlineListCacheAt = 0;
+let onlineListBuildInFlight = null;
+let lastBroadcastOnlineListSignature = "";
+
+function invalidateOnlineListCache(reason = "") {
+  onlineListCache = null;
+  onlineListCacheAt = 0;
+  if (reason && process.env.DEBUG_ONLINE_CACHE === "1") {
+    console.log(`[ONLINE CACHE] invalidated: ${reason}`);
+  }
+}
+
+function stableStringifySmall(value) {
+  if (!value) return "";
+  if (typeof value !== "object") return String(value);
+  try { return JSON.stringify(value); } catch (err) { return String(value); }
+}
+
+function buildOnlineListSignature(list = []) {
+  if (!Array.isArray(list) || !list.length) return "empty";
+  return list.map(user => {
+    const online = user && user.online === true;
+    const lastSeenToken = online ? "" : String(user && user.lastSeen || "");
+    return [
+      user && user.name || "",
+      online ? "1" : "0",
+      online ? (user && user.id || "") : "",
+      lastSeenToken,
+      user && user.profileUpdatedAt || 0,
+      user && user.avatar || "",
+      user && user.role || "",
+      user && user.banned ? "1" : "0",
+      stableStringifySmall(user && user.ps3Status)
+    ].join(":");
+  }).join("|");
+}
+
+function getOnlineCountFromList(list = []) {
+  return Array.isArray(list) ? list.reduce((count, user) => count + (user && user.online === true ? 1 : 0), 0) : 0;
+}
+
+function hasAdminSockets() {
+  for (const client of io.sockets.sockets.values()) {
+    if (client && client.connected && client.isAdmin === true) return true;
+  }
+  return false;
+}
+
+pool.on('error', (err) => {
+  console.error('[DB POOL IDLE ERROR]:', err && err.message ? err.message : err);
+});
+
+function isPgConnectionLimitError(err) {
+  return !!(err && (err.code === '53300' || /remaining connection slots|too many clients/i.test(String(err.message || ''))));
+}
+
+function scheduleProfileSyncReconnect(delayMs = 5000) {
+  if (profileSyncReconnectTimer) return;
+  profileSyncReconnectTimer = setTimeout(() => {
+    profileSyncReconnectTimer = null;
+    initProfileSyncNotifications().catch(e => console.error('[PROFILE LISTEN RECONNECT ERROR]:', e));
+  }, delayMs);
+}
+
+function runNonOverlappingTask(taskName, taskFn) {
+  let running = false;
+  return async () => {
+    if (running) return;
+    running = true;
+    try {
+      await taskFn();
+    } catch (err) {
+      console.error(`[${taskName} ERROR]:`, err);
+    } finally {
+      running = false;
+    }
+  };
+}
+
+
 
 app.get('/ping', (req, res) => {
   res.send('Server is Awake!');
@@ -103,6 +197,9 @@ let moderationLog = [];
 let serverLog = [];
 let adminReports = [];
 let lastKnownOnlineList = [];
+let adminStateLastRefreshAt = 0;
+let adminStateRefreshInFlight = null;
+let adminStateConnectionLimitWarnedAt = 0;
 
 async function refreshAdminStateFromDb() {
   try {
@@ -116,10 +213,28 @@ async function refreshAdminStateFromDb() {
         adminState.pinnedAnnouncement = row.data && row.data.text ? row.data : null;
       }
     });
+    adminStateLastRefreshAt = Date.now();
   } catch (err) {
-    console.error('[ADMIN STATE REFRESH ERROR]:', err);
+    if (isPgConnectionLimitError(err)) {
+      const now = Date.now();
+      if (now - adminStateConnectionLimitWarnedAt > 30000) {
+        adminStateConnectionLimitWarnedAt = now;
+        console.error('[ADMIN STATE REFRESH ERROR]: PostgreSQL connection limit reached; using cached admin state.');
+      }
+    } else {
+      console.error('[ADMIN STATE REFRESH ERROR]:', err);
+    }
   }
   return adminState;
+}
+
+async function refreshAdminStateThrottled(maxAgeMs = 3000) {
+  if (adminStateRefreshInFlight) return adminStateRefreshInFlight;
+  if (adminStateLastRefreshAt && Date.now() - adminStateLastRefreshAt < maxAgeMs) return adminState;
+
+  adminStateRefreshInFlight = refreshAdminStateFromDb()
+    .finally(() => { adminStateRefreshInFlight = null; });
+  return adminStateRefreshInFlight;
 }
 
 async function refreshModerationLogFromDb() {
@@ -232,72 +347,82 @@ initDb()
   .catch(console.error);
 
 
-setInterval(() => {
-  APP_URLS.forEach(url => {
-    https.get(url, (res) => {
-      console.log(`Auto-ping [${url}]: Status ${res.statusCode}`);
-    }).on('error', (err) => {
-      console.error(`Auto-ping error [${url}]:`, err.message);
+
+async function getSanitizedOnlineListFromDb(options = {}) {
+  const now = Date.now();
+  const maxAgeMs = options.force === true ? 0 : Math.max(0, Number(options.maxAgeMs || ONLINE_LIST_CACHE_MS) || 0);
+
+  if (maxAgeMs > 0 && Array.isArray(onlineListCache) && onlineListCacheAt && now - onlineListCacheAt < maxAgeMs) {
+    return onlineListCache;
+  }
+
+  if (onlineListBuildInFlight) return onlineListBuildInFlight;
+
+  onlineListBuildInFlight = (async () => {
+    await ensureUserCacheReady();
+    await pool.query(`DELETE FROM presence_sessions WHERE last_seen < NOW() - INTERVAL '90 seconds'`);
+
+    const presenceRes = await pool.query(`
+      SELECT name,
+             MAX(last_seen) AS last_seen,
+             (ARRAY_AGG(socket_id ORDER BY last_seen DESC))[1] AS socket_id,
+             COUNT(socket_id)::int AS active_sessions
+      FROM presence_sessions
+      WHERE last_seen > NOW() - INTERVAL '90 seconds'
+      GROUP BY name
+    `);
+
+    Object.values(userDatabase).forEach(user => {
+      user.online = false;
+      if (!user.lastSeen) user.lastSeen = null;
     });
-  });
-}, 840000);
 
-async function getSanitizedOnlineListFromDb() {
-  await ensureUserCacheReady();
-  await pool.query(`DELETE FROM presence_sessions WHERE last_seen < NOW() - INTERVAL '90 seconds'`);
-
-  const presenceRes = await pool.query(`
-    SELECT name,
-           MAX(last_seen) AS last_seen,
-           (ARRAY_AGG(socket_id ORDER BY last_seen DESC))[1] AS socket_id,
-           COUNT(socket_id)::int AS active_sessions
-    FROM presence_sessions
-    WHERE last_seen > NOW() - INTERVAL '90 seconds'
-    GROUP BY name
-  `);
-
-  Object.values(userDatabase).forEach(user => {
-    user.online = false;
-    if (!user.lastSeen) user.lastSeen = null;
-  });
-
-  presenceRes.rows.forEach(row => {
-    const username = row.name;
-    if (!userDatabase[username]) return;
-    userDatabase[username].online = Number(row.active_sessions || 0) > 0;
-    userDatabase[username].id = row.socket_id || userDatabase[username].id || null;
-    userDatabase[username].lastSeen = row.last_seen ? new Date(row.last_seen).getTime() : (userDatabase[username].lastSeen || Date.now());
-  });
-
-  return Object.keys(userDatabase)
-    .sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()))
-    .map(username => {
-      const hydratedUser = userDatabase[username] || {};
-      return {
-        id: hydratedUser.id,
-        name: username,
-        avatar: hydratedUser.avatar || DEFAULT_AVATAR,
-        isAdmin: isUserAdmin(username, hydratedUser),
-        role: getUserRole(username, hydratedUser),
-        banned: isUserBanned(hydratedUser),
-        banReason: hydratedUser.banReason || "",
-        level: hydratedUser.level || 1,
-        joined: hydratedUser.joined || '2026',
-        online: hydratedUser.online === true,
-        lastSeen: hydratedUser.lastSeen || null,
-        ps3Status: hydratedUser.ps3Status || null,
-        profileUpdatedAt: normalizeTimestampValue(hydratedUser.profileUpdatedAt),
-        profileCardStyle: getUserProfileCardStyle(hydratedUser),
-        profileCardEffect: getUserProfileCardStyle(hydratedUser),
-        settingsData: getPublicProfileSettings(hydratedUser),
-        downloadsClearedAt: normalizeTimestampValue(hydratedUser.downloadsClearedAt),
-        downloads: Array.isArray(hydratedUser.downloadsData) ? hydratedUser.downloadsData.length : (hydratedUser.downloads || 0),
-        wishlist: Array.isArray(hydratedUser.wishlistData) ? hydratedUser.wishlistData.length : (hydratedUser.wishlist || 0),
-        favorites: Array.isArray(hydratedUser.favoritesData) ? hydratedUser.favoritesData.length : (hydratedUser.favorites || 0),
-        trophies: hydratedUser.trophies || 0,
-        library: Array.isArray(hydratedUser.libraryData) ? hydratedUser.libraryData.length : (hydratedUser.library || 0)
-      };
+    presenceRes.rows.forEach(row => {
+      const username = row.name;
+      if (!userDatabase[username]) return;
+      userDatabase[username].online = Number(row.active_sessions || 0) > 0;
+      userDatabase[username].id = row.socket_id || userDatabase[username].id || null;
+      userDatabase[username].lastSeen = row.last_seen ? new Date(row.last_seen).getTime() : (userDatabase[username].lastSeen || Date.now());
     });
+
+    const list = Object.keys(userDatabase)
+      .sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()))
+      .map(username => {
+        const hydratedUser = userDatabase[username] || {};
+        return {
+          id: hydratedUser.id,
+          name: username,
+          avatar: hydratedUser.avatar || DEFAULT_AVATAR,
+          isAdmin: isUserAdmin(username, hydratedUser),
+          role: getUserRole(username, hydratedUser),
+          banned: isUserBanned(hydratedUser),
+          banReason: hydratedUser.banReason || "",
+          level: hydratedUser.level || 1,
+          joined: hydratedUser.joined || '2026',
+          online: hydratedUser.online === true,
+          lastSeen: hydratedUser.lastSeen || null,
+          ps3Status: hydratedUser.ps3Status || null,
+          profileUpdatedAt: normalizeTimestampValue(hydratedUser.profileUpdatedAt),
+          profileCardStyle: getUserProfileCardStyle(hydratedUser),
+          profileCardEffect: getUserProfileCardStyle(hydratedUser),
+          settingsData: getPublicProfileSettings(hydratedUser),
+          downloadsClearedAt: normalizeTimestampValue(hydratedUser.downloadsClearedAt),
+          downloads: Array.isArray(hydratedUser.downloadsData) ? hydratedUser.downloadsData.length : (hydratedUser.downloads || 0),
+          wishlist: Array.isArray(hydratedUser.wishlistData) ? hydratedUser.wishlistData.length : (hydratedUser.wishlist || 0),
+          favorites: Array.isArray(hydratedUser.favoritesData) ? hydratedUser.favoritesData.length : (hydratedUser.favorites || 0),
+          trophies: hydratedUser.trophies || 0,
+          library: Array.isArray(hydratedUser.libraryData) ? hydratedUser.libraryData.length : (hydratedUser.library || 0)
+        };
+      });
+
+    onlineListCache = list;
+    onlineListCacheAt = Date.now();
+    return list;
+  })().finally(() => {
+    onlineListBuildInFlight = null;
+  });
+
+  return onlineListBuildInFlight;
 }
 async function calculateGlobalTrophyStatsFromDb() {
   const stats = {};
@@ -1001,6 +1126,7 @@ async function refreshAllUsersCacheFromDb(options = {}) {
     userCacheMeta = nextMeta;
     userCacheLastFullRefresh = now;
     await syncPresenceOnlineFromDb();
+    invalidateOnlineListCache("users-full-refresh");
     console.log(`[USER CACHE] ${Object.keys(userDatabase).length} users loaded from DB into RAM on ${INSTANCE_ID}.`);
     return userDatabase;
   })();
@@ -1020,6 +1146,7 @@ async function refreshSingleUserCacheFromDb(name, options = {}) {
   if (!userRes.rows.length) {
     delete userDatabase[safeName];
     delete userCacheMeta[safeName];
+    invalidateOnlineListCache("single-user-missing");
     return null;
   }
 
@@ -1038,6 +1165,7 @@ async function refreshSingleUserCacheFromDb(name, options = {}) {
     lastSeen: preserveOnline ? (localUser.lastSeen || baseUser.lastSeen || null) : (baseUser.lastSeen || null)
   };
   userCacheMeta[safeName] = keepLocalProfile ? (userCacheMeta[safeName] || Date.now()) : Date.now();
+  invalidateOnlineListCache("single-user-refresh");
   return userDatabase[safeName];
 }
 
@@ -1236,6 +1364,7 @@ async function saveUser(name, options = {}) {
   userDatabase[name].profileUpdatedAt = userDatabase[name].profileUpdatedAt || Date.now();
   userCacheMeta[name] = Date.now();
   await pool.query('UPDATE users SET data = $1 WHERE name = $2', [userDatabase[name], name]);
+  invalidateOnlineListCache('save-user');
   if (options.notify !== false) {
     await notifyProfileSyncAcrossInstances(name, options.sourceSocketId || null, userDatabase[name].profileUpdatedAt);
   }
@@ -1553,6 +1682,7 @@ async function initProfileSyncNotifications() {
         emitProfileSync(name, data.sourceSocketId || null);
       }
       emitPublicProfileBannerUpdate(name, refreshedUser);
+      invalidateOnlineListCache("profile-sync-listen");
       await emitOnlineList();
     } catch (err) {
       console.error('[PROFILE LISTEN ERROR]:', err);
@@ -1560,9 +1690,15 @@ async function initProfileSyncNotifications() {
   });
 
   client.on('error', (err) => {
-    console.error('[PROFILE LISTEN CONNECTION ERROR]:', err);
-    profileSyncNotifyClient = null;
-    setTimeout(() => initProfileSyncNotifications().catch(e => console.error('[PROFILE LISTEN RECONNECT ERROR]:', e)), 5000);
+    console.error('[PROFILE LISTEN CONNECTION ERROR]:', err && err.message ? err.message : err);
+    if (profileSyncNotifyClient === client) profileSyncNotifyClient = null;
+    client.end().catch(() => {});
+    scheduleProfileSyncReconnect(isPgConnectionLimitError(err) ? 15000 : 5000);
+  });
+
+  client.on('end', () => {
+    if (profileSyncNotifyClient === client) profileSyncNotifyClient = null;
+    scheduleProfileSyncReconnect(5000);
   });
 
   try {
@@ -1570,9 +1706,10 @@ async function initProfileSyncNotifications() {
     await client.query('LISTEN profile_sync');
     console.log('[PROFILE SYNC] Postgres LISTEN enabled.');
   } catch (err) {
-    profileSyncNotifyClient = null;
-    console.error('[PROFILE LISTEN INIT ERROR]:', err);
-    setTimeout(() => initProfileSyncNotifications().catch(e => console.error('[PROFILE LISTEN RECONNECT ERROR]:', e)), 5000);
+    if (profileSyncNotifyClient === client) profileSyncNotifyClient = null;
+    console.error('[PROFILE LISTEN INIT ERROR]:', err && err.message ? err.message : err);
+    await client.end().catch(() => {});
+    scheduleProfileSyncReconnect(isPgConnectionLimitError(err) ? 15000 : 5000);
   }
 }
 
@@ -1593,11 +1730,13 @@ async function upsertPresenceForSocket(socket, name) {
      ON CONFLICT (socket_id) DO UPDATE SET name = $2, instance_id = $3, last_seen = NOW(), data = $4`,
     [socket.id, name, INSTANCE_ID, { role: getUserRole(name, userDatabase[name] || null) }]
   );
+  invalidateOnlineListCache('presence-upsert');
 }
 
 async function removePresenceForSocket(socket) {
   if (!socket || !socket.id) return;
   await pool.query('DELETE FROM presence_sessions WHERE socket_id = $1', [socket.id]);
+  invalidateOnlineListCache('presence-remove');
 }
 
 async function syncPresenceOnlineFromDb() {
@@ -1624,15 +1763,29 @@ async function syncPresenceOnlineFromDb() {
     userDatabase[username].lastSeen = row.last_seen ? new Date(row.last_seen).getTime() : Date.now();
   });
 
+  invalidateOnlineListCache("presence-sync");
   return userDatabase;
 }
 
-async function emitOnlineList(targetSocket = null) {
+async function emitOnlineList(targetSocket = null, options = {}) {
   try {
-    const list = await getSanitizedOnlineListFromDb();
+    const list = await getSanitizedOnlineListFromDb(options);
     if (Array.isArray(list) && list.length > 0) lastKnownOnlineList = list;
-    if (targetSocket) targetSocket.emit('online_list', list);
-    else io.emit('online_list', list);
+
+    if (targetSocket) {
+      targetSocket.emit('online_list', list);
+      targetSocket.emit('online_count', { count: getOnlineCountFromList(list) });
+      return list;
+    }
+
+    const signature = buildOnlineListSignature(list);
+    if (ONLINE_LIST_UNCHANGED_SKIP_ENABLED && options.force !== true && signature === lastBroadcastOnlineListSignature) {
+      return list;
+    }
+
+    lastBroadcastOnlineListSignature = signature;
+    io.emit('online_list', list);
+    io.emit('online_count', { count: getOnlineCountFromList(list) });
     return list;
   } catch (err) {
     console.error('[PRESENCE SYNC ERROR]:', err);
@@ -1641,7 +1794,10 @@ async function emitOnlineList(targetSocket = null) {
     // Never broadcast a fake empty presence list after a temporary DB/reconnect hiccup.
     // Mobile browsers can resume before Postgres answers, and replacing everyone with
     // [] is what made the UI show "0 Online" until the next good refresh.
-    if (targetSocket && fallback.length > 0) targetSocket.emit('online_list', fallback);
+    if (targetSocket && fallback.length > 0) {
+      targetSocket.emit('online_list', fallback);
+      targetSocket.emit('online_count', { count: getOnlineCountFromList(fallback), stale: true });
+    }
     return fallback;
   }
 }
@@ -1652,8 +1808,32 @@ async function heartbeatPresenceSessions() {
     if (client.connected && client.userName) activeSockets.push(client);
   });
 
-  for (const client of activeSockets) {
-    await upsertPresenceForSocket(client, client.userName);
+  if (activeSockets.length > 0) {
+    const socketIds = [];
+    const names = [];
+    const instanceIds = [];
+    const payloads = [];
+
+    activeSockets.forEach(client => {
+      socketIds.push(client.id);
+      names.push(client.userName);
+      instanceIds.push(INSTANCE_ID);
+      payloads.push({ role: getUserRole(client.userName, userDatabase[client.userName] || null) });
+      if (userDatabase[client.userName]) userDatabase[client.userName].lastSeen = Date.now();
+    });
+
+    await pool.query(
+      `INSERT INTO presence_sessions (socket_id, name, instance_id, connected_at, last_seen, data)
+       SELECT socket_id, name, instance_id, NOW(), NOW(), data
+       FROM UNNEST($1::text[], $2::text[], $3::text[], $4::jsonb[]) AS t(socket_id, name, instance_id, data)
+       ON CONFLICT (socket_id) DO UPDATE SET
+         name = EXCLUDED.name,
+         instance_id = EXCLUDED.instance_id,
+         last_seen = NOW(),
+         data = EXCLUDED.data`,
+      [socketIds, names, instanceIds, payloads]
+    );
+    invalidateOnlineListCache("presence-heartbeat");
   }
 
   await emitOnlineList();
@@ -1851,12 +2031,17 @@ const io = new Server(server, {
 
 async function syncAdminStateAcrossInstances() {
   const previous = JSON.stringify(adminState);
-  const previousServerLog = JSON.stringify(serverLog);
-  await refreshAdminStateFromDb();
-  await refreshServerLogFromDb();
+  const adminConnected = hasAdminSockets();
+  const previousServerLog = adminConnected ? JSON.stringify(serverLog) : "";
 
-  if (JSON.stringify(serverLog) !== previousServerLog) {
-    emitToAdmins('admin_server_log_list', serverLog);
+  await refreshAdminStateThrottled(8000);
+
+  if (adminConnected) {
+    await refreshServerLogFromDb();
+
+    if (JSON.stringify(serverLog) !== previousServerLog) {
+      emitToAdmins('admin_server_log_list', serverLog);
+    }
   }
 
   if (JSON.stringify(adminState) === previous) return;
@@ -1868,31 +2053,29 @@ async function syncAdminStateAcrossInstances() {
     maintenance: adminState.maintenance,
     chatControls: adminState.chatControls,
     pinnedAnnouncement: adminState.pinnedAnnouncement || null,
-    reports: adminReports,
-    serverLog
+    reports: adminConnected ? adminReports : [],
+    serverLog: adminConnected ? serverLog : []
   });
 }
 
-setInterval(() => {
-  syncAdminStateAcrossInstances().catch(err => console.error('[ADMIN STATE SYNC ERROR]:', err));
-}, 15000);
+const syncAdminStateIntervalTask = runNonOverlappingTask('ADMIN STATE SYNC', syncAdminStateAcrossInstances);
+const presenceHeartbeatIntervalTask = runNonOverlappingTask('PRESENCE HEARTBEAT', heartbeatPresenceSessions);
+const chatPollIntervalTask = runNonOverlappingTask('CHAT POLL', syncChatAcrossInstances);
+const profileSyncIntervalTask = runNonOverlappingTask('PROFILE SYNC', syncActiveProfilesAcrossInstances);
 
-setInterval(() => {
-  heartbeatPresenceSessions().catch(err => console.error('[PRESENCE HEARTBEAT ERROR]:', err));
-}, PRESENCE_HEARTBEAT_MS);
-
-setInterval(() => {
-  syncChatAcrossInstances().catch(err => console.error('[CHAT POLL ERROR]:', err));
-}, CHAT_SYNC_INTERVAL_MS);
-
-setInterval(() => {
-  syncActiveProfilesAcrossInstances().catch(err => console.error('[PROFILE SYNC ERROR]:', err));
-}, PROFILE_SYNC_INTERVAL_MS);
+setInterval(syncAdminStateIntervalTask, 15000);
+setInterval(presenceHeartbeatIntervalTask, PRESENCE_HEARTBEAT_MS);
+setInterval(chatPollIntervalTask, CHAT_SYNC_INTERVAL_MS);
+setInterval(profileSyncIntervalTask, PROFILE_SYNC_INTERVAL_MS);
 
 io.on('connection', async (socket) => {
   console.log('[NETWORK] Socket connected. ID: ' + socket.id);
-  await refreshAdminStateFromDb();
-  await emitAdminState(socket);
+  try {
+    await refreshAdminStateThrottled(5000);
+    await emitAdminState(socket);
+  } catch (err) {
+    console.error('[CONNECTION INIT ERROR]:', err);
+  }
 
   socket.on('authenticate_user', async (data = {}) => {
     try {
@@ -1958,6 +2141,7 @@ io.on('connection', async (socket) => {
           userCacheMeta[name] = Date.now();
           
           await pool.query('UPDATE users SET data = $1 WHERE name = $2', [userDatabase[name], name]);
+          invalidateOnlineListCache('auth-existing-save');
           await notifyProfileSyncAcrossInstances(name, socket.id, userDatabase[name].profileUpdatedAt);
           await upsertPresenceForSocket(socket, name);
           await refreshChatHistoryFromDb();
@@ -2026,6 +2210,7 @@ io.on('connection', async (socket) => {
           'INSERT INTO users (name, data) VALUES ($1, $2)',
           [name, userDatabase[name]]
         );
+        invalidateOnlineListCache('auth-new-user');
         await notifyProfileSyncAcrossInstances(name, socket.id, userDatabase[name].profileUpdatedAt);
         await upsertPresenceForSocket(socket, name);
         await refreshChatHistoryFromDb();
@@ -2091,6 +2276,7 @@ io.on('connection', async (socket) => {
     try {
       userCacheMeta[name] = Date.now();
       await pool.query('UPDATE users SET data = $1 WHERE name = $2', [userDatabase[name], name]);
+      invalidateOnlineListCache('settings-realtime-save');
     } catch (err) {
       console.error(`[DATABASE ERROR] Failed to save realtime settings for ${name}:`, err);
     }
@@ -2159,6 +2345,7 @@ io.on('connection', async (socket) => {
         try {
             userCacheMeta[name] = Date.now();
             await pool.query('UPDATE users SET data = $1 WHERE name = $2', [userDatabase[name], name]);
+            invalidateOnlineListCache('profile-update-save');
         } catch (err) {
             console.error(`[DATABASE ERROR] Failed to save profile for ${name}:`, err);
         }
@@ -2227,11 +2414,18 @@ io.on('connection', async (socket) => {
   });
 
   socket.on('request_online_list', async () => {
-    if (socket.userName && userDatabase[socket.userName]) {
-      await upsertPresenceForSocket(socket, socket.userName);
-      userDatabase[socket.userName].lastSeen = Date.now();
+    try {
+      if (socket.userName && userDatabase[socket.userName]) {
+        await upsertPresenceForSocket(socket, socket.userName);
+        userDatabase[socket.userName].lastSeen = Date.now();
+      }
+      await emitOnlineList(socket);
+    } catch (err) {
+      console.error('[REQUEST ONLINE LIST ERROR]:', err);
+      if (Array.isArray(lastKnownOnlineList) && lastKnownOnlineList.length > 0) {
+        socket.emit('online_list', lastKnownOnlineList);
+      }
     }
-    await emitOnlineList(socket);
   });
 
   socket.on('presence_ping', async (data = {}, respond = () => {}) => {
@@ -2673,31 +2867,41 @@ io.on('connection', async (socket) => {
   });
 
   socket.on('admin_request_chat_controls', async (data, callback) => {
-    await refreshAdminStateFromDb();
-    const payload = adminState.chatControls || normalizeChatControls({});
-    socket.emit('chat_controls', payload);
-    if (socket.isAdmin === true) socket.emit('admin_chat_controls_state', payload);
-    if (typeof callback === 'function') callback({ success: true, state: payload });
+    try {
+      await refreshAdminStateThrottled(3000);
+      const payload = adminState.chatControls || normalizeChatControls({});
+      socket.emit('chat_controls', payload);
+      if (socket.isAdmin === true) socket.emit('admin_chat_controls_state', payload);
+      if (typeof callback === 'function') callback({ success: true, state: payload });
+    } catch (err) {
+      console.error('[ADMIN CHAT CONTROLS REQUEST ERROR]:', err);
+      if (typeof callback === 'function') callback({ success: false, message: 'Server error while loading chat controls.' });
+    }
   });
 
   socket.on('admin_request_admin_state', async (data, callback) => {
-    await refreshAdminStateFromDb();
-    if (socket.isAdmin === true) {
-      await refreshReportsFromDb();
-      await refreshServerLogFromDb();
+    try {
+      await refreshAdminStateThrottled(3000);
+      if (socket.isAdmin === true) {
+        await refreshReportsFromDb();
+        await refreshServerLogFromDb();
+      }
+      const payload = {
+        maintenance: adminState.maintenance,
+        chatControls: adminState.chatControls,
+        pinnedAnnouncement: adminState.pinnedAnnouncement || null,
+        reports: socket.isAdmin === true ? adminReports : [],
+        serverLog: socket.isAdmin === true ? serverLog : []
+      };
+      socket.emit('admin_state', payload);
+      socket.emit('maintenance_mode', adminState.maintenance);
+      socket.emit('chat_controls', adminState.chatControls);
+      socket.emit('admin_pinned_announcement', adminState.pinnedAnnouncement || { clear: true });
+      if (typeof callback === 'function') callback({ success: true, state: payload });
+    } catch (err) {
+      console.error('[ADMIN STATE REQUEST ERROR]:', err);
+      if (typeof callback === 'function') callback({ success: false, message: 'Server error while loading admin state.' });
     }
-    const payload = {
-      maintenance: adminState.maintenance,
-      chatControls: adminState.chatControls,
-      pinnedAnnouncement: adminState.pinnedAnnouncement || null,
-      reports: socket.isAdmin === true ? adminReports : [],
-      serverLog: socket.isAdmin === true ? serverLog : []
-    };
-    socket.emit('admin_state', payload);
-    socket.emit('maintenance_mode', adminState.maintenance);
-    socket.emit('chat_controls', adminState.chatControls);
-    socket.emit('admin_pinned_announcement', adminState.pinnedAnnouncement || { clear: true });
-    if (typeof callback === 'function') callback({ success: true, state: payload });
   });
 
   socket.on('admin_chat_controls', async (data, callback) => {
@@ -3097,7 +3301,9 @@ io.on('connection', async (socket) => {
 
   socket.on('disconnect', async () => {
     const name = socket.userName;
-    if (name && userDatabase[name]) {
+    if (!name || !userDatabase[name]) return;
+
+    try {
       await removePresenceForSocket(socket);
       userDatabase[name].lastSeen = Date.now();
       socket.broadcast.emit('user_stopped_typing', { name: name });
@@ -3107,15 +3313,19 @@ io.on('connection', async (socket) => {
       if (!stillOnline) {
         userDatabase[name].online = false;
         await pool.query('UPDATE users SET data = $1 WHERE name = $2', [userDatabase[name], name]);
+        invalidateOnlineListCache('disconnect-save');
         await addServerLog('logout', `${name} disconnected`, { socketId: socket.id }, name);
       }
 
       await emitOnlineList();
+    } catch (err) {
+      console.error('[DISCONNECT CLEANUP ERROR]:', err);
+      userDatabase[name].lastSeen = Date.now();
     }
   });
 });
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-  console.log(`PSN Database Server running on port ${PORT}`);
+  console.log(`PSN Database Server running on port ${PORT} (pg pool max ${PG_POOL_MAX}, online cache ${ONLINE_LIST_CACHE_MS}ms, chat sync ${CHAT_SYNC_INTERVAL_MS}ms, instance ${INSTANCE_ID})`);
 });
