@@ -12272,8 +12272,8 @@ P
 		const exploreView = document.getElementById('view-explore');
 		if (exploreView) {
 			window.__exploreBootRevealActive = true;
-			showExploreBootSkeletons(exploreView);
 			const cards = exploreView.querySelectorAll('.horizontal-scroll .game-card');
+			if (!cards.length) showExploreBootSkeletons(exploreView);
 			cards.forEach(card => {
 				card.classList.remove('anim-reveal', 'no-anim');
 				card.style.opacity = '0'; 
@@ -12384,7 +12384,7 @@ P
 								if (typeof initAudioSettings === 'function') initAudioSettings({ forcePlay: true });
 							}, 2600);
 					}
-				}, 150);
+				}, 0);
 	
 				setTimeout(() => {
 					if (mainLayout) {
@@ -12543,6 +12543,12 @@ P
 	}
 
     document.addEventListener('DOMContentLoaded' , () => {
+        if (!window.__exploreFastLoadPromise && typeof populateExploreTab === 'function') {
+            window.__exploreFastLoadPromise = populateExploreTab({ animateCards: true, reason: 'dom-ready-fast' }).catch(e => {
+                console.warn('[System] Fast Explore load failed. Fallback skeleton remains.', e);
+                return null;
+            });
+        }
 		if (!window.__userGridLoadedOnce && typeof loadUserGrid === 'function') {
 			window.__userGridLoadedOnce = true;
 			loadUserGrid();
@@ -13031,9 +13037,10 @@ P
         });
     }
 
-    async function preloadExploreCoverImages(limit = 36, timeout = 2400) {
+    async function preloadExploreCoverImages(limit = 8, timeout = 250) {
         const exploreView = document.getElementById('view-explore');
         if (!exploreView) return;
+        if (!limit || limit <= 0) return;
         const imgs = Array.from(exploreView.querySelectorAll('.horizontal-scroll .game-img')).slice(0, limit);
         if (!imgs.length) return;
         await Promise.race([
@@ -13047,10 +13054,15 @@ P
         bootExploreWarmPromise = (async () => {
             try {
                 if (typeof populateExploreTab === 'function') {
-                    await populateExploreTab({ animateCards: true, reason: 'starting-gate' });
+                    if (!window.__exploreFastLoadPromise) {
+                        window.__exploreFastLoadPromise = populateExploreTab({ animateCards: true, reason: 'starting-gate-fast' });
+                    }
+                    await window.__exploreFastLoadPromise;
                 }
-                await preloadExploreCoverImages(36, 2400);
                 window.__exploreWarmedBeforeLogin = true;
+                setTimeout(() => {
+                    try { preloadExploreCoverImages(8, 250); } catch(e) {}
+                }, 0);
             } catch (e) {
                 console.warn('[System] Explore warmup failed. Continuing boot.', e);
             }
@@ -13204,7 +13216,7 @@ P
 			const dateHtml = game.date ? `<div class="date-tag"><i class="far fa-clock"></i> ${game.date}</div>` : '';
 	
 			html += `
-				<div class="game-card no-anim" style="--tile-idx: ${idx};" onclick="playUiClick(); switchAndSearch('${cat}', '${game.id}', true, '${String(game.contentId || '').replace(/'/g, "\\'")}')" onmouseenter="const __hoverTarget = document.elementFromPoint(event.clientX, event.clientY); if(!__hoverTarget || !__hoverTarget.closest('.btn-mini,.btn-mini-round,.fav-btn,.wish-btn,.action-btn,button,a')) playUiHover(); this.classList.remove('anim-reveal'); this.classList.add('no-anim');">
+				<div class="game-card ${animateCards ? 'anim-reveal' : 'no-anim'}" style="--tile-idx: ${idx};" onclick="playUiClick(); switchAndSearch('${cat}', '${game.id}', true, '${String(game.contentId || '').replace(/'/g, "\\'")}')" onmouseenter="const __hoverTarget = document.elementFromPoint(event.clientX, event.clientY); if(!__hoverTarget || !__hoverTarget.closest('.btn-mini,.btn-mini-round,.fav-btn,.wish-btn,.action-btn,button,a')) playUiHover(); this.classList.remove('anim-reveal'); this.classList.add('no-anim');">
 					<div class="game-img-container">
 						<div class="console-tag ${tagClass}">${consoleName}</div>
 						<div class="region-tag">${game.region}</div>
@@ -13230,6 +13242,7 @@ P
 		});
 	
 		container.innerHTML = html;
+		container.dataset.exploreCardsReady = '1';
 		if (animateCards) setupRevealAnimations(containerId);
 	}
 
@@ -21366,12 +21379,17 @@ P
 	
 			if (viewId === 'view-explore') {
 				if (typeof populateExploreTab === 'function') {
-					const exploreLoad = populateExploreTab({ animateCards: false });
+					const exploreTarget = document.getElementById('view-explore');
+					const hasExploreCards = !!(exploreTarget && exploreTarget.querySelector('.horizontal-scroll .game-card'));
+					const exploreLoad = hasExploreCards
+						? Promise.resolve()
+						: (window.__exploreFastLoadPromise || populateExploreTab({ animateCards: true, reason: 'switch-fast' }));
+					if (!window.__exploreFastLoadPromise && exploreLoad && typeof exploreLoad.then === 'function') window.__exploreFastLoadPromise = exploreLoad;
 					if (exploreLoad && typeof exploreLoad.then === 'function') {
 						exploreLoad.then(() => {
-							const exploreTarget = document.getElementById('view-explore');
-							if (exploreTarget && exploreTarget.style.display !== 'none' && typeof replayExploreCardsReveal === 'function') {
-								replayExploreCardsReveal();
+							const target = document.getElementById('view-explore');
+							if (target && target.style.display !== 'none' && typeof replayExploreCardsReveal === 'function') {
+								replayExploreCardsReveal({ allowDuringBoot: true });
 							}
 						}).catch(err => console.warn('Explore refresh failed:', err));
 					}
