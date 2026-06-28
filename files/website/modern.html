@@ -11161,7 +11161,8 @@ P
 
         } catch (e) { console.error("Erro no Sync:", e); }
         
-        if (window.renderTrophiesView) window.renderTrophiesView();
+        if (typeof psnMarkTrophyViewsDirty === 'function') psnMarkTrophyViewsDirty();
+        if (window.renderTrophiesView && typeof psnIsViewVisible === 'function' && psnIsViewVisible('view-trophies')) window.renderTrophiesView(true);
         if (window.updateWishlistUI) window.updateWishlistUI();
         if (window.updateDownloadUI) window.updateDownloadUI();
         if (window.updateFavoritesLibraryUI) window.updateFavoritesLibraryUI();
@@ -12284,6 +12285,7 @@ P
 	
 		const bootContainer = document.getElementById('ps5-boot-container');
 		if (bootContainer) {
+			bootContainer.style.pointerEvents = 'none';
 			bootContainer.style.transition = 'all 0.6s cubic-bezier(0.2, 0.8, 0.2, 1)';
 			bootContainer.style.opacity = '0';
 			bootContainer.style.transform = 'scale(1.2)';
@@ -12316,7 +12318,7 @@ P
 				setTimeout(() => {
 					if (typeof initAudioSettings === 'function') initAudioSettings({ forcePlay: true });
 				}, 450);
-			}, 1000);
+			}, 650);
 		}
 	
 		requestAnimationFrame(() => {
@@ -12382,7 +12384,7 @@ P
 								window.__exploreBootRevealActive = false;
 								window.__loginRevealBusy = false;
 								if (typeof initAudioSettings === 'function') initAudioSettings({ forcePlay: true });
-							}, 2600);
+							}, 650);
 					}
 				}, 0);
 	
@@ -12407,7 +12409,7 @@ P
 					if (typeof scheduleSavedPs3Reconnect === 'function') scheduleSavedPs3Reconnect(username, 500);
 					if (typeof markMobilePadCapability === 'function') markMobilePadCapability();
 					clearTimeout(window.__loginRevealBusyTimer);
-					window.__loginRevealBusyTimer = setTimeout(() => { window.__loginRevealBusy = false; }, 1800);
+					window.__loginRevealBusyTimer = setTimeout(() => { window.__loginRevealBusy = false; }, 650);
 				}, 1000);
 			});
 		});
@@ -12529,16 +12531,22 @@ P
 		};
 
 		setTimeout(() => {
-			const waitForCache = (typeof waitBootPreloadsBeforeUserSelect === 'function')
-				? waitBootPreloadsBeforeUserSelect()
-				: Promise.resolve();
-			Promise.resolve(waitForCache)
-				.then(() => (typeof warmExploreBeforeUserSelect === 'function') ? warmExploreBeforeUserSelect() : null)
-				.then(transitionToUserSelect)
-				.catch((e) => {
-					console.warn('[System] Starting gate finished with partial warmup.', e);
-					transitionToUserSelect();
-				});
+			transitionToUserSelect();
+
+			setTimeout(() => {
+				try {
+					const waitForCache = (typeof waitBootPreloadsBeforeUserSelect === 'function')
+						? waitBootPreloadsBeforeUserSelect()
+						: Promise.resolve();
+					Promise.resolve(waitForCache).catch((e) => console.warn('[System] Boot preload continued with partial cache.', e));
+
+					if (typeof warmExploreBeforeUserSelect === 'function') {
+						Promise.resolve(warmExploreBeforeUserSelect()).catch((e) => console.warn('[System] Explore warmup continued with partial data.', e));
+					}
+				} catch (e) {
+					console.warn('[System] Background boot warmup skipped.', e);
+				}
+			}, 0);
 		}, introDelay);
 	}
 
@@ -15775,6 +15783,10 @@ P
     window.setupRevealAnimations = function(containerId, options = {}) {
         const container = typeof containerId === 'string' ? document.getElementById(containerId) : containerId;
         if (!container) return;
+
+        const parentView = container.closest ? container.closest('.view-section') : null;
+        if (parentView && window.getComputedStyle(parentView).display === 'none') return;
+        if (window.getComputedStyle(container).display === 'none') return;
 
         const animClass = options.animClass || 'anim-reveal';
         const selector = options.selector || '.game-card, .reward-card, .game-trophy-card, .online-user-item, .setting-item';
@@ -24006,6 +24018,7 @@ P
 			const bootContainer = document.getElementById('ps5-boot-container');
 			if (bootContainer) {
 				bootContainer.style.display = 'flex';
+				bootContainer.style.pointerEvents = 'auto';
 				bootContainer.style.transition = 'none';
 				bootContainer.style.opacity = '0';
 				bootContainer.style.transform = 'scale(1.15)';
@@ -24082,6 +24095,7 @@ P
 	
 				if (bootContainer) {
 					bootContainer.style.display = 'flex';
+					bootContainer.style.pointerEvents = 'auto';
 					bootContainer.style.opacity = '0';
 					bootContainer.style.filter = 'blur(5px)';
 					bootContainer.style.zIndex = '9999999';
@@ -29940,10 +29954,53 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 	};
 	
 	const TROPHY_WEIGHT = { platinum: 1, gold: 2, silver: 3, bronze: 4 };
+
+	window.__trophyViewsDirty = true;
+	window.__rewardsViewDirty = true;
+	window.__lastTrophyRenderSignature = '';
+	window.__lastRewardsRenderSignature = '';
+
+	function psnIsViewVisible(viewId) {
+		const view = document.getElementById(viewId);
+		if (!view) return false;
+		return window.getComputedStyle(view).display !== 'none';
+	}
+
+	function psnMarkTrophyViewsDirty() {
+		window.__trophyViewsDirty = true;
+		window.__rewardsViewDirty = true;
+	}
+
+	function psnTrophyRenderSignature() {
+		const sortSelect = document.getElementById('trophy-sort-select');
+		try {
+			return JSON.stringify({
+				trophies: window.userTrophies || {},
+				stats: window.globalTrophyStats || {},
+				sort: sortSelect ? sortSelect.value : 'default',
+				order: (window.sortOrders && window.sortOrders.trophy) || 'desc'
+			});
+		} catch (e) {
+			return String(Date.now());
+		}
+	}
+
+	function psnRewardsRenderSignature() {
+		try {
+			return JSON.stringify({
+				trophies: window.userTrophies || {},
+				rewards: (window.REWARDS_DATA || []).map(r => [r.id, r.req, r.kind || 'avatar', r.styleId || '', r.img || ''])
+			});
+		} catch (e) {
+			return String(Date.now());
+		}
+	}
 	
 	function saveTrophies() {
 		saveState('psn_user_trophies', JSON.stringify(window.userTrophies));
-		renderTrophiesView();
+		if (typeof psnMarkTrophyViewsDirty === 'function') psnMarkTrophyViewsDirty();
+		if (typeof renderTrophiesView === 'function' && psnIsViewVisible('view-trophies')) renderTrophiesView(false);
+		if (typeof renderRewardsView === 'function' && psnIsViewVisible('view-rewards')) renderRewardsView();
 	}
 	
 	function showTrophyPopup(trophy) {
@@ -30088,9 +30145,13 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 		}, 1500);
 	};
 	
-	window.renderTrophiesView = function(isSilent = false) {
+	window.renderTrophiesView = function(isSilent = false, options = {}) {
 		const grid = document.getElementById('trophy-grid-container');
 		if (!grid) return;
+		if (typeof psnIsViewVisible === 'function' && !psnIsViewVisible('view-trophies')) {
+			if (typeof psnMarkTrophyViewsDirty === 'function') psnMarkTrophyViewsDirty();
+			return;
+		}
 		
 		if (!window.userTrophies) window.userTrophies = {};
 		if (!window.globalTrophyStats) window.globalTrophyStats = {};
@@ -30104,6 +30165,11 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 		
 		const currentOrder = (window.sortOrders && window.sortOrders.trophy) || 'desc';
 		const sortMultiplier = currentOrder === 'asc' ? -1 : 1;
+
+		const renderSignature = (typeof psnTrophyRenderSignature === 'function') ? psnTrophyRenderSignature() : '';
+		if (!options.force && grid.dataset.rendered === '1' && !window.__trophyViewsDirty && window.__lastTrophyRenderSignature === renderSignature) return;
+		window.__lastTrophyRenderSignature = renderSignature;
+		window.__trophyViewsDirty = false;
 		
 		const sortedIds = allIds.sort((a, b) => {
 			const tA = TROPHY_DATA[a];
@@ -30257,6 +30323,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 		});
 	
 		grid.innerHTML = html;
+		grid.dataset.rendered = '1';
 		if (typeof setupRevealAnimations === 'function') {
 			setupRevealAnimations('trophy-grid-container', { selector: '.trophy-card' });
 		}
@@ -30352,7 +30419,11 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 		{ id: 'rew_banner_8', req: 'trailer_10', title: 'Inferno Banner', kind: 'banner', styleId: 'spotlight' }
 	];
 	
-	window.renderRewardsView = function() {
+	window.renderRewardsView = function(options = {}) {
+		if (typeof psnIsViewVisible === 'function' && !psnIsViewVisible('view-rewards')) {
+			window.__rewardsViewDirty = true;
+			return;
+		}
 		if (!document.getElementById('reward-is-new-style')) {
 			const s = document.createElement('style');
 			s.id = 'reward-is-new-style';
@@ -30369,6 +30440,10 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 
 		const grid = document.getElementById('rewards-grid-container');
 		if (!grid) return;
+		const renderSignature = (typeof psnRewardsRenderSignature === 'function') ? psnRewardsRenderSignature() : '';
+		if (!options.force && grid.dataset.rendered === '1' && !window.__rewardsViewDirty && window.__lastRewardsRenderSignature === renderSignature) return;
+		window.__lastRewardsRenderSignature = renderSignature;
+		window.__rewardsViewDirty = false;
 		
 		grid.className = 'games-grid';
 		grid.style.display = '';
@@ -30442,6 +30517,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 		});
 	
 		grid.innerHTML = html;
+		grid.dataset.rendered = '1';
 		
 		if (typeof setupRevealAnimations === 'function') {
 			setupRevealAnimations('rewards-grid-container');
@@ -34681,7 +34757,8 @@ function getVisibleChatStackEl(id) {
 			document.body.classList.toggle('is-mod', userData.isModerator === true || incomingRole === 'mod' || incomingRole === 'moderator');
 
 			if (typeof updateConsoleLibraryStatusUI === 'function') updateConsoleLibraryStatusUI(window.lastScannedGames || []);
-			if (typeof renderTrophiesView === 'function') renderTrophiesView(true);
+			if (typeof psnMarkTrophyViewsDirty === 'function') psnMarkTrophyViewsDirty();
+			if (typeof renderTrophiesView === 'function' && typeof psnIsViewVisible === 'function' && psnIsViewVisible('view-trophies')) renderTrophiesView(true);
 			if (typeof updateWishlistUI === 'function') updateWishlistUI(true);
 			if (typeof updateDownloadUI === 'function') updateDownloadUI();
 			if (typeof updateFavoritesLibraryUI === 'function') updateFavoritesLibraryUI(true);
@@ -36419,6 +36496,7 @@ function getVisibleChatStackEl(id) {
 
 		if (bootContainer) {
 			bootContainer.style.display = 'flex';
+			bootContainer.style.pointerEvents = 'auto';
 			bootContainer.style.visibility = 'visible';
 			bootContainer.style.opacity = '1';
 			bootContainer.style.transform = 'scale(1)';
