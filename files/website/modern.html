@@ -1042,6 +1042,11 @@ input:checked + .slider:before { transform: translateX(20px); }
 .ps-line.left { background: linear-gradient(to right, transparent, #ffffff); }
 .ps-line.right { background: linear-gradient(to left, transparent, #ffffff); }
 #chat-dot { display: block; position: absolute; right: 19px; top: 10px; background-color: var(--ps-blue); box-shadow: 0 0 10px var(--ps-blue); }
+.chat-history-loading { flex:1 1 auto; width:100%; min-height:220px; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:13px; color:rgba(255,255,255,.72); font-size:11px; font-weight:800; letter-spacing:1.1px; text-transform:uppercase; text-align:center; opacity:.96; animation:psFadeIn .22s ease-out; border:1px dashed rgba(255,255,255,.10); border-radius:12px; background:rgba(0,0,0,.16); margin-top:16px; }
+.chat-history-loading .chat-ps-list-loader { --ps-list-symbol-size:clamp(16px,3.8vw,20px); min-height:0; padding:0; margin:0; width:min(168px,72vw); }
+.chat-history-loading .chat-ps-list-loader .profile-ps-list-symbols { margin:0 auto 14px; max-width:150px; gap:clamp(11px,3vw,18px); }
+.chat-history-loading .chat-ps-list-loader .profile-ps-list-symbol svg { filter:drop-shadow(0 0 4px rgba(255,255,255,.22)) drop-shadow(0 0 10px rgba(0,188,255,.18)); }
+.chat-history-loading .chat-ps-list-loader .profile-ps-list-title { color:rgba(255,255,255,.82); text-shadow:0 0 9px rgba(0,112,204,.28); }
 .chat-mention { color: #00bcff; font-weight: bold; cursor: pointer; }
 #chat-input { resize: none; overflow-y: auto; min-height: 45px; line-height: 20px; padding: 12px 15px; flex: 1; min-width: 0; box-sizing: border-box; }
 .chat-control-inline-banner { display: none !important; }
@@ -1180,9 +1185,6 @@ div[style*="display: flex"] { transition: opacity 0.3s ease, transform 0.3s ease
 #chat-input.chat-upload-waiting { border-color: rgba(255,255,255,.28) !important; }
 @keyframes chatUploadSkeleton { 0% { background-position: 120% 0; opacity: .55; } 50% { opacity: 1; } 100% { background-position: -120% 0; opacity: .55; } }
 
-.chat-history-loading { width:100%; min-height:130px; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:13px; color:rgba(255,255,255,.68); font-size:11px; font-weight:800; letter-spacing:.8px; text-transform:uppercase; border:1px dashed rgba(255,255,255,.10); border-radius:12px; background:rgba(0,0,0,.16); margin-top:16px; }
-.chat-history-loading i { font-size:22px; color:#00bcff; filter:drop-shadow(0 0 12px rgba(0,188,255,.35)); animation:pulse-dot 1.15s ease-in-out infinite; }
-.chat-history-loading span { opacity:.82; }
 
 .chat-lazy-image-shell { position: relative; overflow: hidden; background: rgba(0,0,0,0.22); border: 1px solid rgba(255,255,255,0.08); display: block; box-sizing: border-box; cursor: zoom-in; }
 .chat-single-image-shell { width: 100%; min-width: min(100%, 250px); min-height: 180px; max-height: 300px; margin: 10px 0 0 0; border-radius: 6px; }
@@ -14164,31 +14166,16 @@ P
 				if (typeof requestChatHistoryNow === 'function') requestChatHistoryNow('open-chat');
 			}
 
+			let chatRenderPromise = null;
 			if (typeof renderDeferredChatHistory === 'function') {
-				renderDeferredChatHistory({ reason: 'open-chat', force: !window.__chatHistoryDomRendered });
+				chatRenderPromise = renderDeferredChatHistory({ reason: 'open-chat', force: !window.__chatHistoryDomRendered });
 			}
-	
-			setTimeout(() => {
-				const chatBox = document.getElementById('chat-messages');
-				const divider = document.getElementById('unread-divider');
-				
-				if (chatBox) {
-					chatBox.style.setProperty('scroll-behavior', 'auto', 'important');
-	
-					if (divider) {
-						const topPos = divider.offsetTop - (chatBox.offsetHeight / 2);
-						chatBox.scrollTop = topPos;
-						if (typeof setupDividerAutoRemove === 'function') setupDividerAutoRemove();
-						
-						setTimeout(() => { chatBox.style.setProperty('scroll-behavior', 'smooth'); }, 100);
-						return; 
-					} 
-	
-					chatBox.scrollTop = chatBox.scrollHeight;
-					
-					setTimeout(() => { chatBox.style.setProperty('scroll-behavior', 'smooth'); }, 100);
-				}
-			}, 50);
+			const scrollAfterChatRender = () => {
+				if (typeof isChatScreenVisibleForRead === 'function' && !isChatScreenVisibleForRead()) return;
+				if (typeof scrollChatToUnreadOrBottom === 'function') scrollChatToUnreadOrBottom({ restoreSmooth: true, setupDivider: true });
+			};
+			if (chatRenderPromise && typeof chatRenderPromise.then === 'function') chatRenderPromise.then(scrollAfterChatRender);
+			else requestAnimationFrame(scrollAfterChatRender);
 	
 		} else {
 			if(chatView) {
@@ -21628,14 +21615,11 @@ P
 				if (typeof showSocialSection === 'function') showSocialSection(isFriendsActive ? 'friends' : 'chat');
 	
 				setTimeout(() => {
-					const box = document.getElementById('chat-messages');
-					const divider = document.getElementById('unread-divider');
-					if (box) {
-						const oldSmooth = box.style.scrollBehavior;
-						box.style.setProperty('scroll-behavior', 'auto', 'important');
-						box.scrollTop = divider ? divider.offsetTop - (box.offsetHeight / 2) : box.scrollHeight;
-						setTimeout(() => { box.style.setProperty('scroll-behavior', oldSmooth || 'smooth'); }, 100);
-					}
+					const doChatScroll = () => {
+						if (typeof scrollChatToUnreadOrBottom === 'function') scrollChatToUnreadOrBottom({ restoreSmooth: true, setupDivider: true });
+					};
+					if (window.__chatLazyRenderPromise && typeof window.__chatLazyRenderPromise.then === 'function') window.__chatLazyRenderPromise.then(doChatScroll);
+					else doChatScroll();
 				}, 150);
 			}
 			else if (viewId === 'view-settings') {
@@ -30892,20 +30876,70 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 
 
     function getChatHistoryLoadingHtml(text = 'Loading messages') {
+        const safeText = String(text || 'Loading messages').replace(/[&<>'"]/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' })[ch]);
         return `
             <div id="chat-history-loading" class="chat-history-loading">
-                <i class="fas fa-comments"></i>
-                <span>${text}</span>
+                <div class="profile-ps-list-loader profile-ps-list-loader--row chat-ps-list-loader is-running" role="status" aria-live="polite" aria-label="${safeText}">
+                    <div class="profile-ps-list-symbols" aria-hidden="true">
+                        <span class="profile-ps-list-symbol ps-triangle"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 129 115" aria-hidden="true"><path d="M64.5 0L129 115H0L64.5 0zm0 24.531L20.489 103h88.021L64.5 24.531z"/></svg></span>
+                        <span class="profile-ps-list-symbol ps-circle"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 129 129" aria-hidden="true"><path d="M64.5 0C100.122 0 129 28.878 129 64.5S100.122 129 64.5 129 0 100.122 0 64.5 28.878 0 64.5 0zm0 12C35.505 12 12 35.505 12 64.5S35.505 117 64.5 117 117 93.495 117 64.5 93.495 12 64.5 12z"/></svg></span>
+                        <span class="profile-ps-list-symbol ps-cross"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 110 110" aria-hidden="true"><path d="M101 .515L109.485 9l-46 46 46 46-8.485 8.485-46-46-46 46L.515 101l46-46-46-46L9 .515l46 46 46-46z"/></svg></span>
+                        <span class="profile-ps-list-symbol ps-square"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 113 113" aria-hidden="true"><path d="M113 0v113H0V0h113zm-12 12H12v89h89V12z"/></svg></span>
+                    </div>
+                    <div class="profile-ps-list-title">${safeText}</div>
+                </div>
             </div>`;
     }
 
-    function showChatHistoryLoading(text = 'Loading messages') {
+    function showChatHistoryLoading(text = 'Loading messages', force = false) {
         const box = document.getElementById('chat-messages');
-        if (!box || box.querySelector('[id^="msg-row-"]')) return;
+        if (!box || (!force && box.querySelector('[id^="msg-row-"]'))) return;
         box.style.opacity = '1';
         box.style.removeProperty('transition');
+        box.style.setProperty('scroll-behavior', 'auto', 'important');
         box.innerHTML = getChatWelcomeBannerHtml() + getChatHistoryLoadingHtml(text);
     }
+
+    function scrollChatToUnreadOrBottom(options = {}) {
+        const box = document.getElementById('chat-messages');
+        if (!box) return false;
+        const divider = document.getElementById('unread-divider');
+        const restoreSmooth = options.restoreSmooth !== false;
+        const setupDivider = options.setupDivider !== false;
+        const oldSmooth = box.style.scrollBehavior || '';
+        box.style.setProperty('scroll-behavior', 'auto', 'important');
+        if (divider) {
+            const topPos = Math.max(0, divider.offsetTop - (box.offsetHeight / 2));
+            box.scrollTop = topPos;
+            if (setupDivider && typeof setupDividerAutoRemove === 'function') setupDividerAutoRemove();
+            if (typeof updateJumpBottomUnreadBadge === 'function') updateJumpBottomUnreadBadge();
+        } else {
+            box.scrollTop = box.scrollHeight;
+            if (typeof updateJumpBottomUnreadBadge === 'function') updateJumpBottomUnreadBadge(0);
+        }
+        if (restoreSmooth) {
+            setTimeout(() => {
+                if (oldSmooth) box.style.scrollBehavior = oldSmooth;
+                else box.style.setProperty('scroll-behavior', 'smooth');
+            }, 160);
+        }
+        return !!divider;
+    }
+    window.scrollChatToUnreadOrBottom = scrollChatToUnreadOrBottom;
+
+    function scheduleBackgroundChatHistoryWarmup(reason = 'background-warmup') {
+        if (window.__chatHistoryReceived || window.__chatHistoryRequesting || window.__chatHistoryWarmupTimer) return;
+        window.__chatHistoryWarmupTimer = setTimeout(() => {
+            window.__chatHistoryWarmupTimer = null;
+            const run = () => {
+                if (window.__chatHistoryReceived || window.__chatHistoryRequesting) return;
+                if (typeof requestChatHistoryNow === 'function') requestChatHistoryNow(reason);
+            };
+            if ('requestIdleCallback' in window) requestIdleCallback(run, { timeout: 1800 });
+            else setTimeout(run, 500);
+        }, 1400);
+    }
+    window.scheduleBackgroundChatHistoryWarmup = scheduleBackgroundChatHistoryWarmup;
 
     function requestChatHistoryNow(reason = 'open-chat') {
         if (!(typeof socketChat !== 'undefined' && socketChat && socketChat.connected)) return false;
@@ -30982,29 +31016,23 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
             box.style.opacity = '1';
             box.style.removeProperty('transition');
             box.style.setProperty('scroll-behavior', 'auto', 'important');
-            box.innerHTML = getChatWelcomeBannerHtml();
+            box.innerHTML = getChatWelcomeBannerHtml() + getChatHistoryLoadingHtml('Preparing messages');
             const finish = () => {
                 initDateStickyLogic();
-                const unread = document.getElementById('unread-divider');
-                if (unread) {
-                    const topPos = unread.offsetTop - (box.offsetHeight / 2);
-                    box.scrollTop = topPos;
-                    if (typeof setupDividerAutoRemove === 'function') setupDividerAutoRemove();
-                    if (typeof updateJumpBottomUnreadBadge === 'function') updateJumpBottomUnreadBadge();
-                } else {
-                    box.scrollTop = box.scrollHeight;
-                    if (typeof updateJumpBottomUnreadBadge === 'function') updateJumpBottomUnreadBadge(0);
-                }
+                if (typeof scrollChatToUnreadOrBottom === 'function') scrollChatToUnreadOrBottom({ restoreSmooth: true, setupDivider: true });
                 window.__chatHistoryDomRendered = true;
                 updateChatHistoryRenderSignature();
                 window.__chatRenderLastReadSnapshot = null;
                 box.style.opacity = '1';
-                setTimeout(() => box.style.setProperty('scroll-behavior', 'smooth'), 100);
                 if (typeof refreshChatNotificationDot === 'function') refreshChatNotificationDot();
                 if (typeof refreshMentionJumpButton === 'function') refreshMentionJumpButton();
                 resolve(true);
             };
             const step = () => {
+                if (index === 0) {
+                    const loader = document.getElementById('chat-history-loading');
+                    if (loader) loader.remove();
+                }
                 const limit = Math.min(index + chunkSize, history.length);
                 for (; index < limit; index++) {
                     const data = history[index];
@@ -35375,6 +35403,7 @@ function getVisibleChatStackEl(id) {
 			if (userData.joined) localStorage.setItem(`${name}_joined_date`, userData.joined);
 		
 			window.isProfileLoaded = true; 
+			if (typeof scheduleBackgroundChatHistoryWarmup === 'function') scheduleBackgroundChatHistoryWarmup('post-auth-idle');
 
 			if (typeof scheduleSavedPs3Reconnect === 'function') scheduleSavedPs3Reconnect(name, 1400);
 
