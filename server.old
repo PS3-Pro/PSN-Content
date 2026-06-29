@@ -19,11 +19,7 @@ const INSTANCE_ID = process.env.RENDER_INSTANCE_ID || process.env.RAILWAY_REPLIC
 const PRESENCE_TTL_SECONDS = 90;
 const PRESENCE_HEARTBEAT_MS = 25000;
 const CHAT_SYNC_INTERVAL_MS = 3000;
-const PROFILE_SYNC_INTERVAL_MS = Math.max(10000, parseInt(process.env.PROFILE_SYNC_INTERVAL_MS || "15000", 10) || 15000);
-const POST_AUTH_CHAT_HISTORY_DELAY_MS = Math.max(0, parseInt(process.env.POST_AUTH_CHAT_HISTORY_DELAY_MS || "180", 10) || 180);
-const POST_AUTH_ADMIN_STATE_DELAY_MS = Math.max(0, parseInt(process.env.POST_AUTH_ADMIN_STATE_DELAY_MS || "550", 10) || 550);
-const POST_AUTH_ONLINE_LIST_DELAY_MS = Math.max(0, parseInt(process.env.POST_AUTH_ONLINE_LIST_DELAY_MS || "1400", 10) || 1400);
-const POST_AUTH_PROFILE_SYNC_DELAY_MS = Math.max(0, parseInt(process.env.POST_AUTH_PROFILE_SYNC_DELAY_MS || "1800", 10) || 1800);
+const PROFILE_SYNC_INTERVAL_MS = 5000;
 const USER_CACHE_REFRESH_INTERVAL_MS = 30000;
 const USER_CACHE_WARMUP_INTERVAL_MS = 120000;
 const DEFAULT_MAINTENANCE_MESSAGE = "The service is under maintenance. Please try again soon.";
@@ -1546,10 +1542,7 @@ function buildFullProfileSyncPayload(name, user = {}, sourceSocketId = null) {
 function emitProfileSync(name, sourceSocketId = null) {
   if (!name || !userDatabase[name]) return;
   const payload = buildFullProfileSyncPayload(name, userDatabase[name], sourceSocketId);
-  getSocketsByUserName(name).forEach(client => {
-    if (sourceSocketId && client.id === sourceSocketId) return;
-    client.emit('profile_sync', payload);
-  });
+  getSocketsByUserName(name).forEach(client => client.emit('profile_sync', payload));
 }
 
 
@@ -1570,10 +1563,7 @@ function emitSettingsRealtimeSync(name, sourceSocketId = null, extra = {}) {
     },
     ...extra
   };
-  getSocketsByUserName(name).forEach(client => {
-    if (sourceSocketId && client.id === sourceSocketId) return;
-    client.emit('settings_realtime_sync', payload);
-  });
+  getSocketsByUserName(name).forEach(client => client.emit('settings_realtime_sync', payload));
 }
 
 
@@ -1649,7 +1639,7 @@ async function initProfileSyncNotifications() {
       emitProfileSync(name, data.sourceSocketId || null);
       emitPublicProfileBannerUpdate(name, refreshedUser);
       invalidateOnlineListCache("profile-sync-listen");
-      deferServerTask('PROFILE LISTEN ONLINE LIST', () => emitOnlineList(), 1000);
+      await emitOnlineList();
     } catch (err) {
       console.error('[PROFILE LISTEN ERROR]:', err);
     }
@@ -2024,28 +2014,6 @@ async function syncAdminStateAcrossInstances() {
   });
 }
 
-function deferServerTask(label, taskFn, delayMs = 0) {
-  const run = () => Promise.resolve()
-    .then(taskFn)
-    .catch(err => console.error(`[${label} DEFERRED ERROR]:`, err));
-  if (delayMs > 0) setTimeout(run, delayMs);
-  else setImmediate(run);
-}
-
-function markSocketAuthenticated(socket) {
-  if (socket) socket.__authenticatedAt = Date.now();
-}
-
-function getPostAuthRemainingDelay(socket, totalDelayMs) {
-  const start = Number(socket && socket.__authenticatedAt || 0);
-  if (!start) return 0;
-  return Math.max(0, totalDelayMs - (Date.now() - start));
-}
-
-function deferAfterAuthSettle(socket, label, taskFn, totalDelayMs = POST_AUTH_PROFILE_SYNC_DELAY_MS) {
-  deferServerTask(label, taskFn, getPostAuthRemainingDelay(socket, totalDelayMs));
-}
-
 const syncAdminStateIntervalTask = runNonOverlappingTask('ADMIN STATE SYNC', syncAdminStateAcrossInstances);
 const presenceHeartbeatIntervalTask = runNonOverlappingTask('PRESENCE HEARTBEAT', heartbeatPresenceSessions);
 const chatPollIntervalTask = runNonOverlappingTask('CHAT POLL', syncChatAcrossInstances);
@@ -2056,12 +2024,14 @@ setInterval(presenceHeartbeatIntervalTask, PRESENCE_HEARTBEAT_MS);
 setInterval(chatPollIntervalTask, CHAT_SYNC_INTERVAL_MS);
 setInterval(profileSyncIntervalTask, PROFILE_SYNC_INTERVAL_MS);
 
-io.on('connection', (socket) => {
+io.on('connection', async (socket) => {
   console.log('[NETWORK] Socket connected. ID: ' + socket.id);
-  deferServerTask('CONNECTION INIT', async () => {
+  try {
     await refreshAdminStateThrottled(5000);
     await emitAdminState(socket);
-  }, 0);
+  } catch (err) {
+    console.error('[CONNECTION INIT ERROR]:', err);
+  }
 
   socket.on('authenticate_user', async (data = {}) => {
     try {
@@ -2126,19 +2096,14 @@ io.on('connection', (socket) => {
           normalizeProfileArrayPayloads(userDatabase[name]);
           userCacheMeta[name] = Date.now();
           
-          markSocketAuthenticated(socket);
-          invalidateOnlineListCache('auth-existing-memory');
-          deferServerTask('AUTH EXISTING SAVE', async () => {
-            await pool.query('UPDATE users SET data = $1 WHERE name = $2', [userDatabase[name], name]);
-            invalidateOnlineListCache('auth-existing-save');
-            await notifyProfileSyncAcrossInstances(name, socket.id, userDatabase[name].profileUpdatedAt);
-          }, 2200);
-          deferServerTask('AUTH EXISTING PRESENCE', () => upsertPresenceForSocket(socket, name), 250);
+          await pool.query('UPDATE users SET data = $1 WHERE name = $2', [userDatabase[name], name]);
+          invalidateOnlineListCache('auth-existing-save');
+          setImmediate(() => notifyProfileSyncAcrossInstances(name, socket.id, userDatabase[name].profileUpdatedAt).catch(err => console.error('[PROFILE NOTIFY DEFERRED ERROR]:', err)));
+          await upsertPresenceForSocket(socket, name);
+          await refreshChatHistoryFromDb();
 
           console.log(`[NETWORK] ${name} logged in. Admin: ${isAdmin}`);
-          deferServerTask('AUTH LOGIN LOG', async () => {
-            await addServerLog('login', `${name} signed in${isAdmin ? ' as admin' : ''}`, { socketId: socket.id, role: getUserRole(name, userDatabase[name]) }, name);
-          }, 2400);
+          await addServerLog('login', `${name} signed in${isAdmin ? ' as admin' : ''}`, { socketId: socket.id, role: getUserRole(name, userDatabase[name]) }, name);
 
           socket.emit('auth_success', { 
             name, 
@@ -2148,10 +2113,11 @@ io.on('connection', (socket) => {
             isModerator: isUserModerator(name, userDatabase[name])
           });
 
+          socket.emit('chat_history', getPublicChatHistory());
           socket.emit('pinned_list', pinnedMessages);
-          deferServerTask('POST AUTH CHAT HISTORY', () => socket.emit('chat_history', getPublicChatHistory()), POST_AUTH_CHAT_HISTORY_DELAY_MS);
-          deferServerTask('POST AUTH ADMIN STATE', () => emitAdminState(socket), socket.isAdmin === true ? POST_AUTH_ADMIN_STATE_DELAY_MS : 120);
-          deferServerTask('POST AUTH ONLINE LIST', () => emitOnlineList(), POST_AUTH_ONLINE_LIST_DELAY_MS);
+          await emitAdminState(socket);
+
+          setImmediate(() => emitOnlineList().catch(err => console.error('[ONLINE LIST DEFERRED ERROR]:', err)));
         } else {
           if (adminMaintenanceBypass === true) {
             socket.emit('auth_error', 'Incorrect admin password. Access denied.');
@@ -2195,23 +2161,21 @@ io.on('connection', (socket) => {
         socket.role = getUserRole(name, userDatabase[name]);
         normalizeProfileArrayPayloads(userDatabase[name]);
         userCacheMeta[name] = Date.now();
-        markSocketAuthenticated(socket);
 
         await pool.query(
           'INSERT INTO users (name, data) VALUES ($1, $2)',
           [name, userDatabase[name]]
         );
         invalidateOnlineListCache('auth-new-user');
-        deferServerTask('AUTH NEW NOTIFY', () => notifyProfileSyncAcrossInstances(name, socket.id, userDatabase[name].profileUpdatedAt), 0);
-        deferServerTask('AUTH NEW PRESENCE', () => upsertPresenceForSocket(socket, name), 0);
+        setImmediate(() => notifyProfileSyncAcrossInstances(name, socket.id, userDatabase[name].profileUpdatedAt).catch(err => console.error('[PROFILE NOTIFY DEFERRED ERROR]:', err)));
+        await upsertPresenceForSocket(socket, name);
+        await refreshChatHistoryFromDb();
         if (wasDeletedAccount) {
           await pool.query('DELETE FROM deleted_accounts WHERE name = $1', [name]);
         }
         
         console.log(`[NETWORK] ${name} created a new account. Admin: ${isAdmin}`);
-        deferServerTask('AUTH SIGNUP LOG', async () => {
-          await addServerLog('signup', `${name} created an account${isAdmin ? ' as admin' : ''}`, { socketId: socket.id, role: getUserRole(name, userDatabase[name]) }, name);
-        }, 0);
+        await addServerLog('signup', `${name} created an account${isAdmin ? ' as admin' : ''}`, { socketId: socket.id, role: getUserRole(name, userDatabase[name]) }, name);
 
         socket.emit('auth_success', { 
           name, 
@@ -2221,10 +2185,11 @@ io.on('connection', (socket) => {
           isModerator: isUserModerator(name, userDatabase[name])
         });
 
+        socket.emit('chat_history', getPublicChatHistory());
         socket.emit('pinned_list', pinnedMessages);
-        deferServerTask('POST AUTH CHAT HISTORY', () => socket.emit('chat_history', getPublicChatHistory()), POST_AUTH_CHAT_HISTORY_DELAY_MS);
-        deferServerTask('POST AUTH ADMIN STATE', () => emitAdminState(socket), socket.isAdmin === true ? POST_AUTH_ADMIN_STATE_DELAY_MS : 120);
-        deferServerTask('POST AUTH ONLINE LIST', () => emitOnlineList(), POST_AUTH_ONLINE_LIST_DELAY_MS);
+        await emitAdminState(socket);
+
+        setImmediate(() => emitOnlineList().catch(err => console.error('[ONLINE LIST DEFERRED ERROR]:', err)));
       }
     } catch (error) {
       console.error("[AUTH ERROR]:", error);
@@ -2279,7 +2244,7 @@ io.on('connection', (socket) => {
       emitPublicProfileBannerUpdate(name, userDatabase[name]);
     }
 
-    deferServerTask('SETTINGS PROFILE NOTIFY', () => notifyProfileSyncAcrossInstances(name, sourceSocketId, userDatabase[name].profileUpdatedAt), 0);
+    await notifyProfileSyncAcrossInstances(name, sourceSocketId, userDatabase[name].profileUpdatedAt);
   });
 
   socket.on('update_profile', async (userData) => {
@@ -2345,12 +2310,12 @@ io.on('connection', (socket) => {
             emitTrendingFromCache();
         }
 
-        deferServerTask('PROFILE ONLINE LIST', () => emitOnlineList(), 450);
+        await emitOnlineList();
         if (shouldBroadcastProfileBanner) {
             emitPublicProfileBannerUpdate(name, userDatabase[name]);
         }
         emitProfileSync(name, shouldForceProfileSyncToSource ? null : socket.id);
-        deferServerTask('PROFILE NOTIFY', () => notifyProfileSyncAcrossInstances(name, shouldForceProfileSyncToSource ? null : socket.id, userDatabase[name].profileUpdatedAt), 0);
+        await notifyProfileSyncAcrossInstances(name, shouldForceProfileSyncToSource ? null : socket.id, userDatabase[name].profileUpdatedAt);
 
         if (userData.trophiesData) {
             try {
@@ -2394,40 +2359,23 @@ io.on('connection', (socket) => {
     if (!name || !userDatabase[name]) return;
 
     try {
-      const sendProfileSync = async () => {
-        if (data && data.forceRefresh === true) {
-          await refreshSingleUserCacheFromDb(name);
-        }
-        socket.emit('profile_sync', buildFullProfileSyncPayload(name, userDatabase[name], null));
-      };
-
-      if (!(data && data.forceRefresh === true) && getPostAuthRemainingDelay(socket, POST_AUTH_PROFILE_SYNC_DELAY_MS) > 0) {
-        deferAfterAuthSettle(socket, 'REQUEST PROFILE SYNC', sendProfileSync, POST_AUTH_PROFILE_SYNC_DELAY_MS);
-        return;
+      if (data && data.forceRefresh === true) {
+        await refreshSingleUserCacheFromDb(name);
       }
 
-      await sendProfileSync();
+      socket.emit('profile_sync', buildFullProfileSyncPayload(name, userDatabase[name], null));
     } catch (err) {
       console.error('[REQUEST PROFILE SYNC ERROR]:', err);
     }
   });
 
   socket.on('request_online_list', async () => {
-    const sendOnlineList = async () => {
+    try {
       if (socket.userName && userDatabase[socket.userName]) {
+        await upsertPresenceForSocket(socket, socket.userName);
         userDatabase[socket.userName].lastSeen = Date.now();
-        deferServerTask('REQUEST ONLINE PRESENCE UPSERT', () => upsertPresenceForSocket(socket, socket.userName), 0);
       }
       await emitOnlineList(socket);
-    };
-
-    try {
-      const remaining = getPostAuthRemainingDelay(socket, POST_AUTH_ONLINE_LIST_DELAY_MS);
-      if (remaining > 0) {
-        deferServerTask('REQUEST ONLINE LIST', sendOnlineList, remaining);
-        return;
-      }
-      await sendOnlineList();
     } catch (err) {
       console.error('[REQUEST ONLINE LIST ERROR]:', err);
       if (Array.isArray(lastKnownOnlineList) && lastKnownOnlineList.length > 0) {
@@ -2444,14 +2392,10 @@ io.on('connection', (socket) => {
         return;
       }
 
+      await upsertPresenceForSocket(socket, name);
       userDatabase[name].lastSeen = Date.now();
-      deferServerTask('PRESENCE PING UPSERT', () => upsertPresenceForSocket(socket, name), 0);
-      const cachedList = getSanitizedOnlineList();
-      const sendList = () => emitOnlineList(socket);
-      const remaining = getPostAuthRemainingDelay(socket, POST_AUTH_ONLINE_LIST_DELAY_MS);
-      if (remaining > 0) deferServerTask('PRESENCE PING ONLINE LIST', sendList, remaining);
-      else await sendList();
-      respond({ success: true, authenticated: true, onlineCount: getOnlineCountFromList(cachedList) });
+      const list = await emitOnlineList(socket);
+      respond({ success: true, authenticated: true, onlineCount: Array.isArray(list) ? list.filter(u => u && u.online === true).length : 0 });
     } catch (err) {
       console.error('[PRESENCE PING ERROR]:', err);
       respond({ success: false, authenticated: !!socket.userName });
