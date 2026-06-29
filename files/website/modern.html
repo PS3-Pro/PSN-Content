@@ -1180,6 +1180,10 @@ div[style*="display: flex"] { transition: opacity 0.3s ease, transform 0.3s ease
 #chat-input.chat-upload-waiting { border-color: rgba(255,255,255,.28) !important; }
 @keyframes chatUploadSkeleton { 0% { background-position: 120% 0; opacity: .55; } 50% { opacity: 1; } 100% { background-position: -120% 0; opacity: .55; } }
 
+.chat-history-loading { width:100%; min-height:130px; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:13px; color:rgba(255,255,255,.68); font-size:11px; font-weight:800; letter-spacing:.8px; text-transform:uppercase; border:1px dashed rgba(255,255,255,.10); border-radius:12px; background:rgba(0,0,0,.16); margin-top:16px; }
+.chat-history-loading i { font-size:22px; color:#00bcff; filter:drop-shadow(0 0 12px rgba(0,188,255,.35)); animation:pulse-dot 1.15s ease-in-out infinite; }
+.chat-history-loading span { opacity:.82; }
+
 .chat-lazy-image-shell { position: relative; overflow: hidden; background: rgba(0,0,0,0.22); border: 1px solid rgba(255,255,255,0.08); display: block; box-sizing: border-box; cursor: zoom-in; }
 .chat-single-image-shell { width: 100%; min-width: min(100%, 250px); min-height: 180px; max-height: 300px; margin: 10px 0 0 0; border-radius: 6px; }
 .chat-gallery-image-shell { width: 100%; height: 100%; min-height: 100px; border-radius: 0; }
@@ -14154,6 +14158,12 @@ P
 				switchView('view-chat');
 			}
 
+			if (window.__chatRenderLastReadSnapshot === null || window.__chatRenderLastReadSnapshot === undefined) window.__chatRenderLastReadSnapshot = parseInt(loadState('psn_last_chat_read') || 0) || 0;
+			if ((!window.__chatHistoryReceived || !Array.isArray(window.messageHistory)) && typeof showChatHistoryLoading === 'function') {
+				showChatHistoryLoading('Loading messages');
+				if (typeof requestChatHistoryNow === 'function') requestChatHistoryNow('open-chat');
+			}
+
 			if (typeof renderDeferredChatHistory === 'function') {
 				renderDeferredChatHistory({ reason: 'open-chat', force: !window.__chatHistoryDomRendered });
 			}
@@ -21607,6 +21617,7 @@ P
 				}, 5000);
 			}
 			else if (viewId === 'view-chat') {
+				window.__chatRenderLastReadSnapshot = parseInt(loadState('psn_last_chat_read') || 0) || 0;
 				const chatDot = document.getElementById('chat-dot');
 				if (chatDot) chatDot.style.display = 'none';
 				saveState('psn_chat_dot', 'false');
@@ -30865,6 +30876,10 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 
     window.__chatHistoryDomRendered = false;
     window.__chatLazyRenderPromise = null;
+    window.__chatHistoryReceived = false;
+    window.__chatHistoryRequesting = false;
+    window.__lastChatHistoryRequestAt = 0;
+    window.__chatRenderLastReadSnapshot = null;
 
     function getChatWelcomeBannerHtml() {
         return `
@@ -30873,6 +30888,33 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
                     Welcome to the Chat
                 </span>
             </div>`;
+    }
+
+
+    function getChatHistoryLoadingHtml(text = 'Loading messages') {
+        return `
+            <div id="chat-history-loading" class="chat-history-loading">
+                <i class="fas fa-comments"></i>
+                <span>${text}</span>
+            </div>`;
+    }
+
+    function showChatHistoryLoading(text = 'Loading messages') {
+        const box = document.getElementById('chat-messages');
+        if (!box || box.querySelector('[id^="msg-row-"]')) return;
+        box.style.opacity = '1';
+        box.style.removeProperty('transition');
+        box.innerHTML = getChatWelcomeBannerHtml() + getChatHistoryLoadingHtml(text);
+    }
+
+    function requestChatHistoryNow(reason = 'open-chat') {
+        if (!(typeof socketChat !== 'undefined' && socketChat && socketChat.connected)) return false;
+        const now = Date.now();
+        if (window.__lastChatHistoryRequestAt && now - window.__lastChatHistoryRequestAt < 900) return false;
+        window.__lastChatHistoryRequestAt = now;
+        window.__chatHistoryRequesting = true;
+        socketChat.emit('request_chat_history', { reason, at: now });
+        return true;
     }
 
     function normalizeChatHistoryPayload(history = []) {
@@ -30922,17 +30964,23 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
         }
         const history = Array.isArray(window.messageHistory) ? window.messageHistory.slice() : [];
         const signature = getChatHistoryRenderSignature(history);
+        if (!history.length && window.__chatHistoryReceived !== true) {
+            if (typeof showChatHistoryLoading === 'function') showChatHistoryLoading('Loading messages');
+            if (typeof requestChatHistoryNow === 'function') requestChatHistoryNow(options.reason || 'empty-render');
+            return Promise.resolve(false);
+        }
         if (window.__chatHistoryDomRendered && window.__chatHistoryRenderSignature === signature && box.querySelector('[id^="msg-row-"]') && options.force !== true) {
             return Promise.resolve(true);
         }
         window.__chatLazyRenderPromise = new Promise(resolve => {
-            const lastReadTime = parseInt(loadState('psn_last_chat_read') || 0);
+            const lastReadTime = window.__chatRenderLastReadSnapshot !== null && window.__chatRenderLastReadSnapshot !== undefined ? parseInt(window.__chatRenderLastReadSnapshot || 0) : parseInt(loadState('psn_last_chat_read') || 0);
             const myName = localStorage.getItem('psn_username') || "Guest";
             const chunkSize = window.matchMedia && window.matchMedia('(max-width: 768px)').matches ? 18 : 28;
             let unreadDividerAdded = false;
             let index = 0;
             window.lastChatRawDate = "";
-            box.style.opacity = '0';
+            box.style.opacity = '1';
+            box.style.removeProperty('transition');
             box.style.setProperty('scroll-behavior', 'auto', 'important');
             box.innerHTML = getChatWelcomeBannerHtml();
             const finish = () => {
@@ -30949,11 +30997,9 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
                 }
                 window.__chatHistoryDomRendered = true;
                 updateChatHistoryRenderSignature();
-                requestAnimationFrame(() => {
-                    box.style.transition = "opacity 0.28s ease-out";
-                    box.style.opacity = '1';
-                    setTimeout(() => box.style.setProperty('scroll-behavior', 'smooth'), 100);
-                });
+                window.__chatRenderLastReadSnapshot = null;
+                box.style.opacity = '1';
+                setTimeout(() => box.style.setProperty('scroll-behavior', 'smooth'), 100);
                 if (typeof refreshChatNotificationDot === 'function') refreshChatNotificationDot();
                 if (typeof refreshMentionJumpButton === 'function') refreshMentionJumpButton();
                 resolve(true);
@@ -35725,6 +35771,8 @@ function getVisibleChatStackEl(id) {
 		});
 	
 		socketChat.on('chat_history', function(history) {
+			window.__chatHistoryReceived = true;
+			window.__chatHistoryRequesting = false;
 			const normalizedHistory = typeof normalizeChatHistoryPayload === 'function' ? normalizeChatHistoryPayload(history) : (Array.isArray(history) ? history : []);
 			const incomingSignature = getChatHistoryRenderSignature(normalizedHistory);
 			const sameRenderedHistory = window.__chatHistoryDomRendered === true && window.__chatHistoryRenderSignature === incomingSignature;
