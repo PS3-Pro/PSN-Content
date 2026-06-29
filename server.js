@@ -348,81 +348,34 @@ initDb()
 
 
 
+function getSanitizedOnlineList() {
+  return Object.entries(userDatabase).map(([username, u]) => ({
+    id: u.id,
+    name: username,
+    avatar: u.avatar || DEFAULT_AVATAR,
+    isAdmin: isUserAdmin(username, u),
+    role: getUserRole(username, u),
+    banned: isUserBanned(u),
+    banReason: u.banReason || "",
+    level: u.level || 1,
+    joined: u.joined || '2026',
+    online: u.online,
+    lastSeen: u.lastSeen,
+    ps3Status: u.ps3Status || null,
+    downloads: u.downloads || (Array.isArray(u.downloadsData) ? u.downloadsData.length : 0),
+    wishlist: u.wishlist || (Array.isArray(u.wishlistData) ? u.wishlistData.length : 0),
+    favorites: u.favorites || (Array.isArray(u.favoritesData) ? u.favoritesData.length : 0),
+    trophies: u.trophies || 0,
+    library: u.library || (Array.isArray(u.libraryData) ? u.libraryData.length : 0)
+  }));
+}
+
 async function getSanitizedOnlineListFromDb(options = {}) {
-  const now = Date.now();
-  const maxAgeMs = options.force === true ? 0 : Math.max(0, Number(options.maxAgeMs || ONLINE_LIST_CACHE_MS) || 0);
-
-  if (maxAgeMs > 0 && Array.isArray(onlineListCache) && onlineListCacheAt && now - onlineListCacheAt < maxAgeMs) {
-    return onlineListCache;
-  }
-
-  if (onlineListBuildInFlight) return onlineListBuildInFlight;
-
-  onlineListBuildInFlight = (async () => {
-    await ensureUserCacheReady();
-    await pool.query(`DELETE FROM presence_sessions WHERE last_seen < NOW() - INTERVAL '90 seconds'`);
-
-    const presenceRes = await pool.query(`
-      SELECT name,
-             MAX(last_seen) AS last_seen,
-             (ARRAY_AGG(socket_id ORDER BY last_seen DESC))[1] AS socket_id,
-             COUNT(socket_id)::int AS active_sessions
-      FROM presence_sessions
-      WHERE last_seen > NOW() - INTERVAL '90 seconds'
-      GROUP BY name
-    `);
-
-    Object.values(userDatabase).forEach(user => {
-      user.online = false;
-      if (!user.lastSeen) user.lastSeen = null;
-    });
-
-    presenceRes.rows.forEach(row => {
-      const username = row.name;
-      if (!userDatabase[username]) return;
-      userDatabase[username].online = Number(row.active_sessions || 0) > 0;
-      userDatabase[username].id = row.socket_id || userDatabase[username].id || null;
-      userDatabase[username].lastSeen = row.last_seen ? new Date(row.last_seen).getTime() : (userDatabase[username].lastSeen || Date.now());
-    });
-
-    const list = Object.keys(userDatabase)
-      .sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()))
-      .map(username => {
-        const hydratedUser = userDatabase[username] || {};
-        return {
-          id: hydratedUser.id,
-          name: username,
-          avatar: hydratedUser.avatar || DEFAULT_AVATAR,
-          isAdmin: isUserAdmin(username, hydratedUser),
-          role: getUserRole(username, hydratedUser),
-          banned: isUserBanned(hydratedUser),
-          banReason: hydratedUser.banReason || "",
-          level: hydratedUser.level || 1,
-          joined: hydratedUser.joined || '2026',
-          online: hydratedUser.online === true,
-          lastSeen: hydratedUser.lastSeen || null,
-          ps3Status: hydratedUser.ps3Status || null,
-          profileUpdatedAt: normalizeTimestampValue(hydratedUser.profileUpdatedAt),
-          profileCardStyle: getUserProfileCardStyle(hydratedUser),
-          profileCardEffect: getUserProfileCardStyle(hydratedUser),
-          settingsData: getPublicProfileSettings(hydratedUser),
-          downloadsClearedAt: normalizeTimestampValue(hydratedUser.downloadsClearedAt),
-          downloads: Array.isArray(hydratedUser.downloadsData) ? hydratedUser.downloadsData.length : (hydratedUser.downloads || 0),
-          wishlist: Array.isArray(hydratedUser.wishlistData) ? hydratedUser.wishlistData.length : (hydratedUser.wishlist || 0),
-          favorites: Array.isArray(hydratedUser.favoritesData) ? hydratedUser.favoritesData.length : (hydratedUser.favorites || 0),
-          trophies: hydratedUser.trophies || 0,
-          library: Array.isArray(hydratedUser.libraryData) ? hydratedUser.libraryData.length : (hydratedUser.library || 0)
-        };
-      });
-
-    onlineListCache = list;
-    onlineListCacheAt = Date.now();
-    return list;
-  })().finally(() => {
-    onlineListBuildInFlight = null;
-  });
-
-  return onlineListBuildInFlight;
+  if (!Object.keys(userDatabase).length) await ensureUserCacheReady();
+  const list = getSanitizedOnlineList();
+  onlineListCache = list;
+  onlineListCacheAt = Date.now();
+  return list;
 }
 async function calculateGlobalTrophyStatsFromDb() {
   const stats = {};
@@ -1188,6 +1141,11 @@ async function getUserCached(name) {
 }
 
 function startUserCacheWarmup() {
+  if (process.env.ENABLE_USER_CACHE_WARMUP !== "1") {
+    console.log('[USER CACHE] background full refresh disabled; using startup RAM cache + targeted refresh only.');
+    return;
+  }
+
   setInterval(() => {
     refreshAllUsersCacheFromDb()
       .catch(err => console.error('[USER CACHE REFRESH ERROR]:', err));
@@ -1672,15 +1630,13 @@ async function initProfileSyncNotifications() {
       const hasLocalSession = Array.from(io.sockets.sockets.values()).some(activeSocket => (
         activeSocket.connected && activeSocket.userName === name
       ));
+      if (!hasLocalSession) return;
 
       const refreshedUser = await refreshSingleUserCacheFromDb(name);
       if (!refreshedUser) return;
 
       emitTrendingFromCache();
-
-      if (hasLocalSession) {
-        emitProfileSync(name, data.sourceSocketId || null);
-      }
+      emitProfileSync(name, data.sourceSocketId || null);
       emitPublicProfileBannerUpdate(name, refreshedUser);
       invalidateOnlineListCache("profile-sync-listen");
       await emitOnlineList();
@@ -2142,7 +2098,7 @@ io.on('connection', async (socket) => {
           
           await pool.query('UPDATE users SET data = $1 WHERE name = $2', [userDatabase[name], name]);
           invalidateOnlineListCache('auth-existing-save');
-          await notifyProfileSyncAcrossInstances(name, socket.id, userDatabase[name].profileUpdatedAt);
+          setImmediate(() => notifyProfileSyncAcrossInstances(name, socket.id, userDatabase[name].profileUpdatedAt).catch(err => console.error('[PROFILE NOTIFY DEFERRED ERROR]:', err)));
           await upsertPresenceForSocket(socket, name);
           await refreshChatHistoryFromDb();
 
@@ -2161,7 +2117,7 @@ io.on('connection', async (socket) => {
           socket.emit('pinned_list', pinnedMessages);
           await emitAdminState(socket);
 
-          await emitOnlineList();
+          setImmediate(() => emitOnlineList().catch(err => console.error('[ONLINE LIST DEFERRED ERROR]:', err)));
         } else {
           if (adminMaintenanceBypass === true) {
             socket.emit('auth_error', 'Incorrect admin password. Access denied.');
@@ -2211,7 +2167,7 @@ io.on('connection', async (socket) => {
           [name, userDatabase[name]]
         );
         invalidateOnlineListCache('auth-new-user');
-        await notifyProfileSyncAcrossInstances(name, socket.id, userDatabase[name].profileUpdatedAt);
+        setImmediate(() => notifyProfileSyncAcrossInstances(name, socket.id, userDatabase[name].profileUpdatedAt).catch(err => console.error('[PROFILE NOTIFY DEFERRED ERROR]:', err)));
         await upsertPresenceForSocket(socket, name);
         await refreshChatHistoryFromDb();
         if (wasDeletedAccount) {
@@ -2233,7 +2189,7 @@ io.on('connection', async (socket) => {
         socket.emit('pinned_list', pinnedMessages);
         await emitAdminState(socket);
 
-        await emitOnlineList();
+        setImmediate(() => emitOnlineList().catch(err => console.error('[ONLINE LIST DEFERRED ERROR]:', err)));
       }
     } catch (error) {
       console.error("[AUTH ERROR]:", error);
