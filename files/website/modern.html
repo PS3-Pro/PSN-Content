@@ -30901,6 +30901,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
     }
 
     function scrollChatToUnreadOrBottom(options = {}) {
+        if (window.__chatDetachedRenderingActive && options.allowDetached !== true) return false;
         const box = document.getElementById('chat-messages');
         if (!box) return false;
         const divider = document.getElementById('unread-divider');
@@ -30989,8 +30990,8 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 
     function renderDeferredChatHistory(options = {}) {
         if (window.__chatLazyRenderPromise) return window.__chatLazyRenderPromise;
-        const box = document.getElementById('chat-messages');
-        if (!box) return Promise.resolve(false);
+        const liveBox = document.getElementById('chat-messages');
+        if (!liveBox) return Promise.resolve(false);
         const chatVisible = typeof isChatScreenVisibleForRead === 'function' ? isChatScreenVisibleForRead() : true;
         if (!chatVisible && options.force !== true) {
             window.__chatHistoryDomRendered = false;
@@ -31003,36 +31004,79 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
             if (typeof requestChatHistoryNow === 'function') requestChatHistoryNow(options.reason || 'empty-render');
             return Promise.resolve(false);
         }
-        if (window.__chatHistoryDomRendered && window.__chatHistoryRenderSignature === signature && box.querySelector('[id^="msg-row-"]') && options.force !== true) {
+        if (window.__chatHistoryDomRendered && window.__chatHistoryRenderSignature === signature && liveBox.querySelector('[id^="msg-row-"]') && options.force !== true) {
             return Promise.resolve(true);
         }
         window.__chatLazyRenderPromise = new Promise(resolve => {
             const lastReadTime = window.__chatRenderLastReadSnapshot !== null && window.__chatRenderLastReadSnapshot !== undefined ? parseInt(window.__chatRenderLastReadSnapshot || 0) : parseInt(loadState('psn_last_chat_read') || 0);
             const myName = localStorage.getItem('psn_username') || "Guest";
-            const chunkSize = window.matchMedia && window.matchMedia('(max-width: 768px)').matches ? 18 : 28;
+            const chunkSize = window.matchMedia && window.matchMedia('(max-width: 768px)').matches ? 22 : 36;
             let unreadDividerAdded = false;
             let index = 0;
+            let tempBox = null;
+            let originalId = 'chat-messages';
             window.lastChatRawDate = "";
-            box.style.opacity = '1';
-            box.style.removeProperty('transition');
-            box.style.setProperty('scroll-behavior', 'auto', 'important');
-            box.innerHTML = getChatWelcomeBannerHtml() + getChatHistoryLoadingHtml('Preparing messages');
-            const finish = () => {
-                initDateStickyLogic();
-                if (typeof scrollChatToUnreadOrBottom === 'function') scrollChatToUnreadOrBottom({ restoreSmooth: true, setupDivider: true });
-                window.__chatHistoryDomRendered = true;
-                updateChatHistoryRenderSignature();
-                window.__chatRenderLastReadSnapshot = null;
-                box.style.opacity = '1';
-                if (typeof refreshChatNotificationDot === 'function') refreshChatNotificationDot();
-                if (typeof refreshMentionJumpButton === 'function') refreshMentionJumpButton();
-                resolve(true);
-            };
-            const step = () => {
-                if (index === 0) {
-                    const loader = document.getElementById('chat-history-loading');
-                    if (loader) loader.remove();
+            window.__chatDetachedRenderingActive = true;
+            liveBox.style.opacity = '1';
+            liveBox.style.removeProperty('transition');
+            liveBox.style.setProperty('scroll-behavior', 'auto', 'important');
+            liveBox.innerHTML = getChatWelcomeBannerHtml() + getChatHistoryLoadingHtml('Preparing messages');
+
+            const cleanupDetachedRender = () => {
+                window.__chatDetachedRenderingActive = false;
+                if (tempBox && tempBox.parentNode) {
+                    tempBox.id = 'chat-messages-render-buffer';
+                    tempBox.parentNode.removeChild(tempBox);
                 }
+                if (liveBox.id !== originalId) liveBox.id = originalId;
+            };
+
+            const createDetachedRenderBox = () => {
+                originalId = liveBox.id || 'chat-messages';
+                liveBox.id = 'chat-messages-visible-rendering';
+                tempBox = document.createElement('div');
+                tempBox.id = 'chat-messages';
+                tempBox.className = liveBox.className || '';
+                tempBox.style.cssText = `position:fixed !important; left:-99999px !important; top:0 !important; width:${Math.max(320, liveBox.clientWidth || 320)}px !important; height:${Math.max(320, liveBox.clientHeight || 320)}px !important; overflow:hidden !important; visibility:hidden !important; opacity:0 !important; pointer-events:none !important; scroll-behavior:auto !important;`;
+                tempBox.innerHTML = getChatWelcomeBannerHtml();
+                document.body.appendChild(tempBox);
+                return tempBox;
+            };
+
+            let renderBox = createDetachedRenderBox();
+
+            const finish = () => {
+                try {
+                    liveBox.style.setProperty('scroll-behavior', 'auto', 'important');
+                    liveBox.style.visibility = 'hidden';
+                    if (tempBox) {
+                        const html = tempBox.innerHTML;
+                        tempBox.id = 'chat-messages-render-buffer';
+                        liveBox.id = originalId;
+                        liveBox.innerHTML = html;
+                    } else {
+                        liveBox.id = originalId;
+                    }
+                    cleanupDetachedRender();
+                    initDateStickyLogic();
+                    if (typeof scrollChatToUnreadOrBottom === 'function') scrollChatToUnreadOrBottom({ restoreSmooth: true, setupDivider: true });
+                    window.__chatHistoryDomRendered = true;
+                    updateChatHistoryRenderSignature();
+                    window.__chatRenderLastReadSnapshot = null;
+                    liveBox.style.opacity = '1';
+                    requestAnimationFrame(() => { liveBox.style.visibility = ''; });
+                    if (typeof refreshChatNotificationDot === 'function') refreshChatNotificationDot();
+                    if (typeof refreshMentionJumpButton === 'function') refreshMentionJumpButton();
+                    resolve(true);
+                } catch (err) {
+                    console.error('[chat] detached render finish failed:', err);
+                    cleanupDetachedRender();
+                    resolve(false);
+                }
+            };
+
+            const step = () => {
+                if (!renderBox || renderBox.id !== 'chat-messages') renderBox = createDetachedRenderBox();
                 const limit = Math.min(index + chunkSize, history.length);
                 for (; index < limit; index++) {
                     const data = history[index];
@@ -31045,12 +31089,12 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
                         divider.className = 'date-divider';
                         divider.setAttribute('data-label', currentDateLabel);
                         divider.innerHTML = `<span>${currentDateLabel}</span>`;
-                        box.appendChild(divider);
+                        renderBox.appendChild(divider);
                         window.lastChatRawDate = msgRawDate;
                     }
                     const msgTime = new Date(data.time).getTime();
                     if (data.user !== myName && lastReadTime > 0 && msgTime > lastReadTime && !unreadDividerAdded) {
-                        box.insertAdjacentHTML('beforeend', `
+                        renderBox.insertAdjacentHTML('beforeend', `
                             <div id="unread-divider" class="ps-new-messages-container">
                                 <div class="ps-line left"></div>
                                 <span class="ps-unread-text">UNREAD MESSAGES</span>
@@ -31064,7 +31108,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
                 else finish();
             };
             requestAnimationFrame(step);
-        }).finally(() => { window.__chatLazyRenderPromise = null; });
+        }).finally(() => { window.__chatLazyRenderPromise = null; window.__chatDetachedRenderingActive = false; });
         return window.__chatLazyRenderPromise;
     }
     window.renderDeferredChatHistory = renderDeferredChatHistory;
@@ -38845,7 +38889,7 @@ function getVisibleChatStackEl(id) {
 				`;
 				
 				const chatBox = document.getElementById('chat-messages');
-				if (chatBox && !window.__chatSearchActive) chatBox.scrollTop = chatBox.scrollHeight;
+				if (chatBox && !window.__chatSearchActive && !window.__chatDetachedRenderingActive) chatBox.scrollTop = chatBox.scrollHeight;
 			} else {
 				console.warn("Link preview failed for:", url);
 			}
