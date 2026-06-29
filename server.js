@@ -20,6 +20,7 @@ const PRESENCE_TTL_SECONDS = 90;
 const PRESENCE_HEARTBEAT_MS = 25000;
 const CHAT_SYNC_INTERVAL_MS = 3000;
 const PROFILE_SYNC_INTERVAL_MS = Math.max(10000, parseInt(process.env.PROFILE_SYNC_INTERVAL_MS || "15000", 10) || 15000);
+const ENABLE_PROFILE_PERIODIC_SYNC = process.env.ENABLE_PROFILE_PERIODIC_SYNC === "1";
 const POST_AUTH_CHAT_HISTORY_DELAY_MS = Math.max(0, parseInt(process.env.POST_AUTH_CHAT_HISTORY_DELAY_MS || "180", 10) || 180);
 const POST_AUTH_ADMIN_STATE_DELAY_MS = Math.max(0, parseInt(process.env.POST_AUTH_ADMIN_STATE_DELAY_MS || "550", 10) || 550);
 const POST_AUTH_ONLINE_LIST_DELAY_MS = Math.max(0, parseInt(process.env.POST_AUTH_ONLINE_LIST_DELAY_MS || "1400", 10) || 1400);
@@ -2054,7 +2055,7 @@ const profileSyncIntervalTask = runNonOverlappingTask('PROFILE SYNC', syncActive
 setInterval(syncAdminStateIntervalTask, 15000);
 setInterval(presenceHeartbeatIntervalTask, PRESENCE_HEARTBEAT_MS);
 setInterval(chatPollIntervalTask, CHAT_SYNC_INTERVAL_MS);
-setInterval(profileSyncIntervalTask, PROFILE_SYNC_INTERVAL_MS);
+if (ENABLE_PROFILE_PERIODIC_SYNC) { setInterval(profileSyncIntervalTask, PROFILE_SYNC_INTERVAL_MS); } else { console.log('[PROFILE SYNC] Periodic fallback disabled. Realtime LISTEN/NOTIFY remains enabled.'); }
 
 io.on('connection', (socket) => {
   console.log('[NETWORK] Socket connected. ID: ' + socket.id);
