@@ -14153,6 +14153,10 @@ P
 			if (chatRoot && chatRoot.style.display !== 'block' && chatRoot.style.display !== 'flex') {
 				switchView('view-chat');
 			}
+
+			if (typeof renderDeferredChatHistory === 'function') {
+				renderDeferredChatHistory({ reason: 'open-chat', force: !window.__chatHistoryDomRendered });
+			}
 	
 			setTimeout(() => {
 				const chatBox = document.getElementById('chat-messages');
@@ -30859,51 +30863,152 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
         window.__chatHistoryRenderSignature = getChatHistoryRenderSignature(window.messageHistory || []);
     }
 
+    window.__chatHistoryDomRendered = false;
+    window.__chatLazyRenderPromise = null;
+
+    function getChatWelcomeBannerHtml() {
+        return `
+            <div id="welcome-banner-scroll" style="text-align: center; margin-bottom: -15px; margin-top: -5px;">
+                <span style="background: rgba(0, 188, 255, 0.05); padding: 6px 20px; border-radius: 20px; font-size: 9.5px; color: #fff; text-transform: uppercase; letter-spacing: 1.5px; border: 1px solid rgba(0, 188, 255, 0.1); font-weight: bold; white-space: nowrap;">
+                    Welcome to the Chat
+                </span>
+            </div>`;
+    }
+
+    function normalizeChatHistoryPayload(history = []) {
+        const seenMessages = new Set();
+        return (Array.isArray(history) ? history : []).map(msg => {
+            if (msg && typeof msg === 'object' && typeof isChatGlobalPingMessage === 'function' && isChatGlobalPingMessage(msg, msg.user)) {
+                return Object.assign({}, msg, { isGlobalPing: true });
+            }
+            return msg;
+        }).filter(msg => {
+            const key = String(new Date(msg && msg.time).getTime() || msg?.time || Math.random());
+            if (seenMessages.has(key)) return false;
+            seenMessages.add(key);
+            return true;
+        });
+    }
+
+    function applyChatReactionToStoredMessage(data = {}) {
+        if (!window.messageHistory || !Array.isArray(window.messageHistory)) return;
+        const msg = window.messageHistory.find(m => String(new Date(m && m.time).getTime()) === String(data.msgId));
+        if (!msg || !data.emoji || !data.user) return;
+        const reactions = Array.isArray(msg.reactions) ? msg.reactions : [];
+        let reaction = reactions.find(r => r && r.emoji === data.emoji);
+        if (!reaction) {
+            reactions.push({ emoji: data.emoji, count: 1, users: [data.user] });
+            msg.reactions = reactions;
+            return;
+        }
+        const users = Array.isArray(reaction.users) ? reaction.users.slice() : [];
+        const index = users.indexOf(data.user);
+        if (index > -1) users.splice(index, 1);
+        else users.push(data.user);
+        reaction.users = users;
+        reaction.count = users.length;
+        if (reaction.count <= 0) msg.reactions = reactions.filter(r => r !== reaction);
+        else msg.reactions = reactions;
+    }
+
+    function renderDeferredChatHistory(options = {}) {
+        if (window.__chatLazyRenderPromise) return window.__chatLazyRenderPromise;
+        const box = document.getElementById('chat-messages');
+        if (!box) return Promise.resolve(false);
+        const chatVisible = typeof isChatScreenVisibleForRead === 'function' ? isChatScreenVisibleForRead() : true;
+        if (!chatVisible && options.force !== true) {
+            window.__chatHistoryDomRendered = false;
+            return Promise.resolve(false);
+        }
+        const history = Array.isArray(window.messageHistory) ? window.messageHistory.slice() : [];
+        const signature = getChatHistoryRenderSignature(history);
+        if (window.__chatHistoryDomRendered && window.__chatHistoryRenderSignature === signature && box.querySelector('[id^="msg-row-"]') && options.force !== true) {
+            return Promise.resolve(true);
+        }
+        window.__chatLazyRenderPromise = new Promise(resolve => {
+            const lastReadTime = parseInt(loadState('psn_last_chat_read') || 0);
+            const myName = localStorage.getItem('psn_username') || "Guest";
+            const chunkSize = window.matchMedia && window.matchMedia('(max-width: 768px)').matches ? 18 : 28;
+            let unreadDividerAdded = false;
+            let index = 0;
+            window.lastChatRawDate = "";
+            box.style.opacity = '0';
+            box.style.setProperty('scroll-behavior', 'auto', 'important');
+            box.innerHTML = getChatWelcomeBannerHtml();
+            const finish = () => {
+                initDateStickyLogic();
+                const unread = document.getElementById('unread-divider');
+                if (unread) {
+                    const topPos = unread.offsetTop - (box.offsetHeight / 2);
+                    box.scrollTop = topPos;
+                    if (typeof setupDividerAutoRemove === 'function') setupDividerAutoRemove();
+                    if (typeof updateJumpBottomUnreadBadge === 'function') updateJumpBottomUnreadBadge();
+                } else {
+                    box.scrollTop = box.scrollHeight;
+                    if (typeof updateJumpBottomUnreadBadge === 'function') updateJumpBottomUnreadBadge(0);
+                }
+                window.__chatHistoryDomRendered = true;
+                updateChatHistoryRenderSignature();
+                requestAnimationFrame(() => {
+                    box.style.transition = "opacity 0.28s ease-out";
+                    box.style.opacity = '1';
+                    setTimeout(() => box.style.setProperty('scroll-behavior', 'smooth'), 100);
+                });
+                if (typeof refreshChatNotificationDot === 'function') refreshChatNotificationDot();
+                if (typeof refreshMentionJumpButton === 'function') refreshMentionJumpButton();
+                resolve(true);
+            };
+            const step = () => {
+                const limit = Math.min(index + chunkSize, history.length);
+                for (; index < limit; index++) {
+                    const data = history[index];
+                    if (!data) continue;
+                    if (typeof trackUser === 'function') trackUser(data.user);
+                    const msgRawDate = new Date(data.time).toDateString();
+                    if (msgRawDate !== window.lastChatRawDate) {
+                        const currentDateLabel = getChatDateLabel(data.time);
+                        const divider = document.createElement('div');
+                        divider.className = 'date-divider';
+                        divider.setAttribute('data-label', currentDateLabel);
+                        divider.innerHTML = `<span>${currentDateLabel}</span>`;
+                        box.appendChild(divider);
+                        window.lastChatRawDate = msgRawDate;
+                    }
+                    const msgTime = new Date(data.time).getTime();
+                    if (data.user !== myName && lastReadTime > 0 && msgTime > lastReadTime && !unreadDividerAdded) {
+                        box.insertAdjacentHTML('beforeend', `
+                            <div id="unread-divider" class="ps-new-messages-container">
+                                <div class="ps-line left"></div>
+                                <span class="ps-unread-text">UNREAD MESSAGES</span>
+                                <div class="ps-line right"></div>
+                            </div>`);
+                        unreadDividerAdded = true;
+                    }
+                    appendMessageToChat(data, data.user === myName, data.time);
+                }
+                if (index < history.length) requestAnimationFrame(step);
+                else finish();
+            };
+            requestAnimationFrame(step);
+        }).finally(() => { window.__chatLazyRenderPromise = null; });
+        return window.__chatLazyRenderPromise;
+    }
+    window.renderDeferredChatHistory = renderDeferredChatHistory;
+
     function scheduleChatHistorySoftRerender(reason = 'sync', forceBottom = false) {
         if (!Array.isArray(window.messageHistory) || window.messageHistory.length === 0) return;
-        const chatView = document.getElementById('view-chat');
-        const chatVisible = !!(chatView && chatView.style.display !== 'none');
+        const chatVisible = typeof isChatScreenVisibleForRead === 'function' && isChatScreenVisibleForRead();
         if (!chatVisible || window.__loginRevealBusy || window.__exploreBootRevealActive) {
+            window.__chatHistoryDomRendered = false;
             if (typeof updateChatHistoryRenderSignature === 'function') updateChatHistoryRenderSignature();
             return;
         }
         if (window.__chatSoftRerenderTimer) clearTimeout(window.__chatSoftRerenderTimer);
         window.__chatSoftRerenderTimer = setTimeout(() => {
-            const box = document.getElementById('chat-messages');
-            if (!box) return;
-            const myName = localStorage.getItem('psn_username') || 'Guest';
-            const wasNearBottom = typeof isChatNearBottom === 'function' ? isChatNearBottom(box, 120) : ((box.scrollHeight - box.scrollTop - box.clientHeight) < 120);
-            const oldScrollTop = box.scrollTop;
-            const oldScrollHeight = box.scrollHeight;
-            box.style.setProperty('scroll-behavior', 'auto', 'important');
-            box.innerHTML = '';
-            window.lastChatRawDate = '';
-            window.messageHistory.forEach(msg => {
-                if (!msg) return;
-                const msgRawDate = new Date(msg.time).toDateString();
-                if (msg.time && msgRawDate !== window.lastChatRawDate && typeof getChatDateLabel === 'function') {
-                    const currentDateLabel = getChatDateLabel(msg.time);
-                    const divider = document.createElement('div');
-                    divider.className = 'date-divider';
-                    divider.setAttribute('data-label', currentDateLabel);
-                    divider.innerHTML = `<span>${currentDateLabel}</span>`;
-                    box.appendChild(divider);
-                    window.lastChatRawDate = msgRawDate;
-                }
-                appendMessageToChat(msg, msg.user === myName, msg.time);
-            });
-            if (forceBottom || wasNearBottom) {
-                box.scrollTop = box.scrollHeight;
-            } else {
-                const delta = box.scrollHeight - oldScrollHeight;
-                box.scrollTop = Math.max(0, oldScrollTop + delta);
-            }
-            setTimeout(() => box.style.setProperty('scroll-behavior', 'smooth'), 80);
-            updateChatHistoryRenderSignature();
-            if (typeof refreshMentionJumpButton === 'function') refreshMentionJumpButton();
-            if (typeof refreshChatNotificationDot === 'function') refreshChatNotificationDot();
+            if (typeof renderDeferredChatHistory === 'function') renderDeferredChatHistory({ reason, force: true, forceBottom });
         }, 80);
     }
+
 
 
     function setupDividerAutoRemove() {
@@ -35561,6 +35666,7 @@ function getVisibleChatStackEl(id) {
 		});
 	
 		socketChat.on('message_reaction', function(data) {
+			if (typeof applyChatReactionToStoredMessage === 'function') applyChatReactionToStoredMessage(data);
 			const container = document.getElementById(`reactions-${data.msgId}`);
 			if (!container) return;
 			
@@ -35619,98 +35725,22 @@ function getVisibleChatStackEl(id) {
 		});
 	
 		socketChat.on('chat_history', function(history) {
-			const seenMessages = new Set();
-			const normalizedHistory = (Array.isArray(history) ? history : []).map(msg => {
-				if (msg && typeof msg === 'object' && typeof isChatGlobalPingMessage === 'function' && isChatGlobalPingMessage(msg, msg.user)) {
-					return Object.assign({}, msg, { isGlobalPing: true });
-				}
-				return msg;
-			}).filter(msg => {
-				const key = String(new Date(msg && msg.time).getTime() || msg?.time || Math.random());
-				if (seenMessages.has(key)) return false;
-				seenMessages.add(key);
-				return true;
-			});
+			const normalizedHistory = typeof normalizeChatHistoryPayload === 'function' ? normalizeChatHistoryPayload(history) : (Array.isArray(history) ? history : []);
 			const incomingSignature = getChatHistoryRenderSignature(normalizedHistory);
-			const box = document.getElementById('chat-messages');
-			if (!box) return;
-			if (window.__chatHistoryRenderSignature === incomingSignature && box.querySelector('[id^="msg-row-"]')) {
-				window.messageHistory = normalizedHistory;
-				if (typeof registerChatUsersFromHistory === 'function') registerChatUsersFromHistory(window.messageHistory);
-				if (typeof refreshChatNotificationDot === 'function') refreshChatNotificationDot();
-				if (typeof refreshMentionJumpButton === 'function') refreshMentionJumpButton();
-				return;
-			}
+			const sameRenderedHistory = window.__chatHistoryDomRendered === true && window.__chatHistoryRenderSignature === incomingSignature;
 			window.messageHistory = normalizedHistory;
-			history = window.messageHistory;
-		
-			box.style.opacity = '0';
-			box.style.setProperty('scroll-behavior', 'auto', 'important');
-
-			box.innerHTML = `
-				<div id="welcome-banner-scroll" style="text-align: center; margin-bottom: -15px; margin-top: -5px;">
-					<span style="background: rgba(0, 188, 255, 0.05); padding: 6px 20px; border-radius: 20px; font-size: 9.5px; color: #fff; text-transform: uppercase; letter-spacing: 1.5px; border: 1px solid rgba(0, 188, 255, 0.1); font-weight: bold; white-space: nowrap;">
-						Welcome to the Chat
-					</span>
-				</div>`;
-		
-			const lastReadTime = parseInt(loadState('psn_last_chat_read') || 0);
-			const myName = localStorage.getItem('psn_username') || "Guest";
-			let unreadDividerAdded = false;
-			window.lastChatRawDate = "";
-		
-			history.forEach((data) => {
-				trackUser(data.user);
-	
-				const msgRawDate = new Date(data.time).toDateString();
-				if (msgRawDate !== window.lastChatRawDate) {
-					const currentDateLabel = getChatDateLabel(data.time);
-					const divider = document.createElement('div');
-					divider.className = 'date-divider'; 
-					divider.setAttribute('data-label', currentDateLabel);
-					divider.innerHTML = `<span>${currentDateLabel}</span>`;
-					box.appendChild(divider);
-					window.lastChatRawDate = msgRawDate;
-				}
-	
-				const msgTime = new Date(data.time).getTime();
-				if (data.user !== myName && lastReadTime > 0 && msgTime > lastReadTime && !unreadDividerAdded) {
-					box.insertAdjacentHTML('beforeend', `
-						<div id="unread-divider" class="ps-new-messages-container">
-							<div class="ps-line left"></div>
-							<span class="ps-unread-text">UNREAD MESSAGES</span>
-							<div class="ps-line right"></div>
-						</div>`);
-					unreadDividerAdded = true;
-				}
-	
-				appendMessageToChat(data, data.user === myName, data.time);
-			});
-	
-			initDateStickyLogic();
-			
-			const unread = document.getElementById('unread-divider');
-			if (unread) {
-				const topPos = unread.offsetTop - (box.offsetHeight / 2);
-				box.scrollTop = topPos;
-				if (typeof setupDividerAutoRemove === 'function') setupDividerAutoRemove();
-				if (typeof updateJumpBottomUnreadBadge === 'function') updateJumpBottomUnreadBadge();
-			} else {
-				box.scrollTop = box.scrollHeight;
-				if (typeof updateJumpBottomUnreadBadge === 'function') updateJumpBottomUnreadBadge(0);
-			}
-
+			if (typeof registerChatUsersFromHistory === 'function') registerChatUsersFromHistory(window.messageHistory);
+			if (!sameRenderedHistory) window.__chatHistoryDomRendered = false;
 			updateChatHistoryRenderSignature();
-
-			requestAnimationFrame(() => {
-				box.style.transition = "opacity 0.4s ease-out";
-				box.style.opacity = '1';
-				setTimeout(() => {
-					box.style.setProperty('scroll-behavior', 'smooth');
-				}, 100);
-			});
-		
+			const chatVisible = typeof isChatScreenVisibleForRead === 'function' && isChatScreenVisibleForRead();
+			if (chatVisible) {
+				if (typeof renderDeferredChatHistory === 'function') renderDeferredChatHistory({ reason: 'chat_history', force: !sameRenderedHistory, forceBottom: true });
+			} else {
+				const box = document.getElementById('chat-messages');
+				if (box && !box.querySelector('[id^="msg-row-"]') && typeof getChatWelcomeBannerHtml === 'function') box.innerHTML = getChatWelcomeBannerHtml();
+			}
 			if (typeof refreshChatNotificationDot === 'function') refreshChatNotificationDot();
+			if (typeof refreshMentionJumpButton === 'function') refreshMentionJumpButton();
 		});
 	
 		socketChat.on('chat_message', function(data) {
@@ -35731,6 +35761,19 @@ function getVisibleChatStackEl(id) {
 				const isMention = data.text && (typeof chatTextMentionsUser === 'function' ? chatTextMentionsUser(data.text, myName) : data.text.includes(`@${myName}`));
 				const isReply = data.replyTo && data.replyTo.user === myName;
 				if (isMention || isReply || data.isGlobalPing) showChatNotification(data.user, isMention, data.isGlobalPing, data.globalPingRole);
+			}
+
+			if (!chatVisible) {
+				window.__chatHistoryDomRendered = false;
+				updateChatHistoryRenderSignature();
+				if (typeof refreshChatNotificationDot === 'function') refreshChatNotificationDot();
+				if (typeof updateJumpBottomUnreadBadge === 'function') updateJumpBottomUnreadBadge();
+				return;
+			}
+
+			if (!window.__chatHistoryDomRendered && typeof renderDeferredChatHistory === 'function') {
+				renderDeferredChatHistory({ reason: 'chat_message_visible_pending', force: true, forceBottom: data.user === myName });
+				return;
 			}
 			
 			const searchInput = document.getElementById('search-input');
@@ -36147,14 +36190,14 @@ function getVisibleChatStackEl(id) {
 		socketChat.on('user_typing', (data) => {
 			if (typeof typingUsers !== 'undefined') {
 				typingUsers.set(data.name, data.avatar);
-				if (typeof renderTypingIndicator === 'function') renderTypingIndicator();
+				if (typeof renderTypingIndicator === 'function' && typeof isChatScreenVisibleForRead === 'function' && isChatScreenVisibleForRead()) renderTypingIndicator();
 			}
 		});
 	
 		socketChat.on('user_stopped_typing', (data) => {
 			if (typeof typingUsers !== 'undefined') {
 				typingUsers.delete(data.name);
-				if (typeof renderTypingIndicator === 'function') renderTypingIndicator();
+				if (typeof renderTypingIndicator === 'function' && typeof isChatScreenVisibleForRead === 'function' && isChatScreenVisibleForRead()) renderTypingIndicator();
 			}
 		});
 		
