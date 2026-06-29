@@ -1544,6 +1544,46 @@ function buildFullProfileSyncPayload(name, user = {}, sourceSocketId = null) {
   };
 }
 
+function buildLightAuthUserPayload(name, user = {}) {
+  const safe = normalizeUserRecord(name, user || {});
+  const settingsData = { ...normalizeProfileRealtimeSettings(safe.settingsData || {}), ...getPublicProfileSettings(safe) };
+  return {
+    _lightAuth: true,
+    id: safe.id || null,
+    name,
+    avatar: safe.avatar || DEFAULT_AVATAR,
+    joined: safe.joined || '2026',
+    role: getUserRole(name, safe),
+    isAdmin: isUserAdmin(name, safe),
+    isModerator: isUserModerator(name, safe),
+    banned: isUserBanned(safe),
+    banReason: safe.banReason || '',
+    lastSeen: safe.lastSeen || null,
+    profileUpdatedAt: normalizeTimestampValue(safe.profileUpdatedAt) || Date.now(),
+    ps3Status: safe.ps3Status || null,
+    level: safe.level || 1,
+    xp: safe.xp || 0,
+    downloads: Array.isArray(safe.downloadsData) ? safe.downloadsData.length : (safe.downloads || 0),
+    wishlist: Array.isArray(safe.wishlistData) ? safe.wishlistData.length : (safe.wishlist || 0),
+    favorites: Array.isArray(safe.favoritesData) ? safe.favoritesData.length : (safe.favorites || 0),
+    trophies: safe.trophies || 0,
+    library: Array.isArray(safe.libraryData) ? safe.libraryData.length : (safe.library || 0),
+    downloadsClearedAt: normalizeTimestampValue(safe.downloadsClearedAt),
+    downloadsUpdatedAt: normalizeTimestampValue(safe.downloadsUpdatedAt),
+    wishlistUpdatedAt: normalizeTimestampValue(safe.wishlistUpdatedAt),
+    favoritesUpdatedAt: normalizeTimestampValue(safe.favoritesUpdatedAt),
+    libraryUpdatedAt: normalizeTimestampValue(safe.libraryUpdatedAt),
+    friendsUpdatedAt: normalizeTimestampValue(safe.friendsUpdatedAt),
+    themeColor: safe.themeColor || '#0070cc',
+    settingsData
+  };
+}
+
+function emitFullProfileSyncToSocket(socket, name, reason = 'post_auth_full_profile') {
+  if (!socket || !name || !userDatabase[name]) return;
+  socket.emit('profile_sync', { ...buildFullProfileSyncPayload(name, userDatabase[name], null), reason });
+}
+
 function emitProfileSync(name, sourceSocketId = null) {
   if (!name || !userDatabase[name]) return;
   const payload = buildFullProfileSyncPayload(name, userDatabase[name], sourceSocketId);
@@ -2143,11 +2183,15 @@ io.on('connection', (socket) => {
 
           socket.emit('auth_success', { 
             name, 
-            userData: userDatabase[name],
+            userData: buildLightAuthUserPayload(name, userDatabase[name]),
             isAdmin: isAdmin,
             role: getUserRole(name, userDatabase[name]),
-            isModerator: isUserModerator(name, userDatabase[name])
+            isModerator: isUserModerator(name, userDatabase[name]),
+            lightAuth: true,
+            fullProfileDeferred: true
           });
+
+          deferServerTask('POST AUTH FULL PROFILE SYNC', () => emitFullProfileSyncToSocket(socket, name), POST_AUTH_PROFILE_SYNC_DELAY_MS + 900);
 
           socket.emit('pinned_list', pinnedMessages);
           deferServerTask('POST AUTH CHAT HISTORY', () => socket.emit('chat_history', getPublicChatHistory()), POST_AUTH_CHAT_HISTORY_DELAY_MS);
