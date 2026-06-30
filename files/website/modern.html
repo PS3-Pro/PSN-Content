@@ -10071,26 +10071,236 @@ P
 		}
 	}
 	
+	/* ========================================================================== MOBILE HAPTIC FEEDBACK ========================================================================== */
+	const psnHapticPatterns = {
+		success: [{ duration: 30, intensity: 0.5 }, { delay: 60, duration: 40, intensity: 1 }],
+		warning: [{ duration: 40, intensity: 0.8 }, { delay: 100, duration: 40, intensity: 0.6 }],
+		error: [{ duration: 40, intensity: 0.7 }, { delay: 40, duration: 40, intensity: 0.7 }, { delay: 40, duration: 40, intensity: 0.9 }, { delay: 40, duration: 50, intensity: 0.6 }],
+		light: [{ duration: 15, intensity: 0.4 }],
+		medium: [{ duration: 25, intensity: 0.7 }],
+		heavy: [{ duration: 35, intensity: 1 }],
+		soft: [{ duration: 40, intensity: 0.5 }],
+		rigid: [{ duration: 10, intensity: 1 }],
+		selection: [{ duration: 8, intensity: 0.3 }],
+		nudge: [{ duration: 80, intensity: 0.8 }, { delay: 80, duration: 50, intensity: 0.3 }],
+		buzz: [{ duration: 1000, intensity: 1 }]
+	};
+
+	function isMobileHapticsReady() {
+		try {
+			return !!(
+				(navigator && (navigator.maxTouchPoints || 0) > 0) ||
+				('ontouchstart' in window) ||
+				(window.matchMedia && (
+					window.matchMedia('(pointer: coarse)').matches ||
+					window.matchMedia('(any-pointer: coarse)').matches ||
+					window.matchMedia('(hover: none)').matches
+				))
+			);
+		} catch (e) {}
+		return false;
+	}
+
+	function normalizePsnHapticInput(input) {
+		if (input === undefined || input === null) input = 'medium';
+		if (typeof input === 'number') return [{ duration: input }];
+		if (typeof input === 'string') return (psnHapticPatterns[input] || psnHapticPatterns.medium).map(v => ({ ...v }));
+		if (Array.isArray(input)) {
+			if (!input.length) return [];
+			if (typeof input[0] === 'number') {
+				const list = [];
+				for (let i = 0; i < input.length; i += 2) {
+					const delay = i > 0 ? Number(input[i - 1] || 0) : 0;
+					const duration = Number(input[i] || 0);
+					if (duration > 0) list.push({ ...(delay > 0 ? { delay } : {}), duration });
+				}
+				return list;
+			}
+			return input.map(v => ({ ...v }));
+		}
+		if (input && Array.isArray(input.pattern)) return input.pattern.map(v => ({ ...v }));
+		return psnHapticPatterns.medium.map(v => ({ ...v }));
+	}
+
+	function modulatePsnHaptic(duration, intensity) {
+		const PWM_CYCLE = 20;
+		if (intensity >= 1) return [duration];
+		if (intensity <= 0) return [];
+		const onTime = Math.max(1, Math.round(PWM_CYCLE * intensity));
+		const offTime = PWM_CYCLE - onTime;
+		const result = [];
+		let remaining = duration;
+		while (remaining >= PWM_CYCLE) {
+			result.push(onTime);
+			if (offTime > 0) result.push(offTime);
+			remaining -= PWM_CYCLE;
+		}
+		if (remaining > 0) {
+			const remOn = Math.max(1, Math.round(remaining * intensity));
+			result.push(remOn);
+			const remOff = remaining - remOn;
+			if (remOff > 0) result.push(remOff);
+		}
+		return result;
+	}
+
+	function buildPsnVibratePattern(vibrations, defaultIntensity = 0.5) {
+		const MAX_PHASE_MS = 1000;
+		const result = [];
+		vibrations.forEach(vib => {
+			const duration = Math.max(0, Math.min(MAX_PHASE_MS, Number(vib.duration || 0)));
+			const delay = Math.max(0, Number(vib.delay || 0));
+			const intensity = Math.max(0, Math.min(1, Number(vib.intensity ?? defaultIntensity)));
+			if (delay > 0) {
+				if (result.length > 0 && result.length % 2 === 0) result[result.length - 1] += delay;
+				else {
+					if (result.length === 0) result.push(0);
+					result.push(delay);
+				}
+			}
+			modulatePsnHaptic(duration, intensity).forEach(seg => result.push(seg));
+		});
+		return result;
+	}
+
+	function getPsnHapticLabel() {
+		if (window.__psnHapticLabel && document.body.contains(window.__psnHapticLabel)) return window.__psnHapticLabel;
+		const id = 'psn-web-haptics-toggle';
+		const label = document.createElement('label');
+		label.setAttribute('for', id);
+		label.setAttribute('aria-hidden', 'true');
+		label.style.position = 'fixed';
+		label.style.left = '-9999px';
+		label.style.bottom = '0';
+		label.style.width = '1px';
+		label.style.height = '1px';
+		label.style.overflow = 'hidden';
+		label.style.opacity = '0';
+		label.style.pointerEvents = 'none';
+		const input = document.createElement('input');
+		input.type = 'checkbox';
+		input.id = id;
+		input.setAttribute('switch', '');
+		input.style.all = 'initial';
+		input.style.appearance = 'auto';
+		input.style.webkitAppearance = 'checkbox';
+		input.style.width = '1px';
+		input.style.height = '1px';
+		input.style.opacity = '0';
+		label.appendChild(input);
+		document.body.appendChild(label);
+		window.__psnHapticLabel = label;
+		return label;
+	}
+
+	function clickPsnHapticFallback(pattern, defaultIntensity = 0.5) {
+		try {
+			const label = getPsnHapticLabel();
+			const phases = [];
+			let total = 0;
+			pattern.forEach(vib => {
+				const delay = Math.max(0, Number(vib.delay || 0));
+				if (delay > 0) total += delay;
+				const duration = Math.max(0, Math.min(1000, Number(vib.duration || 0)));
+				const intensity = Math.max(0, Math.min(1, Number(vib.intensity ?? defaultIntensity)));
+				total += duration;
+				phases.push({ at: total - duration, until: total, intensity });
+			});
+			if (!phases.length) return;
+			label.click();
+			let start = 0;
+			let lastToggle = 0;
+			const loop = (time) => {
+				if (!start) start = time;
+				const elapsed = time - start;
+				if (elapsed >= total) return;
+				const phase = phases.find(p => elapsed >= p.at && elapsed < p.until);
+				if (phase) {
+					const interval = 16 + (1 - phase.intensity) * 184;
+					if (!lastToggle || time - lastToggle >= interval) {
+						label.click();
+						lastToggle = time;
+					}
+				}
+				requestAnimationFrame(loop);
+			};
+			requestAnimationFrame(loop);
+		} catch (e) {}
+	}
+
+	function mobileHaptic(input = 'medium', options = {}) {
+		if (!isMobileHapticsReady()) return false;
+		const now = (window.performance && performance.now) ? performance.now() : Date.now();
+		const last = window.__psnHapticLastAt || 0;
+		if ((now - last) < (options.cooldown || 70)) return false;
+		window.__psnHapticLastAt = now;
+		const defaultIntensity = Math.max(0, Math.min(1, Number(options.intensity ?? 0.5)));
+		const vibrations = normalizePsnHapticInput(input);
+		if (!vibrations.length) return false;
+		try {
+			if (navigator && typeof navigator.vibrate === 'function') navigator.vibrate(buildPsnVibratePattern(vibrations, defaultIntensity));
+		} catch (e) {}
+		clickPsnHapticFallback(vibrations, defaultIntensity);
+		return true;
+	}
+
+	function getMobileHapticType(target) {
+		if (!target || !target.closest) return '';
+		if (target.closest('textarea, select, [contenteditable="true"], #chat-input, .admin-broadcast-editor, .admin-message-edit-input')) return '';
+		const input = target.closest('input');
+		if (input && !input.matches('[type="radio"], [type="checkbox"], [type="button"], [type="submit"]')) return '';
+		if (target.closest('.delete-btn, .remove-btn, .clear-btn, .danger, .danger-btn, .logout-btn, .admin-danger-btn, [data-haptic="error"]')) return 'warning';
+		if (target.closest('.nps-liquid-switcher__option, #mobile-menu-btn, .sidebar-menu li, .top-nav a, .profile-item, .letter-btn, .scroll-arrow, .reaction-pill, .reaction-option, .emoji-option, [data-haptic="selection"]')) return 'selection';
+		if (target.closest('.wish-btn, .fav-btn, .chat-avatar-clickable, .suggestion-item, .modal-cover-wrapper, [data-haptic="light"]')) return 'light';
+		if (target.closest('.game-card, .promo-card, .user-profile-card, [data-haptic="soft"]')) return 'soft';
+		if (target.closest('button, a[href], [role="button"], [onclick], .action-btn, .btn-mini, .btn-mini-round, .sys-modal-close, .admin-action-btn, [data-haptic="medium"]')) return 'medium';
+		return '';
+	}
+
+	function fireMobileHapticFromTap(target) {
+		const type = getMobileHapticType(target);
+		if (!type) return;
+		window.__psnHapticPointerAt = (window.performance && performance.now) ? performance.now() : Date.now();
+		mobileHaptic(type);
+	}
+
+	if (!window.__psnWebHapticsBound) {
+		window.__psnWebHapticsBound = true;
+		document.addEventListener('pointerdown', function(e) {
+			if (e.pointerType && e.pointerType !== 'touch' && e.pointerType !== 'pen') return;
+			fireMobileHapticFromTap(e.target);
+		}, { capture: true, passive: true });
+		document.addEventListener('touchstart', function(e) {
+			fireMobileHapticFromTap(e.target);
+		}, { capture: true, passive: true });
+		document.addEventListener('click', function(e) {
+			const now = (window.performance && performance.now) ? performance.now() : Date.now();
+			if ((now - (window.__psnHapticPointerAt || 0)) < 520) return;
+			const type = getMobileHapticType(e.target);
+			if (type) mobileHaptic(type);
+		}, { capture: true, passive: true });
+	}
+
 	function playUiHover() { playSystemSound('sound-ui-hover', 0.8); }
-	function playUiClick() { playSystemSound('sound-ui-enter', 0.6); }
-	function playUiToggle() { playSystemSound('sound-ui-toggle', 0.4); }
-	function playUiBack() { playSystemSound('sound-ui-back', 0.6); }
-	function playUiModal() { playSystemSound('sound-ui-modal', 0.6); }
-	function playUiRemove() { playSystemSound('sound-ui-remove', 1); }
-	function playUiSuccess() { playSystemSound('sound-ui-success', 0.6); }
-	function playUiError() { playSystemSound('sound-ui-error', 0.6); }
-	function playUiLetterFilter() { playSystemSound('sound-ui-letter', 1); }
-	function playUiDropdown() { playSystemSound('sound-ui-dropdown', 0.6); }
-	function playUiDropdownSelect() { playSystemSound('sound-ui-dropdown-select', 0.6); }
+	function playUiClick() { mobileHaptic('medium'); playSystemSound('sound-ui-enter', 0.6); }
+	function playUiToggle() { mobileHaptic('selection'); playSystemSound('sound-ui-toggle', 0.4); }
+	function playUiBack() { mobileHaptic('light'); playSystemSound('sound-ui-back', 0.6); }
+	function playUiModal() { mobileHaptic('soft'); playSystemSound('sound-ui-modal', 0.6); }
+	function playUiRemove() { mobileHaptic('warning'); playSystemSound('sound-ui-remove', 1); }
+	function playUiSuccess() { mobileHaptic('success'); playSystemSound('sound-ui-success', 0.6); }
+	function playUiError() { mobileHaptic('error'); playSystemSound('sound-ui-error', 0.6); }
+	function playUiLetterFilter() { mobileHaptic('selection'); playSystemSound('sound-ui-letter', 1); }
+	function playUiDropdown() { mobileHaptic('selection'); playSystemSound('sound-ui-dropdown', 0.6); }
+	function playUiDropdownSelect() { mobileHaptic('selection'); playSystemSound('sound-ui-dropdown-select', 0.6); }
 	function playUiInput() { playSystemSound('sound-ui-input', 1); }
 	function playUiBackspace() { playSystemSound('sound-ui-backspace', 1); }
 	function playUiTextField() { playSystemSound('sound-ui-field', 1); }
-	function playUiSwitchUser() { playSystemSound('sound-ui-switch-user', 1); }
-	function playUiSwitchOn() { playSystemSound('sound-ui-switch-on', 0.6); }
-	function playUiSwitchOff() { playSystemSound('sound-ui-switch-off', 0.6); }
+	function playUiSwitchUser() { mobileHaptic('medium'); playSystemSound('sound-ui-switch-user', 1); }
+	function playUiSwitchOn() { mobileHaptic('success'); playSystemSound('sound-ui-switch-on', 0.6); }
+	function playUiSwitchOff() { mobileHaptic('selection'); playSystemSound('sound-ui-switch-off', 0.6); }
 	function playUiArrow() { playSystemSound('sound-ui-arrow', 1); }
-	function playUiLogin() { playSystemSound('sound-ui-login', 1); }
-	function playUiLogout() { playSystemSound('sound-ui-logout', 1); }
+	function playUiLogin() { mobileHaptic('success'); playSystemSound('sound-ui-login', 1); }
+	function playUiLogout() { mobileHaptic('warning'); playSystemSound('sound-ui-logout', 1); }
 	function playUiCheckbox(input) { (input && input.checked) ? playUiSwitchOn() : playUiSwitchOff(); }
 	
 	function initUiSoundDelegates() {
