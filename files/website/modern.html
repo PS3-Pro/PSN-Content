@@ -2085,6 +2085,10 @@ body:not(.is-admin) #view-admin { display: none !important; }
 .setting-item.companion-pro-detected { opacity: 0.52; filter: grayscale(0.45); }
 .setting-item.companion-pro-detected .switch { pointer-events: none; opacity: 0.55; }
 .setting-item.companion-pro-detected #companion-plugin-status { color: var(--ps-blue) !important; opacity: 1 !important; filter: grayscale(0); }
+.setting-item.haptic-not-supported { opacity: 0.52; filter: grayscale(0.55); }
+.setting-item.haptic-not-supported:hover { transform: none !important; box-shadow: none !important; border-color: transparent !important; background-color: rgba(255,255,255,0.05) !important; }
+.setting-item.haptic-not-supported .switch { pointer-events: none; opacity: 0.5; }
+.setting-item.haptic-not-supported #haptic-feedback-status { color: var(--text-muted) !important; opacity: 0.85 !important; }
 #view-admin.anim-up .admin-hero-card { animation: adminHeroBoot .52s cubic-bezier(.16,.84,.28,1), adminGlowPop 1.2s ease-out; }
 #view-admin.anim-up .admin-hero-card::before { content: ""; position: absolute; top: -30%; bottom: -30%; width: 90px; left: 0; background: linear-gradient(90deg, transparent, rgba(255,255,255,0.22), transparent); pointer-events: none; z-index: 2; animation: adminScanSweep .9s ease-out .16s both; }
 #view-admin.anim-up .admin-card { opacity: 0; animation: adminCardBoot .48s cubic-bezier(.16,.84,.28,1) forwards; }
@@ -8140,6 +8144,22 @@ body.chat-selection-mode .chat-message-actions .chat-delete-action:hover { trans
 						<span class="slider"></span>
 					</label>
 				</div>
+
+				<div class="setting-item" id="haptic-feedback-setting" onmouseenter="playUiHover()">
+					<div>
+						<div style="font-size: 18px; color: #fff; font-weight: 500;">Haptic Feedback</div>
+						<div style="font-size: 13px; color: var(--text-muted); margin-top: 6px;">
+							Set whether or not to vibrate the device on supported mobile actions.
+						</div>
+						<div id="haptic-feedback-status" style="font-size: 11px; color: var(--ps-blue); margin-top: 8px; font-weight: bold; opacity: 0.85;">
+							<i class="fas fa-wave-square"></i> ENABLED
+						</div>
+					</div>
+					<label class="switch">
+						<input type="checkbox" id="haptic-feedback-toggle" onchange="toggleHapticFeedback()" checked>
+						<span class="slider"></span>
+					</label>
+				</div>
 				
 				<div class="setting-item" onmouseenter="playUiHover()">
 					<div>
@@ -10101,6 +10121,67 @@ P
 		return false;
 	}
 
+	function isPsnHapticSupported() {
+		try {
+			return !!(isMobileHapticsReady() && navigator && typeof navigator.vibrate === 'function');
+		} catch (e) {}
+		return false;
+	}
+
+	function isPsnHapticFeedbackEnabled() {
+		try {
+			if (!isPsnHapticSupported()) return false;
+			if (typeof STORAGE_KEY_HAPTIC_FEEDBACK !== 'undefined') return loadState(STORAGE_KEY_HAPTIC_FEEDBACK) !== "0";
+			return localStorage.getItem('psn_haptic_feedback_state') !== "0";
+		} catch (e) {}
+		return false;
+	}
+
+	function updateHapticFeedbackUi() {
+		const setting = document.getElementById('haptic-feedback-setting');
+		const toggle = document.getElementById('haptic-feedback-toggle');
+		const status = document.getElementById('haptic-feedback-status');
+		if (!setting && !toggle && !status) return;
+		const supported = isPsnHapticSupported();
+		const enabled = supported && (loadState((typeof STORAGE_KEY_HAPTIC_FEEDBACK !== 'undefined') ? STORAGE_KEY_HAPTIC_FEEDBACK : 'psn_haptic_feedback_state') !== "0");
+		if (setting) setting.classList.toggle('haptic-not-supported', !supported);
+		if (toggle) {
+			toggle.disabled = !supported;
+			toggle.checked = enabled;
+		}
+		if (status) {
+			if (!supported) {
+				status.innerHTML = '<i class="fas fa-ban"></i> NOT SUPPORTED';
+				status.style.color = 'var(--text-muted)';
+			} else if (enabled) {
+				status.innerHTML = '<i class="fas fa-wave-square"></i> ENABLED';
+				status.style.color = 'var(--ps-blue)';
+			} else {
+				status.innerHTML = '<i class="fas fa-wave-square"></i> DISABLED';
+				status.style.color = '#ff7777';
+			}
+		}
+	}
+	window.updateHapticFeedbackUi = updateHapticFeedbackUi;
+
+	window.toggleHapticFeedback = function() {
+		const toggle = document.getElementById('haptic-feedback-toggle');
+		if (!toggle || toggle.disabled || !isPsnHapticSupported()) {
+			updateHapticFeedbackUi();
+			return;
+		}
+		const enabled = !!toggle.checked;
+		saveState((typeof STORAGE_KEY_HAPTIC_FEEDBACK !== 'undefined') ? STORAGE_KEY_HAPTIC_FEEDBACK : 'psn_haptic_feedback_state', enabled ? "1" : "0");
+		if (typeof markProfileSettingsChanged === 'function') markProfileSettingsChanged();
+		if (enabled) mobileHaptic('success', { cooldown: 0 });
+		else {
+			try { if (navigator && typeof navigator.vibrate === 'function') navigator.vibrate(0); } catch (e) {}
+			playSystemSound('sound-ui-switch-off', 0.6);
+		}
+		updateHapticFeedbackUi();
+		if (typeof broadcastProfileUpdate === 'function') broadcastProfileUpdate();
+	};
+
 	function normalizePsnHapticInput(input) {
 		if (input === undefined || input === null) input = 'medium';
 		if (typeof input === 'number') return [{ duration: input }];
@@ -10229,7 +10310,7 @@ P
 	}
 
 	function mobileHaptic(input = 'medium', options = {}) {
-		if (!isMobileHapticsReady()) return false;
+		if (!isPsnHapticFeedbackEnabled()) return false;
 		const now = (window.performance && performance.now) ? performance.now() : Date.now();
 		const last = window.__psnHapticLastAt || 0;
 		if ((now - last) < (options.cooldown || 70)) return false;
@@ -10377,6 +10458,7 @@ P
 		let uxState = loadState(STORAGE_KEY_UX);
 		let uxToggle = document.getElementById('ux-sounds-toggle');
 		if (uxToggle) uxToggle.checked = (uxState !== "0");
+		if (typeof updateHapticFeedbackUi === 'function') updateHapticFeedbackUi();
 	
 		let chatState = loadState(STORAGE_KEY_CHAT_SOUND);
 		let chatToggle = document.getElementById('chat-sound-toggle');
@@ -10426,6 +10508,7 @@ P
     const STORAGE_KEY_AUDIO = "psn_audio_state";
 	const STORAGE_KEY_UX = "psn_ux_sounds_state";
 	const STORAGE_KEY_CHAT_SOUND = "psn_chat_sound_state";
+	const STORAGE_KEY_HAPTIC_FEEDBACK = "psn_haptic_feedback_state";
 	const STORAGE_KEY_CHAT_AUTO_TRANSLATE = "psn_chat_auto_translate";
 	const STORAGE_KEY_SETTINGS_UPDATED_AT = "psn_settings_updated_at";
 	const STORAGE_KEY_PROFILE_CARD_STYLE = "psn_profile_card_effect";
@@ -10516,7 +10599,7 @@ P
 			const keysToClear = [
 				'psn_user_trophies', COOKIE_NAME_HISTORY, STORAGE_KEY_WISHLIST, 
 				'psn_accessed_days', STORAGE_KEY_FAVS, 'psn_trailers_watched', STORAGE_KEY_AUDIO, 
-				'psn_ux_sounds_state', 'psn_last_chat_read', 
+				STORAGE_KEY_UX, STORAGE_KEY_CHAT_SOUND, STORAGE_KEY_HAPTIC_FEEDBACK, 'psn_last_chat_read', 
 				'psn_chat_dot', 'psn_dl_dot', 'psn_wish_dot', 'psn_wish_dot_items', 'psn_trophy_dot', 'psn_fav_dot', 'psn_fav_dot_items',
 				'psn_avatar'
 			];
@@ -10758,6 +10841,7 @@ P
 		return {
 			audio: loadState(STORAGE_KEY_AUDIO) || "1",
 			ux: loadState(STORAGE_KEY_UX) || "1",
+			hapticFeedback: loadState(STORAGE_KEY_HAPTIC_FEEDBACK) === "0" ? "0" : "1",
 			chatSound: loadState(STORAGE_KEY_CHAT_SOUND) || "1",
 			chatAutoTranslate: loadState(STORAGE_KEY_CHAT_AUTO_TRANSLATE) === "1" ? "1" : "0",
 			settingsUpdatedAt: (typeof getProfileSettingsUpdatedAtForUser === 'function') ? getProfileSettingsUpdatedAtForUser(localStorage.getItem('psn_username')) : 0,
@@ -10969,6 +11053,7 @@ P
 		const previous = {
 			audio: readSyncedSettingForUser(name, STORAGE_KEY_AUDIO, "1") || "1",
 			ux: readSyncedSettingForUser(name, STORAGE_KEY_UX, "1") || "1",
+			hapticFeedback: readSyncedSettingForUser(name, STORAGE_KEY_HAPTIC_FEEDBACK, "1") === "0" ? "0" : "1",
 			chatSound: readSyncedSettingForUser(name, STORAGE_KEY_CHAT_SOUND, "1") || "1",
 			chatAutoTranslate: readSyncedSettingForUser(name, STORAGE_KEY_CHAT_AUTO_TRANSLATE, "0") === "1" ? "1" : "0",
 			companionPlugin: (readSyncedSettingForUser(name, STORAGE_KEY_COMPANION_PLUGIN, "1") !== "0") ? "1" : "0",
@@ -10984,6 +11069,7 @@ P
 		const next = {
 			audio: normalizeSyncedToggleValue(incomingSettings.audio, previous.audio || "1"),
 			ux: normalizeSyncedToggleValue(incomingSettings.ux, previous.ux || "1"),
+			hapticFeedback: normalizeSyncedToggleValue(incomingSettings.hapticFeedback ?? incomingSettings.haptics, previous.hapticFeedback || "1"),
 			chatSound: normalizeSyncedToggleValue(incomingSettings.chatSound, previous.chatSound || "1"),
 			chatAutoTranslate: String(incomingSettings.chatAutoTranslate) === "1" ? "1" : "0",
 			ps3Ip: normalizeSyncedTextValue(incomingSettings.ps3Ip, ""),
@@ -11003,6 +11089,7 @@ P
 
 		writeSyncedSettingForUser(name, STORAGE_KEY_AUDIO, next.audio);
 		writeSyncedSettingForUser(name, STORAGE_KEY_UX, next.ux);
+		writeSyncedSettingForUser(name, STORAGE_KEY_HAPTIC_FEEDBACK, next.hapticFeedback);
 		writeSyncedSettingForUser(name, STORAGE_KEY_CHAT_SOUND, next.chatSound);
 		writeSyncedSettingForUser(name, STORAGE_KEY_CHAT_AUTO_TRANSLATE, next.chatAutoTranslate);
 		writeSyncedSettingForUser(name, STORAGE_KEY_COMPANION_PLUGIN, next.companionPlugin);
@@ -11032,6 +11119,7 @@ P
 
 		const audioToggle = document.getElementById('audio-toggle');
 		const uxToggle = document.getElementById('ux-sounds-toggle');
+		const hapticToggle = document.getElementById('haptic-feedback-toggle');
 		const chatToggle = document.getElementById('chat-sound-toggle');
 		const chatAutoTranslateToggle = document.getElementById('chat-auto-translate-toggle');
 		const companionToggle = document.getElementById('companion-plugin-toggle');
@@ -11040,6 +11128,7 @@ P
 
 		if (audioToggle) audioToggle.checked = next.audio !== "0";
 		if (uxToggle) uxToggle.checked = next.ux !== "0";
+		if (hapticToggle) hapticToggle.checked = next.hapticFeedback !== "0";
 		if (chatToggle) chatToggle.checked = next.chatSound !== "0";
 		if (chatAutoTranslateToggle) chatAutoTranslateToggle.checked = next.chatAutoTranslate === "1";
 		if (companionToggle) companionToggle.checked = next.companionPlugin !== "0";
@@ -11048,6 +11137,7 @@ P
 
 		applySyncedBackgroundMusic(next.audio !== "0");
 		if (typeof updateChatAutoTranslateUi === 'function') updateChatAutoTranslateUi();
+		if (typeof updateHapticFeedbackUi === 'function') updateHapticFeedbackUi();
 		if (typeof updateCompanionPluginStatus === 'function') updateCompanionPluginStatus();
 		if (typeof updateFpsCounterStatus === 'function') updateFpsCounterStatus();
 		applySyncedConsoleSettingsUi(next);
@@ -11247,6 +11337,7 @@ P
 			settingsData: {
 				audio: readLocalUserValueForAuth(username, STORAGE_KEY_AUDIO, '1') || '1',
 				ux: readLocalUserValueForAuth(username, STORAGE_KEY_UX, '1') || '1',
+				hapticFeedback: readLocalUserValueForAuth(username, STORAGE_KEY_HAPTIC_FEEDBACK, '1') === '0' ? '0' : '1',
 				chatSound: readLocalUserValueForAuth(username, STORAGE_KEY_CHAT_SOUND, '1') || '1',
 				chatAutoTranslate: readLocalUserValueForAuth(username, STORAGE_KEY_CHAT_AUTO_TRANSLATE, '0') === '1' ? '1' : '0',
 				settingsUpdatedAt: (typeof getProfileSettingsUpdatedAtForUser === 'function') ? getProfileSettingsUpdatedAtForUser(username) : 0,
@@ -11299,6 +11390,7 @@ P
 			settingsData: {
 				audio: readLocalUserValueForAuth(username, STORAGE_KEY_AUDIO, '1') || '1',
 				ux: readLocalUserValueForAuth(username, STORAGE_KEY_UX, '1') || '1',
+				hapticFeedback: readLocalUserValueForAuth(username, STORAGE_KEY_HAPTIC_FEEDBACK, '1') === '0' ? '0' : '1',
 				chatSound: readLocalUserValueForAuth(username, STORAGE_KEY_CHAT_SOUND, '1') || '1',
 				chatAutoTranslate: readLocalUserValueForAuth(username, STORAGE_KEY_CHAT_AUTO_TRANSLATE, '0') === '1' ? '1' : '0',
 				settingsUpdatedAt,
