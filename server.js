@@ -2284,14 +2284,20 @@ io.on('connection', (socket) => {
     ) || Date.now();
     incomingSettingsData.settingsUpdatedAt = incomingStamp;
 
+    const currentSettingsStamp = getProfileSettingsUpdatedAt(userDatabase[name].settingsData || {}, userDatabase[name].profileUpdatedAt);
     const mergedSettings = mergeProfileSettingsByTimestamp(userDatabase[name].settingsData || {}, incomingSettingsData, {
       currentFallback: normalizeTimestampValue(userDatabase[name].profileUpdatedAt),
       incomingFallback: incomingStamp
     });
 
     userDatabase[name].settingsData = mergedSettings.settingsData;
-    if (payload && typeof payload.themeColor === "string" && payload.themeColor.trim()) {
-      userDatabase[name].themeColor = payload.themeColor.trim();
+    const incomingThemeColor = payload && typeof payload.themeColor === "string" ? payload.themeColor.trim() : "";
+    const acceptIncomingThemeColor = !!(incomingThemeColor && (
+      mergedSettings.settingsAccepted === true ||
+      (incomingStamp && (!currentSettingsStamp || incomingStamp >= currentSettingsStamp))
+    ));
+    if (acceptIncomingThemeColor) {
+      userDatabase[name].themeColor = incomingThemeColor;
     }
     userDatabase[name].lastSeen = Date.now();
     userDatabase[name].profileUpdatedAt = Date.now();
@@ -2308,7 +2314,7 @@ io.on('connection', (socket) => {
     const sourceSocketId = (mergedSettings.settingsRejected === true || mergedSettings.bannerRejected === true) ? null : socket.id;
     emitSettingsRealtimeSync(name, sourceSocketId, { reason: payload.reason || 'settings_realtime' });
 
-    if (mergedSettings.bannerAccepted === true || (payload && typeof payload.themeColor === "string" && payload.themeColor.trim())) {
+    if (mergedSettings.bannerAccepted === true || acceptIncomingThemeColor) {
       emitPublicProfileBannerUpdate(name, userDatabase[name]);
     }
 
@@ -2324,15 +2330,35 @@ io.on('connection', (socket) => {
     const shouldEmitTrendingUpdate = profileUpdateTouchesTrending(userData || {});
     if (name && userDatabase[name]) {
         
+        let incomingSettingsAccepted = false;
+        let incomingThemeColorAccepted = false;
+        const incomingThemeColor = typeof userData.themeColor === "string" ? userData.themeColor.trim() : "";
+        const currentSettingsStamp = getProfileSettingsUpdatedAt(userDatabase[name].settingsData || {}, userDatabase[name].profileUpdatedAt);
         if (incomingSettingsData) {
+            const incomingSettingsStamp = getProfileSettingsUpdatedAt(incomingSettingsData, userData.profileCardStyleUpdatedAt || userData.profileUpdatedAt);
             const mergedSettings = mergeProfileSettingsByTimestamp(userDatabase[name].settingsData || {}, incomingSettingsData, {
                 currentFallback: normalizeTimestampValue(userDatabase[name].profileUpdatedAt),
                 incomingFallback: normalizeTimestampValue(userData.profileCardStyleUpdatedAt || userData.profileUpdatedAt)
             });
             userDatabase[name].settingsData = mergedSettings.settingsData;
+            incomingSettingsAccepted = !!(mergedSettings.settingsAccepted === true || (incomingSettingsStamp && (!currentSettingsStamp || incomingSettingsStamp >= currentSettingsStamp)));
             shouldBroadcastProfileBanner = mergedSettings.bannerAccepted === true;
             shouldForceProfileSyncToSource = mergedSettings.settingsRejected === true || mergedSettings.bannerRejected === true;
             delete userData.settingsData;
+        }
+        if (incomingThemeColor) {
+            const incomingThemeStamp = incomingSettingsData ? getProfileSettingsUpdatedAt(incomingSettingsData, userData.profileUpdatedAt) : normalizeTimestampValue(userData.profileUpdatedAt);
+            incomingThemeColorAccepted = !!(
+                incomingSettingsAccepted ||
+                (incomingThemeStamp && (!currentSettingsStamp || incomingThemeStamp >= currentSettingsStamp)) ||
+                (!currentSettingsStamp && (!userDatabase[name].themeColor || userDatabase[name].themeColor === '#0070cc'))
+            );
+            if (incomingThemeColorAccepted) {
+                userDatabase[name].themeColor = incomingThemeColor;
+            } else {
+                shouldForceProfileSyncToSource = true;
+            }
+            delete userData.themeColor;
         }
 
         if (userData.avatar === null || userData.avatar === undefined) {
@@ -2388,7 +2414,7 @@ io.on('connection', (socket) => {
         }
 
         deferServerTask('PROFILE ONLINE LIST', () => emitOnlineList(), 450);
-        if (shouldBroadcastProfileBanner) {
+        if (shouldBroadcastProfileBanner || incomingThemeColorAccepted) {
             emitPublicProfileBannerUpdate(name, userDatabase[name]);
         }
         emitProfileSync(name, shouldForceProfileSyncToSource ? null : socket.id);
