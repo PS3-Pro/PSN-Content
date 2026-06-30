@@ -31135,13 +31135,18 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
                         liveBox.id = originalId;
                     }
                     cleanupDetachedRender();
+                    if (typeof resetChatLazyMediaBindings === 'function') resetChatLazyMediaBindings(liveBox);
                     initDateStickyLogic();
                     if (typeof scrollChatToUnreadOrBottom === 'function') scrollChatToUnreadOrBottom({ restoreSmooth: true, setupDivider: true });
                     window.__chatHistoryDomRendered = true;
                     updateChatHistoryRenderSignature();
                     window.__chatRenderLastReadSnapshot = null;
                     liveBox.style.opacity = '1';
-                    requestAnimationFrame(() => { liveBox.style.visibility = ''; });
+                    requestAnimationFrame(() => {
+                        liveBox.style.visibility = '';
+                        if (typeof scheduleChatLazyMediaCheck === 'function') scheduleChatLazyMediaCheck(liveBox);
+                    });
+                    setTimeout(() => { if (typeof scheduleChatLazyMediaCheck === 'function') scheduleChatLazyMediaCheck(liveBox); }, 120);
                     if (typeof refreshChatNotificationDot === 'function') refreshChatNotificationDot();
                     if (typeof refreshMentionJumpButton === 'function') refreshMentionJumpButton();
                     resolve(true);
@@ -34303,6 +34308,7 @@ function getVisibleChatStackEl(id) {
 		const src = getChatLazyMediaSource(img.getAttribute('data-chat-lazy-key'));
 		if (!src) return;
 		img.dataset.lazyLoaded = 'true';
+		try { img.loading = 'eager'; } catch(e) {}
 		img.src = src;
 	}
 
@@ -34328,12 +34334,56 @@ function getVisibleChatStackEl(id) {
 		}
 	}
 
+	function resetChatLazyMediaBindings(rootEl) {
+		const root = rootEl || document.getElementById('chat-messages');
+		if (!root || !root.querySelectorAll) return;
+		const shells = Array.prototype.slice.call(root.querySelectorAll('.chat-lazy-image-shell'));
+		shells.forEach(shell => {
+			shell.removeAttribute('data-lazy-bound');
+			if (shell.dataset) delete shell.dataset.lazyBound;
+			const img = shell.querySelector('.chat-lazy-img');
+			if (!img) return;
+			if (!img.getAttribute('src')) {
+				img.removeAttribute('data-lazy-loaded');
+				if (img.dataset) delete img.dataset.lazyLoaded;
+				shell.classList.remove('is-loaded', 'is-error');
+			} else if (img.complete && img.naturalWidth > 0) {
+				chatLazyImageLoaded(img);
+			}
+		});
+	}
+
+	function loadVisibleChatLazyImages(rootEl) {
+		const root = rootEl || document.getElementById('chat-messages');
+		if (!root || !root.querySelectorAll) return;
+		const rootRect = root.getBoundingClientRect ? root.getBoundingClientRect() : null;
+		const shells = Array.prototype.slice.call(root.querySelectorAll('.chat-lazy-image-shell:not(.is-loaded):not(.is-error)'));
+		shells.forEach(shell => {
+			const img = shell.querySelector('.chat-lazy-img');
+			if (!img || img.dataset.lazyLoaded === 'true') return;
+			let shouldLoad = true;
+			if (rootRect && shell.getBoundingClientRect) {
+				const rect = shell.getBoundingClientRect();
+				shouldLoad = rect.bottom >= (rootRect.top - 900) && rect.top <= (rootRect.bottom + 900);
+			}
+			if (shouldLoad) {
+				shell.classList.add('skeleton-active');
+				loadChatLazyImage(img);
+			}
+		});
+	}
+
 	function setupChatLazyMedia(rootEl) {
+		if (window.__chatDetachedRenderingActive) return;
 		const root = document.getElementById('chat-messages');
 		if (!root) return;
-		const scope = rootEl || root;
+		let scope = rootEl || root;
+		if (!scope.querySelectorAll || (scope !== root && !root.contains(scope))) scope = root;
 		const shells = Array.prototype.slice.call(scope.querySelectorAll ? scope.querySelectorAll('.chat-lazy-image-shell:not([data-lazy-bound="true"])') : []);
-		if (!shells.length) return;
+		if (!shells.length) {
+			loadVisibleChatLazyImages(root);
+			return;
+		}
 
 		if (!('IntersectionObserver' in window)) {
 			shells.forEach(shell => {
@@ -34387,11 +34437,18 @@ function getVisibleChatStackEl(id) {
 	}
 
 	function scheduleChatLazyMediaCheck(rootEl) {
+		if (window.__chatDetachedRenderingActive) return;
 		if (window.__chatLazyMediaQueued) return;
 		window.__chatLazyMediaQueued = true;
 		requestAnimationFrame(() => {
 			window.__chatLazyMediaQueued = false;
-			setupChatLazyMedia(rootEl || document.getElementById('chat-messages'));
+			if (window.__chatDetachedRenderingActive) return;
+			const root = document.getElementById('chat-messages');
+			if (!root) return;
+			let scope = rootEl || root;
+			if (!scope.querySelectorAll || (scope !== root && !root.contains(scope))) scope = root;
+			setupChatLazyMedia(scope);
+			loadVisibleChatLazyImages(root);
 		});
 	}
 
