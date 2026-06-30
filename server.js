@@ -591,6 +591,38 @@ function preferLocalObjectPayload(currentValue, localValue) {
   return localSize > currentSize ? localValue : currentValue;
 }
 
+function countUnlockedTrophiesPayload(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return 0;
+  return Object.values(value).reduce((count, trophy) => {
+    if (!trophy || typeof trophy !== 'object') return count;
+    const unlocked = String(trophy.unlocked || '').toLowerCase();
+    return count + (unlocked === 'true' || unlocked === '1' || unlocked === 'yes' ? 1 : 0);
+  }, 0);
+}
+
+function preferBestTrophiesPayload(currentValue, localValue) {
+  const currentSize = hasObjectPayload(currentValue) ? Object.keys(currentValue).length : 0;
+  const localSize = hasObjectPayload(localValue) ? Object.keys(localValue).length : 0;
+  const currentUnlocked = countUnlockedTrophiesPayload(currentValue);
+  const localUnlocked = countUnlockedTrophiesPayload(localValue);
+  if (localUnlocked > currentUnlocked) return localValue;
+  if (localUnlocked === currentUnlocked && localSize > currentSize) return localValue;
+  return currentValue;
+}
+
+function shouldAcceptIncomingTrophies(currentUser = {}, incomingUser = {}) {
+  if (!incomingUser || !hasObjectPayload(incomingUser.trophiesData)) return false;
+  const currentUnlocked = countUnlockedTrophiesPayload(currentUser.trophiesData);
+  const incomingUnlocked = countUnlockedTrophiesPayload(incomingUser.trophiesData);
+  if (incomingUnlocked > currentUnlocked) return true;
+  if (incomingUnlocked === currentUnlocked) {
+    const currentSize = hasObjectPayload(currentUser.trophiesData) ? Object.keys(currentUser.trophiesData).length : 0;
+    const incomingSize = hasObjectPayload(incomingUser.trophiesData) ? Object.keys(incomingUser.trophiesData).length : 0;
+    return incomingSize >= currentSize;
+  }
+  return false;
+}
+
 const PROFILE_ARRAY_SYNC_KEYS = {
   downloadsData: { versionKey: 'downloadsUpdatedAt', countKey: 'downloads' },
   wishlistData: { versionKey: 'wishlistUpdatedAt', countKey: 'wishlist' },
@@ -953,10 +985,10 @@ function mergeLocalRecoveryData(dbUser = {}, localData = {}) {
   if (localData.avatar && isDefaultAvatarValue(merged.avatar) && !isDefaultAvatarValue(localData.avatar)) merged.avatar = localData.avatar;
   if ((!merged.joined || merged.joined === '2026') && localData.joined) merged.joined = localData.joined;
   if ((!merged.themeColor || merged.themeColor === '#0070cc') && localData.themeColor) merged.themeColor = localData.themeColor;
-  ['trophiesData', 'countersData'].forEach(key => {
-    const preferred = preferLocalObjectPayload(merged[key], localData[key]);
-    if (preferred !== merged[key]) merged[key] = preferred;
-  });
+  const preferredTrophies = preferBestTrophiesPayload(merged.trophiesData, localData.trophiesData);
+  if (preferredTrophies !== merged.trophiesData) merged.trophiesData = preferredTrophies;
+  const preferredCounters = preferLocalObjectPayload(merged.countersData, localData.countersData);
+  if (preferredCounters !== merged.countersData) merged.countersData = preferredCounters;
 
   merged.downloadsClearedAt = Math.max(dbDownloadsClearedAt, localDownloadsClearedAt) || 0;
 
@@ -2321,6 +2353,15 @@ io.on('connection', (socket) => {
         if (isUserBanned(userDatabase[name]) && !ADMIN_USERS.includes(name)) {
             socket.emit('auth_error', 'This account is banned.');
             return;
+        }
+
+        if (hasObjectPayload(userData.trophiesData)) {
+            if (!shouldAcceptIncomingTrophies(userDatabase[name], userData)) {
+                delete userData.trophiesData;
+                delete userData.trophies;
+                delete userData.level;
+                delete userData.xp;
+            }
         }
 
         userData = reconcileIncomingDownloads(userDatabase[name], userData || {});
