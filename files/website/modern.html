@@ -10077,7 +10077,30 @@ P
 		}
 	}
 	
+	function isChatNotificationSessionReady() {
+		const user = localStorage.getItem('psn_username');
+		if (!user || user === 'null' || user === 'undefined' || user === 'Guest') return false;
+		if (window.isProfileLoaded !== true) return false;
+
+		const boot = document.getElementById('ps5-boot-container');
+		if (boot && boot.style.display !== 'none' && !boot.classList.contains('psn-boot-released')) return false;
+
+		const userSelect = document.getElementById('user-select-screen');
+		if (userSelect && userSelect.style.display !== 'none' && !userSelect.classList.contains('auth-hidden')) return false;
+
+		const loginOverlay = document.getElementById('login-input-overlay');
+		if (loginOverlay && (loginOverlay.classList.contains('is-visible') || loginOverlay.style.display === 'flex')) return false;
+
+		const nameOverlay = document.getElementById('name-input-overlay');
+		if (nameOverlay && (nameOverlay.classList.contains('is-visible') || nameOverlay.style.display === 'flex')) return false;
+
+		return true;
+	}
+	window.isChatNotificationSessionReady = isChatNotificationSessionReady;
+
 	function playMessageSound() {
+		if (!isChatNotificationSessionReady()) return;
+
 		const sound = document.getElementById('sound-ui-message');
 		const uxToggle = document.getElementById('ux-sounds-toggle');
 		const chatToggle = document.getElementById('chat-sound-toggle');
@@ -10121,18 +10144,59 @@ P
 		return false;
 	}
 
-	function isPsnHapticSupported() {
+	function isPsnHapticFallbackAvailable() {
 		try {
-			return !!(isMobileHapticsReady() && navigator && typeof navigator.vibrate === 'function');
+			return !!(isMobileHapticsReady() && document && document.createElement && document.body);
 		} catch (e) {}
 		return false;
+	}
+
+	function isPsnHapticSupported() {
+		try {
+			const nativeVibrate = !!(navigator && typeof navigator.vibrate === 'function');
+			return !!(isMobileHapticsReady() && (nativeVibrate || isPsnHapticFallbackAvailable()));
+		} catch (e) {}
+		return false;
+	}
+
+	function getPsnHapticFeedbackStorageValue() {
+		const key = (typeof STORAGE_KEY_HAPTIC_FEEDBACK !== 'undefined') ? STORAGE_KEY_HAPTIC_FEEDBACK : 'psn_haptic_feedback_state';
+		let value = null;
+		try {
+			if (typeof loadState === 'function') value = loadState(key);
+		} catch (e) {}
+		if (value === null || value === undefined) {
+			try { value = localStorage.getItem('psn_haptic_feedback_state'); } catch (e) {}
+		}
+		return value;
+	}
+
+	function savePsnHapticFeedbackStorageValue(value) {
+		const key = (typeof STORAGE_KEY_HAPTIC_FEEDBACK !== 'undefined') ? STORAGE_KEY_HAPTIC_FEEDBACK : 'psn_haptic_feedback_state';
+		const clean = value === "0" ? "0" : "1";
+		try {
+			if (typeof saveState === 'function') saveState(key, clean);
+			else localStorage.setItem(key, clean);
+		} catch (e) {}
+		try { localStorage.setItem('psn_haptic_feedback_state', clean); } catch (e) {}
 	}
 
 	function isPsnHapticFeedbackEnabled() {
 		try {
 			if (!isPsnHapticSupported()) return false;
-			if (typeof STORAGE_KEY_HAPTIC_FEEDBACK !== 'undefined') return loadState(STORAGE_KEY_HAPTIC_FEEDBACK) !== "0";
-			return localStorage.getItem('psn_haptic_feedback_state') !== "0";
+			return getPsnHapticFeedbackStorageValue() !== "0";
+		} catch (e) {}
+		return false;
+	}
+
+	function isPsnAuthHapticAreaActive() {
+		try {
+			const boot = document.getElementById('ps5-boot-container');
+			if (!boot) return false;
+			if (boot.classList && boot.classList.contains('psn-boot-released')) return false;
+			const style = window.getComputedStyle ? window.getComputedStyle(boot) : null;
+			if (style && (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0)) return false;
+			return true;
 		} catch (e) {}
 		return false;
 	}
@@ -10143,7 +10207,7 @@ P
 		const status = document.getElementById('haptic-feedback-status');
 		if (!setting && !toggle && !status) return;
 		const supported = isPsnHapticSupported();
-		const enabled = supported && (loadState((typeof STORAGE_KEY_HAPTIC_FEEDBACK !== 'undefined') ? STORAGE_KEY_HAPTIC_FEEDBACK : 'psn_haptic_feedback_state') !== "0");
+		const enabled = supported && (getPsnHapticFeedbackStorageValue() !== "0");
 		if (setting) setting.classList.toggle('haptic-not-supported', !supported);
 		if (toggle) {
 			toggle.disabled = !supported;
@@ -10171,7 +10235,7 @@ P
 			return;
 		}
 		const enabled = !!toggle.checked;
-		saveState((typeof STORAGE_KEY_HAPTIC_FEEDBACK !== 'undefined') ? STORAGE_KEY_HAPTIC_FEEDBACK : 'psn_haptic_feedback_state', enabled ? "1" : "0");
+		savePsnHapticFeedbackStorageValue(enabled ? "1" : "0");
 		if (typeof markProfileSettingsChanged === 'function') markProfileSettingsChanged();
 		if (enabled) mobileHaptic('success', { cooldown: 0 });
 		else {
@@ -10310,7 +10374,10 @@ P
 	}
 
 	function mobileHaptic(input = 'medium', options = {}) {
-		if (!isPsnHapticFeedbackEnabled()) return false;
+		const forceAuth = options.forceAuth === true || isPsnAuthHapticAreaActive();
+		if (forceAuth) {
+			if (!isPsnHapticSupported()) return false;
+		} else if (!isPsnHapticFeedbackEnabled()) return false;
 		const now = (window.performance && performance.now) ? performance.now() : Date.now();
 		const last = window.__psnHapticLastAt || 0;
 		if ((now - last) < (options.cooldown || 70)) return false;
@@ -10331,10 +10398,10 @@ P
 		const input = target.closest('input');
 		if (input && !input.matches('[type="radio"], [type="checkbox"], [type="button"], [type="submit"]')) return '';
 		if (target.closest('.delete-btn, .remove-btn, .clear-btn, .danger, .danger-btn, .logout-btn, .admin-danger-btn, [data-haptic="error"]')) return 'warning';
-		if (target.closest('.nps-liquid-switcher__option, #mobile-menu-btn, .sidebar-menu li, .top-nav a, .profile-item, .letter-btn, .scroll-arrow, .filter-checkboxes label, .filter-checkboxes input[type="checkbox"], .filter-checkboxes input[type="radio"], #missing-rap-filter label, #missing-rap-filter input, .reaction-pill, .reaction-option, .emoji-option, [data-haptic="selection"]')) return 'selection';
-		if (target.closest('.wish-btn, .fav-btn, .chat-avatar-clickable, .suggestion-item, .modal-cover-wrapper, [data-haptic="light"]')) return 'light';
-		if (target.closest('.game-card, .promo-card, .user-profile-card, [data-haptic="soft"]')) return 'soft';
-		if (target.closest('button, a[href], [role="button"], [onclick], .action-btn, .btn-mini, .btn-mini-round, .sys-modal-close, .admin-action-btn, [data-haptic="medium"]')) return 'medium';
+		if (target.closest('.nps-liquid-switcher__option, #mobile-menu-btn, .sidebar-menu li, .top-nav a, .profile-item, .letter-btn, .scroll-arrow, .filter-checkboxes label, .filter-checkboxes input[type="checkbox"], .filter-checkboxes input[type="radio"], #missing-rap-filter label, #missing-rap-filter input, #ps5-boot-container input[type="checkbox"], #ps5-boot-container label[for], .site-disclaimer-skip-today, .site-disclaimer-skip-today input, .reaction-pill, .reaction-option, .emoji-option, [data-haptic="selection"]')) return 'selection';
+		if (target.closest('.wish-btn, .fav-btn, .chat-avatar-clickable, .suggestion-item, .modal-cover-wrapper, #ps5-boot-container .password-toggle-icon, [data-haptic="light"]')) return 'light';
+		if (target.closest('.game-card, .promo-card, .user-profile-card, #user-select-screen .user-profile-card, [data-haptic="soft"]')) return 'soft';
+		if (target.closest('button, a[href], [role="button"], [onclick], .action-btn, .btn-mini, .btn-mini-round, .sys-modal-close, .admin-action-btn, #ps5-boot-container .manage-btn-round, #ps5-boot-container .ps5-pill-btn, #ps5-boot-container .ps5-avatar-arrow, .site-disclaimer-btn, [data-haptic="medium"]')) return 'medium';
 		return '';
 	}
 
@@ -10380,6 +10447,7 @@ P
 	function playUiSwitchOn() { mobileHaptic('success'); playSystemSound('sound-ui-switch-on', 0.6); }
 	function playUiSwitchOff() { mobileHaptic('selection'); playSystemSound('sound-ui-switch-off', 0.6); }
 	function playUiArrow() { playSystemSound('sound-ui-arrow', 1); }
+	function playUiChatDatePill() { mobileHaptic('selection', { cooldown: 180 }); playSystemSound('sound-ui-arrow', 1); }
 	function playUiLogin() { mobileHaptic('success'); playSystemSound('sound-ui-login', 1); }
 	function playUiLogout() { mobileHaptic('warning'); playSystemSound('sound-ui-logout', 1); }
 	function playUiCheckbox(input) { (input && input.checked) ? playUiSwitchOn() : playUiSwitchOff(); }
@@ -10447,7 +10515,7 @@ P
 			const input = event.target;
 			if (!(input instanceof HTMLInputElement)) return;
 			if (input.matches('.admin-mini-toggle input')) playUiCheckbox(input);
-			if (input.closest('.filter-checkboxes') || input.closest('#missing-rap-filter')) {
+			if (input.closest('.filter-checkboxes') || input.closest('#missing-rap-filter') || input.closest('#ps5-boot-container') || input.closest('.site-disclaimer-overlay')) {
 				const now = (window.performance && performance.now) ? performance.now() : Date.now();
 				if ((now - (window.__psnHapticPointerAt || 0)) >= 520) mobileHaptic('selection');
 			}
@@ -11094,6 +11162,7 @@ P
 		writeSyncedSettingForUser(name, STORAGE_KEY_AUDIO, next.audio);
 		writeSyncedSettingForUser(name, STORAGE_KEY_UX, next.ux);
 		writeSyncedSettingForUser(name, STORAGE_KEY_HAPTIC_FEEDBACK, next.hapticFeedback);
+		if (name === (localStorage.getItem('psn_username') || '') && typeof savePsnHapticFeedbackStorageValue === 'function') savePsnHapticFeedbackStorageValue(next.hapticFeedback);
 		writeSyncedSettingForUser(name, STORAGE_KEY_CHAT_SOUND, next.chatSound);
 		writeSyncedSettingForUser(name, STORAGE_KEY_CHAT_AUTO_TRANSLATE, next.chatAutoTranslate);
 		writeSyncedSettingForUser(name, STORAGE_KEY_COMPANION_PLUGIN, next.companionPlugin);
@@ -31646,7 +31715,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 			});
 
 			if (box.dataset.lastLabel !== "INIT" && box.dataset.lastLabel !== currentLabel) {
-				if (typeof playUiArrow === 'function') playUiArrow();
+				if (typeof playUiChatDatePill === 'function' && currentLabel !== "HIDDEN_TOP") playUiChatDatePill();
 			}
 			box.dataset.lastLabel = currentLabel;
 	
@@ -35115,9 +35184,8 @@ function getVisibleChatStackEl(id) {
 	}
 
     function showChatNotification(userName, isMention, isGlobalPing, globalPingRole = '') {
-        const systemSound = document.getElementById('sound-ui-message');
-        if (systemSound) systemSound.play().catch(() => {});
-    
+        if (typeof isChatNotificationSessionReady === 'function' && !isChatNotificationSessionReady()) return;
+
         const container = document.getElementById('trophy-container');
         if (!container) return;
     
@@ -36281,8 +36349,8 @@ function getVisibleChatStackEl(id) {
 			const chatVisible = typeof isChatScreenVisibleForRead === 'function' ? isChatScreenVisibleForRead() : (document.getElementById('view-chat').style.display === 'flex' || document.getElementById('view-chat').style.display === 'block');
 			const myName = localStorage.getItem('psn_username') || "Guest";
 			
-			playMessageSound();
-			if (!chatVisible && data.user !== myName) {
+			if (data.user !== myName) playMessageSound();
+			if (!chatVisible && data.user !== myName && (typeof isChatNotificationSessionReady !== 'function' || isChatNotificationSessionReady())) {
 				const isMention = data.text && (typeof chatTextMentionsUser === 'function' ? chatTextMentionsUser(data.text, myName) : data.text.includes(`@${myName}`));
 				const isReply = data.replyTo && data.replyTo.user === myName;
 				if (isMention || isReply || data.isGlobalPing) showChatNotification(data.user, isMention, data.isGlobalPing, data.globalPingRole);
