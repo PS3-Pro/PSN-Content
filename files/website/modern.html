@@ -10629,6 +10629,7 @@ P
 	const STORAGE_KEY_HAPTIC_FEEDBACK = "psn_haptic_feedback_state";
 	const STORAGE_KEY_CHAT_AUTO_TRANSLATE = "psn_chat_auto_translate";
 	const STORAGE_KEY_SETTINGS_UPDATED_AT = "psn_settings_updated_at";
+	const STORAGE_KEY_THEME_COLOR_UPDATED_AT = "psn_theme_color_updated_at";
 	const STORAGE_KEY_PROFILE_CARD_STYLE = "psn_profile_card_effect";
 		const STORAGE_KEY_PROFILE_CARD_STYLE_UPDATED_AT = "psn_profile_card_effect_updated_at";
 	const STORAGE_KEY_DOWNLOAD_CLEAR_PENDING = "psn_dl_history_cleared_at";
@@ -10719,7 +10720,7 @@ P
 				'psn_accessed_days', STORAGE_KEY_FAVS, 'psn_trailers_watched', STORAGE_KEY_AUDIO, 
 				STORAGE_KEY_UX, STORAGE_KEY_CHAT_SOUND, STORAGE_KEY_HAPTIC_FEEDBACK, 'psn_last_chat_read', 
 				'psn_chat_dot', 'psn_dl_dot', 'psn_wish_dot', 'psn_wish_dot_items', 'psn_trophy_dot', 'psn_fav_dot', 'psn_fav_dot_items',
-				'psn_avatar'
+				'psn_avatar', 'psn_theme_color', STORAGE_KEY_THEME_COLOR_UPDATED_AT
 			];
 			
 			keysToClear.forEach(key => localStorage.removeItem(`${username}_${key}`));
@@ -10887,6 +10888,29 @@ P
 	}
 	window.markProfileSettingsChanged = markProfileSettingsChanged;
 
+	function getProfileThemeColorUpdatedAtForUser(username) {
+		const activeUser = localStorage.getItem('psn_username') || '';
+		const safeUser = username || activeUser || '';
+		const scoped = safeUser ? normalizeProfileListTimestamp(localStorage.getItem(`${safeUser}_${STORAGE_KEY_THEME_COLOR_UPDATED_AT}`)) : 0;
+		const active = (!safeUser || safeUser === activeUser) ? normalizeProfileListTimestamp(localStorage.getItem(STORAGE_KEY_THEME_COLOR_UPDATED_AT)) : 0;
+		return Math.max(scoped, active) || 0;
+	}
+
+	function setProfileThemeColorUpdatedAtForUser(username, value) {
+		const timestamp = normalizeProfileListTimestamp(value);
+		if (!timestamp) return 0;
+		const activeUser = localStorage.getItem('psn_username') || '';
+		const safeUser = username || activeUser || '';
+		if (safeUser && safeUser !== "null") localStorage.setItem(`${safeUser}_${STORAGE_KEY_THEME_COLOR_UPDATED_AT}`, String(timestamp));
+		if (!safeUser || safeUser === activeUser) localStorage.setItem(STORAGE_KEY_THEME_COLOR_UPDATED_AT, String(timestamp));
+		return timestamp;
+	}
+
+	function markProfileThemeColorChanged(stamp = Date.now()) {
+		return setProfileThemeColorUpdatedAtForUser(localStorage.getItem('psn_username') || '', stamp) || Date.now();
+	}
+	window.markProfileThemeColorChanged = markProfileThemeColorChanged;
+
 	function getProfileCardStyleUpdatedAtForUser(username) {
 		const activeUser = localStorage.getItem('psn_username') || '';
 		const safeUser = username || activeUser || '';
@@ -10963,6 +10987,8 @@ P
 			chatSound: loadState(STORAGE_KEY_CHAT_SOUND) || "1",
 			chatAutoTranslate: loadState(STORAGE_KEY_CHAT_AUTO_TRANSLATE) === "1" ? "1" : "0",
 			settingsUpdatedAt: (typeof getProfileSettingsUpdatedAtForUser === 'function') ? getProfileSettingsUpdatedAtForUser(localStorage.getItem('psn_username')) : 0,
+			themeColor: getRuntimeSettingsThemeColor(),
+			themeColorUpdatedAt: (typeof getProfileThemeColorUpdatedAtForUser === 'function') ? getProfileThemeColorUpdatedAtForUser(localStorage.getItem('psn_username')) : 0,
 			profileCardStyle: (typeof readProfileCardStyleLocalValue === 'function') ? readProfileCardStyleLocalValue(localStorage.getItem('psn_username'), "default") : ((typeof normalizeProfileCardStyle === 'function') ? normalizeProfileCardStyle(loadState(STORAGE_KEY_PROFILE_CARD_STYLE) || "default") : (loadState(STORAGE_KEY_PROFILE_CARD_STYLE) || "default")),
 			profileCardEffect: (typeof readProfileCardStyleLocalValue === 'function') ? readProfileCardStyleLocalValue(localStorage.getItem('psn_username'), "default") : ((typeof normalizeProfileCardStyle === 'function') ? normalizeProfileCardStyle(loadState(STORAGE_KEY_PROFILE_CARD_STYLE) || "default") : (loadState(STORAGE_KEY_PROFILE_CARD_STYLE) || "default")),
 			profileCardStyleUpdatedAt: (typeof getProfileCardStyleUpdatedAtForUser === 'function') ? getProfileCardStyleUpdatedAtForUser(localStorage.getItem('psn_username')) : 0,
@@ -10997,11 +11023,12 @@ P
 			if (typeof getRuntimePluginSettingsPayload !== 'function') return false;
 			const settingsData = getRuntimePluginSettingsPayload();
 			if (!Number(settingsData.settingsUpdatedAt || 0) && typeof getProfileSettingsUpdatedAtForUser === 'function') {
-				settingsData.settingsUpdatedAt = getProfileSettingsUpdatedAtForUser(myName) || Date.now();
+				settingsData.settingsUpdatedAt = getProfileSettingsUpdatedAtForUser(myName) || 0;
 			}
 			socketChat.emit('settings_realtime_update', {
 				settingsData,
 				themeColor: getRuntimeSettingsThemeColor(),
+				themeColorUpdatedAt: (typeof getProfileThemeColorUpdatedAtForUser === 'function') ? getProfileThemeColorUpdatedAtForUser(myName) : 0,
 				reason,
 				clientSentAt: Date.now()
 			});
@@ -11202,6 +11229,8 @@ P
 		};
 
 		const incomingSettingsUpdatedAt = Number(incomingSettings.settingsUpdatedAt || incomingSettings.settingsSyncedAt || incomingSettings.settingsVersion || options.userData?.settingsUpdatedAt || options.payload?.settingsUpdatedAt || options.userData?.profileUpdatedAt || options.incomingProfileUpdatedAt || 0);
+		const currentSettingsUpdatedAt = (typeof getProfileSettingsUpdatedAtForUser === 'function') ? getProfileSettingsUpdatedAtForUser(name) : 0;
+		if (incomingSettingsUpdatedAt && currentSettingsUpdatedAt && incomingSettingsUpdatedAt < currentSettingsUpdatedAt) return null;
 		if (incomingSettingsUpdatedAt && typeof setProfileSettingsUpdatedAtForUser === 'function') setProfileSettingsUpdatedAtForUser(name, incomingSettingsUpdatedAt);
 		if (typeof applySiteDisclaimerSkipTodayFromSettings === 'function') applySiteDisclaimerSkipTodayFromSettings(name, incomingSettings.siteDisclaimerSkipToday);
 
@@ -11278,14 +11307,30 @@ P
 			} catch (err) {}
 		}
 
-		const incomingThemeColor = normalizeSyncedTextValue(options.themeColor || incomingSettings.themeColor || options.userData?.themeColor || options.payload?.themeColor || '', '');
+		const incomingThemeColor = normalizeSyncedTextValue(incomingSettings.themeColor || options.themeColor || options.userData?.themeColor || options.payload?.themeColor || '', '');
 		if (incomingThemeColor) {
-			localStorage.setItem(`${name}_psn_theme_color`, incomingThemeColor);
-			if (name === localStorage.getItem('psn_username')) {
-				localStorage.setItem('psn_theme_color', incomingThemeColor);
-				document.documentElement.style.setProperty('--ps-blue', incomingThemeColor);
-				document.documentElement.style.setProperty('--ps-neon', incomingThemeColor + '66');
-				if (typeof updateDynamicCursor === 'function') updateDynamicCursor(incomingThemeColor);
+			const incomingThemeColorUpdatedAt = Number(
+				incomingSettings.themeColorUpdatedAt ||
+				incomingSettings.themeUpdatedAt ||
+				options.userData?.themeColorUpdatedAt ||
+				options.payload?.themeColorUpdatedAt ||
+				0
+			) || 0;
+			const currentThemeColorUpdatedAt = (typeof getProfileThemeColorUpdatedAtForUser === 'function') ? getProfileThemeColorUpdatedAtForUser(name) : 0;
+			const currentThemeColor = (localStorage.getItem(`${name}_psn_theme_color`) || (name === localStorage.getItem('psn_username') ? localStorage.getItem('psn_theme_color') : '') || '#0070cc').toLowerCase();
+			const incomingThemeIsFresh = !!(
+				(incomingThemeColorUpdatedAt && (!currentThemeColorUpdatedAt || incomingThemeColorUpdatedAt >= currentThemeColorUpdatedAt)) ||
+				(!incomingThemeColorUpdatedAt && !currentThemeColorUpdatedAt && (!currentThemeColor || currentThemeColor === '#0070cc'))
+			);
+			if (incomingThemeIsFresh) {
+				localStorage.setItem(`${name}_psn_theme_color`, incomingThemeColor);
+				if (incomingThemeColorUpdatedAt && typeof setProfileThemeColorUpdatedAtForUser === 'function') setProfileThemeColorUpdatedAtForUser(name, incomingThemeColorUpdatedAt);
+				if (name === localStorage.getItem('psn_username')) {
+					localStorage.setItem('psn_theme_color', incomingThemeColor);
+					document.documentElement.style.setProperty('--ps-blue', incomingThemeColor);
+					document.documentElement.style.setProperty('--ps-neon', incomingThemeColor + '66');
+					if (typeof updateDynamicCursor === 'function') updateDynamicCursor(incomingThemeColor);
+				}
 			}
 		}
 
@@ -11453,6 +11498,7 @@ P
 				lastChatRead: localStorage.getItem(`${username}_psn_last_chat_read`) || '0'
 			},
 			themeColor: readLocalUserValueForAuth(username, 'psn_theme_color', '#0070cc') || '#0070cc',
+			themeColorUpdatedAt: normalizeProfileListTimestamp(readLocalUserValueForAuth(username, STORAGE_KEY_THEME_COLOR_UPDATED_AT, 0)),
 			settingsData: {
 				audio: readLocalUserValueForAuth(username, STORAGE_KEY_AUDIO, '1') || '1',
 				ux: readLocalUserValueForAuth(username, STORAGE_KEY_UX, '1') || '1',
@@ -11460,6 +11506,8 @@ P
 				chatSound: readLocalUserValueForAuth(username, STORAGE_KEY_CHAT_SOUND, '1') || '1',
 				chatAutoTranslate: readLocalUserValueForAuth(username, STORAGE_KEY_CHAT_AUTO_TRANSLATE, '0') === '1' ? '1' : '0',
 				settingsUpdatedAt: (typeof getProfileSettingsUpdatedAtForUser === 'function') ? getProfileSettingsUpdatedAtForUser(username) : 0,
+				themeColor: readLocalUserValueForAuth(username, 'psn_theme_color', '#0070cc') || '#0070cc',
+				themeColorUpdatedAt: normalizeProfileListTimestamp(readLocalUserValueForAuth(username, STORAGE_KEY_THEME_COLOR_UPDATED_AT, 0)),
 				profileCardStyle: (typeof normalizeProfileCardStyle === 'function') ? normalizeProfileCardStyle(readLocalUserValueForAuth(username, STORAGE_KEY_PROFILE_CARD_STYLE, 'neon') || 'neon') : (readLocalUserValueForAuth(username, STORAGE_KEY_PROFILE_CARD_STYLE, 'neon') || 'neon'),
 				profileCardEffect: (typeof normalizeProfileCardStyle === 'function') ? normalizeProfileCardStyle(readLocalUserValueForAuth(username, STORAGE_KEY_PROFILE_CARD_STYLE, 'neon') || 'neon') : (readLocalUserValueForAuth(username, STORAGE_KEY_PROFILE_CARD_STYLE, 'neon') || 'neon'),
 				profileCardStyleUpdatedAt: (typeof getProfileCardStyleUpdatedAtForUser === 'function') ? getProfileCardStyleUpdatedAtForUser(username) : 0,
@@ -11506,6 +11554,7 @@ P
 				lastChatRead: localStorage.getItem(`${username}_psn_last_chat_read`) || '0'
 			},
 			themeColor: readLocalUserValueForAuth(username, 'psn_theme_color', '#0070cc') || '#0070cc',
+			themeColorUpdatedAt: normalizeProfileListTimestamp(readLocalUserValueForAuth(username, STORAGE_KEY_THEME_COLOR_UPDATED_AT, 0)),
 			settingsData: {
 				audio: readLocalUserValueForAuth(username, STORAGE_KEY_AUDIO, '1') || '1',
 				ux: readLocalUserValueForAuth(username, STORAGE_KEY_UX, '1') || '1',
@@ -11513,6 +11562,8 @@ P
 				chatSound: readLocalUserValueForAuth(username, STORAGE_KEY_CHAT_SOUND, '1') || '1',
 				chatAutoTranslate: readLocalUserValueForAuth(username, STORAGE_KEY_CHAT_AUTO_TRANSLATE, '0') === '1' ? '1' : '0',
 				settingsUpdatedAt,
+				themeColor: readLocalUserValueForAuth(username, 'psn_theme_color', '#0070cc') || '#0070cc',
+				themeColorUpdatedAt: normalizeProfileListTimestamp(readLocalUserValueForAuth(username, STORAGE_KEY_THEME_COLOR_UPDATED_AT, 0)),
 				profileCardStyle,
 				profileCardEffect: profileCardStyle,
 				profileCardStyleUpdatedAt: (typeof getProfileCardStyleUpdatedAtForUser === 'function') ? getProfileCardStyleUpdatedAtForUser(username) : 0,
@@ -12042,6 +12093,8 @@ P
 						chatSound: "1",
 						chatAutoTranslate: "0",
 						settingsUpdatedAt: Date.now(),
+						themeColor: "#0070cc",
+						themeColorUpdatedAt: Date.now(),
 						profileCardStyle: "neon",
 						profileCardEffect: "neon",
 						profileCardStyleUpdatedAt: Date.now(),
@@ -35661,13 +35714,6 @@ function getVisibleChatStackEl(id) {
 				if (userData.countersData.lastChatRead) localStorage.setItem(`${name}_psn_last_chat_read`, userData.countersData.lastChatRead);
 			}
 
-			if (userData.themeColor) {
-				localStorage.setItem(`${name}_psn_theme_color`, userData.themeColor);
-				localStorage.setItem('psn_theme_color', userData.themeColor);
-				document.documentElement.style.setProperty('--ps-blue', userData.themeColor);
-				document.documentElement.style.setProperty('--ps-neon', userData.themeColor + '66');
-				if (typeof updateDynamicCursor === 'function') updateDynamicCursor(userData.themeColor);
-			}
 
 			if (!userData.settingsData) {
 				const standaloneIp = String(userData.ps3Ip || userData.ps3_ip || payload.ps3Ip || payload.ps3_ip || '').trim();
@@ -35685,6 +35731,7 @@ function getVisibleChatStackEl(id) {
 					payload,
 					incomingProfileUpdatedAt,
 					themeColor: userData.themeColor || payload.themeColor || '',
+					themeColorUpdatedAt: userData.themeColorUpdatedAt || payload.themeColorUpdatedAt || 0,
 					runPluginActions: true,
 					source: 'profile_sync'
 				});
@@ -35977,19 +36024,13 @@ function getVisibleChatStackEl(id) {
 				}
 			}
 			
-			if (userData.themeColor) {
-				localStorage.setItem(`${name}_psn_theme_color`, userData.themeColor);
-				localStorage.setItem('psn_theme_color', userData.themeColor);
-				document.documentElement.style.setProperty('--ps-blue', userData.themeColor);
-				document.documentElement.style.setProperty('--ps-neon', userData.themeColor + '66');
-				
-				if (typeof updateDynamicCursor === 'function') updateDynamicCursor(userData.themeColor);
-			}
 			
 			if (userData.settingsData) {
 				applySyncedProfileSettings(name, userData.settingsData, {
 					userData,
-					payload: { profileUpdatedAt: userData.profileUpdatedAt || 0 },
+					payload: { profileUpdatedAt: userData.profileUpdatedAt || 0, themeColorUpdatedAt: userData.themeColorUpdatedAt || 0 },
+					themeColor: userData.themeColor || '',
+					themeColorUpdatedAt: userData.themeColorUpdatedAt || 0,
 					incomingProfileUpdatedAt: Number(userData.profileUpdatedAt || 0),
 					runPluginActions: false,
 					source: 'auth_success'
@@ -36975,6 +37016,7 @@ function getVisibleChatStackEl(id) {
 					userData: payload.userData || {},
 					incomingProfileUpdatedAt: Number(payload.profileUpdatedAt || 0),
 					themeColor: payload.themeColor || (payload.userData && payload.userData.themeColor) || '',
+					themeColorUpdatedAt: payload.themeColorUpdatedAt || (payload.userData && payload.userData.themeColorUpdatedAt) || 0,
 					runPluginActions: true,
 					source: 'settings_realtime_sync'
 				});
@@ -37187,12 +37229,15 @@ function getVisibleChatStackEl(id) {
 			friendsUpdatedAt: normalizeProfileListTimestamp(loadState(getProfileListTimestampStorageKey('friends'))),
 			countersData: myCounters, 
 			themeColor: myTheme,
+			themeColorUpdatedAt: (typeof getProfileThemeColorUpdatedAtForUser === 'function') ? getProfileThemeColorUpdatedAtForUser(myName) : 0,
 			settingsData: {
 				audio: myAudio,
 				ux: myUx,
 				chatSound: myChatSound,
 				chatAutoTranslate: myChatAutoTranslate,
 				settingsUpdatedAt: (typeof getProfileSettingsUpdatedAtForUser === 'function') ? getProfileSettingsUpdatedAtForUser(myName) : 0,
+				themeColor: myTheme,
+				themeColorUpdatedAt: (typeof getProfileThemeColorUpdatedAtForUser === 'function') ? getProfileThemeColorUpdatedAtForUser(myName) : 0,
 				profileCardStyle: (typeof normalizeProfileCardStyle === 'function') ? normalizeProfileCardStyle(loadState(STORAGE_KEY_PROFILE_CARD_STYLE) || "neon") : (loadState(STORAGE_KEY_PROFILE_CARD_STYLE) || "neon"),
 				profileCardEffect: (typeof normalizeProfileCardStyle === 'function') ? normalizeProfileCardStyle(loadState(STORAGE_KEY_PROFILE_CARD_STYLE) || "neon") : (loadState(STORAGE_KEY_PROFILE_CARD_STYLE) || "neon"),
 				profileCardStyleUpdatedAt: (typeof getProfileCardStyleUpdatedAtForUser === 'function') ? getProfileCardStyleUpdatedAtForUser(myName) : 0,
@@ -41894,7 +41939,9 @@ function getVisibleChatStackEl(id) {
 
 		if (typeof playUiSuccess === 'function') playUiSuccess();
 
-		if (typeof markProfileSettingsChanged === 'function') markProfileSettingsChanged();
+		const themeChangedAt = Date.now();
+		if (typeof setProfileThemeColorUpdatedAtForUser === 'function') setProfileThemeColorUpdatedAtForUser(username || '', themeChangedAt);
+		if (typeof markProfileSettingsChanged === 'function') markProfileSettingsChanged(themeChangedAt);
 		if (typeof emitRealtimeSettingsUpdate === 'function') emitRealtimeSettingsUpdate('theme');
 		if (typeof broadcastProfileUpdate === 'function') {
 			broadcastProfileUpdate();

@@ -641,8 +641,10 @@ const PROFILE_CARD_STYLE_UPDATED_AT_KEY = "profileCardStyleUpdatedAt";
 const PROFILE_CARD_STYLE_TIMESTAMP_ALIASES = ["profileCardStyleUpdatedAt", "profileCardEffectUpdatedAt", "profileCardThemeUpdatedAt", "bannerUpdatedAt"];
 const PROFILE_SETTINGS_UPDATED_AT_KEY = "settingsUpdatedAt";
 const PROFILE_SETTINGS_TIMESTAMP_ALIASES = ["settingsUpdatedAt", "settingsSyncedAt", "settingsVersion"];
+const PROFILE_THEME_COLOR_UPDATED_AT_KEY = "themeColorUpdatedAt";
+const PROFILE_THEME_COLOR_TIMESTAMP_ALIASES = ["themeColorUpdatedAt", "themeUpdatedAt", "themeColorSyncedAt"];
 const PROFILE_BANNER_SETTING_KEYS = new Set(["profileCardStyle", "profileCardEffect", "profileCardTheme", ...PROFILE_CARD_STYLE_TIMESTAMP_ALIASES]);
-const PROFILE_SETTINGS_META_KEYS = new Set([...PROFILE_SETTINGS_TIMESTAMP_ALIASES, ...PROFILE_CARD_STYLE_TIMESTAMP_ALIASES]);
+const PROFILE_SETTINGS_META_KEYS = new Set([...PROFILE_SETTINGS_TIMESTAMP_ALIASES, ...PROFILE_CARD_STYLE_TIMESTAMP_ALIASES, ...PROFILE_THEME_COLOR_TIMESTAMP_ALIASES]);
 
 function normalizeProfileCardStyleServer(value, fallback = "default") {
   const style = normalizeText(value, fallback).toLowerCase();
@@ -682,10 +684,14 @@ function getUserProfileCardStyleUpdatedAt(user = {}) {
 function getPublicProfileSettings(user = {}) {
   const profileCardStyle = getUserProfileCardStyle(user);
   const profileCardStyleUpdatedAt = getUserProfileCardStyleUpdatedAt(user) || normalizeTimestampValue(user.profileUpdatedAt) || Date.now();
+  const themeColor = normalizeThemeColorServer(user.themeColor || (user.settingsData && user.settingsData.themeColor) || "#0070cc");
+  const themeColorUpdatedAt = getUserThemeColorUpdatedAt(user) || 0;
   return {
     profileCardStyle,
     profileCardEffect: profileCardStyle,
-    profileCardStyleUpdatedAt
+    profileCardStyleUpdatedAt,
+    themeColor,
+    themeColorUpdatedAt
   };
 }
 
@@ -699,6 +705,71 @@ function getProfileSettingsUpdatedAt(settings = {}, fallback = 0) {
   return normalizeTimestampValue(fallback);
 }
 
+function normalizeThemeColorServer(value, fallback = "#0070cc") {
+  const raw = normalizeText(value, "").toLowerCase();
+  if (!raw) return fallback;
+  const color = raw.startsWith("#") ? raw : `#${raw}`;
+  return /^#[0-9a-f]{6}$/i.test(color) ? color : fallback;
+}
+
+function getProfileThemeColorUpdatedAt(settings = {}, fallback = 0) {
+  if (settings && typeof settings === "object") {
+    for (const key of PROFILE_THEME_COLOR_TIMESTAMP_ALIASES) {
+      const timestamp = normalizeTimestampValue(settings[key]);
+      if (timestamp) return timestamp;
+    }
+  }
+  return normalizeTimestampValue(fallback);
+}
+
+function hasThemeColorPayload(settings = {}, userData = {}) {
+  return !!(
+    (settings && typeof settings === "object" && Object.prototype.hasOwnProperty.call(settings, "themeColor")) ||
+    (userData && typeof userData === "object" && Object.prototype.hasOwnProperty.call(userData, "themeColor"))
+  );
+}
+
+function getUserThemeColorUpdatedAt(user = {}) {
+  const settings = user && user.settingsData && typeof user.settingsData === "object" ? user.settingsData : {};
+  return getProfileThemeColorUpdatedAt(settings, user.themeColorUpdatedAt || user.themeUpdatedAt || 0);
+}
+
+function reconcileIncomingThemeColor(currentUser = {}, incomingUser = {}, incomingSettings = {}) {
+  if (!hasThemeColorPayload(incomingSettings, incomingUser)) {
+    return { accepted: false, rejected: false };
+  }
+
+  const incomingTheme = normalizeThemeColorServer(
+    (incomingSettings && incomingSettings.themeColor) || (incomingUser && incomingUser.themeColor) || "",
+    ""
+  );
+  if (!incomingTheme) return { accepted: false, rejected: true };
+
+  const currentTheme = normalizeThemeColorServer(currentUser.themeColor || (currentUser.settingsData && currentUser.settingsData.themeColor) || "#0070cc");
+  const currentUpdatedAt = getUserThemeColorUpdatedAt(currentUser);
+  const incomingUpdatedAt = Math.max(
+    getProfileThemeColorUpdatedAt(incomingSettings || {}),
+    getProfileThemeColorUpdatedAt(incomingUser || {})
+  );
+
+  const currentHasCustomTheme = currentTheme && currentTheme !== "#0070cc";
+  const acceptIncoming = !!(
+    (incomingUpdatedAt && (!currentUpdatedAt || incomingUpdatedAt >= currentUpdatedAt)) ||
+    (!incomingUpdatedAt && !currentUpdatedAt && !currentHasCustomTheme)
+  );
+
+  if (!acceptIncoming) {
+    return { accepted: false, rejected: true, currentTheme, currentUpdatedAt };
+  }
+
+  currentUser.themeColor = incomingTheme;
+  currentUser.themeColorUpdatedAt = incomingUpdatedAt || currentUpdatedAt || normalizeTimestampValue(currentUser.profileUpdatedAt) || Date.now();
+  currentUser.settingsData = currentUser.settingsData && typeof currentUser.settingsData === "object" ? currentUser.settingsData : {};
+  currentUser.settingsData.themeColor = incomingTheme;
+  currentUser.settingsData[PROFILE_THEME_COLOR_UPDATED_AT_KEY] = currentUser.themeColorUpdatedAt;
+  return { accepted: currentTheme !== incomingTheme || incomingUpdatedAt > currentUpdatedAt, rejected: false, themeColor: incomingTheme, themeColorUpdatedAt: currentUser.themeColorUpdatedAt };
+}
+
 function hasRealtimeSettingsPayload(settings = {}) {
   if (!settings || typeof settings !== "object" || Array.isArray(settings)) return false;
   return Object.keys(settings).some(key => !PROFILE_BANNER_SETTING_KEYS.has(key) && !PROFILE_SETTINGS_META_KEYS.has(key));
@@ -707,9 +778,17 @@ function hasRealtimeSettingsPayload(settings = {}) {
 function normalizeProfileRealtimeSettings(settings = {}) {
   const clean = normalizeProfileBannerSettings(settings || {});
   const updatedAt = getProfileSettingsUpdatedAt(settings || {});
+  const themeUpdatedAt = getProfileThemeColorUpdatedAt(settings || {});
+  if (settings && typeof settings === "object" && Object.prototype.hasOwnProperty.call(settings, "themeColor")) {
+    clean.themeColor = normalizeThemeColorServer(settings.themeColor, "#0070cc");
+  }
+  if (themeUpdatedAt) clean[PROFILE_THEME_COLOR_UPDATED_AT_KEY] = themeUpdatedAt;
   if (updatedAt) clean[PROFILE_SETTINGS_UPDATED_AT_KEY] = updatedAt;
   PROFILE_SETTINGS_TIMESTAMP_ALIASES.forEach(key => {
     if (key !== PROFILE_SETTINGS_UPDATED_AT_KEY) delete clean[key];
+  });
+  PROFILE_THEME_COLOR_TIMESTAMP_ALIASES.forEach(key => {
+    if (key !== PROFILE_THEME_COLOR_UPDATED_AT_KEY) delete clean[key];
   });
   return clean;
 }
@@ -793,7 +872,7 @@ function mergeProfileSettingsByTimestamp(currentSettings = {}, incomingSettings 
 
   if (acceptIncomingSettings) {
     Object.keys(incoming).forEach(key => {
-      if (PROFILE_BANNER_SETTING_KEYS.has(key) || PROFILE_SETTINGS_META_KEYS.has(key)) return;
+      if (PROFILE_BANNER_SETTING_KEYS.has(key) || PROFILE_SETTINGS_META_KEYS.has(key) || key === "themeColor") return;
       merged[key] = incoming[key];
     });
     if (incomingSettingsUpdatedAt) merged[PROFILE_SETTINGS_UPDATED_AT_KEY] = incomingSettingsUpdatedAt;
@@ -824,7 +903,9 @@ function emitPublicProfileBannerUpdate(name, user = null) {
     settingsData,
     profileCardStyle: settingsData.profileCardStyle,
     profileCardEffect: settingsData.profileCardEffect,
-    profileCardStyleUpdatedAt: settingsData.profileCardStyleUpdatedAt
+    profileCardStyleUpdatedAt: settingsData.profileCardStyleUpdatedAt,
+    themeColor: settingsData.themeColor,
+    themeColorUpdatedAt: settingsData.themeColorUpdatedAt
   });
 }
 
@@ -984,7 +1065,7 @@ function mergeLocalRecoveryData(dbUser = {}, localData = {}) {
 
   if (localData.avatar && isDefaultAvatarValue(merged.avatar) && !isDefaultAvatarValue(localData.avatar)) merged.avatar = localData.avatar;
   if ((!merged.joined || merged.joined === '2026') && localData.joined) merged.joined = localData.joined;
-  if ((!merged.themeColor || merged.themeColor === '#0070cc') && localData.themeColor) merged.themeColor = localData.themeColor;
+  reconcileIncomingThemeColor(merged, localData, localData.settingsData || {});
   const preferredTrophies = preferBestTrophiesPayload(merged.trophiesData, localData.trophiesData);
   if (preferredTrophies !== merged.trophiesData) merged.trophiesData = preferredTrophies;
   const preferredCounters = preferLocalObjectPayload(merged.countersData, localData.countersData);
@@ -1570,7 +1651,8 @@ function buildFullProfileSyncPayload(name, user = {}, sourceSocketId = null) {
       friendsData: Array.isArray(safe.friendsData) ? safe.friendsData : [],
       friendsUpdatedAt: normalizeTimestampValue(safe.friendsUpdatedAt),
       countersData: safe.countersData || {},
-      themeColor: safe.themeColor || '#0070cc',
+      themeColor: normalizeThemeColorServer(safe.themeColor || (safe.settingsData && safe.settingsData.themeColor) || '#0070cc'),
+      themeColorUpdatedAt: getUserThemeColorUpdatedAt(safe),
       settingsData: { ...normalizeProfileRealtimeSettings(safe.settingsData || {}), ...getPublicProfileSettings(safe) }
     }
   };
@@ -1594,11 +1676,13 @@ function emitSettingsRealtimeSync(name, sourceSocketId = null, extra = {}) {
     sourceSocketId,
     profileUpdatedAt: normalizeTimestampValue(safe.profileUpdatedAt) || Date.now(),
     settingsUpdatedAt: getProfileSettingsUpdatedAt(safe.settingsData || {}),
-    themeColor: safe.themeColor || '#0070cc',
+    themeColor: normalizeThemeColorServer(safe.themeColor || (safe.settingsData && safe.settingsData.themeColor) || '#0070cc'),
+    themeColorUpdatedAt: getUserThemeColorUpdatedAt(safe),
     settingsData: normalizeProfileRealtimeSettings(safe.settingsData || {}),
     userData: {
       profileUpdatedAt: normalizeTimestampValue(safe.profileUpdatedAt) || Date.now(),
-      themeColor: safe.themeColor || '#0070cc',
+      themeColor: normalizeThemeColorServer(safe.themeColor || (safe.settingsData && safe.settingsData.themeColor) || '#0070cc'),
+      themeColorUpdatedAt: getUserThemeColorUpdatedAt(safe),
       settingsData: normalizeProfileRealtimeSettings(safe.settingsData || {})
     },
     ...extra
@@ -2290,9 +2374,11 @@ io.on('connection', (socket) => {
     });
 
     userDatabase[name].settingsData = mergedSettings.settingsData;
-    if (payload && typeof payload.themeColor === "string" && payload.themeColor.trim()) {
-      userDatabase[name].themeColor = payload.themeColor.trim();
-    }
+    const incomingThemePayload = {
+      themeColor: payload && payload.themeColor,
+      themeColorUpdatedAt: payload && (payload.themeColorUpdatedAt || payload.themeUpdatedAt)
+    };
+    const themeMerge = reconcileIncomingThemeColor(userDatabase[name], incomingThemePayload, incomingSettingsData);
     userDatabase[name].lastSeen = Date.now();
     userDatabase[name].profileUpdatedAt = Date.now();
     await upsertPresenceForSocket(socket, name);
@@ -2305,10 +2391,10 @@ io.on('connection', (socket) => {
       console.error(`[DATABASE ERROR] Failed to save realtime settings for ${name}:`, err);
     }
 
-    const sourceSocketId = (mergedSettings.settingsRejected === true || mergedSettings.bannerRejected === true) ? null : socket.id;
+    const sourceSocketId = (mergedSettings.settingsRejected === true || mergedSettings.bannerRejected === true || themeMerge.rejected === true) ? null : socket.id;
     emitSettingsRealtimeSync(name, sourceSocketId, { reason: payload.reason || 'settings_realtime' });
 
-    if (mergedSettings.bannerAccepted === true || (payload && typeof payload.themeColor === "string" && payload.themeColor.trim())) {
+    if (mergedSettings.bannerAccepted === true || themeMerge.accepted === true) {
       emitPublicProfileBannerUpdate(name, userDatabase[name]);
     }
 
@@ -2330,9 +2416,20 @@ io.on('connection', (socket) => {
                 incomingFallback: normalizeTimestampValue(userData.profileCardStyleUpdatedAt || userData.profileUpdatedAt)
             });
             userDatabase[name].settingsData = mergedSettings.settingsData;
-            shouldBroadcastProfileBanner = mergedSettings.bannerAccepted === true;
-            shouldForceProfileSyncToSource = mergedSettings.settingsRejected === true || mergedSettings.bannerRejected === true;
+            const themeMerge = reconcileIncomingThemeColor(userDatabase[name], userData, incomingSettingsData || {});
+            shouldBroadcastProfileBanner = mergedSettings.bannerAccepted === true || themeMerge.accepted === true;
+            shouldForceProfileSyncToSource = mergedSettings.settingsRejected === true || mergedSettings.bannerRejected === true || themeMerge.rejected === true;
             delete userData.settingsData;
+            delete userData.themeColor;
+            delete userData.themeColorUpdatedAt;
+            delete userData.themeUpdatedAt;
+        } else {
+            const themeMerge = reconcileIncomingThemeColor(userDatabase[name], userData, {});
+            shouldBroadcastProfileBanner = themeMerge.accepted === true;
+            shouldForceProfileSyncToSource = themeMerge.rejected === true;
+            delete userData.themeColor;
+            delete userData.themeColorUpdatedAt;
+            delete userData.themeUpdatedAt;
         }
 
         if (userData.avatar === null || userData.avatar === undefined) {
