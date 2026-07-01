@@ -337,6 +337,8 @@ select option { background-color: var(--bg-dark); }
 .horizontal-scroll { display: flex; overflow-x: auto; min-height: 260px; gap: 15px; padding: 4px 3px; scroll-snap-type: x mandatory; scrollbar-width: none; -webkit-overflow-scrolling: touch; scroll-behavior: smooth; width: 100%; }
 .horizontal-scroll::-webkit-scrollbar { display: none; }
 .horizontal-scroll .game-card { flex: 0 0 auto; width: 160px; scroll-snap-align: start; }
+.explore-virtual-spacer { flex: 0 0 auto; height: 1px; min-width: 0; pointer-events: none; }
+#view-explore .horizontal-scroll[data-explore-virtual="1"] .game-img { opacity: 1 !important; transition: transform 0.3s ease, filter 0.3s ease !important; }
 .horizontal-scroll .game-card:first-child:hover { transform-origin: left center; }
 .horizontal-scroll .game-card:last-child:hover { transform-origin: right center; }
 .scroll-arrow { position: absolute; top: 40%; transform: translateY(-50%); width: 36px; height: 36px; background: rgba(18, 24, 36, 0.95); color: white; border: 1px solid rgba(255, 255, 255, 0.2); border-radius: 50%; font-size: 14px; cursor: pointer; z-index: 20; display: flex; align-items: center; justify-content: center; transition: 0.3s; box-shadow: 0 4px 10px rgba(0, 0, 0, 0.6); }
@@ -12501,6 +12503,260 @@ P
 
 	const EXPLORE_VISIBLE_REVEAL_LIMIT = 36;
 	const EXPLORE_SCROLL_REVEAL_LIMIT = 18;
+	const EXPLORE_VIRTUAL_BUFFER_CARDS = 3;
+	const EXPLORE_VIRTUAL_VERTICAL_MARGIN = 260;
+	const EXPLORE_VIRTUAL_DESKTOP_CARD_WIDTH = 160;
+	const EXPLORE_VIRTUAL_MOBILE_CARD_WIDTH = 140;
+	const EXPLORE_VIRTUAL_DEFAULT_GAP = 15;
+
+	function escapeExploreHtmlText(value) {
+		return String(value || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+	}
+
+	function escapeExploreHtmlAttr(value) {
+		return escapeExploreHtmlText(value).replace(/"/g, '&quot;');
+	}
+
+	function escapeExploreJsValue(value) {
+		return String(value || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+	}
+
+	function buildExploreCardHTML(game, cat, idx, animateCards) {
+		const imgUrl = getItemCover(game, cat);
+		const consoleClasses = ['ps3', 'ps2', 'psx', 'psp', 'minis', 'pce', 'neogeo'];
+		const tagClass = consoleClasses.includes(game.cTag) ? `tag-${game.cTag}` : 'tag-default';
+		const consoleName = String(game.cTag || '').toUpperCase();
+		const safeName = escapeExploreHtmlText(game.cleanName);
+		const safeNameAttr = escapeExploreHtmlAttr(game.cleanName);
+		const safeDate = escapeExploreHtmlText(game.date || '');
+		const safeRegion = escapeExploreHtmlText(game.region || '');
+		const safeIdText = escapeExploreHtmlText(game.id || '');
+		const safeCat = escapeExploreJsValue(cat);
+		const safeId = escapeExploreJsValue(game.id || '');
+		const safeContentId = escapeExploreJsValue(game.contentId || '');
+		const dateHtml = game.date ? `<div class="date-tag"><i class="far fa-clock"></i> ${safeDate}</div>` : '';
+
+		return `
+			<div class="game-card ${animateCards ? 'anim-reveal' : 'no-anim'}" data-explore-index="${idx}" style="--tile-idx: ${idx};" onclick="playUiClick(); switchAndSearch('${safeCat}', '${safeId}', true, '${safeContentId}')" onmouseenter="const __hoverTarget = document.elementFromPoint(event.clientX, event.clientY); if(!__hoverTarget || !__hoverTarget.closest('.btn-mini,.btn-mini-round,.fav-btn,.wish-btn,.action-btn,button,a')) playUiHover(); this.classList.remove('anim-reveal'); this.classList.add('no-anim');">
+				<div class="game-img-container">
+					<div class="console-tag ${tagClass}">${consoleName}</div>
+					<div class="region-tag">${safeRegion}</div>
+					${dateHtml}
+					<img src="${imgUrl}" alt="Cover" class="game-img" loading="eager" decoding="async" data-loaded="true" data-name="${safeNameAttr}" data-console="${escapeExploreHtmlAttr(game.cTag)}" onload="markCoverLoaded(this)" onerror="handleCoverError(this, '${safeCat}')">
+				</div>
+				<div class="game-info" style="padding: 10px; min-height: 0;">
+					<div style="display: flex; flex-direction: column; justify-content: space-between; height: 100%;">
+						<div>
+							<h3 class="game-title" title="${safeNameAttr}">${safeName}</h3>
+							<div class="game-meta-info">
+								<span class="game-id">${safeIdText}</span>
+							</div>
+						</div>
+						<div style="margin-top: 12px; display: flex; align-items: center; gap: 6px;">
+							<span style="font-size: 10px; font-weight: 800; color: var(--ps-blue); letter-spacing: 1.2px;">GO TO STORE</span>
+							<i class="fas fa-chevron-right" style="font-size: 8px; color: var(--ps-blue); opacity: 0.8;"></i>
+						</div>
+					</div>
+				</div>
+			</div>
+		`;
+	}
+
+	function getExploreVirtualMetrics(container) {
+		const style = window.getComputedStyle ? getComputedStyle(container) : null;
+		const cssGap = style ? parseFloat(style.columnGap || style.gap || style.gridColumnGap) : 0;
+		const gap = Number.isFinite(cssGap) && cssGap > 0 ? cssGap : EXPLORE_VIRTUAL_DEFAULT_GAP;
+		let cardWidth = parseFloat(container.dataset.exploreVirtualCardWidth || '0');
+		const sampleCard = container.querySelector('.game-card');
+		if (sampleCard) {
+			const rect = sampleCard.getBoundingClientRect();
+			if (rect && rect.width > 0) {
+				cardWidth = rect.width;
+				container.dataset.exploreVirtualCardWidth = String(cardWidth);
+			}
+		}
+		if (!cardWidth || !Number.isFinite(cardWidth)) {
+			const isMobile = window.matchMedia && window.matchMedia('(max-width: 768px)').matches;
+			cardWidth = isMobile ? EXPLORE_VIRTUAL_MOBILE_CARD_WIDTH : EXPLORE_VIRTUAL_DESKTOP_CARD_WIDTH;
+		}
+		return { cardWidth, gap, step: cardWidth + gap };
+	}
+
+	function getExploreVirtualSpacerWidth(count, metrics) {
+		if (!count || count <= 0) return 0;
+		return (count * metrics.cardWidth) + (Math.max(0, count - 1) * metrics.gap);
+	}
+
+	function isExploreVirtualContainerNearViewport(container) {
+		if (!container || !container.isConnected) return false;
+		const rootRect = getExploreRevealRootRect();
+		const rect = container.getBoundingClientRect();
+		return rect.bottom > rootRect.top - EXPLORE_VIRTUAL_VERTICAL_MARGIN && rect.top < rootRect.bottom + EXPLORE_VIRTUAL_VERTICAL_MARGIN;
+	}
+
+
+	function createExploreVirtualSpacer(width) {
+		const spacer = document.createElement('div');
+		spacer.className = 'explore-virtual-spacer';
+		spacer.style.flexBasis = `${width}px`;
+		spacer.style.width = `${width}px`;
+		return spacer;
+	}
+
+	function createExploreCardElement(game, cat, idx, animateCards) {
+		const template = document.createElement('template');
+		template.innerHTML = buildExploreCardHTML(game, cat, idx, animateCards).trim();
+		return template.content.firstElementChild;
+	}
+
+	function renderExploreVirtualWindow(container, force = false) {
+		if (!container || !container.__exploreVirtualData) return;
+		if (container.__exploreVirtualRendering) return;
+		const data = container.__exploreVirtualData;
+		const items = data.items || [];
+		if (!items.length) return;
+
+		const metrics = getExploreVirtualMetrics(container);
+		const scrollLeft = Math.max(0, container.scrollLeft || 0);
+		const nearViewport = isExploreVirtualContainerNearViewport(container);
+		let start = 0;
+		let end = 0;
+
+		if (nearViewport || force) {
+			const rawStart = Math.floor(scrollLeft / Math.max(1, metrics.step));
+			const buffer = EXPLORE_VIRTUAL_BUFFER_CARDS;
+			const baseVisibleCount = Math.max(4, Math.ceil((container.clientWidth || 0) / Math.max(1, metrics.step)) + 1);
+			const visibleCount = baseVisibleCount + (buffer * 2);
+			const currentStart = parseInt(container.dataset.exploreVirtualStart || '-999', 10);
+			const currentEnd = parseInt(container.dataset.exploreVirtualEnd || '-999', 10);
+			const firstNeeded = Math.max(0, rawStart);
+			const lastNeeded = Math.min(items.length, rawStart + baseVisibleCount);
+			const hysteresis = Math.max(2, Math.floor(buffer / 2));
+
+			if (!force && currentStart >= 0 && currentEnd >= 0 && firstNeeded >= currentStart + hysteresis && lastNeeded <= currentEnd - hysteresis) {
+				return;
+			}
+
+			start = Math.max(0, rawStart - buffer);
+			end = Math.min(items.length, start + visibleCount);
+			if (end === items.length) start = Math.max(0, end - visibleCount);
+		} else {
+			start = -1;
+			end = -1;
+		}
+
+		if (!force && container.dataset.exploreVirtualStart === String(start) && container.dataset.exploreVirtualEnd === String(end)) return;
+
+		container.__exploreVirtualRendering = true;
+		const previousScroll = container.scrollLeft || 0;
+		const existingCards = new Map();
+		container.querySelectorAll('.game-card[data-explore-index]').forEach(card => {
+			existingCards.set(card.dataset.exploreIndex, card);
+		});
+
+		const fragment = document.createDocumentFragment();
+
+		if (start === -1) {
+			fragment.appendChild(createExploreVirtualSpacer(getExploreVirtualSpacerWidth(items.length, metrics)));
+		} else {
+			const leftWidth = getExploreVirtualSpacerWidth(start, metrics);
+			const rightCount = Math.max(0, items.length - end);
+			const rightWidth = getExploreVirtualSpacerWidth(rightCount, metrics);
+			if (leftWidth > 0) fragment.appendChild(createExploreVirtualSpacer(leftWidth));
+
+			for (let i = start; i < end; i++) {
+				const key = String(i);
+				let card = existingCards.get(key);
+				if (!card) {
+					card = createExploreCardElement(items[i], data.cat, i, data.animateCards && !data.initialRevealDone);
+				} else if (data.initialRevealDone) {
+					card.classList.remove('anim-reveal');
+					card.classList.add('no-anim');
+					card.style.opacity = '';
+					card.style.animation = '';
+				}
+				fragment.appendChild(card);
+			}
+
+			if (rightWidth > 0) fragment.appendChild(createExploreVirtualSpacer(rightWidth));
+			data.initialRevealDone = true;
+		}
+
+		container.replaceChildren(fragment);
+		container.dataset.exploreVirtualStart = String(start);
+		container.dataset.exploreVirtualEnd = String(end);
+		container.dataset.exploreCardsReady = '1';
+		if (Math.abs((container.scrollLeft || 0) - previousScroll) > 1) container.scrollLeft = previousScroll;
+		container.__exploreVirtualRendering = false;
+	}
+
+	function scheduleExploreVirtualRender(container, force = false) {
+		if (!container || !container.__exploreVirtualData) return;
+		if (container.__exploreVirtualFrame) cancelAnimationFrame(container.__exploreVirtualFrame);
+		container.__exploreVirtualFrame = requestAnimationFrame(() => {
+			container.__exploreVirtualFrame = 0;
+			renderExploreVirtualWindow(container, force);
+		});
+	}
+
+	function refreshExploreVirtualCarousels(force = false) {
+		const exploreView = document.getElementById('view-explore');
+		if (!exploreView) return;
+		exploreView.querySelectorAll('.horizontal-scroll[data-explore-virtual="1"]').forEach(container => scheduleExploreVirtualRender(container, force));
+	}
+
+	window.refreshExploreVirtualCarousels = refreshExploreVirtualCarousels;
+
+	function getExploreVirtualStats() {
+		const exploreView = document.getElementById('view-explore');
+		if (!exploreView) return [];
+		return Array.from(exploreView.querySelectorAll('.horizontal-scroll[data-explore-virtual="1"]')).map((container, index) => {
+			const data = container.__exploreVirtualData || {};
+			return {
+				carousel: index + 1,
+				category: container.dataset.exploreCat || data.cat || '',
+				realCards: container.querySelectorAll('.game-card').length,
+				cachedItems: data.items ? data.items.length : 0,
+				window: `${container.dataset.exploreVirtualStart || '?'}-${container.dataset.exploreVirtualEnd || '?'}`,
+				scrollLeft: Math.round(container.scrollLeft || 0),
+				scrollWidth: Math.round(container.scrollWidth || 0)
+			};
+		});
+	}
+
+
+	window.exploreVirtualStats = function() {
+		const stats = getExploreVirtualStats();
+		try { console.table(stats); } catch (e) { console.log(stats); }
+		return stats;
+	};
+
+	function attachExploreVirtualHandlers(container) {
+		if (!container || container.__exploreVirtualHandlersAttached) return;
+		container.__exploreVirtualHandlersAttached = true;
+		container.addEventListener('scroll', () => scheduleExploreVirtualRender(container), { passive: true });
+		const main = document.querySelector('.main-content');
+		if (main && !main.__exploreVirtualScrollAttached) {
+			main.__exploreVirtualScrollAttached = true;
+			main.addEventListener('scroll', () => refreshExploreVirtualCarousels(false), { passive: true });
+		}
+		if (!window.__exploreVirtualResizeAttached) {
+			window.__exploreVirtualResizeAttached = true;
+			window.addEventListener('resize', () => refreshExploreVirtualCarousels(true), { passive: true });
+		}
+	}
+
+	function setExploreVirtualData(container, cat, items, animateCards) {
+		if (!container) return;
+		container.__exploreVirtualData = { cat, items: items || [], animateCards: !!animateCards, initialRevealDone: false };
+		container.dataset.exploreCat = cat;
+		container.dataset.exploreVirtual = '1';
+		delete container.dataset.exploreVirtualStart;
+		delete container.dataset.exploreVirtualEnd;
+		attachExploreVirtualHandlers(container);
+		renderExploreVirtualWindow(container, true);
+	}
+
 
 	function cleanupExploreVisibleRevealWatcher() {
 		if (typeof window.__exploreVisibleRevealCleanup === 'function') {
@@ -12650,6 +12906,7 @@ P
 		if (!exploreView || exploreView.style.display === 'none') return;
 		if (window.__exploreBootRevealActive && !options.allowDuringBoot) return;
 		hideExploreBootSkeletons(exploreView);
+		if (typeof refreshExploreVirtualCarousels === 'function') refreshExploreVirtualCarousels(true);
 
 		const containers = Array.from(exploreView.querySelectorAll('.horizontal-scroll')).filter(container => container.querySelector('.game-card'));
 		if (!containers.length) return;
@@ -13124,6 +13381,7 @@ P
 						if (typeof resetTimer === 'function') resetTimer();
 	
 						hideExploreBootSkeletons(exploreView);
+						if (typeof refreshExploreVirtualCarousels === 'function') refreshExploreVirtualCarousels(true);
 
 						const cards = exploreView.querySelectorAll('.horizontal-scroll .game-card');
 						cards.forEach(card => {
@@ -14042,43 +14300,8 @@ P
 		}
 	
 		const animateCards = options.animateCards !== false && window.__explorePopulateAnimateCards !== false;
-		let html = '';
-		latestItems.forEach((game, idx) => {
-			const imgUrl = getItemCover(game, cat);
-			const consoleClasses = ['ps3', 'ps2', 'psx', 'psp', 'minis', 'pce', 'neogeo'];
-			const tagClass = consoleClasses.includes(game.cTag) ? `tag-${game.cTag}` : 'tag-default';
-			const consoleName = game.cTag.toUpperCase();
-			const dateHtml = game.date ? `<div class="date-tag"><i class="far fa-clock"></i> ${game.date}</div>` : '';
-	
-			html += `
-				<div class="game-card ${animateCards ? 'anim-reveal' : 'no-anim'}" style="--tile-idx: ${idx};" onclick="playUiClick(); switchAndSearch('${cat}', '${game.id}', true, '${String(game.contentId || '').replace(/'/g, "\\'")}')" onmouseenter="const __hoverTarget = document.elementFromPoint(event.clientX, event.clientY); if(!__hoverTarget || !__hoverTarget.closest('.btn-mini,.btn-mini-round,.fav-btn,.wish-btn,.action-btn,button,a')) playUiHover(); this.classList.remove('anim-reveal'); this.classList.add('no-anim');">
-					<div class="game-img-container">
-						<div class="console-tag ${tagClass}">${consoleName}</div>
-						<div class="region-tag">${game.region}</div>
-						${dateHtml}
-						<img src="${imgUrl}" alt="Cover" class="game-img" loading="lazy" data-name="${game.cleanName.replace(/"/g, '&quot;')}" data-console="${game.cTag}" onload="markCoverLoaded(this)" onerror="handleCoverError(this, '${cat}')">
-					</div>
-					<div class="game-info" style="padding: 10px; min-height: 0;">
-						<div style="display: flex; flex-direction: column; justify-content: space-between; height: 100%;">
-							<div>
-								<h3 class="game-title" title="${game.cleanName}">${game.cleanName}</h3>
-								<div class="game-meta-info">
-									<span class="game-id">${game.id}</span>
-								</div>
-							</div>
-							<div style="margin-top: 12px; display: flex; align-items: center; gap: 6px;">
-								<span style="font-size: 10px; font-weight: 800; color: var(--ps-blue); letter-spacing: 1.2px;">GO TO STORE</span>
-								<i class="fas fa-chevron-right" style="font-size: 8px; color: var(--ps-blue); opacity: 0.8;"></i>
-							</div>
-						</div>
-					</div>
-				</div>
-			`;
-		});
-	
-		container.innerHTML = html;
-		container.dataset.exploreCardsReady = '1';
-		if (animateCards) setupRevealAnimations(containerId);
+		setExploreVirtualData(container, cat, latestItems, animateCards);
+
 	}
 
     async function populateExploreTab(options = {}) {
@@ -22502,6 +22725,11 @@ P
         if (container) {
             const scrollAmount = 350; 
             container.scrollBy({ left: scrollAmount * direction, behavior: 'smooth' });
+            if (container.dataset && container.dataset.exploreVirtual === '1' && typeof scheduleExploreVirtualRender === 'function') {
+                scheduleExploreVirtualRender(container);
+                setTimeout(() => scheduleExploreVirtualRender(container), 120);
+                setTimeout(() => scheduleExploreVirtualRender(container), 360);
+            }
         }
     };
     
