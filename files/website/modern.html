@@ -24598,8 +24598,25 @@ P
 
 	window.updateRevivedPlayersOnline = async function(forceSkeleton = false) {
 		if (!isRevivedPlayersOnlineViewActive()) return;
+		const onlineView = document.getElementById('view-online');
 		const sources = window.revivedPlayerSources || {};
-		const keys = Object.keys(sources);
+		const keys = Object.keys(sources).filter(key => {
+			const badges = onlineView ? Array.from(onlineView.querySelectorAll(`[data-revived-player-badge="${key}"]`)) : [];
+			return badges.some(badge => {
+				if (!badge || !badge.isConnected) return false;
+
+				let node = badge;
+				while (node && node.nodeType === 1) {
+					const style = window.getComputedStyle ? window.getComputedStyle(node) : null;
+					if (style && (style.display === 'none' || style.visibility === 'hidden')) return false;
+					if (node === onlineView) break;
+					node = node.parentElement;
+				}
+
+				const rect = badge.getBoundingClientRect();
+				return rect.width > 0 && rect.height > 0;
+			});
+		});
 		if (!keys.length) return;
 
 		keys.forEach(key => {
@@ -25589,8 +25606,13 @@ P
 			? window.lastScannedGames
 			: ((typeof lastScannedGames !== 'undefined' && Array.isArray(lastScannedGames)) ? lastScannedGames : []);
 		const hasCachedGames = cachedGames.length > 0;
+		const libraryScanVisible = isPsnDomSectionVisible('view-library') && (isPsnDomSectionVisible('subview-games') || isPsnDomSectionVisible('subview-monitor'));
 		if (ps3AutoScanBusy) return false;
 		if (hasCachedGames && (now - ps3LastAutoScanAt) < PS3_AUTO_SCAN_COOLDOWN_MS) return false;
+		if (!libraryScanVisible) {
+			window.__pendingLibraryAutoScan = true;
+			return false;
+		}
 		return true;
 	}
 
@@ -27448,6 +27470,11 @@ P
 
 			setTimeout(async () => {
 				try {
+					if (isAutomatic && !isPsnDomSectionVisible('view-library')) {
+						window.__pendingLibraryAutoScan = true;
+						return;
+					}
+
 					await reloadLocalLibrary();
 					if (!isAutomatic) {
 						if (typeof showToastNotification === 'function') showToastNotification('Scan Games', 'Library refreshed from PS3™.');
@@ -30295,6 +30322,11 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 		nextView.classList.add('anim-up');
 	}
 
+	if ((type === 'games' || type === 'monitor') && window.__pendingLibraryAutoScan && shouldRunAutomaticPs3Scan()) {
+		window.__pendingLibraryAutoScan = false;
+		setTimeout(() => scanConsoleAndReload(true), 300);
+	}
+
 	if (type === 'favorites' && typeof updateFavoritesLibraryUI === 'function') {
 		updateFavoritesLibraryUI();
 	}
@@ -30391,7 +30423,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 			}
 	
 			checkTrophyProgress('connect_ps3', 1);
-			scanConsoleAndReload(true);
+			if (shouldRunAutomaticPs3Scan()) scanConsoleAndReload(true);
 			if (typeof updateConsoleDashboardUI === 'function') updateConsoleDashboardUI();
 
 			if (typeof syncCompanionPluginOnConnect === 'function') {
