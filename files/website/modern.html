@@ -11860,9 +11860,12 @@ P
         
         if (typeof psnMarkTrophyViewsDirty === 'function') psnMarkTrophyViewsDirty();
         if (window.renderTrophiesView && typeof psnIsViewVisible === 'function' && psnIsViewVisible('view-trophies')) window.renderTrophiesView(true);
-        if (window.updateWishlistUI) window.updateWishlistUI();
-        if (window.updateDownloadUI) window.updateDownloadUI();
-        if (window.updateFavoritesLibraryUI) window.updateFavoritesLibraryUI();
+        if (typeof window.refreshWishlistSummaryUI === 'function') window.refreshWishlistSummaryUI();
+        if (typeof window.refreshDownloadSummaryUI === 'function') window.refreshDownloadSummaryUI();
+        if (typeof window.refreshFavoritesSummaryUI === 'function') window.refreshFavoritesSummaryUI();
+        if (window.updateWishlistUI && isPsnDomSectionVisible('view-wishlist')) window.updateWishlistUI();
+        if (window.updateDownloadUI && isPsnDomSectionVisible('view-downloads')) window.updateDownloadUI();
+        if (window.updateFavoritesLibraryUI && isPsnDomSectionVisible('view-library') && isPsnDomSectionVisible('subview-favs')) window.updateFavoritesLibraryUI();
         if (window.renderFriendsList) window.renderFriendsList();
 
         initSettings();
@@ -19174,6 +19177,63 @@ P
 		window.broadcastProfileUpdate();
     };
     
+
+	function isPsnDomSectionVisible(id) {
+		const el = document.getElementById(id);
+		if (!el) return false;
+		return window.getComputedStyle(el).display !== 'none';
+	}
+
+	function refreshDownloadSummaryUI() {
+		const history = Array.isArray(window.downloadHistory) ? window.downloadHistory : [];
+		const statCount = document.getElementById('stat-total-count');
+		const statSize = document.getElementById('stat-total-size');
+		const globalCount = document.getElementById('dl-count');
+		const statsHeader = document.querySelector('.dl-stats-header');
+		const dot = document.getElementById('dl-dot');
+		const totalBytes = history.reduce((acc, item) => acc + (item.sizeBytes || 0), 0);
+
+		if (statCount) statCount.innerText = String(history.length);
+		if (statSize) statSize.innerText = history.length ? formatSizeFromBytes(totalBytes) : '0 KB';
+		if (globalCount) globalCount.innerText = `(${history.length} item${history.length === 1 ? '' : 's'})`;
+		if (statsHeader && isPsnDomSectionVisible('view-downloads')) statsHeader.style.display = history.length ? 'flex' : 'none';
+
+		if (dot) {
+			const shouldShow = history.length > 0 && loadState('psn_dl_dot') === 'true' && !isPsnDomSectionVisible('view-downloads');
+			dot.style.display = shouldShow ? 'block' : 'none';
+		}
+	}
+	window.refreshDownloadSummaryUI = refreshDownloadSummaryUI;
+
+	function refreshWishlistSummaryUI() {
+		const wishlist = Array.isArray(window.wishlist) ? window.wishlist : [];
+		const countSpan = document.getElementById('wish-count');
+		if (countSpan) countSpan.innerText = `(${wishlist.length} item${wishlist.length === 1 ? '' : 's'})`;
+		if (typeof window.refreshCategoryDot === 'function') {
+			window.refreshCategoryDot('wishlist');
+		} else {
+			const dot = document.getElementById('wish-dot');
+			if (dot) dot.style.display = (wishlist.length > 0 && loadState('psn_wish_dot') === 'true' && !isPsnDomSectionVisible('view-wishlist')) ? 'block' : 'none';
+		}
+	}
+	window.refreshWishlistSummaryUI = refreshWishlistSummaryUI;
+
+	function refreshFavoritesSummaryUI() {
+		const favs = Array.isArray(window.favoritesLibrary) ? window.favoritesLibrary : [];
+		const countSpan = document.getElementById('fav-count');
+		if (countSpan && !isPsnDomSectionVisible('subview-favs')) {
+			countSpan.innerText = `(${favs.length} item${favs.length === 1 ? '' : 's'})`;
+			countSpan.style.color = '#4caf50';
+		}
+		if (typeof window.refreshCategoryDot === 'function') {
+			window.refreshCategoryDot('favorites');
+		} else {
+			const dot = document.getElementById('fav-dot');
+			if (dot) dot.style.display = (favs.length > 0 && loadState('psn_fav_dot') === 'true' && !isPsnDomSectionVisible('subview-favs')) ? 'block' : 'none';
+		}
+	}
+	window.refreshFavoritesSummaryUI = refreshFavoritesSummaryUI;
+
     window.clearDownloadHistory = function() {
         if (confirm("Do you want to clear all history and statistics?")) {
             window.downloadHistory = [];
@@ -19197,6 +19257,10 @@ P
 		const activeUser = localStorage.getItem('psn_username');
 		
 		if (!listContainer) return;
+		if (!isPsnDomSectionVisible('view-downloads')) {
+			if (typeof window.refreshDownloadSummaryUI === 'function') window.refreshDownloadSummaryUI();
+			return;
+		}
 		if (typeof window.normalizeDownloadHistoryCovers === 'function') window.normalizeDownloadHistoryCovers(true, true);
 	
 		if (window.downloadHistory.length === 0) {
@@ -23729,6 +23793,11 @@ P
 		const activeUser = localStorage.getItem('psn_username');
 		
 		if (!grid) return;
+		const wishlistViewIsActive = isPsnDomSectionVisible('view-wishlist');
+		if (!wishlistViewIsActive) {
+			if (typeof window.refreshWishlistSummaryUI === 'function') window.refreshWishlistSummaryUI();
+			return;
+		}
 		if (isSilent && typeof window.captureGridCoverCache === 'function') window.captureGridCoverCache(grid);
 	
 		if (window.wishlist.length === 0) {
@@ -23754,7 +23823,6 @@ P
 		if (toolbar) toolbar.style.display = 'flex';
 		if (letterContainer) letterContainer.style.display = 'flex';
 	
-		const wishlistViewIsActive = document.getElementById('view-wishlist')?.style.display === 'block';
 		const pendingWishlistRevealKeys = (wishlistViewIsActive && typeof window.consumeCategoryPendingReveal === 'function')
 			? window.consumeCategoryPendingReveal('wishlist', true)
 			: [];
@@ -27050,9 +27118,13 @@ P
 		const favToolbar = document.getElementById('fav-toolbar');
 		
 		if (!grid) return;
+		const favViewIsActive = isPsnDomSectionVisible('view-library') && isPsnDomSectionVisible('subview-favs');
+		if (!favViewIsActive) {
+			if (typeof window.refreshFavoritesSummaryUI === 'function') window.refreshFavoritesSummaryUI();
+			return;
+		}
 		if (isSilent && typeof window.captureGridCoverCache === 'function') window.captureGridCoverCache(grid);
 	
-		const favViewIsActive = document.getElementById('subview-favs')?.style.display === 'block';
 		const pendingFavoritesRevealKeys = (typeof window.consumeCategoryPendingReveal === 'function')
 			? window.consumeCategoryPendingReveal('favorites', favViewIsActive)
 			: [];
@@ -30197,7 +30269,6 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 		if (typeof window.captureCategoryPendingReveal === 'function') {
 			window.captureCategoryPendingReveal('favorites');
 		}
-		updateFavoritesLibraryUI();
 		
 		if (typeof window.clearCategoryDotPending === 'function') {
 			window.clearCategoryDotPending('favorites');
@@ -30222,6 +30293,10 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 		nextView.style.display = 'block';
 		void nextView.offsetWidth;
 		nextView.classList.add('anim-up');
+	}
+
+	if (type === 'favorites' && typeof updateFavoritesLibraryUI === 'function') {
+		updateFavoritesLibraryUI();
 	}
 
 	const shouldSkipLibraryScrollReset = !!noScrollToTop || !!window.isRestoringHistory || !!window.__preserveLibraryScrollOnce;
@@ -36338,9 +36413,18 @@ function getVisibleChatStackEl(id) {
 
 			if (profileSyncChanges.library && typeof updateConsoleLibraryStatusUI === 'function') updateConsoleLibraryStatusUI(window.lastScannedGames || []);
 			if (profileSyncChanges.trophies && typeof renderTrophiesView === 'function' && typeof psnIsViewVisible === 'function' && psnIsViewVisible('view-trophies')) renderTrophiesView(true);
-			if (profileSyncChanges.wishlist && typeof updateWishlistUI === 'function') updateWishlistUI(true);
-			if (profileSyncChanges.downloads && typeof updateDownloadUI === 'function') updateDownloadUI();
-			if (profileSyncChanges.favorites && typeof updateFavoritesLibraryUI === 'function') updateFavoritesLibraryUI(true);
+			if (profileSyncChanges.wishlist) {
+				if (typeof window.refreshWishlistSummaryUI === 'function') window.refreshWishlistSummaryUI();
+				if (typeof updateWishlistUI === 'function' && isPsnDomSectionVisible('view-wishlist')) updateWishlistUI(true);
+			}
+			if (profileSyncChanges.downloads) {
+				if (typeof window.refreshDownloadSummaryUI === 'function') window.refreshDownloadSummaryUI();
+				if (typeof updateDownloadUI === 'function' && isPsnDomSectionVisible('view-downloads')) updateDownloadUI();
+			}
+			if (profileSyncChanges.favorites) {
+				if (typeof window.refreshFavoritesSummaryUI === 'function') window.refreshFavoritesSummaryUI();
+				if (typeof updateFavoritesLibraryUI === 'function' && isPsnDomSectionVisible('view-library') && isPsnDomSectionVisible('subview-favs')) updateFavoritesLibraryUI(true);
+			}
 			if (profileSyncChanges.friends && typeof renderFriendsList === 'function') renderFriendsList(document.getElementById('search-input')?.value || '', true);
 			if (typeof updateAdminVisibility === 'function') updateAdminVisibility();
 			if (typeof window.refreshCategoryDot === 'function') {
