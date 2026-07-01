@@ -1067,6 +1067,7 @@ input:checked + .slider:before { transform: translateX(20px); }
 .chat-history-loading .chat-ps-list-loader .profile-ps-list-symbols { margin:0 auto 14px; max-width:150px; gap:clamp(11px,3vw,18px); }
 .chat-history-loading .chat-ps-list-loader .profile-ps-list-symbol svg { filter:drop-shadow(0 0 4px rgba(255,255,255,.22)) drop-shadow(0 0 10px rgba(0,188,255,.18)); }
 .chat-history-loading .chat-ps-list-loader .profile-ps-list-title { color:rgba(255,255,255,.82); text-shadow:0 0 9px rgba(0,112,204,.28); }
+#view-chat[style*="display: none"] .profile-ps-list-loader.is-running .profile-ps-list-symbol { animation: none !important; }
 .chat-mention { color: #00bcff; font-weight: bold; cursor: pointer; }
 #chat-input { resize: none; overflow-y: auto; min-height: 45px; line-height: 20px; padding: 12px 15px; flex: 1; min-width: 0; box-sizing: border-box; }
 .chat-control-inline-banner { display: none !important; }
@@ -22051,6 +22052,18 @@ P
 		}
 		
 		if (currentView && currentView.id === 'view-chat' && viewId !== 'view-chat') {
+			window.__chatRenderAbortToken = (window.__chatRenderAbortToken || 0) + 1;
+			window.__chatDetachedRenderingActive = false;
+			const visibleChatBox = document.getElementById('chat-messages-visible-rendering');
+			const detachedChatBox = document.getElementById('chat-messages');
+			if (visibleChatBox && detachedChatBox && detachedChatBox.parentNode === document.body) {
+				detachedChatBox.remove();
+				visibleChatBox.id = 'chat-messages';
+				visibleChatBox.style.visibility = '';
+				visibleChatBox.style.opacity = '1';
+			}
+			const activeChatLoader = document.querySelector('#view-chat .profile-ps-list-loader.is-running');
+			if (activeChatLoader) activeChatLoader.classList.remove('is-running');
 			const divider = document.getElementById('unread-divider');
 			if (divider) divider.remove();
 			if (typeof updateJumpBottomUnreadBadge === 'function') updateJumpBottomUnreadBadge(0);
@@ -31828,10 +31841,11 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
         const liveBox = document.getElementById('chat-messages');
         if (!liveBox) return Promise.resolve(false);
         const chatVisible = typeof isChatScreenVisibleForRead === 'function' ? isChatScreenVisibleForRead() : true;
-        if (!chatVisible && options.force !== true) {
+        if (!chatVisible) {
             window.__chatHistoryDomRendered = false;
             return Promise.resolve(false);
         }
+        const renderToken = (window.__chatRenderAbortToken = (window.__chatRenderAbortToken || 0) + 1);
         const history = Array.isArray(window.messageHistory) ? window.messageHistory.slice() : [];
         const signature = getChatHistoryRenderSignature(history);
         if (!history.length && window.__chatHistoryReceived !== true) {
@@ -31885,7 +31899,28 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 
             let renderBox = createDetachedRenderBox();
 
+            const shouldAbortDetachedRender = () => {
+                if (renderToken !== window.__chatRenderAbortToken) return true;
+                return typeof isChatScreenVisibleForRead === 'function' && !isChatScreenVisibleForRead();
+            };
+
+            const abortDetachedRender = () => {
+                try {
+                    cleanupDetachedRender();
+                    if (liveBox && liveBox.id !== originalId) liveBox.id = originalId;
+                    if (liveBox) {
+                        liveBox.style.visibility = '';
+                        liveBox.style.opacity = '1';
+                    }
+                } catch (e) {}
+                resolve(false);
+            };
+
             const finish = () => {
+                if (shouldAbortDetachedRender()) {
+                    abortDetachedRender();
+                    return;
+                }
                 try {
                     liveBox.style.setProperty('scroll-behavior', 'auto', 'important');
                     const wasShowingLoader = !!(liveBox.querySelector && liveBox.querySelector('#chat-history-loading'));
@@ -31923,6 +31958,10 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
             };
 
             const step = () => {
+                if (shouldAbortDetachedRender()) {
+                    abortDetachedRender();
+                    return;
+                }
                 if (!renderBox || renderBox.id !== 'chat-messages') renderBox = createDetachedRenderBox();
                 const limit = Math.min(index + chunkSize, history.length);
                 for (; index < limit; index++) {
