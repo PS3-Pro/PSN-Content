@@ -13622,11 +13622,11 @@ P
 		if (typeof startBootPreloads === 'function') startBootPreloads('intro-starting-screen');
 
 		const reduceMotion = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-		const introDelay = reduceMotion ? 0 : 120;
-		const exitDelay = reduceMotion ? 0 : 180;
+		const introDelay = reduceMotion ? 120 : 1880;
+		const exitDelay = reduceMotion ? 0 : 460;
 
 		const revealUserSelectOnce = () => {
-			restartUserSelectIntroAnimation(userSelect, { delay: 25 });
+			restartUserSelectIntroAnimation(userSelect, { delay: 90 });
 			bootContainer.classList.remove('boot-intro-pending', 'boot-intro-transitioning');
 			bootContainer.classList.add('boot-intro-finished');
 			bootContainer.dataset.introCompleted = 'true';
@@ -13641,7 +13641,7 @@ P
 				setTimeout(() => {
 					bootIntro.style.display = 'none';
 					revealUserSelectOnce();
-				}, exitDelay);
+				}, Math.max(exitDelay, 470));
 			} else {
 				revealUserSelectOnce();
 			}
@@ -14143,15 +14143,22 @@ P
     function bootLowPriorityPause(ms = 0, priority = 'low') {
         return new Promise(resolve => {
             const highPriority = priority === 'high';
+            const visualActive = isBootLoginVisualActive();
 
-            if (highPriority) {
-                resolve();
+            if (visualActive && highPriority) {
+                // Fallback only: normally the heavy cache is finished on the Starting screen.
+                // If login somehow starts while parsing, yield a real paint frame for the avatar.
+                if (window.requestAnimationFrame) {
+                    window.requestAnimationFrame(() => setTimeout(resolve, 0));
+                } else {
+                    setTimeout(resolve, 24);
+                }
                 return;
             }
 
             if (ms > 0) {
-                setTimeout(resolve, ms);
-            } else if (window.requestIdleCallback) {
+                setTimeout(resolve, highPriority ? Math.min(ms, 16) : ms);
+            } else if (!highPriority && window.requestIdleCallback) {
                 window.requestIdleCallback(() => resolve(), { timeout: 250 });
             } else {
                 setTimeout(resolve, 0);
@@ -14162,11 +14169,11 @@ P
     function runWhenBootVisualSettled(fn, delay = 0) {
         setTimeout(() => {
             if (isBootLoginVisualActive() || window.__loginRevealBusy === true) {
-                setTimeout(() => runWhenBootVisualSettled(fn, 0), 180);
+                setTimeout(() => runWhenBootVisualSettled(fn, 0), 650);
                 return;
             }
             if (window.requestIdleCallback) {
-                window.requestIdleCallback(fn, { timeout: 600 });
+                window.requestIdleCallback(fn, { timeout: 1800 });
             } else {
                 setTimeout(fn, 0);
             }
@@ -14176,11 +14183,11 @@ P
     async function addCacheIdsToSetSmooth(items, target, priority = 'low') {
         if (!items || !target) return;
         const highPriority = priority === 'high';
-        const pauseEvery = 5000;
+        const pauseEvery = highPriority && isBootLoginVisualActive() ? 1200 : 5000;
         for (let i = 0; i < items.length; i++) {
             const id = items[i] && items[i].id;
             if (id) target.add(id);
-            if (!highPriority && i > 0 && i % pauseEvery === 0) await bootLowPriorityPause(0, 'low');
+            if (i > 0 && i % pauseEvery === 0) await bootLowPriorityPause(0, highPriority ? 'high' : 'low');
         }
     }
 
@@ -14193,16 +14200,14 @@ P
         if (window.__bootPreloadsStarted) return window.__bootPreloadsReadyPromise || Promise.resolve(window.psnStoreCache || {});
         window.__bootPreloadsStarted = true;
         window.__bootStorePrefetchHighPriority = true;
-        console.log(`[System] Boot preloads started (${reason}, full speed).`);
+        console.log(`[System] Boot preloads scheduled (${reason}, high priority).`);
 
         window.__bootPreloadsReadyPromise = (async () => {
-            const backgroundJob = loadBackgroundIndexes('high').catch(e => console.warn('[System] Background indexes failed', e));
+            await bootLowPriorityPause(120, 'high');
+            const backgroundJob = loadBackgroundIndexes().catch(e => console.warn('[System] Background indexes failed', e));
+            await bootLowPriorityPause(120, 'high');
             const prefetchJob = prefetchEssentialDbs({ priority: 'high', reason }).catch(e => console.warn('[System] Prefetch failed', e));
-            const exploreJob = (typeof warmExploreBeforeUserSelect === 'function')
-                ? warmExploreBeforeUserSelect().catch(e => console.warn('[System] Explore warmup failed', e))
-                : Promise.resolve();
-
-            await Promise.allSettled([backgroundJob, prefetchJob, exploreJob]);
+            await Promise.allSettled([backgroundJob, prefetchJob]);
             return window.psnStoreCache || {};
         })();
 
@@ -14233,39 +14238,10 @@ P
         const exploreView = document.getElementById('view-explore');
         if (!exploreView) return;
         if (!limit || limit <= 0) return;
-
-        const urls = [];
-        exploreView.querySelectorAll('.horizontal-scroll').forEach(container => {
-            container.querySelectorAll('.game-img').forEach(img => {
-                if (img && img.src) urls.push(img.src);
-            });
-
-            const data = container.__exploreVirtualData;
-            if (data && Array.isArray(data.items)) {
-                data.items.forEach(item => {
-                    try {
-                        const url = getItemCover(item, data.cat);
-                        if (url) urls.push(url);
-                    } catch(e) {}
-                });
-            }
-        });
-
-        const uniqueUrls = Array.from(new Set(urls)).slice(0, limit);
-        if (!uniqueUrls.length) return;
-
-        const loadUrl = (url) => new Promise(resolve => {
-            const img = new Image();
-            img.loading = 'eager';
-            img.decoding = 'async';
-            img.onload = resolve;
-            img.onerror = resolve;
-            img.src = url;
-            if (img.decode) img.decode().then(resolve).catch(resolve);
-        });
-
+        const imgs = Array.from(exploreView.querySelectorAll('.horizontal-scroll .game-img')).slice(0, limit);
+        if (!imgs.length) return;
         await Promise.race([
-            Promise.allSettled(uniqueUrls.map(loadUrl)),
+            Promise.allSettled(imgs.map(waitForExploreImage)),
             new Promise(resolve => setTimeout(resolve, timeout))
         ]);
     }
@@ -14277,7 +14253,7 @@ P
                 if (typeof populateExploreTab === 'function') {
                     await populateExploreTab({ animateCards: true, reason: 'starting-gate' });
                 }
-                await preloadExploreCoverImages(200, 4500);
+                await preloadExploreCoverImages(36, 2400);
                 window.__exploreWarmedBeforeLogin = true;
             } catch (e) {
                 console.warn('[System] Explore warmup failed. Continuing boot.', e);
@@ -14287,46 +14263,46 @@ P
     }
     window.warmExploreBeforeUserSelect = warmExploreBeforeUserSelect;
 
-    async function addIndexLinesToSet(text, target, onComplete, priority = 'low') {
-        const highPriority = priority === 'high';
+    async function addIndexLinesToSet(text, target, onComplete) {
         if (text) {
             const lines = text.split('\n');
             for (let i = 0; i < lines.length; i++) {
                 const line = lines[i];
                 if (line && line.trim().length > 8) target.add(line.substring(0, 9).trim());
-                if (!highPriority && i > 0 && i % 2500 === 0) await bootLowPriorityPause(0, 'low');
+                if (i > 0 && i % 2500 === 0) await bootLowPriorityPause();
             }
         }
         if (onComplete) onComplete();
     }
 
-    async function loadBackgroundIndexes(priority = 'high') {
+    async function loadBackgroundIndexes() {
         if (sysData.coversLoaded && sysData.covers.size > 0) return;
         if (bootBackgroundIndexesPromise) return bootBackgroundIndexesPromise;
 
         bootBackgroundIndexesPromise = (async () => {
-            console.log("[System] Loading cover indexes...");
+            console.log("[System] Loading cover indexes in background...");
             const fetchList = [
                 { url: "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/database/covers/blacklist.tsv", target: sysData.noCovers },
                 { url: "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/database/covers/index.tsv", target: sysData.covers, onComplete: () => sysData.coversLoaded = true }
             ];
 
-            await Promise.all(fetchList.map(async item => {
+            for (const item of fetchList) {
                 try {
                     const res = await fetch(item.url);
                     const text = res.ok ? await res.text() : "";
-                    await addIndexLinesToSet(text, item.target, item.onComplete, priority);
+                    await addIndexLinesToSet(text, item.target, item.onComplete);
                 } catch (e) {
                     console.log("Failed background index", e);
                 }
-            }));
+                await bootLowPriorityPause(60);
+            }
 
             console.log("[System] Cover indexes loaded. Ready to render cards.");
         })();
 
         return bootBackgroundIndexesPromise;
     }
-
+    
     async function fetchLatestForExplore(cat, containerId, options = {}) {
 		const container = document.getElementById(containerId);
 		if (!container) return;
@@ -16055,7 +16031,7 @@ P
     async function buildStoreCategoryData(cat, texts, priority = 'high') {
 		let tempGroupMap = {};
 		const highPriority = priority === 'high';
-		const pauseEvery = highPriority ? Number.POSITIVE_INFINITY : 900;
+		const pauseEvery = highPriority ? 2500 : 900;
 
 		for (const text of texts) {
 			if (!text) continue;
@@ -16158,11 +16134,11 @@ P
 					}
 				}
 
-				if (!highPriority && lineIndex > 0 && lineIndex % pauseEvery === 0) {
-					await bootLowPriorityPause(0, 'low');
+				if (lineIndex > 0 && lineIndex % pauseEvery === 0) {
+					await bootLowPriorityPause(0, highPriority ? 'high' : 'low');
 				}
 			}
-			if (!highPriority) await bootLowPriorityPause(30, 'low');
+			await bootLowPriorityPause(highPriority ? 0 : 30, highPriority ? 'high' : 'low');
 		}
 
 		const data = Object.values(tempGroupMap);
@@ -16184,15 +16160,17 @@ P
 
 		psnStoreRenderPromises[cat] = (async () => {
 			const paths = DB_PATHS[cat] || [];
-			const texts = await Promise.all(paths.map(async url => {
+			const texts = [];
+			for (const url of paths) {
+				await bootLowPriorityPause(0, priority === 'high' ? 'high' : 'low');
 				try {
 					const res = await fetch(url);
-					return res.ok ? await res.text() : "";
+					texts.push(res.ok ? await res.text() : "");
 				} catch (err) {
 					console.warn('[System] Store category fetch failed:', cat, url, err);
-					return "";
+					texts.push("");
 				}
-			}));
+			}
 			const data = await buildStoreCategoryData(cat, texts, priority);
 			psnStoreRenderCache[cat] = data;
 			window.psnStoreCache[cat] = data;
@@ -16253,14 +16231,15 @@ P
 		if (bootEssentialDbsPromise) return bootEssentialDbsPromise;
 
 		bootEssentialDbsPromise = (async () => {
-			const essential = Object.keys(DB_PATHS);
+			const essential = ['games', 'demos', 'apps', 'prototypes', 'homebrew_games', 'emulators', 'ports', 'tools', 'dev_tools', 'backup_manager', 'launchers', 'legacy', 'no_psn', 'dlcs', 'updates', 'avatars', 'themes'];
 			const isHighPriority = () => window.__bootStorePrefetchHighPriority === true;
-			console.log(`[System] Starting full ${isHighPriority() ? 'high-priority' : 'low-priority'} store prefetch...`);
+			console.log(`[System] Starting ${isHighPriority() ? 'high-priority' : 'low-priority'} store prefetch...`);
 			window.psnStorePrefetchReady = false;
 			window.psnStorePrefetchProgress = { done: 0, total: essential.length, category: '' };
-
-			await Promise.all(essential.map(async cat => {
+			
+			for (let cat of essential) {
 				window.psnStorePrefetchProgress.category = cat;
+				await bootLowPriorityPause(0, isHighPriority() ? 'high' : 'low');
 
 				if (!psnStoreRenderCache[cat]) {
 					try {
@@ -16272,25 +16251,26 @@ P
 				}
 
 				window.psnStorePrefetchProgress.done++;
-			}));
+				await bootLowPriorityPause(isHighPriority() ? 0 : 120, isHighPriority() ? 'high' : 'low');
+			}
 
 			window.psnStorePrefetchReady = true;
 			window.psnStorePrefetchProgress.category = 'ready';
 
 			window.dispatchEvent(new CustomEvent('psnStorePrefetchReady'));
-			const postPrefetchUiDelay = 40;
+			const postPrefetchUiDelay = 220;
 			runWhenBootVisualSettled(() => {
 				if (typeof updateConsoleLibraryStatusUI === 'function') updateConsoleLibraryStatusUI(window.lastScannedGames || []);
 			}, postPrefetchUiDelay);
 			runWhenBootVisualSettled(() => {
 				if (typeof window.normalizeDownloadHistoryCovers === 'function') window.normalizeDownloadHistoryCovers(true, true);
-			}, postPrefetchUiDelay + 120);
+			}, postPrefetchUiDelay + 520);
 			runWhenBootVisualSettled(() => {
 				if (typeof updateDownloadUI === 'function') updateDownloadUI();
-			}, postPrefetchUiDelay + 200);
+			}, postPrefetchUiDelay + 820);
 			runWhenBootVisualSettled(() => {
 				if (typeof window.refreshOpenProfileListCovers === 'function') window.refreshOpenProfileListCovers();
-			}, postPrefetchUiDelay + 280);
+			}, postPrefetchUiDelay + 1120);
 			console.log("[System] Store prefetch ready.");
 			return window.psnStoreCache;
 		})();
