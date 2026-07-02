@@ -10515,6 +10515,7 @@ P
 
 	function getMobileHapticType(target) {
 		if (!target || !target.closest) return '';
+		if (target.closest('.seen-by-popover')) return '';
 		if (target.closest('textarea, select, [contenteditable="true"], #chat-input, .admin-broadcast-editor, .admin-message-edit-input')) return '';
 		if (target.closest('.delete-btn, .remove-btn, .clear-btn, .danger, .danger-btn, .logout-btn, .admin-danger-btn, [data-haptic="error"]')) return 'warning';
 		if (target.closest('.sys-modal-close, .modal-close, .console-webman-modal-close, [data-haptic="close"]')) return '';
@@ -40563,11 +40564,26 @@ function getVisibleChatStackEl(id) {
 		}
 	}
 	
+	function closeSeenByPopovers() {
+		document.querySelectorAll('.seen-by-popover').forEach(p => p.remove());
+	}
+	window.closeSeenByPopovers = closeSeenByPopovers;
+
+	window.openSeenByUserProfile = function(event, user) {
+		if (event) {
+			event.preventDefault();
+			event.stopPropagation();
+		}
+		if (typeof playUiClick === 'function') playUiClick();
+		closeSeenByPopovers();
+		if (typeof openProfileModal === 'function') openProfileModal(user);
+	};
+
 	function openSeenByPopup(event, msgId) {
 		event.stopPropagation();
 		if (typeof playUiClick === 'function') playUiClick();
 
-		document.querySelectorAll('.seen-by-popover').forEach(p => p.remove());
+		closeSeenByPopovers();
 
 		const checkContainer = document.getElementById(`check-${msgId}`);
 		const chatBox = document.getElementById('chat-messages');
@@ -40597,6 +40613,7 @@ function getVisibleChatStackEl(id) {
 		users.forEach(user => {
 			const avatar = localStorage.getItem(`${user}_psn_avatar`) || "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/main/resources/interface/modern/images/avatars/default.png";
 			const seenDateValue = seenAtMap[user];
+			const encodedUser = encodeURIComponent(user);
 			let seenTime = "";
 			if (seenDateValue) {
 				const seenDate = new Date(seenDateValue);
@@ -40609,7 +40626,7 @@ function getVisibleChatStackEl(id) {
 				}
 			}
 			itemsHtml += `
-				<div class="seen-user-item" onclick="openProfileModal('${user}')" style="cursor:pointer;">
+				<div class="seen-user-item" data-seen-user="${encodedUser}" style="cursor:pointer;">
 					<img src="${avatar}" class="seen-user-avatar">
 					<div style="min-width:0; flex:1; display:flex; flex-direction:column; gap:2px;">
 						<span class="seen-user-name">${user}</span>
@@ -40619,8 +40636,44 @@ function getVisibleChatStackEl(id) {
 		});
 
 		popover.innerHTML = itemsHtml;
+		popover.__seenTouchMoved = false;
+		popover.querySelectorAll('.seen-user-item').forEach(item => {
+			item.addEventListener('click', e => {
+				if (popover.__seenTouchMoved) return;
+				let user = item.getAttribute('data-seen-user') || '';
+				try { user = decodeURIComponent(user); } catch (decodeError) {}
+				window.openSeenByUserProfile(e, user);
+			});
+		});
 		document.body.appendChild(popover);
 		popover.addEventListener('click', e => e.stopPropagation());
+		popover.addEventListener('pointerdown', e => e.stopPropagation());
+		popover.addEventListener('wheel', e => e.stopPropagation(), { passive: true });
+
+		let seenTouchStartY = 0;
+		popover.addEventListener('touchstart', e => {
+			popover.__seenTouchMoved = false;
+			if (e.touches && e.touches.length) seenTouchStartY = e.touches[0].clientY;
+			e.stopPropagation();
+		}, { passive: true });
+		popover.addEventListener('touchmove', e => {
+			popover.__seenTouchMoved = true;
+			e.stopPropagation();
+			if (!e.touches || !e.touches.length) return;
+
+			const touchY = e.touches[0].clientY;
+			const deltaY = touchY - seenTouchStartY;
+			const atTop = popover.scrollTop <= 0;
+			const atBottom = Math.ceil(popover.scrollTop + popover.clientHeight) >= popover.scrollHeight;
+
+			if ((atTop && deltaY > 0) || (atBottom && deltaY < 0)) {
+				e.preventDefault();
+			}
+		}, { passive: false });
+		popover.addEventListener('touchend', e => {
+			e.stopPropagation();
+			setTimeout(() => { popover.__seenTouchMoved = false; }, 90);
+		}, { passive: true });
 
 		const checkRect = checkContainer.getBoundingClientRect();
 		const chatRect = chatBox.getBoundingClientRect();
@@ -40645,13 +40698,18 @@ function getVisibleChatStackEl(id) {
 		popover.style.top = `${Math.round(top)}px`;
 
 		setTimeout(() => {
-			const closeTrigger = () => {
+			const closeTrigger = e => {
+				if (e && e.target && e.target.closest && e.target.closest('.seen-by-popover')) return;
 				if (document.body.contains(popover)) popover.remove();
-				window.removeEventListener('click', closeTrigger);
+				window.removeEventListener('pointerdown', closeTrigger, true);
+				window.removeEventListener('touchstart', closeTrigger, true);
+				window.removeEventListener('click', closeTrigger, true);
 				window.removeEventListener('resize', closeTrigger);
 				chatBox.removeEventListener('scroll', closeTrigger);
 			};
-			window.addEventListener('click', closeTrigger);
+			window.addEventListener('pointerdown', closeTrigger, true);
+			window.addEventListener('touchstart', closeTrigger, true);
+			window.addEventListener('click', closeTrigger, true);
 			window.addEventListener('resize', closeTrigger);
 			chatBox.addEventListener('scroll', closeTrigger, { once: true });
 		}, 100);
