@@ -8605,11 +8605,11 @@ body.chat-selection-mode .chat-message-actions .chat-delete-action:hover { trans
 								<button id="btn-toolbar-cmd" class="tool-btn" onmouseenter="playUiHover();" onmousedown="event.preventDefault(); if(typeof saveChatInputRange === 'function') saveChatInputRange();" ontouchstart="if(typeof saveChatInputRange === 'function') saveChatInputRange();" onclick="triggerCommandBtn()" title="Commands" style="font-size: 12px;"><i class="fas fa-terminal"></i></button>
 								<button id="btn-create-poll" class="tool-btn" onmouseenter="playUiHover();" onclick="openPollModal()" title="Create Poll" style="font-size: 14px;"><i class="fas fa-poll-h"></i></button>
 								<div class="chat-toolbar-divider" aria-hidden="true"></div>
-								<button id="btn-bold" class="tool-btn" onmouseenter="playUiHover();" onclick="wrapStyle('bold')" title="Bold"><i class="fas fa-bold"></i></button>
-								<button id="btn-italic" class="tool-btn" onmouseenter="playUiHover();" onclick="wrapStyle('italic')" title="Italic"><i class="fas fa-italic"></i></button>
-								<button id="btn-strike" class="tool-btn" onmouseenter="playUiHover();" onclick="wrapStyle('strikeThrough')" title="Strikethrough"><i class="fas fa-strikethrough"></i></button>
+								<button id="btn-bold" type="button" tabindex="-1" class="tool-btn" onmouseenter="playUiHover();" onpointerdown="return handleChatFormatToolbarDown(event, 'bold')" onmousedown="event.preventDefault(); event.stopPropagation(); if(!window.PointerEvent) return handleChatFormatToolbarDown(event, 'bold'); return false;" ontouchstart="return handleChatFormatToolbarDown(event, 'bold')" onclick="return handleChatFormatToolbarClick(event, 'bold')" title="Bold"><i class="fas fa-bold"></i></button>
+								<button id="btn-italic" type="button" tabindex="-1" class="tool-btn" onmouseenter="playUiHover();" onpointerdown="return handleChatFormatToolbarDown(event, 'italic')" onmousedown="event.preventDefault(); event.stopPropagation(); if(!window.PointerEvent) return handleChatFormatToolbarDown(event, 'italic'); return false;" ontouchstart="return handleChatFormatToolbarDown(event, 'italic')" onclick="return handleChatFormatToolbarClick(event, 'italic')" title="Italic"><i class="fas fa-italic"></i></button>
+								<button id="btn-strike" type="button" tabindex="-1" class="tool-btn" onmouseenter="playUiHover();" onpointerdown="return handleChatFormatToolbarDown(event, 'strikeThrough')" onmousedown="event.preventDefault(); event.stopPropagation(); if(!window.PointerEvent) return handleChatFormatToolbarDown(event, 'strikeThrough'); return false;" ontouchstart="return handleChatFormatToolbarDown(event, 'strikeThrough')" onclick="return handleChatFormatToolbarClick(event, 'strikeThrough')" title="Strikethrough"><i class="fas fa-strikethrough"></i></button>
 								<div class="chat-toolbar-divider" aria-hidden="true"></div>
-								<button id="btn-bullet" class="tool-btn" onmouseenter="playUiHover();" onpointerdown="if(typeof saveChatInputRange === 'function') saveChatInputRange();" onmousedown="event.preventDefault(); if(typeof saveChatInputRange === 'function') saveChatInputRange();" ontouchstart="if(typeof saveChatInputRange === 'function') saveChatInputRange();" onclick="insertChatBulletPoint()" title="Bullet Point" style="font-size: 13px;"><i class="fas fa-list-ul"></i></button>
+								<button id="btn-bullet" type="button" tabindex="-1" class="tool-btn" onmouseenter="playUiHover();" onpointerdown="return handleChatFormatToolbarDown(event, 'insertUnorderedList')" onmousedown="event.preventDefault(); event.stopPropagation(); if(!window.PointerEvent) return handleChatFormatToolbarDown(event, 'insertUnorderedList'); return false;" ontouchstart="return handleChatFormatToolbarDown(event, 'insertUnorderedList')" onclick="return handleChatFormatToolbarClick(event, 'insertUnorderedList')" title="Bullet Point" style="font-size: 13px;"><i class="fas fa-list-ul"></i></button>
 								<div id="chat-mode-status-tags" class="chat-mode-status-tags" aria-live="polite"></div>
 							</div>
 							<div style="display: flex; gap: 10px; align-items: flex-end; width: 100%;">
@@ -33159,6 +33159,8 @@ function getVisibleChatStackEl(id) {
 	}
 
 	let chatInputSavedRange = null;
+	let chatInputSavedSelectionOffsets = null;
+	let chatToolbarSelectionLockUntil = 0;
 
 	function isChatRangeInsideInput(range, input) {
 		if (!range || !input) return false;
@@ -33166,14 +33168,95 @@ function getVisibleChatStackEl(id) {
 		return container === input || input.contains(container);
 	}
 
+	function getChatRangeTextOffsets(input, range) {
+		if (!input || !range || !isChatRangeInsideInput(range, input)) return null;
+
+		try {
+			const startRange = document.createRange();
+			startRange.selectNodeContents(input);
+			startRange.setEnd(range.startContainer, range.startOffset);
+
+			const endRange = document.createRange();
+			endRange.selectNodeContents(input);
+			endRange.setEnd(range.endContainer, range.endOffset);
+
+			return {
+				start: startRange.toString().length,
+				end: endRange.toString().length,
+				collapsed: range.collapsed
+			};
+		} catch(e) {
+			return null;
+		}
+	}
+
+	function rememberChatInputRange(range, input) {
+		if (!range || !input || !isChatRangeInsideInput(range, input)) return false;
+		chatInputSavedRange = range.cloneRange();
+		chatInputSavedSelectionOffsets = getChatRangeTextOffsets(input, range);
+		return true;
+	}
+
+	function getSavedChatInputRange(input) {
+		if (!input) return null;
+
+		if (chatInputSavedRange && isChatRangeInsideInput(chatInputSavedRange, input)) {
+			try { return chatInputSavedRange.cloneRange(); } catch(e) {}
+		}
+
+		if (chatInputSavedSelectionOffsets) {
+			try {
+				return createChatRangeFromTextOffsets(input, chatInputSavedSelectionOffsets.start, chatInputSavedSelectionOffsets.end);
+			} catch(e) {}
+		}
+
+		return null;
+	}
+
+	function getSavedChatInputRangeForToolbar(input) {
+		if (!input) return null;
+
+		if (chatInputSavedSelectionOffsets) {
+			try {
+				const textLength = (input.innerText || input.textContent || '').length;
+				let start = Math.max(0, Math.min(chatInputSavedSelectionOffsets.start || 0, textLength));
+				let end = Math.max(start, Math.min(chatInputSavedSelectionOffsets.end || 0, textLength));
+				if (end > start) return createChatRangeFromTextOffsets(input, start, end);
+			} catch(e) {}
+		}
+
+		return getSavedChatInputRange(input);
+	}
+
 	function saveChatInputRange() {
 		const input = document.getElementById('chat-input');
 		const selection = window.getSelection();
 		if (!input || !selection || !selection.rangeCount) return;
 		const range = selection.getRangeAt(0);
-		if (isChatRangeInsideInput(range, input)) {
-			chatInputSavedRange = range.cloneRange();
+		if (!isChatRangeInsideInput(range, input)) return;
+
+		if (range.collapsed && chatInputSavedRange && !chatInputSavedRange.collapsed && Date.now() < chatToolbarSelectionLockUntil) return;
+		rememberChatInputRange(range, input);
+	}
+
+	function captureChatInputRangeForToolbar() {
+		const input = document.getElementById('chat-input');
+		const selection = window.getSelection();
+		if (!input || !selection || !selection.rangeCount) return false;
+		const range = selection.getRangeAt(0);
+		if (!isChatRangeInsideInput(range, input)) return false;
+
+		chatToolbarSelectionLockUntil = Date.now() + 900;
+		if (!range.collapsed) {
+			rememberChatInputRange(range, input);
+			return true;
 		}
+
+		if (!chatInputSavedSelectionOffsets || chatInputSavedSelectionOffsets.collapsed) {
+			rememberChatInputRange(range, input);
+		}
+
+		return false;
 	}
 
 	function moveChatCaretToEnd(input) {
@@ -33183,25 +33266,37 @@ function getVisibleChatStackEl(id) {
 		range.collapse(false);
 		selection.removeAllRanges();
 		selection.addRange(range);
-		chatInputSavedRange = range.cloneRange();
+		rememberChatInputRange(range, input);
 		return range;
 	}
 
-	function restoreChatInputRange() {
+	function restoreChatInputRange(preferSavedRange) {
 		const input = document.getElementById('chat-input');
 		const selection = window.getSelection();
 		if (!input || !selection) return null;
-		input.focus();
+
+		if (preferSavedRange) {
+			const savedRange = getSavedChatInputRangeForToolbar(input);
+			if (savedRange) {
+				selection.removeAllRanges();
+				selection.addRange(savedRange);
+				focusChatInputForToolbar(input);
+				return savedRange;
+			}
+		}
+
+		focusChatInputForToolbar(input);
 
 		if (selection.rangeCount && isChatRangeInsideInput(selection.getRangeAt(0), input)) {
-			chatInputSavedRange = selection.getRangeAt(0).cloneRange();
+			rememberChatInputRange(selection.getRangeAt(0), input);
 			return selection.getRangeAt(0);
 		}
 
-		if (chatInputSavedRange && isChatRangeInsideInput(chatInputSavedRange, input)) {
+		const savedRange = getSavedChatInputRange(input);
+		if (savedRange) {
 			selection.removeAllRanges();
-			selection.addRange(chatInputSavedRange.cloneRange());
-			return selection.getRangeAt(0);
+			selection.addRange(savedRange);
+			return savedRange;
 		}
 
 		return moveChatCaretToEnd(input);
@@ -34323,23 +34418,321 @@ function getVisibleChatStackEl(id) {
 		}
 	}
 
-	function insertChatBulletPoint() {
-		if (typeof adminBlockLockedToolbarAction === 'function' && adminBlockLockedToolbarAction()) return;
+	function getChatInlineFormatTag(command) {
+		if (command === 'bold') return 'strong';
+		if (command === 'italic') return 'em';
+		if (command === 'strikeThrough') return 's';
+		return '';
+	}
 
-		const input = document.getElementById('chat-input');
-		if (!input) return;
+	function getChatInlineFormatTags(command) {
+		if (command === 'bold') return ['strong', 'b'];
+		if (command === 'italic') return ['em', 'i'];
+		if (command === 'strikeThrough') return ['s', 'strike', 'del'];
+		const tagName = getChatInlineFormatTag(command);
+		return tagName ? [tagName] : [];
+	}
 
-		if (typeof playUiArrow === 'function') playUiArrow();
+	function isChatInlineFormatElement(el, tagNames) {
+		if (!el || !el.tagName || !tagNames || !tagNames.length) return false;
+		return tagNames.indexOf(el.tagName.toLowerCase()) !== -1;
+	}
 
-		focusChatInputForToolbar(input);
-		restoreChatInputRange();
+	function getChatFormatAncestorForNode(node, input, tagNameOrList) {
+		if (!node || !input || !tagNameOrList) return null;
+		const tagNames = Array.isArray(tagNameOrList) ? tagNameOrList : [tagNameOrList];
+		let el = node.nodeType === 1 ? node : node.parentElement;
 
-		try {
-			document.execCommand('insertUnorderedList', false, null);
-		} catch(e) {
-			console.warn('insertUnorderedList failed:', e);
+		while (el && el !== input) {
+			if (isChatInlineFormatElement(el, tagNames)) return el;
+			el = el.parentElement;
 		}
 
+		return null;
+	}
+
+	function chatRangeIntersectsTextNode(range, node) {
+		if (!range || !node || node.nodeType !== 3) return false;
+		try {
+			if (typeof range.intersectsNode === 'function' && !range.intersectsNode(node)) return false;
+		} catch(e) {}
+
+		try {
+			const nodeRange = document.createRange();
+			nodeRange.selectNodeContents(node);
+			return range.compareBoundaryPoints(Range.END_TO_START, nodeRange) < 0 && range.compareBoundaryPoints(Range.START_TO_END, nodeRange) > 0;
+		} catch(e) {
+			return false;
+		}
+	}
+
+	function getChatSelectedTextNodes(input, range) {
+		const nodes = [];
+		if (!input || !range) return nodes;
+
+		try {
+			const walker = document.createTreeWalker(input, 4, null);
+			let node;
+			while ((node = walker.nextNode())) {
+				if (!chatRangeIntersectsTextNode(range, node)) continue;
+
+				let start = 0;
+				let end = node.textContent.length;
+				if (range.startContainer === node) start = Math.max(0, Math.min(range.startOffset, end));
+				if (range.endContainer === node) end = Math.max(start, Math.min(range.endOffset, end));
+
+				const selectedPart = node.textContent.slice(start, end);
+				if (selectedPart && selectedPart.replace(/[\s\u200B]+/g, '') !== '') nodes.push(node);
+			}
+		} catch(e) {}
+
+		return nodes;
+	}
+
+	function isChatRangeFullyFormatted(input, range, tagNames) {
+		const nodes = getChatSelectedTextNodes(input, range);
+		if (!nodes.length) return false;
+		return nodes.every(node => !!getChatFormatAncestorForNode(node, input, tagNames));
+	}
+
+	function stripChatInlineFormatTags(root, tagNames) {
+		if (!root || !tagNames || !tagNames.length) return;
+		const walker = document.createTreeWalker(root, 1, null);
+		const toUnwrap = [];
+		let node;
+		while ((node = walker.nextNode())) {
+			if (isChatInlineFormatElement(node, tagNames)) toUnwrap.push(node);
+		}
+
+		toUnwrap.reverse().forEach(el => {
+			const parent = el.parentNode;
+			if (!parent) return;
+			while (el.firstChild) parent.insertBefore(el.firstChild, el);
+			parent.removeChild(el);
+		});
+	}
+
+	function appendChatToolbarSegment(segments, node, selected) {
+		if (!node) return;
+		segments.push({ node: node, selected: !!selected });
+	}
+
+	function cloneChatToolbarElementShell(el) {
+		const clone = el.cloneNode(false);
+		return clone;
+	}
+
+	function cloneChatNodeForInlineFormatRemoval(node, ctx, startOffset, endOffset, tagNames, forceSplit) {
+		const segments = [];
+		if (!node) return segments;
+
+		if (node.nodeType === 3) {
+			const text = node.textContent || '';
+			const nodeStart = ctx.offset;
+			const nodeEnd = nodeStart + text.length;
+			ctx.offset = nodeEnd;
+
+			if (!text.length) return segments;
+
+			const selectedStart = Math.max(nodeStart, Math.min(startOffset, nodeEnd));
+			const selectedEnd = Math.max(selectedStart, Math.min(endOffset, nodeEnd));
+
+			if (selectedStart > nodeStart) {
+				appendChatToolbarSegment(segments, document.createTextNode(text.slice(0, selectedStart - nodeStart)), false);
+			}
+
+			if (selectedEnd > selectedStart) {
+				appendChatToolbarSegment(segments, document.createTextNode(text.slice(selectedStart - nodeStart, selectedEnd - nodeStart)), true);
+			}
+
+			if (selectedEnd < nodeEnd) {
+				appendChatToolbarSegment(segments, document.createTextNode(text.slice(selectedEnd - nodeStart)), false);
+			}
+
+			return segments;
+		}
+
+		if (node.nodeType !== 1) {
+			appendChatToolbarSegment(segments, node.cloneNode(true), false);
+			return segments;
+		}
+
+		const isTargetFormat = isChatInlineFormatElement(node, tagNames);
+		const childSegments = [];
+		Array.prototype.slice.call(node.childNodes).forEach(child => {
+			childSegments.push.apply(childSegments, cloneChatNodeForInlineFormatRemoval(child, ctx, startOffset, endOffset, tagNames, forceSplit || isTargetFormat));
+		});
+
+		if (!childSegments.length) {
+			appendChatToolbarSegment(segments, cloneChatToolbarElementShell(node), false);
+			return segments;
+		}
+
+		if (isTargetFormat) {
+			let activeWrapper = null;
+			childSegments.forEach(seg => {
+				if (seg.selected) {
+					activeWrapper = null;
+					appendChatToolbarSegment(segments, seg.node, true);
+				} else {
+					if (!activeWrapper) {
+						activeWrapper = cloneChatToolbarElementShell(node);
+						appendChatToolbarSegment(segments, activeWrapper, false);
+					}
+					activeWrapper.appendChild(seg.node);
+				}
+			});
+			return segments;
+		}
+
+		if (forceSplit) {
+			let activeClone = null;
+			let activeSelected = null;
+			childSegments.forEach(seg => {
+				if (!activeClone || activeSelected !== seg.selected) {
+					activeClone = cloneChatToolbarElementShell(node);
+					activeSelected = seg.selected;
+					appendChatToolbarSegment(segments, activeClone, activeSelected);
+				}
+				activeClone.appendChild(seg.node);
+			});
+			return segments;
+		}
+
+		const clone = cloneChatToolbarElementShell(node);
+		let hasSelected = false;
+		childSegments.forEach(seg => {
+			if (seg.selected) hasSelected = true;
+			clone.appendChild(seg.node);
+		});
+		appendChatToolbarSegment(segments, clone, hasSelected);
+		return segments;
+	}
+
+	function removeChatInlineFormatFromRange(input, range, selection, tagNames) {
+		if (!input || !range || !selection || !tagNames || !tagNames.length) return false;
+
+		const preservedOffsets = getChatRangeTextOffsets(input, range);
+		if (!preservedOffsets || preservedOffsets.end <= preservedOffsets.start) return false;
+
+		try {
+			const ctx = { offset: 0 };
+			const rebuiltSegments = [];
+			Array.prototype.slice.call(input.childNodes).forEach(child => {
+				rebuiltSegments.push.apply(rebuiltSegments, cloneChatNodeForInlineFormatRemoval(child, ctx, preservedOffsets.start, preservedOffsets.end, tagNames, false));
+			});
+
+			input.innerHTML = '';
+			rebuiltSegments.forEach(seg => input.appendChild(seg.node));
+			input.normalize();
+
+			const textLength = (input.innerText || input.textContent || '').length;
+			const safeStart = Math.max(0, Math.min(preservedOffsets.start, textLength));
+			const safeEnd = Math.max(safeStart, Math.min(preservedOffsets.end, textLength));
+			const newRange = createChatRangeFromTextOffsets(input, safeStart, safeEnd);
+			selection.removeAllRanges();
+			selection.addRange(newRange);
+			rememberChatInputRange(newRange, input);
+
+			return true;
+		} catch(e) {
+			return false;
+		}
+	}
+
+	function unwrapChatInlineFormatElement(formatEl, input, selection, preservedOffsets) {
+		if (!formatEl || !formatEl.parentNode || !input || !selection) return false;
+
+		try {
+			const parent = formatEl.parentNode;
+			const movedNodes = [];
+
+			while (formatEl.firstChild) {
+				const child = formatEl.firstChild;
+				movedNodes.push(child);
+				parent.insertBefore(child, formatEl);
+			}
+
+			parent.removeChild(formatEl);
+			input.normalize();
+
+			let newRange = null;
+			if (preservedOffsets && preservedOffsets.end > preservedOffsets.start) {
+				newRange = createChatRangeFromTextOffsets(input, preservedOffsets.start, preservedOffsets.end);
+			} else if (movedNodes.length) {
+				newRange = document.createRange();
+				newRange.setStartBefore(movedNodes[0]);
+				newRange.setEndAfter(movedNodes[movedNodes.length - 1]);
+			}
+
+			if (newRange) {
+				selection.removeAllRanges();
+				selection.addRange(newRange);
+				rememberChatInputRange(newRange, input);
+			}
+
+			return true;
+		} catch(e) {
+			return false;
+		}
+	}
+
+	function getChatFormatElementSelectedByRange(range, input, tagName) {
+		if (!range || !input || !tagName) return null;
+
+		try {
+			if (range.startContainer === range.endContainer && range.startContainer.nodeType === 1) {
+				const parent = range.startContainer;
+				const selectedNodes = Array.prototype.slice.call(parent.childNodes, range.startOffset, range.endOffset).filter(node => {
+					if (node.nodeType === 3) return (node.textContent || '').trim() !== '';
+					return true;
+				});
+
+				if (selectedNodes.length === 1) {
+					const el = selectedNodes[0];
+					if (el.nodeType === 1 && el.tagName && el.tagName.toLowerCase() === tagName && (el === input || input.contains(el))) return el;
+				}
+			}
+		} catch(e) {}
+
+		return null;
+	}
+
+	function tryToggleOffChatInlineFormat(input, command, tagName, range, selection, preferSavedRange) {
+		const tagNames = getChatInlineFormatTags(command);
+		if (!input || !range || !selection || !tagNames.length) return false;
+		if (!isChatRangeFullyFormatted(input, range, tagNames)) return false;
+		return removeChatInlineFormatFromRange(input, range, selection, tagNames);
+	}
+
+	function applyChatInlineFormatManually(input, command, preferSavedRange) {
+		const tagName = getChatInlineFormatTag(command);
+		const selection = window.getSelection();
+		if (!input || !tagName || !selection) return false;
+
+		const range = preferSavedRange ? getSavedChatInputRangeForToolbar(input) : (selection.rangeCount ? selection.getRangeAt(0).cloneRange() : null);
+		if (!range || range.collapsed || !isChatRangeInsideInput(range, input)) return false;
+
+		if (tryToggleOffChatInlineFormat(input, command, tagName, range, selection, preferSavedRange)) return true;
+
+		try {
+			const wrapper = document.createElement(tagName);
+			const contents = range.extractContents();
+			wrapper.appendChild(contents);
+			range.insertNode(wrapper);
+
+			const newRange = document.createRange();
+			newRange.selectNodeContents(wrapper);
+			selection.removeAllRanges();
+			selection.addRange(newRange);
+			rememberChatInputRange(newRange, input);
+			return true;
+		} catch(e) {
+			return false;
+		}
+	}
+
+	function finishChatToolbarFormat(input) {
 		focusChatInputForToolbar(input);
 		input.dispatchEvent(new Event('input', { bubbles: true }));
 		saveChatInputRange();
@@ -34347,13 +34740,247 @@ function getVisibleChatStackEl(id) {
 		if (typeof updateToolbarStates === 'function') updateToolbarStates();
 	}
 
-	function wrapStyle(command) {
+	function getChatClosestElement(node, input, tagNames) {
+		if (!node || !input || !tagNames || !tagNames.length) return null;
+		let el = node.nodeType === 1 ? node : node.parentElement;
+
+		while (el && el !== input) {
+			if (el.tagName && tagNames.indexOf(el.tagName.toLowerCase()) !== -1) return el;
+			el = el.parentElement;
+		}
+
+		return null;
+	}
+
+	function chatRangeIntersectsElement(range, el) {
+		if (!range || !el) return false;
+
+		try {
+			if (typeof range.intersectsNode === 'function') return range.intersectsNode(el);
+		} catch(e) {}
+
+		try {
+			const nodeRange = document.createRange();
+			nodeRange.selectNode(el);
+			return range.compareBoundaryPoints(Range.END_TO_START, nodeRange) < 0 && range.compareBoundaryPoints(Range.START_TO_END, nodeRange) > 0;
+		} catch(e) {
+			return false;
+		}
+	}
+
+	function getChatUnorderedListFromRange(input, range) {
+		if (!input || !range || !isChatRangeInsideInput(range, input)) return null;
+
+		const directStartUl = getChatClosestElement(range.startContainer, input, ['ul']);
+		if (directStartUl) return directStartUl;
+
+		const directEndUl = getChatClosestElement(range.endContainer, input, ['ul']);
+		if (directEndUl) return directEndUl;
+
+		try {
+			if (range.startContainer && range.startContainer.nodeType === 1) {
+				const selectedNodes = Array.prototype.slice.call(range.startContainer.childNodes, range.startOffset, range.endOffset);
+				const selectedUl = selectedNodes.find(node => node.nodeType === 1 && node.tagName && node.tagName.toLowerCase() === 'ul');
+				if (selectedUl && (selectedUl === input || input.contains(selectedUl))) return selectedUl;
+			}
+		} catch(e) {}
+
+		try {
+			const lists = input.querySelectorAll('ul');
+			for (let i = 0; i < lists.length; i++) {
+				if (chatRangeIntersectsElement(range, lists[i])) return lists[i];
+			}
+		} catch(e) {}
+
+		return null;
+	}
+
+	function removeChatBulletListElement(input, listEl, selection, preservedRange) {
+		if (!input || !listEl || !selection || listEl.tagName.toLowerCase() !== 'ul') return false;
+
+		try {
+			const parent = listEl.parentNode;
+			if (!parent) return false;
+
+			const insertedNodes = [];
+			const items = Array.prototype.slice.call(listEl.children).filter(child => child.tagName && child.tagName.toLowerCase() === 'li');
+
+			if (!items.length) {
+				parent.removeChild(listEl);
+				return true;
+			}
+
+			items.forEach((li, index) => {
+				const textNode = document.createTextNode((li.innerText || li.textContent || '').replace(/\n+/g, ' ').trim());
+				parent.insertBefore(textNode, listEl);
+				insertedNodes.push(textNode);
+
+				if (index < items.length - 1) {
+					const br = document.createElement('br');
+					parent.insertBefore(br, listEl);
+					insertedNodes.push(br);
+				}
+			});
+
+			parent.removeChild(listEl);
+
+			const textNodes = insertedNodes.filter(node => node.nodeType === 3);
+			let newRange = null;
+
+			if (textNodes.length) {
+				newRange = document.createRange();
+				newRange.setStart(textNodes[0], 0);
+				newRange.setEnd(textNodes[textNodes.length - 1], textNodes[textNodes.length - 1].textContent.length);
+			} else if (preservedRange) {
+				newRange = preservedRange.cloneRange();
+			}
+
+			if (newRange && isChatRangeInsideInput(newRange, input)) {
+				selection.removeAllRanges();
+				selection.addRange(newRange);
+				rememberChatInputRange(newRange, input);
+			}
+
+			return true;
+		} catch(e) {
+			return false;
+		}
+	}
+
+	function applyChatBulletListManually(input, preferSavedRange) {
+		const selection = window.getSelection();
+		if (!input || !selection) return false;
+
+		const range = preferSavedRange ? getSavedChatInputRangeForToolbar(input) : (selection.rangeCount ? selection.getRangeAt(0).cloneRange() : null);
+		if (!range || !isChatRangeInsideInput(range, input)) return false;
+
+		try {
+			const existingList = getChatUnorderedListFromRange(input, range);
+			if (existingList) return removeChatBulletListElement(input, existingList, selection, range);
+
+			if (range.collapsed) return false;
+
+			const selectedText = range.toString();
+			const lines = selectedText.split(/\n+/).map(line => line.trim()).filter(Boolean);
+			if (!lines.length) return false;
+
+			const ul = document.createElement('ul');
+			lines.forEach(line => {
+				const li = document.createElement('li');
+				li.textContent = line;
+				ul.appendChild(li);
+			});
+
+			range.deleteContents();
+			range.insertNode(ul);
+
+			const newRange = document.createRange();
+			newRange.selectNodeContents(ul);
+			selection.removeAllRanges();
+			selection.addRange(newRange);
+			rememberChatInputRange(newRange, input);
+			return true;
+		} catch(e) {
+			return false;
+		}
+	}
+
+	function insertChatBulletPoint(preferSavedRange) {
 		if (typeof adminBlockLockedToolbarAction === 'function' && adminBlockLockedToolbarAction()) return;
+
+		const input = document.getElementById('chat-input');
+		if (!input) return;
+
 		if (typeof playUiArrow === 'function') playUiArrow();
-		document.execCommand(command, false, null);
-		document.getElementById('chat-input').focus();
-		
-		updateToolbarStates();
+
+		let appliedManually = false;
+		const selectedRange = preferSavedRange ? getSavedChatInputRangeForToolbar(input) : null;
+		if (selectedRange && isChatRangeInsideInput(selectedRange, input)) {
+			appliedManually = applyChatBulletListManually(input, true);
+		}
+
+		if (!appliedManually) {
+			restoreChatInputRange(!!preferSavedRange);
+
+			try {
+				document.execCommand('insertUnorderedList', false, null);
+			} catch(e) {
+				console.warn('insertUnorderedList failed:', e);
+			}
+		}
+
+		finishChatToolbarFormat(input);
+	}
+
+	function wrapStyle(command, preferSavedRange) {
+		if (typeof adminBlockLockedToolbarAction === 'function' && adminBlockLockedToolbarAction()) return;
+
+		const input = document.getElementById('chat-input');
+		if (!input) return;
+
+		if (typeof playUiArrow === 'function') playUiArrow();
+
+		const selectedRange = preferSavedRange ? getSavedChatInputRangeForToolbar(input) : null;
+		const hasSavedSelection = !!(selectedRange && !selectedRange.collapsed && isChatRangeInsideInput(selectedRange, input));
+		let appliedManually = false;
+
+		if (hasSavedSelection && getChatInlineFormatTag(command)) {
+			appliedManually = applyChatInlineFormatManually(input, command, true);
+		}
+
+		if (!appliedManually) {
+			restoreChatInputRange(!!preferSavedRange);
+
+			try {
+				document.execCommand(command, false, null);
+			} catch(e) {
+				console.warn(command + ' failed:', e);
+			}
+		}
+
+		finishChatToolbarFormat(input);
+	}
+
+	let lastChatToolbarCommandTime = 0;
+	let lastChatToolbarCommandName = '';
+
+	function handleChatFormatToolbarDown(event, command) {
+		if (event) {
+			event.preventDefault();
+			event.stopPropagation();
+		}
+
+		if (lastChatToolbarCommandName === command && Date.now() - lastChatToolbarCommandTime < 120) return false;
+
+		captureChatInputRangeForToolbar();
+		chatToolbarSelectionLockUntil = Date.now() + 900;
+		lastChatToolbarCommandTime = Date.now();
+		lastChatToolbarCommandName = command;
+
+		if (command === 'insertUnorderedList') {
+			insertChatBulletPoint(true);
+		} else {
+			wrapStyle(command, true);
+		}
+
+		return false;
+	}
+
+	function handleChatFormatToolbarClick(event, command) {
+		if (event) {
+			event.preventDefault();
+			event.stopPropagation();
+		}
+
+		if (lastChatToolbarCommandName === command && Date.now() - lastChatToolbarCommandTime < 700) return false;
+
+		if (command === 'insertUnorderedList') {
+			insertChatBulletPoint(true);
+		} else {
+			wrapStyle(command, true);
+		}
+
+		return false;
 	}
 	
 	function updateToolbarStates() {
