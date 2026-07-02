@@ -17003,11 +17003,20 @@ P
         });
     });
 
+    let browseResizeRenderTimer = null;
     window.addEventListener('resize', () => {
+        g_browseViewportCache = null;
+        g_browseViewportCacheAt = 0;
+
         if (typeof setupAllVisibleSkeletonAnimations === 'function') setupAllVisibleSkeletonAnimations(document);
-        if (document.getElementById('view-browse').style.display === 'block') {
-            renderGrid();
-        }
+
+        clearTimeout(browseResizeRenderTimer);
+        browseResizeRenderTimer = setTimeout(() => {
+            if (document.hidden) return;
+            if (document.getElementById('view-browse').style.display === 'block') {
+                renderGrid();
+            }
+        }, 140);
     });
 
     document.getElementById('cat-select').addEventListener('change', (e) => {
@@ -36228,21 +36237,44 @@ function getVisibleChatStackEl(id) {
 		}
 	};
 
+	window.getProfileSyncVisibleCardRoots = function() {
+		const roots = [];
+		try {
+			document.querySelectorAll('.view-section').forEach(view => {
+				if (window.getComputedStyle(view).display !== 'none') roots.push(view);
+			});
+
+			document.querySelectorAll('.modal-overlay, .sys-modal').forEach(modal => {
+				const shown = modal.classList.contains('show') || modal.style.display === 'flex' || modal.style.display === 'block';
+				if (shown) roots.push(modal);
+			});
+		} catch (err) {}
+
+		return roots.length ? roots : [document];
+	};
+
 	window.refreshVisibleWishlistCardsFromProfileSync = function() {
 		try {
 			const wishlistKeys = window.makeProfileSyncKeySet(window.wishlist || [], 'wishlist', true);
-			document.querySelectorAll('#database-grid .game-card[data-title-id], .horizontal-scroll .game-card[data-title-id]').forEach(card => {
-				const titleId = String(card.getAttribute('data-title-id') || '').trim();
-				const contentId = String(card.getAttribute('data-content-id') || '').trim();
-				const isWished = (!!contentId && wishlistKeys.has(contentId)) || (!!titleId && wishlistKeys.has(titleId));
-				card.classList.toggle('is-wishlisted', isWished);
-				const btn = card.querySelector('.wish-btn');
-				const icon = btn ? btn.querySelector('i') : null;
-				if (btn) btn.title = isWished ? 'Remove from Wishlist' : 'Add to Wishlist';
-				if (icon) {
-					icon.className = isWished ? 'fas fa-heart' : 'far fa-heart';
-					icon.style.color = isWished ? '#ff4444' : 'rgba(255,255,255,0.6)';
-				}
+			const seenCards = new Set();
+
+			window.getProfileSyncVisibleCardRoots().forEach(root => {
+				root.querySelectorAll('.game-card[data-title-id]').forEach(card => {
+					if (seenCards.has(card)) return;
+					seenCards.add(card);
+
+					const titleId = String(card.getAttribute('data-title-id') || '').trim();
+					const contentId = String(card.getAttribute('data-content-id') || '').trim();
+					const isWished = (!!contentId && wishlistKeys.has(contentId)) || (!!titleId && wishlistKeys.has(titleId));
+					card.classList.toggle('is-wishlisted', isWished);
+					const btn = card.querySelector('.wish-btn');
+					const icon = btn ? btn.querySelector('i') : null;
+					if (btn) btn.title = isWished ? 'Remove from Wishlist' : 'Add to Wishlist';
+					if (icon) {
+						icon.className = isWished ? 'fas fa-heart' : 'far fa-heart';
+						icon.style.color = isWished ? '#ff4444' : 'rgba(255,255,255,0.6)';
+					}
+				});
 			});
 		} catch (err) {
 			console.warn('[PROFILE SYNC] Could not refresh visible wishlist cards:', err);
@@ -36275,30 +36307,38 @@ function getVisibleChatStackEl(id) {
 	window.refreshVisibleFavoriteCardsFromProfileSync = function() {
 		try {
 			const favoriteKeys = window.makeProfileSyncKeySet(window.favoritesLibrary || [], 'favorites', true);
-			document.querySelectorAll('#ps3-local-grid .game-card').forEach(card => {
-				const img = card.querySelector('img[data-lib-path]');
-				const path = String(img?.getAttribute('data-lib-path') || '').trim();
-				const title = String(img?.getAttribute('data-name') || card.querySelector('.game-title')?.getAttribute('title') || card.querySelector('.game-title')?.textContent || '').trim();
-				const titleId = String(card.querySelector('.game-id')?.textContent || '').trim();
-				const isFav = (!!path && favoriteKeys.has(path)) || (!!title && favoriteKeys.has(title)) || (!!titleId && favoriteKeys.has(titleId));
-				card.classList.toggle('is-favorited', isFav);
-				const btn = card.querySelector('.fav-btn');
-				const icon = btn ? btn.querySelector('i') : null;
-				if (btn) btn.title = isFav ? 'Remove from Favorites' : 'Add to Favorites';
-				if (icon) {
-					icon.className = isFav ? 'fas fa-star' : 'far fa-star';
-					icon.style.color = isFav ? '#ffcc00' : 'rgba(255,255,255,0.6)';
-				}
+			const seenCards = new Set();
+
+			window.getProfileSyncVisibleCardRoots().forEach(root => {
+				root.querySelectorAll('#ps3-local-grid .game-card, .game-card').forEach(card => {
+					if (seenCards.has(card)) return;
+					seenCards.add(card);
+
+					const img = card.querySelector('img[data-lib-path]');
+					const path = String(img?.getAttribute('data-lib-path') || '').trim();
+					const title = String(img?.getAttribute('data-name') || card.querySelector('.game-title')?.getAttribute('title') || card.querySelector('.game-title')?.textContent || '').trim();
+					const titleId = String(card.querySelector('.game-id')?.textContent || '').trim();
+					const isFav = (!!path && favoriteKeys.has(path)) || (!!title && favoriteKeys.has(title)) || (!!titleId && favoriteKeys.has(titleId));
+					card.classList.toggle('is-favorited', isFav);
+					const btn = card.querySelector('.fav-btn');
+					const icon = btn ? btn.querySelector('i') : null;
+					if (btn) btn.title = isFav ? 'Remove from Favorites' : 'Add to Favorites';
+					if (icon) {
+						icon.className = isFav ? 'fas fa-star' : 'far fa-star';
+						icon.style.color = isFav ? '#ffcc00' : 'rgba(255,255,255,0.6)';
+					}
+				});
 			});
 		} catch (err) {
 			console.warn('[PROFILE SYNC] Could not refresh visible favorite cards:', err);
 		}
 	};
 
-	window.refreshProfileSyncVisibleUI = function(userData = {}, previousState = {}) {
-		if (typeof window.refreshVisibleWishlistCardsFromProfileSync === 'function') window.refreshVisibleWishlistCardsFromProfileSync();
-		if (typeof window.refreshGameModalWishlistButtonFromProfileSync === 'function') window.refreshGameModalWishlistButtonFromProfileSync();
-		if (typeof window.refreshVisibleFavoriteCardsFromProfileSync === 'function') window.refreshVisibleFavoriteCardsFromProfileSync();
+	window.refreshProfileSyncVisibleUI = function(userData = {}, previousState = {}, profileSyncChanges = null) {
+		const changes = profileSyncChanges || (typeof window.getRemoteProfileSyncChanges === 'function' ? window.getRemoteProfileSyncChanges(userData, previousState) : { wishlist: true, favorites: true });
+		if (changes.wishlist && typeof window.refreshVisibleWishlistCardsFromProfileSync === 'function') window.refreshVisibleWishlistCardsFromProfileSync();
+		if (changes.wishlist && typeof window.refreshGameModalWishlistButtonFromProfileSync === 'function') window.refreshGameModalWishlistButtonFromProfileSync();
+		if (changes.favorites && typeof window.refreshVisibleFavoriteCardsFromProfileSync === 'function') window.refreshVisibleFavoriteCardsFromProfileSync();
 		if (typeof window.applyProfileSyncNotificationDots === 'function') window.applyProfileSyncNotificationDots(previousState, userData);
 	};
 
@@ -36435,7 +36475,7 @@ function getVisibleChatStackEl(id) {
 			}
 
 
-			if (typeof window.refreshProfileSyncVisibleUI === 'function') window.refreshProfileSyncVisibleUI(userData, previousProfileSyncState);
+			if (typeof window.refreshProfileSyncVisibleUI === 'function') window.refreshProfileSyncVisibleUI(userData, previousProfileSyncState, profileSyncChanges);
 
 			const incomingRole = String(userData.role || (userData.isAdmin ? 'admin' : '')).toLowerCase();
 			if (incomingRole && incomingRole !== 'user') localStorage.setItem(`${name}_psn_role`, incomingRole === 'moderator' ? 'mod' : incomingRole);
@@ -36489,54 +36529,7 @@ function getVisibleChatStackEl(id) {
 		}
 	};
 
-	function requestRealtimeStateAfterReconnect(reason = 'resume') {
-		try {
-			if (!(typeof socketChat !== 'undefined' && socketChat)) return false;
-			if (!socketChat.connected) {
-				try { socketChat.connect(); } catch (err) {}
-				return false;
-			}
-
-			const myName = localStorage.getItem('psn_username') || '';
-			if (!myName || myName === 'null' || myName === 'undefined') return false;
-
-			if (typeof socketChat.timeout === 'function') {
-				socketChat.timeout(2500).emit('presence_ping', { reason, at: Date.now() }, () => {});
-			} else {
-				socketChat.emit('presence_ping', { reason, at: Date.now() });
-			}
-
-			socketChat.emit('request_online_list');
-			if (window.isProfileLoaded) {
-				socketChat.emit('request_profile_sync', { forceRefresh: true, reason, at: Date.now() });
-			}
-			return true;
-		} catch (err) {
-			console.warn('[NETWORK] Could not refresh realtime state after reconnect:', err);
-			return false;
-		}
-	}
-	window.requestRealtimeStateAfterReconnect = requestRealtimeStateAfterReconnect;
-
-	function scheduleRealtimeStateRefresh(reason = 'resume') {
-		clearTimeout(window.__profileRealtimeRefreshTimer);
-		window.__profileRealtimeRefreshTimer = setTimeout(() => requestRealtimeStateAfterReconnect(reason), 250);
-		setTimeout(() => requestRealtimeStateAfterReconnect(`${reason}:retry`), 1600);
-	}
-	window.scheduleRealtimeStateRefresh = scheduleRealtimeStateRefresh;
-
-	function installRealtimeResumeHandlers() {
-		if (window.__profileRealtimeResumeHandlersInstalled) return;
-		window.__profileRealtimeResumeHandlersInstalled = true;
-		const refresh = reason => {
-			if (document.hidden) return;
-			scheduleRealtimeStateRefresh(reason);
-		};
-		document.addEventListener('visibilitychange', () => { if (!document.hidden) refresh('visibility'); });
-		window.addEventListener('pageshow', () => refresh('pageshow'));
-		window.addEventListener('focus', () => refresh('focus'));
-		window.addEventListener('online', () => refresh('online'));
-	}
+	let profileRealtimeConnectionWasLost = false;
 
 	function initChat() {
 		document.body.classList.remove('is-admin');
@@ -36585,10 +36578,21 @@ function getVisibleChatStackEl(id) {
 					isNewAccount: false,
 					userData: buildFastLocalUserDataForAuth(myName)
 				});
-				setTimeout(() => requestRealtimeStateAfterReconnect('connect-auth'), 700);
-				setTimeout(() => requestRealtimeStateAfterReconnect('connect-auth-retry'), 2200);
-			} else {
-				setTimeout(() => requestRealtimeStateAfterReconnect('connect'), 500);
+			}
+			if (profileRealtimeConnectionWasLost) {
+				setTimeout(() => {
+					if (!socketChat || !socketChat.connected) return;
+					const syncName = localStorage.getItem('psn_username') || '';
+					if (!syncName || syncName === 'null' || syncName === 'undefined') return;
+					if (typeof socketChat.timeout === 'function') {
+						socketChat.timeout(2500).emit('presence_ping', { reason: 'reconnect', at: Date.now() }, () => {});
+					} else {
+						socketChat.emit('presence_ping', { reason: 'reconnect', at: Date.now() });
+					}
+					socketChat.emit('request_online_list');
+					if (window.isProfileLoaded) socketChat.emit('request_profile_sync', { forceRefresh: true, reason: 'reconnect', at: Date.now() });
+					profileRealtimeConnectionWasLost = false;
+				}, 500);
 			}
 			
 			const s = document.getElementById('chat-status-text');
@@ -36942,7 +36946,12 @@ function getVisibleChatStackEl(id) {
 			const hasLoggedSocket = !!(window.isProfileLoaded && myChatNameForPresence && myChatNameForPresence !== 'null' && socketChat && socketChat.connected);
 			if (users.length === 0 && hasLoggedSocket) {
 				console.warn('[NETWORK] Ignored empty online_list while this client is connected. Requesting presence refresh.');
-				scheduleRealtimeStateRefresh('empty-online-list');
+				if (typeof socketChat.timeout === 'function') {
+					socketChat.timeout(2500).emit('presence_ping', { reason: 'empty-online-list', at: Date.now() }, () => {});
+				} else {
+					socketChat.emit('presence_ping', { reason: 'empty-online-list', at: Date.now() });
+				}
+				socketChat.emit('request_online_list');
 				return;
 			}
 
@@ -37799,6 +37808,7 @@ function getVisibleChatStackEl(id) {
 	
 		socketChat.on('connect_error', () => {
 			if (typeof isKicked !== 'undefined' && isKicked) return;
+			profileRealtimeConnectionWasLost = true;
 			
 			if (typeof updateGlobalOnlineStatus === 'function') updateGlobalOnlineStatus('connecting');
 			const s = document.getElementById('chat-status-text');
@@ -37813,8 +37823,9 @@ function getVisibleChatStackEl(id) {
 			}
 		});
 	
-		socketChat.on('disconnect', () => {
+		socketChat.on('disconnect', (reason) => {
 			if (typeof isKicked !== 'undefined' && isKicked) return;
+			if (reason !== 'io client disconnect') profileRealtimeConnectionWasLost = true;
 			
 			if (typeof updateGlobalOnlineStatus === 'function') updateGlobalOnlineStatus('offline');
 			const s = document.getElementById('chat-status-text');
@@ -37827,11 +37838,9 @@ function getVisibleChatStackEl(id) {
 			});
 			socketChat.io.on('reconnect', () => {
 				if (typeof updateGlobalOnlineStatus === 'function') updateGlobalOnlineStatus('online');
-				scheduleRealtimeStateRefresh('reconnect');
 			});
 		}
 
-		installRealtimeResumeHandlers();
 	}
 
 	window.refreshChatNotificationDot = function() {
