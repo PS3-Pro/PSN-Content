@@ -718,6 +718,12 @@ select option { background-color: var(--bg-dark); }
 .promo-card h3 { margin: 0 0 10px 0; font-size: 18px; z-index: 2; font-weight: 700; color: #1a1a1a; text-transform: uppercase; }
 .promo-card p { margin: 0 0 20px 0; font-size: 13px; color: #333; z-index: 2; line-height: 1.4; font-weight: 600; }
 .promo-card .btn-buy { background: rgba(0, 0, 0, 0.1); color: #000; border: 1px solid rgba(0, 0, 0, 0.2); padding: 8px 15px; border-radius: 20px; font-weight: bold; font-size: 12px; align-self: flex-start; z-index: 2; cursor: pointer; transition: 0.2s; }
+.license-pack-title-row { z-index: 2; display: flex; align-items: center; justify-content: space-between; gap: 10px; margin: 0 0 10px 0; }
+.license-pack-title-row h3 { margin: 0; min-width: 0; }
+.license-pack-count-pill { flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center; gap: 5px; min-height: 22px; padding: 0 9px; border-radius: 999px; background: linear-gradient(180deg, rgba(0, 0, 0, 0.06), rgba(0, 0, 0, 0.16)); border: 1px solid rgba(0, 0, 0, 0.18); color: #1a1a1a; font-size: 9px; font-weight: 900; letter-spacing: 0.6px; line-height: 1; text-transform: uppercase; white-space: nowrap; box-shadow: inset 0 1px 0 rgba(255,255,255,0.30), 0 2px 8px rgba(0,0,0,0.10); backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px); }
+.license-pack-count-pill i { font-size: 8px; color: #1a1a1a; opacity: 0.78; }
+.license-pack-count-value { display: inline-block; min-width: 0; }
+.license-pack-count-pill.is-loading .license-pack-count-value { min-width: 22px; height: 7px; border-radius: 999px; color: transparent; background: linear-gradient(90deg, rgba(0,0,0,.14), rgba(0,0,0,.34), rgba(0,0,0,.14)); background-size: 220% 100%; animation: revivedPlayerSkeleton .95s ease-in-out infinite; }
 .promo-card:hover .btn-buy { background: #000; color: #fff; }
 .promo-card-dark { background: linear-gradient(135deg, #00439c 0%, #0070cc 100%); border: 1px solid rgba(255, 255, 255, 0.05); border-radius: 12px; padding: 20px; display: flex; flex-direction: column; gap: 15px; cursor: pointer; transition: all 0.3s ease; position: relative; overflow: hidden; }
 .promo-card-dark:hover { background: linear-gradient(135deg, #0056a3 0%, #0088ff 100%); border-color: rgba(255, 255, 255, 0.2); transform: translateY(-4px); box-shadow: 0 10px 25px rgba(0, 112, 204, 0.5); }
@@ -7209,7 +7215,10 @@ body.chat-selection-mode .chat-message-actions .chat-delete-action:hover { trans
 						</div>
 						<div class="promo-card" onmouseenter="playUiHover()">
 							<i class="fas fa-plus promo-icon" style="right: -10px;"></i>
-							<h3>License Pack</h3>
+							<div class="license-pack-title-row">
+								<h3>License Pack</h3>
+								<span class="license-pack-count-pill is-loading" data-license-pack-count-pill title="Loading license file count"><i class="fas fa-key"></i><span class="license-pack-count-value" data-license-pack-count>…</span></span>
+							</div>
 							<p>Get the latest license pack that unlocks all digital content on your console.</p>
 								<button class="btn-buy" onclick="playUiClick(); checkTrophyProgress('unlock_all', 1); smartDownload(event, 'promo', 'https://github.com/PS3-Pro/License-Files/releases/download/Licenses/License_Pack_Bin.pkg', 'License Pack', '', this)">DOWNLOAD NOW</button>
 						</div>
@@ -14097,6 +14106,7 @@ P
     }
 
     const PROXY_URL = "https://proxy.ps3-pro.workers.dev/";
+    const LICENSE_PACK_STATS_URL = "https://raw.githubusercontent.com/PS3-Pro/License-Files/main/.github/stats.json";
     const BASE_OFFICIAL = "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/database/content/official";
     const BASE_UNOFFICIAL = "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/database/content/unofficial";
     const BASE_LATEST = "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/database/content/latest";
@@ -14135,6 +14145,55 @@ P
         coversLoaded: false, noCovers: new Set(), covers: new Set(),
         dlcs: new Set(), avatars: new Set(), updates: new Set()
     };
+
+    	function formatLicensePackCount(value) {
+    		const count = Number(value);
+    		if (!Number.isFinite(count) || count <= 0) return '';
+    		try {
+    			return count.toLocaleString('pt-BR');
+    		} catch (e) {
+    			return String(Math.round(count)).replace(/\B(?=(\d{3})+(?!\d))/g, '.');
+    		}
+    	}
+
+    	function applyLicensePackStats(stats) {
+    		if (!stats || typeof stats !== 'object') return false;
+    		const label = String(stats.label || formatLicensePackCount(stats.quantity) || '').trim();
+    		if (!label) return false;
+
+    		document.querySelectorAll('[data-license-pack-count-pill]').forEach(pill => {
+    			const valueEl = pill.querySelector('[data-license-pack-count]');
+    			if (valueEl) valueEl.textContent = label;
+    			pill.classList.remove('is-loading', 'is-error');
+    			pill.classList.add('has-value');
+    			pill.title = stats.date ? `${label} license files • Updated ${stats.date}` : `${label} license files`;
+    		});
+    		return true;
+    	}
+
+    	async function loadLicensePackStats() {
+    		const pills = document.querySelectorAll('[data-license-pack-count-pill]');
+    		if (!pills.length || typeof fetch !== 'function') return;
+
+    		try {
+    			const res = await fetch(LICENSE_PACK_STATS_URL, { cache: 'no-store' });
+    			if (!res.ok) throw new Error('License stats unavailable');
+    			const stats = await res.json();
+    			if (!applyLicensePackStats(stats)) throw new Error('Invalid license stats');
+    		} catch (e) {
+    			pills.forEach(pill => {
+    				pill.classList.remove('is-loading');
+    				pill.classList.add('is-error');
+    				pill.style.display = 'none';
+    			});
+    		}
+    	}
+
+    	if (document.readyState === 'loading') {
+    		document.addEventListener('DOMContentLoaded', () => loadLicensePackStats(), { once: true });
+    	} else {
+    		loadLicensePackStats();
+    	}
 
     let currentData = [];
 	window.psnStoreCache = {};
