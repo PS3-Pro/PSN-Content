@@ -14378,12 +14378,27 @@ P
         if (onComplete) onComplete();
     }
 
-    async function loadBackgroundIndexes(priority = 'high') {
-        if (sysData.coversLoaded && sysData.covers.size > 0) return;
-        if (bootBackgroundIndexesPromise) return bootBackgroundIndexesPromise;
+    async function loadBackgroundIndexes(priority = 'high', options = {}) {
+        const forceRefresh = !!(options && options.forceRefresh);
+
+        if (!forceRefresh && sysData.coversLoaded && sysData.covers.size > 0) return;
+        if (!forceRefresh && bootBackgroundIndexesPromise) return bootBackgroundIndexesPromise;
+
+        if (forceRefresh && bootBackgroundIndexesPromise) {
+            try { await bootBackgroundIndexesPromise; } catch (e) {}
+            bootBackgroundIndexesPromise = null;
+        }
+
+        if (forceRefresh) {
+            sysData.coversLoaded = false;
+            sysData.noCovers.clear();
+            sysData.covers.clear();
+        }
 
         bootBackgroundIndexesPromise = (async () => {
             console.log("[System] Loading cover indexes...");
+            const cacheBust = forceRefresh ? (`?t=${Date.now()}`) : '';
+            const fetchOptions = forceRefresh ? { cache: 'no-store' } : undefined;
             const fetchList = [
                 { url: "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/database/covers/blacklist.tsv", target: sysData.noCovers },
                 { url: "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/database/covers/index.tsv", target: sysData.covers, onComplete: () => sysData.coversLoaded = true }
@@ -14391,7 +14406,7 @@ P
 
             await Promise.all(fetchList.map(async item => {
                 try {
-                    const res = await fetch(item.url);
+                    const res = await fetch(item.url + cacheBust, fetchOptions);
                     const text = res.ok ? await res.text() : "";
                     await addIndexLinesToSet(text, item.target, item.onComplete, priority);
                 } catch (e) {
@@ -14418,13 +14433,15 @@ P
 		`;
 	
 		let latestItems = [];
+		const forceRefresh = !!(options && options.forceRefresh);
 	
-		if (exploreCache[cat]) {
+		if (!forceRefresh && exploreCache[cat]) {
 			latestItems = exploreCache[cat];
 		} else {
 			try {
-				const url = `${BASE_LATEST}/latest_${cat}.tsv`;
-				const res = await fetch(url);
+				const cacheBust = forceRefresh ? (`?t=${Date.now()}`) : '';
+				const url = `${BASE_LATEST}/latest_${cat}.tsv${cacheBust}`;
+				const res = await fetch(url, forceRefresh ? { cache: 'no-store' } : undefined);
 				
 				if (!res.ok) throw new Error("Latest file not found");
 				
@@ -16264,15 +16281,24 @@ P
 		return data;
 	}
 
-	async function loadStoreCategoryData(cat, priority = 'high') {
-		if (psnStoreRenderCache[cat]) return psnStoreRenderCache[cat];
-		if (psnStoreRenderPromises[cat]) return psnStoreRenderPromises[cat];
+	async function loadStoreCategoryData(cat, priority = 'high', options = {}) {
+		const forceRefresh = !!(options && options.forceRefresh);
+		if (forceRefresh) {
+			delete psnStoreRenderCache[cat];
+			if (window.psnStoreCache) delete window.psnStoreCache[cat];
+			psnStoreRenderPromises[cat] = null;
+		}
+
+		if (!forceRefresh && psnStoreRenderCache[cat]) return psnStoreRenderCache[cat];
+		if (!forceRefresh && psnStoreRenderPromises[cat]) return psnStoreRenderPromises[cat];
 
 		psnStoreRenderPromises[cat] = (async () => {
 			const paths = DB_PATHS[cat] || [];
+			const cacheBust = forceRefresh ? (`t=${Date.now()}`) : '';
 			const texts = await Promise.all(paths.map(async url => {
 				try {
-					const res = await fetch(url);
+					const requestUrl = forceRefresh ? `${url}${url.includes('?') ? '&' : '?'}${cacheBust}` : url;
+					const res = await fetch(requestUrl, forceRefresh ? { cache: 'no-store' } : undefined);
 					return res.ok ? await res.text() : "";
 				} catch (err) {
 					console.warn('[System] Store category fetch failed:', cat, url, err);
@@ -16334,9 +16360,14 @@ P
     }
 
 	async function prefetchEssentialDbs(options = {}) {
+		const forceRefresh = !!(options && options.forceRefresh);
 		if (options.priority === 'high') window.__bootStorePrefetchHighPriority = true;
-		if (window.psnStorePrefetchReady) return window.psnStoreCache;
-		if (bootEssentialDbsPromise) return bootEssentialDbsPromise;
+		if (forceRefresh) {
+			window.psnStorePrefetchReady = false;
+			bootEssentialDbsPromise = null;
+		}
+		if (!forceRefresh && window.psnStorePrefetchReady) return window.psnStoreCache;
+		if (!forceRefresh && bootEssentialDbsPromise) return bootEssentialDbsPromise;
 
 		bootEssentialDbsPromise = (async () => {
 			const essential = Object.keys(DB_PATHS);
@@ -16348,9 +16379,9 @@ P
 			await Promise.all(essential.map(async cat => {
 				window.psnStorePrefetchProgress.category = cat;
 
-				if (!psnStoreRenderCache[cat]) {
+				if (forceRefresh || !psnStoreRenderCache[cat]) {
 					try {
-						const parsedItems = await loadStoreCategoryData(cat, isHighPriority() ? 'high' : 'low');
+						const parsedItems = await loadStoreCategoryData(cat, isHighPriority() ? 'high' : 'low', { forceRefresh });
 						console.log(`[System] Cache populated: ${cat} (${parsedItems.length} items)`);
 					} catch(e) {
 						console.warn("[System] Prefetch failed for: " + cat, e);
@@ -22997,7 +23028,11 @@ P
 		}
 	
 		console.log("[System] Starting boot cache jobs in background...");
-		if (typeof startBootPreloads === 'function') startBootPreloads('dom-ready');
+		if (typeof startBootPreloads === 'function') {
+			startBootPreloads('dom-ready').then(() => {
+				if (typeof updateSyncTimestamp === 'function') updateSyncTimestamp();
+			}).catch(e => console.warn('[System] Boot sync timestamp update skipped.', e));
+		}
 	
 		renderLetterFilter();
 		
@@ -23365,14 +23400,37 @@ P
 		btn.disabled = true;
 		btn.innerHTML = '<i class="fas fa-sync-alt fa-spin"></i> UPDATING...';
 	
+		if (window.__bootPreloadsReadyPromise) {
+			try { await window.__bootPreloadsReadyPromise; } catch (e) {}
+		}
+		if (bootEssentialDbsPromise) {
+			try { await bootEssentialDbsPromise; } catch (e) {}
+		}
+	
 		exploreCache = { games: null, dlcs: null, avatars: null, demos: null };
 		currentData = []; 
 		navHistory = null;
+		bootExploreWarmPromise = null;
+		window.__exploreWarmedBeforeLogin = false;
+		window.psnStorePrefetchReady = false;
+		window.psnStoreCache = {};
+		Object.keys(psnStoreRenderCache).forEach(key => delete psnStoreRenderCache[key]);
+		Object.keys(psnStoreRenderPromises).forEach(key => psnStoreRenderPromises[key] = null);
+		bootEssentialDbsPromise = null;
+		window.__bootPreloadsStarted = false;
+		window.__bootPreloadsReadyPromise = null;
+		sysData.dlcs.clear();
+		sysData.avatars.clear();
+		sysData.updates.clear();
 		
 		try {
-			await loadBackgroundIndexes(); 
-			await populateExploreTab(); 
-	
+			await loadBackgroundIndexes('high', { forceRefresh: true });
+			await Promise.all([
+				prefetchEssentialDbs({ priority: 'high', forceRefresh: true }),
+				populateExploreTab({ forceRefresh: true })
+			]);
+
+			if (typeof fetchDatabase === 'function') await fetchDatabase();
 			updateSyncTimestamp();
 			playUiSuccess();
 			
