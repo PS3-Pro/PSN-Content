@@ -74,7 +74,7 @@ input,textarea,[contenteditable="true"],[contenteditable="true"] * { cursor: tex
 @media (max-width: 768px) { .chat-toolbar-divider { height: 16px; margin: 0 2px; } }
 .chat-translated-tag { display: inline !important; margin-left: 0 !important; font-size: 10px !important; line-height: 1 !important; color: rgba(255,255,255,.48) !important; font-style: italic !important; font-weight: 400 !important; white-space: nowrap !important; vertical-align: baseline !important; }
 .chat-edited-tag, .chat-translated-tag { font-size: 10px !important; line-height: 1 !important; vertical-align: baseline !important; font-style: italic !important; font-weight: 400 !important; color: rgba(255,255,255,.48) !important; white-space: nowrap !important; }
-#chat-input ul, #chat-input ol, [id^="msg-text-"] ul, [id^="msg-text-"] ol { margin: 0 !important; margin-block-start: 0 !important; margin-block-end: 0 !important; padding-left: 22px; }
+#chat-input ul, #chat-input ol, [id^="msg-text-"] ul, [id^="msg-text-"] ol { display: inline-block; vertical-align: top; margin: 0 !important; margin-block-start: 0 !important; margin-block-end: 0 !important; padding-left: 22px; }
 #chat-input li, [id^="msg-text-"] li { margin: 0 !important; padding-left: 2px; line-height: inherit; }
 .message-content ul, .message-content ol,
 .chat-message-content ul, .chat-message-content ol,
@@ -35756,6 +35756,113 @@ function getVisibleChatStackEl(id) {
 		return null;
 	}
 
+	function getChatTrimmedRangeForBulletList(input, range) {
+		if (!input || !range || !isChatRangeInsideInput(range, input) || range.collapsed) return null;
+
+		let firstNode = null;
+		let firstOffset = 0;
+		let lastNode = null;
+		let lastOffset = 0;
+
+		try {
+			const walker = document.createTreeWalker(input, 4, null);
+			let node;
+
+			while ((node = walker.nextNode())) {
+				if (!chatRangeIntersectsTextNode(range, node)) continue;
+
+				const text = node.textContent || '';
+				let start = 0;
+				let end = text.length;
+
+				if (range.startContainer === node) start = Math.max(0, Math.min(range.startOffset, end));
+				if (range.endContainer === node) end = Math.max(start, Math.min(range.endOffset, end));
+				if (end <= start) continue;
+
+				const selectedPart = text.slice(start, end);
+				const firstMatch = selectedPart.search(/[^\s\u200B]/);
+				if (firstMatch === -1) continue;
+
+				if (!firstNode) {
+					firstNode = node;
+					firstOffset = start + firstMatch;
+				}
+
+				for (let i = selectedPart.length - 1; i >= 0; i--) {
+					if (!/[\s\u200B]/.test(selectedPart.charAt(i))) {
+						lastNode = node;
+						lastOffset = start + i + 1;
+						break;
+					}
+				}
+			}
+
+			if (!firstNode || !lastNode) return null;
+
+			const trimmedRange = document.createRange();
+			trimmedRange.setStart(firstNode, firstOffset);
+			trimmedRange.setEnd(lastNode, lastOffset);
+			return trimmedRange;
+		} catch(e) {
+			return null;
+		}
+	}
+
+	function isChatBlankLineNode(node) {
+		if (!node) return false;
+		if (node.nodeType === 3) return !/[\S\u200B]/.test(node.textContent || '');
+		if (node.nodeType !== 1 || !node.tagName) return false;
+
+		const tag = node.tagName.toLowerCase();
+		if (tag === 'br') return true;
+		if (tag !== 'div' && tag !== 'p') return false;
+
+		try {
+			const text = (node.innerText || node.textContent || '').replace(/\u200B/g, '').trim();
+			if (text) return false;
+			return Array.prototype.every.call(node.childNodes, child => isChatBlankLineNode(child));
+		} catch(e) {
+			return false;
+		}
+	}
+
+	function chatElementOnlyWrapsList(wrapper, listEl) {
+		if (!wrapper || !listEl || !wrapper.tagName) return false;
+
+		const tag = wrapper.tagName.toLowerCase();
+		if (tag !== 'div' && tag !== 'p') return false;
+
+		try {
+			const meaningful = Array.prototype.filter.call(wrapper.childNodes, node => {
+				if (node === listEl) return true;
+				return !isChatBlankLineNode(node);
+			});
+
+			return meaningful.length === 1 && meaningful[0] === listEl;
+		} catch(e) {
+			return false;
+		}
+	}
+
+
+	function normalizeChatBulletListAfterInsert(input, listEl) {
+		if (!input || !listEl || !listEl.parentNode) return listEl;
+
+		let normalizedList = listEl;
+
+		try {
+			const parent = normalizedList.parentNode;
+			if (parent && parent !== input && input.contains(parent) && chatElementOnlyWrapsList(parent, normalizedList)) {
+				parent.parentNode.insertBefore(normalizedList, parent);
+				if (parent.parentNode) parent.parentNode.removeChild(parent);
+			}
+
+		} catch(e) {}
+
+
+		return normalizedList;
+	}
+
 	function removeChatBulletListElement(input, listEl, selection, preservedRange) {
 		if (!input || !listEl || !selection || listEl.tagName.toLowerCase() !== 'ul') return false;
 
@@ -35812,7 +35919,7 @@ function getVisibleChatStackEl(id) {
 		const selection = window.getSelection();
 		if (!input || !selection) return false;
 
-		const range = preferSavedRange ? getSavedChatInputRangeForToolbar(input) : (selection.rangeCount ? selection.getRangeAt(0).cloneRange() : null);
+		let range = preferSavedRange ? getSavedChatInputRangeForToolbar(input) : (selection.rangeCount ? selection.getRangeAt(0).cloneRange() : null);
 		if (!range || !isChatRangeInsideInput(range, input)) return false;
 
 		try {
@@ -35821,11 +35928,10 @@ function getVisibleChatStackEl(id) {
 
 			if (range.collapsed) return false;
 
+			const trimmedRange = getChatTrimmedRangeForBulletList(input, range);
+			if (trimmedRange && isChatRangeInsideInput(trimmedRange, input) && !trimmedRange.collapsed) range = trimmedRange;
+
 			const selectedText = range.toString().replace(/\r\n/g, '\n').replace(/\r/g, '\n');
-			const leadingBreakMatch = selectedText.match(/^(?:[ \t]*\n)+/);
-			const trailingBreakMatch = selectedText.match(/(?:\n[ \t]*)+$/);
-			const leadingBreaks = leadingBreakMatch ? (leadingBreakMatch[0].match(/\n/g) || []).length : 0;
-			const trailingBreaks = trailingBreakMatch ? (trailingBreakMatch[0].match(/\n/g) || []).length : 0;
 			const listText = selectedText.replace(/^(?:[ \t]*\n)+/, '').replace(/(?:\n[ \t]*)+$/, '');
 			const lines = listText.split(/\n+/).map(line => line.trim()).filter(Boolean);
 			if (!lines.length) return false;
@@ -35837,16 +35943,12 @@ function getVisibleChatStackEl(id) {
 				ul.appendChild(li);
 			});
 
-			const fragment = document.createDocumentFragment();
-			for (let i = 0; i < leadingBreaks; i++) fragment.appendChild(document.createElement('br'));
-			fragment.appendChild(ul);
-			for (let i = 0; i < trailingBreaks; i++) fragment.appendChild(document.createElement('br'));
-
 			range.deleteContents();
-			range.insertNode(fragment);
+			range.insertNode(ul);
+			const normalizedUl = normalizeChatBulletListAfterInsert(input, ul);
 
 			const newRange = document.createRange();
-			newRange.selectNodeContents(ul);
+			newRange.selectNodeContents(normalizedUl);
 			selection.removeAllRanges();
 			selection.addRange(newRange);
 			rememberChatInputRange(newRange, input);
@@ -36586,6 +36688,12 @@ function getVisibleChatStackEl(id) {
 			.replace(/(?:\s|<br\s*\/?>)+$/gi, '');
 	}
 
+	function limitChatBreakRun(value, maxBreaks = 2) {
+		const breaks = String(value || '').match(/<br\s*\/?>/gi) || [];
+		if (!breaks.length) return '';
+		return '<br>'.repeat(Math.min(breaks.length, maxBreaks));
+	}
+
 	function normalizeChatListSpacingHtml(value) {
 		let html = String(value || '');
 
@@ -36600,12 +36708,12 @@ function getVisibleChatStackEl(id) {
 		html = html.replace(/<p(?:\s[^>]*)?>/gi, '<br>');
 		html = html.replace(/<\/p>/gi, '');
 
-		html = html.replace(/(?:<br\s*\/?>\s*)+(?=<(?:ul|ol)\b)/gi, function(match) {
-			const count = (match.match(/<br\s*\/?>/gi) || []).length;
-			if (count <= 1) return '';
-			let result = '';
-			for (let i = 0; i < count; i++) result += '<br>';
-			return result;
+		html = html.replace(/((?:<br\s*\/?>\s*)+)(?=<(?:ul|ol)\b)/gi, function(match) {
+			return limitChatBreakRun(match, 2);
+		});
+
+		html = html.replace(/<\/(ul|ol)>\s*((?:<br\s*\/?>\s*)+)(?=\S|<(?!br\b))/gi, function(match, tag, breaks) {
+			return '</' + tag + '>' + limitChatBreakRun(breaks, 2);
 		});
 
 		return trimChatOuterBreaks(html);
