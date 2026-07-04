@@ -32871,6 +32871,16 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
     window.__chatHistoryRequesting = false;
     window.__lastChatHistoryRequestAt = 0;
     window.__chatRenderLastReadSnapshot = null;
+    window.__chatPresenceUiStableDelay = 900;
+    window.__chatPresenceAvatarHydrationDelay = 1400;
+    window.__chatPresenceAvatarHydrationBlockedUntil = 0;
+
+    function markChatUiStableAfterRender() {
+        const now = Date.now();
+        window.__chatUiStableAt = now;
+        window.__chatPresenceAvatarHydrationBlockedUntil = now + (Number(window.__chatPresenceAvatarHydrationDelay || 1400));
+    }
+    window.markChatUiStableAfterRender = markChatUiStableAfterRender;
 
     function restoreVisibleChatBoxFromDetachedRender() {
         const visibleBox = document.getElementById('chat-messages-visible-rendering');
@@ -32886,7 +32896,8 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
         visibleBox.style.opacity = '1';
         window.__chatLazyRenderPromise = null;
         window.__chatHistoryDomRendered = true;
-        window.__chatUiStableAt = Date.now();
+        if (typeof markChatUiStableAfterRender === 'function') markChatUiStableAfterRender();
+        else window.__chatUiStableAt = Date.now();
         if (typeof updateChatHistoryRenderSignature === 'function') updateChatHistoryRenderSignature();
         if (typeof flushPendingChatPresenceUiRefresh === 'function') flushPendingChatPresenceUiRefresh();
         return true;
@@ -32931,7 +32942,8 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
         if (typeof isChatScreenVisibleForRead !== 'function' || !isChatScreenVisibleForRead()) return true;
         if (typeof isChatLiveUiReady === 'function' && !isChatLiveUiReady()) return false;
         const stableAt = Number(window.__chatUiStableAt || 0);
-        if (!stableAt || Date.now() - stableAt < 450) return false;
+        const stableDelay = Number(window.__chatPresenceUiStableDelay || 900);
+        if (!stableAt || Date.now() - stableAt < stableDelay) return false;
         return true;
     }
     window.isChatPresenceUiReady = isChatPresenceUiReady;
@@ -32946,6 +32958,9 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 
         const myChatName = localStorage.getItem('psn_username');
         const socketOnline = typeof socketChat !== 'undefined' && socketChat && socketChat.connected;
+        const avatarHydrationBlockedUntil = Number(window.__chatPresenceAvatarHydrationBlockedUntil || 0);
+        const isChatVisibleForPresence = typeof isChatScreenVisibleForRead === 'function' && isChatScreenVisibleForRead();
+        const canHydrateMessageAvatars = !isChatVisibleForPresence || !avatarHydrationBlockedUntil || Date.now() >= avatarHydrationBlockedUntil;
 
         document.querySelectorAll('.chat-status-dot').forEach(dot => {
             const dotUser = dot.getAttribute('data-user');
@@ -32967,7 +32982,8 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
             const uData = users.find(u => (u.name || u) === imgUser);
             const isMe = (imgUser === myChatName);
 
-            if (!isMe && uData && uData.avatar && img.src !== uData.avatar) {
+            const isMessageAvatar = !!(img.closest && img.closest('[id^="msg-row-"]'));
+            if (!isMe && uData && uData.avatar && img.src !== uData.avatar && (canHydrateMessageAvatars || !isMessageAvatar)) {
                 img.src = uData.avatar;
             }
 
@@ -32988,6 +33004,12 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 
             if (img.style.borderColor !== newBorderColor) img.style.borderColor = newBorderColor;
         });
+
+        if (!canHydrateMessageAvatars && avatarHydrationBlockedUntil) {
+            window.__pendingChatPresenceUiRefresh = true;
+            clearTimeout(window.__pendingChatPresenceUiTimer);
+            window.__pendingChatPresenceUiTimer = setTimeout(flushPendingChatPresenceUiRefresh, Math.max(180, avatarHydrationBlockedUntil - Date.now() + 60));
+        }
     }
     window.applyChatPresenceUiRefresh = applyChatPresenceUiRefresh;
 
@@ -33254,6 +33276,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
             let originalId = 'chat-messages';
             window.lastChatRawDate = "";
             window.__chatDetachedRenderingActive = true;
+            window.__chatUiStableAt = 0;
             if (shouldShowPreparingMessages && typeof hideMentionJumpButtonImmediately === 'function') hideMentionJumpButtonImmediately();
             liveBox.style.opacity = '1';
             liveBox.style.removeProperty('transition');
@@ -33323,7 +33346,8 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
                     initDateStickyLogic();
                     if (typeof scrollChatToUnreadOrBottom === 'function') scrollChatToUnreadOrBottom({ restoreSmooth: true, setupDivider: true });
                     window.__chatHistoryDomRendered = true;
-                    window.__chatUiStableAt = Date.now();
+                    if (typeof markChatUiStableAfterRender === 'function') markChatUiStableAfterRender();
+                    else window.__chatUiStableAt = Date.now();
                     updateChatHistoryRenderSignature();
                     window.__chatRenderLastReadSnapshot = null;
                     liveBox.style.opacity = '1';
@@ -38793,7 +38817,8 @@ function getVisibleChatStackEl(id) {
 		socketChat.on('global_search_results', function(results) {
 			window.globalSearchResults = results;
 			const mentionDbChanged = (typeof mergeChatMentionDatabaseUsers === 'function') ? mergeChatMentionDatabaseUsers(results) : false;
-			if (mentionDbChanged && typeof scheduleChatHistorySoftRerender === 'function') {
+			const chatVisibleForMentionResults = typeof isChatScreenVisibleForRead === 'function' && isChatScreenVisibleForRead();
+			if (mentionDbChanged && typeof scheduleChatHistorySoftRerender === 'function' && !chatVisibleForMentionResults) {
 				scheduleChatHistorySoftRerender('mention-database-results', true);
 			}
 			if (mentionDbChanged && typeof refreshMentionJumpButton === 'function') {
