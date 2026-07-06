@@ -313,6 +313,16 @@ select option { background-color: var(--bg-dark); }
 .action-btn:hover { background: var(--ps-blue); box-shadow: 0 0 10px var(--ps-neon); transform: translateY(-2px); }
 .back-btn { background: var(--ps-blue); color: white; border: none; padding: 8px 15px; border-radius: 6px; cursor: pointer; display: inline-flex; align-items: center; gap: 8px; transition: 0.2s; font-weight: bold; margin-bottom: 15px; }
 .back-btn:hover { box-shadow: 0 0 15px var(--ps-neon); transform: scale(1.02); }
+.download-all-btn { background: rgba(76, 175, 80, 0.16); color: #ffffff; border: 1px solid rgba(115, 255, 154, 0.55); padding: 8px 15px; border-radius: 6px; cursor: pointer; display: inline-flex; align-items: center; justify-content: center; gap: 8px; transition: 0.2s; font-weight: 800; font-size: 12px; letter-spacing: .35px; white-space: nowrap; box-shadow: 0 0 14px rgba(76, 175, 80, 0.08); }
+.download-all-btn:hover { background: rgba(76, 175, 80, 0.35); border-color: rgba(115, 255, 154, 0.9); box-shadow: 0 0 15px rgba(76, 175, 80, 0.28); transform: scale(1.02); }
+.download-all-btn:disabled, .download-all-btn.is-running { opacity: .72; pointer-events: none; transform: none !important; }
+.browse-nav-actions { display: flex; align-items: center; justify-content: flex-end; gap: 8px; margin-left: 10px; }
+@media (max-width: 768px) {
+	.browse-nav-return-bar { flex-wrap: wrap; gap: 8px; padding: 6px 8px !important; }
+	.browse-nav-return-bar .back-btn { flex: 1 1 auto; min-width: 0; justify-content: center; }
+	.browse-nav-actions { flex: 0 0 auto; margin-left: auto; }
+	.download-all-btn { padding: 8px 12px; font-size: 11px; }
+}
 
 
 .browse-title-main { display:inline-flex; align-items:baseline; flex-wrap:nowrap; gap:0; min-width:0; }
@@ -15182,6 +15192,235 @@ P
 		}
 	};
 
+	function getBulkDownloadSafeName(game) {
+		return String((game && (game.cleanName || game.title || game.name || game.id)) || 'Download')
+			.trim() || 'Download';
+	}
+
+	function getBulkPkgDownloadType(game) {
+		const url = String((game && game.url) || '').trim();
+		if (!url || url === 'MISSING') return '';
+		if (url.toLowerCase().endsWith('.xml')) return 'xml';
+		if (url.indexOf('|') !== -1) return 'multi';
+		return 'single';
+	}
+
+	function hasValidRapDownload(game) {
+		return !!(game && game.rap && game.rap !== 'MISSING' && game.rap !== 'NOT REQUIRED' && game.contentId && game.contentId !== 'MISSING');
+	}
+
+	function getCurrentDlcBulkDownloadItems() {
+		const catSelect = document.getElementById('cat-select');
+		const currentCat = catSelect ? catSelect.value : '';
+		if (currentCat !== 'dlcs' || !Array.isArray(filteredData)) return [];
+		return filteredData.filter(game => game && getBulkPkgDownloadType(game));
+	}
+
+	window.getDlcBulkDownloadStats = function() {
+		const items = getCurrentDlcBulkDownloadItems();
+		return {
+			pkgCount: items.length,
+			rapCount: items.filter(hasValidRapDownload).length
+		};
+	};
+
+	function triggerBulkDirectLink(href, downloadName) {
+		const a = document.createElement('a');
+		a.href = href;
+		if (downloadName) a.download = downloadName;
+		a.rel = 'noreferrer';
+		document.body.appendChild(a);
+		a.click();
+		setTimeout(() => { if (document.body.contains(a)) document.body.removeChild(a); }, 2000);
+	}
+
+	function waitBulkDownloadStep(ms) {
+		return new Promise(resolve => setTimeout(resolve, ms));
+	}
+
+	function getBulkVersionSuffix(version) {
+		return (version && version !== 'N/A') ? '_-_Update_v' + String(version).replace(/v/gi, '').replace(/\s/g, '') : '';
+	}
+
+	async function downloadBulkPkgToDevice(game, category) {
+		const type = getBulkPkgDownloadType(game);
+		const safeName = getBulkDownloadSafeName(game);
+		const version = game.version || '';
+		const sizeBytes = game.sizeBytes || 0;
+		const titleId = game.id || game.titleId || '';
+		const contentId = game.contentId || '';
+
+		if (type === 'xml') {
+			try {
+				const proxyBypassUrl = 'https://corsproxy.io/?' + encodeURIComponent(game.url);
+				const response = await fetch(proxyBypassUrl);
+				if (!response.ok) throw new Error('Error accessing XML');
+				const xmlText = await response.text();
+				const parser = new DOMParser();
+				const xmlDoc = parser.parseFromString(xmlText, 'text/xml');
+				let pkgUrls = [];
+				const allElements = xmlDoc.getElementsByTagName('*');
+				for (let i = 0; i < allElements.length; i++) {
+					const url = allElements[i].getAttribute('url');
+					if (url && url.toLowerCase().includes('.pkg')) pkgUrls.push(url);
+				}
+				pkgUrls = [...new Set(pkgUrls)];
+				if (!pkgUrls.length) return false;
+				if (typeof window.addToDownloadManager === 'function') window.addToDownloadManager(safeName, sizeBytes, titleId, category, contentId);
+				if (pkgUrls.length === 1) {
+					triggerBulkDirectLink(buildProxyLink(pkgUrls[0], safeName, version));
+				} else {
+					downloadBulkMultiPartsToDevice(pkgUrls.join('|'), safeName, version);
+				}
+				return true;
+			} catch (err) {
+				console.error('Failed to process bulk XML download:', err);
+				return false;
+			}
+		}
+
+		if (type === 'multi') {
+			if (typeof window.addToDownloadManager === 'function') window.addToDownloadManager(safeName, sizeBytes, titleId, category, contentId);
+			downloadBulkMultiPartsToDevice(game.url, safeName, version);
+			return true;
+		}
+
+		if (typeof window.addToDownloadManager === 'function') window.addToDownloadManager(safeName, sizeBytes, titleId, category, contentId);
+		triggerBulkDirectLink(buildProxyLink(game.url, safeName, version));
+		return true;
+	}
+
+	function downloadBulkMultiPartsToDevice(urls, safeName, version) {
+		const parts = String(urls || '').split('|').filter(Boolean);
+		const versionSuffix = getBulkVersionSuffix(version);
+		const baseName = safeName.replace(/[^a-z0-9]/gi, '_').replace(/_{2,}/g, '_').replace(/^_|_$/g, '') || 'Download';
+		parts.forEach((partUrl, index) => {
+			setTimeout(() => {
+				const partFileName = baseName + versionSuffix + '_-_Part_' + (index + 1) + '.pkg';
+				const finalLink = PROXY_URL + '?url=' + encodeURIComponent(partUrl) + '&name=' + encodeURIComponent(partFileName);
+				triggerBulkDirectLink(finalLink);
+			}, 100 + (index * 1200));
+		});
+	}
+
+	function downloadBulkRapToDevice(game) {
+		if (!hasValidRapDownload(game)) return false;
+		const contentId = String(game.contentId || '').trim();
+		triggerBulkDirectLink('https://ps3-pro.github.io/License-Files/files/' + contentId + '.rap', contentId + '.rap');
+		return true;
+	}
+
+	function sendBulkDownloadToPs3(game, jobKind, ip, category) {
+		const type = getBulkPkgDownloadType(game);
+		let webmanCmd = '';
+
+		if (jobKind === 'rap') {
+			const finalUrl = 'https://ps3-pro.github.io/License-Files/files/' + game.contentId + '.rap';
+			webmanCmd = 'http://' + ip + '/xmb.ps3/download.ps3?to=/dev_hdd0/exdata/&url=' + encodeURIComponent(finalUrl);
+		} else if (type === 'xml') {
+			webmanCmd = 'http://' + ip + '/browser.ps3?https://ps3-pro.github.io/PSN-Content/resources/interface/classic/images/backgrounds/transparent.html;/install.ps3?url=' + encodeURIComponent(game.url);
+		} else if (type === 'multi') {
+			const workerUrl = 'http://xml-generator.ps3-pro.workers.dev/';
+			const manifestUrl = workerUrl + 'id/' + (game.id || game.titleId || '') + '/' + category + '.xml';
+			webmanCmd = 'http://' + ip + '/browser.ps3?https://ps3-pro.github.io/PSN-Content/resources/interface/classic/images/backgrounds/transparent.html;/install.ps3?url=' + encodeURIComponent(manifestUrl);
+		} else {
+			webmanCmd = 'http://' + ip + '/browser.ps3?https://ps3-pro.github.io/PSN-Content/resources/interface/classic/images/backgrounds/transparent.html;/install.ps3?url=' + encodeURIComponent(game.url);
+		}
+
+		if (!webmanCmd) return false;
+		fetch(webmanCmd, { mode: 'no-cors' }).catch(() => {});
+		return true;
+	}
+
+	window.downloadAllCurrentDlcPage = async function(event, btnElement) {
+		if (event) {
+			event.preventDefault();
+			event.stopPropagation();
+		}
+		if (typeof playUiClick === 'function') playUiClick();
+
+		const catSelect = document.getElementById('cat-select');
+		const currentCat = catSelect ? catSelect.value : '';
+		const items = getCurrentDlcBulkDownloadItems();
+		const stats = window.getDlcBulkDownloadStats ? window.getDlcBulkDownloadStats() : { pkgCount: 0, rapCount: 0 };
+
+		if (currentCat !== 'dlcs' || !items.length) {
+			if (typeof showNotification === 'function') showNotification('No DLC downloads found on this page.', 'warning');
+			else alert('No DLC downloads found on this page.');
+			return;
+		}
+
+		const pkgLabel = stats.pkgCount + ' PKG' + (stats.pkgCount === 1 ? '' : 's');
+		const rapLabel = stats.rapCount ? ' and ' + stats.rapCount + ' RAP' + (stats.rapCount === 1 ? '' : 's') : '';
+		const confirmMsg = 'Download ' + pkgLabel + rapLabel + ' from this page?\n\nDownloads will start in a queue. If the browser asks to allow multiple downloads, click Allow.';
+		if (!confirm(confirmMsg)) {
+			if (typeof playUiBack === 'function') playUiBack();
+			return;
+		}
+
+		const ipInput = document.getElementById('ps3-ip');
+		const ip = ipInput ? ipInput.value.trim() : '';
+		const globalIcon = document.getElementById('global-status-icon');
+		const isConnected = globalIcon && globalIcon.classList.contains('status-dot-connected');
+		const hasRemoteBlockedLink = items.some(game => /dropbox\.com|dropboxusercontent\.com/i.test(String(game.url || '')));
+		let target = 'pc';
+
+		if (isConnected && ip && !hasRemoteBlockedLink) {
+			if (confirm('PS3™ is connected!\n\nSend this Download All queue directly to the console?\n\n[OK] = Download on PS3™\n[Cancel] = Download on this device')) {
+				target = 'ps3';
+			}
+		} else if (isConnected && hasRemoteBlockedLink && typeof showNotification === 'function') {
+			showNotification('Some links cannot be sent remotely. Downloading on this device instead.', 'info');
+		}
+
+		const originalHtml = btnElement ? btnElement.innerHTML : '';
+		if (btnElement) {
+			btnElement.disabled = true;
+			btnElement.classList.add('is-running');
+			btnElement.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Queueing...';
+		}
+
+		try {
+			let queuedPkgs = 0;
+			let queuedRaps = 0;
+			const stepDelay = target === 'ps3' ? 450 : 850;
+
+			for (const game of items) {
+				if (target === 'ps3') {
+					if (sendBulkDownloadToPs3(game, 'pkg', ip, currentCat)) queuedPkgs++;
+				} else if (await downloadBulkPkgToDevice(game, currentCat)) {
+					queuedPkgs++;
+				}
+				await waitBulkDownloadStep(stepDelay);
+
+				if (hasValidRapDownload(game)) {
+					if (target === 'ps3') {
+						if (sendBulkDownloadToPs3(game, 'rap', ip, currentCat)) queuedRaps++;
+					} else if (downloadBulkRapToDevice(game)) {
+						queuedRaps++;
+					}
+					await waitBulkDownloadStep(stepDelay);
+				}
+			}
+
+			if (typeof showToastNotification === 'function') {
+				const targetLabel = target === 'ps3' ? 'PS3™' : 'this device';
+				showToastNotification('Download All queued', queuedPkgs + ' PKG' + (queuedPkgs === 1 ? '' : 's') + (queuedRaps ? ' and ' + queuedRaps + ' RAP' + (queuedRaps === 1 ? '' : 's') : '') + ' sent to ' + targetLabel + '.');
+			}
+			if (typeof playUiSuccess === 'function') playUiSuccess();
+		} finally {
+			if (btnElement) {
+				btnElement.innerHTML = '<i class="fas fa-check"></i> Queued';
+				setTimeout(() => {
+					btnElement.disabled = false;
+					btnElement.classList.remove('is-running');
+					btnElement.innerHTML = originalHtml || '<i class="fas fa-download"></i> Download All';
+				}, 2200);
+			}
+		}
+	};
+
+
     window.downloadAllParts = function(urls, safeName, version) {
 		const parts = urls.split('|');
 		const cleanVer = (version && version !== "N/A") ? version.replace(/v/gi, '').replace(/\s/g, '') : "";
@@ -17283,9 +17522,12 @@ P
 						<button type="button" class="back-btn" onmouseenter="playUiHover()" onclick="restorePreviousState()" style="margin: 0;">
 							<i class="fas fa-arrow-left"></i> Go back to ${prevLabel}
 						</button>
-						<button type="button" title="Dismiss navigation" onmouseenter="playUiHover()" onclick="dismissBrowseNavigation(event); return false;" style="background: transparent; border: none; color: rgba(255,255,255,0.4); cursor: pointer; font-size: 18px; padding: 5px 10px; transition: all 0.2s ease;" onmouseover="this.style.color='#ff4444'; this.style.transform='scale(1.1)';" onmouseout="this.style.color='rgba(255,255,255,0.4)'; this.style.transform='scale(1)';">
-							<i class="fas fa-times"></i>
-						</button>
+						<div class="browse-nav-actions">
+							${(currentCat === 'dlcs' && !browseExpandedGroupTitle && typeof window.getDlcBulkDownloadStats === 'function' && window.getDlcBulkDownloadStats().pkgCount > 0) ? `<button type="button" class="download-all-btn" title="Download all DLC PKGs and RAP licenses from this page" onmouseenter="playUiHover()" onclick="downloadAllCurrentDlcPage(event, this); return false;"><i class="fas fa-download"></i> Download All</button>` : ''}
+							<button type="button" title="Dismiss navigation" onmouseenter="playUiHover()" onclick="dismissBrowseNavigation(event); return false;" style="background: transparent; border: none; color: rgba(255,255,255,0.4); cursor: pointer; font-size: 18px; padding: 5px 10px; transition: all 0.2s ease;" onmouseover="this.style.color='#ff4444'; this.style.transform='scale(1.1)';" onmouseout="this.style.color='rgba(255,255,255,0.4)'; this.style.transform='scale(1)';">
+								<i class="fas fa-times"></i>
+							</button>
+						</div>
 					</div>`;
 			}
 		}
