@@ -728,9 +728,10 @@ select option { background-color: var(--bg-dark); }
 .hero-carousel { display: flex; align-items: center; justify-content: center; gap: 15px; padding: 30px 40px 15px 40px; height: 240px; position: relative; overflow: hidden; }
 .carousel-main { flex-grow: 1; height: 100%; position: relative; overflow: visible; border-radius: 8px; }
 .carousel-track { display: flex; height: 100%; width: 100%; align-items: center; transition: transform 0.8s cubic-bezier(0.4, 0, 0.2, 1); }
-#carousel-track { display: flex; height: 100%; width: 100%; align-items: center; will-change: transform; transform: translateX(-73.75%); }
-.hero-slide { flex: 0 0 80%; width: 80%; height: 85%; margin: 0 1.25%; background-size: cover; background-position: center; filter: blur(3px) brightness(0.6); border-radius: 12px; transition: opacity 0.6s, filter 0.6s, transform 0.6s cubic-bezier(0.4, 0, 0.2, 1); opacity: 1; display: flex; align-items: flex-end; padding: 40px; box-sizing: border-box; align-self: center; }
-.hero-slide.active-slide { opacity: 1; filter: brightness(1) blur(0); height: 100%; transform: scale(1); box-shadow: 0 10px 10px rgba(0, 0, 0, 0.1); z-index: 5; }
+#carousel-track { display: flex; height: 100%; width: 100%; align-items: center; will-change: transform; transform: translate3d(-73.75%, 0, 0); }
+.hero-slide { flex: 0 0 80%; width: 80%; height: 85%; margin: 0 1.25%; background-size: cover; background-position: center; background-color: #050a14; filter: blur(3px) brightness(0.6); border-radius: 12px; transition: opacity 0.6s, filter 0.6s, transform 0.6s cubic-bezier(0.4, 0, 0.2, 1); opacity: 1; display: flex; align-items: flex-end; padding: 40px; box-sizing: border-box; align-self: center; position: relative; overflow: hidden; transform: translateZ(0); backface-visibility: hidden; contain: paint; }
+.hero-slide-img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; z-index: 0; pointer-events: none; opacity: 1; transform: translateZ(0); backface-visibility: hidden; }
+.hero-slide.active-slide { opacity: 1; filter: brightness(1) blur(0); height: 100%; transform: scale(1) translateZ(0); box-shadow: 0 10px 10px rgba(0, 0, 0, 0.1); z-index: 5; }
 .hero-slide:not(.active-slide) .hero-content { display: none; }
 .carousel-side { position: absolute; top: 55%; transform: translateY(-50%); width: 11%; height: 82%; border-radius: 12px; display: flex; align-items: center; justify-content: center; font-size: 24px; color: rgba(255, 255, 255, 0.2); cursor: pointer; transition: all 0.3s ease; z-index: 100; }
 #side-left { left: 0px; }
@@ -12612,8 +12613,8 @@ P
 
 	const EXPLORE_VISIBLE_REVEAL_LIMIT = 36;
 	const EXPLORE_SCROLL_REVEAL_LIMIT = 18;
-	const EXPLORE_VIRTUAL_BUFFER_CARDS = 3;
-	const EXPLORE_VIRTUAL_VERTICAL_MARGIN = 260;
+	const EXPLORE_VIRTUAL_BUFFER_CARDS = 8;
+	const EXPLORE_VIRTUAL_VERTICAL_MARGIN = 420;
 	const EXPLORE_VIRTUAL_DESKTOP_CARD_WIDTH = 160;
 	const EXPLORE_VIRTUAL_MOBILE_CARD_WIDTH = 140;
 	const EXPLORE_VIRTUAL_DEFAULT_GAP = 15;
@@ -12786,8 +12787,15 @@ P
 			end = Math.min(items.length, start + visibleCount);
 			if (end === items.length) start = Math.max(0, end - visibleCount);
 		} else {
-			start = -1;
-			end = -1;
+			const currentStart = parseInt(container.dataset.exploreVirtualStart || '-1', 10);
+			const currentEnd = parseInt(container.dataset.exploreVirtualEnd || '-1', 10);
+			if (currentStart >= 0 && currentEnd >= 0) {
+				container.dataset.exploreCardsReady = '1';
+				return;
+			}
+
+			start = 0;
+			end = Math.min(items.length, getExploreVirtualVisibleCount(container, metrics) + (EXPLORE_VIRTUAL_BUFFER_CARDS * 2));
 		}
 
 		if (container.dataset.exploreVirtualStart === String(start) && container.dataset.exploreVirtualEnd === String(end)) {
@@ -24041,6 +24049,7 @@ P
     
         track.innerHTML = fullData.map((data, i) => `
             <div class="hero-slide" style="background-image: url('${data.img}')">
+                <img class="hero-slide-img" src="${data.img}" alt="${data.title}" loading="eager" decoding="async" draggable="false">
                 <div class="hero-content">
                     <h1>${data.title}</h1>
                     <p>${data.desc}</p>
@@ -24061,17 +24070,6 @@ P
 
         initHeroMobileSwipe(track);
 
-        if (track.dataset.heroScrollRepairReady !== 'true') {
-            track.dataset.heroScrollRepairReady = 'true';
-            const scrollArea = document.getElementById('scroll-area');
-            if (scrollArea) {
-                scrollArea.addEventListener('scroll', () => {
-                    if (!isTransitioning) return;
-                    if (!window.matchMedia || !window.matchMedia('(max-width: 768px)').matches) return;
-                    finishHeroTransition(true);
-                }, { passive: true });
-            }
-        }
 
         if (track.dataset.heroResizeReady !== 'true') {
             track.dataset.heroResizeReady = 'true';
@@ -24135,7 +24133,7 @@ P
         }, { passive: true });
     }
     
-	function finishHeroTransition(forceSnap = false) {
+	function finishHeroTransition() {
 		const track = document.getElementById('carousel-track');
 		if (!track) return;
 
@@ -24148,7 +24146,7 @@ P
 		const slidesCount = bannerData.length;
 		const needsLoopReset = currentIndex >= slidesCount + 1 || currentIndex <= 0;
 
-		if (forceSnap || needsLoopReset) {
+		if (needsLoopReset) {
 			track.style.transition = 'none';
 			const allSlides = document.querySelectorAll('.hero-slide');
 			allSlides.forEach(s => s.style.transition = 'none');
@@ -24200,7 +24198,7 @@ P
 			const centerAdjustment = ((100 - slideWidthPercent) / 2) - marginLeftPercent;
 			moveAmount = (currentIndex * slideUnit) - centerAdjustment;
 		}
-		track.style.transform = `translateX(-${moveAmount}%)`;
+		track.style.transform = `translate3d(-${moveAmount}%, 0, 0)`;
 	
 		let dotIndex = currentIndex - 1;
 		if (currentIndex === 0) dotIndex = bannerData.length - 1;
