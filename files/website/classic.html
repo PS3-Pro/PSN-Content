@@ -1424,6 +1424,217 @@
 		return buildBingCoverUrl(imgElement.getAttribute('data-name') || "", imgElement.getAttribute('data-console') || "ps3");
 	}
 
+	var g_psnStoreMetadataCache = {};
+	var g_psnStoreCoverEntryCache = {};
+	var g_psnStoreNoSummaryCache = {};
+
+	function classicTrim(value) {
+		return String(value === undefined || value === null ? "" : value).replace(/^\s+|\s+$/g, "");
+	}
+
+	function classicGetPsnStoreLocale(region, contentId) {
+		var cleanRegion = classicTrim(region).toUpperCase();
+		var cleanContentId = classicTrim(contentId).toUpperCase();
+		if (cleanContentId.indexOf("JP") === 0 || cleanRegion === "JP") return { country: "JP", language: "ja" };
+		if (cleanContentId.indexOf("KP") === 0 || cleanRegion === "KR") return { country: "KR", language: "ko" };
+		if (cleanContentId.indexOf("HP") === 0 || cleanContentId.indexOf("AP") === 0 || cleanRegion === "ASIA") return { country: "HK", language: "en" };
+		if (cleanContentId.indexOf("EP") === 0 || cleanRegion === "EU") return { country: "GB", language: "en" };
+		return { country: "US", language: "en" };
+	}
+
+	function classicGetPsnStoreApiUrl(titleId, contentId, region, imageOnly) {
+		var cleanContentId = classicTrim(contentId);
+		var cleanTitleId = classicTrim(titleId);
+		var identifier = (cleanContentId && cleanContentId !== "MISSING") ? cleanContentId : cleanTitleId;
+		if (!identifier) return "";
+		var locale = classicGetPsnStoreLocale(region, cleanContentId);
+		var endpoint = (cleanContentId && cleanContentId !== "MISSING") ? "container" : "titlecontainer";
+		return "https://store.playstation.com/store/api/chihiro/00_09_000/" + endpoint + "/" + locale.country + "/" + locale.language + "/999/" + encodeURIComponent(identifier) + (imageOnly ? "/image" : "");
+	}
+
+	function classicGetPsnStoreEntryKey(titleId, contentId, region) {
+		return classicGetPsnStoreApiUrl(titleId, contentId, region, false);
+	}
+
+	function classicMarkPsnStoreCoverEntry(imgElement, finalUrl) {
+		var src = String(finalUrl || (imgElement ? (imgElement.currentSrc || imgElement.src || "") : "")).toLowerCase();
+		if (src.indexOf("store.playstation.com/store/api/chihiro/") === -1) return;
+
+		var titleId = imgElement ? (imgElement.getAttribute("data-title_id") || "") : "";
+		var contentId = imgElement ? (imgElement.getAttribute("data-content_id") || "") : "";
+		var region = imgElement ? (imgElement.getAttribute("data-region") || "") : "";
+		var key = classicGetPsnStoreEntryKey(titleId, contentId, region);
+		if (key) g_psnStoreCoverEntryCache[key] = true;
+		if (imgElement && imgElement.setAttribute) imgElement.setAttribute("data-psn-store-loaded", "true");
+	}
+
+	function classicHasPsnStoreCoverEntry(titleId, contentId, region) {
+		var key = classicGetPsnStoreEntryKey(titleId, contentId, region);
+		return !!(key && g_psnStoreCoverEntryCache[key] && !g_psnStoreNoSummaryCache[key]);
+	}
+
+	function classicMarkPsnStoreNoSummary(titleId, contentId, region) {
+		var key = classicGetPsnStoreEntryKey(titleId, contentId, region);
+		if (key) g_psnStoreNoSummaryCache[key] = true;
+	}
+
+	function classicCleanPsnStoreDescription(value) {
+		var html = String(value || "");
+		html = html.replace(/<br\s*\/?\s*>/gi, "\n");
+		html = html.replace(/<\/p\s*>/gi, "\n\n");
+		html = html.replace(/<p(?:\s[^>]*)?>/gi, "");
+		html = html.replace(/<[^>]+>/g, "");
+		var div = document.createElement("div");
+		div.innerHTML = html;
+		var text = div.textContent || div.innerText || html;
+		text = text.replace(/\r/g, "");
+		text = text.replace(/[ \t]+\n/g, "\n");
+		text = text.replace(/\n[ \t]+/g, "\n");
+		text = text.replace(/\n{3,}/g, "\n\n");
+		return classicTrim(text);
+	}
+
+	function classicFetchPsnStoreMetadata(titleId, contentId, region, callback) {
+		var apiUrl = classicGetPsnStoreApiUrl(titleId, contentId, region, false);
+		if (!apiUrl) { callback(null); return; }
+		if (g_psnStoreMetadataCache.hasOwnProperty(apiUrl)) { callback(g_psnStoreMetadataCache[apiUrl]); return; }
+
+		var encoded = encodeURIComponent(apiUrl);
+		var attempts = [
+			apiUrl,
+			"https://api.allorigins.win/raw?url=" + encoded,
+			"https://corsproxy.io/?" + encoded
+		];
+		var index = 0;
+
+		function tryNext() {
+			if (index >= attempts.length) {
+				g_psnStoreMetadataCache[apiUrl] = null;
+				callback(null);
+				return;
+			}
+
+			var url = attempts[index++];
+			var xhr = new XMLHttpRequest();
+			var finished = false;
+			var timer = null;
+
+			function finish(data) {
+				if (finished) return;
+				finished = true;
+				if (timer) clearTimeout(timer);
+				g_psnStoreMetadataCache[apiUrl] = data || null;
+				callback(data || null);
+			}
+
+			function failNext() {
+				if (finished) return;
+				finished = true;
+				if (timer) clearTimeout(timer);
+				tryNext();
+			}
+
+			xhr.onreadystatechange = function() {
+				if (xhr.readyState !== 4) return;
+				var responseText = xhr.responseText || "";
+				if ((xhr.status === 200 || xhr.status === 0) && responseText) {
+					try {
+						var data = JSON.parse(responseText);
+						finish(data);
+					} catch(e1) {
+						failNext();
+					}
+				} else {
+					failNext();
+				}
+			};
+
+			try {
+				xhr.open("GET", url, true);
+				timer = setTimeout(function() {
+					try { xhr.onreadystatechange = null; xhr.abort(); } catch(e2) {}
+					failNext();
+				}, isPS3 ? 6500 : 4500);
+				xhr.send();
+			} catch(e3) {
+				failNext();
+			}
+		}
+
+		tryNext();
+	}
+
+	function classicExtractPsnStoreDescription(data) {
+		var bestLong = "";
+		var bestShort = "";
+		var seen = 0;
+		var maxSeen = 450;
+		var keysLong = { long_desc: 1, longDesc: 1, long_description: 1, longDescription: 1, description: 1 };
+		var keysShort = { short_desc: 1, shortDesc: 1, short_description: 1, shortDescription: 1, name: 1 };
+		function walk(value) {
+			if (!value || seen > maxSeen) return;
+			seen++;
+			if (typeof value === "string") return;
+			if (Object.prototype.toString.call(value) === "[object Array]") {
+				for (var i = 0; i < value.length; i++) walk(value[i]);
+				return;
+			}
+			if (typeof value !== "object") return;
+			for (var key in value) {
+				if (!value.hasOwnProperty(key)) continue;
+				var item = value[key];
+				if (typeof item === "string") {
+					var clean = classicCleanPsnStoreDescription(item);
+					if (!clean) continue;
+					if (keysLong[key] && clean.length > bestLong.length) bestLong = clean;
+					else if (keysShort[key] && clean.length > bestShort.length) bestShort = clean;
+				} else {
+					walk(item);
+				}
+			}
+		}
+		walk(data);
+		return bestLong || bestShort || "";
+	}
+
+	function classicFetchPsnStoreSummary(titleId, contentId, region, callback) {
+		classicFetchPsnStoreMetadata(titleId, contentId, region, function(data) {
+			var summary = classicExtractPsnStoreDescription(data);
+			if (!summary) classicMarkPsnStoreNoSummary(titleId, contentId, region);
+			callback(summary);
+		});
+	}
+
+	function classicShowPsnStoreBadge() {
+		var el = document.getElementById("modal-rawg-meta");
+		if (!el) return;
+		el.className = "modal-rawg-meta";
+		el.style.display = "block";
+		el.innerHTML = '<div class="rawg-meta-chips"><span class="rawg-meta-chip rawg-chip-year" style="background:#082c45;border-color:#166a9d;color:#aee7ff;">PlayStation Store</span></div>';
+	}
+
+	function classicShowPsnSummarySkeleton() {
+		var summaryEl = document.getElementById("modal-summary");
+		if (!summaryEl) return;
+		summaryEl.style.display = "block";
+		summaryEl.setAttribute("data-summary-loading", "true");
+		summaryEl.innerHTML =
+			'<div class="rawg-meta-skeleton" style="width:100%;height:12px;margin-bottom:7px;"></div>' +
+			'<div class="rawg-meta-skeleton" style="width:94%;height:12px;margin-bottom:7px;"></div>' +
+			'<div class="rawg-meta-skeleton" style="width:56%;height:12px;"></div>';
+	}
+
+	function classicRenderPsnStoreSummary(summaryText) {
+		var summaryEl = document.getElementById("modal-summary");
+		if (!summaryEl) return;
+		summaryEl.style.display = "block";
+		summaryEl.removeAttribute("data-summary-loading");
+		summaryEl.innerHTML = modalSafeText(summaryText).replace(/\n/g, "<br>");
+		classicShowPsnStoreBadge();
+		hideModalGallery();
+		scheduleModalLayoutFit();
+	}
+
 	function copyCoverImageAttributes(fromImg, toImg) {
 		if (!fromImg || !toImg) return toImg;
 
@@ -1474,6 +1685,7 @@
 		}
 
 		if (!isPS3 || !oldImg.parentNode) {
+			if (typeof classicMarkPsnStoreCoverEntry === 'function') classicMarkPsnStoreCoverEntry(oldImg, finalUrl || loadedImg.src);
 			oldImg.onload = null;
 			oldImg.onerror = null;
 			oldImg.src = finalUrl || loadedImg.src;
@@ -1484,6 +1696,7 @@
 		}
 
 		copyCoverImageAttributes(oldImg, loadedImg);
+		if (typeof classicMarkPsnStoreCoverEntry === 'function') classicMarkPsnStoreCoverEntry(loadedImg, finalUrl || loadedImg.src);
 		loadedImg.setAttribute('data-loaded', 'true');
 		loadedImg.removeAttribute('data-loading');
 		loadedImg.removeAttribute('data-failed');
@@ -2264,6 +2477,10 @@
 						img.removeAttribute('data-loaded');
 						img.removeAttribute('data-failed');
 						img.removeAttribute('data-loading');
+						if (img.getAttribute('data-psn-store-loaded') === 'true') {
+							img.removeAttribute('data-psn-store-tried');
+							img.removeAttribute('data-psn-store-loaded');
+						}
 					}
 					continue;
 				}
@@ -2340,6 +2557,10 @@
 				img.removeAttribute('data-loaded');
 				img.removeAttribute('data-loading');
 				img.removeAttribute('data-failed');
+				if (img.getAttribute('data-psn-store-loaded') === 'true') {
+					img.removeAttribute('data-psn-store-tried');
+					img.removeAttribute('data-psn-store-loaded');
+				}
 				
 				active_imgs.splice(i, 1);
 				unloaded++;
@@ -2356,6 +2577,54 @@
 		}
 	}
 	silentGarbageCollector();
+
+	function classicLoadGithubCoverPC(img, title_id) {
+		if (!img || !title_id) return;
+
+		if (g_noCoverIndexLoaded && g_noCoverMap[title_id]) {
+			finishCoverFallback(img);
+			return;
+		}
+
+		var hash_val = generateSonyHash(title_id) || "MISSING";
+		var primaryUrl = "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/database/covers/uncompressed/" + title_id + ".JPG";
+		var hashUrl = "https://raw.githubusercontent.com/PS3-Pro/Recently-Played-Games/master/np/" + hash_val + "/ICON0.PNG";
+		var targetUrl = primaryUrl;
+		var knownHash = false;
+
+		if (g_coverIndexLoaded && !g_coverMap[title_id]) {
+			targetUrl = hashUrl;
+			knownHash = true;
+		}
+
+		img.onload = function() {
+			this.onload = null;
+			this.onerror = null;
+			this.setAttribute('data-loaded', 'true');
+		};
+
+		img.onerror = function() {
+			this.onerror = null;
+			if (!knownHash && this.src.indexOf('.JPG') !== -1) {
+				this.onerror = function() {
+					this.onerror = null;
+					this.onload = null;
+					finishCoverFallback(this);
+				};
+				this.onload = function() {
+					this.onload = null;
+					this.onerror = null;
+					this.setAttribute('data-loaded', 'true');
+				};
+				this.src = hashUrl;
+			} else {
+				this.onload = null;
+				finishCoverFallback(this);
+			}
+		};
+
+		img.src = targetUrl;
+	}
 
 	function loadPCImage(img) {
 		var title_id = img.getAttribute('data-title_id');
@@ -2382,6 +2651,26 @@
 			};
 			img.src = getLocalContentCover(cat_h, title_id, content_id_h);
 			return;
+		}
+
+		if (cat_h === "dlcs") {
+			var psnUrl = classicGetPsnStoreApiUrl(title_id, content_id_h, img.getAttribute("data-region") || "", true);
+			if (psnUrl && img.getAttribute("data-psn-store-tried") !== "true") {
+				img.setAttribute("data-psn-store-tried", "true");
+				img.onload = function() {
+					this.onload = null;
+					this.onerror = null;
+					classicMarkPsnStoreCoverEntry(this, psnUrl);
+					this.setAttribute('data-loaded', 'true');
+				};
+				img.onerror = function() {
+					this.onload = null;
+					this.onerror = null;
+					classicLoadGithubCoverPC(this, title_id);
+				};
+				img.src = psnUrl;
+				return;
+			}
 		}
 
 		if (g_noCoverIndexLoaded && g_noCoverMap[title_id]) {
@@ -2445,6 +2734,73 @@
 				}, idx * 40);
 			})(i);
 		}
+	}
+
+	function classicLoadGithubCoverPS3(img, tid, batchID, markCoverDone, continueQueue) {
+		if (g_noCoverIndexLoaded && g_noCoverMap[tid]) {
+			finishCoverFallback(img, function(doneImg) {
+				if (markCoverDone(doneImg)) {
+					setTimeout(function() {
+						if (batchID === g_renderID) processMasterQueue(batchID);
+					}, 0);
+				}
+			}, batchID);
+			return;
+		}
+
+		var hash = generateSonyHash(tid) || "MISSING";
+		var urlJPG = "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/database/covers/uncompressed/" + tid + ".JPG";
+		var urlPNG = "https://raw.githubusercontent.com/PS3-Pro/Recently-Played-Games/master/np/" + hash + "/ICON0.PNG";
+
+		var targetUrl = urlJPG;
+		var isHashMode = false;
+
+		if (g_coverIndexLoaded && !g_coverMap[tid]) {
+			targetUrl = urlPNG;
+			isHashMode = true;
+		}
+
+		if (isPS3 && isHashMode) {
+			preloadPS3CoverBeforeSwap(img, targetUrl, function(doneImg) {
+				if (markCoverDone(doneImg)) continueQueue();
+			}, function(failedImg) {
+				if (!classicIsLiveCoverElement(failedImg, batchID)) return;
+				finishCoverFallback(failedImg, function(doneImg) {
+					if (markCoverDone(doneImg)) continueQueue();
+				}, batchID);
+			}, batchID);
+			return;
+		}
+
+		img.onload = function() {
+			this.onload = this.onerror = null;
+			if (markCoverDone(this)) continueQueue();
+		};
+
+		img.onerror = function() {
+			this.onload = this.onerror = null;
+			if (!classicIsLiveCoverElement(this, batchID)) return;
+
+			if (!isHashMode && this.src.indexOf('.JPG') !== -1) {
+				isHashMode = true;
+				var failedVisibleImg = this;
+				failedVisibleImg.src = defaultCover;
+				preloadPS3CoverBeforeSwap(failedVisibleImg, urlPNG, function(doneImg) {
+					if (markCoverDone(doneImg)) continueQueue();
+				}, function(failedImg) {
+					if (!classicIsLiveCoverElement(failedImg, batchID)) return;
+					finishCoverFallback(failedImg, function(doneImg) {
+						if (markCoverDone(doneImg)) continueQueue();
+					}, batchID);
+				}, batchID);
+			} else {
+				finishCoverFallback(this, function(doneImg) {
+					if (markCoverDone(doneImg)) continueQueue();
+				}, batchID);
+			}
+		};
+
+		img.src = targetUrl;
 	}
 
 	function processMasterQueue(batchID) {
@@ -2532,71 +2888,22 @@
 			return;
 		}
 
-		if (g_noCoverIndexLoaded && g_noCoverMap[tid]) {
-			finishCoverFallback(img, function(doneImg) {
-				if (markCoverDone(doneImg)) {
-					setTimeout(function() {
-						if (batchID === g_renderID) processMasterQueue(batchID);
-					}, 0);
-				}
-			}, batchID);
-			return;
-		}
-
-		var hash = generateSonyHash(tid) || "MISSING";
-		var urlJPG = "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/database/covers/" + (is_ps3 ? "uncompressed/" : "uncompressed/") + tid + ".JPG";
-		//var urlJPG = "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/database/covers/" + (is_ps3 ? "compressed/" : "uncompressed/") + tid + ".JPG";
-		var urlPNG = "https://raw.githubusercontent.com/PS3-Pro/Recently-Played-Games/master/np/" + hash + "/ICON0.PNG";
-
-		var targetUrl = urlJPG;
-		var isHashMode = false;
-
-		if (g_coverIndexLoaded && !g_coverMap[tid]) {
-			targetUrl = urlPNG;
-			isHashMode = true;
-		}
-
-		if (is_ps3 && isHashMode) {
-			preloadPS3CoverBeforeSwap(img, targetUrl, function(doneImg) {
-				if (markCoverDone(doneImg)) continueQueue();
-			}, function(failedImg) {
-				if (!classicIsLiveCoverElement(failedImg, batchID)) return;
-				finishCoverFallback(failedImg, function(doneImg) {
-					if (markCoverDone(doneImg)) continueQueue();
-				}, batchID);
-			}, batchID);
-			return;
-		}
-
-		img.onload = function() {
-			this.onload = this.onerror = null;
-			if (markCoverDone(this)) continueQueue();
-		};
-
-		img.onerror = function() {
-			this.onload = this.onerror = null;
-			if (!classicIsLiveCoverElement(this, batchID)) return;
-
-			if (!isHashMode && this.src.indexOf('.JPG') !== -1) {
-				isHashMode = true;
-				var failedVisibleImg = this;
-				failedVisibleImg.src = defaultCover;
-				preloadPS3CoverBeforeSwap(failedVisibleImg, urlPNG, function(doneImg) {
+		if (cat_h === "dlcs") {
+			var psnUrl = classicGetPsnStoreApiUrl(tid, content_id_h, img.getAttribute("data-region") || "", true);
+			if (psnUrl && img.getAttribute("data-psn-store-tried") !== "true") {
+				img.setAttribute("data-psn-store-tried", "true");
+				preloadPS3CoverBeforeSwap(img, psnUrl, function(doneImg) {
+					classicMarkPsnStoreCoverEntry(doneImg, psnUrl);
 					if (markCoverDone(doneImg)) continueQueue();
 				}, function(failedImg) {
 					if (!classicIsLiveCoverElement(failedImg, batchID)) return;
-					finishCoverFallback(failedImg, function(doneImg) {
-						if (markCoverDone(doneImg)) continueQueue();
-					}, batchID);
+					classicLoadGithubCoverPS3(failedImg, tid, batchID, markCoverDone, continueQueue);
 				}, batchID);
-			} else {
-				finishCoverFallback(this, function(doneImg) {
-					if (markCoverDone(doneImg)) continueQueue();
-				}, batchID);
+				return;
 			}
-		};
+		}
 
-		img.src = targetUrl;
+		classicLoadGithubCoverPS3(img, tid, batchID, markCoverDone, continueQueue);
 	}
 
 	function startSilentPreloader() {
@@ -3899,7 +4206,7 @@ function restorePreviousState() {
 						'<div class="tile-content" style="position: relative;">' +
 							'<div class="console-tag ' + tagClass + '">' + consoleName + '</div>' +
 							'<div class="region-tag">' + regionName + '</div>' +
-							'<img id="img_' + tid_h + '_' + i + '" src="' + def_cover_h + '" data-title_id="' + tid_h + '" data-category="' + cat_h + '" data-content_id="' + escapeAttr(row_h[5] || '') + '" data-name="' + escapeAttr(name_h) + '" data-console="' + escapeAttr(row_h.cTag || 'ps3') + '" onclick="showGameDetails(' + i + ')" style="cursor:pointer;">' +
+							'<img id="img_' + tid_h + '_' + i + '" src="' + def_cover_h + '" data-title_id="' + tid_h + '" data-category="' + cat_h + '" data-content_id="' + escapeAttr(row_h[5] || '') + '" data-name="' + escapeAttr(name_h) + '" data-console="' + escapeAttr(row_h.cTag || 'ps3') + '" data-region="' + escapeAttr(regionName) + '" onclick="showGameDetails(' + i + ')" style="cursor:pointer;">' +
 							'<div class="classic-card-info" aria-hidden="true"><i class="fas fa-circle-info"></i><span>Information</span></div>' +
 							'<div class="title">' + name_h + '</div>' +
 							'<div class="title-id">' + classicBuildTitleIdHtml(tid_h, cat_h, true) + '</div>' +
@@ -5911,6 +6218,7 @@ function restorePreviousState() {
 		if (summaryEl) {
 			summaryEl.style.display = 'none';
 			summaryEl.className = '';
+			summaryEl.removeAttribute('data-summary-loading');
 			summaryEl.style.height = '';
 			summaryEl.style.maxHeight = '';
 			summaryEl.style.overflowY = '';
@@ -5981,6 +6289,7 @@ function restorePreviousState() {
 	function modalShouldUseCompactNoSummary() {
 		var summaryEl = document.getElementById('modal-summary');
 		if (!summaryEl) return false;
+		if (summaryEl.getAttribute && summaryEl.getAttribute('data-summary-loading') === 'true') return false;
 		if (summaryEl.style.display === 'none') return true;
 		var txt = (summaryEl.textContent || summaryEl.innerText || '').replace(/^\s+|\s+$/g, '');
 		if (!txt) return true;
@@ -7757,7 +8066,7 @@ function restorePreviousState() {
 		}
 	}
 
-	function showGameDetails(gameIndex) {
+	function showGameDetails(gameIndex, forcedPsnSummary, forceCompactDlc) {
 		var doc = document;
 		g_pcGameModalLeftH = 0;
 		var modal_reset_el = doc.getElementById('game-modal');
@@ -7778,9 +8087,18 @@ function restorePreviousState() {
 		var rapHex_h = row_h[4];
 		var contentId_h = row_h[5];
 		var version_h = row_h[10] || "";
+		var forcedPsnSummary_h = forcedPsnSummary ? String(forcedPsnSummary) : "";
+		var forceCompactDlc_h = !!forceCompactDlc;
 
 		var displayName_h = row_h.cleanName || rawName_h;
 		var size_h = row_h.formattedSize || "N/A";
+
+		if (modal_reset_el) {
+			modal_reset_el.setAttribute('data-title_id', id_h || '');
+			modal_reset_el.setAttribute('data-content_id', contentId_h || '');
+			modal_reset_el.setAttribute('data-category', cat_h || '');
+			modal_reset_el.setAttribute('data-modal-index', String(gameIndex));
+		}
 
 		var label_h = "";
 		var categoryLabels_h = {
@@ -7847,6 +8165,14 @@ function restorePreviousState() {
 		}
 
 		var modal_img_el = doc.getElementById('modal-image');
+		if (modal_img_el) {
+			modal_img_el.setAttribute('data-title_id', id_h || '');
+			modal_img_el.setAttribute('data-content_id', contentId_h || '');
+			modal_img_el.setAttribute('data-category', cat_h || '');
+			modal_img_el.setAttribute('data-region', region_h || '');
+			modal_img_el.setAttribute('data-name', displayName_h || '');
+			modal_img_el.setAttribute('data-console', row_h.cTag || 'ps3');
+		}
 		var sourceImgId_h = "img_" + id_h + "_" + gameIndex;
 		var sourceImg_el = doc.getElementById(sourceImgId_h);
 		modal_img_el.src = defaultCover;
@@ -7928,24 +8254,54 @@ function restorePreviousState() {
 		if (links_div_el) links_div_el.innerHTML = buildModernButtonGroup(btnsObj);
 
 		var validSummaryCats = ['games', 'updates', 'homebrew_games', 'demos'];
-		var usesSummaryModal = validSummaryCats.indexOf(cat_h) !== -1;
+		var isDlcSummaryCandidate_h = (cat_h === 'dlcs' && !forceCompactDlc_h);
+		var psnDlcEntryKnown_h = isDlcSummaryCandidate_h && (forcedPsnSummary_h || classicHasPsnStoreCoverEntry(id_h, contentId_h, region_h));
+		var usesSummaryModal = (validSummaryCats.indexOf(cat_h) !== -1) || psnDlcEntryKnown_h;
 		var summary_el = doc.getElementById('modal-summary');
 		var midDivider = doc.getElementById('modal-divider-middle');
 
 		if (usesSummaryModal) {
 			restoreFullSummaryModalStructure();
-			if (summary_el) {
-				summary_el.style.display = 'block';
-				summary_el.innerHTML = 'Fetching summary...';
-			}
 			if (midDivider) midDivider.style.display = 'block';
-			prepareModalGalleryReserve();
-			fetchGameSummary(displayName_h, id_h);
+			if (cat_h === 'dlcs') {
+				classicShowPsnStoreBadge();
+				classicShowPsnSummarySkeleton();
+				hideModalGallery();
+				if (forcedPsnSummary_h) {
+					classicRenderPsnStoreSummary(forcedPsnSummary_h);
+				} else {
+					classicFetchPsnStoreSummary(id_h, contentId_h, region_h, function(summaryText) {
+						var modalCheck = document.getElementById('game-modal');
+						if (!modalCheck || modalCheck.style.display === 'none') return;
+						if (modalCheck.getAttribute('data-title_id') !== id_h || modalCheck.getAttribute('data-content_id') !== (contentId_h || '') || modalCheck.getAttribute('data-category') !== cat_h) return;
+						if (summaryText) {
+							classicRenderPsnStoreSummary(summaryText);
+						} else {
+							showGameDetails(gameIndex, '', true);
+						}
+					});
+				}
+			} else {
+				if (summary_el) {
+					summary_el.style.display = 'block';
+					summary_el.innerHTML = 'Fetching summary...';
+				}
+				prepareModalGalleryReserve();
+				fetchGameSummary(displayName_h, id_h);
+			}
 		} else {
 			hideRawgMeta();
 			if (summary_el) summary_el.style.display = 'none';
 			if (midDivider) midDivider.style.display = 'none';
 			prepareCompactNoSummaryModal();
+			if (cat_h === 'dlcs' && !forceCompactDlc_h) {
+				classicFetchPsnStoreSummary(id_h, contentId_h, region_h, function(summaryText) {
+					var modalCheck = document.getElementById('game-modal');
+					if (!summaryText || !modalCheck || modalCheck.style.display === 'none') return;
+					if (modalCheck.getAttribute('data-title_id') !== id_h || modalCheck.getAttribute('data-content_id') !== (contentId_h || '') || modalCheck.getAttribute('data-category') !== cat_h) return;
+					showGameDetails(gameIndex, summaryText, false);
+				});
+			}
 		}
 
 		openModal();
@@ -7953,10 +8309,11 @@ function restorePreviousState() {
 
         var isHashImg_h = sourceImg_el && sourceImg_el.src && sourceImg_el.src.indexOf('Recently-Played-Games') !== -1;
         var isBingImg_h = sourceImg_el && sourceImg_el.src && sourceImg_el.src.indexOf('bing.net') !== -1;
-        
+        var isPsnImg_h = sourceImg_el && sourceImg_el.src && sourceImg_el.src.indexOf('store.playstation.com/store/api/chihiro/') !== -1;
+
         if (sourceImg_el && sourceImg_el.src && sourceImg_el.src.indexOf('data:image') === -1 && sourceImg_el.getAttribute('data-loaded') === 'true') {
             modal_img_el.src = sourceImg_el.src;
-            if (cat_h === 'avatars' || cat_h === 'themes' || isHashImg_h || isBingImg_h || !high_res_h) return; 
+            if (cat_h === 'avatars' || cat_h === 'themes' || isHashImg_h || isBingImg_h || isPsnImg_h || !high_res_h) return; 
         }
 
 		if (cat_h === 'avatars' || cat_h === 'themes') {
@@ -7991,41 +8348,65 @@ function restorePreviousState() {
             modalBingGhost_h.src = modalBingUrl_h;
         };
 
-        var ghost_h = new Image();
-        ghost_h.onload = function() {
-            ghost_h.onload = null;
-            ghost_h.onerror = null;
-            replaceCoverWithLoadedImage(modal_img_el, ghost_h, this.src);
-        };
-        ghost_h.onerror = function() {
-            ghost_h.onload = null;
-            ghost_h.onerror = null;
-            if (this.src.indexOf('.JPG') !== -1 && typeof generateSonyHash === 'function') {
-                var hash_h = generateSonyHash(id_h);
-                var fallback_h = new Image();
-                fallback_h.onload = function() {
-                    fallback_h.onload = null;
-                    fallback_h.onerror = null;
-                    replaceCoverWithLoadedImage(modal_img_el, fallback_h, this.src);
-                };
-                fallback_h.onerror = modalBingFallback_h;
-                fallback_h.src = "https://raw.githubusercontent.com/PS3-Pro/Recently-Played-Games/master/np/" + hash_h + "/ICON0.PNG";
+        var modalGithubFallback_h = function() {
+            var ghost_h = new Image();
+            ghost_h.onload = function() {
+                ghost_h.onload = null;
+                ghost_h.onerror = null;
+                replaceCoverWithLoadedImage(modal_img_el, ghost_h, this.src);
+            };
+            ghost_h.onerror = function() {
+                ghost_h.onload = null;
+                ghost_h.onerror = null;
+                if (this.src.indexOf('.JPG') !== -1 && typeof generateSonyHash === 'function') {
+                    var hash_h = generateSonyHash(id_h);
+                    var fallback_h = new Image();
+                    fallback_h.onload = function() {
+                        fallback_h.onload = null;
+                        fallback_h.onerror = null;
+                        replaceCoverWithLoadedImage(modal_img_el, fallback_h, this.src);
+                    };
+                    fallback_h.onerror = modalBingFallback_h;
+                    fallback_h.src = "https://raw.githubusercontent.com/PS3-Pro/Recently-Played-Games/master/np/" + hash_h + "/ICON0.PNG";
+                } else {
+                    modalBingFallback_h();
+                }
+            };
+
+            var targetUrl_h = "";
+            if (g_noCoverIndexLoaded && g_noCoverMap[id_h]) {
+                targetUrl_h = buildBingCoverUrl(displayName_h, row_h.cTag || 'ps3');
+            } else if (g_coverIndexLoaded && !g_coverMap[id_h]) {
+                var hash_val_h = generateSonyHash(id_h);
+                targetUrl_h = "https://raw.githubusercontent.com/PS3-Pro/Recently-Played-Games/master/np/" + hash_val_h + "/ICON0.PNG";
             } else {
-                modalBingFallback_h();
+                var folder_h = (is_ps3_h && !high_res_h) ? "compressed" : "uncompressed";
+                targetUrl_h = "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/database/covers/" + folder_h + "/" + id_h + ".JPG";
             }
+            ghost_h.src = targetUrl_h;
         };
 
-        var targetUrl_h = "";
-        if (g_noCoverIndexLoaded && g_noCoverMap[id_h]) {
-            targetUrl_h = buildBingCoverUrl(displayName_h, row_h.cTag || 'ps3');
-        } else if (g_coverIndexLoaded && !g_coverMap[id_h]) {
-            var hash_val_h = generateSonyHash(id_h);
-            targetUrl_h = "https://raw.githubusercontent.com/PS3-Pro/Recently-Played-Games/master/np/" + hash_val_h + "/ICON0.PNG";
-        } else {
-            var folder_h = (is_ps3_h && !high_res_h) ? "compressed" : "uncompressed";
-            targetUrl_h = "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/database/covers/" + folder_h + "/" + id_h + ".JPG";
+        if (cat_h === 'dlcs') {
+            var modalPsnUrl_h = classicGetPsnStoreApiUrl(id_h, contentId_h, region_h, true);
+            if (modalPsnUrl_h) {
+                var modalPsnGhost_h = new Image();
+                modalPsnGhost_h.onload = function() {
+                    modalPsnGhost_h.onload = null;
+                    modalPsnGhost_h.onerror = null;
+                    classicMarkPsnStoreCoverEntry(modal_img_el, modalPsnUrl_h);
+                    replaceCoverWithLoadedImage(modal_img_el, modalPsnGhost_h, modalPsnUrl_h);
+                };
+                modalPsnGhost_h.onerror = function() {
+                    modalPsnGhost_h.onload = null;
+                    modalPsnGhost_h.onerror = null;
+                    modalGithubFallback_h();
+                };
+                modalPsnGhost_h.src = modalPsnUrl_h;
+                return;
+            }
         }
-        ghost_h.src = targetUrl_h;
+
+        modalGithubFallback_h();
     }
 	</script>
 	<script>
