@@ -22,7 +22,35 @@ jobs:
           BASE_DIR="resources/database/content/official"
           LATEST_DIR="resources/database/content/latest"
           PY_SCRIPT=".github/scripts/generate_latest_releases.py"
-          
+
+          clean_tsv() {
+            awk -F'\t' '
+              BEGIN { OFS = FS }
+
+              function trim(value) {
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+                return value
+              }
+
+              NR == 1 {
+                print
+                next
+              }
+
+              {
+                title_id = trim($1)
+                name = trim($3)
+                pkg_url = trim($4)
+
+                if (title_id != "" &&
+                    name != "" && toupper(name) != "MISSING" &&
+                    pkg_url != "" && toupper(pkg_url) != "MISSING") {
+                  print
+                }
+              }
+            ' "$1" > "$2"
+          }
+
           mkdir -p "$BASE_DIR/pending"
           mkdir -p "$LATEST_DIR"
 
@@ -30,20 +58,20 @@ jobs:
 
           for cat in "${categories[@]}"; do
             echo "Processando $cat..."
-            
+
             URL_OFFICIAL="https://nopaystation.com/tsv/PS3_${cat^^}.tsv"
             curl -L "$URL_OFFICIAL" -o "nps_raw.tsv"
-            
-            awk -F'\t' 'NR==1 || ($4 != "MISSING" && $4 != "")' "nps_raw.tsv" > "nps_clean.tsv"
-            
+
+            clean_tsv "nps_raw.tsv" "nps_clean.tsv"
+
             python "$PY_SCRIPT" "$BASE_DIR/${cat}.tsv" "nps_clean.tsv" "$LATEST_DIR/latest_${cat}.tsv"
-            
+
             mv "nps_clean.tsv" "$BASE_DIR/${cat}.tsv"
             rm "nps_raw.tsv"
 
             curl -L "https://nopaystation.com/tsv/pending/PS3_${cat^^}.tsv" -o "p_raw.tsv"
-            awk -F'\t' 'NR==1 || ($4 != "MISSING" && $4 != "")' "p_raw.tsv" > "p_clean.tsv"
-            
+            clean_tsv "p_raw.tsv" "p_clean.tsv"
+
             python "$PY_SCRIPT" "$BASE_DIR/pending/${cat}.tsv" "p_clean.tsv" "$LATEST_DIR/latest_${cat}.tsv"
             mv "p_clean.tsv" "$BASE_DIR/pending/${cat}.tsv"
             rm "p_raw.tsv"
@@ -53,10 +81,10 @@ jobs:
         run: |
           git config --global user.name "PS3-Pro Bot"
           git config --global user.email "bot@ps3pro.com"
-          
+
           git add resources/database/content/official/*.tsv
           git add resources/database/content/official/pending/*.tsv
           git add resources/database/content/latest/*.tsv
-          
+
           git diff-index --quiet HEAD || git commit -m "Auto-update: Synchronized with NoPayStation (Official & Pending)"
           git push
