@@ -16737,7 +16737,7 @@ P
 
 	function getItemCover(item, category) {
 		const cat = category || item?.category || "";
-		if (cat === 'dlcs') {
+		if (cat === 'dlcs' || cat === 'apps') {
 			const psnFirstCover = getPsnStoreApiUrlCompat(item?.id || item?.titleId, item?.contentId, item?.region, true);
 			return psnFirstCover || getGithubItemCover(item, cat);
 		}
@@ -16838,11 +16838,47 @@ P
 		return textarea.value.replace(/\r/g, '').replace(/[ \t]+\n/g, '\n').replace(/\n[ \t]+/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
 	};
 
+	window.extractPsnStoreDescription = function(data) {
+		const preferredKeys = ['long_desc', 'longDesc', 'long_description', 'longDescription', 'description', 'short_desc', 'shortDesc', 'short_description', 'shortDescription'];
+		const seen = new Set();
+		let best = '';
+		let inspected = 0;
+
+		const consider = (value) => {
+			const clean = window.cleanPsnStoreDescription(value);
+			if (clean && clean.length > best.length) best = clean;
+		};
+
+		const walk = (node) => {
+			if (!node || inspected > 600) return;
+			if (typeof node === 'string') { consider(node); return; }
+			if (typeof node !== 'object' || seen.has(node)) return;
+			seen.add(node);
+			inspected++;
+
+			for (const key of preferredKeys) {
+				if (typeof node[key] === 'string') consider(node[key]);
+			}
+			if (best.length >= 90) return;
+
+			if (Array.isArray(node)) {
+				for (const item of node) walk(item);
+				return;
+			}
+			for (const key of Object.keys(node)) {
+				if (!preferredKeys.includes(key)) walk(node[key]);
+			}
+		};
+
+		walk(data);
+		return best;
+	};
+
 	window.getPsnStoreSummaryText = async function(titleId, contentId, region) {
 		if (!window.fetchPsnStoreMetadata || !window.cleanPsnStoreDescription) return '';
 		try {
 			const psnStoreData = await window.fetchPsnStoreMetadata(titleId, contentId, region);
-			return window.cleanPsnStoreDescription(psnStoreData?.long_desc || psnStoreData?.short_desc || '');
+			return window.extractPsnStoreDescription ? window.extractPsnStoreDescription(psnStoreData) : window.cleanPsnStoreDescription(psnStoreData?.long_desc || psnStoreData?.short_desc || '');
 		} catch (error) {
 			return '';
 		}
@@ -16892,7 +16928,7 @@ P
 
 	window.tryGithubCoverAfterPsn = function(imgElement, category) {
 		const cat = String(category || imgElement?.getAttribute?.('data-cover-category') || '').trim().toLowerCase();
-		if (!imgElement || cat !== 'dlcs' || imgElement.getAttribute('data-github-cover-tried') === 'true') return false;
+		if (!imgElement || !['dlcs', 'apps'].includes(cat) || imgElement.getAttribute('data-github-cover-tried') === 'true') return false;
 		const githubCover = normalizeCoverSrcForCache(imgElement.getAttribute('data-github-cover') || '');
 		const currentSrc = normalizeCoverSrcForCache(imgElement.currentSrc || imgElement.src);
 		if (!githubCover || githubCover === currentSrc) return false;
@@ -16911,7 +16947,7 @@ P
 	window.handleCoverError = function(imgElement, category) {
 		const cat = String(category || imgElement?.getAttribute?.('data-cover-category') || '').trim().toLowerCase();
 
-		if (cat === 'dlcs') {
+		if (cat === 'dlcs' || cat === 'apps') {
 			if (window.tryGithubCoverAfterPsn && window.tryGithubCoverAfterPsn(imgElement, cat)) return;
 			getOnlineCoverFallback(imgElement);
 			return;
@@ -18853,8 +18889,11 @@ P
 		const modalSafeContentId = escapeCategoryDotAttr(game.contentId || '');
 		const forcedPsnStoreSummaryText = String(forcedPsnStoreSummary || '').trim();
 		const psnStoreEntryKey = window.getPsnStoreEntryKey ? window.getPsnStoreEntryKey(game.id || '', game.contentId || '', game.region || '') : '';
+		const psnStoreSummaryCats = ['dlcs', 'apps'];
+		const isPsnStoreSummaryCat = psnStoreSummaryCats.includes(currentCat);
 		const hasPsnDlcCoverEntry = currentCat === 'dlcs' && !forceCompactDlc && window.hasPsnStoreCoverEntry && window.hasPsnStoreCoverEntry(game.id || '', game.contentId || '', game.region || '');
-		const hasForcedPsnDlcSummary = currentCat === 'dlcs' && forcedPsnStoreSummaryText;
+		const hasPsnAppCoverEntry = currentCat === 'apps' && window.hasPsnStoreCoverEntry && window.hasPsnStoreCoverEntry(game.id || '', game.contentId || '', game.region || '');
+		const hasForcedPsnStoreSummary = isPsnStoreSummaryCat && forcedPsnStoreSummaryText;
 		const modalSafeText = (value) => String(value === undefined || value === null ? '' : value).replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;' }[char]));
 
 		if (modalHeader) {
@@ -18910,7 +18949,7 @@ P
 		}
 
 		const allowedSummaryCats = ['demos', 'games', 'updates', 'ports', 'homebrew_games'];
-		const isPremium = allowedSummaryCats.includes(currentCat) || hasForcedPsnDlcSummary || hasPsnDlcCoverEntry;
+		const isPremium = allowedSummaryCats.includes(currentCat) || hasForcedPsnStoreSummary || hasPsnDlcCoverEntry || hasPsnAppCoverEntry;
 		const modalContent = modal.querySelector('.sys-modal-content');
 
 		if (isPremium) {
@@ -18947,13 +18986,13 @@ P
 				<div class="modal-divider" style="margin: 15px 0;"></div>
 				<div class="btn-group" style="margin-top: 0;">${actionsHtml}</div>
 			`;
-			if (currentCat === 'dlcs') {
+			if (isPsnStoreSummaryCat) {
 				const summaryEl = document.getElementById('modal-summary');
 				const badgesEl = document.getElementById('modal-badges');
 				const extraMetaEl = document.getElementById('modal-extra-meta');
 				const screenshotsEl = document.getElementById('modal-screenshots-wrapper');
 				const screenshotsDividerEl = document.getElementById('modal-screenshots-divider');
-				const renderDlcPsnSummary = (summaryText) => {
+				const renderPsnStoreSummary = (summaryText) => {
 					if (summaryEl) {
 						summaryEl.innerHTML = '<span style="font-size: 10px; color: var(--text-muted); font-weight: bold; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px; display: block;"><i class="fas fa-align-left" style="margin-right: 4px;"></i> Summary</span>' + modalSafeText(summaryText).replace(/\n/g, '<br>');
 					}
@@ -18967,7 +19006,7 @@ P
 					setGameModalNoScreenshots(modal, true);
 				};
 				if (forcedPsnStoreSummaryText) {
-					renderDlcPsnSummary(forcedPsnStoreSummaryText);
+					renderPsnStoreSummary(forcedPsnStoreSummaryText);
 				} else if (window.getPsnStoreSummaryText) {
 					if (summaryEl) {
 						summaryEl.innerHTML = `
@@ -18987,12 +19026,12 @@ P
 					setGameModalNoScreenshots(modal, true);
 					window.getPsnStoreSummaryText(game.id || '', game.contentId || '', game.region || '').then(summary => {
 						if (!modal || modal.style.display === 'none') return;
-						if (modal.dataset.storeCategory !== 'dlcs') return;
+						if (modal.dataset.storeCategory !== currentCat) return;
 						if (String(modal.dataset.modalIndex || '') !== String(index)) return;
 						if (String(modal.dataset.titleId || '') !== String(game.id || '')) return;
 						if (String(modal.dataset.contentId || '') !== String(game.contentId || '')) return;
 						if (summary) {
-							renderDlcPsnSummary(summary);
+							renderPsnStoreSummary(summary);
 						} else {
 							if (psnStoreEntryKey) window.__psnStoreNoSummaryCache[psnStoreEntryKey] = true;
 							openModal(index, '', true);
@@ -19036,24 +19075,26 @@ P
 					</div>
 				</div>
 			`;
-			if (currentCat === 'dlcs' && !forcedPsnStoreSummaryText && window.getPsnStoreSummaryText) {
-				const dlcSummaryToken = `${Date.now()}_${game.id || ''}_${game.contentId || ''}`;
-				modal.dataset.dlcPsnSummaryToken = dlcSummaryToken;
-				const dlcSummaryIndex = index;
-				const dlcSummaryId = String(game.id || '');
-				const dlcSummaryContentId = String(game.contentId || '');
+			if (isPsnStoreSummaryCat && !forcedPsnStoreSummaryText && window.getPsnStoreSummaryText) {
+				const psnSummaryToken = `${Date.now()}_${currentCat}_${game.id || ''}_${game.contentId || ''}`;
+				modal.dataset.psnStoreSummaryToken = psnSummaryToken;
+				const psnSummaryCat = currentCat;
+				const psnSummaryIndex = index;
+				const psnSummaryId = String(game.id || '');
+				const psnSummaryContentId = String(game.contentId || '');
+				const psnSummaryRegion = String(game.region || '');
 				window.getPsnStoreSummaryText(game.id || '', game.contentId || '', game.region || '').then(summary => {
 					const liveModal = document.getElementById('game-modal');
-					if (!summary || !liveModal || liveModal.style.display === 'none') return;
-					if (liveModal.dataset.dlcPsnSummaryToken !== dlcSummaryToken) return;
-					if (liveModal.dataset.storeCategory !== 'dlcs') return;
-					if (String(liveModal.dataset.modalIndex || '') !== String(dlcSummaryIndex)) return;
-					if (String(liveModal.dataset.titleId || '') !== dlcSummaryId) return;
-					if (String(liveModal.dataset.contentId || '') !== dlcSummaryContentId) return;
+					if (!liveModal || liveModal.style.display === 'none') return;
+					if (liveModal.dataset.psnStoreSummaryToken !== psnSummaryToken) return;
+					if (liveModal.dataset.storeCategory !== psnSummaryCat) return;
+					if (String(liveModal.dataset.modalIndex || '') !== String(psnSummaryIndex)) return;
+					if (String(liveModal.dataset.titleId || '') !== psnSummaryId) return;
+					if (String(liveModal.dataset.contentId || '') !== psnSummaryContentId) return;
 					if (summary) {
-						openModal(dlcSummaryIndex, summary);
+						openModal(psnSummaryIndex, summary);
 					} else {
-						const noSummaryKey = window.getPsnStoreEntryKey ? window.getPsnStoreEntryKey(dlcSummaryId, dlcSummaryContentId, game.region || '') : '';
+						const noSummaryKey = window.getPsnStoreEntryKey ? window.getPsnStoreEntryKey(psnSummaryId, psnSummaryContentId, psnSummaryRegion) : '';
 						if (noSummaryKey) window.__psnStoreNoSummaryCache[noSummaryKey] = true;
 					}
 				});
