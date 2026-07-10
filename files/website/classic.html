@@ -1389,6 +1389,10 @@
 		return defaultCover;
 	}
 
+	function classicIsPsnStoreContentCategory(category) {
+		return category === "dlcs" || category === "apps";
+	}
+
 	function escapeAttr(value) {
 		if (value === undefined || value === null) return "";
 		return String(value)
@@ -1442,14 +1446,22 @@
 		return { country: "US", language: "en" };
 	}
 
-	function classicGetPsnStoreApiUrl(titleId, contentId, region, imageOnly) {
+	function classicBuildPsnStoreApiUrl(titleId, contentId, region, imageOnly, ageValue) {
 		var cleanContentId = classicTrim(contentId);
 		var cleanTitleId = classicTrim(titleId);
 		var identifier = (cleanContentId && cleanContentId !== "MISSING") ? cleanContentId : cleanTitleId;
 		if (!identifier) return "";
 		var locale = classicGetPsnStoreLocale(region, cleanContentId);
 		var endpoint = (cleanContentId && cleanContentId !== "MISSING") ? "container" : "titlecontainer";
-		return "https://store.playstation.com/store/api/chihiro/00_09_000/" + endpoint + "/" + locale.country + "/" + locale.language + "/999/" + encodeURIComponent(identifier) + (imageOnly ? "/image" : "");
+		return "https://store.playstation.com/store/api/chihiro/00_09_000/" + endpoint + "/" + locale.country + "/" + locale.language + "/" + (ageValue || "19") + "/" + encodeURIComponent(identifier) + (imageOnly ? "/image" : "");
+	}
+
+	function classicGetPsnStoreApiUrl(titleId, contentId, region, imageOnly) {
+		return classicBuildPsnStoreApiUrl(titleId, contentId, region, imageOnly, "19");
+	}
+
+	function classicGetPsnStoreFallbackApiUrl(titleId, contentId, region, imageOnly) {
+		return classicBuildPsnStoreApiUrl(titleId, contentId, region, imageOnly, "999");
 	}
 
 	function classicGetPsnStoreEntryKey(titleId, contentId, region) {
@@ -1499,12 +1511,23 @@
 		if (!apiUrl) { callback(null); return; }
 		if (g_psnStoreMetadataCache.hasOwnProperty(apiUrl)) { callback(g_psnStoreMetadataCache[apiUrl]); return; }
 
-		var encoded = encodeURIComponent(apiUrl);
-		var attempts = [
-			apiUrl,
-			"https://api.allorigins.win/raw?url=" + encoded,
-			"https://corsproxy.io/?" + encoded
-		];
+		var fallbackApiUrl = classicGetPsnStoreFallbackApiUrl(titleId, contentId, region, false);
+		var attempts = [];
+		function addAttempt(url) {
+			if (!url) return;
+			for (var i = 0; i < attempts.length; i++) {
+				if (attempts[i] === url) return;
+			}
+			attempts.push(url);
+		}
+		function addUrlWithProxies(url) {
+			var encoded = encodeURIComponent(url);
+			addAttempt(url);
+			addAttempt("https://api.allorigins.win/raw?url=" + encoded);
+			addAttempt("https://corsproxy.io/?" + encoded);
+		}
+		addUrlWithProxies(apiUrl);
+		addUrlWithProxies(fallbackApiUrl);
 		var index = 0;
 
 		function tryNext() {
@@ -2479,6 +2502,7 @@
 						img.removeAttribute('data-loading');
 						if (img.getAttribute('data-psn-store-loaded') === 'true') {
 							img.removeAttribute('data-psn-store-tried');
+							img.removeAttribute('data-psn-store-fallback-tried');
 							img.removeAttribute('data-psn-store-loaded');
 						}
 					}
@@ -2559,6 +2583,7 @@
 				img.removeAttribute('data-failed');
 				if (img.getAttribute('data-psn-store-loaded') === 'true') {
 					img.removeAttribute('data-psn-store-tried');
+					img.removeAttribute('data-psn-store-fallback-tried');
 					img.removeAttribute('data-psn-store-loaded');
 				}
 				
@@ -2653,19 +2678,36 @@
 			return;
 		}
 
-		if (cat_h === "dlcs") {
+		if (classicIsPsnStoreContentCategory(cat_h)) {
 			var psnUrl = classicGetPsnStoreApiUrl(title_id, content_id_h, img.getAttribute("data-region") || "", true);
+			var psnFallbackUrl = classicGetPsnStoreFallbackApiUrl(title_id, content_id_h, img.getAttribute("data-region") || "", true);
 			if (psnUrl && img.getAttribute("data-psn-store-tried") !== "true") {
 				img.setAttribute("data-psn-store-tried", "true");
 				img.onload = function() {
 					this.onload = null;
 					this.onerror = null;
-					classicMarkPsnStoreCoverEntry(this, psnUrl);
+					classicMarkPsnStoreCoverEntry(this, this.src || psnUrl);
 					this.setAttribute('data-loaded', 'true');
 				};
 				img.onerror = function() {
 					this.onload = null;
 					this.onerror = null;
+					if (psnFallbackUrl && psnFallbackUrl !== psnUrl && this.getAttribute("data-psn-store-fallback-tried") !== "true") {
+						this.setAttribute("data-psn-store-fallback-tried", "true");
+						this.onload = function() {
+							this.onload = null;
+							this.onerror = null;
+							classicMarkPsnStoreCoverEntry(this, this.src || psnFallbackUrl);
+							this.setAttribute('data-loaded', 'true');
+						};
+						this.onerror = function() {
+							this.onload = null;
+							this.onerror = null;
+							classicLoadGithubCoverPC(this, title_id);
+						};
+						this.src = psnFallbackUrl;
+						return;
+					}
 					classicLoadGithubCoverPC(this, title_id);
 				};
 				img.src = psnUrl;
@@ -2888,8 +2930,9 @@
 			return;
 		}
 
-		if (cat_h === "dlcs") {
+		if (classicIsPsnStoreContentCategory(cat_h)) {
 			var psnUrl = classicGetPsnStoreApiUrl(tid, content_id_h, img.getAttribute("data-region") || "", true);
+			var psnFallbackUrl = classicGetPsnStoreFallbackApiUrl(tid, content_id_h, img.getAttribute("data-region") || "", true);
 			if (psnUrl && img.getAttribute("data-psn-store-tried") !== "true") {
 				img.setAttribute("data-psn-store-tried", "true");
 				preloadPS3CoverBeforeSwap(img, psnUrl, function(doneImg) {
@@ -2897,6 +2940,17 @@
 					if (markCoverDone(doneImg)) continueQueue();
 				}, function(failedImg) {
 					if (!classicIsLiveCoverElement(failedImg, batchID)) return;
+					if (psnFallbackUrl && psnFallbackUrl !== psnUrl && failedImg.getAttribute("data-psn-store-fallback-tried") !== "true") {
+						failedImg.setAttribute("data-psn-store-fallback-tried", "true");
+						preloadPS3CoverBeforeSwap(failedImg, psnFallbackUrl, function(doneFallbackImg) {
+							classicMarkPsnStoreCoverEntry(doneFallbackImg, psnFallbackUrl);
+							if (markCoverDone(doneFallbackImg)) continueQueue();
+						}, function(fallbackFailedImg) {
+							if (!classicIsLiveCoverElement(fallbackFailedImg, batchID)) return;
+							classicLoadGithubCoverPS3(fallbackFailedImg, tid, batchID, markCoverDone, continueQueue);
+						}, batchID);
+						return;
+					}
 					classicLoadGithubCoverPS3(failedImg, tid, batchID, markCoverDone, continueQueue);
 				}, batchID);
 				return;
@@ -8254,16 +8308,17 @@ function restorePreviousState() {
 		if (links_div_el) links_div_el.innerHTML = buildModernButtonGroup(btnsObj);
 
 		var validSummaryCats = ['games', 'updates', 'homebrew_games', 'demos'];
-		var isDlcSummaryCandidate_h = (cat_h === 'dlcs' && !forceCompactDlc_h);
-		var psnDlcEntryKnown_h = isDlcSummaryCandidate_h && (forcedPsnSummary_h || classicHasPsnStoreCoverEntry(id_h, contentId_h, region_h));
-		var usesSummaryModal = (validSummaryCats.indexOf(cat_h) !== -1) || psnDlcEntryKnown_h;
+		var forceCompactPsn_h = !!forceCompactDlc_h;
+		var isPsnSummaryCandidate_h = (classicIsPsnStoreContentCategory(cat_h) && !forceCompactPsn_h);
+		var psnStoreEntryKnown_h = isPsnSummaryCandidate_h && (forcedPsnSummary_h || classicHasPsnStoreCoverEntry(id_h, contentId_h, region_h));
+		var usesSummaryModal = (validSummaryCats.indexOf(cat_h) !== -1) || psnStoreEntryKnown_h;
 		var summary_el = doc.getElementById('modal-summary');
 		var midDivider = doc.getElementById('modal-divider-middle');
 
 		if (usesSummaryModal) {
 			restoreFullSummaryModalStructure();
 			if (midDivider) midDivider.style.display = 'block';
-			if (cat_h === 'dlcs') {
+			if (classicIsPsnStoreContentCategory(cat_h)) {
 				classicShowPsnStoreBadge();
 				classicShowPsnSummarySkeleton();
 				hideModalGallery();
@@ -8294,7 +8349,7 @@ function restorePreviousState() {
 			if (summary_el) summary_el.style.display = 'none';
 			if (midDivider) midDivider.style.display = 'none';
 			prepareCompactNoSummaryModal();
-			if (cat_h === 'dlcs' && !forceCompactDlc_h) {
+			if (classicIsPsnStoreContentCategory(cat_h) && !forceCompactPsn_h) {
 				classicFetchPsnStoreSummary(id_h, contentId_h, region_h, function(summaryText) {
 					var modalCheck = document.getElementById('game-modal');
 					if (!summaryText || !modalCheck || modalCheck.style.display === 'none') return;
@@ -8386,8 +8441,9 @@ function restorePreviousState() {
             ghost_h.src = targetUrl_h;
         };
 
-        if (cat_h === 'dlcs') {
+        if (classicIsPsnStoreContentCategory(cat_h)) {
             var modalPsnUrl_h = classicGetPsnStoreApiUrl(id_h, contentId_h, region_h, true);
+            var modalPsnFallbackUrl_h = classicGetPsnStoreFallbackApiUrl(id_h, contentId_h, region_h, true);
             if (modalPsnUrl_h) {
                 var modalPsnGhost_h = new Image();
                 modalPsnGhost_h.onload = function() {
@@ -8399,6 +8455,22 @@ function restorePreviousState() {
                 modalPsnGhost_h.onerror = function() {
                     modalPsnGhost_h.onload = null;
                     modalPsnGhost_h.onerror = null;
+                    if (modalPsnFallbackUrl_h && modalPsnFallbackUrl_h !== modalPsnUrl_h) {
+                        var modalPsnFallbackGhost_h = new Image();
+                        modalPsnFallbackGhost_h.onload = function() {
+                            modalPsnFallbackGhost_h.onload = null;
+                            modalPsnFallbackGhost_h.onerror = null;
+                            classicMarkPsnStoreCoverEntry(modal_img_el, modalPsnFallbackUrl_h);
+                            replaceCoverWithLoadedImage(modal_img_el, modalPsnFallbackGhost_h, modalPsnFallbackUrl_h);
+                        };
+                        modalPsnFallbackGhost_h.onerror = function() {
+                            modalPsnFallbackGhost_h.onload = null;
+                            modalPsnFallbackGhost_h.onerror = null;
+                            modalGithubFallback_h();
+                        };
+                        modalPsnFallbackGhost_h.src = modalPsnFallbackUrl_h;
+                        return;
+                    }
                     modalGithubFallback_h();
                 };
                 modalPsnGhost_h.src = modalPsnUrl_h;
