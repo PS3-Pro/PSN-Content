@@ -16746,6 +16746,7 @@ P
 
 	window.markCoverLoaded = function(imgElement) {
 		if (!imgElement) return;
+		if (typeof window.markPsnStoreCoverEntry === 'function') window.markPsnStoreCoverEntry(imgElement);
 		imgElement.setAttribute('data-loaded', 'true');
 		const src = normalizeCoverSrcForCache(imgElement.currentSrc || imgElement.src);
 		if (!src) return;
@@ -16777,6 +16778,8 @@ P
 
 
 	window.__psnStoreMetadataCache = window.__psnStoreMetadataCache || {};
+	window.__psnStoreCoverEntryCache = window.__psnStoreCoverEntryCache || {};
+	window.__psnStoreNoSummaryCache = window.__psnStoreNoSummaryCache || {};
 
 	window.getPsnStoreLocale = function(region, contentId) {
 		const cleanRegion = String(region || '').trim().toUpperCase();
@@ -16798,6 +16801,27 @@ P
 		return `https://store.playstation.com/store/api/chihiro/00_09_000/${endpoint}/${locale.country}/${locale.language}/999/${encodeURIComponent(identifier)}${imageOnly ? '/image' : ''}`;
 	};
 
+	window.getPsnStoreEntryKey = function(titleId, contentId, region) {
+		return window.getPsnStoreApiUrl ? window.getPsnStoreApiUrl(titleId, contentId, region, false) : '';
+	};
+
+	window.markPsnStoreCoverEntry = function(imgElement) {
+		if (!imgElement) return;
+		const src = String(imgElement.currentSrc || imgElement.src || '').toLowerCase();
+		if (src.indexOf('store.playstation.com/store/api/chihiro/') === -1) return;
+		const card = imgElement.closest?.('.game-card') || null;
+		const titleId = imgElement.getAttribute('data-title-id') || card?.getAttribute('data-title-id') || '';
+		const contentId = imgElement.getAttribute('data-content-id') || card?.getAttribute('data-content-id') || '';
+		const region = imgElement.getAttribute('data-region') || card?.querySelector?.('.region-tag')?.textContent || '';
+		const key = window.getPsnStoreEntryKey(titleId, contentId, region);
+		if (key) window.__psnStoreCoverEntryCache[key] = true;
+	};
+
+	window.hasPsnStoreCoverEntry = function(titleId, contentId, region) {
+		const key = window.getPsnStoreEntryKey ? window.getPsnStoreEntryKey(titleId, contentId, region) : '';
+		return !!key && window.__psnStoreCoverEntryCache[key] === true && window.__psnStoreNoSummaryCache[key] !== true;
+	};
+
 	window.cleanPsnStoreDescription = function(value) {
 		const html = String(value || '')
 			.replace(/<br\s*\/?\s*>/gi, '\n')
@@ -16807,6 +16831,16 @@ P
 		const textarea = document.createElement('textarea');
 		textarea.innerHTML = html;
 		return textarea.value.replace(/\r/g, '').replace(/[ \t]+\n/g, '\n').replace(/\n[ \t]+/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+	};
+
+	window.getPsnStoreSummaryText = async function(titleId, contentId, region) {
+		if (!window.fetchPsnStoreMetadata || !window.cleanPsnStoreDescription) return '';
+		try {
+			const psnStoreData = await window.fetchPsnStoreMetadata(titleId, contentId, region);
+			return window.cleanPsnStoreDescription(psnStoreData?.long_desc || psnStoreData?.short_desc || '');
+		} catch (error) {
+			return '';
+		}
 	};
 
 	window.fetchPsnStoreMetadata = async function(titleId, contentId, region) {
@@ -18771,7 +18805,7 @@ P
 		}, 250);
 	};
 
-    window.openModal = function(index) {
+    window.openModal = function(index, forcedPsnStoreSummary = '', forceCompactDlc = false) {
 		if (typeof playUiModal === 'function') playUiModal();
 	
 		const game = filteredData[index];
@@ -18812,6 +18846,11 @@ P
 		const modalWishTitle = modalIsWishlisted ? 'Remove from Wishlist' : 'Add to Wishlist';
 		const modalSafeGameId = escapeGameTrophyJs(game.id || '');
 		const modalSafeContentId = escapeCategoryDotAttr(game.contentId || '');
+		const forcedPsnStoreSummaryText = String(forcedPsnStoreSummary || '').trim();
+		const psnStoreEntryKey = window.getPsnStoreEntryKey ? window.getPsnStoreEntryKey(game.id || '', game.contentId || '', game.region || '') : '';
+		const hasPsnDlcCoverEntry = currentCat === 'dlcs' && !forceCompactDlc && window.hasPsnStoreCoverEntry && window.hasPsnStoreCoverEntry(game.id || '', game.contentId || '', game.region || '');
+		const hasForcedPsnDlcSummary = currentCat === 'dlcs' && forcedPsnStoreSummaryText;
+		const modalSafeText = (value) => String(value === undefined || value === null ? '' : value).replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;' }[char]));
 
 		if (modalHeader) {
 			modalHeader.style.cssText = "display: flex !important; align-items: center !important; gap: 10px; margin: 0 !important;";
@@ -18866,7 +18905,7 @@ P
 		}
 
 		const allowedSummaryCats = ['demos', 'games', 'updates', 'ports', 'homebrew_games'];
-		const isPremium = allowedSummaryCats.includes(currentCat);
+		const isPremium = allowedSummaryCats.includes(currentCat) || hasForcedPsnDlcSummary || hasPsnDlcCoverEntry;
 		const modalContent = modal.querySelector('.sys-modal-content');
 
 		if (isPremium) {
@@ -18875,7 +18914,7 @@ P
 				<div style="display: flex; flex-direction: row; gap: 25px;">					
 					<div class="modal-left-col" style="width: 180px; flex-shrink: 0; display: flex; flex-direction: column; gap: 15px;">
 						<div class="${trailerClass}" ${trailerAttrs} style="margin: 0; width: 180px; height: 270px;">
-							<img src="${coverImg}" alt="Cover" class="modal-img" data-name="${game.cleanName.replace(/"/g, '&quot;')}" data-console="${game.cTag}" data-title-id="${game.id || ''}" data-content-id="${game.contentId || ''}" data-region="${game.region || ''}" data-github-cover="${githubCoverImg.replace(/"/g, '&quot;')}" onerror="handleCoverError(this, '${currentCat}')">
+							<img src="${coverImg}" alt="Cover" class="modal-img" data-name="${game.cleanName.replace(/"/g, '&quot;')}" data-console="${game.cTag}" data-title-id="${game.id || ''}" data-content-id="${game.contentId || ''}" data-region="${game.region || ''}" data-github-cover="${githubCoverImg.replace(/"/g, '&quot;')}" onload="markCoverLoaded(this)" onerror="handleCoverError(this, '${currentCat}')">
 							${trailerOverlayHtml}
 						</div>
 						<div class="modal-info-card ${currentCat === 'games' ? 'has-trophies-row' : ''}" style="background: rgba(0,0,0,0.2); border-radius: 6px; border: 1px solid rgba(255,255,255,0.05); padding: 12px; display: flex; flex-direction: column; gap: 8px;">
@@ -18903,15 +18942,69 @@ P
 				<div class="modal-divider" style="margin: 15px 0;"></div>
 				<div class="btn-group" style="margin-top: 0;">${actionsHtml}</div>
 			`;
-			fetchGameSummary(game.cleanName, game.id, game.contentId || '', game.region || '');
-			updateModalTrophyStatus(game, currentCat);
+			if (currentCat === 'dlcs') {
+				const summaryEl = document.getElementById('modal-summary');
+				const badgesEl = document.getElementById('modal-badges');
+				const extraMetaEl = document.getElementById('modal-extra-meta');
+				const screenshotsEl = document.getElementById('modal-screenshots-wrapper');
+				const screenshotsDividerEl = document.getElementById('modal-screenshots-divider');
+				const renderDlcPsnSummary = (summaryText) => {
+					if (summaryEl) {
+						summaryEl.innerHTML = '<span style="font-size: 10px; color: var(--text-muted); font-weight: bold; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px; display: block;"><i class="fas fa-align-left" style="margin-right: 4px;"></i> Summary</span>' + modalSafeText(summaryText).replace(/\n/g, '<br>');
+					}
+					if (badgesEl) {
+						badgesEl.classList.remove('rawg-badge-row');
+						badgesEl.innerHTML = '<span style="background:rgba(0,112,204,0.12); border:1px solid rgba(0,112,204,0.35); color:#9fd4ff; padding:3px 8px; border-radius:4px; font-size:11px; font-weight:bold;"><i class="fab fa-playstation"></i> PlayStation Store</span>';
+					}
+					if (extraMetaEl) extraMetaEl.innerHTML = '';
+					if (screenshotsEl) screenshotsEl.style.display = 'none';
+					if (screenshotsDividerEl) screenshotsDividerEl.style.display = 'none';
+					setGameModalNoScreenshots(modal, true);
+				};
+				if (forcedPsnStoreSummaryText) {
+					renderDlcPsnSummary(forcedPsnStoreSummaryText);
+				} else if (window.getPsnStoreSummaryText) {
+					if (summaryEl) {
+						summaryEl.innerHTML = `
+							<span style="font-size: 10px; color: var(--text-muted); font-weight: bold; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px; display: block;"><i class="fas fa-align-left" style="margin-right: 4px;"></i> Summary</span>
+							<div class="pulse-skeleton" style="width: 100%; height: 14px; margin-bottom: 8px; border-radius: 2px;"></div>
+							<div class="pulse-skeleton" style="width: 95%; height: 14px; margin-bottom: 8px; border-radius: 2px;"></div>
+							<div class="pulse-skeleton" style="width: 55%; height: 14px; border-radius: 2px;"></div>
+						`;
+					}
+					if (badgesEl) {
+						badgesEl.classList.remove('rawg-badge-row');
+						badgesEl.innerHTML = '<span style="background:rgba(0,112,204,0.12); border:1px solid rgba(0,112,204,0.35); color:#9fd4ff; padding:3px 8px; border-radius:4px; font-size:11px; font-weight:bold;"><i class="fab fa-playstation"></i> PlayStation Store</span>';
+					}
+					if (extraMetaEl) extraMetaEl.innerHTML = '';
+					if (screenshotsEl) screenshotsEl.style.display = 'none';
+					if (screenshotsDividerEl) screenshotsDividerEl.style.display = 'none';
+					setGameModalNoScreenshots(modal, true);
+					window.getPsnStoreSummaryText(game.id || '', game.contentId || '', game.region || '').then(summary => {
+						if (!modal || modal.style.display === 'none') return;
+						if (modal.dataset.storeCategory !== 'dlcs') return;
+						if (String(modal.dataset.modalIndex || '') !== String(index)) return;
+						if (String(modal.dataset.titleId || '') !== String(game.id || '')) return;
+						if (String(modal.dataset.contentId || '') !== String(game.contentId || '')) return;
+						if (summary) {
+							renderDlcPsnSummary(summary);
+						} else {
+							if (psnStoreEntryKey) window.__psnStoreNoSummaryCache[psnStoreEntryKey] = true;
+							openModal(index, '', true);
+						}
+					});
+				}
+			} else {
+				fetchGameSummary(game.cleanName, game.id, game.contentId || '', game.region || '');
+				updateModalTrophyStatus(game, currentCat);
+			}
 		} else {
 			modalContent.style.maxWidth = '650px';
 			modalBody.innerHTML = `
 				<div style="display: flex; flex-direction: row; gap: 30px; align-items: stretch;">					
 					<div class="modal-left-col" style="width: 180px; flex-shrink: 0; display: flex; flex-direction: column;">
 						<div class="${trailerClass} compact-cover" ${trailerAttrs} style="margin: 0; width: 180px; height: 248px; min-height: 248px;">
-							<img src="${coverImg}" alt="Cover" class="modal-img" data-name="${game.cleanName.replace(/"/g, '&quot;')}" data-console="${game.cTag}" data-title-id="${game.id || ''}" data-content-id="${game.contentId || ''}" data-region="${game.region || ''}" data-github-cover="${githubCoverImg.replace(/"/g, '&quot;')}" onerror="handleCoverError(this, '${currentCat}')">
+							<img src="${coverImg}" alt="Cover" class="modal-img" data-name="${game.cleanName.replace(/"/g, '&quot;')}" data-console="${game.cTag}" data-title-id="${game.id || ''}" data-content-id="${game.contentId || ''}" data-region="${game.region || ''}" data-github-cover="${githubCoverImg.replace(/"/g, '&quot;')}" onload="markCoverLoaded(this)" onerror="handleCoverError(this, '${currentCat}')">
 							${trailerOverlayHtml}
 						</div>
 					</div>
@@ -18938,6 +19031,28 @@ P
 					</div>
 				</div>
 			`;
+			if (currentCat === 'dlcs' && !forcedPsnStoreSummaryText && window.getPsnStoreSummaryText) {
+				const dlcSummaryToken = `${Date.now()}_${game.id || ''}_${game.contentId || ''}`;
+				modal.dataset.dlcPsnSummaryToken = dlcSummaryToken;
+				const dlcSummaryIndex = index;
+				const dlcSummaryId = String(game.id || '');
+				const dlcSummaryContentId = String(game.contentId || '');
+				window.getPsnStoreSummaryText(game.id || '', game.contentId || '', game.region || '').then(summary => {
+					const liveModal = document.getElementById('game-modal');
+					if (!summary || !liveModal || liveModal.style.display === 'none') return;
+					if (liveModal.dataset.dlcPsnSummaryToken !== dlcSummaryToken) return;
+					if (liveModal.dataset.storeCategory !== 'dlcs') return;
+					if (String(liveModal.dataset.modalIndex || '') !== String(dlcSummaryIndex)) return;
+					if (String(liveModal.dataset.titleId || '') !== dlcSummaryId) return;
+					if (String(liveModal.dataset.contentId || '') !== dlcSummaryContentId) return;
+					if (summary) {
+						openModal(dlcSummaryIndex, summary);
+					} else {
+						const noSummaryKey = window.getPsnStoreEntryKey ? window.getPsnStoreEntryKey(dlcSummaryId, dlcSummaryContentId, game.region || '') : '';
+						if (noSummaryKey) window.__psnStoreNoSummaryCache[noSummaryKey] = true;
+					}
+				});
+			}
 		}
 	
 		modal.style.display = 'flex';
