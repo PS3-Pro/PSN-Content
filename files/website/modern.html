@@ -12634,6 +12634,7 @@ P
 
 	function buildExploreCardHTML(game, cat, idx, animateCards) {
 		const imgUrl = getItemCover(game, cat);
+		const githubCoverUrl = getGithubItemCover(game, cat);
 		const consoleClasses = ['ps3', 'ps2', 'psx', 'psp', 'minis', 'pce', 'neogeo'];
 		const tagClass = consoleClasses.includes(game.cTag) ? `tag-${game.cTag}` : 'tag-default';
 		const consoleName = String(game.cTag || '').toUpperCase();
@@ -12653,7 +12654,7 @@ P
 					<div class="console-tag ${tagClass}">${consoleName}</div>
 					<div class="region-tag">${safeRegion}</div>
 					${dateHtml}
-					<img src="${imgUrl}" alt="Cover" class="game-img" loading="eager" decoding="async" data-name="${safeNameAttr}" data-console="${escapeExploreHtmlAttr(game.cTag)}" onload="markCoverLoaded(this)" onerror="handleCoverError(this, '${safeCat}')">
+					<img src="${imgUrl}" alt="Cover" class="game-img" loading="eager" decoding="async" data-name="${safeNameAttr}" data-console="${escapeExploreHtmlAttr(game.cTag)}" data-github-cover="${escapeExploreHtmlAttr(githubCoverUrl)}" data-title-id="${escapeExploreHtmlAttr(game.id || '')}" data-content-id="${escapeExploreHtmlAttr(game.contentId || '')}" data-region="${safeRegion}" onload="markCoverLoaded(this)" onerror="handleCoverError(this, '${safeCat}')">
 				</div>
 				<div class="game-info" style="padding: 10px; min-height: 0;">
 					<div style="display: flex; flex-direction: column; justify-content: space-between; height: 100%;">
@@ -16699,7 +16700,7 @@ P
 		return `${THEME_COVERS_BASE}/${encodeURIComponent(titleId)}/${encodeURIComponent(contentId)}.png`;
 	}
 
-	function getItemCover(item, category) {
+	function getGithubItemCover(item, category) {
 		const cat = category || item?.category || "";
 		if (cat === "avatars") {
 			return getAvatarCover(item?.id || item?.titleId, item?.contentId);
@@ -16708,6 +16709,17 @@ P
 			return getThemeCover(item?.id || item?.titleId, item?.contentId);
 		}
 		return getOptimizedCover(item?.id || item?.titleId || item);
+	}
+
+	function getItemCover(item, category) {
+		const cat = category || item?.category || "";
+		if (cat === 'dlcs') {
+			const psnFirstCover = window.getPsnStoreApiUrl
+				? window.getPsnStoreApiUrl(item?.id || item?.titleId, item?.contentId, item?.region, true)
+				: '';
+			return psnFirstCover || getGithubItemCover(item, cat);
+		}
+		return getGithubItemCover(item, cat);
 	}
 
 	window.__cardCoverSrcCache = window.__cardCoverSrcCache || {};
@@ -16763,6 +16775,93 @@ P
 		});
 	};
 
+
+	window.__psnStoreMetadataCache = window.__psnStoreMetadataCache || {};
+
+	window.getPsnStoreLocale = function(region, contentId) {
+		const cleanRegion = String(region || '').trim().toUpperCase();
+		const cleanContentId = String(contentId || '').trim().toUpperCase();
+		if (cleanContentId.startsWith('JP') || cleanRegion === 'JP') return { country: 'JP', language: 'ja' };
+		if (cleanContentId.startsWith('KP') || cleanRegion === 'KR') return { country: 'KR', language: 'ko' };
+		if (cleanContentId.startsWith('HP') || cleanContentId.startsWith('AP') || cleanRegion === 'ASIA') return { country: 'HK', language: 'en' };
+		if (cleanContentId.startsWith('EP') || cleanRegion === 'EU') return { country: 'GB', language: 'en' };
+		return { country: 'US', language: 'en' };
+	};
+
+	window.getPsnStoreApiUrl = function(titleId, contentId, region, imageOnly = false) {
+		const cleanContentId = String(contentId || '').trim();
+		const cleanTitleId = String(titleId || '').trim();
+		const identifier = cleanContentId && cleanContentId !== 'MISSING' ? cleanContentId : cleanTitleId;
+		if (!identifier) return '';
+		const locale = window.getPsnStoreLocale(region, cleanContentId);
+		const endpoint = cleanContentId && cleanContentId !== 'MISSING' ? 'container' : 'titlecontainer';
+		return `https://store.playstation.com/store/api/chihiro/00_09_000/${endpoint}/${locale.country}/${locale.language}/999/${encodeURIComponent(identifier)}${imageOnly ? '/image' : ''}`;
+	};
+
+	window.cleanPsnStoreDescription = function(value) {
+		const html = String(value || '')
+			.replace(/<br\s*\/?\s*>/gi, '\n')
+			.replace(/<\/p\s*>/gi, '\n\n')
+			.replace(/<p(?:\s[^>]*)?>/gi, '')
+			.replace(/<[^>]+>/g, '');
+		const textarea = document.createElement('textarea');
+		textarea.innerHTML = html;
+		return textarea.value.replace(/\r/g, '').replace(/[ \t]+\n/g, '\n').replace(/\n[ \t]+/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+	};
+
+	window.fetchPsnStoreMetadata = async function(titleId, contentId, region) {
+		const apiUrl = window.getPsnStoreApiUrl(titleId, contentId, region, false);
+		if (!apiUrl) return null;
+		if (Object.prototype.hasOwnProperty.call(window.__psnStoreMetadataCache, apiUrl)) return window.__psnStoreMetadataCache[apiUrl];
+
+		const encoded = encodeURIComponent(apiUrl);
+		const attempts = [
+			apiUrl,
+			`https://api.allorigins.win/raw?url=${encoded}`,
+			`https://corsproxy.io/?${encoded}`
+		];
+		let result = null;
+		for (const url of attempts) {
+			const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+			const timer = controller ? setTimeout(() => controller.abort(), 3500) : null;
+			try {
+				const response = await fetch(url, { cache: 'force-cache', signal: controller ? controller.signal : undefined });
+				if (timer) clearTimeout(timer);
+				if (!response.ok) continue;
+				const data = await response.json();
+				if (data && typeof data === 'object') { result = data; break; }
+			} catch (error) {
+				if (timer) clearTimeout(timer);
+			}
+		}
+		window.__psnStoreMetadataCache[apiUrl] = result;
+		return result;
+	};
+
+	window.tryPsnStoreCover = function(imgElement, category) {
+		if (!imgElement || imgElement.getAttribute('data-psn-store-tried') === 'true') return false;
+		const card = imgElement.closest?.('.game-card') || null;
+		const titleId = imgElement.getAttribute('data-title-id') || card?.getAttribute('data-title-id') || '';
+		const contentId = imgElement.getAttribute('data-content-id') || card?.getAttribute('data-content-id') || '';
+		const region = imgElement.getAttribute('data-region') || card?.querySelector?.('.region-tag')?.textContent || '';
+		const psnImage = window.getPsnStoreApiUrl(titleId, contentId, region, true);
+		if (!psnImage) return false;
+		imgElement.setAttribute('data-psn-store-tried', 'true');
+		imgElement.src = psnImage;
+		return true;
+	};
+
+	window.tryGithubCoverAfterPsn = function(imgElement, category) {
+		const cat = String(category || imgElement?.getAttribute?.('data-cover-category') || '').trim().toLowerCase();
+		if (!imgElement || cat !== 'dlcs' || imgElement.getAttribute('data-github-cover-tried') === 'true') return false;
+		const githubCover = normalizeCoverSrcForCache(imgElement.getAttribute('data-github-cover') || '');
+		const currentSrc = normalizeCoverSrcForCache(imgElement.currentSrc || imgElement.src);
+		if (!githubCover || githubCover === currentSrc) return false;
+		imgElement.setAttribute('data-github-cover-tried', 'true');
+		imgElement.src = githubCover;
+		return true;
+	};
+
 	window.isDirectNoBingCover = function(imgElement, category) {
 		const cat = String(category || imgElement?.getAttribute?.('data-cover-category') || '').trim().toLowerCase();
 		const noBingAttr = String(imgElement?.getAttribute?.('data-no-bing') || '').toLowerCase() === 'true';
@@ -16771,6 +16870,16 @@ P
 	};
 
 	window.handleCoverError = function(imgElement, category) {
+		const cat = String(category || imgElement?.getAttribute?.('data-cover-category') || '').trim().toLowerCase();
+
+		if (cat === 'dlcs') {
+			if (window.tryGithubCoverAfterPsn && window.tryGithubCoverAfterPsn(imgElement, cat)) return;
+			getOnlineCoverFallback(imgElement);
+			return;
+		}
+
+		if (window.tryPsnStoreCover && window.tryPsnStoreCover(imgElement, category)) return;
+
 		if (window.isDirectNoBingCover && window.isDirectNoBingCover(imgElement, category)) {
 			imgElement.onerror = null;
 			imgElement.src = FALLBACK_IMG;
@@ -17732,6 +17841,7 @@ P
 			const game = renderItem.game;
 			const sourceIndex = typeof renderItem.sourceIndex === 'number' ? renderItem.sourceIndex : i;
 			const imgUrl = getItemCover(game, currentCat);
+			const githubCoverUrl = getGithubItemCover(game, currentCat);
 			
 			if (renderItem.isGroup) {
 				const groupItems = Array.isArray(renderItem.items) ? renderItem.items : [];
@@ -17753,7 +17863,7 @@ P
 				<div class="game-img-container">
 					<div class="console-tag ${tagClass}">${consoleName}</div>
 					<div class="region-tag">${regionLabel}</div>
-					<img src="${imgUrl}" alt="Cover" class="game-img" loading="lazy" data-name="${game.cleanName.replace(/"/g, '&quot;')}" data-console="${game.cTag}" onload="markCoverLoaded(this)" onerror="handleCoverError(this, '${currentCat}')">
+					<img src="${imgUrl}" alt="Cover" class="game-img" loading="lazy" data-name="${game.cleanName.replace(/"/g, '&quot;')}" data-console="${game.cTag}" data-github-cover="${githubCoverUrl.replace(/"/g, '&quot;')}" data-title-id="${game.id || ''}" data-content-id="${game.contentId || ''}" data-region="${game.region || ''}" onload="markCoverLoaded(this)" onerror="handleCoverError(this, '${currentCat}')">
 				</div>
 				<div class="game-info" style="padding: 10px; min-height: 0;">
 					<div style="display: flex; flex-direction: column; justify-content: space-between; height: 100%;">
@@ -17830,7 +17940,7 @@ P
 					<div class="wish-btn" title="Add to Wishlist" onclick="toggleWishlist(event, '${game.id}')">
 						<i class="${heartIcon}" style="color: ${heartColor}; font-size: 14px;"></i>
 					</div>
-					<img src="${imgUrl}" alt="Cover" class="game-img" loading="lazy" data-name="${game.cleanName.replace(/"/g, '&quot;')}" data-console="${game.cTag}" onload="markCoverLoaded(this)" onerror="handleCoverError(this, '${currentCat}')">
+					<img src="${imgUrl}" alt="Cover" class="game-img" loading="lazy" data-name="${game.cleanName.replace(/"/g, '&quot;')}" data-console="${game.cTag}" data-github-cover="${githubCoverUrl.replace(/"/g, '&quot;')}" data-title-id="${game.id || ''}" data-content-id="${game.contentId || ''}" data-region="${game.region || ''}" onload="markCoverLoaded(this)" onerror="handleCoverError(this, '${currentCat}')">
 					<div class="card-details-hint" aria-hidden="true"><i class="fas fa-circle-info"></i><span>Details</span></div>
 				</div>
 				<div class="game-info">
@@ -18709,6 +18819,7 @@ P
 		}
 		
 		const coverImg = getItemCover(game, currentCat);
+		const githubCoverImg = getGithubItemCover(game, currentCat);
 		let displayVersion = game.version ? game.version.replace(/v/gi, '').trim() : "";
 		const titleHtml = game.cleanName + (displayVersion ? ` <span style="color:#FF1493; font-size:14px;">[v${displayVersion}]</span>` : "");
 		const typeText = (currentCat === 'games') ? game.cTag.toUpperCase() + " Game" : catSelect.options[catSelect.selectedIndex].text;
@@ -18764,7 +18875,7 @@ P
 				<div style="display: flex; flex-direction: row; gap: 25px;">					
 					<div class="modal-left-col" style="width: 180px; flex-shrink: 0; display: flex; flex-direction: column; gap: 15px;">
 						<div class="${trailerClass}" ${trailerAttrs} style="margin: 0; width: 180px; height: 270px;">
-							<img src="${coverImg}" alt="Cover" class="modal-img" data-name="${game.cleanName.replace(/"/g, '&quot;')}" data-console="${game.cTag}" onerror="handleCoverError(this, '${currentCat}')">
+							<img src="${coverImg}" alt="Cover" class="modal-img" data-name="${game.cleanName.replace(/"/g, '&quot;')}" data-console="${game.cTag}" data-title-id="${game.id || ''}" data-content-id="${game.contentId || ''}" data-region="${game.region || ''}" data-github-cover="${githubCoverImg.replace(/"/g, '&quot;')}" onerror="handleCoverError(this, '${currentCat}')">
 							${trailerOverlayHtml}
 						</div>
 						<div class="modal-info-card ${currentCat === 'games' ? 'has-trophies-row' : ''}" style="background: rgba(0,0,0,0.2); border-radius: 6px; border: 1px solid rgba(255,255,255,0.05); padding: 12px; display: flex; flex-direction: column; gap: 8px;">
@@ -18792,7 +18903,7 @@ P
 				<div class="modal-divider" style="margin: 15px 0;"></div>
 				<div class="btn-group" style="margin-top: 0;">${actionsHtml}</div>
 			`;
-			fetchGameSummary(game.cleanName, game.id);
+			fetchGameSummary(game.cleanName, game.id, game.contentId || '', game.region || '');
 			updateModalTrophyStatus(game, currentCat);
 		} else {
 			modalContent.style.maxWidth = '650px';
@@ -18800,7 +18911,7 @@ P
 				<div style="display: flex; flex-direction: row; gap: 30px; align-items: stretch;">					
 					<div class="modal-left-col" style="width: 180px; flex-shrink: 0; display: flex; flex-direction: column;">
 						<div class="${trailerClass} compact-cover" ${trailerAttrs} style="margin: 0; width: 180px; height: 248px; min-height: 248px;">
-							<img src="${coverImg}" alt="Cover" class="modal-img" data-name="${game.cleanName.replace(/"/g, '&quot;')}" data-console="${game.cTag}" onerror="handleCoverError(this, '${currentCat}')">
+							<img src="${coverImg}" alt="Cover" class="modal-img" data-name="${game.cleanName.replace(/"/g, '&quot;')}" data-console="${game.cTag}" data-title-id="${game.id || ''}" data-content-id="${game.contentId || ''}" data-region="${game.region || ''}" data-github-cover="${githubCoverImg.replace(/"/g, '&quot;')}" onerror="handleCoverError(this, '${currentCat}')">
 							${trailerOverlayHtml}
 						</div>
 					</div>
@@ -18952,7 +19063,7 @@ P
 		scheduleModalSummaryAlignment();
 	}
 	
-	window.fetchGameSummary = async function(gameName, gameId) {
+	window.fetchGameSummary = async function(gameName, gameId, contentId = '', region = '') {
 		const summaryContainer = document.getElementById('modal-summary');
 		const screenshotsWrapper = document.getElementById('modal-screenshots-wrapper');
 		const badgesContainer = document.getElementById('modal-badges');
@@ -19081,6 +19192,12 @@ P
 		
 		const searchQueries = [...new Set([gameName, baseName, gameId])].filter(q => q);
 		let summaryTitleHtml = '<span style="font-size: 10px; color: var(--text-muted); font-weight: bold; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px; display: block;"><i class="fas fa-align-left" style="margin-right: 4px;"></i> Summary</span>';
+		let psnStoreSummary = '';
+		try {
+			const psnStoreData = await window.fetchPsnStoreMetadata(gameId, contentId, region);
+			psnStoreSummary = window.cleanPsnStoreDescription(psnStoreData?.long_desc || psnStoreData?.short_desc || '');
+			if (psnStoreSummary) summaryContainer.innerHTML = summaryTitleHtml + modalSafeText(psnStoreSummary).replace(/\n/g, '<br>');
+		} catch (error) {}
 	
 		for (let query of searchQueries) {
 			let querySuccess = false;
@@ -19138,7 +19255,7 @@ P
 							finalDesc = detailsData.description.trim();
 						}
 						
-						summaryContainer.innerHTML = summaryTitleHtml + finalDesc;
+						if (!psnStoreSummary) summaryContainer.innerHTML = summaryTitleHtml + finalDesc;
 						if (modalRoot && modalRoot.classList.contains('modal-no-screenshots')) scheduleModalSummaryAlignment();
 						return;
 					} else {
@@ -19163,7 +19280,7 @@ P
 				const page = detailsData.query.pages[pageId];
 	
 				if (page && page.extract) {
-					summaryContainer.innerHTML = summaryTitleHtml + page.extract.trim().replace(/\n+/g, '<br><br>');
+					if (!psnStoreSummary) summaryContainer.innerHTML = summaryTitleHtml + page.extract.trim().replace(/\n+/g, '<br><br>');
 					
 					if (badgesContainer.querySelector('.pulse-skeleton')) {
 						const yearMatch = page.extract.match(/\b(19|20)\d{2}\b/);
@@ -19187,7 +19304,7 @@ P
 			}
 		} catch (e) {}
 
-		summaryContainer.innerHTML = summaryTitleHtml + "No description available.";
+		if (!psnStoreSummary) summaryContainer.innerHTML = summaryTitleHtml + "No description available.";
 		if (modalRoot && modalRoot.classList.contains('modal-no-screenshots')) scheduleModalSummaryAlignment();
 		if (badgesContainer) { badgesContainer.innerHTML = ''; badgesContainer.classList.remove('rawg-badge-row'); }
 		if (extraMetaContainer) extraMetaContainer.innerHTML = '';
@@ -20337,6 +20454,7 @@ P
 			const dlCoverData = (typeof window.getDownloadCoverData === 'function') ? window.getDownloadCoverData(dl, resolvedDlCategory) : { id: dl.titleId, titleId: dl.titleId, contentId: dl.contentId, cleanName: dl.cleanName || dl.name, cTag: dl.cTag || dl.console || 'ps3', category: resolvedDlCategory };
 			const dlFinalCategory = dlCoverData.category || resolvedDlCategory;
 			const coverImg = getItemCover(dlCoverData, dlFinalCategory);
+			const githubCoverImg = getGithubItemCover(dlCoverData, dlFinalCategory);
 			const dlCoverName = String(dlCoverData.cleanName || dl.cleanName || dl.name || dl.titleId || '').replace(/"/g, '&quot;');
 			const dlCoverConsole = String(dlCoverData.cTag || dl.cTag || dl.console || 'ps3').replace(/"/g, '&quot;');
 			const dlCoverCategoryRaw = String(dlFinalCategory || 'games');
@@ -20352,7 +20470,7 @@ P
 					onclick="playUiClick(); switchAndSearch('${dlFinalCategory}', '${dl.titleId}', 'downloads', '${(dlCoverData.contentId || dl.contentId || '').replace(/'/g, "\\'")}')">
 					
 					<div class="dl-cover-wrap dl-cover-main">
-						<img src="${coverImg}" class="dl-mini-cover" data-name="${dlCoverName}" data-console="${dlCoverConsole}" data-cover-category="${dlCoverCategory}" data-no-bing="${dlNoBingCover}" onerror="handleCoverError(this, this.getAttribute('data-cover-category'))">
+						<img src="${coverImg}" class="dl-mini-cover" data-name="${dlCoverName}" data-console="${dlCoverConsole}" data-cover-category="${dlCoverCategory}" data-no-bing="${dlNoBingCover}" data-title-id="${dlCoverData.id || dlCoverData.titleId || ''}" data-content-id="${dlCoverData.contentId || ''}" data-region="${dlCoverData.region || ''}" data-github-cover="${String(githubCoverImg || '').replace(/"/g, '&quot;')}" onerror="handleCoverError(this, this.getAttribute('data-cover-category'))">
 						${typeTagHtml}
 					</div>
 					
@@ -25051,6 +25169,7 @@ P
 			const wishDotKey = (typeof getWishlistDotKey === 'function') ? getWishlistDotKey(game) : (game.contentId || game.id || '');
 			const resolvedWishCategory = (typeof window.getWishlistItemCategoryKey === 'function') ? window.getWishlistItemCategoryKey(game) : (game.category || 'games');
 			const imgUrl = (typeof window.getCachedCardCoverSrc === 'function' ? window.getCachedCardCoverSrc(wishDotKey) : '') || getItemCover(game, resolvedWishCategory);
+			const githubCoverUrl = getGithubItemCover(game, resolvedWishCategory);
 			const tagClass = `tag-${game.cTag}`;
 			
 			const shouldShowWishTypeTag = catFilter === 'ALL';
@@ -25065,7 +25184,7 @@ P
 					<div class="wish-btn" title="Remove from Wishlist" onclick="toggleWishlist(event, '${game.id}')">
 						<i class="fas fa-heart" style="color: #ff4444; font-size: 14px;"></i>
 					</div>
-					<img src="${imgUrl}" class="game-img" loading="lazy" data-cover-key="${escapeCategoryDotAttr(wishDotKey)}" data-name="${(game.cleanName || '').replace(/"/g, '&quot;')}" data-console="${game.cTag}" onload="markCoverLoaded(this)" onerror="handleCoverError(this, '${resolvedWishCategory}')">
+					<img src="${imgUrl}" class="game-img" loading="lazy" data-cover-key="${escapeCategoryDotAttr(wishDotKey)}" data-name="${(game.cleanName || '').replace(/"/g, '&quot;')}" data-console="${game.cTag}" data-github-cover="${String(githubCoverUrl || '').replace(/"/g, '&quot;')}" data-title-id="${game.id || ''}" data-content-id="${game.contentId || ''}" data-region="${game.region || ''}" onload="markCoverLoaded(this)" onerror="handleCoverError(this, '${resolvedWishCategory}')">
 				</div>
 				<div class="game-info" style="padding: 10px; min-height: 0;">
 					<div style="display: flex; flex-direction: column; justify-content: space-between; height: 100%;">
@@ -27869,8 +27988,8 @@ P
 	
 			if (!window.libCoverCache[game.path]) {
 				const gameId = game.id || (game.path.match(/[A-Z]{4}\d{5}/) ? game.path.match(/[A-Z]{4}\d{5}/)[0] : null);
-				const localCover = String(game.cover || '').trim();
-				const hasUsableLocalCover = !!localCover && localCover !== FALLBACK_IMG && !/NOCOVER00\.JPG/i.test(localCover);
+				const githubCover = String(game.cover || '').trim();
+				const hasUsableLocalCover = !!githubCover && localCover !== FALLBACK_IMG && !/NOCOVER00\.JPG/i.test(localCover);
 				const smartCover = (gameId && isNaN(gameId))
 					? getOptimizedCover(gameId)
 					: (hasUsableLocalCover ? localCover : 'data:image/png;base64,BING');
@@ -45562,6 +45681,7 @@ function getVisibleChatStackEl(id) {
 				const itemCover = (typeof window.getProfileListSafeCover === 'function')
 					? window.getProfileListSafeCover({ item, listType, itemCoverData, itemFinalCategory, itemCoverId, isMe })
 					: (profileUsesBingCover ? ((typeof getItemCover === 'function' && itemCoverId && isNaN(itemCoverId)) ? getItemCover(itemCoverData, itemFinalCategory) : (item.cover || FALLBACK_IMG)) : ((typeof getOptimizedCover === 'function' && itemCoverId && isNaN(itemCoverId)) ? getOptimizedCover(itemCoverId) : FALLBACK_IMG));
+				const itemGithubCover = (typeof window.getGithubItemCover === 'function' && itemCoverId && isNaN(itemCoverId)) ? window.getGithubItemCover(itemCoverData, itemFinalCategory) : FALLBACK_IMG;
 				const itemCoverName = window.escapePlayerListText(itemCoverData.cleanName || itemName);
 				const itemCoverConsole = window.escapePlayerListText(itemConsoleTag);
 				const itemCoverCategoryRaw = String(itemFinalCategory || itemTypeCategory || 'games');
@@ -45636,8 +45756,8 @@ function getVisibleChatStackEl(id) {
 				const typeTagHtml = window.getDownloadTypeTagHtml(itemFinalCategory || itemTypeCategory, itemCoverData || item);
 				const typeClass = `dl-kind-${typeMeta.cls || 'default'}`;
 				const profileCoverImgHtml = profileUsesBingCover
-					? `<img src="${itemCover}" data-name="${itemCoverName}" data-console="${itemCoverConsole}" data-cover-category="${itemCoverCategory}" data-no-bing="${itemNoBingCover}" onerror="handleCoverError(this, this.getAttribute('data-cover-category'))">`
-					: `<img src="${itemCover}" data-name="${itemCoverName}" data-console="${itemCoverConsole}" data-cover-category="${itemCoverCategory}" onerror="handleCoverError(this, this.getAttribute('data-cover-category'))">`;
+					? `<img src="${itemCover}" data-name="${itemCoverName}" data-console="${itemCoverConsole}" data-cover-category="${itemCoverCategory}" data-no-bing="${itemNoBingCover}" data-title-id="${itemCoverData.id || itemCoverData.titleId || ''}" data-content-id="${itemCoverData.contentId || ''}" data-region="${itemCoverData.region || ''}" data-github-cover="${String(itemGithubCover || '').replace(/"/g, '&quot;')}" onerror="handleCoverError(this, this.getAttribute('data-cover-category'))">`
+					: `<img src="${itemCover}" data-name="${itemCoverName}" data-console="${itemCoverConsole}" data-cover-category="${itemCoverCategory}" data-github-cover="${String(itemGithubCover || '').replace(/"/g, '&quot;')}" data-title-id="${itemCoverData.id || itemCoverData.titleId || ''}" data-content-id="${itemCoverData.contentId || ''}" data-region="${itemCoverData.region || ''}" onerror="handleCoverError(this, this.getAttribute('data-cover-category'))">`;
 
 				html += `
 					<div class="download-item social-list-item ${typeClass}" onmouseenter="if(typeof playUiHover === 'function') playUiHover()" ${clickAction} ${cursorStyle}>
