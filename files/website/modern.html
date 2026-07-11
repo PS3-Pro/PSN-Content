@@ -15252,12 +15252,13 @@ P
 	}
 
 	function isBulkDownloadCategory(category) {
-		return category === 'dlcs' || category === 'avatars';
+		return category === 'dlcs' || category === 'avatars' || category === 'themes';
 	}
 
 	function getBulkDownloadCategoryLabel(category, plural) {
 		if (category === 'dlcs') return plural ? 'DLCs' : 'DLC';
 		if (category === 'avatars') return plural ? 'avatars' : 'avatar';
+		if (category === 'themes') return plural ? 'themes' : 'theme';
 		return plural ? 'items' : 'item';
 	}
 
@@ -15267,6 +15268,50 @@ P
 		if (!isBulkDownloadCategory(currentCat) || !Array.isArray(filteredData)) return [];
 		return filteredData.filter(game => game && getBulkPkgDownloadType(game));
 	}
+
+	function getBulkDownloadTitleId(game) {
+		return String(game && (game.id || game.titleId || game.titleID || game.titleid) || '').trim().toUpperCase();
+	}
+
+	function getBulkDownloadSharedTitleId(items) {
+		if (!Array.isArray(items) || !items.length) return '';
+		let sharedId = '';
+		for (const item of items) {
+			const titleId = getBulkDownloadTitleId(item);
+			if (!titleId) return '';
+			if (!sharedId) sharedId = titleId;
+			else if (sharedId !== titleId) return '';
+		}
+		return sharedId;
+	}
+
+	function canShowBulkDownloadSearchAllButton(itemsOverride) {
+		const searchInput = document.getElementById('search-input');
+		const searchTerm = searchInput ? String(searchInput.value || '').trim() : '';
+		if (!searchTerm) return false;
+		if (!Array.isArray(filteredData) || filteredData.length <= 1) return false;
+
+		const items = Array.isArray(itemsOverride) ? itemsOverride : getCurrentBulkDownloadItems();
+		if (!items || items.length <= 1) return false;
+
+		const sharedResultsId = getBulkDownloadSharedTitleId(filteredData);
+		const sharedDownloadsId = getBulkDownloadSharedTitleId(items);
+		return !!(sharedResultsId && sharedDownloadsId && sharedResultsId === sharedDownloadsId);
+	}
+
+	function canShowBulkDownloadAllButton() {
+		const catSelect = document.getElementById('cat-select');
+		const currentCat = catSelect ? catSelect.value : '';
+		if (!isBulkDownloadCategory(currentCat) || browseExpandedGroupTitle) return false;
+
+		const items = getCurrentBulkDownloadItems();
+		if (!items.length || items.length <= 1) return false;
+
+		if (navHistory) return true;
+		return canShowBulkDownloadSearchAllButton(items);
+	}
+
+	window.canShowBulkDownloadAllButton = canShowBulkDownloadAllButton;
 
 	window.getBulkDownloadStats = function() {
 		const items = getCurrentBulkDownloadItems();
@@ -15406,6 +15451,13 @@ P
 
 		if (items.length <= 1) {
 			const message = 'Download All is only available when this page has more than one ' + getBulkDownloadCategoryLabel(currentCat, false) + '.';
+			if (typeof showNotification === 'function') showNotification(message, 'info');
+			else alert(message);
+			return;
+		}
+
+		if (!navHistory && !canShowBulkDownloadSearchAllButton(items)) {
+			const message = 'Download All is only available when the search results belong to the same Title ID.';
 			if (typeof showNotification === 'function') showNotification(message, 'info');
 			else alert(message);
 			return;
@@ -17806,7 +17858,7 @@ P
 							<i class="fas fa-arrow-left"></i> Go back to ${prevLabel}
 						</button>
 						<div class="browse-nav-actions">
-							${(typeof isBulkDownloadCategory === 'function' && isBulkDownloadCategory(currentCat) && !browseExpandedGroupTitle && typeof window.getBulkDownloadStats === 'function' && window.getBulkDownloadStats().pkgCount > 1) ? `<button type="button" class="download-all-btn" title="Download all ${getBulkDownloadCategoryLabel(currentCat, true)} PKGs and RAP licenses from this page" onmouseenter="playUiHover()" onclick="downloadAllCurrentPage(event, this); return false;"><i class="fas fa-download"></i> Download All</button>` : ''}
+							${(typeof canShowBulkDownloadAllButton === 'function' && canShowBulkDownloadAllButton()) ? `<button type="button" class="download-all-btn" title="Download all ${getBulkDownloadCategoryLabel(currentCat, true)} PKGs and RAP licenses from this page" onmouseenter="playUiHover()" onclick="downloadAllCurrentPage(event, this); return false;"><i class="fas fa-download"></i> Download All</button>` : ''}
 							<button type="button" title="Dismiss navigation" onmouseenter="playUiHover()" onclick="dismissBrowseNavigation(event); return false;" style="background: transparent; border: none; color: rgba(255,255,255,0.4); cursor: pointer; font-size: 18px; padding: 5px 10px; transition: all 0.2s ease;" onmouseover="this.style.color='#ff4444'; this.style.transform='scale(1.1)';" onmouseout="this.style.color='rgba(255,255,255,0.4)'; this.style.transform='scale(1)';">
 								<i class="fas fa-times"></i>
 							</button>
@@ -17815,6 +17867,24 @@ P
 			}
 		}
 		
+		if (!backButtonHtml && typeof canShowBulkDownloadSearchAllButton === 'function' && canShowBulkDownloadSearchAllButton()) {
+			const bulkItems = getCurrentBulkDownloadItems();
+			const bulkStats = window.getBulkDownloadStats ? window.getBulkDownloadStats() : { pkgCount: bulkItems.length, rapCount: bulkItems.filter(hasValidRapDownload).length };
+			const bulkTitleId = getBulkDownloadSharedTitleId(bulkItems);
+			const bulkCategoryLabel = getBulkDownloadCategoryLabel(currentCat, true);
+			const bulkRapText = bulkStats.rapCount ? ` + ${bulkStats.rapCount} RAP${bulkStats.rapCount === 1 ? '' : 's'}` : '';
+			backButtonHtml = `
+				<div class="browse-nav-return-bar" style="grid-column: 1/-1; margin-bottom: 15px; display: flex; align-items: center; justify-content: space-between; background: rgba(255,255,255,0.03); border-radius: 8px; padding: 6px 12px;">
+					<span style="display: inline-flex; align-items: center; gap: 8px; color: rgba(255,255,255,0.78); font-size: 12px; font-weight: 700; letter-spacing: .2px; min-width: 0;">
+						<i class="fas fa-layer-group" style="color: #73ff9a;"></i>
+						<span style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">${bulkStats.pkgCount} ${bulkCategoryLabel} for ${bulkTitleId}${bulkRapText}</span>
+					</span>
+					<div class="browse-nav-actions">
+						<button type="button" class="download-all-btn" title="Download all ${bulkCategoryLabel} PKGs and RAP licenses from this search" onmouseenter="playUiHover()" onclick="downloadAllCurrentPage(event, this); return false;"><i class="fas fa-download"></i> Download All</button>
+					</div>
+				</div>`;
+		}
+
 		if (!isAppending) {
 			const missingRapToggleForCount = document.getElementById('show-missing-rap-toggle');
 			const canFilterMissingRapForCount = window.__browseCanFilterMissingRap !== false;
