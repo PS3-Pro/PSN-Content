@@ -593,6 +593,7 @@ select option { background-color: var(--bg-dark); }
 .sys-modal-overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0, 0, 0, 0.4); backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); z-index: 10000; display: none; justify-content: center; align-items: center; opacity: 0; transition: opacity 0.3s ease; }
 .sys-modal-overlay.show { display: flex; opacity: 1; }
 .sys-modal-content { background: rgba(18, 24, 36, 0.85); border: 1px solid rgba(255, 255, 255, 0.2); border-radius: 12px; width: 90%; max-width: 450px; box-shadow: 0 10px 40px rgba(0, 0, 0, 0.8), 0 0 20px rgba(255, 255, 255, 0.05); backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px); transform: translateY(20px) scale(0.95); transition: all 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275); overflow: hidden; }
+#game-modal .sys-modal-content { transition: transform 0.3s cubic-bezier(0.2, 0.8, 0.2, 1) !important; transform-origin: center center; }
 .sys-modal-overlay.show .sys-modal-content { transform: translateY(0) scale(1); }
 .sys-modal-header { padding: 20px; border-bottom: 1px solid rgba(255, 255, 255, 0.1); display: flex; justify-content: space-between; align-items: center; }
 .sys-modal-header h2 { margin: 0; font-size: 18px; font-weight: bold; color: #fff; display: flex; align-items: center; gap: 10px; line-height: 1; }
@@ -3838,6 +3839,7 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 .rawg-chip { display:inline-flex; align-items:center; gap:5px; border-radius:999px; padding:4px 9px; font-size:10.5px; font-weight:800; line-height:1; letter-spacing:.2px; white-space:nowrap; }
 .rawg-chip i { font-size:10px; opacity:.9; }
 .rawg-chip-year { background:rgba(255, 255, 255, .055); border:1px solid rgba(255, 255, 255, .12); color:#d8e2f0; }
+.rawg-chip-store { background:rgba(0, 112, 204, .12); border:1px solid rgba(0, 112, 204, .35); color:#9fd4ff; }
 .rawg-chip-score { background:rgba(0, 0, 0, .38); }
 .rawg-chip-genre { background:rgba(0, 112, 204, .13); border:1px solid rgba(0, 174, 255, .28); color:#aee7ff; }
 .rawg-chip-mode { background:rgba(255, 255, 255, .06); border:1px solid rgba(255, 255, 255, .16); color:#fff; }
@@ -16946,6 +16948,14 @@ P
 		return best;
 	};
 
+	window.extractPsnStoreProductMeta = function(data) {
+		const source = data && typeof data === 'object' ? data : {};
+		const provider = String(source.provider_name || source.providerName || source.publisher_name || source.publisherName || '').trim();
+		const releaseDate = String(source.release_date || source.releaseDate || '').trim();
+		const yearMatch = releaseDate.match(/\b(19|20)\d{2}\b/);
+		return { provider, releaseDate, releaseYear: yearMatch ? yearMatch[0] : '' };
+	};
+
 	window.getPsnStoreSummaryText = async function(titleId, contentId, region) {
 		if (!window.fetchPsnStoreMetadata || !window.cleanPsnStoreDescription) return '';
 		try {
@@ -19089,13 +19099,17 @@ P
 				const extraMetaEl = document.getElementById('modal-extra-meta');
 				const screenshotsEl = document.getElementById('modal-screenshots-wrapper');
 				const screenshotsDividerEl = document.getElementById('modal-screenshots-divider');
-				const renderPsnStoreSummary = (summaryText) => {
+				const renderPsnStoreSummary = (summaryText, psnStoreData = null) => {
 					if (summaryEl) {
 						summaryEl.innerHTML = '<span style="font-size: 10px; color: var(--text-muted); font-weight: bold; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px; display: block;"><i class="fas fa-align-left" style="margin-right: 4px;"></i> Summary</span>' + modalSafeText(summaryText).replace(/\n/g, '<br>');
 					}
 					if (badgesEl) {
-						badgesEl.classList.remove('rawg-badge-row');
-						badgesEl.innerHTML = '<span style="display:inline-flex; align-items:center; justify-content:center; gap:5px; line-height:1; vertical-align:middle; white-space:nowrap; background:rgba(0,112,204,0.12); border:1px solid rgba(0,112,204,0.35); color:#9fd4ff; padding:4px 8px; border-radius:4px; font-size:11px; font-weight:bold;"><i class="fab fa-playstation" style="display:block; line-height:1;"></i><span style="display:block; line-height:1;">PlayStation Store</span></span>';
+						const psnMeta = window.extractPsnStoreProductMeta ? window.extractPsnStoreProductMeta(psnStoreData) : { provider: '', releaseYear: '' };
+						const studioHtml = psnMeta.provider ? `<div class="rawg-alt2-studio"><i class="fas fa-code"></i>${modalSafeText(psnMeta.provider)}</div>` : '';
+						const chips = ['<span class="rawg-chip rawg-chip-store"><i class="fab fa-playstation"></i>PlayStation Store</span>'];
+						if (psnMeta.releaseYear) chips.push(`<span class="rawg-chip rawg-chip-year"><i class="far fa-calendar-alt"></i>${psnMeta.releaseYear}</span>`);
+						badgesEl.classList.add('rawg-badge-row');
+						badgesEl.innerHTML = `<div class="rawg-alt2-panel"><div class="rawg-alt2-top">${studioHtml}<div class="rawg-alt2-tagline">${chips.join('')}</div></div></div>`;
 					}
 					if (extraMetaEl) extraMetaEl.innerHTML = '';
 					if (screenshotsEl) screenshotsEl.style.display = 'none';
@@ -19103,8 +19117,9 @@ P
 					setGameModalNoScreenshots(modal, true);
 				};
 				if (forcedPsnStoreSummaryText) {
-					renderPsnStoreSummary(forcedPsnStoreSummaryText);
-				} else if (window.getPsnStoreSummaryText) {
+					const cachedPsnStoreData = psnStoreEntryKey && window.__psnStoreMetadataCache ? window.__psnStoreMetadataCache[psnStoreEntryKey] : null;
+					renderPsnStoreSummary(forcedPsnStoreSummaryText, cachedPsnStoreData);
+				} else if (window.fetchPsnStoreMetadata) {
 					if (summaryEl) {
 						summaryEl.innerHTML = `
 							<span style="font-size: 10px; color: var(--text-muted); font-weight: bold; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px; display: block;"><i class="fas fa-align-left" style="margin-right: 4px;"></i> Summary</span>
@@ -19114,21 +19129,32 @@ P
 						`;
 					}
 					if (badgesEl) {
-						badgesEl.classList.remove('rawg-badge-row');
-						badgesEl.innerHTML = '<span style="display:inline-flex; align-items:center; justify-content:center; gap:5px; line-height:1; vertical-align:middle; white-space:nowrap; background:rgba(0,112,204,0.12); border:1px solid rgba(0,112,204,0.35); color:#9fd4ff; padding:4px 8px; border-radius:4px; font-size:11px; font-weight:bold;"><i class="fab fa-playstation" style="display:block; line-height:1;"></i><span style="display:block; line-height:1;">PlayStation Store</span></span>';
+						badgesEl.classList.add('rawg-badge-row');
+						badgesEl.innerHTML = `
+							<div class="rawg-alt2-panel rawg-alt2-loading">
+								<div class="rawg-alt2-top">
+									<div class="pulse-skeleton rawg-alt2-studio-skeleton"></div>
+									<div class="rawg-alt2-tagline">
+										<div class="pulse-skeleton rawg-chip-skeleton"></div>
+										<div class="pulse-skeleton rawg-chip-skeleton"></div>
+									</div>
+								</div>
+							</div>
+						`;
 					}
 					if (extraMetaEl) extraMetaEl.innerHTML = '';
 					if (screenshotsEl) screenshotsEl.style.display = 'none';
 					if (screenshotsDividerEl) screenshotsDividerEl.style.display = 'none';
 					setGameModalNoScreenshots(modal, true);
-					window.getPsnStoreSummaryText(game.id || '', game.contentId || '', game.region || '').then(summary => {
+					window.fetchPsnStoreMetadata(game.id || '', game.contentId || '', game.region || '').then(psnStoreData => {
 						if (!modal || modal.style.display === 'none') return;
 						if (modal.dataset.storeCategory !== currentCat) return;
 						if (String(modal.dataset.modalIndex || '') !== String(index)) return;
 						if (String(modal.dataset.titleId || '') !== String(game.id || '')) return;
 						if (String(modal.dataset.contentId || '') !== String(game.contentId || '')) return;
+						const summary = window.extractPsnStoreDescription ? window.extractPsnStoreDescription(psnStoreData) : window.cleanPsnStoreDescription(psnStoreData?.long_desc || psnStoreData?.short_desc || '');
 						if (summary) {
-							renderPsnStoreSummary(summary);
+							renderPsnStoreSummary(summary, psnStoreData);
 						} else {
 							if (psnStoreEntryKey) window.__psnStoreNoSummaryCache[psnStoreEntryKey] = true;
 							openModal(index, '', true);
@@ -19172,7 +19198,7 @@ P
 					</div>
 				</div>
 			`;
-			if (isPsnStoreSummaryCat && !forcedPsnStoreSummaryText && window.getPsnStoreSummaryText) {
+			if (isPsnStoreSummaryCat && !forcedPsnStoreSummaryText && window.fetchPsnStoreMetadata) {
 				const psnSummaryToken = `${Date.now()}_${currentCat}_${game.id || ''}_${game.contentId || ''}`;
 				modal.dataset.psnStoreSummaryToken = psnSummaryToken;
 				const psnSummaryCat = currentCat;
@@ -19180,7 +19206,8 @@ P
 				const psnSummaryId = String(game.id || '');
 				const psnSummaryContentId = String(game.contentId || '');
 				const psnSummaryRegion = String(game.region || '');
-				window.getPsnStoreSummaryText(game.id || '', game.contentId || '', game.region || '').then(summary => {
+				window.fetchPsnStoreMetadata(game.id || '', game.contentId || '', game.region || '').then(psnStoreData => {
+					const summary = window.extractPsnStoreDescription ? window.extractPsnStoreDescription(psnStoreData) : window.cleanPsnStoreDescription(psnStoreData?.long_desc || psnStoreData?.short_desc || '');
 					const liveModal = document.getElementById('game-modal');
 					if (!liveModal || liveModal.style.display === 'none') return;
 					if (liveModal.dataset.psnStoreSummaryToken !== psnSummaryToken) return;
@@ -19390,6 +19417,17 @@ P
 			badgesContainer.classList.add('rawg-badge-row');
 			badgesContainer.innerHTML = `<div class="rawg-alt2-panel"><div class="rawg-alt2-top">${studioHtml}${tagLineHtml}</div></div>`;
 		};
+
+		const renderPsnStoreExtraMeta = (psnStoreData = null) => {
+			if (!badgesContainer || !window.extractPsnStoreProductMeta) return false;
+			const psnMeta = window.extractPsnStoreProductMeta(psnStoreData);
+			if (!psnMeta.provider && !psnMeta.releaseYear) return false;
+			const studioHtml = psnMeta.provider ? `<div class="rawg-alt2-studio"><i class="fas fa-code"></i>${modalSafeText(psnMeta.provider)}</div>` : '';
+			const yearHtml = psnMeta.releaseYear ? `<div class="rawg-alt2-tagline"><span class="rawg-chip rawg-chip-year"><i class="far fa-calendar-alt"></i>${psnMeta.releaseYear}</span></div>` : '';
+			badgesContainer.classList.add('rawg-badge-row');
+			badgesContainer.innerHTML = `<div class="rawg-alt2-panel"><div class="rawg-alt2-top">${studioHtml}${yearHtml}</div></div>`;
+			return true;
+		};
 	
 		if (badgesContainer) {
 			badgesContainer.classList.add('rawg-badge-row');
@@ -19451,9 +19489,13 @@ P
 		const searchQueries = [...new Set([gameName, baseName, gameId])].filter(q => q);
 		let summaryTitleHtml = '<span style="font-size: 10px; color: var(--text-muted); font-weight: bold; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px; display: block;"><i class="fas fa-align-left" style="margin-right: 4px;"></i> Summary</span>';
 		let psnStoreSummary = '';
+		let psnStoreMeta = { provider: '', releaseDate: '', releaseYear: '' };
+		let hasPsnStoreMeta = false;
 		try {
 			const psnStoreData = await window.fetchPsnStoreMetadata(gameId, contentId, region);
-			psnStoreSummary = window.cleanPsnStoreDescription(psnStoreData?.long_desc || psnStoreData?.short_desc || '');
+			psnStoreSummary = window.extractPsnStoreDescription ? window.extractPsnStoreDescription(psnStoreData) : window.cleanPsnStoreDescription(psnStoreData?.long_desc || psnStoreData?.short_desc || '');
+			psnStoreMeta = window.extractPsnStoreProductMeta ? window.extractPsnStoreProductMeta(psnStoreData) : psnStoreMeta;
+			hasPsnStoreMeta = renderPsnStoreExtraMeta(psnStoreData);
 			if (psnStoreSummary) summaryContainer.innerHTML = summaryTitleHtml + modalSafeText(psnStoreSummary).replace(/\n/g, '<br>');
 		} catch (error) {}
 	
@@ -19480,6 +19522,11 @@ P
 						
 						const detailsData = detailsRes.ok ? await detailsRes.json() : {};
 						const screensData = screensRes.ok ? await screensRes.json() : {};
+						const displayDetailsData = { ...detailsData };
+						if (!getRawgNames(displayDetailsData.developers || [], 1).length && !getRawgNames(displayDetailsData.publishers || [], 1).length && psnStoreMeta.provider) {
+							displayDetailsData.publishers = [{ name: psnStoreMeta.provider }];
+						}
+						if (!displayDetailsData.released && psnStoreMeta.releaseDate) displayDetailsData.released = psnStoreMeta.releaseDate;
 	
 						if (scrContainer) {
 							if (screensData.results?.length > 0) {
@@ -19500,11 +19547,11 @@ P
 							let color = detailsData.metacritic >= 75 ? '#4caf50' : (detailsData.metacritic >= 50 ? '#ffa500' : '#ff4444');
 							bHtml += `<span class="rawg-chip rawg-chip-score" style="border:1px solid ${color}; color:${color};"><i class="fas fa-star"></i>${detailsData.metacritic}</span>`;
 						}
-						if (detailsData.released) {
-							const year = detailsData.released.split('-')[0];
-							bHtml += `<span class="rawg-chip rawg-chip-year"><i class="far fa-calendar-alt"></i>${year}</span>`;
+						if (displayDetailsData.released) {
+							const year = String(displayDetailsData.released).split('-')[0];
+							bHtml += `<span class="rawg-chip rawg-chip-year"><i class="far fa-calendar-alt"></i>${modalSafeText(year)}</span>`;
 						}
-						renderRawgExtraMeta(detailsData, bHtml);
+						renderRawgExtraMeta(displayDetailsData, bHtml);
 	
 						let finalDesc = "No description available.";
 						if (detailsData.description_raw && detailsData.description_raw.trim() !== "") {
@@ -19564,7 +19611,7 @@ P
 
 		if (!psnStoreSummary) summaryContainer.innerHTML = summaryTitleHtml + "No description available.";
 		if (modalRoot && modalRoot.classList.contains('modal-no-screenshots')) scheduleModalSummaryAlignment();
-		if (badgesContainer) { badgesContainer.innerHTML = ''; badgesContainer.classList.remove('rawg-badge-row'); }
+		if (badgesContainer && !hasPsnStoreMeta) { badgesContainer.innerHTML = ''; badgesContainer.classList.remove('rawg-badge-row'); }
 		if (extraMetaContainer) extraMetaContainer.innerHTML = '';
 		if (screenshotsWrapper) {
 			screenshotsWrapper.style.display = 'none';
