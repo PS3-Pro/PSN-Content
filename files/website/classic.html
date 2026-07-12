@@ -1623,40 +1623,67 @@
 		return bestLong || bestShort || "";
 	}
 
+	function classicExtractPsnStoreProductMeta(data) {
+		var source = data && typeof data === "object" ? data : {};
+		var provider = classicTrim(source.provider_name || source.providerName || source.publisher_name || source.publisherName || "");
+		var releaseDate = classicTrim(source.release_date || source.releaseDate || "");
+		var yearMatch = releaseDate.match(/\b(19|20)\d{2}\b/);
+		return {
+			provider: provider,
+			releaseDate: releaseDate,
+			releaseYear: yearMatch ? yearMatch[0] : ""
+		};
+	}
+
 	function classicFetchPsnStoreSummary(titleId, contentId, region, callback) {
 		classicFetchPsnStoreMetadata(titleId, contentId, region, function(data) {
 			var summary = classicExtractPsnStoreDescription(data);
 			if (!summary) classicMarkPsnStoreNoSummary(titleId, contentId, region);
-			callback(summary);
+			callback(summary, data);
 		});
 	}
 
-	function classicShowPsnStoreBadge() {
+	function classicShowPsnStoreBadge(psnStoreData, loading) {
 		var el = document.getElementById("modal-rawg-meta");
 		if (!el) return;
-		el.className = "modal-rawg-meta";
 		el.style.display = "block";
-		el.innerHTML = '<div class="rawg-meta-chips"><span class="rawg-meta-chip rawg-chip-year" style="background:#082c45;border-color:#166a9d;color:#aee7ff;">PlayStation Store</span></div>';
+
+		if (loading) {
+			el.className = "modal-rawg-meta rawg-meta-loading";
+			el.innerHTML = '<span class="rawg-meta-skeleton" style="width:62%;"></span><div class="rawg-meta-chips"><span class="rawg-meta-skeleton-chip" style="width:96px;"></span><span class="rawg-meta-skeleton-chip"></span></div>';
+			return;
+		}
+
+		var psnMeta = classicExtractPsnStoreProductMeta(psnStoreData);
+		var studioHtml = psnMeta.provider
+			? '<div class="rawg-meta-studio">' + buildRawgStudioIcon() + modalSafeText(psnMeta.provider) + '</div>'
+			: '<div class="rawg-meta-studio" style="visibility:hidden;" aria-hidden="true">' + buildRawgStudioIcon() + '&nbsp;</div>';
+		var chips = [
+			'<span class="rawg-meta-chip rawg-chip-genre" style="background:#082c45;border-color:#166a9d;color:#aee7ff;">PlayStation Store</span>'
+		];
+		if (psnMeta.releaseYear) {
+			chips.push(buildRawgMetaChip(psnMeta.releaseYear, 'rawg-chip-year', '', 'year', '▣', 'rawg-icon-year'));
+		}
+
+		el.className = "modal-rawg-meta";
+		el.innerHTML = studioHtml + '<div class="rawg-meta-chips">' + chips.join('') + '</div>';
 	}
 
-	function classicShowPsnSummarySkeleton() {
+	function classicShowPsnSummaryLoading() {
 		var summaryEl = document.getElementById("modal-summary");
 		if (!summaryEl) return;
 		summaryEl.style.display = "block";
 		summaryEl.setAttribute("data-summary-loading", "true");
-		summaryEl.innerHTML =
-			'<div class="rawg-meta-skeleton" style="width:100%;height:12px;margin-bottom:7px;"></div>' +
-			'<div class="rawg-meta-skeleton" style="width:94%;height:12px;margin-bottom:7px;"></div>' +
-			'<div class="rawg-meta-skeleton" style="width:56%;height:12px;"></div>';
+		summaryEl.innerHTML = "Fetching summary...";
 	}
 
-	function classicRenderPsnStoreSummary(summaryText) {
+	function classicRenderPsnStoreSummary(summaryText, psnStoreData) {
 		var summaryEl = document.getElementById("modal-summary");
 		if (!summaryEl) return;
 		summaryEl.style.display = "block";
 		summaryEl.removeAttribute("data-summary-loading");
 		summaryEl.innerHTML = modalSafeText(summaryText).replace(/\n/g, "<br>");
-		classicShowPsnStoreBadge();
+		classicShowPsnStoreBadge(psnStoreData, false);
 		hideModalGallery();
 		scheduleModalLayoutFit();
 	}
@@ -8159,7 +8186,7 @@ function restorePreviousState() {
 		}
 	}
 
-	function showGameDetails(gameIndex, forcedPsnSummary, forceCompactDlc) {
+	function showGameDetails(gameIndex, forcedPsnSummary, forceCompactDlc, forcedPsnMetadata) {
 		var doc = document;
 		g_pcGameModalLeftH = 0;
 		var modal_reset_el = doc.getElementById('game-modal');
@@ -8181,6 +8208,7 @@ function restorePreviousState() {
 		var contentId_h = row_h[5];
 		var version_h = row_h[10] || "";
 		var forcedPsnSummary_h = forcedPsnSummary ? String(forcedPsnSummary) : "";
+		var forcedPsnMetadata_h = forcedPsnMetadata && typeof forcedPsnMetadata === "object" ? forcedPsnMetadata : null;
 		var forceCompactDlc_h = !!forceCompactDlc;
 
 		var displayName_h = row_h.cleanName || rawName_h;
@@ -8361,18 +8389,25 @@ function restorePreviousState() {
 			restoreFullSummaryModalStructure();
 			if (midDivider) midDivider.style.display = 'block';
 			if (classicIsPsnStoreContentCategory(cat_h)) {
-				classicShowPsnStoreBadge();
-				classicShowPsnSummarySkeleton();
+				classicShowPsnStoreBadge(null, true);
+				classicShowPsnSummaryLoading();
 				hideModalGallery();
 				if (forcedPsnSummary_h) {
-					classicRenderPsnStoreSummary(forcedPsnSummary_h);
+					var cachedPsnStoreData_h = forcedPsnMetadata_h;
+					if (!cachedPsnStoreData_h) {
+						var psnStoreCacheKey_h = classicGetPsnStoreEntryKey(id_h, contentId_h, region_h);
+						if (psnStoreCacheKey_h && g_psnStoreMetadataCache.hasOwnProperty(psnStoreCacheKey_h)) {
+							cachedPsnStoreData_h = g_psnStoreMetadataCache[psnStoreCacheKey_h];
+						}
+					}
+					classicRenderPsnStoreSummary(forcedPsnSummary_h, cachedPsnStoreData_h);
 				} else {
-					classicFetchPsnStoreSummary(id_h, contentId_h, region_h, function(summaryText) {
+					classicFetchPsnStoreSummary(id_h, contentId_h, region_h, function(summaryText, psnStoreData) {
 						var modalCheck = document.getElementById('game-modal');
 						if (!modalCheck || modalCheck.style.display === 'none') return;
 						if (modalCheck.getAttribute('data-title_id') !== id_h || modalCheck.getAttribute('data-content_id') !== (contentId_h || '') || modalCheck.getAttribute('data-category') !== cat_h) return;
 						if (summaryText) {
-							classicRenderPsnStoreSummary(summaryText);
+							classicRenderPsnStoreSummary(summaryText, psnStoreData);
 						} else {
 							showGameDetails(gameIndex, '', true);
 						}
@@ -8392,11 +8427,11 @@ function restorePreviousState() {
 			if (midDivider) midDivider.style.display = 'none';
 			prepareCompactNoSummaryModal();
 			if (classicIsPsnStoreContentCategory(cat_h) && !forceCompactPsn_h) {
-				classicFetchPsnStoreSummary(id_h, contentId_h, region_h, function(summaryText) {
+				classicFetchPsnStoreSummary(id_h, contentId_h, region_h, function(summaryText, psnStoreData) {
 					var modalCheck = document.getElementById('game-modal');
 					if (!summaryText || !modalCheck || modalCheck.style.display === 'none') return;
 					if (modalCheck.getAttribute('data-title_id') !== id_h || modalCheck.getAttribute('data-content_id') !== (contentId_h || '') || modalCheck.getAttribute('data-category') !== cat_h) return;
-					showGameDetails(gameIndex, summaryText, false);
+					showGameDetails(gameIndex, summaryText, false, psnStoreData);
 				});
 			}
 		}
