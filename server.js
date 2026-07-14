@@ -1380,14 +1380,24 @@ function calculateTrendingFromCache() {
   Object.values(userDatabase).forEach(user => {
     const downloads = Array.isArray(user.downloadsData) ? user.downloadsData : [];
     const wishlist = Array.isArray(user.wishlistData) ? user.wishlistData : [];
+    const userGameDownloadIds = new Set();
     const userContentKeys = new Set();
 
     downloads.forEach(item => {
-      const id = item && (item.titleId || item.id);
-      if (id) dlCounts[id] = (dlCounts[id] || 0) + 1;
+      const safeItem = item || {};
+      const category = normalizeDownloadCountCategory(safeItem.category || safeItem.rawCategory || 'games');
+      const titleId = normalizeDownloadCountId(safeItem.titleId || safeItem.id);
 
-      const contentKey = getContentDownloadCountKey(item || {});
+      // Trending Games and the counter shown on a game card use the same metric:
+      // one unique user per game Title ID. DLCs, updates and repeated downloads do not inflate it.
+      if (category === 'games' && titleId) userGameDownloadIds.add(titleId);
+
+      const contentKey = getContentDownloadCountKey(safeItem);
       if (contentKey) userContentKeys.add(contentKey);
+    });
+
+    userGameDownloadIds.forEach(id => {
+      dlCounts[id] = (dlCounts[id] || 0) + 1;
     });
 
     userContentKeys.forEach(key => {
@@ -1395,7 +1405,7 @@ function calculateTrendingFromCache() {
     });
 
     wishlist.forEach(item => {
-      const id = item && (item.titleId || item.id);
+      const id = normalizeDownloadCountId(item && (item.titleId || item.id));
       if (id) wishCounts[id] = (wishCounts[id] || 0) + 1;
     });
   });
