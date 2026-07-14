@@ -1338,29 +1338,60 @@ function calculateGlobalTrophyStatsFromCache() {
   return stats;
 }
 
+function normalizeDownloadCountCategory(value) {
+  const raw = normalizeText(value, 'games').toLowerCase().replace(/[\s-]+/g, '_');
+  const aliases = {
+    game: 'games', app: 'apps', demo: 'demos', dlc: 'dlcs', update: 'updates',
+    avatar: 'avatars', theme: 'themes', homebrew: 'homebrew_games', port: 'ports',
+    prototype: 'prototypes', emulator: 'emulators', launcher: 'launchers', tool: 'tools',
+    dev_tool: 'dev_tools', manager: 'backup_manager'
+  };
+  return aliases[raw] || raw || 'games';
+}
+
+function normalizeDownloadCountId(value) {
+  const normalized = normalizeText(value, '').toUpperCase();
+  return /^(MISSING|N\/A|NONE|NULL|UNDEFINED)$/.test(normalized) ? '' : normalized;
+}
+
+function normalizeDownloadCountName(value) {
+  return normalizeText(value, '').toLowerCase().replace(/&amp;/g, '&').replace(/[^a-z0-9]+/g, '');
+}
+
+function getContentDownloadCountKey(item = {}) {
+  const category = normalizeDownloadCountCategory(item.category || item.rawCategory || 'games');
+  const titleId = normalizeDownloadCountId(item.titleId || item.id);
+  const contentId = normalizeDownloadCountId(item.contentId || item.contentID);
+  const name = normalizeDownloadCountName(item.cleanName || item.name || item.title || item.rawName);
+
+  if (category === 'games' && titleId) return `${category}|T:${titleId}`;
+  if (contentId) return `${category}|C:${contentId}`;
+  if (titleId && name) return `${category}|T:${titleId}|N:${name}`;
+  if (titleId) return `${category}|T:${titleId}`;
+  if (name) return `${category}|N:${name}`;
+  return '';
+}
+
 function calculateTrendingFromCache() {
   const dlCounts = {};
   const wishCounts = {};
-  const gameDownloadCounts = {};
+  const contentDownloadCounts = {};
 
   Object.values(userDatabase).forEach(user => {
     const downloads = Array.isArray(user.downloadsData) ? user.downloadsData : [];
     const wishlist = Array.isArray(user.wishlistData) ? user.wishlistData : [];
-    const userGameTitleIds = new Set();
+    const userContentKeys = new Set();
 
     downloads.forEach(item => {
       const id = item && (item.titleId || item.id);
       if (id) dlCounts[id] = (dlCounts[id] || 0) + 1;
 
-      const gameTitleId = normalizeText(id, '').toUpperCase();
-      const category = normalizeText(item && (item.category || item.rawCategory), '').toLowerCase();
-      if (gameTitleId && (!category || category === 'game' || category === 'games')) {
-        userGameTitleIds.add(gameTitleId);
-      }
+      const contentKey = getContentDownloadCountKey(item || {});
+      if (contentKey) userContentKeys.add(contentKey);
     });
 
-    userGameTitleIds.forEach(id => {
-      gameDownloadCounts[id] = (gameDownloadCounts[id] || 0) + 1;
+    userContentKeys.forEach(key => {
+      contentDownloadCounts[key] = (contentDownloadCounts[key] || 0) + 1;
     });
 
     wishlist.forEach(item => {
@@ -1377,11 +1408,11 @@ function calculateTrendingFromCache() {
   return {
     topDownloads: sortTop(dlCounts),
     topWishlist: sortTop(wishCounts),
-    gameDownloadCounts
+    contentDownloadCounts
   };
 }
 
-function buildGameDownloadCountsPayload(counts = {}) {
+function buildContentDownloadCountsPayload(counts = {}) {
   return {
     success: true,
     counts,
@@ -1394,27 +1425,27 @@ function buildGameDownloadCountsPayload(counts = {}) {
 function emitTrendingFromCache(targetSocket = null) {
   try {
     const payload = calculateTrendingFromCache();
-    const downloadCountsPayload = buildGameDownloadCountsPayload(payload.gameDownloadCounts);
+    const downloadCountsPayload = buildContentDownloadCountsPayload(payload.contentDownloadCounts);
 
     if (targetSocket && targetSocket.connected) {
       targetSocket.emit('trending_data', payload);
-      targetSocket.emit('game_download_counts', downloadCountsPayload);
+      targetSocket.emit('content_download_counts', downloadCountsPayload);
     } else {
       io.emit('trending_data', payload);
-      io.emit('game_download_counts', downloadCountsPayload);
+      io.emit('content_download_counts', downloadCountsPayload);
     }
     return payload;
   } catch (err) {
     console.error('[TRENDING CACHE EMIT ERROR]:', err);
-    const emptyPayload = { topDownloads: [], topWishlist: [], gameDownloadCounts: {} };
-    const emptyDownloadCountsPayload = buildGameDownloadCountsPayload({});
+    const emptyPayload = { topDownloads: [], topWishlist: [], contentDownloadCounts: {} };
+    const emptyDownloadCountsPayload = buildContentDownloadCountsPayload({});
 
     if (targetSocket && targetSocket.connected) {
       targetSocket.emit('trending_data', emptyPayload);
-      targetSocket.emit('game_download_counts', emptyDownloadCountsPayload);
+      targetSocket.emit('content_download_counts', emptyDownloadCountsPayload);
     } else {
       io.emit('trending_data', emptyPayload);
-      io.emit('game_download_counts', emptyDownloadCountsPayload);
+      io.emit('content_download_counts', emptyDownloadCountsPayload);
     }
     return emptyPayload;
   }
@@ -2679,35 +2710,35 @@ io.on('connection', (socket) => {
       socket.emit('trending_data', {
         topDownloads: [],
         topWishlist: [],
-        gameDownloadCounts: {}
+        contentDownloadCounts: {}
       });
-      socket.emit('game_download_counts', buildGameDownloadCountsPayload({}));
+      socket.emit('content_download_counts', buildContentDownloadCountsPayload({}));
     }
   });
 
-  socket.on('request_game_download_counts', async (_request = {}, callback) => {
+  socket.on('request_content_download_counts', async (_request = {}, callback) => {
     try {
       if (!Object.keys(userDatabase).length) {
         await withTimeout(ensureUserCacheReady(), 2000, null);
       }
 
       const activity = calculateTrendingFromCache();
-      const payload = buildGameDownloadCountsPayload(activity.gameDownloadCounts);
+      const payload = buildContentDownloadCountsPayload(activity.contentDownloadCounts);
 
       if (typeof callback === 'function') callback(payload);
-      else socket.emit('game_download_counts', payload);
+      else socket.emit('content_download_counts', payload);
     } catch (err) {
-      console.error('[GAME DOWNLOAD COUNTS ERROR]:', err);
+      console.error('[CONTENT DOWNLOAD COUNTS ERROR]:', err);
       const payload = {
         success: false,
         counts: {},
         updatedAt: Date.now(),
         uniqueUsers: true,
-        error: 'Failed to calculate game download counts.'
+        error: 'Failed to calculate content download counts.'
       };
 
       if (typeof callback === 'function') callback(payload);
-      else socket.emit('game_download_counts', payload);
+      else socket.emit('content_download_counts', payload);
     }
   });
 
