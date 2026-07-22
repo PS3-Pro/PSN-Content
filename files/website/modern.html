@@ -14314,6 +14314,55 @@ P
 
     let currentData = [];
 	window.psnStoreCache = {};
+
+	const PSN_STORE_LOOKUP_CATEGORIES = [
+		'no_psn',
+		'games'
+	];
+
+	window.psnStoreLookup = new Map();
+	window.__psnStoreLookupDirty = true;
+
+	window.invalidatePsnStoreLookup = function () {
+		window.__psnStoreLookupDirty = true;
+	};
+
+	window.rebuildPsnStoreLookup = function () {
+		const lookup = new Map();
+
+		for (const category of PSN_STORE_LOOKUP_CATEGORIES) {
+			const items = window.psnStoreCache?.[category];
+			if (!Array.isArray(items)) continue;
+
+			for (const item of items) {
+				const itemId = String(
+					item?.id || item?.titleId || item?.titleid || ''
+				).trim().toUpperCase();
+
+				if (!itemId || lookup.has(itemId)) continue;
+
+				lookup.set(itemId, {
+					item,
+					category
+				});
+			}
+		}
+
+		window.psnStoreLookup = lookup;
+		window.__psnStoreLookupDirty = false;
+		return lookup;
+	};
+
+	window.findPsnStoreItemById = function (titleId) {
+		const cleanId = String(titleId || '').trim().toUpperCase();
+		if (!cleanId) return null;
+
+		if (!(window.psnStoreLookup instanceof Map) || window.__psnStoreLookupDirty) {
+			window.rebuildPsnStoreLookup();
+		}
+
+		return window.psnStoreLookup.get(cleanId) || null;
+	};
     let filteredData = [];
     let activeLetter = "ALL";
     let navHistory = null;
@@ -17282,6 +17331,7 @@ P
 		if (forceRefresh) {
 			delete psnStoreRenderCache[cat];
 			if (window.psnStoreCache) delete window.psnStoreCache[cat];
+			if (typeof window.invalidatePsnStoreLookup === 'function') window.invalidatePsnStoreLookup();
 			psnStoreRenderPromises[cat] = null;
 		}
 
@@ -17304,6 +17354,7 @@ P
 			const data = await buildStoreCategoryData(cat, texts, priority);
 			psnStoreRenderCache[cat] = data;
 			window.psnStoreCache[cat] = data;
+			if (typeof window.invalidatePsnStoreLookup === 'function') window.invalidatePsnStoreLookup();
 			return data;
 		})().finally(() => {
 			psnStoreRenderPromises[cat] = null;
@@ -24876,6 +24927,7 @@ P
 		window.__exploreWarmedBeforeLogin = false;
 		window.psnStorePrefetchReady = false;
 		window.psnStoreCache = {};
+		if (typeof window.invalidatePsnStoreLookup === 'function') window.invalidatePsnStoreLookup();
 		Object.keys(psnStoreRenderCache).forEach(key => delete psnStoreRenderCache[key]);
 		Object.keys(psnStoreRenderPromises).forEach(key => psnStoreRenderPromises[key] = null);
 		bootEssentialDbsPromise = null;
@@ -25823,8 +25875,6 @@ P
 		const cleanUrl = String(url || '').trim();
 		if (!cleanUrl) return [];
 
-		// Search endpoints already act as a proxy. Wrapping them again creates lots of
-		// 400/401/403 noise and extra network work, especially during startup.
 		if (/^https:\/\/s\.jina\.ai\//i.test(cleanUrl)) {
 			return uniqueRevivedUrls([cleanUrl]);
 		}
@@ -26078,8 +26128,6 @@ P
 	async function fetchCountFromScript(key, scriptUrl, config) {
 		const scriptText = await fetchRevivedPlayerText(scriptUrl, 4200);
 
-		// Important: do not parse the raw JS as a count. It can contain cache-busters,
-		// IDs, timestamps or large numeric constants, which caused the bogus huge values.
 		const candidateUrls = extractRevivedCandidateUrls(scriptText, scriptUrl);
 		if (!candidateUrls.length) return null;
 
@@ -26191,13 +26239,9 @@ P
 
 	async function fetchRevivedCount(key, config) {
 		if (key === 'home-headquarters') {
-			// HHQ's page renders from Players-Online.js, which gets the real total from:
-			// https://homeheadquarters.net:8443/GetRooms/
-			// The correct count is result.usernames.length.
 			const directValue = await fetchHomeHeadquartersDirectCount(config);
 			if (Number.isFinite(directValue)) return directValue;
 
-			// Fallback only if the endpoint/proxy is blocked.
 			const searchValue = await resolveFirstRevivedCount(createRevivedSearchJobs(key, config), 5200);
 			if (Number.isFinite(searchValue)) return searchValue;
 
@@ -26650,40 +26694,50 @@ P
 		};
 	
 		idsArray.forEach((id) => {
-			id = id.trim().toUpperCase();
+			id = String(id || '').trim().toUpperCase();
 	
 			let gameData = null;
 			let isInStore = false;
-	
-			if (window.psnStoreCache?.games) {
-				gameData = window.psnStoreCache.games.find(
-					g => g.id === id || g.titleId === id
-				);
-	
-				if (gameData) isInStore = true;
+
+			const storeMatch = (typeof window.findPsnStoreItemById === 'function')
+				? window.findPsnStoreItemById(id)
+				: null;
+
+			if (storeMatch?.item) {
+				gameData = storeMatch.item;
+				isInStore = true;
 			}
-	
-			if (!gameData && window.psnStoreCache?.updates) {
-				const updateEntry = window.psnStoreCache.updates.find(
-					u => u.id === id
-				);
-	
+
+			if (!gameData && Array.isArray(window.psnStoreCache?.updates)) {
+				const updateEntry = window.psnStoreCache.updates.find((item) => {
+					const itemId = String(
+						item?.id || item?.titleId || item?.titleid || ''
+					).trim().toUpperCase();
+
+					return itemId === id;
+				});
+
 				if (updateEntry) {
-					const cleanName = updateEntry.cleanName
+					const updateName = String(
+						updateEntry.cleanName || updateEntry.title || updateEntry.name || ''
+					);
+
+					const cleanName = updateName
 						.replace(/\s*v?\d+\.\d+(\.\d+)?/gi, '')
 						.replace(/\s*-\s*Update/gi, '')
 						.trim();
-	
+
 					gameData = {
 						...updateEntry,
-						cleanName
+						cleanName: cleanName || updateName
 					};
 				}
 			}
-	
+
 			let displayName =
 				gameData?.cleanName ||
 				gameData?.title ||
+				gameData?.name ||
 				window.gameNameCache?.[id] ||
 				`Unknown (${id})`;
 	
@@ -26692,7 +26746,7 @@ P
 				gameData,
 				isInStore,
 				displayName,
-				needsNameLookup: !gameData?.cleanName && !gameData?.title && !window.gameNameCache?.[id]
+				needsNameLookup: !gameData?.cleanName && !gameData?.title && !gameData?.name && !window.gameNameCache?.[id]
 			});
 		});
 	
@@ -35510,13 +35564,11 @@ function getVisibleChatStackEl(id) {
 			const leftOffset = Math.max(0, imgPrev.offsetWidth + 12);
 			box.style.left = leftOffset + "px";
 
-			// Align with image preview stack position.
 			box.style.bottom = `calc(100% + ${layout.imageBottom}px)`;
 		} else {
 			box.classList.remove('chat-side-image');
 			box.style.left = "0px";
 
-			// No image: stay above reply/edit/typing stack.
 			box.style.bottom = `calc(100% + ${layout.topBottom}px)`;
 		}
 
