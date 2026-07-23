@@ -15011,6 +15011,13 @@ P
 	}
 
     async function populateExploreTab(options = {}) {
+		// Keep Explore/Recently Added on the same deterministic cover decision used by Browse.
+		// Without this wait, cards can be created before blacklist.tsv/index.tsv finish loading,
+		// making getOptimizedCover() choose a different source from a later Browse render.
+		if (typeof loadBackgroundIndexes === 'function') {
+			try { await loadBackgroundIndexes('high'); } catch (e) { console.warn('[System] Cover indexes unavailable for Explore.', e); }
+		}
+
 		const previousExplorePopulateAnimate = window.__explorePopulateAnimateCards;
 		window.__explorePopulateAnimateCards = options.animateCards !== false;
 		try {
@@ -15076,9 +15083,14 @@ P
 		}
 	};
 
-	window.renderTrendingCarousel = function(containerId, topList, iconClass) {
+	window.renderTrendingCarousel = async function(containerId, topList, iconClass) {
 		const container = document.getElementById(containerId);
 		if (!container) return;
+
+		// Trending must resolve covers only after the same indexes used by Browse are ready.
+		if (typeof loadBackgroundIndexes === 'function') {
+			try { await loadBackgroundIndexes('high'); } catch (e) { console.warn('[System] Cover indexes unavailable for Trending.', e); }
+		}
 	
 		const skeletonHTML = `
 			<div class="skeleton-card"><div class="skeleton-img"></div><div class="skeleton-text"></div><div class="skeleton-text short"></div></div>
@@ -15117,17 +15129,23 @@ P
 			if (displayRank >= 30) break;
 	
 			let gameData = null;
+			let gameCategory = 'games';
 			if (window.psnStoreCache) {
-				for (let cat of allowedCats) {
+				for (const cat of allowedCats) {
 					if (window.psnStoreCache[cat]) {
 						gameData = window.psnStoreCache[cat].find(g => g.id === item.id || g.titleId === item.id);
-						if (gameData) break;
+						if (gameData) {
+							gameCategory = cat;
+							break;
+						}
 					}
 				}
 			}
 	
 			if (gameData) {
-				const imgUrl = getOptimizedCover(gameData.id);
+				// Use the exact same initial source and fallback metadata as Browse/Explore.
+				const imgUrl = getItemCover(gameData, gameCategory);
+				const githubCoverUrl = getGithubItemCover(gameData, gameCategory);
 				
 				let rankClass = "";
 				let badgeStyle = `position: absolute; bottom: 8px; left: 8px; z-index: 5; font-weight: 900; font-size: 10px; padding: 2px 8px; border-radius: 4px; display: flex; align-items: center; gap: 4px; backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px);`;
@@ -15164,7 +15182,7 @@ P
 								${fireIcon} #${displayRank + 1}
 							</div>
 	
-							<img src="${imgUrl}" class="game-img" data-name="${(gameData.cleanName || gameData.title).replace(/"/g, '&quot;')}" data-console="${gameData.cTag}" onload="markCoverLoaded(this)" onerror="getOnlineCoverFallback(this)">
+							<img src="${imgUrl}" class="game-img" data-name="${(gameData.cleanName || gameData.title).replace(/"/g, '&quot;')}" data-console="${gameData.cTag}" data-github-cover="${String(githubCoverUrl || '').replace(/"/g, '&quot;')}" data-title-id="${gameData.id || gameData.titleId || ''}" data-content-id="${gameData.contentId || ''}" data-region="${gameData.region || ''}" onload="markCoverLoaded(this)" onerror="handleCoverError(this, '${gameCategory}')">
 						</div>
 						<div class="game-info" style="padding: 10px; min-height: 0;">
 							<div style="display: flex; flex-direction: column; justify-content: space-between; height: 100%;">
