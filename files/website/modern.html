@@ -439,6 +439,8 @@ select option { background-color: var(--bg-dark); }
 .btn-dlc { order: 4; background: linear-gradient(135deg, #6a1b9a, #8e24aa); color: #fff; }
 .btn-thm { order: 5; background: linear-gradient(135deg, #7f1d3a, #db3f7c); color: #fff; }
 .btn-rap { order: 6; background: linear-gradient(135deg, #e0e0e0, #ffffff); color: #000; }
+.btn-rap.btn-rap-by-dlc { background: linear-gradient(135deg, #59616d, #858d98); color: #f7f8fa; border-color: rgba(255, 255, 255, 0.18); }
+.btn-rap.btn-rap-by-dlc:hover { box-shadow: inset 0 0 0 100px rgba(0, 0, 0, 0.20); border-color: rgba(255, 255, 255, 0.42); }
 .btn-group.loop-child-removed > .btn-pkg,
 .btn-group.loop-child-removed > .btn-multi { order: 1 !important; grid-column: auto !important; padding: 6px 2px !important; }
 .btn-group.loop-child-removed > .btn-rap { order: 2 !important; grid-column: auto !important; padding: 6px 2px !important; }
@@ -15325,9 +15327,224 @@ P
 		return 'single';
 	}
 
-	function hasValidRapDownload(game) {
-		return !!(game && game.rap && game.rap !== 'MISSING' && game.rap !== 'NOT REQUIRED' && game.contentId && game.contentId !== 'MISSING');
+	function normalizeRapMarker(value) {
+		return String(value || '').trim().replace(/\s+/g, ' ').toUpperCase();
 	}
+
+	function isLicenseByDlcRapValue(value) {
+		const marker = normalizeRapMarker(value);
+		return marker === 'UNLOCK/LICENSE BY DLC' ||
+			marker === 'LICENSE BY DLC' ||
+			(marker.includes('UNLOCK') && marker.includes('DLC'));
+	}
+
+	function isLicenseByDlcItem(game) {
+		return !!game && isLicenseByDlcRapValue(game.rap);
+	}
+
+	function hasDirectRapValue(value) {
+		const marker = normalizeRapMarker(value);
+		return !!marker &&
+			marker !== 'MISSING' &&
+			marker !== 'NOT REQUIRED' &&
+			marker !== 'NOT NEEDED' &&
+			marker !== 'N/A' &&
+			!isLicenseByDlcRapValue(marker);
+	}
+
+	function hasValidRapDownload(game) {
+		return !!(game && hasDirectRapValue(game.rap) && game.contentId && game.contentId !== 'MISSING');
+	}
+
+	function normalizeUnlockLookupText(value) {
+		return String(value || '')
+			.normalize('NFKD')
+			.replace(/[\u0300-\u036f]/g, '')
+			.toLowerCase()
+			.replace(/[^a-z0-9]+/g, ' ')
+			.trim();
+	}
+
+	function getLicenseContentSuffix(contentId) {
+		const value = String(contentId || '').toUpperCase();
+		const markerIndex = value.indexOf('_00-');
+		return markerIndex >= 0 ? value.slice(markerIndex + 4) : value;
+	}
+
+	function getLicenseCommonPrefixLength(a, b) {
+		const left = String(a || '');
+		const right = String(b || '');
+		let count = 0;
+		while (count < left.length && count < right.length && left[count] === right[count]) count++;
+		return count;
+	}
+
+	function getLicenseNameSimilarity(a, b) {
+		const left = normalizeUnlockLookupText(a);
+		const right = normalizeUnlockLookupText(b);
+		if (!left || !right) return 0;
+		const leftTokens = new Set(left.split(' ').filter(Boolean));
+		const rightTokens = new Set(right.split(' ').filter(Boolean));
+		let intersection = 0;
+		leftTokens.forEach(token => { if (rightTokens.has(token)) intersection++; });
+		return intersection / Math.max(leftTokens.size, rightTokens.size, 1);
+	}
+
+	function scoreLicenseDlcCandidate(baseGame, candidate) {
+		if (!candidate || !hasValidRapDownload(candidate) || !getBulkPkgDownloadType(candidate)) return -999;
+
+		const baseName = normalizeUnlockLookupText(baseGame && (baseGame.cleanName || baseGame.name || baseGame.title));
+		const candidateName = normalizeUnlockLookupText(candidate.cleanName || candidate.name || candidate.title);
+		const baseSuffix = getLicenseContentSuffix(baseGame && baseGame.contentId);
+		const candidateSuffix = getLicenseContentSuffix(candidate.contentId);
+		const prefixLength = getLicenseCommonPrefixLength(baseSuffix, candidateSuffix);
+		const similarity = getLicenseNameSimilarity(baseName, candidateName);
+		let score = (similarity * 35) + (Math.min(prefixLength, 16) * 3);
+
+		if (/\bunlock key\b/.test(candidateName)) score += 55;
+		else if (/\bunlock\b/.test(candidateName)) score += 42;
+		if (/full game unlock|full version/.test(candidateName)) score += 25;
+		if (/\blicen[cs]e\b/.test(candidateName)) score += 35;
+		if (/\btrial upgrade\b|\bupgrade\b|\bpurchase\b/.test(candidateName)) score += 35;
+		if (/(UNLOCK|KEY|FULL|UPGRADE|LICENSE|LICENCE|PURCHASE)/.test(candidateSuffix)) score += 30;
+		if (prefixLength >= 12) score += 20;
+
+		const baseNumeric = baseSuffix.match(/^(.*?)(\d+)$/);
+		const candidateNumeric = candidateSuffix.match(/^(.*?)(\d+)$/);
+		if (baseNumeric && candidateNumeric && baseNumeric[1] === candidateNumeric[1]) {
+			const baseNumber = Number(baseNumeric[2]);
+			const candidateNumber = Number(candidateNumeric[2]);
+			if (Number.isFinite(baseNumber) && candidateNumber === baseNumber + 1) score += 55;
+		}
+
+		const hasExplicitUnlockSignal = /\bunlock\b|\bkey\b|\blicen[cs]e\b|\bupgrade\b|\bpurchase\b|full game/.test(candidateName) ||
+			/(UNLOCK|KEY|FULL|UPGRADE|LICENSE|LICENCE|PURCHASE)/.test(candidateSuffix);
+		if (!hasExplicitUnlockSignal && /\bepisode [2-9]\b|\bskin\b|\bpack\b|\bexpansion\b|\bmap\b|\btheme\b|\bavatar\b|\bwaldgeist\b/.test(candidateName)) {
+			score -= 45;
+		}
+
+		return score;
+	}
+
+	async function resolveLicenseDlcForGame(baseGame) {
+		let dlcItems = window.psnStoreCache && Array.isArray(window.psnStoreCache.dlcs)
+			? window.psnStoreCache.dlcs
+			: null;
+
+		if (!dlcItems) {
+			try {
+				dlcItems = await loadStoreCategoryData('dlcs', 'high');
+			} catch (e) {
+				dlcItems = [];
+			}
+		}
+
+		const titleId = String(baseGame && (baseGame.id || baseGame.titleId) || '').trim().toUpperCase();
+		const ranked = (Array.isArray(dlcItems) ? dlcItems : [])
+			.filter(item => String(item && (item.id || item.titleId) || '').trim().toUpperCase() === titleId)
+			.map(item => ({ item, score: scoreLicenseDlcCandidate(baseGame, item) }))
+			.filter(entry => entry.score > -900)
+			.sort((a, b) => b.score - a.score);
+
+		if (!ranked.length) return null;
+
+		const top = ranked[0];
+		const second = ranked[1];
+		if (top.score < 55 || (second && (top.score - second.score) < 15)) return null;
+
+		return top.item;
+	}
+
+	function findBaseGameForLicenseDlc(titleId, contentId, displayName) {
+		const normalizedId = String(titleId || '').trim().toUpperCase();
+		const normalizedContentId = String(contentId || '').trim().toUpperCase();
+		const pools = [
+			Array.isArray(currentData) ? currentData : [],
+			(window.psnStoreCache && Array.isArray(window.psnStoreCache.games)) ? window.psnStoreCache.games : []
+		];
+
+		for (const pool of pools) {
+			const exact = pool.find(item =>
+				String(item && (item.id || item.titleId) || '').trim().toUpperCase() === normalizedId &&
+				(!normalizedContentId || String(item && item.contentId || '').trim().toUpperCase() === normalizedContentId)
+			);
+			if (exact) return exact;
+		}
+
+		return {
+			id: normalizedId,
+			titleId: normalizedId,
+			contentId: normalizedContentId,
+			cleanName: String(displayName || normalizedId),
+			rap: 'UNLOCK/LICENSE BY DLC'
+		};
+	}
+
+	window.downloadLicenseByDlc = async function(event, titleId, contentId, displayName, btnElement) {
+		if (event) {
+			event.preventDefault();
+			event.stopPropagation();
+		}
+		if (btnElement && btnElement.dataset.licenseDlcBusy === '1') return false;
+		if (typeof playUiClick === 'function') playUiClick();
+
+		const originalHtml = btnElement ? btnElement.innerHTML : '';
+		if (btnElement) {
+			btnElement.dataset.licenseDlcBusy = '1';
+			btnElement.classList.add('is-running');
+			btnElement.innerHTML = '<i class="fas fa-spinner fa-spin"></i> RAP';
+		}
+
+		const openDlcListSilently = function() {
+			if (typeof closeModal === 'function') closeModal();
+			if (typeof switchAndSearch === 'function') switchAndSearch('dlcs', String(titleId || ''));
+		};
+
+		try {
+			const baseGame = findBaseGameForLicenseDlc(titleId, contentId, displayName);
+			const dlc = await resolveLicenseDlcForGame(baseGame);
+
+			if (!dlc) {
+				openDlcListSilently();
+				return false;
+			}
+			const ipInput = document.getElementById('ps3-ip');
+			const ip = ipInput ? ipInput.value.trim() : '';
+			const globalIcon = document.getElementById('global-status-icon');
+			const isConnected = !!(globalIcon && globalIcon.classList.contains('status-dot-connected'));
+			const remoteBlocked = /dropbox\.com|dropboxusercontent\.com/i.test(String(dlc.url || ''));
+
+			let pkgQueued = false;
+			let rapQueued = false;
+
+			if (isConnected && ip && !remoteBlocked) {
+				pkgQueued = sendBulkDownloadToPs3(dlc, 'pkg', ip, 'dlcs');
+				await waitBulkDownloadStep(450);
+				rapQueued = sendBulkDownloadToPs3(dlc, 'rap', ip, 'dlcs');
+			} else {
+				pkgQueued = await downloadBulkPkgToDevice(dlc, 'dlcs');
+				await waitBulkDownloadStep(850);
+				rapQueued = downloadBulkRapToDevice(dlc);
+			}
+
+			if (!pkgQueued || !rapQueued) {
+				openDlcListSilently();
+				return false;
+			}
+
+			return true;
+		} catch (error) {
+			console.error('[License DLC] Failed to resolve/download unlock DLC:', error);
+			openDlcListSilently();
+			return false;
+		} finally {
+			if (btnElement) {
+				delete btnElement.dataset.licenseDlcBusy;
+				btnElement.classList.remove('is-running');
+				btnElement.innerHTML = originalHtml || '<i class="fas fa-key"></i> RAP';
+			}
+		}
+	};
 
 	function isBulkDownloadCategory(category) {
 		return category === 'dlcs' || category === 'avatars' || category === 'themes';
@@ -17307,7 +17524,7 @@ P
 						}
 					}
 
-					if ((!existing.rap || existing.rap === "MISSING") && (rap && rap !== "MISSING")) {
+					if (!hasDirectRapValue(existing.rap) && hasDirectRapValue(rap)) {
 						existing.rap = rap;
 						existing.contentId = contentId;
 					}
@@ -18291,8 +18508,10 @@ P
 				buttonsHtml += `<a style="cursor: pointer;" title="Download PKG" class="btn-mini btn-pkg" onclick="smartDownload(event, 'single', '${game.url}', '${escapedName}', '${game.version}', this, ${game.sizeBytes || 0}, '${game.id}', '${currentCat}', '${game.contentId || ''}')"><i class="fas fa-download"></i> PKG</a>`;
 			}
 			
-			if (game.rap && game.rap !== "MISSING" && game.rap !== "NOT REQUIRED" && game.contentId && game.contentId !== "MISSING") {
+			if (hasValidRapDownload(game)) {
 				buttonsHtml += `<a style="cursor: pointer;" title="Download RAP (License)" class="btn-mini btn-rap" onclick="playUiClick(); smartDownload(event, 'rap', '', '${escapedName}', '', this, 0, '${game.id}', '${currentCat}', '${game.contentId}')"><i class="fas fa-key"></i> RAP</a>`;
+			} else if (isLicenseByDlcItem(game)) {
+				buttonsHtml += `<a style="cursor: pointer;" title="Download RAP (License)" class="btn-mini btn-rap btn-rap-by-dlc" onclick="downloadLicenseByDlc(event, '${game.id}', '${game.contentId || ''}', '${escapedName}', this)"><i class="fas fa-key"></i> RAP</a>`;
 			}
 		
 			if (currentCat === 'games' || currentCat === 'apps') {
@@ -19248,8 +19467,10 @@ P
 			actionsHtml += `<a style="cursor: pointer;" title="Download PKG" class="btn-mini btn-pkg" onmouseenter="playUiArrow()" onclick="smartDownload(event, 'single', '${game.url}', '${safeName}', '${game.version}', this, ${game.sizeBytes || 0}, '${game.id}', '${currentCat}', '${game.contentId || ''}')"><i class="fas fa-download"></i> PKG</a>`;
 		}
 	
-		if (game.rap && game.rap !== "MISSING" && game.rap !== "NOT REQUIRED" && game.contentId && game.contentId !== "MISSING") {
+		if (hasValidRapDownload(game)) {
 			actionsHtml += `<a style="cursor: pointer;" title="Download RAP (License)" class="btn-mini btn-rap" onmouseenter="playUiArrow()" onclick="playUiClick(); smartDownload(event, 'rap', '', '${safeName}', '', this, 0, '${game.id}', '${currentCat}', '${game.contentId}')"><i class="fas fa-key"></i> RAP</a>`;
+		} else if (isLicenseByDlcItem(game)) {
+			actionsHtml += `<a style="cursor: pointer;" title="Download RAP (License)" class="btn-mini btn-rap btn-rap-by-dlc" onmouseenter="playUiArrow()" onclick="downloadLicenseByDlc(event, '${game.id}', '${game.contentId || ''}', '${safeName}', this)"><i class="fas fa-key"></i> RAP</a>`;
 		}
 	
 		if (currentCat === 'games' || currentCat === 'apps') {
