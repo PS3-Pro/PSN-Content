@@ -29,6 +29,7 @@ const USER_CACHE_REFRESH_INTERVAL_MS = 30000;
 const USER_CACHE_WARMUP_INTERVAL_MS = 120000;
 const DEFAULT_MAINTENANCE_MESSAGE = "The service is under maintenance. Please try again soon.";
 const VALID_USER_ROLES = new Set(["user", "trusted", "mod", "admin"]);
+const VALID_PROFILE_COUNTRY_CODES = new Set(['AD','AE','AF','AG','AI','AL','AM','AO','AQ','AR','AS','AT','AU','AW','AX','AZ','BA','BB','BD','BE','BF','BG','BH','BI','BJ','BL','BM','BN','BO','BQ','BR','BS','BT','BV','BW','BY','BZ','CA','CC','CD','CF','CG','CH','CI','CK','CL','CM','CN','CO','CR','CU','CV','CW','CX','CY','CZ','DE','DJ','DK','DM','DO','DZ','EC','EE','EG','EH','ER','ES','ET','FI','FJ','FK','FM','FO','FR','GA','GB','GD','GE','GF','GG','GH','GI','GL','GM','GN','GP','GQ','GR','GS','GT','GU','GW','GY','HK','HM','HN','HR','HT','HU','ID','IE','IL','IM','IN','IO','IQ','IR','IS','IT','JE','JM','JO','JP','KE','KG','KH','KI','KM','KN','KP','KR','KW','KY','KZ','LA','LB','LC','LI','LK','LR','LS','LT','LU','LV','LY','MA','MC','MD','ME','MF','MG','MH','MK','ML','MM','MN','MO','MP','MQ','MR','MS','MT','MU','MV','MW','MX','MY','MZ','NA','NC','NE','NF','NG','NI','NL','NO','NP','NR','NU','NZ','OM','PA','PE','PF','PG','PH','PK','PL','PM','PN','PR','PS','PT','PW','PY','QA','RE','RO','RS','RU','RW','SA','SB','SC','SD','SE','SG','SH','SI','SJ','SK','SL','SM','SN','SO','SR','SS','ST','SV','SX','SY','SZ','TC','TD','TF','TG','TH','TJ','TK','TL','TM','TN','TO','TR','TT','TV','TW','TZ','UA','UG','UM','US','UY','UZ','VA','VC','VE','VG','VI','VN','VU','WF','WS','YE','YT','ZA','ZM','ZW']);
 const ADMIN_STATE_KEYS = {
   maintenance: "maintenance",
   chatControls: "chat_controls",
@@ -96,6 +97,7 @@ function buildOnlineListSignature(list = []) {
       user && user.profileUpdatedAt || 0,
       user && user.avatar || "",
       user && user.role || "",
+      getUserCountryCode(user),
       user && user.banned ? "1" : "0",
       stableStringifySmall(user && user.ps3Status)
     ].join(":");
@@ -364,6 +366,7 @@ function getSanitizedOnlineList() {
     banReason: u.banReason || "",
     level: u.level || 1,
     joined: u.joined || '2026',
+    countryCode: getUserCountryCode(u),
     online: u.online,
     lastSeen: u.lastSeen,
     ps3Status: u.ps3Status || null,
@@ -421,6 +424,50 @@ async function calculateGlobalTrophyStatsFromDb() {
 
 function normalizeText(value, fallback = "") {
   return String(value === undefined || value === null ? fallback : value).trim();
+}
+
+function normalizeProfileCountryCodeServer(value) {
+  const code = normalizeText(value, "").toUpperCase();
+  return VALID_PROFILE_COUNTRY_CODES.has(code) ? code : "";
+}
+
+function getUserCountryCode(user = {}) {
+  const settings = user && user.settingsData && typeof user.settingsData === "object" && !Array.isArray(user.settingsData)
+    ? user.settingsData
+    : {};
+  return normalizeProfileCountryCodeServer(
+    user && (user.countryCode || user.country_code || user.country) ||
+    settings.countryCode || settings.country_code || settings.country
+  );
+}
+
+function hasProfileCountryPayload(payload = {}) {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return false;
+  const settings = payload.settingsData && typeof payload.settingsData === "object" && !Array.isArray(payload.settingsData)
+    ? payload.settingsData
+    : {};
+  return ["countryCode", "country_code", "country"].some(key => Object.prototype.hasOwnProperty.call(payload, key)) ||
+    ["countryCode", "country_code", "country"].some(key => Object.prototype.hasOwnProperty.call(settings, key));
+}
+
+function normalizeIncomingProfileCountry(payload = {}, settings = null) {
+  const hasCountry = hasProfileCountryPayload({ ...payload, settingsData: settings || payload.settingsData });
+  if (!hasCountry) return { hasCountry: false, countryCode: "" };
+
+  const countryCode = normalizeProfileCountryCodeServer(
+    payload.countryCode || payload.country_code || payload.country ||
+    (settings && (settings.countryCode || settings.country_code || settings.country))
+  );
+
+  [payload, settings].forEach(target => {
+    if (!target || typeof target !== "object" || Array.isArray(target)) return;
+    delete target.country_code;
+    delete target.country;
+    if (countryCode) target.countryCode = countryCode;
+    else delete target.countryCode;
+  });
+
+  return { hasCountry: true, countryCode };
 }
 
 function normalizeTimeValue(value, fallback = "00:00") {
@@ -554,6 +601,14 @@ function normalizeUserRecord(name, userData = {}) {
     role: getUserRole(name, userData),
     banned: userData.banned === true || legacyBannedRole
   };
+
+  const countryCode = getUserCountryCode(userData);
+  if (countryCode) {
+    normalized.countryCode = countryCode;
+    normalized.settingsData = normalized.settingsData && typeof normalized.settingsData === "object" && !Array.isArray(normalized.settingsData)
+      ? { ...normalized.settingsData, countryCode }
+      : { countryCode };
+  }
 
   if (!normalized.banned) {
     delete normalized.banReason;
@@ -691,7 +746,8 @@ function getPublicProfileSettings(user = {}) {
     profileCardEffect: profileCardStyle,
     profileCardStyleUpdatedAt,
     themeColor,
-    themeColorUpdatedAt
+    themeColorUpdatedAt,
+    countryCode: getUserCountryCode(user)
   };
 }
 
@@ -905,7 +961,8 @@ function emitPublicProfileBannerUpdate(name, user = null) {
     profileCardEffect: settingsData.profileCardEffect,
     profileCardStyleUpdatedAt: settingsData.profileCardStyleUpdatedAt,
     themeColor: settingsData.themeColor,
-    themeColorUpdatedAt: settingsData.themeColorUpdatedAt
+    themeColorUpdatedAt: settingsData.themeColorUpdatedAt,
+    countryCode: settingsData.countryCode
   });
 }
 
@@ -1065,6 +1122,13 @@ function mergeLocalRecoveryData(dbUser = {}, localData = {}) {
 
   if (localData.avatar && isDefaultAvatarValue(merged.avatar) && !isDefaultAvatarValue(localData.avatar)) merged.avatar = localData.avatar;
   if ((!merged.joined || merged.joined === '2026') && localData.joined) merged.joined = localData.joined;
+  const localCountryCode = getUserCountryCode(localData);
+  if (!getUserCountryCode(merged) && localCountryCode) {
+    merged.countryCode = localCountryCode;
+    merged.settingsData = merged.settingsData && typeof merged.settingsData === "object" && !Array.isArray(merged.settingsData)
+      ? { ...merged.settingsData, countryCode: localCountryCode }
+      : { countryCode: localCountryCode };
+  }
   reconcileIncomingThemeColor(merged, localData, localData.settingsData || {});
   const preferredTrophies = preferBestTrophiesPayload(merged.trophiesData, localData.trophiesData);
   if (preferredTrophies !== merged.trophiesData) merged.trophiesData = preferredTrophies;
@@ -1140,6 +1204,7 @@ function getPublicUserData(username, user = {}, includeAdminFields = false) {
     role: getUserRole(username, user),
     level: user.level || 1,
     joined: user.joined || "2026",
+    countryCode: getUserCountryCode(user),
     online: !!user.online,
     lastSeen: user.lastSeen || null,
     ps3Status: user.ps3Status || null,
@@ -1702,6 +1767,7 @@ function buildFullProfileSyncPayload(name, user = {}, sourceSocketId = null) {
       name,
       avatar: safe.avatar || DEFAULT_AVATAR,
       joined: safe.joined || '2026',
+      countryCode: getUserCountryCode(safe),
       role: getUserRole(name, safe),
       isAdmin: isUserAdmin(name, safe),
       isModerator: isUserModerator(name, safe),
@@ -2437,6 +2503,9 @@ io.on('connection', (socket) => {
       : ((payload && typeof payload === "object") ? { ...payload } : null);
     if (!incomingSettingsData || Array.isArray(incomingSettingsData)) return;
 
+    const previousCountryCode = getUserCountryCode(userDatabase[name]);
+    normalizeIncomingProfileCountry({}, incomingSettingsData);
+
     const incomingStamp = normalizeTimestampValue(
       incomingSettingsData.settingsUpdatedAt ||
       incomingSettingsData.settingsSyncedAt ||
@@ -2452,6 +2521,9 @@ io.on('connection', (socket) => {
     });
 
     userDatabase[name].settingsData = mergedSettings.settingsData;
+    const currentCountryCode = getUserCountryCode(userDatabase[name]);
+    if (currentCountryCode) userDatabase[name].countryCode = currentCountryCode;
+    const countryChanged = currentCountryCode !== previousCountryCode;
     const incomingThemePayload = {
       themeColor: payload && payload.themeColor,
       themeColorUpdatedAt: payload && (payload.themeColorUpdatedAt || payload.themeUpdatedAt)
@@ -2472,7 +2544,7 @@ io.on('connection', (socket) => {
     const sourceSocketId = (mergedSettings.settingsRejected === true || mergedSettings.bannerRejected === true || themeMerge.rejected === true) ? null : socket.id;
     emitSettingsRealtimeSync(name, sourceSocketId, { reason: payload.reason || 'settings_realtime' });
 
-    if (mergedSettings.bannerAccepted === true || themeMerge.accepted === true) {
+    if (mergedSettings.bannerAccepted === true || themeMerge.accepted === true || countryChanged) {
       emitPublicProfileBannerUpdate(name, userDatabase[name]);
     }
 
@@ -2483,6 +2555,8 @@ io.on('connection', (socket) => {
     const name = socket.userName;
     userData = (userData && typeof userData === "object") ? userData : {};
     const incomingSettingsData = (userData.settingsData && typeof userData.settingsData === "object") ? userData.settingsData : null;
+    const previousCountryCode = name && userDatabase[name] ? getUserCountryCode(userDatabase[name]) : "";
+    normalizeIncomingProfileCountry(userData, incomingSettingsData);
     let shouldBroadcastProfileBanner = false;
     let shouldForceProfileSyncToSource = false;
     const shouldEmitTrendingUpdate = profileUpdateTouchesTrending(userData || {});
@@ -2543,6 +2617,15 @@ io.on('connection', (socket) => {
         userData = reconcileIncomingProfileArrays(userDatabase[name], userData || {});
         
         Object.assign(userDatabase[name], userData);
+        const currentCountryCode = getUserCountryCode(userDatabase[name]);
+        if (currentCountryCode) {
+            userDatabase[name].countryCode = currentCountryCode;
+            userDatabase[name].settingsData = userDatabase[name].settingsData && typeof userDatabase[name].settingsData === "object" && !Array.isArray(userDatabase[name].settingsData)
+                ? { ...userDatabase[name].settingsData, countryCode: currentCountryCode }
+                : { countryCode: currentCountryCode };
+        }
+        const countryChanged = currentCountryCode !== previousCountryCode;
+        if (countryChanged) shouldBroadcastProfileBanner = true;
         if (Array.isArray(userDatabase[name].downloadsData)) userDatabase[name].downloads = userDatabase[name].downloadsData.length;
         userDatabase[name].downloadsClearedAt = normalizeTimestampValue(userDatabase[name].downloadsClearedAt);
         normalizeProfileArrayPayloads(userDatabase[name]);
