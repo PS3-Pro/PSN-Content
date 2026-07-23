@@ -365,6 +365,7 @@
 		.pkg-btn, .rap-btn, .dlc-btn, .avatar-btn, .theme-btn, .upd-btn, .pkg-multi-btn { padding: 2px 6px; border-radius: 4px; font-size: 1.0em; display: inline-block; white-space: nowrap; text-decoration: none; cursor: pointer; }
 		.pkg-btn { background: #007bff; color: #fff !important; margin-left: 5px; border: 1px solid #0056b3; }
 		.rap-btn { background: #fff; margin-left: 5px; border: 1px solid #888 !important; }
+		.is-pc .rap-btn.rap-dlc-btn { background: #777 !important; color: #fff !important; border-color: #555 !important; }
 		.dlc-btn { background: #8A2BE2; color: #fff !important; margin-left: 5px; border: 1px solid #4B0082; }
 		.avatar-btn { background: #008B8B; color: #fff !important; margin-left: 5px !important; border: 1px solid #005F5F; }
 		.theme-btn { background: #7f1d3a; color: #fff !important; margin-left: 5px !important; border: 1px solid #db3f7c; }
@@ -377,6 +378,7 @@
 		.avatar-btn:hover { background-color: #003d3d !important; text-decoration: underline !important; }
 		.theme-btn:hover { background-color: #4a1023 !important; text-decoration: underline !important; }
 		.rap-btn:hover { background-color: #444444 !important; color: #ffffff !important; text-decoration: underline !important; }
+		.is-pc .rap-btn.rap-dlc-btn:hover { background-color: #555 !important; color: #fff !important; }
 		.pkg-multi-btn:hover { background-color: #218838 !important; text-decoration: underline !important; }
 		
 		/* =========================================
@@ -3194,21 +3196,218 @@
 		}
 	}
 
+	function classicNormalizeRapMarker(value) {
+		return String(value || '').replace(/^\s+|\s+$/g, '').replace(/\s+/g, ' ').toUpperCase();
+	}
+
+	function classicIsLicenseByDlcRapValue(value) {
+		var marker = classicNormalizeRapMarker(value);
+		return marker === 'UNLOCK/LICENSE BY DLC' ||
+			marker === 'LICENSE BY DLC' ||
+			(marker.indexOf('UNLOCK') !== -1 && marker.indexOf('DLC') !== -1);
+	}
+
+	function classicEscapeHtmlAttr(value) {
+		return String(value == null ? '' : value)
+			.replace(/&/g, '&amp;')
+			.replace(/"/g, '&quot;')
+			.replace(/</g, '&lt;')
+			.replace(/>/g, '&gt;');
+	}
+
+	function classicNormalizeUnlockText(value) {
+		return String(value || '')
+			.toLowerCase()
+			.replace(/[áàâãä]/g, 'a')
+			.replace(/[éèêë]/g, 'e')
+			.replace(/[íìîï]/g, 'i')
+			.replace(/[óòôõö]/g, 'o')
+			.replace(/[úùûü]/g, 'u')
+			.replace(/ç/g, 'c')
+			.replace(/[^a-z0-9]+/g, ' ')
+			.replace(/^\s+|\s+$/g, '');
+	}
+
+	function classicLicenseContentSuffix(contentId) {
+		var value = String(contentId || '').toUpperCase();
+		var markerIndex = value.indexOf('_00-');
+		return markerIndex >= 0 ? value.substring(markerIndex + 4) : value;
+	}
+
+	function classicCommonPrefixLength(left, right) {
+		left = String(left || '');
+		right = String(right || '');
+		var count = 0;
+		while (count < left.length && count < right.length && left.charAt(count) === right.charAt(count)) count++;
+		return count;
+	}
+
+	function classicNameSimilarity(leftValue, rightValue) {
+		var left = classicNormalizeUnlockText(leftValue);
+		var right = classicNormalizeUnlockText(rightValue);
+		if (!left || !right) return 0;
+
+		var leftParts = left.split(' ');
+		var rightParts = right.split(' ');
+		var leftMap = {};
+		var rightMap = {};
+		var leftCount = 0;
+		var rightCount = 0;
+		var intersection = 0;
+		var i;
+
+		for (i = 0; i < leftParts.length; i++) {
+			if (leftParts[i] && !leftMap[leftParts[i]]) {
+				leftMap[leftParts[i]] = true;
+				leftCount++;
+			}
+		}
+		for (i = 0; i < rightParts.length; i++) {
+			if (rightParts[i] && !rightMap[rightParts[i]]) {
+				rightMap[rightParts[i]] = true;
+				rightCount++;
+			}
+		}
+		for (var token in leftMap) {
+			if (leftMap.hasOwnProperty(token) && rightMap[token]) intersection++;
+		}
+
+		return intersection / Math.max(leftCount, rightCount, 1);
+	}
+
+	function classicHasDirectRapRow(row) {
+		if (!row) return false;
+		var rap = classicNormalizeRapMarker(row[4]);
+		var contentId = String(row[5] || '').replace(/^\s+|\s+$/g, '');
+		var url = String(row[3] || '').replace(/^\s+|\s+$/g, '');
+		return !!(rap && rap !== 'MISSING' && rap !== 'NOT REQUIRED' && rap.length === 32 && contentId && contentId !== 'MISSING' && url && url !== 'MISSING');
+	}
+
+	function classicScoreLicenseDlcCandidate(baseTitle, baseContentId, candidate) {
+		if (!classicHasDirectRapRow(candidate)) return -999;
+
+		var candidateName = classicNormalizeUnlockText(candidate[2]);
+		var baseSuffix = classicLicenseContentSuffix(baseContentId);
+		var candidateSuffix = classicLicenseContentSuffix(candidate[5]);
+		var prefixLength = classicCommonPrefixLength(baseSuffix, candidateSuffix);
+		var similarity = classicNameSimilarity(baseTitle, candidate[2]);
+		var score = (similarity * 35) + (Math.min(prefixLength, 16) * 3);
+
+		if (/\bunlock key\b/.test(candidateName)) score += 55;
+		else if (/\bunlock\b/.test(candidateName)) score += 42;
+		if (/full game unlock|full version/.test(candidateName)) score += 25;
+		if (/\blicen[cs]e\b/.test(candidateName)) score += 35;
+		if (/\btrial upgrade\b|\bupgrade\b|\bpurchase\b/.test(candidateName)) score += 35;
+		if (/(UNLOCK|KEY|FULL|UPGRADE|LICENSE|LICENCE|PURCHASE)/.test(candidateSuffix)) score += 30;
+		if (prefixLength >= 12) score += 20;
+
+		var baseNumeric = baseSuffix.match(/^(.*?)(\d+)$/);
+		var candidateNumeric = candidateSuffix.match(/^(.*?)(\d+)$/);
+		if (baseNumeric && candidateNumeric && baseNumeric[1] === candidateNumeric[1]) {
+			var baseNumber = Number(baseNumeric[2]);
+			var candidateNumber = Number(candidateNumeric[2]);
+			if (isFinite(baseNumber) && candidateNumber === baseNumber + 1) score += 55;
+		}
+
+		var hasUnlockSignal = /\bunlock\b|\bkey\b|\blicen[cs]e\b|\bupgrade\b|\bpurchase\b|full game/.test(candidateName) ||
+			/(UNLOCK|KEY|FULL|UPGRADE|LICENSE|LICENCE|PURCHASE)/.test(candidateSuffix);
+		if (!hasUnlockSignal && /\bepisode [2-9]\b|\bskin\b|\bpack\b|\bexpansion\b|\bmap\b|\btheme\b|\bavatar\b|\bwaldgeist\b/.test(candidateName)) {
+			score -= 45;
+		}
+
+		return score;
+	}
+
+	function classicResolveLicenseDlc(titleId, baseTitle, baseContentId) {
+		var cleanId = String(titleId || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+		var rows = g_classicDlcRowsByTitle[cleanId] || [];
+		var ranked = [];
+		var i;
+
+		for (i = 0; i < rows.length; i++) {
+			var score = classicScoreLicenseDlcCandidate(baseTitle, baseContentId, rows[i]);
+			if (score > -900) ranked.push({ row: rows[i], score: score });
+		}
+
+		ranked.sort(function(a, b) { return b.score - a.score; });
+		if (!ranked.length) return null;
+		if (ranked[0].score < 55) return null;
+		if (ranked.length > 1 && (ranked[0].score - ranked[1].score) < 15) return null;
+		return ranked[0].row;
+	}
+
+	function classicTriggerHiddenDownload(url, filename) {
+		var link = document.createElement('a');
+		link.href = url;
+		if (filename) link.setAttribute('download', filename);
+		link.style.display = 'none';
+		document.body.appendChild(link);
+		try { link.click(); } catch (e) { window.location.href = url; }
+		setTimeout(function() {
+			if (link.parentNode) link.parentNode.removeChild(link);
+		}, 2000);
+	}
+
+	function classicSafeDownloadName(value) {
+		var name = String(value || 'Unlock_DLC')
+			.replace(/['’]/g, '')
+			.replace(/:/g, ' - ')
+			.replace(/[^a-z0-9]/gi, '_')
+			.replace(/_{2,}/g, '_')
+			.replace(/^_|_$/g, '');
+		return name || 'Unlock_DLC';
+	}
+
+	function classicDownloadLicenseByDlc(event, button) {
+		if (event) {
+			if (event.preventDefault) event.preventDefault();
+			if (event.stopPropagation) event.stopPropagation();
+			event.cancelBubble = true;
+		}
+		if (isPS3 || !button || button._classicLicenseDlcBusy) return false;
+
+		var titleId = button.getAttribute('data-title-id') || '';
+		var baseTitle = button.getAttribute('data-title') || titleId;
+		var baseContentId = button.getAttribute('data-content-id') || '';
+		var candidate = classicResolveLicenseDlc(titleId, baseTitle, baseContentId);
+
+		if (!candidate) {
+			if (typeof closeModal === 'function') closeModal();
+			if (typeof openGameDLCs === 'function') openGameDLCs(titleId);
+			return false;
+		}
+
+		button._classicLicenseDlcBusy = true;
+		var pkgUrl = PROXY_URL + '?url=' + encodeURIComponent(candidate[3]) + '&name=' + encodeURIComponent(classicSafeDownloadName(candidate[2]) + '.pkg');
+		var rapContentId = String(candidate[5] || '').replace(/^\s+|\s+$/g, '');
+		var rapUrl = 'https://ps3-pro.github.io/License-Files/files/' + rapContentId + '.rap';
+
+		classicTriggerHiddenDownload(pkgUrl, classicSafeDownloadName(candidate[2]) + '.pkg');
+		setTimeout(function() {
+			classicTriggerHiddenDownload(rapUrl, rapContentId + '.rap');
+		}, 900);
+		setTimeout(function() {
+			button._classicLicenseDlcBusy = false;
+		}, 2500);
+
+		return false;
+	}
+
 	function makeRap(row) {
 		var hex = row[4];
 		var contentID = row[5];
-		if (!hex) return "";
-		if (hex.length < 10 && hex.indexOf("NOT") === -1) return "";
+		if (!hex) return '';
 
-		if (hex === "NOT REQUIRED") {
-			return '';
+		if (classicIsLicenseByDlcRapValue(hex)) {
+			if (isPS3) return '';
+			return '<a href="#" class="rap-btn rap-dlc-btn" data-title-id="' + classicEscapeHtmlAttr(row[0] || '') + '" data-title="' + classicEscapeHtmlAttr(row[2] || '') + '" data-content-id="' + classicEscapeHtmlAttr(contentID || '') + '" onclick="return classicDownloadLicenseByDlc(event, this);">RAP</a>';
 		}
 
-		if (hex === "MISSING" || hex.length !== 32) {
-			return '';
-		}
+		if (hex.length < 10 && hex.indexOf('NOT') === -1) return '';
+		if (hex === 'NOT REQUIRED') return '';
+		if (hex === 'MISSING' || hex.length !== 32) return '';
 
-		return '<a class="rap-btn" download="'+contentID+'.rap" href="https://ps3-pro.github.io/License-Files/files/'+contentID+'.rap">RAP</a>';
+		return '<a class="rap-btn" download="' + contentID + '.rap" href="https://ps3-pro.github.io/License-Files/files/' + contentID + '.rap">RAP</a>';
 	}
 
 	var g_classicShowMissingLicenses = false;
@@ -3627,6 +3826,7 @@ function classicIsGameToRelatedLoop(titleId, category) {
 	// 9. COVERS, DLC, AVATAR & THEME SYSTEM
 	// ==============================================================	
 	var g_dlcExists = {}, g_dlcIndexLoaded = false;
+	var g_classicDlcRowsByTitle = {};
 	var g_avatarExists = {}, g_avatarIndexLoaded = false;
 	var g_themeExists = {}, g_themeIndexLoaded = false;
 	var g_updateExists = {}, g_updateIndexLoaded = false;
@@ -3950,16 +4150,26 @@ function restorePreviousState() {
 			if (xhr_h.readyState == 4 && (xhr_h.status == 200 || xhr_h.status == 0)) {
 				var text_h = xhr_h.responseText; if (!text_h) return;
 				var map_h = g_dlcExists;
+				var keepRows_h = !isPS3;
 
 				var pos_h = 0;
 				var len_h = text_h.length;
 				while (pos_h < len_h) {
-					var id_h = text_h.substr(pos_h, 9);
-					if (id_h.length === 9) map_h[id_h] = true;
-					
-					pos_h = text_h.indexOf('\n', pos_h);
-					if (pos_h === -1) break;
-					pos_h++;
+					var lineEnd_h = text_h.indexOf('\n', pos_h);
+					if (lineEnd_h === -1) lineEnd_h = len_h;
+					var line_h = text_h.substring(pos_h, lineEnd_h);
+					if (line_h.length && line_h.charCodeAt(line_h.length - 1) === 13) line_h = line_h.substring(0, line_h.length - 1);
+					var id_h = line_h.substr(0, 9);
+					if (id_h.length === 9) {
+						map_h[id_h] = true;
+						if (keepRows_h) {
+							var row_h = line_h.split('\t');
+							if (!g_classicDlcRowsByTitle[id_h]) g_classicDlcRowsByTitle[id_h] = [];
+							g_classicDlcRowsByTitle[id_h].push(row_h);
+						}
+					}
+					if (lineEnd_h >= len_h) break;
+					pos_h = lineEnd_h + 1;
 				}
 
 				g_dlcIndexLoaded = true;
@@ -8369,9 +8579,8 @@ function restorePreviousState() {
 			}
 		}
 
-		if (rapHex_h && rapHex_h !== "MISSING" && rapHex_h !== "NOT REQUIRED" && rapHex_h.length === 32) {
-			btnsObj.rap = '<a download="' + contentId_h + '.rap" href="https://ps3-pro.github.io/License-Files/files/' + contentId_h + '.rap" class="rap-btn">RAP</a>';
-		}
+		var modalRapButton_h = makeRap([id_h, region_h, displayName_h, url_h, rapHex_h, contentId_h]);
+		if (modalRapButton_h) btnsObj.rap = modalRapButton_h;
 
 		
 
