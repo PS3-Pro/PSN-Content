@@ -264,6 +264,54 @@ async function refreshServerLogFromDb() {
   return serverLog;
 }
 
+
+async function migrateStoredDownloadHistories() {
+  const client = await pool.connect();
+  let migratedUsers = 0;
+  let removedDuplicates = 0;
+
+  try {
+    await client.query('BEGIN');
+    const result = await client.query(`
+      SELECT name, data
+      FROM users
+      WHERE jsonb_typeof(data->'downloadsData') = 'array'
+    `);
+
+    for (const row of result.rows) {
+      const currentData = row.data && typeof row.data === 'object' ? row.data : {};
+      const currentHistory = Array.isArray(currentData.downloadsData) ? currentData.downloadsData : [];
+      const normalized = normalizeDownloadHistoryRecordsServer(currentHistory);
+      if (!normalized.changed) continue;
+
+      const stamp = Date.now();
+      const nextData = {
+        ...currentData,
+        downloadsData: normalized.history,
+        downloads: normalized.history.length,
+        downloadsUpdatedAt: stamp,
+        profileUpdatedAt: Math.max(normalizeTimestampValue(currentData.profileUpdatedAt), stamp)
+      };
+
+      await client.query('UPDATE users SET data = $1 WHERE name = $2', [nextData, row.name]);
+      migratedUsers += 1;
+      removedDuplicates += Math.max(0, currentHistory.length - normalized.history.length);
+    }
+
+    await client.query('COMMIT');
+    if (migratedUsers > 0) {
+      console.log(`[DOWNLOAD MIGRATION] ${migratedUsers} user(s) normalized; ${removedDuplicates} duplicate record(s) grouped.`);
+    }
+    return { migratedUsers, removedDuplicates };
+  } catch (err) {
+    try { await client.query('ROLLBACK'); } catch (rollbackErr) {}
+    console.error('[DOWNLOAD MIGRATION ERROR]:', err);
+    return { migratedUsers: 0, removedDuplicates: 0, error: err };
+  } finally {
+    client.release();
+  }
+}
+
 async function initDb() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
@@ -325,6 +373,7 @@ async function initDb() {
 
   await pool.query('DELETE FROM presence_sessions WHERE instance_id = $1 OR last_seen < NOW() - INTERVAL \'90 seconds\'', [INSTANCE_ID]);
 
+  await migrateStoredDownloadHistories();
   await refreshAllUsersCacheFromDb({ preserveOnline: false });
 
   await refreshChatHistoryFromDb();
@@ -424,6 +473,100 @@ async function calculateGlobalTrophyStatsFromDb() {
 
 function normalizeText(value, fallback = "") {
   return String(value === undefined || value === null ? fallback : value).trim();
+}
+
+
+function normalizeDownloadHistoryNameServer(value) {
+  return normalizeText(value, '').toLowerCase().replace(/&amp;/g, '&').replace(/[^a-z0-9]+/g, '');
+}
+
+function normalizeDownloadHistoryCategoryServer(value) {
+  const raw = normalizeText(value, 'games').toLowerCase().replace(/[\s-]+/g, '_');
+  const aliases = {
+    game: 'games', app: 'apps', demo: 'demos', dlc: 'dlcs', update: 'updates',
+    avatar: 'avatars', theme: 'themes', homebrew: 'homebrew_games', port: 'ports',
+    prototype: 'prototypes', emulator: 'emulators', launcher: 'launchers', tool: 'tools',
+    dev_tool: 'dev_tools', manager: 'backup_manager'
+  };
+  return aliases[raw] || raw || 'games';
+}
+
+function getDownloadHistoryItemCountServer(item = {}) {
+  const count = Number(item.downloadCount);
+  return Number.isFinite(count) && count > 0 ? Math.floor(count) : 1;
+}
+
+function isSameDownloadHistoryItemServer(first = {}, second = {}) {
+  const firstCategory = normalizeDownloadHistoryCategoryServer(first.category || first.rawCategory || 'games');
+  const secondCategory = normalizeDownloadHistoryCategoryServer(second.category || second.rawCategory || 'games');
+  if (firstCategory !== secondCategory) return false;
+
+  const firstTitleId = normalizeText(first.titleId || first.id, '').toUpperCase();
+  const secondTitleId = normalizeText(second.titleId || second.id, '').toUpperCase();
+  const firstContentId = normalizeText(first.contentId || first.contentID, '').toUpperCase();
+  const secondContentId = normalizeText(second.contentId || second.contentID, '').toUpperCase();
+  const firstName = normalizeDownloadHistoryNameServer(first.cleanName || first.name || first.title || first.rawName);
+  const secondName = normalizeDownloadHistoryNameServer(second.cleanName || second.name || second.title || second.rawName);
+
+  if (firstTitleId && secondTitleId && firstTitleId !== secondTitleId) return false;
+  if (firstContentId && secondContentId) return firstContentId === secondContentId;
+
+  if (firstTitleId && secondTitleId) {
+    if (firstName && secondName) return firstName === secondName;
+    return !firstContentId && !secondContentId;
+  }
+
+  if (firstContentId || secondContentId) return false;
+  return !!(firstName && secondName && firstName === secondName);
+}
+
+function normalizeDownloadHistoryRecordsServer(history = []) {
+  const source = Array.isArray(history) ? history : [];
+  const grouped = [];
+  let changed = !Array.isArray(history);
+
+  source.forEach(rawItem => {
+    if (!rawItem || typeof rawItem !== 'object' || Array.isArray(rawItem)) {
+      changed = true;
+      return;
+    }
+
+    const item = { ...rawItem };
+    const rawItemCount = Number(item.downloadCount);
+    const itemCount = getDownloadHistoryItemCountServer(item);
+    if (Number.isFinite(rawItemCount) && rawItemCount > 0 && rawItemCount !== itemCount) changed = true;
+    item.downloadCount = itemCount;
+    const normalizedCategory = normalizeDownloadHistoryCategoryServer(item.category || item.rawCategory || 'games');
+    if (String(item.category || '') !== normalizedCategory) changed = true;
+    item.category = normalizedCategory;
+
+    const existingIndex = grouped.findIndex(existing => isSameDownloadHistoryItemServer(existing, item));
+    if (existingIndex < 0) {
+      grouped.push(item);
+      return;
+    }
+
+    changed = true;
+    const existing = grouped[existingIndex];
+    existing.downloadCount = getDownloadHistoryItemCountServer(existing) + itemCount;
+
+    ['titleId', 'contentId', 'cleanName', 'name', 'cTag', 'console', 'rawCategory', 'cover'].forEach(key => {
+      if (!existing[key] && item[key]) existing[key] = item[key];
+    });
+    if (item.noBingCover === true) existing.noBingCover = true;
+
+    const existingSize = Number(existing.sizeBytes) || 0;
+    const itemSize = Number(item.sizeBytes) || 0;
+    if (itemSize > existingSize) {
+      existing.sizeBytes = itemSize;
+      if (item.sizeText) existing.sizeText = item.sizeText;
+    } else if (!existing.sizeText && item.sizeText) {
+      existing.sizeText = item.sizeText;
+    }
+  });
+
+  if (grouped.length !== source.length) changed = true;
+  return { history: grouped, changed };
 }
 
 function normalizeProfileCountryCodeServer(value) {
@@ -614,6 +757,11 @@ function normalizeUserRecord(name, userData = {}) {
     delete normalized.banReason;
     delete normalized.bannedBy;
     delete normalized.bannedAt;
+  }
+
+  if (Array.isArray(normalized.downloadsData)) {
+    normalized.downloadsData = normalizeDownloadHistoryRecordsServer(normalized.downloadsData).history;
+    normalized.downloads = normalized.downloadsData.length;
   }
 
   return normalized;
@@ -989,7 +1137,8 @@ function setProfileArrayPayload(target = {}, key = '', list = [], version = 0) {
 function normalizeProfileArrayPayloads(target = {}) {
   Object.keys(PROFILE_ARRAY_SYNC_KEYS).forEach(key => {
     const sync = PROFILE_ARRAY_SYNC_KEYS[key];
-    const list = Array.isArray(target[key]) ? target[key] : [];
+    const rawList = Array.isArray(target[key]) ? target[key] : [];
+    const list = key === 'downloadsData' ? normalizeDownloadHistoryRecordsServer(rawList).history : rawList;
     target[key] = list;
     target[sync.countKey] = list.length;
     target[sync.versionKey] = normalizeTimestampValue(target[sync.versionKey]);
@@ -1041,8 +1190,10 @@ function applyLocalRecoveryArrayPayload(merged = {}, localData = {}, key = '') {
   const sync = PROFILE_ARRAY_SYNC_KEYS[key];
   if (!sync) return merged;
 
-  const dbList = getProfileArrayPayload(merged[key]);
-  const localList = getProfileArrayPayload(localData[key]);
+  const dbRawList = getProfileArrayPayload(merged[key]);
+  const localRawList = getProfileArrayPayload(localData[key]);
+  const dbList = key === 'downloadsData' ? normalizeDownloadHistoryRecordsServer(dbRawList).history : dbRawList;
+  const localList = key === 'downloadsData' ? normalizeDownloadHistoryRecordsServer(localRawList).history : localRawList;
   const dbVersion = normalizeTimestampValue(merged[sync.versionKey]);
   const localVersion = normalizeTimestampValue(localData[sync.versionKey]);
   const dbHasItems = dbList.length > 0;
@@ -1086,8 +1237,10 @@ function reconcileIncomingDownloads(currentUser = {}, incomingUser = {}) {
   }
 
   if (hasIncomingDownloadsData && Array.isArray(incomingUser.downloadsData)) {
-    const incomingList = incomingUser.downloadsData;
-    const currentList = Array.isArray(currentUser.downloadsData) ? currentUser.downloadsData : [];
+    const incomingList = normalizeDownloadHistoryRecordsServer(incomingUser.downloadsData).history;
+    const currentList = normalizeDownloadHistoryRecordsServer(Array.isArray(currentUser.downloadsData) ? currentUser.downloadsData : []).history;
+    incomingUser.downloadsData = incomingList;
+    currentUser.downloadsData = currentList;
     const currentHasItems = currentList.length > 0;
     const incomingHasItems = incomingList.length > 0;
     const acceptIncoming = !!(
@@ -1361,7 +1514,8 @@ function getUserDataPayloadFromCache(targetName, type) {
     trophies: 'trophiesData'
   };
   const dataKey = keyMap[type] || `${type}Data`;
-  return targetUser[dataKey] || (dataKey === 'trophiesData' ? {} : []);
+  const payload = targetUser[dataKey] || (dataKey === 'trophiesData' ? {} : []);
+  return dataKey === 'downloadsData' ? normalizeDownloadHistoryRecordsServer(payload).history : payload;
 }
 
 function searchUsersFromCache(query, includeAdminFields = false) {

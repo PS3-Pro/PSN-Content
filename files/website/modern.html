@@ -431,14 +431,14 @@ select option { background-color: var(--bg-dark); }
 #view-browse .card-details-hint { position: absolute; left: 50%; top: 50%; z-index: 10; display: inline-flex; align-items: center; justify-content: center; gap: 5px; min-width: 28px; height: 28px; padding: 0 9px; color: #fff; font-size: 10px; font-weight: 800; letter-spacing: .35px; text-transform: uppercase; background: rgba(0,0,0,0.7); border: 1px solid rgba(255,255,255,0.2); border-radius: 999px; backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px); opacity: 0; transform: translate(-50%,calc(-50% + 4px)); transition: opacity .2s ease,transform .2s ease; pointer-events: none; }
 #view-browse .card-details-hint i { display: block; margin: 0; padding: 0; line-height: 1; font-size: 12px; color: #fff; }
 #view-browse .game-card:hover .card-details-hint, #view-browse .game-card:focus-within .card-details-hint { opacity: 1; transform: translate(-50%,-50%); }
-#view-browse .content-download-card-count, #view-downloads .dl-download-count { display: inline-flex; align-items: center; justify-content: center; border-radius: 999px; background: rgba(0,0,0,0.7); border: 1px solid rgba(255,255,255,0.2); color: #fff; font-weight: 900; line-height: 1; letter-spacing: 0; backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px); }
+#view-browse .content-download-card-count, #view-downloads .dl-download-count, #modal-sys-list .dl-download-count { display: inline-flex; align-items: center; justify-content: center; border-radius: 999px; background: rgba(0,0,0,0.7); border: 1px solid rgba(255,255,255,0.2); color: #fff; font-weight: 900; line-height: 1; letter-spacing: 0; backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px); }
 #view-browse .content-download-card-count { position: absolute; left: 8px; bottom: 8px; z-index: 11; min-width: 28px; height: 28px; padding: 0 8px; gap: 5px; font-size: 9px; }
-#view-browse .content-download-card-count i, #view-downloads .dl-download-count i { line-height: 1; color: #fff; }
+#view-browse .content-download-card-count i, #view-downloads .dl-download-count i, #modal-sys-list .dl-download-count i { line-height: 1; color: #fff; }
 #view-browse .content-download-card-count i { font-size: 10px; }
 #view-browse .content-download-card-count[hidden] { display: none !important; }
-#view-downloads .dl-download-count { min-width: 18px; height: 18px; padding: 0 5px; gap: 3px; flex: 0 0 auto; font-size: 8px; white-space: nowrap; background: rgba(255,255,255,0.045); border-color: rgba(255,255,255,0.16); box-shadow: inset 0 1px 0 rgba(255,255,255,0.08); backdrop-filter: blur(10px) saturate(135%); -webkit-backdrop-filter: blur(10px) saturate(135%); }
-#view-downloads .dl-download-count i { font-size: 8px; }
-#view-downloads .dl-download-count span { line-height: 1; }
+#view-downloads .dl-download-count, #modal-sys-list .dl-download-count { min-width: 18px; height: 18px; padding: 0 5px; gap: 3px; flex: 0 0 auto; font-size: 8px; white-space: nowrap; background: rgba(255,255,255,0.045); border-color: rgba(255,255,255,0.16); box-shadow: inset 0 1px 0 rgba(255,255,255,0.08); backdrop-filter: blur(10px) saturate(135%); -webkit-backdrop-filter: blur(10px) saturate(135%); }
+#view-downloads .dl-download-count i, #modal-sys-list .dl-download-count i { font-size: 8px; }
+#view-downloads .dl-download-count span, #modal-sys-list .dl-download-count span { line-height: 1; }
 .region-tag { position: absolute; top: 8px; right: 8px; background: rgba(0,0,0,0.7); font-size: 9px; padding: 2px 5px; border-radius: 4px; font-weight: bold; border: 1px solid rgba(255,255,255,0.1); z-index: 2; }
 .console-tag { position: absolute; top: 8px; left: 8px; font-size: 9px; padding: 3px 6px; border-radius: 4px; font-weight: 900; z-index: 2; text-transform: uppercase; letter-spacing: 0.5px; box-shadow: 0 3px 6px rgba(0,0,0,0.6); backdrop-filter: blur(4px); }
 .tag-ps3 { background: linear-gradient(135deg,#111111,#333333); color: #ffffff; border: 1px solid #555555; }
@@ -9603,11 +9603,134 @@ P
 		if (!username || activeUser === username) localStorage.removeItem(STORAGE_KEY_DOWNLOAD_CLEAR_PENDING);
 	}
 
+
+	function normalizeDownloadHistoryText(value) {
+		return String(value || '').trim().toLowerCase();
+	}
+
+	function normalizeDownloadHistoryName(value) {
+		return normalizeDownloadHistoryText(value)
+			.replace(/&amp;/g, '&')
+			.replace(/[^a-z0-9]+/g, '');
+	}
+
+	function normalizeDownloadHistoryCategory(value) {
+		const raw = normalizeDownloadHistoryText(value || 'games').replace(/[\s-]+/g, '_');
+		const aliases = {
+			game: 'games', app: 'apps', demo: 'demos', dlc: 'dlcs', update: 'updates',
+			avatar: 'avatars', theme: 'themes', homebrew: 'homebrew_games', port: 'ports',
+			prototype: 'prototypes', emulator: 'emulators', launcher: 'launchers', tool: 'tools',
+			dev_tool: 'dev_tools', manager: 'backup_manager'
+		};
+		return aliases[raw] || raw || 'games';
+	}
+
+	function getDownloadHistoryItemCount(item) {
+		const count = Number(item && item.downloadCount);
+		return Number.isFinite(count) && count > 0 ? Math.floor(count) : 1;
+	}
+
+	function isSameDownloadHistoryItem(first, second) {
+		if (!first || !second) return false;
+		const firstCategory = normalizeDownloadHistoryCategory(first.category || first.rawCategory || 'games');
+		const secondCategory = normalizeDownloadHistoryCategory(second.category || second.rawCategory || 'games');
+		if (firstCategory !== secondCategory) return false;
+
+		const firstTitleId = normalizeDownloadHistoryText(first.titleId || first.id).toUpperCase();
+		const secondTitleId = normalizeDownloadHistoryText(second.titleId || second.id).toUpperCase();
+		const firstContentId = normalizeDownloadHistoryText(first.contentId || first.contentID).toUpperCase();
+		const secondContentId = normalizeDownloadHistoryText(second.contentId || second.contentID).toUpperCase();
+		const firstName = normalizeDownloadHistoryName(first.cleanName || first.name || first.title || first.rawName);
+		const secondName = normalizeDownloadHistoryName(second.cleanName || second.name || second.title || second.rawName);
+
+		if (firstTitleId && secondTitleId && firstTitleId !== secondTitleId) return false;
+		if (firstContentId && secondContentId) return firstContentId === secondContentId;
+
+		if (firstTitleId && secondTitleId) {
+			if (firstName && secondName) return firstName === secondName;
+			return !firstContentId && !secondContentId;
+		}
+
+		if (firstContentId || secondContentId) return false;
+		return !!(firstName && secondName && firstName === secondName);
+	}
+	window.isSameDownloadHistoryItem = isSameDownloadHistoryItem;
+
+	function normalizeDownloadHistoryRecords(history) {
+		const source = Array.isArray(history) ? history : [];
+		const grouped = [];
+		let changed = !Array.isArray(history);
+
+		source.forEach(rawItem => {
+			if (!rawItem || typeof rawItem !== 'object' || Array.isArray(rawItem)) {
+				changed = true;
+				return;
+			}
+
+			const item = { ...rawItem };
+			const rawItemCount = Number(item.downloadCount);
+			const itemCount = getDownloadHistoryItemCount(item);
+			if (Number.isFinite(rawItemCount) && rawItemCount > 0 && rawItemCount !== itemCount) changed = true;
+			item.downloadCount = itemCount;
+			const normalizedCategory = normalizeDownloadHistoryCategory(item.category || item.rawCategory || 'games');
+			if (String(item.category || '') !== normalizedCategory) changed = true;
+			item.category = normalizedCategory;
+
+			const existingIndex = grouped.findIndex(existing => isSameDownloadHistoryItem(existing, item));
+			if (existingIndex < 0) {
+				grouped.push(item);
+				return;
+			}
+
+			changed = true;
+			const existing = grouped[existingIndex];
+			existing.downloadCount = getDownloadHistoryItemCount(existing) + itemCount;
+
+			['titleId', 'contentId', 'cleanName', 'name', 'cTag', 'console', 'rawCategory', 'cover'].forEach(key => {
+				if (!existing[key] && item[key]) existing[key] = item[key];
+			});
+			if (item.noBingCover === true) existing.noBingCover = true;
+
+			const existingSize = Number(existing.sizeBytes) || 0;
+			const itemSize = Number(item.sizeBytes) || 0;
+			if (itemSize > existingSize) {
+				existing.sizeBytes = itemSize;
+				existing.sizeText = typeof formatSizeFromBytes === 'function' ? formatSizeFromBytes(itemSize) : (item.sizeText || existing.sizeText);
+			} else if (!existing.sizeText && item.sizeText) {
+				existing.sizeText = item.sizeText;
+			}
+		});
+
+		if (grouped.length !== source.length) changed = true;
+		return { history: grouped, changed };
+	}
+	window.normalizeDownloadHistoryRecords = normalizeDownloadHistoryRecords;
+
+	function normalizeAndStoreDownloadHistory(username, history, options = {}) {
+		const result = normalizeDownloadHistoryRecords(history);
+		const activeUser = localStorage.getItem('psn_username');
+		if (activeUser === username) window.downloadHistory = result.history;
+		if (username && username !== 'null') localStorage.setItem(`${username}_${COOKIE_NAME_HISTORY}`, JSON.stringify(result.history));
+		if (activeUser === username && typeof saveState === 'function') saveState(COOKIE_NAME_HISTORY, JSON.stringify(result.history));
+
+		if (result.changed && options.markChanged === true && activeUser === username) {
+			const stamp = Date.now();
+			if (typeof markProfileListChanged === 'function') markProfileListChanged('downloads', stamp);
+			if (options.broadcast === true && typeof window.broadcastProfileUpdate === 'function') {
+				clearTimeout(window.__downloadHistoryMigrationBroadcastTimer);
+				window.__downloadHistoryMigrationBroadcastTimer = setTimeout(() => window.broadcastProfileUpdate(), 350);
+			}
+		}
+		return result;
+	}
+	window.normalizeAndStoreDownloadHistory = normalizeAndStoreDownloadHistory;
+
 	function getLocalDownloadHistoryForProfile(username) {
 		const activeUser = localStorage.getItem('psn_username');
-		if (activeUser === username && Array.isArray(window.downloadHistory)) return window.downloadHistory;
-		const parsed = parseLocalJsonForAuth(localStorage.getItem(`${username}_${COOKIE_NAME_HISTORY}`), []);
-		return Array.isArray(parsed) ? parsed : [];
+		const rawHistory = (activeUser === username && Array.isArray(window.downloadHistory))
+			? window.downloadHistory
+			: parseLocalJsonForAuth(localStorage.getItem(`${username}_${COOKIE_NAME_HISTORY}`), []);
+		return normalizeDownloadHistoryRecords(rawHistory).history;
 	}
 
 	function shouldRejectStaleIncomingDownloadHistory(username, userData = {}, payload = {}) {
@@ -9633,11 +9756,10 @@ P
 			return true;
 		}
 
-		const incomingDownloads = userData.downloadsData;
+		const incomingResult = normalizeAndStoreDownloadHistory(username, userData.downloadsData, { markChanged: true, broadcast: true });
+		const incomingDownloads = incomingResult.history;
 		const incomingDownloadsUpdatedAt = normalizeProfileListTimestamp(userData.downloadsUpdatedAt || payload.downloadsUpdatedAt || userData.profileUpdatedAt || payload.profileUpdatedAt || Date.now());
-		if (localStorage.getItem('psn_username') === username) window.downloadHistory = incomingDownloads;
-		localStorage.setItem(`${username}_${COOKIE_NAME_HISTORY}`, JSON.stringify(incomingDownloads));
-		applyProfileListUpdatedAtFromServer(username, 'downloads', incomingDownloadsUpdatedAt);
+		applyProfileListUpdatedAtFromServer(username, 'downloads', incomingResult.changed ? Date.now() : incomingDownloadsUpdatedAt);
 
 		const incomingDownloadsClearedAt = normalizeProfileListTimestamp(userData.downloadsClearedAt || payload.downloadsClearedAt || 0);
 		const pendingClearAt = getDownloadHistoryClearPendingAt(username);
@@ -9676,7 +9798,9 @@ P
 		const localAvatar = readLocalUserValueForAuth(username, 'psn_avatar', null) || fallbackAvatar;
 		const trophiesData = readLocalObjectForAuth(username, 'psn_user_trophies', activeUser === username ? window.userTrophies : null);
 		const trophyPayload = calculateLocalTrophyPayloadForAuth(trophiesData);
-		const downloadsData = readLocalArrayForAuth(username, COOKIE_NAME_HISTORY, activeUser === username ? window.downloadHistory : null);
+		const rawDownloadsData = readLocalArrayForAuth(username, COOKIE_NAME_HISTORY, activeUser === username ? window.downloadHistory : null);
+		const normalizedDownloadsResult = normalizeAndStoreDownloadHistory(username, rawDownloadsData, { markChanged: true, broadcast: false });
+		const downloadsData = normalizedDownloadsResult.history;
 		const wishlistData = readLocalArrayForAuth(username, STORAGE_KEY_WISHLIST, activeUser === username ? window.wishlist : null);
 		const favoritesData = readLocalArrayForAuth(username, STORAGE_KEY_FAVS, activeUser === username ? window.favoritesLibrary : null);
 		const libraryData = readLocalArrayForAuth(username, 'psn_local_library', activeUser === username && typeof lastScannedGames !== 'undefined' ? lastScannedGames : null);
@@ -9911,6 +10035,7 @@ P
             window.userTrophies = JSON.parse(loadState('psn_user_trophies') || "{}");
             window.wishlist = JSON.parse(loadState(STORAGE_KEY_WISHLIST) || "[]");
             window.downloadHistory = JSON.parse(loadState(COOKIE_NAME_HISTORY) || "[]");
+            normalizeAndStoreDownloadHistory(activeUser, window.downloadHistory, { markChanged: true, broadcast: true });
             window.favoritesLibrary = JSON.parse(loadState(STORAGE_KEY_FAVS) || "[]");
 			window.friendsList = JSON.parse(loadState(STORAGE_KEY_FRIENDS) || "[]");
             lastScannedGames = JSON.parse(loadState('psn_local_library') || "[]");
@@ -19090,30 +19215,17 @@ P
             sizeText: formatSizeFromBytes(sizeBytes),
             date: dateTime,
             downloadCount: 1,
+            lastDownloadedAt: Date.now(),
             isNew: true
         };
 
-        const sameDownloadText = (a, b) => String(a || '').trim().toLowerCase() === String(b || '').trim().toLowerCase();
-        const isSameDownloadItem = (historyItem, nextItem) => {
-            if (!historyItem || !nextItem) return false;
-            if (!sameDownloadText(historyItem.titleId, nextItem.titleId)) return false;
-            if (!sameDownloadText(historyItem.category, nextItem.category)) return false;
-
-            const historyContentId = String(historyItem.contentId || '').trim();
-            const nextContentId = String(nextItem.contentId || '').trim();
-            if (historyContentId || nextContentId) return sameDownloadText(historyContentId, nextContentId);
-
-            return sameDownloadText(historyItem.cleanName, nextItem.cleanName) ||
-                sameDownloadText(historyItem.name, nextItem.name);
-        };
-
         const previousDownload = Array.isArray(window.downloadHistory) ? window.downloadHistory[0] : null;
-        if (isSameDownloadItem(previousDownload, entry)) {
+        if (isSameDownloadHistoryItem(previousDownload, entry)) {
             if (typeof playUiSuccess === "function") playUiSuccess();
             return;
         }
 
-        const existingIndex = downloadHistory.findIndex(item => isSameDownloadItem(item, entry));
+        const existingIndex = downloadHistory.findIndex(item => isSameDownloadHistoryItem(item, entry));
         if (existingIndex >= 0) {
             const existingEntry = downloadHistory.splice(existingIndex, 1)[0];
             const previousCount = Number(existingEntry.downloadCount);
@@ -19121,6 +19233,7 @@ P
                 ? Math.floor(previousCount) + 1
                 : 2;
             existingEntry.date = dateTime;
+            existingEntry.lastDownloadedAt = Date.now();
             existingEntry.isNew = true;
             downloadHistory.unshift(existingEntry);
         } else {
@@ -19275,6 +19388,11 @@ P
 		if (!isPsnDomSectionVisible('view-downloads')) {
 			if (typeof window.refreshDownloadSummaryUI === 'function') window.refreshDownloadSummaryUI();
 			return;
+		}
+		const normalizedHistoryResult = normalizeDownloadHistoryRecords(window.downloadHistory);
+		if (normalizedHistoryResult.changed) {
+			window.downloadHistory = normalizedHistoryResult.history;
+			saveState(COOKIE_NAME_HISTORY, JSON.stringify(window.downloadHistory));
 		}
 		if (typeof window.normalizeDownloadHistoryCovers === 'function') window.normalizeDownloadHistoryCovers(true, true);
 	
@@ -38797,7 +38915,8 @@ function getVisibleChatStackEl(id) {
 				if (!Array.isArray(window.downloadHistory)) window.downloadHistory = [];
 			} else {
 				const localDl = localStorage.getItem(`${name}_psn_dl_history`);
-				window.downloadHistory = localDl ? JSON.parse(localDl) : [];
+				const localHistory = localDl ? JSON.parse(localDl) : [];
+				normalizeAndStoreDownloadHistory(name, localHistory, { markChanged: true, broadcast: true });
 			}
 
 			if (Array.isArray(userData.favoritesData)) {
@@ -44714,6 +44833,7 @@ function getVisibleChatStackEl(id) {
 			dataArray.sort((a, b) => weight[a.type] - weight[b.type]);
 		} else {
 			dataArray = Array.isArray(rawData) ? rawData : [];
+			if (listType === 'downloads') dataArray = normalizeDownloadHistoryRecords(dataArray).history;
 		}
 	
 		titleEl.innerHTML = window.getPlayerListTitleHtml(targetUser, listMeta, dataArray.length);
@@ -44851,7 +44971,18 @@ function getVisibleChatStackEl(id) {
 					}
 				}
 
-				let dateDisp = listType === 'library' ? (item.lastPlayed ? `Last played: <span style="color:#fff;">${item.lastPlayed}</span>` : `Last played: Unknown`) : `<i class="far fa-clock"></i> ${item.date || 'Recently'}`;
+				const profileDownloadCount = listType === 'downloads' ? getDownloadHistoryItemCount(item) : 1;
+				const profileDownloadDateText = listType === 'downloads' && profileDownloadCount > 1
+					? `Last download: ${item.date || 'Recently'}`
+					: (item.date || 'Recently');
+				let dateDisp = listType === 'library'
+					? (item.lastPlayed ? `Last played: <span style="color:#fff;">${item.lastPlayed}</span>` : `Last played: Unknown`)
+					: (listType === 'downloads'
+						? `<i class="far fa-clock"></i>${profileDownloadDateText}`
+						: `<i class="far fa-clock"></i> ${item.date || 'Recently'}`);
+				const profileDownloadCountHtml = listType === 'downloads' && profileDownloadCount > 1
+					? `<span class="dl-download-count" title="Downloaded ${profileDownloadCount.toLocaleString('en-US')} times"><i class="fas fa-download"></i><span>${profileDownloadCount.toLocaleString('en-US')}</span></span>`
+					: '';
 				const typeMeta = window.getDownloadTypeMeta(itemFinalCategory || itemTypeCategory, itemCoverData || item);
 				const typeTagHtml = window.getDownloadTypeTagHtml(itemFinalCategory || itemTypeCategory, itemCoverData || item);
 				const typeClass = `dl-kind-${typeMeta.cls || 'default'}`;
@@ -44866,7 +44997,7 @@ function getVisibleChatStackEl(id) {
 								${profileCoverImgHtml}
 								${typeTagHtml}
 							</div>
-							<div class="dl-main-info"><div class="dl-title-row"><span class="dl-name profile-list-game-name" data-no-translate="true" translate="no" style="font-size: 14px; color: #fff; font-weight: 500;">${itemName}</span></div><div class="dl-meta-row"><span class="dl-date" style="font-size: 11px; color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; display: block;">${dateDisp}</span></div></div>
+							<div class="dl-main-info"><div class="dl-title-row"><span class="dl-name profile-list-game-name" data-no-translate="true" translate="no" style="font-size: 14px; color: #fff; font-weight: 500;">${itemName}</span></div><div class="dl-meta-row"><span class="dl-date" style="font-size: 11px; color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; display: block;">${dateDisp}</span>${profileDownloadCountHtml}</div></div>
 						</div>
 						<div class="dl-side-info" style="text-align: right;"><span class="dl-size-tag" style="font-size: 12px; color: var(--text-muted);">${item.sizeText || item.size || ''}</span>${searchTagHtml}</div>
 					</div>`;
