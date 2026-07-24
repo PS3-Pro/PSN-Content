@@ -48392,6 +48392,7 @@ function getVisibleChatStackEl(id) {
                 installInterfaceTranslationUiHooks();
                 if (!state.observer) startInterfaceTranslationObserver();
                 warmEagerInterfaceRoots();
+                if (typeof window.warmNativeDialogTranslations === 'function') window.warmNativeDialogTranslations();
                 scheduleInterfaceTranslationAfterUiChange(document.body);
             }
             return;
@@ -48416,6 +48417,7 @@ function getVisibleChatStackEl(id) {
             warmEagerInterfaceRoots();
             if (typeof window.warmPsnWelcomeMessageTranslations === 'function') window.warmPsnWelcomeMessageTranslations();
             if (typeof window.refreshPsnWelcomeMessageTranslation === 'function') window.refreshPsnWelcomeMessageTranslation();
+            if (typeof window.warmNativeDialogTranslations === 'function') window.warmNativeDialogTranslations();
             scheduleInterfaceTranslationAfterUiChange(document.body);
         }
     }
@@ -48543,6 +48545,537 @@ function getVisibleChatStackEl(id) {
         const toggle = document.getElementById('interface-auto-translate-toggle');
         window.setInterfaceAutoTranslateEnabled(!!(toggle && toggle.checked));
     };
+
+
+    /* ==========================================================================
+       NATIVE BROWSER DIALOG TRANSLATION PATCH
+       Keeps alert/confirm/prompt synchronous while using the interface cache.
+       ========================================================================== */
+    if (!window.__nativeDialogTranslationPatched) {
+        window.__nativeDialogTranslationPatched = true;
+
+        const nativeBrowserAlert = window.alert.bind(window);
+        const nativeBrowserConfirm = window.confirm.bind(window);
+        const nativeBrowserPrompt = window.prompt.bind(window);
+
+        const NATIVE_DIALOG_PROMPT_DEFAULTS = new Set([
+        "Banned by administrator",
+        "Account deleted by administrator.",
+        "Spam / abuse / inappropriate content"
+]);
+        const NATIVE_DIALOG_PRIORITY_EXACT = [
+        "PS3™ is connected!\n\nSend this Download All queue directly to the console?\n\n[OK] = Download on PS3™\n[Cancel] = Download on this device",
+        "Do you want to clear all history and statistics?",
+        "Force reload for everyone currently connected? This sends the same /reload command used in chat.",
+        "Permanently clear the global chat history? This cannot be undone.",
+        "Clear server log?",
+        "Clear moderation log?",
+        "Enable maintenance mode now for normal users?",
+        "Clear all pending reports? With the updated server this also resolves them in the database.",
+        "Are you sure you want to log out?",
+        "Are you sure you want to relaunch the game?",
+        "Are you sure you want to exit the game?",
+        "Turn off the PS3™?",
+        "Unpin this message?",
+        "Unpin this message for everyone?",
+        "🚨 WARNING: This will clear the global chat history. A server backup will be saved first. Continue?",
+        "Do you want to delete this message?",
+        "Banned by administrator",
+        "Account deleted by administrator.",
+        "Spam / abuse / inappropriate content",
+        "Disable CFW syscalls on the PS3™?",
+        "Re-enable CFW syscalls on the PS3™ if webMAN allows it?",
+        "Clear webMAN history files on the PS3™?",
+        "Restart the PS3™ now?"
+];
+        const NATIVE_DIALOG_PRIORITY_PATTERNS = [
+        {
+                "source": "Do you really want to delete the \"PSNDIALOGVALUE0TOKEN\"?",
+                "regex": "^Do\\ you\\ really\\ want\\ to\\ delete\\ the\\ \"([\\s\\S]*?)\"\\?$"
+        },
+        {
+                "source": "PS3™ is connected!\n\nDo you want to send \"PSNDIALOGVALUE0TOKEN\" directly to the console?\n\n[OK] = Download on PS3™\n[Cancel] = Download on this device",
+                "regex": "^PS3™\\ is\\ connected!\\\n\\\nDo\\ you\\ want\\ to\\ send\\ \"([\\s\\S]*?)\"\\ directly\\ to\\ the\\ console\\?\\\n\\\n\\[OK\\]\\ =\\ Download\\ on\\ PS3™\\\n\\[Cancel\\]\\ =\\ Download\\ on\\ this\\ device$"
+        },
+        {
+                "source": "Kick PSNDIALOGVALUE0TOKEN from the current session?",
+                "regex": "^Kick\\ ([\\s\\S]*?)\\ from\\ the\\ current\\ session\\?$"
+        },
+        {
+                "source": "Unban PSNDIALOGVALUE0TOKEN? The account should be able to log in again after this.",
+                "regex": "^Unban\\ ([\\s\\S]*?)\\?\\ The\\ account\\ should\\ be\\ able\\ to\\ log\\ in\\ again\\ after\\ this\\.$"
+        },
+        {
+                "source": "Ban PSNDIALOGVALUE0TOKEN? This should block the account on the server.",
+                "regex": "^Ban\\ ([\\s\\S]*?)\\?\\ This\\ should\\ block\\ the\\ account\\ on\\ the\\ server\\.$"
+        },
+        {
+                "source": "Unload VSH plugin slot PSNDIALOGVALUE0TOKEN?",
+                "regex": "^Unload\\ VSH\\ plugin\\ slot\\ ([\\s\\S]*?)\\?$"
+        },
+        {
+                "source": "Delete this file/folder?\n\nPSNDIALOGVALUE0TOKEN",
+                "regex": "^Delete\\ this\\ file/folder\\?\\\n\\\n([\\s\\S]*?)$"
+        },
+        {
+                "source": "Kick PSNDIALOGVALUE0TOKEN?",
+                "regex": "^Kick\\ ([\\s\\S]*?)\\?$"
+        },
+        {
+                "source": "Delete PSNDIALOGVALUE0TOKEN?",
+                "regex": "^Delete\\ ([\\s\\S]*?)\\?$"
+        },
+        {
+                "source": "Are you sure you want to kick PSNDIALOGVALUE0TOKEN?",
+                "regex": "^Are\\ you\\ sure\\ you\\ want\\ to\\ kick\\ ([\\s\\S]*?)\\?$"
+        },
+        {
+                "source": "New temporary password for PSNDIALOGVALUE0TOKEN:",
+                "regex": "^New\\ temporary\\ password\\ for\\ ([\\s\\S]*?):$"
+        },
+        {
+                "source": "Reason for banning PSNDIALOGVALUE0TOKEN:",
+                "regex": "^Reason\\ for\\ banning\\ ([\\s\\S]*?):$"
+        },
+        {
+                "source": "Reason for deleting PSNDIALOGVALUE0TOKEN:",
+                "regex": "^Reason\\ for\\ deleting\\ ([\\s\\S]*?):$"
+        },
+        {
+                "source": "This will delete PSNDIALOGVALUE0TOKEN from the database and block automatic recreation. Type DELETE to confirm:",
+                "regex": "^This\\ will\\ delete\\ ([\\s\\S]*?)\\ from\\ the\\ database\\ and\\ block\\ automatic\\ recreation\\.\\ Type\\ DELETE\\ to\\ confirm:$"
+        },
+        {
+                "source": "Set role for PSNDIALOGVALUE0TOKEN: user, trusted, mod, admin",
+                "regex": "^Set\\ role\\ for\\ ([\\s\\S]*?):\\ user,\\ trusted,\\ mod,\\ admin$"
+        },
+        {
+                "source": "Report message from PSNDIALOGVALUE0TOKEN. Reason:",
+                "regex": "^Report\\ message\\ from\\ ([\\s\\S]*?)\\.\\ Reason:$"
+        },
+        {
+                "source": "Download PSNDIALOGVALUE0TOKEN from these PSNDIALOGVALUE1TOKEN?\n\nDownloads will start in a queue. If the browser asks to allow multiple downloads, click Allow.",
+                "regex": "^Download\\ ([\\s\\S]*?)\\ from\\ these\\ ([\\s\\S]*?)\\?\\\n\\\nDownloads\\ will\\ start\\ in\\ a\\ queue\\.\\ If\\ the\\ browser\\ asks\\ to\\ allow\\ multiple\\ downloads,\\ click\\ Allow\\.$"
+        },
+        {
+                "source": "Found PSNDIALOGVALUE0TOKEN package parts for: PSNDIALOGVALUE1TOKEN.\n\nWould you like to start the download queue?\n\nNote: If the browser asks to 'Download multiple files', please click 'Allow'.",
+                "regex": "^Found\\ ([\\s\\S]*?)\\ package\\ parts\\ for:\\ ([\\s\\S]*?)\\.\\\n\\\nWould\\ you\\ like\\ to\\ start\\ the\\ download\\ queue\\?\\\n\\\nNote:\\ If\\ the\\ browser\\ asks\\ to\\ 'Download\\ multiple\\ files',\\ please\\ click\\ 'Allow'\\.$"
+        },
+        {
+                "source": "Apply PSNDIALOGVALUE0TOKEN DNS to your PS3™?\n\nDNS: PSNDIALOGVALUE1TOKEN\n\nWarning:\nAfter applying this DNS, PSN™ games and games from other revived servers may not work until you set a DNS that supports them.\n\nYour PS3™ system will be restarted to apply the changes.",
+                "regex": "^Apply\\ ([\\s\\S]*?)\\ DNS\\ to\\ your\\ PS3™\\?\\\n\\\nDNS:\\ ([\\s\\S]*?)\\\n\\\nWarning:\\\nAfter\\ applying\\ this\\ DNS,\\ PSN™\\ games\\ and\\ games\\ from\\ other\\ revived\\ servers\\ may\\ not\\ work\\ until\\ you\\ set\\ a\\ DNS\\ that\\ supports\\ them\\.\\\n\\\nYour\\ PS3™\\ system\\ will\\ be\\ restarted\\ to\\ apply\\ the\\ changes\\.$"
+        }
+].map(item => ({
+            source: item.source,
+            regex: new RegExp(item.regex)
+        }));
+        const NATIVE_DIALOG_ALL_EXACT = [
+        "Maintenance mode is active. Only a saved admin profile can log in here.",
+        "Password is too short. Minimum 4 characters.",
+        "This Online ID already exists in this device.",
+        "Cannot connect to PSN Database. Check your internet connection.",
+        "Cannot connect to PSN Database. Server might be offline.",
+        "No PKG files found inside this XML manifest.",
+        "Failed to process the XML.",
+        "Administrator access required.",
+        "Socket is offline. Showing only locally cached users.",
+        "Image upload failed.",
+        "Write a message or attach an image before sending.",
+        "Socket is offline. Cannot send broadcast.",
+        "Socket is offline. Cannot force reload.",
+        "The server refused to clear the chat.",
+        "Socket is offline. Cannot clear chat.",
+        "Socket is offline. Cannot kick user.",
+        "Socket is offline. Cannot reset password.",
+        "Password reset failed.",
+        "Socket is offline. Cannot unban user.",
+        "Unban failed.",
+        "Socket is offline. Cannot ban user.",
+        "Ban failed.",
+        "Socket is offline. Cannot delete account.",
+        "Delete account failed.",
+        "Clipboard blocked by the browser. Diagnostics were printed in the console.",
+        "No saved admin profile was found on this device.",
+        "Select at least one day for scheduled maintenance.",
+        "Start and end time cannot be the same.",
+        "Socket is offline. Cannot broadcast maintenance notice.",
+        "Write an announcement first.",
+        "Socket is offline. Chat controls were not synced to the server.",
+        "Server refused chat controls update.",
+        "Invalid role. Use user, trusted, mod or admin. Ban is now controlled by the Ban/Unban button.",
+        "Database reload failed. Check console.",
+        "Socket is offline. Showing local reports only.",
+        "That message is not in the loaded chat history anymore.",
+        "Console Not Connected\n\nPlease enter your PS3™ IP in the top header and click the connect icon before applying DNS.",
+        "This server has no DNS set.",
+        "Console Offline\n\nPlease click the connect button in the header when the PS3™ is turned on.",
+        "No valid PS3 Title ID was detected for the current game.",
+        "Please enter PS3™ IP first!",
+        "Please enter the PS3™ IP address first!",
+        "Invalid IP format. Please enter a valid IP (e.g. 192.168.1.100).",
+        "Installation command sent! Please check your PS3™ screen.",
+        "Could not reopen this image for editing.",
+        "This account is not an administrator. Maintenance login was rejected.",
+        "Only admins can use the /clean command.",
+        "Only admins can use the /reload command.",
+        "You cannot kick this user.",
+        "User not found or offline.",
+        "Only admins/moderators can use the /kick command.",
+        "Use: /ban @Username",
+        "Only admins can use the /ban command.",
+        "Use: /unban @Username",
+        "Only admins can use the /unban command.",
+        "Use: /resetpassword @Username",
+        "Only admins can use the /resetpassword command.",
+        "Use: /role @Username user|trusted|mod|admin",
+        "Only admins can use the /role command.",
+        "Please enter a report reason.",
+        "Could not send report.",
+        "Report sent to the moderation team.",
+        "Socket is offline. Cannot send report now.",
+        "An error occurred during the upload.",
+        "An error occurred while updating the image.",
+        "Maximum 10 options allowed.",
+        "Please enter a question.",
+        "You need at least 2 options.",
+        "PS3™ is connected!\n\nSend this Download All queue directly to the console?\n\n[OK] = Download on PS3™\n[Cancel] = Download on this device",
+        "Do you want to clear all history and statistics?",
+        "Force reload for everyone currently connected? This sends the same /reload command used in chat.",
+        "Permanently clear the global chat history? This cannot be undone.",
+        "Clear server log?",
+        "Clear moderation log?",
+        "Enable maintenance mode now for normal users?",
+        "Clear all pending reports? With the updated server this also resolves them in the database.",
+        "Are you sure you want to log out?",
+        "Are you sure you want to relaunch the game?",
+        "Are you sure you want to exit the game?",
+        "Turn off the PS3™?",
+        "Unpin this message?",
+        "Unpin this message for everyone?",
+        "🚨 WARNING: This will clear the global chat history. A server backup will be saved first. Continue?",
+        "Do you want to delete this message?",
+        "Banned by administrator",
+        "Account deleted by administrator.",
+        "Spam / abuse / inappropriate content",
+        "Disable CFW syscalls on the PS3™?",
+        "Re-enable CFW syscalls on the PS3™ if webMAN allows it?",
+        "Clear webMAN history files on the PS3™?",
+        "Restart the PS3™ now?",
+        "Enter your PSN™ ID.",
+        "Legacy Online ID must be 3 to 32 characters.",
+        "Invalid legacy Online ID.",
+        "Online ID cannot be the same as your password.",
+        "Online ID must be 3 to 16 characters.",
+        "Online ID must start with a letter.",
+        "Use only letters, numbers, hyphens (-), and underscores (_). No spaces, accents, or symbols.",
+        "Download All is only available when the search results belong to the same Title ID.",
+        "Command sent to the console!"
+];
+        const NATIVE_DIALOG_ALL_PATTERNS = [
+        {
+                "source": "File \"PSNDIALOGVALUE0TOKEN\" is too large! Max 10MB.",
+                "regex": "^File\\ \"([\\s\\S]*?)\"\\ is\\ too\\ large!\\ Max\\ 10MB\\.$"
+        },
+        {
+                "source": "PSNDIALOGVALUE0TOKEN's temporary password is: PSNDIALOGVALUE1TOKEN",
+                "regex": "^([\\s\\S]*?)'s\\ temporary\\ password\\ is:\\ ([\\s\\S]*?)$"
+        },
+        {
+                "source": "Password reset request sent for PSNDIALOGVALUE0TOKEN. Temporary password: PSNDIALOGVALUE1TOKEN",
+                "regex": "^Password\\ reset\\ request\\ sent\\ for\\ ([\\s\\S]*?)\\.\\ Temporary\\ password:\\ ([\\s\\S]*?)$"
+        },
+        {
+                "source": "Unban request sent for PSNDIALOGVALUE0TOKEN.",
+                "regex": "^Unban\\ request\\ sent\\ for\\ ([\\s\\S]*?)\\.$"
+        },
+        {
+                "source": "Ban request sent for PSNDIALOGVALUE0TOKEN.",
+                "regex": "^Ban\\ request\\ sent\\ for\\ ([\\s\\S]*?)\\.$"
+        },
+        {
+                "source": "No confirmation received from server for deleting PSNDIALOGVALUE0TOKEN. Please refresh the admin panel before trying again.",
+                "regex": "^No\\ confirmation\\ received\\ from\\ server\\ for\\ deleting\\ ([\\s\\S]*?)\\.\\ Please\\ refresh\\ the\\ admin\\ panel\\ before\\ trying\\ again\\.$"
+        },
+        {
+                "source": "PSNDIALOGVALUE0TOKEN DNS command sent to PS3™. Restarting system...",
+                "regex": "^([\\s\\S]*?)\\ DNS\\ command\\ sent\\ to\\ PS3™\\.\\ Restarting\\ system\\.\\.\\.$"
+        },
+        {
+                "source": "Failed to connect to PSNDIALOGVALUE0TOKEN!\n\nFirefox is blocking the connection to the PS3™ due to security rules (Mixed Content).",
+                "regex": "^Failed\\ to\\ connect\\ to\\ ([\\s\\S]*?)!\\\n\\\nFirefox\\ is\\ blocking\\ the\\ connection\\ to\\ the\\ PS3™\\ due\\ to\\ security\\ rules\\ \\(Mixed\\ Content\\)\\.$"
+        },
+        {
+                "source": "Failed to connect to PSNDIALOGVALUE0TOKEN!\nPlease verify that the PS3™ is turned on and webMAN is running.",
+                "regex": "^Failed\\ to\\ connect\\ to\\ ([\\s\\S]*?)!\\\nPlease\\ verify\\ that\\ the\\ PS3™\\ is\\ turned\\ on\\ and\\ webMAN\\ is\\ running\\.$"
+        },
+        {
+                "source": "Delete failed: PSNDIALOGVALUE0TOKEN",
+                "regex": "^Delete\\ failed:\\ ([\\s\\S]*?)$"
+        },
+        {
+                "source": "PSNDIALOGVALUE0TOKEN is already banned.",
+                "regex": "^([\\s\\S]*?)\\ is\\ already\\ banned\\.$"
+        },
+        {
+                "source": "PSNDIALOGVALUE0TOKEN is not banned.",
+                "regex": "^([\\s\\S]*?)\\ is\\ not\\ banned\\.$"
+        },
+        {
+                "source": "Do you really want to delete the \"PSNDIALOGVALUE0TOKEN\"?",
+                "regex": "^Do\\ you\\ really\\ want\\ to\\ delete\\ the\\ \"([\\s\\S]*?)\"\\?$"
+        },
+        {
+                "source": "PS3™ is connected!\n\nDo you want to send \"PSNDIALOGVALUE0TOKEN\" directly to the console?\n\n[OK] = Download on PS3™\n[Cancel] = Download on this device",
+                "regex": "^PS3™\\ is\\ connected!\\\n\\\nDo\\ you\\ want\\ to\\ send\\ \"([\\s\\S]*?)\"\\ directly\\ to\\ the\\ console\\?\\\n\\\n\\[OK\\]\\ =\\ Download\\ on\\ PS3™\\\n\\[Cancel\\]\\ =\\ Download\\ on\\ this\\ device$"
+        },
+        {
+                "source": "Kick PSNDIALOGVALUE0TOKEN from the current session?",
+                "regex": "^Kick\\ ([\\s\\S]*?)\\ from\\ the\\ current\\ session\\?$"
+        },
+        {
+                "source": "Unban PSNDIALOGVALUE0TOKEN? The account should be able to log in again after this.",
+                "regex": "^Unban\\ ([\\s\\S]*?)\\?\\ The\\ account\\ should\\ be\\ able\\ to\\ log\\ in\\ again\\ after\\ this\\.$"
+        },
+        {
+                "source": "Ban PSNDIALOGVALUE0TOKEN? This should block the account on the server.",
+                "regex": "^Ban\\ ([\\s\\S]*?)\\?\\ This\\ should\\ block\\ the\\ account\\ on\\ the\\ server\\.$"
+        },
+        {
+                "source": "Unload VSH plugin slot PSNDIALOGVALUE0TOKEN?",
+                "regex": "^Unload\\ VSH\\ plugin\\ slot\\ ([\\s\\S]*?)\\?$"
+        },
+        {
+                "source": "Delete this file/folder?\n\nPSNDIALOGVALUE0TOKEN",
+                "regex": "^Delete\\ this\\ file/folder\\?\\\n\\\n([\\s\\S]*?)$"
+        },
+        {
+                "source": "Kick PSNDIALOGVALUE0TOKEN?",
+                "regex": "^Kick\\ ([\\s\\S]*?)\\?$"
+        },
+        {
+                "source": "Delete PSNDIALOGVALUE0TOKEN?",
+                "regex": "^Delete\\ ([\\s\\S]*?)\\?$"
+        },
+        {
+                "source": "Are you sure you want to kick PSNDIALOGVALUE0TOKEN?",
+                "regex": "^Are\\ you\\ sure\\ you\\ want\\ to\\ kick\\ ([\\s\\S]*?)\\?$"
+        },
+        {
+                "source": "New temporary password for PSNDIALOGVALUE0TOKEN:",
+                "regex": "^New\\ temporary\\ password\\ for\\ ([\\s\\S]*?):$"
+        },
+        {
+                "source": "Reason for banning PSNDIALOGVALUE0TOKEN:",
+                "regex": "^Reason\\ for\\ banning\\ ([\\s\\S]*?):$"
+        },
+        {
+                "source": "Reason for deleting PSNDIALOGVALUE0TOKEN:",
+                "regex": "^Reason\\ for\\ deleting\\ ([\\s\\S]*?):$"
+        },
+        {
+                "source": "This will delete PSNDIALOGVALUE0TOKEN from the database and block automatic recreation. Type DELETE to confirm:",
+                "regex": "^This\\ will\\ delete\\ ([\\s\\S]*?)\\ from\\ the\\ database\\ and\\ block\\ automatic\\ recreation\\.\\ Type\\ DELETE\\ to\\ confirm:$"
+        },
+        {
+                "source": "Set role for PSNDIALOGVALUE0TOKEN: user, trusted, mod, admin",
+                "regex": "^Set\\ role\\ for\\ ([\\s\\S]*?):\\ user,\\ trusted,\\ mod,\\ admin$"
+        },
+        {
+                "source": "Report message from PSNDIALOGVALUE0TOKEN. Reason:",
+                "regex": "^Report\\ message\\ from\\ ([\\s\\S]*?)\\.\\ Reason:$"
+        },
+        {
+                "source": "Download PSNDIALOGVALUE0TOKEN from these PSNDIALOGVALUE1TOKEN?\n\nDownloads will start in a queue. If the browser asks to allow multiple downloads, click Allow.",
+                "regex": "^Download\\ ([\\s\\S]*?)\\ from\\ these\\ ([\\s\\S]*?)\\?\\\n\\\nDownloads\\ will\\ start\\ in\\ a\\ queue\\.\\ If\\ the\\ browser\\ asks\\ to\\ allow\\ multiple\\ downloads,\\ click\\ Allow\\.$"
+        },
+        {
+                "source": "Found PSNDIALOGVALUE0TOKEN package parts for: PSNDIALOGVALUE1TOKEN.\n\nWould you like to start the download queue?\n\nNote: If the browser asks to 'Download multiple files', please click 'Allow'.",
+                "regex": "^Found\\ ([\\s\\S]*?)\\ package\\ parts\\ for:\\ ([\\s\\S]*?)\\.\\\n\\\nWould\\ you\\ like\\ to\\ start\\ the\\ download\\ queue\\?\\\n\\\nNote:\\ If\\ the\\ browser\\ asks\\ to\\ 'Download\\ multiple\\ files',\\ please\\ click\\ 'Allow'\\.$"
+        },
+        {
+                "source": "Apply PSNDIALOGVALUE0TOKEN DNS to your PS3™?\n\nDNS: PSNDIALOGVALUE1TOKEN\n\nWarning:\nAfter applying this DNS, PSN™ games and games from other revived servers may not work until you set a DNS that supports them.\n\nYour PS3™ system will be restarted to apply the changes.",
+                "regex": "^Apply\\ ([\\s\\S]*?)\\ DNS\\ to\\ your\\ PS3™\\?\\\n\\\nDNS:\\ ([\\s\\S]*?)\\\n\\\nWarning:\\\nAfter\\ applying\\ this\\ DNS,\\ PSN™\\ games\\ and\\ games\\ from\\ other\\ revived\\ servers\\ may\\ not\\ work\\ until\\ you\\ set\\ a\\ DNS\\ that\\ supports\\ them\\.\\\n\\\nYour\\ PS3™\\ system\\ will\\ be\\ restarted\\ to\\ apply\\ the\\ changes\\.$"
+        },
+        {
+                "source": "No PSNDIALOGVALUE0TOKEN downloads found on this page.",
+                "regex": "^No\\ ([\\s\\S]*?)\\ downloads\\ found\\ on\\ this\\ page\\.$"
+        },
+        {
+                "source": "Download All is only available when this page has more than one PSNDIALOGVALUE0TOKEN.",
+                "regex": "^Download\\ All\\ is\\ only\\ available\\ when\\ this\\ page\\ has\\ more\\ than\\ one\\ ([\\s\\S]*?)\\.$"
+        },
+        {
+                "source": "Oops! The game (PSNDIALOGVALUE0TOKEN) is not cataloged in our Database.\n\nThis is a Physical (Disc) game, which cannot be downloaded directly from the PSN Store.",
+                "regex": "^Oops!\\ The\\ game\\ \\(([\\s\\S]*?)\\)\\ is\\ not\\ cataloged\\ in\\ our\\ Database\\.\\\n\\\nThis\\ is\\ a\\ Physical\\ \\(Disc\\)\\ game,\\ which\\ cannot\\ be\\ downloaded\\ directly\\ from\\ the\\ PSN\\ Store\\.$"
+        },
+        {
+                "source": "Oops! The game (PSNDIALOGVALUE0TOKEN) is not cataloged in our Database.\n\nThis is a Digital (PSN) game, but it seems to be missing from our current servers.",
+                "regex": "^Oops!\\ The\\ game\\ \\(([\\s\\S]*?)\\)\\ is\\ not\\ cataloged\\ in\\ our\\ Database\\.\\\n\\\nThis\\ is\\ a\\ Digital\\ \\(PSN\\)\\ game,\\ but\\ it\\ seems\\ to\\ be\\ missing\\ from\\ our\\ current\\ servers\\.$"
+        },
+        {
+                "source": "Oops! The game (PSNDIALOGVALUE0TOKEN) is not cataloged in our Database.\n\nThis appears to be an unofficial release, homebrew, or an invalid entry.",
+                "regex": "^Oops!\\ The\\ game\\ \\(([\\s\\S]*?)\\)\\ is\\ not\\ cataloged\\ in\\ our\\ Database\\.\\\n\\\nThis\\ appears\\ to\\ be\\ an\\ unofficial\\ release,\\ homebrew,\\ or\\ an\\ invalid\\ entry\\.$"
+        }
+].map(item => ({
+            source: item.source,
+            regex: new RegExp(item.regex)
+        }));
+
+        // These placeholders must never be translated. They are restored after
+        // the sentence is translated, allowing names, paths, counts and IDs to move
+        // naturally with the target language without changing their values.
+        for (let index = 0; index < 12; index++) {
+            const valueToken = `PSNDIALOGVALUE${index}TOKEN`;
+            const breakToken = `PSNDIALOGBREAK${index}TOKEN`;
+            if (!INTERFACE_TRANSLATE_PROTECTED_TERMS.includes(valueToken)) INTERFACE_TRANSLATE_PROTECTED_TERMS.push(valueToken);
+            if (!INTERFACE_TRANSLATE_PROTECTED_TERMS.includes(breakToken)) INTERFACE_TRANSLATE_PROTECTED_TERMS.push(breakToken);
+        }
+
+        function isNativeDialogTranslationActive() {
+            return !!state.enabled && !!state.target && state.target !== 'en';
+        }
+
+        function protectNativeDialogLineBreaks(value) {
+            let breakIndex = 0;
+            const source = String(value).replace(/\r\n|\r|\n/g, () => `PSNDIALOGBREAK${breakIndex++}TOKEN`);
+            return {
+                source,
+                restore(translated) {
+                    return String(translated || '').replace(/PSNDIALOGBREAK(\d+)TOKEN/g, '\n');
+                }
+            };
+        }
+
+        function getCachedNativeDialogTranslation(value) {
+            const original = String(value);
+            if (!isNativeDialogTranslationActive()) return original;
+
+            const lineProtected = protectNativeDialogLineBreaks(original);
+            const protectedSource = prepareInterfaceProtectedTranslation(lineProtected.source, null);
+            const cached = getImmediateInterfaceTranslation(protectedSource.source, state.target);
+            if (!cached) return '';
+            return lineProtected.restore(protectedSource.restore(cached));
+        }
+
+        function resolveNativeDialogTranslation(value) {
+            const original = String(value);
+            if (!isNativeDialogTranslationActive()) return Promise.resolve(original);
+
+            const lineProtected = protectNativeDialogLineBreaks(original);
+            const protectedSource = prepareInterfaceProtectedTranslation(lineProtected.source, null);
+            return translateCached(protectedSource.source, state.target)
+                .then(translated => lineProtected.restore(protectedSource.restore(translated || protectedSource.source)))
+                .catch(() => original);
+        }
+
+        function findNativeDialogPattern(original) {
+            for (const item of NATIVE_DIALOG_ALL_PATTERNS) {
+                const match = String(original).match(item.regex);
+                if (match) return { item, match };
+            }
+            return null;
+        }
+
+        function restoreNativeDialogPatternValues(translated, match) {
+            return String(translated || '').replace(/PSNDIALOGVALUE(\d+)TOKEN/g, (token, indexText) => {
+                const index = Number(indexText) + 1;
+                return match[index] === undefined ? token : String(match[index]);
+            });
+        }
+
+        const nativeDialogSingleWarm = new Map();
+
+        function warmSingleNativeDialogSource(source) {
+            if (!isNativeDialogTranslationActive()) return Promise.resolve(String(source));
+            const key = state.target + '\u0000' + String(source);
+            if (nativeDialogSingleWarm.has(key)) return nativeDialogSingleWarm.get(key);
+            const request = resolveNativeDialogTranslation(source)
+                .finally(() => nativeDialogSingleWarm.delete(key));
+            nativeDialogSingleWarm.set(key, request);
+            return request;
+        }
+
+        function getNativeDialogDisplayText(value, options = {}) {
+            const original = String(value);
+            if (!isNativeDialogTranslationActive()) return original;
+
+            const exact = getCachedNativeDialogTranslation(original);
+            if (exact) return exact;
+
+            const patternResult = findNativeDialogPattern(original);
+            if (patternResult) {
+                const translatedPattern = getCachedNativeDialogTranslation(patternResult.item.source);
+                if (translatedPattern) return restoreNativeDialogPatternValues(translatedPattern, patternResult.match);
+                warmSingleNativeDialogSource(patternResult.item.source).catch(() => {});
+                return original;
+            }
+
+            if (options.warmUnknown !== false) warmSingleNativeDialogSource(original).catch(() => {});
+            return original;
+        }
+
+        let nativeDialogWarmPromise = null;
+        let nativeDialogWarmKey = '';
+        const nativeDialogWarmedTargets = new Set();
+
+        window.warmNativeDialogTranslations = function() {
+            if (!isNativeDialogTranslationActive()) return Promise.resolve();
+            const targetKey = state.target + '|' + state.locale;
+            if (nativeDialogWarmedTargets.has(targetKey)) return Promise.resolve();
+            if (nativeDialogWarmPromise && nativeDialogWarmKey === targetKey) return nativeDialogWarmPromise;
+
+            const orderedSources = [
+                ...NATIVE_DIALOG_PRIORITY_EXACT,
+                ...NATIVE_DIALOG_PRIORITY_PATTERNS.map(item => item.source),
+                ...NATIVE_DIALOG_ALL_EXACT,
+                ...NATIVE_DIALOG_ALL_PATTERNS.map(item => item.source)
+            ];
+            const sources = Array.from(new Set(orderedSources.map(value => String(value)).filter(Boolean)));
+            let cursor = 0;
+            nativeDialogWarmKey = targetKey;
+
+            const worker = async () => {
+                while (cursor < sources.length && isNativeDialogTranslationActive() && nativeDialogWarmKey === targetKey) {
+                    const source = sources[cursor++];
+                    await warmSingleNativeDialogSource(source).catch(() => {});
+                }
+            };
+
+            nativeDialogWarmPromise = Promise.all([worker(), worker(), worker()])
+                .then(() => {
+                    if (isNativeDialogTranslationActive() && nativeDialogWarmKey === targetKey) {
+                        nativeDialogWarmedTargets.add(targetKey);
+                    }
+                })
+                .finally(() => {
+                    if (nativeDialogWarmKey === targetKey) {
+                        nativeDialogWarmPromise = null;
+                        nativeDialogWarmKey = '';
+                    }
+                });
+
+            return nativeDialogWarmPromise;
+        };
+
+        window.alert = function(message) {
+            return nativeBrowserAlert(getNativeDialogDisplayText(message));
+        };
+
+        window.confirm = function(message) {
+            return nativeBrowserConfirm(getNativeDialogDisplayText(message));
+        };
+
+        window.prompt = function(message, defaultValue) {
+            const translatedMessage = getNativeDialogDisplayText(message);
+            if (arguments.length < 2) return nativeBrowserPrompt(translatedMessage);
+
+            const originalDefault = String(defaultValue);
+            const translatedDefault = NATIVE_DIALOG_PROMPT_DEFAULTS.has(originalDefault)
+                ? getNativeDialogDisplayText(originalDefault, { warmUnknown: false })
+                : originalDefault;
+            return nativeBrowserPrompt(translatedMessage, translatedDefault);
+        };
+    }
 
     document.addEventListener('DOMContentLoaded', function() {
         setTimeout(() => window.resetInterfaceTranslationForLoginScreen(), 0);
