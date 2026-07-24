@@ -543,6 +543,7 @@ select option { background-color: var(--bg-dark); }
 #game-modal .modal-info-text>.modal-info-label, #game-modal .modal-info-card .modal-info-text>.modal-info-label { font-size: inherit !important; font-weight: inherit !important; color: inherit !important; float: none !important; display: inline !important; min-width: 0 !important; min-height: 0 !important; height: auto !important; line-height: inherit !important; }
 #modal-links-actions { margin-top: auto; width: 100%; }
 #game-modal .btn-mini { padding: 6px 4px !important; font-size: 11px !important; }
+#game-modal .modal-action-label-upper { text-transform: uppercase; }
 #game-modal .btn-mini:hover { transform: none; filter: none box-shadow: inset 0 0 0 100px rgba(0,0,0,0.25) border-color: rgba(255,255,255,0.4); }
 #game-modal .btn-rap:hover { transform: none; box-shadow: inset 0 0 0 100px rgba(0,0,0,0.15); }
 #trailer-modal .modal-content { width: 854px; max-width: 90%; flex-direction: column; padding: 20px; align-items: center; }
@@ -17270,35 +17271,21 @@ P
 		if (!statusEl || !source) return;
 		const target = statusEl.querySelector('[data-modal-trophy-source]') || statusEl;
 		target.setAttribute('data-modal-trophy-source', source);
-
-		const lang = typeof window.getInterfaceTranslationTargetLang === 'function'
-			? String(window.getInterfaceTranslationTargetLang() || 'en')
-			: 'en';
-		const localizedAnswers = {
-			pt: { Yes: 'Sim', No: 'Não' }, es: { Yes: 'Sí', No: 'No' }, fr: { Yes: 'Oui', No: 'Non' },
-			de: { Yes: 'Ja', No: 'Nein' }, it: { Yes: 'Sì', No: 'No' }, nl: { Yes: 'Ja', No: 'Nee' },
-			pl: { Yes: 'Tak', No: 'Nie' }, ru: { Yes: 'Да', No: 'Нет' }, uk: { Yes: 'Так', No: 'Ні' },
-			ja: { Yes: 'はい', No: 'いいえ' }, ko: { Yes: '예', No: '아니요' }, 'zh-CN': { Yes: '是', No: '否' },
-			'zh-TW': { Yes: '是', No: '否' }, tr: { Yes: 'Evet', No: 'Hayır' }, ar: { Yes: 'نعم', No: 'لا' },
-			hi: { Yes: 'हाँ', No: 'नहीं' }, id: { Yes: 'Ya', No: 'Tidak' }, cs: { Yes: 'Ano', No: 'Ne' },
-			sv: { Yes: 'Ja', No: 'Nej' }, da: { Yes: 'Ja', No: 'Nej' }, fi: { Yes: 'Kyllä', No: 'Ei' },
-			no: { Yes: 'Ja', No: 'Nei' }, ro: { Yes: 'Da', No: 'Nu' }, hu: { Yes: 'Igen', No: 'Nem' },
-			el: { Yes: 'Ναι', No: 'Όχι' }, he: { Yes: 'כן', No: 'לא' }, th: { Yes: 'ใช่', No: 'ไม่' },
-			vi: { Yes: 'Có', No: 'Không' }
+		const isNegativeAnswer = source === 'No';
+		const translationSource = isNegativeAnswer ? 'Negative answer: PSNSTATUSSTART No PSNSTATUSEND' : source;
+		const extractDisplayText = value => {
+			const text = String(value || '').trim();
+			if (!isNegativeAnswer) return text;
+			const match = text.match(/PSNSTATUSSTART\s*([\s\S]*?)\s*PSNSTATUSEND/i);
+			return match && match[1].trim() ? match[1].trim().replace(/[.!。！？]+$/u, '') : '';
 		};
-		const direct = localizedAnswers[lang] && localizedAnswers[lang][source];
-		if (direct) {
-			target.textContent = direct;
-			return;
-		}
-
 		const immediate = typeof window.getImmediateInterfaceDisplayText === 'function'
-			? window.getImmediateInterfaceDisplayText(source, target)
+			? window.getImmediateInterfaceDisplayText(translationSource, target)
 			: '';
-		target.textContent = immediate || source;
+		target.textContent = extractDisplayText(immediate) || source;
 		if (typeof window.resolveInterfaceDisplayText !== 'function') return;
-		window.resolveInterfaceDisplayText(source, target).then(translated => {
-			if (target.isConnected && target.getAttribute('data-modal-trophy-source') === source) target.textContent = translated || source;
+		window.resolveInterfaceDisplayText(translationSource, target).then(translated => {
+			if (target.isConnected && target.getAttribute('data-modal-trophy-source') === source) target.textContent = extractDisplayText(translated) || source;
 		}).catch(() => {
 			if (target.isConnected && target.getAttribute('data-modal-trophy-source') === source) target.textContent = source;
 		});
@@ -17316,10 +17303,22 @@ P
 		});
 	}
 
+	function isPs3TrophyGame(localGame = {}, currentCat = '') {
+		const consoleTag = String(localGame.cTag || localGame.console || localGame.platform || '').trim().toLowerCase();
+		return currentCat === 'games' && consoleTag.startsWith('ps3');
+	}
+
 	function updateModalTrophyStatus(localGame, currentCat) {
 		const statusEl = document.getElementById('modal-trophies-status');
 		if (!statusEl || currentCat !== 'games') return;
 		const token = ++modalTrophyLookupToken;
+
+		if (!isPs3TrophyGame(localGame, currentCat)) {
+			statusEl.className = 'modal-trophies-no';
+			translateModalTrophyAvailability(statusEl, 'No');
+			return;
+		}
+
 		statusEl.className = 'modal-trophies-loading';
 		statusEl.innerHTML = '<span class="modal-trophies-skeleton"></span>';
 
@@ -17505,6 +17504,7 @@ P
 		let displayVersion = game.version ? game.version.replace(/v/gi, '').trim() : "";
 		const titleHtml = game.cleanName + (displayVersion ? ` <span style="color:#FF1493; font-size:14px;">[v${displayVersion}]</span>` : "");
 		const typeText = (currentCat === 'games') ? game.cTag.toUpperCase() + " Game" : catSelect.options[catSelect.selectedIndex].text;
+		const showModalTrophies = currentCat === 'games';
 	
 		let actionsHtml = '';
 		const safeName = game.cleanName.replace(/'/g, "\\'");
@@ -17521,33 +17521,33 @@ P
 			: '';
 		
 		if (game.url.toLowerCase().endsWith('.xml')) {
-			actionsHtml += `<a style="cursor: pointer;" title="Download PKG (XML)" class="btn-mini btn-pkg btn-multi" onmouseenter="playUiArrow()" onclick="smartDownload(event, 'xml', '${game.url}', '${safeName}', '${game.version}', this, ${game.sizeBytes || 0}, '${game.id}', '${currentCat}', '${game.contentId || ''}')"><i class="fas fa-layer-group"></i> PKG (XML)</a>`;
+			actionsHtml += `<a style="cursor: pointer;" title="Download PKG (XML)" class="btn-mini btn-pkg btn-multi" onmouseenter="playUiArrow()" onclick="smartDownload(event, 'xml', '${game.url}', '${safeName}', '${game.version}', this, ${game.sizeBytes || 0}, '${game.id}', '${currentCat}', '${game.contentId || ''}')"><i class="fas fa-layer-group"></i> <span data-no-translate="true" translate="no">PKG (XML)</span></a>`;
 		} else if (game.url.includes('|')) {
 			const parts = game.url.split('|').length;
-			actionsHtml += `<a style="cursor: pointer;" title="Download PKG (${parts} parts)" class="btn-mini btn-pkg btn-multi" onmouseenter="playUiArrow()" onclick="smartDownload(event, 'multi', '${game.url}', '${safeName}', '${game.version}', this, ${game.sizeBytes || 0}, '${game.id}', '${currentCat}', '${game.contentId || ''}')"><i class="fas fa-layer-group"></i> PKG (${parts})</a>`;
+			actionsHtml += `<a style="cursor: pointer;" title="Download PKG (${parts} parts)" class="btn-mini btn-pkg btn-multi" onmouseenter="playUiArrow()" onclick="smartDownload(event, 'multi', '${game.url}', '${safeName}', '${game.version}', this, ${game.sizeBytes || 0}, '${game.id}', '${currentCat}', '${game.contentId || ''}')"><i class="fas fa-layer-group"></i> <span data-no-translate="true" translate="no">PKG (${parts})</span></a>`;
 		} else {
-			actionsHtml += `<a style="cursor: pointer;" title="Download PKG" class="btn-mini btn-pkg" onmouseenter="playUiArrow()" onclick="smartDownload(event, 'single', '${game.url}', '${safeName}', '${game.version}', this, ${game.sizeBytes || 0}, '${game.id}', '${currentCat}', '${game.contentId || ''}')"><i class="fas fa-download"></i> PKG</a>`;
+			actionsHtml += `<a style="cursor: pointer;" title="Download PKG" class="btn-mini btn-pkg" onmouseenter="playUiArrow()" onclick="smartDownload(event, 'single', '${game.url}', '${safeName}', '${game.version}', this, ${game.sizeBytes || 0}, '${game.id}', '${currentCat}', '${game.contentId || ''}')"><i class="fas fa-download"></i> <span data-no-translate="true" translate="no">PKG</span></a>`;
 		}
 	
 		if (hasValidRapDownload(game)) {
-			actionsHtml += `<a style="cursor: pointer;" title="Download RAP (License)" class="btn-mini btn-rap" onmouseenter="playUiArrow()" onclick="playUiClick(); smartDownload(event, 'rap', '', '${safeName}', '', this, 0, '${game.id}', '${currentCat}', '${game.contentId}')"><i class="fas fa-key"></i> RAP</a>`;
+			actionsHtml += `<a style="cursor: pointer;" title="Download RAP (License)" class="btn-mini btn-rap" onmouseenter="playUiArrow()" onclick="playUiClick(); smartDownload(event, 'rap', '', '${safeName}', '', this, 0, '${game.id}', '${currentCat}', '${game.contentId}')"><i class="fas fa-key"></i> <span data-no-translate="true" translate="no">RAP</span></a>`;
 		} else if (isLicenseByDlcItem(game)) {
-			actionsHtml += `<a style="cursor: pointer;" title="Download RAP (License)" class="btn-mini btn-rap btn-rap-by-dlc" onmouseenter="playUiArrow()" onclick="downloadLicenseByDlc(event, '${game.id}', '${game.contentId || ''}', '${safeName}', this)"><i class="fas fa-key"></i> RAP</a>`;
+			actionsHtml += `<a style="cursor: pointer;" title="Download RAP (License)" class="btn-mini btn-rap btn-rap-by-dlc" onmouseenter="playUiArrow()" onclick="downloadLicenseByDlc(event, '${game.id}', '${game.contentId || ''}', '${safeName}', this)"><i class="fas fa-key"></i> <span data-no-translate="true" translate="no">RAP</span></a>`;
 		}
 	
 		if (currentCat === 'games' || currentCat === 'apps') {
 			if (sysData.updates.has(game.id)) {
-				actionsHtml += `<a style="cursor: pointer;" title="Find Updates" class="btn-mini btn-upd" onmouseenter="playUiArrow()" onclick="playUiClick(); closeModal(); switchAndSearch('updates', '${game.id}')"><i class="fas fa-sync-alt"></i> UPDATE</a>`;
+				actionsHtml += `<a style="cursor: pointer;" title="Find Updates" class="btn-mini btn-upd" onmouseenter="playUiArrow()" onclick="playUiClick(); closeModal(); switchAndSearch('updates', '${game.id}')"><i class="fas fa-sync-alt"></i> <span class="modal-action-label modal-action-label-upper">Update</span></a>`;
 			}
 			if (currentCat === 'games') {
 				if (sysData.dlcs.has(game.id)) {
 					actionsHtml += `<a style="cursor: pointer;" title="Find DLCs" class="btn-mini btn-dlc" onmouseenter="playUiArrow()" onclick="playUiClick(); closeModal(); switchAndSearch('dlcs', '${game.id}')"><i class="fas fa-puzzle-piece"></i> DLC</a>`;
 				}
 				if (sysData.avatars.has(game.id)) {
-					actionsHtml += `<a style="cursor: pointer;" title="Find Avatars" class="btn-mini btn-avt" onmouseenter="playUiArrow()" onclick="playUiClick(); closeModal(); switchAndSearch('avatars', '${game.id}')"><i class="fas fa-user-circle"></i> Avatar</a>`;
+					actionsHtml += `<a style="cursor: pointer;" title="Find Avatars" class="btn-mini btn-avt" onmouseenter="playUiArrow()" onclick="playUiClick(); closeModal(); switchAndSearch('avatars', '${game.id}')"><i class="fas fa-user-circle"></i> <span class="modal-action-label">Avatar</span></a>`;
 				}
 				if (sysData.themes.has(game.id)) {
-					actionsHtml += `<a style="cursor: pointer;" title="Find Themes" class="btn-mini btn-thm" onmouseenter="playUiArrow()" onclick="playUiClick(); closeModal(); switchAndSearch('themes', '${game.id}')"><i class="fas fa-palette"></i> THEME</a>`;
+					actionsHtml += `<a style="cursor: pointer;" title="Find Themes" class="btn-mini btn-thm" onmouseenter="playUiArrow()" onclick="playUiClick(); closeModal(); switchAndSearch('themes', '${game.id}')"><i class="fas fa-palette"></i> <span class="modal-action-label modal-action-label-upper">Theme</span></a>`;
 				}
 			}
 		}
@@ -17565,12 +17565,12 @@ P
 							<img src="${coverImg}" alt="Cover" class="modal-img" data-name="${game.cleanName.replace(/"/g, '&quot;')}" data-console="${game.cTag}" data-title-id="${game.id || ''}" data-content-id="${game.contentId || ''}" data-region="${game.region || ''}" data-github-cover="${githubCoverImg.replace(/"/g, '&quot;')}" onload="markCoverLoaded(this)" onerror="handleCoverError(this, '${currentCat}')">
 							${trailerOverlayHtml}
 						</div>
-						<div class="modal-info-card ${currentCat === 'games' ? 'has-trophies-row' : ''}" style="background: rgba(0,0,0,0.2); border-radius: 6px; border: 1px solid rgba(255,255,255,0.05); padding: 12px; display: flex; flex-direction: column; gap: 8px;">
+						<div class="modal-info-card ${showModalTrophies ? 'has-trophies-row' : ''}" style="background: rgba(0,0,0,0.2); border-radius: 6px; border: 1px solid rgba(255,255,255,0.05); padding: 12px; display: flex; flex-direction: column; gap: 8px;">
 							<div class="modal-info-text" style="margin:0; font-size: 11px;"><span class="modal-info-label" data-modal-info-source="ID:" data-no-translate="true" translate="no">ID:</span> <span style="color: #ffff00; font-weight: bold; float: right;">${game.id}</span><button type="button" class="title-id-copy-btn modal-title-id-copy-btn" data-copy-title-id="${game.id}" aria-label="Copy Title ID" title="Copy Title ID" style="margin-left: 6px; vertical-align: middle;"><i class="far fa-copy"></i></button></div>
 							<div class="modal-info-text" style="margin:0; font-size: 11px;"><span class="modal-info-label" data-modal-info-source="Type:" data-no-translate="true" translate="no">Type:</span> <span style="color: #66ccff; font-weight: bold; float: right;">${typeText}</span></div>
 							<div class="modal-info-text" style="margin:0; font-size: 11px;"><span class="modal-info-label" data-modal-info-source="Region:" data-no-translate="true" translate="no">Region:</span> <span style="color: #ff00ff; font-weight: bold; float: right;">${game.region}</span></div>
 							<div class="modal-info-text" style="margin:0; font-size: 11px;"><span class="modal-info-label" data-modal-info-source="Size:" data-no-translate="true" translate="no">Size:</span> <span style="color: #fff; font-weight: bold; float: right;">${game.size}</span></div>
-							${currentCat === 'games' ? `<div class="modal-info-text" style="margin:0; font-size: 11px;"><span class="modal-info-label" data-modal-info-source="Trophies:" data-no-translate="true" translate="no">Trophies:</span> <span id="modal-trophies-status" class="modal-trophies-loading" style="float: right;"><span class="modal-trophies-skeleton"></span></span></div>` : ''}
+							${showModalTrophies ? `<div class="modal-info-text" style="margin:0; font-size: 11px;"><span class="modal-info-label" data-modal-info-source="Trophies:" data-no-translate="true" translate="no">Trophies:</span> <span id="modal-trophies-status" class="modal-trophies-loading" style="float: right;"><span class="modal-trophies-skeleton"></span></span></div>` : ''}
 						</div>
 					</div>
 					<div class="modal-details" style="flex: 1; display: flex; flex-direction: column; min-width: 0;">
@@ -17662,7 +17662,7 @@ P
 				}
 			} else {
 				fetchGameSummary(game.cleanName, game.id, game.contentId || '', game.region || '');
-				updateModalTrophyStatus(game, currentCat);
+				if (showModalTrophies) updateModalTrophyStatus(game, currentCat);
 			}
 		} else {
 			modalContent.style.maxWidth = '650px';
@@ -21482,6 +21482,43 @@ P
 		}
 	}
 
+
+	function setChatInputInterfacePlaceholder(input, source) {
+		if (!input) return;
+		const original = String(source || '');
+		const token = String((Number(input.dataset.interfacePlaceholderToken || 0) + 1));
+		input.dataset.interfacePlaceholderSource = original;
+		input.dataset.interfacePlaceholderToken = token;
+
+		const apply = value => {
+			if (!input.isConnected) return;
+			if (input.dataset.interfacePlaceholderSource !== original) return;
+			if (input.dataset.interfacePlaceholderToken !== token) return;
+			input.setAttribute('data-placeholder', String(value || original));
+		};
+
+		if (typeof window.getImmediateInterfaceDisplayText === 'function') {
+			const immediate = window.getImmediateInterfaceDisplayText(original, input);
+			if (immediate) {
+				apply(immediate);
+				return;
+			}
+		}
+
+		apply(original);
+		if (typeof window.resolveInterfaceDisplayText === 'function') {
+			window.resolveInterfaceDisplayText(original, input).then(apply).catch(() => apply(original));
+		}
+	}
+
+	window.refreshChatInputPlaceholderTranslation = function() {
+		const input = document.getElementById('chat-input');
+		if (!input) return;
+		const source = input.dataset.interfacePlaceholderSource ||
+			(input.classList.contains('chat-control-waiting') ? 'Slow mode cooldown...' : 'Type a message');
+		setChatInputInterfacePlaceholder(input, source);
+	};
+
 	function adminUpdateChatControlsBanner() {
 		const state = adminGetChatControlsUiState();
 		const isActive = !!state.locked || state.slowSeconds > 0;
@@ -21496,7 +21533,7 @@ P
 
 		if (input) {
 			input.classList.remove('chat-control-locked', 'chat-control-slow', 'chat-control-bypass', 'chat-control-waiting');
-			input.setAttribute('data-placeholder', 'Type a message');
+			setChatInputInterfacePlaceholder(input, 'Type a message');
 
 			if (isLockedForUser) {
 				input.classList.add('chat-control-locked');
@@ -21506,7 +21543,7 @@ P
 			} else if (isSlowWaitingForUser) {
 				input.classList.add('chat-control-slow', 'chat-control-waiting');
 				input.setAttribute('contenteditable', 'false');
-				input.setAttribute('data-placeholder', 'Slow mode cooldown...');
+				setChatInputInterfacePlaceholder(input, 'Slow mode cooldown...');
 				if (!input.dataset.adminSlowDraft) input.dataset.adminSlowDraft = input.innerHTML || '';
 				input.innerHTML = '';
 			} else {
@@ -32398,10 +32435,64 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
     }
 
 
+    function escapeChatHistoryLoadingText(value) {
+        return String(value || '').replace(/[&<>'"]/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' })[ch]);
+    }
+
+    function getImmediateChatHistoryLoadingText(source, host = null) {
+        const original = String(source || 'Preparing messages');
+        if (typeof window.getImmediateInterfaceDisplayText === 'function') {
+            const immediate = window.getImmediateInterfaceDisplayText(original, host);
+            if (immediate) return String(immediate);
+        }
+        return original;
+    }
+
+    function applyChatHistoryLoadingInterfaceText(root, source = 'Preparing messages') {
+        if (!root) return;
+        const original = String(source || 'Preparing messages');
+        const token = String((Number(root.dataset.interfaceLoadingToken || 0) + 1));
+        root.dataset.interfaceLoadingSource = original;
+        root.dataset.interfaceLoadingToken = token;
+
+        const apply = value => {
+            if (!root.isConnected) return;
+            if (root.dataset.interfaceLoadingSource !== original) return;
+            if (root.dataset.interfaceLoadingToken !== token) return;
+            const display = String(value || original);
+            const title = root.querySelector('.profile-ps-list-title');
+            const loader = root.querySelector('.profile-ps-list-loader');
+            if (title) title.textContent = display;
+            if (loader) loader.setAttribute('aria-label', display);
+        };
+
+        if (typeof window.getImmediateInterfaceDisplayText === 'function') {
+            const immediate = window.getImmediateInterfaceDisplayText(original, root);
+            if (immediate) {
+                apply(immediate);
+                return;
+            }
+        }
+
+        apply(original);
+        if (typeof window.resolveInterfaceDisplayText === 'function') {
+            window.resolveInterfaceDisplayText(original, root).then(apply).catch(() => apply(original));
+        }
+    }
+
+    window.refreshChatHistoryLoadingTranslation = function() {
+        document.querySelectorAll('#chat-history-loading').forEach(root => {
+            applyChatHistoryLoadingInterfaceText(root, root.dataset.interfaceLoadingSource || 'Preparing messages');
+        });
+    };
+
     function getChatHistoryLoadingHtml(text = 'Preparing messages') {
-        const safeText = String(text || 'Preparing messages').replace(/[&<>'"]/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' })[ch]);
+        const sourceText = String(text || 'Preparing messages');
+        const displayText = getImmediateChatHistoryLoadingText(sourceText);
+        const safeText = escapeChatHistoryLoadingText(displayText);
+        const safeSource = escapeChatHistoryLoadingText(sourceText);
         return `
-            <div id="chat-history-loading" class="chat-history-loading">
+            <div id="chat-history-loading" class="chat-history-loading" data-interface-loading-source="${safeSource}">
                 <div class="profile-ps-list-loader profile-ps-list-loader--row chat-ps-list-loader is-running" role="status" aria-live="polite" aria-label="${safeText}">
                     <div class="profile-ps-list-symbols" aria-hidden="true">
                         <span class="profile-ps-list-symbol ps-triangle"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 129 115" aria-hidden="true"><path d="M64.5 0L129 115H0L64.5 0zm0 24.531L20.489 103h88.021L64.5 24.531z"/></svg></span>
@@ -32417,13 +32508,10 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
     function showChatHistoryLoading(text = 'Preparing messages', force = false) {
         const box = document.getElementById('chat-messages');
         if (!box || (!force && box.querySelector('[id^="msg-row-"]'))) return;
+        const sourceText = String(text || 'Preparing messages');
         const activeLoader = box.querySelector('#chat-history-loading');
         if (!force && activeLoader) {
-            const safeText = String(text || 'Preparing messages');
-            const title = activeLoader.querySelector('.profile-ps-list-title');
-            const loader = activeLoader.querySelector('.profile-ps-list-loader');
-            if (title) title.textContent = safeText;
-            if (loader) loader.setAttribute('aria-label', safeText);
+            applyChatHistoryLoadingInterfaceText(activeLoader, sourceText);
             return;
         }
         if (typeof hideMentionJumpButtonImmediately === 'function') hideMentionJumpButtonImmediately();
@@ -32431,7 +32519,8 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
         box.style.opacity = '1';
         box.style.removeProperty('transition');
         box.style.setProperty('scroll-behavior', 'auto', 'important');
-        box.innerHTML = getChatWelcomeBannerHtml() + getChatHistoryLoadingHtml(text);
+        box.innerHTML = getChatWelcomeBannerHtml() + getChatHistoryLoadingHtml(sourceText);
+        applyChatHistoryLoadingInterfaceText(box.querySelector('#chat-history-loading'), sourceText);
     }
 
     function prepareChatOpenRenderBeforePaint(reason = 'open-chat') {
@@ -33214,6 +33303,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
             liveBox.style.setProperty('scroll-behavior', 'auto', 'important');
             if (shouldShowPreparingMessages) {
                 liveBox.innerHTML = getChatWelcomeBannerHtml() + getChatHistoryLoadingHtml('Preparing messages');
+                applyChatHistoryLoadingInterfaceText(liveBox.querySelector('#chat-history-loading'), 'Preparing messages');
             }
 
             const cleanupDetachedRender = () => {
@@ -37283,6 +37373,7 @@ function getVisibleChatStackEl(id) {
 		} else {
 			restoreAutoTranslatedMessages();
 		}
+		if (typeof renderPinnedBar === 'function') setTimeout(renderPinnedBar, 0);
 	}
 
 	function setChatAutoTranslateEnabled(enabled, options = {}) {
@@ -37816,11 +37907,60 @@ function getVisibleChatStackEl(id) {
 		if (typeof refreshMentionJumpButton === 'function') refreshMentionJumpButton();
 	}
 	
+	function escapePinnedChatPreviewText(value) {
+		return String(value || '')
+			.replace(/&/g, '&amp;')
+			.replace(/</g, '&lt;')
+			.replace(/>/g, '&gt;')
+			.replace(/"/g, '&quot;')
+			.replace(/'/g, '&#39;');
+	}
+
+	function renderPinnedChatPreview(preview, current, cleanText, nameColor) {
+		if (!preview || !current) return;
+		const safeUser = escapePinnedChatPreviewText(current.user || '');
+		const isImage = current.type === 'image' && current.content;
+		const setPreview = displayText => {
+			const safeText = escapePinnedChatPreviewText(displayText || '');
+			const authorHtml = `<span class="pinned-chat-author" data-no-translate="true" translate="no" style="color:${nameColor}; font-weight:bold; margin-right: 4px;">${safeUser}:</span>`;
+			const messageHtml = safeText
+				? `<span class="pinned-chat-message" data-no-translate="true" translate="no">${safeText}</span>`
+				: (isImage ? '<span class="pinned-chat-media-label">Image</span>' : '');
+			preview.innerHTML = isImage
+				? `${authorHtml} <i class="fas fa-camera" style="font-size:10px; margin-right: 4px; color: #888;"></i> ${messageHtml}`
+				: `${authorHtml} ${messageHtml}`;
+		};
+
+		setPreview(cleanText);
+		if (!cleanText || !cleanText.trim() || typeof isChatAutoTranslateEnabled !== 'function' || !isChatAutoTranslateEnabled() || typeof requestChatTranslation !== 'function') return;
+
+		const cacheKey = String(current.id || current.time || `${current.user || ''}:${cleanText}`);
+		const cache = window.chatTranslationCache[cacheKey] || (window.chatTranslationCache[cacheKey] = {});
+		const targetLang = getChatTranslateTargetLang();
+		if (cache.pinnedOriginalText === cleanText && cache.pinnedTargetLang === targetLang && cache.pinnedTranslatedText) {
+			setPreview(cache.pinnedTranslatedText);
+			return;
+		}
+
+		const pendingKey = `${targetLang}\u0000${cleanText}`;
+		if (cache.pinnedTranslatePending === pendingKey) return;
+		cache.pinnedTranslatePending = pendingKey;
+		requestChatTranslation(cleanText, targetLang).then(result => {
+			cache.pinnedTranslatePending = '';
+			cache.pinnedOriginalText = cleanText;
+			cache.pinnedTargetLang = targetLang;
+			cache.pinnedTranslatedText = result && result.text ? result.text : cleanText;
+			const active = pinnedMessages && pinnedMessages[currentPinIndex];
+			if (active && String(active.id || active.time || '') === String(current.id || current.time || '') && isChatAutoTranslateEnabled()) renderPinnedBar();
+		}).catch(() => { cache.pinnedTranslatePending = ''; });
+	}
+
 	function renderPinnedBar() {
 		const container = document.getElementById('pinned-messages-container');
 		const chatBox = document.getElementById('chat-messages');
 		const floatingPill = document.getElementById('floating-chat-date');
 		const isAdmin = document.body.classList.contains('is-admin');
+		if (!container) return;
 		
 		if (typeof updateAllPinIcons === 'function') updateAllPinIcons();
 	
@@ -37850,16 +37990,18 @@ function getVisibleChatStackEl(id) {
 		const current = pinnedMessages[currentPinIndex];
 		if (current) {
 			const nameColor = (current.user === myName) ? '#00bcff' : '#ffcc00';
-			let cleanText = current.text ? current.text.replace(/<[^>]*>?/gm, ' ').replace(/\n/g, ' ') : "";
+			const cleanText = current.text ? current.text.replace(/<[^>]*>?/gm, ' ').replace(/\n/g, ' ').replace(/\s+/g, ' ').trim() : "";
 			if (current.type === 'image' && current.content) {
 				const images = Array.isArray(current.content) ? current.content : [current.content];
-				thumbnailWrapper.innerHTML = images.map(imgUrl => `<img src="${escapeChatMediaAttr(imgUrl)}" loading="lazy" decoding="async">`).join('');
-				thumbnailWrapper.style.display = 'flex';
-				preview.innerHTML = `<span style="color:${nameColor}; font-weight:bold; margin-right: 4px;">${current.user}:</span> <i class="fas fa-camera" style="font-size:10px; margin-right: 4px; color: #888;"></i> ${cleanText || "Image"}`;
-			} else {
-				if(thumbnailWrapper) { thumbnailWrapper.style.display = 'none'; thumbnailWrapper.innerHTML = ''; }
-				preview.innerHTML = `<span style="color:${nameColor}; font-weight:bold; margin-right: 4px;">${current.user}:</span> ${cleanText}`;
+				if (thumbnailWrapper) {
+					thumbnailWrapper.innerHTML = images.map(imgUrl => `<img src="${escapeChatMediaAttr(imgUrl)}" loading="lazy" decoding="async">`).join('');
+					thumbnailWrapper.style.display = 'flex';
+				}
+			} else if (thumbnailWrapper) {
+				thumbnailWrapper.style.display = 'none';
+				thumbnailWrapper.innerHTML = '';
 			}
+			renderPinnedChatPreview(preview, current, cleanText, nameColor);
 			if (count) count.innerText = pinnedMessages.length > 1 ? `(${currentPinIndex + 1}/${pinnedMessages.length})` : '';
 		}
 	}
@@ -47186,7 +47328,7 @@ function getVisibleChatStackEl(id) {
         'INSTALL', 'MORE', 'NEW', 'NEXT', 'NO', 'OFF', 'OK', 'ON', 'OPEN',
         'PLAY', 'RESET', 'RETRY', 'SAVE', 'SEARCH', 'SELECT', 'SEND', 'SHARE',
         'SORT', 'VIEW', 'YES', 'LOCKED', 'UNLOCKED', 'REWARD', 'REQUIRES',
-        'EXIT', 'CHEATS', 'LAUNCH', 'MOUNT', 'STORE', 'MISSING'
+        'EXIT', 'CHEATS', 'LAUNCH', 'MOUNT', 'STORE', 'MISSING', 'LEVEL'
     ]);
 
     function shouldTranslateInterfaceText(text, node = null) {
@@ -47653,7 +47795,8 @@ function getVisibleChatStackEl(id) {
     const INTERFACE_TRANSLATE_PROTECTED_TERMS = [
         'NoPayStation™ Network Database', 'NoPayStation Network Database',
         'PlayStation Home', 'Home Headquarters', 'Home Laboratory', 'Destination Home',
-        'NoPayStation™', 'NoPayStation', 'PlayStation', 'Discord'
+        'NoPayStation™', 'NoPayStation', 'PlayStation', 'Discord',
+        'PSNSTATUSSTART', 'PSNSTATUSEND'
     ];
 
     function escapeInterfaceTranslationRegExp(value) {
@@ -47811,15 +47954,32 @@ function getVisibleChatStackEl(id) {
         Array.from(select.options || []).forEach(option => translateSelectOption(option, target, generation));
     }
 
+    function applyImmediateInterfaceTranslationToAttribute(el, attr, target) {
+        if (!el || el.nodeType !== Node.ELEMENT_NODE || shouldSkipNode(el) || !el.hasAttribute(attr)) return false;
+        const current = el.getAttribute(attr) || '';
+        const records = state.attributeRecords.get(el) || {};
+        const existing = records[attr];
+        if (existing && existing.target === target && current === existing.translated) return true;
+        const source = existing && current === existing.translated ? existing.original : current;
+        if (!shouldTranslateInterfaceText(source, el)) return false;
+        const protectedSource = prepareInterfaceProtectedTranslation(source, el);
+        const immediate = getImmediateInterfaceTranslation(protectedSource.source, target);
+        if (!immediate) return false;
+        const restoredTranslation = protectedSource.restore(String(immediate || ''));
+        records[attr] = { original: source, translated: restoredTranslation, target };
+        state.attributeRecords.set(el, records);
+        if (current !== restoredTranslation) el.setAttribute(attr, restoredTranslation);
+        return true;
+    }
+
     function translateElementAttributes(el, target, generation, options = {}) {
         const allowHidden = options.allowHidden === true;
         if (!el || el.nodeType !== Node.ELEMENT_NODE || shouldSkipNode(el) || !el.isConnected || (!allowHidden && !isElementVisible(el))) return;
         ['placeholder', 'data-placeholder', 'title', 'aria-label'].forEach(attr => {
-            if (!el.hasAttribute(attr)) return;
+            if (!el.hasAttribute(attr) || applyImmediateInterfaceTranslationToAttribute(el, attr, target)) return;
             const current = el.getAttribute(attr) || '';
             const elementRecords = state.attributeRecords.get(el) || {};
             const existing = elementRecords[attr];
-            if (existing && existing.target === target && current === existing.translated) return;
             const source = existing && current === existing.translated ? existing.original : current;
             if (!shouldTranslateInterfaceText(source, el)) return;
             const protectedSource = prepareInterfaceProtectedTranslation(source, el);
@@ -48108,7 +48268,7 @@ function getVisibleChatStackEl(id) {
                     const target = mutation.target;
                     const attr = mutation.attributeName || '';
                     if (attr === 'placeholder' || attr === 'data-placeholder' || attr === 'title' || attr === 'aria-label') {
-                        scheduleInterfaceTranslationScan(target);
+                        if (!applyImmediateInterfaceTranslationToAttribute(target, attr, state.target)) scheduleInterfaceTranslationScan(target);
                     } else if (isInterfaceTranslationVisibilityHost(target) && isElementVisible(target)) {
                         // Hidden views and modals are translated when they actually become visible.
                         scheduleInterfaceTranslationScan(target);
@@ -48144,6 +48304,8 @@ function getVisibleChatStackEl(id) {
         refreshCountryLanguageUi();
         window.refitInterfaceSingleLineLabels(document);
         try { if (typeof window.refreshHeaderClock === 'function') window.refreshHeaderClock(); } catch (err) {}
+        try { if (typeof window.refreshChatInputPlaceholderTranslation === 'function') window.refreshChatInputPlaceholderTranslation(); } catch (err) {}
+        try { if (typeof window.refreshChatHistoryLoadingTranslation === 'function') window.refreshChatHistoryLoadingTranslation(); } catch (err) {}
         if (target !== 'en') {
             installInterfaceTranslationUiHooks();
             startInterfaceTranslationObserver();
@@ -48163,6 +48325,8 @@ function getVisibleChatStackEl(id) {
         state.pendingRoots.clear();
         if (state.observer) state.observer.disconnect();
         restoreInterfaceTranslations();
+        try { if (typeof window.refreshChatInputPlaceholderTranslation === 'function') window.refreshChatInputPlaceholderTranslation(); } catch (err) {}
+        try { if (typeof window.refreshChatHistoryLoadingTranslation === 'function') window.refreshChatHistoryLoadingTranslation(); } catch (err) {}
         if (typeof window.restorePsnWelcomeMessageSource === 'function') window.restorePsnWelcomeMessageSource();
         document.documentElement.lang = 'en';
         document.body?.classList.remove('interface-auto-translate-enabled');
