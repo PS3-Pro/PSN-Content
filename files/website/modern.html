@@ -47128,6 +47128,7 @@ function getVisibleChatStackEl(id) {
     const INTERFACE_TRANSLATE_MAX_CACHE_ENTRIES = 1200;
     const INTERFACE_TRANSLATE_MAX_CONCURRENT = 6;
     const INTERFACE_TRANSLATE_CHUNK_LENGTH = 680;
+    const INTERFACE_TRANSLATE_REQUEST_TIMEOUT = 12000;
     const INTERFACE_TRANSLATE_VISIBILITY_HOST_SELECTOR = [
         '[id^="view-"]', '[id^="subview-"]', '.sys-modal-overlay', '.modal-overlay',
         '[role="dialog"]', '.tab-content', '.ps5-auth-container', '.profile-country-dialog'
@@ -47180,6 +47181,7 @@ function getVisibleChatStackEl(id) {
     };
     window.__interfaceTranslationState = state;
     if (!(state.pendingRoots instanceof Set)) state.pendingRoots = new Set();
+    if (!(state.pendingNodes instanceof WeakSet)) state.pendingNodes = new WeakSet();
     if (!(state.inFlight instanceof Map)) state.inFlight = new Map();
     if (!(state.optionRecords instanceof Map)) state.optionRecords = new Map();
     if (!(state.fixedCardRecords instanceof Map)) state.fixedCardRecords = new Map();
@@ -47712,14 +47714,39 @@ function getVisibleChatStackEl(id) {
         if (fixedLabel) fitFixedInterfaceSingleLineElement(fixedLabel);
     }
 
+    function withInterfaceTranslationTimeout(request) {
+        return new Promise((resolve, reject) => {
+            let settled = false;
+            const timer = setTimeout(() => {
+                if (settled) return;
+                settled = true;
+                reject(new Error('translation-timeout'));
+            }, INTERFACE_TRANSLATE_REQUEST_TIMEOUT);
+            Promise.resolve(request).then(value => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
+                resolve(value);
+            }, error => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
+                reject(error);
+            });
+        });
+    }
+
     function requestInterfaceTranslation(text, target) {
         if (typeof requestChatTranslation === 'function') {
-            return requestChatTranslation(text, target).then(result => result && result.text ? result.text : text);
+            return withInterfaceTranslationTimeout(
+                requestChatTranslation(text, target).then(result => result && result.text ? result.text : text)
+            );
         }
-        return new Promise((resolve, reject) => {
+        return withInterfaceTranslationTimeout(new Promise((resolve, reject) => {
             const url = 'https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&tl=' + encodeURIComponent(target) + '&dt=t&q=' + encodeURIComponent(text);
             const xhr = new XMLHttpRequest();
             xhr.open('GET', url, true);
+            xhr.timeout = INTERFACE_TRANSLATE_REQUEST_TIMEOUT;
             xhr.onreadystatechange = function() {
                 if (xhr.readyState !== 4) return;
                 if (xhr.status < 200 || xhr.status >= 300) return reject(new Error('status'));
@@ -47730,8 +47757,9 @@ function getVisibleChatStackEl(id) {
                 } catch (err) { reject(err); }
             };
             xhr.onerror = function() { reject(new Error('network')); };
+            xhr.ontimeout = function() { reject(new Error('translation-timeout')); };
             xhr.send();
-        });
+        }));
     }
 
     function splitInterfaceTranslationText(text, maxLength = INTERFACE_TRANSLATE_CHUNK_LENGTH) {
@@ -47801,18 +47829,27 @@ function getVisibleChatStackEl(id) {
     }
 
     function drainInterfaceTranslationQueue() {
-        if (!state.enabled) { state.queue.length = 0; return; }
+        if (!state.enabled) {
+            state.queue.length = 0;
+            state.pendingNodes = new WeakSet();
+            return;
+        }
         while (state.activeRequests < INTERFACE_TRANSLATE_MAX_CONCURRENT && state.queue.length) {
             const task = state.queue.shift();
-            if (!task || task.generation !== state.generation) continue;
+            if (!task || task.generation !== state.generation) {
+                if (task?.node) state.pendingNodes.delete(task.node);
+                continue;
+            }
+            const taskGeneration = task.generation;
             state.activeRequests++;
             translateCached(task.source, task.target)
                 .then(translated => {
-                    if (!state.enabled || task.generation !== state.generation || !task.node?.isConnected) return;
+                    if (!state.enabled || taskGeneration !== state.generation || !task.node?.isConnected) return;
                     task.apply(translated);
                 })
                 .catch(() => {})
                 .finally(() => {
+                    if (taskGeneration !== state.generation) return;
                     state.activeRequests = Math.max(0, state.activeRequests - 1);
                     if (task.node) state.pendingNodes.delete(task.node);
                     drainInterfaceTranslationQueue();
@@ -48188,6 +48225,7 @@ function getVisibleChatStackEl(id) {
         state.attributeRecords.clear();
         state.optionRecords.clear();
         state.queue.length = 0;
+        state.pendingNodes = new WeakSet();
         document.querySelectorAll('.interface-compact-label').forEach(label => {
             const parent = label.parentNode;
             if (!parent) return;
@@ -48321,20 +48359,57 @@ function getVisibleChatStackEl(id) {
         });
     }
 
-    function enableInterfaceTranslation() {
-        const target = window.getInterfaceTranslationTargetLang();
-        state.enabled = true;
-        state.target = target;
-        state.locale = getDeviceInterfaceLocale();
-        state.generation++;
-        document.documentElement.lang = state.locale || target;
-        document.body?.classList.add('interface-auto-translate-enabled');
+    function refreshInterfaceTranslationDependentUi() {
         refreshCountryLanguageUi();
         window.refitInterfaceSingleLineLabels(document);
         try { if (typeof window.refreshHeaderClock === 'function') window.refreshHeaderClock(); } catch (err) {}
         try { if (typeof window.refreshChatInputPlaceholderTranslation === 'function') window.refreshChatInputPlaceholderTranslation(); } catch (err) {}
         try { if (typeof window.refreshChatHistoryLoadingTranslation === 'function') window.refreshChatHistoryLoadingTranslation(); } catch (err) {}
         try { if (typeof window.refreshChatDatePillLocale === 'function') window.refreshChatDatePillLocale(); } catch (err) {}
+    }
+
+    function resetInterfaceTranslationPendingWork() {
+        clearTimeout(state.scanTimer);
+        clearTimeout(state.postUiTimer);
+        state.scanTimer = null;
+        state.postUiTimer = null;
+        state.pendingRoots.clear();
+        state.queue.length = 0;
+        state.pendingNodes = new WeakSet();
+        state.activeRequests = 0;
+    }
+
+    function enableInterfaceTranslation() {
+        const target = window.getInterfaceTranslationTargetLang();
+        const locale = getDeviceInterfaceLocale();
+        const alreadyEnabledForTarget = state.enabled && state.target === target && state.locale === locale;
+
+        if (alreadyEnabledForTarget) {
+            document.documentElement.lang = locale || target;
+            document.body?.classList.add('interface-auto-translate-enabled');
+            refreshInterfaceTranslationDependentUi();
+            if (target !== 'en') {
+                installInterfaceTranslationUiHooks();
+                if (!state.observer) startInterfaceTranslationObserver();
+                warmEagerInterfaceRoots();
+                scheduleInterfaceTranslationAfterUiChange(document.body);
+            }
+            return;
+        }
+
+        if (state.enabled && (state.target !== target || state.locale !== locale)) {
+            if (state.observer) state.observer.disconnect();
+            restoreInterfaceTranslations();
+        }
+
+        state.generation++;
+        resetInterfaceTranslationPendingWork();
+        state.enabled = true;
+        state.target = target;
+        state.locale = locale;
+        document.documentElement.lang = locale || target;
+        document.body?.classList.add('interface-auto-translate-enabled');
+        refreshInterfaceTranslationDependentUi();
         if (target !== 'en') {
             installInterfaceTranslationUiHooks();
             startInterfaceTranslationObserver();
@@ -48346,22 +48421,26 @@ function getVisibleChatStackEl(id) {
     }
 
     function disableInterfaceTranslation() {
+        if (!state.enabled) {
+            resetInterfaceTranslationPendingWork();
+            restoreInterfaceTranslations();
+            document.documentElement.lang = 'en';
+            document.body?.classList.remove('interface-auto-translate-enabled');
+            refreshInterfaceTranslationDependentUi();
+            return;
+        }
+
         state.enabled = false;
         state.generation++;
-        clearTimeout(state.scanTimer);
-        clearTimeout(state.postUiTimer);
+        resetInterfaceTranslationPendingWork();
         clearTimeout(state.fixedCardResizeTimer);
-        state.pendingRoots.clear();
+        state.fixedCardResizeTimer = null;
         if (state.observer) state.observer.disconnect();
         restoreInterfaceTranslations();
-        try { if (typeof window.refreshChatInputPlaceholderTranslation === 'function') window.refreshChatInputPlaceholderTranslation(); } catch (err) {}
-        try { if (typeof window.refreshChatHistoryLoadingTranslation === 'function') window.refreshChatHistoryLoadingTranslation(); } catch (err) {}
-        try { if (typeof window.refreshChatDatePillLocale === 'function') window.refreshChatDatePillLocale(); } catch (err) {}
         if (typeof window.restorePsnWelcomeMessageSource === 'function') window.restorePsnWelcomeMessageSource();
         document.documentElement.lang = 'en';
         document.body?.classList.remove('interface-auto-translate-enabled');
-        refreshCountryLanguageUi();
-        try { if (typeof window.refreshHeaderClock === 'function') window.refreshHeaderClock(); } catch (err) {}
+        refreshInterfaceTranslationDependentUi();
     }
 
     function setInterfaceAutoTranslateStatusContent(status, text) {
