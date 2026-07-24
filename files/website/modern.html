@@ -22004,15 +22004,7 @@ P
 			if (!data) return;
 			const msgRawDate = new Date(data.time).toDateString();
 			if (data.time && msgRawDate !== window.lastChatRawDate && typeof getChatDateLabel === 'function') {
-				const currentDateLabel = getChatDateLabel(data.time);
-				const divider = document.createElement('div');
-				divider.className = 'date-divider';
-
-				divider.setAttribute('data-no-translate', 'true');
-
-				divider.setAttribute('translate', 'no');
-				divider.setAttribute('data-label', currentDateLabel);
-				divider.innerHTML = `<span>${currentDateLabel}</span>`;
+				const divider = createChatDateDivider(data.time);
 				box.appendChild(divider);
 				window.lastChatRawDate = msgRawDate;
 			}
@@ -32767,15 +32759,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
                 if (typeof trackUser === 'function') trackUser(data.user);
                 const msgRawDate = new Date(data.time).toDateString();
                 if (msgRawDate !== window.lastChatRawDate) {
-                    const currentDateLabel = typeof getChatDateLabel === 'function' ? getChatDateLabel(data.time) : '';
-                    const divider = document.createElement('div');
-                    divider.className = 'date-divider';
-
-                    divider.setAttribute('data-no-translate', 'true');
-
-                    divider.setAttribute('translate', 'no');
-                    divider.setAttribute('data-label', currentDateLabel);
-                    divider.innerHTML = `<span>${currentDateLabel}</span>`;
+                    const divider = createChatDateDivider(data.time);
                     box.appendChild(divider);
                     window.lastChatRawDate = msgRawDate;
                 }
@@ -33206,15 +33190,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
             if (typeof trackUser === 'function') trackUser(data.user);
             const msgRawDate = new Date(data.time).toDateString();
             if (msgRawDate !== window.lastChatRawDate) {
-                const currentDateLabel = typeof getChatDateLabel === 'function' ? getChatDateLabel(data.time) : '';
-                const divider = document.createElement('div');
-                divider.className = 'date-divider';
-
-                divider.setAttribute('data-no-translate', 'true');
-
-                divider.setAttribute('translate', 'no');
-                divider.setAttribute('data-label', currentDateLabel);
-                divider.innerHTML = `<span>${currentDateLabel}</span>`;
+                const divider = createChatDateDivider(data.time);
                 box.appendChild(divider);
                 window.lastChatRawDate = msgRawDate;
             }
@@ -33518,6 +33494,30 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 		observer.observe(divider);
 	}
 	
+	function getChatDateLocale() {
+		try {
+			return (typeof getInterfaceDisplayLocale === 'function' && getInterfaceDisplayLocale()) || 'en';
+		} catch (err) {
+			return 'en';
+		}
+	}
+
+	function formatChatDatePart(date, locale, options) {
+		try {
+			return new Intl.DateTimeFormat(locale || 'en', options).format(date);
+		} catch (err) {
+			return new Intl.DateTimeFormat('en', options).format(date);
+		}
+	}
+
+	function formatChatRelativeDay(value, locale) {
+		try {
+			return new Intl.RelativeTimeFormat(locale || 'en', { numeric: 'auto' }).format(value, 'day');
+		} catch (err) {
+			return value === 0 ? 'Today' : (value === -1 ? 'Yesterday' : '');
+		}
+	}
+
 	function getRelativeCalendarInfo(timestamp) {
 		const date = new Date(timestamp);
 		if (Number.isNaN(date.getTime())) return null;
@@ -33528,28 +33528,69 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 		let diffInDays = Math.floor((today - targetDay) / 86400000);
 		if (diffInDays < 0) diffInDays = 0;
 
+		const locale = getChatDateLocale();
 		const sameYear = date.getFullYear() === now.getFullYear();
 		return {
 			date,
 			now,
+			locale,
 			diffInDays,
-			weekday: date.toLocaleDateString('en-US', { weekday: 'long' }),
-			compactDate: date.toLocaleDateString('en-US', sameYear
+			todayLabel: formatChatRelativeDay(0, locale),
+			yesterdayLabel: formatChatRelativeDay(-1, locale),
+			weekday: formatChatDatePart(date, locale, { weekday: 'long' }),
+			compactDate: formatChatDatePart(date, locale, sameYear
 				? { month: 'short', day: 'numeric' }
 				: { month: 'short', day: 'numeric', year: 'numeric' }
 			),
-			fullDate: date.toLocaleDateString('en-US', { day: 'numeric', month: 'long', year: 'numeric' })
+			fullDate: formatChatDatePart(date, locale, { day: 'numeric', month: 'long', year: 'numeric' })
 		};
 	}
 
 	function getChatDateLabel(dateStr) {
 		const info = getRelativeCalendarInfo(dateStr);
 		if (!info) return "";
-		if (info.diffInDays <= 0) return "TODAY";
-		if (info.diffInDays === 1) return "YESTERDAY";
-		if (info.diffInDays < 7) return info.weekday.toUpperCase();
-		return info.fullDate.toUpperCase();
+		if (info.diffInDays <= 0) return info.todayLabel;
+		if (info.diffInDays === 1) return info.yesterdayLabel;
+		if (info.diffInDays < 7) return info.weekday;
+		return info.fullDate;
 	}
+
+	function createChatDateDivider(timestamp) {
+		const info = getRelativeCalendarInfo(timestamp);
+		const label = info ? getChatDateLabel(timestamp) : '';
+		const divider = document.createElement('div');
+		const span = document.createElement('span');
+		divider.className = 'date-divider';
+		divider.setAttribute('data-no-translate', 'true');
+		divider.setAttribute('translate', 'no');
+		divider.dataset.label = label;
+		divider.dataset.chatDateTimestamp = String(new Date(timestamp).getTime());
+		divider.dataset.chatDayOffset = info ? String(info.diffInDays) : '';
+		span.setAttribute('data-no-translate', 'true');
+		span.setAttribute('translate', 'no');
+		span.textContent = label;
+		divider.appendChild(span);
+		return divider;
+	}
+	window.createChatDateDivider = createChatDateDivider;
+
+	window.refreshChatDatePillLocale = function() {
+		const box = document.getElementById('chat-messages');
+		if (!box) return;
+		box.querySelectorAll('.date-divider[data-chat-date-timestamp]').forEach(divider => {
+			const timestamp = Number(divider.dataset.chatDateTimestamp || 0);
+			const info = getRelativeCalendarInfo(timestamp);
+			if (!info) return;
+			const label = getChatDateLabel(timestamp);
+			divider.dataset.label = label;
+			divider.dataset.chatDayOffset = String(info.diffInDays);
+			const span = divider.querySelector('span');
+			if (span && span.textContent !== label) span.textContent = label;
+		});
+		box.dataset.lastLabel = 'HIDDEN_TOP';
+		box.dataset.lastFloatingLabel = '';
+		if (typeof box.onscroll === 'function') box.onscroll();
+	};
 	
 	function initDateStickyLogic() {
 		const box = document.getElementById('chat-messages');
@@ -33584,11 +33625,13 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 			let threshold = pinHeight + 15; 
 	
 			let currentLabel = "HIDDEN_TOP";
+			let currentIsToday = false;
 			let anyDividerPassed = false;
 	
 			dividers.forEach(div => {
 				if (div.offsetTop <= box.scrollTop + threshold) {
-					currentLabel = div.getAttribute('data-label');
+					currentLabel = div.getAttribute('data-label') || '';
+					currentIsToday = div.dataset.chatDayOffset === '0';
 					anyDividerPassed = true;
 					div.style.opacity = "0";
 				} else {
@@ -33598,7 +33641,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 
 			box.dataset.lastLabel = currentLabel;
 	
-			if (anyDividerPassed && currentLabel !== "TODAY" && currentLabel !== "HIDDEN_TOP") {
+			if (anyDividerPassed && !currentIsToday && currentLabel !== "HIDDEN_TOP") {
 				floatingPill.querySelector('span').innerText = currentLabel;
 				floatingPill.style.display = 'flex';
 				floatingPill.style.top = threshold + 'px';
@@ -33611,6 +33654,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 				floatingPill.style.display = 'none';
 			}
 		};
+		if (typeof window.refreshChatDatePillLocale === 'function') window.refreshChatDatePillLocale();
 	}
     
     let currentFullImageIndex = 0;
@@ -39299,15 +39343,7 @@ function getVisibleChatStackEl(id) {
 				if (!box) return;
 				const msgRawDate = new Date(data.time).toDateString();
 				if (msgRawDate !== window.lastChatRawDate) {
-					const currentDateLabel = getChatDateLabel(data.time);
-					const divider = document.createElement('div');
-					divider.className = 'date-divider';
-
-					divider.setAttribute('data-no-translate', 'true');
-
-					divider.setAttribute('translate', 'no'); 
-					divider.setAttribute('data-label', currentDateLabel);
-					divider.innerHTML = `<span>${currentDateLabel}</span>`;
+					const divider = createChatDateDivider(data.time);
 					box.appendChild(divider);
 					window.lastChatRawDate = msgRawDate;
 				}
@@ -42919,15 +42955,7 @@ function getVisibleChatStackEl(id) {
 			const msgRawDate = new Date(data.time).toDateString();
 			
 			if (msgRawDate !== window.lastChatRawDate) {
-				const currentDateLabel = getChatDateLabel(data.time);
-				const divider = document.createElement('div');
-				divider.className = 'date-divider';
-
-				divider.setAttribute('data-no-translate', 'true');
-
-				divider.setAttribute('translate', 'no'); 
-				divider.setAttribute('data-label', currentDateLabel);
-				divider.innerHTML = `<span>${currentDateLabel}</span>`;
+				const divider = createChatDateDivider(data.time);
 				box.appendChild(divider);
 				window.lastChatRawDate = msgRawDate;
 			}
@@ -48306,6 +48334,7 @@ function getVisibleChatStackEl(id) {
         try { if (typeof window.refreshHeaderClock === 'function') window.refreshHeaderClock(); } catch (err) {}
         try { if (typeof window.refreshChatInputPlaceholderTranslation === 'function') window.refreshChatInputPlaceholderTranslation(); } catch (err) {}
         try { if (typeof window.refreshChatHistoryLoadingTranslation === 'function') window.refreshChatHistoryLoadingTranslation(); } catch (err) {}
+        try { if (typeof window.refreshChatDatePillLocale === 'function') window.refreshChatDatePillLocale(); } catch (err) {}
         if (target !== 'en') {
             installInterfaceTranslationUiHooks();
             startInterfaceTranslationObserver();
@@ -48327,6 +48356,7 @@ function getVisibleChatStackEl(id) {
         restoreInterfaceTranslations();
         try { if (typeof window.refreshChatInputPlaceholderTranslation === 'function') window.refreshChatInputPlaceholderTranslation(); } catch (err) {}
         try { if (typeof window.refreshChatHistoryLoadingTranslation === 'function') window.refreshChatHistoryLoadingTranslation(); } catch (err) {}
+        try { if (typeof window.refreshChatDatePillLocale === 'function') window.refreshChatDatePillLocale(); } catch (err) {}
         if (typeof window.restorePsnWelcomeMessageSource === 'function') window.restorePsnWelcomeMessageSource();
         document.documentElement.lang = 'en';
         document.body?.classList.remove('interface-auto-translate-enabled');
