@@ -2067,9 +2067,12 @@ body.is-admin #nav-admin-footer { display: flex !important; }
 .setting-item.companion-pro-detected { opacity: 0.52; filter: grayscale(0.45); }
 .setting-item.companion-pro-detected .switch { pointer-events: none; opacity: 0.55; }
 .setting-item.companion-pro-detected #companion-plugin-status { color: var(--ps-blue) !important; opacity: 1 !important; filter: grayscale(0); }
-.setting-item.haptic-not-supported { opacity: 0.52; filter: grayscale(0.55); }
-.setting-item.haptic-not-supported:hover { transform: none !important; box-shadow: none !important; border-color: transparent !important; background-color: rgba(255,255,255,0.05) !important; }
-.setting-item.haptic-not-supported .switch { pointer-events: none; opacity: 0.5; }
+.setting-item.haptic-not-supported,
+.setting-item.setting-unavailable { opacity: 0.52; filter: grayscale(0.55); }
+.setting-item.haptic-not-supported:hover,
+.setting-item.setting-unavailable:hover { transform: none !important; box-shadow: none !important; border-color: transparent !important; background-color: rgba(255,255,255,0.05) !important; }
+.setting-item.haptic-not-supported .switch,
+.setting-item.setting-unavailable .switch { pointer-events: none; opacity: 0.5; }
 .setting-item.haptic-not-supported #haptic-feedback-status { display: block !important; color: var(--text-muted) !important; opacity: 0.85 !important; }
 #view-admin.anim-up .admin-hero-card { animation: adminHeroBoot .52s cubic-bezier(.16,.84,.28,1),adminGlowPop 1.2s ease-out; }
 #view-admin.anim-up .admin-hero-card::before { content: ""; position: absolute; top: -30%; bottom: -30%; width: 90px; left: 0; background: linear-gradient(90deg,transparent,rgba(255,255,255,0.22),transparent); pointer-events: none; z-index: 2; animation: adminScanSweep .9s ease-out .16s both; }
@@ -48480,20 +48483,32 @@ function getVisibleChatStackEl(id) {
 
     window.updateInterfaceAutoTranslateUi = function(options = {}) {
         const sessionReady = hasAuthenticatedInterfaceTranslationUser();
-        const enabled = window.isInterfaceAutoTranslateEnabled();
-        if (sessionReady) rememberStartupInterfaceAutoTranslatePreference(enabled ? '1' : '0');
+        const enabledPreference = window.isInterfaceAutoTranslateEnabled();
+        const targetLanguage = getInterfaceTranslationTargetLang();
+        const translationNeeded = targetLanguage !== 'en';
+        const enabled = enabledPreference && translationNeeded;
+        if (sessionReady) rememberStartupInterfaceAutoTranslatePreference(enabledPreference ? '1' : '0');
 
+        const setting = document.getElementById('interface-auto-translate-setting');
         const toggle = document.getElementById('interface-auto-translate-toggle');
         const status = document.getElementById('interface-auto-translate-status');
+        if (setting) {
+            setting.classList.toggle('setting-unavailable', !translationNeeded);
+            setting.setAttribute('aria-disabled', (!translationNeeded || !sessionReady) ? 'true' : 'false');
+        }
         if (toggle) {
+            // English needs no translation. Keep the stored preference intact so it
+            // becomes active again automatically if the device language changes.
             toggle.checked = enabled;
-            toggle.disabled = !sessionReady;
+            toggle.disabled = !sessionReady || !translationNeeded;
         }
         if (status) {
             const language = getInterfaceLanguageLabel(getDeviceInterfaceLocale());
-            const sourceStatus = enabled
-                ? 'DEVICE LANGUAGE: ' + language.toUpperCase()
-                : 'OFF — ENGLISH INTERFACE';
+            const sourceStatus = !translationNeeded
+                ? 'DEVICE LANGUAGE: ENGLISH'
+                : (enabledPreference
+                    ? 'DEVICE LANGUAGE: ' + language.toUpperCase()
+                    : 'OFF — ENGLISH INTERFACE');
             renderInterfaceAutoTranslateStatus(status, sourceStatus, enabled);
         }
         if (enabled) enableInterfaceTranslation();
@@ -48501,12 +48516,19 @@ function getVisibleChatStackEl(id) {
     };
 
     window.resetInterfaceTranslationForLoginScreen = function() {
-        const enabled = getStartupInterfaceAutoTranslatePreference() !== '0';
+        const enabledPreference = getStartupInterfaceAutoTranslatePreference() !== '0';
+        const translationNeeded = getInterfaceTranslationTargetLang() !== 'en';
+        const enabled = enabledPreference && translationNeeded;
         if (enabled) enableInterfaceTranslation();
         else disableInterfaceTranslation();
 
+        const setting = document.getElementById('interface-auto-translate-setting');
         const toggle = document.getElementById('interface-auto-translate-toggle');
         const status = document.getElementById('interface-auto-translate-status');
+        if (setting) {
+            setting.classList.toggle('setting-unavailable', !translationNeeded);
+            setting.setAttribute('aria-disabled', 'true');
+        }
         if (toggle) {
             toggle.checked = enabled;
             toggle.disabled = true;
@@ -48514,15 +48536,17 @@ function getVisibleChatStackEl(id) {
         state.statusRenderToken++;
         if (status) {
             const language = getInterfaceLanguageLabel(getDeviceInterfaceLocale());
-            const sourceStatus = enabled
-                ? 'DEVICE LANGUAGE: ' + language.toUpperCase()
-                : 'OFF — ENGLISH INTERFACE';
+            const sourceStatus = !translationNeeded
+                ? 'DEVICE LANGUAGE: ENGLISH'
+                : (enabledPreference
+                    ? 'DEVICE LANGUAGE: ' + language.toUpperCase()
+                    : 'OFF — ENGLISH INTERFACE');
             renderInterfaceAutoTranslateStatus(status, sourceStatus, enabled);
         }
     };
 
     window.setInterfaceAutoTranslateEnabled = function(enabled, options = {}) {
-        if (!hasAuthenticatedInterfaceTranslationUser()) {
+        if (!hasAuthenticatedInterfaceTranslationUser() || getInterfaceTranslationTargetLang() === 'en') {
             window.updateInterfaceAutoTranslateUi({ silent: true });
             return;
         }
@@ -48543,8 +48567,20 @@ function getVisibleChatStackEl(id) {
 
     window.toggleInterfaceAutoTranslate = function() {
         const toggle = document.getElementById('interface-auto-translate-toggle');
-        window.setInterfaceAutoTranslateEnabled(!!(toggle && toggle.checked));
+        if (!toggle || toggle.disabled || getInterfaceTranslationTargetLang() === 'en') {
+            window.updateInterfaceAutoTranslateUi({ silent: true });
+            return;
+        }
+        window.setInterfaceAutoTranslateEnabled(!!toggle.checked);
     };
+
+    if (!window.__interfaceLanguageChangeUiBound) {
+        window.__interfaceLanguageChangeUiBound = true;
+        window.addEventListener('languagechange', function() {
+            if (hasAuthenticatedInterfaceTranslationUser()) window.updateInterfaceAutoTranslateUi({ silent: true });
+            else window.resetInterfaceTranslationForLoginScreen();
+        });
+    }
 
 
     /* ==========================================================================
