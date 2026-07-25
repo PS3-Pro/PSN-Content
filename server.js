@@ -265,53 +265,6 @@ async function refreshServerLogFromDb() {
 }
 
 
-async function migrateStoredDownloadHistories() {
-  const client = await pool.connect();
-  let migratedUsers = 0;
-  let removedDuplicates = 0;
-
-  try {
-    await client.query('BEGIN');
-    const result = await client.query(`
-      SELECT name, data
-      FROM users
-      WHERE jsonb_typeof(data->'downloadsData') = 'array'
-    `);
-
-    for (const row of result.rows) {
-      const currentData = row.data && typeof row.data === 'object' ? row.data : {};
-      const currentHistory = Array.isArray(currentData.downloadsData) ? currentData.downloadsData : [];
-      const normalized = normalizeDownloadHistoryRecordsServer(currentHistory);
-      if (!normalized.changed) continue;
-
-      const stamp = Date.now();
-      const nextData = {
-        ...currentData,
-        downloadsData: normalized.history,
-        downloads: normalized.history.length,
-        downloadsUpdatedAt: stamp,
-        profileUpdatedAt: Math.max(normalizeTimestampValue(currentData.profileUpdatedAt), stamp)
-      };
-
-      await client.query('UPDATE users SET data = $1 WHERE name = $2', [nextData, row.name]);
-      migratedUsers += 1;
-      removedDuplicates += Math.max(0, currentHistory.length - normalized.history.length);
-    }
-
-    await client.query('COMMIT');
-    if (migratedUsers > 0) {
-      console.log(`[DOWNLOAD MIGRATION] ${migratedUsers} user(s) normalized; ${removedDuplicates} duplicate record(s) grouped.`);
-    }
-    return { migratedUsers, removedDuplicates };
-  } catch (err) {
-    try { await client.query('ROLLBACK'); } catch (rollbackErr) {}
-    console.error('[DOWNLOAD MIGRATION ERROR]:', err);
-    return { migratedUsers: 0, removedDuplicates: 0, error: err };
-  } finally {
-    client.release();
-  }
-}
-
 async function initDb() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
@@ -372,8 +325,6 @@ async function initDb() {
   `);
 
   await pool.query('DELETE FROM presence_sessions WHERE instance_id = $1 OR last_seen < NOW() - INTERVAL \'90 seconds\'', [INSTANCE_ID]);
-
-  await migrateStoredDownloadHistories();
   await refreshAllUsersCacheFromDb({ preserveOnline: false });
 
   await refreshChatHistoryFromDb();
@@ -569,6 +520,117 @@ function normalizeDownloadHistoryRecordsServer(history = []) {
   return { history: grouped, changed };
 }
 
+
+function normalizeLibraryIdentityTextServer(value) {
+  return normalizeText(value, '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/&amp;/g, '&')
+    .replace(/[^a-z0-9]+/g, '');
+}
+
+function normalizeLibraryGamePathServer(value) {
+  return normalizeText(value, '')
+    .replace(/^https?:\/\/[^/]+/i, '')
+    .replace(/\\/g, '/')
+    .replace(/\/{2,}/g, '/')
+    .toLowerCase();
+}
+
+function getLibraryGameTitleIdServer(game = {}) {
+  const candidates = [game.titleId, game.id, game.path, game.title];
+  for (const candidate of candidates) {
+    const match = normalizeText(candidate, '').toUpperCase().match(/[A-Z]{4}\d{5}/);
+    if (match) return match[0];
+  }
+  return '';
+}
+
+function getLibraryLastPlayedTimestampServer(game = {}) {
+  const explicit = normalizeTimestampValue(game && game.lastPlayedAt);
+  if (explicit) return explicit;
+
+  const text = normalizeText(game && game.lastPlayed, '');
+  if (!text) return 0;
+
+  const match = text.match(/^([A-Za-z]{3})\s+(\d{1,2}),\s+(\d{4})\s+-\s+(\d{1,2}):(\d{2})$/);
+  if (match) {
+    const monthIndex = ['jan','feb','mar','apr','may','jun','jul','aug','sep','oct','nov','dec'].indexOf(match[1].toLowerCase());
+    if (monthIndex >= 0) {
+      const parsed = new Date(
+        Number(match[3]),
+        monthIndex,
+        Number(match[2]),
+        Number(match[4]),
+        Number(match[5]),
+        0,
+        0
+      ).getTime();
+      if (Number.isFinite(parsed) && parsed > 0) return parsed;
+    }
+  }
+
+  const fallback = Date.parse(text.replace(/\s+-\s+/, ' '));
+  return Number.isFinite(fallback) && fallback > 0 ? fallback : 0;
+}
+
+function isSameLibraryGameServer(first = {}, second = {}) {
+  const firstTitleId = getLibraryGameTitleIdServer(first);
+  const secondTitleId = getLibraryGameTitleIdServer(second);
+  if (firstTitleId && secondTitleId) return firstTitleId === secondTitleId;
+
+  const firstPath = normalizeLibraryGamePathServer(first.path);
+  const secondPath = normalizeLibraryGamePathServer(second.path);
+  if (firstPath && secondPath && firstPath === secondPath) return true;
+
+  const firstTitle = normalizeLibraryIdentityTextServer(first.title || first.name);
+  const secondTitle = normalizeLibraryIdentityTextServer(second.title || second.name);
+  return !!(firstTitle && secondTitle && firstTitle === secondTitle);
+}
+
+function mergeLibraryLastPlayedRecordServer(primary = {}, fallback = {}) {
+  const merged = { ...primary };
+  const ownTimestamp = getLibraryLastPlayedTimestampServer(merged);
+
+  if (!fallback || typeof fallback !== 'object' || Array.isArray(fallback) || !isSameLibraryGameServer(merged, fallback)) {
+    if (ownTimestamp && !normalizeTimestampValue(merged.lastPlayedAt)) merged.lastPlayedAt = ownTimestamp;
+    return merged;
+  }
+
+  if (!merged.titleId && fallback.titleId) merged.titleId = fallback.titleId;
+  if (!merged.id && fallback.id) merged.id = fallback.id;
+
+  const fallbackTimestamp = getLibraryLastPlayedTimestampServer(fallback);
+  const shouldUseFallback = fallbackTimestamp > ownTimestamp ||
+    (!merged.lastPlayed && !!fallback.lastPlayed) ||
+    (!ownTimestamp && fallbackTimestamp > 0);
+
+  if (shouldUseFallback) {
+    if (fallback.lastPlayed) merged.lastPlayed = fallback.lastPlayed;
+    if (fallbackTimestamp) merged.lastPlayedAt = fallbackTimestamp;
+  } else if (ownTimestamp && !normalizeTimestampValue(merged.lastPlayedAt)) {
+    merged.lastPlayedAt = ownTimestamp;
+  }
+
+  return merged;
+}
+
+function mergeLibraryRecordsServer(primaryList = [], fallbackList = []) {
+  const primary = Array.isArray(primaryList) ? primaryList : [];
+  const fallback = Array.isArray(fallbackList) ? fallbackList : [];
+
+  return primary
+    .filter(item => item && typeof item === 'object' && !Array.isArray(item))
+    .map(item => {
+      const previous = fallback.find(candidate =>
+        candidate && typeof candidate === 'object' && !Array.isArray(candidate) &&
+        isSameLibraryGameServer(item, candidate)
+      );
+      return mergeLibraryLastPlayedRecordServer(item, previous || {});
+    });
+}
+
 function normalizeProfileCountryCodeServer(value) {
   const code = normalizeText(value, "").toUpperCase();
   return VALID_PROFILE_COUNTRY_CODES.has(code) ? code : "";
@@ -762,6 +824,11 @@ function normalizeUserRecord(name, userData = {}) {
   if (Array.isArray(normalized.downloadsData)) {
     normalized.downloadsData = normalizeDownloadHistoryRecordsServer(normalized.downloadsData).history;
     normalized.downloads = normalized.downloadsData.length;
+  }
+
+  if (Array.isArray(normalized.libraryData)) {
+    normalized.libraryData = mergeLibraryRecordsServer(normalized.libraryData, []);
+    normalized.library = normalized.libraryData.length;
   }
 
   return normalized;
@@ -1138,7 +1205,9 @@ function normalizeProfileArrayPayloads(target = {}) {
   Object.keys(PROFILE_ARRAY_SYNC_KEYS).forEach(key => {
     const sync = PROFILE_ARRAY_SYNC_KEYS[key];
     const rawList = Array.isArray(target[key]) ? target[key] : [];
-    const list = key === 'downloadsData' ? normalizeDownloadHistoryRecordsServer(rawList).history : rawList;
+    const list = key === 'downloadsData'
+      ? normalizeDownloadHistoryRecordsServer(rawList).history
+      : (key === 'libraryData' ? mergeLibraryRecordsServer(rawList, []) : rawList);
     target[key] = list;
     target[sync.countKey] = list.length;
     target[sync.versionKey] = normalizeTimestampValue(target[sync.versionKey]);
@@ -1154,8 +1223,14 @@ function reconcileIncomingProfileArrays(currentUser = {}, incomingUser = {}) {
     const hasIncomingVersion = hasOwnPayload(incomingUser, sync.versionKey);
     if (!hasIncomingArray && !hasIncomingCount && !hasIncomingVersion) return;
 
-    const currentList = getProfileArrayPayload(currentUser[key]);
-    const incomingList = getProfileArrayPayload(incomingUser[key]);
+    const currentRawList = getProfileArrayPayload(currentUser[key]);
+    const incomingRawList = getProfileArrayPayload(incomingUser[key]);
+    const currentList = key === 'downloadsData'
+      ? normalizeDownloadHistoryRecordsServer(currentRawList).history
+      : (key === 'libraryData' ? mergeLibraryRecordsServer(currentRawList, []) : currentRawList);
+    const incomingList = key === 'downloadsData'
+      ? normalizeDownloadHistoryRecordsServer(incomingRawList).history
+      : (key === 'libraryData' ? mergeLibraryRecordsServer(incomingRawList, []) : incomingRawList);
     const currentVersion = normalizeTimestampValue(currentUser[sync.versionKey]);
     const incomingVersion = normalizeTimestampValue(incomingUser[sync.versionKey]);
     const currentHasItems = currentList.length > 0;
@@ -1172,9 +1247,15 @@ function reconcileIncomingProfileArrays(currentUser = {}, incomingUser = {}) {
       acceptIncoming = true;
     }
 
+    currentUser[key] = currentList;
+    currentUser[sync.countKey] = currentList.length;
+
     if (acceptIncoming) {
-      incomingUser[key] = incomingList;
-      incomingUser[sync.countKey] = incomingList.length;
+      const acceptedList = key === 'libraryData'
+        ? mergeLibraryRecordsServer(incomingList, currentList)
+        : incomingList;
+      incomingUser[key] = acceptedList;
+      incomingUser[sync.countKey] = acceptedList.length;
       incomingUser[sync.versionKey] = incomingVersion || normalizeTimestampValue(incomingUser.profileUpdatedAt) || Date.now();
     } else {
       delete incomingUser[key];
@@ -1192,23 +1273,31 @@ function applyLocalRecoveryArrayPayload(merged = {}, localData = {}, key = '') {
 
   const dbRawList = getProfileArrayPayload(merged[key]);
   const localRawList = getProfileArrayPayload(localData[key]);
-  const dbList = key === 'downloadsData' ? normalizeDownloadHistoryRecordsServer(dbRawList).history : dbRawList;
-  const localList = key === 'downloadsData' ? normalizeDownloadHistoryRecordsServer(localRawList).history : localRawList;
+  const dbList = key === 'downloadsData'
+    ? normalizeDownloadHistoryRecordsServer(dbRawList).history
+    : (key === 'libraryData' ? mergeLibraryRecordsServer(dbRawList, []) : dbRawList);
+  const localList = key === 'downloadsData'
+    ? normalizeDownloadHistoryRecordsServer(localRawList).history
+    : (key === 'libraryData' ? mergeLibraryRecordsServer(localRawList, []) : localRawList);
   const dbVersion = normalizeTimestampValue(merged[sync.versionKey]);
   const localVersion = normalizeTimestampValue(localData[sync.versionKey]);
   const dbHasItems = dbList.length > 0;
   const localHasItems = localList.length > 0;
 
   if (localVersion && (!dbVersion || localVersion > dbVersion)) {
-    return setProfileArrayPayload(merged, key, localList, localVersion);
+    const selected = key === 'libraryData' ? mergeLibraryRecordsServer(localList, dbList) : localList;
+    return setProfileArrayPayload(merged, key, selected, localVersion);
   }
 
   if (!dbVersion && !dbHasItems && localHasItems) {
-    return setProfileArrayPayload(merged, key, localList, localVersion || normalizeTimestampValue(localData.profileUpdatedAt) || Date.now());
+    const selected = key === 'libraryData' ? mergeLibraryRecordsServer(localList, dbList) : localList;
+    return setProfileArrayPayload(merged, key, selected, localVersion || normalizeTimestampValue(localData.profileUpdatedAt) || Date.now());
   }
 
-  return setProfileArrayPayload(merged, key, dbList, dbVersion);
+  const selected = key === 'libraryData' ? mergeLibraryRecordsServer(dbList, localList) : dbList;
+  return setProfileArrayPayload(merged, key, selected, dbVersion);
 }
+
 
 function applyDownloadsClearedState(target = {}, clearAt = 0) {
   const normalizedClearAt = normalizeTimestampValue(clearAt);
@@ -1515,7 +1604,9 @@ function getUserDataPayloadFromCache(targetName, type) {
   };
   const dataKey = keyMap[type] || `${type}Data`;
   const payload = targetUser[dataKey] || (dataKey === 'trophiesData' ? {} : []);
-  return dataKey === 'downloadsData' ? normalizeDownloadHistoryRecordsServer(payload).history : payload;
+  if (dataKey === 'downloadsData') return normalizeDownloadHistoryRecordsServer(payload).history;
+  if (dataKey === 'libraryData') return mergeLibraryRecordsServer(payload, []);
+  return payload;
 }
 
 function searchUsersFromCache(query, includeAdminFields = false) {

@@ -3859,9 +3859,9 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 #view-browse #missing-rap-filter.license-filter-separated:not(.is-hidden) { display: inline-flex !important; }
 #view-browse #missing-rap-filter.license-filter-separated.is-hidden { display: none !important; }
 #view-browse #missing-rap-filter.license-filter-separated label { height: 28px !important; padding: 0 10px !important; font-size: 9.5px !important; letter-spacing: .35px !important; }
-#view-browse .section-title { justify-content: flex-start !important; align-items: baseline !important; flex-wrap: wrap !important; gap: 6px !important; line-height: 1.1 !important; }
-#view-browse #display-title { flex: 0 0 auto !important; }
-#view-browse #item-count { flex: 0 1 auto !important; font-size: 12px !important; line-height: 1.15 !important; white-space: nowrap !important; letter-spacing: 1px !important; }
+#view-browse .section-title { width: 100% !important; justify-content: space-between !important; align-items: baseline !important; flex-wrap: nowrap !important; gap: 10px !important; line-height: 1.1 !important; }
+#view-browse #display-title { flex: 0 1 auto !important; min-width: 0 !important; }
+#view-browse #item-count { flex: 0 0 auto !important; margin-left: auto !important; text-align: right !important; font-size: 12px !important; line-height: 1.15 !important; white-space: nowrap !important; letter-spacing: 1px !important; }
 #view-wishlist #wishlist-toolbar { gap: 12px !important; }
 #view-wishlist #wishlist-toolbar>.toolbar-group { gap: 10px !important; }
 #view-wishlist #wishlist-toolbar>.toolbar-group:nth-of-type(2) { flex-direction: row !important; align-items: center !important; justify-content: flex-start !important; flex-wrap: wrap !important; gap: 8px 9px !important; margin-top: 2px !important; }
@@ -4015,9 +4015,9 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 .ps3-pad-analog, .ps3-pad-l3, .ps3-pad-r3 { top: 81vh; }
 }
 @media (hover: none) and (pointer: coarse), (max-width: 768px) {
-#view-browse .section-title { font-size: 14px !important; line-height: 1.08 !important; letter-spacing: .85px !important; margin: 0 0 8px 0 !important; gap: 6px !important; align-items: baseline !important; justify-content: flex-start !important; flex-wrap: nowrap !important; }
-#view-browse #display-title { font-size: 14px !important; line-height: 1.08 !important; letter-spacing: .85px !important; flex: 0 0 auto !important; }
-#view-browse #item-count { font-size: 11px !important; line-height: 1.08 !important; letter-spacing: .55px !important; white-space: nowrap !important; flex: 0 1 auto !important; }
+#view-browse .section-title { width: 100% !important; font-size: 14px !important; line-height: 1.08 !important; letter-spacing: .85px !important; margin: 0 0 8px 0 !important; gap: 10px !important; align-items: baseline !important; justify-content: space-between !important; flex-wrap: nowrap !important; }
+#view-browse #display-title { font-size: 14px !important; line-height: 1.08 !important; letter-spacing: .85px !important; flex: 0 1 auto !important; min-width: 0 !important; }
+#view-browse #item-count { font-size: 11px !important; line-height: 1.08 !important; letter-spacing: .55px !important; white-space: nowrap !important; flex: 0 0 auto !important; margin-left: auto !important; text-align: right !important; }
 #view-browse .letter-filter { margin-top: 0 !important; }
 #ps5-boot-container { justify-content: center !important; align-items: center !important; padding: max(18px,env(safe-area-inset-top,0px)) 18px max(22px,env(safe-area-inset-bottom,0px)) 18px !important; box-sizing: border-box !important; }
 #user-select-screen { width: 100% !important; max-width: 430px !important; margin: 0 auto !important; align-items: center !important; justify-content: center !important; transform: none !important; }
@@ -10038,7 +10038,7 @@ P
             normalizeAndStoreDownloadHistory(activeUser, window.downloadHistory, { markChanged: true, broadcast: true });
             window.favoritesLibrary = JSON.parse(loadState(STORAGE_KEY_FAVS) || "[]");
 			window.friendsList = JSON.parse(loadState(STORAGE_KEY_FRIENDS) || "[]");
-            lastScannedGames = JSON.parse(loadState('psn_local_library') || "[]");
+            lastScannedGames = mergeLibraryLastPlayedLists(JSON.parse(loadState('psn_local_library') || "[]"), []);
             window.lastScannedGames = lastScannedGames;
 
             if (typeof writeCategoryDotPending === 'function') {
@@ -26852,16 +26852,9 @@ P
 			let shouldRepaintLocalLibrary = false;
 			if (typeof lastScannedGames !== 'undefined') {
 				const previousSignature = getLocalLibraryDataSignature(lastScannedGames);
-				const mergedGames = discoveredGames.map(newGame => {
-					const oldGame = lastScannedGames.find(og => og.path === newGame.path);
-					if (oldGame) {
-						return {
-							...newGame,
-							lastPlayed: oldGame.lastPlayed || null,
-							titleId: oldGame.titleId || oldGame.id || null
-						};
-					}
-					return newGame;
+				const mergedGames = mergeLibraryLastPlayedLists(discoveredGames, lastScannedGames).map(game => {
+					if (!game.titleId) game.titleId = getLibraryGameTitleId(game) || null;
+					return game;
 				});
 	
 				lastScannedGames = mergedGames;
@@ -26917,6 +26910,115 @@ P
 	window.lastScannedGames = lastScannedGames;
 	window.libCoverCache = window.libCoverCache || {};
 	
+	function normalizeLibraryIdentityText(value) {
+		return String(value || '')
+			.normalize('NFD')
+			.replace(/[\u0300-\u036f]/g, '')
+			.toLowerCase()
+			.replace(/&amp;/g, '&')
+			.replace(/[^a-z0-9]+/g, '');
+	}
+
+	function normalizeLibraryGamePath(value) {
+		return String(value || '')
+			.trim()
+			.replace(/^https?:\/\/[^/]+/i, '')
+			.replace(/\\/g, '/')
+			.replace(/\/{2,}/g, '/')
+			.toLowerCase();
+	}
+
+	function getLibraryGameTitleId(game = {}) {
+		const candidates = [game.titleId, game.id, game.path, game.title];
+		for (const candidate of candidates) {
+			const match = String(candidate || '').toUpperCase().match(/[A-Z]{4}\d{5}/);
+			if (match) return match[0];
+		}
+		return '';
+	}
+
+	function getLibraryLastPlayedTimestamp(game = {}) {
+		const explicit = Number(game.lastPlayedAt || 0);
+		if (Number.isFinite(explicit) && explicit > 0) return Math.floor(explicit);
+
+		const text = String(game.lastPlayed || '').trim();
+		if (!text) return 0;
+
+		const match = text.match(/^([A-Za-z]{3})\s+(\d{1,2}),\s+(\d{4})\s+-\s+(\d{1,2}):(\d{2})$/);
+		if (match) {
+			const monthIndex = ['jan','feb','mar','apr','may','jun','jul','aug','sep','oct','nov','dec'].indexOf(match[1].toLowerCase());
+			if (monthIndex >= 0) {
+				const parsed = new Date(
+					Number(match[3]),
+					monthIndex,
+					Number(match[2]),
+					Number(match[4]),
+					Number(match[5]),
+					0,
+					0
+				).getTime();
+				if (Number.isFinite(parsed) && parsed > 0) return parsed;
+			}
+		}
+
+		const fallback = Date.parse(text.replace(/\s+-\s+/, ' '));
+		return Number.isFinite(fallback) && fallback > 0 ? fallback : 0;
+	}
+
+	function isSameLibraryGameRecord(first = {}, second = {}) {
+		const firstTitleId = getLibraryGameTitleId(first);
+		const secondTitleId = getLibraryGameTitleId(second);
+		if (firstTitleId && secondTitleId) return firstTitleId === secondTitleId;
+
+		const firstPath = normalizeLibraryGamePath(first.path);
+		const secondPath = normalizeLibraryGamePath(second.path);
+		if (firstPath && secondPath && firstPath === secondPath) return true;
+
+		const firstTitle = normalizeLibraryIdentityText(first.title || first.name);
+		const secondTitle = normalizeLibraryIdentityText(second.title || second.name);
+		return !!(firstTitle && secondTitle && firstTitle === secondTitle);
+	}
+
+	function mergeLibraryLastPlayedRecord(primary = {}, fallback = {}) {
+		const merged = { ...primary };
+		if (!fallback || typeof fallback !== 'object' || !isSameLibraryGameRecord(merged, fallback)) {
+			const ownTimestamp = getLibraryLastPlayedTimestamp(merged);
+			if (ownTimestamp && !Number(merged.lastPlayedAt)) merged.lastPlayedAt = ownTimestamp;
+			return merged;
+		}
+
+		if (!merged.titleId && fallback.titleId) merged.titleId = fallback.titleId;
+		if (!merged.id && fallback.id) merged.id = fallback.id;
+
+		const primaryTimestamp = getLibraryLastPlayedTimestamp(merged);
+		const fallbackTimestamp = getLibraryLastPlayedTimestamp(fallback);
+		const shouldUseFallback = fallbackTimestamp > primaryTimestamp ||
+			(!merged.lastPlayed && !!fallback.lastPlayed) ||
+			(!primaryTimestamp && fallbackTimestamp > 0);
+
+		if (shouldUseFallback) {
+			if (fallback.lastPlayed) merged.lastPlayed = fallback.lastPlayed;
+			if (fallbackTimestamp) merged.lastPlayedAt = fallbackTimestamp;
+		} else if (primaryTimestamp && !Number(merged.lastPlayedAt)) {
+			merged.lastPlayedAt = primaryTimestamp;
+		}
+
+		return merged;
+	}
+
+	function mergeLibraryLastPlayedLists(primaryList = [], fallbackList = []) {
+		const primary = Array.isArray(primaryList) ? primaryList : [];
+		const fallback = Array.isArray(fallbackList) ? fallbackList : [];
+		return primary
+			.filter(item => item && typeof item === 'object' && !Array.isArray(item))
+			.map(item => {
+				const previous = fallback.find(candidate => candidate && typeof candidate === 'object' && isSameLibraryGameRecord(item, candidate));
+				return mergeLibraryLastPlayedRecord(item, previous || {});
+			});
+	}
+
+	window.mergeLibraryLastPlayedLists = mergeLibraryLastPlayedLists;
+	
 	function getLocalLibraryDataSignature(games) {
 		return JSON.stringify((games || []).map(g => ({
 			path: g.path || '',
@@ -26924,6 +27026,7 @@ P
 			id: g.id || '',
 			cover: g.cover || '',
 			lastPlayed: g.lastPlayed || '',
+			lastPlayedAt: Number(g.lastPlayedAt || 0) || 0,
 			titleId: g.titleId || ''
 		})));
 	}
@@ -26965,7 +27068,7 @@ P
 		grid.dataset.localLibraryRenderSignature = renderSignature;
 		
 		if (!isFiltering) {
-			lastScannedGames = games || [];
+			lastScannedGames = mergeLibraryLastPlayedLists(games || [], lastScannedGames || []);
 			window.lastScannedGames = lastScannedGames;
 			saveState('psn_local_library', JSON.stringify(lastScannedGames));
 		}
@@ -27166,21 +27269,22 @@ P
 		
 		let updated = false;
 		const now = new Date();
+		const nowTimestamp = now.getTime();
 		const datePart = now.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
 		const timePart = now.getHours().toString().padStart(2, '0') + ':' + now.getMinutes().toString().padStart(2, '0');
 		const dateTime = `${datePart} - ${timePart}`;
+		const playingGame = { title, titleId, id: titleId, path: titleId || '' };
 	
 		lastScannedGames.forEach(game => {
-			const isMatch = (game.id && titleId && game.id.toUpperCase() === titleId.toUpperCase()) || 
-							(game.title.toLowerCase() === title.toLowerCase()) || 
-							(titleId && game.path.includes(titleId));
+			if (!isSameLibraryGameRecord(game, playingGame)) return;
 	
-			if (isMatch) {
-				if (game.lastPlayed !== dateTime || game.titleId !== titleId) {
-					game.lastPlayed = dateTime;
-					game.titleId = titleId;
-					updated = true;
-				}
+			const storedTimestamp = Number(game.lastPlayedAt || 0);
+			const resolvedTitleId = getLibraryGameTitleId(playingGame);
+			if (game.lastPlayed !== dateTime || (resolvedTitleId && game.titleId !== resolvedTitleId) || !Number.isFinite(storedTimestamp) || storedTimestamp <= 0) {
+				game.lastPlayed = dateTime;
+				game.lastPlayedAt = nowTimestamp;
+				game.titleId = resolvedTitleId || game.titleId || game.id || null;
+				updated = true;
 			}
 		});
 	
@@ -38660,7 +38764,12 @@ function getVisibleChatStackEl(id) {
 			if (profileSyncChanges.wishlist && Array.isArray(userData.wishlistData)) { window.wishlist = userData.wishlistData; localStorage.setItem(`${name}_psn_wishlist_db`, JSON.stringify(userData.wishlistData)); applyProfileListUpdatedAtFromServer(name, 'wishlist', userData.wishlistUpdatedAt); }
 			if (profileSyncChanges.downloads && Array.isArray(userData.downloadsData)) { applyIncomingDownloadHistoryForProfile(name, userData, payload); }
 			if (profileSyncChanges.favorites && Array.isArray(userData.favoritesData)) { window.favoritesLibrary = userData.favoritesData; localStorage.setItem(`${name}_ps3_library_favs`, JSON.stringify(userData.favoritesData)); applyProfileListUpdatedAtFromServer(name, 'favorites', userData.favoritesUpdatedAt); }
-			if (profileSyncChanges.library && Array.isArray(userData.libraryData)) { if (typeof lastScannedGames !== 'undefined') { lastScannedGames = userData.libraryData; window.lastScannedGames = lastScannedGames; } localStorage.setItem(`${name}_psn_local_library`, JSON.stringify(userData.libraryData)); applyProfileListUpdatedAtFromServer(name, 'library', userData.libraryUpdatedAt); }
+			if (profileSyncChanges.library && Array.isArray(userData.libraryData)) {
+				const mergedLibraryData = mergeLibraryLastPlayedLists(userData.libraryData, (typeof lastScannedGames !== 'undefined' && Array.isArray(lastScannedGames)) ? lastScannedGames : []);
+				if (typeof lastScannedGames !== 'undefined') { lastScannedGames = mergedLibraryData; window.lastScannedGames = lastScannedGames; }
+				localStorage.setItem(`${name}_psn_local_library`, JSON.stringify(mergedLibraryData));
+				applyProfileListUpdatedAtFromServer(name, 'library', userData.libraryUpdatedAt);
+			}
 			if (profileSyncChanges.friends && Array.isArray(userData.friendsData)) { window.friendsList = userData.friendsData; localStorage.setItem(`${name}_psn_friends_list`, JSON.stringify(userData.friendsData)); applyProfileListUpdatedAtFromServer(name, 'friends', userData.friendsUpdatedAt); }
 
 			if (userData.avatar) { localStorage.setItem(`${name}_psn_avatar`, userData.avatar); const sidebarAvatar = document.querySelector('.user-avatar'); if (sidebarAvatar) sidebarAvatar.style.backgroundImage = `url('${userData.avatar}')`; }
@@ -38931,14 +39040,16 @@ function getVisibleChatStackEl(id) {
 			}
 
 			if (Array.isArray(userData.libraryData)) {
-				if (typeof lastScannedGames !== 'undefined') { lastScannedGames = userData.libraryData; window.lastScannedGames = lastScannedGames; }
-				localStorage.setItem(`${name}_psn_local_library`, JSON.stringify(userData.libraryData));
+				const currentLibraryData = (typeof lastScannedGames !== 'undefined' && Array.isArray(lastScannedGames)) ? lastScannedGames : [];
+				const mergedLibraryData = mergeLibraryLastPlayedLists(userData.libraryData, currentLibraryData);
+				if (typeof lastScannedGames !== 'undefined') { lastScannedGames = mergedLibraryData; window.lastScannedGames = lastScannedGames; }
+				localStorage.setItem(`${name}_psn_local_library`, JSON.stringify(mergedLibraryData));
 				applyProfileListUpdatedAtFromServer(name, 'library', userData.libraryUpdatedAt);
 			} else if (isLightAuthPayload) {
 				if (typeof lastScannedGames !== 'undefined' && !Array.isArray(lastScannedGames)) { lastScannedGames = []; window.lastScannedGames = lastScannedGames; }
 			} else {
 				const localLib = localStorage.getItem(`${name}_psn_local_library`);
-				if (typeof lastScannedGames !== 'undefined') { lastScannedGames = localLib ? JSON.parse(localLib) : []; window.lastScannedGames = lastScannedGames; }
+				if (typeof lastScannedGames !== 'undefined') { lastScannedGames = mergeLibraryLastPlayedLists(localLib ? JSON.parse(localLib) : [], []); window.lastScannedGames = lastScannedGames; }
 			}
 			if (!isLightAuthPayload && typeof updateConsoleLibraryStatusUI === 'function') updateConsoleLibraryStatusUI(window.lastScannedGames || []);
 
