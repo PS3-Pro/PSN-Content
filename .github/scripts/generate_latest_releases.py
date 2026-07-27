@@ -86,8 +86,7 @@ def get_reference_paths(old_path, new_path):
     ]
 
 
-def buid_name_lookup(paths):
-
+def build_name_lookup(paths):
     name_lookup = {}
 
     for path in paths:
@@ -116,11 +115,6 @@ def buid_name_lookup(paths):
 
 
 def resolve_item_name(parts, name_lookup):
-    """
-    Se o item estiver com UNKNOWN TITLE, MISSING ou vazio,
-    procura um título válido pelo mesmo Content ID.
-    """
-
     if len(parts) <= 2:
         return parts
 
@@ -153,7 +147,6 @@ def read_valid_latest_items(latest_path, name_lookup):
 
     for line in lines[1:]:
         parts = line.rstrip("\r\n").split("\t")
-
         resolve_item_name(parts, name_lookup)
 
         if is_valid_item(parts):
@@ -163,7 +156,6 @@ def read_valid_latest_items(latest_path, name_lookup):
 
 
 def merge_without_duplicates(items):
-
     merged = []
     positions = {}
 
@@ -236,7 +228,6 @@ def process_latest(old_path, new_path, latest_path):
 
         for line in lines[1:]:
             parts = line.rstrip("\r\n").split("\t")
-
             resolve_item_name(parts, name_lookup)
 
             if not is_valid_item(parts):
@@ -280,7 +271,7 @@ def process_latest(old_path, new_path, latest_path):
 if __name__ == "__main__":
     if len(sys.argv) < 4:
         print(
-            "Uso: python script.py "
+            "Usage: python script.py "
             "old_database new_database latest_file"
         )
         sys.exit(1)
