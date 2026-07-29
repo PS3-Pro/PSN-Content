@@ -22996,6 +22996,8 @@ P
 				const chatDot = document.getElementById('chat-dot');
 				if (chatDot) chatDot.style.display = 'none';
 				saveState('psn_chat_dot', 'false');
+				saveState('psn_last_chat_read', Date.now().toString());
+				if (typeof broadcastProfileUpdate === 'function') broadcastProfileUpdate();
 				
 				const isFriendsActive = document.getElementById('nav-chat-friends')?.classList.contains('active');
 				if (typeof showSocialSection === 'function') showSocialSection(isFriendsActive ? 'friends' : 'chat');
@@ -32911,230 +32913,6 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
     }
     window.isChatManualJumpActive = isChatManualJumpActive;
 
-    function stabilizeChatBottomAfterMedia(box, options = {}) {
-        if (!box) return false;
-        if (typeof window.__chatBottomStabilizeCleanup === 'function') window.__chatBottomStabilizeCleanup();
-
-        const token = Number(window.__chatBottomStabilizeToken || 0) + 1;
-        window.__chatBottomStabilizeToken = token;
-
-        const restoreSmooth = options.restoreSmooth !== false;
-        const oldSmooth = options.oldSmooth !== undefined ? options.oldSmooth : (box.style.scrollBehavior || '');
-        const oldPriority = options.oldPriority !== undefined ? options.oldPriority : box.style.getPropertyPriority('scroll-behavior');
-        const maxDuration = Math.max(2500, Number(options.maxDuration || 15000));
-        const minimumStableDuration = Math.max(700, Number(options.minimumStableDuration || 1400));
-        const startedAt = Date.now();
-        const observedElements = new Set();
-        const mediaImages = new Set();
-        const pendingDecodes = new Set();
-        const cleanupCallbacks = [];
-        let stopped = false;
-        let pinFrame = 0;
-        let checkTimer = 0;
-        let hardStopTimer = 0;
-        let resizeObserver = null;
-        let mutationObserver = null;
-        let lastLayoutChangeAt = startedAt;
-        let lastScrollHeight = -1;
-        let lastClientHeight = -1;
-        let lastContentBottom = -1;
-
-        const restoreScrollBehavior = () => {
-            if (!restoreSmooth || !document.body.contains(box)) return;
-            if (oldSmooth) box.style.setProperty('scroll-behavior', oldSmooth, oldPriority || '');
-            else box.style.setProperty('scroll-behavior', 'smooth');
-        };
-
-        const stop = () => {
-            if (stopped) return;
-            stopped = true;
-            if (pinFrame) cancelAnimationFrame(pinFrame);
-            if (checkTimer) clearTimeout(checkTimer);
-            if (hardStopTimer) clearTimeout(hardStopTimer);
-            if (resizeObserver) resizeObserver.disconnect();
-            if (mutationObserver) mutationObserver.disconnect();
-            cleanupCallbacks.forEach(callback => callback());
-            if (window.__chatBottomStabilizeToken === token) {
-                window.__chatBottomStabilizeCleanup = null;
-                restoreScrollBehavior();
-            }
-        };
-
-        const markLayoutChanged = () => {
-            lastLayoutChangeAt = Date.now();
-        };
-
-        const getContentBottom = () => {
-            const last = box.lastElementChild;
-            return last ? Math.round(last.offsetTop + last.offsetHeight) : 0;
-        };
-
-        const hasPendingMedia = () => {
-            if (pendingDecodes.size > 0) return true;
-            return Array.from(mediaImages).some(img => !img.complete);
-        };
-
-        const updateLayoutSnapshot = () => {
-            const nextScrollHeight = Math.round(box.scrollHeight || 0);
-            const nextClientHeight = Math.round(box.clientHeight || 0);
-            const nextContentBottom = getContentBottom();
-            if (
-                nextScrollHeight !== lastScrollHeight ||
-                nextClientHeight !== lastClientHeight ||
-                nextContentBottom !== lastContentBottom
-            ) {
-                lastScrollHeight = nextScrollHeight;
-                lastClientHeight = nextClientHeight;
-                lastContentBottom = nextContentBottom;
-                markLayoutChanged();
-            }
-        };
-
-        const scheduleCheck = (delay = 90) => {
-            if (stopped) return;
-            if (checkTimer) clearTimeout(checkTimer);
-            checkTimer = setTimeout(() => {
-                checkTimer = 0;
-                schedulePin();
-            }, delay);
-        };
-
-        const pinToBottom = () => {
-            if (stopped || window.__chatBottomStabilizeToken !== token || !document.body.contains(box)) {
-                stop();
-                return;
-            }
-            if (document.getElementById('unread-divider')) {
-                stop();
-                return;
-            }
-            if (typeof isChatManualJumpActive === 'function' && isChatManualJumpActive()) {
-                stop();
-                return;
-            }
-            if (typeof isChatScreenVisibleForRead === 'function' && !isChatScreenVisibleForRead()) {
-                stop();
-                return;
-            }
-
-            updateLayoutSnapshot();
-            box.style.setProperty('scroll-behavior', 'auto', 'important');
-            box.scrollTop = box.scrollHeight;
-
-            const distanceFromBottom = Math.max(0, box.scrollHeight - box.scrollTop - box.clientHeight);
-            const stableLongEnough = Date.now() - lastLayoutChangeAt >= minimumStableDuration;
-            if (!hasPendingMedia() && stableLongEnough && distanceFromBottom <= 1) {
-                stop();
-                return;
-            }
-
-            scheduleCheck(90);
-        };
-
-        const schedulePin = () => {
-            if (stopped) return;
-            if (pinFrame) cancelAnimationFrame(pinFrame);
-            pinFrame = requestAnimationFrame(() => {
-                pinFrame = requestAnimationFrame(() => {
-                    pinFrame = 0;
-                    pinToBottom();
-                });
-            });
-        };
-
-        const observeElement = element => {
-            if (!element || observedElements.has(element)) return;
-            observedElements.add(element);
-            if (resizeObserver) resizeObserver.observe(element);
-        };
-
-        const watchImage = img => {
-            observeElement(img);
-            if (mediaImages.has(img)) return;
-            mediaImages.add(img);
-
-            const imageFinished = () => {
-                markLayoutChanged();
-                schedulePin();
-            };
-
-            if (!img.complete) {
-                img.addEventListener('load', imageFinished, { once: true });
-                img.addEventListener('error', imageFinished, { once: true });
-                cleanupCallbacks.push(() => {
-                    img.removeEventListener('load', imageFinished);
-                    img.removeEventListener('error', imageFinished);
-                });
-                return;
-            }
-
-            if (typeof img.decode === 'function') {
-                pendingDecodes.add(img);
-                img.decode().catch(() => {}).then(() => {
-                    pendingDecodes.delete(img);
-                    imageFinished();
-                });
-            }
-        };
-
-        const watchRenderedMedia = () => {
-            observeElement(box);
-            box.querySelectorAll('[id^="msg-row-"]').forEach(observeElement);
-            box.querySelectorAll('.msg-bubble img, .chat-gallery img, .yt-video-card img').forEach(watchImage);
-            updateLayoutSnapshot();
-        };
-
-        if (typeof ResizeObserver === 'function') {
-            resizeObserver = new ResizeObserver(() => {
-                markLayoutChanged();
-                schedulePin();
-            });
-        }
-
-        if (typeof MutationObserver === 'function') {
-            mutationObserver = new MutationObserver(() => {
-                markLayoutChanged();
-                watchRenderedMedia();
-                schedulePin();
-            });
-            mutationObserver.observe(box, {
-                childList: true,
-                subtree: true,
-                attributes: true,
-                attributeFilter: ['src', 'style', 'class']
-            });
-        }
-
-        const cancelOnUserInput = () => stop();
-        ['wheel', 'touchstart', 'pointerdown'].forEach(eventName => {
-            box.addEventListener(eventName, cancelOnUserInput, { passive: true, once: true });
-            cleanupCallbacks.push(() => box.removeEventListener(eventName, cancelOnUserInput));
-        });
-
-        const cancelOnScrollKey = event => {
-            if (['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End', ' '].includes(event.key)) stop();
-        };
-        document.addEventListener('keydown', cancelOnScrollKey, true);
-        cleanupCallbacks.push(() => document.removeEventListener('keydown', cancelOnScrollKey, true));
-
-        window.__chatBottomStabilizeCleanup = stop;
-        watchRenderedMedia();
-        schedulePin();
-        [120, 350, 700, 1200, 2000, 3500, 5500, 8000, 11000].forEach(delay => {
-            const timer = setTimeout(() => {
-                if (!stopped) {
-                    markLayoutChanged();
-                    watchRenderedMedia();
-                    schedulePin();
-                }
-            }, delay);
-            cleanupCallbacks.push(() => clearTimeout(timer));
-        });
-        hardStopTimer = setTimeout(stop, maxDuration);
-        return true;
-    }
-    window.stabilizeChatBottomAfterMedia = stabilizeChatBottomAfterMedia;
-
     function scrollChatToUnreadOrBottom(options = {}) {
         if (typeof isChatManualJumpActive === 'function' && isChatManualJumpActive() && options.allowManualJumpOverride !== true) return false;
         if (window.__chatDetachedRenderingActive && options.allowDetached !== true) return false;
@@ -33143,32 +32921,22 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
         const divider = document.getElementById('unread-divider');
         const restoreSmooth = options.restoreSmooth !== false;
         const setupDivider = options.setupDivider !== false;
-        if (typeof window.__chatBottomStabilizeCleanup === 'function') window.__chatBottomStabilizeCleanup();
         const oldSmooth = box.style.scrollBehavior || '';
-        const oldPriority = box.style.getPropertyPriority('scroll-behavior');
         box.style.setProperty('scroll-behavior', 'auto', 'important');
         if (divider) {
             const topPos = Math.max(0, divider.offsetTop - (box.offsetHeight / 2));
             box.scrollTop = topPos;
             if (setupDivider && typeof setupDividerAutoRemove === 'function') setupDividerAutoRemove();
             if (typeof updateJumpBottomUnreadBadge === 'function') updateJumpBottomUnreadBadge();
-            if (restoreSmooth) {
-                setTimeout(() => {
-                    if (oldSmooth) box.style.setProperty('scroll-behavior', oldSmooth, oldPriority || '');
-                    else box.style.setProperty('scroll-behavior', 'smooth');
-                }, 160);
-            }
         } else {
             box.scrollTop = box.scrollHeight;
             if (typeof updateJumpBottomUnreadBadge === 'function') updateJumpBottomUnreadBadge(0);
-            if (options.stabilizeMedia !== false && typeof stabilizeChatBottomAfterMedia === 'function') {
-                stabilizeChatBottomAfterMedia(box, { restoreSmooth, oldSmooth, oldPriority, maxDuration: options.mediaWaitMs || 15000 });
-            } else if (restoreSmooth) {
-                setTimeout(() => {
-                    if (oldSmooth) box.style.setProperty('scroll-behavior', oldSmooth, oldPriority || '');
-                    else box.style.setProperty('scroll-behavior', 'smooth');
-                }, 160);
-            }
+        }
+        if (restoreSmooth) {
+            setTimeout(() => {
+                if (oldSmooth) box.style.scrollBehavior = oldSmooth;
+                else box.style.setProperty('scroll-behavior', 'smooth');
+            }, 160);
         }
         return !!divider;
     }
@@ -39967,20 +39735,10 @@ function getVisibleChatStackEl(id) {
 				checkAndInsertDivider();
 				maybeInsertUnreadDivider(shouldAutoScroll);
 				appendMessageToChat(data, data.user === myName, data.time);
-                    if (shouldAutoScroll) {
-                        if (typeof scrollChatToUnreadOrBottom === 'function') {
-                            scrollChatToUnreadOrBottom({
-                                restoreSmooth: true,
-                                setupDivider: true,
-                                stabilizeMedia: true,
-                                mediaWaitMs: 8000,
-                                allowManualJumpOverride: true
-                            });
-                        } else if (typeof jumpToBottom === 'function') {
-                            jumpToBottom();
-                        }
-                    } else if (typeof setJumpBottomButtonVisible === 'function') {
-                        setJumpBottomButtonVisible(true);
+				if (shouldAutoScroll && typeof jumpToBottom === 'function') {
+					jumpToBottom();
+				} else if (typeof setJumpBottomButtonVisible === 'function') {
+					setJumpBottomButtonVisible(true);
 				}
 			} else {
 				let matches = false;
@@ -40014,20 +39772,10 @@ function getVisibleChatStackEl(id) {
 					checkAndInsertDivider();
 					maybeInsertUnreadDivider(shouldAutoScroll);
 					appendMessageToChat(data, data.user === myName, data.time);
-                    if (shouldAutoScroll) {
-                        if (typeof scrollChatToUnreadOrBottom === 'function') {
-                            scrollChatToUnreadOrBottom({
-                                restoreSmooth: true,
-                                setupDivider: true,
-                                stabilizeMedia: true,
-                                mediaWaitMs: 8000,
-                                allowManualJumpOverride: true
-                            });
-                        } else if (typeof jumpToBottom === 'function') {
-                            jumpToBottom();
-                        }
-                    } else if (typeof setJumpBottomButtonVisible === 'function') {
-                        setJumpBottomButtonVisible(true);
+					if (shouldAutoScroll && typeof jumpToBottom === 'function') {
+						jumpToBottom();
+					} else if (typeof setJumpBottomButtonVisible === 'function') {
+						setJumpBottomButtonVisible(true);
 					}
 				}
 			}
@@ -40564,17 +40312,8 @@ function getVisibleChatStackEl(id) {
 		const box = document.getElementById('chat-messages');
 		const chatReadable = typeof isChatScreenVisibleForRead === 'function' && isChatScreenVisibleForRead();
 		const divider = document.getElementById('unread-divider');
-		const chatHistoryReady = !!(
-			box &&
-			window.__chatHistoryReceived === true &&
-			window.__chatHistoryDomRendered === true &&
-			!window.__chatLazyRenderPromise &&
-			!window.__chatDetachedRenderingActive &&
-			!box.querySelector('#chat-history-loading') &&
-			box.querySelector('[id^="msg-row-"]')
-		);
 
-		if (chatReadable && chatHistoryReady && !divider && (typeof isChatNearBottom !== 'function' || isChatNearBottom(box, 100))) {
+		if (chatReadable && !divider && (typeof isChatNearBottom !== 'function' || isChatNearBottom(box, 100))) {
 			if (typeof markVisibleChatAsRead === 'function') markVisibleChatAsRead();
 			return;
 		}
@@ -41754,35 +41493,19 @@ function getVisibleChatStackEl(id) {
             return;
         }
 
-        const jumpOptions = {
-            restoreSmooth: true,
-            setupDivider: true,
-            stabilizeMedia: true,
-            mediaWaitMs: 8000,
-            allowManualJumpOverride: true
-        };
-
         const history = Array.isArray(window.messageHistory) ? window.messageHistory : [];
         const virtualEnd = Number(window.__chatVirtualEndIndex || 0);
         if (history.length && virtualEnd > 0 && virtualEnd < history.length && typeof renderChatWindowAroundIndex === 'function') {
             renderChatWindowAroundIndex(history.length - 1, { align: 'end', loadingText: 'Loading latest messages', scrollToBottom: true }).then(() => {
-                if (typeof scrollChatToUnreadOrBottom === 'function') {
-                    scrollChatToUnreadOrBottom(jumpOptions);
-                } else {
-                    const latestBox = document.getElementById('chat-messages');
-                    if (latestBox) latestBox.scrollTo({ top: latestBox.scrollHeight, behavior: 'smooth' });
-                }
+                const latestBox = document.getElementById('chat-messages');
+                if (latestBox) latestBox.scrollTo({ top: latestBox.scrollHeight, behavior: 'smooth' });
                 setJumpBottomButtonVisible(false);
                 setTimeout(() => { if (typeof refreshChatNotificationDot === 'function') refreshChatNotificationDot(); }, 350);
             });
             return;
         }
 
-        if (typeof scrollChatToUnreadOrBottom === 'function') {
-            scrollChatToUnreadOrBottom(jumpOptions);
-        } else {
-            box.scrollTo({ top: box.scrollHeight, behavior: 'smooth' });
-        }
+        box.scrollTo({ top: box.scrollHeight, behavior: 'smooth' });
         setJumpBottomButtonVisible(false);
         setTimeout(() => { if (typeof refreshChatNotificationDot === 'function') refreshChatNotificationDot(); }, 350);
     }
