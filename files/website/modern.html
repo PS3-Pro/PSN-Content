@@ -38003,6 +38003,213 @@ function getVisibleChatStackEl(id) {
 	window.getChatImageGroup = getChatImageGroup;
 	window.openChatImageGroupModal = openChatImageGroupModal;
 
+	window.__chatOutgoingEntryRequest = null;
+	window.__chatOutgoingEntryObserver = null;
+	window.__chatOutgoingEntryTimer = null;
+
+	function normalizeChatOutgoingEntryValue(value) {
+		return String(value || '')
+			.replace(/<br\s*\/?>/gi, ' ')
+			.replace(/<[^>]*>?/gm, ' ')
+			.replace(/&nbsp;/gi, ' ')
+			.replace(/\s+/g, ' ')
+			.trim();
+	}
+
+	function decodeChatOutgoingEntryValue(value) {
+		try {
+			return decodeURIComponent(String(value || ''));
+		} catch (err) {
+			return String(value || '');
+		}
+	}
+
+	function getVisibleChatMessageBox() {
+		const root = document.getElementById('view-chat');
+		if (!root) return null;
+		return root.querySelector('#chat-messages') || root.querySelector('#chat-messages-visible-rendering');
+	}
+
+	function getChatOutgoingRowText(row) {
+		if (!row) return '';
+		const textElement = row.querySelector('[id^="msg-text-"]');
+		if (!textElement) return '';
+		const encodedText = textElement.getAttribute('data-translate-text');
+		if (encodedText !== null) return normalizeChatOutgoingEntryValue(decodeChatOutgoingEntryValue(encodedText));
+		return normalizeChatOutgoingEntryValue(textElement.textContent || '');
+	}
+
+	function getChatOutgoingRowUser(row) {
+		if (!row) return '';
+		return decodeChatOutgoingEntryValue(row.getAttribute('data-user') || '');
+	}
+
+	function stopChatOutgoingEntryWatch() {
+		if (window.__chatOutgoingEntryObserver) {
+			window.__chatOutgoingEntryObserver.disconnect();
+			window.__chatOutgoingEntryObserver = null;
+		}
+		if (window.__chatOutgoingEntryTimer) {
+			clearTimeout(window.__chatOutgoingEntryTimer);
+			window.__chatOutgoingEntryTimer = null;
+		}
+		window.__chatOutgoingEntryRequest = null;
+	}
+
+	function primeChatOutgoingEntryRow(row) {
+		if (!row || !row.isConnected) return false;
+		if (row.dataset.chatOutgoingEntryAnimated === '1') return true;
+		if (row.dataset.chatOutgoingEntryPrimed === '1') return true;
+
+		row.dataset.chatOutgoingEntryPrimed = '1';
+		row.dataset.chatOutgoingEntryTransition = row.style.getPropertyValue('transition') || '';
+		row.getAnimations().forEach(animation => animation.cancel());
+		row.classList.remove('chat-no-entry-anim', 'msg-anim');
+		row.style.setProperty('transition', 'none', 'important');
+		row.style.setProperty('opacity', '0');
+		row.style.setProperty('transform', 'translateY(20px)');
+		return true;
+	}
+
+	function playChatOutgoingEntryAnimation(row, box) {
+		if (!row || !row.isConnected || !box) return false;
+		if (row.dataset.chatOutgoingEntryAnimated === '1') return true;
+
+		primeChatOutgoingEntryRow(row);
+		row.dataset.chatOutgoingEntryAnimated = '1';
+
+		const previousScrollBehavior = box.style.getPropertyValue('scroll-behavior');
+		const previousScrollPriority = box.style.getPropertyPriority('scroll-behavior');
+		box.style.setProperty('scroll-behavior', 'auto', 'important');
+		box.scrollTop = box.scrollHeight;
+
+		requestAnimationFrame(() => {
+			if (!row.isConnected) return;
+			box.scrollTop = box.scrollHeight;
+			const previousTransition = row.dataset.chatOutgoingEntryTransition || '';
+			const animation = row.animate([
+				{ opacity: 0, transform: 'translateY(20px)' },
+				{ opacity: 1, transform: 'translateY(0)' }
+			], {
+				duration: 900,
+				easing: 'cubic-bezier(0.2,0.8,0.2,1)',
+				fill: 'both'
+			});
+
+			const cleanup = () => {
+				row.style.removeProperty('opacity');
+				row.style.removeProperty('transform');
+				row.style.removeProperty('transition');
+				if (previousTransition) row.style.setProperty('transition', previousTransition);
+				delete row.dataset.chatOutgoingEntryPrimed;
+				delete row.dataset.chatOutgoingEntryTransition;
+			};
+
+			animation.onfinish = () => {
+				cleanup();
+				animation.cancel();
+			};
+
+			animation.oncancel = cleanup;
+
+			if (previousScrollBehavior) {
+				box.style.setProperty('scroll-behavior', previousScrollBehavior, previousScrollPriority || '');
+			} else {
+				box.style.removeProperty('scroll-behavior');
+			}
+		});
+
+		return true;
+	}
+
+	function findChatOutgoingEntryRow(request, box) {
+		if (!request || !box) return null;
+		const rows = Array.from(box.querySelectorAll('[id^="msg-row-"]'));
+		const candidates = rows.filter(row => {
+			if (request.baselineIds.has(row.id)) return false;
+			if (getChatOutgoingRowUser(row) !== request.user) return false;
+			const rowId = Number(row.getAttribute('data-chat-msg-id') || row.id.replace('msg-row-', ''));
+			if (Number.isFinite(rowId) && rowId < request.createdAt - 60000) return false;
+			if (request.text && getChatOutgoingRowText(row) !== request.text) return false;
+			return true;
+		});
+
+		if (!candidates.length) return null;
+		candidates.sort((a, b) => {
+			const aId = Number(a.getAttribute('data-chat-msg-id') || a.id.replace('msg-row-', '')) || 0;
+			const bId = Number(b.getAttribute('data-chat-msg-id') || b.id.replace('msg-row-', '')) || 0;
+			return bId - aId;
+		});
+		return candidates[0];
+	}
+
+	function tryChatOutgoingEntryAnimation() {
+		window.__chatOutgoingEntryTimer = null;
+		const request = window.__chatOutgoingEntryRequest;
+		if (!request) return true;
+		if (Date.now() - request.createdAt > 12000) {
+			stopChatOutgoingEntryWatch();
+			return false;
+		}
+
+		const box = getVisibleChatMessageBox();
+		const chatVisible = typeof isChatScreenVisibleForRead === 'function'
+			? isChatScreenVisibleForRead()
+			: !!box;
+		const renderBusy = !!(window.__chatLazyRenderPromise || window.__chatDetachedRenderingActive || window.__chatVirtualWindowRendering);
+		const row = findChatOutgoingEntryRow(request, box);
+		if (row) primeChatOutgoingEntryRow(row);
+
+		if (row && chatVisible && !renderBusy && !box.querySelector('#chat-history-loading')) {
+			const played = playChatOutgoingEntryAnimation(row, box);
+			stopChatOutgoingEntryWatch();
+			return played;
+		}
+
+		window.__chatOutgoingEntryTimer = setTimeout(tryChatOutgoingEntryAnimation, 40);
+		return false;
+	}
+
+	function armChatOutgoingEntryAnimation(data = {}) {
+		stopChatOutgoingEntryWatch();
+		const root = document.getElementById('view-chat');
+		const box = getVisibleChatMessageBox();
+		const baselineIds = new Set(box ? Array.from(box.querySelectorAll('[id^="msg-row-"]')).map(row => row.id) : []);
+		window.__chatOutgoingEntryRequest = {
+			user: String(data.user || localStorage.getItem('psn_username') || ''),
+			text: normalizeChatOutgoingEntryValue(data.text || ''),
+			type: String(data.type || 'text'),
+			createdAt: Date.now(),
+			baselineIds
+		};
+
+		if (root && typeof MutationObserver !== 'undefined') {
+			window.__chatOutgoingEntryObserver = new MutationObserver(() => {
+				tryChatOutgoingEntryAnimation();
+			});
+			window.__chatOutgoingEntryObserver.observe(root, { childList: true, subtree: true });
+		}
+
+		window.__chatOutgoingEntryTimer = setTimeout(tryChatOutgoingEntryAnimation, 0);
+		return true;
+	}
+
+	window.armChatOutgoingEntryAnimation = armChatOutgoingEntryAnimation;
+
+	function shouldPrimeChatOutgoingMessage(userName, cleanText, msgType, msgId) {
+		const request = window.__chatOutgoingEntryRequest;
+		if (!request) return false;
+		if (String(userName || '') !== request.user) return false;
+		if (String(msgType || 'text') !== request.type) return false;
+		if (request.text && normalizeChatOutgoingEntryValue(cleanText) !== request.text) return false;
+		if (request.baselineIds && request.baselineIds.has(`msg-row-${msgId}`)) return false;
+		const numericId = Number(msgId);
+		if (Number.isFinite(numericId) && numericId < request.createdAt - 15000) return false;
+		if (Number.isFinite(numericId) && numericId > request.createdAt + 60000) return false;
+		return true;
+	}
+
+
 	function appendMessageToChat(msg, isMe = false, timestamp = null) {
 		const box = document.getElementById('chat-messages');
 		if (!box) return;
@@ -38024,7 +38231,9 @@ function getVisibleChatStackEl(id) {
 			? Number(msg.__chatRenderIndex)
 			: (Number.isFinite(Number(window.__chatAppendingRenderIndex)) ? Number(window.__chatAppendingRenderIndex) : -1);
 		const renderIndexAttr = renderIndexValue >= 0 ? ` data-chat-index="${renderIndexValue}"` : '';
-		const messageEntryClass = window.__chatDisableMessageEntryAnimation === true ? 'msg-anim chat-no-entry-anim' : 'msg-anim';
+		const shouldPrimeOutgoingEntry = shouldPrimeChatOutgoingMessage(userName, cleanText, (msg && msg.type) || 'text', msgId);
+		const messageEntryClass = shouldPrimeOutgoingEntry ? '' : (window.__chatDisableMessageEntryAnimation === true ? 'msg-anim chat-no-entry-anim' : 'msg-anim');
+		const outgoingEntryInitialStyle = shouldPrimeOutgoingEntry ? ' opacity:0; transform:translateY(20px);' : '';
 	
 		const encodedText = encodeURIComponent(cleanText).replace(/'/g, "%27");
 		const encodedUser = encodeURIComponent(userName).replace(/'/g, "%27");
@@ -38211,7 +38420,7 @@ function getVisibleChatStackEl(id) {
 		}
 	
 		const msgHtml = `
-		<div id="msg-row-${msgId}"${renderIndexAttr} data-chat-msg-id="${msgId}" class="${messageEntryClass} ${msg.type === 'poll' ? 'msg-row-poll' : ''}" data-user="${encodedUser}" data-can-delete="${canDeleteThisMsg ? 'true' : 'false'}" onclick="if(window.chatSelectionMode && typeof toggleChatMessageSelection === 'function') toggleChatMessageSelection(event, '${msgId}')" style="display: flex; flex-direction: ${flexDir}; align-self: ${alignSelf}; max-width: min(85%, 450px); margin-bottom: 12px; gap: 10px; transition: all 0.3s ease;">
+		<div id="msg-row-${msgId}"${renderIndexAttr} data-chat-msg-id="${msgId}" class="${messageEntryClass} ${msg.type === 'poll' ? 'msg-row-poll' : ''}" data-user="${encodedUser}" data-can-delete="${canDeleteThisMsg ? 'true' : 'false'}" onclick="if(window.chatSelectionMode && typeof toggleChatMessageSelection === 'function') toggleChatMessageSelection(event, '${msgId}')" style="display: flex; flex-direction: ${flexDir}; align-self: ${alignSelf}; max-width: min(85%, 450px); margin-bottom: 12px; gap: 10px; transition: all 0.3s ease;${outgoingEntryInitialStyle}">
 			<img src="${userAvatar}" class="chat-avatar-clickable chat-avatar-status" 
 				data-user="${userName}" 
 				onerror="this.onerror=null; this.src='https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/interface/modern/images/avatars/default.png';" 
@@ -41041,6 +41250,7 @@ function getVisibleChatStackEl(id) {
 			globalPingRole: globalPingActive ? globalPingRole : ''
 		};
 		
+		if (typeof armChatOutgoingEntryAnimation === 'function') armChatOutgoingEntryAnimation(data);
 		socketChat.emit('chat_message', data);
 		if (!canModerate) {
 			localStorage.setItem('psn_chat_last_sent_at', String(Date.now()));
