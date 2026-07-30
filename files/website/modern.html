@@ -9655,6 +9655,12 @@ P
 		return aliases[raw] || raw || 'games';
 	}
 
+	const PSN_SOUNDTRACK_TITLE_SIGNAL_REGEX = /(?:\bsound\s*track\b|\bsountrack\b|\bost\b|\bbanda\s+sonora\b|\bcolonna\s+sonora\b|\btrilha\s+sonora\b|\boriginal\s+score\b|\bpiano\s+remixes?\b|\bmusical\s+montage\b)/i;
+
+	function isPsnSoundtrackTitle(value) {
+		return PSN_SOUNDTRACK_TITLE_SIGNAL_REGEX.test(String(value || ''));
+	}
+
 	function isGuideDownloadHistoryItem(item = {}) {
 		const text = `${item.cleanName || ''} ${item.name || ''} ${item.title || ''} ${item.rawName || ''}`.toLowerCase();
 		return /\b(?:guidebook|guide|play\s*view)\b/i.test(text);
@@ -9662,7 +9668,7 @@ P
 
 	function isSoundtrackDownloadHistoryItem(item = {}) {
 		const text = `${item.cleanName || ''} ${item.name || ''} ${item.title || ''} ${item.rawName || ''}`.toLowerCase();
-		return /\bsound(?:\s+)?track\b/i.test(text);
+		return isPsnSoundtrackTitle(text);
 	}
 
 	function isDemoDownloadHistoryItem(item = {}) {
@@ -12782,6 +12788,10 @@ P
         }
 
         if (/\b(?:trial|demo|beta|soundtrack|digital|downloadable?)\s+(?:version|ver)\b/i.test(title)) score -= 100;
+        if (String(game && game.category || '').toLowerCase() === 'soundtracks') {
+            if (/^(?:extended\s+)?(?:official\s+)?(?:game\s+)?(?:sound\s*track|sountrack|ost)$/i.test(title.trim())) score -= 420;
+            if (/\b(?:soundtrack\s+van|banda\s+sonora|colonna\s+sonora|trilha\s+sonora|offiziell(?:e|er|es|en)?)\b/i.test(title)) score -= 90;
+        }
         if (/\b(?:hd|high\s+definition)\s*$/i.test(title)) score -= 55;
         if (/[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af]/.test(title) && /[a-z]/i.test(title)) score -= 45;
         if (/\([^)]*\)|\[[^\]]*\]/.test(title)) score -= 8;
@@ -12936,10 +12946,55 @@ P
         return tokens.join('');
     }
 
+    function normalizeSoundtrackGroupTitleName(game) {
+        const contentId = String(game && (game.contentId || game.contentID) ? (game.contentId || game.contentID) : '').toUpperCase();
+        let name = stripTitleLanguageQualifiers(String(
+            game && (game.cleanName || game.name || game.title || game.rawName)
+                ? game.cleanName || game.name || game.title || game.rawName
+                : ''
+        ));
+
+        name = name
+            .replace(/^\s*(?:sound\s*track|sountrack)\s+(?:van|of|de|da|del|do)\s+/i, '')
+            .replace(/^\s*(?:banda\s+sonora|colonna\s+sonora|trilha\s+sonora)\s+(?:de|da|del|do|of)\s+/i, '')
+            .replace(/\b(?:original\s+sound\s*track\s+from\s+the\s+video\s+game|original\s+sound\s*track\s+from\s+the\s+game)\b/gi, ' ')
+            .replace(/\b(?:official\s+game\s+sound\s*track|original\s+game\s+sound\s*track|game\s+sound\s*track)\b/gi, ' ')
+            .replace(/\b(?:sound\s*track|sountrack|banda\s+sonora|colonna\s+sonora|trilha\s+sonora|ost)\b/gi, ' ')
+            .replace(/\b(?:official|original|offiziell(?:e|er|es|en)?)\b/gi, ' ')
+            .replace(/\bfrom\s+the\s+(?:video\s+)?game\b/gi, ' ')
+            .replace(/\s*[+&]\s*bonus\s+track\s*$/i, ' ')
+            .replace(/\s{2,}/g, ' ')
+            .replace(/^[\s\-–—:,]+|[\s\-–—:,]+$/g, '')
+            .trim();
+
+        const lowerName = name.toLowerCase();
+        const originalText = String(game && (game.cleanName || game.name || game.title || game.rawName) || '').toLowerCase();
+
+        if (/GBEYONDTWO/.test(contentId)) {
+            if (/\bextended\b/.test(originalText)) name = 'Beyond Two Souls Extended';
+            else if (!/\bbeyond\b/.test(lowerName)) name = 'Beyond Two Souls';
+        }
+
+        if (/GTEARAWAYSOUND/.test(contentId)) {
+            name = 'Tearaway';
+        }
+
+        return normalizeBrowseGroupTitleName({
+            cleanName: name,
+            cTag: game && game.cTag ? game.cTag : '',
+            category: 'soundtracks'
+        });
+    }
+
     function getBrowseGroupTitleKey(game) {
+        const category = String(game && game.category ? game.category : '').toLowerCase();
+        const normalizedTitle = category === 'soundtracks'
+            ? normalizeSoundtrackGroupTitleName(game)
+            : normalizeBrowseGroupTitleName(game);
+
         return [
             String(game && game.cTag ? game.cTag : '').toLowerCase(),
-            normalizeBrowseGroupTitleName(game)
+            normalizedTitle
         ].join('|');
     }
 
@@ -13494,7 +13549,7 @@ P
 							const RX_DEMO_CHK = /(?:\b(?:demo|trial|beta|bèta|network\s+test|test\s*ver(?:sion)?|testver|testversie)\b|体験版|체험판|демо(?:нстрационная)?(?:\s*[-–—]?\s*версия)?|пробная\s+версия|vers[aã]o\s+demo|versi[oó]n\s+demo|version\s+d[ée]mo|\bd[ée]mo(?:\s+de)?\b|demoversion)/gi;
 							const isTestVersion = RX_DEMO_CHK.test(rawName);
 							const isGuide = /\b(?:guidebook|guide|play\s*view)\b/i.test(rawName);
-							const isSoundtrack = /\bsound(?:\s+)?track\b/i.test(rawName);
+							const isSoundtrack = isPsnSoundtrackTitle(rawName);
 	
 							if ((cat === "games" || cat === "apps" || cat === "demos") && (isGuide || isSoundtrack)) continue;
 							if ((cat === "games" || cat === "apps") && isTestVersion) continue;
@@ -16028,7 +16083,7 @@ P
 				const RX_DEMO_CHK = /(?:\b(?:demo|trial|beta|bèta|network\s+test|test\s*ver(?:sion)?|testver|testversie)\b|体験版|체험판|демо(?:нстрационная)?(?:\s*[-–—]?\s*версия)?|пробная\s+версия|vers[aã]o\s+demo|versi[oó]n\s+demo|version\s+d[ée]mo|\bd[ée]mo(?:\s+de)?\b|demoversion)/gi;
 				const isTestVersion = RX_DEMO_CHK.test(rawName);
 				const isGuide = /\b(?:guidebook|guide|play\s*view)\b/i.test(rawName);
-				const isSoundtrack = /\bsound(?:\s+)?track\b/i.test(rawName);
+				const isSoundtrack = isPsnSoundtrackTitle(rawName);
 
 				if ((cat === "games" || cat === "apps" || cat === "demos") && (isGuide || isSoundtrack)) continue;
 				if (cat === "guides" && !isGuide) continue;
@@ -19173,7 +19228,7 @@ P
 		const aTag = String(item.aTag || item.appTag || '').trim().toLowerCase();
 		const text = `${item.cleanName || ''} ${item.name || ''} ${item.title || ''} ${item.rawName || ''} ${id}`.toLowerCase();
 		const isGuide = /\b(?:guidebook|guide|play\s*view)\b/i.test(text);
-		const isSoundtrack = /\bsound(?:\s+)?track\b/i.test(text);
+		const isSoundtrack = isPsnSoundtrackTitle(text);
 
 		const blockedForLibrary = !!(options && options.library === true);
 		const libraryBlockedCategories = ['dlcs', 'updates', 'avatars', 'themes'];
@@ -19326,7 +19381,7 @@ P
 		const nameKey = normalizeText(item.cleanName || item.name || item.title || item.rawName);
 		const categorySignalText = `${item.cleanName || ''} ${item.name || ''} ${item.title || ''} ${item.rawName || ''}`;
 		const isGuide = /\b(?:guidebook|guide|play\s*view)\b/i.test(categorySignalText);
-		const isSoundtrack = /\bsound(?:\s+)?track\b/i.test(categorySignalText);
+		const isSoundtrack = isPsnSoundtrackTitle(categorySignalText);
 		const exactOnly = !!(options && (options.exactOnly === true || options.library === true));
 		const categoryPriority = (options && options.library === true && typeof window.getLibraryStoreCategoryPriority === 'function')
 			? window.getLibraryStoreCategoryPriority()
@@ -19472,7 +19527,7 @@ P
 			const preferred = [];
 			if (!isLibraryList) {
 				if (/\b(?:guidebook|guide|play\s*view)\b/i.test(text)) preferred.push('guides');
-				if (/\bsound(?:\s+)?track\b/i.test(text)) preferred.push('soundtracks');
+				if (isPsnSoundtrackTitle(text)) preferred.push('soundtracks');
 				if (/\btheme\b/.test(text)) preferred.push('themes');
 				if (/\bavatar\b/.test(text)) preferred.push('avatars');
 				if (/\bdlc\b|add[- ]?on|expansion|pack/.test(text)) preferred.push('dlcs');
