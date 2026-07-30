@@ -12592,6 +12592,37 @@ P
         'episode', 'ep', 'chapter', 'season', 'part', 'book', 'volume', 'vol'
     ]);
 
+    const BROWSE_REGION_ORDER = Object.freeze({
+        US: 1,
+        EU: 2,
+        JP: 3,
+        ASIA: 4
+    });
+
+    function getBrowseRegionRank(region) {
+        const key = String(region || '').trim().toUpperCase();
+        return Object.prototype.hasOwnProperty.call(BROWSE_REGION_ORDER, key)
+            ? BROWSE_REGION_ORDER[key]
+            : 99;
+    }
+
+    function compareBrowseRegionItems(a, b) {
+        const firstGame = a && a.game ? a.game : a;
+        const secondGame = b && b.game ? b.game : b;
+        const firstRank = getBrowseRegionRank(firstGame && firstGame.region);
+        const secondRank = getBrowseRegionRank(secondGame && secondGame.region);
+
+        if (firstRank !== secondRank) return firstRank - secondRank;
+
+        const firstRegion = String(firstGame && firstGame.region ? firstGame.region : '').toUpperCase();
+        const secondRegion = String(secondGame && secondGame.region ? secondGame.region : '').toUpperCase();
+        if (firstRegion !== secondRegion) return firstRegion.localeCompare(secondRegion);
+
+        const firstId = String(firstGame && (firstGame.id || firstGame.titleId) ? (firstGame.id || firstGame.titleId) : '');
+        const secondId = String(secondGame && (secondGame.id || secondGame.titleId) ? (secondGame.id || secondGame.titleId) : '');
+        return firstId.localeCompare(secondId);
+    }
+
     const TITLE_LANGUAGE_QUALIFIER_WORDS = new Set([
         'english', 'england', 'britain', 'british',
         'french', 'france', 'german', 'germany',
@@ -12704,6 +12735,87 @@ P
             .replace(/\s{2,}/g, ' ')
             .replace(/^[\s\-–—:,]+|[\s\-–—:,]+$/g, '')
             .trim();
+    }
+
+    function getBrowseDisplayTitleCandidate(game) {
+        let name = stripTitleLanguageQualifiers(String(
+            game && (game.cleanName || game.name || game.title || game.rawName)
+                ? game.cleanName || game.name || game.title || game.rawName
+                : ''
+        ));
+
+        const bracketPattern = /\s*[\(\[\{<【（［｛]([^\)\]\}>】）］｝]*)[\)\]\}>】）］｝]\s*/g;
+        const cjkPattern = /[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af]/;
+        const latinPattern = /[a-z]/i;
+
+        for (let i = 0; i < 4; i++) {
+            const cleaned = name.replace(bracketPattern, function (match, content, offset, fullText) {
+                const annotation = String(content || '').trim();
+                const outside = String(fullText || '').slice(0, offset) + String(fullText || '').slice(offset + match.length);
+                const duplicatedCjkTitle = cjkPattern.test(annotation) && !latinPattern.test(annotation) && latinPattern.test(outside);
+                return duplicatedCjkTitle || isTitleLanguageQualifier(annotation) ? ' ' : match;
+            });
+
+            if (cleaned === name) break;
+            name = cleaned;
+        }
+
+        return name
+            .replace(/\s{2,}/g, ' ')
+            .replace(/^[\s\-–—:,]+|[\s\-–—:,]+$/g, '')
+            .trim();
+    }
+
+    function scoreBrowseDisplayTitle(game) {
+        const title = getBrowseDisplayTitleCandidate(game);
+        if (!title) return Number.NEGATIVE_INFINITY;
+
+        const lower = title.toLowerCase();
+        const words = lower
+            .normalize('NFD')
+            .replace(/[\u0300-\u036f]/g, '')
+            .match(/[a-z0-9]+/g) || [];
+        let score = 1000;
+
+        for (const word of words) {
+            if (Object.prototype.hasOwnProperty.call(BROWSE_GROUP_TITLE_WORD_ALIASES, word)) score -= 80;
+        }
+
+        if (/\b(?:trial|demo|beta|soundtrack|digital|downloadable?)\s+(?:version|ver)\b/i.test(title)) score -= 100;
+        if (/\b(?:hd|high\s+definition)\s*$/i.test(title)) score -= 55;
+        if (/[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af]/.test(title) && /[a-z]/i.test(title)) score -= 45;
+        if (/\([^)]*\)|\[[^\]]*\]/.test(title)) score -= 8;
+        if (title === title.toUpperCase() && /[A-Z]/.test(title)) score -= 12;
+        if (title === title.toLowerCase() && /[a-z]/.test(title)) score -= 12;
+
+        if (title.includes(':')) score += 9;
+        if (title.includes('&')) score += 5;
+        if (/[’']/u.test(title)) score += 4;
+        if (/\b(?:II|III|IV|V|VI|VII|VIII|IX|X|XI|XII|XIII|XIV|XV|XVI|XVII|XVIII|XIX|XX)\b/.test(title)) score += 5;
+
+        score -= title.length * 0.01;
+        return score;
+    }
+
+    function chooseBrowseGroupDisplayTitle(items) {
+        const candidates = (items || []).filter(item => item && item.game);
+        if (!candidates.length) return '';
+
+        const ranked = candidates.slice().sort((a, b) => {
+            const scoreDifference = scoreBrowseDisplayTitle(b.game) - scoreBrowseDisplayTitle(a.game);
+            if (scoreDifference) return scoreDifference;
+
+            const firstTitle = getBrowseDisplayTitleCandidate(a.game);
+            const secondTitle = getBrowseDisplayTitleCandidate(b.game);
+            if (firstTitle.length !== secondTitle.length) return firstTitle.length - secondTitle.length;
+
+            const regionDifference = compareBrowseRegionItems(a, b);
+            if (regionDifference) return regionDifference;
+
+            return firstTitle.localeCompare(secondTitle);
+        });
+
+        return getBrowseDisplayTitleCandidate(ranked[0].game);
     }
 
     function normalizeBrowseGroupTitleName(game) {
@@ -13033,17 +13145,18 @@ P
         });
 
         return Array.from(groups.values()).map(group => {
-            const sortedItems = group.items.slice().sort((a, b) => {
-                const regionOrder = { US: 1, EU: 2, JP: 3, ASIA: 4 };
-                const ar = regionOrder[a.game.region] || 99;
-                const br = regionOrder[b.game.region] || 99;
-                if (ar !== br) return ar - br;
-                return String(a.game.id || '').localeCompare(String(b.game.id || ''));
-            });
+            const sortedItems = group.items.slice().sort(compareBrowseRegionItems);
+            const representativeItem = sortedItems[0] || null;
+            const displayTitle = chooseBrowseGroupDisplayTitle(sortedItems);
 
             group.items = sortedItems;
-            group.game = sortedItems[0]?.game || group.game;
-            group.sourceIndex = sortedItems[0]?.sourceIndex || group.sourceIndex;
+            group.game = representativeItem
+                ? { ...representativeItem.game, cleanName: displayTitle || representativeItem.game.cleanName }
+                : group.game;
+            group.sourceIndex = representativeItem && typeof representativeItem.sourceIndex === 'number'
+                ? representativeItem.sourceIndex
+                : group.sourceIndex;
+            group.displayTitle = displayTitle || (group.game && group.game.cleanName) || '';
             return group;
         });
     }
@@ -13054,7 +13167,8 @@ P
         if (browseExpandedGroupTitle && browseExpandedGroupTitle.key) {
             return source
                 .map((game, index) => ({ game, sourceIndex: index }))
-                .filter(item => getBrowseGroupTitleKey(item.game) === browseExpandedGroupTitle.key);
+                .filter(item => getBrowseGroupTitleKey(item.game) === browseExpandedGroupTitle.key)
+                .sort(compareBrowseRegionItems);
         }
 
         if (shouldUseBrowseGroupedTitleCards()) {
