@@ -13271,12 +13271,12 @@ P
     function updateBrowseTypeFilterVisibility(categoryOverride = null) {
         const catEl = document.getElementById('cat-select');
         const category = categoryOverride !== null ? categoryOverride : (catEl ? catEl.value : '');
-        const inRegionsView = !!browseExpandedGroupTitle;
+        const inContextualView = !!browseExpandedGroupTitle || !!(navHistory && navHistory.lockSearch === true);
         const consoleFilters = document.getElementById('console-filters');
         const appFilters = document.getElementById('app-filters');
 
-        if (consoleFilters) consoleFilters.style.display = (!inRegionsView && category === 'games') ? 'flex' : 'none';
-        if (appFilters) appFilters.style.display = (!inRegionsView && category === 'apps') ? 'flex' : 'none';
+        if (consoleFilters) consoleFilters.style.display = (!inContextualView && category === 'games') ? 'flex' : 'none';
+        if (appFilters) appFilters.style.display = (!inContextualView && category === 'apps') ? 'flex' : 'none';
     }
 
     function isBrowseRegionSelectLocked(categoryOverride = null) {
@@ -14829,6 +14829,28 @@ P
 	window.switchAndSearch = function(category, titleId, fromWhere = false, focusContentId = '', originCard = null) {
 		window.g_animCutoffFound = false;
 
+		const resolveRelatedGameTitle = () => {
+			if (originCard) {
+				const titleNode = originCard.querySelector ? originCard.querySelector('.game-title') : null;
+				const imageNode = originCard.querySelector ? originCard.querySelector('.game-img[data-name]') : null;
+				const cardTitle = titleNode ? titleNode.textContent : (imageNode ? imageNode.getAttribute('data-name') : '');
+				if (cardTitle && String(cardTitle).trim()) return String(cardTitle).trim();
+			}
+
+			const wantedId = String(titleId || '').toUpperCase().trim();
+			if (wantedId && Array.isArray(currentData)) {
+				const sourceItem = currentData.find(item => item && String(item.id || '').toUpperCase().trim() === wantedId);
+				if (sourceItem) {
+					const sourceTitle = sourceItem.cleanName || sourceItem.name || '';
+					if (String(sourceTitle || '').trim()) return String(sourceTitle).trim();
+				}
+			}
+
+			return '';
+		};
+
+		const relatedGameTitle = resolveRelatedGameTitle();
+
 		const cleanFocusContentId = (focusContentId && focusContentId !== 'undefined' && focusContentId !== 'null') ? String(focusContentId).trim() : '';
 		if (originCard && typeof window.captureStoreNavigationCover === 'function') {
 			window.captureStoreNavigationCover(originCard, category, titleId, cleanFocusContentId);
@@ -14885,6 +14907,8 @@ P
 			showMissingRap: document.getElementById('show-missing-rap-toggle') ? document.getElementById('show-missing-rap-toggle').checked : false,
 			lockSearch: true,
 			contextualType: 'related',
+			contextualCategory: String(category || ''),
+			contextualGameTitle: relatedGameTitle,
 			scroll: safeScroll,
 			limit: safeLimit,
 			fromExplore: finalFromWhere,
@@ -14921,10 +14945,9 @@ P
 		if (catSelect) catSelect.value = category;
 		if (searchInput) searchInput.value = titleId;
 		
-		const consoleF = document.getElementById('console-filters');
-		const appF = document.getElementById('app-filters');
-		if (consoleF) consoleF.style.display = (category === 'games') ? 'flex' : 'none';
-		if (appF) appF.style.display = (category === 'apps') ? 'flex' : 'none';
+		if (typeof updateBrowseTypeFilterVisibility === 'function') {
+			updateBrowseTypeFilterVisibility(category);
+		}
 	
 		if (typeof renderLetterFilter === 'function') {
 			activeLetter = "ALL"; 
@@ -16757,6 +16780,41 @@ P
 		return compact ? `(${base} • ${hidden} hidden)` : `(${base} • ${hidden} missing license${hidden === 1 ? '' : 's'} hidden)`;
 	}
 
+	function updateBrowseContextualCategoryTitle(itemCount) {
+		const titleEl = document.getElementById('display-title');
+		const categoryEl = document.getElementById('cat-select');
+		if (!titleEl || !categoryEl) return;
+
+		const category = String(categoryEl.value || '');
+		const categoryOption = categoryEl.options[categoryEl.selectedIndex];
+		const defaultTitle = categoryOption ? categoryOption.text : 'Browse Database';
+		const relatedLabels = {
+			dlcs: ['DLC', 'DLCs'],
+			avatars: ['Avatar', 'Avatars'],
+			themes: ['Theme', 'Themes'],
+			updates: ['Update', 'Updates']
+		};
+
+		const isRelatedContext = !!(
+			navHistory &&
+			navHistory.lockSearch &&
+			navHistory.contextualType === 'related' &&
+			String(navHistory.contextualCategory || '') === category &&
+			String(navHistory.contextualGameTitle || '').trim() &&
+			relatedLabels[category]
+		);
+
+		if (!isRelatedContext) {
+			titleEl.innerText = defaultTitle;
+			return;
+		}
+
+		const count = Number(itemCount || 0);
+		const labels = relatedLabels[category];
+		const categoryLabel = count === 1 ? labels[0] : labels[1];
+		titleEl.innerText = `${String(navHistory.contextualGameTitle).trim()}’s ${categoryLabel}`;
+	}
+
 	window.dismissBrowseNavigation = function(event) {
 		if (event) {
 			event.preventDefault();
@@ -17216,6 +17274,9 @@ P
 				? formatBrowseGroupedTitleItemCount(renderItems.length, getBrowseGroupedTitleChildCount(renderItems), hiddenMissingRapCount)
 				: formatBrowseItemCount(renderItems.length, hiddenMissingRapCount);
 			document.getElementById('item-count').innerText = countText;
+			if (typeof updateBrowseContextualCategoryTitle === 'function') {
+				updateBrowseContextualCategoryTitle(renderItems.length);
+			}
 			
 			if (window.isRestoringHistory) {
 				window.isRestoringHistory = false;
@@ -23576,8 +23637,7 @@ P
 	
 			if (viewId === 'view-browse') {
 				const currentCat = catSelect ? catSelect.value : 'games';
-				if (consoleFilters) consoleFilters.style.display = (currentCat === 'games') ? 'flex' : 'none';
-				if (appFilters) appFilters.style.display = (currentCat === 'apps') ? 'flex' : 'none';
+				if (typeof updateBrowseTypeFilterVisibility === 'function') updateBrowseTypeFilterVisibility(currentCat);
 				if (typeof syncBrowseContextualSearchState === 'function') syncBrowseContextualSearchState(viewId);
 			}
 			
