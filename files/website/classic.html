@@ -2658,11 +2658,11 @@
 				img.removeAttribute('data-loaded');
 				img.removeAttribute('data-loading');
 				img.removeAttribute('data-failed');
-				if (img.getAttribute('data-psn-store-loaded') === 'true') {
-					img.removeAttribute('data-psn-store-tried');
-					img.removeAttribute('data-psn-store-fallback-tried');
-					img.removeAttribute('data-psn-store-loaded');
-				}
+				img.removeAttribute('data-bing-tried');
+				img.removeAttribute('data-psn-store-tried');
+				img.removeAttribute('data-psn-store-fallback-tried');
+				img.removeAttribute('data-psn-store-loaded');
+				img.removeAttribute('data-sony-icon-tried');
 				
 				active_imgs.splice(i, 1);
 				unloaded++;
@@ -2680,64 +2680,117 @@
 	}
 	silentGarbageCollector();
 
-	function classicLoadGithubCoverPC(img, title_id) {
-		if (!img || !title_id) return;
+	function classicCoverIndexSkipsGithub(title_id) {
+		if (!title_id) return true;
+		if (g_noCoverIndexLoaded && g_noCoverMap[title_id]) return true;
+		if (g_coverIndexLoaded && g_coverIndexUsable && !g_coverMap[title_id]) return true;
+		return false;
+	}
 
-		if (g_noCoverIndexLoaded && g_noCoverMap[title_id]) {
+	function classicLoadSonyCoverPC(img, title_id) {
+		if (!img || !title_id) {
 			finishCoverFallback(img);
 			return;
 		}
 
-		var hash_val = generateSonyHash(title_id) || "MISSING";
-		var primaryUrl = "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/database/covers/uncompressed/" + title_id + ".JPG";
-		var hashUrl = "https://raw.githubusercontent.com/PS3-Pro/Recently-Played-Games/master/np/" + hash_val + "/ICON0.PNG";
-		var targetUrl = primaryUrl;
-		var knownHash = false;
-
-		if (g_coverIndexLoaded && !g_coverMap[title_id]) {
-			targetUrl = hashUrl;
-			knownHash = true;
+		var hash_val = generateSonyHash(title_id);
+		if (!hash_val) {
+			finishCoverFallback(img);
+			return;
 		}
 
+		var hashUrl = "https://raw.githubusercontent.com/PS3-Pro/Recently-Played-Games/master/np/" + hash_val + "/ICON0.PNG";
+		img.setAttribute('data-sony-icon-tried', 'true');
 		img.onload = function() {
 			this.onload = null;
 			this.onerror = null;
 			this.setAttribute('data-loaded', 'true');
 		};
-
 		img.onerror = function() {
+			this.onload = null;
 			this.onerror = null;
-			if (!knownHash && this.src.indexOf('.JPG') !== -1) {
-				this.onerror = function() {
-					this.onerror = null;
-					this.onload = null;
-					finishCoverFallback(this);
-				};
-				this.onload = function() {
-					this.onload = null;
-					this.onerror = null;
-					this.setAttribute('data-loaded', 'true');
-				};
-				this.src = hashUrl;
-			} else {
-				this.onload = null;
-				finishCoverFallback(this);
-			}
+			finishCoverFallback(this);
 		};
+		img.src = hashUrl;
+	}
 
-		img.src = targetUrl;
+	function classicLoadPsnStoreThenSonyPC(img, title_id, content_id, region) {
+		if (!img) return;
+
+		var psnUrl = classicGetPsnStoreApiUrl(title_id, content_id, region, true);
+		var psnFallbackUrl = classicGetPsnStoreFallbackApiUrl(title_id, content_id, region, true);
+
+		function trySony() {
+			classicLoadSonyCoverPC(img, title_id);
+		}
+
+		function tryStoreUrl(url, next) {
+			if (!url) {
+				next();
+				return;
+			}
+			img.onload = function() {
+				this.onload = null;
+				this.onerror = null;
+				classicMarkPsnStoreCoverEntry(this, url);
+				this.setAttribute('data-loaded', 'true');
+			};
+			img.onerror = function() {
+				this.onload = null;
+				this.onerror = null;
+				next();
+			};
+			img.src = url;
+		}
+
+		tryStoreUrl(psnUrl, function() {
+			if (psnFallbackUrl && psnFallbackUrl !== psnUrl) {
+				tryStoreUrl(psnFallbackUrl, trySony);
+			} else {
+				trySony();
+			}
+		});
+	}
+
+	function classicLoadGithubCoverPC(img, title_id, content_id, region, skipStoreAndSony) {
+		if (!img || !title_id) return;
+
+		if (classicCoverIndexSkipsGithub(title_id)) {
+			if (skipStoreAndSony) finishCoverFallback(img);
+			else classicLoadPsnStoreThenSonyPC(img, title_id, content_id, region);
+			return;
+		}
+
+		var primaryUrl = "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/database/covers/uncompressed/" + title_id + ".JPG";
+		img.onload = function() {
+			this.onload = null;
+			this.onerror = null;
+			this.setAttribute('data-loaded', 'true');
+		};
+		img.onerror = function() {
+			this.onload = null;
+			this.onerror = null;
+			if (skipStoreAndSony) finishCoverFallback(this);
+			else classicLoadPsnStoreThenSonyPC(this, title_id, content_id, region);
+		};
+		img.src = primaryUrl;
 	}
 
 	function loadPCImage(img) {
 		var title_id = img.getAttribute('data-title_id');
 		var cat_h = img.getAttribute('data-category') || currentCategory;
 		var content_id_h = img.getAttribute('data-content_id') || "";
+		var region_h = img.getAttribute('data-region') || "";
 
 		img.removeAttribute('data-loaded');
 		img.removeAttribute('data-loading');
 		img.removeAttribute('data-failed');
 		img.removeAttribute('data-bing-tried');
-		img.style.opacity = "0"; 
+		img.removeAttribute('data-psn-store-tried');
+		img.removeAttribute('data-psn-store-fallback-tried');
+		img.removeAttribute('data-psn-store-loaded');
+		img.removeAttribute('data-sony-icon-tried');
+		img.style.opacity = "0";
 
 		if (isLocalContentCoverCategory(cat_h)) {
 			img.onload = function() {
@@ -2756,86 +2809,45 @@
 		}
 
 		if (classicIsPsnStoreContentCategory(cat_h)) {
-			var psnUrl = classicGetPsnStoreApiUrl(title_id, content_id_h, img.getAttribute("data-region") || "", true);
-			var psnFallbackUrl = classicGetPsnStoreFallbackApiUrl(title_id, content_id_h, img.getAttribute("data-region") || "", true);
-			if (psnUrl && img.getAttribute("data-psn-store-tried") !== "true") {
-				img.setAttribute("data-psn-store-tried", "true");
+			var psnUrl = classicGetPsnStoreApiUrl(title_id, content_id_h, region_h, true);
+			var psnFallbackUrl = classicGetPsnStoreFallbackApiUrl(title_id, content_id_h, region_h, true);
+			if (psnUrl) {
+				img.setAttribute('data-psn-store-tried', 'true');
 				img.onload = function() {
 					this.onload = null;
 					this.onerror = null;
-					classicMarkPsnStoreCoverEntry(this, this.src || psnUrl);
+					classicMarkPsnStoreCoverEntry(this, psnUrl);
 					this.setAttribute('data-loaded', 'true');
 				};
 				img.onerror = function() {
 					this.onload = null;
 					this.onerror = null;
-					if (psnFallbackUrl && psnFallbackUrl !== psnUrl && this.getAttribute("data-psn-store-fallback-tried") !== "true") {
-						this.setAttribute("data-psn-store-fallback-tried", "true");
+					if (psnFallbackUrl && psnFallbackUrl !== psnUrl) {
+						this.setAttribute('data-psn-store-fallback-tried', 'true');
 						this.onload = function() {
 							this.onload = null;
 							this.onerror = null;
-							classicMarkPsnStoreCoverEntry(this, this.src || psnFallbackUrl);
+							classicMarkPsnStoreCoverEntry(this, psnFallbackUrl);
 							this.setAttribute('data-loaded', 'true');
 						};
 						this.onerror = function() {
 							this.onload = null;
 							this.onerror = null;
-							classicLoadGithubCoverPC(this, title_id);
+							classicLoadGithubCoverPC(this, title_id, content_id_h, region_h, true);
 						};
 						this.src = psnFallbackUrl;
 						return;
 					}
-					classicLoadGithubCoverPC(this, title_id);
+					classicLoadGithubCoverPC(this, title_id, content_id_h, region_h, true);
 				};
 				img.src = psnUrl;
 				return;
 			}
-		}
-
-		if (g_noCoverIndexLoaded && g_noCoverMap[title_id]) {
-			finishCoverFallback(img);
+			classicLoadGithubCoverPC(img, title_id, content_id_h, region_h, true);
 			return;
 		}
 
-		var hash_val = generateSonyHash(title_id) || "MISSING";
-		var primaryUrl = "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/database/covers/uncompressed/" + title_id + ".JPG";
-		var hashUrl = "https://raw.githubusercontent.com/PS3-Pro/Recently-Played-Games/master/np/" + hash_val + "/ICON0.PNG";
-
-		var targetUrl = primaryUrl;
-		var knownHash = false;
-
-		if (g_coverIndexLoaded && !g_coverMap[title_id]) {
-			targetUrl = hashUrl;
-			knownHash = true;
-		}
-
-		img.onload = function() {
-			this.onload = null;
-			this.onerror = null;
-			this.setAttribute('data-loaded', 'true');
-		};
-
-		img.onerror = function() {
-			this.onerror = null;
-			if (!knownHash && this.src.indexOf('.JPG') !== -1) {
-				this.onerror = function() {
-					this.onerror = null;
-					this.onload = null;
-					finishCoverFallback(this);
-				};
-				this.onload = function() {
-					this.onload = null;
-					this.onerror = null;
-					this.setAttribute('data-loaded', 'true');
-				};
-				this.src = hashUrl;
-			} else {
-				this.onload = null;
-				finishCoverFallback(this);
-			}
-		};
-
-		img.src = targetUrl;
+		classicLoadGithubCoverPC(img, title_id, content_id_h, region_h, false);
 	}
 
 	function startQueueWorkers() {
@@ -2855,71 +2867,90 @@
 		}
 	}
 
-	function classicLoadGithubCoverPS3(img, tid, batchID, markCoverDone, continueQueue) {
-		if (g_noCoverIndexLoaded && g_noCoverMap[tid]) {
+	function classicLoadSonyCoverPS3(img, tid, batchID, markCoverDone, continueQueue) {
+		var hash = generateSonyHash(tid);
+		if (!hash) {
 			finishCoverFallback(img, function(doneImg) {
-				if (markCoverDone(doneImg)) {
-					setTimeout(function() {
-						if (batchID === g_renderID) processMasterQueue(batchID);
-					}, 0);
-				}
+				if (markCoverDone(doneImg)) continueQueue();
 			}, batchID);
 			return;
 		}
 
-		var hash = generateSonyHash(tid) || "MISSING";
-		var urlJPG = "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/database/covers/uncompressed/" + tid + ".JPG";
 		var urlPNG = "https://raw.githubusercontent.com/PS3-Pro/Recently-Played-Games/master/np/" + hash + "/ICON0.PNG";
+		img.setAttribute('data-sony-icon-tried', 'true');
+		preloadPS3CoverBeforeSwap(img, urlPNG, function(doneImg) {
+			if (markCoverDone(doneImg)) continueQueue();
+		}, function(failedImg) {
+			if (!classicIsLiveCoverElement(failedImg, batchID)) return;
+			finishCoverFallback(failedImg, function(doneImg) {
+				if (markCoverDone(doneImg)) continueQueue();
+			}, batchID);
+		}, batchID);
+	}
 
-		var targetUrl = urlJPG;
-		var isHashMode = false;
+	function classicLoadPsnStoreThenSonyPS3(img, tid, content_id, region, batchID, markCoverDone, continueQueue) {
+		var psnUrl = classicGetPsnStoreApiUrl(tid, content_id, region, true);
+		var psnFallbackUrl = classicGetPsnStoreFallbackApiUrl(tid, content_id, region, true);
 
-		if (g_coverIndexLoaded && !g_coverMap[tid]) {
-			targetUrl = urlPNG;
-			isHashMode = true;
+		function trySony(failedImg) {
+			classicLoadSonyCoverPS3(failedImg, tid, batchID, markCoverDone, continueQueue);
 		}
 
-		if (isPS3 && isHashMode) {
-			preloadPS3CoverBeforeSwap(img, targetUrl, function(doneImg) {
-				if (markCoverDone(doneImg)) continueQueue();
-			}, function(failedImg) {
-				if (!classicIsLiveCoverElement(failedImg, batchID)) return;
+		function tryFallbackStore(failedImg) {
+			if (!classicIsLiveCoverElement(failedImg, batchID)) return;
+			if (psnFallbackUrl && psnFallbackUrl !== psnUrl) {
+				failedImg.setAttribute('data-psn-store-fallback-tried', 'true');
+				preloadPS3CoverBeforeSwap(failedImg, psnFallbackUrl, function(doneImg) {
+					classicMarkPsnStoreCoverEntry(doneImg, psnFallbackUrl);
+					if (markCoverDone(doneImg)) continueQueue();
+				}, function(fallbackFailedImg) {
+					if (!classicIsLiveCoverElement(fallbackFailedImg, batchID)) return;
+					trySony(fallbackFailedImg);
+				}, batchID);
+				return;
+			}
+			trySony(failedImg);
+		}
+
+		if (!psnUrl) {
+			trySony(img);
+			return;
+		}
+
+		img.setAttribute('data-psn-store-tried', 'true');
+		preloadPS3CoverBeforeSwap(img, psnUrl, function(doneImg) {
+			classicMarkPsnStoreCoverEntry(doneImg, psnUrl);
+			if (markCoverDone(doneImg)) continueQueue();
+		}, function(failedImg) {
+			tryFallbackStore(failedImg);
+		}, batchID);
+	}
+
+	function classicLoadGithubCoverPS3(img, tid, content_id, region, batchID, markCoverDone, continueQueue, skipStoreAndSony) {
+		if (classicCoverIndexSkipsGithub(tid)) {
+			if (skipStoreAndSony) {
+				finishCoverFallback(img, function(doneImg) {
+					if (markCoverDone(doneImg)) continueQueue();
+				}, batchID);
+			} else {
+				classicLoadPsnStoreThenSonyPS3(img, tid, content_id, region, batchID, markCoverDone, continueQueue);
+			}
+			return;
+		}
+
+		var urlJPG = "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/database/covers/uncompressed/" + tid + ".JPG";
+		preloadPS3CoverBeforeSwap(img, urlJPG, function(doneImg) {
+			if (markCoverDone(doneImg)) continueQueue();
+		}, function(failedImg) {
+			if (!classicIsLiveCoverElement(failedImg, batchID)) return;
+			if (skipStoreAndSony) {
 				finishCoverFallback(failedImg, function(doneImg) {
 					if (markCoverDone(doneImg)) continueQueue();
 				}, batchID);
-			}, batchID);
-			return;
-		}
-
-		img.onload = function() {
-			this.onload = this.onerror = null;
-			if (markCoverDone(this)) continueQueue();
-		};
-
-		img.onerror = function() {
-			this.onload = this.onerror = null;
-			if (!classicIsLiveCoverElement(this, batchID)) return;
-
-			if (!isHashMode && this.src.indexOf('.JPG') !== -1) {
-				isHashMode = true;
-				var failedVisibleImg = this;
-				failedVisibleImg.src = defaultCover;
-				preloadPS3CoverBeforeSwap(failedVisibleImg, urlPNG, function(doneImg) {
-					if (markCoverDone(doneImg)) continueQueue();
-				}, function(failedImg) {
-					if (!classicIsLiveCoverElement(failedImg, batchID)) return;
-					finishCoverFallback(failedImg, function(doneImg) {
-						if (markCoverDone(doneImg)) continueQueue();
-					}, batchID);
-				}, batchID);
 			} else {
-				finishCoverFallback(this, function(doneImg) {
-					if (markCoverDone(doneImg)) continueQueue();
-				}, batchID);
+				classicLoadPsnStoreThenSonyPS3(failedImg, tid, content_id, region, batchID, markCoverDone, continueQueue);
 			}
-		};
-
-		img.src = targetUrl;
+		}, batchID);
 	}
 
 	function processMasterQueue(batchID) {
@@ -2974,6 +3005,10 @@
 		img.setAttribute('data-loading', 'true');
 		img.removeAttribute('data-failed');
 		img.removeAttribute('data-bing-tried');
+		img.removeAttribute('data-psn-store-tried');
+		img.removeAttribute('data-psn-store-fallback-tried');
+		img.removeAttribute('data-psn-store-loaded');
+		img.removeAttribute('data-sony-icon-tried');
 
 		if (img.src.indexOf('data:image') !== -1) img.src = def;
 
@@ -3024,17 +3059,17 @@
 							if (markCoverDone(doneFallbackImg)) continueQueue();
 						}, function(fallbackFailedImg) {
 							if (!classicIsLiveCoverElement(fallbackFailedImg, batchID)) return;
-							classicLoadGithubCoverPS3(fallbackFailedImg, tid, batchID, markCoverDone, continueQueue);
+							classicLoadGithubCoverPS3(fallbackFailedImg, tid, content_id_h, img.getAttribute("data-region") || "", batchID, markCoverDone, continueQueue, true);
 						}, batchID);
 						return;
 					}
-					classicLoadGithubCoverPS3(failedImg, tid, batchID, markCoverDone, continueQueue);
+					classicLoadGithubCoverPS3(failedImg, tid, content_id_h, img.getAttribute("data-region") || "", batchID, markCoverDone, continueQueue, true);
 				}, batchID);
 				return;
 			}
 		}
 
-		classicLoadGithubCoverPS3(img, tid, batchID, markCoverDone, continueQueue);
+		classicLoadGithubCoverPS3(img, tid, content_id_h, img.getAttribute("data-region") || "", batchID, markCoverDone, continueQueue, false);
 	}
 
 	function startSilentPreloader() {
@@ -3884,7 +3919,7 @@ function classicIsGameToRelatedLoop(titleId, category) {
 	var g_themeExists = {}, g_themeIndexLoaded = false;
 	var g_updateExists = {}, g_updateIndexLoaded = false;
 	var g_noCoverMap = {}, g_noCoverIndexLoaded = false;
-	var g_coverMap = {}, g_coverIndexLoaded = false;
+	var g_coverMap = {}, g_coverIndexLoaded = false, g_coverIndexUsable = false;
 
 	var URL_DB_NOCOVER = "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/database/covers/blacklist.tsv";
 	var URL_DB_COVERS = "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/database/covers/index.tsv";
@@ -4174,26 +4209,31 @@ function restorePreviousState() {
 		var xhr_h = new XMLHttpRequest();
 		xhr_h.onreadystatechange = function() {
 			if (xhr_h.readyState == 4) {
+				var validCount_h = 0;
 				if (xhr_h.status == 200 || xhr_h.status == 0) {
-					var text_h = xhr_h.responseText; 
+					var text_h = xhr_h.responseText;
 					if (text_h) {
 						var map_h = g_coverMap;
 						var pos_h = 0;
 						var len_h = text_h.length;
 						while (pos_h < len_h) {
 							var id_h = text_h.substr(pos_h, 9);
-							if (id_h.length === 9) map_h[id_h] = true;
-							
+							if (id_h.length === 9) {
+								map_h[id_h] = true;
+								validCount_h++;
+							}
 							pos_h = text_h.indexOf('\n', pos_h);
 							if (pos_h === -1) break;
 							pos_h++;
 						}
 					}
 				}
+				g_coverIndexUsable = validCount_h > 0;
 				g_coverIndexLoaded = true;
 			}
 		};
-		xhr_h.open('GET', URL_DB_COVERS, true); xhr_h.send();
+		xhr_h.open('GET', URL_DB_COVERS, true);
+		xhr_h.send();
 	}
 
 	loadNoCoverIndexBackground();
@@ -8777,42 +8817,116 @@ function restorePreviousState() {
             modalBingGhost_h.src = modalBingUrl_h;
         };
 
-        var modalGithubFallback_h = function() {
-            var ghost_h = new Image();
-            ghost_h.onload = function() {
-                ghost_h.onload = null;
-                ghost_h.onerror = null;
-                replaceCoverWithLoadedImage(modal_img_el, ghost_h, this.src);
-            };
-            ghost_h.onerror = function() {
-                ghost_h.onload = null;
-                ghost_h.onerror = null;
-                if (this.src.indexOf('.JPG') !== -1 && typeof generateSonyHash === 'function') {
-                    var hash_h = generateSonyHash(id_h);
-                    var fallback_h = new Image();
-                    fallback_h.onload = function() {
-                        fallback_h.onload = null;
-                        fallback_h.onerror = null;
-                        replaceCoverWithLoadedImage(modal_img_el, fallback_h, this.src);
-                    };
-                    fallback_h.onerror = modalBingFallback_h;
-                    fallback_h.src = "https://raw.githubusercontent.com/PS3-Pro/Recently-Played-Games/master/np/" + hash_h + "/ICON0.PNG";
-                } else {
-                    modalBingFallback_h();
-                }
-            };
-
-            var targetUrl_h = "";
-            if (g_noCoverIndexLoaded && g_noCoverMap[id_h]) {
-                targetUrl_h = buildBingCoverUrl(displayName_h, row_h.cTag || 'ps3');
-            } else if (g_coverIndexLoaded && !g_coverMap[id_h]) {
-                var hash_val_h = generateSonyHash(id_h);
-                targetUrl_h = "https://raw.githubusercontent.com/PS3-Pro/Recently-Played-Games/master/np/" + hash_val_h + "/ICON0.PNG";
-            } else {
-                var folder_h = (is_ps3_h && !high_res_h) ? "compressed" : "uncompressed";
-                targetUrl_h = "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/database/covers/" + folder_h + "/" + id_h + ".JPG";
+        var modalSonyFallback_h = function() {
+            var hash_h = generateSonyHash(id_h);
+            if (!hash_h) {
+                modalBingFallback_h();
+                return;
             }
-            ghost_h.src = targetUrl_h;
+            var sonyUrl_h = "https://raw.githubusercontent.com/PS3-Pro/Recently-Played-Games/master/np/" + hash_h + "/ICON0.PNG";
+            var sonyGhost_h = new Image();
+            sonyGhost_h.onload = function() {
+                sonyGhost_h.onload = null;
+                sonyGhost_h.onerror = null;
+                replaceCoverWithLoadedImage(modal_img_el, sonyGhost_h, sonyUrl_h);
+            };
+            sonyGhost_h.onerror = function() {
+                sonyGhost_h.onload = null;
+                sonyGhost_h.onerror = null;
+                modalBingFallback_h();
+            };
+            sonyGhost_h.src = sonyUrl_h;
+        };
+
+        var modalPsnThenSony_h = function() {
+            var modalPsnUrl_h = classicGetPsnStoreApiUrl(id_h, contentId_h, region_h, true);
+            var modalPsnFallbackUrl_h = classicGetPsnStoreFallbackApiUrl(id_h, contentId_h, region_h, true);
+
+            function trySony_h() {
+                modalSonyFallback_h();
+            }
+
+            function tryFallbackStore_h() {
+                if (modalPsnFallbackUrl_h && modalPsnFallbackUrl_h !== modalPsnUrl_h) {
+                    var fallbackStoreGhost_h = new Image();
+                    fallbackStoreGhost_h.onload = function() {
+                        fallbackStoreGhost_h.onload = null;
+                        fallbackStoreGhost_h.onerror = null;
+                        classicMarkPsnStoreCoverEntry(modal_img_el, modalPsnFallbackUrl_h);
+                        replaceCoverWithLoadedImage(modal_img_el, fallbackStoreGhost_h, modalPsnFallbackUrl_h);
+                    };
+                    fallbackStoreGhost_h.onerror = function() {
+                        fallbackStoreGhost_h.onload = null;
+                        fallbackStoreGhost_h.onerror = null;
+                        trySony_h();
+                    };
+                    fallbackStoreGhost_h.src = modalPsnFallbackUrl_h;
+                    return;
+                }
+                trySony_h();
+            }
+
+            if (!modalPsnUrl_h) {
+                trySony_h();
+                return;
+            }
+
+            var storeGhost_h = new Image();
+            storeGhost_h.onload = function() {
+                storeGhost_h.onload = null;
+                storeGhost_h.onerror = null;
+                classicMarkPsnStoreCoverEntry(modal_img_el, modalPsnUrl_h);
+                replaceCoverWithLoadedImage(modal_img_el, storeGhost_h, modalPsnUrl_h);
+            };
+            storeGhost_h.onerror = function() {
+                storeGhost_h.onload = null;
+                storeGhost_h.onerror = null;
+                tryFallbackStore_h();
+            };
+            storeGhost_h.src = modalPsnUrl_h;
+        };
+
+        var modalGithubThenStore_h = function() {
+            if (classicCoverIndexSkipsGithub(id_h)) {
+                modalPsnThenSony_h();
+                return;
+            }
+
+            var folder_h = (is_ps3_h && !high_res_h) ? "compressed" : "uncompressed";
+            var githubUrl_h = "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/database/covers/" + folder_h + "/" + id_h + ".JPG";
+            var githubGhost_h = new Image();
+            githubGhost_h.onload = function() {
+                githubGhost_h.onload = null;
+                githubGhost_h.onerror = null;
+                replaceCoverWithLoadedImage(modal_img_el, githubGhost_h, githubUrl_h);
+            };
+            githubGhost_h.onerror = function() {
+                githubGhost_h.onload = null;
+                githubGhost_h.onerror = null;
+                modalPsnThenSony_h();
+            };
+            githubGhost_h.src = githubUrl_h;
+        };
+
+        var modalGithubOnlyThenBing_h = function() {
+            if (classicCoverIndexSkipsGithub(id_h)) {
+                modalBingFallback_h();
+                return;
+            }
+            var folder_h = (is_ps3_h && !high_res_h) ? "compressed" : "uncompressed";
+            var githubUrl_h = "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/database/covers/" + folder_h + "/" + id_h + ".JPG";
+            var githubGhost_h = new Image();
+            githubGhost_h.onload = function() {
+                githubGhost_h.onload = null;
+                githubGhost_h.onerror = null;
+                replaceCoverWithLoadedImage(modal_img_el, githubGhost_h, githubUrl_h);
+            };
+            githubGhost_h.onerror = function() {
+                githubGhost_h.onload = null;
+                githubGhost_h.onerror = null;
+                modalBingFallback_h();
+            };
+            githubGhost_h.src = githubUrl_h;
         };
 
         if (classicIsPsnStoreContentCategory(cat_h)) {
@@ -8840,19 +8954,21 @@ function restorePreviousState() {
                         modalPsnFallbackGhost_h.onerror = function() {
                             modalPsnFallbackGhost_h.onload = null;
                             modalPsnFallbackGhost_h.onerror = null;
-                            modalGithubFallback_h();
+                            modalGithubOnlyThenBing_h();
                         };
                         modalPsnFallbackGhost_h.src = modalPsnFallbackUrl_h;
                         return;
                     }
-                    modalGithubFallback_h();
+                    modalGithubOnlyThenBing_h();
                 };
                 modalPsnGhost_h.src = modalPsnUrl_h;
                 return;
             }
+            modalGithubOnlyThenBing_h();
+            return;
         }
 
-        modalGithubFallback_h();
+        modalGithubThenStore_h();
     }
 	</script>
 	<script>
