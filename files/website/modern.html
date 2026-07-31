@@ -10876,7 +10876,13 @@ P
 	}
 
 	function buildExploreCardHTML(game, cat, idx, animateCards) {
-		const imgUrl = getItemCover(game, cat);
+		const coverKey = typeof window.getStoreCardCoverKey === 'function'
+			? window.getStoreCardCoverKey(cat, game.id || game.titleId, game.contentId)
+			: '';
+		const cachedCoverUrl = coverKey && typeof window.getCachedCardCoverSrc === 'function'
+			? window.getCachedCardCoverSrc(coverKey)
+			: '';
+		const imgUrl = cachedCoverUrl || getItemCover(game, cat);
 		const githubCoverUrl = getGithubItemCover(game, cat);
 		const consoleClasses = ['ps3', 'ps2', 'psx', 'psp', 'minis', 'pce', 'neogeo'];
 		const tagClass = consoleClasses.includes(game.cTag) ? `tag-${game.cTag}` : 'tag-default';
@@ -10889,15 +10895,16 @@ P
 		const safeCat = escapeExploreJsValue(cat);
 		const safeId = escapeExploreJsValue(game.id || '');
 		const safeContentId = escapeExploreJsValue(game.contentId || '');
+		const safeCoverKeyAttr = escapeExploreHtmlAttr(coverKey);
 		const dateHtml = game.date ? `<div class="date-tag"><i class="far fa-clock"></i> ${safeDate}</div>` : '';
 
 		return `
-			<div class="game-card ${animateCards ? 'anim-reveal' : 'no-anim'}" data-explore-index="${idx}" style="--tile-idx: ${idx};" onclick="playUiClick(); switchAndSearch('${safeCat}', '${safeId}', true, '${safeContentId}')" onmouseenter="const __hoverTarget = document.elementFromPoint(event.clientX, event.clientY); if(!__hoverTarget || !__hoverTarget.closest('.btn-mini,.btn-mini-round,.fav-btn,.wish-btn,.action-btn,button,a')) playUiHover(); this.classList.remove('anim-reveal'); this.classList.add('no-anim');">
+			<div class="game-card ${animateCards ? 'anim-reveal' : 'no-anim'}" data-explore-index="${idx}" style="--tile-idx: ${idx};" onclick="playUiClick(); switchAndSearch('${safeCat}', '${safeId}', true, '${safeContentId}', this)" onmouseenter="const __hoverTarget = document.elementFromPoint(event.clientX, event.clientY); if(!__hoverTarget || !__hoverTarget.closest('.btn-mini,.btn-mini-round,.fav-btn,.wish-btn,.action-btn,button,a')) playUiHover(); this.classList.remove('anim-reveal'); this.classList.add('no-anim');">
 				<div class="game-img-container">
 					<div class="console-tag ${tagClass}">${consoleName}</div>
 					<div class="region-tag">${safeRegion}</div>
 					${dateHtml}
-					<img src="${imgUrl}" alt="Cover" class="game-img" loading="eager" decoding="async" data-name="${safeNameAttr}" data-console="${escapeExploreHtmlAttr(game.cTag)}" data-github-cover="${escapeExploreHtmlAttr(githubCoverUrl)}" data-title-id="${escapeExploreHtmlAttr(game.id || '')}" data-content-id="${escapeExploreHtmlAttr(game.contentId || '')}" data-region="${safeRegion}" onload="markCoverLoaded(this)" onerror="handleCoverError(this, '${safeCat}')">
+					<img src="${imgUrl}" alt="Cover" class="game-img" loading="eager" decoding="async" data-cover-key="${safeCoverKeyAttr}" data-cover-category="${escapeExploreHtmlAttr(cat)}" data-name="${safeNameAttr}" data-console="${escapeExploreHtmlAttr(game.cTag)}" data-github-cover="${escapeExploreHtmlAttr(githubCoverUrl)}" data-title-id="${escapeExploreHtmlAttr(game.id || '')}" data-content-id="${escapeExploreHtmlAttr(game.contentId || '')}" data-region="${safeRegion}" onload="markCoverLoaded(this)" onerror="handleCoverError(this, '${safeCat}')">
 				</div>
 				<div class="game-info" style="padding: 10px; min-height: 0;">
 					<div style="display: flex; flex-direction: column; justify-content: space-between; height: 100%;">
@@ -13322,7 +13329,18 @@ P
 
         return Array.from(groups.values()).map(group => {
             const sortedItems = group.items.slice().sort(compareBrowseRegionItems);
-            const representativeItem = sortedItems[0] || null;
+            const pendingFocus = window.__pendingStoreFocus || null;
+            const focusedRepresentative = pendingFocus && pendingFocus.contentId
+                ? sortedItems.find(item => {
+                    const focusedGame = item && item.game ? item.game : {};
+                    const gameContentId = String(focusedGame.contentId || '').toUpperCase();
+                    const gameTitleId = String(focusedGame.id || focusedGame.titleId || '').toUpperCase();
+                    const focusContentId = String(pendingFocus.contentId || '').toUpperCase();
+                    const focusTitleId = String(pendingFocus.titleId || '').toUpperCase();
+                    return gameContentId === focusContentId && (!focusTitleId || gameTitleId === focusTitleId);
+                })
+                : null;
+            const representativeItem = focusedRepresentative || sortedItems[0] || null;
             const displayTitle = chooseBrowseGroupDisplayTitle(sortedItems);
 
             group.items = sortedItems;
@@ -14734,10 +14752,13 @@ P
 		window.__browseCanFilterMissingRap = false;
     };
 
-	window.switchAndSearch = function(category, titleId, fromWhere = false, focusContentId = '') {
+	window.switchAndSearch = function(category, titleId, fromWhere = false, focusContentId = '', originCard = null) {
 		window.g_animCutoffFound = false;
 
 		const cleanFocusContentId = (focusContentId && focusContentId !== 'undefined' && focusContentId !== 'null') ? String(focusContentId).trim() : '';
+		if (originCard && typeof window.captureStoreNavigationCover === 'function') {
+			window.captureStoreNavigationCover(originCard, category, titleId, cleanFocusContentId);
+		}
 		if (cleanFocusContentId) {
 			window.__pendingStoreFocus = {
 				category: String(category || ''),
@@ -15865,12 +15886,19 @@ P
 
 	window.__cardCoverSrcCache = window.__cardCoverSrcCache || {};
 
+	window.getStoreCardCoverKey = function(category, titleId, contentId) {
+		const cleanCategory = String(category || '').trim().toLowerCase();
+		const cleanTitleId = String(titleId || '').trim().toUpperCase();
+		const cleanContentId = String(contentId || '').trim().toUpperCase();
+		if (!cleanCategory || (!cleanTitleId && !cleanContentId)) return '';
+		return `store|${cleanCategory}|${cleanTitleId}|${cleanContentId}`;
+	};
+
 	function normalizeCoverSrcForCache(src) {
 		src = String(src || '').trim();
 		if (!src) return '';
 		if (/^data:image\/png;base64,(?:BING|COVER_INDEX_MISS)$/i.test(src)) return '';
-		if (/Recently-Played-Games\/master\/np\/[^/]+\/ICON0\.PNG/i.test(src)) return '';
-		if (/tse\d*\.mm\.bing\.net/i.test(src)) return '';
+		if (/NOCOVER00\.JPG(?:$|[?#])/i.test(src)) return '';
 		return src;
 	}
 
@@ -15885,6 +15913,21 @@ P
 		key = String(key || '').trim();
 		if (!key || !window.__cardCoverSrcCache) return '';
 		return normalizeCoverSrcForCache(window.__cardCoverSrcCache[key]);
+	};
+
+	window.captureStoreNavigationCover = function(originCard, category, titleId, contentId) {
+		const card = originCard && originCard.closest ? (originCard.closest('.game-card') || originCard) : originCard;
+		const img = card && card.querySelector ? card.querySelector('.game-img') : null;
+		if (!img || !img.complete || !img.naturalWidth) return '';
+
+		const resolvedTitleId = titleId || img.getAttribute('data-title-id') || card?.getAttribute?.('data-title-id') || '';
+		const resolvedContentId = contentId || img.getAttribute('data-content-id') || card?.getAttribute?.('data-content-id') || '';
+		const key = window.getStoreCardCoverKey(category, resolvedTitleId, resolvedContentId);
+		const src = normalizeCoverSrcForCache(img.currentSrc || img.src);
+		if (!key || !src) return '';
+
+		window.rememberCardCoverSrc(key, src);
+		return src;
 	};
 
 	window.markCoverLoaded = function(imgElement) {
@@ -17225,8 +17268,15 @@ P
 			const renderItem = renderItems[i];
 			const game = renderItem.game;
 			const sourceIndex = typeof renderItem.sourceIndex === 'number' ? renderItem.sourceIndex : i;
-			const imgUrl = getItemCover(game, currentCat);
+			const coverKey = typeof window.getStoreCardCoverKey === 'function'
+				? window.getStoreCardCoverKey(currentCat, game.id || game.titleId, game.contentId)
+				: '';
+			const cachedCoverUrl = coverKey && typeof window.getCachedCardCoverSrc === 'function'
+				? window.getCachedCardCoverSrc(coverKey)
+				: '';
+			const imgUrl = cachedCoverUrl || getItemCover(game, currentCat);
 			const githubCoverUrl = getGithubItemCover(game, currentCat);
+			const coverKeyAttr = String(coverKey || '').replace(/[&<>"]/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[ch]);
 			
 			if (renderItem.isGroup) {
 				const groupItems = Array.isArray(renderItem.items) ? renderItem.items : [];
@@ -17248,7 +17298,7 @@ P
 				<div class="game-img-container">
 					<div class="console-tag ${tagClass}">${consoleName}</div>
 					<div class="region-tag">${regionLabel}</div>
-					<img src="${imgUrl}" alt="Cover" class="game-img" loading="lazy" data-name="${game.cleanName.replace(/"/g, '&quot;')}" data-console="${game.cTag}" data-github-cover="${githubCoverUrl.replace(/"/g, '&quot;')}" data-title-id="${game.id || ''}" data-content-id="${game.contentId || ''}" data-region="${game.region || ''}" onload="markCoverLoaded(this)" onerror="handleCoverError(this, '${currentCat}')">
+					<img src="${imgUrl}" alt="Cover" class="game-img" loading="lazy" data-cover-key="${coverKeyAttr}" data-cover-category="${currentCat}" data-name="${game.cleanName.replace(/"/g, '&quot;')}" data-console="${game.cTag}" data-github-cover="${githubCoverUrl.replace(/"/g, '&quot;')}" data-title-id="${game.id || ''}" data-content-id="${game.contentId || ''}" data-region="${game.region || ''}" onload="markCoverLoaded(this)" onerror="handleCoverError(this, '${currentCat}')">
 				</div>
 				<div class="game-info" style="padding: 10px; min-height: 0;">
 					<div style="display: flex; flex-direction: column; justify-content: space-between; height: 100%;">
@@ -17323,14 +17373,14 @@ P
 			let versionTagHtml = displayVersion ? ` <span style="color:#FF1493; font-size:11px; vertical-align: middle;">[v${displayVersion}]</span>` : "";
 		
 			htmlChunks.push(`
-			<div class="game-card ${animClass} ${wishlistClass}" data-title-id="${game.id || ''}" data-content-id="${game.contentId || ''}" data-store-category="${currentCat}" ${animStyle} onclick="openModal(${sourceIndex})" onmouseenter="const __hoverTarget = document.elementFromPoint(event.clientX, event.clientY); if(!__hoverTarget || !__hoverTarget.closest('.btn-mini,.btn-mini-round,.fav-btn,.wish-btn,.action-btn,button,a')) playUiHover(); this.classList.remove('anim-reveal'); this.classList.add('no-anim');">
+			<div class="game-card ${animClass} ${wishlistClass}" data-title-id="${game.id || ''}" data-content-id="${game.contentId || ''}" data-store-category="${currentCat}" ${animStyle} onclick="openModal(${sourceIndex}, '', false, this)" onmouseenter="const __hoverTarget = document.elementFromPoint(event.clientX, event.clientY); if(!__hoverTarget || !__hoverTarget.closest('.btn-mini,.btn-mini-round,.fav-btn,.wish-btn,.action-btn,button,a')) playUiHover(); this.classList.remove('anim-reveal'); this.classList.add('no-anim');">
 				<div class="game-img-container">
 					<div class="console-tag ${tagClass}">${consoleName}</div>
 					<div class="region-tag">${game.region}</div>
 					<div class="wish-btn" title="Add to Wishlist" onclick="toggleWishlist(event, '${game.id}')">
 						<i class="${heartIcon}" style="color: ${heartColor}; font-size: 14px;"></i>
 					</div>
-					<img src="${imgUrl}" alt="Cover" class="game-img" loading="lazy" data-name="${game.cleanName.replace(/"/g, '&quot;')}" data-console="${game.cTag}" data-github-cover="${githubCoverUrl.replace(/"/g, '&quot;')}" data-title-id="${game.id || ''}" data-content-id="${game.contentId || ''}" data-region="${game.region || ''}" onload="markCoverLoaded(this)" onerror="handleCoverError(this, '${currentCat}')">
+					<img src="${imgUrl}" alt="Cover" class="game-img" loading="lazy" data-cover-key="${coverKeyAttr}" data-cover-category="${currentCat}" data-name="${game.cleanName.replace(/"/g, '&quot;')}" data-console="${game.cTag}" data-github-cover="${githubCoverUrl.replace(/"/g, '&quot;')}" data-title-id="${game.id || ''}" data-content-id="${game.contentId || ''}" data-region="${game.region || ''}" onload="markCoverLoaded(this)" onerror="handleCoverError(this, '${currentCat}')">
 					<div class="content-download-card-count" data-download-category="${currentCat}" data-download-title-id="${game.id || ''}" data-download-content-id="${game.contentId || ''}" data-download-name="${game.cleanName.replace(/"/g, '&quot;')}" hidden><i class="fas fa-download"></i><span></span></div>
 					<div class="card-details-hint" aria-hidden="true"><i class="fas fa-circle-info"></i><span>Details</span></div>
 				</div>
@@ -18231,7 +18281,7 @@ P
 		});
 	}
 
-    window.openModal = function(index, forcedPsnStoreSummary = '', forceCompactDlc = false) {
+    window.openModal = function(index, forcedPsnStoreSummary = '', forceCompactDlc = false, originCard = null) {
 		if (typeof playUiModal === 'function') playUiModal();
 	
 		const game = filteredData[index];
@@ -18289,8 +18339,18 @@ P
 			modalHeader.innerHTML = `<i class="${iconClass}"></i><span>${headerText}</span><button type="button" id="modal-title-wish-btn" class="wish-btn modal-title-wish-btn" title="${modalWishTitle}" data-content-id="${modalSafeContentId}" data-store-category="${currentCat}" onmouseenter="playUiHover()" onclick="toggleWishlist(event, '${modalSafeGameId}')"><i class="${modalWishIcon}" style="color: ${modalWishColor}; font-size: 14px;"></i></button>`;
 		}
 		
-		const coverImg = getItemCover(game, currentCat);
+		const modalCoverKey = typeof window.getStoreCardCoverKey === 'function'
+			? window.getStoreCardCoverKey(currentCat, game.id || game.titleId, game.contentId)
+			: '';
+		const originCoverImg = originCard && typeof window.captureStoreNavigationCover === 'function'
+			? window.captureStoreNavigationCover(originCard, currentCat, game.id || game.titleId, game.contentId)
+			: '';
+		const cachedModalCoverImg = modalCoverKey && typeof window.getCachedCardCoverSrc === 'function'
+			? window.getCachedCardCoverSrc(modalCoverKey)
+			: '';
+		const coverImg = originCoverImg || cachedModalCoverImg || getItemCover(game, currentCat);
 		const githubCoverImg = getGithubItemCover(game, currentCat);
+		const modalCoverKeyAttr = modalSafeText(modalCoverKey);
 		const modalDisplayName = currentCat === 'videos' && browseExpandedGroupTitle
 			? getVideoGroupedVariantDisplayTitle(game)
 			: game.cleanName;
@@ -18355,7 +18415,7 @@ P
 				<div style="display: flex; flex-direction: row; gap: 25px;">					
 					<div class="modal-left-col" style="width: 180px; flex-shrink: 0; display: flex; flex-direction: column; gap: 15px;">
 						<div class="${trailerClass}" ${trailerAttrs} style="margin: 0; width: 180px; height: 270px;">
-							<img src="${coverImg}" alt="Cover" class="modal-img" data-name="${game.cleanName.replace(/"/g, '&quot;')}" data-console="${game.cTag}" data-title-id="${game.id || ''}" data-content-id="${game.contentId || ''}" data-region="${game.region || ''}" data-github-cover="${githubCoverImg.replace(/"/g, '&quot;')}" onload="markCoverLoaded(this)" onerror="handleCoverError(this, '${currentCat}')">
+							<img src="${coverImg}" alt="Cover" class="modal-img" data-cover-key="${modalCoverKeyAttr}" data-cover-category="${modalSafeText(currentCat)}" data-name="${game.cleanName.replace(/"/g, '&quot;')}" data-console="${game.cTag}" data-title-id="${game.id || ''}" data-content-id="${game.contentId || ''}" data-region="${game.region || ''}" data-github-cover="${githubCoverImg.replace(/"/g, '&quot;')}" onload="markCoverLoaded(this)" onerror="handleCoverError(this, '${currentCat}')">
 							${trailerOverlayHtml}
 						</div>
 						<div class="modal-info-card ${showModalTrophies ? 'has-trophies-row' : ''}" style="background: rgba(0,0,0,0.2); border-radius: 6px; border: 1px solid rgba(255,255,255,0.05); padding: 12px; display: flex; flex-direction: column; gap: 8px;">
@@ -18463,7 +18523,7 @@ P
 				<div style="display: flex; flex-direction: row; gap: 30px; align-items: stretch;">					
 					<div class="modal-left-col" style="width: 180px; flex-shrink: 0; display: flex; flex-direction: column;">
 						<div class="${trailerClass} compact-cover" ${trailerAttrs} style="margin: 0; width: 180px; height: 248px; min-height: 248px;">
-							<img src="${coverImg}" alt="Cover" class="modal-img" data-name="${game.cleanName.replace(/"/g, '&quot;')}" data-console="${game.cTag}" data-title-id="${game.id || ''}" data-content-id="${game.contentId || ''}" data-region="${game.region || ''}" data-github-cover="${githubCoverImg.replace(/"/g, '&quot;')}" onload="markCoverLoaded(this)" onerror="handleCoverError(this, '${currentCat}')">
+							<img src="${coverImg}" alt="Cover" class="modal-img" data-cover-key="${modalCoverKeyAttr}" data-cover-category="${modalSafeText(currentCat)}" data-name="${game.cleanName.replace(/"/g, '&quot;')}" data-console="${game.cTag}" data-title-id="${game.id || ''}" data-content-id="${game.contentId || ''}" data-region="${game.region || ''}" data-github-cover="${githubCoverImg.replace(/"/g, '&quot;')}" onload="markCoverLoaded(this)" onerror="handleCoverError(this, '${currentCat}')">
 							${trailerOverlayHtml}
 						</div>
 					</div>
