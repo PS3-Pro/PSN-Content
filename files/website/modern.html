@@ -345,6 +345,7 @@ select option { background-color: var(--bg-dark); }
 .letter-btn:hover { background: rgba(255,255,255,0.1); color: #fff; }
 .letter-btn.active { background: var(--ps-blue); border-color: var(--ps-blue); color: #fff; box-shadow: 0 0 10px var(--ps-neon); }
 .search-bar { display: none; background-color: rgba(18,24,36,0.7); border-radius: 20px; padding: 8px 15px; align-items: center; gap: 10px; width: 200px; border: 1px solid rgba(255,255,255,0.1); transition: all 0.3s ease; position: relative; z-index: 1; }
+.search-bar.browse-context-locked { display: none !important; }
 .search-bar:hover { border: 1px solid #ffffff !important; box-shadow: 0 0 10px rgba(255,255,255,0.2); }
 .search-bar::before { content: ""; position: absolute; top: -2px; left: -2px; right: -2px; bottom: -2px; border-radius: 22px; padding: 2px; background: conic-gradient(from var(--angle),#222 75%,#ffffff 100%); mask: linear-gradient(#fff 0 0) content-box,linear-gradient(#fff 0 0); mask-composite: exclude; -webkit-mask-composite: destination-out; z-index: -1; opacity: 0; transition: opacity 0.3s; }
 .search-bar:focus-within { background-color: rgba(5,8,15,0.98) !important; width: 200px; border-color: transparent !important; }
@@ -13130,6 +13131,78 @@ P
         browseExpandedGroupTitle = null;
     }
 
+    function isBrowseContextualNavigationActive() {
+        return !!(browseExpandedGroupTitle || (navHistory && navHistory.lockSearch === true));
+    }
+
+    function syncBrowseContextualSearchState(viewIdOverride = null) {
+        const searchInput = document.getElementById('search-input');
+        const searchBar = searchInput ? searchInput.closest('.search-bar') : null;
+        if (!searchBar) return false;
+
+        const browseView = document.getElementById('view-browse');
+        const inBrowse = viewIdOverride !== null
+            ? viewIdOverride === 'view-browse'
+            : !!(browseView && (browseView.style.display === 'block' || browseView.style.display === 'flex'));
+        const locked = inBrowse && isBrowseContextualNavigationActive();
+
+        searchBar.classList.toggle('browse-context-locked', locked);
+        searchBar.setAttribute('aria-hidden', locked ? 'true' : 'false');
+
+        if (locked) {
+            searchInput.blur();
+            if (typeof hideChatSearchMenu === 'function') hideChatSearchMenu();
+        }
+
+        return locked;
+    }
+
+    function resetBrowseSessionToggles() {
+        const groupTitleToggle = getBrowseGroupTitleToggle();
+        const missingRapToggle = document.getElementById('show-missing-rap-toggle');
+
+        if (groupTitleToggle) {
+            groupTitleToggle.checked = true;
+            groupTitleToggle.dataset.defaultReady = '1';
+            groupTitleToggle.dataset.groupCategory = 'games';
+        }
+
+        if (missingRapToggle) missingRapToggle.checked = false;
+
+        window.__browseMissingRapSearchActive = false;
+        window.__browseMissingRapBeforeSearch = null;
+        window.__browseMissingRapSearchCandidateCount = 0;
+        window.__browseCanFilterMissingRap = false;
+    }
+
+    function syncBrowseMissingRapSearchOverride(isSearching) {
+        const missingRapToggle = document.getElementById('show-missing-rap-toggle');
+
+        if (!missingRapToggle) {
+            if (!isSearching) {
+                window.__browseMissingRapSearchActive = false;
+                window.__browseMissingRapBeforeSearch = null;
+            }
+            return;
+        }
+
+        if (isSearching) {
+            if (!window.__browseMissingRapSearchActive) {
+                window.__browseMissingRapBeforeSearch = !!missingRapToggle.checked;
+                window.__browseMissingRapSearchActive = true;
+                missingRapToggle.checked = true;
+            }
+            return;
+        }
+
+        if (window.__browseMissingRapSearchActive && typeof window.__browseMissingRapBeforeSearch === 'boolean') {
+            missingRapToggle.checked = window.__browseMissingRapBeforeSearch;
+        }
+
+        window.__browseMissingRapSearchActive = false;
+        window.__browseMissingRapBeforeSearch = null;
+    }
+
     function getBrowseGroupRegionCount(items) {
         return Array.from(new Set((items || [])
             .map(item => item && (item.game ? item.game.region : item.region))
@@ -13162,6 +13235,10 @@ P
             if (regionSelect) regionSelect.value = 'ALL';
             if (typeof activeLetter !== 'undefined') activeLetter = 'ALL';
         }
+
+        resetBrowseSessionToggles();
+        if (typeof syncBrowseContextualSearchState === 'function') syncBrowseContextualSearchState();
+        if (typeof primeMissingRapFilterShell === 'function') primeMissingRapFilterShell();
 
         if (typeof renderLimit !== 'undefined') {
             renderLimit = typeof getBrowseInitialRenderLimit === 'function' ? getBrowseInitialRenderLimit() : DEFAULT_RENDER_LIMIT;
@@ -13261,8 +13338,7 @@ P
         wrap.setAttribute('aria-hidden', 'false');
 
         if (toggle) {
-            const previousCategory = toggle.dataset.groupCategory || '';
-            if (toggle.dataset.defaultReady !== '1' || (['soundtracks', 'videos'].includes(category) && previousCategory !== category)) {
+            if (toggle.dataset.defaultReady !== '1') {
                 toggle.checked = true;
                 toggle.dataset.defaultReady = '1';
             }
@@ -13406,6 +13482,8 @@ P
             consoles: Array.from(document.querySelectorAll('#console-filters input:checked')).map(cb => cb.value),
             appsFilters: Array.from(document.querySelectorAll('#app-filters input:checked')).map(cb => cb.value),
             showMissingRap: !!(missingRapToggle && missingRapToggle.checked),
+            lockSearch: true,
+            contextualType: 'regions',
             limit: renderLimit,
             scroll: scrollArea ? scrollArea.scrollTop : 0,
             parentHistory: navHistory || null
@@ -13423,6 +13501,7 @@ P
             scrollArea.style.scrollBehavior = oldBehavior;
         }
 
+        if (typeof syncBrowseContextualSearchState === 'function') syncBrowseContextualSearchState('view-browse');
         if (typeof window.renderGrid === 'function') window.renderGrid(false);
     };
 
@@ -14743,11 +14822,6 @@ P
             cb.checked = (cb.value === 'media');
         });
 
-		const missingRapToggle = document.getElementById('show-missing-rap-toggle');
-		if (missingRapToggle) missingRapToggle.checked = false;
-		window.__browseAutoRestoredMissingRapToggle = false;
-		window.__browseLastMissingRapSearchKey = '';
-		window.__browseHadMissingRapSearch = false;
 		window.__browseMissingRapSearchCandidateCount = 0;
 		window.__browseCanFilterMissingRap = false;
     };
@@ -14809,6 +14883,8 @@ P
 			consoles: Array.from(document.querySelectorAll('#console-filters input:checked')).map(cb => cb.value),
 			appsFilters: Array.from(document.querySelectorAll('#app-filters input:checked')).map(cb => cb.value),
 			showMissingRap: document.getElementById('show-missing-rap-toggle') ? document.getElementById('show-missing-rap-toggle').checked : false,
+			lockSearch: true,
+			contextualType: 'related',
 			scroll: safeScroll,
 			limit: safeLimit,
 			fromExplore: finalFromWhere,
@@ -16599,16 +16675,13 @@ P
 		);
 	}
 
-	function primeMissingRapFilterShell(categoryOverride = null, resetToggle = false) {
+	function primeMissingRapFilterShell() {
 		const wrap = document.getElementById('missing-rap-filter');
-		const toggle = document.getElementById('show-missing-rap-toggle');
 		if (!wrap) return;
 
 		wrap.classList.remove('has-filter-separator');
 		wrap.classList.add('is-hidden');
 		wrap.setAttribute('aria-hidden', 'true');
-
-		if (resetToggle && toggle) toggle.checked = false;
 
 		const label = wrap.querySelector('label');
 		const text = wrap.querySelector('span');
@@ -16637,7 +16710,6 @@ P
 		if (!canShowFilter) {
 			wrap.classList.add('is-hidden');
 			wrap.setAttribute('aria-hidden', 'true');
-			if (toggle && toggle.checked && !searchCanUseMissingFilter) toggle.checked = false;
 		} else {
 			wrap.classList.remove('is-hidden');
 			if (needsSeparator) wrap.classList.add('has-filter-separator');
@@ -16692,24 +16764,28 @@ P
 		}
 		if (typeof playUiClick === 'function') playUiClick();
 
+		window.isRestoringHistory = false;
 		navHistory = null;
+		if (typeof clearBrowseExpandedGroupTitle === 'function') clearBrowseExpandedGroupTitle();
+		window.__pendingStoreFocus = null;
 
-		const backBar = document.querySelector('.browse-nav-return-bar');
-		if (backBar) backBar.remove();
+		if (typeof resetAllFilters === 'function') {
+			resetAllFilters();
+		} else {
+			const searchInput = document.getElementById('search-input');
+			const regionSelect = document.getElementById('region-select');
+			if (searchInput) searchInput.value = '';
+			if (regionSelect) regionSelect.value = 'ALL';
+			if (typeof activeLetter !== 'undefined') activeLetter = 'ALL';
+		}
 
-		const searchInput = document.getElementById('search-input');
-		const missingRapToggle = document.getElementById('show-missing-rap-toggle');
-		const currentCatEl = document.getElementById('cat-select');
-		const hasMissingLicenses = Number(window.__browseAvailableMissingRapCount || 0) > 0;
+		if (typeof syncBrowseContextualSearchState === 'function') syncBrowseContextualSearchState('view-browse');
+		window.__browseForceTopOnNextFilter = true;
 
-		if (typeof updateMissingRapFilterVisibility === 'function') {
-			updateMissingRapFilterVisibility(
-				window.__browseAvailableMissingRapCount || 0,
-				window.__browseHiddenMissingRapCount || 0,
-				!!(missingRapToggle && missingRapToggle.checked),
-				currentCatEl ? currentCatEl.value : null,
-				false
-			);
+		if (typeof applyFilters === 'function') {
+			applyFilters();
+		} else if (typeof window.renderGrid === 'function') {
+			window.renderGrid(false);
 		}
 	};
 
@@ -16851,9 +16927,10 @@ P
 		const activeConsolesNodes = document.querySelectorAll('#console-filters input:checked');
 		const activeConsoles = activeConsolesNodes ? Array.from(activeConsolesNodes).map(cb => cb.value) : [];
 		const currentCat = document.getElementById('cat-select').value;
+		if (typeof syncBrowseContextualSearchState === 'function') syncBrowseContextualSearchState('view-browse');
 		const missingRapToggleEl = document.getElementById('show-missing-rap-toggle');
 		const searchHasText = !!term;
-		const missingRapSearchKey = searchHasText ? `${currentCat}|${term}` : '';
+		if (typeof syncBrowseMissingRapSearchOverride === 'function') syncBrowseMissingRapSearchOverride(searchHasText);
 		const isGamesCat = currentCat === 'games';
 		const isAppsCat = currentCat === 'apps';
 		if (typeof isBrowseLetterFilterLocked === 'function' && isBrowseLetterFilterLocked() && activeLetter !== 'ALL') activeLetter = 'ALL';
@@ -16881,27 +16958,6 @@ P
 		const searchCanUseMissingRapToggle = searchHasText && searchCandidateMissingRapCount > 0 && searchCandidateCount > 1;
 		window.__browseMissingRapSearchCandidateCount = searchCandidateCount;
 		window.__browseCanFilterMissingRap = searchHasText ? searchCanUseMissingRapToggle : true;
-
-		if (missingRapToggleEl) {
-			if (searchHasText) {
-				if (searchCanUseMissingRapToggle) {
-					if (window.__browseLastMissingRapSearchKey !== missingRapSearchKey) {
-						missingRapToggleEl.checked = true;
-						window.__browseLastMissingRapSearchKey = missingRapSearchKey;
-					}
-					window.__browseHadMissingRapSearch = true;
-				} else {
-					missingRapToggleEl.checked = searchSingleMissingRapCandidate ? true : false;
-					window.__browseLastMissingRapSearchKey = missingRapSearchKey;
-					window.__browseHadMissingRapSearch = false;
-				}
-			} else if (window.__browseHadMissingRapSearch || window.__browseAutoRestoredMissingRapToggle || window.__browseLastMissingRapSearchKey) {
-				missingRapToggleEl.checked = false;
-				window.__browseHadMissingRapSearch = false;
-				window.__browseLastMissingRapSearchKey = '';
-				window.__browseAutoRestoredMissingRapToggle = false;
-			}
-		}
 
 		const showMissingRap = missingRapToggleEl ? missingRapToggleEl.checked : false;
 		const searchIncludesMissingRap = false;
@@ -17579,18 +17635,14 @@ P
         const cat = e.target.value;
         navHistory = null; 
         if (typeof clearBrowseExpandedGroupTitle === 'function') clearBrowseExpandedGroupTitle();
+        if (typeof syncBrowseContextualSearchState === 'function') syncBrowseContextualSearchState('view-browse');
         if (typeof updateBrowseTypeFilterVisibility === 'function') updateBrowseTypeFilterVisibility(cat);
         
         document.getElementById('search-input').value = "";
         document.getElementById('region-select').value = "ALL";
-		const missingRapToggle = document.getElementById('show-missing-rap-toggle');
-		if (missingRapToggle) missingRapToggle.checked = false;
-		window.__browseAutoRestoredMissingRapToggle = false;
-		window.__browseLastMissingRapSearchKey = '';
-		window.__browseHadMissingRapSearch = false;
 		window.__browseMissingRapSearchCandidateCount = 0;
 		window.__browseCanFilterMissingRap = false;
-		if (typeof primeMissingRapFilterShell === 'function') primeMissingRapFilterShell(cat, true);
+		if (typeof primeMissingRapFilterShell === 'function') primeMissingRapFilterShell();
         activeLetter = "ALL";
         renderLetterFilter();
         
@@ -17618,6 +17670,13 @@ P
 		if (typeof playUiBack === 'function') playUiBack();
 		const searchInput = document.getElementById('search-input');
 		if (!searchInput) return;
+
+		const browseView = document.getElementById('view-browse');
+		const browseVisible = !!(browseView && (browseView.style.display === 'block' || browseView.style.display === 'flex'));
+		if (browseVisible && typeof isBrowseContextualNavigationActive === 'function' && isBrowseContextualNavigationActive()) {
+			if (typeof window.restorePreviousState === 'function') window.restorePreviousState();
+			return;
+		}
 	
 		searchInput.value = '';
 		
@@ -17724,12 +17783,38 @@ P
 			this.blur();
 		} else if (e.key === "Escape" || e.keyCode === 27) {
 			this.blur();
-			clearGlobalSearch(); 
+			if (typeof isBrowseContextualNavigationActive === 'function' && isBrowseContextualNavigationActive() && typeof window.restorePreviousState === 'function') {
+				window.restorePreviousState();
+			} else {
+				clearGlobalSearch();
+			} 
 		} else if (e.key === "Backspace" || e.key === "Delete") {
 			playUiBackspace();
 		} else if (e.key.length === 1) {
 			playUiInput();
 		}
+	});
+
+	document.addEventListener('keydown', function(e) {
+		if (!(e.key === 'Escape' || e.keyCode === 27)) return;
+
+		const browseView = document.getElementById('view-browse');
+		const browseVisible = !!(browseView && (browseView.style.display === 'block' || browseView.style.display === 'flex'));
+		if (!browseVisible || typeof isBrowseContextualNavigationActive !== 'function' || !isBrowseContextualNavigationActive()) return;
+
+		const activeElement = document.activeElement;
+		if (activeElement && activeElement !== document.body && activeElement.id !== 'search-input' && /^(INPUT|TEXTAREA|SELECT)$/.test(activeElement.tagName)) return;
+
+		const visibleDialog = Array.from(document.querySelectorAll('[role="dialog"], .modal, [class*="modal"]')).some(element => {
+			if (!element || element === browseView || !element.isConnected) return false;
+			const style = window.getComputedStyle(element);
+			return style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity || 1) !== 0 && element.getClientRects().length > 0;
+		});
+		if (visibleDialog) return;
+
+		e.preventDefault();
+		e.stopPropagation();
+		if (typeof window.restorePreviousState === 'function') window.restorePreviousState();
 	});
 	
 	document.getElementById('ps3-ip').addEventListener('keydown', function(e) {
@@ -17762,13 +17847,6 @@ P
 	if (showMissingRapToggle) {
 		showMissingRapToggle.addEventListener('change', () => {
 			if (typeof playUiArrow === 'function') playUiArrow();
-			const searchInputEl = document.getElementById('search-input');
-			const catSelectEl = document.getElementById('cat-select');
-			const term = searchInputEl ? searchInputEl.value.toLowerCase().trim() : '';
-			if (term && catSelectEl) {
-				window.__browseLastMissingRapSearchKey = `${catSelectEl.value}|${term}`;
-				window.__browseHadMissingRapSearch = true;
-			}
 			applyFilters();
 		});
 	}
@@ -23327,6 +23405,7 @@ P
 		const consoleFilters = document.getElementById('console-filters');
 		const appFilters = document.getElementById('app-filters');
 		const catSelect = document.getElementById('cat-select');
+		if (searchBar) searchBar.classList.remove('browse-context-locked');
 		
 		if (currentView && currentView.id === 'view-browse' && viewId !== 'view-browse') {
 			if (searchInput) {
@@ -23499,6 +23578,7 @@ P
 				const currentCat = catSelect ? catSelect.value : 'games';
 				if (consoleFilters) consoleFilters.style.display = (currentCat === 'games') ? 'flex' : 'none';
 				if (appFilters) appFilters.style.display = (currentCat === 'apps') ? 'flex' : 'none';
+				if (typeof syncBrowseContextualSearchState === 'function') syncBrowseContextualSearchState(viewId);
 			}
 			
 			if (viewId === 'view-wishlist') {
