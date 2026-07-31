@@ -166,6 +166,8 @@
 		@property --angle { syntax: '<angle>'; initial-value: 0deg; inherits: false; }
 		.is-pc input[name="query"] { border-radius: 4px; outline: none; border: 2px solid transparent; background: linear-gradient(#fff, #fff) padding-box, conic-gradient(from var(--angle), #aaa 75%, #00aaff 100%) border-box; animation: rotate-border 3s linear infinite; }
 		.is-pc input[name="query"]:focus, .is-pc input[name="query"]:not(:placeholder-shown) { background: linear-gradient(#222, #222) padding-box, conic-gradient(from var(--angle), transparent 50%, #ffffff 100%) border-box; animation-duration: 1.5s; color: #fff !important; }
+		#search-group.context-locked input[name="query"], #search-group.context-locked input[name="send"] { background: #555 !important; background-image: none !important; border-color: #777 !important; color: #aaa !important; cursor: default !important; opacity: .72; animation: none !important; box-shadow: none !important; }
+		.is-ps3 #search-group.context-locked input[name="query"], .is-ps3 #search-group.context-locked input[name="send"] { background: #b8b8b8 !important; border-color: #777 !important; color: #666 !important; }
 		.is-pc #license-link-rainbow.rainbow-btn { -webkit-appearance: none !important; appearance: none !important; border: 1.5px solid transparent !important; background-image: linear-gradient(120deg, transparent 30%, rgba(255, 255, 255, 0.8) 50%, transparent 70%), linear-gradient(#050a14, #050a14), conic-gradient(from var(--angle), #ff0000, #ff7f00, #ffff00, #00ff00, #00ffff, #0000ff, #ff00ff, #ff0000); background-origin: padding-box, padding-box, border-box; background-clip: padding-box, padding-box, border-box; background-size: 200% 100%, 100% 100%, 100% 100%; background-repeat: no-repeat; background-color: transparent !important; animation: shine-move 3s infinite linear, rotate-border 2s infinite linear; }
 		@keyframes shine-move {
 			0% { background-position: 200% 0, 0 0, 0 0; }
@@ -394,6 +396,10 @@
 		.load-more-btn:hover { background: #0056b3 !important; }
 		.is-pc .load-more-btn { transition: background 0.3s, transform 0.2s; }
 		.is-pc .load-more-btn:hover { transform: scale(1.02); }
+		#classic-browse-action-row { width: 100%; text-align: center; white-space: nowrap; }
+		#classic-browse-action-row.has-context-nav #btn-load-more { vertical-align: middle; margin-left: 0; margin-right: 4px; }
+		#btn-dismiss-navigation { display: none; width: 42px; min-width: 42px; padding-left: 0; padding-right: 0; vertical-align: middle; margin-left: 4px; margin-right: 0; }
+		#classic-browse-action-row.has-context-nav #btn-dismiss-navigation { display: inline-block !important; }
 		
 		/* =========================================
 		13. BLUR EFFECT (PC Only)
@@ -1124,7 +1130,10 @@
 
 			<div class="content">
 				<ul id="list"></ul>
-				<button id="btn-load-more" class="load-more-btn" onclick="loadMoreItems()" style="display:none;"></button>
+				<div id="classic-browse-action-row">
+					<button id="btn-load-more" class="load-more-btn" onclick="loadMoreItems()" style="display:none;"></button>
+					<button id="btn-dismiss-navigation" class="load-more-btn" type="button" title="Dismiss navigation" onclick="dismissClassicNavigation(); return false;">&#10006;</button>
+				</div>
 				<div id="bottom-spacer"></div>
 			</div>
 
@@ -1300,6 +1309,133 @@
 	var g_renderTimer = null;
 	var g_renderID = 0;
 	var g_navHistory = null;
+
+	function classicCloneSimpleState(state) {
+		if (!state) return null;
+		var copy = {};
+		for (var key in state) {
+			if (Object.prototype.hasOwnProperty.call(state, key)) copy[key] = state[key];
+		}
+		return copy;
+	}
+
+	function classicCaptureBrowseState(parentHistory) {
+		var contentDiv = document.querySelector ? document.querySelector('.content') : null;
+		return {
+			category: currentCategory,
+			letter: g_letterFilter,
+			region: g_regionFilter,
+			query: (f && f.query) ? f.query.value : '',
+			pcLimit: g_pcRenderLimit,
+			ps3Limit: g_ps3RenderLimit,
+			limit: g_pcRenderLimit,
+			scroll: contentDiv ? contentDiv.scrollTop : (window.pageYOffset || 0),
+			isSearchActive: !!g_isSearchActive,
+			preSearchState: classicCloneSimpleState(g_preSearchState),
+			showMissingLicenses: !!g_classicShowMissingLicenses,
+			missingLicenseSearchKey: g_classicMissingLicenseSearchKey || '',
+			missingLicenseSearchActive: !!g_classicMissingLicenseSearchActive,
+			relatedFromGame: classicCloneSimpleState(g_classicRelatedFromGame),
+			baseFromRelated: classicCloneSimpleState(g_classicBaseFromRelated),
+			parentHistory: parentHistory || null
+		};
+	}
+
+	function classicSyncContextualSearchState() {
+		var locked = !!g_navHistory;
+		var searchGroup = document.getElementById('search-group');
+		var searchInput = (f && f.query) ? f.query : null;
+		var searchButton = (f && f.send) ? f.send : null;
+		var actionRow = document.getElementById('classic-browse-action-row');
+
+		if (searchGroup) {
+			var groupClass = searchGroup.className || '';
+			groupClass = (' ' + groupClass + ' ').replace(/ context-locked /g, ' ');
+			groupClass = groupClass.replace(/^\s+|\s+$/g, '').replace(/\s+/g, ' ');
+			if (locked) groupClass += (groupClass ? ' ' : '') + 'context-locked';
+			searchGroup.className = groupClass;
+		}
+
+		if (searchInput) {
+			searchInput.style.display = '';
+			searchInput.disabled = locked;
+			if (locked) searchInput.setAttribute('aria-disabled', 'true');
+			else searchInput.removeAttribute('aria-disabled');
+			if (locked && searchInput.blur) searchInput.blur();
+		}
+
+		if (searchButton) {
+			searchButton.style.display = '';
+			searchButton.disabled = locked;
+			if (locked) searchButton.setAttribute('aria-disabled', 'true');
+			else searchButton.removeAttribute('aria-disabled');
+		}
+
+		if (actionRow) {
+			actionRow.className = locked ? 'has-context-nav' : '';
+		}
+
+		return locked;
+	}
+
+	function classicGetCategoryLabel(category) {
+		var labels = {
+			games: 'Games',
+			guides: 'Guides',
+			soundtracks: 'Soundtracks',
+			videos: 'Videos',
+			apps: 'Apps',
+			updates: 'Updates',
+			dlcs: 'DLCs',
+			avatars: 'Avatars',
+			themes: 'Themes',
+			demos: 'Demos',
+			prototypes: 'Prototypes',
+			homebrew_games: 'Homebrew',
+			homebrew_apps: 'Homebrew Apps',
+			emulators: 'Emulators',
+			ports: 'Ports'
+		};
+		return labels[category] || 'Previous';
+	}
+
+	function classicConfigureBackButton(button) {
+		if (!button || !g_navHistory) return false;
+		button.innerHTML = '&#8592; Back to ' + classicGetCategoryLabel(g_navHistory.category);
+		button.style.display = 'inline-block';
+		button.onclick = function() { restorePreviousState(); return false; };
+		return true;
+	}
+
+	function classicGetRootNavigationState() {
+		var state = g_navHistory;
+		if (!state) return null;
+		while (state.parentHistory) state = state.parentHistory;
+		return state;
+	}
+
+	function dismissClassicNavigation() {
+		var rootState = classicGetRootNavigationState();
+		var keepCategory = currentCategory;
+
+		if (rootState && typeof rootState.showMissingLicenses !== 'undefined') {
+			g_classicShowMissingLicenses = !!rootState.showMissingLicenses;
+		}
+
+		g_navHistory = null;
+		g_classicRelatedFromGame = null;
+		g_classicBaseFromRelated = null;
+		g_classicBaseLookupFallback = null;
+		g_classicPendingCategorySearch = null;
+		g_classicMissingLicenseSearchKey = '';
+		g_classicMissingLicenseSearchActive = false;
+		g_preSearchState = null;
+		g_isSearchActive = false;
+
+		classicSyncContextualSearchState();
+		selectCategory(keepCategory);
+	}
+
 	var g_currentFetchID = 0;
 	var g_safeMode = false; 
 	var g_gamesLoadCount = 0;
@@ -3908,16 +4044,7 @@ function classicIsGameToRelatedLoop(titleId, category) {
 			closeModal();
 		}
 
-		var contentDiv = doc.querySelector ? doc.querySelector('.content') : null;
-
-		var previousState = {
-			category: currentCategory,
-			letter: g_letterFilter,
-			region: g_regionFilter,
-			query: (f && f.query) ? f.query.value : '',
-			limit: g_pcRenderLimit,
-			scroll: contentDiv ? contentDiv.scrollTop : 0
-		};
+		var previousState = classicCaptureBrowseState(g_navHistory);
 
 		g_classicBaseFromRelated = {
 			sourceCategory: sourceCategory || currentCategory,
@@ -3947,6 +4074,7 @@ function classicIsGameToRelatedLoop(titleId, category) {
 		g_classicInternalBaseOpen = false;
 
 		g_navHistory = previousState;
+		classicSyncContextualSearchState();
 
 		return false;
 	}
@@ -4010,6 +4138,7 @@ function classicIsGameToRelatedLoop(titleId, category) {
 		var doc = document;
 		var is_ps3_h = isPS3;
 		var f_obj = f;
+		var previousState = classicCaptureBrowseState(g_navHistory);
 
 		g_classicRelatedFromGame = {
 			fromCategory: currentCategory,
@@ -4017,21 +4146,11 @@ function classicIsGameToRelatedLoop(titleId, category) {
 			baseGameId: title_id
 		};
 		g_classicBaseFromRelated = null;
+		g_navHistory = previousState;
+		classicSyncContextualSearchState();
 
 		g_currentFetchID++;
 		var thisFetchID = g_currentFetchID;
-
-		if (!g_navHistory) {
-			var contentDiv = doc.querySelector('.content');
-			g_navHistory = {
-				category: currentCategory,
-				letter: g_letterFilter,
-				region: g_regionFilter,
-				query: f_obj.query.value,
-				limit: g_pcRenderLimit,
-				scroll: contentDiv ? contentDiv.scrollTop : (window.pageYOffset || 0)
-			};
-		}
 
 		clearListMemory();
 		var btnMore_el = doc.getElementById('btn-load-more');
@@ -4177,9 +4296,9 @@ function restorePreviousState() {
 		var doc = document;
 		var h = g_navHistory;
 		if (!h) return;
-		g_navHistory = null;
-		g_classicRelatedFromGame = null;
-		g_classicBaseFromRelated = null;
+		g_navHistory = h.parentHistory || null;
+		g_classicRelatedFromGame = classicCloneSimpleState(h.relatedFromGame);
+		g_classicBaseFromRelated = classicCloneSimpleState(h.baseFromRelated);
 		g_classicBaseLookupFallback = null;
 		g_classicPendingCategorySearch = null;
 
@@ -4196,13 +4315,20 @@ function restorePreviousState() {
 			g_lastUnofficialCat = currentCategory;
 		}
 
-		g_pcRenderLimit = h.limit;
+		g_pcRenderLimit = typeof h.pcLimit === 'number' ? h.pcLimit : h.limit;
+		g_ps3RenderLimit = typeof h.ps3Limit === 'number' ? h.ps3Limit : g_ps3PageSize;
 		g_letterFilter = h.letter;
 		g_regionFilter = h.region;
+		g_preSearchState = classicCloneSimpleState(h.preSearchState);
+		g_classicShowMissingLicenses = !!h.showMissingLicenses;
+		g_classicMissingLicenseSearchKey = h.missingLicenseSearchKey || '';
+		g_classicMissingLicenseSearchActive = !!h.missingLicenseSearchActive;
 		
 		if (f) f.query.value = h.query;
-		g_isSearchActive = (h.query !== "");
+		g_isSearchActive = typeof h.isSearchActive === 'boolean' ? h.isSearchActive : (h.query !== "");
 		g_pendingScroll = h.scroll;
+		classicSyncContextualSearchState();
+		updateMissingLicenseFilterButton();
 
 		var menu_el = doc.getElementById("selection-menu");
 		if (menu_el) {
@@ -4554,7 +4680,10 @@ function restorePreviousState() {
 				var allGamesOff_h = (cat_h === 'games') && !g_consoleFilter.ps3 && !g_consoleFilter.ps2 && !g_consoleFilter.psx && !g_consoleFilter.psp && !g_consoleFilter.minis && !g_consoleFilter.pce && !g_consoleFilter.neogeo;
 				var allAppsOff_h = (cat_h === 'apps') && !g_appFilter.firstplay && !g_appFilter.media && !g_appFilter.qore;
 
-				if (allGamesOff_h || allAppsOff_h) {
+				if (g_navHistory) {
+					list_el.innerHTML = '<li class="no-results-msg">No items found.</li>';
+					classicConfigureBackButton(btn_el);
+				} else if (allGamesOff_h || allAppsOff_h) {
 					list_el.innerHTML = '<li class="no-results-msg">All content types disabled. Select at least one.</li>';
 					if (btn_el) {
 						btn_el.innerHTML = "&#8596; Restore default types"; btn_el.style.display = 'block';
@@ -4767,29 +4896,7 @@ function restorePreviousState() {
 			var btnF = doc_h.getElementById('btn-load-more');
 			if (g_navHistory) {
 				list_el.style.minHeight = 'auto';
-				if (btnF) {
-					var catNames = {
-						games: 'Games',
-						guides: 'Guides',
-						soundtracks: 'Soundtracks',
-						videos: 'Videos',
-						apps: 'Apps',
-						updates: 'Updates',
-						dlcs: 'DLCs',
-						avatars: 'Avatars',
-						themes: 'Themes',
-						demos: 'Demos',
-						prototypes: 'Prototypes',
-						homebrew_games: 'Homebrew',
-						homebrew_apps: 'Homebrew Apps',
-						homebrew_emulators: 'Emulators',
-						homebrew_ports: 'Ports'
-					};
-					var catN = catNames[g_navHistory.category] || 'Previous';
-					btnF.innerHTML = "&#8592; Back to " + catN; 
-					btnF.style.display = 'block';
-					btnF.onclick = function() { restorePreviousState(); return false; };
-				}
+				classicConfigureBackButton(btnF);
 			} else if (g_isSearchActive) {
 				list_el.style.minHeight = 'auto';
 				if (btnF) {
@@ -4983,7 +5090,12 @@ function restorePreviousState() {
 			query: id
 		};
 
+		var savedHistory = g_navHistory;
+		g_classicInternalBaseOpen = true;
 		selectCategory(cats[idx]);
+		g_classicInternalBaseOpen = false;
+		g_navHistory = savedHistory;
+		classicSyncContextualSearchState();
 		return true;
 	}
 
@@ -4992,6 +5104,7 @@ function restorePreviousState() {
 		var doc = document;
 		var is_ps3_h = isPS3;
 
+		classicSyncContextualSearchState();
 		if (g_isFetching) return;
 		clearListMemory();
 
@@ -5947,6 +6060,7 @@ function restorePreviousState() {
 		if (classicIsChildContentCategory(cat)) classicEnsureBaseGameIndex();
 
 		g_navHistory = null;
+		classicSyncContextualSearchState();
 		if (!g_classicInternalBaseOpen) {
 			g_classicRelatedFromGame = null;
 			g_classicBaseFromRelated = null;
