@@ -13607,14 +13607,17 @@ P
             const fetchOptions = forceRefresh ? { cache: 'no-store' } : undefined;
             const fetchList = [
                 { url: "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/database/covers/blacklist.tsv", target: sysData.noCovers },
-                { url: "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/database/covers/index.tsv", target: sysData.covers, onComplete: () => sysData.coversLoaded = true }
+                { url: "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/database/covers/index.tsv", target: sysData.covers, marksCoverIndexReady: true }
             ];
 
             await Promise.all(fetchList.map(async item => {
                 try {
                     const res = await fetch(item.url + cacheBust, fetchOptions);
                     const text = res.ok ? await res.text() : "";
-                    await addIndexLinesToSet(text, item.target, item.onComplete, priority);
+                    await addIndexLinesToSet(text, item.target, null, priority);
+                    if (item.marksCoverIndexReady && res.ok && item.target.size > 0) {
+                        sysData.coversLoaded = true;
+                    }
                 } catch (e) {
                     console.log("Failed background index", e);
                 }
@@ -15794,20 +15797,16 @@ P
     }
 
 	function getOptimizedCover(id) {
-		// THE LINE BELOW WAS COMMENTED OUT BECAUSE IT PREVENTED BING FROM WORKING
-		// if (sysData.noCovers.has(id)) return FALLBACK_IMG;
-	
-		// NEW MAGIC: Returns a purposely corrupted Base64 image string.
-		// The browser tries to read it, instantly chokes (without making a network request)
-		// and triggers the HTML "onerror" event to call Bing, without polluting F12 with GitHub 404 errors!
-		if (sysData.noCovers.has(id)) return 'data:image/png;base64,BING';
-	
-		if (sysData.coversLoaded && !sysData.covers.has(id)) {
-			const hash = generateSonyHash(id);
-			if (hash) return `https://raw.githubusercontent.com/PS3-Pro/Recently-Played-Games/master/np/${hash}/ICON0.PNG`;
+		const cleanId = String(id || '').trim();
+		if (!cleanId) return FALLBACK_IMG;
+
+		const isBlacklisted = sysData.noCovers.has(cleanId);
+		const isMissingFromIndex = sysData.coversLoaded && !sysData.covers.has(cleanId);
+		if (isBlacklisted || isMissingFromIndex) {
+			return 'data:image/png;base64,COVER_INDEX_MISS';
 		}
-	
-		return `https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/database/covers/uncompressed/${id}.JPG`;
+
+		return `https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/database/covers/uncompressed/${cleanId}.JPG`;
 	}
 
 	const AVATAR_COVERS_BASE = "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/database/avatars";
@@ -15868,7 +15867,9 @@ P
 	function normalizeCoverSrcForCache(src) {
 		src = String(src || '').trim();
 		if (!src) return '';
-		if (src === 'data:image/png;base64,BING') return '';
+		if (/^data:image\/png;base64,(?:BING|COVER_INDEX_MISS)$/i.test(src)) return '';
+		if (/Recently-Played-Games\/master\/np\/[^/]+\/ICON0\.PNG/i.test(src)) return '';
+		if (/tse\d*\.mm\.bing\.net/i.test(src)) return '';
 		return src;
 	}
 
@@ -16053,6 +16054,21 @@ P
 		return true;
 	};
 
+	window.trySonyIconCoverAfterGithub = function(imgElement, category) {
+		const cat = String(category || imgElement?.getAttribute?.('data-cover-category') || '').trim().toLowerCase();
+		if (!imgElement) return false;
+		if (['dlcs', 'apps', 'avatars', 'themes'].includes(cat)) return false;
+		if (imgElement.getAttribute('data-sony-icon-tried') === 'true') return false;
+		const card = imgElement.closest?.('.game-card') || null;
+		const titleId = imgElement.getAttribute('data-title-id') || card?.getAttribute('data-title-id') || '';
+		const hash = generateSonyHash(String(titleId || '').trim());
+		if (!hash) return false;
+		imgElement.setAttribute('data-sony-icon-tried', 'true');
+		imgElement.setAttribute('data-cover-source', 'sony-icon0');
+		imgElement.src = `https://raw.githubusercontent.com/PS3-Pro/Recently-Played-Games/master/np/${hash}/ICON0.PNG`;
+		return true;
+	};
+
 	window.tryGithubCoverAfterPsn = function(imgElement, category) {
 		const cat = String(category || imgElement?.getAttribute?.('data-cover-category') || '').trim().toLowerCase();
 		if (!imgElement || !['dlcs', 'apps'].includes(cat) || imgElement.getAttribute('data-github-cover-tried') === 'true') return false;
@@ -16081,6 +16097,7 @@ P
 		}
 
 		if (window.tryPsnStoreCover && window.tryPsnStoreCover(imgElement, category)) return;
+		if (window.trySonyIconCoverAfterGithub && window.trySonyIconCoverAfterGithub(imgElement, category)) return;
 
 		if (window.isDirectNoBingCover && window.isDirectNoBingCover(imgElement, category)) {
 			imgElement.onerror = null;
