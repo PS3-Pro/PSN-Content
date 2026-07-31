@@ -1733,6 +1733,73 @@
 		return true;
 	}
 
+	var g_classicCoverSrcCache = {};
+	var g_classicCoverSrcCacheOrder = [];
+	var g_classicCoverSrcCacheMax = isPS3 ? 240 : 1200;
+
+	function classicNormalizeCoverSrcForCache(src) {
+		src = String(src || '').replace(/^\s+|\s+$/g, '');
+		if (!src || /^data:/i.test(src) || /^about:blank$/i.test(src)) return '';
+		if (/\/NOCOVER\d*\.JPG(?:[?#]|$)/i.test(src)) return '';
+		if (typeof defaultCover !== 'undefined' && src === String(defaultCover || '')) return '';
+		if (typeof defaultCoverUnofficial !== 'undefined' && src === String(defaultCoverUnofficial || '')) return '';
+		return src;
+	}
+
+	function classicBuildCoverCacheKey(category, titleId, contentId, region) {
+		category = String(category || '').toLowerCase().replace(/^\s+|\s+$/g, '');
+		titleId = String(titleId || '').toUpperCase().replace(/^\s+|\s+$/g, '');
+		contentId = String(contentId || '').toUpperCase().replace(/^\s+|\s+$/g, '');
+		region = String(region || '').toUpperCase().replace(/^\s+|\s+$/g, '');
+		if (!titleId && !contentId) return '';
+		return category + '|' + titleId + '|' + contentId + '|' + region;
+	}
+
+	function classicGetCoverCacheKeyFromElement(img) {
+		if (!img || !img.getAttribute) return '';
+		return classicBuildCoverCacheKey(
+			img.getAttribute('data-category') || currentCategory,
+			img.getAttribute('data-title_id'),
+			img.getAttribute('data-content_id'),
+			img.getAttribute('data-region')
+		);
+	}
+
+	function classicRememberCoverSrc(img, src) {
+		var key = classicGetCoverCacheKeyFromElement(img);
+		src = classicNormalizeCoverSrcForCache(src);
+		if (!key || !src) return '';
+
+		if (!g_classicCoverSrcCache[key]) {
+			g_classicCoverSrcCacheOrder.push(key);
+		}
+		g_classicCoverSrcCache[key] = src;
+		try { img.setAttribute('data-resolved-cover-src', src); } catch(e0) {}
+
+		while (g_classicCoverSrcCacheOrder.length > g_classicCoverSrcCacheMax) {
+			var oldestKey = g_classicCoverSrcCacheOrder.shift();
+			if (oldestKey) delete g_classicCoverSrcCache[oldestKey];
+		}
+		return src;
+	}
+
+	function classicGetCachedCoverSrc(category, titleId, contentId, region) {
+		var key = classicBuildCoverCacheKey(category, titleId, contentId, region);
+		if (!key) return '';
+		var src = classicNormalizeCoverSrcForCache(g_classicCoverSrcCache[key]);
+		if (!src) delete g_classicCoverSrcCache[key];
+		return src;
+	}
+
+	function classicGetResolvedCoverSrc(img) {
+		if (!img) return '';
+		var src = classicNormalizeCoverSrcForCache(img.src);
+		if (!src && img.getAttribute) {
+			src = classicNormalizeCoverSrcForCache(img.getAttribute('data-resolved-cover-src'));
+		}
+		return src;
+	}
+
 	function replaceCoverWithLoadedImage(oldImg, loadedImg, finalUrl) {
 		if (!oldImg || !loadedImg) return oldImg;
 
@@ -1747,6 +1814,7 @@
 			oldImg.onload = null;
 			oldImg.onerror = null;
 			oldImg.src = finalUrl || loadedImg.src;
+			classicRememberCoverSrc(oldImg, finalUrl || loadedImg.src);
 			oldImg.setAttribute('data-loaded', 'true');
 			oldImg.removeAttribute('data-loading');
 			oldImg.removeAttribute('data-failed');
@@ -1755,6 +1823,7 @@
 
 		copyCoverImageAttributes(oldImg, loadedImg);
 		if (typeof classicMarkPsnStoreCoverEntry === 'function') classicMarkPsnStoreCoverEntry(loadedImg, finalUrl || loadedImg.src);
+		classicRememberCoverSrc(loadedImg, finalUrl || loadedImg.src);
 		loadedImg.setAttribute('data-loaded', 'true');
 		loadedImg.removeAttribute('data-loading');
 		loadedImg.removeAttribute('data-failed');
@@ -2704,6 +2773,7 @@
 		img.onload = function() {
 			this.onload = null;
 			this.onerror = null;
+			classicRememberCoverSrc(this, this.src);
 			this.setAttribute('data-loaded', 'true');
 		};
 		img.onerror = function() {
@@ -2733,6 +2803,7 @@
 				this.onload = null;
 				this.onerror = null;
 				classicMarkPsnStoreCoverEntry(this, url);
+				classicRememberCoverSrc(this, url);
 				this.setAttribute('data-loaded', 'true');
 			};
 			img.onerror = function() {
@@ -2765,6 +2836,7 @@
 		img.onload = function() {
 			this.onload = null;
 			this.onerror = null;
+			classicRememberCoverSrc(this, primaryUrl);
 			this.setAttribute('data-loaded', 'true');
 		};
 		img.onerror = function() {
@@ -2796,6 +2868,7 @@
 			img.onload = function() {
 				this.onload = null;
 				this.onerror = null;
+				classicRememberCoverSrc(this, this.src);
 				this.setAttribute('data-loaded', 'true');
 			};
 			img.onerror = function() {
@@ -2817,6 +2890,7 @@
 					this.onload = null;
 					this.onerror = null;
 					classicMarkPsnStoreCoverEntry(this, psnUrl);
+					classicRememberCoverSrc(this, psnUrl);
 					this.setAttribute('data-loaded', 'true');
 				};
 				img.onerror = function() {
@@ -2828,6 +2902,7 @@
 							this.onload = null;
 							this.onerror = null;
 							classicMarkPsnStoreCoverEntry(this, psnFallbackUrl);
+							classicRememberCoverSrc(this, psnFallbackUrl);
 							this.setAttribute('data-loaded', 'true');
 						};
 						this.onerror = function() {
@@ -3018,6 +3093,7 @@
 
 		function markCoverDone(doneImg) {
 			if (!classicIsLiveCoverElement(doneImg, batchID)) return false;
+			classicRememberCoverSrc(doneImg, doneImg.src);
 			doneImg.setAttribute('data-loaded', 'true');
 			doneImg.removeAttribute('data-loading');
 			if (typeof g_activeCovers !== 'undefined') g_activeCovers.push(doneImg);
@@ -8776,14 +8852,21 @@ function restorePreviousState() {
 		openModal();
 		scheduleModalLayoutFit();
 
-        var isHashImg_h = sourceImg_el && sourceImg_el.src && sourceImg_el.src.indexOf('Recently-Played-Games') !== -1;
-        var isBingImg_h = sourceImg_el && sourceImg_el.src && sourceImg_el.src.indexOf('bing.net') !== -1;
-        var isPsnImg_h = sourceImg_el && sourceImg_el.src && sourceImg_el.src.indexOf('store.playstation.com/store/api/chihiro/') !== -1;
-
-        if (sourceImg_el && sourceImg_el.src && sourceImg_el.src.indexOf('data:image') === -1 && sourceImg_el.getAttribute('data-loaded') === 'true') {
-            modal_img_el.src = sourceImg_el.src;
-            if (cat_h === 'avatars' || cat_h === 'themes' || isHashImg_h || isBingImg_h || isPsnImg_h || !high_res_h) return; 
-        }
+		var resolvedCoverSrc_h = '';
+		if (sourceImg_el && sourceImg_el.getAttribute('data-loaded') === 'true' && sourceImg_el.getAttribute('data-failed') !== 'true') {
+			resolvedCoverSrc_h = classicGetResolvedCoverSrc(sourceImg_el);
+		}
+		if (!resolvedCoverSrc_h) {
+			resolvedCoverSrc_h = classicGetCachedCoverSrc(cat_h, id_h, contentId_h, region_h);
+		}
+		if (resolvedCoverSrc_h) {
+			modal_img_el.onload = null;
+			modal_img_el.onerror = null;
+			modal_img_el.src = resolvedCoverSrc_h;
+			modal_img_el.setAttribute('data-loaded', 'true');
+			classicRememberCoverSrc(modal_img_el, resolvedCoverSrc_h);
+			return;
+		}
 
 		if (cat_h === 'avatars' || cat_h === 'themes') {
 			var localCoverGhost_h = new Image();
