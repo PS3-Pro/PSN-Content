@@ -10880,10 +10880,11 @@ P
 		const coverKey = typeof window.getStoreCardCoverKey === 'function'
 			? window.getStoreCardCoverKey(cat, game.id || game.titleId, game.contentId)
 			: '';
+		const preferredCoverUrl = getItemCover(game, cat);
 		const cachedCoverUrl = coverKey && typeof window.getCachedCardCoverSrc === 'function'
-			? window.getCachedCardCoverSrc(coverKey)
+			? window.getCachedCardCoverSrc(coverKey, cat, preferredCoverUrl)
 			: '';
-		const imgUrl = cachedCoverUrl || getItemCover(game, cat);
+		const imgUrl = cachedCoverUrl || preferredCoverUrl;
 		const githubCoverUrl = getGithubItemCover(game, cat);
 		const consoleClasses = ['ps3', 'ps2', 'psx', 'psp', 'minis', 'pce', 'neogeo'];
 		const tagClass = consoleClasses.includes(game.cTag) ? `tag-${game.cTag}` : 'tag-default';
@@ -16006,17 +16007,83 @@ P
 		return src;
 	}
 
-	window.rememberCardCoverSrc = function(key, src) {
+	function getCoverCacheCategory(key, category, imgElement) {
+		let cat = String(category || imgElement?.getAttribute?.('data-cover-category') || '').trim().toLowerCase();
+		if (!cat) {
+			const match = String(key || '').match(/^store\|([^|]+)\|/i);
+			if (match) cat = String(match[1] || '').trim().toLowerCase();
+		}
+		return cat;
+	}
+
+	function getCoverCacheSource(src, imgElement) {
+		const cleanSrc = normalizeCoverSrcForCache(src);
+		if (!cleanSrc) return 'fallback';
+		const lowerSrc = cleanSrc.toLowerCase();
+		if (lowerSrc.indexOf('store.playstation.com/store/api/chihiro/') !== -1) return 'psn';
+		if (/(?:^|\.)bing\.(?:net|com)(?:[/:]|$)/i.test(lowerSrc) || /tse\d*\.mm\.bing\.net/i.test(lowerSrc)) return 'bing';
+		if (/raw\.githubusercontent\.com\/PS3-Pro\/Recently-Played-Games\/master\/np\//i.test(cleanSrc)) return 'sony';
+		const githubCover = normalizeCoverSrcForCache(imgElement?.getAttribute?.('data-github-cover') || '');
+		if (githubCover && githubCover === cleanSrc) return 'github';
+		if (/raw\.githubusercontent\.com\/PS3-Pro\/PSN-Content\/master\/resources\/database\/(?:covers\/uncompressed|avatars|themes)\//i.test(cleanSrc)) return 'github';
+		return 'other';
+	}
+
+	function getCoverCachePriority(category, src, imgElement) {
+		const cat = String(category || '').trim().toLowerCase();
+		const source = getCoverCacheSource(src, imgElement);
+		if (source === 'fallback') return 0;
+		if ((cat === 'avatars' || cat === 'themes') && (source === 'sony' || source === 'bing')) return 0;
+		if (cat === 'dlcs' || cat === 'apps') {
+			if (source === 'psn') return 500;
+			if (source === 'github') return 400;
+			if (source === 'other') return 350;
+			if (source === 'sony') return 300;
+			if (source === 'bing') return 200;
+			return 0;
+		}
+		if (source === 'github') return 500;
+		if (source === 'psn') return 400;
+		if (source === 'other') return 350;
+		if (source === 'sony') return 300;
+		if (source === 'bing') return 200;
+		return 0;
+	}
+
+	window.rememberCardCoverSrc = function(key, src, category, imgElement) {
 		key = String(key || '').trim();
 		src = normalizeCoverSrcForCache(src);
 		if (!key || !src) return;
-		window.__cardCoverSrcCache[key] = src;
+		const cat = getCoverCacheCategory(key, category, imgElement);
+		const source = getCoverCacheSource(src, imgElement);
+		const priority = getCoverCachePriority(cat, src, imgElement);
+		if (priority <= 0) return;
+
+		const currentEntry = window.__cardCoverSrcCache[key];
+		const currentSrc = normalizeCoverSrcForCache(currentEntry && typeof currentEntry === 'object' ? currentEntry.src : currentEntry);
+		const currentPriority = currentSrc
+			? Number(currentEntry && typeof currentEntry === 'object' && currentEntry.priority) || getCoverCachePriority(cat, currentSrc, null)
+			: 0;
+		if (currentSrc && currentPriority > priority) return;
+
+		window.__cardCoverSrcCache[key] = { src, source, priority, category: cat };
 	};
 
-	window.getCachedCardCoverSrc = function(key) {
+	window.getCachedCardCoverSrc = function(key, category, preferredSrc) {
 		key = String(key || '').trim();
 		if (!key || !window.__cardCoverSrcCache) return '';
-		return normalizeCoverSrcForCache(window.__cardCoverSrcCache[key]);
+		const entry = window.__cardCoverSrcCache[key];
+		const cachedSrc = normalizeCoverSrcForCache(entry && typeof entry === 'object' ? entry.src : entry);
+		if (!cachedSrc) return '';
+
+		const cat = getCoverCacheCategory(key, category, null);
+		if (!preferredSrc) return cachedSrc;
+
+		const cachedPriority = Number(entry && typeof entry === 'object' && entry.priority) || getCoverCachePriority(cat, cachedSrc, null);
+		const preferredPriority = getCoverCachePriority(cat, preferredSrc, null);
+		if (cachedPriority <= 0) return '';
+		if (preferredPriority > cachedPriority) return '';
+		return cachedSrc;
 	};
 
 	window.captureStoreNavigationCover = function(originCard, category, titleId, contentId) {
@@ -16030,7 +16097,7 @@ P
 		const src = normalizeCoverSrcForCache(img.currentSrc || img.src);
 		if (!key || !src) return '';
 
-		window.rememberCardCoverSrc(key, src);
+		window.rememberCardCoverSrc(key, src, category, img);
 		return src;
 	};
 
@@ -16043,7 +16110,8 @@ P
 
 		const card = imgElement.closest ? imgElement.closest('.game-card') : null;
 		const key = imgElement.getAttribute('data-cover-key') || card?.getAttribute('data-category-dot-key') || '';
-		if (key) window.rememberCardCoverSrc(key, src);
+		const category = imgElement.getAttribute('data-cover-category') || card?.getAttribute?.('data-store-category') || '';
+		if (key) window.rememberCardCoverSrc(key, src, category, imgElement);
 
 		const libPath = imgElement.getAttribute('data-lib-path') || '';
 		if (libPath && window.libCoverCache && window.libCoverCache[libPath]) {
@@ -16058,7 +16126,8 @@ P
 			if (!img) return;
 			const key = img.getAttribute('data-cover-key') || card.getAttribute('data-category-dot-key') || '';
 			const src = normalizeCoverSrcForCache(img.currentSrc || img.src);
-			if (key && src) window.rememberCardCoverSrc(key, src);
+			const category = img.getAttribute('data-cover-category') || card.getAttribute('data-store-category') || '';
+			if (key && src) window.rememberCardCoverSrc(key, src, category, img);
 			const libPath = img.getAttribute('data-lib-path') || '';
 			if (libPath && src && window.libCoverCache && window.libCoverCache[libPath]) {
 				window.libCoverCache[libPath].cover = src;
@@ -17396,10 +17465,11 @@ P
 			const coverKey = typeof window.getStoreCardCoverKey === 'function'
 				? window.getStoreCardCoverKey(currentCat, game.id || game.titleId, game.contentId)
 				: '';
+			const preferredCoverUrl = getItemCover(game, currentCat);
 			const cachedCoverUrl = coverKey && typeof window.getCachedCardCoverSrc === 'function'
-				? window.getCachedCardCoverSrc(coverKey)
+				? window.getCachedCardCoverSrc(coverKey, currentCat, preferredCoverUrl)
 				: '';
-			const imgUrl = cachedCoverUrl || getItemCover(game, currentCat);
+			const imgUrl = cachedCoverUrl || preferredCoverUrl;
 			const githubCoverUrl = getGithubItemCover(game, currentCat);
 			const coverKeyAttr = String(coverKey || '').replace(/[&<>"]/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[ch]);
 			
@@ -18492,10 +18562,11 @@ P
 		const originCoverImg = originCard && typeof window.captureStoreNavigationCover === 'function'
 			? window.captureStoreNavigationCover(originCard, currentCat, game.id || game.titleId, game.contentId)
 			: '';
+		const preferredModalCoverImg = getItemCover(game, currentCat);
 		const cachedModalCoverImg = modalCoverKey && typeof window.getCachedCardCoverSrc === 'function'
-			? window.getCachedCardCoverSrc(modalCoverKey)
+			? window.getCachedCardCoverSrc(modalCoverKey, currentCat, preferredModalCoverImg)
 			: '';
-		const coverImg = originCoverImg || cachedModalCoverImg || getItemCover(game, currentCat);
+		const coverImg = originCoverImg || cachedModalCoverImg || preferredModalCoverImg;
 		const githubCoverImg = getGithubItemCover(game, currentCat);
 		const modalCoverKeyAttr = modalSafeText(modalCoverKey);
 		const modalDisplayName = currentCat === 'videos' && browseExpandedGroupTitle
@@ -25079,7 +25150,8 @@ P
 		filteredWishlist.forEach((game, i) => {
 			const wishDotKey = (typeof getWishlistDotKey === 'function') ? getWishlistDotKey(game) : (game.contentId || game.id || '');
 			const resolvedWishCategory = (typeof window.getWishlistItemCategoryKey === 'function') ? window.getWishlistItemCategoryKey(game) : (game.category || 'games');
-			const imgUrl = (typeof window.getCachedCardCoverSrc === 'function' ? window.getCachedCardCoverSrc(wishDotKey) : '') || getItemCover(game, resolvedWishCategory);
+			const preferredWishCoverUrl = getItemCover(game, resolvedWishCategory);
+			const imgUrl = (typeof window.getCachedCardCoverSrc === 'function' ? window.getCachedCardCoverSrc(wishDotKey, resolvedWishCategory, preferredWishCoverUrl) : '') || preferredWishCoverUrl;
 			const githubCoverUrl = getGithubItemCover(game, resolvedWishCategory);
 			const tagClass = `tag-${game.cTag}`;
 			
@@ -25095,7 +25167,7 @@ P
 					<div class="wish-btn" title="Remove from Wishlist" onclick="toggleWishlist(event, '${game.id}')">
 						<i class="fas fa-heart" style="color: #ff4444; font-size: 14px;"></i>
 					</div>
-					<img src="${imgUrl}" class="game-img" loading="lazy" data-cover-key="${escapeCategoryDotAttr(wishDotKey)}" data-name="${(game.cleanName || '').replace(/"/g, '&quot;')}" data-console="${game.cTag}" data-github-cover="${String(githubCoverUrl || '').replace(/"/g, '&quot;')}" data-title-id="${game.id || ''}" data-content-id="${game.contentId || ''}" data-region="${game.region || ''}" onload="markCoverLoaded(this)" onerror="handleCoverError(this, '${resolvedWishCategory}')">
+					<img src="${imgUrl}" class="game-img" loading="lazy" data-cover-key="${escapeCategoryDotAttr(wishDotKey)}" data-cover-category="${resolvedWishCategory}" data-name="${(game.cleanName || '').replace(/"/g, '&quot;')}" data-console="${game.cTag}" data-github-cover="${String(githubCoverUrl || '').replace(/"/g, '&quot;')}" data-title-id="${game.id || ''}" data-content-id="${game.contentId || ''}" data-region="${game.region || ''}" onload="markCoverLoaded(this)" onerror="handleCoverError(this, '${resolvedWishCategory}')">
 				</div>
 				<div class="game-info" style="padding: 10px; min-height: 0;">
 					<div style="display: flex; flex-direction: column; justify-content: space-between; height: 100%;">

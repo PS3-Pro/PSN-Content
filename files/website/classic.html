@@ -1882,8 +1882,69 @@
 		return src;
 	}
 
+	function classicNormalizeCoverCategory(category) {
+		return String(category || '').toLowerCase().replace(/^\s+|\s+$/g, '');
+	}
+
+	function classicGetCoverSource(src) {
+		var cleanSrc = classicNormalizeCoverSrcForCache(src);
+		var lowerSrc;
+		if (!cleanSrc) return 'fallback';
+		lowerSrc = cleanSrc.toLowerCase();
+		if (lowerSrc.indexOf('store.playstation.com/store/api/chihiro/') !== -1) return 'psn';
+		if (/(?:^|\.)bing\.(?:net|com)(?:[\/:]|$)/i.test(lowerSrc) || /tse\d*\.mm\.bing\.net/i.test(lowerSrc)) return 'bing';
+		if (/raw\.githubusercontent\.com\/PS3-Pro\/Recently-Played-Games\/master\/np\//i.test(cleanSrc)) return 'sony';
+		if (/raw\.githubusercontent\.com\/PS3-Pro\/PSN-Content\/master\/resources\/database\/(?:covers\/(?:compressed|uncompressed)|avatars|themes)\//i.test(cleanSrc)) return 'github';
+		return 'other';
+	}
+
+	function classicGetCoverSourcePriority(category, source) {
+		var cat = classicNormalizeCoverCategory(category);
+		var srcType = String(source || '').toLowerCase();
+		if (!srcType || srcType === 'fallback') return 0;
+		if (cat === 'avatars' || cat === 'themes') {
+			if (srcType === 'github') return 500;
+			if (srcType === 'other') return 400;
+			return 0;
+		}
+		if (cat === 'dlcs' || cat === 'apps') {
+			if (srcType === 'psn') return 500;
+			if (srcType === 'github') return 400;
+			if (srcType === 'other') return 350;
+			if (srcType === 'sony') return 300;
+			if (srcType === 'bing') return 200;
+			return 0;
+		}
+		if (srcType === 'github') return 500;
+		if (srcType === 'psn') return 400;
+		if (srcType === 'other') return 350;
+		if (srcType === 'sony') return 300;
+		if (srcType === 'bing') return 200;
+		return 0;
+	}
+
+	function classicGetCoverPriority(category, src) {
+		return classicGetCoverSourcePriority(category, classicGetCoverSource(src));
+	}
+
+	function classicGetPreferredCoverSource(category, titleId) {
+		var cat = classicNormalizeCoverCategory(category);
+		if (cat === 'avatars' || cat === 'themes') return 'github';
+		if (cat === 'dlcs' || cat === 'apps') return 'psn';
+		if (typeof classicCoverIndexSkipsGithub === 'function' && classicCoverIndexSkipsGithub(titleId)) return 'psn';
+		return 'github';
+	}
+
+	function classicCoverMeetsPreferredPriority(category, src, preferredSource) {
+		var actualPriority = classicGetCoverPriority(category, src);
+		var preferredPriority = classicGetCoverSourcePriority(category, preferredSource);
+		if (actualPriority <= 0) return false;
+		if (preferredPriority <= 0) return true;
+		return actualPriority >= preferredPriority;
+	}
+
 	function classicBuildCoverCacheKey(category, titleId, contentId, region) {
-		category = String(category || '').toLowerCase().replace(/^\s+|\s+$/g, '');
+		category = classicNormalizeCoverCategory(category);
 		titleId = String(titleId || '').toUpperCase().replace(/^\s+|\s+$/g, '');
 		contentId = String(contentId || '').toUpperCase().replace(/^\s+|\s+$/g, '');
 		region = String(region || '').toUpperCase().replace(/^\s+|\s+$/g, '');
@@ -1903,14 +1964,40 @@
 
 	function classicRememberCoverSrc(img, src) {
 		var key = classicGetCoverCacheKeyFromElement(img);
+		var category = img && img.getAttribute ? (img.getAttribute('data-category') || currentCategory) : currentCategory;
+		var source;
+		var priority;
+		var currentEntry;
+		var currentSrc;
+		var currentPriority;
 		src = classicNormalizeCoverSrcForCache(src);
 		if (!key || !src) return '';
 
-		if (!g_classicCoverSrcCache[key]) {
-			g_classicCoverSrcCacheOrder.push(key);
+		source = classicGetCoverSource(src);
+		priority = classicGetCoverSourcePriority(category, source);
+		if (priority <= 0) return '';
+
+		currentEntry = g_classicCoverSrcCache[key];
+		currentSrc = classicNormalizeCoverSrcForCache(currentEntry && typeof currentEntry === 'object' ? currentEntry.src : currentEntry);
+		currentPriority = currentSrc
+			? ((currentEntry && typeof currentEntry === 'object' && Number(currentEntry.priority)) || classicGetCoverPriority(category, currentSrc))
+			: 0;
+
+		if (!currentEntry) g_classicCoverSrcCacheOrder.push(key);
+		if (!currentSrc || priority >= currentPriority) {
+			g_classicCoverSrcCache[key] = {
+				src: src,
+				source: source,
+				priority: priority,
+				category: classicNormalizeCoverCategory(category)
+			};
 		}
-		g_classicCoverSrcCache[key] = src;
-		try { img.setAttribute('data-resolved-cover-src', src); } catch(e0) {}
+
+		try {
+			img.setAttribute('data-resolved-cover-src', src);
+			img.setAttribute('data-resolved-cover-source', source);
+			img.setAttribute('data-resolved-cover-priority', String(priority));
+		} catch(e0) {}
 
 		while (g_classicCoverSrcCacheOrder.length > g_classicCoverSrcCacheMax) {
 			var oldestKey = g_classicCoverSrcCacheOrder.shift();
@@ -1919,11 +2006,24 @@
 		return src;
 	}
 
-	function classicGetCachedCoverSrc(category, titleId, contentId, region) {
+	function classicGetCachedCoverSrc(category, titleId, contentId, region, preferredSource) {
 		var key = classicBuildCoverCacheKey(category, titleId, contentId, region);
+		var entry;
+		var src;
+		var cachedPriority;
+		var preferredPriority;
 		if (!key) return '';
-		var src = classicNormalizeCoverSrcForCache(g_classicCoverSrcCache[key]);
-		if (!src) delete g_classicCoverSrcCache[key];
+		entry = g_classicCoverSrcCache[key];
+		src = classicNormalizeCoverSrcForCache(entry && typeof entry === 'object' ? entry.src : entry);
+		if (!src) {
+			delete g_classicCoverSrcCache[key];
+			return '';
+		}
+		if (!preferredSource) return src;
+		cachedPriority = (entry && typeof entry === 'object' && Number(entry.priority)) || classicGetCoverPriority(category, src);
+		preferredPriority = classicGetCoverSourcePriority(category, preferredSource);
+		if (cachedPriority <= 0) return '';
+		if (preferredPriority > cachedPriority) return '';
 		return src;
 	}
 
@@ -8978,11 +9078,15 @@ function restorePreviousState() {
 		scheduleModalLayoutFit();
 
 		var resolvedCoverSrc_h = '';
+		var preferredCoverSource_h = classicGetPreferredCoverSource(cat_h, id_h);
 		if (sourceImg_el && sourceImg_el.getAttribute('data-loaded') === 'true' && sourceImg_el.getAttribute('data-failed') !== 'true') {
-			resolvedCoverSrc_h = classicGetResolvedCoverSrc(sourceImg_el);
+			var sourceResolvedCover_h = classicGetResolvedCoverSrc(sourceImg_el);
+			if (classicCoverMeetsPreferredPriority(cat_h, sourceResolvedCover_h, preferredCoverSource_h)) {
+				resolvedCoverSrc_h = sourceResolvedCover_h;
+			}
 		}
 		if (!resolvedCoverSrc_h) {
-			resolvedCoverSrc_h = classicGetCachedCoverSrc(cat_h, id_h, contentId_h, region_h);
+			resolvedCoverSrc_h = classicGetCachedCoverSrc(cat_h, id_h, contentId_h, region_h, preferredCoverSource_h);
 		}
 		if (resolvedCoverSrc_h) {
 			modal_img_el.onload = null;
