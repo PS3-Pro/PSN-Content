@@ -19084,9 +19084,24 @@ P
 		const fetchWithTimeout = async (url, ms = 3500) => {
 			const controller = new AbortController();
 			const id = setTimeout(() => controller.abort(), ms);
-			const response = await fetch(url, { signal: controller.signal });
-			clearTimeout(id);
-			return response;
+			try {
+				return await fetch(url, { signal: controller.signal });
+			} finally {
+				clearTimeout(id);
+			}
+		};
+
+		const rotateRawgKey = () => {
+			currentRawgKeyIndex = (currentRawgKeyIndex + 1) % RAWG_KEYS.length;
+			localStorage.setItem('rawg_key_index', currentRawgKeyIndex);
+		};
+
+		const getRawgFailureAction = (response) => {
+			if (!response || response.ok) return 'ok';
+			const status = Number(response.status || 0);
+			if (status === 401 || status === 403 || status === 429) return 'rotate-key';
+			if (status >= 500 && status <= 599) return 'skip-rawg';
+			return 'skip-query';
 		};
 
 		const scrContainer = document.getElementById('modal-screenshots');
@@ -19105,82 +19120,101 @@ P
 			if (psnStoreSummary) summaryContainer.innerHTML = summaryTitleHtml + modalSafeText(psnStoreSummary).replace(/\n/g, '<br>');
 		} catch (error) {}
 	
+		rawgSearchLoop:
 		for (let query of searchQueries) {
-			let querySuccess = false;
 			for (let attempt = 0; attempt < RAWG_KEYS.length; attempt++) {
-				let activeKey = RAWG_KEYS[currentRawgKeyIndex];
+				const activeKey = RAWG_KEYS[currentRawgKeyIndex];
 				try {
 					const searchRes = await fetchWithTimeout(`https://api.rawg.io/api/games?key=${activeKey}&search=${encodeURIComponent(query)}&page_size=1`, 4000);
-					const searchData = await searchRes.json();
-					
-					if (!searchRes.ok || searchData.error) {
-						currentRawgKeyIndex = (currentRawgKeyIndex + 1) % RAWG_KEYS.length;
-						localStorage.setItem('rawg_key_index', currentRawgKeyIndex);
+					const searchAction = getRawgFailureAction(searchRes);
+
+					if (searchAction === 'rotate-key') {
+						rotateRawgKey();
 						continue;
 					}
-					
-					if (searchData.results && searchData.results.length > 0) {
-						const slug = searchData.results[0].slug;
-						const [detailsRes, screensRes] = await Promise.all([
-							fetchWithTimeout(`https://api.rawg.io/api/games/${slug}?key=${activeKey}`, 3500),
-							fetchWithTimeout(`https://api.rawg.io/api/games/${slug}/screenshots?key=${activeKey}`, 3500)
-						]);
-						
-						const detailsData = detailsRes.ok ? await detailsRes.json() : {};
-						const screensData = screensRes.ok ? await screensRes.json() : {};
-						const displayDetailsData = { ...detailsData };
-						if (!getRawgNames(displayDetailsData.developers || [], 1).length && !getRawgNames(displayDetailsData.publishers || [], 1).length && psnStoreMeta.provider) {
-							displayDetailsData.publishers = [{ name: psnStoreMeta.provider }];
-						}
-						if (!displayDetailsData.released && psnStoreMeta.releaseDate) displayDetailsData.released = psnStoreMeta.releaseDate;
-	
-						if (scrContainer) {
-							if (screensData.results?.length > 0) {
-								if (modalRoot) setGameModalNoScreenshots(modalRoot, false);
-								if (screenshotsWrapper) screenshotsWrapper.style.display = 'flex';
-								const gameImages = screensData.results.slice(0, 8).map(img => img.image);
-								scrContainer.innerHTML = gameImages.map((url, index) => 
-									`<img src="${url}" class="screenshot-item" onmouseenter="if(typeof playUiHover === 'function') playUiHover()" onclick="openImageModal(${index}, ${JSON.stringify(gameImages).replace(/"/g, '&quot;')})">`
-								).join('');
-							} else if (screenshotsWrapper) {
-								screenshotsWrapper.style.display = 'none';
-								if (modalRoot) setGameModalNoScreenshots(modalRoot, true);
-							}
-						}
-	
-						let bHtml = '';
-						if (detailsData.metacritic) {
-							let color = detailsData.metacritic >= 75 ? '#4caf50' : (detailsData.metacritic >= 50 ? '#ffa500' : '#ff4444');
-							bHtml += `<span class="rawg-chip rawg-chip-score" style="border:1px solid ${color}; color:${color};"><i class="fas fa-star"></i>${detailsData.metacritic}</span>`;
-						}
-						if (displayDetailsData.released) {
-							const year = String(displayDetailsData.released).split('-')[0];
-							bHtml += `<span class="rawg-chip rawg-chip-year"><i class="far fa-calendar-alt"></i>${modalSafeText(year)}</span>`;
-						}
-						renderRawgExtraMeta(displayDetailsData, bHtml);
-	
-						let finalDesc = "No description available.";
-						if (detailsData.description_raw && detailsData.description_raw.trim() !== "") {
-							finalDesc = detailsData.description_raw.trim().replace(/\n+/g, '<br><br>');
-						} else if (detailsData.description && detailsData.description.trim() !== "") {
-							finalDesc = detailsData.description.trim();
-						}
-						
-						if (!psnStoreSummary) summaryContainer.innerHTML = summaryTitleHtml + finalDesc;
-						if (modalRoot && modalRoot.classList.contains('modal-no-screenshots')) scheduleModalSummaryAlignment();
-						return;
-					} else {
-						break;
+					if (searchAction === 'skip-rawg') break rawgSearchLoop;
+					if (searchAction === 'skip-query') break;
+
+					const searchData = await searchRes.json();
+					if (searchData.error) {
+						rotateRawgKey();
+						continue;
 					}
-				} catch (e) { 
-					currentRawgKeyIndex = (currentRawgKeyIndex + 1) % RAWG_KEYS.length;
-					localStorage.setItem('rawg_key_index', currentRawgKeyIndex);
-					continue; 
+
+					if (!searchData.results || searchData.results.length === 0) break;
+
+					const slug = searchData.results[0].slug;
+					const safeRawgFetch = (url, timeout) => fetchWithTimeout(url, timeout)
+						.then(response => ({ response }))
+						.catch(error => ({ error }));
+					const [detailsResult, screensResult] = await Promise.all([
+						safeRawgFetch(`https://api.rawg.io/api/games/${slug}?key=${activeKey}`, 3500),
+						safeRawgFetch(`https://api.rawg.io/api/games/${slug}/screenshots?key=${activeKey}`, 3500)
+					]);
+
+					if (detailsResult.error) break rawgSearchLoop;
+
+					const detailsRes = detailsResult.response;
+					const detailsAction = getRawgFailureAction(detailsRes);
+					if (detailsAction === 'rotate-key') {
+						rotateRawgKey();
+						continue;
+					}
+					if (detailsAction === 'skip-rawg') break rawgSearchLoop;
+					if (detailsAction === 'skip-query') break;
+
+					const detailsData = await detailsRes.json();
+					let screensData = {};
+					if (!screensResult.error && screensResult.response && screensResult.response.ok) {
+						try { screensData = await screensResult.response.json(); } catch (error) {}
+					}
+					const displayDetailsData = { ...detailsData };
+					if (!getRawgNames(displayDetailsData.developers || [], 1).length && !getRawgNames(displayDetailsData.publishers || [], 1).length && psnStoreMeta.provider) {
+						displayDetailsData.publishers = [{ name: psnStoreMeta.provider }];
+					}
+					if (!displayDetailsData.released && psnStoreMeta.releaseDate) displayDetailsData.released = psnStoreMeta.releaseDate;
+
+					if (scrContainer) {
+						if (screensData.results?.length > 0) {
+							if (modalRoot) setGameModalNoScreenshots(modalRoot, false);
+							if (screenshotsWrapper) screenshotsWrapper.style.display = 'flex';
+							const gameImages = screensData.results.slice(0, 8).map(img => img.image);
+							scrContainer.innerHTML = gameImages.map((url, index) =>
+								`<img src="${url}" class="screenshot-item" onmouseenter="if(typeof playUiHover === 'function') playUiHover()" onclick="openImageModal(${index}, ${JSON.stringify(gameImages).replace(/"/g, '&quot;')})">`
+							).join('');
+						} else if (screenshotsWrapper) {
+							screenshotsWrapper.style.display = 'none';
+							if (modalRoot) setGameModalNoScreenshots(modalRoot, true);
+						}
+					}
+
+					let bHtml = '';
+					if (detailsData.metacritic) {
+						let color = detailsData.metacritic >= 75 ? '#4caf50' : (detailsData.metacritic >= 50 ? '#ffa500' : '#ff4444');
+						bHtml += `<span class="rawg-chip rawg-chip-score" style="border:1px solid ${color}; color:${color};"><i class="fas fa-star"></i>${detailsData.metacritic}</span>`;
+					}
+					if (displayDetailsData.released) {
+						const year = String(displayDetailsData.released).split('-')[0];
+						bHtml += `<span class="rawg-chip rawg-chip-year"><i class="far fa-calendar-alt"></i>${modalSafeText(year)}</span>`;
+					}
+					renderRawgExtraMeta(displayDetailsData, bHtml);
+
+					let finalDesc = "No description available.";
+					if (detailsData.description_raw && detailsData.description_raw.trim() !== "") {
+						finalDesc = detailsData.description_raw.trim().replace(/\n+/g, '<br><br>');
+					} else if (detailsData.description && detailsData.description.trim() !== "") {
+						finalDesc = detailsData.description.trim();
+					}
+
+					if (!psnStoreSummary) summaryContainer.innerHTML = summaryTitleHtml + finalDesc;
+					if (modalRoot && modalRoot.classList.contains('modal-no-screenshots')) scheduleModalSummaryAlignment();
+					return;
+				} catch (error) {
+					break rawgSearchLoop;
 				}
 			}
-			if (querySuccess) break;
 		}
-		
+
 		try {
 			const wikiSearch = await fetch(`https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(baseName + " video game")}&format=json&origin=*`);
 			const wikiData = await wikiSearch.json();
