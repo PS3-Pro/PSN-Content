@@ -9349,15 +9349,10 @@ P
 		if (typeof updateConsoleFanUI === 'function') {
 			updateConsoleFanUI(next.consoleFanSpeed, next.consoleFanMode, next.consoleFanTarget);
 		}
-		if (typeof updateConsolePerformanceUI === 'function') {
-			updateConsolePerformanceUI(next.performanceMode);
-		}
 		const rsxInput = document.getElementById('console-custom-rsx');
 		const vramInput = document.getElementById('console-custom-vram');
-		if (rsxInput) rsxInput.value = next.performanceRsx;
-		if (vramInput) vramInput.value = next.performanceVram;
-		const perfStatus = document.getElementById('console-performance-status');
-		if (perfStatus && perfStatus.textContent !== 'Sent') perfStatus.textContent = 'Synced';
+		if (rsxInput && document.activeElement !== rsxInput) rsxInput.value = next.performanceRsx;
+		if (vramInput && document.activeElement !== vramInput) vramInput.value = next.performanceVram;
 	}
 
 	function runSyncedPluginActions(previous = {}, next = {}, options = {}) {
@@ -16034,6 +16029,14 @@ P
 		const source = getCoverCacheSource(src, imgElement);
 		if (source === 'fallback') return 0;
 		if ((cat === 'avatars' || cat === 'themes') && (source === 'sony' || source === 'bing')) return 0;
+		if (cat === 'library') {
+			if (source === 'other') return 600;
+			if (source === 'github') return 500;
+			if (source === 'psn') return 400;
+			if (source === 'sony') return 300;
+			if (source === 'bing') return 200;
+			return 0;
+		}
 		if (cat === 'dlcs' || cat === 'apps') {
 			if (source === 'psn') return 500;
 			if (source === 'github') return 400;
@@ -16115,7 +16118,7 @@ P
 
 		const libPath = imgElement.getAttribute('data-lib-path') || '';
 		if (libPath && window.libCoverCache && window.libCoverCache[libPath]) {
-			window.libCoverCache[libPath].cover = src;
+			window.libCoverCache[libPath].resolvedCover = src;
 		}
 	};
 
@@ -16130,7 +16133,7 @@ P
 			if (key && src) window.rememberCardCoverSrc(key, src, category, img);
 			const libPath = img.getAttribute('data-lib-path') || '';
 			if (libPath && src && window.libCoverCache && window.libCoverCache[libPath]) {
-				window.libCoverCache[libPath].cover = src;
+				window.libCoverCache[libPath].resolvedCover = src;
 			}
 		});
 	};
@@ -27794,7 +27797,7 @@ P
 					title: title,
 					id: extractedId,
 					path: path,
-					cover: (coverPath.startsWith('/')) ? `http://${ip}${coverPath}` : coverPath
+					cover: resolveWebmanLibraryCoverUrl(coverPath, ip)
 				};
 			}).filter(game => game.path !== "");
 	
@@ -27858,6 +27861,67 @@ P
 	let lastScannedGames = [];
 	window.lastScannedGames = lastScannedGames;
 	window.libCoverCache = window.libCoverCache || {};
+
+	function resolveWebmanLibraryCoverUrl(coverPath, ip) {
+		const raw = String(coverPath || '').trim();
+		const cleanIp = String(ip || '').trim();
+		if (!raw) return '';
+		if (/^https?:\/\//i.test(raw)) return raw;
+		if (/^\/\//.test(raw)) return `http:${raw}`;
+		if (!cleanIp) return raw;
+		return `http://${cleanIp}/${raw.replace(/^\/+/, '')}`;
+	}
+
+	function getUsableLibraryWebmanCover(game = {}) {
+		const cover = String(game.cover || '').trim();
+		if (!cover || cover === FALLBACK_IMG || /^data:/i.test(cover) || /NOCOVER00\.JPG/i.test(cover)) return '';
+		return cover;
+	}
+
+	function getLibraryGithubCover(game = {}, gameId = '') {
+		const titleId = String(gameId || getLibraryGameTitleId(game) || '').trim().toUpperCase();
+		if (!titleId || isNaN(titleId) === false) return '';
+		const cover = getOptimizedCover(titleId);
+		if (!cover || /^data:image\/png;base64,(?:BING|COVER_INDEX_MISS)$/i.test(String(cover)) || cover === FALLBACK_IMG || /NOCOVER00\.JPG/i.test(String(cover))) return '';
+		return cover;
+	}
+
+	function ensureLibraryCoverCache(game = {}, gameId = '') {
+		const path = String(game.path || '');
+		const titleId = String(gameId || getLibraryGameTitleId(game) || '').trim().toUpperCase();
+		const webmanCover = getUsableLibraryWebmanCover(game);
+		const githubCover = getLibraryGithubCover(game, titleId);
+		const entry = window.libCoverCache[path] || {};
+		entry.id = titleId || entry.id || null;
+		entry.webmanCover = webmanCover;
+		entry.githubCover = githubCover;
+		if (!entry.cover) entry.cover = webmanCover || githubCover || FALLBACK_IMG;
+		window.libCoverCache[path] = entry;
+		return entry;
+	}
+
+	function getLibraryPreferredCover(game = {}, cachedData = {}) {
+		return getUsableLibraryWebmanCover(game) || cachedData.webmanCover || cachedData.githubCover || getLibraryGithubCover(game, cachedData.id) || '';
+	}
+
+	window.tryLibraryGithubCover = function(imgElement) {
+		if (!imgElement || imgElement.getAttribute('data-library-github-tried') === 'true') return false;
+		imgElement.setAttribute('data-library-github-tried', 'true');
+		const githubCover = normalizeCoverSrcForCache(imgElement.getAttribute('data-github-cover') || '');
+		const currentSrc = normalizeCoverSrcForCache(imgElement.currentSrc || imgElement.src);
+		if (!githubCover || githubCover === currentSrc) return false;
+		imgElement.setAttribute('data-cover-source', 'github');
+		imgElement.src = githubCover;
+		return true;
+	};
+
+	window.handleLibraryCoverError = function(imgElement) {
+		if (!imgElement) return;
+		if (window.tryLibraryGithubCover && window.tryLibraryGithubCover(imgElement)) return;
+		if (window.tryPsnStoreCover && window.tryPsnStoreCover(imgElement, 'library')) return;
+		if (window.trySonyIconCoverAfterGithub && window.trySonyIconCoverAfterGithub(imgElement, 'library')) return;
+		getOnlineCoverFallback(imgElement);
+	};
 	
 	function normalizeLibraryIdentityText(value) {
 		return String(value || '')
@@ -28084,20 +28148,8 @@ P
 			if (pathUpper.includes("USB")) region = "USB";
 			else if (pathUpper.includes("NET")) region = "NET";
 	
-			if (!window.libCoverCache[game.path]) {
-				const gameId = game.id || (game.path.match(/[A-Z]{4}\d{5}/) ? game.path.match(/[A-Z]{4}\d{5}/)[0] : null);
-				const localCover = String(game.cover || '').trim();
-				const hasUsableLocalCover = !!localCover && localCover !== FALLBACK_IMG && !/NOCOVER00\.JPG/i.test(localCover);
-				const smartCover = (gameId && isNaN(gameId))
-					? getOptimizedCover(gameId)
-					: (hasUsableLocalCover ? localCover : 'data:image/png;base64,BING');
-				window.libCoverCache[game.path] = {
-					id: gameId,
-					cover: smartCover
-				};
-			}
-			
-			const cachedData = window.libCoverCache[game.path];
+			const gameId = game.id || (game.path.match(/[A-Z]{4}\d{5}/) ? game.path.match(/[A-Z]{4}\d{5}/)[0] : null);
+			const cachedData = ensureLibraryCoverCache(game, gameId);
 			const isFav = favoritesLibrary.some(fav => fav.path === game.path);
 			const favClass = isFav ? 'is-favorited' : '';
 			const starIcon = isFav ? 'fas fa-star' : 'far fa-star';
@@ -28171,9 +28223,10 @@ P
 			}
 	
 			const localCoverKey = game.path || cachedData.id || game.title || '';
-			let displayCover = (typeof window.getCachedCardCoverSrc === 'function' ? window.getCachedCardCoverSrc(localCoverKey) : '') || cachedData.cover;
+			const preferredLibraryCover = getLibraryPreferredCover(game, cachedData);
+			let displayCover = cachedData.webmanCover || ((typeof window.getCachedCardCoverSrc === 'function' ? window.getCachedCardCoverSrc(localCoverKey, 'library', preferredLibraryCover) : '') || preferredLibraryCover);
 			if ((!displayCover || displayCover === FALLBACK_IMG || /NOCOVER00\.JPG/i.test(String(displayCover))) && game.title) {
-				displayCover = 'data:image/png;base64,BING';
+				displayCover = cachedData.githubCover || 'data:image/png;base64,BING';
 			}
 			const card = document.createElement('div');
 			card.className = `game-card ${animClass} ${activeClass} ${favClass}`
@@ -28188,7 +28241,7 @@ P
 						<span class="playing-now-label">PLAYING NOW</span>
 						<span class="dot">.</span><span class="dot">.</span><span class="dot">.</span>
 					</div>` : ''}
-					<img src="${displayCover}" class="game-img" data-cover-key="${escapeCategoryDotAttr(localCoverKey)}" data-lib-path="${game.path.replace(/"/g, '&quot;')}" data-name="${game.title.replace(/"/g, '&quot;')}" data-console="${consoleType}" onload="markCoverLoaded(this)" onerror="getOnlineCoverFallback(this)">
+					<img src="${escapeCategoryDotAttr(displayCover)}" class="game-img" data-cover-key="${escapeCategoryDotAttr(localCoverKey)}" data-cover-category="library" data-title-id="${escapeCategoryDotAttr(cachedData.id || '')}" data-github-cover="${escapeCategoryDotAttr(cachedData.githubCover || '')}" data-webman-cover="${escapeCategoryDotAttr(cachedData.webmanCover || '')}" data-lib-path="${game.path.replace(/"/g, '&quot;')}" data-name="${game.title.replace(/"/g, '&quot;')}" data-console="${consoleType}" onload="markCoverLoaded(this)" onerror="handleLibraryCoverError(this)">
 					<div class="console-tag ${tagClass}">${consoleType}</div>
 					<div class="region-tag">${region}</div>
 					<div class="fav-btn" style="cursor: pointer;" title="${starTooltip}" onclick="toggleLocalFavorite(event, ${lastScannedGames.indexOf(game)})">
@@ -28382,9 +28435,11 @@ P
 		checkTrophyProgress('fav_1', favoritesLibrary.length);
 		checkTrophyProgress('fav_10', favoritesLibrary.length);
 	
-		const activeFavs = favoritesLibrary.filter(fav =>
-			lastScannedGames.some(installed => installed.path === fav.path)
-		);
+		const activeFavs = favoritesLibrary.map(fav => {
+			const installed = lastScannedGames.find(item => item.path === fav.path);
+			if (!installed) return null;
+			return { ...fav, ...installed, date: fav.date || installed.date || '' };
+		}).filter(Boolean);
 		
 		if (activeFavs.length === 0) {
 			if (typeof window.clearCategoryDotPending === 'function') {
@@ -28621,15 +28676,9 @@ P
 			if (pathUpper.includes("USB")) region = "USB";
 			else if (pathUpper.includes("NET")) region = "NET";
 	
-			if (!window.libCoverCache[game.path]) {
-				const matchId = game.path.match(/[A-Z]{4}\d{5}/);
-				const gameId = matchId ? matchId[0] : null;
-				window.libCoverCache[game.path] = {
-					id: gameId,
-					cover: (gameId && isNaN(gameId)) ? getOptimizedCover(gameId) : (game.cover || FALLBACK_IMG)
-				};
-			}
-			const cachedData = window.libCoverCache[game.path];
+			const matchId = game.path.match(/[A-Z]{4}\d{5}/);
+			const gameId = game.id || (matchId ? matchId[0] : null);
+			const cachedData = ensureLibraryCoverCache(game, gameId);
 
 			const isThisGamePlaying = (currentPlaying.status === 'playing' && 
 									(game.title === currentPlaying.title || (cachedData.id && cachedData.id === currentPlaying.titleId)));
@@ -28698,9 +28747,10 @@ P
 
 			const card = document.createElement('div');
 			const favDotKey = (typeof getFavoriteDotKey === 'function') ? getFavoriteDotKey(game) : (game.path || game.title || '');
-			let displayCover = (typeof window.getCachedCardCoverSrc === 'function' ? window.getCachedCardCoverSrc(favDotKey) : '') || cachedData.cover;
+			const preferredLibraryCover = getLibraryPreferredCover(game, cachedData);
+			let displayCover = cachedData.webmanCover || ((typeof window.getCachedCardCoverSrc === 'function' ? window.getCachedCardCoverSrc(favDotKey, 'library', preferredLibraryCover) : '') || preferredLibraryCover);
 			if ((!displayCover || displayCover === FALLBACK_IMG || /NOCOVER00\.JPG/i.test(String(displayCover))) && game.title) {
-				displayCover = 'data:image/png;base64,BING';
+				displayCover = cachedData.githubCover || 'data:image/png;base64,BING';
 			}
 			card.className = `game-card ${animClass} ${isSilent ? "no-img-fade" : ""} ${activeClass} is-favorited`;
 			card.style.setProperty('--tile-idx', i % 50);
@@ -28714,7 +28764,7 @@ P
 						<span class="playing-now-label">PLAYING NOW</span>
 						<span class="dot">.</span><span class="dot">.</span><span class="dot">.</span>
 					</div>` : ''}
-					<img src="${displayCover}" class="game-img" data-cover-key="${escapeCategoryDotAttr(favDotKey)}" data-lib-path="${game.path.replace(/"/g, '&quot;')}" data-name="${game.title.replace(/"/g, '&quot;')}" data-console="${consoleType}" onload="markCoverLoaded(this)" onerror="getOnlineCoverFallback(this)">
+					<img src="${escapeCategoryDotAttr(displayCover)}" class="game-img" data-cover-key="${escapeCategoryDotAttr(favDotKey)}" data-cover-category="library" data-title-id="${escapeCategoryDotAttr(cachedData.id || '')}" data-github-cover="${escapeCategoryDotAttr(cachedData.githubCover || '')}" data-webman-cover="${escapeCategoryDotAttr(cachedData.webmanCover || '')}" data-lib-path="${game.path.replace(/"/g, '&quot;')}" data-name="${game.title.replace(/"/g, '&quot;')}" data-console="${consoleType}" onload="markCoverLoaded(this)" onerror="handleLibraryCoverError(this)">
 					<div class="console-tag ${tagClass}">${consoleType}</div>
 					<div class="region-tag">${region}</div>
 					<div class="fav-btn active" style="cursor: pointer;" title="Remove from Favorites" onclick="removeFromFavsOnly(event, ${i})">
@@ -29101,6 +29151,9 @@ P
 		boost: { label: 'Boost', subtitle: 'High performance profile', rsx: 850, vram: 1000, popup: 'Boost%20Mode' },
 		power: { label: 'Default', subtitle: 'Stock RSX profile', rsx: 500, vram: 650, popup: 'Default%20Mode' }
 	};
+	let consolePerformanceSelectedMode = 'balanced';
+	let consolePerformanceLiveClocks = null;
+	let consolePerformanceRefreshPromise = null;
 
 	function clampConsoleValue(value, min, max) {
 		const number = Number(value);
@@ -30369,7 +30422,7 @@ P
 	};
 
 	function getConsolePerformancePreset(mode = null) {
-		let cleanMode = mode || loadState(STORAGE_KEY_PERFORMANCE_MODE) || 'balanced';
+		let cleanMode = mode || consolePerformanceSelectedMode || 'balanced';
 		if (cleanMode === 'power') cleanMode = 'default';
 		if (cleanMode === 'custom') {
 			const rsx = clampConsoleValue(loadState(STORAGE_KEY_PERFORMANCE_RSX) || 650, 300, 1200);
@@ -30474,62 +30527,88 @@ P
 		if (icon) icon.style.filter = `drop-shadow(0 0 9px ${glow})`;
 	}
 
-	function updateConsolePerformanceUI(mode = null) {
-		const currentMode = mode || loadState(STORAGE_KEY_PERFORMANCE_MODE) || 'balanced';
-		const preset = getConsolePerformancePreset(currentMode);
+	function hydrateConsoleCustomPerformanceInputs() {
+		const rsxInput = document.getElementById('console-custom-rsx');
+		const vramInput = document.getElementById('console-custom-vram');
+		if (rsxInput && document.activeElement !== rsxInput) rsxInput.value = clampConsoleValue(loadState(STORAGE_KEY_PERFORMANCE_RSX) || 650, 300, 1200);
+		if (vramInput && document.activeElement !== vramInput) vramInput.value = clampConsoleValue(loadState(STORAGE_KEY_PERFORMANCE_VRAM) || 850, 300, 1200);
+	}
+
+	function getConsolePerformanceModeFromClocks(clocks) {
+		if (!clocks) return 'custom';
+		for (const mode of ['default', 'balanced', 'boost']) {
+			const preset = CONSOLE_PERFORMANCE_PRESETS[mode];
+			if (Math.round(clocks.rsx) === Math.round(preset.rsx) && Math.round(clocks.vram) === Math.round(preset.vram)) return mode;
+		}
+		return 'custom';
+	}
+
+	function renderConsolePerformanceLive(clocks, statusText = 'Live') {
+		if (!clocks) return false;
+		consolePerformanceLiveClocks = { rsx: Math.round(clocks.rsx), vram: Math.round(clocks.vram) };
+		const mode = getConsolePerformanceModeFromClocks(consolePerformanceLiveClocks);
+		const base = mode === 'custom'
+			? { label: 'Custom', subtitle: 'Live PS3™ clocks', popup: 'Custom%20Performance', mode: 'custom' }
+			: { ...CONSOLE_PERFORMANCE_PRESETS[mode], mode };
+		const livePreset = { ...base, ...consolePerformanceLiveClocks };
 		const label = document.getElementById('console-performance-mode-label');
 		const subtitle = document.getElementById('console-performance-subtitle');
 		const rsx = document.getElementById('console-rsx-clock');
 		const vram = document.getElementById('console-vram-clock');
 		const status = document.getElementById('console-performance-status');
 		const ring = document.getElementById('console-performance-ring');
-		const rsxInput = document.getElementById('console-custom-rsx');
-		const vramInput = document.getElementById('console-custom-vram');
+		if (label) label.textContent = livePreset.label;
+		if (subtitle) subtitle.textContent = mode === 'custom' ? 'Live PS3™ clocks' : livePreset.subtitle;
+		if (rsx) rsx.textContent = `${livePreset.rsx} MHz`;
+		if (vram) vram.textContent = `${livePreset.vram} MHz`;
+		if (status) status.textContent = statusText;
+		document.querySelectorAll('.console-performance-actions .console-performance-btn').forEach(btn => btn.classList.remove('active'));
+		const activeBtn = document.getElementById(`perf-mode-${mode}`);
+		if (activeBtn) activeBtn.classList.add('active');
+		if (ring) updateConsolePerformanceRing(ring, livePreset);
+		hydrateConsoleCustomPerformanceInputs();
+		return true;
+	}
+
+	function updateConsolePerformanceUI(mode = null) {
+		const currentMode = mode || consolePerformanceSelectedMode || 'balanced';
+		consolePerformanceSelectedMode = currentMode === 'power' ? 'default' : currentMode;
+		const preset = getConsolePerformancePreset(consolePerformanceSelectedMode);
+		const label = document.getElementById('console-performance-mode-label');
+		const subtitle = document.getElementById('console-performance-subtitle');
+		const rsx = document.getElementById('console-rsx-clock');
+		const vram = document.getElementById('console-vram-clock');
+		const ring = document.getElementById('console-performance-ring');
 		if (label) label.textContent = preset.label;
 		if (subtitle) subtitle.textContent = preset.subtitle;
 		if (rsx) rsx.textContent = `${preset.rsx} MHz`;
 		if (vram) vram.textContent = `${preset.vram} MHz`;
-		if (status) status.textContent = 'Saved';
-		if (rsxInput) rsxInput.value = preset.rsx;
-		if (vramInput) vramInput.value = preset.vram;
 		document.querySelectorAll('.console-performance-actions .console-performance-btn').forEach(btn => btn.classList.remove('active'));
 		const activeBtn = document.getElementById(`perf-mode-${preset.mode}`);
 		if (activeBtn) activeBtn.classList.add('active');
 		if (ring) updateConsolePerformanceRing(ring, preset);
+		if (preset.mode === 'custom') hydrateConsoleCustomPerformanceInputs();
 	}
 
 
 	function parseConsolePerformanceClocksFromText(raw) {
-		const text = String(raw || '').replace(/\s+/g, ' ');
-		let rsx = parseConsoleNumber(text, /(?:GPU|RSX|Core)[^0-9]{0,32}(\d{3,4})\s*(?:MHz)?/i);
-		let vram = parseConsoleNumber(text, /(?:VRAM|MEM(?:ORY)?)[^0-9]{0,32}(\d{3,4})\s*(?:MHz)?/i);
-		const pair = text.match(/(\d{3,4})\s*\|\s*(\d{3,4})/);
-		if ((!rsx || !vram) && pair) { rsx = Number(pair[1]); vram = Number(pair[2]); }
-		if (!rsx || !vram) {
-			const nums = [...text.matchAll(/\b(3\d{2}|4\d{2}|5\d{2}|6\d{2}|7\d{2}|8\d{2}|9\d{2}|10\d{2}|11\d{2}|1200)\b/g)].map(m => Number(m[1]));
-			if (!rsx && nums.length) rsx = nums[0];
-			if (!vram && nums.length > 1) vram = nums[1];
-		}
-		if (!rsx || !vram) return null;
+		const text = String(raw || '')
+			.replace(/<[^>]+>/g, ' ')
+			.replace(/&(?:bull|middot|nbsp);/gi, ' ')
+			.replace(/\s+/g, ' ');
+		const gpuMatch = text.match(/\bGPU\s*[:=]?\s*(\d{3,4})\s*MHz\b/i);
+		const vramMatch = text.match(/\bVRAM\s*[:=]?\s*(\d{3,4})\s*MHz\b/i);
+		if (!gpuMatch || !vramMatch) return null;
+		const rsx = Number(gpuMatch[1]);
+		const vram = Number(vramMatch[1]);
+		if (!Number.isFinite(rsx) || !Number.isFinite(vram)) return null;
 		return { rsx: clampConsoleValue(rsx, 300, 1200), vram: clampConsoleValue(vram, 300, 1200) };
 	}
 
 	async function refreshConsolePerformanceClocks() {
-		try {
-			const raw = await fetchConsoleReadableText('/gpuclock.ps3', 9000);
-			const clocks = parseConsolePerformanceClocksFromText(raw);
-			if (!clocks) return false;
-			saveState(STORAGE_KEY_PERFORMANCE_MODE, 'custom');
-			saveState(STORAGE_KEY_PERFORMANCE_RSX, String(clocks.rsx));
-			saveState(STORAGE_KEY_PERFORMANCE_VRAM, String(clocks.vram));
-			updateConsolePerformanceUI('custom');
-			const status = document.getElementById('console-performance-status');
-			if (status) status.textContent = 'Live';
-			return true;
-		} catch (err) {
-			console.warn('[Console Dashboard] Could not read GPU clocks:', err);
-			return false;
-		}
+		if (!consolePerformanceLiveClocks) return false;
+		renderConsolePerformanceLive(consolePerformanceLiveClocks, 'Live');
+		return true;
 	}
 	window.refreshConsolePerformanceClocks = refreshConsolePerformanceClocks;
 
@@ -30539,15 +30618,11 @@ P
 		await sendConsoleDashboardCommand(`/gpuclock.ps3?${Math.round(preset.rsx)}|${Math.round(preset.vram)}`);
 		await sendConsoleDashboardCommand(`/popup.ps3?${preset.popup}%20${Math.round(preset.rsx)}%2F${Math.round(preset.vram)}%20MHz&icon=0&snd=8`, 5000);
 		if (status) status.textContent = 'Sent';
-		setTimeout(async () => { if (!(await refreshConsolePerformanceClocks())) updateConsolePerformanceUI(preset.mode); }, 1200);
 	}
 
 	window.setConsolePerformanceMode = function(mode = 'balanced') {
-		const preset = getConsolePerformancePreset(mode);
-		saveState(STORAGE_KEY_PERFORMANCE_MODE, preset.mode);
-		saveState(STORAGE_KEY_PERFORMANCE_RSX, String(preset.rsx));
-		saveState(STORAGE_KEY_PERFORMANCE_VRAM, String(preset.vram));
-		updateConsolePerformanceUI(preset.mode);
+		consolePerformanceSelectedMode = mode === 'power' ? 'default' : mode;
+		updateConsolePerformanceUI(consolePerformanceSelectedMode);
 		const status = document.getElementById('console-performance-status');
 		if (status) status.textContent = 'Pending';
 		if (typeof playUiArrow === 'function') playUiArrow();
@@ -30572,7 +30647,7 @@ P
 		if (subtitle) subtitle.textContent = 'User defined clocks';
 		document.querySelectorAll('.console-performance-actions .console-performance-btn').forEach(btn => btn.classList.remove('active'));
 		document.getElementById('perf-mode-custom')?.classList.add('active');
-		saveState(STORAGE_KEY_PERFORMANCE_MODE, 'custom');
+		consolePerformanceSelectedMode = 'custom';
 		if (ring) {
 			updateConsolePerformanceRing(ring, { rsx, vram, mode: 'custom' });
 			ring.classList.add('is-live-preview');
@@ -30597,7 +30672,7 @@ P
 	};
 
 	window.applyConsolePerformanceSettings = async function(btnElement = null) {
-		let mode = loadState(STORAGE_KEY_PERFORMANCE_MODE) || 'balanced';
+		let mode = consolePerformanceSelectedMode || 'balanced';
 		if (mode === 'power') mode = 'default';
 		if (mode === 'custom') {
 			const rsxInput = document.getElementById('console-custom-rsx');
@@ -30606,11 +30681,10 @@ P
 			const vram = clampConsoleValue(vramInput?.value || 850, 300, 1200);
 			saveState(STORAGE_KEY_PERFORMANCE_RSX, String(rsx));
 			saveState(STORAGE_KEY_PERFORMANCE_VRAM, String(vram));
+			if (typeof markProfileSettingsChanged === 'function') markProfileSettingsChanged();
+			if (typeof syncRuntimePluginPreferencesToServer === 'function') syncRuntimePluginPreferencesToServer();
 		}
-		saveState(STORAGE_KEY_PERFORMANCE_MODE, mode);
-		if (typeof markProfileSettingsChanged === 'function') markProfileSettingsChanged();
 		updateConsolePerformanceUI(mode);
-		if (typeof syncRuntimePluginPreferencesToServer === 'function') syncRuntimePluginPreferencesToServer();
 		try {
 			const preset = getConsolePerformancePreset(mode);
 			await sendConsolePerformanceClocks(preset);
@@ -31069,6 +31143,7 @@ P
 		const free = parseConsoleNumber(text, /Free[^0-9]{0,30}(\d+(?:[\.,]\d+)?)\s*GB/i);
 		const total = parseConsoleNumber(text, /Total[^0-9]{0,30}(\d+(?:[\.,]\d+)?)\s*GB/i);
 		const liveMode = parseConsoleFanModeFromText(text, loadState(STORAGE_KEY_CONSOLE_FAN_MODE) || 'dynamic');
+		const livePerformanceClocks = parseConsolePerformanceClocksFromText(text);
 		updateConsoleRuntimeUI(parseConsoleRuntimeFromWebmanHtml(html));
 		updateConsoleSystemInfoUI(parseConsoleSystemInfoFromWebmanHtml(html));
 		updateConsoleLibraryStatusUI();
@@ -31077,6 +31152,8 @@ P
 			if (target) saveState(STORAGE_KEY_CONSOLE_FAN_TARGET, String(target));
 			if (fan || target) updateConsoleFanUI(fan || loadState(STORAGE_KEY_CONSOLE_FAN_SPEED) || 35, liveMode, target || null);
 		}
+		const perfStatus = document.getElementById('console-performance-status');
+		if (livePerformanceClocks && (!perfStatus || perfStatus.textContent !== 'Pending')) renderConsolePerformanceLive(livePerformanceClocks, 'Live');
 		if (free && total) {
 			updateConsoleStorageUI(free, total, detectConsoleStorageDevicesFromText(text, free, total));
 		} else if (live && typeof refreshConsoleStorageFromFileManager === 'function') {
@@ -31098,7 +31175,21 @@ P
 		updateConsoleLibraryStatusUI();
 		if (!isLive) return;
 		updateConsoleFanUI();
-		updateConsolePerformanceUI();
+		hydrateConsoleCustomPerformanceInputs();
+		const perfStatus = document.getElementById('console-performance-status');
+		if (consolePerformanceLiveClocks && (!perfStatus || perfStatus.textContent !== 'Pending')) {
+			renderConsolePerformanceLive(consolePerformanceLiveClocks, 'Live');
+		} else if (!consolePerformanceLiveClocks && (!perfStatus || perfStatus.textContent !== 'Pending')) {
+			const rsxClock = document.getElementById('console-rsx-clock');
+			const vramClock = document.getElementById('console-vram-clock');
+			const perfLabel = document.getElementById('console-performance-mode-label');
+			const perfSubtitle = document.getElementById('console-performance-subtitle');
+			if (perfStatus) perfStatus.textContent = 'Reading';
+			if (rsxClock) rsxClock.textContent = '-- MHz';
+			if (vramClock) vramClock.textContent = '-- MHz';
+			if (perfLabel) perfLabel.textContent = 'Reading';
+			if (perfSubtitle) perfSubtitle.textContent = 'Reading live clocks from PS3™';
+		}
 		if (typeof refreshConsoleStorageFromFileManager === 'function') refreshConsoleStorageFromFileManager(true);
 		if (typeof refreshConsoleTaskManager === 'function') refreshConsoleTaskManager(false);
 	}
