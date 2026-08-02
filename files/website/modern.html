@@ -29153,7 +29153,6 @@ P
 	};
 	let consolePerformanceSelectedMode = 'balanced';
 	let consolePerformanceLiveClocks = null;
-	let consolePerformanceRefreshPromise = null;
 
 	function clampConsoleValue(value, min, max) {
 		const number = Number(value);
@@ -29189,6 +29188,7 @@ P
 
 	function setConsoleDashboardMode(isLive) {
 		const live = !!isLive;
+		if (!live) consolePerformanceLiveClocks = null;
 		const mode = document.getElementById('console-dashboard-mode');
 		const monitorStatus = document.getElementById('system-monitor-status');
 		if (mode) {
@@ -30616,12 +30616,20 @@ P
 		const status = document.getElementById('console-performance-status');
 		if (status) status.textContent = 'Queued';
 		await sendConsoleDashboardCommand(`/gpuclock.ps3?${Math.round(preset.rsx)}|${Math.round(preset.vram)}`);
-		await sendConsoleDashboardCommand(`/popup.ps3?${preset.popup}%20${Math.round(preset.rsx)}%2F${Math.round(preset.vram)}%20MHz&icon=0&snd=8`, 5000);
 		if (status) status.textContent = 'Sent';
 	}
 
 	window.setConsolePerformanceMode = function(mode = 'balanced') {
 		consolePerformanceSelectedMode = mode === 'power' ? 'default' : mode;
+		const rsxInput = document.getElementById('console-custom-rsx');
+		const vramInput = document.getElementById('console-custom-vram');
+		if (consolePerformanceSelectedMode === 'custom') {
+			hydrateConsoleCustomPerformanceInputs();
+		} else {
+			const preset = getConsolePerformancePreset(consolePerformanceSelectedMode);
+			if (rsxInput) rsxInput.value = Math.round(preset.rsx);
+			if (vramInput) vramInput.value = Math.round(preset.vram);
+		}
 		updateConsolePerformanceUI(consolePerformanceSelectedMode);
 		const status = document.getElementById('console-performance-status');
 		if (status) status.textContent = 'Pending';
@@ -30672,23 +30680,25 @@ P
 	};
 
 	window.applyConsolePerformanceSettings = async function(btnElement = null) {
-		let mode = consolePerformanceSelectedMode || 'balanced';
-		if (mode === 'power') mode = 'default';
-		if (mode === 'custom') {
-			const rsxInput = document.getElementById('console-custom-rsx');
-			const vramInput = document.getElementById('console-custom-vram');
-			const rsx = clampConsoleValue(rsxInput?.value || 650, 300, 1200);
-			const vram = clampConsoleValue(vramInput?.value || 850, 300, 1200);
+		const rsxInput = document.getElementById('console-custom-rsx');
+		const vramInput = document.getElementById('console-custom-vram');
+		const rsx = clampConsoleValue(rsxInput?.value || loadState(STORAGE_KEY_PERFORMANCE_RSX) || 650, 300, 1200);
+		const vram = clampConsoleValue(vramInput?.value || loadState(STORAGE_KEY_PERFORMANCE_VRAM) || 850, 300, 1200);
+		const preset = { label: 'Custom', subtitle: 'User defined clocks', rsx, vram, mode: 'custom' };
+
+		const appliedMode = consolePerformanceSelectedMode || 'custom';
+		if (appliedMode === 'custom') {
 			saveState(STORAGE_KEY_PERFORMANCE_RSX, String(rsx));
 			saveState(STORAGE_KEY_PERFORMANCE_VRAM, String(vram));
 			if (typeof markProfileSettingsChanged === 'function') markProfileSettingsChanged();
 			if (typeof syncRuntimePluginPreferencesToServer === 'function') syncRuntimePluginPreferencesToServer();
 		}
-		updateConsolePerformanceUI(mode);
+		updateConsolePerformanceUI(appliedMode);
+
 		try {
-			const preset = getConsolePerformancePreset(mode);
 			await sendConsolePerformanceClocks(preset);
-			showConsoleActionToast('Performance', `${preset.label} ${Math.round(preset.rsx)}/${Math.round(preset.vram)} MHz sent to PS3™.`);
+			const sentLabel = appliedMode === 'custom' ? 'Custom' : getConsolePerformancePreset(appliedMode).label;
+			showConsoleActionToast('Performance', `${sentLabel} ${Math.round(rsx)}/${Math.round(vram)} MHz sent to PS3™.`);
 			flashConsoleApplyButton(btnElement, 'Sent');
 		} catch (err) {
 			console.warn('[Console Dashboard] Performance command failed:', err);
