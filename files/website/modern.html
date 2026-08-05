@@ -7946,6 +7946,69 @@ P
 	}
 	window.playMessageSound = playMessageSound;
 	
+	const SERVER_BACKED_LARGE_STORAGE_PATTERNS = [
+		/(^|_)psn_user_trophies$/,
+		/(^|_)psn_wishlist_db$/,
+		/(^|_)psn_dl_history$/,
+		/(^|_)ps3_library_favs$/,
+		/(^|_)psn_local_library$/,
+		/(^|_)psn_friends_list$/,
+		/^psn_admin_server_log$/,
+		/^psn_admin_moderation_log$/
+	];
+
+	function isServerBackedLargeStorageKey(key) {
+		const cleanKey = String(key || '');
+		return SERVER_BACKED_LARGE_STORAGE_PATTERNS.some(pattern => pattern.test(cleanKey));
+	}
+
+	function cleanupServerBackedLocalStorage() {
+		try {
+			const keysToRemove = [];
+			for (let i = 0; i < localStorage.length; i++) {
+				const key = localStorage.key(i);
+				if (key && isServerBackedLargeStorageKey(key)) keysToRemove.push(key);
+			}
+			keysToRemove.forEach(key => {
+				try { localStorage.removeItem(key); } catch (e) {}
+			});
+			return keysToRemove.length;
+		} catch (err) {
+			return 0;
+		}
+	}
+
+	function safeLocalStorageSet(key, value) {
+		const cleanKey = String(key || '');
+		if (!cleanKey) return false;
+
+		if (isServerBackedLargeStorageKey(cleanKey)) return true;
+
+		const write = () => window.localStorage.setItem(cleanKey, String(value));
+		try {
+			write();
+			return true;
+		} catch (err) {
+			const quotaError = !!(err && (err.name === 'QuotaExceededError' || err.code === 22 || err.code === 1014));
+			if (!quotaError) throw err;
+
+			cleanupServerBackedLocalStorage();
+			try {
+				write();
+				return true;
+			} catch (retryErr) {
+				if (!window.__psnStorageQuotaWarned) {
+					window.__psnStorageQuotaWarned = true;
+					console.warn('[STORAGE] Browser storage is full. Server-backed profile data will remain on the server instead of localStorage.');
+				}
+				return false;
+			}
+		}
+	}
+	window.safeLocalStorageSet = safeLocalStorageSet;
+	window.cleanupServerBackedLocalStorage = cleanupServerBackedLocalStorage;
+	cleanupServerBackedLocalStorage();
+
 	/* ========================================================================== MOBILE HAPTIC FEEDBACK ========================================================================== */
 	const psnHapticPatterns = {
 		success: [{ duration: 34, intensity: 0.75 }, { delay: 55, duration: 44, intensity: 1 }],
@@ -8008,9 +8071,9 @@ P
 		const clean = value === "0" ? "0" : "1";
 		try {
 			if (typeof saveState === 'function') saveState(key, clean);
-			else localStorage.setItem(key, clean);
+			else safeLocalStorageSet(key, clean);
 		} catch (e) {}
-		try { localStorage.setItem('psn_haptic_feedback_state', clean); } catch (e) {}
+		try { safeLocalStorageSet('psn_haptic_feedback_state', clean); } catch (e) {}
 	}
 
 	function isPsnHapticFeedbackEnabled() {
@@ -8600,7 +8663,7 @@ P
 		const code = normalizeProfileCountryCode(value);
 		if (!code) return;
 		try {
-			localStorage.setItem(PROFILE_COUNTRY_GEO_CACHE_KEY, JSON.stringify({ code, savedAt: Date.now() }));
+			safeLocalStorageSet(PROFILE_COUNTRY_GEO_CACHE_KEY, JSON.stringify({ code, savedAt: Date.now() }));
 		} catch (err) {}
 	}
 
@@ -8655,7 +8718,7 @@ P
 		const code = normalizeProfileCountryCode(value);
 		if (!username || !code) return '';
 		const activeUser = localStorage.getItem('psn_username') || '';
-		localStorage.setItem(`${username}_${STORAGE_KEY_PROFILE_COUNTRY}`, code);
+		safeLocalStorageSet(`${username}_${STORAGE_KEY_PROFILE_COUNTRY}`, code);
 		if (username === activeUser) saveState(STORAGE_KEY_PROFILE_COUNTRY, code);
 		if (options.sync !== false && username === activeUser && window.isProfileLoaded) {
 			if (typeof markProfileSettingsChanged === 'function') markProfileSettingsChanged();
@@ -8938,7 +9001,7 @@ P
         if (!users.includes(username)) {
             if (users.length < 3) {
                 users.push(username);
-                localStorage.setItem(GLOBAL_USERS_KEY, JSON.stringify(users));
+                safeLocalStorageSet(GLOBAL_USERS_KEY, JSON.stringify(users));
                 return true;
             }
             return false;
@@ -8954,7 +9017,7 @@ P
 		const executeDelete = () => {
 			let users = getAllUsers();
 			users = users.filter(u => u !== username);
-			localStorage.setItem(GLOBAL_USERS_KEY, JSON.stringify(users));
+			safeLocalStorageSet(GLOBAL_USERS_KEY, JSON.stringify(users));
 	
 			if (users.length === 0) {
 				isEditMode = false;
@@ -9192,7 +9255,7 @@ P
     
     function saveState(key, value) {
         const finalKey = getUserKey(key);
-        window.localStorage.setItem(finalKey, value); 
+        return safeLocalStorageSet(finalKey, value);
     }
     
     function loadState(key) {
@@ -9222,8 +9285,8 @@ P
 		if (!timestamp) return 0;
 		const activeUser = localStorage.getItem('psn_username') || '';
 		const safeUser = username || activeUser || '';
-		if (safeUser && safeUser !== "null") localStorage.setItem(`${safeUser}_${STORAGE_KEY_SETTINGS_UPDATED_AT}`, String(timestamp));
-		if (!safeUser || safeUser === activeUser) localStorage.setItem(STORAGE_KEY_SETTINGS_UPDATED_AT, String(timestamp));
+		if (safeUser && safeUser !== "null") safeLocalStorageSet(`${safeUser}_${STORAGE_KEY_SETTINGS_UPDATED_AT}`, String(timestamp));
+		if (!safeUser || safeUser === activeUser) safeLocalStorageSet(STORAGE_KEY_SETTINGS_UPDATED_AT, String(timestamp));
 		return timestamp;
 	}
 
@@ -9247,8 +9310,8 @@ P
 		if (!timestamp) return 0;
 		const activeUser = localStorage.getItem('psn_username') || '';
 		const safeUser = username || activeUser || '';
-		if (safeUser && safeUser !== "null") localStorage.setItem(`${safeUser}_${STORAGE_KEY_THEME_COLOR_UPDATED_AT}`, String(timestamp));
-		if (!safeUser || safeUser === activeUser) localStorage.setItem(STORAGE_KEY_THEME_COLOR_UPDATED_AT, String(timestamp));
+		if (safeUser && safeUser !== "null") safeLocalStorageSet(`${safeUser}_${STORAGE_KEY_THEME_COLOR_UPDATED_AT}`, String(timestamp));
+		if (!safeUser || safeUser === activeUser) safeLocalStorageSet(STORAGE_KEY_THEME_COLOR_UPDATED_AT, String(timestamp));
 		return timestamp;
 	}
 
@@ -9270,8 +9333,8 @@ P
 		if (!timestamp) return 0;
 		const activeUser = localStorage.getItem('psn_username') || '';
 		const safeUser = username || activeUser || '';
-		if (safeUser && safeUser !== "null") localStorage.setItem(`${safeUser}_${STORAGE_KEY_PROFILE_CARD_STYLE_UPDATED_AT}`, String(timestamp));
-		if (!safeUser || safeUser === activeUser) localStorage.setItem(STORAGE_KEY_PROFILE_CARD_STYLE_UPDATED_AT, String(timestamp));
+		if (safeUser && safeUser !== "null") safeLocalStorageSet(`${safeUser}_${STORAGE_KEY_PROFILE_CARD_STYLE_UPDATED_AT}`, String(timestamp));
+		if (!safeUser || safeUser === activeUser) safeLocalStorageSet(STORAGE_KEY_PROFILE_CARD_STYLE_UPDATED_AT, String(timestamp));
 		return timestamp;
 	}
 
@@ -9287,7 +9350,7 @@ P
 	function setProfileListUpdatedAtForUser(username, type, value) {
 		const timestamp = normalizeProfileListTimestamp(value);
 		if (!username || username === "null" || !timestamp) return 0;
-		localStorage.setItem(`${username}_${getProfileListTimestampStorageKey(type)}`, String(timestamp));
+		safeLocalStorageSet(`${username}_${getProfileListTimestampStorageKey(type)}`, String(timestamp));
 		return timestamp;
 	}
 
@@ -9430,7 +9493,7 @@ P
 
 	function writeSyncedSettingForUser(username, key, value) {
 		if (!username || username === "null" || typeof key === 'undefined') return;
-		localStorage.setItem(`${username}_${key}`, String(value));
+		safeLocalStorageSet(`${username}_${key}`, String(value));
 	}
 
 
@@ -9582,7 +9645,8 @@ P
 
 		const incomingSettingsUpdatedAt = Number(incomingSettings.settingsUpdatedAt || incomingSettings.settingsSyncedAt || incomingSettings.settingsVersion || options.userData?.settingsUpdatedAt || options.payload?.settingsUpdatedAt || options.userData?.profileUpdatedAt || options.incomingProfileUpdatedAt || 0);
 		const currentSettingsUpdatedAt = (typeof getProfileSettingsUpdatedAtForUser === 'function') ? getProfileSettingsUpdatedAtForUser(name) : 0;
-		if (incomingSettingsUpdatedAt && currentSettingsUpdatedAt && incomingSettingsUpdatedAt < currentSettingsUpdatedAt) return null;
+		const serverAuthoritative = options.serverAuthoritative === true;
+		if (!serverAuthoritative && incomingSettingsUpdatedAt && currentSettingsUpdatedAt && incomingSettingsUpdatedAt < currentSettingsUpdatedAt) return null;
 		if (incomingSettingsUpdatedAt && typeof setProfileSettingsUpdatedAtForUser === 'function') setProfileSettingsUpdatedAtForUser(name, incomingSettingsUpdatedAt);
 		if (typeof applySiteDisclaimerSkipTodayFromSettings === 'function') applySiteDisclaimerSkipTodayFromSettings(name, incomingSettings.siteDisclaimerSkipToday);
 
@@ -9597,7 +9661,7 @@ P
 		writeSyncedSettingForUser(name, STORAGE_KEY_INTERFACE_AUTO_TRANSLATE, next.interfaceAutoTranslate);
 		if (name === (localStorage.getItem('psn_username') || '')) {
 			saveState(STORAGE_KEY_INTERFACE_AUTO_TRANSLATE, next.interfaceAutoTranslate);
-			localStorage.setItem(STORAGE_KEY_INTERFACE_AUTO_TRANSLATE_LAST, next.interfaceAutoTranslate);
+			safeLocalStorageSet(STORAGE_KEY_INTERFACE_AUTO_TRANSLATE_LAST, next.interfaceAutoTranslate);
 		}
 		writeSyncedSettingForUser(name, STORAGE_KEY_COMPANION_PLUGIN, next.companionPlugin);
 		writeSyncedSettingForUser(name, STORAGE_KEY_FPS_COUNTER, next.fpsCounterPlugin);
@@ -9610,8 +9674,8 @@ P
 		writeSyncedSettingForUser(name, STORAGE_KEY_PERFORMANCE_VRAM, next.performanceVram);
 		writeSyncedSettingForUser(name, STORAGE_KEY_PROFILE_COUNTRY, next.countryCode);
 		if (name === (localStorage.getItem('psn_username') || '')) saveState(STORAGE_KEY_PROFILE_COUNTRY, next.countryCode);
-		localStorage.setItem(`${name}_ps3_ip`, next.ps3Ip);
-		localStorage.setItem('ps3_ip', next.ps3Ip);
+		safeLocalStorageSet(`${name}_ps3_ip`, next.ps3Ip);
+		safeLocalStorageSet('ps3_ip', next.ps3Ip);
 
 		if (typeof STORAGE_KEY_PROFILE_CARD_STYLE !== 'undefined' && (incomingSettings.profileCardStyle || incomingSettings.profileCardEffect || incomingSettings.profileCardTheme)) {
 			const incomingProfileCardStyle = (typeof normalizeProfileCardStyle === 'function') ? normalizeProfileCardStyle(incomingSettings.profileCardStyle || incomingSettings.profileCardEffect || incomingSettings.profileCardTheme || 'default') : (incomingSettings.profileCardStyle || incomingSettings.profileCardEffect || incomingSettings.profileCardTheme || 'default');
@@ -9621,7 +9685,7 @@ P
 			if (incomingProfileCardStyleUpdatedAt && typeof setProfileCardStyleUpdatedAtForUser === 'function') setProfileCardStyleUpdatedAtForUser(name, incomingProfileCardStyleUpdatedAt);
 			if (name === localStorage.getItem('psn_username')) {
 				saveState(STORAGE_KEY_PROFILE_CARD_STYLE, incomingProfileCardStyle);
-				if (incomingProfileCardStyleUpdatedAt) localStorage.setItem(STORAGE_KEY_PROFILE_CARD_STYLE_UPDATED_AT, String(incomingProfileCardStyleUpdatedAt));
+				if (incomingProfileCardStyleUpdatedAt) safeLocalStorageSet(STORAGE_KEY_PROFILE_CARD_STYLE_UPDATED_AT, String(incomingProfileCardStyleUpdatedAt));
 			}
 			if (typeof refreshOpenProfileCardStyleForUser === 'function') refreshOpenProfileCardStyleForUser(name);
 		}
@@ -9685,15 +9749,15 @@ P
 			) || 0;
 			const currentThemeColorUpdatedAt = (typeof getProfileThemeColorUpdatedAtForUser === 'function') ? getProfileThemeColorUpdatedAtForUser(name) : 0;
 			const currentThemeColor = (localStorage.getItem(`${name}_psn_theme_color`) || (name === localStorage.getItem('psn_username') ? localStorage.getItem('psn_theme_color') : '') || '#0070cc').toLowerCase();
-			const incomingThemeIsFresh = !!(
+			const incomingThemeIsFresh = serverAuthoritative || !!(
 				(incomingThemeColorUpdatedAt && (!currentThemeColorUpdatedAt || incomingThemeColorUpdatedAt >= currentThemeColorUpdatedAt)) ||
 				(!incomingThemeColorUpdatedAt && !currentThemeColorUpdatedAt && (!currentThemeColor || currentThemeColor === '#0070cc'))
 			);
 			if (incomingThemeIsFresh) {
-				localStorage.setItem(`${name}_psn_theme_color`, incomingThemeColor);
+				safeLocalStorageSet(`${name}_psn_theme_color`, incomingThemeColor);
 				if (incomingThemeColorUpdatedAt && typeof setProfileThemeColorUpdatedAtForUser === 'function') setProfileThemeColorUpdatedAtForUser(name, incomingThemeColorUpdatedAt);
 				if (name === localStorage.getItem('psn_username')) {
-					localStorage.setItem('psn_theme_color', incomingThemeColor);
+					safeLocalStorageSet('psn_theme_color', incomingThemeColor);
 					document.documentElement.style.setProperty('--ps-blue', incomingThemeColor);
 					document.documentElement.style.setProperty('--ps-neon', incomingThemeColor + '66');
 					if (typeof updateDynamicCursor === 'function') updateDynamicCursor(incomingThemeColor);
@@ -9936,7 +10000,7 @@ P
 		const result = normalizeDownloadHistoryRecords(history);
 		const activeUser = localStorage.getItem('psn_username');
 		if (activeUser === username) window.downloadHistory = result.history;
-		if (username && username !== 'null') localStorage.setItem(`${username}_${COOKIE_NAME_HISTORY}`, JSON.stringify(result.history));
+		if (username && username !== 'null') safeLocalStorageSet(`${username}_${COOKIE_NAME_HISTORY}`, JSON.stringify(result.history));
 		if (activeUser === username && typeof saveState === 'function') saveState(COOKIE_NAME_HISTORY, JSON.stringify(result.history));
 
 		if (result.changed && options.markChanged === true && activeUser === username) {
@@ -9975,17 +10039,11 @@ P
 
 	function applyIncomingDownloadHistoryForProfile(username, userData = {}, payload = {}) {
 		if (!Array.isArray(userData.downloadsData)) return false;
-		if (shouldRejectStaleIncomingDownloadHistory(username, userData, payload)) {
-			const localDownloads = getLocalDownloadHistoryForProfile(username);
-			if (localStorage.getItem('psn_username') === username) window.downloadHistory = localDownloads;
-			localStorage.setItem(`${username}_${COOKIE_NAME_HISTORY}`, JSON.stringify(localDownloads));
-			return true;
-		}
 
-		const incomingResult = normalizeAndStoreDownloadHistory(username, userData.downloadsData, { markChanged: true, broadcast: true });
+		const incomingResult = normalizeAndStoreDownloadHistory(username, userData.downloadsData, { markChanged: false, broadcast: false });
 		const incomingDownloads = incomingResult.history;
 		const incomingDownloadsUpdatedAt = normalizeProfileListTimestamp(userData.downloadsUpdatedAt || payload.downloadsUpdatedAt || userData.profileUpdatedAt || payload.profileUpdatedAt || Date.now());
-		applyProfileListUpdatedAtFromServer(username, 'downloads', incomingResult.changed ? Date.now() : incomingDownloadsUpdatedAt);
+		applyProfileListUpdatedAtFromServer(username, 'downloads', incomingDownloadsUpdatedAt);
 
 		const incomingDownloadsClearedAt = normalizeProfileListTimestamp(userData.downloadsClearedAt || payload.downloadsClearedAt || 0);
 		const pendingClearAt = getDownloadHistoryClearPendingAt(username);
@@ -10017,140 +10075,6 @@ P
 		return { totalXp, totalTrophies, level: Math.floor(totalXp / 100) + 1 };
 	}
 
-	function buildLocalUserDataForAuth(username) {
-		const activeUser = localStorage.getItem('psn_username');
-		const DEFAULT_URL = "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/interface/modern/images/avatars/default.png";
-		const fallbackAvatar = (typeof AVAILABLE_AVATARS !== 'undefined' && AVAILABLE_AVATARS[0]) ? AVAILABLE_AVATARS[0] : DEFAULT_URL;
-		const localAvatar = readLocalUserValueForAuth(username, 'psn_avatar', null) || fallbackAvatar;
-		const trophiesData = readLocalObjectForAuth(username, 'psn_user_trophies', activeUser === username ? window.userTrophies : null);
-		const trophyPayload = calculateLocalTrophyPayloadForAuth(trophiesData);
-		const rawDownloadsData = readLocalArrayForAuth(username, COOKIE_NAME_HISTORY, activeUser === username ? window.downloadHistory : null);
-		const normalizedDownloadsResult = normalizeAndStoreDownloadHistory(username, rawDownloadsData, { markChanged: true, broadcast: false });
-		const downloadsData = normalizedDownloadsResult.history;
-		const wishlistData = readLocalArrayForAuth(username, STORAGE_KEY_WISHLIST, activeUser === username ? window.wishlist : null);
-		const favoritesData = readLocalArrayForAuth(username, STORAGE_KEY_FAVS, activeUser === username ? window.favoritesLibrary : null);
-		const libraryData = readLocalArrayForAuth(username, 'psn_local_library', activeUser === username && typeof lastScannedGames !== 'undefined' ? lastScannedGames : null);
-		const friendsData = readLocalArrayForAuth(username, STORAGE_KEY_FRIENDS, activeUser === username ? window.friendsList : null);
-		return {
-			avatar: localAvatar,
-			joined: readLocalUserValueForAuth(username, 'joined_date', '2026') || '2026',
-			level: trophyPayload.level,
-			xp: trophyPayload.totalXp,
-			downloads: downloadsData.length,
-			wishlist: wishlistData.length,
-			favorites: favoritesData.length,
-			trophies: trophyPayload.totalTrophies,
-			library: libraryData.length,
-			trophiesData,
-			downloadsData,
-			downloadsClearedAt: getDownloadHistoryClearPendingAt(username) || 0,
-			downloadsUpdatedAt: getProfileListUpdatedAtForAuth(username, 'downloads'),
-			wishlistData,
-			wishlistUpdatedAt: getProfileListUpdatedAtForAuth(username, 'wishlist'),
-			favoritesData,
-			favoritesUpdatedAt: getProfileListUpdatedAtForAuth(username, 'favorites'),
-			libraryData,
-			libraryUpdatedAt: getProfileListUpdatedAtForAuth(username, 'library'),
-			friendsData,
-			friendsUpdatedAt: getProfileListUpdatedAtForAuth(username, 'friends'),
-			countersData: {
-				msgs: localStorage.getItem(`${username}_psn_chat_msgs_sent`) || '0',
-				imgs: localStorage.getItem(`${username}_psn_chat_imgs_sent`) || '0',
-				reactions: localStorage.getItem(`${username}_psn_chat_reactions_given`) || '0',
-				trailers: localStorage.getItem(`${username}_psn_trailers_watched`) || '0',
-				days: localStorage.getItem(`${username}_psn_accessed_days`) || '[]',
-				lastChatRead: localStorage.getItem(`${username}_psn_last_chat_read`) || '0'
-			},
-			themeColor: readLocalUserValueForAuth(username, 'psn_theme_color', '#0070cc') || '#0070cc',
-			themeColorUpdatedAt: normalizeProfileListTimestamp(readLocalUserValueForAuth(username, STORAGE_KEY_THEME_COLOR_UPDATED_AT, 0)),
-			settingsData: {
-				audio: readLocalUserValueForAuth(username, STORAGE_KEY_AUDIO, '1') || '1',
-				ux: readLocalUserValueForAuth(username, STORAGE_KEY_UX, '1') || '1',
-				hapticFeedback: readLocalUserValueForAuth(username, STORAGE_KEY_HAPTIC_FEEDBACK, '1') === '0' ? '0' : '1',
-				cardBlur: readLocalUserValueForAuth(username, STORAGE_KEY_CARD_BLUR, '0') === '1' ? '1' : '0',
-				chatSound: readLocalUserValueForAuth(username, STORAGE_KEY_CHAT_SOUND, '1') || '1',
-				chatAutoTranslate: readLocalUserValueForAuth(username, STORAGE_KEY_CHAT_AUTO_TRANSLATE, '0') === '1' ? '1' : '0',
-				interfaceAutoTranslate: readLocalUserValueForAuth(username, STORAGE_KEY_INTERFACE_AUTO_TRANSLATE, '1') !== '0' ? '1' : '0',
-				settingsUpdatedAt: (typeof getProfileSettingsUpdatedAtForUser === 'function') ? getProfileSettingsUpdatedAtForUser(username) : 0,
-				themeColor: readLocalUserValueForAuth(username, 'psn_theme_color', '#0070cc') || '#0070cc',
-				themeColorUpdatedAt: normalizeProfileListTimestamp(readLocalUserValueForAuth(username, STORAGE_KEY_THEME_COLOR_UPDATED_AT, 0)),
-				profileCardStyle: (typeof normalizeProfileCardStyle === 'function') ? normalizeProfileCardStyle(readLocalUserValueForAuth(username, STORAGE_KEY_PROFILE_CARD_STYLE, 'neon') || 'neon') : (readLocalUserValueForAuth(username, STORAGE_KEY_PROFILE_CARD_STYLE, 'neon') || 'neon'),
-				profileCardEffect: (typeof normalizeProfileCardStyle === 'function') ? normalizeProfileCardStyle(readLocalUserValueForAuth(username, STORAGE_KEY_PROFILE_CARD_STYLE, 'neon') || 'neon') : (readLocalUserValueForAuth(username, STORAGE_KEY_PROFILE_CARD_STYLE, 'neon') || 'neon'),
-				profileCardStyleUpdatedAt: (typeof getProfileCardStyleUpdatedAtForUser === 'function') ? getProfileCardStyleUpdatedAtForUser(username) : 0,
-				countryCode: normalizeProfileCountryCode(readLocalUserValueForAuth(username, STORAGE_KEY_PROFILE_COUNTRY, '')),
-				ps3Ip: readLocalUserValueForAuth(username, 'ps3_ip', '') || '',
-				companionPlugin: readLocalUserValueForAuth(username, STORAGE_KEY_COMPANION_PLUGIN, '1') !== '0' ? '1' : '0',
-				fpsCounterPlugin: readLocalUserValueForAuth(username, STORAGE_KEY_FPS_COUNTER, '0') === '1' ? '1' : '0',
-				consoleFanMode: readLocalUserValueForAuth(username, STORAGE_KEY_CONSOLE_FAN_MODE, 'dynamic') || 'dynamic',
-				consoleFanSpeed: readLocalUserValueForAuth(username, STORAGE_KEY_CONSOLE_FAN_SPEED, '35') || '35',
-				consoleFanTarget: readLocalUserValueForAuth(username, STORAGE_KEY_CONSOLE_FAN_TARGET, '68') || '68',
-				performanceMode: readLocalUserValueForAuth(username, STORAGE_KEY_PERFORMANCE_MODE, 'balanced') || 'balanced',
-				performanceRsx: readLocalUserValueForAuth(username, STORAGE_KEY_PERFORMANCE_RSX, '500') || '500',
-				performanceVram: readLocalUserValueForAuth(username, STORAGE_KEY_PERFORMANCE_VRAM, '650') || '650',
-				siteDisclaimerSkipToday: (typeof getStoredSiteDisclaimerSkipToday === 'function') ? getStoredSiteDisclaimerSkipToday(username) : ''
-			},
-			ps3Status: activeUser === username ? (window.myCurrentPS3Status || null) : null
-		};
-	}
-
-
-	function buildFastLocalUserDataForAuth(username) {
-		const activeUser = localStorage.getItem('psn_username');
-		const DEFAULT_URL = "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/interface/modern/images/avatars/default.png";
-		const fallbackAvatar = (typeof AVAILABLE_AVATARS !== 'undefined' && AVAILABLE_AVATARS[0]) ? AVAILABLE_AVATARS[0] : DEFAULT_URL;
-		const localAvatar = readLocalUserValueForAuth(username, 'psn_avatar', null) || fallbackAvatar;
-		const settingsUpdatedAt = (typeof getProfileSettingsUpdatedAtForUser === 'function') ? getProfileSettingsUpdatedAtForUser(username) : 0;
-		const profileCardStyle = (typeof normalizeProfileCardStyle === 'function') ? normalizeProfileCardStyle(readLocalUserValueForAuth(username, STORAGE_KEY_PROFILE_CARD_STYLE, 'neon') || 'neon') : (readLocalUserValueForAuth(username, STORAGE_KEY_PROFILE_CARD_STYLE, 'neon') || 'neon');
-		return {
-			_fastAuth: true,
-			avatar: localAvatar,
-			joined: readLocalUserValueForAuth(username, 'joined_date', '2026') || '2026',
-			level: Number(localStorage.getItem(`${username}_psn_level`) || localStorage.getItem('psn_level') || 1) || 1,
-			xp: Number(localStorage.getItem(`${username}_psn_xp`) || localStorage.getItem('psn_xp') || 0) || 0,
-			downloadsClearedAt: getDownloadHistoryClearPendingAt(username) || 0,
-			downloadsUpdatedAt: getProfileListUpdatedAtForAuth(username, 'downloads'),
-			wishlistUpdatedAt: getProfileListUpdatedAtForAuth(username, 'wishlist'),
-			favoritesUpdatedAt: getProfileListUpdatedAtForAuth(username, 'favorites'),
-			libraryUpdatedAt: getProfileListUpdatedAtForAuth(username, 'library'),
-			friendsUpdatedAt: getProfileListUpdatedAtForAuth(username, 'friends'),
-			countersData: {
-				msgs: localStorage.getItem(`${username}_psn_chat_msgs_sent`) || '0',
-				imgs: localStorage.getItem(`${username}_psn_chat_imgs_sent`) || '0',
-				reactions: localStorage.getItem(`${username}_psn_chat_reactions_given`) || '0',
-				trailers: localStorage.getItem(`${username}_psn_trailers_watched`) || '0',
-				lastChatRead: localStorage.getItem(`${username}_psn_last_chat_read`) || '0'
-			},
-			themeColor: readLocalUserValueForAuth(username, 'psn_theme_color', '#0070cc') || '#0070cc',
-			themeColorUpdatedAt: normalizeProfileListTimestamp(readLocalUserValueForAuth(username, STORAGE_KEY_THEME_COLOR_UPDATED_AT, 0)),
-			settingsData: {
-				audio: readLocalUserValueForAuth(username, STORAGE_KEY_AUDIO, '1') || '1',
-				ux: readLocalUserValueForAuth(username, STORAGE_KEY_UX, '1') || '1',
-				hapticFeedback: readLocalUserValueForAuth(username, STORAGE_KEY_HAPTIC_FEEDBACK, '1') === '0' ? '0' : '1',
-				cardBlur: readLocalUserValueForAuth(username, STORAGE_KEY_CARD_BLUR, '0') === '1' ? '1' : '0',
-				chatSound: readLocalUserValueForAuth(username, STORAGE_KEY_CHAT_SOUND, '1') || '1',
-				chatAutoTranslate: readLocalUserValueForAuth(username, STORAGE_KEY_CHAT_AUTO_TRANSLATE, '0') === '1' ? '1' : '0',
-				interfaceAutoTranslate: readLocalUserValueForAuth(username, STORAGE_KEY_INTERFACE_AUTO_TRANSLATE, '1') !== '0' ? '1' : '0',
-				settingsUpdatedAt,
-				themeColor: readLocalUserValueForAuth(username, 'psn_theme_color', '#0070cc') || '#0070cc',
-				themeColorUpdatedAt: normalizeProfileListTimestamp(readLocalUserValueForAuth(username, STORAGE_KEY_THEME_COLOR_UPDATED_AT, 0)),
-				profileCardStyle,
-				profileCardEffect: profileCardStyle,
-				profileCardStyleUpdatedAt: (typeof getProfileCardStyleUpdatedAtForUser === 'function') ? getProfileCardStyleUpdatedAtForUser(username) : 0,
-				countryCode: normalizeProfileCountryCode(readLocalUserValueForAuth(username, STORAGE_KEY_PROFILE_COUNTRY, '')),
-				ps3Ip: readLocalUserValueForAuth(username, 'ps3_ip', '') || '',
-				companionPlugin: readLocalUserValueForAuth(username, STORAGE_KEY_COMPANION_PLUGIN, '1') !== '0' ? '1' : '0',
-				fpsCounterPlugin: readLocalUserValueForAuth(username, STORAGE_KEY_FPS_COUNTER, '0') === '1' ? '1' : '0',
-				consoleFanMode: readLocalUserValueForAuth(username, STORAGE_KEY_CONSOLE_FAN_MODE, 'dynamic') || 'dynamic',
-				consoleFanSpeed: readLocalUserValueForAuth(username, STORAGE_KEY_CONSOLE_FAN_SPEED, '35') || '35',
-				consoleFanTarget: readLocalUserValueForAuth(username, STORAGE_KEY_CONSOLE_FAN_TARGET, '68') || '68',
-				performanceMode: readLocalUserValueForAuth(username, STORAGE_KEY_PERFORMANCE_MODE, 'balanced') || 'balanced',
-				performanceRsx: readLocalUserValueForAuth(username, STORAGE_KEY_PERFORMANCE_RSX, '500') || '500',
-				performanceVram: readLocalUserValueForAuth(username, STORAGE_KEY_PERFORMANCE_VRAM, '650') || '650',
-				siteDisclaimerSkipToday: (typeof getStoredSiteDisclaimerSkipToday === 'function') ? getStoredSiteDisclaimerSkipToday(username) : ''
-			},
-			ps3Status: activeUser === username ? (window.myCurrentPS3Status || null) : null
-		};
-	}
 
 	function syncRuntimePluginPreferencesToServer() {
 		try {
@@ -10160,7 +10084,6 @@ P
 			if (!myName || myName === "null") return false;
 			const settingsData = getRuntimePluginSettingsPayload();
 			socketChat.emit('settings_realtime_update', { settingsData, themeColor: getRuntimeSettingsThemeColor(), reason: 'runtime_preferences', clientSentAt: Date.now() });
-			socketChat.emit('update_profile', { settingsData });
 			return true;
 		} catch (err) {
 			console.warn('[Runtime Plugins] Could not sync plugin preferences to server:', err);
@@ -10258,14 +10181,13 @@ P
         if (!activeUser) return;
 
         try {
-            window.userTrophies = JSON.parse(loadState('psn_user_trophies') || "{}");
-            window.wishlist = JSON.parse(loadState(STORAGE_KEY_WISHLIST) || "[]");
-            window.downloadHistory = JSON.parse(loadState(COOKIE_NAME_HISTORY) || "[]");
-            normalizeAndStoreDownloadHistory(activeUser, window.downloadHistory, { markChanged: true, broadcast: true });
-            window.favoritesLibrary = JSON.parse(loadState(STORAGE_KEY_FAVS) || "[]");
-			window.friendsList = JSON.parse(loadState(STORAGE_KEY_FRIENDS) || "[]");
-            lastScannedGames = mergeLibraryLastPlayedLists(JSON.parse(loadState('psn_local_library') || "[]"), []);
-            window.lastScannedGames = lastScannedGames;
+            if (!window.userTrophies || typeof window.userTrophies !== 'object' || Array.isArray(window.userTrophies)) window.userTrophies = {};
+            if (!Array.isArray(window.wishlist)) window.wishlist = [];
+            if (!Array.isArray(window.downloadHistory)) window.downloadHistory = [];
+            if (!Array.isArray(window.favoritesLibrary)) window.favoritesLibrary = [];
+			if (!Array.isArray(window.friendsList)) window.friendsList = [];
+            if (typeof lastScannedGames !== 'undefined' && !Array.isArray(lastScannedGames)) lastScannedGames = [];
+            if (typeof lastScannedGames !== 'undefined') window.lastScannedGames = lastScannedGames;
 
             if (typeof writeCategoryDotPending === 'function') {
                 const dotSchemaKey = 'psn_category_dot_pending_schema';
@@ -10278,7 +10200,7 @@ P
                 }
             }
 
-            const userImg = loadState('psn_avatar') || AVAILABLE_AVATARS[0];
+            const userImg = (window.__serverProfileHydratedUser === activeUser && window.__serverProfileAvatar) ? window.__serverProfileAvatar : (loadState('psn_avatar') || AVAILABLE_AVATARS[0]);
             const sidebarAvatar = document.querySelector('.user-avatar');
             if (sidebarAvatar) sidebarAvatar.style.backgroundImage = `url('${userImg}')`;
 
@@ -10828,7 +10750,7 @@ P
 		btnConfirm.style.opacity = '0.7';
 	
 		if (rememberMe) {
-			localStorage.setItem(`${name}_psn_password`, pass);
+			safeLocalStorageSet(`${name}_psn_password`, pass);
 		} else {
 			localStorage.removeItem(`${name}_psn_password`);
 		}
@@ -10975,8 +10897,7 @@ P
 					name: username,
 					password: savedPass,
 					isNewAccount: false,
-					adminMaintenanceBypass: document.body.classList.contains('admin-maintenance-login-bypass'),
-					userData: buildFastLocalUserDataForAuth(username)
+					adminMaintenanceBypass: document.body.classList.contains('admin-maintenance-login-bypass')
 				};
 
 				if (typeof window.sendLoginAuthentication === 'function') {
@@ -11077,7 +10998,7 @@ P
 		btnConfirm.style.opacity = '0.7';
 	
 		if (rememberMe) {
-			localStorage.setItem(`${currentLoginUser}_psn_password`, pass);
+			safeLocalStorageSet(`${currentLoginUser}_psn_password`, pass);
 		} else {
 			localStorage.removeItem(`${currentLoginUser}_psn_password`);
 		}
@@ -11096,8 +11017,7 @@ P
 				name: currentLoginUser,
 				password: pass,
 				isNewAccount: false,
-				adminMaintenanceBypass: document.body.classList.contains('admin-maintenance-login-bypass'),
-				userData: buildFastLocalUserDataForAuth(currentLoginUser)
+				adminMaintenanceBypass: document.body.classList.contains('admin-maintenance-login-bypass')
 			};
 
 			if (typeof window.sendLoginAuthentication === 'function') {
@@ -11759,7 +11679,7 @@ P
 	function setStoredSiteDisclaimerSkipToday(username, stamp) {
 		const safeName = String(username || localStorage.getItem('psn_username') || 'guest');
 		const safeStamp = String(stamp || getSiteDisclaimerTodayStamp());
-		try { localStorage.setItem(getSiteDisclaimerDailyKey(safeName), safeStamp); } catch(e) {}
+		try { safeLocalStorageSet(getSiteDisclaimerDailyKey(safeName), safeStamp); } catch(e) {}
 	}
 	function hideSiteDisclaimerModalSilently() {
 		const modal = document.getElementById('site-disclaimer-modal');
@@ -12013,14 +11933,14 @@ P
 			localStorage.removeItem('psn_admin_secret');
 		}
 	
-		localStorage.setItem('psn_username', username);
+		safeLocalStorageSet('psn_username', username);
 		const sidebarName = document.getElementById('sidebar-user-name');
 		if (sidebarName) sidebarName.innerText = username;
 		
-		const userTheme = localStorage.getItem(`${username}_psn_theme_color`) || '#0070cc';
+		const userTheme = (window.__serverProfileHydratedUser === username && window.__serverProfileThemeColor) ? window.__serverProfileThemeColor : (localStorage.getItem(`${username}_psn_theme_color`) || '#0070cc');
 		document.documentElement.style.setProperty('--ps-blue', userTheme);
 		document.documentElement.style.setProperty('--ps-neon', userTheme + '66');
-		localStorage.setItem('psn_theme_color', userTheme);
+		safeLocalStorageSet('psn_theme_color', userTheme);
 		
 		if (typeof updateDynamicCursor === 'function') updateDynamicCursor(userTheme);
 	
@@ -16241,7 +16161,7 @@ P
 		const isBlacklisted = sysData.noCovers.has(cleanId);
 		const isMissingFromIndex = sysData.coversLoaded && !sysData.covers.has(cleanId);
 		if (isBlacklisted || isMissingFromIndex) {
-			return 'data:image/png;base64,COVER_INDEX_MISS';
+			return 'data:image/png;base64,BING';
 		}
 
 		return `https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/database/covers/uncompressed/${cleanId}.JPG`;
@@ -16421,7 +16341,7 @@ P
 					})
 					.sort((a, b) => (Number(a[1]?.at) || 0) - (Number(b[1]?.at) || 0))
 					.slice(-window.__cardCoverSrcCacheMaxEntries);
-				localStorage.setItem(window.__cardCoverSrcCacheStorageKey, JSON.stringify(Object.fromEntries(entries)));
+				safeLocalStorageSet(window.__cardCoverSrcCacheStorageKey, JSON.stringify(Object.fromEntries(entries)));
 			} catch (e) {}
 		}, 120);
 	}
@@ -17456,7 +17376,7 @@ P
 		window.contentDownloadCountsReady = true;
 		if (options.save !== false) {
 			try {
-				localStorage.setItem(CONTENT_DOWNLOAD_COUNTS_CACHE_KEY, JSON.stringify({ updatedAt: Date.now(), counts }));
+				safeLocalStorageSet(CONTENT_DOWNLOAD_COUNTS_CACHE_KEY, JSON.stringify({ updatedAt: Date.now(), counts }));
 			} catch (err) {}
 		}
 		window.applyContentDownloadCountsToCards(document);
@@ -19511,7 +19431,7 @@ P
 
 		const rotateRawgKey = () => {
 			currentRawgKeyIndex = (currentRawgKeyIndex + 1) % RAWG_KEYS.length;
-			localStorage.setItem('rawg_key_index', currentRawgKeyIndex);
+			safeLocalStorageSet('rawg_key_index', currentRawgKeyIndex);
 		};
 
 		const getRawgFailureAction = (response) => {
@@ -19986,7 +19906,7 @@ P
 			if (response.status === 403) {
 				console.warn(`Key ${currentKeyIndex + 1} exceeded. Rotating...`);
 				currentKeyIndex++;
-				localStorage.setItem('yt_key_index', currentKeyIndex);
+				safeLocalStorageSet('yt_key_index', currentKeyIndex);
 				return await fetchYouTubeVideoPage(query, maxResults, pageToken);
 			}
 
@@ -21107,7 +21027,7 @@ P
 		if (!Number.isFinite(value) || value < 1) value = 25;
 		value = Math.max(1, Math.min(1000, value));
 		window.adminUsersBatchSize = value;
-		localStorage.setItem('psn_admin_users_batch_size', String(value));
+		safeLocalStorageSet('psn_admin_users_batch_size', String(value));
 		if (input && String(input.value) !== String(value)) input.value = value;
 		return value;
 	}
@@ -21118,7 +21038,7 @@ P
 		if (!Number.isFinite(size) || size < 1) size = 25;
 		size = Math.max(1, Math.min(1000, size));
 		window.adminUsersBatchSize = size;
-		localStorage.setItem('psn_admin_users_batch_size', String(size));
+		safeLocalStorageSet('psn_admin_users_batch_size', String(size));
 		if (input && String(input.value) !== String(size)) input.value = size;
 		window.adminRenderLimit = size;
 		renderAdminPanel();
@@ -21136,7 +21056,7 @@ P
 		const batchSize = adminGetUsersBatchSize();
 		window.adminRenderLimit = batchSize;
 		window.adminUserFilterMode = 'all';
-		localStorage.setItem('psn_admin_user_filter', 'all');
+		safeLocalStorageSet('psn_admin_user_filter', 'all');
 		const input = document.getElementById('admin-user-search');
 		if (input) input.value = '';
 		adminSyncUserFilterControls();
@@ -21181,7 +21101,7 @@ P
 		mode = String(mode || 'all').toLowerCase();
 		if (!allowed.includes(mode)) mode = 'all';
 		window.adminUserFilterMode = mode;
-		localStorage.setItem('psn_admin_user_filter', mode);
+		safeLocalStorageSet('psn_admin_user_filter', mode);
 		window.adminRenderLimit = adminGetUsersBatchSize();
 		adminSyncUserFilterControls();
 		if (typeof playUiClick === 'function') playUiClick();
@@ -22099,7 +22019,7 @@ P
 	window.adminApplyUserBanState = function(name, isBanned) {
 		if (!name) return;
 		if (isBanned) {
-			localStorage.setItem(`${name}_psn_isBanned`, 'true');
+			safeLocalStorageSet(`${name}_psn_isBanned`, 'true');
 		} else {
 			localStorage.removeItem(`${name}_psn_isBanned`);
 		}
@@ -22219,7 +22139,7 @@ P
 			localStorage.removeItem(`${name}_psn_isBanned`);
 			if (typeof getAllUsers === 'function' && typeof GLOBAL_USERS_KEY !== 'undefined') {
 				const users = getAllUsers().filter(user => user !== name);
-				localStorage.setItem(GLOBAL_USERS_KEY, JSON.stringify(users));
+				safeLocalStorageSet(GLOBAL_USERS_KEY, JSON.stringify(users));
 			}
 		} catch (e) {}
 	};
@@ -22320,13 +22240,13 @@ P
 		if (typeof playUiSuccess === 'function') playUiSuccess();
 	}
 
+	window.__psnAdminModerationLog = window.__psnAdminModerationLog || [];
 	function adminGetModerationLog() {
-		return adminSafeParseJson(localStorage.getItem('psn_admin_moderation_log'), []);
+		return Array.isArray(window.__psnAdminModerationLog) ? window.__psnAdminModerationLog : [];
 	}
 
 	function adminSetModerationLog(log) {
-		const clean = Array.isArray(log) ? log.filter(Boolean).slice(0, 100) : [];
-		localStorage.setItem('psn_admin_moderation_log', JSON.stringify(clean));
+		window.__psnAdminModerationLog = Array.isArray(log) ? log.filter(Boolean).slice(0, 100) : [];
 	}
 
 	function adminAddLog(type, message, detail = {}, meta = {}) {
@@ -22351,13 +22271,13 @@ P
 	}
 
 
+	window.__psnAdminServerLog = window.__psnAdminServerLog || [];
 	function adminGetServerLog() {
-		return adminSafeParseJson(localStorage.getItem('psn_admin_server_log'), []);
+		return Array.isArray(window.__psnAdminServerLog) ? window.__psnAdminServerLog : [];
 	}
 
 	function adminSetServerLog(log = []) {
-		const clean = Array.isArray(log) ? log.filter(Boolean).slice(0, 120) : [];
-		localStorage.setItem('psn_admin_server_log', JSON.stringify(clean));
+		window.__psnAdminServerLog = Array.isArray(log) ? log.filter(Boolean).slice(0, 120) : [];
 	}
 
 	function adminAddServerLog(item = {}) {
@@ -22381,7 +22301,7 @@ P
 	window.adminClearServerLog = function() {
 		if (!adminGuard()) return;
 		if (!confirm('Clear server log?')) return;
-		localStorage.removeItem('psn_admin_server_log');
+		window.__psnAdminServerLog = [];
 		if (typeof socketChat !== 'undefined' && socketChat && socketChat.connected) {
 			socketChat.emit('admin_clear_server_log');
 		}
@@ -22392,7 +22312,7 @@ P
 	window.adminClearModerationLog = function() {
 		if (!adminGuard()) return;
 		if (!confirm('Clear moderation log?')) return;
-		localStorage.removeItem('psn_admin_moderation_log');
+		window.__psnAdminModerationLog = [];
 		if (typeof socketChat !== 'undefined' && socketChat && socketChat.connected) {
 			socketChat.emit('admin_clear_moderation_log');
 		}
@@ -22513,7 +22433,7 @@ P
 
 	function adminSetMaintenanceState(state, shouldEmit = false) {
 		const normalized = adminNormalizeMaintenanceState(state || {});
-		localStorage.setItem('psn_admin_maintenance_mode', JSON.stringify(normalized));
+		safeLocalStorageSet('psn_admin_maintenance_mode', JSON.stringify(normalized));
 		if (shouldEmit && typeof socketChat !== 'undefined' && socketChat && socketChat.connected) {
 			socketChat.emit('admin_maintenance_mode', normalized);
 		}
@@ -22778,7 +22698,7 @@ P
 	}
 
 	function adminSetPinnedAnnouncementState(data, shouldEmit = false) {
-		if (data && data.text) localStorage.setItem('psn_admin_pinned_announcement', JSON.stringify(data));
+		if (data && data.text) safeLocalStorageSet('psn_admin_pinned_announcement', JSON.stringify(data));
 		else localStorage.removeItem('psn_admin_pinned_announcement');
 		if (shouldEmit && typeof socketChat !== 'undefined' && socketChat && socketChat.connected) {
 			socketChat.emit('admin_pinned_announcement', data || { clear: true });
@@ -22917,7 +22837,7 @@ P
 			at: state.at || new Date().toISOString(),
 			source: state.source || (shouldEmit ? 'pending' : 'server')
 		};
-		localStorage.setItem('psn_admin_chat_controls', JSON.stringify(normalized));
+		safeLocalStorageSet('psn_admin_chat_controls', JSON.stringify(normalized));
 		if (state.source === 'pending') {
 			adminSetChatControlsSyncState('syncing');
 		} else if (!shouldEmit && (state.source === 'server' || state.serverSynced === true || state.at)) {
@@ -23380,13 +23300,13 @@ P
 		const explicitUnban = user.isBanned === false || user.banned === false || (user.role && rawUserRole !== 'banned');
 		const explicitBan = user.isBanned === true || user.banned === true || rawUserRole === 'banned';
 		const role = window.getPsnUserRole(name, user);
-		if (role && role !== 'user') localStorage.setItem(`${name}_psn_role`, role);
+		if (role && role !== 'user') safeLocalStorageSet(`${name}_psn_role`, role);
 		else localStorage.removeItem(`${name}_psn_role`);
-		if (user.isAdmin === true || role === 'admin') localStorage.setItem(`${name}_psn_isAdmin`, 'true');
+		if (user.isAdmin === true || role === 'admin') safeLocalStorageSet(`${name}_psn_isAdmin`, 'true');
 		else if (user.isAdmin === false && role !== 'admin') localStorage.removeItem(`${name}_psn_isAdmin`);
 
 		if (explicitBan) {
-			localStorage.setItem(`${name}_psn_isBanned`, 'true');
+			safeLocalStorageSet(`${name}_psn_isBanned`, 'true');
 			user.isBanned = true;
 			user.banned = true;
 		} else if (explicitUnban) {
@@ -23418,8 +23338,8 @@ P
 			return false;
 		}
 		if (normalized === 'user') localStorage.removeItem(`${name}_psn_role`);
-		else localStorage.setItem(`${name}_psn_role`, normalized);
-		if (normalized === 'admin') localStorage.setItem(`${name}_psn_isAdmin`, 'true');
+		else safeLocalStorageSet(`${name}_psn_role`, normalized);
+		if (normalized === 'admin') safeLocalStorageSet(`${name}_psn_isAdmin`, 'true');
 		else localStorage.removeItem(`${name}_psn_isAdmin`);
 
 		const updateRecord = (user) => {
@@ -23532,7 +23452,7 @@ P
 
 	function adminSetReports(reports) {
 		window.adminReports = Array.isArray(reports) ? reports.slice(0, 100) : [];
-		localStorage.setItem('psn_admin_reports', JSON.stringify(window.adminReports));
+		safeLocalStorageSet('psn_admin_reports', JSON.stringify(window.adminReports));
 	}
 
 	function adminReportKey(report) {
@@ -28355,8 +28275,8 @@ P
 		saveState('ps3_ip', ip);
 		try {
 			const activeUserForIpSync = localStorage.getItem('psn_username');
-			if (activeUserForIpSync) localStorage.setItem(`${activeUserForIpSync}_ps3_ip`, ip);
-			localStorage.setItem('ps3_ip', ip);
+			if (activeUserForIpSync) safeLocalStorageSet(`${activeUserForIpSync}_ps3_ip`, ip);
+			safeLocalStorageSet('ps3_ip', ip);
 		} catch (ipStoreErr) {}
 		
 		if (typeof markProfileSettingsChanged === 'function') markProfileSettingsChanged();
@@ -30704,7 +30624,7 @@ P
 
     function toggleConsoleLibraryShowEmpty(enabled) {
         if (typeof saveState === 'function') saveState(STORAGE_KEY_CONSOLE_LIBRARY_SHOW_EMPTY, enabled ? '1' : '0');
-        else localStorage.setItem(STORAGE_KEY_CONSOLE_LIBRARY_SHOW_EMPTY, enabled ? '1' : '0');
+        else safeLocalStorageSet(STORAGE_KEY_CONSOLE_LIBRARY_SHOW_EMPTY, enabled ? '1' : '0');
         syncConsoleLibraryShowEmptyToggle();
         if (typeof updateConsoleLibraryStatusUI === 'function') updateConsoleLibraryStatusUI();
     }
@@ -31356,7 +31276,7 @@ P
 	function writeConsoleSyscallsDisabled(disabled) {
 		try {
 			if (typeof saveState === 'function') saveState(STORAGE_KEY_CONSOLE_SYSCALLS_DISABLED, disabled ? '1' : '0');
-			else localStorage.setItem(STORAGE_KEY_CONSOLE_SYSCALLS_DISABLED, disabled ? '1' : '0');
+			else safeLocalStorageSet(STORAGE_KEY_CONSOLE_SYSCALLS_DISABLED, disabled ? '1' : '0');
 		} catch (err) {}
 		updateConsoleSyscallsToggleButton();
 	}
@@ -32431,8 +32351,8 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 			saveState('ps3_ip', ip);
 			try {
 				const activeUserForIpSync = localStorage.getItem('psn_username');
-				if (activeUserForIpSync) localStorage.setItem(`${activeUserForIpSync}_ps3_ip`, ip);
-				localStorage.setItem('ps3_ip', ip);
+				if (activeUserForIpSync) safeLocalStorageSet(`${activeUserForIpSync}_ps3_ip`, ip);
+				safeLocalStorageSet('ps3_ip', ip);
 				if (typeof markProfileSettingsChanged === 'function') markProfileSettingsChanged();
 				if (typeof socketChat !== 'undefined' && socketChat && socketChat.connected) {
 					const settingsPayload = (typeof getRuntimePluginSettingsPayload === 'function') ? getRuntimePluginSettingsPayload() : null;
@@ -33505,9 +33425,6 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 	
 			saveState('psn_user_trophies', JSON.stringify(window.userTrophies));
 			
-			if (typeof window.broadcastProfileUpdate === 'function') {
-				window.broadcastProfileUpdate();
-			}
 	
 			window.trophyPopupDelay = setTimeout(() => {
 				if (!localStorage.getItem('psn_username') || localStorage.getItem('psn_username') === "null") return;
@@ -38510,7 +38427,7 @@ function getVisibleChatStackEl(id) {
 				const counterKey = `${myName}_psn_chat_reactions_given`;
 				let reactionsGiven = parseInt(localStorage.getItem(counterKey) || '0') + 1;
 				
-				localStorage.setItem(counterKey, reactionsGiven);
+				safeLocalStorageSet(counterKey, reactionsGiven);
 				
 				if (typeof checkTrophyProgress === 'function') {
 					checkTrophyProgress('chat_reaction_first', reactionsGiven);
@@ -40393,7 +40310,7 @@ function getVisibleChatStackEl(id) {
 			console.warn(`Conta ${provider.name} Failed. Rotating to the next one...`);
 			
 			window.currentCloudinaryIndex = (window.currentCloudinaryIndex + 1) % CLOUDINARY_PROVIDERS.length;
-			localStorage.setItem('cloudinary_key_index', window.currentCloudinaryIndex);
+			safeLocalStorageSet('cloudinary_key_index', window.currentCloudinaryIndex);
 			
 			return uploadToCloudinary(file, attempt + 1);
 		}
@@ -40656,10 +40573,8 @@ function getVisibleChatStackEl(id) {
 		if (!window.isProfileLoaded) return;
 
 		const incomingProfileUpdatedAt = Number(userData.profileUpdatedAt || payload.profileUpdatedAt || 0);
-		const lastAppliedProfileUpdatedAt = Number(window.__lastAppliedProfileUpdatedAt || localStorage.getItem(`${name}_psn_profile_updated_at`) || 0);
-		const incomingSettingsUpdatedAt = Number((userData.settingsData && (userData.settingsData.settingsUpdatedAt || userData.settingsData.settingsSyncedAt || userData.settingsData.settingsVersion)) || payload.settingsUpdatedAt || 0);
-		const lastAppliedSettingsUpdatedAt = (typeof getProfileSettingsUpdatedAtForUser === 'function') ? Number(getProfileSettingsUpdatedAtForUser(name) || 0) : 0;
-		if (incomingProfileUpdatedAt && lastAppliedProfileUpdatedAt && incomingProfileUpdatedAt <= lastAppliedProfileUpdatedAt && (!incomingSettingsUpdatedAt || incomingSettingsUpdatedAt <= lastAppliedSettingsUpdatedAt)) return;
+		const lastAppliedProfileUpdatedAt = Number(window.__lastAppliedProfileUpdatedAt || 0);
+		if (incomingProfileUpdatedAt && lastAppliedProfileUpdatedAt && incomingProfileUpdatedAt < lastAppliedProfileUpdatedAt) return;
 
 		const previousProfileSyncState = {
 			trophies: (window.userTrophies && typeof window.userTrophies === 'object') ? JSON.parse(JSON.stringify(window.userTrophies)) : {},
@@ -40677,43 +40592,43 @@ function getVisibleChatStackEl(id) {
 		try {
 			if (incomingProfileUpdatedAt) {
 				window.__lastAppliedProfileUpdatedAt = incomingProfileUpdatedAt;
-				localStorage.setItem(`${name}_psn_profile_updated_at`, String(incomingProfileUpdatedAt));
+				safeLocalStorageSet(`${name}_psn_profile_updated_at`, String(incomingProfileUpdatedAt));
 			}
-			if (profileSyncChanges.trophies && userData.trophiesData && typeof userData.trophiesData === 'object' && !Array.isArray(userData.trophiesData)) { window.userTrophies = userData.trophiesData; localStorage.setItem(`${name}_psn_user_trophies`, JSON.stringify(userData.trophiesData)); if (typeof psnMarkTrophyViewsDirty === 'function') psnMarkTrophyViewsDirty(); }
-			if (profileSyncChanges.wishlist && Array.isArray(userData.wishlistData)) { window.wishlist = userData.wishlistData; localStorage.setItem(`${name}_psn_wishlist_db`, JSON.stringify(userData.wishlistData)); applyProfileListUpdatedAtFromServer(name, 'wishlist', userData.wishlistUpdatedAt); }
+			if (profileSyncChanges.trophies && userData.trophiesData && typeof userData.trophiesData === 'object' && !Array.isArray(userData.trophiesData)) { window.userTrophies = userData.trophiesData; safeLocalStorageSet(`${name}_psn_user_trophies`, JSON.stringify(userData.trophiesData)); if (typeof psnMarkTrophyViewsDirty === 'function') psnMarkTrophyViewsDirty(); }
+			if (profileSyncChanges.wishlist && Array.isArray(userData.wishlistData)) { window.wishlist = userData.wishlistData; safeLocalStorageSet(`${name}_psn_wishlist_db`, JSON.stringify(userData.wishlistData)); applyProfileListUpdatedAtFromServer(name, 'wishlist', userData.wishlistUpdatedAt); }
 			if (profileSyncChanges.downloads && Array.isArray(userData.downloadsData)) { applyIncomingDownloadHistoryForProfile(name, userData, payload); }
-			if (profileSyncChanges.favorites && Array.isArray(userData.favoritesData)) { window.favoritesLibrary = userData.favoritesData; localStorage.setItem(`${name}_ps3_library_favs`, JSON.stringify(userData.favoritesData)); applyProfileListUpdatedAtFromServer(name, 'favorites', userData.favoritesUpdatedAt); }
+			if (profileSyncChanges.favorites && Array.isArray(userData.favoritesData)) { window.favoritesLibrary = userData.favoritesData; safeLocalStorageSet(`${name}_ps3_library_favs`, JSON.stringify(userData.favoritesData)); applyProfileListUpdatedAtFromServer(name, 'favorites', userData.favoritesUpdatedAt); }
 			if (profileSyncChanges.library && Array.isArray(userData.libraryData)) {
-				const mergedLibraryData = mergeLibraryLastPlayedLists(userData.libraryData, (typeof lastScannedGames !== 'undefined' && Array.isArray(lastScannedGames)) ? lastScannedGames : []);
+				const mergedLibraryData = mergeLibraryLastPlayedLists(userData.libraryData, []);
 				if (typeof lastScannedGames !== 'undefined') { lastScannedGames = mergedLibraryData; window.lastScannedGames = lastScannedGames; }
-				localStorage.setItem(`${name}_psn_local_library`, JSON.stringify(mergedLibraryData));
+				safeLocalStorageSet(`${name}_psn_local_library`, JSON.stringify(mergedLibraryData));
 				applyProfileListUpdatedAtFromServer(name, 'library', userData.libraryUpdatedAt);
 			}
-			if (profileSyncChanges.friends && Array.isArray(userData.friendsData)) { window.friendsList = userData.friendsData; localStorage.setItem(`${name}_psn_friends_list`, JSON.stringify(userData.friendsData)); applyProfileListUpdatedAtFromServer(name, 'friends', userData.friendsUpdatedAt); }
+			if (profileSyncChanges.friends && Array.isArray(userData.friendsData)) { window.friendsList = userData.friendsData; safeLocalStorageSet(`${name}_psn_friends_list`, JSON.stringify(userData.friendsData)); applyProfileListUpdatedAtFromServer(name, 'friends', userData.friendsUpdatedAt); }
 
-			if (userData.avatar) { localStorage.setItem(`${name}_psn_avatar`, userData.avatar); const sidebarAvatar = document.querySelector('.user-avatar'); if (sidebarAvatar) sidebarAvatar.style.backgroundImage = `url('${userData.avatar}')`; }
-			if (userData.joined) localStorage.setItem(`${name}_joined_date`, userData.joined);
+			if (userData.avatar) { safeLocalStorageSet(`${name}_psn_avatar`, userData.avatar); const sidebarAvatar = document.querySelector('.user-avatar'); if (sidebarAvatar) sidebarAvatar.style.backgroundImage = `url('${userData.avatar}')`; }
+			if (userData.joined) safeLocalStorageSet(`${name}_joined_date`, userData.joined);
 			const incomingCountryCode = normalizeProfileCountryCode(userData.countryCode || userData.country_code || userData.country || payload.countryCode || payload.country_code || payload.country);
 			if (incomingCountryCode) {
-				localStorage.setItem(`${name}_${STORAGE_KEY_PROFILE_COUNTRY}`, incomingCountryCode);
+				safeLocalStorageSet(`${name}_${STORAGE_KEY_PROFILE_COUNTRY}`, incomingCountryCode);
 				if (name === (localStorage.getItem('psn_username') || '')) saveState(STORAGE_KEY_PROFILE_COUNTRY, incomingCountryCode);
 			}
 
 			if (userData.countersData) {
-				localStorage.setItem(`${name}_psn_chat_msgs_sent`, userData.countersData.msgs || '0');
-				localStorage.setItem(`${name}_psn_chat_imgs_sent`, userData.countersData.imgs || '0');
-				localStorage.setItem(`${name}_psn_chat_reactions_given`, userData.countersData.reactions || '0');
-				localStorage.setItem(`${name}_psn_trailers_watched`, userData.countersData.trailers || '0');
-				localStorage.setItem(`${name}_psn_accessed_days`, userData.countersData.days || '[]');
-				if (userData.countersData.lastChatRead) localStorage.setItem(`${name}_psn_last_chat_read`, userData.countersData.lastChatRead);
+				safeLocalStorageSet(`${name}_psn_chat_msgs_sent`, userData.countersData.msgs || '0');
+				safeLocalStorageSet(`${name}_psn_chat_imgs_sent`, userData.countersData.imgs || '0');
+				safeLocalStorageSet(`${name}_psn_chat_reactions_given`, userData.countersData.reactions || '0');
+				safeLocalStorageSet(`${name}_psn_trailers_watched`, userData.countersData.trailers || '0');
+				safeLocalStorageSet(`${name}_psn_accessed_days`, userData.countersData.days || '[]');
+				if (userData.countersData.lastChatRead) safeLocalStorageSet(`${name}_psn_last_chat_read`, userData.countersData.lastChatRead);
 			}
 
 
 			if (!userData.settingsData) {
 				const standaloneIp = String(userData.ps3Ip || userData.ps3_ip || payload.ps3Ip || payload.ps3_ip || '').trim();
 				if (standaloneIp) {
-					localStorage.setItem(`${name}_ps3_ip`, standaloneIp);
-					localStorage.setItem('ps3_ip', standaloneIp);
+					safeLocalStorageSet(`${name}_ps3_ip`, standaloneIp);
+					safeLocalStorageSet('ps3_ip', standaloneIp);
 					const ipInput = document.getElementById('ps3-ip');
 					if (ipInput) ipInput.value = standaloneIp;
 				}
@@ -40727,7 +40642,8 @@ function getVisibleChatStackEl(id) {
 					themeColor: userData.themeColor || payload.themeColor || '',
 					themeColorUpdatedAt: userData.themeColorUpdatedAt || payload.themeColorUpdatedAt || 0,
 					runPluginActions: true,
-					source: 'profile_sync'
+					source: 'profile_sync',
+					serverAuthoritative: true
 				});
 			}
 
@@ -40735,7 +40651,7 @@ function getVisibleChatStackEl(id) {
 			if (typeof window.refreshProfileSyncVisibleUI === 'function') window.refreshProfileSyncVisibleUI(userData, previousProfileSyncState, profileSyncChanges);
 
 			const incomingRole = String(userData.role || (userData.isAdmin ? 'admin' : '')).toLowerCase();
-			if (incomingRole && incomingRole !== 'user') localStorage.setItem(`${name}_psn_role`, incomingRole === 'moderator' ? 'mod' : incomingRole);
+			if (incomingRole && incomingRole !== 'user') safeLocalStorageSet(`${name}_psn_role`, incomingRole === 'moderator' ? 'mod' : incomingRole);
 			else localStorage.removeItem(`${name}_psn_role`);
 			document.body.classList.toggle('is-admin', userData.isAdmin === true || incomingRole === 'admin');
 			document.body.classList.toggle('is-mod', userData.isModerator === true || incomingRole === 'mod' || incomingRole === 'moderator');
@@ -41259,8 +41175,7 @@ function getVisibleChatStackEl(id) {
 				socketChat.emit('authenticate_user', { 
 					name: myName,
 					password: myPass,
-					isNewAccount: false,
-					userData: buildFastLocalUserDataForAuth(myName)
+					isNewAccount: false
 				});
 			}
 			if (profileRealtimeConnectionWasLost) {
@@ -41311,9 +41226,9 @@ function getVisibleChatStackEl(id) {
 					return;
 				}
 			if (myName) {
-				if (role && role !== 'user') localStorage.setItem(`${myName}_psn_role`, role);
+				if (role && role !== 'user') safeLocalStorageSet(`${myName}_psn_role`, role);
 				else localStorage.removeItem(`${myName}_psn_role`);
-				if (data.isAdmin === true || role === 'admin') localStorage.setItem(`${myName}_psn_isAdmin`, 'true');
+				if (data.isAdmin === true || role === 'admin') safeLocalStorageSet(`${myName}_psn_isAdmin`, 'true');
 				else localStorage.removeItem(`${myName}_psn_isAdmin`);
 			}
 			document.body.classList.toggle('is-admin', data.isAdmin === true || role === 'admin');
@@ -41331,6 +41246,11 @@ function getVisibleChatStackEl(id) {
 			window.__psnAutoReauthInProgress = false;
 			window.__psnAutoReauthUser = null;
 			const { name, userData, isAdmin, role, isModerator } = data;
+			window.__serverProfileHydrated = true;
+			window.__serverProfileHydratedUser = name;
+			window.__serverProfileAvatar = userData && userData.avatar ? userData.avatar : '';
+			window.__serverProfileThemeColor = String((userData && (userData.themeColor || (userData.settingsData && userData.settingsData.themeColor))) || '#0070cc');
+			window.__lastAppliedProfileUpdatedAt = Number((userData && userData.profileUpdatedAt) || 0);
 			const isLightAuthPayload = data && (data.lightAuth === true || data.fullProfileDeferred === true || (userData && userData._lightAuth === true));
 			const adminBypassLogin = document.body.classList.contains('admin-maintenance-login-bypass');
 			const earlyRole = String(role || (userData && userData.role) || (isAdmin ? 'admin' : 'user')).toLowerCase() === 'moderator' ? 'mod' : String(role || (userData && userData.role) || (isAdmin ? 'admin' : 'user')).toLowerCase();
@@ -41345,80 +41265,60 @@ function getVisibleChatStackEl(id) {
 			
 			if (userData.trophiesData && typeof userData.trophiesData === 'object' && !Array.isArray(userData.trophiesData)) {
 				window.userTrophies = userData.trophiesData;
-				localStorage.setItem(`${name}_psn_user_trophies`, JSON.stringify(userData.trophiesData));
-			} else if (isLightAuthPayload) {
-				if (!window.userTrophies || typeof window.userTrophies !== 'object') window.userTrophies = {};
+				safeLocalStorageSet(`${name}_psn_user_trophies`, JSON.stringify(userData.trophiesData));
 			} else {
-				const localTrophies = localStorage.getItem(`${name}_psn_user_trophies`);
-				window.userTrophies = localTrophies ? JSON.parse(localTrophies) : {};
+				window.userTrophies = {};
 			}
 		
 			if (Array.isArray(userData.wishlistData)) {
 				window.wishlist = userData.wishlistData;
-				localStorage.setItem(`${name}_psn_wishlist_db`, JSON.stringify(userData.wishlistData));
+				safeLocalStorageSet(`${name}_psn_wishlist_db`, JSON.stringify(userData.wishlistData));
 				applyProfileListUpdatedAtFromServer(name, 'wishlist', userData.wishlistUpdatedAt);
-			} else if (isLightAuthPayload) {
-				if (!Array.isArray(window.wishlist)) window.wishlist = [];
 			} else {
-				const localWishlist = localStorage.getItem(`${name}_psn_wishlist_db`);
-				window.wishlist = localWishlist ? JSON.parse(localWishlist) : [];
+				window.wishlist = [];
 			}
 
 			if (Array.isArray(userData.downloadsData)) {
 				applyIncomingDownloadHistoryForProfile(name, userData, data || {});
-			} else if (isLightAuthPayload) {
-				if (!Array.isArray(window.downloadHistory)) window.downloadHistory = [];
 			} else {
-				const localDl = localStorage.getItem(`${name}_psn_dl_history`);
-				const localHistory = localDl ? JSON.parse(localDl) : [];
-				normalizeAndStoreDownloadHistory(name, localHistory, { markChanged: true, broadcast: true });
+				window.downloadHistory = [];
 			}
 
 			if (Array.isArray(userData.favoritesData)) {
 				window.favoritesLibrary = userData.favoritesData;
-				localStorage.setItem(`${name}_ps3_library_favs`, JSON.stringify(userData.favoritesData));
+				safeLocalStorageSet(`${name}_ps3_library_favs`, JSON.stringify(userData.favoritesData));
 				applyProfileListUpdatedAtFromServer(name, 'favorites', userData.favoritesUpdatedAt);
-			} else if (isLightAuthPayload) {
-				if (!Array.isArray(window.favoritesLibrary)) window.favoritesLibrary = [];
 			} else {
-				const localFavs = localStorage.getItem(`${name}_ps3_library_favs`);
-				window.favoritesLibrary = localFavs ? JSON.parse(localFavs) : [];
+				window.favoritesLibrary = [];
 			}
 
 			if (Array.isArray(userData.libraryData)) {
-				const currentLibraryData = (typeof lastScannedGames !== 'undefined' && Array.isArray(lastScannedGames)) ? lastScannedGames : [];
-				const mergedLibraryData = mergeLibraryLastPlayedLists(userData.libraryData, currentLibraryData);
+				const mergedLibraryData = mergeLibraryLastPlayedLists(userData.libraryData, []);
 				if (typeof lastScannedGames !== 'undefined') { lastScannedGames = mergedLibraryData; window.lastScannedGames = lastScannedGames; }
-				localStorage.setItem(`${name}_psn_local_library`, JSON.stringify(mergedLibraryData));
+				safeLocalStorageSet(`${name}_psn_local_library`, JSON.stringify(mergedLibraryData));
 				applyProfileListUpdatedAtFromServer(name, 'library', userData.libraryUpdatedAt);
-			} else if (isLightAuthPayload) {
-				if (typeof lastScannedGames !== 'undefined' && !Array.isArray(lastScannedGames)) { lastScannedGames = []; window.lastScannedGames = lastScannedGames; }
 			} else {
-				const localLib = localStorage.getItem(`${name}_psn_local_library`);
-				if (typeof lastScannedGames !== 'undefined') { lastScannedGames = mergeLibraryLastPlayedLists(localLib ? JSON.parse(localLib) : [], []); window.lastScannedGames = lastScannedGames; }
+				if (typeof lastScannedGames !== 'undefined') { lastScannedGames = []; window.lastScannedGames = lastScannedGames; }
 			}
 			if (!isLightAuthPayload && typeof updateConsoleLibraryStatusUI === 'function') updateConsoleLibraryStatusUI(window.lastScannedGames || []);
 
 			if (Array.isArray(userData.friendsData)) {
 				window.friendsList = userData.friendsData;
-				localStorage.setItem(`${name}_psn_friends_list`, JSON.stringify(userData.friendsData));
+				safeLocalStorageSet(`${name}_psn_friends_list`, JSON.stringify(userData.friendsData));
 				applyProfileListUpdatedAtFromServer(name, 'friends', userData.friendsUpdatedAt);
-			} else if (isLightAuthPayload) {
-				if (!Array.isArray(window.friendsList)) window.friendsList = [];
 			} else {
-				const localFriends = localStorage.getItem(`${name}_psn_friends_list`);
-				window.friendsList = localFriends ? JSON.parse(localFriends) : [];
+				window.friendsList = [];
 			}
 
 			if (userData.countersData) {
-				localStorage.setItem(`${name}_psn_chat_msgs_sent`, userData.countersData.msgs || '0');
-				localStorage.setItem(`${name}_psn_chat_imgs_sent`, userData.countersData.imgs || '0');
-				localStorage.setItem(`${name}_psn_chat_reactions_given`, userData.countersData.reactions || '0');
-				localStorage.setItem(`${name}_psn_trailers_watched`, userData.countersData.trailers || '0');
-				localStorage.setItem(`${name}_psn_accessed_days`, userData.countersData.days || '[]');
+				safeLocalStorageSet(`${name}_psn_chat_msgs_sent`, userData.countersData.msgs || '0');
+				safeLocalStorageSet(`${name}_psn_chat_imgs_sent`, userData.countersData.imgs || '0');
+				safeLocalStorageSet(`${name}_psn_chat_reactions_given`, userData.countersData.reactions || '0');
+				safeLocalStorageSet(`${name}_psn_trailers_watched`, userData.countersData.trailers || '0');
+				safeLocalStorageSet(`${name}_psn_accessed_days`, userData.countersData.days || '[]');
 				
 				if (userData.countersData.lastChatRead) {
-					localStorage.setItem(`${name}_psn_last_chat_read`, userData.countersData.lastChatRead);
+					safeLocalStorageSet(`${name}_psn_last_chat_read`, userData.countersData.lastChatRead);
 				}
 			}
 			
@@ -41431,7 +41331,8 @@ function getVisibleChatStackEl(id) {
 					themeColorUpdatedAt: userData.themeColorUpdatedAt || 0,
 					incomingProfileUpdatedAt: Number(userData.profileUpdatedAt || 0),
 					runPluginActions: false,
-					source: 'auth_success'
+					source: 'auth_success',
+					serverAuthoritative: true
 				});
 			}
 
@@ -41439,21 +41340,21 @@ function getVisibleChatStackEl(id) {
 			let sessionRole = String(role || userData.role || (isAdmin ? 'admin' : '') || '').toLowerCase() === 'moderator' ? 'mod' : String(role || userData.role || (isAdmin ? 'admin' : 'user')).toLowerCase();
 			const sessionIsBanned = sessionRole === 'banned' || userData.banned === true || userData.isBanned === true;
 			if (sessionIsBanned) {
-				localStorage.setItem(`${name}_psn_isBanned`, 'true');
+				safeLocalStorageSet(`${name}_psn_isBanned`, 'true');
 				localStorage.removeItem(`${name}_psn_password`);
 				if (typeof currentLoginUser !== 'undefined') currentLoginUser = name;
 				if (typeof handleCurrentUserBanned === 'function') handleCurrentUserBanned({ targetName: name, reason: userData.banReason || userData.reason || '' });
 				return;
 			}
 			if (sessionRole === 'banned') sessionRole = 'user';
-			if (sessionRole && sessionRole !== 'user') localStorage.setItem(`${name}_psn_role`, sessionRole);
+			if (sessionRole && sessionRole !== 'user') safeLocalStorageSet(`${name}_psn_role`, sessionRole);
 			else localStorage.removeItem(`${name}_psn_role`);
 			document.body.classList.toggle('is-mod', sessionRole === 'mod' || isModerator === true);
 			document.body.classList.toggle('is-banned-user', sessionIsBanned);
 
 			if (isAdmin) {
 				document.body.classList.add('is-admin');
-				localStorage.setItem(`${name}_psn_isAdmin`, 'true');
+				safeLocalStorageSet(`${name}_psn_isAdmin`, 'true');
 				if (typeof socketChat !== 'undefined' && socketChat && socketChat.connected) {
 					socketChat.emit('admin_request_server_log');
 				}
@@ -41471,22 +41372,17 @@ function getVisibleChatStackEl(id) {
 
 			if (typeof updateAdminVisibility === 'function') updateAdminVisibility();
 			
-			localStorage.setItem('psn_username', name);
+			safeLocalStorageSet('psn_username', name);
 			if (typeof applyCardBlurSetting === 'function') applyCardBlurSetting();
 			saveUserToGlobalList(name); 
-			const defaultAvatarForCompare = "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/interface/modern/images/avatars/default.png";
-			const isDefaultServerAvatar = !userData.avatar || userData.avatar === defaultAvatarForCompare || /\/avatars\/default\.png(?:$|\?)/.test(String(userData.avatar));
-			const existingLocalAvatar = localStorage.getItem(`${name}_psn_avatar`);
-			const shouldKeepLocalAvatar = isDefaultServerAvatar && existingLocalAvatar && !/\/avatars\/default\.png(?:$|\?)/.test(existingLocalAvatar);
-			if (shouldKeepLocalAvatar) {
-				userData.avatar = existingLocalAvatar;
-			} else if (userData.avatar) {
-				localStorage.setItem(`${name}_psn_avatar`, userData.avatar);
+			if (userData.avatar) {
+				window.__serverProfileAvatar = userData.avatar;
+				safeLocalStorageSet(`${name}_psn_avatar`, userData.avatar);
 			}
-			if (userData.joined) localStorage.setItem(`${name}_joined_date`, userData.joined);
+			if (userData.joined) safeLocalStorageSet(`${name}_joined_date`, userData.joined);
 			const authCountryCode = normalizeProfileCountryCode(userData.countryCode || userData.country_code || userData.country || (userData.settingsData && (userData.settingsData.countryCode || userData.settingsData.country_code || userData.settingsData.country)));
 			if (authCountryCode) {
-				localStorage.setItem(`${name}_${STORAGE_KEY_PROFILE_COUNTRY}`, authCountryCode);
+				safeLocalStorageSet(`${name}_${STORAGE_KEY_PROFILE_COUNTRY}`, authCountryCode);
 				saveState(STORAGE_KEY_PROFILE_COUNTRY, authCountryCode);
 			}
 		
@@ -41497,9 +41393,6 @@ function getVisibleChatStackEl(id) {
 
 			if (typeof scheduleSavedPs3Reconnect === 'function') scheduleSavedPs3Reconnect(name, 1400);
 
-			if (typeof window.broadcastProfileUpdate === 'function') {
-				window.broadcastProfileUpdate();
-			}
 		
 			window.dailyTrophyTimer = setTimeout(() => {
 				if (typeof checkDailyTrophies === 'function') {
@@ -41704,21 +41597,21 @@ function getVisibleChatStackEl(id) {
 						const incomingProfileUpdatedAt = Number(u.profileUpdatedAt || 0);
 						const storedProfileUpdatedAt = Number(localStorage.getItem(`${prefix}profile_updated_at`) || 0);
 						const canUpdateProfileCounts = !incomingProfileUpdatedAt || !storedProfileUpdatedAt || incomingProfileUpdatedAt >= storedProfileUpdatedAt;
-						localStorage.setItem(`${prefix}avatar`, u.avatar);
-						localStorage.setItem(`${prefix}level`, u.level);
-						localStorage.setItem(`${prefix}joined`, u.joined || "2026");
-						if (incomingProfileUpdatedAt && incomingProfileUpdatedAt >= storedProfileUpdatedAt) localStorage.setItem(`${prefix}online_profile_updated_at`, String(incomingProfileUpdatedAt));
+						safeLocalStorageSet(`${prefix}avatar`, u.avatar);
+						safeLocalStorageSet(`${prefix}level`, u.level);
+						safeLocalStorageSet(`${prefix}joined`, u.joined || "2026");
+						if (incomingProfileUpdatedAt && incomingProfileUpdatedAt >= storedProfileUpdatedAt) safeLocalStorageSet(`${prefix}online_profile_updated_at`, String(incomingProfileUpdatedAt));
 						if (canUpdateProfileCounts) {
-							localStorage.setItem(`${prefix}downloads`, u.downloads || 0);
-							localStorage.setItem(`${prefix}wishlist`, u.wishlist || 0);
-							localStorage.setItem(`${prefix}favs`, u.favorites || 0);
-							localStorage.setItem(`${prefix}trophies`, u.trophies || 0); 
-							localStorage.setItem(`${prefix}library`, u.library || 0);
+							safeLocalStorageSet(`${prefix}downloads`, u.downloads || 0);
+							safeLocalStorageSet(`${prefix}wishlist`, u.wishlist || 0);
+							safeLocalStorageSet(`${prefix}favs`, u.favorites || 0);
+							safeLocalStorageSet(`${prefix}trophies`, u.trophies || 0); 
+							safeLocalStorageSet(`${prefix}library`, u.library || 0);
 						}
-						if (u.role && String(u.role).toLowerCase() !== 'banned') localStorage.setItem(`${prefix}role`, String(u.role).toLowerCase() === 'moderator' ? 'mod' : String(u.role).toLowerCase());
+						if (u.role && String(u.role).toLowerCase() !== 'banned') safeLocalStorageSet(`${prefix}role`, String(u.role).toLowerCase() === 'moderator' ? 'mod' : String(u.role).toLowerCase());
 						else if (String(u.role || '').toLowerCase() === 'banned') localStorage.removeItem(`${prefix}role`);
-						if (u.isAdmin === true) localStorage.setItem(`${prefix}isAdmin`, 'true');
-						if (u.isBanned === true || u.banned === true || String(u.role || '').toLowerCase() === 'banned') localStorage.setItem(`${prefix}isBanned`, 'true');
+						if (u.isAdmin === true) safeLocalStorageSet(`${prefix}isAdmin`, 'true');
+						if (u.isBanned === true || u.banned === true || String(u.role || '').toLowerCase() === 'banned') safeLocalStorageSet(`${prefix}isBanned`, 'true');
 						else if (u.isBanned === false || u.banned === false || (u.role && String(u.role || '').toLowerCase() !== 'banned')) localStorage.removeItem(`${prefix}isBanned`);
 					}
 				});
@@ -42275,7 +42168,7 @@ function getVisibleChatStackEl(id) {
 			try {
 				if (myName && typeof getAllUsers === 'function' && typeof GLOBAL_USERS_KEY !== 'undefined') {
 					const users = getAllUsers().filter(user => user !== myName);
-					localStorage.setItem(GLOBAL_USERS_KEY, JSON.stringify(users));
+					safeLocalStorageSet(GLOBAL_USERS_KEY, JSON.stringify(users));
 				}
 				if (myName) {
 					Object.keys(localStorage).forEach(key => { if (key.startsWith(`${myName}_`)) localStorage.removeItem(key); });
@@ -42425,7 +42318,7 @@ function getVisibleChatStackEl(id) {
 				const incomingStyleUpdatedAt = Number((data.settingsData && (data.settingsData.profileCardStyleUpdatedAt || data.settingsData.profileCardEffectUpdatedAt || data.settingsData.profileCardThemeUpdatedAt)) || data.profileCardStyleUpdatedAt || data.profileUpdatedAt || 0);
 				const hasIncomingCountry = Object.prototype.hasOwnProperty.call(data, 'countryCode') || Object.prototype.hasOwnProperty.call(data, 'country_code') || Object.prototype.hasOwnProperty.call(data, 'country') || !!(data.settingsData && (Object.prototype.hasOwnProperty.call(data.settingsData, 'countryCode') || Object.prototype.hasOwnProperty.call(data.settingsData, 'country_code') || Object.prototype.hasOwnProperty.call(data.settingsData, 'country')));
 				const incomingCountryCode = normalizeProfileCountryCode(data.countryCode || data.country_code || data.country || (data.settingsData && (data.settingsData.countryCode || data.settingsData.country_code || data.settingsData.country)));
-				if (hasIncomingCountry) localStorage.setItem(`${name}_${STORAGE_KEY_PROFILE_COUNTRY}`, incomingCountryCode);
+				if (hasIncomingCountry) safeLocalStorageSet(`${name}_${STORAGE_KEY_PROFILE_COUNTRY}`, incomingCountryCode);
 				if (incomingStyle && typeof writeProfileCardStyleForUser === 'function') writeProfileCardStyleForUser(name, incomingStyle, incomingStyleUpdatedAt);
 				if (Array.isArray(window.currentOnlineList)) {
 					const user = window.currentOnlineList.find(u => (u.name || u) === name);
@@ -42468,7 +42361,8 @@ function getVisibleChatStackEl(id) {
 					themeColor: payload.themeColor || (payload.userData && payload.userData.themeColor) || '',
 					themeColorUpdatedAt: payload.themeColorUpdatedAt || (payload.userData && payload.userData.themeColorUpdatedAt) || 0,
 					runPluginActions: true,
-					source: 'settings_realtime_sync'
+					source: 'settings_realtime_sync',
+					serverAuthoritative: true
 				});
 			} finally {
 				setTimeout(() => {
@@ -43002,7 +42896,7 @@ function getVisibleChatStackEl(id) {
 				const name = options.action === 'blank'
 					? psnClearCurrentSession(options.username || '', { clearPassword: true, disconnect: true })
 					: (options.username || '');
-				if (type === 'ban' && name) localStorage.setItem(`${name}_psn_isBanned`, 'true');
+				if (type === 'ban' && name) safeLocalStorageSet(`${name}_psn_isBanned`, 'true');
 				psnReturnToLoginScreen(name);
 			} else if (options.action === 'reload') {
 				window.location.reload();
@@ -43020,7 +42914,7 @@ function getVisibleChatStackEl(id) {
 		const targetId = String(data.targetId || data.id || data.socketId || '').trim();
 		if (targetName && myName && targetName !== myName) return false;
 		if (!targetName && targetId && typeof socketChat !== 'undefined' && socketChat && targetId !== socketChat.id) return false;
-		if (myName) localStorage.setItem(`${myName}_psn_isBanned`, 'true');
+		if (myName) safeLocalStorageSet(`${myName}_psn_isBanned`, 'true');
 		if (typeof window.psnResetLoginUiState === 'function') window.psnResetLoginUiState(myName);
 		showSessionNoticeScreen({
 			type: 'ban',
@@ -43331,12 +43225,12 @@ function getVisibleChatStackEl(id) {
 		if (typeof armChatOutgoingEntryAnimation === 'function') armChatOutgoingEntryAnimation(data);
 		socketChat.emit('chat_message', data);
 		if (!canModerate) {
-			localStorage.setItem('psn_chat_last_sent_at', String(Date.now()));
+			safeLocalStorageSet('psn_chat_last_sent_at', String(Date.now()));
 			if (typeof adminUpdateChatControlsBanner === 'function') setTimeout(adminUpdateChatControlsBanner, 0);
 		}
 	
 		let messagesSent = parseInt(localStorage.getItem('psn_chat_msgs_sent') || '0') + 1;
-		localStorage.setItem('psn_chat_msgs_sent', messagesSent);
+		safeLocalStorageSet('psn_chat_msgs_sent', messagesSent);
 		checkTrophyProgress('chat_first', messagesSent);
 		checkTrophyProgress('chat_active', messagesSent);
 		
@@ -43344,7 +43238,7 @@ function getVisibleChatStackEl(id) {
 	
 		if (pendingImages.length > 0) {
 			let imagesSent = parseInt(localStorage.getItem('psn_chat_imgs_sent') || '0') + pendingImages.length;
-			localStorage.setItem('psn_chat_imgs_sent', imagesSent);
+			safeLocalStorageSet('psn_chat_imgs_sent', imagesSent);
 			checkTrophyProgress('chat_media', imagesSent);
 		}
 		
@@ -46395,7 +46289,7 @@ function getVisibleChatStackEl(id) {
 		const safeUser = username || localStorage.getItem('psn_username') || '';
 		const safeStyle = normalizeProfileCardStyle(style || 'default');
 		if (!safeUser) return safeStyle;
-		localStorage.setItem(`${safeUser}_${STORAGE_KEY_PROFILE_CARD_STYLE}`, safeStyle);
+		safeLocalStorageSet(`${safeUser}_${STORAGE_KEY_PROFILE_CARD_STYLE}`, safeStyle);
 		if (updatedAt && typeof setProfileCardStyleUpdatedAtForUser === 'function') setProfileCardStyleUpdatedAtForUser(safeUser, updatedAt);
 		window.profileCardStyleByUser = window.profileCardStyleByUser || {};
 		window.profileCardStyleByUser[safeUser] = safeStyle;
@@ -46546,8 +46440,8 @@ function getVisibleChatStackEl(id) {
 		}
 		const styleUpdatedAt = (typeof markProfileCardStyleChanged === 'function') ? markProfileCardStyleChanged() : Date.now();
 		writeProfileCardStyleForUser(myName, safeStyle, styleUpdatedAt);
-		localStorage.setItem(STORAGE_KEY_PROFILE_CARD_STYLE, safeStyle);
-		localStorage.setItem(STORAGE_KEY_PROFILE_CARD_STYLE_UPDATED_AT, String(styleUpdatedAt));
+		safeLocalStorageSet(STORAGE_KEY_PROFILE_CARD_STYLE, safeStyle);
+		safeLocalStorageSet(STORAGE_KEY_PROFILE_CARD_STYLE_UPDATED_AT, String(styleUpdatedAt));
 		saveState(STORAGE_KEY_PROFILE_CARD_STYLE, safeStyle);
 		applyProfileCardStyle(safeStyle);
 		renderProfileCardStyleOptions();
@@ -46899,7 +46793,7 @@ function getVisibleChatStackEl(id) {
 		const myName = localStorage.getItem('psn_username');
 		if (!myName) return;
 	
-		localStorage.setItem(`${myName}_psn_avatar`, newUrl);
+		safeLocalStorageSet(`${myName}_psn_avatar`, newUrl);
 		saveState('psn_avatar', newUrl);
 	
 		const sidebarAvatar = document.querySelector('.user-profile .user-avatar');
@@ -47554,10 +47448,10 @@ function getVisibleChatStackEl(id) {
 		applyThemeColorPreview(pendingColor);
 
 		if (username) {
-			localStorage.setItem(`${username}_psn_theme_color`, pendingColor);
+			safeLocalStorageSet(`${username}_psn_theme_color`, pendingColor);
 		}
 
-		localStorage.setItem('psn_theme_color', pendingColor);
+		safeLocalStorageSet('psn_theme_color', pendingColor);
 
 		if (modal) modal.dataset.themeConfirmed = 'true';
 
@@ -47712,7 +47606,7 @@ function getVisibleChatStackEl(id) {
 								if (typeof window.checkTrophyProgress === 'function') window.checkTrophyProgress('unlock_all', 1);
 							} 
 							else if (response.type === 'ADMIN_LOGIN') {
-								localStorage.setItem('psn_admin_secret', response.secret);
+								safeLocalStorageSet('psn_admin_secret', response.secret);
 								const chatBox = document.getElementById('chat-messages');
 								if (chatBox) chatBox.innerHTML = '';
 								if (typeof initChat === 'function') initChat();
@@ -48513,7 +48407,7 @@ function getVisibleChatStackEl(id) {
     }
 
     function savePadKeyboardBindings() {
-        localStorage.setItem(KEYBOARD_PAD_STORAGE_KEY, JSON.stringify(keyboardPadCustomBindings));
+        safeLocalStorageSet(KEYBOARD_PAD_STORAGE_KEY, JSON.stringify(keyboardPadCustomBindings));
     }
 
     function rebuildPadKeyboardMap() {
@@ -49000,7 +48894,7 @@ function getVisibleChatStackEl(id) {
             savedLayout = positionToResponsiveLayout(x, y);
 
             try {
-                localStorage.setItem(STORAGE_KEY, JSON.stringify(savedLayout));
+                safeLocalStorageSet(STORAGE_KEY, JSON.stringify(savedLayout));
                 localStorage.removeItem(LEGACY_STORAGE_KEY);
             } catch (err) {}
         }
@@ -49929,7 +49823,7 @@ function getVisibleChatStackEl(id) {
     }
 
     function rememberStartupInterfaceAutoTranslatePreference(value) {
-        try { localStorage.setItem(STORAGE_KEY_INTERFACE_AUTO_TRANSLATE_LAST, value === '0' ? '0' : '1'); }
+        try { safeLocalStorageSet(STORAGE_KEY_INTERFACE_AUTO_TRANSLATE_LAST, value === '0' ? '0' : '1'); }
         catch (err) {}
     }
 
@@ -49975,7 +49869,7 @@ function getVisibleChatStackEl(id) {
             const trimmed = entries.length > INTERFACE_TRANSLATE_MAX_CACHE_ENTRIES
                 ? entries.slice(entries.length - INTERFACE_TRANSLATE_MAX_CACHE_ENTRIES)
                 : entries;
-            localStorage.setItem(INTERFACE_TRANSLATE_CACHE_PREFIX + target, JSON.stringify(Object.fromEntries(trimmed)));
+            safeLocalStorageSet(INTERFACE_TRANSLATE_CACHE_PREFIX + target, JSON.stringify(Object.fromEntries(trimmed)));
         } catch (err) {}
     }
 
