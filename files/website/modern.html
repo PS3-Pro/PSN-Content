@@ -647,6 +647,11 @@ select option { background-color: var(--bg-dark); }
 .server-unavailable-actions.ps5-btn-group { margin-top: 25px; opacity: 0; transform: translateY(10px); }
 .server-unavailable-actions .ps5-pill-btn { flex: 1 1 0; display: inline-flex; align-items: center; justify-content: center; gap: 8px; }
 .server-unavailable-actions .ps5-pill-btn:disabled { opacity: .62; pointer-events: none; transform: none !important; }
+#server-unavailable-retry { transition: background-color .38s ease,color .38s ease,border-color .38s ease,box-shadow .38s ease,opacity .25s ease,transform .25s ease !important; }
+#server-unavailable-retry .server-retry-content { display: inline-flex; align-items: center; justify-content: center; gap: 8px; opacity: 1; transform: translateY(0); transition: opacity .24s ease,transform .24s ease; }
+#server-unavailable-retry.is-switching .server-retry-content { opacity: 0; transform: translateY(3px); }
+#server-unavailable-retry.is-failed { background: #d83248 !important; color: #ffffff !important; border: 1px solid rgba(255,120,135,.78) !important; box-shadow: 0 0 0 1px rgba(255,255,255,.06) inset,0 7px 22px rgba(216,50,72,.34),0 0 22px rgba(255,68,90,.22) !important; opacity: 1 !important; }
+#server-unavailable-retry.is-connected { background: #299a57 !important; color: #ffffff !important; border: 1px solid rgba(113,230,157,.78) !important; box-shadow: 0 0 0 1px rgba(255,255,255,.06) inset,0 7px 22px rgba(41,154,87,.34),0 0 22px rgba(76,220,130,.22) !important; opacity: 1 !important; }
 .server-unavailable-overlay.show .server-unavailable-status { animation: serverUnavailableLineIn .46s ease .39s both; }
 .server-unavailable-overlay.show .server-unavailable-title { animation: serverUnavailableLineIn .48s ease .46s both; }
 .server-unavailable-overlay.show .server-unavailable-copy { animation: serverUnavailableLineIn .48s ease .53s both; }
@@ -6486,7 +6491,7 @@ a:focus, button:focus, select:focus, input:focus, textarea:focus, [contenteditab
 			<p class="server-unavailable-hint">Please come back later and try again.</p>
 			<div class="server-unavailable-actions ps5-btn-group">
 				<button class="ps5-pill-btn ps5-pill-secondary" type="button" onclick="returnToLoginFromServerUnavailable()" onmouseenter="if(typeof playUiHover === 'function') playUiHover()">Back to Login</button>
-				<button id="server-unavailable-retry" class="ps5-pill-btn ps5-pill-primary" type="button" onclick="retryServerConnection()" onmouseenter="if(typeof playUiHover === 'function') playUiHover()">Retry Connection</button>
+				<button id="server-unavailable-retry" class="ps5-pill-btn ps5-pill-primary" type="button" onclick="retryServerConnection()" onmouseenter="if(typeof playUiHover === 'function') playUiHover()"><span class="server-retry-content">Try to reconnect</span></button>
 			</div>
 		</div>
 	</div>
@@ -10199,7 +10204,7 @@ P
 
 			preloader.src = selectedAvatarUrl;
 
-		}, 150);
+		}, 220);
 	}
 
 	function nextAvatar() {
@@ -40570,14 +40575,127 @@ function getVisibleChatStackEl(id) {
 
 
 	let serverUnavailableNoticeShown = false;
+	let serverUnavailableManualRetryActive = false;
+	let serverUnavailableManualRetryStartedAt = 0;
+	let serverUnavailableRetryButtonState = 'idle';
+	let serverUnavailableRetryFailureTimer = null;
+	let serverUnavailableRetryFailureDelayTimer = null;
+	let serverUnavailableRetryTransitionTimer = null;
+	let serverUnavailableRetrySuccessDelayTimer = null;
+	let serverUnavailableRetrySuccessTimer = null;
 
-	function setServerUnavailableRetrying(isRetrying) {
+	function clearServerUnavailableRetryTimers() {
+		if (serverUnavailableRetryFailureTimer) {
+			clearTimeout(serverUnavailableRetryFailureTimer);
+			serverUnavailableRetryFailureTimer = null;
+		}
+		if (serverUnavailableRetryFailureDelayTimer) {
+			clearTimeout(serverUnavailableRetryFailureDelayTimer);
+			serverUnavailableRetryFailureDelayTimer = null;
+		}
+		if (serverUnavailableRetrySuccessDelayTimer) {
+			clearTimeout(serverUnavailableRetrySuccessDelayTimer);
+			serverUnavailableRetrySuccessDelayTimer = null;
+		}
+		if (serverUnavailableRetrySuccessTimer) {
+			clearTimeout(serverUnavailableRetrySuccessTimer);
+			serverUnavailableRetrySuccessTimer = null;
+		}
+	}
+
+	function setServerUnavailableRetryButtonState(state, animate = true, force = false) {
 		const button = document.getElementById('server-unavailable-retry');
 		if (!button) return;
-		button.disabled = !!isRetrying;
-		button.innerHTML = isRetrying
-			? '<i class="fas fa-spinner fa-spin"></i> Connecting...'
-			: 'Retry Connection';
+
+		if (!force && serverUnavailableRetryButtonState === state) {
+			button.disabled = state !== 'idle';
+			return;
+		}
+
+		serverUnavailableRetryButtonState = state;
+		if (serverUnavailableRetryTransitionTimer) {
+			clearTimeout(serverUnavailableRetryTransitionTimer);
+			serverUnavailableRetryTransitionTimer = null;
+		}
+
+		const applyState = () => {
+			button.classList.toggle('is-failed', state === 'failed');
+			button.classList.toggle('is-connected', state === 'connected');
+			button.disabled = state !== 'idle';
+			let content = button.querySelector('.server-retry-content');
+			if (!content) {
+				content = document.createElement('span');
+				content.className = 'server-retry-content';
+				button.innerHTML = '';
+				button.appendChild(content);
+			}
+			if (state === 'connecting') content.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Connecting...';
+			else if (state === 'failed') content.textContent = 'Failed';
+			else if (state === 'connected') content.textContent = 'Connected';
+			else content.textContent = 'Try to reconnect';
+			requestAnimationFrame(() => requestAnimationFrame(() => button.classList.remove('is-switching')));
+		};
+
+		if (!animate) {
+			button.classList.remove('is-switching');
+			applyState();
+			return;
+		}
+
+		button.classList.add('is-switching');
+		serverUnavailableRetryTransitionTimer = setTimeout(() => {
+			serverUnavailableRetryTransitionTimer = null;
+			applyState();
+		}, 220);
+	}
+
+	function setServerUnavailableRetrying(isRetrying, animate = true) {
+		if (serverUnavailableRetryFailureTimer) {
+			clearTimeout(serverUnavailableRetryFailureTimer);
+			serverUnavailableRetryFailureTimer = null;
+		}
+		setServerUnavailableRetryButtonState(isRetrying ? 'connecting' : 'idle', animate);
+	}
+
+	function setServerUnavailableRetryFailed() {
+		if (serverUnavailableRetryFailureDelayTimer) {
+			clearTimeout(serverUnavailableRetryFailureDelayTimer);
+			serverUnavailableRetryFailureDelayTimer = null;
+		}
+		if (serverUnavailableRetryFailureTimer) clearTimeout(serverUnavailableRetryFailureTimer);
+		setServerUnavailableRetryButtonState('failed', true);
+		if (typeof playUiError === 'function') playUiError();
+		serverUnavailableRetryFailureTimer = setTimeout(() => {
+			serverUnavailableRetryFailureTimer = null;
+			setServerUnavailableRetrying(false, true);
+		}, 2500);
+	}
+
+	function scheduleServerUnavailableRetryFailed() {
+		if (serverUnavailableRetryFailureDelayTimer) clearTimeout(serverUnavailableRetryFailureDelayTimer);
+		const elapsed = serverUnavailableManualRetryStartedAt ? Date.now() - serverUnavailableManualRetryStartedAt : 2200;
+		const delay = Math.max(0, 2200 - elapsed);
+		serverUnavailableRetryFailureDelayTimer = setTimeout(() => {
+			serverUnavailableRetryFailureDelayTimer = null;
+			setServerUnavailableRetryFailed();
+		}, delay);
+	}
+
+	function showServerUnavailableRetryConnected() {
+		if (serverUnavailableRetryFailureTimer) {
+			clearTimeout(serverUnavailableRetryFailureTimer);
+			serverUnavailableRetryFailureTimer = null;
+		}
+		if (serverUnavailableRetryFailureDelayTimer) {
+			clearTimeout(serverUnavailableRetryFailureDelayTimer);
+			serverUnavailableRetryFailureDelayTimer = null;
+		}
+		setServerUnavailableRetryButtonState('connected', true);
+		if (typeof playUiSuccess === 'function') playUiSuccess();
+		serverUnavailableRetrySuccessTimer = setTimeout(() => {
+			serverUnavailableRetrySuccessTimer = null;
+			window.hideServerUnavailableModal();
+		}, 1200);
 	}
 
 	let serverUnavailableCloseTimer = null;
@@ -40587,7 +40705,10 @@ function getVisibleChatStackEl(id) {
 		const modal = document.getElementById('server-unavailable-modal');
 		if (!modal) return;
 		serverUnavailableNoticeShown = true;
-		setServerUnavailableRetrying(false);
+		serverUnavailableManualRetryActive = false;
+		serverUnavailableManualRetryStartedAt = 0;
+		clearServerUnavailableRetryTimers();
+		setServerUnavailableRetryButtonState('idle', false, true);
 		if (serverUnavailableCloseTimer) {
 			clearTimeout(serverUnavailableCloseTimer);
 			serverUnavailableCloseTimer = null;
@@ -40599,14 +40720,20 @@ function getVisibleChatStackEl(id) {
 
 	window.hideServerUnavailableModal = function() {
 		const modal = document.getElementById('server-unavailable-modal');
-		setServerUnavailableRetrying(false);
-		if (!modal || (!modal.classList.contains('show') && !modal.classList.contains('closing'))) return;
+		serverUnavailableManualRetryActive = false;
+		serverUnavailableManualRetryStartedAt = 0;
+		clearServerUnavailableRetryTimers();
+		if (!modal || (!modal.classList.contains('show') && !modal.classList.contains('closing'))) {
+			setServerUnavailableRetryButtonState('idle', false, true);
+			return;
+		}
 		if (serverUnavailableCloseTimer) clearTimeout(serverUnavailableCloseTimer);
 		modal.classList.remove('show');
 		modal.classList.add('closing');
 		serverUnavailableCloseTimer = setTimeout(() => {
 			modal.classList.remove('closing');
 			serverUnavailableCloseTimer = null;
+			setServerUnavailableRetryButtonState('idle', false, true);
 		}, 400);
 	};
 
@@ -40792,6 +40919,9 @@ function getVisibleChatStackEl(id) {
 
 	window.retryServerConnection = function() {
 		if (typeof playUiClick === 'function') playUiClick();
+		clearServerUnavailableRetryTimers();
+		serverUnavailableManualRetryActive = true;
+		serverUnavailableManualRetryStartedAt = Date.now();
 		setServerUnavailableRetrying(true);
 		try {
 			if (socketChat && !socketChat.connected) {
@@ -40802,15 +40932,39 @@ function getVisibleChatStackEl(id) {
 			}
 		} catch (err) {
 			console.warn('[NETWORK] Manual reconnect failed:', err);
-			setServerUnavailableRetrying(false);
+			serverUnavailableManualRetryActive = false;
+			scheduleServerUnavailableRetryFailed();
 		}
 		setTimeout(() => {
-			if (!socketChat || !socketChat.connected) setServerUnavailableRetrying(false);
+			if (serverUnavailableManualRetryActive && (!socketChat || !socketChat.connected)) {
+				serverUnavailableManualRetryActive = false;
+				scheduleServerUnavailableRetryFailed();
+			}
 		}, 3500);
 	};
 
 	function markServerConnectionAvailable() {
+		const modal = document.getElementById('server-unavailable-modal');
+		const modalVisible = !!(modal && modal.classList.contains('show'));
+		const retryWasActive = serverUnavailableManualRetryActive || serverUnavailableRetryButtonState === 'connecting';
+		const retryStartedAt = serverUnavailableManualRetryStartedAt;
+
+		serverUnavailableManualRetryActive = false;
 		serverUnavailableNoticeShown = false;
+		clearServerUnavailableRetryTimers();
+
+		if (modalVisible) {
+			const elapsed = retryStartedAt ? Date.now() - retryStartedAt : 900;
+			const delay = retryWasActive ? Math.max(0, 900 - elapsed) : 0;
+			serverUnavailableRetrySuccessDelayTimer = setTimeout(() => {
+				serverUnavailableRetrySuccessDelayTimer = null;
+				serverUnavailableManualRetryStartedAt = 0;
+				showServerUnavailableRetryConnected();
+			}, delay);
+			return;
+		}
+
+		serverUnavailableManualRetryStartedAt = 0;
 		window.hideServerUnavailableModal();
 	}
 
@@ -42139,7 +42293,10 @@ function getVisibleChatStackEl(id) {
 		socketChat.on('connect_error', () => {
 			if (typeof isKicked !== 'undefined' && isKicked) return;
 			profileRealtimeConnectionWasLost = true;
-			setServerUnavailableRetrying(false);
+			if (serverUnavailableManualRetryActive) {
+				serverUnavailableManualRetryActive = false;
+				scheduleServerUnavailableRetryFailed();
+			}
 			
 			if (typeof updateGlobalOnlineStatus === 'function') updateGlobalOnlineStatus('connecting');
 			const s = document.getElementById('chat-status-text');
