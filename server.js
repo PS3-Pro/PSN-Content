@@ -1,5 +1,6 @@
 const express = require('express');
 const http = require('http');
+const https = require('https');
 const { Server } = require("socket.io");
 const { Pool, Client } = require('pg');
 const bcrypt = require('bcrypt');
@@ -19,6 +20,11 @@ const INSTANCE_ID = process.env.RENDER_INSTANCE_ID || process.env.RAILWAY_REPLIC
 const PRESENCE_TTL_SECONDS = 90;
 const PRESENCE_HEARTBEAT_MS = 25000;
 const CHAT_SYNC_INTERVAL_MS = 3000;
+const KEEP_ALIVE_INTERVAL_MS = Math.max(60000, parseInt(process.env.KEEP_ALIVE_INTERVAL_MS || "600000", 10) || 600000);
+const KEEP_ALIVE_TIMEOUT_MS = Math.max(1000, parseInt(process.env.KEEP_ALIVE_TIMEOUT_MS || "10000", 10) || 10000);
+const KEEP_ALIVE_URLS = [
+  "https://psn-content-0u8u.onrender.com/",
+];
 const PROFILE_SYNC_INTERVAL_MS = Math.max(10000, parseInt(process.env.PROFILE_SYNC_INTERVAL_MS || "15000", 10) || 15000);
 const ENABLE_PROFILE_PERIODIC_SYNC = process.env.ENABLE_PROFILE_PERIODIC_SYNC === "1";
 const POST_AUTH_CHAT_HISTORY_DELAY_MS = Math.max(0, parseInt(process.env.POST_AUTH_CHAT_HISTORY_DELAY_MS || "180", 10) || 180);
@@ -146,7 +152,97 @@ function runNonOverlappingTask(taskName, taskFn) {
   };
 }
 
+let keepAliveInterval = null;
 
+function getKeepAlivePingUrl(rawUrl) {
+  const value = String(rawUrl || "").trim();
+  if (!value) return null;
+
+  try {
+    const url = new URL(value);
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return null;
+    url.hash = '';
+    url.search = '';
+    const pathname = url.pathname.replace(/\/+$/, '');
+    url.pathname = pathname.endsWith('/ping') ? pathname : `${pathname}/ping`;
+    return url;
+  } catch (err) {
+    console.error(`[KEEP ALIVE] Invalid URL: ${value}`);
+    return null;
+  }
+}
+
+function pingKeepAliveServer(rawUrl, redirectsLeft = 2) {
+  const url = rawUrl instanceof URL ? rawUrl : getKeepAlivePingUrl(rawUrl);
+  if (!url) return Promise.resolve({ ok: false, url: String(rawUrl || ''), error: 'Invalid URL' });
+
+  return new Promise(resolve => {
+    const client = url.protocol === 'https:' ? https : http;
+    const req = client.get(url, {
+      headers: {
+        'User-Agent': 'PSN-Server-KeepAlive/1.0',
+        'Cache-Control': 'no-cache'
+      }
+    }, res => {
+      const status = Number(res.statusCode || 0);
+      const location = res.headers.location;
+      res.resume();
+
+      if (status >= 300 && status < 400 && location && redirectsLeft > 0) {
+        try {
+          const redirectedUrl = new URL(location, url);
+          pingKeepAliveServer(redirectedUrl, redirectsLeft - 1).then(resolve);
+        } catch (err) {
+          resolve({ ok: false, url: url.href, status, error: err.message });
+        }
+        return;
+      }
+
+      resolve({
+        ok: status >= 200 && status < 400,
+        url: url.href,
+        status
+      });
+    });
+
+    req.setTimeout(KEEP_ALIVE_TIMEOUT_MS, () => {
+      req.destroy(new Error(`Timeout after ${KEEP_ALIVE_TIMEOUT_MS}ms`));
+    });
+
+    req.on('error', err => {
+      resolve({ ok: false, url: url.href, error: err.message });
+    });
+  });
+}
+
+function startKeepAlivePings() {
+  const urls = [...new Set(KEEP_ALIVE_URLS.map(value => String(value || '').trim()).filter(Boolean))];
+  if (!urls.length) {
+    console.log('[KEEP ALIVE] Disabled. Add server URLs to KEEP_ALIVE_URLS to enable it.');
+    return;
+  }
+  if (keepAliveInterval) return;
+
+  const runKeepAlive = runNonOverlappingTask('KEEP ALIVE', async () => {
+    const results = await Promise.all(urls.map(url => pingKeepAliveServer(url)));
+    const failed = results.filter(result => !result.ok);
+
+    if (failed.length) {
+      failed.forEach(result => {
+        console.error(`[KEEP ALIVE] Failed ${result.url}: ${result.status || result.error || 'Unknown error'}`);
+      });
+    }
+
+    if (process.env.DEBUG_KEEP_ALIVE === '1' || failed.length) {
+      console.log(`[KEEP ALIVE] ${results.length - failed.length}/${results.length} server(s) reachable.`);
+    }
+  });
+
+  console.log(`[KEEP ALIVE] Enabled for ${urls.length} server(s), every ${Math.round(KEEP_ALIVE_INTERVAL_MS / 60000)} minute(s).`);
+  setTimeout(runKeepAlive, 5000);
+  keepAliveInterval = setInterval(runKeepAlive, KEEP_ALIVE_INTERVAL_MS);
+  if (typeof keepAliveInterval.unref === 'function') keepAliveInterval.unref();
+}
 
 app.get('/ping', (req, res) => {
   res.send('Server is Awake!');
@@ -3937,4 +4033,5 @@ io.on('connection', (socket) => {
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
   console.log(`PSN Database Server running on port ${PORT} (pg pool max ${PG_POOL_MAX}, online cache ${ONLINE_LIST_CACHE_MS}ms, chat sync ${CHAT_SYNC_INTERVAL_MS}ms, instance ${INSTANCE_ID})`);
+  startKeepAlivePings();
 });
