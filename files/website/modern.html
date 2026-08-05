@@ -1828,7 +1828,10 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 .user-avatar-ps5 { background-size: cover; background-position: center; background-color: transparent; }
 .chat-avatar { width: 32px; height: 32px; border-radius: 50%; margin-right: 8px; border: 1px solid rgba(255,255,255,0.2); object-fit: cover; }
 .new-user-label.hover-only { opacity: 0; }
+.new-user-card { transition: opacity 0.28s ease,transform 0.34s cubic-bezier(0.22,1,0.36,1),filter 0.28s ease !important; transform-origin: center center; }
 .new-user-card:hover .new-user-label { opacity: 1 !important; }
+.edit-mode .new-user-card { opacity: 0 !important; transform: scale(0.78); filter: blur(4px); pointer-events: none !important; }
+.edit-mode .new-user-card .user-avatar-ps5 { animation: none !important; }
 .manage-btn-round { width: 45px; height: 45px; border-radius: 50%; background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.15); color: white; display: flex; align-items: center; justify-content: center; cursor: pointer; transition: all 0.4s cubic-bezier(0.165,0.84,0.44,1); margin: 70px auto 0; transform-origin: center center; position: relative; }
 .manage-btn-round:hover { background: rgba(255,255,255,0.2); transform: scale(1.15) !important; border-color: #fff; box-shadow: 0 10px 25px rgba(0,0,0,0.5); }
 .manage-btn-round.active { background: var(--ps-blue); border-color: #00bcff; box-shadow: 0 0 15px rgba(0,112,204,0.5); transform: scale(1.1); }
@@ -9141,7 +9144,7 @@ P
 				</div>`;
 		});
 	
-		if ((users.length < 3 && !isEditMode && !maintenanceAdminOnly) || showAdminBootstrapCard) {
+		if ((users.length < 3 && !maintenanceAdminOnly) || showAdminBootstrapCard) {
 			const isFirstUser = users.length === 0;
 			const avatarScale = isFirstUser ? "1" : "0.7";
 			const labelMargin = isFirstUser ? "15px" : "-15px";
@@ -10301,23 +10304,157 @@ P
     let isEditMode = false;
 
 	function toggleEditMode() {
-		isEditMode = !isEditMode;
 		const screen = document.getElementById('user-select-screen');
 		const grid = document.getElementById('ps5-user-grid');
 		const btn = document.getElementById('manage-profiles-btn');
-		
-		if (screen) screen.classList.add('no-anim');
-	
-		if (grid) grid.classList.toggle('edit-mode', isEditMode);
-		if (btn) btn.classList.toggle('active', isEditMode);
-		
-		if (isEditMode) {
-			if (typeof playUiClick === 'function') playUiClick();
-		} else {
-			if (typeof playUiBack === 'function') playUiBack();
+		if (!grid) return;
+
+		const enteringEdit = !isEditMode;
+		const userCards = Array.from(grid.querySelectorAll('.user-profile-card:not(.new-user-card)'));
+		const newUserCard = grid.querySelector('.new-user-card');
+
+		if (screen && !screen.classList.contains('no-anim')) {
+			screen.classList.add('no-anim');
+			Array.from(grid.querySelectorAll('.user-profile-card')).forEach(card => {
+				card.style.setProperty('animation', 'none', 'important');
+			});
+			void grid.offsetWidth;
 		}
-	
-		loadUserGrid();
+
+		const firstRects = userCards.map(card => card.getBoundingClientRect());
+
+		if (enteringEdit) {
+			isEditMode = true;
+			if (btn) btn.classList.add('active');
+
+			let exitGhost = null;
+			if (newUserCard) {
+				const rect = newUserCard.getBoundingClientRect();
+				const computed = getComputedStyle(newUserCard);
+				exitGhost = newUserCard.cloneNode(true);
+				exitGhost.removeAttribute('onclick');
+				exitGhost.removeAttribute('onmouseenter');
+				exitGhost.setAttribute('aria-hidden', 'true');
+				exitGhost.style.setProperty('position', 'fixed', 'important');
+				exitGhost.style.setProperty('left', `${rect.left}px`, 'important');
+				exitGhost.style.setProperty('top', `${rect.top}px`, 'important');
+				exitGhost.style.setProperty('width', `${rect.width}px`, 'important');
+				exitGhost.style.setProperty('height', `${rect.height}px`, 'important');
+				exitGhost.style.setProperty('margin', '0', 'important');
+				exitGhost.style.setProperty('opacity', computed.opacity || '0.78', 'important');
+				exitGhost.style.setProperty('transform', 'scale(1)', 'important');
+				exitGhost.style.setProperty('transform-origin', 'center center', 'important');
+				exitGhost.style.setProperty('filter', 'blur(0px)', 'important');
+				exitGhost.style.setProperty('animation', 'none', 'important');
+				exitGhost.style.setProperty('transition', 'none', 'important');
+				exitGhost.style.setProperty('pointer-events', 'none', 'important');
+				exitGhost.style.setProperty('z-index', '13050', 'important');
+				document.body.appendChild(exitGhost);
+				newUserCard.style.display = 'none';
+			}
+
+			grid.classList.add('edit-mode');
+
+			const lastRects = userCards.map(card => card.getBoundingClientRect());
+			userCards.forEach((card, index) => {
+				const dx = firstRects[index].left - lastRects[index].left;
+				const dy = firstRects[index].top - lastRects[index].top;
+				card.style.setProperty('animation', 'none', 'important');
+				card.style.transition = 'none';
+				card.style.transform = `translate(${dx}px, ${dy}px)`;
+			});
+
+			void grid.offsetWidth;
+
+			requestAnimationFrame(() => {
+				requestAnimationFrame(() => {
+					userCards.forEach(card => {
+						card.style.transition = 'transform 0.38s cubic-bezier(0.22,1,0.36,1)';
+						card.style.transform = 'translate(0, 0)';
+					});
+
+					if (exitGhost) {
+						const fade = exitGhost.animate([
+							{ opacity: parseFloat(getComputedStyle(exitGhost).opacity) || 0.78, transform: 'scale(1)', filter: 'blur(0px)' },
+							{ opacity: 0, transform: 'scale(0.78)', filter: 'blur(4px)' }
+						], {
+							duration: 340,
+							easing: 'cubic-bezier(0.22,1,0.36,1)',
+							fill: 'forwards'
+						});
+						fade.onfinish = () => exitGhost.remove();
+					}
+				});
+			});
+
+			setTimeout(() => {
+				userCards.forEach(card => {
+					card.style.transition = '';
+					card.style.transform = '';
+				});
+				if (exitGhost && exitGhost.isConnected) exitGhost.remove();
+			}, 430);
+
+			if (typeof playUiClick === 'function') playUiClick();
+			return;
+		}
+
+		isEditMode = false;
+		if (btn) btn.classList.remove('active');
+
+		if (newUserCard) {
+			newUserCard.style.display = '';
+			newUserCard.style.setProperty('animation', 'none', 'important');
+			newUserCard.style.setProperty('transition', 'none', 'important');
+			newUserCard.style.setProperty('opacity', '0', 'important');
+			newUserCard.style.setProperty('transform', 'scale(0.78)', 'important');
+			newUserCard.style.setProperty('filter', 'blur(4px)', 'important');
+		}
+
+		grid.classList.remove('edit-mode');
+
+		const lastRects = userCards.map(card => card.getBoundingClientRect());
+		userCards.forEach((card, index) => {
+			const dx = firstRects[index].left - lastRects[index].left;
+			const dy = firstRects[index].top - lastRects[index].top;
+			card.style.setProperty('animation', 'none', 'important');
+			card.style.transition = 'none';
+			card.style.transform = `translate(${dx}px, ${dy}px)`;
+		});
+
+		void grid.offsetWidth;
+
+		requestAnimationFrame(() => {
+			requestAnimationFrame(() => {
+				userCards.forEach(card => {
+					card.style.transition = 'transform 0.38s cubic-bezier(0.22,1,0.36,1)';
+					card.style.transform = 'translate(0, 0)';
+				});
+
+				if (newUserCard) {
+					newUserCard.style.setProperty('transition', 'opacity 0.30s ease, transform 0.38s cubic-bezier(0.22,1,0.36,1), filter 0.30s ease', 'important');
+					newUserCard.style.setProperty('opacity', '0.78', 'important');
+					newUserCard.style.setProperty('transform', 'scale(1)', 'important');
+					newUserCard.style.setProperty('filter', 'blur(0px)', 'important');
+				}
+			});
+		});
+
+		setTimeout(() => {
+			userCards.forEach(card => {
+				card.style.transition = '';
+				card.style.transform = '';
+			});
+
+			if (newUserCard && !isEditMode) {
+				newUserCard.style.removeProperty('transition');
+				newUserCard.style.removeProperty('transform');
+				newUserCard.style.removeProperty('filter');
+				newUserCard.style.setProperty('opacity', '0.78');
+			}
+		}, 430);
+
+		if (typeof playUiBack === 'function') playUiBack();
 	}
 
 
