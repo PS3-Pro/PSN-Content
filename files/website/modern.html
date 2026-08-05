@@ -4925,7 +4925,7 @@ a:focus, button:focus, select:focus, input:focus, textarea:focus, [contenteditab
 				</div>
 			
 				<div class="explore-section" style="margin-top: 20px;">
-					<div class="section-header"><h2>MOST WANTED (WISHLIST)</h2></div>
+					<div class="section-header"><h2>MOST WANTED GAMES (WISHLIST)</h2></div>
 					<div class="carousel-wrapper">
 						<button class="scroll-arrow left-arrow" onmouseenter="playUiArrow()" onclick="scrollCarousel('trending-wish-grid', -1)"><i class="fas fa-chevron-left"></i></button>
 						<div class="horizontal-scroll" id="trending-wish-grid">
@@ -5801,7 +5801,7 @@ a:focus, button:focus, select:focus, input:focus, textarea:focus, [contenteditab
 				</div>
 				<div id="subview-online-revived" style="display: none; padding: 20px var(--page-gutter) 40px;">
 					<h2 style="font-size: 28px; font-weight: 300; margin-top: 0; margin-bottom: 30px; border-bottom: 1px solid rgba(255,255,255,0.1); padding-bottom: 15px; display: flex; justify-content: space-between; align-items: baseline;">
-						<div>Revived Servers <span id="revived-server-count" style="color: var(--ps-blue); font-size: 14px; margin-left: 10px;">(0 items)</span></div>
+						<div><span id="revived-server-title-label">Revived Servers</span> <span id="revived-server-count" style="color: var(--ps-blue); font-size: 14px; margin-left: 10px;">(0 items)</span></div>
 						<i class="fas fa-server" style="opacity: 0.2;"></i>
 					</h2>
 					<div id="dynamic-servers-container"></div>
@@ -7585,7 +7585,7 @@ P
 	<div id="modal-sys-online" class="sys-modal-overlay">
 		<div class="sys-modal-content">
 			<div class="sys-modal-header">
-				<h2><i class="fas fa-users"></i> Online Players</h2>
+				<h2><i class="fas fa-users"></i> <span id="online-players-title-label">Online Players</span></h2>
 				<button class="sys-modal-close" onmouseenter="playUiHover()" onclick="closeSysModal(null, 'modal-sys-online')"><i class="fas fa-times"></i></button>
 			</div>
 			<div class="sys-modal-body">
@@ -11253,6 +11253,52 @@ P
 		return String(value || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'");
 	}
 
+	const COUNT_AWARE_SECTION_TITLES = Object.freeze({
+		'latest-games-grid': ['RECENTLY ADDED GAME', 'RECENTLY ADDED GAMES'],
+		'latest-dlcs-grid': ['RECENTLY ADDED DLC', 'RECENTLY ADDED DLCS'],
+		'latest-avatars-grid': ['RECENTLY ADDED AVATAR', 'RECENTLY ADDED AVATARS'],
+		'latest-demos-grid': ['RECENTLY ADDED DEMO', 'RECENTLY ADDED DEMOS'],
+		'trending-dl-grid': ['MOST DOWNLOADED GAME', 'MOST DOWNLOADED GAMES'],
+		'trending-wish-grid': ['MOST WANTED GAME (WISHLIST)', 'MOST WANTED GAMES (WISHLIST)'],
+		'home-servers-grid': ['AVAILABLE SERVER', 'AVAILABLE SERVERS']
+	});
+
+	window.formatUiCount = function(count, singular = 'item', plural = 'items') {
+		const n = Number(count || 0);
+		return `${n} ${n === 1 ? singular : plural}`;
+	};
+
+	window.updateCountAwareSectionTitle = function(containerId, explicitCount = null) {
+		const config = COUNT_AWARE_SECTION_TITLES[containerId];
+		const container = document.getElementById(containerId);
+		if (!config || !container) return;
+
+		let count = explicitCount;
+		if (count === null || count === undefined) {
+			const stored = container.dataset.countAwareTotal;
+			if (stored !== undefined && stored !== '') count = Number(stored);
+		}
+		if (!Number.isFinite(Number(count))) {
+			if (containerId === 'home-servers-grid') count = container.querySelectorAll('.promo-card-dark').length;
+			else count = container.querySelectorAll('.game-card').length;
+		}
+
+		count = Number(count || 0);
+		container.dataset.countAwareTotal = String(count);
+		const title = container.closest('.explore-section')?.querySelector('.section-header h2');
+		if (title) title.textContent = count === 1 ? config[0] : config[1];
+	};
+
+	window.refreshStaticCountAwareSections = function() {
+		window.updateCountAwareSectionTitle('home-servers-grid', document.querySelectorAll('#home-servers-grid .promo-card-dark').length);
+	};
+
+	if (document.readyState === 'loading') {
+		document.addEventListener('DOMContentLoaded', window.refreshStaticCountAwareSections, { once: true });
+	} else {
+		window.refreshStaticCountAwareSections();
+	}
+
 	function buildExploreCardHTML(game, cat, idx, animateCards) {
 		const coverKey = typeof window.getStoreCardCoverKey === 'function'
 			? window.getStoreCardCoverKey(cat, game.id || game.titleId, game.contentId)
@@ -11590,6 +11636,8 @@ P
 		if (!container) return;
 		container.__exploreVirtualData = { cat, items: items || [], animateCards: !!animateCards, initialRevealDone: false, cardCache: new Map() };
 		container.dataset.exploreCat = cat;
+		container.dataset.countAwareTotal = String((items || []).length);
+		if (typeof window.updateCountAwareSectionTitle === 'function') window.updateCountAwareSectionTitle(container.id, (items || []).length);
 		container.dataset.exploreVirtual = '1';
 		delete container.dataset.exploreVirtualStart;
 		delete container.dataset.exploreVirtualEnd;
@@ -14305,12 +14353,15 @@ P
 		const cacheKey = JSON.stringify(topList);
 		
 		if (window.trendingCache[containerId] === cacheKey && container.querySelector('.game-card')) {
+			if (typeof window.updateCountAwareSectionTitle === 'function') window.updateCountAwareSectionTitle(containerId, container.querySelectorAll('.game-card').length);
 			return;
 		}
 		window.trendingCache[containerId] = cacheKey;
 	
 		if (!topList || topList.length === 0) {
 			container.innerHTML = skeletonHTML;
+			container.dataset.countAwareTotal = '0';
+			if (typeof window.updateCountAwareSectionTitle === 'function') window.updateCountAwareSectionTitle(containerId, 0);
 			return;
 		}
 	
@@ -14413,6 +14464,9 @@ P
 			}
 		}
 	
+		container.dataset.countAwareTotal = String(displayRank);
+		if (typeof window.updateCountAwareSectionTitle === 'function') window.updateCountAwareSectionTitle(containerId, displayRank);
+
 		if (html === '') {
 			container.innerHTML = skeletonHTML;
 			if (typeof setupSkeletonAnimations === 'function') setupSkeletonAnimations(containerId);
@@ -15240,6 +15294,12 @@ P
 		};
 
 		const relatedGameTitle = resolveRelatedGameTitle();
+		const isExploreDlcContext = !!(
+			String(category || '') === 'dlcs' &&
+			originCard &&
+			typeof originCard.closest === 'function' &&
+			originCard.closest('#latest-dlcs-grid')
+		);
 
 		const cleanFocusContentId = (focusContentId && focusContentId !== 'undefined' && focusContentId !== 'null') ? String(focusContentId).trim() : '';
 		if (originCard && typeof window.captureStoreNavigationCover === 'function') {
@@ -15298,7 +15358,8 @@ P
 			lockSearch: true,
 			contextualType: 'related',
 			contextualCategory: String(category || ''),
-			contextualGameTitle: relatedGameTitle,
+			contextualCategoryOnly: isExploreDlcContext,
+			contextualGameTitle: isExploreDlcContext ? '' : relatedGameTitle,
 			scroll: safeScroll,
 			limit: safeLimit,
 			fromExplore: finalFromWhere,
@@ -17349,8 +17410,9 @@ P
 		const compact = !!(window.matchMedia && window.matchMedia('(max-width: 480px)').matches);
 		const visible = Number(visibleCount || 0);
 		const hidden = Number(hiddenMissingRapCount || 0);
-		if (!hidden) return `(${visible} items)`;
-		return compact ? `(${visible} items • ${hidden} hidden)` : `(${visible} items • ${hidden} missing license${hidden === 1 ? '' : 's'} hidden)`;
+		const visibleLabel = `${visible} ${visible === 1 ? 'item' : 'items'}`;
+		if (!hidden) return `(${visibleLabel})`;
+		return compact ? `(${visibleLabel} • ${hidden} hidden)` : `(${visibleLabel} • ${hidden} missing license${hidden === 1 ? '' : 's'} hidden)`;
 	}
 
 	function getBrowseGroupedTitleChildCount(renderItems) {
@@ -17387,13 +17449,29 @@ P
 			updates: ['Update', 'Updates']
 		};
 
+		const isCategoryOnlyContext = !!(
+			navHistory &&
+			navHistory.lockSearch &&
+			navHistory.contextualType === 'related' &&
+			String(navHistory.contextualCategory || '') === category &&
+			navHistory.contextualCategoryOnly === true &&
+			relatedLabels[category]
+		);
+
+		const count = Number(itemCount || 0);
+		const labels = relatedLabels[category];
+		if (isCategoryOnlyContext && labels) {
+			titleEl.innerText = count === 1 ? labels[0] : labels[1];
+			return;
+		}
+
 		const isRelatedContext = !!(
 			navHistory &&
 			navHistory.lockSearch &&
 			navHistory.contextualType === 'related' &&
 			String(navHistory.contextualCategory || '') === category &&
 			String(navHistory.contextualGameTitle || '').trim() &&
-			relatedLabels[category]
+			labels
 		);
 
 		if (!isRelatedContext) {
@@ -17401,8 +17479,6 @@ P
 			return;
 		}
 
-		const count = Number(itemCount || 0);
-		const labels = relatedLabels[category];
 		const categoryLabel = count === 1 ? labels[0] : labels[1];
 		const gameTitle = String(navHistory.contextualGameTitle).trim();
 		const possessiveSuffix = /s$/i.test(gameTitle) ? '’' : '’s';
@@ -20920,7 +20996,7 @@ P
 		
 		if(statCount) statCount.innerText = window.downloadHistory.length;
 		if(statSize) statSize.innerText = formatSizeFromBytes(totalBytes);
-		if(globalCount) globalCount.innerText = `(${window.downloadHistory.length} items)`;
+		if(globalCount) globalCount.innerText = `(${window.formatUiCount ? window.formatUiCount(window.downloadHistory.length, 'item', 'items') : `${window.downloadHistory.length} ${window.downloadHistory.length === 1 ? 'item' : 'items'}`})`;
 		
 		listContainer.innerHTML = window.downloadHistory.map((dl, index) => {
 			dl = (typeof window.sanitizeDownloadCoverRecord === 'function') ? window.sanitizeDownloadCoverRecord(dl, 'downloads') : dl;
@@ -25723,7 +25799,7 @@ P
 			filteredWishlist.reverse();
 		}
 		
-		if (countSpan) countSpan.innerText = `(${filteredWishlist.length} items)`;
+		if (countSpan) countSpan.innerText = `(${window.formatUiCount ? window.formatUiCount(filteredWishlist.length, 'item', 'items') : `${filteredWishlist.length} ${filteredWishlist.length === 1 ? 'item' : 'items'}`})`;
 	
 		if (typeof window.refreshCategoryDot === 'function') {
 			window.refreshCategoryDot('wishlist');
@@ -26413,17 +26489,20 @@ P
 		badges.forEach(badge => {
 			const countEl = getRevivedPlayerCountElement(badge, key);
 			if (!countEl) return;
+			const featuredLabelEl = badge.querySelector('.featured-revived-player-label');
 
 			badge.classList.remove('is-loading', 'has-value', 'is-error', 'is-offline', 'is-zero');
 
 			if (n !== null) {
 				if (countEl.textContent !== String(n)) countEl.textContent = String(n);
+				if (featuredLabelEl) featuredLabelEl.textContent = n === 1 ? 'PLAYER' : 'PLAYERS';
 				if (n === 0) badge.classList.add('is-zero');
 				return;
 			}
 
 			if (Number.isFinite(oldValue)) {
 				if (countEl.textContent !== String(oldValue)) countEl.textContent = String(oldValue);
+				if (featuredLabelEl) featuredLabelEl.textContent = oldValue === 1 ? 'PLAYER' : 'PLAYERS';
 				badge.classList.add('has-value');
 				if (oldValue === 0) badge.classList.add('is-zero');
 				return;
@@ -26623,6 +26702,7 @@ P
 		const container = document.getElementById('dynamic-servers-container');
 		if (!container) return;
 		const revivedServerCountEl = document.getElementById('revived-server-count');
+		const revivedServerTitleEl = document.getElementById('revived-server-title-label');
 		if (revivedServerCountEl) revivedServerCountEl.textContent = '(Loading...)';
 	
 		const TSV_URL = "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/main/resources/database/content/online_servers.tsv";
@@ -26756,12 +26836,14 @@ P
 	
 				renderPromises.push(renderServerGamesCards(gridId, ids));
 			}
-			if (revivedServerCountEl) revivedServerCountEl.textContent = `(${revivedServerCount} items)`;
+			if (revivedServerTitleEl) revivedServerTitleEl.textContent = revivedServerCount === 1 ? 'Revived Server' : 'Revived Servers';
+			if (revivedServerCountEl) revivedServerCountEl.textContent = `(${window.formatUiCount ? window.formatUiCount(revivedServerCount, 'item', 'items') : `${revivedServerCount} ${revivedServerCount === 1 ? 'item' : 'items'}`})`;
 	
 			await Promise.all(renderPromises);
 	
 			window.isRevivedLoaded = true;
 		} catch (error) {
+			if (revivedServerTitleEl) revivedServerTitleEl.textContent = 'Revived Servers';
 			if (revivedServerCountEl) revivedServerCountEl.textContent = '(0 items)';
 			container.innerHTML = '<div class="loader" style="color:red;">Failed to load server data.</div>';
 		}
@@ -28498,7 +28580,7 @@ P
 	
 			if (actions) actions.style.display = 'flex';
 			if (typeof updateFpsCounterStatus === 'function') updateFpsCounterStatus();
-			if (status) { status.innerText = `(${discoveredGames.length} items)`; status.style.color = "#4caf50"; }
+			if (status) { status.innerText = `(${window.formatUiCount ? window.formatUiCount(discoveredGames.length, 'item', 'items') : `${discoveredGames.length} ${discoveredGames.length === 1 ? 'item' : 'items'}`})`; status.style.color = "#4caf50"; }
 			
 			if (globalIcon) {
 				globalIcon.style.color = "#4caf50";
@@ -29040,7 +29122,7 @@ P
 		
 		const status = document.getElementById('library-status');
 		if (status && lastScannedGames.length > 0) {
-			status.innerText = `(${filtered.length} items)`;
+			status.innerText = `(${window.formatUiCount ? window.formatUiCount(filtered.length, 'item', 'items') : `${filtered.length} ${filtered.length === 1 ? 'item' : 'items'}`})`;
 		}
 	
 		renderLocalLibrary(filtered, true);
@@ -29181,7 +29263,7 @@ P
 			window.animateCategoryRemoveCard(card, () => {
 				if (card && card.parentNode) card.remove();
 				const countSpan = document.getElementById('fav-count');
-				if (countSpan) countSpan.innerText = `(${remaining.length} items)`;
+				if (countSpan) countSpan.innerText = `(${window.formatUiCount ? window.formatUiCount(remaining.length, 'item', 'items') : `${remaining.length} ${remaining.length === 1 ? 'item' : 'items'}`})`;
 			});
 		}
 	};
@@ -29303,7 +29385,7 @@ P
 		}
 		
 		if (countSpan) {
-			countSpan.innerText = `(${filteredFavs.length} items)`;
+			countSpan.innerText = `(${window.formatUiCount ? window.formatUiCount(filteredFavs.length, 'item', 'items') : `${filteredFavs.length} ${filteredFavs.length === 1 ? 'item' : 'items'}`})`;
 			countSpan.style.color = "#4caf50";
 		}
 	
@@ -45179,6 +45261,8 @@ function getVisibleChatStackEl(id) {
 	
 		const activeUsers = currentOnlineList.filter(u => u.online === true);
 		if (countElement) countElement.innerText = `${activeUsers.length} Online`;
+		const onlinePlayersTitle = document.getElementById('online-players-title-label');
+		if (onlinePlayersTitle) onlinePlayersTitle.textContent = activeUsers.length === 1 ? 'Online Player' : 'Online Players';
 	
 		renderOnlineList();
 	
@@ -45199,6 +45283,8 @@ function getVisibleChatStackEl(id) {
 		const myName = localStorage.getItem('psn_username');
 	
 		const activeUsers = currentOnlineList.filter(u => u.online === true);
+		const onlinePlayersTitle = document.getElementById('online-players-title-label');
+		if (onlinePlayersTitle) onlinePlayersTitle.textContent = activeUsers.length === 1 ? 'Online Player' : 'Online Players';
 	
 		if (activeUsers.length === 0) {
 			container.innerHTML = '<div style="text-align:center; padding:20px; color:var(--text-muted);">No users online.</div>';
@@ -46111,7 +46197,9 @@ function getVisibleChatStackEl(id) {
 	
 		if (titleHeader) {
 			const totalFriends = window.friendsList ? window.friendsList.length : 0;
-			titleHeader.innerHTML = `Friends <span class="friends-title-count" style="color: var(--ps-blue); font-size: 14px; margin-left: 10px; font-weight: normal; opacity: 0.8;">(${totalFriends} players)</span>`;
+			const friendsLabel = totalFriends === 1 ? 'Friend' : 'Friends';
+			const playersLabel = totalFriends === 1 ? 'player' : 'players';
+			titleHeader.innerHTML = `${friendsLabel} <span class="friends-title-count" style="color: var(--ps-blue); font-size: 14px; margin-left: 10px; font-weight: normal; opacity: 0.8;">(${totalFriends} ${playersLabel})</span>`;
 		}
 	
 		const sortMode = document.getElementById('friends-sort-select')?.value || 'status';
