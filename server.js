@@ -27,7 +27,6 @@ const POST_AUTH_ONLINE_LIST_DELAY_MS = Math.max(0, parseInt(process.env.POST_AUT
 const POST_AUTH_PROFILE_SYNC_DELAY_MS = Math.max(0, parseInt(process.env.POST_AUTH_PROFILE_SYNC_DELAY_MS || "1800", 10) || 1800);
 const USER_CACHE_REFRESH_INTERVAL_MS = 30000;
 const USER_CACHE_WARMUP_INTERVAL_MS = 120000;
-const USER_CACHE_MAX_AGE_MS = Math.max(1000, parseInt(process.env.USER_CACHE_MAX_AGE_MS || "5000", 10) || 5000);
 const DEFAULT_MAINTENANCE_MESSAGE = "The service is under maintenance. Please try again soon.";
 const VALID_USER_ROLES = new Set(["user", "trusted", "mod", "admin"]);
 const VALID_PROFILE_COUNTRY_CODES = new Set(['AD','AE','AF','AG','AI','AL','AM','AO','AQ','AR','AS','AT','AU','AW','AX','AZ','BA','BB','BD','BE','BF','BG','BH','BI','BJ','BL','BM','BN','BO','BQ','BR','BS','BT','BV','BW','BY','BZ','CA','CC','CD','CF','CG','CH','CI','CK','CL','CM','CN','CO','CR','CU','CV','CW','CX','CY','CZ','DE','DJ','DK','DM','DO','DZ','EC','EE','EG','EH','ER','ES','ET','FI','FJ','FK','FM','FO','FR','GA','GB','GD','GE','GF','GG','GH','GI','GL','GM','GN','GP','GQ','GR','GS','GT','GU','GW','GY','HK','HM','HN','HR','HT','HU','ID','IE','IL','IM','IN','IO','IQ','IR','IS','IT','JE','JM','JO','JP','KE','KG','KH','KI','KM','KN','KP','KR','KW','KY','KZ','LA','LB','LC','LI','LK','LR','LS','LT','LU','LV','LY','MA','MC','MD','ME','MF','MG','MH','MK','ML','MM','MN','MO','MP','MQ','MR','MS','MT','MU','MV','MW','MX','MY','MZ','NA','NC','NE','NF','NG','NI','NL','NO','NP','NR','NU','NZ','OM','PA','PE','PF','PG','PH','PK','PL','PM','PN','PR','PS','PT','PW','PY','QA','RE','RO','RS','RU','RW','SA','SB','SC','SD','SE','SG','SH','SI','SJ','SK','SL','SM','SN','SO','SR','SS','ST','SV','SX','SY','SZ','TC','TD','TF','TG','TH','TJ','TK','TL','TM','TN','TO','TR','TT','TV','TW','TZ','UA','UG','UM','US','UY','UZ','VA','VC','VE','VG','VI','VN','VU','WF','WS','YE','YT','ZA','ZM','ZW']);
@@ -192,6 +191,7 @@ let userDatabase = {};
 let userCacheMeta = {};
 let userCacheLastFullRefresh = 0;
 let userCacheRefreshInFlight = null;
+const userProfileWriteInFlight = new Set();
 let messageHistory = [];
 let lastChatDbId = 0;
 let pinnedMessages = [];
@@ -1488,6 +1488,12 @@ async function refreshAllUsersCacheFromDb(options = {}) {
       const dbUser = normalizeUserRecord(username, row.data || {});
       const localUser = userDatabase[username] || {};
 
+      if (userProfileWriteInFlight.has(username) && userDatabase[username]) {
+        nextDatabase[username] = normalizeUserRecord(username, localUser);
+        nextMeta[username] = userCacheMeta[username] || now;
+        return;
+      }
+
       nextDatabase[username] = {
         ...dbUser,
         online: preserveOnline ? localUser.online === true : false,
@@ -1516,6 +1522,7 @@ async function refreshAllUsersCacheFromDb(options = {}) {
 async function refreshSingleUserCacheFromDb(name, options = {}) {
   const safeName = normalizeText(name, "");
   if (!safeName) return null;
+  if (userProfileWriteInFlight.has(safeName) && options.forceDuringWrite !== true) return userDatabase[safeName] || null;
 
   const userRes = await pool.query('SELECT data FROM users WHERE name = $1', [safeName]);
   if (!userRes.rows.length) {
@@ -1547,15 +1554,11 @@ async function ensureUserCacheReady() {
   return userDatabase;
 }
 
-async function getUserCached(name, options = {}) {
+async function getUserCached(name) {
   const safeName = normalizeText(name, "");
   if (!safeName) return null;
 
-  const requestedMaxAge = Number(options.maxAgeMs);
-  const maxAgeMs = Number.isFinite(requestedMaxAge) ? Math.max(0, requestedMaxAge) : USER_CACHE_MAX_AGE_MS;
-  const cachedAt = Number(userCacheMeta[safeName] || 0);
-
-  if (userDatabase[safeName] && cachedAt && Date.now() - cachedAt <= maxAgeMs) {
+  if (userDatabase[safeName]) {
     return userDatabase[safeName];
   }
 
@@ -1564,7 +1567,7 @@ async function getUserCached(name, options = {}) {
 
 function startUserCacheWarmup() {
   if (process.env.ENABLE_USER_CACHE_WARMUP !== "1") {
-    console.log('[USER CACHE] background full refresh disabled; PostgreSQL remains authoritative through startup load, targeted refresh and LISTEN/NOTIFY.');
+    console.log('[USER CACHE] background full refresh disabled; using startup RAM cache + targeted refresh only.');
     return;
   }
 
@@ -2092,23 +2095,20 @@ async function syncActiveProfilesAcrossInstances() {
     const name = row.name;
     const dbUser = normalizeUserRecord(name, row.data || {});
     const localUser = userDatabase[name] || {};
-    const dbVersion = normalizeTimestampValue(dbUser.profileUpdatedAt);
-    const localVersion = normalizeTimestampValue(localUser.profileUpdatedAt);
-    const changed = dbVersion !== localVersion;
+    const dbVersion = Number(dbUser.profileUpdatedAt || 0);
+    const localVersion = Number(localUser.profileUpdatedAt || 0);
+
+    if (!dbVersion || dbVersion <= localVersion) return;
 
     userDatabase[name] = {
       ...dbUser,
       online: localUser.online === true,
-      id: localUser.id || dbUser.id || null,
+      id: localUser.id || dbUser.id,
       lastSeen: localUser.lastSeen || dbUser.lastSeen || Date.now()
     };
-    userCacheMeta[name] = Date.now();
-    invalidateOnlineListCache("active-profile-db-refresh");
 
-    if (changed) {
-      emitProfileSync(name, null);
-      emitPublicProfileBannerUpdate(name, userDatabase[name]);
-    }
+    emitProfileSync(name, null);
+    emitPublicProfileBannerUpdate(name, userDatabase[name]);
   });
 }
 
@@ -2741,15 +2741,7 @@ io.on('connection', (socket) => {
 
   socket.on('settings_realtime_update', async (payload = {}) => {
     const name = socket.userName;
-    if (!name) return;
-
-    try {
-      await getUserCached(name, { maxAgeMs: USER_CACHE_MAX_AGE_MS });
-    } catch (err) {
-      console.error(`[SETTINGS BASE REFRESH ERROR] ${name}:`, err);
-      return;
-    }
-    if (!userDatabase[name]) return;
+    if (!name || !userDatabase[name]) return;
 
     const incomingSettingsData = (payload && payload.settingsData && typeof payload.settingsData === "object")
       ? { ...payload.settingsData }
@@ -2784,14 +2776,16 @@ io.on('connection', (socket) => {
     const themeMerge = reconcileIncomingThemeColor(userDatabase[name], incomingThemePayload, incomingSettingsData);
     userDatabase[name].lastSeen = Date.now();
     userDatabase[name].profileUpdatedAt = Date.now();
-    await upsertPresenceForSocket(socket, name);
-
+    userProfileWriteInFlight.add(name);
     try {
+      await upsertPresenceForSocket(socket, name);
       userCacheMeta[name] = Date.now();
       await pool.query('UPDATE users SET data = $1 WHERE name = $2', [userDatabase[name], name]);
       invalidateOnlineListCache('settings-realtime-save');
     } catch (err) {
       console.error(`[DATABASE ERROR] Failed to save realtime settings for ${name}:`, err);
+    } finally {
+      userProfileWriteInFlight.delete(name);
     }
 
     const sourceSocketId = (mergedSettings.settingsRejected === true || mergedSettings.bannerRejected === true || themeMerge.rejected === true) ? null : socket.id;
@@ -2806,19 +2800,9 @@ io.on('connection', (socket) => {
 
   socket.on('update_profile', async (userData) => {
     const name = socket.userName;
-    if (!name) return;
-
-    try {
-      await getUserCached(name, { maxAgeMs: USER_CACHE_MAX_AGE_MS });
-    } catch (err) {
-      console.error(`[PROFILE BASE REFRESH ERROR] ${name}:`, err);
-      return;
-    }
-    if (!userDatabase[name]) return;
-
     userData = (userData && typeof userData === "object") ? userData : {};
     const incomingSettingsData = (userData.settingsData && typeof userData.settingsData === "object") ? userData.settingsData : null;
-    const previousCountryCode = getUserCountryCode(userDatabase[name]);
+    const previousCountryCode = name && userDatabase[name] ? getUserCountryCode(userDatabase[name]) : "";
     normalizeIncomingProfileCountry(userData, incomingSettingsData);
     let shouldBroadcastProfileBanner = false;
     let shouldForceProfileSyncToSource = false;
@@ -2894,14 +2878,16 @@ io.on('connection', (socket) => {
         normalizeProfileArrayPayloads(userDatabase[name]);
         userDatabase[name].lastSeen = Date.now();
         userDatabase[name].profileUpdatedAt = Date.now();
-        await upsertPresenceForSocket(socket, name);
-        
+        userProfileWriteInFlight.add(name);
         try {
+            await upsertPresenceForSocket(socket, name);
             userCacheMeta[name] = Date.now();
             await pool.query('UPDATE users SET data = $1 WHERE name = $2', [userDatabase[name], name]);
             invalidateOnlineListCache('profile-update-save');
         } catch (err) {
             console.error(`[DATABASE ERROR] Failed to save profile for ${name}:`, err);
+        } finally {
+            userProfileWriteInFlight.delete(name);
         }
 
         if (shouldEmitTrendingUpdate) {
@@ -2927,34 +2913,27 @@ io.on('connection', (socket) => {
 
   socket.on('request_user_data', async (data = {}) => {
     const { targetName, type, requestId } = data;
-    const safeTargetName = normalizeText(targetName, "");
     try {
-      const cachedAt = Number(userCacheMeta[safeTargetName] || 0);
-      const cacheIsFresh = !!(
-        safeTargetName &&
-        userDatabase[safeTargetName] &&
-        cachedAt &&
-        Date.now() - cachedAt <= USER_CACHE_MAX_AGE_MS
-      );
+      let rawData = getUserDataPayloadFromCache(targetName, type);
 
-      if (!cacheIsFresh) {
-        await withTimeout(
-          refreshSingleUserCacheFromDb(safeTargetName),
+      if (rawData === null) {
+        const refreshedUser = await withTimeout(
+          refreshSingleUserCacheFromDb(targetName),
           4500,
           null
         );
+        rawData = refreshedUser ? getUserDataPayloadFromCache(targetName, type) : getEmptyUserDataPayload(type);
       }
 
-      const rawData = getUserDataPayloadFromCache(safeTargetName, type) ?? getEmptyUserDataPayload(type);
-      socket.emit('user_data_response', { targetName: safeTargetName, type, requestId, rawData });
+      socket.emit('user_data_response', { targetName, type, requestId, rawData });
     } catch (err) {
-      console.error('[REQUEST USER DATA DB REFRESH ERROR]:', err);
+      console.error('[REQUEST USER DATA CACHE ERROR]:', err);
       socket.emit('user_data_response', {
-        targetName: safeTargetName || targetName,
+        targetName,
         type,
         requestId,
         rawData: getEmptyUserDataPayload(type),
-        error: 'Unable to load this list from the server.'
+        error: 'Unable to load this list from the server cache.'
       });
     }
   });
@@ -2965,12 +2944,9 @@ io.on('connection', (socket) => {
 
     try {
       const sendProfileSync = async () => {
-        const cachedAt = Number(userCacheMeta[name] || 0);
-        const cacheIsFresh = !!(cachedAt && Date.now() - cachedAt <= USER_CACHE_MAX_AGE_MS);
-        if ((data && data.forceRefresh === true) || !cacheIsFresh) {
+        if (data && data.forceRefresh === true) {
           await refreshSingleUserCacheFromDb(name);
         }
-        if (!userDatabase[name]) return;
         socket.emit('profile_sync', buildFullProfileSyncPayload(name, userDatabase[name], null));
       };
 
