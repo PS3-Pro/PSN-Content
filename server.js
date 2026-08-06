@@ -265,6 +265,8 @@ app.get('/debug-db', async (req, res) => {
       FROM chat
     `);
 
+    const memory = process.memoryUsage();
+    const toMb = value => Math.round((Number(value) || 0) / 1024 / 1024 * 10) / 10;
     res.json({
       instance: INSTANCE_ID,
       startedAt: new Date(SERVER_STARTED_AT).toISOString(),
@@ -272,6 +274,13 @@ app.get('/debug-db', async (req, res) => {
       chat: chat.rows[0],
       memoryMessages: messageHistory.length,
       cachedUsers: Object.keys(userDatabase).length,
+      fullProfilesInRam: fullUserCacheNames.size,
+      memory: {
+        rssMb: toMb(memory.rss),
+        heapUsedMb: toMb(memory.heapUsed),
+        heapTotalMb: toMb(memory.heapTotal),
+        externalMb: toMb(memory.external)
+      },
       userCacheLastFullRefresh: userCacheLastFullRefresh ? new Date(userCacheLastFullRefresh).toISOString() : null,
       lastChatDbId
     });
@@ -288,6 +297,18 @@ let userCacheMeta = {};
 let userCacheLastFullRefresh = 0;
 let userCacheRefreshInFlight = null;
 const userProfileWriteInFlight = new Set();
+const fullUserCacheNames = new Set();
+const USER_HEAVY_CACHE_KEYS = ['downloadsData', 'libraryData', 'wishlistData', 'favoritesData', 'trophiesData', 'friendsData'];
+let trendingCache = null;
+let trendingCacheAt = 0;
+let trendingBuildInFlight = null;
+let globalTrophyStatsCache = null;
+let globalTrophyStatsCacheAt = 0;
+let globalTrophyStatsBuildInFlight = null;
+let trendingRefreshTimer = null;
+let trophyStatsRefreshTimer = null;
+const TRENDING_CACHE_MS = Math.max(10000, parseInt(process.env.TRENDING_CACHE_MS || '60000', 10) || 60000);
+const TROPHY_STATS_CACHE_MS = Math.max(10000, parseInt(process.env.TROPHY_STATS_CACHE_MS || '30000', 10) || 30000);
 let messageHistory = [];
 let lastChatDbId = 0;
 let pinnedMessages = [];
@@ -443,17 +464,8 @@ async function initDb() {
   console.log(`[DB] Database initialized. ${messageHistory.length} messages, ${pinnedMessages.length} pins, ${Object.keys(userDatabase).length} users loaded.`);
 }
 
-initDb()
-  .then(async () => {
-    await initProfileSyncNotifications();
-    startUserCacheWarmup();
-  })
-  .catch(console.error);
-
-
-
 function getSanitizedOnlineList() {
-  return Object.entries(userDatabase).map(([username, u]) => ({
+  return Object.entries(userDatabase).filter(([, u]) => u && u.online === true).map(([username, u]) => ({
     id: u.id,
     name: username,
     avatar: u.avatar || DEFAULT_AVATAR,
@@ -477,6 +489,9 @@ function getSanitizedOnlineList() {
 
 async function getSanitizedOnlineListFromDb(options = {}) {
   if (!Object.keys(userDatabase).length) await ensureUserCacheReady();
+  if (options.force !== true && Array.isArray(onlineListCache) && Date.now() - onlineListCacheAt < ONLINE_LIST_CACHE_MS) {
+    return onlineListCache;
+  }
   const list = getSanitizedOnlineList();
   onlineListCache = list;
   onlineListCacheAt = Date.now();
@@ -1569,42 +1584,188 @@ function getPublicUserData(username, user = {}, includeAdminFields = false) {
 }
 
 
+function buildCompactUserSummary(name, userData = {}) {
+  const source = (userData && typeof userData === 'object' && !Array.isArray(userData)) ? userData : {};
+  const compact = { ...source };
+
+  if (Array.isArray(source.downloadsData)) compact.downloads = source.downloadsData.length;
+  if (Array.isArray(source.wishlistData)) compact.wishlist = source.wishlistData.length;
+  if (Array.isArray(source.favoritesData)) compact.favorites = source.favoritesData.length;
+  if (Array.isArray(source.libraryData)) compact.library = source.libraryData.length;
+  if (Array.isArray(source.friendsData)) compact.friends = source.friendsData.length;
+  if (source.trophiesData && typeof source.trophiesData === 'object' && !Array.isArray(source.trophiesData)) {
+    compact.trophies = countUnlockedTrophiesPayload(source.trophiesData);
+  }
+
+  USER_HEAVY_CACHE_KEYS.forEach(key => delete compact[key]);
+  delete compact.passwordHash;
+  delete compact.password;
+
+  return normalizeUserRecord(name, compact);
+}
+
+function compactCachedUser(name) {
+  if (!name || !userDatabase[name]) return null;
+  const current = userDatabase[name];
+  const online = current.online === true;
+  const id = current.id || null;
+  const lastSeen = current.lastSeen || null;
+  userDatabase[name] = {
+    ...buildCompactUserSummary(name, current),
+    online,
+    id,
+    lastSeen
+  };
+  fullUserCacheNames.delete(name);
+  userCacheMeta[name] = Date.now();
+  invalidateOnlineListCache('user-cache-compact');
+  return userDatabase[name];
+}
+
+function invalidateTrendingCache() {
+  trendingCache = null;
+  trendingCacheAt = 0;
+}
+
+function invalidateGlobalTrophyStatsCache() {
+  globalTrophyStatsCache = null;
+  globalTrophyStatsCacheAt = 0;
+}
+
+function scheduleTrendingRefreshBroadcast(delayMs = 1500) {
+  if (trendingRefreshTimer) return;
+  trendingRefreshTimer = setTimeout(async () => {
+    trendingRefreshTimer = null;
+    try {
+      if (trendingBuildInFlight) await trendingBuildInFlight.catch(() => null);
+      invalidateTrendingCache();
+      await emitTrendingFromDb(null, { force: true });
+    } catch (err) {
+      console.error('[TRENDING SCHEDULED REFRESH ERROR]:', err);
+    }
+  }, Math.max(0, delayMs));
+}
+
+function scheduleTrophyStatsRefreshBroadcast(delayMs = 1500) {
+  if (trophyStatsRefreshTimer) return;
+  trophyStatsRefreshTimer = setTimeout(async () => {
+    trophyStatsRefreshTimer = null;
+    try {
+      if (globalTrophyStatsBuildInFlight) await globalTrophyStatsBuildInFlight.catch(() => null);
+      invalidateGlobalTrophyStatsCache();
+      const stats = await getGlobalTrophyStats({ force: true });
+      io.emit('global_trophy_stats', stats);
+    } catch (err) {
+      console.error('[TROPHY STATS SCHEDULED REFRESH ERROR]:', err);
+    }
+  }, Math.max(0, delayMs));
+}
+
+async function refreshSingleUserSummaryFromDb(name, options = {}) {
+  const safeName = normalizeText(name, '');
+  if (!safeName) return null;
+
+  const userRes = await pool.query(`
+    SELECT
+      name,
+      data - ARRAY['downloadsData','libraryData','wishlistData','favoritesData','trophiesData','friendsData','passwordHash','password']::text[] AS data,
+      CASE WHEN jsonb_typeof(data->'downloadsData') = 'array' THEN jsonb_array_length(data->'downloadsData') ELSE NULL END AS downloads_count,
+      CASE WHEN jsonb_typeof(data->'wishlistData') = 'array' THEN jsonb_array_length(data->'wishlistData') ELSE NULL END AS wishlist_count,
+      CASE WHEN jsonb_typeof(data->'favoritesData') = 'array' THEN jsonb_array_length(data->'favoritesData') ELSE NULL END AS favorites_count,
+      CASE WHEN jsonb_typeof(data->'libraryData') = 'array' THEN jsonb_array_length(data->'libraryData') ELSE NULL END AS library_count,
+      CASE WHEN jsonb_typeof(data->'friendsData') = 'array' THEN jsonb_array_length(data->'friendsData') ELSE NULL END AS friends_count
+    FROM users
+    WHERE name = $1
+  `, [safeName]);
+
+  if (!userRes.rows.length) {
+    delete userDatabase[safeName];
+    delete userCacheMeta[safeName];
+    fullUserCacheNames.delete(safeName);
+    invalidateOnlineListCache('single-user-summary-missing');
+    return null;
+  }
+
+  const row = userRes.rows[0];
+  const summaryData = { ...(row.data || {}) };
+  if (row.downloads_count !== null) summaryData.downloads = Number(row.downloads_count) || 0;
+  if (row.wishlist_count !== null) summaryData.wishlist = Number(row.wishlist_count) || 0;
+  if (row.favorites_count !== null) summaryData.favorites = Number(row.favorites_count) || 0;
+  if (row.library_count !== null) summaryData.library = Number(row.library_count) || 0;
+  if (row.friends_count !== null) summaryData.friends = Number(row.friends_count) || 0;
+
+  const localUser = userDatabase[safeName] || {};
+  const preserveOnline = options.preserveOnline !== false;
+  userDatabase[safeName] = {
+    ...buildCompactUserSummary(safeName, summaryData),
+    online: preserveOnline ? localUser.online === true : false,
+    id: preserveOnline ? (localUser.id || summaryData.id || null) : (summaryData.id || null),
+    lastSeen: preserveOnline ? (localUser.lastSeen || summaryData.lastSeen || null) : (summaryData.lastSeen || null)
+  };
+  fullUserCacheNames.delete(safeName);
+  userCacheMeta[safeName] = Date.now();
+  invalidateOnlineListCache('single-user-summary-refresh');
+  return userDatabase[safeName];
+}
+
+
 async function refreshAllUsersCacheFromDb(options = {}) {
   if (userCacheRefreshInFlight) return userCacheRefreshInFlight;
 
   const preserveOnline = options.preserveOnline !== false;
   userCacheRefreshInFlight = (async () => {
     const now = Date.now();
-    const usersRes = await pool.query('SELECT name, data FROM users ORDER BY LOWER(name) ASC');
+    const usersRes = await pool.query(`
+      SELECT
+        name,
+        data - ARRAY['downloadsData','libraryData','wishlistData','favoritesData','trophiesData','friendsData','passwordHash','password']::text[] AS data,
+        CASE WHEN jsonb_typeof(data->'downloadsData') = 'array' THEN jsonb_array_length(data->'downloadsData') ELSE NULL END AS downloads_count,
+        CASE WHEN jsonb_typeof(data->'wishlistData') = 'array' THEN jsonb_array_length(data->'wishlistData') ELSE NULL END AS wishlist_count,
+        CASE WHEN jsonb_typeof(data->'favoritesData') = 'array' THEN jsonb_array_length(data->'favoritesData') ELSE NULL END AS favorites_count,
+        CASE WHEN jsonb_typeof(data->'libraryData') = 'array' THEN jsonb_array_length(data->'libraryData') ELSE NULL END AS library_count,
+        CASE WHEN jsonb_typeof(data->'friendsData') = 'array' THEN jsonb_array_length(data->'friendsData') ELSE NULL END AS friends_count
+      FROM users
+      ORDER BY LOWER(name) ASC
+    `);
     const nextDatabase = {};
     const nextMeta = {};
+    const nextFullNames = new Set();
 
     usersRes.rows.forEach(row => {
       const username = row.name;
-      const dbUser = normalizeUserRecord(username, row.data || {});
       const localUser = userDatabase[username] || {};
 
-      if (userProfileWriteInFlight.has(username) && userDatabase[username]) {
+      if ((userProfileWriteInFlight.has(username) || fullUserCacheNames.has(username)) && userDatabase[username]) {
         nextDatabase[username] = normalizeUserRecord(username, localUser);
         nextMeta[username] = userCacheMeta[username] || now;
+        nextFullNames.add(username);
         return;
       }
 
+      const summaryData = { ...(row.data || {}) };
+      if (row.downloads_count !== null) summaryData.downloads = Number(row.downloads_count) || 0;
+      if (row.wishlist_count !== null) summaryData.wishlist = Number(row.wishlist_count) || 0;
+      if (row.favorites_count !== null) summaryData.favorites = Number(row.favorites_count) || 0;
+      if (row.library_count !== null) summaryData.library = Number(row.library_count) || 0;
+      if (row.friends_count !== null) summaryData.friends = Number(row.friends_count) || 0;
+
       nextDatabase[username] = {
-        ...dbUser,
+        ...buildCompactUserSummary(username, summaryData),
         online: preserveOnline ? localUser.online === true : false,
-        id: preserveOnline ? (localUser.id || dbUser.id || null) : (dbUser.id || null),
-        lastSeen: preserveOnline ? (localUser.lastSeen || dbUser.lastSeen || null) : (dbUser.lastSeen || null)
+        id: preserveOnline ? (localUser.id || summaryData.id || null) : (summaryData.id || null),
+        lastSeen: preserveOnline ? (localUser.lastSeen || summaryData.lastSeen || null) : (summaryData.lastSeen || null)
       };
       nextMeta[username] = now;
     });
 
     userDatabase = nextDatabase;
     userCacheMeta = nextMeta;
+    fullUserCacheNames.clear();
+    nextFullNames.forEach(name => fullUserCacheNames.add(name));
     userCacheLastFullRefresh = now;
     await syncPresenceOnlineFromDb();
-    invalidateOnlineListCache("users-full-refresh");
-    console.log(`[USER CACHE] ${Object.keys(userDatabase).length} users loaded fresh from DB into RAM on ${INSTANCE_ID}.`);
+    invalidateOnlineListCache('users-summary-refresh');
+    console.log(`[USER CACHE] ${Object.keys(userDatabase).length} compact user summaries loaded into RAM on ${INSTANCE_ID}. Full profile payloads load only for active/targeted users.`);
     return userDatabase;
   })();
 
@@ -1639,6 +1800,7 @@ async function refreshSingleUserCacheFromDb(name, options = {}) {
     lastSeen: preserveOnline ? (localUser.lastSeen || dbUser.lastSeen || null) : (dbUser.lastSeen || null)
   };
   userCacheMeta[safeName] = Date.now();
+  fullUserCacheNames.add(safeName);
   invalidateOnlineListCache("single-user-refresh");
   return userDatabase[safeName];
 }
@@ -1705,6 +1867,17 @@ function getUserDataPayloadFromCache(targetName, type) {
   return payload;
 }
 
+function searchUserNamesFromCache(query) {
+  const searchTerm = normalizeText(query, '').toLowerCase();
+  const isAllCommand = (searchTerm === '@all' || searchTerm === '*');
+  if (!isAllCommand && searchTerm.length < 2) return [];
+  return Object.keys(userDatabase)
+    .filter(username => isAllCommand || username.toLowerCase().includes(searchTerm))
+    .sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()))
+    .slice(0, isAllCommand ? Object.keys(userDatabase).length : 25)
+    .map(name => name);
+}
+
 function searchUsersFromCache(query, includeAdminFields = false) {
   const searchTerm = normalizeText(query, "").toLowerCase();
   const isAllCommand = (searchTerm === '@all' || searchTerm === '*');
@@ -1715,33 +1888,6 @@ function searchUsersFromCache(query, includeAdminFields = false) {
     .sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()))
     .slice(0, isAllCommand ? Object.keys(userDatabase).length : 15)
     .map(username => getPublicUserData(username, userDatabase[username], includeAdminFields));
-}
-
-function calculateGlobalTrophyStatsFromCache() {
-  const users = Object.values(userDatabase);
-  const totalUsers = users.length;
-  const unlockedCounts = {};
-
-  if (!totalUsers) return {};
-
-  users.forEach(user => {
-    const trophiesData = user && typeof user.trophiesData === 'object' && !Array.isArray(user.trophiesData)
-      ? user.trophiesData
-      : {};
-
-    Object.entries(trophiesData).forEach(([trophyId, trophy]) => {
-      const unlocked = trophy && String(trophy.unlocked || '').toLowerCase();
-      if (unlocked === 'true' || unlocked === '1' || unlocked === 'yes') {
-        unlockedCounts[trophyId] = (unlockedCounts[trophyId] || 0) + 1;
-      }
-    });
-  });
-
-  const stats = {};
-  Object.entries(unlockedCounts).forEach(([trophyId, count]) => {
-    stats[trophyId] = (Number(count) / totalUsers) * 100;
-  });
-  return stats;
 }
 
 function normalizeDownloadCountCategory(value) {
@@ -1778,54 +1924,111 @@ function getContentDownloadCountKey(item = {}) {
   return '';
 }
 
-function calculateTrendingFromCache() {
-  const dlCounts = {};
-  const wishCounts = {};
+async function calculateTrendingFromDb() {
+  const rows = await pool.query(`
+    WITH download_items AS (
+      SELECT
+        u.name AS username,
+        CASE raw_category
+          WHEN 'game' THEN 'games'
+          WHEN 'app' THEN 'apps'
+          WHEN 'demo' THEN 'demos'
+          WHEN 'dlc' THEN 'dlcs'
+          WHEN 'update' THEN 'updates'
+          WHEN 'avatar' THEN 'avatars'
+          WHEN 'theme' THEN 'themes'
+          WHEN 'homebrew' THEN 'homebrew_games'
+          WHEN 'port' THEN 'ports'
+          WHEN 'prototype' THEN 'prototypes'
+          WHEN 'emulator' THEN 'emulators'
+          WHEN 'launcher' THEN 'launchers'
+          WHEN 'tool' THEN 'tools'
+          WHEN 'dev_tool' THEN 'dev_tools'
+          WHEN 'manager' THEN 'backup_manager'
+          ELSE COALESCE(NULLIF(raw_category, ''), 'games')
+        END AS category,
+        CASE WHEN upper(trim(COALESCE(item->>'titleId', item->>'id', ''))) IN ('MISSING','N/A','NONE','NULL','UNDEFINED') THEN '' ELSE upper(trim(COALESCE(item->>'titleId', item->>'id', ''))) END AS title_id,
+        CASE WHEN upper(trim(COALESCE(item->>'contentId', item->>'contentID', ''))) IN ('MISSING','N/A','NONE','NULL','UNDEFINED') THEN '' ELSE upper(trim(COALESCE(item->>'contentId', item->>'contentID', ''))) END AS content_id,
+        regexp_replace(lower(replace(trim(COALESCE(item->>'cleanName', item->>'name', item->>'title', item->>'rawName', '')), '&amp;', '&')), '[^a-z0-9]+', '', 'g') AS normalized_name
+      FROM users u
+      CROSS JOIN LATERAL jsonb_array_elements(
+        CASE WHEN jsonb_typeof(u.data->'downloadsData') = 'array' THEN u.data->'downloadsData' ELSE '[]'::jsonb END
+      ) item
+      CROSS JOIN LATERAL (
+        SELECT regexp_replace(lower(trim(COALESCE(item->>'category', item->>'rawCategory', 'games'))), '[[:space:]-]+', '_', 'g') AS raw_category
+      ) cat
+    ), keyed_downloads AS (
+      SELECT
+        username,
+        category,
+        title_id,
+        CASE
+          WHEN category = 'games' AND title_id <> '' THEN category || '|T:' || title_id
+          WHEN content_id <> '' THEN category || '|C:' || content_id
+          WHEN title_id <> '' AND normalized_name <> '' THEN category || '|T:' || title_id || '|N:' || normalized_name
+          WHEN title_id <> '' THEN category || '|T:' || title_id
+          WHEN normalized_name <> '' THEN category || '|N:' || normalized_name
+          ELSE ''
+        END AS content_key
+      FROM download_items
+    ), wishlist_items AS (
+      SELECT
+        u.name AS username,
+        CASE WHEN upper(trim(COALESCE(item->>'titleId', item->>'id', ''))) IN ('MISSING','N/A','NONE','NULL','UNDEFINED') THEN '' ELSE upper(trim(COALESCE(item->>'titleId', item->>'id', ''))) END AS title_id
+      FROM users u
+      CROSS JOIN LATERAL jsonb_array_elements(
+        CASE WHEN jsonb_typeof(u.data->'wishlistData') = 'array' THEN u.data->'wishlistData' ELSE '[]'::jsonb END
+      ) item
+    )
+    SELECT 'game' AS kind, title_id AS key, COUNT(DISTINCT username)::int AS count
+    FROM keyed_downloads
+    WHERE category = 'games' AND title_id <> ''
+    GROUP BY title_id
+    UNION ALL
+    SELECT 'content' AS kind, content_key AS key, COUNT(DISTINCT username)::int AS count
+    FROM keyed_downloads
+    WHERE content_key <> ''
+    GROUP BY content_key
+    UNION ALL
+    SELECT 'wishlist' AS kind, title_id AS key, COUNT(*)::int AS count
+    FROM wishlist_items
+    WHERE title_id <> ''
+    GROUP BY title_id
+  `);
+
+  const gameCounts = [];
+  const wishCounts = [];
   const contentDownloadCounts = {};
 
-  Object.values(userDatabase).forEach(user => {
-    const downloads = Array.isArray(user.downloadsData) ? user.downloadsData : [];
-    const wishlist = Array.isArray(user.wishlistData) ? user.wishlistData : [];
-    const userGameDownloadIds = new Set();
-    const userContentKeys = new Set();
-
-    downloads.forEach(item => {
-      const safeItem = item || {};
-      const category = normalizeDownloadCountCategory(safeItem.category || safeItem.rawCategory || 'games');
-      const titleId = normalizeDownloadCountId(safeItem.titleId || safeItem.id);
-
-      // Trending Games and the counter shown on a game card use the same metric:
-      // one unique user per game Title ID. DLCs, updates and repeated downloads do not inflate it.
-      if (category === 'games' && titleId) userGameDownloadIds.add(titleId);
-
-      const contentKey = getContentDownloadCountKey(safeItem);
-      if (contentKey) userContentKeys.add(contentKey);
-    });
-
-    userGameDownloadIds.forEach(id => {
-      dlCounts[id] = (dlCounts[id] || 0) + 1;
-    });
-
-    userContentKeys.forEach(key => {
-      contentDownloadCounts[key] = (contentDownloadCounts[key] || 0) + 1;
-    });
-
-    wishlist.forEach(item => {
-      const id = normalizeDownloadCountId(item && (item.titleId || item.id));
-      if (id) wishCounts[id] = (wishCounts[id] || 0) + 1;
-    });
+  rows.rows.forEach(row => {
+    const count = Number(row.count) || 0;
+    if (row.kind === 'game') gameCounts.push({ id: row.key, count });
+    else if (row.kind === 'wishlist') wishCounts.push({ id: row.key, count });
+    else if (row.kind === 'content' && row.key) contentDownloadCounts[row.key] = count;
   });
 
-  const sortTop = counts => Object.entries(counts)
-    .map(([id, count]) => ({ id, count: Number(count) || 0 }))
-    .sort((a, b) => b.count - a.count || String(a.id).localeCompare(String(b.id)))
-    .slice(0, 50);
-
+  const sortTop = list => list.sort((a, b) => b.count - a.count || String(a.id).localeCompare(String(b.id))).slice(0, 50);
   return {
-    topDownloads: sortTop(dlCounts),
+    topDownloads: sortTop(gameCounts),
     topWishlist: sortTop(wishCounts),
     contentDownloadCounts
   };
+}
+
+async function getTrendingActivity(options = {}) {
+  const force = options.force === true;
+  const now = Date.now();
+  if (!force && trendingCache && now - trendingCacheAt < TRENDING_CACHE_MS) return trendingCache;
+  if (trendingBuildInFlight) return trendingBuildInFlight;
+
+  trendingBuildInFlight = calculateTrendingFromDb()
+    .then(payload => {
+      trendingCache = payload;
+      trendingCacheAt = Date.now();
+      return payload;
+    })
+    .finally(() => { trendingBuildInFlight = null; });
+  return trendingBuildInFlight;
 }
 
 function buildContentDownloadCountsPayload(counts = {}) {
@@ -1834,13 +2037,13 @@ function buildContentDownloadCountsPayload(counts = {}) {
     counts,
     updatedAt: Date.now(),
     uniqueUsers: true,
-    source: 'user-cache'
+    source: 'database-aggregate'
   };
 }
 
-function emitTrendingFromCache(targetSocket = null) {
+async function emitTrendingFromDb(targetSocket = null, options = {}) {
   try {
-    const payload = calculateTrendingFromCache();
+    const payload = await getTrendingActivity(options);
     const downloadCountsPayload = buildContentDownloadCountsPayload(payload.contentDownloadCounts);
 
     if (targetSocket && targetSocket.connected) {
@@ -1852,19 +2055,31 @@ function emitTrendingFromCache(targetSocket = null) {
     }
     return payload;
   } catch (err) {
-    console.error('[TRENDING CACHE EMIT ERROR]:', err);
+    console.error('[TRENDING DB EMIT ERROR]:', err);
     const emptyPayload = { topDownloads: [], topWishlist: [], contentDownloadCounts: {} };
     const emptyDownloadCountsPayload = buildContentDownloadCountsPayload({});
-
     if (targetSocket && targetSocket.connected) {
       targetSocket.emit('trending_data', emptyPayload);
       targetSocket.emit('content_download_counts', emptyDownloadCountsPayload);
-    } else {
-      io.emit('trending_data', emptyPayload);
-      io.emit('content_download_counts', emptyDownloadCountsPayload);
     }
     return emptyPayload;
   }
+}
+
+async function getGlobalTrophyStats(options = {}) {
+  const force = options.force === true;
+  const now = Date.now();
+  if (!force && globalTrophyStatsCache && now - globalTrophyStatsCacheAt < TROPHY_STATS_CACHE_MS) return globalTrophyStatsCache;
+  if (globalTrophyStatsBuildInFlight) return globalTrophyStatsBuildInFlight;
+
+  globalTrophyStatsBuildInFlight = calculateGlobalTrophyStatsFromDb()
+    .then(stats => {
+      globalTrophyStatsCache = stats;
+      globalTrophyStatsCacheAt = Date.now();
+      return stats;
+    })
+    .finally(() => { globalTrophyStatsBuildInFlight = null; });
+  return globalTrophyStatsBuildInFlight;
 }
 
 function profileUpdateTouchesTrending(userData = {}) {
@@ -1894,7 +2109,7 @@ function withTimeout(promise, ms, fallbackValue) {
 
 
 async function getUserFromDb(name) {
-  return await refreshSingleUserCacheFromDb(name);
+  return await refreshSingleUserCacheFromDb(name, { forceDuringWrite: true });
 }
 
 async function refreshReportsFromDb() {
@@ -1909,17 +2124,38 @@ async function searchUsersFromDb(query, includeAdminFields = false) {
 }
 
 async function getUserDataPayloadFromDb(targetName, type) {
-  const safeTargetName = normalizeText(targetName, "");
+  const safeTargetName = normalizeText(targetName, '');
   if (!safeTargetName) return null;
 
-  let targetUser = await getUserCached(safeTargetName);
-  if (!targetUser) return null;
+  const keyMap = {
+    favs: 'favoritesData',
+    favorites: 'favoritesData',
+    wishlist: 'wishlistData',
+    downloads: 'downloadsData',
+    library: 'libraryData',
+    trophies: 'trophiesData'
+  };
+  const dataKey = keyMap[type] || `${type}Data`;
+  const result = await pool.query('SELECT data -> $2 AS payload FROM users WHERE name = $1', [safeTargetName, dataKey]);
+  if (!result.rows.length) return null;
 
-  return getUserDataPayloadFromCache(safeTargetName, type);
+  let payload = result.rows[0].payload;
+  if (dataKey === 'trophiesData') {
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) payload = {};
+    return payload;
+  }
+  if (!Array.isArray(payload)) payload = [];
+  if (dataKey === 'downloadsData') return normalizeDownloadHistoryRecordsServer(payload).history;
+  if (dataKey === 'libraryData') return mergeLibraryRecordsServer(payload, []);
+  return payload;
 }
 
 async function saveUser(name, options = {}) {
   if (!name || !userDatabase[name]) return;
+  if (!fullUserCacheNames.has(name)) {
+    const loaded = await refreshSingleUserCacheFromDb(name, { forceDuringWrite: true });
+    if (!loaded) return;
+  }
   userDatabase[name] = normalizeUserRecord(name, userDatabase[name]);
   userDatabase[name].profileUpdatedAt = Date.now();
   userCacheMeta[name] = Date.now();
@@ -1927,6 +2163,10 @@ async function saveUser(name, options = {}) {
   invalidateOnlineListCache('save-user');
   if (options.notify !== false) {
     await notifyProfileSyncAcrossInstances(name, options.sourceSocketId || null, userDatabase[name].profileUpdatedAt);
+  }
+  const hasLocalSession = getSocketsByUserName(name).some(client => client && client.connected);
+  if (!hasLocalSession) {
+    deferServerTask('USER CACHE COMPACT AFTER SAVE', () => compactCachedUser(name), 250);
   }
 }
 
@@ -1943,14 +2183,25 @@ function cleanChatMessage(message = {}) {
   return clean;
 }
 
+function attachChatDbId(message, dbId) {
+  if (!message || typeof message !== 'object') return message;
+  Object.defineProperty(message, '_dbId', {
+    value: Number(dbId) || 0,
+    writable: true,
+    configurable: true,
+    enumerable: false
+  });
+  return message;
+}
+
 function getPublicChatHistory() {
-  return messageHistory.map(cleanChatMessage);
+  return messageHistory;
 }
 
 async function refreshChatHistoryFromDb() {
   const chatRes = await pool.query('SELECT id, message FROM chat ORDER BY id DESC LIMIT $1', [MAX_CHAT_HISTORY]);
   const rows = chatRes.rows.reverse();
-  messageHistory = rows.map(row => ({ ...(row.message || {}), _dbId: row.id }));
+  messageHistory = rows.map(row => attachChatDbId({ ...(row.message || {}) }, row.id));
   lastChatDbId = rows.length ? Math.max(...rows.map(row => Number(row.id) || 0)) : 0;
   return messageHistory;
 }
@@ -1987,7 +2238,7 @@ async function syncChatAcrossInstances() {
           lastChatDbId = Math.max(lastChatDbId, dbId);
           continue;
         }
-        const message = { ...(row.message || {}), _dbId: dbId };
+        const message = attachChatDbId({ ...(row.message || {}) }, dbId);
         messageHistory.push(message);
         if (messageHistory.length > MAX_CHAT_HISTORY) messageHistory.shift();
         lastChatDbId = Math.max(lastChatDbId, dbId);
@@ -2152,6 +2403,31 @@ function emitProfileSync(name, sourceSocketId = null) {
   });
 }
 
+function emitProfileCountsUpdate(name, user = null) {
+  if (!name) return;
+  const source = user || userDatabase[name];
+  if (!source) return;
+  io.emit('profile_counts_update', {
+    name,
+    downloads: Array.isArray(source.downloadsData) ? source.downloadsData.length : Number(source.downloads || 0),
+    wishlist: Array.isArray(source.wishlistData) ? source.wishlistData.length : Number(source.wishlist || 0),
+    favorites: Array.isArray(source.favoritesData) ? source.favoritesData.length : Number(source.favorites || 0),
+    trophies: source.trophiesData && typeof source.trophiesData === 'object' && !Array.isArray(source.trophiesData) ? countUnlockedTrophiesPayload(source.trophiesData) : Number(source.trophies || 0),
+    library: Array.isArray(source.libraryData) ? source.libraryData.length : Number(source.library || 0),
+    profileUpdatedAt: normalizeTimestampValue(source.profileUpdatedAt) || Date.now()
+  });
+}
+
+function profileUpdateTouchesPublicCounts(userData = {}) {
+  return !!(userData && [
+    'downloadsData', 'downloads', 'downloadsClearedAt', 'downloadsUpdatedAt',
+    'wishlistData', 'wishlist', 'wishlistUpdatedAt',
+    'favoritesData', 'favorites', 'favoritesUpdatedAt',
+    'libraryData', 'library', 'libraryUpdatedAt',
+    'trophiesData', 'trophies'
+  ].some(key => Object.prototype.hasOwnProperty.call(userData, key)));
+}
+
 
 function emitSettingsRealtimeSync(name, sourceSocketId = null, extra = {}) {
   if (!name || !userDatabase[name]) return;
@@ -2209,13 +2485,18 @@ async function syncActiveProfilesAcrossInstances() {
 }
 
 
-async function notifyProfileSyncAcrossInstances(name, sourceSocketId = null, profileUpdatedAt = Date.now()) {
+async function notifyProfileSyncAcrossInstances(name, sourceSocketId = null, profileUpdatedAt = Date.now(), changes = {}) {
   if (!name) return;
   const payload = {
     name,
     sourceSocketId,
     profileUpdatedAt,
-    instanceId: INSTANCE_ID
+    instanceId: INSTANCE_ID,
+    changes: {
+      trending: changes && changes.trending === true,
+      trophies: changes && changes.trophies === true,
+      counts: changes && changes.counts === true
+    }
   };
 
   try {
@@ -2243,14 +2524,24 @@ async function initProfileSyncNotifications() {
         activeSocket.connected && activeSocket.userName === name
       ));
 
-      const refreshedUser = await refreshSingleUserCacheFromDb(name);
+      const refreshedUser = hasLocalSession
+        ? await refreshSingleUserCacheFromDb(name)
+        : await refreshSingleUserSummaryFromDb(name);
       if (!refreshedUser) {
         invalidateOnlineListCache("profile-sync-listen-missing");
         deferServerTask('PROFILE LISTEN ONLINE LIST', () => emitOnlineList(), 1000);
         return;
       }
 
-      emitTrendingFromCache();
+      if (data.changes && data.changes.trending === true) {
+        invalidateTrendingCache();
+        scheduleTrendingRefreshBroadcast(1200);
+      }
+      if (data.changes && data.changes.trophies === true) {
+        invalidateGlobalTrophyStatsCache();
+        scheduleTrophyStatsRefreshBroadcast(1200);
+      }
+      if (data.changes && data.changes.counts === true) emitProfileCountsUpdate(name, refreshedUser);
       if (hasLocalSession) emitProfileSync(name, data.sourceSocketId || null);
       emitPublicProfileBannerUpdate(name, refreshedUser);
       invalidateOnlineListCache("profile-sync-listen");
@@ -2295,12 +2586,22 @@ function disconnectUserSessions(name, eventName = 'user_kicked', payload = {}) {
 
 async function upsertPresenceForSocket(socket, name) {
   if (!socket || !name) return;
+  if (userDatabase[name]) {
+    userDatabase[name].online = true;
+    userDatabase[name].id = socket.id;
+    userDatabase[name].lastSeen = Date.now();
+  }
   await pool.query(
     `INSERT INTO presence_sessions (socket_id, name, instance_id, connected_at, last_seen, data)
      VALUES ($1, $2, $3, NOW(), NOW(), $4)
      ON CONFLICT (socket_id) DO UPDATE SET name = $2, instance_id = $3, last_seen = NOW(), data = $4`,
     [socket.id, name, INSTANCE_ID, { role: getUserRole(name, userDatabase[name] || null) }]
   );
+  if (userDatabase[name]) {
+    userDatabase[name].online = true;
+    userDatabase[name].id = socket.id;
+    userDatabase[name].lastSeen = Date.now();
+  }
   invalidateOnlineListCache('presence-upsert');
 }
 
@@ -2407,6 +2708,7 @@ async function heartbeatPresenceSessions() {
     invalidateOnlineListCache("presence-heartbeat");
   }
 
+  await syncPresenceOnlineFromDb();
   await emitOnlineList();
 }
 
@@ -2563,6 +2865,7 @@ async function deleteUserAccount(targetName, reason, adminName) {
 
   delete userDatabase[targetName];
   delete userCacheMeta[targetName];
+  fullUserCacheNames.delete(targetName);
   disconnectUserSessions(targetName, 'account_deleted', { reason: deleteReason, by: adminName || 'Admin' });
   await emitOnlineList();
 
@@ -2656,10 +2959,19 @@ const presenceHeartbeatIntervalTask = runNonOverlappingTask('PRESENCE HEARTBEAT'
 const chatPollIntervalTask = runNonOverlappingTask('CHAT POLL', syncChatAcrossInstances);
 const profileSyncIntervalTask = runNonOverlappingTask('PROFILE SYNC', syncActiveProfilesAcrossInstances);
 
-setInterval(syncAdminStateIntervalTask, 15000);
-setInterval(presenceHeartbeatIntervalTask, PRESENCE_HEARTBEAT_MS);
-setInterval(chatPollIntervalTask, CHAT_SYNC_INTERVAL_MS);
-if (ENABLE_PROFILE_PERIODIC_SYNC) { setInterval(profileSyncIntervalTask, PROFILE_SYNC_INTERVAL_MS); } else { console.log('[PROFILE SYNC] Periodic fallback disabled. Realtime LISTEN/NOTIFY remains enabled.'); }
+let backgroundTasksStarted = false;
+function startBackgroundTasks() {
+  if (backgroundTasksStarted) return;
+  backgroundTasksStarted = true;
+  setInterval(syncAdminStateIntervalTask, 15000);
+  setInterval(presenceHeartbeatIntervalTask, PRESENCE_HEARTBEAT_MS);
+  setInterval(chatPollIntervalTask, CHAT_SYNC_INTERVAL_MS);
+  if (ENABLE_PROFILE_PERIODIC_SYNC) {
+    setInterval(profileSyncIntervalTask, PROFILE_SYNC_INTERVAL_MS);
+  } else {
+    console.log('[PROFILE SYNC] Periodic fallback disabled. Realtime LISTEN/NOTIFY remains enabled.');
+  }
+}
 
 io.on('connection', (socket) => {
   console.log('[NETWORK] Socket connected. ID: ' + socket.id);
@@ -2730,6 +3042,7 @@ io.on('connection', (socket) => {
           };
           normalizeProfileArrayPayloads(userDatabase[name]);
           userCacheMeta[name] = Date.now();
+          fullUserCacheNames.add(name);
           
           markSocketAuthenticated(socket);
           invalidateOnlineListCache('auth-existing-db');
@@ -2796,6 +3109,7 @@ io.on('connection', (socket) => {
         socket.role = getUserRole(name, userDatabase[name]);
         normalizeProfileArrayPayloads(userDatabase[name]);
         userCacheMeta[name] = Date.now();
+        fullUserCacheNames.add(name);
         markSocketAuthenticated(socket);
 
         await pool.query(
@@ -2958,6 +3272,7 @@ io.on('connection', (socket) => {
 
         userData = reconcileIncomingDownloads(userDatabase[name], userData || {});
         userData = reconcileIncomingProfileArrays(userDatabase[name], userData || {});
+        const publicCountsChanged = profileUpdateTouchesPublicCounts(userData);
         
         Object.assign(userDatabase[name], userData);
         const currentCountryCode = getUserCountryCode(userDatabase[name]);
@@ -2986,8 +3301,11 @@ io.on('connection', (socket) => {
             userProfileWriteInFlight.delete(name);
         }
 
+        if (publicCountsChanged) emitProfileCountsUpdate(name, userDatabase[name]);
+
         if (shouldEmitTrendingUpdate) {
-            emitTrendingFromCache();
+            invalidateTrendingCache();
+            scheduleTrendingRefreshBroadcast(900);
         }
 
         deferServerTask('PROFILE ONLINE LIST', () => emitOnlineList(), 450);
@@ -2995,14 +3313,17 @@ io.on('connection', (socket) => {
             emitPublicProfileBannerUpdate(name, userDatabase[name]);
         }
         emitProfileSync(name, shouldForceProfileSyncToSource ? null : socket.id);
-        deferServerTask('PROFILE NOTIFY', () => notifyProfileSyncAcrossInstances(name, shouldForceProfileSyncToSource ? null : socket.id, userDatabase[name].profileUpdatedAt), 0);
+        const trophiesChanged = !!userData.trophiesData;
+        deferServerTask('PROFILE NOTIFY', () => notifyProfileSyncAcrossInstances(
+            name,
+            shouldForceProfileSyncToSource ? null : socket.id,
+            userDatabase[name].profileUpdatedAt,
+            { trending: shouldEmitTrendingUpdate, trophies: trophiesChanged, counts: publicCountsChanged }
+        ), 0);
 
-        if (userData.trophiesData) {
-            try {
-                io.emit('global_trophy_stats', calculateGlobalTrophyStatsFromCache());
-            } catch (err) {
-                console.error('[TROPHY STATS CACHE ERROR]:', err);
-            }
+        if (trophiesChanged) {
+            invalidateGlobalTrophyStatsCache();
+            scheduleTrophyStatsRefreshBroadcast(900);
         }
     }
   });
@@ -3010,15 +3331,15 @@ io.on('connection', (socket) => {
   socket.on('request_user_data', async (data = {}) => {
     const { targetName, type, requestId } = data;
     try {
-      let rawData = getUserDataPayloadFromCache(targetName, type);
+      let rawData = fullUserCacheNames.has(targetName) ? getUserDataPayloadFromCache(targetName, type) : null;
 
       if (rawData === null) {
-        const refreshedUser = await withTimeout(
-          refreshSingleUserCacheFromDb(targetName),
+        rawData = await withTimeout(
+          getUserDataPayloadFromDb(targetName, type),
           4500,
           null
         );
-        rawData = refreshedUser ? getUserDataPayloadFromCache(targetName, type) : getEmptyUserDataPayload(type);
+        if (rawData === null) rawData = getEmptyUserDataPayload(type);
       }
 
       socket.emit('user_data_response', { targetName, type, requestId, rawData });
@@ -3060,8 +3381,12 @@ io.on('connection', (socket) => {
   socket.on('request_online_list', async () => {
     const sendOnlineList = async () => {
       if (socket.userName && userDatabase[socket.userName]) {
-        userDatabase[socket.userName].lastSeen = Date.now();
-        deferServerTask('REQUEST ONLINE PRESENCE UPSERT', () => upsertPresenceForSocket(socket, socket.userName), 0);
+        const currentUser = userDatabase[socket.userName];
+        const presenceChanged = currentUser.online !== true || currentUser.id !== socket.id;
+        currentUser.online = true;
+        currentUser.id = socket.id;
+        currentUser.lastSeen = Date.now();
+        if (presenceChanged) invalidateOnlineListCache('request-online-local-presence');
       }
       await emitOnlineList(socket);
     };
@@ -3101,8 +3426,12 @@ io.on('connection', (socket) => {
         return;
       }
 
-      userDatabase[name].lastSeen = Date.now();
-      deferServerTask('PRESENCE PING UPSERT', () => upsertPresenceForSocket(socket, name), 0);
+      const currentUser = userDatabase[name];
+      const presenceChanged = currentUser.online !== true || currentUser.id !== socket.id;
+      currentUser.lastSeen = Date.now();
+      currentUser.online = true;
+      currentUser.id = socket.id;
+      if (presenceChanged) invalidateOnlineListCache('presence-ping-local');
       const cachedList = getSanitizedOnlineList();
       const sendList = () => emitOnlineList(socket);
       const remaining = getPostAuthRemainingDelay(socket, POST_AUTH_ONLINE_LIST_DELAY_MS);
@@ -3115,52 +3444,53 @@ io.on('connection', (socket) => {
     }
   });
 
-  socket.on('search_users', async (query) => {
+  socket.on('search_users', async (request) => {
+    const query = request && typeof request === 'object' ? request.query : request;
+    const purpose = request && typeof request === 'object' ? normalizeText(request.purpose, '') : '';
     if (!query) return;
 
     try {
-      const results = await searchUsersFromDb(query, socket.isAdmin === true);
+      await ensureUserCacheReady();
+      if (purpose === 'mentions') {
+        socket.emit('mention_users_results', searchUserNamesFromCache(query));
+        return;
+      }
+      const results = await searchUsersFromDb(query, socket.isAdmin === true && purpose === 'admin');
       socket.emit('global_search_results', results);
     } catch (err) {
       console.error('[SEARCH USERS DB ERROR]:', err);
-      socket.emit('global_search_results', []);
+      if (purpose === 'mentions') socket.emit('mention_users_results', []);
+      else socket.emit('global_search_results', []);
     }
   });
   
   socket.on('request_trophy_stats', async () => {
     try {
-      await ensureUserCacheReady();
-      socket.emit('global_trophy_stats', calculateGlobalTrophyStatsFromCache());
+      const stats = await getGlobalTrophyStats();
+      socket.emit('global_trophy_stats', stats);
     } catch (err) {
-      console.error('[TROPHY STATS CACHE ERROR]:', err);
-      socket.emit('global_trophy_stats', {});
+      console.error('[TROPHY STATS DB ERROR]:', err);
+      socket.emit('global_trophy_stats', globalTrophyStatsCache || {});
     }
   });
 
   socket.on('request_trending', async () => {
     try {
-      if (!Object.keys(userDatabase).length) {
-        await withTimeout(ensureUserCacheReady(), 2000, null);
-      }
-      emitTrendingFromCache(socket);
+      await emitTrendingFromDb(socket);
     } catch (err) {
-      console.error('[TRENDING CACHE ERROR]:', err);
-      socket.emit('trending_data', {
+      console.error('[TRENDING DB ERROR]:', err);
+      socket.emit('trending_data', trendingCache || {
         topDownloads: [],
         topWishlist: [],
         contentDownloadCounts: {}
       });
-      socket.emit('content_download_counts', buildContentDownloadCountsPayload({}));
+      socket.emit('content_download_counts', buildContentDownloadCountsPayload((trendingCache && trendingCache.contentDownloadCounts) || {}));
     }
   });
 
   socket.on('request_content_download_counts', async (_request = {}, callback) => {
     try {
-      if (!Object.keys(userDatabase).length) {
-        await withTimeout(ensureUserCacheReady(), 2000, null);
-      }
-
-      const activity = calculateTrendingFromCache();
+      const activity = await getTrendingActivity();
       const payload = buildContentDownloadCountsPayload(activity.contentDownloadCounts);
 
       if (typeof callback === 'function') callback(payload);
@@ -3380,7 +3710,7 @@ io.on('connection', (socket) => {
     try {
       const savedMessage = cleanChatMessage(messageData);
       const savedRes = await pool.query('INSERT INTO chat (message) VALUES ($1) RETURNING id', [savedMessage]);
-      messageData._dbId = Number(savedRes.rows[0]?.id || 0);
+      attachChatDbId(messageData, savedRes.rows[0]?.id);
       lastChatDbId = Math.max(lastChatDbId, messageData._dbId || 0);
 
       messageHistory.push(messageData);
@@ -4001,13 +4331,26 @@ io.on('connection', (socket) => {
     if (!name || !userDatabase[name]) return;
 
     try {
-      await removePresenceForSocket(socket);
-      userDatabase[name].lastSeen = Date.now();
-      socket.broadcast.emit('user_stopped_typing', { name: name });
+      const presenceState = await pool.query(`
+        WITH removed AS (
+          DELETE FROM presence_sessions WHERE socket_id = $1 RETURNING socket_id
+        )
+        SELECT socket_id, last_seen
+        FROM presence_sessions
+        WHERE name = $2 AND last_seen >= NOW() - INTERVAL '90 seconds'
+        ORDER BY last_seen DESC
+        LIMIT 1
+      `, [socket.id, name]);
+      invalidateOnlineListCache('presence-remove');
+      socket.broadcast.emit('user_stopped_typing', { name });
 
-      await syncPresenceOnlineFromDb();
-      const stillOnline = userDatabase[name].online === true;
-      if (!stillOnline) {
+      const remainingPresence = presenceState.rows[0] || null;
+      const stillOnline = !!remainingPresence;
+      if (stillOnline) {
+        userDatabase[name].online = true;
+        userDatabase[name].id = remainingPresence.socket_id || userDatabase[name].id;
+        userDatabase[name].lastSeen = remainingPresence.last_seen ? new Date(remainingPresence.last_seen).getTime() : Date.now();
+      } else {
         const lastSeen = Date.now();
         userDatabase[name].online = false;
         userDatabase[name].lastSeen = lastSeen;
@@ -4019,19 +4362,50 @@ io.on('connection', (socket) => {
         );
         userCacheMeta[name] = Date.now();
         invalidateOnlineListCache('disconnect-presence-save');
-        await addServerLog('logout', `${name} disconnected`, { socketId: socket.id }, name);
+        deferServerTask('LOGOUT SERVER LOG', () => addServerLog('logout', `${name} disconnected`, { socketId: socket.id }, name), 0);
       }
 
+      const stillHasLocalSession = getSocketsByUserName(name).some(client => client && client.connected);
+      if (!stillHasLocalSession) compactCachedUser(name);
       await emitOnlineList();
     } catch (err) {
       console.error('[DISCONNECT CLEANUP ERROR]:', err);
-      userDatabase[name].lastSeen = Date.now();
+      if (userDatabase[name]) userDatabase[name].lastSeen = Date.now();
+      const stillHasLocalSession = getSocketsByUserName(name).some(client => client && client.connected);
+      if (!stillHasLocalSession) compactCachedUser(name);
     }
   });
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-  console.log(`PSN Database Server running on port ${PORT} (pg pool max ${PG_POOL_MAX}, online cache ${ONLINE_LIST_CACHE_MS}ms, chat sync ${CHAT_SYNC_INTERVAL_MS}ms, instance ${INSTANCE_ID})`);
-  startKeepAlivePings();
-});
+let startupInFlight = false;
+let startupRetryTimer = null;
+let serverListening = false;
+
+async function startServer() {
+  if (startupInFlight || serverListening) return;
+  startupInFlight = true;
+  try {
+    await initDb();
+    await initProfileSyncNotifications();
+    startUserCacheWarmup();
+    startBackgroundTasks();
+    serverListening = true;
+    server.listen(PORT, () => {
+      console.log(`PSN Database Server running on port ${PORT} (pg pool max ${PG_POOL_MAX}, online cache ${ONLINE_LIST_CACHE_MS}ms, chat sync ${CHAT_SYNC_INTERVAL_MS}ms, instance ${INSTANCE_ID})`);
+      startKeepAlivePings();
+    });
+  } catch (err) {
+    console.error('[STARTUP ERROR]:', err);
+    if (!startupRetryTimer) {
+      startupRetryTimer = setTimeout(() => {
+        startupRetryTimer = null;
+        startServer();
+      }, 5000);
+    }
+  } finally {
+    startupInFlight = false;
+  }
+}
+
+startServer();
