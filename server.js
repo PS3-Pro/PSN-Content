@@ -1723,20 +1723,19 @@ function searchUserNamesFromCache(query) {
   return Object.keys(userDatabase)
     .filter(username => isAllCommand || username.toLowerCase().includes(searchTerm))
     .sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()))
-    .slice(0, isAllCommand ? Object.keys(userDatabase).length : 25)
     .map(name => name);
 }
 
-function searchUsersFromCache(query, includeAdminFields = false) {
+function searchUsersFromCache(query, includeAdminFields = false, includeAllMatches = false) {
   const searchTerm = normalizeText(query, "").toLowerCase();
   const isAllCommand = (searchTerm === '@all' || searchTerm === '*');
   if (!isAllCommand && searchTerm.length < 2) return [];
 
-  return Object.keys(userDatabase)
+  const matches = Object.keys(userDatabase)
     .filter(username => isAllCommand || username.toLowerCase().includes(searchTerm))
-    .sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()))
-    .slice(0, isAllCommand ? Object.keys(userDatabase).length : 15)
-    .map(username => getPublicUserData(username, userDatabase[username], includeAdminFields));
+    .sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()));
+  const visibleMatches = (isAllCommand || includeAllMatches) ? matches : matches.slice(0, 15);
+  return visibleMatches.map(username => getPublicUserData(username, userDatabase[username], includeAdminFields));
 }
 
 async function calculateTrendingFromDb() {
@@ -1947,9 +1946,9 @@ async function refreshReportsFromDb() {
   return adminReports;
 }
 
-async function searchUsersFromDb(query, includeAdminFields = false) {
+async function searchUsersFromDb(query, includeAdminFields = false, includeAllMatches = false) {
   await ensureUserCacheReady();
-  return searchUsersFromCache(query, includeAdminFields);
+  return searchUsersFromCache(query, includeAdminFields, includeAllMatches);
 }
 
 async function getUserDataPayloadFromDb(targetName, type) {
@@ -2108,7 +2107,8 @@ async function emitAdminState(socket) {
       chatControls: adminState.chatControls,
       pinnedAnnouncement: adminState.pinnedAnnouncement || null,
       reports: adminReports,
-      serverLog
+      serverLog,
+      registeredUsers: Object.keys(userDatabase).length
     });
     socket.emit('admin_chat_controls_state', adminState.chatControls);
     socket.emit('reports_list', adminReports);
@@ -2955,8 +2955,28 @@ io.on('connection', (socket) => {
 
       if (dbUser) {
         if (!dbUser.passwordHash) {
-          socket.emit('auth_error', 'Legacy account detected! Please recreate your ID.');
-          return;
+          if (isNewAccount === true) {
+            socket.emit('auth_error', 'This Online ID is already taken...');
+            return;
+          }
+
+          const legacyPassword = typeof dbUser.password === 'string' ? dbUser.password : '';
+          if (!legacyPassword) {
+            socket.emit('auth_error', 'Legacy account detected. A password reset is required before this account can sign in.');
+            return;
+          }
+
+          if (String(password || '') !== legacyPassword) {
+            socket.emit('auth_error', 'Incorrect password. Access denied.');
+            return;
+          }
+
+          dbUser.passwordHash = await bcrypt.hash(password, 10);
+          delete dbUser.password;
+          dbUser.passwordMigratedAt = new Date().toISOString();
+          dbUser.profileUpdatedAt = Date.now();
+          await queryDbWithRetry('UPDATE users SET data = $1 WHERE name = $2', [dbUser, name], { attempts: 2, label: 'LEGACY PASSWORD MIGRATION' });
+          console.log(`[AUTH] Migrated legacy password for ${name} to bcrypt.`);
         }
 
         const match = await bcrypt.compare(password, dbUser.passwordHash);
@@ -3393,7 +3413,7 @@ io.on('connection', (socket) => {
         socket.emit('mention_users_results', searchUserNamesFromCache(query));
         return;
       }
-      const results = await searchUsersFromDb(query, socket.isAdmin === true && purpose === 'admin');
+      const results = await searchUsersFromDb(query, socket.isAdmin === true && purpose === 'admin', purpose === 'friends');
       socket.emit('global_search_results', results);
     } catch (err) {
       console.error('[SEARCH USERS DB ERROR]:', err);
@@ -3855,7 +3875,8 @@ io.on('connection', (socket) => {
         chatControls: adminState.chatControls,
         pinnedAnnouncement: adminState.pinnedAnnouncement || null,
         reports: socket.isAdmin === true ? adminReports : [],
-        serverLog: socket.isAdmin === true ? serverLog : []
+        serverLog: socket.isAdmin === true ? serverLog : [],
+        registeredUsers: socket.isAdmin === true ? Object.keys(userDatabase).length : 0
       };
       socket.emit('admin_state', payload);
       socket.emit('maintenance_mode', adminState.maintenance);
