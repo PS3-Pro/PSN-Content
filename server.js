@@ -73,7 +73,6 @@ let profileSyncReconnectTimer = null;
 
 let onlineListCache = null;
 let onlineListCacheAt = 0;
-let onlineListBuildInFlight = null;
 let lastBroadcastOnlineListSignature = "";
 
 function invalidateOnlineListCache(reason = "") {
@@ -442,7 +441,7 @@ async function initDb() {
     );
   `);
 
-  await pool.query('DELETE FROM presence_sessions WHERE instance_id = $1 OR last_seen < NOW() - INTERVAL \'90 seconds\'', [INSTANCE_ID]);
+  await pool.query(`DELETE FROM presence_sessions WHERE instance_id = $1 OR last_seen < NOW() - INTERVAL '${PRESENCE_TTL_SECONDS} seconds'`, [INSTANCE_ID]);
   await refreshAllUsersCacheFromDb({ preserveOnline: false });
 
   await refreshChatHistoryFromDb();
@@ -1812,17 +1811,6 @@ async function ensureUserCacheReady() {
   return userDatabase;
 }
 
-async function getUserCached(name) {
-  const safeName = normalizeText(name, "");
-  if (!safeName) return null;
-
-  if (userDatabase[safeName]) {
-    return userDatabase[safeName];
-  }
-
-  return await refreshSingleUserCacheFromDb(safeName);
-}
-
 function startUserCacheWarmup() {
   if (process.env.ENABLE_USER_CACHE_WARMUP !== "1") {
     console.log('[USER CACHE] background full refresh disabled; using startup RAM cache + targeted refresh only.');
@@ -1888,40 +1876,6 @@ function searchUsersFromCache(query, includeAdminFields = false) {
     .sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()))
     .slice(0, isAllCommand ? Object.keys(userDatabase).length : 15)
     .map(username => getPublicUserData(username, userDatabase[username], includeAdminFields));
-}
-
-function normalizeDownloadCountCategory(value) {
-  const raw = normalizeText(value, 'games').toLowerCase().replace(/[\s-]+/g, '_');
-  const aliases = {
-    game: 'games', app: 'apps', demo: 'demos', dlc: 'dlcs', update: 'updates',
-    avatar: 'avatars', theme: 'themes', homebrew: 'homebrew_games', port: 'ports',
-    prototype: 'prototypes', emulator: 'emulators', launcher: 'launchers', tool: 'tools',
-    dev_tool: 'dev_tools', manager: 'backup_manager'
-  };
-  return aliases[raw] || raw || 'games';
-}
-
-function normalizeDownloadCountId(value) {
-  const normalized = normalizeText(value, '').toUpperCase();
-  return /^(MISSING|N\/A|NONE|NULL|UNDEFINED)$/.test(normalized) ? '' : normalized;
-}
-
-function normalizeDownloadCountName(value) {
-  return normalizeText(value, '').toLowerCase().replace(/&amp;/g, '&').replace(/[^a-z0-9]+/g, '');
-}
-
-function getContentDownloadCountKey(item = {}) {
-  const category = normalizeDownloadCountCategory(item.category || item.rawCategory || 'games');
-  const titleId = normalizeDownloadCountId(item.titleId || item.id);
-  const contentId = normalizeDownloadCountId(item.contentId || item.contentID);
-  const name = normalizeDownloadCountName(item.cleanName || item.name || item.title || item.rawName);
-
-  if (category === 'games' && titleId) return `${category}|T:${titleId}`;
-  if (contentId) return `${category}|C:${contentId}`;
-  if (titleId && name) return `${category}|T:${titleId}|N:${name}`;
-  if (titleId) return `${category}|T:${titleId}`;
-  if (name) return `${category}|N:${name}`;
-  return '';
 }
 
 async function calculateTrendingFromDb() {
@@ -2657,11 +2611,6 @@ async function upsertPresenceForSocket(socket, name) {
      ON CONFLICT (socket_id) DO UPDATE SET name = $2, instance_id = $3, last_seen = NOW(), data = $4`,
     [socket.id, name, INSTANCE_ID, { role: getUserRole(name, userDatabase[name] || null) }]
   );
-  if (userDatabase[name]) {
-    userDatabase[name].online = true;
-    userDatabase[name].id = socket.id;
-    userDatabase[name].lastSeen = Date.now();
-  }
   invalidateOnlineListCache('presence-upsert');
   if (shouldAnnouncePresence && userDatabase[name]) {
     socket.__presenceAnnounced = true;
@@ -2670,19 +2619,22 @@ async function upsertPresenceForSocket(socket, name) {
   }
 }
 
-async function removePresenceForSocket(socket) {
-  if (!socket || !socket.id) return;
-  await pool.query('DELETE FROM presence_sessions WHERE socket_id = $1', [socket.id]);
-  invalidateOnlineListCache('presence-remove');
-}
-
 async function syncPresenceOnlineFromDb() {
   const previousOnlineState = new Map(Object.entries(userDatabase).map(([username, user]) => [
     username,
     { online: user && user.online === true, lastSeen: Number(user && user.lastSeen || 0) }
   ]));
 
-  await pool.query(`DELETE FROM presence_sessions WHERE last_seen < NOW() - INTERVAL '90 seconds'`);
+  const expiredRes = await pool.query(`
+    WITH expired AS (
+      DELETE FROM presence_sessions
+      WHERE last_seen < NOW() - INTERVAL '${PRESENCE_TTL_SECONDS} seconds'
+      RETURNING name, last_seen
+    )
+    SELECT name, MAX(last_seen) AS last_seen
+    FROM expired
+    GROUP BY name
+  `);
 
   const presenceRes = await pool.query(`
     SELECT name,
@@ -2691,10 +2643,20 @@ async function syncPresenceOnlineFromDb() {
     FROM presence_sessions
     GROUP BY name
   `);
+  const activeNames = new Set(presenceRes.rows.map(row => row.name));
+  const expiredOfflineRows = expiredRes.rows.filter(row => row && row.name && !activeNames.has(row.name));
 
-  Object.entries(userDatabase).forEach(([username, user]) => {
+  Object.entries(userDatabase).forEach(([, user]) => {
     user.online = false;
     if (!user.lastSeen) user.lastSeen = null;
+  });
+
+  expiredOfflineRows.forEach(row => {
+    const username = row.name;
+    if (!userDatabase[username]) return;
+    const expiredLastSeen = row.last_seen ? new Date(row.last_seen).getTime() : Date.now();
+    userDatabase[username].lastSeen = Math.max(Number(userDatabase[username].lastSeen || 0), expiredLastSeen);
+    userCacheMeta[username] = Date.now();
   });
 
   presenceRes.rows.forEach(row => {
@@ -2705,12 +2667,35 @@ async function syncPresenceOnlineFromDb() {
     userDatabase[username].lastSeen = row.last_seen ? new Date(row.last_seen).getTime() : Date.now();
   });
 
+  if (expiredOfflineRows.length > 0) {
+    const names = [];
+    const lastSeenValues = [];
+    expiredOfflineRows.forEach(row => {
+      if (!userDatabase[row.name]) return;
+      names.push(row.name);
+      lastSeenValues.push(Number(userDatabase[row.name].lastSeen || Date.now()));
+    });
+    if (names.length > 0) {
+      await pool.query(
+        `UPDATE users AS u
+         SET data = COALESCE(u.data, '{}'::jsonb) || jsonb_build_object('online', false, 'lastSeen', v.last_seen)
+         FROM UNNEST($1::text[], $2::bigint[]) AS v(name, last_seen)
+         WHERE u.name = v.name`,
+        [names, lastSeenValues]
+      );
+    }
+  }
+
   invalidateOnlineListCache("presence-sync");
 
   Object.entries(userDatabase).forEach(([username, user]) => {
     const previous = previousOnlineState.get(username);
-    if (!previous || previous.online === (user && user.online === true)) return;
-    emitPresenceUpdate(username, user);
+    if (!previous) return;
+    const onlineChanged = previous.online !== (user && user.online === true);
+    const offlineLastSeenChanged = user && user.online !== true && Number(user.lastSeen || 0) > previous.lastSeen;
+    if (!onlineChanged && !offlineLastSeenChanged) return;
+    const payload = emitPresenceUpdate(username, user);
+    if (payload) deferServerTask('PRESENCE STATE NOTIFY', () => notifyPresenceAcrossInstances(username, user), 0);
   });
 
   return userDatabase;
@@ -3809,12 +3794,12 @@ io.on('connection', (socket) => {
     const respond = typeof callback === 'function' ? callback : () => {};
 
     try {
-      await pool.query(`DELETE FROM presence_sessions WHERE last_seen < NOW() - INTERVAL '90 seconds'`);
+      await pool.query(`DELETE FROM presence_sessions WHERE last_seen < NOW() - INTERVAL '${PRESENCE_TTL_SECONDS} seconds'`);
 
       const statsRes = await pool.query(`
         SELECT
           (SELECT COUNT(*)::int FROM users) AS users,
-          (SELECT COUNT(DISTINCT name)::int FROM presence_sessions WHERE last_seen > NOW() - INTERVAL '90 seconds') AS online
+          (SELECT COUNT(DISTINCT name)::int FROM presence_sessions WHERE last_seen > NOW() - INTERVAL '${PRESENCE_TTL_SECONDS} seconds') AS online
       `);
 
       const stats = statsRes.rows[0] || {};
@@ -4414,7 +4399,7 @@ io.on('connection', (socket) => {
         )
         SELECT socket_id, last_seen
         FROM presence_sessions
-        WHERE name = $2 AND last_seen >= NOW() - INTERVAL '90 seconds'
+        WHERE name = $2 AND last_seen >= NOW() - INTERVAL '${PRESENCE_TTL_SECONDS} seconds'
         ORDER BY last_seen DESC
         LIMIT 1
       `, [socket.id, name]);
