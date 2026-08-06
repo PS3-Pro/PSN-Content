@@ -3440,7 +3440,7 @@ io.on('connection', (socket) => {
 
   socket.on('admin_redeem', (data, callback) => {
     if (!data || typeof callback !== 'function') return;
-    const { code, user } = data;
+    const { code } = data;
     if (!code) return callback({ success: false, message: "Enter a code." });
 
     const cleanCode = code.replace(/-/g, "").toUpperCase();
@@ -4140,7 +4140,6 @@ io.on('connection', (socket) => {
   socket.on('delete_message', async (data) => {
     const msgIndex = messageHistory.findIndex(m => String(new Date(m.time).getTime()) === String(data.msgId));
     if (msgIndex > -1) {
-        const isAdmin = socket.isAdmin === true;
         const canModerate = canModerateSocket(socket);
         const msg = messageHistory[msgIndex];
         const msgTime = msg.time;
