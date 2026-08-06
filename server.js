@@ -280,50 +280,6 @@ app.get('/ping', (req, res) => {
   res.send('Server is Awake!');
 });
 
-app.get('/debug-db', async (req, res) => {
-  try {
-    const info = await pool.query(`
-      SELECT
-        current_database() AS database,
-        current_schema() AS schema,
-        current_user AS user,
-        current_setting('search_path') AS search_path,
-        to_regclass('chat') AS active_chat_table,
-        to_regclass('public.chat') AS public_chat_table
-    `);
-
-    const chat = await pool.query(`
-      SELECT COUNT(*)::int AS total, COALESCE(MAX(id), 0)::int AS max_id
-      FROM chat
-    `);
-
-    const memory = process.memoryUsage();
-    const toMb = value => Math.round((Number(value) || 0) / 1024 / 1024 * 10) / 10;
-    res.json({
-      instance: INSTANCE_ID,
-      startedAt: new Date(SERVER_STARTED_AT).toISOString(),
-      db: info.rows[0],
-      chat: chat.rows[0],
-      memoryMessages: messageHistory.length,
-      cachedUsers: Object.keys(userDatabase).length,
-      fullProfilesInRam: fullUserCacheNames.size,
-      memory: {
-        rssMb: toMb(memory.rss),
-        heapUsedMb: toMb(memory.heapUsed),
-        heapTotalMb: toMb(memory.heapTotal),
-        externalMb: toMb(memory.external)
-      },
-      userCacheLastFullRefresh: userCacheLastFullRefresh ? new Date(userCacheLastFullRefresh).toISOString() : null,
-      lastChatDbId
-    });
-  } catch (err) {
-    res.status(500).json({
-      error: err.message,
-      instance: INSTANCE_ID
-    });
-  }
-});
-
 let userDatabase = {};
 let userCacheMeta = {};
 let userCacheLastFullRefresh = 0;
@@ -984,26 +940,9 @@ function hasObjectPayload(value) {
   return !!(value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).length > 0);
 }
 
-function hasArrayPayload(value) {
-  return Array.isArray(value) && value.length > 0;
-}
 
-function isDefaultAvatarValue(value) {
-  const text = normalizeText(value, "");
-  return !text || text === DEFAULT_AVATAR || /\/avatars\/default\.png(?:$|\?)/.test(text);
-}
 
-function preferLocalArrayPayload(currentValue, localValue) {
-  const currentLength = Array.isArray(currentValue) ? currentValue.length : 0;
-  const localLength = Array.isArray(localValue) ? localValue.length : 0;
-  return localLength > currentLength ? localValue : currentValue;
-}
 
-function preferLocalObjectPayload(currentValue, localValue) {
-  const currentSize = hasObjectPayload(currentValue) ? Object.keys(currentValue).length : 0;
-  const localSize = hasObjectPayload(localValue) ? Object.keys(localValue).length : 0;
-  return localSize > currentSize ? localValue : currentValue;
-}
 
 function countUnlockedTrophiesPayload(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return 0;
@@ -1014,15 +953,6 @@ function countUnlockedTrophiesPayload(value) {
   }, 0);
 }
 
-function preferBestTrophiesPayload(currentValue, localValue) {
-  const currentSize = hasObjectPayload(currentValue) ? Object.keys(currentValue).length : 0;
-  const localSize = hasObjectPayload(localValue) ? Object.keys(localValue).length : 0;
-  const currentUnlocked = countUnlockedTrophiesPayload(currentValue);
-  const localUnlocked = countUnlockedTrophiesPayload(localValue);
-  if (localUnlocked > currentUnlocked) return localValue;
-  if (localUnlocked === currentUnlocked && localSize > currentSize) return localValue;
-  return currentValue;
-}
 
 function shouldAcceptIncomingTrophies(currentUser = {}, incomingUser = {}) {
   if (!incomingUser || !hasObjectPayload(incomingUser.trophiesData)) return false;
@@ -1333,17 +1263,6 @@ function hasOwnPayload(target = {}, key = '') {
   return Object.prototype.hasOwnProperty.call(target || {}, key);
 }
 
-function setProfileArrayPayload(target = {}, key = '', list = [], version = 0) {
-  const sync = PROFILE_ARRAY_SYNC_KEYS[key];
-  if (!sync) return target;
-  const safeList = Array.isArray(list) ? list : [];
-  target[key] = safeList;
-  target[sync.countKey] = safeList.length;
-  const safeVersion = normalizeTimestampValue(version);
-  if (safeVersion) target[sync.versionKey] = safeVersion;
-  else target[sync.versionKey] = normalizeTimestampValue(target[sync.versionKey]);
-  return target;
-}
 
 function normalizeProfileArrayPayloads(target = {}) {
   Object.keys(PROFILE_ARRAY_SYNC_KEYS).forEach(key => {
@@ -1411,46 +1330,8 @@ function reconcileIncomingProfileArrays(currentUser = {}, incomingUser = {}) {
   return incomingUser;
 }
 
-function applyLocalRecoveryArrayPayload(merged = {}, localData = {}, key = '') {
-  const sync = PROFILE_ARRAY_SYNC_KEYS[key];
-  if (!sync) return merged;
-
-  const dbRawList = getProfileArrayPayload(merged[key]);
-  const localRawList = getProfileArrayPayload(localData[key]);
-  const dbList = key === 'downloadsData'
-    ? normalizeDownloadHistoryRecordsServer(dbRawList).history
-    : (key === 'libraryData' ? mergeLibraryRecordsServer(dbRawList, []) : dbRawList);
-  const localList = key === 'downloadsData'
-    ? normalizeDownloadHistoryRecordsServer(localRawList).history
-    : (key === 'libraryData' ? mergeLibraryRecordsServer(localRawList, []) : localRawList);
-  const dbVersion = normalizeTimestampValue(merged[sync.versionKey]);
-  const localVersion = normalizeTimestampValue(localData[sync.versionKey]);
-  const dbHasItems = dbList.length > 0;
-  const localHasItems = localList.length > 0;
-
-  if (localVersion && (!dbVersion || localVersion > dbVersion)) {
-    const selected = key === 'libraryData' ? mergeLibraryRecordsServer(localList, dbList) : localList;
-    return setProfileArrayPayload(merged, key, selected, localVersion);
-  }
-
-  if (!dbVersion && !dbHasItems && localHasItems) {
-    const selected = key === 'libraryData' ? mergeLibraryRecordsServer(localList, dbList) : localList;
-    return setProfileArrayPayload(merged, key, selected, localVersion || normalizeTimestampValue(localData.profileUpdatedAt) || Date.now());
-  }
-
-  const selected = key === 'libraryData' ? mergeLibraryRecordsServer(dbList, localList) : dbList;
-  return setProfileArrayPayload(merged, key, selected, dbVersion);
-}
 
 
-function applyDownloadsClearedState(target = {}, clearAt = 0) {
-  const normalizedClearAt = normalizeTimestampValue(clearAt);
-  if (!normalizedClearAt) return target;
-  target.downloadsClearedAt = normalizedClearAt;
-  target.downloadsData = [];
-  target.downloads = 0;
-  return target;
-}
 
 function reconcileIncomingDownloads(currentUser = {}, incomingUser = {}) {
   const currentClearAt = normalizeTimestampValue(currentUser.downloadsClearedAt);
@@ -1499,59 +1380,6 @@ function reconcileIncomingDownloads(currentUser = {}, incomingUser = {}) {
   }
 
   return incomingUser;
-}
-function mergeLocalRecoveryData(dbUser = {}, localData = {}) {
-  if (!hasObjectPayload(localData)) return dbUser;
-  const merged = { ...dbUser };
-  const dbDownloadsClearedAt = normalizeTimestampValue(merged.downloadsClearedAt);
-  const localDownloadsClearedAt = normalizeTimestampValue(localData.downloadsClearedAt);
-
-  if (localData.avatar && isDefaultAvatarValue(merged.avatar) && !isDefaultAvatarValue(localData.avatar)) merged.avatar = localData.avatar;
-  if ((!merged.joined || merged.joined === '2026') && localData.joined) merged.joined = localData.joined;
-  const localCountryCode = getUserCountryCode(localData);
-  if (!getUserCountryCode(merged) && localCountryCode) {
-    merged.countryCode = localCountryCode;
-    merged.settingsData = merged.settingsData && typeof merged.settingsData === "object" && !Array.isArray(merged.settingsData)
-      ? { ...merged.settingsData, countryCode: localCountryCode }
-      : { countryCode: localCountryCode };
-  }
-  reconcileIncomingThemeColor(merged, localData, localData.settingsData || {});
-  const preferredTrophies = preferBestTrophiesPayload(merged.trophiesData, localData.trophiesData);
-  if (preferredTrophies !== merged.trophiesData) merged.trophiesData = preferredTrophies;
-  const preferredCounters = preferLocalObjectPayload(merged.countersData, localData.countersData);
-  if (preferredCounters !== merged.countersData) merged.countersData = preferredCounters;
-
-  merged.downloadsClearedAt = Math.max(dbDownloadsClearedAt, localDownloadsClearedAt) || 0;
-
-  Object.keys(PROFILE_ARRAY_SYNC_KEYS).forEach(key => applyLocalRecoveryArrayPayload(merged, localData, key));
-
-  if (localDownloadsClearedAt > dbDownloadsClearedAt) {
-    const localDownloadsUpdatedAt = normalizeTimestampValue(localData.downloadsUpdatedAt || localData.profileUpdatedAt);
-    if (!Array.isArray(localData.downloadsData) || localData.downloadsData.length === 0 || !localDownloadsUpdatedAt || localDownloadsClearedAt >= localDownloadsUpdatedAt) {
-      applyDownloadsClearedState(merged, localDownloadsClearedAt);
-      merged.downloadsUpdatedAt = Math.max(normalizeTimestampValue(merged.downloadsUpdatedAt), localDownloadsClearedAt);
-    }
-  }
-  if (hasObjectPayload(localData.settingsData)) {
-    const mergedSettings = mergeProfileSettingsByTimestamp(merged.settingsData || {}, localData.settingsData, {
-      currentFallback: normalizeTimestampValue(merged.profileUpdatedAt),
-      incomingFallback: normalizeTimestampValue(localData.profileCardStyleUpdatedAt || localData.profileUpdatedAt)
-    });
-    merged.settingsData = mergedSettings.settingsData;
-  }
-  ['trophies', 'level', 'xp'].forEach(key => {
-    const current = Number(merged[key] || 0);
-    const incoming = Number(localData[key] || 0);
-    if (incoming > current) merged[key] = incoming;
-  });
-  if (localDownloadsClearedAt === dbDownloadsClearedAt) {
-    const currentDownloads = Number(merged.downloads || 0);
-    const incomingDownloads = Number(localData.downloads || 0);
-    if (incomingDownloads > currentDownloads) merged.downloads = incomingDownloads;
-  }
-  if (Array.isArray(merged.downloadsData)) merged.downloads = merged.downloadsData.length;
-  normalizeProfileArrayPayloads(merged);
-  return merged;
 }
 
 function normalizeMaintenanceState(data = {}) {
