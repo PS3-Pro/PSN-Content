@@ -1224,6 +1224,7 @@ input:checked+.slider:before { transform: translateX(20px); }
 .chat-mode-status-tag.sync.synced { color: #96ff9c; border-color: rgba(76,175,80,0.42); background: linear-gradient(135deg,rgba(76,175,80,0.14),rgba(0,0,0,0.34)); box-shadow: inset 0 1px 0 rgba(255,255,255,0.05),0 0 14px rgba(76,175,80,0.12); }
 .chat-mode-status-tag.sync.syncing { color: #ffdf73; border-color: rgba(255,204,0,0.42); background: linear-gradient(135deg,rgba(255,204,0,0.14),rgba(0,0,0,0.34)); box-shadow: inset 0 1px 0 rgba(255,255,255,0.05),0 0 14px rgba(255,204,0,0.12); }
 .chat-mode-status-tag.sync.offline { color: #ff8585; border-color: rgba(255,68,68,0.42); background: linear-gradient(135deg,rgba(255,68,68,0.14),rgba(0,0,0,0.34)); box-shadow: inset 0 1px 0 rgba(255,255,255,0.05),0 0 14px rgba(255,68,68,0.12); }
+.chat-mode-status-tag.offline { color: #ff8585; border-color: rgba(255,68,68,0.45); background: linear-gradient(135deg,rgba(255,68,68,0.16),rgba(0,0,0,0.34)); box-shadow: inset 0 1px 0 rgba(255,255,255,0.05),0 0 14px rgba(255,68,68,0.14); min-width: 72px; justify-content: center; }
 .chat-mode-status-tag.sync.local { color: var(--text-muted); border-color: rgba(255,255,255,0.14); background: rgba(0,0,0,0.28); box-shadow: inset 0 1px 0 rgba(255,255,255,0.05); }
 .chat-mode-status-tag i { font-size: 10px; }
 .chat-mode-status-tag[data-stable="true"] { animation: none; }
@@ -1237,8 +1238,10 @@ input:checked+.slider:before { transform: translateX(20px); }
 #chat-input.chat-control-slow { border-color: rgba(255,204,0,0.52) !important; background: rgba(45,35,0,0.20) !important; box-shadow: inset 0 0 0 1px rgba(255,204,0,0.10),0 0 14px rgba(255,204,0,0.10); }
 #chat-input.chat-control-bypass { border-color: rgba(0,188,255,0.50) !important; background: rgba(0,188,255,0.06) !important; box-shadow: inset 0 0 0 1px rgba(0,188,255,0.10),0 0 14px rgba(0,188,255,0.10); }
 #chat-input.chat-control-waiting, #chat-input.chat-control-locked[contenteditable="false"] { opacity: 0.72; filter: grayscale(0.25); cursor: not-allowed !important; }
+#chat-input.chat-connection-unavailable { opacity: 0.68; filter: grayscale(0.30); cursor: not-allowed !important; border-color: rgba(255,68,68,0.48) !important; background: rgba(45,0,10,0.18) !important; box-shadow: inset 0 0 0 1px rgba(255,68,68,0.10),0 0 14px rgba(255,68,68,0.10) !important; }
 #chat-input.chat-control-waiting:empty::before { color: rgba(255,223,115,0.55) !important; }
 #chat-input.chat-control-locked:empty::before { color: rgba(255,133,133,0.55) !important; }
+#chat-input.chat-connection-unavailable:empty::before { color: rgba(255,133,133,0.50) !important; }
 .chat-control-disabled-btn { opacity: 0.35 !important; filter: grayscale(0.65); pointer-events: none !important; cursor: not-allowed !important; transform: none !important; box-shadow: none !important; }
 .chat-toolbar.chat-toolbar-locked .tool-btn { opacity: 0.35 !important; filter: grayscale(0.65); pointer-events: none !important; cursor: not-allowed !important; }
 .chat-toolbar.chat-toolbar-locked .tool-btn.active { background: rgba(255,255,255,0.04) !important; color: var(--text-muted) !important; border-color: rgba(255,255,255,0.1) !important; }
@@ -23074,15 +23077,17 @@ P
 		const state = adminGetChatControlsUiState();
 		const tagBox = document.getElementById('admin-chat-controls-status-tags');
 		const syncEl = document.getElementById('admin-chat-controls-sync');
+		const isConnected = !!(typeof socketChat !== 'undefined' && socketChat && socketChat.connected);
+		const isConnectionUnavailable = !isConnected;
 		if (tagBox) {
 			const tagList = [];
+			if (isConnectionUnavailable) tagList.push({ kind: 'offline', icon: 'fa-cloud-slash', text: 'Offline' });
 			if (state.locked) tagList.push({ kind: 'locked', icon: 'fa-lock', text: `Locked by ${state.by || 'Admin'}` });
 			if (state.slowSeconds > 0) tagList.push({ kind: 'slow', icon: 'fa-clock', text: `Slow ${state.slowSeconds}s` });
 			if (!state.locked && !(state.slowSeconds > 0)) tagList.push({ kind: 'open', icon: 'fa-unlock', text: 'Open' });
 			adminSyncChatControlTags(tagBox, tagList);
 		}
 		if (syncEl) {
-			const isConnected = !!(typeof socketChat !== 'undefined' && socketChat && socketChat.connected);
 			let syncState = isConnected ? (window.adminChatControlsSyncState || 'live') : 'offline';
 			if (syncState === 'local' && isConnected) syncState = 'live';
 			if (!isConnected) syncState = 'offline';
@@ -23133,7 +23138,7 @@ P
 		const input = document.getElementById('chat-input');
 		if (!input) return;
 		const source = input.dataset.interfacePlaceholderSource ||
-			(input.classList.contains('chat-control-waiting') ? 'Slow mode cooldown...' : 'Type a message');
+			(input.classList.contains('chat-connection-unavailable') ? 'Reconnecting...' : (input.classList.contains('chat-control-waiting') ? 'Slow mode cooldown...' : 'Type a message'));
 		setChatInputInterfacePlaceholder(input, source);
 	};
 
@@ -23142,14 +23147,15 @@ P
 		const isActive = !!state.locked || state.slowSeconds > 0;
 		const isLockedForUser = !!state.locked && !state.canBypass;
 		const isSlowWaitingForUser = !state.locked && !state.canBypass && state.slowSeconds > 0 && state.waitMs > 0;
-		const isDisabledForUser = isLockedForUser || isSlowWaitingForUser;
+		const isConnectionUnavailable = !(typeof socketChat !== 'undefined' && socketChat && socketChat.connected);
+		const isDisabledForUser = isLockedForUser || isSlowWaitingForUser || isConnectionUnavailable;
 		const input = document.getElementById('chat-input');
 		const inline = document.getElementById('chat-control-inline-banner');
 		const tagBox = document.getElementById('chat-mode-status-tags');
 		const wait = Math.ceil((state.waitMs || 0) / 1000);
 
 		if (input) {
-			input.classList.remove('chat-control-locked', 'chat-control-slow', 'chat-control-bypass', 'chat-control-waiting');
+			input.classList.remove('chat-control-locked', 'chat-control-slow', 'chat-control-bypass', 'chat-control-waiting', 'chat-connection-unavailable');
 			setChatInputInterfacePlaceholder(input, 'Type a message');
 
 			if (isLockedForUser) {
@@ -23163,6 +23169,10 @@ P
 				setChatInputInterfacePlaceholder(input, 'Slow mode cooldown...');
 				if (!input.dataset.adminSlowDraft) input.dataset.adminSlowDraft = input.innerHTML || '';
 				input.innerHTML = '';
+			} else if (isConnectionUnavailable) {
+				input.classList.add('chat-connection-unavailable');
+				input.setAttribute('contenteditable', 'false');
+				setChatInputInterfacePlaceholder(input, 'Reconnecting...');
 			} else {
 				input.setAttribute('contenteditable', 'true');
 				if (input.dataset.adminLockedDraft !== undefined) {
@@ -23183,10 +23193,11 @@ P
 			}
 		}
 
-		adminSetChatComposerButtonState(isDisabledForUser, isLockedForUser ? `Chat locked by ${state.by || 'Admin'}` : (isSlowWaitingForUser ? `Slow mode: wait ${wait}s` : 'Chat controls active'), isLockedForUser);
+		adminSetChatComposerButtonState(isDisabledForUser, isLockedForUser ? `Chat locked by ${state.by || 'Admin'}` : (isSlowWaitingForUser ? `Slow mode: wait ${wait}s` : (isConnectionUnavailable ? 'Reconnecting to chat...' : 'Chat controls active')), isLockedForUser);
 
 		if (tagBox) {
 			const tagList = [];
+			if (isConnectionUnavailable) tagList.push({ kind: 'offline', icon: 'fa-cloud-slash', text: 'Offline' });
 			if (state.locked) tagList.push({ kind: 'locked', icon: 'fa-lock', text: `Locked by ${state.by || 'Admin'}` });
 			if (state.slowSeconds > 0) {
 				const slowLabel = (!state.canBypass && wait > 0) ? `${wait}s` : `Slow ${state.slowSeconds}s`;
@@ -41356,6 +41367,7 @@ function getVisibleChatStackEl(id) {
 			timeout: 12000,
 			closeOnBeforeunload: false
 		})
+		if (typeof adminUpdateChatControlsBanner === 'function') adminUpdateChatControlsBanner();
 		
 		socketChat.on('connect', () => {
 			markServerConnectionAvailable();
@@ -41374,6 +41386,7 @@ function getVisibleChatStackEl(id) {
 				loginServerAttempt.trySend();
 			}
 			if (typeof updateGlobalOnlineStatus === 'function') updateGlobalOnlineStatus('online');
+			if (typeof adminUpdateChatControlsBanner === 'function') adminUpdateChatControlsBanner();
 		
 			const myName = localStorage.getItem('psn_username');
 			const myPass = myName ? localStorage.getItem(`${myName}_psn_password`) : null;
@@ -42865,6 +42878,7 @@ function getVisibleChatStackEl(id) {
 			}
 			
 			if (typeof updateGlobalOnlineStatus === 'function') updateGlobalOnlineStatus('connecting');
+			if (typeof adminUpdateChatControlsBanner === 'function') adminUpdateChatControlsBanner();
 			const s = document.getElementById('chat-status-text');
 			const failedServerIndex = currentServerIndex;
 			
@@ -42905,6 +42919,7 @@ function getVisibleChatStackEl(id) {
 			}
 			
 			if (typeof updateGlobalOnlineStatus === 'function') updateGlobalOnlineStatus('offline');
+			if (typeof adminUpdateChatControlsBanner === 'function') adminUpdateChatControlsBanner();
 			const s = document.getElementById('chat-status-text');
 			if (s) { s.innerText = "(Disconnected)"; s.style.color = "#ffbb33"; }
 		});
@@ -42913,10 +42928,12 @@ function getVisibleChatStackEl(id) {
 			socketChat.io.on('reconnect_attempt', () => {
 				if (typeof resetChatOnlinePresenceUi === 'function') resetChatOnlinePresenceUi();
 				if (typeof updateGlobalOnlineStatus === 'function') updateGlobalOnlineStatus('connecting');
+				if (typeof adminUpdateChatControlsBanner === 'function') adminUpdateChatControlsBanner();
 			});
 			socketChat.io.on('reconnect', () => {
 				markServerConnectionAvailable();
 				if (typeof updateGlobalOnlineStatus === 'function') updateGlobalOnlineStatus('online');
+				if (typeof adminUpdateChatControlsBanner === 'function') adminUpdateChatControlsBanner();
 				if (typeof isTrendingViewVisible === 'function' && isTrendingViewVisible()) setTimeout(() => socketChat.emit('request_trending'), 700);
 			});
 		}
@@ -43436,7 +43453,11 @@ function getVisibleChatStackEl(id) {
 	};
 	
     function sendChatMessage() {
-		if (!socketChat) return;
+		if (!socketChat || !socketChat.connected) {
+			if (typeof playUiError === 'function') playUiError();
+			if (typeof adminUpdateChatControlsBanner === 'function') adminUpdateChatControlsBanner();
+			return;
+		}
 		const input = document.getElementById('chat-input');
 
 		if (typeof blockChatSendWhileUploading === 'function' && blockChatSendWhileUploading()) return;
