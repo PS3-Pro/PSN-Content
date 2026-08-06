@@ -2418,6 +2418,48 @@ function emitProfileCountsUpdate(name, user = null) {
   });
 }
 
+function buildPresenceUpdatePayload(name, user = null) {
+  if (!name) return null;
+  const source = user || userDatabase[name];
+  if (!source) return null;
+  return {
+    name,
+    id: source.online === true ? (source.id || null) : null,
+    online: source.online === true,
+    lastSeen: normalizeTimestampValue(source.lastSeen) || null,
+    avatar: source.avatar || DEFAULT_AVATAR,
+    level: Number(source.level || 1),
+    joined: source.joined || '2026',
+    countryCode: getUserCountryCode(source),
+    role: getUserRole(name, source),
+    isAdmin: isUserAdmin(name, source),
+    banned: isUserBanned(source),
+    ps3Status: source.online === true ? (source.ps3Status || null) : null,
+    downloads: Array.isArray(source.downloadsData) ? source.downloadsData.length : Number(source.downloads || 0),
+    wishlist: Array.isArray(source.wishlistData) ? source.wishlistData.length : Number(source.wishlist || 0),
+    favorites: Array.isArray(source.favoritesData) ? source.favoritesData.length : Number(source.favorites || 0),
+    trophies: Number(source.trophies || 0),
+    library: Array.isArray(source.libraryData) ? source.libraryData.length : Number(source.library || 0)
+  };
+}
+
+function emitPresenceUpdate(name, user = null) {
+  const payload = buildPresenceUpdatePayload(name, user);
+  if (!payload) return null;
+  io.emit('presence_update', payload);
+  return payload;
+}
+
+async function notifyPresenceAcrossInstances(name, user = null) {
+  const payload = buildPresenceUpdatePayload(name, user);
+  if (!payload) return;
+  try {
+    await pool.query('SELECT pg_notify($1, $2)', ['presence_sync', JSON.stringify({ ...payload, instanceId: INSTANCE_ID })]);
+  } catch (err) {
+    console.error('[PRESENCE NOTIFY ERROR]:', err);
+  }
+}
+
 function profileUpdateTouchesPublicCounts(userData = {}) {
   return !!(userData && [
     'downloadsData', 'downloads', 'downloadsClearedAt', 'downloadsUpdatedAt',
@@ -2513,7 +2555,7 @@ async function initProfileSyncNotifications() {
   profileSyncNotifyClient = client;
 
   client.on('notification', async (message) => {
-    if (!message || message.channel !== 'profile_sync') return;
+    if (!message || !['profile_sync', 'presence_sync'].includes(message.channel)) return;
 
     try {
       const data = JSON.parse(message.payload || '{}');
@@ -2523,6 +2565,21 @@ async function initProfileSyncNotifications() {
       const hasLocalSession = Array.from(io.sockets.sockets.values()).some(activeSocket => (
         activeSocket.connected && activeSocket.userName === name
       ));
+
+      if (message.channel === 'presence_sync') {
+        if (!userDatabase[name]) await refreshSingleUserSummaryFromDb(name);
+        if (!userDatabase[name]) return;
+
+        const incomingLastSeen = normalizeTimestampValue(data.lastSeen);
+        userDatabase[name].online = hasLocalSession ? true : data.online === true;
+        if (data.online === true && data.id) userDatabase[name].id = data.id;
+        if (incomingLastSeen) userDatabase[name].lastSeen = Math.max(Number(userDatabase[name].lastSeen || 0), incomingLastSeen);
+        if (Object.prototype.hasOwnProperty.call(data, 'ps3Status')) userDatabase[name].ps3Status = data.ps3Status || null;
+        invalidateOnlineListCache('presence-listen');
+        emitPresenceUpdate(name, userDatabase[name]);
+        deferServerTask('PRESENCE LISTEN ONLINE LIST', () => emitOnlineList(), 80);
+        return;
+      }
 
       const refreshedUser = hasLocalSession
         ? await refreshSingleUserCacheFromDb(name)
@@ -2547,7 +2604,7 @@ async function initProfileSyncNotifications() {
       invalidateOnlineListCache("profile-sync-listen");
       deferServerTask('PROFILE LISTEN ONLINE LIST', () => emitOnlineList(), 1000);
     } catch (err) {
-      console.error('[PROFILE LISTEN ERROR]:', err);
+      console.error(`[${message && message.channel === 'presence_sync' ? 'PRESENCE' : 'PROFILE'} LISTEN ERROR]:`, err);
     }
   });
 
@@ -2566,7 +2623,9 @@ async function initProfileSyncNotifications() {
   try {
     await client.connect();
     await client.query('LISTEN profile_sync');
+    await client.query('LISTEN presence_sync');
     console.log('[PROFILE SYNC] Postgres LISTEN enabled.');
+    console.log('[PRESENCE SYNC] Postgres LISTEN enabled.');
   } catch (err) {
     if (profileSyncNotifyClient === client) profileSyncNotifyClient = null;
     console.error('[PROFILE LISTEN INIT ERROR]:', err && err.message ? err.message : err);
@@ -2586,6 +2645,7 @@ function disconnectUserSessions(name, eventName = 'user_kicked', payload = {}) {
 
 async function upsertPresenceForSocket(socket, name) {
   if (!socket || !name) return;
+  const shouldAnnouncePresence = socket.__presenceAnnounced !== true;
   if (userDatabase[name]) {
     userDatabase[name].online = true;
     userDatabase[name].id = socket.id;
@@ -2603,6 +2663,11 @@ async function upsertPresenceForSocket(socket, name) {
     userDatabase[name].lastSeen = Date.now();
   }
   invalidateOnlineListCache('presence-upsert');
+  if (shouldAnnouncePresence && userDatabase[name]) {
+    socket.__presenceAnnounced = true;
+    emitPresenceUpdate(name, userDatabase[name]);
+    deferServerTask('PRESENCE ONLINE NOTIFY', () => notifyPresenceAcrossInstances(name, userDatabase[name]), 0);
+  }
 }
 
 async function removePresenceForSocket(socket) {
@@ -2612,6 +2677,11 @@ async function removePresenceForSocket(socket) {
 }
 
 async function syncPresenceOnlineFromDb() {
+  const previousOnlineState = new Map(Object.entries(userDatabase).map(([username, user]) => [
+    username,
+    { online: user && user.online === true, lastSeen: Number(user && user.lastSeen || 0) }
+  ]));
+
   await pool.query(`DELETE FROM presence_sessions WHERE last_seen < NOW() - INTERVAL '90 seconds'`);
 
   const presenceRes = await pool.query(`
@@ -2636,6 +2706,13 @@ async function syncPresenceOnlineFromDb() {
   });
 
   invalidateOnlineListCache("presence-sync");
+
+  Object.entries(userDatabase).forEach(([username, user]) => {
+    const previous = previousOnlineState.get(username);
+    if (!previous || previous.online === (user && user.online === true)) return;
+    emitPresenceUpdate(username, user);
+  });
+
   return userDatabase;
 }
 
@@ -4364,6 +4441,9 @@ io.on('connection', (socket) => {
         invalidateOnlineListCache('disconnect-presence-save');
         deferServerTask('LOGOUT SERVER LOG', () => addServerLog('logout', `${name} disconnected`, { socketId: socket.id }, name), 0);
       }
+
+      const presencePayload = emitPresenceUpdate(name, userDatabase[name]);
+      if (presencePayload) deferServerTask('PRESENCE DISCONNECT NOTIFY', () => notifyPresenceAcrossInstances(name, userDatabase[name]), 0);
 
       const stillHasLocalSession = getSocketsByUserName(name).some(client => client && client.connected);
       if (!stillHasLocalSession) compactCachedUser(name);

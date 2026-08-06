@@ -23527,6 +23527,8 @@ P
 		else localStorage.removeItem(`${name}_psn_role`);
 		if (user.isAdmin === true || role === 'admin') safeLocalStorageSet(`${name}_psn_isAdmin`, 'true');
 		else if (user.isAdmin === false && role !== 'admin') localStorage.removeItem(`${name}_psn_isAdmin`);
+		const incomingLastSeen = Number(user.lastSeen || user.last_seen || 0);
+		if (incomingLastSeen > 0) safeLocalStorageSet(`${name}_psn_lastSeen`, String(incomingLastSeen));
 
 		if (explicitBan) {
 			safeLocalStorageSet(`${name}_psn_isBanned`, 'true');
@@ -42725,6 +42727,90 @@ function getVisibleChatStackEl(id) {
 		});
 
 		
+
+		socketChat.on('presence_update', function(data = {}) {
+			try {
+				const name = String(data.name || '').trim();
+				if (!name || name === 'Guest') return;
+
+				const online = data.online === true;
+				const lastSeen = Number(data.lastSeen || 0) || Date.now();
+				safeLocalStorageSet(`${name}_psn_lastSeen`, String(lastSeen));
+				if (data.avatar) safeLocalStorageSet(`${name}_psn_avatar`, data.avatar);
+				if (data.level) safeLocalStorageSet(`${name}_psn_level`, String(data.level));
+				if (data.joined) safeLocalStorageSet(`${name}_psn_joined`, String(data.joined));
+				if (typeof window.syncPsnUserMeta === 'function') window.syncPsnUserMeta(data);
+
+				if (!Array.isArray(currentOnlineList)) currentOnlineList = [];
+				const onlineIndex = currentOnlineList.findIndex(user => user && (user.name || user) === name);
+				if (online) {
+					if (onlineIndex >= 0) currentOnlineList[onlineIndex] = { ...currentOnlineList[onlineIndex], ...data, online: true };
+					else currentOnlineList.push({ ...data, online: true });
+				} else if (onlineIndex >= 0) {
+					currentOnlineList.splice(onlineIndex, 1);
+				}
+				window.currentOnlineList = currentOnlineList;
+
+				const mergePresence = list => {
+					if (!Array.isArray(list)) return;
+					const item = list.find(user => user && (user.name || user) === name);
+					if (!item || typeof item !== 'object') return;
+					Object.assign(item, data, { online });
+				};
+				mergePresence(window.globalSearchResults);
+				mergePresence(window.adminAllUsers);
+
+				if (Array.isArray(window.friendsList)) {
+					const friend = window.friendsList.find(item => item && (item.name || item) === name);
+					if (friend && typeof friend === 'object') {
+						friend.lastSeen = lastSeen;
+						if (data.avatar) friend.avatar = data.avatar;
+						if (data.level) friend.level = data.level;
+						if (data.role) friend.role = data.role;
+						if (Object.prototype.hasOwnProperty.call(data, 'ps3Status')) friend.ps3Status = data.ps3Status || null;
+						saveState(STORAGE_KEY_FRIENDS, JSON.stringify(window.friendsList));
+					}
+				}
+
+				const countElement = document.getElementById('online-count');
+				if (countElement) countElement.innerText = `${currentOnlineList.filter(user => user && user.online === true).length} Online`;
+
+				const profileModal = document.getElementById('modal-sys-profile');
+				const openedUser = profileModal?.dataset?.profileUsername || document.getElementById('profile-name-val')?.innerText || '';
+				const profileVisible = !!(profileModal && (profileModal.style.display === 'flex' || profileModal.style.display === 'block' || profileModal.classList.contains('show')));
+				if (profileVisible && openedUser === name) {
+					const statusText = document.getElementById('card-status-text');
+					const statusIcon = document.getElementById('card-status-icon');
+					const statusContainer = document.getElementById('card-status-container');
+					const cardAvatar = document.getElementById('card-avatar');
+					if (cardAvatar && data.avatar) cardAvatar.src = data.avatar;
+					if (statusText && statusIcon && statusContainer) {
+						statusIcon.className = 'fas fa-circle';
+						statusIcon.style.display = 'block';
+						if (online) {
+							statusText.innerText = 'Status: Online';
+							statusContainer.style.color = '#4caf50';
+							statusIcon.classList.add('status-pulsing-full');
+						} else {
+							statusText.innerText = `Last seen: ${typeof formatLastSeen === 'function' ? formatLastSeen(lastSeen) : 'Offline'}`;
+							statusContainer.style.color = '#8b96a8';
+							statusIcon.classList.remove('status-pulsing-full');
+						}
+					}
+				}
+
+				if (typeof isFriendsSubviewVisible === 'function' && isFriendsSubviewVisible() && typeof renderFriendsList === 'function') {
+					renderFriendsList(document.getElementById('search-input')?.value || '', true);
+				}
+
+				const onlineModal = document.getElementById('modal-sys-online');
+				if (onlineModal && (onlineModal.style.display === 'flex' || onlineModal.classList.contains('show')) && typeof renderOnlineList === 'function') renderOnlineList();
+				if (document.getElementById('view-admin')?.style.display === 'block' && typeof renderAdminPanel === 'function') renderAdminPanel();
+				if (typeof applyChatPresenceUiRefresh === 'function') applyChatPresenceUiRefresh(currentOnlineList);
+			} catch (err) {
+				console.warn('[PRESENCE] Could not apply realtime presence update:', err);
+			}
+		});
 
 		socketChat.on('profile_counts_update', function(data = {}) {
 			try {
