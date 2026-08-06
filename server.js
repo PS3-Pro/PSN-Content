@@ -295,7 +295,7 @@ let globalTrophyStatsCacheAt = 0;
 let globalTrophyStatsBuildInFlight = null;
 let trendingRefreshTimer = null;
 let trophyStatsRefreshTimer = null;
-const TRENDING_CACHE_MS = Math.max(10000, parseInt(process.env.TRENDING_CACHE_MS || '60000', 10) || 60000);
+const TRENDING_CACHE_MS = Math.max(10000, parseInt(process.env.TRENDING_CACHE_MS || '300000', 10) || 300000);
 const TROPHY_STATS_CACHE_MS = Math.max(10000, parseInt(process.env.TROPHY_STATS_CACHE_MS || '30000', 10) || 30000);
 let messageHistory = [];
 let lastChatDbId = 0;
@@ -1856,16 +1856,26 @@ function buildContentDownloadCountsPayload(counts = {}) {
   };
 }
 
+function buildTrendingViewPayload(payload = {}) {
+  return {
+    topDownloads: Array.isArray(payload.topDownloads) ? payload.topDownloads : [],
+    topWishlist: Array.isArray(payload.topWishlist) ? payload.topWishlist : [],
+    ...(payload.stale === true ? { stale: true } : {}),
+    ...(payload.unavailable === true ? { unavailable: true } : {})
+  };
+}
+
 async function emitTrendingFromDb(targetSocket = null, options = {}) {
   try {
     const payload = await getTrendingActivity(options);
     const downloadCountsPayload = buildContentDownloadCountsPayload(payload.contentDownloadCounts);
 
+    const trendingViewPayload = buildTrendingViewPayload(payload);
     if (targetSocket && targetSocket.connected) {
-      targetSocket.emit('trending_data', payload);
+      targetSocket.emit('trending_data', trendingViewPayload);
       targetSocket.emit('content_download_counts', downloadCountsPayload);
     } else {
-      io.emit('trending_data', payload);
+      io.emit('trending_data', trendingViewPayload);
       io.emit('content_download_counts', downloadCountsPayload);
     }
     return payload;
@@ -1878,7 +1888,7 @@ async function emitTrendingFromDb(targetSocket = null, options = {}) {
     fallbackDownloadCountsPayload.stale = fallbackPayload.stale === true;
     fallbackDownloadCountsPayload.unavailable = fallbackPayload.unavailable === true;
     if (targetSocket && targetSocket.connected) {
-      targetSocket.emit('trending_data', fallbackPayload);
+      targetSocket.emit('trending_data', buildTrendingViewPayload(fallbackPayload));
       targetSocket.emit('content_download_counts', fallbackDownloadCountsPayload);
     }
     return fallbackPayload;
@@ -3407,11 +3417,10 @@ io.on('connection', (socket) => {
       await emitTrendingFromDb(socket);
     } catch (err) {
       console.error('[TRENDING DB ERROR]:', err);
-      socket.emit('trending_data', trendingCache || {
+      socket.emit('trending_data', buildTrendingViewPayload(trendingCache || {
         topDownloads: [],
-        topWishlist: [],
-        contentDownloadCounts: {}
-      });
+        topWishlist: []
+      }));
       socket.emit('content_download_counts', buildContentDownloadCountsPayload((trendingCache && trendingCache.contentDownloadCounts) || {}));
     }
   });

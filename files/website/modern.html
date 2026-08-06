@@ -14185,7 +14185,12 @@ P
 	
 			let gameData = null;
 			let gameCategory = 'games';
-			if (window.psnStoreCache) {
+			const indexedStoreItem = typeof window.findPsnStoreItemById === 'function' ? window.findPsnStoreItemById(item.id) : null;
+			if (indexedStoreItem && allowedCats.includes(indexedStoreItem.category)) {
+				gameData = indexedStoreItem.item;
+				gameCategory = indexedStoreItem.category;
+			}
+			if (!gameData && window.psnStoreCache) {
 				for (const cat of allowedCats) {
 					if (window.psnStoreCache[cat]) {
 						gameData = window.psnStoreCache[cat].find(g => g.id === item.id || g.titleId === item.id);
@@ -17301,7 +17306,6 @@ P
 	/* ========================================================================== CONTENT DOWNLOAD COUNTS ========================================================================== */
 	window.contentDownloadCounts = window.contentDownloadCounts || Object.create(null);
 	window.contentDownloadCountsReady = window.contentDownloadCountsReady === true;
-	window.__contentDownloadCountsRequestAt = Number(window.__contentDownloadCountsRequestAt || 0);
 	const CONTENT_DOWNLOAD_COUNTS_CACHE_KEY = 'psn_global_content_download_counts_v2';
 
 	window.normalizeDownloadCountCategory = function(value) {
@@ -17389,26 +17393,7 @@ P
 		return true;
 	};
 
-	window.requestContentDownloadCounts = function(force = false) {
-		if (!(typeof socketChat !== 'undefined' && socketChat && socketChat.connected)) return false;
-		const now = Date.now();
-		if (!force && now - window.__contentDownloadCountsRequestAt < 30000) return false;
-		window.__contentDownloadCountsRequestAt = now;
-		const accept = response => {
-			if (!response || response.success === false) return;
-			window.setContentDownloadCounts(response);
-		};
-		try {
-			if (typeof socketChat.timeout === 'function') {
-				socketChat.timeout(8000).emit('request_content_download_counts', { at: now }, (err, response) => {
-					if (!err) accept(response);
-				});
-			} else {
-				socketChat.emit('request_content_download_counts', { at: now }, accept);
-			}
-		} catch (err) {}
-		return true;
-	};
+
 
 	(function clearLegacyContentDownloadCountsCache() {
 		try { localStorage.removeItem(CONTENT_DOWNLOAD_COUNTS_CACHE_KEY); } catch (err) {}
@@ -41312,7 +41297,10 @@ function getVisibleChatStackEl(id) {
 			window.__psnAutoReauthInProgress = false;
 			window.__psnAutoReauthUser = null;
 			const { name, userData, isAdmin, role, isModerator } = data;
-			if (typeof window.requestContentDownloadCounts === 'function') setTimeout(() => window.requestContentDownloadCounts(true), 1800);
+			setTimeout(() => {
+				if (!(typeof socketChat !== 'undefined' && socketChat && socketChat.connected)) return;
+				if (!window.__pendingTrendingData || !window.contentDownloadCountsReady) socketChat.emit('request_trending');
+			}, 1800);
 			window.__serverProfileHydratedUser = name;
 			window.__lastAppliedProfileUpdatedAt = Number((userData && userData.profileUpdatedAt) || 0);
 			const isLightAuthPayload = data && (data.lightAuth === true || data.fullProfileDeferred === true || (userData && userData._lightAuth === true));
