@@ -14375,7 +14375,12 @@ P
 		window.trendingCache[containerId] = cacheKey;
 	
 		if (!topList || topList.length === 0) {
-			container.innerHTML = skeletonHTML;
+			const unavailable = window.__trendingUnavailable === true;
+			container.innerHTML = `<div class="admin-users-empty-state" style="width:100%; min-height:180px;">
+				<div class="admin-users-empty-icon"><i class="fas ${unavailable ? 'fa-wifi' : 'fa-chart-line'}"></i></div>
+				<div class="admin-users-empty-title">${unavailable ? 'Trending is temporarily unavailable' : 'No trending activity yet'}</div>
+				<p class="admin-users-empty-desc">${unavailable ? 'The database connection is recovering. This view will refresh automatically when data is available.' : 'Download and wishlist activity will appear here as users interact with the store.'}</p>
+			</div>`;
 			container.dataset.countAwareTotal = '0';
 			if (typeof window.updateCountAwareSectionTitle === 'function') window.updateCountAwareSectionTitle(containerId, 0);
 			return;
@@ -14484,8 +14489,12 @@ P
 		if (typeof window.updateCountAwareSectionTitle === 'function') window.updateCountAwareSectionTitle(containerId, displayRank);
 
 		if (html === '') {
-			container.innerHTML = skeletonHTML;
-			if (typeof setupSkeletonAnimations === 'function') setupSkeletonAnimations(containerId);
+			if (window.__trendingUnavailable === true) {
+				container.innerHTML = '<div class="admin-users-empty-state" style="width:100%; min-height:180px;"><div class="admin-users-empty-icon"><i class="fas fa-wifi"></i></div><div class="admin-users-empty-title">Trending is temporarily unavailable</div><p class="admin-users-empty-desc">The database connection is recovering. This view will refresh automatically when data is available.</p></div>';
+			} else {
+				container.innerHTML = skeletonHTML;
+				if (typeof setupSkeletonAnimations === 'function') setupSkeletonAnimations(containerId);
+			}
 		} else {
 			container.innerHTML = html;
 			if (typeof setupRevealAnimations === 'function') setupRevealAnimations(containerId);
@@ -17597,11 +17606,7 @@ P
 
 		window.contentDownloadCounts = counts;
 		window.contentDownloadCountsReady = true;
-		if (options.save !== false) {
-			try {
-				safeLocalStorageSet(CONTENT_DOWNLOAD_COUNTS_CACHE_KEY, JSON.stringify({ updatedAt: Date.now(), counts }));
-			} catch (err) {}
-		}
+		try { localStorage.removeItem(CONTENT_DOWNLOAD_COUNTS_CACHE_KEY); } catch (err) {}
 		window.applyContentDownloadCountsToCards(document);
 		return true;
 	};
@@ -17627,13 +17632,8 @@ P
 		return true;
 	};
 
-	(function loadCachedContentDownloadCounts() {
-		try {
-			const cached = JSON.parse(localStorage.getItem(CONTENT_DOWNLOAD_COUNTS_CACHE_KEY) || 'null');
-			if (cached && cached.counts && typeof cached.counts === 'object') {
-				window.setContentDownloadCounts(cached.counts, { save: false });
-			}
-		} catch (err) {}
+	(function clearLegacyContentDownloadCountsCache() {
+		try { localStorage.removeItem(CONTENT_DOWNLOAD_COUNTS_CACHE_KEY); } catch (err) {}
 	})();
 
     function applyFilters() {
@@ -41291,8 +41291,61 @@ function getVisibleChatStackEl(id) {
 		return String(serverUrls[normalizedIndex] || normalizedIndex);
 	}
 
+	const LOGIN_SINGLE_SERVER_RECONNECT_GRACE_MS = 6500;
+	const LOGIN_TRANSIENT_AUTH_RETRY_LIMIT = 1;
+
 	function clearLoginServerAttemptTimers(attempt) {
 		if (!attempt) return;
+		if (attempt.reconnectGraceTimer) {
+			clearTimeout(attempt.reconnectGraceTimer);
+			attempt.reconnectGraceTimer = null;
+		}
+		if (attempt.authRetryTimer) {
+			clearTimeout(attempt.authRetryTimer);
+			attempt.authRetryTimer = null;
+		}
+	}
+
+	function holdSingleServerLoginForReconnect(reason = 'connection lost') {
+		const attempt = loginServerAttempt;
+		if (!attempt || getLoginServerCount() !== 1) return false;
+		attempt.emitted = false;
+		attempt.emittedServerIndex = null;
+		if (attempt.reconnectGraceTimer) clearTimeout(attempt.reconnectGraceTimer);
+		console.warn(`[AUTH] Temporary ${reason} during ${attempt.mode === 'create' ? 'account creation' : 'sign-in'}. Waiting for the same server to reconnect before showing it as unavailable.`);
+		attempt.reconnectGraceTimer = setTimeout(() => {
+			attempt.reconnectGraceTimer = null;
+			if (!loginServerAttempt || loginServerAttempt.token !== attempt.token) return;
+			if (socketChat && socketChat.connected) {
+				if (typeof attempt.trySend === 'function') attempt.trySend();
+				return;
+			}
+			attempt.failedServers.add(getLoginServerKey(0));
+			window.handleLoginServerUnavailable(attempt.username, attempt.mode);
+		}, LOGIN_SINGLE_SERVER_RECONNECT_GRACE_MS);
+		return true;
+	}
+
+	function retrySingleServerTransientAuth(reason = 'temporary authentication error') {
+		const attempt = loginServerAttempt;
+		if (!attempt || getLoginServerCount() !== 1) return false;
+		attempt.transientAuthRetries = Number(attempt.transientAuthRetries || 0) + 1;
+		if (attempt.transientAuthRetries > LOGIN_TRANSIENT_AUTH_RETRY_LIMIT) return false;
+		attempt.emitted = false;
+		attempt.emittedServerIndex = null;
+		if (attempt.authRetryTimer) clearTimeout(attempt.authRetryTimer);
+		const delay = attempt.transientAuthRetries === 1 ? 900 : 1800;
+		console.warn(`[AUTH] ${reason}. Retrying sign-in on the same server (${attempt.transientAuthRetries}/${LOGIN_TRANSIENT_AUTH_RETRY_LIMIT}) in ${delay}ms.`);
+		attempt.authRetryTimer = setTimeout(() => {
+			attempt.authRetryTimer = null;
+			if (!loginServerAttempt || loginServerAttempt.token !== attempt.token) return;
+			if (socketChat && socketChat.connected) {
+				if (typeof attempt.trySend === 'function') attempt.trySend();
+			} else {
+				holdSingleServerLoginForReconnect('connection loss');
+			}
+		}, delay);
+		return true;
 	}
 
 	function getNextUntestedLoginServerIndex(fromIndex, attempt) {
@@ -41423,6 +41476,9 @@ function getVisibleChatStackEl(id) {
 			emitted: false,
 			emittedServerIndex: null,
 			failedServers: new Set(),
+			transientAuthRetries: 0,
+			reconnectGraceTimer: null,
+			authRetryTimer: null,
 			trySend: null
 		};
 
@@ -41536,11 +41592,14 @@ function getVisibleChatStackEl(id) {
 				if (Number(window.__chatRealtimeBootstrapToken || 0) !== chatRealtimeConnectToken) return;
 				if (typeof bootstrapChatRealtime === 'function') bootstrapChatRealtime('socket-connect', { token: chatRealtimeConnectToken, attempt: 0 });
 			}, 180);
+			if (loginServerAttempt && loginServerAttempt.reconnectGraceTimer) {
+				clearTimeout(loginServerAttempt.reconnectGraceTimer);
+				loginServerAttempt.reconnectGraceTimer = null;
+			}
 			if (loginServerAttempt && !loginServerAttempt.emitted && typeof loginServerAttempt.trySend === 'function') {
 				loginServerAttempt.trySend();
 			}
 			if (typeof updateGlobalOnlineStatus === 'function') updateGlobalOnlineStatus('online');
-			if (typeof window.requestContentDownloadCounts === 'function') setTimeout(() => window.requestContentDownloadCounts(true), 300);
 		
 			const myName = localStorage.getItem('psn_username');
 			const myPass = myName ? localStorage.getItem(`${myName}_psn_password`) : null;
@@ -41626,6 +41685,7 @@ function getVisibleChatStackEl(id) {
 			window.__psnAutoReauthInProgress = false;
 			window.__psnAutoReauthUser = null;
 			const { name, userData, isAdmin, role, isModerator } = data;
+			if (typeof window.requestContentDownloadCounts === 'function') setTimeout(() => window.requestContentDownloadCounts(true), 1800);
 			window.__serverProfileHydratedUser = name;
 			window.__lastAppliedProfileUpdatedAt = Number((userData && userData.profileUpdatedAt) || 0);
 			const isLightAuthPayload = data && (data.lightAuth === true || data.fullProfileDeferred === true || (userData && userData._lightAuth === true));
@@ -41838,6 +41898,7 @@ function getVisibleChatStackEl(id) {
 			if (hadInteractiveLoginAttempt && !isAutoReauth && isTransientAuthError) {
 				window.__psnAutoReauthInProgress = false;
 				window.__psnAutoReauthUser = null;
+				if (retrySingleServerTransientAuth('Temporary server/database authentication error')) return;
 				const failedIndex = loginServerAttempt && Number.isInteger(loginServerAttempt.emittedServerIndex)
 					? loginServerAttempt.emittedServerIndex
 					: currentServerIndex;
@@ -42959,12 +43020,19 @@ function getVisibleChatStackEl(id) {
 		});
 
 		socketChat.on('trending_data', (data) => {
+			window.__trendingUnavailable = !!(data && data.unavailable === true);
 			window.__pendingTrendingData = data;
 			if (data && data.contentDownloadCounts && typeof window.setContentDownloadCounts === 'function') {
 				window.setContentDownloadCounts(data.contentDownloadCounts);
 			}
 			if (typeof renderCachedTrendingIfVisible === 'function') {
 				renderCachedTrendingIfVisible();
+			}
+			if (window.__trendingUnavailable && typeof isTrendingViewVisible === 'function' && isTrendingViewVisible()) {
+				clearTimeout(window.__trendingRecoveryTimer);
+				window.__trendingRecoveryTimer = setTimeout(() => {
+					if (socketChat && socketChat.connected && isTrendingViewVisible()) socketChat.emit('request_trending');
+				}, 5000);
 			}
 		});
 
@@ -43027,7 +43095,9 @@ function getVisibleChatStackEl(id) {
 				const attemptServerIndex = Number.isInteger(loginServerAttempt.emittedServerIndex)
 					? loginServerAttempt.emittedServerIndex
 					: failedServerIndex;
-				failLoginServerAttemptServer(attemptServerIndex, 'connection error', { rotate: false });
+				if (!holdSingleServerLoginForReconnect('connection error')) {
+					failLoginServerAttemptServer(attemptServerIndex, 'connection error', { rotate: false });
+				}
 			}
 			
 			currentServerIndex = (currentServerIndex + 1) % serverUrls.length;
@@ -43051,7 +43121,9 @@ function getVisibleChatStackEl(id) {
 					const failedIndex = Number.isInteger(loginServerAttempt.emittedServerIndex)
 						? loginServerAttempt.emittedServerIndex
 						: currentServerIndex;
-					failLoginServerAttemptServer(failedIndex, 'connection lost', { rotate: true });
+					if (!holdSingleServerLoginForReconnect('connection loss')) {
+						failLoginServerAttemptServer(failedIndex, 'connection lost', { rotate: true });
+					}
 				}
 			}
 			
@@ -43068,6 +43140,7 @@ function getVisibleChatStackEl(id) {
 			socketChat.io.on('reconnect', () => {
 				markServerConnectionAvailable();
 				if (typeof updateGlobalOnlineStatus === 'function') updateGlobalOnlineStatus('online');
+				if (typeof isTrendingViewVisible === 'function' && isTrendingViewVisible()) setTimeout(() => socketChat.emit('request_trending'), 700);
 			});
 		}
 

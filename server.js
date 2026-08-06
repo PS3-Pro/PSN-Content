@@ -42,12 +42,12 @@ const ADMIN_STATE_KEYS = {
   pinnedAnnouncement: "pinned_announcement"
 };
 
-const PG_POOL_MAX = Math.max(1, Math.min(5, parseInt(process.env.PG_POOL_MAX || process.env.DB_POOL_MAX || "3", 10) || 3));
-const PG_CONNECTION_TIMEOUT_MS = Math.max(1000, parseInt(process.env.PG_CONNECTION_TIMEOUT_MS || "5000", 10) || 5000);
-const PG_IDLE_TIMEOUT_MS = Math.max(5000, parseInt(process.env.PG_IDLE_TIMEOUT_MS || "10000", 10) || 10000);
-const PG_QUERY_TIMEOUT_MS = Math.max(5000, parseInt(process.env.PG_QUERY_TIMEOUT_MS || "20000", 10) || 20000);
-const PG_STATEMENT_TIMEOUT_MS = Math.max(5000, parseInt(process.env.PG_STATEMENT_TIMEOUT_MS || "15000", 10) || 15000);
-const PG_MAX_USES = Math.max(100, parseInt(process.env.PG_MAX_USES || "750", 10) || 750);
+const PG_POOL_MAX = Math.max(1, Math.min(5, parseInt(process.env.PG_POOL_MAX || process.env.DB_POOL_MAX || "5", 10) || 5));
+const PG_CONNECTION_TIMEOUT_MS = Math.max(3000, parseInt(process.env.PG_CONNECTION_TIMEOUT_MS || "10000", 10) || 10000);
+const PG_IDLE_TIMEOUT_MS = Math.max(30000, parseInt(process.env.PG_IDLE_TIMEOUT_MS || "120000", 10) || 120000);
+const PG_QUERY_TIMEOUT_MS = Math.max(5000, parseInt(process.env.PG_QUERY_TIMEOUT_MS || "25000", 10) || 25000);
+const PG_STATEMENT_TIMEOUT_MS = Math.max(5000, parseInt(process.env.PG_STATEMENT_TIMEOUT_MS || "20000", 10) || 20000);
+const PG_MAX_USES = Math.max(0, parseInt(process.env.PG_MAX_USES || "0", 10) || 0);
 const ONLINE_LIST_CACHE_MS = Math.max(250, parseInt(process.env.ONLINE_LIST_CACHE_MS || "1200", 10) || 1200);
 const ONLINE_LIST_UNCHANGED_SKIP_ENABLED = process.env.ONLINE_LIST_SKIP_UNCHANGED !== "0";
 
@@ -57,17 +57,20 @@ const pgConnectionOptions = {
   application_name: String(`psn-db-${INSTANCE_ID}`).slice(0, 63),
   connectionTimeoutMillis: PG_CONNECTION_TIMEOUT_MS,
   statement_timeout: PG_STATEMENT_TIMEOUT_MS,
-  query_timeout: PG_QUERY_TIMEOUT_MS
+  query_timeout: PG_QUERY_TIMEOUT_MS,
+  keepAlive: true,
+  keepAliveInitialDelayMillis: 5000
 };
 
-const pool = new Pool({
+const poolOptions = {
   ...pgConnectionOptions,
   max: PG_POOL_MAX,
   min: 0,
   idleTimeoutMillis: PG_IDLE_TIMEOUT_MS,
-  maxUses: PG_MAX_USES,
   allowExitOnIdle: false
-});
+};
+if (PG_MAX_USES > 0) poolOptions.maxUses = PG_MAX_USES;
+const pool = new Pool(poolOptions);
 let profileSyncNotifyClient = null;
 let profileSyncReconnectTimer = null;
 
@@ -126,6 +129,36 @@ pool.on('error', (err) => {
 
 function isPgConnectionLimitError(err) {
   return !!(err && (err.code === '53300' || /remaining connection slots|too many clients/i.test(String(err.message || ''))));
+}
+
+function isPgTransientConnectionError(err) {
+  if (!err) return false;
+  const code = String(err.code || '').toUpperCase();
+  if (['08000','08001','08003','08004','08006','08007','08P01','57P01','57P02','57P03','53300'].includes(code)) return true;
+  const message = String(err.message || err).toLowerCase();
+  return /connection terminated|connection timeout|timeout exceeded when trying to connect|connection reset|econnreset|etimedout|ehostunreach|enetunreach|socket hang up|broken pipe|server closed the connection|terminating connection|the database system is starting up|too many clients|remaining connection slots/.test(message);
+}
+
+function waitMs(ms) {
+  return new Promise(resolve => setTimeout(resolve, Math.max(0, Number(ms) || 0)));
+}
+
+async function queryDbWithRetry(text, params = [], options = {}) {
+  const attempts = Math.max(1, Math.min(4, Number(options.attempts) || 2));
+  const label = String(options.label || 'DB QUERY');
+  let lastError = null;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      return await pool.query(text, params);
+    } catch (err) {
+      lastError = err;
+      if (!isPgTransientConnectionError(err) || attempt >= attempts) throw err;
+      const delayMs = attempt === 1 ? 180 : 650;
+      console.warn(`[${label}] Temporary PostgreSQL connection failure. Retrying ${attempt + 1}/${attempts} in ${delayMs}ms.`);
+      await waitMs(delayMs);
+    }
+  }
+  throw lastError;
 }
 
 function scheduleProfileSyncReconnect(delayMs = 5000) {
@@ -327,7 +360,7 @@ let adminStateConnectionLimitWarnedAt = 0;
 
 async function refreshAdminStateFromDb() {
   try {
-    const stateRes = await pool.query('SELECT state_key, data FROM admin_state');
+    const stateRes = await queryDbWithRetry('SELECT state_key, data FROM admin_state', [], { attempts: 2, label: 'ADMIN STATE READ' });
     stateRes.rows.forEach(row => {
       if (row.state_key === ADMIN_STATE_KEYS.maintenance) {
         adminState.maintenance = normalizeMaintenanceState(row.data || {});
@@ -451,7 +484,7 @@ async function initDb() {
 
   await refreshAdminStateFromDb();
 
-  const reportsRes = await pool.query('SELECT data FROM reports WHERE resolved = false ORDER BY created_at DESC LIMIT 100');
+  const reportsRes = await queryDbWithRetry('SELECT data FROM reports WHERE resolved = false ORDER BY created_at DESC LIMIT 100', [], { attempts: 2, label: 'REPORTS READ' });
   adminReports = reportsRes.rows.map(r => r.data);
 
   const modLogRes = await pool.query('SELECT entry FROM moderation_log ORDER BY created_at DESC LIMIT 100');
@@ -499,7 +532,7 @@ async function getSanitizedOnlineListFromDb(options = {}) {
 async function calculateGlobalTrophyStatsFromDb() {
   const stats = {};
 
-  const trophyRes = await pool.query(`
+  const trophyRes = await queryDbWithRetry(`
     WITH total_users AS (
       SELECT COUNT(*)::numeric AS total FROM users
     ), unlocked_trophies AS (
@@ -523,7 +556,7 @@ async function calculateGlobalTrophyStatsFromDb() {
         ELSE 0
       END AS percentage
     FROM unlocked_trophies, total_users
-  `);
+  `, [], { attempts: 2, label: 'TROPHY AGGREGATE' });
 
   trophyRes.rows.forEach(row => {
     if (row.trophy_id) stats[row.trophy_id] = Number(row.percentage) || 0;
@@ -1664,7 +1697,7 @@ async function refreshSingleUserSummaryFromDb(name, options = {}) {
   const safeName = normalizeText(name, '');
   if (!safeName) return null;
 
-  const userRes = await pool.query(`
+  const userRes = await queryDbWithRetry(`
     SELECT
       name,
       data - ARRAY['downloadsData','libraryData','wishlistData','favoritesData','trophiesData','friendsData','passwordHash','password']::text[] AS data,
@@ -1675,7 +1708,7 @@ async function refreshSingleUserSummaryFromDb(name, options = {}) {
       CASE WHEN jsonb_typeof(data->'friendsData') = 'array' THEN jsonb_array_length(data->'friendsData') ELSE NULL END AS friends_count
     FROM users
     WHERE name = $1
-  `, [safeName]);
+  `, [safeName], { attempts: 2, label: 'USER SUMMARY READ' });
 
   if (!userRes.rows.length) {
     delete userDatabase[safeName];
@@ -1714,7 +1747,7 @@ async function refreshAllUsersCacheFromDb(options = {}) {
   const preserveOnline = options.preserveOnline !== false;
   userCacheRefreshInFlight = (async () => {
     const now = Date.now();
-    const usersRes = await pool.query(`
+    const usersRes = await queryDbWithRetry(`
       SELECT
         name,
         data - ARRAY['downloadsData','libraryData','wishlistData','favoritesData','trophiesData','friendsData','passwordHash','password']::text[] AS data,
@@ -1725,7 +1758,7 @@ async function refreshAllUsersCacheFromDb(options = {}) {
         CASE WHEN jsonb_typeof(data->'friendsData') = 'array' THEN jsonb_array_length(data->'friendsData') ELSE NULL END AS friends_count
       FROM users
       ORDER BY LOWER(name) ASC
-    `);
+    `, [], { attempts: 3, label: 'USER CACHE STARTUP READ' });
     const nextDatabase = {};
     const nextMeta = {};
     const nextFullNames = new Set();
@@ -1780,7 +1813,7 @@ async function refreshSingleUserCacheFromDb(name, options = {}) {
   if (!safeName) return null;
   if (userProfileWriteInFlight.has(safeName) && options.forceDuringWrite !== true) return userDatabase[safeName] || null;
 
-  const userRes = await pool.query('SELECT data FROM users WHERE name = $1', [safeName]);
+  const userRes = await queryDbWithRetry('SELECT data FROM users WHERE name = $1', [safeName], { attempts: 3, label: 'USER PROFILE READ' });
   if (!userRes.rows.length) {
     delete userDatabase[safeName];
     delete userCacheMeta[safeName];
@@ -1879,7 +1912,7 @@ function searchUsersFromCache(query, includeAdminFields = false) {
 }
 
 async function calculateTrendingFromDb() {
-  const rows = await pool.query(`
+  const rows = await queryDbWithRetry(`
     WITH download_items AS (
       SELECT
         u.name AS username,
@@ -1948,7 +1981,7 @@ async function calculateTrendingFromDb() {
     FROM wishlist_items
     WHERE title_id <> ''
     GROUP BY title_id
-  `);
+  `, [], { attempts: 2, label: 'TRENDING AGGREGATE' });
 
   const gameCounts = [];
   const wishCounts = [];
@@ -2010,13 +2043,17 @@ async function emitTrendingFromDb(targetSocket = null, options = {}) {
     return payload;
   } catch (err) {
     console.error('[TRENDING DB EMIT ERROR]:', err);
-    const emptyPayload = { topDownloads: [], topWishlist: [], contentDownloadCounts: {} };
-    const emptyDownloadCountsPayload = buildContentDownloadCountsPayload({});
+    const fallbackPayload = trendingCache
+      ? { ...trendingCache, stale: true, unavailable: false }
+      : { topDownloads: [], topWishlist: [], contentDownloadCounts: {}, stale: false, unavailable: true };
+    const fallbackDownloadCountsPayload = buildContentDownloadCountsPayload(fallbackPayload.contentDownloadCounts || {});
+    fallbackDownloadCountsPayload.stale = fallbackPayload.stale === true;
+    fallbackDownloadCountsPayload.unavailable = fallbackPayload.unavailable === true;
     if (targetSocket && targetSocket.connected) {
-      targetSocket.emit('trending_data', emptyPayload);
-      targetSocket.emit('content_download_counts', emptyDownloadCountsPayload);
+      targetSocket.emit('trending_data', fallbackPayload);
+      targetSocket.emit('content_download_counts', fallbackDownloadCountsPayload);
     }
-    return emptyPayload;
+    return fallbackPayload;
   }
 }
 
@@ -2090,7 +2127,7 @@ async function getUserDataPayloadFromDb(targetName, type) {
     trophies: 'trophiesData'
   };
   const dataKey = keyMap[type] || `${type}Data`;
-  const result = await pool.query('SELECT data -> $2 AS payload FROM users WHERE name = $1', [safeTargetName, dataKey]);
+  const result = await queryDbWithRetry('SELECT data -> $2 AS payload FROM users WHERE name = $1', [safeTargetName, dataKey], { attempts: 3, label: 'USER DATA READ' });
   if (!result.rows.length) return null;
 
   let payload = result.rows[0].payload;
@@ -2113,7 +2150,7 @@ async function saveUser(name, options = {}) {
   userDatabase[name] = normalizeUserRecord(name, userDatabase[name]);
   userDatabase[name].profileUpdatedAt = Date.now();
   userCacheMeta[name] = Date.now();
-  await pool.query('UPDATE users SET data = $1 WHERE name = $2', [userDatabase[name], name]);
+  await queryDbWithRetry('UPDATE users SET data = $1 WHERE name = $2', [userDatabase[name], name], { attempts: 2, label: 'USER PROFILE SAVE' });
   invalidateOnlineListCache('save-user');
   if (options.notify !== false) {
     await notifyProfileSyncAcrossInstances(name, options.sourceSocketId || null, userDatabase[name].profileUpdatedAt);
@@ -2180,9 +2217,10 @@ async function clearChatHistorySafely(byUser = "Admin", reason = "manual clear")
 
 async function syncChatAcrossInstances() {
   try {
-    const newRows = await pool.query(
+    const newRows = await queryDbWithRetry(
       'SELECT id, message FROM chat WHERE id > $1 ORDER BY id ASC LIMIT $2',
-      [lastChatDbId, MAX_CHAT_HISTORY]
+      [lastChatDbId, MAX_CHAT_HISTORY],
+      { attempts: 2, label: 'CHAT SYNC READ' }
     );
 
     if (newRows.rows.length > 0) {
@@ -2202,7 +2240,7 @@ async function syncChatAcrossInstances() {
     }
 
     if (messageHistory.length > 0) {
-      const meta = await pool.query('SELECT COUNT(*)::int AS total, COALESCE(MAX(id), 0)::int AS max_id FROM chat');
+      const meta = await queryDbWithRetry('SELECT COUNT(*)::int AS total, COALESCE(MAX(id), 0)::int AS max_id FROM chat', [], { attempts: 2, label: 'CHAT SYNC META' });
       const total = Number(meta.rows[0]?.total || 0);
       const maxId = Number(meta.rows[0]?.max_id || 0);
       if (total === 0) {
@@ -2605,11 +2643,12 @@ async function upsertPresenceForSocket(socket, name) {
     userDatabase[name].id = socket.id;
     userDatabase[name].lastSeen = Date.now();
   }
-  await pool.query(
+  await queryDbWithRetry(
     `INSERT INTO presence_sessions (socket_id, name, instance_id, connected_at, last_seen, data)
      VALUES ($1, $2, $3, NOW(), NOW(), $4)
      ON CONFLICT (socket_id) DO UPDATE SET name = $2, instance_id = $3, last_seen = NOW(), data = $4`,
-    [socket.id, name, INSTANCE_ID, { role: getUserRole(name, userDatabase[name] || null) }]
+    [socket.id, name, INSTANCE_ID, { role: getUserRole(name, userDatabase[name] || null) }],
+    { attempts: 3, label: 'PRESENCE UPSERT' }
   );
   invalidateOnlineListCache('presence-upsert');
   if (shouldAnnouncePresence && userDatabase[name]) {
@@ -2625,7 +2664,7 @@ async function syncPresenceOnlineFromDb() {
     { online: user && user.online === true, lastSeen: Number(user && user.lastSeen || 0) }
   ]));
 
-  const expiredRes = await pool.query(`
+  const expiredRes = await queryDbWithRetry(`
     WITH expired AS (
       DELETE FROM presence_sessions
       WHERE last_seen < NOW() - INTERVAL '${PRESENCE_TTL_SECONDS} seconds'
@@ -2634,15 +2673,15 @@ async function syncPresenceOnlineFromDb() {
     SELECT name, MAX(last_seen) AS last_seen
     FROM expired
     GROUP BY name
-  `);
+  `, [], { attempts: 2, label: 'PRESENCE EXPIRE' });
 
-  const presenceRes = await pool.query(`
+  const presenceRes = await queryDbWithRetry(`
     SELECT name,
            MAX(last_seen) AS last_seen,
            (ARRAY_AGG(socket_id ORDER BY last_seen DESC))[1] AS socket_id
     FROM presence_sessions
     GROUP BY name
-  `);
+  `, [], { attempts: 2, label: 'PRESENCE READ' });
   const activeNames = new Set(presenceRes.rows.map(row => row.name));
   const expiredOfflineRows = expiredRes.rows.filter(row => row && row.name && !activeNames.has(row.name));
 
@@ -2676,12 +2715,13 @@ async function syncPresenceOnlineFromDb() {
       lastSeenValues.push(Number(userDatabase[row.name].lastSeen || Date.now()));
     });
     if (names.length > 0) {
-      await pool.query(
+      await queryDbWithRetry(
         `UPDATE users AS u
          SET data = COALESCE(u.data, '{}'::jsonb) || jsonb_build_object('online', false, 'lastSeen', v.last_seen)
          FROM UNNEST($1::text[], $2::bigint[]) AS v(name, last_seen)
          WHERE u.name = v.name`,
-        [names, lastSeenValues]
+        [names, lastSeenValues],
+        { attempts: 2, label: 'PRESENCE LAST SEEN SAVE' }
       );
     }
   }
@@ -2756,7 +2796,7 @@ async function heartbeatPresenceSessions() {
       if (userDatabase[client.userName]) userDatabase[client.userName].lastSeen = Date.now();
     });
 
-    await pool.query(
+    await queryDbWithRetry(
       `INSERT INTO presence_sessions (socket_id, name, instance_id, connected_at, last_seen, data)
        SELECT socket_id, name, instance_id, NOW(), NOW(), data
        FROM UNNEST($1::text[], $2::text[], $3::text[], $4::jsonb[]) AS t(socket_id, name, instance_id, data)
@@ -2765,7 +2805,8 @@ async function heartbeatPresenceSessions() {
          instance_id = EXCLUDED.instance_id,
          last_seen = NOW(),
          data = EXCLUDED.data`,
-      [socketIds, names, instanceIds, payloads]
+      [socketIds, names, instanceIds, payloads],
+      { attempts: 2, label: 'PRESENCE HEARTBEAT SAVE' }
     );
     invalidateOnlineListCache("presence-heartbeat");
   }
@@ -3037,17 +3078,14 @@ function startBackgroundTasks() {
 
 io.on('connection', (socket) => {
   console.log('[NETWORK] Socket connected. ID: ' + socket.id);
-  deferServerTask('CONNECTION INIT', async () => {
-    await refreshAdminStateThrottled(5000);
-    await emitAdminState(socket);
-  }, 0);
+  deferServerTask('CONNECTION INIT', () => emitAdminState(socket), 0);
 
   socket.on('authenticate_user', async (data = {}) => {
     try {
       const { name, password, isNewAccount, adminMaintenanceBypass } = data;
       const safeUserData = (data.userData && typeof data.userData === 'object') ? data.userData : {};
       
-      const dbRes = await pool.query('SELECT data FROM users WHERE name = $1', [name]);
+      const dbRes = await queryDbWithRetry('SELECT data FROM users WHERE name = $1', [name], { attempts: 3, label: 'AUTH USER LOOKUP' });
       let dbUser = dbRes.rows.length > 0 ? normalizeUserRecord(name, dbRes.rows[0].data || {}) : null;
       let wasDeletedAccount = false;
 
@@ -3055,7 +3093,7 @@ io.on('connection', (socket) => {
       const isAdmin = isUserAdmin(name, dbUser);
 
       if (!dbUser && !isHardcodedAdmin) {
-        const deletedRes = await pool.query('SELECT data FROM deleted_accounts WHERE name = $1', [name]);
+        const deletedRes = await queryDbWithRetry('SELECT data FROM deleted_accounts WHERE name = $1', [name], { attempts: 3, label: 'AUTH DELETED ACCOUNT LOOKUP' });
         if (deletedRes.rows.length > 0) {
           wasDeletedAccount = true;
           if (isNewAccount !== true) {
@@ -3252,7 +3290,7 @@ io.on('connection', (socket) => {
     try {
       await upsertPresenceForSocket(socket, name);
       userCacheMeta[name] = Date.now();
-      await pool.query('UPDATE users SET data = $1 WHERE name = $2', [userDatabase[name], name]);
+      await queryDbWithRetry('UPDATE users SET data = $1 WHERE name = $2', [userDatabase[name], name], { attempts: 2, label: 'SETTINGS SAVE' });
       invalidateOnlineListCache('settings-realtime-save');
     } catch (err) {
       console.error(`[DATABASE ERROR] Failed to save realtime settings for ${name}:`, err);
@@ -3355,7 +3393,7 @@ io.on('connection', (socket) => {
         try {
             await upsertPresenceForSocket(socket, name);
             userCacheMeta[name] = Date.now();
-            await pool.query('UPDATE users SET data = $1 WHERE name = $2', [userDatabase[name], name]);
+            await queryDbWithRetry('UPDATE users SET data = $1 WHERE name = $2', [userDatabase[name], name], { attempts: 2, label: 'PROFILE SAVE' });
             invalidateOnlineListCache('profile-update-save');
         } catch (err) {
             console.error(`[DATABASE ERROR] Failed to save profile for ${name}:`, err);
@@ -4457,7 +4495,7 @@ async function startServer() {
     startBackgroundTasks();
     serverListening = true;
     server.listen(PORT, () => {
-      console.log(`PSN Database Server running on port ${PORT} (pg pool max ${PG_POOL_MAX}, online cache ${ONLINE_LIST_CACHE_MS}ms, chat sync ${CHAT_SYNC_INTERVAL_MS}ms, instance ${INSTANCE_ID})`);
+      console.log(`PSN Database Server running on port ${PORT} (pg pool max ${PG_POOL_MAX}, connect timeout ${PG_CONNECTION_TIMEOUT_MS}ms, idle timeout ${PG_IDLE_TIMEOUT_MS}ms, online cache ${ONLINE_LIST_CACHE_MS}ms, chat sync ${CHAT_SYNC_INTERVAL_MS}ms, instance ${INSTANCE_ID})`);
       startKeepAlivePings();
     });
   } catch (err) {
