@@ -24591,7 +24591,6 @@ P
 			updateSyncTimestamp();
 		}
 		
-		if (typeof initChat === 'function') initChat();
 		switchView('view-explore', false, true);
 	});
     
@@ -27345,7 +27344,6 @@ P
 	
 				loadUserGrid();
 				if (typeof restartUserSelectIntroAnimation === 'function') restartUserSelectIntroAnimation(document.getElementById('user-select-screen'), { delay: 90 });
-				if (typeof initChat === 'function') initChat();
 	
 				requestAnimationFrame(() => {
 					requestAnimationFrame(() => {
@@ -27360,6 +27358,7 @@ P
 	}
 
 	function logOut(options = {}) {
+		clearSessionServerUnavailableTimer();
 		const forceLogout = !!(options && options.force === true);
 		const afterLogout = options && typeof options.afterLogout === 'function' ? options.afterLogout : null;
 		if (forceLogout || confirm("Are you sure you want to log out?")) {
@@ -27429,7 +27428,6 @@ P
 					bootContainer.style.zIndex = '9999999';
 					
 					if (typeof loadUserGrid === 'function') loadUserGrid();
-					if (typeof initChat === 'function') initChat();
 					
 					requestAnimationFrame(() => {
 						requestAnimationFrame(() => {
@@ -34159,7 +34157,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
     // CHAT LOGIC
     // ==========================================================================
     const serverUrls = [
-		"https://psn-content-0u8u.onrender.com/",
+		"https://psn-content-6enm.onrender.com/",
 		
 
 		// Expired
@@ -41053,8 +41051,25 @@ function getVisibleChatStackEl(id) {
 
 	let serverUnavailableCloseTimer = null;
 
+	function pauseServerAutomaticReconnect() {
+		if (typeof socketChat === 'undefined' || !socketChat) return;
+		try {
+			if (socketChat.io && typeof socketChat.io.reconnection === 'function') socketChat.io.reconnection(false);
+		} catch (e) {}
+		try {
+			if (socketChat.connected || socketChat.active) socketChat.disconnect();
+		} catch (e) {}
+	}
+
+	function enableServerAutomaticReconnect() {
+		if (typeof socketChat === 'undefined' || !socketChat) return;
+		try {
+			if (socketChat.io && typeof socketChat.io.reconnection === 'function') socketChat.io.reconnection(true);
+		} catch (e) {}
+	}
+
 	function setServerUnavailableModalContext(context = 'login') {
-		serverUnavailableContext = context === 'create' ? 'create' : 'login';
+		serverUnavailableContext = context === 'create' ? 'create' : (context === 'session' ? 'session' : 'login');
 		const statusText = document.getElementById('server-unavailable-status-text');
 		const title = document.getElementById('server-unavailable-title');
 		const copy = document.getElementById('server-unavailable-copy');
@@ -41067,6 +41082,12 @@ function getVisibleChatStackEl(id) {
 			if (copy) copy.innerHTML = 'We couldn’t connect to the <strong>NoPayStation Network server</strong>. Your profile has not been created yet.';
 			if (hint) hint.textContent = 'Please try again in a few moments or come back later.';
 			if (backButton) backButton.textContent = 'Back to Create Profile';
+		} else if (serverUnavailableContext === 'session') {
+			if (statusText) statusText.textContent = 'Network service offline';
+			if (title) title.textContent = 'Server unavailable';
+			if (copy) copy.innerHTML = 'The connection to the <strong>NoPayStation Network server</strong> was lost. Online features are temporarily unavailable.';
+			if (hint) hint.textContent = 'You can keep browsing while we continue trying to reconnect.';
+			if (backButton) backButton.textContent = 'Continue offline';
 		} else {
 			if (statusText) statusText.textContent = 'Login service offline';
 			if (title) title.textContent = 'Unable to sign in';
@@ -41082,6 +41103,7 @@ function getVisibleChatStackEl(id) {
 		if (!modal) return;
 		serverUnavailableNoticeShown = true;
 		setServerUnavailableModalContext(context);
+		pauseServerAutomaticReconnect();
 		serverUnavailableManualRetryActive = false;
 		serverUnavailableManualRetryStartedAt = 0;
 		clearServerUnavailableRetryTimers();
@@ -41141,7 +41163,26 @@ function getVisibleChatStackEl(id) {
 	}
 
 	const LOGIN_SINGLE_SERVER_RECONNECT_GRACE_MS = 6500;
+	const SESSION_SERVER_UNAVAILABLE_GRACE_MS = 6500;
 	const LOGIN_TRANSIENT_AUTH_RETRY_LIMIT = 1;
+	let sessionServerUnavailableTimer = null;
+
+	function clearSessionServerUnavailableTimer() {
+		if (!sessionServerUnavailableTimer) return;
+		clearTimeout(sessionServerUnavailableTimer);
+		sessionServerUnavailableTimer = null;
+	}
+
+	function scheduleSessionServerUnavailable() {
+		if (window.isProfileLoaded !== true || loginServerAttempt) return;
+		if (sessionServerUnavailableTimer) return;
+		sessionServerUnavailableTimer = setTimeout(() => {
+			sessionServerUnavailableTimer = null;
+			if (window.isProfileLoaded !== true) return;
+			if (socketChat && socketChat.connected) return;
+			window.showServerUnavailableModal(true, 'session');
+		}, SESSION_SERVER_UNAVAILABLE_GRACE_MS);
+	}
 
 	function clearLoginServerAttemptTimers(attempt) {
 		if (!attempt) return;
@@ -41160,7 +41201,7 @@ function getVisibleChatStackEl(id) {
 		if (!attempt || getLoginServerCount() !== 1) return false;
 		attempt.emitted = false;
 		attempt.emittedServerIndex = null;
-		if (attempt.reconnectGraceTimer) clearTimeout(attempt.reconnectGraceTimer);
+		if (attempt.reconnectGraceTimer) return true;
 		console.warn(`[AUTH] Temporary ${reason} during ${attempt.mode === 'create' ? 'account creation' : 'sign-in'}. Waiting for the same server to reconnect before showing it as unavailable.`);
 		attempt.reconnectGraceTimer = setTimeout(() => {
 			attempt.reconnectGraceTimer = null;
@@ -41287,6 +41328,11 @@ function getVisibleChatStackEl(id) {
 
 	window.returnToLoginFromServerUnavailable = function() {
 		if (typeof playUiBack === 'function') playUiBack();
+		pauseServerAutomaticReconnect();
+		if (serverUnavailableContext === 'session') {
+			window.hideServerUnavailableModal();
+			return;
+		}
 		window.clearLoginServerAttempt();
 		if (typeof window.psnResetLoginUiState === 'function') window.psnResetLoginUiState(currentLoginUser || '');
 
@@ -41312,6 +41358,7 @@ function getVisibleChatStackEl(id) {
 	window.sendLoginAuthentication = function(payload) {
 		if (!payload || !payload.name) return false;
 		window.clearLoginServerAttempt();
+		enableServerAutomaticReconnect();
 
 		const count = getLoginServerCount();
 		const token = ++loginServerAttemptSequence;
@@ -41354,13 +41401,27 @@ function getVisibleChatStackEl(id) {
 		};
 
 		loginServerAttempt.trySend = trySend;
+
+		if (typeof socketChat === 'undefined' || !socketChat) {
+			connectLoginAttemptToServer(currentServerIndex);
+		} else if (!socketChat.connected) {
+			try {
+				if (socketChat.io) socketChat.io.uri = serverUrls[currentServerIndex];
+				socketChat.connect();
+			} catch (err) {
+				console.warn('[AUTH] Could not start authentication connection:', err);
+			}
+		}
+
 		trySend();
+		if (!socketChat || !socketChat.connected) holdSingleServerLoginForReconnect('connection startup');
 		return true;
 	};
 
 	window.retryServerConnection = function() {
 		if (typeof playUiClick === 'function') playUiClick();
 		clearServerUnavailableRetryTimers();
+		pauseServerAutomaticReconnect();
 		serverUnavailableManualRetryActive = true;
 		serverUnavailableManualRetryStartedAt = Date.now();
 		setServerUnavailableRetrying(true);
@@ -41370,6 +41431,8 @@ function getVisibleChatStackEl(id) {
 				socketChat.connect();
 			} else if (!socketChat) {
 				initChat();
+				pauseServerAutomaticReconnect();
+				if (socketChat && !socketChat.connected) socketChat.connect();
 			}
 		} catch (err) {
 			console.warn('[NETWORK] Manual reconnect failed:', err);
@@ -41379,6 +41442,8 @@ function getVisibleChatStackEl(id) {
 	};
 
 	function markServerConnectionAvailable() {
+		clearSessionServerUnavailableTimer();
+		if (window.isProfileLoaded === true) enableServerAutomaticReconnect();
 		const modal = document.getElementById('server-unavailable-modal');
 		const modalVisible = !!(modal && modal.classList.contains('show'));
 		const retryWasActive = serverUnavailableManualRetryActive || serverUnavailableRetryButtonState === 'connecting';
@@ -42992,6 +43057,8 @@ function getVisibleChatStackEl(id) {
 				if (!holdSingleServerLoginForReconnect('connection error')) {
 					failLoginServerAttemptServer(attemptServerIndex, 'connection error', { rotate: false });
 				}
+			} else {
+				scheduleSessionServerUnavailable();
 			}
 			
 			currentServerIndex = (currentServerIndex + 1) % serverUrls.length;
@@ -43018,7 +43085,11 @@ function getVisibleChatStackEl(id) {
 					if (!holdSingleServerLoginForReconnect('connection loss')) {
 						failLoginServerAttemptServer(failedIndex, 'connection lost', { rotate: true });
 					}
+				} else {
+					scheduleSessionServerUnavailable();
 				}
+			} else {
+				clearSessionServerUnavailableTimer();
 			}
 			
 			if (typeof updateGlobalOnlineStatus === 'function') updateGlobalOnlineStatus('offline');
@@ -43354,13 +43425,13 @@ function getVisibleChatStackEl(id) {
 	};
 
 	window.psnReturnToLoginScreen = function(username = '') {
+		clearSessionServerUnavailableTimer();
 		const name = psnClearCurrentSession(username, { clearPassword: true, disconnect: true });
 		if (name && typeof currentLoginUser !== 'undefined') currentLoginUser = name;
 		if (typeof window.psnResetLoginUiState === 'function') window.psnResetLoginUiState(name);
 		if (typeof closeAllPs5AuthOverlaysInstant === 'function') closeAllPs5AuthOverlaysInstant();
 		if (typeof setUserSelectAuthHidden === 'function') setUserSelectAuthHidden(false);
 		if (typeof loadUserGrid === 'function') loadUserGrid();
-		if (typeof initChat === 'function') initChat();
 		if (typeof updateAdminVisibility === 'function') updateAdminVisibility();
 
 		const bootContainer = document.getElementById('ps5-boot-container');
@@ -44323,7 +44394,6 @@ function getVisibleChatStackEl(id) {
     });
 
    document.addEventListener('DOMContentLoaded', () => {
-		initChat();
 		setTimeout(() => { if (typeof refreshMentionJumpButton === 'function') refreshMentionJumpButton(); }, 400);
 		const chatInput = document.getElementById('chat-input');
 		
