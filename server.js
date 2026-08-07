@@ -17,17 +17,6 @@ const MAX_CHAT_HISTORY = 1000;
 
 const SERVER_STARTED_AT = Date.now();
 const INSTANCE_ID = process.env.RENDER_INSTANCE_ID || process.env.RAILWAY_REPLICA_ID || process.env.HOSTNAME || `instance-${Math.random().toString(36).slice(2, 10)}`;
-const AUTH_DEBUG_ENABLED = process.env.AUTH_DEBUG_ENABLED !== '0';
-
-function emitAuthDebug(socket, stage, details = {}) {
-  if (!AUTH_DEBUG_ENABLED || !socket) return;
-  socket.emit('auth_debug', {
-    at: new Date().toISOString(),
-    instanceId: INSTANCE_ID,
-    stage: String(stage || 'unknown'),
-    ...details
-  });
-}
 const PRESENCE_TTL_SECONDS = 90;
 const PRESENCE_HEARTBEAT_MS = 25000;
 const CHAT_SYNC_INTERVAL_MS = 3000;
@@ -2935,39 +2924,8 @@ io.on('connection', (socket) => {
       const safeUserData = (data.userData && typeof data.userData === 'object') ? data.userData : {};
       
       const dbRes = await queryDbWithRetry('SELECT data FROM users WHERE name = $1', [name], { attempts: 3, label: 'AUTH USER LOOKUP' });
-      const rawDbUser = dbRes.rows.length > 0 ? (dbRes.rows[0].data || {}) : null;
-      const ramUserBeforeAuth = userDatabase[name] || null;
-      let dbUser = rawDbUser ? normalizeUserRecord(name, rawDbUser) : null;
+      let dbUser = dbRes.rows.length > 0 ? normalizeUserRecord(name, dbRes.rows[0].data || {}) : null;
       let wasDeletedAccount = false;
-
-      emitAuthDebug(socket, 'db_lookup', {
-        name: String(name || ''),
-        isNewAccount: isNewAccount === true,
-        dbRowFound: !!rawDbUser,
-        dbCredentialState: rawDbUser ? {
-          passwordHashKeyExists: Object.prototype.hasOwnProperty.call(rawDbUser, 'passwordHash'),
-          passwordKeyExists: Object.prototype.hasOwnProperty.call(rawDbUser, 'password'),
-          hasPasswordHash: typeof rawDbUser.passwordHash === 'string' && rawDbUser.passwordHash.length > 0,
-          passwordHashType: typeof rawDbUser.passwordHash,
-          passwordHashLength: typeof rawDbUser.passwordHash === 'string' ? rawDbUser.passwordHash.length : 0,
-          hasLegacyPassword: typeof rawDbUser.password === 'string' && rawDbUser.password.length > 0,
-          legacyPasswordType: typeof rawDbUser.password,
-          legacyPasswordLength: typeof rawDbUser.password === 'string' ? rawDbUser.password.length : 0
-        } : null,
-        dbTimestamps: rawDbUser ? {
-          profileUpdatedAt: rawDbUser.profileUpdatedAt || null,
-          passwordMigratedAt: rawDbUser.passwordMigratedAt || null,
-          passwordResetAt: rawDbUser.passwordResetAt || null,
-          passwordResetBy: rawDbUser.passwordResetBy || null
-        } : null,
-        ramStateBeforeAuth: {
-          exists: !!ramUserBeforeAuth,
-          fullCache: fullUserCacheNames.has(name),
-          hasPasswordHash: !!(ramUserBeforeAuth && typeof ramUserBeforeAuth.passwordHash === 'string' && ramUserBeforeAuth.passwordHash.length),
-          hasLegacyPassword: !!(ramUserBeforeAuth && typeof ramUserBeforeAuth.password === 'string' && ramUserBeforeAuth.password.length),
-          profileUpdatedAt: ramUserBeforeAuth ? (ramUserBeforeAuth.profileUpdatedAt || null) : null
-        }
-      });
 
       const isHardcodedAdmin = ADMIN_USERS.includes(name);
       const isAdmin = isUserAdmin(name, dbUser);
@@ -3004,57 +2962,24 @@ io.on('connection', (socket) => {
 
           const legacyPassword = typeof dbUser.password === 'string' ? dbUser.password : '';
           if (!legacyPassword) {
-            emitAuthDebug(socket, 'legacy_missing_credentials', {
-              name: String(name || ''),
-              dbRowFound: true,
-              hasPasswordHash: false,
-              hasLegacyPassword: false,
-              profileUpdatedAt: dbUser.profileUpdatedAt || null,
-              passwordMigratedAt: dbUser.passwordMigratedAt || null,
-              passwordResetAt: dbUser.passwordResetAt || null
-            });
             socket.emit('auth_error', 'Legacy account detected. A password reset is required before this account can sign in.');
             return;
           }
 
           if (String(password || '') !== legacyPassword) {
-            emitAuthDebug(socket, 'legacy_password_mismatch', {
-              name: String(name || ''),
-              hasLegacyPassword: true,
-              legacyPasswordLength: legacyPassword.length,
-              submittedPasswordLength: String(password || '').length
-            });
             socket.emit('auth_error', 'Incorrect password. Access denied.');
             return;
           }
 
-          emitAuthDebug(socket, 'legacy_migration_start', {
-            name: String(name || ''),
-            legacyPasswordLength: legacyPassword.length
-          });
           dbUser.passwordHash = await bcrypt.hash(password, 10);
           delete dbUser.password;
           dbUser.passwordMigratedAt = new Date().toISOString();
           dbUser.profileUpdatedAt = Date.now();
           await queryDbWithRetry('UPDATE users SET data = $1 WHERE name = $2', [dbUser, name], { attempts: 2, label: 'LEGACY PASSWORD MIGRATION' });
-          emitAuthDebug(socket, 'legacy_migration_saved', {
-            name: String(name || ''),
-            hasPasswordHash: true,
-            passwordHashLength: dbUser.passwordHash.length,
-            legacyPasswordRemoved: !Object.prototype.hasOwnProperty.call(dbUser, 'password'),
-            passwordMigratedAt: dbUser.passwordMigratedAt || null
-          });
           console.log(`[AUTH] Migrated legacy password for ${name} to bcrypt.`);
         }
 
         const match = await bcrypt.compare(password, dbUser.passwordHash);
-        emitAuthDebug(socket, 'bcrypt_compare', {
-          name: String(name || ''),
-          matched: match === true,
-          hasPasswordHash: typeof dbUser.passwordHash === 'string' && dbUser.passwordHash.length > 0,
-          passwordHashLength: typeof dbUser.passwordHash === 'string' ? dbUser.passwordHash.length : 0,
-          submittedPasswordLength: String(password || '').length
-        });
         
         if (match) {
           socket.userName = name;
@@ -3081,13 +3006,6 @@ io.on('connection', (socket) => {
           invalidateOnlineListCache('auth-existing-db');
           deferServerTask('AUTH EXISTING PRESENCE', () => upsertPresenceForSocket(socket, name), 250);
 
-          emitAuthDebug(socket, 'auth_success', {
-            name: String(name || ''),
-            source: 'existing_db_user',
-            fullCache: fullUserCacheNames.has(name),
-            hasPasswordHash: typeof userDatabase[name].passwordHash === 'string' && userDatabase[name].passwordHash.length > 0,
-            hasLegacyPassword: typeof userDatabase[name].password === 'string' && userDatabase[name].password.length > 0
-          });
           console.log(`[NETWORK] ${name} logged in. Admin: ${isAdmin}`);
           deferServerTask('AUTH LOGIN LOG', async () => {
             await addServerLog('login', `${name} signed in${isAdmin ? ' as admin' : ''}`, { socketId: socket.id, role: getUserRole(name, userDatabase[name]) }, name);
