@@ -32,6 +32,7 @@ const POST_AUTH_ADMIN_STATE_DELAY_MS = Math.max(0, parseInt(process.env.POST_AUT
 const POST_AUTH_ONLINE_LIST_DELAY_MS = Math.max(0, parseInt(process.env.POST_AUTH_ONLINE_LIST_DELAY_MS || "1400", 10) || 1400);
 const POST_AUTH_PROFILE_SYNC_DELAY_MS = Math.max(0, parseInt(process.env.POST_AUTH_PROFILE_SYNC_DELAY_MS || "1800", 10) || 1800);
 const USER_CACHE_REFRESH_INTERVAL_MS = 30000;
+const PASSWORD_RESET_WINDOW_MS = 10 * 60 * 1000;
 const USER_CACHE_WARMUP_INTERVAL_MS = 120000;
 const DEFAULT_MAINTENANCE_MESSAGE = "The service is under maintenance. Please try again soon.";
 const VALID_USER_ROLES = new Set(["user", "trusted", "mod", "admin"]);
@@ -1998,6 +1999,9 @@ async function updateUserDataPreservingCredentials(name, userData, label = 'USER
       || CASE WHEN NOT ($1::jsonb ? 'passwordMigratedAt') AND data ? 'passwordMigratedAt' THEN jsonb_build_object('passwordMigratedAt', data->'passwordMigratedAt') ELSE '{}'::jsonb END
       || CASE WHEN NOT ($1::jsonb ? 'passwordResetAt') AND data ? 'passwordResetAt' THEN jsonb_build_object('passwordResetAt', data->'passwordResetAt') ELSE '{}'::jsonb END
       || CASE WHEN NOT ($1::jsonb ? 'passwordResetBy') AND data ? 'passwordResetBy' THEN jsonb_build_object('passwordResetBy', data->'passwordResetBy') ELSE '{}'::jsonb END
+      || CASE WHEN NOT ($1::jsonb ? 'passwordResetRequired') AND data ? 'passwordResetRequired' THEN jsonb_build_object('passwordResetRequired', data->'passwordResetRequired') ELSE '{}'::jsonb END
+      || CASE WHEN NOT ($1::jsonb ? 'passwordResetExpiresAt') AND data ? 'passwordResetExpiresAt' THEN jsonb_build_object('passwordResetExpiresAt', data->'passwordResetExpiresAt') ELSE '{}'::jsonb END
+      || CASE WHEN NOT ($1::jsonb ? 'passwordResetPending') AND data ? 'passwordResetPending' THEN jsonb_build_object('passwordResetPending', data->'passwordResetPending') ELSE '{}'::jsonb END
     WHERE name = $2
     RETURNING data
   `, [outgoing, name], { attempts: 2, label });
@@ -2800,20 +2804,28 @@ async function unbanUser(targetName, adminName) {
   return { success: true, targetName };
 }
 
-async function resetUserPassword(targetName, newPassword, adminName) {
+async function resetUserPassword(targetName, adminName) {
   if (!targetName) return { success: false, message: "Missing target user." };
   await getUserFromDb(targetName);
   if (!userDatabase[targetName]) return { success: false, message: "User not found." };
 
-  const temporaryPassword = normalizeText(newPassword, "") || generateTemporaryPassword();
-  const hash = await bcrypt.hash(temporaryPassword, 10);
-  userDatabase[targetName].passwordHash = hash;
-  userDatabase[targetName].passwordResetAt = new Date().toISOString();
+  const resetRequestedAt = Date.now();
+  const resetExpiresAt = resetRequestedAt + PASSWORD_RESET_WINDOW_MS;
+  userDatabase[targetName].passwordResetRequired = true;
+  userDatabase[targetName].passwordResetAt = new Date(resetRequestedAt).toISOString();
+  userDatabase[targetName].passwordResetExpiresAt = resetExpiresAt;
   userDatabase[targetName].passwordResetBy = adminName || "Admin";
+  delete userDatabase[targetName].passwordResetPending;
   await saveUser(targetName);
 
-  disconnectUserSessions(targetName, 'password_reset_by_admin', { by: adminName || 'Admin' });
-  return { success: true, targetName, temporaryPassword };
+  disconnectUserSessions(targetName, 'password_reset_by_admin', {
+    targetName,
+    by: adminName || 'Admin',
+    resetAt: userDatabase[targetName].passwordResetAt,
+    expiresAt: resetExpiresAt,
+    expiresInMs: PASSWORD_RESET_WINDOW_MS
+  });
+  return { success: true, targetName, resetExpiresAt, expiresInMs: PASSWORD_RESET_WINDOW_MS };
 }
 
 async function deleteUserAccount(targetName, reason, adminName) {
@@ -2954,7 +2966,7 @@ io.on('connection', (socket) => {
 
   socket.on('authenticate_user', async (data = {}) => {
     try {
-      const { name, password, isNewAccount, adminMaintenanceBypass } = data;
+      const { name, password, isNewAccount, adminMaintenanceBypass, passwordResetSubmission } = data;
       const safeUserData = (data.userData && typeof data.userData === 'object') ? data.userData : {};
       
       const dbRes = await queryDbWithRetry('SELECT data FROM users WHERE name = $1', [name], { attempts: 3, label: 'AUTH USER LOOKUP' });
@@ -2988,6 +3000,57 @@ io.on('connection', (socket) => {
       }
 
       if (dbUser) {
+        const legacyResetPending = dbUser.passwordResetPending === true;
+        const resetRequired = dbUser.passwordResetRequired === true || legacyResetPending;
+        const parsedResetAt = Date.parse(String(dbUser.passwordResetAt || ''));
+        const explicitResetExpiresAt = Number(dbUser.passwordResetExpiresAt || 0);
+        const resetExpiresAt = explicitResetExpiresAt > 0
+          ? explicitResetExpiresAt
+          : (Number.isFinite(parsedResetAt) ? parsedResetAt + PASSWORD_RESET_WINDOW_MS : 0);
+
+        if (resetRequired) {
+          if (!resetExpiresAt || resetExpiresAt <= Date.now()) {
+            delete dbUser.passwordResetRequired;
+            delete dbUser.passwordResetPending;
+            delete dbUser.passwordResetExpiresAt;
+            dbUser.profileUpdatedAt = Date.now();
+            await queryDbWithRetry('UPDATE users SET data = $1 WHERE name = $2', [dbUser, name], { attempts: 2, label: 'PASSWORD RESET EXPIRED' });
+            socket.emit('password_reset_expired', {
+              targetName: name,
+              by: dbUser.passwordResetBy || 'Admin',
+              resetAt: dbUser.passwordResetAt || null
+            });
+            return;
+          }
+
+          if (passwordResetSubmission === true) {
+            const nextPassword = String(password || '').trim();
+            if (nextPassword.length < 4) {
+              socket.emit('auth_error', 'New password is too short. Minimum 4 characters.');
+              return;
+            }
+
+            dbUser.passwordHash = await bcrypt.hash(nextPassword, 10);
+            delete dbUser.password;
+            delete dbUser.passwordResetRequired;
+            delete dbUser.passwordResetPending;
+            delete dbUser.passwordResetExpiresAt;
+            dbUser.passwordResetCompletedAt = new Date().toISOString();
+            dbUser.profileUpdatedAt = Date.now();
+            await queryDbWithRetry('UPDATE users SET data = $1 WHERE name = $2', [dbUser, name], { attempts: 2, label: 'PASSWORD RESET COMPLETE' });
+            console.log(`[AUTH] ${name} created a new password after an administrator reset.`);
+          } else {
+            socket.emit('password_reset_required', {
+              targetName: name,
+              by: dbUser.passwordResetBy || 'Admin',
+              resetAt: dbUser.passwordResetAt || null,
+              expiresAt: resetExpiresAt,
+              expiresInMs: Math.max(0, resetExpiresAt - Date.now())
+            });
+            return;
+          }
+        }
+
         if (!dbUser.passwordHash) {
           if (isNewAccount === true) {
             socket.emit('auth_error', 'This Online ID is already taken...');
@@ -2996,21 +3059,30 @@ io.on('connection', (socket) => {
 
           const legacyPassword = typeof dbUser.password === 'string' ? dbUser.password : '';
           if (!legacyPassword) {
-            socket.emit('auth_error', 'Legacy account detected. A password reset is required before this account can sign in.');
-            return;
-          }
+            const recoveryPassword = String(password || '').trim();
+            if (recoveryPassword.length < 4) {
+              socket.emit('auth_error', 'Enter a password with at least 4 characters to recover this account.');
+              return;
+            }
+            dbUser.passwordHash = await bcrypt.hash(recoveryPassword, 10);
+            dbUser.passwordRecoveredAt = new Date().toISOString();
+            dbUser.passwordRecoverySource = 'missing_credentials_login';
+            dbUser.profileUpdatedAt = Date.now();
+            await queryDbWithRetry('UPDATE users SET data = $1 WHERE name = $2', [dbUser, name], { attempts: 2, label: 'MISSING CREDENTIAL RECOVERY' });
+            console.warn(`[AUTH] Rebuilt missing credentials for ${name} from a login password.`);
+          } else {
+            if (String(password || '') !== legacyPassword) {
+              socket.emit('auth_error', 'Incorrect password. Access denied.');
+              return;
+            }
 
-          if (String(password || '') !== legacyPassword) {
-            socket.emit('auth_error', 'Incorrect password. Access denied.');
-            return;
+            dbUser.passwordHash = await bcrypt.hash(password, 10);
+            delete dbUser.password;
+            dbUser.passwordMigratedAt = new Date().toISOString();
+            dbUser.profileUpdatedAt = Date.now();
+            await queryDbWithRetry('UPDATE users SET data = $1 WHERE name = $2', [dbUser, name], { attempts: 2, label: 'LEGACY PASSWORD MIGRATION' });
+            console.log(`[AUTH] Migrated legacy password for ${name} to bcrypt.`);
           }
-
-          dbUser.passwordHash = await bcrypt.hash(password, 10);
-          delete dbUser.password;
-          dbUser.passwordMigratedAt = new Date().toISOString();
-          dbUser.profileUpdatedAt = Date.now();
-          await queryDbWithRetry('UPDATE users SET data = $1 WHERE name = $2', [dbUser, name], { attempts: 2, label: 'LEGACY PASSWORD MIGRATION' });
-          console.log(`[AUTH] Migrated legacy password for ${name} to bcrypt.`);
         }
 
         const match = await bcrypt.compare(password, dbUser.passwordHash);
@@ -3250,8 +3322,15 @@ io.on('connection', (socket) => {
             delete userData.bannedBy;
             delete userData.bannedAt;
             delete userData.passwordHash;
+            delete userData.password;
             delete userData.passwordResetAt;
             delete userData.passwordResetBy;
+            delete userData.passwordResetRequired;
+            delete userData.passwordResetExpiresAt;
+            delete userData.passwordResetPending;
+            delete userData.passwordResetCompletedAt;
+            delete userData.passwordRecoveredAt;
+            delete userData.passwordRecoverySource;
         }
 
         if (isUserBanned(userDatabase[name]) && !ADMIN_USERS.includes(name)) {
@@ -3668,10 +3747,10 @@ io.on('connection', (socket) => {
       }
 
       const commandName = lowerText.startsWith('/reset_password') ? '/reset_password' : '/resetpassword';
-      const { targetName, rest } = resolveCommandTarget(text.slice(commandName.length));
-      const result = await resetUserPassword(targetName, rest, senderName || 'Admin');
+      const { targetName } = resolveCommandTarget(text.slice(commandName.length));
+      const result = await resetUserPassword(targetName, senderName || 'Admin');
       if (result.success) {
-        await addModerationLog('reset_password', `Reset password for ${targetName} via chat command`, { targetName }, senderName || 'Admin');
+        await addModerationLog('reset_password', `Authorized a 10-minute password reset for ${targetName} via chat command`, { targetName }, senderName || 'Admin');
         socket.emit('admin_command_result', { command: 'resetpassword', ...result });
       } else {
         socket.emit('admin_command_error', { command: 'resetpassword', ...result });
@@ -3792,11 +3871,10 @@ io.on('connection', (socket) => {
       if (socket.isAdmin !== true) return respond({ success: false, message: "Admin only." });
 
       const targetName = normalizeText(data && data.targetName, "");
-      const newPassword = normalizeText(data && data.newPassword, "");
-      const result = await resetUserPassword(targetName, newPassword, socket.userName || normalizeText(data && data.adminUser, "Admin"));
+      const result = await resetUserPassword(targetName, socket.userName || normalizeText(data && data.adminUser, "Admin"));
 
       if (result.success) {
-        await addModerationLog('reset_password', `Reset temporary password for ${targetName}`, { targetName }, socket.userName || 'Admin');
+        await addModerationLog('reset_password', `Authorized a 10-minute password reset for ${targetName}`, { targetName }, socket.userName || 'Admin');
       }
 
       respond(result);

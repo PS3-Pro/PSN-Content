@@ -9074,6 +9074,7 @@ P
 	}
 	
 	let currentLoginUser = null;
+	window.__psnPasswordResetPendingUser = window.__psnPasswordResetPendingUser || '';
 	let currentAvatarIndex = 0;
 
 	/* Translate login messages before revealing them so the original fade remains smooth. */
@@ -10978,6 +10979,7 @@ P
 		const passInput = document.getElementById('login-psn-pass');
 		const pass = passInput.value.trim();
 		const rememberMe = document.getElementById('remember-me-login').checked;
+		const isPasswordResetSubmission = String(window.__psnPasswordResetPendingUser || '') === String(currentLoginUser || '');
 
 		if (!pass) {
 			if (typeof playUiError === 'function') playUiError();
@@ -11012,6 +11014,7 @@ P
 				name: currentLoginUser,
 				password: pass,
 				isNewAccount: false,
+				passwordResetSubmission: isPasswordResetSubmission,
 				adminMaintenanceBypass: document.body.classList.contains('admin-maintenance-login-bypass')
 			};
 
@@ -22089,9 +22092,7 @@ P
 		const name = decodeURIComponent(encodedName || '');
 		const myName = localStorage.getItem('psn_username') || 'Admin';
 		if (!name || name === myName) return;
-		const generated = 'PSN-' + Math.random().toString(36).slice(2, 8).toUpperCase();
-		const newPassword = prompt(`New temporary password for ${name}:`, generated);
-		if (!newPassword) {
+		if (!confirm(`Allow ${name} to create a new password? This authorization expires in 10 minutes.`)) {
 			if (typeof playUiBack === 'function') playUiBack();
 			return;
 		}
@@ -22101,7 +22102,7 @@ P
 			return;
 		}
 		let acknowledged = false;
-		socketChat.emit('admin_reset_password', { targetName: name, newPassword, adminUser: myName }, (response) => {
+		socketChat.emit('admin_reset_password', { targetName: name, adminUser: myName }, (response) => {
 			acknowledged = true;
 			if (response && response.success === false) {
 				if (typeof playUiError === 'function') playUiError();
@@ -22109,14 +22110,14 @@ P
 				return;
 			}
 			if (typeof playUiSuccess === 'function') playUiSuccess();
-			adminAddLog('reset_password', `Reset temporary password for ${name}`, { targetName: name });
-			alert(`${name}'s temporary password is: ${newPassword}`);
+			adminAddLog('reset_password', `Authorized password reset for ${name}`, { targetName: name });
+			alert(`${name} can now enter a new password. This authorization expires in 10 minutes.`);
 		});
 		setTimeout(() => {
 			if (!acknowledged) {
 				if (typeof playUiSuccess === 'function') playUiSuccess();
-				adminAddLog('reset_password', `Sent password reset request for ${name}`, { targetName: name });
-				alert(`Password reset request sent for ${name}. Temporary password: ${newPassword}`);
+				adminAddLog('reset_password', `Sent password reset authorization for ${name}`, { targetName: name });
+				alert(`Password reset authorization sent for ${name}. It expires in 10 minutes.`);
 			}
 		}, 900);
 	};
@@ -41471,6 +41472,7 @@ function getVisibleChatStackEl(id) {
 			window.__psnAutoReauthInProgress = false;
 			window.__psnAutoReauthUser = null;
 			const { name, userData, isAdmin, role, isModerator } = data;
+			if (String(window.__psnPasswordResetPendingUser || '') === String(name || '')) window.__psnPasswordResetPendingUser = '';
 			setTimeout(() => {
 				if (!(typeof socketChat !== 'undefined' && socketChat && socketChat.connected)) return;
 				if (!window.__pendingTrendingData || !window.contentDownloadCountsReady) socketChat.emit('request_trending');
@@ -41712,7 +41714,7 @@ function getVisibleChatStackEl(id) {
 				if (typeof handleCurrentUserBanned === 'function') handleCurrentUserBanned({ targetName: currentLoginUser || localStorage.getItem('psn_username') || '', reason: authMessage });
 				return;
 			}
-			if (!/legacy account/i.test(authMessage) && /(password.*reset|reset.*password|temporary password)/i.test(authMessage)) {
+			if (!/legacy account/i.test(authMessage) && /(password.*reset|reset.*password)/i.test(authMessage)) {
 				if (typeof window.psnResetLoginUiState === 'function') window.psnResetLoginUiState(currentLoginUser || localStorage.getItem('psn_username') || '');
 				if (typeof handleCurrentUserPasswordReset === 'function') handleCurrentUserPasswordReset({ targetName: currentLoginUser || localStorage.getItem('psn_username') || '' });
 				return;
@@ -42465,9 +42467,30 @@ function getVisibleChatStackEl(id) {
 			});
 		});
 
-		['password_reset', 'password_reset_required', 'admin_password_reset', 'account_password_reset'].forEach(eventName => {
+		['password_reset', 'password_reset_required', 'password_reset_by_admin', 'admin_password_reset', 'account_password_reset'].forEach(eventName => {
 			socketChat.on(eventName, (data = {}) => {
+				if (typeof window.clearLoginServerAttempt === 'function') window.clearLoginServerAttempt();
+				if (typeof isLoggingIn !== 'undefined') isLoggingIn = false;
+				window.__psnAutoReauthInProgress = false;
+				window.__psnAutoReauthUser = null;
 				if (typeof handleCurrentUserPasswordReset === 'function') handleCurrentUserPasswordReset(data || {});
+			});
+		});
+		
+		socketChat.on('password_reset_expired', (data = {}) => {
+			const targetName = String(data.targetName || data.name || '').trim();
+			if (targetName && String(window.__psnPasswordResetPendingUser || '') === targetName) window.__psnPasswordResetPendingUser = '';
+			if (targetName) localStorage.removeItem(`${targetName}_psn_password`);
+			if (typeof window.psnResetLoginUiState === 'function') window.psnResetLoginUiState(targetName || currentLoginUser || '');
+			showSessionNoticeScreen({
+				type: 'reset',
+				icon: 'fa-clock',
+				title: 'Password Reset Expired',
+				message: 'The 10-minute password reset authorization has expired.',
+				detail: 'Ask an administrator to reset the password again if you still need access.',
+				action: 'login',
+				username: targetName || currentLoginUser || '',
+				delay: 3600
 			});
 		});
 		
@@ -43396,19 +43419,26 @@ function getVisibleChatStackEl(id) {
 		const myName = localStorage.getItem('psn_username') || (typeof currentLoginUser !== 'undefined' ? currentLoginUser : '') || '';
 		const targetName = String(data.targetName || data.name || data.username || data.user || '').trim();
 		const targetId = String(data.targetId || data.id || data.socketId || '').trim();
+		const resetBy = String(data.by || data.adminUser || data.passwordResetBy || '').trim();
 		if (targetName && myName && targetName !== myName) return false;
 		if (!targetName && targetId && typeof socketChat !== 'undefined' && socketChat && targetId !== socketChat.id) return false;
-		if (myName) localStorage.removeItem(`${myName}_psn_password`);
-		if (typeof window.psnResetLoginUiState === 'function') window.psnResetLoginUiState(myName);
+		const loginName = targetName || myName;
+		if (!loginName) return false;
+		window.__psnPasswordResetPendingUser = loginName;
+		localStorage.removeItem(`${loginName}_psn_password`);
+		if (typeof currentLoginUser !== 'undefined') currentLoginUser = loginName;
+		if (typeof window.psnResetLoginUiState === 'function') window.psnResetLoginUiState(loginName);
+		const expiresAt = Number(data.expiresAt || 0);
+		const remainingMinutes = expiresAt > Date.now() ? Math.max(1, Math.ceil((expiresAt - Date.now()) / 60000)) : 10;
 		showSessionNoticeScreen({
 			type: 'reset',
 			icon: 'fa-key',
-			title: 'Password Reset',
-			message: 'An administrator reset your password. Please log in again using the new temporary password.',
-			detail: 'Your saved password was cleared on this device for security.',
+			title: 'Reset Your Password',
+			message: 'An administrator authorized a password reset for this account.',
+			detail: `${resetBy ? `${resetBy} requested the reset. ` : ''}Enter a new password on the next screen. This authorization expires in ${remainingMinutes} minute${remainingMinutes === 1 ? '' : 's'}.`,
 			action: 'login',
-			username: myName,
-			delay: 3300
+			username: loginName,
+			delay: 3600
 		});
 		return true;
 	};
@@ -51695,8 +51725,8 @@ function getVisibleChatStackEl(id) {
                 "regex": "^Are\\ you\\ sure\\ you\\ want\\ to\\ kick\\ ([\\s\\S]*?)\\?$"
         },
         {
-                "source": "New temporary password for PSNDIALOGVALUE0TOKEN:",
-                "regex": "^New\\ temporary\\ password\\ for\\ ([\\s\\S]*?):$"
+                "source": "Allow PSNDIALOGVALUE0TOKEN to create a new password? This authorization expires in 10 minutes.",
+                "regex": "^Allow\\ ([\\s\\S]*?)\\ to\\ create\\ a\\ new\\ password\\?\\ This\\ authorization\\ expires\\ in\\ 10\\ minutes\\.$"
         },
         {
                 "source": "Reason for banning PSNDIALOGVALUE0TOKEN:",
@@ -51842,12 +51872,12 @@ function getVisibleChatStackEl(id) {
                 "regex": "^File\\ \"([\\s\\S]*?)\"\\ is\\ too\\ large!\\ Max\\ 10MB\\.$"
         },
         {
-                "source": "PSNDIALOGVALUE0TOKEN's temporary password is: PSNDIALOGVALUE1TOKEN",
-                "regex": "^([\\s\\S]*?)'s\\ temporary\\ password\\ is:\\ ([\\s\\S]*?)$"
+                "source": "PSNDIALOGVALUE0TOKEN can now enter a new password. This authorization expires in 10 minutes.",
+                "regex": "^([\\s\\S]*?)\\ can\\ now\\ enter\\ a\\ new\\ password\\.\\ This\\ authorization\\ expires\\ in\\ 10\\ minutes\\.$"
         },
         {
-                "source": "Password reset request sent for PSNDIALOGVALUE0TOKEN. Temporary password: PSNDIALOGVALUE1TOKEN",
-                "regex": "^Password\\ reset\\ request\\ sent\\ for\\ ([\\s\\S]*?)\\.\\ Temporary\\ password:\\ ([\\s\\S]*?)$"
+                "source": "Password reset authorization sent for PSNDIALOGVALUE0TOKEN. It expires in 10 minutes.",
+                "regex": "^Password\\ reset\\ authorization\\ sent\\ for\\ ([\\s\\S]*?)\\.\\ It\\ expires\\ in\\ 10\\ minutes\\.$"
         },
         {
                 "source": "Unban request sent for PSNDIALOGVALUE0TOKEN.",
@@ -51926,8 +51956,8 @@ function getVisibleChatStackEl(id) {
                 "regex": "^Are\\ you\\ sure\\ you\\ want\\ to\\ kick\\ ([\\s\\S]*?)\\?$"
         },
         {
-                "source": "New temporary password for PSNDIALOGVALUE0TOKEN:",
-                "regex": "^New\\ temporary\\ password\\ for\\ ([\\s\\S]*?):$"
+                "source": "Allow PSNDIALOGVALUE0TOKEN to create a new password? This authorization expires in 10 minutes.",
+                "regex": "^Allow\\ ([\\s\\S]*?)\\ to\\ create\\ a\\ new\\ password\\?\\ This\\ authorization\\ expires\\ in\\ 10\\ minutes\\.$"
         },
         {
                 "source": "Reason for banning PSNDIALOGVALUE0TOKEN:",
