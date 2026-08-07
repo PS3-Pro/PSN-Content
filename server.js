@@ -1978,16 +1978,50 @@ async function getUserDataPayloadFromDb(targetName, type) {
   return payload;
 }
 
+async function ensureFullUserCacheForWrite(name) {
+  if (!name || !userDatabase[name]) return null;
+  if (fullUserCacheNames.has(name)) return userDatabase[name];
+  const loaded = await refreshSingleUserCacheFromDb(name, { forceDuringWrite: true });
+  if (!loaded) return null;
+  return userDatabase[name];
+}
+
+async function updateUserDataPreservingCredentials(name, userData, label = 'USER DATA SAVE') {
+  const outgoing = normalizeUserRecord(name, userData || {});
+  const outgoingHasPasswordHash = Object.prototype.hasOwnProperty.call(outgoing, 'passwordHash') && !!outgoing.passwordHash;
+  const outgoingHasLegacyPassword = Object.prototype.hasOwnProperty.call(outgoing, 'password') && typeof outgoing.password === 'string' && outgoing.password.length > 0;
+  const result = await queryDbWithRetry(`
+    UPDATE users
+    SET data = $1::jsonb
+      || CASE WHEN NOT ($1::jsonb ? 'passwordHash') AND data ? 'passwordHash' THEN jsonb_build_object('passwordHash', data->'passwordHash') ELSE '{}'::jsonb END
+      || CASE WHEN NOT ($1::jsonb ? 'password') AND data ? 'password' THEN jsonb_build_object('password', data->'password') ELSE '{}'::jsonb END
+      || CASE WHEN NOT ($1::jsonb ? 'passwordMigratedAt') AND data ? 'passwordMigratedAt' THEN jsonb_build_object('passwordMigratedAt', data->'passwordMigratedAt') ELSE '{}'::jsonb END
+      || CASE WHEN NOT ($1::jsonb ? 'passwordResetAt') AND data ? 'passwordResetAt' THEN jsonb_build_object('passwordResetAt', data->'passwordResetAt') ELSE '{}'::jsonb END
+      || CASE WHEN NOT ($1::jsonb ? 'passwordResetBy') AND data ? 'passwordResetBy' THEN jsonb_build_object('passwordResetBy', data->'passwordResetBy') ELSE '{}'::jsonb END
+    WHERE name = $2
+    RETURNING data
+  `, [outgoing, name], { attempts: 2, label });
+
+  if (!result.rows.length) return null;
+  const saved = normalizeUserRecord(name, result.rows[0].data || {});
+  if ((!outgoingHasPasswordHash && saved.passwordHash) || (!outgoingHasLegacyPassword && saved.password)) {
+    console.warn(`[CREDENTIAL GUARD] ${label} preserved existing credentials for ${name}. Outgoing cache was missing credential fields.`);
+  }
+  userDatabase[name] = saved;
+  userCacheMeta[name] = Date.now();
+  fullUserCacheNames.add(name);
+  return saved;
+}
+
 async function saveUser(name, options = {}) {
   if (!name || !userDatabase[name]) return;
-  if (!fullUserCacheNames.has(name)) {
-    const loaded = await refreshSingleUserCacheFromDb(name, { forceDuringWrite: true });
-    if (!loaded) return;
-  }
+  const loaded = await ensureFullUserCacheForWrite(name);
+  if (!loaded) return;
   userDatabase[name] = normalizeUserRecord(name, userDatabase[name]);
   userDatabase[name].profileUpdatedAt = Date.now();
   userCacheMeta[name] = Date.now();
-  await queryDbWithRetry('UPDATE users SET data = $1 WHERE name = $2', [userDatabase[name], name], { attempts: 2, label: 'USER PROFILE SAVE' });
+  const saved = await updateUserDataPreservingCredentials(name, userDatabase[name], 'USER PROFILE SAVE');
+  if (!saved) return;
   invalidateOnlineListCache('save-user');
   if (options.notify !== false) {
     await notifyProfileSyncAcrossInstances(name, options.sourceSocketId || null, userDatabase[name].profileUpdatedAt);
@@ -3110,6 +3144,8 @@ io.on('connection', (socket) => {
   socket.on('settings_realtime_update', async (payload = {}) => {
     const name = socket.userName;
     if (!name || !userDatabase[name]) return;
+    const fullUser = await ensureFullUserCacheForWrite(name);
+    if (!fullUser) return;
 
     const incomingSettingsData = (payload && payload.settingsData && typeof payload.settingsData === "object")
       ? { ...payload.settingsData }
@@ -3148,7 +3184,8 @@ io.on('connection', (socket) => {
     try {
       await upsertPresenceForSocket(socket, name);
       userCacheMeta[name] = Date.now();
-      await queryDbWithRetry('UPDATE users SET data = $1 WHERE name = $2', [userDatabase[name], name], { attempts: 2, label: 'SETTINGS SAVE' });
+      const savedUser = await updateUserDataPreservingCredentials(name, userDatabase[name], 'SETTINGS SAVE');
+      if (!savedUser) return;
       invalidateOnlineListCache('settings-realtime-save');
     } catch (err) {
       console.error(`[DATABASE ERROR] Failed to save realtime settings for ${name}:`, err);
@@ -3168,6 +3205,9 @@ io.on('connection', (socket) => {
 
   socket.on('update_profile', async (userData) => {
     const name = socket.userName;
+    if (!name || !userDatabase[name]) return;
+    const fullUser = await ensureFullUserCacheForWrite(name);
+    if (!fullUser) return;
     userData = (userData && typeof userData === "object") ? userData : {};
     const incomingSettingsData = (userData.settingsData && typeof userData.settingsData === "object") ? userData.settingsData : null;
     const previousCountryCode = name && userDatabase[name] ? getUserCountryCode(userDatabase[name]) : "";
@@ -3251,7 +3291,8 @@ io.on('connection', (socket) => {
         try {
             await upsertPresenceForSocket(socket, name);
             userCacheMeta[name] = Date.now();
-            await queryDbWithRetry('UPDATE users SET data = $1 WHERE name = $2', [userDatabase[name], name], { attempts: 2, label: 'PROFILE SAVE' });
+            const savedUser = await updateUserDataPreservingCredentials(name, userDatabase[name], 'PROFILE SAVE');
+            if (!savedUser) return;
             invalidateOnlineListCache('profile-update-save');
         } catch (err) {
             console.error(`[DATABASE ERROR] Failed to save profile for ${name}:`, err);
