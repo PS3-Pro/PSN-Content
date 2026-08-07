@@ -3413,11 +3413,37 @@ io.on('connection', (socket) => {
         socket.emit('mention_users_results', searchUserNamesFromCache(query));
         return;
       }
-      const results = await searchUsersFromDb(query, socket.isAdmin === true && purpose === 'admin', purpose === 'friends');
+      if (purpose === 'admin') {
+        if (socket.isAdmin !== true) {
+          socket.emit('admin_users_results', { query, offset: 0, limit: 0, total: 0, results: [] });
+          return;
+        }
+        const offset = Math.max(0, parseInt(request && request.offset, 10) || 0);
+        const limit = Math.max(1, Math.min(1000, parseInt(request && request.limit, 10) || 25));
+        const filter = normalizeText(request && request.filter, 'all').toLowerCase();
+        const names = searchUserNamesFromCache(query).filter(username => {
+          const user = userDatabase[username] || {};
+          const role = getUserRole(username, user);
+          const banned = isUserBanned(user);
+          if (filter === 'online') return user.online === true;
+          if (filter === 'offline') return user.online !== true;
+          if (filter === 'admin') return isUserAdmin(username, user);
+          if (filter === 'mod') return role === 'mod';
+          if (filter === 'trusted') return role === 'trusted';
+          if (filter === 'banned') return banned;
+          if (filter === 'user') return !isUserAdmin(username, user) && !banned && role === 'user';
+          return true;
+        });
+        const results = names.slice(offset, offset + limit).map(username => getPublicUserData(username, userDatabase[username], true));
+        socket.emit('admin_users_results', { query, filter, offset, limit, total: names.length, results });
+        return;
+      }
+      const results = await searchUsersFromDb(query, false, purpose === 'friends');
       socket.emit('global_search_results', results);
     } catch (err) {
       console.error('[SEARCH USERS DB ERROR]:', err);
       if (purpose === 'mentions') socket.emit('mention_users_results', []);
+      else if (purpose === 'admin') socket.emit('admin_users_results', { query, offset: 0, limit: 0, total: 0, results: [] });
       else socket.emit('global_search_results', []);
     }
   });

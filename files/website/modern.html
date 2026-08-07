@@ -21095,7 +21095,8 @@ P
 
 	function adminGetDiagnostics() {
 		const myName = localStorage.getItem('psn_username') || 'Guest';
-		const loadedItems = Array.isArray(window.currentData) ? window.currentData.length : (typeof currentData !== 'undefined' && Array.isArray(currentData) ? currentData.length : 0);
+		const loadedCacheItems = window.psnStoreCache && typeof window.psnStoreCache === 'object' ? Object.values(window.psnStoreCache).reduce((total, items) => total + (Array.isArray(items) ? items.length : 0), 0) : 0;
+		const loadedItems = loadedCacheItems || (typeof currentData !== 'undefined' && Array.isArray(currentData) ? currentData.length : 0);
 		const allKnownUsers = adminGetAllKnownUsers();
 		const onlineUsers = allKnownUsers.filter(u => u && u.online === true);
 		const trophyCount = window.userTrophies ? Object.values(window.userTrophies).filter(t => t && t.unlocked).length : 0;
@@ -21213,7 +21214,8 @@ P
 		window.adminRenderLimit = adminGetUsersBatchSize();
 		adminSyncUserFilterControls();
 		if (typeof playUiClick === 'function') playUiClick();
-		renderAdminPanel();
+		if (typeof socketChat !== 'undefined' && socketChat && socketChat.connected) adminRequestUsersList(true, true, false);
+		else renderAdminPanel();
 	};
 
 	window.adminResetUserFilters = function() {
@@ -21245,7 +21247,7 @@ P
 		adminResetUsersPanelState();
 		renderAdminPanel();
 		setTimeout(() => { const list = document.getElementById('admin-online-list'); if (list) list.scrollTop = 0; }, 0);
-		setTimeout(() => adminRequestUsersList(true, false), 250);
+		setTimeout(() => adminRequestUsersList(true, true), 250);
 		setTimeout(() => {
 			if (typeof moveNavLight === 'function') moveNavLight();
 			if (typeof updateSidebarLight === 'function') updateSidebarLight();
@@ -21266,7 +21268,11 @@ P
 
 	window.adminHandleUserSearchInput = function(input) {
 		window.adminRenderLimit = adminGetUsersBatchSize();
-		renderAdminPanel();
+		clearTimeout(window.adminUserSearchTimer);
+		window.adminUserSearchTimer = setTimeout(() => {
+			if (typeof socketChat !== 'undefined' && socketChat && socketChat.connected) adminRequestUsersList(true, true, false);
+			else renderAdminPanel();
+		}, 220);
 	};
 
 	window.adminUserSearchKeydown = function(e) {
@@ -21290,7 +21296,9 @@ P
 		if (typeof playUiBack === 'function') playUiBack();
 		input.value = '';
 		window.adminRenderLimit = adminGetUsersBatchSize();
-		renderAdminPanel();
+		clearTimeout(window.adminUserSearchTimer);
+		if (typeof socketChat !== 'undefined' && socketChat && socketChat.connected) adminRequestUsersList(true, true, false);
+		else renderAdminPanel();
 		setTimeout(() => { try { input.focus(); } catch(e) {} }, 0);
 	};
 
@@ -21365,24 +21373,28 @@ P
 				return matchesSearch && adminUserMatchesFilter(u, userFilterMode);
 			});
 			const countPill = document.getElementById('admin-user-count-pill');
-			const hasFullUserCache = Array.isArray(window.adminAllUsers) && window.adminAllUsers.length > 0;
+			const hasLoadedUserBatch = Array.isArray(window.adminAllUsers) && window.adminAllUsers.length > 0;
 			const batchSize = adminGetUsersBatchSize();
 			const renderLimit = Math.max(1, parseInt(window.adminRenderLimit || batchSize, 10) || batchSize);
 			const visibleUsers = filteredUsers.slice(0, renderLimit);
-			const hiddenCount = Math.max(0, filteredUsers.length - visibleUsers.length);
+			const resultTotal = Math.max(0, Number(window.adminUsersResultTotal) || 0);
+			const loadedServerUsers = Array.isArray(window.adminAllUsers) ? window.adminAllUsers.length : 0;
+			const remoteHiddenCount = Math.max(0, resultTotal - loadedServerUsers);
+			const localHiddenCount = Math.max(0, filteredUsers.length - visibleUsers.length);
+			const hiddenCount = Math.max(remoteHiddenCount, localHiddenCount);
 			const note = document.getElementById('admin-user-load-note');
 			if (countPill) {
-				const authoritativeTotal = (!filter && userFilterMode === 'all') ? (Number(window.adminRegisteredUsers) || 0) : 0;
-				const denominator = Math.max(authoritativeTotal, allKnownUsers.length, filteredUsers.length, visibleUsers.length);
+				const authoritativeTotal = (!filter && userFilterMode === 'all') ? (Number(window.adminRegisteredUsers) || 0) : resultTotal;
+				const denominator = Math.max(authoritativeTotal, resultTotal, visibleUsers.length);
 				countPill.textContent = `Showing ${visibleUsers.length}/${denominator}`;
 			}
 			if (note) {
 				if (window.adminUsersLoading) {
-					note.innerHTML = '<i class="fas fa-circle-notch fa-spin"></i> Loading registered users without freezing the panel...';
-				} else if (!hasFullUserCache) {
-					note.innerHTML = '<i class="fas fa-layer-group"></i> User list is using batches. Use Refresh Users to update the registered list; the Load field controls how many appear per click.';
+					note.innerHTML = '<i class="fas fa-circle-notch fa-spin"></i> Loading user batch...';
+				} else if (!hasLoadedUserBatch) {
+					note.innerHTML = '<i class="fas fa-layer-group"></i> Users load in batches. The Load field controls how many the server sends per request.';
 				} else if (hiddenCount > 0) {
-					note.innerHTML = `<i class="fas fa-layer-group"></i> Showing ${visibleUsers.length} users now. ${hiddenCount} more hidden to keep the admin panel smooth.`;
+					note.innerHTML = `<i class="fas fa-layer-group"></i> Showing ${visibleUsers.length} users now. ${hiddenCount} more available.`;
 				} else {
 					note.innerHTML = '<i class="fas fa-check-circle"></i> User list loaded.';
 				}
@@ -21541,21 +21553,21 @@ P
 		if (typeof adminRenderControlPanels === 'function') adminRenderControlPanels();
 	};
 
-	window.adminRequestUsersList = function(silent = false, includeRegistered = true) {
+	window.adminRequestUsersList = function(silent = false, includeRegistered = true, append = false) {
 		if (!adminGuard(!silent)) return;
 		window.adminLastUsersRequest = Date.now();
-		window.adminRenderLimit = window.adminRenderLimit || adminGetUsersBatchSize();
+		const batchSize = adminGetUsersBatchSize();
 		if (typeof socketChat !== 'undefined' && socketChat && socketChat.connected) {
 			socketChat.emit('request_online_list');
 
 			if (includeRegistered) {
-				const now = Date.now();
-				const recentlyRequestedFullList = window.adminLastFullUsersRequest && (now - window.adminLastFullUsersRequest < 30000);
-				if (!recentlyRequestedFullList || !silent) {
-					window.adminLastFullUsersRequest = now;
-					window.adminUsersLoading = true;
-					socketChat.emit('search_users', { query: '*', purpose: 'admin' });
-				}
+				const searchInput = document.getElementById('admin-user-search');
+				const query = String(searchInput && searchInput.value || '').trim() || '*';
+				const filter = adminGetUserFilterMode();
+				const offset = append && Array.isArray(window.adminAllUsers) ? window.adminAllUsers.length : 0;
+				window.adminUsersLoading = true;
+				if (!append) window.adminRenderLimit = batchSize;
+				socketChat.emit('search_users', { query, purpose: 'admin', filter, offset, limit: batchSize });
 			}
 
 			if (!silent && typeof playUiSuccess === 'function') playUiSuccess();
@@ -21566,7 +21578,7 @@ P
 				alert('Socket is offline. Showing only locally cached users.');
 			}
 		}
-		setTimeout(renderAdminPanel, includeRegistered ? 650 : 250);
+		setTimeout(renderAdminPanel, includeRegistered ? 350 : 250);
 	};
 
 	window.adminRequestOnlineList = function() {
@@ -21574,9 +21586,8 @@ P
 	};
 
 	window.adminShowMoreUsers = function() {
-		const batchSize = adminGetUsersBatchSize();
-		window.adminRenderLimit = (window.adminRenderLimit || batchSize) + batchSize;
-		renderAdminPanel();
+		if (window.adminUsersLoading) return;
+		adminRequestUsersList(true, true, true);
 	};
 
 	window.adminBroadcastImages = window.adminBroadcastImages || [];
@@ -41943,6 +41954,24 @@ function getVisibleChatStackEl(id) {
 			if (mentionDbChanged && typeof refreshMentionJumpButton === 'function') refreshMentionJumpButton();
 		});
 
+		socketChat.on('admin_users_results', function(payload) {
+			const results = payload && Array.isArray(payload.results) ? payload.results : [];
+			const offset = Math.max(0, Number(payload && payload.offset) || 0);
+			const total = Math.max(0, Number(payload && payload.total) || 0);
+			if (offset === 0) {
+				window.adminAllUsers = results;
+			} else {
+				const merged = new Map((Array.isArray(window.adminAllUsers) ? window.adminAllUsers : []).map(user => [String(user && user.name || '').toLowerCase(), user]));
+				results.forEach(user => { const key = String(user && user.name || '').toLowerCase(); if (key) merged.set(key, user); });
+				window.adminAllUsers = Array.from(merged.values());
+			}
+			window.adminUsersResultTotal = total;
+			window.adminRenderLimit = Math.max(adminGetUsersBatchSize(), Array.isArray(window.adminAllUsers) ? window.adminAllUsers.length : 0);
+			window.adminUsersLoading = false;
+			if (Array.isArray(results) && typeof window.syncPsnUserMeta === 'function') results.forEach(user => window.syncPsnUserMeta(user));
+			if (document.getElementById('view-admin')?.style.display === 'block' && typeof renderAdminPanel === 'function') renderAdminPanel();
+		});
+
 		socketChat.on('global_search_results', function(results) {
 			window.globalSearchResults = results;
 			const mentionDbChanged = (typeof mergeChatMentionDatabaseUsers === 'function') ? mergeChatMentionDatabaseUsers(results) : false;
@@ -41960,13 +41989,6 @@ function getVisibleChatStackEl(id) {
 				if (profileModal && (profileModal.style.display === 'flex' || profileModal.classList.contains('show')) && typeof openProfileModal === 'function') {
 					setTimeout(() => openProfileModal(encodeURIComponent(openProfileTarget)), 0);
 				}
-			}
-			window.adminUsersLoading = false;
-			const adminView = document.getElementById('view-admin');
-			const adminRecentlyRequested = window.adminLastUsersRequest && (Date.now() - window.adminLastUsersRequest < 10000);
-			if (document.body.classList.contains('is-admin') && (adminRecentlyRequested || (adminView && adminView.style.display === 'block'))) {
-				window.adminAllUsers = Array.isArray(results) ? results : [];
-				if (adminView && adminView.style.display === 'block' && typeof renderAdminPanel === 'function') renderAdminPanel();
 			}
 			const term = document.getElementById('search-input').value;
 			if (typeof isFriendsSubviewVisible === 'function' && isFriendsSubviewVisible()) {
