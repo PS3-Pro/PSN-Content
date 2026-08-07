@@ -1876,6 +1876,7 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 .ps5-form-label { font-size: 11px; font-weight: 600; color: rgba(255,255,255,0.6); text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px; margin-left: 5px; }
 .ps5-auth-input { background: rgba(20,20,20,0.8); border: 2px solid rgba(255,255,255,0.15); border-radius: 8px; color: #ffffff; padding: 15px 20px; font-size: 16px; outline: none; transition: all 0.2s ease; width: 100%; box-sizing: border-box; }
 .ps5-auth-input:focus { border-color: #ffffff; background: rgba(0,0,0,0.9); box-shadow: 0 0 15px rgba(255,255,255,0.1); }
+#login-psn-pass.password-reset-mode, #login-psn-pass.password-reset-mode:focus { border-color: #ffcc00 !important; box-shadow: 0 0 16px rgba(255,204,0,0.28) !important; }
 .ps5-auth-input::placeholder { color: rgba(255,255,255,0.3); }
 .psn-id-rules-hint { margin: 8px 5px 0; font-size: 11px; line-height: 1.35; color: rgba(255,255,255,.42); letter-spacing: .2px; }
 .psn-id-rules-hint strong { color: rgba(255,255,255,.72); font-weight: 700; }
@@ -9075,6 +9076,50 @@ P
 	
 	let currentLoginUser = null;
 	window.__psnPasswordResetUser = window.__psnPasswordResetUser || '';
+	window.__psnPasswordResetExpiryTimer = window.__psnPasswordResetExpiryTimer || null;
+
+	window.setPasswordResetLoginMode = function(username = '', enabled = true) {
+		const name = String(username || '').trim();
+		if (enabled && name) {
+			window.__psnPasswordResetUser = name;
+		} else if (!enabled && (!name || String(window.__psnPasswordResetUser || '') === name)) {
+			window.__psnPasswordResetUser = '';
+		}
+		const activeName = String(window.__psnPasswordResetUser || '');
+		const active = !!activeName && (!name || activeName === name);
+		const passwordLabel = document.getElementById('login-password-label');
+		const passInput = document.getElementById('login-psn-pass');
+		if (passwordLabel) passwordLabel.innerText = active ? 'Enter New Password' : 'Enter Password';
+		if (passInput) passInput.classList.toggle('password-reset-mode', active);
+		return active;
+	};
+
+	window.clearPasswordResetExpiryTimer = function() {
+		if (window.__psnPasswordResetExpiryTimer) {
+			clearTimeout(window.__psnPasswordResetExpiryTimer);
+			window.__psnPasswordResetExpiryTimer = null;
+		}
+	};
+
+	window.schedulePasswordResetExpiry = function(username = '', expiresAt = 0) {
+		window.clearPasswordResetExpiryTimer();
+		const name = String(username || '').trim();
+		const expiry = Number(expiresAt || 0);
+		if (!name || !Number.isFinite(expiry) || expiry <= Date.now()) return;
+		window.__psnPasswordResetExpiryTimer = setTimeout(() => {
+			window.__psnPasswordResetExpiryTimer = null;
+			if (String(window.__psnPasswordResetUser || '') !== name) return;
+			window.setPasswordResetLoginMode(name, false);
+			localStorage.removeItem(`${name}_psn_password`);
+			if (typeof currentLoginUser !== 'undefined') currentLoginUser = name;
+			if (typeof window.psnResetLoginUiState === 'function') window.psnResetLoginUiState(name);
+			const passInput = document.getElementById('login-psn-pass');
+			if (passInput) {
+				passInput.value = '';
+				passInput.classList.remove('password-reset-mode');
+			}
+		}, Math.max(0, expiry - Date.now()) + 50);
+	};
 	let currentAvatarIndex = 0;
 
 	/* Translate login messages before revealing them so the original fade remains smooth. */
@@ -10873,11 +10918,8 @@ P
 		
 		if (typeof playUiClick === 'function') playUiClick();
 		currentLoginUser = username;
-		const passwordLabel = document.getElementById('login-password-label');
-		if (passwordLabel) {
-			passwordLabel.innerText = String(window.__psnPasswordResetUser || '') === String(username || '')
-				? 'Enter New Password'
-				: 'Enter Password';
+		if (typeof window.setPasswordResetLoginMode === 'function') {
+			window.setPasswordResetLoginMode(username, String(window.__psnPasswordResetUser || '') === String(username || ''));
 		}
 
 		const savedPass = localStorage.getItem(`${username}_psn_password`);
@@ -34117,7 +34159,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
     // CHAT LOGIC
     // ==========================================================================
     const serverUrls = [
-		"https://psn-content-6enm.onrender.com/",
+		"https://psn-content-0u8u.onrender.com/",
 		
 
 		// Expired
@@ -41494,10 +41536,9 @@ function getVisibleChatStackEl(id) {
 			window.__psnAutoReauthInProgress = false;
 			window.__psnAutoReauthUser = null;
 			const { name, userData, isAdmin, role, isModerator } = data;
-			if (String(window.__psnPasswordResetUser || '') === String(name || '')) window.__psnPasswordResetUser = '';
+			if (typeof window.clearPasswordResetExpiryTimer === 'function') window.clearPasswordResetExpiryTimer();
+			if (typeof window.setPasswordResetLoginMode === 'function') window.setPasswordResetLoginMode(name, false);
 			if (typeof isKicked !== 'undefined') isKicked = false;
-			const passwordLabel = document.getElementById('login-password-label');
-			if (passwordLabel) passwordLabel.innerText = 'Enter Password';
 			setTimeout(() => {
 				if (!(typeof socketChat !== 'undefined' && socketChat && socketChat.connected)) return;
 				if (!window.__pendingTrendingData || !window.contentDownloadCountsReady) socketChat.emit('request_trending');
@@ -41745,7 +41786,14 @@ function getVisibleChatStackEl(id) {
 				if (typeof showToastNotification === 'function') showToastNotification('Network', 'Temporary login sync failed. Your saved session was kept.');
 				else console.warn('[NETWORK]', authMessage);
 			} else {
-				alert(msg);
+				const resetExpired = /(password reset authorization is not active|password reset expired)/i.test(authMessage);
+				if (resetExpired) {
+					if (typeof window.clearPasswordResetExpiryTimer === 'function') window.clearPasswordResetExpiryTimer();
+					if (typeof window.setPasswordResetLoginMode === 'function') window.setPasswordResetLoginMode(currentLoginUser || '', false);
+					alert('Password Reset Expired\n\nAsk an administrator to authorize another password reset.');
+				} else {
+					alert(msg);
+				}
 			}
 			
 			const btnCreate = document.getElementById('btn-create-profile');
@@ -41768,7 +41816,10 @@ function getVisibleChatStackEl(id) {
 				passInput.style.borderColor = '#ff4444';
 				passInput.value = '';
 				passInput.focus();
-				setTimeout(() => passInput.style.borderColor = '', 1000);
+				setTimeout(() => {
+					passInput.style.borderColor = '';
+					passInput.classList.toggle('password-reset-mode', String(window.__psnPasswordResetUser || '') === String(currentLoginUser || ''));
+				}, 1000);
 			}
 
 			const shouldClearSavedPassword = /(incorrect password|access denied|already taken)/i.test(authMessage) && !isTransientAuthError;
@@ -42493,27 +42544,24 @@ function getVisibleChatStackEl(id) {
 				if (typeof isLoggingIn !== 'undefined') isLoggingIn = false;
 				window.__psnAutoReauthInProgress = false;
 				window.__psnAutoReauthUser = null;
-				if (typeof handleCurrentUserPasswordReset === 'function') handleCurrentUserPasswordReset(data || {});
+				if (typeof handleCurrentUserPasswordReset === 'function') {
+					handleCurrentUserPasswordReset({ ...(data || {}), resetEventName: eventName });
+				}
 			});
 		});
 		
 		socketChat.on('password_reset_expired', (data = {}) => {
-			const targetName = String(data.targetName || data.name || '').trim();
-			window.__psnPasswordResetUser = '';
-			const passwordLabel = document.getElementById('login-password-label');
-			if (passwordLabel) passwordLabel.innerText = 'Enter Password';
+			const targetName = String(data.targetName || data.name || currentLoginUser || '').trim();
+			if (typeof window.clearPasswordResetExpiryTimer === 'function') window.clearPasswordResetExpiryTimer();
+			if (typeof window.setPasswordResetLoginMode === 'function') window.setPasswordResetLoginMode(targetName, false);
 			if (targetName) localStorage.removeItem(`${targetName}_psn_password`);
-			if (typeof window.psnResetLoginUiState === 'function') window.psnResetLoginUiState(targetName || currentLoginUser || '');
-			showSessionNoticeScreen({
-				type: 'reset',
-				icon: 'fa-clock',
-				title: 'Password Reset Expired',
-				message: 'The 10-minute password reset authorization has expired.',
-				detail: 'Ask an administrator to authorize another password reset.',
-				action: 'blank',
-				username: targetName || currentLoginUser || '',
-				delay: 3600
-			});
+			if (typeof currentLoginUser !== 'undefined' && targetName) currentLoginUser = targetName;
+			if (typeof window.psnResetLoginUiState === 'function') window.psnResetLoginUiState(targetName);
+			if (typeof playUiError === 'function') playUiError();
+			alert('Password Reset Expired\n\nAsk an administrator to authorize another password reset.');
+			setTimeout(() => {
+				if (targetName && typeof promptLogin === 'function') promptLogin(targetName);
+			}, 0);
 		});
 		
 		socketChat.on('kick_success', function(data) {
@@ -43322,11 +43370,8 @@ function getVisibleChatStackEl(id) {
 		const passInput = document.getElementById('login-psn-pass');
 		const avatarPreview = document.getElementById('login-avatar-preview');
 		const nameDisplay = document.getElementById('login-username-display');
-		const passwordLabel = document.getElementById('login-password-label');
-		if (passwordLabel) {
-			passwordLabel.innerText = String(window.__psnPasswordResetUser || '') === String(name || '')
-				? 'Enter New Password'
-				: 'Enter Password';
+		if (typeof window.setPasswordResetLoginMode === 'function') {
+			window.setPasswordResetLoginMode(name, String(window.__psnPasswordResetUser || '') === String(name || ''));
 		}
 
 		if (bootContainer) {
@@ -43346,6 +43391,7 @@ function getVisibleChatStackEl(id) {
 			if (passInput) {
 				passInput.value = '';
 				passInput.style.borderColor = '';
+				if (String(window.__psnPasswordResetUser || '') === String(name || '')) passInput.classList.add('password-reset-mode');
 			}
 			if (userSelect) userSelect.style.opacity = '0';
 			if (loginOverlay && typeof showPs5AuthOverlay === 'function') showPs5AuthOverlay(loginOverlay);
@@ -43406,28 +43452,31 @@ function getVisibleChatStackEl(id) {
 		document.body.appendChild(screen);
 		const delay = Number.isFinite(options.delay) ? options.delay : 3200;
 		setTimeout(() => {
-			if (options.action === 'reset-login') {
+			if (options.action === 'reset-direct') {
 				const name = String(options.username || '').trim();
 				screen.remove();
-				window.__psnPasswordResetUser = name;
+				if (typeof window.psnResetLoginUiState === 'function') window.psnResetLoginUiState(name);
+				if (typeof window.setPasswordResetLoginMode === 'function') window.setPasswordResetLoginMode(name, true);
+				if (typeof currentLoginUser !== 'undefined') currentLoginUser = name;
+				if (typeof promptLogin === 'function') promptLogin(name);
+			} else if (options.action === 'reset-login') {
+				const name = String(options.username || '').trim();
+				screen.remove();
+				if (typeof window.setPasswordResetLoginMode === 'function') window.setPasswordResetLoginMode(name, true);
 				if (typeof logOut === 'function') {
 					logOut({
 						force: true,
 						afterLogout: () => {
-							window.__psnPasswordResetUser = name;
+							if (typeof window.setPasswordResetLoginMode === 'function') window.setPasswordResetLoginMode(name, true);
 							if (typeof currentLoginUser !== 'undefined') currentLoginUser = name;
-							const passwordLabel = document.getElementById('login-password-label');
-							if (passwordLabel) passwordLabel.innerText = 'Enter New Password';
 							if (typeof promptLogin === 'function') promptLogin(name);
 						}
 					});
 				} else {
 					psnReturnToLoginScreen(name);
 					setTimeout(() => {
-						window.__psnPasswordResetUser = name;
+						if (typeof window.setPasswordResetLoginMode === 'function') window.setPasswordResetLoginMode(name, true);
 						if (typeof currentLoginUser !== 'undefined') currentLoginUser = name;
-						const passwordLabel = document.getElementById('login-password-label');
-						if (passwordLabel) passwordLabel.innerText = 'Enter New Password';
 						if (typeof promptLogin === 'function') promptLogin(name);
 					}, 500);
 				}
@@ -43469,28 +43518,33 @@ function getVisibleChatStackEl(id) {
 	};
 
 	window.handleCurrentUserPasswordReset = function(data = {}) {
-		const myName = localStorage.getItem('psn_username') || (typeof currentLoginUser !== 'undefined' ? currentLoginUser : '') || '';
+		const storedSessionName = localStorage.getItem('psn_username') || '';
+		const myName = storedSessionName || (typeof currentLoginUser !== 'undefined' ? currentLoginUser : '') || '';
 		const targetName = String(data.targetName || data.name || data.username || data.user || '').trim();
 		const targetId = String(data.targetId || data.id || data.socketId || '').trim();
 		const resetBy = String(data.by || data.adminUser || data.passwordResetBy || '').trim();
-		if (targetName && myName && targetName !== myName) return false;
+		const resetEventName = String(data.resetEventName || '').trim();
+		if (targetName && myName && targetName !== myName && window.isProfileLoaded === true) return false;
 		if (!targetName && targetId && typeof socketChat !== 'undefined' && socketChat && targetId !== socketChat.id) return false;
 		const loginName = targetName || myName;
 		if (!loginName) return false;
-		window.__psnPasswordResetUser = loginName;
-		localStorage.removeItem(`${loginName}_psn_password`);
-		if (typeof currentLoginUser !== 'undefined') currentLoginUser = loginName;
-		const passwordLabel = document.getElementById('login-password-label');
-		if (passwordLabel) passwordLabel.innerText = 'Enter New Password';
+
+		const isAuthenticatedSession = window.isProfileLoaded === true && storedSessionName === loginName;
 		const expiresAt = Number(data.expiresAt || 0);
 		const remainingMinutes = expiresAt > Date.now() ? Math.max(1, Math.ceil((expiresAt - Date.now()) / 60000)) : 10;
+
+		if (typeof window.setPasswordResetLoginMode === 'function') window.setPasswordResetLoginMode(loginName, true);
+		if (typeof window.schedulePasswordResetExpiry === 'function') window.schedulePasswordResetExpiry(loginName, expiresAt);
+		localStorage.removeItem(`${loginName}_psn_password`);
+		if (typeof currentLoginUser !== 'undefined') currentLoginUser = loginName;
+
 		showSessionNoticeScreen({
 			type: 'reset',
 			icon: 'fa-key',
 			title: 'Reset Your Password',
 			message: 'An administrator authorized a password reset for this account.',
 			detail: `${resetBy ? `${resetBy} requested the reset. ` : ''}Enter a new password on the next screen. This authorization expires in ${remainingMinutes} minute${remainingMinutes === 1 ? '' : 's'}.`,
-			action: 'reset-login',
+			action: isAuthenticatedSession && resetEventName === 'password_reset_by_admin' ? 'reset-login' : 'reset-direct',
 			username: loginName,
 			delay: 3600
 		});

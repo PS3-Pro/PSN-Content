@@ -23,7 +23,7 @@ const CHAT_SYNC_INTERVAL_MS = 3000;
 const KEEP_ALIVE_INTERVAL_MS = Math.max(60000, parseInt(process.env.KEEP_ALIVE_INTERVAL_MS || "600000", 10) || 600000);
 const KEEP_ALIVE_TIMEOUT_MS = Math.max(1000, parseInt(process.env.KEEP_ALIVE_TIMEOUT_MS || "10000", 10) || 10000);
 const KEEP_ALIVE_URLS = [
-  "https://psn-content-6enm.onrender.com/",
+  "https://psn-content-0u8u.onrender.com/",
 ];
 const PROFILE_SYNC_INTERVAL_MS = Math.max(10000, parseInt(process.env.PROFILE_SYNC_INTERVAL_MS || "15000", 10) || 15000);
 const ENABLE_PROFILE_PERIODIC_SYNC = process.env.ENABLE_PROFILE_PERIODIC_SYNC === "1";
@@ -3064,7 +3064,7 @@ io.on('connection', (socket) => {
           await queryDbWithRetry('UPDATE users SET data = $1 WHERE name = $2', [dbUser, name], { attempts: 2, label: 'PASSWORD RESET COMPLETE' });
           console.log(`[AUTH] ${name} created a new password after an administrator reset.`);
         } else if (passwordResetSubmission === true) {
-          socket.emit('auth_error', 'Password reset authorization is not active. Ask an administrator to authorize another reset.');
+          socket.emit('auth_error', 'Password reset expired. Ask an administrator to authorize another reset.');
           return;
         }
 
@@ -3081,7 +3081,7 @@ io.on('connection', (socket) => {
             const hasUnresolvedAdminReset = Number.isFinite(resetRequestedAt)
               && (!Number.isFinite(resetCompletedAt) || resetCompletedAt < resetRequestedAt);
             if (hasUnresolvedAdminReset) {
-              socket.emit('auth_error', 'Password reset authorization is not active. Ask an administrator to authorize another reset.');
+              socket.emit('auth_error', 'Password reset expired. Ask an administrator to authorize another reset.');
               return;
             }
             const recoveryPassword = String(password || '').trim();
