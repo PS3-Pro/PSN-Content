@@ -2458,6 +2458,19 @@ async function initProfileSyncNotifications() {
         return;
       }
 
+      if (hasLocalSession && refreshedUser.passwordResetRequired === true) {
+        const resetExpiresAt = Number(refreshedUser.passwordResetExpiresAt || 0);
+        if (!resetExpiresAt || resetExpiresAt > Date.now()) {
+          disconnectUserSessions(name, 'password_reset_by_admin', {
+            targetName: name,
+            by: refreshedUser.passwordResetBy || 'Admin',
+            resetAt: refreshedUser.passwordResetAt || null,
+            expiresAt: resetExpiresAt || (Date.now() + PASSWORD_RESET_WINDOW_MS),
+            expiresInMs: resetExpiresAt ? Math.max(0, resetExpiresAt - Date.now()) : PASSWORD_RESET_WINDOW_MS
+          });
+        }
+      }
+
       if (data.changes && data.changes.trending === true) {
         invalidateTrendingCache();
         scheduleTrendingRefreshBroadcast(1200);
@@ -2513,7 +2526,7 @@ function disconnectUserSessions(name, eventName = 'user_kicked', payload = {}) {
     client.emit(eventName, payload);
     setTimeout(() => {
       if (client.connected) client.disconnect(true);
-    }, isPasswordResetDisconnect ? 250 : 1200);
+    }, isPasswordResetDisconnect ? 120 : 1200);
   });
 }
 
