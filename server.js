@@ -2503,11 +2503,17 @@ async function initProfileSyncNotifications() {
 }
 
 function disconnectUserSessions(name, eventName = 'user_kicked', payload = {}) {
+  const isPasswordResetDisconnect = eventName === 'password_reset_by_admin';
   getSocketsByUserName(name).forEach(client => {
+    if (isPasswordResetDisconnect) {
+      client.__passwordResetRevoked = true;
+      client.isAdmin = false;
+      client.isModerator = false;
+    }
     client.emit(eventName, payload);
     setTimeout(() => {
       if (client.connected) client.disconnect(true);
-    }, 1200);
+    }, isPasswordResetDisconnect ? 250 : 1200);
   });
 }
 
@@ -3088,6 +3094,7 @@ io.on('connection', (socket) => {
         const match = await bcrypt.compare(password, dbUser.passwordHash);
         
         if (match) {
+          socket.__passwordResetRevoked = false;
           socket.userName = name;
           socket.isAdmin = isAdmin;
           socket.role = getUserRole(name, dbUser);
@@ -3141,6 +3148,7 @@ io.on('connection', (socket) => {
         }
       } else {
         const hash = await bcrypt.hash(password, 10);
+        socket.__passwordResetRevoked = false;
         socket.userName = name;
         socket.isAdmin = isAdmin;
 
@@ -3627,6 +3635,12 @@ io.on('connection', (socket) => {
 
   socket.on('chat_message', async (msg, callback) => {
     const respond = typeof callback === 'function' ? callback : () => {};
+    if (socket.__passwordResetRevoked === true) {
+      const blocked = { success: false, reason: 'password_reset', message: 'Your session ended because an administrator reset your password.' };
+      socket.emit('chat_blocked', blocked);
+      respond(blocked);
+      return;
+    }
     let messageData = { ...(typeof msg === 'object' ? msg : { text: msg }), time: new Date().toISOString(), seenBy: [], seenAt: {} };
     const isAdmin = socket.isAdmin === true;
     const canModerate = canModerateSocket(socket);
