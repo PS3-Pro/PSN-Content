@@ -27317,8 +27317,10 @@ P
 		}, 450);
 	}
 
-	function logOut() {
-		if (confirm("Are you sure you want to log out?")) {
+	function logOut(options = {}) {
+		const forceLogout = !!(options && options.force === true);
+		const afterLogout = options && typeof options.afterLogout === 'function' ? options.afterLogout : null;
+		if (forceLogout || confirm("Are you sure you want to log out?")) {
 			window.isProfileLoaded = false;
 			if (typeof window.resetInterfaceTranslationForLoginScreen === 'function') window.resetInterfaceTranslationForLoginScreen();
 			if (window.dailyTrophyTimer) clearTimeout(window.dailyTrophyTimer);
@@ -27446,6 +27448,11 @@ P
 								});
 	
 								document.body.style.transition = "";
+								if (afterLogout) {
+									setTimeout(() => {
+										try { afterLogout(); } catch (err) { console.warn('[LOGOUT CALLBACK ERROR]:', err); }
+									}, 100);
+								}
 							}, 300);
 						});
 					});
@@ -42489,7 +42496,7 @@ function getVisibleChatStackEl(id) {
 		
 		socketChat.on('password_reset_expired', (data = {}) => {
 			const targetName = String(data.targetName || data.name || '').trim();
-			if (targetName && String(window.__psnPasswordResetPendingUser || '') === targetName) window.__psnPasswordResetPendingUser = '';
+			window.__psnPasswordResetPendingUser = '';
 			window.__psnPasswordResetSessionLock = false;
 			const passwordLabel = document.getElementById('login-password-label');
 			if (passwordLabel) passwordLabel.innerText = 'Enter Password';
@@ -42500,8 +42507,8 @@ function getVisibleChatStackEl(id) {
 				icon: 'fa-clock',
 				title: 'Password Reset Expired',
 				message: 'The 10-minute password reset authorization has expired.',
-				detail: 'Ask an administrator to reset the password again if you still need access.',
-				action: 'login',
+				detail: 'Ask an administrator to authorize another password reset.',
+				action: 'blank',
 				username: targetName || currentLoginUser || '',
 				delay: 3600
 			});
@@ -43400,22 +43407,28 @@ function getVisibleChatStackEl(id) {
 			if (options.action === 'reset-login') {
 				const name = String(options.username || '').trim();
 				screen.remove();
-				if (typeof isKicked !== 'undefined') isKicked = false;
-				if (typeof prepareUserSelectReturn === 'function') {
-					prepareUserSelectReturn();
+				window.__psnPasswordResetPendingUser = name;
+				window.__psnPasswordResetSessionLock = true;
+				if (typeof logOut === 'function') {
+					logOut({
+						force: true,
+						afterLogout: () => {
+							window.__psnPasswordResetPendingUser = name;
+							window.__psnPasswordResetSessionLock = true;
+							if (typeof currentLoginUser !== 'undefined') currentLoginUser = name;
+							const passwordLabel = document.getElementById('login-password-label');
+							if (passwordLabel) passwordLabel.innerText = 'Enter New Password';
+							if (typeof promptLogin === 'function') promptLogin(name);
+						}
+					});
+				} else {
+					psnReturnToLoginScreen(name);
 					setTimeout(() => {
 						window.__psnPasswordResetPendingUser = name;
 						window.__psnPasswordResetSessionLock = true;
 						if (typeof currentLoginUser !== 'undefined') currentLoginUser = name;
 						const passwordLabel = document.getElementById('login-password-label');
 						if (passwordLabel) passwordLabel.innerText = 'Enter New Password';
-						if (typeof promptLogin === 'function') promptLogin(name);
-					}, 1100);
-				} else {
-					psnReturnToLoginScreen(name);
-					setTimeout(() => {
-						window.__psnPasswordResetPendingUser = name;
-						if (typeof currentLoginUser !== 'undefined') currentLoginUser = name;
 						if (typeof promptLogin === 'function') promptLogin(name);
 					}, 500);
 				}
@@ -43467,7 +43480,6 @@ function getVisibleChatStackEl(id) {
 		if (!loginName) return false;
 		window.__psnPasswordResetPendingUser = loginName;
 		window.__psnPasswordResetSessionLock = true;
-		if (typeof isKicked !== 'undefined') isKicked = true;
 		localStorage.removeItem(`${loginName}_psn_password`);
 		if (typeof currentLoginUser !== 'undefined') currentLoginUser = loginName;
 		const passwordLabel = document.getElementById('login-password-label');

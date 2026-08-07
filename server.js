@@ -1999,6 +1999,7 @@ async function updateUserDataPreservingCredentials(name, userData, label = 'USER
       || CASE WHEN NOT ($1::jsonb ? 'passwordMigratedAt') AND data ? 'passwordMigratedAt' THEN jsonb_build_object('passwordMigratedAt', data->'passwordMigratedAt') ELSE '{}'::jsonb END
       || CASE WHEN NOT ($1::jsonb ? 'passwordResetAt') AND data ? 'passwordResetAt' THEN jsonb_build_object('passwordResetAt', data->'passwordResetAt') ELSE '{}'::jsonb END
       || CASE WHEN NOT ($1::jsonb ? 'passwordResetBy') AND data ? 'passwordResetBy' THEN jsonb_build_object('passwordResetBy', data->'passwordResetBy') ELSE '{}'::jsonb END
+      || CASE WHEN NOT ($1::jsonb ? 'passwordResetExpiredAt') AND data ? 'passwordResetExpiredAt' THEN jsonb_build_object('passwordResetExpiredAt', data->'passwordResetExpiredAt') ELSE '{}'::jsonb END
       || CASE WHEN NOT ($1::jsonb ? 'passwordResetRequired') AND data ? 'passwordResetRequired' THEN jsonb_build_object('passwordResetRequired', data->'passwordResetRequired') ELSE '{}'::jsonb END
       || CASE WHEN NOT ($1::jsonb ? 'passwordResetExpiresAt') AND data ? 'passwordResetExpiresAt' THEN jsonb_build_object('passwordResetExpiresAt', data->'passwordResetExpiresAt') ELSE '{}'::jsonb END
       || CASE WHEN NOT ($1::jsonb ? 'passwordResetPending') AND data ? 'passwordResetPending' THEN jsonb_build_object('passwordResetPending', data->'passwordResetPending') ELSE '{}'::jsonb END
@@ -2835,6 +2836,7 @@ async function resetUserPassword(targetName, adminName) {
   userDatabase[targetName].passwordResetExpiresAt = resetExpiresAt;
   userDatabase[targetName].passwordResetBy = adminName || "Admin";
   delete userDatabase[targetName].passwordResetPending;
+  delete userDatabase[targetName].passwordResetExpiredAt;
   await saveUser(targetName);
 
   disconnectUserSessions(targetName, 'password_reset_by_admin', {
@@ -3032,6 +3034,7 @@ io.on('connection', (socket) => {
             delete dbUser.passwordResetRequired;
             delete dbUser.passwordResetPending;
             delete dbUser.passwordResetExpiresAt;
+            dbUser.passwordResetExpiredAt = new Date().toISOString();
             dbUser.profileUpdatedAt = Date.now();
             await queryDbWithRetry('UPDATE users SET data = $1 WHERE name = $2', [dbUser, name], { attempts: 2, label: 'PASSWORD RESET EXPIRED' });
             socket.emit('password_reset_expired', {
@@ -3054,6 +3057,7 @@ io.on('connection', (socket) => {
             delete dbUser.passwordResetRequired;
             delete dbUser.passwordResetPending;
             delete dbUser.passwordResetExpiresAt;
+            delete dbUser.passwordResetExpiredAt;
             dbUser.passwordResetCompletedAt = new Date().toISOString();
             dbUser.profileUpdatedAt = Date.now();
             await queryDbWithRetry('UPDATE users SET data = $1 WHERE name = $2', [dbUser, name], { attempts: 2, label: 'PASSWORD RESET COMPLETE' });
@@ -3078,6 +3082,10 @@ io.on('connection', (socket) => {
 
           const legacyPassword = typeof dbUser.password === 'string' ? dbUser.password : '';
           if (!legacyPassword) {
+            if (dbUser.passwordResetExpiredAt) {
+              socket.emit('auth_error', 'Password reset authorization expired. Ask an administrator to authorize another reset.');
+              return;
+            }
             const recoveryPassword = String(password || '').trim();
             if (recoveryPassword.length < 4) {
               socket.emit('auth_error', 'Enter a password with at least 4 characters to recover this account.');
