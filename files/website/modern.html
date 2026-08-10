@@ -33684,6 +33684,32 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 		}
 	}
 	
+	window.__trophyProfileHydrationPending = window.__trophyProfileHydrationPending === true;
+	window.__pendingTrophyProgressChecks = window.__pendingTrophyProgressChecks || {};
+
+	function queueTrophyProgressUntilHydrated(trophyId, currentAmount) {
+		if (!trophyId) return;
+		const numericAmount = Number(currentAmount);
+		if (Number.isFinite(numericAmount)) {
+			const previousAmount = Number(window.__pendingTrophyProgressChecks[trophyId]);
+			window.__pendingTrophyProgressChecks[trophyId] = Number.isFinite(previousAmount) ? Math.max(previousAmount, numericAmount) : numericAmount;
+		} else {
+			window.__pendingTrophyProgressChecks[trophyId] = currentAmount;
+		}
+	}
+
+	window.markTrophyProfileHydrated = function() {
+		if (window.__trophyProfileHydrationPending !== true) return;
+		window.__trophyProfileHydrationPending = false;
+		const queuedChecks = window.__pendingTrophyProgressChecks || {};
+		window.__pendingTrophyProgressChecks = {};
+		setTimeout(() => {
+			Object.entries(queuedChecks).forEach(([trophyId, currentAmount]) => {
+				if (typeof window.checkTrophyProgress === 'function') window.checkTrophyProgress(trophyId, currentAmount);
+			});
+		}, 0);
+	};
+
 	function queueTrophyProfileSync(reason = 'trophies') {
 		if (window.__applyingRemoteProfileSync || window.__applyingRealtimeSettingsSync || window.__applyingSyncedProfileSettings) return;
 		if (typeof markProfileSyncDirty === 'function') markProfileSyncDirty('trophies');
@@ -33737,6 +33763,10 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 	
 	window.checkTrophyProgress = function(trophyId, currentAmount) {
 		if (!localStorage.getItem('psn_username') || localStorage.getItem('psn_username') === "null" || !window.userTrophies) return;
+		if (window.__trophyProfileHydrationPending === true) {
+			queueTrophyProgressUntilHydrated(trophyId, currentAmount);
+			return;
+		}
 
 		const trophy = TROPHY_DATA[trophyId];
 		if (!trophy) return;
@@ -33795,6 +33825,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 	};
 	
 	function checkPlatinum() {
+		if (window.__trophyProfileHydrationPending === true) return;
 		if (window.userTrophies['platinum']?.unlocked) return;
 		const allIds = Object.keys(TROPHY_DATA).filter(id => id !== 'platinum');
 		const allUnlocked = allIds.every(id => window.userTrophies[id]?.unlocked);
@@ -40938,6 +40969,7 @@ function getVisibleChatStackEl(id) {
 	window.applyRemoteProfileSync = function(payload = {}) {
 		const name = String(payload.name || payload.targetName || '').trim();
 		const userData = payload.userData || payload.data || {};
+		const receivedTrophyHydration = !!(userData.trophiesData && typeof userData.trophiesData === 'object' && !Array.isArray(userData.trophiesData));
 		const myName = localStorage.getItem('psn_username') || '';
 		if (!name || name !== myName || !userData || typeof userData !== 'object') return;
 		if (!window.isProfileLoaded) return;
@@ -41068,7 +41100,10 @@ function getVisibleChatStackEl(id) {
 		} catch (err) {
 			console.warn('[PROFILE SYNC] Could not apply remote profile data:', err);
 		} finally {
-			setTimeout(() => { window.__applyingRemoteProfileSync = false; }, 0);
+			setTimeout(() => {
+				window.__applyingRemoteProfileSync = false;
+				if (receivedTrophyHydration && typeof window.markTrophyProfileHydrated === 'function') window.markTrophyProfileHydrated();
+			}, 0);
 		}
 	};
 
@@ -41764,6 +41799,8 @@ function getVisibleChatStackEl(id) {
 			window.__serverProfileHydratedUser = name;
 			window.__lastAppliedProfileUpdatedAt = Number((userData && userData.profileUpdatedAt) || 0);
 			const isLightAuthPayload = data && (data.lightAuth === true || data.fullProfileDeferred === true || (userData && userData._lightAuth === true));
+			window.__trophyProfileHydrationPending = isLightAuthPayload === true;
+			window.__pendingTrophyProgressChecks = {};
 			const adminBypassLogin = document.body.classList.contains('admin-maintenance-login-bypass');
 			const earlyRole = String(role || (userData && userData.role) || (isAdmin ? 'admin' : 'user')).toLowerCase() === 'moderator' ? 'mod' : String(role || (userData && userData.role) || (isAdmin ? 'admin' : 'user')).toLowerCase();
 			if (adminBypassLogin && !(isAdmin === true || earlyRole === 'admin')) {
@@ -41778,11 +41815,18 @@ function getVisibleChatStackEl(id) {
 			if (userData.trophiesData && typeof userData.trophiesData === 'object' && !Array.isArray(userData.trophiesData)) {
 				window.userTrophies = userData.trophiesData;
 				safeLocalStorageSet(`${name}_psn_user_trophies`, JSON.stringify(userData.trophiesData));
+				window.__trophyProfileHydrationPending = false;
 			} else if (isLightAuthPayload) {
-				if (!window.userTrophies || typeof window.userTrophies !== 'object') window.userTrophies = {};
+				const localTrophies = localStorage.getItem(`${name}_psn_user_trophies`);
+				try {
+					window.userTrophies = localTrophies ? JSON.parse(localTrophies) : {};
+				} catch (err) {
+					window.userTrophies = {};
+				}
 			} else {
 				const localTrophies = localStorage.getItem(`${name}_psn_user_trophies`);
 				window.userTrophies = localTrophies ? JSON.parse(localTrophies) : {};
+				window.__trophyProfileHydrationPending = false;
 			}
 		
 			if (Array.isArray(userData.wishlistData)) {

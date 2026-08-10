@@ -981,6 +981,30 @@ function shouldAcceptIncomingTrophies(currentUser = {}, incomingUser = {}) {
   return false;
 }
 
+function mergeIncomingTrophiesPreservingUnlockState(currentTrophies = {}, incomingTrophies = {}) {
+  const current = hasObjectPayload(currentTrophies) ? currentTrophies : {};
+  const incoming = hasObjectPayload(incomingTrophies) ? incomingTrophies : {};
+  const merged = { ...incoming };
+
+  Object.entries(current).forEach(([id, currentState]) => {
+    if (!currentState || typeof currentState !== 'object' || Array.isArray(currentState)) return;
+    const currentUnlocked = String(currentState.unlocked || '').toLowerCase();
+    if (!['true', '1', 'yes'].includes(currentUnlocked)) return;
+
+    const incomingState = merged[id] && typeof merged[id] === 'object' && !Array.isArray(merged[id]) ? merged[id] : {};
+    merged[id] = {
+      ...currentState,
+      ...incomingState,
+      unlocked: true,
+      isNew: currentState.isNew === true
+    };
+
+    if (currentState.unlockDate) merged[id].unlockDate = currentState.unlockDate;
+  });
+
+  return merged;
+}
+
 const PROFILE_ARRAY_SYNC_KEYS = {
   downloadsData: { versionKey: 'downloadsUpdatedAt', countKey: 'downloads' },
   wishlistData: { versionKey: 'wishlistUpdatedAt', countKey: 'wishlist' },
@@ -3883,6 +3907,9 @@ io.on('connection', (socket) => {
                 delete userData.trophies;
                 delete userData.level;
                 delete userData.xp;
+            } else {
+                userData.trophiesData = mergeIncomingTrophiesPreservingUnlockState(workingUser.trophiesData, userData.trophiesData);
+                userData.trophies = countUnlockedTrophiesPayload(userData.trophiesData);
             }
         }
 
