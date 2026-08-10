@@ -23,7 +23,7 @@ const CHAT_SYNC_INTERVAL_MS = 3000;
 const KEEP_ALIVE_INTERVAL_MS = Math.max(60000, parseInt(process.env.KEEP_ALIVE_INTERVAL_MS || "600000", 10) || 600000);
 const KEEP_ALIVE_TIMEOUT_MS = Math.max(1000, parseInt(process.env.KEEP_ALIVE_TIMEOUT_MS || "10000", 10) || 10000);
 const KEEP_ALIVE_URLS = [
-  "https://psn-content-escw.onrender.com",
+  "https://psn-content-escw.onrender.com/",
 ];
 const PROFILE_SYNC_INTERVAL_MS = Math.max(10000, parseInt(process.env.PROFILE_SYNC_INTERVAL_MS || "15000", 10) || 15000);
 const ENABLE_PROFILE_PERIODIC_SYNC = process.env.ENABLE_PROFILE_PERIODIC_SYNC === "1";
@@ -287,6 +287,8 @@ let userCacheLastFullRefresh = 0;
 let userCacheRefreshInFlight = null;
 const userProfileWriteInFlight = new Set();
 const fullUserCacheNames = new Set();
+let profileHydrationQueue = Promise.resolve();
+let chatHistoryEmitQueue = Promise.resolve();
 const USER_HEAVY_CACHE_KEYS = ['downloadsData', 'libraryData', 'wishlistData', 'favoritesData', 'trophiesData', 'friendsData'];
 let trendingCache = null;
 let trendingCacheAt = 0;
@@ -1979,6 +1981,209 @@ async function getUserDataPayloadFromDb(targetName, type) {
   return payload;
 }
 
+
+async function getAuthUserRecordFromDb(name) {
+  const safeName = normalizeText(name, '');
+  if (!safeName) return null;
+
+  const result = await queryDbWithRetry(`
+    SELECT
+      data - ARRAY['downloadsData','libraryData','wishlistData','favoritesData','trophiesData','friendsData']::text[] AS data,
+      CASE WHEN jsonb_typeof(data->'downloadsData') = 'array' THEN jsonb_array_length(data->'downloadsData') ELSE NULL END AS downloads_count,
+      CASE WHEN jsonb_typeof(data->'wishlistData') = 'array' THEN jsonb_array_length(data->'wishlistData') ELSE NULL END AS wishlist_count,
+      CASE WHEN jsonb_typeof(data->'favoritesData') = 'array' THEN jsonb_array_length(data->'favoritesData') ELSE NULL END AS favorites_count,
+      CASE WHEN jsonb_typeof(data->'libraryData') = 'array' THEN jsonb_array_length(data->'libraryData') ELSE NULL END AS library_count,
+      CASE WHEN jsonb_typeof(data->'friendsData') = 'array' THEN jsonb_array_length(data->'friendsData') ELSE NULL END AS friends_count
+    FROM users
+    WHERE name = $1
+  `, [safeName], { attempts: 3, label: 'AUTH USER LOOKUP' });
+
+  if (!result.rows.length) return null;
+  const row = result.rows[0];
+  const data = { ...(row.data || {}) };
+  if (row.downloads_count !== null) data.downloads = Number(row.downloads_count) || 0;
+  if (row.wishlist_count !== null) data.wishlist = Number(row.wishlist_count) || 0;
+  if (row.favorites_count !== null) data.favorites = Number(row.favorites_count) || 0;
+  if (row.library_count !== null) data.library = Number(row.library_count) || 0;
+  if (row.friends_count !== null) data.friends = Number(row.friends_count) || 0;
+  return normalizeUserRecord(safeName, data);
+}
+
+function runSerializedProfileHydration(task) {
+  const run = profileHydrationQueue.catch(() => null).then(task);
+  profileHydrationQueue = run.then(() => null, () => null);
+  return run;
+}
+
+async function loadFullUserRecordTransient(name) {
+  const safeName = normalizeText(name, '');
+  if (!safeName) return null;
+  const result = await queryDbWithRetry('SELECT data FROM users WHERE name = $1', [safeName], { attempts: 3, label: 'FULL PROFILE TRANSIENT READ' });
+  if (!result.rows.length) return null;
+  return normalizeUserRecord(safeName, result.rows[0].data || {});
+}
+
+async function patchUserDataInternal(name, patch = {}, deleteKeys = [], label = 'INTERNAL USER PATCH') {
+  if (!name || !patch || typeof patch !== 'object' || Array.isArray(patch)) return false;
+  const outgoing = { ...patch };
+  const removals = Array.isArray(deleteKeys) ? deleteKeys.filter(Boolean) : [];
+  const result = await queryDbWithRetry(`
+    UPDATE users
+    SET data = (COALESCE(data, '{}'::jsonb) - $3::text[]) || $1::jsonb
+    WHERE name = $2
+    RETURNING name
+  `, [outgoing, name, removals], { attempts: 2, label });
+  return result.rows.length > 0;
+}
+
+const PROFILE_HEAVY_SECTION_META = {
+  trophiesData: { type: 'trophies', countKey: 'trophies', versionKeys: [] },
+  downloadsData: { type: 'downloads', countKey: 'downloads', versionKeys: ['downloadsUpdatedAt', 'downloadsClearedAt'] },
+  wishlistData: { type: 'wishlist', countKey: 'wishlist', versionKeys: ['wishlistUpdatedAt'] },
+  favoritesData: { type: 'favorites', countKey: 'favorites', versionKeys: ['favoritesUpdatedAt'] },
+  libraryData: { type: 'library', countKey: 'library', versionKeys: ['libraryUpdatedAt'] },
+  friendsData: { type: 'friends', countKey: 'friends', versionKeys: ['friendsUpdatedAt'] }
+};
+
+function incomingTouchesHeavyProfileSection(incoming = {}, dataKey, meta = {}) {
+  if (!incoming || typeof incoming !== 'object') return false;
+  if (Object.prototype.hasOwnProperty.call(incoming, dataKey)) return true;
+  if (meta.countKey && Object.prototype.hasOwnProperty.call(incoming, meta.countKey)) return true;
+  return (meta.versionKeys || []).some(key => Object.prototype.hasOwnProperty.call(incoming, key));
+}
+
+async function buildWorkingUserForProfileUpdate(name, incoming = {}) {
+  const base = { ...(userDatabase[name] || {}) };
+  for (const [dataKey, meta] of Object.entries(PROFILE_HEAVY_SECTION_META)) {
+    if (!incomingTouchesHeavyProfileSection(incoming, dataKey, meta)) continue;
+    const payload = await getUserDataPayloadFromDb(name, meta.type);
+    if (payload !== null) base[dataKey] = payload;
+  }
+  return base;
+}
+
+function updateCompactUserCacheFromPatch(name, workingUser = {}, patch = {}) {
+  if (!name || !userDatabase[name]) return;
+  const compact = { ...userDatabase[name] };
+  const heavyKeys = new Set(USER_HEAVY_CACHE_KEYS);
+
+  Object.keys(patch || {}).forEach(key => {
+    if (heavyKeys.has(key)) return;
+    compact[key] = patch[key];
+  });
+
+  if (Object.prototype.hasOwnProperty.call(patch, 'downloadsData')) compact.downloads = Array.isArray(workingUser.downloadsData) ? workingUser.downloadsData.length : Number(workingUser.downloads || 0);
+  if (Object.prototype.hasOwnProperty.call(patch, 'wishlistData')) compact.wishlist = Array.isArray(workingUser.wishlistData) ? workingUser.wishlistData.length : Number(workingUser.wishlist || 0);
+  if (Object.prototype.hasOwnProperty.call(patch, 'favoritesData')) compact.favorites = Array.isArray(workingUser.favoritesData) ? workingUser.favoritesData.length : Number(workingUser.favorites || 0);
+  if (Object.prototype.hasOwnProperty.call(patch, 'libraryData')) compact.library = Array.isArray(workingUser.libraryData) ? workingUser.libraryData.length : Number(workingUser.library || 0);
+  if (Object.prototype.hasOwnProperty.call(patch, 'friendsData')) compact.friends = Array.isArray(workingUser.friendsData) ? workingUser.friendsData.length : Number(workingUser.friends || 0);
+  if (Object.prototype.hasOwnProperty.call(patch, 'trophiesData')) compact.trophies = countUnlockedTrophiesPayload(workingUser.trophiesData || {});
+
+  USER_HEAVY_CACHE_KEYS.forEach(key => delete compact[key]);
+  userDatabase[name] = normalizeUserRecord(name, compact);
+  fullUserCacheNames.delete(name);
+  userCacheMeta[name] = Date.now();
+}
+
+function buildLightProfileUserData(name, user = {}) {
+  return {
+    _lightAuth: true,
+    id: user.id || null,
+    name,
+    avatar: user.avatar || DEFAULT_AVATAR,
+    joined: user.joined || '2026',
+    countryCode: getUserCountryCode(user),
+    role: getUserRole(name, user),
+    isAdmin: isUserAdmin(name, user),
+    isModerator: isUserModerator(name, user),
+    banned: isUserBanned(user),
+    lastSeen: user.lastSeen || null,
+    profileUpdatedAt: normalizeTimestampValue(user.profileUpdatedAt),
+    ps3Status: user.ps3Status || null,
+    level: user.level || 1,
+    xp: user.xp || 0,
+    downloads: Number(user.downloads || 0),
+    wishlist: Number(user.wishlist || 0),
+    favorites: Number(user.favorites || 0),
+    trophies: Number(user.trophies || 0),
+    library: Number(user.library || 0),
+    countersData: user.countersData || {},
+    themeColor: normalizeThemeColorServer(user.themeColor || (user.settingsData && user.settingsData.themeColor) || '#0070cc'),
+    themeColorUpdatedAt: getUserThemeColorUpdatedAt(user),
+    settingsData: { ...normalizeProfileRealtimeSettings(user.settingsData || {}), ...getPublicProfileSettings(user) }
+  };
+}
+
+async function emitChunkedProfileSyncToSocket(socket, name, options = {}) {
+  if (!socket || !socket.connected || !name) return;
+  if (socket.__profileChunkSyncInFlight) return socket.__profileChunkSyncInFlight;
+
+  socket.__profileChunkSyncInFlight = (async () => {
+    if (options.forceRefresh === true || !userDatabase[name]) await refreshSingleUserSummaryFromDb(name);
+    const compactUser = userDatabase[name];
+    if (!compactUser || !socket.connected) return;
+
+    const requestedKeys = Array.isArray(options.changedKeys) ? new Set(options.changedKeys) : null;
+    const profileUpdatedAt = normalizeTimestampValue(compactUser.profileUpdatedAt) || Date.now();
+    const heavyKeys = new Set(Object.keys(PROFILE_HEAVY_SECTION_META));
+    const shouldSendCore = !requestedKeys || Array.from(requestedKeys).some(key => !heavyKeys.has(key));
+
+    if (shouldSendCore) {
+      socket.emit('profile_sync', {
+        name,
+        sourceSocketId: options.sourceSocketId || null,
+        profileUpdatedAt,
+        userData: buildLightProfileUserData(name, compactUser)
+      });
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+
+    const sections = [
+      ['trophiesData', 'trophies', null],
+      ['downloadsData', 'downloads', 'downloadsUpdatedAt'],
+      ['wishlistData', 'wishlist', 'wishlistUpdatedAt'],
+      ['favoritesData', 'favorites', 'favoritesUpdatedAt'],
+      ['libraryData', 'library', 'libraryUpdatedAt'],
+      ['friendsData', 'friends', 'friendsUpdatedAt']
+    ];
+
+    for (const [dataKey, type, versionKey] of sections) {
+      const meta = PROFILE_HEAVY_SECTION_META[dataKey];
+      const sectionRequested = !requestedKeys || requestedKeys.has(dataKey) || requestedKeys.has(meta.countKey) || (meta.versionKeys || []).some(key => requestedKeys.has(key));
+      if (!sectionRequested) continue;
+      if (!socket.connected) return;
+
+      await runSerializedProfileHydration(async () => {
+        if (!socket.connected) return;
+        const rawData = await getUserDataPayloadFromDb(name, type);
+        if (rawData === null || !socket.connected) return;
+        const userData = { profileUpdatedAt, [dataKey]: rawData };
+        if (dataKey === 'trophiesData') userData.trophies = countUnlockedTrophiesPayload(rawData || {});
+        else userData[meta.countKey] = Array.isArray(rawData) ? rawData.length : 0;
+        if (versionKey) userData[versionKey] = normalizeTimestampValue(compactUser[versionKey]);
+        if (dataKey === 'downloadsData') userData.downloadsClearedAt = normalizeTimestampValue(compactUser.downloadsClearedAt);
+        socket.emit('profile_sync', { name, sourceSocketId: options.sourceSocketId || null, profileUpdatedAt, userData });
+        await new Promise(resolve => setTimeout(resolve, 35));
+      });
+    }
+  })().finally(() => {
+    socket.__profileChunkSyncInFlight = null;
+  });
+
+  return socket.__profileChunkSyncInFlight;
+}
+
+function emitChatHistoryToSocket(socket) {
+  if (!socket) return Promise.resolve();
+  const run = chatHistoryEmitQueue.catch(() => null).then(async () => {
+    if (!socket.connected) return;
+    socket.emit('chat_history', getPublicChatHistory());
+    await new Promise(resolve => setTimeout(resolve, 25));
+  });
+  chatHistoryEmitQueue = run.then(() => null, () => null);
+  return run;
+}
+
 async function ensureFullUserCacheForWrite(name) {
   if (!name || !userDatabase[name]) return null;
   if (fullUserCacheNames.has(name)) return userDatabase[name];
@@ -2034,7 +2239,7 @@ async function patchUserData(name, patch = {}, label = 'USER DATA PATCH') {
 
   if (!result.rows.length) return false;
   userCacheMeta[name] = Date.now();
-  fullUserCacheNames.add(name);
+  fullUserCacheNames.delete(name);
   return true;
 }
 
@@ -2051,10 +2256,7 @@ async function saveUser(name, options = {}) {
   if (options.notify !== false) {
     await notifyProfileSyncAcrossInstances(name, options.sourceSocketId || null, userDatabase[name].profileUpdatedAt);
   }
-  const hasLocalSession = getSocketsByUserName(name).some(client => client && client.connected);
-  if (!hasLocalSession) {
-    deferServerTask('USER CACHE COMPACT AFTER SAVE', () => compactCachedUser(name), 250);
-  }
+  deferServerTask('USER CACHE COMPACT AFTER SAVE', () => compactCachedUser(name), 250);
 }
 
 async function saveAdminState(key, data) {
@@ -2322,8 +2524,8 @@ function getSocketsByUserName(name) {
 }
 
 
-function buildFullProfileSyncPayload(name, user = {}, sourceSocketId = null) {
-  const safe = normalizeUserRecord(name, user || {});
+function buildFullProfileSyncPayload(name, user = {}, sourceSocketId = null, options = {}) {
+  const safe = options.normalized === true ? user : normalizeUserRecord(name, user || {});
   return {
     name,
     sourceSocketId,
@@ -2429,6 +2631,17 @@ function buildProfileSyncPatchPayload(name, user = {}, changedKeys = [], sourceS
   if (include('settingsData')) target.settingsData = { ...normalizeProfileRealtimeSettings(user.settingsData || {}), ...getPublicProfileSettings(user) };
 
   return payload;
+}
+
+function emitProfileSyncPatchFromUser(name, user = {}, changedKeys = [], sourceSocketId = null) {
+  if (!name || !user) return;
+  const safeKeys = Array.isArray(changedKeys) ? [...new Set(changedKeys.filter(key => PROFILE_SYNC_PATCH_KEYS.has(key)))] : [];
+  if (!safeKeys.length) return;
+  const payload = buildProfileSyncPatchPayload(name, user, safeKeys, sourceSocketId);
+  getSocketsByUserName(name).forEach(client => {
+    if (sourceSocketId && client.id === sourceSocketId) return;
+    client.emit('profile_sync', payload);
+  });
 }
 
 function emitProfileSyncPatch(name, changedKeys = [], sourceSocketId = null) {
@@ -2541,28 +2754,24 @@ async function syncActiveProfilesAcrossInstances() {
     .filter(client => client.connected && client.userName)
     .map(client => client.userName))];
 
-  if (!activeNames.length) return;
+  for (const name of activeNames) {
+    const localVersion = normalizeTimestampValue(userDatabase[name] && userDatabase[name].profileUpdatedAt);
+    const refreshedUser = await refreshSingleUserSummaryFromDb(name);
+    if (!refreshedUser) continue;
+    const dbVersion = normalizeTimestampValue(refreshedUser.profileUpdatedAt);
+    if (!dbVersion || dbVersion <= localVersion) continue;
 
-  const dbRes = await pool.query('SELECT name, data FROM users WHERE name = ANY($1)', [activeNames]);
-  dbRes.rows.forEach(row => {
-    const name = row.name;
-    const dbUser = normalizeUserRecord(name, row.data || {});
-    const localUser = userDatabase[name] || {};
-    const dbVersion = Number(dbUser.profileUpdatedAt || 0);
-    const localVersion = Number(localUser.profileUpdatedAt || 0);
-
-    if (!dbVersion || dbVersion <= localVersion) return;
-
-    userDatabase[name] = {
-      ...dbUser,
-      online: localUser.online === true,
-      id: localUser.id || dbUser.id,
-      lastSeen: localUser.lastSeen || dbUser.lastSeen || Date.now()
-    };
-
-    emitProfileSync(name, null);
-    emitPublicProfileBannerUpdate(name, userDatabase[name]);
-  });
+    const localSockets = getSocketsByUserName(name);
+    for (const client of localSockets) {
+      if (client.profileSyncV2 === true) {
+        await emitChunkedProfileSyncToSocket(client, name, { forceRefresh: false });
+      } else {
+        const fullUser = await runSerializedProfileHydration(() => loadFullUserRecordTransient(name));
+        if (fullUser && client.connected) client.emit('profile_sync', buildFullProfileSyncPayload(name, fullUser, null, { normalized: true }));
+      }
+    }
+    emitPublicProfileBannerUpdate(name, refreshedUser);
+  }
 }
 
 
@@ -2621,9 +2830,7 @@ async function initProfileSyncNotifications() {
         return;
       }
 
-      const refreshedUser = hasLocalSession
-        ? await refreshSingleUserCacheFromDb(name)
-        : await refreshSingleUserSummaryFromDb(name);
+      const refreshedUser = await refreshSingleUserSummaryFromDb(name);
       if (!refreshedUser) {
         invalidateOnlineListCache("profile-sync-listen-missing");
         deferServerTask('PROFILE LISTEN ONLINE LIST', () => emitOnlineList(), 1000);
@@ -2654,8 +2861,15 @@ async function initProfileSyncNotifications() {
       if (data.changes && data.changes.counts === true) emitProfileCountsUpdate(name, refreshedUser);
       if (hasLocalSession) {
         const changedKeys = data.changes && Array.isArray(data.changes.keys) ? data.changes.keys : [];
-        if (changedKeys.length) emitProfileSyncPatch(name, changedKeys, data.sourceSocketId || null);
-        else emitProfileSync(name, data.sourceSocketId || null);
+        const localSockets = getSocketsByUserName(name).filter(client => !(data.sourceSocketId && client.id === data.sourceSocketId));
+        for (const client of localSockets) {
+          if (client.profileSyncV2 === true) {
+            await emitChunkedProfileSyncToSocket(client, name, { forceRefresh: false, changedKeys, sourceSocketId: data.sourceSocketId || null });
+          } else {
+            const fullUser = await runSerializedProfileHydration(() => loadFullUserRecordTransient(name));
+            if (fullUser && client.connected) client.emit('profile_sync', buildFullProfileSyncPayload(name, fullUser, data.sourceSocketId || null, { normalized: true }));
+          }
+        }
       }
       emitPublicProfileBannerUpdate(name, refreshedUser);
       invalidateOnlineListCache("profile-sync-listen");
@@ -3166,8 +3380,8 @@ io.on('connection', (socket) => {
       const { name, password, isNewAccount, adminMaintenanceBypass, passwordResetSubmission } = data;
       const safeUserData = (data.userData && typeof data.userData === 'object') ? data.userData : {};
       
-      const dbRes = await queryDbWithRetry('SELECT data FROM users WHERE name = $1', [name], { attempts: 3, label: 'AUTH USER LOOKUP' });
-      let dbUser = dbRes.rows.length > 0 ? normalizeUserRecord(name, dbRes.rows[0].data || {}) : null;
+      const supportsProfileSyncV2 = data && data.profileSyncV2 === true;
+      let dbUser = await getAuthUserRecordFromDb(name);
       let wasDeletedAccount = false;
 
       const isHardcodedAdmin = ADMIN_USERS.includes(name);
@@ -3205,7 +3419,7 @@ io.on('connection', (socket) => {
             delete dbUser.passwordResetRequired;
             delete dbUser.passwordResetExpiresAt;
             dbUser.profileUpdatedAt = Date.now();
-            await queryDbWithRetry('UPDATE users SET data = $1 WHERE name = $2', [dbUser, name], { attempts: 2, label: 'PASSWORD RESET EXPIRED' });
+            await patchUserDataInternal(name, { profileUpdatedAt: dbUser.profileUpdatedAt }, ['passwordResetRequired', 'passwordResetExpiresAt'], 'PASSWORD RESET EXPIRED');
             socket.emit('password_reset_expired', {
               targetName: name,
               by: dbUser.passwordResetBy || 'Admin',
@@ -3237,7 +3451,7 @@ io.on('connection', (socket) => {
           delete dbUser.passwordResetExpiresAt;
           dbUser.passwordResetCompletedAt = new Date().toISOString();
           dbUser.profileUpdatedAt = Date.now();
-          await queryDbWithRetry('UPDATE users SET data = $1 WHERE name = $2', [dbUser, name], { attempts: 2, label: 'PASSWORD RESET COMPLETE' });
+          await patchUserDataInternal(name, { passwordHash: dbUser.passwordHash, passwordResetCompletedAt: dbUser.passwordResetCompletedAt, profileUpdatedAt: dbUser.profileUpdatedAt }, ['password', 'passwordResetRequired', 'passwordResetExpiresAt'], 'PASSWORD RESET COMPLETE');
           console.log(`[AUTH] ${name} created a new password after an administrator reset.`);
         } else if (passwordResetSubmission === true) {
           socket.emit('auth_error', 'Password reset expired. Ask an administrator to authorize another reset.');
@@ -3269,7 +3483,7 @@ io.on('connection', (socket) => {
             dbUser.passwordRecoveredAt = new Date().toISOString();
             dbUser.passwordRecoverySource = 'missing_credentials_login';
             dbUser.profileUpdatedAt = Date.now();
-            await queryDbWithRetry('UPDATE users SET data = $1 WHERE name = $2', [dbUser, name], { attempts: 2, label: 'MISSING CREDENTIAL RECOVERY' });
+            await patchUserDataInternal(name, { passwordHash: dbUser.passwordHash, passwordRecoveredAt: dbUser.passwordRecoveredAt, passwordRecoverySource: dbUser.passwordRecoverySource, profileUpdatedAt: dbUser.profileUpdatedAt }, [], 'MISSING CREDENTIAL RECOVERY');
             console.warn(`[AUTH] Rebuilt missing credentials for ${name} from a login password.`);
           } else {
             if (String(password || '') !== legacyPassword) {
@@ -3281,7 +3495,7 @@ io.on('connection', (socket) => {
             delete dbUser.password;
             dbUser.passwordMigratedAt = new Date().toISOString();
             dbUser.profileUpdatedAt = Date.now();
-            await queryDbWithRetry('UPDATE users SET data = $1 WHERE name = $2', [dbUser, name], { attempts: 2, label: 'LEGACY PASSWORD MIGRATION' });
+            await patchUserDataInternal(name, { passwordHash: dbUser.passwordHash, passwordMigratedAt: dbUser.passwordMigratedAt, profileUpdatedAt: dbUser.profileUpdatedAt }, ['password'], 'LEGACY PASSWORD MIGRATION');
             console.log(`[AUTH] Migrated legacy password for ${name} to bcrypt.`);
           }
         }
@@ -3294,7 +3508,7 @@ io.on('connection', (socket) => {
           socket.isAdmin = isAdmin;
           socket.role = getUserRole(name, dbUser);
 
-          const serverUser = normalizeUserRecord(name, dbUser);
+          const serverUser = buildCompactUserSummary(name, dbUser);
 
           userDatabase[name] = {
             ...serverUser,
@@ -3306,9 +3520,10 @@ io.on('connection', (socket) => {
             banned: isUserBanned(serverUser),
             profileUpdatedAt: normalizeTimestampValue(serverUser.profileUpdatedAt)
           };
-          normalizeProfileArrayPayloads(userDatabase[name]);
+          USER_HEAVY_CACHE_KEYS.forEach(key => delete userDatabase[name][key]);
           userCacheMeta[name] = Date.now();
-          fullUserCacheNames.add(name);
+          fullUserCacheNames.delete(name);
+          socket.profileSyncV2 = supportsProfileSyncV2;
           
           markSocketAuthenticated(socket);
           invalidateOnlineListCache('auth-existing-db');
@@ -3319,17 +3534,35 @@ io.on('connection', (socket) => {
             await addServerLog('login', `${name} signed in${isAdmin ? ' as admin' : ''}`, { socketId: socket.id, role: getUserRole(name, userDatabase[name]) }, name);
           }, 2400);
 
-          socket.emit('auth_success', { 
-            name, 
-            userData: buildFullProfileSyncPayload(name, userDatabase[name], socket.id).userData,
-            isAdmin: isAdmin,
-            role: getUserRole(name, userDatabase[name]),
-            isModerator: isUserModerator(name, userDatabase[name]),
-            serverAuthoritative: true
-          });
+          if (supportsProfileSyncV2) {
+            socket.emit('auth_success', {
+              name,
+              userData: buildLightProfileUserData(name, userDatabase[name]),
+              isAdmin: isAdmin,
+              role: getUserRole(name, userDatabase[name]),
+              isModerator: isUserModerator(name, userDatabase[name]),
+              serverAuthoritative: true,
+              lightAuth: true,
+              fullProfileDeferred: true
+            });
+          } else {
+            const fullAuthUser = await runSerializedProfileHydration(() => loadFullUserRecordTransient(name));
+            if (!fullAuthUser) {
+              socket.emit('auth_error', 'Server Error: Profile could not be loaded.');
+              return;
+            }
+            socket.emit('auth_success', {
+              name,
+              userData: buildFullProfileSyncPayload(name, fullAuthUser, socket.id, { normalized: true }).userData,
+              isAdmin: isAdmin,
+              role: getUserRole(name, fullAuthUser),
+              isModerator: isUserModerator(name, fullAuthUser),
+              serverAuthoritative: true
+            });
+          }
 
           socket.emit('pinned_list', pinnedMessages);
-          deferServerTask('POST AUTH CHAT HISTORY', () => socket.emit('chat_history', getPublicChatHistory()), POST_AUTH_CHAT_HISTORY_DELAY_MS);
+          deferServerTask('POST AUTH CHAT HISTORY', () => emitChatHistoryToSocket(socket), POST_AUTH_CHAT_HISTORY_DELAY_MS);
           deferServerTask('POST AUTH ADMIN STATE', () => emitAdminState(socket), socket.isAdmin === true ? POST_AUTH_ADMIN_STATE_DELAY_MS : 120);
           deferServerTask('POST AUTH ONLINE LIST', () => emitOnlineList(), POST_AUTH_ONLINE_LIST_DELAY_MS);
         } else {
@@ -3374,9 +3607,10 @@ io.on('connection', (socket) => {
           profileUpdatedAt: Date.now()
         });
         socket.role = getUserRole(name, userDatabase[name]);
+        socket.profileSyncV2 = supportsProfileSyncV2;
         normalizeProfileArrayPayloads(userDatabase[name]);
         userCacheMeta[name] = Date.now();
-        fullUserCacheNames.add(name);
+        fullUserCacheNames.delete(name);
         markSocketAuthenticated(socket);
 
         await pool.query(
@@ -3395,17 +3629,19 @@ io.on('connection', (socket) => {
           await addServerLog('signup', `${name} created an account${isAdmin ? ' as admin' : ''}`, { socketId: socket.id, role: getUserRole(name, userDatabase[name]) }, name);
         }, 0);
 
-        socket.emit('auth_success', { 
-          name, 
-          userData: buildFullProfileSyncPayload(name, userDatabase[name], socket.id).userData,
+        socket.emit('auth_success', {
+          name,
+          userData: supportsProfileSyncV2 ? buildLightProfileUserData(name, userDatabase[name]) : buildFullProfileSyncPayload(name, userDatabase[name], socket.id).userData,
           isAdmin: isAdmin,
           role: getUserRole(name, userDatabase[name]),
           isModerator: isUserModerator(name, userDatabase[name]),
-          serverAuthoritative: true
+          serverAuthoritative: true,
+          ...(supportsProfileSyncV2 ? { lightAuth: true, fullProfileDeferred: true } : {})
         });
+        compactCachedUser(name);
 
         socket.emit('pinned_list', pinnedMessages);
-        deferServerTask('POST AUTH CHAT HISTORY', () => socket.emit('chat_history', getPublicChatHistory()), POST_AUTH_CHAT_HISTORY_DELAY_MS);
+        deferServerTask('POST AUTH CHAT HISTORY', () => emitChatHistoryToSocket(socket), POST_AUTH_CHAT_HISTORY_DELAY_MS);
         deferServerTask('POST AUTH ADMIN STATE', () => emitAdminState(socket), socket.isAdmin === true ? POST_AUTH_ADMIN_STATE_DELAY_MS : 120);
         deferServerTask('POST AUTH ONLINE LIST', () => emitOnlineList(), POST_AUTH_ONLINE_LIST_DELAY_MS);
       }
@@ -3419,8 +3655,6 @@ io.on('connection', (socket) => {
   socket.on('settings_realtime_update', async (payload = {}) => {
     const name = socket.userName;
     if (!name || !userDatabase[name]) return;
-    const fullUser = await ensureFullUserCacheForWrite(name);
-    if (!fullUser) return;
 
     const incomingSettingsData = (payload && payload.settingsData && typeof payload.settingsData === "object")
       ? { ...payload.settingsData }
@@ -3495,11 +3729,11 @@ io.on('connection', (socket) => {
   socket.on('update_profile', async (userData) => {
     const name = socket.userName;
     if (!name || !userDatabase[name]) return;
-    const fullUser = await ensureFullUserCacheForWrite(name);
-    if (!fullUser) return;
     userData = (userData && typeof userData === "object") ? userData : {};
+    const workingUser = await buildWorkingUserForProfileUpdate(name, userData);
+    if (!workingUser) return;
     const incomingSettingsData = (userData.settingsData && typeof userData.settingsData === "object") ? userData.settingsData : null;
-    const previousCountryCode = name && userDatabase[name] ? getUserCountryCode(userDatabase[name]) : "";
+    const previousCountryCode = name && userDatabase[name] ? getUserCountryCode(workingUser) : "";
     normalizeIncomingProfileCountry(userData, incomingSettingsData);
     let shouldBroadcastProfileBanner = false;
     let shouldForceProfileSyncToSource = false;
@@ -3508,12 +3742,12 @@ io.on('connection', (socket) => {
     if (name && userDatabase[name]) {
         
         if (incomingSettingsData) {
-            const mergedSettings = mergeProfileSettingsByTimestamp(userDatabase[name].settingsData || {}, incomingSettingsData, {
-                currentFallback: normalizeTimestampValue(userDatabase[name].profileUpdatedAt),
+            const mergedSettings = mergeProfileSettingsByTimestamp(workingUser.settingsData || {}, incomingSettingsData, {
+                currentFallback: normalizeTimestampValue(workingUser.profileUpdatedAt),
                 incomingFallback: normalizeTimestampValue(userData.profileCardStyleUpdatedAt || userData.profileUpdatedAt)
             });
-            userDatabase[name].settingsData = mergedSettings.settingsData;
-            profileThemeMerge = reconcileIncomingThemeColor(userDatabase[name], userData, incomingSettingsData || {});
+            workingUser.settingsData = mergedSettings.settingsData;
+            profileThemeMerge = reconcileIncomingThemeColor(workingUser, userData, incomingSettingsData || {});
             shouldBroadcastProfileBanner = mergedSettings.bannerAccepted === true || profileThemeMerge.accepted === true;
             shouldForceProfileSyncToSource = mergedSettings.settingsRejected === true || mergedSettings.bannerRejected === true || profileThemeMerge.rejected === true;
             delete userData.settingsData;
@@ -3521,7 +3755,7 @@ io.on('connection', (socket) => {
             delete userData.themeColorUpdatedAt;
             delete userData.themeUpdatedAt;
         } else {
-            profileThemeMerge = reconcileIncomingThemeColor(userDatabase[name], userData, {});
+            profileThemeMerge = reconcileIncomingThemeColor(workingUser, userData, {});
             shouldBroadcastProfileBanner = profileThemeMerge.accepted === true;
             shouldForceProfileSyncToSource = profileThemeMerge.rejected === true;
             delete userData.themeColor;
@@ -3550,13 +3784,13 @@ io.on('connection', (socket) => {
             delete userData.passwordRecoverySource;
         }
 
-        if (isUserBanned(userDatabase[name]) && !ADMIN_USERS.includes(name)) {
+        if (isUserBanned(workingUser) && !ADMIN_USERS.includes(name)) {
             socket.emit('auth_error', 'This account is banned.');
             return;
         }
 
         if (hasObjectPayload(userData.trophiesData)) {
-            if (!shouldAcceptIncomingTrophies(userDatabase[name], userData)) {
+            if (!shouldAcceptIncomingTrophies(workingUser, userData)) {
                 delete userData.trophiesData;
                 delete userData.trophies;
                 delete userData.level;
@@ -3564,42 +3798,50 @@ io.on('connection', (socket) => {
             }
         }
 
-        userData = reconcileIncomingDownloads(userDatabase[name], userData || {});
-        userData = reconcileIncomingProfileArrays(userDatabase[name], userData || {});
+        userData = reconcileIncomingDownloads(workingUser, userData || {});
+        userData = reconcileIncomingProfileArrays(workingUser, userData || {});
         const publicCountsChanged = profileUpdateTouchesPublicCounts(userData);
         
-        Object.assign(userDatabase[name], userData);
-        const currentCountryCode = getUserCountryCode(userDatabase[name]);
+        Object.assign(workingUser, userData);
+        const currentCountryCode = getUserCountryCode(workingUser);
         if (currentCountryCode) {
-            userDatabase[name].countryCode = currentCountryCode;
-            userDatabase[name].settingsData = userDatabase[name].settingsData && typeof userDatabase[name].settingsData === "object" && !Array.isArray(userDatabase[name].settingsData)
-                ? { ...userDatabase[name].settingsData, countryCode: currentCountryCode }
+            workingUser.countryCode = currentCountryCode;
+            workingUser.settingsData = workingUser.settingsData && typeof workingUser.settingsData === "object" && !Array.isArray(workingUser.settingsData)
+                ? { ...workingUser.settingsData, countryCode: currentCountryCode }
                 : { countryCode: currentCountryCode };
         }
         const countryChanged = currentCountryCode !== previousCountryCode;
         if (countryChanged) shouldBroadcastProfileBanner = true;
-        if (Array.isArray(userDatabase[name].downloadsData)) userDatabase[name].downloads = userDatabase[name].downloadsData.length;
-        userDatabase[name].downloadsClearedAt = normalizeTimestampValue(userDatabase[name].downloadsClearedAt);
-        normalizeProfileArrayPayloads(userDatabase[name]);
-        userDatabase[name].lastSeen = Date.now();
-        userDatabase[name].profileUpdatedAt = Date.now();
+        if (Array.isArray(workingUser.downloadsData)) workingUser.downloads = workingUser.downloadsData.length;
+        workingUser.downloadsClearedAt = normalizeTimestampValue(workingUser.downloadsClearedAt);
+        Object.entries(PROFILE_ARRAY_SYNC_KEYS).forEach(([key, sync]) => {
+          if (!Object.prototype.hasOwnProperty.call(userData, key)) return;
+          const list = key === 'downloadsData'
+            ? normalizeDownloadHistoryRecordsServer(Array.isArray(workingUser[key]) ? workingUser[key] : []).history
+            : (key === 'libraryData' ? mergeLibraryRecordsServer(Array.isArray(workingUser[key]) ? workingUser[key] : [], []) : (Array.isArray(workingUser[key]) ? workingUser[key] : []));
+          workingUser[key] = list;
+          workingUser[sync.countKey] = list.length;
+          workingUser[sync.versionKey] = normalizeTimestampValue(workingUser[sync.versionKey]);
+        });
+        workingUser.lastSeen = Date.now();
+        workingUser.profileUpdatedAt = Date.now();
 
         const profileDbPatch = {};
         Object.keys(userData).forEach(key => {
-            if (Object.prototype.hasOwnProperty.call(userDatabase[name], key)) profileDbPatch[key] = userDatabase[name][key];
+            if (Object.prototype.hasOwnProperty.call(workingUser, key)) profileDbPatch[key] = workingUser[key];
         });
-        if (incomingSettingsData) profileDbPatch.settingsData = userDatabase[name].settingsData;
+        if (incomingSettingsData) profileDbPatch.settingsData = workingUser.settingsData;
         if (currentCountryCode && (countryChanged || Object.prototype.hasOwnProperty.call(userData, 'countryCode'))) {
             profileDbPatch.countryCode = currentCountryCode;
-            profileDbPatch.settingsData = userDatabase[name].settingsData;
+            profileDbPatch.settingsData = workingUser.settingsData;
         }
         if (profileThemeMerge.accepted === true || profileThemeMerge.rejected === true || Object.prototype.hasOwnProperty.call(userData, 'themeColor')) {
-            profileDbPatch.themeColor = userDatabase[name].themeColor;
-            profileDbPatch.themeColorUpdatedAt = userDatabase[name].themeColorUpdatedAt;
-            profileDbPatch.settingsData = userDatabase[name].settingsData;
+            profileDbPatch.themeColor = workingUser.themeColor;
+            profileDbPatch.themeColorUpdatedAt = workingUser.themeColorUpdatedAt;
+            profileDbPatch.settingsData = workingUser.settingsData;
         }
-        profileDbPatch.lastSeen = userDatabase[name].lastSeen;
-        profileDbPatch.profileUpdatedAt = userDatabase[name].profileUpdatedAt;
+        profileDbPatch.lastSeen = workingUser.lastSeen;
+        profileDbPatch.profileUpdatedAt = workingUser.profileUpdatedAt;
 
         userProfileWriteInFlight.add(name);
         try {
@@ -3614,6 +3856,7 @@ io.on('connection', (socket) => {
             userProfileWriteInFlight.delete(name);
         }
 
+        updateCompactUserCacheFromPatch(name, workingUser, profileDbPatch);
         if (publicCountsChanged) emitProfileCountsUpdate(name, userDatabase[name]);
 
         if (shouldEmitTrendingUpdate) {
@@ -3623,15 +3866,15 @@ io.on('connection', (socket) => {
 
         deferServerTask('PROFILE ONLINE LIST', () => emitOnlineList(), 450);
         if (shouldBroadcastProfileBanner) {
-            emitPublicProfileBannerUpdate(name, userDatabase[name]);
+            emitPublicProfileBannerUpdate(name, workingUser);
         }
         const profileChangedKeys = Object.keys(profileDbPatch);
-        emitProfileSyncPatch(name, profileChangedKeys, shouldForceProfileSyncToSource ? null : socket.id);
+        emitProfileSyncPatchFromUser(name, workingUser, profileChangedKeys, shouldForceProfileSyncToSource ? null : socket.id);
         const trophiesChanged = !!userData.trophiesData;
         deferServerTask('PROFILE NOTIFY', () => notifyProfileSyncAcrossInstances(
             name,
             shouldForceProfileSyncToSource ? null : socket.id,
-            userDatabase[name].profileUpdatedAt,
+            workingUser.profileUpdatedAt,
             { trending: shouldEmitTrendingUpdate, trophies: trophiesChanged, counts: publicCountsChanged, keys: profileChangedKeys }
         ), 0);
 
@@ -3675,10 +3918,15 @@ io.on('connection', (socket) => {
 
     try {
       const sendProfileSync = async () => {
-        if (data && data.forceRefresh === true) {
-          await refreshSingleUserCacheFromDb(name);
+        if (socket.profileSyncV2 === true) {
+          await emitChunkedProfileSyncToSocket(socket, name, { forceRefresh: data && data.forceRefresh === true });
+          return;
         }
-        socket.emit('profile_sync', buildFullProfileSyncPayload(name, userDatabase[name], null));
+
+        const fullUser = await runSerializedProfileHydration(() => loadFullUserRecordTransient(name));
+        if (!fullUser || !socket.connected) return;
+        socket.emit('profile_sync', buildFullProfileSyncPayload(name, fullUser, null, { normalized: true }));
+        compactCachedUser(name);
       };
 
       if (!(data && data.forceRefresh === true) && getPostAuthRemainingDelay(socket, POST_AUTH_PROFILE_SYNC_DELAY_MS) > 0) {
@@ -3720,13 +3968,13 @@ io.on('connection', (socket) => {
     }
   });
 
-  socket.on('request_chat_history', () => {
+  socket.on('request_chat_history', async () => {
     try {
       if (!socket.userName) return;
       const now = Date.now();
       if (socket.__lastChatHistoryRequestAt && now - socket.__lastChatHistoryRequestAt < 900) return;
       socket.__lastChatHistoryRequestAt = now;
-      socket.emit('chat_history', getPublicChatHistory());
+      await emitChatHistoryToSocket(socket);
     } catch (err) {
       console.error('[REQUEST CHAT HISTORY ERROR]:', err);
     }
