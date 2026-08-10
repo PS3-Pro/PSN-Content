@@ -2017,6 +2017,27 @@ async function updateUserDataPreservingCredentials(name, userData, label = 'USER
   return saved;
 }
 
+async function patchUserData(name, patch = {}, label = 'USER DATA PATCH') {
+  if (!name || !patch || typeof patch !== 'object' || Array.isArray(patch)) return false;
+  const outgoing = { ...patch };
+  delete outgoing.passwordHash;
+  delete outgoing.password;
+  const keys = Object.keys(outgoing);
+  if (!keys.length) return true;
+
+  const result = await queryDbWithRetry(`
+    UPDATE users
+    SET data = COALESCE(data, '{}'::jsonb) || $1::jsonb
+    WHERE name = $2
+    RETURNING name
+  `, [outgoing, name], { attempts: 2, label });
+
+  if (!result.rows.length) return false;
+  userCacheMeta[name] = Date.now();
+  fullUserCacheNames.add(name);
+  return true;
+}
+
 async function saveUser(name, options = {}) {
   if (!name || !userDatabase[name]) return;
   const loaded = await ensureFullUserCacheForWrite(name);
@@ -2271,6 +2292,71 @@ function emitProfileSync(name, sourceSocketId = null) {
   });
 }
 
+const PROFILE_SYNC_PATCH_KEYS = new Set([
+  'id', 'name', 'avatar', 'joined', 'countryCode', 'role', 'isAdmin', 'isModerator', 'banned',
+  'lastSeen', 'ps3Status', 'level', 'xp', 'downloads', 'wishlist', 'favorites', 'trophies', 'library',
+  'trophiesData', 'downloadsData', 'downloadsClearedAt', 'downloadsUpdatedAt',
+  'wishlistData', 'wishlistUpdatedAt', 'favoritesData', 'favoritesUpdatedAt',
+  'libraryData', 'libraryUpdatedAt', 'friendsData', 'friendsUpdatedAt',
+  'countersData', 'themeColor', 'themeColorUpdatedAt', 'settingsData'
+]);
+
+function buildProfileSyncPatchPayload(name, user = {}, changedKeys = [], sourceSocketId = null) {
+  const keys = new Set(Array.isArray(changedKeys) ? changedKeys : []);
+  const profileUpdatedAt = normalizeTimestampValue(user.profileUpdatedAt) || Date.now();
+  const payload = { name, sourceSocketId, profileUpdatedAt, userData: { profileUpdatedAt } };
+  const target = payload.userData;
+  const include = key => keys.has(key) && PROFILE_SYNC_PATCH_KEYS.has(key);
+
+  if (include('id')) target.id = user.id || null;
+  if (include('name')) target.name = name;
+  if (include('avatar')) target.avatar = user.avatar || DEFAULT_AVATAR;
+  if (include('joined')) target.joined = user.joined || '2026';
+  if (include('countryCode')) target.countryCode = getUserCountryCode(user);
+  if (include('role')) target.role = getUserRole(name, user);
+  if (include('isAdmin')) target.isAdmin = isUserAdmin(name, user);
+  if (include('isModerator')) target.isModerator = isUserModerator(name, user);
+  if (include('banned')) target.banned = isUserBanned(user);
+  if (include('lastSeen')) target.lastSeen = user.lastSeen || null;
+  if (include('ps3Status')) target.ps3Status = user.ps3Status || null;
+  if (include('level')) target.level = user.level || 1;
+  if (include('xp')) target.xp = user.xp || 0;
+  if (include('downloads')) target.downloads = Array.isArray(user.downloadsData) ? user.downloadsData.length : Number(user.downloads || 0);
+  if (include('wishlist')) target.wishlist = Array.isArray(user.wishlistData) ? user.wishlistData.length : Number(user.wishlist || 0);
+  if (include('favorites')) target.favorites = Array.isArray(user.favoritesData) ? user.favoritesData.length : Number(user.favorites || 0);
+  if (include('trophies')) target.trophies = Number(user.trophies || 0);
+  if (include('library')) target.library = Array.isArray(user.libraryData) ? user.libraryData.length : Number(user.library || 0);
+  if (include('trophiesData')) target.trophiesData = user.trophiesData && typeof user.trophiesData === 'object' && !Array.isArray(user.trophiesData) ? user.trophiesData : {};
+  if (include('downloadsData')) target.downloadsData = Array.isArray(user.downloadsData) ? user.downloadsData : [];
+  if (include('downloadsClearedAt')) target.downloadsClearedAt = normalizeTimestampValue(user.downloadsClearedAt);
+  if (include('downloadsUpdatedAt')) target.downloadsUpdatedAt = normalizeTimestampValue(user.downloadsUpdatedAt);
+  if (include('wishlistData')) target.wishlistData = Array.isArray(user.wishlistData) ? user.wishlistData : [];
+  if (include('wishlistUpdatedAt')) target.wishlistUpdatedAt = normalizeTimestampValue(user.wishlistUpdatedAt);
+  if (include('favoritesData')) target.favoritesData = Array.isArray(user.favoritesData) ? user.favoritesData : [];
+  if (include('favoritesUpdatedAt')) target.favoritesUpdatedAt = normalizeTimestampValue(user.favoritesUpdatedAt);
+  if (include('libraryData')) target.libraryData = Array.isArray(user.libraryData) ? user.libraryData : [];
+  if (include('libraryUpdatedAt')) target.libraryUpdatedAt = normalizeTimestampValue(user.libraryUpdatedAt);
+  if (include('friendsData')) target.friendsData = Array.isArray(user.friendsData) ? user.friendsData : [];
+  if (include('friendsUpdatedAt')) target.friendsUpdatedAt = normalizeTimestampValue(user.friendsUpdatedAt);
+  if (include('countersData')) target.countersData = user.countersData || {};
+  if (include('themeColor')) target.themeColor = normalizeThemeColorServer(user.themeColor || (user.settingsData && user.settingsData.themeColor) || '#0070cc');
+  if (include('themeColorUpdatedAt')) target.themeColorUpdatedAt = getUserThemeColorUpdatedAt(user);
+  if (include('settingsData')) target.settingsData = { ...normalizeProfileRealtimeSettings(user.settingsData || {}), ...getPublicProfileSettings(user) };
+
+  return payload;
+}
+
+function emitProfileSyncPatch(name, changedKeys = [], sourceSocketId = null) {
+  if (!name || !userDatabase[name]) return;
+  const safeKeys = Array.isArray(changedKeys) ? [...new Set(changedKeys.filter(key => PROFILE_SYNC_PATCH_KEYS.has(key)))] : [];
+  if (!safeKeys.length) return;
+  const payload = buildProfileSyncPatchPayload(name, userDatabase[name], safeKeys, sourceSocketId);
+  getSocketsByUserName(name).forEach(client => {
+    if (sourceSocketId && client.id === sourceSocketId) return;
+    client.emit('profile_sync', payload);
+  });
+}
+
 function emitProfileCountsUpdate(name, user = null) {
   if (!name) return;
   const source = user || userDatabase[name];
@@ -2405,7 +2491,8 @@ async function notifyProfileSyncAcrossInstances(name, sourceSocketId = null, pro
     changes: {
       trending: changes && changes.trending === true,
       trophies: changes && changes.trophies === true,
-      counts: changes && changes.counts === true
+      counts: changes && changes.counts === true,
+      keys: Array.isArray(changes && changes.keys) ? [...new Set(changes.keys.filter(key => PROFILE_SYNC_PATCH_KEYS.has(key)))] : []
     }
   };
 
@@ -2480,7 +2567,11 @@ async function initProfileSyncNotifications() {
         scheduleTrophyStatsRefreshBroadcast(1200);
       }
       if (data.changes && data.changes.counts === true) emitProfileCountsUpdate(name, refreshedUser);
-      if (hasLocalSession) emitProfileSync(name, data.sourceSocketId || null);
+      if (hasLocalSession) {
+        const changedKeys = data.changes && Array.isArray(data.changes.keys) ? data.changes.keys : [];
+        if (changedKeys.length) emitProfileSyncPatch(name, changedKeys, data.sourceSocketId || null);
+        else emitProfileSync(name, data.sourceSocketId || null);
+      }
       emitPublicProfileBannerUpdate(name, refreshedUser);
       invalidateOnlineListCache("profile-sync-listen");
       deferServerTask('PROFILE LISTEN ONLINE LIST', () => emitOnlineList(), 1000);
@@ -3279,11 +3370,20 @@ io.on('connection', (socket) => {
     const themeMerge = reconcileIncomingThemeColor(userDatabase[name], incomingThemePayload, incomingSettingsData);
     userDatabase[name].lastSeen = Date.now();
     userDatabase[name].profileUpdatedAt = Date.now();
+    const settingsDbPatch = {
+      settingsData: userDatabase[name].settingsData,
+      lastSeen: userDatabase[name].lastSeen,
+      profileUpdatedAt: userDatabase[name].profileUpdatedAt
+    };
+    if (currentCountryCode) settingsDbPatch.countryCode = currentCountryCode;
+    if (userDatabase[name].themeColor) settingsDbPatch.themeColor = userDatabase[name].themeColor;
+    if (userDatabase[name].themeColorUpdatedAt) settingsDbPatch.themeColorUpdatedAt = userDatabase[name].themeColorUpdatedAt;
+
     userProfileWriteInFlight.add(name);
     try {
       await upsertPresenceForSocket(socket, name);
       userCacheMeta[name] = Date.now();
-      const savedUser = await updateUserDataPreservingCredentials(name, userDatabase[name], 'SETTINGS SAVE');
+      const savedUser = await patchUserData(name, settingsDbPatch, 'SETTINGS PATCH SAVE');
       if (!savedUser) return;
       invalidateOnlineListCache('settings-realtime-save');
     } catch (err) {
@@ -3299,7 +3399,12 @@ io.on('connection', (socket) => {
       emitPublicProfileBannerUpdate(name, userDatabase[name]);
     }
 
-    deferServerTask('SETTINGS PROFILE NOTIFY', () => notifyProfileSyncAcrossInstances(name, sourceSocketId, userDatabase[name].profileUpdatedAt), 0);
+    deferServerTask('SETTINGS PROFILE NOTIFY', () => notifyProfileSyncAcrossInstances(
+      name,
+      sourceSocketId,
+      userDatabase[name].profileUpdatedAt,
+      { keys: Object.keys(settingsDbPatch) }
+    ), 0);
   });
 
   socket.on('update_profile', async (userData) => {
@@ -3313,6 +3418,7 @@ io.on('connection', (socket) => {
     normalizeIncomingProfileCountry(userData, incomingSettingsData);
     let shouldBroadcastProfileBanner = false;
     let shouldForceProfileSyncToSource = false;
+    let profileThemeMerge = { accepted: false, rejected: false };
     const shouldEmitTrendingUpdate = profileUpdateTouchesTrending(userData || {});
     if (name && userDatabase[name]) {
         
@@ -3322,17 +3428,17 @@ io.on('connection', (socket) => {
                 incomingFallback: normalizeTimestampValue(userData.profileCardStyleUpdatedAt || userData.profileUpdatedAt)
             });
             userDatabase[name].settingsData = mergedSettings.settingsData;
-            const themeMerge = reconcileIncomingThemeColor(userDatabase[name], userData, incomingSettingsData || {});
-            shouldBroadcastProfileBanner = mergedSettings.bannerAccepted === true || themeMerge.accepted === true;
-            shouldForceProfileSyncToSource = mergedSettings.settingsRejected === true || mergedSettings.bannerRejected === true || themeMerge.rejected === true;
+            profileThemeMerge = reconcileIncomingThemeColor(userDatabase[name], userData, incomingSettingsData || {});
+            shouldBroadcastProfileBanner = mergedSettings.bannerAccepted === true || profileThemeMerge.accepted === true;
+            shouldForceProfileSyncToSource = mergedSettings.settingsRejected === true || mergedSettings.bannerRejected === true || profileThemeMerge.rejected === true;
             delete userData.settingsData;
             delete userData.themeColor;
             delete userData.themeColorUpdatedAt;
             delete userData.themeUpdatedAt;
         } else {
-            const themeMerge = reconcileIncomingThemeColor(userDatabase[name], userData, {});
-            shouldBroadcastProfileBanner = themeMerge.accepted === true;
-            shouldForceProfileSyncToSource = themeMerge.rejected === true;
+            profileThemeMerge = reconcileIncomingThemeColor(userDatabase[name], userData, {});
+            shouldBroadcastProfileBanner = profileThemeMerge.accepted === true;
+            shouldForceProfileSyncToSource = profileThemeMerge.rejected === true;
             delete userData.themeColor;
             delete userData.themeColorUpdatedAt;
             delete userData.themeUpdatedAt;
@@ -3392,11 +3498,29 @@ io.on('connection', (socket) => {
         normalizeProfileArrayPayloads(userDatabase[name]);
         userDatabase[name].lastSeen = Date.now();
         userDatabase[name].profileUpdatedAt = Date.now();
+
+        const profileDbPatch = {};
+        Object.keys(userData).forEach(key => {
+            if (Object.prototype.hasOwnProperty.call(userDatabase[name], key)) profileDbPatch[key] = userDatabase[name][key];
+        });
+        if (incomingSettingsData) profileDbPatch.settingsData = userDatabase[name].settingsData;
+        if (currentCountryCode && (countryChanged || Object.prototype.hasOwnProperty.call(userData, 'countryCode'))) {
+            profileDbPatch.countryCode = currentCountryCode;
+            profileDbPatch.settingsData = userDatabase[name].settingsData;
+        }
+        if (profileThemeMerge.accepted === true || profileThemeMerge.rejected === true || Object.prototype.hasOwnProperty.call(userData, 'themeColor')) {
+            profileDbPatch.themeColor = userDatabase[name].themeColor;
+            profileDbPatch.themeColorUpdatedAt = userDatabase[name].themeColorUpdatedAt;
+            profileDbPatch.settingsData = userDatabase[name].settingsData;
+        }
+        profileDbPatch.lastSeen = userDatabase[name].lastSeen;
+        profileDbPatch.profileUpdatedAt = userDatabase[name].profileUpdatedAt;
+
         userProfileWriteInFlight.add(name);
         try {
             await upsertPresenceForSocket(socket, name);
             userCacheMeta[name] = Date.now();
-            const savedUser = await updateUserDataPreservingCredentials(name, userDatabase[name], 'PROFILE SAVE');
+            const savedUser = await patchUserData(name, profileDbPatch, 'PROFILE PATCH SAVE');
             if (!savedUser) return;
             invalidateOnlineListCache('profile-update-save');
         } catch (err) {
@@ -3416,13 +3540,14 @@ io.on('connection', (socket) => {
         if (shouldBroadcastProfileBanner) {
             emitPublicProfileBannerUpdate(name, userDatabase[name]);
         }
-        emitProfileSync(name, shouldForceProfileSyncToSource ? null : socket.id);
+        const profileChangedKeys = Object.keys(profileDbPatch);
+        emitProfileSyncPatch(name, profileChangedKeys, shouldForceProfileSyncToSource ? null : socket.id);
         const trophiesChanged = !!userData.trophiesData;
         deferServerTask('PROFILE NOTIFY', () => notifyProfileSyncAcrossInstances(
             name,
             shouldForceProfileSyncToSource ? null : socket.id,
             userDatabase[name].profileUpdatedAt,
-            { trending: shouldEmitTrendingUpdate, trophies: trophiesChanged, counts: publicCountsChanged }
+            { trending: shouldEmitTrendingUpdate, trophies: trophiesChanged, counts: publicCountsChanged, keys: profileChangedKeys }
         ), 0);
 
         if (trophiesChanged) {

@@ -9374,6 +9374,34 @@ P
 		return timestamp;
 	}
 
+	function getProfileSyncDirtyState() {
+		const username = localStorage.getItem('psn_username') || '';
+		if (!window.__profileSyncDirtyState || window.__profileSyncDirtyState.username !== username) {
+			window.__profileSyncDirtyState = {
+				username,
+				dirty: { trophies: false, downloads: false, wishlist: false, favorites: false, library: false, friends: false },
+				lastBaseSignature: ''
+			};
+		}
+		return window.__profileSyncDirtyState;
+	}
+
+	function normalizeProfileSyncDirtyType(type) {
+		const value = String(type || '').trim().toLowerCase();
+		if (value === 'favs' || value === 'favorite') return 'favorites';
+		if (value === 'friend') return 'friends';
+		if (value === 'trophy') return 'trophies';
+		return value;
+	}
+
+	function markProfileSyncDirty(type) {
+		const key = normalizeProfileSyncDirtyType(type);
+		const state = getProfileSyncDirtyState();
+		if (Object.prototype.hasOwnProperty.call(state.dirty, key)) state.dirty[key] = true;
+		return state;
+	}
+	window.markProfileSyncDirty = markProfileSyncDirty;
+
 	function markProfileSettingsChanged(stamp = Date.now()) {
 		const appliedStamp = setProfileSettingsUpdatedAtForUser(localStorage.getItem('psn_username') || '', stamp) || Date.now();
 		if (typeof queueRealtimeSettingsUpdate === 'function') queueRealtimeSettingsUpdate('settings_changed');
@@ -9442,6 +9470,7 @@ P
 		const key = getProfileListTimestampStorageKey(type);
 		const timestamp = normalizeProfileListTimestamp(stamp) || Date.now();
 		saveState(key, String(timestamp));
+		if (typeof markProfileSyncDirty === 'function') markProfileSyncDirty(type);
 		return timestamp;
 	}
 
@@ -20674,6 +20703,7 @@ P
 
 		if (changed && saveChanges && typeof saveState === 'function') {
 			saveState(COOKIE_NAME_HISTORY, JSON.stringify(window.downloadHistory));
+			if (typeof markProfileListChanged === 'function') markProfileListChanged('downloads');
 		}
 
 		if (changed && broadcastChanges && typeof window.broadcastProfileUpdate === 'function') {
@@ -24112,6 +24142,7 @@ P
 					});
 					if (changed) {
 						saveState('psn_user_trophies', JSON.stringify(window.userTrophies));
+						if (typeof markProfileSyncDirty === 'function') markProfileSyncDirty('trophies');
 						if (typeof broadcastProfileUpdate === 'function') broadcastProfileUpdate();
 						document.querySelectorAll('#trophy-grid-container .is-new').forEach(el => el.classList.remove('is-new'));
 					}
@@ -24122,6 +24153,7 @@ P
 					window.downloadHistory.forEach(item => { if (item.isNew) { item.isNew = false; changed = true; } });
 					if (changed) {
 						saveState(COOKIE_NAME_HISTORY, JSON.stringify(window.downloadHistory));
+						if (typeof markProfileListChanged === 'function') markProfileListChanged('downloads');
 						if (typeof broadcastProfileUpdate === 'function') broadcastProfileUpdate();
 						document.querySelectorAll('#downloads-list .is-new').forEach(el => el.classList.remove('is-new'));
 					}
@@ -24406,6 +24438,7 @@ P
 					});
 					if (changed) {
 						saveState('psn_user_trophies', JSON.stringify(window.userTrophies));
+						if (typeof markProfileSyncDirty === 'function') markProfileSyncDirty('trophies');
 						if (typeof broadcastProfileUpdate === 'function') broadcastProfileUpdate();
 						document.querySelectorAll('#trophy-grid-container .is-new').forEach(el => el.classList.remove('is-new'));
 					}
@@ -33576,6 +33609,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 	
 	function queueTrophyProfileSync(reason = 'trophies') {
 		if (window.__applyingRemoteProfileSync || window.__applyingRealtimeSettingsSync || window.__applyingSyncedProfileSettings) return;
+		if (typeof markProfileSyncDirty === 'function') markProfileSyncDirty('trophies');
 		if (window.__trophyProfileSyncTimer) clearTimeout(window.__trophyProfileSyncTimer);
 		window.__trophyProfileSyncTimer = setTimeout(() => {
 			window.__trophyProfileSyncTimer = null;
@@ -33651,6 +33685,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 	
 			saveState('psn_user_trophies', JSON.stringify(window.userTrophies));
 			
+			if (typeof markProfileSyncDirty === 'function') markProfileSyncDirty('trophies');
 			if (typeof window.broadcastProfileUpdate === 'function') {
 				window.broadcastProfileUpdate();
 			}
@@ -43205,12 +43240,14 @@ function getVisibleChatStackEl(id) {
 	
 		const myName = localStorage.getItem('psn_username');
 		if (!myName || myName === "null") return;
+
+		const syncState = (typeof getProfileSyncDirtyState === 'function') ? getProfileSyncDirtyState() : null;
+		const dirty = syncState ? syncState.dirty : { trophies: true, downloads: true, wishlist: true, favorites: true, library: true, friends: true };
 	
 		let totalXp = 0;
 		let totalTrophies = 0;
 		const xpMap = { bronze: 15, silver: 30, gold: 90, platinum: 300 };
-		
-		if (window.userTrophies && typeof TROPHY_DATA !== 'undefined') {
+		if (dirty.trophies && window.userTrophies && typeof TROPHY_DATA !== 'undefined') {
 			Object.keys(window.userTrophies).forEach(id => {
 				if (window.userTrophies[id].unlocked && TROPHY_DATA[id]) {
 					totalXp += xpMap[TROPHY_DATA[id].type] || 0;
@@ -43218,13 +43255,11 @@ function getVisibleChatStackEl(id) {
 				}
 			});
 		}
-		const myLevel = Math.floor(totalXp / 100) + 1;
+
 		const DEFAULT_URL = "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/interface/modern/images/avatars/default.png";
-		
 		const myAvatar = loadState('psn_avatar') || (typeof AVAILABLE_AVATARS !== 'undefined' ? AVAILABLE_AVATARS[0] : DEFAULT_URL);
 		const myJoined = loadState('joined_date') || "2026";
 		const myCountryCode = normalizeProfileCountryCode(loadState(STORAGE_KEY_PROFILE_COUNTRY));
-	
 		const myCounters = {
 			msgs: localStorage.getItem(`${myName}_psn_chat_msgs_sent`) || '0',
 			imgs: localStorage.getItem(`${myName}_psn_chat_imgs_sent`) || '0',
@@ -43233,71 +43268,59 @@ function getVisibleChatStackEl(id) {
 			days: localStorage.getItem(`${myName}_psn_accessed_days`) || '[]',
 			lastChatRead: localStorage.getItem(`${myName}_psn_last_chat_read`) || '0'
 		};
-	
-		const myTheme = loadState('psn_theme_color') || '#0070cc';
-		const myAudio = loadState('psn_audio_state') || "1";
-		const myUx = loadState('psn_ux_sounds_state') || "1";
-		const myChatSound = loadState('psn_chat_sound_state') || "1";
-		const myCardBlur = loadState(STORAGE_KEY_CARD_BLUR) === "1" ? "1" : "0";
-		const myChatAutoTranslate = loadState(STORAGE_KEY_CHAT_AUTO_TRANSLATE) === "1" ? "1" : "0";
-		const myInterfaceAutoTranslate = loadState(STORAGE_KEY_INTERFACE_AUTO_TRANSLATE) !== "0" ? "1" : "0";
-		const myIp = loadState('ps3_ip') || "";
-		const myCompanionPlugin = (loadState(STORAGE_KEY_COMPANION_PLUGIN) !== "0") ? "1" : "0";
-		const myFpsCounterPlugin = (loadState(STORAGE_KEY_FPS_COUNTER) === "1") ? "1" : "0";
-	
-		socketChat.emit('update_profile', {
-			avatar: myAvatar,
-			joined: myJoined,
-			countryCode: myCountryCode,
-			level: myLevel,
-			xp: totalXp,
-			downloads: window.downloadHistory ? window.downloadHistory.length : 0,
-			wishlist: window.wishlist ? window.wishlist.length : 0,
-			favorites: window.favoritesLibrary ? window.favoritesLibrary.length : 0,
-			trophies: totalTrophies,
-			library: typeof lastScannedGames !== 'undefined' ? lastScannedGames.length : 0,
-			ps3Status: (typeof _lastConnectionState !== 'undefined' && _lastConnectionState) ? (window.myCurrentPS3Status || { status: 'idle' }) : null,
-			trophiesData: window.userTrophies || {},
-			downloadsData: window.downloadHistory || [],
-			downloadsClearedAt: Number(loadState(STORAGE_KEY_DOWNLOAD_CLEAR_PENDING) || 0) || 0,
-			downloadsUpdatedAt: normalizeProfileListTimestamp(loadState(getProfileListTimestampStorageKey('downloads'))),
-			wishlistData: window.wishlist || [],
-			wishlistUpdatedAt: normalizeProfileListTimestamp(loadState(getProfileListTimestampStorageKey('wishlist'))),
-			favoritesData: window.favoritesLibrary || [],
-			favoritesUpdatedAt: normalizeProfileListTimestamp(loadState(getProfileListTimestampStorageKey('favorites'))),
-			libraryData: typeof lastScannedGames !== 'undefined' ? lastScannedGames : [],
-			libraryUpdatedAt: normalizeProfileListTimestamp(loadState(getProfileListTimestampStorageKey('library'))),
-			friendsData: window.friendsList || [],
-			friendsUpdatedAt: normalizeProfileListTimestamp(loadState(getProfileListTimestampStorageKey('friends'))),
-			countersData: myCounters, 
-			themeColor: myTheme,
-			themeColorUpdatedAt: (typeof getProfileThemeColorUpdatedAtForUser === 'function') ? getProfileThemeColorUpdatedAtForUser(myName) : 0,
-			settingsData: {
-				audio: myAudio,
-				ux: myUx,
-				chatSound: myChatSound,
-				cardBlur: myCardBlur,
-				chatAutoTranslate: myChatAutoTranslate,
-				interfaceAutoTranslate: myInterfaceAutoTranslate,
-				settingsUpdatedAt: (typeof getProfileSettingsUpdatedAtForUser === 'function') ? getProfileSettingsUpdatedAtForUser(myName) : 0,
-				themeColor: myTheme,
-				themeColorUpdatedAt: (typeof getProfileThemeColorUpdatedAtForUser === 'function') ? getProfileThemeColorUpdatedAtForUser(myName) : 0,
-				profileCardStyle: (typeof normalizeProfileCardStyle === 'function') ? normalizeProfileCardStyle(loadState(STORAGE_KEY_PROFILE_CARD_STYLE) || "neon") : (loadState(STORAGE_KEY_PROFILE_CARD_STYLE) || "neon"),
-				profileCardEffect: (typeof normalizeProfileCardStyle === 'function') ? normalizeProfileCardStyle(loadState(STORAGE_KEY_PROFILE_CARD_STYLE) || "neon") : (loadState(STORAGE_KEY_PROFILE_CARD_STYLE) || "neon"),
-				profileCardStyleUpdatedAt: (typeof getProfileCardStyleUpdatedAtForUser === 'function') ? getProfileCardStyleUpdatedAtForUser(myName) : 0,
-				countryCode: myCountryCode,
-				ps3Ip: myIp,
-				companionPlugin: myCompanionPlugin,
-				fpsCounterPlugin: myFpsCounterPlugin,
-				consoleFanMode: loadState(STORAGE_KEY_CONSOLE_FAN_MODE) || "dynamic",
-				consoleFanSpeed: loadState(STORAGE_KEY_CONSOLE_FAN_SPEED) || "35",
-				consoleFanTarget: loadState(STORAGE_KEY_CONSOLE_FAN_TARGET) || "68",
-				performanceMode: loadState(STORAGE_KEY_PERFORMANCE_MODE) || "balanced",
-				performanceRsx: loadState(STORAGE_KEY_PERFORMANCE_RSX) || "500",
-				performanceVram: loadState(STORAGE_KEY_PERFORMANCE_VRAM) || "650",
-				siteDisclaimerSkipToday: (typeof getStoredSiteDisclaimerSkipToday === 'function') ? getStoredSiteDisclaimerSkipToday(myName) : ""
-			}
-		});
+		const ps3Status = (typeof _lastConnectionState !== 'undefined' && _lastConnectionState) ? (window.myCurrentPS3Status || { status: 'idle' }) : null;
+		const baseSignature = JSON.stringify([myAvatar, myJoined, myCountryCode, ps3Status, myCounters.msgs, myCounters.imgs, myCounters.reactions, myCounters.trailers, myCounters.days, myCounters.lastChatRead]);
+
+		const payload = {};
+		if (!syncState || syncState.lastBaseSignature !== baseSignature) {
+			payload.avatar = myAvatar;
+			payload.joined = myJoined;
+			payload.countryCode = myCountryCode;
+			payload.ps3Status = ps3Status;
+			payload.countersData = myCounters;
+		}
+
+		if (dirty.trophies) {
+			payload.level = Math.floor(totalXp / 100) + 1;
+			payload.xp = totalXp;
+			payload.trophies = totalTrophies;
+			payload.trophiesData = window.userTrophies || {};
+		}
+		if (dirty.downloads) {
+			payload.downloads = window.downloadHistory ? window.downloadHistory.length : 0;
+			payload.downloadsData = window.downloadHistory || [];
+			payload.downloadsClearedAt = Number(loadState(STORAGE_KEY_DOWNLOAD_CLEAR_PENDING) || 0) || 0;
+			payload.downloadsUpdatedAt = normalizeProfileListTimestamp(loadState(getProfileListTimestampStorageKey('downloads')));
+		}
+		if (dirty.wishlist) {
+			payload.wishlist = window.wishlist ? window.wishlist.length : 0;
+			payload.wishlistData = window.wishlist || [];
+			payload.wishlistUpdatedAt = normalizeProfileListTimestamp(loadState(getProfileListTimestampStorageKey('wishlist')));
+		}
+		if (dirty.favorites) {
+			payload.favorites = window.favoritesLibrary ? window.favoritesLibrary.length : 0;
+			payload.favoritesData = window.favoritesLibrary || [];
+			payload.favoritesUpdatedAt = normalizeProfileListTimestamp(loadState(getProfileListTimestampStorageKey('favorites')));
+		}
+		if (dirty.library) {
+			payload.library = typeof lastScannedGames !== 'undefined' ? lastScannedGames.length : 0;
+			payload.libraryData = typeof lastScannedGames !== 'undefined' ? lastScannedGames : [];
+			payload.libraryUpdatedAt = normalizeProfileListTimestamp(loadState(getProfileListTimestampStorageKey('library')));
+		}
+		if (dirty.friends) {
+			payload.friendsData = window.friendsList || [];
+			payload.friendsUpdatedAt = normalizeProfileListTimestamp(loadState(getProfileListTimestampStorageKey('friends')));
+		}
+
+		if (!Object.keys(payload).length) return;
+		socketChat.emit('update_profile', payload);
+
+		if (syncState) {
+			syncState.lastBaseSignature = baseSignature;
+			Object.keys(syncState.dirty).forEach(key => {
+				if (dirty[key]) syncState.dirty[key] = false;
+			});
+		}
 	};
 	
 	window.renderTypingIndicator = function() {
