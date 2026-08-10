@@ -2070,6 +2070,91 @@ function cleanChatMessage(message = {}) {
   return clean;
 }
 
+const pendingSeenMessageWrites = new Map();
+let seenMessageFlushTimer = null;
+let seenMessageFlushInFlight = false;
+const SEEN_MESSAGE_FLUSH_DELAY_MS = 180;
+const SEEN_MESSAGE_BATCH_SIZE = 150;
+
+function getSeenMessageWriteKey(entry = {}) {
+  const id = Number(entry.id || 0);
+  if (id > 0) return `id:${id}`;
+  const time = String(entry.time || '');
+  return time ? `time:${time}` : '';
+}
+
+function scheduleSeenMessageFlush(delayMs = SEEN_MESSAGE_FLUSH_DELAY_MS) {
+  if (seenMessageFlushTimer || seenMessageFlushInFlight || !pendingSeenMessageWrites.size) return;
+  seenMessageFlushTimer = setTimeout(() => {
+    seenMessageFlushTimer = null;
+    flushPendingSeenMessageWrites().catch(err => console.error('[SEEN BATCH ERROR]:', err));
+  }, Math.max(0, Number(delayMs) || 0));
+}
+
+function queueSeenMessagePersist(message = {}) {
+  const entry = {
+    id: Number(message && message._dbId) || 0,
+    time: String(message && message.time || ''),
+    message: cleanChatMessage(message)
+  };
+  const key = getSeenMessageWriteKey(entry);
+  if (!key) return false;
+  pendingSeenMessageWrites.set(key, entry);
+  scheduleSeenMessageFlush(pendingSeenMessageWrites.size >= SEEN_MESSAGE_BATCH_SIZE ? 0 : SEEN_MESSAGE_FLUSH_DELAY_MS);
+  return true;
+}
+
+async function flushPendingSeenMessageWrites() {
+  if (seenMessageFlushInFlight || !pendingSeenMessageWrites.size) return;
+  seenMessageFlushInFlight = true;
+
+  const batchEntries = Array.from(pendingSeenMessageWrites.entries()).slice(0, SEEN_MESSAGE_BATCH_SIZE);
+  batchEntries.forEach(([key]) => pendingSeenMessageWrites.delete(key));
+  const batch = batchEntries.map(([, entry]) => entry);
+
+  try {
+    const byId = batch.filter(entry => entry.id > 0);
+    const byTime = batch.filter(entry => entry.id <= 0 && entry.time);
+
+    if (byId.length) {
+      const payload = byId.map(entry => ({ id: entry.id, message: entry.message }));
+      await queryDbWithRetry(`
+        WITH updates AS (
+          SELECT id, message
+          FROM jsonb_to_recordset($1::jsonb) AS x(id bigint, message jsonb)
+        )
+        UPDATE chat AS c
+        SET message = updates.message
+        FROM updates
+        WHERE c.id = updates.id
+      `, [JSON.stringify(payload)], { attempts: 2, label: 'SEEN BATCH SAVE' });
+    }
+
+    if (byTime.length) {
+      const payload = byTime.map(entry => ({ msg_time: entry.time, message: entry.message }));
+      await queryDbWithRetry(`
+        WITH updates AS (
+          SELECT msg_time, message
+          FROM jsonb_to_recordset($1::jsonb) AS x(msg_time text, message jsonb)
+        )
+        UPDATE chat AS c
+        SET message = updates.message
+        FROM updates
+        WHERE c.message->>'time' = updates.msg_time
+      `, [JSON.stringify(payload)], { attempts: 2, label: 'SEEN BATCH SAVE' });
+    }
+  } catch (err) {
+    batch.forEach(entry => {
+      const key = getSeenMessageWriteKey(entry);
+      if (key && !pendingSeenMessageWrites.has(key)) pendingSeenMessageWrites.set(key, entry);
+    });
+    console.error(`[SEEN BATCH ERROR] Failed to persist ${batch.length} seen update(s):`, err);
+  } finally {
+    seenMessageFlushInFlight = false;
+    if (pendingSeenMessageWrites.size) scheduleSeenMessageFlush(120);
+  }
+}
+
 function attachChatDbId(message, dbId) {
   if (!message || typeof message !== 'object') return message;
   Object.defineProperty(message, '_dbId', {
@@ -4396,7 +4481,7 @@ io.on('connection', (socket) => {
     }
   });
 
-  socket.on('mark_as_read', async (data) => {
+  socket.on('mark_as_read', (data) => {
     const msg = messageHistory.find(m => String(new Date(m.time).getTime()) === String(data.msgId));
     if (msg && msg.user !== data.user) {
         if (!msg.seenBy) msg.seenBy = [];
@@ -4404,11 +4489,8 @@ io.on('connection', (socket) => {
         if (!msg.seenBy.includes(data.user)) {
             msg.seenBy.push(data.user);
             msg.seenAt[data.user] = new Date().toISOString();
-
-            try {
-                await pool.query("UPDATE chat SET message = $1 WHERE message->>'time' = $2", [cleanChatMessage(msg), msg.time]);
-                io.emit('message_seen', { msgId: data.msgId, seenBy: msg.seenBy, seenAt: msg.seenAt });
-            } catch (err) { console.error("Seen Mark Error:", err); }
+            io.emit('message_seen', { msgId: data.msgId, seenBy: msg.seenBy, seenAt: msg.seenAt });
+            queueSeenMessagePersist(msg);
         }
     }
   });
