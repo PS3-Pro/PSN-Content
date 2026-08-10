@@ -33684,32 +33684,6 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 		}
 	}
 	
-	window.__trophyProfileHydrationPending = window.__trophyProfileHydrationPending === true;
-	window.__pendingTrophyProgressChecks = window.__pendingTrophyProgressChecks || {};
-
-	function queueTrophyProgressUntilHydrated(trophyId, currentAmount) {
-		if (!trophyId) return;
-		const numericAmount = Number(currentAmount);
-		if (Number.isFinite(numericAmount)) {
-			const previousAmount = Number(window.__pendingTrophyProgressChecks[trophyId]);
-			window.__pendingTrophyProgressChecks[trophyId] = Number.isFinite(previousAmount) ? Math.max(previousAmount, numericAmount) : numericAmount;
-		} else {
-			window.__pendingTrophyProgressChecks[trophyId] = currentAmount;
-		}
-	}
-
-	window.markTrophyProfileHydrated = function() {
-		if (window.__trophyProfileHydrationPending !== true) return;
-		window.__trophyProfileHydrationPending = false;
-		const queuedChecks = window.__pendingTrophyProgressChecks || {};
-		window.__pendingTrophyProgressChecks = {};
-		setTimeout(() => {
-			Object.entries(queuedChecks).forEach(([trophyId, currentAmount]) => {
-				if (typeof window.checkTrophyProgress === 'function') window.checkTrophyProgress(trophyId, currentAmount);
-			});
-		}, 0);
-	};
-
 	function queueTrophyProfileSync(reason = 'trophies') {
 		if (window.__applyingRemoteProfileSync || window.__applyingRealtimeSettingsSync || window.__applyingSyncedProfileSettings) return;
 		if (typeof markProfileSyncDirty === 'function') markProfileSyncDirty('trophies');
@@ -33763,11 +33737,6 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 	
 	window.checkTrophyProgress = function(trophyId, currentAmount) {
 		if (!localStorage.getItem('psn_username') || localStorage.getItem('psn_username') === "null" || !window.userTrophies) return;
-		if (window.__trophyProfileHydrationPending === true) {
-			queueTrophyProgressUntilHydrated(trophyId, currentAmount);
-			return;
-		}
-
 		const trophy = TROPHY_DATA[trophyId];
 		if (!trophy) return;
 		
@@ -33825,7 +33794,6 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 	};
 	
 	function checkPlatinum() {
-		if (window.__trophyProfileHydrationPending === true) return;
 		if (window.userTrophies['platinum']?.unlocked) return;
 		const allIds = Object.keys(TROPHY_DATA).filter(id => id !== 'platinum');
 		const allUnlocked = allIds.every(id => window.userTrophies[id]?.unlocked);
@@ -40969,10 +40937,9 @@ function getVisibleChatStackEl(id) {
 	window.applyRemoteProfileSync = function(payload = {}) {
 		const name = String(payload.name || payload.targetName || '').trim();
 		const userData = payload.userData || payload.data || {};
-		const receivedTrophyHydration = !!(userData.trophiesData && typeof userData.trophiesData === 'object' && !Array.isArray(userData.trophiesData));
 		const myName = localStorage.getItem('psn_username') || '';
 		if (!name || name !== myName || !userData || typeof userData !== 'object') return;
-		if (!window.isProfileLoaded) return;
+		if (!window.isProfileLoaded && window.__initialProfileSyncInProgress !== true) return;
 
 		const incomingProfileUpdatedAt = Number(userData.profileUpdatedAt || payload.profileUpdatedAt || 0);
 		const lastAppliedProfileUpdatedAt = Number(window.__lastAppliedProfileUpdatedAt || 0);
@@ -41102,7 +41069,6 @@ function getVisibleChatStackEl(id) {
 		} finally {
 			setTimeout(() => {
 				window.__applyingRemoteProfileSync = false;
-				if (receivedTrophyHydration && typeof window.markTrophyProfileHydrated === 'function') window.markTrophyProfileHydrated();
 			}, 0);
 		}
 	};
@@ -41792,15 +41758,10 @@ function getVisibleChatStackEl(id) {
 			if (typeof window.clearPasswordResetExpiryTimer === 'function') window.clearPasswordResetExpiryTimer();
 			if (typeof window.setPasswordResetLoginMode === 'function') window.setPasswordResetLoginMode(name, false);
 			if (typeof isKicked !== 'undefined') isKicked = false;
-			setTimeout(() => {
-				if (!(typeof socketChat !== 'undefined' && socketChat && socketChat.connected)) return;
-				if (!window.__pendingTrendingData) socketChat.emit('request_trending');
-			}, 1800);
 			window.__serverProfileHydratedUser = name;
 			window.__lastAppliedProfileUpdatedAt = Number((userData && userData.profileUpdatedAt) || 0);
 			const isLightAuthPayload = data && (data.lightAuth === true || data.fullProfileDeferred === true || (userData && userData._lightAuth === true));
-			window.__trophyProfileHydrationPending = isLightAuthPayload === true;
-			window.__pendingTrophyProgressChecks = {};
+			const profileWasAlreadyLoaded = window.isProfileLoaded === true;
 			const adminBypassLogin = document.body.classList.contains('admin-maintenance-login-bypass');
 			const earlyRole = String(role || (userData && userData.role) || (isAdmin ? 'admin' : 'user')).toLowerCase() === 'moderator' ? 'mod' : String(role || (userData && userData.role) || (isAdmin ? 'admin' : 'user')).toLowerCase();
 			if (adminBypassLogin && !(isAdmin === true || earlyRole === 'admin')) {
@@ -41815,7 +41776,6 @@ function getVisibleChatStackEl(id) {
 			if (userData.trophiesData && typeof userData.trophiesData === 'object' && !Array.isArray(userData.trophiesData)) {
 				window.userTrophies = userData.trophiesData;
 				safeLocalStorageSet(`${name}_psn_user_trophies`, JSON.stringify(userData.trophiesData));
-				window.__trophyProfileHydrationPending = false;
 			} else if (isLightAuthPayload) {
 				const localTrophies = localStorage.getItem(`${name}_psn_user_trophies`);
 				try {
@@ -41826,7 +41786,6 @@ function getVisibleChatStackEl(id) {
 			} else {
 				const localTrophies = localStorage.getItem(`${name}_psn_user_trophies`);
 				window.userTrophies = localTrophies ? JSON.parse(localTrophies) : {};
-				window.__trophyProfileHydrationPending = false;
 			}
 		
 			if (Array.isArray(userData.wishlistData)) {
@@ -41961,7 +41920,13 @@ function getVisibleChatStackEl(id) {
 				saveState(STORAGE_KEY_PROFILE_COUNTRY, authCountryCode);
 			}
 		
-			window.isProfileLoaded = true;
+			if (isLightAuthPayload && !profileWasAlreadyLoaded) {
+				window.__initialProfileSyncInProgress = true;
+				window.isProfileLoaded = false;
+			} else {
+				window.__initialProfileSyncInProgress = false;
+				window.isProfileLoaded = true;
+			}
 			if (typeof forceCurrentAuthenticatedUserOnline === 'function') {
 				currentOnlineList = forceCurrentAuthenticatedUserOnline(currentOnlineList);
 				window.currentOnlineList = currentOnlineList;
@@ -41973,39 +41938,83 @@ function getVisibleChatStackEl(id) {
 				if (onlineModal && (onlineModal.style.display === 'flex' || onlineModal.classList.contains('show')) && typeof renderOnlineList === 'function') renderOnlineList();
 				if (socketChat && socketChat.connected) socketChat.emit('request_online_list');
 			}
+			const bootContainer = document.getElementById('ps5-boot-container');
+			const shouldFinishInteractiveBoot = !!(bootContainer && bootContainer.style.display !== 'none' && !window.isBooting);
+
+			if (shouldFinishInteractiveBoot) {
+				window.isBooting = true;
+				if (typeof closeAllPs5AuthOverlaysInstant === 'function') closeAllPs5AuthOverlaysInstant();
+				const userSelectScreen = document.getElementById('user-select-screen');
+				if (userSelectScreen) userSelectScreen.style.opacity = '1';
+				if (typeof playUiSuccess === 'function') playUiSuccess();
+			}
+
+			let initialProfileSyncOk = true;
+			if (isLightAuthPayload && typeof socketChat !== 'undefined' && socketChat && socketChat.connected) {
+				initialProfileSyncOk = await new Promise(resolve => {
+					const request = { reason: shouldFinishInteractiveBoot ? 'pre_boot' : 'post_light_auth', forceRefresh: false };
+					if (typeof socketChat.timeout === 'function') {
+						socketChat.timeout(20000).emit('request_profile_sync', request, (err, response) => {
+							resolve(!err && (!response || response.ok !== false));
+						});
+						return;
+					}
+
+					let settled = false;
+					const timer = setTimeout(() => {
+						if (settled) return;
+						settled = true;
+						resolve(false);
+					}, 20000);
+					socketChat.emit('request_profile_sync', request, response => {
+						if (settled) return;
+						settled = true;
+						clearTimeout(timer);
+						resolve(!response || response.ok !== false);
+					});
+				});
+			}
+
+			if (!initialProfileSyncOk && shouldFinishInteractiveBoot) {
+				window.__initialProfileSyncInProgress = false;
+				window.isProfileLoaded = false;
+				window.isBooting = false;
+				isLoggingIn = false;
+				if (typeof playUiError === 'function') playUiError();
+				if (typeof showToastNotification === 'function') showToastNotification('Profile', 'Profile synchronization failed. Please try logging in again.');
+				else alert('Profile synchronization failed. Please try logging in again.');
+				return;
+			}
+
+			if (isLightAuthPayload && initialProfileSyncOk && !profileWasAlreadyLoaded) {
+				window.__initialProfileSyncInProgress = false;
+				window.isProfileLoaded = true;
+			}
+
 			setTimeout(() => {
 				if (typeof bootstrapChatRealtime === 'function') bootstrapChatRealtime('auth-success');
 			}, 120);
 			if (typeof updateInterfaceAutoTranslateUi === 'function') updateInterfaceAutoTranslateUi({ silent: true, source: 'auth-success' });
 			if (!authCountryCode) setTimeout(() => ensureProfileCountryForUser(name, userData), 0);
 			if (typeof markChatNotificationsReady === 'function') markChatNotificationsReady('auth-success');
-
 			if (typeof scheduleSavedPs3Reconnect === 'function') scheduleSavedPs3Reconnect(name, 1400);
 
-		
-			window.dailyTrophyTimer = setTimeout(() => {
-				if (typeof checkDailyTrophies === 'function') {
-					checkDailyTrophies();
-				}
-			}, 2000);
-		
-			const bootContainer = document.getElementById('ps5-boot-container');
-			
-			if (bootContainer && bootContainer.style.display !== 'none' && !window.isBooting) {
-				window.isBooting = true;
-				
-				if (typeof closeAllPs5AuthOverlaysInstant === 'function') closeAllPs5AuthOverlaysInstant();
-				
-				document.getElementById('user-select-screen').style.opacity = '1';
-				if (typeof playUiSuccess === 'function') playUiSuccess();
-				
+			if (!isLightAuthPayload || initialProfileSyncOk) {
+				window.dailyTrophyTimer = setTimeout(() => {
+					if (typeof checkDailyTrophies === 'function') checkDailyTrophies();
+				}, 2000);
+			}
+
+			setTimeout(() => {
+				if (!(typeof socketChat !== 'undefined' && socketChat && socketChat.connected)) return;
+				if (!window.__pendingTrendingData) socketChat.emit('request_trending');
+			}, 250);
+
+			if (shouldFinishInteractiveBoot) {
 				if (typeof ensureStorePrefetchBeforeLogin === 'function') {
 					await ensureStorePrefetchBeforeLogin(name);
 				}
-				finishBoot(name); 
-			}
-			if (isLightAuthPayload && typeof socketChat !== 'undefined' && socketChat && socketChat.connected) {
-				setTimeout(() => socketChat.emit('request_profile_sync', { reason: 'post_light_auth', forceRefresh: false }), 2800);
+				finishBoot(name);
 			}
 		});
 		

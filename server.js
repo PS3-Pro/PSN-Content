@@ -2755,17 +2755,6 @@ function emitProfileSyncPatchFromUser(name, user = {}, changedKeys = [], sourceS
   });
 }
 
-function emitProfileSyncPatch(name, changedKeys = [], sourceSocketId = null) {
-  if (!name || !userDatabase[name]) return;
-  const safeKeys = Array.isArray(changedKeys) ? [...new Set(changedKeys.filter(key => PROFILE_SYNC_PATCH_KEYS.has(key)))] : [];
-  if (!safeKeys.length) return;
-  const payload = buildProfileSyncPatchPayload(name, userDatabase[name], safeKeys, sourceSocketId);
-  getSocketsByUserName(name).forEach(client => {
-    if (sourceSocketId && client.id === sourceSocketId) return;
-    client.emit('profile_sync', payload);
-  });
-}
-
 function emitProfileCountsUpdate(name, user = null) {
   if (!name) return;
   const source = user || userDatabase[name];
@@ -4027,32 +4016,41 @@ io.on('connection', (socket) => {
     }
   });
 
-  socket.on('request_profile_sync', async (data = {}) => {
+  socket.on('request_profile_sync', async (data = {}, ack) => {
     const name = socket.userName;
-    if (!name || !userDatabase[name]) return;
+    if (!name || !userDatabase[name]) {
+      if (typeof ack === 'function') ack({ ok: false, error: 'Profile is not available.' });
+      return;
+    }
 
-    try {
-      const sendProfileSync = async () => {
-        if (socket.profileSyncV2 === true) {
-          await emitChunkedProfileSyncToSocket(socket, name, { forceRefresh: data && data.forceRefresh === true });
-          return;
-        }
-
-        const fullUser = await runSerializedProfileHydration(() => loadFullUserRecordTransient(name));
-        if (!fullUser || !socket.connected) return;
-        socket.emit('profile_sync', buildFullProfileSyncPayload(name, fullUser, null, { normalized: true }));
-        compactCachedUser(name);
-      };
-
-      if (!(data && data.forceRefresh === true) && getPostAuthRemainingDelay(socket, POST_AUTH_PROFILE_SYNC_DELAY_MS) > 0) {
-        deferAfterAuthSettle(socket, 'REQUEST PROFILE SYNC', sendProfileSync, POST_AUTH_PROFILE_SYNC_DELAY_MS);
+    const sendProfileSync = async () => {
+      if (socket.profileSyncV2 === true) {
+        await emitChunkedProfileSyncToSocket(socket, name, { forceRefresh: data && data.forceRefresh === true });
         return;
       }
 
-      await sendProfileSync();
-    } catch (err) {
-      console.error('[REQUEST PROFILE SYNC ERROR]:', err);
+      const fullUser = await runSerializedProfileHydration(() => loadFullUserRecordTransient(name));
+      if (!fullUser || !socket.connected) throw new Error('Profile could not be loaded.');
+      socket.emit('profile_sync', buildFullProfileSyncPayload(name, fullUser, null, { normalized: true }));
+      compactCachedUser(name);
+    };
+
+    const completeProfileSync = async () => {
+      try {
+        await sendProfileSync();
+        if (typeof ack === 'function') ack({ ok: true, profileUpdatedAt: normalizeTimestampValue(userDatabase[name] && userDatabase[name].profileUpdatedAt) });
+      } catch (err) {
+        console.error('[REQUEST PROFILE SYNC ERROR]:', err);
+        if (typeof ack === 'function') ack({ ok: false, error: 'Profile synchronization failed.' });
+      }
+    };
+
+    if (!(data && data.forceRefresh === true) && getPostAuthRemainingDelay(socket, POST_AUTH_PROFILE_SYNC_DELAY_MS) > 0) {
+      deferAfterAuthSettle(socket, 'REQUEST PROFILE SYNC', completeProfileSync, POST_AUTH_PROFILE_SYNC_DELAY_MS);
+      return;
     }
+
+    await completeProfileSync();
   });
 
   socket.on('request_online_list', async () => {
