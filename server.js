@@ -296,6 +296,17 @@ let trendingBuildInFlight = null;
 let globalTrophyStatsCache = null;
 let globalTrophyStatsCacheAt = 0;
 let globalTrophyStatsBuildInFlight = null;
+let lastMemoryPressureLogAt = 0;
+
+function logMemoryPressureIfNeeded(reason = 'periodic') {
+  const mem = process.memoryUsage();
+  const heapMb = mem.heapUsed / 1024 / 1024;
+  if (heapMb < 150 && reason === 'periodic') return;
+  const now = Date.now();
+  if (reason === 'periodic' && now - lastMemoryPressureLogAt < 60000) return;
+  lastMemoryPressureLogAt = now;
+  console.log(`[MEMORY] ${reason} heap ${heapMb.toFixed(1)} MB / ${(mem.heapTotal / 1024 / 1024).toFixed(1)} MB, rss ${(mem.rss / 1024 / 1024).toFixed(1)} MB, sockets ${io.sockets.sockets.size}, trend cache ${trendingCache ? 'yes' : 'no'}, content-count cache ${contentDownloadCountCache ? contentDownloadCountCache.size : 0}`);
+}
 let trendingRefreshTimer = null;
 let trophyStatsRefreshTimer = null;
 const TRENDING_CACHE_MS = Math.max(10000, parseInt(process.env.TRENDING_CACHE_MS || '300000', 10) || 300000);
@@ -1496,6 +1507,7 @@ function invalidateGlobalTrophyStatsCache() {
 }
 
 function scheduleTrendingRefreshBroadcast(delayMs = 1500) {
+  clearContentDownloadCountCache();
   if (trendingRefreshTimer) return;
   trendingRefreshTimer = setTimeout(async () => {
     trendingRefreshTimer = null;
@@ -1743,51 +1755,15 @@ function searchUsersFromCache(query, includeAdminFields = false, includeAllMatch
 
 async function calculateTrendingFromDb() {
   const rows = await queryDbWithRetry(`
-    WITH download_items AS (
+    WITH game_downloads AS (
       SELECT
         u.name AS username,
-        CASE raw_category
-          WHEN 'game' THEN 'games'
-          WHEN 'app' THEN 'apps'
-          WHEN 'demo' THEN 'demos'
-          WHEN 'dlc' THEN 'dlcs'
-          WHEN 'update' THEN 'updates'
-          WHEN 'avatar' THEN 'avatars'
-          WHEN 'theme' THEN 'themes'
-          WHEN 'homebrew' THEN 'homebrew_games'
-          WHEN 'port' THEN 'ports'
-          WHEN 'prototype' THEN 'prototypes'
-          WHEN 'emulator' THEN 'emulators'
-          WHEN 'launcher' THEN 'launchers'
-          WHEN 'tool' THEN 'tools'
-          WHEN 'dev_tool' THEN 'dev_tools'
-          WHEN 'manager' THEN 'backup_manager'
-          ELSE COALESCE(NULLIF(raw_category, ''), 'games')
-        END AS category,
         CASE WHEN upper(trim(COALESCE(item->>'titleId', item->>'id', ''))) IN ('MISSING','N/A','NONE','NULL','UNDEFINED') THEN '' ELSE upper(trim(COALESCE(item->>'titleId', item->>'id', ''))) END AS title_id,
-        CASE WHEN upper(trim(COALESCE(item->>'contentId', item->>'contentID', ''))) IN ('MISSING','N/A','NONE','NULL','UNDEFINED') THEN '' ELSE upper(trim(COALESCE(item->>'contentId', item->>'contentID', ''))) END AS content_id,
-        regexp_replace(lower(replace(trim(COALESCE(item->>'cleanName', item->>'name', item->>'title', item->>'rawName', '')), '&amp;', '&')), '[^a-z0-9]+', '', 'g') AS normalized_name
+        regexp_replace(lower(trim(COALESCE(item->>'category', item->>'rawCategory', 'games'))), '[[:space:]-]+', '_', 'g') AS raw_category
       FROM users u
       CROSS JOIN LATERAL jsonb_array_elements(
         CASE WHEN jsonb_typeof(u.data->'downloadsData') = 'array' THEN u.data->'downloadsData' ELSE '[]'::jsonb END
       ) item
-      CROSS JOIN LATERAL (
-        SELECT regexp_replace(lower(trim(COALESCE(item->>'category', item->>'rawCategory', 'games'))), '[[:space:]-]+', '_', 'g') AS raw_category
-      ) cat
-    ), keyed_downloads AS (
-      SELECT
-        username,
-        category,
-        title_id,
-        CASE
-          WHEN category = 'games' AND title_id <> '' THEN category || '|T:' || title_id
-          WHEN content_id <> '' THEN category || '|C:' || content_id
-          WHEN title_id <> '' AND normalized_name <> '' THEN category || '|T:' || title_id || '|N:' || normalized_name
-          WHEN title_id <> '' THEN category || '|T:' || title_id
-          WHEN normalized_name <> '' THEN category || '|N:' || normalized_name
-          ELSE ''
-        END AS content_key
-      FROM download_items
     ), wishlist_items AS (
       SELECT
         u.name AS username,
@@ -1796,40 +1772,163 @@ async function calculateTrendingFromDb() {
       CROSS JOIN LATERAL jsonb_array_elements(
         CASE WHEN jsonb_typeof(u.data->'wishlistData') = 'array' THEN u.data->'wishlistData' ELSE '[]'::jsonb END
       ) item
+    ), top_games AS (
+      SELECT title_id AS key, COUNT(DISTINCT username)::int AS count
+      FROM game_downloads
+      WHERE raw_category IN ('game','games') AND title_id <> ''
+      GROUP BY title_id
+      ORDER BY count DESC, title_id ASC
+      LIMIT 50
+    ), top_wishlist AS (
+      SELECT title_id AS key, COUNT(*)::int AS count
+      FROM wishlist_items
+      WHERE title_id <> ''
+      GROUP BY title_id
+      ORDER BY count DESC, title_id ASC
+      LIMIT 50
     )
-    SELECT 'game' AS kind, title_id AS key, COUNT(DISTINCT username)::int AS count
-    FROM keyed_downloads
-    WHERE category = 'games' AND title_id <> ''
-    GROUP BY title_id
+    SELECT 'game' AS kind, key, count FROM top_games
     UNION ALL
-    SELECT 'content' AS kind, content_key AS key, COUNT(DISTINCT username)::int AS count
-    FROM keyed_downloads
-    WHERE content_key <> ''
-    GROUP BY content_key
-    UNION ALL
-    SELECT 'wishlist' AS kind, title_id AS key, COUNT(*)::int AS count
-    FROM wishlist_items
-    WHERE title_id <> ''
-    GROUP BY title_id
+    SELECT 'wishlist' AS kind, key, count FROM top_wishlist
   `, [], { attempts: 2, label: 'TRENDING AGGREGATE' });
 
-  const gameCounts = [];
-  const wishCounts = [];
-  const contentDownloadCounts = {};
-
+  const topDownloads = [];
+  const topWishlist = [];
   rows.rows.forEach(row => {
-    const count = Number(row.count) || 0;
-    if (row.kind === 'game') gameCounts.push({ id: row.key, count });
-    else if (row.kind === 'wishlist') wishCounts.push({ id: row.key, count });
-    else if (row.kind === 'content' && row.key) contentDownloadCounts[row.key] = count;
+    const item = { id: row.key, count: Number(row.count) || 0 };
+    if (row.kind === 'game') topDownloads.push(item);
+    else if (row.kind === 'wishlist') topWishlist.push(item);
   });
 
-  const sortTop = list => list.sort((a, b) => b.count - a.count || String(a.id).localeCompare(String(b.id))).slice(0, 50);
-  return {
-    topDownloads: sortTop(gameCounts),
-    topWishlist: sortTop(wishCounts),
-    contentDownloadCounts
-  };
+  return { topDownloads, topWishlist };
+}
+
+const CONTENT_DOWNLOAD_COUNT_CACHE_TTL_MS = Math.max(30000, parseInt(process.env.CONTENT_DOWNLOAD_COUNT_CACHE_TTL_MS || '300000', 10) || 300000);
+const CONTENT_DOWNLOAD_COUNT_CACHE_MAX = Math.max(250, parseInt(process.env.CONTENT_DOWNLOAD_COUNT_CACHE_MAX || '4000', 10) || 4000);
+const CONTENT_DOWNLOAD_COUNT_REQUEST_MAX = Math.max(25, Math.min(500, parseInt(process.env.CONTENT_DOWNLOAD_COUNT_REQUEST_MAX || '200', 10) || 200));
+const contentDownloadCountCache = new Map();
+let contentDownloadCountQueryQueue = Promise.resolve();
+
+function runSerializedContentDownloadCountQuery(task) {
+  const run = contentDownloadCountQueryQueue.catch(() => null).then(task);
+  contentDownloadCountQueryQueue = run.then(() => null, () => null);
+  return run;
+}
+
+function clearContentDownloadCountCache() {
+  contentDownloadCountCache.clear();
+}
+
+function setCachedContentDownloadCount(key, count) {
+  if (!key) return;
+  if (contentDownloadCountCache.has(key)) contentDownloadCountCache.delete(key);
+  contentDownloadCountCache.set(key, { count: Math.max(0, Number(count) || 0), at: Date.now() });
+  while (contentDownloadCountCache.size > CONTENT_DOWNLOAD_COUNT_CACHE_MAX) {
+    const oldestKey = contentDownloadCountCache.keys().next().value;
+    if (oldestKey === undefined) break;
+    contentDownloadCountCache.delete(oldestKey);
+  }
+}
+
+async function getContentDownloadCountsForKeys(rawKeys = []) {
+  const keys = [...new Set((Array.isArray(rawKeys) ? rawKeys : [])
+    .map(value => String(value || '').trim())
+    .filter(value => value && value.length <= 512))]
+    .slice(0, CONTENT_DOWNLOAD_COUNT_REQUEST_MAX);
+  if (!keys.length) return {};
+
+  const now = Date.now();
+  const counts = {};
+  const missing = [];
+  keys.forEach(key => {
+    const cached = contentDownloadCountCache.get(key);
+    if (cached && now - cached.at < CONTENT_DOWNLOAD_COUNT_CACHE_TTL_MS) {
+      counts[key] = cached.count;
+      contentDownloadCountCache.delete(key);
+      contentDownloadCountCache.set(key, cached);
+    } else {
+      if (cached) contentDownloadCountCache.delete(key);
+      missing.push(key);
+    }
+  });
+
+  if (missing.length) {
+    await runSerializedContentDownloadCountQuery(async () => {
+      const queryKeys = [];
+      const recheckNow = Date.now();
+      missing.forEach(key => {
+        const cached = contentDownloadCountCache.get(key);
+        if (cached && recheckNow - cached.at < CONTENT_DOWNLOAD_COUNT_CACHE_TTL_MS) {
+          counts[key] = cached.count;
+          contentDownloadCountCache.delete(key);
+          contentDownloadCountCache.set(key, cached);
+        } else {
+          if (cached) contentDownloadCountCache.delete(key);
+          queryKeys.push(key);
+        }
+      });
+      if (!queryKeys.length) return;
+
+      const rows = await queryDbWithRetry(`
+        WITH download_items AS (
+          SELECT
+            u.name AS username,
+            CASE raw_category
+              WHEN 'game' THEN 'games'
+              WHEN 'app' THEN 'apps'
+              WHEN 'demo' THEN 'demos'
+              WHEN 'dlc' THEN 'dlcs'
+              WHEN 'update' THEN 'updates'
+              WHEN 'avatar' THEN 'avatars'
+              WHEN 'theme' THEN 'themes'
+              WHEN 'homebrew' THEN 'homebrew_games'
+              WHEN 'port' THEN 'ports'
+              WHEN 'prototype' THEN 'prototypes'
+              WHEN 'emulator' THEN 'emulators'
+              WHEN 'launcher' THEN 'launchers'
+              WHEN 'tool' THEN 'tools'
+              WHEN 'dev_tool' THEN 'dev_tools'
+              WHEN 'manager' THEN 'backup_manager'
+              ELSE COALESCE(NULLIF(raw_category, ''), 'games')
+            END AS category,
+            CASE WHEN upper(trim(COALESCE(item->>'titleId', item->>'id', ''))) IN ('MISSING','N/A','NONE','NULL','UNDEFINED') THEN '' ELSE upper(trim(COALESCE(item->>'titleId', item->>'id', ''))) END AS title_id,
+            CASE WHEN upper(trim(COALESCE(item->>'contentId', item->>'contentID', ''))) IN ('MISSING','N/A','NONE','NULL','UNDEFINED') THEN '' ELSE upper(trim(COALESCE(item->>'contentId', item->>'contentID', ''))) END AS content_id,
+            regexp_replace(lower(replace(trim(COALESCE(item->>'cleanName', item->>'name', item->>'title', item->>'rawName', '')), '&amp;', '&')), '[^a-z0-9]+', '', 'g') AS normalized_name
+          FROM users u
+          CROSS JOIN LATERAL jsonb_array_elements(
+            CASE WHEN jsonb_typeof(u.data->'downloadsData') = 'array' THEN u.data->'downloadsData' ELSE '[]'::jsonb END
+          ) item
+          CROSS JOIN LATERAL (
+            SELECT regexp_replace(lower(trim(COALESCE(item->>'category', item->>'rawCategory', 'games'))), '[[:space:]-]+', '_', 'g') AS raw_category
+          ) cat
+        ), keyed_downloads AS (
+          SELECT
+            username,
+            CASE
+              WHEN category = 'games' AND title_id <> '' THEN category || '|T:' || title_id
+              WHEN content_id <> '' THEN category || '|C:' || content_id
+              WHEN title_id <> '' AND normalized_name <> '' THEN category || '|T:' || title_id || '|N:' || normalized_name
+              WHEN title_id <> '' THEN category || '|T:' || title_id
+              WHEN normalized_name <> '' THEN category || '|N:' || normalized_name
+              ELSE ''
+            END AS content_key
+          FROM download_items
+        )
+        SELECT content_key AS key, COUNT(DISTINCT username)::int AS count
+        FROM keyed_downloads
+        WHERE content_key = ANY($1::text[])
+        GROUP BY content_key
+      `, [queryKeys], { attempts: 2, label: 'CONTENT DOWNLOAD COUNTS' });
+
+      const found = new Map(rows.rows.map(row => [String(row.key || ''), Math.max(0, Number(row.count) || 0)]));
+      queryKeys.forEach(key => {
+        const count = found.get(key) || 0;
+        counts[key] = count;
+        setCachedContentDownloadCount(key, count);
+      });
+    });
+  }
+  return counts;
 }
 
 async function getTrendingActivity(options = {}) {
@@ -1848,13 +1947,14 @@ async function getTrendingActivity(options = {}) {
   return trendingBuildInFlight;
 }
 
-function buildContentDownloadCountsPayload(counts = {}) {
+function buildContentDownloadCountsPayload(counts = {}, options = {}) {
   return {
     success: true,
     counts,
     updatedAt: Date.now(),
     uniqueUsers: true,
-    source: 'database-aggregate'
+    partial: options.partial === true,
+    source: options.partial === true ? 'database-targeted' : 'database-aggregate'
   };
 }
 
@@ -1870,29 +1970,16 @@ function buildTrendingViewPayload(payload = {}) {
 async function emitTrendingFromDb(targetSocket = null, options = {}) {
   try {
     const payload = await getTrendingActivity(options);
-    const downloadCountsPayload = buildContentDownloadCountsPayload(payload.contentDownloadCounts);
-
     const trendingViewPayload = buildTrendingViewPayload(payload);
-    if (targetSocket && targetSocket.connected) {
-      targetSocket.emit('trending_data', trendingViewPayload);
-      targetSocket.emit('content_download_counts', downloadCountsPayload);
-    } else {
-      io.emit('trending_data', trendingViewPayload);
-      io.emit('content_download_counts', downloadCountsPayload);
-    }
+    if (targetSocket && targetSocket.connected) targetSocket.emit('trending_data', trendingViewPayload);
+    else io.emit('trending_data', trendingViewPayload);
     return payload;
   } catch (err) {
     console.error('[TRENDING DB EMIT ERROR]:', err);
     const fallbackPayload = trendingCache
       ? { ...trendingCache, stale: true, unavailable: false }
-      : { topDownloads: [], topWishlist: [], contentDownloadCounts: {}, stale: false, unavailable: true };
-    const fallbackDownloadCountsPayload = buildContentDownloadCountsPayload(fallbackPayload.contentDownloadCounts || {});
-    fallbackDownloadCountsPayload.stale = fallbackPayload.stale === true;
-    fallbackDownloadCountsPayload.unavailable = fallbackPayload.unavailable === true;
-    if (targetSocket && targetSocket.connected) {
-      targetSocket.emit('trending_data', buildTrendingViewPayload(fallbackPayload));
-      targetSocket.emit('content_download_counts', fallbackDownloadCountsPayload);
-    }
+      : { topDownloads: [], topWishlist: [], stale: false, unavailable: true };
+    if (targetSocket && targetSocket.connected) targetSocket.emit('trending_data', buildTrendingViewPayload(fallbackPayload));
     return fallbackPayload;
   }
 }
@@ -3364,6 +3451,7 @@ function startBackgroundTasks() {
   setInterval(syncAdminStateIntervalTask, 15000);
   setInterval(presenceHeartbeatIntervalTask, PRESENCE_HEARTBEAT_MS);
   setInterval(chatPollIntervalTask, CHAT_SYNC_INTERVAL_MS);
+  setInterval(() => logMemoryPressureIfNeeded('periodic'), 60000);
   if (ENABLE_PROFILE_PERIODIC_SYNC) {
     setInterval(profileSyncIntervalTask, PROFILE_SYNC_INTERVAL_MS);
   } else {
@@ -4071,14 +4159,14 @@ io.on('connection', (socket) => {
         topDownloads: [],
         topWishlist: []
       }));
-      socket.emit('content_download_counts', buildContentDownloadCountsPayload((trendingCache && trendingCache.contentDownloadCounts) || {}));
     }
   });
 
-  socket.on('request_content_download_counts', async (_request = {}, callback) => {
+  socket.on('request_content_download_counts', async (request = {}, callback) => {
     try {
-      const activity = await getTrendingActivity();
-      const payload = buildContentDownloadCountsPayload(activity.contentDownloadCounts);
+      const keys = Array.isArray(request && request.keys) ? request.keys : [];
+      const counts = await getContentDownloadCountsForKeys(keys);
+      const payload = buildContentDownloadCountsPayload(counts, { partial: true });
 
       if (typeof callback === 'function') callback(payload);
       else socket.emit('content_download_counts', payload);
@@ -4089,6 +4177,7 @@ io.on('connection', (socket) => {
         counts: {},
         updatedAt: Date.now(),
         uniqueUsers: true,
+        partial: true,
         error: 'Failed to calculate content download counts.'
       };
 

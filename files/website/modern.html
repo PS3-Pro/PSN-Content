@@ -17564,8 +17564,68 @@ P
 		return `${compact >= 100 ? Math.floor(compact) : compact.toFixed(compact >= 10 ? 0 : 1).replace(/\.0$/, '')}M`;
 	};
 
+	window.__contentDownloadCountPendingKeys = window.__contentDownloadCountPendingKeys instanceof Set ? window.__contentDownloadCountPendingKeys : new Set();
+	window.__contentDownloadCountQueuedKeys = window.__contentDownloadCountQueuedKeys instanceof Set ? window.__contentDownloadCountQueuedKeys : new Set();
+	window.__contentDownloadCountRequestTimer = window.__contentDownloadCountRequestTimer || null;
+
+	window.requestContentDownloadCounts = function(rawKeys = []) {
+		if (!(typeof socketChat !== 'undefined' && socketChat && socketChat.connected)) return false;
+		const keys = [...new Set((Array.isArray(rawKeys) ? rawKeys : [])
+			.map(value => String(value || '').trim())
+			.filter(Boolean))]
+			.filter(key => !Object.prototype.hasOwnProperty.call(window.contentDownloadCounts || {}, key) && !window.__contentDownloadCountPendingKeys.has(key))
+			.slice(0, 200);
+		if (!keys.length) return false;
+
+		keys.forEach(key => window.__contentDownloadCountPendingKeys.add(key));
+		let settled = false;
+		const release = () => {
+			if (settled) return;
+			settled = true;
+			keys.forEach(key => window.__contentDownloadCountPendingKeys.delete(key));
+		};
+		const timeout = setTimeout(() => {
+			release();
+			if (typeof window.applyContentDownloadCountsToCards === 'function') window.applyContentDownloadCountsToCards(document);
+		}, 10000);
+
+		socketChat.emit('request_content_download_counts', { keys }, payload => {
+			clearTimeout(timeout);
+			release();
+			if (payload && payload.success !== false && typeof window.setContentDownloadCounts === 'function') {
+				window.setContentDownloadCounts(payload, { partial: true });
+			}
+		});
+		return true;
+	};
+
+	window.flushContentDownloadCountQueue = function() {
+		clearTimeout(window.__contentDownloadCountRequestTimer);
+		window.__contentDownloadCountRequestTimer = null;
+		if (!(typeof socketChat !== 'undefined' && socketChat && socketChat.connected)) return;
+		const batch = [...window.__contentDownloadCountQueuedKeys]
+			.filter(key => !Object.prototype.hasOwnProperty.call(window.contentDownloadCounts || {}, key) && !window.__contentDownloadCountPendingKeys.has(key))
+			.slice(0, 200);
+		batch.forEach(key => window.__contentDownloadCountQueuedKeys.delete(key));
+		if (batch.length) window.requestContentDownloadCounts(batch);
+		if (window.__contentDownloadCountQueuedKeys.size) {
+			window.__contentDownloadCountRequestTimer = setTimeout(window.flushContentDownloadCountQueue, 180);
+		}
+	};
+
+	window.scheduleContentDownloadCountRequest = function(rawKeys = []) {
+		const keys = [...new Set((Array.isArray(rawKeys) ? rawKeys : []).map(value => String(value || '').trim()).filter(Boolean))]
+			.filter(key => !Object.prototype.hasOwnProperty.call(window.contentDownloadCounts || {}, key) && !window.__contentDownloadCountPendingKeys.has(key));
+		if (!keys.length) return;
+		keys.forEach(key => window.__contentDownloadCountQueuedKeys.add(key));
+		if (!window.__contentDownloadCountRequestTimer) {
+			window.__contentDownloadCountRequestTimer = setTimeout(window.flushContentDownloadCountQueue, 120);
+		}
+	};
+
 	window.applyContentDownloadCountsToCards = function(root = document) {
 		if (!root || !root.querySelectorAll) return;
+		const missingKeys = [];
 		root.querySelectorAll('.content-download-card-count').forEach(element => {
 			const key = window.getContentDownloadCountKey(
 				element.dataset.downloadCategory,
@@ -17573,12 +17633,25 @@ P
 				element.dataset.downloadContentId,
 				element.dataset.downloadName
 			);
+			if (!key) {
+				element.hidden = true;
+				return;
+			}
+
+			const hasCount = Object.prototype.hasOwnProperty.call(window.contentDownloadCounts || {}, key);
+			if (!hasCount) {
+				element.hidden = true;
+				if (!window.__contentDownloadCountPendingKeys.has(key) && !window.__contentDownloadCountQueuedKeys.has(key)) missingKeys.push(key);
+				return;
+			}
+
 			const count = Math.max(0, Number(window.contentDownloadCounts[key]) || 0);
 			const value = element.querySelector('span');
 			if (value) value.textContent = window.formatContentDownloadCount(count);
 			element.title = `${count.toLocaleString('en-US')} ${count === 1 ? 'user downloaded' : 'users downloaded'} this content`;
-			element.hidden = !window.contentDownloadCountsReady;
+			element.hidden = false;
 		});
+		if (missingKeys.length) window.scheduleContentDownloadCountRequest(missingKeys);
 	};
 
 	window.setContentDownloadCounts = function(payload, options = {}) {
@@ -17587,7 +17660,8 @@ P
 			: payload;
 		if (!rawCounts || typeof rawCounts !== 'object') return false;
 
-		const counts = Object.create(null);
+		const partial = options.partial === true || (payload && payload.partial === true);
+		const counts = partial ? (window.contentDownloadCounts || Object.create(null)) : Object.create(null);
 		Object.entries(rawCounts).forEach(([rawKey, rawValue]) => {
 			const key = String(rawKey || '').trim();
 			const value = rawValue && typeof rawValue === 'object'
@@ -17595,6 +17669,7 @@ P
 				: rawValue;
 			if (!key || !Number.isFinite(Number(value))) return;
 			counts[key] = Math.max(0, Number(value) || 0);
+			if (window.__contentDownloadCountPendingKeys) window.__contentDownloadCountPendingKeys.delete(key);
 		});
 
 		window.contentDownloadCounts = counts;
@@ -17603,7 +17678,6 @@ P
 		window.applyContentDownloadCountsToCards(document);
 		return true;
 	};
-
 
 
 	(function clearLegacyContentDownloadCountsCache() {
@@ -41685,7 +41759,7 @@ function getVisibleChatStackEl(id) {
 			if (typeof isKicked !== 'undefined') isKicked = false;
 			setTimeout(() => {
 				if (!(typeof socketChat !== 'undefined' && socketChat && socketChat.connected)) return;
-				if (!window.__pendingTrendingData || !window.contentDownloadCountsReady) socketChat.emit('request_trending');
+				if (!window.__pendingTrendingData) socketChat.emit('request_trending');
 			}, 1800);
 			window.__serverProfileHydratedUser = name;
 			window.__lastAppliedProfileUpdatedAt = Number((userData && userData.profileUpdatedAt) || 0);
