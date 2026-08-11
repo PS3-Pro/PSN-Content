@@ -297,15 +297,104 @@ let globalTrophyStatsCache = null;
 let globalTrophyStatsCacheAt = 0;
 let globalTrophyStatsBuildInFlight = null;
 let lastMemoryPressureLogAt = 0;
+let profileHydrationQueued = 0;
+let profileHydrationActive = 0;
+let profileSyncActiveSockets = 0;
+const MEMORY_TRACE_ENABLED = process.env.MEMORY_TRACE !== '0';
+
+function getSocketWriteBufferLength(socket) {
+  try {
+    const conn = socket && socket.client && socket.client.conn;
+    return conn && Array.isArray(conn.writeBuffer) ? conn.writeBuffer.length : 0;
+  } catch (err) {
+    return 0;
+  }
+}
+
+function getTotalSocketWriteBufferLength() {
+  let total = 0;
+  try {
+    io.sockets.sockets.forEach(client => { total += getSocketWriteBufferLength(client); });
+  } catch (err) {}
+  return total;
+}
+
+function formatApproxBytes(bytes = 0) {
+  const value = Math.max(0, Number(bytes) || 0);
+  if (value >= 1024 * 1024) return `${(value / 1024 / 1024).toFixed(1)} MB`;
+  if (value >= 1024) return `${(value / 1024).toFixed(1)} KB`;
+  return `${Math.round(value)} B`;
+}
+
+function estimateValueBytes(value, options = {}) {
+  const maxNodes = Math.max(1000, Number(options.maxNodes || 100000));
+  const maxBytes = Math.max(1024 * 1024, Number(options.maxBytes || 128 * 1024 * 1024));
+  const seen = new WeakSet();
+  const stack = [value];
+  let nodes = 0;
+  let bytes = 0;
+  while (stack.length && nodes < maxNodes && bytes < maxBytes) {
+    const current = stack.pop();
+    nodes += 1;
+    if (current === null || current === undefined) { bytes += 4; continue; }
+    const type = typeof current;
+    if (type === 'string') { bytes += current.length * 2; continue; }
+    if (type === 'number') { bytes += 8; continue; }
+    if (type === 'boolean') { bytes += 4; continue; }
+    if (type !== 'object') { bytes += 8; continue; }
+    if (seen.has(current)) continue;
+    seen.add(current);
+    if (Array.isArray(current)) {
+      bytes += current.length * 8;
+      for (let i = 0; i < current.length; i += 1) stack.push(current[i]);
+      continue;
+    }
+    const keys = Object.keys(current);
+    bytes += keys.length * 8;
+    for (const key of keys) {
+      bytes += key.length * 2;
+      stack.push(current[key]);
+    }
+  }
+  return { bytes, truncated: stack.length > 0 || nodes >= maxNodes || bytes >= maxBytes, nodes };
+}
+
+function getPayloadItemCount(value) {
+  if (Array.isArray(value)) return value.length;
+  if (value && typeof value === 'object') return Object.keys(value).length;
+  return value === null || value === undefined ? 0 : 1;
+}
+
+function getMemoryDiagnosticSnapshot() {
+  const mem = process.memoryUsage();
+  return {
+    heapMb: mem.heapUsed / 1024 / 1024,
+    heapTotalMb: mem.heapTotal / 1024 / 1024,
+    rssMb: mem.rss / 1024 / 1024,
+    sockets: io.sockets.sockets.size,
+    writeBufferPackets: getTotalSocketWriteBufferLength(),
+    profileHydrationQueued,
+    profileHydrationActive,
+    profileSyncActiveSockets
+  };
+}
+
+function logMemoryTrace(reason, details = '') {
+  if (!MEMORY_TRACE_ENABLED) return;
+  const snap = getMemoryDiagnosticSnapshot();
+  const suffix = details ? ` ${details}` : '';
+  console.log(`[MEMORY TRACE] ${reason} heap=${snap.heapMb.toFixed(1)}/${snap.heapTotalMb.toFixed(1)}MB rss=${snap.rssMb.toFixed(1)}MB sockets=${snap.sockets} writeBuffer=${snap.writeBufferPackets} hydration=${snap.profileHydrationActive}/${snap.profileHydrationQueued} profileSync=${snap.profileSyncActiveSockets}${suffix}`);
+}
 
 function logMemoryPressureIfNeeded(reason = 'periodic') {
   const mem = process.memoryUsage();
   const heapMb = mem.heapUsed / 1024 / 1024;
-  if (heapMb < 150 && reason === 'periodic') return;
+  if (heapMb < 120 && reason === 'periodic') return;
   const now = Date.now();
-  if (reason === 'periodic' && now - lastMemoryPressureLogAt < 60000) return;
+  if (reason === 'periodic' && now - lastMemoryPressureLogAt < 30000) return;
   lastMemoryPressureLogAt = now;
-  console.log(`[MEMORY] ${reason} heap ${heapMb.toFixed(1)} MB / ${(mem.heapTotal / 1024 / 1024).toFixed(1)} MB, rss ${(mem.rss / 1024 / 1024).toFixed(1)} MB, sockets ${io.sockets.sockets.size}, trend cache ${trendingCache ? 'yes' : 'no'}, content-count cache ${contentDownloadCountCache ? contentDownloadCountCache.size : 0}`);
+  const snap = getMemoryDiagnosticSnapshot();
+  console.log(`[MEMORY] ${reason} heap ${heapMb.toFixed(1)} MB / ${(mem.heapTotal / 1024 / 1024).toFixed(1)} MB, rss ${(mem.rss / 1024 / 1024).toFixed(1)} MB, sockets ${snap.sockets}, writeBuffer ${snap.writeBufferPackets}, hydration ${snap.profileHydrationActive}/${snap.profileHydrationQueued}, profile-sync ${snap.profileSyncActiveSockets}, compact users ${Object.keys(userDatabase).length}, full-cache ${fullUserCacheNames.size}, trend cache ${trendingCache ? 'yes' : 'no'}, content-count cache ${contentDownloadCountCache ? contentDownloadCountCache.size : 0}`);
 }
 let trendingRefreshTimer = null;
 let trophyStatsRefreshTimer = null;
@@ -1482,24 +1571,91 @@ function getPublicUserData(username, user = {}, includeAdminFields = false) {
 }
 
 
+const COMPACT_PROFILE_SETTING_KEYS = new Set([
+  'audio', 'ux', 'hapticFeedback', 'haptics', 'cardBlur', 'cardBlurEnabled', 'gameCardBlur',
+  'chatSound', 'chatAutoTranslate', 'interfaceAutoTranslate', 'ps3Ip', 'companionPlugin',
+  'fpsCounterPlugin', 'fpsCounter', 'consoleFanMode', 'consoleFanSpeed', 'consoleFanTarget',
+  'performanceMode', 'performanceRsx', 'performanceVram', 'siteDisclaimerSkipToday',
+  'settingsUpdatedAt', 'settingsSyncedAt', 'settingsVersion', 'themeColor', 'themeColorUpdatedAt',
+  'themeUpdatedAt', 'themeColorSyncedAt', 'profileCardStyle', 'profileCardEffect', 'profileCardTheme',
+  'profileCardStyleUpdatedAt', 'profileCardEffectUpdatedAt', 'profileCardThemeUpdatedAt',
+  'countryCode', 'country_code', 'country'
+]);
+
+function buildCompactSettingsData(user = {}) {
+  const source = user && user.settingsData && typeof user.settingsData === 'object' && !Array.isArray(user.settingsData) ? user.settingsData : {};
+  const compact = {};
+  Object.keys(source).forEach(key => {
+    if (COMPACT_PROFILE_SETTING_KEYS.has(key)) compact[key] = source[key];
+  });
+  return { ...compact, ...getPublicProfileSettings(user) };
+}
+
+function buildCompactCountersData(value = {}) {
+  const source = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+  return {
+    msgs: source.msgs || '0',
+    imgs: source.imgs || '0',
+    reactions: source.reactions || '0',
+    trailers: source.trailers || '0',
+    days: source.days || '[]',
+    lastChatRead: source.lastChatRead || 0
+  };
+}
+
 function buildCompactUserSummary(name, userData = {}) {
   const source = (userData && typeof userData === 'object' && !Array.isArray(userData)) ? userData : {};
-  const compact = { ...source };
+  const downloads = Array.isArray(source.downloadsData) ? source.downloadsData.length : Number(source.downloads || 0);
+  const wishlist = Array.isArray(source.wishlistData) ? source.wishlistData.length : Number(source.wishlist || 0);
+  const favorites = Array.isArray(source.favoritesData) ? source.favoritesData.length : Number(source.favorites || 0);
+  const library = Array.isArray(source.libraryData) ? source.libraryData.length : Number(source.library || 0);
+  const friends = Array.isArray(source.friendsData) ? source.friendsData.length : Number(source.friends || 0);
+  const trophies = source.trophiesData && typeof source.trophiesData === 'object' && !Array.isArray(source.trophiesData)
+    ? countUnlockedTrophiesPayload(source.trophiesData)
+    : Number(source.trophies || 0);
 
-  if (Array.isArray(source.downloadsData)) compact.downloads = source.downloadsData.length;
-  if (Array.isArray(source.wishlistData)) compact.wishlist = source.wishlistData.length;
-  if (Array.isArray(source.favoritesData)) compact.favorites = source.favoritesData.length;
-  if (Array.isArray(source.libraryData)) compact.library = source.libraryData.length;
-  if (Array.isArray(source.friendsData)) compact.friends = source.friendsData.length;
-  if (source.trophiesData && typeof source.trophiesData === 'object' && !Array.isArray(source.trophiesData)) {
-    compact.trophies = countUnlockedTrophiesPayload(source.trophiesData);
-  }
-
-  USER_HEAVY_CACHE_KEYS.forEach(key => delete compact[key]);
-  delete compact.passwordHash;
-  delete compact.password;
-
-  return normalizeUserRecord(name, compact);
+  return normalizeUserRecord(name, {
+    name,
+    id: source.id || null,
+    avatar: source.avatar || DEFAULT_AVATAR,
+    joined: source.joined || '2026',
+    countryCode: getUserCountryCode(source),
+    role: getUserRole(name, source),
+    banned: isUserBanned(source),
+    ...(source.banReason ? { banReason: source.banReason } : {}),
+    ...(source.bannedAt ? { bannedAt: source.bannedAt } : {}),
+    ...(source.bannedBy ? { bannedBy: source.bannedBy } : {}),
+    online: source.online === true,
+    lastSeen: source.lastSeen || null,
+    ps3Status: source.ps3Status || null,
+    level: Number(source.level || 1),
+    xp: Number(source.xp || 0),
+    downloads,
+    wishlist,
+    favorites,
+    trophies,
+    library,
+    friends,
+    countersData: buildCompactCountersData(source.countersData),
+    themeColor: normalizeThemeColorServer(source.themeColor || (source.settingsData && source.settingsData.themeColor) || '#0070cc'),
+    themeColorUpdatedAt: getUserThemeColorUpdatedAt(source),
+    profileCardStyle: getUserProfileCardStyle(source),
+    profileCardEffect: getUserProfileCardStyle(source),
+    profileCardStyleUpdatedAt: getUserProfileCardStyleUpdatedAt(source),
+    settingsData: buildCompactSettingsData(source),
+    profileUpdatedAt: normalizeTimestampValue(source.profileUpdatedAt),
+    downloadsUpdatedAt: normalizeTimestampValue(source.downloadsUpdatedAt),
+    downloadsClearedAt: normalizeTimestampValue(source.downloadsClearedAt),
+    wishlistUpdatedAt: normalizeTimestampValue(source.wishlistUpdatedAt),
+    favoritesUpdatedAt: normalizeTimestampValue(source.favoritesUpdatedAt),
+    libraryUpdatedAt: normalizeTimestampValue(source.libraryUpdatedAt),
+    friendsUpdatedAt: normalizeTimestampValue(source.friendsUpdatedAt),
+    passwordResetAt: source.passwordResetAt || null,
+    passwordResetBy: source.passwordResetBy || '',
+    passwordResetRequired: source.passwordResetRequired === true,
+    passwordResetExpiresAt: normalizeTimestampValue(source.passwordResetExpiresAt),
+    passwordResetCompletedAt: source.passwordResetCompletedAt || null
+  });
 }
 
 function compactCachedUser(name) {
@@ -1665,6 +1821,17 @@ async function refreshAllUsersCacheFromDb(options = {}) {
     await syncPresenceOnlineFromDb();
     invalidateOnlineListCache('users-summary-refresh');
     console.log(`[USER CACHE] ${Object.keys(userDatabase).length} compact user summaries loaded into RAM on ${INSTANCE_ID}. Full profile payloads load only for active/targeted users.`);
+    if (MEMORY_TRACE_ENABLED) {
+      let approxBytes = 0;
+      let largestName = '';
+      let largestBytes = 0;
+      Object.entries(userDatabase).forEach(([cacheName, cacheUser]) => {
+        const estimate = estimateValueBytes(cacheUser, { maxNodes: 5000, maxBytes: 2 * 1024 * 1024 });
+        approxBytes += estimate.bytes;
+        if (estimate.bytes > largestBytes) { largestBytes = estimate.bytes; largestName = cacheName; }
+      });
+      logMemoryTrace('user-cache:ready', `users=${Object.keys(userDatabase).length} approx=${formatApproxBytes(approxBytes)} largest=${largestName || '-'}:${formatApproxBytes(largestBytes)}`);
+    }
     return userDatabase;
   })();
 
@@ -1995,6 +2162,10 @@ async function emitTrendingFromDb(targetSocket = null, options = {}) {
   try {
     const payload = await getTrendingActivity(options);
     const trendingViewPayload = buildTrendingViewPayload(payload);
+    if (MEMORY_TRACE_ENABLED) {
+      const estimate = estimateValueBytes(trendingViewPayload, { maxNodes: 20000, maxBytes: 8 * 1024 * 1024 });
+      logMemoryTrace('trending:send', `target=${targetSocket && targetSocket.userName ? targetSocket.userName : 'broadcast'} items=${(trendingViewPayload.topDownloads || []).length + (trendingViewPayload.topWishlist || []).length} approx=${formatApproxBytes(estimate.bytes)}${estimate.truncated ? '+' : ''}`);
+    }
     if (targetSocket && targetSocket.connected) targetSocket.emit('trending_data', trendingViewPayload);
     else io.emit('trending_data', trendingViewPayload);
     return payload;
@@ -2117,11 +2288,25 @@ async function getAuthUserRecordFromDb(name) {
   if (row.favorites_count !== null) data.favorites = Number(row.favorites_count) || 0;
   if (row.library_count !== null) data.library = Number(row.library_count) || 0;
   if (row.friends_count !== null) data.friends = Number(row.friends_count) || 0;
-  return normalizeUserRecord(safeName, data);
+
+  const compact = buildCompactUserSummary(safeName, data);
+  ['passwordHash', 'password', 'passwordMigratedAt'].forEach(key => {
+    if (Object.prototype.hasOwnProperty.call(data, key)) compact[key] = data[key];
+  });
+  return compact;
 }
 
 function runSerializedProfileHydration(task) {
-  const run = profileHydrationQueue.catch(() => null).then(task);
+  profileHydrationQueued += 1;
+  const run = profileHydrationQueue.catch(() => null).then(async () => {
+    profileHydrationQueued = Math.max(0, profileHydrationQueued - 1);
+    profileHydrationActive += 1;
+    try {
+      return await task();
+    } finally {
+      profileHydrationActive = Math.max(0, profileHydrationActive - 1);
+    }
+  });
   profileHydrationQueue = run.then(() => null, () => null);
   return run;
 }
@@ -2218,18 +2403,62 @@ function buildLightProfileUserData(name, user = {}) {
     favorites: Number(user.favorites || 0),
     trophies: Number(user.trophies || 0),
     library: Number(user.library || 0),
-    countersData: user.countersData || {},
+    countersData: buildCompactCountersData(user.countersData),
     themeColor: normalizeThemeColorServer(user.themeColor || (user.settingsData && user.settingsData.themeColor) || '#0070cc'),
     themeColorUpdatedAt: getUserThemeColorUpdatedAt(user),
-    settingsData: { ...normalizeProfileRealtimeSettings(user.settingsData || {}), ...getPublicProfileSettings(user) }
+    settingsData: buildCompactSettingsData(user)
   };
+}
+
+function emitProfileSyncPacket(socket, payload, options = {}) {
+  const requireAck = socket && socket.profileSyncAckV1 === true;
+  const timeoutMs = Math.max(3000, Number(options.timeoutMs || 15000));
+  const label = String(options.label || 'profile');
+  if (!socket || !socket.connected) return Promise.reject(new Error(`Socket disconnected before ${label}.`));
+
+  if (!requireAck) {
+    socket.emit('profile_sync', payload);
+    return new Promise(resolve => setTimeout(() => resolve({ acked: false, legacy: true }), 250));
+  }
+
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const startedAt = Date.now();
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      reject(new Error(`Profile sync ACK timeout for ${label}.`));
+    }, timeoutMs);
+
+    const done = response => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (response && response.ok === false) {
+        reject(new Error(response.error || `Client rejected ${label}.`));
+        return;
+      }
+      resolve({ acked: true, elapsedMs: Date.now() - startedAt });
+    };
+
+    try {
+      socket.emit('profile_sync', payload, done);
+    } catch (err) {
+      clearTimeout(timer);
+      settled = true;
+      reject(err);
+    }
+  });
 }
 
 async function emitChunkedProfileSyncToSocket(socket, name, options = {}) {
   if (!socket || !socket.connected || !name) return;
   if (socket.__profileChunkSyncInFlight) return socket.__profileChunkSyncInFlight;
 
+  profileSyncActiveSockets += 1;
   socket.__profileChunkSyncInFlight = (async () => {
+    const syncStartedAt = Date.now();
+    logMemoryTrace('profile-sync:start', `user=${name} socket=${socket.id} ack=${socket.profileSyncAckV1 === true}`);
     if (options.forceRefresh === true || !userDatabase[name]) await refreshSingleUserSummaryFromDb(name);
     const compactUser = userDatabase[name];
     if (!compactUser || !socket.connected) return;
@@ -2240,13 +2469,16 @@ async function emitChunkedProfileSyncToSocket(socket, name, options = {}) {
     const shouldSendCore = !requestedKeys || Array.from(requestedKeys).some(key => !heavyKeys.has(key));
 
     if (shouldSendCore) {
-      socket.emit('profile_sync', {
+      const corePayload = {
         name,
         sourceSocketId: options.sourceSocketId || null,
         profileUpdatedAt,
         userData: buildLightProfileUserData(name, compactUser)
-      });
-      await new Promise(resolve => setTimeout(resolve, 10));
+      };
+      const coreSize = estimateValueBytes(corePayload, { maxNodes: 10000, maxBytes: 4 * 1024 * 1024 });
+      logMemoryTrace('profile-sync:core:send', `user=${name} socket=${socket.id} approx=${formatApproxBytes(coreSize.bytes)}${coreSize.truncated ? '+' : ''} buffer=${getSocketWriteBufferLength(socket)}`);
+      const result = await emitProfileSyncPacket(socket, corePayload, { label: 'core', timeoutMs: 15000 });
+      logMemoryTrace('profile-sync:core:ack', `user=${name} socket=${socket.id} ack=${result.acked === true} ms=${result.elapsedMs || 0} buffer=${getSocketWriteBufferLength(socket)}`);
     }
 
     const sections = [
@@ -2262,23 +2494,34 @@ async function emitChunkedProfileSyncToSocket(socket, name, options = {}) {
       const meta = PROFILE_HEAVY_SECTION_META[dataKey];
       const sectionRequested = !requestedKeys || requestedKeys.has(dataKey) || requestedKeys.has(meta.countKey) || (meta.versionKeys || []).some(key => requestedKeys.has(key));
       if (!sectionRequested) continue;
-      if (!socket.connected) return;
+      if (!socket.connected) throw new Error(`Socket disconnected before ${dataKey}.`);
 
       await runSerializedProfileHydration(async () => {
-        if (!socket.connected) return;
+        if (!socket.connected) throw new Error(`Socket disconnected before loading ${dataKey}.`);
+        logMemoryTrace('profile-sync:section:load', `user=${name} socket=${socket.id} section=${dataKey}`);
         const rawData = await getUserDataPayloadFromDb(name, type);
-        if (rawData === null || !socket.connected) return;
+        if (rawData === null || !socket.connected) throw new Error(`Could not load ${dataKey}.`);
+        const estimate = estimateValueBytes(rawData);
+        const itemCount = getPayloadItemCount(rawData);
+        logMemoryTrace('profile-sync:section:loaded', `user=${name} socket=${socket.id} section=${dataKey} items=${itemCount} approx=${formatApproxBytes(estimate.bytes)}${estimate.truncated ? '+' : ''}`);
+
         const userData = { profileUpdatedAt, [dataKey]: rawData };
         if (dataKey === 'trophiesData') userData.trophies = countUnlockedTrophiesPayload(rawData || {});
         else userData[meta.countKey] = Array.isArray(rawData) ? rawData.length : 0;
         if (versionKey) userData[versionKey] = normalizeTimestampValue(compactUser[versionKey]);
         if (dataKey === 'downloadsData') userData.downloadsClearedAt = normalizeTimestampValue(compactUser.downloadsClearedAt);
-        socket.emit('profile_sync', { name, sourceSocketId: options.sourceSocketId || null, profileUpdatedAt, userData });
-        await new Promise(resolve => setTimeout(resolve, 35));
+
+        const packet = { name, sourceSocketId: options.sourceSocketId || null, profileUpdatedAt, userData };
+        logMemoryTrace('profile-sync:section:send', `user=${name} socket=${socket.id} section=${dataKey} items=${itemCount} approx=${formatApproxBytes(estimate.bytes)}${estimate.truncated ? '+' : ''} buffer=${getSocketWriteBufferLength(socket)}`);
+        const result = await emitProfileSyncPacket(socket, packet, { label: dataKey, timeoutMs: 20000 });
+        logMemoryTrace('profile-sync:section:ack', `user=${name} socket=${socket.id} section=${dataKey} ack=${result.acked === true} ms=${result.elapsedMs || 0} buffer=${getSocketWriteBufferLength(socket)}`);
       });
     }
+
+    logMemoryTrace('profile-sync:done', `user=${name} socket=${socket.id} ms=${Date.now() - syncStartedAt}`);
   })().finally(() => {
     socket.__profileChunkSyncInFlight = null;
+    profileSyncActiveSockets = Math.max(0, profileSyncActiveSockets - 1);
   });
 
   return socket.__profileChunkSyncInFlight;
@@ -2288,7 +2531,12 @@ function emitChatHistoryToSocket(socket) {
   if (!socket) return Promise.resolve();
   const run = chatHistoryEmitQueue.catch(() => null).then(async () => {
     if (!socket.connected) return;
-    socket.emit('chat_history', getPublicChatHistory());
+    const history = getPublicChatHistory();
+    if (MEMORY_TRACE_ENABLED) {
+      const estimate = estimateValueBytes(history, { maxNodes: 100000, maxBytes: 64 * 1024 * 1024 });
+      logMemoryTrace('chat-history:send', `user=${socket.userName || '-'} socket=${socket.id} items=${Array.isArray(history) ? history.length : 0} approx=${formatApproxBytes(estimate.bytes)}${estimate.truncated ? '+' : ''} buffer=${getSocketWriteBufferLength(socket)}`);
+    }
+    socket.emit('chat_history', history);
     await new Promise(resolve => setTimeout(resolve, 25));
   });
   chatHistoryEmitQueue = run.then(() => null, () => null);
@@ -3132,6 +3380,10 @@ async function emitOnlineList(targetSocket = null, options = {}) {
     if (Array.isArray(list) && list.length > 0) lastKnownOnlineList = list;
 
     if (targetSocket) {
+      if (MEMORY_TRACE_ENABLED) {
+        const estimate = estimateValueBytes(list, { maxNodes: 20000, maxBytes: 8 * 1024 * 1024 });
+        logMemoryTrace('online-list:send', `user=${targetSocket.userName || '-'} socket=${targetSocket.id} items=${Array.isArray(list) ? list.length : 0} approx=${formatApproxBytes(estimate.bytes)}${estimate.truncated ? '+' : ''} buffer=${getSocketWriteBufferLength(targetSocket)}`);
+      }
       targetSocket.emit('online_list', list);
       targetSocket.emit('online_count', { count: getOnlineCountFromList(list) });
       return list;
@@ -3464,7 +3716,7 @@ function startBackgroundTasks() {
   setInterval(syncAdminStateIntervalTask, 15000);
   setInterval(presenceHeartbeatIntervalTask, PRESENCE_HEARTBEAT_MS);
   setInterval(chatPollIntervalTask, CHAT_SYNC_INTERVAL_MS);
-  setInterval(() => logMemoryPressureIfNeeded('periodic'), 60000);
+  setInterval(() => logMemoryPressureIfNeeded('periodic'), 15000);
   if (ENABLE_PROFILE_PERIODIC_SYNC) {
     setInterval(profileSyncIntervalTask, PROFILE_SYNC_INTERVAL_MS);
   } else {
@@ -3482,7 +3734,13 @@ io.on('connection', (socket) => {
       const safeUserData = (data.userData && typeof data.userData === 'object') ? data.userData : {};
       
       const supportsProfileSyncV2 = data && data.profileSyncV2 === true;
+      const supportsProfileSyncAckV1 = data && data.profileSyncAckV1 === true;
+      logMemoryTrace('auth:start', `user=${name || ''} socket=${socket.id} new=${isNewAccount === true} v2=${supportsProfileSyncV2} ack=${supportsProfileSyncAckV1}`);
       let dbUser = await getAuthUserRecordFromDb(name);
+      if (dbUser) {
+        const authEstimate = estimateValueBytes(dbUser, { maxNodes: 10000, maxBytes: 8 * 1024 * 1024 });
+        logMemoryTrace('auth:record', `user=${name} socket=${socket.id} keys=${Object.keys(dbUser).length} approx=${formatApproxBytes(authEstimate.bytes)}${authEstimate.truncated ? '+' : ''}`);
+      }
       let wasDeletedAccount = false;
 
       const isHardcodedAdmin = ADMIN_USERS.includes(name);
@@ -3625,12 +3883,14 @@ io.on('connection', (socket) => {
           userCacheMeta[name] = Date.now();
           fullUserCacheNames.delete(name);
           socket.profileSyncV2 = supportsProfileSyncV2;
+          socket.profileSyncAckV1 = supportsProfileSyncAckV1;
           
           markSocketAuthenticated(socket);
           invalidateOnlineListCache('auth-existing-db');
           deferServerTask('AUTH EXISTING PRESENCE', () => upsertPresenceForSocket(socket, name), 250);
 
           console.log(`[NETWORK] ${name} logged in. Admin: ${isAdmin}`);
+          logMemoryTrace('auth:accepted', `user=${name} socket=${socket.id} compactKeys=${Object.keys(userDatabase[name] || {}).length}`);
           deferServerTask('AUTH LOGIN LOG', async () => {
             await addServerLog('login', `${name} signed in${isAdmin ? ' as admin' : ''}`, { socketId: socket.id, role: getUserRole(name, userDatabase[name]) }, name);
           }, 2400);
@@ -3709,6 +3969,7 @@ io.on('connection', (socket) => {
         });
         socket.role = getUserRole(name, userDatabase[name]);
         socket.profileSyncV2 = supportsProfileSyncV2;
+        socket.profileSyncAckV1 = supportsProfileSyncAckV1;
         normalizeProfileArrayPayloads(userDatabase[name]);
         userCacheMeta[name] = Date.now();
         fullUserCacheNames.delete(name);
@@ -3726,6 +3987,7 @@ io.on('connection', (socket) => {
         }
         
         console.log(`[NETWORK] ${name} created a new account. Admin: ${isAdmin}`);
+        logMemoryTrace('auth:created', `user=${name} socket=${socket.id}`);
         deferServerTask('AUTH SIGNUP LOG', async () => {
           await addServerLog('signup', `${name} created an account${isAdmin ? ' as admin' : ''}`, { socketId: socket.id, role: getUserRole(name, userDatabase[name]) }, name);
         }, 0);

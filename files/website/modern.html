@@ -10847,6 +10847,7 @@ P
 			isNewAccount: !psnLegacyUsernameUnlock,
 			legacyUsernameLogin: psnLegacyUsernameUnlock,
 			profileSyncV2: true,
+			profileSyncAckV1: true,
 			adminMaintenanceBypass: document.body.classList.contains('admin-maintenance-login-bypass'),
 			userData: {
 				avatar: selectedAvatarUrl,
@@ -10996,6 +10997,7 @@ P
 					password: savedPass,
 					isNewAccount: false,
 					profileSyncV2: true,
+					profileSyncAckV1: true,
 					adminMaintenanceBypass: document.body.classList.contains('admin-maintenance-login-bypass')
 				};
 
@@ -11117,6 +11119,7 @@ P
 				password: pass,
 				isNewAccount: false,
 				profileSyncV2: true,
+				profileSyncAckV1: true,
 				passwordResetSubmission: isPasswordResetSubmission,
 				adminMaintenanceBypass: document.body.classList.contains('admin-maintenance-login-bypass')
 			};
@@ -41510,6 +41513,7 @@ function getVisibleChatStackEl(id) {
 	window.sendLoginAuthentication = function(payload) {
 		if (!payload || !payload.name) return false;
 		payload.profileSyncV2 = true;
+		payload.profileSyncAckV1 = true;
 		window.clearLoginServerAttempt();
 		enableServerAutomaticReconnect();
 
@@ -41684,7 +41688,8 @@ function getVisibleChatStackEl(id) {
 					name: myName,
 					password: myPass,
 					isNewAccount: false,
-					profileSyncV2: true
+					profileSyncV2: true,
+					profileSyncAckV1: true
 				});
 			}
 			if (profileRealtimeConnectionWasLost) {
@@ -41951,10 +41956,11 @@ function getVisibleChatStackEl(id) {
 
 			let initialProfileSyncOk = true;
 			if (isLightAuthPayload && typeof socketChat !== 'undefined' && socketChat && socketChat.connected) {
+				const initialProfileSyncTimeoutMs = 90000;
 				initialProfileSyncOk = await new Promise(resolve => {
 					const request = { reason: shouldFinishInteractiveBoot ? 'pre_boot' : 'post_light_auth', forceRefresh: false };
 					if (typeof socketChat.timeout === 'function') {
-						socketChat.timeout(20000).emit('request_profile_sync', request, (err, response) => {
+						socketChat.timeout(initialProfileSyncTimeoutMs).emit('request_profile_sync', request, (err, response) => {
 							resolve(!err && (!response || response.ok !== false));
 						});
 						return;
@@ -41965,7 +41971,7 @@ function getVisibleChatStackEl(id) {
 						if (settled) return;
 						settled = true;
 						resolve(false);
-					}, 20000);
+					}, initialProfileSyncTimeoutMs);
 					socketChat.emit('request_profile_sync', request, response => {
 						if (settled) return;
 						settled = true;
@@ -43143,11 +43149,29 @@ function getVisibleChatStackEl(id) {
 			}
 		});
 
-		socketChat.on('profile_sync', (payload = {}) => {
-			const myName = localStorage.getItem('psn_username') || '';
-			if (!payload || payload.name !== myName) return;
-			if (payload.sourceSocketId && socketChat && payload.sourceSocketId === socketChat.id) return;
-			if (typeof window.applyRemoteProfileSync === 'function') window.applyRemoteProfileSync(payload);
+		socketChat.on('profile_sync', (payload = {}, ack) => {
+			const respond = (response) => {
+				if (typeof ack !== 'function') return;
+				try { ack(response); } catch (e) {}
+			};
+			try {
+				const myName = localStorage.getItem('psn_username') || '';
+				if (!payload || payload.name !== myName) { respond({ ok: true, ignored: true }); return; }
+				if (payload.sourceSocketId && socketChat && payload.sourceSocketId === socketChat.id) { respond({ ok: true, ignored: true }); return; }
+				if (typeof window.applyRemoteProfileSync === 'function') window.applyRemoteProfileSync(payload);
+				const userData = payload.userData || payload.data || {};
+				let section = 'core';
+				if (userData.trophiesData) section = 'trophiesData';
+				else if (Array.isArray(userData.downloadsData)) section = 'downloadsData';
+				else if (Array.isArray(userData.wishlistData)) section = 'wishlistData';
+				else if (Array.isArray(userData.favoritesData)) section = 'favoritesData';
+				else if (Array.isArray(userData.libraryData)) section = 'libraryData';
+				else if (Array.isArray(userData.friendsData)) section = 'friendsData';
+				respond({ ok: true, section });
+			} catch (err) {
+				console.warn('[PROFILE SYNC] Could not acknowledge profile data:', err);
+				respond({ ok: false, error: err && err.message ? err.message : 'Profile data could not be applied.' });
+			}
 		});
 
 		socketChat.on('settings_realtime_sync', (payload = {}) => {
