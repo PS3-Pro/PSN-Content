@@ -864,6 +864,33 @@ function getUserCountryCode(user = {}) {
   );
 }
 
+function getAdminCountryStats() {
+  const counts = new Map();
+  let total = 0;
+  let unknown = 0;
+
+  Object.values(userDatabase || {}).forEach(user => {
+    total++;
+    const code = getUserCountryCode(user || {});
+    if (!code) {
+      unknown++;
+      return;
+    }
+    counts.set(code, (counts.get(code) || 0) + 1);
+  });
+
+  const countries = Array.from(counts.entries())
+    .map(([code, count]) => ({ code, count }))
+    .sort((a, b) => b.count - a.count || a.code.localeCompare(b.code));
+
+  return {
+    total,
+    known: Math.max(0, total - unknown),
+    unknown,
+    countries
+  };
+}
+
 function hasProfileCountryPayload(payload = {}) {
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) return false;
   const settings = payload.settingsData && typeof payload.settingsData === "object" && !Array.isArray(payload.settingsData)
@@ -2950,7 +2977,8 @@ async function emitAdminState(socket) {
       pinnedAnnouncement: adminState.pinnedAnnouncement || null,
       reports: adminReports,
       serverLog,
-      registeredUsers: Object.keys(userDatabase).length
+      registeredUsers: Object.keys(userDatabase).length,
+      countryStats: getAdminCountryStats()
     });
     socket.emit('admin_chat_controls_state', adminState.chatControls);
     socket.emit('reports_list', adminReports);
@@ -3815,7 +3843,9 @@ async function syncAdminStateAcrossInstances() {
     chatControls: adminState.chatControls,
     pinnedAnnouncement: adminState.pinnedAnnouncement || null,
     reports: adminConnected ? adminReports : [],
-    serverLog: adminConnected ? serverLog : []
+    serverLog: adminConnected ? serverLog : [],
+    registeredUsers: Object.keys(userDatabase).length,
+    countryStats: getAdminCountryStats()
   });
 }
 
@@ -4581,7 +4611,7 @@ io.on('connection', (socket) => {
           return true;
         });
         const results = names.slice(offset, offset + limit).map(username => getPublicUserData(username, userDatabase[username], true));
-        socket.emit('admin_users_results', { query, filter, offset, limit, total: names.length, results });
+        socket.emit('admin_users_results', { query, filter, offset, limit, total: names.length, results, countryStats: getAdminCountryStats() });
         return;
       }
       const results = await searchUsersFromDb(query, false, purpose === 'friends');
@@ -5018,7 +5048,9 @@ io.on('connection', (socket) => {
         chatControls: adminState.chatControls,
         pinnedAnnouncement: adminState.pinnedAnnouncement || null,
         reports: adminReports,
-        serverLog
+        serverLog,
+        registeredUsers: Object.keys(userDatabase).length,
+        countryStats: getAdminCountryStats()
       });
       await addModerationLog(adminState.maintenance.enabled ? 'maintenance_on' : 'maintenance_off', adminState.maintenance.enabled ? 'Enabled maintenance mode' : 'Disabled maintenance mode', adminState.maintenance, socket.userName || 'Admin');
       respond({ success: true, state: adminState.maintenance });
@@ -5054,7 +5086,8 @@ io.on('connection', (socket) => {
         pinnedAnnouncement: adminState.pinnedAnnouncement || null,
         reports: socket.isAdmin === true ? adminReports : [],
         serverLog: socket.isAdmin === true ? serverLog : [],
-        registeredUsers: socket.isAdmin === true ? Object.keys(userDatabase).length : 0
+        registeredUsers: socket.isAdmin === true ? Object.keys(userDatabase).length : 0,
+        countryStats: socket.isAdmin === true ? getAdminCountryStats() : { total: 0, known: 0, unknown: 0, countries: [] }
       };
       socket.emit('admin_state', payload);
       socket.emit('maintenance_mode', adminState.maintenance);
@@ -5087,7 +5120,9 @@ io.on('connection', (socket) => {
         chatControls: adminState.chatControls,
         pinnedAnnouncement: adminState.pinnedAnnouncement || null,
         reports: adminReports,
-        serverLog
+        serverLog,
+        registeredUsers: Object.keys(userDatabase).length,
+        countryStats: getAdminCountryStats()
       });
       await addModerationLog('chat_controls', `Updated chat controls: ${adminState.chatControls.locked ? 'locked' : 'open'}, slow ${adminState.chatControls.slowSeconds}s`, adminState.chatControls, socket.userName || 'Admin');
       respond({ success: true, state: adminState.chatControls });
