@@ -287,7 +287,8 @@ let userCacheLastFullRefresh = 0;
 let userCacheRefreshInFlight = null;
 const userProfileWriteInFlight = new Set();
 const fullUserCacheNames = new Set();
-let profileHydrationQueue = Promise.resolve();
+let profileHydrationQueues = [Promise.resolve(), Promise.resolve()];
+let profileHydrationNextLane = 0;
 let chatHistoryEmitQueue = Promise.resolve();
 const USER_HEAVY_CACHE_KEYS = ['downloadsData', 'libraryData', 'wishlistData', 'favoritesData', 'trophiesData', 'friendsData'];
 let trendingCache = null;
@@ -2312,7 +2313,8 @@ async function getAuthUserRecordFromDb(name) {
 
 function runSerializedProfileHydration(task) {
   profileHydrationQueued += 1;
-  const run = profileHydrationQueue.catch(() => null).then(async () => {
+  const lane = profileHydrationNextLane++ % profileHydrationQueues.length;
+  const run = profileHydrationQueues[lane].catch(() => null).then(async () => {
     profileHydrationQueued = Math.max(0, profileHydrationQueued - 1);
     profileHydrationActive += 1;
     try {
@@ -2321,7 +2323,7 @@ function runSerializedProfileHydration(task) {
       profileHydrationActive = Math.max(0, profileHydrationActive - 1);
     }
   });
-  profileHydrationQueue = run.then(() => null, () => null);
+  profileHydrationQueues[lane] = run.then(() => null, () => null);
   return run;
 }
 
@@ -2439,28 +2441,42 @@ async function emitProfileSyncPacket(socket, payload, options = {}) {
   return new Promise((resolve, reject) => {
     let settled = false;
     const startedAt = Date.now();
+    const finish = result => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try { socket.off('disconnect', onDisconnect); } catch (e) {}
+      resolve(result);
+    };
+    const onDisconnect = () => finish({ acked: false, cancelled: true, elapsedMs: Date.now() - startedAt });
     const timer = setTimeout(() => {
       if (settled) return;
       settled = true;
+      try { socket.off('disconnect', onDisconnect); } catch (e) {}
       reject(new Error(`Profile sync ACK timeout for ${label}.`));
     }, timeoutMs);
 
     const done = response => {
       if (settled) return;
-      settled = true;
-      clearTimeout(timer);
       if (response && response.ok === false) {
+        settled = true;
+        clearTimeout(timer);
+        try { socket.off('disconnect', onDisconnect); } catch (e) {}
         reject(new Error(response.error || `Client rejected ${label}.`));
         return;
       }
-      resolve({ acked: true, elapsedMs: Date.now() - startedAt });
+      finish({ acked: true, cancelled: false, elapsedMs: Date.now() - startedAt });
     };
 
+    try { socket.once('disconnect', onDisconnect); } catch (e) {}
     try {
       socket.emit('profile_sync', payload, done);
     } catch (err) {
-      clearTimeout(timer);
-      settled = true;
+      if (!settled) {
+        clearTimeout(timer);
+        settled = true;
+        try { socket.off('disconnect', onDisconnect); } catch (e) {}
+      }
       reject(err);
     }
   });
@@ -2493,6 +2509,7 @@ async function emitChunkedProfileSyncToSocket(socket, name, options = {}) {
       const coreSize = estimateValueBytes(corePayload, { maxNodes: 10000, maxBytes: 4 * 1024 * 1024 });
       logMemoryTrace('profile-sync:core:send', `user=${name} socket=${socket.id} approx=${formatApproxBytes(coreSize.bytes)}${coreSize.truncated ? '+' : ''} buffer=${getSocketWriteBufferLength(socket)}`);
       const result = await emitProfileSyncPacket(socket, corePayload, { label: 'core', timeoutMs: 15000 });
+      if (result && result.cancelled) { logMemoryTrace('profile-sync:cancel', `user=${name} socket=${socket.id} stage=core`); return; }
       logMemoryTrace('profile-sync:core:ack', `user=${name} socket=${socket.id} ack=${result.acked === true} ms=${result.elapsedMs || 0} buffer=${getSocketWriteBufferLength(socket)}`);
     }
 
@@ -2509,13 +2526,15 @@ async function emitChunkedProfileSyncToSocket(socket, name, options = {}) {
       const meta = PROFILE_HEAVY_SECTION_META[dataKey];
       const sectionRequested = !requestedKeys || requestedKeys.has(dataKey) || requestedKeys.has(meta.countKey) || (meta.versionKeys || []).some(key => requestedKeys.has(key));
       if (!sectionRequested) continue;
-      if (!socket.connected) throw new Error(`Socket disconnected before ${dataKey}.`);
+      if (!socket.connected) { logMemoryTrace('profile-sync:cancel', `user=${name} socket=${socket.id} stage=${dataKey}`); return; }
 
+      let sectionCancelled = false;
       await runSerializedProfileHydration(async () => {
-        if (!socket.connected) throw new Error(`Socket disconnected before loading ${dataKey}.`);
+        if (!socket.connected) { sectionCancelled = true; return; }
         logMemoryTrace('profile-sync:section:load', `user=${name} socket=${socket.id} section=${dataKey}`);
         const rawData = await getUserDataPayloadFromDb(name, type);
-        if (rawData === null || !socket.connected) throw new Error(`Could not load ${dataKey}.`);
+        if (rawData === null) throw new Error(`Could not load ${dataKey}.`);
+        if (!socket.connected) { sectionCancelled = true; return; }
         const estimate = estimateValueBytes(rawData);
         const itemCount = getPayloadItemCount(rawData);
         logMemoryTrace('profile-sync:section:loaded', `user=${name} socket=${socket.id} section=${dataKey} items=${itemCount} approx=${formatApproxBytes(estimate.bytes)}${estimate.truncated ? '+' : ''}`);
@@ -2529,8 +2548,10 @@ async function emitChunkedProfileSyncToSocket(socket, name, options = {}) {
         const packet = { name, sourceSocketId: options.sourceSocketId || null, profileUpdatedAt, userData };
         logMemoryTrace('profile-sync:section:send', `user=${name} socket=${socket.id} section=${dataKey} items=${itemCount} approx=${formatApproxBytes(estimate.bytes)}${estimate.truncated ? '+' : ''} buffer=${getSocketWriteBufferLength(socket)}`);
         const result = await emitProfileSyncPacket(socket, packet, { label: dataKey, timeoutMs: 20000 });
+        if (result && result.cancelled) { sectionCancelled = true; return; }
         logMemoryTrace('profile-sync:section:ack', `user=${name} socket=${socket.id} section=${dataKey} ack=${result.acked === true} ms=${result.elapsedMs || 0} buffer=${getSocketWriteBufferLength(socket)}`);
       });
+      if (sectionCancelled || !socket.connected) { logMemoryTrace('profile-sync:cancel', `user=${name} socket=${socket.id} stage=${dataKey}`); return; }
     }
 
     logMemoryTrace('profile-sync:done', `user=${name} socket=${socket.id} ms=${Date.now() - syncStartedAt}`);
@@ -2544,9 +2565,11 @@ async function emitChunkedProfileSyncToSocket(socket, name, options = {}) {
 
 function emitChatHistoryToSocket(socket) {
   if (!socket) return Promise.resolve();
+  if (socket.__chatHistoryInFlight) return socket.__chatHistoryInFlight;
+
   const run = chatHistoryEmitQueue.catch(() => null).then(async () => {
     if (!socket.connected) return;
-    const history = getPublicChatHistory();
+    const history = getPublicChatHistoryForUser(socket.userName || '');
     const requiresAck = socket.chatHistoryAckV1 === true;
     if (MEMORY_TRACE_ENABLED) {
       const estimate = estimateValueBytes(history, { maxNodes: 100000, maxBytes: 64 * 1024 * 1024 });
@@ -2555,27 +2578,48 @@ function emitChatHistoryToSocket(socket) {
 
     const startedAt = Date.now();
     if (requiresAck) {
-      await new Promise((resolve, reject) => {
+      const result = await new Promise((resolve, reject) => {
         let settled = false;
+        const finish = value => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          try { socket.off('disconnect', onDisconnect); } catch (e) {}
+          resolve(value);
+        };
+        const onDisconnect = () => finish({ cancelled: true });
         const timer = setTimeout(() => {
           if (settled) return;
           settled = true;
+          try { socket.off('disconnect', onDisconnect); } catch (e) {}
           reject(new Error('Chat history ACK timeout.'));
         }, 20000);
+        try { socket.once('disconnect', onDisconnect); } catch (e) {}
         try {
           socket.emit('chat_history', history, response => {
             if (settled) return;
-            settled = true;
-            clearTimeout(timer);
-            if (response && response.ok === false) reject(new Error(response.error || 'Chat history rejected by client.'));
-            else resolve();
+            if (response && response.ok === false) {
+              settled = true;
+              clearTimeout(timer);
+              try { socket.off('disconnect', onDisconnect); } catch (e) {}
+              reject(new Error(response.error || 'Chat history rejected by client.'));
+              return;
+            }
+            finish({ cancelled: false });
           });
         } catch (err) {
-          clearTimeout(timer);
-          settled = true;
+          if (!settled) {
+            settled = true;
+            clearTimeout(timer);
+            try { socket.off('disconnect', onDisconnect); } catch (e) {}
+          }
           reject(err);
         }
       });
+      if (result && result.cancelled) {
+        logMemoryTrace('chat-history:cancel', `user=${socket.userName || '-'} socket=${socket.id} ms=${Date.now() - startedAt}`);
+        return;
+      }
       logMemoryTrace('chat-history:ack', `user=${socket.userName || '-'} socket=${socket.id} ms=${Date.now() - startedAt} buffer=${getSocketWriteBufferLength(socket)}`);
       return;
     }
@@ -2584,8 +2628,12 @@ function emitChatHistoryToSocket(socket) {
     const drain = await waitForSocketWriteBufferDrain(socket, { maxPending: 1, timeoutMs: 20000 });
     logMemoryTrace('chat-history:drain', `user=${socket.userName || '-'} socket=${socket.id} drained=${drain.drained === true} ms=${drain.elapsedMs || 0} buffer=${getSocketWriteBufferLength(socket)}`);
   });
-  chatHistoryEmitQueue = run.then(() => null, () => null);
-  return run;
+
+  socket.__chatHistoryInFlight = run.finally(() => {
+    socket.__chatHistoryInFlight = null;
+  });
+  chatHistoryEmitQueue = socket.__chatHistoryInFlight.then(() => null, () => null);
+  return socket.__chatHistoryInFlight;
 }
 
 async function ensureFullUserCacheForWrite(name) {
@@ -2774,6 +2822,24 @@ function attachChatDbId(message, dbId) {
 
 function getPublicChatHistory() {
   return messageHistory;
+}
+
+function getPublicChatHistoryForUser(userName = '') {
+  const targetUser = String(userName || '');
+  if (!targetUser) return messageHistory.map(message => cleanChatMessage(message));
+
+  return messageHistory.map(message => {
+    const clean = cleanChatMessage(message);
+    if (String(clean.user || '') === targetUser) return clean;
+
+    const seenBy = Array.isArray(clean.seenBy) ? clean.seenBy : [];
+    const wasSeenByTarget = seenBy.includes(targetUser);
+    clean.seenBy = wasSeenByTarget ? [targetUser] : [];
+
+    const seenAt = clean.seenAt && typeof clean.seenAt === 'object' && !Array.isArray(clean.seenAt) ? clean.seenAt : {};
+    clean.seenAt = wasSeenByTarget && seenAt[targetUser] ? { [targetUser]: seenAt[targetUser] } : {};
+    return clean;
+  });
 }
 
 async function refreshChatHistoryFromDb() {
@@ -3972,7 +4038,7 @@ io.on('connection', (socket) => {
           }
 
           socket.emit('pinned_list', pinnedMessages);
-          if (!supportsChatHistoryPullV1) deferServerTask('POST AUTH CHAT HISTORY', () => emitChatHistoryToSocket(socket), POST_AUTH_CHAT_HISTORY_DELAY_MS);
+          if (!supportsProfileSyncV2) deferServerTask('POST AUTH CHAT HISTORY', () => emitChatHistoryToSocket(socket), POST_AUTH_CHAT_HISTORY_DELAY_MS);
           deferServerTask('POST AUTH ADMIN STATE', () => emitAdminState(socket), socket.isAdmin === true ? POST_AUTH_ADMIN_STATE_DELAY_MS : 120);
           deferServerTask('POST AUTH ONLINE LIST', () => emitOnlineList(), POST_AUTH_ONLINE_LIST_DELAY_MS);
         } else {
@@ -4055,7 +4121,7 @@ io.on('connection', (socket) => {
         compactCachedUser(name);
 
         socket.emit('pinned_list', pinnedMessages);
-        if (!supportsChatHistoryPullV1) deferServerTask('POST AUTH CHAT HISTORY', () => emitChatHistoryToSocket(socket), POST_AUTH_CHAT_HISTORY_DELAY_MS);
+        if (!supportsProfileSyncV2) deferServerTask('POST AUTH CHAT HISTORY', () => emitChatHistoryToSocket(socket), POST_AUTH_CHAT_HISTORY_DELAY_MS);
         deferServerTask('POST AUTH ADMIN STATE', () => emitAdminState(socket), socket.isAdmin === true ? POST_AUTH_ADMIN_STATE_DELAY_MS : 120);
         deferServerTask('POST AUTH ONLINE LIST', () => emitOnlineList(), POST_AUTH_ONLINE_LIST_DELAY_MS);
       }
@@ -4353,8 +4419,11 @@ io.on('connection', (socket) => {
         await sendProfileSync();
         if (typeof ack === 'function') ack({ ok: true, profileUpdatedAt: normalizeTimestampValue(userDatabase[name] && userDatabase[name].profileUpdatedAt) });
       } catch (err) {
-        console.error('[REQUEST PROFILE SYNC ERROR]:', err);
-        if (typeof ack === 'function') ack({ ok: false, error: 'Profile synchronization failed.' });
+        const message = String(err && err.message || err || '');
+        const expectedDisconnect = !socket.connected || /socket disconnected/i.test(message);
+        if (!expectedDisconnect) console.error('[REQUEST PROFILE SYNC ERROR]:', err);
+        else logMemoryTrace('profile-sync:cancel', `user=${name} socket=${socket.id} reason=disconnect`);
+        if (typeof ack === 'function' && socket.connected) ack({ ok: false, error: 'Profile synchronization failed.' });
       }
     };
 
@@ -5167,7 +5236,14 @@ io.on('connection', (socket) => {
         if (!msg.seenBy.includes(data.user)) {
             msg.seenBy.push(data.user);
             msg.seenAt[data.user] = new Date().toISOString();
-            io.emit('message_seen', { msgId: data.msgId, seenBy: msg.seenBy, seenAt: msg.seenAt });
+            const fullSeenPayload = { msgId: data.msgId, seenBy: msg.seenBy, seenAt: msg.seenAt };
+            getSocketsByUserName(msg.user).forEach(client => {
+                if (client && client.connected) client.emit('message_seen', fullSeenPayload);
+            });
+            const readerSeenPayload = { msgId: data.msgId, seenBy: [data.user], seenAt: { [data.user]: msg.seenAt[data.user] } };
+            getSocketsByUserName(data.user).forEach(client => {
+                if (client && client.connected && client.userName !== msg.user) client.emit('message_seen', readerSeenPayload);
+            });
             queueSeenMessagePersist(msg);
         }
     }
