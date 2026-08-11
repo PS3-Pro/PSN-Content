@@ -1960,6 +1960,8 @@ function searchUsersFromCache(query, includeAdminFields = false, includeAllMatch
 }
 
 async function calculateTrendingFromDb() {
+  const trendingStartedAt = Date.now();
+  logMemoryTrace('trending:build:start', `cacheUsers=${Object.keys(userDatabase).length}`);
   const rows = await queryDbWithRetry(`
     WITH game_downloads AS (
       SELECT
@@ -1997,6 +1999,7 @@ async function calculateTrendingFromDb() {
     UNION ALL
     SELECT 'wishlist' AS kind, key, count FROM top_wishlist
   `, [], { attempts: 2, label: 'TRENDING AGGREGATE' });
+  logMemoryTrace('trending:query:done', `rows=${rows && Array.isArray(rows.rows) ? rows.rows.length : 0} ms=${Date.now() - trendingStartedAt}`);
 
   const topDownloads = [];
   const topWishlist = [];
@@ -2006,7 +2009,9 @@ async function calculateTrendingFromDb() {
     else if (row.kind === 'wishlist') topWishlist.push(item);
   });
 
-  return { topDownloads, topWishlist };
+  const result = { topDownloads, topWishlist };
+  logMemoryTrace('trending:build:done', `downloads=${topDownloads.length} wishlist=${topWishlist.length} ms=${Date.now() - trendingStartedAt}`);
+  return result;
 }
 
 const CONTENT_DOWNLOAD_COUNT_CACHE_TTL_MS = Math.max(30000, parseInt(process.env.CONTENT_DOWNLOAD_COUNT_CACHE_TTL_MS || '300000', 10) || 300000);
@@ -2449,11 +2454,22 @@ async function emitProfileSyncPacket(socket, payload, options = {}) {
       resolve(result);
     };
     const onDisconnect = () => finish({ acked: false, cancelled: true, elapsedMs: Date.now() - startedAt });
-    const timer = setTimeout(() => {
+    const timer = setTimeout(async () => {
       if (settled) return;
-      settled = true;
-      try { socket.off('disconnect', onDisconnect); } catch (e) {}
-      reject(new Error(`Profile sync ACK timeout for ${label}.`));
+      if (!socket.connected) {
+        finish({ acked: false, cancelled: true, ackTimeout: true, elapsedMs: Date.now() - startedAt });
+        return;
+      }
+      const drain = await waitForSocketWriteBufferDrain(socket, { maxPending: 1, timeoutMs: 2500 });
+      if (settled) return;
+      finish({
+        acked: false,
+        cancelled: false,
+        ackTimeout: true,
+        drained: drain && drain.drained === true,
+        elapsedMs: Date.now() - startedAt,
+        pending: drain && Number(drain.pending || 0) || 0
+      });
     }, timeoutMs);
 
     const done = response => {
@@ -2508,9 +2524,13 @@ async function emitChunkedProfileSyncToSocket(socket, name, options = {}) {
       };
       const coreSize = estimateValueBytes(corePayload, { maxNodes: 10000, maxBytes: 4 * 1024 * 1024 });
       logMemoryTrace('profile-sync:core:send', `user=${name} socket=${socket.id} approx=${formatApproxBytes(coreSize.bytes)}${coreSize.truncated ? '+' : ''} buffer=${getSocketWriteBufferLength(socket)}`);
-      const result = await emitProfileSyncPacket(socket, corePayload, { label: 'core', timeoutMs: 15000 });
+      const result = await emitProfileSyncPacket(socket, corePayload, { label: 'core', timeoutMs: 8000 });
       if (result && result.cancelled) { logMemoryTrace('profile-sync:cancel', `user=${name} socket=${socket.id} stage=core`); return; }
-      logMemoryTrace('profile-sync:core:ack', `user=${name} socket=${socket.id} ack=${result.acked === true} ms=${result.elapsedMs || 0} buffer=${getSocketWriteBufferLength(socket)}`);
+      if (result && result.ackTimeout) {
+        logMemoryTrace('profile-sync:core:ack-timeout', `user=${name} socket=${socket.id} drained=${result.drained === true} ms=${result.elapsedMs || 0} pending=${result.pending || 0} buffer=${getSocketWriteBufferLength(socket)}`);
+      } else {
+        logMemoryTrace('profile-sync:core:ack', `user=${name} socket=${socket.id} ack=${result.acked === true} ms=${result.elapsedMs || 0} buffer=${getSocketWriteBufferLength(socket)}`);
+      }
     }
 
     const sections = [
@@ -2547,9 +2567,13 @@ async function emitChunkedProfileSyncToSocket(socket, name, options = {}) {
 
         const packet = { name, sourceSocketId: options.sourceSocketId || null, profileUpdatedAt, userData };
         logMemoryTrace('profile-sync:section:send', `user=${name} socket=${socket.id} section=${dataKey} items=${itemCount} approx=${formatApproxBytes(estimate.bytes)}${estimate.truncated ? '+' : ''} buffer=${getSocketWriteBufferLength(socket)}`);
-        const result = await emitProfileSyncPacket(socket, packet, { label: dataKey, timeoutMs: 20000 });
+        const result = await emitProfileSyncPacket(socket, packet, { label: dataKey, timeoutMs: 10000 });
         if (result && result.cancelled) { sectionCancelled = true; return; }
-        logMemoryTrace('profile-sync:section:ack', `user=${name} socket=${socket.id} section=${dataKey} ack=${result.acked === true} ms=${result.elapsedMs || 0} buffer=${getSocketWriteBufferLength(socket)}`);
+        if (result && result.ackTimeout) {
+          logMemoryTrace('profile-sync:section:ack-timeout', `user=${name} socket=${socket.id} section=${dataKey} drained=${result.drained === true} ms=${result.elapsedMs || 0} pending=${result.pending || 0} buffer=${getSocketWriteBufferLength(socket)}`);
+        } else {
+          logMemoryTrace('profile-sync:section:ack', `user=${name} socket=${socket.id} section=${dataKey} ack=${result.acked === true} ms=${result.elapsedMs || 0} buffer=${getSocketWriteBufferLength(socket)}`);
+        }
       });
       if (sectionCancelled || !socket.connected) { logMemoryTrace('profile-sync:cancel', `user=${name} socket=${socket.id} stage=${dataKey}`); return; }
     }
@@ -4404,37 +4428,43 @@ io.on('connection', (socket) => {
       return;
     }
 
-    const sendProfileSync = async () => {
-      if (socket.profileSyncV2 === true) {
-        await emitChunkedProfileSyncToSocket(socket, name, { forceRefresh: data && data.forceRefresh === true });
-        return;
-      }
-
-      const fullUser = await runSerializedProfileHydration(() => loadFullUserRecordTransient(name));
-      if (!fullUser || !socket.connected) throw new Error('Profile could not be loaded.');
-      socket.emit('profile_sync', buildFullProfileSyncPayload(name, fullUser, null, { normalized: true }));
-      compactCachedUser(name);
-    };
-
-    const completeProfileSync = async () => {
-      try {
-        await sendProfileSync();
-        if (typeof ack === 'function') ack({ ok: true, profileUpdatedAt: normalizeTimestampValue(userDatabase[name] && userDatabase[name].profileUpdatedAt) });
-      } catch (err) {
-        const message = String(err && err.message || err || '');
-        const expectedDisconnect = !socket.connected || /socket disconnected/i.test(message);
-        if (!expectedDisconnect) console.error('[REQUEST PROFILE SYNC ERROR]:', err);
-        else logMemoryTrace('profile-sync:cancel', `user=${name} socket=${socket.id} reason=disconnect`);
-        if (typeof ack === 'function' && socket.connected) ack({ ok: false, error: 'Profile synchronization failed.' });
-      }
-    };
-
-    if (!(data && data.forceRefresh === true) && getPostAuthRemainingDelay(socket, POST_AUTH_PROFILE_SYNC_DELAY_MS) > 0) {
-      deferAfterAuthSettle(socket, 'REQUEST PROFILE SYNC', completeProfileSync, POST_AUTH_PROFILE_SYNC_DELAY_MS);
+    if (socket.__profileSyncRequestInFlight) {
+      logMemoryTrace('profile-sync:request:dedupe', `user=${name} socket=${socket.id} reason=${normalizeText(data && data.reason, 'duplicate')}`);
+      const existingResult = await socket.__profileSyncRequestInFlight.catch(() => ({ ok: false, error: 'Profile synchronization failed.' }));
+      if (typeof ack === 'function' && socket.connected) ack(existingResult);
       return;
     }
 
-    await completeProfileSync();
+    const runRequest = async () => {
+      const remainingDelay = (data && data.forceRefresh === true) ? 0 : getPostAuthRemainingDelay(socket, POST_AUTH_PROFILE_SYNC_DELAY_MS);
+      if (remainingDelay > 0) await waitMs(remainingDelay);
+      if (!socket.connected) return { ok: false, cancelled: true, error: 'Socket disconnected.' };
+
+      try {
+        if (socket.profileSyncV2 === true) {
+          await emitChunkedProfileSyncToSocket(socket, name, { forceRefresh: data && data.forceRefresh === true });
+        } else {
+          const fullUser = await runSerializedProfileHydration(() => loadFullUserRecordTransient(name));
+          if (!fullUser || !socket.connected) throw new Error('Profile could not be loaded.');
+          socket.emit('profile_sync', buildFullProfileSyncPayload(name, fullUser, null, { normalized: true }));
+          compactCachedUser(name);
+        }
+        return { ok: true, profileUpdatedAt: normalizeTimestampValue(userDatabase[name] && userDatabase[name].profileUpdatedAt) };
+      } catch (err) {
+        const message = String(err && err.message || err || '');
+        const expectedDisconnect = !socket.connected || /socket disconnected/i.test(message);
+        if (!expectedDisconnect) console.error(`[REQUEST PROFILE SYNC ERROR] user=${name} socket=${socket.id}:`, err);
+        else logMemoryTrace('profile-sync:cancel', `user=${name} socket=${socket.id} reason=disconnect`);
+        return { ok: false, cancelled: expectedDisconnect, error: 'Profile synchronization failed.' };
+      }
+    };
+
+    socket.__profileSyncRequestInFlight = runRequest().finally(() => {
+      socket.__profileSyncRequestInFlight = null;
+    });
+
+    const result = await socket.__profileSyncRequestInFlight;
+    if (typeof ack === 'function' && socket.connected) ack(result);
   });
 
   socket.on('request_online_list', async () => {
