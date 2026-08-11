@@ -607,12 +607,14 @@ select option { background-color: var(--bg-dark); }
 #modal-screenshots { display: flex; gap: 10px; overflow-x: auto; scroll-behavior: smooth; -ms-overflow-style: none; scrollbar-width: none; }
 #modal-screenshots::-webkit-scrollbar { display: none; }
 #game-modal #modal-screenshots .pulse-skeleton { width: 180px; height: 120px; min-width: 180px; min-height: 120px; border-radius: 8px; flex: 0 0 auto; }
-#modal-summary { min-height: 150px; transition: all 0.3s ease; }
+#modal-summary { min-height: 150px; }
 .carousel-wrapper:has(#modal-screenshots) { min-height: 135px; display: flex; align-items: center; }
 #game-modal #dynamic-carousel-wrapper { position: relative; height: 130px; min-height: 130px; display: flex; align-items: center; }
 #game-modal #dynamic-carousel-wrapper>.scroll-arrow { top: 50%; transform: translateY(-50%); }
 #game-modal #dynamic-carousel-wrapper>.scroll-arrow:hover { transform: translateY(-50%) scale(1.1); }
 .pulse-skeleton { animation: pulse-skeleton 1.5s infinite ease-in-out; background-color: rgba(255,255,255,0.05); display: inline-block; flex-shrink: 0; }
+.modal-screenshot-skeleton { position: relative; overflow: hidden; }
+.modal-screenshot-skeleton::after { content: ''; position: absolute; top: 0; bottom: 0; left: -150%; width: 42%; background: rgba(255,255,255,0.14); filter: blur(12px); transform: skewX(-14deg); animation: ps5Sweep 1.25s linear infinite; pointer-events: none; }
 
 /* ========================================================================== SYSTEM MODALS (PROFILE, THEME, REDEEM) ========================================================================== */
 .sys-modal-overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.4); backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); z-index: 10000; display: none; justify-content: center; align-items: center; opacity: 0; transition: opacity 0.3s ease; }
@@ -19708,8 +19710,8 @@ P
 	
 	let currentRawgKeyIndex = parseInt(localStorage.getItem('rawg_key_index') || '0');
 
-	function clearModalSummaryAlignedHeight() {
-		const summary = document.getElementById('modal-summary');
+	function clearModalSummaryAlignedHeight(modalRoot = document.getElementById('game-modal')) {
+		const summary = modalRoot?.querySelector('#modal-summary');
 		if (!summary) return;
 		summary.style.removeProperty('height');
 		summary.style.removeProperty('min-height');
@@ -19721,65 +19723,53 @@ P
 		return window.matchMedia ? window.matchMedia('(min-width: 769px)').matches : window.innerWidth > 768;
 	}
 
-	function alignModalSummaryToInfoCard() {
-		const modalRoot = document.getElementById('game-modal');
+	let modalSummaryResizeAlignTimer = null;
+	function alignModalSummaryToInfoCard(modalRoot = document.getElementById('game-modal')) {
 		if (!modalRoot || !modalRoot.classList.contains('modal-no-screenshots')) return;
-		if (!isGameModalDesktopLayout()) { clearModalSummaryAlignedHeight(); return; }
+		clearModalSummaryAlignedHeight(modalRoot);
+		if (!isGameModalDesktopLayout()) return;
 
-		const summary = document.getElementById('modal-summary');
+		const summary = modalRoot.querySelector('#modal-summary');
 		const infoCard = modalRoot.querySelector('.modal-left-col .modal-info-card');
 		if (!summary || !infoCard) return;
 
-		const summaryRect = summary.getBoundingClientRect();
-		const infoRect = infoCard.getBoundingClientRect();
-		const targetHeight = Math.floor(infoRect.bottom - summaryRect.top);
-		if (!targetHeight || targetHeight < 150) return;
-
-		summary.style.setProperty('height', targetHeight + 'px', 'important');
-		summary.style.setProperty('min-height', targetHeight + 'px', 'important');
-		summary.style.setProperty('max-height', targetHeight + 'px', 'important');
-		summary.style.setProperty('flex', '0 0 ' + targetHeight + 'px', 'important');
+		requestAnimationFrame(() => {
+			if (!modalRoot.classList.contains('modal-no-screenshots')) return;
+			const summaryRect = summary.getBoundingClientRect();
+			const infoRect = infoCard.getBoundingClientRect();
+			const targetHeight = Math.floor(infoRect.bottom - summaryRect.top);
+			if (!targetHeight || targetHeight < 150) return;
+			summary.style.setProperty('height', targetHeight + 'px', 'important');
+			summary.style.setProperty('min-height', targetHeight + 'px', 'important');
+			summary.style.setProperty('max-height', targetHeight + 'px', 'important');
+			summary.style.setProperty('flex', '0 0 ' + targetHeight + 'px', 'important');
+		});
 	}
 
-	let modalSummaryResizeAlignTimer = null;
 	function scheduleModalSummaryAlignment() {
 		const modalRoot = document.getElementById('game-modal');
 		if (!modalRoot || !modalRoot.classList.contains('modal-no-screenshots')) return;
-
 		clearTimeout(modalSummaryResizeAlignTimer);
-		clearModalSummaryAlignedHeight();
-
-		if (!isGameModalDesktopLayout()) return;
-
-		const runAlignment = () => {
-			const currentModal = document.getElementById('game-modal');
-			if (!currentModal || !currentModal.classList.contains('modal-no-screenshots')) return;
-			if (!isGameModalDesktopLayout()) { clearModalSummaryAlignedHeight(); return; }
-
-			clearModalSummaryAlignedHeight();
-			requestAnimationFrame(() => {
-				if (!isGameModalDesktopLayout()) { clearModalSummaryAlignedHeight(); return; }
-				requestAnimationFrame(alignModalSummaryToInfoCard);
-			});
-		};
-
-		runAlignment();
-		modalSummaryResizeAlignTimer = setTimeout(runAlignment, 140);
+		alignModalSummaryToInfoCard(modalRoot);
+		modalSummaryResizeAlignTimer = setTimeout(() => alignModalSummaryToInfoCard(modalRoot), 140);
 	}
 
 	function setGameModalNoScreenshots(modalRoot, enabled) {
 		if (!modalRoot) return;
 		if (!enabled) {
 			modalRoot.classList.remove('modal-no-screenshots');
-			clearModalSummaryAlignedHeight();
+			clearTimeout(modalSummaryResizeAlignTimer);
+			clearModalSummaryAlignedHeight(modalRoot);
 			return;
 		}
 
 		modalRoot.classList.add('modal-no-screenshots');
 		scheduleModalSummaryAlignment();
 	}
-	
 
+	window.addEventListener('resize', scheduleModalSummaryAlignment);
+	window.addEventListener('orientationchange', scheduleModalSummaryAlignment);
+	
 
 	const normalizeMetadataMatchTitle = (value) => {
 		let text = String(value || '');
@@ -19938,7 +19928,6 @@ P
 		const summaryContainer = document.getElementById('modal-summary');
 		const screenshotsWrapper = document.getElementById('modal-screenshots-wrapper');
 		const badgesContainer = document.getElementById('modal-badges');
-		const screenshotsDivider = document.getElementById('modal-screenshots-divider');
 		const modalRoot = document.getElementById('game-modal');
 		if (modalRoot) setGameModalNoScreenshots(modalRoot, false);
 
@@ -20049,9 +20038,7 @@ P
 		`;
 	
 		if (screenshotsWrapper) {
-			if (modalRoot) setGameModalNoScreenshots(modalRoot, false);
 			screenshotsWrapper.style.display = 'flex';
-			if (screenshotsDivider) screenshotsDivider.style.display = 'block';
 			
 			screenshotsWrapper.innerHTML = `
 				<div id="modal-screenshots-divider" class="modal-divider"></div>
@@ -20060,9 +20047,9 @@ P
 				</span>
 				<div class="carousel-wrapper" id="dynamic-carousel-wrapper"> <button class="scroll-arrow left-arrow" onmouseenter="playUiArrow()" onclick="moveModalScroll(-1)"><i class="fas fa-chevron-left"></i></button>
 					<div class="horizontal-scroll" id="modal-screenshots" style="min-height: 120px; padding: 5px 0;">
-						<div class="pulse-skeleton"></div>
-						<div class="pulse-skeleton"></div>
-						<div class="pulse-skeleton"></div>
+						<div class="pulse-skeleton modal-screenshot-skeleton"></div>
+						<div class="pulse-skeleton modal-screenshot-skeleton"></div>
+						<div class="pulse-skeleton modal-screenshot-skeleton"></div>
 					</div>
 					<button class="scroll-arrow right-arrow" onmouseenter="playUiArrow()" onclick="moveModalScroll(1)"><i class="fas fa-chevron-right"></i></button>
 				</div>
@@ -20290,11 +20277,8 @@ P
 			screenshotsWrapper.style.display = 'none';
 			if (modalRoot) setGameModalNoScreenshots(modalRoot, true);
 		}
-		if (modalRoot && modalRoot.classList.contains('modal-no-screenshots')) scheduleModalSummaryAlignment();
 	};
 
-	window.addEventListener('resize', scheduleModalSummaryAlignment);
-	window.addEventListener('orientationchange', scheduleModalSummaryAlignment);
 
 	window.moveModalScroll = function(direction) {
 		const container = document.getElementById('modal-screenshots');
