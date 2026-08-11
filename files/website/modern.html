@@ -10848,6 +10848,8 @@ P
 			legacyUsernameLogin: psnLegacyUsernameUnlock,
 			profileSyncV2: true,
 			profileSyncAckV1: true,
+			chatHistoryAckV1: true,
+			chatHistoryPullV1: true,
 			adminMaintenanceBypass: document.body.classList.contains('admin-maintenance-login-bypass'),
 			userData: {
 				avatar: selectedAvatarUrl,
@@ -10998,6 +11000,8 @@ P
 					isNewAccount: false,
 					profileSyncV2: true,
 					profileSyncAckV1: true,
+					chatHistoryAckV1: true,
+					chatHistoryPullV1: true,
 					adminMaintenanceBypass: document.body.classList.contains('admin-maintenance-login-bypass')
 				};
 
@@ -11120,6 +11124,8 @@ P
 				isNewAccount: false,
 				profileSyncV2: true,
 				profileSyncAckV1: true,
+				chatHistoryAckV1: true,
+				chatHistoryPullV1: true,
 				passwordResetSubmission: isPasswordResetSubmission,
 				adminMaintenanceBypass: document.body.classList.contains('admin-maintenance-login-bypass')
 			};
@@ -34910,6 +34916,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 
     function requestChatHistoryNow(reason = 'open-chat') {
         if (!(typeof socketChat !== 'undefined' && socketChat && socketChat.connected)) return false;
+        if (window.__chatHistoryRequesting === true) return false;
         const now = Date.now();
         if (window.__lastChatHistoryRequestAt && now - window.__lastChatHistoryRequestAt < 900) return false;
         window.__lastChatHistoryRequestAt = now;
@@ -41022,11 +41029,18 @@ function getVisibleChatStackEl(id) {
 
 			if (typeof window.refreshProfileSyncVisibleUI === 'function') window.refreshProfileSyncVisibleUI(userData, previousProfileSyncState, profileSyncChanges);
 
-			const incomingRole = String(userData.role || (userData.isAdmin ? 'admin' : '')).toLowerCase();
-			if (incomingRole && incomingRole !== 'user') safeLocalStorageSet(`${name}_psn_role`, incomingRole === 'moderator' ? 'mod' : incomingRole);
-			else localStorage.removeItem(`${name}_psn_role`);
-			document.body.classList.toggle('is-admin', userData.isAdmin === true || incomingRole === 'admin');
-			document.body.classList.toggle('is-mod', userData.isModerator === true || incomingRole === 'mod' || incomingRole === 'moderator');
+			const hasRoleSync = Object.prototype.hasOwnProperty.call(userData, 'role');
+			const hasAdminSync = Object.prototype.hasOwnProperty.call(userData, 'isAdmin');
+			const hasModeratorSync = Object.prototype.hasOwnProperty.call(userData, 'isModerator');
+			if (hasRoleSync || hasAdminSync || hasModeratorSync) {
+				const incomingRole = String(userData.role || (userData.isAdmin ? 'admin' : '')).toLowerCase();
+				if (hasRoleSync) {
+					if (incomingRole && incomingRole !== 'user') safeLocalStorageSet(`${name}_psn_role`, incomingRole === 'moderator' ? 'mod' : incomingRole);
+					else localStorage.removeItem(`${name}_psn_role`);
+				}
+				if (hasAdminSync || hasRoleSync) document.body.classList.toggle('is-admin', userData.isAdmin === true || incomingRole === 'admin');
+				if (hasModeratorSync || hasRoleSync) document.body.classList.toggle('is-mod', userData.isModerator === true || incomingRole === 'mod' || incomingRole === 'moderator');
+			}
 
 			if (profileSyncChanges.library && typeof updateConsoleLibraryStatusUI === 'function') updateConsoleLibraryStatusUI(window.lastScannedGames || []);
 			if (profileSyncChanges.trophies && typeof renderTrophiesView === 'function' && typeof psnIsViewVisible === 'function' && psnIsViewVisible('view-trophies')) renderTrophiesView(true);
@@ -41514,6 +41528,8 @@ function getVisibleChatStackEl(id) {
 		if (!payload || !payload.name) return false;
 		payload.profileSyncV2 = true;
 		payload.profileSyncAckV1 = true;
+		payload.chatHistoryAckV1 = true;
+		payload.chatHistoryPullV1 = true;
 		window.clearLoginServerAttempt();
 		enableServerAutomaticReconnect();
 
@@ -41689,7 +41705,9 @@ function getVisibleChatStackEl(id) {
 					password: myPass,
 					isNewAccount: false,
 					profileSyncV2: true,
-					profileSyncAckV1: true
+					profileSyncAckV1: true,
+					chatHistoryAckV1: true,
+					chatHistoryPullV1: true
 				});
 			}
 			if (profileRealtimeConnectionWasLost) {
@@ -41995,6 +42013,10 @@ function getVisibleChatStackEl(id) {
 			if (isLightAuthPayload && initialProfileSyncOk && !profileWasAlreadyLoaded) {
 				window.__initialProfileSyncInProgress = false;
 				window.isProfileLoaded = true;
+			}
+
+			if (isAdmin && typeof socketChat !== 'undefined' && socketChat && socketChat.connected) {
+				socketChat.emit('admin_request_admin_state', { at: Date.now() });
 			}
 
 			setTimeout(() => {
@@ -42391,7 +42413,7 @@ function getVisibleChatStackEl(id) {
 			}
 		});
 	
-		socketChat.on('chat_history', function(history) {
+		socketChat.on('chat_history', function(history, respond) {
 			window.__chatHistoryReceived = true;
 			window.__chatHistoryRequesting = false;
 			const normalizedHistory = typeof normalizeChatHistoryPayload === 'function' ? normalizeChatHistoryPayload(history) : (Array.isArray(history) ? history : []);
@@ -42427,6 +42449,7 @@ function getVisibleChatStackEl(id) {
 			}
 			if (typeof refreshChatNotificationDot === 'function') refreshChatNotificationDot();
 			if (typeof refreshMentionJumpButton === 'function') refreshMentionJumpButton();
+			if (typeof respond === 'function') { try { respond({ ok: true, received: normalizedHistory.length }); } catch (e) {} }
 		});
 
 		socketChat.on('chat_message', function(data) {

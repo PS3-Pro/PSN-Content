@@ -30,7 +30,7 @@ const ENABLE_PROFILE_PERIODIC_SYNC = process.env.ENABLE_PROFILE_PERIODIC_SYNC ==
 const POST_AUTH_CHAT_HISTORY_DELAY_MS = Math.max(0, parseInt(process.env.POST_AUTH_CHAT_HISTORY_DELAY_MS || "180", 10) || 180);
 const POST_AUTH_ADMIN_STATE_DELAY_MS = Math.max(0, parseInt(process.env.POST_AUTH_ADMIN_STATE_DELAY_MS || "550", 10) || 550);
 const POST_AUTH_ONLINE_LIST_DELAY_MS = Math.max(0, parseInt(process.env.POST_AUTH_ONLINE_LIST_DELAY_MS || "1400", 10) || 1400);
-const POST_AUTH_PROFILE_SYNC_DELAY_MS = Math.max(0, parseInt(process.env.POST_AUTH_PROFILE_SYNC_DELAY_MS || "1800", 10) || 1800);
+const POST_AUTH_PROFILE_SYNC_DELAY_MS = Math.max(0, parseInt(process.env.POST_AUTH_PROFILE_SYNC_DELAY_MS || "250", 10) || 250);
 const USER_CACHE_REFRESH_INTERVAL_MS = 30000;
 const PASSWORD_RESET_WINDOW_MS = 10 * 60 * 1000;
 const USER_CACHE_WARMUP_INTERVAL_MS = 120000;
@@ -309,6 +309,20 @@ function getSocketWriteBufferLength(socket) {
   } catch (err) {
     return 0;
   }
+}
+
+async function waitForSocketWriteBufferDrain(socket, options = {}) {
+  const maxPending = Math.max(0, Number(options.maxPending ?? 1));
+  const timeoutMs = Math.max(500, Number(options.timeoutMs || 12000));
+  const pollMs = Math.max(10, Number(options.pollMs || 25));
+  const startedAt = Date.now();
+  while (socket && socket.connected) {
+    const pending = getSocketWriteBufferLength(socket);
+    if (pending <= maxPending) return { drained: true, pending, elapsedMs: Date.now() - startedAt };
+    if (Date.now() - startedAt >= timeoutMs) return { drained: false, pending, elapsedMs: Date.now() - startedAt };
+    await waitMs(pollMs);
+  }
+  return { drained: false, pending: getSocketWriteBufferLength(socket), elapsedMs: Date.now() - startedAt, disconnected: true };
 }
 
 function getTotalSocketWriteBufferLength() {
@@ -2410,7 +2424,7 @@ function buildLightProfileUserData(name, user = {}) {
   };
 }
 
-function emitProfileSyncPacket(socket, payload, options = {}) {
+async function emitProfileSyncPacket(socket, payload, options = {}) {
   const requireAck = socket && socket.profileSyncAckV1 === true;
   const timeoutMs = Math.max(3000, Number(options.timeoutMs || 15000));
   const label = String(options.label || 'profile');
@@ -2418,7 +2432,8 @@ function emitProfileSyncPacket(socket, payload, options = {}) {
 
   if (!requireAck) {
     socket.emit('profile_sync', payload);
-    return new Promise(resolve => setTimeout(() => resolve({ acked: false, legacy: true }), 250));
+    const drain = await waitForSocketWriteBufferDrain(socket, { maxPending: 1, timeoutMs });
+    return { acked: false, legacy: true, drained: drain.drained === true, elapsedMs: drain.elapsedMs || 0, pending: drain.pending || 0 };
   }
 
   return new Promise((resolve, reject) => {
@@ -2532,12 +2547,42 @@ function emitChatHistoryToSocket(socket) {
   const run = chatHistoryEmitQueue.catch(() => null).then(async () => {
     if (!socket.connected) return;
     const history = getPublicChatHistory();
+    const requiresAck = socket.chatHistoryAckV1 === true;
     if (MEMORY_TRACE_ENABLED) {
       const estimate = estimateValueBytes(history, { maxNodes: 100000, maxBytes: 64 * 1024 * 1024 });
-      logMemoryTrace('chat-history:send', `user=${socket.userName || '-'} socket=${socket.id} items=${Array.isArray(history) ? history.length : 0} approx=${formatApproxBytes(estimate.bytes)}${estimate.truncated ? '+' : ''} buffer=${getSocketWriteBufferLength(socket)}`);
+      logMemoryTrace('chat-history:send', `user=${socket.userName || '-'} socket=${socket.id} items=${Array.isArray(history) ? history.length : 0} approx=${formatApproxBytes(estimate.bytes)}${estimate.truncated ? '+' : ''} ack=${requiresAck} buffer=${getSocketWriteBufferLength(socket)}`);
     }
+
+    const startedAt = Date.now();
+    if (requiresAck) {
+      await new Promise((resolve, reject) => {
+        let settled = false;
+        const timer = setTimeout(() => {
+          if (settled) return;
+          settled = true;
+          reject(new Error('Chat history ACK timeout.'));
+        }, 20000);
+        try {
+          socket.emit('chat_history', history, response => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            if (response && response.ok === false) reject(new Error(response.error || 'Chat history rejected by client.'));
+            else resolve();
+          });
+        } catch (err) {
+          clearTimeout(timer);
+          settled = true;
+          reject(err);
+        }
+      });
+      logMemoryTrace('chat-history:ack', `user=${socket.userName || '-'} socket=${socket.id} ms=${Date.now() - startedAt} buffer=${getSocketWriteBufferLength(socket)}`);
+      return;
+    }
+
     socket.emit('chat_history', history);
-    await new Promise(resolve => setTimeout(resolve, 25));
+    const drain = await waitForSocketWriteBufferDrain(socket, { maxPending: 1, timeoutMs: 20000 });
+    logMemoryTrace('chat-history:drain', `user=${socket.userName || '-'} socket=${socket.id} drained=${drain.drained === true} ms=${drain.elapsedMs || 0} buffer=${getSocketWriteBufferLength(socket)}`);
   });
   chatHistoryEmitQueue = run.then(() => null, () => null);
   return run;
@@ -3735,7 +3780,9 @@ io.on('connection', (socket) => {
       
       const supportsProfileSyncV2 = data && data.profileSyncV2 === true;
       const supportsProfileSyncAckV1 = data && data.profileSyncAckV1 === true;
-      logMemoryTrace('auth:start', `user=${name || ''} socket=${socket.id} new=${isNewAccount === true} v2=${supportsProfileSyncV2} ack=${supportsProfileSyncAckV1}`);
+      const supportsChatHistoryAckV1 = data && data.chatHistoryAckV1 === true;
+      const supportsChatHistoryPullV1 = data && data.chatHistoryPullV1 === true;
+      logMemoryTrace('auth:start', `user=${name || ''} socket=${socket.id} new=${isNewAccount === true} v2=${supportsProfileSyncV2} ack=${supportsProfileSyncAckV1} chatAck=${supportsChatHistoryAckV1} chatPull=${supportsChatHistoryPullV1}`);
       let dbUser = await getAuthUserRecordFromDb(name);
       if (dbUser) {
         const authEstimate = estimateValueBytes(dbUser, { maxNodes: 10000, maxBytes: 8 * 1024 * 1024 });
@@ -3884,6 +3931,8 @@ io.on('connection', (socket) => {
           fullUserCacheNames.delete(name);
           socket.profileSyncV2 = supportsProfileSyncV2;
           socket.profileSyncAckV1 = supportsProfileSyncAckV1;
+          socket.chatHistoryAckV1 = supportsChatHistoryAckV1;
+          socket.chatHistoryPullV1 = supportsChatHistoryPullV1;
           
           markSocketAuthenticated(socket);
           invalidateOnlineListCache('auth-existing-db');
@@ -3923,7 +3972,7 @@ io.on('connection', (socket) => {
           }
 
           socket.emit('pinned_list', pinnedMessages);
-          deferServerTask('POST AUTH CHAT HISTORY', () => emitChatHistoryToSocket(socket), POST_AUTH_CHAT_HISTORY_DELAY_MS);
+          if (!supportsChatHistoryPullV1) deferServerTask('POST AUTH CHAT HISTORY', () => emitChatHistoryToSocket(socket), POST_AUTH_CHAT_HISTORY_DELAY_MS);
           deferServerTask('POST AUTH ADMIN STATE', () => emitAdminState(socket), socket.isAdmin === true ? POST_AUTH_ADMIN_STATE_DELAY_MS : 120);
           deferServerTask('POST AUTH ONLINE LIST', () => emitOnlineList(), POST_AUTH_ONLINE_LIST_DELAY_MS);
         } else {
@@ -3970,6 +4019,8 @@ io.on('connection', (socket) => {
         socket.role = getUserRole(name, userDatabase[name]);
         socket.profileSyncV2 = supportsProfileSyncV2;
         socket.profileSyncAckV1 = supportsProfileSyncAckV1;
+        socket.chatHistoryAckV1 = supportsChatHistoryAckV1;
+        socket.chatHistoryPullV1 = supportsChatHistoryPullV1;
         normalizeProfileArrayPayloads(userDatabase[name]);
         userCacheMeta[name] = Date.now();
         fullUserCacheNames.delete(name);
@@ -4004,7 +4055,7 @@ io.on('connection', (socket) => {
         compactCachedUser(name);
 
         socket.emit('pinned_list', pinnedMessages);
-        deferServerTask('POST AUTH CHAT HISTORY', () => emitChatHistoryToSocket(socket), POST_AUTH_CHAT_HISTORY_DELAY_MS);
+        if (!supportsChatHistoryPullV1) deferServerTask('POST AUTH CHAT HISTORY', () => emitChatHistoryToSocket(socket), POST_AUTH_CHAT_HISTORY_DELAY_MS);
         deferServerTask('POST AUTH ADMIN STATE', () => emitAdminState(socket), socket.isAdmin === true ? POST_AUTH_ADMIN_STATE_DELAY_MS : 120);
         deferServerTask('POST AUTH ONLINE LIST', () => emitOnlineList(), POST_AUTH_ONLINE_LIST_DELAY_MS);
       }
@@ -4346,11 +4397,14 @@ io.on('connection', (socket) => {
   socket.on('request_chat_history', async () => {
     try {
       if (!socket.userName) return;
+      if (socket.__chatHistoryRequestInFlight) return socket.__chatHistoryRequestInFlight;
       const now = Date.now();
       if (socket.__lastChatHistoryRequestAt && now - socket.__lastChatHistoryRequestAt < 900) return;
       socket.__lastChatHistoryRequestAt = now;
-      await emitChatHistoryToSocket(socket);
+      socket.__chatHistoryRequestInFlight = emitChatHistoryToSocket(socket).finally(() => { socket.__chatHistoryRequestInFlight = null; });
+      await socket.__chatHistoryRequestInFlight;
     } catch (err) {
+      socket.__chatHistoryRequestInFlight = null;
       console.error('[REQUEST CHAT HISTORY ERROR]:', err);
     }
   });
