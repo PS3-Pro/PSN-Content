@@ -19692,6 +19692,9 @@ P
 		}
 	}
     
+   const IGDB_CLIENT_ID = 'vwqel850270bn3woyontsoyqbc5v78';
+   const IGDB_CLIENT_SECRET = '75o86v0w2nf5ifutimju0oc6bp20qy';
+
    const RAWG_KEYS = [
 		'666e45b739d5401f84ea3595f64f6b0d',
 		'092c6f79440d4fdfb1eaae48983e6210',
@@ -19776,6 +19779,161 @@ P
 		scheduleModalSummaryAlignment();
 	}
 	
+
+
+	const normalizeMetadataMatchTitle = (value) => {
+		let text = String(value || '');
+		try { text = text.normalize('NFKD').replace(/[\u0300-\u036f]/g, ''); } catch (error) {}
+		const romanMap = { ii: '2', iii: '3', iv: '4', v: '5', vi: '6', vii: '7', viii: '8', ix: '9', x: '10' };
+		return text
+			.replace(/[™®©]/g, ' ')
+			.replace(/&/g, ' and ')
+			.replace(/[’']/g, '')
+			.toLowerCase()
+			.replace(/\bgame of the year\b/g, ' goty ')
+			.replace(/[^a-z0-9]+/g, ' ')
+			.replace(/\s+/g, ' ')
+			.trim()
+			.split(' ')
+			.map(token => romanMap[token] || token)
+			.join(' ');
+	};
+
+	const cleanMetadataCatalogTitle = (value) => {
+		let text = String(value || '').trim();
+		const trailingTags = /\s*\((?:trial(?: to full)?|demo|psx|ps1|ps2(?: classics?| classic)?|ps3|psp|mini(?:s)?|version[^)]*|download ver\.?|full game|russian[^)]*|uk english|english|french|german|italian|spanish|polish|japanese|korean|chinese|taiwanese)[^)]*\)\s*$/i;
+		for (let pass = 0; pass < 4; pass++) {
+			const next = text.replace(trailingTags, '').trim();
+			if (next === text) break;
+			text = next;
+		}
+		text = text.replace(/\s+PlayStation\s*3\s+the\s+Best\s*$/i, '').trim();
+		return text;
+	};
+	const getMetadataPlatformHint = (value) => {
+		const raw = String(value || '').toLowerCase();
+		if (/\(psx\)|\(ps1\)|playstation\s*1/.test(raw)) return ['playstation', 'playstation 1', 'ps1'];
+		if (/\(ps2(?: classics?| classic)?\)|playstation\s*2/.test(raw)) return ['playstation 2', 'ps2'];
+		if (/\(psp\)|playstation portable/.test(raw)) return ['playstation portable', 'psp'];
+		return ['playstation 3', 'ps3'];
+	};
+
+	const metadataBundleEditionSuffixes = [
+		'digital deluxe edition', 'deluxe edition', 'complete edition', 'gold edition', 'game of the year edition',
+		'goty edition', 'goty', 'ultimate evil edition', 'ultimate edition', 'premium edition', 'limited edition',
+		'collectors edition', 'collector edition', 'all in one edition', 'templar edition', 'legion edition',
+		'victory edition', 'digital edition', 'the ultimate box', 'the complete tale', 'complete collection'
+	];
+	const metadataVariantEditionSuffixes = [
+		'hd edition', 'hd remaster', 'remastered', 'remaster', 'bfg edition', 'megaton edition', 'arcade edition',
+		'online edition', 'playstation 3 edition', 'playstation3 edition', 'move edition', 'anniversary edition',
+		'anniversary', 'directors cut', 'extended edition', 'special edition', 'alternative edition', 'addition edition',
+		'giant edition', 'multiplayer edition', 'home run derby edition', 'hd version', 'hd ver', 'hd remix', 'on fire edition',
+		'championship edition', 'trial edition', 'final edition', 'grand edition', 'party edition', 'converted edition', 'collected edition', 'hd'
+	];
+	const getMetadataEditionPolicy = (value) => {
+		const normalized = normalizeMetadataMatchTitle(cleanMetadataCatalogTitle(value));
+		if (!normalized) return { kind: 'none', normalized: '', baseTitle: '', suffix: '' };
+		for (const suffix of metadataVariantEditionSuffixes) {
+			if (normalized.endsWith(` ${suffix}`)) return { kind: 'variant', normalized, baseTitle: '', suffix };
+		}
+		const numberedAnniversary = normalized.match(/^(.*)\s+\d+\s+anniversary(?:\s+edition)?$/);
+		if (numberedAnniversary) return { kind: 'variant', normalized, baseTitle: '', suffix: 'numbered anniversary' };
+		for (const suffix of metadataBundleEditionSuffixes) {
+			if (!normalized.endsWith(` ${suffix}`)) continue;
+			const baseTitle = normalized.slice(0, -(suffix.length + 1)).trim();
+			if (baseTitle) return { kind: 'bundle', normalized, baseTitle, suffix };
+		}
+		return { kind: 'none', normalized, baseTitle: '', suffix: '' };
+	};
+
+	const metadataStopWords = new Set(['the', 'a', 'an', 'of', 'and', 'for', 'to', 'in', 'on', 'with', 'edition']);
+	const getMetadataMatchTokens = (value) => normalizeMetadataMatchTitle(value).split(' ').filter(token => token && !metadataStopWords.has(token));
+	const getMetadataNumberTokens = (tokens) => tokens.filter(token => /\d/.test(token));
+	const getMetadataCandidatePlatforms = (candidate = {}) => {
+		const direct = Array.isArray(candidate.platforms) ? candidate.platforms : [];
+		return direct.map(item => {
+			if (typeof item === 'string') return item;
+			if (item && item.platform && item.platform.name) return item.platform.name;
+			return item && item.name ? item.name : '';
+		}).map(value => normalizeMetadataMatchTitle(value)).filter(Boolean);
+	};
+	const scoreMetadataCandidate = (targetTitle, candidate = {}, releaseYear = '', platformHint = ['playstation 3', 'ps3']) => {
+		const target = normalizeMetadataMatchTitle(cleanMetadataCatalogTitle(targetTitle));
+		const candidateName = normalizeMetadataMatchTitle(candidate.name || '');
+		if (!target || !candidateName) return 0;
+		let score = 0;
+		if (target === candidateName) {
+			score = 100;
+		} else {
+			const targetTokens = getMetadataMatchTokens(target);
+			const candidateTokens = getMetadataMatchTokens(candidateName);
+			const targetSet = new Set(targetTokens);
+			const candidateSet = new Set(candidateTokens);
+			const shared = [...targetSet].filter(token => candidateSet.has(token)).length;
+			if (targetSet.size && candidateSet.size) {
+				const targetCoverage = shared / targetSet.size;
+				const candidateCoverage = shared / candidateSet.size;
+				score = Math.round(((targetCoverage * 0.62) + (candidateCoverage * 0.38)) * 74);
+				if (targetCoverage === 1) score = Math.max(score, 82);
+				if (candidateCoverage === 1) score = Math.max(score, 66);
+			}
+			if (target.includes(candidateName) || candidateName.includes(target)) score = Math.max(score, 66);
+			if (targetTokens.length >= 2 && candidateTokens.length >= 2 && targetTokens[0] === candidateTokens[0] && targetTokens[1] === candidateTokens[1]) score += 6;
+
+			const targetNumbers = getMetadataNumberTokens(targetTokens);
+			const candidateNumbers = getMetadataNumberTokens(candidateTokens);
+			if (targetNumbers.length && candidateNumbers.length) {
+				const sharedNumbers = targetNumbers.filter(token => candidateNumbers.includes(token));
+				if (!sharedNumbers.length) score -= 45;
+				else if (new Set([...targetNumbers, ...candidateNumbers]).size > new Set(sharedNumbers).size) score -= 18;
+			}
+		}
+
+		const targetPolicy = getMetadataEditionPolicy(targetTitle);
+		const candidatePolicy = getMetadataEditionPolicy(candidate.name || '');
+		if (targetPolicy.kind === 'bundle' && candidatePolicy.kind === 'none' && targetPolicy.baseTitle === candidateName) score = Math.min(score, 74);
+		if (targetPolicy.kind === 'variant' && candidatePolicy.kind === 'none') score = Math.min(score, 64);
+		if (targetPolicy.kind === 'variant' && candidatePolicy.kind === 'variant' && targetPolicy.suffix && candidatePolicy.suffix && targetPolicy.suffix !== candidatePolicy.suffix) score -= 18;
+
+		const expectedYear = Number.parseInt(releaseYear, 10);
+		const candidateYearMatch = String(candidate.released || candidate.releaseDate || '').match(/\b(19|20)\d{2}\b/);
+		const candidateYear = candidateYearMatch ? Number.parseInt(candidateYearMatch[0], 10) : NaN;
+		if (Number.isFinite(expectedYear) && Number.isFinite(candidateYear)) {
+			const diff = Math.abs(expectedYear - candidateYear);
+			if (diff === 0) score += 6;
+			else if (diff === 1) score += 3;
+			else if (diff >= 5) score -= 10;
+			else if (diff >= 2) score -= 4;
+		}
+
+		const platforms = getMetadataCandidatePlatforms(candidate);
+		if (platforms.length) {
+			const hints = (Array.isArray(platformHint) ? platformHint : [platformHint]).map(value => normalizeMetadataMatchTitle(value)).filter(Boolean);
+			const hasExpectedPlatform = platforms.some(platform => hints.some(hint => platform === hint || platform.includes(hint) || hint.includes(platform)));
+			if (hasExpectedPlatform) score += 8;
+			else if (candidate.source === 'igdb') score -= 6;
+		}
+		return Math.max(0, Math.min(100, Math.round(score)));
+	};
+	const pickMetadataCandidate = (results, targetTitle, minScore, releaseYear, platformHint) => {
+		let best = null;
+		let bestScore = -1;
+		(Array.isArray(results) ? results : []).forEach(candidate => {
+			const score = scoreMetadataCandidate(targetTitle, candidate, releaseYear, platformHint);
+			if (score > bestScore) { best = candidate; bestScore = score; }
+		});
+		return { candidate: bestScore >= minScore ? best : null, best, score: bestScore };
+	};
+	const getMetadataServerBase = () => {
+		try {
+			if (typeof socketChat !== 'undefined' && socketChat && socketChat.io && socketChat.io.uri) return String(socketChat.io.uri).replace(/\/+$/, '');
+		} catch (error) {}
+		try {
+			if (typeof serverUrls !== 'undefined' && Array.isArray(serverUrls) && serverUrls.length) return String(serverUrls[Math.max(0, Number(currentServerIndex || 0))] || serverUrls[0]).replace(/\/+$/, '');
+		} catch (error) {}
+		return 'https://psn-content-escw.onrender.com';
+	};
 	window.fetchGameSummary = async function(gameName, gameId, contentId = '', region = '') {
 		const summaryContainer = document.getElementById('modal-summary');
 		const screenshotsWrapper = document.getElementById('modal-screenshots-wrapper');
@@ -19790,8 +19948,8 @@ P
 		const getImportantModeTags = (detailsData = {}) => {
 			const rawTags = getRawgNames(detailsData.tags || [], 80);
 			const modeMap = [
-				{ match: ['singleplayer', 'single player'], label: 'Single Player', icon: 'fa-user' },
-				{ match: ['multiplayer'], label: 'Multiplayer', icon: 'fa-users' },
+				{ match: ['singleplayer', 'single player', 'single-player'], label: 'Single Player', icon: 'fa-user' },
+				{ match: ['multiplayer', 'multi-player'], label: 'Multiplayer', icon: 'fa-users' },
 				{ match: ['co-op', 'coop', 'cooperative'], label: 'Co-op', icon: 'fa-handshake' },
 				{ match: ['split screen', 'splitscreen'], label: 'Split Screen', icon: 'fa-table-columns' },
 				{ match: ['pvp'], label: 'PvP', icon: 'fa-bolt' }
@@ -19911,21 +20069,20 @@ P
 			`;
 		}
 		
-		const fetchWithTimeout = async (url, ms = 3500) => {
+		const fetchWithTimeout = async (url, ms = 3500, options = {}) => {
 			const controller = new AbortController();
 			const id = setTimeout(() => controller.abort(), ms);
-			try {
-				return await fetch(url, { signal: controller.signal });
-			} finally {
-				clearTimeout(id);
-			}
+			try { return await fetch(url, { ...options, signal: controller.signal }); }
+			finally { clearTimeout(id); }
 		};
-
+		const fetchMetadataProxy = async (path, ms = 6000, options = {}) => {
+			const base = getMetadataServerBase();
+			return fetchWithTimeout(`${base}${path}`, ms, options);
+		};
 		const rotateRawgKey = () => {
 			currentRawgKeyIndex = (currentRawgKeyIndex + 1) % RAWG_KEYS.length;
 			safeLocalStorageSet('rawg_key_index', currentRawgKeyIndex);
 		};
-
 		const getRawgFailureAction = (response) => {
 			if (!response || response.ok) return 'ok';
 			const status = Number(response.status || 0);
@@ -19935,9 +20092,11 @@ P
 		};
 
 		const scrContainer = document.getElementById('modal-screenshots');
-		let baseName = gameName.split(/[-:]/)[0].trim();
-		
-		const searchQueries = [...new Set([gameName, baseName, gameId])].filter(q => q);
+		const metadataLookupTitle = cleanMetadataCatalogTitle(gameName) || gameName;
+		const metadataPlatformHint = getMetadataPlatformHint(gameName);
+		const editionPolicy = getMetadataEditionPolicy(metadataLookupTitle);
+		const metadataSearchSpecs = [{ query: metadataLookupTitle, target: metadataLookupTitle, minScore: 80, kind: 'full-title' }];
+		if (editionPolicy.kind === 'bundle' && editionPolicy.baseTitle) metadataSearchSpecs.push({ query: editionPolicy.baseTitle, target: editionPolicy.baseTitle, minScore: 86, kind: 'bundle-base' });
 		let summaryTitleHtml = '<span style="font-size: 10px; color: var(--text-muted); font-weight: bold; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px; display: block;"><i class="fas fa-align-left" style="margin-right: 4px;"></i> Summary</span>';
 		let psnStoreSummary = '';
 		let psnStoreMeta = { provider: '', releaseDate: '', releaseYear: '' };
@@ -19949,146 +20108,191 @@ P
 			hasPsnStoreMeta = renderPsnStoreExtraMeta(psnStoreData);
 			if (psnStoreSummary) summaryContainer.innerHTML = summaryTitleHtml + modalSafeText(psnStoreSummary).replace(/\n/g, '<br>');
 		} catch (error) {}
-	
+
+		let externalMetadataResolved = false;
+		let screenshotsResolved = false;
+		const renderExternalScreenshots = (imageUrls = []) => {
+			const images = Array.from(new Set((Array.isArray(imageUrls) ? imageUrls : []).map(url => String(url || '').trim()).filter(Boolean))).slice(0, 8);
+			if (!scrContainer || !images.length) return false;
+			screenshotsResolved = true;
+			if (modalRoot) setGameModalNoScreenshots(modalRoot, false);
+			if (screenshotsWrapper) screenshotsWrapper.style.display = 'flex';
+			scrContainer.innerHTML = images.map((url, index) => `<img src="${modalSafeText(url)}" class="screenshot-item" onmouseenter="if(typeof playUiHover === 'function') playUiHover()" onclick="openImageModal(${index}, ${JSON.stringify(images).replace(/"/g, '&quot;')})">`).join('');
+			return true;
+		};
+
+		const renderExternalMetadata = (detailsData = {}, imageUrls = [], options = {}) => {
+			const renderedScreenshots = renderExternalScreenshots(imageUrls);
+			if (options.metadata === false) return renderedScreenshots;
+			externalMetadataResolved = true;
+			const displayDetailsData = { ...detailsData };
+			if (!getRawgNames(displayDetailsData.developers || [], 1).length && !getRawgNames(displayDetailsData.publishers || [], 1).length && psnStoreMeta.provider) displayDetailsData.publishers = [{ name: psnStoreMeta.provider }];
+			if (!displayDetailsData.released && psnStoreMeta.releaseDate) displayDetailsData.released = psnStoreMeta.releaseDate;
+
+			let badgeHtml = '';
+			if (Number(detailsData.metacritic) > 0) {
+				const score = Math.round(Number(detailsData.metacritic));
+				const color = score >= 75 ? '#4caf50' : (score >= 50 ? '#ffa500' : '#ff4444');
+				badgeHtml += `<span class="rawg-chip rawg-chip-score" style="border:1px solid ${color}; color:${color};"><i class="fas fa-star"></i>${score}</span>`;
+			}
+			if (displayDetailsData.released) {
+				const yearMatch = String(displayDetailsData.released).match(/\b(19|20)\d{2}\b/);
+				if (yearMatch) badgeHtml += `<span class="rawg-chip rawg-chip-year"><i class="far fa-calendar-alt"></i>${modalSafeText(yearMatch[0])}</span>`;
+			}
+			renderRawgExtraMeta(displayDetailsData, badgeHtml);
+
+			let finalDesc = String(detailsData.description_raw || detailsData.description || '').trim();
+			if (finalDesc) finalDesc = modalSafeText(finalDesc).replace(/\n+/g, '<br><br>');
+			else finalDesc = 'No description available.';
+			if (!psnStoreSummary) summaryContainer.innerHTML = summaryTitleHtml + finalDesc;
+			return renderedScreenshots;
+		};
+
 		rawgSearchLoop:
-		for (let query of searchQueries) {
+		for (const searchSpec of metadataSearchSpecs) {
 			for (let attempt = 0; attempt < RAWG_KEYS.length; attempt++) {
 				const activeKey = RAWG_KEYS[currentRawgKeyIndex];
 				try {
-					const searchRes = await fetchWithTimeout(`https://api.rawg.io/api/games?key=${activeKey}&search=${encodeURIComponent(query)}&page_size=1`, 4000);
+					const searchRes = await fetchWithTimeout(`https://api.rawg.io/api/games?key=${activeKey}&search=${encodeURIComponent(searchSpec.query)}&page_size=5`, 4000);
 					const searchAction = getRawgFailureAction(searchRes);
-
-					if (searchAction === 'rotate-key') {
-						rotateRawgKey();
-						continue;
-					}
-					if (searchAction === 'skip-rawg') break rawgSearchLoop;
+					if (searchAction === 'rotate-key') { console.warn(`[Metadata] RAWG request returned HTTP ${searchRes.status}; rotating API key.`); rotateRawgKey(); continue; }
+					if (searchAction === 'skip-rawg') { console.warn(`[Metadata] RAWG is temporarily unavailable (HTTP ${searchRes.status}). Falling back.`); break rawgSearchLoop; }
 					if (searchAction === 'skip-query') break;
-
 					const searchData = await searchRes.json();
-					if (searchData.error) {
-						rotateRawgKey();
-						continue;
-					}
-
-					if (!searchData.results || searchData.results.length === 0) break;
-
-					const slug = searchData.results[0].slug;
-					const safeRawgFetch = (url, timeout) => fetchWithTimeout(url, timeout)
-						.then(response => ({ response }))
-						.catch(error => ({ error }));
+					if (searchData.error) { console.warn('[Metadata] RAWG returned an API error; rotating API key.'); rotateRawgKey(); continue; }
+					if (!Array.isArray(searchData.results) || !searchData.results.length) break;
+					const match = pickMetadataCandidate(searchData.results, searchSpec.target, searchSpec.minScore, psnStoreMeta.releaseYear, metadataPlatformHint);
+					if (!match.candidate) { console.warn(`[Metadata] RAWG rejected low-confidence ${searchSpec.kind} match for "${gameName}" (closest: "${match.best?.name || 'none'}", score ${match.score}/${searchSpec.minScore}).`); break; }
+					const slug = match.candidate.slug;
+					if (!slug) break;
+					console.debug(`[Metadata] RAWG ${searchSpec.kind} match accepted for "${gameName}": "${match.candidate.name}" (${match.score}/100).`);
+					const safeRawgFetch = (url, timeout) => fetchWithTimeout(url, timeout).then(response => ({ response })).catch(error => ({ error }));
 					const [detailsResult, screensResult] = await Promise.all([
 						safeRawgFetch(`https://api.rawg.io/api/games/${slug}?key=${activeKey}`, 3500),
 						safeRawgFetch(`https://api.rawg.io/api/games/${slug}/screenshots?key=${activeKey}`, 3500)
 					]);
-
 					if (detailsResult.error) break rawgSearchLoop;
-
-					const detailsRes = detailsResult.response;
-					const detailsAction = getRawgFailureAction(detailsRes);
-					if (detailsAction === 'rotate-key') {
-						rotateRawgKey();
-						continue;
-					}
+					const detailsAction = getRawgFailureAction(detailsResult.response);
+					if (detailsAction === 'rotate-key') { rotateRawgKey(); continue; }
 					if (detailsAction === 'skip-rawg') break rawgSearchLoop;
 					if (detailsAction === 'skip-query') break;
-
-					const detailsData = await detailsRes.json();
-					let screensData = {};
+					const detailsData = await detailsResult.response.json();
+					let screenshots = [];
 					if (!screensResult.error && screensResult.response && screensResult.response.ok) {
-						try { screensData = await screensResult.response.json(); } catch (error) {}
+						try { const data = await screensResult.response.json(); screenshots = (data.results || []).map(item => item && item.image).filter(Boolean); } catch (error) {}
 					}
-					const displayDetailsData = { ...detailsData };
-					if (!getRawgNames(displayDetailsData.developers || [], 1).length && !getRawgNames(displayDetailsData.publishers || [], 1).length && psnStoreMeta.provider) {
-						displayDetailsData.publishers = [{ name: psnStoreMeta.provider }];
-					}
-					if (!displayDetailsData.released && psnStoreMeta.releaseDate) displayDetailsData.released = psnStoreMeta.releaseDate;
-
-					if (scrContainer) {
-						if (screensData.results?.length > 0) {
-							if (modalRoot) setGameModalNoScreenshots(modalRoot, false);
-							if (screenshotsWrapper) screenshotsWrapper.style.display = 'flex';
-							const gameImages = screensData.results.slice(0, 8).map(img => img.image);
-							scrContainer.innerHTML = gameImages.map((url, index) =>
-								`<img src="${url}" class="screenshot-item" onmouseenter="if(typeof playUiHover === 'function') playUiHover()" onclick="openImageModal(${index}, ${JSON.stringify(gameImages).replace(/"/g, '&quot;')})">`
-							).join('');
-						} else if (screenshotsWrapper) {
-							screenshotsWrapper.style.display = 'none';
-							if (modalRoot) setGameModalNoScreenshots(modalRoot, true);
-						}
-					}
-
-					let bHtml = '';
-					if (detailsData.metacritic) {
-						let color = detailsData.metacritic >= 75 ? '#4caf50' : (detailsData.metacritic >= 50 ? '#ffa500' : '#ff4444');
-						bHtml += `<span class="rawg-chip rawg-chip-score" style="border:1px solid ${color}; color:${color};"><i class="fas fa-star"></i>${detailsData.metacritic}</span>`;
-					}
-					if (displayDetailsData.released) {
-						const year = String(displayDetailsData.released).split('-')[0];
-						bHtml += `<span class="rawg-chip rawg-chip-year"><i class="far fa-calendar-alt"></i>${modalSafeText(year)}</span>`;
-					}
-					renderRawgExtraMeta(displayDetailsData, bHtml);
-
-					let finalDesc = "No description available.";
-					if (detailsData.description_raw && detailsData.description_raw.trim() !== "") {
-						finalDesc = detailsData.description_raw.trim().replace(/\n+/g, '<br><br>');
-					} else if (detailsData.description && detailsData.description.trim() !== "") {
-						finalDesc = detailsData.description.trim();
-					}
-
-					if (!psnStoreSummary) summaryContainer.innerHTML = summaryTitleHtml + finalDesc;
-					if (modalRoot && modalRoot.classList.contains('modal-no-screenshots')) scheduleModalSummaryAlignment();
-					return;
+					const hasRawgScreenshots = renderExternalMetadata(detailsData, screenshots);
+					if (hasRawgScreenshots) return;
+					console.debug(`[Metadata] RAWG metadata accepted for "${gameName}", but no screenshots were returned. Trying IGDB screenshots.`);
+					break rawgSearchLoop;
 				} catch (error) {
+					console.warn(`[Metadata] RAWG network failure for "${gameName}". Falling back.`);
 					break rawgSearchLoop;
 				}
 			}
 		}
 
-		try {
-			const wikiSearch = await fetch(`https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(baseName + " video game")}&format=json&origin=*`);
-			const wikiData = await wikiSearch.json();
-			if (wikiData.query?.search.length > 0) {
-				const pageId = wikiData.query.search[0].pageid;
-				const details = await fetch(`https://en.wikipedia.org/w/api.php?action=query&prop=extracts|pageimages&exintro=1&explaintext=1&piprop=thumbnail&pithumbsize=1000&pageids=${pageId}&format=json&origin=*`);
-				const detailsData = await details.json();
-				const page = detailsData.query.pages[pageId];
-	
-				if (page && page.extract) {
-					if (!psnStoreSummary) summaryContainer.innerHTML = summaryTitleHtml + page.extract.trim().replace(/\n+/g, '<br><br>');
-					
-					if (badgesContainer.querySelector('.pulse-skeleton')) {
-						const yearMatch = page.extract.match(/\b(19|20)\d{2}\b/);
-						badgesContainer.classList.remove('rawg-badge-row');
-						badgesContainer.innerHTML = yearMatch ? `<span style="background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); color:#ccc; padding:3px 8px; border-radius:4px; font-size:11px; font-weight:bold;"><i class="far fa-calendar-alt"></i> ${yearMatch[0]}</span>` : '';
-					}
-					
-					if (page.thumbnail) {
-						if (modalRoot) setGameModalNoScreenshots(modalRoot, false);
-						if (screenshotsWrapper) screenshotsWrapper.style.display = 'flex';
-						if (scrContainer.querySelector('.pulse-skeleton') || !scrContainer.innerHTML.trim()) {
-							scrContainer.innerHTML = `<img src="${page.thumbnail.source}" class="screenshot-item" onclick="openImageModal(this.src)">`;
-						}
-					} else if (screenshotsWrapper) {
-						screenshotsWrapper.style.display = 'none';
-						if (modalRoot) setGameModalNoScreenshots(modalRoot, true);
-					}
-					if (modalRoot && modalRoot.classList.contains('modal-no-screenshots')) scheduleModalSummaryAlignment();
-					return;
+		igdbSearchLoop:
+		for (const searchSpec of metadataSearchSpecs) {
+			try {
+				const igdbHeaders = {};
+				if (IGDB_CLIENT_ID && IGDB_CLIENT_SECRET) {
+					igdbHeaders['X-IGDB-Client-ID'] = IGDB_CLIENT_ID;
+					igdbHeaders['X-IGDB-Client-Secret'] = IGDB_CLIENT_SECRET;
 				}
+				const response = await fetchMetadataProxy(`/api/metadata/igdb?q=${encodeURIComponent(searchSpec.query)}`, 7000, { headers: igdbHeaders });
+				let data = {};
+				try { data = await response.json(); } catch (error) {}
+				if (response.status === 503 && data.configured === false) {
+					if (!window.__igdbConfigWarningShown) { window.__igdbConfigWarningShown = true; console.info('[Metadata] IGDB fallback is ready but disabled until IGDB_CLIENT_ID and IGDB_CLIENT_SECRET are filled in the HTML or configured on the server.'); }
+					break igdbSearchLoop;
+				}
+				if (!response.ok || !Array.isArray(data.results)) {
+					if (response.status === 429) console.warn('[Metadata] IGDB rate limit reached. Falling back to Steam.');
+					break igdbSearchLoop;
+				}
+				const match = pickMetadataCandidate(data.results, searchSpec.target, searchSpec.minScore, psnStoreMeta.releaseYear, metadataPlatformHint);
+				if (!match.candidate) { console.warn(`[Metadata] IGDB rejected low-confidence ${searchSpec.kind} match for "${gameName}" (closest: "${match.best?.name || 'none'}", score ${match.score}/${searchSpec.minScore}).`); continue; }
+				console.debug(`[Metadata] IGDB ${searchSpec.kind} match accepted for "${gameName}": "${match.candidate.name}" (${match.score}/100).`);
+				const hasIgdbScreenshots = externalMetadataResolved
+					? renderExternalMetadata(match.candidate, match.candidate.screenshots || [], { metadata: false })
+					: renderExternalMetadata(match.candidate, match.candidate.screenshots || []);
+				if (hasIgdbScreenshots) return;
+				console.debug(`[Metadata] IGDB match for "${gameName}" had no screenshots. Trying the next screenshot fallback.`);
+			} catch (error) {
+				console.warn('[Metadata] IGDB proxy unavailable. Falling back to Steam.');
+				break igdbSearchLoop;
 			}
-		} catch (e) {}
+		}
 
-		if (!psnStoreSummary) summaryContainer.innerHTML = summaryTitleHtml + "No description available.";
-		if (modalRoot && modalRoot.classList.contains('modal-no-screenshots')) scheduleModalSummaryAlignment();
-		if (badgesContainer && !hasPsnStoreMeta) { badgesContainer.innerHTML = ''; badgesContainer.classList.remove('rawg-badge-row'); }
-		if (extraMetaContainer) extraMetaContainer.innerHTML = '';
-		if (screenshotsWrapper) {
+		steamSearchLoop:
+		for (const searchSpec of metadataSearchSpecs) {
+			try {
+				const response = await fetchMetadataProxy(`/api/metadata/steam/search?q=${encodeURIComponent(searchSpec.query)}`, 6500);
+				let data = {};
+				try { data = await response.json(); } catch (error) {}
+				if (!response.ok || !Array.isArray(data.results)) {
+					if (response.status === 429) console.warn('[Metadata] Steam rate limit reached. Falling back to Wikipedia.');
+					break steamSearchLoop;
+				}
+				const match = pickMetadataCandidate(data.results, searchSpec.target, searchSpec.minScore, psnStoreMeta.releaseYear, metadataPlatformHint);
+				if (!match.candidate) { console.warn(`[Metadata] Steam rejected low-confidence ${searchSpec.kind} match for "${gameName}" (closest: "${match.best?.name || 'none'}", score ${match.score}/${searchSpec.minScore}).`); continue; }
+				const detailsResponse = await fetchMetadataProxy(`/api/metadata/steam/details?appid=${encodeURIComponent(match.candidate.id)}`, 6500);
+				let detailsPayload = {};
+				try { detailsPayload = await detailsResponse.json(); } catch (error) {}
+				if (!detailsResponse.ok || !detailsPayload.details) continue;
+				const verifiedScore = scoreMetadataCandidate(searchSpec.target, detailsPayload.details, psnStoreMeta.releaseYear, metadataPlatformHint);
+				if (verifiedScore < searchSpec.minScore) { console.warn(`[Metadata] Steam details no longer meet confidence threshold for "${gameName}" (${verifiedScore}/${searchSpec.minScore}).`); continue; }
+				console.debug(`[Metadata] Steam ${searchSpec.kind} match accepted for "${gameName}": "${detailsPayload.details.name}" (${verifiedScore}/100).`);
+				const hasSteamScreenshots = externalMetadataResolved
+					? renderExternalMetadata(detailsPayload.details, detailsPayload.details.screenshots || [], { metadata: false })
+					: renderExternalMetadata(detailsPayload.details, detailsPayload.details.screenshots || []);
+				if (hasSteamScreenshots) return;
+				console.debug(`[Metadata] Steam match for "${gameName}" had no screenshots.`);
+			} catch (error) {
+				console.warn('[Metadata] Steam fallback unavailable. Falling back to Wikipedia.');
+				break steamSearchLoop;
+			}
+		}
+
+		if (!externalMetadataResolved) {
+			try {
+				let wikiBest = null;
+				let wikiBestScore = -1;
+				for (const searchSpec of metadataSearchSpecs) {
+					const wikiSearch = await fetchWithTimeout(`https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(searchSpec.query + ' video game')}&srlimit=5&format=json&origin=*`, 4500);
+					const wikiData = await wikiSearch.json();
+					const candidates = (wikiData.query?.search || []).map(item => ({ id: item.pageid, name: item.title, released: '', source: 'wikipedia' }));
+					const match = pickMetadataCandidate(candidates, searchSpec.target, Math.max(72, searchSpec.minScore - 8), psnStoreMeta.releaseYear, metadataPlatformHint);
+					if (match.candidate && match.score > wikiBestScore) { wikiBest = match.candidate; wikiBestScore = match.score; }
+				}
+				if (wikiBest) {
+					const details = await fetchWithTimeout(`https://en.wikipedia.org/w/api.php?action=query&prop=extracts&exintro=1&explaintext=1&pageids=${wikiBest.id}&format=json&origin=*`, 4500);
+					const detailsData = await details.json();
+					const page = detailsData.query?.pages?.[wikiBest.id];
+					if (page && page.extract) {
+						externalMetadataResolved = true;
+						if (!psnStoreSummary) summaryContainer.innerHTML = summaryTitleHtml + modalSafeText(page.extract.trim()).replace(/\n+/g, '<br><br>');
+						if (badgesContainer.querySelector('.pulse-skeleton')) {
+							const yearMatch = page.extract.match(/\b(19|20)\d{2}\b/);
+							badgesContainer.classList.remove('rawg-badge-row');
+							badgesContainer.innerHTML = yearMatch ? `<span style="background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); color:#ccc; padding:3px 8px; border-radius:4px; font-size:11px; font-weight:bold;"><i class="far fa-calendar-alt"></i> ${yearMatch[0]}</span>` : '';
+						}
+					}
+				}
+			} catch (error) {}
+		}
+
+		if (!psnStoreSummary && !externalMetadataResolved) summaryContainer.innerHTML = summaryTitleHtml + 'No description available.';
+		if (badgesContainer && !hasPsnStoreMeta && !externalMetadataResolved) { badgesContainer.innerHTML = ''; badgesContainer.classList.remove('rawg-badge-row'); }
+		if (extraMetaContainer && !externalMetadataResolved) extraMetaContainer.innerHTML = '';
+		if (!screenshotsResolved && screenshotsWrapper) {
 			screenshotsWrapper.style.display = 'none';
 			if (modalRoot) setGameModalNoScreenshots(modalRoot, true);
 		}
+		if (modalRoot && modalRoot.classList.contains('modal-no-screenshots')) scheduleModalSummaryAlignment();
 	};
-	
+
 	window.addEventListener('resize', scheduleModalSummaryAlignment);
 	window.addEventListener('orientationchange', scheduleModalSummaryAlignment);
 

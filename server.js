@@ -281,6 +281,300 @@ app.get('/ping', (req, res) => {
   res.send('Server is Awake!');
 });
 
+
+const DEFAULT_IGDB_CLIENT_ID = String(process.env.IGDB_CLIENT_ID || process.env.TWITCH_CLIENT_ID || '').trim();
+const DEFAULT_IGDB_CLIENT_SECRET = String(process.env.IGDB_CLIENT_SECRET || process.env.TWITCH_CLIENT_SECRET || '').trim();
+const METADATA_PROXY_TIMEOUT_MS = Math.max(2500, parseInt(process.env.METADATA_PROXY_TIMEOUT_MS || '8000', 10) || 8000);
+const METADATA_PROXY_CACHE_MS = Math.max(60000, parseInt(process.env.METADATA_PROXY_CACHE_MS || '1800000', 10) || 1800000);
+const METADATA_PROXY_CACHE_MAX = Math.max(50, Math.min(1000, parseInt(process.env.METADATA_PROXY_CACHE_MAX || '300', 10) || 300));
+const metadataProxyCache = new Map();
+let igdbAccessToken = '';
+let igdbAccessTokenExpiresAt = 0;
+let igdbAccessTokenPromise = null;
+let igdbAccessTokenClientId = '';
+
+function setMetadataCors(res) {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-IGDB-Client-ID, X-IGDB-Client-Secret');
+  res.setHeader('Vary', 'Origin');
+}
+
+function getMetadataProxyCache(key) {
+  const entry = metadataProxyCache.get(key);
+  if (!entry) return null;
+  if (Date.now() - entry.at > METADATA_PROXY_CACHE_MS) {
+    metadataProxyCache.delete(key);
+    return null;
+  }
+  return entry.value;
+}
+
+function setMetadataProxyCache(key, value) {
+  metadataProxyCache.set(key, { at: Date.now(), value });
+  while (metadataProxyCache.size > METADATA_PROXY_CACHE_MAX) {
+    const oldestKey = metadataProxyCache.keys().next().value;
+    if (oldestKey === undefined) break;
+    metadataProxyCache.delete(oldestKey);
+  }
+}
+
+function requestMetadataJson(rawUrl, options = {}) {
+  return new Promise((resolve, reject) => {
+    let url;
+    try { url = rawUrl instanceof URL ? rawUrl : new URL(rawUrl); }
+    catch (err) { reject(err); return; }
+
+    const body = options.body === undefined || options.body === null ? null : Buffer.from(String(options.body), 'utf8');
+    const headers = { ...(options.headers || {}) };
+    if (body && !headers['Content-Length'] && !headers['content-length']) headers['Content-Length'] = String(body.length);
+    const requestOptions = {
+      protocol: url.protocol,
+      hostname: url.hostname,
+      port: url.port || undefined,
+      path: `${url.pathname}${url.search}`,
+      method: String(options.method || (body ? 'POST' : 'GET')).toUpperCase(),
+      headers
+    };
+
+    const client = url.protocol === 'http:' ? http : https;
+    const req = client.request(requestOptions, response => {
+      const chunks = [];
+      let bytes = 0;
+      response.on('data', chunk => {
+        bytes += chunk.length;
+        if (bytes <= 4 * 1024 * 1024) chunks.push(chunk);
+      });
+      response.on('end', () => {
+        const text = Buffer.concat(chunks).toString('utf8');
+        let data = null;
+        if (text) {
+          try { data = JSON.parse(text); }
+          catch (err) { data = null; }
+        }
+        resolve({
+          ok: Number(response.statusCode || 0) >= 200 && Number(response.statusCode || 0) < 300,
+          status: Number(response.statusCode || 0),
+          data,
+          text
+        });
+      });
+    });
+
+    req.setTimeout(Math.max(1000, Number(options.timeoutMs || METADATA_PROXY_TIMEOUT_MS)), () => {
+      req.destroy(new Error('Metadata upstream timeout.'));
+    });
+    req.on('error', reject);
+    if (body) req.write(body);
+    req.end();
+  });
+}
+
+async function getIgdbAccessToken(clientId = DEFAULT_IGDB_CLIENT_ID, clientSecret = DEFAULT_IGDB_CLIENT_SECRET, forceRefresh = false) {
+  clientId = String(clientId || '').trim();
+  clientSecret = String(clientSecret || '').trim();
+  if (!clientId || !clientSecret) {
+    const err = new Error('IGDB credentials are not configured.');
+    err.code = 'IGDB_NOT_CONFIGURED';
+    throw err;
+  }
+  const sameClient = igdbAccessTokenClientId === clientId;
+  if (!forceRefresh && sameClient && igdbAccessToken && Date.now() < igdbAccessTokenExpiresAt - 60000) return igdbAccessToken;
+  if (!forceRefresh && sameClient && igdbAccessTokenPromise) return igdbAccessTokenPromise;
+  if (!sameClient) {
+    igdbAccessToken = '';
+    igdbAccessTokenExpiresAt = 0;
+    igdbAccessTokenPromise = null;
+    igdbAccessTokenClientId = clientId;
+  }
+
+  igdbAccessTokenPromise = (async () => {
+    const tokenUrl = new URL('https://id.twitch.tv/oauth2/token');
+    tokenUrl.searchParams.set('client_id', clientId);
+    tokenUrl.searchParams.set('client_secret', clientSecret);
+    tokenUrl.searchParams.set('grant_type', 'client_credentials');
+    const response = await requestMetadataJson(tokenUrl, { method: 'POST' });
+    const token = String(response.data && response.data.access_token || '').trim();
+    if (!response.ok || !token) {
+      const err = new Error(`IGDB token request failed (HTTP ${response.status || 0}).`);
+      err.status = response.status || 502;
+      throw err;
+    }
+    const expiresIn = Math.max(300, Number(response.data && response.data.expires_in || 3600));
+    igdbAccessToken = token;
+    igdbAccessTokenExpiresAt = Date.now() + expiresIn * 1000;
+    return token;
+  })().finally(() => { igdbAccessTokenPromise = null; });
+
+  return igdbAccessTokenPromise;
+}
+
+function escapeIgdbSearchText(value) {
+  return String(value || '').replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/[\r\n]+/g, ' ').trim().slice(0, 180);
+}
+
+function igdbImageUrl(imageId, size = '720p') {
+  const id = String(imageId || '').trim();
+  return id ? `https://images.igdb.com/igdb/image/upload/t_${size}/${id}.jpg` : '';
+}
+
+function normalizeIgdbGame(game = {}) {
+  const companies = Array.isArray(game.involved_companies) ? game.involved_companies : [];
+  const companyNames = items => items.map(item => String(item && item.company && item.company.name || '').trim()).filter(Boolean);
+  const developers = companyNames(companies.filter(item => item && item.developer === true));
+  const publishers = companyNames(companies.filter(item => item && item.publisher === true));
+  const released = Number(game.first_release_date) > 0 ? new Date(Number(game.first_release_date) * 1000).toISOString().slice(0, 10) : '';
+  return {
+    id: game.id,
+    name: String(game.name || '').trim(),
+    released,
+    description_raw: String(game.summary || '').trim(),
+    metacritic: Number.isFinite(Number(game.aggregated_rating)) ? Math.round(Number(game.aggregated_rating)) : null,
+    developers: developers.map(name => ({ name })),
+    publishers: publishers.map(name => ({ name })),
+    genres: (Array.isArray(game.genres) ? game.genres : []).map(item => ({ name: String(item && item.name || '').trim() })).filter(item => item.name),
+    tags: (Array.isArray(game.game_modes) ? game.game_modes : []).map(item => ({ name: String(item && item.name || '').trim() })).filter(item => item.name),
+    platforms: (Array.isArray(game.platforms) ? game.platforms : []).map(item => String(item && item.name || '').trim()).filter(Boolean),
+    screenshots: (Array.isArray(game.screenshots) ? game.screenshots : []).map(item => igdbImageUrl(item && item.image_id, '720p')).filter(Boolean).slice(0, 8),
+    cover: igdbImageUrl(game.cover && game.cover.image_id, 'cover_big_2x'),
+    versionParent: game.version_parent || null,
+    versionTitle: String(game.version_title || '').trim(),
+    source: 'igdb'
+  };
+}
+
+async function queryIgdbGames(searchText, clientId = DEFAULT_IGDB_CLIENT_ID, clientSecret = DEFAULT_IGDB_CLIENT_SECRET, retryAuth = true) {
+  const token = await getIgdbAccessToken(clientId, clientSecret, false);
+  const safeSearch = escapeIgdbSearchText(searchText);
+  if (!safeSearch) return [];
+  const body = `search "${safeSearch}"; fields name,summary,first_release_date,aggregated_rating,genres.name,involved_companies.company.name,involved_companies.developer,involved_companies.publisher,platforms.name,game_modes.name,screenshots.image_id,cover.image_id,version_parent,version_title; limit 10;`;
+  const response = await requestMetadataJson('https://api.igdb.com/v4/games', {
+    method: 'POST',
+    headers: {
+      'Accept': 'application/json',
+      'Content-Type': 'text/plain',
+      'Client-ID': clientId,
+      'Authorization': `Bearer ${token}`
+    },
+    body
+  });
+  if (response.status === 401 && retryAuth) {
+    igdbAccessToken = '';
+    igdbAccessTokenExpiresAt = 0;
+    await getIgdbAccessToken(clientId, clientSecret, true);
+    return queryIgdbGames(searchText, clientId, clientSecret, false);
+  }
+  if (!response.ok || !Array.isArray(response.data)) {
+    const err = new Error(`IGDB search failed (HTTP ${response.status || 0}).`);
+    err.status = response.status || 502;
+    throw err;
+  }
+  return response.data.map(normalizeIgdbGame).filter(item => item.name);
+}
+
+function normalizeSteamDetails(appId, data = {}) {
+  const categories = (Array.isArray(data.categories) ? data.categories : []).map(item => String(item && item.description || '').trim()).filter(Boolean);
+  return {
+    id: String(appId || ''),
+    name: String(data.name || '').trim(),
+    released: String(data.release_date && data.release_date.date || '').trim(),
+    description_raw: String(data.short_description || data.detailed_description || '').replace(/<br\s*\/?\s*>/gi, '\n').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim(),
+    metacritic: Number.isFinite(Number(data.metacritic && data.metacritic.score)) ? Number(data.metacritic.score) : null,
+    developers: (Array.isArray(data.developers) ? data.developers : []).map(name => ({ name: String(name || '').trim() })).filter(item => item.name),
+    publishers: (Array.isArray(data.publishers) ? data.publishers : []).map(name => ({ name: String(name || '').trim() })).filter(item => item.name),
+    genres: (Array.isArray(data.genres) ? data.genres : []).map(item => ({ name: String(item && item.description || '').trim() })).filter(item => item.name),
+    tags: categories.map(name => ({ name })),
+    platforms: Object.keys(data.platforms || {}).filter(key => data.platforms[key] === true),
+    screenshots: (Array.isArray(data.screenshots) ? data.screenshots : []).map(item => String(item && (item.path_full || item.path_thumbnail) || '').trim()).filter(Boolean).slice(0, 8),
+    cover: String(data.header_image || '').trim(),
+    source: 'steam'
+  };
+}
+
+app.options('/api/metadata/igdb', (req, res) => { setMetadataCors(res); res.status(204).end(); });
+app.options('/api/metadata/steam/search', (req, res) => { setMetadataCors(res); res.status(204).end(); });
+app.options('/api/metadata/steam/details', (req, res) => { setMetadataCors(res); res.status(204).end(); });
+
+app.get('/api/metadata/igdb', async (req, res) => {
+  setMetadataCors(res);
+  const query = String(req.query && req.query.q || '').trim().slice(0, 180);
+  const clientId = String(req.get('x-igdb-client-id') || DEFAULT_IGDB_CLIENT_ID || '').trim().slice(0, 160);
+  const clientSecret = String(req.get('x-igdb-client-secret') || DEFAULT_IGDB_CLIENT_SECRET || '').trim().slice(0, 300);
+  if (!query) return res.status(400).json({ ok: false, provider: 'igdb', error: 'Missing q.' });
+  if (!clientId || !clientSecret) return res.status(503).json({ ok: false, provider: 'igdb', configured: false, error: 'IGDB credentials are not configured.' });
+  const cacheKey = `igdb:${query.toLowerCase()}`;
+  const cached = getMetadataProxyCache(cacheKey);
+  if (cached) return res.json({ ...cached, cached: true });
+  try {
+    const results = await queryIgdbGames(query, clientId, clientSecret);
+    const payload = { ok: true, provider: 'igdb', configured: true, results };
+    setMetadataProxyCache(cacheKey, payload);
+    return res.json(payload);
+  } catch (err) {
+    const status = Number(err && err.status || 502);
+    console.warn(`[METADATA IGDB] ${query}: ${err && err.message ? err.message : err}`);
+    return res.status(status === 429 ? 429 : 502).json({ ok: false, provider: 'igdb', configured: true, upstreamStatus: status, error: err && err.message ? err.message : 'IGDB request failed.' });
+  }
+});
+
+app.get('/api/metadata/steam/search', async (req, res) => {
+  setMetadataCors(res);
+  const query = String(req.query && req.query.q || '').trim().slice(0, 180);
+  if (!query) return res.status(400).json({ ok: false, provider: 'steam', error: 'Missing q.' });
+  const cacheKey = `steam-search:${query.toLowerCase()}`;
+  const cached = getMetadataProxyCache(cacheKey);
+  if (cached) return res.json({ ...cached, cached: true });
+  try {
+    const url = new URL('https://store.steampowered.com/api/storesearch/');
+    url.searchParams.set('term', query);
+    url.searchParams.set('l', 'english');
+    url.searchParams.set('cc', 'US');
+    const response = await requestMetadataJson(url, { headers: { 'User-Agent': 'PSN-Content-Metadata/1.0' } });
+    if (!response.ok || !response.data || !Array.isArray(response.data.items)) {
+      return res.status(response.status === 429 ? 429 : 502).json({ ok: false, provider: 'steam', upstreamStatus: response.status || 0, error: `Steam search failed (HTTP ${response.status || 0}).` });
+    }
+    const results = response.data.items.slice(0, 10).map(item => ({
+      id: String(item && (item.id || item.appid) || ''),
+      name: String(item && item.name || '').trim(),
+      released: String(item && (item.released || item.release_date || '') || '').trim(),
+      platforms: item && item.platforms ? item.platforms : null,
+      source: 'steam'
+    })).filter(item => item.id && item.name);
+    const payload = { ok: true, provider: 'steam', results };
+    setMetadataProxyCache(cacheKey, payload);
+    return res.json(payload);
+  } catch (err) {
+    console.warn(`[METADATA STEAM SEARCH] ${query}: ${err && err.message ? err.message : err}`);
+    return res.status(502).json({ ok: false, provider: 'steam', error: err && err.message ? err.message : 'Steam search failed.' });
+  }
+});
+
+app.get('/api/metadata/steam/details', async (req, res) => {
+  setMetadataCors(res);
+  const appId = String(req.query && req.query.appid || '').trim();
+  if (!/^\d{1,12}$/.test(appId)) return res.status(400).json({ ok: false, provider: 'steam', error: 'Invalid appid.' });
+  const cacheKey = `steam-details:${appId}`;
+  const cached = getMetadataProxyCache(cacheKey);
+  if (cached) return res.json({ ...cached, cached: true });
+  try {
+    const url = new URL('https://store.steampowered.com/api/appdetails');
+    url.searchParams.set('appids', appId);
+    url.searchParams.set('l', 'english');
+    url.searchParams.set('cc', 'US');
+    const response = await requestMetadataJson(url, { headers: { 'User-Agent': 'PSN-Content-Metadata/1.0' } });
+    const entry = response.data && response.data[appId];
+    if (!response.ok || !entry || entry.success !== true || !entry.data || entry.data.type !== 'game') {
+      return res.status(response.status === 429 ? 429 : 404).json({ ok: false, provider: 'steam', upstreamStatus: response.status || 0, error: 'Steam game details unavailable.' });
+    }
+    const payload = { ok: true, provider: 'steam', details: normalizeSteamDetails(appId, entry.data) };
+    setMetadataProxyCache(cacheKey, payload);
+    return res.json(payload);
+  } catch (err) {
+    console.warn(`[METADATA STEAM DETAILS] ${appId}: ${err && err.message ? err.message : err}`);
+    return res.status(502).json({ ok: false, provider: 'steam', error: err && err.message ? err.message : 'Steam details failed.' });
+  }
+});
+
 let userDatabase = {};
 let userCacheMeta = {};
 let userCacheLastFullRefresh = 0;
