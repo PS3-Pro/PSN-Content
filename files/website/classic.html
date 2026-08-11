@@ -6533,6 +6533,10 @@ function restorePreviousState() {
 	}, true);
 	</script>
 	<script>
+	var IGDB_CLIENT_ID = 'vwqel850270bn3woyontsoyqbc5v78';
+	var IGDB_CLIENT_SECRET = '75o86v0w2nf5ifutimju0oc6bp20qy';
+	var CLASSIC_METADATA_SERVER_BASE = 'https://psn-content-escw.onrender.com';
+
 	var RAWG_KEYS = [
 		'666e45b739d5401f84ea3595f64f6b0d',
 		'092c6f79440d4fdfb1eaae48983e6210',
@@ -6666,27 +6670,258 @@ function restorePreviousState() {
 		el.style.display = 'block';
 	}
 
-	function fetchGameSummary(gameName, gameId, modalRequestEpoch) {
-		if (!classicGameModalRequestIsActive(modalRequestEpoch)) return;
-
-		var summaryContainer = document.getElementById('modal-summary');
-		if (!summaryContainer) return;
-	
-		summaryContainer.innerHTML = 'Fetching summary...';
-		showRawgMetaSkeleton();
-		var cleanQuery = gameName.replace(/^\s+|\s+$/g, '');
-		attemptRawgSearch(cleanQuery, 0, modalRequestEpoch);
-	}
-	
-	var RAWG_SEARCH_TIMEOUT_MS = 4000;
-	var RAWG_DETAILS_TIMEOUT_MS = 3500;
-	var RAWG_SCREENSHOTS_TIMEOUT_MS = 3500;
-
-	function isRawgKeyErrorStatus(status) {
-		return status === 401 || status === 403 || status === 429;
+	function classicMetadataTrim(value) {
+		return String(value === undefined || value === null ? '' : value).replace(/^\s+|\s+$/g, '');
 	}
 
-	function classicRawgRequest(url, timeoutMs, onComplete, onNetworkFailure) {
+	function classicMetadataNormalizeTitle(value) {
+		var text = classicMetadataTrim(value).toLowerCase();
+		text = text
+			.replace(/[àáâãäå]/g, 'a')
+			.replace(/[èéêë]/g, 'e')
+			.replace(/[ìíîï]/g, 'i')
+			.replace(/[òóôõö]/g, 'o')
+			.replace(/[ùúûü]/g, 'u')
+			.replace(/[ç]/g, 'c')
+			.replace(/[ñ]/g, 'n')
+			.replace(/[ýÿ]/g, 'y')
+			.replace(/[™®©]/g, ' ')
+			.replace(/&/g, ' and ')
+			.replace(/[’']/g, '')
+			.replace(/\bgame of the year\b/g, ' goty ')
+			.replace(/[^a-z0-9]+/g, ' ')
+			.replace(/\s+/g, ' ')
+			.replace(/^\s+|\s+$/g, '');
+
+		if (!text) return '';
+		var romanMap = { ii: '2', iii: '3', iv: '4', v: '5', vi: '6', vii: '7', viii: '8', ix: '9', x: '10' };
+		var parts = text.split(' ');
+		for (var i = 0; i < parts.length; i++) {
+			if (romanMap[parts[i]]) parts[i] = romanMap[parts[i]];
+		}
+		return parts.join(' ');
+	}
+
+	function classicMetadataCleanCatalogTitle(value) {
+		var text = classicMetadataTrim(value);
+		var trailingTags = /\s*\((?:trial(?: to full)?|demo|psx|ps1|ps2(?: classics?| classic)?|ps3|psp|mini(?:s)?|version[^)]*|download ver\.?|full game|russian[^)]*|uk english|english|french|german|italian|spanish|polish|japanese|korean|chinese|taiwanese)[^)]*\)\s*$/i;
+		for (var pass = 0; pass < 4; pass++) {
+			var next = classicMetadataTrim(text.replace(trailingTags, ''));
+			if (next === text) break;
+			text = next;
+		}
+		return classicMetadataTrim(text.replace(/\s+PlayStation\s*3\s+the\s+Best\s*$/i, ''));
+	}
+
+	function classicMetadataPlatformHint(value) {
+		var raw = String(value || '').toLowerCase();
+		if (/\(psx\)|\(ps1\)|playstation\s*1/.test(raw)) return ['playstation', 'playstation 1', 'ps1'];
+		if (/\(ps2(?: classics?| classic)?\)|playstation\s*2/.test(raw)) return ['playstation 2', 'ps2'];
+		if (/\(psp\)|playstation portable/.test(raw)) return ['playstation portable', 'psp'];
+		return ['playstation 3', 'ps3'];
+	}
+
+	var CLASSIC_METADATA_BUNDLE_SUFFIXES = [
+		'digital deluxe edition', 'deluxe edition', 'complete edition', 'gold edition', 'game of the year edition',
+		'goty edition', 'goty', 'ultimate evil edition', 'ultimate edition', 'premium edition', 'limited edition',
+		'collectors edition', 'collector edition', 'all in one edition', 'templar edition', 'legion edition',
+		'victory edition', 'digital edition', 'the ultimate box', 'the complete tale', 'complete collection'
+	];
+
+	var CLASSIC_METADATA_VARIANT_SUFFIXES = [
+		'hd edition', 'hd remaster', 'remastered', 'remaster', 'bfg edition', 'megaton edition', 'arcade edition',
+		'online edition', 'playstation 3 edition', 'playstation3 edition', 'move edition', 'anniversary edition',
+		'anniversary', 'directors cut', 'extended edition', 'special edition', 'alternative edition', 'addition edition',
+		'giant edition', 'multiplayer edition', 'home run derby edition', 'hd version', 'hd ver', 'hd remix', 'on fire edition',
+		'championship edition', 'trial edition', 'final edition', 'grand edition', 'party edition', 'converted edition', 'collected edition', 'hd'
+	];
+
+	function classicMetadataEndsWith(text, suffix) {
+		if (!text || !suffix || suffix.length > text.length) return false;
+		return text.substr(text.length - suffix.length) === suffix;
+	}
+
+	function classicMetadataEditionPolicy(value) {
+		var normalized = classicMetadataNormalizeTitle(classicMetadataCleanCatalogTitle(value));
+		var i;
+		if (!normalized) return { kind: 'none', normalized: '', baseTitle: '', suffix: '' };
+
+		for (i = 0; i < CLASSIC_METADATA_VARIANT_SUFFIXES.length; i++) {
+			var variantSuffix = CLASSIC_METADATA_VARIANT_SUFFIXES[i];
+			if (classicMetadataEndsWith(normalized, ' ' + variantSuffix)) {
+				return { kind: 'variant', normalized: normalized, baseTitle: '', suffix: variantSuffix };
+			}
+		}
+
+		if (/^(.*)\s+\d+\s+anniversary(?:\s+edition)?$/.test(normalized)) {
+			return { kind: 'variant', normalized: normalized, baseTitle: '', suffix: 'numbered anniversary' };
+		}
+
+		for (i = 0; i < CLASSIC_METADATA_BUNDLE_SUFFIXES.length; i++) {
+			var bundleSuffix = CLASSIC_METADATA_BUNDLE_SUFFIXES[i];
+			var fullSuffix = ' ' + bundleSuffix;
+			if (!classicMetadataEndsWith(normalized, fullSuffix)) continue;
+			var baseTitle = classicMetadataTrim(normalized.substr(0, normalized.length - fullSuffix.length));
+			if (baseTitle) return { kind: 'bundle', normalized: normalized, baseTitle: baseTitle, suffix: bundleSuffix };
+		}
+
+		return { kind: 'none', normalized: normalized, baseTitle: '', suffix: '' };
+	}
+
+	var CLASSIC_METADATA_STOP_WORDS = { the:1, a:1, an:1, of:1, and:1, for:1, to:1, in:1, on:1, with:1, edition:1 };
+
+	function classicMetadataTokens(value) {
+		var normalized = classicMetadataNormalizeTitle(value);
+		var raw = normalized ? normalized.split(' ') : [];
+		var out = [];
+		for (var i = 0; i < raw.length; i++) {
+			if (raw[i] && !CLASSIC_METADATA_STOP_WORDS[raw[i]]) out.push(raw[i]);
+		}
+		return out;
+	}
+
+	function classicMetadataUniqueMap(tokens) {
+		var map = {};
+		for (var i = 0; i < tokens.length; i++) map['$' + tokens[i]] = 1;
+		return map;
+	}
+
+	function classicMetadataNumberTokens(tokens) {
+		var out = [];
+		for (var i = 0; i < tokens.length; i++) {
+			if (/\d/.test(tokens[i])) out.push(tokens[i]);
+		}
+		return out;
+	}
+
+	function classicMetadataCandidatePlatforms(candidate) {
+		var direct = candidate && Object.prototype.toString.call(candidate.platforms) === '[object Array]' ? candidate.platforms : [];
+		var out = [];
+		for (var i = 0; i < direct.length; i++) {
+			var item = direct[i];
+			var name = '';
+			if (typeof item === 'string') name = item;
+			else if (item && item.platform && item.platform.name) name = item.platform.name;
+			else if (item && item.name) name = item.name;
+			name = classicMetadataNormalizeTitle(name);
+			if (name) out.push(name);
+		}
+		return out;
+	}
+
+	function classicMetadataArrayContains(arr, value) {
+		for (var i = 0; i < arr.length; i++) if (arr[i] === value) return true;
+		return false;
+	}
+
+	function classicScoreMetadataCandidate(targetTitle, candidate, releaseYear, platformHint) {
+		candidate = candidate || {};
+		var target = classicMetadataNormalizeTitle(classicMetadataCleanCatalogTitle(targetTitle));
+		var candidateName = classicMetadataNormalizeTitle(candidate.name || '');
+		if (!target || !candidateName) return 0;
+
+		var score = 0;
+		if (target === candidateName) {
+			score = 100;
+		} else {
+			var targetTokens = classicMetadataTokens(target);
+			var candidateTokens = classicMetadataTokens(candidateName);
+			var targetMap = classicMetadataUniqueMap(targetTokens);
+			var candidateMap = classicMetadataUniqueMap(candidateTokens);
+			var targetCount = 0;
+			var candidateCount = 0;
+			var shared = 0;
+			var key;
+
+			for (key in targetMap) if (targetMap.hasOwnProperty(key)) targetCount++;
+			for (key in candidateMap) if (candidateMap.hasOwnProperty(key)) candidateCount++;
+			for (key in targetMap) if (targetMap.hasOwnProperty(key) && candidateMap[key]) shared++;
+
+			if (targetCount && candidateCount) {
+				var targetCoverage = shared / targetCount;
+				var candidateCoverage = shared / candidateCount;
+				score = Math.round(((targetCoverage * 0.62) + (candidateCoverage * 0.38)) * 74);
+				if (targetCoverage === 1) score = Math.max(score, 82);
+				if (candidateCoverage === 1) score = Math.max(score, 66);
+			}
+
+			if (target.indexOf(candidateName) !== -1 || candidateName.indexOf(target) !== -1) score = Math.max(score, 66);
+			if (targetTokens.length >= 2 && candidateTokens.length >= 2 && targetTokens[0] === candidateTokens[0] && targetTokens[1] === candidateTokens[1]) score += 6;
+
+			var targetNumbers = classicMetadataNumberTokens(targetTokens);
+			var candidateNumbers = classicMetadataNumberTokens(candidateTokens);
+			if (targetNumbers.length && candidateNumbers.length) {
+				var sharedNumbers = 0;
+				for (var n = 0; n < targetNumbers.length; n++) {
+					if (classicMetadataArrayContains(candidateNumbers, targetNumbers[n])) sharedNumbers++;
+				}
+				if (!sharedNumbers) score -= 45;
+				else {
+					var uniqueNumbers = classicMetadataUniqueMap(targetNumbers.concat(candidateNumbers));
+					var uniqueCount = 0;
+					for (key in uniqueNumbers) if (uniqueNumbers.hasOwnProperty(key)) uniqueCount++;
+					if (uniqueCount > sharedNumbers) score -= 18;
+				}
+			}
+		}
+
+		var targetPolicy = classicMetadataEditionPolicy(targetTitle);
+		var candidatePolicy = classicMetadataEditionPolicy(candidate.name || '');
+		if (targetPolicy.kind === 'bundle' && candidatePolicy.kind === 'none' && targetPolicy.baseTitle === candidateName) score = Math.min(score, 74);
+		if (targetPolicy.kind === 'variant' && candidatePolicy.kind === 'none') score = Math.min(score, 64);
+		if (targetPolicy.kind === 'variant' && candidatePolicy.kind === 'variant' && targetPolicy.suffix && candidatePolicy.suffix && targetPolicy.suffix !== candidatePolicy.suffix) score -= 18;
+
+		var expectedYear = parseInt(releaseYear, 10);
+		var candidateYearMatch = String(candidate.released || candidate.releaseDate || '').match(/\b(19|20)\d{2}\b/);
+		var candidateYear = candidateYearMatch ? parseInt(candidateYearMatch[0], 10) : NaN;
+		if (!isNaN(expectedYear) && !isNaN(candidateYear)) {
+			var diff = Math.abs(expectedYear - candidateYear);
+			if (diff === 0) score += 6;
+			else if (diff === 1) score += 3;
+			else if (diff >= 5) score -= 10;
+			else if (diff >= 2) score -= 4;
+		}
+
+		var platforms = classicMetadataCandidatePlatforms(candidate);
+		if (platforms.length) {
+			var hints = Object.prototype.toString.call(platformHint) === '[object Array]' ? platformHint : [platformHint];
+			var hasExpected = false;
+			for (var p = 0; p < platforms.length && !hasExpected; p++) {
+				for (var h = 0; h < hints.length; h++) {
+					var hint = classicMetadataNormalizeTitle(hints[h]);
+					if (hint && (platforms[p] === hint || platforms[p].indexOf(hint) !== -1 || hint.indexOf(platforms[p]) !== -1)) {
+						hasExpected = true;
+						break;
+					}
+				}
+			}
+			if (hasExpected) score += 8;
+			else if (candidate.source === 'igdb') score -= 6;
+		}
+
+		if (targetPolicy.kind === 'bundle' && candidatePolicy.kind === 'none' && targetPolicy.baseTitle === candidateName) score = Math.min(score, 74);
+		if (targetPolicy.kind === 'variant' && candidatePolicy.kind === 'none') score = Math.min(score, 64);
+
+		if (score < 0) score = 0;
+		if (score > 100) score = 100;
+		return Math.round(score);
+	}
+
+	function classicPickMetadataCandidate(results, targetTitle, minScore, releaseYear, platformHint) {
+		var best = null;
+		var bestScore = -1;
+		if (Object.prototype.toString.call(results) !== '[object Array]') results = [];
+		for (var i = 0; i < results.length; i++) {
+			var score = classicScoreMetadataCandidate(targetTitle, results[i], releaseYear, platformHint);
+			if (score > bestScore) {
+				best = results[i];
+				bestScore = score;
+			}
+		}
+		return { candidate: bestScore >= minScore ? best : null };
+	}
+
+	function classicMetadataRequest(url, timeoutMs, onComplete, onNetworkFailure) {
 		var xhr = null;
 		var timer = null;
 		var finished = false;
@@ -6720,134 +6955,324 @@ function restorePreviousState() {
 				cleanup();
 				if (onComplete) onComplete(status, responseText);
 			};
-			xhr.onerror = function() {
-				failNetwork();
-			};
+			xhr.onerror = failNetwork;
 			timer = setTimeout(function() {
 				if (finished) return;
 				finished = true;
 				cleanup();
-				try { xhr.abort(); } catch(e) {}
+				try { xhr.abort(); } catch(e1) {}
 				if (onNetworkFailure) onNetworkFailure();
 			}, timeoutMs);
 			xhr.send(null);
-		} catch(e) {
+		} catch(e2) {
 			failNetwork();
 		}
 	}
 
-	function attemptRawgSearch(cleanQuery, keyIndex, modalRequestEpoch) {
-		if (!classicGameModalRequestIsActive(modalRequestEpoch)) return;
 
-		if (keyIndex >= RAWG_KEYS.length) {
-			fetchWikipediaSummary(cleanQuery, modalRequestEpoch);
+	var RAWG_SEARCH_TIMEOUT_MS = 4000;
+	var RAWG_DETAILS_TIMEOUT_MS = 3500;
+	var RAWG_SCREENSHOTS_TIMEOUT_MS = 3500;
+	var CLASSIC_IGDB_TIMEOUT_MS = 7000;
+	var CLASSIC_STEAM_TIMEOUT_MS = 6500;
+	var CLASSIC_WIKIPEDIA_TIMEOUT_MS = 4500;
+	var g_classicRawgKeyIndex = 0;
+
+	try {
+		var storedRawgKeyIndex = parseInt(localStorage.getItem('rawg_key_index') || '0', 10);
+		if (!isNaN(storedRawgKeyIndex) && RAWG_KEYS.length) g_classicRawgKeyIndex = storedRawgKeyIndex % RAWG_KEYS.length;
+	} catch(e) {}
+
+	function classicRotateRawgKey() {
+		if (!RAWG_KEYS.length) return;
+		g_classicRawgKeyIndex = (g_classicRawgKeyIndex + 1) % RAWG_KEYS.length;
+		try { localStorage.setItem('rawg_key_index', String(g_classicRawgKeyIndex)); } catch(e) {}
+	}
+
+	function isRawgKeyErrorStatus(status) {
+		return status === 401 || status === 403 || status === 429;
+	}
+
+	function classicMetadataCreateState(gameName, modalRequestEpoch) {
+		var lookupTitle = classicMetadataCleanCatalogTitle(gameName) || classicMetadataTrim(gameName);
+		var policy = classicMetadataEditionPolicy(lookupTitle);
+		var specs = [{ query: lookupTitle, target: lookupTitle, minScore: 80 }];
+		if (policy.kind === 'bundle' && policy.baseTitle) {
+			specs.push({ query: policy.baseTitle, target: policy.baseTitle, minScore: 86 });
+		}
+		return {
+			gameName: gameName,
+			modalRequestEpoch: modalRequestEpoch,
+			searchSpecs: specs,
+			platformHint: classicMetadataPlatformHint(gameName),
+			releaseYear: '',
+			metadataResolved: false,
+			summaryResolved: false,
+			screenshotsResolved: false
+		};
+	}
+
+	function classicMetadataIsActive(state) {
+		return !!state && classicGameModalRequestIsActive(state.modalRequestEpoch);
+	}
+
+	function classicMetadataSetSummary(state, value) {
+		if (!classicMetadataIsActive(state)) return false;
+		var clean = classicMetadataTrim(value);
+		if (!clean) return false;
+		var summaryEl = document.getElementById('modal-summary');
+		if (!summaryEl) return false;
+		summaryEl.innerHTML = modalSafeText(clean).replace(/\r/g, '').replace(/\n+/g, '<br><br>');
+		state.summaryResolved = true;
+		scheduleModalLayoutFit();
+		return true;
+	}
+
+	function classicMetadataApplyDetails(state, detailsData) {
+		if (!classicMetadataIsActive(state) || !detailsData) return;
+
+		if (!state.metadataResolved) {
+			renderRawgMetadata(detailsData);
+			var metaEl = document.getElementById('modal-rawg-meta');
+			if (metaEl && metaEl.style.display !== 'none' && String(metaEl.className || '').indexOf('rawg-meta-loading') === -1) state.metadataResolved = true;
+		}
+
+		if (!state.summaryResolved) {
+			classicMetadataSetSummary(state, detailsData.description_raw || detailsData.description || '');
+		}
+	}
+
+	function classicMetadataRenderScreenshots(state, urls) {
+		if (!classicMetadataIsActive(state) || state.screenshotsResolved) return false;
+		if (Object.prototype.toString.call(urls) !== '[object Array]') return false;
+		var seen = {};
+		var results = [];
+		for (var i = 0; i < urls.length && results.length < 6; i++) {
+			var url = classicMetadataTrim(urls[i]);
+			if (!url || seen[url]) continue;
+			seen[url] = 1;
+			results.push({ image: url });
+		}
+		if (!results.length) return false;
+		state.screenshotsResolved = true;
+		renderModalGallery(results);
+		return true;
+	}
+
+	function classicMetadataNeedsFallback(state) {
+		return !state.metadataResolved || !state.summaryResolved || !state.screenshotsResolved;
+	}
+
+	function classicMetadataFinishProviders(state) {
+		if (!classicMetadataIsActive(state)) return;
+		if (!state.screenshotsResolved) hideModalGallery();
+		if (!state.metadataResolved) hideRawgMeta();
+		if (!state.summaryResolved) {
+			classicTryWikipediaSummary(state, 0);
+		} else {
+			scheduleModalLayoutFit();
+		}
+	}
+
+	function fetchGameSummary(gameName, modalRequestEpoch) {
+		if (!classicGameModalRequestIsActive(modalRequestEpoch)) return;
+		var summaryContainer = document.getElementById('modal-summary');
+		if (!summaryContainer) return;
+
+		summaryContainer.innerHTML = 'Fetching summary...';
+		showRawgMetaSkeleton();
+		var state = classicMetadataCreateState(gameName, modalRequestEpoch);
+		classicTryRawgSearch(state, 0, 0);
+	}
+
+	function classicTryRawgSearch(state, specIndex, keyAttempt) {
+		if (!classicMetadataIsActive(state)) return;
+		if (specIndex >= state.searchSpecs.length || !RAWG_KEYS.length || keyAttempt >= RAWG_KEYS.length) {
+			classicTryIgdbSearch(state, 0);
 			return;
 		}
 
+		var spec = state.searchSpecs[specIndex];
+		var keyIndex = (g_classicRawgKeyIndex + keyAttempt) % RAWG_KEYS.length;
 		var currentKey = RAWG_KEYS[keyIndex];
-		var rawgSearchUrl = 'https://api.rawg.io/api/games?key=' + currentKey + '&search=' + encodeURIComponent(cleanQuery) + '&page_size=1';
+		var url = 'https://api.rawg.io/api/games?key=' + currentKey + '&search=' + encodeURIComponent(spec.query) + '&page_size=5';
 
-		classicRawgRequest(rawgSearchUrl, RAWG_SEARCH_TIMEOUT_MS, function(status, responseText) {
-			if (!classicGameModalRequestIsActive(modalRequestEpoch)) return;
+		classicMetadataRequest(url, RAWG_SEARCH_TIMEOUT_MS, function(status, responseText) {
+			if (!classicMetadataIsActive(state)) return;
 			if (status === 200) {
 				var data = null;
-				try { data = JSON.parse(responseText); } catch(e) {}
-				if (!data) {
-					fetchWikipediaSummary(cleanQuery, modalRequestEpoch);
+				try { data = JSON.parse(responseText); } catch(e0) {}
+				if (!data || Object.prototype.toString.call(data.results) !== '[object Array]' || !data.results.length) {
+					classicTryRawgSearch(state, specIndex + 1, 0);
 					return;
 				}
 
-				if (data.results && data.results.length > 0 && data.results[0].slug) {
-					fetchRawgDetails(data.results[0].slug, cleanQuery, keyIndex, modalRequestEpoch);
-				} else {
-					fetchWikipediaSummary(cleanQuery, modalRequestEpoch);
+				for (var i = 0; i < data.results.length; i++) if (data.results[i]) data.results[i].source = 'rawg';
+				var match = classicPickMetadataCandidate(data.results, spec.target, spec.minScore, state.releaseYear, state.platformHint);
+				if (!match.candidate || !match.candidate.slug) {
+					classicTryRawgSearch(state, specIndex + 1, 0);
+					return;
 				}
+				classicFetchRawgDetails(state, specIndex, match.candidate.slug, currentKey, keyAttempt);
 			} else if (isRawgKeyErrorStatus(status)) {
-				attemptRawgSearch(cleanQuery, keyIndex + 1, modalRequestEpoch);
+				classicRotateRawgKey();
+				classicTryRawgSearch(state, specIndex, keyAttempt + 1);
 			} else {
-				fetchWikipediaSummary(cleanQuery, modalRequestEpoch);
+				classicTryIgdbSearch(state, 0);
 			}
 		}, function() {
-			if (!classicGameModalRequestIsActive(modalRequestEpoch)) return;
-			fetchWikipediaSummary(cleanQuery, modalRequestEpoch);
+			if (!classicMetadataIsActive(state)) return;
+			classicTryIgdbSearch(state, 0);
 		});
 	}
 
-	function fetchRawgDetails(slug, originalName, keyIndex, modalRequestEpoch) {
-		if (!classicGameModalRequestIsActive(modalRequestEpoch)) return;
+	function classicFetchRawgDetails(state, specIndex, slug, currentKey, keyAttempt) {
+		if (!classicMetadataIsActive(state)) return;
+		var url = 'https://api.rawg.io/api/games/' + encodeURIComponent(slug) + '?key=' + currentKey;
+		classicMetadataRequest(url, RAWG_DETAILS_TIMEOUT_MS, function(status, responseText) {
+			if (!classicMetadataIsActive(state)) return;
+			if (status === 200) {
+				var data = null;
+				try { data = JSON.parse(responseText); } catch(e0) {}
+				if (!data) {
+					classicTryIgdbSearch(state, 0);
+					return;
+				}
+				data.source = 'rawg';
+				classicMetadataApplyDetails(state, data);
+				classicFetchRawgScreenshots(state, slug, currentKey, 0);
+			} else if (isRawgKeyErrorStatus(status) && keyAttempt + 1 < RAWG_KEYS.length) {
+				classicRotateRawgKey();
+				classicTryRawgSearch(state, specIndex, keyAttempt + 1);
+			} else {
+				classicTryIgdbSearch(state, 0);
+			}
+		}, function() {
+			if (!classicMetadataIsActive(state)) return;
+			classicTryIgdbSearch(state, 0);
+		});
+	}
 
-		if (keyIndex >= RAWG_KEYS.length) {
-			fetchWikipediaSummary(originalName, modalRequestEpoch);
+	function classicFetchRawgScreenshots(state, slug, currentKey, screenshotKeyAttempt) {
+		if (!classicMetadataIsActive(state)) return;
+		var url = 'https://api.rawg.io/api/games/' + encodeURIComponent(slug) + '/screenshots?key=' + currentKey;
+		classicMetadataRequest(url, RAWG_SCREENSHOTS_TIMEOUT_MS, function(status, responseText) {
+			if (!classicMetadataIsActive(state)) return;
+			if (status === 200) {
+				var data = null;
+				try { data = JSON.parse(responseText); } catch(e0) {}
+				var urls = [];
+				if (data && Object.prototype.toString.call(data.results) === '[object Array]') {
+					for (var i = 0; i < data.results.length; i++) if (data.results[i] && data.results[i].image) urls.push(data.results[i].image);
+				}
+				classicMetadataRenderScreenshots(state, urls);
+				if (classicMetadataNeedsFallback(state)) classicTryIgdbSearch(state, 0);
+				else scheduleModalLayoutFit();
+			} else if (isRawgKeyErrorStatus(status) && screenshotKeyAttempt + 1 < RAWG_KEYS.length) {
+				classicRotateRawgKey();
+				classicFetchRawgScreenshots(state, slug, RAWG_KEYS[g_classicRawgKeyIndex], screenshotKeyAttempt + 1);
+			} else {
+				classicTryIgdbSearch(state, 0);
+			}
+		}, function() {
+			if (!classicMetadataIsActive(state)) return;
+			classicTryIgdbSearch(state, 0);
+		});
+	}
+
+	function classicTryIgdbSearch(state, specIndex) {
+		if (!classicMetadataIsActive(state)) return;
+		if (!classicMetadataNeedsFallback(state)) {
+			scheduleModalLayoutFit();
+			return;
+		}
+		if (!IGDB_CLIENT_ID || !IGDB_CLIENT_SECRET || specIndex >= state.searchSpecs.length) {
+			classicTrySteamSearch(state, 0);
 			return;
 		}
 
-		var currentKey = RAWG_KEYS[keyIndex];
-		var detailsUrl = 'https://api.rawg.io/api/games/' + slug + '?key=' + currentKey;
+		var spec = state.searchSpecs[specIndex];
+		var url = CLASSIC_METADATA_SERVER_BASE + '/api/metadata/igdb?q=' + encodeURIComponent(spec.query) + '&client_id=' + encodeURIComponent(IGDB_CLIENT_ID) + '&client_secret=' + encodeURIComponent(IGDB_CLIENT_SECRET);
 
-		classicRawgRequest(detailsUrl, RAWG_DETAILS_TIMEOUT_MS, function(status, responseText) {
-			if (!classicGameModalRequestIsActive(modalRequestEpoch)) return;
+		classicMetadataRequest(url, CLASSIC_IGDB_TIMEOUT_MS, function(status, responseText) {
+			if (!classicMetadataIsActive(state)) return;
 			if (status === 200) {
 				var data = null;
-				try { data = JSON.parse(responseText); } catch(e) {}
-				if (!data) {
-					fetchWikipediaSummary(originalName, modalRequestEpoch);
+				try { data = JSON.parse(responseText); } catch(e0) {}
+				var results = data && Object.prototype.toString.call(data.results) === '[object Array]' ? data.results : [];
+				var match = classicPickMetadataCandidate(results, spec.target, spec.minScore, state.releaseYear, state.platformHint);
+				if (match.candidate) {
+					classicMetadataApplyDetails(state, match.candidate);
+					if (!state.screenshotsResolved) classicMetadataRenderScreenshots(state, match.candidate.screenshots || []);
+					if (!classicMetadataNeedsFallback(state)) {
+						scheduleModalLayoutFit();
+						return;
+					}
+				}
+				classicTryIgdbSearch(state, specIndex + 1);
+			} else {
+				classicTrySteamSearch(state, 0);
+			}
+		}, function() {
+			if (!classicMetadataIsActive(state)) return;
+			classicTrySteamSearch(state, 0);
+		});
+	}
+
+	function classicTrySteamSearch(state, specIndex) {
+		if (!classicMetadataIsActive(state)) return;
+		if (!classicMetadataNeedsFallback(state)) {
+			scheduleModalLayoutFit();
+			return;
+		}
+		if (specIndex >= state.searchSpecs.length) {
+			classicMetadataFinishProviders(state);
+			return;
+		}
+
+		var spec = state.searchSpecs[specIndex];
+		var searchUrl = CLASSIC_METADATA_SERVER_BASE + '/api/metadata/steam/search?q=' + encodeURIComponent(spec.query);
+		classicMetadataRequest(searchUrl, CLASSIC_STEAM_TIMEOUT_MS, function(status, responseText) {
+			if (!classicMetadataIsActive(state)) return;
+			if (status !== 200) {
+				classicMetadataFinishProviders(state);
+				return;
+			}
+			var data = null;
+			try { data = JSON.parse(responseText); } catch(e0) {}
+			var results = data && Object.prototype.toString.call(data.results) === '[object Array]' ? data.results : [];
+			var match = classicPickMetadataCandidate(results, spec.target, spec.minScore, state.releaseYear, state.platformHint);
+			if (!match.candidate || !match.candidate.id) {
+				classicTrySteamSearch(state, specIndex + 1);
+				return;
+			}
+
+			var detailsUrl = CLASSIC_METADATA_SERVER_BASE + '/api/metadata/steam/details?appid=' + encodeURIComponent(match.candidate.id);
+			classicMetadataRequest(detailsUrl, CLASSIC_STEAM_TIMEOUT_MS, function(detailsStatus, detailsText) {
+				if (!classicMetadataIsActive(state)) return;
+				if (detailsStatus !== 200) {
+					classicTrySteamSearch(state, specIndex + 1);
+					return;
+				}
+				var detailsPayload = null;
+				try { detailsPayload = JSON.parse(detailsText); } catch(e1) {}
+				var details = detailsPayload && detailsPayload.details ? detailsPayload.details : null;
+				if (!details || classicScoreMetadataCandidate(spec.target, details, state.releaseYear, state.platformHint) < spec.minScore) {
+					classicTrySteamSearch(state, specIndex + 1);
 					return;
 				}
 
-				renderRawgMetadata(data);
-				scheduleModalLayoutFit();
-				if (data.description_raw) {
-					var text = data.description_raw.replace(/^\s+|\s+$/g, '').replace(/\n+/g, '<br><br>');
-					document.getElementById('modal-summary').innerHTML = text;
-					scheduleModalLayoutFit();
-					fetchRawgScreenshots(slug, keyIndex, modalRequestEpoch);
-				} else {
-					fetchWikipediaSummary(originalName, modalRequestEpoch);
-				}
-			} else if (isRawgKeyErrorStatus(status)) {
-				fetchRawgDetails(slug, originalName, keyIndex + 1, modalRequestEpoch);
-			} else {
-				fetchWikipediaSummary(originalName, modalRequestEpoch);
-			}
+				classicMetadataApplyDetails(state, details);
+				if (!state.screenshotsResolved) classicMetadataRenderScreenshots(state, details.screenshots || []);
+				if (classicMetadataNeedsFallback(state)) classicTrySteamSearch(state, specIndex + 1);
+				else scheduleModalLayoutFit();
+			}, function() {
+				if (!classicMetadataIsActive(state)) return;
+				classicTrySteamSearch(state, specIndex + 1);
+			});
 		}, function() {
-			if (!classicGameModalRequestIsActive(modalRequestEpoch)) return;
-			fetchWikipediaSummary(originalName, modalRequestEpoch);
-		});
-	}
-
-	function fetchRawgScreenshots(slug, keyIndex, modalRequestEpoch) {
-		if (!classicGameModalRequestIsActive(modalRequestEpoch)) return;
-
-		if (keyIndex >= RAWG_KEYS.length) {
-			hideModalGallery();
-			setTimeout(fitGameModalLayout, 120);
-			return;
-		}
-
-		var currentKey = RAWG_KEYS[keyIndex];
-		var screensUrl = 'https://api.rawg.io/api/games/' + slug + '/screenshots?key=' + currentKey;
-
-		classicRawgRequest(screensUrl, RAWG_SCREENSHOTS_TIMEOUT_MS, function(status, responseText) {
-			if (!classicGameModalRequestIsActive(modalRequestEpoch)) return;
-			if (status === 200) {
-				var data = null;
-				try { data = JSON.parse(responseText); } catch(e) {}
-				if (data && data.results && data.results.length > 0) {
-					renderModalGallery(data.results);
-				} else {
-					hideModalGallery();
-					setTimeout(fitGameModalLayout, 120);
-				}
-			} else if (isRawgKeyErrorStatus(status)) {
-				fetchRawgScreenshots(slug, keyIndex + 1, modalRequestEpoch);
-			} else {
-				hideModalGallery();
-				setTimeout(fitGameModalLayout, 120);
-			}
-		}, function() {
-			if (!classicGameModalRequestIsActive(modalRequestEpoch)) return;
-			hideModalGallery();
-			setTimeout(fitGameModalLayout, 120);
+			if (!classicMetadataIsActive(state)) return;
+			classicMetadataFinishProviders(state);
 		});
 	}
 
@@ -7704,41 +8129,72 @@ function restorePreviousState() {
 	}
 
 
-	function fetchWikipediaSummary(gameName, modalRequestEpoch) {
-		if (!classicGameModalRequestIsActive(modalRequestEpoch)) return;
+	function classicTryWikipediaSummary(state, specIndex) {
+		if (!classicMetadataIsActive(state)) return;
+		if (state.summaryResolved) {
+			scheduleModalLayoutFit();
+			return;
+		}
+		if (specIndex >= state.searchSpecs.length) {
+			var summaryEl = document.getElementById('modal-summary');
+			if (summaryEl) summaryEl.innerHTML = 'Summary not available for this title.';
+			scheduleModalLayoutFit();
+			return;
+		}
 
-		hideModalGallery();
-		var metaEl = document.getElementById('modal-rawg-meta');
-		if (metaEl && metaEl.className && metaEl.className.indexOf('rawg-meta-loading') !== -1) hideRawgMeta();
-		var wikiUrl = 'https://en.wikipedia.org/w/api.php?action=query&prop=extracts&exintro=1&explaintext=1&generator=search&gsrsearch=' + encodeURIComponent(gameName + " video game") + '&gsrlimit=1&format=json&origin=*';
-		
-		var xhr = new XMLHttpRequest();
-		xhr.open('GET', wikiUrl, true);
-		xhr.onreadystatechange = function() {
-			if (xhr.readyState === 4) {
-				if (!classicGameModalRequestIsActive(modalRequestEpoch)) return;
-				if (xhr.status === 200) {
-					var data = JSON.parse(xhr.responseText);
-					if (data.query && data.query.pages) {
-						var pages = data.query.pages;
-						for (var id in pages) {
-							if (pages[id].extract) {
-								var text = pages[id].extract.replace(/^\s+|\s+$/g, '').replace(/\n+/g, '<br><br>');
-								document.getElementById('modal-summary').innerHTML = text;
-								scheduleModalLayoutFit();
-								return;
-							}
-						}
-					}
-					document.getElementById('modal-summary').innerHTML = "Summary not available for this title.";
-					scheduleModalLayoutFit();
-				} else {
-					document.getElementById('modal-summary').innerHTML = "Summary not available (Network Error).";
-					scheduleModalLayoutFit();
-				}
+		var spec = state.searchSpecs[specIndex];
+		var threshold = Math.max(72, spec.minScore - 8);
+		var searchUrl = 'https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=' + encodeURIComponent(spec.query + ' video game') + '&srlimit=5&format=json&origin=*';
+
+		classicMetadataRequest(searchUrl, CLASSIC_WIKIPEDIA_TIMEOUT_MS, function(status, responseText) {
+			if (!classicMetadataIsActive(state)) return;
+			if (status !== 200) {
+				classicTryWikipediaSummary(state, specIndex + 1);
+				return;
 			}
-		};
-		xhr.send();
+
+			var data = null;
+			try { data = JSON.parse(responseText); } catch(e0) {}
+			var rawResults = data && data.query && Object.prototype.toString.call(data.query.search) === '[object Array]' ? data.query.search : [];
+			var candidates = [];
+			for (var i = 0; i < rawResults.length; i++) {
+				if (!rawResults[i] || !rawResults[i].pageid || !rawResults[i].title) continue;
+				candidates.push({ id: rawResults[i].pageid, name: rawResults[i].title, released: '', source: 'wikipedia' });
+			}
+
+			var match = classicPickMetadataCandidate(candidates, spec.target, threshold, state.releaseYear, state.platformHint);
+			if (!match.candidate) {
+				classicTryWikipediaSummary(state, specIndex + 1);
+				return;
+			}
+
+			var detailsUrl = 'https://en.wikipedia.org/w/api.php?action=query&prop=extracts&exintro=1&explaintext=1&pageids=' + encodeURIComponent(match.candidate.id) + '&format=json&origin=*';
+			classicMetadataRequest(detailsUrl, CLASSIC_WIKIPEDIA_TIMEOUT_MS, function(detailsStatus, detailsText) {
+				if (!classicMetadataIsActive(state)) return;
+				if (detailsStatus !== 200) {
+					classicTryWikipediaSummary(state, specIndex + 1);
+					return;
+				}
+
+				var detailsData = null;
+				try { detailsData = JSON.parse(detailsText); } catch(e1) {}
+				var pages = detailsData && detailsData.query ? detailsData.query.pages : null;
+				var page = pages ? pages[match.candidate.id] : null;
+				if (!page && pages) {
+					for (var id in pages) {
+						if (pages.hasOwnProperty(id)) { page = pages[id]; break; }
+					}
+				}
+				if (page && page.extract && classicMetadataSetSummary(state, page.extract)) return;
+				classicTryWikipediaSummary(state, specIndex + 1);
+			}, function() {
+				if (!classicMetadataIsActive(state)) return;
+				classicTryWikipediaSummary(state, specIndex + 1);
+			});
+		}, function() {
+			if (!classicMetadataIsActive(state)) return;
+			classicTryWikipediaSummary(state, specIndex + 1);
+		});
 	}
 
 	var YOUTUBE_KEYS = [
@@ -9198,7 +9654,7 @@ function restorePreviousState() {
 					summary_el.innerHTML = 'Fetching summary...';
 				}
 				prepareModalGalleryReserve();
-				fetchGameSummary(displayName_h, id_h, modalRequestEpoch_h);
+				fetchGameSummary(displayName_h, modalRequestEpoch_h);
 			}
 		} else {
 			hideRawgMeta();

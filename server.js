@@ -498,8 +498,8 @@ app.options('/api/metadata/steam/details', (req, res) => { setMetadataCors(res);
 app.get('/api/metadata/igdb', async (req, res) => {
   setMetadataCors(res);
   const query = String(req.query && req.query.q || '').trim().slice(0, 180);
-  const clientId = String(req.get('x-igdb-client-id') || DEFAULT_IGDB_CLIENT_ID || '').trim().slice(0, 160);
-  const clientSecret = String(req.get('x-igdb-client-secret') || DEFAULT_IGDB_CLIENT_SECRET || '').trim().slice(0, 300);
+  const clientId = String(req.get('x-igdb-client-id') || (req.query && req.query.client_id) || DEFAULT_IGDB_CLIENT_ID || '').trim().slice(0, 160);
+  const clientSecret = String(req.get('x-igdb-client-secret') || (req.query && req.query.client_secret) || DEFAULT_IGDB_CLIENT_SECRET || '').trim().slice(0, 300);
   if (!query) return res.status(400).json({ ok: false, provider: 'igdb', error: 'Missing q.' });
   if (!clientId || !clientSecret) return res.status(503).json({ ok: false, provider: 'igdb', configured: false, error: 'IGDB credentials are not configured.' });
   const cacheKey = `igdb:${query.toLowerCase()}`;
