@@ -301,7 +301,7 @@ let lastMemoryPressureLogAt = 0;
 let profileHydrationQueued = 0;
 let profileHydrationActive = 0;
 let profileSyncActiveSockets = 0;
-const MEMORY_TRACE_ENABLED = process.env.MEMORY_TRACE === '1';
+const MEMORY_TRACE_ENABLED = String(process.env.MEMORY_TRACE || 'false').trim().toLowerCase() === 'true';
 
 function getSocketWriteBufferLength(socket) {
   try {
