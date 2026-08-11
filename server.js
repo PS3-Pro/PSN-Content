@@ -2605,7 +2605,7 @@ function emitChatHistoryToSocket(socket) {
               reject(new Error(response.error || 'Chat history rejected by client.'));
               return;
             }
-            finish({ cancelled: false });
+            finish({ cancelled: false, response: response || null });
           });
         } catch (err) {
           if (!settled) {
@@ -2620,7 +2620,9 @@ function emitChatHistoryToSocket(socket) {
         logMemoryTrace('chat-history:cancel', `user=${socket.userName || '-'} socket=${socket.id} ms=${Date.now() - startedAt}`);
         return;
       }
-      logMemoryTrace('chat-history:ack', `user=${socket.userName || '-'} socket=${socket.id} ms=${Date.now() - startedAt} buffer=${getSocketWriteBufferLength(socket)}`);
+      const rendered = !(result && result.response && result.response.rendered === false);
+      const received = result && result.response && Number.isFinite(Number(result.response.received)) ? Number(result.response.received) : -1;
+      logMemoryTrace('chat-history:ack', `user=${socket.userName || '-'} socket=${socket.id} ms=${Date.now() - startedAt} rendered=${rendered} received=${received} buffer=${getSocketWriteBufferLength(socket)}`);
       return;
     }
 
@@ -4460,6 +4462,18 @@ io.on('connection', (socket) => {
       if (Array.isArray(lastKnownOnlineList) && lastKnownOnlineList.length > 0) {
         socket.emit('online_list', lastKnownOnlineList);
       }
+    }
+  });
+
+  socket.on('chat_render_error', (data = {}) => {
+    try {
+      const stage = normalizeText(data.stage, 'unknown').slice(0, 40);
+      const index = Number.isFinite(Number(data.index)) ? Number(data.index) : -1;
+      const msgId = normalizeText(data.msgId, '').slice(0, 80);
+      const message = normalizeText(data.message, '').slice(0, 500);
+      console.error(`[CHAT RENDER CLIENT ERROR] user=${socket.userName || '-'} socket=${socket.id} stage=${stage} index=${index} msgId=${msgId} error=${message}`);
+    } catch (err) {
+      console.error('[CHAT RENDER CLIENT ERROR] Could not format client render diagnostic.');
     }
   });
 

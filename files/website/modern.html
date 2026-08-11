@@ -34921,6 +34921,15 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
         if (window.__lastChatHistoryRequestAt && now - window.__lastChatHistoryRequestAt < 900) return false;
         window.__lastChatHistoryRequestAt = now;
         window.__chatHistoryRequesting = true;
+        clearTimeout(window.__chatHistoryRequestWatchdog);
+        window.__chatHistoryRequestWatchdog = setTimeout(() => {
+            if (window.__chatHistoryReceived === true || window.__chatHistoryRequesting !== true) return;
+            window.__chatHistoryRequesting = false;
+            window.__chatHistoryRequestRetries = Math.min(2, Number(window.__chatHistoryRequestRetries || 0) + 1);
+            if (window.__chatHistoryRequestRetries <= 2 && typeof isChatScreenVisibleForRead === 'function' && isChatScreenVisibleForRead()) {
+                requestChatHistoryNow('history-timeout-retry');
+            }
+        }, 12000);
         socketChat.emit('request_chat_history', { reason, at: now });
         return true;
     }
@@ -35637,6 +35646,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
             const shouldShowPreparingMessages = options.showLoading === false ? false : (options.showLoading === true || (!alreadyHasRenderedMessages && !activeHistoryLoader));
             let tempBox = null;
             let originalId = 'chat-messages';
+            let settled = false;
             window.__chatDetachedRenderingActive = true;
             window.__chatUiStableAt = 0;
             window.__chatVirtualStartIndex = startIndex;
@@ -35649,6 +35659,12 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
                 liveBox.innerHTML = getChatWelcomeBannerHtml() + getChatHistoryLoadingHtml('Preparing messages');
                 applyChatHistoryLoadingInterfaceText(liveBox.querySelector('#chat-history-loading'), 'Preparing messages');
             }
+
+            const settle = value => {
+                if (settled) return;
+                settled = true;
+                resolve(value);
+            };
 
             const cleanupDetachedRender = () => {
                 window.__chatDetachedRenderingActive = false;
@@ -35676,16 +35692,95 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
                 return typeof isChatScreenVisibleForRead === 'function' && !isChatScreenVisibleForRead();
             };
 
+            const scheduleRenderRetry = () => {
+                clearTimeout(window.__chatRenderRetryTimer);
+                window.__chatRenderRetryTimer = setTimeout(() => {
+                    if (!Array.isArray(window.messageHistory) || !window.messageHistory.length) return;
+                    if (typeof isChatScreenVisibleForRead === 'function' && !isChatScreenVisibleForRead()) return;
+                    if (window.__chatLazyRenderPromise) return;
+                    renderDeferredChatHistory({ reason: 'chat-render-retry', force: true, forceBottom: false, showLoading: false });
+                }, 90);
+            };
+
             const abortDetachedRender = () => {
                 try {
                     cleanupDetachedRender();
+                    window.__chatHistoryDomRendered = false;
                     if (liveBox && liveBox.id !== originalId) liveBox.id = originalId;
                     if (liveBox) {
+                        if (liveBox.querySelector && liveBox.querySelector('#chat-history-loading')) liveBox.innerHTML = getChatWelcomeBannerHtml();
                         liveBox.style.visibility = '';
                         liveBox.style.opacity = '1';
                     }
                 } catch (e) {}
-                resolve(false);
+                settle(false);
+                scheduleRenderRetry();
+            };
+
+            const reportRenderError = (err, stage, index = -1) => {
+                console.error(`[chat] lazy render ${stage} failed:`, err);
+                try {
+                    if (typeof socketChat !== 'undefined' && socketChat && socketChat.connected) {
+                        const failed = index >= 0 && history[index] ? history[index] : null;
+                        socketChat.emit('chat_render_error', {
+                            stage,
+                            index,
+                            msgId: failed ? String(new Date(failed.time).getTime() || failed.time || '') : '',
+                            message: String(err && err.message ? err.message : err || '').slice(0, 500)
+                        });
+                    }
+                } catch (e) {}
+            };
+
+            const renderSafeFallback = (err, stage, failedIndex = -1) => {
+                reportRenderError(err, stage, failedIndex);
+                try {
+                    cleanupDetachedRender();
+                    originalId = 'chat-messages';
+                    liveBox.id = originalId;
+                    liveBox.innerHTML = getChatWelcomeBannerHtml();
+                    window.lastChatRawDate = '';
+                    const firstUnreadIndex = getChatFirstUnreadIndex(history, lastReadTime, myName);
+                    for (let index = startIndex; index < endIndex; index++) {
+                        try {
+                            renderChatHistorySliceToActiveBox(history, index, index + 1, {
+                                myName,
+                                lastReadTime,
+                                firstUnreadIndex,
+                                allowUnreadDivider: true,
+                                initialRawDate: window.lastChatRawDate || '',
+                                animateMessages: false
+                            });
+                        } catch (messageError) {
+                            reportRenderError(messageError, 'message', index);
+                        }
+                    }
+                    normalizeChatDateDividers(liveBox);
+                    refreshChatLastRawDateFromRendered();
+                    if (typeof initDateStickyLogic === 'function') initDateStickyLogic();
+                    if (typeof scrollChatToUnreadOrBottom === 'function') scrollChatToUnreadOrBottom({ restoreSmooth: true, setupDivider: true });
+                    window.__chatHistoryDomRendered = true;
+                    window.__chatRenderLastReadSnapshot = null;
+                    if (typeof updateChatHistoryRenderSignature === 'function') updateChatHistoryRenderSignature();
+                    if (typeof markChatUiStableAfterRender === 'function') markChatUiStableAfterRender();
+                    liveBox.style.visibility = '';
+                    liveBox.style.opacity = '1';
+                    if (typeof setupDividerAutoRemove === 'function') setupDividerAutoRemove();
+                    if (typeof refreshChatNotificationDot === 'function') refreshChatNotificationDot();
+                    if (typeof refreshMentionJumpButton === 'function') refreshMentionJumpButton();
+                    settle(true);
+                } catch (fallbackError) {
+                    reportRenderError(fallbackError, 'fallback', failedIndex);
+                    try {
+                        cleanupDetachedRender();
+                        liveBox.id = 'chat-messages';
+                        liveBox.innerHTML = getChatWelcomeBannerHtml();
+                        liveBox.style.visibility = '';
+                        liveBox.style.opacity = '1';
+                    } catch (e) {}
+                    window.__chatHistoryDomRendered = false;
+                    settle(false);
+                }
             };
 
             const finish = () => {
@@ -35719,20 +35814,16 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
                     if (wasShowingLoader) {
                         liveBox.style.visibility = '';
                     } else {
-                        requestAnimationFrame(() => {
-                            liveBox.style.visibility = '';
-                        });
+                        requestAnimationFrame(() => { liveBox.style.visibility = ''; });
                     }
                     if (typeof setupDividerAutoRemove === 'function') setupDividerAutoRemove();
                     if (typeof refreshChatNotificationDot === 'function') refreshChatNotificationDot();
                     if (typeof refreshMentionJumpButton === 'function') refreshMentionJumpButton();
                     if (typeof flushPendingTypingIndicator === 'function') flushPendingTypingIndicator();
                     if (typeof flushPendingChatPresenceUiRefresh === 'function') flushPendingChatPresenceUiRefresh();
-                    resolve(true);
+                    settle(true);
                 } catch (err) {
-                    console.error('[chat] lazy render finish failed:', err);
-                    cleanupDetachedRender();
-                    resolve(false);
+                    renderSafeFallback(err, 'finish');
                 }
             };
 
@@ -35741,42 +35832,45 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
                     abortDetachedRender();
                     return;
                 }
-                createDetachedRenderBox();
-                const firstUnreadIndex = getChatFirstUnreadIndex(history, lastReadTime, myName);
-                const chunkSize = window.matchMedia && window.matchMedia('(max-width: 768px)').matches ? 22 : 36;
-                let renderIndex = startIndex;
-                window.lastChatRawDate = '';
+                try {
+                    createDetachedRenderBox();
+                    const firstUnreadIndex = getChatFirstUnreadIndex(history, lastReadTime, myName);
+                    const chunkSize = window.matchMedia && window.matchMedia('(max-width: 768px)').matches ? 22 : 36;
+                    let renderIndex = startIndex;
+                    window.lastChatRawDate = '';
 
-                const renderChunk = () => {
-                    if (shouldAbortDetachedRender()) {
-                        abortDetachedRender();
-                        return;
-                    }
-                    const chunkEnd = Math.min(endIndex, renderIndex + chunkSize);
-                    renderChatHistorySliceToActiveBox(history, renderIndex, chunkEnd, {
-                        myName,
-                        lastReadTime,
-                        firstUnreadIndex,
-                        allowUnreadDivider: true,
-                        initialRawDate: window.lastChatRawDate || '',
-                        animateMessages: true
-                    });
-                    renderIndex = chunkEnd;
-                    if (renderIndex < endIndex) {
-                        requestAnimationFrame(renderChunk);
-                    } else {
-                        finish();
-                    }
-                };
+                    const renderChunk = () => {
+                        if (shouldAbortDetachedRender()) {
+                            abortDetachedRender();
+                            return;
+                        }
+                        const chunkEnd = Math.min(endIndex, renderIndex + chunkSize);
+                        try {
+                            renderChatHistorySliceToActiveBox(history, renderIndex, chunkEnd, {
+                                myName,
+                                lastReadTime,
+                                firstUnreadIndex,
+                                allowUnreadDivider: true,
+                                initialRawDate: window.lastChatRawDate || '',
+                                animateMessages: true
+                            });
+                        } catch (err) {
+                            renderSafeFallback(err, 'chunk', renderIndex);
+                            return;
+                        }
+                        renderIndex = chunkEnd;
+                        if (renderIndex < endIndex) requestAnimationFrame(renderChunk);
+                        else finish();
+                    };
 
-                requestAnimationFrame(renderChunk);
+                    requestAnimationFrame(renderChunk);
+                } catch (err) {
+                    renderSafeFallback(err, 'initial');
+                }
             };
 
-            if (shouldShowPreparingMessages) {
-                requestAnimationFrame(() => requestAnimationFrame(renderInitialWindow));
-            } else {
-                requestAnimationFrame(renderInitialWindow);
-            }
+            if (shouldShowPreparingMessages) requestAnimationFrame(() => requestAnimationFrame(renderInitialWindow));
+            else requestAnimationFrame(renderInitialWindow);
         }).finally(() => { window.__chatLazyRenderPromise = null; window.__chatDetachedRenderingActive = false; });
         return window.__chatLazyRenderPromise;
     }
@@ -42413,44 +42507,62 @@ function getVisibleChatStackEl(id) {
 			}
 		});
 	
-		socketChat.on('chat_history', function(history, respond) {
-			window.__chatHistoryReceived = true;
-			window.__chatHistoryRequesting = false;
-			const normalizedHistory = typeof normalizeChatHistoryPayload === 'function' ? normalizeChatHistoryPayload(history) : (Array.isArray(history) ? history : []);
-			const incomingSignature = getChatHistoryRenderSignature(normalizedHistory);
-			const sameRenderedHistory = window.__chatHistoryDomRendered === true && window.__chatHistoryRenderSignature === incomingSignature;
-			const box = document.getElementById('chat-messages');
-			const hasRenderedRows = !!(box && box.querySelector('[id^="msg-row-"]'));
-			const hasActiveLoader = !!(box && box.querySelector('#chat-history-loading'));
-			const chatVisible = typeof isChatScreenVisibleForRead === 'function' && isChatScreenVisibleForRead();
+        socketChat.on('chat_history', function(history, respond) {
+            window.__chatHistoryReceived = true;
+            window.__chatHistoryRequesting = false;
+            window.__chatHistoryRequestRetries = 0;
+            clearTimeout(window.__chatHistoryRequestWatchdog);
+            const normalizedHistory = typeof normalizeChatHistoryPayload === 'function' ? normalizeChatHistoryPayload(history) : (Array.isArray(history) ? history : []);
+            const incomingSignature = getChatHistoryRenderSignature(normalizedHistory);
+            const sameRenderedHistory = window.__chatHistoryDomRendered === true && window.__chatHistoryRenderSignature === incomingSignature;
+            const box = document.getElementById('chat-messages');
+            const hasRenderedRows = !!(box && box.querySelector('[id^="msg-row-"]'));
+            const hasActiveLoader = !!(box && box.querySelector('#chat-history-loading'));
+            const chatVisible = typeof isChatScreenVisibleForRead === 'function' && isChatScreenVisibleForRead();
+            let responded = false;
 
-			window.messageHistory = normalizedHistory;
-			if (typeof registerChatUsersFromHistory === 'function') registerChatUsersFromHistory(window.messageHistory);
+            const finishResponse = rendered => {
+                if (responded || typeof respond !== 'function') return;
+                responded = true;
+                try { respond({ ok: true, received: normalizedHistory.length, rendered: rendered !== false }); } catch (e) {}
+            };
 
-			if (chatVisible && hasRenderedRows && !hasActiveLoader && !sameRenderedHistory) {
-				const syncedIncrementally = typeof syncRenderedChatHistoryIncrementally === 'function' && syncRenderedChatHistoryIncrementally(normalizedHistory);
-				if (!syncedIncrementally) {
-					window.__chatHistoryDomRendered = true;
-					window.__chatHistoryRenderSignature = incomingSignature;
-				}
-			} else {
-				if (!sameRenderedHistory) window.__chatHistoryDomRendered = false;
-				window.__chatHistoryRenderSignature = incomingSignature;
-			}
+            window.messageHistory = normalizedHistory;
+            if (typeof registerChatUsersFromHistory === 'function') registerChatUsersFromHistory(window.messageHistory);
 
-			if (chatVisible) {
-				if (!sameRenderedHistory && (!hasRenderedRows || hasActiveLoader)) {
-					if (typeof renderDeferredChatHistory === 'function') {
-						renderDeferredChatHistory({ reason: 'chat_history', force: true, forceBottom: false, showLoading: hasActiveLoader });
-					}
-				}
-			} else {
-				if (box && !box.querySelector('[id^="msg-row-"]') && typeof getChatWelcomeBannerHtml === 'function') box.innerHTML = getChatWelcomeBannerHtml();
-			}
-			if (typeof refreshChatNotificationDot === 'function') refreshChatNotificationDot();
-			if (typeof refreshMentionJumpButton === 'function') refreshMentionJumpButton();
-			if (typeof respond === 'function') { try { respond({ ok: true, received: normalizedHistory.length }); } catch (e) {} }
-		});
+            if (chatVisible && hasRenderedRows && !hasActiveLoader && !sameRenderedHistory) {
+                const syncedIncrementally = typeof syncRenderedChatHistoryIncrementally === 'function' && syncRenderedChatHistoryIncrementally(normalizedHistory);
+                if (!syncedIncrementally) {
+                    window.__chatHistoryDomRendered = true;
+                    window.__chatHistoryRenderSignature = incomingSignature;
+                }
+            } else {
+                if (!sameRenderedHistory) window.__chatHistoryDomRendered = false;
+                window.__chatHistoryRenderSignature = incomingSignature;
+            }
+
+            let renderPromise = null;
+            if (chatVisible) {
+                if (!sameRenderedHistory && (!hasRenderedRows || hasActiveLoader)) {
+                    if (typeof renderDeferredChatHistory === 'function') {
+                        renderPromise = renderDeferredChatHistory({ reason: 'chat_history', force: true, forceBottom: false, showLoading: hasActiveLoader });
+                    }
+                }
+            } else {
+                if (box && !box.querySelector('[id^="msg-row-"]') && typeof getChatWelcomeBannerHtml === 'function') box.innerHTML = getChatWelcomeBannerHtml();
+            }
+            if (typeof refreshChatNotificationDot === 'function') refreshChatNotificationDot();
+            if (typeof refreshMentionJumpButton === 'function') refreshMentionJumpButton();
+
+            if (renderPromise && typeof renderPromise.then === 'function') {
+                Promise.resolve(renderPromise).then(rendered => finishResponse(rendered)).catch(err => {
+                    console.error('[chat] history render promise failed:', err);
+                    finishResponse(false);
+                });
+            } else {
+                finishResponse(true);
+            }
+        });
 
 		socketChat.on('chat_message', function(data) {
 			if (!window.messageHistory) window.messageHistory = [];
