@@ -5514,9 +5514,9 @@ a:focus, button:focus, select:focus, input:focus, textarea:focus, [contenteditab
 							</div>
 							<div class="console-custom-clock-grid">
 								<div class="console-clock-stepper" title="RSX Core MHz">
-									<button type="button" onmouseenter="if(typeof playUiArrow === 'function') playUiArrow()" onclick="adjustConsoleClockInput('console-custom-rsx', -25)" aria-label="Decrease RSX Core"><i class="fas fa-minus"></i></button>
-									<input id="console-custom-rsx" type="number" min="300" max="1200" step="25" value="500" title="RSX Core MHz" oninput="previewConsoleCustomPerformance()" onfocus="if(typeof playUiTextField === 'function') playUiTextField()" onblur="if(typeof playUiBack === 'function') playUiBack()" onkeydown="if(event.key === 'Backspace' || event.key === 'Delete') { if(typeof playUiBackspace === 'function') playUiBackspace(); } else if(event.key.length === 1) { if(typeof playUiInput === 'function') playUiInput(); }">
-									<button type="button" onmouseenter="if(typeof playUiArrow === 'function') playUiArrow()" onclick="adjustConsoleClockInput('console-custom-rsx', 25)" aria-label="Increase RSX Core"><i class="fas fa-plus"></i></button>
+									<button type="button" onmouseenter="if(typeof playUiArrow === 'function') playUiArrow()" onclick="adjustConsoleClockInput('console-custom-rsx', -50)" aria-label="Decrease RSX Core"><i class="fas fa-minus"></i></button>
+									<input id="console-custom-rsx" type="number" min="300" max="1200" step="50" value="500" title="RSX Core MHz" oninput="previewConsoleCustomPerformance()" onfocus="if(typeof playUiTextField === 'function') playUiTextField()" onblur="if(typeof playUiBack === 'function') playUiBack()" onkeydown="if(event.key === 'Backspace' || event.key === 'Delete') { if(typeof playUiBackspace === 'function') playUiBackspace(); } else if(event.key.length === 1) { if(typeof playUiInput === 'function') playUiInput(); }">
+									<button type="button" onmouseenter="if(typeof playUiArrow === 'function') playUiArrow()" onclick="adjustConsoleClockInput('console-custom-rsx', 50)" aria-label="Increase RSX Core"><i class="fas fa-plus"></i></button>
 								</div>
 								<div class="console-clock-stepper" title="VRAM MHz">
 									<button type="button" onmouseenter="if(typeof playUiArrow === 'function') playUiArrow()" onclick="adjustConsoleClockInput('console-custom-vram', -25)" aria-label="Decrease VRAM"><i class="fas fa-minus"></i></button>
@@ -29265,6 +29265,7 @@ P
 	let ps3PingInFlight = false;
 	let ps3ConnectionMisses = 0;
 	let ps3AutoScanBusy = false;
+	let ps3LibraryScanInProgress = false;
 	let ps3LastAutoScanAt = 0;
 	let companionPluginLastLoadAt = 0;
 
@@ -29316,6 +29317,23 @@ P
 		}
 		return true;
 	}
+
+	function revealMyGamesAfterPendingScan() {
+		if (window.__pendingMyGamesScanReveal !== true || window.isRestoringHistory) return false;
+		requestAnimationFrame(() => requestAnimationFrame(() => {
+			if (window.__pendingMyGamesScanReveal !== true || window.isRestoringHistory) return;
+			const libraryView = document.getElementById('view-library');
+			const gamesSubview = document.getElementById('subview-games');
+			const grid = document.getElementById('ps3-local-grid');
+			const libraryVisible = !!libraryView && window.getComputedStyle(libraryView).display !== 'none';
+			const gamesVisible = !!gamesSubview && window.getComputedStyle(gamesSubview).display !== 'none';
+			if (!libraryVisible || !gamesVisible || !grid || !grid.querySelector('.game-card')) return;
+			if (typeof setupRevealAnimations === 'function') setupRevealAnimations('ps3-local-grid');
+			window.__pendingMyGamesScanReveal = false;
+		}));
+		return true;
+	}
+	window.revealMyGamesAfterPendingScan = revealMyGamesAfterPendingScan;
 
 	function setPs3ConnectingVisual() {
 		const globalIcon = document.getElementById('global-status-icon');
@@ -29525,20 +29543,37 @@ P
 		}
 	}
 	
+	function isVisibleConsoleLibrarySection(id) {
+		if (typeof isPsnDomSectionVisible === 'function') return isPsnDomSectionVisible(id);
+		const el = document.getElementById(id);
+		return !!(el && window.getComputedStyle(el).display !== 'none');
+	}
+
 	function onConnectionChanged(isConnected) {
 		syncBrowseRemoteDownloadStatusFromIpDot();
 
-		const libraryVisible = document.getElementById('view-library')?.style.display === 'block';
-		if (!libraryVisible) return;
-	
-		const gamesVisible = document.getElementById('subview-games')?.style.display === 'block';
-		const filesVisible = document.getElementById('subview-files')?.style.display === 'block';
-		const favsVisible  = document.getElementById('subview-favs')?.style.display === 'block';
-		const monitorVisible = document.getElementById('subview-monitor')?.style.display !== 'none';
-	
-		if (gamesVisible) refreshPS3Library();
-		if (filesVisible) explorePath(currentPath || '/');
-		if (favsVisible)  updateFavoritesLibraryUI();
+		if (!isVisibleConsoleLibrarySection('view-library')) return;
+
+		const gamesVisible = isVisibleConsoleLibrarySection('subview-games');
+		const filesVisible = isVisibleConsoleLibrarySection('subview-files');
+		const favsVisible = isVisibleConsoleLibrarySection('subview-favs');
+		const monitorVisible = isVisibleConsoleLibrarySection('subview-monitor');
+
+		if (gamesVisible) {
+			const gamesSubview = document.getElementById('subview-games');
+			if (isConnected) {
+				if (gamesSubview) gamesSubview.classList.remove('my-games-offline');
+				const cachedGames = (typeof lastScannedGames !== 'undefined' && Array.isArray(lastScannedGames)) ? lastScannedGames : [];
+				if (cachedGames.length > 0) {
+					if (typeof window.applyLibraryFilters === 'function') window.applyLibraryFilters(true);
+					else if (typeof renderLocalLibrary === 'function') renderLocalLibrary(cachedGames, true, true);
+				}
+			}
+			Promise.resolve(refreshPS3Library()).catch(err => console.warn('[PS3 Library] Reconnect refresh failed:', err));
+		}
+
+		if (filesVisible && typeof explorePath === 'function') explorePath(currentPath || '/');
+		if (favsVisible && typeof updateFavoritesLibraryUI === 'function') updateFavoritesLibraryUI(true);
 		if (monitorVisible && typeof updateConsoleDashboardUI === 'function') updateConsoleDashboardUI();
 	}
 	
@@ -30314,6 +30349,10 @@ P
 			if (searchBar && canToggleSearch) {
 				searchBar.style.display = 'flex';
 			}
+
+			if (!ps3LibraryScanInProgress && typeof revealMyGamesAfterPendingScan === 'function') {
+				revealMyGamesAfterPendingScan();
+			}
 	
 		} catch (err) {
 			console.error("Connection Error:", err);
@@ -30808,7 +30847,7 @@ P
 		}
 	}
 	
-	window.applyLibraryFilters = function() {
+	window.applyLibraryFilters = function(isSilent = false) {
 		if (!lastScannedGames || lastScannedGames.length === 0) return;
 	
 		const term = document.getElementById('search-input').value.toLowerCase().trim();
@@ -30851,7 +30890,7 @@ P
 			status.innerText = `(${window.formatUiCount ? window.formatUiCount(filtered.length, 'item', 'items') : `${filtered.length} ${filtered.length === 1 ? 'item' : 'items'}`})`;
 		}
 	
-		renderLocalLibrary(filtered, true);
+		renderLocalLibrary(filtered, true, !!isSilent);
 	};
 	
 	window.toggleLocalFavorite = function(event, index) {
@@ -31340,6 +31379,7 @@ P
 			ps3LastAutoScanAt = Date.now();
 		}
 
+		ps3LibraryScanInProgress = true;
 		if (typeof playUiClick === "function") playUiClick();
 
 		if (status) { 
@@ -31369,11 +31409,14 @@ P
 					}
 				} finally {
 					ps3AutoScanBusy = false;
+					ps3LibraryScanInProgress = false;
+					if (typeof revealMyGamesAfterPendingScan === 'function') revealMyGamesAfterPendingScan();
 				}
 
 			}, 5000);
 		} catch (e) {
 			ps3AutoScanBusy = false;
+			ps3LibraryScanInProgress = false;
 			console.error("Scan failed", e);
 			if (status) { 
 				status.innerText = "(Scan Error)"; 
@@ -34224,6 +34267,10 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 		}
 		
 		const existingLibraryCards = document.querySelector('#ps3-local-grid .game-card');
+		const hasExistingLibraryCards = !!existingLibraryCards;
+		const libraryStatusText = String(document.getElementById('library-status')?.innerText || '');
+		const enteringDuringLibraryScan = ps3LibraryScanInProgress || /\b(?:Scanning|Refreshing)\b/i.test(libraryStatusText);
+		if (!window.isRestoringHistory) window.__pendingMyGamesScanReveal = enteringDuringLibraryScan && !hasExistingLibraryCards;
 		if (window.isRestoringHistory && existingLibraryCards && typeof applyLibraryFilters === 'function') applyLibraryFilters();
 		else refreshPS3Library();
 	}
@@ -34234,10 +34281,18 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 		nextView.classList.add('anim-up');
 	}
 
-	if (type === 'games' && !window.isRestoringHistory && typeof setupRevealAnimations === 'function') {
+	if (type === 'games' && !window.isRestoringHistory) {
 		requestAnimationFrame(() => requestAnimationFrame(() => {
 			const grid = document.getElementById('ps3-local-grid');
-			if (grid && grid.querySelector('.game-card')) setupRevealAnimations('ps3-local-grid');
+			const hasVisibleCards = !!(grid && grid.querySelector('.game-card'));
+			if (hasVisibleCards && typeof setupRevealAnimations === 'function') {
+				window.__pendingMyGamesScanReveal = false;
+				setupRevealAnimations('ps3-local-grid');
+				return;
+			}
+			if (window.__pendingMyGamesScanReveal === true && !ps3LibraryScanInProgress && typeof revealMyGamesAfterPendingScan === 'function') {
+				revealMyGamesAfterPendingScan();
+			}
 		}));
 	}
 
@@ -34360,9 +34415,11 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 				if (favDot) favDot.style.display = 'block';
 			}
 	
-			updateFavoritesLibraryUI();
-			if (document.getElementById('subview-files').style.display === 'block') {
-				explorePath('/');
+			if (typeof onConnectionChanged === 'function') {
+				onConnectionChanged(true);
+			} else {
+				if (typeof updateFavoritesLibraryUI === 'function') updateFavoritesLibraryUI(true);
+				if (document.getElementById('subview-files')?.style.display === 'block' && typeof explorePath === 'function') explorePath('/');
 			}
 	
 			startConnectionMonitor();
@@ -34379,9 +34436,13 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 			const favDot = document.getElementById('fav-dot');
 			if (favDot) favDot.style.display = 'none';
 	
-			refreshPS3Library();
-			updateFavoritesLibraryUI();
-			if (typeof updateConsoleDashboardUI === 'function') updateConsoleDashboardUI();
+			if (typeof onConnectionChanged === 'function') {
+				onConnectionChanged(false);
+			} else {
+				refreshPS3Library();
+				updateFavoritesLibraryUI();
+				if (typeof updateConsoleDashboardUI === 'function') updateConsoleDashboardUI();
+			}
 	
 			const isFirefox = navigator.userAgent.toLowerCase().includes('firefox');
 			if (!silent) {
