@@ -5496,6 +5496,7 @@ io.on('connection', (socket) => {
       adminState.pinnedAnnouncement = shouldClear ? null : {
         id: data.id || `admin-announcement-${Date.now()}`,
         text: normalizeText(data.text, ""),
+        color: /^#[0-9a-f]{6}$/i.test(normalizeText(data.color, "")) ? normalizeText(data.color, "").toLowerCase() : "#ffcc00",
         by: socket.userName || data.by || "Admin",
         at: data.at || new Date().toISOString()
       };
