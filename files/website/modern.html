@@ -2608,6 +2608,7 @@ body.is-admin #nav-admin-footer { display: flex !important; }
 .admin-report-actions .btn-mini-round.report-resolve { border-color: rgba(76,175,80,0.45); color: #4caf50; }
 .admin-log-type { display: inline-flex; align-items: center; gap: 4px; padding: 2px 6px; border-radius: 999px; background: rgba(0,112,204,.12); color: #00d4ff; font-size: 8px; font-weight: 900; margin-right: 6px; text-transform: uppercase; letter-spacing: .5px; }
 #admin-maintenance-overlay { position: fixed; inset: 0; z-index: 2147483000; display: flex; align-items: center; justify-content: center; padding: 24px; background: radial-gradient(circle at 50% 0%,rgba(0,112,204,.34),rgba(3,5,9,.96) 58%,#000 100%); backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px); }
+body.admin-maintenance-reveal-pending #user-select-screen, body.admin-maintenance-reveal-pending .classic-site-switch, body.admin-maintenance-reveal-pending #name-input-overlay, body.admin-maintenance-reveal-pending #login-input-overlay { pointer-events: none !important; }
 .admin-maintenance-box { width: min(560px,92vw); border-radius: 18px; padding: 28px; background: rgba(18,24,36,.9); border: 1px solid rgba(255,255,255,.16); box-shadow: 0 25px 80px rgba(0,0,0,.8),0 0 30px rgba(0,112,204,.2); text-align: center; }
 .admin-maintenance-box i { font-size: 42px; color: #ffcc00; filter: drop-shadow(0 0 12px rgba(255,204,0,.5)); margin-bottom: 14px; }
 .admin-maintenance-box h2 { margin: 0 0 10px 0; font-weight: 300; letter-spacing: -.4px; }
@@ -12826,6 +12827,8 @@ P
 			bootContainer.classList.remove('boot-intro-pending', 'boot-intro-transitioning');
 			bootContainer.classList.add('boot-intro-finished');
 			bootContainer.dataset.introCompleted = 'true';
+			window.__psnUserSelectRevealedAt = Date.now();
+			if (typeof window.adminMaintenanceUserSelectRevealed === 'function') window.adminMaintenanceUserSelectRevealed();
 		};
 
 		const transitionToUserSelect = () => {
@@ -23806,7 +23809,65 @@ P
 	}
 
 
-	function adminUpdateMaintenanceOverlay() {
+	const ADMIN_MAINTENANCE_LOGIN_REVEAL_DELAY_MS = 1800;
+	let adminMaintenanceLoginRevealTimer = null;
+
+	function adminIsStartingScreenActive() {
+		const bootContainer = document.getElementById('ps5-boot-container');
+		const bootIntro = document.getElementById('ps5-boot-intro');
+		if (!bootContainer || bootContainer.style.display === 'none') return false;
+		const introState = String(bootContainer.dataset.introCompleted || '');
+		if (introState === 'running' || introState === 'transitioning') return true;
+		if (bootContainer.classList.contains('boot-intro-pending') || bootContainer.classList.contains('boot-intro-transitioning')) return true;
+		if (bootIntro) {
+			const style = window.getComputedStyle ? window.getComputedStyle(bootIntro) : null;
+			if ((!style || style.display !== 'none') && bootIntro.style.display !== 'none') return true;
+		}
+		return false;
+	}
+
+	function adminSetMaintenanceRevealPending(pending) {
+		if (!document.body) return;
+		document.body.classList.toggle('admin-maintenance-reveal-pending', !!pending);
+	}
+
+	function adminClearMaintenanceLoginRevealDelay() {
+		if (adminMaintenanceLoginRevealTimer) {
+			clearTimeout(adminMaintenanceLoginRevealTimer);
+			adminMaintenanceLoginRevealTimer = null;
+		}
+		adminSetMaintenanceRevealPending(false);
+	}
+
+	function adminScheduleMaintenanceOverlayAfterUserReveal(delayMs = ADMIN_MAINTENANCE_LOGIN_REVEAL_DELAY_MS) {
+		const state = adminGetMaintenanceState();
+		if (!state.enabled || window.isProfileLoaded === true || document.body.classList.contains('is-admin') || document.body.classList.contains('admin-maintenance-login-bypass')) {
+			adminClearMaintenanceLoginRevealDelay();
+			return false;
+		}
+		const waitMs = Math.max(0, Number(delayMs) || 0);
+		adminSetMaintenanceRevealPending(true);
+		if (adminMaintenanceLoginRevealTimer) clearTimeout(adminMaintenanceLoginRevealTimer);
+		adminMaintenanceLoginRevealTimer = setTimeout(() => {
+			adminMaintenanceLoginRevealTimer = null;
+			adminSetMaintenanceRevealPending(false);
+			adminUpdateMaintenanceOverlay({ skipInitialRevealDelay: true });
+		}, waitMs);
+		return true;
+	}
+
+	window.adminMaintenanceUserSelectRevealed = function() {
+		window.__psnUserSelectRevealedAt = Date.now();
+		const state = adminGetMaintenanceState();
+		if (!state.enabled) {
+			adminClearMaintenanceLoginRevealDelay();
+			adminUpdateMaintenanceOverlay({ skipInitialRevealDelay: true });
+			return;
+		}
+		adminScheduleMaintenanceOverlayAfterUserReveal(ADMIN_MAINTENANCE_LOGIN_REVEAL_DELAY_MS);
+	};
+
+	function adminUpdateMaintenanceOverlay(options = {}) {
 		const state = adminGetMaintenanceState();
 		let overlay = document.getElementById('admin-maintenance-overlay');
 		const isAdmin = document.body.classList.contains('is-admin');
@@ -23814,9 +23875,29 @@ P
 		const adminLoginBypass = document.body.classList.contains('admin-maintenance-login-bypass') && loginVisible;
 
 		if (!state.enabled || isAdmin || adminLoginBypass) {
+			adminClearMaintenanceLoginRevealDelay();
 			if (overlay) overlay.remove();
 			return;
 		}
+
+		if (window.isProfileLoaded !== true && options.skipInitialRevealDelay !== true) {
+			if (adminIsStartingScreenActive()) {
+				if (overlay) overlay.remove();
+				adminSetMaintenanceRevealPending(false);
+				return;
+			}
+			const revealedAt = Number(window.__psnUserSelectRevealedAt || 0);
+			if (revealedAt > 0) {
+				const elapsed = Math.max(0, Date.now() - revealedAt);
+				if (elapsed < ADMIN_MAINTENANCE_LOGIN_REVEAL_DELAY_MS) {
+					if (overlay) overlay.remove();
+					adminScheduleMaintenanceOverlayAfterUserReveal(ADMIN_MAINTENANCE_LOGIN_REVEAL_DELAY_MS - elapsed);
+					return;
+				}
+			}
+		}
+
+		adminClearMaintenanceLoginRevealDelay();
 		if (!overlay) {
 			overlay = document.createElement('div');
 			overlay.id = 'admin-maintenance-overlay';
@@ -23845,6 +23926,7 @@ P
 			return;
 		}
 		document.body.classList.add('admin-maintenance-login-bypass');
+		if (typeof adminClearMaintenanceLoginRevealDelay === 'function') adminClearMaintenanceLoginRevealDelay();
 		isEditMode = false;
 		const selectScreen = document.getElementById('user-select-screen');
 		if (typeof closeAllPs5AuthOverlaysInstant === 'function') closeAllPs5AuthOverlaysInstant();
@@ -25491,10 +25573,37 @@ P
 		adminUpdateMaintenanceOverlay();
 	}
 
+	function adminEnsurePreAuthMaintenanceConnection(reason = 'maintenance-preauth') {
+		if (window.isProfileLoaded === true) return false;
+		try {
+			if (typeof socketChat !== 'undefined' && socketChat) {
+				if (typeof adminInstallMaintenanceSocketListeners === 'function') adminInstallMaintenanceSocketListeners();
+				window.__psnPreAuthMaintenanceSocket = true;
+				if (socketChat.io) {
+					if (typeof socketChat.io.reconnection === 'function') socketChat.io.reconnection(true);
+					if (typeof socketChat.io.reconnectionAttempts === 'function') socketChat.io.reconnectionAttempts(Infinity);
+					if (typeof socketChat.io.reconnectionDelay === 'function') socketChat.io.reconnectionDelay(1500);
+					if (typeof socketChat.io.reconnectionDelayMax === 'function') socketChat.io.reconnectionDelayMax(30000);
+				}
+				if (!socketChat.connected && !socketChat.active) socketChat.connect();
+				return true;
+			}
+			if (typeof initChat === 'function') {
+				initChat({ preAuthMaintenance: true, reason });
+				return true;
+			}
+		} catch (err) {
+			console.warn('[MAINTENANCE] Pre-login realtime connection could not start:', err);
+		}
+		return false;
+	}
+	window.adminEnsurePreAuthMaintenanceConnection = adminEnsurePreAuthMaintenanceConnection;
+
 	function adminBootExtras() {
 		window.adminPageStartTime = window.adminPageStartTime || Date.now();
 		adminInstallMaintenanceSocketListeners();
-		adminInstallSocketListeners();
+		if (window.isProfileLoaded === true) adminInstallSocketListeners();
+		setTimeout(() => adminEnsurePreAuthMaintenanceConnection('page-load'), 0);
 		adminInstallAnnouncementScrollHandler();
 		setTimeout(adminLightMaintenanceOverlayTick, 180);
 		setTimeout(adminUpdateAnnouncementBanner, 220);
@@ -25504,7 +25613,7 @@ P
 		setTimeout(() => { if (typeof window.adminRequestChatControlsState === 'function') window.adminRequestChatControlsState(); }, 2600);
 		setInterval(() => {
 			adminInstallMaintenanceSocketListeners();
-			adminInstallSocketListeners();
+			if (window.isProfileLoaded === true) adminInstallSocketListeners();
 			const adminVisible = document.getElementById('view-admin')?.style.display === 'block';
 			if (adminVisible) {
 				adminRefreshHealth(false);
@@ -35755,6 +35864,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 
 	const MAX_CHAT_HISTORY = 1000;
     let socketChat;
+	window.__psnPreAuthMaintenanceSocket = false;
 	let currentOnlineList = [];
 	let pinnedMessages = [];
 	let currentPinIndex = 0;
@@ -43004,6 +43114,18 @@ function getVisibleChatStackEl(id) {
 		} catch (e) {}
 	}
 
+	function promoteServerConnectionForAuthenticatedUse() {
+		window.__psnPreAuthMaintenanceSocket = false;
+		if (typeof socketChat === 'undefined' || !socketChat || !socketChat.io) return;
+		try {
+			if (typeof socketChat.io.reconnection === 'function') socketChat.io.reconnection(true);
+			if (typeof socketChat.io.reconnectionAttempts === 'function') socketChat.io.reconnectionAttempts(Infinity);
+			if (typeof socketChat.io.reconnectionDelay === 'function') socketChat.io.reconnectionDelay(700);
+			if (typeof socketChat.io.reconnectionDelayMax === 'function') socketChat.io.reconnectionDelayMax(5000);
+		} catch (e) {}
+	}
+	window.promoteServerConnectionForAuthenticatedUse = promoteServerConnectionForAuthenticatedUse;
+
 	function setServerUnavailableModalContext(context = 'login') {
 		serverUnavailableContext = context === 'create' ? 'create' : (context === 'session' ? 'session' : 'login');
 		const statusText = document.getElementById('server-unavailable-status-text');
@@ -43403,10 +43525,14 @@ function getVisibleChatStackEl(id) {
 		if (typeof closeAllPs5AuthOverlaysInstant === 'function') closeAllPs5AuthOverlaysInstant();
 		if (typeof setUserSelectAuthHidden === 'function') setUserSelectAuthHidden(false);
 		window.hideServerUnavailableModal();
+		setTimeout(() => {
+			if (typeof window.adminEnsurePreAuthMaintenanceConnection === 'function') window.adminEnsurePreAuthMaintenanceConnection('server-unavailable-back');
+		}, 80);
 	};
 
 	window.sendLoginAuthentication = function(payload) {
 		if (!payload || !payload.name) return false;
+		if (typeof promoteServerConnectionForAuthenticatedUse === 'function') promoteServerConnectionForAuthenticatedUse();
 		payload.profileSyncV2 = true;
 		payload.profileSyncAckV1 = true;
 		payload.chatHistoryAckV1 = true;
@@ -43524,7 +43650,9 @@ function getVisibleChatStackEl(id) {
 		window.hideServerUnavailableModal();
 	}
 
-	function initChat() {
+	function initChat(options = {}) {
+		const preAuthMaintenance = options.preAuthMaintenance === true && window.isProfileLoaded !== true && !loginServerAttempt;
+		window.__psnPreAuthMaintenanceSocket = preAuthMaintenance;
 		document.body.classList.remove('is-admin');
 		document.body.classList.remove('is-mod');
 		document.body.classList.remove('admin-maintenance-login-bypass');
@@ -43540,16 +43668,16 @@ function getVisibleChatStackEl(id) {
 			socketChat = null;
 		}
 		
-		if (typeof resetChatOnlinePresenceUi === 'function') resetChatOnlinePresenceUi();
-		if (typeof updateGlobalOnlineStatus === 'function') updateGlobalOnlineStatus('connecting');
+		if (!preAuthMaintenance && typeof resetChatOnlinePresenceUi === 'function') resetChatOnlinePresenceUi();
+		if (!preAuthMaintenance && typeof updateGlobalOnlineStatus === 'function') updateGlobalOnlineStatus('connecting');
 
 		socketChat = io(serverUrls[currentServerIndex], {
 			forceNew: true,
 			reconnection: true,
 			reconnectionAttempts: Infinity,
-			reconnectionDelay: 700,
-			reconnectionDelayMax: 5000,
-			timeout: 12000,
+			reconnectionDelay: preAuthMaintenance ? 1500 : 700,
+			reconnectionDelayMax: preAuthMaintenance ? 30000 : 5000,
+			timeout: preAuthMaintenance ? 8000 : 12000,
 			closeOnBeforeunload: false
 		})
 		if (typeof adminInstallMaintenanceSocketListeners === 'function') adminInstallMaintenanceSocketListeners();
@@ -43557,13 +43685,17 @@ function getVisibleChatStackEl(id) {
 		
 		socketChat.on('connect', () => {
 			markServerConnectionAvailable();
-			window.__chatOnlineListReceived = false;
-			window.__chatRealtimeBootstrapToken = Number(window.__chatRealtimeBootstrapToken || 0) + 1;
-			const chatRealtimeConnectToken = window.__chatRealtimeBootstrapToken;
-			setTimeout(() => {
-				if (Number(window.__chatRealtimeBootstrapToken || 0) !== chatRealtimeConnectToken) return;
-				if (typeof bootstrapChatRealtime === 'function') bootstrapChatRealtime('socket-connect', { token: chatRealtimeConnectToken, attempt: 0 });
-			}, 180);
+			const authenticatedRuntime = window.isProfileLoaded === true || !!loginServerAttempt || window.__psnAutoReauthInProgress === true;
+			if (authenticatedRuntime) {
+				window.__chatOnlineListReceived = false;
+				window.__chatRealtimeBootstrapToken = Number(window.__chatRealtimeBootstrapToken || 0) + 1;
+				const chatRealtimeConnectToken = window.__chatRealtimeBootstrapToken;
+				setTimeout(() => {
+					if (Number(window.__chatRealtimeBootstrapToken || 0) !== chatRealtimeConnectToken) return;
+					if (window.isProfileLoaded !== true) return;
+					if (typeof bootstrapChatRealtime === 'function') bootstrapChatRealtime('socket-connect', { token: chatRealtimeConnectToken, attempt: 0 });
+				}, 180);
+			}
 			if (loginServerAttempt && loginServerAttempt.reconnectGraceTimer) {
 				clearTimeout(loginServerAttempt.reconnectGraceTimer);
 				loginServerAttempt.reconnectGraceTimer = null;
@@ -43572,8 +43704,9 @@ function getVisibleChatStackEl(id) {
 				loginServerAttempt.trySend();
 			}
 			const restoringOfflineSession = psnOfflineModeActive && window.isProfileLoaded === true;
-			if (typeof updateGlobalOnlineStatus === 'function') updateGlobalOnlineStatus(restoringOfflineSession ? 'connecting' : 'online');
-			if (typeof adminUpdateChatControlsBanner === 'function') adminUpdateChatControlsBanner();
+			const preAuthMaintenanceRuntime = window.__psnPreAuthMaintenanceSocket === true && window.isProfileLoaded !== true && !loginServerAttempt;
+			if (!preAuthMaintenanceRuntime && typeof updateGlobalOnlineStatus === 'function') updateGlobalOnlineStatus(restoringOfflineSession ? 'connecting' : 'online');
+			if (!preAuthMaintenanceRuntime && typeof adminUpdateChatControlsBanner === 'function') adminUpdateChatControlsBanner();
 		
 			const myName = localStorage.getItem('psn_username');
 			const myPass = myName ? localStorage.getItem(`${myName}_psn_password`) : null;
@@ -43612,7 +43745,7 @@ function getVisibleChatStackEl(id) {
 			}
 			
 			const s = document.getElementById('chat-status-text');
-			if (s) {
+			if (!preAuthMaintenanceRuntime && s) {
 				s.innerText = restoringOfflineSession ? "(Reconnecting...)" : "(Connected)";
 				s.style.color = restoringOfflineSession ? "#ffbb33" : "#4caf50";
 			}
@@ -43662,6 +43795,7 @@ function getVisibleChatStackEl(id) {
 		});
 		
 		socketChat.on('auth_success', async (data) => {
+			if (typeof promoteServerConnectionForAuthenticatedUse === 'function') promoteServerConnectionForAuthenticatedUse();
 			if (typeof adminInstallSocketListeners === 'function') adminInstallSocketListeners();
 			if (typeof window.clearLoginServerAttempt === 'function') window.clearLoginServerAttempt();
 			window.__psnAutoReauthInProgress = false;
@@ -45306,15 +45440,16 @@ function getVisibleChatStackEl(id) {
 	
 		socketChat.on('connect_error', () => {
 			if (typeof isKicked !== 'undefined' && isKicked) return;
-			if (typeof resetChatOnlinePresenceUi === 'function') resetChatOnlinePresenceUi();
-			profileRealtimeConnectionWasLost = true;
+			const preAuthMaintenanceRuntime = window.__psnPreAuthMaintenanceSocket === true && window.isProfileLoaded !== true && !loginServerAttempt;
+			if (!preAuthMaintenanceRuntime && typeof resetChatOnlinePresenceUi === 'function') resetChatOnlinePresenceUi();
+			if (!preAuthMaintenanceRuntime) profileRealtimeConnectionWasLost = true;
 			if (serverUnavailableManualRetryActive) {
 				serverUnavailableManualRetryActive = false;
 				scheduleServerUnavailableRetryFailed();
 			}
 			
-			if (typeof updateGlobalOnlineStatus === 'function') updateGlobalOnlineStatus('connecting');
-			if (typeof adminUpdateChatControlsBanner === 'function') adminUpdateChatControlsBanner();
+			if (!preAuthMaintenanceRuntime && typeof updateGlobalOnlineStatus === 'function') updateGlobalOnlineStatus('connecting');
+			if (!preAuthMaintenanceRuntime && typeof adminUpdateChatControlsBanner === 'function') adminUpdateChatControlsBanner();
 			const s = document.getElementById('chat-status-text');
 			const failedServerIndex = currentServerIndex;
 			
@@ -45329,22 +45464,23 @@ function getVisibleChatStackEl(id) {
 				scheduleSessionServerUnavailable();
 			}
 			
-			currentServerIndex = (currentServerIndex + 1) % serverUrls.length;
-			console.log(`[NETWORK] Connection failed. Rotating to server: ${serverUrls[currentServerIndex]}`);
-			
-			if (s) { s.innerText = "(Connecting...)"; s.style.color = "#ffbb33"; }
-			
-			if (socketChat.io) {
-				socketChat.io.uri = serverUrls[currentServerIndex];
+			if (!preAuthMaintenanceRuntime) {
+				currentServerIndex = (currentServerIndex + 1) % serverUrls.length;
+				console.log(`[NETWORK] Connection failed. Rotating to server: ${serverUrls[currentServerIndex]}`);
+				if (s) { s.innerText = "(Connecting...)"; s.style.color = "#ffbb33"; }
+				if (socketChat.io) socketChat.io.uri = serverUrls[currentServerIndex];
 			}
 		});
 	
 		socketChat.on('disconnect', (reason) => {
 			if (typeof isKicked !== 'undefined' && isKicked) return;
-			if (typeof resetChatOnlinePresenceUi === 'function') resetChatOnlinePresenceUi();
-			window.__chatOnlineListReceived = false;
-			window.__chatRealtimeBootstrapToken = Number(window.__chatRealtimeBootstrapToken || 0) + 1;
-			if (reason !== 'io client disconnect') {
+			const preAuthMaintenanceRuntime = window.__psnPreAuthMaintenanceSocket === true && window.isProfileLoaded !== true && !loginServerAttempt;
+			if (!preAuthMaintenanceRuntime && typeof resetChatOnlinePresenceUi === 'function') resetChatOnlinePresenceUi();
+			if (!preAuthMaintenanceRuntime) {
+				window.__chatOnlineListReceived = false;
+				window.__chatRealtimeBootstrapToken = Number(window.__chatRealtimeBootstrapToken || 0) + 1;
+			}
+			if (reason !== 'io client disconnect' && !preAuthMaintenanceRuntime) {
 				profileRealtimeConnectionWasLost = true;
 				if (loginServerAttempt) {
 					const failedIndex = Number.isInteger(loginServerAttempt.emittedServerIndex)
@@ -45360,20 +45496,24 @@ function getVisibleChatStackEl(id) {
 				clearSessionServerUnavailableTimer();
 			}
 			
-			if (typeof updateGlobalOnlineStatus === 'function') updateGlobalOnlineStatus('offline');
-			if (typeof adminUpdateChatControlsBanner === 'function') adminUpdateChatControlsBanner();
+			if (!preAuthMaintenanceRuntime && typeof updateGlobalOnlineStatus === 'function') updateGlobalOnlineStatus('offline');
+			if (!preAuthMaintenanceRuntime && typeof adminUpdateChatControlsBanner === 'function') adminUpdateChatControlsBanner();
 			const s = document.getElementById('chat-status-text');
-			if (s) { s.innerText = "(Disconnected)"; s.style.color = "#ffbb33"; }
+			if (!preAuthMaintenanceRuntime && s) { s.innerText = "(Disconnected)"; s.style.color = "#ffbb33"; }
 		});
 
 		if (socketChat.io) {
 			socketChat.io.on('reconnect_attempt', () => {
+				const preAuthMaintenanceRuntime = window.__psnPreAuthMaintenanceSocket === true && window.isProfileLoaded !== true && !loginServerAttempt;
+				if (preAuthMaintenanceRuntime) return;
 				if (typeof resetChatOnlinePresenceUi === 'function') resetChatOnlinePresenceUi();
 				if (typeof updateGlobalOnlineStatus === 'function') updateGlobalOnlineStatus('connecting');
 				if (typeof adminUpdateChatControlsBanner === 'function') adminUpdateChatControlsBanner();
 			});
 			socketChat.io.on('reconnect', () => {
 				markServerConnectionAvailable();
+				const preAuthMaintenanceRuntime = window.__psnPreAuthMaintenanceSocket === true && window.isProfileLoaded !== true && !loginServerAttempt;
+				if (preAuthMaintenanceRuntime) return;
 				const restoringOfflineSession = psnOfflineModeActive && window.isProfileLoaded === true;
 				if (typeof updateGlobalOnlineStatus === 'function') updateGlobalOnlineStatus(restoringOfflineSession ? 'connecting' : 'online');
 				if (typeof adminUpdateChatControlsBanner === 'function') adminUpdateChatControlsBanner();
@@ -45701,6 +45841,9 @@ function getVisibleChatStackEl(id) {
 		if (typeof setUserSelectAuthHidden === 'function') setUserSelectAuthHidden(false);
 		if (typeof loadUserGrid === 'function') loadUserGrid();
 		if (typeof updateAdminVisibility === 'function') updateAdminVisibility();
+		setTimeout(() => {
+			if (typeof window.adminEnsurePreAuthMaintenanceConnection === 'function') window.adminEnsurePreAuthMaintenanceConnection('return-to-login');
+		}, 80);
 
 		const bootContainer = document.getElementById('ps5-boot-container');
 		const userSelect = document.getElementById('user-select-screen');
