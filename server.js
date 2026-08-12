@@ -1438,6 +1438,15 @@ const PROFILE_ARRAY_SYNC_KEYS = {
   friendsData: { versionKey: 'friendsUpdatedAt', countKey: 'friends' }
 };
 
+const PROFILE_REPLAY_SECTION_DATA_KEYS = {
+  trophies: 'trophiesData',
+  downloads: 'downloadsData',
+  wishlist: 'wishlistData',
+  favorites: 'favoritesData',
+  library: 'libraryData',
+  friends: 'friendsData'
+};
+
 function normalizeTimestampValue(value) {
   const timestamp = Number(value || 0);
   return Number.isFinite(timestamp) && timestamp > 0 ? timestamp : 0;
@@ -4563,12 +4572,24 @@ io.on('connection', (socket) => {
     ), 0);
   });
 
-  socket.on('update_profile', async (userData) => {
+  socket.on('update_profile', async (userData, ack) => {
+    const respond = response => {
+      if (typeof ack !== 'function' || !socket.connected) return;
+      try { ack(response); } catch (err) {}
+    };
     const name = socket.userName;
-    if (!name || !userDatabase[name]) return;
-    userData = (userData && typeof userData === "object") ? userData : {};
+    if (!name || !userDatabase[name]) { respond({ ok: false, error: 'Profile is not available.' }); return; }
+    userData = (userData && typeof userData === "object") ? { ...userData } : {};
+    const syncRequestId = normalizeText(userData._syncRequestId, '');
+    const syncReason = normalizeText(userData._syncReason, '');
+    const requestedSyncSections = Array.isArray(userData._syncSections)
+      ? [...new Set(userData._syncSections.map(value => normalizeText(value, '').toLowerCase()).filter(value => Object.prototype.hasOwnProperty.call(PROFILE_REPLAY_SECTION_DATA_KEYS, value)))]
+      : [];
+    delete userData._syncRequestId;
+    delete userData._syncReason;
+    delete userData._syncSections;
     const workingUser = await buildWorkingUserForProfileUpdate(name, userData);
-    if (!workingUser) return;
+    if (!workingUser) { respond({ ok: false, requestId: syncRequestId, error: 'Profile could not be prepared.' }); return; }
     const incomingSettingsData = (userData.settingsData && typeof userData.settingsData === "object") ? userData.settingsData : null;
     const previousCountryCode = name && userDatabase[name] ? getUserCountryCode(workingUser) : "";
     normalizeIncomingProfileCountry(userData, incomingSettingsData);
@@ -4623,6 +4644,7 @@ io.on('connection', (socket) => {
 
         if (isUserBanned(workingUser) && !ADMIN_USERS.includes(name)) {
             socket.emit('auth_error', 'This account is banned.');
+            respond({ ok: false, requestId: syncRequestId, error: 'This account is banned.' });
             return;
         }
 
@@ -4640,6 +4662,12 @@ io.on('connection', (socket) => {
 
         userData = reconcileIncomingDownloads(workingUser, userData || {});
         userData = reconcileIncomingProfileArrays(workingUser, userData || {});
+        const replaySectionStatus = {};
+        requestedSyncSections.forEach(section => {
+          const dataKey = PROFILE_REPLAY_SECTION_DATA_KEYS[section];
+          replaySectionStatus[section] = dataKey && Object.prototype.hasOwnProperty.call(userData, dataKey) ? 'accepted' : 'rejected';
+        });
+        if (requestedSyncSections.some(section => replaySectionStatus[section] === 'rejected')) shouldForceProfileSyncToSource = true;
         const publicCountsChanged = profileUpdateTouchesPublicCounts(userData);
         
         Object.assign(workingUser, userData);
@@ -4688,10 +4716,15 @@ io.on('connection', (socket) => {
             await upsertPresenceForSocket(socket, name);
             userCacheMeta[name] = Date.now();
             const savedUser = await patchUserData(name, profileDbPatch, 'PROFILE PATCH SAVE');
-            if (!savedUser) return;
+            if (!savedUser) {
+              respond({ ok: false, requestId: syncRequestId, error: 'Profile was not saved.' });
+              return;
+            }
             invalidateOnlineListCache('profile-update-save');
         } catch (err) {
             console.error(`[DATABASE ERROR] Failed to save profile for ${name}:`, err);
+            respond({ ok: false, requestId: syncRequestId, error: 'Profile database save failed.' });
+            return;
         } finally {
             userProfileWriteInFlight.delete(name);
         }
@@ -4722,6 +4755,24 @@ io.on('connection', (socket) => {
             invalidateGlobalTrophyStatsCache();
             scheduleTrophyStatsRefreshBroadcast(900);
         }
+
+        const acceptedSections = requestedSyncSections.filter(section => replaySectionStatus[section] === 'accepted');
+        const rejectedSections = requestedSyncSections.filter(section => replaySectionStatus[section] === 'rejected');
+        respond({
+          ok: true,
+          requestId: syncRequestId,
+          reason: syncReason || undefined,
+          acceptedSections,
+          rejectedSections,
+          profileUpdatedAt: normalizeTimestampValue(workingUser.profileUpdatedAt) || Date.now(),
+          versions: {
+            downloads: normalizeTimestampValue(workingUser.downloadsUpdatedAt),
+            wishlist: normalizeTimestampValue(workingUser.wishlistUpdatedAt),
+            favorites: normalizeTimestampValue(workingUser.favoritesUpdatedAt),
+            library: normalizeTimestampValue(workingUser.libraryUpdatedAt),
+            friends: normalizeTimestampValue(workingUser.friendsUpdatedAt)
+          }
+        });
     }
   });
 

@@ -682,6 +682,24 @@ select option { background-color: var(--bg-dark); }
 @keyframes serverUnavailableDot { 0%,100%{opacity:.55;transform:scale(.85);} 50%{opacity:1;transform:scale(1.18);} }
 @media (max-width:560px) { .server-unavailable-card { width:calc(100vw - 28px);padding:28px 20px 22px;border-radius:16px; } .server-unavailable-title { font-size:23px; } .server-unavailable-actions { flex-direction:column; } .server-unavailable-actions .ps5-pill-btn { width:100%;flex-basis:auto; } }
 @media (prefers-reduced-motion:reduce) { .server-unavailable-overlay.show,.server-unavailable-overlay.closing,.server-unavailable-overlay.show .server-unavailable-card,.server-unavailable-overlay.closing .server-unavailable-card,.server-unavailable-overlay.show .server-unavailable-card::before,.server-unavailable-overlay.show .server-unavailable-card::after,.server-unavailable-overlay.show .server-unavailable-icon,.server-unavailable-overlay.show .server-unavailable-icon::before,.server-unavailable-overlay.show .server-unavailable-icon-badge,.server-unavailable-overlay.show .server-unavailable-status,.server-unavailable-overlay.show .server-unavailable-title,.server-unavailable-overlay.show .server-unavailable-copy,.server-unavailable-overlay.show .server-unavailable-hint,.server-unavailable-overlay.show .server-unavailable-actions,.server-unavailable-status-dot { animation-duration:.01ms !important;animation-delay:0ms !important;animation-iteration-count:1 !important; } }
+#psn-offline-mode-badge { position:fixed;right:18px;bottom:max(18px,env(safe-area-inset-bottom));z-index:999998;display:flex;align-items:center;gap:8px;min-height:34px;padding:7px 12px;border:1px solid rgba(255,92,92,.28);border-radius:999px;background:rgba(20,20,25,.78);box-shadow:0 10px 30px rgba(0,0,0,.42),0 0 18px rgba(255,68,68,.08);backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px);color:#f4f6fa;font-size:11px;font-weight:700;letter-spacing:.2px;opacity:0;visibility:hidden;pointer-events:none;transform:translateY(12px) scale(.97);transition:opacity .24s ease,transform .34s cubic-bezier(.16,1,.3,1),visibility 0s linear .34s,border-color .25s ease,box-shadow .25s ease; }
+#psn-offline-mode-badge.show { opacity:1;visibility:visible;transform:translateY(0) scale(1);transition:opacity .24s ease,transform .34s cubic-bezier(.16,1,.3,1),visibility 0s linear 0s,border-color .25s ease,box-shadow .25s ease; }
+#psn-offline-mode-badge .psn-offline-mode-dot { width:7px;height:7px;flex:0 0 7px;border-radius:50%;background:#ff5252;box-shadow:0 0 0 0 rgba(255,82,82,.35);animation:psnOfflineModePulse 1.8s ease-out infinite; }
+#psn-offline-mode-badge .psn-offline-mode-icon { color:#ff7373;font-size:11px; }
+#psn-offline-mode-badge .psn-offline-mode-copy { display:flex;align-items:baseline;gap:5px;white-space:nowrap; }
+#psn-offline-mode-badge .psn-offline-mode-title { color:#fff; }
+#psn-offline-mode-badge .psn-offline-mode-detail { color:rgba(255,255,255,.58);font-size:10px;font-weight:600; }
+#psn-offline-mode-badge.is-reconnecting { border-color:rgba(255,196,64,.30);box-shadow:0 10px 30px rgba(0,0,0,.42),0 0 18px rgba(255,196,64,.09); }
+#psn-offline-mode-badge.is-reconnecting .psn-offline-mode-dot { background:#ffc440;animation:psnOfflineModePulseReconnect 1.25s ease-out infinite; }
+#psn-offline-mode-badge.is-reconnecting .psn-offline-mode-icon { color:#ffd36c;animation:psnOfflineModeReconnectSpin .9s linear infinite;transform-origin:50% 50%; }
+#psn-offline-mode-badge.is-recovered { border-color:rgba(70,211,105,.32);box-shadow:0 10px 30px rgba(0,0,0,.42),0 0 20px rgba(70,211,105,.11); }
+#psn-offline-mode-badge.is-recovered .psn-offline-mode-dot { background:#46d369;animation:none;box-shadow:0 0 10px rgba(70,211,105,.42); }
+#psn-offline-mode-badge.is-recovered .psn-offline-mode-icon { color:#69e487; }
+@keyframes psnOfflineModePulse { 0%{box-shadow:0 0 0 0 rgba(255,82,82,.34)} 72%,100%{box-shadow:0 0 0 7px rgba(255,82,82,0)} }
+@keyframes psnOfflineModePulseReconnect { 0%{box-shadow:0 0 0 0 rgba(255,196,64,.30)} 72%,100%{box-shadow:0 0 0 7px rgba(255,196,64,0)} }
+@keyframes psnOfflineModeReconnectSpin { from{transform:rotate(0deg)} to{transform:rotate(360deg)} }
+@media (max-width:560px) { #psn-offline-mode-badge { right:12px;bottom:max(12px,env(safe-area-inset-bottom));max-width:calc(100vw - 24px); } #psn-offline-mode-badge .psn-offline-mode-detail { display:none; } }
+@media (prefers-reduced-motion:reduce) { #psn-offline-mode-badge,#psn-offline-mode-badge .psn-offline-mode-dot,#psn-offline-mode-badge .psn-offline-mode-icon { animation:none !important;transition-duration:.01ms !important; } }
 .theme-grid { display: flex; flex-wrap: wrap; gap: 15px; justify-content: center; }
 .theme-btn { width: 50px; height: 50px; border-radius: 50%; border: 2px solid transparent; cursor: pointer; transition: all 0.2s ease; box-shadow: 0 4px 10px rgba(0,0,0,0.5); }
 .theme-btn:hover { transform: scale(1.1); }
@@ -9518,14 +9536,210 @@ P
 		return timestamp;
 	}
 
+	const PROFILE_SYNC_PENDING_STORAGE_SUFFIX = 'psn_profile_sync_pending_v1';
+	const PROFILE_SYNC_PERSISTENT_SECTIONS = ['trophies', 'downloads', 'wishlist', 'favorites', 'library', 'friends'];
+
+	function getPersistentProfileSyncStorageKey(username = localStorage.getItem('psn_username') || '') {
+		const name = String(username || '').trim();
+		return name && name !== 'null' && name !== 'undefined' ? `${name}_${PROFILE_SYNC_PENDING_STORAGE_SUFFIX}` : '';
+	}
+
+	function readPersistentProfileSyncPending(username = localStorage.getItem('psn_username') || '') {
+		const key = getPersistentProfileSyncStorageKey(username);
+		const empty = { version: 1, username: String(username || ''), updatedAt: 0, sections: {} };
+		if (!key) return empty;
+		try {
+			const parsed = JSON.parse(localStorage.getItem(key) || 'null');
+			if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return empty;
+			const sections = {};
+			PROFILE_SYNC_PERSISTENT_SECTIONS.forEach(section => {
+				const stamp = normalizeProfileListTimestamp(parsed.sections && parsed.sections[section]);
+				if (stamp) sections[section] = stamp;
+			});
+			return { version: 1, username: String(username || ''), updatedAt: normalizeProfileListTimestamp(parsed.updatedAt), sections };
+		} catch (err) {
+			return empty;
+		}
+	}
+	window.readPersistentProfileSyncPending = readPersistentProfileSyncPending;
+
+	function writePersistentProfileSyncPending(username, state) {
+		const key = getPersistentProfileSyncStorageKey(username);
+		if (!key) return;
+		const sections = state && state.sections && typeof state.sections === 'object' ? state.sections : {};
+		const cleanSections = {};
+		PROFILE_SYNC_PERSISTENT_SECTIONS.forEach(section => {
+			const stamp = normalizeProfileListTimestamp(sections[section]);
+			if (stamp) cleanSections[section] = stamp;
+		});
+		if (!Object.keys(cleanSections).length) {
+			localStorage.removeItem(key);
+			return;
+		}
+		safeLocalStorageSet(key, JSON.stringify({ version: 1, username: String(username || ''), updatedAt: Date.now(), sections: cleanSections }));
+	}
+
+	function shouldPersistProfileSyncPendingNow() {
+		if (window.__psnOfflineModeActive === true) return true;
+		try {
+			if (typeof socketChat === 'undefined' || !socketChat || !socketChat.connected) return true;
+		} catch (err) {
+			return true;
+		}
+		return false;
+	}
+
+	function markPersistentProfileSyncPending(type, stamp = Date.now(), username = localStorage.getItem('psn_username') || '') {
+		const section = normalizeProfileSyncDirtyType(type);
+		if (!PROFILE_SYNC_PERSISTENT_SECTIONS.includes(section)) return 0;
+		const name = String(username || '').trim();
+		if (!name || name === 'null' || name === 'undefined') return 0;
+		const timestamp = normalizeProfileListTimestamp(stamp) || Date.now();
+		const state = readPersistentProfileSyncPending(name);
+		state.sections[section] = Math.max(normalizeProfileListTimestamp(state.sections[section]), timestamp);
+		state.updatedAt = Date.now();
+		writePersistentProfileSyncPending(name, state);
+		return state.sections[section];
+	}
+	window.markPersistentProfileSyncPending = markPersistentProfileSyncPending;
+
+	function clearPersistentProfileSyncPending(type, username = localStorage.getItem('psn_username') || '') {
+		const section = normalizeProfileSyncDirtyType(type);
+		const name = String(username || '').trim();
+		if (!name || !PROFILE_SYNC_PERSISTENT_SECTIONS.includes(section)) return;
+		const state = readPersistentProfileSyncPending(name);
+		delete state.sections[section];
+		state.updatedAt = Date.now();
+		writePersistentProfileSyncPending(name, state);
+	}
+	window.clearPersistentProfileSyncPending = clearPersistentProfileSyncPending;
+
+	function getLocalProfileSectionVersion(username, section) {
+		const pending = readPersistentProfileSyncPending(username);
+		let stamp = normalizeProfileListTimestamp(pending.sections[section]);
+		if (section !== 'trophies') {
+			const key = getProfileListTimestampStorageKey(section);
+			stamp = Math.max(stamp, normalizeProfileListTimestamp(localStorage.getItem(`${username}_${key}`)));
+		}
+		if (section === 'downloads') {
+			stamp = Math.max(stamp, normalizeProfileListTimestamp(localStorage.getItem(`${username}_${STORAGE_KEY_DOWNLOAD_CLEAR_PENDING}`)));
+		}
+		return stamp;
+	}
+
+	function getIncomingProfileSectionVersion(section, userData = {}, payload = {}) {
+		if (section === 'downloads') return Math.max(
+			normalizeProfileListTimestamp(userData.downloadsUpdatedAt || payload.downloadsUpdatedAt),
+			normalizeProfileListTimestamp(userData.downloadsClearedAt || payload.downloadsClearedAt)
+		);
+		const map = {
+			wishlist: 'wishlistUpdatedAt',
+			favorites: 'favoritesUpdatedAt',
+			library: 'libraryUpdatedAt',
+			friends: 'friendsUpdatedAt'
+		};
+		const key = map[section];
+		return key ? normalizeProfileListTimestamp(userData[key] || payload[key]) : 0;
+	}
+
+	function parsePersistentLocalJson(key, fallback) {
+		try {
+			const parsed = JSON.parse(localStorage.getItem(key) || 'null');
+			return parsed === null || parsed === undefined ? fallback : parsed;
+		} catch (err) {
+			return fallback;
+		}
+	}
+
+	function restorePersistentLocalProfileSection(username, section) {
+		if (!username) return;
+		if (section === 'trophies') {
+			window.userTrophies = parsePersistentLocalJson(`${username}_psn_user_trophies`, {});
+			return;
+		}
+		if (section === 'downloads') {
+			const raw = parsePersistentLocalJson(`${username}_${COOKIE_NAME_HISTORY}`, []);
+			window.downloadHistory = Array.isArray(raw) ? raw : [];
+			return;
+		}
+		if (section === 'wishlist') {
+			const raw = parsePersistentLocalJson(`${username}_psn_wishlist_db`, []);
+			window.wishlist = Array.isArray(raw) ? raw : [];
+			return;
+		}
+		if (section === 'favorites') {
+			const raw = parsePersistentLocalJson(`${username}_ps3_library_favs`, []);
+			window.favoritesLibrary = Array.isArray(raw) ? raw : [];
+			return;
+		}
+		if (section === 'library') {
+			const raw = parsePersistentLocalJson(`${username}_psn_local_library`, []);
+			const list = Array.isArray(raw) ? raw : [];
+			if (typeof lastScannedGames !== 'undefined') lastScannedGames = list;
+			window.lastScannedGames = list;
+			return;
+		}
+		if (section === 'friends') {
+			const raw = parsePersistentLocalJson(`${username}_psn_friends_list`, []);
+			window.friendsList = Array.isArray(raw) ? raw : [];
+		}
+	}
+
+	function protectPendingProfileSectionFromIncoming(username, section, userData = {}, payload = {}) {
+		const pending = readPersistentProfileSyncPending(username);
+		if (!normalizeProfileListTimestamp(pending.sections[section])) return false;
+		const localVersion = getLocalProfileSectionVersion(username, section);
+		const incomingVersion = getIncomingProfileSectionVersion(section, userData, payload);
+		if (section !== 'trophies' && incomingVersion && incomingVersion > localVersion) {
+			clearPersistentProfileSyncPending(section, username);
+			const syncState = window.__profileSyncDirtyState && window.__profileSyncDirtyState.username === username ? window.__profileSyncDirtyState : null;
+			if (syncState && syncState.dirty) syncState.dirty[section] = false;
+			return false;
+		}
+
+		restorePersistentLocalProfileSection(username, section);
+		const fields = {
+			trophies: ['trophiesData', 'trophies', 'level', 'xp'],
+			downloads: ['downloadsData', 'downloads', 'downloadsUpdatedAt', 'downloadsClearedAt'],
+			wishlist: ['wishlistData', 'wishlist', 'wishlistUpdatedAt'],
+			favorites: ['favoritesData', 'favorites', 'favoritesUpdatedAt'],
+			library: ['libraryData', 'library', 'libraryUpdatedAt'],
+			friends: ['friendsData', 'friendsUpdatedAt']
+		};
+		(fields[section] || []).forEach(key => { delete userData[key]; });
+		const syncState = getProfileSyncDirtyState();
+		if (syncState && syncState.dirty && Object.prototype.hasOwnProperty.call(syncState.dirty, section)) syncState.dirty[section] = true;
+		return true;
+	}
+
+	window.prepareIncomingProfileForPersistentPending = function(username, userData = {}, payload = {}) {
+		const name = String(username || '').trim();
+		if (!name || !userData || typeof userData !== 'object') return [];
+		const protectedSections = [];
+		PROFILE_SYNC_PERSISTENT_SECTIONS.forEach(section => {
+			if (protectPendingProfileSectionFromIncoming(name, section, userData, payload)) protectedSections.push(section);
+		});
+		return protectedSections;
+	};
+
+	function persistCurrentProfileSyncDirtyState(username = localStorage.getItem('psn_username') || '') {
+		const state = getProfileSyncDirtyState();
+		if (!state || !state.dirty) return;
+		Object.keys(state.dirty).forEach(section => {
+			if (state.dirty[section]) markPersistentProfileSyncPending(section, getLocalProfileSectionVersion(username, section) || Date.now(), username);
+		});
+	}
+	window.persistCurrentProfileSyncDirtyState = persistCurrentProfileSyncDirtyState;
+
 	function getProfileSyncDirtyState() {
 		const username = localStorage.getItem('psn_username') || '';
 		if (!window.__profileSyncDirtyState || window.__profileSyncDirtyState.username !== username) {
-			window.__profileSyncDirtyState = {
-				username,
-				dirty: { trophies: false, downloads: false, wishlist: false, favorites: false, library: false, friends: false },
-				lastBaseSignature: ''
-			};
+			const persistent = readPersistentProfileSyncPending(username);
+			const dirty = { trophies: false, downloads: false, wishlist: false, favorites: false, library: false, friends: false };
+			Object.keys(persistent.sections || {}).forEach(section => {
+				if (Object.prototype.hasOwnProperty.call(dirty, section)) dirty[section] = true;
+			});
+			window.__profileSyncDirtyState = { username, dirty, lastBaseSignature: '' };
 		}
 		return window.__profileSyncDirtyState;
 	}
@@ -9538,10 +9752,13 @@ P
 		return value;
 	}
 
-	function markProfileSyncDirty(type) {
+	function markProfileSyncDirty(type, stamp = Date.now()) {
 		const key = normalizeProfileSyncDirtyType(type);
 		const state = getProfileSyncDirtyState();
-		if (Object.prototype.hasOwnProperty.call(state.dirty, key)) state.dirty[key] = true;
+		if (Object.prototype.hasOwnProperty.call(state.dirty, key)) {
+			state.dirty[key] = true;
+			if (shouldPersistProfileSyncPendingNow()) markPersistentProfileSyncPending(key, stamp);
+		}
 		return state;
 	}
 	window.markProfileSyncDirty = markProfileSyncDirty;
@@ -9614,11 +9831,130 @@ P
 		const key = getProfileListTimestampStorageKey(type);
 		const timestamp = normalizeProfileListTimestamp(stamp) || Date.now();
 		saveState(key, String(timestamp));
-		if (typeof markProfileSyncDirty === 'function') markProfileSyncDirty(type);
+		if (typeof markProfileSyncDirty === 'function') markProfileSyncDirty(type, timestamp);
 		return timestamp;
 	}
 
 	window.markProfileListChanged = markProfileListChanged;
+
+	function buildPersistentProfileSyncReplayPayload(username, section) {
+		const requestId = `offline-sync-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+		const payload = { _syncRequestId: requestId, _syncReason: 'offline-replay', _syncSections: [section] };
+		if (section === 'trophies') {
+			const trophiesData = parsePersistentLocalJson(`${username}_psn_user_trophies`, {});
+			let totalXp = 0;
+			let totalTrophies = 0;
+			const xpMap = { bronze: 15, silver: 30, gold: 90, platinum: 300 };
+			Object.keys(trophiesData || {}).forEach(id => {
+				const trophy = trophiesData[id];
+				if (!trophy || trophy.unlocked !== true) return;
+				totalTrophies++;
+				if (typeof TROPHY_DATA !== 'undefined' && TROPHY_DATA[id]) totalXp += xpMap[TROPHY_DATA[id].type] || 0;
+			});
+			payload.trophiesData = trophiesData || {};
+			payload.trophies = totalTrophies;
+			payload.level = Math.floor(totalXp / 100) + 1;
+			payload.xp = totalXp;
+			return payload;
+		}
+		if (section === 'downloads') {
+			const list = parsePersistentLocalJson(`${username}_${COOKIE_NAME_HISTORY}`, []);
+			payload.downloadsData = Array.isArray(list) ? list : [];
+			payload.downloads = payload.downloadsData.length;
+			payload.downloadsUpdatedAt = getLocalProfileSectionVersion(username, 'downloads');
+			payload.downloadsClearedAt = normalizeProfileListTimestamp(localStorage.getItem(`${username}_${STORAGE_KEY_DOWNLOAD_CLEAR_PENDING}`));
+			return payload;
+		}
+		const config = {
+			wishlist: { dataKey: 'wishlistData', countKey: 'wishlist', storageKey: `${username}_psn_wishlist_db`, versionKey: 'wishlistUpdatedAt' },
+			favorites: { dataKey: 'favoritesData', countKey: 'favorites', storageKey: `${username}_ps3_library_favs`, versionKey: 'favoritesUpdatedAt' },
+			library: { dataKey: 'libraryData', countKey: 'library', storageKey: `${username}_psn_local_library`, versionKey: 'libraryUpdatedAt' },
+			friends: { dataKey: 'friendsData', countKey: '', storageKey: `${username}_psn_friends_list`, versionKey: 'friendsUpdatedAt' }
+		}[section];
+		if (!config) return null;
+		const list = parsePersistentLocalJson(config.storageKey, []);
+		payload[config.dataKey] = Array.isArray(list) ? list : [];
+		if (config.countKey) payload[config.countKey] = payload[config.dataKey].length;
+		payload[config.versionKey] = getLocalProfileSectionVersion(username, section);
+		return payload;
+	}
+
+	function emitPersistentProfileUpdateWithAck(payload, timeoutMs = 7000) {
+		return new Promise(resolve => {
+			if (typeof socketChat === 'undefined' || !socketChat || !socketChat.connected) {
+				resolve({ ok: false, error: 'Socket disconnected.' });
+				return;
+			}
+			let settled = false;
+			const finish = response => {
+				if (settled) return;
+				settled = true;
+				resolve(response && typeof response === 'object' ? response : { ok: false, error: 'Invalid synchronization response.' });
+			};
+			try {
+				if (typeof socketChat.timeout === 'function') {
+					socketChat.timeout(timeoutMs).emit('update_profile', payload, (err, response) => {
+						if (err) finish({ ok: false, error: 'Synchronization acknowledgement timed out.' });
+						else finish(response);
+					});
+					return;
+				}
+				const timer = setTimeout(() => finish({ ok: false, error: 'Synchronization acknowledgement timed out.' }), timeoutMs);
+				socketChat.emit('update_profile', payload, response => {
+					clearTimeout(timer);
+					finish(response);
+				});
+			} catch (err) {
+				finish({ ok: false, error: err && err.message ? err.message : 'Synchronization could not be sent.' });
+			}
+		});
+	}
+
+	window.replayPersistentProfileSyncPending = async function(reason = 'session-restore') {
+		if (window.__persistentProfileReplayPromise) return window.__persistentProfileReplayPromise;
+		window.__persistentProfileReplayPromise = (async () => {
+			const username = localStorage.getItem('psn_username') || '';
+			if (!username || username === 'null' || username === 'undefined') return { ok: true, remaining: [] };
+			if (!window.isProfileLoaded || window.__initialProfileSyncInProgress === true) return { ok: false, deferred: true, remaining: Object.keys(readPersistentProfileSyncPending(username).sections || {}) };
+			if (typeof socketChat === 'undefined' || !socketChat || !socketChat.connected) return { ok: false, remaining: Object.keys(readPersistentProfileSyncPending(username).sections || {}) };
+
+			const state = readPersistentProfileSyncPending(username);
+			const sections = PROFILE_SYNC_PERSISTENT_SECTIONS.filter(section => normalizeProfileListTimestamp(state.sections[section]));
+			if (!sections.length) return { ok: true, remaining: [] };
+
+			console.log(`[PROFILE SYNC] Replaying ${sections.length} saved offline section(s) after ${reason}.`);
+			const rejected = [];
+			for (const section of sections) {
+				if (!socketChat || !socketChat.connected) break;
+				const payload = buildPersistentProfileSyncReplayPayload(username, section);
+				if (!payload) continue;
+				const response = await emitPersistentProfileUpdateWithAck(payload);
+				if (!response || response.ok !== true) {
+					console.warn(`[PROFILE SYNC] Offline replay for ${section} was not acknowledged:`, response && response.error ? response.error : 'Unknown error');
+					continue;
+				}
+				const accepted = Array.isArray(response.acceptedSections) && response.acceptedSections.includes(section);
+				const wasRejected = Array.isArray(response.rejectedSections) && response.rejectedSections.includes(section);
+				if (accepted || wasRejected) {
+					clearPersistentProfileSyncPending(section, username);
+					const syncState = getProfileSyncDirtyState();
+					if (syncState && syncState.dirty) syncState.dirty[section] = false;
+				}
+				if (wasRejected) rejected.push(section);
+			}
+
+			const remaining = Object.keys(readPersistentProfileSyncPending(username).sections || {});
+			if (rejected.length && socketChat && socketChat.connected) {
+				setTimeout(() => {
+					if (socketChat && socketChat.connected) socketChat.emit('request_profile_sync', { forceRefresh: true, reason: 'offline-replay-server-newer', at: Date.now() });
+				}, 80);
+			}
+			return { ok: remaining.length === 0, remaining, rejected };
+		})().finally(() => {
+			window.__persistentProfileReplayPromise = null;
+		});
+		return window.__persistentProfileReplayPromise;
+	};
 
 	function ensureFpsCounterDefaultOff() {
 		if (typeof STORAGE_KEY_FPS_COUNTER === 'undefined' || typeof STORAGE_KEY_FPS_COUNTER_DEFAULT_OFF_MIGRATION === 'undefined') return false;
@@ -41984,6 +42320,9 @@ function getVisibleChatStackEl(id) {
 		const myName = localStorage.getItem('psn_username') || '';
 		if (!name || name !== myName || !userData || typeof userData !== 'object') return;
 		if (!window.isProfileLoaded && window.__initialProfileSyncInProgress !== true) return;
+		if (typeof window.prepareIncomingProfileForPersistentPending === 'function') {
+			window.prepareIncomingProfileForPersistentPending(name, userData, payload || {});
+		}
 
 		const incomingProfileUpdatedAt = Number(userData.profileUpdatedAt || payload.profileUpdatedAt || 0);
 		const lastAppliedProfileUpdatedAt = Number(window.__lastAppliedProfileUpdatedAt || 0);
@@ -42145,6 +42484,238 @@ function getVisibleChatStackEl(id) {
 	let serverUnavailableRetrySuccessDelayTimer = null;
 	let serverUnavailableRetrySuccessTimer = null;
 
+	let psnOfflineModeActive = false;
+	let psnOfflineModeBadgeHideTimer = null;
+	let psnOfflineModeReconnectTimer = null;
+	let psnOfflineModeReconnectWindowTimer = null;
+	let psnOfflineModeRetryCooldownTimer = null;
+	let psnOfflineModeReconnectCycleActive = false;
+	let psnOfflineModeNextRetryAt = 0;
+	let psnOfflineModeEnteredAt = 0;
+	const PSN_OFFLINE_MODE_MIN_VISIBLE_MS = 1200;
+	const PSN_OFFLINE_MODE_RECONNECT_WINDOW_MS = 10000;
+	const PSN_OFFLINE_MODE_RETRY_COOLDOWN_MS = 30000;
+	window.__psnOfflineModeActive = false;
+
+	function getPsnOfflineModeBadge() {
+		let badge = document.getElementById('psn-offline-mode-badge');
+		if (badge) return badge;
+		badge = document.createElement('div');
+		badge.id = 'psn-offline-mode-badge';
+		badge.setAttribute('role', 'status');
+		badge.setAttribute('aria-live', 'polite');
+		badge.innerHTML = '<span class="psn-offline-mode-dot"></span><i class="fas fa-cloud-slash psn-offline-mode-icon" aria-hidden="true"></i><span class="psn-offline-mode-copy"><span class="psn-offline-mode-title">Offline Mode</span><span class="psn-offline-mode-detail">Browsing locally</span></span>';
+		document.body.appendChild(badge);
+		return badge;
+	}
+
+	function setPsnOfflineModeBadgeState(state = 'offline') {
+		const badge = getPsnOfflineModeBadge();
+		if (!badge) return;
+		if (psnOfflineModeBadgeHideTimer) {
+			clearTimeout(psnOfflineModeBadgeHideTimer);
+			psnOfflineModeBadgeHideTimer = null;
+		}
+		badge.classList.remove('is-reconnecting', 'is-recovered');
+		const icon = badge.querySelector('.psn-offline-mode-icon');
+		const title = badge.querySelector('.psn-offline-mode-title');
+		const detail = badge.querySelector('.psn-offline-mode-detail');
+		if (state === 'reconnecting') {
+			badge.classList.add('is-reconnecting', 'show');
+			if (icon) icon.className = 'fas fa-arrows-rotate psn-offline-mode-icon';
+			if (title) title.textContent = 'Reconnecting';
+			if (detail) detail.textContent = 'Restoring your session';
+			return;
+		}
+		if (state === 'recovered') {
+			badge.classList.add('is-recovered', 'show');
+			if (icon) icon.className = 'fas fa-cloud-arrow-up psn-offline-mode-icon';
+			if (title) title.textContent = 'Back Online';
+			if (detail) detail.textContent = 'Session synchronized';
+			psnOfflineModeBadgeHideTimer = setTimeout(() => {
+				psnOfflineModeBadgeHideTimer = null;
+				if (!psnOfflineModeActive && badge && badge.isConnected) badge.classList.remove('show', 'is-recovered');
+			}, 1800);
+			return;
+		}
+		badge.classList.add('show');
+		if (icon) icon.className = 'fas fa-cloud-slash psn-offline-mode-icon';
+		if (title) title.textContent = 'Offline Mode';
+		if (detail) {
+			const waitingForRetry = psnOfflineModeNextRetryAt > Date.now();
+			detail.textContent = waitingForRetry ? 'Browsing locally · retry in 30s' : 'Browsing locally';
+		}
+	}
+
+	function setPsnOfflineMode(active, options = {}) {
+		psnOfflineModeActive = active === true;
+		window.__psnOfflineModeActive = psnOfflineModeActive;
+		document.body.classList.toggle('psn-offline-mode', psnOfflineModeActive);
+		if (psnOfflineModeActive) {
+			setPsnOfflineModeBadgeState(options.reconnecting ? 'reconnecting' : 'offline');
+			return;
+		}
+		const badge = document.getElementById('psn-offline-mode-badge');
+		if (!badge) return;
+		if (options.recovered === true) setPsnOfflineModeBadgeState('recovered');
+		else badge.classList.remove('show', 'is-reconnecting', 'is-recovered');
+	}
+
+	function clearPsnOfflineReconnectWindowTimer() {
+		if (!psnOfflineModeReconnectWindowTimer) return;
+		clearTimeout(psnOfflineModeReconnectWindowTimer);
+		psnOfflineModeReconnectWindowTimer = null;
+	}
+
+	function clearPsnOfflineRetryCooldownTimer() {
+		if (!psnOfflineModeRetryCooldownTimer) return;
+		clearTimeout(psnOfflineModeRetryCooldownTimer);
+		psnOfflineModeRetryCooldownTimer = null;
+	}
+
+	function schedulePsnOfflineModeRetry(delayMs = PSN_OFFLINE_MODE_RETRY_COOLDOWN_MS) {
+		if (!psnOfflineModeActive || window.isProfileLoaded !== true) return;
+		clearPsnOfflineRetryCooldownTimer();
+		const delay = Math.max(1000, Number(delayMs) || PSN_OFFLINE_MODE_RETRY_COOLDOWN_MS);
+		psnOfflineModeNextRetryAt = Date.now() + delay;
+		setPsnOfflineModeBadgeState('offline');
+		psnOfflineModeRetryCooldownTimer = setTimeout(() => {
+			psnOfflineModeRetryCooldownTimer = null;
+			psnOfflineModeNextRetryAt = 0;
+			if (!psnOfflineModeActive || window.isProfileLoaded !== true) return;
+			ensurePsnOfflineModeReconnect({ reason: 'scheduled retry' });
+		}, delay);
+	}
+
+	function stopPsnOfflineModeReconnectCycle(reason = 'reconnect window expired', scheduleRetry = true) {
+		clearPsnOfflineReconnectWindowTimer();
+		psnOfflineModeReconnectCycleActive = false;
+		if (!psnOfflineModeActive) return;
+		console.log(`[OFFLINE MODE] ${reason}. Pausing reconnect attempts.`);
+		pauseServerAutomaticReconnect();
+		if (scheduleRetry) schedulePsnOfflineModeRetry();
+		else {
+			clearPsnOfflineRetryCooldownTimer();
+			psnOfflineModeNextRetryAt = 0;
+			setPsnOfflineModeBadgeState('offline');
+		}
+		if (typeof updateGlobalOnlineStatus === 'function') updateGlobalOnlineStatus('offline');
+		if (typeof adminUpdateChatControlsBanner === 'function') adminUpdateChatControlsBanner();
+		const status = document.getElementById('chat-status-text');
+		if (status) {
+			status.innerText = '(Offline Mode)';
+			status.style.color = '#ff7373';
+		}
+	}
+
+
+	function ensurePsnOfflineModeReconnect(options = {}) {
+		if (!psnOfflineModeActive || window.isProfileLoaded !== true) return false;
+		if (typeof isKicked !== 'undefined' && isKicked) return false;
+		if (psnOfflineModeReconnectCycleActive) return true;
+
+		const force = options.force === true;
+		const elapsed = psnOfflineModeEnteredAt > 0 ? Date.now() - psnOfflineModeEnteredAt : PSN_OFFLINE_MODE_MIN_VISIBLE_MS;
+		const remaining = Math.max(0, PSN_OFFLINE_MODE_MIN_VISIBLE_MS - elapsed);
+		if (remaining > 0) {
+			if (psnOfflineModeReconnectTimer) clearTimeout(psnOfflineModeReconnectTimer);
+			psnOfflineModeReconnectTimer = setTimeout(() => {
+				psnOfflineModeReconnectTimer = null;
+				ensurePsnOfflineModeReconnect({ reason: 'initial offline delay complete' });
+			}, remaining);
+			return true;
+		}
+
+		if (!force && psnOfflineModeNextRetryAt > Date.now()) {
+			const retryIn = Math.max(1000, psnOfflineModeNextRetryAt - Date.now());
+			if (!psnOfflineModeRetryCooldownTimer) schedulePsnOfflineModeRetry(retryIn);
+			setPsnOfflineModeBadgeState('offline');
+			return true;
+		}
+
+		if (psnOfflineModeReconnectTimer) {
+			clearTimeout(psnOfflineModeReconnectTimer);
+			psnOfflineModeReconnectTimer = null;
+		}
+		clearPsnOfflineRetryCooldownTimer();
+		clearPsnOfflineReconnectWindowTimer();
+		psnOfflineModeNextRetryAt = 0;
+		psnOfflineModeReconnectCycleActive = true;
+
+		setPsnOfflineModeBadgeState('reconnecting');
+		if (typeof updateGlobalOnlineStatus === 'function') updateGlobalOnlineStatus('connecting');
+		if (typeof adminUpdateChatControlsBanner === 'function') adminUpdateChatControlsBanner();
+		const status = document.getElementById('chat-status-text');
+		if (status) {
+			status.innerText = '(Reconnecting...)';
+			status.style.color = '#ffbb33';
+		}
+
+		try {
+			enableServerAutomaticReconnect();
+			if (socketChat) {
+				if (socketChat.io) socketChat.io.uri = serverUrls[currentServerIndex];
+				if (!socketChat.connected && !socketChat.active) socketChat.connect();
+			} else {
+				initChat();
+			}
+		} catch (err) {
+			console.warn('[OFFLINE MODE] Quiet reconnect could not start:', err);
+		}
+
+		psnOfflineModeReconnectWindowTimer = setTimeout(() => {
+			psnOfflineModeReconnectWindowTimer = null;
+			if (!psnOfflineModeActive) return;
+			stopPsnOfflineModeReconnectCycle('10-second reconnect window expired', true);
+		}, PSN_OFFLINE_MODE_RECONNECT_WINDOW_MS);
+		return true;
+	}
+	window.enterPsnOfflineMode = function() {
+		if (window.isProfileLoaded !== true) return false;
+		clearSessionServerUnavailableTimer();
+		clearSessionAutoReconnectTimer();
+		if (psnOfflineModeReconnectTimer) {
+			clearTimeout(psnOfflineModeReconnectTimer);
+			psnOfflineModeReconnectTimer = null;
+		}
+		clearPsnOfflineReconnectWindowTimer();
+		clearPsnOfflineRetryCooldownTimer();
+		psnOfflineModeReconnectCycleActive = false;
+		psnOfflineModeNextRetryAt = 0;
+		sessionAutoReconnectAttemptInProgress = false;
+		sessionReconnectDeferredWhileHidden = false;
+		serverUnavailableNoticeShown = false;
+		psnOfflineModeEnteredAt = Date.now();
+		setPsnOfflineMode(true);
+		window.hideServerUnavailableModal();
+		if (typeof updateGlobalOnlineStatus === 'function') updateGlobalOnlineStatus('offline');
+		if (typeof adminUpdateChatControlsBanner === 'function') adminUpdateChatControlsBanner();
+		const status = document.getElementById('chat-status-text');
+		if (status) {
+			status.innerText = '(Offline Mode)';
+			status.style.color = '#ff7373';
+		}
+		psnOfflineModeReconnectTimer = setTimeout(() => {
+			psnOfflineModeReconnectTimer = null;
+			ensurePsnOfflineModeReconnect();
+		}, PSN_OFFLINE_MODE_MIN_VISIBLE_MS);
+		return false;
+	};
+
+	window.leavePsnOfflineMode = function(recovered = false) {
+		if (!psnOfflineModeActive && !window.__psnOfflineModeActive) return;
+		if (psnOfflineModeReconnectTimer) {
+			clearTimeout(psnOfflineModeReconnectTimer);
+			psnOfflineModeReconnectTimer = null;
+		}
+		clearPsnOfflineReconnectWindowTimer();
+		clearPsnOfflineRetryCooldownTimer();
+		psnOfflineModeReconnectCycleActive = false;
+		psnOfflineModeNextRetryAt = 0;
+		psnOfflineModeEnteredAt = 0;
+		setPsnOfflineMode(false, { recovered: recovered === true });
+	};
+
 	function clearServerUnavailableRetryTimers() {
 		if (serverUnavailableRetryFailureTimer) {
 			clearTimeout(serverUnavailableRetryFailureTimer);
@@ -42296,7 +42867,7 @@ function getVisibleChatStackEl(id) {
 			if (statusText) statusText.textContent = 'Network service offline';
 			if (title) title.textContent = 'Server unavailable';
 			if (copy) copy.innerHTML = 'The connection to the <strong>NoPayStation Network server</strong> was lost. Online features are temporarily unavailable.';
-			if (hint) hint.textContent = 'Automatic reconnect failed. You can keep browsing or try again manually.';
+			if (hint) hint.textContent = 'Automatic reconnect failed. Continue offline keeps local browsing available while the site retries periodically.';
 			if (backButton) backButton.textContent = 'Continue offline';
 		} else {
 			if (statusText) statusText.textContent = 'Login service offline';
@@ -42308,6 +42879,7 @@ function getVisibleChatStackEl(id) {
 	}
 
 	window.showServerUnavailableModal = function(force, context = serverUnavailableContext) {
+		if (context === 'session' && psnOfflineModeActive) return;
 		if (!force && serverUnavailableNoticeShown) return;
 		const modal = document.getElementById('server-unavailable-modal');
 		if (!modal) return;
@@ -42406,6 +42978,7 @@ function getVisibleChatStackEl(id) {
 	}
 
 	function showSessionServerUnavailableAfterAutoReconnect() {
+		if (psnOfflineModeActive) { ensurePsnOfflineModeReconnect(); return; }
 		if (window.isProfileLoaded !== true || loginServerAttempt) return;
 		if (socketChat && socketChat.connected) return;
 		if (document.hidden) {
@@ -42461,6 +43034,7 @@ function getVisibleChatStackEl(id) {
 	function handleLoggedInSessionForeground() {
 		if (document.hidden || window.isProfileLoaded !== true || loginServerAttempt) return;
 		if (typeof isKicked !== 'undefined' && isKicked) return;
+		if (psnOfflineModeActive) { ensurePsnOfflineModeReconnect({ reason: 'offline mode active' }); return; }
 		if (socketChat && socketChat.connected) {
 			resetSessionAutoReconnectState();
 			return;
@@ -42488,6 +43062,7 @@ function getVisibleChatStackEl(id) {
 	installLoggedInSessionForegroundReconnect();
 
 	function scheduleSessionServerUnavailable() {
+		if (psnOfflineModeActive) { ensurePsnOfflineModeReconnect(); return; }
 		if (window.isProfileLoaded !== true || loginServerAttempt) return;
 		if (sessionServerUnavailableTimer || sessionAutoReconnectAttemptInProgress) return;
 		sessionServerUnavailableTimer = setTimeout(() => {
@@ -42649,6 +43224,7 @@ function getVisibleChatStackEl(id) {
 		if (typeof playUiBack === 'function') playUiBack();
 		pauseServerAutomaticReconnect();
 		if (serverUnavailableContext === 'session') {
+			if (typeof window.enterPsnOfflineMode === 'function') return window.enterPsnOfflineMode();
 			window.hideServerUnavailableModal();
 			return;
 		}
@@ -42767,6 +43343,7 @@ function getVisibleChatStackEl(id) {
 	function markServerConnectionAvailable() {
 		clearSessionServerUnavailableTimer();
 		resetSessionAutoReconnectState();
+		if (psnOfflineModeActive) setPsnOfflineModeBadgeState(psnOfflineModeReconnectCycleActive ? 'reconnecting' : 'offline');
 		if (window.isProfileLoaded === true) enableServerAutomaticReconnect();
 		const modal = document.getElementById('server-unavailable-modal');
 		const modalVisible = !!(modal && modal.classList.contains('show'));
@@ -42838,7 +43415,8 @@ function getVisibleChatStackEl(id) {
 			if (loginServerAttempt && !loginServerAttempt.emitted && typeof loginServerAttempt.trySend === 'function') {
 				loginServerAttempt.trySend();
 			}
-			if (typeof updateGlobalOnlineStatus === 'function') updateGlobalOnlineStatus('online');
+			const restoringOfflineSession = psnOfflineModeActive && window.isProfileLoaded === true;
+			if (typeof updateGlobalOnlineStatus === 'function') updateGlobalOnlineStatus(restoringOfflineSession ? 'connecting' : 'online');
 			if (typeof adminUpdateChatControlsBanner === 'function') adminUpdateChatControlsBanner();
 		
 			const myName = localStorage.getItem('psn_username');
@@ -42878,7 +43456,10 @@ function getVisibleChatStackEl(id) {
 			}
 			
 			const s = document.getElementById('chat-status-text');
-			if (s) { s.innerText = "(Connected)"; s.style.color = "#4caf50"; }
+			if (s) {
+				s.innerText = restoringOfflineSession ? "(Reconnecting...)" : "(Connected)";
+				s.style.color = restoringOfflineSession ? "#ffbb33" : "#4caf50";
+			}
 		});
 		
 		socketChat.on('pinned_list', (list) => {
@@ -42930,6 +43511,9 @@ function getVisibleChatStackEl(id) {
 			window.__psnAutoReauthInProgress = false;
 			window.__psnAutoReauthUser = null;
 			const { name, userData, isAdmin, role, isModerator } = data;
+			if (typeof window.prepareIncomingProfileForPersistentPending === 'function' && userData && typeof userData === 'object') {
+				window.prepareIncomingProfileForPersistentPending(name, userData, data || {});
+			}
 			if (typeof window.clearPasswordResetExpiryTimer === 'function') window.clearPasswordResetExpiryTimer();
 			if (typeof window.setPasswordResetLoginMode === 'function') window.setPasswordResetLoginMode(name, false);
 			if (typeof isKicked !== 'undefined') isKicked = false;
@@ -43238,6 +43822,38 @@ function getVisibleChatStackEl(id) {
 				}
 				if (typeof window.tryStartPostAuthChatRealtime === 'function') window.tryStartPostAuthChatRealtime();
 				if (typeof window.adminRestoreAnnouncementForSessionEntry === 'function') setTimeout(() => window.adminRestoreAnnouncementForSessionEntry(), 0);
+			}
+
+			let persistentReplayResult = { ok: true, remaining: [] };
+			if (typeof window.replayPersistentProfileSyncPending === 'function') {
+				persistentReplayResult = await window.replayPersistentProfileSyncPending(window.__psnOfflineModeActive === true ? 'offline-recovery' : 'auth-success');
+			}
+
+			if (window.__psnOfflineModeActive === true && typeof window.leavePsnOfflineMode === 'function') {
+				clearPsnOfflineReconnectWindowTimer();
+				psnOfflineModeReconnectCycleActive = false;
+				if (persistentReplayResult && persistentReplayResult.ok === true) {
+					if (typeof updateGlobalOnlineStatus === 'function') updateGlobalOnlineStatus('online');
+					const recoveredChatStatus = document.getElementById('chat-status-text');
+					if (recoveredChatStatus) {
+						recoveredChatStatus.innerText = "(Connected)";
+						recoveredChatStatus.style.color = "#4caf50";
+					}
+					window.leavePsnOfflineMode(true);
+				} else {
+					setPsnOfflineModeBadgeState('reconnecting');
+					const badgeDetail = document.querySelector('#psn-offline-mode-badge .psn-offline-mode-detail');
+					if (badgeDetail) badgeDetail.textContent = 'Syncing saved changes';
+					setTimeout(async () => {
+						if (!window.__psnOfflineModeActive || !socketChat || !socketChat.connected) return;
+						const retryResult = await window.replayPersistentProfileSyncPending('offline-recovery-retry');
+						if (!retryResult || retryResult.ok !== true || !window.__psnOfflineModeActive) return;
+						if (typeof updateGlobalOnlineStatus === 'function') updateGlobalOnlineStatus('online');
+						const recoveredChatStatus = document.getElementById('chat-status-text');
+						if (recoveredChatStatus) { recoveredChatStatus.innerText = "(Connected)"; recoveredChatStatus.style.color = "#4caf50"; }
+						window.leavePsnOfflineMode(true);
+					}, 2500);
+				}
 			}
 
 		});
@@ -44426,6 +45042,18 @@ function getVisibleChatStackEl(id) {
 				gate.profileComplete = true;
 				if (typeof window.tryStartPostAuthChatRealtime === 'function') window.tryStartPostAuthChatRealtime();
 			}
+			if (typeof window.replayPersistentProfileSyncPending === 'function') {
+				setTimeout(async () => {
+					const replayResult = await window.replayPersistentProfileSyncPending('profile-sync-complete');
+					if (!replayResult || replayResult.ok !== true || window.__psnOfflineModeActive !== true || !socketChat || !socketChat.connected) return;
+					clearPsnOfflineReconnectWindowTimer();
+					psnOfflineModeReconnectCycleActive = false;
+					if (typeof updateGlobalOnlineStatus === 'function') updateGlobalOnlineStatus('online');
+					const recoveredChatStatus = document.getElementById('chat-status-text');
+					if (recoveredChatStatus) { recoveredChatStatus.innerText = "(Connected)"; recoveredChatStatus.style.color = "#4caf50"; }
+					if (typeof window.leavePsnOfflineMode === 'function') window.leavePsnOfflineMode(true);
+				}, 0);
+			}
 		});
 
 		socketChat.on('settings_realtime_sync', (payload = {}) => {
@@ -44590,7 +45218,8 @@ function getVisibleChatStackEl(id) {
 			});
 			socketChat.io.on('reconnect', () => {
 				markServerConnectionAvailable();
-				if (typeof updateGlobalOnlineStatus === 'function') updateGlobalOnlineStatus('online');
+				const restoringOfflineSession = psnOfflineModeActive && window.isProfileLoaded === true;
+				if (typeof updateGlobalOnlineStatus === 'function') updateGlobalOnlineStatus(restoringOfflineSession ? 'connecting' : 'online');
 				if (typeof adminUpdateChatControlsBanner === 'function') adminUpdateChatControlsBanner();
 				if (typeof isTrendingViewVisible === 'function' && isTrendingViewVisible()) setTimeout(() => socketChat.emit('request_trending'), 700);
 			});
@@ -44646,7 +45275,14 @@ function getVisibleChatStackEl(id) {
 
 	window.broadcastProfileUpdate = function() {
 		if (window.__applyingRemoteProfileSync) return;
-		if (!window.isProfileLoaded || !socketChat || !socketChat.connected) return;
+		if (window.__psnOfflineModeActive === true) {
+			if (typeof window.persistCurrentProfileSyncDirtyState === 'function') window.persistCurrentProfileSyncDirtyState();
+			return;
+		}
+		if (!window.isProfileLoaded || !socketChat || !socketChat.connected) {
+			if (window.isProfileLoaded && typeof window.persistCurrentProfileSyncDirtyState === 'function') window.persistCurrentProfileSyncDirtyState();
+			return;
+		}
 	
 		const myName = localStorage.getItem('psn_username');
 		if (!myName || myName === "null") return;
@@ -44872,6 +45508,7 @@ function getVisibleChatStackEl(id) {
 
 	window.psnClearCurrentSession = function(username = '', options = {}) {
 		const name = username || localStorage.getItem('psn_username') || (typeof currentLoginUser !== 'undefined' ? currentLoginUser : '') || '';
+		if (window.__psnOfflineModeActive === true && typeof window.leavePsnOfflineMode === 'function') window.leavePsnOfflineMode(false);
 		try {
 			if (name && options.clearPassword !== false) localStorage.removeItem(`${name}_psn_password`);
 			localStorage.removeItem('psn_username');
@@ -49007,6 +49644,10 @@ function getVisibleChatStackEl(id) {
 	
 	window.updateGlobalOnlineStatus = function(state) {
 		window.globalOnlineState = state || 'offline';
+		if (psnOfflineModeActive) {
+			if (state === 'connecting' && psnOfflineModeReconnectCycleActive) setPsnOfflineModeBadgeState('reconnecting');
+			else if (state === 'offline' || (state === 'connecting' && !psnOfflineModeReconnectCycleActive)) setPsnOfflineModeBadgeState('offline');
+		}
 		const sText = document.getElementById('sidebar-status-text');
 		const sIcon = document.getElementById('sidebar-status-icon');
 		const sCont = document.getElementById('sidebar-status-container');
