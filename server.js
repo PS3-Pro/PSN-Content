@@ -1857,14 +1857,20 @@ function reconcileIncomingDownloads(currentUser = {}, incomingUser = {}) {
 function normalizeMaintenanceState(data = {}) {
   const schedule = normalizeMaintenanceSchedule(data.schedule || {});
   const scheduled = getMaintenanceScheduleStatus(schedule);
+  const now = Date.now();
+  const rawSuppressedUntil = data.scheduleSuppressedUntil ? Date.parse(data.scheduleSuppressedUntil) : 0;
+  const scheduleSuppressedUntil = rawSuppressedUntil && rawSuppressedUntil > now ? new Date(rawSuppressedUntil).toISOString() : null;
+  const scheduleSuppressed = !!scheduleSuppressedUntil;
+  const scheduledActive = scheduled.active && !scheduleSuppressed;
   const manualEnabled = data.manualEnabled === undefined ? !!data.enabled : !!data.manualEnabled;
-  const enabled = manualEnabled || scheduled.active;
+  const enabled = manualEnabled || scheduledActive;
 
   return {
     enabled,
     manualEnabled,
-    scheduledActive: scheduled.active,
-    activeUntil: scheduled.activeUntil || data.activeUntil || null,
+    scheduledActive,
+    activeUntil: scheduledActive ? scheduled.activeUntil : null,
+    scheduleSuppressedUntil,
     message: normalizeText(data.message, DEFAULT_MAINTENANCE_MESSAGE) || DEFAULT_MAINTENANCE_MESSAGE,
     by: normalizeText(data.by, ""),
     at: data.at || (enabled ? new Date().toISOString() : null),
@@ -3075,9 +3081,10 @@ async function saveUser(name, options = {}) {
 }
 
 async function saveAdminState(key, data) {
-  await pool.query(
+  await queryDbWithRetry(
     'INSERT INTO admin_state (state_key, data) VALUES ($1, $2) ON CONFLICT (state_key) DO UPDATE SET data = $2',
-    [key, data]
+    [key, data],
+    { attempts: 3, label: 'ADMIN STATE SAVE' }
   );
 }
 
@@ -3620,6 +3627,16 @@ async function notifyProfileSyncAcrossInstances(name, sourceSocketId = null, pro
   }
 }
 
+async function notifyAdminStateAcrossInstances(key, state) {
+  if (!key) return;
+  const payload = { key, state, instanceId: INSTANCE_ID, at: Date.now() };
+  try {
+    await pool.query('SELECT pg_notify($1, $2)', ['admin_state_sync', JSON.stringify(payload)]);
+  } catch (err) {
+    console.error('[ADMIN STATE NOTIFY ERROR]:', err);
+  }
+}
+
 async function initProfileSyncNotifications() {
   if (profileSyncNotifyClient) return;
 
@@ -3627,12 +3644,34 @@ async function initProfileSyncNotifications() {
   profileSyncNotifyClient = client;
 
   client.on('notification', async (message) => {
-    if (!message || !['profile_sync', 'presence_sync'].includes(message.channel)) return;
+    if (!message || !['profile_sync', 'presence_sync', 'admin_state_sync'].includes(message.channel)) return;
 
     try {
       const data = JSON.parse(message.payload || '{}');
+      if (data.instanceId === INSTANCE_ID) return;
+
+      if (message.channel === 'admin_state_sync') {
+        const key = normalizeText(data.key, '');
+        if (key === ADMIN_STATE_KEYS.maintenance) {
+          adminState.maintenance = normalizeMaintenanceState(data.state || {});
+          adminStateLastRefreshAt = Date.now();
+          io.emit('maintenance_mode', adminState.maintenance);
+          io.emit('admin_maintenance_mode', adminState.maintenance);
+          emitToAdmins('admin_state', {
+            maintenance: adminState.maintenance,
+            chatControls: adminState.chatControls,
+            pinnedAnnouncement: adminState.pinnedAnnouncement || null,
+            reports: adminReports,
+            serverLog,
+            registeredUsers: Object.keys(userDatabase).length,
+            countryStats: getAdminCountryStats()
+          });
+        }
+        return;
+      }
+
       const name = normalizeText(data.name, '');
-      if (!name || data.instanceId === INSTANCE_ID) return;
+      if (!name) return;
 
       const hasLocalSession = Array.from(io.sockets.sockets.values()).some(activeSocket => (
         activeSocket.connected && activeSocket.userName === name
@@ -3718,8 +3757,10 @@ async function initProfileSyncNotifications() {
     await client.connect();
     await client.query('LISTEN profile_sync');
     await client.query('LISTEN presence_sync');
+    await client.query('LISTEN admin_state_sync');
     console.log('[PROFILE SYNC] Postgres LISTEN enabled.');
     console.log('[PRESENCE SYNC] Postgres LISTEN enabled.');
+    console.log('[ADMIN STATE SYNC] Postgres LISTEN enabled.');
   } catch (err) {
     if (profileSyncNotifyClient === client) profileSyncNotifyClient = null;
     console.error('[PROFILE LISTEN INIT ERROR]:', err && err.message ? err.message : err);
@@ -5440,13 +5481,15 @@ io.on('connection', (socket) => {
     try {
       if (socket.isAdmin !== true) return respond({ success: false, message: "Admin only." });
 
-      adminState.maintenance = normalizeMaintenanceState({
+      const nextMaintenance = normalizeMaintenanceState({
         ...(data || {}),
         by: socket.userName || (data && data.by) || "Admin",
         at: new Date().toISOString()
       });
 
-      await saveAdminState(ADMIN_STATE_KEYS.maintenance, adminState.maintenance);
+      await saveAdminState(ADMIN_STATE_KEYS.maintenance, nextMaintenance);
+      adminState.maintenance = nextMaintenance;
+      adminStateLastRefreshAt = Date.now();
       io.emit('maintenance_mode', adminState.maintenance);
       io.emit('admin_maintenance_mode', adminState.maintenance);
       emitToAdmins('admin_state', {
@@ -5458,11 +5501,25 @@ io.on('connection', (socket) => {
         registeredUsers: Object.keys(userDatabase).length,
         countryStats: getAdminCountryStats()
       });
-      await addModerationLog(adminState.maintenance.enabled ? 'maintenance_on' : 'maintenance_off', adminState.maintenance.enabled ? 'Enabled maintenance mode' : 'Disabled maintenance mode', adminState.maintenance, socket.userName || 'Admin');
-      respond({ success: true, state: adminState.maintenance });
+      deferServerTask('ADMIN MAINTENANCE NOTIFY', () => notifyAdminStateAcrossInstances(ADMIN_STATE_KEYS.maintenance, nextMaintenance), 0);
+      deferServerTask('ADMIN MAINTENANCE LOG', () => addModerationLog(nextMaintenance.enabled ? 'maintenance_on' : 'maintenance_off', nextMaintenance.enabled ? 'Enabled maintenance mode' : 'Disabled maintenance mode', nextMaintenance, socket.userName || 'Admin'), 0);
+      respond({ success: true, state: nextMaintenance });
     } catch (err) {
       console.error('[ADMIN MAINTENANCE ERROR]:', err);
       respond({ success: false, message: "Server error while updating maintenance mode." });
+    }
+  });
+
+  socket.on('request_maintenance_state', async (data, callback) => {
+    const respond = typeof callback === 'function' ? callback : () => {};
+    try {
+      await refreshAdminStateThrottled(1500);
+      const state = adminState.maintenance || normalizeMaintenanceState({});
+      socket.emit('maintenance_mode', state);
+      respond({ success: true, state });
+    } catch (err) {
+      console.error('[MAINTENANCE STATE REQUEST ERROR]:', err);
+      respond({ success: false, message: 'Server error while loading maintenance state.' });
     }
   });
 

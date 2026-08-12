@@ -23566,16 +23566,21 @@ P
 	function adminNormalizeMaintenanceState(state = {}) {
 		const schedule = adminNormalizeMaintenanceSchedule(state.schedule || {});
 		const scheduled = adminGetMaintenanceScheduleStatus(schedule);
+		const now = Date.now();
 		const serverActiveUntil = state.activeUntil ? Date.parse(state.activeUntil) : 0;
-		const serverScheduledStillActive = !!state.scheduledActive && serverActiveUntil && serverActiveUntil > Date.now();
-		const scheduledActive = scheduled.active || serverScheduledStillActive;
+		const serverScheduledStillActive = !!state.scheduledActive && serverActiveUntil && serverActiveUntil > now;
+		const rawSuppressedUntil = state.scheduleSuppressedUntil ? Date.parse(state.scheduleSuppressedUntil) : 0;
+		const scheduleSuppressedUntil = rawSuppressedUntil && rawSuppressedUntil > now ? new Date(rawSuppressedUntil).toISOString() : null;
+		const scheduleSuppressed = !!scheduleSuppressedUntil;
+		const scheduledActive = !scheduleSuppressed && (scheduled.active || serverScheduledStillActive);
 		const manualEnabled = state.manualEnabled === undefined ? (!!state.enabled && !state.scheduledActive) : !!state.manualEnabled;
 		const enabled = manualEnabled || scheduledActive;
 		return {
 			enabled,
 			manualEnabled,
 			scheduledActive,
-			activeUntil: scheduled.activeUntil || (serverScheduledStillActive ? state.activeUntil : null),
+			activeUntil: scheduledActive ? (scheduled.activeUntil || (serverScheduledStillActive ? state.activeUntil : null)) : null,
+			scheduleSuppressedUntil,
 			message: String(state.message || 'The service is under maintenance. Please try again soon.'),
 			by: state.by || localStorage.getItem('psn_username') || 'Admin',
 			at: state.at || (enabled ? new Date().toISOString() : null),
@@ -23597,6 +23602,84 @@ P
 		adminForceMaintenanceOverlayForNonAdmins(normalized);
 		return normalized;
 	}
+
+	window.__adminMaintenanceCommitInFlight = false;
+
+	function adminSetMaintenanceCommitUi(busy, text = 'Updating...') {
+		window.__adminMaintenanceCommitInFlight = !!busy;
+		const button = document.getElementById('admin-maintenance-toggle');
+		if (!button) return;
+		button.disabled = !!busy;
+		button.style.pointerEvents = busy ? 'none' : '';
+		button.style.opacity = busy ? '0.72' : '';
+		if (busy) button.innerHTML = `<i class="fas fa-circle-notch fa-spin"></i> ${adminEscapeHtml(text)}`;
+	}
+
+	function adminShowMaintenanceCommitError(message) {
+		if (typeof playUiError === 'function') playUiError();
+		const clean = String(message || 'The maintenance state could not be saved.');
+		if (typeof showToastNotification === 'function') showToastNotification('Maintenance', clean);
+		else alert(clean);
+	}
+
+	function adminRequestMaintenanceState(reason = 'client-request') {
+		if (!(typeof socketChat !== 'undefined' && socketChat && socketChat.connected)) return false;
+		try {
+			socketChat.timeout(5000).emit('request_maintenance_state', { at: Date.now(), reason }, (err, response) => {
+				if (err || !response || response.success === false || !response.state) return;
+				adminSetMaintenanceState(response.state, false);
+				if (document.getElementById('view-admin')?.style.display === 'block') renderAdminPanel();
+			});
+			return true;
+		} catch (err) {
+			return false;
+		}
+	}
+	window.adminRequestMaintenanceState = adminRequestMaintenanceState;
+
+	function adminCommitMaintenanceState(nextState, options = {}) {
+		if (window.__adminMaintenanceCommitInFlight) return Promise.resolve(null);
+		if (!(typeof socketChat !== 'undefined' && socketChat && socketChat.connected)) {
+			adminShowMaintenanceCommitError('Server connection is offline. Maintenance was not changed.');
+			return Promise.resolve(null);
+		}
+		const desired = adminNormalizeMaintenanceState(nextState || {});
+		adminSetMaintenanceCommitUi(true, options.busyText || 'Updating...');
+		return new Promise(resolve => {
+			let settled = false;
+			const finish = (response, err = null) => {
+				if (settled) return;
+				settled = true;
+				adminSetMaintenanceCommitUi(false);
+				if (err || !response || response.success !== true || !response.state) {
+					adminShowMaintenanceCommitError((response && response.message) || 'The server did not confirm the maintenance change.');
+					adminRequestMaintenanceState('commit-failed');
+					renderAdminPanel();
+					resolve(null);
+					return;
+				}
+				const confirmed = adminSetMaintenanceState(response.state, false);
+				if (options.logType) adminAddLog(options.logType, options.logMessage || 'Updated maintenance state', confirmed);
+				renderAdminPanel();
+				if (typeof playUiSuccess === 'function') playUiSuccess();
+				resolve(confirmed);
+			};
+			try {
+				if (typeof socketChat.timeout === 'function') {
+					socketChat.timeout(8000).emit('admin_maintenance_mode', desired, (err, response) => finish(response, err));
+				} else {
+					const timer = setTimeout(() => finish(null, new Error('timeout')), 8000);
+					socketChat.emit('admin_maintenance_mode', desired, response => {
+						clearTimeout(timer);
+						finish(response, null);
+					});
+				}
+			} catch (err) {
+				finish(null, err);
+			}
+		});
+	}
+	window.adminCommitMaintenanceState = adminCommitMaintenanceState;
 
 	function adminForceMaintenanceOverlayForNonAdmins(state = null) {
 		const normalized = state || adminGetMaintenanceState();
@@ -23743,21 +23826,37 @@ P
 		}
 	};
 
-	window.adminToggleMaintenanceMode = function() {
-		if (!adminGuard()) return;
+	window.adminToggleMaintenanceMode = async function() {
+		if (!adminGuard() || window.__adminMaintenanceCommitInFlight) return;
 		const current = adminGetMaintenanceState();
 		const input = document.getElementById('admin-maintenance-message');
 		const message = (input?.value || current.message || 'The service is under maintenance. Please try again soon.').trim();
-		const next = !current.manualEnabled;
-		if (next && !confirm('Enable maintenance mode now for normal users?')) return;
-		const state = adminSetMaintenanceState({ ...current, manualEnabled: next, message }, true);
-		adminAddLog(next ? 'maintenance_on' : 'maintenance_off', next ? 'Enabled manual maintenance mode' : 'Disabled manual maintenance mode', state);
-		renderAdminPanel();
-		if (typeof playUiSuccess === 'function') playUiSuccess();
+
+		if (!current.enabled) {
+			if (!confirm('Enable maintenance mode now for normal users?')) return;
+			await adminCommitMaintenanceState({ ...current, manualEnabled: true, message }, {
+				busyText: 'Enabling...',
+				logType: 'maintenance_on',
+				logMessage: 'Enabled maintenance mode'
+			});
+			return;
+		}
+
+		const suppressedUntil = current.scheduledActive && current.activeUntil ? current.activeUntil : current.scheduleSuppressedUntil;
+		await adminCommitMaintenanceState({
+			...current,
+			manualEnabled: false,
+			message,
+			scheduleSuppressedUntil: suppressedUntil || null
+		}, {
+			busyText: 'Disabling...',
+			logType: 'maintenance_off',
+			logMessage: current.scheduledActive ? 'Disabled maintenance now; current scheduled window skipped' : 'Disabled maintenance mode'
+		});
 	};
 
-	window.adminSaveMaintenanceSchedule = function() {
-		if (!adminGuard()) return;
+	window.adminSaveMaintenanceSchedule = async function() {
+		if (!adminGuard() || window.__adminMaintenanceCommitInFlight) return;
 		const current = adminGetMaintenanceState();
 		const input = document.getElementById('admin-maintenance-message');
 		const scheduleDraft = adminReadMaintenanceScheduleFromUi();
@@ -23771,10 +23870,16 @@ P
 			return;
 		}
 		const schedule = scheduleDraft;
-		const state = adminSetMaintenanceState({ ...current, message: (input?.value || current.message).trim(), schedule }, true);
-		adminAddLog('maintenance_schedule', enabled ? `Updated maintenance schedule: ${adminMaintenanceScheduleLabel(schedule)}` : 'Disabled maintenance schedule', state);
-		renderAdminPanel();
-		if (typeof playUiSuccess === 'function') playUiSuccess();
+		await adminCommitMaintenanceState({
+			...current,
+			message: (input?.value || current.message).trim(),
+			schedule,
+			scheduleSuppressedUntil: null
+		}, {
+			busyText: 'Saving...',
+			logType: 'maintenance_schedule',
+			logMessage: enabled ? `Updated maintenance schedule: ${adminMaintenanceScheduleLabel(schedule)}` : 'Disabled maintenance schedule'
+		});
 	};
 
 
@@ -25136,8 +25241,9 @@ P
 		if (scheduleStatus) {
 			const label = adminMaintenanceScheduleLabel(schedule);
 			const countdown = maintenance.activeUntil ? adminFormatMaintenanceTimeLeft(maintenance.activeUntil) : '';
+			const suppressedCountdown = maintenance.scheduleSuppressedUntil ? adminFormatMaintenanceTimeLeft(maintenance.scheduleSuppressedUntil) : '';
 			scheduleStatus.innerHTML = schedule.enabled
-				? `<i class="fas fa-calendar-check"></i> ${adminEscapeHtml(label)}${maintenance.scheduledActive && countdown ? ` • Live again in ${adminEscapeHtml(countdown)}` : ''}`
+				? `<i class="fas fa-calendar-check"></i> ${adminEscapeHtml(label)}${maintenance.scheduledActive && countdown ? ` • Live again in ${adminEscapeHtml(countdown)}` : (suppressedCountdown ? ` • Current window skipped (${adminEscapeHtml(suppressedCountdown)})` : '')}`
 				: 'Schedule is off.';
 		}
 		const maintPill = document.getElementById('admin-maintenance-pill');
@@ -25148,9 +25254,12 @@ P
 				: (maintenance.scheduledActive ? '<i class="fas fa-calendar-day"></i> Scheduled Active' : (schedule.enabled ? '<i class="fas fa-calendar-alt"></i> Scheduled' : '<i class="fas fa-circle"></i> Off'));
 		}
 		const maintBtn = document.getElementById('admin-maintenance-toggle');
-		if (maintBtn) {
-			maintBtn.className = maintenance.manualEnabled ? 'admin-action-btn danger' : 'admin-action-btn warning';
-			maintBtn.innerHTML = maintenance.manualEnabled ? '<i class="fas fa-power-off"></i> Disable Manual' : '<i class="fas fa-power-off"></i> Enable Now';
+		if (maintBtn && !window.__adminMaintenanceCommitInFlight) {
+			maintBtn.disabled = false;
+			maintBtn.style.pointerEvents = '';
+			maintBtn.style.opacity = '';
+			maintBtn.className = maintenance.enabled ? 'admin-action-btn danger' : 'admin-action-btn warning';
+			maintBtn.innerHTML = maintenance.enabled ? '<i class="fas fa-power-off"></i> Disable Now' : '<i class="fas fa-power-off"></i> Enable Now';
 		}
 
 		const pinned = adminGetPinnedAnnouncement();
@@ -25243,6 +25352,21 @@ P
 		adminUpdateChatControlsBanner();
 	}
 
+	function adminInstallMaintenanceSocketListeners() {
+		if (!(typeof socketChat !== 'undefined' && socketChat)) return;
+		if (window.adminMaintenanceListenersSocket === socketChat) return;
+		window.adminMaintenanceListenersSocket = socketChat;
+		const applyMaintenanceState = data => {
+			adminSetMaintenanceState(data || {}, false);
+			if (document.getElementById('view-admin')?.style.display === 'block') renderAdminPanel();
+		};
+		socketChat.on('maintenance_mode', applyMaintenanceState);
+		socketChat.on('connect', () => {
+			setTimeout(() => adminRequestMaintenanceState('socket-connect'), 0);
+		});
+	}
+	window.adminInstallMaintenanceSocketListeners = adminInstallMaintenanceSocketListeners;
+
 	function adminInstallSocketListeners() {
 		if (!(typeof socketChat !== 'undefined' && socketChat)) return;
 		if (window.adminSocketListenersInstalled && window.adminSocketListenersSocket === socketChat) return;
@@ -25274,8 +25398,6 @@ P
 		socketChat.on('connect_error', () => { adminSetChatControlsSyncState('offline'); syncAdminHealth('connecting'); });
 		socketChat.io?.on?.('reconnect_attempt', () => syncAdminHealth('connecting'));
 		socketChat.io?.on?.('reconnect', () => syncAdminHealth('online'));
-		socketChat.on('admin_maintenance_mode', data => { adminSetMaintenanceState(data || {}, false); renderAdminPanel(); });
-		socketChat.on('maintenance_mode', data => { adminSetMaintenanceState(data || {}, false); renderAdminPanel(); });
 		socketChat.on('admin_server_log_list', list => {
 			adminSetServerLog(Array.isArray(list) ? list : []);
 			renderAdminPanel();
@@ -25340,6 +25462,7 @@ P
 
 	function adminBootExtras() {
 		window.adminPageStartTime = window.adminPageStartTime || Date.now();
+		adminInstallMaintenanceSocketListeners();
 		adminInstallSocketListeners();
 		adminInstallAnnouncementScrollHandler();
 		setTimeout(adminLightMaintenanceOverlayTick, 180);
@@ -25349,6 +25472,7 @@ P
 		if (!window.adminMaintenanceOverlayTimer) window.adminMaintenanceOverlayTimer = setInterval(adminLightMaintenanceOverlayTick, 10000);
 		setTimeout(() => { if (typeof window.adminRequestChatControlsState === 'function') window.adminRequestChatControlsState(); }, 2600);
 		setInterval(() => {
+			adminInstallMaintenanceSocketListeners();
 			adminInstallSocketListeners();
 			const adminVisible = document.getElementById('view-admin')?.style.display === 'block';
 			if (adminVisible) {
@@ -43397,6 +43521,7 @@ function getVisibleChatStackEl(id) {
 			timeout: 12000,
 			closeOnBeforeunload: false
 		})
+		if (typeof adminInstallMaintenanceSocketListeners === 'function') adminInstallMaintenanceSocketListeners();
 		if (typeof adminUpdateChatControlsBanner === 'function') adminUpdateChatControlsBanner();
 		
 		socketChat.on('connect', () => {
