@@ -18629,8 +18629,10 @@ P
 				const titleIdLabel = `${groupCount} Title ID${groupCount === 1 ? '' : 's'}`;
 				const sizeLabel = getBrowseGroupSizeLabel(sourceGames);
 				const groupedSingleGame = groupCount === 1 ? groupItems[0].game : null;
-				const groupedWishKey = groupedSingleGame ? (((currentCat === 'avatars' || currentCat === 'themes') && groupedSingleGame.contentId) ? groupedSingleGame.contentId : groupedSingleGame.id) : '';
-				const groupedIsInWishlist = !!groupedSingleGame && wishlist.some(item => ((((item.category === 'avatars' || item.category === 'themes') && item.contentId) ? item.contentId : item.id) === groupedWishKey));
+				const groupedIsInWishlist = sourceGames.some(groupedGame => {
+					const groupedWishKey = ((currentCat === 'avatars' || currentCat === 'themes') && groupedGame.contentId) ? groupedGame.contentId : groupedGame.id;
+					return wishlist.some(item => ((((item.category === 'avatars' || item.category === 'themes') && item.contentId) ? item.contentId : item.id) === groupedWishKey));
+				});
 				const groupedWishlistClass = groupedIsInWishlist ? 'is-wishlisted' : '';
 				const groupedIsFavorited = !!groupedSingleGame && (
 					favoriteBrowseKeys.has(String(groupedSingleGame.id || '').trim()) ||
@@ -18640,6 +18642,7 @@ P
 				);
 				const groupedFavoriteClass = groupedIsFavorited ? 'is-favorited' : '';
 				const groupedSingleTitleId = groupedSingleGame ? (groupedSingleGame.id || groupedSingleGame.titleId || '') : '';
+				const groupedTitleIds = sourceGames.map(groupedGame => groupedGame.id || groupedGame.titleId || '').filter(Boolean).join('|');
 				const encodedGroupKey = encodeURIComponent(renderItem.groupKey).replace(/'/g, '%27');
 				const animClass = 'no-anim';
 				const animStyle = `style="--tile-idx: ${i % LOAD_AMOUNT};"`;
@@ -18648,7 +18651,7 @@ P
 				const consoleName = game.cTag.toUpperCase();
 
 				htmlChunks.push(`
-			<div class="game-card grouped-title-card ${animClass} ${groupedWishlistClass} ${groupedFavoriteClass}" data-group-title-key="${encodedGroupKey}" data-store-category="${currentCat}"${groupedSingleTitleId ? ` data-group-single-title-id="${groupedSingleTitleId}"` : ''} ${animStyle} onclick="openBrowseTitleGroupFromCard(this)" onmouseenter="playUiHover(); this.classList.remove('anim-reveal'); this.classList.add('no-anim');">
+			<div class="game-card grouped-title-card ${animClass} ${groupedWishlistClass} ${groupedFavoriteClass}" data-group-title-key="${encodedGroupKey}" data-store-category="${currentCat}"${groupedSingleTitleId ? ` data-group-single-title-id="${groupedSingleTitleId}"` : ''}${groupedTitleIds ? ` data-group-title-ids="${groupedTitleIds.replace(/"/g, '&quot;')}"` : ''} ${animStyle} onclick="openBrowseTitleGroupFromCard(this)" onmouseenter="playUiHover(); this.classList.remove('anim-reveal'); this.classList.add('no-anim');">
 				<div class="game-img-container">
 					<div class="console-tag ${tagClass}">${consoleName}</div>
 					<div class="region-tag">${regionLabel}</div>
@@ -30200,7 +30203,8 @@ P
 	
 		if (subviewGames) subviewGames.classList.remove('my-games-offline');
 		const hasRenderedLocalCards = !!(grid && grid.querySelector('.game-card'));
-		if (typeof lastScannedGames !== 'undefined' && lastScannedGames.length > 0) {
+		const hadCachedLocalGames = typeof lastScannedGames !== 'undefined' && lastScannedGames.length > 0;
+		if (hadCachedLocalGames) {
 			if (!hasRenderedLocalCards) renderLocalLibrary(lastScannedGames, true, true);
 		} else {
 			grid.innerHTML = "";
@@ -30282,6 +30286,16 @@ P
 				renderLocalLibrary(lastScannedGames, false, true);
 			} else if (typeof updateConsoleLibraryStatusUI === 'function') {
 				updateConsoleLibraryStatusUI(lastScannedGames);
+			}
+
+			if (!hadCachedLocalGames && !window.isRestoringHistory && typeof setupRevealAnimations === 'function') {
+				requestAnimationFrame(() => requestAnimationFrame(() => {
+					const libraryView = document.getElementById('view-library');
+					const gamesSubview = document.getElementById('subview-games');
+					const libraryVisible = !!libraryView && window.getComputedStyle(libraryView).display !== 'none';
+					const gamesVisible = !!gamesSubview && window.getComputedStyle(gamesSubview).display !== 'none';
+					if (libraryVisible && gamesVisible && grid.querySelector('.game-card')) setupRevealAnimations('ps3-local-grid');
+				}));
 			}
 			
 			if (typeof window.broadcastProfileUpdate === 'function') {
@@ -30634,6 +30648,7 @@ P
 			const starColor = isFav ? '#ffcc00' : 'rgba(255,255,255,0.6)';
 			
 			const starTooltip = isFav ? "Remove from Favorites" : "Add to Favorites";
+			const favoriteSourceIndex = lastScannedGames.findIndex(item => item && isSameLibraryGameRecord(item, game));
 	
 			const isThisGamePlaying = (currentPlaying.status === 'playing' && 
 									(game.title === currentPlaying.title || (cachedData.id && cachedData.id === currentPlaying.titleId)));
@@ -30728,7 +30743,7 @@ P
 					<img src="${escapeCategoryDotAttr(displayCover)}" class="game-img" data-cover-key="${escapeCategoryDotAttr(localCoverKey)}" data-cover-category="library" data-title-id="${escapeCategoryDotAttr(cachedData.id || '')}" data-github-cover="${escapeCategoryDotAttr(cachedData.githubCover || '')}" data-webman-cover="${escapeCategoryDotAttr(cachedData.webmanCover || '')}" data-lib-path="${game.path.replace(/"/g, '&quot;')}" data-name="${String(coverSearchName || game.title || '').replace(/"/g, '&quot;')}" data-console="${String(coverConsoleTag || consoleType).replace(/"/g, '&quot;')}" data-content-id="${escapeCategoryDotAttr(coverContentId)}" data-region="${escapeCategoryDotAttr(coverRegion)}" onload="markCoverLoaded(this)" onerror="handleLibraryCoverError(this)">
 					<div class="console-tag ${tagClass}">${consoleType}</div>
 					<div class="region-tag">${region}</div>
-					<div class="fav-btn" style="cursor: pointer;" title="${starTooltip}" onclick="toggleLocalFavorite(event, ${lastScannedGames.indexOf(game)})">
+					<div class="fav-btn" style="cursor: pointer;" title="${starTooltip}" onclick="toggleLocalFavorite(event, ${favoriteSourceIndex})">
 						<i class="${starIcon}" style="color: ${starColor}; font-size: 14px;"></i>
 					</div>
 				</div>
@@ -30849,7 +30864,11 @@ P
 			return; 
 		}
 	
-		const game = lastScannedGames[index];
+		let game = lastScannedGames[index];
+		if (!game && card) {
+			const renderedPath = card.querySelector('.game-img')?.dataset.libPath || '';
+			if (renderedPath) game = lastScannedGames.find(item => item && normalizeLibraryGamePath(item.path) === normalizeLibraryGamePath(renderedPath));
+		}
 		if (!game) return;
 	
 		const favIndex = favoritesLibrary.findIndex(f => f.path === game.path);
@@ -34141,15 +34160,6 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 		return;
 	}
 
-	if (!window.isRestoringHistory) {
-		document.querySelectorAll('#library-console-filters input').forEach(cb => cb.checked = true);
-		document.querySelectorAll('#fav-console-filters input').forEach(cb => cb.checked = true);
-		if (typeof resetSortToDefault === 'function') {
-			resetSortToDefault('library');
-			resetSortToDefault('fav');
-		}
-	}
-
 	const searchInput = document.getElementById('search-input');
 	const searchBar = searchInput ? searchInput.closest('.search-bar') : null;
 	
@@ -34222,6 +34232,13 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 		nextView.style.display = 'block';
 		void nextView.offsetWidth;
 		nextView.classList.add('anim-up');
+	}
+
+	if (type === 'games' && !window.isRestoringHistory && typeof setupRevealAnimations === 'function') {
+		requestAnimationFrame(() => requestAnimationFrame(() => {
+			const grid = document.getElementById('ps3-local-grid');
+			if (grid && grid.querySelector('.game-card')) setupRevealAnimations('ps3-local-grid');
+		}));
 	}
 
 	if ((type === 'games' || type === 'favorites') && typeof window.refreshVisibleFavoriteCardsFromProfileSync === 'function') {
@@ -52636,12 +52653,20 @@ function getVisibleChatStackEl(id) {
 			span.addEventListener('click', span.__baseGameClickHandler);
 		}
 
-		var groupedCards = document.querySelectorAll('.grouped-title-card[data-group-single-title-id]');
+		var groupedCards = document.querySelectorAll('.grouped-title-card[data-group-title-ids], .grouped-title-card[data-group-single-title-id]');
 		for (var g = 0; g < groupedCards.length; g++) {
 			var groupedCard = groupedCards[g];
 			var groupedId = cleanId(groupedCard.getAttribute('data-group-single-title-id'));
-			var groupedCat = String(groupedCard.getAttribute('data-store-category') || getCurrentCategory() || '').trim();
-			if (groupedId) applyInstalledCardState(groupedCard, groupedId, groupedCat, installedTitleIds, false);
+			var groupedIds = String(groupedCard.getAttribute('data-group-title-ids') || groupedId || '').split('|').map(cleanId).filter(Boolean);
+			var groupedInstalled = !!installedTitleIds && groupedIds.some(function(candidate){
+				var titleId = normalizeInstalledTitleId(candidate);
+				return !!titleId && installedTitleIds.has(titleId);
+			});
+			groupedCard.classList.toggle('is-installed-on-ps3', groupedInstalled);
+			if (groupedId) {
+				var groupedCat = String(groupedCard.getAttribute('data-store-category') || getCurrentCategory() || '').trim();
+				applyInstalledCardState(groupedCard, groupedId, groupedCat, installedTitleIds, false);
+			}
 		}
 
 		var wishlistCards = document.querySelectorAll('#wishlist-grid .game-card[data-wishlist-title-id]');
