@@ -2607,9 +2607,19 @@ body.is-admin #nav-admin-footer { display: flex !important; }
 .admin-report-actions .btn-mini-round.report-jump { border-color: rgba(0,212,255,0.45); color: #00d4ff; }
 .admin-report-actions .btn-mini-round.report-resolve { border-color: rgba(76,175,80,0.45); color: #4caf50; }
 .admin-log-type { display: inline-flex; align-items: center; gap: 4px; padding: 2px 6px; border-radius: 999px; background: rgba(0,112,204,.12); color: #00d4ff; font-size: 8px; font-weight: 900; margin-right: 6px; text-transform: uppercase; letter-spacing: .5px; }
-#admin-maintenance-overlay { position: fixed; inset: 0; z-index: 2147483000; display: flex; align-items: center; justify-content: center; padding: 24px; background: radial-gradient(circle at 50% 0%,rgba(0,112,204,.34),rgba(3,5,9,.96) 58%,#000 100%); backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px); }
+#admin-maintenance-overlay { position: fixed; inset: 0; z-index: 2147483000; display: flex; align-items: center; justify-content: center; padding: 24px; background: radial-gradient(circle at 50% 0%,rgba(0,112,204,.34),rgba(3,5,9,.96) 58%,#000 100%); backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px); opacity: 0; visibility: hidden; pointer-events: none; will-change: opacity,backdrop-filter; }
+#admin-maintenance-overlay.show, #admin-maintenance-overlay.closing { visibility: visible; }
+#admin-maintenance-overlay.show { pointer-events: auto; animation: adminMaintenanceOverlayIn .46s ease both; }
+#admin-maintenance-overlay.closing { pointer-events: none; animation: adminMaintenanceOverlayOut .28s cubic-bezier(.4,0,1,1) both; }
 body.admin-maintenance-reveal-pending #user-select-screen, body.admin-maintenance-reveal-pending .classic-site-switch, body.admin-maintenance-reveal-pending #name-input-overlay, body.admin-maintenance-reveal-pending #login-input-overlay { pointer-events: none !important; }
-.admin-maintenance-box { width: min(560px,92vw); border-radius: 18px; padding: 28px; background: rgba(18,24,36,.9); border: 1px solid rgba(255,255,255,.16); box-shadow: 0 25px 80px rgba(0,0,0,.8),0 0 30px rgba(0,112,204,.2); text-align: center; }
+.admin-maintenance-box { width: min(560px,92vw); border-radius: 18px; padding: 28px; background: rgba(18,24,36,.9); border: 1px solid rgba(255,255,255,.16); box-shadow: 0 25px 80px rgba(0,0,0,.8),0 0 30px rgba(0,112,204,.2); text-align: center; opacity: 1; transform: translateY(0) scale(1); filter: blur(0); transform-origin: center; will-change: opacity,transform,filter; }
+#admin-maintenance-overlay.entering .admin-maintenance-box { animation: adminMaintenanceBoxIn .66s cubic-bezier(.16,1,.3,1) .06s both; }
+#admin-maintenance-overlay.closing .admin-maintenance-box { animation: adminMaintenanceBoxOut .26s cubic-bezier(.4,0,1,1) both; }
+@keyframes adminMaintenanceOverlayIn { from { opacity: 0; backdrop-filter: blur(0); -webkit-backdrop-filter: blur(0); } to { opacity: 1; backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px); } }
+@keyframes adminMaintenanceOverlayOut { from { opacity: 1; backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px); } to { opacity: 0; backdrop-filter: blur(0); -webkit-backdrop-filter: blur(0); } }
+@keyframes adminMaintenanceBoxIn { 0% { opacity: 0; transform: translateY(30px) scale(.94); filter: blur(9px); } 62% { opacity: 1; transform: translateY(-4px) scale(1.012); filter: blur(0); } 100% { opacity: 1; transform: translateY(0) scale(1); filter: blur(0); } }
+@keyframes adminMaintenanceBoxOut { from { opacity: 1; transform: translateY(0) scale(1); filter: blur(0); } to { opacity: 0; transform: translateY(14px) scale(.98); filter: blur(4px); } }
+@media (prefers-reduced-motion:reduce) { #admin-maintenance-overlay.show,#admin-maintenance-overlay.closing,#admin-maintenance-overlay.entering .admin-maintenance-box,#admin-maintenance-overlay.closing .admin-maintenance-box { animation-duration:.01ms !important; animation-delay:0ms !important; animation-iteration-count:1 !important; } }
 .admin-maintenance-box i { font-size: 42px; color: #ffcc00; filter: drop-shadow(0 0 12px rgba(255,204,0,.5)); margin-bottom: 14px; }
 .admin-maintenance-box h2 { margin: 0 0 10px 0; font-weight: 300; letter-spacing: -.4px; }
 .admin-maintenance-box p { margin: 0; color: var(--text-muted); line-height: 1.55; font-size: 13px; }
@@ -23692,13 +23702,6 @@ P
 		const loginBypass = document.body.classList.contains('admin-maintenance-login-bypass');
 		if (isAdmin || loginBypass) return;
 
-		const overlay = document.getElementById('admin-maintenance-overlay');
-		if (overlay) {
-			overlay.style.display = 'flex';
-			overlay.style.visibility = 'visible';
-			overlay.style.opacity = '1';
-		}
-
 		document.querySelectorAll('.modal-overlay.show, .sys-modal.show, .profile-dropdown-menu.show, .admin-broadcast-popover.show').forEach(el => {
 			el.classList.remove('show');
 		});
@@ -23810,7 +23813,11 @@ P
 
 
 	const ADMIN_MAINTENANCE_LOGIN_REVEAL_DELAY_MS = 1800;
+	const ADMIN_MAINTENANCE_OVERLAY_EXIT_MS = 320;
+	const ADMIN_MAINTENANCE_OVERLAY_ENTRY_MS = 760;
 	let adminMaintenanceLoginRevealTimer = null;
+	let adminMaintenanceOverlayCloseTimer = null;
+	let adminMaintenanceOverlayEntryTimer = null;
 
 	function adminIsStartingScreenActive() {
 		const bootContainer = document.getElementById('ps5-boot-container');
@@ -23837,6 +23844,69 @@ P
 			adminMaintenanceLoginRevealTimer = null;
 		}
 		adminSetMaintenanceRevealPending(false);
+	}
+
+	function adminClearMaintenanceOverlayAnimationTimers() {
+		if (adminMaintenanceOverlayCloseTimer) {
+			clearTimeout(adminMaintenanceOverlayCloseTimer);
+			adminMaintenanceOverlayCloseTimer = null;
+		}
+		if (adminMaintenanceOverlayEntryTimer) {
+			clearTimeout(adminMaintenanceOverlayEntryTimer);
+			adminMaintenanceOverlayEntryTimer = null;
+		}
+	}
+
+	function adminShowMaintenanceOverlay(overlay) {
+		if (!overlay) return;
+		if (overlay.classList.contains('show') && !overlay.classList.contains('closing')) return;
+		if (overlay.classList.contains('entering') && !overlay.classList.contains('closing')) return;
+		adminClearMaintenanceOverlayAnimationTimers();
+		overlay.classList.remove('closing');
+		overlay.classList.add('entering');
+		requestAnimationFrame(() => {
+			if (!overlay.isConnected) return;
+			const state = adminGetMaintenanceState();
+			const isAdmin = document.body.classList.contains('is-admin');
+			const loginVisible = adminIsLoginScreenVisible();
+			const adminLoginBypass = document.body.classList.contains('admin-maintenance-login-bypass') && loginVisible;
+			if (!state.enabled || isAdmin || adminLoginBypass) {
+				overlay.remove();
+				return;
+			}
+			overlay.classList.add('show');
+			adminMaintenanceOverlayEntryTimer = setTimeout(() => {
+				adminMaintenanceOverlayEntryTimer = null;
+				if (overlay.isConnected) overlay.classList.remove('entering');
+			}, ADMIN_MAINTENANCE_OVERLAY_ENTRY_MS);
+		});
+	}
+
+	function adminHideMaintenanceOverlay(options = {}) {
+		const overlay = document.getElementById('admin-maintenance-overlay');
+		if (!overlay) return;
+		const instant = options.instant === true;
+		if (adminMaintenanceOverlayEntryTimer) {
+			clearTimeout(adminMaintenanceOverlayEntryTimer);
+			adminMaintenanceOverlayEntryTimer = null;
+		}
+		overlay.classList.remove('entering');
+		if (instant || !overlay.classList.contains('show')) {
+			if (adminMaintenanceOverlayCloseTimer) {
+				clearTimeout(adminMaintenanceOverlayCloseTimer);
+				adminMaintenanceOverlayCloseTimer = null;
+			}
+			overlay.remove();
+			return;
+		}
+		if (overlay.classList.contains('closing')) return;
+		overlay.classList.remove('show');
+		overlay.classList.add('closing');
+		if (adminMaintenanceOverlayCloseTimer) clearTimeout(adminMaintenanceOverlayCloseTimer);
+		adminMaintenanceOverlayCloseTimer = setTimeout(() => {
+			adminMaintenanceOverlayCloseTimer = null;
+			if (overlay.isConnected && overlay.classList.contains('closing')) overlay.remove();
+		}, ADMIN_MAINTENANCE_OVERLAY_EXIT_MS);
 	}
 
 	function adminScheduleMaintenanceOverlayAfterUserReveal(delayMs = ADMIN_MAINTENANCE_LOGIN_REVEAL_DELAY_MS) {
@@ -23876,13 +23946,13 @@ P
 
 		if (!state.enabled || isAdmin || adminLoginBypass) {
 			adminClearMaintenanceLoginRevealDelay();
-			if (overlay) overlay.remove();
+			adminHideMaintenanceOverlay({ instant: options.instant === true });
 			return;
 		}
 
 		if (window.isProfileLoaded !== true && options.skipInitialRevealDelay !== true) {
 			if (adminIsStartingScreenActive()) {
-				if (overlay) overlay.remove();
+				adminHideMaintenanceOverlay({ instant: true });
 				adminSetMaintenanceRevealPending(false);
 				return;
 			}
@@ -23890,7 +23960,7 @@ P
 			if (revealedAt > 0) {
 				const elapsed = Math.max(0, Date.now() - revealedAt);
 				if (elapsed < ADMIN_MAINTENANCE_LOGIN_REVEAL_DELAY_MS) {
-					if (overlay) overlay.remove();
+					adminHideMaintenanceOverlay({ instant: true });
 					adminScheduleMaintenanceOverlayAfterUserReveal(ADMIN_MAINTENANCE_LOGIN_REVEAL_DELAY_MS - elapsed);
 					return;
 				}
@@ -23915,6 +23985,7 @@ P
 		const scheduleNote = scheduleLabel ? `<p class="admin-maintenance-schedule-note">Scheduled maintenance: ${adminEscapeHtml(scheduleLabel)}</p>` : '';
 		const adminAccess = canShowAdminAccess ? `<div class="admin-maintenance-actions"><button class="admin-maintenance-login-btn" onclick="adminMaintenanceLoginBypass()"><i class="fas fa-user-shield" style="font-size:12px;margin:0 6px 0 0;color:#00d4ff;filter:none;"></i> Admin Login</button></div>` : '';
 		overlay.innerHTML = `<div class="admin-maintenance-box"><i class="fas fa-tools"></i><h2>Maintenance Mode</h2><p>${adminEscapeHtml(state.message)}</p>${countdown}${scheduleNote}${adminAccess}</div>`;
+		adminShowMaintenanceOverlay(overlay);
 	}
 
 	window.adminMaintenanceLoginBypass = function() {
