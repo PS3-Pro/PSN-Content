@@ -23743,6 +23743,37 @@ P
 		return `${adminMaintenanceDaysLabel(normalized.days)} • ${normalized.startTime} → ${normalized.endTime} (${normalized.timezone})`;
 	}
 
+	function adminMaintenancePublicScheduleLabel(state = {}) {
+		const schedule = adminNormalizeMaintenanceSchedule(state.schedule || {});
+		if (!schedule.enabled || !state.scheduledActive) return '';
+
+		const endAt = state.activeUntil ? Date.parse(state.activeUntil) : 0;
+		if (!endAt || endAt <= Date.now()) return '';
+
+		const parseMinutes = value => {
+			const match = String(value || '').match(/^(\d{1,2}):(\d{2})$/);
+			if (!match) return 0;
+			return Math.max(0, Math.min(23, parseInt(match[1], 10) || 0)) * 60 + Math.max(0, Math.min(59, parseInt(match[2], 10) || 0));
+		};
+
+		const startMinutes = parseMinutes(schedule.startTime);
+		const endMinutes = parseMinutes(schedule.endTime);
+		const durationMinutes = (endMinutes - startMinutes + 1440) % 1440;
+		if (!durationMinutes) return '';
+
+		const endDate = new Date(endAt);
+		const startDate = new Date(endAt - durationMinutes * 60000);
+		const formatTime = date => date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
+		const sameLocalDay = startDate.getFullYear() === endDate.getFullYear()
+			&& startDate.getMonth() === endDate.getMonth()
+			&& startDate.getDate() === endDate.getDate();
+
+		if (sameLocalDay) return `${formatTime(startDate)} - ${formatTime(endDate)}`;
+
+		const formatDay = date => new Intl.DateTimeFormat(undefined, { weekday: 'short' }).format(date);
+		return `${formatDay(startDate)} ${formatTime(startDate)} - ${formatDay(endDate)} ${formatTime(endDate)}`;
+	}
+
 	function adminMaintenanceUrlBypassEnabled() {
 		try {
 			const hasParam = (raw) => {
@@ -23799,8 +23830,8 @@ P
 		const countdown = timeLeft
 			? `<div class="admin-maintenance-countdown"><span>Back online in</span><strong>${adminEscapeHtml(timeLeft)}</strong></div>`
 			: (canShowAdminAccess ? '' : `<div class="admin-maintenance-countdown"><span>Waiting for admin</span></div>`);
-		const scheduleLabel = adminMaintenanceScheduleLabel(state.schedule);
-		const scheduleNote = scheduleLabel ? `<p class="admin-maintenance-schedule-note">Scheduled window: ${adminEscapeHtml(scheduleLabel)}</p>` : '';
+		const scheduleLabel = adminMaintenancePublicScheduleLabel(state);
+		const scheduleNote = scheduleLabel ? `<p class="admin-maintenance-schedule-note">Scheduled maintenance: ${adminEscapeHtml(scheduleLabel)}</p>` : '';
 		const adminAccess = canShowAdminAccess ? `<div class="admin-maintenance-actions"><button class="admin-maintenance-login-btn" onclick="adminMaintenanceLoginBypass()"><i class="fas fa-user-shield" style="font-size:12px;margin:0 6px 0 0;color:#00d4ff;filter:none;"></i> Admin Login</button></div>` : '';
 		overlay.innerHTML = `<div class="admin-maintenance-box"><i class="fas fa-tools"></i><h2>Maintenance Mode</h2><p>${adminEscapeHtml(state.message)}</p>${countdown}${scheduleNote}${adminAccess}</div>`;
 	}
