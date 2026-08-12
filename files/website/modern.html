@@ -42296,7 +42296,7 @@ function getVisibleChatStackEl(id) {
 			if (statusText) statusText.textContent = 'Network service offline';
 			if (title) title.textContent = 'Server unavailable';
 			if (copy) copy.innerHTML = 'The connection to the <strong>NoPayStation Network server</strong> was lost. Online features are temporarily unavailable.';
-			if (hint) hint.textContent = 'You can keep browsing while we continue trying to reconnect.';
+			if (hint) hint.textContent = 'Automatic reconnect failed. You can keep browsing or try again manually.';
 			if (backButton) backButton.textContent = 'Continue offline';
 		} else {
 			if (statusText) statusText.textContent = 'Login service offline';
@@ -42313,6 +42313,10 @@ function getVisibleChatStackEl(id) {
 		if (!modal) return;
 		serverUnavailableNoticeShown = true;
 		setServerUnavailableModalContext(context);
+		if (serverUnavailableContext === 'session') {
+			clearSessionAutoReconnectTimer();
+			sessionAutoReconnectAttemptInProgress = false;
+		}
 		pauseServerAutomaticReconnect();
 		serverUnavailableManualRetryActive = false;
 		serverUnavailableManualRetryStartedAt = 0;
@@ -42374,8 +42378,13 @@ function getVisibleChatStackEl(id) {
 
 	const LOGIN_SINGLE_SERVER_RECONNECT_GRACE_MS = 6500;
 	const SESSION_SERVER_UNAVAILABLE_GRACE_MS = 6500;
+	const SESSION_AUTO_RECONNECT_ONCE_TIMEOUT_MS = 5000;
 	const LOGIN_TRANSIENT_AUTH_RETRY_LIMIT = 1;
 	let sessionServerUnavailableTimer = null;
+	let sessionAutoReconnectTimer = null;
+	let sessionAutoReconnectAttemptInProgress = false;
+	let sessionAutoReconnectTriedForLoss = false;
+	let sessionReconnectDeferredWhileHidden = false;
 
 	function clearSessionServerUnavailableTimer() {
 		if (!sessionServerUnavailableTimer) return;
@@ -42383,14 +42392,114 @@ function getVisibleChatStackEl(id) {
 		sessionServerUnavailableTimer = null;
 	}
 
+	function clearSessionAutoReconnectTimer() {
+		if (!sessionAutoReconnectTimer) return;
+		clearTimeout(sessionAutoReconnectTimer);
+		sessionAutoReconnectTimer = null;
+	}
+
+	function resetSessionAutoReconnectState() {
+		clearSessionAutoReconnectTimer();
+		sessionAutoReconnectAttemptInProgress = false;
+		sessionAutoReconnectTriedForLoss = false;
+		sessionReconnectDeferredWhileHidden = false;
+	}
+
+	function showSessionServerUnavailableAfterAutoReconnect() {
+		if (window.isProfileLoaded !== true || loginServerAttempt) return;
+		if (socketChat && socketChat.connected) return;
+		if (document.hidden) {
+			sessionReconnectDeferredWhileHidden = true;
+			return;
+		}
+		sessionReconnectDeferredWhileHidden = false;
+		window.showServerUnavailableModal(true, 'session');
+	}
+
+	function attemptLoggedInSessionReconnectOnce(reason = 'session connection lost') {
+		if (window.isProfileLoaded !== true || loginServerAttempt) return false;
+		if (typeof isKicked !== 'undefined' && isKicked) return false;
+		if (socketChat && socketChat.connected) return false;
+		if (sessionAutoReconnectAttemptInProgress || sessionAutoReconnectTriedForLoss) return false;
+
+		clearSessionServerUnavailableTimer();
+		clearSessionAutoReconnectTimer();
+		sessionAutoReconnectAttemptInProgress = true;
+		sessionAutoReconnectTriedForLoss = true;
+		sessionReconnectDeferredWhileHidden = false;
+
+		console.log(`[NETWORK] Logged-in session disconnected (${reason}). Trying one automatic reconnect before showing manual recovery.`);
+		enableServerAutomaticReconnect();
+		if (typeof updateGlobalOnlineStatus === 'function') updateGlobalOnlineStatus('connecting');
+		if (typeof adminUpdateChatControlsBanner === 'function') adminUpdateChatControlsBanner();
+		const status = document.getElementById('chat-status-text');
+		if (status) {
+			status.innerText = '(Reconnecting...)';
+			status.style.color = '#ffbb33';
+		}
+
+		try {
+			if (socketChat) {
+				if (socketChat.io) socketChat.io.uri = serverUrls[currentServerIndex];
+				if (!socketChat.connected) socketChat.connect();
+			} else {
+				initChat();
+			}
+		} catch (err) {
+			console.warn('[NETWORK] Automatic session reconnect could not start:', err);
+		}
+
+		sessionAutoReconnectTimer = setTimeout(() => {
+			sessionAutoReconnectTimer = null;
+			sessionAutoReconnectAttemptInProgress = false;
+			if (window.isProfileLoaded !== true || (socketChat && socketChat.connected)) return;
+			showSessionServerUnavailableAfterAutoReconnect();
+		}, SESSION_AUTO_RECONNECT_ONCE_TIMEOUT_MS);
+		return true;
+	}
+
+	function handleLoggedInSessionForeground() {
+		if (document.hidden || window.isProfileLoaded !== true || loginServerAttempt) return;
+		if (typeof isKicked !== 'undefined' && isKicked) return;
+		if (socketChat && socketChat.connected) {
+			resetSessionAutoReconnectState();
+			return;
+		}
+
+		clearSessionServerUnavailableTimer();
+		if (!sessionAutoReconnectTriedForLoss) {
+			attemptLoggedInSessionReconnectOnce('app returned to foreground');
+			return;
+		}
+		if (!sessionAutoReconnectAttemptInProgress && sessionReconnectDeferredWhileHidden) {
+			showSessionServerUnavailableAfterAutoReconnect();
+		}
+	}
+
+	function installLoggedInSessionForegroundReconnect() {
+		if (window.__loggedInSessionForegroundReconnectInstalled) return;
+		window.__loggedInSessionForegroundReconnectInstalled = true;
+		document.addEventListener('visibilitychange', () => {
+			if (!document.hidden) setTimeout(handleLoggedInSessionForeground, 120);
+		}, { passive: true });
+		window.addEventListener('pageshow', () => setTimeout(handleLoggedInSessionForeground, 120), { passive: true });
+		window.addEventListener('focus', () => setTimeout(handleLoggedInSessionForeground, 120), { passive: true });
+	}
+	installLoggedInSessionForegroundReconnect();
+
 	function scheduleSessionServerUnavailable() {
 		if (window.isProfileLoaded !== true || loginServerAttempt) return;
-		if (sessionServerUnavailableTimer) return;
+		if (sessionServerUnavailableTimer || sessionAutoReconnectAttemptInProgress) return;
 		sessionServerUnavailableTimer = setTimeout(() => {
 			sessionServerUnavailableTimer = null;
 			if (window.isProfileLoaded !== true) return;
 			if (socketChat && socketChat.connected) return;
-			window.showServerUnavailableModal(true, 'session');
+			if (document.hidden) {
+				sessionReconnectDeferredWhileHidden = true;
+				return;
+			}
+			if (!sessionAutoReconnectTriedForLoss && attemptLoggedInSessionReconnectOnce('session reconnect grace expired')) return;
+			showSessionServerUnavailableAfterAutoReconnect();
 		}, SESSION_SERVER_UNAVAILABLE_GRACE_MS);
 	}
 
@@ -42657,6 +42766,7 @@ function getVisibleChatStackEl(id) {
 
 	function markServerConnectionAvailable() {
 		clearSessionServerUnavailableTimer();
+		resetSessionAutoReconnectState();
 		if (window.isProfileLoaded === true) enableServerAutomaticReconnect();
 		const modal = document.getElementById('server-unavailable-modal');
 		const modalVisible = !!(modal && modal.classList.contains('show'));
