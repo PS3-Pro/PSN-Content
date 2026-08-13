@@ -1360,6 +1360,92 @@ body.is-ps3 #game-modal.no-gallery-active:not(.compact-no-summary):not(.help-mod
 	var URL_DB_THEMES = "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/database/content/official/themes.tsv";
 	var DB = [];
 
+	// PC-only session RAM caches. Nothing here is used on PS3.
+	var g_pcCategoryRamCache = {};
+	var g_pcRawTsvRamCache = {};
+	var g_pcRawPrefetchStarted = {};
+	var g_pcRawPrefetchTimer = null;
+
+	function classicPcRamModeKey() {
+		return isUnofficialMode ? "unofficial" : "official";
+	}
+
+	function classicPcCategoryRamKey(cat) {
+		return classicPcRamModeKey() + "|" + String(cat || "");
+	}
+
+	function classicPcGetCategoryRam(cat) {
+		if (isPS3) return null;
+		var key = classicPcCategoryRamKey(cat);
+		return g_pcCategoryRamCache[key] || null;
+	}
+
+	function classicPcStoreCategoryRam(cat, data) {
+		if (isPS3 || !data) return;
+		g_pcCategoryRamCache[classicPcCategoryRamKey(cat)] = data;
+	}
+
+	function classicPcDropCategoryRam(cat) {
+		if (isPS3) return;
+		delete g_pcCategoryRamCache[classicPcCategoryRamKey(cat)];
+	}
+
+	function classicPcDropRawPaths(paths) {
+		if (isPS3 || !paths) return;
+		for (var i = 0; i < paths.length; i++) delete g_pcRawTsvRamCache[paths[i]];
+	}
+
+	function classicPcScheduleRawPrefetch() {
+		if (isPS3) return;
+
+		var prefetchUnofficial_h = !!isUnofficialMode;
+		var modeKey = prefetchUnofficial_h ? "unofficial" : "official";
+		if (g_pcRawPrefetchStarted[modeKey]) return;
+		g_pcRawPrefetchStarted[modeKey] = true;
+
+		if (g_pcRawPrefetchTimer) clearTimeout(g_pcRawPrefetchTimer);
+		g_pcRawPrefetchTimer = setTimeout(function() {
+			g_pcRawPrefetchTimer = null;
+
+			var cats = prefetchUnofficial_h
+				? ["homebrew_games", "homebrew_apps", "backup_manager", "emulators", "launchers", "legacy", "ports", "tools"]
+				: ["games", "demos", "apps", "avatars", "dlcs", "themes", "updates", "prototypes", "dev_tools"];
+			var queue = [];
+			var seen = {};
+
+			for (var c = 0; c < cats.length; c++) {
+				var paths = classicGetDbPathsForCategory(cats[c]);
+				for (var p = 0; p < paths.length; p++) {
+					var path = paths[p];
+					if (!seen[path] && typeof g_pcRawTsvRamCache[path] !== "string") {
+						seen[path] = true;
+						queue.push(path);
+					}
+				}
+			}
+
+			var index = 0;
+			function next() {
+				if (isPS3 || index >= queue.length) return;
+				var path = queue[index++];
+				if (typeof g_pcRawTsvRamCache[path] === "string") { setTimeout(next, 0); return; }
+
+				var xhr = new XMLHttpRequest();
+				xhr.onreadystatechange = function() {
+					if (xhr.readyState !== 4) return;
+					xhr.onreadystatechange = null;
+					if (xhr.status === 200 || xhr.status === 0) g_pcRawTsvRamCache[path] = xhr.responseText;
+					xhr = null;
+					setTimeout(next, 10);
+				};
+				xhr.open("GET", path + (path.indexOf("?") === -1 ? "?" : "&") + "t=" + new Date().getTime(), true);
+				xhr.send();
+			}
+
+			next();
+		}, 350);
+	}
+
 	var STORAGE_KEY_COVERS = "psn_db_covers_state";
 	var STORAGE_KEY_AUDIO = "psn_db_audio_state";
 
@@ -5889,20 +5975,46 @@ function restorePreviousState() {
 			}
 
 			DB = db_local;
+			if (!isPS3) classicPcStoreCategoryRam(currentCategory, db_local);
 			g_tempMap = {}; 
 			keys = null;
 			g_isFetching = false;
 		}
 
-		function fetchDB() {
+		function fetchDB(forceFresh) {
 			var doc_h = document;
 			var is_ps3_h = isPS3;
 			var cat_h = currentCategory;
 			var f_obj_h = f;
+			var paths_h = dbPaths;
+
+			if (!is_ps3_h && forceFresh) {
+				g_pcCategoryRamCache = {};
+				classicPcDropRawPaths(paths_h);
+			}
+
+			if (!is_ps3_h && !forceFresh) {
+				var ramDb_h = classicPcGetCategoryRam(cat_h);
+				if (ramDb_h) {
+					stopRendering();
+					cancelAllDownloads();
+					DB = ramDb_h;
+					g_tempMap = {};
+					g_isFetching = false;
+					g_instantRender = true;
+					if (f_obj_h) f_obj_h.fetch.disabled = false;
+					setTimeout(function() {
+						render();
+						attachScrollLogic();
+					}, 0);
+					classicPcScheduleRawPrefetch();
+					return;
+				}
+			}
 
 			stopRendering();
 
-			if (DB) DB.length = 0;
+			DB = [];
 			if (g_allMatches) g_allMatches.length = 0;
 			g_tempMap = {};
 
@@ -5931,7 +6043,6 @@ function restorePreviousState() {
 			if (f_obj_h) f_obj_h.fetch.disabled = true;
 
 			var currentIndex = 0; 
-			var paths_h = dbPaths;
 
 			function loadNextFile() {
 				if (thisFetchID !== g_currentFetchID) return;
@@ -5942,10 +6053,20 @@ function restorePreviousState() {
 					render();
 					checkStartupAlert();
 					attachScrollLogic();
+					if (!is_ps3_h) classicPcScheduleRawPrefetch();
 					return; 
 				}
 
-				var urlToLoad = paths_h[currentIndex];
+				var sourcePath_h = paths_h[currentIndex];
+				if (!is_ps3_h && !forceFresh && typeof g_pcRawTsvRamCache[sourcePath_h] === "string") {
+					processChunk(g_pcRawTsvRamCache[sourcePath_h], sourcePath_h);
+					currentIndex++;
+					if (count_el) count_el.textContent = "Processing part " + currentIndex + "/" + paths_h.length + "...";
+					setTimeout(loadNextFile, 0);
+					return;
+				}
+
+				var urlToLoad = sourcePath_h;
 				urlToLoad += (urlToLoad.indexOf('?') === -1 ? '?' : '&') + "t=" + new Date().getTime();
 
 				var xhr = new XMLHttpRequest();
@@ -5965,9 +6086,9 @@ function restorePreviousState() {
 						var status_h = xhr.status;
 						if (status_h == 200 || status_h == 0) {
 							var content_h = xhr.responseText;
+							if (!is_ps3_h) g_pcRawTsvRamCache[sourcePath_h] = content_h;
 
-
-							processChunk(content_h, paths_h[currentIndex]);
+							processChunk(content_h, sourcePath_h);
 
 							currentIndex++;
 							if (count_el) {
@@ -6061,7 +6182,7 @@ function restorePreviousState() {
 			var countEl = doc.getElementById('count');
 			if (countEl) countEl.textContent = "Reloading | " + g_regionFilter;
 			
-			fetchDB();
+			fetchDB(true);
 		}
 
         function setFilter(type, value, clickedElement) {
@@ -6296,7 +6417,7 @@ function restorePreviousState() {
 		cancelAllDownloads();
 		clearListMemory();
 
-		if (DB) DB.length = 0; 
+		DB = []; 
 		if (g_allMatches) g_allMatches.length = 0;
 		if (g_masterQueue) g_masterQueue.length = 0;
 
