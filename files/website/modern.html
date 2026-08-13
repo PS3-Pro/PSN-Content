@@ -489,10 +489,6 @@ select option { background-color: var(--bg-dark); }
 .btn-rap { order: 6; background: linear-gradient(135deg,#e0e0e0,#ffffff); color: #000; }
 .btn-rap.btn-rap-by-dlc { background: linear-gradient(135deg,#59616d,#858d98); color: #f7f8fa; border-color: rgba(255,255,255,0.18); }
 .btn-rap.btn-rap-by-dlc:hover { box-shadow: inset 0 0 0 100px rgba(0,0,0,0.20); border-color: rgba(255,255,255,0.42); }
-.btn-group.loop-child-removed>.btn-pkg, .btn-group.loop-child-removed>.btn-multi { order: 1 !important; grid-column: auto !important; padding: 6px 2px !important; }
-.btn-group.loop-child-removed>.btn-rap { order: 2 !important; grid-column: auto !important; padding: 6px 2px !important; }
-.btn-group.loop-child-removed>.btn-pkg:only-child, .btn-group.loop-child-removed>.btn-multi:only-child { order: 1 !important; grid-column: 1 / -1 !important; padding: 8px 4px !important; }
-.btn-group.loop-child-removed, .btn-group.loop-child-removed>.btn-mini { transition: none !important; }
 .btn-group:has(> :nth-child(4)) .btn-upd, .btn-group:has(> :nth-child(4)) .btn-avt { order: 10; }
 .btn-group:has(> :nth-child(4)) .btn-dlc, .btn-group:has(> :nth-child(4)) .btn-thm { order: 20; }
 .btn-group:has(> :nth-child(4)) .btn-pkg, .btn-group:has(> :nth-child(4)) .btn-multi { order: 30; }
@@ -21012,18 +21008,21 @@ P
 			badgesContainer.innerHTML = `<div class="rawg-alt2-panel"><div class="rawg-alt2-top">${studioHtml}${tagLineHtml}</div></div>`;
 		};
 
-		const renderPsnStoreExtraMeta = (psnStoreData = null) => {
+		const renderPsnStoreExtraMeta = (psnStoreData = null, hasStoreSource = false) => {
 			if (!badgesContainer || !window.extractPsnStoreProductMeta) return false;
 			const psnMeta = window.extractPsnStoreProductMeta(psnStoreData);
-			if (!psnMeta.provider && !psnMeta.releaseYear) return false;
+			if (!hasStoreSource && !psnMeta.provider && !psnMeta.releaseYear) return false;
 			const studioHtml = psnMeta.provider
 				? `<div class="rawg-alt2-studio" data-no-translate="true" translate="no"><i class="fas fa-code"></i>${modalSafeText(psnMeta.provider)}</div>`
 				: '<div class="rawg-alt2-studio rawg-alt2-placeholder" data-no-translate="true" translate="no" aria-hidden="true">&nbsp;</div>';
-			const yearHtml = psnMeta.releaseYear
-				? `<div class="rawg-alt2-tagline"><span class="rawg-chip rawg-chip-year"><i class="far fa-calendar-alt"></i>${psnMeta.releaseYear}</span></div>`
-				: '<div class="rawg-alt2-tagline rawg-alt2-placeholder" aria-hidden="true"><span class="rawg-chip rawg-chip-year">&nbsp;</span></div>';
+			const chips = [];
+			if (hasStoreSource) chips.push('<span class="rawg-chip rawg-chip-store"><i class="fab fa-playstation"></i>PlayStation Store</span>');
+			if (psnMeta.releaseYear) chips.push(`<span class="rawg-chip rawg-chip-year"><i class="far fa-calendar-alt"></i>${psnMeta.releaseYear}</span>`);
+			const tagLineHtml = chips.length
+				? `<div class="rawg-alt2-tagline">${chips.join('')}</div>`
+				: '<div class="rawg-alt2-tagline rawg-alt2-placeholder" aria-hidden="true"><span class="rawg-chip">&nbsp;</span></div>';
 			badgesContainer.classList.add('rawg-badge-row');
-			badgesContainer.innerHTML = `<div class="rawg-alt2-panel"><div class="rawg-alt2-top">${studioHtml}${yearHtml}</div></div>`;
+			badgesContainer.innerHTML = `<div class="rawg-alt2-panel"><div class="rawg-alt2-top">${studioHtml}${tagLineHtml}</div></div>`;
 			return true;
 		};
 	
@@ -21103,16 +21102,68 @@ P
 		let psnStoreSummary = '';
 		let psnStoreMeta = { provider: '', releaseDate: '', releaseYear: '' };
 		let hasPsnStoreMeta = false;
+		let hasPsnStoreSummary = false;
 		try {
 			const psnStoreData = await window.fetchPsnStoreMetadata(gameId, contentId, region);
 			psnStoreSummary = window.extractPsnStoreDescription ? window.extractPsnStoreDescription(psnStoreData) : window.cleanPsnStoreDescription(psnStoreData?.long_desc || psnStoreData?.short_desc || '');
 			psnStoreMeta = window.extractPsnStoreProductMeta ? window.extractPsnStoreProductMeta(psnStoreData) : psnStoreMeta;
-			hasPsnStoreMeta = renderPsnStoreExtraMeta(psnStoreData);
+			hasPsnStoreSummary = !!psnStoreSummary;
+			hasPsnStoreMeta = renderPsnStoreExtraMeta(psnStoreData, hasPsnStoreSummary);
 			if (psnStoreSummary) summaryContainer.innerHTML = summaryTitleHtml + modalSafeText(psnStoreSummary).replace(/\n/g, '<br>');
 		} catch (error) {}
 
 		let externalMetadataResolved = false;
+		let externalSummaryResolved = false;
 		let screenshotsResolved = false;
+		const mergedMetadata = {
+			developers: [],
+			publishers: psnStoreMeta.provider ? [{ name: psnStoreMeta.provider }] : [],
+			genres: [],
+			tags: [],
+			playtime: 0,
+			metacritic: 0,
+			released: psnStoreMeta.releaseDate || psnStoreMeta.releaseYear || ''
+		};
+		const mergeMetadataDetails = (detailsData = {}) => {
+			let changed = false;
+			const sourceDevelopers = getRawgNames(detailsData.developers || [], 2);
+			const sourcePublishers = getRawgNames(detailsData.publishers || [], 1);
+			if (!mergedMetadata.developers.length && !mergedMetadata.publishers.length) {
+				if (sourceDevelopers.length) { mergedMetadata.developers = sourceDevelopers.map(name => ({ name })); changed = true; }
+				else if (sourcePublishers.length) { mergedMetadata.publishers = sourcePublishers.map(name => ({ name })); changed = true; }
+			}
+			if (!mergedMetadata.genres.length) {
+				const sourceGenres = getRawgNames(detailsData.genres || [], 1);
+				if (sourceGenres.length) { mergedMetadata.genres = sourceGenres.map(name => ({ name })); changed = true; }
+			}
+			const existingTags = new Set(getRawgNames(mergedMetadata.tags || [], 80).map(tag => tag.toLowerCase()));
+			getRawgNames(detailsData.tags || [], 80).forEach(name => {
+				const key = name.toLowerCase();
+				if (!existingTags.has(key)) { mergedMetadata.tags.push({ name }); existingTags.add(key); changed = true; }
+			});
+			if (!(Number(mergedMetadata.playtime) > 0) && Number(detailsData.playtime) > 0) { mergedMetadata.playtime = Number(detailsData.playtime); changed = true; }
+			if (!(Number(mergedMetadata.metacritic) > 0) && Number(detailsData.metacritic) > 0) { mergedMetadata.metacritic = Number(detailsData.metacritic); changed = true; }
+			if (!mergedMetadata.released && detailsData.released) { mergedMetadata.released = detailsData.released; changed = true; }
+			return changed;
+		};
+		const hasMergedStudio = () => getRawgNames(mergedMetadata.developers || [], 1).length > 0 || getRawgNames(mergedMetadata.publishers || [], 1).length > 0;
+		const hasMergedYear = () => /\b(19|20)\d{2}\b/.test(String(mergedMetadata.released || psnStoreMeta.releaseYear || ''));
+		const hasMergedGenre = () => getRawgNames(mergedMetadata.genres || [], 1).length > 0;
+		const hasMergedMode = () => getImportantModeTags(mergedMetadata).length > 0;
+		const metadataEnrichmentComplete = () => hasMergedStudio() && hasMergedYear() && hasMergedGenre() && hasMergedMode();
+		const buildMergedBadgeHtml = () => {
+			const badges = [];
+			if (hasPsnStoreSummary) badges.push('<span class="rawg-chip rawg-chip-store"><i class="fab fa-playstation"></i>PlayStation Store</span>');
+			if (Number(mergedMetadata.metacritic) > 0) {
+				const score = Math.round(Number(mergedMetadata.metacritic));
+				const color = score >= 75 ? '#4caf50' : (score >= 50 ? '#ffa500' : '#ff4444');
+				badges.push(`<span class="rawg-chip rawg-chip-score" style="border:1px solid ${color}; color:${color};"><i class="fas fa-star"></i>${score}</span>`);
+			}
+			const yearMatch = String(mergedMetadata.released || psnStoreMeta.releaseYear || '').match(/\b(19|20)\d{2}\b/);
+			if (yearMatch) badges.push(`<span class="rawg-chip rawg-chip-year"><i class="far fa-calendar-alt"></i>${modalSafeText(yearMatch[0])}</span>`);
+			return badges.join('');
+		};
+		const renderMergedMetadata = () => renderRawgExtraMeta(mergedMetadata, buildMergedBadgeHtml());
 		const renderExternalScreenshots = (imageUrls = []) => {
 			const images = Array.from(new Set((Array.isArray(imageUrls) ? imageUrls : []).map(url => String(url || '').trim()).filter(Boolean))).slice(0, 8);
 			if (!scrContainer || !images.length) return false;
@@ -21126,27 +21177,15 @@ P
 		const renderExternalMetadata = (detailsData = {}, imageUrls = [], options = {}) => {
 			const renderedScreenshots = renderExternalScreenshots(imageUrls);
 			if (options.metadata === false) return renderedScreenshots;
-			externalMetadataResolved = true;
-			const displayDetailsData = { ...detailsData };
-			if (!getRawgNames(displayDetailsData.developers || [], 1).length && !getRawgNames(displayDetailsData.publishers || [], 1).length && psnStoreMeta.provider) displayDetailsData.publishers = [{ name: psnStoreMeta.provider }];
-			if (!displayDetailsData.released && psnStoreMeta.releaseDate) displayDetailsData.released = psnStoreMeta.releaseDate;
+			const metadataChanged = mergeMetadataDetails(detailsData);
+			if (metadataChanged) externalMetadataResolved = true;
+			if (metadataChanged || hasPsnStoreSummary || hasPsnStoreMeta) renderMergedMetadata();
 
-			let badgeHtml = '';
-			if (Number(detailsData.metacritic) > 0) {
-				const score = Math.round(Number(detailsData.metacritic));
-				const color = score >= 75 ? '#4caf50' : (score >= 50 ? '#ffa500' : '#ff4444');
-				badgeHtml += `<span class="rawg-chip rawg-chip-score" style="border:1px solid ${color}; color:${color};"><i class="fas fa-star"></i>${score}</span>`;
+			const finalDesc = String(detailsData.description_raw || detailsData.description || '').trim();
+			if (!psnStoreSummary && !externalSummaryResolved && finalDesc) {
+				externalSummaryResolved = true;
+				summaryContainer.innerHTML = summaryTitleHtml + modalSafeText(finalDesc).replace(/\n+/g, '<br><br>');
 			}
-			if (displayDetailsData.released) {
-				const yearMatch = String(displayDetailsData.released).match(/\b(19|20)\d{2}\b/);
-				if (yearMatch) badgeHtml += `<span class="rawg-chip rawg-chip-year"><i class="far fa-calendar-alt"></i>${modalSafeText(yearMatch[0])}</span>`;
-			}
-			renderRawgExtraMeta(displayDetailsData, badgeHtml);
-
-			let finalDesc = String(detailsData.description_raw || detailsData.description || '').trim();
-			if (finalDesc) finalDesc = modalSafeText(finalDesc).replace(/\n+/g, '<br><br>');
-			else finalDesc = 'No description available.';
-			if (!psnStoreSummary) summaryContainer.innerHTML = summaryTitleHtml + finalDesc;
 			return renderedScreenshots;
 		};
 
@@ -21184,8 +21223,9 @@ P
 						try { const data = await screensResult.response.json(); screenshots = (data.results || []).map(item => item && item.image).filter(Boolean); } catch (error) {}
 					}
 					const hasRawgScreenshots = renderExternalMetadata(detailsData, screenshots);
-					if (hasRawgScreenshots) return;
-					console.debug(`[Metadata] RAWG metadata accepted for "${gameName}", but no screenshots were returned. Trying IGDB screenshots.`);
+					if (hasRawgScreenshots && metadataEnrichmentComplete()) return;
+					if (!hasRawgScreenshots) console.debug(`[Metadata] RAWG metadata accepted for "${gameName}", but no screenshots were returned. Trying IGDB screenshots.`);
+					else console.debug(`[Metadata] RAWG metadata accepted for "${gameName}", but some metadata fields are still missing. Trying IGDB enrichment.`);
 					break rawgSearchLoop;
 				} catch (error) {
 					console.warn(`[Metadata] RAWG network failure for "${gameName}". Falling back.`);
@@ -21216,11 +21256,10 @@ P
 				const match = pickMetadataCandidate(data.results, searchSpec.target, searchSpec.minScore, psnStoreMeta.releaseYear, metadataPlatformHint);
 				if (!match.candidate) { console.warn(`[Metadata] IGDB rejected low-confidence ${searchSpec.kind} match for "${gameName}" (closest: "${match.best?.name || 'none'}", score ${match.score}/${searchSpec.minScore}).`); continue; }
 				console.debug(`[Metadata] IGDB ${searchSpec.kind} match accepted for "${gameName}": "${match.candidate.name}" (${match.score}/100).`);
-				const hasIgdbScreenshots = externalMetadataResolved
-					? renderExternalMetadata(match.candidate, match.candidate.screenshots || [], { metadata: false })
-					: renderExternalMetadata(match.candidate, match.candidate.screenshots || []);
-				if (hasIgdbScreenshots) return;
-				console.debug(`[Metadata] IGDB match for "${gameName}" had no screenshots. Trying the next screenshot fallback.`);
+				const hasIgdbScreenshots = renderExternalMetadata(match.candidate, match.candidate.screenshots || []);
+				if (hasIgdbScreenshots && metadataEnrichmentComplete()) return;
+				if (!hasIgdbScreenshots) console.debug(`[Metadata] IGDB match for "${gameName}" had no screenshots. Trying the next screenshot fallback.`);
+				else console.debug(`[Metadata] IGDB added data for "${gameName}", but some metadata fields are still missing. Trying Steam enrichment.`);
 			} catch (error) {
 				console.warn('[Metadata] IGDB proxy unavailable. Falling back to Steam.');
 				break igdbSearchLoop;
@@ -21246,18 +21285,17 @@ P
 				const verifiedScore = scoreMetadataCandidate(searchSpec.target, detailsPayload.details, psnStoreMeta.releaseYear, metadataPlatformHint);
 				if (verifiedScore < searchSpec.minScore) { console.warn(`[Metadata] Steam details no longer meet confidence threshold for "${gameName}" (${verifiedScore}/${searchSpec.minScore}).`); continue; }
 				console.debug(`[Metadata] Steam ${searchSpec.kind} match accepted for "${gameName}": "${detailsPayload.details.name}" (${verifiedScore}/100).`);
-				const hasSteamScreenshots = externalMetadataResolved
-					? renderExternalMetadata(detailsPayload.details, detailsPayload.details.screenshots || [], { metadata: false })
-					: renderExternalMetadata(detailsPayload.details, detailsPayload.details.screenshots || []);
-				if (hasSteamScreenshots) return;
-				console.debug(`[Metadata] Steam match for "${gameName}" had no screenshots.`);
+				const hasSteamScreenshots = renderExternalMetadata(detailsPayload.details, detailsPayload.details.screenshots || []);
+				if (hasSteamScreenshots && metadataEnrichmentComplete()) return;
+				if (!hasSteamScreenshots) console.debug(`[Metadata] Steam match for "${gameName}" had no screenshots.`);
+				else if (!metadataEnrichmentComplete()) console.debug(`[Metadata] Steam added data for "${gameName}", but some metadata fields are still missing.`);
 			} catch (error) {
 				console.warn('[Metadata] Steam fallback unavailable. Falling back to Wikipedia.');
 				break steamSearchLoop;
 			}
 		}
 
-		if (!externalMetadataResolved) {
+		if (!metadataEnrichmentComplete() || (!psnStoreSummary && !externalSummaryResolved)) {
 			try {
 				let wikiBest = null;
 				let wikiBestScore = -1;
@@ -21273,19 +21311,21 @@ P
 					const detailsData = await details.json();
 					const page = detailsData.query?.pages?.[wikiBest.id];
 					if (page && page.extract) {
-						externalMetadataResolved = true;
-						if (!psnStoreSummary) summaryContainer.innerHTML = summaryTitleHtml + modalSafeText(page.extract.trim()).replace(/\n+/g, '<br><br>');
-						if (badgesContainer.querySelector('.pulse-skeleton')) {
-							const yearMatch = page.extract.match(/\b(19|20)\d{2}\b/);
-							badgesContainer.classList.remove('rawg-badge-row');
-							badgesContainer.innerHTML = yearMatch ? `<span style="background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); color:#ccc; padding:3px 8px; border-radius:4px; font-size:11px; font-weight:bold;"><i class="far fa-calendar-alt"></i> ${yearMatch[0]}</span>` : '';
+						const wikiExtract = page.extract.trim();
+						if (!psnStoreSummary && !externalSummaryResolved && wikiExtract) {
+							externalSummaryResolved = true;
+							summaryContainer.innerHTML = summaryTitleHtml + modalSafeText(wikiExtract).replace(/\n+/g, '<br><br>');
+						}
+						if (!hasMergedYear()) {
+							const yearMatch = wikiExtract.match(/\b(19|20)\d{2}\b/);
+							if (yearMatch) { mergedMetadata.released = yearMatch[0]; externalMetadataResolved = true; renderMergedMetadata(); }
 						}
 					}
 				}
 			} catch (error) {}
 		}
 
-		if (!psnStoreSummary && !externalMetadataResolved) summaryContainer.innerHTML = summaryTitleHtml + 'No description available.';
+		if (!psnStoreSummary && !externalSummaryResolved) summaryContainer.innerHTML = summaryTitleHtml + 'No description available.';
 		if (badgesContainer && !hasPsnStoreMeta && !externalMetadataResolved) { badgesContainer.innerHTML = ''; badgesContainer.classList.remove('rawg-badge-row'); }
 		if (extraMetaContainer && !externalMetadataResolved) extraMetaContainer.innerHTML = '';
 		if (!screenshotsResolved && screenshotsWrapper) {
@@ -53269,10 +53309,10 @@ function getVisibleChatStackEl(id) {
 			var avtBtn = card.querySelector('.btn-avt');
 			var thmBtn = card.querySelector('.btn-thm');
 
-			if (updBtn && shouldHideChildShortcut(card, 'updates')) { updBtn.parentElement?.classList.add('loop-child-removed'); updBtn.remove(); }
-			if (dlcBtn && shouldHideChildShortcut(card, 'dlcs')) { dlcBtn.parentElement?.classList.add('loop-child-removed'); dlcBtn.remove(); }
-			if (avtBtn && shouldHideChildShortcut(card, 'avatars')) { avtBtn.parentElement?.classList.add('loop-child-removed'); avtBtn.remove(); }
-			if (thmBtn && shouldHideChildShortcut(card, 'themes')) { thmBtn.parentElement?.classList.add('loop-child-removed'); thmBtn.remove(); }
+			if (updBtn && shouldHideChildShortcut(card, 'updates')) updBtn.remove();
+			if (dlcBtn && shouldHideChildShortcut(card, 'dlcs')) dlcBtn.remove();
+			if (avtBtn && shouldHideChildShortcut(card, 'avatars')) avtBtn.remove();
+			if (thmBtn && shouldHideChildShortcut(card, 'themes')) thmBtn.remove();
 
 			if (cat !== 'dlcs' && cat !== 'updates' && cat !== 'avatars' && cat !== 'themes') continue;
 			if (!span) continue;
