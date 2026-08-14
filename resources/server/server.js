@@ -3464,6 +3464,57 @@ async function getChatSyncSnapshotForUser(userName = '') {
   };
 }
 
+async function getStableInitialChatSyncForUser(userName = '', clientSeenCursor = 0) {
+  const deadline = Date.now() + 28000;
+  let attempts = 0;
+
+  while (Date.now() < deadline) {
+    attempts++;
+    const stateBefore = await refreshChatSyncStateFromDb();
+    const snapshot = await getChatSyncSnapshotForUser(userName);
+    const stateAfter = await refreshChatSyncStateFromDb();
+    const messages = Array.isArray(snapshot && snapshot.messages) ? snapshot.messages : [];
+    const expectedCount = Math.max(0, Number(snapshot && snapshot.expectedCount) || 0);
+    const sameSnapshotRevision = String(stateBefore.epoch || '') === String(stateAfter.epoch || '')
+      && Math.max(0, Number(stateBefore.revision) || 0) === Math.max(0, Number(stateAfter.revision) || 0);
+    const completeSnapshot = messages.length === expectedCount;
+
+    if (sameSnapshotRevision && completeSnapshot) {
+      await new Promise(resolve => setTimeout(resolve, 120));
+      const confirmedState = await refreshChatSyncStateFromDb();
+      const stillStable = String(stateAfter.epoch || '') === String(confirmedState.epoch || '')
+        && Math.max(0, Number(stateAfter.revision) || 0) === Math.max(0, Number(confirmedState.revision) || 0);
+
+      if (stillStable) {
+        const seenSync = await getChatSeenSyncForUser(userName, clientSeenCursor);
+        return {
+          success: true,
+          syncV1: true,
+          mode: 'snapshot',
+          reason: 'initial-stable-snapshot',
+          epoch: String(confirmedState.epoch || ''),
+          revision: Math.max(0, Number(confirmedState.revision) || 0),
+          messages,
+          snapshotCount: messages.length,
+          snapshotExpectedCount: expectedCount,
+          snapshotComplete: true,
+          seenSyncV1: true,
+          seenMode: seenSync.mode,
+          seenCursor: seenSync.cursor,
+          seenEvents: seenSync.events,
+          maxHistory: MAX_CHAT_HISTORY,
+          initialStableSync: true,
+          attempts
+        };
+      }
+    }
+
+    await new Promise(resolve => setTimeout(resolve, 40));
+  }
+
+  return null;
+}
+
 function sanitizeChatSyncChangeForUser(row, userName = '') {
   return {
     revision: Math.max(0, Number(row.revision) || 0),
@@ -3519,7 +3570,11 @@ async function syncChatAcrossInstances() {
         messageHistory.push(message);
         if (messageHistory.length > MAX_CHAT_HISTORY) messageHistory.shift();
         lastChatDbId = Math.max(lastChatDbId, dbId);
-        io.emit('chat_message', cleanChatMessage(message));
+        const publicSyncedMessage = cleanChatMessage(message);
+        io.sockets.sockets.forEach(client => {
+          if (!client || !client.connected || client.__chatInitialFullSyncInFlight === true) return;
+          client.emit('chat_message', publicSyncedMessage);
+        });
       }
       return;
     }
@@ -3534,7 +3589,11 @@ async function syncChatAcrossInstances() {
         io.emit('chat_cleared', { by: 'Server Sync' });
       } else if (maxId < lastChatDbId) {
         await refreshChatHistoryFromDb();
-        io.emit('chat_history', getPublicChatHistory());
+        const publicHistory = getPublicChatHistory();
+        io.sockets.sockets.forEach(client => {
+          if (!client || !client.connected || client.__chatInitialFullSyncInFlight === true) return;
+          client.emit('chat_history', publicHistory);
+        });
       }
     }
   } catch (err) {
@@ -5325,12 +5384,21 @@ io.on('connection', (socket) => {
       if (!socket.userName) return reply({ success: false, syncV1: true, error: 'Not authenticated.' });
       if (socket.__chatSyncRequestInFlight) return reply({ success: false, syncV1: true, busy: true, error: 'Chat synchronization already running.' });
 
+      const clientEpoch = normalizeText(request && request.epoch, '').slice(0, 160);
+      const clientRevision = Math.max(0, Number(request && request.revision) || 0);
+      const clientSeenCursor = Math.max(0, Number(request && request.seenCursor) || 0);
+      const initialFullSync = request && request.initialFullSync === true && !clientEpoch && clientRevision === 0;
+      if (initialFullSync) socket.__chatInitialFullSyncInFlight = true;
+
       socket.__chatSyncRequestInFlight = (async () => {
+        if (initialFullSync) {
+          const stableSnapshot = await getStableInitialChatSyncForUser(socket.userName, clientSeenCursor);
+          if (!stableSnapshot) return { success: false, syncV1: true, retry: true, error: 'Initial chat snapshot did not reach a stable revision.' };
+          return stableSnapshot;
+        }
+
         const state = await refreshChatSyncStateFromDb();
-        const clientEpoch = normalizeText(request && request.epoch, '').slice(0, 160);
-        const clientRevision = Math.max(0, Number(request && request.revision) || 0);
         const forceSnapshot = request && request.forceSnapshot === true;
-        const clientSeenCursor = Math.max(0, Number(request && request.seenCursor) || 0);
         const seenSync = await getChatSeenSyncForUser(socket.userName, clientSeenCursor);
 
         const withSeenSync = payload => ({
@@ -5411,6 +5479,7 @@ io.on('connection', (socket) => {
       reply({ success: false, syncV1: true, error: 'Chat synchronization failed.' });
     } finally {
       socket.__chatSyncRequestInFlight = null;
+      socket.__chatInitialFullSyncInFlight = false;
     }
   });
 
@@ -5747,7 +5816,11 @@ io.on('connection', (socket) => {
 
       const publicMessage = cleanChatMessage(messageData);
       const syncChange = await recordChatSyncChangeSafe('upsert', String(new Date(messageData.time).getTime()), publicMessage);
-      io.emit('chat_message', publicMessage);
+      io.sockets.sockets.forEach(client => {
+        if (!client || !client.connected) return;
+        if (client.__chatInitialFullSyncInFlight === true) return;
+        client.emit('chat_message', publicMessage);
+      });
       if (syncChange) emitChatSyncChange(syncChange);
       respond({ success: true, message: publicMessage });
     } catch (err) {

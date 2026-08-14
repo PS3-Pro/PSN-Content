@@ -37130,7 +37130,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
         if (!box || (!force && box.querySelector('[id^="msg-row-"]'))) return;
         const sourceText = String(text || 'Preparing messages');
         const activeLoader = box.querySelector('#chat-history-loading');
-        if (activeLoader) {
+        if (!force && activeLoader) {
             applyChatHistoryLoadingInterfaceText(activeLoader, sourceText);
             return;
         }
@@ -37255,119 +37255,6 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
     window.scrollChatToUnreadOrBottom = scrollChatToUnreadOrBottom;
 
 
-    function emitChatSyncRequest(request = {}, timeoutMs = 6500) {
-        return new Promise(resolve => {
-            let settled = false;
-            const finish = value => { if (!settled) { settled = true; resolve(value || null); } };
-            try {
-                if (typeof socketChat.timeout === 'function') socketChat.timeout(timeoutMs).emit('request_chat_sync', request, (err, response) => finish(err ? null : response));
-                else {
-                    socketChat.emit('request_chat_sync', request, response => finish(response));
-                    setTimeout(() => finish(null), timeoutMs);
-                }
-            } catch (err) { finish(null); }
-        });
-    }
-
-    function applyQueuedInitialChatChanges(epoch = String(window.__chatCacheEpoch || '')) {
-        const queued = Array.isArray(window.__chatInitialPendingSyncChanges) ? window.__chatInitialPendingSyncChanges : [];
-        if (!queued.length) return { applied: 0, deferred: 0 };
-        const matching = [];
-        const foreign = [];
-        queued.forEach(change => {
-            if (!change || !change.epoch || String(change.epoch) === epoch) matching.push(change);
-            else foreign.push(change);
-        });
-        matching.sort((a, b) => (Number(a && a.revision) || 0) - (Number(b && b.revision) || 0));
-        let revision = Math.max(0, Number(window.__chatCacheRevision) || 0);
-        let history = Array.isArray(window.messageHistory) ? window.messageHistory : [];
-        let applied = 0;
-        const deferred = [];
-        const seenRevisions = new Set();
-        for (const change of matching) {
-            const changeRevision = Math.max(0, Number(change && change.revision) || 0);
-            if (!changeRevision || changeRevision <= revision || seenRevisions.has(changeRevision)) continue;
-            seenRevisions.add(changeRevision);
-            if (changeRevision !== revision + 1) {
-                deferred.push(change);
-                continue;
-            }
-            history = mergeChatSyncChanges(history, [change]);
-            revision = changeRevision;
-            applied++;
-        }
-        window.messageHistory = history;
-        window.__chatCacheRevision = revision;
-        window.__chatInitialPendingSyncChanges = foreign.concat(deferred);
-        return { applied, deferred: window.__chatInitialPendingSyncChanges.length };
-    }
-
-    function applyQueuedInitialSeenEvents() {
-        const queued = Array.isArray(window.__chatInitialPendingSeenEvents) ? window.__chatInitialPendingSeenEvents : [];
-        if (!queued.length) return 0;
-        window.__chatInitialPendingSeenEvents = [];
-        applyChatSeenEventsToHistory(window.messageHistory || [], queued);
-        const cursor = queued.reduce((max, event) => Math.max(max, Math.max(0, Number(event && event.cursor) || 0)), Math.max(0, Number(window.__chatSeenCursor) || 0));
-        window.__chatSeenCursor = cursor;
-        return queued.length;
-    }
-
-    async function stabilizeInitialChatSync(initialResponse, reason = 'initial-no-cache') {
-        let response = initialResponse;
-        let stablePasses = 0;
-        let failedRequests = 0;
-        for (let round = 0; round < 16; round++) {
-            if (!(response && response.syncV1 === true && response.success !== false)) {
-                failedRequests++;
-                if (failedRequests >= 3) return false;
-            } else {
-                failedRequests = 0;
-                if (String(response.mode || '') === 'snapshot') {
-                    const snapshotMessages = Array.isArray(response.messages) ? response.messages : [];
-                    const snapshotExpectedCount = Math.max(0, Number(response.snapshotExpectedCount) || 0);
-                    if (response.snapshotComplete !== true || snapshotMessages.length !== snapshotExpectedCount) return false;
-                }
-                applyChatSyncResponse(response, { holdInitialRelease: true });
-            }
-
-            await new Promise(resolve => setTimeout(resolve, 80));
-            const queuedChanges = applyQueuedInitialChatChanges(String(window.__chatCacheEpoch || ''));
-            const queuedSeen = applyQueuedInitialSeenEvents();
-            const pendingForeignOrGap = Array.isArray(window.__chatInitialPendingSyncChanges) && window.__chatInitialPendingSyncChanges.length > 0;
-            const responseChanges = response && Array.isArray(response.changes) ? response.changes.length : 0;
-            const responseSeenEvents = response && Array.isArray(response.seenEvents) ? response.seenEvents.length : 0;
-            const responseIsQuiet = !!(response && String(response.mode || '') === 'changes' && responseChanges === 0 && responseSeenEvents === 0);
-            const revisionCaughtUp = !!(response && Math.max(0, Number(response.revision) || 0) === Math.max(0, Number(window.__chatCacheRevision) || 0));
-            const seenCaughtUp = !!(response && Math.max(0, Number(response.seenCursor) || 0) <= Math.max(0, Number(window.__chatSeenCursor) || 0));
-            if (responseIsQuiet && revisionCaughtUp && seenCaughtUp && queuedChanges.applied === 0 && queuedSeen === 0 && !pendingForeignOrGap) stablePasses++;
-            else stablePasses = 0;
-
-            if (stablePasses >= 2) {
-                window.__chatInitialPendingSyncChanges = [];
-                window.__chatInitialPendingSeenEvents = [];
-                window.__chatInitialSnapshotPending = false;
-                window.__chatPersistentCacheAvailable = true;
-                window.__chatCacheReadyForWrite = true;
-                window.__chatCacheHydratedHasCache = true;
-                handleChatHistorySnapshot(window.messageHistory || []);
-                scheduleChatPersistentCacheWrite(0);
-                return true;
-            }
-
-            const request = {
-                syncV1: true,
-                epoch: String(window.__chatCacheEpoch || ''),
-                revision: Math.max(0, Number(window.__chatCacheRevision) || 0),
-                seenCursor: Math.max(0, Number(window.__chatSeenCursor) || 0),
-                reason: `${reason}-barrier-${round + 1}`,
-                barrierV1: true,
-                at: Date.now()
-            };
-            response = await emitChatSyncRequest(request, 12000);
-        }
-        return false;
-    }
-
     function requestChatHistoryNow(reason = 'open-chat') {
         if (!(typeof socketChat !== 'undefined' && socketChat && socketChat.connected)) return false;
         if (window.__chatHistoryRequesting === true || window.__chatSyncRequestPromise) return false;
@@ -37384,10 +37271,6 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
             if (hasPersistentCache) window.__chatInitialSnapshotPending = false;
             else if (window.__chatHistoryReceived !== true) {
                 window.__chatInitialSnapshotPending = true;
-                window.__chatPersistentCacheAvailable = false;
-                window.__chatCacheReadyForWrite = false;
-                window.__chatInitialPendingSyncChanges = [];
-                window.__chatInitialPendingSeenEvents = [];
                 if (typeof isChatScreenVisibleForRead === 'function' && isChatScreenVisibleForRead() && typeof showChatHistoryLoading === 'function') showChatHistoryLoading('Preparing messages', true);
             }
             const request = {
@@ -37395,58 +37278,43 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
                 epoch: String(window.__chatCacheEpoch || ''),
                 revision: Math.max(0, Number(window.__chatCacheRevision) || 0),
                 seenCursor: Math.max(0, Number(window.__chatSeenCursor) || 0),
+                initialFullSync: !hasPersistentCache,
                 reason,
                 at: Date.now()
             };
-            const syncResponse = await emitChatSyncRequest(request, hasPersistentCache ? 6500 : 20000);
+            const syncResponse = await new Promise(resolve => {
+                let settled = false;
+                const finish = value => { if (!settled) { settled = true; resolve(value || null); } };
+                try {
+                    const syncTimeoutMs = hasPersistentCache ? 6500 : 30000;
+                    if (typeof socketChat.timeout === 'function') socketChat.timeout(syncTimeoutMs).emit('request_chat_sync', request, (err, response) => finish(err ? null : response));
+                    else {
+                        socketChat.emit('request_chat_sync', request, response => finish(response));
+                        setTimeout(() => finish(null), syncTimeoutMs);
+                    }
+                } catch (err) { finish(null); }
+            });
             if (syncResponse && syncResponse.syncV1 === true && syncResponse.success !== false) {
-                if (!hasPersistentCache) {
-                    const completed = await stabilizeInitialChatSync(syncResponse, reason);
-                    if (completed) return true;
-                    window.__chatInitialSnapshotPending = true;
-                    window.__chatPersistentCacheAvailable = false;
-                    window.__chatCacheReadyForWrite = false;
-                    if (typeof isChatScreenVisibleForRead === 'function' && isChatScreenVisibleForRead() && typeof showChatHistoryLoading === 'function') showChatHistoryLoading('Preparing messages', true);
-                    setTimeout(() => {
-                        window.__chatHistoryRequesting = false;
-                        if (typeof requestChatHistoryNow === 'function') requestChatHistoryNow('initial-sync-barrier-retry');
-                    }, 500);
-                    return false;
-                }
                 applyChatSyncResponse(syncResponse);
                 return true;
             }
-            if (!hasPersistentCache) {
-                window.__chatInitialSnapshotPending = true;
-                window.__chatPersistentCacheAvailable = false;
-                window.__chatCacheReadyForWrite = false;
-                if (typeof isChatScreenVisibleForRead === 'function' && isChatScreenVisibleForRead() && typeof showChatHistoryLoading === 'function') showChatHistoryLoading('Preparing messages', true);
-                setTimeout(() => {
-                    window.__chatHistoryRequesting = false;
-                    if (typeof requestChatHistoryNow === 'function') requestChatHistoryNow('initial-sync-request-retry');
-                }, 500);
-                return false;
-            }
+            if (!hasPersistentCache) return false;
             try {
                 socketChat.emit('request_chat_history', { reason, at: Date.now() });
                 return true;
             } catch (err) { return false; }
         })().finally(() => {
             window.__chatSyncRequestPromise = null;
-            if (window.__chatHistoryReceived !== true && window.__chatInitialSnapshotPending !== true) window.__chatHistoryRequesting = false;
+            if (window.__chatHistoryReceived !== true) window.__chatHistoryRequesting = false;
         });
 
         window.__chatSyncRequestPromise = run;
         window.__chatHistoryRequestWatchdog = setTimeout(() => {
             if (window.__chatHistoryReceived === true || window.__chatHistoryRequesting !== true) return;
-            if (window.__chatInitialSnapshotPending === true && window.__chatPersistentCacheAvailable !== true) {
-                if (typeof showChatHistoryLoading === 'function' && typeof isChatScreenVisibleForRead === 'function' && isChatScreenVisibleForRead()) showChatHistoryLoading('Preparing messages', true);
-                return;
-            }
             window.__chatHistoryRequesting = false;
             window.__chatHistoryRequestRetries = Math.min(2, Number(window.__chatHistoryRequestRetries || 0) + 1);
             if (window.__chatHistoryRequestRetries <= 2 && typeof isChatScreenVisibleForRead === 'function' && isChatScreenVisibleForRead()) requestChatHistoryNow('history-timeout-retry');
-        }, 30000);
+        }, 35000);
         return true;
     }
 
@@ -37709,57 +37577,32 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
     }
     window.hydrateChatHistoryFromPersistentCache = hydrateChatHistoryFromPersistentCache;
 
-    function applyChatSyncResponse(response = {}, options = {}) {
+    function applyChatSyncResponse(response = {}) {
         if (!response || response.syncV1 !== true || response.success === false) return false;
-        const holdInitialRelease = options && options.holdInitialRelease === true;
         const mode = String(response.mode || 'changes');
         const responseEpoch = String(response.epoch || '');
-        const queuedChangesAll = Array.isArray(window.__chatInitialPendingSyncChanges) ? window.__chatInitialPendingSyncChanges.slice() : [];
-        const pendingSyncChanges = queuedChangesAll.filter(change => !change || !change.epoch || String(change.epoch) === responseEpoch);
-        const pendingSeenEvents = Array.isArray(window.__chatInitialPendingSeenEvents) ? window.__chatInitialPendingSeenEvents.slice() : [];
-        if (mode === 'snapshot') window.__chatInitialPendingSyncChanges = [];
-        else window.__chatInitialPendingSyncChanges = queuedChangesAll.filter(change => change && change.epoch && String(change.epoch) !== responseEpoch);
-        window.__chatInitialPendingSeenEvents = [];
-
+        const pendingSyncChanges = mode === 'snapshot' && Array.isArray(window.__chatInitialPendingSyncChanges)
+            ? window.__chatInitialPendingSyncChanges.filter(change => !change || !change.epoch || String(change.epoch) === responseEpoch)
+            : [];
+        const pendingSeenEvents = mode === 'snapshot' && Array.isArray(window.__chatInitialPendingSeenEvents) ? window.__chatInitialPendingSeenEvents.slice() : [];
         let nextHistory = mode === 'snapshot'
             ? normalizeChatHistoryPayload(response.messages || []).slice(-MAX_CHAT_HISTORY)
             : mergeChatSyncChanges(window.messageHistory || [], response.changes || []);
-        if (mode === 'snapshot' && Array.isArray(response.changes) && response.changes.length) nextHistory = mergeChatSyncChanges(nextHistory, response.changes);
-        window.__chatCacheEpoch = responseEpoch;
-        let nextRevision = Math.max(0, Number(response.revision) || 0);
-        window.__chatCacheRevision = nextRevision;
-        window.messageHistory = nextHistory;
-
-        if (pendingSyncChanges.length) {
-            window.__chatInitialPendingSyncChanges = pendingSyncChanges.concat(Array.isArray(window.__chatInitialPendingSyncChanges) ? window.__chatInitialPendingSyncChanges : []);
-            applyQueuedInitialChatChanges(responseEpoch);
-        }
-        nextHistory = window.messageHistory || nextHistory;
-        nextRevision = Math.max(0, Number(window.__chatCacheRevision) || nextRevision);
-
+        if (pendingSyncChanges.length) nextHistory = mergeChatSyncChanges(nextHistory, pendingSyncChanges);
         const combinedSeenEvents = (Array.isArray(response.seenEvents) ? response.seenEvents : []).concat(pendingSeenEvents);
         applyChatSeenEventsToHistory(nextHistory, combinedSeenEvents);
-        if (response.seenSyncV1 === true || combinedSeenEvents.length) {
+        window.__chatCacheEpoch = responseEpoch;
+        const responseRevision = Math.max(0, Number(response.revision) || 0);
+        const pendingRevision = pendingSyncChanges.reduce((max, change) => Math.max(max, Math.max(0, Number(change && change.revision) || 0)), 0);
+        window.__chatCacheRevision = Math.max(responseRevision, pendingRevision);
+        if (response.seenSyncV1 === true || pendingSeenEvents.length) {
             const responseSeenCursor = Math.max(0, Number(response.seenCursor) || 0);
-            const pendingSeenCursor = combinedSeenEvents.reduce((max, event) => Math.max(max, Math.max(0, Number(event && event.cursor) || 0)), 0);
-            window.__chatSeenCursor = Math.max(responseSeenCursor, pendingSeenCursor, Math.max(0, Number(window.__chatSeenCursor) || 0));
+            const pendingSeenCursor = pendingSeenEvents.reduce((max, event) => Math.max(max, Math.max(0, Number(event && event.cursor) || 0)), 0);
+            window.__chatSeenCursor = Math.max(responseSeenCursor, pendingSeenCursor);
         }
-
-        if (holdInitialRelease) {
-            window.messageHistory = normalizeChatHistoryPayload(nextHistory).slice(-MAX_CHAT_HISTORY);
-            window.__chatInitialSnapshotPending = true;
-            window.__chatPersistentCacheAvailable = false;
-            window.__chatCacheReadyForWrite = false;
-            window.__chatCacheHydratedHasCache = false;
-            window.__chatHistoryReceived = false;
-            window.__chatHistoryDomRendered = false;
-            if (typeof registerChatUsersFromHistory === 'function') registerChatUsersFromHistory(window.messageHistory);
-            if (typeof updateChatHistoryRenderSignature === 'function') updateChatHistoryRenderSignature();
-            if (typeof isChatScreenVisibleForRead === 'function' && isChatScreenVisibleForRead() && typeof showChatHistoryLoading === 'function') showChatHistoryLoading('Preparing messages', true);
-            return true;
-        }
-
         if (mode === 'snapshot') {
+            window.__chatInitialPendingSyncChanges = [];
+            window.__chatInitialPendingSeenEvents = [];
             window.__chatInitialSnapshotPending = false;
             window.__chatPersistentCacheAvailable = true;
             window.__chatCacheReadyForWrite = true;
@@ -37972,27 +37815,6 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
     window.syncChatVirtualBoundsFromRendered = syncChatVirtualBoundsFromRendered;
 
 
-
-    function getChatViewportAnchor(box) {
-        if (!box || !box.querySelectorAll || !box.getBoundingClientRect) return null;
-        const boxRect = box.getBoundingClientRect();
-        const rows = Array.from(box.querySelectorAll('[id^="msg-row-"]'));
-        const row = rows.find(item => {
-            const rect = item.getBoundingClientRect();
-            return rect.bottom > boxRect.top + 1 && rect.top < boxRect.bottom - 1;
-        }) || rows[0] || null;
-        if (!row) return null;
-        return { row, top: row.getBoundingClientRect().top };
-    }
-
-    function restoreChatViewportAnchor(box, anchor) {
-        if (!box || !anchor || !anchor.row || !anchor.row.isConnected) return false;
-        const currentTop = anchor.row.getBoundingClientRect().top;
-        const delta = currentTop - anchor.top;
-        if (!Number.isFinite(delta) || Math.abs(delta) < 0.5) return true;
-        box.scrollTop = Math.max(0, box.scrollTop + delta);
-        return true;
-    }
 
     function centerChatMessageRow(row, behavior = 'auto') {
         const chatBox = document.getElementById('chat-messages');
@@ -45948,13 +45770,6 @@ function getVisibleChatStackEl(id) {
         });
 
         socketChat.on('chat_history', function(history, respond) {
-            if (window.__chatInitialSnapshotPending === true && window.__chatPersistentCacheAvailable !== true) {
-                if (typeof respond === 'function') {
-                    try { respond({ ok: true, deferred: true, reason: 'initial-sync-barrier' }); } catch (e) {}
-                }
-                if (typeof showChatHistoryLoading === 'function' && typeof isChatScreenVisibleForRead === 'function' && isChatScreenVisibleForRead()) showChatHistoryLoading('Preparing messages', true);
-                return false;
-            }
             const result = handleChatHistorySnapshot(history, respond);
             scheduleChatPersistentCacheWrite();
             return result;
