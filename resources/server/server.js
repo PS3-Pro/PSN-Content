@@ -3668,15 +3668,6 @@ function buildFullProfileSyncPayload(name, user = {}, sourceSocketId = null, opt
   };
 }
 
-function emitProfileSync(name, sourceSocketId = null) {
-  if (!name || !userDatabase[name]) return;
-  const payload = buildFullProfileSyncPayload(name, userDatabase[name], sourceSocketId);
-  getSocketsByUserName(name).forEach(client => {
-    if (sourceSocketId && client.id === sourceSocketId) return;
-    client.emit('profile_sync', payload);
-  });
-}
-
 const PROFILE_SYNC_PATCH_KEYS = new Set([
   'id', 'name', 'avatar', 'joined', 'countryCode', 'role', 'isAdmin', 'isModerator', 'banned',
   'lastSeen', 'ps3Status', 'level', 'xp', 'downloads', 'wishlist', 'favorites', 'trophies', 'library',
@@ -4316,9 +4307,6 @@ async function setUserRole(targetName, role, adminName) {
   return { success: true, role: getUserRole(targetName, userDatabase[targetName]), banned: isUserBanned(userDatabase[targetName]) };
 }
 
-function generateTemporaryPassword() {
-  return `PSN-${Math.random().toString(36).slice(2, 8).toUpperCase()}`;
-}
 
 function resolveCommandTarget(rawArgs = "", options = {}) {
   const args = normalizeText(rawArgs, "");
@@ -4528,9 +4516,6 @@ function getPostAuthRemainingDelay(socket, totalDelayMs) {
   return Math.max(0, totalDelayMs - (Date.now() - start));
 }
 
-function deferAfterAuthSettle(socket, label, taskFn, totalDelayMs = POST_AUTH_PROFILE_SYNC_DELAY_MS) {
-  deferServerTask(label, taskFn, getPostAuthRemainingDelay(socket, totalDelayMs));
-}
 
 const syncAdminStateIntervalTask = runNonOverlappingTask('ADMIN STATE SYNC', syncAdminStateAcrossInstances);
 const presenceHeartbeatIntervalTask = runNonOverlappingTask('PRESENCE HEARTBEAT', heartbeatPresenceSessions);
