@@ -16676,11 +16676,13 @@ P
 			const needsFreshChatHistory = !window.__chatHistoryReceived || !Array.isArray(window.messageHistory);
 			let requestedFreshChatHistory = false;
 			if (needsFreshChatHistory) {
-				if (!hasLocalChatHistory && typeof showChatHistoryLoading === 'function') {
+				const hasUsablePersistentCache = window.__chatPersistentCacheAvailable === true && hasLocalChatHistory;
+				if (!hasUsablePersistentCache && typeof showChatHistoryLoading === 'function') {
 					showChatHistoryLoading('Preparing messages');
 				}
 				if (typeof requestChatHistoryNow === 'function') {
-					requestedFreshChatHistory = !hasLocalChatHistory && requestChatHistoryNow('open-chat') === true;
+					const syncStarted = requestChatHistoryNow('open-chat') === true;
+					requestedFreshChatHistory = syncStarted && !hasUsablePersistentCache;
 				}
 			}
 
@@ -16695,6 +16697,7 @@ P
 				chatRenderPromise = renderDeferredChatHistory({ reason: 'open-chat', force: !chatRowsAlreadyVisible && !window.__chatHistoryDomRendered });
 			}
 			const scrollAfterChatRender = () => {
+				if (window.__chatInitialSnapshotPending === true && window.__chatPersistentCacheAvailable !== true) return;
 				if (typeof isChatScreenVisibleForRead === 'function' && !isChatScreenVisibleForRead()) return;
 				if (typeof isChatManualJumpActive === 'function' && isChatManualJumpActive()) return;
 				const history = Array.isArray(window.messageHistory) ? window.messageHistory : [];
@@ -36996,9 +36999,15 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
     window.__chatCacheRevision = 0;
     window.__chatSeenCursor = 0;
     window.__chatCacheHydratedUser = '';
+    window.__chatCacheHydratedHasCache = false;
     window.__chatCacheHydratePromise = null;
     window.__chatCacheWriteTimer = null;
     window.__chatSyncRequestPromise = null;
+    window.__chatPersistentCacheAvailable = false;
+    window.__chatCacheReadyForWrite = false;
+    window.__chatInitialSnapshotPending = false;
+    window.__chatInitialPendingSyncChanges = [];
+    window.__chatInitialPendingSeenEvents = [];
 
     function markChatUiStableAfterRender() {
         const now = Date.now();
@@ -37433,10 +37442,17 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
         if (window.__lastChatHistoryRequestAt && now - window.__lastChatHistoryRequestAt < 700) return false;
         window.__lastChatHistoryRequestAt = now;
         window.__chatHistoryRequesting = true;
+        if (window.__chatPersistentCacheAvailable !== true) window.__chatInitialSnapshotPending = true;
         clearTimeout(window.__chatHistoryRequestWatchdog);
 
         const run = (async () => {
-            await hydrateChatHistoryFromPersistentCache({ renderIfVisible: true });
+            const cacheState = await hydrateChatHistoryFromPersistentCache({ renderIfVisible: true });
+            const hasPersistentCache = !!(cacheState && cacheState.cached === true);
+            if (hasPersistentCache) window.__chatInitialSnapshotPending = false;
+            else if (window.__chatHistoryReceived !== true) {
+                window.__chatInitialSnapshotPending = true;
+                if (typeof isChatScreenVisibleForRead === 'function' && isChatScreenVisibleForRead() && typeof showChatHistoryLoading === 'function') showChatHistoryLoading('Preparing messages', true);
+            }
             const request = {
                 syncV1: true,
                 epoch: String(window.__chatCacheEpoch || ''),
@@ -37577,7 +37593,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 
     async function writeChatPersistentCacheNow() {
         const userName = getChatCacheUserName();
-        if (!userName) return false;
+        if (!userName || window.__chatCacheReadyForWrite !== true) return false;
         const db = await openChatPersistentCacheDb();
         if (!db) return false;
         const record = {
@@ -37585,6 +37601,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
             epoch: String(window.__chatCacheEpoch || ''),
             revision: Math.max(0, Number(window.__chatCacheRevision) || 0),
             seenCursor: Math.max(0, Number(window.__chatSeenCursor) || 0),
+            complete: true,
             messages: normalizeChatHistoryPayload(window.messageHistory || []).slice(-MAX_CHAT_HISTORY),
             savedAt: Date.now()
         };
@@ -37680,6 +37697,12 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 
     function applyRealtimeChatSeenChange(event = {}) {
         if (!event || event.seenSyncV1 !== true) return false;
+        if (window.__chatInitialSnapshotPending === true && window.__chatPersistentCacheAvailable !== true) {
+            if (!Array.isArray(window.__chatInitialPendingSeenEvents)) window.__chatInitialPendingSeenEvents = [];
+            const cursorKey = Math.max(0, Number(event.cursor) || 0);
+            if (!cursorKey || !window.__chatInitialPendingSeenEvents.some(item => Math.max(0, Number(item && item.cursor) || 0) === cursorKey)) window.__chatInitialPendingSeenEvents.push(event);
+            return true;
+        }
         const cursor = Math.max(0, Number(event.cursor) || 0);
         if (cursor && cursor <= Math.max(0, Number(window.__chatSeenCursor) || 0)) return true;
         applyChatSeenEventsToHistory(window.messageHistory || [], [event]);
@@ -37693,21 +37716,29 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
     async function hydrateChatHistoryFromPersistentCache(options = {}) {
         const userName = getChatCacheUserName();
         if (!userName) return null;
-        if (window.__chatCacheHydratedUser === userName) return { hydrated: true, cached: true };
+        if (window.__chatCacheHydratedUser === userName) return { hydrated: true, cached: window.__chatCacheHydratedHasCache === true };
         if (window.__chatCacheHydratePromise) return window.__chatCacheHydratePromise;
         window.__chatCacheHydratePromise = (async () => {
             const record = await readChatPersistentCache(userName);
             window.__chatCacheHydratedUser = userName;
-            if (!record || !Array.isArray(record.messages)) {
+            const hasUsableRecord = !!(record && Array.isArray(record.messages) && String(record.epoch || ''));
+            window.__chatCacheHydratedHasCache = hasUsableRecord;
+            if (!hasUsableRecord) {
                 window.__chatCacheEpoch = '';
                 window.__chatCacheRevision = 0;
                 window.__chatSeenCursor = 0;
+                window.__chatPersistentCacheAvailable = false;
+                window.__chatCacheReadyForWrite = false;
+                window.__chatInitialSnapshotPending = true;
                 return { hydrated: true, cached: false };
             }
             const cachedHistory = normalizeChatHistoryPayload(record.messages).slice(-MAX_CHAT_HISTORY);
             window.__chatCacheEpoch = String(record.epoch || '');
             window.__chatCacheRevision = Math.max(0, Number(record.revision) || 0);
             window.__chatSeenCursor = Math.max(0, Number(record.seenCursor) || 0);
+            window.__chatPersistentCacheAvailable = true;
+            window.__chatCacheReadyForWrite = true;
+            window.__chatInitialSnapshotPending = false;
             window.messageHistory = cachedHistory;
             window.__chatServerPaginationActive = false;
             window.__chatVirtualStartIndex = Math.max(0, cachedHistory.length - getChatVirtualInitialLimit());
@@ -37727,13 +37758,34 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
     function applyChatSyncResponse(response = {}) {
         if (!response || response.syncV1 !== true || response.success === false) return false;
         const mode = String(response.mode || 'changes');
-        const nextHistory = mode === 'snapshot'
+        const responseEpoch = String(response.epoch || '');
+        const pendingSyncChanges = mode === 'snapshot' && Array.isArray(window.__chatInitialPendingSyncChanges)
+            ? window.__chatInitialPendingSyncChanges.filter(change => !change || !change.epoch || String(change.epoch) === responseEpoch)
+            : [];
+        const pendingSeenEvents = mode === 'snapshot' && Array.isArray(window.__chatInitialPendingSeenEvents) ? window.__chatInitialPendingSeenEvents.slice() : [];
+        let nextHistory = mode === 'snapshot'
             ? normalizeChatHistoryPayload(response.messages || []).slice(-MAX_CHAT_HISTORY)
             : mergeChatSyncChanges(window.messageHistory || [], response.changes || []);
-        applyChatSeenEventsToHistory(nextHistory, response.seenEvents || []);
-        window.__chatCacheEpoch = String(response.epoch || '');
-        window.__chatCacheRevision = Math.max(0, Number(response.revision) || 0);
-        if (response.seenSyncV1 === true) window.__chatSeenCursor = Math.max(0, Number(response.seenCursor) || 0);
+        if (pendingSyncChanges.length) nextHistory = mergeChatSyncChanges(nextHistory, pendingSyncChanges);
+        const combinedSeenEvents = (Array.isArray(response.seenEvents) ? response.seenEvents : []).concat(pendingSeenEvents);
+        applyChatSeenEventsToHistory(nextHistory, combinedSeenEvents);
+        window.__chatCacheEpoch = responseEpoch;
+        const responseRevision = Math.max(0, Number(response.revision) || 0);
+        const pendingRevision = pendingSyncChanges.reduce((max, change) => Math.max(max, Math.max(0, Number(change && change.revision) || 0)), 0);
+        window.__chatCacheRevision = Math.max(responseRevision, pendingRevision);
+        if (response.seenSyncV1 === true || pendingSeenEvents.length) {
+            const responseSeenCursor = Math.max(0, Number(response.seenCursor) || 0);
+            const pendingSeenCursor = pendingSeenEvents.reduce((max, event) => Math.max(max, Math.max(0, Number(event && event.cursor) || 0)), 0);
+            window.__chatSeenCursor = Math.max(responseSeenCursor, pendingSeenCursor);
+        }
+        if (mode === 'snapshot') {
+            window.__chatInitialPendingSyncChanges = [];
+            window.__chatInitialPendingSeenEvents = [];
+            window.__chatInitialSnapshotPending = false;
+            window.__chatPersistentCacheAvailable = true;
+            window.__chatCacheReadyForWrite = true;
+            window.__chatCacheHydratedHasCache = true;
+        }
         window.__chatServerPaginationActive = false;
         window.__chatServerHasMoreOlder = false;
         window.__chatServerHasMoreNewer = false;
@@ -37746,7 +37798,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
             window.__chatHistoryRequestRetries = 0;
             clearTimeout(window.__chatHistoryRequestWatchdog);
             if (typeof updateChatHistoryRenderSignature === 'function') updateChatHistoryRenderSignature();
-            const seenIds = new Set((Array.isArray(response.seenEvents) ? response.seenEvents : []).map(event => String(event && event.msgId || '')).filter(Boolean));
+            const seenIds = new Set(combinedSeenEvents.map(event => String(event && event.msgId || '')).filter(Boolean));
             seenIds.forEach(id => refreshChatSeenDomForMessage(id));
         }
         scheduleChatPersistentCacheWrite(0);
@@ -37756,6 +37808,12 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 
     function applyRealtimeChatSyncChange(change = {}) {
         if (!change || change.syncV1 !== true || !change.epoch) return false;
+        if (window.__chatInitialSnapshotPending === true && window.__chatPersistentCacheAvailable !== true) {
+            if (!Array.isArray(window.__chatInitialPendingSyncChanges)) window.__chatInitialPendingSyncChanges = [];
+            const revisionKey = Math.max(0, Number(change.revision) || 0);
+            if (!revisionKey || !window.__chatInitialPendingSyncChanges.some(item => Math.max(0, Number(item && item.revision) || 0) === revisionKey)) window.__chatInitialPendingSyncChanges.push(change);
+            return true;
+        }
         const incomingEpoch = String(change.epoch || '');
         const incomingRevision = Math.max(0, Number(change.revision) || 0);
         const currentEpoch = String(window.__chatCacheEpoch || '');
@@ -37805,6 +37863,13 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
     window.applyChatServerPaginationMeta = applyChatServerPaginationMeta;
 
     function handleChatHistorySnapshot(history, respond = null, pageMeta = null) {
+        const isFullHistorySnapshot = !(pageMeta && pageMeta.paginationV1 === true);
+        if (isFullHistorySnapshot) {
+            window.__chatInitialSnapshotPending = false;
+            window.__chatPersistentCacheAvailable = true;
+            window.__chatCacheReadyForWrite = true;
+            window.__chatCacheHydratedHasCache = true;
+        }
         window.__chatHistoryReceived = true;
         window.__chatHistoryRequesting = false;
         window.__chatHistoryRequestRetries = 0;
@@ -38915,6 +38980,11 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
         const renderToken = (window.__chatRenderAbortToken = (window.__chatRenderAbortToken || 0) + 1);
         const history = Array.isArray(window.messageHistory) ? window.messageHistory.slice() : [];
         const signature = getChatHistoryRenderSignature(history);
+        if (window.__chatInitialSnapshotPending === true && window.__chatPersistentCacheAvailable !== true) {
+            if (typeof showChatHistoryLoading === 'function') showChatHistoryLoading('Preparing messages', true);
+            if (window.__chatHistoryRequesting !== true && typeof requestChatHistoryNow === 'function') requestChatHistoryNow(options.reason || 'initial-snapshot-render');
+            return Promise.resolve(false);
+        }
         if (!history.length && window.__chatHistoryReceived !== true) {
             if (typeof showChatHistoryLoading === 'function') showChatHistoryLoading('Preparing messages');
             if (typeof requestChatHistoryNow === 'function') requestChatHistoryNow(options.reason || 'empty-render');
@@ -46354,6 +46424,12 @@ function getVisibleChatStackEl(id) {
 
 				return;
 
+			}
+
+			if (window.__chatInitialSnapshotPending === true && window.__chatPersistentCacheAvailable !== true) {
+				window.__chatHistoryDomRendered = false;
+				if (typeof showChatHistoryLoading === 'function') showChatHistoryLoading('Preparing messages', true);
+				return;
 			}
 
 			if (window.__chatDetachedRenderingActive && typeof restoreVisibleChatBoxFromDetachedRender === 'function') {
