@@ -3668,14 +3668,6 @@ function buildFullProfileSyncPayload(name, user = {}, sourceSocketId = null, opt
   };
 }
 
-function emitProfileSync(name, sourceSocketId = null) {
-  if (!name || !userDatabase[name]) return;
-  const payload = buildFullProfileSyncPayload(name, userDatabase[name], sourceSocketId);
-  getSocketsByUserName(name).forEach(client => {
-    if (sourceSocketId && client.id === sourceSocketId) return;
-    client.emit('profile_sync', payload);
-  });
-}
 
 const PROFILE_SYNC_PATCH_KEYS = new Set([
   'id', 'name', 'avatar', 'joined', 'countryCode', 'role', 'isAdmin', 'isModerator', 'banned',
@@ -3933,7 +3925,6 @@ async function initProfileSyncNotifications() {
           adminState.maintenance = normalizeMaintenanceState(data.state || {});
           adminStateLastRefreshAt = Date.now();
           io.emit('maintenance_mode', adminState.maintenance);
-          io.emit('admin_maintenance_mode', adminState.maintenance);
           emitToAdmins('admin_state', {
             maintenance: adminState.maintenance,
             chatControls: adminState.chatControls,
@@ -4211,7 +4202,6 @@ async function emitOnlineList(targetSocket = null, options = {}) {
         logMemoryTrace('online-list:send', `user=${targetSocket.userName || '-'} socket=${targetSocket.id} items=${Array.isArray(list) ? list.length : 0} approx=${formatApproxBytes(estimate.bytes)}${estimate.truncated ? '+' : ''} buffer=${getSocketWriteBufferLength(targetSocket)}`);
       }
       targetSocket.emit('online_list', list);
-      targetSocket.emit('online_count', { count: getOnlineCountFromList(list) });
       return list;
     }
 
@@ -4222,7 +4212,6 @@ async function emitOnlineList(targetSocket = null, options = {}) {
 
     lastBroadcastOnlineListSignature = signature;
     io.emit('online_list', list);
-    io.emit('online_count', { count: getOnlineCountFromList(list) });
     return list;
   } catch (err) {
     console.error('[PRESENCE SYNC ERROR]:', err);
@@ -4233,7 +4222,6 @@ async function emitOnlineList(targetSocket = null, options = {}) {
     // [] is what made the UI show "0 Online" until the next good refresh.
     if (targetSocket && fallback.length > 0) {
       targetSocket.emit('online_list', fallback);
-      targetSocket.emit('online_count', { count: getOnlineCountFromList(fallback), stale: true });
     }
     return fallback;
   }
@@ -4316,9 +4304,6 @@ async function setUserRole(targetName, role, adminName) {
   return { success: true, role: getUserRole(targetName, userDatabase[targetName]), banned: isUserBanned(userDatabase[targetName]) };
 }
 
-function generateTemporaryPassword() {
-  return `PSN-${Math.random().toString(36).slice(2, 8).toUpperCase()}`;
-}
 
 function resolveCommandTarget(rawArgs = "", options = {}) {
   const args = normalizeText(rawArgs, "");
@@ -4528,9 +4513,6 @@ function getPostAuthRemainingDelay(socket, totalDelayMs) {
   return Math.max(0, totalDelayMs - (Date.now() - start));
 }
 
-function deferAfterAuthSettle(socket, label, taskFn, totalDelayMs = POST_AUTH_PROFILE_SYNC_DELAY_MS) {
-  deferServerTask(label, taskFn, getPostAuthRemainingDelay(socket, totalDelayMs));
-}
 
 const syncAdminStateIntervalTask = runNonOverlappingTask('ADMIN STATE SYNC', syncAdminStateAcrossInstances);
 const presenceHeartbeatIntervalTask = runNonOverlappingTask('PRESENCE HEARTBEAT', heartbeatPresenceSessions);
@@ -5600,13 +5582,11 @@ io.on('connection', (socket) => {
       const targetSocket = getSocketsByUserName(targetName)[0];
       if (!targetName || !targetSocket) {
         const error = { success: false, message: 'User not found or offline.' };
-        socket.emit('kick_error', error);
         respond(error);
         return;
       }
       if (!canModerateTarget(socket, targetName)) {
         const error = { success: false, message: 'You cannot kick this user.' };
-        socket.emit('kick_error', error);
         respond(error);
         return;
       }
@@ -5634,9 +5614,6 @@ io.on('connection', (socket) => {
       const result = await banUser(targetName, reason, senderName || 'Admin');
       if (result.success) {
         await addModerationLog('ban', `Banned ${targetName} via chat command`, { targetName, reason: result.reason }, senderName || 'Admin');
-        socket.emit('admin_command_result', { command: 'ban', ...result });
-      } else {
-        socket.emit('admin_command_error', { command: 'ban', ...result });
       }
       respond({ command: 'ban', ...result });
       return;
@@ -5654,9 +5631,6 @@ io.on('connection', (socket) => {
       const result = await unbanUser(targetName, senderName || 'Admin');
       if (result.success) {
         await addModerationLog('unban', `Unbanned ${targetName} via chat command`, { targetName }, senderName || 'Admin');
-        socket.emit('admin_command_result', { command: 'unban', ...result });
-      } else {
-        socket.emit('admin_command_error', { command: 'unban', ...result });
       }
       respond({ command: 'unban', ...result });
       return;
@@ -5675,9 +5649,6 @@ io.on('connection', (socket) => {
       const result = await setUserRole(targetName, role, senderName || 'Admin');
       if (result.success) {
         await addModerationLog('role', `Changed ${targetName}'s role to ${result.role} via chat command`, { targetName, role: result.role }, senderName || 'Admin');
-        socket.emit('admin_command_result', { command: 'role', targetName, ...result });
-      } else {
-        socket.emit('admin_command_error', { command: 'role', targetName, ...result });
       }
       respond({ command: 'role', targetName, ...result });
       return;
@@ -5696,9 +5667,6 @@ io.on('connection', (socket) => {
       const result = await resetUserPassword(targetName, senderName || 'Admin');
       if (result.success) {
         await addModerationLog('reset_password', `Authorized a 10-minute password reset for ${targetName} via chat command`, { targetName }, senderName || 'Admin');
-        socket.emit('admin_command_result', { command: 'resetpassword', ...result });
-      } else {
-        socket.emit('admin_command_error', { command: 'resetpassword', ...result });
       }
       respond({ command: 'resetpassword', ...result });
       return;
@@ -5928,7 +5896,6 @@ io.on('connection', (socket) => {
       adminState.maintenance = nextMaintenance;
       adminStateLastRefreshAt = Date.now();
       io.emit('maintenance_mode', adminState.maintenance);
-      io.emit('admin_maintenance_mode', adminState.maintenance);
       emitToAdmins('admin_state', {
         maintenance: adminState.maintenance,
         chatControls: adminState.chatControls,
@@ -6349,7 +6316,6 @@ io.on('connection', (socket) => {
         if (targetSocket) {
             const targetName = targetSocket.userName || normalizeText(data.targetName, 'Unknown');
             if (!canModerateTarget(socket, targetName)) {
-                socket.emit('kick_error', { targetId: data.targetId, targetName, message: 'You cannot kick this user.' });
                 return;
             }
             targetSocket.emit('user_kicked', { by: socket.userName, role: getActorRole(socket) });
