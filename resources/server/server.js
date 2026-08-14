@@ -14,6 +14,8 @@ const ADMIN_USERS = ["Luan Teles", "Goku Cheats", "JumpSuit"];
 const DEFAULT_AVATAR = "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/interface/modern/images/avatars/default.png";
 
 const MAX_CHAT_HISTORY = 1000; 
+const CHAT_HISTORY_PAGE_SIZE = Math.max(10, Math.min(100, parseInt(process.env.CHAT_HISTORY_PAGE_SIZE || "50", 10) || 50));
+const CHAT_HISTORY_PAGE_MAX = 100;
 
 const SERVER_STARTED_AT = Date.now();
 const INSTANCE_ID = process.env.RENDER_INSTANCE_ID || process.env.RAILWAY_REPLICA_ID || process.env.HOSTNAME || `instance-${Math.random().toString(36).slice(2, 10)}`;
@@ -3209,22 +3211,57 @@ function getPublicChatHistory() {
   return messageHistory;
 }
 
-function getPublicChatHistoryForUser(userName = '') {
+function getPublicChatMessageForUser(message, userName = '') {
   const targetUser = String(userName || '');
-  if (!targetUser) return messageHistory.map(message => cleanChatMessage(message));
+  const clean = cleanChatMessage(message);
+  if (!targetUser || String(clean.user || '') === targetUser) return clean;
 
-  return messageHistory.map(message => {
-    const clean = cleanChatMessage(message);
-    if (String(clean.user || '') === targetUser) return clean;
+  const seenBy = Array.isArray(clean.seenBy) ? clean.seenBy : [];
+  const wasSeenByTarget = seenBy.includes(targetUser);
+  clean.seenBy = wasSeenByTarget ? [targetUser] : [];
 
-    const seenBy = Array.isArray(clean.seenBy) ? clean.seenBy : [];
-    const wasSeenByTarget = seenBy.includes(targetUser);
-    clean.seenBy = wasSeenByTarget ? [targetUser] : [];
+  const seenAt = clean.seenAt && typeof clean.seenAt === 'object' && !Array.isArray(clean.seenAt) ? clean.seenAt : {};
+  clean.seenAt = wasSeenByTarget && seenAt[targetUser] ? { [targetUser]: seenAt[targetUser] } : {};
+  return clean;
+}
 
-    const seenAt = clean.seenAt && typeof clean.seenAt === 'object' && !Array.isArray(clean.seenAt) ? clean.seenAt : {};
-    clean.seenAt = wasSeenByTarget && seenAt[targetUser] ? { [targetUser]: seenAt[targetUser] } : {};
-    return clean;
-  });
+function getPublicChatHistoryForUser(userName = '') {
+  return messageHistory.map(message => getPublicChatMessageForUser(message, userName));
+}
+
+async function getChatHistoryPageForUser(userName = '', options = {}) {
+  const limit = Math.max(10, Math.min(CHAT_HISTORY_PAGE_MAX, Math.floor(Number(options.limit) || CHAT_HISTORY_PAGE_SIZE)));
+  const beforeId = Math.max(0, Number(options.beforeId) || 0);
+
+  if (!beforeId) {
+    const cached = messageHistory.slice(-(limit + 1));
+    const hasMoreOlder = cached.length > limit;
+    const selected = (hasMoreOlder ? cached.slice(1) : cached);
+    return {
+      messages: selected.map(message => getPublicChatMessageForUser(message, userName)),
+      hasMoreOlder,
+      oldestId: selected.length ? Number(selected[0]._dbId || 0) : 0,
+      newestId: selected.length ? Number(selected[selected.length - 1]._dbId || 0) : 0,
+      limit
+    };
+  }
+
+  const pageRes = await queryDbWithRetry(
+    'SELECT id, message FROM chat WHERE id < $1 ORDER BY id DESC LIMIT $2',
+    [beforeId, limit + 1],
+    { attempts: 2, label: 'CHAT HISTORY PAGE READ' }
+  );
+  const hasMoreOlder = pageRes.rows.length > limit;
+  const selectedDesc = pageRes.rows.slice(0, limit);
+  const selected = selectedDesc.reverse();
+
+  return {
+    messages: selected.map(row => getPublicChatMessageForUser(attachChatDbId({ ...(row.message || {}) }, row.id), userName)),
+    hasMoreOlder,
+    oldestId: selected.length ? Number(selected[0].id || 0) : beforeId,
+    newestId: selected.length ? Number(selected[selected.length - 1].id || 0) : 0,
+    limit
+  };
 }
 
 async function refreshChatHistoryFromDb() {
@@ -5090,9 +5127,59 @@ io.on('connection', (socket) => {
     }
   });
 
-  socket.on('request_chat_history', async () => {
+  socket.on('request_chat_history', async (request = {}, respond) => {
+    const payload = request && typeof request === 'object' && !Array.isArray(request) ? request : {};
+    const reply = typeof respond === 'function'
+      ? respond
+      : result => { if (socket.connected) socket.emit('chat_history_page', result); };
+
     try {
-      if (!socket.userName) return;
+      if (!socket.userName) {
+        if (payload.paginationV1 === true) reply({ success: false, paginationV1: true, error: 'Not authenticated.' });
+        return;
+      }
+
+      if (payload.paginationV1 === true) {
+        if (socket.__chatHistoryPageRequestInFlight) {
+          reply({ success: false, paginationV1: true, busy: true });
+          return;
+        }
+
+        const mode = payload.mode === 'older' ? 'older' : 'latest';
+        const beforeId = mode === 'older' ? Math.max(0, Number(payload.beforeId) || 0) : 0;
+        const limit = Math.max(10, Math.min(CHAT_HISTORY_PAGE_MAX, Math.floor(Number(payload.limit) || CHAT_HISTORY_PAGE_SIZE)));
+        const requestId = normalizeText(payload.requestId, '').slice(0, 80);
+
+        if (mode === 'older' && beforeId <= 0) {
+          reply({ success: true, paginationV1: true, mode, requestId, messages: [], hasMoreOlder: false, oldestId: 0, newestId: 0, limit });
+          return;
+        }
+
+        socket.__chatHistoryPageRequestInFlight = (async () => {
+          const page = await getChatHistoryPageForUser(socket.userName, { beforeId, limit });
+          const response = {
+            success: true,
+            paginationV1: true,
+            mode,
+            requestId,
+            messages: page.messages,
+            hasMoreOlder: page.hasMoreOlder === true,
+            oldestId: Number(page.oldestId || 0),
+            newestId: Number(page.newestId || 0),
+            limit: page.limit
+          };
+          if (MEMORY_TRACE_ENABLED) {
+            const estimate = estimateValueBytes(response.messages, { maxNodes: 25000, maxBytes: 16 * 1024 * 1024 });
+            logMemoryTrace('chat-history:page', `user=${socket.userName || '-'} socket=${socket.id} mode=${mode} items=${response.messages.length} before=${beforeId || '-'} oldest=${response.oldestId || '-'} more=${response.hasMoreOlder} approx=${formatApproxBytes(estimate.bytes)}${estimate.truncated ? '+' : ''}`);
+          }
+          reply(response);
+          return response;
+        })().finally(() => { socket.__chatHistoryPageRequestInFlight = null; });
+
+        await socket.__chatHistoryPageRequestInFlight;
+        return;
+      }
+
       if (socket.__chatHistoryRequestInFlight) return socket.__chatHistoryRequestInFlight;
       const now = Date.now();
       if (socket.__lastChatHistoryRequestAt && now - socket.__lastChatHistoryRequestAt < 900) return;
@@ -5100,7 +5187,11 @@ io.on('connection', (socket) => {
       socket.__chatHistoryRequestInFlight = emitChatHistoryToSocket(socket).finally(() => { socket.__chatHistoryRequestInFlight = null; });
       await socket.__chatHistoryRequestInFlight;
     } catch (err) {
+      socket.__chatHistoryPageRequestInFlight = null;
       socket.__chatHistoryRequestInFlight = null;
+      if (payload.paginationV1 === true) {
+        try { reply({ success: false, paginationV1: true, error: err && err.message ? err.message : 'Chat history page failed.' }); } catch (e) {}
+      }
       console.error('[REQUEST CHAT HISTORY ERROR]:', err);
     }
   });
