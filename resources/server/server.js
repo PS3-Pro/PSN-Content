@@ -93,6 +93,14 @@ function stableStringifySmall(value) {
   try { return JSON.stringify(value); } catch (err) { return String(value); }
 }
 
+function getPs3StatusPresenceSignature(status) {
+  if (!status || typeof status !== "object" || Array.isArray(status)) return stableStringifySmall(status);
+  const stable = { ...status };
+  delete stable.playTime;
+  delete stable.playTimeUpdatedAt;
+  return stableStringifySmall(stable);
+}
+
 function buildOnlineListSignature(list = []) {
   if (!Array.isArray(list) || !list.length) return "empty";
   return list.map(user => {
@@ -108,7 +116,7 @@ function buildOnlineListSignature(list = []) {
       user && user.role || "",
       getUserCountryCode(user),
       user && user.banned ? "1" : "0",
-      stableStringifySmall(user && user.ps3Status)
+      getPs3StatusPresenceSignature(user && user.ps3Status)
     ].join(":");
   }).join("|");
 }
@@ -1212,6 +1220,13 @@ function normalizeIncomingProfileCountry(payload = {}, settings = null) {
   });
 
   return { hasCountry: true, countryCode };
+}
+
+function normalizePs3PlayTimeServer(value) {
+  const text = normalizeText(value, '');
+  const match = text.match(/^(\d{1,4}):([0-5]\d):([0-5]\d)$/);
+  if (!match) return '';
+  return `${match[1].padStart(2, '0')}:${match[2]}:${match[3]}`;
 }
 
 function normalizeTimeValue(value, fallback = "00:00") {
@@ -3542,6 +3557,26 @@ async function notifyPresenceAcrossInstances(name, user = null) {
   }
 }
 
+async function notifyPs3PlayTimeAcrossInstances(payload = {}) {
+  const name = normalizeText(payload.name, '');
+  const playTime = normalizePs3PlayTimeServer(payload.playTime);
+  if (!name || !playTime) return;
+
+  const message = {
+    name,
+    titleId: normalizeText(payload.titleId, '').toUpperCase().slice(0, 32),
+    playTime,
+    playTimeUpdatedAt: normalizeTimestampValue(payload.playTimeUpdatedAt) || Date.now(),
+    instanceId: INSTANCE_ID
+  };
+
+  try {
+    await pool.query('SELECT pg_notify($1, $2)', ['ps3_playtime_sync', JSON.stringify(message)]);
+  } catch (err) {
+    console.error('[PS3 PLAYTIME NOTIFY ERROR]:', err);
+  }
+}
+
 function profileUpdateTouchesPublicCounts(userData = {}) {
   return !!(userData && [
     'downloadsData', 'downloads', 'downloadsClearedAt', 'downloadsUpdatedAt',
@@ -3644,7 +3679,7 @@ async function initProfileSyncNotifications() {
   profileSyncNotifyClient = client;
 
   client.on('notification', async (message) => {
-    if (!message || !['profile_sync', 'presence_sync', 'admin_state_sync'].includes(message.channel)) return;
+    if (!message || !['profile_sync', 'presence_sync', 'ps3_playtime_sync', 'admin_state_sync'].includes(message.channel)) return;
 
     try {
       const data = JSON.parse(message.payload || '{}');
@@ -3672,6 +3707,37 @@ async function initProfileSyncNotifications() {
 
       const name = normalizeText(data.name, '');
       if (!name) return;
+
+      if (message.channel === 'ps3_playtime_sync') {
+        const playTime = normalizePs3PlayTimeServer(data.playTime);
+        if (!playTime) return;
+
+        if (!userDatabase[name]) await refreshSingleUserSummaryFromDb(name);
+        if (!userDatabase[name]) return;
+
+        const currentStatus = userDatabase[name].ps3Status;
+        if (!currentStatus || currentStatus.status !== 'playing') return;
+
+        const incomingTitleId = normalizeText(data.titleId, '').toUpperCase();
+        const currentTitleId = normalizeText(currentStatus.titleId, '').toUpperCase();
+        if (incomingTitleId && currentTitleId && incomingTitleId !== currentTitleId) return;
+
+        const updatedAt = normalizeTimestampValue(data.playTimeUpdatedAt) || Date.now();
+        userDatabase[name].ps3Status = {
+          ...currentStatus,
+          playTime,
+          playTimeUpdatedAt: updatedAt
+        };
+
+        invalidateOnlineListCache('ps3-playtime-listen');
+        io.emit('ps3_playtime_update', {
+          name,
+          titleId: currentTitleId || incomingTitleId,
+          playTime,
+          playTimeUpdatedAt: updatedAt
+        });
+        return;
+      }
 
       const hasLocalSession = Array.from(io.sockets.sockets.values()).some(activeSocket => (
         activeSocket.connected && activeSocket.userName === name
@@ -3757,9 +3823,11 @@ async function initProfileSyncNotifications() {
     await client.connect();
     await client.query('LISTEN profile_sync');
     await client.query('LISTEN presence_sync');
+    await client.query('LISTEN ps3_playtime_sync');
     await client.query('LISTEN admin_state_sync');
     console.log('[PROFILE SYNC] Postgres LISTEN enabled.');
     console.log('[PRESENCE SYNC] Postgres LISTEN enabled.');
+    console.log('[PS3 PLAYTIME SYNC] Postgres LISTEN enabled.');
     console.log('[ADMIN STATE SYNC] Postgres LISTEN enabled.');
   } catch (err) {
     if (profileSyncNotifyClient === client) profileSyncNotifyClient = null;
@@ -4815,6 +4883,44 @@ io.on('connection', (socket) => {
           }
         });
     }
+  });
+
+  socket.on('ps3_playtime_update', (data = {}) => {
+    const name = socket.userName;
+    if (!name || !userDatabase[name] || userDatabase[name].online !== true) return;
+
+    const currentStatus = userDatabase[name].ps3Status;
+    if (!currentStatus || currentStatus.status !== 'playing') return;
+
+    const playTime = normalizePs3PlayTimeServer(data.playTime);
+    if (!playTime) return;
+
+    const incomingTitleId = normalizeText(data.titleId, '').toUpperCase();
+    const currentTitleId = normalizeText(currentStatus.titleId, '').toUpperCase();
+    if (incomingTitleId && currentTitleId && incomingTitleId !== currentTitleId) return;
+
+    const now = Date.now();
+    const previousAt = normalizeTimestampValue(currentStatus.playTimeUpdatedAt);
+    const previousPlayTime = normalizePs3PlayTimeServer(currentStatus.playTime);
+
+    if (previousPlayTime === playTime && previousAt && now - previousAt < 45000) return;
+
+    userDatabase[name].ps3Status = {
+      ...currentStatus,
+      playTime,
+      playTimeUpdatedAt: now
+    };
+    invalidateOnlineListCache('ps3-playtime-update');
+
+    const payload = {
+      name,
+      titleId: currentTitleId || incomingTitleId,
+      playTime,
+      playTimeUpdatedAt: now
+    };
+
+    socket.broadcast.emit('ps3_playtime_update', payload);
+    deferServerTask('PS3 PLAYTIME NOTIFY', () => notifyPs3PlayTimeAcrossInstances(payload), 0);
   });
 
   socket.on('request_user_data', async (data = {}) => {
