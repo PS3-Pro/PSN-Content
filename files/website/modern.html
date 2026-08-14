@@ -8088,7 +8088,17 @@ P
 		}
 	}
 	
+	function unlockChatMessageAudio() {
+		window.__chatMessageAudioUnlocked = true;
+	}
+	window.unlockChatMessageAudio = unlockChatMessageAudio;
 
+	function markChatNotificationsReady(reason = 'auth') {
+		window.__chatNotificationLoginReady = true;
+		window.__chatNotificationReadyAt = Date.now();
+		window.__chatNotificationReadyReason = reason;
+	}
+	window.markChatNotificationsReady = markChatNotificationsReady;
 
 	function isChatNotificationElementVisible(el) {
 		if (!el) return false;
@@ -12378,9 +12388,11 @@ P
 		if (isSiteDisclaimerOpenOrOpening()) return;
 		const safeName = String(username || localStorage.getItem('psn_username') || 'guest');
 		const sessionKey = SITE_DISCLAIMER_SESSION_PREFIX + safeName;
+		const dailyKey = getSiteDisclaimerDailyKey(safeName);
 		const todayStamp = getSiteDisclaimerTodayStamp();
 		if (!shouldShowSiteDisclaimerForUser(safeName)) { unlockSiteDisclaimerInput(); return; }
 		window.__pendingSiteDisclaimerKey = sessionKey;
+		window.__pendingSiteDisclaimerDailyKey = dailyKey;
 		window.__pendingSiteDisclaimerDailyStamp = todayStamp;
 		window.__pendingSiteDisclaimerUser = safeName;
 		window.__siteDisclaimerOpening = true;
@@ -12696,6 +12708,7 @@ P
 	
 				if (typeof closeAllPs5AuthOverlaysInstant === 'function') closeAllPs5AuthOverlaysInstant();
 				window.__allowBackgroundMusicPlayback = true;
+				if (typeof markChatNotificationsReady === 'function') markChatNotificationsReady('boot-hidden');
 				setTimeout(() => {
 					if (typeof initAudioSettings === 'function') initAudioSettings({ forcePlay: true });
 				}, 450);
@@ -12766,6 +12779,7 @@ P
 							setTimeout(() => {
 								window.__exploreBootRevealActive = false;
 								window.__loginRevealBusy = false;
+								if (typeof markChatNotificationsReady === 'function') markChatNotificationsReady('home-reveal-complete');
 								if (typeof initAudioSettings === 'function') initAudioSettings({ forcePlay: true });
 							}, 1800);
 					}
@@ -17781,6 +17795,7 @@ P
 	window.__psnStoreCoverEntryCache = window.__psnStoreCoverEntryCache || {};
 	window.__psnStoreNoSummaryCache = window.__psnStoreNoSummaryCache || {};
 
+	window.getPsnStoreLocale = getPsnStoreLocaleCompat;
 	window.getPsnStoreApiUrl = getPsnStoreApiUrlCompat;
 
 	window.getPsnStoreEntryKey = function(titleId, contentId, region) {
@@ -17859,6 +17874,15 @@ P
 		return { provider, releaseDate, releaseYear: yearMatch ? yearMatch[0] : '' };
 	};
 
+	window.getPsnStoreSummaryText = async function(titleId, contentId, region) {
+		if (!window.fetchPsnStoreMetadata || !window.cleanPsnStoreDescription) return '';
+		try {
+			const psnStoreData = await window.fetchPsnStoreMetadata(titleId, contentId, region);
+			return window.extractPsnStoreDescription ? window.extractPsnStoreDescription(psnStoreData) : window.cleanPsnStoreDescription(psnStoreData?.long_desc || psnStoreData?.short_desc || '');
+		} catch (error) {
+			return '';
+		}
+	};
 
 	window.fetchPsnStoreMetadata = async function(titleId, contentId, region) {
 		const apiUrl = window.getPsnStoreApiUrl(titleId, contentId, region, false);
@@ -18819,7 +18843,9 @@ P
 		window.__browseCanFilterMissingRap = searchHasText ? searchCanUseMissingRapToggle : true;
 
 		const showMissingRap = missingRapToggleEl ? missingRapToggleEl.checked : false;
+		const searchIncludesMissingRap = false;
 		const effectiveShowMissingRap = showMissingRap || searchSingleMissingRapCandidate;
+		window.__browseSearchIncludesMissingRap = searchIncludesMissingRap;
 		window.__browseHiddenMissingRapCount = 0;
 		window.__browseAvailableMissingRapCount = 0;
 
@@ -22565,9 +22591,34 @@ P
 		}).join(''); 
 	};
 	
+	window.openDownloadsView = function(fromGoBack = false, savedScroll = 0) {
+		switchView('view-downloads', false, true);
+	
+		if (typeof updateDownloadUI === 'function') {
+			updateDownloadUI();
+		}
+	
+		requestAnimationFrame(() => {
+			const list = document.getElementById('downloads-list');
+			if (!list) return;
+	
+			list.style.scrollBehavior = 'auto';
+			list.scrollTop = fromGoBack ? savedScroll : 0;
+	
+			setTimeout(() => {
+				list.style.scrollBehavior = 'smooth';
+			}, 100);
+		});
+	};
     
 
+	window.isAdminSession = function() {
+		return document.body.classList.contains('is-admin');
+	};
 
+	window.isModSession = function() {
+		return document.body.classList.contains('is-mod');
+	};
 
 	window.canModerateSession = function() {
 		return document.body.classList.contains('is-admin') || document.body.classList.contains('is-mod');
@@ -22813,6 +22864,9 @@ P
 		else renderAdminPanel();
 	};
 
+	window.adminResetUserFilters = function() {
+		adminSetUserFilter('all');
+	};
 
 	window.openAdminPanel = function() {
 		if (!adminGuard()) return;
@@ -23202,6 +23256,7 @@ P
 
 	window.adminRequestUsersList = function(silent = false, includeRegistered = true, append = false) {
 		if (!adminGuard(!silent)) return;
+		window.adminLastUsersRequest = Date.now();
 		const batchSize = adminGetUsersBatchSize();
 		if (typeof socketChat !== 'undefined' && socketChat && socketChat.connected) {
 			socketChat.emit('request_online_list');
@@ -33741,6 +33796,10 @@ function formatLibraryLastPlayedBadge(game = {}) {
 		}
 	};
 
+	window.applyConsoleFanSpeed = async function(speed) {
+		setConsoleFanMode('manual', speed);
+		await applyConsoleCoolingSettings();
+	};
 
 	function getConsolePerformancePreset(mode = null) {
 		let cleanMode = mode || consolePerformanceSelectedMode || 'balanced';
@@ -34028,6 +34087,7 @@ function formatLibraryLastPlayedBadge(game = {}) {
 			if (typeof playUiError === 'function') playUiError();
 		}
 	};
+	window.applyConsoleCustomPerformance = window.applyConsolePerformanceSettings;
 
 	function updateConsoleActionsStatus(text, color = null, icon = 'fa-circle-info') {
 		const status = document.getElementById('console-actions-status');
@@ -37925,7 +37985,26 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
     }
     window.syncChatVirtualBoundsFromRendered = syncChatVirtualBoundsFromRendered;
 
+    function getChatViewportAnchor(box) {
+        if (!box || !box.querySelectorAll || !box.getBoundingClientRect) return null;
+        const boxRect = box.getBoundingClientRect();
+        const rows = Array.from(box.querySelectorAll('[id^="msg-row-"]'));
+        const row = rows.find(item => {
+            const rect = item.getBoundingClientRect();
+            return rect.bottom > boxRect.top + 1 && rect.top < boxRect.bottom - 1;
+        }) || rows[0] || null;
+        if (!row) return null;
+        return { row, top: row.getBoundingClientRect().top };
+    }
 
+    function restoreChatViewportAnchor(box, anchor) {
+        if (!box || !anchor || !anchor.row || !anchor.row.isConnected) return false;
+        const currentTop = anchor.row.getBoundingClientRect().top;
+        const delta = currentTop - anchor.top;
+        if (!Number.isFinite(delta) || Math.abs(delta) < 0.5) return true;
+        box.scrollTop = Math.max(0, box.scrollTop + delta);
+        return true;
+    }
 
     function centerChatMessageRow(row, behavior = 'auto') {
         const chatBox = document.getElementById('chat-messages');
@@ -44566,6 +44645,10 @@ function getVisibleChatStackEl(id) {
 		}, 400);
 	};
 
+	window.closeServerUnavailableModal = function() {
+		if (typeof playUiClick === 'function') playUiClick();
+		window.hideServerUnavailableModal();
+	};
 
 	let loginServerAttempt = null;
 	let loginServerAttemptSequence = 0;
@@ -45448,6 +45531,7 @@ function getVisibleChatStackEl(id) {
 
 			if (typeof updateInterfaceAutoTranslateUi === 'function') updateInterfaceAutoTranslateUi({ silent: true, source: 'auth-success' });
 			if (!authCountryCode) setTimeout(() => ensureProfileCountryForUser(name, userData), 0);
+			if (typeof markChatNotificationsReady === 'function') markChatNotificationsReady('auth-success');
 			if (typeof scheduleSavedPs3Reconnect === 'function') scheduleSavedPs3Reconnect(name, 1400);
 
 			if ((!isLightAuthPayload || initialProfileSyncOk) && window.__trophiesHydrated === true) {
@@ -51501,6 +51585,28 @@ function getVisibleChatStackEl(id) {
 		return html;
 	};
 
+	window.getPlayerListContextHtml = function(targetUser, listType, itemCount, isMe) {
+		const meta = window.getPlayerListMeta(listType);
+		const safeUser = window.escapePlayerListText(targetUser || 'Player');
+		const safeTitle = window.escapePlayerListText(meta.title);
+		const safeDesc = window.escapePlayerListText(meta.desc);
+		const ownerText = isMe ? 'MY PROFILE' : 'PLAYER PROFILE';
+		const countText = `${Number(itemCount || 0)} ${Number(itemCount || 0) === 1 ? 'ITEM' : 'ITEMS'}`;
+		return `
+			<div class="profile-list-context-card">
+				<div class="profile-list-context-left">
+					<div class="profile-list-context-icon"><i class="fas ${meta.icon}"></i></div>
+					<div style="min-width:0;">
+						<div class="profile-list-context-title"><span>${safeTitle}</span> • <span class="profile-list-owner-name" data-no-translate="true" translate="no">${safeUser}</span></div>
+						<div class="profile-list-context-desc">${safeDesc}</div>
+					</div>
+				</div>
+				<div class="profile-list-context-pills">
+					<span class="profile-list-context-pill owner"><i class="fas ${isMe ? 'fa-user-check' : 'fa-user-friends'}"></i>${ownerText}</span>
+					<span class="profile-list-context-pill count">${countText}</span>
+				</div>
+			</div>`;
+	};
 
 	window.getProfilePsListLoaderHtml = function(safeTargetUser, listMeta, layoutClass) {
 		return `
@@ -54337,6 +54443,7 @@ function getVisibleChatStackEl(id) {
             return false;
         }
     }
+    window.isInterfaceTranslationSessionReady = hasAuthenticatedInterfaceTranslationUser;
 
     function getStartupInterfaceAutoTranslatePreference() {
         try {
