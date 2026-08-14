@@ -36989,12 +36989,6 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
     window.__chatVirtualLoadingOlder = false;
     window.__chatLazyInlineHideTimer = null;
     window.__chatLazyInlineRemoveTimer = null;
-    window.__chatServerPaginationActive = false;
-    window.__chatServerHasMoreOlder = false;
-    window.__chatServerHasMoreNewer = false;
-    window.__chatServerOldestId = 0;
-    window.__chatServerNewestId = 0;
-    window.__chatServerPageRequestSeq = 0;
     window.__chatCacheEpoch = '';
     window.__chatCacheRevision = 0;
     window.__chatSeenCursor = 0;
@@ -37740,7 +37734,6 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
             window.__chatCacheReadyForWrite = true;
             window.__chatInitialSnapshotPending = false;
             window.messageHistory = cachedHistory;
-            window.__chatServerPaginationActive = false;
             window.__chatVirtualStartIndex = Math.max(0, cachedHistory.length - getChatVirtualInitialLimit());
             window.__chatVirtualEndIndex = cachedHistory.length;
             window.__chatHistoryDomRendered = false;
@@ -37786,11 +37779,8 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
             window.__chatCacheReadyForWrite = true;
             window.__chatCacheHydratedHasCache = true;
         }
-        window.__chatServerPaginationActive = false;
-        window.__chatServerHasMoreOlder = false;
-        window.__chatServerHasMoreNewer = false;
         const hasMessageChanges = mode === 'snapshot' || (Array.isArray(response.changes) && response.changes.length > 0);
-        if (hasMessageChanges) handleChatHistorySnapshot(nextHistory, null, { chatSyncV1: true, mode });
+        if (hasMessageChanges) handleChatHistorySnapshot(nextHistory);
         else {
             window.messageHistory = nextHistory;
             window.__chatHistoryReceived = true;
@@ -37836,46 +37826,15 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
     setTimeout(() => { hydrateChatHistoryFromPersistentCache({ renderIfVisible: true }).catch(() => {}); }, 0);
 
 
-    function applyChatServerPaginationMeta(page = {}) {
-        if (!page || page.paginationV1 !== true) return false;
-        window.__chatServerPaginationActive = true;
-        const mode = String(page.mode || 'latest').toLowerCase();
-
-        if (mode === 'latest') {
-            window.__chatServerHasMoreOlder = page.hasMoreOlder === true;
-            window.__chatServerHasMoreNewer = false;
-            window.__chatServerOldestId = Math.max(0, Number(page.oldestId) || 0);
-            window.__chatServerNewestId = Math.max(0, Number(page.newestId) || 0);
-        } else if (mode === 'older') {
-            window.__chatServerHasMoreOlder = page.hasMoreOlder === true;
-            window.__chatServerOldestId = Math.max(0, Number(page.oldestId) || window.__chatServerOldestId || 0);
-        } else if (mode === 'newer') {
-            window.__chatServerHasMoreNewer = page.hasMoreNewer === true;
-            window.__chatServerNewestId = Math.max(0, Number(page.newestId) || window.__chatServerNewestId || 0);
-        } else if (mode === 'around') {
-            window.__chatServerHasMoreOlder = page.hasMoreOlder === true;
-            window.__chatServerHasMoreNewer = page.hasMoreNewer === true;
-            window.__chatServerOldestId = Math.max(0, Number(page.oldestId) || 0);
-            window.__chatServerNewestId = Math.max(0, Number(page.newestId) || 0);
-        }
-        return true;
-    }
-    window.applyChatServerPaginationMeta = applyChatServerPaginationMeta;
-
-    function handleChatHistorySnapshot(history, respond = null, pageMeta = null) {
-        const isFullHistorySnapshot = !(pageMeta && pageMeta.paginationV1 === true);
-        if (isFullHistorySnapshot) {
-            window.__chatInitialSnapshotPending = false;
-            window.__chatPersistentCacheAvailable = true;
-            window.__chatCacheReadyForWrite = true;
-            window.__chatCacheHydratedHasCache = true;
-        }
+    function handleChatHistorySnapshot(history, respond = null) {
+        window.__chatInitialSnapshotPending = false;
+        window.__chatPersistentCacheAvailable = true;
+        window.__chatCacheReadyForWrite = true;
+        window.__chatCacheHydratedHasCache = true;
         window.__chatHistoryReceived = true;
         window.__chatHistoryRequesting = false;
         window.__chatHistoryRequestRetries = 0;
         clearTimeout(window.__chatHistoryRequestWatchdog);
-        if (pageMeta && pageMeta.paginationV1 === true) applyChatServerPaginationMeta(pageMeta);
-        else window.__chatServerPaginationActive = false;
 
         const normalizedHistory = typeof normalizeChatHistoryPayload === 'function' ? normalizeChatHistoryPayload(history) : (Array.isArray(history) ? history : []);
         const incomingSignature = getChatHistoryRenderSignature(normalizedHistory);
@@ -37897,30 +37856,28 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
         window.__chatVirtualEndIndex = normalizedHistory.length;
         if (typeof registerChatUsersFromHistory === 'function') registerChatUsersFromHistory(window.messageHistory);
 
-        const isPaginatedSnapshot = !!(pageMeta && pageMeta.paginationV1 === true);
-        if (!isPaginatedSnapshot && chatVisible && hasRenderedRows && !hasActiveLoader && !sameRenderedHistory) {
+        if (chatVisible && hasRenderedRows && !hasActiveLoader && !sameRenderedHistory) {
             const syncedIncrementally = typeof syncRenderedChatHistoryIncrementally === 'function' && syncRenderedChatHistoryIncrementally(normalizedHistory);
             if (!syncedIncrementally) {
                 window.__chatHistoryDomRendered = true;
                 window.__chatHistoryRenderSignature = incomingSignature;
             }
         } else {
-            if (!sameRenderedHistory || isPaginatedSnapshot) window.__chatHistoryDomRendered = false;
+            if (!sameRenderedHistory) window.__chatHistoryDomRendered = false;
             window.__chatHistoryRenderSignature = incomingSignature;
         }
 
         let renderPromise = null;
         if (chatVisible) {
-            if (isPaginatedSnapshot || (!sameRenderedHistory && (!hasRenderedRows || hasActiveLoader))) {
+            if (!sameRenderedHistory && (!hasRenderedRows || hasActiveLoader)) {
                 if (typeof renderDeferredChatHistory === 'function') {
-                    renderPromise = renderDeferredChatHistory({ reason: isPaginatedSnapshot ? 'chat_history_page' : 'chat_history', force: true, forceBottom: false, showLoading: isPaginatedSnapshot ? false : hasActiveLoader });
+                    renderPromise = renderDeferredChatHistory({ reason: 'chat_history', force: true, forceBottom: false, showLoading: hasActiveLoader });
                 }
             }
-        } else {
-            if (box && !box.querySelector('[id^="msg-row-"]') && typeof getChatWelcomeBannerHtml === 'function') {
-                box.innerHTML = window.__chatServerPaginationActive === true && window.__chatServerHasMoreOlder === true ? '' : getChatWelcomeBannerHtml();
-            }
+        } else if (box && !box.querySelector('[id^="msg-row-"]') && typeof getChatWelcomeBannerHtml === 'function') {
+            box.innerHTML = getChatWelcomeBannerHtml();
         }
+
         if (typeof refreshChatNotificationDot === 'function') refreshChatNotificationDot();
         if (typeof refreshMentionJumpButton === 'function') refreshMentionJumpButton();
 
@@ -38183,131 +38140,6 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
         const edgeLoadingThreshold = Math.max(420, Math.floor((box && box.clientHeight || 0) * 0.70));
         const canShowWaiting = !!(box && (box.scrollTop <= edgeLoadingThreshold || reason === 'scroll-hard-top' || reason === 'scroll-preload-top'));
 
-        if (window.__chatServerPaginationActive === true) {
-            if (!box || !history.length || window.__chatVirtualWindowRendering || window.__chatLazyRenderPromise || window.__chatDetachedRenderingActive || window.__chatSearchActive) return Promise.resolve(false);
-            if (window.__chatVirtualLoadingOlder) return Promise.resolve(false);
-            if (window.__chatServerHasMoreOlder !== true || Number(window.__chatServerOldestId || 0) <= 0) {
-                if (typeof hideChatLazyInlineLoading === 'function') hideChatLazyInlineLoading(0);
-                return Promise.resolve(false);
-            }
-            if (!(typeof socketChat !== 'undefined' && socketChat && socketChat.connected)) return Promise.resolve(false);
-
-            const beforeId = Math.max(0, Number(window.__chatServerOldestId || 0));
-            const requestId = `older-${beforeId}-${Date.now()}-${++window.__chatServerPageRequestSeq}`;
-            window.__chatVirtualLoadingOlder = true;
-            if (canShowWaiting && typeof showChatLazyInlineLoading === 'function') showChatLazyInlineLoading('Loading older messages');
-
-            return new Promise(resolve => {
-                let finished = false;
-                const finish = value => {
-                    if (finished) return;
-                    finished = true;
-                    window.__chatVirtualLoadingOlder = false;
-                    if (typeof hideChatLazyInlineLoading === 'function') hideChatLazyInlineLoading(0);
-                    resolve(value);
-                };
-
-                const applyPage = response => {
-                    if (!response || response.success === false || response.paginationV1 !== true || response.mode !== 'older' || !Array.isArray(response.messages)) {
-                        finish(false);
-                        return;
-                    }
-
-                    const incoming = normalizeChatHistoryPayload(response.messages);
-                    const existingKeys = new Set(history.map(getChatMessageTimeKey));
-                    const uniqueIncoming = incoming.filter(msg => {
-                        const key = getChatMessageTimeKey(msg);
-                        return key && !existingKeys.has(key);
-                    });
-
-                    applyChatServerPaginationMeta(response);
-                    if (!uniqueIncoming.length) {
-                        finish(false);
-                        return;
-                    }
-
-                    const combined = uniqueIncoming.concat(history);
-                    window.messageHistory = combined;
-                    if (typeof registerChatUsersFromHistory === 'function') registerChatUsersFromHistory(uniqueIncoming);
-
-                    const addedCount = uniqueIncoming.length;
-                    Array.from(box.querySelectorAll('[id^="msg-row-"]')).forEach(row => {
-                        const oldIndex = Number(row.getAttribute('data-chat-index'));
-                        if (Number.isFinite(oldIndex) && oldIndex >= 0) row.setAttribute('data-chat-index', String(oldIndex + addedCount));
-                    });
-
-                    const myName = localStorage.getItem('psn_username') || 'Guest';
-                    const lastReadTime = parseInt(loadState('psn_last_chat_read') || 0) || 0;
-                    const firstUnreadIndex = getChatFirstUnreadIndex(combined, lastReadTime, myName);
-                    if (firstUnreadIndex >= 0 && firstUnreadIndex < addedCount) {
-                        const oldDivider = document.getElementById('unread-divider');
-                        if (oldDivider) oldDivider.remove();
-                    }
-                    const oldWelcome = document.getElementById('welcome-banner-scroll');
-                    if (oldWelcome) oldWelcome.remove();
-
-                    let tempBox = null;
-                    try {
-                        // Server pagination is asynchronous: preserve the position the user
-                        // is actually viewing when the page ARRIVES, not where the request started.
-                        const insertScrollHeight = box.scrollHeight;
-                        const insertScrollTop = box.scrollTop;
-                        tempBox = document.createElement('div');
-                        tempBox.className = box.className || '';
-                        tempBox.style.cssText = `position:fixed !important; left:-99999px !important; top:0 !important; width:${Math.max(320, box.clientWidth || 320)}px !important; height:${Math.max(320, box.clientHeight || 320)}px !important; overflow:hidden !important; visibility:hidden !important; opacity:0 !important; pointer-events:none !important; scroll-behavior:auto !important;`;
-                        tempBox.innerHTML = response.hasMoreOlder === true ? '' : getChatWelcomeBannerHtml();
-                        document.body.appendChild(tempBox);
-
-                        renderChatHistorySliceToActiveBox(combined, 0, addedCount, {
-                            targetBox: tempBox,
-                            myName,
-                            lastReadTime,
-                            firstUnreadIndex,
-                            allowUnreadDivider: true,
-                            initialRawDate: '',
-                            animateMessages: false
-                        });
-
-                        const fragment = document.createDocumentFragment();
-                        while (tempBox.firstChild) fragment.appendChild(tempBox.firstChild);
-                        box.insertBefore(fragment, box.firstChild);
-                        normalizeChatDateDividers(box);
-                        window.__chatVirtualStartIndex = 0;
-                        window.__chatVirtualEndIndex = combined.length;
-                        window.__chatHistoryDomRendered = true;
-                        if (typeof updateChatHistoryRenderSignature === 'function') updateChatHistoryRenderSignature();
-                        refreshChatLastRawDateFromRendered();
-                        box.scrollTop = insertScrollTop + Math.max(0, box.scrollHeight - insertScrollHeight);
-                        if (typeof initDateStickyLogic === 'function') initDateStickyLogic();
-                        if (typeof setupDividerAutoRemove === 'function') setupDividerAutoRemove();
-                        if (typeof refreshMentionJumpButton === 'function') refreshMentionJumpButton();
-                        finish(true);
-                    } catch (err) {
-                        console.error('[chat] server older page render failed:', err);
-                        finish(false);
-                    } finally {
-                        if (tempBox && tempBox.parentNode) tempBox.remove();
-                    }
-                };
-
-                const request = { paginationV1: true, mode: 'older', beforeId, limit: getChatVirtualOlderChunkSize(), requestId };
-                try {
-                    if (typeof socketChat.timeout === 'function') {
-                        socketChat.timeout(9000).emit('request_chat_history', request, (err, response) => {
-                            if (err) { finish(false); return; }
-                            applyPage(response);
-                        });
-                    } else {
-                        let acked = false;
-                        socketChat.emit('request_chat_history', request, response => { acked = true; applyPage(response); });
-                        setTimeout(() => { if (!acked) finish(false); }, 9000);
-                    }
-                } catch (e) {
-                    finish(false);
-                }
-            });
-        }
-
         if (!box || !history.length || window.__chatVirtualWindowRendering || window.__chatLazyRenderPromise || window.__chatDetachedRenderingActive || window.__chatSearchActive) {
             if (canShowWaiting && window.__chatVirtualLoadingOlder) {
                 if (typeof showChatLazyInlineLoading === 'function') showChatLazyInlineLoading('Loading older messages');
@@ -38547,7 +38379,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
                     tempBox.id = 'chat-messages';
                     tempBox.className = box.className || '';
                     tempBox.style.cssText = `position:fixed !important; left:-99999px !important; top:0 !important; width:${Math.max(320, box.clientWidth || 320)}px !important; height:${Math.max(320, box.clientHeight || 320)}px !important; overflow:hidden !important; visibility:hidden !important; opacity:0 !important; pointer-events:none !important; scroll-behavior:auto !important;`;
-                    tempBox.innerHTML = startIndex <= 0 && !(window.__chatServerPaginationActive === true && window.__chatServerHasMoreOlder === true) ? getChatWelcomeBannerHtml() : '';
+                    tempBox.innerHTML = startIndex <= 0 ? getChatWelcomeBannerHtml() : '';
                     document.body.appendChild(tempBox);
 
                     renderChatHistorySliceToActiveBox(history, startIndex, endIndex, {
@@ -38602,230 +38434,10 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
     }
     window.renderChatWindowAroundMessage = renderChatWindowAroundMessage;
 
-    window.__chatJumpFetchInFlight = null;
-    window.__chatJumpFetchTarget = '';
-
-    function requestChatMessageWindow(msgId, options = {}) {
-        const id = String(msgId || '');
-        if (!id || window.__chatServerPaginationActive !== true) return Promise.resolve(false);
-        if (!(typeof socketChat !== 'undefined' && socketChat && socketChat.connected)) return Promise.resolve(false);
-
-        if (window.__chatJumpFetchInFlight && window.__chatJumpFetchTarget === id) return window.__chatJumpFetchInFlight;
-        if (window.__chatJumpFetchInFlight) return Promise.resolve(false);
-
-        const loadingText = options.loadingText || 'Loading message';
-        const requestId = `around-${id}-${Date.now()}-${++window.__chatServerPageRequestSeq}`;
-        const request = {
-            paginationV1: true,
-            mode: 'around',
-            targetMsgId: id,
-            limit: Math.max(getChatVirtualInitialLimit(), Number(options.limit || 0) || 0),
-            requestId
-        };
-
-        if (typeof markChatManualJumpActive === 'function') markChatManualJumpActive(options.manualJumpGuardMs || 4200);
-        if (typeof showChatJumpLoading === 'function') showChatJumpLoading(loadingText);
-
-        const run = new Promise(resolve => {
-            let settled = false;
-            const finish = value => {
-                if (settled) return;
-                settled = true;
-                if (typeof hideChatJumpLoading === 'function') hideChatJumpLoading(Number(options.minLoadingVisibleMs || 320));
-                resolve(value);
-            };
-
-            const applyWindow = response => {
-                if (!response || response.success === false || response.paginationV1 !== true || response.mode !== 'around' || !Array.isArray(response.messages)) {
-                    finish(false);
-                    return;
-                }
-
-                const incoming = normalizeChatHistoryPayload(response.messages);
-                if (!incoming.length) {
-                    finish(false);
-                    return;
-                }
-
-                window.messageHistory = incoming;
-                applyChatServerPaginationMeta(response);
-                window.__chatVirtualStartIndex = 0;
-                window.__chatVirtualEndIndex = incoming.length;
-                window.__chatHistoryDomRendered = false;
-                if (typeof registerChatUsersFromHistory === 'function') registerChatUsersFromHistory(incoming);
-                if (typeof updateChatHistoryRenderSignature === 'function') updateChatHistoryRenderSignature();
-
-                let targetIndex = Number.isFinite(Number(response.targetIndex)) ? Number(response.targetIndex) : -1;
-                if (targetIndex < 0 || targetIndex >= incoming.length || getChatMessageTimeKey(incoming[targetIndex]) !== id) {
-                    targetIndex = typeof getChatMessageIndexById === 'function' ? getChatMessageIndexById(id, options.matchData || null) : -1;
-                }
-                if (targetIndex < 0) {
-                    finish(false);
-                    return;
-                }
-
-                renderChatWindowAroundIndex(targetIndex, {
-                    align: 'center',
-                    limit: incoming.length,
-                    showLoading: false,
-                    animateMessages: false
-                }).then(ok => {
-                    if (!ok) {
-                        finish(false);
-                        return;
-                    }
-                    const jumped = scrollToMessage(id, {
-                        skipMissingRender: true,
-                        skipManualJumpGuard: true,
-                        targetIndex,
-                        matchData: options.matchData || null,
-                        manualJumpGuardMs: options.manualJumpGuardMs || 4200,
-                        anchorLockMs: options.anchorLockMs || 4200,
-                        instant: true
-                    });
-                    finish(jumped !== false);
-                }).catch(() => finish(false));
-            };
-
-            try {
-                if (typeof socketChat.timeout === 'function') {
-                    socketChat.timeout(9000).emit('request_chat_history', request, (err, response) => {
-                        if (err) { finish(false); return; }
-                        applyWindow(response);
-                    });
-                } else {
-                    let acked = false;
-                    socketChat.emit('request_chat_history', request, response => {
-                        acked = true;
-                        applyWindow(response);
-                    });
-                    setTimeout(() => { if (!acked) finish(false); }, 9000);
-                }
-            } catch (e) {
-                finish(false);
-            }
-        });
-
-        window.__chatJumpFetchTarget = id;
-        window.__chatJumpFetchInFlight = run.finally(() => {
-            window.__chatJumpFetchInFlight = null;
-            window.__chatJumpFetchTarget = '';
-        });
-        return window.__chatJumpFetchInFlight;
-    }
-    window.requestChatMessageWindow = requestChatMessageWindow;
-
     function loadNewerChatMessages(reason = 'scroll-bottom', options = {}) {
         const box = document.getElementById('chat-messages');
         const history = Array.isArray(window.messageHistory) ? window.messageHistory : [];
         if (!box || !history.length || window.__chatVirtualLoadingNewer || window.__chatVirtualWindowRendering || window.__chatLazyRenderPromise || window.__chatDetachedRenderingActive || window.__chatSearchActive) return Promise.resolve(false);
-
-        if (window.__chatServerPaginationActive === true) {
-            if (window.__chatServerHasMoreNewer !== true || Number(window.__chatServerNewestId || 0) <= 0) return Promise.resolve(false);
-            if (!(typeof socketChat !== 'undefined' && socketChat && socketChat.connected)) return Promise.resolve(false);
-
-            const afterId = Math.max(0, Number(window.__chatServerNewestId || 0));
-            const requestId = `newer-${afterId}-${Date.now()}-${++window.__chatServerPageRequestSeq}`;
-            window.__chatVirtualLoadingNewer = true;
-
-            return new Promise(resolve => {
-                let finished = false;
-                const finish = value => {
-                    if (finished) return;
-                    finished = true;
-                    window.__chatVirtualLoadingNewer = false;
-                    resolve(value);
-                };
-
-                const applyPage = response => {
-                    if (!response || response.success === false || response.paginationV1 !== true || response.mode !== 'newer' || !Array.isArray(response.messages)) {
-                        finish(false);
-                        return;
-                    }
-
-                    const incoming = normalizeChatHistoryPayload(response.messages);
-                    const existingKeys = new Set(history.map(getChatMessageTimeKey));
-                    const uniqueIncoming = incoming.filter(msg => {
-                        const key = getChatMessageTimeKey(msg);
-                        return key && !existingKeys.has(key);
-                    });
-
-                    applyChatServerPaginationMeta(response);
-                    if (!uniqueIncoming.length) {
-                        finish(false);
-                        return;
-                    }
-
-                    const combined = history.concat(uniqueIncoming);
-                    const oldLength = history.length;
-                    window.messageHistory = combined;
-                    if (typeof registerChatUsersFromHistory === 'function') registerChatUsersFromHistory(uniqueIncoming);
-
-                    const previousScrollTop = box.scrollTop;
-                    const myName = localStorage.getItem('psn_username') || 'Guest';
-                    const lastReadTime = parseInt(loadState('psn_last_chat_read') || 0) || 0;
-                    const firstUnreadIndex = getChatFirstUnreadIndex(combined, lastReadTime, myName);
-                    const renderedTimes = getChatRenderedRowTimes(box);
-                    const lastRenderedTime = renderedTimes.length ? renderedTimes[renderedTimes.length - 1] : 0;
-                    const initialRawDate = lastRenderedTime ? new Date(lastRenderedTime).toDateString() : '';
-
-                    let tempBox = null;
-                    try {
-                        tempBox = document.createElement('div');
-                        tempBox.className = box.className || '';
-                        tempBox.style.cssText = `position:fixed !important; left:-99999px !important; top:0 !important; width:${Math.max(320, box.clientWidth || 320)}px !important; height:${Math.max(320, box.clientHeight || 320)}px !important; overflow:hidden !important; visibility:hidden !important; opacity:0 !important; pointer-events:none !important; scroll-behavior:auto !important;`;
-                        document.body.appendChild(tempBox);
-
-                        renderChatHistorySliceToActiveBox(combined, oldLength, combined.length, {
-                            targetBox: tempBox,
-                            myName,
-                            lastReadTime,
-                            firstUnreadIndex,
-                            allowUnreadDivider: true,
-                            initialRawDate,
-                            animateMessages: false
-                        });
-
-                        const fragment = document.createDocumentFragment();
-                        while (tempBox.firstChild) fragment.appendChild(tempBox.firstChild);
-                        box.appendChild(fragment);
-                        normalizeChatDateDividers(box);
-                        window.__chatVirtualStartIndex = 0;
-                        window.__chatVirtualEndIndex = combined.length;
-                        window.__chatHistoryDomRendered = true;
-                        if (typeof updateChatHistoryRenderSignature === 'function') updateChatHistoryRenderSignature();
-                        refreshChatLastRawDateFromRendered();
-                        if (options.stickToBottom) box.scrollTop = box.scrollHeight;
-                        else box.scrollTop = previousScrollTop;
-                        if (typeof initDateStickyLogic === 'function') initDateStickyLogic();
-                        if (typeof setupDividerAutoRemove === 'function') setupDividerAutoRemove();
-                        if (typeof refreshMentionJumpButton === 'function') refreshMentionJumpButton();
-                        finish(true);
-                    } catch (err) {
-                        console.error('[chat] server newer page render failed:', err);
-                        finish(false);
-                    } finally {
-                        if (tempBox && tempBox.parentNode) tempBox.remove();
-                    }
-                };
-
-                const request = { paginationV1: true, mode: 'newer', afterId, limit: getChatVirtualOlderChunkSize(), requestId };
-                try {
-                    if (typeof socketChat.timeout === 'function') {
-                        socketChat.timeout(9000).emit('request_chat_history', request, (err, response) => {
-                            if (err) { finish(false); return; }
-                            applyPage(response);
-                        });
-                    } else {
-                        let acked = false;
-                        socketChat.emit('request_chat_history', request, response => { acked = true; applyPage(response); });
-                        setTimeout(() => { if (!acked) finish(false); }, 9000);
-                    }
-                } catch (e) {
-                    finish(false);
-                }
-            });
-        }
 
         const currentEnd = Math.max(0, Number(window.__chatVirtualEndIndex || 0));
         if (!currentEnd || currentEnd >= history.length) return Promise.resolve(false);
@@ -39022,7 +38634,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
             liveBox.style.removeProperty('transition');
             liveBox.style.setProperty('scroll-behavior', 'auto', 'important');
             if (shouldShowPreparingMessages) {
-                liveBox.innerHTML = (window.__chatServerPaginationActive === true && window.__chatServerHasMoreOlder === true ? '' : getChatWelcomeBannerHtml()) + getChatHistoryLoadingHtml('Preparing messages');
+                liveBox.innerHTML = getChatWelcomeBannerHtml() + getChatHistoryLoadingHtml('Preparing messages');
                 applyChatHistoryLoadingInterfaceText(liveBox.querySelector('#chat-history-loading'), 'Preparing messages');
             }
 
@@ -39048,7 +38660,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
                 tempBox.id = 'chat-messages';
                 tempBox.className = liveBox.className || '';
                 tempBox.style.cssText = `position:fixed !important; left:-99999px !important; top:0 !important; width:${Math.max(320, liveBox.clientWidth || 320)}px !important; height:${Math.max(320, liveBox.clientHeight || 320)}px !important; overflow:hidden !important; visibility:hidden !important; opacity:0 !important; pointer-events:none !important; scroll-behavior:auto !important;`;
-                tempBox.innerHTML = window.__chatServerPaginationActive === true && window.__chatServerHasMoreOlder === true ? '' : getChatWelcomeBannerHtml();
+                tempBox.innerHTML = getChatWelcomeBannerHtml();
                 document.body.appendChild(tempBox);
                 return tempBox;
             };
@@ -40968,16 +40580,6 @@ function getVisibleChatStackEl(id) {
 			markChatManualJumpActive(options.manualJumpGuardMs || 2400);
 		}
 		let target = typeof getRenderedChatMessageRow === 'function' ? getRenderedChatMessageRow(msgId, targetIndex) : document.getElementById(`msg-row-${msgId}`);
-		if (!target && options.skipMissingRender !== true && targetIndex < 0 && window.__chatServerPaginationActive === true && typeof requestChatMessageWindow === 'function') {
-			requestChatMessageWindow(msgId, {
-				loadingText: options.loadingText || 'Loading message',
-				minLoadingVisibleMs: options.minLoadingVisibleMs,
-				manualJumpGuardMs: options.manualJumpGuardMs,
-				anchorLockMs: options.anchorLockMs,
-				matchData: options.matchData || null
-			});
-			return true;
-		}
 		if (!target && options.skipMissingRender !== true && Array.isArray(window.messageHistory)) {
 			const currentStart = Number(window.__chatVirtualStartIndex || 0);
 			if (targetIndex > -1 && typeof renderChatWindowAroundIndex === 'function') {
@@ -46369,16 +45971,9 @@ function getVisibleChatStackEl(id) {
         });
 
         socketChat.on('chat_history', function(history, respond) {
-            const pageMeta = history && !Array.isArray(history) && history.paginationV1 === true ? history : null;
-            const messages = pageMeta ? pageMeta.messages : history;
-            const result = handleChatHistorySnapshot(messages, respond, pageMeta);
-            if (!pageMeta || pageMeta.paginationV1 !== true) scheduleChatPersistentCacheWrite();
+            const result = handleChatHistorySnapshot(history, respond);
+            scheduleChatPersistentCacheWrite();
             return result;
-        });
-
-        socketChat.on('chat_history_page', function(page) {
-            if (!page || page.paginationV1 !== true || page.success === false) return;
-            if (page.mode === 'latest') handleChatHistorySnapshot(page.messages || [], null, page);
         });
 
 		socketChat.on('chat_message', function(data) {
@@ -46850,10 +46445,6 @@ function getVisibleChatStackEl(id) {
 			window.__chatCacheEpoch = String(data.chatEpoch || '');
 			window.__chatCacheRevision = Math.max(0, Number(data.chatRevision) || 0);
 			window.__chatSeenCursor = 0;
-			window.__chatServerPaginationActive = false;
-			window.__chatServerHasMoreOlder = false;
-			window.__chatServerOldestId = 0;
-			window.__chatServerNewestId = 0;
 			window.__chatVirtualStartIndex = 0;
 			window.__chatVirtualEndIndex = 0;
 			const box = document.getElementById('chat-messages');
@@ -48634,42 +48225,6 @@ function getVisibleChatStackEl(id) {
             if (isManualClick) {
                 jumpToUnreadDivider();
                 setJumpBottomButtonVisible(true);
-            }
-            return;
-        }
-
-        if (window.__chatServerPaginationActive === true && window.__chatServerHasMoreNewer === true && typeof socketChat !== 'undefined' && socketChat && socketChat.connected) {
-            if (typeof showChatJumpLoading === 'function') showChatJumpLoading('Loading latest messages');
-            const requestId = `latest-jump-${Date.now()}-${++window.__chatServerPageRequestSeq}`;
-            const request = { paginationV1: true, mode: 'latest', limit: getChatVirtualInitialLimit(), requestId };
-            const applyLatest = response => {
-                if (!response || response.success === false || response.paginationV1 !== true || !Array.isArray(response.messages)) {
-                    if (typeof hideChatJumpLoading === 'function') hideChatJumpLoading(0);
-                    return;
-                }
-                Promise.resolve(handleChatHistorySnapshot(response.messages, null, response)).then(() => {
-                    const latestBox = document.getElementById('chat-messages');
-                    if (latestBox) {
-                        latestBox.style.setProperty('scroll-behavior', 'auto', 'important');
-                        latestBox.scrollTop = latestBox.scrollHeight;
-                        setTimeout(() => latestBox.style.setProperty('scroll-behavior', 'smooth'), 80);
-                    }
-                    setJumpBottomButtonVisible(false);
-                    if (typeof hideChatJumpLoading === 'function') hideChatJumpLoading(240);
-                    setTimeout(() => { if (typeof refreshChatNotificationDot === 'function') refreshChatNotificationDot(); }, 350);
-                });
-            };
-            try {
-                if (typeof socketChat.timeout === 'function') {
-                    socketChat.timeout(9000).emit('request_chat_history', request, (err, response) => {
-                        if (err) { if (typeof hideChatJumpLoading === 'function') hideChatJumpLoading(0); return; }
-                        applyLatest(response);
-                    });
-                } else {
-                    socketChat.emit('request_chat_history', request, applyLatest);
-                }
-            } catch (e) {
-                if (typeof hideChatJumpLoading === 'function') hideChatJumpLoading(0);
             }
             return;
         }
