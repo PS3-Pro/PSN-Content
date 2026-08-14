@@ -36988,9 +36988,17 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
     window.__chatLazyInlineRemoveTimer = null;
     window.__chatServerPaginationActive = false;
     window.__chatServerHasMoreOlder = false;
+    window.__chatServerHasMoreNewer = false;
     window.__chatServerOldestId = 0;
     window.__chatServerNewestId = 0;
     window.__chatServerPageRequestSeq = 0;
+    window.__chatCacheEpoch = '';
+    window.__chatCacheRevision = 0;
+    window.__chatSeenCursor = 0;
+    window.__chatCacheHydratedUser = '';
+    window.__chatCacheHydratePromise = null;
+    window.__chatCacheWriteTimer = null;
+    window.__chatSyncRequestPromise = null;
 
     function markChatUiStableAfterRender() {
         const now = Date.now();
@@ -37420,58 +37428,54 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 
     function requestChatHistoryNow(reason = 'open-chat') {
         if (!(typeof socketChat !== 'undefined' && socketChat && socketChat.connected)) return false;
-        if (window.__chatHistoryRequesting === true) return false;
+        if (window.__chatHistoryRequesting === true || window.__chatSyncRequestPromise) return false;
         const now = Date.now();
-        if (window.__lastChatHistoryRequestAt && now - window.__lastChatHistoryRequestAt < 900) return false;
+        if (window.__lastChatHistoryRequestAt && now - window.__lastChatHistoryRequestAt < 700) return false;
         window.__lastChatHistoryRequestAt = now;
         window.__chatHistoryRequesting = true;
         clearTimeout(window.__chatHistoryRequestWatchdog);
+
+        const run = (async () => {
+            await hydrateChatHistoryFromPersistentCache({ renderIfVisible: true });
+            const request = {
+                syncV1: true,
+                epoch: String(window.__chatCacheEpoch || ''),
+                revision: Math.max(0, Number(window.__chatCacheRevision) || 0),
+                seenCursor: Math.max(0, Number(window.__chatSeenCursor) || 0),
+                reason,
+                at: Date.now()
+            };
+            const syncResponse = await new Promise(resolve => {
+                let settled = false;
+                const finish = value => { if (!settled) { settled = true; resolve(value || null); } };
+                try {
+                    if (typeof socketChat.timeout === 'function') socketChat.timeout(6500).emit('request_chat_sync', request, (err, response) => finish(err ? null : response));
+                    else {
+                        socketChat.emit('request_chat_sync', request, response => finish(response));
+                        setTimeout(() => finish(null), 6500);
+                    }
+                } catch (err) { finish(null); }
+            });
+            if (syncResponse && syncResponse.syncV1 === true && syncResponse.success !== false) {
+                applyChatSyncResponse(syncResponse);
+                return true;
+            }
+            try {
+                socketChat.emit('request_chat_history', { reason, at: Date.now() });
+                return true;
+            } catch (err) { return false; }
+        })().finally(() => {
+            window.__chatSyncRequestPromise = null;
+            if (window.__chatHistoryReceived !== true) window.__chatHistoryRequesting = false;
+        });
+
+        window.__chatSyncRequestPromise = run;
         window.__chatHistoryRequestWatchdog = setTimeout(() => {
             if (window.__chatHistoryReceived === true || window.__chatHistoryRequesting !== true) return;
             window.__chatHistoryRequesting = false;
             window.__chatHistoryRequestRetries = Math.min(2, Number(window.__chatHistoryRequestRetries || 0) + 1);
-            if (window.__chatHistoryRequestRetries <= 2 && typeof isChatScreenVisibleForRead === 'function' && isChatScreenVisibleForRead()) {
-                requestChatHistoryNow('history-timeout-retry');
-            }
+            if (window.__chatHistoryRequestRetries <= 2 && typeof isChatScreenVisibleForRead === 'function' && isChatScreenVisibleForRead()) requestChatHistoryNow('history-timeout-retry');
         }, 12000);
-
-        const requestId = `latest-${Date.now()}-${++window.__chatServerPageRequestSeq}`;
-        const request = { reason, at: now, paginationV1: true, mode: 'latest', limit: getChatVirtualInitialLimit(), requestId };
-        let settled = false;
-
-        const acceptPage = response => {
-            if (!response || response.success === false || response.paginationV1 !== true || !Array.isArray(response.messages)) return false;
-            settled = true;
-            window.__chatServerPaginationActive = true;
-            if (typeof handleChatHistorySnapshot === 'function') handleChatHistorySnapshot(response.messages, null, response);
-            return true;
-        };
-
-        const fallbackLegacy = () => {
-            if (settled || window.__chatHistoryReceived === true) return;
-            settled = true;
-            window.__chatServerPaginationActive = false;
-            try { socketChat.emit('request_chat_history', { reason, at: Date.now() }); } catch (e) {
-                window.__chatHistoryRequesting = false;
-            }
-        };
-
-        try {
-            if (typeof socketChat.timeout === 'function') {
-                socketChat.timeout(5000).emit('request_chat_history', request, (err, response) => {
-                    if (!err && acceptPage(response)) return;
-                    fallbackLegacy();
-                });
-            } else {
-                socketChat.emit('request_chat_history', request, response => {
-                    if (acceptPage(response)) return;
-                    fallbackLegacy();
-                });
-                setTimeout(fallbackLegacy, 5000);
-            }
-        } catch (e) {
-            fallbackLegacy();
-        }
         return true;
     }
 
@@ -37530,12 +37534,272 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
         });
     }
 
+    const CHAT_CACHE_DB_NAME = 'psn-chat-history-cache-v1';
+    const CHAT_CACHE_DB_VERSION = 1;
+    const CHAT_CACHE_STORE = 'history';
+
+    function getChatCacheUserName() {
+        const value = localStorage.getItem('psn_username') || '';
+        return value && value !== 'null' && value !== 'undefined' ? value : '';
+    }
+
+    function openChatPersistentCacheDb() {
+        if (!('indexedDB' in window)) return Promise.resolve(null);
+        if (window.__chatCacheDbPromise) return window.__chatCacheDbPromise;
+        window.__chatCacheDbPromise = new Promise(resolve => {
+            let request;
+            try { request = indexedDB.open(CHAT_CACHE_DB_NAME, CHAT_CACHE_DB_VERSION); }
+            catch (err) { resolve(null); return; }
+            request.onupgradeneeded = () => {
+                const db = request.result;
+                if (!db.objectStoreNames.contains(CHAT_CACHE_STORE)) db.createObjectStore(CHAT_CACHE_STORE, { keyPath: 'user' });
+            };
+            request.onsuccess = () => resolve(request.result);
+            request.onerror = () => resolve(null);
+            request.onblocked = () => resolve(null);
+        });
+        return window.__chatCacheDbPromise;
+    }
+
+    async function readChatPersistentCache(userName = getChatCacheUserName()) {
+        if (!userName) return null;
+        const db = await openChatPersistentCacheDb();
+        if (!db) return null;
+        return new Promise(resolve => {
+            try {
+                const tx = db.transaction(CHAT_CACHE_STORE, 'readonly');
+                const req = tx.objectStore(CHAT_CACHE_STORE).get(userName);
+                req.onsuccess = () => resolve(req.result || null);
+                req.onerror = () => resolve(null);
+            } catch (err) { resolve(null); }
+        });
+    }
+
+    async function writeChatPersistentCacheNow() {
+        const userName = getChatCacheUserName();
+        if (!userName) return false;
+        const db = await openChatPersistentCacheDb();
+        if (!db) return false;
+        const record = {
+            user: userName,
+            epoch: String(window.__chatCacheEpoch || ''),
+            revision: Math.max(0, Number(window.__chatCacheRevision) || 0),
+            seenCursor: Math.max(0, Number(window.__chatSeenCursor) || 0),
+            messages: normalizeChatHistoryPayload(window.messageHistory || []).slice(-MAX_CHAT_HISTORY),
+            savedAt: Date.now()
+        };
+        return new Promise(resolve => {
+            try {
+                const tx = db.transaction(CHAT_CACHE_STORE, 'readwrite');
+                tx.objectStore(CHAT_CACHE_STORE).put(record);
+                tx.oncomplete = () => resolve(true);
+                tx.onerror = () => resolve(false);
+                tx.onabort = () => resolve(false);
+            } catch (err) { resolve(false); }
+        });
+    }
+
+    function scheduleChatPersistentCacheWrite(delay = 220) {
+        clearTimeout(window.__chatCacheWriteTimer);
+        window.__chatCacheWriteTimer = setTimeout(() => {
+            window.__chatCacheWriteTimer = null;
+            writeChatPersistentCacheNow().catch(() => {});
+        }, Math.max(0, Number(delay) || 0));
+    }
+    window.scheduleChatPersistentCacheWrite = scheduleChatPersistentCacheWrite;
+
+    async function deleteChatPersistentCacheForUser(userName = getChatCacheUserName()) {
+        if (!userName) return false;
+        const db = await openChatPersistentCacheDb();
+        if (!db) return false;
+        return new Promise(resolve => {
+            try {
+                const tx = db.transaction(CHAT_CACHE_STORE, 'readwrite');
+                tx.objectStore(CHAT_CACHE_STORE).delete(userName);
+                tx.oncomplete = () => resolve(true);
+                tx.onerror = () => resolve(false);
+                tx.onabort = () => resolve(false);
+            } catch (err) { resolve(false); }
+        });
+    }
+    window.deleteChatPersistentCacheForUser = deleteChatPersistentCacheForUser;
+
+    function mergeChatSyncChanges(history = [], changes = []) {
+        let merged = normalizeChatHistoryPayload(history || []).slice();
+        (Array.isArray(changes) ? changes : []).forEach(change => {
+            if (!change || typeof change !== 'object') return;
+            const msgId = String(change.msgId || '');
+            if (String(change.type || '') === 'delete') {
+                merged = merged.filter(msg => String(new Date(msg && msg.time).getTime()) !== msgId);
+                return;
+            }
+            if (String(change.type || '') !== 'upsert' || !change.message) return;
+            const incoming = normalizeChatHistoryPayload([change.message])[0] || change.message;
+            const incomingId = String(new Date(incoming && incoming.time).getTime() || msgId);
+            const index = merged.findIndex(msg => String(new Date(msg && msg.time).getTime()) === incomingId);
+            if (index > -1) merged[index] = incoming;
+            else merged.push(incoming);
+        });
+        merged.sort((a, b) => (new Date(a && a.time).getTime() || 0) - (new Date(b && b.time).getTime() || 0));
+        return normalizeChatHistoryPayload(merged).slice(-MAX_CHAT_HISTORY);
+    }
+
+    function applyChatSeenEventsToHistory(history = [], events = []) {
+        const target = Array.isArray(history) ? history : [];
+        (Array.isArray(events) ? events : []).forEach(event => {
+            if (!event || typeof event !== 'object') return;
+            const msgId = String(event.msgId || '');
+            const reader = String(event.reader || '');
+            if (!msgId || !reader) return;
+            const msg = target.find(item => String(new Date(item && item.time).getTime()) === msgId);
+            if (!msg) return;
+            if (!Array.isArray(msg.seenBy)) msg.seenBy = [];
+            if (!msg.seenBy.includes(reader)) msg.seenBy.push(reader);
+            if (!msg.seenAt || typeof msg.seenAt !== 'object' || Array.isArray(msg.seenAt)) msg.seenAt = {};
+            if (event.seenAt) msg.seenAt[reader] = String(event.seenAt);
+        });
+        return target;
+    }
+    window.applyChatSeenEventsToHistory = applyChatSeenEventsToHistory;
+
+    function refreshChatSeenDomForMessage(msgId) {
+        const id = String(msgId || '');
+        if (!id) return;
+        const msg = Array.isArray(window.messageHistory) ? window.messageHistory.find(item => String(new Date(item && item.time).getTime()) === id) : null;
+        const checkCont = document.getElementById(`check-${id}`);
+        if (!msg || !checkCont) return;
+        const seenList = Array.isArray(msg.seenBy) ? msg.seenBy : [];
+        const seenAtMap = msg.seenAt && typeof msg.seenAt === 'object' && !Array.isArray(msg.seenAt) ? msg.seenAt : {};
+        checkCont.querySelectorAll('i').forEach(c => { c.style.color = '#4caf50'; if (seenList.length) c.style.display = 'block'; });
+        checkCont.setAttribute('data-seen-list', seenList.join(', '));
+        checkCont.setAttribute('data-seen-count', String(seenList.length));
+        checkCont.setAttribute('data-seen-at', encodeURIComponent(JSON.stringify(seenAtMap)));
+        checkCont.setAttribute('title', `Seen by: ${seenList.length}`);
+    }
+    window.refreshChatSeenDomForMessage = refreshChatSeenDomForMessage;
+
+    function applyRealtimeChatSeenChange(event = {}) {
+        if (!event || event.seenSyncV1 !== true) return false;
+        const cursor = Math.max(0, Number(event.cursor) || 0);
+        if (cursor && cursor <= Math.max(0, Number(window.__chatSeenCursor) || 0)) return true;
+        applyChatSeenEventsToHistory(window.messageHistory || [], [event]);
+        if (cursor) window.__chatSeenCursor = cursor;
+        refreshChatSeenDomForMessage(event.msgId);
+        scheduleChatPersistentCacheWrite();
+        return true;
+    }
+    window.applyRealtimeChatSeenChange = applyRealtimeChatSeenChange;
+
+    async function hydrateChatHistoryFromPersistentCache(options = {}) {
+        const userName = getChatCacheUserName();
+        if (!userName) return null;
+        if (window.__chatCacheHydratedUser === userName) return { hydrated: true, cached: true };
+        if (window.__chatCacheHydratePromise) return window.__chatCacheHydratePromise;
+        window.__chatCacheHydratePromise = (async () => {
+            const record = await readChatPersistentCache(userName);
+            window.__chatCacheHydratedUser = userName;
+            if (!record || !Array.isArray(record.messages)) {
+                window.__chatCacheEpoch = '';
+                window.__chatCacheRevision = 0;
+                window.__chatSeenCursor = 0;
+                return { hydrated: true, cached: false };
+            }
+            const cachedHistory = normalizeChatHistoryPayload(record.messages).slice(-MAX_CHAT_HISTORY);
+            window.__chatCacheEpoch = String(record.epoch || '');
+            window.__chatCacheRevision = Math.max(0, Number(record.revision) || 0);
+            window.__chatSeenCursor = Math.max(0, Number(record.seenCursor) || 0);
+            window.messageHistory = cachedHistory;
+            window.__chatServerPaginationActive = false;
+            window.__chatVirtualStartIndex = Math.max(0, cachedHistory.length - getChatVirtualInitialLimit());
+            window.__chatVirtualEndIndex = cachedHistory.length;
+            window.__chatHistoryDomRendered = false;
+            if (typeof registerChatUsersFromHistory === 'function') registerChatUsersFromHistory(cachedHistory);
+            if (typeof updateChatHistoryRenderSignature === 'function') updateChatHistoryRenderSignature();
+            if (options.renderIfVisible !== false && typeof isChatScreenVisibleForRead === 'function' && isChatScreenVisibleForRead() && typeof renderDeferredChatHistory === 'function') {
+                Promise.resolve(renderDeferredChatHistory({ reason: 'chat-cache', force: true, forceBottom: false, showLoading: false })).catch(() => {});
+            }
+            return { hydrated: true, cached: true, messages: cachedHistory.length };
+        })().finally(() => { window.__chatCacheHydratePromise = null; });
+        return window.__chatCacheHydratePromise;
+    }
+    window.hydrateChatHistoryFromPersistentCache = hydrateChatHistoryFromPersistentCache;
+
+    function applyChatSyncResponse(response = {}) {
+        if (!response || response.syncV1 !== true || response.success === false) return false;
+        const mode = String(response.mode || 'changes');
+        const nextHistory = mode === 'snapshot'
+            ? normalizeChatHistoryPayload(response.messages || []).slice(-MAX_CHAT_HISTORY)
+            : mergeChatSyncChanges(window.messageHistory || [], response.changes || []);
+        applyChatSeenEventsToHistory(nextHistory, response.seenEvents || []);
+        window.__chatCacheEpoch = String(response.epoch || '');
+        window.__chatCacheRevision = Math.max(0, Number(response.revision) || 0);
+        if (response.seenSyncV1 === true) window.__chatSeenCursor = Math.max(0, Number(response.seenCursor) || 0);
+        window.__chatServerPaginationActive = false;
+        window.__chatServerHasMoreOlder = false;
+        window.__chatServerHasMoreNewer = false;
+        const hasMessageChanges = mode === 'snapshot' || (Array.isArray(response.changes) && response.changes.length > 0);
+        if (hasMessageChanges) handleChatHistorySnapshot(nextHistory, null, { chatSyncV1: true, mode });
+        else {
+            window.messageHistory = nextHistory;
+            window.__chatHistoryReceived = true;
+            window.__chatHistoryRequesting = false;
+            window.__chatHistoryRequestRetries = 0;
+            clearTimeout(window.__chatHistoryRequestWatchdog);
+            if (typeof updateChatHistoryRenderSignature === 'function') updateChatHistoryRenderSignature();
+            const seenIds = new Set((Array.isArray(response.seenEvents) ? response.seenEvents : []).map(event => String(event && event.msgId || '')).filter(Boolean));
+            seenIds.forEach(id => refreshChatSeenDomForMessage(id));
+        }
+        scheduleChatPersistentCacheWrite(0);
+        return true;
+    }
+    window.applyChatSyncResponse = applyChatSyncResponse;
+
+    function applyRealtimeChatSyncChange(change = {}) {
+        if (!change || change.syncV1 !== true || !change.epoch) return false;
+        const incomingEpoch = String(change.epoch || '');
+        const incomingRevision = Math.max(0, Number(change.revision) || 0);
+        const currentEpoch = String(window.__chatCacheEpoch || '');
+        const currentRevision = Math.max(0, Number(window.__chatCacheRevision) || 0);
+        if (!currentEpoch || currentEpoch !== incomingEpoch || incomingRevision > currentRevision + 1) {
+            window.__chatHistoryReceived = false;
+            window.__chatHistoryRequesting = false;
+            setTimeout(() => { if (typeof requestChatHistoryNow === 'function') requestChatHistoryNow('chat-sync-gap'); }, 0);
+            return false;
+        }
+        if (incomingRevision <= currentRevision) return true;
+        window.messageHistory = mergeChatSyncChanges(window.messageHistory || [], [change]);
+        window.__chatCacheEpoch = incomingEpoch;
+        window.__chatCacheRevision = incomingRevision;
+        if (typeof updateChatHistoryRenderSignature === 'function') updateChatHistoryRenderSignature();
+        scheduleChatPersistentCacheWrite();
+        return true;
+    }
+    window.applyRealtimeChatSyncChange = applyRealtimeChatSyncChange;
+    setTimeout(() => { hydrateChatHistoryFromPersistentCache({ renderIfVisible: true }).catch(() => {}); }, 0);
+
+
     function applyChatServerPaginationMeta(page = {}) {
         if (!page || page.paginationV1 !== true) return false;
         window.__chatServerPaginationActive = true;
-        window.__chatServerHasMoreOlder = page.hasMoreOlder === true;
-        window.__chatServerOldestId = Math.max(0, Number(page.oldestId) || 0);
-        if (page.mode !== 'older' || !Number(window.__chatServerNewestId || 0)) window.__chatServerNewestId = Math.max(0, Number(page.newestId) || 0);
+        const mode = String(page.mode || 'latest').toLowerCase();
+
+        if (mode === 'latest') {
+            window.__chatServerHasMoreOlder = page.hasMoreOlder === true;
+            window.__chatServerHasMoreNewer = false;
+            window.__chatServerOldestId = Math.max(0, Number(page.oldestId) || 0);
+            window.__chatServerNewestId = Math.max(0, Number(page.newestId) || 0);
+        } else if (mode === 'older') {
+            window.__chatServerHasMoreOlder = page.hasMoreOlder === true;
+            window.__chatServerOldestId = Math.max(0, Number(page.oldestId) || window.__chatServerOldestId || 0);
+        } else if (mode === 'newer') {
+            window.__chatServerHasMoreNewer = page.hasMoreNewer === true;
+            window.__chatServerNewestId = Math.max(0, Number(page.newestId) || window.__chatServerNewestId || 0);
+        } else if (mode === 'around') {
+            window.__chatServerHasMoreOlder = page.hasMoreOlder === true;
+            window.__chatServerHasMoreNewer = page.hasMoreNewer === true;
+            window.__chatServerOldestId = Math.max(0, Number(page.oldestId) || 0);
+            window.__chatServerNewestId = Math.max(0, Number(page.newestId) || 0);
+        }
         return true;
     }
     window.applyChatServerPaginationMeta = applyChatServerPaginationMeta;
@@ -38273,10 +38537,231 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
     }
     window.renderChatWindowAroundMessage = renderChatWindowAroundMessage;
 
+    window.__chatJumpFetchInFlight = null;
+    window.__chatJumpFetchTarget = '';
+
+    function requestChatMessageWindow(msgId, options = {}) {
+        const id = String(msgId || '');
+        if (!id || window.__chatServerPaginationActive !== true) return Promise.resolve(false);
+        if (!(typeof socketChat !== 'undefined' && socketChat && socketChat.connected)) return Promise.resolve(false);
+
+        if (window.__chatJumpFetchInFlight && window.__chatJumpFetchTarget === id) return window.__chatJumpFetchInFlight;
+        if (window.__chatJumpFetchInFlight) return Promise.resolve(false);
+
+        const loadingText = options.loadingText || 'Loading message';
+        const requestId = `around-${id}-${Date.now()}-${++window.__chatServerPageRequestSeq}`;
+        const request = {
+            paginationV1: true,
+            mode: 'around',
+            targetMsgId: id,
+            limit: Math.max(getChatVirtualInitialLimit(), Number(options.limit || 0) || 0),
+            requestId
+        };
+
+        if (typeof markChatManualJumpActive === 'function') markChatManualJumpActive(options.manualJumpGuardMs || 4200);
+        if (typeof showChatJumpLoading === 'function') showChatJumpLoading(loadingText);
+
+        const run = new Promise(resolve => {
+            let settled = false;
+            const finish = value => {
+                if (settled) return;
+                settled = true;
+                if (typeof hideChatJumpLoading === 'function') hideChatJumpLoading(Number(options.minLoadingVisibleMs || 320));
+                resolve(value);
+            };
+
+            const applyWindow = response => {
+                if (!response || response.success === false || response.paginationV1 !== true || response.mode !== 'around' || !Array.isArray(response.messages)) {
+                    finish(false);
+                    return;
+                }
+
+                const incoming = normalizeChatHistoryPayload(response.messages);
+                if (!incoming.length) {
+                    finish(false);
+                    return;
+                }
+
+                window.messageHistory = incoming;
+                applyChatServerPaginationMeta(response);
+                window.__chatVirtualStartIndex = 0;
+                window.__chatVirtualEndIndex = incoming.length;
+                window.__chatHistoryDomRendered = false;
+                if (typeof registerChatUsersFromHistory === 'function') registerChatUsersFromHistory(incoming);
+                if (typeof updateChatHistoryRenderSignature === 'function') updateChatHistoryRenderSignature();
+
+                let targetIndex = Number.isFinite(Number(response.targetIndex)) ? Number(response.targetIndex) : -1;
+                if (targetIndex < 0 || targetIndex >= incoming.length || getChatMessageTimeKey(incoming[targetIndex]) !== id) {
+                    targetIndex = typeof getChatMessageIndexById === 'function' ? getChatMessageIndexById(id, options.matchData || null) : -1;
+                }
+                if (targetIndex < 0) {
+                    finish(false);
+                    return;
+                }
+
+                renderChatWindowAroundIndex(targetIndex, {
+                    align: 'center',
+                    limit: incoming.length,
+                    showLoading: false,
+                    animateMessages: false
+                }).then(ok => {
+                    if (!ok) {
+                        finish(false);
+                        return;
+                    }
+                    const jumped = scrollToMessage(id, {
+                        skipMissingRender: true,
+                        skipManualJumpGuard: true,
+                        targetIndex,
+                        matchData: options.matchData || null,
+                        manualJumpGuardMs: options.manualJumpGuardMs || 4200,
+                        anchorLockMs: options.anchorLockMs || 4200,
+                        instant: true
+                    });
+                    finish(jumped !== false);
+                }).catch(() => finish(false));
+            };
+
+            try {
+                if (typeof socketChat.timeout === 'function') {
+                    socketChat.timeout(9000).emit('request_chat_history', request, (err, response) => {
+                        if (err) { finish(false); return; }
+                        applyWindow(response);
+                    });
+                } else {
+                    let acked = false;
+                    socketChat.emit('request_chat_history', request, response => {
+                        acked = true;
+                        applyWindow(response);
+                    });
+                    setTimeout(() => { if (!acked) finish(false); }, 9000);
+                }
+            } catch (e) {
+                finish(false);
+            }
+        });
+
+        window.__chatJumpFetchTarget = id;
+        window.__chatJumpFetchInFlight = run.finally(() => {
+            window.__chatJumpFetchInFlight = null;
+            window.__chatJumpFetchTarget = '';
+        });
+        return window.__chatJumpFetchInFlight;
+    }
+    window.requestChatMessageWindow = requestChatMessageWindow;
+
     function loadNewerChatMessages(reason = 'scroll-bottom', options = {}) {
         const box = document.getElementById('chat-messages');
         const history = Array.isArray(window.messageHistory) ? window.messageHistory : [];
         if (!box || !history.length || window.__chatVirtualLoadingNewer || window.__chatVirtualWindowRendering || window.__chatLazyRenderPromise || window.__chatDetachedRenderingActive || window.__chatSearchActive) return Promise.resolve(false);
+
+        if (window.__chatServerPaginationActive === true) {
+            if (window.__chatServerHasMoreNewer !== true || Number(window.__chatServerNewestId || 0) <= 0) return Promise.resolve(false);
+            if (!(typeof socketChat !== 'undefined' && socketChat && socketChat.connected)) return Promise.resolve(false);
+
+            const afterId = Math.max(0, Number(window.__chatServerNewestId || 0));
+            const requestId = `newer-${afterId}-${Date.now()}-${++window.__chatServerPageRequestSeq}`;
+            window.__chatVirtualLoadingNewer = true;
+
+            return new Promise(resolve => {
+                let finished = false;
+                const finish = value => {
+                    if (finished) return;
+                    finished = true;
+                    window.__chatVirtualLoadingNewer = false;
+                    resolve(value);
+                };
+
+                const applyPage = response => {
+                    if (!response || response.success === false || response.paginationV1 !== true || response.mode !== 'newer' || !Array.isArray(response.messages)) {
+                        finish(false);
+                        return;
+                    }
+
+                    const incoming = normalizeChatHistoryPayload(response.messages);
+                    const existingKeys = new Set(history.map(getChatMessageTimeKey));
+                    const uniqueIncoming = incoming.filter(msg => {
+                        const key = getChatMessageTimeKey(msg);
+                        return key && !existingKeys.has(key);
+                    });
+
+                    applyChatServerPaginationMeta(response);
+                    if (!uniqueIncoming.length) {
+                        finish(false);
+                        return;
+                    }
+
+                    const combined = history.concat(uniqueIncoming);
+                    const oldLength = history.length;
+                    window.messageHistory = combined;
+                    if (typeof registerChatUsersFromHistory === 'function') registerChatUsersFromHistory(uniqueIncoming);
+
+                    const previousScrollTop = box.scrollTop;
+                    const myName = localStorage.getItem('psn_username') || 'Guest';
+                    const lastReadTime = parseInt(loadState('psn_last_chat_read') || 0) || 0;
+                    const firstUnreadIndex = getChatFirstUnreadIndex(combined, lastReadTime, myName);
+                    const renderedTimes = getChatRenderedRowTimes(box);
+                    const lastRenderedTime = renderedTimes.length ? renderedTimes[renderedTimes.length - 1] : 0;
+                    const initialRawDate = lastRenderedTime ? new Date(lastRenderedTime).toDateString() : '';
+
+                    let tempBox = null;
+                    try {
+                        tempBox = document.createElement('div');
+                        tempBox.className = box.className || '';
+                        tempBox.style.cssText = `position:fixed !important; left:-99999px !important; top:0 !important; width:${Math.max(320, box.clientWidth || 320)}px !important; height:${Math.max(320, box.clientHeight || 320)}px !important; overflow:hidden !important; visibility:hidden !important; opacity:0 !important; pointer-events:none !important; scroll-behavior:auto !important;`;
+                        document.body.appendChild(tempBox);
+
+                        renderChatHistorySliceToActiveBox(combined, oldLength, combined.length, {
+                            targetBox: tempBox,
+                            myName,
+                            lastReadTime,
+                            firstUnreadIndex,
+                            allowUnreadDivider: true,
+                            initialRawDate,
+                            animateMessages: false
+                        });
+
+                        const fragment = document.createDocumentFragment();
+                        while (tempBox.firstChild) fragment.appendChild(tempBox.firstChild);
+                        box.appendChild(fragment);
+                        normalizeChatDateDividers(box);
+                        window.__chatVirtualStartIndex = 0;
+                        window.__chatVirtualEndIndex = combined.length;
+                        window.__chatHistoryDomRendered = true;
+                        if (typeof updateChatHistoryRenderSignature === 'function') updateChatHistoryRenderSignature();
+                        refreshChatLastRawDateFromRendered();
+                        if (options.stickToBottom) box.scrollTop = box.scrollHeight;
+                        else box.scrollTop = previousScrollTop;
+                        if (typeof initDateStickyLogic === 'function') initDateStickyLogic();
+                        if (typeof setupDividerAutoRemove === 'function') setupDividerAutoRemove();
+                        if (typeof refreshMentionJumpButton === 'function') refreshMentionJumpButton();
+                        finish(true);
+                    } catch (err) {
+                        console.error('[chat] server newer page render failed:', err);
+                        finish(false);
+                    } finally {
+                        if (tempBox && tempBox.parentNode) tempBox.remove();
+                    }
+                };
+
+                const request = { paginationV1: true, mode: 'newer', afterId, limit: getChatVirtualOlderChunkSize(), requestId };
+                try {
+                    if (typeof socketChat.timeout === 'function') {
+                        socketChat.timeout(9000).emit('request_chat_history', request, (err, response) => {
+                            if (err) { finish(false); return; }
+                            applyPage(response);
+                        });
+                    } else {
+                        let acked = false;
+                        socketChat.emit('request_chat_history', request, response => { acked = true; applyPage(response); });
+                        setTimeout(() => { if (!acked) finish(false); }, 9000);
+                    }
+                } catch (e) {
+                    finish(false);
+                }
+            });
+        }
+
         const currentEnd = Math.max(0, Number(window.__chatVirtualEndIndex || 0));
         if (!currentEnd || currentEnd >= history.length) return Promise.resolve(false);
 
@@ -40413,6 +40898,16 @@ function getVisibleChatStackEl(id) {
 			markChatManualJumpActive(options.manualJumpGuardMs || 2400);
 		}
 		let target = typeof getRenderedChatMessageRow === 'function' ? getRenderedChatMessageRow(msgId, targetIndex) : document.getElementById(`msg-row-${msgId}`);
+		if (!target && options.skipMissingRender !== true && targetIndex < 0 && window.__chatServerPaginationActive === true && typeof requestChatMessageWindow === 'function') {
+			requestChatMessageWindow(msgId, {
+				loadingText: options.loadingText || 'Loading message',
+				minLoadingVisibleMs: options.minLoadingVisibleMs,
+				manualJumpGuardMs: options.manualJumpGuardMs,
+				anchorLockMs: options.anchorLockMs,
+				matchData: options.matchData || null
+			});
+			return true;
+		}
 		if (!target && options.skipMissingRender !== true && Array.isArray(window.messageHistory)) {
 			const currentStart = Number(window.__chatVirtualStartIndex || 0);
 			if (targetIndex > -1 && typeof renderChatWindowAroundIndex === 'function') {
@@ -45795,10 +46290,20 @@ function getVisibleChatStackEl(id) {
 			}
 		});
 	
+        socketChat.on('chat_sync_change', function(change) {
+            if (typeof applyRealtimeChatSyncChange === 'function') applyRealtimeChatSyncChange(change || {});
+        });
+
+        socketChat.on('chat_seen_sync_change', function(event) {
+            if (typeof applyRealtimeChatSeenChange === 'function') applyRealtimeChatSeenChange(event || {});
+        });
+
         socketChat.on('chat_history', function(history, respond) {
             const pageMeta = history && !Array.isArray(history) && history.paginationV1 === true ? history : null;
             const messages = pageMeta ? pageMeta.messages : history;
-            return handleChatHistorySnapshot(messages, respond, pageMeta);
+            const result = handleChatHistorySnapshot(messages, respond, pageMeta);
+            if (!pageMeta || pageMeta.paginationV1 !== true) scheduleChatPersistentCacheWrite();
+            return result;
         });
 
         socketChat.on('chat_history_page', function(page) {
@@ -45817,6 +46322,7 @@ function getVisibleChatStackEl(id) {
 				window.__chatVirtualStartIndex = Math.max(0, Number(window.__chatVirtualStartIndex || 0) - 1);
 				window.__chatVirtualEndIndex = Math.max(window.__chatVirtualStartIndex, Number(window.__chatVirtualEndIndex || 0) - 1);
 			}
+			if (typeof scheduleChatPersistentCacheWrite === 'function') scheduleChatPersistentCacheWrite();
 		
 			if (typeof trackUser === 'function') trackUser(data.user);
 		
@@ -46171,6 +46677,7 @@ function getVisibleChatStackEl(id) {
 
 		socketChat.on('account_deleted', (data = {}) => {
 			const myName = localStorage.getItem('psn_username') || (typeof currentLoginUser !== 'undefined' ? currentLoginUser : '') || '';
+			if (myName && typeof deleteChatPersistentCacheForUser === 'function') deleteChatPersistentCacheForUser(myName).catch(() => {});
 			try {
 				if (myName && typeof getAllUsers === 'function' && typeof GLOBAL_USERS_KEY !== 'undefined') {
 					const users = getAllUsers().filter(user => user !== myName);
@@ -46264,6 +46771,10 @@ function getVisibleChatStackEl(id) {
 			}
 		
 			window.messageHistory = [];
+			window.__chatCacheEpoch = String(data.chatEpoch || '');
+			window.__chatCacheRevision = Math.max(0, Number(data.chatRevision) || 0);
+			window.__chatSeenCursor = 0;
+			window.__chatServerPaginationActive = false;
 			window.__chatServerHasMoreOlder = false;
 			window.__chatServerOldestId = 0;
 			window.__chatServerNewestId = 0;
@@ -46279,6 +46790,7 @@ function getVisibleChatStackEl(id) {
 					</div>`;
 			}
 			
+			if (typeof scheduleChatPersistentCacheWrite === 'function') scheduleChatPersistentCacheWrite(0);
 			if (typeof refreshChatNotificationDot === 'function') refreshChatNotificationDot();
 			if (isAdminPanelVisible && typeof renderAdminPanel === 'function') setTimeout(renderAdminPanel, 350);
 		});
@@ -46301,6 +46813,7 @@ function getVisibleChatStackEl(id) {
 					msg.seenAt = seenAtMap;
 				}
 			}
+			if (typeof scheduleChatPersistentCacheWrite === 'function') scheduleChatPersistentCacheWrite();
 		});
 		
 		socketChat.on('user_typing', (data) => {
@@ -48049,6 +48562,42 @@ function getVisibleChatStackEl(id) {
             return;
         }
 
+        if (window.__chatServerPaginationActive === true && window.__chatServerHasMoreNewer === true && typeof socketChat !== 'undefined' && socketChat && socketChat.connected) {
+            if (typeof showChatJumpLoading === 'function') showChatJumpLoading('Loading latest messages');
+            const requestId = `latest-jump-${Date.now()}-${++window.__chatServerPageRequestSeq}`;
+            const request = { paginationV1: true, mode: 'latest', limit: getChatVirtualInitialLimit(), requestId };
+            const applyLatest = response => {
+                if (!response || response.success === false || response.paginationV1 !== true || !Array.isArray(response.messages)) {
+                    if (typeof hideChatJumpLoading === 'function') hideChatJumpLoading(0);
+                    return;
+                }
+                Promise.resolve(handleChatHistorySnapshot(response.messages, null, response)).then(() => {
+                    const latestBox = document.getElementById('chat-messages');
+                    if (latestBox) {
+                        latestBox.style.setProperty('scroll-behavior', 'auto', 'important');
+                        latestBox.scrollTop = latestBox.scrollHeight;
+                        setTimeout(() => latestBox.style.setProperty('scroll-behavior', 'smooth'), 80);
+                    }
+                    setJumpBottomButtonVisible(false);
+                    if (typeof hideChatJumpLoading === 'function') hideChatJumpLoading(240);
+                    setTimeout(() => { if (typeof refreshChatNotificationDot === 'function') refreshChatNotificationDot(); }, 350);
+                });
+            };
+            try {
+                if (typeof socketChat.timeout === 'function') {
+                    socketChat.timeout(9000).emit('request_chat_history', request, (err, response) => {
+                        if (err) { if (typeof hideChatJumpLoading === 'function') hideChatJumpLoading(0); return; }
+                        applyLatest(response);
+                    });
+                } else {
+                    socketChat.emit('request_chat_history', request, applyLatest);
+                }
+            } catch (e) {
+                if (typeof hideChatJumpLoading === 'function') hideChatJumpLoading(0);
+            }
+            return;
+        }
+
         const history = Array.isArray(window.messageHistory) ? window.messageHistory : [];
         const virtualEnd = Number(window.__chatVirtualEndIndex || 0);
         if (history.length && virtualEnd > 0 && virtualEnd < history.length && typeof renderChatWindowAroundIndex === 'function') {
@@ -48070,7 +48619,7 @@ function getVisibleChatStackEl(id) {
         const nearBottom = isChatNearBottom(this, 100);
         const manualJumpActive = typeof isChatManualJumpActive === 'function' && isChatManualJumpActive();
         const lazyPreloadTop = Math.max(120, Math.floor((this.clientHeight || 0) * 0.18));
-        const hasMoreOlder = window.__chatServerPaginationActive === true ? window.__chatServerHasMoreOlder === true : Number(window.__chatVirtualStartIndex || 0) > 0;
+        const hasMoreOlder = Number(window.__chatVirtualStartIndex || 0) > 0;
         if (!manualJumpActive && hasMoreOlder && this.scrollTop < lazyPreloadTop && typeof loadOlderChatMessages === 'function') {
             loadOlderChatMessages(this.scrollTop <= 2 ? 'scroll-hard-top' : 'scroll-preload-top');
         } else if (!hasMoreOlder) {

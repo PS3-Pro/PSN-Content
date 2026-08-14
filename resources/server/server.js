@@ -14,6 +14,8 @@ const ADMIN_USERS = ["Luan Teles", "Goku Cheats", "JumpSuit"];
 const DEFAULT_AVATAR = "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/interface/modern/images/avatars/default.png";
 
 const MAX_CHAT_HISTORY = 1000; 
+const CHAT_SYNC_CHANGE_LOG_MAX = Math.max(1000, Math.min(20000, parseInt(process.env.CHAT_SYNC_CHANGE_LOG_MAX || "5000", 10) || 5000));
+const CHAT_SYNC_MAX_DELTA = Math.max(100, Math.min(5000, parseInt(process.env.CHAT_SYNC_MAX_DELTA || "1500", 10) || 1500));
 const CHAT_HISTORY_PAGE_SIZE = Math.max(10, Math.min(100, parseInt(process.env.CHAT_HISTORY_PAGE_SIZE || "50", 10) || 50));
 const CHAT_HISTORY_PAGE_MAX = 100;
 
@@ -721,6 +723,7 @@ const TRENDING_CACHE_MS = Math.max(10000, parseInt(process.env.TRENDING_CACHE_MS
 const TROPHY_STATS_CACHE_MS = Math.max(10000, parseInt(process.env.TROPHY_STATS_CACHE_MS || '30000', 10) || 30000);
 let messageHistory = [];
 let lastChatDbId = 0;
+let chatSyncState = { epoch: '', revision: 0 };
 let pinnedMessages = [];
 
 let adminState = {
@@ -803,6 +806,31 @@ async function initDb() {
       id SERIAL PRIMARY KEY,
       message JSONB
     );
+    CREATE TABLE IF NOT EXISTS chat_sync_state (
+      id SMALLINT PRIMARY KEY,
+      epoch TEXT NOT NULL,
+      revision BIGINT NOT NULL DEFAULT 0,
+      updated_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS chat_changes (
+      revision BIGINT PRIMARY KEY,
+      epoch TEXT NOT NULL,
+      change_type TEXT NOT NULL,
+      message_id TEXT,
+      message JSONB,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_chat_changes_epoch_revision ON chat_changes(epoch, revision);
+    CREATE TABLE IF NOT EXISTS chat_seen_events (
+      id BIGSERIAL PRIMARY KEY,
+      message_id TEXT NOT NULL,
+      sender TEXT NOT NULL,
+      reader TEXT NOT NULL,
+      seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE(message_id, reader)
+    );
+    CREATE INDEX IF NOT EXISTS idx_chat_seen_events_sender_id ON chat_seen_events(sender, id);
+    CREATE INDEX IF NOT EXISTS idx_chat_seen_events_reader_id ON chat_seen_events(reader, id);
     CREATE TABLE IF NOT EXISTS pinned_messages (
       id SERIAL PRIMARY KEY,
       message_id TEXT UNIQUE,
@@ -851,6 +879,13 @@ async function initDb() {
       created_at TIMESTAMPTZ DEFAULT NOW()
     );
   `);
+
+  await queryDbWithRetry(
+    'INSERT INTO chat_sync_state (id, epoch, revision) VALUES (1, $1, 0) ON CONFLICT (id) DO NOTHING',
+    [`${Date.now()}-${INSTANCE_ID}-${Math.random().toString(36).slice(2, 8)}`],
+    { attempts: 2, label: 'CHAT SYNC STATE INIT' }
+  );
+  await refreshChatSyncStateFromDb();
 
   await pool.query(`DELETE FROM presence_sessions WHERE instance_id = $1 OR last_seen < NOW() - INTERVAL '${PRESENCE_TTL_SECONDS} seconds'`, [INSTANCE_ID]);
   await refreshAllUsersCacheFromDb({ preserveOnline: false });
@@ -3229,6 +3264,97 @@ function getPublicChatHistoryForUser(userName = '') {
   return messageHistory.map(message => getPublicChatMessageForUser(message, userName));
 }
 
+function getChatSeenSnapshotForUser(userName = '') {
+  const targetUser = String(userName || '');
+  if (!targetUser) return [];
+  const events = [];
+  messageHistory.forEach(message => {
+    if (!message || !message.time) return;
+    const msgId = String(new Date(message.time).getTime());
+    if (!msgId || msgId === 'NaN') return;
+    const seenBy = Array.isArray(message.seenBy) ? message.seenBy : [];
+    const seenAt = message.seenAt && typeof message.seenAt === 'object' && !Array.isArray(message.seenAt) ? message.seenAt : {};
+    if (String(message.user || '') === targetUser) {
+      seenBy.forEach(reader => {
+        const name = String(reader || '');
+        if (!name) return;
+        events.push({ msgId, reader: name, seenAt: String(seenAt[name] || '') });
+      });
+      return;
+    }
+    if (seenBy.includes(targetUser)) events.push({ msgId, reader: targetUser, seenAt: String(seenAt[targetUser] || '') });
+  });
+  return events;
+}
+
+async function getChatSeenSyncForUser(userName = '', cursor = 0) {
+  const targetUser = String(userName || '');
+  const safeCursor = Math.max(0, Number(cursor) || 0);
+  const maxRes = await queryDbWithRetry('SELECT COALESCE(MAX(id), 0)::bigint AS max_id FROM chat_seen_events', [], { attempts: 2, label: 'CHAT SEEN CURSOR READ' });
+  const maxId = Math.max(0, Number(maxRes.rows[0]?.max_id) || 0);
+
+  if (!safeCursor || safeCursor > maxId) {
+    return { mode: 'snapshot', cursor: maxId, events: getChatSeenSnapshotForUser(targetUser) };
+  }
+
+  const res = await queryDbWithRetry(
+    'SELECT id, message_id, sender, reader, seen_at FROM chat_seen_events WHERE id > $1 AND (sender = $2 OR reader = $2) ORDER BY id ASC LIMIT 2001',
+    [safeCursor, targetUser],
+    { attempts: 2, label: 'CHAT SEEN DELTA READ' }
+  );
+  if (res.rows.length > 2000) {
+    return { mode: 'snapshot', cursor: maxId, events: getChatSeenSnapshotForUser(targetUser) };
+  }
+  return {
+    mode: 'changes',
+    cursor: maxId,
+    events: res.rows.map(row => ({
+      eventId: Math.max(0, Number(row.id) || 0),
+      msgId: String(row.message_id || ''),
+      reader: String(row.reader || ''),
+      seenAt: row.seen_at ? new Date(row.seen_at).toISOString() : ''
+    }))
+  };
+}
+
+async function recordChatSeenEvent(msgId = '', sender = '', reader = '', seenAt = '') {
+  const safeMsgId = String(msgId || '');
+  const safeSender = String(sender || '');
+  const safeReader = String(reader || '');
+  if (!safeMsgId || !safeSender || !safeReader) return null;
+  const result = await queryDbWithRetry(`
+    INSERT INTO chat_seen_events (message_id, sender, reader, seen_at)
+    VALUES ($1, $2, $3, COALESCE($4::timestamptz, NOW()))
+    ON CONFLICT (message_id, reader) DO UPDATE SET seen_at = EXCLUDED.seen_at
+    RETURNING id, message_id, sender, reader, seen_at
+  `, [safeMsgId, safeSender, safeReader, seenAt || null], { attempts: 2, label: 'CHAT SEEN EVENT SAVE' });
+  const row = result.rows[0];
+  if (!row) return null;
+  return {
+    eventId: Math.max(0, Number(row.id) || 0),
+    msgId: String(row.message_id || safeMsgId),
+    sender: String(row.sender || safeSender),
+    reader: String(row.reader || safeReader),
+    seenAt: row.seen_at ? new Date(row.seen_at).toISOString() : String(seenAt || '')
+  };
+}
+
+function emitChatSeenSyncChange(event) {
+  if (!event || !event.eventId || !event.msgId || !event.reader) return;
+  const payload = {
+    seenSyncV1: true,
+    cursor: event.eventId,
+    msgId: event.msgId,
+    reader: event.reader,
+    seenAt: event.seenAt || ''
+  };
+  const recipients = new Set([String(event.sender || ''), String(event.reader || '')].filter(Boolean));
+  io.sockets.sockets.forEach(client => {
+    if (!client || !client.connected || !client.userName || !recipients.has(String(client.userName))) return;
+    client.emit('chat_seen_sync_change', payload);
+  });
+}
+
 async function getChatHistoryPageForUser(userName = '', options = {}) {
   const limit = Math.max(10, Math.min(CHAT_HISTORY_PAGE_MAX, Math.floor(Number(options.limit) || CHAT_HISTORY_PAGE_SIZE)));
   const beforeId = Math.max(0, Number(options.beforeId) || 0);
@@ -3264,6 +3390,207 @@ async function getChatHistoryPageForUser(userName = '', options = {}) {
   };
 }
 
+
+async function getChatHistoryNewerPageForUser(userName = '', options = {}) {
+  const limit = Math.max(10, Math.min(CHAT_HISTORY_PAGE_MAX, Math.floor(Number(options.limit) || CHAT_HISTORY_PAGE_SIZE)));
+  const afterId = Math.max(0, Number(options.afterId) || 0);
+  if (!afterId) return { messages: [], hasMoreNewer: false, oldestId: 0, newestId: 0, limit };
+
+  const pageRes = await queryDbWithRetry(
+    'SELECT id, message FROM chat WHERE id > $1 ORDER BY id ASC LIMIT $2',
+    [afterId, limit + 1],
+    { attempts: 2, label: 'CHAT HISTORY NEWER PAGE READ' }
+  );
+  const hasMoreNewer = pageRes.rows.length > limit;
+  const selected = pageRes.rows.slice(0, limit);
+
+  return {
+    messages: selected.map(row => getPublicChatMessageForUser(attachChatDbId({ ...(row.message || {}) }, row.id), userName)),
+    hasMoreNewer,
+    oldestId: selected.length ? Number(selected[0].id || 0) : 0,
+    newestId: selected.length ? Number(selected[selected.length - 1].id || 0) : afterId,
+    limit
+  };
+}
+
+async function getChatHistoryAroundMessageForUser(userName = '', options = {}) {
+  const limit = Math.max(10, Math.min(CHAT_HISTORY_PAGE_MAX, Math.floor(Number(options.limit) || CHAT_HISTORY_PAGE_SIZE)));
+  const msgId = normalizeText(options.msgId, '').slice(0, 80);
+  const msgTimeMs = Number(msgId);
+  if (!msgId || !Number.isFinite(msgTimeMs) || msgTimeMs <= 0) return null;
+
+  let targetRow = null;
+  const cachedTarget = messageHistory.find(message => String(new Date(message && message.time).getTime()) === String(msgId));
+  if (cachedTarget && Number(cachedTarget._dbId || 0) > 0) {
+    targetRow = { id: Number(cachedTarget._dbId), message: cleanChatMessage(cachedTarget) };
+  }
+
+  if (!targetRow) {
+    let targetIso = '';
+    try { targetIso = new Date(msgTimeMs).toISOString(); } catch (err) { targetIso = ''; }
+    if (!targetIso) return null;
+    const targetRes = await queryDbWithRetry(
+      "SELECT id, message FROM chat WHERE message->>'time' = $1 ORDER BY id DESC LIMIT 1",
+      [targetIso],
+      { attempts: 2, label: 'CHAT HISTORY JUMP TARGET READ' }
+    );
+    if (!targetRes.rows.length) return null;
+    targetRow = targetRes.rows[0];
+  }
+
+  const targetId = Math.max(0, Number(targetRow.id) || 0);
+  if (!targetId) return null;
+
+  const olderCount = Math.floor((limit - 1) / 2);
+  const newerCount = Math.max(0, limit - 1 - olderCount);
+  const [olderRes, newerRes] = await Promise.all([
+    queryDbWithRetry(
+      'SELECT id, message FROM chat WHERE id < $1 ORDER BY id DESC LIMIT $2',
+      [targetId, olderCount + 1],
+      { attempts: 2, label: 'CHAT HISTORY JUMP OLDER READ' }
+    ),
+    queryDbWithRetry(
+      'SELECT id, message FROM chat WHERE id > $1 ORDER BY id ASC LIMIT $2',
+      [targetId, newerCount + 1],
+      { attempts: 2, label: 'CHAT HISTORY JUMP NEWER READ' }
+    )
+  ]);
+
+  const hasMoreOlder = olderRes.rows.length > olderCount;
+  const hasMoreNewer = newerRes.rows.length > newerCount;
+  const olderRows = olderRes.rows.slice(0, olderCount).reverse();
+  const newerRows = newerRes.rows.slice(0, newerCount);
+  const rows = olderRows.concat([targetRow], newerRows);
+  const messages = rows.map(row => getPublicChatMessageForUser(attachChatDbId({ ...(row.message || {}) }, row.id), userName));
+
+  return {
+    messages,
+    hasMoreOlder,
+    hasMoreNewer,
+    oldestId: rows.length ? Number(rows[0].id || 0) : targetId,
+    newestId: rows.length ? Number(rows[rows.length - 1].id || 0) : targetId,
+    targetId,
+    targetMsgId: msgId,
+    targetIndex: olderRows.length,
+    limit
+  };
+}
+
+async function refreshChatSyncStateFromDb() {
+  const result = await queryDbWithRetry(
+    'SELECT epoch, revision FROM chat_sync_state WHERE id = 1',
+    [],
+    { attempts: 2, label: 'CHAT SYNC STATE READ' }
+  );
+  if (result.rows.length) {
+    chatSyncState = {
+      epoch: String(result.rows[0].epoch || ''),
+      revision: Math.max(0, Number(result.rows[0].revision) || 0)
+    };
+  }
+  return chatSyncState;
+}
+
+async function recordChatSyncChange(changeType, messageId = '', message = null) {
+  const type = String(changeType || '').toLowerCase();
+  if (!['upsert', 'delete'].includes(type)) throw new Error(`Unsupported chat sync change: ${type}`);
+  const cleanMessage = message && typeof message === 'object' ? cleanChatMessage(message) : null;
+  const result = await queryDbWithRetry(`
+    WITH next_state AS (
+      UPDATE chat_sync_state
+      SET revision = revision + 1, updated_at = NOW()
+      WHERE id = 1
+      RETURNING epoch, revision
+    ), inserted AS (
+      INSERT INTO chat_changes (revision, epoch, change_type, message_id, message)
+      SELECT revision, epoch, $1, $2, $3::jsonb FROM next_state
+      RETURNING revision, epoch, change_type, message_id, message
+    )
+    SELECT revision, epoch, change_type, message_id, message FROM inserted
+  `, [type, String(messageId || ''), cleanMessage], { attempts: 2, label: 'CHAT SYNC CHANGE SAVE' });
+
+  if (!result.rows.length) throw new Error('Chat sync state is unavailable.');
+  const row = result.rows[0];
+  const change = {
+    epoch: String(row.epoch || ''),
+    revision: Math.max(0, Number(row.revision) || 0),
+    type: String(row.change_type || type),
+    msgId: String(row.message_id || messageId || ''),
+    message: row.message || cleanMessage || null
+  };
+  chatSyncState = { epoch: change.epoch, revision: change.revision };
+
+  const pruneBefore = change.revision - CHAT_SYNC_CHANGE_LOG_MAX;
+  if (pruneBefore > 0) {
+    pool.query('DELETE FROM chat_changes WHERE epoch = $1 AND revision <= $2', [change.epoch, pruneBefore]).catch(err => {
+      if (process.env.DEBUG_CHAT_SYNC === '1') console.warn('[CHAT SYNC PRUNE ERROR]:', err && err.message ? err.message : err);
+    });
+  }
+  return change;
+}
+
+async function recordChatSyncChangeSafe(changeType, messageId = '', message = null) {
+  try {
+    return await recordChatSyncChange(changeType, messageId, message);
+  } catch (err) {
+    console.error('[CHAT SYNC CHANGE ERROR]:', err && err.message ? err.message : err);
+    return null;
+  }
+}
+
+function emitChatSyncChange(change) {
+  if (!change || !change.epoch || !change.revision) return;
+  io.sockets.sockets.forEach(client => {
+    if (!client || !client.connected || !client.userName) return;
+    const payload = {
+      syncV1: true,
+      epoch: change.epoch,
+      revision: change.revision,
+      type: change.type,
+      msgId: change.msgId,
+      message: change.message ? getPublicChatMessageForUser(change.message, client.userName) : null
+    };
+    client.emit('chat_sync_change', payload);
+  });
+}
+
+async function resetChatSyncEpoch() {
+  const nextEpoch = `${Date.now()}-${INSTANCE_ID}-${Math.random().toString(36).slice(2, 10)}`;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('UPDATE chat_sync_state SET epoch = $1, revision = 0, updated_at = NOW() WHERE id = 1', [nextEpoch]);
+    await client.query('DELETE FROM chat_changes');
+    await client.query('TRUNCATE chat_seen_events RESTART IDENTITY');
+    await client.query('COMMIT');
+    chatSyncState = { epoch: nextEpoch, revision: 0 };
+  } catch (err) {
+    try { await client.query('ROLLBACK'); } catch (e) {}
+    throw err;
+  } finally {
+    client.release();
+  }
+  return chatSyncState;
+}
+
+async function getChatSyncSnapshotForUser(userName = '') {
+  const result = await queryDbWithRetry(
+    'SELECT id, message FROM chat ORDER BY id DESC LIMIT $1',
+    [MAX_CHAT_HISTORY],
+    { attempts: 2, label: 'CHAT SYNC SNAPSHOT READ' }
+  );
+  return result.rows.reverse().map(row => getPublicChatMessageForUser(attachChatDbId({ ...(row.message || {}) }, row.id), userName));
+}
+
+function sanitizeChatSyncChangeForUser(row, userName = '') {
+  return {
+    revision: Math.max(0, Number(row.revision) || 0),
+    type: String(row.change_type || row.type || ''),
+    msgId: String(row.message_id || row.msgId || ''),
+    message: row.message ? getPublicChatMessageForUser(row.message, userName) : null
+  };
+}
+
 async function refreshChatHistoryFromDb() {
   const chatRes = await pool.query('SELECT id, message FROM chat ORDER BY id DESC LIMIT $1', [MAX_CHAT_HISTORY]);
   const rows = chatRes.rows.reverse();
@@ -3287,6 +3614,7 @@ async function clearChatHistorySafely(byUser = "Admin", reason = "manual clear")
   messageHistory = [];
   lastChatDbId = 0;
   await pool.query('TRUNCATE chat RESTART IDENTITY');
+  await resetChatSyncEpoch();
   return backedUpCount;
 }
 
@@ -5127,6 +5455,93 @@ io.on('connection', (socket) => {
     }
   });
 
+  socket.on('request_chat_sync', async (request = {}, respond) => {
+    const reply = typeof respond === 'function' ? respond : () => {};
+    try {
+      if (!socket.userName) return reply({ success: false, syncV1: true, error: 'Not authenticated.' });
+      if (socket.__chatSyncRequestInFlight) return reply({ success: false, syncV1: true, busy: true, error: 'Chat synchronization already running.' });
+
+      socket.__chatSyncRequestInFlight = (async () => {
+        const state = await refreshChatSyncStateFromDb();
+        const clientEpoch = normalizeText(request && request.epoch, '').slice(0, 160);
+        const clientRevision = Math.max(0, Number(request && request.revision) || 0);
+        const forceSnapshot = request && request.forceSnapshot === true;
+        const clientSeenCursor = Math.max(0, Number(request && request.seenCursor) || 0);
+        const seenSync = await getChatSeenSyncForUser(socket.userName, clientSeenCursor);
+
+        const withSeenSync = payload => ({
+          ...payload,
+          seenSyncV1: true,
+          seenMode: seenSync.mode,
+          seenCursor: seenSync.cursor,
+          seenEvents: seenSync.events
+        });
+
+        const sendSnapshot = async reason => {
+          const messages = await getChatSyncSnapshotForUser(socket.userName);
+          return withSeenSync({
+            success: true,
+            syncV1: true,
+            mode: 'snapshot',
+            reason,
+            epoch: state.epoch,
+            revision: state.revision,
+            messages,
+            maxHistory: MAX_CHAT_HISTORY
+          });
+        };
+
+        if (forceSnapshot || !clientEpoch || clientEpoch !== state.epoch || clientRevision > state.revision) {
+          return sendSnapshot(forceSnapshot ? 'forced' : (!clientEpoch ? 'no-cache' : 'epoch-mismatch'));
+        }
+
+        if (clientRevision === state.revision) {
+          return withSeenSync({
+            success: true,
+            syncV1: true,
+            mode: 'changes',
+            epoch: state.epoch,
+            revision: state.revision,
+            changes: [],
+            maxHistory: MAX_CHAT_HISTORY
+          });
+        }
+
+        const changesRes = await queryDbWithRetry(
+          'SELECT revision, change_type, message_id, message FROM chat_changes WHERE epoch = $1 AND revision > $2 ORDER BY revision ASC LIMIT $3',
+          [state.epoch, clientRevision, CHAT_SYNC_MAX_DELTA + 1],
+          { attempts: 2, label: 'CHAT SYNC DELTA READ' }
+        );
+        const rows = changesRes.rows;
+        const contiguous = rows.length > 0
+          && Number(rows[0].revision) === clientRevision + 1
+          && Number(rows[Math.min(rows.length, CHAT_SYNC_MAX_DELTA) - 1].revision) >= Math.min(state.revision, clientRevision + CHAT_SYNC_MAX_DELTA);
+
+        if (!contiguous || rows.length > CHAT_SYNC_MAX_DELTA || Number(rows[rows.length - 1]?.revision || 0) !== state.revision) {
+          return sendSnapshot(!contiguous ? 'delta-gap' : 'delta-too-large');
+        }
+
+        return withSeenSync({
+          success: true,
+          syncV1: true,
+          mode: 'changes',
+          epoch: state.epoch,
+          revision: state.revision,
+          changes: rows.map(row => sanitizeChatSyncChangeForUser(row, socket.userName)),
+          maxHistory: MAX_CHAT_HISTORY
+        });
+      })();
+
+      const result = await socket.__chatSyncRequestInFlight;
+      reply(result);
+    } catch (err) {
+      console.error('[REQUEST CHAT SYNC ERROR]:', err);
+      reply({ success: false, syncV1: true, error: 'Chat synchronization failed.' });
+    } finally {
+      socket.__chatSyncRequestInFlight = null;
+    }
+  });
+
   socket.on('request_chat_history', async (request = {}, respond) => {
     const payload = request && typeof request === 'object' && !Array.isArray(request) ? request : {};
     const reply = typeof respond === 'function'
@@ -5141,12 +5556,15 @@ io.on('connection', (socket) => {
 
       if (payload.paginationV1 === true) {
         if (socket.__chatHistoryPageRequestInFlight) {
-          reply({ success: false, paginationV1: true, busy: true });
-          return;
+          try { await socket.__chatHistoryPageRequestInFlight; } catch (e) {}
+          if (!socket.connected) return;
         }
 
-        const mode = payload.mode === 'older' ? 'older' : 'latest';
+        const requestedMode = normalizeText(payload.mode, 'latest').toLowerCase();
+        const mode = ['older', 'newer', 'around'].includes(requestedMode) ? requestedMode : 'latest';
         const beforeId = mode === 'older' ? Math.max(0, Number(payload.beforeId) || 0) : 0;
+        const afterId = mode === 'newer' ? Math.max(0, Number(payload.afterId) || 0) : 0;
+        const targetMsgId = mode === 'around' ? normalizeText(payload.targetMsgId || payload.msgId, '').slice(0, 80) : '';
         const limit = Math.max(10, Math.min(CHAT_HISTORY_PAGE_MAX, Math.floor(Number(payload.limit) || CHAT_HISTORY_PAGE_SIZE)));
         const requestId = normalizeText(payload.requestId, '').slice(0, 80);
 
@@ -5154,23 +5572,50 @@ io.on('connection', (socket) => {
           reply({ success: true, paginationV1: true, mode, requestId, messages: [], hasMoreOlder: false, oldestId: 0, newestId: 0, limit });
           return;
         }
+        if (mode === 'newer' && afterId <= 0) {
+          reply({ success: true, paginationV1: true, mode, requestId, messages: [], hasMoreNewer: false, oldestId: 0, newestId: 0, limit });
+          return;
+        }
+        if (mode === 'around' && !targetMsgId) {
+          reply({ success: false, paginationV1: true, mode, requestId, notFound: true, error: 'Missing target message.' });
+          return;
+        }
 
         socket.__chatHistoryPageRequestInFlight = (async () => {
-          const page = await getChatHistoryPageForUser(socket.userName, { beforeId, limit });
+          let page;
+          if (mode === 'around') {
+            page = await getChatHistoryAroundMessageForUser(socket.userName, { msgId: targetMsgId, limit });
+            if (!page) {
+              const response = { success: false, paginationV1: true, mode, requestId, notFound: true, targetMsgId, error: 'Message not found.' };
+              reply(response);
+              return response;
+            }
+          } else if (mode === 'newer') {
+            page = await getChatHistoryNewerPageForUser(socket.userName, { afterId, limit });
+          } else {
+            page = await getChatHistoryPageForUser(socket.userName, { beforeId, limit });
+          }
+
           const response = {
             success: true,
             paginationV1: true,
             mode,
             requestId,
             messages: page.messages,
-            hasMoreOlder: page.hasMoreOlder === true,
+            ...(mode === 'latest' || mode === 'older' || mode === 'around' ? { hasMoreOlder: page.hasMoreOlder === true } : {}),
+            ...(mode === 'newer' || mode === 'around' ? { hasMoreNewer: page.hasMoreNewer === true } : {}),
             oldestId: Number(page.oldestId || 0),
             newestId: Number(page.newestId || 0),
+            ...(mode === 'around' ? {
+              targetId: Number(page.targetId || 0),
+              targetMsgId: String(page.targetMsgId || targetMsgId),
+              targetIndex: Math.max(0, Number(page.targetIndex) || 0)
+            } : {}),
             limit: page.limit
           };
           if (MEMORY_TRACE_ENABLED) {
             const estimate = estimateValueBytes(response.messages, { maxNodes: 25000, maxBytes: 16 * 1024 * 1024 });
-            logMemoryTrace('chat-history:page', `user=${socket.userName || '-'} socket=${socket.id} mode=${mode} items=${response.messages.length} before=${beforeId || '-'} oldest=${response.oldestId || '-'} more=${response.hasMoreOlder} approx=${formatApproxBytes(estimate.bytes)}${estimate.truncated ? '+' : ''}`);
+            logMemoryTrace('chat-history:page', `user=${socket.userName || '-'} socket=${socket.id} mode=${mode} items=${response.messages.length} before=${beforeId || '-'} after=${afterId || '-'} target=${targetMsgId || '-'} oldest=${response.oldestId || '-'} newer=${response.hasMoreNewer === true} older=${response.hasMoreOlder === true} approx=${formatApproxBytes(estimate.bytes)}${estimate.truncated ? '+' : ''}`);
           }
           reply(response);
           return response;
@@ -5483,7 +5928,7 @@ io.on('connection', (socket) => {
       }
 
       const backedUpCount = await clearChatHistorySafely(senderName || 'Admin', 'chat command');
-      io.emit('chat_cleared', { by: senderName || 'Admin', backedUpCount });
+      io.emit('chat_cleared', { by: senderName || 'Admin', backedUpCount, chatEpoch: chatSyncState.epoch, chatRevision: chatSyncState.revision });
       await addModerationLog('clear_chat', `Cleared global chat history via command (${backedUpCount} messages backed up)`, { backedUpCount }, senderName || 'Admin');
       respond({ success: true, command: 'clear_chat', backedUpCount });
       return;
@@ -5527,7 +5972,9 @@ io.on('connection', (socket) => {
       if (messageHistory.length > MAX_CHAT_HISTORY) messageHistory.shift();
 
       const publicMessage = cleanChatMessage(messageData);
+      const syncChange = await recordChatSyncChangeSafe('upsert', String(new Date(messageData.time).getTime()), publicMessage);
       io.emit('chat_message', publicMessage);
+      if (syncChange) emitChatSyncChange(syncChange);
       respond({ success: true, message: publicMessage });
     } catch (err) {
       console.error('[CHAT SAVE ERROR]:', err);
@@ -5923,7 +6370,9 @@ io.on('connection', (socket) => {
 
         try {
             await pool.query("UPDATE chat SET message = $1 WHERE message->>'time' = $2", [cleanChatMessage(msg), msg.time]);
+            const syncChange = await recordChatSyncChangeSafe('upsert', String(data.msgId || new Date(msg.time).getTime()), msg);
             io.emit('message_reaction', data);
+            if (syncChange) emitChatSyncChange(syncChange);
         } catch (err) { console.error("Reaction Sync Error:", err); }
     }
   });
@@ -5948,6 +6397,7 @@ io.on('connection', (socket) => {
 
             try {
                 await pool.query("UPDATE chat SET message = $1 WHERE message->>'time' = $2", [cleanChatMessage(msg), msg.time]);
+                const syncChange = await recordChatSyncChangeSafe('upsert', String(data.msgId || new Date(msg.time).getTime()), msg);
                 
                 io.emit('message_edited', { 
                     msgId: data.msgId, 
@@ -5956,6 +6406,7 @@ io.on('connection', (socket) => {
                     content: poll,
                     editedByAdmin: msg.editedByAdmin 
                 });
+                if (syncChange) emitChatSyncChange(syncChange);
                 
                 const pinned = pinnedMessages.find(p => p.id === data.msgId);
                 if (pinned) {
@@ -5985,6 +6436,9 @@ io.on('connection', (socket) => {
                 if (client && client.connected && client.userName !== msg.user) client.emit('message_seen', readerSeenPayload);
             });
             queueSeenMessagePersist(msg);
+            recordChatSeenEvent(data.msgId, msg.user, data.user, msg.seenAt[data.user])
+              .then(event => { if (event) emitChatSeenSyncChange(event); })
+              .catch(err => console.error('[CHAT SEEN SYNC ERROR]:', err && err.message ? err.message : err));
         }
     }
   });
@@ -6019,6 +6473,7 @@ io.on('connection', (socket) => {
             
             try {
                 await pool.query("UPDATE chat SET message = $1 WHERE message->>'time' = $2", [cleanChatMessage(msg), msg.time]);
+                const syncChange = await recordChatSyncChangeSafe('upsert', String(data.msgId || new Date(msg.time).getTime()), msg);
                 io.emit('message_edited', { 
                     msgId: data.msgId, 
                     newText: data.newText, 
@@ -6029,6 +6484,7 @@ io.on('connection', (socket) => {
                     editedBy: msg.editedBy || null,
                     editedByRole: msg.editedByRole || null 
                 });
+                if (syncChange) emitChatSyncChange(syncChange);
 
                 const pinned = pinnedMessages.find(p => p.id === data.msgId);
                 if (pinned) {
@@ -6061,7 +6517,9 @@ io.on('connection', (socket) => {
                 console.error("Erro ao deletar mensagem do banco:", err);
             }
 
+            const syncChange = await recordChatSyncChangeSafe('delete', String(data.msgId || ''), null);
             io.emit('message_deleted', data.msgId);
+            if (syncChange) emitChatSyncChange(syncChange);
             if (!isOwner) {
                 await addModerationLog('delete_message', `Deleted message from ${msg.user}`, { msgId: data.msgId, targetUser: msg.user }, socket.userName || 'Moderator');
             }
@@ -6082,7 +6540,7 @@ io.on('connection', (socket) => {
 
     const byUser = socket.userName || data.user || data.adminUser || 'Admin';
     const backedUpCount = await clearChatHistorySafely(byUser, 'admin clear button');
-    io.emit('chat_cleared', { by: byUser, user: byUser, backedUpCount });
+    io.emit('chat_cleared', { by: byUser, user: byUser, backedUpCount, chatEpoch: chatSyncState.epoch, chatRevision: chatSyncState.revision });
 
     pinnedMessages = [];
     await pool.query('TRUNCATE pinned_messages');
