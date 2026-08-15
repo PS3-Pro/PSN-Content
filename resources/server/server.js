@@ -145,9 +145,10 @@ function isPgConnectionLimitError(err) {
 function isPgTransientConnectionError(err) {
   if (!err) return false;
   const code = String(err.code || '').toUpperCase();
-  if (['08000','08001','08003','08004','08006','08007','08P01','57P01','57P02','57P03','53300'].includes(code)) return true;
   const message = String(err.message || err).toLowerCase();
-  return /connection terminated|connection timeout|timeout exceeded when trying to connect|connection reset|econnreset|etimedout|ehostunreach|enetunreach|socket hang up|broken pipe|server closed the connection|terminating connection|the database system is starting up|too many clients|remaining connection slots/.test(message);
+  if (['08000','08001','08003','08004','08006','08007','08P01','57P01','57P02','57P03','53300'].includes(code)) return true;
+  if (code === '57014' && /statement timeout|query timeout|canceling statement/.test(message)) return true;
+  return /query read timeout|query timeout|read timeout|connection terminated|connection timeout|timeout exceeded when trying to connect|connection reset|econnreset|etimedout|ehostunreach|enetunreach|socket hang up|broken pipe|server closed the connection|terminating connection|the database system is starting up|too many clients|remaining connection slots/.test(message);
 }
 
 function waitMs(ms) {
@@ -2642,6 +2643,18 @@ async function searchUsersFromDb(query, includeAdminFields = false, includeAllMa
   return searchUsersFromCache(query, includeAdminFields, includeAllMatches);
 }
 
+function normalizeUserDataPayloadFromDb(dataKey, rawPayload) {
+  let payload = rawPayload;
+  if (dataKey === 'trophiesData') {
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) payload = {};
+    return payload;
+  }
+  if (!Array.isArray(payload)) payload = [];
+  if (dataKey === 'downloadsData') return normalizeDownloadHistoryRecordsServer(payload).history;
+  if (dataKey === 'libraryData') return mergeLibraryRecordsServer(payload, []);
+  return payload;
+}
+
 async function getUserDataPayloadFromDb(targetName, type) {
   const safeTargetName = normalizeText(targetName, '');
   if (!safeTargetName) return null;
@@ -2657,16 +2670,26 @@ async function getUserDataPayloadFromDb(targetName, type) {
   const dataKey = keyMap[type] || `${type}Data`;
   const result = await queryDbWithRetry('SELECT data -> $2 AS payload FROM users WHERE name = $1', [safeTargetName, dataKey], { attempts: 3, label: 'USER DATA READ' });
   if (!result.rows.length) return null;
+  return normalizeUserDataPayloadFromDb(dataKey, result.rows[0].payload);
+}
 
-  let payload = result.rows[0].payload;
-  if (dataKey === 'trophiesData') {
-    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) payload = {};
-    return payload;
-  }
-  if (!Array.isArray(payload)) payload = [];
-  if (dataKey === 'downloadsData') return normalizeDownloadHistoryRecordsServer(payload).history;
-  if (dataKey === 'libraryData') return mergeLibraryRecordsServer(payload, []);
-  return payload;
+async function getUserDataPayloadsFromDb(targetName, dataKeys = []) {
+  const safeTargetName = normalizeText(targetName, '');
+  if (!safeTargetName) return null;
+
+  const uniqueKeys = [...new Set((Array.isArray(dataKeys) ? dataKeys : []).filter(key => USER_HEAVY_CACHE_KEYS.includes(key)))];
+  if (!uniqueKeys.length) return {};
+
+  const selectList = uniqueKeys.map((dataKey, index) => `data -> $${index + 2} AS "${dataKey}"`).join(', ');
+  const result = await queryDbWithRetry(`SELECT ${selectList} FROM users WHERE name = $1`, [safeTargetName, ...uniqueKeys], { attempts: 3, label: 'PROFILE HEAVY READ' });
+  if (!result.rows.length) return null;
+
+  const row = result.rows[0] || {};
+  const payloads = {};
+  uniqueKeys.forEach(dataKey => {
+    payloads[dataKey] = normalizeUserDataPayloadFromDb(dataKey, row[dataKey]);
+  });
+  return payloads;
 }
 
 
@@ -2757,11 +2780,17 @@ function incomingTouchesHeavyProfileSection(incoming = {}, dataKey, meta = {}) {
 
 async function buildWorkingUserForProfileUpdate(name, incoming = {}) {
   const base = { ...(userDatabase[name] || {}) };
-  for (const [dataKey, meta] of Object.entries(PROFILE_HEAVY_SECTION_META)) {
-    if (!incomingTouchesHeavyProfileSection(incoming, dataKey, meta)) continue;
-    const payload = await getUserDataPayloadFromDb(name, meta.type);
-    if (payload !== null) base[dataKey] = payload;
-  }
+  const touchedKeys = Object.entries(PROFILE_HEAVY_SECTION_META)
+    .filter(([dataKey, meta]) => incomingTouchesHeavyProfileSection(incoming, dataKey, meta))
+    .map(([dataKey]) => dataKey);
+
+  if (!touchedKeys.length) return base;
+
+  const payloads = await getUserDataPayloadsFromDb(name, touchedKeys);
+  if (!payloads) return base;
+  touchedKeys.forEach(dataKey => {
+    if (Object.prototype.hasOwnProperty.call(payloads, dataKey)) base[dataKey] = payloads[dataKey];
+  });
   return base;
 }
 
@@ -4985,7 +5014,14 @@ io.on('connection', (socket) => {
     delete userData._syncRequestId;
     delete userData._syncReason;
     delete userData._syncSections;
-    const workingUser = await buildWorkingUserForProfileUpdate(name, userData);
+    let workingUser;
+    try {
+      workingUser = await buildWorkingUserForProfileUpdate(name, userData);
+    } catch (err) {
+      console.error(`[DATABASE ERROR] Failed to prepare profile for ${name}:`, err);
+      respond({ ok: false, requestId: syncRequestId, error: 'Profile database read failed.' });
+      return;
+    }
     if (!workingUser) { respond({ ok: false, requestId: syncRequestId, error: 'Profile could not be prepared.' }); return; }
     const incomingSettingsData = (userData.settingsData && typeof userData.settingsData === "object") ? userData.settingsData : null;
     const previousCountryCode = name && userDatabase[name] ? getUserCountryCode(workingUser) : "";
