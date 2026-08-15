@@ -155,6 +155,25 @@ function waitMs(ms) {
   return new Promise(resolve => setTimeout(resolve, Math.max(0, Number(ms) || 0)));
 }
 
+let dbPressureUntil = 0;
+let dbPressureLastLogAt = 0;
+const DB_PRESSURE_BACKOFF_MS = Math.max(5000, parseInt(process.env.DB_PRESSURE_BACKOFF_MS || "15000", 10) || 15000);
+
+function noteDbPressure(err, label = 'DB') {
+  if (!isPgTransientConnectionError(err)) return false;
+  const now = Date.now();
+  dbPressureUntil = Math.max(dbPressureUntil, now + DB_PRESSURE_BACKOFF_MS);
+  if (now - dbPressureLastLogAt > 5000) {
+    dbPressureLastLogAt = now;
+    console.warn(`[DB PRESSURE] ${label}: ${err && err.message ? err.message : err}. Non-essential DB work paused for ${Math.round(DB_PRESSURE_BACKOFF_MS / 1000)}s.`);
+  }
+  return true;
+}
+
+function isDbPressureActive() {
+  return Date.now() < dbPressureUntil;
+}
+
 async function queryDbWithRetry(text, params = [], options = {}) {
   const attempts = Math.max(1, Math.min(4, Number(options.attempts) || 2));
   const label = String(options.label || 'DB QUERY');
@@ -164,7 +183,9 @@ async function queryDbWithRetry(text, params = [], options = {}) {
       return await pool.query(text, params);
     } catch (err) {
       lastError = err;
-      if (!isPgTransientConnectionError(err) || attempt >= attempts) throw err;
+      const transient = isPgTransientConnectionError(err);
+      if (transient) noteDbPressure(err, label);
+      if (!transient || attempt >= attempts) throw err;
       const delayMs = attempt === 1 ? 180 : 650;
       console.warn(`[${label}] Temporary PostgreSQL connection failure. Retrying ${attempt + 1}/${attempts} in ${delayMs}ms.`);
       await waitMs(delayMs);
@@ -3672,10 +3693,12 @@ async function addModerationLog(type, message, detail = {}, admin = "System") {
   moderationLog.unshift(entry);
   moderationLog = moderationLog.slice(0, 100);
 
-  try {
-    await pool.query('INSERT INTO moderation_log (entry) VALUES ($1)', [entry]);
-  } catch (err) {
-    console.error('[ADMIN LOG ERROR]:', err);
+  if (!isDbPressureActive()) {
+    try {
+      await queryDbWithRetry('INSERT INTO moderation_log (entry) VALUES ($1)', [entry], { attempts: 1, label: 'ADMIN LOG SAVE' });
+    } catch (err) {
+      if (!isPgTransientConnectionError(err)) console.error('[ADMIN LOG ERROR]:', err);
+    }
   }
 
   emitToAdmins('admin_moderation_log', entry);
@@ -3696,10 +3719,12 @@ async function addServerLog(type, message, detail = {}, user = "Server") {
   serverLog.unshift(entry);
   serverLog = serverLog.slice(0, 120);
 
-  try {
-    await pool.query('INSERT INTO server_log (entry) VALUES ($1)', [entry]);
-  } catch (err) {
-    console.error('[SERVER LOG ERROR]:', err);
+  if (!isDbPressureActive()) {
+    try {
+      await queryDbWithRetry('INSERT INTO server_log (entry) VALUES ($1)', [entry], { attempts: 1, label: 'SERVER LOG SAVE' });
+    } catch (err) {
+      if (!isPgTransientConnectionError(err)) console.error('[SERVER LOG ERROR]:', err);
+    }
   }
 
   emitToAdmins('admin_server_log', entry);
@@ -4186,13 +4211,19 @@ async function upsertPresenceForSocket(socket, name) {
     userDatabase[name].id = socket.id;
     userDatabase[name].lastSeen = Date.now();
   }
-  await queryDbWithRetry(
-    `INSERT INTO presence_sessions (socket_id, name, instance_id, connected_at, last_seen, data)
-     VALUES ($1, $2, $3, NOW(), NOW(), $4)
-     ON CONFLICT (socket_id) DO UPDATE SET name = $2, instance_id = $3, last_seen = NOW(), data = $4`,
-    [socket.id, name, INSTANCE_ID, { role: getUserRole(name, userDatabase[name] || null) }],
-    { attempts: 3, label: 'PRESENCE UPSERT' }
-  );
+  if (!isDbPressureActive()) {
+    try {
+      await queryDbWithRetry(
+        `INSERT INTO presence_sessions (socket_id, name, instance_id, connected_at, last_seen, data)
+         VALUES ($1, $2, $3, NOW(), NOW(), $4)
+         ON CONFLICT (socket_id) DO UPDATE SET name = $2, instance_id = $3, last_seen = NOW(), data = $4`,
+        [socket.id, name, INSTANCE_ID, { role: getUserRole(name, userDatabase[name] || null) }],
+        { attempts: 1, label: 'PRESENCE UPSERT' }
+      );
+    } catch (err) {
+      if (!isPgTransientConnectionError(err)) throw err;
+    }
+  }
   invalidateOnlineListCache('presence-upsert');
   if (shouldAnnouncePresence && userDatabase[name]) {
     socket.__presenceAnnounced = true;
@@ -4323,8 +4354,16 @@ async function emitOnlineList(targetSocket = null, options = {}) {
 async function heartbeatPresenceSessions() {
   const activeSockets = [];
   io.sockets.sockets.forEach(client => {
-    if (client.connected && client.userName) activeSockets.push(client);
+    if (client.connected && client.userName) {
+      activeSockets.push(client);
+      if (userDatabase[client.userName]) userDatabase[client.userName].lastSeen = Date.now();
+    }
   });
+
+  if (isDbPressureActive()) {
+    await emitOnlineList();
+    return;
+  }
 
   if (activeSockets.length > 0) {
     const socketIds = [];
@@ -4337,7 +4376,6 @@ async function heartbeatPresenceSessions() {
       names.push(client.userName);
       instanceIds.push(INSTANCE_ID);
       payloads.push({ role: getUserRole(client.userName, userDatabase[client.userName] || null) });
-      if (userDatabase[client.userName]) userDatabase[client.userName].lastSeen = Date.now();
     });
 
     await queryDbWithRetry(
@@ -4974,7 +5012,7 @@ io.on('connection', (socket) => {
     try {
       await upsertPresenceForSocket(socket, name);
       userCacheMeta[name] = Date.now();
-      const savedUser = await patchUserData(name, settingsDbPatch, 'SETTINGS PATCH SAVE');
+      const savedUser = await runSerializedProfileHydration(() => patchUserData(name, settingsDbPatch, 'SETTINGS PATCH SAVE'));
       if (!savedUser) return;
       invalidateOnlineListCache('settings-realtime-save');
     } catch (err) {
@@ -5016,7 +5054,7 @@ io.on('connection', (socket) => {
     delete userData._syncSections;
     let workingUser;
     try {
-      workingUser = await buildWorkingUserForProfileUpdate(name, userData);
+      workingUser = await runSerializedProfileHydration(() => buildWorkingUserForProfileUpdate(name, userData));
     } catch (err) {
       console.error(`[DATABASE ERROR] Failed to prepare profile for ${name}:`, err);
       respond({ ok: false, requestId: syncRequestId, error: 'Profile database read failed.' });
@@ -5148,7 +5186,7 @@ io.on('connection', (socket) => {
         try {
             await upsertPresenceForSocket(socket, name);
             userCacheMeta[name] = Date.now();
-            const savedUser = await patchUserData(name, profileDbPatch, 'PROFILE PATCH SAVE');
+            const savedUser = await runSerializedProfileHydration(() => patchUserData(name, profileDbPatch, 'PROFILE PATCH SAVE'));
             if (!savedUser) {
               respond({ ok: false, requestId: syncRequestId, error: 'Profile was not saved.' });
               return;
@@ -5254,7 +5292,7 @@ io.on('connection', (socket) => {
 
       if (rawData === null) {
         rawData = await withTimeout(
-          getUserDataPayloadFromDb(targetName, type),
+          runSerializedProfileHydration(() => getUserDataPayloadFromDb(targetName, type)),
           4500,
           null
         );
