@@ -1246,14 +1246,14 @@ input:checked+.slider:before { transform: translateX(20px); }
 .chat-history-loading .chat-ps-list-loader { --ps-list-symbol-size: clamp(16px,3.8vw,20px); min-height: 0; padding: 0; margin: 0; width: min(168px,72vw); }
 .chat-history-loading .chat-ps-list-loader .profile-ps-list-symbols { margin: 0 auto 14px; max-width: 150px; gap: clamp(11px,3vw,18px); }
 .chat-history-loading .chat-ps-list-loader .profile-ps-list-symbol svg { filter: drop-shadow(0 0 4px rgba(255,255,255,.22)) drop-shadow(0 0 10px rgba(0,188,255,.18)); }
-.chat-history-loading .chat-ps-list-loader .profile-ps-list-title { color: rgba(255,255,255,.82); text-shadow: 0 0 9px rgba(0,112,204,.28); }
+.chat-history-loading .chat-ps-list-loader .profile-ps-list-title { width: 100%; min-height: 12px; display: flex; align-items: center; justify-content: center; color: rgba(255,255,255,.82); text-shadow: 0 0 9px rgba(0,112,204,.28); }
 .chat-jump-loading-overlay { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; padding: 20px; background: rgba(5,8,15,.42); backdrop-filter: blur(10px) saturate(140%); -webkit-backdrop-filter: blur(10px) saturate(140%); z-index: 90; opacity: 0; visibility: hidden; pointer-events: none; transition: opacity .16s ease,visibility .16s ease; }
 .chat-jump-loading-overlay.show { opacity: 1; visibility: visible; pointer-events: auto; }
 .chat-jump-loading-overlay .chat-history-loading { flex: 0 0 auto; width: auto; min-height: 0; margin: 0; padding: 18px 22px; border-radius: 18px; background: rgba(18,24,36,.82); border: 1px solid rgba(255,255,255,.11); box-shadow: 0 18px 45px rgba(0,0,0,.38),0 0 22px rgba(0,112,204,.12); backdrop-filter: blur(18px) saturate(150%); -webkit-backdrop-filter: blur(18px) saturate(150%); }
 .chat-jump-loading-overlay .chat-ps-list-loader { width: min(168px,72vw); }
 .chat-lazy-older-pill { display: inline-flex; align-items: center; justify-content: center; gap: 8px; height: 30px; padding: 0 14px; border-radius: 999px; background: rgba(18,24,36,.86); border: 1px solid rgba(255,255,255,.12); box-shadow: 0 10px 24px rgba(0,0,0,.34),0 0 16px rgba(0,112,204,.14); backdrop-filter: blur(16px) saturate(150%); -webkit-backdrop-filter: blur(16px) saturate(150%); color: rgba(255,255,255,.84); font-size: 9.5px; font-weight: 800; letter-spacing: 1px; text-transform: uppercase; }
 .chat-lazy-older-spinner { width: 12px; height: 12px; border-radius: 50%; border: 2px solid rgba(255,255,255,.22); border-top-color: #fff; animation: consoleStorageRefreshSpin .75s linear infinite; flex: 0 0 auto; }
-.chat-lazy-inline-loading { position: sticky; top: 20px; z-index: 95; display: flex; justify-content: center; padding: 10px 0 8px; pointer-events: none; opacity: 0; transform: translateY(-6px); transition: opacity .16s ease,transform .16s ease; }
+.chat-lazy-inline-loading { position: absolute; top: 20px; left: 0; right: 0; z-index: 95; display: flex; justify-content: center; padding: 0; pointer-events: none; opacity: 0; transform: translateY(-6px); transition: opacity .16s ease,transform .16s ease; }
 .chat-lazy-inline-loading.show { opacity: 1; transform: translateY(0); }
 .chat-lazy-inline-loading .chat-lazy-older-pill { background: rgba(18,24,36,.92); }
 #view-chat[style*="display: none"] .profile-ps-list-loader.is-running .profile-ps-list-symbol { animation: none !important; }
@@ -16609,7 +16609,7 @@ P
 				chatRenderPromise = renderDeferredChatHistory({ reason: 'open-chat', force: !chatRowsAlreadyVisible && !window.__chatHistoryDomRendered });
 			}
 			const scrollAfterChatRender = () => {
-				if (window.__chatInitialSnapshotPending === true && window.__chatPersistentCacheAvailable !== true) return;
+				if (window.__chatInitialSnapshotPending === true) return;
 				if (typeof isChatScreenVisibleForRead === 'function' && !isChatScreenVisibleForRead()) return;
 				if (typeof isChatManualJumpActive === 'function' && isChatManualJumpActive()) return;
 				const history = Array.isArray(window.messageHistory) ? window.messageHistory : [];
@@ -36828,6 +36828,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
     window.__chatVirtualStartIndex = 0;
     window.__chatVirtualEndIndex = 0;
     window.__chatVirtualLoadingOlder = false;
+    window.__chatOlderLoadCooldownUntil = 0;
     window.__chatLazyInlineHideTimer = null;
     window.__chatLazyInlineRemoveTimer = null;
     window.__chatCacheEpoch = '';
@@ -37141,7 +37142,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
         if (!box || (!force && box.querySelector('[id^="msg-row-"]'))) return;
         const sourceText = String(text || 'Preparing messages');
         const activeLoader = box.querySelector('#chat-history-loading');
-        if (!force && activeLoader) {
+        if (activeLoader) {
             applyChatHistoryLoadingInterfaceText(activeLoader, sourceText);
             return;
         }
@@ -37272,24 +37273,30 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
         const now = Date.now();
         if (window.__lastChatHistoryRequestAt && now - window.__lastChatHistoryRequestAt < 700) return false;
         window.__lastChatHistoryRequestAt = now;
+        const needsInitialServerSync = window.__chatHistoryReceived !== true;
         window.__chatHistoryRequesting = true;
-        if (window.__chatPersistentCacheAvailable !== true) window.__chatInitialSnapshotPending = true;
+        if (needsInitialServerSync) window.__chatInitialSnapshotPending = true;
         clearTimeout(window.__chatHistoryRequestWatchdog);
 
         const run = (async () => {
-            const cacheState = await hydrateChatHistoryFromPersistentCache({ renderIfVisible: true });
+            const cacheState = await hydrateChatHistoryFromPersistentCache({
+                renderIfVisible: !needsInitialServerSync,
+                holdForServer: needsInitialServerSync
+            });
             const hasPersistentCache = !!(cacheState && cacheState.cached === true);
-            if (hasPersistentCache) window.__chatInitialSnapshotPending = false;
-            else if (window.__chatHistoryReceived !== true) {
+            const needsStableFullSnapshot = needsInitialServerSync && !hasPersistentCache;
+            if (needsInitialServerSync) {
                 window.__chatInitialSnapshotPending = true;
                 if (typeof isChatScreenVisibleForRead === 'function' && isChatScreenVisibleForRead() && typeof showChatHistoryLoading === 'function') showChatHistoryLoading('Preparing messages', true);
+            } else if (hasPersistentCache) {
+                window.__chatInitialSnapshotPending = false;
             }
             const request = {
                 syncV1: true,
-                epoch: String(window.__chatCacheEpoch || ''),
-                revision: Math.max(0, Number(window.__chatCacheRevision) || 0),
+                epoch: needsStableFullSnapshot ? '' : String(window.__chatCacheEpoch || ''),
+                revision: needsStableFullSnapshot ? 0 : Math.max(0, Number(window.__chatCacheRevision) || 0),
                 seenCursor: Math.max(0, Number(window.__chatSeenCursor) || 0),
-                initialFullSync: !hasPersistentCache,
+                initialFullSync: needsStableFullSnapshot,
                 reason,
                 at: Date.now()
             };
@@ -37308,6 +37315,16 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
             if (syncResponse && syncResponse.syncV1 === true && syncResponse.success !== false) {
                 applyChatSyncResponse(syncResponse);
                 return true;
+            }
+            if (needsInitialServerSync) {
+                window.__chatInitialSnapshotPending = true;
+                if (typeof isChatScreenVisibleForRead === 'function' && isChatScreenVisibleForRead() && typeof showChatHistoryLoading === 'function') showChatHistoryLoading('Preparing messages', true);
+                setTimeout(() => {
+                    if (window.__chatHistoryReceived !== true && window.__chatHistoryRequesting !== true && !window.__chatSyncRequestPromise && typeof requestChatHistoryNow === 'function') {
+                        requestChatHistoryNow('initial-stable-retry');
+                    }
+                }, 900);
+                return false;
             }
             if (!hasPersistentCache) return false;
             try {
@@ -37531,7 +37548,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 
     function applyRealtimeChatSeenChange(event = {}) {
         if (!event || event.seenSyncV1 !== true) return false;
-        if (window.__chatInitialSnapshotPending === true && window.__chatPersistentCacheAvailable !== true) {
+        if (window.__chatInitialSnapshotPending === true) {
             if (!Array.isArray(window.__chatInitialPendingSeenEvents)) window.__chatInitialPendingSeenEvents = [];
             const cursorKey = Math.max(0, Number(event.cursor) || 0);
             if (!cursorKey || !window.__chatInitialPendingSeenEvents.some(item => Math.max(0, Number(item && item.cursor) || 0) === cursorKey)) window.__chatInitialPendingSeenEvents.push(event);
@@ -37550,7 +37567,11 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
     async function hydrateChatHistoryFromPersistentCache(options = {}) {
         const userName = getChatCacheUserName();
         if (!userName) return null;
-        if (window.__chatCacheHydratedUser === userName) return { hydrated: true, cached: window.__chatCacheHydratedHasCache === true };
+        const holdForServer = options.holdForServer === true || window.__chatHistoryReceived !== true;
+        if (window.__chatCacheHydratedUser === userName) {
+            if (holdForServer) window.__chatInitialSnapshotPending = true;
+            return { hydrated: true, cached: window.__chatCacheHydratedHasCache === true };
+        }
         if (window.__chatCacheHydratePromise) return window.__chatCacheHydratePromise;
         window.__chatCacheHydratePromise = (async () => {
             const record = await readChatPersistentCache(userName);
@@ -37572,14 +37593,14 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
             window.__chatSeenCursor = Math.max(0, Number(record.seenCursor) || 0);
             window.__chatPersistentCacheAvailable = true;
             window.__chatCacheReadyForWrite = true;
-            window.__chatInitialSnapshotPending = false;
+            window.__chatInitialSnapshotPending = holdForServer;
             window.messageHistory = cachedHistory;
             window.__chatVirtualStartIndex = Math.max(0, cachedHistory.length - getChatVirtualInitialLimit());
             window.__chatVirtualEndIndex = cachedHistory.length;
             window.__chatHistoryDomRendered = false;
             if (typeof registerChatUsersFromHistory === 'function') registerChatUsersFromHistory(cachedHistory);
             if (typeof updateChatHistoryRenderSignature === 'function') updateChatHistoryRenderSignature();
-            if (options.renderIfVisible !== false && typeof isChatScreenVisibleForRead === 'function' && isChatScreenVisibleForRead() && typeof renderDeferredChatHistory === 'function') {
+            if (!holdForServer && options.renderIfVisible !== false && typeof isChatScreenVisibleForRead === 'function' && isChatScreenVisibleForRead() && typeof renderDeferredChatHistory === 'function') {
                 Promise.resolve(renderDeferredChatHistory({ reason: 'chat-cache', force: true, forceBottom: false, showLoading: false })).catch(() => {});
             }
             return { hydrated: true, cached: true, messages: cachedHistory.length };
@@ -37592,10 +37613,19 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
         if (!response || response.syncV1 !== true || response.success === false) return false;
         const mode = String(response.mode || 'changes');
         const responseEpoch = String(response.epoch || '');
-        const pendingSyncChanges = mode === 'snapshot' && Array.isArray(window.__chatInitialPendingSyncChanges)
-            ? window.__chatInitialPendingSyncChanges.filter(change => !change || !change.epoch || String(change.epoch) === responseEpoch)
+        const responseRevision = Math.max(0, Number(response.revision) || 0);
+        const responseSeenCursor = Math.max(0, Number(response.seenCursor) || 0);
+        const wasInitialSyncPending = window.__chatInitialSnapshotPending === true;
+        const pendingSyncChanges = wasInitialSyncPending && Array.isArray(window.__chatInitialPendingSyncChanges)
+            ? window.__chatInitialPendingSyncChanges.filter(change => {
+                if (!change) return false;
+                if (change.epoch && String(change.epoch) !== responseEpoch) return false;
+                return Math.max(0, Number(change.revision) || 0) > responseRevision;
+            })
             : [];
-        const pendingSeenEvents = mode === 'snapshot' && Array.isArray(window.__chatInitialPendingSeenEvents) ? window.__chatInitialPendingSeenEvents.slice() : [];
+        const pendingSeenEvents = wasInitialSyncPending && Array.isArray(window.__chatInitialPendingSeenEvents)
+            ? window.__chatInitialPendingSeenEvents.filter(event => Math.max(0, Number(event && event.cursor) || 0) > responseSeenCursor)
+            : [];
         let nextHistory = mode === 'snapshot'
             ? normalizeChatHistoryPayload(response.messages || []).slice(-MAX_CHAT_HISTORY)
             : mergeChatSyncChanges(window.messageHistory || [], response.changes || []);
@@ -37603,15 +37633,13 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
         const combinedSeenEvents = (Array.isArray(response.seenEvents) ? response.seenEvents : []).concat(pendingSeenEvents);
         applyChatSeenEventsToHistory(nextHistory, combinedSeenEvents);
         window.__chatCacheEpoch = responseEpoch;
-        const responseRevision = Math.max(0, Number(response.revision) || 0);
         const pendingRevision = pendingSyncChanges.reduce((max, change) => Math.max(max, Math.max(0, Number(change && change.revision) || 0)), 0);
         window.__chatCacheRevision = Math.max(responseRevision, pendingRevision);
         if (response.seenSyncV1 === true || pendingSeenEvents.length) {
-            const responseSeenCursor = Math.max(0, Number(response.seenCursor) || 0);
             const pendingSeenCursor = pendingSeenEvents.reduce((max, event) => Math.max(max, Math.max(0, Number(event && event.cursor) || 0)), 0);
             window.__chatSeenCursor = Math.max(responseSeenCursor, pendingSeenCursor);
         }
-        if (mode === 'snapshot') {
+        if (wasInitialSyncPending || mode === 'snapshot') {
             window.__chatInitialPendingSyncChanges = [];
             window.__chatInitialPendingSeenEvents = [];
             window.__chatInitialSnapshotPending = false;
@@ -37619,7 +37647,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
             window.__chatCacheReadyForWrite = true;
             window.__chatCacheHydratedHasCache = true;
         }
-        const hasMessageChanges = mode === 'snapshot' || (Array.isArray(response.changes) && response.changes.length > 0);
+        const hasMessageChanges = mode === 'snapshot' || (Array.isArray(response.changes) && response.changes.length > 0) || pendingSyncChanges.length > 0;
         if (hasMessageChanges) handleChatHistorySnapshot(nextHistory);
         else {
             window.messageHistory = nextHistory;
@@ -37630,6 +37658,9 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
             if (typeof updateChatHistoryRenderSignature === 'function') updateChatHistoryRenderSignature();
             const seenIds = new Set(combinedSeenEvents.map(event => String(event && event.msgId || '')).filter(Boolean));
             seenIds.forEach(id => refreshChatSeenDomForMessage(id));
+            if (wasInitialSyncPending && typeof isChatScreenVisibleForRead === 'function' && isChatScreenVisibleForRead() && typeof renderDeferredChatHistory === 'function') {
+                Promise.resolve(renderDeferredChatHistory({ reason: 'chat-sync-ready', force: true, forceBottom: false, showLoading: false })).catch(() => {});
+            }
         }
         scheduleChatPersistentCacheWrite(0);
         return true;
@@ -37638,7 +37669,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 
     function applyRealtimeChatSyncChange(change = {}) {
         if (!change || change.syncV1 !== true || !change.epoch) return false;
-        if (window.__chatInitialSnapshotPending === true && window.__chatPersistentCacheAvailable !== true) {
+        if (window.__chatInitialSnapshotPending === true) {
             if (!Array.isArray(window.__chatInitialPendingSyncChanges)) window.__chatInitialPendingSyncChanges = [];
             const revisionKey = Math.max(0, Number(change.revision) || 0);
             if (!revisionKey || !window.__chatInitialPendingSyncChanges.some(item => Math.max(0, Number(item && item.revision) || 0) === revisionKey)) window.__chatInitialPendingSyncChanges.push(change);
@@ -38026,9 +38057,16 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
         if (nextStart >= currentStart) return Promise.resolve(false);
 
         window.__chatVirtualLoadingOlder = true;
+        window.__chatOlderLoadCooldownUntil = Date.now() + 240;
         if (canShowWaiting && typeof showChatLazyInlineLoading === 'function') showChatLazyInlineLoading('Loading older messages');
         const previousScrollHeight = box.scrollHeight;
         const previousScrollTop = box.scrollTop;
+        const previousScrollBehavior = box.style.getPropertyValue('scroll-behavior');
+        const previousScrollBehaviorPriority = box.style.getPropertyPriority('scroll-behavior');
+        const previousOverflowAnchor = box.style.getPropertyValue('overflow-anchor');
+        const previousOverflowAnchorPriority = box.style.getPropertyPriority('overflow-anchor');
+        box.style.setProperty('scroll-behavior', 'auto', 'important');
+        box.style.setProperty('overflow-anchor', 'none', 'important');
         const myName = localStorage.getItem('psn_username') || 'Guest';
         const lastReadTime = parseInt(loadState('psn_last_chat_read') || 0) || 0;
         const firstUnreadIndex = getChatFirstUnreadIndex(history, lastReadTime, myName);
@@ -38067,6 +38105,13 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
                     if (typeof syncChatVirtualBoundsFromRendered === 'function') syncChatVirtualBoundsFromRendered(history, box);
                     refreshChatLastRawDateFromRendered();
                     box.scrollTop = previousScrollTop + Math.max(0, box.scrollHeight - previousScrollHeight);
+                    requestAnimationFrame(() => {
+                        if (!box.isConnected) return;
+                        if (previousScrollBehavior) box.style.setProperty('scroll-behavior', previousScrollBehavior, previousScrollBehaviorPriority);
+                        else box.style.removeProperty('scroll-behavior');
+                        if (previousOverflowAnchor) box.style.setProperty('overflow-anchor', previousOverflowAnchor, previousOverflowAnchorPriority);
+                        else box.style.removeProperty('overflow-anchor');
+                    });
                     if (typeof initDateStickyLogic === 'function') initDateStickyLogic();
                     if (typeof setupDividerAutoRemove === 'function') setupDividerAutoRemove();
                     if (typeof refreshMentionJumpButton === 'function') refreshMentionJumpButton();
@@ -38074,10 +38119,15 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
                 } catch (err) {
                     console.error('[chat] older lazy load failed:', err);
                     try { box.id = originalId; } catch (e) {}
+                    if (previousScrollBehavior) box.style.setProperty('scroll-behavior', previousScrollBehavior, previousScrollBehaviorPriority);
+                    else box.style.removeProperty('scroll-behavior');
+                    if (previousOverflowAnchor) box.style.setProperty('overflow-anchor', previousOverflowAnchor, previousOverflowAnchorPriority);
+                    else box.style.removeProperty('overflow-anchor');
                     resolve(false);
                 } finally {
                     if (tempBox && tempBox.parentNode) tempBox.remove();
                     window.__chatVirtualLoadingOlder = false;
+                    window.__chatOlderLoadCooldownUntil = Date.now() + 220;
                     if (typeof hideChatLazyInlineLoading === 'function') hideChatLazyInlineLoading(0);
                 }
             };
@@ -38132,9 +38182,31 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
         else closeOverlay();
     }
 
+    function positionChatLazyInlineLoading() {
+        const loader = document.getElementById('chat-lazy-inline-loading');
+        const box = document.getElementById('chat-messages');
+        if (!loader || !box) return false;
+        const pinContainer = document.getElementById('pinned-messages-container');
+        const pinVisible = !!(pinContainer && getComputedStyle(pinContainer).display !== 'none' && pinContainer.offsetHeight > 0);
+        const pinHeight = pinVisible ? pinContainer.offsetHeight : 0;
+        const floatingDate = document.getElementById('floating-chat-date');
+        const floatingSpan = floatingDate ? floatingDate.querySelector('span') : null;
+        const measuredDateHeight = Math.max(
+            floatingDate ? Number(floatingDate.offsetHeight || 0) : 0,
+            floatingSpan ? Number(floatingSpan.getBoundingClientRect().height || 0) : 0,
+            20
+        );
+        const dateTop = pinHeight + 15;
+        loader.style.top = `${dateTop + measuredDateHeight + 10}px`;
+        return true;
+    }
+    window.positionChatLazyInlineLoading = positionChatLazyInlineLoading;
+
     function showChatLazyInlineLoading(text = 'Loading older messages') {
         const box = document.getElementById('chat-messages');
         if (!box || !window.__chatVirtualLoadingOlder) return null;
+        const host = document.querySelector('#subview-chat .file-manager-container') || box.parentElement;
+        if (!host) return null;
         if (window.__chatLazyInlineHideTimer) {
             clearTimeout(window.__chatLazyInlineHideTimer);
             window.__chatLazyInlineHideTimer = null;
@@ -38145,22 +38217,16 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
         }
         let loader = document.getElementById('chat-lazy-inline-loading');
         if (!loader) {
-            const previousScrollHeight = box.scrollHeight;
-            const previousScrollTop = box.scrollTop;
             loader = document.createElement('div');
             loader.id = 'chat-lazy-inline-loading';
             loader.className = 'chat-lazy-inline-loading';
             loader.innerHTML = '<div class="chat-lazy-older-pill"><span class="chat-lazy-older-spinner" aria-hidden="true"></span><span class="chat-lazy-inline-title"></span></div>';
-            box.insertBefore(loader, box.firstChild);
-            const addedHeight = Math.max(0, box.scrollHeight - previousScrollHeight);
-            if (previousScrollTop > 0 && addedHeight > 0) {
-                loader.dataset.preserveScroll = '1';
-                loader.dataset.addedHeight = String(addedHeight);
-                box.scrollTop = previousScrollTop + addedHeight;
-            }
+            host.appendChild(loader);
         }
         const title = loader.querySelector('.chat-lazy-inline-title');
         if (title) title.textContent = String(text || 'Loading older messages');
+        positionChatLazyInlineLoading();
+        requestAnimationFrame(() => positionChatLazyInlineLoading());
         loader.dataset.shownAt = String(Date.now());
         loader.dataset.active = '1';
         loader.classList.add('show');
@@ -38184,18 +38250,11 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
         const delay = Math.max(0, Number(minVisibleMs || 0) - elapsed);
         const closeLoader = () => {
             if (!loader || !loader.parentNode) return;
-            const parentBox = loader.parentElement;
-            const shouldPreserve = loader.dataset.preserveScroll === '1';
-            const addedHeight = Number(loader.dataset.addedHeight || loader.offsetHeight || 0);
             loader.dataset.active = '0';
             loader.classList.remove('show');
             window.__chatLazyInlineRemoveTimer = setTimeout(() => {
                 window.__chatLazyInlineRemoveTimer = null;
-                if (loader && loader.parentNode && loader.dataset.active !== '1' && !loader.classList.contains('show')) {
-                    const currentTop = parentBox && parentBox.scrollTop ? parentBox.scrollTop : 0;
-                    loader.remove();
-                    if (shouldPreserve && parentBox && currentTop > addedHeight) parentBox.scrollTop = Math.max(0, currentTop - addedHeight);
-                }
+                if (loader && loader.parentNode && loader.dataset.active !== '1' && !loader.classList.contains('show')) loader.remove();
             }, 120);
         };
         if (delay > 0) window.__chatLazyInlineHideTimer = setTimeout(() => {
@@ -38447,7 +38506,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
         const renderToken = (window.__chatRenderAbortToken = (window.__chatRenderAbortToken || 0) + 1);
         const history = Array.isArray(window.messageHistory) ? window.messageHistory.slice() : [];
         const signature = getChatHistoryRenderSignature(history);
-        if (window.__chatInitialSnapshotPending === true && window.__chatPersistentCacheAvailable !== true) {
+        if (window.__chatInitialSnapshotPending === true) {
             if (typeof showChatHistoryLoading === 'function') showChatHistoryLoading('Preparing messages', true);
             if (window.__chatHistoryRequesting !== true && typeof requestChatHistoryNow === 'function') requestChatHistoryNow(options.reason || 'initial-snapshot-render');
             return Promise.resolve(false);
@@ -38913,6 +38972,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 			const dividers = box.querySelectorAll('.date-divider');
 			if (dividers.length === 0) { 
 				floatingPill.style.display = 'none'; 
+				if (typeof positionChatLazyInlineLoading === 'function') positionChatLazyInlineLoading();
 				return; 
 			}
 	
@@ -38948,6 +39008,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 				box.dataset.lastFloatingLabel = "";
 				floatingPill.style.display = 'none';
 			}
+			if (typeof positionChatLazyInlineLoading === 'function') positionChatLazyInlineLoading();
 		};
 		if (typeof window.refreshChatDatePillLocale === 'function') window.refreshChatDatePillLocale();
 	}
@@ -43435,12 +43496,14 @@ function getVisibleChatStackEl(id) {
 			container.style.display = 'none';
 			if (chatBox) chatBox.style.paddingTop = '25px';
 			if (floatingPill) floatingPill.style.top = '10px';
+			if (typeof positionChatLazyInlineLoading === 'function') positionChatLazyInlineLoading();
 			return;
 		}
 	
 		container.style.display = 'block';
 		if (chatBox) chatBox.style.paddingTop = '76px';
 		if (floatingPill) floatingPill.style.top = '66px';
+		if (typeof positionChatLazyInlineLoading === 'function') requestAnimationFrame(() => positionChatLazyInlineLoading());
 	
 		const preview = document.getElementById('pin-preview-text');
 		const count = document.getElementById('pin-count');
@@ -45878,7 +45941,7 @@ function getVisibleChatStackEl(id) {
 
 			}
 
-			if (window.__chatInitialSnapshotPending === true && window.__chatPersistentCacheAvailable !== true) {
+			if (window.__chatInitialSnapshotPending === true) {
 				window.__chatHistoryDomRendered = false;
 				if (typeof showChatHistoryLoading === 'function') showChatHistoryLoading('Preparing messages', true);
 				return;
@@ -48108,7 +48171,8 @@ function getVisibleChatStackEl(id) {
         const manualJumpActive = typeof isChatManualJumpActive === 'function' && isChatManualJumpActive();
         const lazyPreloadTop = Math.max(120, Math.floor((this.clientHeight || 0) * 0.18));
         const hasMoreOlder = Number(window.__chatVirtualStartIndex || 0) > 0;
-        if (!manualJumpActive && hasMoreOlder && this.scrollTop < lazyPreloadTop && typeof loadOlderChatMessages === 'function') {
+        const olderLoadCoolingDown = Date.now() < Number(window.__chatOlderLoadCooldownUntil || 0);
+        if (!manualJumpActive && !olderLoadCoolingDown && hasMoreOlder && this.scrollTop < lazyPreloadTop && typeof loadOlderChatMessages === 'function') {
             loadOlderChatMessages(this.scrollTop <= 2 ? 'scroll-hard-top' : 'scroll-preload-top');
         } else if (!hasMoreOlder) {
             if (typeof hideChatLazyInlineLoading === 'function') hideChatLazyInlineLoading(0);
