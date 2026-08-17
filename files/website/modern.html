@@ -17235,9 +17235,9 @@ P
         if (/^DUST\s+514(?:\s*[-–—]\s*EVE\s+ONLINE|\s+Free[- ]to[- ]Play|\s+免費遊戲|\s*[\(（]基本プレイ無料[\)）])?$/i.test(t.trim())) t = "DUST 514";
         if (tLower.includes("tube")) t = t.replace(/\bYou\sTube\b/gi, "YouTube");
 
-        t = t.replace(/\sfor\sPS3\b/gi, "").replace(/\bPS3\b/gi, "").replace(/\bPlay\s*Station\b/gi, "PlayStation").replace(/\bFull\s+(Game|Version)\b/gi, "");
+        t = t.replace(/\sfor\sPS3(?:™|®)?/gi, "").replace(/\bPS3(?:™|®)?/gi, "").replace(/\bPlay\s*Station\b/gi, "PlayStation").replace(/\bFull\s+(Game|Version)\b/gi, "");
         t = normalizeGameTitlePunctuation(t);
-        t = t.replace(/\(\s+/g, "(").replace(/\s+\)/g, ")").replace(/\(\s*\)/g, "");
+        t = t.replace(/\(\s+/g, "(").replace(/\s+\)/g, ")").replace(/\(\s*\)/g, "").replace(/(?:\s*™){2,}/g, "™");
 
         return t.replace(/\s{2,}/g, ' ')
         .replace(/^[\s\-–—\:\,]+|[\s\-–—\:\,]+$/g, '')
@@ -21776,11 +21776,7 @@ P
 		let finalCategory = String(category || 'games').trim().toLowerCase().replace(/\s+/g, '_') || 'games';
 
 		if (finalCategory === 'games' || finalCategory === 'apps' || finalCategory === 'demos') {
-			const rawName = [
-				foundItem.rawName, foundItem.title, foundItem.name,
-				fallbackItem.rawName, fallbackItem.title, fallbackItem.name,
-				foundItem.cleanName, fallbackItem.cleanName
-			].filter(Boolean).join(' ');
+			let rawName = foundItem.title || foundItem.name || foundItem.cleanName || fallbackItem.title || fallbackItem.name || fallbackItem.cleanName || "";
 			const isTestVersion = isDemoLikeTitle(rawName);
 
 			const upName = String(rawName || '').toUpperCase();
@@ -21930,7 +21926,12 @@ P
 	};
 
 	window.getDownloadTypeMeta = function(category, item = {}) {
-		const resolved = window.inferContentCategoryKey(item, category || item.category || 'games');
+		const explicitCategory = category
+			? ((typeof window.normalizeContentCategoryKey === 'function')
+				? window.normalizeContentCategoryKey(category, '')
+				: String(category).trim().toLowerCase().replace(/\s+/g, '_'))
+			: '';
+		const resolved = explicitCategory || window.inferContentCategoryKey(item, item.category || 'games');
 		const map = {
 			games: { label: 'GAME', icon: 'fas fa-gamepad', cls: 'game' },
 			guides: { label: 'GUIDE', icon: 'fas fa-book-open', cls: 'guide' },
@@ -22054,6 +22055,10 @@ P
 
 		finalCategory = (matched && matched.category) ? matched.category : matchedCat || resolvedCategory;
 		if (isLibraryList && window.isLibraryBlockedContentCategory(finalCategory)) finalCategory = resolvedCategory || 'games';
+		let canonicalCleanName = matched ? String(matched.cleanName || '').trim() : '';
+		if (!canonicalCleanName && matched && typeof cleanGameName === 'function') {
+			canonicalCleanName = cleanGameName(matched.rawName || matched.title || matched.name || '', finalCategory) || '';
+		}
 		const rawConsoleTag = item.cTag || item.console || (matched ? matched.cTag : '') || 'ps3';
 		const safeConsoleTag = (typeof window.getSafeConsoleTagForItem === 'function')
 			? window.getSafeConsoleTagForItem(Object.assign({}, matched || {}, item, { category: finalCategory, cTag: rawConsoleTag, console: rawConsoleTag }), finalCategory)
@@ -22063,7 +22068,7 @@ P
 			id: titleId || (matched ? matched.id : ''),
 			titleId: titleId || (matched ? matched.id : ''),
 			contentId: currentContentId || (matched ? (matched.contentId || '') : ''),
-			cleanName: item.cleanName || (matched ? matched.cleanName : '') || item.name || item.title || '',
+			cleanName: canonicalCleanName || item.cleanName || item.name || item.title || '',
 			cTag: safeConsoleTag,
 			console: safeConsoleTag,
 			category: finalCategory
@@ -22121,8 +22126,7 @@ P
 			: rawConsoleTag;
 		let displayCleanName = coverData.cleanName || item.cleanName || item.name || item.title || '';
 		if (finalCategory === 'demos' && typeof cleanGameName === 'function') {
-			const cleanedDemoName = cleanGameName(displayCleanName, 'demos');
-			if (cleanedDemoName) displayCleanName = cleanedDemoName;
+			displayCleanName = cleanGameName(displayCleanName, 'demos') || displayCleanName;
 		}
 		const fixed = Object.assign({}, item, {
 			category: finalCategory,
@@ -22464,7 +22468,7 @@ P
 			const dlCoverCategoryRaw = String(dlFinalCategory || 'games');
 			const dlCoverCategory = dlCoverCategoryRaw.replace(/"/g, '&quot;');
 			const dlNoBingCover = (dlCoverCategoryRaw === 'avatars' || dlCoverCategoryRaw === 'themes') ? 'true' : 'false';
-			const dlDisplayName = dlFinalCategory === 'demos' ? (dl.cleanName || dl.name || '') : (dl.name || dl.cleanName || '');
+			const dlDisplayName = dlCoverData.cleanName || dl.cleanName || dl.name || '';
 			const typeMeta = window.getDownloadTypeMeta(dlFinalCategory, dlCoverData);
 			const typeTagHtml = window.getDownloadTypeTagHtml(dlFinalCategory, dlCoverData);
 			const typeClass = `dl-kind-${typeMeta.cls || 'default'}`;
@@ -51845,7 +51849,8 @@ function getVisibleChatStackEl(id) {
 				let clickAction = '';
 				let searchTagHtml = '';
 				let cursorStyle = '';
-				const itemSearchCategory = String(matchedStoreCategory || itemFinalCategory || item.category || '').replace(/'/g, "\'");
+				const itemResolvedSearchCategory = matchedStoreCategory || itemFinalCategory || item.category || '';
+				const itemSearchCategory = String(itemResolvedSearchCategory).replace(/'/g, "\'");
 				const itemSearchContentId = String(itemCoverData.contentId || item.contentId || '').replace(/'/g, "\'");
 
 				if (isSearchable) {
@@ -51873,8 +51878,9 @@ function getVisibleChatStackEl(id) {
 				const profileDownloadCountHtml = listType === 'downloads' && profileDownloadCount > 1
 					? `<span class="dl-download-count" title="Downloaded ${profileDownloadCount.toLocaleString('en-US')} times"><i class="fas fa-download"></i><span>${profileDownloadCount.toLocaleString('en-US')}</span></span>`
 					: '';
-				const typeMeta = window.getDownloadTypeMeta(itemFinalCategory || itemTypeCategory, itemCoverData || item);
-				const typeTagHtml = window.getDownloadTypeTagHtml(itemFinalCategory || itemTypeCategory, itemCoverData || item);
+				const itemTypeCategoryForDisplay = itemResolvedSearchCategory || itemFinalCategory || itemTypeCategory;
+				const typeMeta = window.getDownloadTypeMeta(itemTypeCategoryForDisplay, itemCoverData || item);
+				const typeTagHtml = window.getDownloadTypeTagHtml(itemTypeCategoryForDisplay, itemCoverData || item);
 				const typeClass = `dl-kind-${typeMeta.cls || 'default'}`;
 				const profileCoverKeyAttr = window.escapePlayerListText(profileCoverKey || '');
 				const profileCoverImgHtml = profileUsesBingCover
