@@ -21776,7 +21776,11 @@ P
 		let finalCategory = String(category || 'games').trim().toLowerCase().replace(/\s+/g, '_') || 'games';
 
 		if (finalCategory === 'games' || finalCategory === 'apps' || finalCategory === 'demos') {
-			let rawName = foundItem.title || foundItem.name || foundItem.cleanName || fallbackItem.title || fallbackItem.name || fallbackItem.cleanName || "";
+			const rawName = [
+				foundItem.rawName, foundItem.title, foundItem.name,
+				fallbackItem.rawName, fallbackItem.title, fallbackItem.name,
+				foundItem.cleanName, fallbackItem.cleanName
+			].filter(Boolean).join(' ');
 			const isTestVersion = isDemoLikeTitle(rawName);
 
 			const upName = String(rawName || '').toUpperCase();
@@ -22115,10 +22119,15 @@ P
 		const safeConsoleTag = (typeof window.getSafeConsoleTagForItem === 'function')
 			? window.getSafeConsoleTagForItem(Object.assign({}, item, coverData, { category: finalCategory, cTag: rawConsoleTag, console: rawConsoleTag }), finalCategory)
 			: rawConsoleTag;
+		let displayCleanName = coverData.cleanName || item.cleanName || item.name || item.title || '';
+		if (finalCategory === 'demos' && typeof cleanGameName === 'function') {
+			const cleanedDemoName = cleanGameName(displayCleanName, 'demos');
+			if (cleanedDemoName) displayCleanName = cleanedDemoName;
+		}
 		const fixed = Object.assign({}, item, {
 			category: finalCategory,
 			contentId: coverData.contentId || item.contentId || item.contentID || '',
-			cleanName: coverData.cleanName || item.cleanName || item.name || item.title || '',
+			cleanName: displayCleanName,
 			cTag: safeConsoleTag,
 			console: safeConsoleTag
 		});
@@ -22455,6 +22464,7 @@ P
 			const dlCoverCategoryRaw = String(dlFinalCategory || 'games');
 			const dlCoverCategory = dlCoverCategoryRaw.replace(/"/g, '&quot;');
 			const dlNoBingCover = (dlCoverCategoryRaw === 'avatars' || dlCoverCategoryRaw === 'themes') ? 'true' : 'false';
+			const dlDisplayName = dlFinalCategory === 'demos' ? (dl.cleanName || dl.name || '') : (dl.name || dl.cleanName || '');
 			const typeMeta = window.getDownloadTypeMeta(dlFinalCategory, dlCoverData);
 			const typeTagHtml = window.getDownloadTypeTagHtml(dlFinalCategory, dlCoverData);
 			const typeClass = `dl-kind-${typeMeta.cls || 'default'}`;
@@ -22482,7 +22492,7 @@ P
 					</div>
 					
 					<div class="dl-main-info" style="flex-grow: 1;">
-						<div class="dl-title-row"><span class="dl-name" data-no-translate="true" translate="no">${dl.name}</span></div>
+						<div class="dl-title-row"><span class="dl-name" data-no-translate="true" translate="no">${dlDisplayName}</span></div>
 						<div class="dl-meta-row"><span class="dl-date"><i class="far fa-clock"></i>${downloadDateText}</span>${remoteStatusHtml}${downloadCountHtml}</div>
 					</div>
 					<div class="dl-side-info" style="text-align: right;">
@@ -46964,10 +46974,6 @@ function getVisibleChatStackEl(id) {
 
 	window.broadcastProfileUpdate = function() {
 		if (window.__applyingRemoteProfileSync) return;
-		if (window.__profileBroadcastUpdateInFlight) {
-			window.__profileBroadcastUpdateQueued = true;
-			return window.__profileBroadcastUpdateInFlight;
-		}
 		if (window.__psnOfflineModeActive === true) {
 			if (typeof window.persistCurrentProfileSyncDirtyState === 'function') window.persistCurrentProfileSyncDirtyState();
 			return;
@@ -46982,12 +46988,11 @@ function getVisibleChatStackEl(id) {
 
 		const syncState = (typeof getProfileSyncDirtyState === 'function') ? getProfileSyncDirtyState() : null;
 		const dirty = syncState ? syncState.dirty : { trophies: true, downloads: true, wishlist: true, favorites: true, library: true, friends: true };
-		const dirtySnapshot = { ...dirty };
 	
 		let totalXp = 0;
 		let totalTrophies = 0;
 		const xpMap = { bronze: 15, silver: 30, gold: 90, platinum: 300 };
-		if (dirtySnapshot.trophies && window.userTrophies && typeof TROPHY_DATA !== 'undefined') {
+		if (dirty.trophies && window.userTrophies && typeof TROPHY_DATA !== 'undefined') {
 			Object.keys(window.userTrophies).forEach(id => {
 				if (window.userTrophies[id].unlocked && TROPHY_DATA[id]) {
 					totalXp += xpMap[TROPHY_DATA[id].type] || 0;
@@ -47020,83 +47025,47 @@ function getVisibleChatStackEl(id) {
 			payload.countersData = myCounters;
 		}
 
-		if (dirtySnapshot.trophies) {
+		if (dirty.trophies) {
 			payload.level = Math.floor(totalXp / 100) + 1;
 			payload.xp = totalXp;
 			payload.trophies = totalTrophies;
 			payload.trophiesData = window.userTrophies || {};
 		}
-		if (dirtySnapshot.downloads) {
+		if (dirty.downloads) {
 			payload.downloads = window.downloadHistory ? window.downloadHistory.length : 0;
 			payload.downloadsData = window.downloadHistory || [];
 			payload.downloadsClearedAt = Number(loadState(STORAGE_KEY_DOWNLOAD_CLEAR_PENDING) || 0) || 0;
 			payload.downloadsUpdatedAt = normalizeProfileListTimestamp(loadState(getProfileListTimestampStorageKey('downloads')));
 		}
-		if (dirtySnapshot.wishlist) {
+		if (dirty.wishlist) {
 			payload.wishlist = window.wishlist ? window.wishlist.length : 0;
 			payload.wishlistData = window.wishlist || [];
 			payload.wishlistUpdatedAt = normalizeProfileListTimestamp(loadState(getProfileListTimestampStorageKey('wishlist')));
 		}
-		if (dirtySnapshot.favorites) {
+		if (dirty.favorites) {
 			payload.favorites = window.favoritesLibrary ? window.favoritesLibrary.length : 0;
 			payload.favoritesData = window.favoritesLibrary || [];
 			payload.favoritesUpdatedAt = normalizeProfileListTimestamp(loadState(getProfileListTimestampStorageKey('favorites')));
 		}
-		if (dirtySnapshot.library) {
+		if (dirty.library) {
 			payload.library = typeof lastScannedGames !== 'undefined' ? lastScannedGames.length : 0;
 			payload.libraryData = typeof lastScannedGames !== 'undefined' ? lastScannedGames : [];
 			payload.libraryUpdatedAt = normalizeProfileListTimestamp(loadState(getProfileListTimestampStorageKey('library')));
 		}
-		if (dirtySnapshot.friends) {
+		if (dirty.friends) {
 			payload.friendsData = window.friendsList || [];
 			payload.friendsUpdatedAt = normalizeProfileListTimestamp(loadState(getProfileListTimestampStorageKey('friends')));
 		}
 
 		if (!Object.keys(payload).length) return;
+		socketChat.emit('update_profile', payload);
 
-		const sentDirtySections = Object.keys(dirtySnapshot).filter(key => dirtySnapshot[key]);
-		if (syncState && syncState.dirty) {
-			sentDirtySections.forEach(key => {
-				if (Object.prototype.hasOwnProperty.call(syncState.dirty, key)) syncState.dirty[key] = false;
+		if (syncState) {
+			syncState.lastBaseSignature = baseSignature;
+			Object.keys(syncState.dirty).forEach(key => {
+				if (dirty[key]) syncState.dirty[key] = false;
 			});
 		}
-
-		window.__profileBroadcastUpdateQueued = false;
-		window.__profileBroadcastUpdateInFlight = emitPersistentProfileUpdateWithAck(payload, 10000).then(response => {
-			const sameState = syncState && window.__profileSyncDirtyState === syncState && syncState.username === myName;
-			if (response && response.ok === true) {
-				if (sameState) syncState.lastBaseSignature = baseSignature;
-				return response;
-			}
-
-			if (sameState && syncState.dirty) {
-				sentDirtySections.forEach(key => {
-					if (Object.prototype.hasOwnProperty.call(syncState.dirty, key)) syncState.dirty[key] = true;
-				});
-			}
-			sentDirtySections.forEach(section => {
-				const stamp = getLocalProfileSectionVersion(myName, section) || Date.now();
-				markPersistentProfileSyncPending(section, stamp, myName);
-			});
-			console.warn('[PROFILE SYNC] Profile update was not acknowledged; keeping local changes pending:', response && response.error ? response.error : 'Unknown error');
-			return response || { ok: false, error: 'Profile update was not acknowledged.' };
-		}).catch(err => {
-			const sameState = syncState && window.__profileSyncDirtyState === syncState && syncState.username === myName;
-			if (sameState && syncState.dirty) sentDirtySections.forEach(key => { syncState.dirty[key] = true; });
-			sentDirtySections.forEach(section => markPersistentProfileSyncPending(section, getLocalProfileSectionVersion(myName, section) || Date.now(), myName));
-			console.warn('[PROFILE SYNC] Profile update failed; keeping local changes pending:', err);
-			return { ok: false, error: err && err.message ? err.message : 'Profile update failed.' };
-		}).finally(() => {
-			window.__profileBroadcastUpdateInFlight = null;
-			if (window.__profileBroadcastUpdateQueued === true) {
-				window.__profileBroadcastUpdateQueued = false;
-				setTimeout(() => {
-					if (typeof window.broadcastProfileUpdate === 'function') window.broadcastProfileUpdate();
-				}, 0);
-			}
-		});
-
-		return window.__profileBroadcastUpdateInFlight;
 	};
 	
 	window.renderTypingIndicator = function() {

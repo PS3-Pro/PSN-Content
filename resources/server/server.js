@@ -2643,18 +2643,6 @@ async function searchUsersFromDb(query, includeAdminFields = false, includeAllMa
   return searchUsersFromCache(query, includeAdminFields, includeAllMatches);
 }
 
-function normalizeUserDataPayloadFromDb(dataKey, rawPayload) {
-  let payload = rawPayload;
-  if (dataKey === 'trophiesData') {
-    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) payload = {};
-    return payload;
-  }
-  if (!Array.isArray(payload)) payload = [];
-  if (dataKey === 'downloadsData') return normalizeDownloadHistoryRecordsServer(payload).history;
-  if (dataKey === 'libraryData') return mergeLibraryRecordsServer(payload, []);
-  return payload;
-}
-
 async function getUserDataPayloadFromDb(targetName, type) {
   const safeTargetName = normalizeText(targetName, '');
   if (!safeTargetName) return null;
@@ -2670,26 +2658,16 @@ async function getUserDataPayloadFromDb(targetName, type) {
   const dataKey = keyMap[type] || `${type}Data`;
   const result = await queryDbWithRetry('SELECT data -> $2 AS payload FROM users WHERE name = $1', [safeTargetName, dataKey], { attempts: 3, label: 'USER DATA READ' });
   if (!result.rows.length) return null;
-  return normalizeUserDataPayloadFromDb(dataKey, result.rows[0].payload);
-}
 
-async function getUserDataPayloadsFromDb(targetName, dataKeys = []) {
-  const safeTargetName = normalizeText(targetName, '');
-  if (!safeTargetName) return null;
-
-  const uniqueKeys = [...new Set((Array.isArray(dataKeys) ? dataKeys : []).filter(key => USER_HEAVY_CACHE_KEYS.includes(key)))];
-  if (!uniqueKeys.length) return {};
-
-  const selectList = uniqueKeys.map((dataKey, index) => `data -> $${index + 2} AS "${dataKey}"`).join(', ');
-  const result = await queryDbWithRetry(`SELECT ${selectList} FROM users WHERE name = $1`, [safeTargetName, ...uniqueKeys], { attempts: 3, label: 'PROFILE HEAVY READ' });
-  if (!result.rows.length) return null;
-
-  const row = result.rows[0] || {};
-  const payloads = {};
-  uniqueKeys.forEach(dataKey => {
-    payloads[dataKey] = normalizeUserDataPayloadFromDb(dataKey, row[dataKey]);
-  });
-  return payloads;
+  let payload = result.rows[0].payload;
+  if (dataKey === 'trophiesData') {
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) payload = {};
+    return payload;
+  }
+  if (!Array.isArray(payload)) payload = [];
+  if (dataKey === 'downloadsData') return normalizeDownloadHistoryRecordsServer(payload).history;
+  if (dataKey === 'libraryData') return mergeLibraryRecordsServer(payload, []);
+  return payload;
 }
 
 
@@ -2780,17 +2758,11 @@ function incomingTouchesHeavyProfileSection(incoming = {}, dataKey, meta = {}) {
 
 async function buildWorkingUserForProfileUpdate(name, incoming = {}) {
   const base = { ...(userDatabase[name] || {}) };
-  const touchedKeys = Object.entries(PROFILE_HEAVY_SECTION_META)
-    .filter(([dataKey, meta]) => incomingTouchesHeavyProfileSection(incoming, dataKey, meta))
-    .map(([dataKey]) => dataKey);
-
-  if (!touchedKeys.length) return base;
-
-  const payloads = await getUserDataPayloadsFromDb(name, touchedKeys);
-  if (!payloads) return base;
-  touchedKeys.forEach(dataKey => {
-    if (Object.prototype.hasOwnProperty.call(payloads, dataKey)) base[dataKey] = payloads[dataKey];
-  });
+  for (const [dataKey, meta] of Object.entries(PROFILE_HEAVY_SECTION_META)) {
+    if (!incomingTouchesHeavyProfileSection(incoming, dataKey, meta)) continue;
+    const payload = await getUserDataPayloadFromDb(name, meta.type);
+    if (payload !== null) base[dataKey] = payload;
+  }
   return base;
 }
 
