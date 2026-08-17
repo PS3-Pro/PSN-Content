@@ -6505,7 +6505,7 @@ io.on('connection', (socket) => {
     if (!name || !userDatabase[name]) return;
 
     try {
-      const presenceState = await queryDbWithRetry(`
+      const presenceState = await pool.query(`
         WITH removed AS (
           DELETE FROM presence_sessions WHERE socket_id = $1 RETURNING socket_id
         )
@@ -6514,7 +6514,7 @@ io.on('connection', (socket) => {
         WHERE name = $2 AND last_seen >= NOW() - INTERVAL '${PRESENCE_TTL_SECONDS} seconds'
         ORDER BY last_seen DESC
         LIMIT 1
-      `, [socket.id, name], { attempts: 1, label: 'DISCONNECT PRESENCE READ' });
+      `, [socket.id, name]);
       invalidateOnlineListCache('presence-remove');
       socket.broadcast.emit('user_stopped_typing', { name });
 
@@ -6528,12 +6528,11 @@ io.on('connection', (socket) => {
         const lastSeen = Date.now();
         userDatabase[name].online = false;
         userDatabase[name].lastSeen = lastSeen;
-        await queryDbWithRetry(
+        await pool.query(
           `UPDATE users
            SET data = COALESCE(data, '{}'::jsonb) || jsonb_build_object('online', false, 'lastSeen', $2::bigint)
            WHERE name = $1`,
-          [name, lastSeen],
-          { attempts: 1, label: 'DISCONNECT PRESENCE SAVE' }
+          [name, lastSeen]
         );
         userCacheMeta[name] = Date.now();
         invalidateOnlineListCache('disconnect-presence-save');
@@ -6547,11 +6546,7 @@ io.on('connection', (socket) => {
       if (!stillHasLocalSession) compactCachedUser(name);
       await emitOnlineList();
     } catch (err) {
-      if (isPgTransientConnectionError(err)) {
-        console.warn(`[DISCONNECT CLEANUP] PostgreSQL temporarily unavailable for ${name}; presence TTL will reconcile it automatically: ${err && err.message ? err.message : err}`);
-      } else {
-        console.error('[DISCONNECT CLEANUP ERROR]:', err);
-      }
+      console.error('[DISCONNECT CLEANUP ERROR]:', err);
       if (userDatabase[name]) userDatabase[name].lastSeen = Date.now();
       const stillHasLocalSession = getSocketsByUserName(name).some(client => client && client.connected);
       if (!stillHasLocalSession) compactCachedUser(name);
