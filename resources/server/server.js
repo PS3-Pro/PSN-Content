@@ -292,6 +292,56 @@ app.get('/ping', (req, res) => {
   res.send('Server is Awake!');
 });
 
+function setSiteVisitsCors(res) {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Vary', 'Origin');
+}
+
+app.options('/api/site-visits', (req, res) => {
+  setSiteVisitsCors(res);
+  res.status(204).end();
+});
+
+app.get('/api/site-visits', async (req, res) => {
+  setSiteVisitsCors(res);
+  try {
+    const result = await queryDbWithRetry(
+      "SELECT value FROM site_stats WHERE stat_key = 'database_visits' LIMIT 1",
+      [],
+      { attempts: 2, label: 'SITE VISITS READ' }
+    );
+    const total = Number(result.rows[0] && result.rows[0].value || 0);
+    return res.json({ ok: true, total: Number.isFinite(total) && total >= 0 ? total : 0 });
+  } catch (err) {
+    console.error('[SITE VISITS READ ERROR]:', err && err.message ? err.message : err);
+    return res.status(503).json({ ok: false, error: 'Visit counter unavailable.' });
+  }
+});
+
+app.post('/api/site-visits', async (req, res) => {
+  setSiteVisitsCors(res);
+  try {
+    const result = await queryDbWithRetry(
+      `INSERT INTO site_stats (stat_key, value, updated_at)
+       VALUES ('database_visits', 1, NOW())
+       ON CONFLICT (stat_key)
+       DO UPDATE SET value = site_stats.value + 1, updated_at = NOW()
+       RETURNING value`,
+      [],
+      { attempts: 3, label: 'SITE VISITS INCREMENT' }
+    );
+    const total = Number(result.rows[0] && result.rows[0].value || 0);
+    return res.json({ ok: true, total: Number.isFinite(total) && total >= 0 ? total : 0 });
+  } catch (err) {
+    console.error('[SITE VISITS INCREMENT ERROR]:', err && err.message ? err.message : err);
+    return res.status(503).json({ ok: false, error: 'Visit counter unavailable.' });
+  }
+});
+
 
 const DEFAULT_IGDB_CLIENT_ID = String(process.env.IGDB_CLIENT_ID || process.env.TWITCH_CLIENT_ID || '').trim();
 const DEFAULT_IGDB_CLIENT_SECRET = String(process.env.IGDB_CLIENT_SECRET || process.env.TWITCH_CLIENT_SECRET || '').trim();
@@ -876,6 +926,11 @@ async function initDb() {
       reason TEXT,
       messages JSONB,
       created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS site_stats (
+      stat_key TEXT PRIMARY KEY,
+      value BIGINT NOT NULL DEFAULT 0,
+      updated_at TIMESTAMPTZ DEFAULT NOW()
     );
   `);
 
