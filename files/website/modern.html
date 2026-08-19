@@ -16861,18 +16861,12 @@ P
 		}
 	};
 	
-	window.showSocialSection = function(section) {
+	function applySocialSection(section) {
 		const chatView = document.getElementById('subview-chat');
 		const friendsView = document.getElementById('subview-friends');
 		
 		const parentView = document.getElementById('view-chat');
-		const isParentVisible = parentView && (parentView.style.display === 'block' || parentView.style.display === 'flex');
 		if (parentView) parentView.classList.toggle('friends-mobile-scroll', section === 'friends');
-	
-		if (isParentVisible) {
-			if (section === 'chat' && chatView && chatView.style.display === 'flex') return;
-			if (section === 'friends' && friendsView && friendsView.style.display === 'flex') return;
-		}
 	
 		const btnChat = document.getElementById('nav-chat-global');
 		const btnFriends = document.getElementById('nav-chat-friends');
@@ -16919,12 +16913,6 @@ P
 				
 				searchInput.setAttribute('autocomplete', 'off');
 				searchInput.setAttribute('spellcheck', 'false');
-			}
-	
-	
-			const chatRoot = document.getElementById('view-chat');
-			if (chatRoot && chatRoot.style.display !== 'block' && chatRoot.style.display !== 'flex') {
-				switchView('view-chat');
 			}
 
 			if (window.__chatRenderLastReadSnapshot === null || window.__chatRenderLastReadSnapshot === undefined) window.__chatRenderLastReadSnapshot = parseInt(loadState('psn_last_chat_read') || 0) || 0;
@@ -17028,11 +17016,6 @@ P
 				searchInput.setAttribute('autocomplete', 'off');
 				searchInput.setAttribute('spellcheck', 'false');
 			}
-			
-			const chatRoot = document.getElementById('view-chat');
-			if (chatRoot && chatRoot.style.display !== 'block' && chatRoot.style.display !== 'flex') {
-				switchView('view-chat');
-			}
 	
 			if (typeof renderFriendsList === 'function') renderFriendsList('');
 	
@@ -17044,7 +17027,25 @@ P
 		if (section === 'chat' && typeof adminUpdateChatControlsBanner === 'function') {
 			setTimeout(adminUpdateChatControlsBanner, 80);
 		}
-	};
+	}
+
+	window.showSocialSection = function(section) {
+		const parentView = document.getElementById('view-chat');
+		const chatView = document.getElementById('subview-chat');
+		const friendsView = document.getElementById('subview-friends');
+		const isParentVisible = parentView && (parentView.style.display === 'block' || parentView.style.display === 'flex');
+
+		if (!isParentVisible) {
+			switchView('view-chat', false, false, () => applySocialSection(section));
+			return;
+		}
+
+		if (section === 'chat' && chatView && chatView.style.display === 'flex') return;
+		if (section === 'friends' && friendsView && friendsView.style.display === 'flex') return;
+
+		applySocialSection(section);
+	}
+;
 	
 	window.restorePreviousState = function() {
 		if (typeof playUiBack === 'function') playUiBack();
@@ -26779,6 +26780,76 @@ P
 		if (typeof renderWishLetterFilter === 'function') renderWishLetterFilter();
 	}
 
+
+	function runChatDestinationExit(currentView, request) {
+		window.__pendingViewSwitch = request;
+		if (window.__viewExitTransitionActive) return;
+
+		window.__viewExitTransitionActive = true;
+
+		const pausedEntryAnimations = [];
+		currentView.querySelectorAll('.anim-up').forEach(el => {
+			if (typeof el.getAnimations !== 'function') return;
+			el.getAnimations().forEach(animation => {
+				try {
+					animation.pause();
+					pausedEntryAnimations.push({ el, animation });
+				} catch (e) {}
+			});
+		});
+
+		const computed = window.getComputedStyle ? window.getComputedStyle(currentView) : null;
+		const startOpacity = computed ? computed.opacity : '1';
+		const startTransform = computed && computed.transform !== 'none'
+			? computed.transform
+			: 'translateY(0) scale(1)';
+		const startFilter = computed && computed.filter !== 'none' ? computed.filter : 'none';
+		const isExploreExit = currentView.id === 'view-explore';
+		const exitDuration = isExploreExit ? 300 : 180;
+		const endFilter = isExploreExit ? 'none' : 'blur(4px)';
+
+		currentView.classList.remove('anim-up', 'anim-out');
+
+		const finish = () => {
+			pausedEntryAnimations.forEach(({ el, animation }) => {
+				try { animation.cancel(); } catch (e) {}
+				el.classList.remove('anim-up');
+			});
+
+			window.__viewExitTransitionActive = false;
+			window.__viewExitAnimation = null;
+
+			const next = window.__pendingViewSwitch || request;
+			window.__pendingViewSwitch = null;
+			window.switchView(next.viewId, next.forceReset, next.preventAutoLoad, next.onShown, true);
+		};
+
+		if (typeof currentView.animate === 'function') {
+			const animation = currentView.animate([
+				{ opacity: startOpacity, transform: startTransform, filter: startFilter },
+				{ opacity: 0, transform: 'translateY(-8px) scale(.985)', filter: endFilter }
+			], {
+				duration: exitDuration,
+				easing: 'cubic-bezier(.4,0,1,1)',
+				fill: 'forwards'
+			});
+
+			window.__viewExitAnimation = animation;
+			animation.onfinish = () => {
+				finish();
+				try { animation.cancel(); } catch (e) {}
+			};
+			return;
+		}
+
+		currentView.classList.add('anim-out');
+		window.__viewExitTimer = setTimeout(() => {
+			currentView.classList.remove('anim-out');
+			window.__viewExitTimer = null;
+			finish();
+		}, exitDuration);
+	}
+
 	window.switchView = function(viewId, forceReset = false, preventAutoLoad = false, onShown = null, _skipExit = false) {
 		const mainViews = ['view-explore', 'view-browse', 'view-wishlist', 'view-downloads', 'view-library', 'view-trending', 'view-online'];
 		const profileUtils = ['view-chat', 'view-trophies', 'view-rewards'];
@@ -26803,6 +26874,12 @@ P
 		window.__lastSwitchViewWasNoop = null;
 
 		const reduceViewMotion = !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+
+		if (!_skipExit && viewId === 'view-chat' && currentView && currentView.id !== viewId && !window.isRestoringHistory && !reduceViewMotion) {
+			runChatDestinationExit(currentView, { viewId, forceReset, preventAutoLoad, onShown });
+			return;
+		}
+
 		if (!_skipExit && viewId !== 'view-chat' && currentView && currentView.id !== viewId && !window.isRestoringHistory && !reduceViewMotion) {
 			window.__pendingViewSwitch = { viewId, forceReset, preventAutoLoad, onShown };
 			if (window.__viewExitTransitionActive) return;
