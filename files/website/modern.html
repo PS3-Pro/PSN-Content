@@ -17047,9 +17047,76 @@ P
 	}
 ;
 	
-	window.restorePreviousState = function() {
-		if (typeof playUiBack === 'function') playUiBack();
+	function getHistoryReturnViewId(history) {
+		if (!history) return 'view-browse';
+
+		const from = history.fromExplore;
+		const normalizeView = (name) => {
+			if (!name) return 'view-browse';
+			if (name.startsWith('library_')) return 'view-library';
+			if (name.startsWith('online_')) return 'view-online';
+			return 'view-' + name;
+		};
+
+		if (from === true || from === 'explore') return 'view-explore';
+
+		if (typeof from === 'string' && from.startsWith('gamemodal|')) {
+			const parts = from.split('|');
+			return normalizeView(parts[2] || 'browse');
+		}
+
+		if (typeof from === 'string' && from.startsWith('profilelist|')) {
+			const parts = from.split('|');
+			return normalizeView(parts[3] || 'browse');
+		}
+
+		if (typeof from === 'string' && from.startsWith('profile|')) {
+			const parts = from.split('|');
+			return normalizeView(parts[2] || 'browse');
+		}
+
+		if (typeof from === 'string' && from.startsWith('online_modal|')) {
+			const parts = from.split('|');
+			return normalizeView(parts[1] || 'online');
+		}
+
+		const crossViewNames = new Set([
+			'downloads', 'wishlist', 'library', 'trending',
+			'library_monitor', 'library_games', 'library_favs', 'library_files',
+			'online_revived', 'online_featured', 'guides', 'settings', 'rewards'
+		]);
+
+		return typeof from === 'string' && crossViewNames.has(from)
+			? normalizeView(from)
+			: 'view-browse';
+	}
+
+	window.restorePreviousState = function(_skipExit = false) {
+		if (!_skipExit && typeof playUiBack === 'function') playUiBack();
 		if (!navHistory) return;
+
+		if (!_skipExit) {
+			const currentView = document.querySelector('.view-section[style*="display: block"]');
+			const returnViewId = getHistoryReturnViewId(navHistory);
+			const reduceViewMotion = !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+
+			if (currentView && returnViewId && currentView.id !== returnViewId && !reduceViewMotion) {
+				if (window.__viewExitTransitionActive) return;
+				window.__viewExitTransitionActive = true;
+
+				const exitDuration = currentView.id === 'view-explore' ? 300 : 180;
+				currentView.classList.remove('anim-up', 'anim-out');
+				void currentView.offsetWidth;
+				currentView.classList.add('anim-out');
+
+				setTimeout(() => {
+					currentView.classList.remove('anim-out');
+					window.__viewExitTransitionActive = false;
+					window.restorePreviousState(true);
+				}, exitDuration);
+				return;
+			}
+		}
 		if (typeof navHistory.fromExplore === 'string' && navHistory.fromExplore.startsWith('group_title|') && typeof clearBrowseExpandedGroupTitle === 'function') {
 			clearBrowseExpandedGroupTitle();
 		}
