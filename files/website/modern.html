@@ -2146,9 +2146,17 @@ body.chat-selection-mode .chat-message-actions .chat-delete-action:not(.chat-del
 /* ========================================================================== PAGE EXIT TRANSITION ========================================================================== */
 @keyframes view-exit{0%{opacity:1;transform:translateY(0) scale(1);filter:none;}100%{opacity:0;transform:translateY(-8px) scale(.985);filter:blur(4px);}}
 @keyframes explore-view-exit{0%{opacity:1;transform:translate3d(0,0,0) scale(1);}100%{opacity:0;transform:translate3d(0,-8px,0) scale(.985);}}
+@keyframes browse-context-forward-out{0%{opacity:1;transform:translateX(0);}100%{opacity:0;transform:translateX(-16px);}}
+@keyframes browse-context-forward-in{0%{opacity:0;transform:translateX(18px);}100%{opacity:1;transform:translateX(0);}}
+@keyframes browse-context-back-out{0%{opacity:1;transform:translateX(0);}100%{opacity:0;transform:translateX(16px);}}
+@keyframes browse-context-back-in{0%{opacity:0;transform:translateX(-18px);}100%{opacity:1;transform:translateX(0);}}
 .anim-out { transform-origin: top center; pointer-events: none !important; animation: view-exit .18s cubic-bezier(.4,0,1,1) forwards !important; }
+#view-browse.browse-context-forward-out { pointer-events: none !important; animation: browse-context-forward-out .11s cubic-bezier(.4,0,1,1) forwards !important; }
+#view-browse.browse-context-forward-in { animation: browse-context-forward-in .16s cubic-bezier(.2,.8,.2,1) forwards !important; }
+#view-browse.browse-context-back-out { pointer-events: none !important; animation: browse-context-back-out .11s cubic-bezier(.4,0,1,1) forwards !important; }
+#view-browse.browse-context-back-in { animation: browse-context-back-in .16s cubic-bezier(.2,.8,.2,1) forwards !important; }
 #view-explore.anim-out { will-change: transform,opacity; backface-visibility: hidden; animation: explore-view-exit .30s cubic-bezier(.4,0,1,1) forwards !important; }
-@media (prefers-reduced-motion:reduce) { .anim-out { animation-duration: .01ms !important; animation-delay: 0ms !important; } }
+@media (prefers-reduced-motion:reduce) { .anim-out, #view-browse.browse-context-forward-out, #view-browse.browse-context-forward-in, #view-browse.browse-context-back-out, #view-browse.browse-context-back-in { animation-duration: .01ms !important; animation-delay: 0ms !important; } }
 
 /* ========================================================================== PAGE ENTRANCE (FADE-IN UP & EXCEPTIONS) ========================================================================== */
 .anim-up { transform-origin: top center; animation: view-enter 0.4s cubic-bezier(0.2,0.8,0.2,1) forwards !important; }
@@ -15008,6 +15016,53 @@ P
         return source.map((game, index) => ({ game, sourceIndex: index }));
     }
 
+    function runBrowseContextTransition(updateContent, direction = 'forward') {
+        if (typeof updateContent !== 'function') return;
+
+        const browseView = document.getElementById('view-browse');
+        const isBrowseVisible = browseView && (browseView.style.display === 'block' || browseView.style.display === 'flex');
+        const reduceMotion = !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+
+        if (!isBrowseVisible || reduceMotion) {
+            updateContent();
+            return;
+        }
+
+        if (window.__browseContextTransitionActive) return;
+        window.__browseContextTransitionActive = true;
+
+        const isBack = direction === 'back';
+        const outClass = isBack ? 'browse-context-back-out' : 'browse-context-forward-out';
+        const inClass = isBack ? 'browse-context-back-in' : 'browse-context-forward-in';
+        const transitionClasses = [
+            'anim-up',
+            'browse-context-forward-out',
+            'browse-context-forward-in',
+            'browse-context-back-out',
+            'browse-context-back-in'
+        ];
+
+        browseView.classList.remove(...transitionClasses);
+        void browseView.offsetWidth;
+        browseView.classList.add(outClass);
+
+        setTimeout(() => {
+            browseView.classList.remove(outClass);
+            updateContent();
+
+            requestAnimationFrame(() => {
+                browseView.classList.remove(inClass);
+                void browseView.offsetWidth;
+                browseView.classList.add(inClass);
+
+                setTimeout(() => {
+                    browseView.classList.remove(inClass);
+                    window.__browseContextTransitionActive = false;
+                }, 160);
+            });
+        }, 110);
+    }
+
     window.openBrowseTitleGroup = function(encodedKey) {
         const key = decodeURIComponent(encodedKey || '');
         if (!key) return;
@@ -15020,43 +15075,45 @@ P
 
         if (typeof playUiClick === 'function') playUiClick();
 
-        const scrollArea = document.getElementById('scroll-area') || document.querySelector('.content');
-        const currentCat = document.getElementById('cat-select')?.value || 'games';
-        const currentRegion = document.getElementById('region-select')?.value || 'ALL';
-        const missingRapToggle = document.getElementById('show-missing-rap-toggle');
+        runBrowseContextTransition(() => {
+            const scrollArea = document.getElementById('scroll-area') || document.querySelector('.content');
+            const currentCat = document.getElementById('cat-select')?.value || 'games';
+            const currentRegion = document.getElementById('region-select')?.value || 'ALL';
+            const missingRapToggle = document.getElementById('show-missing-rap-toggle');
 
-        browseExpandedGroupTitle = { key };
+            browseExpandedGroupTitle = { key };
 
-        navHistory = {
-            fromExplore: `group_title|${currentCat.charAt(0).toUpperCase() + currentCat.slice(1)}`,
-            category: currentCat,
-            search: document.getElementById('search-input')?.value || '',
-            region: currentRegion,
-            letter: typeof activeLetter !== 'undefined' ? activeLetter : 'ALL',
-            consoles: Array.from(document.querySelectorAll('#console-filters input:checked')).map(cb => cb.value),
-            appsFilters: Array.from(document.querySelectorAll('#app-filters input:checked')).map(cb => cb.value),
-            showMissingRap: !!(missingRapToggle && missingRapToggle.checked),
-            lockSearch: true,
-            contextualType: 'regions',
-            limit: renderLimit,
-            scroll: scrollArea ? scrollArea.scrollTop : 0,
-            parentHistory: navHistory || null
-        };
+            navHistory = {
+                fromExplore: `group_title|${currentCat.charAt(0).toUpperCase() + currentCat.slice(1)}`,
+                category: currentCat,
+                search: document.getElementById('search-input')?.value || '',
+                region: currentRegion,
+                letter: typeof activeLetter !== 'undefined' ? activeLetter : 'ALL',
+                consoles: Array.from(document.querySelectorAll('#console-filters input:checked')).map(cb => cb.value),
+                appsFilters: Array.from(document.querySelectorAll('#app-filters input:checked')).map(cb => cb.value),
+                showMissingRap: !!(missingRapToggle && missingRapToggle.checked),
+                lockSearch: true,
+                contextualType: 'regions',
+                limit: renderLimit,
+                scroll: scrollArea ? scrollArea.scrollTop : 0,
+                parentHistory: navHistory || null
+            };
 
-        renderLimit = Math.max(
-            groupItems.length,
-            typeof getBrowseInitialRenderLimit === 'function' ? getBrowseInitialRenderLimit() : DEFAULT_RENDER_LIMIT
-        );
+            renderLimit = Math.max(
+                groupItems.length,
+                typeof getBrowseInitialRenderLimit === 'function' ? getBrowseInitialRenderLimit() : DEFAULT_RENDER_LIMIT
+            );
 
-        if (scrollArea) {
-            const oldBehavior = scrollArea.style.scrollBehavior;
-            scrollArea.style.scrollBehavior = 'auto';
-            scrollArea.scrollTop = 0;
-            scrollArea.style.scrollBehavior = oldBehavior;
-        }
+            if (scrollArea) {
+                const oldBehavior = scrollArea.style.scrollBehavior;
+                scrollArea.style.scrollBehavior = 'auto';
+                scrollArea.scrollTop = 0;
+                scrollArea.style.scrollBehavior = oldBehavior;
+            }
 
-        if (typeof syncBrowseContextualSearchState === 'function') syncBrowseContextualSearchState('view-browse');
-        if (typeof window.renderGrid === 'function') window.renderGrid(false);
+            if (typeof syncBrowseContextualSearchState === 'function') syncBrowseContextualSearchState('view-browse');
+            if (typeof window.renderGrid === 'function') window.renderGrid(false);
+        });
     };
 
     window.openBrowseTitleGroupFromCard = function(card) {
@@ -16709,7 +16766,7 @@ P
 		const browseView = document.getElementById('view-browse');
 		const isBrowseVisible = browseView && (browseView.style.display === 'block' || browseView.style.display === 'flex');
 		if (isBrowseVisible) {
-			openSearchInBrowse();
+			runBrowseContextTransition(openSearchInBrowse);
 		} else {
 			switchView('view-browse', false, true, openSearchInBrowse);
 		}
@@ -17114,6 +17171,11 @@ P
 					window.__viewExitTransitionActive = false;
 					window.restorePreviousState(true);
 				}, exitDuration);
+				return;
+			}
+
+			if (currentView && currentView.id === 'view-browse' && returnViewId === 'view-browse' && !reduceViewMotion) {
+				runBrowseContextTransition(() => window.restorePreviousState(true), 'back');
 				return;
 			}
 		}
