@@ -13897,6 +13897,11 @@ P
     let activeLetter = "ALL";
     let navHistory = null;
     let browseExpandedGroupTitle = null;
+    let browseFilteredDataVersion = 0;
+    let browseGroupedItemsIndex = new Map();
+    let browseMissingRapByGroup = new Map();
+    let browseMissingRapStatsVersion = -1;
+    const browseGroupTitleKeyCache = new WeakMap();
 
     function getBrowseGroupTitleToggle() {
         return document.getElementById('group-titles-toggle');
@@ -14676,17 +14681,23 @@ P
     }
 
     function getBrowseGroupTitleKey(game) {
+        if (game && typeof game === 'object' && browseGroupTitleKeyCache.has(game)) {
+            return browseGroupTitleKeyCache.get(game);
+        }
+
         const category = String(game && game.category ? game.category : '').toLowerCase();
         const normalizedTitle = category === 'soundtracks'
             ? normalizeSoundtrackGroupTitleName(game)
             : (category === 'videos'
                 ? normalizeVideoGroupTitleName(game)
                 : normalizeBrowseGroupTitleName(game));
-
-        return [
+        const key = [
             String(game && game.cTag ? game.cTag : '').toLowerCase(),
             normalizedTitle
         ].join('|');
+
+        if (game && typeof game === 'object') browseGroupTitleKeyCache.set(game, key);
+        return key;
     }
 
     function clearBrowseExpandedGroupTitle() {
@@ -14776,9 +14787,21 @@ P
         const key = groupKey || (browseExpandedGroupTitle && browseExpandedGroupTitle.key);
         if (!key) return 'Regions';
 
-        const count = getBrowseGroupRegionCount((Array.isArray(filteredData) ? filteredData : [])
-            .filter(game => getBrowseGroupTitleKey(game) === key));
+        let items = null;
+        if (browseExpandedGroupTitle && browseExpandedGroupTitle.key === key && browseExpandedGroupTitle.version === browseFilteredDataVersion && Array.isArray(browseExpandedGroupTitle.items)) {
+            items = browseExpandedGroupTitle.items;
+        } else {
+            const indexed = browseGroupedItemsIndex.get(key);
+            if (indexed && indexed.version === browseFilteredDataVersion && Array.isArray(indexed.items)) items = indexed.items;
+        }
 
+        if (!items) {
+            items = (Array.isArray(filteredData) ? filteredData : [])
+                .filter(game => getBrowseGroupTitleKey(game) === key)
+                .map((game, sourceIndex) => ({ game, sourceIndex }));
+        }
+
+        const count = getBrowseGroupRegionCount(items);
         return count === 1 ? 'Region' : 'Regions';
     }
 
@@ -14965,7 +14988,7 @@ P
             group.items.push({ game, sourceIndex: index });
         });
 
-        return Array.from(groups.values()).map(group => {
+        const groupedItems = Array.from(groups.values()).map(group => {
             const sortedItems = group.items.slice().sort(compareBrowseRegionItems);
             const pendingFocus = window.__pendingStoreFocus || null;
             const focusedRepresentative = pendingFocus && pendingFocus.contentId
@@ -14991,22 +15014,46 @@ P
             group.displayTitle = displayTitle || (group.game && group.game.cleanName) || '';
             return group;
         });
+
+        browseGroupedItemsIndex = new Map(groupedItems.map(group => [
+            group.groupKey,
+            { items: group.items, version: browseFilteredDataVersion }
+        ]));
+        return groupedItems;
     }
 
     function getBrowseRenderItems() {
         const source = Array.isArray(filteredData) ? filteredData : [];
 
         if (browseExpandedGroupTitle && browseExpandedGroupTitle.key) {
+            const key = browseExpandedGroupTitle.key;
             const currentCategory = String(document.getElementById('cat-select')?.value || '').toLowerCase();
-            return source
-                .map((game, index) => ({
-                    game: currentCategory === 'videos'
-                        ? { ...game, cleanName: getVideoGroupedVariantDisplayTitle(game) }
-                        : game,
-                    sourceIndex: index
-                }))
-                .filter(item => getBrowseGroupTitleKey(item.game) === browseExpandedGroupTitle.key)
-                .sort(compareBrowseRegionItems);
+            let groupItems = null;
+
+            if (browseExpandedGroupTitle.version === browseFilteredDataVersion && Array.isArray(browseExpandedGroupTitle.items)) {
+                groupItems = browseExpandedGroupTitle.items;
+            } else {
+                const indexed = browseGroupedItemsIndex.get(key);
+                if (indexed && indexed.version === browseFilteredDataVersion && Array.isArray(indexed.items)) {
+                    groupItems = indexed.items;
+                }
+            }
+
+            if (!groupItems) {
+                groupItems = source
+                    .map((game, sourceIndex) => ({ game, sourceIndex }))
+                    .filter(item => getBrowseGroupTitleKey(item.game) === key)
+                    .sort(compareBrowseRegionItems);
+            }
+
+            browseExpandedGroupTitle.items = groupItems;
+            browseExpandedGroupTitle.version = browseFilteredDataVersion;
+
+            if (currentCategory !== 'videos') return groupItems;
+            return groupItems.map(item => ({
+                ...item,
+                game: { ...item.game, cleanName: getVideoGroupedVariantDisplayTitle(item.game) }
+            }));
         }
 
         if (shouldUseBrowseGroupedTitleCards()) {
@@ -15067,9 +15114,13 @@ P
         const key = decodeURIComponent(encodedKey || '');
         if (!key) return;
 
-        const groupItems = (Array.isArray(filteredData) ? filteredData : [])
-            .map((game, index) => ({ game, sourceIndex: index }))
-            .filter(item => getBrowseGroupTitleKey(item.game) === key);
+        const indexedGroup = browseGroupedItemsIndex.get(key);
+        const groupItems = indexedGroup && indexedGroup.version === browseFilteredDataVersion && Array.isArray(indexedGroup.items)
+            ? indexedGroup.items
+            : (Array.isArray(filteredData) ? filteredData : [])
+                .map((game, sourceIndex) => ({ game, sourceIndex }))
+                .filter(item => getBrowseGroupTitleKey(item.game) === key)
+                .sort(compareBrowseRegionItems);
 
         if (!groupItems.length) return;
 
@@ -15081,7 +15132,7 @@ P
             const currentRegion = document.getElementById('region-select')?.value || 'ALL';
             const missingRapToggle = document.getElementById('show-missing-rap-toggle');
 
-            browseExpandedGroupTitle = { key };
+            browseExpandedGroupTitle = { key, items: groupItems, version: browseFilteredDataVersion };
 
             navHistory = {
                 fromExplore: `group_title|${currentCat.charAt(0).toUpperCase() + currentCat.slice(1)}`,
@@ -18796,12 +18847,20 @@ P
 	function getBrowseRegionsMissingRapStats() {
 		if (typeof browseExpandedGroupTitle === 'undefined' || !browseExpandedGroupTitle || !browseExpandedGroupTitle.key) return null;
 		const missingRapToggle = document.getElementById('show-missing-rap-toggle');
-		const ctx = getBrowseActiveFilterContext();
-		ctx.regionFilter = 'ALL';
-		const groupCandidates = (Array.isArray(currentData) ? currentData : [])
-			.filter(game => getBrowseGroupTitleKey(game) === browseExpandedGroupTitle.key)
-			.filter(game => browseItemPassesFiltersBeforeMissingRap(game, ctx));
-		const available = groupCandidates.filter(isMissingRapItem).length;
+		const key = browseExpandedGroupTitle.key;
+		let available = 0;
+
+		if (browseMissingRapStatsVersion === browseFilteredDataVersion) {
+			available = browseMissingRapByGroup.get(key) || 0;
+		} else {
+			const ctx = getBrowseActiveFilterContext();
+			ctx.regionFilter = 'ALL';
+			available = (Array.isArray(currentData) ? currentData : [])
+				.filter(game => getBrowseGroupTitleKey(game) === key)
+				.filter(game => browseItemPassesFiltersBeforeMissingRap(game, ctx))
+				.filter(isMissingRapItem).length;
+		}
+
 		const showing = !!(missingRapToggle && missingRapToggle.checked);
 		return {
 			available,
@@ -19344,6 +19403,10 @@ P
     function applyFilters() {
 		window.g_animCutoffFound = false;
 		window.__browseMotionSnapshot = captureBrowseMotionLayout();
+		browseFilteredDataVersion++;
+		browseGroupedItemsIndex = new Map();
+		browseMissingRapByGroup = new Map();
+		browseMissingRapStatsVersion = -1;
 
 		const searchInputEl = document.getElementById('search-input');
 		const term = searchInputEl ? searchInputEl.value.toLowerCase().trim() : '';
@@ -19398,6 +19461,10 @@ P
 			const missingRap = isMissingRapItem(game);
 			if (missingRap) {
 				window.__browseAvailableMissingRapCount++;
+				const groupKey = getBrowseGroupTitleKey(game);
+				if (groupKey && !groupKey.endsWith('|')) {
+					browseMissingRapByGroup.set(groupKey, (browseMissingRapByGroup.get(groupKey) || 0) + 1);
+				}
 				if (!effectiveShowMissingRap) {
 					window.__browseHiddenMissingRapCount++;
 					return false;
@@ -19406,6 +19473,7 @@ P
 
 			return true;
 		});
+		browseMissingRapStatsVersion = browseFilteredDataVersion;
 
 		if (!searchHasText) {
 			window.__browseCanFilterMissingRap = window.__browseAvailableMissingRapCount > 0;
