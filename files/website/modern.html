@@ -8126,6 +8126,122 @@ P
 		if (typeof broadcastProfileUpdate === 'function') broadcastProfileUpdate();
 	}
 	
+	/* UI effects use pre-decoded Web Audio buffers so short navigation sounds are not
+	   delayed by HTMLMediaElement scheduling while the next view is being rendered. */
+	const psnUiAudioBuffers = new Map();
+	const psnUiAudioLoads = new Map();
+	let psnUiAudioContext = null;
+
+	function getPsnUiAudioContext() {
+		if (psnUiAudioContext) return psnUiAudioContext;
+		const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+		if (!AudioContextClass) return null;
+		try {
+			psnUiAudioContext = new AudioContextClass({ latencyHint: 'interactive' });
+		} catch (e) {
+			try { psnUiAudioContext = new AudioContextClass(); } catch (err) { return null; }
+		}
+		return psnUiAudioContext;
+	}
+
+	function getPsnUiSoundUrl(soundNode) {
+		if (!soundNode) return '';
+		const source = soundNode.querySelector('source');
+		return soundNode.currentSrc || soundNode.src || (source && source.src) || '';
+	}
+
+	function decodePsnUiAudioData(context, arrayBuffer) {
+		return new Promise((resolve, reject) => {
+			let settled = false;
+			const ok = buffer => { if (!settled) { settled = true; resolve(buffer); } };
+			const fail = error => { if (!settled) { settled = true; reject(error); } };
+			try {
+				const result = context.decodeAudioData(arrayBuffer, ok, fail);
+				if (result && typeof result.then === 'function') result.then(ok, fail);
+			} catch (error) {
+				fail(error);
+			}
+		});
+	}
+
+	function preloadPsnUiSound(id) {
+		if (psnUiAudioBuffers.has(id)) return Promise.resolve(psnUiAudioBuffers.get(id));
+		if (psnUiAudioLoads.has(id)) return psnUiAudioLoads.get(id);
+
+		const context = getPsnUiAudioContext();
+		const soundNode = document.getElementById(id);
+		const url = getPsnUiSoundUrl(soundNode);
+		if (!context || !url || typeof fetch !== 'function') return Promise.resolve(null);
+
+		const load = fetch(url, { cache: 'force-cache', mode: 'cors' })
+			.then(response => {
+				if (!response.ok) throw new Error(`Audio HTTP ${response.status}`);
+				return response.arrayBuffer();
+			})
+			.then(data => decodePsnUiAudioData(context, data))
+			.then(buffer => {
+				if (buffer) psnUiAudioBuffers.set(id, buffer);
+				return buffer || null;
+			})
+			.catch(() => null)
+			.finally(() => psnUiAudioLoads.delete(id));
+
+		psnUiAudioLoads.set(id, load);
+		return load;
+	}
+
+	function preloadPsnUiSounds() {
+		const priorityIds = [
+			'sound-ui-toggle', 'sound-ui-enter', 'sound-ui-back', 'sound-ui-hover',
+			'sound-ui-modal', 'sound-ui-arrow', 'sound-ui-letter',
+			'sound-ui-dropdown', 'sound-ui-dropdown-select', 'sound-ui-switch-on',
+			'sound-ui-switch-off', 'sound-ui-switch-user', 'sound-ui-success',
+			'sound-ui-error', 'sound-ui-remove', 'sound-ui-input',
+			'sound-ui-backspace', 'sound-ui-field', 'sound-ui-login', 'sound-ui-logout'
+		];
+		priorityIds.forEach(id => preloadPsnUiSound(id));
+	}
+
+	function unlockPsnUiAudio() {
+		const context = getPsnUiAudioContext();
+		if (!context) return;
+		if (context.state === 'suspended') {
+			try {
+				const resume = context.resume();
+				if (resume && typeof resume.catch === 'function') resume.catch(() => {});
+			} catch (e) {}
+		}
+		preloadPsnUiSounds();
+	}
+
+	function playPsnUiBuffer(id, volumeParam) {
+		const context = getPsnUiAudioContext();
+		const buffer = psnUiAudioBuffers.get(id);
+		if (!context || !buffer || context.state !== 'running') return false;
+		try {
+			const source = context.createBufferSource();
+			const gain = context.createGain();
+			source.buffer = buffer;
+			gain.gain.value = Math.max(0, Math.min(1, Number(volumeParam)));
+			source.connect(gain);
+			gain.connect(context.destination);
+			source.start(0);
+			return true;
+		} catch (e) {
+			return false;
+		}
+	}
+
+	function playPsnUiHtmlFallback(soundNode, volumeParam) {
+		if (!soundNode) return;
+		try {
+			soundNode.currentTime = 0;
+			soundNode.volume = Math.max(0, Math.min(1, Number(volumeParam)));
+			const attempt = soundNode.play();
+			if (attempt && typeof attempt.catch === 'function') attempt.catch(() => {});
+		} catch (e) {}
+	}
+
 	function playSystemSound(id, volumeParam) {
 		const uxToggle = document.getElementById('ux-sounds-toggle');
 		if (uxToggle && !uxToggle.checked) return;
@@ -8135,13 +8251,22 @@ P
 		const last = window.__uiSoundLastPlayedAt[id] || 0;
 		if ((now - last) < 85) return;
 		window.__uiSoundLastPlayedAt[id] = now;
-	
+
+		if (playPsnUiBuffer(id, volumeParam)) return;
+
 		const soundNode = document.getElementById(id);
-		if (soundNode) {
-			soundNode.currentTime = 0;
-			soundNode.volume = volumeParam;
-			soundNode.play().catch(e => {});
-		}
+		preloadPsnUiSound(id);
+		playPsnUiHtmlFallback(soundNode, volumeParam);
+	}
+
+	/* Decode while the page is settling, then resume the low-latency context on the
+	   earliest real interaction (pointerdown happens before the tab's click handler). */
+	preloadPsnUiSounds();
+	if (!window.__psnUiAudioUnlockBound) {
+		window.__psnUiAudioUnlockBound = true;
+		['pointerdown', 'touchstart', 'keydown'].forEach(eventName => {
+			document.addEventListener(eventName, unlockPsnUiAudio, { capture: true, passive: true });
+		});
 	}
 	
 
