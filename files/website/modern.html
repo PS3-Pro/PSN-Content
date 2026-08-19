@@ -789,6 +789,7 @@ select option { background-color: var(--bg-dark); }
 
 /* ========================================================================== PROFILE LIST PLAYSTATION LOADER ========================================================================== */
 #modal-sys-list.show #list-modal-body>.profile-ps-list-loader { animation: none !important; }
+#list-modal-body.profile-list-resizing { overflow-y: hidden !important; justify-content: center; }
 .profile-ps-list-loader { width: 100%; min-height: clamp(108px,20vh,148px); padding: clamp(18px,3vw,24px) 10px clamp(18px,3vw,24px); display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; color: #fff; overflow: hidden; }
 .profile-ps-list-symbols { position: relative; display: grid; place-items: center; margin: 0 auto 14px; color: #fff; }
 .profile-ps-list-symbol { display: grid; place-items: center; width: var(--ps-list-symbol-size); height: var(--ps-list-symbol-size); color: #fff; transform-origin: center; opacity: 0; transform: rotate(-90deg) scale(.12); will-change: transform,opacity; }
@@ -52011,6 +52012,136 @@ function getVisibleChatStackEl(id) {
 		});
 	};
 
+	window.__profileListResizeGeneration = 0;
+	window.__profileListResizeAnimation = null;
+
+	window.cancelProfileListResize = function(body) {
+		const animation = window.__profileListResizeAnimation;
+		if (animation) {
+			try { animation.cancel(); } catch (e) {}
+			window.__profileListResizeAnimation = null;
+		}
+		if (!body) return;
+		body.classList.remove('profile-list-resizing');
+		body.style.height = '';
+	};
+
+	window.measureProfileListVisualHeight = function(body, html) {
+		const modalContent = body && body.parentElement;
+		if (!body || !modalContent) return 0;
+
+		const bodyStyle = window.getComputedStyle(body);
+		const bodyRect = body.getBoundingClientRect();
+		const maxHeight = parseFloat(bodyStyle.maxHeight);
+		const probe = document.createElement('div');
+		probe.className = 'sys-modal-body';
+		probe.style.position = 'fixed';
+		probe.style.left = '-100000px';
+		probe.style.top = '0';
+		probe.style.width = `${bodyRect.width}px`;
+		probe.style.height = 'auto';
+		probe.style.maxHeight = 'none';
+		probe.style.overflow = 'visible';
+		probe.style.visibility = 'hidden';
+		probe.style.pointerEvents = 'none';
+		probe.style.display = 'flex';
+		probe.style.flexDirection = 'column';
+		probe.style.gap = bodyStyle.gap;
+		probe.style.padding = `${bodyStyle.paddingTop} ${bodyStyle.paddingRight} ${bodyStyle.paddingBottom} ${bodyStyle.paddingLeft}`;
+		probe.style.boxSizing = 'border-box';
+		probe.innerHTML = html;
+		probe.querySelectorAll('img').forEach(img => {
+			img.removeAttribute('src');
+			img.removeAttribute('srcset');
+			img.removeAttribute('onload');
+			img.removeAttribute('onerror');
+		});
+		modalContent.appendChild(probe);
+		const naturalHeight = probe.scrollHeight;
+		probe.remove();
+
+		if (!Number.isFinite(maxHeight) || maxHeight <= 0) return naturalHeight;
+		return Math.min(naturalHeight, maxHeight);
+	};
+
+	window.swapProfileListLoaderToContent = function(body, html, targetUser, listType, onCommit) {
+		const modal = document.getElementById('modal-sys-list');
+		if (!body || !modal) return;
+
+		const generation = String(modal.dataset.profileListGeneration || '');
+		const expectedTarget = String(targetUser || '');
+		const expectedType = String(listType || '');
+		const hasLoader = !!body.querySelector('.profile-ps-list-loader');
+
+		const isCurrent = function() {
+			return String(modal.dataset.profileListGeneration || '') === generation
+				&& String(modal.dataset.profileTarget || '') === expectedTarget
+				&& String(modal.dataset.profileListType || '') === expectedType;
+		};
+
+		const commit = function() {
+			if (!isCurrent()) return;
+			window.cancelProfileListResize(body);
+			body.innerHTML = html;
+			if (typeof onCommit === 'function') onCommit();
+		};
+
+		if (!hasLoader || typeof body.animate !== 'function' || window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+			commit();
+			return;
+		}
+
+		const waitForVisibleModal = function() {
+			if (!isCurrent()) return;
+			if (modal.style.display === 'none') return;
+			if (modal.dataset.profileListReady !== '1') {
+				requestAnimationFrame(waitForVisibleModal);
+				return;
+			}
+
+			const startHeight = body.getBoundingClientRect().height;
+			const targetHeight = window.measureProfileListVisualHeight(body, html);
+			if (!startHeight || !targetHeight || Math.abs(targetHeight - startHeight) < 1) {
+				commit();
+				return;
+			}
+
+			body.classList.add('profile-list-resizing');
+			body.style.height = `${startHeight}px`;
+
+			requestAnimationFrame(() => {
+				requestAnimationFrame(() => {
+					if (!isCurrent()) {
+						window.cancelProfileListResize(body);
+						return;
+					}
+
+					const animation = body.animate(
+						[{ height: `${startHeight}px` }, { height: `${targetHeight}px` }],
+						{ duration: 380, easing: 'cubic-bezier(.22,.8,.24,1)', fill: 'forwards' }
+					);
+					window.__profileListResizeAnimation = animation;
+
+					animation.finished.then(() => {
+						if (!isCurrent()) {
+							window.cancelProfileListResize(body);
+							return;
+						}
+						body.style.height = `${targetHeight}px`;
+						try { animation.cancel(); } catch (e) {}
+						window.__profileListResizeAnimation = null;
+						body.innerHTML = html;
+						body.classList.remove('profile-list-resizing');
+						body.style.height = '';
+						if (typeof onCommit === 'function') onCommit();
+					}).catch(() => {});
+				});
+			});
+		};
+
+		requestAnimationFrame(waitForVisibleModal);
+	};
+
 
 	window.__activeProfileListRequest = null;
 
@@ -52080,15 +52211,43 @@ function getVisibleChatStackEl(id) {
 	
 		const listMeta = window.getPlayerListMeta(listType);
 		const safeTargetUser = window.escapePlayerListText(targetUser || 'Player');
+		window.cancelProfileListResize(body);
+		window.__profileListResizeGeneration += 1;
+		const profileListGeneration = String(window.__profileListResizeGeneration);
 		titleEl.innerHTML = window.getPlayerListTitleHtml(targetUser, listMeta);
 		body.innerHTML = window.getProfilePsListLoaderHtml(safeTargetUser, listMeta, 'profile-ps-list-loader--row');
 		modal.dataset.profileTarget = targetUser;
 		modal.dataset.profileListType = listType;
+		modal.dataset.profileListGeneration = profileListGeneration;
+		modal.dataset.profileListReady = '0';
 		window.__lastProfileListRender = null;
 		
 		modal.style.display = 'flex';
 		if (typeof window.restartProfilePsListLoader === 'function') window.restartProfilePsListLoader();
-		setTimeout(() => modal.classList.add('show'), 10);
+		setTimeout(() => {
+			if (modal.dataset.profileListGeneration !== profileListGeneration) return;
+			modal.classList.add('show');
+			const modalContent = modal.querySelector('.sys-modal-content');
+			if (!modalContent) {
+				modal.dataset.profileListReady = '1';
+				return;
+			}
+
+			let ready = false;
+			const markReady = function() {
+				if (ready) return;
+				ready = true;
+				modalContent.removeEventListener('transitionend', handleModalReady);
+				if (modal.dataset.profileListGeneration === profileListGeneration && modal.classList.contains('show')) {
+					modal.dataset.profileListReady = '1';
+				}
+			};
+			const handleModalReady = function(event) {
+				if (event.target === modalContent && event.propertyName === 'transform') markReady();
+			};
+			modalContent.addEventListener('transitionend', handleModalReady);
+			setTimeout(markReady, 340);
+		}, 10);
 	
 		if (isMe) {
 			let myData = null;
@@ -52185,7 +52344,8 @@ function getVisibleChatStackEl(id) {
 		titleEl.innerHTML = window.getPlayerListTitleHtml(targetUser, listMeta, dataArray.length);
 
 		if (dataArray.length === 0) {
-			body.innerHTML = `<div style="text-align:center; padding: 40px; color: var(--text-muted); font-size: 13px;">No items in this ${listMeta.title.toLowerCase()} yet.</div>`;
+			const emptyHtml = `<div style="text-align:center; padding: 40px; color: var(--text-muted); font-size: 13px;">No items in this ${listMeta.title.toLowerCase()} yet.</div>`;
+			window.swapProfileListLoaderToContent(body, emptyHtml, targetUser, listType);
 			return;
 		}
 	
@@ -52361,19 +52521,19 @@ function getVisibleChatStackEl(id) {
 					</div>`;
 			}
 		});
-		body.innerHTML = html;
-		
-		if (window.pendingProfileListScroll != null) {
-			const savedScroll = window.pendingProfileListScroll;
-			window.pendingProfileListScroll = null;
-			const previousBehavior = body.style.scrollBehavior;
-			body.style.scrollBehavior = 'auto';
-			body.scrollTop = savedScroll || 0;
-			requestAnimationFrame(() => {
+		window.swapProfileListLoaderToContent(body, html, targetUser, listType, function() {
+			if (window.pendingProfileListScroll != null) {
+				const savedScroll = window.pendingProfileListScroll;
+				window.pendingProfileListScroll = null;
+				const previousBehavior = body.style.scrollBehavior;
+				body.style.scrollBehavior = 'auto';
 				body.scrollTop = savedScroll || 0;
-				body.style.scrollBehavior = previousBehavior || 'smooth';
-			});
-		}
+				requestAnimationFrame(() => {
+					body.scrollTop = savedScroll || 0;
+					body.style.scrollBehavior = previousBehavior || 'smooth';
+				});
+			}
+		});
 	};
 
     function applyThemeColorPreview(color) {
