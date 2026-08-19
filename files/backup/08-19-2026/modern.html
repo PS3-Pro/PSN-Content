@@ -13847,30 +13847,14 @@ P
 
 	const PSN_STORE_LOOKUP_CATEGORIES = [
 		'no_psn',
-		'games',
-		'guides',
-		'soundtracks',
-		'videos',
-		'homebrew_games',
-		'ports',
-		'prototypes',
-		'apps',
-		'demos',
-		'emulators',
-		'legacy',
-		'tools',
-		'dev_tools',
-		'backup_manager',
-		'launchers'
+		'games'
 	];
 
 	window.psnStoreLookup = new Map();
 	window.__psnStoreLookupDirty = true;
-	window.__psnStoreExactLookupByCategory = new Map();
 
 	window.invalidatePsnStoreLookup = function () {
 		window.__psnStoreLookupDirty = true;
-		if (window.__psnStoreExactLookupByCategory instanceof Map) window.__psnStoreExactLookupByCategory.clear();
 	};
 
 	window.rebuildPsnStoreLookup = function () {
@@ -13908,58 +13892,6 @@ P
 		}
 
 		return window.psnStoreLookup.get(cleanId) || null;
-	};
-
-	window.getPsnStoreExactCategoryLookup = function (category) {
-		const cat = String(category || '').trim();
-		if (!cat || !window.psnStoreCache) return null;
-		const bucket = window.psnStoreCache[cat];
-		if (!Array.isArray(bucket) || !bucket.length) return null;
-
-		if (!(window.__psnStoreExactLookupByCategory instanceof Map)) window.__psnStoreExactLookupByCategory = new Map();
-		const cached = window.__psnStoreExactLookupByCategory.get(cat);
-		if (cached && cached.source === bucket && cached.length === bucket.length) return cached;
-
-		const normalizeKey = value => String(value || '').trim().toUpperCase();
-		const idMap = new Map();
-		const contentMap = new Map();
-		bucket.forEach((entry, index) => {
-			[entry && entry.id, entry && entry.titleId, entry && entry.titleID, entry && entry.titleid].forEach(value => {
-				const key = normalizeKey(value);
-				if (key && !idMap.has(key)) idMap.set(key, { item: entry, index });
-			});
-			[entry && entry.contentId, entry && entry.contentID].forEach(value => {
-				const key = normalizeKey(value);
-				if (key && !contentMap.has(key)) contentMap.set(key, { item: entry, index });
-			});
-		});
-
-		const lookup = { source: bucket, length: bucket.length, idMap, contentMap };
-		window.__psnStoreExactLookupByCategory.set(cat, lookup);
-		return lookup;
-	};
-
-	window.findPsnStoreExactMatchInCategory = function (category, idCandidates = [], contentIdCandidates = []) {
-		const lookup = window.getPsnStoreExactCategoryLookup(category);
-		if (!lookup) return null;
-		const normalizeKey = value => String(value || '').trim().toUpperCase();
-		let best = null;
-
-		const consider = hit => {
-			if (!hit) return;
-			if (!best || hit.index < best.index) best = hit;
-		};
-
-		(Array.isArray(contentIdCandidates) ? contentIdCandidates : [contentIdCandidates]).forEach(value => {
-			const key = normalizeKey(value);
-			if (key) consider(lookup.contentMap.get(key));
-		});
-		(Array.isArray(idCandidates) ? idCandidates : [idCandidates]).forEach(value => {
-			const key = normalizeKey(value);
-			if (key) consider(lookup.idMap.get(key));
-		});
-
-		return best ? best.item : null;
 	};
     let filteredData = [];
     let activeLetter = "ALL";
@@ -15738,13 +15670,12 @@ P
 			}
 			if (!gameData && window.psnStoreCache) {
 				for (const cat of allowedCats) {
-					if (!window.psnStoreCache[cat]) continue;
-					gameData = (typeof window.findPsnStoreExactMatchInCategory === 'function')
-						? window.findPsnStoreExactMatchInCategory(cat, [item.id], [])
-						: window.psnStoreCache[cat].find(g => g.id === item.id || g.titleId === item.id);
-					if (gameData) {
-						gameCategory = cat;
-						break;
+					if (window.psnStoreCache[cat]) {
+						gameData = window.psnStoreCache[cat].find(g => g.id === item.id || g.titleId === item.id);
+						if (gameData) {
+							gameCategory = cat;
+							break;
+						}
 					}
 				}
 			}
@@ -22472,7 +22403,7 @@ P
 	};
 
 	window.getLibraryStoreCategoryPriority = function() {
-		return ['prototypes', 'homebrew_games', 'emulators', 'ports', 'legacy', 'no_psn', 'tools', 'dev_tools', 'backup_manager', 'launchers', 'apps', 'demos', 'guides', 'soundtracks', 'videos', 'games'];
+		return ['prototypes', 'homebrew_games', 'emulators', 'ports', 'legacy', 'no_psn', 'tools', 'dev_tools', 'backup_manager', 'launchers', 'apps', 'demos', 'games'];
 	};
 
 	window.normalizeLibraryContentCategory = function(item = {}, fallback = 'games') {
@@ -22619,21 +22550,22 @@ P
 
 		const categories = (typeof window.getLibraryStoreCategoryPriority === 'function')
 			? window.getLibraryStoreCategoryPriority()
-			: ['prototypes', 'homebrew_games', 'emulators', 'ports', 'legacy', 'no_psn', 'tools', 'dev_tools', 'backup_manager', 'launchers', 'apps', 'demos', 'guides', 'soundtracks', 'videos', 'games'];
+			: ['prototypes', 'homebrew_games', 'emulators', 'ports', 'legacy', 'no_psn', 'tools', 'dev_tools', 'backup_manager', 'launchers', 'apps', 'demos', 'games'];
 
 		for (const cat of categories) {
 			if (typeof window.isLibraryBlockedContentCategory === 'function' && window.isLibraryBlockedContentCategory(cat)) continue;
 			const bucket = window.psnStoreCache[cat];
 			if (!Array.isArray(bucket) || !bucket.length) continue;
 
-			const found = (typeof window.findPsnStoreExactMatchInCategory === 'function')
-				? window.findPsnStoreExactMatchInCategory(cat, idCandidates, contentIdCandidates)
-				: bucket.find(entry => {
-					const entryContentIds = [entry.contentId, entry.contentID].map(normalizeId).filter(Boolean);
-					if (contentIdCandidates.length && entryContentIds.some(value => contentIdCandidates.includes(value))) return true;
-					const entryIds = [entry.id, entry.titleId, entry.titleID, entry.titleid].map(normalizeId).filter(Boolean);
-					return !!(idCandidates.length && entryIds.some(value => idCandidates.includes(value)));
-				});
+			const found = bucket.find(entry => {
+				const entryContentIds = [entry.contentId, entry.contentID].map(normalizeId).filter(Boolean);
+				if (contentIdCandidates.length && entryContentIds.some(value => contentIdCandidates.includes(value))) return true;
+
+				const entryIds = [entry.id, entry.titleId, entry.titleID, entry.titleid].map(normalizeId).filter(Boolean);
+				if (idCandidates.length && entryIds.some(value => idCandidates.includes(value))) return true;
+
+				return false;
+			});
 
 			if (found) {
 				const resolvedCategory = (typeof window.resolveLibraryStoreMatchCategory === 'function')
@@ -22674,22 +22606,16 @@ P
 			const bucket = window.psnStoreCache[cat];
 			if (!Array.isArray(bucket) || !bucket.length) continue;
 
-			let found = null;
-			if (typeof window.findPsnStoreExactMatchInCategory === 'function') {
-				found = contentId
-					? window.findPsnStoreExactMatchInCategory(cat, [], [contentId])
-					: window.findPsnStoreExactMatchInCategory(cat, idCandidates, []);
-			}
-			if (found) return cat;
-			if (exactOnly) continue;
-
-			found = bucket.find(entry => {
+			const found = bucket.find(entry => {
 				const entryContentId = String(entry.contentId || entry.contentID || '').trim().toUpperCase();
 				if (contentId) return !!(entryContentId && entryContentId === contentId);
+
 				const entryIds = [entry.id, entry.titleId, entry.titleID, entry.titleid]
 					.map(value => String(value || '').trim().toUpperCase())
 					.filter(Boolean);
 				if (idCandidates.length && entryIds.some(entryId => idCandidates.includes(entryId))) return true;
+
+				if (exactOnly) return false;
 				const entryName = normalizeText(entry.cleanName || entry.name || entry.title || entry.rawName);
 				return !!(nameKey && entryName && entryName.length > 3 && (entryName === nameKey || nameKey.includes(entryName) || entryName.includes(nameKey)));
 			});
@@ -30075,12 +30001,13 @@ P
 			}
 
 			if (!gameData && Array.isArray(window.psnStoreCache?.updates)) {
-				const updateEntry = (typeof window.findPsnStoreExactMatchInCategory === 'function')
-					? window.findPsnStoreExactMatchInCategory('updates', [id], [])
-					: window.psnStoreCache.updates.find((item) => {
-						const itemId = String(item?.id || item?.titleId || item?.titleid || '').trim().toUpperCase();
-						return itemId === id;
-					});
+				const updateEntry = window.psnStoreCache.updates.find((item) => {
+					const itemId = String(
+						item?.id || item?.titleId || item?.titleid || ''
+					).trim().toUpperCase();
+
+					return itemId === id;
+				});
 
 				if (updateEntry) {
 					const updateName = String(
@@ -31679,21 +31606,17 @@ P
 	
 			for (let cat of priorityCats) {
 				if (!window.psnStoreCache[cat] || blacklist.includes(cat)) continue;
-
-				let foundItem = null;
-				if (searchId && typeof window.findPsnStoreExactMatchInCategory === 'function') {
-					foundItem = window.findPsnStoreExactMatchInCategory(cat, [searchId], []);
-				} else {
-					foundItem = window.psnStoreCache[cat].find(g => {
-						const gId = (g.id || g.titleId || g.titleid || "").toUpperCase();
-						if (searchId && gId === searchId) return true;
-						if (!searchId && g.cleanName) {
-							const gName = g.cleanName.toLowerCase().replace(/[^a-z0-9]/g, '');
-							if (gName.length > 3 && (gName === searchTitle || searchTitle.includes(gName))) return true;
-						}
-						return false;
-					});
-				}
+				
+				let foundItem = window.psnStoreCache[cat].find(g => {
+					const gId = (g.id || g.titleId || g.titleid || "").toUpperCase();
+					if (searchId && gId === searchId) return true;
+					
+					if (!searchId && g.cleanName) {
+						const gName = g.cleanName.toLowerCase().replace(/[^a-z0-9]/g, '');
+						if (gName.length > 3 && (gName === searchTitle || searchTitle.includes(gName))) return true;
+					}
+					return false;
+				});
 	
 				if (foundItem) {
 					if (cat === 'games' || cat === 'apps' || cat === 'demos') {
@@ -32260,11 +32183,6 @@ function formatLibraryLastPlayedBadge(game = {}) {
 	
 		const currentPlaying = window.myCurrentPS3Status || { status: 'idle' };
 		const ip = document.getElementById('ps3-ip').value;
-		const favoriteLibraryPaths = new Set((favoritesLibrary || []).map(fav => fav && fav.path).filter(Boolean));
-		const lastScannedIndexByObject = new WeakMap();
-		(lastScannedGames || []).forEach((item, index) => {
-			if (item && typeof item === 'object') lastScannedIndexByObject.set(item, index);
-		});
 	
 		games.forEach((game, i) => {
 			const pathUpper = game.path.toUpperCase();
@@ -32280,15 +32198,13 @@ function formatLibraryLastPlayedBadge(game = {}) {
 	
 			const gameId = game.id || (game.path.match(/[A-Z]{4}\d{5}/) ? game.path.match(/[A-Z]{4}\d{5}/)[0] : null);
 			const cachedData = ensureLibraryCoverCache(game, gameId);
-			const isFav = favoriteLibraryPaths.has(game.path);
+			const isFav = favoritesLibrary.some(fav => fav.path === game.path);
 			const favClass = isFav ? 'is-favorited' : '';
 			const starIcon = isFav ? 'fas fa-star' : 'far fa-star';
 			const starColor = isFav ? '#ffcc00' : 'rgba(255,255,255,0.6)';
 			
 			const starTooltip = isFav ? "Remove from Favorites" : "Add to Favorites";
-			const favoriteSourceIndex = (game && typeof game === 'object' && lastScannedIndexByObject.has(game))
-				? lastScannedIndexByObject.get(game)
-				: lastScannedGames.findIndex(item => item && isSameLibraryGameRecord(item, game));
+			const favoriteSourceIndex = lastScannedGames.findIndex(item => item && isSameLibraryGameRecord(item, game));
 	
 			const isThisGamePlaying = (currentPlaying.status === 'playing' && 
 									(game.title === currentPlaying.title || (cachedData.id && cachedData.id === currentPlaying.titleId)));
@@ -32707,8 +32623,9 @@ function formatLibraryLastPlayedBadge(game = {}) {
 		if (offlineMsg) offlineMsg.style.display = 'none';
 		if (onlineContainer) onlineContainer.style.display = 'block';
 	
-		const installedLibraryPaths = new Set((lastScannedGames || []).map(installed => installed && installed.path).filter(Boolean));
-		const activeFavs = favoritesLibrary.filter(fav => installedLibraryPaths.has(fav.path));
+		const activeFavs = favoritesLibrary.filter(fav =>
+			lastScannedGames.some(installed => installed.path === fav.path)
+		);
 	
 		if (activeFavs.length === 0) {
 			if (countSpan) {
@@ -34093,7 +34010,7 @@ function formatLibraryLastPlayedBadge(game = {}) {
 
         const priority = (typeof window.getLibraryStoreCategoryPriority === 'function')
             ? window.getLibraryStoreCategoryPriority().concat(['dlcs', 'updates', 'themes', 'avatars'])
-            : ['prototypes', 'homebrew_games', 'emulators', 'ports', 'legacy', 'no_psn', 'tools', 'dev_tools', 'backup_manager', 'launchers', 'apps', 'demos', 'guides', 'soundtracks', 'videos', 'games', 'dlcs', 'updates', 'themes', 'avatars'];
+            : ['prototypes', 'homebrew_games', 'emulators', 'ports', 'legacy', 'no_psn', 'tools', 'dev_tools', 'backup_manager', 'launchers', 'apps', 'demos', 'games', 'dlcs', 'updates', 'themes', 'avatars'];
 
         const seen = new Set();
         for (const cat of priority) {
@@ -34104,21 +34021,19 @@ function formatLibraryLastPlayedBadge(game = {}) {
             const bucket = window.psnStoreCache[key];
             if (!Array.isArray(bucket) || !bucket.length) continue;
 
-            const found = (typeof window.findPsnStoreExactMatchInCategory === 'function')
-                ? window.findPsnStoreExactMatchInCategory(key, idCandidates, contentIdCandidates)
-                : bucket.find(entry => {
-                    const entryContentIds = [entry.contentId, entry.contentID, entry.content_id]
-                        .map(normalizeId)
-                        .filter(Boolean);
-                    if (contentIdCandidates.length && entryContentIds.some(value => contentIdCandidates.includes(value))) return true;
+            const found = bucket.find(entry => {
+                const entryContentIds = [entry.contentId, entry.contentID, entry.content_id]
+                    .map(normalizeId)
+                    .filter(Boolean);
+                if (contentIdCandidates.length && entryContentIds.some(value => contentIdCandidates.includes(value))) return true;
 
-                    const entryIds = [entry.id, entry.titleId, entry.titleID, entry.titleid]
-                        .map(normalizeId)
-                        .filter(Boolean);
-                    if (idCandidates.length && entryIds.some(value => idCandidates.includes(value))) return true;
+                const entryIds = [entry.id, entry.titleId, entry.titleID, entry.titleid]
+                    .map(normalizeId)
+                    .filter(Boolean);
+                if (idCandidates.length && entryIds.some(value => idCandidates.includes(value))) return true;
 
-                    return false;
-                });
+                return false;
+            });
 
             if (found) {
                 const blocked = (typeof window.isLibraryBlockedContentCategory === 'function')
@@ -36942,26 +36857,6 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 	window.__rewardsViewDirty = true;
 	window.__lastTrophyRenderSignature = '';
 	window.__lastRewardsRenderSignature = '';
-	window.__rewardRequirementSetCache = { source: null, length: -1, set: new Set() };
-	window.__rewardDefinitionSignatureCache = { source: null, length: -1, signature: '[]' };
-
-	function psnGetRewardRequirementSet() {
-		const rewards = Array.isArray(window.REWARDS_DATA) ? window.REWARDS_DATA : [];
-		const cached = window.__rewardRequirementSetCache;
-		if (cached && cached.source === rewards && cached.length === rewards.length) return cached.set;
-		const set = new Set(rewards.map(reward => reward && reward.req).filter(Boolean));
-		window.__rewardRequirementSetCache = { source: rewards, length: rewards.length, set };
-		return set;
-	}
-
-	function psnGetRewardDefinitionSignature() {
-		const rewards = Array.isArray(window.REWARDS_DATA) ? window.REWARDS_DATA : [];
-		const cached = window.__rewardDefinitionSignatureCache;
-		if (cached && cached.source === rewards && cached.length === rewards.length) return cached.signature;
-		const signature = JSON.stringify(rewards.map(r => [r.id, r.req, r.kind || 'avatar', r.styleId || '', r.img || '']));
-		window.__rewardDefinitionSignatureCache = { source: rewards, length: rewards.length, signature };
-		return signature;
-	}
 
 	function psnIsViewVisible(viewId) {
 		const view = document.getElementById(viewId);
@@ -36992,7 +36887,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 		try {
 			return JSON.stringify({
 				trophies: window.userTrophies || {},
-				rewards: psnGetRewardDefinitionSignature()
+				rewards: (window.REWARDS_DATA || []).map(r => [r.id, r.req, r.kind || 'avatar', r.styleId || '', r.img || ''])
 			});
 		} catch (e) {
 			return String(Date.now());
@@ -37193,8 +37088,6 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 		window.__lastTrophyRenderSignature = renderSignature;
 		window.__trophyViewsDirty = false;
 		
-		const rewardRequirementSet = psnGetRewardRequirementSet();
-		const trophyGroupOrder = { 'Platinum': 1, 'System & Usage': 2, 'Social & Chat': 3, 'Store & Wishlist': 4, 'Downloads & Content': 5, 'Local Library': 6 };
 		const sortedIds = allIds.sort((a, b) => {
 			const tA = TROPHY_DATA[a];
 			const tB = TROPHY_DATA[b];
@@ -37215,8 +37108,8 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 			} else if (currentSort === 'grade') {
 				result = TROPHY_WEIGHT[tA.type] - TROPHY_WEIGHT[tB.type];
 			} else if (currentSort === 'reward') {
-				const hasRewardA = rewardRequirementSet.has(a) ? 1 : 0;
-				const hasRewardB = rewardRequirementSet.has(b) ? 1 : 0;
+				const hasRewardA = (window.REWARDS_DATA && window.REWARDS_DATA.some(r => r.req === a)) ? 1 : 0;
+				const hasRewardB = (window.REWARDS_DATA && window.REWARDS_DATA.some(r => r.req === b)) ? 1 : 0;
 				
 				if (hasRewardA !== hasRewardB) {
 					result = hasRewardB - hasRewardA;
@@ -37224,8 +37117,10 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 					result = TROPHY_WEIGHT[tA.type] - TROPHY_WEIGHT[tB.type];
 				}
 			} else {
-				if (trophyGroupOrder[tA.group] !== trophyGroupOrder[tB.group]) {
-					result = trophyGroupOrder[tA.group] - trophyGroupOrder[tB.group];
+				const groupOrder = { 'Platinum': 1, 'System & Usage': 2, 'Social & Chat': 3, 'Store & Wishlist': 4, 'Downloads & Content': 5, 'Local Library': 6 };
+				
+				if (groupOrder[tA.group] !== groupOrder[tB.group]) {
+					result = groupOrder[tA.group] - groupOrder[tB.group];
 				} else {
 					result = TROPHY_WEIGHT[tA.type] - TROPHY_WEIGHT[tB.type];
 				}
@@ -37884,11 +37779,6 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 
     function applyChatPresenceUiRefresh(users = window.currentOnlineList || []) {
         if (!Array.isArray(users)) users = [];
-        const onlineUserByName = new Map();
-        users.forEach(user => {
-            const name = user && typeof user === 'object' ? user.name : user;
-            if (name && !onlineUserByName.has(name)) onlineUserByName.set(name, user);
-        });
         const countElement = document.getElementById('online-count');
         if (countElement && window.__pendingOnlineCountText) {
             countElement.innerText = window.__pendingOnlineCountText;
@@ -37903,10 +37793,9 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 
         document.querySelectorAll('.chat-status-dot').forEach(dot => {
             const dotUser = dot.getAttribute('data-user');
-            const dotUserData = onlineUserByName.get(dotUser);
             const isOnline = (dotUser === myChatName && socketOnline)
                 ? true
-                : !!(dotUserData && typeof dotUserData === 'object' && dotUserData.online === true);
+                : users.some(u => (u.name || u) === dotUser && u.online === true);
 
             if (isOnline) {
                 dot.classList.add('status-pulsing-soft');
@@ -37919,7 +37808,7 @@ window.showLibrarySection = function(type, noScrollToTop = false) {
 
         document.querySelectorAll('.chat-avatar-status').forEach(img => {
             const imgUser = img.getAttribute('data-user');
-            const uData = onlineUserByName.get(imgUser);
+            const uData = users.find(u => (u.name || u) === imgUser);
             const isMe = (imgUser === myChatName);
 
             const isMessageAvatar = !!(img.closest && img.closest('[id^="msg-row-"]'));
@@ -51306,17 +51195,11 @@ function getVisibleChatStackEl(id) {
 	// ==========================================================================
     // FRIENDS LOGIC
     // ==========================================================================
-	function getResolvedUserAvatar(name, preferredAvatar = '', lookupContext = null) {
+	function getResolvedUserAvatar(name, preferredAvatar = '') {
 		const DEFAULT_AVATAR = "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/main/resources/interface/modern/images/avatars/default.png";
-		const netUser = lookupContext && lookupContext.onlineByName instanceof Map
-			? (lookupContext.onlineByName.get(name) || null)
-			: (typeof currentOnlineList !== 'undefined' ? currentOnlineList.find(u => (u.name || u) === name) : null);
-		const searchUser = lookupContext && lookupContext.globalSearchByName instanceof Map
-			? (lookupContext.globalSearchByName.get(name) || null)
-			: (window.globalSearchResults ? window.globalSearchResults.find(u => (u.name || u) === name) : null);
-		const friendData = lookupContext && lookupContext.friendByName instanceof Map
-			? (lookupContext.friendByName.get(name) || null)
-			: (window.friendsList ? window.friendsList.find(f => (f.name || f) === name) : null);
+		const netUser = typeof currentOnlineList !== 'undefined' ? currentOnlineList.find(u => (u.name || u) === name) : null;
+		const searchUser = window.globalSearchResults ? window.globalSearchResults.find(u => (u.name || u) === name) : null;
+		const friendData = window.friendsList ? window.friendsList.find(f => (f.name || f) === name) : null;
 		const savedAvatar = localStorage.getItem(`${name}_psn_avatar`);
 		const firstAvatar = (typeof AVAILABLE_AVATARS !== 'undefined' && AVAILABLE_AVATARS[0]) ? AVAILABLE_AVATARS[0] : DEFAULT_AVATAR;
 
@@ -51413,32 +51296,11 @@ function getVisibleChatStackEl(id) {
 		
 		const isSearching = searchTerm !== '';
 		const isAllCommand = (searchTerm === '@all' || searchTerm === '*');
-		const onlineList = Array.isArray(currentOnlineList) ? currentOnlineList : [];
-		const friendList = Array.isArray(window.friendsList) ? window.friendsList : [];
-		const globalSearchList = Array.isArray(window.globalSearchResults) ? window.globalSearchResults : [];
-		const onlineByName = new Map();
-		onlineList.forEach(user => {
-			const name = user && typeof user === 'object' ? user.name : user;
-			if (name && !onlineByName.has(name)) onlineByName.set(name, user);
-		});
-		const friendByName = new Map();
-		friendList.forEach(friend => {
-			const name = friend && typeof friend === 'object' ? friend.name : friend;
-			if (name && !friendByName.has(name)) friendByName.set(name, friend);
-		});
-		const friendNames = new Set(friendByName.keys());
-		const onlineNames = new Set(Array.from(onlineByName.entries()).filter(([, user]) => user && typeof user === 'object' && user.online === true).map(([name]) => name));
-		const globalSearchByName = new Map();
-		globalSearchList.forEach(user => {
-			const name = user && typeof user === 'object' ? user.name : user;
-			if (name && !globalSearchByName.has(name)) globalSearchByName.set(name, user);
-		});
-		const friendLookupContext = { onlineByName, friendByName, globalSearchByName };
 	
-		let filteredFriends = friendList.filter(f => {
+		let filteredFriends = window.friendsList.filter(f => {
 			const fName = f.name || f;
 			
-			const netData = onlineByName.get(fName) || null;
+			const netData = typeof currentOnlineList !== 'undefined' ? currentOnlineList.find(u => (u.name || u) === fName) : null;
 			const isOnline = netData ? netData.online === true : false;
 			const isPlaying = isOnline && netData.ps3Status && netData.ps3Status.status === 'playing';
 
@@ -51448,27 +51310,27 @@ function getVisibleChatStackEl(id) {
 			return isAllCommand ? true : fName.toLowerCase().includes(searchTerm);
 		});
 
-		let onlineOthers = isSearching ? onlineList.filter(u => {
+		let onlineOthers = isSearching ? currentOnlineList.filter(u => {
 			const uName = u.name || u;
 			const isPlaying = u.ps3Status && u.ps3Status.status === 'playing';
 
 			if (showPlayingOnly && !isPlaying) return false;
 
 			return (isAllCommand ? true : uName.toLowerCase().includes(searchTerm)) && 
-				!friendNames.has(uName) && 
+				!window.friendsList.some(f => (f.name || f) === uName) && 
 				uName !== myName &&
 				u.online === true;
 		}) : [];
 	
-		let globalOffline = isSearching ? globalSearchList.filter(u => {
+		let globalOffline = isSearching ? (window.globalSearchResults || []).filter(u => {
 			const uName = u.name || u;
 			
 			if (showOnlineOnly || showPlayingOnly) return false; 
 
 			return (isAllCommand ? true : uName.toLowerCase().includes(searchTerm)) &&
 				uName !== myName &&
-				!friendNames.has(uName) &&
-				!onlineNames.has(uName);
+				!window.friendsList.some(f => (f.name || f) === uName) &&
+				!currentOnlineList.some(on => (on.name || on) === uName && on.online === true);
 		}) : [];
 	
 		if (window.friendsList.length === 0 && !isSearching) {
@@ -51483,8 +51345,8 @@ function getVisibleChatStackEl(id) {
 		const sorterLogic = (a, b) => {
 			const nameA = a.name || a;
 			const nameB = b.name || b;
-			const netA = onlineByName.get(nameA) || null;
-			const netB = onlineByName.get(nameB) || null;
+			const netA = typeof currentOnlineList !== 'undefined' ? currentOnlineList.find(u => (u.name || u) === nameA) : null;
+			const netB = typeof currentOnlineList !== 'undefined' ? currentOnlineList.find(u => (u.name || u) === nameB) : null;
 			
 			const onlineA = netA ? netA.online === true : false;
 			const onlineB = netB ? netB.online === true : false;
@@ -51526,9 +51388,9 @@ function getVisibleChatStackEl(id) {
 			}
 			filteredFriends.forEach((f, i) => {
 				const fName = f.name || f;
-				const net = onlineByName.get(fName) || null;
+				const net = currentOnlineList.find(u => (u.name || u) === fName);
 				const isOn = net && net.online === true;
-				const card = createUserCardElement(fName, f.avatar, isOn ? '#4caf50' : '#8b96a8', isOn ? 'Online' : `Last seen: ${formatLastSeen(net?.lastSeen || f.lastSeen)}`, isOn, true, i, isSilent, friendLookupContext);
+				const card = createUserCardElement(fName, getResolvedUserAvatar(fName, f.avatar), isOn ? '#4caf50' : '#8b96a8', isOn ? 'Online' : `Last seen: ${formatLastSeen(net?.lastSeen || f.lastSeen)}`, isOn, true, i, isSilent);
 				grid.appendChild(card);
 			});
 		}
@@ -51538,7 +51400,7 @@ function getVisibleChatStackEl(id) {
 			grid.insertAdjacentHTML('beforeend', `<div class="search-divider online-header" style="${extraStyle}">PLAYERS ONLINE (${onlineOthers.length})</div>`);
 			onlineOthers.forEach((u, i) => {
 				const uName = u.name || u;
-				const card = createUserCardElement(uName, u.avatar, '#4caf50', 'Online Now', true, false, i + 100, isSilent, friendLookupContext);
+				const card = createUserCardElement(uName, getResolvedUserAvatar(uName, u.avatar), '#4caf50', 'Online Now', true, false, i + 100, isSilent);
 				grid.appendChild(card);
 			});
 		}
@@ -51548,7 +51410,7 @@ function getVisibleChatStackEl(id) {
 			grid.insertAdjacentHTML('beforeend', `<div class="search-divider" style="${extraStyle} color: #8b96a8;">PLAYERS OFFLINE (${globalOffline.length})</div>`);
 			globalOffline.forEach((u, i) => {
 				const uName = u.name || u;
-				const card = createUserCardElement(uName, u.avatar, '#8b96a8', 'Offline', false, false, i + 500, isSilent, friendLookupContext);
+				const card = createUserCardElement(uName, getResolvedUserAvatar(uName, u.avatar), '#8b96a8', 'Offline', false, false, i + 500, isSilent);
 				grid.appendChild(card);
 			});
 		}
@@ -51574,13 +51436,11 @@ function getVisibleChatStackEl(id) {
 		}
 	};
 	
-	function createUserCardElement(name, avatar, statusColor, statusText, isOnline, isFriend, idx, isSilent = false, lookupContext = null) {
-		avatar = getResolvedUserAvatar(name, avatar, lookupContext);
+	function createUserCardElement(name, avatar, statusColor, statusText, isOnline, isFriend, idx, isSilent = false) {
+		avatar = getResolvedUserAvatar(name, avatar);
 		const myName = localStorage.getItem('psn_username');
 		const isMe = (name === myName);
-		const netUser = lookupContext && lookupContext.onlineByName instanceof Map
-			? (lookupContext.onlineByName.get(name) || null)
-			: (typeof currentOnlineList !== 'undefined' ? currentOnlineList.find(u => (u.name || u) === name) : null);
+		const netUser = typeof currentOnlineList !== 'undefined' ? currentOnlineList.find(u => (u.name || u) === name) : null;
 		
 		let playerLevel = 1;
 		if (isMe) {
@@ -51588,22 +51448,14 @@ function getVisibleChatStackEl(id) {
 		} else if (netUser && netUser.level) {
 			playerLevel = netUser.level;
 		} else {
-			const friendData = lookupContext && lookupContext.friendByName instanceof Map
-				? (lookupContext.friendByName.get(name) || null)
-				: (window.friendsList ? window.friendsList.find(f => (f.name || f) === name) : null);
-			const searchData = lookupContext && lookupContext.globalSearchByName instanceof Map
-				? (lookupContext.globalSearchByName.get(name) || null)
-				: (window.globalSearchResults ? window.globalSearchResults.find(u => (u.name || u) === name) : null);
+			const friendData = window.friendsList ? window.friendsList.find(f => (f.name || f) === name) : null;
+			const searchData = window.globalSearchResults ? window.globalSearchResults.find(u => (u.name || u) === name) : null;
 			if (friendData && friendData.level) playerLevel = friendData.level;
 			else if (searchData && searchData.level) playerLevel = searchData.level;
 		}
 		
-		const searchDataForRole = lookupContext && lookupContext.globalSearchByName instanceof Map
-			? (lookupContext.globalSearchByName.get(name) || null)
-			: (window.globalSearchResults ? window.globalSearchResults.find(u => (u.name || u) === name) : null);
-		const friendDataForRole = lookupContext && lookupContext.friendByName instanceof Map
-			? (lookupContext.friendByName.get(name) || null)
-			: (window.friendsList ? window.friendsList.find(f => (f.name || f) === name) : null);
+		const searchDataForRole = window.globalSearchResults ? window.globalSearchResults.find(u => (u.name || u) === name) : null;
+		const friendDataForRole = window.friendsList ? window.friendsList.find(f => (f.name || f) === name) : null;
 		const roleSource = netUser || searchDataForRole || friendDataForRole || {};
 		const userRole = typeof window.getPsnUserRole === 'function' ? window.getPsnUserRole(name, roleSource) : (roleSource.isAdmin ? 'admin' : 'user');
 		const isTargetAdmin = (netUser && netUser.isAdmin === true) || userRole === 'admin';
@@ -52974,24 +52826,21 @@ function getVisibleChatStackEl(id) {
 					for (let cat of searchableStoreCategories) {
 						if (isWebmanList && typeof window.isLibraryBlockedContentCategory === 'function' && window.isLibraryBlockedContentCategory(cat)) continue;
 						if (!Array.isArray(window.psnStoreCache[cat])) continue;
-						let foundStoreItem = null;
-						if (isWebmanList && typeof window.findPsnStoreExactMatchInCategory === 'function') {
-							foundStoreItem = window.findPsnStoreExactMatchInCategory(cat, searchId ? [searchId] : [], searchContentId ? [searchContentId] : []);
-						} else {
-							foundStoreItem = window.psnStoreCache[cat].find(g => {
-								const gContentId = String(g.contentId || g.contentID || '').trim().toUpperCase();
-								if (searchContentId && gContentId && gContentId === searchContentId) return true;
-								const gIds = [g.id, g.titleId, g.titleID, g.titleid]
-									.map(value => String(value || '').trim().toUpperCase())
-									.filter(Boolean);
-								if (searchId && gIds.includes(searchId)) return true;
-								if (g.cleanName) {
-									const gName = g.cleanName.toLowerCase().replace(/[^a-z0-9]/g, '');
-									if (gName.length > 3 && (gName === searchTitle || searchTitle.includes(gName))) return true;
-								}
-								return false;
-							});
-						}
+						const foundStoreItem = window.psnStoreCache[cat].find(g => {
+							const gContentId = String(g.contentId || g.contentID || '').trim().toUpperCase();
+							if (searchContentId && gContentId && gContentId === searchContentId) return true;
+
+							const gIds = [g.id, g.titleId, g.titleID, g.titleid]
+								.map(value => String(value || '').trim().toUpperCase())
+								.filter(Boolean);
+							if (searchId && gIds.includes(searchId)) return true;
+
+							if (!isWebmanList && g.cleanName) {
+								const gName = g.cleanName.toLowerCase().replace(/[^a-z0-9]/g, '');
+								if (gName.length > 3 && (gName === searchTitle || searchTitle.includes(gName))) return true;
+							}
+							return false;
+						});
 
 						if (foundStoreItem) {
 							existsInStore = true;
