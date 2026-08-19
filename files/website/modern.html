@@ -2123,6 +2123,11 @@ body.chat-selection-mode .chat-message-actions .chat-delete-action:not(.chat-del
 	.sidebar-menu li>i { transition: color .15s ease !important; transform: none !important; filter: none !important; }
 }
 
+/* ========================================================================== PAGE EXIT TRANSITION ========================================================================== */
+@keyframes view-exit{0%{opacity:1;transform:translateY(0) scale(1);filter:none;}100%{opacity:0;transform:translateY(-8px) scale(.985);filter:blur(4px);}}
+.anim-out { transform-origin: top center; pointer-events: none !important; animation: view-exit .18s cubic-bezier(.4,0,1,1) forwards !important; }
+@media (prefers-reduced-motion:reduce) { .anim-out { animation-duration: .01ms !important; animation-delay: 0ms !important; } }
+
 /* ========================================================================== PAGE ENTRANCE (FADE-IN UP & EXCEPTIONS) ========================================================================== */
 .anim-up { transform-origin: top center; animation: view-enter 0.4s cubic-bezier(0.2,0.8,0.2,1) forwards !important; }
 #view-explore.anim-up { animation: explore-view-enter 0.4s cubic-bezier(0.2,0.8,0.2,1) forwards !important; }
@@ -26728,7 +26733,7 @@ P
 		if (typeof renderWishLetterFilter === 'function') renderWishLetterFilter();
 	}
 
-	window.switchView = function(viewId, forceReset = false, preventAutoLoad = false) {
+	window.switchView = function(viewId, forceReset = false, preventAutoLoad = false, _skipExit = false) {
 		const mainViews = ['view-explore', 'view-browse', 'view-wishlist', 'view-downloads', 'view-library', 'view-trending', 'view-online'];
 		const profileUtils = ['view-chat', 'view-trophies', 'view-rewards'];
 
@@ -26745,14 +26750,37 @@ P
 		const currentViewId = currentView ? currentView.id : '';
 		const movingWithinBrowseContext = !!(currentViewId && browseContextViews.has(currentViewId) && browseContextViews.has(viewId));
 		const leavingBrowseContext = !!(currentViewId && browseContextViews.has(currentViewId) && !browseContextViews.has(viewId));
-		if (currentViewId && currentViewId !== viewId && !window.isRestoringHistory && typeof window.resetStoreSearchForNavigation === 'function') {
-			window.resetStoreSearchForNavigation(currentViewId);
-		}
 		if (!forceReset && currentView && currentView.id === viewId) {
 			window.__lastSwitchViewWasNoop = viewId;
 			return;
 		}
 		window.__lastSwitchViewWasNoop = null;
+
+		const reduceViewMotion = !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+		if (!_skipExit && currentView && currentView.id !== viewId && !window.isRestoringHistory && !reduceViewMotion) {
+			window.__pendingViewSwitch = { viewId, forceReset, preventAutoLoad };
+			if (window.__viewExitTransitionActive) return;
+
+			window.__viewExitTransitionActive = true;
+			currentView.classList.remove('anim-up', 'anim-out');
+			void currentView.offsetWidth;
+			currentView.classList.add('anim-out');
+
+			window.__viewExitTimer = setTimeout(() => {
+				currentView.classList.remove('anim-out');
+				window.__viewExitTransitionActive = false;
+				window.__viewExitTimer = null;
+				const next = window.__pendingViewSwitch || { viewId, forceReset, preventAutoLoad };
+				window.__pendingViewSwitch = null;
+				window.switchView(next.viewId, next.forceReset, next.preventAutoLoad, true);
+			}, 180);
+			return;
+		}
+
+		if (currentView) currentView.classList.remove('anim-out');
+		if (currentViewId && currentViewId !== viewId && !window.isRestoringHistory && typeof window.resetStoreSearchForNavigation === 'function') {
+			window.resetStoreSearchForNavigation(currentViewId);
+		}
 
 		if (currentView) {
 			if (currentView.id !== viewId && !window.isRestoringHistory) {
