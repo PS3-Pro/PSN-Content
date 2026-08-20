@@ -511,6 +511,8 @@ select option { background-color: var(--bg-dark); }
 .btn-rap { order: 6; background: linear-gradient(135deg,#e0e0e0,#ffffff); color: #000; }
 .btn-rap.btn-rap-by-dlc { background: linear-gradient(135deg,#59616d,#858d98); color: #f7f8fa; border-color: rgba(255,255,255,0.18); }
 .btn-rap.btn-rap-by-dlc:hover { box-shadow: inset 0 0 0 100px rgba(0,0,0,0.20); border-color: rgba(255,255,255,0.42); }
+.btn-rap.btn-rap-by-repo { background: linear-gradient(135deg,#5d4037,#8d6e63); color: #fff8f3; border-color: rgba(215,177,157,0.34); }
+.btn-rap.btn-rap-by-repo:hover { box-shadow: inset 0 0 0 100px rgba(0,0,0,0.18); border-color: rgba(239,204,184,0.62); }
 .btn-group:has(> :nth-child(4)) .btn-upd, .btn-group:has(> :nth-child(4)) .btn-avt { order: 10; }
 .btn-group:has(> :nth-child(4)) .btn-dlc, .btn-group:has(> :nth-child(4)) .btn-thm { order: 20; }
 .btn-group:has(> :nth-child(4)) .btn-pkg, .btn-group:has(> :nth-child(4)) .btn-multi { order: 30; }
@@ -16136,8 +16138,14 @@ P
 			(marker.includes('UNLOCK') && marker.includes('DLC'));
 	}
 
-	function isLicenseByDlcItem(game) {
-		return !!game && isLicenseByDlcRapValue(game.rap);
+	function isLicenseByDlcItem(game, category = '') {
+		if (!game) return false;
+		if (isLicenseByDlcRapValue(game.rap)) return true;
+
+		const resolvedCategory = String(category || game.category || game.rawCategory || '').trim().toLowerCase();
+		if (resolvedCategory && resolvedCategory !== 'games') return false;
+
+		return !!getCachedLicenseDlcForGame(game);
 	}
 
 	function hasDirectRapValue(value) {
@@ -16152,6 +16160,172 @@ P
 
 	function hasValidRapDownload(game) {
 		return !!(game && hasDirectRapValue(game.rap) && game.contentId && game.contentId !== 'MISSING');
+	}
+
+	const LICENSE_REPO_RAP_BASE_URL = 'https://ps3-pro.github.io/License-Files/files/';
+	const LICENSE_REPO_RAP_MAX_CONCURRENT = 4;
+	const licenseRepoRapAvailability = Object.create(null);
+	const licenseRepoRapPending = new Set();
+	const licenseRepoRapQueue = [];
+	let licenseRepoRapActiveChecks = 0;
+
+	function getLicenseRepoRapContentId(game) {
+		const contentId = String(game && game.contentId || '').trim();
+		return contentId && contentId !== 'MISSING' ? contentId : '';
+	}
+
+	function isRepoRapFallbackCandidate(game, category = '') {
+		if (!game || normalizeRapMarker(game.rap) !== 'MISSING') return false;
+		if (!getLicenseRepoRapContentId(game)) return false;
+
+		const resolvedCategory = String(category || game.category || game.rawCategory || '').trim().toLowerCase();
+		// Priority: direct database RAP -> unlock DLC -> repository fallback.
+		if (resolvedCategory === 'games' && isLicenseByDlcItem(game, resolvedCategory)) return false;
+		return true;
+	}
+
+	function hasCachedRepoRapDownload(game, category = '') {
+		if (!isRepoRapFallbackCandidate(game, category)) return false;
+		const contentId = getLicenseRepoRapContentId(game);
+		return licenseRepoRapAvailability[contentId] === true;
+	}
+
+	function getRapButtonMode(game, category = '') {
+		if (hasValidRapDownload(game)) return 'direct';
+		if (isLicenseByDlcItem(game, category)) return 'dlc';
+		if (hasCachedRepoRapDownload(game, category)) return 'repo';
+		return '';
+	}
+
+	function findStoreItemByIdentity(titleId, contentId, category = '') {
+		const normalizedTitleId = String(titleId || '').trim().toUpperCase();
+		const normalizedContentId = String(contentId || '').trim().toUpperCase();
+		const pools = [];
+		if (Array.isArray(currentData)) pools.push(currentData);
+		if (Array.isArray(filteredData)) pools.push(filteredData);
+		const cacheItems = window.psnStoreCache && Array.isArray(window.psnStoreCache[category]) ? window.psnStoreCache[category] : null;
+		if (cacheItems) pools.push(cacheItems);
+
+		for (const pool of pools) {
+			const item = pool.find(candidate => {
+				const candidateTitleId = String(candidate && (candidate.id || candidate.titleId) || '').trim().toUpperCase();
+				const candidateContentId = String(candidate && candidate.contentId || '').trim().toUpperCase();
+				return (!normalizedTitleId || candidateTitleId === normalizedTitleId) &&
+					(!normalizedContentId || candidateContentId === normalizedContentId);
+			});
+			if (item) return item;
+		}
+		return null;
+	}
+
+	function createRepoRapButton(game, category = '', compact = false) {
+		const contentId = getLicenseRepoRapContentId(game);
+		if (!contentId) return null;
+		const titleId = String(game.id || game.titleId || '');
+		const displayName = String(game.cleanName || game.name || game.title || titleId || 'RAP');
+		const button = document.createElement('a');
+		button.className = 'btn-mini btn-rap btn-rap-by-repo';
+		button.style.cursor = 'pointer';
+		button.title = 'Download RAP (Found in License Repository)';
+		button.innerHTML = compact
+			? '<i class="fas fa-key"></i> <span data-no-translate="true" translate="no">RAP</span>'
+			: '<i class="fas fa-key"></i> RAP';
+		button.addEventListener('mouseenter', () => { if (typeof playUiArrow === 'function') playUiArrow(); });
+		button.addEventListener('click', event => {
+			if (typeof playUiClick === 'function') playUiClick();
+			smartDownload(event, 'rap', '', displayName, '', button, 0, titleId, category, contentId);
+		});
+		return button;
+	}
+
+	function refreshVisibleRepoRapButtons(contentId) {
+		const normalizedContentId = String(contentId || '').trim();
+		if (!normalizedContentId || licenseRepoRapAvailability[normalizedContentId] !== true) return;
+
+		document.querySelectorAll('.game-card[data-content-id]').forEach(card => {
+			if (String(card.getAttribute('data-content-id') || '').trim() !== normalizedContentId) return;
+			const category = String(card.getAttribute('data-store-category') || document.getElementById('cat-select')?.value || '').trim().toLowerCase();
+			const titleId = String(card.getAttribute('data-title-id') || '').trim();
+			const game = findStoreItemByIdentity(titleId, normalizedContentId, category);
+			if (!game || getRapButtonMode(game, category) !== 'repo') return;
+			const group = card.querySelector('.btn-group');
+			if (!group || group.querySelector('.btn-rap')) return;
+			const button = createRepoRapButton(game, category, false);
+			if (button) group.appendChild(button);
+		});
+
+		const modal = document.getElementById('game-modal');
+		if (!modal || String(modal.dataset.contentId || '').trim() !== normalizedContentId) return;
+		const category = String(modal.dataset.storeCategory || '').trim().toLowerCase();
+		const titleId = String(modal.dataset.titleId || '').trim();
+		const game = findStoreItemByIdentity(titleId, normalizedContentId, category);
+		if (!game || getRapButtonMode(game, category) !== 'repo') return;
+		const group = modal.querySelector('.sys-modal-body .btn-group');
+		if (!group || group.querySelector('.btn-rap')) return;
+		const button = createRepoRapButton(game, category, true);
+		if (button) group.appendChild(button);
+	}
+
+	async function checkLicenseRepoRap(contentId) {
+		const url = LICENSE_REPO_RAP_BASE_URL + encodeURIComponent(contentId) + '.rap';
+		try {
+			let response = await fetch(url, { method: 'HEAD', cache: 'force-cache' });
+			if (response.status === 405) {
+				response = await fetch(url, { method: 'GET', headers: { Range: 'bytes=0-0' }, cache: 'force-cache' });
+			}
+			return response.ok;
+		} catch (error) {
+			console.warn('[RAP REPO] Could not verify license:', contentId, error);
+			return false;
+		}
+	}
+
+	function pumpLicenseRepoRapQueue() {
+		while (licenseRepoRapActiveChecks < LICENSE_REPO_RAP_MAX_CONCURRENT && licenseRepoRapQueue.length) {
+			const contentId = licenseRepoRapQueue.shift();
+			licenseRepoRapActiveChecks++;
+			checkLicenseRepoRap(contentId).then(exists => {
+				licenseRepoRapAvailability[contentId] = exists;
+				if (exists) refreshVisibleRepoRapButtons(contentId);
+			}).finally(() => {
+				licenseRepoRapPending.delete(contentId);
+				licenseRepoRapActiveChecks--;
+				pumpLicenseRepoRapQueue();
+			});
+		}
+	}
+
+	function scheduleLicenseRepoRapCheck(game, category = '') {
+		if (!isRepoRapFallbackCandidate(game, category)) return;
+		const contentId = getLicenseRepoRapContentId(game);
+		if (!contentId || Object.prototype.hasOwnProperty.call(licenseRepoRapAvailability, contentId) || licenseRepoRapPending.has(contentId)) return;
+		licenseRepoRapPending.add(contentId);
+		licenseRepoRapQueue.push(contentId);
+		pumpLicenseRepoRapQueue();
+	}
+
+	function getRapButtonHtml(game, category, safeName, modal = false) {
+		const mode = getRapButtonMode(game, category);
+		const spanOpen = modal ? '<span data-no-translate="true" translate="no">' : '';
+		const spanClose = modal ? '</span>' : '';
+		const hover = modal ? ' onmouseenter="playUiArrow()"' : '';
+		const titleId = game.id || game.titleId || '';
+		const contentId = game.contentId || '';
+
+		if (mode === 'direct') {
+			return `<a style="cursor: pointer;" title="Download RAP (License)" class="btn-mini btn-rap"${hover} onclick="playUiClick(); smartDownload(event, 'rap', '', '${safeName}', '', this, 0, '${titleId}', '${category}', '${contentId}')"><i class="fas fa-key"></i> ${spanOpen}RAP${spanClose}</a>`;
+		}
+
+		if (mode === 'dlc') {
+			return `<a style="cursor: pointer;" title="View Unlock DLC (License)" class="btn-mini btn-rap btn-rap-by-dlc"${hover} onclick="openLicenseDlc(event, '${titleId}', '${contentId}', '${safeName}', this)"><i class="fas fa-key"></i> ${spanOpen}RAP${spanClose}</a>`;
+		}
+
+		if (mode === 'repo') {
+			return `<a style="cursor: pointer;" title="Download RAP (Found in License Repository)" class="btn-mini btn-rap btn-rap-by-repo"${hover} onclick="playUiClick(); smartDownload(event, 'rap', '', '${safeName}', '', this, 0, '${titleId}', '${category}', '${contentId}')"><i class="fas fa-key"></i> ${spanOpen}RAP${spanClose}</a>`;
+		}
+
+		scheduleLicenseRepoRapCheck(game, category);
+		return '';
 	}
 
 	function normalizeUnlockLookupText(value) {
@@ -16188,24 +16362,60 @@ P
 		return intersection / Math.max(leftTokens.size, rightTokens.size, 1);
 	}
 
-	function scoreLicenseDlcCandidate(baseGame, candidate) {
-		if (!candidate || !hasValidRapDownload(candidate) || !getBulkPkgDownloadType(candidate)) return -999;
+	function getLicenseDlcCandidateName(candidate) {
+		return normalizeUnlockLookupText(candidate && (candidate.rawName || candidate.title || candidate.name || candidate.cleanName));
+	}
 
+	function hasUsableLicenseDlcContentId(candidate) {
+		const contentId = String(candidate && candidate.contentId || '').trim();
+		return !!contentId && contentId !== 'MISSING';
+	}
+
+	function hasExplicitLicenseDlcSignal(candidate, titleId = '') {
+		if (!candidate) return false;
+		const candidateName = getLicenseDlcCandidateName(candidate);
+		const candidateSuffix = getLicenseContentSuffix(candidate.contentId);
+		const normalizedTitleId = normalizeUnlockLookupText(titleId || candidate.id || candidate.titleId);
+		const titleIdUnlockName = !!(normalizedTitleId && (
+			candidateName === normalizedTitleId + ' unlock key' ||
+			candidateName.startsWith(normalizedTitleId + ' unlock key ') ||
+			candidateName === normalizedTitleId + ' unlock' ||
+			candidateName.startsWith(normalizedTitleId + ' unlock ')
+		));
+
+		return titleIdUnlockName ||
+			/\bunlock key\b|\bunlock\b|\blicen[cs]e\b|\btrial upgrade\b|\bupgrade\b|\bpurchase\b|full game unlock|full version/.test(candidateName) ||
+			/(UNLOCK|KEY|FULL|UPGRADE|LICENSE|LICENCE|PURCHASE)/.test(candidateSuffix);
+	}
+
+	function scoreLicenseDlcCandidate(baseGame, candidate) {
+		if (!candidate || !getBulkPkgDownloadType(candidate) || !hasUsableLicenseDlcContentId(candidate)) return -999;
+
+		const titleId = String(baseGame && (baseGame.id || baseGame.titleId) || '').trim().toUpperCase();
 		const baseName = normalizeUnlockLookupText(baseGame && (baseGame.cleanName || baseGame.name || baseGame.title));
-		const candidateName = normalizeUnlockLookupText(candidate.cleanName || candidate.name || candidate.title);
+		const candidateName = getLicenseDlcCandidateName(candidate);
 		const baseSuffix = getLicenseContentSuffix(baseGame && baseGame.contentId);
 		const candidateSuffix = getLicenseContentSuffix(candidate.contentId);
 		const prefixLength = getLicenseCommonPrefixLength(baseSuffix, candidateSuffix);
 		const similarity = getLicenseNameSimilarity(baseName, candidateName);
-		let score = (similarity * 35) + (Math.min(prefixLength, 16) * 3);
+		const hasDirectRap = hasValidRapDownload(candidate);
+		const hasExplicitUnlockSignal = hasExplicitLicenseDlcSignal(candidate, titleId);
 
-		if (/\bunlock key\b/.test(candidateName)) score += 55;
-		else if (/\bunlock\b/.test(candidateName)) score += 42;
+		// A DLC whose title explicitly identifies an unlock/license is valid even when
+		// the database RAP column says MISSING. The RAP repository is keyed by Content ID.
+		if (!hasDirectRap && !hasExplicitUnlockSignal) return -999;
+
+		let score = (similarity * 35) + (Math.min(prefixLength, 16) * 3);
+		const normalizedTitleId = normalizeUnlockLookupText(titleId);
+		if (normalizedTitleId && (candidateName === normalizedTitleId + ' unlock key' || candidateName.startsWith(normalizedTitleId + ' unlock key '))) score += 120;
+		else if (/\bunlock key\b/.test(candidateName)) score += 70;
+		else if (/\bunlock\b/.test(candidateName)) score += 48;
 		if (/full game unlock|full version/.test(candidateName)) score += 25;
 		if (/\blicen[cs]e\b/.test(candidateName)) score += 35;
 		if (/\btrial upgrade\b|\bupgrade\b|\bpurchase\b/.test(candidateName)) score += 35;
 		if (/(UNLOCK|KEY|FULL|UPGRADE|LICENSE|LICENCE|PURCHASE)/.test(candidateSuffix)) score += 30;
 		if (prefixLength >= 12) score += 20;
+		if (hasDirectRap) score += 10;
 
 		const baseNumeric = baseSuffix.match(/^(.*?)(\d+)$/);
 		const candidateNumeric = candidateSuffix.match(/^(.*?)(\d+)$/);
@@ -16215,13 +16425,49 @@ P
 			if (Number.isFinite(baseNumber) && candidateNumber === baseNumber + 1) score += 55;
 		}
 
-		const hasExplicitUnlockSignal = /\bunlock\b|\bkey\b|\blicen[cs]e\b|\bupgrade\b|\bpurchase\b|full game/.test(candidateName) ||
-			/(UNLOCK|KEY|FULL|UPGRADE|LICENSE|LICENCE|PURCHASE)/.test(candidateSuffix);
 		if (!hasExplicitUnlockSignal && /\bepisode [2-9]\b|\bskin\b|\bpack\b|\bexpansion\b|\bmap\b|\btheme\b|\bavatar\b|\bwaldgeist\b/.test(candidateName)) {
 			score -= 45;
 		}
 
 		return score;
+	}
+
+	function pickLicenseDlcCandidate(baseGame, dlcItems) {
+		const titleId = String(baseGame && (baseGame.id || baseGame.titleId) || '').trim().toUpperCase();
+		if (!titleId) return null;
+
+		const sameTitleDlcs = (Array.isArray(dlcItems) ? dlcItems : [])
+			.filter(item => String(item && (item.id || item.titleId) || '').trim().toUpperCase() === titleId);
+
+		// Strongest case: databases sometimes name the unlock DLC exactly
+		// "TITLEID - Unlock Key" (for example NPUB30058 - Unlock Key).
+		const normalizedTitleId = normalizeUnlockLookupText(titleId);
+		const exactTitleUnlock = sameTitleDlcs.find(item => {
+			if (!getBulkPkgDownloadType(item) || !hasUsableLicenseDlcContentId(item)) return false;
+			const name = getLicenseDlcCandidateName(item);
+			return name === normalizedTitleId + ' unlock key' || name.startsWith(normalizedTitleId + ' unlock key ');
+		});
+		if (exactTitleUnlock) return exactTitleUnlock;
+
+		const ranked = sameTitleDlcs
+			.map(item => ({ item, score: scoreLicenseDlcCandidate(baseGame, item) }))
+			.filter(entry => entry.score > -900)
+			.sort((a, b) => b.score - a.score);
+
+		if (!ranked.length) return null;
+
+		const top = ranked[0];
+		const second = ranked[1];
+		if (top.score < 55 || (second && (top.score - second.score) < 15)) return null;
+
+		return top.item;
+	}
+
+	function getCachedLicenseDlcForGame(baseGame) {
+		const dlcItems = window.psnStoreCache && Array.isArray(window.psnStoreCache.dlcs)
+			? window.psnStoreCache.dlcs
+			: [];
+		return pickLicenseDlcCandidate(baseGame, dlcItems);
 	}
 
 	async function resolveLicenseDlcForGame(baseGame) {
@@ -16237,20 +16483,7 @@ P
 			}
 		}
 
-		const titleId = String(baseGame && (baseGame.id || baseGame.titleId) || '').trim().toUpperCase();
-		const ranked = (Array.isArray(dlcItems) ? dlcItems : [])
-			.filter(item => String(item && (item.id || item.titleId) || '').trim().toUpperCase() === titleId)
-			.map(item => ({ item, score: scoreLicenseDlcCandidate(baseGame, item) }))
-			.filter(entry => entry.score > -900)
-			.sort((a, b) => b.score - a.score);
-
-		if (!ranked.length) return null;
-
-		const top = ranked[0];
-		const second = ranked[1];
-		if (top.score < 55 || (second && (top.score - second.score) < 15)) return null;
-
-		return top.item;
+		return pickLicenseDlcCandidate(baseGame, dlcItems);
 	}
 
 	function findBaseGameForLicenseDlc(titleId, contentId, displayName) {
@@ -16278,7 +16511,7 @@ P
 		};
 	}
 
-	window.downloadLicenseByDlc = async function(event, titleId, contentId, displayName, btnElement) {
+	window.openLicenseDlc = async function(event, titleId, contentId, displayName, btnElement) {
 		if (event) {
 			event.preventDefault();
 			event.stopPropagation();
@@ -16293,47 +16526,20 @@ P
 			btnElement.innerHTML = '<i class="fas fa-spinner fa-spin"></i> RAP';
 		}
 
-		const openDlcListSilently = function() {
-			if (typeof closeModal === 'function') closeModal();
-			if (typeof switchAndSearch === 'function') switchAndSearch('dlcs', String(titleId || ''));
-		};
-
 		try {
 			const baseGame = findBaseGameForLicenseDlc(titleId, contentId, displayName);
 			const dlc = await resolveLicenseDlcForGame(baseGame);
+			const focusContentId = String(dlc && dlc.contentId || '').trim();
 
-			if (!dlc) {
-				openDlcListSilently();
-				return false;
+			if (typeof closeModal === 'function') closeModal();
+			if (typeof switchAndSearch === 'function') {
+				switchAndSearch('dlcs', String(titleId || ''), false, focusContentId);
 			}
-			const ipInput = document.getElementById('ps3-ip');
-			const ip = ipInput ? ipInput.value.trim() : '';
-			const globalIcon = document.getElementById('global-status-icon');
-			const isConnected = !!(globalIcon && globalIcon.classList.contains('status-dot-connected'));
-			const remoteBlocked = /dropbox\.com|dropboxusercontent\.com/i.test(String(dlc.url || ''));
-
-			let pkgQueued = false;
-			let rapQueued = false;
-
-			if (isConnected && ip && !remoteBlocked) {
-				pkgQueued = sendBulkDownloadToPs3(dlc, 'pkg', ip, 'dlcs');
-				await waitBulkDownloadStep(450);
-				rapQueued = sendBulkDownloadToPs3(dlc, 'rap', ip, 'dlcs');
-			} else {
-				pkgQueued = await downloadBulkPkgToDevice(dlc, 'dlcs');
-				await waitBulkDownloadStep(850);
-				rapQueued = downloadBulkRapToDevice(dlc);
-			}
-
-			if (!pkgQueued || !rapQueued) {
-				openDlcListSilently();
-				return false;
-			}
-
-			return true;
+			return !!dlc;
 		} catch (error) {
-			console.error('[License DLC] Failed to resolve/download unlock DLC:', error);
-			openDlcListSilently();
+			console.error('[License DLC] Could not open unlock DLC:', error);
+			if (typeof closeModal === 'function') closeModal();
+			if (typeof switchAndSearch === 'function') switchAndSearch('dlcs', String(titleId || ''));
 			return false;
 		} finally {
 			if (btnElement) {
@@ -16504,6 +16710,7 @@ P
 		triggerBulkDirectLink('https://ps3-pro.github.io/License-Files/files/' + contentId + '.rap', contentId + '.rap');
 		return true;
 	}
+
 
 	function sendBulkDownloadToPs3(game, jobKind, ip, category) {
 		const type = getBulkPkgDownloadType(game);
@@ -19034,11 +19241,16 @@ P
 		const gameId = String(game.id || '');
 
 		if (term) {
-			const nameNormalized = cleanName.toLowerCase().replace(/[^a-z0-9]/g, '').replace(/(.)\1+/g, '$1');
-			const idMatch = gameId.toLowerCase().includes(term);
-			const nameMatch = nameNormalized.includes(termNormalized);
-
-			if (!(nameMatch || idMatch)) return false;
+			const normalizedTermId = term.toUpperCase().replace(/[^A-Z0-9]/g, '');
+			const isExactTitleIdSearch = /^[A-Z]{4}[0-9]{5}$/.test(normalizedTermId);
+			if (isExactTitleIdSearch) {
+				if (gameId.toUpperCase().replace(/[^A-Z0-9]/g, '') !== normalizedTermId) return false;
+			} else {
+				const nameNormalized = cleanName.toLowerCase().replace(/[^a-z0-9]/g, '').replace(/([a-z])\1+/g, '$1');
+				const idMatch = gameId.toLowerCase().includes(term);
+				const nameMatch = nameNormalized.includes(termNormalized);
+				if (!(nameMatch || idMatch)) return false;
+			}
 		} else if (typeof activeLetter !== 'undefined' && activeLetter !== 'ALL') {
 			const firstChar = cleanName.charAt(0).toUpperCase();
 			if (activeLetter === '#') { if (/[A-Z0-9]/.test(firstChar)) return false; }
@@ -19066,7 +19278,7 @@ P
 		const currentCat = catSelect ? catSelect.value : '';
 		return {
 			term,
-			termNormalized: term.replace(/[^a-z0-9]/g, '').replace(/(.)\1+/g, '$1'),
+			termNormalized: term.replace(/[^a-z0-9]/g, '').replace(/([a-z])\1+/g, '$1'),
 			regionFilter: (typeof browseExpandedGroupTitle !== 'undefined' && browseExpandedGroupTitle) ? 'ALL' : (regionSelect ? regionSelect.value : 'ALL'),
 			activeConsoles: Array.from(document.querySelectorAll('#console-filters input:checked')).map(cb => cb.value),
 			currentCat,
@@ -19642,7 +19854,7 @@ P
 
 		const searchInputEl = document.getElementById('search-input');
 		const term = searchInputEl ? searchInputEl.value.toLowerCase().trim() : '';
-		const termNormalized = term.replace(/[^a-z0-9]/g, '').replace(/(.)\1+/g, '$1'); 
+		const termNormalized = term.replace(/[^a-z0-9]/g, '').replace(/([a-z])\1+/g, '$1'); 
 		const forceBrowseTopOnThisFilter = !!window.__browseForceTopOnNextFilter;
 		window.__browseForceTopOnNextFilter = false;
 
@@ -20148,11 +20360,7 @@ P
 				buttonsHtml += `<a style="cursor: pointer;" title="Download PKG" class="btn-mini btn-pkg" onclick="smartDownload(event, 'single', '${game.url}', '${escapedName}', '${game.version}', this, ${game.sizeBytes || 0}, '${game.id}', '${currentCat}', '${game.contentId || ''}')"><i class="fas fa-download"></i> PKG</a>`;
 			}
 			
-			if (hasValidRapDownload(game)) {
-				buttonsHtml += `<a style="cursor: pointer;" title="Download RAP (License)" class="btn-mini btn-rap" onclick="playUiClick(); smartDownload(event, 'rap', '', '${escapedName}', '', this, 0, '${game.id}', '${currentCat}', '${game.contentId}')"><i class="fas fa-key"></i> RAP</a>`;
-			} else if (isLicenseByDlcItem(game)) {
-				buttonsHtml += `<a style="cursor: pointer;" title="Download RAP (License)" class="btn-mini btn-rap btn-rap-by-dlc" onclick="downloadLicenseByDlc(event, '${game.id}', '${game.contentId || ''}', '${escapedName}', this)"><i class="fas fa-key"></i> RAP</a>`;
-			}
+			buttonsHtml += getRapButtonHtml(game, currentCat, escapedName, false);
 		
 			if (currentCat === 'games' || currentCat === 'apps') {
 				if (sysData.updates.has(game.id)) {
@@ -21353,11 +21561,7 @@ P
 			actionsHtml += `<a style="cursor: pointer;" title="Download PKG" class="btn-mini btn-pkg" onmouseenter="playUiArrow()" onclick="smartDownload(event, 'single', '${game.url}', '${safeName}', '${game.version}', this, ${game.sizeBytes || 0}, '${game.id}', '${currentCat}', '${game.contentId || ''}')"><i class="fas fa-download"></i> <span data-no-translate="true" translate="no">PKG</span></a>`;
 		}
 	
-		if (hasValidRapDownload(game)) {
-			actionsHtml += `<a style="cursor: pointer;" title="Download RAP (License)" class="btn-mini btn-rap" onmouseenter="playUiArrow()" onclick="playUiClick(); smartDownload(event, 'rap', '', '${safeName}', '', this, 0, '${game.id}', '${currentCat}', '${game.contentId}')"><i class="fas fa-key"></i> <span data-no-translate="true" translate="no">RAP</span></a>`;
-		} else if (isLicenseByDlcItem(game)) {
-			actionsHtml += `<a style="cursor: pointer;" title="Download RAP (License)" class="btn-mini btn-rap btn-rap-by-dlc" onmouseenter="playUiArrow()" onclick="downloadLicenseByDlc(event, '${game.id}', '${game.contentId || ''}', '${safeName}', this)"><i class="fas fa-key"></i> <span data-no-translate="true" translate="no">RAP</span></a>`;
-		}
+		actionsHtml += getRapButtonHtml(game, currentCat, safeName, true);
 	
 		if (currentCat === 'games' || currentCat === 'apps') {
 			if (sysData.updates.has(game.id)) {
