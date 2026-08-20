@@ -9015,6 +9015,29 @@ P
 	window.__trophiesHydrated = false;
     const COOKIE_NAME_HISTORY = "psn_dl_history";
     const STORAGE_KEY_WISHLIST = "psn_wishlist_db";
+	
+	window.getWishlistIdentityKey = function(item = {}, fallbackCategory = 'games') {
+		const contentId = String(item.contentId || '').trim();
+		if (contentId) return `content:${contentId}`;
+
+		const titleId = String(item.id || item.titleId || '').trim();
+		if (!titleId) return '';
+
+		const rawCategory = item.rawCategory || item.category || fallbackCategory || 'games';
+		const category = (typeof window.normalizeContentCategoryKey === 'function')
+			? window.normalizeContentCategoryKey(rawCategory, 'games')
+			: String(rawCategory || 'games').trim().toLowerCase().replace(/\s+/g, '_');
+
+		return `title:${category}:${titleId}`;
+	};
+
+	window.isWishlistItemSaved = function(item = {}, fallbackCategory = 'games') {
+		const targetKey = window.getWishlistIdentityKey(item, fallbackCategory);
+		if (!targetKey) return false;
+		return (Array.isArray(window.wishlist) ? window.wishlist : []).some(savedItem =>
+			window.getWishlistIdentityKey(savedItem, savedItem.rawCategory || savedItem.category || 'games') === targetKey
+		);
+	};
     const STORAGE_KEY_AUDIO = "psn_audio_state";
 	const STORAGE_KEY_UX = "psn_ux_sounds_state";
 	const STORAGE_KEY_CHAT_SOUND = "psn_chat_sound_state";
@@ -20058,10 +20081,9 @@ P
 				const titleIdLabel = `${groupCount} Title ID${groupCount === 1 ? '' : 's'}`;
 				const sizeLabel = getBrowseGroupSizeLabel(sourceGames);
 				const groupedSingleGame = groupCount === 1 ? groupItems[0].game : null;
-				const groupedIsInWishlist = sourceGames.some(groupedGame => {
-					const groupedWishKey = ((currentCat === 'avatars' || currentCat === 'themes') && groupedGame.contentId) ? groupedGame.contentId : groupedGame.id;
-					return wishlist.some(item => ((((item.category === 'avatars' || item.category === 'themes') && item.contentId) ? item.contentId : item.id) === groupedWishKey));
-				});
+				const groupedIsInWishlist = sourceGames.some(groupedGame =>
+					window.isWishlistItemSaved(groupedGame, currentCat)
+				);
 				const groupedWishlistClass = groupedIsInWishlist ? 'is-wishlisted' : '';
 				const groupedIsFavorited = !!groupedSingleGame && (
 					favoriteBrowseKeys.has(String(groupedSingleGame.id || '').trim()) ||
@@ -20106,8 +20128,7 @@ P
 				continue;
 			}
 			
-			const wishKey = ((currentCat === 'avatars' || currentCat === 'themes') && game.contentId) ? game.contentId : game.id;
-			const isInWishlist = wishlist.some(item => (((item.category === 'avatars' || item.category === 'themes') && item.contentId) ? item.contentId : item.id) === wishKey);
+			const isInWishlist = window.isWishlistItemSaved(game, currentCat);
 			const wishlistClass = isInWishlist ? 'is-wishlisted' : '';
 			const isFavoritedBrowse = favoriteBrowseKeys.has(String(game.id || '').trim()) || favoriteBrowseKeys.has(String(game.titleId || '').trim()) || favoriteBrowseKeys.has(String(game.cleanName || '').trim()) || favoriteBrowseKeys.has(String(game.name || '').trim());
 			const favoriteClass = isFavoritedBrowse ? 'is-favorited' : '';
@@ -21268,8 +21289,7 @@ P
 		else if (currentCat === 'legacy') { iconClass = 'fas fa-archive'; headerText = 'Legacy Details'; }
 		else if (currentCat === 'prototypes') { iconClass = 'fas fa-flask'; headerText = 'Prototype Details'; }
 		
-		const modalWishlistKey = game.contentId || game.id;
-		const modalIsWishlisted = wishlist.findIndex(item => (item.contentId || item.id) === modalWishlistKey) > -1;
+		const modalIsWishlisted = window.isWishlistItemSaved(game, currentCat);
 		const modalWishIcon = modalIsWishlisted ? 'fas fa-heart' : 'far fa-heart';
 		const modalWishColor = modalIsWishlisted ? '#ff4444' : 'rgba(255,255,255,0.6)';
 		const modalWishTitle = modalIsWishlisted ? 'Remove from Wishlist' : 'Add to Wishlist';
@@ -28790,7 +28810,8 @@ P
 		if (!gameData || !btn) return;
 
 		const itemKey = gameData.contentId || gameData.id;
-		const index = wishlist.findIndex(item => (item.contentId || item.id) === itemKey);
+		const identityKey = window.getWishlistIdentityKey(gameData, currentCat);
+		const index = wishlist.findIndex(item => window.getWishlistIdentityKey(item, item.rawCategory || item.category || 'games') === identityKey);
 		if (!card) {
 			card = Array.from(document.querySelectorAll('.game-card')).find(el => {
 				const cardContentId = el.getAttribute('data-content-id') || '';
@@ -45081,7 +45102,6 @@ function getVisibleChatStackEl(id) {
 
 	window.refreshVisibleWishlistCardsFromProfileSync = function() {
 		try {
-			const wishlistKeys = window.makeProfileSyncKeySet(window.wishlist || [], 'wishlist', true);
 			const seenCards = new Set();
 
 			window.getProfileSyncVisibleCardRoots().forEach(root => {
@@ -45091,7 +45111,8 @@ function getVisibleChatStackEl(id) {
 
 					const titleId = String(card.getAttribute('data-title-id') || '').trim();
 					const contentId = String(card.getAttribute('data-content-id') || '').trim();
-					const isWished = (!!contentId && wishlistKeys.has(contentId)) || (!!titleId && wishlistKeys.has(titleId));
+					const category = String(card.getAttribute('data-store-category') || 'games').trim();
+					const isWished = window.isWishlistItemSaved({ id: titleId, titleId, contentId, category }, category);
 					card.classList.toggle('is-wishlisted', isWished);
 					const btn = card.querySelector('.wish-btn');
 					const icon = btn ? btn.querySelector('i') : null;
@@ -45117,8 +45138,8 @@ function getVisibleChatStackEl(id) {
 			const titleId = String(modal.dataset.titleId || '').trim();
 			const contentId = String(modal.dataset.contentId || btn.getAttribute('data-content-id') || '').trim();
 			if (!titleId && !contentId) return;
-			const wishlistKeys = window.makeProfileSyncKeySet(window.wishlist || [], 'wishlist', true);
-			const isWished = (!!contentId && wishlistKeys.has(contentId)) || (!!titleId && wishlistKeys.has(titleId));
+			const category = String(modal.dataset.storeCategory || btn.getAttribute('data-store-category') || 'games').trim();
+			const isWished = window.isWishlistItemSaved({ id: titleId, titleId, contentId, category }, category);
 			const icon = btn.querySelector('i');
 			btn.title = isWished ? 'Remove from Wishlist' : 'Add to Wishlist';
 			if (icon) {
