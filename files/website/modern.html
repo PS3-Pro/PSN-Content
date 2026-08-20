@@ -27225,6 +27225,101 @@ P
 		}, exitDuration);
 	}
 
+	function getRelativeViewExitTransform(startTransform, isExploreExit) {
+		const fallback = isExploreExit ? 'translate3d(0,-8px,0) scale(.985)' : 'translateY(-8px) scale(.985)';
+		const value = String(startTransform || '').trim();
+		if (!value || value === 'none') return fallback;
+
+		const matrix2d = value.match(/^matrix\(([^)]+)\)$/i);
+		if (matrix2d) {
+			const parts = matrix2d[1].split(',').map(Number);
+			if (parts.length === 6 && parts.every(Number.isFinite)) {
+				parts[0] *= 0.985;
+				parts[1] *= 0.985;
+				parts[2] *= 0.985;
+				parts[3] *= 0.985;
+				parts[5] -= 8;
+				return `matrix(${parts.join(',')})`;
+			}
+		}
+
+		const matrix3d = value.match(/^matrix3d\(([^)]+)\)$/i);
+		if (matrix3d) {
+			const parts = matrix3d[1].split(',').map(Number);
+			if (parts.length === 16 && parts.every(Number.isFinite)) {
+				[0,1,2,4,5,6,8,9,10].forEach(index => { parts[index] *= 0.985; });
+				parts[13] -= 8;
+				return `matrix3d(${parts.join(',')})`;
+			}
+		}
+
+		return `${value} translateY(-8px) scale(.985)`;
+	}
+
+	function runStandardDestinationExit(currentView, request) {
+		window.__pendingViewSwitch = request;
+		if (window.__viewExitTransitionActive) return;
+
+		window.__viewExitTransitionActive = true;
+
+		if (currentView.id === 'view-browse' && request.viewId !== 'view-browse' && typeof window.cancelBrowseContextTransition === 'function') {
+			window.cancelBrowseContextTransition();
+		}
+
+		const isExploreExit = currentView.id === 'view-explore';
+		const isBrowseToLibraryExit = currentView.id === 'view-browse' && request.viewId === 'view-library';
+		const exitDuration = isExploreExit ? 160 : (isBrowseToLibraryExit ? 160 : 120);
+		const computed = window.getComputedStyle ? window.getComputedStyle(currentView) : null;
+		const startOpacity = computed && Number.isFinite(parseFloat(computed.opacity)) ? computed.opacity : '1';
+		const startTransform = computed && computed.transform !== 'none' ? computed.transform : 'translateY(0) scale(1)';
+		const startFilter = computed && computed.filter !== 'none' ? computed.filter : 'none';
+		const endTransform = getRelativeViewExitTransform(startTransform, isExploreExit);
+		const endFilter = isExploreExit ? 'none' : 'blur(4px)';
+		const previousPointerEvents = currentView.style.pointerEvents;
+		const previousTransformOrigin = currentView.style.transformOrigin;
+
+		currentView.classList.remove('anim-up', 'anim-out', 'browse-library-exit');
+		currentView.style.pointerEvents = 'none';
+		currentView.style.transformOrigin = 'top center';
+		if (typeof currentView.getAnimations === 'function') {
+			currentView.getAnimations().forEach(animation => {
+				try { animation.cancel(); } catch (e) {}
+			});
+		}
+
+		const finish = () => {
+			currentView.classList.remove('anim-out', 'browse-library-exit');
+			currentView.style.pointerEvents = previousPointerEvents;
+			currentView.style.transformOrigin = previousTransformOrigin;
+			window.__viewExitTransitionActive = false;
+			window.__viewExitTimer = null;
+			const next = window.__pendingViewSwitch || request;
+			window.__pendingViewSwitch = null;
+			window.switchView(next.viewId, next.forceReset, next.preventAutoLoad, next.onShown, true);
+		};
+
+		if (typeof currentView.animate === 'function') {
+			const animation = currentView.animate([
+				{ opacity: startOpacity, transform: startTransform, filter: startFilter },
+				{ opacity: 0, transform: endTransform, filter: endFilter }
+			], {
+				duration: exitDuration,
+				easing: 'cubic-bezier(.4,0,1,1)',
+				fill: 'forwards'
+			});
+			animation.onfinish = () => {
+				finish();
+				try { animation.cancel(); } catch (e) {}
+			};
+			return;
+		}
+
+		if (isBrowseToLibraryExit) currentView.classList.add('browse-library-exit');
+		void currentView.offsetWidth;
+		currentView.classList.add('anim-out');
+		window.__viewExitTimer = setTimeout(finish, exitDuration);
+	}
+
 	window.switchView = function(viewId, forceReset = false, preventAutoLoad = false, onShown = null, _skipExit = false) {
 		const mainViews = ['view-explore', 'view-browse', 'view-wishlist', 'view-downloads', 'view-library', 'view-trending', 'view-online'];
 		const profileUtils = ['view-chat', 'view-trophies', 'view-rewards'];
@@ -27250,35 +27345,13 @@ P
 
 		const reduceViewMotion = !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
 
-		if (!_skipExit && currentView && currentView.id === 'view-browse' && viewId !== 'view-browse' && !window.isRestoringHistory && typeof window.cancelBrowseContextTransition === 'function') {
-			window.cancelBrowseContextTransition();
-		}
-
 		if (!_skipExit && viewId === 'view-chat' && currentView && currentView.id !== viewId && !window.isRestoringHistory && !reduceViewMotion) {
 			runChatDestinationExit(currentView, { viewId, forceReset, preventAutoLoad, onShown });
 			return;
 		}
 
 		if (!_skipExit && viewId !== 'view-chat' && currentView && currentView.id !== viewId && !window.isRestoringHistory && !reduceViewMotion) {
-			window.__pendingViewSwitch = { viewId, forceReset, preventAutoLoad, onShown };
-			if (window.__viewExitTransitionActive) return;
-
-			window.__viewExitTransitionActive = true;
-			const isBrowseToLibraryExit = currentView.id === 'view-browse' && viewId === 'view-library';
-			const exitDuration = currentView.id === 'view-explore' ? 160 : (isBrowseToLibraryExit ? 160 : 120);
-			currentView.classList.remove('anim-up', 'anim-out', 'browse-library-exit');
-			if (isBrowseToLibraryExit) currentView.classList.add('browse-library-exit');
-			void currentView.offsetWidth;
-			currentView.classList.add('anim-out');
-
-			window.__viewExitTimer = setTimeout(() => {
-				currentView.classList.remove('anim-out', 'browse-library-exit');
-				window.__viewExitTransitionActive = false;
-				window.__viewExitTimer = null;
-				const next = window.__pendingViewSwitch || { viewId, forceReset, preventAutoLoad, onShown };
-				window.__pendingViewSwitch = null;
-				window.switchView(next.viewId, next.forceReset, next.preventAutoLoad, next.onShown, true);
-			}, exitDuration);
+			runStandardDestinationExit(currentView, { viewId, forceReset, preventAutoLoad, onShown });
 			return;
 		}
 
