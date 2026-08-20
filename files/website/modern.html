@@ -13910,6 +13910,24 @@ P
 		return window.psnStoreLookup.get(cleanId) || null;
 	};
 
+	window.normalizePsnStoreLookupName = function (value) {
+		let text = String(value || '').trim().toLowerCase();
+		try { text = text.normalize('NFD').replace(/[\u0300-\u036f]/g, ''); } catch (e) {}
+		return text.replace(/[^a-z0-9]/g, '');
+	};
+
+	window.normalizeLibraryStoreLookupName = function (value) {
+		let text = String(value || '').trim().toLowerCase();
+		try { text = text.normalize('NFD').replace(/[\u0300-\u036f]/g, ''); } catch (e) {}
+		text = text.replace(/[™®©]/g, ' ');
+		for (let i = 0; i < 2; i++) {
+			const next = text.replace(/(?:\s*[-–—|:/]?\s*(?:playstation\s*3|playstation\s*2|playstation\s*1|ps3|ps2|ps1|psx|psp))\s*$/i, '').trim();
+			if (next === text) break;
+			text = next;
+		}
+		return text.replace(/[^a-z0-9]/g, '');
+	};
+
 	window.getPsnStoreExactCategoryLookup = function (category) {
 		const cat = String(category || '').trim();
 		if (!cat || !window.psnStoreCache) return null;
@@ -13921,8 +13939,12 @@ P
 		if (cached && cached.source === bucket && cached.length === bucket.length) return cached;
 
 		const normalizeKey = value => String(value || '').trim().toUpperCase();
+		const normalizeName = typeof window.normalizePsnStoreLookupName === 'function'
+			? window.normalizePsnStoreLookupName
+			: value => String(value || '').trim().toLowerCase().replace(/[^a-z0-9]/g, '');
 		const idMap = new Map();
 		const contentMap = new Map();
+		const nameMap = new Map();
 		bucket.forEach((entry, index) => {
 			[entry && entry.id, entry && entry.titleId, entry && entry.titleID, entry && entry.titleid].forEach(value => {
 				const key = normalizeKey(value);
@@ -13932,9 +13954,13 @@ P
 				const key = normalizeKey(value);
 				if (key && !contentMap.has(key)) contentMap.set(key, { item: entry, index });
 			});
+			[entry && entry.cleanName, entry && entry.name, entry && entry.title, entry && entry.rawName].forEach(value => {
+				const key = normalizeName(value);
+				if (key && key.length > 2 && !nameMap.has(key)) nameMap.set(key, { item: entry, index });
+			});
 		});
 
-		const lookup = { source: bucket, length: bucket.length, idMap, contentMap };
+		const lookup = { source: bucket, length: bucket.length, idMap, contentMap, nameMap };
 		window.__psnStoreExactLookupByCategory.set(cat, lookup);
 		return lookup;
 	};
@@ -13957,6 +13983,28 @@ P
 		(Array.isArray(idCandidates) ? idCandidates : [idCandidates]).forEach(value => {
 			const key = normalizeKey(value);
 			if (key) consider(lookup.idMap.get(key));
+		});
+
+		return best ? best.item : null;
+	};
+
+	window.findPsnStoreExactNameMatchInCategory = function (category, nameCandidates = []) {
+		const lookup = window.getPsnStoreExactCategoryLookup(category);
+		if (!lookup || !(lookup.nameMap instanceof Map)) return null;
+		const normalizeName = typeof window.normalizePsnStoreLookupName === 'function'
+			? window.normalizePsnStoreLookupName
+			: value => String(value || '').trim().toLowerCase().replace(/[^a-z0-9]/g, '');
+		const normalizeLibraryName = typeof window.normalizeLibraryStoreLookupName === 'function'
+			? window.normalizeLibraryStoreLookupName
+			: normalizeName;
+		let best = null;
+
+		(Array.isArray(nameCandidates) ? nameCandidates : [nameCandidates]).forEach(value => {
+			const keys = [normalizeName(value), normalizeLibraryName(value)].filter((key, index, list) => key && key.length > 2 && list.indexOf(key) === index);
+			keys.forEach(key => {
+				const hit = lookup.nameMap.get(key);
+				if (hit && (!best || hit.index < best.index)) best = hit;
+			});
 		});
 
 		return best ? best.item : null;
@@ -22616,6 +22664,17 @@ P
 		]
 			.map(normalizeId)
 			.filter(Boolean);
+		const nameCandidates = [
+			cachedData.cleanName,
+			cachedData.name,
+			cachedData.title,
+			cachedData.rawName,
+			item.cleanName,
+			item.name,
+			item.title,
+			item.rawName
+		].filter(Boolean);
+		const canUseNameFallback = !idCandidates.length && !contentIdCandidates.length && nameCandidates.length > 0;
 
 		const categories = (typeof window.getLibraryStoreCategoryPriority === 'function')
 			? window.getLibraryStoreCategoryPriority()
@@ -22626,7 +22685,7 @@ P
 			const bucket = window.psnStoreCache[cat];
 			if (!Array.isArray(bucket) || !bucket.length) continue;
 
-			const found = (typeof window.findPsnStoreExactMatchInCategory === 'function')
+			let found = (typeof window.findPsnStoreExactMatchInCategory === 'function')
 				? window.findPsnStoreExactMatchInCategory(cat, idCandidates, contentIdCandidates)
 				: bucket.find(entry => {
 					const entryContentIds = [entry.contentId, entry.contentID].map(normalizeId).filter(Boolean);
@@ -22634,6 +22693,10 @@ P
 					const entryIds = [entry.id, entry.titleId, entry.titleID, entry.titleid].map(normalizeId).filter(Boolean);
 					return !!(idCandidates.length && entryIds.some(value => idCandidates.includes(value)));
 				});
+
+			if (!found && canUseNameFallback && typeof window.findPsnStoreExactNameMatchInCategory === 'function') {
+				found = window.findPsnStoreExactNameMatchInCategory(cat, nameCandidates);
+			}
 
 			if (found) {
 				const resolvedCategory = (typeof window.resolveLibraryStoreMatchCategory === 'function')
@@ -22786,8 +22849,12 @@ P
 		let finalCategory = resolvedCategory;
 		const titleId = item.titleId || item.id || item.titleid || '';
 		const currentContentId = item.contentId || item.contentID || '';
-		const normalizeName = value => String(value || '').toLowerCase().replace(/\([^)]*\)/g, ' ').replace(/[^a-z0-9]/g, '');
-		const itemNameKey = normalizeName(item.cleanName || item.name || item.title || '');
+		const normalizeName = typeof window.normalizePsnStoreLookupName === 'function'
+			? window.normalizePsnStoreLookupName
+			: value => String(value || '').toLowerCase().replace(/\([^)]*\)/g, ' ').replace(/[^a-z0-9]/g, '');
+		const itemNameCandidates = [item.cleanName, item.name, item.title, item.rawName].filter(Boolean);
+		const itemNameKey = normalizeName(itemNameCandidates[0] || '');
+		const canUseLibraryNameFallback = isLibraryList && !titleId && !currentContentId && itemNameCandidates.length > 0;
 		const pools = [];
 		if (Array.isArray(window.currentData)) pools.push({ cat: resolvedCategory, items: window.currentData });
 		if (window.psnStoreCache && Array.isArray(window.psnStoreCache[resolvedCategory]) && !(isLibraryList && window.isLibraryBlockedContentCategory(resolvedCategory))) pools.push({ cat: resolvedCategory, items: window.psnStoreCache[resolvedCategory] });
@@ -22836,15 +22903,20 @@ P
 
 				let found = null;
 				if (currentContentId) {
-					found = bucket.find(game => String(game.contentId || '').toUpperCase() === String(currentContentId).toUpperCase()) || null;
+					found = (typeof window.findPsnStoreExactMatchInCategory === 'function')
+						? window.findPsnStoreExactMatchInCategory(cat, [], [currentContentId])
+						: (bucket.find(game => String(game.contentId || '').toUpperCase() === String(currentContentId).toUpperCase()) || null);
 				}
 				if (!found && titleId && itemNameKey) {
-					found = bucket.find(game => {
-						const gameId = game.id || game.titleId || game.titleid || '';
-						if (!gameId || String(gameId).toUpperCase() !== String(titleId).toUpperCase()) return false;
-						const gameNameKey = normalizeName(game.cleanName || game.name || game.title || game.rawName || '');
-						return gameNameKey && (gameNameKey === itemNameKey || itemNameKey.indexOf(gameNameKey) !== -1 || gameNameKey.indexOf(itemNameKey) !== -1);
-					}) || null;
+					found = (typeof window.findPsnStoreExactMatchInCategory === 'function')
+						? window.findPsnStoreExactMatchInCategory(cat, [titleId], [])
+						: bucket.find(game => {
+							const gameId = game.id || game.titleId || game.titleid || '';
+							return !!(gameId && String(gameId).toUpperCase() === String(titleId).toUpperCase());
+						}) || null;
+				}
+				if (!found && canUseLibraryNameFallback && typeof window.findPsnStoreExactNameMatchInCategory === 'function') {
+					found = window.findPsnStoreExactNameMatchInCategory(cat, itemNameCandidates);
 				}
 				if (found) { matched = found; matchedCat = cat; break; }
 			}
@@ -22867,9 +22939,10 @@ P
 			: rawConsoleTag;
 
 		return Object.assign({}, matched || {}, item, {
-			id: titleId || (matched ? matched.id : ''),
-			titleId: titleId || (matched ? matched.id : ''),
-			contentId: currentContentId || (matched ? (matched.contentId || '') : ''),
+			id: titleId || (matched ? (matched.id || matched.titleId || '') : ''),
+			titleId: titleId || (matched ? (matched.titleId || matched.id || '') : ''),
+			contentId: currentContentId || (matched ? (matched.contentId || matched.contentID || '') : ''),
+			cover: (!titleId && !currentContentId && matched && matched.cover) ? matched.cover : (item.cover || (matched ? matched.cover : '')),
 			cleanName: canonicalCleanName || item.cleanName || item.name || item.title || '',
 			cTag: safeConsoleTag,
 			console: safeConsoleTag,
@@ -32315,6 +32388,10 @@ function formatLibraryLastPlayedBadge(game = {}) {
 			const coverConsoleTag = exactStoreMatch?.item?.cTag || consoleType;
 			const coverContentId = exactStoreMatch?.item?.contentId || exactStoreMatch?.item?.contentID || '';
 			const coverRegion = exactStoreMatch?.item?.region || '';
+			const resolvedLibraryCoverId = storeSearchId || cachedData.id || '';
+			const resolvedLibraryGithubCover = (exactStoreMatch && resolvedLibraryCoverId && typeof getGithubItemCover === 'function')
+				? getGithubItemCover(Object.assign({}, exactStoreMatch.item, { id: resolvedLibraryCoverId, titleId: resolvedLibraryCoverId }), targetCategory)
+				: (cachedData.githubCover || '');
 
 			const cheatsTitleId = encodeURIComponent(currentPlaying.titleId || cachedData.id || '');
 			const cheatsTitle = encodeURIComponent(currentPlaying.title || game.title || 'Current Game');
@@ -32364,10 +32441,10 @@ function formatLibraryLastPlayedBadge(game = {}) {
 			const localCoverKey = (exactStoreMatch && typeof window.getStoreCardCoverKey === 'function')
 				? window.getStoreCardCoverKey(targetCategory, storeSearchId, coverContentId)
 				: ((typeof window.getLibraryCardCoverKey === 'function') ? window.getLibraryCardCoverKey(game, cachedData) : (game.path || cachedData.id || game.title || ''));
-			const preferredLibraryCover = getLibraryPreferredCover(game, cachedData);
+			const preferredLibraryCover = getUsableLibraryWebmanCover(game) || cachedData.webmanCover || resolvedLibraryGithubCover || getLibraryPreferredCover(game, cachedData);
 			let displayCover = cachedData.webmanCover || ((typeof window.getCachedCardCoverSrc === 'function' ? window.getCachedCardCoverSrc(localCoverKey, 'library', preferredLibraryCover) : '') || preferredLibraryCover);
 			if ((!displayCover || displayCover === FALLBACK_IMG || /NOCOVER00\.JPG/i.test(String(displayCover))) && game.title) {
-				displayCover = cachedData.githubCover || 'data:image/png;base64,BING';
+				displayCover = resolvedLibraryGithubCover || cachedData.githubCover || 'data:image/png;base64,BING';
 			}
 			const card = document.createElement('div');
 			card.className = `game-card ${animClass} ${activeClass} ${favClass}`
@@ -32383,7 +32460,7 @@ function formatLibraryLastPlayedBadge(game = {}) {
 						<i class="far fa-clock"></i><span class="my-games-playing-time">${window.currentPs3PlayTime || "--:--:--"}</span>
 					</div>` : ""}
 					${lastPlayedBadgeHtml}
-					<img src="${escapeCategoryDotAttr(displayCover)}" class="game-img" data-cover-key="${escapeCategoryDotAttr(localCoverKey)}" data-cover-category="library" data-title-id="${escapeCategoryDotAttr(cachedData.id || '')}" data-github-cover="${escapeCategoryDotAttr(cachedData.githubCover || '')}" data-webman-cover="${escapeCategoryDotAttr(cachedData.webmanCover || '')}" data-lib-path="${game.path.replace(/"/g, '&quot;')}" data-name="${String(coverSearchName || game.title || '').replace(/"/g, '&quot;')}" data-console="${String(coverConsoleTag || consoleType).replace(/"/g, '&quot;')}" data-content-id="${escapeCategoryDotAttr(coverContentId)}" data-region="${escapeCategoryDotAttr(coverRegion)}" onload="markCoverLoaded(this)" onerror="handleLibraryCoverError(this)">
+					<img src="${escapeCategoryDotAttr(displayCover)}" class="game-img" data-cover-key="${escapeCategoryDotAttr(localCoverKey)}" data-cover-category="library" data-title-id="${escapeCategoryDotAttr(resolvedLibraryCoverId)}" data-github-cover="${escapeCategoryDotAttr(resolvedLibraryGithubCover || cachedData.githubCover || '')}" data-webman-cover="${escapeCategoryDotAttr(cachedData.webmanCover || '')}" data-lib-path="${game.path.replace(/"/g, '&quot;')}" data-name="${String(coverSearchName || game.title || '').replace(/"/g, '&quot;')}" data-console="${String(coverConsoleTag || consoleType).replace(/"/g, '&quot;')}" data-content-id="${escapeCategoryDotAttr(coverContentId)}" data-region="${escapeCategoryDotAttr(coverRegion)}" onload="markCoverLoaded(this)" onerror="handleLibraryCoverError(this)">
 					<div class="console-tag ${tagClass}">${consoleType}</div>
 					<div class="region-tag">${region}</div>
 					<div class="fav-btn" style="cursor: pointer;" title="${starTooltip}" onclick="toggleLocalFavorite(event, ${favoriteSourceIndex})">
@@ -32394,7 +32471,7 @@ function formatLibraryLastPlayedBadge(game = {}) {
 					<div>
 						<h3 class="game-title" title="${game.title}">${game.title}</h3>
 						<div class="game-meta-info" style="margin-top: 4px; display: flex; justify-content: space-between; align-items: center;">
-							<span class="game-id">${cachedData.id || 'UNKNOW'}</span>
+							<span class="game-id">${resolvedLibraryCoverId || 'UNKNOW'}</span>
 							${game.lastPlayed ? `<span class="game-size" style="font-size: 9px; opacity: 0.6;">${game.lastPlayed.split(' - ')[0]}</span>` : ''}
 						</div>
 					</div>
@@ -32863,6 +32940,10 @@ function formatLibraryLastPlayedBadge(game = {}) {
 			const coverConsoleTag = exactStoreMatch?.item?.cTag || consoleType;
 			const coverContentId = exactStoreMatch?.item?.contentId || exactStoreMatch?.item?.contentID || '';
 			const coverRegion = exactStoreMatch?.item?.region || '';
+			const resolvedFavoriteCoverId = storeSearchId || cachedData.id || '';
+			const resolvedFavoriteGithubCover = (exactStoreMatch && resolvedFavoriteCoverId && typeof getGithubItemCover === 'function')
+				? getGithubItemCover(Object.assign({}, exactStoreMatch.item, { id: resolvedFavoriteCoverId, titleId: resolvedFavoriteCoverId }), targetCategory)
+				: (cachedData.githubCover || '');
 
 			const cheatsTitleId = encodeURIComponent(currentPlaying.titleId || cachedData.id || '');
 			const cheatsTitle = encodeURIComponent(currentPlaying.title || game.title || 'Current Game');
@@ -32915,10 +32996,10 @@ function formatLibraryLastPlayedBadge(game = {}) {
 			const favoriteCoverKey = (exactStoreMatch && typeof window.getStoreCardCoverKey === 'function')
 				? window.getStoreCardCoverKey(targetCategory, storeSearchId, coverContentId)
 				: ((typeof window.getLibraryCardCoverKey === 'function') ? window.getLibraryCardCoverKey(game, cachedData) : favDotKey);
-			const preferredLibraryCover = getLibraryPreferredCover(game, cachedData);
+			const preferredLibraryCover = getUsableLibraryWebmanCover(game) || cachedData.webmanCover || resolvedFavoriteGithubCover || getLibraryPreferredCover(game, cachedData);
 			let displayCover = cachedData.webmanCover || ((typeof window.getCachedCardCoverSrc === 'function' ? window.getCachedCardCoverSrc(favoriteCoverKey, 'library', preferredLibraryCover) : '') || preferredLibraryCover);
 			if ((!displayCover || displayCover === FALLBACK_IMG || /NOCOVER00\.JPG/i.test(String(displayCover))) && game.title) {
-				displayCover = cachedData.githubCover || 'data:image/png;base64,BING';
+				displayCover = resolvedFavoriteGithubCover || cachedData.githubCover || 'data:image/png;base64,BING';
 			}
 			card.className = `game-card ${animClass} ${isSilent ? "no-img-fade" : ""} ${isPendingFavoriteReveal ? 'category-favorites-entry' : ''} ${activeClass} is-favorited`;
 			card.style.setProperty('--tile-idx', i % 50);
@@ -32933,7 +33014,7 @@ function formatLibraryLastPlayedBadge(game = {}) {
 						<i class="far fa-clock"></i><span class="my-games-playing-time">${window.currentPs3PlayTime || "--:--:--"}</span>
 					</div>` : ""}
 					${lastPlayedBadgeHtml}
-					<img src="${escapeCategoryDotAttr(displayCover)}" class="game-img" data-cover-key="${escapeCategoryDotAttr(favoriteCoverKey)}" data-cover-category="library" data-title-id="${escapeCategoryDotAttr(cachedData.id || '')}" data-github-cover="${escapeCategoryDotAttr(cachedData.githubCover || '')}" data-webman-cover="${escapeCategoryDotAttr(cachedData.webmanCover || '')}" data-lib-path="${game.path.replace(/"/g, '&quot;')}" data-name="${String(coverSearchName || game.title || '').replace(/"/g, '&quot;')}" data-console="${String(coverConsoleTag || consoleType).replace(/"/g, '&quot;')}" data-content-id="${escapeCategoryDotAttr(coverContentId)}" data-region="${escapeCategoryDotAttr(coverRegion)}" onload="markCoverLoaded(this)" onerror="handleLibraryCoverError(this)">
+					<img src="${escapeCategoryDotAttr(displayCover)}" class="game-img" data-cover-key="${escapeCategoryDotAttr(favoriteCoverKey)}" data-cover-category="library" data-title-id="${escapeCategoryDotAttr(resolvedFavoriteCoverId)}" data-github-cover="${escapeCategoryDotAttr(resolvedFavoriteGithubCover || cachedData.githubCover || '')}" data-webman-cover="${escapeCategoryDotAttr(cachedData.webmanCover || '')}" data-lib-path="${game.path.replace(/"/g, '&quot;')}" data-name="${String(coverSearchName || game.title || '').replace(/"/g, '&quot;')}" data-console="${String(coverConsoleTag || consoleType).replace(/"/g, '&quot;')}" data-content-id="${escapeCategoryDotAttr(coverContentId)}" data-region="${escapeCategoryDotAttr(coverRegion)}" onload="markCoverLoaded(this)" onerror="handleLibraryCoverError(this)">
 					<div class="console-tag ${tagClass}">${consoleType}</div>
 					<div class="region-tag">${region}</div>
 					<div class="fav-btn active" style="cursor: pointer;" title="Remove from Favorites" onclick="removeFromFavsOnly(event, ${i})">
@@ -32944,7 +33025,7 @@ function formatLibraryLastPlayedBadge(game = {}) {
 					<div>
 						<h3 class="game-title" title="${game.title}">${game.title}</h3>
 						<div class="game-meta-info" style="margin-top: 4px; display: flex; justify-content: space-between; align-items: center;">
-							<span class="game-id">${cachedData.id || 'NO ID'}</span>
+							<span class="game-id">${resolvedFavoriteCoverId || 'NO ID'}</span>
 							${game.lastPlayed ? `<span class="game-size" style="font-size: 9px; opacity: 0.6;">${game.lastPlayed.split(' - ')[0]}</span>` : ''}
 						</div>
 					</div>
@@ -34088,8 +34169,19 @@ function formatLibraryLastPlayedBadge(game = {}) {
         ]
             .map(normalizeId)
             .filter(Boolean);
+        const nameCandidates = [
+            cacheData.cleanName,
+            cacheData.name,
+            cacheData.title,
+            cacheData.rawName,
+            game.cleanName,
+            game.name,
+            game.title,
+            game.rawName
+        ].filter(Boolean);
+        const canUseNameFallback = !idCandidates.length && !contentIdCandidates.length && nameCandidates.length > 0;
 
-        if (!idCandidates.length && !contentIdCandidates.length) return '';
+        if (!idCandidates.length && !contentIdCandidates.length && !canUseNameFallback) return '';
 
         const priority = (typeof window.getLibraryStoreCategoryPriority === 'function')
             ? window.getLibraryStoreCategoryPriority().concat(['dlcs', 'updates', 'themes', 'avatars'])
@@ -34104,7 +34196,7 @@ function formatLibraryLastPlayedBadge(game = {}) {
             const bucket = window.psnStoreCache[key];
             if (!Array.isArray(bucket) || !bucket.length) continue;
 
-            const found = (typeof window.findPsnStoreExactMatchInCategory === 'function')
+            let found = (typeof window.findPsnStoreExactMatchInCategory === 'function')
                 ? window.findPsnStoreExactMatchInCategory(key, idCandidates, contentIdCandidates)
                 : bucket.find(entry => {
                     const entryContentIds = [entry.contentId, entry.contentID, entry.content_id]
@@ -34119,6 +34211,10 @@ function formatLibraryLastPlayedBadge(game = {}) {
 
                     return false;
                 });
+
+            if (!found && canUseNameFallback && typeof window.findPsnStoreExactNameMatchInCategory === 'function') {
+                found = window.findPsnStoreExactNameMatchInCategory(key, nameCandidates);
+            }
 
             if (found) {
                 const blocked = (typeof window.isLibraryBlockedContentCategory === 'function')
@@ -52956,15 +53052,20 @@ function getVisibleChatStackEl(id) {
 				
 				let existsInStore = false;
 				let matchedStoreCategory = '';
+				let matchedStoreItem = null;
 				let searchId = itemCoverId ? itemCoverId.toUpperCase() : "";
-				let searchTitle = itemName ? itemName.toLowerCase().replace(/[^a-z0-9]/g, '') : "";
+				const normalizeProfileStoreName = typeof window.normalizePsnStoreLookupName === 'function'
+					? window.normalizePsnStoreLookupName
+					: value => String(value || '').trim().toLowerCase().replace(/[^a-z0-9]/g, '');
+				const searchTitle = normalizeProfileStoreName(itemName);
+				const canSearchProfileItemByName = !!(searchTitle && searchTitle.length > 2);
 
 				if (listType === 'downloads' || listType === 'wishlist') {
 					existsInStore = true;
 					matchedStoreCategory = itemFinalCategory || itemTypeCategory || item.category || 'games';
 				} 
 				
-				else if (isSearchable && window.psnStoreCache) {
+				else if ((isSearchable || canSearchProfileItemByName) && window.psnStoreCache) {
 					const isWebmanList = (typeof window.isWebmanBackedProfileList === 'function') ? window.isWebmanBackedProfileList(listType) : (listType === 'library');
 					const searchableStoreCategories = (isWebmanList && typeof window.getLibraryStoreCategoryPriority === 'function')
 						? window.getLibraryStoreCategoryPriority()
@@ -52977,6 +53078,9 @@ function getVisibleChatStackEl(id) {
 						let foundStoreItem = null;
 						if (isWebmanList && typeof window.findPsnStoreExactMatchInCategory === 'function') {
 							foundStoreItem = window.findPsnStoreExactMatchInCategory(cat, searchId ? [searchId] : [], searchContentId ? [searchContentId] : []);
+							if (!foundStoreItem && !searchId && !searchContentId && canSearchProfileItemByName && typeof window.findPsnStoreExactNameMatchInCategory === 'function') {
+								foundStoreItem = window.findPsnStoreExactNameMatchInCategory(cat, [itemName]);
+							}
 						} else {
 							foundStoreItem = window.psnStoreCache[cat].find(g => {
 								const gContentId = String(g.contentId || g.contentID || '').trim().toUpperCase();
@@ -52995,6 +53099,7 @@ function getVisibleChatStackEl(id) {
 
 						if (foundStoreItem) {
 							existsInStore = true;
+							matchedStoreItem = foundStoreItem;
 							matchedStoreCategory = (isWebmanList && typeof window.resolveLibraryStoreMatchCategory === 'function')
 								? window.resolveLibraryStoreMatchCategory(cat, foundStoreItem, item)
 								: cat;
@@ -53008,16 +53113,21 @@ function getVisibleChatStackEl(id) {
 				let cursorStyle = '';
 				const itemResolvedSearchCategory = matchedStoreCategory || itemFinalCategory || item.category || '';
 				const itemSearchCategory = String(itemResolvedSearchCategory).replace(/'/g, "\'");
-				const itemSearchContentId = String(itemCoverData.contentId || item.contentId || '').replace(/'/g, "\'");
+				const matchedStoreId = String(
+					(matchedStoreItem && (matchedStoreItem.id || matchedStoreItem.titleId || matchedStoreItem.titleID || matchedStoreItem.titleid)) || ''
+				).trim();
+				const effectiveSearchId = String(itemCoverId || matchedStoreId || '').trim();
+				const itemSearchContentId = String(
+					itemCoverData.contentId || item.contentId || (matchedStoreItem && (matchedStoreItem.contentId || matchedStoreItem.contentID)) || ''
+				).replace(/'/g, "\'");
+				const canOpenProfileStoreSearch = !!(effectiveSearchId && isNaN(effectiveSearchId) && effectiveSearchId.length >= 5);
 
-				if (isSearchable) {
-					if (existsInStore) {
-						clickAction = `onclick="playUiClick(); searchGameFromProfileList('${itemCoverId}', '${targetUser}', '${listType}', '${bgView}', '${returnToOnline}', '${itemSearchCategory}', '${itemSearchContentId}')"`;
-						searchTagHtml = `<div class="profile-list-search-status profile-list-search-status--ok">SEARCH</div>`;
-					} else {
-						searchTagHtml = `<div class="profile-list-search-status profile-list-search-status--missing"><span class="profile-list-search-id">${searchId}</span><span class="profile-list-search-sep"> - </span><span class="profile-list-search-missing">NOT FOUND</span></div>`;
-						cursorStyle = 'style="cursor: default;"';
-					}
+				if (existsInStore && canOpenProfileStoreSearch) {
+					clickAction = `onclick="playUiClick(); searchGameFromProfileList('${effectiveSearchId}', '${targetUser}', '${listType}', '${bgView}', '${returnToOnline}', '${itemSearchCategory}', '${itemSearchContentId}')"`;
+					searchTagHtml = `<div class="profile-list-search-status profile-list-search-status--ok">SEARCH</div>`;
+				} else if (isSearchable) {
+					searchTagHtml = `<div class="profile-list-search-status profile-list-search-status--missing"><span class="profile-list-search-id">${searchId}</span><span class="profile-list-search-sep"> - </span><span class="profile-list-search-missing">NOT FOUND</span></div>`;
+					cursorStyle = 'style="cursor: default;"';
 				}
 
 				const profileDownloadCount = listType === 'downloads' ? getDownloadHistoryItemCount(item) : 1;
