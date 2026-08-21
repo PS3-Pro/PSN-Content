@@ -4984,6 +4984,7 @@ a:focus, button:focus, select:focus, input:focus, textarea:focus, [contenteditab
 			<ul class="sidebar-menu menu-group-store" style="display: none;">
 				<li class="active" id="nav-browse" onmouseenter="playUiHover()" onclick="playUiClick(); switchView('view-browse'); toggleSidebar(true)">
 					<i class="fas fa-search"></i> <span class="interface-compact-label sidebar-press-label" data-sidebar-press-label>Browse</span>
+					<span id="sidebar-count-browse" class="sidebar-count-pill" title="0 database items">0</span>
 				</li>
 				<li id="nav-wishlist" onmouseenter="playUiHover()" onclick="playUiClick(); switchView('view-wishlist'); toggleSidebar(true)">
 					<i class="fas fa-heart"></i> <span class="interface-compact-label sidebar-press-label" data-sidebar-press-label>Wishlist</span>
@@ -5002,7 +5003,8 @@ a:focus, button:focus, select:focus, input:focus, textarea:focus, [contenteditab
 					<i class="fas fa-star"></i> <span class="interface-compact-label sidebar-press-label" data-sidebar-press-label>Featured</span>
 				</li>
 				<li id="nav-online-revived" onmouseenter="playUiHover()" onclick="playUiClick(); showOnlineSection('revived'); toggleSidebar(true)">
-					<i class="fas fa-server"></i> <span class="interface-compact-label sidebar-press-label" data-sidebar-press-label>Revived Servers</span>
+					<i class="fas fa-server"></i> <span class="interface-compact-label sidebar-press-label" data-sidebar-press-label>Servers</span>
+					<span id="sidebar-count-revived" class="sidebar-count-pill" title="0 revived servers" style="display:none;">0</span>
 				</li>
 			</ul>
 	
@@ -5026,9 +5028,11 @@ a:focus, button:focus, select:focus, input:focus, textarea:focus, [contenteditab
 			<ul class="sidebar-menu menu-group-chat" style="display: none;">
 				<li id="nav-chat-global" onclick="playUiClick(); showSocialSection('chat'); toggleSidebar(true)">
 					<i class="fas fa-comments"></i> <span class="interface-compact-label sidebar-press-label" data-sidebar-press-label>Global Chat</span>
+					<span id="sidebar-count-chat" class="sidebar-count-pill" title="0 chat messages">0</span>
 				</li>
 				<li id="nav-chat-friends" onclick="playUiClick(); showSocialSection('friends'); toggleSidebar(true)">
 					<i class="fas fa-user-friends"></i> <span class="interface-compact-label sidebar-press-label" data-sidebar-press-label>Friends List</span>
+					<span id="sidebar-count-friends" class="sidebar-count-pill" title="0 friends">0</span>
 				</li>
 			</ul>
 			<ul class="sidebar-menu menu-group-trophies" style="display: none;">
@@ -10222,6 +10226,7 @@ P
 		if (section === 'friends') {
 			const raw = parsePersistentLocalJson(`${username}_psn_friends_list`, []);
 			window.friendsList = Array.isArray(raw) ? raw : [];
+			if (typeof window.updateSidebarCountPills === 'function') window.updateSidebarCountPills();
 		}
 	}
 
@@ -23899,26 +23904,57 @@ P
 	}
 
 	window.updateSidebarCountPills = function() {
+		const databaseCount = window.psnStoreCache && typeof window.psnStoreCache === 'object'
+			? Object.values(window.psnStoreCache).reduce((total, items) => total + (Array.isArray(items) ? items.length : 0), 0)
+			: 0;
+		const revivedCount = Number.isFinite(window.revivedServersTotalCount) ? Math.max(0, window.revivedServersTotalCount) : null;
+		const chatCount = Array.isArray(window.messageHistory) ? window.messageHistory.length : 0;
+		const friendsCount = Array.isArray(window.friendsList) ? window.friendsList.length : 0;
 		const counts = {
+			browse: databaseCount,
 			wishlist: Array.isArray(window.wishlist) ? window.wishlist.length : 0,
 			downloads: Array.isArray(window.downloadHistory) ? window.downloadHistory.length : 0,
+			revived: revivedCount,
+			chat: chatCount,
+			friends: friendsCount,
 			games: Array.isArray(window.lastScannedGames) ? window.lastScannedGames.length : 0,
 			favorites: Array.isArray(window.favoritesLibrary) ? window.favoritesLibrary.length : 0
 		};
-		const labels = { wishlist: 'wishlist item', downloads: 'download', games: 'game', favorites: 'favorite' };
+		const labels = { browse: 'database item', wishlist: 'wishlist item', downloads: 'download', revived: 'server', chat: 'chat message', friends: 'friend', games: 'game', favorites: 'favorite' };
 		const globalIcon = document.getElementById('global-status-icon');
 		const consoleConnected = !!(globalIcon && globalIcon.classList.contains('status-dot-connected'));
 		Object.keys(counts).forEach(type => {
 			const pill = document.getElementById(`sidebar-count-${type}`);
 			if (!pill) return;
 			const consoleOnly = type === 'games' || type === 'favorites';
-			pill.style.display = consoleOnly && !consoleConnected ? 'none' : '';
-			const count = Math.max(0, Number(counts[type]) || 0);
-			pill.textContent = count > 999 ? '999+' : String(count);
+			if (consoleOnly && !consoleConnected) {
+				pill.style.display = 'none';
+				return;
+			}
+			const rawCount = counts[type];
+			if (rawCount === null || rawCount === undefined) {
+				pill.style.display = 'none';
+				return;
+			}
+			pill.style.display = '';
+			const count = Math.max(0, Number(rawCount) || 0);
+			if (type === 'browse' && count >= 1000) {
+				const divisor = count >= 1000000 ? 1000000 : 1000;
+				const suffix = divisor === 1000000 ? 'M' : 'K';
+				const decimals = count >= divisor * 100 ? 0 : 1;
+				pill.textContent = `${(count / divisor).toFixed(decimals).replace(/\.0$/, '')}${suffix}`;
+			} else {
+				pill.textContent = count > 999 ? '999+' : String(count);
+			}
 			pill.title = `${count.toLocaleString('en-US')} ${labels[type]}${count === 1 ? '' : 's'}`;
 			pill.setAttribute('aria-label', pill.title);
 		});
 	};
+
+	window.addEventListener('psnStorePrefetchReady', () => {
+		if (typeof window.updateSidebarCountPills === 'function') window.updateSidebarCountPills();
+	});
+	if (window.psnStorePrefetchReady) window.updateSidebarCountPills();
 
 	function refreshDownloadSummaryUI() {
 		if (typeof window.updateSidebarCountPills === 'function') window.updateSidebarCountPills();
@@ -31145,6 +31181,44 @@ P
 		}
 	}
 	
+	const REVIVED_SERVERS_TSV_URL = "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/main/resources/database/content/online_servers.tsv";
+	window.revivedServersTotalCount = Number.isFinite(window.revivedServersTotalCount) ? window.revivedServersTotalCount : null;
+	window.revivedServersTsvText = typeof window.revivedServersTsvText === 'string' ? window.revivedServersTsvText : null;
+	window.revivedServersTsvPromise = window.revivedServersTsvPromise || null;
+
+	function countRevivedServersFromTSV(text) {
+		return String(text || '').split('\n').reduce((count, line, index) => {
+			if (index === 0 || line.trim().length < 5) return count;
+			const parts = line.split('\t');
+			const serverName = parts[0]?.trim();
+			const gameIdsRaw = parts[4]?.trim();
+			return serverName && gameIdsRaw ? count + 1 : count;
+		}, 0);
+	}
+
+	window.prefetchRevivedServersTSV = function () {
+		if (typeof window.revivedServersTsvText === 'string') return Promise.resolve(window.revivedServersTsvText);
+		if (window.revivedServersTsvPromise) return window.revivedServersTsvPromise;
+
+		window.revivedServersTsvPromise = fetchTextWithEncodingFallback(REVIVED_SERVERS_TSV_URL)
+			.then(text => {
+				window.revivedServersTsvText = text;
+				window.revivedServersTotalCount = countRevivedServersFromTSV(text);
+				if (typeof window.updateSidebarCountPills === 'function') window.updateSidebarCountPills();
+				return text;
+			})
+			.catch(error => {
+				window.revivedServersTsvPromise = null;
+				throw error;
+			});
+
+		return window.revivedServersTsvPromise;
+	};
+
+	setTimeout(() => {
+		window.prefetchRevivedServersTSV().catch(() => {});
+	}, 0);
+
 	window.loadRevivedServersFromTSV = async function () {
 		if (window.isRevivedLoaded) return;
 	
@@ -31153,8 +31227,6 @@ P
 		const revivedServerCountEl = document.getElementById('revived-server-count');
 		const revivedServerTitleEl = document.getElementById('revived-server-title-label');
 		if (revivedServerCountEl) revivedServerCountEl.textContent = '(Loading...)';
-	
-		const TSV_URL = "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/main/resources/database/content/online_servers.tsv";
 		
 		const skeletonCards = `
 			<div class="skeleton-card"><div class="skeleton-img"></div><div class="skeleton-text"></div><div class="skeleton-text short"></div></div>
@@ -31182,7 +31254,7 @@ P
 		if (typeof setupSkeletonAnimations === 'function') setupSkeletonAnimations(container);
 	
 		try {
-			const text = await fetchTextWithEncodingFallback(TSV_URL);
+			const text = await window.prefetchRevivedServersTSV();
 			const lines = text.split('\n');
 			container.innerHTML = '';
 	
@@ -31287,6 +31359,8 @@ P
 			}
 			if (revivedServerTitleEl) revivedServerTitleEl.textContent = revivedServerCount === 1 ? 'Revived Server' : 'Revived Servers';
 			if (revivedServerCountEl) revivedServerCountEl.textContent = `(${window.formatUiCount ? window.formatUiCount(revivedServerCount, 'item', 'items') : `${revivedServerCount} ${revivedServerCount === 1 ? 'item' : 'items'}`})`;
+			window.revivedServersTotalCount = revivedServerCount;
+			if (typeof window.updateSidebarCountPills === 'function') window.updateSidebarCountPills();
 	
 			await Promise.all(renderPromises);
 	
@@ -31294,6 +31368,8 @@ P
 		} catch (error) {
 			if (revivedServerTitleEl) revivedServerTitleEl.textContent = 'Revived Servers';
 			if (revivedServerCountEl) revivedServerCountEl.textContent = '(0 items)';
+			window.revivedServersTotalCount = 0;
+			if (typeof window.updateSidebarCountPills === 'function') window.updateSidebarCountPills();
 			container.innerHTML = '<div class="loader" style="color:red;">Failed to load server data.</div>';
 		}
 	};
@@ -40257,6 +40333,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
             window.__chatCacheReadyForWrite = true;
             window.__chatInitialSnapshotPending = holdForServer;
             window.messageHistory = cachedHistory;
+            if (typeof window.updateSidebarCountPills === 'function') window.updateSidebarCountPills();
             window.__chatVirtualStartIndex = Math.max(0, cachedHistory.length - getChatVirtualInitialLimit());
             window.__chatVirtualEndIndex = cachedHistory.length;
             window.__chatHistoryDomRendered = false;
@@ -40313,6 +40390,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
         if (hasMessageChanges) handleChatHistorySnapshot(nextHistory);
         else {
             window.messageHistory = nextHistory;
+            if (typeof window.updateSidebarCountPills === 'function') window.updateSidebarCountPills();
             window.__chatHistoryReceived = true;
             window.__chatHistoryRequesting = false;
             window.__chatHistoryRequestRetries = 0;
@@ -40349,6 +40427,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
         }
         if (incomingRevision <= currentRevision) return true;
         window.messageHistory = mergeChatSyncChanges(window.messageHistory || [], [change]);
+        if (typeof window.updateSidebarCountPills === 'function') window.updateSidebarCountPills();
         window.__chatCacheEpoch = incomingEpoch;
         window.__chatCacheRevision = incomingRevision;
         if (typeof updateChatHistoryRenderSignature === 'function') updateChatHistoryRenderSignature();
@@ -40385,6 +40464,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
         };
 
         window.messageHistory = normalizedHistory;
+        if (typeof window.updateSidebarCountPills === 'function') window.updateSidebarCountPills();
         window.__chatVirtualStartIndex = 0;
         window.__chatVirtualEndIndex = normalizedHistory.length;
         if (typeof registerChatUsersFromHistory === 'function') registerChatUsersFromHistory(window.messageHistory);
@@ -47916,13 +47996,16 @@ function getVisibleChatStackEl(id) {
 
 			if (Array.isArray(userData.friendsData)) {
 				window.friendsList = userData.friendsData;
+			if (typeof window.updateSidebarCountPills === 'function') window.updateSidebarCountPills();
 				safeLocalStorageSet(`${name}_psn_friends_list`, JSON.stringify(userData.friendsData));
 				applyProfileListUpdatedAtFromServer(name, 'friends', userData.friendsUpdatedAt);
 			} else if (isLightAuthPayload) {
 				if (!Array.isArray(window.friendsList)) window.friendsList = [];
+			if (typeof window.updateSidebarCountPills === 'function') window.updateSidebarCountPills();
 			} else {
 				const localFriends = localStorage.getItem(`${name}_psn_friends_list`);
 				window.friendsList = localFriends ? JSON.parse(localFriends) : [];
+			if (typeof window.updateSidebarCountPills === 'function') window.updateSidebarCountPills();
 			}
 
 			if (userData.countersData) {
@@ -48570,6 +48653,7 @@ function getVisibleChatStackEl(id) {
 			const alreadyRendered = incomingKey && window.messageHistory.some(m => String(new Date(m && m.time).getTime() || m?.time || '') === incomingKey);
 			if (alreadyRendered) return;
 			window.messageHistory.push(data);
+			if (typeof window.updateSidebarCountPills === 'function') window.updateSidebarCountPills();
 			if (window.messageHistory.length > MAX_CHAT_HISTORY) {
 				window.messageHistory.shift();
 				window.__chatVirtualStartIndex = Math.max(0, Number(window.__chatVirtualStartIndex || 0) - 1);
@@ -48875,6 +48959,7 @@ function getVisibleChatStackEl(id) {
 		socketChat.on('message_deleted', function(msgId) {
 			if (window.messageHistory) {
 				window.messageHistory = window.messageHistory.filter(m => String(new Date(m.time).getTime()) !== String(msgId));
+			if (typeof window.updateSidebarCountPills === 'function') window.updateSidebarCountPills();
 			}
 		
 			if (typeof editingMsgId !== 'undefined' && String(editingMsgId) === String(msgId)) {
@@ -49030,6 +49115,7 @@ function getVisibleChatStackEl(id) {
 			}
 		
 			window.messageHistory = [];
+			if (typeof window.updateSidebarCountPills === 'function') window.updateSidebarCountPills();
 			window.__chatCacheEpoch = String(data.chatEpoch || '');
 			window.__chatCacheRevision = Math.max(0, Number(data.chatRevision) || 0);
 			window.__chatSeenCursor = 0;
@@ -53078,6 +53164,7 @@ function getVisibleChatStackEl(id) {
 	};
 	
 	window.renderFriendsList = function(filter = '', isSilent = false) {
+		if (typeof window.updateSidebarCountPills === 'function') window.updateSidebarCountPills();
 		isSilent = isSilent || !!window.isRestoringHistory;
 		const grid = document.getElementById('friends-list-grid');
 		const emptyMsg = document.getElementById('friends-empty-msg');
