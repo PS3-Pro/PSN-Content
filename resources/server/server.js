@@ -53,6 +53,7 @@ const PG_STATEMENT_TIMEOUT_MS = Math.max(5000, parseInt(process.env.PG_STATEMENT
 const PG_MAX_USES = Math.max(0, parseInt(process.env.PG_MAX_USES || "0", 10) || 0);
 const ONLINE_LIST_CACHE_MS = Math.max(250, parseInt(process.env.ONLINE_LIST_CACHE_MS || "1200", 10) || 1200);
 const ONLINE_LIST_UNCHANGED_SKIP_ENABLED = process.env.ONLINE_LIST_SKIP_UNCHANGED !== "0";
+const FRIEND_ACTIVITY_MAX_PER_USER = 200;
 
 const pgConnectionOptions = {
   connectionString: process.env.DATABASE_URL,
@@ -945,9 +946,16 @@ async function initDb() {
   `);
 
   await queryDbWithRetry(
-    "DELETE FROM friend_activity WHERE created_at < NOW() - INTERVAL '60 days'",
+    `DELETE FROM friend_activity
+     WHERE id IN (
+       SELECT id FROM (
+         SELECT id, ROW_NUMBER() OVER (PARTITION BY actor_name ORDER BY id DESC) AS row_num
+         FROM friend_activity
+       ) ranked
+       WHERE row_num > ${FRIEND_ACTIVITY_MAX_PER_USER}
+     )`,
     [],
-    { attempts: 2, label: 'FRIEND ACTIVITY CLEANUP' }
+    { attempts: 2, label: 'FRIEND ACTIVITY RETENTION' }
   );
 
   await queryDbWithRetry(
@@ -4380,6 +4388,22 @@ async function recordFriendActivity(actorName, type, rawData = {}, options = {})
     if (!result.rows[0]) return null;
     const event = serializeFriendActivityRow(result.rows[0]);
     if (!event) return null;
+    deferServerTask('FRIEND ACTIVITY RETENTION', async () => {
+      await queryDbWithRetry(
+        `DELETE FROM friend_activity
+         WHERE actor_name = $1
+           AND id < COALESCE((
+             SELECT id
+             FROM friend_activity
+             WHERE actor_name = $1
+             ORDER BY id DESC
+             OFFSET $2
+             LIMIT 1
+           ), 0)`,
+        [actor, FRIEND_ACTIVITY_MAX_PER_USER - 1],
+        { attempts: 2, label: 'FRIEND ACTIVITY RETENTION' }
+      );
+    }, 0);
     emitFriendActivityToLocalSubscribers(event);
     deferServerTask('FRIEND ACTIVITY NOTIFY', () => notifyFriendActivityAcrossInstances(event), 0);
     return event;
