@@ -5382,7 +5382,7 @@ a:focus, button:focus, select:focus, input:focus, textarea:focus, [contenteditab
 							<label onmouseenter="playUiArrow()"><input type="checkbox" value="qore"> Qore</label>
 							<label onmouseenter="playUiArrow()"><input type="checkbox" value="media" checked> Media</label>
 						</div>
-						<div class="filter-checkboxes" id="group-titles-filter">
+						<div class="filter-checkboxes group-titles-separated" id="group-titles-filter">
 							<label onmouseenter="playUiArrow()" title="Group same-title items while browsing all regions"><input type="checkbox" id="group-titles-toggle" checked><i class="fas fa-layer-group"></i><span>Group Titles</span></label>
 						</div>
 						<div class="license-filter-separated has-filter-separator" id="missing-rap-filter" aria-hidden="false">
@@ -9651,16 +9651,22 @@ P
 		if (displayedName && displayedName !== myName) return;
 		modal.dataset.profileUsername = myName;
 		const dialog = document.getElementById('modal-sys-profile-country');
+		const dialogCard = dialog ? dialog.querySelector('.profile-country-dialog-card') : null;
 		const search = document.getElementById('profile-country-dialog-search');
 		if (!dialog) return;
 		if (profileCountryDialogCloseTimer) {
 			clearTimeout(profileCountryDialogCloseTimer);
 			profileCountryDialogCloseTimer = null;
 		}
+		if (dialogCard) dialogCard.style.removeProperty('height');
 		if (search) search.value = '';
 		window.filterProfileCountryDialog('');
 		dialog.classList.remove('show');
 		dialog.style.display = 'flex';
+		if (dialogCard) {
+			const initialHeight = window.getComputedStyle(dialogCard).height;
+			if (initialHeight && initialHeight !== 'auto') dialogCard.style.height = initialHeight;
+		}
 		dialog.style.removeProperty('opacity');
 		dialog.style.removeProperty('pointer-events');
 		dialog.setAttribute('aria-hidden', 'false');
@@ -24135,69 +24141,73 @@ P
             list.addEventListener('wheel', cancelHintFromListScroll, { passive: true });
         }
 
-        list.addEventListener('pointerdown', event => {
-            if (event.button !== undefined && event.button !== 0) return;
-            if (event.target.closest('.download-swipe-row.is-swipe-hinting')) return;
-            if (event.target.closest('.download-swipe-delete')) return;
+        const beginDownloadSwipeDrag = (target, clientX, clientY, inputType, inputId) => {
+            if (target.closest('.download-swipe-row.is-swipe-hinting')) return false;
+            if (target.closest('.download-swipe-delete')) return false;
             if (downloadSwipeHintRow || downloadSwipeHintTimer) {
                 markDownloadSwipeHintSeen();
                 cancelDownloadSwipeHintPreview(true);
             }
-            const content = event.target.closest('.download-swipe-content');
-            if (!content || !list.contains(content)) return;
+            const content = target.closest('.download-swipe-content');
+            if (!content || !list.contains(content)) return false;
             const row = content.closest('.download-swipe-row');
-            if (!row) return;
+            if (!row) return false;
 
+            const openRow = list.querySelector('.download-swipe-row.is-open');
+            const dismissedOtherOpenRow = !!(openRow && openRow !== row);
             closeDownloadSwipeRows(row);
             const startsOpen = row.classList.contains('is-open');
             downloadSwipeDragState = {
-                pointerId: event.pointerId,
+                inputType,
+                inputId,
                 row,
                 content,
                 item: content.querySelector('.download-item'),
-                startX: event.clientX,
-                startY: event.clientY,
+                startX: clientX,
+                startY: clientY,
                 baseOffset: startsOpen ? -DOWNLOAD_SWIPE_REVEAL_PX : 0,
                 offset: startsOpen ? -DOWNLOAD_SWIPE_REVEAL_PX : 0,
                 dragging: false,
                 cancelled: false,
+                dismissedOtherOpenRow,
                 snapSoundPlayed: startsOpen
             };
-        });
+            return true;
+        };
 
-        list.addEventListener('pointermove', event => {
+        const moveDownloadSwipeDrag = (clientX, clientY, preventDefault) => {
             const state = downloadSwipeDragState;
-            if (!state || state.pointerId !== event.pointerId || state.cancelled) return;
-            const dx = event.clientX - state.startX;
-            const dy = event.clientY - state.startY;
+            if (!state || state.cancelled) return;
+            const dx = clientX - state.startX;
+            const dy = clientY - state.startY;
             const absX = Math.abs(dx);
             const absY = Math.abs(dy);
 
             if (!state.dragging) {
                 if (absY > 8 && absY > absX) {
                     state.cancelled = true;
+                    downloadSwipeDragState = null;
                     return;
                 }
                 if (absX < 8 || absX <= absY) return;
                 state.dragging = true;
                 state.row.classList.add('is-swiping');
                 if (state.item) state.item.classList.remove('mobile-pressed');
-                try { state.content.setPointerCapture(event.pointerId); } catch (_) {}
             }
 
-            event.preventDefault();
+            preventDefault();
             state.offset = Math.max(-DOWNLOAD_SWIPE_REVEAL_PX, Math.min(0, state.baseOffset + dx));
             setDownloadSwipeOffset(state.row, state.offset, false);
             if (!state.snapSoundPlayed && state.offset <= -(DOWNLOAD_SWIPE_REVEAL_PX * .42)) {
                 state.snapSoundPlayed = true;
                 if (typeof playUiToggle === 'function') playUiToggle();
             }
-        }, { passive: false });
+        };
 
-        const finishSwipe = event => {
+        const finishDownloadSwipeDrag = () => {
             const state = downloadSwipeDragState;
-            if (!state || state.pointerId !== event.pointerId) return;
             downloadSwipeDragState = null;
+            if (!state || state.cancelled) return;
 
             if (state.dragging) {
                 const shouldOpen = state.offset <= -(DOWNLOAD_SWIPE_REVEAL_PX * .42);
@@ -24206,16 +24216,62 @@ P
                 setDownloadSwipeOffset(state.row, shouldOpen ? -DOWNLOAD_SWIPE_REVEAL_PX : 0, true);
                 syncDownloadSwipeListState();
                 state.row.dataset.downloadSwipeSuppressUntil = String(Date.now() + 350);
+            } else if (state.dismissedOtherOpenRow) {
+                state.row.dataset.downloadSwipeSuppressUntil = String(Date.now() + 350);
             }
-
-            try { state.content.releasePointerCapture(event.pointerId); } catch (_) {}
         };
 
-        list.addEventListener('pointerup', finishSwipe);
-        list.addEventListener('pointercancel', finishSwipe);
-        list.addEventListener('lostpointercapture', event => {
-            if (downloadSwipeDragState && downloadSwipeDragState.pointerId === event.pointerId) finishSwipe(event);
+        list.addEventListener('pointerdown', event => {
+            if (event.pointerType === 'touch') return;
+            if (event.button !== undefined && event.button !== 0) return;
+            if (!beginDownloadSwipeDrag(event.target, event.clientX, event.clientY, 'pointer', event.pointerId)) return;
+            try { event.target.closest('.download-swipe-content')?.setPointerCapture(event.pointerId); } catch (_) {}
         });
+
+        list.addEventListener('pointermove', event => {
+            const state = downloadSwipeDragState;
+            if (!state || state.inputType !== 'pointer' || state.inputId !== event.pointerId) return;
+            moveDownloadSwipeDrag(event.clientX, event.clientY, () => event.preventDefault());
+        }, { passive: false });
+
+        const finishPointerSwipe = event => {
+            const state = downloadSwipeDragState;
+            if (!state || state.inputType !== 'pointer' || state.inputId !== event.pointerId) return;
+            const content = state.content;
+            finishDownloadSwipeDrag();
+            try { content.releasePointerCapture(event.pointerId); } catch (_) {}
+        };
+
+        list.addEventListener('pointerup', finishPointerSwipe);
+        list.addEventListener('pointercancel', finishPointerSwipe);
+        list.addEventListener('lostpointercapture', event => {
+            const state = downloadSwipeDragState;
+            if (state && state.inputType === 'pointer' && state.inputId === event.pointerId) finishPointerSwipe(event);
+        });
+
+        list.addEventListener('touchstart', event => {
+            if (event.touches.length !== 1) return;
+            const touch = event.touches[0];
+            beginDownloadSwipeDrag(event.target, touch.clientX, touch.clientY, 'touch', touch.identifier);
+        }, { passive: true });
+
+        list.addEventListener('touchmove', event => {
+            const state = downloadSwipeDragState;
+            if (!state || state.inputType !== 'touch') return;
+            const touch = Array.from(event.touches).find(item => item.identifier === state.inputId);
+            if (!touch) return;
+            moveDownloadSwipeDrag(touch.clientX, touch.clientY, () => event.preventDefault());
+        }, { passive: false });
+
+        const finishTouchSwipe = event => {
+            const state = downloadSwipeDragState;
+            if (!state || state.inputType !== 'touch') return;
+            const ended = Array.from(event.changedTouches || []).some(item => item.identifier === state.inputId);
+            if (ended || event.type === 'touchcancel') finishDownloadSwipeDrag();
+        };
+
+        list.addEventListener('touchend', finishTouchSwipe, { passive: true });
+        list.addEventListener('touchcancel', finishTouchSwipe, { passive: true });
 
         list.addEventListener('click', event => {
             const hintingRow = event.target.closest('.download-swipe-row.is-swipe-hinting');
@@ -54772,7 +54828,11 @@ function getVisibleChatStackEl(id) {
         requestAnimationFrame(() => {
             requestAnimationFrame(() => {
                 modal.classList.add('show');
-                input.focus();
+                if (typeof shouldAutoFocusCountrySearch === 'function' && shouldAutoFocusCountrySearch()) {
+                    try { input.focus({ preventScroll: true }); } catch (e) { input.focus(); }
+                } else {
+                    input.blur();
+                }
             });
         });
     }
