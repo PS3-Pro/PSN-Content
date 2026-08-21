@@ -13558,6 +13558,59 @@ P
 		return Math.max(minMargin, Math.ceil((rect.height || 600) * multiplier)) + 'px';
 	}
 
+
+	/* --- PROGRESSIVE GRID RENDERING (WISHLIST / MY GAMES / FAVORITES) --- */
+	const progressiveGridObservers = Object.create(null);
+
+	function getProgressiveGridInitialLimit() {
+		return (typeof getBrowseInitialRenderLimit === 'function') ? getBrowseInitialRenderLimit() : DEFAULT_RENDER_LIMIT;
+	}
+
+	function getProgressiveGridLoadAmount() {
+		return (typeof getBrowseLoadAmount === 'function') ? getBrowseLoadAmount() : LOAD_AMOUNT;
+	}
+
+	function clearProgressiveGridObserver(key, grid) {
+		const observer = progressiveGridObservers[key];
+		if (observer) {
+			try { observer.disconnect(); } catch (e) {}
+			delete progressiveGridObservers[key];
+		}
+		if (grid) {
+			const sentinel = grid.querySelector(`[data-progressive-grid-sentinel="${key}"]`);
+			if (sentinel) sentinel.remove();
+		}
+	}
+
+	function setupProgressiveGridObserver(key, grid, renderedCount, totalCount, loadMore) {
+		clearProgressiveGridObserver(key, grid);
+		if (!grid || renderedCount >= totalCount || typeof loadMore !== 'function') return;
+
+		const root = document.getElementById('scroll-area') || document.querySelector('.main-content') || document.querySelector('.content');
+		const sentinel = document.createElement('div');
+		sentinel.dataset.progressiveGridSentinel = key;
+		sentinel.style.cssText = 'height:20px;grid-column:1/-1;opacity:0;pointer-events:none;';
+		grid.appendChild(sentinel);
+
+		if (typeof IntersectionObserver !== 'function') {
+			requestAnimationFrame(() => loadMore());
+			return;
+		}
+		const rootMargin = (typeof getBrowseInfiniteRootMargin === 'function') ? getBrowseInfiniteRootMargin() : '1200px';
+		const observer = new IntersectionObserver(entries => {
+			if (!entries[0] || !entries[0].isIntersecting) return;
+			try { observer.disconnect(); } catch (e) {}
+			delete progressiveGridObservers[key];
+			requestAnimationFrame(() => loadMore());
+		}, { root, rootMargin });
+		progressiveGridObservers[key] = observer;
+		observer.observe(sentinel);
+	}
+
+	function getProgressiveGridSignature(parts) {
+		return parts.map(value => String(value ?? '')).join('\u001f');
+	}
+
     async function toggleFullScreen() {
         try {
             const isFullScreen = document.fullscreenElement || 
@@ -20661,7 +20714,8 @@ P
 		}
 		
 	};
-    
+
+
     function getVisibleRevealRootRect() {
         const root = document.getElementById('scroll-area') || document.querySelector('.main-content') || document.querySelector('.content');
         if (root && typeof root.getBoundingClientRect === 'function') return root.getBoundingClientRect();
@@ -29921,8 +29975,9 @@ P
 	};
 
 
-	window.updateWishlistUI = async function(isSilent = false) {
+	window.updateWishlistUI = async function(isSilent = false, progressiveMode = 'reset') {
 		isSilent = isSilent || !!window.isRestoringHistory;
+		const appendProgressive = progressiveMode === 'append';
 		const renderToken = (window.__wishlistRenderToken || 0) + 1;
 		window.__wishlistRenderToken = renderToken;
 		const grid = document.getElementById('wishlist-grid');
@@ -29945,6 +30000,9 @@ P
 		}
 	
 		if (window.wishlist.length === 0) {
+			clearProgressiveGridObserver('wishlist', grid);
+			delete grid.dataset.progressiveGridSignature;
+			delete grid.dataset.progressiveGridRendered;
 			if (letterContainer) letterContainer.style.display = 'none';
 			if (toolbar) toolbar.style.display = 'none';
 			
@@ -29967,9 +30025,15 @@ P
 		if (toolbar) toolbar.style.display = 'flex';
 		if (letterContainer) letterContainer.style.display = 'flex';
 	
-		const pendingWishlistRevealKeys = (wishlistViewIsActive && typeof window.consumeCategoryPendingReveal === 'function')
-			? window.consumeCategoryPendingReveal('wishlist', true)
-			: [];
+		let pendingWishlistRevealKeys;
+		if (appendProgressive) {
+			pendingWishlistRevealKeys = Array.isArray(window.__wishlistProgressivePendingKeys) ? window.__wishlistProgressivePendingKeys : [];
+		} else {
+			pendingWishlistRevealKeys = (wishlistViewIsActive && typeof window.consumeCategoryPendingReveal === 'function')
+				? window.consumeCategoryPendingReveal('wishlist', true)
+				: [];
+			window.__wishlistProgressivePendingKeys = pendingWishlistRevealKeys.slice();
+		}
 		const pendingWishlistRevealSet = new Set((pendingWishlistRevealKeys || []).map(String));
 
 
@@ -30056,8 +30120,27 @@ P
 		} else if (loadState('psn_wish_dot') === 'true' && document.getElementById('view-wishlist').style.display !== 'block') {
 			if (dot) dot.style.display = 'block';
 		}
+
+		const wishlistPreviouslyRendered = Number(grid.dataset.progressiveGridRendered || 0);
+		const wishlistProgressiveSignature = getProgressiveGridSignature([
+			term,
+			catFilter,
+			regionFilter,
+			activeConsoles.join(','),
+			typeof activeWishLetter !== 'undefined' ? activeWishLetter : 'ALL',
+			window.sortOrders?.wishlist || 'asc',
+			filteredWishlist.map(game => getWishlistDotKey(game)).join('|')
+		]);
+		const wishlistCanAppend = appendProgressive && grid.dataset.progressiveGridSignature === wishlistProgressiveSignature;
+		clearProgressiveGridObserver('wishlist', grid);
+		if (!wishlistCanAppend) {
+			grid.innerHTML = '';
+			grid.dataset.progressiveGridSignature = wishlistProgressiveSignature;
+			grid.dataset.progressiveGridRendered = '0';
+		}
 	
 		if (filteredWishlist.length === 0) {
+			grid.dataset.progressiveGridRendered = '0';
 			let emptyTitle = 'No Items Found';
 			let emptyDesc = 'No items match your filters in Wishlist.';
 			let emptyIcon = 'fas fa-search-minus';
@@ -30117,8 +30200,16 @@ P
 	
 		const animClass = 'no-anim';
 		let html = '';
+		const wishlistRenderedBefore = wishlistCanAppend ? Number(grid.dataset.progressiveGridRendered || 0) : 0;
+		const wishlistResetTarget = (!wishlistCanAppend && isSilent && wishlistPreviouslyRendered > 0)
+			? Math.max(getProgressiveGridInitialLimit(), wishlistPreviouslyRendered)
+			: getProgressiveGridInitialLimit();
+		const wishlistRenderEnd = wishlistCanAppend
+			? Math.min(filteredWishlist.length, wishlistRenderedBefore + getProgressiveGridLoadAmount())
+			: Math.min(filteredWishlist.length, wishlistResetTarget);
 	
-		filteredWishlist.forEach((game, i) => {
+		for (let i = wishlistRenderedBefore; i < wishlistRenderEnd; i++) {
+			const game = filteredWishlist[i];
 			const wishDotKey = (typeof getWishlistDotKey === 'function') ? getWishlistDotKey(game) : (game.contentId || game.id || '');
 			const isPendingWishlistReveal = pendingWishlistRevealSet.has(String(wishDotKey));
 			const resolvedWishCategory = (typeof window.getWishlistItemCategoryKey === 'function') ? window.getWishlistItemCategoryKey(game) : (game.category || 'games');
@@ -30166,9 +30257,11 @@ P
 					</div>
 				</div>
 			</div>`;
-		});
+		}
 		
-		grid.innerHTML = html;
+		if (wishlistCanAppend) grid.insertAdjacentHTML('beforeend', html);
+		else grid.innerHTML = html;
+		grid.dataset.progressiveGridRendered = String(wishlistRenderEnd);
 		if (typeof window.refreshStoreInstalledChecks === 'function') window.refreshStoreInstalledChecks();
 	
 		if (typeof renderWishLetterFilter === 'function') {
@@ -30181,6 +30274,8 @@ P
 		if (pendingWishlistRevealKeys && pendingWishlistRevealKeys.length && typeof window.revealCategoryPendingCards === 'function') {
 			window.revealCategoryPendingCards('wishlist', pendingWishlistRevealKeys);
 		}
+		if (wishlistRenderEnd >= filteredWishlist.length) window.__wishlistProgressivePendingKeys = [];
+		setupProgressiveGridObserver('wishlist', grid, wishlistRenderEnd, filteredWishlist.length, () => window.updateWishlistUI(true, 'append'));
 	};
 	
 	let activeWishLetter = "ALL";
@@ -33324,22 +33419,33 @@ function formatLibraryLastPlayedBadge(game = {}) {
 		].join('::');
 	}
 	
-	function renderLocalLibrary(games, isFiltering = false, isSilent = false) {
+	function renderLocalLibrary(games, isFiltering = false, isSilent = false, progressiveMode = 'reset') {
 		isSilent = isSilent || !!window.isRestoringHistory;
+		const appendProgressive = progressiveMode === 'append';
+		window.__lastLocalLibraryRenderArgs = { games: Array.isArray(games) ? games : [], isFiltering: !!isFiltering };
 		const grid = document.getElementById('ps3-local-grid');
 		if (!grid) return;
 		
 		const renderSignature = getLocalLibraryRenderSignature(games || []);
+		const libraryPreviouslyRendered = Number(grid.dataset.progressiveGridRendered || 0);
 		const hasRenderedCards = !!grid.querySelector('.game-card');
-		if (hasRenderedCards && grid.dataset.localLibraryRenderSignature === renderSignature) {
+		const sameSignature = grid.dataset.localLibraryRenderSignature === renderSignature;
+		const canAppend = appendProgressive && sameSignature;
+		if (!appendProgressive && hasRenderedCards && sameSignature) {
 			if (typeof updateConsoleLibraryStatusUI === 'function') updateConsoleLibraryStatusUI(lastScannedGames);
+			const renderedCount = Number(grid.dataset.progressiveGridRendered || grid.querySelectorAll(':scope > .game-card').length);
+			setupProgressiveGridObserver('my-games', grid, renderedCount, (games || []).length, () => renderLocalLibrary(games, isFiltering, true, 'append'));
 			return;
 		}
 		
-		grid.innerHTML = "";
-		grid.dataset.localLibraryRenderSignature = renderSignature;
+		clearProgressiveGridObserver('my-games', grid);
+		if (!canAppend) {
+			grid.innerHTML = "";
+			grid.dataset.localLibraryRenderSignature = renderSignature;
+			grid.dataset.progressiveGridRendered = '0';
+		}
 		
-		if (!isFiltering) {
+		if (!isFiltering && !appendProgressive) {
 			lastScannedGames = mergeLibraryLastPlayedLists(games || [], lastScannedGames || []);
 			window.lastScannedGames = lastScannedGames;
 			saveState('psn_local_library', JSON.stringify(lastScannedGames));
@@ -33347,6 +33453,7 @@ function formatLibraryLastPlayedBadge(game = {}) {
 		if (typeof updateConsoleLibraryStatusUI === 'function') updateConsoleLibraryStatusUI(lastScannedGames);
 	
 		if (isFiltering && games.length === 0 && lastScannedGames.length > 0) {
+			grid.dataset.progressiveGridRendered = '0';
 			const activeConsoles = document.querySelectorAll('#library-console-filters input:checked').length;
 			const typeFilter = document.getElementById('library-type-select')?.value || 'ALL';
 			const regionFilter = document.getElementById('library-region-select')?.value || 'ALL';
@@ -33402,6 +33509,7 @@ function formatLibraryLastPlayedBadge(game = {}) {
 		}
 	
 		if (!games || games.length === 0) {
+			grid.dataset.progressiveGridRendered = '0';
 			grid.innerHTML = `
 			<div style="grid-column: 1/-1; text-align: center; color: #888; padding: 100px 50px; background: rgba(0,0,0,0.2); border-radius: 12px; border: 1px dashed rgba(255,255,255,0.05); margin-top: 10px; backdrop-filter: blur(5px);">
 				<i class="fas fa-gamepad" style="font-size: 50px; margin-bottom: 20px; opacity: 0.2;"></i>
@@ -33418,8 +33526,17 @@ function formatLibraryLastPlayedBadge(game = {}) {
 		(lastScannedGames || []).forEach((item, index) => {
 			if (item && typeof item === 'object') lastScannedIndexByObject.set(item, index);
 		});
+
+		const libraryRenderedBefore = canAppend ? Number(grid.dataset.progressiveGridRendered || 0) : 0;
+		const libraryResetTarget = (!canAppend && isSilent && libraryPreviouslyRendered > 0)
+			? Math.max(getProgressiveGridInitialLimit(), libraryPreviouslyRendered)
+			: getProgressiveGridInitialLimit();
+		const libraryRenderEnd = canAppend
+			? Math.min(games.length, libraryRenderedBefore + getProgressiveGridLoadAmount())
+			: Math.min(games.length, libraryResetTarget);
 	
-		games.forEach((game, i) => {
+		for (let i = libraryRenderedBefore; i < libraryRenderEnd; i++) {
+			const game = games[i];
 			const pathUpper = game.path.toUpperCase();
 			let consoleType = "PS3", tagClass = "tag-ps3", region = "HDD";
 	
@@ -33540,7 +33657,7 @@ function formatLibraryLastPlayedBadge(game = {}) {
 						<i class="far fa-clock"></i><span class="my-games-playing-time">${window.currentPs3PlayTime || "--:--:--"}</span>
 					</div>` : ""}
 					${lastPlayedBadgeHtml}
-					<img src="${escapeCategoryDotAttr(displayCover)}" class="game-img" data-cover-key="${escapeCategoryDotAttr(localCoverKey)}" data-cover-category="library" data-title-id="${escapeCategoryDotAttr(resolvedLibraryCoverId)}" data-github-cover="${escapeCategoryDotAttr(resolvedLibraryGithubCover || cachedData.githubCover || '')}" data-webman-cover="${escapeCategoryDotAttr(cachedData.webmanCover || '')}" data-lib-path="${game.path.replace(/"/g, '&quot;')}" data-name="${String(coverSearchName || game.title || '').replace(/"/g, '&quot;')}" data-console="${String(coverConsoleTag || consoleType).replace(/"/g, '&quot;')}" data-content-id="${escapeCategoryDotAttr(coverContentId)}" data-region="${escapeCategoryDotAttr(coverRegion)}" onload="markCoverLoaded(this)" onerror="handleLibraryCoverError(this)">
+					<img src="${escapeCategoryDotAttr(displayCover)}" class="game-img" loading="lazy" data-cover-key="${escapeCategoryDotAttr(localCoverKey)}" data-cover-category="library" data-title-id="${escapeCategoryDotAttr(resolvedLibraryCoverId)}" data-github-cover="${escapeCategoryDotAttr(resolvedLibraryGithubCover || cachedData.githubCover || '')}" data-webman-cover="${escapeCategoryDotAttr(cachedData.webmanCover || '')}" data-lib-path="${game.path.replace(/"/g, '&quot;')}" data-name="${String(coverSearchName || game.title || '').replace(/"/g, '&quot;')}" data-console="${String(coverConsoleTag || consoleType).replace(/"/g, '&quot;')}" data-content-id="${escapeCategoryDotAttr(coverContentId)}" data-region="${escapeCategoryDotAttr(coverRegion)}" onload="markCoverLoaded(this)" onerror="handleLibraryCoverError(this)">
 					<div class="console-tag ${tagClass}">${consoleType}</div>
 					<div class="region-tag">${region}</div>
 					<div class="fav-btn" style="cursor: pointer;" title="${starTooltip}" onclick="toggleLocalFavorite(event, ${favoriteSourceIndex})">
@@ -33558,12 +33675,15 @@ function formatLibraryLastPlayedBadge(game = {}) {
 					${buttonsHtml}
 				</div>`;
 			grid.appendChild(card);
-		});
+		}
+		grid.dataset.progressiveGridRendered = String(libraryRenderEnd);
 	
 		if (!isSilent) {
 			setupRevealAnimations('ps3-local-grid');
 		}
+		setupProgressiveGridObserver('my-games', grid, libraryRenderEnd, games.length, () => renderLocalLibrary(games, isFiltering, true, 'append'));
 	}
+	window.renderLocalLibrary = renderLocalLibrary;
 	
 	window.updateLibraryLastPlayed = function(title, titleId) {
 		if (!lastScannedGames || lastScannedGames.length === 0) return;
@@ -33898,12 +34018,14 @@ function formatLibraryLastPlayedBadge(game = {}) {
 				if (card && card.parentNode) card.remove();
 				const countSpan = document.getElementById('fav-count');
 				if (countSpan) countSpan.innerText = `(${window.formatUiCount ? window.formatUiCount(remaining.length, 'item', 'items') : `${remaining.length} ${remaining.length === 1 ? 'item' : 'items'}`})`;
+				if (typeof window.updateFavoritesLibraryUI === 'function') window.updateFavoritesLibraryUI(true);
 			});
 		}
 	};
 	
-	window.updateFavoritesLibraryUI = function(isSilent = false) {
+	window.updateFavoritesLibraryUI = function(isSilent = false, progressiveMode = 'reset') {
 		isSilent = isSilent || !!window.isRestoringHistory;
+		const appendProgressive = progressiveMode === 'append';
 		const ip = document.getElementById('ps3-ip').value;
 		const grid = document.getElementById('ps3-favs-grid');
 		const countSpan = document.getElementById('fav-count');
@@ -33922,9 +34044,15 @@ function formatLibraryLastPlayedBadge(game = {}) {
 		}
 		if (isSilent && typeof window.captureGridCoverCache === 'function') window.captureGridCoverCache(grid);
 	
-		const pendingFavoritesRevealKeys = (typeof window.consumeCategoryPendingReveal === 'function')
-			? window.consumeCategoryPendingReveal('favorites', favViewIsActive)
-			: [];
+		let pendingFavoritesRevealKeys;
+		if (appendProgressive) {
+			pendingFavoritesRevealKeys = Array.isArray(window.__favoritesProgressivePendingKeys) ? window.__favoritesProgressivePendingKeys : [];
+		} else {
+			pendingFavoritesRevealKeys = (typeof window.consumeCategoryPendingReveal === 'function')
+				? window.consumeCategoryPendingReveal('favorites', favViewIsActive)
+				: [];
+			window.__favoritesProgressivePendingKeys = pendingFavoritesRevealKeys.slice();
+		}
 		const pendingFavoritesRevealSet = new Set((pendingFavoritesRevealKeys || []).map(String));
 
 		if (favViewIsActive && typeof window.clearCategoryDotPending === 'function') {
@@ -33935,6 +34063,9 @@ function formatLibraryLastPlayedBadge(game = {}) {
 		const isConnected = globalIcon && (globalIcon.classList.contains('status-dot-connected') || globalIcon.style.color === "rgb(76, 175, 80)");
 	
 		if (!ip) {
+			clearProgressiveGridObserver('favorites', grid);
+			delete grid.dataset.progressiveGridSignature;
+			delete grid.dataset.progressiveGridRendered;
 			if (countSpan) { countSpan.innerText = "(Disconnected)"; countSpan.style.color = "#ff4444"; }
 			if (dot) dot.style.display = 'none'; 
 			if (favToolbar) favToolbar.style.display = 'none';
@@ -33952,6 +34083,9 @@ function formatLibraryLastPlayedBadge(game = {}) {
 		}
 	
 		if (!isConnected) {
+			clearProgressiveGridObserver('favorites', grid);
+			delete grid.dataset.progressiveGridSignature;
+			delete grid.dataset.progressiveGridRendered;
 			if (countSpan) { countSpan.innerText = "(Disconnected)"; countSpan.style.color = "#ff4444"; }
 			if (dot) dot.style.display = 'none'; 
 			if (favToolbar) favToolbar.style.display = 'none';
@@ -33975,6 +34109,8 @@ function formatLibraryLastPlayedBadge(game = {}) {
 		const activeFavs = favoritesLibrary.filter(fav => installedLibraryPaths.has(fav.path));
 	
 		if (activeFavs.length === 0) {
+			clearProgressiveGridObserver('favorites', grid);
+			grid.dataset.progressiveGridRendered = '0';
 			if (countSpan) {
 				countSpan.innerText = `(0 items)`;
 				countSpan.style.color = "var(--ps-blue)";
@@ -34055,8 +34191,24 @@ function formatLibraryLastPlayedBadge(game = {}) {
 		} else {
 			if (dot) dot.style.display = 'none';
 		}
-	
-		grid.innerHTML = "";
+
+		const favoritesPreviouslyRendered = Number(grid.dataset.progressiveGridRendered || 0);
+		const favoritesProgressiveSignature = getProgressiveGridSignature([
+			term,
+			typeFilter,
+			regionFilter,
+			activeConsoles.join(','),
+			activeFavoriteLibraryLetter,
+			window.sortOrders?.fav || 'asc',
+			filteredFavs.map(game => getFavoriteDotKey(game)).join('|')
+		]);
+		const favoritesCanAppend = appendProgressive && grid.dataset.progressiveGridSignature === favoritesProgressiveSignature;
+		clearProgressiveGridObserver('favorites', grid);
+		if (!favoritesCanAppend) {
+			grid.innerHTML = "";
+			grid.dataset.progressiveGridSignature = favoritesProgressiveSignature;
+			grid.dataset.progressiveGridRendered = '0';
+		}
 
 		if (filteredFavs.length === 0) {
 			let emptyTitle = '';
@@ -34109,8 +34261,16 @@ function formatLibraryLastPlayedBadge(game = {}) {
 		}
 
 		const currentPlaying = window.myCurrentPS3Status || { status: 'idle' };
+		const favoritesRenderedBefore = favoritesCanAppend ? Number(grid.dataset.progressiveGridRendered || 0) : 0;
+		const favoritesResetTarget = (!favoritesCanAppend && isSilent && favoritesPreviouslyRendered > 0)
+			? Math.max(getProgressiveGridInitialLimit(), favoritesPreviouslyRendered)
+			: getProgressiveGridInitialLimit();
+		const favoritesRenderEnd = favoritesCanAppend
+			? Math.min(filteredFavs.length, favoritesRenderedBefore + getProgressiveGridLoadAmount())
+			: Math.min(filteredFavs.length, favoritesResetTarget);
 
-		filteredFavs.forEach((game, i) => {
+		for (let i = favoritesRenderedBefore; i < favoritesRenderEnd; i++) {
+			const game = filteredFavs[i];
 			const pathUpper = game.path.toUpperCase();
 			let consoleType = "PS3", tagClass = "tag-ps3", region = "HDD";
 	
@@ -34225,7 +34385,7 @@ function formatLibraryLastPlayedBadge(game = {}) {
 						<i class="far fa-clock"></i><span class="my-games-playing-time">${window.currentPs3PlayTime || "--:--:--"}</span>
 					</div>` : ""}
 					${lastPlayedBadgeHtml}
-					<img src="${escapeCategoryDotAttr(displayCover)}" class="game-img" data-cover-key="${escapeCategoryDotAttr(favoriteCoverKey)}" data-cover-category="library" data-title-id="${escapeCategoryDotAttr(resolvedFavoriteCoverId)}" data-github-cover="${escapeCategoryDotAttr(resolvedFavoriteGithubCover || cachedData.githubCover || '')}" data-webman-cover="${escapeCategoryDotAttr(cachedData.webmanCover || '')}" data-lib-path="${game.path.replace(/"/g, '&quot;')}" data-name="${String(coverSearchName || game.title || '').replace(/"/g, '&quot;')}" data-console="${String(coverConsoleTag || consoleType).replace(/"/g, '&quot;')}" data-content-id="${escapeCategoryDotAttr(coverContentId)}" data-region="${escapeCategoryDotAttr(coverRegion)}" onload="markCoverLoaded(this)" onerror="handleLibraryCoverError(this)">
+					<img src="${escapeCategoryDotAttr(displayCover)}" class="game-img" loading="lazy" data-cover-key="${escapeCategoryDotAttr(favoriteCoverKey)}" data-cover-category="library" data-title-id="${escapeCategoryDotAttr(resolvedFavoriteCoverId)}" data-github-cover="${escapeCategoryDotAttr(resolvedFavoriteGithubCover || cachedData.githubCover || '')}" data-webman-cover="${escapeCategoryDotAttr(cachedData.webmanCover || '')}" data-lib-path="${game.path.replace(/"/g, '&quot;')}" data-name="${String(coverSearchName || game.title || '').replace(/"/g, '&quot;')}" data-console="${String(coverConsoleTag || consoleType).replace(/"/g, '&quot;')}" data-content-id="${escapeCategoryDotAttr(coverContentId)}" data-region="${escapeCategoryDotAttr(coverRegion)}" onload="markCoverLoaded(this)" onerror="handleLibraryCoverError(this)">
 					<div class="console-tag ${tagClass}">${consoleType}</div>
 					<div class="region-tag">${region}</div>
 					<div class="fav-btn active" style="cursor: pointer;" title="Remove from Favorites" onclick="removeFromFavsOnly(event, ${i})">
@@ -34243,7 +34403,8 @@ function formatLibraryLastPlayedBadge(game = {}) {
 					${buttonsHtml}
 				</div>`;
 			grid.appendChild(card);
-		});
+		}
+		grid.dataset.progressiveGridRendered = String(favoritesRenderEnd);
 	
 		if (!isSilent) {
 			setupRevealAnimations('ps3-favs-grid', { selector: '.game-card:not(.category-favorites-entry)' });
@@ -34251,8 +34412,11 @@ function formatLibraryLastPlayedBadge(game = {}) {
 		if (pendingFavoritesRevealKeys && pendingFavoritesRevealKeys.length && typeof window.revealCategoryPendingCards === 'function') {
 			window.revealCategoryPendingCards('favorites', pendingFavoritesRevealKeys);
 		}
+		if (favoritesRenderEnd >= filteredFavs.length) window.__favoritesProgressivePendingKeys = [];
+		setupProgressiveGridObserver('favorites', grid, favoritesRenderEnd, filteredFavs.length, () => window.updateFavoritesLibraryUI(true, 'append'));
 	};
-	
+
+
 	async function scanConsoleAndReload(isAutomatic = false) {
 		const ip = document.getElementById('ps3-ip').value;
 		const status = document.getElementById('library-status');
