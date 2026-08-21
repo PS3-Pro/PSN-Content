@@ -1001,6 +1001,30 @@ select option { background-color: var(--bg-dark); }
 
 #view-downloads .download-item { width: 100% !important; min-width: 0 !important; max-width: 100% !important; box-sizing: border-box !important; transform-origin: center top; }
 .download-item:first-child { margin-top: 3px; }
+#downloads-list>.download-swipe-row:first-child { margin-top: 3px; }
+.download-swipe-row { position: relative; flex: 0 0 auto; width: 100%; min-width: 0; overflow: visible; border-radius: 6px; transition: opacity .22s ease,filter .22s ease; }
+.download-swipe-row:hover { z-index: 10; }
+.download-swipe-content { position: relative; z-index: 2; width: 100%; min-width: 0; transition: transform .28s cubic-bezier(.2,.8,.2,1); touch-action: pan-y; }
+.download-swipe-content .download-item { margin-top: 0 !important; }
+.download-swipe-content img { -webkit-user-drag: none; user-select: none; }
+.download-swipe-action { position: absolute; z-index: 1; top: 0; right: 0; width: 82px; height: 100%; display: flex; align-items: stretch; justify-content: stretch; overflow: hidden; border-radius: 0 6px 6px 0; background: linear-gradient(135deg,#d83248,#ff4444); opacity: 0; transition: opacity .12s ease; }
+.download-swipe-row.is-swiping .download-swipe-action, .download-swipe-row.is-open .download-swipe-action { opacity: 1; }
+.download-swipe-delete { width: 100%; height: 100%; min-height: 100%; border: 0; border-radius: 0; background: transparent; color: #fff; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 5px; font: inherit; font-size: 9px; font-weight: 900; letter-spacing: .45px; text-transform: uppercase; box-shadow: inset 1px 0 0 rgba(255,255,255,.12); transition: filter .08s ease,box-shadow .08s ease,background-color .16s ease; }
+.download-swipe-delete i { font-size: 17px; }
+.download-swipe-delete i, .download-swipe-delete span { transition: transform .06s ease,filter .06s ease; transform-origin: center; }
+.download-swipe-action:hover { background: rgba(62,0,14,.92); }
+.download-swipe-delete:hover { background-color: rgba(62,0,14,.92); filter: brightness(.82); }
+.download-swipe-action:has(.download-swipe-delete:is(:active,.mobile-pressed)) { background: rgba(34,0,8,.98); }
+.download-swipe-delete:is(:active,.mobile-pressed) { transform: none !important; border: 0 !important; outline: none !important; background-color: rgba(34,0,8,.98) !important; filter: brightness(.72) !important; box-shadow: inset 0 4px 9px rgba(0,0,0,.55) !important; transition-duration: .06s !important; }
+.download-swipe-delete:is(:active,.mobile-pressed) i, .download-swipe-delete:is(:active,.mobile-pressed) span { transform: translateY(2px) scale(.90) !important; filter: brightness(.88); }
+#downloads-list.has-open-swipe .download-swipe-row:not(.is-open) { opacity: .36; filter: grayscale(.88) brightness(.68); }
+#downloads-list .download-swipe-row.is-swiping .download-item { border-color: rgba(255,68,68,calc(.14 + (var(--download-swipe-progress,0) * .50))) !important; box-shadow: 0 0 calc(4px + (var(--download-swipe-progress,0) * 10px)) rgba(255,68,68,calc(var(--download-swipe-progress,0) * .16)) !important; }
+#downloads-list .download-swipe-row.is-open .download-item { border-color: rgba(255,68,68,.68) !important; box-shadow: 0 0 14px rgba(255,68,68,.16) !important; }
+#downloads-list .download-swipe-row.is-open .download-item:hover, #downloads-list .download-swipe-row.is-swiping .download-item:hover, #downloads-list .download-swipe-row.is-open .download-item:is(:active,.mobile-pressed) { transform: none !important; filter: none !important; z-index: 1 !important; }
+#downloads-list .download-swipe-row.is-open .download-item[class*="dl-kind-"]:hover, #downloads-list .download-swipe-row.is-swiping .download-item[class*="dl-kind-"]:hover, #downloads-list .download-swipe-row.is-open .download-item[class*="dl-kind-"]:is(:active,.mobile-pressed) { background: linear-gradient(90deg,var(--dl-accent-soft),rgba(255,255,255,0.03) 24%,rgba(255,255,255,0.03)) !important; }
+#downloads-list .download-swipe-row.is-open .download-item:hover::before, #downloads-list .download-swipe-row.is-swiping .download-item:hover::before { animation: none !important; }
+#downloads-list .download-swipe-row.is-open .download-item[class*="dl-kind-"]:hover::after, #downloads-list .download-swipe-row.is-swiping .download-item[class*="dl-kind-"]:hover::after { width: 3px !important; opacity: .95 !important; }
+.download-swipe-row.is-removing { pointer-events: none; overflow: hidden; transition: height .24s ease,opacity .2s ease,margin .24s ease,transform .24s ease; }
 
 .dl-date { font-size: 11px; color: var(--text-muted); font-family: monospace; }
 
@@ -23848,6 +23872,215 @@ P
 	}
 	window.refreshFavoritesSummaryUI = refreshFavoritesSummaryUI;
 
+    const DOWNLOAD_SWIPE_REVEAL_PX = 82;
+    let downloadSwipeDragState = null;
+
+    function setDownloadSwipeOffset(row, offset, animate = true) {
+        if (!row) return;
+        const content = row.querySelector('.download-swipe-content');
+        if (!content) return;
+        const value = Math.max(-DOWNLOAD_SWIPE_REVEAL_PX, Math.min(0, Number(offset) || 0));
+        const progress = Math.max(0, Math.min(1, Math.abs(value) / DOWNLOAD_SWIPE_REVEAL_PX));
+        row.style.setProperty('--download-swipe-progress', String(progress));
+        clearTimeout(row.__downloadSwipeTransformResetTimer);
+        content.style.transition = animate ? '' : 'none';
+
+        if (value === 0 && !animate) {
+            content.style.transform = '';
+            content.style.transition = '';
+            return;
+        }
+
+        content.style.transform = `translate3d(${value}px,0,0)`;
+
+        if (value === 0 && animate) {
+            row.__downloadSwipeTransformResetTimer = setTimeout(() => {
+                if (!row.classList.contains('is-open') && !row.classList.contains('is-swiping')) {
+                    content.style.transform = '';
+                    content.style.transition = '';
+                    row.style.removeProperty('--download-swipe-progress');
+                }
+            }, 320);
+        }
+    }
+
+    function syncDownloadSwipeListState() {
+        const list = document.getElementById('downloads-list');
+        if (!list) return;
+        list.classList.toggle('has-open-swipe', !!list.querySelector('.download-swipe-row.is-open'));
+    }
+
+    function closeDownloadSwipeRow(row, animate = true) {
+        if (!row) return;
+        row.classList.remove('is-open', 'is-swiping');
+        setDownloadSwipeOffset(row, 0, animate);
+        syncDownloadSwipeListState();
+    }
+
+    function closeDownloadSwipeRows(exceptRow = null) {
+        const list = document.getElementById('downloads-list');
+        if (!list) return;
+        list.querySelectorAll('.download-swipe-row.is-open').forEach(row => {
+            if (row !== exceptRow) closeDownloadSwipeRow(row, true);
+        });
+        syncDownloadSwipeListState();
+    }
+
+    window.removeDownloadHistoryItem = function(index, rowElement = null) {
+        if (window.__downloadHistoryRemoveBusy) return false;
+        const targetIndex = Number(index);
+        if (!Array.isArray(window.downloadHistory) || !Number.isInteger(targetIndex) || targetIndex < 0 || targetIndex >= window.downloadHistory.length) return false;
+
+        window.__downloadHistoryRemoveBusy = true;
+        const removed = window.downloadHistory.splice(targetIndex, 1)[0];
+        saveState(COOKIE_NAME_HISTORY, JSON.stringify(window.downloadHistory));
+        if (typeof window.refreshDownloadSummaryUI === 'function') window.refreshDownloadSummaryUI();
+        if (window.downloadHistory.length === 0) saveState('psn_dl_dot', 'false');
+        if (typeof markProfileListChanged === 'function') markProfileListChanged('downloads');
+        if (typeof playUiRemove === 'function') playUiRemove();
+        if (typeof window.broadcastProfileUpdate === 'function') window.broadcastProfileUpdate();
+
+        const removedName = String((removed && (removed.cleanName || removed.name || removed.titleId)) || 'Download');
+        if (typeof showToastNotification === 'function') showToastNotification('Download History', `${removedName} removed.`);
+
+        const finish = () => {
+            window.__downloadHistoryRemoveBusy = false;
+            updateDownloadUI();
+        };
+
+        const row = rowElement && rowElement.classList ? rowElement : null;
+        if (!row) {
+            finish();
+            return true;
+        }
+
+        const height = row.getBoundingClientRect().height;
+        row.style.height = `${height}px`;
+        row.style.opacity = '1';
+        row.classList.add('is-removing');
+        requestAnimationFrame(() => {
+            row.style.height = '0px';
+            row.style.opacity = '0';
+            row.style.marginTop = '0';
+            row.style.marginBottom = '0';
+            row.style.transform = 'scale(.985)';
+        });
+        setTimeout(finish, 250);
+        return true;
+    };
+
+    function setupDownloadSwipeInteractions() {
+        const list = document.getElementById('downloads-list');
+        if (!list || list.dataset.downloadSwipeBound === '1') return;
+        list.dataset.downloadSwipeBound = '1';
+
+        list.addEventListener('pointerdown', event => {
+            if (event.button !== undefined && event.button !== 0) return;
+            if (event.target.closest('.download-swipe-delete')) return;
+            const content = event.target.closest('.download-swipe-content');
+            if (!content || !list.contains(content)) return;
+            const row = content.closest('.download-swipe-row');
+            if (!row) return;
+
+            closeDownloadSwipeRows(row);
+            const startsOpen = row.classList.contains('is-open');
+            downloadSwipeDragState = {
+                pointerId: event.pointerId,
+                row,
+                content,
+                item: content.querySelector('.download-item'),
+                startX: event.clientX,
+                startY: event.clientY,
+                baseOffset: startsOpen ? -DOWNLOAD_SWIPE_REVEAL_PX : 0,
+                offset: startsOpen ? -DOWNLOAD_SWIPE_REVEAL_PX : 0,
+                dragging: false,
+                cancelled: false,
+                snapSoundPlayed: startsOpen
+            };
+        });
+
+        list.addEventListener('pointermove', event => {
+            const state = downloadSwipeDragState;
+            if (!state || state.pointerId !== event.pointerId || state.cancelled) return;
+            const dx = event.clientX - state.startX;
+            const dy = event.clientY - state.startY;
+            const absX = Math.abs(dx);
+            const absY = Math.abs(dy);
+
+            if (!state.dragging) {
+                if (absY > 8 && absY > absX) {
+                    state.cancelled = true;
+                    return;
+                }
+                if (absX < 8 || absX <= absY) return;
+                state.dragging = true;
+                state.row.classList.add('is-swiping');
+                if (state.item) state.item.classList.remove('mobile-pressed');
+                try { state.content.setPointerCapture(event.pointerId); } catch (_) {}
+            }
+
+            event.preventDefault();
+            state.offset = Math.max(-DOWNLOAD_SWIPE_REVEAL_PX, Math.min(0, state.baseOffset + dx));
+            setDownloadSwipeOffset(state.row, state.offset, false);
+            if (!state.snapSoundPlayed && state.offset <= -(DOWNLOAD_SWIPE_REVEAL_PX * .42)) {
+                state.snapSoundPlayed = true;
+                if (typeof playUiToggle === 'function') playUiToggle();
+            }
+        }, { passive: false });
+
+        const finishSwipe = event => {
+            const state = downloadSwipeDragState;
+            if (!state || state.pointerId !== event.pointerId) return;
+            downloadSwipeDragState = null;
+
+            if (state.dragging) {
+                const shouldOpen = state.offset <= -(DOWNLOAD_SWIPE_REVEAL_PX * .42);
+                state.row.classList.remove('is-swiping');
+                state.row.classList.toggle('is-open', shouldOpen);
+                setDownloadSwipeOffset(state.row, shouldOpen ? -DOWNLOAD_SWIPE_REVEAL_PX : 0, true);
+                syncDownloadSwipeListState();
+                state.row.dataset.downloadSwipeSuppressUntil = String(Date.now() + 350);
+            }
+
+            try { state.content.releasePointerCapture(event.pointerId); } catch (_) {}
+        };
+
+        list.addEventListener('pointerup', finishSwipe);
+        list.addEventListener('pointercancel', finishSwipe);
+        list.addEventListener('lostpointercapture', event => {
+            if (downloadSwipeDragState && downloadSwipeDragState.pointerId === event.pointerId) finishSwipe(event);
+        });
+
+        list.addEventListener('click', event => {
+            const deleteButton = event.target.closest('.download-swipe-delete');
+            if (deleteButton) {
+                event.preventDefault();
+                event.stopPropagation();
+                const row = deleteButton.closest('.download-swipe-row');
+                if (row) window.removeDownloadHistoryItem(Number(row.dataset.downloadIndex), row);
+                return;
+            }
+
+            const row = event.target.closest('.download-swipe-row');
+            if (!row) return;
+            const suppressUntil = Number(row.dataset.downloadSwipeSuppressUntil || 0);
+            if (Date.now() < suppressUntil) {
+                event.preventDefault();
+                event.stopPropagation();
+                return;
+            }
+            if (row.classList.contains('is-open')) {
+                event.preventDefault();
+                event.stopPropagation();
+                closeDownloadSwipeRow(row, true);
+            }
+        }, true);
+
+        document.addEventListener('pointerdown', event => {
+            if (!list.contains(event.target)) closeDownloadSwipeRows();
+        }, true);
+    }
+
     window.clearDownloadHistory = function() {
         if (confirm("Do you want to clear all history and statistics?")) {
             window.downloadHistory = [];
@@ -23872,6 +24105,7 @@ P
 		const activeUser = localStorage.getItem('psn_username');
 		
 		if (!listContainer) return;
+		setupDownloadSwipeInteractions();
 		if (!isPsnDomSectionVisible('view-downloads')) {
 			if (typeof window.refreshDownloadSummaryUI === 'function') window.refreshDownloadSummaryUI();
 			return;
@@ -23882,6 +24116,7 @@ P
 			saveState(COOKIE_NAME_HISTORY, JSON.stringify(window.downloadHistory));
 		}
 		if (typeof window.normalizeDownloadHistoryCovers === 'function') window.normalizeDownloadHistoryCovers(true, true);
+		listContainer.classList.remove('has-open-swipe');
 	
 		if (window.downloadHistory.length === 0) {
 			listContainer.innerHTML = `
@@ -23944,9 +24179,16 @@ P
 	
 			const revealClass = isSilentRestore ? 'no-anim' : 'anim-reveal';
 			return `
-				<div class="download-item ${newClass} ${typeClass} ${revealClass}" style="--tile-idx: ${index}; cursor: pointer; display: flex; align-items: center; gap: 15px;" 
-					onmouseenter="playUiHover(); this.classList.remove('anim-reveal');" 
-					onclick="playUiClick(); switchAndSearch('${dlFinalCategory}', '${dl.titleId}', 'downloads', '${(dlCoverData.contentId || dl.contentId || '').replace(/'/g, "\\'")}')">
+				<div class="download-swipe-row" data-download-index="${index}">
+					<div class="download-swipe-action" aria-hidden="false">
+						<button type="button" class="download-swipe-delete" title="Remove from download history" aria-label="Remove ${dlDisplayName.replace(/"/g, '&quot;')} from download history">
+							<i class="fas fa-trash-alt"></i><span>Delete</span>
+						</button>
+					</div>
+					<div class="download-swipe-content">
+						<div class="download-item ${newClass} ${typeClass} ${revealClass}" style="--tile-idx: ${index}; cursor: pointer; display: flex; align-items: center; gap: 15px;" 
+							onmouseenter="if(!this.closest('.download-swipe-row')?.classList.contains('is-open') && !this.closest('.download-swipe-row')?.classList.contains('is-swiping')) playUiHover(); this.classList.remove('anim-reveal');" 
+							onclick="playUiClick(); switchAndSearch('${dlFinalCategory}', '${dl.titleId}', 'downloads', '${(dlCoverData.contentId || dl.contentId || '').replace(/'/g, "\\'")}')">
 					
 					<div class="dl-cover-wrap dl-cover-main">
 						<img src="${coverImg}" class="dl-mini-cover" data-name="${dlCoverName}" data-console="${dlCoverConsole}" data-cover-category="${dlCoverCategory}" data-no-bing="${dlNoBingCover}" data-title-id="${dlCoverData.id || dlCoverData.titleId || ''}" data-content-id="${dlCoverData.contentId || ''}" data-region="${dlCoverData.region || ''}" data-github-cover="${String(githubCoverImg || '').replace(/"/g, '&quot;')}" onerror="handleCoverError(this, this.getAttribute('data-cover-category'))">
@@ -23957,9 +24199,11 @@ P
 						<div class="dl-title-row"><span class="dl-name" data-no-translate="true" translate="no">${dlDisplayName}</span></div>
 						<div class="dl-meta-row"><span class="dl-date"><i class="far fa-clock"></i>${downloadDateText}</span>${remoteStatusHtml}${downloadCountHtml}</div>
 					</div>
-					<div class="dl-side-info" style="text-align: right;">
-						<span class="dl-size-tag">${dl.sizeText}</span>
-						<div style="font-size: 9px; color: var(--ps-blue); margin-top: 4px; font-weight: bold;">SEARCH</div>
+							<div class="dl-side-info" style="text-align: right;">
+								<span class="dl-size-tag">${dl.sizeText}</span>
+								<div style="font-size: 9px; color: var(--ps-blue); margin-top: 4px; font-weight: bold;">SEARCH</div>
+							</div>
+						</div>
 					</div>
 				</div>
 			`;
