@@ -932,7 +932,23 @@ async function initDb() {
       value BIGINT NOT NULL DEFAULT 0,
       updated_at TIMESTAMPTZ DEFAULT NOW()
     );
+    CREATE TABLE IF NOT EXISTS friend_activity (
+      id BIGSERIAL PRIMARY KEY,
+      actor_name TEXT NOT NULL,
+      event_type TEXT NOT NULL,
+      data JSONB NOT NULL DEFAULT '{}'::jsonb,
+      dedupe_key TEXT UNIQUE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_friend_activity_actor_id ON friend_activity(actor_name, id DESC);
+    CREATE INDEX IF NOT EXISTS idx_friend_activity_created_at ON friend_activity(created_at DESC);
   `);
+
+  await queryDbWithRetry(
+    "DELETE FROM friend_activity WHERE created_at < NOW() - INTERVAL '60 days'",
+    [],
+    { attempts: 2, label: 'FRIEND ACTIVITY CLEANUP' }
+  );
 
   await queryDbWithRetry(
     'INSERT INTO chat_sync_state (id, epoch, revision) VALUES (1, $1, 0) ON CONFLICT (id) DO NOTHING',
@@ -1443,6 +1459,28 @@ function isUserBanned(userData = null) {
   return !!(userData && (userData.banned === true || getRawUserRole(userData) === "banned"));
 }
 
+const RECENTLY_VISITED_MAX_ITEMS = 10;
+
+function normalizeRecentlyVisitedRecordsServer(records = []) {
+  const seen = new Set();
+  const normalized = [];
+  for (const raw of Array.isArray(records) ? records : []) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) continue;
+    const id = normalizeText(raw.id || raw.titleId, '').toUpperCase().slice(0, 32);
+    const contentId = normalizeText(raw.contentId, '').toUpperCase().slice(0, 160);
+    const cleanName = normalizeText(raw.cleanName || raw.name, '').slice(0, 180);
+    const cTag = normalizeText(raw.cTag, '').toLowerCase().slice(0, 16);
+    const region = normalizeText(raw.region, '').toUpperCase().slice(0, 16);
+    if (!cleanName || (!contentId && !id)) continue;
+    const key = contentId && contentId !== 'MISSING' ? `content:${contentId}` : `title:${id}|${region}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    normalized.push({ id, contentId, cleanName, cTag, region, category: 'games' });
+    if (normalized.length >= RECENTLY_VISITED_MAX_ITEMS) break;
+  }
+  return normalized;
+}
+
 function normalizeUserRecord(name, userData = {}) {
   const legacyBannedRole = getRawUserRole(userData) === "banned";
   const normalized = {
@@ -1474,6 +1512,12 @@ function normalizeUserRecord(name, userData = {}) {
   if (Array.isArray(normalized.libraryData)) {
     normalized.libraryData = mergeLibraryRecordsServer(normalized.libraryData, []);
     normalized.library = normalized.libraryData.length;
+  }
+
+  if (Array.isArray(normalized.recentlyVisitedData)) {
+    normalized.recentlyVisitedData = normalizeRecentlyVisitedRecordsServer(normalized.recentlyVisitedData);
+    normalized.recentlyVisited = normalized.recentlyVisitedData.length;
+    normalized.recentlyVisitedUpdatedAt = normalizeTimestampValue(normalized.recentlyVisitedUpdatedAt);
   }
 
   return normalized;
@@ -1541,7 +1585,8 @@ const PROFILE_ARRAY_SYNC_KEYS = {
   wishlistData: { versionKey: 'wishlistUpdatedAt', countKey: 'wishlist' },
   favoritesData: { versionKey: 'favoritesUpdatedAt', countKey: 'favorites' },
   libraryData: { versionKey: 'libraryUpdatedAt', countKey: 'library' },
-  friendsData: { versionKey: 'friendsUpdatedAt', countKey: 'friends' }
+  friendsData: { versionKey: 'friendsUpdatedAt', countKey: 'friends' },
+  recentlyVisitedData: { versionKey: 'recentlyVisitedUpdatedAt', countKey: 'recentlyVisited' }
 };
 
 const PROFILE_REPLAY_SECTION_DATA_KEYS = {
@@ -1550,7 +1595,8 @@ const PROFILE_REPLAY_SECTION_DATA_KEYS = {
   wishlist: 'wishlistData',
   favorites: 'favoritesData',
   library: 'libraryData',
-  friends: 'friendsData'
+  friends: 'friendsData',
+  recentlyvisited: 'recentlyVisitedData'
 };
 
 function normalizeTimestampValue(value) {
@@ -1837,6 +1883,14 @@ function getProfileArrayPayload(value) {
   return Array.isArray(value) ? value : [];
 }
 
+function normalizeProfileArrayListServer(key, value, existing = []) {
+  const list = getProfileArrayPayload(value);
+  if (key === 'downloadsData') return normalizeDownloadHistoryRecordsServer(list).history;
+  if (key === 'libraryData') return mergeLibraryRecordsServer(list, getProfileArrayPayload(existing));
+  if (key === 'recentlyVisitedData') return normalizeRecentlyVisitedRecordsServer(list);
+  return list;
+}
+
 function hasOwnPayload(target = {}, key = '') {
   return Object.prototype.hasOwnProperty.call(target || {}, key);
 }
@@ -1845,10 +1899,7 @@ function hasOwnPayload(target = {}, key = '') {
 function normalizeProfileArrayPayloads(target = {}) {
   Object.keys(PROFILE_ARRAY_SYNC_KEYS).forEach(key => {
     const sync = PROFILE_ARRAY_SYNC_KEYS[key];
-    const rawList = Array.isArray(target[key]) ? target[key] : [];
-    const list = key === 'downloadsData'
-      ? normalizeDownloadHistoryRecordsServer(rawList).history
-      : (key === 'libraryData' ? mergeLibraryRecordsServer(rawList, []) : rawList);
+    const list = normalizeProfileArrayListServer(key, target[key]);
     target[key] = list;
     target[sync.countKey] = list.length;
     target[sync.versionKey] = normalizeTimestampValue(target[sync.versionKey]);
@@ -1864,14 +1915,8 @@ function reconcileIncomingProfileArrays(currentUser = {}, incomingUser = {}) {
     const hasIncomingVersion = hasOwnPayload(incomingUser, sync.versionKey);
     if (!hasIncomingArray && !hasIncomingCount && !hasIncomingVersion) return;
 
-    const currentRawList = getProfileArrayPayload(currentUser[key]);
-    const incomingRawList = getProfileArrayPayload(incomingUser[key]);
-    const currentList = key === 'downloadsData'
-      ? normalizeDownloadHistoryRecordsServer(currentRawList).history
-      : (key === 'libraryData' ? mergeLibraryRecordsServer(currentRawList, []) : currentRawList);
-    const incomingList = key === 'downloadsData'
-      ? normalizeDownloadHistoryRecordsServer(incomingRawList).history
-      : (key === 'libraryData' ? mergeLibraryRecordsServer(incomingRawList, []) : incomingRawList);
+    const currentList = normalizeProfileArrayListServer(key, currentUser[key]);
+    const incomingList = normalizeProfileArrayListServer(key, incomingUser[key]);
     const currentVersion = normalizeTimestampValue(currentUser[sync.versionKey]);
     const incomingVersion = normalizeTimestampValue(incomingUser[sync.versionKey]);
     const currentHasItems = currentList.length > 0;
@@ -1892,9 +1937,7 @@ function reconcileIncomingProfileArrays(currentUser = {}, incomingUser = {}) {
     currentUser[sync.countKey] = currentList.length;
 
     if (acceptIncoming) {
-      const acceptedList = key === 'libraryData'
-        ? mergeLibraryRecordsServer(incomingList, currentList)
-        : incomingList;
+      const acceptedList = normalizeProfileArrayListServer(key, incomingList, currentList);
       incomingUser[key] = acceptedList;
       incomingUser[sync.countKey] = acceptedList.length;
       incomingUser[sync.versionKey] = incomingVersion || normalizeTimestampValue(incomingUser.profileUpdatedAt) || Date.now();
@@ -2067,6 +2110,8 @@ function buildCompactUserSummary(name, userData = {}) {
   const favorites = Array.isArray(source.favoritesData) ? source.favoritesData.length : Number(source.favorites || 0);
   const library = Array.isArray(source.libraryData) ? source.libraryData.length : Number(source.library || 0);
   const friends = Array.isArray(source.friendsData) ? source.friendsData.length : Number(source.friends || 0);
+  const recentlyVisitedData = normalizeRecentlyVisitedRecordsServer(source.recentlyVisitedData);
+  const recentlyVisited = recentlyVisitedData.length;
   const trophies = source.trophiesData && typeof source.trophiesData === 'object' && !Array.isArray(source.trophiesData)
     ? countUnlockedTrophiesPayload(source.trophiesData)
     : Number(source.trophies || 0);
@@ -2093,6 +2138,9 @@ function buildCompactUserSummary(name, userData = {}) {
     trophies,
     library,
     friends,
+    recentlyVisited,
+    recentlyVisitedData,
+    recentlyVisitedUpdatedAt: normalizeTimestampValue(source.recentlyVisitedUpdatedAt),
     countersData: buildCompactCountersData(source.countersData),
     themeColor: normalizeThemeColorServer(source.themeColor || (source.settingsData && source.settingsData.themeColor) || '#0070cc'),
     themeColorUpdatedAt: getUserThemeColorUpdatedAt(source),
@@ -2376,6 +2424,7 @@ function getUserDataPayloadFromCache(targetName, type) {
   const payload = targetUser[dataKey] || (dataKey === 'trophiesData' ? {} : []);
   if (dataKey === 'downloadsData') return normalizeDownloadHistoryRecordsServer(payload).history;
   if (dataKey === 'libraryData') return mergeLibraryRecordsServer(payload, []);
+  if (dataKey === 'recentlyVisitedData') return normalizeRecentlyVisitedRecordsServer(payload);
   return payload;
 }
 
@@ -2722,6 +2771,7 @@ async function getUserDataPayloadFromDb(targetName, type) {
   if (!Array.isArray(payload)) payload = [];
   if (dataKey === 'downloadsData') return normalizeDownloadHistoryRecordsServer(payload).history;
   if (dataKey === 'libraryData') return mergeLibraryRecordsServer(payload, []);
+  if (dataKey === 'recentlyVisitedData') return normalizeRecentlyVisitedRecordsServer(payload);
   return payload;
 }
 
@@ -2866,6 +2916,9 @@ function buildLightProfileUserData(name, user = {}) {
     favorites: Number(user.favorites || 0),
     trophies: Number(user.trophies || 0),
     library: Number(user.library || 0),
+    recentlyVisited: Array.isArray(user.recentlyVisitedData) ? user.recentlyVisitedData.length : Number(user.recentlyVisited || 0),
+    recentlyVisitedData: normalizeRecentlyVisitedRecordsServer(user.recentlyVisitedData),
+    recentlyVisitedUpdatedAt: normalizeTimestampValue(user.recentlyVisitedUpdatedAt),
     countersData: buildCompactCountersData(user.countersData),
     themeColor: normalizeThemeColorServer(user.themeColor || (user.settingsData && user.settingsData.themeColor) || '#0070cc'),
     themeColorUpdatedAt: getUserThemeColorUpdatedAt(user),
@@ -3780,6 +3833,9 @@ function buildFullProfileSyncPayload(name, user = {}, sourceSocketId = null, opt
       libraryUpdatedAt: normalizeTimestampValue(safe.libraryUpdatedAt),
       friendsData: Array.isArray(safe.friendsData) ? safe.friendsData : [],
       friendsUpdatedAt: normalizeTimestampValue(safe.friendsUpdatedAt),
+      recentlyVisited: Array.isArray(safe.recentlyVisitedData) ? safe.recentlyVisitedData.length : Number(safe.recentlyVisited || 0),
+      recentlyVisitedData: normalizeRecentlyVisitedRecordsServer(safe.recentlyVisitedData),
+      recentlyVisitedUpdatedAt: normalizeTimestampValue(safe.recentlyVisitedUpdatedAt),
       countersData: safe.countersData || {},
       themeColor: normalizeThemeColorServer(safe.themeColor || (safe.settingsData && safe.settingsData.themeColor) || '#0070cc'),
       themeColorUpdatedAt: getUserThemeColorUpdatedAt(safe),
@@ -3795,6 +3851,7 @@ const PROFILE_SYNC_PATCH_KEYS = new Set([
   'trophiesData', 'downloadsData', 'downloadsClearedAt', 'downloadsUpdatedAt',
   'wishlistData', 'wishlistUpdatedAt', 'favoritesData', 'favoritesUpdatedAt',
   'libraryData', 'libraryUpdatedAt', 'friendsData', 'friendsUpdatedAt',
+  'recentlyVisited', 'recentlyVisitedData', 'recentlyVisitedUpdatedAt',
   'countersData', 'themeColor', 'themeColorUpdatedAt', 'settingsData'
 ]);
 
@@ -3835,6 +3892,9 @@ function buildProfileSyncPatchPayload(name, user = {}, changedKeys = [], sourceS
   if (include('libraryUpdatedAt')) target.libraryUpdatedAt = normalizeTimestampValue(user.libraryUpdatedAt);
   if (include('friendsData')) target.friendsData = Array.isArray(user.friendsData) ? user.friendsData : [];
   if (include('friendsUpdatedAt')) target.friendsUpdatedAt = normalizeTimestampValue(user.friendsUpdatedAt);
+  if (include('recentlyVisited')) target.recentlyVisited = Array.isArray(user.recentlyVisitedData) ? user.recentlyVisitedData.length : Number(user.recentlyVisited || 0);
+  if (include('recentlyVisitedData')) target.recentlyVisitedData = normalizeRecentlyVisitedRecordsServer(user.recentlyVisitedData);
+  if (include('recentlyVisitedUpdatedAt')) target.recentlyVisitedUpdatedAt = normalizeTimestampValue(user.recentlyVisitedUpdatedAt);
   if (include('countersData')) target.countersData = user.countersData || {};
   if (include('themeColor')) target.themeColor = normalizeThemeColorServer(user.themeColor || (user.settingsData && user.settingsData.themeColor) || '#0070cc');
   if (include('themeColorUpdatedAt')) target.themeColorUpdatedAt = getUserThemeColorUpdatedAt(user);
@@ -4033,11 +4093,16 @@ async function initProfileSyncNotifications() {
   profileSyncNotifyClient = client;
 
   client.on('notification', async (message) => {
-    if (!message || !['profile_sync', 'presence_sync', 'ps3_playtime_sync', 'admin_state_sync'].includes(message.channel)) return;
+    if (!message || !['profile_sync', 'presence_sync', 'ps3_playtime_sync', 'admin_state_sync', 'friend_activity_sync'].includes(message.channel)) return;
 
     try {
       const data = JSON.parse(message.payload || '{}');
       if (data.instanceId === INSTANCE_ID) return;
+
+      if (message.channel === 'friend_activity_sync') {
+        if (data.event) emitFriendActivityToLocalSubscribers(data.event);
+        return;
+      }
 
       if (message.channel === 'admin_state_sync') {
         const key = normalizeText(data.key, '');
@@ -4178,16 +4243,186 @@ async function initProfileSyncNotifications() {
     await client.query('LISTEN presence_sync');
     await client.query('LISTEN ps3_playtime_sync');
     await client.query('LISTEN admin_state_sync');
+    await client.query('LISTEN friend_activity_sync');
     console.log('[PROFILE SYNC] Postgres LISTEN enabled.');
     console.log('[PRESENCE SYNC] Postgres LISTEN enabled.');
     console.log('[PS3 PLAYTIME SYNC] Postgres LISTEN enabled.');
     console.log('[ADMIN STATE SYNC] Postgres LISTEN enabled.');
+    console.log('[FRIEND ACTIVITY] Postgres LISTEN enabled.');
   } catch (err) {
     if (profileSyncNotifyClient === client) profileSyncNotifyClient = null;
     console.error('[PROFILE LISTEN INIT ERROR]:', err && err.message ? err.message : err);
     await client.end().catch(() => {});
     scheduleProfileSyncReconnect(isPgConnectionLimitError(err) ? 15000 : 5000);
   }
+}
+
+const FRIEND_ACTIVITY_TYPES = new Set(['online', 'playing', 'xmb', 'trophy']);
+const FRIEND_ACTIVITY_LIMIT = 60;
+const FRIEND_ACTIVITY_ROOM_PREFIX = 'friend-activity:';
+
+function normalizeFriendActivityName(value) {
+  return normalizeText(value, '').slice(0, 80);
+}
+
+function normalizeFriendActivityData(type, rawData = {}) {
+  const source = rawData && typeof rawData === 'object' && !Array.isArray(rawData) ? rawData : {};
+  if (type === 'playing' || type === 'xmb') {
+    return {
+      titleId: normalizeText(source.titleId, '').toUpperCase().slice(0, 32),
+      title: normalizeText(source.title, '').slice(0, 140),
+      appVersion: normalizeText(source.appVersion, '').slice(0, 24)
+    };
+  }
+  if (type === 'trophy') {
+    const trophyType = normalizeText(source.trophyType, '').toLowerCase();
+    return {
+      trophyId: normalizeText(source.trophyId, '').slice(0, 80),
+      title: normalizeText(source.title, 'Trophy').slice(0, 140),
+      trophyType: ['bronze', 'silver', 'gold', 'platinum'].includes(trophyType) ? trophyType : 'bronze'
+    };
+  }
+  return {};
+}
+
+function serializeFriendActivityRow(row = {}) {
+  const type = normalizeText(row.event_type || row.type, '').toLowerCase();
+  if (!FRIEND_ACTIVITY_TYPES.has(type)) return null;
+  const actor = normalizeFriendActivityName(row.actor_name || row.actor);
+  if (!actor) return null;
+  const createdAtRaw = row.created_at instanceof Date ? row.created_at.getTime() : Number(row.created_at || row.createdAt || Date.now());
+  return {
+    id: String(row.id || ''),
+    actor,
+    type,
+    data: normalizeFriendActivityData(type, row.data),
+    createdAt: Number.isFinite(createdAtRaw) && createdAtRaw > 0 ? createdAtRaw : Date.now()
+  };
+}
+
+function friendActivityRoom(actorName) {
+  return `${FRIEND_ACTIVITY_ROOM_PREFIX}${normalizeFriendActivityName(actorName).toLowerCase()}`;
+}
+
+function extractFriendActivityNames(list) {
+  if (!Array.isArray(list)) return [];
+  const names = [];
+  const seen = new Set();
+  list.forEach(item => {
+    const name = normalizeFriendActivityName(item && typeof item === 'object' ? item.name : item);
+    const key = name.toLowerCase();
+    if (!name || seen.has(key)) return;
+    seen.add(key);
+    names.push(name);
+  });
+  return names.slice(0, 500);
+}
+
+function clearFriendActivitySubscription(socket) {
+  if (!socket) return;
+  const rooms = socket.__friendActivityRooms instanceof Set ? Array.from(socket.__friendActivityRooms) : [];
+  rooms.forEach(room => { try { socket.leave(room); } catch (err) {} });
+  socket.__friendActivityRooms = new Set();
+  socket.__friendActivitySubscribed = false;
+}
+
+function setFriendActivitySubscription(socket, friendNames = []) {
+  if (!socket) return [];
+  clearFriendActivitySubscription(socket);
+  const names = extractFriendActivityNames(friendNames);
+  const rooms = new Set();
+  names.forEach(name => {
+    const room = friendActivityRoom(name);
+    socket.join(room);
+    rooms.add(room);
+  });
+  socket.__friendActivityRooms = rooms;
+  socket.__friendActivitySubscribed = true;
+  return names;
+}
+
+function emitFriendActivityToLocalSubscribers(event) {
+  const safeEvent = serializeFriendActivityRow(event);
+  if (!safeEvent) return;
+  io.to(friendActivityRoom(safeEvent.actor)).emit('friend_activity_event', safeEvent);
+}
+
+async function notifyFriendActivityAcrossInstances(event) {
+  const safeEvent = serializeFriendActivityRow(event);
+  if (!safeEvent) return;
+  try {
+    await pool.query('SELECT pg_notify($1, $2)', ['friend_activity_sync', JSON.stringify({ event: safeEvent, instanceId: INSTANCE_ID })]);
+  } catch (err) {
+    console.error('[FRIEND ACTIVITY NOTIFY ERROR]:', err);
+  }
+}
+
+async function recordFriendActivity(actorName, type, rawData = {}, options = {}) {
+  const actor = normalizeFriendActivityName(actorName);
+  const eventType = normalizeText(type, '').toLowerCase();
+  if (!actor || !FRIEND_ACTIVITY_TYPES.has(eventType)) return null;
+  const data = normalizeFriendActivityData(eventType, rawData);
+  const at = normalizeTimestampValue(options.at) || Date.now();
+  const detailKey = eventType === 'playing' || eventType === 'xmb'
+    ? `${data.titleId || data.title}`
+    : (eventType === 'trophy' ? `${data.trophyId || data.title}` : 'online');
+  const dedupeKey = normalizeText(options.dedupeKey, '') || `${actor.toLowerCase()}:${eventType}:${String(detailKey || '').toLowerCase()}:${Math.floor(at / 5000)}`;
+
+  try {
+    const result = await queryDbWithRetry(
+      `INSERT INTO friend_activity (actor_name, event_type, data, dedupe_key, created_at)
+       VALUES ($1, $2, $3::jsonb, $4, to_timestamp($5::double precision / 1000.0))
+       ON CONFLICT (dedupe_key) DO NOTHING
+       RETURNING id, actor_name, event_type, data, created_at`,
+      [actor, eventType, JSON.stringify(data), dedupeKey, at],
+      { attempts: 2, label: 'FRIEND ACTIVITY INSERT' }
+    );
+    if (!result.rows[0]) return null;
+    const event = serializeFriendActivityRow(result.rows[0]);
+    if (!event) return null;
+    emitFriendActivityToLocalSubscribers(event);
+    deferServerTask('FRIEND ACTIVITY NOTIFY', () => notifyFriendActivityAcrossInstances(event), 0);
+    return event;
+  } catch (err) {
+    console.error('[FRIEND ACTIVITY INSERT ERROR]:', err && err.message ? err.message : err);
+    return null;
+  }
+}
+
+async function getFriendActivityHistoryForUser(userName, limit = FRIEND_ACTIVITY_LIMIT) {
+  const friendData = await getUserDataPayloadFromDb(userName, 'friends');
+  const friendNames = extractFriendActivityNames(friendData);
+  if (!friendNames.length) return { friendNames, items: [] };
+  const safeLimit = Math.max(1, Math.min(FRIEND_ACTIVITY_LIMIT, Number(limit) || FRIEND_ACTIVITY_LIMIT));
+  const result = await queryDbWithRetry(
+    `SELECT id, actor_name, event_type, data, created_at
+     FROM friend_activity
+     WHERE actor_name = ANY($1::text[])
+     ORDER BY id DESC
+     LIMIT $2`,
+    [friendNames, safeLimit],
+    { attempts: 2, label: 'FRIEND ACTIVITY READ' }
+  );
+  return { friendNames, items: result.rows.map(serializeFriendActivityRow).filter(Boolean) };
+}
+
+function getPs3FriendActivityTransition(previousStatus, currentStatus) {
+  const previous = previousStatus && typeof previousStatus === 'object' ? previousStatus : null;
+  const current = currentStatus && typeof currentStatus === 'object' ? currentStatus : null;
+  const previousPlaying = previous && previous.status === 'playing';
+  const currentPlaying = current && current.status === 'playing';
+  const previousId = normalizeText(previous && previous.titleId, '').toUpperCase();
+  const currentId = normalizeText(current && current.titleId, '').toUpperCase();
+  const previousTitle = normalizeText(previous && previous.title, '');
+  const currentTitle = normalizeText(current && current.title, '');
+
+  if (currentPlaying && (!previousPlaying || currentId !== previousId || (!currentId && currentTitle !== previousTitle))) {
+    return { type: 'playing', data: current };
+  }
+  if (previousPlaying && current && current.status === 'idle') {
+    return { type: 'xmb', data: previous };
+  }
+  return null;
 }
 
 function disconnectUserSessions(name, eventName = 'user_kicked', payload = {}) {
@@ -4208,6 +4443,7 @@ function disconnectUserSessions(name, eventName = 'user_kicked', payload = {}) {
 async function upsertPresenceForSocket(socket, name) {
   if (!socket || !name) return;
   const shouldAnnouncePresence = socket.__presenceAnnounced !== true;
+  const wasOnline = !!(userDatabase[name] && userDatabase[name].online === true);
   if (userDatabase[name]) {
     userDatabase[name].online = true;
     userDatabase[name].id = socket.id;
@@ -4225,6 +4461,7 @@ async function upsertPresenceForSocket(socket, name) {
     socket.__presenceAnnounced = true;
     emitPresenceUpdate(name, userDatabase[name]);
     deferServerTask('PRESENCE ONLINE NOTIFY', () => notifyPresenceAcrossInstances(name, userDatabase[name]), 0);
+    if (!wasOnline) deferServerTask('FRIEND ACTIVITY ONLINE', () => recordFriendActivity(name, 'online', {}, { at: Date.now() }), 0);
   }
 }
 
@@ -5050,6 +5287,8 @@ io.on('connection', (socket) => {
       return;
     }
     if (!workingUser) { respond({ ok: false, requestId: syncRequestId, error: 'Profile could not be prepared.' }); return; }
+    const previousPs3StatusForActivity = workingUser.ps3Status && typeof workingUser.ps3Status === 'object' ? { ...workingUser.ps3Status } : null;
+    const incomingPs3StatusForActivity = Object.prototype.hasOwnProperty.call(userData, 'ps3Status');
     const incomingSettingsData = (userData.settingsData && typeof userData.settingsData === "object") ? userData.settingsData : null;
     const previousCountryCode = name && userDatabase[name] ? getUserCountryCode(workingUser) : "";
     normalizeIncomingProfileCountry(userData, incomingSettingsData);
@@ -5144,9 +5383,7 @@ io.on('connection', (socket) => {
         workingUser.downloadsClearedAt = normalizeTimestampValue(workingUser.downloadsClearedAt);
         Object.entries(PROFILE_ARRAY_SYNC_KEYS).forEach(([key, sync]) => {
           if (!Object.prototype.hasOwnProperty.call(userData, key)) return;
-          const list = key === 'downloadsData'
-            ? normalizeDownloadHistoryRecordsServer(Array.isArray(workingUser[key]) ? workingUser[key] : []).history
-            : (key === 'libraryData' ? mergeLibraryRecordsServer(Array.isArray(workingUser[key]) ? workingUser[key] : [], []) : (Array.isArray(workingUser[key]) ? workingUser[key] : []));
+          const list = normalizeProfileArrayListServer(key, workingUser[key]);
           workingUser[key] = list;
           workingUser[sync.countKey] = list.length;
           workingUser[sync.versionKey] = normalizeTimestampValue(workingUser[sync.versionKey]);
@@ -5190,6 +5427,15 @@ io.on('connection', (socket) => {
         }
 
         updateCompactUserCacheFromPatch(name, workingUser, profileDbPatch);
+        if (socket.__friendActivitySubscribed && Object.prototype.hasOwnProperty.call(profileDbPatch, 'friendsData')) {
+          setFriendActivitySubscription(socket, workingUser.friendsData || []);
+        }
+        if (incomingPs3StatusForActivity) {
+          const activityTransition = getPs3FriendActivityTransition(previousPs3StatusForActivity, workingUser.ps3Status);
+          if (activityTransition) {
+            deferServerTask('FRIEND ACTIVITY PS3', () => recordFriendActivity(name, activityTransition.type, activityTransition.data, { at: workingUser.profileUpdatedAt }), 0);
+          }
+        }
         if (publicCountsChanged) emitProfileCountsUpdate(name, userDatabase[name]);
 
         if (shouldEmitTrendingUpdate) {
@@ -5230,10 +5476,49 @@ io.on('connection', (socket) => {
             wishlist: normalizeTimestampValue(workingUser.wishlistUpdatedAt),
             favorites: normalizeTimestampValue(workingUser.favoritesUpdatedAt),
             library: normalizeTimestampValue(workingUser.libraryUpdatedAt),
-            friends: normalizeTimestampValue(workingUser.friendsUpdatedAt)
+            friends: normalizeTimestampValue(workingUser.friendsUpdatedAt),
+            recentlyVisited: normalizeTimestampValue(workingUser.recentlyVisitedUpdatedAt)
           }
         });
     }
+  });
+
+  socket.on('request_friend_activity', async (data = {}, ack) => {
+    const respond = payload => { if (typeof ack === 'function' && socket.connected) { try { ack(payload); } catch (err) {} } };
+    const name = socket.userName;
+    if (!name || !userDatabase[name]) { respond({ ok: false, items: [], error: 'Profile is not available.' }); return; }
+    const requestToken = (Number(socket.__friendActivityRequestToken) || 0) + 1;
+    socket.__friendActivityRequestToken = requestToken;
+    try {
+      const result = await getFriendActivityHistoryForUser(name, data && data.limit);
+      if (!socket.connected || socket.__friendActivityRequestToken !== requestToken) return;
+      setFriendActivitySubscription(socket, result.friendNames);
+      respond({ ok: true, items: result.items, friendCount: result.friendNames.length });
+    } catch (err) {
+      if (socket.__friendActivityRequestToken !== requestToken) return;
+      console.error('[FRIEND ACTIVITY READ ERROR]:', err && err.message ? err.message : err);
+      clearFriendActivitySubscription(socket);
+      respond({ ok: false, items: [], error: 'Friend activity is temporarily unavailable.' });
+    }
+  });
+
+  socket.on('friend_activity_unsubscribe', () => {
+    socket.__friendActivityRequestToken = (Number(socket.__friendActivityRequestToken) || 0) + 1;
+    clearFriendActivitySubscription(socket);
+  });
+
+  socket.on('friend_activity_trophy', (data = {}) => {
+    const name = socket.userName;
+    if (!name || !userDatabase[name]) return;
+    const trophyId = normalizeText(data.trophyId, '').slice(0, 80);
+    const title = normalizeText(data.title, 'Trophy').slice(0, 140);
+    const trophyType = normalizeText(data.trophyType, '').toLowerCase();
+    if (!trophyId || !['bronze', 'silver', 'gold', 'platinum'].includes(trophyType)) return;
+    deferServerTask('FRIEND ACTIVITY TROPHY', () => recordFriendActivity(name, 'trophy', {
+      trophyId,
+      title,
+      trophyType
+    }, { dedupeKey: `${name.toLowerCase()}:trophy:${trophyId.toLowerCase()}` }), 0);
   });
 
   socket.on('ps3_playtime_update', (data = {}) => {
@@ -6528,6 +6813,7 @@ io.on('connection', (socket) => {
   });
 
   socket.on('disconnect', async () => {
+    clearFriendActivitySubscription(socket);
     const name = socket.userName;
     if (!name || !userDatabase[name]) return;
 
