@@ -1505,6 +1505,10 @@ body.is-admin #btn-toolbar-cmd, body.is-mod #btn-toolbar-cmd { display: flex !im
 
 /* ========================================================================== LIBRARY ========================================================================== */
 .library-actions { display: flex; gap: 10px; align-items: center; }
+#subview-games #library-auto-scan-status { flex: 0 0 auto; display: none; align-items: baseline; align-self: baseline; margin-left: 10px; padding: 0; border: 0; background: transparent; box-shadow: none; font-family: inherit; font-size: var(--primary-page-title-meta-size); font-weight: 400; line-height: var(--primary-page-title-meta-line-height); letter-spacing: 0; text-transform: none; white-space: nowrap; vertical-align: baseline; }
+#subview-games #library-auto-scan-status.is-visible { display: inline-flex; }
+#subview-games #library-auto-scan-status.is-enabled { color: #4caf50; }
+#subview-games #library-auto-scan-status.is-disabled { color: #ff4444; }
 #library-toolbar { justify-content: flex-end; }
 #subview-games.my-games-offline #ps3-local-grid { display: block !important; padding: 0 var(--page-gutter) 40px !important; }
 #subview-games.my-games-offline #ps3-local-grid>div, #subview-monitor:not(.monitor-live) .console-monitor-offline-msg, #fm-offline-msg, #fav-offline-msg { box-sizing: border-box !important; max-width: 100% !important; padding: 100px 50px !important; text-align: center !important; color: #888 !important; background: rgba(0,0,0,0.2) !important; border: 1px dashed rgba(255,255,255,0.05) !important; border-radius: 12px !important; backdrop-filter: blur(5px) !important; -webkit-backdrop-filter: blur(5px) !important; }
@@ -4430,7 +4434,7 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 #modal-sys-list .profile-list-search-status, #modal-sys-list .profile-list-search-status--missing .profile-list-search-id, #modal-sys-list .profile-list-search-status--missing .profile-list-search-missing { max-width: 68px !important; }
 }
 @media (max-width: 380px) {
-#subview-games #library-status { display: none !important; }
+#subview-games #library-status, #subview-games #library-auto-scan-status { display: none !important; }
 }
 @media (max-width: 360px) {
 .game-trophy-summary { display: flex !important; flex-direction: column !important; align-items: flex-start !important; gap: 9px !important; padding: 11px 12px !important; }
@@ -5755,7 +5759,7 @@ a:focus, button:focus, select:focus, input:focus, textarea:focus, [contenteditab
 				<div id="subview-games" style="display: none;">
 					<h2 style="font-size: 28px; font-weight: 300; margin-top: 20px; margin-left: var(--page-gutter); margin-right: var(--page-gutter); margin-bottom: 20px; border-bottom: 1px solid rgba(255,255,255,0.1); padding-bottom: 15px; display: flex; justify-content: space-between; align-items: center;">
 						<div>
-							Installed Games <span id="library-status" style="color: #ff4444; font-size: 14px; margin-left: 10px;">(Disconnected)</span>
+							Installed Games <span id="library-status" style="color: #ff4444; font-size: 14px; margin-left: 10px;">(Disconnected)</span><span id="library-auto-scan-status" aria-live="polite"></span>
 						</div>
 						
 						<div style="display: flex; align-items: center; gap: 20px;">
@@ -6162,6 +6166,19 @@ a:focus, button:focus, select:focus, input:focus, textarea:focus, [contenteditab
 					</div>
 					<label class="switch">
 						<input type="checkbox" id="companion-plugin-toggle" onchange="toggleCompanionPlugin()" checked>
+						<span class="slider"></span>
+					</label>
+				</div>
+				
+				<div class="setting-item" id="automatic-library-scan-setting" onmouseenter="playUiHover()">
+					<div>
+						<div style="font-size: 18px; color: #fff; font-weight: 500;">Automatic Library Scan</div>
+						<div style="font-size: 13px; color: var(--text-muted); margin-top: 6px;">
+							Automatically scan for installed games when the console connects or Library is opened. Manual Scan Games and Refresh UI remain available when disabled.
+						</div>
+					</div>
+					<label class="switch">
+						<input type="checkbox" id="automatic-library-scan-toggle" onchange="toggleAutomaticLibraryScan()" checked>
 						<span class="slider"></span>
 					</label>
 				</div>
@@ -8200,6 +8217,47 @@ P
 		else playUiSwitchOff();
 		if (typeof broadcastProfileUpdate === 'function') broadcastProfileUpdate();
 	}
+
+	function isAutomaticLibraryScanEnabled() {
+		return loadState(STORAGE_KEY_AUTO_LIBRARY_SCAN) !== "0";
+	}
+	window.isAutomaticLibraryScanEnabled = isAutomaticLibraryScanEnabled;
+
+	function updateAutomaticLibraryScanStatus(connectedOverride = null) {
+		const status = document.getElementById('library-auto-scan-status');
+		if (!status) return;
+
+		const globalIcon = document.getElementById('global-status-icon');
+		const connected = connectedOverride == null
+			? !!((typeof isPs3CurrentlyConnected === 'function' && isPs3CurrentlyConnected()) || (globalIcon && globalIcon.classList.contains('status-dot-connected')))
+			: !!connectedOverride;
+
+		status.classList.remove('is-visible', 'is-enabled', 'is-disabled');
+		if (!connected) {
+			status.textContent = '';
+			return;
+		}
+
+		const enabled = isAutomaticLibraryScanEnabled();
+		status.textContent = enabled ? '(Automatic Scan: Enabled)' : '(Automatic Scan: Disabled)';
+		status.classList.add('is-visible', enabled ? 'is-enabled' : 'is-disabled');
+	}
+	window.updateAutomaticLibraryScanStatus = updateAutomaticLibraryScanStatus;
+
+	window.toggleAutomaticLibraryScan = function() {
+		const toggle = document.getElementById('automatic-library-scan-toggle');
+		const enabled = !!(toggle && toggle.checked);
+		saveState(STORAGE_KEY_AUTO_LIBRARY_SCAN, enabled ? "1" : "0");
+		updateAutomaticLibraryScanStatus();
+		if (!enabled) window.__pendingLibraryAutoScan = false;
+		if (typeof markProfileSettingsChanged === 'function') markProfileSettingsChanged();
+		if (enabled) playUiSwitchOn();
+		else playUiSwitchOff();
+		if (typeof broadcastProfileUpdate === 'function') broadcastProfileUpdate();
+		if (enabled && typeof isPs3CurrentlyConnected === 'function' && isPs3CurrentlyConnected() && typeof shouldRunAutomaticPs3Scan === 'function' && shouldRunAutomaticPs3Scan()) {
+			setTimeout(() => scanConsoleAndReload(true), 0);
+		}
+	};
 	
 	/* UI effects use pre-decoded Web Audio buffers so short navigation sounds are not
 	   delayed by HTMLMediaElement scheduling while the next view is being rendered. */
@@ -8978,6 +9036,9 @@ P
 
 		let companionToggle = document.getElementById('companion-plugin-toggle');
 		if (companionToggle) companionToggle.checked = (loadState(STORAGE_KEY_COMPANION_PLUGIN) !== "0");
+		let automaticLibraryScanToggle = document.getElementById('automatic-library-scan-toggle');
+		if (automaticLibraryScanToggle) automaticLibraryScanToggle.checked = (loadState(STORAGE_KEY_AUTO_LIBRARY_SCAN) !== "0");
+		if (typeof updateAutomaticLibraryScanStatus === 'function') updateAutomaticLibraryScanStatus();
 		if (typeof ensureFpsCounterDefaultOff === 'function') ensureFpsCounterDefaultOff();
 		if (typeof updateCompanionPluginStatus === 'function') updateCompanionPluginStatus();
 		if (typeof updateFpsCounterStatus === 'function') updateFpsCounterStatus();
@@ -9057,6 +9118,7 @@ P
 	const STORAGE_KEY_COMPANION_PLUGIN = "psn_companion_plugin_enabled";
 	const STORAGE_KEY_FPS_COUNTER = "psn_fps_counter_enabled";
 	const STORAGE_KEY_FPS_COUNTER_DEFAULT_OFF_MIGRATION = "psn_fps_counter_default_off_v1";
+	const STORAGE_KEY_AUTO_LIBRARY_SCAN = "psn_auto_library_scan_enabled";
 	const STORAGE_KEY_CONSOLE_FAN_MODE = "psn_console_fan_mode";
 	const STORAGE_KEY_CONSOLE_FAN_SPEED = "psn_console_fan_speed";
 	const STORAGE_KEY_CONSOLE_FAN_TARGET = "psn_console_fan_target_temp";
@@ -10336,6 +10398,7 @@ P
 			ps3Ip: loadState('ps3_ip') || "",
 			companionPlugin: (loadState(STORAGE_KEY_COMPANION_PLUGIN) !== "0") ? "1" : "0",
 			fpsCounterPlugin: (loadState(STORAGE_KEY_FPS_COUNTER) === "1") ? "1" : "0",
+			automaticLibraryScan: (loadState(STORAGE_KEY_AUTO_LIBRARY_SCAN) !== "0") ? "1" : "0",
 			consoleFanMode: loadState(STORAGE_KEY_CONSOLE_FAN_MODE) || "dynamic",
 			consoleFanSpeed: loadState(STORAGE_KEY_CONSOLE_FAN_SPEED) || "35",
 			consoleFanTarget: loadState(STORAGE_KEY_CONSOLE_FAN_TARGET) || "68",
@@ -10515,7 +10578,12 @@ P
 					try {
 						const fpsToggle = document.getElementById('fps-counter-toggle');
 						if (fpsToggle) fpsToggle.checked = next.fpsCounterPlugin === "1";
-						await window.toggleFpsCounter(next.fpsCounterPlugin === "1");
+						await window.toggleFpsCounter(next.fpsCounterPlugin === "1", {
+							persistPreference: false,
+							playSound: false,
+							notify: false,
+							reason: 'profile-sync'
+						});
 					} catch (err) {
 						console.warn('[PROFILE SYNC] FPS Counter action failed:', err);
 						if (typeof updateFpsCounterStatus === 'function') updateFpsCounterStatus();
@@ -10541,6 +10609,7 @@ P
 			interfaceAutoTranslate: readSyncedSettingForUser(name, STORAGE_KEY_INTERFACE_AUTO_TRANSLATE, "1") !== "0" ? "1" : "0",
 			companionPlugin: (readSyncedSettingForUser(name, STORAGE_KEY_COMPANION_PLUGIN, "1") !== "0") ? "1" : "0",
 			fpsCounterPlugin: (readSyncedSettingForUser(name, STORAGE_KEY_FPS_COUNTER, "0") === "1") ? "1" : "0",
+			automaticLibraryScan: (readSyncedSettingForUser(name, STORAGE_KEY_AUTO_LIBRARY_SCAN, "1") !== "0") ? "1" : "0",
 			consoleFanMode: readSyncedSettingForUser(name, STORAGE_KEY_CONSOLE_FAN_MODE, "dynamic") || "dynamic",
 			consoleFanSpeed: readSyncedSettingForUser(name, STORAGE_KEY_CONSOLE_FAN_SPEED, "35") || "35",
 			consoleFanTarget: readSyncedSettingForUser(name, STORAGE_KEY_CONSOLE_FAN_TARGET, "68") || "68",
@@ -10561,6 +10630,7 @@ P
 			ps3Ip: normalizeSyncedTextValue(incomingSettings.ps3Ip, ""),
 			companionPlugin: normalizeSyncedToggleValue(incomingSettings.companionPlugin, previous.companionPlugin || "1"),
 			fpsCounterPlugin: normalizeSyncedToggleValue(incomingSettings.fpsCounterPlugin ?? incomingSettings.fpsCounter, previous.fpsCounterPlugin || "0"),
+			automaticLibraryScan: normalizeSyncedToggleValue(incomingSettings.automaticLibraryScan ?? incomingSettings.autoLibraryScan, previous.automaticLibraryScan || "1"),
 			consoleFanMode: normalizeSyncedConsoleFanMode(incomingSettings.consoleFanMode || previous.consoleFanMode || "dynamic"),
 			consoleFanSpeed: String(Math.round(clampSyncedNumber(incomingSettings.consoleFanSpeed, previous.consoleFanSpeed || 35, 20, 95))),
 			consoleFanTarget: String(Math.round(clampSyncedNumber(incomingSettings.consoleFanTarget, previous.consoleFanTarget || 68, 50, 90))),
@@ -10595,6 +10665,7 @@ P
 		writeSyncedSettingForUser(name, STORAGE_KEY_COMPANION_PLUGIN, next.companionPlugin);
 		writeSyncedSettingForUser(name, STORAGE_KEY_FPS_COUNTER, next.fpsCounterPlugin);
 		writeSyncedSettingForUser(name, STORAGE_KEY_FPS_COUNTER_DEFAULT_OFF_MIGRATION, "1");
+		writeSyncedSettingForUser(name, STORAGE_KEY_AUTO_LIBRARY_SCAN, next.automaticLibraryScan);
 		writeSyncedSettingForUser(name, STORAGE_KEY_CONSOLE_FAN_MODE, next.consoleFanMode);
 		writeSyncedSettingForUser(name, STORAGE_KEY_CONSOLE_FAN_SPEED, next.consoleFanSpeed);
 		writeSyncedSettingForUser(name, STORAGE_KEY_CONSOLE_FAN_TARGET, next.consoleFanTarget);
@@ -10628,6 +10699,7 @@ P
 		const interfaceAutoTranslateToggle = document.getElementById('interface-auto-translate-toggle');
 		const companionToggle = document.getElementById('companion-plugin-toggle');
 		const fpsCounterToggle = document.getElementById('fps-counter-toggle');
+		const automaticLibraryScanToggle = document.getElementById('automatic-library-scan-toggle');
 		const ipInput = document.getElementById('ps3-ip');
 
 		if (audioToggle) audioToggle.checked = next.audio !== "0";
@@ -10640,6 +10712,9 @@ P
 		if (interfaceAutoTranslateToggle) interfaceAutoTranslateToggle.checked = next.interfaceAutoTranslate === "1";
 		if (companionToggle) companionToggle.checked = next.companionPlugin !== "0";
 		if (fpsCounterToggle) fpsCounterToggle.checked = next.fpsCounterPlugin === "1";
+		if (automaticLibraryScanToggle) automaticLibraryScanToggle.checked = next.automaticLibraryScan !== "0";
+		if (next.automaticLibraryScan === "0") window.__pendingLibraryAutoScan = false;
+		if (typeof updateAutomaticLibraryScanStatus === 'function') updateAutomaticLibraryScanStatus();
 		if (ipInput) ipInput.value = next.ps3Ip;
 
 		applySyncedBackgroundMusic(next.audio !== "0");
@@ -11769,6 +11844,7 @@ P
 					ps3Ip: "",
 					companionPlugin: "1",
 					fpsCounterPlugin: "0",
+					automaticLibraryScan: "1",
 					consoleFanMode: "dynamic",
 					consoleFanSpeed: "35",
 					consoleFanTarget: "68",
@@ -31237,6 +31313,10 @@ P
 	}
 
 	function shouldRunAutomaticPs3Scan() {
+		if (typeof isAutomaticLibraryScanEnabled === 'function' && !isAutomaticLibraryScanEnabled()) {
+			window.__pendingLibraryAutoScan = false;
+			return false;
+		}
 		const now = Date.now();
 		const cachedGames = Array.isArray(window.lastScannedGames)
 			? window.lastScannedGames
@@ -31591,6 +31671,7 @@ P
 
 	function onConnectionChanged(isConnected) {
 		syncBrowseRemoteDownloadStatusFromIpDot();
+		if (typeof updateAutomaticLibraryScanStatus === 'function') updateAutomaticLibraryScanStatus(isConnected);
 		if (typeof window.refreshVisibleFavoriteCardsFromProfileSync === 'function') window.refreshVisibleFavoriteCardsFromProfileSync();
 
 		if (!isVisibleConsoleLibrarySection('view-library')) return;
@@ -31625,12 +31706,18 @@ P
 		connectionMonitorTimer = setInterval(pingConsole, 5000);
 	}
 	
-		function sendConnectionPopup(ip) {
+	function sendConnectionPopup(ip) {
+		if (!ip || window.__ps3ConnectionPopupSentThisSession) return false;
+		window.__ps3ConnectionPopupSentThisSession = true;
+
 		const message = "PlayStation%20Network%20Database:%20Connected!";
 		const url = `http://${ip}/popup.ps3?${message}&icon=0&snd=8`;
-		
-		fetch(url, { mode: 'no-cors' })
-			.catch(err => console.error("Error sending popup:", err));
+
+		fetch(url, { mode: 'no-cors' }).catch(err => {
+			window.__ps3ConnectionPopupSentThisSession = false;
+			console.error("Error sending popup:", err);
+		});
+		return true;
 	}
 	
 
@@ -35657,8 +35744,8 @@ function formatLibraryLastPlayedBadge(game = {}) {
 	}
 
 
-	async function fetchConsoleReadableText(path, timeoutMs = 12000) {
-		const ip = getCurrentPs3Ip();
+	async function fetchConsoleReadableText(path, timeoutMs = 12000, ipOverride = '') {
+		const ip = String(ipOverride || getCurrentPs3Ip() || '').trim();
 		if (!ip) throw new Error('PS3 IP is empty.');
 		const cleanPath = String(path || '/').startsWith('/') ? String(path || '/') : `/${path}`;
 		const controller = (typeof AbortController !== 'undefined') ? new AbortController() : null;
@@ -35900,6 +35987,8 @@ function formatLibraryLastPlayedBadge(game = {}) {
 	let fpsCounterPluginLoaded = false;
 	let fpsCounterPluginStateChecked = false;
 	let fpsCounterPluginSlot = null;
+	let fpsCounterResolvedPluginPath = '';
+	let fpsCounterConnectSyncPromise = null;
 
 	function normalizeConsolePluginPath(path) {
 		return String(path || '')
@@ -35916,8 +36005,20 @@ function formatLibraryLastPlayedBadge(game = {}) {
 		return companionPluginPs3ProDetected ? FPS_COUNTER_PRO_PLUGIN_PATH : FPS_COUNTER_PLUGIN_PATH;
 	}
 
+	function getFpsCounterPluginCandidatePaths() {
+		return Array.from(new Set([
+			getFpsCounterPluginPath(),
+			FPS_COUNTER_PRO_PLUGIN_PATH,
+			FPS_COUNTER_PLUGIN_PATH
+		].filter(Boolean)));
+	}
+
+	function getResolvedFpsCounterPluginPath() {
+		return fpsCounterResolvedPluginPath || getFpsCounterPluginPath();
+	}
+
 	function getFpsCounterPluginName() {
-		return getFpsCounterPluginPath().split('/').pop() || 'VshFpsCounter.sprx';
+		return getResolvedFpsCounterPluginPath().split('/').pop() || 'VshFpsCounter.sprx';
 	}
 
 	function findFpsCounterPluginInList(plugins = []) {
@@ -35942,46 +36043,48 @@ function formatLibraryLastPlayedBadge(game = {}) {
 		}) || null;
 	}
 
-	function setFpsCounterRuntimeState({ detected = false, loaded = false, slot = null, stateChecked = false } = {}) {
+	function setFpsCounterRuntimeState({ detected = false, loaded = false, slot = null, stateChecked = false, path = '' } = {}) {
 		fpsCounterPluginDetected = !!detected;
 		fpsCounterPluginLoaded = !!loaded;
 		fpsCounterPluginSlot = (Number.isFinite(Number(slot)) && Number(slot) >= 0) ? Number(slot) : null;
 		fpsCounterDetectionChecked = true;
 		fpsCounterPluginStateChecked = !!stateChecked;
+		if (path) fpsCounterResolvedPluginPath = String(path).replace(/\\/g, '/');
 
-		if (fpsCounterPluginDetected && fpsCounterPluginStateChecked) {
-			saveState(STORAGE_KEY_FPS_COUNTER, fpsCounterPluginLoaded ? '1' : '0');
-			if (typeof syncRuntimePluginPreferencesToServer === 'function') syncRuntimePluginPreferencesToServer();
-		}
-
+		// Runtime detection must never overwrite the saved/profile preference.
 		updateFpsCounterStatus();
 	}
 
-	function syncFpsCounterFromPluginList(plugins = [], detectedOverride = null) {
+	function syncFpsCounterFromPluginList(plugins = [], detectedOverride = null, detectedPath = '') {
 		const plugin = findFpsCounterPluginInList(plugins);
 		const detected = (detectedOverride === null || typeof detectedOverride === 'undefined') ? !!plugin : (!!detectedOverride || !!plugin);
 		const loaded = !!(plugin && plugin.active);
 		const slot = plugin ? plugin.slot : null;
+		const path = (plugin && plugin.path) ? plugin.path : (detectedPath || (detected ? fpsCounterResolvedPluginPath : ''));
 
 		setFpsCounterRuntimeState({
 			detected,
 			loaded,
 			slot,
-			stateChecked: Array.isArray(plugins) && plugins.length > 0
+			stateChecked: Array.isArray(plugins) && plugins.length > 0,
+			path
 		});
 
-		return { detected: fpsCounterPluginDetected, loaded: fpsCounterPluginLoaded, slot: fpsCounterPluginSlot };
+		return { detected: fpsCounterPluginDetected, loaded: fpsCounterPluginLoaded, slot: fpsCounterPluginSlot, path: fpsCounterResolvedPluginPath };
 	}
 	window.syncFpsCounterFromPluginList = syncFpsCounterFromPluginList;
 
-	function isFpsCounterEnabled() {
+	function isFpsCounterDesiredEnabled() {
 		if (typeof ensureFpsCounterDefaultOff === 'function') ensureFpsCounterDefaultOff();
+		return loadState(STORAGE_KEY_FPS_COUNTER) === "1";
+	}
 
+	function isFpsCounterEnabled() {
 		if (typeof isPs3CurrentlyConnected === 'function' && isPs3CurrentlyConnected() && fpsCounterDetectionChecked && fpsCounterPluginStateChecked) {
 			return !!fpsCounterPluginLoaded;
 		}
 
-		return loadState(STORAGE_KEY_FPS_COUNTER) === "1";
+		return isFpsCounterDesiredEnabled();
 	}
 
 	function isFpsCounterMissingOnConnected() {
@@ -35997,12 +36100,13 @@ function formatLibraryLastPlayedBadge(game = {}) {
 		const control = document.getElementById('fps-counter-control');
 		const status = document.getElementById('fps-counter-status');
 		const enabled = isFpsCounterEnabled();
+		const desired = isFpsCounterDesiredEnabled();
 		const missing = isFpsCounterMissingOnConnected();
 		const unknown = isFpsCounterStateUnknownOnConnected();
 
 		if (toggle) {
-			toggle.checked = missing ? false : enabled;
-			toggle.disabled = !!busy || missing;
+			toggle.checked = missing ? desired : enabled;
+			toggle.disabled = !!busy;
 		}
 
 		if (control) {
@@ -36010,7 +36114,7 @@ function formatLibraryLastPlayedBadge(game = {}) {
 			control.classList.toggle('is-busy', !!busy);
 			control.classList.toggle('is-missing', missing);
 			if (missing) {
-				control.title = `FPS Counter plugin was not found at ${getFpsCounterPluginPath()}.`;
+				control.title = `FPS Counter plugin was not found. Saved preference: ${desired ? 'ON' : 'OFF'}.`;
 			} else if (unknown) {
 				control.title = `${getFpsCounterPluginName()} exists, but the active state could not be read from Plugin Manager.`;
 			} else {
@@ -36030,27 +36134,41 @@ function formatLibraryLastPlayedBadge(game = {}) {
 		if (!ip) return { read: false, plugins: [] };
 
 		const pluginPages = ['/home.ps3mapi/sman.ps3', '/home.ps3mapi', '/sman.ps3?', '/ps3mapi.ps3'];
+		let bestPlugins = [];
+		let pageRead = false;
+
 		for (const page of pluginPages) {
 			try {
-				const html = await fetchConsoleReadableText(page, 9000);
+				const html = await fetchConsoleReadableText(page, 9000, ip);
 				const plugins = parseConsolePluginListFromWebmanHtml(html);
-				if (plugins && plugins.length) return { read: true, plugins };
+				if (!plugins || !plugins.length) continue;
+				pageRead = true;
+				if (!bestPlugins.length) bestPlugins = plugins;
+				const fpsPlugin = findFpsCounterPluginInList(plugins);
+				if (fpsPlugin) {
+					bestPlugins = plugins;
+					if (fpsPlugin.active) return { read: true, plugins };
+				}
 			} catch (err) {
 				console.warn(`[FPS Counter] Plugin Manager page failed: ${page}`, err);
 			}
 		}
 
+		if (pageRead) return { read: true, plugins: bestPlugins };
+
 		try {
 			const plugins = [];
+			let successfulReads = 0;
 			for (const slot of CONSOLE_VSH_PLUGIN_SLOTS) {
 				try {
-					const raw = await fetchConsoleReadableText(buildPs3MapiCommand(`MODULE GETVSHPLUGINFO ${slot}`), 6000);
+					const raw = await fetchConsoleReadableText(buildPs3MapiCommand(`MODULE GETVSHPLUGINFO ${slot}`), 6000, ip);
 					plugins.push(parseConsolePluginInfo(raw, slot));
+					successfulReads++;
 				} catch (_) {
 					plugins.push({ slot, name: `Empty slot ${slot}`, path: 'Available VSH plugin slot', active: false });
 				}
 			}
-			return { read: true, plugins };
+			return { read: successfulReads > 0, plugins };
 		} catch (err) {
 			console.warn('[FPS Counter] Could not read Plugin Manager state:', err);
 			return { read: false, plugins: [] };
@@ -36064,25 +36182,32 @@ function formatLibraryLastPlayedBadge(game = {}) {
 			fpsCounterPluginLoaded = false;
 			fpsCounterPluginStateChecked = false;
 			fpsCounterPluginSlot = null;
+			fpsCounterResolvedPluginPath = '';
 			updateFpsCounterStatus();
-			return { detected: false, loaded: false, stateChecked: false, slot: null };
+			return { detected: false, loaded: false, stateChecked: false, slot: null, path: '' };
 		}
 
 		if (!silent) updateFpsCounterStatus('<i class="fas fa-circle-notch fa-spin"></i>', '#ffcc00', true);
 
 		let detected = false;
-		try {
-			detected = await companionFileExists(ip, getFpsCounterPluginPath());
-		} catch (_) {
-			detected = false;
+		let detectedPath = '';
+		for (const candidatePath of getFpsCounterPluginCandidatePaths()) {
+			try {
+				if (await companionFileExists(ip, candidatePath)) {
+					detected = true;
+					detectedPath = candidatePath;
+					break;
+				}
+			} catch (_) {}
 		}
 
 		const managerState = await readFpsCounterPluginStateFromManager(ip);
-		const synced = syncFpsCounterFromPluginList(managerState.plugins || [], detected);
+		const synced = syncFpsCounterFromPluginList(managerState.plugins || [], detected, detectedPath);
 		fpsCounterPluginStateChecked = !!managerState.read;
 
 		if (!detected && !synced.loaded) {
-			console.warn(`[FPS Counter] Plugin not found at ${getFpsCounterPluginPath()}`);
+			fpsCounterResolvedPluginPath = '';
+			console.warn(`[FPS Counter] Plugin not found at known FPS Counter paths.`);
 		}
 
 		updateFpsCounterStatus();
@@ -36090,7 +36215,8 @@ function formatLibraryLastPlayedBadge(game = {}) {
 			detected: fpsCounterPluginDetected,
 			loaded: fpsCounterPluginLoaded,
 			stateChecked: fpsCounterPluginStateChecked,
-			slot: fpsCounterPluginSlot
+			slot: fpsCounterPluginSlot,
+			path: fpsCounterResolvedPluginPath
 		};
 	}
 
@@ -36107,69 +36233,91 @@ function formatLibraryLastPlayedBadge(game = {}) {
 		return true;
 	}
 
-	window.toggleFpsCounter = async function(forceState = null) {
-		if (fpsCounterBusy) return;
-
+	window.toggleFpsCounter = async function(forceState = null, options = {}) {
 		const toggle = document.getElementById('fps-counter-toggle');
 		const enabled = (typeof forceState === 'boolean') ? forceState : !!(toggle && toggle.checked);
-		saveState(STORAGE_KEY_FPS_COUNTER_DEFAULT_OFF_MIGRATION, "1");
-		if (typeof markProfileSettingsChanged === 'function') markProfileSettingsChanged();
+		const persistPreference = options.persistPreference !== false;
+		const playSound = options.playSound !== false;
+		const notify = options.notify !== false;
 
-		if (enabled) {
-			if (typeof playUiSwitchOn === 'function') playUiSwitchOn();
-		} else if (typeof playUiSwitchOff === 'function') {
-			playUiSwitchOff();
+		if (persistPreference) {
+			saveState(STORAGE_KEY_FPS_COUNTER_DEFAULT_OFF_MIGRATION, "1");
+			saveState(STORAGE_KEY_FPS_COUNTER, enabled ? "1" : "0");
+			if (typeof markProfileSettingsChanged === 'function') markProfileSettingsChanged();
+			if (typeof syncRuntimePluginPreferencesToServer === 'function') syncRuntimePluginPreferencesToServer();
 		}
 
+		if (fpsCounterBusy) {
+			updateFpsCounterStatus();
+			return false;
+		}
+
+		if (playSound) {
+			if (enabled) {
+				if (typeof playUiSwitchOn === 'function') playUiSwitchOn();
+			} else if (typeof playUiSwitchOff === 'function') {
+				playUiSwitchOff();
+			}
+		}
+
+		const ip = getCurrentPs3Ip();
+		if (!ip) {
+			updateFpsCounterStatus();
+			return enabled;
+		}
 
 		fpsCounterBusy = true;
 		updateFpsCounterStatus('<i class="fas fa-circle-notch fa-spin"></i>', '#ffcc00', true);
 
 		try {
-			const before = await refreshFpsCounterRuntimeState(getCurrentPs3Ip(), true);
+			const before = await refreshFpsCounterRuntimeState(ip, true);
 			if (!before.detected) {
-				saveState(STORAGE_KEY_FPS_COUNTER, '0');
-				if (typeof syncRuntimePluginPreferencesToServer === 'function') syncRuntimePluginPreferencesToServer();
-				if (toggle) toggle.checked = false;
+				if (toggle) toggle.checked = isFpsCounterDesiredEnabled();
 				updateFpsCounterStatus('MISSING', '#ff7777', false);
-				if (typeof playUiError === 'function') playUiError();
-				if (typeof showToastNotification === 'function') {
-					showToastNotification('FPS Counter', `${getFpsCounterPluginName()} was not found at ${getFpsCounterPluginPath()}.`);
+				if (playSound && typeof playUiError === 'function') playUiError();
+				if (notify && typeof showToastNotification === 'function') {
+					showToastNotification('FPS Counter', `FPS Counter plugin was not found on the PS3™. Preference ${enabled ? 'ON' : 'OFF'} was saved.`);
 				}
-				return;
+				return false;
 			}
 
+			if (before.stateChecked && before.loaded === enabled) {
+				updateFpsCounterStatus(enabled ? 'ON' : 'OFF', enabled ? '#4caf50' : 'var(--text-muted)', false);
+				return true;
+			}
+
+			const commandPath = before.path || getResolvedFpsCounterPluginPath();
 			if (enabled) {
-				await sendFpsCounterCommand(`/loadprx_ps3${getFpsCounterPluginPath()}`);
+				await sendFpsCounterCommand(`/loadprx_ps3${commandPath}`);
 				await sendFpsCounterCommand('/popup.ps3?FPS%20Counter%20ON&icon=0&snd=8');
 
 				setFpsCounterRuntimeState({
 					detected: true,
 					loaded: true,
 					slot: before.slot,
-					stateChecked: before.stateChecked
+					stateChecked: before.stateChecked,
+					path: commandPath
 				});
 				updateFpsCounterStatus('ON', '#4caf50', false);
-				if (typeof showToastNotification === 'function') {
+				if (notify && typeof showToastNotification === 'function') {
 					showToastNotification('FPS Counter', `${getFpsCounterPluginName()} load command sent to PS3™.`);
 				}
 			} else {
-				await sendFpsCounterCommand(`/unloadprx.ps3${getFpsCounterPluginPath()}`);
+				await sendFpsCounterCommand(`/unloadprx.ps3${commandPath}`);
 				await sendFpsCounterCommand('/popup.ps3?FPS%20Counter%20OFF&icon=0&snd=8');
 
 				setFpsCounterRuntimeState({
 					detected: true,
 					loaded: false,
 					slot: null,
-					stateChecked: before.stateChecked
+					stateChecked: before.stateChecked,
+					path: commandPath
 				});
 				updateFpsCounterStatus('OFF', 'var(--text-muted)', false);
-				if (typeof showToastNotification === 'function') {
+				if (notify && typeof showToastNotification === 'function') {
 					showToastNotification('FPS Counter', `${getFpsCounterPluginName()} unload command sent to PS3™.`);
 				}
 			}
-
-			if (typeof syncRuntimePluginPreferencesToServer === 'function') syncRuntimePluginPreferencesToServer();
 
 			setTimeout(async () => {
 				try {
@@ -36179,44 +36327,81 @@ function formatLibraryLastPlayedBadge(game = {}) {
 					console.warn('[FPS Counter] Delayed state verification failed:', verifyErr);
 				}
 			}, enabled ? 2600 : 1400);
+			return true;
 		} catch (err) {
 			console.warn('[FPS Counter] Command failed:', err);
 			await refreshFpsCounterRuntimeState(getCurrentPs3Ip(), true).catch(() => {});
 			updateFpsCounterStatus('ERROR', '#ff7777', false);
 			if (toggle) toggle.checked = isFpsCounterEnabled();
-			if (typeof playUiError === 'function') playUiError();
-			if (typeof showToastNotification === 'function') {
+			if (playSound && typeof playUiError === 'function') playUiError();
+			if (notify && typeof showToastNotification === 'function') {
 				showToastNotification('FPS Counter', 'Could not send or verify the FPS Counter command.');
-			} else if (typeof showNotification === 'function') {
+			} else if (notify && typeof showNotification === 'function') {
 				showNotification('Could not send or verify the FPS Counter command.', 'error');
 			}
+			return false;
 		} finally {
 			fpsCounterBusy = false;
 			updateFpsCounterStatus();
 		}
 	};
 
-	window.syncFpsCounterOnConnect = async function(ip = getCurrentPs3Ip()) {
-		updateFpsCounterStatus();
-		if (!ip) return false;
+	window.syncFpsCounterOnConnect = function(ip = getCurrentPs3Ip()) {
+		if (fpsCounterConnectSyncPromise) return fpsCounterConnectSyncPromise;
 
-		try {
-			updateFpsCounterStatus('<i class="fas fa-circle-notch fa-spin"></i>', '#ffcc00', true);
-			await companionSleep(700);
-			const state = await refreshFpsCounterRuntimeState(ip, true);
+		fpsCounterConnectSyncPromise = (async () => {
+			updateFpsCounterStatus();
+			ip = String(ip || getCurrentPs3Ip() || '').trim();
+			if (!ip) return false;
 
-			if (!state.detected) {
-				updateFpsCounterStatus('MISSING', '#ff7777', false);
+			const desired = isFpsCounterDesiredEnabled();
+			try {
+				updateFpsCounterStatus('<i class="fas fa-circle-notch fa-spin"></i>', '#ffcc00', true);
+
+				// webMAN can report the console as online a little before PS3MAPI's plugin
+				// table is readable. Read it in the background on connect and retry briefly
+				// instead of depending on the System Monitor tab being opened later.
+				let state = null;
+				const retryDelays = [450, 1100, 1900];
+				for (let attempt = 0; attempt < retryDelays.length; attempt++) {
+					await companionSleep(retryDelays[attempt]);
+					state = await refreshFpsCounterRuntimeState(ip, true);
+					if (state.stateChecked) break;
+				}
+
+				if (!state) return false;
+
+				if (!state.detected) {
+					updateFpsCounterStatus('MISSING', '#ff7777', false);
+					return false;
+				}
+
+				if (!state.stateChecked) {
+					updateFpsCounterStatus('READY', '#ffcc00', false);
+					return !!state.loaded;
+				}
+
+				if (state.loaded !== desired) {
+					await window.toggleFpsCounter(desired, {
+						persistPreference: false,
+						playSound: false,
+						notify: false
+					});
+					return desired;
+				}
+
+				updateFpsCounterStatus(state.loaded ? 'ON' : 'OFF', state.loaded ? '#4caf50' : 'var(--text-muted)', false);
+				return !!state.loaded;
+			} catch (err) {
+				console.warn('[FPS Counter] Could not reconcile saved preference with Plugin Manager state on connect:', err);
+				updateFpsCounterStatus('ERROR', '#ff7777', false);
 				return false;
+			} finally {
+				fpsCounterConnectSyncPromise = null;
 			}
+		})();
 
-			updateFpsCounterStatus(state.loaded ? 'ON' : 'OFF', state.loaded ? '#4caf50' : 'var(--text-muted)', false);
-			return !!state.loaded;
-		} catch (err) {
-			console.warn('[FPS Counter] Could not sync Plugin Manager state on connect:', err);
-			updateFpsCounterStatus('ERROR', '#ff7777', false);
-			return false;
-		}
+		return fpsCounterConnectSyncPromise;
 	};
 
 	window.refreshFpsCounterRuntimeState = refreshFpsCounterRuntimeState;
@@ -36395,6 +36580,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 	else {
 		nextView = gamesView;
 		navGames?.classList.add('active');
+		if (typeof updateAutomaticLibraryScanStatus === 'function') updateAutomaticLibraryScanStatus(isConnected);
 		
 		if (searchBar) {
 			searchBar.style.display = isConnected ? 'flex' : 'none';
@@ -36522,7 +36708,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 			syncBrowseRemoteDownloadStatusFromIpDot();
 	
 			playUiSuccess();
-			if (!suppressSuccess) sendConnectionPopup(ip);
+			sendConnectionPopup(ip);
 			
 			if (!suppressSuccess) {
 				showToastNotification(
