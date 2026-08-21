@@ -1005,6 +1005,7 @@ select option { background-color: var(--bg-dark); }
 .download-swipe-row { position: relative; flex: 0 0 auto; width: 100%; min-width: 0; overflow: visible; border-radius: 6px; transition: opacity .22s ease,filter .22s ease; }
 .download-swipe-row:hover { z-index: 10; }
 .download-swipe-content { position: relative; z-index: 2; width: 100%; min-width: 0; transition: transform .28s cubic-bezier(.2,.8,.2,1); touch-action: pan-y; }
+.download-swipe-row.is-swipe-hinting .download-swipe-content { transition: transform .82s cubic-bezier(.16,1,.3,1); }
 .download-swipe-content .download-item { margin-top: 0 !important; }
 .download-swipe-content img { -webkit-user-drag: none; user-select: none; }
 .download-swipe-action { position: absolute; z-index: 1; top: 0; right: 0; width: 82px; height: 100%; display: flex; align-items: stretch; justify-content: stretch; overflow: hidden; border-radius: 0 6px 6px 0; background: linear-gradient(135deg,#d83248,#ff4444); opacity: 0; transition: opacity .12s ease; }
@@ -1025,6 +1026,9 @@ select option { background-color: var(--bg-dark); }
 #downloads-list .download-swipe-row.is-open .download-item:hover::before, #downloads-list .download-swipe-row.is-swiping .download-item:hover::before { animation: none !important; }
 #downloads-list .download-swipe-row.is-open .download-item[class*="dl-kind-"]:hover::after, #downloads-list .download-swipe-row.is-swiping .download-item[class*="dl-kind-"]:hover::after { width: 3px !important; opacity: .95 !important; }
 .download-swipe-row.is-removing { pointer-events: none; overflow: hidden; transition: height .24s ease,opacity .2s ease,margin .24s ease,transform .24s ease; }
+.download-swipe-hint { display: flex; align-items: center; justify-content: flex-end; gap: 7px; max-height: 0; margin: 0 2px; overflow: hidden; color: rgba(255,255,255,.58); font-size: 11px; font-weight: 700; letter-spacing: .15px; opacity: 0; transform: translateY(-5px); transition: max-height .28s ease,margin .28s ease,opacity .22s ease,transform .28s ease; pointer-events: none; }
+.download-swipe-hint i { color: rgba(255,92,108,.88); font-size: 10px; }
+.download-swipe-hint.is-visible { max-height: 26px; margin: 0 2px 8px; opacity: .92; transform: translateY(0); }
 
 .dl-date { font-size: 11px; color: var(--text-muted); font-family: monospace; }
 
@@ -5415,6 +5419,10 @@ a:focus, button:focus, select:focus, input:focus, textarea:focus, [contenteditab
 					</button>
 				</div>
 			
+				<div id="download-swipe-hint" class="download-swipe-hint" aria-live="polite">
+					<i class="fas fa-arrow-left"></i>
+					<span>Swipe or drag left to remove an item</span>
+				</div>
 				<div class="downloads-list" id="downloads-list" style="margin-top: 10px; display: flex; flex-direction: column; gap: 12px; max-height: 60vh; overflow-y: auto; overflow-x: hidden; padding-right: 0; scrollbar-width: thin;">
 					<div style="text-align: center; color: #888; padding: 100px 50px; background: rgba(0,0,0,0.2); border-radius: 12px; border: 1px dashed rgba(255,255,255,0.05); margin-top: 10px;">
 						<i class="fas fa-download" style="font-size: 50px; margin-bottom: 20px; opacity: 0.2;"></i>
@@ -23873,7 +23881,94 @@ P
 	window.refreshFavoritesSummaryUI = refreshFavoritesSummaryUI;
 
     const DOWNLOAD_SWIPE_REVEAL_PX = 82;
+    const DOWNLOAD_SWIPE_HINT_PEEK_PX = 82;
+    let downloadSwipeHintSeenThisVisit = false;
     let downloadSwipeDragState = null;
+    let downloadSwipeHintTimer = null;
+    let downloadSwipeHintReturnTimer = null;
+    let downloadSwipeHintHideTimer = null;
+    let downloadSwipeHintSoundTimer = null;
+    let downloadSwipeHintRow = null;
+
+    function hideDownloadSwipeHint() {
+        const hint = document.getElementById('download-swipe-hint');
+        if (hint) hint.classList.remove('is-visible');
+    }
+
+    function cancelDownloadSwipeHintPreview(resetRow = true) {
+        clearTimeout(downloadSwipeHintTimer);
+        clearTimeout(downloadSwipeHintReturnTimer);
+        clearTimeout(downloadSwipeHintHideTimer);
+        clearTimeout(downloadSwipeHintSoundTimer);
+        downloadSwipeHintTimer = null;
+        downloadSwipeHintReturnTimer = null;
+        downloadSwipeHintHideTimer = null;
+        downloadSwipeHintSoundTimer = null;
+
+        const row = downloadSwipeHintRow;
+        downloadSwipeHintRow = null;
+        if (row && resetRow) {
+            row.classList.remove('is-swipe-hinting', 'is-swiping');
+            setDownloadSwipeOffset(row, 0, true);
+        }
+        hideDownloadSwipeHint();
+    }
+
+    function markDownloadSwipeHintSeen() {
+        downloadSwipeHintSeenThisVisit = true;
+    }
+
+    function scheduleDownloadSwipeHint() {
+        if (downloadSwipeHintSeenThisVisit) return;
+        if (!isPsnDomSectionVisible('view-downloads')) return;
+
+        const list = document.getElementById('downloads-list');
+        if (!list || !list.querySelector('.download-swipe-row')) return;
+
+        clearTimeout(downloadSwipeHintTimer);
+        downloadSwipeHintTimer = setTimeout(() => {
+            downloadSwipeHintTimer = null;
+            if (downloadSwipeHintSeenThisVisit || !isPsnDomSectionVisible('view-downloads')) return;
+
+            const currentList = document.getElementById('downloads-list');
+            const row = currentList?.querySelector('.download-swipe-row');
+            if (!row || currentList.querySelector('.download-swipe-row.is-open, .download-swipe-row.is-swiping')) return;
+
+            const hint = document.getElementById('download-swipe-hint');
+            downloadSwipeHintRow = row;
+            row.classList.add('is-swipe-hinting', 'is-swiping');
+            if (hint) hint.classList.add('is-visible');
+            markDownloadSwipeHintSeen();
+
+            requestAnimationFrame(() => {
+                requestAnimationFrame(() => {
+                    if (downloadSwipeHintRow === row) setDownloadSwipeOffset(row, -DOWNLOAD_SWIPE_HINT_PEEK_PX, true);
+                });
+            });
+
+            downloadSwipeHintSoundTimer = setTimeout(() => {
+                downloadSwipeHintSoundTimer = null;
+                if (downloadSwipeHintRow === row && typeof playUiToggle === 'function') playUiToggle();
+            }, 620);
+
+            downloadSwipeHintReturnTimer = setTimeout(() => {
+                downloadSwipeHintReturnTimer = null;
+                if (downloadSwipeHintRow !== row) return;
+                setDownloadSwipeOffset(row, 0, true);
+                setTimeout(() => {
+                    if (downloadSwipeHintRow === row) {
+                        row.classList.remove('is-swipe-hinting', 'is-swiping');
+                        downloadSwipeHintRow = null;
+                    }
+                }, 900);
+            }, 1850);
+
+            downloadSwipeHintHideTimer = setTimeout(() => {
+                downloadSwipeHintHideTimer = null;
+                hideDownloadSwipeHint();
+            }, 5200);
+        }, 700);
+    }
 
     function setDownloadSwipeOffset(row, offset, animate = true) {
         if (!row) return;
@@ -23977,6 +24072,10 @@ P
         list.addEventListener('pointerdown', event => {
             if (event.button !== undefined && event.button !== 0) return;
             if (event.target.closest('.download-swipe-delete')) return;
+            if (downloadSwipeHintRow || downloadSwipeHintTimer) {
+                markDownloadSwipeHintSeen();
+                cancelDownloadSwipeHintPreview(true);
+            }
             const content = event.target.closest('.download-swipe-content');
             if (!content || !list.contains(content)) return;
             const row = content.closest('.download-swipe-row');
@@ -24119,6 +24218,7 @@ P
 		listContainer.classList.remove('has-open-swipe');
 	
 		if (window.downloadHistory.length === 0) {
+			cancelDownloadSwipeHintPreview(true);
 			listContainer.innerHTML = `
 				<div style="text-align: center; color: #888; padding: 100px 50px; background: rgba(0,0,0,0.2); border-radius: 12px; border: 1px dashed rgba(255,255,255,0.05); backdrop-filter: blur(5px);">
 					<i class="fas fa-download" style="font-size: 50px; margin-bottom: 20px; opacity: 0.2;"></i>
@@ -24207,7 +24307,8 @@ P
 					</div>
 				</div>
 			`;
-		}).join(''); 
+		}).join('');
+		scheduleDownloadSwipeHint();
 	};
 	
     
