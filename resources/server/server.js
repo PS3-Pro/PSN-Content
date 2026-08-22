@@ -5247,25 +5247,58 @@ function disconnectUserSessions(name, eventName = 'user_kicked', payload = {}) {
 async function upsertPresenceForSocket(socket, name) {
   if (!socket || !name) return;
   const shouldAnnouncePresence = socket.__presenceAnnounced !== true;
-  const wasOnline = !!(userDatabase[name] && userDatabase[name].online === true);
+  const presenceData = { role: getUserRole(name, userDatabase[name] || null) };
+  let shouldRecordOnlineActivity = false;
+
+  if (shouldAnnouncePresence) {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query('SELECT name FROM users WHERE name = $1 FOR UPDATE', [name]);
+      const activePresence = await client.query(
+        `SELECT 1
+         FROM presence_sessions
+         WHERE name = $1
+           AND socket_id <> $2
+           AND last_seen >= NOW() - INTERVAL '${PRESENCE_TTL_SECONDS} seconds'
+         LIMIT 1`,
+        [name, socket.id]
+      );
+      shouldRecordOnlineActivity = activePresence.rowCount === 0;
+      await client.query(
+        `INSERT INTO presence_sessions (socket_id, name, instance_id, connected_at, last_seen, data)
+         VALUES ($1, $2, $3, NOW(), NOW(), $4)
+         ON CONFLICT (socket_id) DO UPDATE SET name = $2, instance_id = $3, last_seen = NOW(), data = $4`,
+        [socket.id, name, INSTANCE_ID, presenceData]
+      );
+      await client.query('COMMIT');
+    } catch (err) {
+      try { await client.query('ROLLBACK'); } catch (rollbackErr) {}
+      throw err;
+    } finally {
+      client.release();
+    }
+  } else {
+    await queryDbWithRetry(
+      `INSERT INTO presence_sessions (socket_id, name, instance_id, connected_at, last_seen, data)
+       VALUES ($1, $2, $3, NOW(), NOW(), $4)
+       ON CONFLICT (socket_id) DO UPDATE SET name = $2, instance_id = $3, last_seen = NOW(), data = $4`,
+      [socket.id, name, INSTANCE_ID, presenceData],
+      { attempts: 3, label: 'PRESENCE UPSERT' }
+    );
+  }
+
   if (userDatabase[name]) {
     userDatabase[name].online = true;
     userDatabase[name].id = socket.id;
     userDatabase[name].lastSeen = Date.now();
   }
-  await queryDbWithRetry(
-    `INSERT INTO presence_sessions (socket_id, name, instance_id, connected_at, last_seen, data)
-     VALUES ($1, $2, $3, NOW(), NOW(), $4)
-     ON CONFLICT (socket_id) DO UPDATE SET name = $2, instance_id = $3, last_seen = NOW(), data = $4`,
-    [socket.id, name, INSTANCE_ID, { role: getUserRole(name, userDatabase[name] || null) }],
-    { attempts: 3, label: 'PRESENCE UPSERT' }
-  );
   invalidateOnlineListCache('presence-upsert');
   if (shouldAnnouncePresence && userDatabase[name]) {
     socket.__presenceAnnounced = true;
     emitPresenceUpdate(name, userDatabase[name]);
     deferServerTask('PRESENCE ONLINE NOTIFY', () => notifyPresenceAcrossInstances(name, userDatabase[name]), 0);
-    if (!wasOnline) deferServerTask('FRIEND ACTIVITY ONLINE', () => recordFriendActivity(name, 'online', {}, { at: Date.now() }), 0);
+    if (shouldRecordOnlineActivity) deferServerTask('FRIEND ACTIVITY ONLINE', () => recordFriendActivity(name, 'online', {}, { at: Date.now() }), 0);
   }
 }
 
