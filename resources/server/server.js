@@ -943,6 +943,11 @@ async function initDb() {
     );
     CREATE INDEX IF NOT EXISTS idx_friend_activity_actor_id ON friend_activity(actor_name, id DESC);
     CREATE INDEX IF NOT EXISTS idx_friend_activity_created_at ON friend_activity(created_at DESC);
+    CREATE TABLE IF NOT EXISTS friend_activity_read_state (
+      user_name TEXT PRIMARY KEY,
+      last_read_id BIGINT NOT NULL DEFAULT 0,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
   `);
 
   await queryDbWithRetry(
@@ -4413,21 +4418,58 @@ async function recordFriendActivity(actorName, type, rawData = {}, options = {})
   }
 }
 
-async function getFriendActivityHistoryForUser(userName, limit = FRIEND_ACTIVITY_LIMIT) {
-  const friendData = await getUserDataPayloadFromDb(userName, 'friends');
-  const friendNames = extractFriendActivityNames(friendData);
-  if (!friendNames.length) return { friendNames, items: [] };
-  const safeLimit = Math.max(1, Math.min(FRIEND_ACTIVITY_LIMIT, Number(limit) || FRIEND_ACTIVITY_LIMIT));
+async function getFriendActivityReadId(userName) {
+  const name = normalizeFriendActivityName(userName);
+  if (!name) return 0;
   const result = await queryDbWithRetry(
-    `SELECT id, actor_name, event_type, data, created_at
-     FROM friend_activity
-     WHERE actor_name = ANY($1::text[])
-     ORDER BY id DESC
-     LIMIT $2`,
-    [friendNames, safeLimit],
-    { attempts: 2, label: 'FRIEND ACTIVITY READ' }
+    'SELECT last_read_id FROM friend_activity_read_state WHERE user_name = $1 LIMIT 1',
+    [name],
+    { attempts: 2, label: 'FRIEND ACTIVITY READ STATE' }
   );
-  return { friendNames, items: result.rows.map(serializeFriendActivityRow).filter(Boolean) };
+  return Math.max(0, Number(result.rows[0] && result.rows[0].last_read_id) || 0);
+}
+
+async function setFriendActivityReadId(userName, lastReadId) {
+  const name = normalizeFriendActivityName(userName);
+  const safeId = Math.max(0, Math.floor(Number(lastReadId) || 0));
+  if (!name || !safeId) return 0;
+  const result = await queryDbWithRetry(
+    `INSERT INTO friend_activity_read_state (user_name, last_read_id, updated_at)
+     VALUES ($1, $2, NOW())
+     ON CONFLICT (user_name)
+     DO UPDATE SET last_read_id = GREATEST(friend_activity_read_state.last_read_id, EXCLUDED.last_read_id), updated_at = NOW()
+     RETURNING last_read_id`,
+    [name, safeId],
+    { attempts: 2, label: 'FRIEND ACTIVITY MARK READ' }
+  );
+  return Math.max(0, Number(result.rows[0] && result.rows[0].last_read_id) || safeId);
+}
+
+async function getFriendActivityHistoryForUser(userName, limit = FRIEND_ACTIVITY_LIMIT, afterId = 0, resolvedFriendNames = null) {
+  const friendNames = Array.isArray(resolvedFriendNames)
+    ? extractFriendActivityNames(resolvedFriendNames)
+    : extractFriendActivityNames(await getUserDataPayloadFromDb(userName, 'friends'));
+  const safeLimit = Math.max(1, Math.min(FRIEND_ACTIVITY_LIMIT, Number(limit) || FRIEND_ACTIVITY_LIMIT));
+  const safeAfterId = Math.max(0, Math.floor(Number(afterId) || 0));
+  if (!friendNames.length) return { friendNames, items: [], lastReadId: await getFriendActivityReadId(userName), delta: safeAfterId > 0 };
+  const params = safeAfterId > 0 ? [friendNames, safeAfterId, safeLimit] : [friendNames, safeLimit];
+  const result = await queryDbWithRetry(
+    safeAfterId > 0
+      ? `SELECT id, actor_name, event_type, data, created_at
+         FROM friend_activity
+         WHERE actor_name = ANY($1::text[]) AND id > $2
+         ORDER BY id DESC
+         LIMIT $3`
+      : `SELECT id, actor_name, event_type, data, created_at
+         FROM friend_activity
+         WHERE actor_name = ANY($1::text[])
+         ORDER BY id DESC
+         LIMIT $2`,
+    params,
+    { attempts: 2, label: safeAfterId > 0 ? 'FRIEND ACTIVITY DELTA' : 'FRIEND ACTIVITY READ' }
+  );
+  const lastReadId = await getFriendActivityReadId(userName);
+  return { friendNames, items: result.rows.map(serializeFriendActivityRow).filter(Boolean), lastReadId, delta: safeAfterId > 0 };
 }
 
 function getPs3FriendActivityTransition(previousStatus, currentStatus) {
@@ -4803,6 +4845,8 @@ async function deleteUserAccount(targetName, reason, adminName) {
     [targetName, deletedData]
   );
   await pool.query('DELETE FROM users WHERE name = $1', [targetName]);
+  await pool.query('DELETE FROM friend_activity_read_state WHERE user_name = $1', [targetName]);
+  await pool.query('DELETE FROM friend_activity WHERE actor_name = $1', [targetName]);
   await notifyProfileSyncAcrossInstances(targetName, null, Date.now());
 
   delete userDatabase[targetName];
@@ -5514,21 +5558,39 @@ io.on('connection', (socket) => {
     const requestToken = (Number(socket.__friendActivityRequestToken) || 0) + 1;
     socket.__friendActivityRequestToken = requestToken;
     try {
-      const result = await getFriendActivityHistoryForUser(name, data && data.limit);
+      const friendNames = extractFriendActivityNames(await getUserDataPayloadFromDb(name, 'friends'));
       if (!socket.connected || socket.__friendActivityRequestToken !== requestToken) return;
-      setFriendActivitySubscription(socket, result.friendNames);
-      respond({ ok: true, items: result.items, friendCount: result.friendNames.length });
+      setFriendActivitySubscription(socket, friendNames);
+      const result = await getFriendActivityHistoryForUser(name, data && data.limit, data && data.afterId, friendNames);
+      if (!socket.connected || socket.__friendActivityRequestToken !== requestToken) return;
+      respond({
+        ok: true,
+        items: result.items,
+        friendCount: result.friendNames.length,
+        lastReadId: result.lastReadId || 0,
+        delta: result.delta === true
+      });
     } catch (err) {
       if (socket.__friendActivityRequestToken !== requestToken) return;
       console.error('[FRIEND ACTIVITY READ ERROR]:', err && err.message ? err.message : err);
-      clearFriendActivitySubscription(socket);
       respond({ ok: false, items: [], error: 'Friend activity is temporarily unavailable.' });
     }
   });
 
-  socket.on('friend_activity_unsubscribe', () => {
-    socket.__friendActivityRequestToken = (Number(socket.__friendActivityRequestToken) || 0) + 1;
-    clearFriendActivitySubscription(socket);
+  socket.on('friend_activity_mark_read', async (data = {}, ack) => {
+    const respond = payload => { if (typeof ack === 'function' && socket.connected) { try { ack(payload); } catch (err) {} } };
+    const name = socket.userName;
+    if (!name || !userDatabase[name]) { respond({ ok: false, lastReadId: 0 }); return; }
+    try {
+      const lastReadId = await setFriendActivityReadId(name, data && data.lastReadId);
+      getSocketsByUserName(name).forEach(client => {
+        if (client.connected) client.emit('friend_activity_read_state', { lastReadId });
+      });
+      respond({ ok: true, lastReadId });
+    } catch (err) {
+      console.error('[FRIEND ACTIVITY MARK READ ERROR]:', err && err.message ? err.message : err);
+      respond({ ok: false, lastReadId: 0 });
+    }
   });
 
   socket.on('friend_activity_trophy', (data = {}) => {
