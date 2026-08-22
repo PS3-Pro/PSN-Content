@@ -4150,6 +4150,12 @@ async function initProfileSyncNotifications() {
         if (data.readState && data.readState.userName) {
           emitUserNotificationReadStateToLocalUser(data.readState.userName, data.readState.lastReadId, data.readState.unreadCount);
         }
+        if (data.deleted && data.deleted.userName) {
+          emitUserNotificationDeletedToLocalUser(data.deleted.userName, data.deleted.notificationId, data.deleted.unreadCount);
+        }
+        if (data.cleared && data.cleared.userName) {
+          emitUserNotificationsClearedToLocalUser(data.cleared.userName, data.cleared.throughId, data.cleared.unreadCount);
+        }
         return;
       }
 
@@ -4308,7 +4314,7 @@ async function initProfileSyncNotifications() {
   }
 }
 
-const FRIEND_ACTIVITY_TYPES = new Set(['online', 'offline', 'playing', 'played', 'xmb', 'trophy', 'download', 'wishlist']);
+const FRIEND_ACTIVITY_TYPES = new Set(['online', 'offline', 'playing', 'played', 'xmb', 'trophy', 'download', 'wishlist', 'favorite', 'cheat']);
 const FRIEND_ACTIVITY_LIMIT = 60;
 const FRIEND_ACTIVITY_ROOM_PREFIX = 'friend-activity:';
 
@@ -4327,12 +4333,34 @@ function normalizeFriendActivityData(type, rawData = {}) {
       replacesId: type === 'played' ? normalizeText(source.replacesId, '').replace(/[^0-9]/g, '').slice(0, 32) : ''
     };
   }
-  if (type === 'download' || type === 'wishlist') {
+  if (type === 'download' || type === 'wishlist' || type === 'favorite') {
+    const action = normalizeText(source.action, 'add').toLowerCase();
+    const replacesIds = Array.isArray(source.replacesIds)
+      ? source.replacesIds.map(value => normalizeText(value, '').replace(/[^0-9]/g, '').slice(0, 32)).filter(Boolean).slice(0, FRIEND_ACTIVITY_LIMIT)
+      : [];
     return {
       titleId: normalizeText(source.titleId, '').toUpperCase().slice(0, 32),
       contentId: normalizeText(source.contentId, '').slice(0, 160),
       title: normalizeText(source.title, '').slice(0, 140),
-      category: normalizeText(source.category, 'games').toLowerCase().replace(/[^a-z0-9_]/g, '').slice(0, 40) || 'games'
+      category: normalizeText(source.category, 'games').toLowerCase().replace(/[^a-z0-9_]/g, '').slice(0, 40) || 'games',
+      action: action === 'remove' ? 'remove' : 'add',
+      repeatCount: Math.max(1, Math.min(9999, Math.floor(Number(source.repeatCount) || 1))),
+      replacesIds
+    };
+  }
+  if (type === 'cheat') {
+    const replacesIds = Array.isArray(source.replacesIds)
+      ? source.replacesIds.map(value => normalizeText(value, '').replace(/[^0-9]/g, '').slice(0, 32)).filter(Boolean).slice(0, FRIEND_ACTIVITY_LIMIT)
+      : [];
+    return {
+      titleId: normalizeText(source.titleId, '').toUpperCase().slice(0, 32),
+      contentId: normalizeText(source.contentId, '').slice(0, 160),
+      title: normalizeText(source.title, '').slice(0, 140),
+      category: 'games',
+      cheatCount: Math.max(1, Math.min(999, Math.floor(Number(source.cheatCount) || 1))),
+      cheatSignature: normalizeText(source.cheatSignature, '').slice(0, 180),
+      repeatCount: Math.max(1, Math.min(9999, Math.floor(Number(source.repeatCount) || 1))),
+      replacesIds
     };
   }
   if (type === 'trophy') {
@@ -4344,6 +4372,22 @@ function normalizeFriendActivityData(type, rawData = {}) {
     };
   }
   return {};
+}
+
+function getFriendActivitySemanticKey(type, data = {}) {
+  const eventType = normalizeText(type, '').toLowerCase();
+  const source = data && typeof data === 'object' && !Array.isArray(data) ? data : {};
+  if (eventType === 'download' || eventType === 'wishlist' || eventType === 'favorite') {
+    return [eventType, source.action || 'add', source.contentId || source.titleId || source.title || ''].map(value => String(value || '').toLowerCase()).join(':');
+  }
+  if (eventType === 'cheat') {
+    return [eventType, source.contentId || source.titleId || source.title || '', source.cheatSignature || source.cheatCount || ''].map(value => String(value || '').toLowerCase()).join(':');
+  }
+  if (eventType === 'playing' || eventType === 'played' || eventType === 'xmb') {
+    return [eventType, source.titleId || source.title || ''].map(value => String(value || '').toLowerCase()).join(':');
+  }
+  if (eventType === 'trophy') return [eventType, source.trophyId || source.title || ''].map(value => String(value || '').toLowerCase()).join(':');
+  return eventType;
 }
 
 function serializeFriendActivityRow(row = {}) {
@@ -4424,12 +4468,25 @@ async function recordFriendActivity(actorName, type, rawData = {}, options = {})
   if (!actor || !FRIEND_ACTIVITY_TYPES.has(eventType)) return null;
   const data = normalizeFriendActivityData(eventType, rawData);
   const at = normalizeTimestampValue(options.at) || Date.now();
-  const detailKey = eventType === 'playing' || eventType === 'played' || eventType === 'xmb' || eventType === 'download' || eventType === 'wishlist'
-    ? `${data.contentId || data.titleId || data.title}`
-    : (eventType === 'trophy' ? `${data.trophyId || data.title}` : eventType);
-  const dedupeKey = normalizeText(options.dedupeKey, '') || `${actor.toLowerCase()}:${eventType}:${String(detailKey || '').toLowerCase()}:${Math.floor(at / 5000)}`;
+  const detailKey = getFriendActivitySemanticKey(eventType, data);
+  const dedupeKey = normalizeText(options.dedupeKey, '') || `${actor.toLowerCase()}:${String(detailKey || eventType).toLowerCase()}:${Math.floor(at / 5000)}`;
 
   try {
+    const latestResult = await queryDbWithRetry(
+      `SELECT id, actor_name, event_type, data, created_at
+       FROM friend_activity
+       WHERE actor_name = $1
+       ORDER BY id DESC
+       LIMIT 1`,
+      [actor],
+      { attempts: 2, label: 'FRIEND ACTIVITY DUPLICATE CHECK' }
+    );
+    const latestEvent = latestResult.rows[0] ? serializeFriendActivityRow(latestResult.rows[0]) : null;
+    if (latestEvent) {
+      const latestAt = Math.max(0, Number(latestEvent.createdAt) || 0);
+      if (getFriendActivitySemanticKey(latestEvent.type, latestEvent.data) === detailKey && Math.abs(at - latestAt) <= 60000) return null;
+    }
+
     const result = await queryDbWithRetry(
       `INSERT INTO friend_activity (actor_name, event_type, data, dedupe_key, created_at)
        VALUES ($1, $2, $3::jsonb, $4, to_timestamp($5::double precision / 1000.0))
@@ -4464,6 +4521,90 @@ async function recordFriendActivity(actorName, type, rawData = {}, options = {})
     console.error('[FRIEND ACTIVITY INSERT ERROR]:', err && err.message ? err.message : err);
     return null;
   }
+}
+
+function getFriendActivityRepeatCount(data = {}) {
+  const count = Number(data && data.repeatCount);
+  return Number.isFinite(count) && count > 0 ? Math.min(9999, Math.floor(count)) : 1;
+}
+
+async function recordAggregatedFriendActivity(actorName, type, rawData = {}, options = {}) {
+  const actor = normalizeFriendActivityName(actorName);
+  const eventType = normalizeText(type, '').toLowerCase();
+  if (!actor || !['download', 'wishlist', 'favorite', 'cheat'].includes(eventType)) return null;
+  const baseData = normalizeFriendActivityData(eventType, rawData);
+  const at = normalizeTimestampValue(options.at) || Date.now();
+  const semanticKey = getFriendActivitySemanticKey(eventType, baseData);
+  if (!semanticKey) return null;
+
+  const client = await pool.connect();
+  let event = null;
+  try {
+    await client.query('BEGIN');
+    await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`friend-activity:${actor.toLowerCase()}:${semanticKey}`]);
+
+    const existingResult = await client.query(
+      `SELECT id, actor_name, event_type, data, created_at
+       FROM friend_activity
+       WHERE actor_name = $1 AND event_type = $2
+       ORDER BY id DESC
+       LIMIT $3`,
+      [actor, eventType, FRIEND_ACTIVITY_MAX_PER_USER]
+    );
+    const matching = existingResult.rows
+      .map(row => ({ row, event: serializeFriendActivityRow(row) }))
+      .filter(entry => entry.event && getFriendActivitySemanticKey(entry.event.type, entry.event.data) === semanticKey);
+    const replacesIds = matching.map(entry => String(entry.row.id)).filter(Boolean);
+    const previousCount = matching.reduce((sum, entry) => sum + getFriendActivityRepeatCount(entry.event.data), 0);
+    const data = normalizeFriendActivityData(eventType, {
+      ...baseData,
+      repeatCount: Math.min(9999, previousCount + 1),
+      replacesIds
+    });
+
+    const insertResult = await client.query(
+      `INSERT INTO friend_activity (actor_name, event_type, data, dedupe_key, created_at)
+       VALUES ($1, $2, $3::jsonb, NULL, to_timestamp($4::double precision / 1000.0))
+       RETURNING id, actor_name, event_type, data, created_at`,
+      [actor, eventType, JSON.stringify(data), at]
+    );
+    if (replacesIds.length) {
+      await client.query(
+        `DELETE FROM friend_activity
+         WHERE actor_name = $1 AND id = ANY($2::bigint[])`,
+        [actor, replacesIds]
+      );
+    }
+    await client.query('COMMIT');
+    event = serializeFriendActivityRow(insertResult.rows[0]);
+  } catch (err) {
+    try { await client.query('ROLLBACK'); } catch (rollbackErr) {}
+    console.error('[FRIEND ACTIVITY AGGREGATE ERROR]:', err && err.message ? err.message : err);
+    return null;
+  } finally {
+    client.release();
+  }
+
+  if (!event) return null;
+  deferServerTask('FRIEND ACTIVITY RETENTION', async () => {
+    await queryDbWithRetry(
+      `DELETE FROM friend_activity
+       WHERE actor_name = $1
+         AND id < COALESCE((
+           SELECT id
+           FROM friend_activity
+           WHERE actor_name = $1
+           ORDER BY id DESC
+           OFFSET $2
+           LIMIT 1
+         ), 0)`,
+      [actor, FRIEND_ACTIVITY_MAX_PER_USER - 1],
+      { attempts: 2, label: 'FRIEND ACTIVITY RETENTION' }
+    );
+  }, 0);
+  emitFriendActivityToLocalSubscribers(event);
+  deferServerTask('FRIEND ACTIVITY NOTIFY', () => notifyFriendActivityAcrossInstances(event), 0);
+  return event;
 }
 
 async function getFriendActivityReadId(userName) {
@@ -4591,6 +4732,28 @@ function emitUserNotificationReadStateToLocalUser(userName, lastReadId, unreadCo
   });
 }
 
+function emitUserNotificationDeletedToLocalUser(userName, notificationId, unreadCount = 0, excludeSocketId = '') {
+  const name = normalizeUserNotificationName(userName);
+  const id = String(notificationId || '').trim();
+  const excluded = String(excludeSocketId || '').trim();
+  if (!name || !/^\d+$/.test(id)) return;
+  const payload = { userName: name, notificationId: id, unreadCount: Math.max(0, Math.floor(Number(unreadCount) || 0)) };
+  getSocketsByUserName(name).forEach(client => {
+    if (client && client.connected && (!excluded || client.id !== excluded)) client.emit('user_notification_deleted', payload);
+  });
+}
+
+function emitUserNotificationsClearedToLocalUser(userName, throughId = 0, unreadCount = 0, excludeSocketId = '') {
+  const name = normalizeUserNotificationName(userName);
+  const excluded = String(excludeSocketId || '').trim();
+  const safeThroughId = Math.max(0, Math.floor(Number(throughId) || 0));
+  if (!name) return;
+  const payload = { userName: name, throughId: safeThroughId, unreadCount: Math.max(0, Math.floor(Number(unreadCount) || 0)) };
+  getSocketsByUserName(name).forEach(client => {
+    if (client && client.connected && (!excluded || client.id !== excluded)) client.emit('user_notifications_cleared', payload);
+  });
+}
+
 async function notifyUserNotificationAcrossInstances(event) {
   const safeEvent = serializeUserNotificationRow(event);
   if (!safeEvent) return;
@@ -4611,6 +4774,34 @@ async function notifyUserNotificationReadStateAcrossInstances(userName, lastRead
     })]);
   } catch (err) {
     console.error('[NOTIFICATION READ SYNC ERROR]:', err);
+  }
+}
+
+async function notifyUserNotificationDeletedAcrossInstances(userName, notificationId, unreadCount = 0) {
+  const name = normalizeUserNotificationName(userName);
+  const id = String(notificationId || '').trim();
+  if (!name || !/^\d+$/.test(id)) return;
+  try {
+    await pool.query('SELECT pg_notify($1, $2)', ['user_notification_sync', JSON.stringify({
+      deleted: { userName: name, notificationId: id, unreadCount: Math.max(0, Number(unreadCount) || 0) },
+      instanceId: INSTANCE_ID
+    })]);
+  } catch (err) {
+    console.error('[NOTIFICATION DELETE SYNC ERROR]:', err);
+  }
+}
+
+async function notifyUserNotificationsClearedAcrossInstances(userName, throughId = 0, unreadCount = 0) {
+  const name = normalizeUserNotificationName(userName);
+  const safeThroughId = Math.max(0, Math.floor(Number(throughId) || 0));
+  if (!name) return;
+  try {
+    await pool.query('SELECT pg_notify($1, $2)', ['user_notification_sync', JSON.stringify({
+      cleared: { userName: name, throughId: safeThroughId, unreadCount: Math.max(0, Math.floor(Number(unreadCount) || 0)) },
+      instanceId: INSTANCE_ID
+    })]);
+  } catch (err) {
+    console.error('[NOTIFICATION CLEAR SYNC ERROR]:', err);
   }
 }
 
@@ -4699,6 +4890,32 @@ async function getUserNotificationUnreadCount(userName, lastReadId = null) {
     { attempts: 2, label: 'USER NOTIFICATION UNREAD COUNT' }
   );
   return Math.max(0, Number(result.rows[0] && result.rows[0].count) || 0);
+}
+
+async function deleteUserNotification(userName, notificationId) {
+  const name = normalizeUserNotificationName(userName);
+  const id = String(notificationId || '').trim();
+  if (!name || !/^\d+$/.test(id)) return { deleted: false, notificationId: '', unreadCount: 0 };
+  const result = await queryDbWithRetry(
+    'DELETE FROM user_notifications WHERE user_name = $1 AND id = $2::bigint RETURNING id',
+    [name, id],
+    { attempts: 2, label: 'USER NOTIFICATION DELETE' }
+  );
+  const unreadCount = await getUserNotificationUnreadCount(name);
+  return { deleted: !!result.rows[0], notificationId: id, unreadCount };
+}
+
+async function clearUserNotifications(userName, throughId = 0) {
+  const name = normalizeUserNotificationName(userName);
+  const safeThroughId = Math.max(0, Math.floor(Number(throughId) || 0));
+  if (!name || !safeThroughId) return { deletedCount: 0, throughId: safeThroughId, unreadCount: await getUserNotificationUnreadCount(name) };
+  const result = await queryDbWithRetry(
+    'DELETE FROM user_notifications WHERE user_name = $1 AND id <= $2::bigint',
+    [name, safeThroughId],
+    { attempts: 2, label: 'USER NOTIFICATIONS CLEAR' }
+  );
+  const unreadCount = await getUserNotificationUnreadCount(name);
+  return { deletedCount: Math.max(0, Number(result.rowCount) || 0), throughId: safeThroughId, unreadCount };
 }
 
 async function getUserNotificationHistory(userName, limit = USER_NOTIFICATION_LIMIT, afterId = 0) {
@@ -5983,6 +6200,39 @@ io.on('connection', (socket) => {
     }
   });
 
+  socket.on('user_notification_delete', async (data = {}, ack) => {
+    const respond = payload => { if (typeof ack === 'function' && socket.connected) { try { ack(payload); } catch (err) {} } };
+    const name = socket.userName;
+    if (!name || !userDatabase[name]) { respond({ ok: false, unreadCount: 0, error: 'Profile is not available.' }); return; }
+    try {
+      const result = await deleteUserNotification(name, data && data.notificationId);
+      if (!result.notificationId) { respond({ ok: false, unreadCount: result.unreadCount || 0, error: 'Invalid notification.' }); return; }
+      emitUserNotificationDeletedToLocalUser(name, result.notificationId, result.unreadCount, socket.id);
+      deferServerTask('USER NOTIFICATION DELETE SYNC', () => notifyUserNotificationDeletedAcrossInstances(name, result.notificationId, result.unreadCount), 0);
+      respond({ ok: true, deleted: result.deleted === true, notificationId: result.notificationId, unreadCount: result.unreadCount || 0 });
+    } catch (err) {
+      console.error('[USER NOTIFICATION DELETE ERROR]:', err && err.message ? err.message : err);
+      respond({ ok: false, unreadCount: 0, error: 'Could not delete the notification.' });
+    }
+  });
+
+  socket.on('user_notifications_clear', async (data = {}, ack) => {
+    const respond = payload => { if (typeof ack === 'function' && socket.connected) { try { ack(payload); } catch (err) {} } };
+    const name = socket.userName;
+    if (!name || !userDatabase[name]) { respond({ ok: false, deletedCount: 0, unreadCount: 0, error: 'Profile is not available.' }); return; }
+    try {
+      const throughId = Math.max(0, Math.floor(Number(data && data.throughId) || 0));
+      if (!throughId) { respond({ ok: false, deletedCount: 0, throughId: 0, unreadCount: await getUserNotificationUnreadCount(name), error: 'Invalid notification range.' }); return; }
+      const result = await clearUserNotifications(name, throughId);
+      emitUserNotificationsClearedToLocalUser(name, result.throughId, result.unreadCount, socket.id);
+      deferServerTask('USER NOTIFICATIONS CLEAR SYNC', () => notifyUserNotificationsClearedAcrossInstances(name, result.throughId, result.unreadCount), 0);
+      respond({ ok: true, deletedCount: result.deletedCount || 0, throughId: result.throughId || throughId, unreadCount: result.unreadCount || 0 });
+    } catch (err) {
+      console.error('[USER NOTIFICATIONS CLEAR ERROR]:', err && err.message ? err.message : err);
+      respond({ ok: false, deletedCount: 0, unreadCount: 0, error: 'Could not dismiss notifications.' });
+    }
+  });
+
   socket.on('user_notifications_mark_read', async (data = {}, ack) => {
     const respond = payload => { if (typeof ack === 'function' && socket.connected) { try { ack(payload); } catch (err) {} } };
     const name = socket.userName;
@@ -6045,26 +6295,27 @@ io.on('connection', (socket) => {
     const name = socket.userName;
     if (!name || !userDatabase[name]) return;
     const type = normalizeText(data.type, '').toLowerCase();
-    if (type !== 'download' && type !== 'wishlist') return;
+    if (!['download', 'wishlist', 'favorite', 'cheat'].includes(type)) return;
 
     const titleId = normalizeText(data.titleId, '').toUpperCase().slice(0, 32);
     const contentId = normalizeText(data.contentId, '').slice(0, 160);
     const title = normalizeText(data.title, '').slice(0, 140);
     const category = normalizeText(data.category, 'games').toLowerCase().replace(/[^a-z0-9_]/g, '').slice(0, 40) || 'games';
-    const actionId = normalizeText(data.actionId, '').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 80);
+    const rawAction = normalizeText(data.action, type === 'cheat' ? 'use' : 'add').toLowerCase();
+    const action = type === 'cheat' ? 'use' : (rawAction === 'remove' ? 'remove' : 'add');
+    const cheatCount = Math.max(1, Math.min(999, Math.floor(Number(data.cheatCount) || 1)));
+    const cheatSignature = normalizeText(data.cheatSignature, '').slice(0, 180);
     if (!titleId && !title) return;
 
-    const detail = String(contentId || titleId || title).toLowerCase();
-    const dedupeKey = actionId
-      ? `${name.toLowerCase()}:${type}:${actionId}`
-      : `${name.toLowerCase()}:${type}:${detail}:${Math.floor(Date.now() / 3000)}`;
-
-    deferServerTask('FRIEND ACTIVITY CONTENT', () => recordFriendActivity(name, type, {
+    deferServerTask('FRIEND ACTIVITY CONTENT', () => recordAggregatedFriendActivity(name, type, {
       titleId,
       contentId,
       title,
-      category
-    }, { dedupeKey, at: Date.now() }), 0);
+      category,
+      action,
+      cheatCount,
+      cheatSignature
+    }, { at: Date.now() }), 0);
   });
 
   socket.on('friend_activity_trophy', (data = {}) => {
