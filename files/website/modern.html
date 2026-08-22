@@ -2710,8 +2710,25 @@ body.is-admin #nav-admin-footer { display: flex !important; }
 .admin-user-name { color: #fff; font-size: 14px; font-weight: bold; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; display: flex; align-items: center; gap: 6px; }
 .admin-user-name>span:first-child { overflow: hidden; text-overflow: ellipsis; }
 .admin-user-status-line { font-size: 10px; display: flex; align-items: center; margin-top: 2px; opacity: 0.9; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.admin-session-count { flex:0 0 auto; display:inline-flex; align-items:center; gap:4px; height:17px; margin-left:7px; padding:0 6px; border-radius:999px; border:1px solid rgba(76,175,80,.26); background:rgba(76,175,80,.08); color:#a5ffb6; font-size:8px; font-weight:850; letter-spacing:.2px; line-height:1; }
+.admin-session-count { flex:0 0 auto; display:inline-flex; align-items:center; gap:4px; height:17px; margin-left:7px; padding:0 6px; border-radius:999px; border:1px solid rgba(76,175,80,.26); background:rgba(76,175,80,.08); color:#a5ffb6; font-size:8px; font-weight:850; letter-spacing:.2px; line-height:1; cursor:pointer; transition:background .18s ease,border-color .18s ease,transform .06s ease,filter .06s ease; }
 .admin-session-count i { font-size:7px; opacity:.9; }
+.admin-session-count:hover { background:rgba(76,175,80,.14); border-color:rgba(76,175,80,.42); }
+.admin-session-count:is(:active,.mobile-pressed) { transform:translateY(1px) scale(.96); filter:brightness(.85); }
+.admin-session-inspector-overlay { position:fixed; inset:0; z-index:10070; display:none; align-items:center; justify-content:center; padding:20px; background:rgba(2,8,18,.76); backdrop-filter:blur(12px); -webkit-backdrop-filter:blur(12px); }
+.admin-session-inspector-overlay.show { display:flex; animation:modalFadeIn .22s ease both; }
+.admin-session-inspector-card { width:min(680px,94vw); max-height:min(76vh,720px); overflow:auto; border:1px solid rgba(255,255,255,.14); border-radius:14px; padding:18px; background:rgba(12,22,38,.97); box-shadow:0 24px 70px rgba(0,0,0,.5); }
+.admin-session-inspector-head { display:flex; align-items:center; gap:10px; margin-bottom:14px; }
+.admin-session-inspector-head h3 { margin:0; flex:1; font-size:18px; font-weight:500; }
+.admin-session-inspector-close { width:30px; height:30px; border:0; border-radius:50%; background:rgba(255,255,255,.08); color:#fff; cursor:pointer; }
+.admin-session-inspector-list { display:flex; flex-direction:column; gap:8px; }
+.admin-session-inspector-item { display:grid; grid-template-columns:minmax(110px,.8fr) minmax(0,1.4fr); gap:5px 14px; padding:11px 12px; border:1px solid rgba(255,255,255,.08); border-radius:10px; background:rgba(255,255,255,.035); font-size:10px; }
+.admin-session-inspector-label { color:rgba(255,255,255,.46); }
+.admin-session-inspector-value { min-width:0; color:rgba(255,255,255,.88); overflow-wrap:anywhere; }
+.profile-sync-indicator { display:none; margin-left:4px; font-size:8px; font-weight:700; letter-spacing:.15px; opacity:0; transition:opacity .22s ease,color .22s ease; white-space:nowrap; }
+.profile-sync-indicator.is-syncing,.profile-sync-indicator.is-synced,.profile-sync-indicator.is-pending { display:inline; opacity:.82; }
+.profile-sync-indicator.is-syncing { color:#72d7ff; }
+.profile-sync-indicator.is-synced { color:#8ee99a; }
+.profile-sync-indicator.is-pending { color:#ffcc66; }
 .admin-user-playing { font-size: 10px; font-weight: bold; margin-top: 3px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 220px; }
 .admin-user-actions { display: flex; align-items: center; justify-content: flex-end; gap: 8px; flex-wrap: wrap; flex-shrink: 0; margin-left: 10px; position: relative; z-index: 4; }
 .admin-user-actions .btn-mini-round { width: 30px; height: 30px; flex-shrink: 0; }
@@ -5288,7 +5305,7 @@ a:focus, button:focus, select:focus, input:focus, textarea:focus, [contenteditab
 						
 						<div id="sidebar-status-container" style="font-size: 11px; color: #4caf50; display: flex; align-items: center; gap: 4px;">
 							<i id="sidebar-status-icon" class="fas fa-circle" style="font-size: 8px; vertical-align: middle; transform: translateY(0.5px);"></i> 
-							<span id="sidebar-status-text">Online</span>
+							<span id="sidebar-status-text">Online</span><span id="profile-sync-indicator" class="profile-sync-indicator" aria-live="polite"></span>
 						</div>
 					</div>
 					<i id="profile-arrow" class="fas fa-angle-down elegant-breathe-icon"></i>
@@ -10521,7 +10538,7 @@ P
 		if (section === 'friends') {
 			const raw = parsePersistentLocalJson(`${username}_psn_friends_list`, []);
 			window.friendsList = Array.isArray(raw) ? raw : [];
-			if (typeof window.updateSidebarCountPills === 'function') window.updateSidebarCountPills();
+			if (typeof window.setSidebarCountPill === 'function') window.setSidebarCountPill('friends', window.friendsList.length);
 			return;
 		}
 		if (section === 'recentlyvisited') {
@@ -10577,6 +10594,52 @@ P
 		});
 	}
 	window.persistCurrentProfileSyncDirtyState = persistCurrentProfileSyncDirtyState;
+
+	window.__profileSyncIndicatorActive = 0;
+	window.__profileSyncIndicatorShowTimer = null;
+	window.__profileSyncIndicatorHideTimer = null;
+	window.resetProfileSyncIndicator = function() {
+		clearTimeout(window.__profileSyncIndicatorShowTimer);
+		clearTimeout(window.__profileSyncIndicatorHideTimer);
+		window.__profileSyncIndicatorShowTimer = null;
+		window.__profileSyncIndicatorHideTimer = null;
+		window.__profileSyncIndicatorActive = 0;
+		const el = document.getElementById('profile-sync-indicator');
+		if (el) { el.className = 'profile-sync-indicator'; el.textContent = ''; }
+	};
+	window.resetProfileClientSyncRuntime = function() {
+		if (window.__profileHydratedSections instanceof Set) window.__profileHydratedSections.clear();
+		window.__profileSectionRequests = {};
+		window.__profileBaseSyncPending = false;
+		window.__profileUpdateQueued = false;
+		window.__profileUpdateInFlight = false;
+		window.resetProfileSyncIndicator();
+	};
+	window.beginProfileSyncIndicator = function() {
+		window.__profileSyncIndicatorActive = Math.max(0, Number(window.__profileSyncIndicatorActive) || 0) + 1;
+		clearTimeout(window.__profileSyncIndicatorHideTimer);
+		if (window.__profileSyncIndicatorShowTimer) return;
+		window.__profileSyncIndicatorShowTimer = setTimeout(function() {
+			window.__profileSyncIndicatorShowTimer = null;
+			if (window.__profileSyncIndicatorActive < 1) return;
+			const el = document.getElementById('profile-sync-indicator');
+			if (!el) return;
+			el.textContent = 'Syncing…';
+			el.className = 'profile-sync-indicator is-syncing';
+		}, 500);
+	};
+	window.endProfileSyncIndicator = function(ok = true) {
+		window.__profileSyncIndicatorActive = Math.max(0, (Number(window.__profileSyncIndicatorActive) || 0) - 1);
+		if (window.__profileSyncIndicatorActive > 0) return;
+		clearTimeout(window.__profileSyncIndicatorShowTimer);
+		window.__profileSyncIndicatorShowTimer = null;
+		const el = document.getElementById('profile-sync-indicator');
+		if (!el || !el.classList.contains('is-syncing')) return;
+		el.textContent = ok ? 'Synced' : 'Pending';
+		el.className = `profile-sync-indicator ${ok ? 'is-synced' : 'is-pending'}`;
+		clearTimeout(window.__profileSyncIndicatorHideTimer);
+		window.__profileSyncIndicatorHideTimer = setTimeout(function() { el.className='profile-sync-indicator'; el.textContent=''; }, ok ? 900 : 1800);
+	};
 
 	function getProfileSyncDirtyState() {
 		const username = localStorage.getItem('psn_username') || '';
@@ -10729,11 +10792,14 @@ P
 				resolve({ ok: false, error: 'Socket disconnected.' });
 				return;
 			}
+			if (typeof window.beginProfileSyncIndicator === 'function') window.beginProfileSyncIndicator();
 			let settled = false;
 			const finish = response => {
 				if (settled) return;
 				settled = true;
-				resolve(response && typeof response === 'object' ? response : { ok: false, error: 'Invalid synchronization response.' });
+				const normalized = response && typeof response === 'object' ? response : { ok: false, error: 'Invalid synchronization response.' };
+				if (typeof window.endProfileSyncIndicator === 'function') window.endProfileSyncIndicator(normalized.ok === true);
+				resolve(normalized);
 			};
 			try {
 				if (typeof socketChat.timeout === 'function') {
@@ -10995,21 +11061,35 @@ P
 	window.__profileNotificationPendingSyncCategories = window.__profileNotificationPendingSyncCategories || new Set();
 	window.__profileNotificationMutationSequence = Number(window.__profileNotificationMutationSequence || 0);
 
+	function getProfileNotificationRuntimeOwner(username = localStorage.getItem('psn_username') || '') {
+		return String(username || '').trim();
+	}
+
+	function getProfileNotificationRuntimeKey(category, username = localStorage.getItem('psn_username') || '') {
+		const owner = getProfileNotificationRuntimeOwner(username);
+		const safeCategory = String(category || '').trim().toLowerCase();
+		return owner && safeCategory ? `${owner.toLowerCase()}|${safeCategory}` : '';
+	}
+
 	function createProfileNotificationMutationId(category) {
 		window.__profileNotificationMutationSequence += 1;
 		return `${String(category || 'state')}-${Date.now().toString(36)}-${window.__profileNotificationMutationSequence.toString(36)}-${Math.random().toString(36).slice(2,10)}`;
 	}
 
-	function ensureProfileNotificationPendingOp(category) {
-		const current = window.__profileNotificationPendingOps[category];
+	function ensureProfileNotificationPendingOp(category, username = localStorage.getItem('psn_username') || '') {
+		const owner = getProfileNotificationRuntimeOwner(username);
+		const runtimeKey = getProfileNotificationRuntimeKey(category, owner);
+		if (!runtimeKey) return null;
+		const current = window.__profileNotificationPendingOps[runtimeKey];
 		if (current) return current;
-		const op = { addItems: new Set(), removeItems: new Set(), clearPending: false, replacePending: false, pendingItems: [], hasDot: false, dot: false, hasColor: false, color: '' };
-		window.__profileNotificationPendingOps[category] = op;
+		const op = { owner, category, addItems: new Set(), removeItems: new Set(), clearPending: false, replacePending: false, pendingItems: [], hasDot: false, dot: false, hasColor: false, color: '' };
+		window.__profileNotificationPendingOps[runtimeKey] = op;
 		return op;
 	}
 
 	function mergeProfileNotificationStorageChange(category, key, previousValue, nextValue) {
 		const op = ensureProfileNotificationPendingOp(category);
+		if (!op) return false;
 		if (key.endsWith('_dot_items')) {
 			const previousItems = normalizeProfileNotificationPendingValue(previousValue);
 			const nextItems = normalizeProfileNotificationPendingValue(nextValue);
@@ -11018,7 +11098,7 @@ P
 				op.clearPending = false;
 				op.addItems.clear();
 				op.removeItems.clear();
-				return;
+				return true;
 			}
 			const previousSet = new Set(previousItems);
 			const nextSet = new Set(nextItems);
@@ -11041,6 +11121,7 @@ P
 			op.hasDot = true;
 			op.dot = String(nextValue) === 'true';
 		}
+		return true;
 	}
 
 	function buildProfileNotificationSyncPayload(category, op) {
@@ -11056,119 +11137,138 @@ P
 		return payload;
 	}
 
-	function scheduleProfileNotificationInflightRetry(category, delay = 900) {
-		clearTimeout(window.__profileNotificationSyncTimers[category]);
-		window.__profileNotificationSyncTimers[category] = setTimeout(() => flushProfileNotificationCategoryState(category), delay);
+	function scheduleProfileNotificationInflightRetry(category, owner, delay = 900) {
+		const runtimeKey = getProfileNotificationRuntimeKey(category, owner);
+		if (!runtimeKey) return;
+		clearTimeout(window.__profileNotificationSyncTimers[runtimeKey]);
+		window.__profileNotificationSyncTimers[runtimeKey] = setTimeout(() => flushProfileNotificationCategoryState(category, owner), delay);
 	}
 
-	function sendProfileNotificationInflight(category) {
-		const inflight = window.__profileNotificationInFlight[category];
+	function sendProfileNotificationInflight(category, owner = localStorage.getItem('psn_username') || '') {
+		owner = getProfileNotificationRuntimeOwner(owner);
+		const runtimeKey = getProfileNotificationRuntimeKey(category, owner);
+		const inflight = runtimeKey ? window.__profileNotificationInFlight[runtimeKey] : null;
 		if (!inflight || inflight.sending) return false;
-		if (!window.isProfileLoaded || typeof socketChat === 'undefined' || !socketChat || !socketChat.connected) {
-			window.__profileNotificationPendingSyncCategories.add(category);
+		const activeName = getProfileNotificationRuntimeOwner();
+		if (activeName !== owner || !window.isProfileLoaded || typeof socketChat === 'undefined' || !socketChat || !socketChat.connected) {
+			window.__profileNotificationPendingSyncCategories.add(runtimeKey);
 			return false;
 		}
-		const myName = localStorage.getItem('psn_username');
-		if (!myName || myName === 'null') return false;
 
 		inflight.sending = true;
+		if (!inflight.indicatorActive) { inflight.indicatorActive = true; if (typeof window.beginProfileSyncIndicator === 'function') window.beginProfileSyncIndicator(); }
 		inflight.attempt = Number(inflight.attempt || 0) + 1;
 		const attemptToken = inflight.attempt;
 		clearTimeout(inflight.ackTimer);
 		inflight.ackTimer = setTimeout(() => {
-			const current = window.__profileNotificationInFlight[category];
+			const current = window.__profileNotificationInFlight[runtimeKey];
 			if (current !== inflight || current.attempt !== attemptToken) return;
 			current.sending = false;
-			window.__profileNotificationPendingSyncCategories.add(category);
-			if (typeof socketChat !== 'undefined' && socketChat && socketChat.connected && window.isProfileLoaded) scheduleProfileNotificationInflightRetry(category, 900);
+			if (current.indicatorActive) { current.indicatorActive=false; if (typeof window.endProfileSyncIndicator === 'function') window.endProfileSyncIndicator(false); }
+			window.__profileNotificationPendingSyncCategories.add(runtimeKey);
+			if (getProfileNotificationRuntimeOwner() === owner && typeof socketChat !== 'undefined' && socketChat && socketChat.connected && window.isProfileLoaded) scheduleProfileNotificationInflightRetry(category, owner, 900);
 		}, 4500);
 
 		socketChat.emit('profile_notification_state_update', inflight.payload, response => {
-			const current = window.__profileNotificationInFlight[category];
+			const current = window.__profileNotificationInFlight[runtimeKey];
 			if (current !== inflight || current.attempt !== attemptToken) return;
 			clearTimeout(current.ackTimer);
 			current.ackTimer = null;
 			current.sending = false;
 			if (!response || response.ok !== true) {
-				window.__profileNotificationPendingSyncCategories.add(category);
-				scheduleProfileNotificationInflightRetry(category, 900);
+				if (current.indicatorActive) { current.indicatorActive=false; if (typeof window.endProfileSyncIndicator === 'function') window.endProfileSyncIndicator(false); }
+				window.__profileNotificationPendingSyncCategories.add(runtimeKey);
+				if (getProfileNotificationRuntimeOwner() === owner) scheduleProfileNotificationInflightRetry(category, owner, 900);
 				return;
 			}
 
-			delete window.__profileNotificationInFlight[category];
-			const hasQueuedLocalChanges = !!window.__profileNotificationPendingOps[category];
-			if (!hasQueuedLocalChanges) window.__profileNotificationPendingSyncCategories.delete(category);
+			if (current.indicatorActive) { current.indicatorActive=false; if (typeof window.endProfileSyncIndicator === 'function') window.endProfileSyncIndicator(true); }
+			delete window.__profileNotificationInFlight[runtimeKey];
+			const hasQueuedLocalChanges = !!window.__profileNotificationPendingOps[runtimeKey];
+			if (!hasQueuedLocalChanges) window.__profileNotificationPendingSyncCategories.delete(runtimeKey);
 			const categoryState = response.categoryState || {};
 			const updatedAt = Number(categoryState.updatedAt || 0);
 			if (updatedAt) {
 				const timeKey = getProfileNotificationUpdatedAtStorageKey(category);
-				const currentUpdatedAt = Number(loadState(timeKey) || 0);
-				if (updatedAt > currentUpdatedAt) safeLocalStorageSet(`${myName}_${timeKey}`, String(updatedAt));
-				if (updatedAt > currentUpdatedAt) safeLocalStorageSet(timeKey, String(updatedAt));
+				const scopedTimeKey = `${owner}_${timeKey}`;
+				const currentUpdatedAt = Number(localStorage.getItem(scopedTimeKey) || 0);
+				if (updatedAt > currentUpdatedAt) safeLocalStorageSet(scopedTimeKey, String(updatedAt));
+				if (getProfileNotificationRuntimeOwner() === owner && updatedAt > Number(loadState(timeKey) || 0)) safeLocalStorageSet(timeKey, String(updatedAt));
 			}
 			if (response.notificationState && typeof window.applyProfileNotificationStateFromServer === 'function') {
-				window.applyProfileNotificationStateFromServer(myName, response.notificationState, null);
+				window.applyProfileNotificationStateFromServer(owner, response.notificationState, null);
 			}
-			if (hasQueuedLocalChanges) scheduleProfileNotificationInflightRetry(category, 45);
+			if (hasQueuedLocalChanges && getProfileNotificationRuntimeOwner() === owner) scheduleProfileNotificationInflightRetry(category, owner, 45);
 		});
 		return true;
 	}
 
-	function flushProfileNotificationCategoryState(category) {
-		clearTimeout(window.__profileNotificationSyncTimers[category]);
-		window.__profileNotificationSyncTimers[category] = null;
-		if (window.__profileNotificationInFlight[category]) return sendProfileNotificationInflight(category);
-		const op = window.__profileNotificationPendingOps[category];
+	function flushProfileNotificationCategoryState(category, owner = localStorage.getItem('psn_username') || '') {
+		owner = getProfileNotificationRuntimeOwner(owner);
+		const runtimeKey = getProfileNotificationRuntimeKey(category, owner);
+		if (!runtimeKey) return false;
+		clearTimeout(window.__profileNotificationSyncTimers[runtimeKey]);
+		window.__profileNotificationSyncTimers[runtimeKey] = null;
+		if (window.__profileNotificationInFlight[runtimeKey]) return sendProfileNotificationInflight(category, owner);
+		const op = window.__profileNotificationPendingOps[runtimeKey];
 		if (!op) {
-			window.__profileNotificationPendingSyncCategories.delete(category);
+			window.__profileNotificationPendingSyncCategories.delete(runtimeKey);
 			return false;
 		}
-		if (!window.isProfileLoaded || typeof socketChat === 'undefined' || !socketChat || !socketChat.connected) {
-			window.__profileNotificationPendingSyncCategories.add(category);
+		if (getProfileNotificationRuntimeOwner() !== owner || !window.isProfileLoaded || typeof socketChat === 'undefined' || !socketChat || !socketChat.connected) {
+			window.__profileNotificationPendingSyncCategories.add(runtimeKey);
 			return false;
 		}
-		const myName = localStorage.getItem('psn_username');
-		if (!myName || myName === 'null') return false;
 		const payload = buildProfileNotificationSyncPayload(category, op);
-		delete window.__profileNotificationPendingOps[category];
-		window.__profileNotificationInFlight[category] = { payload, sending: false, attempt: 0, ackTimer: null };
-		window.__profileNotificationPendingSyncCategories.add(category);
-		return sendProfileNotificationInflight(category);
+		delete window.__profileNotificationPendingOps[runtimeKey];
+		window.__profileNotificationInFlight[runtimeKey] = { owner, category, payload, sending: false, attempt: 0, ackTimer: null };
+		window.__profileNotificationPendingSyncCategories.add(runtimeKey);
+		return sendProfileNotificationInflight(category, owner);
 	}
 
 	function queueProfileNotificationStateSync(reason = 'notification_state', previousValue = null, nextValue = null) {
 		if (window.__applyingRemoteProfileSync || window.__applyingRealtimeSettingsSync || window.__applyingSyncedProfileSettings || window.__applyingProfileNotificationState) return false;
 		if (!window.isProfileLoaded) return false;
 		const category = getProfileNotificationCategoryFromStorageKey(reason);
-		if (!category) return false;
-		mergeProfileNotificationStorageChange(category, String(reason), previousValue, nextValue);
-		window.__profileNotificationPendingSyncCategories.add(category);
-		if (!window.__profileNotificationInFlight[category]) {
-			clearTimeout(window.__profileNotificationSyncTimers[category]);
-			window.__profileNotificationSyncTimers[category] = setTimeout(() => flushProfileNotificationCategoryState(category), 45);
+		const owner = getProfileNotificationRuntimeOwner();
+		const runtimeKey = getProfileNotificationRuntimeKey(category, owner);
+		if (!category || !runtimeKey) return false;
+		if (!mergeProfileNotificationStorageChange(category, String(reason), previousValue, nextValue)) return false;
+		window.__profileNotificationPendingSyncCategories.add(runtimeKey);
+		if (!window.__profileNotificationInFlight[runtimeKey]) {
+			clearTimeout(window.__profileNotificationSyncTimers[runtimeKey]);
+			window.__profileNotificationSyncTimers[runtimeKey] = setTimeout(() => flushProfileNotificationCategoryState(category, owner), 45);
 		}
 		return true;
 	}
 	window.queueProfileNotificationStateSync = queueProfileNotificationStateSync;
 
 	function seedProfileNotificationStateMigration() {
+		const owner = getProfileNotificationRuntimeOwner();
+		if (!owner) return;
 		['downloads', 'wishlist', 'favorites', 'trophies'].forEach(category => {
 			const local = getProfileNotificationLocalCategoryState(category, { allowLegacyFallback: true });
-			const op = ensureProfileNotificationPendingOp(category);
+			const op = ensureProfileNotificationPendingOp(category, owner);
+			if (!op) return;
 			op.replacePending = true;
 			op.pendingItems = local.pendingItems.slice();
 			op.hasDot = true;
 			op.dot = !!local.dot;
 			if (category === 'trophies') { op.hasColor = true; op.color = local.color || ''; }
-			window.__profileNotificationPendingSyncCategories.add(category);
+			window.__profileNotificationPendingSyncCategories.add(getProfileNotificationRuntimeKey(category, owner));
 		});
 	}
 
 	function flushProfileNotificationStateSyncPending() {
-		Array.from(window.__profileNotificationPendingSyncCategories || []).forEach(category => {
-			if (!window.__profileNotificationPendingOps[category] && !window.__profileNotificationInFlight[category]) return;
-			clearTimeout(window.__profileNotificationSyncTimers[category]);
-			window.__profileNotificationSyncTimers[category] = setTimeout(() => flushProfileNotificationCategoryState(category), 0);
+		const activeOwner = getProfileNotificationRuntimeOwner();
+		Array.from(window.__profileNotificationPendingSyncCategories || []).forEach(runtimeKey => {
+			const op = window.__profileNotificationPendingOps[runtimeKey];
+			const inflight = window.__profileNotificationInFlight[runtimeKey];
+			const state = op || inflight;
+			if (!state) { window.__profileNotificationPendingSyncCategories.delete(runtimeKey); return; }
+			if (!state.owner || state.owner !== activeOwner) return;
+			clearTimeout(window.__profileNotificationSyncTimers[runtimeKey]);
+			window.__profileNotificationSyncTimers[runtimeKey] = setTimeout(() => flushProfileNotificationCategoryState(state.category, state.owner), 0);
 		});
 	}
 	window.flushProfileNotificationStateSyncPending = flushProfileNotificationStateSyncPending;
@@ -11183,7 +11283,6 @@ P
 		return true;
 	}
 	window.syncProfileNotificationStateMigration = syncProfileNotificationStateMigration;
-
 
 	function normalizeSyncedToggleValue(value, fallback = "1") {
 		if (value === undefined || value === null || value === "") return fallback === "0" ? "0" : "1";
@@ -11263,7 +11362,7 @@ P
 			categories.forEach(category => {
 				const incoming = state[category];
 				if (!incoming || typeof incoming !== 'object' || Array.isArray(incoming)) return;
-				if (window.__profileNotificationPendingSyncCategories && window.__profileNotificationPendingSyncCategories.has(category)) return;
+				if (window.__profileNotificationPendingSyncCategories && window.__profileNotificationPendingSyncCategories.has(getProfileNotificationRuntimeKey(category, name))) return;
 				const incomingUpdatedAt = Number(incoming.updatedAt || 0);
 				const timeKey = getProfileNotificationUpdatedAtStorageKey(category);
 				const scopedTimeKey = `${name}_${timeKey}`;
@@ -24738,7 +24837,8 @@ P
 	};
 
 
-    window.addToDownloadManager = function(fileName, sizeBytes, titleId, category, contentId, sentToPs3 = false) {
+    window.addToDownloadManager = async function(fileName, sizeBytes, titleId, category, contentId, sentToPs3 = false) {
+        if (typeof window.ensureMutableProfileSectionReady === 'function' && !(await window.ensureMutableProfileSectionReady('downloads', 'download-history-add'))) return;
         const now = new Date();
         
         const datePart = now.toLocaleDateString('en-US', { 
@@ -24903,74 +25003,55 @@ P
 		return window.getComputedStyle(el).display !== 'none';
 	}
 
-	window.updateSidebarCountPills = function() {
-		const databaseCount = window.psnStoreCache && typeof window.psnStoreCache === 'object'
-			? Object.values(window.psnStoreCache).reduce((total, items) => total + (Array.isArray(items) ? items.length : 0), 0)
-			: 0;
-		const revivedCount = Number.isFinite(window.revivedServersTotalCount) ? Math.max(0, window.revivedServersTotalCount) : null;
-		const chatCount = Array.isArray(window.messageHistory) ? window.messageHistory.length : 0;
-		const friendsCount = Array.isArray(window.friendsList) ? window.friendsList.length : 0;
-		const trophyCount = window.userTrophies && typeof window.userTrophies === 'object'
-			? Object.values(window.userTrophies).filter(trophy => trophy && trophy.unlocked === true).length
-			: 0;
-		const rewardsReady = Array.isArray(window.REWARDS_DATA);
-		const rewardsCount = rewardsReady
-			? window.REWARDS_DATA.filter(reward => reward && reward.req && window.userTrophies && window.userTrophies[reward.req] && window.userTrophies[reward.req].unlocked === true).length
-			: null;
-		const counts = {
-			browse: databaseCount,
-			wishlist: Array.isArray(window.wishlist) ? window.wishlist.length : 0,
-			downloads: Array.isArray(window.downloadHistory) ? window.downloadHistory.length : 0,
-			revived: revivedCount,
-			chat: chatCount,
-			friends: friendsCount,
-			activity: Array.isArray(window.friendActivityItems) ? window.friendActivityItems.length : 0,
-			notifications: Array.isArray(window.userNotificationItems) ? window.userNotificationItems.length : 0,
-			trophies: trophyCount,
-			rewards: rewardsCount,
-			games: Array.isArray(window.lastScannedGames) ? window.lastScannedGames.length : 0,
-			favorites: Array.isArray(window.favoritesLibrary) ? window.favoritesLibrary.length : 0
-		};
-		const labels = { browse: 'database item', wishlist: 'wishlist item', downloads: 'download', revived: 'server', chat: 'chat message', friends: 'friend', activity: 'activity', notifications: 'notification', trophies: 'trophy', rewards: 'reward', games: 'game', favorites: 'favorite' };
+	window.setSidebarCountPill = function(type, rawCount) {
+		const pill = document.getElementById(`sidebar-count-${type}`);
+		if (!pill) return;
+		pill.dataset.rawCount = (rawCount === null || rawCount === undefined) ? '' : String(Math.max(0, Number(rawCount) || 0));
+		const labels = { browse:'database item', wishlist:'wishlist item', downloads:'download', revived:'server', chat:'chat message', friends:'friend', activity:'activity', notifications:'notification', trophies:'trophy', rewards:'reward', games:'game', favorites:'favorite' };
 		const globalIcon = document.getElementById('global-status-icon');
 		const consoleConnected = !!(globalIcon && globalIcon.classList.contains('status-dot-connected'));
-		Object.keys(counts).forEach(type => {
-			const pill = document.getElementById(`sidebar-count-${type}`);
-			if (!pill) return;
-			const consoleOnly = type === 'games' || type === 'favorites';
-			if (consoleOnly && !consoleConnected) {
-				pill.classList.add('is-empty');
-				pill.style.display = 'none';
-				return;
-			}
-			const rawCount = counts[type];
-			if (rawCount === null || rawCount === undefined) {
-				pill.classList.add('is-empty');
-				pill.style.display = 'none';
-				return;
-			}
-			const count = Math.max(0, Number(rawCount) || 0);
-			const isEmpty = count < 1;
-			pill.classList.toggle('is-empty', isEmpty);
-			if (isEmpty) {
-				pill.style.display = 'none';
-				pill.textContent = '0';
-				return;
-			}
-			pill.style.display = '';
-			if (type === 'browse' && count >= 1000) {
-				const divisor = count >= 1000000 ? 1000000 : 1000;
-				const suffix = divisor === 1000000 ? 'M' : 'K';
-				const decimals = count >= divisor * 100 ? 0 : 1;
-				pill.textContent = `${(count / divisor).toFixed(decimals).replace(/\.0$/, '')}${suffix}`;
-			} else {
-				pill.textContent = count > 999 ? '999+' : String(count);
-			}
-			const label = type === 'trophies' && count !== 1 ? 'trophies' : (type === 'activity' && count !== 1 ? 'activities' : `${labels[type]}${count === 1 ? '' : 's'}`);
-			const suffix = type === 'trophies' ? ' earned' : (type === 'rewards' ? ' unlocked' : '');
-			pill.title = `${count.toLocaleString('en-US')} ${label}${suffix}`;
-			pill.setAttribute('aria-label', pill.title);
-		});
+		const consoleOnly = type === 'games' || type === 'favorites';
+		if (consoleOnly && !consoleConnected) { pill.classList.add('is-empty'); pill.style.display='none'; return; }
+		if (rawCount === null || rawCount === undefined) { pill.classList.add('is-empty'); pill.style.display='none'; return; }
+		const count = Math.max(0, Number(rawCount) || 0);
+		const isEmpty = count < 1;
+		pill.classList.toggle('is-empty', isEmpty);
+		if (isEmpty) { pill.style.display='none'; pill.textContent='0'; return; }
+		pill.style.display='';
+		if (type === 'browse' && count >= 1000) {
+			const divisor = count >= 1000000 ? 1000000 : 1000;
+			const suffix = divisor === 1000000 ? 'M' : 'K';
+			const decimals = count >= divisor * 100 ? 0 : 1;
+			pill.textContent = `${(count / divisor).toFixed(decimals).replace(/\.0$/, '')}${suffix}`;
+		} else pill.textContent = count > 999 ? '999+' : String(count);
+		const baseLabel = labels[type] || 'item';
+		const label = type === 'trophies' && count !== 1 ? 'trophies' : (type === 'activity' && count !== 1 ? 'activities' : `${baseLabel}${count === 1 ? '' : 's'}`);
+		const suffix = type === 'trophies' ? ' earned' : (type === 'rewards' ? ' unlocked' : '');
+		pill.title = `${count.toLocaleString('en-US')} ${label}${suffix}`;
+		pill.setAttribute('aria-label', pill.title);
+	};
+
+
+	window.refreshTrophyRewardSidebarCounts = function() {
+		const trophies = window.userTrophies && typeof window.userTrophies === 'object' ? Object.values(window.userTrophies).filter(trophy => trophy && trophy.unlocked === true).length : 0;
+		window.setSidebarCountPill('trophies', trophies);
+		const rewards = Array.isArray(window.REWARDS_DATA) ? window.REWARDS_DATA.filter(reward => reward && reward.req && window.userTrophies && window.userTrophies[reward.req] && window.userTrophies[reward.req].unlocked === true).length : null;
+		window.setSidebarCountPill('rewards', rewards);
+	};
+
+	window.updateSidebarCountPills = function() {
+		const databaseCount = window.psnStoreCache && typeof window.psnStoreCache === 'object' ? Object.values(window.psnStoreCache).reduce((total, items) => total + (Array.isArray(items) ? items.length : 0), 0) : 0;
+		const revivedCount = Number.isFinite(window.revivedServersTotalCount) ? Math.max(0, window.revivedServersTotalCount) : null;
+		const trophyCount = window.userTrophies && typeof window.userTrophies === 'object' ? Object.values(window.userTrophies).filter(trophy => trophy && trophy.unlocked === true).length : 0;
+		const rewardsReady = Array.isArray(window.REWARDS_DATA);
+		const counts = {
+			browse:databaseCount, wishlist:Array.isArray(window.wishlist)?window.wishlist.length:0, downloads:Array.isArray(window.downloadHistory)?window.downloadHistory.length:0,
+			revived:revivedCount, chat:Array.isArray(window.messageHistory)?window.messageHistory.length:0, friends:Array.isArray(window.friendsList)?window.friendsList.length:0,
+			activity:Array.isArray(window.friendActivityItems)?window.friendActivityItems.length:0, notifications:Array.isArray(window.userNotificationItems)?window.userNotificationItems.length:0,
+			trophies:trophyCount, rewards:rewardsReady?window.REWARDS_DATA.filter(reward=>reward&&reward.req&&window.userTrophies&&window.userTrophies[reward.req]&&window.userTrophies[reward.req].unlocked===true).length:null,
+			games:Array.isArray(window.lastScannedGames)?window.lastScannedGames.length:0, favorites:Array.isArray(window.favoritesLibrary)?window.favoritesLibrary.length:0
+		};
+		Object.keys(counts).forEach(type => window.setSidebarCountPill(type, counts[type]));
 	};
 
 	window.addEventListener('psnStorePrefetchReady', () => {
@@ -24979,8 +25060,8 @@ P
 	if (window.psnStorePrefetchReady) window.updateSidebarCountPills();
 
 	function refreshDownloadSummaryUI() {
-		if (typeof window.updateSidebarCountPills === 'function') window.updateSidebarCountPills();
 		const history = Array.isArray(window.downloadHistory) ? window.downloadHistory : [];
+		if (typeof window.setSidebarCountPill === 'function') window.setSidebarCountPill('downloads', history.length);
 		const statCount = document.getElementById('stat-total-count');
 		const statSize = document.getElementById('stat-total-size');
 		const globalCount = document.getElementById('dl-count');
@@ -25001,8 +25082,8 @@ P
 	window.refreshDownloadSummaryUI = refreshDownloadSummaryUI;
 
 	function refreshWishlistSummaryUI() {
-		if (typeof window.updateSidebarCountPills === 'function') window.updateSidebarCountPills();
 		const wishlist = Array.isArray(window.wishlist) ? window.wishlist : [];
+		if (typeof window.setSidebarCountPill === 'function') window.setSidebarCountPill('wishlist', wishlist.length);
 		const countSpan = document.getElementById('wish-count');
 		if (countSpan) countSpan.innerText = `(${wishlist.length} item${wishlist.length === 1 ? '' : 's'})`;
 		if (typeof window.refreshCategoryDot === 'function') {
@@ -25015,8 +25096,8 @@ P
 	window.refreshWishlistSummaryUI = refreshWishlistSummaryUI;
 
 	function refreshFavoritesSummaryUI() {
-		if (typeof window.updateSidebarCountPills === 'function') window.updateSidebarCountPills();
 		const favs = Array.isArray(window.favoritesLibrary) ? window.favoritesLibrary : [];
+		if (typeof window.setSidebarCountPill === 'function') window.setSidebarCountPill('favorites', favs.length);
 		const countSpan = document.getElementById('fav-count');
 		if (countSpan && !isPsnDomSectionVisible('subview-favs')) {
 			countSpan.innerText = `(${favs.length} item${favs.length === 1 ? '' : 's'})`;
@@ -25417,7 +25498,7 @@ P
     };
 
     window.updateDownloadUI = function() {
-		if (typeof window.updateSidebarCountPills === 'function') window.updateSidebarCountPills();
+		if (typeof window.setSidebarCountPill === 'function') window.setSidebarCountPill('downloads', Array.isArray(window.downloadHistory) ? window.downloadHistory.length : 0);
 		const isSilentRestore = !!window.isRestoringHistory;
 		const listContainer = document.getElementById('downloads-list');
 		const statCount = document.getElementById('stat-total-count');
@@ -26110,7 +26191,7 @@ P
 					const rowClass = `${isOnline ? '' : ' is-offline'}${isMe ? ' is-me' : ''}${isTargetAdmin ? ' is-admin-user' : ''}${isBanned ? ' is-banned' : ''}`;
 					const youTag = isMe ? '<span style="font-size:10px; opacity: 0.8; font-style: italic; margin-left: 3px;">(You)</span>' : '';
 					const roleTag = typeof window.buildPsnRoleBadge === 'function' ? window.buildPsnRoleBadge(name, u, 'name') : (role && role !== 'user' ? `<span class="admin-role-pill role-${adminEscapeAttr(role)}"><i class="fas fa-user-tag"></i>${adminEscapeHtml(role)}</span>` : '');
-					const sessionCountHtml = sessionCount > 1 ? `<span class="admin-session-count" title="${sessionCount} active sessions for this account"><i class="fas fa-layer-group"></i>${sessionCount} sessions</span>` : '';
+					const sessionCountHtml = sessionCount > 1 ? `<span class="admin-session-count" title="Inspect ${sessionCount} active sessions" onclick="event.stopPropagation(); adminOpenSessionInspector(decodeURIComponent('${encodeURIComponent(name)}'))"><i class="fas fa-layer-group"></i>${sessionCount} sessions</span>` : '';
 					const banActionButton = isBanned
 						? `<button class="btn-mini-round admin-unban-action" title="Unban user" ${isMe ? 'disabled' : ''} onclick="event.stopPropagation(); adminUnbanUser('${encodedName}', '${encodedSocketId}')"><i class="fas fa-unlock"></i></button>`
 						: `<button class="btn-mini-round admin-ban-action" title="Ban user" ${isProtected ? 'disabled' : ''} onclick="event.stopPropagation(); adminBanUser('${encodedName}', '${encodedSocketId}')"><i class="fas fa-ban"></i></button>`;
@@ -26180,6 +26261,46 @@ P
 		}
 
 		if (typeof adminRenderControlPanels === 'function') adminRenderControlPanels();
+	};
+
+	window.adminCloseSessionInspector = function() {
+		const modal = document.getElementById('admin-session-inspector-modal');
+		if (modal) modal.classList.remove('show');
+	};
+	window.adminOpenSessionInspector = function(name) {
+		if (!adminGuard(true) || !name) return;
+		let modal = document.getElementById('admin-session-inspector-modal');
+		if (!modal) {
+			modal = document.createElement('div');
+			modal.id = 'admin-session-inspector-modal';
+			modal.className = 'admin-session-inspector-overlay';
+			modal.innerHTML = '<div class="admin-session-inspector-card" onclick="event.stopPropagation()"><div class="admin-session-inspector-head"><i class="fas fa-layer-group"></i><h3 id="admin-session-inspector-title">Active sessions</h3><button class="admin-session-inspector-close" onclick="adminCloseSessionInspector()" title="Close"><i class="fas fa-times"></i></button></div><div id="admin-session-inspector-list" class="admin-session-inspector-list"></div></div>';
+			modal.addEventListener('click', window.adminCloseSessionInspector);
+			document.body.appendChild(modal);
+		}
+		const title = document.getElementById('admin-session-inspector-title');
+		const list = document.getElementById('admin-session-inspector-list');
+		if (title) title.textContent = `${name} · sessions`;
+		if (list) list.innerHTML = '<div class="admin-empty"><i class="fas fa-circle-notch fa-spin"></i> Loading active sessions…</div>';
+		modal.classList.add('show');
+		if (!socketChat || !socketChat.connected) { if (list) list.innerHTML='<div class="admin-empty">Server unavailable.</div>'; return; }
+		socketChat.emit('request_admin_user_sessions', { name }, function(response) {
+			if (!modal.classList.contains('show') || !list) return;
+			if (!response || response.ok !== true) { list.innerHTML='<div class="admin-empty">Could not load sessions.</div>'; return; }
+			const sessions = Array.isArray(response.sessions) ? response.sessions : [];
+			if (title) title.textContent = `${name} · ${sessions.length} active session${sessions.length===1?'':'s'}`;
+			if (!sessions.length) { list.innerHTML='<div class="admin-empty">No active sessions.</div>'; return; }
+			const age = value => typeof formatLastSeen === 'function' ? formatLastSeen(Number(value)||Date.now()) : new Date(Number(value)||Date.now()).toLocaleString();
+			list.innerHTML = sessions.map((session,index) => '<div class="admin-session-inspector-item">' +
+				'<div class="admin-session-inspector-label">Session</div><div class="admin-session-inspector-value">#'+(index+1)+' · '+adminEscapeHtml(session.device||'Unknown')+'</div>'+
+				'<div class="admin-session-inspector-label">Render instance</div><div class="admin-session-inspector-value">'+adminEscapeHtml(session.instanceId||'Unknown')+'</div>'+
+				'<div class="admin-session-inspector-label">Connected</div><div class="admin-session-inspector-value">'+adminEscapeHtml(age(session.connectedAt))+'</div>'+
+				'<div class="admin-session-inspector-label">Heartbeat</div><div class="admin-session-inspector-value">'+adminEscapeHtml(age(session.lastHeartbeat))+'</div>'+
+				'<div class="admin-session-inspector-label">Transport</div><div class="admin-session-inspector-value">'+adminEscapeHtml(session.transport||'unknown')+'</div>'+
+				'<div class="admin-session-inspector-label">Socket ID</div><div class="admin-session-inspector-value">'+adminEscapeHtml(session.socketId||'')+'</div>'+
+				'<div class="admin-session-inspector-label">PS3</div><div class="admin-session-inspector-value">'+(session.ps3Connected?'Connected':'Not connected')+'</div>'+
+				'<div class="admin-session-inspector-label">Client</div><div class="admin-session-inspector-value">'+adminEscapeHtml(session.userAgent||'Unavailable')+'</div></div>').join('');
+		});
 	};
 
 	window.adminRequestUsersList = function(silent = false, includeRegistered = true, append = false) {
@@ -29671,6 +29792,17 @@ P
 			}
 		}
 	
+		if (typeof window.ensureProfileSectionHydrated === 'function') {
+			if (viewId === 'view-downloads') window.ensureProfileSectionHydrated('downloads', { reason:'open-downloads' });
+			else if (viewId === 'view-wishlist') window.ensureProfileSectionHydrated('wishlist', { reason:'open-wishlist' });
+			else if (viewId === 'view-trophies') window.ensureProfileSectionHydrated('trophies', { reason:'open-trophies' });
+			else if (viewId === 'view-library') {
+				window.ensureProfileSectionHydrated('library', { reason:'open-library' });
+				window.ensureProfileSectionHydrated('favorites', { reason:'open-library-favorites' });
+			}
+			else if (viewId === 'view-chat') window.ensureProfileSectionHydrated('friends', { reason:'open-social' });
+		}
+
 		if (viewId === 'view-trending') {
 			document.getElementById('nav-trending')?.classList.add('active');
 			if (typeof renderCachedTrendingIfVisible === 'function') renderCachedTrendingIfVisible();
@@ -30910,8 +31042,9 @@ P
 		setTimeout(finish, duration + 90);
 	};
 
-	window.toggleWishlist = function(event, gameId) {
+	window.toggleWishlist = async function(event, gameId) {
 		if (event) event.stopPropagation();
+		if (typeof window.ensureMutableProfileSectionReady === 'function' && !(await window.ensureMutableProfileSectionReady('wishlist', 'wishlist-toggle'))) return;
 
 		const btn = event ? event.currentTarget : null;
 		const modal = document.getElementById('game-modal');
@@ -31228,7 +31361,7 @@ P
 
 
 	window.updateWishlistUI = async function(isSilent = false, progressiveMode = 'reset') {
-		if (typeof window.updateSidebarCountPills === 'function') window.updateSidebarCountPills();
+		if (typeof window.setSidebarCountPill === 'function') window.setSidebarCountPill('wishlist', Array.isArray(window.wishlist) ? window.wishlist.length : 0);
 		isSilent = isSilent || !!window.isRestoringHistory;
 		const appendProgressive = progressiveMode === 'append';
 		const renderToken = (window.__wishlistRenderToken || 0) + 1;
@@ -32320,7 +32453,7 @@ P
 			.then(text => {
 				window.revivedServersTsvText = text;
 				window.revivedServersTotalCount = countRevivedServersFromTSV(text);
-				if (typeof window.updateSidebarCountPills === 'function') window.updateSidebarCountPills();
+				if (typeof window.setSidebarCountPill === 'function') window.setSidebarCountPill('revived', window.revivedServersTotalCount);
 				return text;
 			})
 			.catch(error => {
@@ -32476,7 +32609,7 @@ P
 			if (revivedServerTitleEl) revivedServerTitleEl.textContent = revivedServerCount === 1 ? 'Revived Server' : 'Revived Servers';
 			if (revivedServerCountEl) revivedServerCountEl.textContent = `(${window.formatUiCount ? window.formatUiCount(revivedServerCount, 'item', 'items') : `${revivedServerCount} ${revivedServerCount === 1 ? 'item' : 'items'}`})`;
 			window.revivedServersTotalCount = revivedServerCount;
-			if (typeof window.updateSidebarCountPills === 'function') window.updateSidebarCountPills();
+			if (typeof window.setSidebarCountPill === 'function') window.setSidebarCountPill('revived', revivedServerCount);
 	
 			await Promise.all(renderPromises);
 	
@@ -32485,7 +32618,7 @@ P
 			if (revivedServerTitleEl) revivedServerTitleEl.textContent = 'Revived Servers';
 			if (revivedServerCountEl) revivedServerCountEl.textContent = '(0 items)';
 			window.revivedServersTotalCount = 0;
-			if (typeof window.updateSidebarCountPills === 'function') window.updateSidebarCountPills();
+			if (typeof window.setSidebarCountPill === 'function') window.setSidebarCountPill('revived', 0);
 			container.innerHTML = '<div class="loader" style="color:red;">Failed to load server data.</div>';
 		}
 	};
@@ -32901,6 +33034,7 @@ P
 		if (document.body) document.body.classList.add('ps3-pad-session-exiting');
 		if (typeof window.adminDismissAnnouncementForSessionExit === 'function') window.adminDismissAnnouncementForSessionExit();
 		window.isProfileLoaded = false;
+		if (typeof window.resetProfileClientSyncRuntime === 'function') window.resetProfileClientSyncRuntime();
 		window.__trophiesHydrated = false;
 		window.__initialProfileSyncInProgress = false;
 		window.__postAuthChatGate = null;
@@ -33045,6 +33179,7 @@ P
 			if (document.body) document.body.classList.add('ps3-pad-session-exiting');
 			if (typeof window.adminDismissAnnouncementForSessionExit === 'function') window.adminDismissAnnouncementForSessionExit();
 			window.isProfileLoaded = false;
+			if (typeof window.resetProfileClientSyncRuntime === 'function') window.resetProfileClientSyncRuntime();
 			window.__trophiesHydrated = false;
 			window.__initialProfileSyncInProgress = false;
 			window.__postAuthChatGate = null;
@@ -33309,7 +33444,7 @@ P
 		const isConnected = !!(globalIcon && globalIcon.classList.contains('status-dot-connected'));
 		if (statusText) statusText.innerText = isConnected ? "Connected" : "Disconnected";
 		status.classList.toggle('is-connected', isConnected);
-		if (typeof window.updateSidebarCountPills === 'function') window.updateSidebarCountPills();
+		if (typeof window.setSidebarCountPill === 'function') { window.setSidebarCountPill('games', Array.isArray(window.lastScannedGames) ? window.lastScannedGames.length : 0); window.setSidebarCountPill('favorites', Array.isArray(window.favoritesLibrary) ? window.favoritesLibrary.length : 0); }
 	}
 	
 	let _lastGameTitle = null;
@@ -35187,8 +35322,9 @@ function formatLibraryLastPlayedBadge(game = {}) {
 		renderLocalLibrary(filtered, true, !!isSilent);
 	};
 	
-	window.toggleLocalFavorite = function(event, index) {
+	window.toggleLocalFavorite = async function(event, index) {
 		if (event) event.stopPropagation();
+		if (typeof window.ensureMutableProfileSectionReady === 'function' && !(await window.ensureMutableProfileSectionReady('favorites', 'favorite-toggle'))) return;
 		const card = event.currentTarget.closest('.game-card');
 	
 		const isFavView = document.getElementById('subview-favs').style.display === 'block';
@@ -35225,7 +35361,7 @@ function formatLibraryLastPlayedBadge(game = {}) {
 			const removedFavoriteItem = favoritesLibrary[favIndex] || game;
 			favoritesLibrary.splice(favIndex, 1);
 			if (typeof window.emitFriendActivityContentAction === 'function') window.emitFriendActivityContentAction('favorite', favoriteActivityItem(removedFavoriteItem), 'remove');
-			if (typeof window.updateSidebarCountPills === 'function') window.updateSidebarCountPills();
+			if (typeof window.setSidebarCountPill === 'function') window.setSidebarCountPill('favorites', favoritesLibrary.length);
 			btn.style.pointerEvents = 'none';
 			btn.title = "Add to Favorites";
 			if (card) {
@@ -35264,7 +35400,7 @@ function formatLibraryLastPlayedBadge(game = {}) {
 			}
 			favoritesLibrary.push(itemToAdd);
 			if (typeof window.emitFriendActivityContentAction === 'function') window.emitFriendActivityContentAction('favorite', favoriteActivityItem(itemToAdd), 'add');
-			if (typeof window.updateSidebarCountPills === 'function') window.updateSidebarCountPills();
+			if (typeof window.setSidebarCountPill === 'function') window.setSidebarCountPill('favorites', favoritesLibrary.length);
 			if (card) card.classList.add('is-favorited');
 			icon.className = 'fas fa-star';
 			icon.style.color = '#ffcc00';
@@ -35307,8 +35443,9 @@ function formatLibraryLastPlayedBadge(game = {}) {
 		window.broadcastProfileUpdate();
 	};
 	
-	window.removeFromFavsOnly = function(event, index) {
+	window.removeFromFavsOnly = async function(event, index) {
 		if (event) event.stopPropagation();
+		if (typeof window.ensureMutableProfileSectionReady === 'function' && !(await window.ensureMutableProfileSectionReady('favorites', 'favorite-remove'))) return;
 		const btn = event.currentTarget;
 		const card = btn.closest('.game-card');
 		if (!card) return;
@@ -35332,7 +35469,7 @@ function formatLibraryLastPlayedBadge(game = {}) {
 				category:removedFavoriteItem.category || 'games'
 			}, 'remove');
 		}
-		if (typeof window.updateSidebarCountPills === 'function') window.updateSidebarCountPills();
+		if (typeof window.setSidebarCountPill === 'function') window.setSidebarCountPill('favorites', favoritesLibrary.length);
 		saveState(STORAGE_KEY_FAVS, JSON.stringify(favoritesLibrary));
 		markProfileListChanged('favorites');
 		
@@ -35361,7 +35498,7 @@ function formatLibraryLastPlayedBadge(game = {}) {
 	};
 	
 	window.updateFavoritesLibraryUI = function(isSilent = false, progressiveMode = 'reset') {
-		if (typeof window.updateSidebarCountPills === 'function') window.updateSidebarCountPills();
+		if (typeof window.setSidebarCountPill === 'function') window.setSidebarCountPill('favorites', Array.isArray(window.favoritesLibrary) ? window.favoritesLibrary.length : 0);
 		isSilent = isSilent || !!window.isRestoringHistory;
 		const appendProgressive = progressiveMode === 'append';
 		const ip = document.getElementById('ps3-ip').value;
@@ -37082,8 +37219,8 @@ function formatLibraryLastPlayedBadge(game = {}) {
     }
 
     function updateConsoleLibraryStatusUI(games = null) {
-        if (typeof window.updateSidebarCountPills === 'function') window.updateSidebarCountPills();
         const sourceGames = Array.isArray(games) ? games : (Array.isArray(window.lastScannedGames) ? window.lastScannedGames : (typeof lastScannedGames !== 'undefined' && Array.isArray(lastScannedGames) ? lastScannedGames : []));
+        if (typeof window.setSidebarCountPill === 'function') window.setSidebarCountPill('games', sourceGames.length);
         const status = buildConsoleLibraryStatus(sourceGames);
         const chart = document.getElementById('console-library-chart');
         const total = status.total || 0;
@@ -39939,7 +40076,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 
 	function saveTrophies(options = {}) {
 		saveState('psn_user_trophies', JSON.stringify(window.userTrophies));
-		if (typeof window.updateSidebarCountPills === 'function') window.updateSidebarCountPills();
+		if (typeof window.refreshTrophyRewardSidebarCounts === 'function') window.refreshTrophyRewardSidebarCounts();
 		if (typeof psnMarkTrophyViewsDirty === 'function') psnMarkTrophyViewsDirty();
 		if (typeof renderTrophiesView === 'function' && psnIsViewVisible('view-trophies')) renderTrophiesView(false);
 		if (typeof renderRewardsView === 'function' && psnIsViewVisible('view-rewards')) renderRewardsView();
@@ -40005,7 +40142,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 			saveState('psn_trophy_dot_items', JSON.stringify(collectTrophyNotificationPendingItems()));
 			const trophyViewAlreadyVisible = document.getElementById('view-trophies')?.style.display === 'block';
 			if (!trophyViewAlreadyVisible) saveState('psn_trophy_dot', 'true');
-			if (typeof window.updateSidebarCountPills === 'function') window.updateSidebarCountPills();
+			if (typeof window.refreshTrophyRewardSidebarCounts === 'function') window.refreshTrophyRewardSidebarCounts();
 			
 			if (typeof markProfileSyncDirty === 'function') markProfileSyncDirty('trophies');
 			if (typeof window.emitFriendTrophyActivity === 'function') window.emitFriendTrophyActivity(trophyId, trophy);
@@ -40377,7 +40514,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 		{ id: 'rew_banner_7', req: 'dl_homebrew', title: 'Cosmic Nebula Banner', kind: 'banner', styleId: 'nebula' },
 		{ id: 'rew_banner_8', req: 'trailer_10', title: 'Inferno Banner', kind: 'banner', styleId: 'spotlight' }
 	];
-	if (typeof window.updateSidebarCountPills === 'function') window.updateSidebarCountPills();
+	if (typeof window.refreshTrophyRewardSidebarCounts === 'function') window.refreshTrophyRewardSidebarCounts();
 	
 
 	let rewardsRevealPrepToken = 0;
@@ -41502,7 +41639,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
             window.__chatCacheReadyForWrite = true;
             window.__chatInitialSnapshotPending = holdForServer;
             window.messageHistory = cachedHistory;
-            if (typeof window.updateSidebarCountPills === 'function') window.updateSidebarCountPills();
+            if (typeof window.setSidebarCountPill === 'function') window.setSidebarCountPill('chat', cachedHistory.length);
             window.__chatVirtualStartIndex = Math.max(0, cachedHistory.length - getChatVirtualInitialLimit());
             window.__chatVirtualEndIndex = cachedHistory.length;
             window.__chatHistoryDomRendered = false;
@@ -41559,7 +41696,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
         if (hasMessageChanges) handleChatHistorySnapshot(nextHistory);
         else {
             window.messageHistory = nextHistory;
-            if (typeof window.updateSidebarCountPills === 'function') window.updateSidebarCountPills();
+            if (typeof window.setSidebarCountPill === 'function') window.setSidebarCountPill('chat', nextHistory.length);
             window.__chatHistoryReceived = true;
             window.__chatHistoryRequesting = false;
             window.__chatHistoryRequestRetries = 0;
@@ -41596,7 +41733,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
         }
         if (incomingRevision <= currentRevision) return true;
         window.messageHistory = mergeChatSyncChanges(window.messageHistory || [], [change]);
-        if (typeof window.updateSidebarCountPills === 'function') window.updateSidebarCountPills();
+        if (typeof window.setSidebarCountPill === 'function') window.setSidebarCountPill('chat', window.messageHistory.length);
         window.__chatCacheEpoch = incomingEpoch;
         window.__chatCacheRevision = incomingRevision;
         if (typeof updateChatHistoryRenderSignature === 'function') updateChatHistoryRenderSignature();
@@ -41633,7 +41770,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
         };
 
         window.messageHistory = normalizedHistory;
-        if (typeof window.updateSidebarCountPills === 'function') window.updateSidebarCountPills();
+        if (typeof window.setSidebarCountPill === 'function') window.setSidebarCountPill('chat', normalizedHistory.length);
         window.__chatVirtualStartIndex = 0;
         window.__chatVirtualEndIndex = normalizedHistory.length;
         if (typeof registerChatUsersFromHistory === 'function') registerChatUsersFromHistory(window.messageHistory);
@@ -47861,6 +47998,86 @@ function getVisibleChatStackEl(id) {
 	};
 
 
+	window.__profileHydratedSections = window.__profileHydratedSections instanceof Set ? window.__profileHydratedSections : new Set();
+	window.__profileSectionRequests = window.__profileSectionRequests || {};
+	window.getProfileHydrationKey = function(section, username = localStorage.getItem('psn_username') || '') {
+		const map = { trophiesData:'trophies', downloadsData:'downloads', wishlistData:'wishlist', favoritesData:'favorites', libraryData:'library', friendsData:'friends' };
+		const key = map[section] || String(section || '').replace(/Data$/, '').toLowerCase();
+		const owner = String(username || '').trim();
+		return owner && key ? `${owner.toLowerCase()}|${key}` : '';
+	};
+	window.markProfileSectionHydrated = function(section) {
+		const hydrationKey = window.getProfileHydrationKey(section);
+		if (hydrationKey) window.__profileHydratedSections.add(hydrationKey);
+	};
+	window.ensureProfileSectionHydrated = function(section, options = {}) {
+		const key = String(section || '').toLowerCase();
+		if (!['trophies','downloads','wishlist','favorites','library','friends'].includes(key)) return Promise.resolve(false);
+		const owner = String(localStorage.getItem('psn_username') || '').trim();
+		const hydrationKey = window.getProfileHydrationKey(key, owner);
+		if (!owner || !hydrationKey) return Promise.resolve(false);
+		if (!options.force && window.__profileHydratedSections.has(hydrationKey)) return Promise.resolve(true);
+		if (!socketChat || !socketChat.connected || !window.isProfileLoaded) return Promise.resolve(false);
+		if (window.__profileSectionRequests[hydrationKey]) return window.__profileSectionRequests[hydrationKey];
+		const requestPromise = new Promise(resolve => {
+			const request = { reason:options.reason || `lazy-${key}`, forceRefresh:false, lazyHydrate:true, sections:[key] };
+			const done = response => {
+				if (window.__profileSectionRequests[hydrationKey] === requestPromise) delete window.__profileSectionRequests[hydrationKey];
+				if (String(localStorage.getItem('psn_username') || '').trim() !== owner) { resolve(false); return; }
+				const ok = !!(response && response.ok !== false);
+				if (ok && !window.__profileHydratedSections.has(hydrationKey) && socketChat && socketChat.connected) {
+					setTimeout(() => window.ensureProfileSectionHydrated(key, { ...options, force:true, reason:`${request.reason}-retry` }).then(resolve), 80);
+					return;
+				}
+				resolve(ok && window.__profileHydratedSections.has(hydrationKey));
+			};
+			if (typeof socketChat.timeout === 'function') socketChat.timeout(12000).emit('request_profile_sync', request, (err,response)=>done(err?{ok:false}:response));
+			else socketChat.emit('request_profile_sync', request, done);
+		});
+		window.__profileSectionRequests[hydrationKey] = requestPromise;
+		return requestPromise;
+	};
+
+	window.ensureMutableProfileSectionReady = async function(section, reason = 'mutation') {
+		const key = String(section || '').toLowerCase();
+		if (!['downloads','wishlist','favorites'].includes(key)) return true;
+		if (window.__psnOfflineModeActive === true || !socketChat || !socketChat.connected) return true;
+		if (!window.isProfileLoaded || typeof window.ensureProfileSectionHydrated !== 'function') return false;
+		const owner = String(localStorage.getItem('psn_username') || '').trim();
+		const hydrationKey = typeof window.getProfileHydrationKey === 'function' ? window.getProfileHydrationKey(key, owner) : '';
+		if (hydrationKey && window.__profileHydratedSections instanceof Set && window.__profileHydratedSections.has(hydrationKey)) return true;
+		const ok = await window.ensureProfileSectionHydrated(key, { reason: `${reason}-${key}` });
+		if (!ok && typeof showToastNotification === 'function') showToastNotification('Profile', `Could not sync ${key} yet. Please try again.`);
+		return ok;
+	};
+
+	window.__lastRealtimeRecoveryAt = 0;
+	window.recoverPsnRealtimeState = function(reason = 'resume') {
+		if (document.hidden || !window.isProfileLoaded || !socketChat || !socketChat.connected) return false;
+		const now = Date.now();
+		if (now - Number(window.__lastRealtimeRecoveryAt || 0) < 1200) return false;
+		window.__lastRealtimeRecoveryAt = now;
+		const beforeProfileUpdatedAt = Number(window.__lastAppliedProfileUpdatedAt || 0);
+		if (typeof socketChat.timeout === 'function') {
+			socketChat.timeout(2500).emit('presence_ping', { reason, at:now }, (err,response) => { if (err || !response || response.success !== true) socketChat.emit('request_online_list'); });
+		} else socketChat.emit('presence_ping', { reason, at:now });
+		if (typeof window.bootstrapFriendActivityRealtime === 'function') window.bootstrapFriendActivityRealtime({ reason, forceFull:false });
+		if (typeof window.bootstrapNotificationCenterRealtime === 'function') window.bootstrapNotificationCenterRealtime({ reason, forceFull:false });
+		if (typeof bootstrapChatRealtime === 'function') bootstrapChatRealtime(reason);
+		const request = { reason, forceRefresh:false, lazyHydrate:true, sinceProfileUpdatedAt:beforeProfileUpdatedAt };
+		const done = response => {
+			const remoteRevision = Number(response && response.profileUpdatedAt || 0);
+			if (remoteRevision > beforeProfileUpdatedAt) window.__profileHydratedSections.clear();
+			if (document.getElementById('view-downloads')?.style.display === 'block') window.ensureProfileSectionHydrated('downloads', { force:remoteRevision > beforeProfileUpdatedAt, reason:`${reason}-visible` });
+			else if (document.getElementById('view-wishlist')?.style.display === 'block') window.ensureProfileSectionHydrated('wishlist', { force:remoteRevision > beforeProfileUpdatedAt, reason:`${reason}-visible` });
+			else if (document.getElementById('view-trophies')?.style.display === 'block') window.ensureProfileSectionHydrated('trophies', { force:remoteRevision > beforeProfileUpdatedAt, reason:`${reason}-visible` });
+			else if (document.getElementById('view-library')?.style.display === 'block') { window.ensureProfileSectionHydrated('library', { force:remoteRevision > beforeProfileUpdatedAt, reason:`${reason}-visible` }); window.ensureProfileSectionHydrated('favorites', { force:remoteRevision > beforeProfileUpdatedAt, reason:`${reason}-visible` }); }
+		};
+		if (typeof socketChat.timeout === 'function') socketChat.timeout(8000).emit('request_profile_sync', request, (err,response)=>done(err?null:response));
+		else socketChat.emit('request_profile_sync', request, done);
+		return true;
+	};
+
 	window.applyRemoteProfileSync = function(payload = {}) {
 		const name = String(payload.name || payload.targetName || '').trim();
 		const userData = payload.userData || payload.data || {};
@@ -48614,6 +48831,7 @@ function getVisibleChatStackEl(id) {
 		if (psnOfflineModeActive) { ensurePsnOfflineModeReconnect({ reason: 'offline mode active' }); return; }
 		if (socketChat && socketChat.connected) {
 			resetSessionAutoReconnectState();
+			if (typeof window.recoverPsnRealtimeState === 'function') setTimeout(() => window.recoverPsnRealtimeState('visibility-resume'), 180);
 			return;
 		}
 
@@ -49033,13 +49251,8 @@ function getVisibleChatStackEl(id) {
 					if (!socketChat || !socketChat.connected) return;
 					const syncName = localStorage.getItem('psn_username') || '';
 					if (!syncName || syncName === 'null' || syncName === 'undefined') return;
-					if (typeof socketChat.timeout === 'function') {
-						socketChat.timeout(2500).emit('presence_ping', { reason: 'reconnect', at: Date.now() }, () => {});
-					} else {
-						socketChat.emit('presence_ping', { reason: 'reconnect', at: Date.now() });
-					}
-					socketChat.emit('request_online_list');
-					if (window.isProfileLoaded) socketChat.emit('request_profile_sync', { forceRefresh: true, reason: 'reconnect', at: Date.now() });
+					if (typeof window.recoverPsnRealtimeState === 'function') window.recoverPsnRealtimeState('reconnect');
+					else socketChat.emit('request_online_list');
 					profileRealtimeConnectionWasLost = false;
 				}, 500);
 			}
@@ -49126,7 +49339,7 @@ function getVisibleChatStackEl(id) {
 				window.userTrophies = userData.trophiesData;
 				safeLocalStorageSet(`${name}_psn_user_trophies`, JSON.stringify(userData.trophiesData));
 				window.__trophiesHydrated = true;
-				if (typeof window.updateSidebarCountPills === 'function') window.updateSidebarCountPills();
+				if (typeof window.refreshTrophyRewardSidebarCounts === 'function') window.refreshTrophyRewardSidebarCounts();
 			} else if (isLightAuthPayload) {
 				const localTrophies = localStorage.getItem(`${name}_psn_user_trophies`);
 				try {
@@ -49188,16 +49401,16 @@ function getVisibleChatStackEl(id) {
 
 			if (Array.isArray(userData.friendsData)) {
 				window.friendsList = userData.friendsData;
-			if (typeof window.updateSidebarCountPills === 'function') window.updateSidebarCountPills();
+			if (typeof window.setSidebarCountPill === 'function') window.setSidebarCountPill('friends', window.friendsList.length);
 				safeLocalStorageSet(`${name}_psn_friends_list`, JSON.stringify(userData.friendsData));
 				applyProfileListUpdatedAtFromServer(name, 'friends', userData.friendsUpdatedAt);
 			} else if (isLightAuthPayload) {
 				if (!Array.isArray(window.friendsList)) window.friendsList = [];
-			if (typeof window.updateSidebarCountPills === 'function') window.updateSidebarCountPills();
+			if (typeof window.setSidebarCountPill === 'function') window.setSidebarCountPill('friends', window.friendsList.length);
 			} else {
 				const localFriends = localStorage.getItem(`${name}_psn_friends_list`);
 				window.friendsList = localFriends ? JSON.parse(localFriends) : [];
-			if (typeof window.updateSidebarCountPills === 'function') window.updateSidebarCountPills();
+			if (typeof window.setSidebarCountPill === 'function') window.setSidebarCountPill('friends', window.friendsList.length);
 			}
 
 			if (userData.countersData) {
@@ -49347,7 +49560,10 @@ function getVisibleChatStackEl(id) {
 					const request = {
 						reason: shouldFinishInteractiveBoot ? 'pre_boot' : 'post_light_auth',
 						forceRefresh: false,
-						criticalReadyAck: true
+						lazyHydrate: true,
+						sections: ['trophies','downloads','wishlist','favorites','friends'],
+						includeCore: true,
+						criticalReadyAck: false
 					};
 					if (typeof socketChat.timeout === 'function') {
 						socketChat.timeout(initialProfileSyncTimeoutMs).emit('request_profile_sync', request, (err, response) => {
@@ -49609,6 +49825,15 @@ function getVisibleChatStackEl(id) {
 			}
 
 			window.__chatOnlineListReceived = true;
+			window.__presenceRevisionByUser = window.__presenceRevisionByUser || {};
+			window.__presenceLastSeenByUser = window.__presenceLastSeenByUser || {};
+			users.forEach(u => {
+				if (!u || !u.name) return;
+				const revision = Math.max(0, Number(u.presenceRevision) || 0);
+				const lastSeen = Math.max(0, Number(u.lastSeen) || 0);
+				if (revision) window.__presenceRevisionByUser[u.name] = Math.max(Number(window.__presenceRevisionByUser[u.name] || 0), revision);
+				if (lastSeen) window.__presenceLastSeenByUser[u.name] = Math.max(Number(window.__presenceLastSeenByUser[u.name] || 0), lastSeen);
+			});
 
 			const activeUsersCount = users.filter(u => u.online === true).length;
 			const onlineCountText = `${activeUsersCount} Online`;
@@ -49649,11 +49874,11 @@ function getVisibleChatStackEl(id) {
 						safeLocalStorageSet(`${prefix}joined`, u.joined || "2026");
 						if (incomingProfileUpdatedAt && incomingProfileUpdatedAt >= storedProfileUpdatedAt) safeLocalStorageSet(`${prefix}online_profile_updated_at`, String(incomingProfileUpdatedAt));
 						if (canUpdateProfileCounts) {
-							safeLocalStorageSet(`${prefix}downloads`, u.downloads || 0);
-							safeLocalStorageSet(`${prefix}wishlist`, u.wishlist || 0);
-							safeLocalStorageSet(`${prefix}favs`, u.favorites || 0);
-							safeLocalStorageSet(`${prefix}trophies`, u.trophies || 0); 
-							safeLocalStorageSet(`${prefix}library`, u.library || 0);
+							if (Object.prototype.hasOwnProperty.call(u,'downloads')) safeLocalStorageSet(`${prefix}downloads`, u.downloads || 0);
+							if (Object.prototype.hasOwnProperty.call(u,'wishlist')) safeLocalStorageSet(`${prefix}wishlist`, u.wishlist || 0);
+							if (Object.prototype.hasOwnProperty.call(u,'favorites')) safeLocalStorageSet(`${prefix}favs`, u.favorites || 0);
+							if (Object.prototype.hasOwnProperty.call(u,'trophies')) safeLocalStorageSet(`${prefix}trophies`, u.trophies || 0);
+							if (Object.prototype.hasOwnProperty.call(u,'library')) safeLocalStorageSet(`${prefix}library`, u.library || 0);
 						}
 						if (u.role && String(u.role).toLowerCase() !== 'banned') safeLocalStorageSet(`${prefix}role`, String(u.role).toLowerCase() === 'moderator' ? 'mod' : String(u.role).toLowerCase());
 						else if (String(u.role || '').toLowerCase() === 'banned') localStorage.removeItem(`${prefix}role`);
@@ -49857,7 +50082,7 @@ function getVisibleChatStackEl(id) {
 			const alreadyRendered = incomingKey && window.messageHistory.some(m => String(new Date(m && m.time).getTime() || m?.time || '') === incomingKey);
 			if (alreadyRendered) return;
 			window.messageHistory.push(data);
-			if (typeof window.updateSidebarCountPills === 'function') window.updateSidebarCountPills();
+			if (typeof window.setSidebarCountPill === 'function') window.setSidebarCountPill('chat', window.messageHistory.length);
 			if (window.messageHistory.length > MAX_CHAT_HISTORY) {
 				window.messageHistory.shift();
 				window.__chatVirtualStartIndex = Math.max(0, Number(window.__chatVirtualStartIndex || 0) - 1);
@@ -50163,7 +50388,7 @@ function getVisibleChatStackEl(id) {
 		socketChat.on('message_deleted', function(msgId) {
 			if (window.messageHistory) {
 				window.messageHistory = window.messageHistory.filter(m => String(new Date(m.time).getTime()) !== String(msgId));
-			if (typeof window.updateSidebarCountPills === 'function') window.updateSidebarCountPills();
+			if (typeof window.setSidebarCountPill === 'function') window.setSidebarCountPill('chat', window.messageHistory.length);
 			}
 		
 			if (typeof editingMsgId !== 'undefined' && String(editingMsgId) === String(msgId)) {
@@ -50319,7 +50544,7 @@ function getVisibleChatStackEl(id) {
 			}
 		
 			window.messageHistory = [];
-			if (typeof window.updateSidebarCountPills === 'function') window.updateSidebarCountPills();
+			if (typeof window.setSidebarCountPill === 'function') window.setSidebarCountPill('chat', 0);
 			window.__chatCacheEpoch = String(data.chatEpoch || '');
 			window.__chatCacheRevision = Math.max(0, Number(data.chatRevision) || 0);
 			window.__chatSeenCursor = 0;
@@ -50537,9 +50762,18 @@ function getVisibleChatStackEl(id) {
 			try {
 				const name = String(data.name || '').trim();
 				if (!name || name === 'Guest') return;
+				window.__presenceRevisionByUser = window.__presenceRevisionByUser || {};
+				window.__presenceLastSeenByUser = window.__presenceLastSeenByUser || {};
+				const incomingRevision = Math.max(0, Number(data.presenceRevision) || 0);
+				const incomingLastSeen = Math.max(0, Number(data.lastSeen) || 0);
+				const previousRevision = Math.max(0, Number(window.__presenceRevisionByUser[name]) || 0);
+				const previousLastSeen = Math.max(0, Number(window.__presenceLastSeenByUser[name]) || 0);
+				if (incomingRevision && previousRevision && (incomingRevision < previousRevision || (incomingRevision === previousRevision && incomingLastSeen && previousLastSeen && incomingLastSeen < previousLastSeen))) return;
+				if (incomingRevision) window.__presenceRevisionByUser[name] = Math.max(previousRevision, incomingRevision);
+				if (incomingLastSeen) window.__presenceLastSeenByUser[name] = Math.max(previousLastSeen, incomingLastSeen);
 
 				const online = data.online === true;
-				const lastSeen = Number(data.lastSeen || 0) || Date.now();
+				const lastSeen = incomingLastSeen || Date.now();
 				safeLocalStorageSet(`${name}_psn_lastSeen`, String(lastSeen));
 				if (data.avatar) safeLocalStorageSet(`${name}_psn_avatar`, data.avatar);
 				if (data.level) safeLocalStorageSet(`${name}_psn_level`, String(data.level));
@@ -50621,6 +50855,11 @@ function getVisibleChatStackEl(id) {
 			try {
 				const name = String(data.name || '').trim();
 				if (!name) return;
+				window.__profileCountsRevisionByUser = window.__profileCountsRevisionByUser || {};
+				const incomingCountsRevision = Math.max(0, Number(data.profileUpdatedAt) || 0);
+				const previousCountsRevision = Math.max(0, Number(window.__profileCountsRevisionByUser[name]) || 0);
+				if (incomingCountsRevision && previousCountsRevision && incomingCountsRevision < previousCountsRevision) return;
+				if (incomingCountsRevision) window.__profileCountsRevisionByUser[name] = Math.max(previousCountsRevision, incomingCountsRevision);
 
 				const countFields = {
 					downloads: ['downloads', 'card-downloads'],
@@ -50649,6 +50888,13 @@ function getVisibleChatStackEl(id) {
 				updateCachedUser(window.currentOnlineList);
 				updateCachedUser(window.globalSearchResults);
 				updateCachedUser(window.adminAllUsers);
+				const myNameForCounts = localStorage.getItem('psn_username') || '';
+				if (name === myNameForCounts && typeof window.setSidebarCountPill === 'function') {
+					if (Object.prototype.hasOwnProperty.call(data,'downloads')) window.setSidebarCountPill('downloads', data.downloads);
+					if (Object.prototype.hasOwnProperty.call(data,'wishlist')) window.setSidebarCountPill('wishlist', data.wishlist);
+					if (Object.prototype.hasOwnProperty.call(data,'favorites')) window.setSidebarCountPill('favorites', data.favorites);
+					if (Object.prototype.hasOwnProperty.call(data,'trophies')) window.setSidebarCountPill('trophies', data.trophies);
+				}
 
 				const profileModal = document.getElementById('modal-sys-profile');
 				const profileOpen = !!(profileModal && profileModal.dataset.profileUsername === name && (profileModal.style.display === 'flex' || profileModal.style.display === 'block' || profileModal.classList.contains('show')));
@@ -50742,6 +50988,7 @@ function getVisibleChatStackEl(id) {
 				else if (Array.isArray(userData.libraryData)) section = 'libraryData';
 				else if (Array.isArray(userData.friendsData)) section = 'friendsData';
 				else if (Array.isArray(userData.recentlyVisitedData)) section = 'recentlyVisitedData';
+				if (typeof window.markProfileSectionHydrated === 'function' && section !== 'core') window.markProfileSectionHydrated(section);
 				respond({ ok: true, section });
 			} catch (err) {
 				console.warn('[PROFILE SYNC] Could not acknowledge profile data:', err);
@@ -51003,6 +51250,7 @@ function getVisibleChatStackEl(id) {
 
 	window.broadcastProfileUpdate = function() {
 		if (window.__applyingRemoteProfileSync) return;
+		if (window.__profileUpdateInFlight) { window.__profileUpdateQueued = true; return; }
 		if (window.__psnOfflineModeActive === true) {
 			if (typeof window.persistCurrentProfileSyncDirtyState === 'function') window.persistCurrentProfileSyncDirtyState();
 			return;
@@ -51087,14 +51335,36 @@ function getVisibleChatStackEl(id) {
 		}
 
 		if (!Object.keys(payload).length) return;
-		socketChat.emit('update_profile', payload);
-
-		if (syncState) {
-			syncState.lastBaseSignature = baseSignature;
-			Object.keys(syncState.dirty).forEach(key => {
-				if (dirty[key]) syncState.dirty[key] = false;
-			});
-		}
+		const sentDirtyKeys = syncState ? Object.keys(syncState.dirty).filter(key => dirty[key]) : [];
+		const sentBaseProfile = Object.prototype.hasOwnProperty.call(payload, 'avatar') || Object.prototype.hasOwnProperty.call(payload, 'joined') || Object.prototype.hasOwnProperty.call(payload, 'countryCode') || Object.prototype.hasOwnProperty.call(payload, 'ps3Status') || Object.prototype.hasOwnProperty.call(payload, 'countersData');
+		const sentProfileUser = myName;
+		if (syncState) sentDirtyKeys.forEach(key => { syncState.dirty[key] = false; });
+		window.__profileUpdateInFlight = true;
+		window.__profileUpdateQueued = false;
+		if (typeof window.beginProfileSyncIndicator === 'function') window.beginProfileSyncIndicator();
+		const finishProfileUpdate = response => {
+			const ok = !!(response && response.ok === true);
+			window.__profileUpdateInFlight = false;
+			const activeProfileUser = String(localStorage.getItem('psn_username') || '');
+			if (!window.isProfileLoaded || activeProfileUser !== sentProfileUser) {
+				window.__profileUpdateQueued = false;
+				window.__profileBaseSyncPending = false;
+				if (typeof window.endProfileSyncIndicator === 'function') window.endProfileSyncIndicator(ok);
+				return;
+			}
+			if (syncState) {
+				if (ok && sentBaseProfile) syncState.lastBaseSignature = baseSignature;
+				else if (!ok) sentDirtyKeys.forEach(key => { syncState.dirty[key] = true; });
+			}
+			if (sentBaseProfile) window.__profileBaseSyncPending = !ok;
+			if (!ok && typeof window.persistCurrentProfileSyncDirtyState === 'function') window.persistCurrentProfileSyncDirtyState();
+			if (typeof window.endProfileSyncIndicator === 'function') window.endProfileSyncIndicator(ok);
+			const shouldReplay = window.__profileUpdateQueued || window.__profileBaseSyncPending === true || (syncState && Object.values(syncState.dirty).some(Boolean));
+			window.__profileUpdateQueued = false;
+			if (shouldReplay && socketChat && socketChat.connected) setTimeout(() => window.broadcastProfileUpdate(), ok ? 45 : 900);
+		};
+		if (typeof socketChat.timeout === 'function') socketChat.timeout(7000).emit('update_profile', payload, (err,response)=>finishProfileUpdate(err?{ok:false,error:'Profile sync timeout'}:response));
+		else socketChat.emit('update_profile', payload, finishProfileUpdate);
 	};
 	
 	window.renderTypingIndicator = function() {
@@ -51244,6 +51514,7 @@ function getVisibleChatStackEl(id) {
 		} catch (e) {}
 		document.body.classList.remove('is-admin', 'is-mod', 'is-banned-user', 'admin-maintenance-login-bypass');
 		window.isProfileLoaded = false;
+		if (typeof window.resetProfileClientSyncRuntime === 'function') window.resetProfileClientSyncRuntime();
 		window.__trophiesHydrated = false;
 		window.__initialProfileSyncInProgress = false;
 		window.__postAuthChatGate = null;
@@ -54520,7 +54791,7 @@ function getVisibleChatStackEl(id) {
 	};
 
 	window.refreshFriendActivityIndicators = function() {
-		if (typeof window.updateSidebarCountPills === 'function') window.updateSidebarCountPills();
+		if (typeof window.setSidebarCountPill === 'function') window.setSidebarCountPill('activity', Array.isArray(window.friendActivityItems) ? window.friendActivityItems.length : 0);
 		const dot = document.getElementById('activity-dot');
 		const lastReadId = Math.max(0, Number(window.__friendActivityLastReadId) || 0);
 		const unread = (Array.isArray(window.friendActivityItems) ? window.friendActivityItems : []).some(function(item) {
@@ -54734,6 +55005,7 @@ function getVisibleChatStackEl(id) {
 
 	function updateFriendActivityChrome() {
 		const items = Array.isArray(window.friendActivityItems) ? window.friendActivityItems : [];
+		if (typeof window.setSidebarCountPill === 'function') window.setSidebarCountPill('activity', items.length);
 		const count = document.getElementById('friend-activity-count');
 		const empty = document.getElementById('friend-activity-empty');
 		const loading = document.getElementById('friend-activity-loading');
@@ -54957,10 +55229,10 @@ function getVisibleChatStackEl(id) {
 
 	window.refreshNotificationCenterIndicators = function() {
 		const unread = Math.max(0, Number(window.__userNotificationUnreadCount) || 0);
+		if (typeof window.setSidebarCountPill === 'function') window.setSidebarCountPill('notifications', Array.isArray(window.userNotificationItems) ? window.userNotificationItems.length : 0);
 		const dot = document.getElementById('notifications-dot');
 		if (dot) dot.style.display = unread > 0 ? 'block' : 'none';
 		try { saveState('psn_notifications_dot', unread > 0 ? 'true' : 'false'); } catch (err) {}
-		if (typeof window.updateSidebarCountPills === 'function') window.updateSidebarCountPills();
 	};
 
 	window.restoreUserNotificationCache = function(username) {
@@ -55783,7 +56055,7 @@ function getVisibleChatStackEl(id) {
 	};
 	
 	window.renderFriendsList = function(filter = '', isSilent = false) {
-		if (typeof window.updateSidebarCountPills === 'function') window.updateSidebarCountPills();
+		if (typeof window.setSidebarCountPill === 'function') window.setSidebarCountPill('friends', Array.isArray(window.friendsList) ? window.friendsList.length : 0);
 		isSilent = isSilent || !!window.isRestoringHistory;
 		const grid = document.getElementById('friends-list-grid');
 		const emptyMsg = document.getElementById('friends-empty-msg');
@@ -56430,7 +56702,8 @@ function getVisibleChatStackEl(id) {
 		const networkUser = typeof currentOnlineList !== 'undefined' ? currentOnlineList.find(u => (u.name || u) === username) : null;
 		const adminUser = Array.isArray(window.adminAllUsers) ? window.adminAllUsers.find(u => (u.name || u) === username) : null;
 		const searchUser = window.globalSearchResults ? window.globalSearchResults.find(u => (u.name || u) === username) : null;
-		if (!isMe && !networkUser && !adminUser && !searchUser && typeof socketChat !== 'undefined' && socketChat && socketChat.connected) {
+		const networkProfileNeedsDetails = !!(networkUser && ['downloads','wishlist','favorites','trophies','library'].some(key => !Object.prototype.hasOwnProperty.call(networkUser, key)));
+		if (!isMe && (!networkUser || networkProfileNeedsDetails) && !adminUser && !searchUser && typeof socketChat !== 'undefined' && socketChat && socketChat.connected) {
 			const now = Date.now();
 			const profileLookupKey = String(username || '').toLowerCase();
 			window.__profileMetaLookupAt = window.__profileMetaLookupAt || {};
