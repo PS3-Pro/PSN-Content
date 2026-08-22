@@ -8,7 +8,9 @@ const bcrypt = require('bcrypt');
 const app = express();
 const server = http.createServer(app);
 
+
 const ADMIN_USERS = ["Luan Teles", "Goku Cheats", "JumpSuit"];
+
 const DEFAULT_AVATAR = "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/interface/modern/images/avatars/default.png";
 
 const MAX_CHAT_HISTORY = 1000; 
