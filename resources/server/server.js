@@ -21,6 +21,7 @@ const SERVER_STARTED_AT = Date.now();
 const INSTANCE_ID = process.env.RENDER_INSTANCE_ID || process.env.RAILWAY_REPLICA_ID || process.env.HOSTNAME || `instance-${Math.random().toString(36).slice(2, 10)}`;
 const PRESENCE_TTL_SECONDS = 90;
 const PRESENCE_HEARTBEAT_MS = 25000;
+const FRIEND_ACTIVITY_PRESENCE_GRACE_MS = Math.max(3000, Math.min(30000, parseInt(process.env.FRIEND_ACTIVITY_PRESENCE_GRACE_MS || "10000", 10) || 10000));
 const CHAT_SYNC_INTERVAL_MS = 3000;
 const KEEP_ALIVE_INTERVAL_MS = Math.max(60000, parseInt(process.env.KEEP_ALIVE_INTERVAL_MS || "600000", 10) || 600000);
 const KEEP_ALIVE_TIMEOUT_MS = Math.max(1000, parseInt(process.env.KEEP_ALIVE_TIMEOUT_MS || "10000", 10) || 10000);
@@ -115,8 +116,9 @@ function buildOnlineListSignature(list = []) {
       online ? "1" : "0",
       online ? (user && user.id || "") : "",
       lastSeenToken,
-      user && user.profileUpdatedAt || 0,
       user && user.avatar || "",
+      user && user.joined || "",
+      user && user.level || 1,
       user && user.role || "",
       getUserCountryCode(user),
       user && user.banned ? "1" : "0",
@@ -998,8 +1000,35 @@ async function initDb() {
   );
   await refreshChatSyncStateFromDb();
 
-  await pool.query(`DELETE FROM presence_sessions WHERE instance_id = $1 OR last_seen < NOW() - INTERVAL '${PRESENCE_TTL_SECONDS} seconds'`, [INSTANCE_ID]);
+  const startupRemovedPresence = await queryDbWithRetry(`
+    WITH removed AS (
+      DELETE FROM presence_sessions
+      WHERE instance_id = $1 OR last_seen < NOW() - INTERVAL '${PRESENCE_TTL_SECONDS} seconds'
+      RETURNING name, last_seen
+    )
+    SELECT name, MAX(last_seen) AS last_seen
+    FROM removed
+    GROUP BY name
+  `, [INSTANCE_ID], { attempts: 2, label: 'PRESENCE STARTUP CLEANUP' });
   await refreshAllUsersCacheFromDb({ preserveOnline: false });
+
+  const startupOfflineRows = (startupRemovedPresence.rows || []).filter(row => row && row.name && userDatabase[row.name] && userDatabase[row.name].online !== true);
+  if (startupOfflineRows.length) {
+    const names = startupOfflineRows.map(row => row.name);
+    const lastSeenValues = startupOfflineRows.map(row => row.last_seen ? new Date(row.last_seen).getTime() : Date.now());
+    await queryDbWithRetry(
+      `UPDATE users AS u
+       SET data = COALESCE(u.data, '{}'::jsonb) || jsonb_build_object('online', false, 'lastSeen', v.last_seen)
+       FROM UNNEST($1::text[], $2::bigint[]) AS v(name, last_seen)
+       WHERE u.name = v.name`,
+      [names, lastSeenValues],
+      { attempts: 2, label: 'PRESENCE STARTUP OFFLINE SAVE' }
+    );
+    names.forEach((name, index) => {
+      if (userDatabase[name]) userDatabase[name].lastSeen = Math.max(Number(userDatabase[name].lastSeen || 0), Number(lastSeenValues[index] || 0));
+      scheduleFriendActivityOffline(name, Number(lastSeenValues[index] || Date.now()), 'startup-recovery');
+    });
+  }
 
   await refreshChatHistoryFromDb();
   
@@ -2416,7 +2445,7 @@ async function refreshSingleUserSummaryFromDb(name, options = {}) {
   };
   fullUserCacheNames.delete(safeName);
   userCacheMeta[safeName] = Date.now();
-  invalidateOnlineListCache('single-user-summary-refresh');
+  if (options.invalidateOnlineList !== false) invalidateOnlineListCache('single-user-summary-refresh');
   return userDatabase[safeName];
 }
 
@@ -3947,6 +3976,23 @@ function getSocketsByUserName(name) {
   return sockets;
 }
 
+async function getActivePresenceCountsForNames(names = []) {
+  const cleanNames = [...new Set((Array.isArray(names) ? names : []).map(name => normalizeText(name, '')).filter(Boolean))];
+  const counts = new Map();
+  if (!cleanNames.length) return counts;
+  const result = await queryDbWithRetry(
+    `SELECT name, COUNT(*)::int AS session_count
+     FROM presence_sessions
+     WHERE name = ANY($1::text[])
+       AND last_seen >= NOW() - INTERVAL '${PRESENCE_TTL_SECONDS} seconds'
+     GROUP BY name`,
+    [cleanNames],
+    { attempts: 2, label: 'ADMIN SESSION COUNT' }
+  );
+  result.rows.forEach(row => counts.set(row.name, Math.max(0, Number(row.session_count) || 0)));
+  return counts;
+}
+
 
 function buildFullProfileSyncPayload(name, user = {}, sourceSocketId = null, options = {}) {
   const safe = options.normalized === true ? user : normalizeUserRecord(name, user || {});
@@ -4008,6 +4054,11 @@ const PROFILE_SYNC_PATCH_KEYS = new Set([
   'recentlyVisited', 'recentlyVisitedData', 'recentlyVisitedUpdatedAt', 'notificationState',
   'countersData', 'themeColor', 'themeColorUpdatedAt', 'settingsData'
 ]);
+
+const PROFILE_ONLINE_LIST_KEYS = new Set(['id', 'avatar', 'joined', 'countryCode', 'role', 'isAdmin', 'banned', 'level', 'ps3Status']);
+function profileChangedKeysTouchOnlineList(changedKeys = []) {
+  return Array.isArray(changedKeys) && changedKeys.some(key => PROFILE_ONLINE_LIST_KEYS.has(key));
+}
 
 function buildProfileSyncPatchPayload(name, user = {}, changedKeys = [], sourceSocketId = null) {
   const keys = new Set(Array.isArray(changedKeys) ? changedKeys : []);
@@ -4220,6 +4271,7 @@ async function notifyProfileSyncAcrossInstances(name, sourceSocketId = null, pro
       trending: changes && changes.trending === true,
       trophies: changes && changes.trophies === true,
       counts: changes && changes.counts === true,
+      publicProfile: changes && changes.publicProfile === true,
       keys: Array.isArray(changes && changes.keys) ? [...new Set(changes.keys.filter(key => PROFILE_SYNC_PATCH_KEYS.has(key)))] : []
     }
   };
@@ -4345,7 +4397,7 @@ async function initProfileSyncNotifications() {
         return;
       }
 
-      const refreshedUser = await refreshSingleUserSummaryFromDb(name);
+      const refreshedUser = await refreshSingleUserSummaryFromDb(name, { invalidateOnlineList: false });
       if (!refreshedUser) {
         invalidateOnlineListCache("profile-sync-listen-missing");
         deferServerTask('PROFILE LISTEN ONLINE LIST', () => emitOnlineList(), 1000);
@@ -4375,8 +4427,7 @@ async function initProfileSyncNotifications() {
       }
       if (data.changes && data.changes.counts === true) emitProfileCountsUpdate(name, refreshedUser);
       const changedKeys = data.changes && Array.isArray(data.changes.keys) ? data.changes.keys : [];
-      const notificationStateOnly = changedKeys.length === 1 && changedKeys[0] === 'notificationState'
-        && !(data.changes && (data.changes.trending === true || data.changes.trophies === true || data.changes.counts === true));
+      const legacyBroadProfileChange = changedKeys.length === 0;
       if (hasLocalSession) {
         const localSockets = getSocketsByUserName(name).filter(client => !(data.sourceSocketId && client.id === data.sourceSocketId));
         for (const client of localSockets) {
@@ -4388,10 +4439,11 @@ async function initProfileSyncNotifications() {
           }
         }
       }
-      if (notificationStateOnly) return;
-      emitPublicProfileBannerUpdate(name, refreshedUser);
-      invalidateOnlineListCache("profile-sync-listen");
-      deferServerTask('PROFILE LISTEN ONLINE LIST', () => emitOnlineList(), 1000);
+      if (legacyBroadProfileChange || (data.changes && data.changes.publicProfile === true)) emitPublicProfileBannerUpdate(name, refreshedUser);
+      if (legacyBroadProfileChange || profileChangedKeysTouchOnlineList(changedKeys)) {
+        invalidateOnlineListCache("profile-sync-listen");
+        deferServerTask('PROFILE LISTEN ONLINE LIST', () => emitOnlineList(), 1000);
+      }
     } catch (err) {
       console.error(`[${message && message.channel === 'presence_sync' ? 'PRESENCE' : 'PROFILE'} LISTEN ERROR]:`, err);
     }
@@ -5244,6 +5296,45 @@ function disconnectUserSessions(name, eventName = 'user_kicked', payload = {}) {
   });
 }
 
+const pendingFriendOfflineTimers = new Map();
+
+function cancelFriendActivityOffline(name) {
+  const key = normalizeFriendActivityName(name).toLowerCase();
+  if (!key) return;
+  const timer = pendingFriendOfflineTimers.get(key);
+  if (timer) clearTimeout(timer);
+  pendingFriendOfflineTimers.delete(key);
+}
+
+function scheduleFriendActivityOffline(name, lastSeen = Date.now(), reason = 'disconnect') {
+  const actor = normalizeFriendActivityName(name);
+  const key = actor.toLowerCase();
+  const at = normalizeTimestampValue(lastSeen) || Date.now();
+  if (!actor) return;
+  cancelFriendActivityOffline(actor);
+  const timer = setTimeout(async () => {
+    pendingFriendOfflineTimers.delete(key);
+    try {
+      const active = await queryDbWithRetry(
+        `SELECT 1 FROM presence_sessions
+         WHERE name = $1 AND last_seen >= NOW() - INTERVAL '${PRESENCE_TTL_SECONDS} seconds'
+         LIMIT 1`,
+        [actor],
+        { attempts: 2, label: 'FRIEND ACTIVITY OFFLINE CHECK' }
+      );
+      if (active.rowCount > 0) return;
+      await recordFriendActivity(actor, 'offline', {}, {
+        at,
+        dedupeKey: `${actor.toLowerCase()}:offline:${Math.floor(at / FRIEND_ACTIVITY_PRESENCE_GRACE_MS)}`
+      });
+    } catch (err) {
+      console.error(`[FRIEND ACTIVITY OFFLINE ${reason} ERROR]:`, err && err.message ? err.message : err);
+    }
+  }, FRIEND_ACTIVITY_PRESENCE_GRACE_MS);
+  if (typeof timer.unref === 'function') timer.unref();
+  pendingFriendOfflineTimers.set(key, timer);
+}
+
 async function upsertPresenceForSocket(socket, name) {
   if (!socket || !name) return;
   const shouldAnnouncePresence = socket.__presenceAnnounced !== true;
@@ -5254,7 +5345,8 @@ async function upsertPresenceForSocket(socket, name) {
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
-      await client.query('SELECT name FROM users WHERE name = $1 FOR UPDATE', [name]);
+      const lockedUser = await client.query('SELECT data FROM users WHERE name = $1 FOR UPDATE', [name]);
+      const storedUser = lockedUser.rows[0] && lockedUser.rows[0].data && typeof lockedUser.rows[0].data === 'object' ? lockedUser.rows[0].data : {};
       const activePresence = await client.query(
         `SELECT 1
          FROM presence_sessions
@@ -5264,7 +5356,12 @@ async function upsertPresenceForSocket(socket, name) {
          LIMIT 1`,
         [name, socket.id]
       );
-      shouldRecordOnlineActivity = activePresence.rowCount === 0;
+      const storedLastSeen = normalizeTimestampValue(storedUser.lastSeen);
+      const shortReconnect = activePresence.rowCount === 0
+        && storedUser.online === false
+        && storedLastSeen > 0
+        && Date.now() - storedLastSeen <= FRIEND_ACTIVITY_PRESENCE_GRACE_MS;
+      shouldRecordOnlineActivity = activePresence.rowCount === 0 && !shortReconnect;
       await client.query(
         `INSERT INTO presence_sessions (socket_id, name, instance_id, connected_at, last_seen, data)
          VALUES ($1, $2, $3, NOW(), NOW(), $4)
@@ -5288,12 +5385,13 @@ async function upsertPresenceForSocket(socket, name) {
     );
   }
 
+  cancelFriendActivityOffline(name);
   if (userDatabase[name]) {
     userDatabase[name].online = true;
     userDatabase[name].id = socket.id;
     userDatabase[name].lastSeen = Date.now();
   }
-  invalidateOnlineListCache('presence-upsert');
+  if (shouldAnnouncePresence) invalidateOnlineListCache('presence-upsert');
   if (shouldAnnouncePresence && userDatabase[name]) {
     socket.__presenceAnnounced = true;
     emitPresenceUpdate(name, userDatabase[name]);
@@ -5368,24 +5466,25 @@ async function syncPresenceOnlineFromDb() {
         { attempts: 2, label: 'PRESENCE LAST SEEN SAVE' }
       );
       names.forEach((username, index) => {
-        deferServerTask('FRIEND ACTIVITY OFFLINE', () => recordFriendActivity(username, 'offline', {}, { at: Number(lastSeenValues[index] || Date.now()) }), 0);
+        scheduleFriendActivityOffline(username, Number(lastSeenValues[index] || Date.now()), 'ttl-expire');
       });
     }
   }
 
-  invalidateOnlineListCache("presence-sync");
-
+  let onlineListChanged = false;
   Object.entries(userDatabase).forEach(([username, user]) => {
     const previous = previousOnlineState.get(username);
     if (!previous) return;
     const onlineChanged = previous.online !== (user && user.online === true);
     const offlineLastSeenChanged = user && user.online !== true && Number(user.lastSeen || 0) > previous.lastSeen;
     if (!onlineChanged && !offlineLastSeenChanged) return;
+    if (onlineChanged) onlineListChanged = true;
     const payload = emitPresenceUpdate(username, user);
     if (payload) deferServerTask('PRESENCE STATE NOTIFY', () => notifyPresenceAcrossInstances(username, user), 0);
   });
+  if (onlineListChanged) invalidateOnlineListCache("presence-sync");
 
-  return userDatabase;
+  return onlineListChanged;
 }
 
 async function emitOnlineList(targetSocket = null, options = {}) {
@@ -5456,11 +5555,10 @@ async function heartbeatPresenceSessions() {
       [socketIds, names, instanceIds, payloads],
       { attempts: 2, label: 'PRESENCE HEARTBEAT SAVE' }
     );
-    invalidateOnlineListCache("presence-heartbeat");
   }
 
-  await syncPresenceOnlineFromDb();
-  await emitOnlineList();
+  const onlineListChanged = await syncPresenceOnlineFromDb();
+  if (onlineListChanged) await emitOnlineList();
 }
 
 async function setUserRole(targetName, role, adminName) {
@@ -6144,7 +6242,7 @@ io.on('connection', (socket) => {
       userCacheMeta[name] = Date.now();
       const savedUser = await patchUserData(name, settingsDbPatch, 'SETTINGS PATCH SAVE');
       if (!savedUser) return;
-      invalidateOnlineListCache('settings-realtime-save');
+      if (countryChanged) invalidateOnlineListCache('settings-realtime-country');
     } catch (err) {
       console.error(`[DATABASE ERROR] Failed to save realtime settings for ${name}:`, err);
     } finally {
@@ -6162,7 +6260,10 @@ io.on('connection', (socket) => {
       name,
       sourceSocketId,
       userDatabase[name].profileUpdatedAt,
-      { keys: Object.keys(settingsDbPatch) }
+      {
+        keys: Object.keys(settingsDbPatch),
+        publicProfile: mergedSettings.bannerAccepted === true || themeMerge.accepted === true || countryChanged
+      }
     ), 0);
   });
 
@@ -6322,7 +6423,6 @@ io.on('connection', (socket) => {
               respond({ ok: false, requestId: syncRequestId, error: 'Profile was not saved.' });
               return;
             }
-            invalidateOnlineListCache('profile-update-save');
         } catch (err) {
             console.error(`[DATABASE ERROR] Failed to save profile for ${name}:`, err);
             respond({ ok: false, requestId: syncRequestId, error: 'Profile database save failed.' });
@@ -6352,18 +6452,21 @@ io.on('connection', (socket) => {
             scheduleTrendingRefreshBroadcast(900);
         }
 
-        deferServerTask('PROFILE ONLINE LIST', () => emitOnlineList(), 450);
+        const profileChangedKeys = Object.keys(profileDbPatch);
+        if (profileChangedKeysTouchOnlineList(profileChangedKeys)) {
+          invalidateOnlineListCache('profile-update-save');
+          deferServerTask('PROFILE ONLINE LIST', () => emitOnlineList(), 450);
+        }
         if (shouldBroadcastProfileBanner) {
             emitPublicProfileBannerUpdate(name, workingUser);
         }
-        const profileChangedKeys = Object.keys(profileDbPatch);
         emitProfileSyncPatchFromUser(name, workingUser, profileChangedKeys, shouldForceProfileSyncToSource ? null : socket.id);
         const trophiesChanged = !!userData.trophiesData;
         deferServerTask('PROFILE NOTIFY', () => notifyProfileSyncAcrossInstances(
             name,
             shouldForceProfileSyncToSource ? null : socket.id,
             workingUser.profileUpdatedAt,
-            { trending: shouldEmitTrendingUpdate, trophies: trophiesChanged, counts: publicCountsChanged, keys: profileChangedKeys }
+            { trending: shouldEmitTrendingUpdate, trophies: trophiesChanged, counts: publicCountsChanged, publicProfile: shouldBroadcastProfileBanner, keys: profileChangedKeys }
         ), 0);
 
         if (trophiesChanged) {
@@ -6927,7 +7030,12 @@ io.on('connection', (socket) => {
           if (filter === 'user') return !isUserAdmin(username, user) && !banned && role === 'user';
           return true;
         });
-        const results = names.slice(offset, offset + limit).map(username => getPublicUserData(username, userDatabase[username], true));
+        const pageNames = names.slice(offset, offset + limit);
+        const sessionCounts = await getActivePresenceCountsForNames(pageNames);
+        const results = pageNames.map(username => ({
+          ...getPublicUserData(username, userDatabase[username], true),
+          sessionCount: sessionCounts.get(username) || 0
+        }));
         socket.emit('admin_users_results', { query, filter, offset, limit, total: names.length, results, countryStats: getAdminCountryStats() });
         return;
       }
@@ -7902,7 +8010,7 @@ io.on('connection', (socket) => {
         );
         userCacheMeta[name] = Date.now();
         invalidateOnlineListCache('disconnect-presence-save');
-        deferServerTask('FRIEND ACTIVITY OFFLINE', () => recordFriendActivity(name, 'offline', {}, { at: lastSeen }), 0);
+        scheduleFriendActivityOffline(name, lastSeen, 'disconnect');
         deferServerTask('LOGOUT SERVER LOG', () => addServerLog('logout', `${name} disconnected`, { socketId: socket.id }, name), 0);
       }
 
