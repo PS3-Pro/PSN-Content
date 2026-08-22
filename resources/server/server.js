@@ -4308,7 +4308,7 @@ async function initProfileSyncNotifications() {
   }
 }
 
-const FRIEND_ACTIVITY_TYPES = new Set(['online', 'playing', 'xmb', 'trophy']);
+const FRIEND_ACTIVITY_TYPES = new Set(['online', 'playing', 'played', 'xmb', 'trophy', 'download', 'wishlist']);
 const FRIEND_ACTIVITY_LIMIT = 60;
 const FRIEND_ACTIVITY_ROOM_PREFIX = 'friend-activity:';
 
@@ -4318,11 +4318,21 @@ function normalizeFriendActivityName(value) {
 
 function normalizeFriendActivityData(type, rawData = {}) {
   const source = rawData && typeof rawData === 'object' && !Array.isArray(rawData) ? rawData : {};
-  if (type === 'playing' || type === 'xmb') {
+  if (type === 'playing' || type === 'played' || type === 'xmb') {
     return {
       titleId: normalizeText(source.titleId, '').toUpperCase().slice(0, 32),
       title: normalizeText(source.title, '').slice(0, 140),
-      appVersion: normalizeText(source.appVersion, '').slice(0, 24)
+      appVersion: normalizeText(source.appVersion, '').slice(0, 24),
+      durationSeconds: type === 'played' ? Math.max(0, Math.min(60 * 60 * 24 * 7, Math.floor(Number(source.durationSeconds) || 0))) : 0,
+      replacesId: type === 'played' ? normalizeText(source.replacesId, '').replace(/[^0-9]/g, '').slice(0, 32) : ''
+    };
+  }
+  if (type === 'download' || type === 'wishlist') {
+    return {
+      titleId: normalizeText(source.titleId, '').toUpperCase().slice(0, 32),
+      contentId: normalizeText(source.contentId, '').slice(0, 160),
+      title: normalizeText(source.title, '').slice(0, 140),
+      category: normalizeText(source.category, 'games').toLowerCase().replace(/[^a-z0-9_]/g, '').slice(0, 40) || 'games'
     };
   }
   if (type === 'trophy') {
@@ -4414,8 +4424,8 @@ async function recordFriendActivity(actorName, type, rawData = {}, options = {})
   if (!actor || !FRIEND_ACTIVITY_TYPES.has(eventType)) return null;
   const data = normalizeFriendActivityData(eventType, rawData);
   const at = normalizeTimestampValue(options.at) || Date.now();
-  const detailKey = eventType === 'playing' || eventType === 'xmb'
-    ? `${data.titleId || data.title}`
+  const detailKey = eventType === 'playing' || eventType === 'played' || eventType === 'xmb' || eventType === 'download' || eventType === 'wishlist'
+    ? `${data.contentId || data.titleId || data.title}`
     : (eventType === 'trophy' ? `${data.trophyId || data.title}` : 'online');
   const dedupeKey = normalizeText(options.dedupeKey, '') || `${actor.toLowerCase()}:${eventType}:${String(detailKey || '').toLowerCase()}:${Math.floor(at / 5000)}`;
 
@@ -4786,7 +4796,75 @@ async function recordChatUserNotifications(message = {}) {
   })));
 }
 
-function getPs3FriendActivityTransition(previousStatus, currentStatus) {
+function ps3PlayTimeToSeconds(value) {
+  const playTime = normalizePs3PlayTimeServer(value);
+  if (!playTime) return 0;
+  const parts = playTime.split(':').map(part => parseInt(part, 10) || 0);
+  if (parts.length !== 3) return 0;
+  return Math.max(0, parts[0] * 3600 + parts[1] * 60 + parts[2]);
+}
+
+async function finalizeFriendPlayingActivity(actorName, previousStatus, at = Date.now()) {
+  const actor = normalizeFriendActivityName(actorName);
+  const previous = previousStatus && typeof previousStatus === 'object' ? previousStatus : {};
+  const titleId = normalizeText(previous.titleId, '').toUpperCase().slice(0, 32);
+  const title = normalizeText(previous.title, '').slice(0, 140);
+  if (!actor || (!titleId && !title)) return null;
+
+  let playingRow = null;
+  try {
+    const result = await queryDbWithRetry(
+      `SELECT id, actor_name, event_type, data, created_at
+       FROM friend_activity
+       WHERE actor_name = $1
+         AND event_type = 'playing'
+         AND (($2 <> '' AND UPPER(COALESCE(data->>'titleId', '')) = $2)
+           OR ($2 = '' AND LOWER(COALESCE(data->>'title', '')) = LOWER($3)))
+       ORDER BY id DESC
+       LIMIT 1`,
+      [actor, titleId, title],
+      { attempts: 2, label: 'FRIEND ACTIVITY PLAY SESSION LOOKUP' }
+    );
+    playingRow = result.rows[0] || null;
+  } catch (err) {
+    console.error('[FRIEND ACTIVITY PLAY SESSION LOOKUP ERROR]:', err && err.message ? err.message : err);
+  }
+
+  const endAt = normalizeTimestampValue(at) || Date.now();
+  const startedAt = playingRow && playingRow.created_at instanceof Date
+    ? playingRow.created_at.getTime()
+    : normalizeTimestampValue(playingRow && playingRow.created_at);
+  const reportedSeconds = ps3PlayTimeToSeconds(previous.playTime);
+  const elapsedSeconds = startedAt ? Math.max(1, Math.floor((endAt - startedAt) / 1000)) : 0;
+  const durationSeconds = reportedSeconds > 0 ? reportedSeconds : elapsedSeconds;
+  const replacesId = playingRow ? String(playingRow.id || '') : '';
+
+  const playedEvent = await recordFriendActivity(actor, 'played', {
+    ...previous,
+    titleId,
+    title,
+    durationSeconds: Math.max(1, durationSeconds || 1),
+    replacesId
+  }, {
+    at: endAt,
+    dedupeKey: `${actor.toLowerCase()}:played:${replacesId || String(titleId || title).toLowerCase()}:${endAt}`
+  });
+
+  if (playedEvent && replacesId) {
+    try {
+      await queryDbWithRetry(
+        `DELETE FROM friend_activity WHERE id = $1 AND actor_name = $2 AND event_type = 'playing'`,
+        [replacesId, actor],
+        { attempts: 2, label: 'FRIEND ACTIVITY PLAY SESSION CLOSE' }
+      );
+    } catch (err) {
+      console.error('[FRIEND ACTIVITY PLAY SESSION CLOSE ERROR]:', err && err.message ? err.message : err);
+    }
+  }
+  return playedEvent;
+}
+
+function getPs3FriendActivityTransitions(previousStatus, currentStatus) {
   const previous = previousStatus && typeof previousStatus === 'object' ? previousStatus : null;
   const current = currentStatus && typeof currentStatus === 'object' ? currentStatus : null;
   const previousPlaying = previous && previous.status === 'playing';
@@ -4795,14 +4873,17 @@ function getPs3FriendActivityTransition(previousStatus, currentStatus) {
   const currentId = normalizeText(current && current.titleId, '').toUpperCase();
   const previousTitle = normalizeText(previous && previous.title, '');
   const currentTitle = normalizeText(current && current.title, '');
+  const changedGame = currentPlaying && previousPlaying && (currentId !== previousId || (!currentId && currentTitle !== previousTitle));
+  const transitions = [];
 
-  if (currentPlaying && (!previousPlaying || currentId !== previousId || (!currentId && currentTitle !== previousTitle))) {
-    return { type: 'playing', data: current };
+  if (previousPlaying && (changedGame || (current && current.status === 'idle'))) {
+    transitions.push({ type: 'played', data: previous });
   }
-  if (previousPlaying && current && current.status === 'idle') {
-    return { type: 'xmb', data: previous };
+
+  if (currentPlaying && (!previousPlaying || changedGame)) {
+    transitions.push({ type: 'playing', data: current });
   }
-  return null;
+  return transitions;
 }
 
 function disconnectUserSessions(name, eventName = 'user_kicked', payload = {}) {
@@ -5815,10 +5896,14 @@ io.on('connection', (socket) => {
           setFriendActivitySubscription(socket, workingUser.friendsData || []);
         }
         if (incomingPs3StatusForActivity) {
-          const activityTransition = getPs3FriendActivityTransition(previousPs3StatusForActivity, workingUser.ps3Status);
-          if (activityTransition) {
-            deferServerTask('FRIEND ACTIVITY PS3', () => recordFriendActivity(name, activityTransition.type, activityTransition.data, { at: workingUser.profileUpdatedAt }), 0);
-          }
+          const activityTransitions = getPs3FriendActivityTransitions(previousPs3StatusForActivity, workingUser.ps3Status);
+          activityTransitions.forEach((activityTransition, index) => {
+            deferServerTask('FRIEND ACTIVITY PS3', () => (
+              activityTransition.type === 'played'
+                ? finalizeFriendPlayingActivity(name, activityTransition.data, workingUser.profileUpdatedAt + index)
+                : recordFriendActivity(name, activityTransition.type, activityTransition.data, { at: workingUser.profileUpdatedAt + index })
+            ), 0);
+          });
         }
         if (publicCountsChanged) emitProfileCountsUpdate(name, userDatabase[name]);
 
@@ -5942,6 +6027,32 @@ io.on('connection', (socket) => {
       console.error('[FRIEND ACTIVITY MARK READ ERROR]:', err && err.message ? err.message : err);
       respond({ ok: false, lastReadId: 0 });
     }
+  });
+
+  socket.on('friend_activity_content_action', (data = {}) => {
+    const name = socket.userName;
+    if (!name || !userDatabase[name]) return;
+    const type = normalizeText(data.type, '').toLowerCase();
+    if (type !== 'download' && type !== 'wishlist') return;
+
+    const titleId = normalizeText(data.titleId, '').toUpperCase().slice(0, 32);
+    const contentId = normalizeText(data.contentId, '').slice(0, 160);
+    const title = normalizeText(data.title, '').slice(0, 140);
+    const category = normalizeText(data.category, 'games').toLowerCase().replace(/[^a-z0-9_]/g, '').slice(0, 40) || 'games';
+    const actionId = normalizeText(data.actionId, '').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 80);
+    if (!titleId && !title) return;
+
+    const detail = String(contentId || titleId || title).toLowerCase();
+    const dedupeKey = actionId
+      ? `${name.toLowerCase()}:${type}:${actionId}`
+      : `${name.toLowerCase()}:${type}:${detail}:${Math.floor(Date.now() / 3000)}`;
+
+    deferServerTask('FRIEND ACTIVITY CONTENT', () => recordFriendActivity(name, type, {
+      titleId,
+      contentId,
+      title,
+      category
+    }, { dedupeKey, at: Date.now() }), 0);
   });
 
   socket.on('friend_activity_trophy', (data = {}) => {

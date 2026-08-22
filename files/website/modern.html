@@ -1947,12 +1947,18 @@ body.is-admin #btn-toolbar-cmd, body.is-mod #btn-toolbar-cmd { display: flex !im
 .friend-activity-item:hover::before { animation: ps5Sweep 1.15s ease-out forwards; }
 .friend-activity-item.is-online { --activity-accent:#4caf50; border-left-color:rgba(76,175,80,.72); background:linear-gradient(90deg,rgba(76,175,80,.075),rgba(255,255,255,.025) 58%,rgba(255,255,255,.012)); }
 .friend-activity-item.is-playing { --activity-accent:#00bcff; border-left-color:rgba(0,188,255,.72); background:linear-gradient(90deg,rgba(0,188,255,.075),rgba(255,255,255,.025) 58%,rgba(255,255,255,.012)); }
+.friend-activity-item.is-played { --activity-accent:#5cc8ff; border-left-color:rgba(92,200,255,.62); background:linear-gradient(90deg,rgba(92,200,255,.055),rgba(255,255,255,.025) 58%,rgba(255,255,255,.012)); }
+.friend-activity-item.is-download { --activity-accent:#00d49a; border-left-color:rgba(0,212,154,.68); background:linear-gradient(90deg,rgba(0,212,154,.06),rgba(255,255,255,.025) 58%,rgba(255,255,255,.012)); }
+.friend-activity-item.is-wishlist { --activity-accent:#ff4fa3; border-left-color:rgba(255,79,163,.68); background:linear-gradient(90deg,rgba(255,79,163,.06),rgba(255,255,255,.025) 58%,rgba(255,255,255,.012)); }
 .friend-activity-item.is-xmb { --activity-accent:#8b96a8; border-left-color:rgba(139,150,168,.56); }
 .friend-activity-item.is-trophy { --activity-accent:#ffcc00; border-left-color:rgba(255,204,0,.72); background:linear-gradient(90deg,rgba(255,204,0,.065),rgba(255,255,255,.025) 58%,rgba(255,255,255,.012)); }
 .friend-activity-avatar-wrap { position:relative; width:46px; height:46px; }
 .friend-activity-avatar { width:46px; height:46px; display:block; border-radius:50%; object-fit:cover; border:2px solid rgba(255,255,255,.16); background:rgba(255,255,255,.05); box-shadow:0 0 12px rgba(0,0,0,.28); cursor:pointer; }
 .friend-activity-item.is-online .friend-activity-avatar { border-color:rgba(76,175,80,.76); box-shadow:0 0 12px rgba(76,175,80,.2); }
 .friend-activity-item.is-playing .friend-activity-avatar { border-color:rgba(0,188,255,.78); box-shadow:0 0 12px rgba(0,188,255,.22); }
+.friend-activity-item.is-played .friend-activity-avatar { border-color:rgba(92,200,255,.7); box-shadow:0 0 12px rgba(92,200,255,.16); }
+.friend-activity-item.is-download .friend-activity-avatar { border-color:rgba(0,212,154,.72); box-shadow:0 0 12px rgba(0,212,154,.16); }
+.friend-activity-item.is-wishlist .friend-activity-avatar { border-color:rgba(255,79,163,.72); box-shadow:0 0 12px rgba(255,79,163,.16); }
 .friend-activity-item.is-trophy .friend-activity-avatar { border-color:rgba(255,204,0,.72); box-shadow:0 0 12px rgba(255,204,0,.16); }
 .friend-activity-badge { position:absolute; right:-3px; bottom:-3px; width:20px; height:20px; border-radius:50%; display:flex; align-items:center; justify-content:center; background:#111722; border:2px solid #111722; color:var(--activity-accent); font-size:9px; }
 .friend-activity-main { min-width:0; color:rgba(255,255,255,.78); font-size:13px; line-height:1.45; }
@@ -7029,7 +7035,7 @@ a:focus, button:focus, select:focus, input:focus, textarea:focus, [contenteditab
 							<i class="fas fa-circle-notch fa-spin"></i><strong>Loading activity</strong><p>Getting the latest moments from your friends.</p>
 						</div>
 						<div id="friend-activity-empty" class="friend-activity-empty" style="display:none;">
-							<i class="fas fa-bolt"></i><strong>No recent friend activity.</strong><p>When your friends come online, start a game or earn a trophy, it will appear here.</p>
+							<i class="fas fa-bolt"></i><strong>No recent friend activity.</strong><p>When your friends come online, play, download, wishlist or earn a trophy, it will appear here.</p>
 						</div>
 						<div id="friend-activity-list" class="friend-activity-list"></div>
 					</div>
@@ -24326,6 +24332,14 @@ P
         
         saveState(COOKIE_NAME_HISTORY, JSON.stringify(downloadHistory));
         markProfileListChanged('downloads');
+        if (typeof window.emitFriendActivityContentAction === 'function') {
+            window.emitFriendActivityContentAction('download', {
+                titleId: titleId,
+                contentId: entry.contentId,
+                cleanName: entry.cleanName || normalizedFileName,
+                category: resolvedCategory
+            });
+        }
     
         const dot = document.getElementById('dl-dot');
         const viewDl = document.getElementById('view-downloads');
@@ -30525,6 +30539,7 @@ P
 			}
 
 			wishlist.push(itemToAdd); 
+			if (typeof window.emitFriendActivityContentAction === 'function') window.emitFriendActivityContentAction('wishlist', itemToAdd);
 			setWishButtonState(true);
 
 			if (!isWishlistView) {
@@ -53787,7 +53802,7 @@ function getVisibleChatStackEl(id) {
 	function normalizeFriendActivityItem(raw) {
 		if (!raw || typeof raw !== 'object') return null;
 		const type = String(raw.type || '').toLowerCase();
-		if (!['online','playing','xmb','trophy'].includes(type)) return null;
+		if (!['online','playing','played','xmb','trophy','download','wishlist'].includes(type)) return null;
 		const actor = String(raw.actor || '').trim();
 		if (!actor) return null;
 		const data = raw.data && typeof raw.data === 'object' && !Array.isArray(raw.data) ? raw.data : {};
@@ -53828,10 +53843,17 @@ function getVisibleChatStackEl(id) {
 	};
 
 	window.mergeFriendActivityItems = function(incoming, replace) {
-		const source = (replace === true ? [] : (Array.isArray(window.friendActivityItems) ? window.friendActivityItems : [])).concat(Array.isArray(incoming) ? incoming : []);
+		const incomingItems = (Array.isArray(incoming) ? incoming : []).map(normalizeFriendActivityItem).filter(Boolean);
+		const replacedIds = new Set(incomingItems.map(function(item) {
+			return item.type === 'played' ? String(item.data && item.data.replacesId || '') : '';
+		}).filter(Boolean));
+		const existingItems = replace === true ? [] : (Array.isArray(window.friendActivityItems) ? window.friendActivityItems : []).map(normalizeFriendActivityItem).filter(Boolean).filter(function(item) {
+			return !replacedIds.has(String(item.id || ''));
+		});
+		const source = incomingItems.concat(existingItems);
 		const deduped = [];
 		const seen = new Set();
-		source.map(normalizeFriendActivityItem).filter(Boolean).sort(function(a,b){
+		source.sort(function(a,b){
 			const idDiff = (Number(b.id) || 0) - (Number(a.id) || 0);
 			return idDiff || b.createdAt - a.createdAt;
 		}).forEach(function(item) {
@@ -53947,18 +53969,53 @@ function getVisibleChatStackEl(id) {
 		return new Date(Number(timestamp || 0)).toLocaleTimeString([], { hour:'2-digit', minute:'2-digit' });
 	}
 
+	window.emitFriendActivityContentAction = function(type, item = {}) {
+		const eventType = String(type || '').toLowerCase();
+		if (!['download','wishlist'].includes(eventType)) return false;
+		if (typeof socketChat === 'undefined' || !socketChat || !socketChat.connected || !localStorage.getItem('psn_username')) return false;
+		const titleId = String(item.titleId || item.id || '').trim().toUpperCase();
+		const contentId = String(item.contentId || '').trim();
+		const title = String(item.cleanName || item.title || item.name || titleId || '').trim();
+		const category = String(item.category || item.rawCategory || 'games').trim().toLowerCase() || 'games';
+		if (!titleId && !title) return false;
+		window.__friendActivityContentActionSeq = (Number(window.__friendActivityContentActionSeq) || 0) + 1;
+		socketChat.emit('friend_activity_content_action', {
+			type:eventType,
+			titleId:titleId,
+			contentId:contentId,
+			title:title,
+			category:category,
+			actionId:String(Date.now()) + '-' + String(window.__friendActivityContentActionSeq)
+		});
+		return true;
+	};
+
+	function formatFriendActivityDuration(seconds) {
+		const totalSeconds = Math.max(0, Math.floor(Number(seconds) || 0));
+		if (totalSeconds < 60) return 'less than a minute';
+		const totalMinutes = Math.max(1, Math.floor(totalSeconds / 60));
+		const hours = Math.floor(totalMinutes / 60);
+		const minutes = totalMinutes % 60;
+		if (!hours) return totalMinutes + (totalMinutes === 1 ? ' minute' : ' minutes');
+		if (!minutes) return hours + 'h';
+		return hours + 'h ' + minutes + 'm';
+	}
+
 	function getFriendActivityPresentation(item) {
 		const data = item.data || {};
 		if (item.type === 'online') return { icon:'fa-circle', cls:'is-online', message:'is online.', meta:'Connected to PlayStation™ Network' };
 		if (item.type === 'playing') return { icon:'fa-gamepad', cls:'is-playing', message:'started playing', meta:[data.titleId, data.appVersion ? 'v' + data.appVersion : ''].filter(Boolean).join(' • ') };
+		if (item.type === 'played') return { icon:'fa-clock', cls:'is-played', message:'played', suffix:' for ' + formatFriendActivityDuration(data.durationSeconds), meta:data.titleId || '' };
+		if (item.type === 'download') return { icon:'fa-download', cls:'is-download', message:'downloaded', meta:[data.titleId, data.category && data.category !== 'games' ? String(data.category).replace(/_/g,' ') : ''].filter(Boolean).join(' • ') };
+		if (item.type === 'wishlist') return { icon:'fa-heart', cls:'is-wishlist', message:'added', suffix:' to Wishlist', meta:[data.titleId, data.category && data.category !== 'games' ? String(data.category).replace(/_/g,' ') : ''].filter(Boolean).join(' • ') };
 		if (item.type === 'xmb') return { icon:'fa-house', cls:'is-xmb', message:'returned to XMB™', meta:data.title ? 'After playing ' + data.title : 'Console idle' };
 		const trophyType = ['bronze','silver','gold','platinum'].includes(String(data.trophyType || '').toLowerCase()) ? String(data.trophyType).toLowerCase() : 'bronze';
 		return { icon:'fa-trophy', cls:'is-trophy', message:'earned a trophy', meta:trophyType.toUpperCase(), trophyType:trophyType };
 	}
 
-	window.openFriendActivityGame = function(titleId, title) {
+	window.openFriendActivityGame = function(titleId, title, category, contentId) {
 		if (typeof playUiClick === 'function') playUiClick();
-		if (typeof searchGameOnSite === 'function') searchGameOnSite(String(titleId || ''), 'activity', null, String(title || ''));
+		if (typeof searchGameOnSite === 'function') searchGameOnSite(String(titleId || ''), 'activity', String(category || '') || null, String(title || ''), String(contentId || ''));
 	};
 
 	window.renderFriendActivity = function() {
@@ -53987,7 +54044,7 @@ function getVisibleChatStackEl(id) {
 					if (p) p.textContent = window.__friendActivityRemoteError;
 				} else if (window.__friendActivityFriendCount > 0) {
 					if (strong) strong.textContent = 'No recent friend activity.';
-					if (p) p.textContent = 'When your friends come online, start a game or earn a trophy, it will appear here.';
+					if (p) p.textContent = 'When your friends come online, play, download, wishlist or earn a trophy, it will appear here.';
 				} else {
 					if (strong) strong.textContent = 'No friends yet.';
 					if (p) p.textContent = 'Add players to your Friends List and their activity will show up here.';
@@ -54007,11 +54064,20 @@ function getVisibleChatStackEl(id) {
 			const avatar = typeof getResolvedUserAvatar === 'function' ? getResolvedUserAvatar(item.actor) : 'https://raw.githubusercontent.com/PS3-Pro/PSN-Content/main/resources/interface/modern/images/avatars/default.png';
 			const title = String(item.data && item.data.title || '').trim();
 			const titleId = String(item.data && item.data.titleId || '').trim();
+			const contentId = String(item.data && item.data.contentId || '').trim();
+			const category = String(item.data && item.data.category || '').trim();
 			let actionHtml = escapeFriendActivityHtml(p.message);
-			if (item.type === 'playing' && title) {
+			if (['playing','played','download','wishlist'].includes(item.type) && title) {
 				const encodedTitle = encodeURIComponent(title);
 				const encodedTitleId = encodeURIComponent(titleId);
-				actionHtml += ' <button type="button" class="friend-activity-game" onclick="event.stopPropagation(); openFriendActivityGame(decodeURIComponent(\'' + encodedTitleId + '\'), decodeURIComponent(\'' + encodedTitle + '\'))">' + escapeFriendActivityHtml(title) + '</button>';
+				const encodedCategory = encodeURIComponent(category);
+				const encodedContentId = encodeURIComponent(contentId);
+				if (titleId) {
+					actionHtml += ' <button type="button" class="friend-activity-game" onclick="event.stopPropagation(); openFriendActivityGame(decodeURIComponent(\'' + encodedTitleId + '\'), decodeURIComponent(\'' + encodedTitle + '\'), decodeURIComponent(\'' + encodedCategory + '\'), decodeURIComponent(\'' + encodedContentId + '\'))">' + escapeFriendActivityHtml(title) + '</button>';
+				} else {
+					actionHtml += ' <span style="color:#fff;font-weight:800">' + escapeFriendActivityHtml(title) + '</span>';
+				}
+				actionHtml += escapeFriendActivityHtml(p.suffix || '');
 			} else if (item.type === 'trophy') {
 				actionHtml += ' <span class="friend-activity-trophy"><span class="ps-trophy-icon ps-trophy-' + p.trophyType + '" aria-hidden="true"></span>' + escapeFriendActivityHtml(title || 'Trophy') + '</span>';
 			}
