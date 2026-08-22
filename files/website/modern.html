@@ -16956,18 +16956,6 @@ P
 	const licenseRepoRapPending = new Set();
 	const licenseRepoRapQueue = [];
 	let licenseRepoRapActiveChecks = 0;
-	let licenseRepoRapBrowseRefreshTimer = 0;
-
-	function scheduleBrowseRefreshForRepoRap() {
-		clearTimeout(licenseRepoRapBrowseRefreshTimer);
-		licenseRepoRapBrowseRefreshTimer = setTimeout(() => {
-			licenseRepoRapBrowseRefreshTimer = 0;
-			const browseView = document.getElementById('view-browse');
-			const catSelect = document.getElementById('cat-select');
-			if (!browseView || browseView.style.display === 'none' || !catSelect || catSelect.value !== 'games') return;
-			if (typeof applyFilters === 'function') applyFilters();
-		}, 120);
-	}
 
 	function getLicenseRepoRapContentId(game) {
 		const contentId = String(game && game.contentId || '').trim();
@@ -17086,10 +17074,7 @@ P
 			licenseRepoRapActiveChecks++;
 			checkLicenseRepoRap(contentId).then(exists => {
 				licenseRepoRapAvailability[contentId] = exists;
-				if (exists) {
-					refreshVisibleRepoRapButtons(contentId);
-					scheduleBrowseRefreshForRepoRap();
-				}
+				if (exists) refreshVisibleRepoRapButtons(contentId);
 			}).finally(() => {
 				licenseRepoRapPending.delete(contentId);
 				licenseRepoRapActiveChecks--;
@@ -20101,17 +20086,14 @@ P
 	function isMissingRapItem(game, category = '') {
 		if (!game || normalizeRapMarker(game.rap) !== 'MISSING') return false;
 
-		const categoryHint = typeof category === 'string' ? category : '';
 		const resolvedCategory = String(
-			categoryHint || game.category || game.rawCategory || document.getElementById('cat-select')?.value || ''
+			category || game.category || game.rawCategory || document.getElementById('cat-select')?.value || ''
 		).trim().toLowerCase();
 
-		// License priority is shared with the RAP button: direct database RAP -> Unlock DLC -> repository RAP.
+		// The gray RAP button means the base game is licensed by an Unlock DLC.
+		// Treat that as a valid license here too so Missing Licenses never hides it.
 		if (resolvedCategory === 'games' && isLicenseByDlcItem(game, 'games')) return false;
-		if (hasCachedRepoRapDownload(game, resolvedCategory)) return false;
 
-		// Items hidden by Missing Licenses still need the repository check; otherwise a brown RAP could never be discovered.
-		if (isRepoRapFallbackCandidate(game, resolvedCategory)) scheduleLicenseRepoRapCheck(game, resolvedCategory);
 		return true;
 	}
 
@@ -20188,7 +20170,7 @@ P
 			available = (Array.isArray(currentData) ? currentData : [])
 				.filter(game => getBrowseGroupTitleKey(game) === key)
 				.filter(game => browseItemPassesFiltersBeforeMissingRap(game, ctx))
-				.filter(game => isMissingRapItem(game, ctx.currentCat)).length;
+				.filter(isMissingRapItem).length;
 		}
 
 		const showing = !!(missingRapToggle && missingRapToggle.checked);
