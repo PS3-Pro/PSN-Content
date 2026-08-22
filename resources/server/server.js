@@ -153,7 +153,7 @@ function isPgTransientConnectionError(err) {
   if (!err) return false;
   const code = String(err.code || '').toUpperCase();
   const message = String(err.message || err).toLowerCase();
-  if (['08000','08001','08003','08004','08006','08007','08P01','57P01','57P02','57P03','53300'].includes(code)) return true;
+  if (['08000','08001','08003','08004','08006','08007','08P01','57P01','57P02','57P03','53300','55P03','40001','40P01'].includes(code)) return true;
   if (code === '57014' && /statement timeout|query timeout|canceling statement/.test(message)) return true;
   return /query read timeout|query timeout|read timeout|connection terminated|connection timeout|timeout exceeded when trying to connect|connection reset|econnreset|etimedout|ehostunreach|enetunreach|socket hang up|broken pipe|server closed the connection|terminating connection|the database system is starting up|too many clients|remaining connection slots/.test(message);
 }
@@ -175,6 +175,55 @@ async function queryDbWithRetry(text, params = [], options = {}) {
       const delayMs = attempt === 1 ? 180 : 650;
       console.warn(`[${label}] Temporary PostgreSQL connection failure. Retrying ${attempt + 1}/${attempts} in ${delayMs}ms.`);
       await waitMs(delayMs);
+    }
+  }
+  throw lastError;
+}
+
+async function runDbTransactionWithRetry(label, taskFn, options = {}) {
+  if (typeof taskFn !== 'function') return null;
+  const attempts = Math.max(1, Math.min(5, Number(options.attempts) || 3));
+  const lockTimeoutMs = Math.max(250, Math.min(3000, Number(options.lockTimeoutMs) || 1200));
+  const advisoryLockKey = String(options.advisoryLockKey || '').trim();
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    let client = null;
+    let inTransaction = false;
+    try {
+      client = await pool.connect();
+      await client.query('BEGIN');
+      inTransaction = true;
+      await client.query(`SET LOCAL lock_timeout = '${lockTimeoutMs}ms'`);
+
+      if (advisoryLockKey) {
+        const lockResult = await client.query(
+          'SELECT pg_try_advisory_xact_lock(hashtext($1)) AS locked',
+          [advisoryLockKey]
+        );
+        if (!(lockResult.rows[0] && lockResult.rows[0].locked === true)) {
+          const busyError = new Error(`${label} is busy`);
+          busyError.code = '55P03';
+          throw busyError;
+        }
+      }
+
+      const result = await taskFn(client);
+      await client.query('COMMIT');
+      inTransaction = false;
+      return result;
+    } catch (err) {
+      lastError = err;
+      if (client && inTransaction) {
+        try { await client.query('ROLLBACK'); } catch (rollbackErr) {}
+        inTransaction = false;
+      }
+      if (!isPgTransientConnectionError(err) || attempt >= attempts) throw err;
+      const delayMs = attempt === 1 ? 40 : attempt === 2 ? 100 : attempt === 3 ? 220 : 450;
+      console.warn(`[${label}] Temporary PostgreSQL lock/connection contention. Retrying ${attempt + 1}/${attempts} in ${delayMs}ms.`);
+      await waitMs(delayMs);
+    } finally {
+      if (client) client.release();
     }
   }
   throw lastError;
@@ -1667,10 +1716,6 @@ function normalizeProfileNotificationStateServer(value = {}) {
   return state;
 }
 
-function createEmptyProfileNotificationStateServer() {
-  return normalizeProfileNotificationStateServer({});
-}
-
 function updateProfileNotificationCategoryServer(currentState, category, patch = {}) {
   const state = normalizeProfileNotificationStateServer(currentState);
   if (!PROFILE_NOTIFICATION_CATEGORIES.has(category)) return state;
@@ -1708,23 +1753,24 @@ function getProfileNotificationStatePayloadServer(user = {}) {
 
 async function updateProfileNotificationCategoryInDb(name, category, patch = {}) {
   if (!name || !PROFILE_NOTIFICATION_CATEGORIES.has(category)) return null;
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    const currentResult = await client.query(
-      `SELECT data->'notificationState' AS notification_state, data->>'profileUpdatedAt' AS profile_updated_at FROM users WHERE name = $1 FOR UPDATE`,
-      [name]
-    );
-    if (!currentResult.rows.length) {
-      await client.query('ROLLBACK');
-      return null;
-    }
+  const mutationId = normalizeText(patch.mutationId, '').slice(0, 96);
+  const maxAttempts = 4;
 
-    const currentState = normalizeProfileNotificationStateServer(currentResult.rows[0].notification_state || {});
-    const mutationId = normalizeText(patch.mutationId, '').slice(0, 96);
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const currentResult = await queryDbWithRetry(
+      `SELECT data->'notificationState' AS notification_state, data->>'profileUpdatedAt' AS profile_updated_at
+       FROM users WHERE name = $1 LIMIT 1`,
+      [name],
+      { attempts: 2, label: 'PROFILE NOTIFICATION STATE READ' }
+    );
+    if (!currentResult.rows.length) return null;
+
+    const rawCurrentState = currentResult.rows[0].notification_state && typeof currentResult.rows[0].notification_state === 'object'
+      ? currentResult.rows[0].notification_state
+      : {};
+    const currentState = normalizeProfileNotificationStateServer(rawCurrentState);
     const currentCategory = currentState[category] || normalizeProfileNotificationCategoryServer(category, {});
     if (mutationId && currentCategory.mutationIds.includes(mutationId)) {
-      await client.query('COMMIT');
       return {
         notificationState: currentState,
         profileUpdatedAt: normalizeTimestampValue(currentResult.rows[0].profile_updated_at) || Date.now(),
@@ -1733,20 +1779,33 @@ async function updateProfileNotificationCategoryInDb(name, category, patch = {})
     }
 
     const nextState = updateProfileNotificationCategoryServer(currentState, category, { ...patch, mutationId });
-    const now = Date.now();
+    const now = Math.max(Date.now(), normalizeTimestampValue(currentResult.rows[0].profile_updated_at) + 1);
     const dbPatch = { notificationState: nextState, lastSeen: now, profileUpdatedAt: now };
-    await client.query(
-      `UPDATE users SET data = COALESCE(data, '{}'::jsonb) || $1::jsonb WHERE name = $2`,
-      [dbPatch, name]
+
+    // Compare only notificationState. Unrelated profile/presence writes no longer force a long row lock transaction.
+    const updateResult = await runDbTransactionWithRetry(
+      'PROFILE NOTIFICATION STATE SAVE',
+      client => client.query(
+        `UPDATE users
+         SET data = COALESCE(data, '{}'::jsonb) || $1::jsonb
+         WHERE name = $2
+           AND COALESCE(data->'notificationState', '{}'::jsonb) = $3::jsonb
+         RETURNING data->>'profileUpdatedAt' AS profile_updated_at`,
+        [dbPatch, name, JSON.stringify(rawCurrentState)]
+      ),
+      { attempts: 2, lockTimeoutMs: 1200 }
     );
-    await client.query('COMMIT');
-    return { notificationState: nextState, profileUpdatedAt: now, duplicate: false };
-  } catch (err) {
-    try { await client.query('ROLLBACK'); } catch (rollbackErr) {}
-    throw err;
-  } finally {
-    client.release();
+    if (updateResult.rowCount > 0) {
+      return { notificationState: nextState, profileUpdatedAt: now, duplicate: false };
+    }
+
+    // Another notification mutation won the race. Re-read, merge the delta, and try again.
+    if (attempt < maxAttempts) await waitMs(attempt === 1 ? 20 : attempt === 2 ? 45 : 90);
   }
+
+  const conflict = new Error('notification state changed concurrently');
+  conflict.code = '40001';
+  throw conflict;
 }
 
 function hasObjectPayload(value) {
@@ -2339,6 +2398,7 @@ function buildCompactUserSummary(name, userData = {}) {
   const trophies = source.trophiesData && typeof source.trophiesData === 'object' && !Array.isArray(source.trophiesData)
     ? countUnlockedTrophiesPayload(source.trophiesData)
     : Number(source.trophies || 0);
+  const notificationState = getProfileNotificationStatePayloadServer(source);
 
   return normalizeUserRecord(name, {
     name,
@@ -2366,7 +2426,7 @@ function buildCompactUserSummary(name, userData = {}) {
     recentlyVisited,
     recentlyVisitedData,
     recentlyVisitedUpdatedAt: normalizeTimestampValue(source.recentlyVisitedUpdatedAt),
-    ...(getProfileNotificationStatePayloadServer(source) ? { notificationState: getProfileNotificationStatePayloadServer(source) } : {}),
+    ...(notificationState ? { notificationState } : {}),
     countersData: buildCompactCountersData(source.countersData),
     themeColor: normalizeThemeColorServer(source.themeColor || (source.settingsData && source.settingsData.themeColor) || '#0070cc'),
     themeColorUpdatedAt: getUserThemeColorUpdatedAt(source),
@@ -3077,7 +3137,7 @@ const PROFILE_HEAVY_SECTION_META = {
   wishlistData: { type: 'wishlist', countKey: 'wishlist', versionKeys: ['wishlistUpdatedAt'] },
   favoritesData: { type: 'favorites', countKey: 'favorites', versionKeys: ['favoritesUpdatedAt'] },
   libraryData: { type: 'library', countKey: 'library', versionKeys: ['libraryUpdatedAt'] },
-  friendsData: { type: 'friends', countKey: 'friends', versionKeys: ['friendsUpdatedAt'] }
+  friendsData: { type: 'friends', countKey: 'friends', versionKeys: ['friendsUpdatedAt'], publicCount: false }
 };
 
 function incomingTouchesHeavyProfileSection(incoming = {}, dataKey, meta = {}) {
@@ -3107,12 +3167,12 @@ function updateCompactUserCacheFromPatch(name, workingUser = {}, patch = {}) {
     compact[key] = patch[key];
   });
 
-  if (Object.prototype.hasOwnProperty.call(patch, 'downloadsData')) compact.downloads = Array.isArray(workingUser.downloadsData) ? workingUser.downloadsData.length : Number(workingUser.downloads || 0);
-  if (Object.prototype.hasOwnProperty.call(patch, 'wishlistData')) compact.wishlist = Array.isArray(workingUser.wishlistData) ? workingUser.wishlistData.length : Number(workingUser.wishlist || 0);
-  if (Object.prototype.hasOwnProperty.call(patch, 'favoritesData')) compact.favorites = Array.isArray(workingUser.favoritesData) ? workingUser.favoritesData.length : Number(workingUser.favorites || 0);
-  if (Object.prototype.hasOwnProperty.call(patch, 'libraryData')) compact.library = Array.isArray(workingUser.libraryData) ? workingUser.libraryData.length : Number(workingUser.library || 0);
-  if (Object.prototype.hasOwnProperty.call(patch, 'friendsData')) compact.friends = Array.isArray(workingUser.friendsData) ? workingUser.friendsData.length : Number(workingUser.friends || 0);
-  if (Object.prototype.hasOwnProperty.call(patch, 'trophiesData')) compact.trophies = countUnlockedTrophiesPayload(workingUser.trophiesData || {});
+  Object.entries(PROFILE_HEAVY_SECTION_META).forEach(([dataKey, meta]) => {
+    if (!Object.prototype.hasOwnProperty.call(patch, dataKey) || !meta.countKey) return;
+    compact[meta.countKey] = dataKey === 'trophiesData'
+      ? countUnlockedTrophiesPayload(workingUser[dataKey] || {})
+      : (Array.isArray(workingUser[dataKey]) ? workingUser[dataKey].length : Number(workingUser[meta.countKey] || 0));
+  });
 
   USER_HEAVY_CACHE_KEYS.forEach(key => delete compact[key]);
   userDatabase[name] = normalizeUserRecord(name, compact);
@@ -3121,6 +3181,7 @@ function updateCompactUserCacheFromPatch(name, workingUser = {}, patch = {}) {
 }
 
 function buildLightProfileUserData(name, user = {}) {
+  const notificationState = getProfileNotificationStatePayloadServer(user);
   return {
     _lightAuth: true,
     id: user.id || null,
@@ -3146,7 +3207,7 @@ function buildLightProfileUserData(name, user = {}) {
     recentlyVisited: Array.isArray(user.recentlyVisitedData) ? user.recentlyVisitedData.length : Number(user.recentlyVisited || 0),
     recentlyVisitedData: normalizeRecentlyVisitedRecordsServer(user.recentlyVisitedData),
     recentlyVisitedUpdatedAt: normalizeTimestampValue(user.recentlyVisitedUpdatedAt),
-    ...(getProfileNotificationStatePayloadServer(user) ? { notificationState: getProfileNotificationStatePayloadServer(user) } : {}),
+    ...(notificationState ? { notificationState } : {}),
     countersData: buildCompactCountersData(user.countersData),
     themeColor: normalizeThemeColorServer(user.themeColor || (user.settingsData && user.settingsData.themeColor) || '#0070cc'),
     themeColorUpdatedAt: getUserThemeColorUpdatedAt(user),
@@ -3271,17 +3332,8 @@ async function emitChunkedProfileSyncToSocket(socket, name, options = {}) {
       }
     }
 
-    const sections = [
-      ['trophiesData', 'trophies', null],
-      ['downloadsData', 'downloads', 'downloadsUpdatedAt'],
-      ['wishlistData', 'wishlist', 'wishlistUpdatedAt'],
-      ['favoritesData', 'favorites', 'favoritesUpdatedAt'],
-      ['libraryData', 'library', 'libraryUpdatedAt'],
-      ['friendsData', 'friends', 'friendsUpdatedAt']
-    ];
-
-    for (const [dataKey, type, versionKey] of sections) {
-      const meta = PROFILE_HEAVY_SECTION_META[dataKey];
+    for (const [dataKey, meta] of Object.entries(PROFILE_HEAVY_SECTION_META)) {
+      const type = meta.type;
       const sectionRequested = !requestedKeys || requestedKeys.has(dataKey) || requestedKeys.has(meta.countKey) || (meta.versionKeys || []).some(key => requestedKeys.has(key));
       if (!sectionRequested) continue;
       if (!socket.connected) { logMemoryTrace('profile-sync:cancel', `user=${name} socket=${socket.id} stage=${dataKey}`); return; }
@@ -3299,9 +3351,8 @@ async function emitChunkedProfileSyncToSocket(socket, name, options = {}) {
 
         const userData = { profileUpdatedAt, [dataKey]: rawData };
         if (dataKey === 'trophiesData') userData.trophies = countUnlockedTrophiesPayload(rawData || {});
-        else userData[meta.countKey] = Array.isArray(rawData) ? rawData.length : 0;
-        if (versionKey) userData[versionKey] = normalizeTimestampValue(compactUser[versionKey]);
-        if (dataKey === 'downloadsData') userData.downloadsClearedAt = normalizeTimestampValue(compactUser.downloadsClearedAt);
+        else if (meta.countKey) userData[meta.countKey] = Array.isArray(rawData) ? rawData.length : 0;
+        (meta.versionKeys || []).forEach(key => { userData[key] = normalizeTimestampValue(compactUser[key]); });
 
         const packet = { name, sourceSocketId: options.sourceSocketId || null, profileUpdatedAt, userData };
         logMemoryTrace('profile-sync:section:send', `user=${name} socket=${socket.id} section=${dataKey} items=${itemCount} approx=${formatApproxBytes(estimate.bytes)}${estimate.truncated ? '+' : ''} buffer=${getSocketWriteBufferLength(socket)}`);
@@ -4109,6 +4160,7 @@ async function getActivePresenceSessionsForName(name) {
 
 function buildFullProfileSyncPayload(name, user = {}, sourceSocketId = null, options = {}) {
   const safe = options.normalized === true ? user : normalizeUserRecord(name, user || {});
+  const notificationState = getProfileNotificationStatePayloadServer(safe);
   return {
     name,
     sourceSocketId,
@@ -4148,7 +4200,7 @@ function buildFullProfileSyncPayload(name, user = {}, sourceSocketId = null, opt
       recentlyVisited: Array.isArray(safe.recentlyVisitedData) ? safe.recentlyVisitedData.length : Number(safe.recentlyVisited || 0),
       recentlyVisitedData: normalizeRecentlyVisitedRecordsServer(safe.recentlyVisitedData),
       recentlyVisitedUpdatedAt: normalizeTimestampValue(safe.recentlyVisitedUpdatedAt),
-      ...(getProfileNotificationStatePayloadServer(safe) ? { notificationState: getProfileNotificationStatePayloadServer(safe) } : {}),
+      ...(notificationState ? { notificationState } : {}),
       countersData: safe.countersData || {},
       themeColor: normalizeThemeColorServer(safe.themeColor || (safe.settingsData && safe.settingsData.themeColor) || '#0070cc'),
       themeColorUpdatedAt: getUserThemeColorUpdatedAt(safe),
@@ -4160,10 +4212,8 @@ function buildFullProfileSyncPayload(name, user = {}, sourceSocketId = null, opt
 
 const PROFILE_SYNC_PATCH_KEYS = new Set([
   'id', 'name', 'avatar', 'joined', 'countryCode', 'role', 'isAdmin', 'isModerator', 'banned',
-  'lastSeen', 'ps3Status', 'level', 'xp', 'downloads', 'wishlist', 'favorites', 'trophies', 'library',
-  'trophiesData', 'downloadsData', 'downloadsClearedAt', 'downloadsUpdatedAt',
-  'wishlistData', 'wishlistUpdatedAt', 'favoritesData', 'favoritesUpdatedAt',
-  'libraryData', 'libraryUpdatedAt', 'friendsData', 'friendsUpdatedAt',
+  'lastSeen', 'ps3Status', 'level', 'xp',
+  ...Object.entries(PROFILE_HEAVY_SECTION_META).flatMap(([dataKey, meta]) => [dataKey, meta.countKey, ...(meta.versionKeys || [])].filter(Boolean)),
   'recentlyVisited', 'recentlyVisitedData', 'recentlyVisitedUpdatedAt', 'notificationState',
   'countersData', 'themeColor', 'themeColorUpdatedAt', 'settingsData'
 ]);
@@ -4213,7 +4263,10 @@ function buildProfileSyncPatchPayload(name, user = {}, changedKeys = [], sourceS
   if (include('recentlyVisited')) target.recentlyVisited = Array.isArray(user.recentlyVisitedData) ? user.recentlyVisitedData.length : Number(user.recentlyVisited || 0);
   if (include('recentlyVisitedData')) target.recentlyVisitedData = normalizeRecentlyVisitedRecordsServer(user.recentlyVisitedData);
   if (include('recentlyVisitedUpdatedAt')) target.recentlyVisitedUpdatedAt = normalizeTimestampValue(user.recentlyVisitedUpdatedAt);
-  if (include('notificationState') && getProfileNotificationStatePayloadServer(user)) target.notificationState = getProfileNotificationStatePayloadServer(user);
+  if (include('notificationState')) {
+    const notificationState = getProfileNotificationStatePayloadServer(user);
+    if (notificationState) target.notificationState = notificationState;
+  }
   if (include('countersData')) target.countersData = user.countersData || {};
   if (include('themeColor')) target.themeColor = normalizeThemeColorServer(user.themeColor || (user.settingsData && user.settingsData.themeColor) || '#0070cc');
   if (include('themeColorUpdatedAt')) target.themeColorUpdatedAt = getUserThemeColorUpdatedAt(user);
@@ -4310,13 +4363,7 @@ async function notifyPs3PlayTimeAcrossInstances(payload = {}) {
 }
 
 function profileUpdateTouchesPublicCounts(userData = {}) {
-  return !!(userData && [
-    'downloadsData', 'downloads', 'downloadsClearedAt', 'downloadsUpdatedAt',
-    'wishlistData', 'wishlist', 'wishlistUpdatedAt',
-    'favoritesData', 'favorites', 'favoritesUpdatedAt',
-    'libraryData', 'library', 'libraryUpdatedAt',
-    'trophiesData', 'trophies'
-  ].some(key => Object.prototype.hasOwnProperty.call(userData, key)));
+  return !!(userData && Object.entries(PROFILE_HEAVY_SECTION_META).some(([dataKey, meta]) => meta.publicCount !== false && incomingTouchesHeavyProfileSection(userData, dataKey, meta)));
 }
 
 
@@ -4836,57 +4883,55 @@ async function recordAggregatedFriendActivity(actorName, type, rawData = {}, opt
   const semanticKey = getFriendActivitySemanticKey(eventType, baseData);
   if (!semanticKey) return null;
 
-  const client = await pool.connect();
   let event = null;
   try {
-    await client.query('BEGIN');
-    await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`friend-activity:${actor.toLowerCase()}:${semanticKey}`]);
-
-    const existingResult = await client.query(
-      `SELECT id, actor_name, event_type, data, created_at
-       FROM friend_activity
-       WHERE actor_name = $1 AND event_type = $2
-       ORDER BY id DESC
-       LIMIT $3`,
-      [actor, eventType, FRIEND_ACTIVITY_MAX_PER_USER]
-    );
-    const groupWindowMs = Math.max(0, Number(options.groupWindowMs) || 0);
-    const matching = existingResult.rows
-      .map(row => ({ row, event: serializeFriendActivityRow(row) }))
-      .filter(entry => {
-        if (!entry.event || getFriendActivitySemanticKey(entry.event.type, entry.event.data) !== semanticKey) return false;
-        if (!groupWindowMs) return true;
-        return Math.abs(at - Number(entry.event.createdAt || 0)) <= groupWindowMs;
-      });
-    const replacesIds = matching.map(entry => String(entry.row.id)).filter(Boolean);
-    const previousCount = matching.reduce((sum, entry) => sum + getFriendActivityRepeatCount(entry.event.data), 0);
-    const data = normalizeFriendActivityData(eventType, {
-      ...baseData,
-      repeatCount: Math.min(9999, previousCount + 1),
-      replacesIds
-    });
-
-    const insertResult = await client.query(
-      `INSERT INTO friend_activity (actor_name, event_type, data, dedupe_key, created_at)
-       VALUES ($1, $2, $3::jsonb, NULL, to_timestamp($4::double precision / 1000.0))
-       RETURNING id, actor_name, event_type, data, created_at`,
-      [actor, eventType, JSON.stringify(data), at]
-    );
-    if (replacesIds.length) {
-      await client.query(
-        `DELETE FROM friend_activity
-         WHERE actor_name = $1 AND id = ANY($2::bigint[])`,
-        [actor, replacesIds]
+    event = await runDbTransactionWithRetry('FRIEND ACTIVITY AGGREGATE', async client => {
+      const existingResult = await client.query(
+        `SELECT id, actor_name, event_type, data, created_at
+         FROM friend_activity
+         WHERE actor_name = $1 AND event_type = $2
+         ORDER BY id DESC
+         LIMIT $3`,
+        [actor, eventType, FRIEND_ACTIVITY_MAX_PER_USER]
       );
-    }
-    await client.query('COMMIT');
-    event = serializeFriendActivityRow(insertResult.rows[0]);
+      const groupWindowMs = Math.max(0, Number(options.groupWindowMs) || 0);
+      const matching = existingResult.rows
+        .map(row => ({ row, event: serializeFriendActivityRow(row) }))
+        .filter(entry => {
+          if (!entry.event || getFriendActivitySemanticKey(entry.event.type, entry.event.data) !== semanticKey) return false;
+          if (!groupWindowMs) return true;
+          return Math.abs(at - Number(entry.event.createdAt || 0)) <= groupWindowMs;
+        });
+      const replacesIds = matching.map(entry => String(entry.row.id)).filter(Boolean);
+      const previousCount = matching.reduce((sum, entry) => sum + getFriendActivityRepeatCount(entry.event.data), 0);
+      const data = normalizeFriendActivityData(eventType, {
+        ...baseData,
+        repeatCount: Math.min(9999, previousCount + 1),
+        replacesIds
+      });
+
+      const insertResult = await client.query(
+        `INSERT INTO friend_activity (actor_name, event_type, data, dedupe_key, created_at)
+         VALUES ($1, $2, $3::jsonb, NULL, to_timestamp($4::double precision / 1000.0))
+         RETURNING id, actor_name, event_type, data, created_at`,
+        [actor, eventType, JSON.stringify(data), at]
+      );
+      if (replacesIds.length) {
+        await client.query(
+          `DELETE FROM friend_activity
+           WHERE actor_name = $1 AND id = ANY($2::bigint[])`,
+          [actor, replacesIds]
+        );
+      }
+      return serializeFriendActivityRow(insertResult.rows[0]);
+    }, {
+      attempts: 3,
+      lockTimeoutMs: 1200,
+      advisoryLockKey: `friend-activity:${actor.toLowerCase()}:${semanticKey}`
+    });
   } catch (err) {
-    try { await client.query('ROLLBACK'); } catch (rollbackErr) {}
     console.error('[FRIEND ACTIVITY AGGREGATE ERROR]:', err && err.message ? err.message : err);
     return null;
-  } finally {
-    client.release();
   }
 
   if (!event) return null;
@@ -5482,11 +5527,9 @@ async function upsertPresenceForSocket(socket, name) {
   const now = Date.now();
 
   if (shouldAnnouncePresence) {
-    const client = await pool.connect();
-    try {
-      await client.query('BEGIN');
-      const lockedUser = await client.query('SELECT data FROM users WHERE name = $1 FOR UPDATE', [name]);
-      const storedUser = lockedUser.rows[0] && lockedUser.rows[0].data && typeof lockedUser.rows[0].data === 'object' ? lockedUser.rows[0].data : {};
+    const transition = await runDbTransactionWithRetry('PRESENCE ONLINE', async client => {
+      const storedResult = await client.query('SELECT data FROM users WHERE name = $1 LIMIT 1', [name]);
+      const storedUser = storedResult.rows[0] && storedResult.rows[0].data && typeof storedResult.rows[0].data === 'object' ? storedResult.rows[0].data : {};
       const activePresence = await client.query(
         `SELECT 1
          FROM presence_sessions
@@ -5496,14 +5539,13 @@ async function upsertPresenceForSocket(socket, name) {
          LIMIT 1`,
         [name, socket.id]
       );
-      isFirstActiveSession = activePresence.rowCount === 0;
+      const firstActiveSession = activePresence.rowCount === 0;
       const storedLastSeen = normalizeTimestampValue(storedUser.lastSeen);
-      const shortReconnect = isFirstActiveSession
+      const shortReconnect = firstActiveSession
         && storedUser.online === false
         && storedLastSeen > 0
         && now - storedLastSeen <= FRIEND_ACTIVITY_PRESENCE_GRACE_MS;
-      shouldRecordOnlineActivity = isFirstActiveSession && !shortReconnect;
-      presenceRevision = Math.max(0, Number(storedUser.presenceRevision) || presenceRevision) + (isFirstActiveSession ? 1 : 0);
+      const nextRevision = Math.max(0, Number(storedUser.presenceRevision) || presenceRevision) + (firstActiveSession ? 1 : 0);
 
       await client.query(
         `INSERT INTO presence_sessions (socket_id, name, instance_id, connected_at, last_seen, data)
@@ -5517,21 +5559,28 @@ async function upsertPresenceForSocket(socket, name) {
          ORDER BY connected_at ASC, socket_id ASC LIMIT 1`,
         [name]
       );
-      representativeSocketId = normalizeText(representativePresence.rows[0] && representativePresence.rows[0].socket_id, '') || socket.id;
-      if (isFirstActiveSession) {
+      const representativeId = normalizeText(representativePresence.rows[0] && representativePresence.rows[0].socket_id, '') || socket.id;
+
+      if (firstActiveSession) {
         await client.query(
           `UPDATE users
            SET data = COALESCE(data, '{}'::jsonb) || jsonb_build_object('online', true, 'lastSeen', $2::bigint, 'presenceRevision', $3::bigint)
            WHERE name = $1`,
-          [name, now, presenceRevision]
+          [name, now, nextRevision]
         );
       }
-      await client.query('COMMIT');
-    } catch (err) {
-      try { await client.query('ROLLBACK'); } catch (rollbackErr) {}
-      throw err;
-    } finally {
-      client.release();
+      return {
+        isFirstActiveSession: firstActiveSession,
+        shouldRecordOnlineActivity: firstActiveSession && !shortReconnect,
+        representativeSocketId: representativeId,
+        presenceRevision: nextRevision
+      };
+    }, { attempts: 4, lockTimeoutMs: 1200, advisoryLockKey: `presence:${String(name).toLowerCase()}` });
+    if (transition) {
+      isFirstActiveSession = transition.isFirstActiveSession === true;
+      shouldRecordOnlineActivity = transition.shouldRecordOnlineActivity === true;
+      representativeSocketId = transition.representativeSocketId || socket.id;
+      presenceRevision = Math.max(presenceRevision, Number(transition.presenceRevision) || 0);
     }
   } else {
     await queryDbWithRetry(
@@ -5564,11 +5613,10 @@ async function upsertPresenceForSocket(socket, name) {
 async function markPresenceOfflineIfNoActiveSessions(name, lastSeen = Date.now(), options = {}) {
   const actor = normalizeText(name, '');
   if (!actor) return { changed: false, online: false, revision: 0, lastSeen: normalizeTimestampValue(lastSeen) || Date.now() };
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    const lockedUser = await client.query('SELECT data FROM users WHERE name = $1 FOR UPDATE', [actor]);
-    const storedUser = lockedUser.rows[0] && lockedUser.rows[0].data && typeof lockedUser.rows[0].data === 'object' ? lockedUser.rows[0].data : {};
+
+  return runDbTransactionWithRetry('PRESENCE OFFLINE', async client => {
+    const storedResult = await client.query('SELECT data FROM users WHERE name = $1 LIMIT 1', [actor]);
+    const storedUser = storedResult.rows[0] && storedResult.rows[0].data && typeof storedResult.rows[0].data === 'object' ? storedResult.rows[0].data : {};
     const removeSocketId = normalizeText(options && options.removeSocketId, '');
     if (removeSocketId) await client.query('DELETE FROM presence_sessions WHERE socket_id = $1 AND name = $2', [removeSocketId, actor]);
     const active = await client.query(
@@ -5578,9 +5626,9 @@ async function markPresenceOfflineIfNoActiveSessions(name, lastSeen = Date.now()
       [actor]
     );
     if (active.rowCount > 0) {
-      await client.query('COMMIT');
       return { changed: false, online: true, revision: Math.max(0, Number(storedUser.presenceRevision) || 0), row: active.rows[0] };
     }
+
     const safeLastSeen = normalizeTimestampValue(lastSeen) || Date.now();
     const wasOnline = storedUser.online === true;
     const revision = Math.max(0, Number(storedUser.presenceRevision) || Number(userDatabase[actor] && userDatabase[actor].presenceRevision) || 0) + (wasOnline ? 1 : 0);
@@ -5592,14 +5640,8 @@ async function markPresenceOfflineIfNoActiveSessions(name, lastSeen = Date.now()
         [actor, safeLastSeen, revision]
       );
     }
-    await client.query('COMMIT');
     return { changed: wasOnline, online: false, revision, lastSeen: safeLastSeen };
-  } catch (err) {
-    try { await client.query('ROLLBACK'); } catch (rollbackErr) {}
-    throw err;
-  } finally {
-    client.release();
-  }
+  }, { attempts: 4, lockTimeoutMs: 1200, advisoryLockKey: `presence:${actor.toLowerCase()}` });
 }
 
 async function syncPresenceOnlineFromDb() {
@@ -6261,7 +6303,7 @@ io.on('connection', (socket) => {
           downloadsUpdatedAt: normalizeTimestampValue(safeUserData.downloadsUpdatedAt),
           libraryData: safeUserData.libraryData || [],
           friendsData: safeUserData.friendsData || [],
-          notificationState: createEmptyProfileNotificationStateServer(),
+          notificationState: normalizeProfileNotificationStateServer({}),
           countersData: safeUserData.countersData || {},
           themeColor: safeUserData.themeColor || '#0070cc',
           role: isAdmin ? "admin" : "user",
@@ -6899,13 +6941,13 @@ io.on('connection', (socket) => {
     }
   });
 
-  const normalizeProfileSyncSections = sections => {
-    const map = {
-      trophies: 'trophiesData', downloads: 'downloadsData', wishlist: 'wishlistData',
-      favorites: 'favoritesData', library: 'libraryData', friends: 'friendsData'
-    };
-    return [...new Set((Array.isArray(sections) ? sections : []).map(value => map[normalizeText(value, '').toLowerCase()] || normalizeText(value, '')).filter(value => PROFILE_HEAVY_SECTION_META[value]))];
-  };
+  const normalizeProfileSyncSections = sections => [...new Set((Array.isArray(sections) ? sections : []).map(value => {
+    const raw = normalizeText(value, '');
+    if (PROFILE_HEAVY_SECTION_META[raw]) return raw;
+    const type = raw.toLowerCase();
+    const match = Object.entries(PROFILE_HEAVY_SECTION_META).find(([, meta]) => meta.type === type);
+    return match ? match[0] : '';
+  }).filter(Boolean))];
 
   socket.on('request_profile_sync', async (data = {}, ack) => {
     const name = socket.userName;
