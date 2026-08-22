@@ -4308,7 +4308,7 @@ async function initProfileSyncNotifications() {
   }
 }
 
-const FRIEND_ACTIVITY_TYPES = new Set(['online', 'playing', 'played', 'xmb', 'trophy', 'download', 'wishlist']);
+const FRIEND_ACTIVITY_TYPES = new Set(['online', 'offline', 'playing', 'played', 'xmb', 'trophy', 'download', 'wishlist']);
 const FRIEND_ACTIVITY_LIMIT = 60;
 const FRIEND_ACTIVITY_ROOM_PREFIX = 'friend-activity:';
 
@@ -4426,7 +4426,7 @@ async function recordFriendActivity(actorName, type, rawData = {}, options = {})
   const at = normalizeTimestampValue(options.at) || Date.now();
   const detailKey = eventType === 'playing' || eventType === 'played' || eventType === 'xmb' || eventType === 'download' || eventType === 'wishlist'
     ? `${data.contentId || data.titleId || data.title}`
-    : (eventType === 'trophy' ? `${data.trophyId || data.title}` : 'online');
+    : (eventType === 'trophy' ? `${data.trophyId || data.title}` : eventType);
   const dedupeKey = normalizeText(options.dedupeKey, '') || `${actor.toLowerCase()}:${eventType}:${String(detailKey || '').toLowerCase()}:${Math.floor(at / 5000)}`;
 
   try {
@@ -5000,6 +5000,9 @@ async function syncPresenceOnlineFromDb() {
         [names, lastSeenValues],
         { attempts: 2, label: 'PRESENCE LAST SEEN SAVE' }
       );
+      names.forEach((username, index) => {
+        deferServerTask('FRIEND ACTIVITY OFFLINE', () => recordFriendActivity(username, 'offline', {}, { at: Number(lastSeenValues[index] || Date.now()) }), 0);
+      });
     }
   }
 
@@ -7437,6 +7440,7 @@ io.on('connection', (socket) => {
         );
         userCacheMeta[name] = Date.now();
         invalidateOnlineListCache('disconnect-presence-save');
+        deferServerTask('FRIEND ACTIVITY OFFLINE', () => recordFriendActivity(name, 'offline', {}, { at: lastSeen }), 0);
         deferServerTask('LOGOUT SERVER LOG', () => addServerLog('logout', `${name} disconnected`, { socketId: socket.id }, name), 0);
       }
 
