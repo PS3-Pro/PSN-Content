@@ -3768,13 +3768,59 @@ body.is-ps3 #game-modal.no-gallery-active:not(.compact-no-summary):not(.help-mod
 		return cat === 'dlcs' || cat === 'updates' || cat === 'avatars' || cat === 'themes';
 	}
 
+	function classicHasLicenseDlcForRow(row) {
+		if (!row || !g_dlcIndexLoaded) return false;
+		if (typeof row.classicHasLicenseDlc !== 'undefined') return row.classicHasLicenseDlc === true;
+
+		var titleId = classicCleanTitleId(row[0]);
+		var candidates = g_classicLicenseDlcCandidates[titleId];
+		if (!candidates || !candidates.length) {
+			row.classicHasLicenseDlc = false;
+			return false;
+		}
+
+		var baseTitle = row.cleanName || row[2] || titleId;
+		var baseContentId = row[5] || '';
+		var bestScore = -999;
+		var secondScore = -999;
+		var candidate = [titleId, '', '', '1', '', ''];
+		var i;
+
+		for (i = 0; i < candidates.length; i += 2) {
+			candidate[2] = candidates[i] || '';
+			candidate[5] = candidates[i + 1] || '';
+			var score = classicScoreLicenseDlcCandidate(baseTitle, baseContentId, candidate);
+			if (score > bestScore) {
+				secondScore = bestScore;
+				bestScore = score;
+			} else if (score > secondScore) {
+				secondScore = score;
+			}
+		}
+
+		row.classicHasLicenseDlc = bestScore >= 55 && (secondScore <= -900 || (bestScore - secondScore) >= 15);
+		if (row.classicHasLicenseDlc && typeof row.isMissingLicense !== 'undefined') row.isMissingLicense = false;
+		return row.classicHasLicenseDlc;
+	}
+
 	function classicIsMissingLicenseRow(row) {
 		if (!row) return false;
-		if (typeof row.isMissingLicense !== 'undefined') return row.isMissingLicense === true;
 
-		var rapHex = String(row[4] || '').replace(/^\s+|\s+$/g, '').toUpperCase();
+		var rapHex = classicNormalizeRapMarker(row[4]);
+		if (rapHex !== 'MISSING') return false;
+		if (classicHasLicenseDlcForRow(row)) return false;
 
-		return rapHex === "MISSING";
+		return true;
+	}
+
+	function classicNeedsMissingLicenseDlcRefresh() {
+		if (currentCategory !== 'games' || typeof DB === 'undefined' || !DB || !DB.length) return false;
+		for (var i = 0; i < DB.length; i++) {
+			var row = DB[i];
+			if (!row || classicNormalizeRapMarker(row[4]) !== 'MISSING') continue;
+			if (classicHasLicenseDlcForRow(row)) return true;
+		}
+		return false;
 	}
 
 	function updateMissingLicenseFilterButton() {
@@ -4164,6 +4210,28 @@ function classicIsGameToRelatedLoop(titleId, category) {
 	// 9. COVERS, DLC, AVATAR & THEME SYSTEM
 	// ==============================================================	
 	var g_dlcExists = {}, g_dlcIndexLoaded = false;
+	var g_classicLicenseDlcCandidates = {};
+
+	function classicIndexLicenseDlcCandidate(line, titleId) {
+		if (!line || !titleId) return;
+		var t1 = line.indexOf('\t');
+		var t2 = t1 === -1 ? -1 : line.indexOf('\t', t1 + 1);
+		var t3 = t2 === -1 ? -1 : line.indexOf('\t', t2 + 1);
+		var t4 = t3 === -1 ? -1 : line.indexOf('\t', t3 + 1);
+		var t5 = t4 === -1 ? -1 : line.indexOf('\t', t4 + 1);
+		if (t2 === -1 || t3 === -1 || t4 === -1 || t5 === -1) return;
+
+		var pkg = line.substring(t3 + 1, t4);
+		if (!pkg || pkg === 'MISSING') return;
+
+		var t6 = line.indexOf('\t', t5 + 1);
+		var name = line.substring(t2 + 1, t3);
+		var contentId = t6 === -1 ? line.substring(t5 + 1) : line.substring(t5 + 1, t6);
+		var candidates = g_classicLicenseDlcCandidates[titleId];
+		if (!candidates) candidates = g_classicLicenseDlcCandidates[titleId] = [];
+		candidates.push(name || '', contentId || '');
+	}
+
 	var g_avatarExists = {}, g_avatarIndexLoaded = false;
 	var g_themeExists = {}, g_themeIndexLoaded = false;
 	var g_updateExists = {}, g_updateIndexLoaded = false;
@@ -4528,12 +4596,18 @@ function restorePreviousState() {
 					while (pos_h < len_h) {
 						var lineEnd_h = text_h.indexOf('\n', pos_h);
 						if (lineEnd_h === -1) lineEnd_h = len_h;
-						var id_h = text_h.substr(pos_h, 9);
-						if (id_h.length === 9) map_h[id_h] = true;
+						var line_h = text_h.substring(pos_h, lineEnd_h);
+						if (line_h.length && line_h.charCodeAt(line_h.length - 1) === 13) line_h = line_h.substring(0, line_h.length - 1);
+						var id_h = line_h.substr(0, 9);
+						if (id_h.length === 9) {
+							map_h[id_h] = true;
+							classicIndexLicenseDlcCandidate(line_h, id_h);
+						}
 						if (lineEnd_h >= len_h) break;
 						pos_h = lineEnd_h + 1;
 					}
 					g_dlcIndexLoaded = true;
+					if (!g_isFetching && typeof render === 'function' && classicNeedsMissingLicenseDlcRefresh()) render();
 					if (currentCategory === 'games' && !isPS3) injectExtraButtonsOnScreen();
 				}
 			}
