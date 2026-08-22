@@ -54,6 +54,7 @@ const PG_MAX_USES = Math.max(0, parseInt(process.env.PG_MAX_USES || "0", 10) || 
 const ONLINE_LIST_CACHE_MS = Math.max(250, parseInt(process.env.ONLINE_LIST_CACHE_MS || "1200", 10) || 1200);
 const ONLINE_LIST_UNCHANGED_SKIP_ENABLED = process.env.ONLINE_LIST_SKIP_UNCHANGED !== "0";
 const FRIEND_ACTIVITY_MAX_PER_USER = 200;
+const USER_NOTIFICATION_MAX_PER_USER = 200;
 
 const pgConnectionOptions = {
   connectionString: process.env.DATABASE_URL,
@@ -948,6 +949,20 @@ async function initDb() {
       last_read_id BIGINT NOT NULL DEFAULT 0,
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
+    CREATE TABLE IF NOT EXISTS user_notifications (
+      id BIGSERIAL PRIMARY KEY,
+      user_name TEXT NOT NULL,
+      event_type TEXT NOT NULL,
+      data JSONB NOT NULL DEFAULT '{}'::jsonb,
+      dedupe_key TEXT UNIQUE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_user_notifications_user_id ON user_notifications(user_name, id DESC);
+    CREATE TABLE IF NOT EXISTS user_notification_read_state (
+      user_name TEXT PRIMARY KEY,
+      last_read_id BIGINT NOT NULL DEFAULT 0,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
   `);
 
   await queryDbWithRetry(
@@ -961,6 +976,19 @@ async function initDb() {
      )`,
     [],
     { attempts: 2, label: 'FRIEND ACTIVITY RETENTION' }
+  );
+
+  await queryDbWithRetry(
+    `DELETE FROM user_notifications
+     WHERE id IN (
+       SELECT id FROM (
+         SELECT id, ROW_NUMBER() OVER (PARTITION BY user_name ORDER BY id DESC) AS row_num
+         FROM user_notifications
+       ) ranked
+       WHERE row_num > ${USER_NOTIFICATION_MAX_PER_USER}
+     )`,
+    [],
+    { attempts: 2, label: 'USER NOTIFICATION RETENTION' }
   );
 
   await queryDbWithRetry(
@@ -4106,7 +4134,7 @@ async function initProfileSyncNotifications() {
   profileSyncNotifyClient = client;
 
   client.on('notification', async (message) => {
-    if (!message || !['profile_sync', 'presence_sync', 'ps3_playtime_sync', 'admin_state_sync', 'friend_activity_sync'].includes(message.channel)) return;
+    if (!message || !['profile_sync', 'presence_sync', 'ps3_playtime_sync', 'admin_state_sync', 'friend_activity_sync', 'user_notification_sync'].includes(message.channel)) return;
 
     try {
       const data = JSON.parse(message.payload || '{}');
@@ -4114,6 +4142,14 @@ async function initProfileSyncNotifications() {
 
       if (message.channel === 'friend_activity_sync') {
         if (data.event) emitFriendActivityToLocalSubscribers(data.event);
+        return;
+      }
+
+      if (message.channel === 'user_notification_sync') {
+        if (data.event) emitUserNotificationToLocalUser(data.event);
+        if (data.readState && data.readState.userName) {
+          emitUserNotificationReadStateToLocalUser(data.readState.userName, data.readState.lastReadId, data.readState.unreadCount);
+        }
         return;
       }
 
@@ -4257,11 +4293,13 @@ async function initProfileSyncNotifications() {
     await client.query('LISTEN ps3_playtime_sync');
     await client.query('LISTEN admin_state_sync');
     await client.query('LISTEN friend_activity_sync');
+    await client.query('LISTEN user_notification_sync');
     console.log('[PROFILE SYNC] Postgres LISTEN enabled.');
     console.log('[PRESENCE SYNC] Postgres LISTEN enabled.');
     console.log('[PS3 PLAYTIME SYNC] Postgres LISTEN enabled.');
     console.log('[ADMIN STATE SYNC] Postgres LISTEN enabled.');
     console.log('[FRIEND ACTIVITY] Postgres LISTEN enabled.');
+    console.log('[NOTIFICATIONS] Postgres LISTEN enabled.');
   } catch (err) {
     if (profileSyncNotifyClient === client) profileSyncNotifyClient = null;
     console.error('[PROFILE LISTEN INIT ERROR]:', err && err.message ? err.message : err);
@@ -4470,6 +4508,282 @@ async function getFriendActivityHistoryForUser(userName, limit = FRIEND_ACTIVITY
   );
   const lastReadId = await getFriendActivityReadId(userName);
   return { friendNames, items: result.rows.map(serializeFriendActivityRow).filter(Boolean), lastReadId, delta: safeAfterId > 0 };
+}
+
+const USER_NOTIFICATION_TYPES = new Set(['mention', 'reply', 'trophy']);
+const USER_NOTIFICATION_LIMIT = 60;
+
+function normalizeUserNotificationName(value) {
+  return normalizeText(value, '').slice(0, 80);
+}
+
+function normalizeUserNotificationData(type, rawData = {}) {
+  const source = rawData && typeof rawData === 'object' && !Array.isArray(rawData) ? rawData : {};
+  if (type === 'mention' || type === 'reply') {
+    return {
+      actor: normalizeUserNotificationName(source.actor),
+      messageId: normalizeText(source.messageId, '').slice(0, 100),
+      text: normalizeText(source.text, '').slice(0, 280)
+    };
+  }
+  if (type === 'trophy') {
+    const trophyType = normalizeText(source.trophyType, '').toLowerCase();
+    return {
+      trophyId: normalizeText(source.trophyId, '').slice(0, 80),
+      title: normalizeText(source.title, 'Trophy').slice(0, 140),
+      trophyType: ['bronze', 'silver', 'gold', 'platinum'].includes(trophyType) ? trophyType : 'bronze'
+    };
+  }
+  return {};
+}
+
+function serializeUserNotificationRow(row = {}) {
+  const type = normalizeText(row.event_type || row.type, '').toLowerCase();
+  if (!USER_NOTIFICATION_TYPES.has(type)) return null;
+  const user = normalizeUserNotificationName(row.user_name || row.user);
+  if (!user) return null;
+  const createdAtRaw = row.created_at instanceof Date ? row.created_at.getTime() : Number(row.created_at || row.createdAt || Date.now());
+  return {
+    id: String(row.id || ''),
+    user,
+    type,
+    data: normalizeUserNotificationData(type, row.data),
+    createdAt: Number.isFinite(createdAtRaw) && createdAtRaw > 0 ? createdAtRaw : Date.now()
+  };
+}
+
+function emitUserNotificationToLocalUser(event) {
+  const safeEvent = serializeUserNotificationRow(event);
+  if (!safeEvent) return;
+  getSocketsByUserName(safeEvent.user).forEach(client => {
+    if (client && client.connected) client.emit('user_notification_event', safeEvent);
+  });
+}
+
+function emitUserNotificationReadStateToLocalUser(userName, lastReadId, unreadCount = 0) {
+  const name = normalizeUserNotificationName(userName);
+  if (!name) return;
+  const payload = {
+    lastReadId: Math.max(0, Math.floor(Number(lastReadId) || 0)),
+    unreadCount: Math.max(0, Math.floor(Number(unreadCount) || 0))
+  };
+  getSocketsByUserName(name).forEach(client => {
+    if (client && client.connected) client.emit('user_notification_read_state', payload);
+  });
+}
+
+async function notifyUserNotificationAcrossInstances(event) {
+  const safeEvent = serializeUserNotificationRow(event);
+  if (!safeEvent) return;
+  try {
+    await pool.query('SELECT pg_notify($1, $2)', ['user_notification_sync', JSON.stringify({ event: safeEvent, instanceId: INSTANCE_ID })]);
+  } catch (err) {
+    console.error('[NOTIFICATION SYNC ERROR]:', err);
+  }
+}
+
+async function notifyUserNotificationReadStateAcrossInstances(userName, lastReadId, unreadCount = 0) {
+  const name = normalizeUserNotificationName(userName);
+  if (!name) return;
+  try {
+    await pool.query('SELECT pg_notify($1, $2)', ['user_notification_sync', JSON.stringify({
+      readState: { userName: name, lastReadId: Math.max(0, Number(lastReadId) || 0), unreadCount: Math.max(0, Number(unreadCount) || 0) },
+      instanceId: INSTANCE_ID
+    })]);
+  } catch (err) {
+    console.error('[NOTIFICATION READ SYNC ERROR]:', err);
+  }
+}
+
+async function recordUserNotification(userName, type, rawData = {}, options = {}) {
+  const user = normalizeUserNotificationName(userName);
+  const eventType = normalizeText(type, '').toLowerCase();
+  if (!user || !USER_NOTIFICATION_TYPES.has(eventType)) return null;
+  const data = normalizeUserNotificationData(eventType, rawData);
+  const at = normalizeTimestampValue(options.at) || Date.now();
+  const fallbackDetail = eventType === 'trophy'
+    ? `${data.trophyId || data.title}`
+    : `${data.messageId || data.actor || at}`;
+  const dedupeKey = normalizeText(options.dedupeKey, '') || `${user.toLowerCase()}:${eventType}:${String(fallbackDetail || '').toLowerCase()}`;
+
+  try {
+    const result = await queryDbWithRetry(
+      `INSERT INTO user_notifications (user_name, event_type, data, dedupe_key, created_at)
+       VALUES ($1, $2, $3::jsonb, $4, to_timestamp($5::double precision / 1000.0))
+       ON CONFLICT (dedupe_key) DO NOTHING
+       RETURNING id, user_name, event_type, data, created_at`,
+      [user, eventType, JSON.stringify(data), dedupeKey, at],
+      { attempts: 2, label: 'USER NOTIFICATION INSERT' }
+    );
+    if (!result.rows[0]) return null;
+    const event = serializeUserNotificationRow(result.rows[0]);
+    if (!event) return null;
+    deferServerTask('USER NOTIFICATION RETENTION', async () => {
+      await queryDbWithRetry(
+        `DELETE FROM user_notifications
+         WHERE user_name = $1
+           AND id < COALESCE((
+             SELECT id
+             FROM user_notifications
+             WHERE user_name = $1
+             ORDER BY id DESC
+             OFFSET $2
+             LIMIT 1
+           ), 0)`,
+        [user, USER_NOTIFICATION_MAX_PER_USER - 1],
+        { attempts: 2, label: 'USER NOTIFICATION RETENTION' }
+      );
+    }, 0);
+    emitUserNotificationToLocalUser(event);
+    deferServerTask('USER NOTIFICATION SYNC', () => notifyUserNotificationAcrossInstances(event), 0);
+    return event;
+  } catch (err) {
+    console.error('[USER NOTIFICATION INSERT ERROR]:', err && err.message ? err.message : err);
+    return null;
+  }
+}
+
+async function getUserNotificationReadId(userName) {
+  const name = normalizeUserNotificationName(userName);
+  if (!name) return 0;
+  const result = await queryDbWithRetry(
+    'SELECT last_read_id FROM user_notification_read_state WHERE user_name = $1 LIMIT 1',
+    [name],
+    { attempts: 2, label: 'USER NOTIFICATION READ STATE' }
+  );
+  return Math.max(0, Number(result.rows[0] && result.rows[0].last_read_id) || 0);
+}
+
+async function setUserNotificationReadId(userName, lastReadId) {
+  const name = normalizeUserNotificationName(userName);
+  const safeId = Math.max(0, Math.floor(Number(lastReadId) || 0));
+  if (!name || !safeId) return 0;
+  const result = await queryDbWithRetry(
+    `INSERT INTO user_notification_read_state (user_name, last_read_id, updated_at)
+     VALUES ($1, $2, NOW())
+     ON CONFLICT (user_name)
+     DO UPDATE SET last_read_id = GREATEST(user_notification_read_state.last_read_id, EXCLUDED.last_read_id), updated_at = NOW()
+     RETURNING last_read_id`,
+    [name, safeId],
+    { attempts: 2, label: 'USER NOTIFICATION MARK READ' }
+  );
+  return Math.max(0, Number(result.rows[0] && result.rows[0].last_read_id) || safeId);
+}
+
+async function getUserNotificationUnreadCount(userName, lastReadId = null) {
+  const name = normalizeUserNotificationName(userName);
+  if (!name) return 0;
+  const readId = lastReadId === null ? await getUserNotificationReadId(name) : Math.max(0, Number(lastReadId) || 0);
+  const result = await queryDbWithRetry(
+    'SELECT COUNT(*)::int AS count FROM user_notifications WHERE user_name = $1 AND id > $2',
+    [name, readId],
+    { attempts: 2, label: 'USER NOTIFICATION UNREAD COUNT' }
+  );
+  return Math.max(0, Number(result.rows[0] && result.rows[0].count) || 0);
+}
+
+async function getUserNotificationHistory(userName, limit = USER_NOTIFICATION_LIMIT, afterId = 0) {
+  const name = normalizeUserNotificationName(userName);
+  const safeLimit = Math.max(1, Math.min(USER_NOTIFICATION_LIMIT, Number(limit) || USER_NOTIFICATION_LIMIT));
+  const safeAfterId = Math.max(0, Math.floor(Number(afterId) || 0));
+  if (!name) return { items: [], lastReadId: 0, unreadCount: 0, delta: safeAfterId > 0 };
+  const result = await queryDbWithRetry(
+    safeAfterId > 0
+      ? `SELECT id, user_name, event_type, data, created_at
+         FROM user_notifications
+         WHERE user_name = $1 AND id > $2
+         ORDER BY id DESC
+         LIMIT $3`
+      : `SELECT id, user_name, event_type, data, created_at
+         FROM user_notifications
+         WHERE user_name = $1
+         ORDER BY id DESC
+         LIMIT $2`,
+    safeAfterId > 0 ? [name, safeAfterId, safeLimit] : [name, safeLimit],
+    { attempts: 2, label: safeAfterId > 0 ? 'USER NOTIFICATION DELTA' : 'USER NOTIFICATION READ' }
+  );
+  const lastReadId = await getUserNotificationReadId(name);
+  const unreadCount = await getUserNotificationUnreadCount(name, lastReadId);
+  return {
+    items: result.rows.map(serializeUserNotificationRow).filter(Boolean),
+    lastReadId,
+    unreadCount,
+    delta: safeAfterId > 0
+  };
+}
+
+function resolveKnownNotificationUserName(value) {
+  const requested = normalizeUserNotificationName(value);
+  if (!requested) return '';
+  if (userDatabase[requested]) return requested;
+  const lower = requested.toLowerCase();
+  return Object.keys(userDatabase).find(name => name.toLowerCase() === lower) || '';
+}
+
+function getChatNotificationPreview(text) {
+  return normalizeText(String(text || '')
+    .replace(/<br\s*\/?\s*>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/\s+/g, ' '), '').slice(0, 240);
+}
+
+function extractChatMentionTargets(text, senderName) {
+  const source = String(text || '');
+  if (!source.includes('@')) return [];
+  const lowerSource = source.toLowerCase();
+  const senderLower = String(senderName || '').toLowerCase();
+  const occupied = [];
+  const found = [];
+  const names = Object.keys(userDatabase)
+    .filter(name => name && name.toLowerCase() !== senderLower)
+    .sort((a, b) => b.length - a.length);
+  const isBoundary = ch => !ch || /[\s.,!?;:()\[\]{}<>"'`]/.test(ch);
+
+  names.forEach(name => {
+    const needle = `@${name.toLowerCase()}`;
+    let from = 0;
+    while (from < lowerSource.length) {
+      const index = lowerSource.indexOf(needle, from);
+      if (index < 0) break;
+      const end = index + needle.length;
+      from = index + 1;
+      if (!isBoundary(index > 0 ? lowerSource[index - 1] : '') || !isBoundary(lowerSource[end] || '')) continue;
+      if (occupied.some(range => index < range[1] && end > range[0])) continue;
+      occupied.push([index, end]);
+      found.push(name);
+      break;
+    }
+  });
+
+  return found;
+}
+
+async function recordChatUserNotifications(message = {}) {
+  const sender = normalizeUserNotificationName(message.user);
+  if (!sender) return;
+  const preview = getChatNotificationPreview(message.text || '');
+  const messageAt = new Date(message.time).getTime();
+  const messageId = String((Number.isFinite(messageAt) && messageAt > 0 ? messageAt : 0) || message.time || '');
+  if (!messageId) return;
+
+  const targets = new Map();
+  const replyTarget = resolveKnownNotificationUserName(message.replyTo && message.replyTo.user);
+  if (replyTarget && replyTarget.toLowerCase() !== sender.toLowerCase()) targets.set(replyTarget.toLowerCase(), { name: replyTarget, type: 'reply' });
+  extractChatMentionTargets(message.text || '', sender).forEach(name => {
+    const key = name.toLowerCase();
+    if (!targets.has(key)) targets.set(key, { name, type: 'mention' });
+  });
+
+  if (!targets.size) return;
+  await Promise.all(Array.from(targets.values()).map(target => recordUserNotification(target.name, target.type, {
+    actor: sender,
+    messageId,
+    text: preview
+  }, {
+    dedupeKey: `chat:${messageId}:${target.name.toLowerCase()}`,
+    at: Number.isFinite(messageAt) && messageAt > 0 ? messageAt : Date.now()
+  })));
 }
 
 function getPs3FriendActivityTransition(previousStatus, currentStatus) {
@@ -4847,6 +5161,8 @@ async function deleteUserAccount(targetName, reason, adminName) {
   await pool.query('DELETE FROM users WHERE name = $1', [targetName]);
   await pool.query('DELETE FROM friend_activity_read_state WHERE user_name = $1', [targetName]);
   await pool.query('DELETE FROM friend_activity WHERE actor_name = $1', [targetName]);
+  await pool.query('DELETE FROM user_notification_read_state WHERE user_name = $1', [targetName]);
+  await pool.query('DELETE FROM user_notifications WHERE user_name = $1', [targetName]);
   await notifyProfileSyncAcrossInstances(targetName, null, Date.now());
 
   delete userDatabase[targetName];
@@ -5551,6 +5867,41 @@ io.on('connection', (socket) => {
     }
   });
 
+  socket.on('request_user_notifications', async (data = {}, ack) => {
+    const respond = payload => { if (typeof ack === 'function' && socket.connected) { try { ack(payload); } catch (err) {} } };
+    const name = socket.userName;
+    if (!name || !userDatabase[name]) { respond({ ok: false, items: [], unreadCount: 0, error: 'Profile is not available.' }); return; }
+    try {
+      const result = await getUserNotificationHistory(name, data && data.limit, data && data.afterId);
+      respond({
+        ok: true,
+        items: result.items,
+        lastReadId: result.lastReadId || 0,
+        unreadCount: result.unreadCount || 0,
+        delta: result.delta === true
+      });
+    } catch (err) {
+      console.error('[USER NOTIFICATION READ ERROR]:', err && err.message ? err.message : err);
+      respond({ ok: false, items: [], unreadCount: 0, error: 'Notifications are temporarily unavailable.' });
+    }
+  });
+
+  socket.on('user_notifications_mark_read', async (data = {}, ack) => {
+    const respond = payload => { if (typeof ack === 'function' && socket.connected) { try { ack(payload); } catch (err) {} } };
+    const name = socket.userName;
+    if (!name || !userDatabase[name]) { respond({ ok: false, lastReadId: 0, unreadCount: 0 }); return; }
+    try {
+      const lastReadId = await setUserNotificationReadId(name, data && data.lastReadId);
+      const unreadCount = await getUserNotificationUnreadCount(name, lastReadId);
+      emitUserNotificationReadStateToLocalUser(name, lastReadId, unreadCount);
+      deferServerTask('USER NOTIFICATION READ SYNC', () => notifyUserNotificationReadStateAcrossInstances(name, lastReadId, unreadCount), 0);
+      respond({ ok: true, lastReadId, unreadCount });
+    } catch (err) {
+      console.error('[USER NOTIFICATION MARK READ ERROR]:', err && err.message ? err.message : err);
+      respond({ ok: false, lastReadId: 0, unreadCount: 0 });
+    }
+  });
+
   socket.on('request_friend_activity', async (data = {}, ack) => {
     const respond = payload => { if (typeof ack === 'function' && socket.connected) { try { ack(payload); } catch (err) {} } };
     const name = socket.userName;
@@ -5600,11 +5951,12 @@ io.on('connection', (socket) => {
     const title = normalizeText(data.title, 'Trophy').slice(0, 140);
     const trophyType = normalizeText(data.trophyType, '').toLowerCase();
     if (!trophyId || !['bronze', 'silver', 'gold', 'platinum'].includes(trophyType)) return;
-    deferServerTask('FRIEND ACTIVITY TROPHY', () => recordFriendActivity(name, 'trophy', {
-      trophyId,
-      title,
-      trophyType
-    }, { dedupeKey: `${name.toLowerCase()}:trophy:${trophyId.toLowerCase()}` }), 0);
+    deferServerTask('TROPHY ACTIVITY AND NOTIFICATION', async () => {
+      await Promise.all([
+        recordFriendActivity(name, 'trophy', { trophyId, title, trophyType }, { dedupeKey: `${name.toLowerCase()}:trophy:${trophyId.toLowerCase()}` }),
+        recordUserNotification(name, 'trophy', { trophyId, title, trophyType }, { dedupeKey: `${name.toLowerCase()}:notification:trophy:${trophyId.toLowerCase()}` })
+      ]);
+    }, 0);
   });
 
   socket.on('ps3_playtime_update', (data = {}) => {
@@ -6249,6 +6601,7 @@ io.on('connection', (socket) => {
       if (messageHistory.length > MAX_CHAT_HISTORY) messageHistory.shift();
 
       const publicMessage = cleanChatMessage(messageData);
+      deferServerTask('CHAT USER NOTIFICATIONS', () => recordChatUserNotifications(publicMessage), 0);
       const syncChange = await recordChatSyncChangeSafe('upsert', String(new Date(messageData.time).getTime()), publicMessage);
       io.sockets.sockets.forEach(client => {
         if (!client || !client.connected) return;
