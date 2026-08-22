@@ -1566,6 +1566,117 @@ function normalizeUserRecord(name, userData = {}) {
 
 
 
+const PROFILE_NOTIFICATION_STATE_VERSION = 1;
+const PROFILE_NOTIFICATION_CATEGORIES = new Set(['downloads', 'wishlist', 'favorites', 'trophies']);
+
+function normalizeProfileNotificationPendingItemsServer(value) {
+  const source = Array.isArray(value) ? value : [];
+  return [...new Set(source.map(item => normalizeText(item, '')).filter(Boolean))].slice(0, 500);
+}
+
+function normalizeProfileNotificationCategoryServer(category, value = {}) {
+  const source = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+  const normalized = {
+    pendingItems: normalizeProfileNotificationPendingItemsServer(source.pendingItems),
+    dot: source.dot === true || String(source.dot) === '1' || String(source.dot).toLowerCase() === 'true',
+    updatedAt: normalizeTimestampValue(source.updatedAt),
+    mutationIds: [...new Set((Array.isArray(source.mutationIds) ? source.mutationIds : []).map(value => normalizeText(value, '').slice(0, 96)).filter(Boolean))].slice(-32)
+  };
+  if (category === 'trophies') normalized.color = normalizeText(source.color, '').slice(0, 64);
+  return normalized;
+}
+
+function normalizeProfileNotificationStateServer(value = {}) {
+  const source = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+  const state = { version: PROFILE_NOTIFICATION_STATE_VERSION };
+  PROFILE_NOTIFICATION_CATEGORIES.forEach(category => {
+    state[category] = normalizeProfileNotificationCategoryServer(category, source[category]);
+  });
+  return state;
+}
+
+function createEmptyProfileNotificationStateServer() {
+  return normalizeProfileNotificationStateServer({});
+}
+
+function updateProfileNotificationCategoryServer(currentState, category, patch = {}) {
+  const state = normalizeProfileNotificationStateServer(currentState);
+  if (!PROFILE_NOTIFICATION_CATEGORIES.has(category)) return state;
+  const previous = state[category] || normalizeProfileNotificationCategoryServer(category, {});
+  const next = { ...previous };
+
+  let pending = new Set(normalizeProfileNotificationPendingItemsServer(previous.pendingItems));
+  if (patch.replacePending === true) pending = new Set(normalizeProfileNotificationPendingItemsServer(patch.pendingItems));
+  else {
+    if (patch.clearPending === true) pending.clear();
+    normalizeProfileNotificationPendingItemsServer(patch.removeItems).forEach(item => pending.delete(item));
+    normalizeProfileNotificationPendingItemsServer(patch.addItems).forEach(item => pending.add(item));
+  }
+  next.pendingItems = [...pending].slice(0, 500);
+
+  if (Object.prototype.hasOwnProperty.call(patch, 'dot')) {
+    next.dot = patch.dot === true || String(patch.dot) === '1' || String(patch.dot).toLowerCase() === 'true';
+  }
+  if (category === 'trophies' && Object.prototype.hasOwnProperty.call(patch, 'color')) {
+    next.color = normalizeText(patch.color, '').slice(0, 64);
+  }
+
+  const mutationId = normalizeText(patch.mutationId, '').slice(0, 96);
+  if (mutationId) next.mutationIds = [...previous.mutationIds.filter(value => value !== mutationId), mutationId].slice(-32);
+  next.updatedAt = Math.max(Date.now(), normalizeTimestampValue(previous.updatedAt) + 1);
+  state[category] = next;
+  state.version = PROFILE_NOTIFICATION_STATE_VERSION;
+  return state;
+}
+
+function getProfileNotificationStatePayloadServer(user = {}) {
+  if (!user || typeof user !== 'object' || !Object.prototype.hasOwnProperty.call(user, 'notificationState')) return null;
+  return normalizeProfileNotificationStateServer(user.notificationState);
+}
+
+async function updateProfileNotificationCategoryInDb(name, category, patch = {}) {
+  if (!name || !PROFILE_NOTIFICATION_CATEGORIES.has(category)) return null;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const currentResult = await client.query(
+      `SELECT data->'notificationState' AS notification_state, data->>'profileUpdatedAt' AS profile_updated_at FROM users WHERE name = $1 FOR UPDATE`,
+      [name]
+    );
+    if (!currentResult.rows.length) {
+      await client.query('ROLLBACK');
+      return null;
+    }
+
+    const currentState = normalizeProfileNotificationStateServer(currentResult.rows[0].notification_state || {});
+    const mutationId = normalizeText(patch.mutationId, '').slice(0, 96);
+    const currentCategory = currentState[category] || normalizeProfileNotificationCategoryServer(category, {});
+    if (mutationId && currentCategory.mutationIds.includes(mutationId)) {
+      await client.query('COMMIT');
+      return {
+        notificationState: currentState,
+        profileUpdatedAt: normalizeTimestampValue(currentResult.rows[0].profile_updated_at) || Date.now(),
+        duplicate: true
+      };
+    }
+
+    const nextState = updateProfileNotificationCategoryServer(currentState, category, { ...patch, mutationId });
+    const now = Date.now();
+    const dbPatch = { notificationState: nextState, lastSeen: now, profileUpdatedAt: now };
+    await client.query(
+      `UPDATE users SET data = COALESCE(data, '{}'::jsonb) || $1::jsonb WHERE name = $2`,
+      [dbPatch, name]
+    );
+    await client.query('COMMIT');
+    return { notificationState: nextState, profileUpdatedAt: now, duplicate: false };
+  } catch (err) {
+    try { await client.query('ROLLBACK'); } catch (rollbackErr) {}
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
 function hasObjectPayload(value) {
   return !!(value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).length > 0);
 }
@@ -2960,6 +3071,7 @@ function buildLightProfileUserData(name, user = {}) {
     recentlyVisited: Array.isArray(user.recentlyVisitedData) ? user.recentlyVisitedData.length : Number(user.recentlyVisited || 0),
     recentlyVisitedData: normalizeRecentlyVisitedRecordsServer(user.recentlyVisitedData),
     recentlyVisitedUpdatedAt: normalizeTimestampValue(user.recentlyVisitedUpdatedAt),
+    ...(getProfileNotificationStatePayloadServer(user) ? { notificationState: getProfileNotificationStatePayloadServer(user) } : {}),
     countersData: buildCompactCountersData(user.countersData),
     themeColor: normalizeThemeColorServer(user.themeColor || (user.settingsData && user.settingsData.themeColor) || '#0070cc'),
     themeColorUpdatedAt: getUserThemeColorUpdatedAt(user),
@@ -3877,6 +3989,7 @@ function buildFullProfileSyncPayload(name, user = {}, sourceSocketId = null, opt
       recentlyVisited: Array.isArray(safe.recentlyVisitedData) ? safe.recentlyVisitedData.length : Number(safe.recentlyVisited || 0),
       recentlyVisitedData: normalizeRecentlyVisitedRecordsServer(safe.recentlyVisitedData),
       recentlyVisitedUpdatedAt: normalizeTimestampValue(safe.recentlyVisitedUpdatedAt),
+      ...(getProfileNotificationStatePayloadServer(safe) ? { notificationState: getProfileNotificationStatePayloadServer(safe) } : {}),
       countersData: safe.countersData || {},
       themeColor: normalizeThemeColorServer(safe.themeColor || (safe.settingsData && safe.settingsData.themeColor) || '#0070cc'),
       themeColorUpdatedAt: getUserThemeColorUpdatedAt(safe),
@@ -3892,7 +4005,7 @@ const PROFILE_SYNC_PATCH_KEYS = new Set([
   'trophiesData', 'downloadsData', 'downloadsClearedAt', 'downloadsUpdatedAt',
   'wishlistData', 'wishlistUpdatedAt', 'favoritesData', 'favoritesUpdatedAt',
   'libraryData', 'libraryUpdatedAt', 'friendsData', 'friendsUpdatedAt',
-  'recentlyVisited', 'recentlyVisitedData', 'recentlyVisitedUpdatedAt',
+  'recentlyVisited', 'recentlyVisitedData', 'recentlyVisitedUpdatedAt', 'notificationState',
   'countersData', 'themeColor', 'themeColorUpdatedAt', 'settingsData'
 ]);
 
@@ -3936,6 +4049,7 @@ function buildProfileSyncPatchPayload(name, user = {}, changedKeys = [], sourceS
   if (include('recentlyVisited')) target.recentlyVisited = Array.isArray(user.recentlyVisitedData) ? user.recentlyVisitedData.length : Number(user.recentlyVisited || 0);
   if (include('recentlyVisitedData')) target.recentlyVisitedData = normalizeRecentlyVisitedRecordsServer(user.recentlyVisitedData);
   if (include('recentlyVisitedUpdatedAt')) target.recentlyVisitedUpdatedAt = normalizeTimestampValue(user.recentlyVisitedUpdatedAt);
+  if (include('notificationState') && getProfileNotificationStatePayloadServer(user)) target.notificationState = getProfileNotificationStatePayloadServer(user);
   if (include('countersData')) target.countersData = user.countersData || {};
   if (include('themeColor')) target.themeColor = normalizeThemeColorServer(user.themeColor || (user.settingsData && user.settingsData.themeColor) || '#0070cc');
   if (include('themeColorUpdatedAt')) target.themeColorUpdatedAt = getUserThemeColorUpdatedAt(user);
@@ -4260,8 +4374,10 @@ async function initProfileSyncNotifications() {
         scheduleTrophyStatsRefreshBroadcast(1200);
       }
       if (data.changes && data.changes.counts === true) emitProfileCountsUpdate(name, refreshedUser);
+      const changedKeys = data.changes && Array.isArray(data.changes.keys) ? data.changes.keys : [];
+      const notificationStateOnly = changedKeys.length === 1 && changedKeys[0] === 'notificationState'
+        && !(data.changes && (data.changes.trending === true || data.changes.trophies === true || data.changes.counts === true));
       if (hasLocalSession) {
-        const changedKeys = data.changes && Array.isArray(data.changes.keys) ? data.changes.keys : [];
         const localSockets = getSocketsByUserName(name).filter(client => !(data.sourceSocketId && client.id === data.sourceSocketId));
         for (const client of localSockets) {
           if (client.profileSyncV2 === true) {
@@ -4272,6 +4388,7 @@ async function initProfileSyncNotifications() {
           }
         }
       }
+      if (notificationStateOnly) return;
       emitPublicProfileBannerUpdate(name, refreshedUser);
       invalidateOnlineListCache("profile-sync-listen");
       deferServerTask('PROFILE LISTEN ONLINE LIST', () => emitOnlineList(), 1000);
@@ -5824,6 +5941,7 @@ io.on('connection', (socket) => {
           downloadsUpdatedAt: normalizeTimestampValue(safeUserData.downloadsUpdatedAt),
           libraryData: safeUserData.libraryData || [],
           friendsData: safeUserData.friendsData || [],
+          notificationState: createEmptyProfileNotificationStateServer(),
           countersData: safeUserData.countersData || {},
           themeColor: safeUserData.themeColor || '#0070cc',
           role: isAdmin ? "admin" : "user",
@@ -5881,6 +5999,65 @@ io.on('connection', (socket) => {
     }
   });
 
+
+  socket.on('profile_notification_state_update', async (payload = {}, ack) => {
+    const respond = response => {
+      if (typeof ack !== 'function' || !socket.connected) return;
+      try { ack(response); } catch (err) {}
+    };
+    const name = socket.userName;
+    if (!name || !userDatabase[name]) { respond({ ok: false, error: 'Profile is not available.' }); return; }
+
+    const category = normalizeText(payload.category, '').toLowerCase();
+    if (!PROFILE_NOTIFICATION_CATEGORIES.has(category)) { respond({ ok: false, error: 'Invalid notification category.' }); return; }
+
+    const categoryPatch = {
+      mutationId: normalizeText(payload.mutationId, '').slice(0, 96),
+      replacePending: payload.replacePending === true,
+      pendingItems: payload.pendingItems,
+      clearPending: payload.clearPending === true,
+      addItems: payload.addItems,
+      removeItems: payload.removeItems,
+      ...(Object.prototype.hasOwnProperty.call(payload, 'dot') ? { dot: payload.dot } : {}),
+      ...(Object.prototype.hasOwnProperty.call(payload, 'color') ? { color: payload.color } : {})
+    };
+
+    let savedState;
+    try {
+      savedState = await updateProfileNotificationCategoryInDb(name, category, categoryPatch);
+      if (!savedState) { respond({ ok: false, error: 'Notification state could not be saved.' }); return; }
+    } catch (err) {
+      console.error(`[PROFILE NOTIFICATION STATE ERROR] ${name}:`, err);
+      respond({ ok: false, error: 'Notification state could not be saved.' });
+      return;
+    }
+
+    const nextState = savedState.notificationState;
+    const now = savedState.profileUpdatedAt;
+    userDatabase[name].notificationState = nextState;
+    userDatabase[name].lastSeen = now;
+    userDatabase[name].profileUpdatedAt = now;
+    userCacheMeta[name] = Date.now();
+    fullUserCacheNames.delete(name);
+
+    if (savedState.duplicate !== true) {
+      emitProfileSyncPatchFromUser(name, userDatabase[name], ['notificationState'], socket.id);
+      deferServerTask('PROFILE NOTIFICATION STATE NOTIFY', () => notifyProfileSyncAcrossInstances(
+        name,
+        socket.id,
+        now,
+        { keys: ['notificationState'] }
+      ), 0);
+    }
+
+    respond({
+      ok: true,
+      category,
+      categoryState: nextState[category],
+      notificationState: nextState,
+      profileUpdatedAt: now
+    });
+  });
 
   socket.on('settings_realtime_update', async (payload = {}) => {
     const name = socket.userName;
@@ -5964,6 +6141,7 @@ io.on('connection', (socket) => {
     const name = socket.userName;
     if (!name || !userDatabase[name]) { respond({ ok: false, error: 'Profile is not available.' }); return; }
     userData = (userData && typeof userData === "object") ? { ...userData } : {};
+    delete userData.notificationState;
     const syncRequestId = normalizeText(userData._syncRequestId, '');
     const syncReason = normalizeText(userData._syncReason, '');
     const requestedSyncSections = Array.isArray(userData._syncSections)
