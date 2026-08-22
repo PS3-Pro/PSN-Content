@@ -4520,7 +4520,7 @@ async function getFriendActivityHistoryForUser(userName, limit = FRIEND_ACTIVITY
   return { friendNames, items: result.rows.map(serializeFriendActivityRow).filter(Boolean), lastReadId, delta: safeAfterId > 0 };
 }
 
-const USER_NOTIFICATION_TYPES = new Set(['mention', 'reply', 'trophy']);
+const USER_NOTIFICATION_TYPES = new Set(['mention', 'reply', 'reaction', 'trophy']);
 const USER_NOTIFICATION_LIMIT = 60;
 
 function normalizeUserNotificationName(value) {
@@ -4533,6 +4533,15 @@ function normalizeUserNotificationData(type, rawData = {}) {
     return {
       actor: normalizeUserNotificationName(source.actor),
       messageId: normalizeText(source.messageId, '').slice(0, 100),
+      text: normalizeText(source.text, '').slice(0, 280)
+    };
+  }
+  if (type === 'reaction') {
+    return {
+      actor: normalizeUserNotificationName(source.actor),
+      messageUser: normalizeUserNotificationName(source.messageUser),
+      messageId: normalizeText(source.messageId, '').slice(0, 100),
+      emoji: normalizeText(source.emoji, '').slice(0, 24),
       text: normalizeText(source.text, '').slice(0, 280)
     };
   }
@@ -7097,26 +7106,55 @@ io.on('connection', (socket) => {
   });
 
 
-  socket.on('message_reaction', async (data) => {
-    const msg = messageHistory.find(m => String(new Date(m.time).getTime()) === String(data.msgId));
+  socket.on('message_reaction', async (data = {}) => {
+    const messageId = String(data.msgId || '');
+    const emoji = normalizeText(data.emoji, '').slice(0, 24);
+    const actor = normalizeUserNotificationName(socket.userName || data.user);
+    if (!messageId || !emoji || !actor) return;
+
+    const msg = messageHistory.find(m => String(new Date(m.time).getTime()) === messageId);
     if (msg) {
         if (!msg.reactions) msg.reactions = [];
-        let react = msg.reactions.find(r => r.emoji === data.emoji);
-        
+        let react = msg.reactions.find(r => r.emoji === emoji);
+        let reactionAdded = false;
+
         if (react) {
-            const idx = react.users.indexOf(data.user);
-            if (idx > -1) { react.users.splice(idx, 1); react.count--; }
-            else { react.users.push(data.user); react.count++; }
-            if (react.count <= 0) msg.reactions = msg.reactions.filter(r => r.emoji !== data.emoji);
+            if (!Array.isArray(react.users)) react.users = [];
+            const idx = react.users.indexOf(actor);
+            if (idx > -1) {
+                react.users.splice(idx, 1);
+                react.count = Math.max(0, (Number(react.count) || 0) - 1);
+            } else {
+                react.users.push(actor);
+                react.count = Math.max(0, Number(react.count) || 0) + 1;
+                reactionAdded = true;
+            }
+            if (react.count <= 0) msg.reactions = msg.reactions.filter(r => r.emoji !== emoji);
         } else {
-            msg.reactions.push({ emoji: data.emoji, count: 1, users: [data.user] });
+            msg.reactions.push({ emoji, count: 1, users: [actor] });
+            reactionAdded = true;
         }
 
         try {
             await pool.query("UPDATE chat SET message = $1 WHERE message->>'time' = $2", [cleanChatMessage(msg), msg.time]);
-            const syncChange = await recordChatSyncChangeSafe('upsert', String(data.msgId || new Date(msg.time).getTime()), msg);
-            io.emit('message_reaction', data);
+            const syncChange = await recordChatSyncChangeSafe('upsert', messageId || String(new Date(msg.time).getTime()), msg);
+            const reactionPayload = { msgId: messageId, emoji, user: actor };
+            io.emit('message_reaction', reactionPayload);
             if (syncChange) emitChatSyncChange(syncChange);
+
+            const messageOwner = resolveKnownNotificationUserName(msg.user);
+            if (reactionAdded && messageOwner && messageOwner.toLowerCase() !== actor.toLowerCase()) {
+                deferServerTask('REACTION NOTIFICATION', () => recordUserNotification(messageOwner, 'reaction', {
+                    actor,
+                    messageUser: messageOwner,
+                    messageId,
+                    emoji,
+                    text: getChatNotificationPreview(msg.text || '')
+                }, {
+                    dedupeKey: `chat-reaction:${messageId}:${messageOwner.toLowerCase()}:${actor.toLowerCase()}:${emoji}`,
+                    at: Date.now()
+                }), 0);
+            }
         } catch (err) { console.error("Reaction Sync Error:", err); }
     }
   });
