@@ -16956,6 +16956,18 @@ P
 	const licenseRepoRapPending = new Set();
 	const licenseRepoRapQueue = [];
 	let licenseRepoRapActiveChecks = 0;
+	let licenseRepoRapBrowseRefreshTimer = 0;
+
+	function scheduleBrowseRefreshForRepoRap() {
+		clearTimeout(licenseRepoRapBrowseRefreshTimer);
+		licenseRepoRapBrowseRefreshTimer = setTimeout(() => {
+			licenseRepoRapBrowseRefreshTimer = 0;
+			const browseView = document.getElementById('view-browse');
+			const catSelect = document.getElementById('cat-select');
+			if (!browseView || browseView.style.display === 'none' || !catSelect || catSelect.value !== 'games') return;
+			if (typeof applyFilters === 'function') applyFilters();
+		}, 120);
+	}
 
 	function getLicenseRepoRapContentId(game) {
 		const contentId = String(game && game.contentId || '').trim();
@@ -17074,7 +17086,10 @@ P
 			licenseRepoRapActiveChecks++;
 			checkLicenseRepoRap(contentId).then(exists => {
 				licenseRepoRapAvailability[contentId] = exists;
-				if (exists) refreshVisibleRepoRapButtons(contentId);
+				if (exists) {
+					refreshVisibleRepoRapButtons(contentId);
+					scheduleBrowseRefreshForRepoRap();
+				}
 			}).finally(() => {
 				licenseRepoRapPending.delete(contentId);
 				licenseRepoRapActiveChecks--;
@@ -17220,12 +17235,31 @@ P
 		return score;
 	}
 
+	const licenseDlcTitleIndexes = new WeakMap();
+
+	function getLicenseDlcItemsByTitleId(dlcItems, titleId) {
+		if (!Array.isArray(dlcItems) || !titleId) return [];
+
+		let index = licenseDlcTitleIndexes.get(dlcItems);
+		if (!index) {
+			index = new Map();
+			dlcItems.forEach(item => {
+				const itemTitleId = String(item && (item.id || item.titleId) || '').trim().toUpperCase();
+				if (!itemTitleId) return;
+				if (!index.has(itemTitleId)) index.set(itemTitleId, []);
+				index.get(itemTitleId).push(item);
+			});
+			licenseDlcTitleIndexes.set(dlcItems, index);
+		}
+
+		return index.get(titleId) || [];
+	}
+
 	function pickLicenseDlcCandidate(baseGame, dlcItems) {
 		const titleId = String(baseGame && (baseGame.id || baseGame.titleId) || '').trim().toUpperCase();
 		if (!titleId) return null;
 
-		const sameTitleDlcs = (Array.isArray(dlcItems) ? dlcItems : [])
-			.filter(item => String(item && (item.id || item.titleId) || '').trim().toUpperCase() === titleId);
+		const sameTitleDlcs = getLicenseDlcItemsByTitleId(dlcItems, titleId);
 
 		// Strongest case: databases sometimes name the unlock DLC exactly
 		// "TITLEID - Unlock Key" (for example NPUB30058 - Unlock Key).
@@ -20064,8 +20098,21 @@ P
 	}
 	window.ensureStorePrefetchBeforeLogin = ensureStorePrefetchBeforeLogin;
 
-	function isMissingRapItem(game) {
-		return !!game && String(game.rap || '').trim().toUpperCase() === 'MISSING';
+	function isMissingRapItem(game, category = '') {
+		if (!game || normalizeRapMarker(game.rap) !== 'MISSING') return false;
+
+		const categoryHint = typeof category === 'string' ? category : '';
+		const resolvedCategory = String(
+			categoryHint || game.category || game.rawCategory || document.getElementById('cat-select')?.value || ''
+		).trim().toLowerCase();
+
+		// License priority is shared with the RAP button: direct database RAP -> Unlock DLC -> repository RAP.
+		if (resolvedCategory === 'games' && isLicenseByDlcItem(game, 'games')) return false;
+		if (hasCachedRepoRapDownload(game, resolvedCategory)) return false;
+
+		// Items hidden by Missing Licenses still need the repository check; otherwise a brown RAP could never be discovered.
+		if (isRepoRapFallbackCandidate(game, resolvedCategory)) scheduleLicenseRepoRapCheck(game, resolvedCategory);
+		return true;
 	}
 
 	function browseItemPassesFiltersBeforeMissingRap(game, ctx = null) {
@@ -20141,7 +20188,7 @@ P
 			available = (Array.isArray(currentData) ? currentData : [])
 				.filter(game => getBrowseGroupTitleKey(game) === key)
 				.filter(game => browseItemPassesFiltersBeforeMissingRap(game, ctx))
-				.filter(isMissingRapItem).length;
+				.filter(game => isMissingRapItem(game, ctx.currentCat)).length;
 		}
 
 		const showing = !!(missingRapToggle && missingRapToggle.checked);
