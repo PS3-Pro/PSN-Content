@@ -5520,95 +5520,117 @@ function scheduleFriendActivityOffline(name, lastSeen = Date.now(), reason = 'di
 
 async function upsertPresenceForSocket(socket, name) {
   if (!socket || !name) return;
-  const shouldAnnouncePresence = socket.__presenceAnnounced !== true;
-  const presenceData = buildPresenceSessionData(socket, name);
-  let shouldRecordOnlineActivity = false;
-  let isFirstActiveSession = false;
-  let representativeSocketId = normalizeText(userDatabase[name] && userDatabase[name].id, '');
-  let presenceRevision = Math.max(0, Number(userDatabase[name] && userDatabase[name].presenceRevision) || 0);
-  const now = Date.now();
+  const owner = normalizeText(name, '');
+  if (!owner) return;
 
-  if (shouldAnnouncePresence) {
-    const transition = await runDbTransactionWithRetry('PRESENCE ONLINE', async client => {
-      const storedResult = await client.query('SELECT data FROM users WHERE name = $1 LIMIT 1', [name]);
-      const storedUser = storedResult.rows[0] && storedResult.rows[0].data && typeof storedResult.rows[0].data === 'object' ? storedResult.rows[0].data : {};
-      const activePresence = await client.query(
-        `SELECT 1
-         FROM presence_sessions
-         WHERE name = $1
-           AND socket_id <> $2
-           AND last_seen >= NOW() - INTERVAL '${PRESENCE_TTL_SECONDS} seconds'
-         LIMIT 1`,
-        [name, socket.id]
-      );
-      const firstActiveSession = activePresence.rowCount === 0;
-      const storedLastSeen = normalizeTimestampValue(storedUser.lastSeen);
-      const shortReconnect = firstActiveSession
-        && storedUser.online === false
-        && storedLastSeen > 0
-        && now - storedLastSeen <= FRIEND_ACTIVITY_PRESENCE_GRACE_MS;
-      const nextRevision = Math.max(0, Number(storedUser.presenceRevision) || presenceRevision) + (firstActiveSession ? 1 : 0);
+  if (socket.__presenceUpsertInFlight && socket.__presenceUpsertInFlightName === owner) {
+    return socket.__presenceUpsertInFlight;
+  }
 
-      await client.query(
+  const run = (async () => {
+
+    const shouldAnnouncePresence = socket.__presenceAnnounced !== true;
+    const presenceData = buildPresenceSessionData(socket, name);
+    let shouldRecordOnlineActivity = false;
+    let isFirstActiveSession = false;
+    let representativeSocketId = normalizeText(userDatabase[name] && userDatabase[name].id, '');
+    let presenceRevision = Math.max(0, Number(userDatabase[name] && userDatabase[name].presenceRevision) || 0);
+    const now = Date.now();
+
+    if (shouldAnnouncePresence) {
+      const transition = await runDbTransactionWithRetry(`PRESENCE ONLINE ${owner}`, async client => {
+        const storedResult = await client.query('SELECT data FROM users WHERE name = $1 LIMIT 1', [name]);
+        const storedUser = storedResult.rows[0] && storedResult.rows[0].data && typeof storedResult.rows[0].data === 'object' ? storedResult.rows[0].data : {};
+        const activePresence = await client.query(
+          `SELECT 1
+           FROM presence_sessions
+           WHERE name = $1
+             AND socket_id <> $2
+             AND last_seen >= NOW() - INTERVAL '${PRESENCE_TTL_SECONDS} seconds'
+           LIMIT 1`,
+          [name, socket.id]
+        );
+        const firstActiveSession = activePresence.rowCount === 0;
+        const storedLastSeen = normalizeTimestampValue(storedUser.lastSeen);
+        const shortReconnect = firstActiveSession
+          && storedUser.online === false
+          && storedLastSeen > 0
+          && now - storedLastSeen <= FRIEND_ACTIVITY_PRESENCE_GRACE_MS;
+        const nextRevision = Math.max(0, Number(storedUser.presenceRevision) || presenceRevision) + (firstActiveSession ? 1 : 0);
+
+        await client.query(
+          `INSERT INTO presence_sessions (socket_id, name, instance_id, connected_at, last_seen, data)
+           VALUES ($1, $2, $3, NOW(), NOW(), $4)
+           ON CONFLICT (socket_id) DO UPDATE SET name = $2, instance_id = $3, last_seen = NOW(), data = $4`,
+          [socket.id, name, INSTANCE_ID, presenceData]
+        );
+        const representativePresence = await client.query(
+          `SELECT socket_id FROM presence_sessions
+           WHERE name = $1 AND last_seen >= NOW() - INTERVAL '${PRESENCE_TTL_SECONDS} seconds'
+           ORDER BY connected_at ASC, socket_id ASC LIMIT 1`,
+          [name]
+        );
+        const representativeId = normalizeText(representativePresence.rows[0] && representativePresence.rows[0].socket_id, '') || socket.id;
+
+        if (firstActiveSession) {
+          await client.query(
+            `UPDATE users
+             SET data = COALESCE(data, '{}'::jsonb) || jsonb_build_object('online', true, 'lastSeen', $2::bigint, 'presenceRevision', $3::bigint)
+             WHERE name = $1`,
+            [name, now, nextRevision]
+          );
+        }
+        return {
+          isFirstActiveSession: firstActiveSession,
+          shouldRecordOnlineActivity: firstActiveSession && !shortReconnect,
+          representativeSocketId: representativeId,
+          presenceRevision: nextRevision
+        };
+      }, { attempts: 4, lockTimeoutMs: 1200, advisoryLockKey: `presence:${String(name).toLowerCase()}` });
+      if (transition) {
+        isFirstActiveSession = transition.isFirstActiveSession === true;
+        shouldRecordOnlineActivity = transition.shouldRecordOnlineActivity === true;
+        representativeSocketId = transition.representativeSocketId || socket.id;
+        presenceRevision = Math.max(presenceRevision, Number(transition.presenceRevision) || 0);
+      }
+    } else {
+      await queryDbWithRetry(
         `INSERT INTO presence_sessions (socket_id, name, instance_id, connected_at, last_seen, data)
          VALUES ($1, $2, $3, NOW(), NOW(), $4)
          ON CONFLICT (socket_id) DO UPDATE SET name = $2, instance_id = $3, last_seen = NOW(), data = $4`,
-        [socket.id, name, INSTANCE_ID, presenceData]
+        [socket.id, name, INSTANCE_ID, presenceData],
+        { attempts: 3, label: 'PRESENCE UPSERT' }
       );
-      const representativePresence = await client.query(
-        `SELECT socket_id FROM presence_sessions
-         WHERE name = $1 AND last_seen >= NOW() - INTERVAL '${PRESENCE_TTL_SECONDS} seconds'
-         ORDER BY connected_at ASC, socket_id ASC LIMIT 1`,
-        [name]
-      );
-      const representativeId = normalizeText(representativePresence.rows[0] && representativePresence.rows[0].socket_id, '') || socket.id;
-
-      if (firstActiveSession) {
-        await client.query(
-          `UPDATE users
-           SET data = COALESCE(data, '{}'::jsonb) || jsonb_build_object('online', true, 'lastSeen', $2::bigint, 'presenceRevision', $3::bigint)
-           WHERE name = $1`,
-          [name, now, nextRevision]
-        );
-      }
-      return {
-        isFirstActiveSession: firstActiveSession,
-        shouldRecordOnlineActivity: firstActiveSession && !shortReconnect,
-        representativeSocketId: representativeId,
-        presenceRevision: nextRevision
-      };
-    }, { attempts: 4, lockTimeoutMs: 1200, advisoryLockKey: `presence:${String(name).toLowerCase()}` });
-    if (transition) {
-      isFirstActiveSession = transition.isFirstActiveSession === true;
-      shouldRecordOnlineActivity = transition.shouldRecordOnlineActivity === true;
-      representativeSocketId = transition.representativeSocketId || socket.id;
-      presenceRevision = Math.max(presenceRevision, Number(transition.presenceRevision) || 0);
     }
-  } else {
-    await queryDbWithRetry(
-      `INSERT INTO presence_sessions (socket_id, name, instance_id, connected_at, last_seen, data)
-       VALUES ($1, $2, $3, NOW(), NOW(), $4)
-       ON CONFLICT (socket_id) DO UPDATE SET name = $2, instance_id = $3, last_seen = NOW(), data = $4`,
-      [socket.id, name, INSTANCE_ID, presenceData],
-      { attempts: 3, label: 'PRESENCE UPSERT' }
-    );
-  }
 
-  cancelFriendActivityOffline(name);
-  if (userDatabase[name]) {
-    userDatabase[name].online = true;
-    if (shouldAnnouncePresence) userDatabase[name].id = representativeSocketId || socket.id;
-    userDatabase[name].lastSeen = Math.max(Number(userDatabase[name].lastSeen) || 0, now);
-    userDatabase[name].presenceRevision = Math.max(Number(userDatabase[name].presenceRevision) || 0, presenceRevision);
-  }
-  if (shouldAnnouncePresence) socket.__presenceAnnounced = true;
+    cancelFriendActivityOffline(name);
+    if (userDatabase[name]) {
+      userDatabase[name].online = true;
+      if (shouldAnnouncePresence) userDatabase[name].id = representativeSocketId || socket.id;
+      userDatabase[name].lastSeen = Math.max(Number(userDatabase[name].lastSeen) || 0, now);
+      userDatabase[name].presenceRevision = Math.max(Number(userDatabase[name].presenceRevision) || 0, presenceRevision);
+    }
+    if (shouldAnnouncePresence) socket.__presenceAnnounced = true;
 
-  // A second tab/session does not change public presence, so don't broadcast a redundant patch.
-  if (shouldAnnouncePresence && isFirstActiveSession && userDatabase[name]) {
-    invalidateOnlineListCache('presence-upsert');
-    emitPresenceUpdate(name, userDatabase[name]);
-    deferServerTask('PRESENCE ONLINE NOTIFY', () => notifyPresenceAcrossInstances(name, userDatabase[name]), 0);
-    if (shouldRecordOnlineActivity) deferServerTask('FRIEND ACTIVITY ONLINE', () => recordPresenceFriendActivity(name, 'online', now), 0);
+    // A second tab/session does not change public presence, so don't broadcast a redundant patch.
+    if (shouldAnnouncePresence && isFirstActiveSession && userDatabase[name]) {
+      invalidateOnlineListCache('presence-upsert');
+      emitPresenceUpdate(name, userDatabase[name]);
+      deferServerTask('PRESENCE ONLINE NOTIFY', () => notifyPresenceAcrossInstances(name, userDatabase[name]), 0);
+      if (shouldRecordOnlineActivity) deferServerTask('FRIEND ACTIVITY ONLINE', () => recordPresenceFriendActivity(name, 'online', now), 0);
+    }
+
+  })();
+
+  socket.__presenceUpsertInFlight = run;
+  socket.__presenceUpsertInFlightName = owner;
+  try {
+    return await run;
+  } finally {
+    if (socket.__presenceUpsertInFlight === run) {
+      socket.__presenceUpsertInFlight = null;
+      socket.__presenceUpsertInFlightName = '';
+    }
   }
 }
 
@@ -5616,7 +5638,7 @@ async function markPresenceOfflineIfNoActiveSessions(name, lastSeen = Date.now()
   const actor = normalizeText(name, '');
   if (!actor) return { changed: false, online: false, revision: 0, lastSeen: normalizeTimestampValue(lastSeen) || Date.now() };
 
-  return runDbTransactionWithRetry('PRESENCE OFFLINE', async client => {
+  return runDbTransactionWithRetry(`PRESENCE OFFLINE ${actor}`, async client => {
     const storedResult = await client.query('SELECT data FROM users WHERE name = $1 LIMIT 1', [actor]);
     const storedUser = storedResult.rows[0] && storedResult.rows[0].data && typeof storedResult.rows[0].data === 'object' ? storedResult.rows[0].data : {};
     const removeSocketId = normalizeText(options && options.removeSocketId, '');
