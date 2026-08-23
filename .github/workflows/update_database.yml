@@ -11,7 +11,6 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v3
-
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
@@ -20,13 +19,12 @@ jobs:
         run: |
           BASE_DIR="resources/database/content/official"
           LATEST_DIR="resources/database/content/latest"
-          DLC_EVENTS_DIR="resources/database/content/events/dlcs"
+          EVENTS_DIR="resources/database/content/events"
           PY_SCRIPT=".github/scripts/generate_latest_releases.py"
 
           clean_tsv() {
             awk -F'\t' '
               BEGIN { OFS = FS }
-
               function trim(value) {
                 gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
                 return value
@@ -40,7 +38,6 @@ jobs:
                 title_id = trim($1)
                 name = trim($3)
                 pkg_url = trim($4)
-
                 if (title_id != "" &&
                     name != "" && toupper(name) != "MISSING" &&
                     pkg_url != "" && toupper(pkg_url) != "MISSING") {
@@ -49,28 +46,33 @@ jobs:
               }
             ' "$1" > "$2"
           }
+
           mkdir -p "$BASE_DIR/pending"
           mkdir -p "$LATEST_DIR"
-          mkdir -p "$DLC_EVENTS_DIR"
+          mkdir -p "$EVENTS_DIR/dlcs" "$EVENTS_DIR/avatars" "$EVENTS_DIR/themes"
 
           categories=("games" "avatars" "demos" "dlcs" "themes")
-
           for cat in "${categories[@]}"; do
             echo "Processando $cat..."
+
+            EVENT_DIR=""
+            case "$cat" in
+              dlcs|avatars|themes) EVENT_DIR="$EVENTS_DIR/$cat" ;;
+            esac
 
             URL_OFFICIAL="https://nopaystation.com/tsv/PS3_${cat^^}.tsv"
             curl -L "$URL_OFFICIAL" -o "nps_raw.tsv"
 
             clean_tsv "nps_raw.tsv" "nps_clean.tsv"
 
-            python "$PY_SCRIPT" "$BASE_DIR/${cat}.tsv" "nps_clean.tsv" "$LATEST_DIR/latest_${cat}.tsv" "$DLC_EVENTS_DIR" "$cat" "official"
+            python "$PY_SCRIPT" "$BASE_DIR/${cat}.tsv" "nps_clean.tsv" "$LATEST_DIR/latest_${cat}.tsv" "$EVENT_DIR" "$cat" "official"
             mv "nps_clean.tsv" "$BASE_DIR/${cat}.tsv"
             rm "nps_raw.tsv"
 
             curl -L "https://nopaystation.com/tsv/pending/PS3_${cat^^}.tsv" -o "p_raw.tsv"
             clean_tsv "p_raw.tsv" "p_clean.tsv"
 
-            python "$PY_SCRIPT" "$BASE_DIR/pending/${cat}.tsv" "p_clean.tsv" "$LATEST_DIR/latest_${cat}.tsv" "$DLC_EVENTS_DIR" "$cat" "pending"
+            python "$PY_SCRIPT" "$BASE_DIR/pending/${cat}.tsv" "p_clean.tsv" "$LATEST_DIR/latest_${cat}.tsv" "$EVENT_DIR" "$cat" "pending"
             mv "p_clean.tsv" "$BASE_DIR/pending/${cat}.tsv"
             rm "p_raw.tsv"
           done
@@ -78,11 +80,10 @@ jobs:
         run: |
           git config --global user.name "PS3-Pro Bot"
           git config --global user.email "bot@ps3pro.com"
-
           git add resources/database/content/official/*.tsv
           git add resources/database/content/official/pending/*.tsv
           git add resources/database/content/latest/*.tsv
-          git add resources/database/content/events/dlcs
+          git add resources/database/content/events
 
           git diff-index --quiet HEAD || git commit -m "Auto-update: Synchronized with NoPayStation (Official & Pending)"
           git push

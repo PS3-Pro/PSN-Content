@@ -51479,7 +51479,7 @@ function getVisibleChatStackEl(id) {
 				if (typeof markProfileListChanged === 'function') markProfileListChanged('library');
 				if (typeof window.broadcastProfileUpdate === 'function') setTimeout(function() { window.broadcastProfileUpdate({ silentIndicator:true }); }, 180);
 			}
-			if (typeof window.scheduleCatalogDlcNotificationScan === 'function') window.scheduleCatalogDlcNotificationScan({ reason:'profile-sync-complete', delayMs:1200 });
+			if (typeof window.scheduleCatalogNotificationScan === 'function') window.scheduleCatalogNotificationScan({ reason:'profile-sync-complete', delayMs:1200 });
 			const gate = window.__postAuthChatGate;
 			if (gate && gate.name === myName) {
 				gate.profileComplete = true;
@@ -55750,15 +55750,21 @@ function getVisibleChatStackEl(id) {
 		return { id:String(raw.id || ''), user:String(raw.user || ''), type:type, data:data, createdAt:Number(raw.createdAt || Date.now()) || Date.now() };
 	}
 
-	const CATALOG_DLC_EVENT_BASE_URL = 'https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/database/content/events/dlcs';
-	const CATALOG_DLC_NOTIFICATION_STATE_KEY = 'psn_catalog_dlc_notification_state_v1';
-	const CATALOG_DLC_NOTIFICATION_CHECK_INTERVAL_MS = 60 * 60 * 1000;
-	window.__catalogDlcNotificationScanInFlight = null;
-	window.__catalogDlcNotificationScanTimer = null;
+	const CATALOG_EVENT_ROOT_URL = 'https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/database/content/events';
+	const CATALOG_NOTIFICATION_CHECK_INTERVAL_MS = 60 * 60 * 1000;
+	const CATALOG_EVENT_CONFIGS = {
+		dlc: { path:'dlcs', stateKey:'psn_catalog_dlc_notification_state_v1', fallbackName:'New DLC' },
+		avatar: { path:'avatars', stateKey:'psn_catalog_avatar_notification_state_v1', fallbackName:'New Avatar' },
+		theme: { path:'themes', stateKey:'psn_catalog_theme_notification_state_v1', fallbackName:'New Theme' }
+	};
+	window.__catalogNotificationScanInFlight = null;
+	window.__catalogNotificationScanTimer = null;
 
-	function readCatalogDlcNotificationState() {
+	function readCatalogNotificationState(catalogType) {
+		const config = CATALOG_EVENT_CONFIGS[catalogType];
+		if (!config) return { initialized:false, lastEventAt:0, lastCheckedAt:0, indexUpdatedAt:0 };
 		try {
-			const parsed = JSON.parse(loadState(CATALOG_DLC_NOTIFICATION_STATE_KEY) || '{}');
+			const parsed = JSON.parse(loadState(config.stateKey) || '{}');
 			return {
 				initialized: parsed && parsed.initialized === true,
 				lastEventAt: Math.max(0, Number(parsed && parsed.lastEventAt) || 0),
@@ -55770,8 +55776,10 @@ function getVisibleChatStackEl(id) {
 		}
 	}
 
-	function writeCatalogDlcNotificationState(state) {
-		try { saveState(CATALOG_DLC_NOTIFICATION_STATE_KEY, JSON.stringify(state || {})); } catch (err) {}
+	function writeCatalogNotificationState(catalogType, state) {
+		const config = CATALOG_EVENT_CONFIGS[catalogType];
+		if (!config) return;
+		try { saveState(config.stateKey, JSON.stringify(state || {})); } catch (err) {}
 	}
 
 	function normalizeCatalogOwnedTitleId(value) {
@@ -55829,23 +55837,56 @@ function getVisibleChatStackEl(id) {
 		return owned;
 	}
 
-	async function fetchCatalogDlcJson(url, version = '') {
+	function normalizeCatalogRelationName(value) {
+		if (typeof window.normalizePsnStoreLookupName === 'function') return window.normalizePsnStoreLookupName(value);
+		let text = String(value || '').trim().toLowerCase();
+		try { text = text.normalize('NFD').replace(/[\u0300-\u036f]/g, ''); } catch (err) {}
+		return text.replace(/[^a-z0-9]/g, '');
+	}
+
+	function findCatalogRelatedOwnedGame(event, catalogType, ownedGames) {
+		const titleId = normalizeCatalogOwnedTitleId(event && (event.titleId || event.contentId));
+		if (titleId && ownedGames.has(titleId)) return ownedGames.get(titleId);
+		if (catalogType !== 'avatar' && catalogType !== 'theme') return null;
+
+		let relatedName = String(event && event.name || '').trim();
+		if (typeof cleanGameName === 'function') {
+			try { relatedName = cleanGameName(relatedName, catalogType === 'avatar' ? 'avatars' : 'themes') || relatedName; } catch (err) {}
+		}
+		const relatedKey = normalizeCatalogRelationName(relatedName);
+		if (!relatedKey) return null;
+
+		const candidates = [];
+		ownedGames.forEach(function(game) {
+			const gameKey = normalizeCatalogRelationName(game && game.title);
+			if (!gameKey || gameKey.length < 5) return;
+			if (relatedKey === gameKey || relatedKey.indexOf(gameKey) === 0 || relatedKey.indexOf(gameKey) > 0) {
+				candidates.push({ game:game, score:gameKey.length });
+			}
+		});
+		candidates.sort(function(a,b) { return b.score - a.score; });
+		return candidates.length ? candidates[0].game : null;
+	}
+
+	async function fetchCatalogEventJson(url, version = '') {
 		const suffix = version ? ((url.includes('?') ? '&' : '?') + 'v=' + encodeURIComponent(String(version))) : '';
 		const response = await fetch(url + suffix, { cache:'no-cache' });
 		if (!response.ok) throw new Error('catalog unavailable');
 		return response.json();
 	}
 
-	function submitCatalogDlcNotificationCandidate(event, ownedGame) {
+	function submitCatalogNotificationCandidate(catalogType, event, ownedGame) {
 		return new Promise(function(resolve) {
-			if (!socketChat || !socketChat.connected) { resolve(false); return; }
+			const config = CATALOG_EVENT_CONFIGS[catalogType];
+			if (!config || !socketChat || !socketChat.connected) { resolve(false); return; }
 			const payload = {
-				catalogType:'dlc',
+				catalogType:catalogType,
 				eventKey:String(event.key || event.contentId || '').trim(),
 				titleId:normalizeCatalogOwnedTitleId(event.titleId || event.contentId),
 				contentId:String(event.contentId || '').trim(),
-				contentName:String(event.name || 'New DLC').trim(),
+				contentName:String(event.name || config.fallbackName).trim(),
 				gameTitle:String(ownedGame && ownedGame.title || event.titleId || 'your game').trim(),
+				gameTitleId:normalizeCatalogOwnedTitleId(ownedGame && ownedGame.titleId),
 				ownershipType:ownedGame && ownedGame.installed ? 'installed' : 'downloaded',
 				addedAt:Math.max(0, Number(event.addedAt) || 0)
 			};
@@ -55855,112 +55896,143 @@ function getVisibleChatStackEl(id) {
 		});
 	}
 
-	window.scanCatalogDlcNotifications = function(options = {}) {
-		if (window.__catalogDlcNotificationScanInFlight) return window.__catalogDlcNotificationScanInFlight;
+	async function scanCatalogNotificationType(catalogType, ownedGames, username, options = {}, prefetchedIndex = null) {
+		const config = CATALOG_EVENT_CONFIGS[catalogType];
+		if (!config) return true;
+		const state = readCatalogNotificationState(catalogType);
+		const now = Date.now();
+		if (options.force !== true && state.lastCheckedAt && now - state.lastCheckedAt < CATALOG_NOTIFICATION_CHECK_INTERVAL_MS) return true;
+
+		try {
+			const baseUrl = CATALOG_EVENT_ROOT_URL + '/' + config.path;
+			const index = prefetchedIndex || await fetchCatalogEventJson(baseUrl + '/index.json');
+			if (String(localStorage.getItem('psn_username') || '').trim() !== username) return false;
+			const latestEventAt = Math.max(0, Number(index && index.latestEventAt) || 0);
+			const trackingStartedAt = Math.max(0, Number(index && index.trackingStartedAt) || 0);
+			const indexUpdatedAt = Math.max(0, Number(index && index.updatedAt) || 0);
+			const months = Array.isArray(index && index.months) ? index.months : [];
+
+			if (!state.initialized) {
+				if (!trackingStartedAt && !latestEventAt) {
+					state.lastCheckedAt = now;
+					state.indexUpdatedAt = indexUpdatedAt;
+					writeCatalogNotificationState(catalogType, state);
+					return true;
+				}
+				state.initialized = true;
+				state.lastEventAt = trackingStartedAt || latestEventAt;
+				state.lastCheckedAt = now;
+				state.indexUpdatedAt = indexUpdatedAt;
+				writeCatalogNotificationState(catalogType, state);
+				if (!trackingStartedAt) return true;
+			}
+
+			if (!latestEventAt || latestEventAt <= state.lastEventAt) {
+				state.lastCheckedAt = now;
+				state.indexUpdatedAt = indexUpdatedAt;
+				writeCatalogNotificationState(catalogType, state);
+				return true;
+			}
+
+			if (!ownedGames || !ownedGames.size) {
+				state.lastEventAt = latestEventAt;
+				state.lastCheckedAt = now;
+				state.indexUpdatedAt = indexUpdatedAt;
+				writeCatalogNotificationState(catalogType, state);
+				return true;
+			}
+
+			const relevantMonths = months.filter(function(month) { return Math.max(0, Number(month && month.maxAt) || 0) > state.lastEventAt; }).sort(function(a,b) { return String(a.id || '').localeCompare(String(b.id || '')); });
+			const events = [];
+			for (const month of relevantMonths) {
+				const fileName = String(month && month.file || '').trim();
+				if (!/^\d{4}-\d{2}\.json$/.test(fileName)) continue;
+				const payload = await fetchCatalogEventJson(baseUrl + '/' + fileName, indexUpdatedAt || latestEventAt);
+				if (Array.isArray(payload && payload.events)) events.push.apply(events, payload.events);
+			}
+
+			const seen = new Set();
+			events.sort(function(a,b) { return (Number(a && a.addedAt) || 0) - (Number(b && b.addedAt) || 0); });
+			for (const event of events) {
+				if (!event || String(event.type || catalogType).toLowerCase() !== catalogType) continue;
+				const addedAt = Math.max(0, Number(event.addedAt) || 0);
+				if (!addedAt || addedAt <= state.lastEventAt) continue;
+				const eventKey = String(event.key || event.contentId || '').trim();
+				if (!eventKey || seen.has(eventKey)) continue;
+				seen.add(eventKey);
+				const ownedGame = findCatalogRelatedOwnedGame(event, catalogType, ownedGames);
+				if (!ownedGame || addedAt <= ownedGame.acquiredAt) continue;
+				if (!(await submitCatalogNotificationCandidate(catalogType, event, ownedGame))) return false;
+				if (String(localStorage.getItem('psn_username') || '').trim() !== username || !socketChat || !socketChat.connected) return false;
+			}
+
+			state.lastEventAt = latestEventAt;
+			state.lastCheckedAt = now;
+			state.indexUpdatedAt = indexUpdatedAt;
+			writeCatalogNotificationState(catalogType, state);
+			return true;
+		} catch (err) {
+			return false;
+		}
+	}
+
+	function catalogNotificationIndexHasPendingEvents(catalogType, index) {
+		const state = readCatalogNotificationState(catalogType);
+		const latestEventAt = Math.max(0, Number(index && index.latestEventAt) || 0);
+		if (!latestEventAt) return false;
+		if (state.initialized) return latestEventAt > state.lastEventAt;
+		const trackingStartedAt = Math.max(0, Number(index && index.trackingStartedAt) || 0);
+		return !!trackingStartedAt && latestEventAt > trackingStartedAt;
+	}
+
+	window.scanCatalogNotifications = function(options = {}) {
+		if (window.__catalogNotificationScanInFlight) return window.__catalogNotificationScanInFlight;
 		if (!window.isProfileLoaded || window.__psnOfflineModeActive === true || !socketChat || !socketChat.connected) return Promise.resolve(false);
 		const username = String(localStorage.getItem('psn_username') || '').trim();
 		if (!username || username === 'null') return Promise.resolve(false);
 
-		const state = readCatalogDlcNotificationState();
-		const now = Date.now();
-		if (options.force !== true && state.lastCheckedAt && now - state.lastCheckedAt < CATALOG_DLC_NOTIFICATION_CHECK_INTERVAL_MS) {
-			if (typeof window.scheduleCatalogDlcNotificationScan === 'function') {
-				window.scheduleCatalogDlcNotificationScan({ reason:'interval', delayMs:CATALOG_DLC_NOTIFICATION_CHECK_INTERVAL_MS - (now - state.lastCheckedAt) + 500 });
-			}
-			return Promise.resolve(false);
-		}
+		window.__catalogNotificationScanInFlight = (async function() {
+			const plans = [];
+			let needsOwnedGames = false;
+			let ok = true;
+			const now = Date.now();
 
-		window.__catalogDlcNotificationScanInFlight = (async function() {
-			try {
-				const index = await fetchCatalogDlcJson(CATALOG_DLC_EVENT_BASE_URL + '/index.json');
-				if (String(localStorage.getItem('psn_username') || '').trim() !== username) return false;
-				const latestEventAt = Math.max(0, Number(index && index.latestEventAt) || 0);
-				const trackingStartedAt = Math.max(0, Number(index && index.trackingStartedAt) || 0);
-				const indexUpdatedAt = Math.max(0, Number(index && index.updatedAt) || 0);
-				const months = Array.isArray(index && index.months) ? index.months : [];
-
-				if (!state.initialized) {
-					if (!trackingStartedAt && !latestEventAt) {
-						state.lastCheckedAt = now;
-						state.indexUpdatedAt = indexUpdatedAt;
-						writeCatalogDlcNotificationState(state);
-						return true;
-					}
-					state.initialized = true;
-					state.lastEventAt = trackingStartedAt || latestEventAt;
-					state.lastCheckedAt = now;
-					state.indexUpdatedAt = indexUpdatedAt;
-					writeCatalogDlcNotificationState(state);
-					// Old indexes do not expose a rollout boundary, so baseline safely.
-					if (!trackingStartedAt) return true;
-				}
-
-				if (!latestEventAt || latestEventAt <= state.lastEventAt) {
-					state.lastCheckedAt = now;
-					state.indexUpdatedAt = indexUpdatedAt;
-					writeCatalogDlcNotificationState(state);
-					return true;
-				}
-
-				const ownedGames = getCatalogOwnedGameMap();
-				if (!ownedGames.size) {
-					state.lastEventAt = latestEventAt;
-					state.lastCheckedAt = now;
-					state.indexUpdatedAt = indexUpdatedAt;
-					writeCatalogDlcNotificationState(state);
-					return true;
-				}
-
-				const relevantMonths = months.filter(function(month) { return Math.max(0, Number(month && month.maxAt) || 0) > state.lastEventAt; }).sort(function(a,b) { return String(a.id || '').localeCompare(String(b.id || '')); });
-				const events = [];
-				for (const month of relevantMonths) {
-					const fileName = String(month && month.file || '').trim();
-					if (!/^\d{4}-\d{2}\.json$/.test(fileName)) continue;
-					const payload = await fetchCatalogDlcJson(CATALOG_DLC_EVENT_BASE_URL + '/' + fileName, indexUpdatedAt || latestEventAt);
-					if (Array.isArray(payload && payload.events)) events.push.apply(events, payload.events);
-				}
-
-				const seen = new Set();
-				events.sort(function(a,b) { return (Number(a && a.addedAt) || 0) - (Number(b && b.addedAt) || 0); });
-				for (const event of events) {
-					if (!event || String(event.type || 'dlc').toLowerCase() !== 'dlc') continue;
-					const addedAt = Math.max(0, Number(event.addedAt) || 0);
-					if (!addedAt || addedAt <= state.lastEventAt) continue;
-					const eventKey = String(event.key || event.contentId || '').trim();
-					if (!eventKey || seen.has(eventKey)) continue;
-					seen.add(eventKey);
-					const titleId = normalizeCatalogOwnedTitleId(event.titleId || event.contentId);
-					const ownedGame = ownedGames.get(titleId);
-					if (!ownedGame || addedAt <= ownedGame.acquiredAt) continue;
-					if (!(await submitCatalogDlcNotificationCandidate(event, ownedGame))) return false;
+			for (const catalogType of Object.keys(CATALOG_EVENT_CONFIGS)) {
+				const config = CATALOG_EVENT_CONFIGS[catalogType];
+				const state = readCatalogNotificationState(catalogType);
+				if (!config || (options.force !== true && state.lastCheckedAt && now - state.lastCheckedAt < CATALOG_NOTIFICATION_CHECK_INTERVAL_MS)) continue;
+				try {
+					const index = await fetchCatalogEventJson(CATALOG_EVENT_ROOT_URL + '/' + config.path + '/index.json');
 					if (String(localStorage.getItem('psn_username') || '').trim() !== username || !socketChat || !socketChat.connected) return false;
-				}
-
-				state.lastEventAt = latestEventAt;
-				state.lastCheckedAt = now;
-				state.indexUpdatedAt = indexUpdatedAt;
-				writeCatalogDlcNotificationState(state);
-				return true;
-			} catch (err) {
-				return false;
-			} finally {
-				window.__catalogDlcNotificationScanInFlight = null;
-				if (String(localStorage.getItem('psn_username') || '').trim() === username && window.isProfileLoaded && window.__psnOfflineModeActive !== true) {
-					window.scheduleCatalogDlcNotificationScan({ reason:'interval', delayMs:CATALOG_DLC_NOTIFICATION_CHECK_INTERVAL_MS + 500 });
+					plans.push({ catalogType:catalogType, index:index });
+					if (catalogNotificationIndexHasPendingEvents(catalogType, index)) needsOwnedGames = true;
+				} catch (err) {
+					ok = false;
 				}
 			}
-		})();
-		return window.__catalogDlcNotificationScanInFlight;
+
+			const ownedGames = needsOwnedGames ? getCatalogOwnedGameMap() : null;
+			for (const plan of plans) {
+				if (!(await scanCatalogNotificationType(plan.catalogType, ownedGames, username, options, plan.index))) ok = false;
+				if (String(localStorage.getItem('psn_username') || '').trim() !== username || !socketChat || !socketChat.connected) return false;
+			}
+			return ok;
+		})().finally(function() {
+			window.__catalogNotificationScanInFlight = null;
+			if (String(localStorage.getItem('psn_username') || '').trim() === username && window.isProfileLoaded && window.__psnOfflineModeActive !== true) {
+				window.scheduleCatalogNotificationScan({ reason:'interval', delayMs:CATALOG_NOTIFICATION_CHECK_INTERVAL_MS + 500 });
+			}
+		});
+		return window.__catalogNotificationScanInFlight;
 	};
 
-	window.scheduleCatalogDlcNotificationScan = function(options = {}) {
-		clearTimeout(window.__catalogDlcNotificationScanTimer);
-		window.__catalogDlcNotificationScanTimer = setTimeout(function() {
-			window.__catalogDlcNotificationScanTimer = null;
-			window.scanCatalogDlcNotifications(options);
+	window.scheduleCatalogNotificationScan = function(options = {}) {
+		clearTimeout(window.__catalogNotificationScanTimer);
+		window.__catalogNotificationScanTimer = setTimeout(function() {
+			window.__catalogNotificationScanTimer = null;
+			window.scanCatalogNotifications(options);
 		}, Math.max(0, Number(options.delayMs) || 900));
 	};
-
 
 	window.isNotificationCenterVisible = function() {
 		const view = document.getElementById('view-notifications');
@@ -56073,18 +56145,24 @@ function getVisibleChatStackEl(id) {
 		if (item.type === 'reply') return { badgeIcon:'fa-comments', cls:'is-reply', title:'replied to your message', meta:'Global Chat', preview:data.text || '' };
 		if (item.type === 'mention') return { badgeIcon:'fa-comments', cls:'is-mention', title:'mentioned you', meta:'Global Chat', preview:data.text || '' };
 		if (item.type === 'reaction') return { badgeIcon:'fa-comments', cls:'is-reaction', title:'reacted ' + String(data.emoji || '❤') + ' to your message', meta:'Global Chat', preview:data.text || '' };
-		if (item.type === 'catalog' && String(data.catalogType || '').toLowerCase() === 'dlc') {
-			const gameTitle = String(data.gameTitle || 'your game').trim() || 'your game';
-			const contentName = String(data.contentName || 'New downloadable content').trim() || 'New downloadable content';
-			let ownershipType = String(data.ownershipType || '').toLowerCase();
-			if (ownershipType !== 'installed' && ownershipType !== 'downloaded') {
-				const titleId = normalizeCatalogOwnedTitleId(data.titleId || data.contentId);
-				const ownedGame = titleId ? getCatalogOwnedGameMap().get(titleId) : null;
-				if (ownedGame && ownedGame.installed) ownershipType = 'installed';
-				else if (ownedGame && ownedGame.downloaded) ownershipType = 'downloaded';
+		if (item.type === 'catalog') {
+			const catalogType = String(data.catalogType || '').toLowerCase();
+			if (CATALOG_EVENT_CONFIGS[catalogType]) {
+				const gameTitle = String(data.gameTitle || 'your game').trim() || 'your game';
+				const fallbackName = catalogType === 'avatar' ? 'New Avatar' : (catalogType === 'theme' ? 'New Theme' : 'New downloadable content');
+				const contentName = String(data.contentName || fallbackName).trim() || fallbackName;
+				let ownershipType = String(data.ownershipType || '').toLowerCase();
+				if (ownershipType !== 'installed' && ownershipType !== 'downloaded') {
+					const titleId = normalizeCatalogOwnedTitleId(data.titleId || data.contentId);
+					const ownedGame = titleId ? getCatalogOwnedGameMap().get(titleId) : null;
+					if (ownedGame && ownedGame.installed) ownershipType = 'installed';
+					else if (ownedGame && ownedGame.downloaded) ownershipType = 'downloaded';
+				}
+				const ownershipText = ownershipType === 'installed' ? 'a game you have installed' : (ownershipType === 'downloaded' ? 'a game you downloaded' : 'one of your games');
+				if (catalogType === 'avatar') return { badgeIcon:'fa-user-circle', cls:'is-catalog', title:'New Avatar you might like', meta:'Recently Added', preview:contentName + ' is now available and is related to ' + ownershipText + ': ' + gameTitle + '.' };
+				if (catalogType === 'theme') return { badgeIcon:'fa-palette', cls:'is-catalog', title:'New Theme you might like', meta:'Recently Added', preview:contentName + ' is now available and is related to ' + ownershipText + ': ' + gameTitle + '.' };
+				return { badgeIcon:'fa-puzzle-piece', cls:'is-catalog', title:'New DLC available', meta:'Recently Added', preview:contentName + ' is now available for ' + ownershipText + ': ' + gameTitle + '.' };
 			}
-			const ownershipText = ownershipType === 'installed' ? 'a game you have installed' : (ownershipType === 'downloaded' ? 'a game you downloaded' : 'one of your games');
-			return { badgeIcon:'fa-puzzle-piece', cls:'is-catalog', title:'New DLC available', meta:'Recently Added', preview:contentName + ' is now available for ' + ownershipText + ': ' + gameTitle + '.' };
 		}
 		const trophyType = ['bronze','silver','gold','platinum'].includes(String(data.trophyType || '').toLowerCase()) ? String(data.trophyType).toLowerCase() : 'bronze';
 		return { badgeIcon:'fa-trophy', cls:'is-trophy', title:'Trophy unlocked', meta:'My Trophies', preview:(trophyType.charAt(0).toUpperCase() + trophyType.slice(1)) + ' • ' + String(data.title || 'Trophy') };
@@ -56120,9 +56198,11 @@ function getVisibleChatStackEl(id) {
 			}, 380);
 			return;
 		}
-		if (item.type === 'catalog' && String(data.catalogType || '').toLowerCase() === 'dlc') {
+		if (item.type === 'catalog') {
+			const catalogType = String(data.catalogType || '').toLowerCase();
+			const category = catalogType === 'avatar' ? 'avatars' : (catalogType === 'theme' ? 'themes' : (catalogType === 'dlc' ? 'dlcs' : ''));
 			const titleId = normalizeCatalogOwnedTitleId(data.titleId || data.contentId);
-			if (titleId && typeof window.switchAndSearch === 'function') window.switchAndSearch('dlcs', titleId, 'notifications', String(data.contentId || ''));
+			if (category && titleId && typeof window.switchAndSearch === 'function') window.switchAndSearch(category, titleId, 'notifications', String(data.contentId || ''));
 		}
 	};
 
@@ -56133,7 +56213,7 @@ function getVisibleChatStackEl(id) {
 		const actor = String(item.data && item.data.actor || (item.type === 'trophy' ? localStorage.getItem('psn_username') || '' : '')).trim();
 		let avatar = typeof getResolvedUserAvatar === 'function' ? getResolvedUserAvatar(actor) : 'https://raw.githubusercontent.com/PS3-Pro/PSN-Content/main/resources/interface/modern/images/avatars/default.png';
 		if (item.type === 'catalog') {
-			const catalogTitleId = normalizeCatalogOwnedTitleId(item.data && (item.data.titleId || item.data.contentId));
+			const catalogTitleId = normalizeCatalogOwnedTitleId(item.data && (item.data.gameTitleId || item.data.titleId || item.data.contentId));
 			if (catalogTitleId && typeof getOptimizedCover === 'function') avatar = getOptimizedCover(catalogTitleId) || avatar;
 		}
 		const encodedActor = encodeURIComponent(actor);
