@@ -1271,7 +1271,51 @@ function isSameDownloadHistoryItemServer(first = {}, second = {}) {
 function normalizeDownloadHistoryRecordsServer(history = []) {
   const source = Array.isArray(history) ? history : [];
   const grouped = [];
+  const titleIndex = new Map();
+  const contentIndex = new Map();
+  const nameIndex = new Map();
   let changed = !Array.isArray(history);
+
+  const addIndex = (map, key, groupIndex) => {
+    if (!key) return;
+    let indexes = map.get(key);
+    if (!indexes) {
+      indexes = new Set();
+      map.set(key, indexes);
+    }
+    indexes.add(groupIndex);
+  };
+
+  const indexGroup = groupIndex => {
+    const item = grouped[groupIndex];
+    if (!item) return;
+    const category = normalizeDownloadHistoryCategoryServer(item.category || item.rawCategory || 'games');
+    const titleId = normalizeText(item.titleId || item.id, '').toUpperCase();
+    const contentId = normalizeText(item.contentId || item.contentID, '').toUpperCase();
+    const name = normalizeDownloadHistoryNameServer(item.cleanName || item.name || item.title || item.rawName);
+    if (titleId) addIndex(titleIndex, `${category}|${titleId}`, groupIndex);
+    if (contentId) addIndex(contentIndex, `${category}|${contentId}`, groupIndex);
+    if (name) addIndex(nameIndex, `${category}|${name}`, groupIndex);
+  };
+
+  const findExistingIndex = item => {
+    const category = normalizeDownloadHistoryCategoryServer(item.category || item.rawCategory || 'games');
+    const titleId = normalizeText(item.titleId || item.id, '').toUpperCase();
+    const contentId = normalizeText(item.contentId || item.contentID, '').toUpperCase();
+    const name = normalizeDownloadHistoryNameServer(item.cleanName || item.name || item.title || item.rawName);
+    const candidates = new Set();
+    const include = indexes => { if (indexes) indexes.forEach(index => candidates.add(index)); };
+
+    if (contentId) include(contentIndex.get(`${category}|${contentId}`));
+    if (titleId) include(titleIndex.get(`${category}|${titleId}`));
+    if (!contentId && name) include(nameIndex.get(`${category}|${name}`));
+
+    const ordered = Array.from(candidates).sort((a, b) => a - b);
+    for (const index of ordered) {
+      if (isSameDownloadHistoryItemServer(grouped[index], item)) return index;
+    }
+    return -1;
+  };
 
   source.forEach(rawItem => {
     if (!rawItem || typeof rawItem !== 'object' || Array.isArray(rawItem)) {
@@ -1288,9 +1332,10 @@ function normalizeDownloadHistoryRecordsServer(history = []) {
     if (String(item.category || '') !== normalizedCategory) changed = true;
     item.category = normalizedCategory;
 
-    const existingIndex = grouped.findIndex(existing => isSameDownloadHistoryItemServer(existing, item));
+    const existingIndex = findExistingIndex(item);
     if (existingIndex < 0) {
       grouped.push(item);
+      indexGroup(grouped.length - 1);
       return;
     }
 
@@ -1317,6 +1362,7 @@ function normalizeDownloadHistoryRecordsServer(history = []) {
     } else if (!existing.sizeText && item.sizeText) {
       existing.sizeText = item.sizeText;
     }
+    indexGroup(existingIndex);
   });
 
   if (grouped.length !== source.length) changed = true;
@@ -1426,19 +1472,73 @@ function mergeLibraryLastPlayedRecordServer(primary = {}, fallback = {}) {
   return merged;
 }
 
+function buildLibraryRecordMatchIndexServer(list = []) {
+  const byTitleId = new Map();
+  const byPath = new Map();
+  const byTitle = new Map();
+  const add = (map, key, entry) => {
+    if (!key) return;
+    if (!map.has(key)) map.set(key, []);
+    map.get(key).push(entry);
+  };
+
+  (Array.isArray(list) ? list : []).forEach((candidate, index) => {
+    if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) return;
+    const entry = {
+      candidate,
+      index,
+      titleId: getLibraryGameTitleIdServer(candidate),
+      path: normalizeLibraryGamePathServer(candidate.path),
+      title: normalizeLibraryIdentityTextServer(candidate.title || candidate.name)
+    };
+    add(byTitleId, entry.titleId, entry);
+    add(byPath, entry.path, entry);
+    add(byTitle, entry.title, entry);
+  });
+
+  return { byTitleId, byPath, byTitle };
+}
+
+function findLibraryRecordMatchServer(item = {}, index = null) {
+  if (!index) return null;
+  const titleId = getLibraryGameTitleIdServer(item);
+  const path = normalizeLibraryGamePathServer(item.path);
+  const title = normalizeLibraryIdentityTextServer(item.title || item.name);
+  const matches = [];
+  const seenIndexes = new Set();
+  const collect = (entries, requireMissingTitleId = false) => {
+    (Array.isArray(entries) ? entries : []).forEach(entry => {
+      if (!entry || seenIndexes.has(entry.index)) return;
+      if (requireMissingTitleId && entry.titleId) return;
+      seenIndexes.add(entry.index);
+      matches.push(entry);
+    });
+  };
+
+  if (titleId) {
+    collect(index.byTitleId.get(titleId));
+    if (path) collect(index.byPath.get(path), true);
+    if (title) collect(index.byTitle.get(title), true);
+  } else {
+    if (path) collect(index.byPath.get(path));
+    if (title) collect(index.byTitle.get(title));
+  }
+
+  matches.sort((a, b) => a.index - b.index);
+  for (const entry of matches) {
+    if (isSameLibraryGameServer(item, entry.candidate)) return entry.candidate;
+  }
+  return null;
+}
+
 function mergeLibraryRecordsServer(primaryList = [], fallbackList = []) {
   const primary = Array.isArray(primaryList) ? primaryList : [];
   const fallback = Array.isArray(fallbackList) ? fallbackList : [];
+  const fallbackIndex = buildLibraryRecordMatchIndexServer(fallback);
 
   return primary
     .filter(item => item && typeof item === 'object' && !Array.isArray(item))
-    .map(item => {
-      const previous = fallback.find(candidate =>
-        candidate && typeof candidate === 'object' && !Array.isArray(candidate) &&
-        isSameLibraryGameServer(item, candidate)
-      );
-      return mergeLibraryLastPlayedRecordServer(item, previous || {});
-    });
+    .map(item => mergeLibraryLastPlayedRecordServer(item, findLibraryRecordMatchServer(item, fallbackIndex) || {}));
 }
 
 function normalizeProfileCountryCodeServer(value) {
