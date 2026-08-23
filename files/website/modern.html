@@ -55804,8 +55804,13 @@ function getVisibleChatStackEl(id) {
 			const id = normalizeCatalogOwnedTitleId(titleId);
 			const at = normalizeCatalogOwnershipTimestamp(acquiredAt);
 			if (!id || !at) return;
-			const current = owned.get(id);
-			if (!current || at < current.acquiredAt) owned.set(id, { titleId:id, title:String(title || id).trim() || id, acquiredAt:at, source:source || '' });
+			const current = owned.get(id) || { titleId:id, title:String(title || id).trim() || id, acquiredAt:at, source:'', downloaded:false, installed:false };
+			if (at < current.acquiredAt) current.acquiredAt = at;
+			if (source === 'downloads') current.downloaded = true;
+			if (source === 'library') current.installed = true;
+			if (source === 'library' || !current.title || current.title === id) current.title = String(title || id).trim() || id;
+			current.source = current.installed ? 'library' : (current.downloaded ? 'downloads' : String(source || ''));
+			owned.set(id, current);
 		};
 
 		(Array.isArray(window.downloadHistory) ? window.downloadHistory : []).forEach(function(item) {
@@ -55841,6 +55846,7 @@ function getVisibleChatStackEl(id) {
 				contentId:String(event.contentId || '').trim(),
 				contentName:String(event.name || 'New DLC').trim(),
 				gameTitle:String(ownedGame && ownedGame.title || event.titleId || 'your game').trim(),
+				ownershipType:ownedGame && ownedGame.installed ? 'installed' : 'downloaded',
 				addedAt:Math.max(0, Number(event.addedAt) || 0)
 			};
 			const done = function(response) { resolve(!!(response && response.ok === true)); };
@@ -56070,7 +56076,15 @@ function getVisibleChatStackEl(id) {
 		if (item.type === 'catalog' && String(data.catalogType || '').toLowerCase() === 'dlc') {
 			const gameTitle = String(data.gameTitle || 'your game').trim() || 'your game';
 			const contentName = String(data.contentName || 'New downloadable content').trim() || 'New downloadable content';
-			return { badgeIcon:'fa-puzzle-piece', cls:'is-catalog', title:'New DLC for ' + gameTitle, meta:'Recently Added', preview:contentName + ' is now available.' };
+			let ownershipType = String(data.ownershipType || '').toLowerCase();
+			if (ownershipType !== 'installed' && ownershipType !== 'downloaded') {
+				const titleId = normalizeCatalogOwnedTitleId(data.titleId || data.contentId);
+				const ownedGame = titleId ? getCatalogOwnedGameMap().get(titleId) : null;
+				if (ownedGame && ownedGame.installed) ownershipType = 'installed';
+				else if (ownedGame && ownedGame.downloaded) ownershipType = 'downloaded';
+			}
+			const ownershipText = ownershipType === 'installed' ? 'a game you have installed' : (ownershipType === 'downloaded' ? 'a game you downloaded' : 'one of your games');
+			return { badgeIcon:'fa-puzzle-piece', cls:'is-catalog', title:'New DLC available', meta:'Recently Added', preview:contentName + ' is now available for ' + ownershipText + ': ' + gameTitle + '.' };
 		}
 		const trophyType = ['bronze','silver','gold','platinum'].includes(String(data.trophyType || '').toLowerCase()) ? String(data.trophyType).toLowerCase() : 'bronze';
 		return { badgeIcon:'fa-trophy', cls:'is-trophy', title:'Trophy unlocked', meta:'My Trophies', preview:(trophyType.charAt(0).toUpperCase() + trophyType.slice(1)) + ' • ' + String(data.title || 'Trophy') };
@@ -56128,7 +56142,7 @@ function getVisibleChatStackEl(id) {
 		const day = realtimeFeedDayLabel(item.createdAt);
 		return '<div class="notification-swipe-row" data-notification-id="' + escapeRealtimeFeedHtml(item.id) + '" data-notification-day="' + escapeRealtimeFeedHtml(day) + '">' +
 			'<div class="notification-swipe-action" aria-hidden="false"><button type="button" class="notification-swipe-delete" data-keyboard-nav="off" title="Delete notification" aria-label="Delete notification"><i class="fas fa-trash-alt"></i><span>Delete</span></button></div>' +
-			'<div class="notification-swipe-content"><div class="user-notification-item ' + p.cls + (isUnread ? ' is-unread' : '') + (extraClass ? ' ' + extraClass : '') + '" style="--tile-idx:' + (index % 30) + '" onmouseenter="if(typeof playUiHover===\'function\') playUiHover()">' +
+			'<div class="notification-swipe-content"><div class="user-notification-item ' + p.cls + (isUnread ? ' is-unread' : '') + (extraClass ? ' ' + extraClass : '') + '" style="--tile-idx:' + (index % 30) + '" onmouseenter="if(!this.closest(\'.notification-swipe-row\')?.classList.contains(\'is-open\') && !this.closest(\'.notification-swipe-row\')?.classList.contains(\'is-swiping\') && typeof playUiHover===\'function\') playUiHover()">' +
 			'<div class="user-notification-avatar-wrap"><img class="user-notification-avatar" src="' + escapeRealtimeFeedHtml(avatar) + '" alt=""' + avatarAction + '><span class="user-notification-badge"><i class="fas ' + p.badgeIcon + '"></i></span></div>' +
 			'<div class="user-notification-main"><div class="user-notification-title">' + titleHtml + '</div>' + (p.preview ? '<div class="user-notification-preview">' + escapeRealtimeFeedHtml(p.preview) + '</div>' : '') + '<div class="user-notification-meta"><span>' + escapeRealtimeFeedHtml(p.meta) + '</span></div></div>' +
 			'<div class="user-notification-time" title="' + escapeRealtimeFeedHtml(new Date(item.createdAt).toLocaleString()) + '">' + escapeRealtimeFeedHtml(realtimeFeedTimeLabel(item.createdAt)) + '</div>' + (isUnread ? '<span class="user-notification-unread-dot"></span>' : '') + '</div></div></div>';

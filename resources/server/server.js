@@ -5071,6 +5071,7 @@ function normalizeUserNotificationData(type, rawData = {}) {
   }
   if (type === 'catalog') {
     const catalogType = normalizeText(source.catalogType || source.type, '').toLowerCase();
+    const ownershipType = normalizeText(source.ownershipType, '').toLowerCase();
     return {
       catalogType: catalogType === 'dlc' ? 'dlc' : '',
       eventKey: normalizeText(source.eventKey, '').slice(0, 180),
@@ -5078,6 +5079,7 @@ function normalizeUserNotificationData(type, rawData = {}) {
       contentId: normalizeText(source.contentId, '').slice(0, 180),
       contentName: normalizeText(source.contentName, 'New DLC').slice(0, 180),
       gameTitle: normalizeText(source.gameTitle, 'your game').slice(0, 180),
+      ownershipType: ['installed', 'downloaded'].includes(ownershipType) ? ownershipType : '',
       addedAt: normalizeTimestampValue(source.addedAt)
     };
   }
@@ -6834,6 +6836,8 @@ io.on('connection', (socket) => {
     const contentId = normalizeText(data && data.contentId, '').slice(0, 180);
     const contentName = normalizeText(data && data.contentName, 'New DLC').slice(0, 180);
     const gameTitle = normalizeText(data && data.gameTitle, 'your game').slice(0, 180);
+    const ownershipTypeRaw = normalizeText(data && data.ownershipType, '').toLowerCase();
+    const ownershipType = ['installed', 'downloaded'].includes(ownershipTypeRaw) ? ownershipTypeRaw : '';
     const addedAt = normalizeTimestampValue(data && data.addedAt);
     const dedupeIdentity = eventKey || contentId;
 
@@ -6850,6 +6854,7 @@ io.on('connection', (socket) => {
         contentId,
         contentName,
         gameTitle,
+        ownershipType,
         addedAt
       });
       respond({ ok: true, created: !!event, duplicate: !event });
