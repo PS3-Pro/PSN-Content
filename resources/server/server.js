@@ -28,7 +28,7 @@ const CHAT_SYNC_INTERVAL_MS = 3000;
 const KEEP_ALIVE_INTERVAL_MS = Math.max(60000, parseInt(process.env.KEEP_ALIVE_INTERVAL_MS || "600000", 10) || 600000);
 const KEEP_ALIVE_TIMEOUT_MS = Math.max(1000, parseInt(process.env.KEEP_ALIVE_TIMEOUT_MS || "10000", 10) || 10000);
 const KEEP_ALIVE_URLS = [
-  "https://psn-content-kjir.onrender.com",
+  "https://psn-content-bgnq.onrender.com",
 ];
 const PROFILE_SYNC_INTERVAL_MS = Math.max(10000, parseInt(process.env.PROFILE_SYNC_INTERVAL_MS || "15000", 10) || 15000);
 const ENABLE_PROFILE_PERIODIC_SYNC = process.env.ENABLE_PROFILE_PERIODIC_SYNC === "1";
@@ -3411,11 +3411,8 @@ function emitChatHistoryToSocket(socket) {
         };
         const onDisconnect = () => finish({ cancelled: true });
         const timer = setTimeout(() => {
-          if (settled) return;
-          settled = true;
-          try { socket.off('disconnect', onDisconnect); } catch (e) {}
-          reject(new Error('Chat history ACK timeout.'));
-        }, 20000);
+          finish({ cancelled: false, ackTimeout: true, response: null });
+        }, 8000);
         try { socket.once('disconnect', onDisconnect); } catch (e) {}
         try {
           socket.emit('chat_history', history, response => {
@@ -3440,6 +3437,10 @@ function emitChatHistoryToSocket(socket) {
       });
       if (result && result.cancelled) {
         logMemoryTrace('chat-history:cancel', `user=${socket.userName || '-'} socket=${socket.id} ms=${Date.now() - startedAt}`);
+        return;
+      }
+      if (result && result.ackTimeout) {
+        logMemoryTrace('chat-history:ack-timeout', `user=${socket.userName || '-'} socket=${socket.id} ms=${Date.now() - startedAt} buffer=${getSocketWriteBufferLength(socket)}`);
         return;
       }
       const rendered = !(result && result.response && result.response.rendered === false);
