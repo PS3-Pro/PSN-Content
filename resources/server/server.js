@@ -4614,6 +4614,7 @@ async function initProfileSyncNotifications() {
 
       if (message.channel === 'user_notification_sync') {
         if (data.event) emitUserNotificationToLocalUser(data.event);
+        if (Array.isArray(data.updatedEvents)) data.updatedEvents.forEach(event => emitUserNotificationUpdatedToLocalUser(event));
         if (data.readState && data.readState.userName) {
           emitUserNotificationReadStateToLocalUser(data.readState.userName, data.readState.lastReadId, data.readState.unreadCount);
         }
@@ -5169,7 +5170,8 @@ function normalizeUserNotificationData(type, rawData = {}) {
     return {
       actor: normalizeUserNotificationName(source.actor),
       messageId: normalizeText(source.messageId, '').slice(0, 100),
-      text: normalizeText(source.text, '').slice(0, 280)
+      text: normalizeText(source.text, '').slice(0, 280),
+      messageDeleted: source.messageDeleted === true
     };
   }
   if (type === 'reaction') {
@@ -5178,7 +5180,8 @@ function normalizeUserNotificationData(type, rawData = {}) {
       messageUser: normalizeUserNotificationName(source.messageUser),
       messageId: normalizeText(source.messageId, '').slice(0, 100),
       emoji: normalizeText(source.emoji, '').slice(0, 24),
-      text: normalizeText(source.text, '').slice(0, 280)
+      text: normalizeText(source.text, '').slice(0, 280),
+      messageDeleted: source.messageDeleted === true
     };
   }
   if (type === 'trophy') {
@@ -5232,6 +5235,14 @@ function emitUserNotificationToLocalUser(event) {
   recipients.forEach(client => client.emit('user_notification_event', safeEvent));
 }
 
+function emitUserNotificationUpdatedToLocalUser(event) {
+  const safeEvent = serializeUserNotificationRow(event);
+  if (!safeEvent) return;
+  const recipients = getSocketsByUserName(safeEvent.user).filter(client => client && client.connected);
+  trackBandwidthPayload('user_notification_updated', safeEvent, recipients.length);
+  recipients.forEach(client => client.emit('user_notification_updated', safeEvent));
+}
+
 function emitUserNotificationReadStateToLocalUser(userName, lastReadId, unreadCount = 0) {
   const name = normalizeUserNotificationName(userName);
   if (!name) return;
@@ -5273,6 +5284,31 @@ async function notifyUserNotificationAcrossInstances(event) {
     await pool.query('SELECT pg_notify($1, $2)', ['user_notification_sync', JSON.stringify({ event: safeEvent, instanceId: INSTANCE_ID })]);
   } catch (err) {
     console.error('[NOTIFICATION SYNC ERROR]:', err);
+  }
+}
+
+async function notifyUserNotificationsUpdatedAcrossInstances(events) {
+  const updatedEvents = (Array.isArray(events) ? events : [events]).map(serializeUserNotificationRow).filter(Boolean);
+  if (!updatedEvents.length) return;
+  try {
+    const batches = [];
+    let batch = [];
+    for (const event of updatedEvents) {
+      const candidate = [...batch, event];
+      const bytes = Buffer.byteLength(JSON.stringify({ updatedEvents: candidate, instanceId: INSTANCE_ID }), 'utf8');
+      if (batch.length && bytes > 7000) {
+        batches.push(batch);
+        batch = [event];
+      } else {
+        batch = candidate;
+      }
+    }
+    if (batch.length) batches.push(batch);
+    for (const updatedBatch of batches) {
+      await pool.query('SELECT pg_notify($1, $2)', ['user_notification_sync', JSON.stringify({ updatedEvents: updatedBatch, instanceId: INSTANCE_ID })]);
+    }
+  } catch (err) {
+    console.error('[NOTIFICATION UPDATE SYNC ERROR]:', err);
   }
 }
 
@@ -5369,6 +5405,80 @@ async function recordUserNotification(userName, type, rawData = {}, options = {}
   } catch (err) {
     console.error('[USER NOTIFICATION INSERT ERROR]:', err && err.message ? err.message : err);
     return null;
+  }
+}
+
+const chatReactionNotificationQueues = new Map();
+
+function runSerializedChatReactionNotificationMutation(key, task) {
+  const safeKey = normalizeText(key, '');
+  if (!safeKey || typeof task !== 'function') return Promise.resolve(null);
+  const previous = chatReactionNotificationQueues.get(safeKey) || Promise.resolve();
+  const run = previous.catch(() => null).then(task);
+  const tail = run.then(() => null, () => null);
+  chatReactionNotificationQueues.set(safeKey, tail);
+  tail.finally(() => {
+    if (chatReactionNotificationQueues.get(safeKey) === tail) chatReactionNotificationQueues.delete(safeKey);
+  });
+  return run;
+}
+
+function getChatReactionNotificationDedupeKey(messageId, messageOwner, actor, emoji) {
+  const id = normalizeText(messageId, '').slice(0, 100);
+  const owner = normalizeUserNotificationName(messageOwner).toLowerCase();
+  const reactingUser = normalizeUserNotificationName(actor).toLowerCase();
+  const reactionEmoji = normalizeText(emoji, '').slice(0, 24);
+  if (!id || !owner || !reactingUser || !reactionEmoji) return '';
+  return `chat-reaction:${id}:${owner}:${reactingUser}:${reactionEmoji}`;
+}
+
+async function removeChatReactionNotification(messageOwner, messageId, actor, emoji) {
+  const owner = normalizeUserNotificationName(messageOwner);
+  const dedupeKey = getChatReactionNotificationDedupeKey(messageId, owner, actor, emoji);
+  if (!owner || !dedupeKey) return false;
+  try {
+    const result = await queryDbWithRetry(
+      `DELETE FROM user_notifications
+       WHERE user_name = $1 AND event_type = 'reaction' AND dedupe_key = $2
+       RETURNING id`,
+      [owner, dedupeKey],
+      { attempts: 2, label: 'REACTION NOTIFICATION REMOVE' }
+    );
+    const row = result.rows[0];
+    if (!row) return false;
+    const notificationId = String(row.id || '');
+    const unreadCount = await getUserNotificationUnreadCount(owner);
+    emitUserNotificationDeletedToLocalUser(owner, notificationId, unreadCount);
+    deferServerTask('REACTION NOTIFICATION REMOVE SYNC', () => notifyUserNotificationDeletedAcrossInstances(owner, notificationId, unreadCount), 0);
+    return true;
+  } catch (err) {
+    console.error('[REACTION NOTIFICATION REMOVE ERROR]:', err && err.message ? err.message : err);
+    return false;
+  }
+}
+
+async function markChatMessageNotificationsDeleted(messageId) {
+  const id = normalizeText(messageId, '').slice(0, 100);
+  if (!id) return 0;
+  try {
+    const result = await queryDbWithRetry(
+      `UPDATE user_notifications
+       SET data = data || jsonb_build_object('messageDeleted', true, 'text', '')
+       WHERE event_type IN ('mention', 'reply', 'reaction')
+         AND data->>'messageId' = $1
+         AND COALESCE(data->>'messageDeleted', 'false') <> 'true'
+       RETURNING id, user_name, event_type, data, created_at`,
+      [id],
+      { attempts: 2, label: 'CHAT NOTIFICATION MESSAGE DELETE' }
+    );
+    const events = result.rows.map(serializeUserNotificationRow).filter(Boolean);
+    if (!events.length) return 0;
+    events.forEach(emitUserNotificationUpdatedToLocalUser);
+    deferServerTask('CHAT NOTIFICATION MESSAGE DELETE SYNC', () => notifyUserNotificationsUpdatedAcrossInstances(events), 0);
+    return events.length;
+  } catch (err) {
+    console.error('[CHAT NOTIFICATION MESSAGE DELETE ERROR]:', err && err.message ? err.message : err);
+    return 0;
   }
 }
 
@@ -8209,6 +8319,7 @@ io.on('connection', (socket) => {
         if (!msg.reactions) msg.reactions = [];
         let react = msg.reactions.find(r => r.emoji === emoji);
         let reactionAdded = false;
+        let reactionRemoved = false;
 
         if (react) {
             if (!Array.isArray(react.users)) react.users = [];
@@ -8216,6 +8327,7 @@ io.on('connection', (socket) => {
             if (idx > -1) {
                 react.users.splice(idx, 1);
                 react.count = Math.max(0, (Number(react.count) || 0) - 1);
+                reactionRemoved = true;
             } else {
                 react.users.push(actor);
                 react.count = Math.max(0, Number(react.count) || 0) + 1;
@@ -8235,17 +8347,22 @@ io.on('connection', (socket) => {
             if (syncChange) emitChatSyncChange(syncChange);
 
             const messageOwner = resolveKnownNotificationUserName(msg.user);
-            if (reactionAdded && messageOwner && messageOwner.toLowerCase() !== actor.toLowerCase()) {
-                deferServerTask('REACTION NOTIFICATION', () => recordUserNotification(messageOwner, 'reaction', {
-                    actor,
-                    messageUser: messageOwner,
-                    messageId,
-                    emoji,
-                    text: getChatNotificationPreview(msg.text || '')
-                }, {
-                    dedupeKey: `chat-reaction:${messageId}:${messageOwner.toLowerCase()}:${actor.toLowerCase()}:${emoji}`,
-                    at: Date.now()
-                }), 0);
+            if (messageOwner && messageOwner.toLowerCase() !== actor.toLowerCase()) {
+                const reactionDedupeKey = getChatReactionNotificationDedupeKey(messageId, messageOwner, actor, emoji);
+                if (reactionAdded) {
+                    deferServerTask('REACTION NOTIFICATION', () => runSerializedChatReactionNotificationMutation(reactionDedupeKey, () => recordUserNotification(messageOwner, 'reaction', {
+                        actor,
+                        messageUser: messageOwner,
+                        messageId,
+                        emoji,
+                        text: getChatNotificationPreview(msg.text || '')
+                    }, {
+                        dedupeKey: reactionDedupeKey,
+                        at: Date.now()
+                    })), 0);
+                } else if (reactionRemoved) {
+                    deferServerTask('REACTION NOTIFICATION REMOVE', () => runSerializedChatReactionNotificationMutation(reactionDedupeKey, () => removeChatReactionNotification(messageOwner, messageId, actor, emoji)), 0);
+                }
             }
         } catch (err) { console.error("Reaction Sync Error:", err); }
     }
@@ -8394,6 +8511,7 @@ io.on('connection', (socket) => {
             const syncChange = await recordChatSyncChangeSafe('delete', String(data.msgId || ''), null);
             io.emit('message_deleted', data.msgId);
             if (syncChange) emitChatSyncChange(syncChange);
+            deferServerTask('CHAT NOTIFICATION MESSAGE DELETE', () => markChatMessageNotificationsDeleted(String(data.msgId || '')), 0);
             if (!isOwner) {
                 await addModerationLog('delete_message', `Deleted message from ${msg.user}`, { msgId: data.msgId, targetUser: msg.user }, socket.userName || 'Moderator');
             }

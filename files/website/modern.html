@@ -2050,6 +2050,15 @@ body.is-admin #btn-toolbar-cmd, body.is-mod #btn-toolbar-cmd { display: flex !im
 .user-notification-item.is-trophy { --notification-accent:#ffcc00; }
 .user-notification-item.is-catalog { --notification-accent:#00bcff; }
 .user-notification-item.is-catalog .user-notification-avatar { border-radius:8px; }
+.user-notification-item.is-message-deleted { --notification-accent:#7f8a9a; opacity:.78; }
+.user-notification-item.is-message-deleted, .user-notification-item.is-message-deleted .user-notification-main, .user-notification-item.is-message-deleted .user-notification-main *, .user-notification-item.is-message-deleted .user-notification-time, .user-notification-item.is-message-deleted .user-notification-avatar-wrap, .user-notification-item.is-message-deleted .user-notification-badge, .user-notification-item.is-message-deleted .user-notification-badge i { cursor:inherit !important; }
+.user-notification-item.is-message-deleted:hover { transform:none; border-color:rgba(255,255,255,.12); box-shadow:none; }
+.user-notification-item.is-message-deleted:hover::before { animation:none; }
+.user-notification-item.is-message-deleted .user-notification-preview { color:rgba(255,255,255,.45); font-style:italic; }
+.user-notification-item.is-message-deleted .user-notification-badge { color:rgba(255,255,255,.58); border-color:rgba(255,255,255,.12); box-shadow:none; }
+.notification-swipe-row.is-content-changing { pointer-events:none; opacity:.48; transform:scale(.994); filter:brightness(.9); transition:opacity .14s ease,transform .14s ease,filter .14s ease; }
+.user-notification-item.notification-content-updated { animation:notificationContentUpdated .46s cubic-bezier(.2,.82,.2,1) both !important; }
+@keyframes notificationContentUpdated { 0%{opacity:.35;transform:translateY(3px) scale(.995);filter:brightness(.9);} 60%{opacity:1;transform:translateY(-1px) scale(1.002);filter:brightness(1.06);} 100%{opacity:1;transform:none;filter:none;} }
 .user-notification-item.is-unread { border-color:color-mix(in srgb,var(--notification-accent) 48%,rgba(255,255,255,.08)); box-shadow:inset 3px 0 0 var(--notification-accent),0 0 18px color-mix(in srgb,var(--notification-accent) 10%,transparent); }
 .user-notification-avatar-wrap { position:relative; width:46px; height:46px; }
 .user-notification-avatar { width:46px; height:46px; display:block; border-radius:50%; object-fit:cover; border:2px solid color-mix(in srgb,var(--notification-accent) 68%,rgba(255,255,255,.16)); background:rgba(255,255,255,.05); box-shadow:0 0 12px color-mix(in srgb,var(--notification-accent) 18%,rgba(0,0,0,.28)); cursor:pointer; }
@@ -48653,7 +48662,7 @@ function getVisibleChatStackEl(id) {
 			socketChat.timeout(2500).emit('presence_ping', { reason, at:now }, (err,response) => { if (err || !response || response.success !== true) socketChat.emit('request_online_list'); });
 		} else socketChat.emit('presence_ping', { reason, at:now }, response => { if (!response || response.success !== true) socketChat.emit('request_online_list'); });
 		if (typeof window.bootstrapFriendActivityRealtime === 'function') window.bootstrapFriendActivityRealtime({ reason, forceFull:false });
-		if (typeof window.bootstrapNotificationCenterRealtime === 'function') window.bootstrapNotificationCenterRealtime({ reason, forceFull:false });
+		if (typeof window.bootstrapNotificationCenterRealtime === 'function') window.bootstrapNotificationCenterRealtime({ reason, forceFull:reason === 'reconnect' });
 		if (typeof bootstrapChatRealtime === 'function') bootstrapChatRealtime(reason);
 		const request = { reason, forceRefresh:false, lazyHydrate:true, sinceProfileUpdatedAt:beforeProfileUpdatedAt };
 		const done = response => {
@@ -50136,7 +50145,7 @@ function getVisibleChatStackEl(id) {
 					if ((localStorage.getItem('psn_username') || '') !== authRealtimePrefetchUser) return;
 					if (!socketChat || !socketChat.connected) return;
 					if (typeof window.bootstrapNotificationCenterRealtime === 'function') {
-						window.bootstrapNotificationCenterRealtime({ reason:'auth-prefetch', forceFull:false });
+						window.bootstrapNotificationCenterRealtime({ reason:'auth-prefetch', forceFull:true });
 					}
 					if (typeof requestChatHistoryNow === 'function') requestChatHistoryNow('auth-prefetch');
 				}, 0);
@@ -50216,7 +50225,7 @@ function getVisibleChatStackEl(id) {
 			}
 			if (typeof window.bootstrapNotificationCenterRealtime === 'function' && !window.__userNotificationRemoteReady && !window.__userNotificationSyncInFlight) {
 				setTimeout(() => {
-					if (!window.__userNotificationRemoteReady && !window.__userNotificationSyncInFlight) window.bootstrapNotificationCenterRealtime({ reason: 'auth-success' });
+					if (!window.__userNotificationRemoteReady && !window.__userNotificationSyncInFlight) window.bootstrapNotificationCenterRealtime({ reason: 'auth-success', forceFull:true });
 				}, 120);
 			}
 
@@ -51279,6 +51288,22 @@ function getVisibleChatStackEl(id) {
 				}
 				if (typeof window.writeUserNotificationCache === 'function') window.writeUserNotificationCache();
 			} catch (err) { console.warn('[NOTIFICATIONS] Could not apply realtime event:', err); }
+		});
+
+		socketChat.on('user_notification_updated', function(rawEvent = {}) {
+			try {
+				const item = normalizeUserNotificationItem(rawEvent);
+				if (!item) return;
+				const index = (Array.isArray(window.userNotificationItems) ? window.userNotificationItems : []).findIndex(function(existing) { return String(existing && existing.id || '') === String(item.id || ''); });
+				if (index < 0) return;
+				window.userNotificationItems[index] = item;
+				if (typeof window.writeUserNotificationCache === 'function') window.writeUserNotificationCache();
+				if (typeof window.isNotificationCenterVisible === 'function' && window.isNotificationCenterVisible() && window.__userNotificationClearBusy !== true) {
+					if (typeof window.applyUserNotificationUpdatedDom === 'function') window.applyUserNotificationUpdatedDom(item);
+				} else if (typeof window.refreshNotificationCenterIndicators === 'function') {
+					window.refreshNotificationCenterIndicators();
+				}
+			} catch (err) { console.warn('[NOTIFICATIONS] Could not apply realtime update:', err); }
 		});
 
 		socketChat.on('user_notification_read_state', function(data = {}) {
@@ -56256,9 +56281,10 @@ function getVisibleChatStackEl(id) {
 
 	function getUserNotificationPresentation(item) {
 		const data = item.data || {};
-		if (item.type === 'reply') return { badgeIcon:'fa-comments', cls:'is-reply', title:'replied to your message', meta:'Global Chat', preview:data.text || '' };
-		if (item.type === 'mention') return { badgeIcon:'fa-comments', cls:'is-mention', title:'mentioned you', meta:'Global Chat', preview:data.text || '' };
-		if (item.type === 'reaction') return { badgeIcon:'fa-comments', cls:'is-reaction', title:'reacted ' + String(data.emoji || '❤') + ' to your message', meta:'Global Chat', preview:data.text || '' };
+		const messageDeleted = data.messageDeleted === true && (item.type === 'reply' || item.type === 'mention' || item.type === 'reaction');
+		if (item.type === 'reply') return { badgeIcon:messageDeleted ? 'fa-comment-slash' : 'fa-comments', cls:'is-reply' + (messageDeleted ? ' is-message-deleted' : ''), title:'replied to your message', meta:'Global Chat', preview:messageDeleted ? 'Message deleted' : (data.text || '') };
+		if (item.type === 'mention') return { badgeIcon:messageDeleted ? 'fa-comment-slash' : 'fa-comments', cls:'is-mention' + (messageDeleted ? ' is-message-deleted' : ''), title:'mentioned you', meta:'Global Chat', preview:messageDeleted ? 'Message deleted' : (data.text || '') };
+		if (item.type === 'reaction') return { badgeIcon:messageDeleted ? 'fa-comment-slash' : 'fa-comments', cls:'is-reaction' + (messageDeleted ? ' is-message-deleted' : ''), title:'reacted ' + String(data.emoji || '❤') + ' to your message', meta:'Global Chat', preview:messageDeleted ? 'Message deleted' : (data.text || '') };
 		if (item.type === 'catalog') {
 			const catalogType = String(data.catalogType || '').toLowerCase();
 			if (CATALOG_EVENT_CONFIGS[catalogType]) {
@@ -56285,8 +56311,9 @@ function getVisibleChatStackEl(id) {
 	window.openUserNotification = function(notificationId) {
 		const item = (Array.isArray(window.userNotificationItems) ? window.userNotificationItems : []).find(function(entry) { return String(entry && entry.id || '') === String(notificationId || ''); });
 		if (!item) return;
-		if (typeof playUiClick === 'function') playUiClick();
 		const data = item.data || {};
+		if ((item.type === 'mention' || item.type === 'reply' || item.type === 'reaction') && data.messageDeleted === true) return;
+		if (typeof playUiClick === 'function') playUiClick();
 		if (item.type === 'mention' || item.type === 'reply' || item.type === 'reaction') {
 			const messageId = String(data.messageId || '');
 			const matchData = { user:String(item.type === 'reaction' ? (data.messageUser || item.user || '') : (data.actor || '')), text:String(data.text || ''), type:'text' };
@@ -56336,7 +56363,7 @@ function getVisibleChatStackEl(id) {
 		const day = realtimeFeedDayLabel(item.createdAt);
 		return '<div class="notification-swipe-row" data-notification-id="' + escapeRealtimeFeedHtml(item.id) + '" data-notification-day="' + escapeRealtimeFeedHtml(day) + '">' +
 			'<div class="notification-swipe-action" aria-hidden="false"><button type="button" class="notification-swipe-delete" data-keyboard-nav="off" title="Delete notification" aria-label="Delete notification"><i class="fas fa-trash-alt"></i><span>Delete</span></button></div>' +
-			'<div class="notification-swipe-content"><div class="user-notification-item ' + p.cls + (isUnread ? ' is-unread' : '') + (extraClass ? ' ' + extraClass : '') + '" style="--tile-idx:' + (index % 30) + '" onmouseenter="if(!this.closest(\'.notification-swipe-row\')?.classList.contains(\'is-open\') && !this.closest(\'.notification-swipe-row\')?.classList.contains(\'is-swiping\') && typeof playUiHover===\'function\') playUiHover()">' +
+			'<div class="notification-swipe-content"><div class="user-notification-item ' + p.cls + (isUnread ? ' is-unread' : '') + (extraClass ? ' ' + extraClass : '') + '" style="--tile-idx:' + (index % 30) + '" onmouseenter="if(!this.classList.contains(\'is-message-deleted\') && !this.closest(\'.notification-swipe-row\')?.classList.contains(\'is-open\') && !this.closest(\'.notification-swipe-row\')?.classList.contains(\'is-swiping\') && typeof playUiHover===\'function\') playUiHover()">' +
 			'<div class="user-notification-avatar-wrap"><img class="user-notification-avatar" src="' + escapeRealtimeFeedHtml(avatar) + '" alt=""' + avatarAction + '><span class="user-notification-badge"><i class="fas ' + p.badgeIcon + '"></i></span></div>' +
 			'<div class="user-notification-main"><div class="user-notification-title">' + titleHtml + '</div>' + (p.preview ? '<div class="user-notification-preview">' + escapeRealtimeFeedHtml(p.preview) + '</div>' : '') + '<div class="user-notification-meta"><span>' + escapeRealtimeFeedHtml(p.meta) + '</span></div></div>' +
 			'<div class="user-notification-time" title="' + escapeRealtimeFeedHtml(new Date(item.createdAt).toLocaleString()) + '">' + escapeRealtimeFeedHtml(realtimeFeedTimeLabel(item.createdAt)) + '</div>' + (isUnread ? '<span class="user-notification-unread-dot"></span>' : '') + '</div></div></div>';
@@ -56396,6 +56423,26 @@ function getVisibleChatStackEl(id) {
 		syncNotificationSwipeListState();
 		window.refreshNotificationCenterIndicators();
 		scheduleNotificationSwipeHint();
+		return true;
+	};
+
+	window.applyUserNotificationUpdatedDom = function(rawItem) {
+		const item = normalizeUserNotificationItem(rawItem);
+		const list = document.getElementById('notification-center-list');
+		if (!item || !list || !window.isNotificationCenterVisible()) return false;
+		const row = list.querySelector('.notification-swipe-row[data-notification-id="' + CSS.escape(String(item.id || '')) + '"]');
+		if (!row || row.classList.contains('is-removing')) return false;
+		closeNotificationSwipeRow(row, false);
+		row.classList.add('is-content-changing');
+		setTimeout(function() {
+			if (!row.isConnected) return;
+			row.insertAdjacentHTML('afterend', buildUserNotificationRowHtml(item, 0, 'notification-content-updated'));
+			row.remove();
+			cleanupUserNotificationDayHeaders(list);
+			updateUserNotificationChrome();
+			syncNotificationSwipeListState();
+			window.refreshNotificationCenterIndicators();
+		}, 140);
 		return true;
 	};
 
