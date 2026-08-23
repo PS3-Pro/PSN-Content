@@ -58,8 +58,8 @@ const PG_STATEMENT_TIMEOUT_MS = Math.max(5000, parseInt(process.env.PG_STATEMENT
 const PG_MAX_USES = Math.max(0, parseInt(process.env.PG_MAX_USES || "0", 10) || 0);
 const ONLINE_LIST_CACHE_MS = Math.max(250, parseInt(process.env.ONLINE_LIST_CACHE_MS || "1200", 10) || 1200);
 const ONLINE_LIST_UNCHANGED_SKIP_ENABLED = process.env.ONLINE_LIST_SKIP_UNCHANGED !== "0";
-const FRIEND_ACTIVITY_MAX_PER_USER = 500;
-const USER_NOTIFICATION_MAX_PER_USER = 500;
+// Shared server-side retention/feed cap. Rendering batches are client-side only.
+const SOCIAL_HISTORY_MAX = 500;
 
 const pgConnectionOptions = {
   connectionString: process.env.DATABASE_URL,
@@ -1076,7 +1076,7 @@ async function initDb() {
          SELECT id, ROW_NUMBER() OVER (PARTITION BY actor_name ORDER BY id DESC) AS row_num
          FROM friend_activity
        ) ranked
-       WHERE row_num > ${FRIEND_ACTIVITY_MAX_PER_USER}
+       WHERE row_num > ${SOCIAL_HISTORY_MAX}
      )`,
     [],
     { attempts: 2, label: 'FRIEND ACTIVITY RETENTION' }
@@ -1089,7 +1089,7 @@ async function initDb() {
          SELECT id, ROW_NUMBER() OVER (PARTITION BY user_name ORDER BY id DESC) AS row_num
          FROM user_notifications
        ) ranked
-       WHERE row_num > ${USER_NOTIFICATION_MAX_PER_USER}
+       WHERE row_num > ${SOCIAL_HISTORY_MAX}
      )`,
     [],
     { attempts: 2, label: 'USER NOTIFICATION RETENTION' }
@@ -4792,7 +4792,6 @@ async function initProfileSyncNotifications() {
 }
 
 const FRIEND_ACTIVITY_TYPES = new Set(['online', 'offline', 'playing', 'played', 'xmb', 'trophy', 'download', 'wishlist', 'favorite', 'cheat']);
-const FRIEND_ACTIVITY_READ_LIMIT = FRIEND_ACTIVITY_MAX_PER_USER;
 const FRIEND_ACTIVITY_REPLACED_IDS_LIMIT = 60;
 const FRIEND_ACTIVITY_ROOM_PREFIX = 'friend-activity:';
 
@@ -5000,7 +4999,7 @@ async function recordFriendActivity(actorName, type, rawData = {}, options = {})
              OFFSET $2
              LIMIT 1
            ), 0)`,
-        [actor, FRIEND_ACTIVITY_MAX_PER_USER - 1],
+        [actor, SOCIAL_HISTORY_MAX - 1],
         { attempts: 2, label: 'FRIEND ACTIVITY RETENTION' }
       );
     }, 0);
@@ -5036,7 +5035,7 @@ async function recordAggregatedFriendActivity(actorName, type, rawData = {}, opt
          WHERE actor_name = $1 AND event_type = $2
          ORDER BY id DESC
          LIMIT $3`,
-        [actor, eventType, FRIEND_ACTIVITY_MAX_PER_USER]
+        [actor, eventType, SOCIAL_HISTORY_MAX]
       );
       const groupWindowMs = Math.max(0, Number(options.groupWindowMs) || 0);
       const matching = existingResult.rows
@@ -5091,7 +5090,7 @@ async function recordAggregatedFriendActivity(actorName, type, rawData = {}, opt
            OFFSET $2
            LIMIT 1
          ), 0)`,
-      [actor, FRIEND_ACTIVITY_MAX_PER_USER - 1],
+      [actor, SOCIAL_HISTORY_MAX - 1],
       { attempts: 2, label: 'FRIEND ACTIVITY RETENTION' }
     );
   }, 0);
@@ -5131,22 +5130,21 @@ async function setFriendActivityReadId(userName, lastReadId) {
   return Math.max(0, Number(result.rows[0] && result.rows[0].last_read_id) || safeId);
 }
 
-async function getFriendActivityHistoryForUser(userName, limit = FRIEND_ACTIVITY_READ_LIMIT, afterId = 0, resolvedFriendNames = null) {
+async function getFriendActivityHistoryForUser(userName, afterId = 0, resolvedFriendNames = null) {
   const friendNames = Array.isArray(resolvedFriendNames)
     ? extractFriendActivityNames(resolvedFriendNames)
     : extractFriendActivityNames(await getUserDataPayloadFromDb(userName, 'friends'));
-  const safeLimit = Math.max(1, Math.min(FRIEND_ACTIVITY_READ_LIMIT, Number(limit) || FRIEND_ACTIVITY_READ_LIMIT));
   const safeAfterId = Math.max(0, Math.floor(Number(afterId) || 0));
   if (!friendNames.length) return { friendNames, items: [], lastReadId: await getFriendActivityReadId(userName), delta: safeAfterId > 0 };
   const result = safeAfterId > 0
     ? await queryDbWithRetry(
         'SELECT id, actor_name, event_type, data, created_at FROM friend_activity WHERE actor_name = ANY($1::text[]) AND id > $2 ORDER BY id DESC LIMIT $3',
-        [friendNames, safeAfterId, safeLimit],
+        [friendNames, safeAfterId, SOCIAL_HISTORY_MAX],
         { attempts: 2, label: 'FRIEND ACTIVITY DELTA' }
       )
     : await queryDbWithRetry(
         'SELECT id, actor_name, event_type, data, created_at FROM friend_activity WHERE actor_name = ANY($1::text[]) ORDER BY id DESC LIMIT $2',
-        [friendNames, safeLimit],
+        [friendNames, SOCIAL_HISTORY_MAX],
         { attempts: 2, label: 'FRIEND ACTIVITY READ' }
       );
   const lastReadId = await getFriendActivityReadId(userName);
@@ -5154,7 +5152,6 @@ async function getFriendActivityHistoryForUser(userName, limit = FRIEND_ACTIVITY
 }
 
 const USER_NOTIFICATION_TYPES = new Set(['mention', 'reply', 'reaction', 'trophy', 'catalog']);
-const USER_NOTIFICATION_READ_LIMIT = USER_NOTIFICATION_MAX_PER_USER;
 
 function normalizeUserNotificationName(value) {
   return normalizeText(value, '').slice(0, 80);
@@ -5367,7 +5364,7 @@ async function publishStoredUserNotification(row) {
            OFFSET $2
            LIMIT 1
          ), 0)`,
-      [user, USER_NOTIFICATION_MAX_PER_USER - 1],
+      [user, SOCIAL_HISTORY_MAX - 1],
       { attempts: 2, label: 'USER NOTIFICATION RETENTION' }
     );
   }, 0);
@@ -5578,20 +5575,19 @@ async function clearUserNotifications(userName, throughId = 0) {
   return { deletedCount: Math.max(0, Number(result.rowCount) || 0), throughId: safeThroughId, unreadCount };
 }
 
-async function getUserNotificationHistory(userName, limit = USER_NOTIFICATION_READ_LIMIT, afterId = 0) {
+async function getUserNotificationHistory(userName, afterId = 0) {
   const name = normalizeUserNotificationName(userName);
-  const safeLimit = Math.max(1, Math.min(USER_NOTIFICATION_READ_LIMIT, Number(limit) || USER_NOTIFICATION_READ_LIMIT));
   const safeAfterId = Math.max(0, Math.floor(Number(afterId) || 0));
   if (!name) return { items: [], lastReadId: 0, unreadCount: 0, delta: safeAfterId > 0 };
   const result = safeAfterId > 0
     ? await queryDbWithRetry(
-        'SELECT id, user_name, event_type, data, created_at FROM user_notifications WHERE user_name = $1 AND id > $2 ORDER BY id DESC LIMIT $3',
-        [name, safeAfterId, safeLimit],
+        'SELECT id, user_name, event_type, data, created_at FROM user_notifications WHERE user_name = $1 AND id > $2 ORDER BY id DESC',
+        [name, safeAfterId],
         { attempts: 2, label: 'USER NOTIFICATION DELTA' }
       )
     : await queryDbWithRetry(
-        'SELECT id, user_name, event_type, data, created_at FROM user_notifications WHERE user_name = $1 ORDER BY id DESC LIMIT $2',
-        [name, safeLimit],
+        'SELECT id, user_name, event_type, data, created_at FROM user_notifications WHERE user_name = $1 ORDER BY id DESC',
+        [name],
         { attempts: 2, label: 'USER NOTIFICATION READ' }
       );
   const lastReadId = await getUserNotificationReadId(name);
@@ -7096,7 +7092,7 @@ io.on('connection', (socket) => {
     const name = socket.userName;
     if (!name || !userDatabase[name]) { respond({ ok: false, items: [], unreadCount: 0, error: 'Profile is not available.' }); return; }
     try {
-      const result = await getUserNotificationHistory(name, data && data.limit, data && data.afterId);
+      const result = await getUserNotificationHistory(name, data && data.afterId);
       respond({
         ok: true,
         items: result.items,
@@ -7169,7 +7165,7 @@ io.on('connection', (socket) => {
       const friendNames = extractFriendActivityNames(await getUserDataPayloadFromDb(name, 'friends'));
       if (!socket.connected || socket.__friendActivityRequestToken !== requestToken) return;
       setFriendActivitySubscription(socket, friendNames);
-      const result = await getFriendActivityHistoryForUser(name, data && data.limit, data && data.afterId, friendNames);
+      const result = await getFriendActivityHistoryForUser(name, data && data.afterId, friendNames);
       if (!socket.connected || socket.__friendActivityRequestToken !== requestToken) return;
       respond({
         ok: true,
