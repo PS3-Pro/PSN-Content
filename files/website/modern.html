@@ -862,7 +862,9 @@ select option { background-color: var(--bg-dark); }
 #card-playing .profile-playing-time-pill:hover { transform:translateY(1px) scale(1.045) !important; background:#fff !important; border-color:rgba(0,188,255,.9) !important; box-shadow:0 2px 8px rgba(0,0,0,.22),0 0 14px rgba(0,188,255,.38),inset 0 1px 0 #fff !important; filter:brightness(1.03); }
 #card-playing .profile-playing-time-pill i { transition:color .24s ease,transform .24s cubic-bezier(.2,.8,.2,1); }
 #card-playing .profile-playing-time-pill:hover i { color:#0070cc; transform:scale(1.08) rotate(-8deg); }
-#modal-sys-list .sys-modal-content { max-width: 650px !important; width: 95%; }
+#modal-sys-list { transition: opacity .36s cubic-bezier(.16,.84,.28,1); }
+#modal-sys-list .sys-modal-content { max-width: 650px !important; width: 95%; transition: transform .38s cubic-bezier(.16,.84,.28,1); }
+#modal-sys-list.profile-list-restoring.show>.sys-modal-content>.sys-modal-header, #modal-sys-list.profile-list-restoring.show>.sys-modal-content>.sys-modal-body>* { animation: none !important; }
 #modal-sys-list .sys-modal-header { gap: 12px; }
 #modal-sys-list #list-modal-title { flex: 1 1 auto; min-width: 0; max-width: 100%; display: flex; align-items: center; gap: 10px; line-height: 1.1; }
 #modal-sys-list #list-modal-title>i { flex: 0 0 auto; }
@@ -19212,11 +19214,13 @@ P
 					}
 		
 					setTimeout(() => {
-						if (typeof openPlayerList === 'function') {
+						const restoredExistingList = typeof window.restoreExistingProfileListModal === 'function'
+							&& window.restoreExistingProfileListModal(username, listType, savedListScroll);
+						if (!restoredExistingList && typeof openPlayerList === 'function') {
 							window.pendingProfileListScroll = savedListScroll || 0;
 							openPlayerList(listType);
 						}
-					}, 100);
+					}, 390);
 				}
 			}, 150);
 		
@@ -58230,6 +58234,39 @@ function getVisibleChatStackEl(id) {
 				searchGameOnSite(realId, returnPath, safeCategory, null, contentId);
 			}
 		};
+
+	window.restoreExistingProfileListModal = function(targetUser, listType, savedScroll) {
+		const modal = document.getElementById('modal-sys-list');
+		const body = document.getElementById('list-modal-body');
+		if (!modal || !body) return false;
+		if (String(modal.dataset.profileTarget || '') !== String(targetUser || '')) return false;
+		if (String(modal.dataset.profileListType || '') !== String(listType || '')) return false;
+		if (!body.innerHTML || body.querySelector('.profile-ps-list-loader')) return false;
+
+		window.cancelProfileListResize(body);
+		modal.dataset.profileListReady = '1';
+
+		const targetScroll = Math.max(0, Number(savedScroll) || 0);
+		const previousBehavior = body.style.scrollBehavior;
+		body.style.scrollBehavior = 'auto';
+		body.scrollTop = targetScroll;
+
+		modal.classList.remove('show');
+		modal.classList.add('profile-list-restoring');
+		modal.style.display = 'flex';
+		void modal.offsetWidth;
+
+		requestAnimationFrame(() => {
+			body.scrollTop = targetScroll;
+			requestAnimationFrame(() => {
+				modal.classList.add('show');
+				body.scrollTop = targetScroll;
+				body.style.scrollBehavior = previousBehavior || 'smooth';
+				if (typeof body.__profileListBatchScrollHandler === 'function') body.__profileListBatchScrollHandler();
+			});
+		});
+		return true;
+	};
 		
 	
 	window.getPlayerListMeta = function(listType) {
@@ -58463,6 +58500,8 @@ function getVisibleChatStackEl(id) {
 	};
 
 	window.openPlayerList = function(listType) {
+		const freshListModal = document.getElementById('modal-sys-list');
+		if (freshListModal) freshListModal.classList.remove('profile-list-restoring');
 		if (typeof playUiClick === 'function') playUiClick();
 		if (typeof window.closeMobileSidebarIfOpen === 'function') window.closeMobileSidebarIfOpen();
 		

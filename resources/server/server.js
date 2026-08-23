@@ -1872,6 +1872,26 @@ function getProfileNotificationStatePayloadServer(user = {}) {
   return normalizeProfileNotificationStateServer(user.notificationState);
 }
 
+const profileNotificationMutationQueues = new Map();
+
+function runSerializedProfileNotificationMutation(name, task) {
+  const safeName = normalizeText(name, '');
+  if (!safeName || typeof task !== 'function') return Promise.resolve(null);
+
+  const previous = profileNotificationMutationQueues.get(safeName) || Promise.resolve();
+  const run = previous.catch(() => null).then(task);
+  const tail = run.then(() => null, () => null);
+  profileNotificationMutationQueues.set(safeName, tail);
+
+  tail.finally(() => {
+    if (profileNotificationMutationQueues.get(safeName) === tail) {
+      profileNotificationMutationQueues.delete(safeName);
+    }
+  });
+
+  return run;
+}
+
 async function updateProfileNotificationCategoryInDb(name, category, patch = {}) {
   if (!name || !PROFILE_NOTIFICATION_CATEGORIES.has(category)) return null;
   const mutationId = normalizeText(patch.mutationId, '').slice(0, 96);
@@ -6590,7 +6610,10 @@ io.on('connection', (socket) => {
 
     let savedState;
     try {
-      savedState = await updateProfileNotificationCategoryInDb(name, category, categoryPatch);
+      savedState = await runSerializedProfileNotificationMutation(
+        name,
+        () => updateProfileNotificationCategoryInDb(name, category, categoryPatch)
+      );
       if (!savedState) { respond({ ok: false, error: 'Notification state could not be saved.' }); return; }
     } catch (err) {
       console.error(`[PROFILE NOTIFICATION STATE ERROR] ${name}:`, err);
