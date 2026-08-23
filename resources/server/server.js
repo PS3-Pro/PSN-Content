@@ -58,8 +58,8 @@ const PG_STATEMENT_TIMEOUT_MS = Math.max(5000, parseInt(process.env.PG_STATEMENT
 const PG_MAX_USES = Math.max(0, parseInt(process.env.PG_MAX_USES || "0", 10) || 0);
 const ONLINE_LIST_CACHE_MS = Math.max(250, parseInt(process.env.ONLINE_LIST_CACHE_MS || "1200", 10) || 1200);
 const ONLINE_LIST_UNCHANGED_SKIP_ENABLED = process.env.ONLINE_LIST_SKIP_UNCHANGED !== "0";
-const FRIEND_ACTIVITY_MAX_PER_USER = 200;
-const USER_NOTIFICATION_MAX_PER_USER = 200;
+const FRIEND_ACTIVITY_MAX_PER_USER = 500;
+const USER_NOTIFICATION_MAX_PER_USER = 500;
 
 const pgConnectionOptions = {
   connectionString: process.env.DATABASE_URL,

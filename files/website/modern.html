@@ -45080,11 +45080,12 @@ function getVisibleChatStackEl(id) {
 							targetIndex,
 							manualJumpGuardMs: options.manualJumpGuardMs,
 							anchorLockMs: options.anchorLockMs,
+							skipNavigationSound: options.skipNavigationSound,
 							instant: true
 						});
 					} else if (targetIndex < currentStart && typeof loadOlderChatMessages === 'function') {
 						loadOlderChatMessages('jump-to-message', { targetIndex: Math.max(0, targetIndex - 2) }).then(() => {
-							scrollToMessage(msgId, { skipMissingRender: true, skipManualJumpGuard: true, targetIndex, instant: true });
+							scrollToMessage(msgId, { skipMissingRender: true, skipManualJumpGuard: true, targetIndex, skipNavigationSound: options.skipNavigationSound, instant: true });
 						});
 					}
 				});
@@ -45092,7 +45093,7 @@ function getVisibleChatStackEl(id) {
 			}
 			if (targetIndex > -1 && targetIndex < currentStart && typeof loadOlderChatMessages === 'function') {
 				loadOlderChatMessages('jump-to-message', { targetIndex: Math.max(0, targetIndex - 2) }).then(() => {
-					scrollToMessage(msgId, { skipMissingRender: true, skipManualJumpGuard: true, targetIndex, instant: true });
+					scrollToMessage(msgId, { skipMissingRender: true, skipManualJumpGuard: true, targetIndex, skipNavigationSound: options.skipNavigationSound, instant: true });
 				});
 				return true;
 			}
@@ -45102,7 +45103,7 @@ function getVisibleChatStackEl(id) {
 		const bubble = target.querySelector('.msg-bubble');
 		if (!bubble) return false;
 	
-		if (typeof playUiClick === 'function') playUiClick();
+		if (options.skipNavigationSound !== true && typeof playUiClick === 'function') playUiClick();
 	
 		const chatBox = document.getElementById('chat-messages');
 		if (chatBox && chatBox.contains(target)) {
@@ -56431,6 +56432,16 @@ function getVisibleChatStackEl(id) {
 		if (typeof showChatHistoryLoading === 'function' && openedChatBox && !openedChatBox.querySelector('#chat-history-loading')) {
 			showChatHistoryLoading('Preparing messages', true);
 		}
+		// Keep notification jumps visually intentional even when the target is already ready.
+		// Count only the time the Preparing screen is actually visible, not the hidden pre-open setup.
+		const preparingVisibleAt = typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now();
+		const minimumPreparingVisibleMs = 900;
+		const waitForMinimumPreparing = async function() {
+			const now = typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now();
+			const remaining = minimumPreparingVisibleMs - Math.max(0, now - preparingVisibleAt);
+			if (remaining > 0) await wait(remaining);
+			return isCurrentJump();
+		};
 
 		const getTargetIndex = function() {
 			return typeof getChatMessageIndexById === 'function' ? getChatMessageIndexById(messageId, matchData) : -1;
@@ -56447,11 +56458,12 @@ function getVisibleChatStackEl(id) {
 				try { await active; } catch (err) {}
 			}
 		};
-		const beginNotificationJumpScreenFade = function() {
+		const beginNotificationJumpScreenFade = async function() {
+			if (!await waitForMinimumPreparing()) return null;
 			const box = document.getElementById('chat-messages');
 			return typeof beginChatPreparingScreenFade === 'function'
 				? beginChatPreparingScreenFade(box, isCurrentJump)
-				: Promise.resolve(box);
+				: box;
 		};
 		const revealNotificationJumpScreen = function(box) {
 			return typeof revealChatPreparingScreen === 'function'
@@ -56467,7 +56479,7 @@ function getVisibleChatStackEl(id) {
 			}
 			const history = Array.isArray(window.messageHistory) ? window.messageHistory : [];
 			if (history.length && typeof renderChatWindowAroundIndex === 'function') {
-				await renderChatWindowAroundIndex(history.length - 1, { showLoading:false, animateMessages:false, align:'end' });
+				await renderChatWindowAroundIndex(history.length - 1, { showLoading:false, animateMessages:false, align:'end', scrollToBottom:true });
 			} else {
 				box = document.getElementById('chat-messages');
 				if (box && box.querySelector('#chat-history-loading')) box.innerHTML = '';
@@ -56600,6 +56612,7 @@ function getVisibleChatStackEl(id) {
 				skipMissingRender: true,
 				manualJumpGuardMs: 4200,
 				anchorLockMs: 4200,
+				skipNavigationSound: true,
 				instant: true
 			});
 		}
