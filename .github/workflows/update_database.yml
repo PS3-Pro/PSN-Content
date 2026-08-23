@@ -16,11 +16,11 @@ jobs:
         uses: actions/setup-python@v4
         with:
           python-version: '3.x'
-
       - name: Sync NPS and Detect Changes
         run: |
           BASE_DIR="resources/database/content/official"
           LATEST_DIR="resources/database/content/latest"
+          DLC_EVENTS_DIR="resources/database/content/events/dlcs"
           PY_SCRIPT=".github/scripts/generate_latest_releases.py"
 
           clean_tsv() {
@@ -31,7 +31,6 @@ jobs:
                 gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
                 return value
               }
-
               NR == 1 {
                 print
                 next
@@ -50,9 +49,9 @@ jobs:
               }
             ' "$1" > "$2"
           }
-
           mkdir -p "$BASE_DIR/pending"
           mkdir -p "$LATEST_DIR"
+          mkdir -p "$DLC_EVENTS_DIR"
 
           categories=("games" "avatars" "demos" "dlcs" "themes")
 
@@ -64,19 +63,17 @@ jobs:
 
             clean_tsv "nps_raw.tsv" "nps_clean.tsv"
 
-            python "$PY_SCRIPT" "$BASE_DIR/${cat}.tsv" "nps_clean.tsv" "$LATEST_DIR/latest_${cat}.tsv"
-
+            python "$PY_SCRIPT" "$BASE_DIR/${cat}.tsv" "nps_clean.tsv" "$LATEST_DIR/latest_${cat}.tsv" "$DLC_EVENTS_DIR" "$cat" "official"
             mv "nps_clean.tsv" "$BASE_DIR/${cat}.tsv"
             rm "nps_raw.tsv"
 
             curl -L "https://nopaystation.com/tsv/pending/PS3_${cat^^}.tsv" -o "p_raw.tsv"
             clean_tsv "p_raw.tsv" "p_clean.tsv"
 
-            python "$PY_SCRIPT" "$BASE_DIR/pending/${cat}.tsv" "p_clean.tsv" "$LATEST_DIR/latest_${cat}.tsv"
+            python "$PY_SCRIPT" "$BASE_DIR/pending/${cat}.tsv" "p_clean.tsv" "$LATEST_DIR/latest_${cat}.tsv" "$DLC_EVENTS_DIR" "$cat" "pending"
             mv "p_clean.tsv" "$BASE_DIR/pending/${cat}.tsv"
             rm "p_raw.tsv"
           done
-
       - name: Commit and Push changes
         run: |
           git config --global user.name "PS3-Pro Bot"
@@ -85,6 +82,7 @@ jobs:
           git add resources/database/content/official/*.tsv
           git add resources/database/content/official/pending/*.tsv
           git add resources/database/content/latest/*.tsv
+          git add resources/database/content/events/dlcs
 
           git diff-index --quiet HEAD || git commit -m "Auto-update: Synchronized with NoPayStation (Official & Pending)"
           git push

@@ -1,17 +1,13 @@
 import datetime
+import json
 import os
+import re
 import sys
 
-
-UNRESOLVED_NAMES = {"", "MISSING", "UNKNOWN TITLE"}
-
-
-def normalize_name(name):
-    return name.strip().upper()
-
-
-def has_resolved_name(name):
-    return normalize_name(name) not in UNRESOLVED_NAMES
+LATEST_LIMIT = 50
+EVENT_SCHEMA_VERSION = 1
+EVENT_INDEX_NAME = "index.json"
+EVENT_SEEN_NAME = ".seen_ids.txt"
 
 
 def is_valid_item(parts):
@@ -25,118 +21,21 @@ def is_valid_item(parts):
     return (
         bool(title_id)
         and bool(name)
-        and normalize_name(name) != "MISSING"
+        and name.upper() != "MISSING"
         and bool(pkg_url)
         and pkg_url.upper() != "MISSING"
     )
 
 
-def get_content_id(parts):
-    if len(parts) > 5:
-        content_id = parts[5].strip()
-
-        if content_id:
-            return content_id
-
-    return None
-
-
 def get_item_id(parts):
-    content_id = get_content_id(parts)
-
-    if content_id:
-        return content_id
-
-    if parts:
-        title_id = parts[0].strip()
-
-        if title_id:
-            return title_id
-
-    return None
+    if len(parts) > 5:
+        value = parts[5].strip()
+        if value and value.upper() != "MISSING":
+            return value
+    return parts[0].strip() if parts else None
 
 
-def get_reference_paths(old_path, new_path):
-    old_path = os.path.normpath(old_path)
-    parent_dir = os.path.dirname(old_path)
-    filename = os.path.basename(old_path)
-
-    if os.path.basename(parent_dir).lower() == "pending":
-        official_path = os.path.join(
-            os.path.dirname(parent_dir),
-            filename,
-        )
-
-        return [
-            official_path,
-            new_path,
-            old_path,
-        ]
-
-    pending_path = os.path.join(
-        parent_dir,
-        "pending",
-        filename,
-    )
-
-    return [
-        new_path,
-        old_path,
-        pending_path,
-    ]
-
-
-def build_name_lookup(paths):
-    name_lookup = {}
-
-    for path in paths:
-        if not path or not os.path.exists(path):
-            continue
-
-        with open(path, "r", encoding="utf-8") as file:
-            lines = file.readlines()
-
-        for line in lines[1:]:
-            parts = line.rstrip("\r\n").split("\t")
-            content_id = get_content_id(parts)
-
-            if not content_id or len(parts) <= 2:
-                continue
-
-            name = parts[2].strip()
-
-            if (
-                has_resolved_name(name)
-                and content_id not in name_lookup
-            ):
-                name_lookup[content_id] = name
-
-    return name_lookup
-
-
-def resolve_item_name(parts, name_lookup):
-    if len(parts) <= 2:
-        return parts
-
-    current_name = parts[2].strip()
-
-    if has_resolved_name(current_name):
-        return parts
-
-    content_id = get_content_id(parts)
-
-    if not content_id:
-        return parts
-
-    resolved_name = name_lookup.get(content_id)
-
-    if resolved_name:
-        parts[2] = resolved_name
-
-    return parts
-
-
-def read_valid_latest_items(latest_path, name_lookup):
+def read_valid_latest_items(latest_path):
     if not os.path.exists(latest_path):
         return []
 
@@ -144,81 +43,251 @@ def read_valid_latest_items(latest_path, name_lookup):
         lines = file.readlines()
 
     valid_items = []
-
     for line in lines[1:]:
         parts = line.rstrip("\r\n").split("\t")
-        resolve_item_name(parts, name_lookup)
-
         if is_valid_item(parts):
-            valid_items.append(parts)
+            valid_items.append(line if line.endswith("\n") else line + "\n")
 
     return valid_items
 
 
-def merge_without_duplicates(items):
-    merged = []
-    positions = {}
+def utc_now():
+    return datetime.datetime.now(datetime.timezone.utc)
 
-    for parts in items:
-        item_id = get_item_id(parts)
 
-        if not item_id:
-            merged.append(parts)
+def normalize_event_key(parts):
+    content_id = parts[5].strip().upper() if len(parts) > 5 and parts[5].strip().upper() != "MISSING" else ""
+    if content_id:
+        return content_id
+
+    title_id = parts[0].strip().upper() if parts else ""
+    name = parts[2].strip().casefold() if len(parts) > 2 else ""
+    return f"{title_id}|{name}".strip("|")
+
+
+def parse_legacy_added_at(value, fallback_ms):
+    text = str(value or "").strip()
+    if not text:
+        return fallback_ms
+
+    for fmt in ("%b %d, %Y", "%Y-%m-%d", "%Y-%m-%dT%H:%M:%S%z"):
+        try:
+            parsed = datetime.datetime.strptime(text, fmt)
+            if parsed.tzinfo is None:
+                # Old Recently Added rows only stored a date. Noon UTC avoids timezone-edge shifts.
+                parsed = parsed.replace(hour=12, tzinfo=datetime.timezone.utc)
+            return int(parsed.timestamp() * 1000)
+        except ValueError:
             continue
 
-        if item_id not in positions:
-            positions[item_id] = len(merged)
-            merged.append(parts)
+    return fallback_ms
+
+
+def build_dlc_event(parts, added_at_ms, source):
+    if not is_valid_item(parts):
+        return None
+
+    key = normalize_event_key(parts)
+    if not key:
+        return None
+
+    title_id = parts[0].strip().upper()
+    region = parts[1].strip() if len(parts) > 1 else ""
+    name = parts[2].strip() if len(parts) > 2 else ""
+    content_id = parts[5].strip() if len(parts) > 5 and parts[5].strip().upper() != "MISSING" else ""
+
+    return {
+        "key": key,
+        "type": "dlc",
+        "titleId": title_id,
+        "contentId": content_id,
+        "name": name,
+        "region": region,
+        "addedAt": int(added_at_ms),
+        "source": str(source or "").strip().lower() or "unknown",
+    }
+
+
+def read_json(path, default):
+    try:
+        with open(path, "r", encoding="utf-8") as file:
+            value = json.load(file)
+        return value
+    except (OSError, ValueError, TypeError):
+        return default
+
+
+def write_json(path, value):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="\n") as file:
+        json.dump(value, file, ensure_ascii=False, indent=2, sort_keys=False)
+        file.write("\n")
+
+
+def get_event_month(added_at_ms):
+    stamp = max(0, int(added_at_ms or 0)) / 1000.0
+    return datetime.datetime.fromtimestamp(stamp, tz=datetime.timezone.utc).strftime("%Y-%m")
+
+
+def iter_event_month_files(events_dir):
+    if not os.path.isdir(events_dir):
+        return []
+    files = []
+    for name in os.listdir(events_dir):
+        if re.fullmatch(r"\d{4}-\d{2}\.json", name):
+            files.append(os.path.join(events_dir, name))
+    return sorted(files)
+
+
+def load_seen_event_keys(events_dir):
+    seen_path = os.path.join(events_dir, EVENT_SEEN_NAME)
+    if os.path.exists(seen_path):
+        with open(seen_path, "r", encoding="utf-8") as file:
+            return {line.strip().upper() for line in file if line.strip()}
+
+    # First migration: reconstruct the dedupe set from any existing monthly shards.
+    seen = set()
+    for path in iter_event_month_files(events_dir):
+        payload = read_json(path, {})
+        for event in payload.get("events", []) if isinstance(payload, dict) else []:
+            key = str(event.get("key", "")).strip().upper()
+            if key:
+                seen.add(key)
+    return seen
+
+
+def write_seen_event_keys(events_dir, seen):
+    os.makedirs(events_dir, exist_ok=True)
+    path = os.path.join(events_dir, EVENT_SEEN_NAME)
+    with open(path, "w", encoding="utf-8", newline="\n") as file:
+        for key in sorted({str(value).strip().upper() for value in seen if str(value).strip()}):
+            file.write(key + "\n")
+
+
+def rebuild_event_index(events_dir, updated_at_ms, tracking_started_at_ms=0):
+    index_path = os.path.join(events_dir, EVENT_INDEX_NAME)
+    previous_index = read_json(index_path, {})
+    previous_tracking_started_at = int(previous_index.get("trackingStartedAt", 0) or 0) if isinstance(previous_index, dict) else 0
+    tracking_started_at = previous_tracking_started_at or max(0, int(tracking_started_at_ms or 0)) or max(0, int(updated_at_ms or 0))
+    months = []
+    latest_event_at = 0
+
+    for path in iter_event_month_files(events_dir):
+        payload = read_json(path, {})
+        events = payload.get("events", []) if isinstance(payload, dict) else []
+        valid_times = [int(event.get("addedAt", 0) or 0) for event in events if isinstance(event, dict) and int(event.get("addedAt", 0) or 0) > 0]
+        if not valid_times:
             continue
+        month_id = os.path.basename(path)[:-5]
+        min_at = min(valid_times)
+        max_at = max(valid_times)
+        latest_event_at = max(latest_event_at, max_at)
+        months.append({
+            "id": month_id,
+            "file": os.path.basename(path),
+            "minAt": min_at,
+            "maxAt": max_at,
+            "count": len(events),
+        })
 
-        existing = merged[positions[item_id]]
-
-        existing_name = (
-            existing[2].strip()
-            if len(existing) > 2
-            else ""
-        )
-
-        duplicate_name = (
-            parts[2].strip()
-            if len(parts) > 2
-            else ""
-        )
-
-        if (
-            not has_resolved_name(existing_name)
-            and has_resolved_name(duplicate_name)
-        ):
-            existing[2] = duplicate_name
-
-    return merged
+    write_json(index_path, {
+        "schemaVersion": EVENT_SCHEMA_VERSION,
+        "type": "dlc",
+        "trackingStartedAt": int(tracking_started_at),
+        "updatedAt": int(updated_at_ms),
+        "latestEventAt": int(latest_event_at),
+        "months": months,
+    })
 
 
-def process_latest(old_path, new_path, latest_path):
-    current_date = datetime.datetime.now().strftime("%b %d, %Y")
+def append_dlc_events(events_dir, events, seen, tracking_started_at_ms=0):
+    pending = []
+    for event in events:
+        if not event:
+            continue
+        key = str(event.get("key", "")).strip().upper()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        pending.append(event)
+
+    if not pending:
+        return False
+
+    by_month = {}
+    for event in pending:
+        by_month.setdefault(get_event_month(event.get("addedAt")), []).append(event)
+
+    for month_id, month_events in by_month.items():
+        path = os.path.join(events_dir, f"{month_id}.json")
+        payload = read_json(path, {"schemaVersion": EVENT_SCHEMA_VERSION, "type": "dlc", "month": month_id, "events": []})
+        if not isinstance(payload, dict):
+            payload = {"schemaVersion": EVENT_SCHEMA_VERSION, "type": "dlc", "month": month_id, "events": []}
+        existing = payload.get("events", [])
+        if not isinstance(existing, list):
+            existing = []
+        existing_keys = {str(item.get("key", "")).strip().upper() for item in existing if isinstance(item, dict)}
+        for event in month_events:
+            if str(event.get("key", "")).strip().upper() not in existing_keys:
+                existing.append(event)
+        existing.sort(key=lambda item: (int(item.get("addedAt", 0) or 0), str(item.get("key", ""))))
+        payload.update({"schemaVersion": EVENT_SCHEMA_VERSION, "type": "dlc", "month": month_id, "events": existing})
+        write_json(path, payload)
+
+    write_seen_event_keys(events_dir, seen)
+    rebuild_event_index(
+        events_dir,
+        max(int(event.get("addedAt", 0) or 0) for event in pending),
+        tracking_started_at_ms,
+    )
+    return True
+
+
+def seed_dlc_events_from_latest(events_dir, latest_path, seen, source="legacy-latest", tracking_started_at_ms=0):
+    # The first rollout seeds whatever is still visible in the 50-item Recently Added window.
+    # Clients establish a baseline from index.latestEventAt, so this does not create retroactive spam.
+    fallback_ms = int(utc_now().timestamp() * 1000)
+    seed_events = []
+    for line in read_valid_latest_items(latest_path):
+        parts = line.rstrip("\r\n").split("\t")
+        added_at_ms = parse_legacy_added_at(parts[11] if len(parts) > 11 else "", fallback_ms)
+        seed_events.append(build_dlc_event(parts, added_at_ms, source))
+    changed = append_dlc_events(events_dir, seed_events, seen, tracking_started_at_ms)
+    if tracking_started_at_ms:
+        rebuild_event_index(events_dir, tracking_started_at_ms, tracking_started_at_ms)
+    return changed
+
+
+def process_latest(old_path, new_path, latest_path, events_dir="", category="", source=""):
+    now = utc_now()
+    current_date = now.strftime("%b %d, %Y")
+    now_ms = int(now.timestamp() * 1000)
+    is_dlc_category = str(category or "").strip().lower() == "dlcs"
+    is_dlc_event_source = is_dlc_category and bool(events_dir)
     old_ids = set()
 
     if os.path.exists(old_path):
         with open(old_path, "r", encoding="utf-8") as file:
-            lines = file.readlines()
+            for line in file:
+                parts = line.rstrip("\r\n").split("\t")
+                item_id = normalize_event_key(parts) if is_dlc_category else get_item_id(parts)
+                if item_id:
+                    old_ids.add(item_id)
 
-        for line in lines[1:]:
-            parts = line.rstrip("\r\n").split("\t")
-            item_id = get_item_id(parts)
-
-            if item_id:
-                old_ids.add(item_id)
-
-    reference_paths = get_reference_paths(
-        old_path,
-        new_path,
-    )
-
-    name_lookup = build_name_lookup(reference_paths)
+    seen_event_keys = None
+    if is_dlc_event_source:
+        os.makedirs(events_dir, exist_ok=True)
+        seen_event_keys = load_seen_event_keys(events_dir)
+        if not os.path.exists(os.path.join(events_dir, EVENT_SEEN_NAME)):
+            seed_dlc_events_from_latest(events_dir, latest_path, seen_event_keys, tracking_started_at_ms=now_ms)
+            # append_dlc_events may have written the file; if there were no seed rows, persist the empty dedupe set.
+            if not os.path.exists(os.path.join(events_dir, EVENT_SEEN_NAME)):
+                write_seen_event_keys(events_dir, seen_event_keys)
+                rebuild_event_index(events_dir, now_ms, now_ms)
 
     header = ""
     new_items = []
-
+    new_event_parts = []
     if os.path.exists(new_path):
         with open(new_path, "r", encoding="utf-8") as file:
             lines = file.readlines()
@@ -228,56 +297,37 @@ def process_latest(old_path, new_path, latest_path):
 
         for line in lines[1:]:
             parts = line.rstrip("\r\n").split("\t")
-            resolve_item_name(parts, name_lookup)
-
             if not is_valid_item(parts):
                 continue
-
-            item_id = get_item_id(parts)
-
+            item_id = normalize_event_key(parts) if is_dlc_category else get_item_id(parts)
             if item_id and item_id not in old_ids:
                 while len(parts) < 11:
                     parts.append("")
-
+                new_event_parts.append(list(parts))
                 parts.append(current_date)
-                new_items.append(parts)
+                new_items.append("\t".join(parts) + "\n")
 
-    existing_latest = read_valid_latest_items(
-        latest_path,
-        name_lookup,
-    )
+    if is_dlc_event_source and seen_event_keys is not None and new_event_parts:
+        events = [build_dlc_event(parts, now_ms, source) for parts in new_event_parts]
+        append_dlc_events(events_dir, events, seen_event_keys, now_ms)
 
-    combined_latest = merge_without_duplicates(
-        new_items + existing_latest
-    )[:50]
-
+    existing_latest = read_valid_latest_items(latest_path)
+    combined_latest = (new_items + existing_latest)[:LATEST_LIMIT]
     if header:
-        with open(
-            latest_path,
-            "w",
-            encoding="utf-8",
-            newline="",
-        ) as file:
-            file.write(
-                header
-                if header.endswith("\n")
-                else header + "\n"
-            )
-
-            for parts in combined_latest:
-                file.write("\t".join(parts) + "\n")
+        with open(latest_path, "w", encoding="utf-8", newline="") as file:
+            file.write(header if header.endswith("\n") else header + "\n")
+            file.writelines(combined_latest)
 
 
 if __name__ == "__main__":
     if len(sys.argv) < 4:
-        print(
-            "Usage: python script.py "
-            "old_database new_database latest_file"
+        print("Uso: python script.py old_database new_database latest_file [events_dir category source]")
+    else:
+        process_latest(
+            sys.argv[1],
+            sys.argv[2],
+            sys.argv[3],
+            sys.argv[4] if len(sys.argv) > 4 else "",
+            sys.argv[5] if len(sys.argv) > 5 else "",
+            sys.argv[6] if len(sys.argv) > 6 else "",
         )
-        sys.exit(1)
-
-    process_latest(
-        sys.argv[1],
-        sys.argv[2],
-        sys.argv[3],
-    )
