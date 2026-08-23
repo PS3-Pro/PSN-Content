@@ -1061,6 +1061,12 @@ async function initDb() {
       last_read_id BIGINT NOT NULL DEFAULT 0,
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
+    CREATE TABLE IF NOT EXISTS user_catalog_notification_seen (
+      user_name TEXT NOT NULL,
+      event_key TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (user_name, event_key)
+    );
   `);
 
   await queryDbWithRetry(
@@ -1295,6 +1301,12 @@ function normalizeDownloadHistoryRecordsServer(history = []) {
     ['titleId', 'contentId', 'cleanName', 'name', 'cTag', 'console', 'rawCategory', 'cover'].forEach(key => {
       if (!existing[key] && item[key]) existing[key] = item[key];
     });
+    const existingFirstDownloadedAt = normalizeTimestampValue(existing.firstDownloadedAt) || normalizeTimestampValue(existing.id);
+    const itemFirstDownloadedAt = normalizeTimestampValue(item.firstDownloadedAt) || normalizeTimestampValue(item.id);
+    const earliestFirstDownloadedAt = existingFirstDownloadedAt && itemFirstDownloadedAt
+      ? Math.min(existingFirstDownloadedAt, itemFirstDownloadedAt)
+      : (existingFirstDownloadedAt || itemFirstDownloadedAt || 0);
+    if (earliestFirstDownloadedAt) existing.firstDownloadedAt = earliestFirstDownloadedAt;
     if (item.noBingCover === true) existing.noBingCover = true;
 
     const existingSize = Number(existing.sizeBytes) || 0;
@@ -1383,8 +1395,15 @@ function isSameLibraryGameServer(first = {}, second = {}) {
 function mergeLibraryLastPlayedRecordServer(primary = {}, fallback = {}) {
   const merged = { ...primary };
   const ownTimestamp = getLibraryLastPlayedTimestampServer(merged);
+  const fallbackMatches = !!(fallback && typeof fallback === 'object' && !Array.isArray(fallback) && isSameLibraryGameServer(merged, fallback));
+  const primaryFirstSeenAt = normalizeTimestampValue(merged.firstSeenAt);
+  const fallbackFirstSeenAt = fallbackMatches ? normalizeTimestampValue(fallback.firstSeenAt) : 0;
+  const earliestFirstSeenAt = primaryFirstSeenAt && fallbackFirstSeenAt
+    ? Math.min(primaryFirstSeenAt, fallbackFirstSeenAt)
+    : (primaryFirstSeenAt || fallbackFirstSeenAt || 0);
+  if (earliestFirstSeenAt) merged.firstSeenAt = earliestFirstSeenAt;
 
-  if (!fallback || typeof fallback !== 'object' || Array.isArray(fallback) || !isSameLibraryGameServer(merged, fallback)) {
+  if (!fallbackMatches) {
     if (ownTimestamp && !normalizeTimestampValue(merged.lastPlayedAt)) merged.lastPlayedAt = ownTimestamp;
     return merged;
   }
@@ -5017,7 +5036,7 @@ async function getFriendActivityHistoryForUser(userName, limit = FRIEND_ACTIVITY
   return { friendNames, items: result.rows.map(serializeFriendActivityRow).filter(Boolean), lastReadId, delta: safeAfterId > 0 };
 }
 
-const USER_NOTIFICATION_TYPES = new Set(['mention', 'reply', 'reaction', 'trophy']);
+const USER_NOTIFICATION_TYPES = new Set(['mention', 'reply', 'reaction', 'trophy', 'catalog']);
 const USER_NOTIFICATION_LIMIT = 60;
 
 function normalizeUserNotificationName(value) {
@@ -5048,6 +5067,18 @@ function normalizeUserNotificationData(type, rawData = {}) {
       trophyId: normalizeText(source.trophyId, '').slice(0, 80),
       title: normalizeText(source.title, 'Trophy').slice(0, 140),
       trophyType: ['bronze', 'silver', 'gold', 'platinum'].includes(trophyType) ? trophyType : 'bronze'
+    };
+  }
+  if (type === 'catalog') {
+    const catalogType = normalizeText(source.catalogType || source.type, '').toLowerCase();
+    return {
+      catalogType: catalogType === 'dlc' ? 'dlc' : '',
+      eventKey: normalizeText(source.eventKey, '').slice(0, 180),
+      titleId: normalizeText(source.titleId, '').toUpperCase().slice(0, 16),
+      contentId: normalizeText(source.contentId, '').slice(0, 180),
+      contentName: normalizeText(source.contentName, 'New DLC').slice(0, 180),
+      gameTitle: normalizeText(source.gameTitle, 'your game').slice(0, 180),
+      addedAt: normalizeTimestampValue(source.addedAt)
     };
   }
   return {};
@@ -5161,6 +5192,33 @@ async function notifyUserNotificationsClearedAcrossInstances(userName, throughId
   }
 }
 
+async function publishStoredUserNotification(row) {
+  const event = serializeUserNotificationRow(row);
+  if (!event) return null;
+  const user = normalizeUserNotificationName(event.user);
+  if (!user) return null;
+
+  deferServerTask('USER NOTIFICATION RETENTION', async () => {
+    await queryDbWithRetry(
+      `DELETE FROM user_notifications
+       WHERE user_name = $1
+         AND id < COALESCE((
+           SELECT id
+           FROM user_notifications
+           WHERE user_name = $1
+           ORDER BY id DESC
+           OFFSET $2
+           LIMIT 1
+         ), 0)`,
+      [user, USER_NOTIFICATION_MAX_PER_USER - 1],
+      { attempts: 2, label: 'USER NOTIFICATION RETENTION' }
+    );
+  }, 0);
+  emitUserNotificationToLocalUser(event);
+  deferServerTask('USER NOTIFICATION SYNC', () => notifyUserNotificationAcrossInstances(event), 0);
+  return event;
+}
+
 async function recordUserNotification(userName, type, rawData = {}, options = {}) {
   const user = normalizeUserNotificationName(userName);
   const eventType = normalizeText(type, '').toLowerCase();
@@ -5182,30 +5240,45 @@ async function recordUserNotification(userName, type, rawData = {}, options = {}
       { attempts: 2, label: 'USER NOTIFICATION INSERT' }
     );
     if (!result.rows[0]) return null;
-    const event = serializeUserNotificationRow(result.rows[0]);
-    if (!event) return null;
-    deferServerTask('USER NOTIFICATION RETENTION', async () => {
-      await queryDbWithRetry(
-        `DELETE FROM user_notifications
-         WHERE user_name = $1
-           AND id < COALESCE((
-             SELECT id
-             FROM user_notifications
-             WHERE user_name = $1
-             ORDER BY id DESC
-             OFFSET $2
-             LIMIT 1
-           ), 0)`,
-        [user, USER_NOTIFICATION_MAX_PER_USER - 1],
-        { attempts: 2, label: 'USER NOTIFICATION RETENTION' }
-      );
-    }, 0);
-    emitUserNotificationToLocalUser(event);
-    deferServerTask('USER NOTIFICATION SYNC', () => notifyUserNotificationAcrossInstances(event), 0);
-    return event;
+    return publishStoredUserNotification(result.rows[0]);
   } catch (err) {
     console.error('[USER NOTIFICATION INSERT ERROR]:', err && err.message ? err.message : err);
     return null;
+  }
+}
+
+async function recordCatalogDlcNotification(userName, rawData = {}) {
+  const user = normalizeUserNotificationName(userName);
+  if (!user) return null;
+  const data = normalizeUserNotificationData('catalog', rawData);
+  const eventIdentity = normalizeText(data.eventKey || data.contentId, '').slice(0, 180);
+  if (data.catalogType !== 'dlc' || !eventIdentity || !/^[A-Z]{4}\d{5}$/.test(data.titleId)) return null;
+
+  const seenKey = `dlc:${eventIdentity}`.toLowerCase();
+  const dedupeKey = `${user.toLowerCase()}:notification:catalog:${seenKey}`;
+  const at = normalizeTimestampValue(data.addedAt) || Date.now();
+
+  try {
+    const result = await queryDbWithRetry(
+      `WITH claimed AS (
+         INSERT INTO user_catalog_notification_seen (user_name, event_key, created_at)
+         VALUES ($1, $2, NOW())
+         ON CONFLICT (user_name, event_key) DO NOTHING
+         RETURNING event_key
+       )
+       INSERT INTO user_notifications (user_name, event_type, data, dedupe_key, created_at)
+       SELECT $1, 'catalog', $3::jsonb, $4, to_timestamp($5::double precision / 1000.0)
+       FROM claimed
+       ON CONFLICT (dedupe_key) DO NOTHING
+       RETURNING id, user_name, event_type, data, created_at`,
+      [user, seenKey, JSON.stringify(data), dedupeKey, at],
+      { attempts: 2, label: 'CATALOG NOTIFICATION INSERT' }
+    );
+    if (!result.rows[0]) return null;
+    return publishStoredUserNotification(result.rows[0]);
+  } catch (err) {
+    console.error('[CATALOG NOTIFICATION INSERT ERROR]:', err && err.message ? err.message : err);
+    throw err;
   }
 }
 
@@ -5977,6 +6050,7 @@ async function deleteUserAccount(targetName, reason, adminName) {
   await pool.query('DELETE FROM friend_activity WHERE actor_name = $1', [targetName]);
   await pool.query('DELETE FROM user_notification_read_state WHERE user_name = $1', [targetName]);
   await pool.query('DELETE FROM user_notifications WHERE user_name = $1', [targetName]);
+  await pool.query('DELETE FROM user_catalog_notification_seen WHERE user_name = $1', [targetName]);
   await notifyProfileSyncAcrossInstances(targetName, null, Date.now());
 
   delete userDatabase[targetName];
@@ -6746,6 +6820,42 @@ io.on('connection', (socket) => {
             recentlyVisited: normalizeTimestampValue(workingUser.recentlyVisitedUpdatedAt)
           }
         });
+    }
+  });
+
+  socket.on('catalog_notification_candidate', async (data = {}, ack) => {
+    const respond = payload => { if (typeof ack === 'function' && socket.connected) { try { ack(payload); } catch (err) {} } };
+    const name = socket.userName;
+    if (!name || !userDatabase[name]) { respond({ ok: false, created: false, error: 'Profile is not available.' }); return; }
+
+    const catalogType = normalizeText(data && data.catalogType, '').toLowerCase();
+    const eventKey = normalizeText(data && data.eventKey, '').slice(0, 180);
+    const titleId = normalizeText(data && data.titleId, '').toUpperCase().slice(0, 16);
+    const contentId = normalizeText(data && data.contentId, '').slice(0, 180);
+    const contentName = normalizeText(data && data.contentName, 'New DLC').slice(0, 180);
+    const gameTitle = normalizeText(data && data.gameTitle, 'your game').slice(0, 180);
+    const addedAt = normalizeTimestampValue(data && data.addedAt);
+    const dedupeIdentity = eventKey || contentId;
+
+    if (catalogType !== 'dlc' || !dedupeIdentity || !/^[A-Z]{4}\d{5}$/.test(titleId)) {
+      respond({ ok: false, created: false, error: 'Invalid catalog notification.' });
+      return;
+    }
+
+    try {
+      const event = await recordCatalogDlcNotification(name, {
+        catalogType: 'dlc',
+        eventKey: dedupeIdentity,
+        titleId,
+        contentId,
+        contentName,
+        gameTitle,
+        addedAt
+      });
+      respond({ ok: true, created: !!event, duplicate: !event });
+    } catch (err) {
+      console.error('[CATALOG NOTIFICATION ERROR]:', err && err.message ? err.message : err);
+      respond({ ok: false, created: false, error: 'Could not save the catalog notification.' });
     }
   });
 
