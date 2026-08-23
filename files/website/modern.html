@@ -19,7 +19,7 @@
 	</script>
 	<script>(function(){if(/SamsungBrowser|Samsung/i.test(navigator.userAgent||''))document.documentElement.classList.add('samsung-browser');})();</script>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, minimum-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>NoPayStation™ Network Database</title>
 	<link rel="icon" type="image/png" sizes="32x32" href="https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/interface/modern/images/favicon/favicon-32x32.png">
 	<link rel="icon" type="image/png" sizes="16x16" href="https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/interface/modern/images/favicon/favicon-16x16.png">
@@ -4924,7 +4924,8 @@ a:focus, button:focus, select:focus, input:focus, textarea:focus, [contenteditab
 .pwa-controls-wrapper { display: none; }
 }
 
-/* ========================================================================== GLOBAL APP-LIKE SELECTION / CALLOUT / DRAG GUARDS ========================================================================== */
+/* ========================================================================== GLOBAL APP-LIKE SELECTION / CALLOUT / DRAG / ZOOM GUARDS ========================================================================== */
+html, body { touch-action: pan-x pan-y; }
 body, body * { -webkit-user-select: none !important; user-select: none !important; -webkit-touch-callout: none !important; }
 input, textarea, [contenteditable="true"], [contenteditable="true"] *, .psn-text-selectable, .psn-text-selectable * { -webkit-user-select: text !important; user-select: text !important; -webkit-touch-callout: default !important; }
 img { -webkit-user-drag: none !important; user-drag: none !important; }
@@ -8899,9 +8900,15 @@ P
 	}
 	window.safeLocalStorageSet = safeLocalStorageSet;
 
-	/* ========================================================================== GLOBAL POINTER INPUT ========================================================================== */
+	/* ========================================================================== GLOBAL POINTER / BROWSER INTERACTION GUARDS ========================================================================== */
+	const PSN_TEXT_SELECTION_ALLOWED_SELECTOR = 'input, textarea, [contenteditable="true"], .psn-text-selectable';
+
+	function isPsnEditableTextTarget(target) {
+		return !!(target && target.closest && target.closest(PSN_TEXT_SELECTION_ALLOWED_SELECTOR));
+	}
+
 	function blockSecondaryMouseInteraction(event) {
-		if (!event || event.button !== 2) return;
+		if (!event || event.button !== 2 || isPsnEditableTextTarget(event.target)) return;
 		event.preventDefault();
 		event.stopImmediatePropagation();
 	}
@@ -8912,9 +8919,48 @@ P
 	document.addEventListener('mouseup', blockSecondaryMouseInteraction, { capture: true });
 	document.addEventListener('auxclick', blockSecondaryMouseInteraction, { capture: true });
 	document.addEventListener('contextmenu', event => {
+		if (isPsnEditableTextTarget(event.target)) return;
 		event.preventDefault();
 		event.stopImmediatePropagation();
 	}, { capture: true });
+
+	if (!window.__psnBrowserInteractionGuardsBound) {
+		window.__psnBrowserInteractionGuardsBound = true;
+
+		// Preserve normal wheel/middle-button scrolling, but reject browser zoom gestures.
+		document.addEventListener('wheel', function(event) {
+			if (!event.ctrlKey && !event.metaKey) return;
+			event.preventDefault();
+		}, { capture: true, passive: false });
+
+		document.addEventListener('keydown', function(event) {
+			if (!event) return;
+
+			const key = String(event.key || '');
+			const code = String(event.code || '');
+			const zoomShortcut = (event.ctrlKey || event.metaKey) && (
+				key === '+' || key === '=' || key === '-' || key === '_' || key === '0' ||
+				code === 'NumpadAdd' || code === 'NumpadSubtract' || code === 'Numpad0'
+			);
+			if (zoomShortcut) {
+				event.preventDefault();
+				event.stopImmediatePropagation();
+				return;
+			}
+
+			const keyboardContextMenu = key === 'ContextMenu' || (event.shiftKey && key === 'F10');
+			if (keyboardContextMenu && !isPsnEditableTextTarget(event.target)) {
+				event.preventDefault();
+				event.stopImmediatePropagation();
+			}
+		}, { capture: true });
+
+		['gesturestart', 'gesturechange', 'gestureend'].forEach(function(type) {
+			document.addEventListener(type, function(event) {
+				event.preventDefault();
+			}, { capture: true, passive: false });
+		});
+	}
 
 	/* ========================================================================== GLOBAL PRESS & MOBILE HAPTIC FEEDBACK ========================================================================== */
 	const psnHapticPatterns = {
@@ -9219,20 +9265,18 @@ P
 	}
 
 
-	// Global app-like interaction guards: keep form editing and intentional drag/drop intact.
-	const PSN_TEXT_SELECTION_ALLOWED_SELECTOR = 'input, textarea, [contenteditable="true"], .psn-text-selectable';
+	// Global app-like interaction guards: keep text editing and intentional drag/drop intact.
 	if (!window.__psnSelectionDragGuardsBound) {
 		window.__psnSelectionDragGuardsBound = true;
 		document.addEventListener('selectstart', function(event) {
-			const target = event.target;
-			if (target && target.closest && target.closest(PSN_TEXT_SELECTION_ALLOWED_SELECTOR)) return;
+			if (isPsnEditableTextTarget(event.target)) return;
 			event.preventDefault();
 		}, true);
 		document.addEventListener('dragstart', function(event) {
 			const target = event.target;
-			if (!target || !target.closest) return;
+			if (!target || !target.closest || isPsnEditableTextTarget(target)) return;
 			if (target.closest('[draggable="true"]')) return;
-			if (target.closest('img, a[href]')) event.preventDefault();
+			event.preventDefault();
 		}, true);
 	}
 
