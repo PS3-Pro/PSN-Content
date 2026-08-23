@@ -55385,7 +55385,7 @@ function getVisibleChatStackEl(id) {
 	// ==========================================================================
 	const FRIEND_ACTIVITY_CACHE_KEY = 'psn_friend_activity_cache_v1';
 	const FRIEND_ACTIVITY_CACHE_LIMIT = 500;
-	const FRIEND_ACTIVITY_PAGE_SIZE = 60;
+	const FRIEND_ACTIVITY_RENDER_BATCH_SIZE = 60;
 	window.friendActivityItems = Array.isArray(window.friendActivityItems) ? window.friendActivityItems : [];
 	window.__friendActivitySubscribed = false;
 	window.__friendActivityRequestToken = 0;
@@ -55399,11 +55399,8 @@ function getVisibleChatStackEl(id) {
 	window.__friendActivityFriendCount = 0;
 	window.__friendActivityReadSyncTimer = null;
 	window.__friendActivityFriendsRefreshTimer = null;
-	window.__friendActivityHasMore = true;
-	window.__friendActivityOlderLoading = false;
-	window.__friendActivityRenderLimit = FRIEND_ACTIVITY_PAGE_SIZE;
+	window.__friendActivityRenderLimit = FRIEND_ACTIVITY_RENDER_BATCH_SIZE;
 	window.__friendActivityOlderObserver = null;
-	window.__friendActivityOlderCursor = 0;
 
 	function escapeRealtimeFeedHtml(value) {
 		return String(value == null ? '' : value).replace(/[&<>"']/g, function(ch) { return ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' })[ch]; });
@@ -55415,13 +55412,6 @@ function getVisibleChatStackEl(id) {
 		}, 0);
 	}
 
-	function getRealtimeFeedMinId(items) {
-		return (Array.isArray(items) ? items : []).reduce(function(minId, item) {
-			const id = Math.max(0, Number(item && item.id) || 0);
-			if (!id) return minId;
-			return !minId || id < minId ? id : minId;
-		}, 0);
-	}
 
 	function getRealtimeFeedScrollRoot(list) {
 		let node = list && list.parentElement;
@@ -55854,7 +55844,7 @@ function getVisibleChatStackEl(id) {
 		cleanupFriendActivityDayHeaders(list);
 		updateFriendActivityChrome();
 		window.refreshFriendActivityIndicators();
-		const maxRendered = Math.max(FRIEND_ACTIVITY_PAGE_SIZE, Number(window.__friendActivityRenderLimit) || FRIEND_ACTIVITY_PAGE_SIZE);
+		const maxRendered = Math.max(FRIEND_ACTIVITY_RENDER_BATCH_SIZE, Number(window.__friendActivityRenderLimit) || FRIEND_ACTIVITY_RENDER_BATCH_SIZE);
 		Array.from(list.querySelectorAll('.friend-activity-item[data-activity-id]')).slice(maxRendered).forEach(function(row) { row.remove(); });
 		cleanupFriendActivityDayHeaders(list);
 		if (highlight) {
@@ -55902,7 +55892,7 @@ function getVisibleChatStackEl(id) {
 			window.refreshFriendActivityIndicators();
 			return;
 		}
-		window.__friendActivityRenderLimit = Math.max(FRIEND_ACTIVITY_PAGE_SIZE, Math.min(Number(window.__friendActivityRenderLimit) || FRIEND_ACTIVITY_PAGE_SIZE, items.length || FRIEND_ACTIVITY_PAGE_SIZE));
+		window.__friendActivityRenderLimit = Math.max(FRIEND_ACTIVITY_RENDER_BATCH_SIZE, Math.min(Number(window.__friendActivityRenderLimit) || FRIEND_ACTIVITY_RENDER_BATCH_SIZE, items.length || FRIEND_ACTIVITY_RENDER_BATCH_SIZE));
 		const renderedItems = items.slice(0, window.__friendActivityRenderLimit);
 		let currentDay = '';
 		renderedItems.forEach(function(item,index) {
@@ -55924,12 +55914,12 @@ function getVisibleChatStackEl(id) {
 		const list = document.getElementById('friend-activity-list');
 		if (!list) return;
 		if (window.__friendActivityOlderObserver) { try { window.__friendActivityOlderObserver.disconnect(); } catch (err) {} window.__friendActivityOlderObserver = null; }
-		let sentinel = list.querySelector('.friend-activity-load-sentinel');
-		if (sentinel) sentinel.remove();
+		const oldSentinel = list.querySelector('.friend-activity-load-sentinel');
+		if (oldSentinel) oldSentinel.remove();
 		const loaded = Array.isArray(window.friendActivityItems) ? window.friendActivityItems.length : 0;
-		const rendered = Math.min(loaded, Number(window.__friendActivityRenderLimit) || FRIEND_ACTIVITY_PAGE_SIZE);
-		if (rendered >= FRIEND_ACTIVITY_CACHE_LIMIT || (rendered >= loaded && window.__friendActivityHasMore === false)) return;
-		sentinel = document.createElement('div');
+		const rendered = Math.min(loaded, Number(window.__friendActivityRenderLimit) || FRIEND_ACTIVITY_RENDER_BATCH_SIZE);
+		if (!loaded || rendered >= loaded) return;
+		const sentinel = document.createElement('div');
 		sentinel.className = 'friend-activity-load-sentinel';
 		sentinel.style.cssText = 'height:1px;width:100%;pointer-events:none;opacity:0;';
 		list.appendChild(sentinel);
@@ -55943,37 +55933,16 @@ function getVisibleChatStackEl(id) {
 	};
 
 	window.loadOlderFriendActivity = function() {
-		if (window.__friendActivityOlderLoading || window.__friendActivitySyncInFlight) return false;
 		const items = Array.isArray(window.friendActivityItems) ? window.friendActivityItems : [];
-		const currentLimit = Math.max(FRIEND_ACTIVITY_PAGE_SIZE, Number(window.__friendActivityRenderLimit) || FRIEND_ACTIVITY_PAGE_SIZE);
-		if (currentLimit < items.length) {
-			const nextLimit = Math.min(items.length, currentLimit + FRIEND_ACTIVITY_PAGE_SIZE, FRIEND_ACTIVITY_CACHE_LIMIT);
-			const revealIds = new Set(items.slice(currentLimit, nextLimit).map(function(item) { return String(item && item.id || ''); }).filter(Boolean));
-			window.__friendActivityRenderLimit = nextLimit;
-			window.renderFriendActivity(true);
-			requestAnimationFrame(function() { const list = document.getElementById('friend-activity-list'); if (list) animateRealtimeFeedRowsByIds(list, '.friend-activity-item[data-activity-id]', 'data-activity-id', revealIds); });
-			return true;
-		}
-		if (items.length >= FRIEND_ACTIVITY_CACHE_LIMIT || window.__friendActivityHasMore === false || !socketChat || !socketChat.connected) return false;
-		const beforeId = Math.max(0, Number(window.__friendActivityOlderCursor) || 0) || getRealtimeFeedMinId(items);
-		if (!beforeId) return false;
-		window.__friendActivityOlderLoading = true;
-		socketChat.emit('request_friend_activity', { limit:FRIEND_ACTIVITY_PAGE_SIZE, beforeId:beforeId }, function(response) {
-			window.__friendActivityOlderLoading = false;
-			if (!response || response.ok !== true) { if (typeof window.setupFriendActivityOlderObserver === 'function') window.setupFriendActivityOlderObserver(); return; }
-			const previousLength = items.length;
-			const pageItems = Array.isArray(response.items) ? response.items : [];
-			const pageMinId = getRealtimeFeedMinId(pageItems);
-			if (pageMinId) window.__friendActivityOlderCursor = pageMinId;
-			window.mergeFriendActivityItems(pageItems, false);
-			window.__friendActivityHasMore = response.hasMore === true && window.friendActivityItems.length < FRIEND_ACTIVITY_CACHE_LIMIT;
-			window.__friendActivityRenderLimit = Math.min(window.friendActivityItems.length, currentLimit + FRIEND_ACTIVITY_PAGE_SIZE, FRIEND_ACTIVITY_CACHE_LIMIT);
-			window.writeFriendActivityCache();
-			if (window.isFriendActivityVisible() && window.friendActivityItems.length !== previousLength) {
-				const revealIds = new Set(pageItems.map(function(item) { return String(item && item.id || ''); }).filter(Boolean));
-				window.renderFriendActivity(true);
-				requestAnimationFrame(function() { const list = document.getElementById('friend-activity-list'); if (list) animateRealtimeFeedRowsByIds(list, '.friend-activity-item[data-activity-id]', 'data-activity-id', revealIds); });
-			} else if (typeof window.setupFriendActivityOlderObserver === 'function') window.setupFriendActivityOlderObserver();
+		const currentLimit = Math.max(FRIEND_ACTIVITY_RENDER_BATCH_SIZE, Number(window.__friendActivityRenderLimit) || FRIEND_ACTIVITY_RENDER_BATCH_SIZE);
+		if (currentLimit >= items.length) return false;
+		const nextLimit = Math.min(items.length, currentLimit + FRIEND_ACTIVITY_RENDER_BATCH_SIZE, FRIEND_ACTIVITY_CACHE_LIMIT);
+		const revealIds = new Set(items.slice(currentLimit, nextLimit).map(function(item) { return String(item && item.id || ''); }).filter(Boolean));
+		window.__friendActivityRenderLimit = nextLimit;
+		window.renderFriendActivity(true);
+		requestAnimationFrame(function() {
+			const list = document.getElementById('friend-activity-list');
+			if (list) animateRealtimeFeedRowsByIds(list, '.friend-activity-item[data-activity-id]', 'data-activity-id', revealIds);
 		});
 		return true;
 	};
@@ -55993,14 +55962,14 @@ function getVisibleChatStackEl(id) {
 		if (window.__friendActivitySyncInFlight) return false;
 		const currentSignature = getFriendActivityFriendSignature();
 		const signatureChanged = window.__friendActivityFriendSignature !== currentSignature;
-		const forceFull = options.forceFull === true || signatureChanged;
+		const forceFull = options.forceFull === true || signatureChanged || window.__friendActivityRemoteReady !== true;
 		const afterId = forceFull ? 0 : getRealtimeFeedMaxId(window.friendActivityItems);
 		const localReadBeforeSync = Math.max(0, Number(window.__friendActivityLastReadId) || 0);
 		const token = ++window.__friendActivityRequestToken;
 		window.__friendActivitySyncInFlight = true;
 		window.__friendActivityRemoteError = '';
 		if (window.isFriendActivityVisible() && !window.friendActivityItems.length) window.renderFriendActivity();
-		socketChat.emit('request_friend_activity', { limit:FRIEND_ACTIVITY_PAGE_SIZE, afterId:afterId }, function(response) {
+		socketChat.emit('request_friend_activity', { limit:FRIEND_ACTIVITY_CACHE_LIMIT, afterId:afterId }, function(response) {
 			if (token !== window.__friendActivityRequestToken) return;
 			window.__friendActivitySyncInFlight = false;
 			if (!response || response.ok !== true) {
@@ -56019,8 +55988,8 @@ function getVisibleChatStackEl(id) {
 			window.__friendActivityLastReadId = Math.max(localReadBeforeSync, serverReadId);
 
 			const previousIds = new Set((Array.isArray(window.friendActivityItems) ? window.friendActivityItems : []).map(function(item) { return String(item && item.id || ''); }).filter(Boolean));
-			const responseIsFull = response.delta !== true && response.older !== true;
-			if (responseIsFull) { window.__friendActivityHasMore = response.hasMore === true; window.__friendActivityRenderLimit = FRIEND_ACTIVITY_PAGE_SIZE; window.__friendActivityOlderCursor = getRealtimeFeedMinId(Array.isArray(response.items) ? response.items : []); }
+			const responseIsFull = response.delta !== true;
+			if (responseIsFull) window.__friendActivityRenderLimit = FRIEND_ACTIVITY_RENDER_BATCH_SIZE;
 			window.mergeFriendActivityItems(Array.isArray(response.items) ? response.items : [], responseIsFull);
 			const addedItems = getRealtimeFeedAddedItems(previousIds, window.friendActivityItems);
 
@@ -56031,7 +56000,7 @@ function getVisibleChatStackEl(id) {
 			if (window.isFriendActivityVisible()) {
 				const list = document.getElementById('friend-activity-list');
 				const hadRows = !!(list && list.querySelector('.friend-activity-item'));
-				const domMatches = realtimeFeedDomMatchesState(list, '.friend-activity-item[data-activity-id]', 'data-activity-id', window.friendActivityItems.slice(0, Number(window.__friendActivityRenderLimit) || FRIEND_ACTIVITY_PAGE_SIZE));
+				const domMatches = realtimeFeedDomMatchesState(list, '.friend-activity-item[data-activity-id]', 'data-activity-id', window.friendActivityItems.slice(0, Number(window.__friendActivityRenderLimit) || FRIEND_ACTIVITY_RENDER_BATCH_SIZE));
 
 				if (responseIsFull) {
 					if (!domMatches) window.renderFriendActivity(hadRows);
@@ -56082,7 +56051,7 @@ function getVisibleChatStackEl(id) {
 	// ==========================================================================
 	const USER_NOTIFICATION_CACHE_KEY = 'psn_notification_center_cache_v1';
 	const USER_NOTIFICATION_CACHE_LIMIT = 500;
-	const USER_NOTIFICATION_PAGE_SIZE = 60;
+	const USER_NOTIFICATION_RENDER_BATCH_SIZE = 60;
 	window.userNotificationItems = Array.isArray(window.userNotificationItems) ? window.userNotificationItems : [];
 	window.__userNotificationCacheLoaded = false;
 	window.__userNotificationCacheUser = '';
@@ -56093,11 +56062,8 @@ function getVisibleChatStackEl(id) {
 	window.__userNotificationLastReadId = Math.max(0, Number(window.__userNotificationLastReadId) || 0);
 	window.__userNotificationUnreadCount = Math.max(0, Number(window.__userNotificationUnreadCount) || 0);
 	window.__userNotificationReadSyncTimer = null;
-	window.__userNotificationHasMore = true;
-	window.__userNotificationOlderLoading = false;
-	window.__userNotificationRenderLimit = USER_NOTIFICATION_PAGE_SIZE;
+	window.__userNotificationRenderLimit = USER_NOTIFICATION_RENDER_BATCH_SIZE;
 	window.__userNotificationOlderObserver = null;
-	window.__userNotificationOlderCursor = 0;
 
 
 	function normalizeUserNotificationItem(raw) {
@@ -56870,7 +56836,7 @@ function getVisibleChatStackEl(id) {
 		updateUserNotificationChrome();
 		syncNotificationSwipeListState();
 		window.refreshNotificationCenterIndicators();
-		const maxRendered = Math.max(USER_NOTIFICATION_PAGE_SIZE, Number(window.__userNotificationRenderLimit) || USER_NOTIFICATION_PAGE_SIZE);
+		const maxRendered = Math.max(USER_NOTIFICATION_RENDER_BATCH_SIZE, Number(window.__userNotificationRenderLimit) || USER_NOTIFICATION_RENDER_BATCH_SIZE);
 		Array.from(list.querySelectorAll('.notification-swipe-row[data-notification-id]')).slice(maxRendered).forEach(function(row) { row.remove(); });
 		cleanupUserNotificationDayHeaders(list);
 		animateUserNotificationRowsByIds(list, new Set([String(authoritative.id || '')]));
@@ -57034,7 +57000,7 @@ function getVisibleChatStackEl(id) {
 			window.refreshNotificationCenterIndicators();
 			return;
 		}
-		window.__userNotificationRenderLimit = Math.max(USER_NOTIFICATION_PAGE_SIZE, Math.min(Number(window.__userNotificationRenderLimit) || USER_NOTIFICATION_PAGE_SIZE, items.length || USER_NOTIFICATION_PAGE_SIZE));
+		window.__userNotificationRenderLimit = Math.max(USER_NOTIFICATION_RENDER_BATCH_SIZE, Math.min(Number(window.__userNotificationRenderLimit) || USER_NOTIFICATION_RENDER_BATCH_SIZE, items.length || USER_NOTIFICATION_RENDER_BATCH_SIZE));
 		const renderedItems = items.slice(0, window.__userNotificationRenderLimit);
 		let currentDay = '';
 		renderedItems.forEach(function(item,index) {
@@ -57460,12 +57426,12 @@ function getVisibleChatStackEl(id) {
 		const list = document.getElementById('notification-center-list');
 		if (!list) return;
 		if (window.__userNotificationOlderObserver) { try { window.__userNotificationOlderObserver.disconnect(); } catch (err) {} window.__userNotificationOlderObserver = null; }
-		let sentinel = list.querySelector('.user-notification-load-sentinel');
-		if (sentinel) sentinel.remove();
+		const oldSentinel = list.querySelector('.user-notification-load-sentinel');
+		if (oldSentinel) oldSentinel.remove();
 		const loaded = Array.isArray(window.userNotificationItems) ? window.userNotificationItems.length : 0;
-		const rendered = Math.min(loaded, Number(window.__userNotificationRenderLimit) || USER_NOTIFICATION_PAGE_SIZE);
-		if (rendered >= USER_NOTIFICATION_CACHE_LIMIT || (rendered >= loaded && window.__userNotificationHasMore === false)) return;
-		sentinel = document.createElement('div');
+		const rendered = Math.min(loaded, Number(window.__userNotificationRenderLimit) || USER_NOTIFICATION_RENDER_BATCH_SIZE);
+		if (!loaded || rendered >= loaded) return;
+		const sentinel = document.createElement('div');
 		sentinel.className = 'user-notification-load-sentinel';
 		sentinel.style.cssText = 'height:1px;width:100%;pointer-events:none;opacity:0;';
 		list.appendChild(sentinel);
@@ -57479,37 +57445,16 @@ function getVisibleChatStackEl(id) {
 	};
 
 	window.loadOlderUserNotifications = function() {
-		if (window.__userNotificationOlderLoading || window.__userNotificationSyncInFlight) return false;
 		const items = Array.isArray(window.userNotificationItems) ? window.userNotificationItems : [];
-		const currentLimit = Math.max(USER_NOTIFICATION_PAGE_SIZE, Number(window.__userNotificationRenderLimit) || USER_NOTIFICATION_PAGE_SIZE);
-		if (currentLimit < items.length) {
-			const nextLimit = Math.min(items.length, currentLimit + USER_NOTIFICATION_PAGE_SIZE, USER_NOTIFICATION_CACHE_LIMIT);
-			const revealIds = new Set(items.slice(currentLimit, nextLimit).map(function(item) { return String(item && item.id || ''); }).filter(Boolean));
-			window.__userNotificationRenderLimit = nextLimit;
-			window.renderNotificationCenter(true);
-			requestAnimationFrame(function() { const list = document.getElementById('notification-center-list'); if (list) animateUserNotificationRowsByIds(list, revealIds); });
-			return true;
-		}
-		if (items.length >= USER_NOTIFICATION_CACHE_LIMIT || window.__userNotificationHasMore === false || !socketChat || !socketChat.connected) return false;
-		const beforeId = Math.max(0, Number(window.__userNotificationOlderCursor) || 0) || getRealtimeFeedMinId(items);
-		if (!beforeId) return false;
-		window.__userNotificationOlderLoading = true;
-		socketChat.emit('request_user_notifications', { limit:USER_NOTIFICATION_PAGE_SIZE, beforeId:beforeId }, function(response) {
-			window.__userNotificationOlderLoading = false;
-			if (!response || response.ok !== true) { if (typeof window.setupUserNotificationOlderObserver === 'function') window.setupUserNotificationOlderObserver(); return; }
-			const previousLength = items.length;
-			const pageItems = Array.isArray(response.items) ? response.items : [];
-			const pageMinId = getRealtimeFeedMinId(pageItems);
-			if (pageMinId) window.__userNotificationOlderCursor = pageMinId;
-			window.mergeUserNotificationItems(pageItems, false);
-			window.__userNotificationHasMore = response.hasMore === true && window.userNotificationItems.length < USER_NOTIFICATION_CACHE_LIMIT;
-			window.__userNotificationRenderLimit = Math.min(window.userNotificationItems.length, currentLimit + USER_NOTIFICATION_PAGE_SIZE, USER_NOTIFICATION_CACHE_LIMIT);
-			window.writeUserNotificationCache();
-			if (window.isNotificationCenterVisible() && window.userNotificationItems.length !== previousLength) {
-				const revealIds = new Set(pageItems.map(function(item) { return String(item && item.id || ''); }).filter(Boolean));
-				window.renderNotificationCenter(true);
-				requestAnimationFrame(function() { const list = document.getElementById('notification-center-list'); if (list) animateUserNotificationRowsByIds(list, revealIds); });
-			} else if (typeof window.setupUserNotificationOlderObserver === 'function') window.setupUserNotificationOlderObserver();
+		const currentLimit = Math.max(USER_NOTIFICATION_RENDER_BATCH_SIZE, Number(window.__userNotificationRenderLimit) || USER_NOTIFICATION_RENDER_BATCH_SIZE);
+		if (currentLimit >= items.length) return false;
+		const nextLimit = Math.min(items.length, currentLimit + USER_NOTIFICATION_RENDER_BATCH_SIZE, USER_NOTIFICATION_CACHE_LIMIT);
+		const revealIds = new Set(items.slice(currentLimit, nextLimit).map(function(item) { return String(item && item.id || ''); }).filter(Boolean));
+		window.__userNotificationRenderLimit = nextLimit;
+		window.renderNotificationCenter(true);
+		requestAnimationFrame(function() {
+			const list = document.getElementById('notification-center-list');
+			if (list) animateUserNotificationRowsByIds(list, revealIds);
 		});
 		return true;
 	};
@@ -57526,13 +57471,13 @@ function getVisibleChatStackEl(id) {
 			return false;
 		}
 		if (window.__userNotificationSyncInFlight) return false;
-		const forceFull = options.forceFull === true;
+		const forceFull = options.forceFull === true || window.__userNotificationRemoteReady !== true;
 		const afterId = forceFull ? 0 : getRealtimeFeedMaxId(window.userNotificationItems);
 		const localReadBeforeSync = Math.max(0, Number(window.__userNotificationLastReadId) || 0);
 		const token = ++window.__userNotificationRequestToken;
 		window.__userNotificationSyncInFlight = true;
 		window.__userNotificationRemoteError = '';
-		socketChat.emit('request_user_notifications', { limit:USER_NOTIFICATION_PAGE_SIZE, afterId:afterId }, function(response) {
+		socketChat.emit('request_user_notifications', { limit:USER_NOTIFICATION_CACHE_LIMIT, afterId:afterId }, function(response) {
 			if (token !== window.__userNotificationRequestToken) return;
 			window.__userNotificationSyncInFlight = false;
 			if (!response || response.ok !== true) {
@@ -57550,8 +57495,8 @@ function getVisibleChatStackEl(id) {
 			window.__userNotificationUnreadCount = Math.max(0, Number(response.unreadCount) || 0);
 
 			const previousIds = new Set((Array.isArray(window.userNotificationItems) ? window.userNotificationItems : []).map(function(item) { return String(item && item.id || ''); }).filter(Boolean));
-			const responseIsFull = response.delta !== true && response.older !== true;
-			if (responseIsFull) { window.__userNotificationHasMore = response.hasMore === true; window.__userNotificationRenderLimit = USER_NOTIFICATION_PAGE_SIZE; window.__userNotificationOlderCursor = getRealtimeFeedMinId(Array.isArray(response.items) ? response.items : []); }
+			const responseIsFull = response.delta !== true;
+			if (responseIsFull) window.__userNotificationRenderLimit = USER_NOTIFICATION_RENDER_BATCH_SIZE;
 			window.mergeUserNotificationItems(Array.isArray(response.items) ? response.items : [], responseIsFull);
 			const addedItems = getRealtimeFeedAddedItems(previousIds, window.userNotificationItems);
 
@@ -57560,7 +57505,7 @@ function getVisibleChatStackEl(id) {
 			if (window.isNotificationCenterVisible()) {
 				const list = document.getElementById('notification-center-list');
 				const hadRows = !!(list && list.querySelector('.notification-swipe-row'));
-				const domMatches = realtimeFeedDomMatchesState(list, '.notification-swipe-row[data-notification-id]', 'data-notification-id', window.userNotificationItems.slice(0, Number(window.__userNotificationRenderLimit) || USER_NOTIFICATION_PAGE_SIZE));
+				const domMatches = realtimeFeedDomMatchesState(list, '.notification-swipe-row[data-notification-id]', 'data-notification-id', window.userNotificationItems.slice(0, Number(window.__userNotificationRenderLimit) || USER_NOTIFICATION_RENDER_BATCH_SIZE));
 
 				if (responseIsFull) {
 					if (!domMatches) window.renderNotificationCenter(hadRows);

@@ -4792,7 +4792,7 @@ async function initProfileSyncNotifications() {
 }
 
 const FRIEND_ACTIVITY_TYPES = new Set(['online', 'offline', 'playing', 'played', 'xmb', 'trophy', 'download', 'wishlist', 'favorite', 'cheat']);
-const FRIEND_ACTIVITY_PAGE_LIMIT = 60;
+const FRIEND_ACTIVITY_READ_LIMIT = FRIEND_ACTIVITY_MAX_PER_USER;
 const FRIEND_ACTIVITY_REPLACED_IDS_LIMIT = 60;
 const FRIEND_ACTIVITY_ROOM_PREFIX = 'friend-activity:';
 
@@ -5131,40 +5131,30 @@ async function setFriendActivityReadId(userName, lastReadId) {
   return Math.max(0, Number(result.rows[0] && result.rows[0].last_read_id) || safeId);
 }
 
-async function getFriendActivityHistoryForUser(userName, limit = FRIEND_ACTIVITY_PAGE_LIMIT, afterId = 0, resolvedFriendNames = null, beforeId = 0) {
+async function getFriendActivityHistoryForUser(userName, limit = FRIEND_ACTIVITY_READ_LIMIT, afterId = 0, resolvedFriendNames = null) {
   const friendNames = Array.isArray(resolvedFriendNames)
     ? extractFriendActivityNames(resolvedFriendNames)
     : extractFriendActivityNames(await getUserDataPayloadFromDb(userName, 'friends'));
-  const safeLimit = Math.max(1, Math.min(FRIEND_ACTIVITY_PAGE_LIMIT, Number(limit) || FRIEND_ACTIVITY_PAGE_LIMIT));
+  const safeLimit = Math.max(1, Math.min(FRIEND_ACTIVITY_READ_LIMIT, Number(limit) || FRIEND_ACTIVITY_READ_LIMIT));
   const safeAfterId = Math.max(0, Math.floor(Number(afterId) || 0));
-  const safeBeforeId = safeAfterId > 0 ? 0 : Math.max(0, Math.floor(Number(beforeId) || 0));
-  if (!friendNames.length) return { friendNames, items: [], lastReadId: await getFriendActivityReadId(userName), delta: safeAfterId > 0, older: safeBeforeId > 0, hasMore: false };
-  const queryLimit = safeLimit + 1;
-  let sql;
-  let params;
-  let label;
-  if (safeAfterId > 0) {
-    sql = `SELECT id, actor_name, event_type, data, created_at FROM friend_activity WHERE actor_name = ANY($1::text[]) AND id > $2 ORDER BY id DESC LIMIT $3`;
-    params = [friendNames, safeAfterId, queryLimit];
-    label = 'FRIEND ACTIVITY DELTA';
-  } else if (safeBeforeId > 0) {
-    sql = `SELECT id, actor_name, event_type, data, created_at FROM friend_activity WHERE actor_name = ANY($1::text[]) AND id < $2 ORDER BY id DESC LIMIT $3`;
-    params = [friendNames, safeBeforeId, queryLimit];
-    label = 'FRIEND ACTIVITY OLDER';
-  } else {
-    sql = `SELECT id, actor_name, event_type, data, created_at FROM friend_activity WHERE actor_name = ANY($1::text[]) ORDER BY id DESC LIMIT $2`;
-    params = [friendNames, queryLimit];
-    label = 'FRIEND ACTIVITY READ';
-  }
-  const result = await queryDbWithRetry(sql, params, { attempts: 2, label });
-  const hasMore = result.rows.length > safeLimit;
-  const rows = hasMore ? result.rows.slice(0, safeLimit) : result.rows;
+  if (!friendNames.length) return { friendNames, items: [], lastReadId: await getFriendActivityReadId(userName), delta: safeAfterId > 0 };
+  const result = safeAfterId > 0
+    ? await queryDbWithRetry(
+        'SELECT id, actor_name, event_type, data, created_at FROM friend_activity WHERE actor_name = ANY($1::text[]) AND id > $2 ORDER BY id DESC LIMIT $3',
+        [friendNames, safeAfterId, safeLimit],
+        { attempts: 2, label: 'FRIEND ACTIVITY DELTA' }
+      )
+    : await queryDbWithRetry(
+        'SELECT id, actor_name, event_type, data, created_at FROM friend_activity WHERE actor_name = ANY($1::text[]) ORDER BY id DESC LIMIT $2',
+        [friendNames, safeLimit],
+        { attempts: 2, label: 'FRIEND ACTIVITY READ' }
+      );
   const lastReadId = await getFriendActivityReadId(userName);
-  return { friendNames, items: rows.map(serializeFriendActivityRow).filter(Boolean), lastReadId, delta: safeAfterId > 0, older: safeBeforeId > 0, hasMore };
+  return { friendNames, items: result.rows.map(serializeFriendActivityRow).filter(Boolean), lastReadId, delta: safeAfterId > 0 };
 }
 
 const USER_NOTIFICATION_TYPES = new Set(['mention', 'reply', 'reaction', 'trophy', 'catalog']);
-const USER_NOTIFICATION_PAGE_LIMIT = 60;
+const USER_NOTIFICATION_READ_LIMIT = USER_NOTIFICATION_MAX_PER_USER;
 
 function normalizeUserNotificationName(value) {
   return normalizeText(value, '').slice(0, 80);
@@ -5588,35 +5578,25 @@ async function clearUserNotifications(userName, throughId = 0) {
   return { deletedCount: Math.max(0, Number(result.rowCount) || 0), throughId: safeThroughId, unreadCount };
 }
 
-async function getUserNotificationHistory(userName, limit = USER_NOTIFICATION_PAGE_LIMIT, afterId = 0, beforeId = 0) {
+async function getUserNotificationHistory(userName, limit = USER_NOTIFICATION_READ_LIMIT, afterId = 0) {
   const name = normalizeUserNotificationName(userName);
-  const safeLimit = Math.max(1, Math.min(USER_NOTIFICATION_PAGE_LIMIT, Number(limit) || USER_NOTIFICATION_PAGE_LIMIT));
+  const safeLimit = Math.max(1, Math.min(USER_NOTIFICATION_READ_LIMIT, Number(limit) || USER_NOTIFICATION_READ_LIMIT));
   const safeAfterId = Math.max(0, Math.floor(Number(afterId) || 0));
-  const safeBeforeId = safeAfterId > 0 ? 0 : Math.max(0, Math.floor(Number(beforeId) || 0));
-  if (!name) return { items: [], lastReadId: 0, unreadCount: 0, delta: safeAfterId > 0, older: safeBeforeId > 0, hasMore: false };
-  const queryLimit = safeLimit + 1;
-  let sql;
-  let params;
-  let label;
-  if (safeAfterId > 0) {
-    sql = `SELECT id, user_name, event_type, data, created_at FROM user_notifications WHERE user_name = $1 AND id > $2 ORDER BY id DESC LIMIT $3`;
-    params = [name, safeAfterId, queryLimit];
-    label = 'USER NOTIFICATION DELTA';
-  } else if (safeBeforeId > 0) {
-    sql = `SELECT id, user_name, event_type, data, created_at FROM user_notifications WHERE user_name = $1 AND id < $2 ORDER BY id DESC LIMIT $3`;
-    params = [name, safeBeforeId, queryLimit];
-    label = 'USER NOTIFICATION OLDER';
-  } else {
-    sql = `SELECT id, user_name, event_type, data, created_at FROM user_notifications WHERE user_name = $1 ORDER BY id DESC LIMIT $2`;
-    params = [name, queryLimit];
-    label = 'USER NOTIFICATION READ';
-  }
-  const result = await queryDbWithRetry(sql, params, { attempts: 2, label });
-  const hasMore = result.rows.length > safeLimit;
-  const rows = hasMore ? result.rows.slice(0, safeLimit) : result.rows;
+  if (!name) return { items: [], lastReadId: 0, unreadCount: 0, delta: safeAfterId > 0 };
+  const result = safeAfterId > 0
+    ? await queryDbWithRetry(
+        'SELECT id, user_name, event_type, data, created_at FROM user_notifications WHERE user_name = $1 AND id > $2 ORDER BY id DESC LIMIT $3',
+        [name, safeAfterId, safeLimit],
+        { attempts: 2, label: 'USER NOTIFICATION DELTA' }
+      )
+    : await queryDbWithRetry(
+        'SELECT id, user_name, event_type, data, created_at FROM user_notifications WHERE user_name = $1 ORDER BY id DESC LIMIT $2',
+        [name, safeLimit],
+        { attempts: 2, label: 'USER NOTIFICATION READ' }
+      );
   const lastReadId = await getUserNotificationReadId(name);
   const unreadCount = await getUserNotificationUnreadCount(name, lastReadId);
-  return { items: rows.map(serializeUserNotificationRow).filter(Boolean), lastReadId, unreadCount, delta: safeAfterId > 0, older: safeBeforeId > 0, hasMore };
+  return { items: result.rows.map(serializeUserNotificationRow).filter(Boolean), lastReadId, unreadCount, delta: safeAfterId > 0 };
 }
 
 function resolveKnownNotificationUserName(value) {
@@ -7116,15 +7096,13 @@ io.on('connection', (socket) => {
     const name = socket.userName;
     if (!name || !userDatabase[name]) { respond({ ok: false, items: [], unreadCount: 0, error: 'Profile is not available.' }); return; }
     try {
-      const result = await getUserNotificationHistory(name, data && data.limit, data && data.afterId, data && data.beforeId);
+      const result = await getUserNotificationHistory(name, data && data.limit, data && data.afterId);
       respond({
         ok: true,
         items: result.items,
         lastReadId: result.lastReadId || 0,
         unreadCount: result.unreadCount || 0,
         delta: result.delta === true,
-        older: result.older === true,
-        hasMore: result.hasMore === true
       });
     } catch (err) {
       console.error('[USER NOTIFICATION READ ERROR]:', err && err.message ? err.message : err);
@@ -7191,7 +7169,7 @@ io.on('connection', (socket) => {
       const friendNames = extractFriendActivityNames(await getUserDataPayloadFromDb(name, 'friends'));
       if (!socket.connected || socket.__friendActivityRequestToken !== requestToken) return;
       setFriendActivitySubscription(socket, friendNames);
-      const result = await getFriendActivityHistoryForUser(name, data && data.limit, data && data.afterId, friendNames, data && data.beforeId);
+      const result = await getFriendActivityHistoryForUser(name, data && data.limit, data && data.afterId, friendNames);
       if (!socket.connected || socket.__friendActivityRequestToken !== requestToken) return;
       respond({
         ok: true,
@@ -7199,8 +7177,6 @@ io.on('connection', (socket) => {
         friendCount: result.friendNames.length,
         lastReadId: result.lastReadId || 0,
         delta: result.delta === true,
-        older: result.older === true,
-        hasMore: result.hasMore === true
       });
     } catch (err) {
       if (socket.__friendActivityRequestToken !== requestToken) return;
