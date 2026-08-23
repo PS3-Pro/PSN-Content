@@ -2440,6 +2440,7 @@ body.chat-selection-mode .chat-message-actions .chat-delete-action:not(.chat-del
 @media (prefers-reduced-motion:reduce) { .anim-out, #view-browse.browse-context-forward-out, #view-browse.browse-context-forward-in, #view-browse.browse-context-back-out, #view-browse.browse-context-back-in { animation-duration: .01ms !important; animation-delay: 0ms !important; } }
 
 /* ========================================================================== PAGE ENTRANCE (FADE-IN UP & EXCEPTIONS) ========================================================================== */
+.view-entry-prep { opacity:0 !important; transform:scale(.99) !important; filter:blur(4px) !important; }
 .anim-up { transform-origin: top center; animation: view-enter 0.4s cubic-bezier(0.2,0.8,0.2,1) forwards !important; }
 #view-explore.anim-up { animation: explore-view-enter 0.4s cubic-bezier(0.2,0.8,0.2,1) forwards !important; }
 
@@ -8893,6 +8894,23 @@ P
 	}
 	window.safeLocalStorageSet = safeLocalStorageSet;
 
+	/* ========================================================================== GLOBAL POINTER INPUT ========================================================================== */
+	function blockSecondaryMouseInteraction(event) {
+		if (!event || event.button !== 2) return;
+		event.preventDefault();
+		event.stopImmediatePropagation();
+	}
+
+	document.addEventListener('pointerdown', blockSecondaryMouseInteraction, { capture: true });
+	document.addEventListener('pointerup', blockSecondaryMouseInteraction, { capture: true });
+	document.addEventListener('mousedown', blockSecondaryMouseInteraction, { capture: true });
+	document.addEventListener('mouseup', blockSecondaryMouseInteraction, { capture: true });
+	document.addEventListener('auxclick', blockSecondaryMouseInteraction, { capture: true });
+	document.addEventListener('contextmenu', event => {
+		event.preventDefault();
+		event.stopImmediatePropagation();
+	}, { capture: true });
+
 	/* ========================================================================== MOBILE HAPTIC FEEDBACK ========================================================================== */
 	const psnHapticPatterns = {
 		success: [{ duration: 34, intensity: 0.75 }, { delay: 55, duration: 44, intensity: 1 }],
@@ -14736,7 +14754,7 @@ P
     window.addEventListener('blur', () => {
         document.body.classList.add('window-inactive');
     });
-    
+
     let dlAnimationTimer = null;
     let musicWasPlaying = false;
 
@@ -16380,7 +16398,10 @@ P
         if (typeof syncBrowseRegionSelectState === 'function') syncBrowseRegionSelectState('games');
         if (typeof renderLetterFilter === 'function') renderLetterFilter();
 
-        if (options && options.clearData) currentData = [];
+        if (options && options.clearData) {
+            const cachedGames = (window.psnStoreRenderCache && window.psnStoreRenderCache.games) || (window.psnStoreCache && window.psnStoreCache.games);
+            currentData = Array.isArray(cachedGames) ? cachedGames : [];
+        }
     }
 
     function isBrowseMainListScreen() {
@@ -18728,16 +18749,8 @@ P
 		else if (tab === 'online') {
 			document.getElementById('top-nav-online')?.classList.add('active');
 			if(groups.online) groups.online.style.display = 'block';
-			
-			const openOnlineFeatured = () => {
-				if (typeof showOnlineSection === 'function') showOnlineSection('featured', true);
-			};
-			if (currentView === 'view-explore') {
-				switchView('view-online', false, true, openOnlineFeatured);
-			} else {
-				switchView('view-online', false, true);
-				openOnlineFeatured();
-			}
+			const openOnlineFeatured = () => { if (typeof showOnlineSection === 'function') showOnlineSection('featured', true); };
+			switchView('view-online', false, true, openOnlineFeatured);
 		}
 		else if (tab === 'admin') {
 			if (typeof openAdminPanel === 'function') openAdminPanel();
@@ -18800,9 +18813,7 @@ P
 			}
 			if(chatView) {
 				chatView.style.display = 'flex';
-				chatView.classList.remove('anim-up');
-				void chatView.offsetWidth;
-				chatView.classList.add('anim-up');
+				restartEntryAnimationWithoutReflow(chatView);
 			}
 			
 			if(btnChat) btnChat.classList.add('active');
@@ -18834,15 +18845,11 @@ P
 				}
 			}
 
-			let chatRenderPromise = null;
 			const chatBoxBeforeRender = document.getElementById('chat-messages');
 			const chatRowsAlreadyVisible = !!(chatBoxBeforeRender && chatBoxBeforeRender.querySelector('[id^="msg-row-"]'));
 			if (chatRowsAlreadyVisible && typeof getChatHistoryRenderSignature === 'function') {
 				window.__chatHistoryDomRendered = true;
 				window.__chatHistoryRenderSignature = getChatHistoryRenderSignature(window.messageHistory || []);
-			}
-			if (typeof renderDeferredChatHistory === 'function' && !requestedFreshChatHistory && !window.__chatNotificationJumpPreparingToken) {
-				chatRenderPromise = renderDeferredChatHistory({ reason: 'open-chat', force: !chatRowsAlreadyVisible && !window.__chatHistoryDomRendered });
 			}
 			const scrollAfterChatRender = () => {
 				if (window.__chatInitialSnapshotPending === true) return;
@@ -18892,8 +18899,17 @@ P
 				}
 				if (typeof scrollChatToUnreadOrBottom === 'function') scrollChatToUnreadOrBottom({ restoreSmooth: true, setupDivider: true, settleBottom: true });
 			};
-			if (chatRenderPromise && typeof chatRenderPromise.then === 'function') chatRenderPromise.then(scrollAfterChatRender);
-			else requestAnimationFrame(scrollAfterChatRender);
+			const startChatOpenWork = () => {
+				let chatRenderPromise = null;
+				if (typeof renderDeferredChatHistory === 'function' && !requestedFreshChatHistory && !window.__chatNotificationJumpPreparingToken) {
+					chatRenderPromise = renderDeferredChatHistory({ reason: 'open-chat', force: !chatRowsAlreadyVisible && !window.__chatHistoryDomRendered });
+				}
+				if (chatRenderPromise && typeof chatRenderPromise.then === 'function') chatRenderPromise.then(scrollAfterChatRender);
+				else requestAnimationFrame(scrollAfterChatRender);
+			};
+			if (window.__chatNotificationJumpPreparingToken) startChatOpenWork();
+			else if (typeof scheduleViewOpenWork === 'function') scheduleViewOpenWork('view-chat', startChatOpenWork);
+			else startChatOpenWork();
 	
 		} else if (section === 'friends') {
 			if(chatView) {
@@ -18906,9 +18922,7 @@ P
 			}
 			if(friendsView) {
 				friendsView.style.display = 'flex';
-				friendsView.classList.remove('anim-up');
-				void friendsView.offsetWidth;
-				friendsView.classList.add('anim-up');
+				restartEntryAnimationWithoutReflow(friendsView);
 			}
 			
 			if(btnFriends) btnFriends.classList.add('active');
@@ -18925,21 +18939,27 @@ P
 				searchInput.setAttribute('spellcheck', 'false');
 			}
 	
-			if (typeof renderFriendsList === 'function') renderFriendsList('');
+			if (typeof renderFriendsList === 'function') {
+				runViewOpenWork('view-chat', () => {
+					if (friendsView && friendsView.style.display === 'flex') renderFriendsList('');
+				});
+			}
 	
 		} else if (section === 'activity') {
 			if(chatView) { chatView.style.display = 'none'; chatView.classList.remove('anim-up'); }
 			if(friendsView) { friendsView.style.display = 'none'; friendsView.classList.remove('anim-up'); }
 			if(activityView) {
 				activityView.style.display = 'flex';
-				activityView.classList.remove('anim-up');
-				void activityView.offsetWidth;
-				activityView.classList.add('anim-up');
+				restartEntryAnimationWithoutReflow(activityView);
 			}
 			if(btnActivity) btnActivity.classList.add('active');
 			if(searchBar) searchBar.style.display = 'none';
 			if(searchInput) searchInput.value = '';
-			if(typeof window.requestFriendActivity === 'function') window.requestFriendActivity();
+			if(typeof window.requestFriendActivity === 'function') {
+				runViewOpenWork('view-chat', () => {
+					if (activityView && activityView.style.display === 'flex') window.requestFriendActivity();
+				});
+			}
 		}
 	
 		if (typeof updateSidebarLight === 'function') {
@@ -21427,6 +21447,41 @@ P
 	})();
 
 
+
+	function getBrowseAppliedStateSignature() {
+		const checkedValues = selector => Array.from(document.querySelectorAll(selector)).filter(el => el.checked).map(el => el.value).join(',');
+		const searchInput = document.getElementById('search-input');
+		const catSelect = document.getElementById('cat-select');
+		const regionSelect = document.getElementById('region-select');
+		const missingRapToggle = document.getElementById('show-missing-rap-toggle');
+		const groupTitlesToggle = typeof getBrowseGroupTitleToggle === 'function' ? getBrowseGroupTitleToggle() : document.getElementById('group-titles-toggle');
+		return [
+			catSelect ? catSelect.value : 'games',
+			regionSelect ? regionSelect.value : 'ALL',
+			searchInput ? String(searchInput.value || '').trim().toLowerCase() : '',
+			typeof activeLetter !== 'undefined' ? activeLetter : 'ALL',
+			checkedValues('#console-filters input'),
+			checkedValues('#app-filters input'),
+			missingRapToggle && missingRapToggle.checked ? 'missing:1' : 'missing:0',
+			groupTitlesToggle && groupTitlesToggle.checked ? 'group:1' : 'group:0',
+			window.sortOrders && window.sortOrders.browse ? window.sortOrders.browse : 'asc',
+			browseExpandedGroupTitle && browseExpandedGroupTitle.key ? `groupkey:${browseExpandedGroupTitle.key}` : '',
+			navHistory && navHistory.lockSearch ? `nav:${String(navHistory.contextualGameTitle || navHistory.fromExplore || 'locked')}` : ''
+		].join('|');
+	}
+
+	function markBrowseAppliedState() {
+		window.__browseLastAppliedDataRef = currentData;
+		window.__browseLastAppliedStateSignature = getBrowseAppliedStateSignature();
+		const grid = document.getElementById('database-grid');
+		if (grid) grid.dataset.browseStateReady = '1';
+	}
+
+	function canReuseBrowseAppliedState() {
+		const grid = document.getElementById('database-grid');
+		return !!(grid && grid.dataset.browseStateReady === '1' && window.__browseLastAppliedDataRef === currentData && window.__browseLastAppliedStateSignature === getBrowseAppliedStateSignature());
+	}
+
 	window.applyBrowseToolbarFilterChange = function() {
 		const scrollArea = document.getElementById('scroll-area') || document.querySelector('.content');
 		window.__browsePreserveScrollOnNextFilter = true;
@@ -21602,6 +21657,7 @@ P
 		renderGrid(false, {
 			restoreScrollTop: (preserveBrowseScrollOnThisFilter && !forceBrowseTopOnThisFilter) ? preserveBrowseScrollValue : null
 		});
+		markBrowseAppliedState();
 
 		if (preserveBrowseScrollOnThisFilter && !forceBrowseTopOnThisFilter) {
 			const restoreBrowseToolbarScroll = () => {
@@ -22223,10 +22279,9 @@ P
             el.style.opacity = '0';
             el.style.transform = '';
             el.style.setProperty('--tile-idx', Math.min(index, 12));
-            void el.offsetWidth;
         });
 
-        requestAnimationFrame(() => {
+        requestAnimationFrame(() => requestAnimationFrame(() => {
             visibleTargets.forEach(el => {
                 if (!el || !el.isConnected) return;
                 el.style.animation = '';
@@ -22241,7 +22296,7 @@ P
                 };
                 el.addEventListener('animationend', onRevealEnd);
             });
-        });
+        }));
     };
     
     document.addEventListener('DOMContentLoaded', () => {
@@ -22250,21 +22305,17 @@ P
         });
     });
 
-    let browseResizeRenderTimer = null;
+    let browseResizeFrame = 0;
     window.addEventListener('resize', () => {
         g_browseViewportCache = null;
         g_browseViewportCacheAt = 0;
 
-        if (typeof setupAllVisibleSkeletonAnimations === 'function') setupAllVisibleSkeletonAnimations(document);
-
-        clearTimeout(browseResizeRenderTimer);
-        browseResizeRenderTimer = setTimeout(() => {
-            if (document.hidden) return;
-            if (document.getElementById('view-browse').style.display === 'block') {
-                renderGrid();
-            }
-        }, 140);
-    });
+        if (browseResizeFrame) cancelAnimationFrame(browseResizeFrame);
+        browseResizeFrame = requestAnimationFrame(() => {
+            browseResizeFrame = 0;
+            if (typeof setupAllVisibleSkeletonAnimations === 'function') setupAllVisibleSkeletonAnimations(document);
+        });
+    }, { passive: true });
 
     document.getElementById('cat-select').addEventListener('change', (e) => {
         playUiDropdownSelect();
@@ -25846,6 +25897,7 @@ P
 	
 		if (window.downloadHistory.length === 0) {
 			cancelDownloadSwipeHintPreview(true);
+			delete listContainer.dataset.downloadRenderSignature;
 			listContainer.innerHTML = `
 				<div style="text-align: center; color: #888; padding: 100px 50px; background: rgba(0,0,0,0.2); border-radius: 12px; border: 1px dashed rgba(255,255,255,0.05); backdrop-filter: blur(5px);">
 					<i class="fas fa-download" style="font-size: 50px; margin-bottom: 20px; opacity: 0.2;"></i>
@@ -25874,6 +25926,17 @@ P
 		if(statCount) statCount.innerText = window.downloadHistory.length;
 		if(statSize) statSize.innerText = formatSizeFromBytes(totalBytes);
 		if(globalCount) globalCount.innerText = `(${window.formatUiCount ? window.formatUiCount(window.downloadHistory.length, 'item', 'items') : `${window.downloadHistory.length} ${window.downloadHistory.length === 1 ? 'item' : 'items'}`})`;
+
+		const downloadRenderSignature = window.downloadHistory.map(dl => [
+			getDownloadNotificationItemKey(dl), dl.date || '', dl.sizeText || '', Number(dl.downloadCount) || 1,
+			dl.sentToPs3 === true ? 1 : 0, dl.cleanName || dl.name || '', dl.category || '', dl.contentId || ''
+		].join('~')).join('|');
+		const canReuseDownloadDom = listContainer.dataset.downloadRenderSignature === downloadRenderSignature && !!listContainer.querySelector('.download-swipe-row');
+		if (canReuseDownloadDom) {
+			if (!isSilentRender && typeof setupRevealAnimations === 'function') setupRevealAnimations(listContainer, { selector:'.download-item', root:listContainer, margin:18 });
+			scheduleDownloadSwipeHint();
+			return;
+		}
 		
 		listContainer.innerHTML = window.downloadHistory.map((dl, index) => {
 			dl = (typeof window.sanitizeDownloadCoverRecord === 'function') ? window.sanitizeDownloadCoverRecord(dl, 'downloads') : dl;
@@ -25937,6 +26000,7 @@ P
 				</div>
 			`;
 		}).join('');
+		listContainer.dataset.downloadRenderSignature = downloadRenderSignature;
 		if (!isSilentRender && typeof setupRevealAnimations === 'function') {
 			setupRevealAnimations(listContainer, { selector:'.download-item', root:listContainer, margin:18 });
 		}
@@ -29954,6 +30018,45 @@ P
 		window.__viewExitTimer = setTimeout(finish, exitDuration);
 	}
 
+
+	const viewOpenWorkTokens = new Map();
+	function scheduleViewOpenWork(viewId, work) {
+		if (typeof work !== 'function') return 0;
+		const token = (viewOpenWorkTokens.get(viewId) || 0) + 1;
+		viewOpenWorkTokens.set(viewId, token);
+		requestAnimationFrame(() => {
+			setTimeout(() => {
+				if (viewOpenWorkTokens.get(viewId) !== token) return;
+				if (!isPsnDomSectionVisible(viewId)) return;
+				work();
+			}, 0);
+		});
+		return token;
+	}
+	window.scheduleViewOpenWork = scheduleViewOpenWork;
+
+	function runViewOpenWork(viewId, work, immediate = false) {
+		if (typeof work !== 'function') return 0;
+		if (immediate || window.isRestoringHistory) {
+			work();
+			return 0;
+		}
+		return scheduleViewOpenWork(viewId, work);
+	}
+	window.runViewOpenWork = runViewOpenWork;
+
+	function restartEntryAnimationWithoutReflow(el) {
+		if (!el) return;
+		el.classList.remove('anim-up');
+		el.classList.add('view-entry-prep');
+		requestAnimationFrame(() => {
+			if (!el.isConnected) return;
+			el.classList.remove('view-entry-prep');
+			el.classList.add('anim-up');
+		});
+	}
+	window.restartEntryAnimationWithoutReflow = restartEntryAnimationWithoutReflow;
+
 	window.switchView = function(viewId, forceReset = false, preventAutoLoad = false, onShown = null, _skipExit = false) {
 		const mainViews = ['view-explore', 'view-browse', 'view-wishlist', 'view-downloads', 'view-library', 'view-trending', 'view-online'];
 		const profileUtils = ['view-chat', 'view-trophies', 'view-rewards'];
@@ -30122,9 +30225,7 @@ P
 		if (target) {
 			if (viewId === 'view-rewards') target.classList.add('rewards-reveal-prep');
 			target.style.display = 'block';
-			target.classList.remove('anim-up');
-			void target.offsetWidth;
-			target.classList.add('anim-up');
+			restartEntryAnimationWithoutReflow(target);
 			
 			if (!window.isRestoringHistory) {
 				const carousels = target.querySelectorAll('.horizontal-scroll');
@@ -30187,18 +30288,20 @@ P
 
 		if (viewId === 'view-trending') {
 			document.getElementById('nav-trending')?.classList.add('active');
-			if (typeof renderCachedTrendingIfVisible === 'function') renderCachedTrendingIfVisible();
-			['trending-dl-grid', 'trending-wish-grid'].forEach(id => {
-				const container = document.getElementById(id);
-				if (!container) return;
-				if (typeof setupSkeletonAnimations === 'function') setupSkeletonAnimations(id);
-				container.querySelectorAll('.game-card').forEach(card => resetRevealTargetToStatic(card, 'anim-reveal'));
-				if (typeof setupRevealAnimations === 'function') setupRevealAnimations(id);
+			runViewOpenWork('view-trending', () => {
+				if (typeof renderCachedTrendingIfVisible === 'function') renderCachedTrendingIfVisible();
+				['trending-dl-grid', 'trending-wish-grid'].forEach(id => {
+					const container = document.getElementById(id);
+					if (!container) return;
+					if (typeof setupSkeletonAnimations === 'function') setupSkeletonAnimations(id);
+					container.querySelectorAll('.game-card').forEach(card => resetRevealTargetToStatic(card, 'anim-reveal'));
+					if (typeof setupRevealAnimations === 'function') setupRevealAnimations(id);
+				});
 			});
 		}
 
 		if (viewId === 'view-library' && typeof window.refreshVisibleFavoriteCardsFromProfileSync === 'function') {
-			window.refreshVisibleFavoriteCardsFromProfileSync();
+			runViewOpenWork('view-library', () => window.refreshVisibleFavoriteCardsFromProfileSync());
 		}
 	
 		if (profileUtils.includes(viewId)) {
@@ -30267,54 +30370,61 @@ P
 				} else if (typeof renderWishLetterFilter === 'function') {
 					renderWishLetterFilter();
 				}
-				if (typeof updateWishlistUI === 'function') updateWishlistUI();
+				if (typeof updateWishlistUI === 'function') {
+					if (window.isRestoringHistory) updateWishlistUI();
+					else scheduleViewOpenWork('view-wishlist', () => updateWishlistUI());
+				}
 			}
 	
-			if (!preventAutoLoad) {
-				if (forceReset) {
-					navHistory = null;
-					if (typeof resetAllFilters === 'function') resetAllFilters();
-					if (catSelect) catSelect.value = "games";
-					if (consoleFilters) consoleFilters.style.display = 'flex';
-					if (typeof fetchDatabase === 'function') fetchDatabase();
-				} else if (typeof currentData !== 'undefined' && currentData.length === 0) {
-					if (typeof fetchDatabase === 'function') fetchDatabase();
-				} else {
-					if (viewId !== 'view-chat' && typeof applyFilters === 'function') applyFilters();
-				}
+			if (!preventAutoLoad && viewId === 'view-browse') {
+				const openBrowse = () => {
+					if (forceReset) {
+						navHistory = null;
+						if (typeof resetAllFilters === 'function') resetAllFilters();
+						if (catSelect) catSelect.value = "games";
+						if (consoleFilters) consoleFilters.style.display = 'flex';
+						if (typeof fetchDatabase === 'function') fetchDatabase();
+					} else if (typeof currentData !== 'undefined' && currentData.length === 0) {
+						if (typeof fetchDatabase === 'function') fetchDatabase();
+					} else {
+						const reuseBrowse = canReuseBrowseAppliedState();
+						if (!reuseBrowse && typeof applyFilters === 'function') {
+							applyFilters();
+						} else if (reuseBrowse) {
+							const grid = document.getElementById('database-grid');
+							if (grid && typeof setupRevealAnimations === 'function') setupRevealAnimations(grid, { selector: '.game-card' });
+							if (typeof setupInfiniteScroll === 'function' && (window.__browseRenderDataLength || filteredData.length) > renderLimit) setupInfiniteScroll();
+						}
+					}
+				};
+				if (window.isRestoringHistory) openBrowse();
+				else scheduleViewOpenWork('view-browse', openBrowse);
 			}
 		} else {
 			if (searchBar) searchBar.style.display = 'none';
 	
 			if (viewId === 'view-explore') {
-				requestAnimationFrame(() => requestAnimationFrame(() => {
+				runViewOpenWork('view-explore', () => {
 					if (typeof syncRecentlyVisitedLayout === 'function') syncRecentlyVisitedLayout();
-				}));
-				if (typeof populateExploreTab === 'function') {
-					const exploreTarget = document.getElementById('view-explore');
-					const hasExploreCards = !!(exploreTarget && exploreTarget.querySelector('.horizontal-scroll .game-card'));
-					const exploreLoad = hasExploreCards
-						? Promise.resolve()
-						: (window.__exploreFastLoadPromise || populateExploreTab({ animateCards: true, reason: 'switch-fast' }));
-					if (!window.__exploreFastLoadPromise && exploreLoad && typeof exploreLoad.then === 'function') window.__exploreFastLoadPromise = exploreLoad;
-					if (exploreLoad && typeof exploreLoad.then === 'function') {
-						exploreLoad.then(() => {
-							const target = document.getElementById('view-explore');
-							if (target && target.style.display !== 'none' && typeof replayExploreCardsReveal === 'function') {
-								replayExploreCardsReveal({ allowDuringBoot: true });
-							}
-						}).catch(err => console.warn('Explore refresh failed:', err));
+					if (typeof populateExploreTab === 'function') {
+						const exploreTarget = document.getElementById('view-explore');
+						const hasExploreCards = !!(exploreTarget && exploreTarget.querySelector('.horizontal-scroll .game-card'));
+						const exploreLoad = hasExploreCards
+							? Promise.resolve()
+							: (window.__exploreFastLoadPromise || populateExploreTab({ animateCards: true, reason: 'switch-fast' }));
+						if (!window.__exploreFastLoadPromise && exploreLoad && typeof exploreLoad.then === 'function') window.__exploreFastLoadPromise = exploreLoad;
+						if (exploreLoad && typeof exploreLoad.then === 'function') {
+							exploreLoad.then(() => {
+								const target = document.getElementById('view-explore');
+								if (target && target.style.display !== 'none' && typeof replayExploreCardsReveal === 'function') replayExploreCardsReveal({ allowDuringBoot: true });
+							}).catch(err => console.warn('Explore refresh failed:', err));
+						}
 					}
-				}
+				});
 				if (typeof updateBanner === 'function') { updateBanner(false); startAutoSlide(); }
 			} 
 			else if (viewId === 'view-online') {
-				if (!preventAutoLoad && typeof showOnlineSection === 'function') {
-					showOnlineSection('featured', true);
-				}
-				if (typeof window.maybeStartRevivedPlayersOnlineUpdates === 'function') {
-					window.maybeStartRevivedPlayersOnlineUpdates(true);
-				}
+				if (!preventAutoLoad && typeof showOnlineSection === 'function') runViewOpenWork('view-online', () => showOnlineSection('featured', true));
 			}
 			else if (viewId === 'view-trophies') {
 				const dot = document.getElementById('trophy-dot');
@@ -30326,12 +30436,14 @@ P
 					socketChat.emit('request_trophy_stats');
 				}
 				
-				renderTrophiesView();
-	
-				setTimeout(() => {
-					const newTrophy = document.querySelector('#trophy-grid-container .is-new');
-					if (newTrophy) newTrophy.scrollIntoView({ behavior: 'smooth', block: 'center' });
-				}, 300);
+				runViewOpenWork('view-trophies', () => {
+					if (typeof renderTrophiesView === 'function') renderTrophiesView();
+					setTimeout(() => {
+						if (!isPsnDomSectionVisible('view-trophies')) return;
+						const newTrophy = document.querySelector('#trophy-grid-container .is-new');
+						if (newTrophy) newTrophy.scrollIntoView({ behavior: 'smooth', block: 'center' });
+					}, 300);
+				});
 	
 				window.trophyAnimationTimer = setTimeout(() => {
 					let changed = false;
@@ -30352,21 +30464,17 @@ P
 				saveState('psn_dl_dot', 'false');
 				saveState('psn_dl_dot_items', '[]');
 			
-				if (typeof updateDownloadUI === 'function') updateDownloadUI();
-			
-				if (!window.isRestoringHistory) {
-					requestAnimationFrame(() => {
+				runViewOpenWork('view-downloads', () => {
+					if (typeof updateDownloadUI === 'function') updateDownloadUI();
+					if (!window.isRestoringHistory) {
 						const list = document.getElementById('downloads-list');
-						if (!list) return;
-			
-						list.style.scrollBehavior = 'auto';
-						list.scrollTop = 0;
-			
-						setTimeout(() => {
-							list.style.scrollBehavior = 'smooth';
-						}, 100);
-					});
-				}
+						if (list) {
+							list.style.scrollBehavior = 'auto';
+							list.scrollTop = 0;
+							setTimeout(() => { if (list.isConnected) list.style.scrollBehavior = 'smooth'; }, 100);
+						}
+					}
+				});
 			
 				window.dlAnimationTimer = setTimeout(() => {
 					if (window.downloadHistory && window.downloadHistory.length > 0) {
@@ -30407,40 +30515,34 @@ P
 				}, 150);
 			}
 			else if (viewId === 'view-notifications') {
-				if (typeof window.requestNotificationCenter === 'function') window.requestNotificationCenter();
+				runViewOpenWork('view-notifications', () => {
+					if (typeof window.requestNotificationCenter === 'function') window.requestNotificationCenter();
+				});
 			}
 			else if (viewId === 'view-settings') {
-				document.querySelectorAll('#view-settings .setting-item').forEach((item, index) => {
-					if (window.isRestoringHistory) {
-						resetRevealTargetToStatic(item, 'anim-reveal');
-						return;
-					}
-					item.classList.remove('anim-reveal', 'no-anim');
-					item.style.setProperty('--tile-idx', index);
-					void item.offsetWidth;
-					item.classList.add('anim-reveal');
+				runViewOpenWork('view-settings', () => {
+					const settingsView = document.getElementById('view-settings');
+					if (!settingsView) return;
+					if (window.isRestoringHistory) settingsView.querySelectorAll('.setting-item').forEach(item => resetRevealTargetToStatic(item, 'anim-reveal'));
+					else if (typeof setupRevealAnimations === 'function') setupRevealAnimations(settingsView, { selector:'.setting-item', animClass:'anim-reveal' });
 				});
 			}
 			else if (viewId === 'view-guides') {
-				document.querySelectorAll('#view-guides .promo-card-dark').forEach((card, index) => {
-					if (window.isRestoringHistory) {
-						resetRevealTargetToStatic(card, 'guide-anim-reveal');
-						return;
-					}
-					card.classList.remove('guide-anim-reveal', 'no-anim');
-					card.style.setProperty('--tile-idx', index);
-					void card.offsetWidth;
-					card.classList.add('guide-anim-reveal');
+				runViewOpenWork('view-guides', () => {
+					const guidesView = document.getElementById('view-guides');
+					if (!guidesView) return;
+					if (window.isRestoringHistory) guidesView.querySelectorAll('.promo-card-dark').forEach(card => resetRevealTargetToStatic(card, 'guide-anim-reveal'));
+					else if (typeof setupRevealAnimations === 'function') setupRevealAnimations(guidesView, { selector:'.promo-card-dark', animClass:'guide-anim-reveal' });
 				});
 			}
 			else if (viewId === 'view-admin') {
 				document.getElementById('top-nav-admin')?.classList.remove('active');
 				document.querySelectorAll('.sidebar-menu li').forEach(el => el.classList.remove('active'));
 				document.getElementById('nav-admin-footer')?.classList.add('active');
-				if (typeof renderAdminPanel === 'function') renderAdminPanel();
+				runViewOpenWork('view-admin', () => { if (typeof renderAdminPanel === 'function') renderAdminPanel(); });
 			}
 			else if (viewId === 'view-rewards') {
-				if (typeof renderRewardsView === 'function') renderRewardsView({ replayEntry: true });
+				runViewOpenWork('view-rewards', () => { if (typeof renderRewardsView === 'function') renderRewardsView({ replayEntry: true }); });
 			}
 		}
 	
@@ -31961,7 +32063,17 @@ P
 			filteredWishlist.map(game => getWishlistDotKey(game)).join('|')
 		]);
 		const wishlistCanAppend = appendProgressive && grid.dataset.progressiveGridSignature === wishlistProgressiveSignature;
+		const wishlistCanReuseExisting = !appendProgressive && grid.dataset.progressiveGridSignature === wishlistProgressiveSignature && wishlistPreviouslyRendered > 0 && !!grid.querySelector('.game-card') && !(pendingWishlistRevealKeys && pendingWishlistRevealKeys.length);
 		clearProgressiveGridObserver('wishlist', grid);
+		if (wishlistCanReuseExisting) {
+			const reusedRenderEnd = Math.min(wishlistPreviouslyRendered, filteredWishlist.length);
+			grid.dataset.progressiveGridRendered = String(reusedRenderEnd);
+			if (typeof window.refreshStoreInstalledChecks === 'function') window.refreshStoreInstalledChecks();
+			if (typeof renderWishLetterFilter === 'function') renderWishLetterFilter();
+			if (!isSilent && typeof setupRevealAnimations === 'function') setupRevealAnimations('wishlist-grid', { selector: '.game-card:not(.category-wishlist-entry)' });
+			setupProgressiveGridObserver('wishlist', grid, reusedRenderEnd, filteredWishlist.length, () => window.updateWishlistUI(true, 'append'));
+			return;
+		}
 		if (!wishlistCanAppend) {
 			grid.innerHTML = '';
 			grid.dataset.progressiveGridSignature = wishlistProgressiveSignature;
@@ -32138,7 +32250,8 @@ P
 		}
 
 		if (document.getElementById('view-online').style.display !== 'block') {
-			switchView('view-online', false, true);
+			switchView('view-online', false, true, () => showOnlineSection(section, true, noScrollToTop));
+			return;
 		}
 	
 		const featuredView = document.getElementById('subview-online-featured');
@@ -32163,9 +32276,6 @@ P
 		} else {
 			targetView = revivedView;
 			navRev?.classList.add('active');
-			
-			const revivedAlreadyPopulated = !!(revivedView && revivedView.querySelector('.game-card, .revived-server-card, [data-server-name]'));
-			if (typeof loadRevivedServersFromTSV === 'function' && (!window.isRestoringHistory || !revivedAlreadyPopulated)) loadRevivedServersFromTSV();
 		}
 
 		if (!noScrollToTop) {
@@ -32179,17 +32289,21 @@ P
 
         if (targetView) {
 			targetView.style.display = 'block';
-			void targetView.offsetWidth;
-			targetView.classList.add('anim-up');
-			if (typeof setupSkeletonAnimations === 'function') setupSkeletonAnimations(targetView);
-			
-			const carousels = targetView.querySelectorAll('.horizontal-scroll');
-			carousels.forEach(c => {
-				if (!window.isRestoringHistory) {
-					c.scrollLeft = 0;
+			restartEntryAnimationWithoutReflow(targetView);
+			runViewOpenWork('view-online', () => {
+				if (!targetView.isConnected || targetView.style.display === 'none') return;
+				if (section !== 'featured') {
+					const revivedAlreadyPopulated = !!targetView.querySelector('.game-card, .revived-server-card, [data-server-name]');
+					if (typeof loadRevivedServersFromTSV === 'function' && (!window.isRestoringHistory || !revivedAlreadyPopulated)) loadRevivedServersFromTSV();
 				}
-				c.querySelectorAll('.game-card').forEach(card => resetRevealTargetToStatic(card, 'anim-reveal'));
-				if (c.id && typeof setupRevealAnimations === 'function') setupRevealAnimations(c.id);
+				if (typeof setupSkeletonAnimations === 'function') setupSkeletonAnimations(targetView);
+				const carousels = targetView.querySelectorAll('.horizontal-scroll');
+				carousels.forEach(c => {
+					if (!window.isRestoringHistory) c.scrollLeft = 0;
+					c.querySelectorAll('.game-card').forEach(card => resetRevealTargetToStatic(card, 'anim-reveal'));
+					if (c.id && typeof setupRevealAnimations === 'function') setupRevealAnimations(c.id);
+				});
+				if (typeof window.maybeStartRevivedPlayersOnlineUpdates === 'function') window.maybeStartRevivedPlayersOnlineUpdates(true);
 			});
 		}
 		
@@ -39321,21 +39435,21 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 	}
 
 	let nextView = null;
+	let libraryOpenWork = null;
 
 	if (type === 'monitor') {
 		nextView = monitorView;
 		navMonitor?.classList.add('active');
 		
 		if (searchBar) searchBar.style.display = 'none';
-		if (typeof updateConsoleDashboardUI === 'function') updateConsoleDashboardUI();
+		libraryOpenWork = () => { if (typeof updateConsoleDashboardUI === 'function') updateConsoleDashboardUI(); };
 	}
 	else if (type === 'files') {
 		nextView = filesView;
 		navFiles?.classList.add('active');
 		
 		if (searchBar) searchBar.style.display = 'none';
-		
-		if (!window.isRestoringHistory || !filesView || !filesView.children.length) explorePath(currentPath || '/');
+		libraryOpenWork = () => { if (!window.isRestoringHistory || !filesView || !filesView.children.length) explorePath(currentPath || '/'); };
 	}
 	else if (type === 'favorites') {
 		nextView = favsView;
@@ -39373,39 +39487,45 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 		const libraryStatusText = String(document.getElementById('library-status')?.innerText || '');
 		const enteringDuringLibraryScan = ps3LibraryScanInProgress || /\b(?:Scanning|Refreshing)\b/i.test(libraryStatusText);
 		if (!window.isRestoringHistory) window.__pendingMyGamesScanReveal = enteringDuringLibraryScan && !hasExistingLibraryCards;
-		if ((window.isRestoringHistory || isSilent) && existingLibraryCards && typeof applyLibraryFilters === 'function') applyLibraryFilters(true);
-		else refreshPS3Library();
+		libraryOpenWork = () => {
+			if ((window.isRestoringHistory || isSilent) && existingLibraryCards && typeof applyLibraryFilters === 'function') applyLibraryFilters(true);
+			else if (typeof refreshPS3Library === 'function') refreshPS3Library();
+			if (!window.isRestoringHistory && !isSilent) {
+				requestAnimationFrame(() => requestAnimationFrame(() => {
+					const grid = document.getElementById('ps3-local-grid');
+					const hasVisibleCards = !!(grid && grid.querySelector('.game-card'));
+					if (hasVisibleCards && typeof setupRevealAnimations === 'function') {
+						window.__pendingMyGamesScanReveal = false;
+						setupRevealAnimations('ps3-local-grid');
+						return;
+					}
+					if (window.__pendingMyGamesScanReveal === true && !ps3LibraryScanInProgress && typeof revealMyGamesAfterPendingScan === 'function') revealMyGamesAfterPendingScan();
+				}));
+			}
+		};
+	}
+
+	if (type === 'favorites') {
+		const priorWork = libraryOpenWork;
+		libraryOpenWork = () => {
+			if (typeof priorWork === 'function') priorWork();
+			if (typeof updateFavoritesLibraryUI === 'function') updateFavoritesLibraryUI(!!window.isRestoringHistory || !!isSilent);
+		};
 	}
 
 	if (nextView) {
 		nextView.style.display = 'block';
-		void nextView.offsetWidth;
-		nextView.classList.add('anim-up');
+		restartEntryAnimationWithoutReflow(nextView);
 	}
 
-	if (type === 'games' && !window.isRestoringHistory && !isSilent) {
-		requestAnimationFrame(() => requestAnimationFrame(() => {
-			const grid = document.getElementById('ps3-local-grid');
-			const hasVisibleCards = !!(grid && grid.querySelector('.game-card'));
-			if (hasVisibleCards && typeof setupRevealAnimations === 'function') {
-				window.__pendingMyGamesScanReveal = false;
-				setupRevealAnimations('ps3-local-grid');
-				return;
-			}
-			if (window.__pendingMyGamesScanReveal === true && !ps3LibraryScanInProgress && typeof revealMyGamesAfterPendingScan === 'function') {
-				revealMyGamesAfterPendingScan();
-			}
-		}));
-	}
-
-	if ((type === 'games' || type === 'favorites') && typeof window.refreshVisibleFavoriteCardsFromProfileSync === 'function') {
-		window.refreshVisibleFavoriteCardsFromProfileSync();
-	}
-
-
-	if (type === 'favorites' && typeof updateFavoritesLibraryUI === 'function') {
-		updateFavoritesLibraryUI(!!window.isRestoringHistory || !!isSilent);
-	}
+	const finalLibraryOpenWork = libraryOpenWork;
+	const runLibraryContentWork = () => {
+		if (!nextView || nextView.style.display === 'none') return;
+		if (typeof finalLibraryOpenWork === 'function') finalLibraryOpenWork();
+		if ((type === 'games' || type === 'favorites') && typeof window.refreshVisibleFavoriteCardsFromProfileSync === 'function') window.refreshVisibleFavoriteCardsFromProfileSync();
+	};
+	if (window.isRestoringHistory || isSilent) runLibraryContentWork();
+	else runViewOpenWork('view-library', runLibraryContentWork);
 
 	const shouldSkipLibraryScrollReset = !!noScrollToTop || !!window.isRestoringHistory || !!window.__preserveLibraryScrollOnce;
 	if (!shouldSkipLibraryScrollReset) {
@@ -59823,6 +59943,7 @@ function getVisibleChatStackEl(id) {
 	}
 	
 	document.addEventListener('mousedown', function(e) {
+		if (e.button !== 0) return;
 		const pulse = document.createElement("div");
 		pulse.classList.add("global-click-pulse");
 		
@@ -59889,13 +60010,6 @@ function getVisibleChatStackEl(id) {
         document.addEventListener('DOMContentLoaded', initMyParticles);
     }
     
-    window.addEventListener('resize', function() {
-        if (window.pJSDom && window.pJSDom.length > 0) {
-        window.pJSDom[0].pJS.fn.vendors.destroypJS();
-        window.pJSDom = [];
-        }
-        initMyParticles();
-    });
     </script>
 <button id="ps3-pad-launch-btn" type="button" aria-label="Open PS3 virtual controller. Drag to reposition." title="Drag to reposition • Click to open">
     <span class="ps3-pad-launch-core"><span class="ps3-pad-launch-hover-icon"><i class="fa-solid fa-gamepad"></i></span></span>
@@ -60269,7 +60383,6 @@ function getVisibleChatStackEl(id) {
         button.addEventListener('pointerdown', start, { passive: false });
         button.addEventListener('pointerup', end, { passive: false });
         button.addEventListener('pointercancel', end, { passive: false });
-        button.addEventListener('contextmenu', function (event) { event.preventDefault(); });
     }
 
     function bindPadAnalog(analog) {
@@ -60363,7 +60476,6 @@ function getVisibleChatStackEl(id) {
 
         analog.addEventListener('pointerup', end, { passive: false });
         analog.addEventListener('pointercancel', end, { passive: false });
-        analog.addEventListener('contextmenu', function (event) { event.preventDefault(); });
     }
 
 
