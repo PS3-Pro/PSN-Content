@@ -28078,6 +28078,7 @@ P
 		}
 		adminUpdateMaintenanceOverlay();
 		adminForceMaintenanceOverlayForNonAdmins(normalized);
+		if (typeof window.adminSyncBackgroundTimers === 'function') window.adminSyncBackgroundTimers();
 		return normalized;
 	}
 
@@ -29113,7 +29114,8 @@ P
 		}
 		adminUpdateChatControlsBanner();
 		if (typeof adminUpdateChatControlsPanelStatus === 'function') adminUpdateChatControlsPanelStatus();
-		if (typeof adminEnsureChatControlsVisualTicker === 'function') adminEnsureChatControlsVisualTicker(normalized);
+		if (typeof window.adminSyncBackgroundTimers === 'function') window.adminSyncBackgroundTimers();
+		else if (typeof adminEnsureChatControlsVisualTicker === 'function') adminEnsureChatControlsVisualTicker(normalized);
 		adminShowChatControlToast(normalized, oldState);
 		return normalized;
 	}
@@ -29379,32 +29381,62 @@ P
 		if (hint) hint.remove();
 	}
 
-	function adminEnsureChatControlsVisualTicker(state = null) {
+	function adminChatControlsAreActive(state = null) {
 		const current = state || ((typeof window.adminGetChatControls === 'function') ? window.adminGetChatControls() : null);
-		const active = !!(current && (current.locked || (parseInt(current.slowSeconds || 0, 10) || 0) > 0));
+		return !!(current && (current.locked || (parseInt(current.slowSeconds || 0, 10) || 0) > 0));
+	}
 
-		if (window.adminChatControlsVisualTicker && !active) {
+	function adminShouldRunChatControlsRealtimeSync(state = null) {
+		if (document.hidden) return false;
+		if (!(typeof socketChat !== 'undefined' && socketChat && socketChat.connected)) return false;
+		return adminChatControlsAreActive(state) || adminIsViewVisible('view-chat') || adminIsViewVisible('view-admin');
+	}
+
+	function adminEnsureChatControlsVisualTicker(state = null) {
+		const active = adminChatControlsAreActive(state);
+		const shouldRun = active && !document.hidden;
+
+		if (window.adminChatControlsVisualTicker && !shouldRun) {
 			clearInterval(window.adminChatControlsVisualTicker);
 			window.adminChatControlsVisualTicker = null;
-			return;
 		}
 
-		if (!window.adminChatControlsVisualTicker && active) {
+		if (!window.adminChatControlsVisualTicker && shouldRun) {
 			window.adminChatControlsVisualTicker = setInterval(() => {
+				if (document.hidden || !adminChatControlsAreActive()) {
+					adminEnsureChatControlsVisualTicker();
+					return;
+				}
 				if (typeof adminUpdateChatControlsBanner === 'function') adminUpdateChatControlsBanner();
 			}, 1000);
 		}
 	}
 
+	function adminEmitChatControlsVisualSync() {
+		try {
+			if (typeof socketChat !== 'undefined' && socketChat && socketChat.connected) {
+				socketChat.emit('admin_request_chat_controls', { visualSync: true, at: Date.now() });
+				return true;
+			}
+		} catch (e) {}
+		return false;
+	}
+
 	function adminStartChatControlsRealtimeSync() {
-		if (window.adminChatControlsRealtimeSyncTimer) return;
+		if (!adminShouldRunChatControlsRealtimeSync()) {
+			adminStopChatControlsRealtimeSync();
+			return false;
+		}
+		if (window.adminChatControlsRealtimeSyncTimer) return true;
+		adminEmitChatControlsVisualSync();
 		window.adminChatControlsRealtimeSyncTimer = setInterval(() => {
-			try {
-				if (typeof socketChat !== 'undefined' && socketChat && socketChat.connected) {
-					socketChat.emit('admin_request_chat_controls', { visualSync: true, at: Date.now() });
-				}
-			} catch (e) {}
+			if (!adminShouldRunChatControlsRealtimeSync()) {
+				adminStopChatControlsRealtimeSync();
+				return;
+			}
+			adminEmitChatControlsVisualSync();
 		}, 2500);
+		return true;
 	}
 
 	function adminStopChatControlsRealtimeSync() {
@@ -30071,13 +30103,14 @@ P
 			if (typeof requestChatMentionDatabaseUsers === 'function') setTimeout(() => requestChatMentionDatabaseUsers('*'), 800);
 			adminSetChatControlsSyncState('syncing');
 			if (typeof window.adminRequestChatControlsState === 'function') window.adminRequestChatControlsState();
-			if (typeof adminStartChatControlsRealtimeSync === 'function') adminStartChatControlsRealtimeSync();
+			if (typeof window.adminSyncBackgroundTimers === 'function') window.adminSyncBackgroundTimers();
 			if (typeof adminUpdateChatControlsBanner === 'function') setTimeout(adminUpdateChatControlsBanner, 80);
 		});
 		socketChat.on('disconnect', () => {
 			adminSetChatControlsSyncState('offline');
 			syncAdminHealth('offline');
 			if (typeof adminStopChatControlsRealtimeSync === 'function') adminStopChatControlsRealtimeSync();
+			if (typeof window.adminSyncBackgroundTimers === 'function') window.adminSyncBackgroundTimers();
 		});
 		socketChat.on('connect_error', () => { adminSetChatControlsSyncState('offline'); syncAdminHealth('connecting'); });
 		socketChat.io?.on?.('reconnect_attempt', () => syncAdminHealth('connecting'));
@@ -30129,16 +30162,63 @@ P
 	}
 
 	function adminLightChatControlsUiTick() {
-		if (!adminShouldRefreshChatControlsUi()) return;
+		if (document.hidden || !adminShouldRefreshChatControlsUi()) return;
 		adminUpdateChatControlsBanner();
 	}
 
 	function adminLightMaintenanceOverlayTick() {
+		if (document.hidden) return;
 		const overlay = document.getElementById('admin-maintenance-overlay');
 		const state = (typeof adminGetMaintenanceState === 'function') ? adminGetMaintenanceState() : null;
-		if (!overlay && !(state && state.enabled)) return;
+		const scheduleEnabled = !!(state && state.schedule && state.schedule.enabled);
+		if (!overlay && !(state && state.enabled) && !scheduleEnabled) return;
 		adminUpdateMaintenanceOverlay();
 	}
+
+	function adminShouldRunChatControlsUiTimer() {
+		if (document.hidden || adminChatControlsAreActive()) return false;
+		return adminIsViewVisible('view-chat') || adminIsViewVisible('view-admin');
+	}
+
+	function adminShouldRunMaintenanceOverlayTimer() {
+		if (document.hidden) return false;
+		const overlay = document.getElementById('admin-maintenance-overlay');
+		const state = (typeof adminGetMaintenanceState === 'function') ? adminGetMaintenanceState() : null;
+		return !!overlay || !!(state && (state.enabled || (state.schedule && state.schedule.enabled)));
+	}
+
+	function adminLightAdminViewTick() {
+		if (document.hidden || !adminIsViewVisible('view-admin')) {
+			if (typeof window.adminSyncBackgroundTimers === 'function') window.adminSyncBackgroundTimers();
+			return;
+		}
+		adminInstallMaintenanceSocketListeners();
+		if (window.isProfileLoaded === true) adminInstallSocketListeners();
+		adminRefreshHealth(false);
+		if (typeof window.adminRequestReports === 'function' && (!window.adminLastReportsRequestAt || Date.now() - window.adminLastReportsRequestAt > 4500)) {
+			window.adminRequestReports(true);
+		}
+	}
+
+	function adminSetIntervalState(key, shouldRun, callback, delay) {
+		if (!shouldRun) {
+			if (window[key]) clearInterval(window[key]);
+			window[key] = null;
+			return;
+		}
+		if (!window[key]) window[key] = setInterval(callback, delay);
+	}
+
+	function adminSyncBackgroundTimers() {
+		adminEnsureChatControlsVisualTicker();
+		adminSetIntervalState('adminChatControlsUiTimer', adminShouldRunChatControlsUiTimer(), adminLightChatControlsUiTick, 6000);
+		adminSetIntervalState('adminMaintenanceOverlayTimer', adminShouldRunMaintenanceOverlayTimer(), adminLightMaintenanceOverlayTick, 10000);
+		adminSetIntervalState('adminViewRefreshTimer', !document.hidden && adminIsViewVisible('view-admin'), adminLightAdminViewTick, 5000);
+
+		if (adminShouldRunChatControlsRealtimeSync()) adminStartChatControlsRealtimeSync();
+		else adminStopChatControlsRealtimeSync();
+	}
+	window.adminSyncBackgroundTimers = adminSyncBackgroundTimers;
 
 	function adminEnsurePreAuthMaintenanceConnection(reason = 'maintenance-preauth') {
 		if (window.isProfileLoaded === true) return false;
@@ -30175,24 +30255,19 @@ P
 		setTimeout(adminLightMaintenanceOverlayTick, 180);
 		setTimeout(adminUpdateAnnouncementBanner, 220);
 		setTimeout(adminLightChatControlsUiTick, 260);
-		if (!window.adminChatControlsUiTimer) window.adminChatControlsUiTimer = setInterval(adminLightChatControlsUiTick, 6000);
-		if (!window.adminMaintenanceOverlayTimer) window.adminMaintenanceOverlayTimer = setInterval(adminLightMaintenanceOverlayTick, 10000);
 		setTimeout(() => { if (typeof window.adminRequestChatControlsState === 'function') window.adminRequestChatControlsState(); }, 2600);
-		setInterval(() => {
-			adminInstallMaintenanceSocketListeners();
-			if (window.isProfileLoaded === true) adminInstallSocketListeners();
-			const adminVisible = document.getElementById('view-admin')?.style.display === 'block';
-			if (adminVisible) {
-				adminRefreshHealth(false);
-				if (typeof window.adminRequestReports === 'function' && (!window.adminLastReportsRequestAt || Date.now() - window.adminLastReportsRequestAt > 4500)) {
-					window.adminRequestReports(true);
-				}
-			}
-		}, 5000);
+		adminSyncBackgroundTimers();
 	}
 
 	document.addEventListener('DOMContentLoaded', () => {
 		adminBootExtras();
+	});
+	document.addEventListener('visibilitychange', () => {
+		if (!document.hidden) {
+			adminLightMaintenanceOverlayTick();
+			adminLightChatControlsUiTick();
+		}
+		if (typeof window.adminSyncBackgroundTimers === 'function') window.adminSyncBackgroundTimers();
 	});
 
 	function resetWishlistNavigationFilters() {
@@ -30911,6 +30986,7 @@ P
 		}
 	
 		scheduleNavigationLightsUpdate({ sidebar: true, profile: true, nav: true });
+		if (typeof window.adminSyncBackgroundTimers === 'function') window.adminSyncBackgroundTimers();
 		if (typeof onShown === 'function') onShown(viewId);
 	};
 
@@ -34294,6 +34370,7 @@ P
 	let ps3LibraryScanInProgress = false;
 	let ps3LastAutoScanAt = 0;
 	let companionPluginLastLoadAt = 0;
+	let ps3NoIpUiStable = false;
 
 	function playPs3OfflineSound() {
 		try {
@@ -34533,22 +34610,13 @@ P
 		if (typeof isUserSessionReadyForConsole === 'function' && !isUserSessionReadyForConsole()) return;
 		ps3PingInFlight = true;
 
-		const ip = document.getElementById('ps3-ip').value;
-		const globalIcon = document.getElementById('global-status-icon');
-		const btnConnect = document.getElementById('btn-connect-ps3');
-		const btnShutdown = document.getElementById('btn-shutdown-ps3');
-		const favDot = document.getElementById('fav-dot');
-
-		const searchBar = document.querySelector('.search-bar'); 
-		const isLibraryActive = document.getElementById('view-library')?.style.display === 'block';
-		const isGamesSubActive = document.getElementById('subview-games')?.style.display === 'block' || 
-								document.getElementById('subview-games')?.style.display === 'flex';
-
-		const shouldManageSearch = isLibraryActive && isGamesSubActive;
-
+		const ipInput = document.getElementById('ps3-ip');
+		const ip = String(ipInput?.value || '').trim();
 		if (!ip) {
 			ps3PingInFlight = false;
 			ps3ConnectionMisses = 0;
+			if (ps3NoIpUiStable && _lastConnectionState === false && window.myCurrentPS3Status === null) return;
+
 			if (typeof setCompanionPluginProDetected === 'function') setCompanionPluginProDetected(false);
 			if (window.myCurrentPS3Status !== null) {
 				window.myCurrentPS3Status = null;
@@ -34562,13 +34630,34 @@ P
 				}
 			}
 
-			if (shouldManageSearch && searchBar) {
-				searchBar.style.display = 'none';
+			const libraryView = document.getElementById('view-library');
+			const gamesView = document.getElementById('subview-games');
+			if (libraryView?.style.display === 'block' && (gamesView?.style.display === 'block' || gamesView?.style.display === 'flex')) {
+				const searchBar = document.querySelector('.search-bar');
+				if (searchBar) searchBar.style.display = 'none';
 			}
 
-			applyPs3DisconnectedUi(favDot, globalIcon, btnConnect, btnShutdown);
+			applyPs3DisconnectedUi(
+				document.getElementById('fav-dot'),
+				document.getElementById('global-status-icon'),
+				document.getElementById('btn-connect-ps3'),
+				document.getElementById('btn-shutdown-ps3')
+			);
+			ps3NoIpUiStable = true;
 			return;
 		}
+
+		ps3NoIpUiStable = false;
+		const globalIcon = document.getElementById('global-status-icon');
+		const btnConnect = document.getElementById('btn-connect-ps3');
+		const btnShutdown = document.getElementById('btn-shutdown-ps3');
+		const favDot = document.getElementById('fav-dot');
+
+		const searchBar = document.querySelector('.search-bar'); 
+		const isLibraryActive = document.getElementById('view-library')?.style.display === 'block';
+		const gamesSubview = document.getElementById('subview-games');
+		const isGamesSubActive = gamesSubview?.style.display === 'block' || gamesSubview?.style.display === 'flex';
+		const shouldManageSearch = isLibraryActive && isGamesSubActive;
 
 		try {
 			const controller = new AbortController();
@@ -40291,6 +40380,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 		companionPluginLastLoadAt = 0;
 		_lastConnectionState = false;
 		window.myCurrentPS3Status = null;
+		ps3NoIpUiStable = true;
 	
 		const globalIcon = document.getElementById('global-status-icon');
 		if (globalIcon) {
