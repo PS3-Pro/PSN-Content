@@ -31,8 +31,6 @@
     <script src="https://cdnjs.cloudflare.com/ajax/libs/chance/1.0.18/chance.min.js"></script>
 	<script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
 	<link href="https://cdnjs.cloudflare.com/ajax/libs/cropperjs/1.5.13/cropper.min.css" rel="stylesheet">
-	<script src="https://cdnjs.cloudflare.com/ajax/libs/cropperjs/1.5.13/cropper.min.js"></script>
-	<script src="https://unpkg.com/fabric@5.3.0/dist/fabric.min.js"></script>
 	<meta name="theme-color" content="#0f1521">
 	<meta name="color-scheme" content="light only">
 	<script>
@@ -3121,7 +3119,7 @@ body.admin-maintenance-reveal-pending #user-select-screen, body.admin-maintenanc
 .profile-card-style-footer { flex: 0 0 auto; padding-top: 10px; margin-top: 10px; border-top: 1px solid rgba(255,255,255,.10); background: linear-gradient(180deg,rgba(18,24,36,.72),rgba(18,24,36,.92)); }
 .profile-card-style-hint { margin: 0 0 10px 0; color: var(--text-muted); font-size: 12px; text-align: center; line-height: 1.35; }
 .profile-card-style-grid { display: grid; grid-template-columns: repeat(4,minmax(0,1fr)); gap: 10px; align-items: start; }
-.profile-card-style-option { position: relative; display: flex; flex-direction: column; gap: 7px; align-items: stretch; height: auto; min-height: 0; padding: 10px 10px 7px; border-radius: 12px; border: 1px solid rgba(255,255,255,.095); background: rgba(0,0,0,.22); color: #fff; text-align: left; cursor: pointer; overflow: hidden; transition: transform .18s ease,border-color .18s ease,background .18s ease,box-shadow .18s ease; }
+.profile-card-style-option { position: relative; display: flex; flex-direction: column; gap: 7px; align-items: stretch; height: auto; min-height: 0; padding: 10px 10px 7px; border-radius: 12px; border: 1px solid rgba(255,255,255,.095); background: rgba(0,0,0,.22); color: #fff; text-align: left; cursor: pointer; overflow: hidden; transition: transform .18s ease,border-color .18s ease,background .18s ease,box-shadow .18s ease; contain: layout paint style; }
 .profile-card-style-option:hover { transform: translateY(-1px); border-color: rgba(255,255,255,.28); background: rgba(255,255,255,.06); box-shadow: 0 0 14px rgba(0,112,204,.14); }
 .profile-card-style-option.active { background: rgba(0,112,204,.10); border-color: rgba(0,112,204,.72); box-shadow: 0 0 0 1px rgba(0,112,204,.28),0 0 18px rgba(0,112,204,.20),inset 0 1px 0 rgba(255,255,255,.08); }
 .profile-card-style-option.active::after { content: none !important; display: none !important; }
@@ -9815,16 +9813,53 @@ P
 	}
 	window.ensureProfileCountryForUser = ensureProfileCountryForUser;
 
-	function renderCountryOptions(container, query, selectedCode, onSelectName) {
-		if (!container) return;
-		const search = String(query || '').trim().toLocaleLowerCase(navigator.language || 'en');
-		const matches = getProfileCountryEntries().filter(item => !search || item.name.toLocaleLowerCase(navigator.language || 'en').includes(search) || item.code.toLowerCase().includes(search));
-		container.innerHTML = matches.length ? matches.map(item => `
-			<button type="button" class="country-picker-option ${item.code === selectedCode ? 'is-selected' : ''}" role="option" aria-selected="${item.code === selectedCode}" onclick="${onSelectName}('${item.code}')">
-				<img src="${getProfileCountryFlagUrl(item.code)}" alt="" loading="lazy" referrerpolicy="no-referrer">
+	function getCountryOptionsLocale() {
+		return (typeof getInterfaceDisplayLocale === 'function' ? getInterfaceDisplayLocale() : (navigator.language || 'en')) || 'en';
+	}
+
+	function ensureCountryOptionsDom(container, onSelectName) {
+		if (!container) return [];
+		const locale = getCountryOptionsLocale();
+		const entries = getProfileCountryEntries();
+		const ready = container.dataset.countryOptionsLocale === locale &&
+			container.dataset.countryOptionsSelect === onSelectName &&
+			container.__countryOptionButtons && container.__countryOptionButtons.length === entries.length;
+		if (ready) return container.__countryOptionButtons;
+
+		container.innerHTML = entries.map(item => `
+			<button type="button" class="country-picker-option" role="option" aria-selected="false" data-country-code="${item.code}" onclick="${onSelectName}('${item.code}')">
+				<img src="${getProfileCountryFlagUrl(item.code)}" alt="" loading="lazy" decoding="async" referrerpolicy="no-referrer">
 				<span class="country-picker-option-name">${item.name}</span>
 				<span class="country-picker-option-code">${item.code}</span>
-			</button>`).join('') : '<div class="country-picker-empty">No country found</div>';
+			</button>`).join('') + '<div class="country-picker-empty" hidden>No country found</div>';
+
+		const buttons = Array.from(container.querySelectorAll(':scope > .country-picker-option'));
+		buttons.forEach((button, index) => {
+			const item = entries[index];
+			button.__countrySearchText = `${item.name} ${item.code}`.toLocaleLowerCase(locale);
+		});
+		container.__countryOptionButtons = buttons;
+		container.dataset.countryOptionsLocale = locale;
+		container.dataset.countryOptionsSelect = onSelectName;
+		return buttons;
+	}
+
+	function renderCountryOptions(container, query, selectedCode, onSelectName) {
+		if (!container) return;
+		const locale = getCountryOptionsLocale();
+		const search = String(query || '').trim().toLocaleLowerCase(locale);
+		const buttons = ensureCountryOptionsDom(container, onSelectName);
+		let visibleCount = 0;
+		buttons.forEach(button => {
+			const code = button.dataset.countryCode || '';
+			const visible = !search || String(button.__countrySearchText || '').includes(search);
+			button.hidden = !visible;
+			button.classList.toggle('is-selected', code === selectedCode);
+			button.setAttribute('aria-selected', code === selectedCode ? 'true' : 'false');
+			if (visible) visibleCount++;
+		});
+		const empty = container.querySelector(':scope > .country-picker-empty');
+		if (empty) empty.hidden = visibleCount !== 0;
 	}
 
 	function setNewProfileCountry(value, userChanged = false) {
@@ -54011,6 +54046,38 @@ function getVisibleChatStackEl(id) {
 	let currentEditorColor = '#ff4444';
 	window.__mediaEditorTarget = window.__mediaEditorTarget || 'chat';
 	window.__mediaEditorReplacePendingIndex = null;
+	let mediaEditorDependenciesPromise = null;
+
+	function loadMediaEditorScriptOnce(src, readyCheck) {
+		if (readyCheck()) return Promise.resolve();
+		return new Promise((resolve, reject) => {
+			const existing = Array.from(document.scripts).find(script => script.src === src);
+			if (existing) {
+				existing.addEventListener('load', () => readyCheck() ? resolve() : reject(new Error(`Dependency unavailable: ${src}`)), { once: true });
+				existing.addEventListener('error', () => reject(new Error(`Failed to load: ${src}`)), { once: true });
+				return;
+			}
+			const script = document.createElement('script');
+			script.src = src;
+			script.async = true;
+			script.onload = () => readyCheck() ? resolve() : reject(new Error(`Dependency unavailable: ${src}`));
+			script.onerror = () => reject(new Error(`Failed to load: ${src}`));
+			document.head.appendChild(script);
+		});
+	}
+
+	function ensureMediaEditorDependencies() {
+		if (window.Cropper && window.fabric) return Promise.resolve();
+		if (mediaEditorDependenciesPromise) return mediaEditorDependenciesPromise;
+		mediaEditorDependenciesPromise = Promise.all([
+			loadMediaEditorScriptOnce('https://cdnjs.cloudflare.com/ajax/libs/cropperjs/1.5.13/cropper.min.js', () => typeof window.Cropper === 'function'),
+			loadMediaEditorScriptOnce('https://unpkg.com/fabric@5.3.0/dist/fabric.min.js', () => !!(window.fabric && window.fabric.Canvas))
+		]).catch(error => {
+			mediaEditorDependenciesPromise = null;
+			throw error;
+		});
+		return mediaEditorDependenciesPromise;
+	}
 	window.openMediaPreviewModal = function(file) {
 		window.__mediaEditorTarget = 'chat';
 		window.__mediaEditorReplacePendingIndex = null;
@@ -54186,7 +54253,15 @@ function getVisibleChatStackEl(id) {
 		if (canvasContainer) canvasContainer.style.opacity = '1';
 	}
 
-	window.openCropModal = function(file, options) {
+	window.openCropModal = async function(file, options) {
+		try {
+			await ensureMediaEditorDependencies();
+		} catch (error) {
+			console.error('[MEDIA EDITOR] Dependencies could not load:', error);
+			if (typeof playUiError === 'function') playUiError();
+			alert('The image editor could not be loaded. Please check your connection and try again.');
+			return;
+		}
 		const replaceIndex = options && Number.isInteger(options.replacePendingIndex) ? options.replacePendingIndex : null;
 		window.__mediaEditorReplacePendingIndex = replaceIndex;
 		unlockMediaEditorModalSize();
@@ -58737,31 +58812,61 @@ function getVisibleChatStackEl(id) {
 		applyProfileCardStyle(getStoredProfileCardStyle(username));
 	}
 
-	function renderProfileCardStyleOptions() {
-		const grid = document.getElementById('profile-card-style-grid');
+	function syncProfileCardStyleOptionStates(grid, pendingStyle = '') {
 		if (!grid) return;
 		const myName = localStorage.getItem('psn_username') || '';
 		const current = readProfileCardStyleLocalValue(myName, 'default');
-		const pending = normalizeProfileCardStyle(window.pendingProfileCardStyleSelection || current);
-		grid.innerHTML = PROFILE_CARD_STYLE_OPTIONS.map(item => {
-			const unlocked = isProfileCardRewardUnlocked(item.id);
-			const isReward = !!item.rewardReq;
-			const premiumIcon = isReward ? '<span class="profile-card-style-premium-star" title="Premium reward"><i class="fas fa-star"></i></span>' : '';
-			const previewVfx = getProfileCardStylePreviewMarkup(item.id);
-			return `
-				<button type="button" class="profile-card-style-option ${item.id === pending ? 'active' : ''} ${(!unlocked && isReward) ? 'is-locked' : ''}" data-style="${item.id}" onmouseenter="playUiArrow()" onclick="selectProfileCardStyle('${item.id}')">
-					<div class="profile-card-style-preview style-${item.id}">
-						${premiumIcon}
-						${previewVfx}
-						<i class="preview-fake-bars" aria-hidden="true"></i>
-					</div>
-					<div>
-						<b class="profile-card-style-name">${item.label}</b>
-						<p class="profile-card-style-desc">${item.desc}</p>
-					</div>
-				</button>
-			`;
-		}).join('');
+		const pending = normalizeProfileCardStyle(pendingStyle || window.pendingProfileCardStyleSelection || current);
+		grid.querySelectorAll(':scope > .profile-card-style-option').forEach(btn => {
+			const styleId = btn.dataset.style || 'default';
+			const meta = getProfileCardStyleMeta(styleId);
+			btn.classList.toggle('active', styleId === pending);
+			btn.classList.toggle('is-locked', !!(meta && meta.rewardReq && !isProfileCardRewardUnlocked(styleId)));
+		});
+	}
+
+	function renderProfileCardStyleOptions() {
+		const grid = document.getElementById('profile-card-style-grid');
+		if (!grid) return;
+		const alreadyBuilt = grid.dataset.profileCardStylesBuilt === '1' && grid.children.length === PROFILE_CARD_STYLE_OPTIONS.length;
+		if (!alreadyBuilt) {
+			grid.innerHTML = PROFILE_CARD_STYLE_OPTIONS.map(item => {
+				const unlocked = isProfileCardRewardUnlocked(item.id);
+				const isReward = !!item.rewardReq;
+				const premiumIcon = isReward ? '<span class="profile-card-style-premium-star" title="Premium reward"><i class="fas fa-star"></i></span>' : '';
+				const previewVfx = getProfileCardStylePreviewMarkup(item.id);
+				return `
+					<button type="button" class="profile-card-style-option ${(!unlocked && isReward) ? 'is-locked' : ''}" data-style="${item.id}" onmouseenter="playUiArrow()" onclick="selectProfileCardStyle('${item.id}')">
+						<div class="profile-card-style-preview style-${item.id}">
+							${premiumIcon}
+							${previewVfx}
+							<i class="preview-fake-bars" aria-hidden="true"></i>
+						</div>
+						<div>
+							<b class="profile-card-style-name">${item.label}</b>
+							<p class="profile-card-style-desc">${item.desc}</p>
+						</div>
+					</button>
+				`;
+			}).join('');
+			grid.dataset.profileCardStylesBuilt = '1';
+		}
+		syncProfileCardStyleOptionStates(grid);
+	}
+
+	let profileCardStylePrewarmScheduled = false;
+	function prewarmProfileCardStyleOptions() {
+		const grid = document.getElementById('profile-card-style-grid');
+		if (!grid || grid.dataset.profileCardStylesBuilt === '1' || profileCardStylePrewarmScheduled) return;
+		profileCardStylePrewarmScheduled = true;
+		const run = () => {
+			profileCardStylePrewarmScheduled = false;
+			const picker = document.getElementById('modal-sys-profile-card-style');
+			if (!picker || picker.style.display === 'flex' || picker.style.display === 'block') return;
+			renderProfileCardStyleOptions();
+		};
+		if (window.requestIdleCallback) window.requestIdleCallback(run, { timeout: 900 });
+		else setTimeout(run, 250);
 	}
 
 	function openProfileCardStyleModal(event) {
@@ -58805,9 +58910,8 @@ function getVisibleChatStackEl(id) {
 		window.pendingProfileCardStyleSelection = safeStyle;
 		const modal = document.getElementById('modal-sys-profile-card-style');
 		if (modal) modal.dataset.profileCardPending = safeStyle;
-		document.querySelectorAll('.profile-card-style-option').forEach(btn => {
-			btn.classList.toggle('active', btn.getAttribute('data-style') === safeStyle);
-		});
+		const grid = document.getElementById('profile-card-style-grid');
+		if (grid) syncProfileCardStyleOptionStates(grid, safeStyle);
 		if (typeof playUiClick === 'function') playUiClick();
 	}
 
@@ -58837,7 +58941,8 @@ function getVisibleChatStackEl(id) {
 		safeLocalStorageSet(STORAGE_KEY_PROFILE_CARD_STYLE_UPDATED_AT, String(styleUpdatedAt));
 		saveState(STORAGE_KEY_PROFILE_CARD_STYLE, safeStyle);
 		applyProfileCardStyle(safeStyle);
-		renderProfileCardStyleOptions();
+		const styleGrid = document.getElementById('profile-card-style-grid');
+		if (styleGrid && styleGrid.dataset.profileCardStylesBuilt === '1') syncProfileCardStyleOptionStates(styleGrid, safeStyle);
 		if (typeof playUiSuccess === 'function') playUiSuccess();
 		if (previousStyle !== safeStyle && typeof checkTrophyProgress === 'function') {
 			checkTrophyProgress('banner_swap', 1);
@@ -59124,6 +59229,7 @@ function getVisibleChatStackEl(id) {
 			profileModal.style.display = 'flex';
 			requestAnimationFrame(() => {
 				profileModal.classList.add('show');
+				if (isMe) prewarmProfileCardStyleOptions();
 				setTimeout(() => {
 					const modalContent = document.querySelector('#modal-sys-profile .modal-content');
 					if (modalContent) modalContent.scrollTop = 0;
@@ -59134,87 +59240,79 @@ function getVisibleChatStackEl(id) {
 	
 	window.tempAvatarSelection = null;
 
-	window.openAvatarModal = function() {
-		const grid = document.getElementById('avatar-selection-grid');
-		const myName = localStorage.getItem('psn_username');
-		const current = window.tempAvatarSelection || localStorage.getItem(`${myName}_psn_avatar`) || AVAILABLE_AVATARS[0];
-		
-		let displayAvatars = [];
-
-		AVAILABLE_AVATARS.forEach(url => {
-			displayAvatars.push({ url: url, isReward: false, isLocked: false });
-		});
-
+	function getAvatarSelectionOptions() {
+		const displayAvatars = AVAILABLE_AVATARS.map(url => ({ url, isReward: false, isLocked: false, rewardTitle: '' }));
 		if (window.REWARDS_DATA) {
 			window.REWARDS_DATA
 				.filter(reward => reward && (reward.kind || 'avatar') === 'avatar' && reward.img)
 				.forEach(reward => {
-					const isUnlocked = window.userTrophies && window.userTrophies[reward.req] && window.userTrophies[reward.req].unlocked;
-					
-					if (!displayAvatars.some(a => a.url === reward.img)) {
-						displayAvatars.push({ 
-							url: reward.img, 
-							isReward: true, 
-							isLocked: !isUnlocked,
-							rewardTitle: reward.title
-						});
-					}
+					if (displayAvatars.some(item => item.url === reward.img)) return;
+					const isUnlocked = !!(window.userTrophies && window.userTrophies[reward.req] && window.userTrophies[reward.req].unlocked);
+					displayAvatars.push({ url: reward.img, isReward: true, isLocked: !isUnlocked, rewardTitle: reward.title || 'reward avatar' });
 				});
 		}
+		return displayAvatars;
+	}
 
+	function syncAvatarSelectionGrid(grid, current) {
+		if (!grid) return;
+		Array.from(grid.children).forEach(option => {
+			if (!option.classList || !option.classList.contains('avatar-option')) return;
+			const selected = option.dataset.avatarUrl === current && !option.classList.contains('locked');
+			option.classList.toggle('selected', selected);
+			const image = option.querySelector('img');
+			if (image && !option.classList.contains('locked')) image.style.opacity = selected ? '1' : '0.6';
+		});
+	}
+
+	function ensureAvatarSelectionGrid(grid, options) {
+		if (!grid) return;
+		const signature = options.map(item => `${item.url}|${item.isReward ? 1 : 0}|${item.isLocked ? 1 : 0}|${item.rewardTitle || ''}`).join('\n');
+		if (grid.dataset.avatarOptionsReady === '1' && grid.__avatarOptionsSignature === signature) return;
 		grid.innerHTML = '';
-		
-		displayAvatars.forEach(avatarObj => {
-			const isSelected = (avatarObj.url === current);
-			
+		const fragment = document.createDocumentFragment();
+		options.forEach(avatarObj => {
 			const div = document.createElement('div');
-			div.className = `avatar-option ${isSelected ? 'selected' : ''}`;
-			
-			div.style.overflow = 'visible'; 
+			div.className = `avatar-option${avatarObj.isLocked ? ' locked' : ''}`;
+			div.dataset.avatarUrl = avatarObj.url;
+			div.style.overflow = 'visible';
 			div.style.position = 'relative';
-			
-			div.onmouseenter = () => { if(typeof playUiHover === 'function') playUiArrow(); };
-			
-			const starIcon = avatarObj.isReward ? `<div style="position: absolute; bottom: -2px; left: -2px; color: #ffcc00; font-size: 14px; filter: drop-shadow(0 0 3px rgba(0,0,0,0.9)); z-index: 10; pointer-events: none;"><i class="fas fa-star"></i></div>` : '';
-			
+			div.onmouseenter = () => { if (typeof playUiHover === 'function') playUiArrow(); };
+			const starIcon = avatarObj.isReward ? '<div style="position:absolute;bottom:-2px;left:-2px;color:#ffcc00;font-size:14px;filter:drop-shadow(0 0 3px rgba(0,0,0,0.9));z-index:10;pointer-events:none;"><i class="fas fa-star"></i></div>' : '';
 			if (avatarObj.isLocked) {
-				div.classList.add('locked');
-				div.innerHTML = `
-					<div style="position: relative; width: 100%; height: 100%; cursor: not-allowed; border-radius: 50%;">
-						<img src="${avatarObj.url}" style="width: 100%; height: 100%; object-fit: cover; opacity: 0.25; filter: grayscale(100%); border-radius: 50%;">
-						<div style="position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); color: rgba(255, 68, 68, 0.8); font-size: 20px; filter: drop-shadow(0 0 5px rgba(0,0,0,0.8));">
-							<i class="fas fa-lock"></i>
-						</div>
-					</div>
-					${starIcon}
-				`;
+				div.innerHTML = `<div style="position:relative;width:100%;height:100%;cursor:not-allowed;border-radius:50%;"><img src="${avatarObj.url}" loading="lazy" decoding="async" style="width:100%;height:100%;object-fit:cover;opacity:.25;filter:grayscale(100%);border-radius:50%;"><div style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);color:rgba(255,68,68,.8);font-size:20px;filter:drop-shadow(0 0 5px rgba(0,0,0,.8));"><i class="fas fa-lock"></i></div></div>${starIcon}`;
 				div.onclick = () => {
 					if (typeof playUiError === 'function') playUiError();
-					if (typeof showToastNotification === 'function') {
-						showToastNotification('Avatar Locked', `Earn the required trophy to unlock the ${avatarObj.rewardTitle}.`);
-					}
+					if (typeof showToastNotification === 'function') showToastNotification('Avatar Locked', `Earn the required trophy to unlock the ${avatarObj.rewardTitle}.`);
 				};
 			} else {
-				div.innerHTML = `
-					<img src="${avatarObj.url}" style="width: 100%; height: 100%; object-fit: cover; opacity: ${isSelected ? '1' : '0.6'}; transition: 0.2s; border-radius: 50%;">
-					${starIcon}
-				`;
-				
+				div.innerHTML = `<img src="${avatarObj.url}" loading="lazy" decoding="async" style="width:100%;height:100%;object-fit:cover;opacity:.6;transition:.2s;border-radius:50%;">${starIcon}`;
 				div.onclick = () => {
-					if (typeof playUiClick === 'function') playUiClick(); 
+					if (typeof playUiClick === 'function') playUiClick();
 					window.tempAvatarSelection = avatarObj.url;
-					openAvatarModal(); 
+					syncAvatarSelectionGrid(grid, avatarObj.url);
 				};
 			}
-			
-			grid.appendChild(div);
+			fragment.appendChild(div);
 		});
-	
+		grid.appendChild(fragment);
+		grid.dataset.avatarOptionsReady = '1';
+		grid.__avatarOptionsSignature = signature;
+	}
+
+	window.openAvatarModal = function() {
+		const grid = document.getElementById('avatar-selection-grid');
+		const myName = localStorage.getItem('psn_username');
+		const current = window.tempAvatarSelection || localStorage.getItem(`${myName}_psn_avatar`) || AVAILABLE_AVATARS[0];
+		const displayAvatars = getAvatarSelectionOptions();
+		ensureAvatarSelectionGrid(grid, displayAvatars);
+		syncAvatarSelectionGrid(grid, current);
+
 		const modal = document.getElementById('modal-sys-avatar');
 		modal.style.display = 'flex';
 		requestAnimationFrame(() => modal.classList.add('show'));
 	};
-	
+
 	window.confirmAvatarSelection = function() {
 		if (window.tempAvatarSelection) {
 			playUiSuccess();
@@ -62499,27 +62597,25 @@ function getVisibleChatStackEl(id) {
 	}
 
 	function processUiSoon(){
-		if (window.__baseGameTitleIdLinkSafePending) return;
+		if (window.__baseGameTitleIdLinkSafePending || window.__baseGameTitleIdLinkDecorating) return;
 		window.__baseGameTitleIdLinkSafePending = true;
 
 		var runner = function(){
 			window.__baseGameTitleIdLinkSafePending = false;
+			window.__baseGameTitleIdLinkDecorating = true;
 			try {
 				cleanupStaleRelatedNavigation();
 				decorateCards();
 				decorateModal();
 			} catch (err) {
 				console.warn('[BaseGameTitleIdLink] skipped:', err);
+			} finally {
+				window.__baseGameTitleIdLinkDecorating = false;
 			}
 		};
 
-		if (typeof queueMicrotask === 'function') {
-			queueMicrotask(runner);
-		} else if (typeof Promise !== 'undefined') {
-			Promise.resolve().then(runner);
-		} else {
-			setTimeout(runner, 0);
-		}
+		if (typeof requestAnimationFrame === 'function') requestAnimationFrame(runner);
+		else setTimeout(runner, 0);
 	}
 
 	window.refreshStoreInstalledChecks = processUiSoon;
@@ -62586,7 +62682,7 @@ function getVisibleChatStackEl(id) {
 
 	if (window.MutationObserver) {
 		var root = document.getElementById('database-grid') || document.body;
-		var observer = new MutationObserver(processUiSoon);
+		var observer = new MutationObserver(function(){ if (!window.__baseGameTitleIdLinkDecorating) processUiSoon(); });
 		observer.observe(root, { childList: true, subtree: true });
 
 		var modal = document.getElementById('game-modal');
@@ -62594,7 +62690,7 @@ function getVisibleChatStackEl(id) {
 
 		var statusIcon = document.getElementById('global-status-icon');
 		if (statusIcon) {
-			var installedStatusObserver = new MutationObserver(processUiSoon);
+			var installedStatusObserver = new MutationObserver(function(){ if (!window.__baseGameTitleIdLinkDecorating) processUiSoon(); });
 			installedStatusObserver.observe(statusIcon, { attributes: true, attributeFilter: ['class', 'style'] });
 		}
 	}
