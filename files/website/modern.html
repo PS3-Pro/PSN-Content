@@ -13261,6 +13261,53 @@ P
 	const EXPLORE_VIRTUAL_SMOOTH_SETTLE_MS = 520;
 	const exploreVirtualContainers = new Set();
 	const exploreVirtualView = document.getElementById('view-explore');
+	let exploreVirtualViewportObserver;
+
+	function ensureExploreVirtualViewportObserver() {
+		if (exploreVirtualViewportObserver !== undefined) return exploreVirtualViewportObserver;
+		if (typeof IntersectionObserver !== 'function') return (exploreVirtualViewportObserver = null);
+
+		const scrollRoot = document.getElementById('scroll-area') || null;
+		exploreVirtualViewportObserver = new IntersectionObserver(entries => {
+			entries.forEach(entry => {
+				const container = entry.target;
+				if (!container.isConnected || !container.__exploreVirtualData) {
+					unobserveExploreVirtualContainer(container);
+					exploreVirtualContainers.delete(container);
+					return;
+				}
+
+				const wasNear = container.__exploreVirtualNearViewport;
+				container.__exploreVirtualNearViewport = !!entry.isIntersecting;
+				if (entry.isIntersecting && wasNear === false && exploreVirtualView && exploreVirtualView.style.display !== 'none') {
+					scheduleExploreVirtualRender(container, false);
+				}
+			});
+		}, { root: scrollRoot, rootMargin: `${EXPLORE_VIRTUAL_VERTICAL_MARGIN}px 0px`, threshold: 0 });
+		return exploreVirtualViewportObserver;
+	}
+
+	function observeExploreVirtualContainer(container) {
+		if (!container || container.__exploreVirtualViewportObserved) return;
+		const observer = ensureExploreVirtualViewportObserver();
+		if (!observer) return;
+		container.__exploreVirtualViewportObserved = true;
+		container.__exploreVirtualNearViewport = true;
+		observer.observe(container);
+	}
+
+	function unobserveExploreVirtualContainer(container) {
+		if (!container) return;
+		if (exploreVirtualViewportObserver && container.__exploreVirtualViewportObserved) {
+			try { exploreVirtualViewportObserver.unobserve(container); } catch (e) {}
+		}
+		container.__exploreVirtualViewportObserved = false;
+		delete container.__exploreVirtualNearViewport;
+	}
+
+	function isExploreVirtualViewportObserverActive() {
+		return !!exploreVirtualViewportObserver;
+	}
 
 	function escapeExploreHtmlText(value) {
 		return String(value || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -13344,6 +13391,8 @@ P
 
 	function clearRecentlyVisitedVirtualState(container) {
 		if (!container) return;
+		unobserveExploreVirtualContainer(container);
+		exploreVirtualContainers.delete(container);
 		if (container.__exploreVirtualFrame) cancelAnimationFrame(container.__exploreVirtualFrame);
 		if (container.__exploreVirtualPinTimer) clearTimeout(container.__exploreVirtualPinTimer);
 		if (container.__exploreVirtualResetFrame) cancelAnimationFrame(container.__exploreVirtualResetFrame);
@@ -13643,6 +13692,7 @@ P
 
 	function isExploreVirtualContainerNearViewport(container) {
 		if (!container || !container.isConnected) return false;
+		if (container.__exploreVirtualViewportObserved) return container.__exploreVirtualNearViewport !== false;
 		const rootRect = getExploreRevealRootRect();
 		const rect = container.getBoundingClientRect();
 		return rect.bottom > rootRect.top - EXPLORE_VIRTUAL_VERTICAL_MARGIN && rect.top < rootRect.bottom + EXPLORE_VIRTUAL_VERTICAL_MARGIN;
@@ -13704,7 +13754,7 @@ P
 
 		const metrics = getExploreVirtualMetrics(container);
 		const scrollLeft = Math.max(0, container.scrollLeft || 0);
-		const nearViewport = isExploreVirtualContainerNearViewport(container);
+		const nearViewport = force ? true : isExploreVirtualContainerNearViewport(container);
 		let start = 0;
 		let end = 0;
 
@@ -13764,12 +13814,15 @@ P
 			const rightWidth = getExploreVirtualSpacerWidth(rightCount, metrics);
 			if (leftWidth > 0) fragment.appendChild(createExploreVirtualSpacer(leftWidth));
 
+			const suppressReveal = container.dataset.exploreReturnResetting === '1';
 			for (let i = start; i < end; i++) {
 				const key = String(i);
 				let card = existingCards.get(key) || cardCache.get(key);
 				if (!card) {
-					card = createExploreCardElement(items[i], data.cat, i, data.animateCards && !data.initialRevealDone);
+					card = createExploreCardElement(items[i], data.cat, i, data.animateCards && !data.initialRevealDone && !suppressReveal);
 					cardCache.set(key, card);
+				} else if (suppressReveal) {
+					resetExploreRevealCard(card, false);
 				} else if (data.initialRevealDone && !card.classList.contains('anim-reveal')) {
 					card.classList.remove('anim-reveal');
 					card.classList.add('no-anim');
@@ -13820,10 +13873,16 @@ P
 
 		const startLeft = container.scrollLeft || 0;
 		if (startLeft <= 1) {
+			delete container.dataset.exploreReturnResetting;
+			delete container.dataset.exploreSkipNextReturnReveal;
 			container.scrollLeft = 0;
 			ensureExploreVirtualStartWindow(container);
 			return;
 		}
+
+		container.dataset.exploreReturnResetting = '1';
+		container.dataset.exploreSkipNextReturnReveal = '1';
+		container.querySelectorAll('.game-card').forEach(card => resetExploreRevealCard(card, false));
 
 		const data = container.__exploreVirtualData;
 		const items = data.items || [];
@@ -13838,6 +13897,7 @@ P
 			container.scrollLeft = 0;
 			delete data.pinnedRange;
 			renderExploreVirtualWindow(container, true);
+			delete container.dataset.exploreReturnResetting;
 			return;
 		}
 
@@ -13848,6 +13908,7 @@ P
 				container.scrollLeft = 0;
 				delete data.pinnedRange;
 				renderExploreVirtualWindow(container, true);
+				delete container.dataset.exploreReturnResetting;
 				container.__exploreVirtualResetFrame = 0;
 				return;
 			}
@@ -13868,6 +13929,7 @@ P
 	function forEachExploreVirtualContainer(callback) {
 		exploreVirtualContainers.forEach(container => {
 			if (!container || !container.isConnected || !container.__exploreVirtualData) {
+				unobserveExploreVirtualContainer(container);
 				exploreVirtualContainers.delete(container);
 				return;
 			}
@@ -13893,7 +13955,9 @@ P
 
 
 	function attachExploreVirtualHandlers(container) {
-		if (!container || container.__exploreVirtualHandlersAttached) return;
+		if (!container) return;
+		observeExploreVirtualContainer(container);
+		if (container.__exploreVirtualHandlersAttached) return;
 		container.__exploreVirtualHandlersAttached = true;
 		container.addEventListener('scroll', () => scheduleExploreVirtualRender(container), { passive: true });
 		if (!window.__exploreVirtualResizeAttached) {
@@ -14041,16 +14105,25 @@ P
 		if (window.__exploreRevealReplayTimer) clearTimeout(window.__exploreRevealReplayTimer);
 		if (window.__exploreRevealReplayFrame) cancelAnimationFrame(window.__exploreRevealReplayFrame);
 
+		const revealContainers = [];
 		containers.forEach(container => {
+			const skipReturnReveal = container.dataset.exploreSkipNextReturnReveal === '1';
+			delete container.dataset.exploreSkipNextReturnReveal;
+			if (skipReturnReveal) {
+				Array.from(container.querySelectorAll('.game-card')).forEach(card => resetExploreRevealCard(card, false));
+				return;
+			}
+			revealContainers.push(container);
 			Array.from(container.querySelectorAll('.game-card')).forEach(card => resetExploreRevealCard(card, true));
 		});
+		if (!revealContainers.length) return;
 
 		let attempts = 0;
 		const revealAfterLayout = () => {
 			window.__exploreRevealReplayFrame = 0;
 			if (!exploreView.isConnected || exploreView.style.display === 'none') return;
 
-			const firstVisibleCards = collectExploreVisibleRevealCards(containers, EXPLORE_VISIBLE_REVEAL_LIMIT);
+			const firstVisibleCards = collectExploreVisibleRevealCards(revealContainers, EXPLORE_VISIBLE_REVEAL_LIMIT);
 			if (!firstVisibleCards.length && attempts < 4) {
 				attempts++;
 				window.__exploreRevealReplayFrame = requestAnimationFrame(revealAfterLayout);
@@ -14058,7 +14131,7 @@ P
 			}
 
 			runExploreRevealBatch(firstVisibleCards);
-			containers.forEach(container => {
+			revealContainers.forEach(container => {
 				Array.from(container.querySelectorAll('.game-card[data-explore-reveal-pending="1"]')).forEach(card => resetExploreRevealCard(card, false));
 			});
 
@@ -31058,7 +31131,9 @@ P
             const scrolled = scrollArea.scrollTop > 90;
             browseToolbars.forEach(tb => tb.classList.toggle('scrolled', scrolled));
             updateScrollButtonsVisibility();
-            if (typeof refreshExploreVirtualCarousels === 'function') refreshExploreVirtualCarousels(false);
+            if ((typeof isExploreVirtualViewportObserverActive !== 'function' || !isExploreVirtualViewportObserverActive()) && typeof refreshExploreVirtualCarousels === 'function') {
+                refreshExploreVirtualCarousels(false);
+            }
         });
     }, { passive: true });
 
