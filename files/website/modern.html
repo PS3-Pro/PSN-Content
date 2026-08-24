@@ -52451,6 +52451,7 @@ function getVisibleChatStackEl(id) {
 			if (sentBaseProfile) window.__profileBaseSyncPending = !ok;
 			if (!ok && typeof window.persistCurrentProfileSyncDirtyState === 'function') window.persistCurrentProfileSyncDirtyState();
 			if (showSyncIndicator && typeof window.endProfileSyncIndicator === 'function') window.endProfileSyncIndicator(ok);
+			if (ok && sentDirtyKeys.includes('friends') && typeof window.friendActivityFriendsChanged === 'function') window.friendActivityFriendsChanged();
 			const shouldReplay = window.__profileUpdateQueued || window.__profileBaseSyncPending === true || (syncState && Object.values(syncState.dirty).some(Boolean));
 			window.__profileUpdateQueued = false;
 			if (shouldReplay && socketChat && socketChat.connected) setTimeout(() => window.broadcastProfileUpdate({ silentIndicator: syncOptions.silentIndicator === true || !showSyncIndicator }), ok ? 45 : 900);
@@ -56043,8 +56044,27 @@ function getVisibleChatStackEl(id) {
 		return names;
 	}
 
+	function getFriendActivityAddedAtForActor(actorName) {
+		const target = String(actorName || '').trim().toLowerCase();
+		if (!target || !Array.isArray(window.friendsList)) return 0;
+		const friend = window.friendsList.find(function(item) {
+			const name = String(item && typeof item === 'object' ? item.name : item || '').trim().toLowerCase();
+			return name === target;
+		});
+		return Math.max(0, Number(friend && typeof friend === 'object' ? friend.addedAt : 0) || 0);
+	}
+
 	function getFriendActivityFriendSignature() {
-		return getFriendActivityFriendNames().map(function(name){ return name.toLowerCase(); }).sort().join('|');
+		const list = Array.isArray(window.friendsList) ? window.friendsList : [];
+		const seen = new Set();
+		return list.map(function(friend) {
+			const name = String(friend && typeof friend === 'object' ? friend.name : friend || '').trim();
+			const key = name.toLowerCase();
+			if (!name || seen.has(key)) return '';
+			seen.add(key);
+			const addedAt = Math.max(0, Number(friend && typeof friend === 'object' ? friend.addedAt : 0) || 0);
+			return key + '@' + addedAt;
+		}).filter(Boolean).sort().join('|');
 	}
 
 	window.isFriendActivityVisible = function() {
@@ -56053,7 +56073,10 @@ function getVisibleChatStackEl(id) {
 	};
 
 	window.mergeFriendActivityItems = function(incoming, replace) {
-		const incomingItems = (Array.isArray(incoming) ? incoming : []).map(normalizeFriendActivityItem).filter(Boolean);
+		const incomingItems = (Array.isArray(incoming) ? incoming : []).map(normalizeFriendActivityItem).filter(Boolean).filter(function(item) {
+			const addedAt = getFriendActivityAddedAtForActor(item.actor);
+			return !addedAt || Math.max(0, Number(item.createdAt) || 0) >= addedAt;
+		});
 		const replacedIds = new Set();
 		incomingItems.forEach(function(item) {
 			if (item.type === 'played') {
@@ -58039,7 +58062,6 @@ function getVisibleChatStackEl(id) {
 			const currentSearch = searchInput ? searchInput.value : '';
 			if (window.renderFriendsList) window.renderFriendsList(currentSearch, true);
 			if (window.broadcastProfileUpdate) window.broadcastProfileUpdate();
-			if (typeof window.friendActivityFriendsChanged === 'function') window.friendActivityFriendsChanged();
 		};
 		
 		if (index > -1) {
@@ -58061,10 +58083,12 @@ function getVisibleChatStackEl(id) {
 		} else {
 			const card = triggerElement && typeof triggerElement.closest === 'function' ? triggerElement.closest('#friends-list-grid .online-user-item') : null;
 			if (card) window.__friendAddingName = name;
+			const addedAt = Date.now();
 			window.friendsList.push({
 				name: name,
 				avatar: resolvedAvatar,
-				dateAdded: new Date().toLocaleDateString()
+				dateAdded: new Date(addedAt).toLocaleDateString(),
+				addedAt: addedAt
 			});
 			if (typeof playUiSuccess === 'function') playUiSuccess();
 		}

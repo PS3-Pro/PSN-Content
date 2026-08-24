@@ -2315,6 +2315,36 @@ function normalizeProfileArrayListServer(key, value, existing = []) {
   return list;
 }
 
+
+function stampNewFriendAddedAtServer(existingList = [], incomingList = []) {
+  const existingByName = new Map();
+  getProfileArrayPayload(existingList).forEach(item => {
+    const name = normalizeText(item && typeof item === 'object' ? item.name : item, '');
+    if (!name) return;
+    existingByName.set(name.toLowerCase(), item);
+  });
+
+  const now = Date.now();
+  return getProfileArrayPayload(incomingList).map(item => {
+    const source = item && typeof item === 'object' && !Array.isArray(item) ? { ...item } : { name: normalizeText(item, '') };
+    const name = normalizeText(source.name, '');
+    if (!name) return null;
+    source.name = name;
+
+    const previous = existingByName.get(name.toLowerCase());
+    const previousAddedAt = normalizeTimestampValue(previous && typeof previous === 'object' ? previous.addedAt : 0);
+    if (previous) {
+      if (previousAddedAt) source.addedAt = previousAddedAt;
+      else delete source.addedAt;
+      return source;
+    }
+
+    const incomingAddedAt = normalizeTimestampValue(source.addedAt);
+    source.addedAt = incomingAddedAt && Math.abs(now - incomingAddedAt) <= 5 * 60 * 1000 ? incomingAddedAt : now;
+    return source;
+  }).filter(Boolean);
+}
+
 function hasOwnPayload(target = {}, key = '') {
   return Object.prototype.hasOwnProperty.call(target || {}, key);
 }
@@ -2361,7 +2391,8 @@ function reconcileIncomingProfileArrays(currentUser = {}, incomingUser = {}) {
     currentUser[sync.countKey] = currentList.length;
 
     if (acceptIncoming) {
-      const acceptedList = normalizeProfileArrayListServer(key, incomingList, currentList);
+      let acceptedList = normalizeProfileArrayListServer(key, incomingList, currentList);
+      if (key === 'friendsData') acceptedList = stampNewFriendAddedAtServer(currentList, acceptedList);
       incomingUser[key] = acceptedList;
       incomingUser[sync.countKey] = acceptedList.length;
       incomingUser[sync.versionKey] = incomingVersion || normalizeTimestampValue(incomingUser.profileUpdatedAt) || Date.now();
@@ -4895,18 +4926,25 @@ function friendActivityRoom(actorName) {
   return `${FRIEND_ACTIVITY_ROOM_PREFIX}${normalizeFriendActivityName(actorName).toLowerCase()}`;
 }
 
-function extractFriendActivityNames(list) {
+function extractFriendActivityRelationships(list) {
   if (!Array.isArray(list)) return [];
-  const names = [];
+  const relationships = [];
   const seen = new Set();
   list.forEach(item => {
     const name = normalizeFriendActivityName(item && typeof item === 'object' ? item.name : item);
     const key = name.toLowerCase();
     if (!name || seen.has(key)) return;
     seen.add(key);
-    names.push(name);
+    relationships.push({
+      name,
+      addedAt: normalizeTimestampValue(item && typeof item === 'object' ? item.addedAt : 0)
+    });
   });
-  return names.slice(0, 500);
+  return relationships.slice(0, 500);
+}
+
+function extractFriendActivityNames(list) {
+  return extractFriendActivityRelationships(list).map(friend => friend.name);
 }
 
 function clearFriendActivitySubscription(socket) {
@@ -5130,23 +5168,28 @@ async function setFriendActivityReadId(userName, lastReadId) {
   return Math.max(0, Number(result.rows[0] && result.rows[0].last_read_id) || safeId);
 }
 
-async function getFriendActivityHistoryForUser(userName, afterId = 0, resolvedFriendNames = null) {
-  const friendNames = Array.isArray(resolvedFriendNames)
-    ? extractFriendActivityNames(resolvedFriendNames)
-    : extractFriendActivityNames(await getUserDataPayloadFromDb(userName, 'friends'));
+async function getFriendActivityHistoryForUser(userName, afterId = 0, resolvedFriends = null) {
+  const friendRecords = Array.isArray(resolvedFriends) ? resolvedFriends : await getUserDataPayloadFromDb(userName, 'friends');
+  const relationships = extractFriendActivityRelationships(friendRecords);
+  const friendNames = relationships.map(friend => friend.name);
+  const friendAddedAt = relationships.map(friend => Math.max(0, Math.floor(Number(friend.addedAt) || 0)));
   const safeAfterId = Math.max(0, Math.floor(Number(afterId) || 0));
   if (!friendNames.length) return { friendNames, items: [], lastReadId: await getFriendActivityReadId(userName), delta: safeAfterId > 0 };
-  const result = safeAfterId > 0
-    ? await queryDbWithRetry(
-        'SELECT id, actor_name, event_type, data, created_at FROM friend_activity WHERE actor_name = ANY($1::text[]) AND id > $2 ORDER BY id DESC LIMIT $3',
-        [friendNames, safeAfterId, SOCIAL_HISTORY_MAX],
-        { attempts: 2, label: 'FRIEND ACTIVITY DELTA' }
-      )
-    : await queryDbWithRetry(
-        'SELECT id, actor_name, event_type, data, created_at FROM friend_activity WHERE actor_name = ANY($1::text[]) ORDER BY id DESC LIMIT $2',
-        [friendNames, SOCIAL_HISTORY_MAX],
-        { attempts: 2, label: 'FRIEND ACTIVITY READ' }
-      );
+
+  const result = await queryDbWithRetry(
+    `WITH friend_since(name, added_at_ms) AS (
+       SELECT * FROM unnest($1::text[], $2::bigint[])
+     )
+     SELECT fa.id, fa.actor_name, fa.event_type, fa.data, fa.created_at
+     FROM friend_activity fa
+     JOIN friend_since fs ON fs.name = fa.actor_name
+     WHERE ($3::bigint = 0 OR fa.id > $3::bigint)
+       AND (fs.added_at_ms <= 0 OR fa.created_at >= to_timestamp(fs.added_at_ms::double precision / 1000.0))
+     ORDER BY fa.id DESC
+     LIMIT $4`,
+    [friendNames, friendAddedAt, safeAfterId, SOCIAL_HISTORY_MAX],
+    { attempts: 2, label: safeAfterId > 0 ? 'FRIEND ACTIVITY DELTA' : 'FRIEND ACTIVITY READ' }
+  );
   const lastReadId = await getFriendActivityReadId(userName);
   return { friendNames, items: result.rows.map(serializeFriendActivityRow).filter(Boolean), lastReadId, delta: safeAfterId > 0 };
 }
@@ -7162,10 +7205,11 @@ io.on('connection', (socket) => {
     const requestToken = (Number(socket.__friendActivityRequestToken) || 0) + 1;
     socket.__friendActivityRequestToken = requestToken;
     try {
-      const friendNames = extractFriendActivityNames(await getUserDataPayloadFromDb(name, 'friends'));
+      const friendRecords = await getUserDataPayloadFromDb(name, 'friends');
+      const friendNames = extractFriendActivityNames(friendRecords);
       if (!socket.connected || socket.__friendActivityRequestToken !== requestToken) return;
       setFriendActivitySubscription(socket, friendNames);
-      const result = await getFriendActivityHistoryForUser(name, data && data.afterId, friendNames);
+      const result = await getFriendActivityHistoryForUser(name, data && data.afterId, friendRecords);
       if (!socket.connected || socket.__friendActivityRequestToken !== requestToken) return;
       respond({
         ok: true,
