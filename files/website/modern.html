@@ -64912,235 +64912,177 @@ function getVisibleChatStackEl(id) {
 	</script>
 
 	<!-- ====================================================================== VIEWPORT ANIMATION SCHEDULER ====================================================================== -->
-	<style>
-		/* Fallback for pseudo-element CSS animations; WAAPI below handles the exact infinite animations themselves. */
-		.psn-viewport-animation-paused::before,
-		.psn-viewport-animation-paused::after { animation-play-state: paused !important; }
-	</style>
 	<script>
 	(function installViewportAnimationScheduler(){
 		if (window.__psnViewportAnimationSchedulerInstalled) return;
 		window.__psnViewportAnimationSchedulerInstalled = true;
-		if (typeof IntersectionObserver !== 'function') return;
+		if (typeof IntersectionObserver !== 'function' || typeof document.getAnimations !== 'function') return;
 
-		const observed = new Set();
-		const intersectionState = new WeakMap();
-		const pausedByElement = new WeakMap();
-		const pauseCountByAnimation = new WeakMap();
-		const schedulerPausedAnimations = new WeakSet();
-		let infiniteSelector = '';
-		let mutationObserver = null;
-		let registrationFrame = 0;
-		const pendingRoots = new Set();
+		const records = new Map();
+		const animationOwner = new WeakMap();
+		const pausedByScheduler = new WeakSet();
+		const pendingSyncTargets = new Set();
+		let syncFrame = 0;
+		let cleanupFrame = 0;
 
-		function splitSelectorList(selectorText) {
-			const out = [];
-			let start = 0, round = 0, square = 0, quote = '';
-			for (let i = 0; i < selectorText.length; i++) {
-				const ch = selectorText[i];
-				if (quote) {
-					if (ch === quote && selectorText[i - 1] !== '\\') quote = '';
-					continue;
-				}
-				if (ch === '"' || ch === "'") { quote = ch; continue; }
-				if (ch === '(') round++;
-				else if (ch === ')') round = Math.max(0, round - 1);
-				else if (ch === '[') square++;
-				else if (ch === ']') square = Math.max(0, square - 1);
-				else if (ch === ',' && round === 0 && square === 0) {
-					out.push(selectorText.slice(start, i).trim());
-					start = i + 1;
-				}
+		function isInfiniteAnimation(animation) {
+			try {
+				const timing = animation && animation.effect && animation.effect.getTiming ? animation.effect.getTiming() : null;
+				return !!timing && timing.iterations === Infinity;
+			} catch (e) {
+				return false;
 			}
-			out.push(selectorText.slice(start).trim());
-			return out.filter(Boolean);
 		}
 
-		function selectorHost(selector) {
-			/* Interaction-only infinite effects cannot run while genuinely offscreen. */
-			if (/:(?:hover|active|focus|focus-visible|focus-within)\b/i.test(selector)) return '';
-			const host = selector.replace(/::[a-zA-Z0-9_-]+(?:\([^)]*\))?/g, '').trim();
-			if (!host || host.includes('::')) return '';
-			return host;
+		function getAnimationHost(animation) {
+			try {
+				const target = animation && animation.effect ? animation.effect.target : null;
+				if (target instanceof Element) return target;
+				if (target && target.element instanceof Element) return target.element;
+			} catch (e) {}
+			return null;
 		}
 
-		function collectInfiniteAnimationSelectors() {
-			const selectors = new Set();
-			function walk(rules) {
-				if (!rules) return;
-				for (const rule of Array.from(rules)) {
-					try {
-						if (rule.cssRules) { walk(rule.cssRules); continue; }
-						if (!rule.selectorText || !rule.style) continue;
-						const animationText = `${rule.style.animation || ''} ${rule.style.animationIterationCount || ''}`;
-						if (!/\binfinite\b/i.test(animationText)) continue;
-						splitSelectorList(rule.selectorText).forEach(selector => {
-							const host = selectorHost(selector);
-							if (host) selectors.add(host);
-						});
-					} catch (e) {}
-				}
-			}
-			for (const sheet of Array.from(document.styleSheets || [])) {
-				try { walk(sheet.cssRules); } catch (e) {}
-			}
-			/* Covers the few dynamically-generated inline infinite animations too. */
-			selectors.add('[style*="infinite"]');
-			return Array.from(selectors).join(',');
-		}
-
-		function getInfiniteAnimations(el) {
-			if (!el || typeof el.getAnimations !== 'function') return [];
-			let animations = [];
-			try { animations = el.getAnimations({ subtree: true }) || []; } catch (e) {
-				try { animations = el.getAnimations() || []; } catch (err) { return []; }
-			}
-			return animations.filter(animation => {
-				try {
-					const timing = animation.effect && animation.effect.getTiming ? animation.effect.getTiming() : null;
-					return !!timing && timing.iterations === Infinity;
-				} catch (e) { return false; }
+		function cleanupRecord(el) {
+			const record = records.get(el);
+			if (!record) return;
+			try { viewportObserver.unobserve(el); } catch (e) {}
+			record.animations.forEach(animation => {
+				animationOwner.delete(animation);
+				pausedByScheduler.delete(animation);
 			});
+			record.animations.clear();
+			records.delete(el);
 		}
 
-		function pauseInfiniteAnimations(el) {
-			if (!el || !el.isConnected) return;
-			el.classList.add('psn-viewport-animation-paused');
-			let owned = pausedByElement.get(el);
-			if (!owned) { owned = new Set(); pausedByElement.set(el, owned); }
-			getInfiniteAnimations(el).forEach(animation => {
-				if (owned.has(animation)) return;
-				owned.add(animation);
-				const count = pauseCountByAnimation.get(animation) || 0;
-				pauseCountByAnimation.set(animation, count + 1);
-				if (count > 0) return;
+		function applyRecordState(el) {
+			const record = records.get(el);
+			if (!record) return;
+			const shouldRun = !document.hidden && record.inView;
+
+			record.animations.forEach(animation => {
+				let playState = '';
+				try { playState = animation.playState; } catch (e) {}
+				if (playState === 'idle' || playState === 'finished') {
+					record.animations.delete(animation);
+					animationOwner.delete(animation);
+					pausedByScheduler.delete(animation);
+					return;
+				}
+
+				if (shouldRun) {
+					if (!pausedByScheduler.has(animation)) return;
+					try { if (animation.playState === 'paused') animation.play(); } catch (e) {}
+					pausedByScheduler.delete(animation);
+					return;
+				}
+
+				if (pausedByScheduler.has(animation)) return;
 				try {
 					if (animation.playState === 'running' || animation.playState === 'pending') {
 						animation.pause();
-						schedulerPausedAnimations.add(animation);
+						pausedByScheduler.add(animation);
 					}
 				} catch (e) {}
 			});
+
+			if (!record.animations.size) cleanupRecord(el);
 		}
 
-		function releaseInfiniteAnimations(el, shouldResume) {
-			if (!el) return;
-			el.classList.remove('psn-viewport-animation-paused');
-			const owned = pausedByElement.get(el);
-			if (!owned) return;
-			owned.forEach(animation => {
-				const count = pauseCountByAnimation.get(animation) || 0;
-				if (count > 1) {
-					pauseCountByAnimation.set(animation, count - 1);
-					return;
-				}
-				pauseCountByAnimation.delete(animation);
-				if (!shouldResume || !schedulerPausedAnimations.has(animation)) return;
-				try { if (animation.playState === 'paused') animation.play(); } catch (e) {}
-			});
-			owned.clear();
-		}
-
-		function resumeInfiniteAnimations(el) {
-			releaseInfiniteAnimations(el, true);
-		}
-
-		function applyElementState(el) {
-			const inView = intersectionState.get(el) === true;
-			if (document.hidden || !inView) pauseInfiniteAnimations(el);
-			else resumeInfiniteAnimations(el);
-		}
-
-		const io = new IntersectionObserver(entries => {
+		const viewportObserver = new IntersectionObserver(entries => {
 			entries.forEach(entry => {
-				intersectionState.set(entry.target, !!(entry.isIntersecting && entry.intersectionRatio > 0));
-				applyElementState(entry.target);
+				const record = records.get(entry.target);
+				if (!record) return;
+				record.inView = !!(entry.isIntersecting && entry.intersectionRatio > 0);
+				applyRecordState(entry.target);
 			});
 		}, { root: null, rootMargin: '120px 0px', threshold: 0.001 });
 
-		function observeElement(el) {
-			if (!el || el.nodeType !== 1 || observed.has(el)) return;
-			observed.add(el);
-			intersectionState.set(el, false);
-			try { io.observe(el); } catch (e) { observed.delete(el); }
-		}
+		function registerAnimation(animation) {
+			if (!isInfiniteAnimation(animation) || animationOwner.has(animation)) return;
+			const host = getAnimationHost(animation);
+			if (!host || !host.isConnected) return;
 
-		function unobserveElement(el) {
-			if (!el || !observed.has(el)) return;
-			try { io.unobserve(el); } catch (e) {}
-			releaseInfiniteAnimations(el, false);
-			observed.delete(el);
-			intersectionState.delete(el);
-		}
-
-		function unregisterRoot(root) {
-			if (!root || root.nodeType !== 1) return;
-			unobserveElement(root);
-			if (!infiniteSelector || typeof root.querySelectorAll !== 'function') return;
-			try { root.querySelectorAll(infiniteSelector).forEach(unobserveElement); } catch (e) {}
-		}
-
-		function registerRoot(root) {
-			if (!infiniteSelector || !root) return;
-			if (root.nodeType === 1) {
-				try { if (root.matches(infiniteSelector)) observeElement(root); } catch (e) {}
+			let record = records.get(host);
+			if (!record) {
+				/* Start optimistic: never pause a visible element before IntersectionObserver's first result. */
+				record = { animations: new Set(), inView: true };
+				records.set(host, record);
+				try { viewportObserver.observe(host); } catch (e) { records.delete(host); return; }
 			}
-			if (typeof root.querySelectorAll !== 'function') return;
-			try { root.querySelectorAll(infiniteSelector).forEach(observeElement); } catch (e) {}
+
+			record.animations.add(animation);
+			animationOwner.set(animation, host);
+			if (document.hidden) applyRecordState(host);
 		}
 
-		function queueRegistration(root) {
-			if (root) pendingRoots.add(root);
-			if (registrationFrame) return;
-			registrationFrame = requestAnimationFrame(() => {
-				registrationFrame = 0;
-				const roots = Array.from(pendingRoots);
-				pendingRoots.clear();
-				roots.forEach(registerRoot);
+		function syncTarget(target) {
+			if (!(target instanceof Element)) return;
+			let current = [];
+			try { current = target.getAnimations ? target.getAnimations({ subtree: true }) : []; } catch (e) { current = []; }
+			const infinite = new Set(current.filter(animation => isInfiniteAnimation(animation) && getAnimationHost(animation) === target));
+			const record = records.get(target);
+
+			if (record) {
+				record.animations.forEach(animation => {
+					if (infinite.has(animation)) return;
+					record.animations.delete(animation);
+					animationOwner.delete(animation);
+					pausedByScheduler.delete(animation);
+				});
+			}
+
+			infinite.forEach(registerAnimation);
+			if (records.has(target)) applyRecordState(target);
+		}
+
+		function queueTargetSync(target) {
+			if (!(target instanceof Element)) return;
+			pendingSyncTargets.add(target);
+			if (syncFrame) return;
+			syncFrame = requestAnimationFrame(() => {
+				syncFrame = 0;
+				const targets = Array.from(pendingSyncTargets);
+				pendingSyncTargets.clear();
+				targets.forEach(syncTarget);
 			});
 		}
 
-		function refreshSelectorMap() {
-			infiniteSelector = collectInfiniteAnimationSelectors();
-			registerRoot(document);
+		function discoverCurrentInfiniteAnimations() {
+			let animations = [];
+			try { animations = document.getAnimations() || []; } catch (e) { return; }
+			animations.forEach(registerAnimation);
 		}
 
-		function boot() {
-			refreshSelectorMap();
-			if (document.body && typeof MutationObserver === 'function') {
-				mutationObserver = new MutationObserver(mutations => {
-					mutations.forEach(mutation => {
-						if (mutation.type === 'childList') {
-							mutation.removedNodes.forEach(node => {
-								if (node && node.nodeType === 1) unregisterRoot(node);
-							});
-							mutation.addedNodes.forEach(node => {
-								if (node && node.nodeType === 1) {
-									if (node.tagName === 'STYLE' || node.tagName === 'LINK') refreshSelectorMap();
-									queueRegistration(node);
-								}
-							});
-						} else if (mutation.type === 'attributes') {
-							queueRegistration(mutation.target);
-							/* Ancestor state changes can activate descendant animation selectors. */
-							if (mutation.target && mutation.target.querySelectorAll) queueRegistration(mutation.target);
-							if (observed.has(mutation.target) && intersectionState.get(mutation.target) !== true) pauseInfiniteAnimations(mutation.target);
-						}
-					});
+		function queueDisconnectedCleanup() {
+			if (cleanupFrame) return;
+			cleanupFrame = requestAnimationFrame(() => {
+				cleanupFrame = 0;
+				records.forEach((record, el) => {
+					if (!el.isConnected) cleanupRecord(el);
 				});
-				mutationObserver.observe(document.body, { subtree: true, childList: true, attributes: true, attributeFilter: ['class','style'] });
-			}
+			});
+		}
+
+		document.addEventListener('animationstart', event => {
+			/* Finite reveal/click/hover animations are never controlled; this only inspects their own element. */
+			queueTargetSync(event.target);
+		}, true);
+		document.addEventListener('animationcancel', event => { if (records.has(event.target)) queueTargetSync(event.target); }, true);
+		document.addEventListener('animationend', event => { if (records.has(event.target)) queueTargetSync(event.target); }, true);
+
+		if (document.body && typeof MutationObserver === 'function') {
+			new MutationObserver(mutations => {
+				if (mutations.some(mutation => mutation.removedNodes && mutation.removedNodes.length)) queueDisconnectedCleanup();
+			}).observe(document.body, { subtree: true, childList: true });
 		}
 
 		document.addEventListener('visibilitychange', () => {
-			observed.forEach(el => {
-				if (!el.isConnected) { observed.delete(el); return; }
-				applyElementState(el);
-			});
+			records.forEach((record, el) => applyRecordState(el));
+			if (!document.hidden) requestAnimationFrame(discoverCurrentInfiniteAnimations);
 		}, { passive: true });
 
-		if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot, { once: true });
-		else boot();
+		discoverCurrentInfiniteAnimations();
 	})();
 	</script>
 
