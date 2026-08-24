@@ -22459,22 +22459,29 @@ P
         };
     }
 
-    function isRevealTargetVisibleNow(el, margin = 24, explicitRoot = null) {
-        if (!el || !el.isConnected || typeof el.getBoundingClientRect !== 'function') return false;
-        const rect = el.getBoundingClientRect();
-        if (!rect.width || !rect.height) return false;
-
-        const rootRect = getVisibleRevealRootRect(explicitRoot);
+    function isRevealRectVisibleNow(el, rect, rootRect, margin = 24, horizontalRectCache = null) {
+        if (!el || !rect || !rect.width || !rect.height) return false;
         if (rect.bottom <= rootRect.top - margin || rect.top >= rootRect.bottom + margin) return false;
         if (rect.right <= rootRect.left - margin || rect.left >= rootRect.right + margin) return false;
 
         const horizontal = el.closest('.horizontal-scroll');
         if (horizontal && typeof horizontal.getBoundingClientRect === 'function') {
-            const hRect = horizontal.getBoundingClientRect();
+            let hRect = horizontalRectCache ? horizontalRectCache.get(horizontal) : null;
+            if (!hRect) {
+                hRect = horizontal.getBoundingClientRect();
+                if (horizontalRectCache) horizontalRectCache.set(horizontal, hRect);
+            }
             if (rect.right <= hRect.left - margin || rect.left >= hRect.right + margin) return false;
         }
 
         return true;
+    }
+
+    function isRevealTargetVisibleNow(el, margin = 24, explicitRoot = null) {
+        if (!el || !el.isConnected || typeof el.getBoundingClientRect !== 'function') return false;
+        const rect = el.getBoundingClientRect();
+        const rootRect = getVisibleRevealRootRect(explicitRoot);
+        return isRevealRectVisibleNow(el, rect, rootRect, margin);
     }
 
     function resetRevealTargetToStatic(el, animClass) {
@@ -22496,12 +22503,13 @@ P
         if (!targets.length) return;
 
         const rootRect = getVisibleRevealRootRect();
+        const horizontalRectCache = new WeakMap();
         for (const el of targets) {
             if (!el || !el.isConnected || typeof el.getBoundingClientRect !== 'function') continue;
             const rect = el.getBoundingClientRect();
             const inHorizontalStrip = !!el.closest('.horizontal-scroll');
 
-            if (isRevealTargetVisibleNow(el, margin)) {
+            if (isRevealRectVisibleNow(el, rect, rootRect, margin, horizontalRectCache)) {
                 el.classList.remove('no-skeleton-anim');
             } else {
                 el.classList.add('no-skeleton-anim');
@@ -22541,6 +22549,7 @@ P
         const visibleTargets = [];
         const revealRoot = options.root && typeof options.root.getBoundingClientRect === 'function' ? options.root : null;
         const rootRect = getVisibleRevealRootRect(revealRoot);
+        const horizontalRectCache = new WeakMap();
         const canStopAfterBelow = options.stopAfterBelow !== false;
 
         for (const el of targets) {
@@ -22549,7 +22558,7 @@ P
 
             const rect = el.getBoundingClientRect();
             const inHorizontalStrip = !!el.closest('.horizontal-scroll');
-            if (visibleTargets.length < maxVisible && isRevealTargetVisibleNow(el, margin, revealRoot)) {
+            if (visibleTargets.length < maxVisible && isRevealRectVisibleNow(el, rect, rootRect, margin, horizontalRectCache)) {
                 visibleTargets.push(el);
             } else if (canStopAfterBelow && !inHorizontalStrip && rect.top > rootRect.bottom + margin) {
                 break;
