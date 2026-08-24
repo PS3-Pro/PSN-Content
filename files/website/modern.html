@@ -25,6 +25,8 @@
 	<link rel="icon" type="image/png" sizes="16x16" href="https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/interface/modern/images/favicon/favicon-16x16.png">
 	<link rel="apple-touch-icon" sizes="180x180" href="https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/interface/modern/images/favicon/apple-touch-icon.png">	
 	<link rel="manifest" href="https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/interface/modern/images/favicon/site.webmanifest">
+	<link rel="preconnect" href="https://raw.githubusercontent.com" crossorigin>
+	<link rel="dns-prefetch" href="//raw.githubusercontent.com">
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
 	<script src="https://cdn.jsdelivr.net/particles.js/2.0.0/particles.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
@@ -20563,6 +20565,43 @@ P
 
     const psnStoreRenderCache = window.psnStoreRenderCache || (window.psnStoreRenderCache = {});
     const psnStoreRenderPromises = window.psnStoreRenderPromises || (window.psnStoreRenderPromises = {});
+    const psnStoreTsvFetchPromises = new Map();
+    const psnStoreSharedRowCache = new Map();
+    const psnStorePathUseCount = new Map();
+    let psnStoreFullPrefetchActive = false;
+
+    Object.values(DB_PATHS).forEach(paths => {
+        (paths || []).forEach(url => psnStorePathUseCount.set(url, (psnStorePathUseCount.get(url) || 0) + 1));
+    });
+
+    async function fetchStoreTsvText(url, forceRefresh = false) {
+        const key = `${forceRefresh ? 'refresh' : 'normal'}:${url}`;
+        if (psnStoreTsvFetchPromises.has(key)) return psnStoreTsvFetchPromises.get(key);
+
+        const request = (async () => {
+            const requestUrl = forceRefresh ? `${url}${url.includes('?') ? '&' : '?'}t=${Date.now()}` : url;
+            const res = await fetch(requestUrl, forceRefresh ? { cache: 'no-store' } : undefined);
+            return res.ok ? await res.text() : '';
+        })().catch(err => {
+            console.warn('[System] Store TSV fetch failed:', url, err);
+            return '';
+        }).finally(() => {
+            psnStoreTsvFetchPromises.delete(key);
+        });
+
+        psnStoreTsvFetchPromises.set(key, request);
+        return request;
+    }
+
+    function getSharedStoreTsvRows(sourceUrl, text) {
+        if (!psnStoreFullPrefetchActive || !sourceUrl || !text || (psnStorePathUseCount.get(sourceUrl) || 0) < 2) return null;
+        const cached = psnStoreSharedRowCache.get(sourceUrl);
+        if (cached && cached.text === text) return cached.rows;
+
+        const rows = text.split('\n').map(line => ({ line, parts: line.split('\t') }));
+        psnStoreSharedRowCache.set(sourceUrl, { text, rows });
+        return rows;
+    }
 
     async function buildStoreCategoryData(cat, texts, priority = 'high', sourcePaths = []) {
 		let tempGroupMap = {};
@@ -20574,12 +20613,14 @@ P
 			if (!text) continue;
 			const sourceUrl = String(sourcePaths[textIndex] || '');
 			const sourceIsExplicitDemo = /(?:^|\/)(?:pending\/)?demos\.tsv(?:[?#]|$)/i.test(sourceUrl);
-			const lines = text.split('\n');
+			const sharedRows = getSharedStoreTsvRows(sourceUrl, text);
+			const lines = sharedRows || text.split('\n');
 
 			for (let lineIndex = 0; lineIndex < lines.length; lineIndex++) {
-				const line = lines[lineIndex];
+				const row = lines[lineIndex];
+				const line = sharedRows ? row.line : row;
 				if (!line || line.trim().length < 15) continue;
-				const parts = line.split('\t');
+				const parts = sharedRows ? row.parts : line.split('\t');
 				const id = parts[0] ? parts[0].trim() : "";
 				
 				if (id === "Title ID" || id === "TitleID") continue;
@@ -20714,17 +20755,7 @@ P
 
 		psnStoreRenderPromises[cat] = (async () => {
 			const paths = DB_PATHS[cat] || [];
-			const cacheBust = forceRefresh ? (`t=${Date.now()}`) : '';
-			const texts = await Promise.all(paths.map(async url => {
-				try {
-					const requestUrl = forceRefresh ? `${url}${url.includes('?') ? '&' : '?'}${cacheBust}` : url;
-					const res = await fetch(requestUrl, forceRefresh ? { cache: 'no-store' } : undefined);
-					return res.ok ? await res.text() : "";
-				} catch (err) {
-					console.warn('[System] Store category fetch failed:', cat, url, err);
-					return "";
-				}
-			}));
+			const texts = await Promise.all(paths.map(url => fetchStoreTsvText(url, forceRefresh)));
 			const data = await buildStoreCategoryData(cat, texts, priority, paths);
 			psnStoreRenderCache[cat] = data;
 			window.psnStoreCache[cat] = data;
@@ -20798,20 +20829,26 @@ P
 			window.psnStorePrefetchReady = false;
 			window.psnStorePrefetchProgress = { done: 0, total: essential.length, category: '' };
 
-			await Promise.all(essential.map(async cat => {
-				window.psnStorePrefetchProgress.category = cat;
+			psnStoreFullPrefetchActive = true;
+			try {
+				await Promise.all(essential.map(async cat => {
+					window.psnStorePrefetchProgress.category = cat;
 
-				if (forceRefresh || !psnStoreRenderCache[cat]) {
-					try {
-						const parsedItems = await loadStoreCategoryData(cat, isHighPriority() ? 'high' : 'low', { forceRefresh });
-						console.log(`[System] Cache populated: ${cat} (${parsedItems.length} items)`);
-					} catch(e) {
-						console.warn("[System] Prefetch failed for: " + cat, e);
+					if (forceRefresh || !psnStoreRenderCache[cat]) {
+						try {
+							const parsedItems = await loadStoreCategoryData(cat, isHighPriority() ? 'high' : 'low', { forceRefresh });
+							console.log(`[System] Cache populated: ${cat} (${parsedItems.length} items)`);
+						} catch(e) {
+							console.warn("[System] Prefetch failed for: " + cat, e);
+						}
 					}
-				}
 
-				window.psnStorePrefetchProgress.done++;
-			}));
+					window.psnStorePrefetchProgress.done++;
+				}));
+			} finally {
+				psnStoreFullPrefetchActive = false;
+				psnStoreSharedRowCache.clear();
+			}
 
 			window.psnStorePrefetchReady = true;
 			window.psnStorePrefetchProgress.category = 'ready';
