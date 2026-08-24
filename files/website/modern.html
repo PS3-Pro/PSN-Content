@@ -26396,15 +26396,9 @@ P
 		switchView('view-admin', false, true);
 
 		adminInstallSocketListeners();
-		if (typeof socketChat !== 'undefined' && socketChat && socketChat.connected) {
-			socketChat.emit('admin_request_moderation_log');
-			if (typeof window.adminRequestChatControlsState === 'function') window.adminRequestChatControlsState();
-			if (typeof window.adminRequestReports === 'function') window.adminRequestReports(true);
-		}
 		adminRefreshHealth(false, false);
 		adminResetUsersPanelState();
 		setTimeout(() => { const list = document.getElementById('admin-online-list'); if (list) list.scrollTop = 0; }, 0);
-		setTimeout(() => adminRequestUsersList(true, true), 250);
 		setTimeout(() => {
 			if (typeof moveNavLight === 'function') moveNavLight();
 			if (typeof updateSidebarLight === 'function') updateSidebarLight();
@@ -26550,12 +26544,14 @@ P
 			scheduleViewOpenWork('view-admin', () => { if (typeof renderAdminPanel === 'function') renderAdminPanel(); });
 			return;
 		}
-		if (document.getElementById('view-admin')?.style.display === 'block' && typeof renderAdminPanel === 'function') adminSchedulePanelRender();
+		if (document.getElementById('view-admin')?.style.display === 'block' && typeof renderAdminPanel === 'function') renderAdminPanel();
 	}
 
 	window.renderAdminPanel = function() {
 		const content = document.getElementById('admin-dashboard-content');
 		const lock = document.getElementById('admin-access-lock');
+		const adminView = document.getElementById('view-admin');
+		const adminEntryActive = !!(adminView && (adminView.classList.contains('view-entry-prep') || adminView.classList.contains('anim-up')));
 		if (!content) return;
 
 		if (!document.body.classList.contains('is-admin')) {
@@ -26578,7 +26574,8 @@ P
 		setTextContentById('admin-stat-messages', messages.length);
 		setTextContentById('admin-stat-database', data.loadedItems);
 		setTextContentById('admin-stat-pins', pinnedCount);
-		if (typeof window.adminRenderCountryStats === 'function') window.adminRenderCountryStats();
+		const countryList = document.getElementById('admin-country-list');
+		if (typeof window.adminRenderCountryStats === 'function' && (!adminEntryActive || countryList?.closest('.admin-card')?.classList.contains('admin-entry-visible'))) window.adminRenderCountryStats();
 		setTextContentById('admin-kv-user', data.admin);
 		setTextContentById('admin-kv-server', data.server);
 		setTextContentById('admin-kv-ps3', data.ps3Ip || 'Not set');
@@ -26599,7 +26596,7 @@ P
 		}
 
 		const list = document.getElementById('admin-online-list');
-		if (list) {
+		if (list && (!adminEntryActive || list.closest('.admin-card')?.classList.contains('admin-entry-visible'))) {
 			const myName = localStorage.getItem('psn_username') || '';
 			const filterInput = document.getElementById('admin-user-search');
 			const filter = (filterInput ? filterInput.value : '').trim().toLowerCase();
@@ -26786,7 +26783,7 @@ P
 		}
 
 		const activity = document.getElementById('admin-recent-activity');
-		if (activity) {
+		if (activity && (!adminEntryActive || activity.closest('.admin-card')?.classList.contains('admin-entry-visible'))) {
 			const recent = messages.slice(-6).reverse();
 			const activityHtml = recent.length === 0
 				? '<div class="admin-empty">No cached chat activity yet.</div>'
@@ -26801,7 +26798,7 @@ P
 			}
 		}
 
-		if (typeof adminRenderControlPanels === 'function') adminRenderControlPanels();
+		if (typeof adminRenderControlPanels === 'function') adminRenderControlPanels(adminEntryActive);
 	};
 
 	window.adminOpenSessionInspector = function(name) {
@@ -26869,7 +26866,7 @@ P
 		clearTimeout(window.adminUsersRenderTimer);
 		window.adminUsersRenderTimer = setTimeout(() => {
 			window.adminUsersRenderTimer = null;
-			renderAdminPanel();
+			adminSchedulePanelRender();
 		}, includeRegistered ? 350 : 250);
 	};
 
@@ -29675,88 +29672,96 @@ P
 		return m ? `${m}m ${s}s` : `${s}s`;
 	}
 
-	function adminRenderControlPanels() {
-		const maintenance = adminGetMaintenanceState();
+	function adminRenderControlPanels(visibleOnly = false) {
+		const cardCanRender = el => !visibleOnly || !!el?.closest('.admin-card')?.classList.contains('admin-entry-visible');
+
 		const maintInput = document.getElementById('admin-maintenance-message');
-		if (maintInput && document.activeElement !== maintInput) maintInput.value = maintenance.message || maintInput.value;
-		const schedule = adminNormalizeMaintenanceSchedule(maintenance.schedule || {});
-		const scheduleEnabled = document.getElementById('admin-maintenance-schedule-enabled');
-		if (scheduleEnabled) scheduleEnabled.checked = !!schedule.enabled;
-		const scheduleStart = document.getElementById('admin-maintenance-start-time');
-		if (scheduleStart && document.activeElement !== scheduleStart) scheduleStart.value = schedule.startTime || '02:00';
-		const scheduleEnd = document.getElementById('admin-maintenance-end-time');
-		if (scheduleEnd && document.activeElement !== scheduleEnd) scheduleEnd.value = schedule.endTime || '03:00';
-		document.querySelectorAll('.admin-maintenance-day').forEach(cb => { cb.checked = schedule.days.includes(parseInt(cb.value, 10)); });
-		const scheduleStatus = document.getElementById('admin-maintenance-schedule-status');
-		if (scheduleStatus) {
-			const label = adminMaintenanceScheduleLabel(schedule);
-			const countdown = maintenance.activeUntil ? adminFormatMaintenanceTimeLeft(maintenance.activeUntil) : '';
-			const suppressedCountdown = maintenance.scheduleSuppressedUntil ? adminFormatMaintenanceTimeLeft(maintenance.scheduleSuppressedUntil) : '';
-			scheduleStatus.innerHTML = schedule.enabled
-				? `<i class="fas fa-calendar-check"></i> ${adminEscapeHtml(label)}${maintenance.scheduledActive && countdown ? ` • Live again in ${adminEscapeHtml(countdown)}` : (suppressedCountdown ? ` • Current window skipped (${adminEscapeHtml(suppressedCountdown)})` : '')}`
-				: 'Schedule is off.';
-		}
-		const maintPill = document.getElementById('admin-maintenance-pill');
-		if (maintPill) {
-			maintPill.className = maintenance.enabled ? 'admin-pill danger' : (schedule.enabled ? 'admin-pill warning' : 'admin-pill online');
-			maintPill.innerHTML = maintenance.manualEnabled
-				? '<i class="fas fa-circle"></i> Manual Active'
-				: (maintenance.scheduledActive ? '<i class="fas fa-calendar-day"></i> Scheduled Active' : (schedule.enabled ? '<i class="fas fa-calendar-alt"></i> Scheduled' : '<i class="fas fa-circle"></i> Off'));
-		}
-		const maintBtn = document.getElementById('admin-maintenance-toggle');
-		if (maintBtn && !window.__adminMaintenanceCommitInFlight) {
-			maintBtn.disabled = false;
-			maintBtn.style.pointerEvents = '';
-			maintBtn.style.opacity = '';
-			maintBtn.className = maintenance.enabled ? 'admin-action-btn danger' : 'admin-action-btn warning';
-			maintBtn.innerHTML = maintenance.enabled ? '<i class="fas fa-power-off"></i> Disable Now' : '<i class="fas fa-power-off"></i> Enable Now';
+		if (cardCanRender(maintInput)) {
+			const maintenance = adminGetMaintenanceState();
+			if (maintInput && document.activeElement !== maintInput) maintInput.value = maintenance.message || maintInput.value;
+			const schedule = adminNormalizeMaintenanceSchedule(maintenance.schedule || {});
+			const scheduleEnabled = document.getElementById('admin-maintenance-schedule-enabled');
+			if (scheduleEnabled) scheduleEnabled.checked = !!schedule.enabled;
+			const scheduleStart = document.getElementById('admin-maintenance-start-time');
+			if (scheduleStart && document.activeElement !== scheduleStart) scheduleStart.value = schedule.startTime || '02:00';
+			const scheduleEnd = document.getElementById('admin-maintenance-end-time');
+			if (scheduleEnd && document.activeElement !== scheduleEnd) scheduleEnd.value = schedule.endTime || '03:00';
+			document.querySelectorAll('.admin-maintenance-day').forEach(cb => { cb.checked = schedule.days.includes(parseInt(cb.value, 10)); });
+			const scheduleStatus = document.getElementById('admin-maintenance-schedule-status');
+			if (scheduleStatus) {
+				const label = adminMaintenanceScheduleLabel(schedule);
+				const countdown = maintenance.activeUntil ? adminFormatMaintenanceTimeLeft(maintenance.activeUntil) : '';
+				const suppressedCountdown = maintenance.scheduleSuppressedUntil ? adminFormatMaintenanceTimeLeft(maintenance.scheduleSuppressedUntil) : '';
+				scheduleStatus.innerHTML = schedule.enabled
+					? `<i class="fas fa-calendar-check"></i> ${adminEscapeHtml(label)}${maintenance.scheduledActive && countdown ? ` • Live again in ${adminEscapeHtml(countdown)}` : (suppressedCountdown ? ` • Current window skipped (${adminEscapeHtml(suppressedCountdown)})` : '')}`
+					: 'Schedule is off.';
+			}
+			const maintPill = document.getElementById('admin-maintenance-pill');
+			if (maintPill) {
+				maintPill.className = maintenance.enabled ? 'admin-pill danger' : (schedule.enabled ? 'admin-pill warning' : 'admin-pill online');
+				maintPill.innerHTML = maintenance.manualEnabled
+					? '<i class="fas fa-circle"></i> Manual Active'
+					: (maintenance.scheduledActive ? '<i class="fas fa-calendar-day"></i> Scheduled Active' : (schedule.enabled ? '<i class="fas fa-calendar-alt"></i> Scheduled' : '<i class="fas fa-circle"></i> Off'));
+			}
+			const maintBtn = document.getElementById('admin-maintenance-toggle');
+			if (maintBtn && !window.__adminMaintenanceCommitInFlight) {
+				maintBtn.disabled = false;
+				maintBtn.style.pointerEvents = '';
+				maintBtn.style.opacity = '';
+				maintBtn.className = maintenance.enabled ? 'admin-action-btn danger' : 'admin-action-btn warning';
+				maintBtn.innerHTML = maintenance.enabled ? '<i class="fas fa-power-off"></i> Disable Now' : '<i class="fas fa-power-off"></i> Enable Now';
+			}
+
+			const pinned = adminGetPinnedAnnouncement();
+			const pinnedStatus = document.getElementById('admin-pinned-status');
+			if (pinnedStatus) pinnedStatus.innerHTML = pinned?.text ? `<i class="fas fa-thumbtack"></i> ${adminEscapeHtml(pinned.text)}` : 'No custom announcement pinned.';
+			const pinnedColor = adminNormalizeAnnouncementColor(pinned?.color || '#ffcc00');
+			const pinnedColorInput = document.getElementById('admin-pinned-announcement-color');
+			if (pinnedColorInput && document.activeElement !== pinnedColorInput) pinnedColorInput.value = pinnedColor;
+			if (typeof window.adminPreviewPinnedAnnouncementColor === 'function') window.adminPreviewPinnedAnnouncementColor(pinnedColor);
 		}
 
-		const pinned = adminGetPinnedAnnouncement();
-		const pinnedStatus = document.getElementById('admin-pinned-status');
-		if (pinnedStatus) pinnedStatus.innerHTML = pinned?.text ? `<i class="fas fa-thumbtack"></i> ${adminEscapeHtml(pinned.text)}` : 'No custom announcement pinned.';
-		const pinnedColor = adminNormalizeAnnouncementColor(pinned?.color || '#ffcc00');
-		const pinnedColorInput = document.getElementById('admin-pinned-announcement-color');
-		if (pinnedColorInput && document.activeElement !== pinnedColorInput) pinnedColorInput.value = pinnedColor;
-		if (typeof window.adminPreviewPinnedAnnouncementColor === 'function') window.adminPreviewPinnedAnnouncementColor(pinnedColor);
-
-		const controls = window.adminGetChatControls();
 		const lockToggle = document.getElementById('admin-chat-lock-toggle');
-		const slowInput = document.getElementById('admin-slowmode-seconds');
-		if (lockToggle) lockToggle.checked = !!controls.locked;
-		if (slowInput && document.activeElement !== slowInput) slowInput.value = controls.slowSeconds || 0;
-		const chatPill = document.getElementById('admin-chat-controls-pill');
-		if (chatPill) {
-			const active = controls.locked || controls.slowSeconds > 0;
-			chatPill.className = controls.locked ? 'admin-pill danger' : (active ? 'admin-pill warning' : 'admin-pill online');
-			chatPill.innerHTML = controls.locked ? '<i class="fas fa-lock"></i> Locked' : (controls.slowSeconds > 0 ? `<i class="fas fa-clock"></i> Slow ${controls.slowSeconds}s` : '<i class="fas fa-lock-open"></i> Open');
+		if (cardCanRender(lockToggle)) {
+			const controls = window.adminGetChatControls();
+			const slowInput = document.getElementById('admin-slowmode-seconds');
+			if (lockToggle) lockToggle.checked = !!controls.locked;
+			if (slowInput && document.activeElement !== slowInput) slowInput.value = controls.slowSeconds || 0;
+			const chatPill = document.getElementById('admin-chat-controls-pill');
+			if (chatPill) {
+				const active = controls.locked || controls.slowSeconds > 0;
+				chatPill.className = controls.locked ? 'admin-pill danger' : (active ? 'admin-pill warning' : 'admin-pill online');
+				chatPill.innerHTML = controls.locked ? '<i class="fas fa-lock"></i> Locked' : (controls.slowSeconds > 0 ? `<i class="fas fa-clock"></i> Slow ${controls.slowSeconds}s` : '<i class="fas fa-lock-open"></i> Open');
+			}
+			if (typeof adminUpdateChatControlsPanelStatus === 'function') adminUpdateChatControlsPanelStatus();
 		}
-		if (typeof adminUpdateChatControlsPanelStatus === 'function') adminUpdateChatControlsPanelStatus();
 
-		const health = window.adminHealth || {};
-		const liveSocketState = health.socketState || adminGetRealtimeSocketState();
-		const socketMeta = adminGetSocketStateMeta(liveSocketState);
-		const latencyText = liveSocketState === 'online'
-			? (health.latency === null || health.latency === undefined ? 'Pending' : health.latency + 'ms')
-			: (liveSocketState === 'connecting' ? 'Waiting...' : '-');
 		const healthList = document.getElementById('admin-health-list');
-		if (healthList) {
-			setAdminHtmlIfChanged(healthList, `
-				<div class="admin-kv"><span>Socket</span><strong>${socketMeta.label}</strong></div>
-				<div class="admin-kv"><span>Latency</span><strong${/^\d/.test(latencyText) ? ' data-live-value="true" translate="no"' : ''}>${latencyText}</strong></div>
-				<div class="admin-kv"><span>Transport</span><strong data-live-value="true" translate="no">${adminEscapeHtml(health.transport || '-')}</strong></div>
-				<div class="admin-kv"><span>Server</span><strong data-live-value="true" translate="no">${adminEscapeHtml(health.server || adminGetDisplayServer())}</strong></div>
-				<div class="admin-kv"><span>Page uptime</span><strong data-live-value="true" translate="no">${adminFormatSeconds(health.uptime || 0)}</strong></div>`);
-		}
-		const healthStrip = document.getElementById('admin-health-strip');
-		if (healthStrip) {
-			setAdminHtmlIfChanged(healthStrip, `
-				<span class="admin-status-chip ${socketMeta.className}"><i class="${socketMeta.icon}"></i> ${socketMeta.shortLabel}</span>
-				<span class="admin-status-chip ${health.loadedItems ? 'online' : 'warning'}"><i class="fas fa-database"></i> <span data-live-value="true" translate="no">${health.loadedItems || 0}</span> <span>items</span></span>`);
+		if (cardCanRender(healthList)) {
+			const health = window.adminHealth || {};
+			const liveSocketState = health.socketState || adminGetRealtimeSocketState();
+			const socketMeta = adminGetSocketStateMeta(liveSocketState);
+			const latencyText = liveSocketState === 'online'
+				? (health.latency === null || health.latency === undefined ? 'Pending' : health.latency + 'ms')
+				: (liveSocketState === 'connecting' ? 'Waiting...' : '-');
+			if (healthList) {
+				setAdminHtmlIfChanged(healthList, `
+					<div class="admin-kv"><span>Socket</span><strong>${socketMeta.label}</strong></div>
+					<div class="admin-kv"><span>Latency</span><strong${/^\d/.test(latencyText) ? ' data-live-value="true" translate="no"' : ''}>${latencyText}</strong></div>
+					<div class="admin-kv"><span>Transport</span><strong data-live-value="true" translate="no">${adminEscapeHtml(health.transport || '-')}</strong></div>
+					<div class="admin-kv"><span>Server</span><strong data-live-value="true" translate="no">${adminEscapeHtml(health.server || adminGetDisplayServer())}</strong></div>
+					<div class="admin-kv"><span>Page uptime</span><strong data-live-value="true" translate="no">${adminFormatSeconds(health.uptime || 0)}</strong></div>`);
+			}
+			const healthStrip = document.getElementById('admin-health-strip');
+			if (healthStrip) {
+				setAdminHtmlIfChanged(healthStrip, `
+					<span class="admin-status-chip ${socketMeta.className}"><i class="${socketMeta.icon}"></i> ${socketMeta.shortLabel}</span>
+					<span class="admin-status-chip ${health.loadedItems ? 'online' : 'warning'}"><i class="fas fa-database"></i> <span data-live-value="true" translate="no">${health.loadedItems || 0}</span> <span>items</span></span>`);
+			}
 		}
 
 		const reportsEl = document.getElementById('admin-report-center');
-		if (reportsEl) {
+		if (reportsEl && cardCanRender(reportsEl)) {
 			const reports = adminGetReports();
 			if (!reports.length) {
 				setAdminHtmlIfChanged(reportsEl, '<div class="admin-empty"><i class="fas fa-flag" style="color:#ffcc00;margin-right:6px;"></i>No reports yet. Users can report messages with the flag icon in chat. Refresh asks the server for pending reports.</div>');
@@ -29770,9 +29775,8 @@ P
 			}
 		}
 
-
 		const serverLogEl = document.getElementById('admin-server-log');
-		if (serverLogEl) {
+		if (serverLogEl && cardCanRender(serverLogEl)) {
 			const log = adminGetServerLog();
 			if (!log.length) {
 				setAdminHtmlIfChanged(serverLogEl, '<div class="admin-empty">No server events yet. Logins and disconnects will appear here.</div>');
@@ -29785,7 +29789,7 @@ P
 		}
 
 		const modLog = document.getElementById('admin-moderation-log');
-		if (modLog) {
+		if (modLog && cardCanRender(modLog)) {
 			const log = adminGetModerationLog();
 			if (!log.length) {
 				setAdminHtmlIfChanged(modLog, '<div class="admin-empty">No moderation actions logged yet.</div>');
@@ -29797,9 +29801,11 @@ P
 			}
 		}
 
-		adminUpdateMaintenanceOverlay();
-		adminUpdateAnnouncementBanner();
-		adminUpdateChatControlsBanner();
+		if (!visibleOnly) {
+			adminUpdateMaintenanceOverlay();
+			adminUpdateAnnouncementBanner();
+			adminUpdateChatControlsBanner();
+		}
 	}
 
 	function adminInstallMaintenanceSocketListeners() {
@@ -41818,8 +41824,8 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
             renderOnlineList();
         }
 
-        if (document.getElementById('view-admin')?.style.display === 'block' && typeof renderAdminPanel === 'function') {
-            renderAdminPanel();
+        if (document.getElementById('view-admin')?.style.display === 'block' && typeof adminSchedulePanelRender === 'function') {
+            adminSchedulePanelRender();
         }
     }
     window.resetChatOnlinePresenceUi = resetChatOnlinePresenceUi;
@@ -50840,8 +50846,8 @@ function getVisibleChatStackEl(id) {
 			});
 			const openedProfileUserForBanner = document.getElementById('modal-sys-profile')?.dataset?.profileUsername || document.getElementById('profile-name-val')?.innerText || '';
 			if (openedProfileUserForBanner && typeof refreshOpenProfileCardStyleForUser === 'function') refreshOpenProfileCardStyleForUser(openedProfileUserForBanner);
-			if (document.getElementById('view-admin')?.style.display === 'block' && typeof renderAdminPanel === 'function') {
-				renderAdminPanel();
+			if (document.getElementById('view-admin')?.style.display === 'block' && typeof adminSchedulePanelRender === 'function') {
+				adminSchedulePanelRender();
 			}
 		
 			if (isVisible) renderOnlineList();
@@ -60204,7 +60210,17 @@ function getVisibleChatStackEl(id) {
 	
 	document.addEventListener('animationend', (e) => {
 		if (['view-enter', 'explore-view-enter', 'online-view-enter'].includes(e.animationName)) {
+			const finishedAdminEntry = e.animationName === 'view-enter' && e.target.id === 'view-admin';
 			e.target.classList.remove('anim-up');
+			if (finishedAdminEntry) {
+				if (typeof adminSchedulePanelRender === 'function') adminSchedulePanelRender();
+				if (typeof socketChat !== 'undefined' && socketChat && socketChat.connected) {
+					socketChat.emit('admin_request_moderation_log');
+					if (typeof window.adminRequestChatControlsState === 'function') window.adminRequestChatControlsState();
+					if (typeof window.adminRequestReports === 'function') window.adminRequestReports(true);
+					if (typeof window.adminRequestUsersList === 'function') window.adminRequestUsersList(true, true);
+				}
+			}
 		}
 	});
 	</script>
