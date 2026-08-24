@@ -13259,6 +13259,8 @@ P
 	const EXPLORE_VIRTUAL_MOBILE_CARD_WIDTH = 140;
 	const EXPLORE_VIRTUAL_DEFAULT_GAP = 15;
 	const EXPLORE_VIRTUAL_SMOOTH_SETTLE_MS = 520;
+	const exploreVirtualContainers = new Set();
+	const exploreVirtualView = document.getElementById('view-explore');
 
 	function escapeExploreHtmlText(value) {
 		return String(value || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -13863,16 +13865,24 @@ P
 		});
 	}
 
+	function forEachExploreVirtualContainer(callback) {
+		exploreVirtualContainers.forEach(container => {
+			if (!container || !container.isConnected || !container.__exploreVirtualData) {
+				exploreVirtualContainers.delete(container);
+				return;
+			}
+			callback(container);
+		});
+	}
+
 	function refreshExploreVirtualCarousels(force = false) {
-		const exploreView = document.getElementById('view-explore');
-		if (!exploreView) return;
-		exploreView.querySelectorAll('.horizontal-scroll[data-explore-virtual="1"]').forEach(container => scheduleExploreVirtualRender(container, force));
+		if (!exploreVirtualView || exploreVirtualView.style.display === 'none') return;
+		forEachExploreVirtualContainer(container => scheduleExploreVirtualRender(container, force));
 	}
 
 	function refreshExploreVirtualCarouselsNow(force = false) {
-		const exploreView = document.getElementById('view-explore');
-		if (!exploreView) return;
-		exploreView.querySelectorAll('.horizontal-scroll[data-explore-virtual="1"]').forEach(container => {
+		if (!exploreVirtualView || exploreVirtualView.style.display === 'none') return;
+		forEachExploreVirtualContainer(container => {
 			if (container.__exploreVirtualFrame) {
 				cancelAnimationFrame(container.__exploreVirtualFrame);
 				container.__exploreVirtualFrame = 0;
@@ -13886,11 +13896,6 @@ P
 		if (!container || container.__exploreVirtualHandlersAttached) return;
 		container.__exploreVirtualHandlersAttached = true;
 		container.addEventListener('scroll', () => scheduleExploreVirtualRender(container), { passive: true });
-		const main = document.querySelector('.main-content');
-		if (main && !main.__exploreVirtualScrollAttached) {
-			main.__exploreVirtualScrollAttached = true;
-			main.addEventListener('scroll', () => refreshExploreVirtualCarousels(false), { passive: true });
-		}
 		if (!window.__exploreVirtualResizeAttached) {
 			window.__exploreVirtualResizeAttached = true;
 			window.addEventListener('resize', () => refreshExploreVirtualCarousels(true), { passive: true });
@@ -13899,6 +13904,7 @@ P
 
 	function setExploreVirtualData(container, cat, items, animateCards) {
 		if (!container) return;
+		exploreVirtualContainers.add(container);
 		container.__exploreVirtualData = { cat, items: items || [], animateCards: !!animateCards, initialRevealDone: false, cardCache: new Map() };
 		container.dataset.exploreCat = cat;
 		container.dataset.countAwareTotal = String((items || []).length);
@@ -30912,6 +30918,13 @@ P
     const btnTop = document.getElementById("btnScrollTop");
     const btnBottom = document.getElementById("btnScrollBottom");
     const scrollBtnsContainer = document.querySelector(".scroll-buttons");
+    const scrollButtonViews = {
+        browse: document.getElementById('view-browse'),
+        wishlist: document.getElementById('view-wishlist'),
+        downloads: document.getElementById('view-downloads'),
+        favorites: document.getElementById('subview-favs'),
+        games: document.getElementById('subview-games')
+    };
 
    let scrollButtonsVisibilityFrame = 0;
    window.updateScrollButtonsVisibility = function() {
@@ -30922,12 +30935,12 @@ P
 
             const isConnected = window._lastConnectionState === true;
 
-            const isBrowse = document.getElementById('view-browse').style.display === 'block';
-            const isWishlist = document.getElementById('view-wishlist').style.display === 'block';
-            const isDownloads = document.getElementById('view-downloads').style.display === 'block';
+            const isBrowse = scrollButtonViews.browse?.style.display === 'block';
+            const isWishlist = scrollButtonViews.wishlist?.style.display === 'block';
+            const isDownloads = scrollButtonViews.downloads?.style.display === 'block';
 
-            const isFavorites = document.getElementById('subview-favs')?.style.display === 'flex' || document.getElementById('subview-favs')?.style.display === 'block';
-            const isGames = document.getElementById('subview-games')?.style.display === 'flex' || document.getElementById('subview-games')?.style.display === 'block';
+            const isFavorites = scrollButtonViews.favorites?.style.display === 'flex' || scrollButtonViews.favorites?.style.display === 'block';
+            const isGames = scrollButtonViews.games?.style.display === 'flex' || scrollButtonViews.games?.style.display === 'block';
             
             const isLibraryAllowed = isConnected && (isFavorites || isGames);
 
@@ -30969,6 +30982,7 @@ P
             const scrolled = scrollArea.scrollTop > 90;
             browseToolbars.forEach(tb => tb.classList.toggle('scrolled', scrolled));
             updateScrollButtonsVisibility();
+            if (typeof refreshExploreVirtualCarousels === 'function') refreshExploreVirtualCarousels(false);
         });
     }, { passive: true });
 
@@ -34467,20 +34481,35 @@ P
 		return true;
 	}
 
+	function stopProfilePlayTimeTicker() {
+		if (!window.__profilePlayTimeTicker) return;
+		clearInterval(window.__profilePlayTimeTicker);
+		window.__profilePlayTimeTicker = null;
+	}
+
+	function isProfilePlayTimeTickerVisible() {
+		if (document.hidden) return false;
+		const modal = document.getElementById('modal-sys-profile');
+		if (!modal || !modal.classList.contains('show') || (modal.style.display !== 'flex' && modal.style.display !== 'block')) return false;
+		return !!document.getElementById('profile-playing-time');
+	}
+
 	function startProfilePlayTimeTicker() {
-		if (window.__profilePlayTimeTicker) {
-			clearInterval(window.__profilePlayTimeTicker);
-			window.__profilePlayTimeTicker = null;
-		}
+		stopProfilePlayTimeTicker();
 		if (!refreshProfilePlayTimeTicker()) return;
 
 		window.__profilePlayTimeTicker = setInterval(() => {
-			if (!refreshProfilePlayTimeTicker()) {
-				clearInterval(window.__profilePlayTimeTicker);
-				window.__profilePlayTimeTicker = null;
-			}
+			if (!isProfilePlayTimeTickerVisible() || !refreshProfilePlayTimeTicker()) stopProfilePlayTimeTicker();
 		}, 1000);
 	}
+
+	document.addEventListener('visibilitychange', () => {
+		if (document.hidden) {
+			stopProfilePlayTimeTicker();
+			return;
+		}
+		if (isProfilePlayTimeTickerVisible()) startProfilePlayTimeTicker();
+	});
 
 	function applyPs3DisconnectedUi(favDot, globalIcon, btnConnect, btnShutdown) {
 		if (favDot) favDot.style.display = 'none';
@@ -59084,6 +59113,7 @@ function getVisibleChatStackEl(id) {
 		const modal = document.getElementById(modalId);
 		const clickedClose = event && event.target && event.target.closest && event.target.closest('.sys-modal-close');
 		if (!event || clickedClose) {
+			if (modalId === 'modal-sys-profile' && typeof stopProfilePlayTimeTicker === 'function') stopProfilePlayTimeTicker();
 			if (typeof cropperInstance !== 'undefined' && cropperInstance) { cropperInstance.destroy(); cropperInstance = null; }
 			if (typeof activeEditorCanvas !== 'undefined' && activeEditorCanvas) { activeEditorCanvas.dispose(); activeEditorCanvas = null; }
 			if (modalId === 'modal-sys-crop') {
@@ -59145,6 +59175,7 @@ function getVisibleChatStackEl(id) {
 
     function openProfileModal(targetUser = null) {
 		closeDropdownMenu();
+		if (typeof stopProfilePlayTimeTicker === 'function') stopProfilePlayTimeTicker();
 		if (typeof window.closeMobileSidebarIfOpen === 'function') window.closeMobileSidebarIfOpen();
 	
 		const onlineModal = document.getElementById('modal-sys-online');
