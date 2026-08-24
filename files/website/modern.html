@@ -14762,7 +14762,7 @@ P
 		return Math.max(minMargin, Math.ceil((rect.height || 600) * multiplier)) + 'px';
 	}
 
-	/* --- PROGRESSIVE GRID RENDERING (WISHLIST / MY GAMES / FAVORITES) --- */
+	/* --- PROGRESSIVE COLLECTION RENDERING (WISHLIST / DOWNLOADS / MY GAMES / FAVORITES / FRIENDS SEARCH) --- */
 	const progressiveGridObservers = Object.create(null);
 
 	function getProgressiveGridInitialLimit() {
@@ -14785,11 +14785,11 @@ P
 		}
 	}
 
-	function setupProgressiveGridObserver(key, grid, renderedCount, totalCount, loadMore) {
+	function setupProgressiveGridObserver(key, grid, renderedCount, totalCount, loadMore, rootOverride = null) {
 		clearProgressiveGridObserver(key, grid);
 		if (!grid || renderedCount >= totalCount || typeof loadMore !== 'function') return;
 
-		const root = document.getElementById('scroll-area') || document.querySelector('.main-content') || document.querySelector('.content');
+		const root = rootOverride || document.getElementById('scroll-area') || document.querySelector('.main-content') || document.querySelector('.content');
 		const sentinel = document.createElement('div');
 		sentinel.dataset.progressiveGridSentinel = key;
 		sentinel.style.cssText = 'height:20px;grid-column:1/-1;opacity:0;pointer-events:none;';
@@ -14799,7 +14799,7 @@ P
 			requestAnimationFrame(() => loadMore());
 			return;
 		}
-		const rootMargin = (typeof getBrowseInfiniteRootMargin === 'function') ? getBrowseInfiniteRootMargin() : '1200px';
+		const rootMargin = rootOverride ? '400px' : ((typeof getBrowseInfiniteRootMargin === 'function') ? getBrowseInfiniteRootMargin() : '1200px');
 		const observer = new IntersectionObserver(entries => {
 			if (!entries[0] || !entries[0].isIntersecting) return;
 			try { observer.disconnect(); } catch (e) {}
@@ -16953,31 +16953,70 @@ P
     window.waitBootPreloadsBeforeUserSelect = waitBootPreloadsBeforeUserSelect;
 
     let bootExploreWarmPromise = null;
+    const bootExplorePreloadedCoverUrls = new Set();
+    let bootExploreBackgroundCoverWarmScheduled = false;
 
-    async function preloadExploreCoverImages(limit = 8, timeout = 250) {
-        const exploreView = document.getElementById('view-explore');
-        if (!exploreView) return;
-        if (!limit || limit <= 0) return;
+    function getExploreBootCoverPreloadCount(container) {
+        if (!container) return 0;
+        const data = container.__exploreVirtualData;
+        const totalItems = data && Array.isArray(data.items)
+            ? data.items.length
+            : container.querySelectorAll('.game-img').length;
+        if (!totalItems) return 0;
 
+        const metrics = getExploreVirtualMetrics(container);
+        let visibleCount = 0;
+        if (container.clientWidth > 0) {
+            visibleCount = getExploreVirtualVisibleCount(container, metrics);
+        } else {
+            const isMobile = window.matchMedia && window.matchMedia('(max-width: 768px)').matches;
+            const viewportWidth = window.innerWidth || document.documentElement.clientWidth || metrics.cardWidth;
+            const fallbackWidth = isMobile
+                ? viewportWidth
+                : Math.max(metrics.cardWidth, viewportWidth - 400);
+            visibleCount = Math.max(4, Math.ceil(fallbackWidth / Math.max(1, metrics.step)) + 1);
+        }
+
+        return Math.min(totalItems, visibleCount + 1);
+    }
+
+    function getExploreCoverUrlsForContainer(container) {
         const urls = [];
-        exploreView.querySelectorAll('.horizontal-scroll').forEach(container => {
-            container.querySelectorAll('.game-img').forEach(img => {
-                if (img && img.src) urls.push(img.src);
-            });
-
-            const data = container.__exploreVirtualData;
-            if (data && Array.isArray(data.items)) {
-                data.items.forEach(item => {
-                    try {
-                        const url = getItemCover(item, data.cat);
-                        if (url) urls.push(url);
-                    } catch(e) {}
-                });
-            }
+        container.querySelectorAll('.game-img').forEach(img => {
+            if (img && img.src) urls.push(img.src);
         });
 
-        const uniqueUrls = Array.from(new Set(urls)).slice(0, limit);
-        if (!uniqueUrls.length) return;
+        const data = container.__exploreVirtualData;
+        if (data && Array.isArray(data.items)) {
+            data.items.forEach(item => {
+                try {
+                    const url = getItemCover(item, data.cat);
+                    if (url) urls.push(url);
+                } catch(e) {}
+            });
+        }
+        return Array.from(new Set(urls));
+    }
+
+    async function preloadExploreCoverImages(options = {}) {
+        const exploreView = document.getElementById('view-explore');
+        if (!exploreView) return;
+
+        const visibleOnly = options.visibleOnly !== false;
+        const timeout = Math.max(0, Number(options.timeout) || (visibleOnly ? 1800 : 0));
+        const batchSize = Math.max(1, Number(options.batchSize) || 16);
+        const urls = [];
+
+        exploreView.querySelectorAll('.horizontal-scroll').forEach(container => {
+            const containerUrls = getExploreCoverUrlsForContainer(container);
+            const takeCount = visibleOnly ? getExploreBootCoverPreloadCount(container) : containerUrls.length;
+            containerUrls.slice(0, takeCount).forEach(url => {
+                if (!url || bootExplorePreloadedCoverUrls.has(url)) return;
+                bootExplorePreloadedCoverUrls.add(url);
+                urls.push(url);
+            });
+        });
+        if (!urls.length) return;
 
         const loadUrl = (url) => new Promise(resolve => {
             const img = new Image();
@@ -16989,10 +17028,33 @@ P
             if (img.decode) img.decode().then(resolve).catch(resolve);
         });
 
-        await Promise.race([
-            Promise.allSettled(uniqueUrls.map(loadUrl)),
-            new Promise(resolve => setTimeout(resolve, timeout))
-        ]);
+        if (visibleOnly) {
+            await Promise.race([
+                Promise.allSettled(urls.map(loadUrl)),
+                new Promise(resolve => setTimeout(resolve, timeout))
+            ]);
+            return;
+        }
+
+        for (let i = 0; i < urls.length; i += batchSize) {
+            await Promise.allSettled(urls.slice(i, i + batchSize).map(loadUrl));
+            if (i + batchSize < urls.length) await bootLowPriorityPause(0, 'low');
+        }
+    }
+
+    function scheduleExploreBackgroundCoverWarmup() {
+        if (bootExploreBackgroundCoverWarmScheduled) return;
+        bootExploreBackgroundCoverWarmScheduled = true;
+
+        const run = () => {
+            const warm = () => preloadExploreCoverImages({ visibleOnly: false, batchSize: 16 })
+                .catch(e => console.warn('[System] Explore background cover warmup failed.', e));
+            if (window.requestIdleCallback) window.requestIdleCallback(warm, { timeout: 2500 });
+            else setTimeout(warm, 600);
+        };
+
+        if (document.readyState === 'complete') run();
+        else window.addEventListener('load', run, { once: true });
     }
 
     async function warmExploreBeforeUserSelect() {
@@ -17002,7 +17064,8 @@ P
                 if (typeof populateExploreTab === 'function') {
                     await populateExploreTab({ animateCards: true, reason: 'starting-gate' });
                 }
-                await preloadExploreCoverImages(200, 4500);
+                await preloadExploreCoverImages({ visibleOnly: true, timeout: 1800 });
+                scheduleExploreBackgroundCoverWarmup();
                 window.__exploreWarmedBeforeLogin = true;
             } catch (e) {
                 console.warn('[System] Explore warmup failed. Continuing boot.', e);
@@ -25961,7 +26024,7 @@ P
         }
     };
 
-    window.updateDownloadUI = function(isSilent = false) {
+    window.updateDownloadUI = function(isSilent = false, progressiveMode = 'reset') {
 		if (typeof window.setSidebarCountPill === 'function') window.setSidebarCountPill('downloads', Array.isArray(window.downloadHistory) ? window.downloadHistory.length : 0);
 		const isSilentRender = !!window.isRestoringHistory || isSilent === true || window.__applyingRemoteProfileSync === true;
 		const listContainer = document.getElementById('downloads-list');
@@ -25995,7 +26058,9 @@ P
 	
 		if (window.downloadHistory.length === 0) {
 			cancelDownloadSwipeHintPreview(true);
+			clearProgressiveGridObserver('downloads', listContainer);
 			delete listContainer.dataset.downloadRenderSignature;
+			delete listContainer.dataset.progressiveGridRendered;
 			listContainer.innerHTML = `
 				<div style="text-align: center; color: #888; padding: 100px 50px; background: rgba(0,0,0,0.2); border-radius: 12px; border: 1px dashed rgba(255,255,255,0.05); backdrop-filter: blur(5px);">
 					<i class="fas fa-download" style="font-size: 50px; margin-bottom: 20px; opacity: 0.2;"></i>
@@ -26029,14 +26094,34 @@ P
 			getDownloadNotificationItemKey(dl), dl.date || '', dl.sizeText || '', Number(dl.downloadCount) || 1,
 			dl.sentToPs3 === true ? 1 : 0, dl.cleanName || dl.name || '', dl.category || '', dl.contentId || ''
 		].join('~')).join('|');
-		const canReuseDownloadDom = listContainer.dataset.downloadRenderSignature === downloadRenderSignature && !!listContainer.querySelector('.download-swipe-row');
-		if (canReuseDownloadDom) {
+		const appendProgressive = progressiveMode === 'append';
+		const downloadPreviouslyRendered = Number(listContainer.dataset.progressiveGridRendered || 0);
+		const downloadSameSignature = listContainer.dataset.downloadRenderSignature === downloadRenderSignature;
+		const downloadHasRows = !!listContainer.querySelector('.download-swipe-row');
+		const downloadInitialLimit = Math.max(1, Math.min(60, getProgressiveGridInitialLimit()));
+		const downloadLoadAmount = Math.max(1, Math.min(100, getProgressiveGridLoadAmount()));
+		clearProgressiveGridObserver('downloads', listContainer);
+
+		if (!appendProgressive && downloadSameSignature && downloadHasRows) {
+			const renderedCount = Math.min(window.downloadHistory.length, downloadPreviouslyRendered || listContainer.querySelectorAll('.download-swipe-row').length);
+			listContainer.dataset.progressiveGridRendered = String(renderedCount);
 			if (!isSilentRender && typeof setupRevealAnimations === 'function') setupRevealAnimations(listContainer, { selector:'.download-item', root:listContainer, margin:18 });
+			setupProgressiveGridObserver('downloads', listContainer, renderedCount, window.downloadHistory.length, () => window.updateDownloadUI(true, 'append'), listContainer);
 			scheduleDownloadSwipeHint();
 			return;
 		}
-		
-		listContainer.innerHTML = window.downloadHistory.map((dl, index) => {
+
+		const downloadCanAppend = appendProgressive && downloadSameSignature && downloadHasRows && downloadPreviouslyRendered > 0;
+		const downloadRenderStart = downloadCanAppend ? downloadPreviouslyRendered : 0;
+		const downloadResetTarget = (!downloadCanAppend && isSilentRender && downloadPreviouslyRendered > 0)
+			? Math.max(downloadInitialLimit, downloadPreviouslyRendered)
+			: downloadInitialLimit;
+		const downloadRenderEnd = Math.min(
+			window.downloadHistory.length,
+			downloadCanAppend ? downloadRenderStart + downloadLoadAmount : downloadResetTarget
+		);
+		const downloadRowsHtml = window.downloadHistory.slice(downloadRenderStart, downloadRenderEnd).map((dl, offset) => {
+			const index = downloadRenderStart + offset;
 			dl = (typeof window.sanitizeDownloadCoverRecord === 'function') ? window.sanitizeDownloadCoverRecord(dl, 'downloads') : dl;
 			const newClass = dl.isNew ? 'is-new' : '';
 			const downloadRealtimeKey = getDownloadNotificationItemKey(dl);
@@ -26098,10 +26183,14 @@ P
 				</div>
 			`;
 		}).join('');
+		if (downloadCanAppend) listContainer.insertAdjacentHTML('beforeend', downloadRowsHtml);
+		else listContainer.innerHTML = downloadRowsHtml;
 		listContainer.dataset.downloadRenderSignature = downloadRenderSignature;
+		listContainer.dataset.progressiveGridRendered = String(downloadRenderEnd);
 		if (!isSilentRender && typeof setupRevealAnimations === 'function') {
 			setupRevealAnimations(listContainer, { selector:'.download-item', root:listContainer, margin:18 });
 		}
+		setupProgressiveGridObserver('downloads', listContainer, downloadRenderEnd, window.downloadHistory.length, () => window.updateDownloadUI(true, 'append'), listContainer);
 		scheduleDownloadSwipeHint();
 	};
 
@@ -48477,7 +48566,7 @@ function getVisibleChatStackEl(id) {
 		}
 	}
 
-    function showChatNotification(userName, isMention, isGlobalPing, globalPingRole = '') {
+    function showChatNotification(userName, isMention, isGlobalPing, globalPingRole = '', reactionEmoji = '') {
         if (typeof isChatNotificationSessionReady === 'function' && !isChatNotificationSessionReady()) return;
 
         const container = document.getElementById('trophy-container');
@@ -48499,6 +48588,10 @@ function getVisibleChatStackEl(id) {
             highlightColor = '#ffcc00';
             titleText = 'NEW MENTION';
             bodyText = `<b>${userName}</b> mentioned you`;
+        } else if (reactionEmoji) {
+            highlightColor = '#ff4fa3';
+            titleText = 'NEW REACTION';
+            bodyText = `<b>${userName}</b> reacted ${reactionEmoji} to your message`;
         }
     
         notification.innerHTML = `
@@ -51649,10 +51742,20 @@ function getVisibleChatStackEl(id) {
 				const item = normalizeUserNotificationItem(rawEvent);
 				if (!item) return;
 				const known = Array.isArray(window.userNotificationItems) && window.userNotificationItems.some(function(existing) { return String(existing && existing.id || '') === String(item.id || ''); });
+				const isFreshUnread = !known && Math.max(0, Number(item.id) || 0) > Math.max(0, Number(window.__userNotificationLastReadId) || 0);
 				if (typeof window.mergeUserNotificationItems === 'function') window.mergeUserNotificationItems([item], false);
 				window.__userNotificationRemoteReady = true;
-				if (!known && Math.max(0, Number(item.id) || 0) > Math.max(0, Number(window.__userNotificationLastReadId) || 0)) {
+				if (isFreshUnread) {
 					window.__userNotificationUnreadCount = Math.max(0, Number(window.__userNotificationUnreadCount) || 0) + 1;
+				}
+				if (isFreshUnread && item.type === 'reaction' && typeof showChatNotification === 'function') {
+					const chatVisible = typeof isChatScreenVisibleForRead === 'function'
+						? isChatScreenVisibleForRead()
+						: (document.getElementById('view-chat')?.style.display === 'flex' || document.getElementById('view-chat')?.style.display === 'block');
+					if (!chatVisible) {
+						const reactionEmoji = String(item.data && item.data.emoji || '❤').trim() || '❤';
+						showChatNotification(item.user || 'Someone', false, false, '', reactionEmoji);
+					}
 				}
 				if (typeof window.isNotificationCenterVisible === 'function' && window.isNotificationCenterVisible() && window.__userNotificationClearBusy !== true) {
 					if (!known && typeof window.applyUserNotificationRealtimeDom === 'function') window.applyUserNotificationRealtimeDom(item);
@@ -57974,7 +58077,7 @@ function getVisibleChatStackEl(id) {
 		}
 	};
 	
-	window.renderFriendsList = function(filter = '', isSilent = false) {
+	window.renderFriendsList = function(filter = '', isSilent = false, progressiveMode = 'reset') {
 		if (typeof window.setSidebarCountPill === 'function') window.setSidebarCountPill('friends', Array.isArray(window.friendsList) ? window.friendsList.length : 0);
 		isSilent = isSilent || !!window.isRestoringHistory;
 		const friendsParentView = document.getElementById('view-chat');
@@ -58141,13 +58244,86 @@ function getVisibleChatStackEl(id) {
 				String(!!(net && net.isBanned || entry && entry.isBanned || friend && friend.isBanned || search && search.isBanned))
 			].join('~');
 		};
+		const friendsSignatureFriend = filteredFriends.map(function(entry) { return friendsSignatureEntry(entry, 'friend'); }).join('||');
+		const friendsSignatureOnline = onlineOthers.map(function(entry) { return friendsSignatureEntry(entry, 'online'); }).join('||');
+		const friendsSignatureOffline = globalOffline.map(function(entry) { return friendsSignatureEntry(entry, 'offline'); }).join('||');
+		const friendsProgressiveSignature = getProgressiveGridSignature([
+			searchTerm, sortMode, showOnlineOnly ? '1' : '0', showPlayingOnly ? '1' : '0', window.sortOrders && window.sortOrders.friends || 'asc',
+			friendsSignatureFriend, friendsSignatureOnline, friendsSignatureOffline
+		]);
 		const friendsRenderSignature = getProgressiveGridSignature([
 			searchTerm, sortMode, showOnlineOnly ? '1' : '0', showPlayingOnly ? '1' : '0', window.sortOrders && window.sortOrders.friends || 'asc',
-			Math.floor(Date.now() / 60000),
-			filteredFriends.map(function(entry) { return friendsSignatureEntry(entry, 'friend'); }).join('||'),
-			onlineOthers.map(function(entry) { return friendsSignatureEntry(entry, 'online'); }).join('||'),
-			globalOffline.map(function(entry) { return friendsSignatureEntry(entry, 'offline'); }).join('||')
+			Math.floor(Date.now() / 60000), friendsSignatureFriend, friendsSignatureOnline, friendsSignatureOffline
 		]);
+		const friendsTotalMatches = filteredFriends.length + onlineOthers.length + globalOffline.length;
+		const friendsProgressiveInitial = Math.max(1, Math.min(60, getProgressiveGridInitialLimit()));
+		const friendsProgressiveLoad = Math.max(1, Math.min(100, getProgressiveGridLoadAmount()));
+		const friendsUseProgressiveSearch = isSearching && friendsTotalMatches > friendsProgressiveInitial;
+		const friendsAppendProgressive = progressiveMode === 'append';
+		const friendsSameSignature = grid.dataset.friendsRenderSignature === friendsRenderSignature;
+		const friendsSameProgressiveSignature = grid.dataset.friendsProgressiveSignature === friendsProgressiveSignature;
+		const friendsPreviouslyRendered = Number(grid.dataset.friendsProgressiveRendered || 0);
+		clearProgressiveGridObserver('friends-search', grid);
+
+		if (friendsUseProgressiveSearch) {
+			if (!friendsAppendProgressive && friendsSameSignature && friendsSameProgressiveSignature && grid.childElementCount > 0) {
+				const renderedCount = Math.min(friendsTotalMatches, friendsPreviouslyRendered || friendsProgressiveInitial);
+				grid.dataset.friendsProgressiveRendered = String(renderedCount);
+				if (!isSilent && typeof setupRevealAnimations === 'function') setupRevealAnimations('friends-list-grid');
+				setupProgressiveGridObserver('friends-search', grid, renderedCount, friendsTotalMatches, () => window.renderFriendsList(searchTerm, true, 'append'));
+				return;
+			}
+
+			const canAppendSearch = friendsAppendProgressive && friendsSameProgressiveSignature && friendsPreviouslyRendered > 0 && grid.childElementCount > 0;
+			const renderStart = canAppendSearch ? friendsPreviouslyRendered : 0;
+			const resetTarget = (!canAppendSearch && friendsSameProgressiveSignature && friendsPreviouslyRendered > 0)
+				? Math.max(friendsProgressiveInitial, friendsPreviouslyRendered)
+				: friendsProgressiveInitial;
+			const renderEnd = Math.min(friendsTotalMatches, canAppendSearch ? renderStart + friendsProgressiveLoad : resetTarget);
+			if (!canAppendSearch) grid.innerHTML = '';
+			grid.dataset.friendsRenderSignature = friendsRenderSignature;
+			grid.dataset.friendsProgressiveSignature = friendsProgressiveSignature;
+
+			const friendEnd = filteredFriends.length;
+			const onlineEnd = friendEnd + onlineOthers.length;
+			for (let position = renderStart; position < renderEnd; position++) {
+				if (position < friendEnd) {
+					if (position === 0) grid.insertAdjacentHTML('beforeend', `<div class="search-divider" style="margin-top: -10px;">FRIENDS (${filteredFriends.length})</div>`);
+					const f = filteredFriends[position];
+					const fName = f.name || f;
+					const net = onlineByName.get(fName) || null;
+					const isOn = net && net.online === true;
+					const knownLastSeen = getKnownFriendLastSeen(fName, f, net);
+					grid.appendChild(createUserCardElement(fName, f.avatar, isOn ? '#4caf50' : '#8b96a8', isOn ? 'Online' : `Last seen: ${formatLastSeen(knownLastSeen)}`, isOn, true, position, true, friendLookupContext));
+				} else if (position < onlineEnd) {
+					const localIndex = position - friendEnd;
+					if (localIndex === 0) {
+						const extraStyle = filteredFriends.length > 0 ? '' : 'margin-top: -10px;';
+						grid.insertAdjacentHTML('beforeend', `<div class="search-divider online-header" style="${extraStyle}">PLAYERS ONLINE (${onlineOthers.length})</div>`);
+					}
+					const u = onlineOthers[localIndex];
+					const uName = u.name || u;
+					grid.appendChild(createUserCardElement(uName, u.avatar, '#4caf50', 'Online Now', true, false, localIndex + 100, true, friendLookupContext));
+				} else {
+					const localIndex = position - onlineEnd;
+					if (localIndex === 0) {
+						const extraStyle = (filteredFriends.length > 0 || onlineOthers.length > 0) ? '' : 'margin-top: -10px;';
+						grid.insertAdjacentHTML('beforeend', `<div class="search-divider" style="${extraStyle} color: #8b96a8;">PLAYERS OFFLINE (${globalOffline.length})</div>`);
+					}
+					const u = globalOffline[localIndex];
+					const uName = u.name || u;
+					grid.appendChild(createUserCardElement(uName, u.avatar, '#8b96a8', 'Offline', false, false, localIndex + 500, true, friendLookupContext));
+				}
+			}
+
+			grid.dataset.friendsProgressiveRendered = String(renderEnd);
+			if (!isSilent && typeof setupRevealAnimations === 'function') setupRevealAnimations('friends-list-grid');
+			setupProgressiveGridObserver('friends-search', grid, renderEnd, friendsTotalMatches, () => window.renderFriendsList(searchTerm, true, 'append'));
+			return;
+		}
+
+		delete grid.dataset.friendsProgressiveRendered;
+		delete grid.dataset.friendsProgressiveSignature;
 		if (grid.dataset.friendsRenderSignature === friendsRenderSignature && grid.childElementCount > 0) {
 			if (!isSilent && typeof setupRevealAnimations === 'function') setupRevealAnimations('friends-list-grid');
 			return;
