@@ -14689,6 +14689,26 @@ P
 
 	let g_browseViewportCache = null;
 	let g_browseViewportCacheAt = 0;
+	const browseSearchKeyCache = new WeakMap();
+
+	function getBrowseSearchKeys(game) {
+		if (!game || (typeof game !== 'object' && typeof game !== 'function')) {
+			return { nameNormalized: '', idLower: '', idNormalized: '' };
+		}
+		const name = String(game.cleanName || '');
+		const id = String(game.id || '');
+		const cached = browseSearchKeyCache.get(game);
+		if (cached && cached.name === name && cached.id === id) return cached;
+		const value = {
+			name,
+			id,
+			nameNormalized: name.toLowerCase().replace(/[^a-z0-9]/g, '').replace(/([a-z])\1+/g, '$1'),
+			idLower: id.toLowerCase(),
+			idNormalized: id.toUpperCase().replace(/[^A-Z0-9]/g, '')
+		};
+		browseSearchKeyCache.set(game, value);
+		return value;
+	}
 
 	function getBrowseIsCompact() {
 		return !!(window.matchMedia && window.matchMedia('(max-width: 768px)').matches);
@@ -14743,23 +14763,26 @@ P
 		if (isCompact) {
 			return getAdaptiveGridBatchCount(DEFAULT_RENDER_LIMIT, { min: 36, max: DEFAULT_RENDER_LIMIT, extraRows: 5 });
 		}
-		return getAdaptiveGridBatchCount(96, { min: DEFAULT_RENDER_LIMIT, max: 96, extraRows: 4 });
+		/* Keep the first paint bounded on every desktop. A fast machine still fills a
+		   large viewport, while a busy machine avoids a 100+ card burst in one frame. */
+		return getAdaptiveGridBatchCount(72, { min: 48, max: 72, extraRows: 3 });
 	}
 
 	function getBrowseLoadAmount() {
 		const isCompact = getBrowseIsCompact();
 		if (isCompact) {
-			return getAdaptiveGridBatchCount(LOAD_AMOUNT, { min: 48, max: LOAD_AMOUNT, extraRows: 8 });
+			return getAdaptiveGridBatchCount(84, { min: 48, max: 84, extraRows: 7 });
 		}
-		return getAdaptiveGridBatchCount(160, { min: LOAD_AMOUNT, max: 160, extraRows: 7 });
+		return getAdaptiveGridBatchCount(104, { min: 64, max: 104, extraRows: 5 });
 	}
 
 	function getBrowseInfiniteRootMargin() {
 		const rect = getBrowseViewportRect();
 		const isCompact = getBrowseIsCompact();
-		const multiplier = isCompact ? 3.0 : 2.4;
-		const minMargin = isCompact ? 1300 : 1100;
-		return Math.max(minMargin, Math.ceil((rect.height || 600) * multiplier)) + 'px';
+		const multiplier = isCompact ? 1.7 : 1.1;
+		const minMargin = isCompact ? 900 : 700;
+		const maxMargin = isCompact ? 1500 : 1200;
+		return Math.min(maxMargin, Math.max(minMargin, Math.ceil((rect.height || 600) * multiplier))) + 'px';
 	}
 
 	/* --- PROGRESSIVE COLLECTION RENDERING (WISHLIST / DOWNLOADS / MY GAMES / FAVORITES / FRIENDS SEARCH) --- */
@@ -20817,17 +20840,16 @@ P
 		const activeConsoles = Array.isArray(context.activeConsoles) ? context.activeConsoles : [];
 		const currentCat = context.currentCat || '';
 		const cleanName = String(game.cleanName || '');
-		const gameId = String(game.id || '');
+		const searchKeys = getBrowseSearchKeys(game);
 
 		if (term) {
-			const normalizedTermId = term.toUpperCase().replace(/[^A-Z0-9]/g, '');
-			const isExactTitleIdSearch = /^[A-Z]{4}[0-9]{5}$/.test(normalizedTermId);
+			const normalizedTermId = context.normalizedTermId || term.toUpperCase().replace(/[^A-Z0-9]/g, '');
+			const isExactTitleIdSearch = context.isExactTitleIdSearch === true || /^[A-Z]{4}[0-9]{5}$/.test(normalizedTermId);
 			if (isExactTitleIdSearch) {
-				if (gameId.toUpperCase().replace(/[^A-Z0-9]/g, '') !== normalizedTermId) return false;
+				if (searchKeys.idNormalized !== normalizedTermId) return false;
 			} else {
-				const nameNormalized = cleanName.toLowerCase().replace(/[^a-z0-9]/g, '').replace(/([a-z])\1+/g, '$1');
-				const idMatch = gameId.toLowerCase().includes(term);
-				const nameMatch = nameNormalized.includes(termNormalized);
+				const idMatch = searchKeys.idLower.includes(term);
+				const nameMatch = searchKeys.nameNormalized.includes(termNormalized);
 				if (!(nameMatch || idMatch)) return false;
 			}
 		} else if (typeof activeLetter !== 'undefined' && activeLetter !== 'ALL') {
@@ -20838,7 +20860,10 @@ P
 		}
 
 		if (regionFilter !== 'ALL' && game.region !== regionFilter) return false;
-		if (currentCat === 'games' && !activeConsoles.includes(game.cTag)) return false;
+		if (currentCat === 'games') {
+			const activeConsolesSet = context.activeConsolesSet instanceof Set ? context.activeConsolesSet : null;
+			if (activeConsolesSet ? !activeConsolesSet.has(game.cTag) : !activeConsoles.includes(game.cTag)) return false;
+		}
 
 		if (currentCat === 'apps') {
 			if (!context.showFirstPlay && game.aTag === 'firstplay') return false;
@@ -20855,11 +20880,16 @@ P
 		const regionSelect = document.getElementById('region-select');
 		const catSelect = document.getElementById('cat-select');
 		const currentCat = catSelect ? catSelect.value : '';
+		const activeConsoles = Array.from(document.querySelectorAll('#console-filters input:checked')).map(cb => cb.value);
+		const normalizedTermId = term.toUpperCase().replace(/[^A-Z0-9]/g, '');
 		return {
 			term,
 			termNormalized: term.replace(/[^a-z0-9]/g, '').replace(/([a-z])\1+/g, '$1'),
+			normalizedTermId,
+			isExactTitleIdSearch: /^[A-Z]{4}[0-9]{5}$/.test(normalizedTermId),
 			regionFilter: (typeof browseExpandedGroupTitle !== 'undefined' && browseExpandedGroupTitle) ? 'ALL' : (regionSelect ? regionSelect.value : 'ALL'),
-			activeConsoles: Array.from(document.querySelectorAll('#console-filters input:checked')).map(cb => cb.value),
+			activeConsoles,
+			activeConsolesSet: new Set(activeConsoles),
 			currentCat,
 			showFirstPlay: !!document.querySelector('#app-filters input[value="firstplay"]')?.checked,
 			showQore: !!document.querySelector('#app-filters input[value="qore"]')?.checked,
@@ -21551,6 +21581,8 @@ P
 		let currentY = 0;
 		let targetX = 0;
 		let targetY = 0;
+		let activeRect = null;
+		let activeRectAt = 0;
 
 		function ensurePointerLight(card) {
 			let light = card.querySelector(':scope > .psn-card-pointer-light');
@@ -21566,6 +21598,8 @@ P
 			if (frame) cancelAnimationFrame(frame);
 			frame = 0;
 			activeCard = null;
+			activeRect = null;
+			activeRectAt = 0;
 		}
 
 		function renderPointerLight() {
@@ -21586,10 +21620,14 @@ P
 			}
 
 			ensurePointerLight(card);
-			const rect = card.getBoundingClientRect();
-			if (!rect.width || !rect.height) return;
-			targetX = event.clientX - rect.left;
-			targetY = event.clientY - rect.top;
+			const now = (window.performance && performance.now) ? performance.now() : Date.now();
+			if (activeCard !== card || !activeRect || (now - activeRectAt) > 120) {
+				activeRect = card.getBoundingClientRect();
+				activeRectAt = now;
+			}
+			if (!activeRect.width || !activeRect.height) return;
+			targetX = event.clientX - activeRect.left;
+			targetY = event.clientY - activeRect.top;
 
 			if (activeCard !== card) {
 				activeCard = card;
@@ -21605,6 +21643,13 @@ P
 			const toCard = event.relatedTarget && event.relatedTarget.closest ? event.relatedTarget.closest('.game-card') : null;
 			if (fromCard === activeCard && toCard !== activeCard) stopPointerLight();
 		}, { passive: true });
+
+		const invalidatePointerRect = () => {
+			activeRect = null;
+			activeRectAt = 0;
+		};
+		document.getElementById('scroll-area')?.addEventListener('scroll', invalidatePointerRect, { passive: true });
+		window.addEventListener('resize', invalidatePointerRect, { passive: true });
 	})();
 
 
@@ -21678,6 +21723,9 @@ P
 		const regionFilter = document.getElementById('region-select').value;
 		const activeConsolesNodes = document.querySelectorAll('#console-filters input:checked');
 		const activeConsoles = activeConsolesNodes ? Array.from(activeConsolesNodes).map(cb => cb.value) : [];
+		const activeConsolesSet = new Set(activeConsoles);
+		const normalizedTermId = term.toUpperCase().replace(/[^A-Z0-9]/g, '');
+		const isExactTitleIdSearch = /^[A-Z]{4}[0-9]{5}$/.test(normalizedTermId);
 		const currentCat = document.getElementById('cat-select').value;
 		if (typeof syncBrowseContextualSearchState === 'function') syncBrowseContextualSearchState('view-browse');
 		const missingRapToggleEl = document.getElementById('show-missing-rap-toggle');
@@ -21691,17 +21739,20 @@ P
 		const showQore = document.querySelector('#app-filters input[value="qore"]').checked;
 		const showMedia = document.querySelector('#app-filters input[value="media"]').checked;
 
-		const browseFilterContext = { term, termNormalized, regionFilter, activeConsoles, currentCat, showFirstPlay, showQore, showMedia };
+		const browseFilterContext = { term, termNormalized, normalizedTermId, isExactTitleIdSearch, regionFilter, activeConsoles, activeConsolesSet, currentCat, showFirstPlay, showQore, showMedia };
 		const passesBrowseFiltersBeforeMissingRap = (game) => browseItemPassesFiltersBeforeMissingRap(game, browseFilterContext);
 
 		let searchCandidateCount = 0;
 		let searchCandidateMissingRapCount = 0;
+		let searchCandidates = null;
 		if (searchHasText) {
-			currentData.forEach(game => {
-				if (!passesBrowseFiltersBeforeMissingRap(game)) return;
+			searchCandidates = [];
+			for (const game of currentData) {
+				if (!passesBrowseFiltersBeforeMissingRap(game)) continue;
+				searchCandidates.push(game);
 				searchCandidateCount++;
 				if (isMissingRapItem(game)) searchCandidateMissingRapCount++;
-			});
+			}
 		}
 
 		const searchSingleMissingRapCandidate = searchHasText && searchCandidateCount === 1 && searchCandidateMissingRapCount === 1;
@@ -21716,8 +21767,9 @@ P
 		window.__browseHiddenMissingRapCount = 0;
 		window.__browseAvailableMissingRapCount = 0;
 
-		filteredData = currentData.filter(game => {
-			if (!passesBrowseFiltersBeforeMissingRap(game)) return false;
+		const browseFilterSource = searchCandidates || currentData;
+		filteredData = browseFilterSource.filter(game => {
+			if (!searchHasText && !passesBrowseFiltersBeforeMissingRap(game)) return false;
 
 			const missingRap = isMissingRapItem(game);
 			if (missingRap) {
@@ -30774,8 +30826,11 @@ P
     const btnBottom = document.getElementById("btnScrollBottom");
     const scrollBtnsContainer = document.querySelector(".scroll-buttons");
 
+   let scrollButtonsVisibilityFrame = 0;
    window.updateScrollButtonsVisibility = function() {
-        requestAnimationFrame(() => {
+        if (scrollButtonsVisibilityFrame) return;
+        scrollButtonsVisibilityFrame = requestAnimationFrame(() => {
+            scrollButtonsVisibilityFrame = 0;
             if (!scrollArea || !scrollBtnsContainer || !btnTop || !btnBottom) return;
 
             const isConnected = window._lastConnectionState === true;
@@ -30818,27 +30873,17 @@ P
         });
     };
 
+    const browseToolbars = Array.from(document.querySelectorAll('.browse-toolbar'));
+    let scrollUiFrame = 0;
     scrollArea.addEventListener("scroll", () => {
-        const toolbars = document.querySelectorAll('.browse-toolbar');
-        
-        toolbars.forEach(tb => {
-            if (tb.id === 'library-toolbar') {
-                if (scrollArea.scrollTop > 90) { 
-                    tb.classList.add('scrolled');
-                } else {
-                    tb.classList.remove('scrolled');
-                }
-            } else {
-                if (scrollArea.scrollTop > 90) {
-                    tb.classList.add('scrolled');
-                } else {
-                    tb.classList.remove('scrolled');
-                }
-            }
+        if (scrollUiFrame) return;
+        scrollUiFrame = requestAnimationFrame(() => {
+            scrollUiFrame = 0;
+            const scrolled = scrollArea.scrollTop > 90;
+            browseToolbars.forEach(tb => tb.classList.toggle('scrolled', scrolled));
+            updateScrollButtonsVisibility();
         });
-        
-        updateScrollButtonsVisibility();
-    });
+    }, { passive: true });
 
     btnTop.addEventListener("click", () => {
         scrollArea.scrollTo({ top: 0, behavior: "smooth" });
@@ -30849,13 +30894,19 @@ P
     });
 
     window.addEventListener('resize', updateScrollButtonsVisibility);
+
+    /* Content changes can alter scrollHeight; style changes from hover/animations must not
+       wake this observer on every frame. View-size changes are covered by ResizeObserver. */
     const scrollObserver = new MutationObserver(updateScrollButtonsVisibility);
-    scrollObserver.observe(scrollArea, { 
-        childList: true,
-        subtree: true,
-        attributes: true,
-        attributeFilter: ['style'] 
-    });
+    scrollObserver.observe(scrollArea, { childList: true, subtree: true });
+
+    if (typeof ResizeObserver === 'function') {
+        const scrollLayoutObserver = new ResizeObserver(updateScrollButtonsVisibility);
+        ['view-browse', 'view-wishlist', 'view-downloads', 'subview-games', 'subview-favs'].forEach(id => {
+            const el = document.getElementById(id);
+            if (el) scrollLayoutObserver.observe(el);
+        });
+    }
 
     document.addEventListener('DOMContentLoaded', () => {
 		const catSelect = document.getElementById('cat-select');
