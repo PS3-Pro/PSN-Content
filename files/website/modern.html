@@ -13344,7 +13344,7 @@ P
 		const videosCard = document.getElementById('recently-visited-videos-card');
 		const isDesktopSplit = !(window.matchMedia && window.matchMedia('(max-width: 1024px)').matches);
 		const sectionVisible = !!(section && getComputedStyle(section).display !== 'none');
-		const display = isDesktopSplit && sectionVisible ? 'flex' : 'none';
+		const display = (!isDesktopSplit || sectionVisible) ? 'flex' : 'none';
 		const leftCol = section ? section.closest('.explore-left-col') : null;
 		if (leftCol) leftCol.classList.toggle('recently-visited-active', isDesktopSplit && sectionVisible);
 		if (guidesCard) guidesCard.style.display = display;
@@ -31000,6 +31000,8 @@ P
     const slideInterval = 5000;
     let autoSlideTimer;
     let heroTransitionFallbackTimer = null;
+    let heroViewportObserver = null;
+    let heroInViewport = true;
     
     function initCarousel() {
         const track = document.getElementById('carousel-track');
@@ -31031,6 +31033,7 @@ P
         });
 
         initHeroMobileSwipe(track);
+        initHeroViewportPlaybackObserver();
 
 
         if (track.dataset.heroResizeReady !== 'true') {
@@ -31205,6 +31208,21 @@ P
 		resetTimer();
 	}
 	
+	function initHeroViewportPlaybackObserver() {
+		const hero = document.querySelector('#view-explore .hero-carousel');
+		if (!hero || typeof IntersectionObserver !== 'function') return;
+		if (heroViewportObserver) { try { heroViewportObserver.disconnect(); } catch (e) {} }
+
+		heroViewportObserver = new IntersectionObserver((entries) => {
+			const entry = entries && entries[0];
+			heroInViewport = !!(entry && entry.isIntersecting && entry.intersectionRatio > 0);
+			if (heroInViewport && !document.hidden) startAutoSlide();
+			else stopAutoSlide();
+		}, { root: null, rootMargin: '120px 0px', threshold: 0.01 });
+
+		heroViewportObserver.observe(hero);
+	}
+
 	function stopAutoSlide() {
 		if (!autoSlideTimer) return;
 		clearInterval(autoSlideTimer);
@@ -31213,7 +31231,9 @@ P
 
 	function startAutoSlide() {
 		stopAutoSlide();
-		if (document.hidden) return;
+		if (document.hidden || heroInViewport === false) return;
+		const exploreView = document.getElementById('view-explore');
+		if (exploreView && getComputedStyle(exploreView).display === 'none') return;
 		autoSlideTimer = setInterval(nextSlide, slideInterval);
 	}
 	
@@ -64890,5 +64910,239 @@ function getVisibleChatStackEl(id) {
 		}
 	})();
 	</script>
+
+	<!-- ====================================================================== VIEWPORT ANIMATION SCHEDULER ====================================================================== -->
+	<style>
+		/* Fallback for pseudo-element CSS animations; WAAPI below handles the exact infinite animations themselves. */
+		.psn-viewport-animation-paused::before,
+		.psn-viewport-animation-paused::after { animation-play-state: paused !important; }
+	</style>
+	<script>
+	(function installViewportAnimationScheduler(){
+		if (window.__psnViewportAnimationSchedulerInstalled) return;
+		window.__psnViewportAnimationSchedulerInstalled = true;
+		if (typeof IntersectionObserver !== 'function') return;
+
+		const observed = new Set();
+		const intersectionState = new WeakMap();
+		const pausedByElement = new WeakMap();
+		const pauseCountByAnimation = new WeakMap();
+		const schedulerPausedAnimations = new WeakSet();
+		let infiniteSelector = '';
+		let mutationObserver = null;
+		let registrationFrame = 0;
+		const pendingRoots = new Set();
+
+		function splitSelectorList(selectorText) {
+			const out = [];
+			let start = 0, round = 0, square = 0, quote = '';
+			for (let i = 0; i < selectorText.length; i++) {
+				const ch = selectorText[i];
+				if (quote) {
+					if (ch === quote && selectorText[i - 1] !== '\\') quote = '';
+					continue;
+				}
+				if (ch === '"' || ch === "'") { quote = ch; continue; }
+				if (ch === '(') round++;
+				else if (ch === ')') round = Math.max(0, round - 1);
+				else if (ch === '[') square++;
+				else if (ch === ']') square = Math.max(0, square - 1);
+				else if (ch === ',' && round === 0 && square === 0) {
+					out.push(selectorText.slice(start, i).trim());
+					start = i + 1;
+				}
+			}
+			out.push(selectorText.slice(start).trim());
+			return out.filter(Boolean);
+		}
+
+		function selectorHost(selector) {
+			/* Interaction-only infinite effects cannot run while genuinely offscreen. */
+			if (/:(?:hover|active|focus|focus-visible|focus-within)\b/i.test(selector)) return '';
+			const host = selector.replace(/::[a-zA-Z0-9_-]+(?:\([^)]*\))?/g, '').trim();
+			if (!host || host.includes('::')) return '';
+			return host;
+		}
+
+		function collectInfiniteAnimationSelectors() {
+			const selectors = new Set();
+			function walk(rules) {
+				if (!rules) return;
+				for (const rule of Array.from(rules)) {
+					try {
+						if (rule.cssRules) { walk(rule.cssRules); continue; }
+						if (!rule.selectorText || !rule.style) continue;
+						const animationText = `${rule.style.animation || ''} ${rule.style.animationIterationCount || ''}`;
+						if (!/\binfinite\b/i.test(animationText)) continue;
+						splitSelectorList(rule.selectorText).forEach(selector => {
+							const host = selectorHost(selector);
+							if (host) selectors.add(host);
+						});
+					} catch (e) {}
+				}
+			}
+			for (const sheet of Array.from(document.styleSheets || [])) {
+				try { walk(sheet.cssRules); } catch (e) {}
+			}
+			/* Covers the few dynamically-generated inline infinite animations too. */
+			selectors.add('[style*="infinite"]');
+			return Array.from(selectors).join(',');
+		}
+
+		function getInfiniteAnimations(el) {
+			if (!el || typeof el.getAnimations !== 'function') return [];
+			let animations = [];
+			try { animations = el.getAnimations({ subtree: true }) || []; } catch (e) {
+				try { animations = el.getAnimations() || []; } catch (err) { return []; }
+			}
+			return animations.filter(animation => {
+				try {
+					const timing = animation.effect && animation.effect.getTiming ? animation.effect.getTiming() : null;
+					return !!timing && timing.iterations === Infinity;
+				} catch (e) { return false; }
+			});
+		}
+
+		function pauseInfiniteAnimations(el) {
+			if (!el || !el.isConnected) return;
+			el.classList.add('psn-viewport-animation-paused');
+			let owned = pausedByElement.get(el);
+			if (!owned) { owned = new Set(); pausedByElement.set(el, owned); }
+			getInfiniteAnimations(el).forEach(animation => {
+				if (owned.has(animation)) return;
+				owned.add(animation);
+				const count = pauseCountByAnimation.get(animation) || 0;
+				pauseCountByAnimation.set(animation, count + 1);
+				if (count > 0) return;
+				try {
+					if (animation.playState === 'running' || animation.playState === 'pending') {
+						animation.pause();
+						schedulerPausedAnimations.add(animation);
+					}
+				} catch (e) {}
+			});
+		}
+
+		function releaseInfiniteAnimations(el, shouldResume) {
+			if (!el) return;
+			el.classList.remove('psn-viewport-animation-paused');
+			const owned = pausedByElement.get(el);
+			if (!owned) return;
+			owned.forEach(animation => {
+				const count = pauseCountByAnimation.get(animation) || 0;
+				if (count > 1) {
+					pauseCountByAnimation.set(animation, count - 1);
+					return;
+				}
+				pauseCountByAnimation.delete(animation);
+				if (!shouldResume || !schedulerPausedAnimations.has(animation)) return;
+				try { if (animation.playState === 'paused') animation.play(); } catch (e) {}
+			});
+			owned.clear();
+		}
+
+		function resumeInfiniteAnimations(el) {
+			releaseInfiniteAnimations(el, true);
+		}
+
+		function applyElementState(el) {
+			const inView = intersectionState.get(el) === true;
+			if (document.hidden || !inView) pauseInfiniteAnimations(el);
+			else resumeInfiniteAnimations(el);
+		}
+
+		const io = new IntersectionObserver(entries => {
+			entries.forEach(entry => {
+				intersectionState.set(entry.target, !!(entry.isIntersecting && entry.intersectionRatio > 0));
+				applyElementState(entry.target);
+			});
+		}, { root: null, rootMargin: '120px 0px', threshold: 0.001 });
+
+		function observeElement(el) {
+			if (!el || el.nodeType !== 1 || observed.has(el)) return;
+			observed.add(el);
+			intersectionState.set(el, false);
+			try { io.observe(el); } catch (e) { observed.delete(el); }
+		}
+
+		function unobserveElement(el) {
+			if (!el || !observed.has(el)) return;
+			try { io.unobserve(el); } catch (e) {}
+			releaseInfiniteAnimations(el, false);
+			observed.delete(el);
+			intersectionState.delete(el);
+		}
+
+		function unregisterRoot(root) {
+			if (!root || root.nodeType !== 1) return;
+			unobserveElement(root);
+			if (!infiniteSelector || typeof root.querySelectorAll !== 'function') return;
+			try { root.querySelectorAll(infiniteSelector).forEach(unobserveElement); } catch (e) {}
+		}
+
+		function registerRoot(root) {
+			if (!infiniteSelector || !root) return;
+			if (root.nodeType === 1) {
+				try { if (root.matches(infiniteSelector)) observeElement(root); } catch (e) {}
+			}
+			if (typeof root.querySelectorAll !== 'function') return;
+			try { root.querySelectorAll(infiniteSelector).forEach(observeElement); } catch (e) {}
+		}
+
+		function queueRegistration(root) {
+			if (root) pendingRoots.add(root);
+			if (registrationFrame) return;
+			registrationFrame = requestAnimationFrame(() => {
+				registrationFrame = 0;
+				const roots = Array.from(pendingRoots);
+				pendingRoots.clear();
+				roots.forEach(registerRoot);
+			});
+		}
+
+		function refreshSelectorMap() {
+			infiniteSelector = collectInfiniteAnimationSelectors();
+			registerRoot(document);
+		}
+
+		function boot() {
+			refreshSelectorMap();
+			if (document.body && typeof MutationObserver === 'function') {
+				mutationObserver = new MutationObserver(mutations => {
+					mutations.forEach(mutation => {
+						if (mutation.type === 'childList') {
+							mutation.removedNodes.forEach(node => {
+								if (node && node.nodeType === 1) unregisterRoot(node);
+							});
+							mutation.addedNodes.forEach(node => {
+								if (node && node.nodeType === 1) {
+									if (node.tagName === 'STYLE' || node.tagName === 'LINK') refreshSelectorMap();
+									queueRegistration(node);
+								}
+							});
+						} else if (mutation.type === 'attributes') {
+							queueRegistration(mutation.target);
+							/* Ancestor state changes can activate descendant animation selectors. */
+							if (mutation.target && mutation.target.querySelectorAll) queueRegistration(mutation.target);
+							if (observed.has(mutation.target) && intersectionState.get(mutation.target) !== true) pauseInfiniteAnimations(mutation.target);
+						}
+					});
+				});
+				mutationObserver.observe(document.body, { subtree: true, childList: true, attributes: true, attributeFilter: ['class','style'] });
+			}
+		}
+
+		document.addEventListener('visibilitychange', () => {
+			observed.forEach(el => {
+				if (!el.isConnected) { observed.delete(el); return; }
+				applyElementState(el);
+			});
+		}, { passive: true });
+
+		if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot, { once: true });
+		else boot();
+	})();
+	</script>
+
 </body>
 </html>
