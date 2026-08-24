@@ -39771,12 +39771,12 @@ function formatLibraryLastPlayedBadge(game = {}) {
 		}
 	};
 
-window.showLibrarySection = function(type, noScrollToTop = false, isSilent = false) {
+window.showLibrarySection = function(type, noScrollToTop = false, isSilent = false, _skipSubviewExit = false) {
 	const libraryRoot = document.getElementById('view-library');
 	const isLibraryVisible = libraryRoot && (libraryRoot.style.display === 'block' || libraryRoot.style.display === 'flex');
 
 	if (!isLibraryVisible) {
-		switchView('view-library', false, true, () => showLibrarySection(type, noScrollToTop, isSilent));
+		switchView('view-library', false, true, () => showLibrarySection(type, noScrollToTop, isSilent, true));
 		return;
 	}
 
@@ -39798,10 +39798,33 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 	const libraryViewWasAlreadyOpen = window.__lastSwitchViewWasNoop === 'view-library';
 	window.__lastSwitchViewWasNoop = null;
 
+	// Library subviews are switched directly, so they need the same direct re-click guard
+	// already used by the other nested navigation groups instead of depending on switchView().
+	if (!_skipSubviewExit && !window.isRestoringHistory && !isSilent && targetAlreadyVisible && targetAlreadyActive) {
+		if (typeof updateSidebarLight === 'function') setTimeout(updateSidebarLight, 50);
+		return;
+	}
+
 	if (libraryViewWasAlreadyOpen && targetAlreadyVisible && targetAlreadyActive) {
 		if (typeof updateSidebarLight === 'function') {
 			setTimeout(updateSidebarLight, 50);
 		}
+		return;
+	}
+
+	const currentSubview = [monitorView, gamesView, filesView, favsView].find(el => el && el !== targetView && el.style.display !== 'none');
+	const reduceLibraryMotion = !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+	if (!_skipSubviewExit && !window.isRestoringHistory && !isSilent && !reduceLibraryMotion && currentSubview) {
+		if (currentSubview.classList.contains('anim-out')) return;
+		currentSubview.classList.remove('anim-up', 'anim-out', 'view-entry-prep');
+		void currentSubview.offsetWidth;
+		currentSubview.classList.add('anim-out');
+		setTimeout(() => {
+			if (!currentSubview.isConnected) return;
+			currentSubview.classList.remove('anim-out');
+			currentSubview.style.display = 'none';
+			showLibrarySection(type, noScrollToTop, isSilent, true);
+		}, 120);
 		return;
 	}
 
