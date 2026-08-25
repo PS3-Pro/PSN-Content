@@ -1494,6 +1494,21 @@ div[style*="display: flex"] { transition: opacity 0.3s ease,transform 0.3s ease;
 #chat-input:hover { border-color: rgba(255,255,255,0.5) !important; }
 #chat-input:focus { border-color: #ffffff !important; background: rgba(0,0,0,0.8) !important; }
 #btn-emoji-picker.is-active { color: #ffcc00 !important; border-color: rgba(255,204,0,0.5) !important; }
+#chat-input-emoji-picker { position:absolute; bottom:75px; right:130px; width:310px; padding:12px; display:flex; flex-direction:column; z-index:1000; background:rgba(10,15,25,.98); border:1px solid var(--ps-blue); border-radius:12px; box-shadow:0 10px 30px rgba(0,0,0,.8); opacity:0; visibility:hidden; pointer-events:none; transform:translateY(5px); transition:opacity .2s ease-out,transform .2s ease-out,visibility 0s linear .2s; contain:layout style; }
+#chat-input-emoji-picker.is-open { opacity:1; visibility:visible; pointer-events:auto; transform:translateY(0); transition-delay:0s; }
+.chat-emoji-nav { display:flex; justify-content:space-around; padding-bottom:10px; margin-bottom:5px; border-bottom:1px solid rgba(255,255,255,.1); flex-shrink:0; }
+.chat-emoji-nav-item { color:var(--text-muted); cursor:pointer; font-size:16px; position:relative; transition:color .2s,text-shadow .2s; }
+.chat-emoji-nav-item::after { content:""; position:absolute; left:50%; bottom:-11px; width:0; height:2px; border-radius:999px; background:var(--ps-blue); box-shadow:0 0 0 rgba(0,112,204,0); transform:translateX(-50%); opacity:0; transition:width .22s ease,opacity .18s ease,box-shadow .22s ease; pointer-events:none; }
+.chat-emoji-nav-item:hover { color:var(--ps-blue); }
+.chat-emoji-nav-item.is-scroll-active { color:#fff; text-shadow:0 0 9px rgba(255,255,255,.24); }
+.chat-emoji-nav-item.is-scroll-active::after { width:22px; opacity:1; box-shadow:0 0 9px var(--ps-neon); }
+#emoji-content-area { max-height:250px; overflow-y:auto; scrollbar-width:thin; display:flex; flex-direction:column; gap:12px; padding-right:5px; overscroll-behavior:contain; }
+.chat-emoji-category { flex:0 0 auto; content-visibility:auto; contain:layout paint style; }
+.chat-emoji-category-title { height:14px; line-height:14px; margin-bottom:8px; font-size:10px; color:var(--ps-blue); font-weight:bold; text-transform:uppercase; letter-spacing:1.2px; }
+.chat-emoji-canvas-grid { position:relative; width:266px; contain:strict; }
+.chat-emoji-canvas { display:block; width:266px; cursor:pointer; contain:paint; transform:translateZ(0); backface-visibility:hidden; }
+.chat-emoji-hover-preview { position:absolute; width:28px; height:26px; display:none; align-items:center; justify-content:center; pointer-events:none; font-size:22px; line-height:normal; text-align:center; transform:scale(1.25); transform-origin:center; z-index:2; user-select:none; -webkit-user-select:none; }
+.chat-emoji-hover-preview.is-visible { display:flex; }
 #btn-attach-file.is-active { color: var(--ps-blue) !important; border-color: var(--ps-blue) !important; }
 .chat-gallery { --chat-gallery-gap: 4px; --chat-gallery-row: 92px; position: relative; display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: var(--chat-gallery-gap); width: 100%; max-width: 520px; min-width: min(100%,250px); margin: 10px 0 0; padding: 2px; overflow: hidden; border-radius: 12px; background: rgba(255,255,255,0.04); box-sizing: border-box; }
 .chat-gallery.grid-2 { grid-template-rows: 150px; }
@@ -47194,21 +47209,17 @@ function getVisibleChatStackEl(id) {
 	}
 
 	let isEmojiPickerBuilt = false;
-	
-	function buildEmojiPicker() {
-		if (isEmojiPickerBuilt || document.getElementById('chat-input-emoji-picker')) return;
-	
-		if ((window.matchMedia && window.matchMedia('(max-width: 768px)').matches) || window.innerWidth <= 768) {
-			const btn = document.getElementById('btn-emoji-picker');
-			if (btn) btn.style.display = 'none';
-			return;
-		}
-	
-		const picker = document.createElement('div');
-		picker.id = 'chat-input-emoji-picker';
-		picker.style.cssText = "position: absolute; bottom: 75px; right: 130px; background: rgba(10,15,25,0.98); border: 1px solid var(--ps-blue); border-radius: 12px; padding: 12px; width: 310px; display: none; flex-direction: column; box-shadow: 0 10px 30px rgba(0,0,0,0.8); backdrop-filter: blur(15px); z-index: 1000; animation: fadeIn 0.2s ease-out;";
-	
-		const emojiCategories = [
+	const CHAT_EMOJI_COLUMNS = 8;
+	const CHAT_EMOJI_CELL_WIDTH_PX = 28;
+	const CHAT_EMOJI_CELL_HEIGHT_PX = 26;
+	const CHAT_EMOJI_GAP_PX = 6;
+	const CHAT_EMOJI_COLUMN_STEP_PX = CHAT_EMOJI_CELL_WIDTH_PX + CHAT_EMOJI_GAP_PX;
+	const CHAT_EMOJI_ROW_STEP_PX = CHAT_EMOJI_CELL_HEIGHT_PX + CHAT_EMOJI_GAP_PX;
+	const CHAT_EMOJI_TITLE_BLOCK_PX = 22;
+	const CHAT_EMOJI_CATEGORY_GAP_PX = 12;
+	const CHAT_EMOJI_CANVAS_WIDTH_PX = (CHAT_EMOJI_COLUMNS * CHAT_EMOJI_CELL_WIDTH_PX) + ((CHAT_EMOJI_COLUMNS - 1) * CHAT_EMOJI_GAP_PX);
+	const CHAT_EMOJI_RASTER_DPR_MAX = 2;
+	const CHAT_EMOJI_CATEGORIES = [
 		{ 
 			id: 'cat-faces', 
 			icon: 'fas fa-smile', 
@@ -47240,42 +47251,248 @@ function getVisibleChatStackEl(id) {
 			emojis: ['⚽️','🏀','🏈','⚾️','🥎','🎾','🏐','🏉','🎱','🏓','🏸','🥅','⛳️','🪁','🏹','🎣','🤿','🥊','🥋','🛹','🛼','🎿','🏂','🏋️‍♀️','🏋️','🏋️‍♂️','🤺','🏇','🧘‍♀️','🏄','🏊‍♀️','🤽‍♀️','🚣','🧗‍♀️','🚵‍♀️','🚴‍♀️','🏆','🥇','🥈','🥉','🏅','🎖','🎫','🎟','🎪','🎭','🎨','🎬','🎤','🎧','🎼','🎹','🥁','🎷','🎺','🎸','🎻','🎲','♟️','🎯','🎳','🎮','🎰','🧩','📱','💻','⌨️','🖥','🖨️','🖱️','🕹️','💽','💾','💿','📀','📷','📸','📹','🎥','📽','🎞','📞','☎️','📺','📻','🎙','🧭','⏱','⏲','⏰','🕰','⌛️','⏳','📡','🔋','🔌','💡','🔦','🕯️','🧯','🛢️','💸','💵','💴','💶','💷','🪙','💰','💳','💎','⚖️','🪜','🧰','🪛','🔧','🔨','⚒','🛠','⛏️','🪚','🔩','⚙️','🧱','⛓','🧲','🔫','💣','🧨','','🔪','🗡️','⚔️','🛡️','🚬','⚰️','🪦','⚱️','🏺','🔮','📿','🧿','💈','⚗️','🔭','🔬','🕳️','🩹','🩺','💊','💉','🩸','🧬','🦠','🧫','🧪','🌡','🧹','🪠','🧺','🧻','🚽','🚰','🚿','🛁','🛀','🧼','🪥','🪒','🧽','🪣','🧴','🔔','🔑','🗝','🚪','🪑','🛋️','🛏️','🛌','🧸','🪆','🖼️','🪞','🪟','🛍','🛒','🎁','🎈','🎏','🎀','🪄','🪅','🎊','🎉','🎎','🏮','🎐','🧧','✉️','📩','📨','📧','💌','📥','📤','📦','🏷️','📪','📫','📬','📭','📮','📯','📜','📃','📄','🔖','🧾','📊','📈','📉','🗒️','🗓','📆','📅','🗑️','📇','🗃️','🗳️','🗄️','📋','📁','📂','🗂️','📰','🗞','📓','📔','📒','📕','📗','📘','📙','📚','📖','🔖','📍','🔗','📎','🖇','📐','📏','🧮','📌','✂️','🖊️','🖋️','✒️','🖌️','🖍️','📝','✏️','🔍','🔎','🔏','🔐','🔒','🔓'] 
 		}
 	];
-	
-		let navHtml = [`<div style="display: flex; justify-content: space-around; padding-bottom: 10px; margin-bottom: 5px; border-bottom: 1px solid rgba(255,255,255,0.1); flex-shrink: 0;">`];
-		emojiCategories.forEach(cat => {
-			navHtml.push(`<i class="${cat.icon}" style="color: var(--text-muted); cursor: pointer; font-size: 16px; transition: 0.2s;" onmouseenter="if(typeof playUiHover === 'function') playUiHover(); this.style.color='var(--ps-blue)'" onmouseleave="this.style.color='var(--text-muted)'" onclick="if(typeof playUiClick === 'function') playUiClick(); document.getElementById('emoji-content-area').scrollTop = document.getElementById('${cat.id}').offsetTop - document.getElementById('emoji-content-area').offsetTop;" title="${cat.title}"></i>`);
-		});
-		navHtml.push(`</div>`);
-	
-		let contentHtml = [`<div id="emoji-content-area" style="max-height: 250px; overflow-y: auto; scrollbar-width: thin; display: flex; flex-direction: column; gap: 12px; padding-right: 5px;">`];
-		
-		emojiCategories.forEach(cat => {
-			contentHtml.push(`<div id="${cat.id}">`);
-			contentHtml.push(`<div style="font-size: 10px; color: var(--ps-blue); margin-bottom: 8px; font-weight: bold; text-transform: uppercase; letter-spacing: 1.2px;">${cat.title}</div>`);
-			contentHtml.push(`<div style="display: flex; flex-wrap: wrap; gap: 6px;">`);
-			
-			const emojisMarkup = cat.emojis.map(e => 
-				`<span style="cursor: pointer; font-size: 22px; width: 28px; text-align: center; transition: transform 0.1s;" 
-					onmouseenter="this.style.transform='scale(1.25)'" 
-					onmouseleave="this.style.transform='scale(1)'" 
-					onmousedown="event.preventDefault(); insertEmojiToInput('${e}')">${e}</span>`
-			).join('');
-			
-			contentHtml.push(emojisMarkup);
-			contentHtml.push(`</div></div>`);
-		});
-		contentHtml.push(`</div>`);
-	
-		picker.innerHTML = navHtml.join('') + contentHtml.join('');
-		
-		const chatInput = document.getElementById('chat-input');
-		if (chatInput && chatInput.parentNode) {
-			chatInput.parentNode.appendChild(picker);
+
+	function buildEmojiPicker() {
+		if (isEmojiPickerBuilt || document.getElementById('chat-input-emoji-picker')) return;
+
+		if ((window.matchMedia && window.matchMedia('(max-width: 768px)').matches) || window.innerWidth <= 768) {
+			const btn = document.getElementById('btn-emoji-picker');
+			if (btn) btn.style.display = 'none';
+			return;
 		}
-		
-		isEmojiPickerBuilt = true; 
+
+		const picker = document.createElement('div');
+		picker.id = 'chat-input-emoji-picker';
+		picker.setAttribute('aria-hidden', 'true');
+
+		const navHtml = ['<div class="chat-emoji-nav">'];
+		const contentHtml = ['<div id="emoji-content-area">'];
+		const rasterMetrics = [];
+		let categoryTop = 0;
+
+		CHAT_EMOJI_CATEGORIES.forEach((cat, catIndex) => {
+			const rowCount = Math.max(1, Math.ceil(cat.emojis.length / CHAT_EMOJI_COLUMNS));
+			const gridHeight = (rowCount * CHAT_EMOJI_CELL_HEIGHT_PX) + (Math.max(0, rowCount - 1) * CHAT_EMOJI_GAP_PX);
+			const categoryHeight = CHAT_EMOJI_TITLE_BLOCK_PX + gridHeight;
+			const canvasId = 'chat-emoji-canvas-' + catIndex;
+			navHtml.push('<i class="' + cat.icon + ' chat-emoji-nav-item" data-emoji-category-index="' + catIndex + '" title="' + cat.title + '"></i>');
+			contentHtml.push('<div id="' + cat.id + '" class="chat-emoji-category" style="contain-intrinsic-size:' + categoryHeight + 'px"><div class="chat-emoji-category-title">' + cat.title + '</div><div class="chat-emoji-canvas-grid" style="height:' + gridHeight + 'px"><canvas id="' + canvasId + '" class="chat-emoji-canvas" style="height:' + gridHeight + 'px" aria-label="' + cat.title + ' emojis"></canvas><span class="chat-emoji-hover-preview" aria-hidden="true"></span></div></div>');
+			rasterMetrics.push({ cat, catIndex, canvasId, categoryTop, gridHeight, rowCount, ready:false, canvas:null, hover:null });
+			categoryTop += categoryHeight + CHAT_EMOJI_CATEGORY_GAP_PX;
+		});
+		navHtml.push('</div>');
+		contentHtml.push('</div>');
+		picker.innerHTML = navHtml.join('') + contentHtml.join('');
+
+		const chatInput = document.getElementById('chat-input');
+		if (!chatInput || !chatInput.parentNode) return;
+		chatInput.parentNode.appendChild(picker);
+
+		const contentArea = document.getElementById('emoji-content-area');
+		const nav = picker.querySelector('.chat-emoji-nav');
+		const navItems = nav ? Array.from(nav.querySelectorAll('[data-emoji-category-index]')) : [];
+		let activeNavIndex = -1;
+		let emojiNavSyncFrame = 0;
+
+		const setEmojiNavActive = function(index) {
+			if (!navItems.length) return;
+			const nextIndex = Math.max(0, Math.min(navItems.length - 1, Number(index) || 0));
+			if (nextIndex === activeNavIndex) return;
+			if (activeNavIndex >= 0 && navItems[activeNavIndex]) navItems[activeNavIndex].classList.remove('is-scroll-active');
+			if (navItems[nextIndex]) navItems[nextIndex].classList.add('is-scroll-active');
+			activeNavIndex = nextIndex;
+		};
+
+		const syncEmojiNavToScroll = function() {
+			emojiNavSyncFrame = 0;
+			if (!contentArea || !rasterMetrics.length) return;
+			const marker = contentArea.scrollTop + 10;
+			let nextIndex = 0;
+			for (let i = 1; i < rasterMetrics.length; i++) {
+				if (rasterMetrics[i].categoryTop <= marker) nextIndex = i;
+				else break;
+			}
+			setEmojiNavActive(nextIndex);
+		};
+
+		const scheduleEmojiNavSync = function() {
+			if (emojiNavSyncFrame) return;
+			emojiNavSyncFrame = requestAnimationFrame(syncEmojiNavToScroll);
+		};
+
+		rasterMetrics.forEach(metric => {
+			metric.canvas = document.getElementById(metric.canvasId);
+			metric.hover = metric.canvas && metric.canvas.parentElement ? metric.canvas.parentElement.querySelector('.chat-emoji-hover-preview') : null;
+		});
+
+		const rasterizeEmojiCategory = function(metric) {
+			if (!metric || metric.ready || !metric.canvas) return false;
+			const canvas = metric.canvas;
+			const dpr = Math.max(1, Math.min(Number(window.devicePixelRatio) || 1, CHAT_EMOJI_RASTER_DPR_MAX));
+			canvas.width = Math.max(1, Math.round(CHAT_EMOJI_CANVAS_WIDTH_PX * dpr));
+			canvas.height = Math.max(1, Math.round(metric.gridHeight * dpr));
+			canvas.style.width = CHAT_EMOJI_CANVAS_WIDTH_PX + 'px';
+			canvas.style.height = metric.gridHeight + 'px';
+			const ctx = canvas.getContext('2d', { alpha:true, desynchronized:true }) || canvas.getContext('2d');
+			if (!ctx) return false;
+			ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+			ctx.clearRect(0, 0, CHAT_EMOJI_CANVAS_WIDTH_PX, metric.gridHeight);
+			ctx.font = '22px "Segoe UI Emoji", "Apple Color Emoji", "Noto Color Emoji", sans-serif';
+			ctx.textAlign = 'center';
+			ctx.textBaseline = 'middle';
+			metric.cat.emojis.forEach(function(emoji, index) {
+				if (!emoji) return;
+				const row = Math.floor(index / CHAT_EMOJI_COLUMNS);
+				const col = index % CHAT_EMOJI_COLUMNS;
+				const x = (col * CHAT_EMOJI_COLUMN_STEP_PX) + (CHAT_EMOJI_CELL_WIDTH_PX / 2);
+				const y = (row * CHAT_EMOJI_ROW_STEP_PX) + (CHAT_EMOJI_CELL_HEIGHT_PX / 2);
+				ctx.fillText(emoji, x, y);
+			});
+			metric.ready = true;
+			canvas.dataset.emojiRasterReady = '1';
+			return true;
+		};
+
+		let warmMetricIndex = 0;
+		let warmHandle = 0;
+		const warmEmojiRaster = function(deadline) {
+			warmHandle = 0;
+			while (warmMetricIndex < rasterMetrics.length) {
+				if (deadline && typeof deadline.timeRemaining === 'function' && !deadline.didTimeout && deadline.timeRemaining() < 4) break;
+				rasterizeEmojiCategory(rasterMetrics[warmMetricIndex]);
+				warmMetricIndex++;
+			}
+			if (warmMetricIndex >= rasterMetrics.length) {
+				picker.dataset.emojiRasterWarm = '1';
+				picker.__emojiRasterWarmComplete = true;
+				return;
+			}
+			scheduleEmojiRasterWarm();
+		};
+
+		const scheduleEmojiRasterWarm = function() {
+			if (warmMetricIndex >= rasterMetrics.length || warmHandle) return;
+			if (typeof requestIdleCallback === 'function') warmHandle = requestIdleCallback(warmEmojiRaster, { timeout:700 });
+			else warmHandle = setTimeout(function() { warmEmojiRaster(null); }, 24);
+		};
+
+		const metricFromCanvas = function(canvas) {
+			if (!canvas) return null;
+			const index = Math.max(0, Number(String(canvas.id || '').replace('chat-emoji-canvas-', '')) || 0);
+			return rasterMetrics[index] || null;
+		};
+
+		const getEmojiCellFromPointer = function(metric, event) {
+			if (!metric || !metric.canvas || !event) return null;
+			const rect = metric.canvas.getBoundingClientRect();
+			if (!rect.width || !rect.height) return null;
+			const scaleX = CHAT_EMOJI_CANVAS_WIDTH_PX / rect.width;
+			const scaleY = metric.gridHeight / rect.height;
+			const x = (event.clientX - rect.left) * scaleX;
+			const y = (event.clientY - rect.top) * scaleY;
+			if (x < 0 || y < 0 || x >= CHAT_EMOJI_CANVAS_WIDTH_PX || y >= metric.gridHeight) return null;
+			const col = Math.floor(x / CHAT_EMOJI_COLUMN_STEP_PX);
+			const row = Math.floor(y / CHAT_EMOJI_ROW_STEP_PX);
+			if (col < 0 || col >= CHAT_EMOJI_COLUMNS || row < 0 || row >= metric.rowCount) return null;
+			if ((x - (col * CHAT_EMOJI_COLUMN_STEP_PX)) >= CHAT_EMOJI_CELL_WIDTH_PX) return null;
+			if ((y - (row * CHAT_EMOJI_ROW_STEP_PX)) >= CHAT_EMOJI_CELL_HEIGHT_PX) return null;
+			const index = (row * CHAT_EMOJI_COLUMNS) + col;
+			const emoji = metric.cat.emojis[index] || '';
+			if (!emoji) return null;
+			return { emoji, row, col };
+		};
+
+		let activeHoverMetric = null;
+		const hideEmojiHover = function(metric = activeHoverMetric) {
+			if (metric && metric.hover) {
+				metric.hover.classList.remove('is-visible');
+				metric.hover.textContent = '';
+			}
+			if (!metric || metric === activeHoverMetric) activeHoverMetric = null;
+		};
+
+		if (contentArea) {
+			contentArea.addEventListener('scroll', function() { hideEmojiHover(); scheduleEmojiNavSync(); }, { passive:true });
+			contentArea.addEventListener('pointermove', function(event) {
+				if (event.pointerType && event.pointerType !== 'mouse' && event.pointerType !== 'pen') return;
+				const canvas = event.target && event.target.closest ? event.target.closest('.chat-emoji-canvas') : null;
+				const metric = metricFromCanvas(canvas);
+				const cell = getEmojiCellFromPointer(metric, event);
+				if (!metric || !cell || !metric.hover) { hideEmojiHover(); return; }
+				if (activeHoverMetric && activeHoverMetric !== metric) hideEmojiHover(activeHoverMetric);
+				activeHoverMetric = metric;
+				metric.hover.textContent = cell.emoji;
+				metric.hover.style.left = (cell.col * CHAT_EMOJI_COLUMN_STEP_PX) + 'px';
+				metric.hover.style.top = (cell.row * CHAT_EMOJI_ROW_STEP_PX) + 'px';
+				metric.hover.classList.add('is-visible');
+			}, { passive:true });
+			contentArea.addEventListener('pointerleave', function() { hideEmojiHover(); }, { passive:true });
+
+			const pickEmoji = function(event) {
+				if (event.button !== undefined && event.button !== 0) return;
+				const canvas = event.target && event.target.closest ? event.target.closest('.chat-emoji-canvas') : null;
+				const metric = metricFromCanvas(canvas);
+				const cell = getEmojiCellFromPointer(metric, event);
+				if (!cell) return;
+				event.preventDefault();
+				insertEmojiToInput(cell.emoji);
+			};
+			if (window.PointerEvent) contentArea.addEventListener('pointerdown', pickEmoji);
+			else contentArea.addEventListener('mousedown', pickEmoji);
+		}
+
+		if (nav && contentArea) {
+			nav.addEventListener('click', function(event) {
+				const target = event.target && event.target.closest ? event.target.closest('[data-emoji-category-index]') : null;
+				if (!target) return;
+				const targetIndex = Math.max(0, Number(target.getAttribute('data-emoji-category-index')) || 0);
+				const metric = rasterMetrics[targetIndex];
+				if (!metric) return;
+				setEmojiNavActive(targetIndex);
+				if (!metric.ready) rasterizeEmojiCategory(metric);
+				if (typeof playUiClick === 'function') playUiClick();
+				contentArea.scrollTop = Math.max(0, metric.categoryTop);
+			});
+		}
+
+		// The first category is guaranteed to be ready immediately; the rest are raster-cached in idle time.
+		rasterizeEmojiCategory(rasterMetrics[0]);
+		warmMetricIndex = rasterMetrics[0] && rasterMetrics[0].ready ? 1 : 0;
+		scheduleEmojiRasterWarm();
+		picker.__emojiRasterMetrics = rasterMetrics;
+		picker.__syncEmojiCategoryNav = syncEmojiNavToScroll;
+		syncEmojiNavToScroll();
+		picker.__ensureEmojiRasterReady = function() {
+			rasterMetrics.forEach(rasterizeEmojiCategory);
+			warmMetricIndex = rasterMetrics.length;
+			if (warmHandle) {
+				if (typeof cancelIdleCallback === 'function') cancelIdleCallback(warmHandle);
+				else clearTimeout(warmHandle);
+				warmHandle = 0;
+			}
+			picker.dataset.emojiRasterWarm = '1';
+			picker.__emojiRasterWarmComplete = true;
+		};
+		isEmojiPickerBuilt = true;
 	}
-	
+
+
+	function scheduleEmojiPickerPrebuild() {
+		const run = function() {
+			if (!isEmojiPickerBuilt && document.getElementById('chat-input')) buildEmojiPicker();
+			const picker = document.getElementById('chat-input-emoji-picker');
+			if (picker && picker.__emojiRasterWarmComplete !== true && typeof picker.__ensureEmojiRasterReady === 'function') picker.__ensureEmojiRasterReady();
+		};
+		const schedule = function() {
+			if (typeof requestIdleCallback === 'function') requestIdleCallback(run, { timeout:2400 });
+			else setTimeout(run, 1400);
+		};
+		if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', schedule, { once:true });
+		else schedule();
+	}
+
+	scheduleEmojiPickerPrebuild();
+
 	window.sendReaction = function(msgId, emoji) {
 		const myName = localStorage.getItem('psn_username') || "Guest";
 		
@@ -47340,8 +47557,8 @@ function getVisibleChatStackEl(id) {
 		const gifBtn = document.getElementById('btn-gif-picker');
 
 		if (keepPicker !== 'emoji' && emojiPicker) {
-			emojiPicker.style.display = 'none';
-			emojiPicker.classList.remove('show');
+			emojiPicker.classList.remove('is-open');
+			emojiPicker.setAttribute('aria-hidden', 'true');
 			if (emojiBtn) emojiBtn.classList.remove('is-active');
 		}
 
@@ -47356,7 +47573,12 @@ function getVisibleChatStackEl(id) {
 		setTimeout(() => {
 			const closePicker = function(e) {
 				if (picker && !picker.contains(e.target) && (!btn || !btn.contains(e.target))) {
-					picker.style.display = 'none';
+					if (picker.id === 'chat-input-emoji-picker') {
+						picker.classList.remove('is-open');
+						picker.setAttribute('aria-hidden', 'true');
+					} else {
+						picker.style.display = 'none';
+					}
 					if (btn) btn.classList.remove('is-active');
 					window.removeEventListener('click', closePicker);
 				}
@@ -47378,13 +47600,17 @@ function getVisibleChatStackEl(id) {
 		
 		if (!picker) return;
 		
-		const isHidden = picker.style.display === 'none';
+		const isHidden = !picker.classList.contains('is-open');
 
 		if (isHidden) {
 			closeChatInputPickers('emoji');
+			picker.classList.add('is-open');
+			picker.setAttribute('aria-hidden', 'false');
+			if (typeof picker.__syncEmojiCategoryNav === 'function') picker.__syncEmojiCategoryNav();
+		} else {
+			picker.classList.remove('is-open');
+			picker.setAttribute('aria-hidden', 'true');
 		}
-
-		picker.style.display = isHidden ? 'flex' : 'none';
 		
 		if (btn) btn.classList.toggle('is-active', isHidden);
 	
