@@ -2094,6 +2094,12 @@ body.is-admin #btn-toolbar-cmd, body.is-mod #btn-toolbar-cmd { display: flex !im
 #notification-center-list .notification-swipe-row.is-open .user-notification-item { border-color:rgba(255,68,68,.68) !important; box-shadow:0 0 14px rgba(255,68,68,.16) !important; }
 #notification-center-list .notification-swipe-row.is-open .user-notification-item:hover, #notification-center-list .notification-swipe-row.is-swiping .user-notification-item:hover, #notification-center-list .notification-swipe-row.is-open .user-notification-item:is(.psn-primary-pressed,.mobile-pressed) { transform:none !important; filter:none !important; z-index:1 !important; }
 #notification-center-list .notification-swipe-row.is-open .user-notification-item:hover::before, #notification-center-list .notification-swipe-row.is-swiping .user-notification-item:hover::before { animation:none !important; }
+#friend-activity-list.has-open-swipe .friend-activity-swipe-row:not(.is-open) { opacity:.36; filter:grayscale(.88) brightness(.68); }
+#friend-activity-list .friend-activity-swipe-row.is-swiping .friend-activity-item { border-color:rgba(255,68,68,calc(.14 + (var(--notification-swipe-progress,0) * .50))) !important; box-shadow:0 0 calc(4px + (var(--notification-swipe-progress,0) * 10px)) rgba(255,68,68,calc(var(--notification-swipe-progress,0) * .16)) !important; }
+#friend-activity-list .friend-activity-swipe-row.is-open .friend-activity-item { border-color:rgba(255,68,68,.68) !important; box-shadow:0 0 14px rgba(255,68,68,.16) !important; }
+#friend-activity-list .friend-activity-swipe-row.is-open .friend-activity-item:hover, #friend-activity-list .friend-activity-swipe-row.is-swiping .friend-activity-item:hover, #friend-activity-list .friend-activity-swipe-row.is-open .friend-activity-item:is(.psn-primary-pressed,.mobile-pressed) { transform:none !important; filter:none !important; z-index:1 !important; }
+#friend-activity-list .friend-activity-swipe-row.is-open .friend-activity-item:hover::before, #friend-activity-list .friend-activity-swipe-row.is-swiping .friend-activity-item:hover::before { animation:none !important; }
+.friend-activity-day.is-dismiss-all { pointer-events:none; animation:notificationDismissDay .42s cubic-bezier(.22,.72,.22,1) forwards; animation-delay:var(--notification-dismiss-delay,0ms); }
 .notification-swipe-row.is-removing { pointer-events:none; overflow:hidden; transition:height .30s cubic-bezier(.4,0,.2,1),opacity .34s ease,margin .30s cubic-bezier(.4,0,.2,1),transform .42s cubic-bezier(.22,.72,.22,1),filter .34s ease; }
 .notification-swipe-hint { display:flex; align-items:center; justify-content:flex-end; gap:7px; max-height:0; margin:0 2px; overflow:hidden; color:rgba(255,255,255,.58); font-size:11px; font-weight:700; letter-spacing:.15px; opacity:0; transform:translateY(-5px); transition:max-height .28s ease,margin .28s ease,opacity .22s ease,transform .28s ease; pointer-events:none; }
 .notification-swipe-hint i { color:rgba(255,92,108,.88); font-size:10px; }
@@ -7066,7 +7072,10 @@ img { -webkit-user-drag: none !important; user-drag: none !important; }
 				<div id="subview-activity" style="display:none; height:100%; flex-direction:column;">
 					<h2 style="font-size:28px; font-weight:300; margin-top:20px; margin-left:var(--page-gutter); margin-right:var(--page-gutter); margin-bottom:20px; border-bottom:1px solid rgba(255,255,255,0.1); padding-bottom:15px; display:flex; justify-content:space-between; align-items:center;">
 						<div>Friend Activity <span id="friend-activity-count"></span></div>
-						<i class="fas fa-bolt" style="opacity:.2;"></i>
+						<div class="notification-title-actions">
+							<button id="friend-activity-dismiss-all" type="button" class="btn-mini-round notification-dismiss-all-btn" title="Dismiss all friend activity" aria-label="Dismiss all friend activity" style="display:none;" onmouseenter="if(typeof playUiArrow === 'function') playUiArrow()" onclick="dismissAllFriendActivity()"><i class="fas fa-bars-staggered"></i></button>
+							<i class="fas fa-bolt notification-title-icon"></i>
+						</div>
 					</h2>
 					<div id="friend-activity-container" class="friend-activity-container">
 						<div id="friend-activity-loading" class="friend-activity-loading" style="display:none;">
@@ -7074,6 +7083,10 @@ img { -webkit-user-drag: none !important; user-drag: none !important; }
 						</div>
 						<div id="friend-activity-empty" class="friend-activity-empty" style="display:none;">
 							<i class="fas fa-bolt"></i><strong>No recent friend activity.</strong><p>When your friends connect, go offline, play, download, wishlist or earn a trophy, it will appear here.</p>
+						</div>
+						<div id="friend-activity-swipe-hint" class="notification-swipe-hint" aria-live="polite">
+							<i class="fas fa-arrow-left"></i>
+							<span>Swipe or drag left to remove an item</span>
 						</div>
 						<div id="friend-activity-list" class="friend-activity-list"></div>
 					</div>
@@ -44531,7 +44544,12 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 	};
     
     function trackUser(username) {
-        if (username && username !== "Guest") chatUsers.add(username);
+        if (!username || username === "Guest") return;
+        const previousSize = chatUsers.size;
+        chatUsers.add(username);
+        if (chatUsers.size !== previousSize && typeof invalidateChatMentionNameCaches === 'function') {
+            invalidateChatMentionNameCaches();
+        }
     }
     
 
@@ -44540,6 +44558,23 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 	window.chatMentionDatabaseUsers = window.chatMentionDatabaseUsers || [];
 	window.chatMentionSearchCache = window.chatMentionSearchCache || {};
 	window.chatMentionPendingSearch = window.chatMentionPendingSearch || {};
+
+	let chatMentionKnownNamesFrameCache = null;
+	let chatMentionNameMatchIndexFrameCache = null;
+	let chatMentionNameCacheResetFrame = 0;
+
+	function invalidateChatMentionNameCaches() {
+		chatMentionKnownNamesFrameCache = null;
+		chatMentionNameMatchIndexFrameCache = null;
+	}
+
+	function scheduleChatMentionNameCacheReset() {
+		if (chatMentionNameCacheResetFrame) return;
+		chatMentionNameCacheResetFrame = requestAnimationFrame(() => {
+			chatMentionNameCacheResetFrame = 0;
+			invalidateChatMentionNameCaches();
+		});
+	}
 
 	function extractChatMentionNamesFromText(text) {
 		const names = [];
@@ -44583,6 +44618,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 		});
 
 		window.chatMentionDatabaseUsers = Array.from(map.values());
+		if (changed) invalidateChatMentionNameCaches();
 		return changed;
 	}
 
@@ -44603,6 +44639,8 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 	}
 
 	function getKnownChatMentionNames() {
+		if (chatMentionKnownNamesFrameCache) return chatMentionKnownNamesFrameCache;
+
 		const known = new Set();
 
 		const addName = (user) => {
@@ -44634,20 +44672,37 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 			});
 		}
 
-		return Array.from(known);
+		chatMentionKnownNamesFrameCache = Array.from(known);
+		scheduleChatMentionNameCacheReset();
+		return chatMentionKnownNamesFrameCache;
+	}
+
+	function getChatMentionNameMatchIndex() {
+		if (chatMentionNameMatchIndexFrameCache) return chatMentionNameMatchIndexFrameCache;
+
+		const index = new Map();
+		getKnownChatMentionNames().forEach(existing => {
+			const normalized = String(existing || '').trim();
+			if (!normalized) return;
+			const lower = normalized.toLowerCase();
+			let matches = index.get(lower);
+			if (!matches) {
+				matches = [];
+				index.set(lower, matches);
+			}
+			if (!matches.includes(normalized)) matches.push(normalized);
+		});
+
+		chatMentionNameMatchIndexFrameCache = index;
+		scheduleChatMentionNameCacheReset();
+		return index;
 	}
 
 	function getChatMentionNameMatches(name) {
 		const value = String(name || '').trim();
 		if (!value) return [];
-		const lowerValue = value.toLowerCase();
-		const seen = new Set();
-		return getKnownChatMentionNames().filter(existing => {
-			const normalized = String(existing || '').trim();
-			if (!normalized || normalized.toLowerCase() !== lowerValue || seen.has(normalized)) return false;
-			seen.add(normalized);
-			return true;
-		});
+		const matches = getChatMentionNameMatchIndex().get(value.toLowerCase());
+		return matches ? matches.slice() : [];
 	}
 
 	function chatMentionHasCaseConflict(name) {
@@ -44794,97 +44849,153 @@ function getVisibleChatStackEl(id) {
 	}
 
 
+	let chatMentionSuggestionRenderToken = 0;
+	let chatMentionSuggestionFrame = 0;
+	let chatMentionSuggestionPendingQuery = '';
+	const CHAT_MENTION_INITIAL_RENDER_ROWS = 90;
+	const CHAT_MENTION_RENDER_CHUNK_ROWS = 180;
+
+	function cancelChatMentionSuggestionRender() {
+		chatMentionSuggestionRenderToken++;
+	}
+
+	function cancelScheduledChatMentionSuggestions() {
+		if (!chatMentionSuggestionFrame) return;
+		cancelAnimationFrame(chatMentionSuggestionFrame);
+		chatMentionSuggestionFrame = 0;
+	}
+
+	function renderChatMentionSuggestionRows(box, rows) {
+		const token = ++chatMentionSuggestionRenderToken;
+		const initialEnd = Math.min(rows.length, CHAT_MENTION_INITIAL_RENDER_ROWS);
+		box.innerHTML = rows.slice(0, initialEnd).join('');
+		let index = initialEnd;
+
+		if (index >= rows.length) return;
+
+		const appendNextChunk = () => {
+			if (token !== chatMentionSuggestionRenderToken || !box.isConnected || box.style.display !== 'block' || box.classList.contains('command-suggestions')) return;
+			const end = Math.min(rows.length, index + CHAT_MENTION_RENDER_CHUNK_ROWS);
+			box.insertAdjacentHTML('beforeend', rows.slice(index, end).join(''));
+			index = end;
+			if (index < rows.length) requestAnimationFrame(appendNextChunk);
+		};
+
+		requestAnimationFrame(appendNextChunk);
+	}
+
+	function scheduleMentionSuggestions(query) {
+		chatMentionSuggestionPendingQuery = String(query || '');
+		if (chatMentionSuggestionFrame) return;
+		chatMentionSuggestionFrame = requestAnimationFrame(() => {
+			chatMentionSuggestionFrame = 0;
+			showMentionSuggestions(chatMentionSuggestionPendingQuery);
+		});
+	}
+
 	function showMentionSuggestions(query) {
 		const box = ensureChatSuggestionBox();
 		if (!box) return;
 		box.classList.remove('command-suggestions');
 		box.classList.add('chat-align-toolbar');
-	
+
+		const normalizedQuery = String(query || '').trim();
+		const queryLower = normalizedQuery.toLowerCase();
 		const myName = localStorage.getItem('psn_username') || '';
 		const isAdmin = document.body.classList.contains('is-admin');
 		const canModerate = typeof window.canModerateSession === 'function' ? window.canModerateSession() : isAdmin;
 
 		if (typeof requestChatMentionDatabaseUsers === 'function') {
-			const mentionQuery = String(query || '').trim();
-			requestChatMentionDatabaseUsers(mentionQuery.length >= 2 ? mentionQuery : '*');
+			requestChatMentionDatabaseUsers(normalizedQuery.length >= 2 ? normalizedQuery : '*');
 		}
-	
+
 		const safeOnlineList = (typeof currentOnlineList !== 'undefined' && Array.isArray(currentOnlineList)) ? currentOnlineList : [];
 		const safeChatUsers = (typeof getKnownChatMentionNames === 'function') ? getKnownChatMentionNames() : ((typeof chatUsers !== 'undefined' && chatUsers) ? Array.from(chatUsers) : []);
-	
+
 		const onlineNames = safeOnlineList
 			.filter(u => u && u.online === true)
 			.map(u => u.name ? u.name : u);
-	
+
 		const allNamesFromList = safeOnlineList.map(u => u && u.name ? u.name : u);
 		const allPossibleUsers = Array.from(new Set([...allNamesFromList, ...safeChatUsers]));
-	
+
 		const onlineExact = new Set(onlineNames.map(u => String(u)));
-		const onlineLower = onlineNames.map(u => String(u).toLowerCase());
-	
+		const onlineLower = new Set(onlineNames.map(u => String(u).toLowerCase()));
+		const caseVariants = new Map();
+
+		allPossibleUsers.forEach(u => {
+			if (!u) return;
+			const value = String(u);
+			const lower = value.toLowerCase();
+			let variants = caseVariants.get(lower);
+			if (!variants) {
+				variants = new Set();
+				caseVariants.set(lower, variants);
+			}
+			variants.add(value);
+		});
+
 		const onlineFiltered = [];
 		const offlineFiltered = [];
-	
+
 		allPossibleUsers.forEach(u => {
 			if (!u) return;
 			const strU = String(u);
-			
-			if (strU.toLowerCase().includes(String(query).toLowerCase()) && strU !== myName) {
+			const lowerU = strU.toLowerCase();
+
+			if (lowerU.includes(queryLower) && strU !== myName) {
+				const variants = caseVariants.get(lowerU);
+				const hasCaseConflict = !!(variants && variants.size > 1);
 				const isOnlineExact = onlineExact.has(strU);
-				const isOnlineSafeFallback = !chatMentionHasCaseConflict(strU) && onlineLower.includes(strU.toLowerCase());
-				if (isOnlineExact || isOnlineSafeFallback) {
-					onlineFiltered.push(strU);
-				} else {
-					offlineFiltered.push(strU);
-				}
+				const isOnlineSafeFallback = !hasCaseConflict && onlineLower.has(lowerU);
+				if (isOnlineExact || isOnlineSafeFallback) onlineFiltered.push(strU);
+				else offlineFiltered.push(strU);
 			}
 		});
-	
+
 		onlineFiltered.sort((a, b) => a.localeCompare(b));
 		offlineFiltered.sort((a, b) => a.localeCompare(b));
-	
-		let suggestionsHtml = '';
-	
-		if (canModerate && "everyone".includes(String(query).toLowerCase())) {
-			suggestionsHtml += `
+
+		const suggestionRows = [];
+
+		if (canModerate && "everyone".includes(queryLower)) {
+			suggestionRows.push(`
 				<div class="suggestion-item" data-value="everyone" onmouseenter="clearChatSuggestionKeyboardActive(this)" onpointerdown="event.preventDefault(); insertMention('everyone')" onmousedown="if(!window.PointerEvent){event.preventDefault(); insertMention('everyone')}">
 					<i class="fas fa-bullhorn" style="color: #ff4444; font-size: 10px;"></i> 
 					<b style="color: #ff4444; margin-left: 3px;">everyone</b>
 					<span style="font-size: 8px; opacity: 0.5; margin-left: 5px;">(GLOBAL ALERT)</span>
 				</div>
-			`;
+			`);
 		}
-	
+
 		if (onlineFiltered.length > 0) {
-			suggestionsHtml += `<div style="font-size: 9px; color: #4caf50; font-weight: bold; margin: 6px 12px 2px 12px; letter-spacing: 1px;">ONLINE</div>`;
-			suggestionsHtml += onlineFiltered.map(u => `
+			suggestionRows.push(`<div style="font-size: 9px; color: #4caf50; font-weight: bold; margin: 6px 12px 2px 12px; letter-spacing: 1px;">ONLINE</div>`);
+			onlineFiltered.forEach(u => suggestionRows.push(`
 				<div class="suggestion-item" data-value="${u}" onmouseenter="clearChatSuggestionKeyboardActive(this)" onpointerdown="event.preventDefault(); insertMention('${u}')" onmousedown="if(!window.PointerEvent){event.preventDefault(); insertMention('${u}')}">
 					<i class="fas fa-circle status-pulsing-soft" style="color: #4caf50; font-size: 7px; margin-right: 5px; vertical-align: middle;"></i> ${u}
 				</div>
-			`).join('');
+			`));
 		}
-	
+
 		if (offlineFiltered.length > 0) {
-			suggestionsHtml += `<div style="font-size: 9px; color: #8b96a8; font-weight: bold; margin: 6px 12px 2px 12px; letter-spacing: 1px;">OFFLINE</div>`;
-			suggestionsHtml += offlineFiltered.map(u => `
+			suggestionRows.push(`<div style="font-size: 9px; color: #8b96a8; font-weight: bold; margin: 6px 12px 2px 12px; letter-spacing: 1px;">OFFLINE</div>`);
+			offlineFiltered.forEach(u => suggestionRows.push(`
 				<div class="suggestion-item" data-value="${u}" onmouseenter="clearChatSuggestionKeyboardActive(this)" onpointerdown="event.preventDefault(); insertMention('${u}')" onmousedown="if(!window.PointerEvent){event.preventDefault(); insertMention('${u}')}">
 					<i class="fas fa-circle" style="color: rgba(255,255,255,0.2); font-size: 7px; margin-right: 5px; vertical-align: middle;"></i> ${u}
 				</div>
-			`).join('');
+			`));
 		}
-	
-		if (suggestionsHtml !== '') {
-			box.innerHTML = suggestionsHtml;
+
+		if (suggestionRows.length > 0) {
+			renderChatMentionSuggestionRows(box, suggestionRows);
 			box.style.display = 'block';
-			
 			box.scrollTop = 0;
 			selectedSuggestionIndex = 0;
-			
-			resetChatSuggestionKeyboardMode(box); 
-	
+			resetChatSuggestionKeyboardMode(box);
 			positionChatSuggestionBox(box, 'mention');
-	
 		} else {
+			cancelChatMentionSuggestionRender();
+			box.innerHTML = '';
 			box.style.display = 'none';
 		}
 	}
@@ -45234,11 +45345,7 @@ function getVisibleChatStackEl(id) {
 
 		insertPlainTextAtChatCaret(input, '@');
 		input.dispatchEvent(new Event('input', { bubbles: true }));
-
-		if (typeof showMentionSuggestions === 'function') {
-			showMentionSuggestions("");
-			setTimeout(updateJumpButtonPosition, 10); 
-		}
+		if (typeof updateJumpButtonPosition === 'function') setTimeout(updateJumpButtonPosition, 10);
 
 		if (typeof playUiClick === 'function') playUiClick();
 	}
@@ -45343,6 +45450,8 @@ function getVisibleChatStackEl(id) {
 	}
 
 	function hideChatSuggestions() {
+		if (typeof cancelScheduledChatMentionSuggestions === 'function') cancelScheduledChatMentionSuggestions();
+		if (typeof cancelChatMentionSuggestionRender === 'function') cancelChatMentionSuggestionRender();
 		const suggBox = document.getElementById('mention-suggestions');
 		if (suggBox) {
 			suggBox.style.display = 'none';
@@ -49570,7 +49679,7 @@ function getVisibleChatStackEl(id) {
 		if (typeof socketChat.timeout === 'function') {
 			socketChat.timeout(2500).emit('presence_ping', { reason, at:now }, (err,response) => { if (err || !response || response.success !== true) socketChat.emit('request_online_list'); });
 		} else socketChat.emit('presence_ping', { reason, at:now }, response => { if (!response || response.success !== true) socketChat.emit('request_online_list'); });
-		if (typeof window.bootstrapFriendActivityRealtime === 'function') window.bootstrapFriendActivityRealtime({ reason, forceFull:false });
+		if (typeof window.bootstrapFriendActivityRealtime === 'function') window.bootstrapFriendActivityRealtime({ reason, forceFull:reason === 'reconnect' });
 		if (typeof window.bootstrapNotificationCenterRealtime === 'function') window.bootstrapNotificationCenterRealtime({ reason, forceFull:reason === 'reconnect' });
 		if (typeof bootstrapChatRealtime === 'function') bootstrapChatRealtime(reason);
 		const request = { reason, forceRefresh:false, lazyHydrate:true, sinceProfileUpdatedAt:beforeProfileUpdatedAt };
@@ -52181,6 +52290,44 @@ function getVisibleChatStackEl(id) {
 			if (typeof window.writeFriendActivityCache === 'function') window.writeFriendActivityCache();
 		});
 
+		socketChat.on('friend_activity_dismissed', function(data = {}) {
+			const targetUser = String(data.userName || '').trim();
+			const activeUser = String(localStorage.getItem('psn_username') || '').trim();
+			if (targetUser && activeUser && targetUser.toLowerCase() !== activeUser.toLowerCase()) return;
+			const id = String(data.activityId || '').trim();
+			if (!id) return;
+			if (Array.isArray(window.friendActivityItems)) window.friendActivityItems = window.friendActivityItems.filter(function(item) { return String(item && item.id || '') !== id; });
+			if (typeof window.writeFriendActivityCache === 'function') window.writeFriendActivityCache();
+			if (typeof window.refreshFriendActivityIndicators === 'function') window.refreshFriendActivityIndicators();
+			if (typeof window.isFriendActivityVisible === 'function' && window.isFriendActivityVisible()) {
+				const list = document.getElementById('friend-activity-list');
+				const row = list ? list.querySelector('.friend-activity-swipe-row[data-activity-id="' + CSS.escape(id) + '"]') : null;
+				if (row && typeof window.animateUserNotificationRowOut === 'function') {
+					window.animateUserNotificationRowOut(row, function() { if (typeof window.syncFriendActivityDomToState === 'function') window.syncFriendActivityDomToState(); });
+				} else if (typeof window.syncFriendActivityDomToState === 'function') window.syncFriendActivityDomToState();
+			}
+		});
+
+		socketChat.on('friend_activity_cleared', function(data = {}) {
+			const targetUser = String(data.userName || '').trim();
+			const activeUser = String(localStorage.getItem('psn_username') || '').trim();
+			if (targetUser && activeUser && targetUser.toLowerCase() !== activeUser.toLowerCase()) return;
+			const throughId = Math.max(0, Number(data.throughId) || 0);
+			if (!throughId) return;
+			window.__friendActivityDismissedThroughId = Math.max(Math.max(0, Number(window.__friendActivityDismissedThroughId) || 0), throughId);
+			window.__friendActivityLastReadId = Math.max(Math.max(0, Number(window.__friendActivityLastReadId) || 0), Math.max(0, Number(data.lastReadId) || throughId));
+			window.friendActivityItems = (Array.isArray(window.friendActivityItems) ? window.friendActivityItems : []).filter(function(item) { return Math.max(0, Number(item && item.id) || 0) > throughId; });
+			if (typeof window.writeFriendActivityCache === 'function') window.writeFriendActivityCache();
+			if (typeof window.refreshFriendActivityIndicators === 'function') window.refreshFriendActivityIndicators();
+			if (typeof window.isFriendActivityVisible === 'function' && window.isFriendActivityVisible() && window.__friendActivityClearBusy !== true) {
+				const list = document.getElementById('friend-activity-list');
+				const staleRows = list ? Array.from(list.querySelectorAll('.friend-activity-swipe-row[data-activity-id]')).filter(function(row) { return Math.max(0, Number(row.dataset.activityId) || 0) <= throughId; }) : [];
+				if (staleRows.length && typeof window.animateFriendActivityCascadeOut === 'function') {
+					window.animateFriendActivityCascadeOut(staleRows, function() { if (typeof window.syncFriendActivityDomToState === 'function') window.syncFriendActivityDomToState(); });
+				} else if (typeof window.syncFriendActivityDomToState === 'function') window.syncFriendActivityDomToState();
+			}
+		});
+
 		socketChat.on('user_notification_event', function(rawEvent = {}) {
 			try {
 				const item = normalizeUserNotificationItem(rawEvent);
@@ -54110,7 +54257,7 @@ function getVisibleChatStackEl(id) {
 				else if (typeof handleCommandSmartSuggestions === 'function' && handleCommandSmartSuggestions(textBeforeCaretFull)) {
 				}
 				else if (currentWord.startsWith('@')) {
-					showMentionSuggestions(currentWord.substring(1));
+					scheduleMentionSuggestions(currentWord.substring(1));
 				} 
 				else if (currentWord.startsWith('/') && isFirstWord) {
 					const commandQuery = currentWord.substring(1).toLowerCase();
@@ -56277,8 +56424,11 @@ function getVisibleChatStackEl(id) {
 	window.__friendActivityRemoteReady = false;
 	window.__friendActivityRemoteError = '';
 	window.__friendActivityLastReadId = Math.max(0, Number(window.__friendActivityLastReadId) || 0);
+	window.__friendActivityDismissedThroughId = Math.max(0, Number(window.__friendActivityDismissedThroughId) || 0);
 	window.__friendActivityFriendSignature = '';
 	window.__friendActivityFriendCount = 0;
+	window.__friendActivityDeleteBusy = false;
+	window.__friendActivityClearBusy = false;
 	window.__friendActivityReadSyncTimer = null;
 	window.__friendActivityFriendsRefreshTimer = null;
 	window.__friendActivityRenderLimit = SOCIAL_FEED_RENDER_BATCH_SIZE;
@@ -56557,7 +56707,9 @@ function getVisibleChatStackEl(id) {
 	};
 
 	window.mergeFriendActivityItems = function(incoming, replace) {
+		const dismissedThroughId = Math.max(0, Number(window.__friendActivityDismissedThroughId) || 0);
 		const incomingItems = (Array.isArray(incoming) ? incoming : []).map(normalizeFriendActivityItem).filter(Boolean).filter(function(item) {
+			if (Math.max(0, Number(item && item.id) || 0) <= dismissedThroughId) return false;
 			const addedAt = getFriendActivityAddedAtForActor(item.actor);
 			return !addedAt || Math.max(0, Number(item.createdAt) || 0) >= addedAt;
 		});
@@ -56571,7 +56723,7 @@ function getVisibleChatStackEl(id) {
 			replaces.forEach(function(id) { if (String(id || '')) replacedIds.add(String(id)); });
 		});
 		const existingItems = replace === true ? [] : (Array.isArray(window.friendActivityItems) ? window.friendActivityItems : []).map(normalizeFriendActivityItem).filter(Boolean).filter(function(item) {
-			return !replacedIds.has(String(item.id || ''));
+			return Math.max(0, Number(item && item.id) || 0) > dismissedThroughId && !replacedIds.has(String(item.id || ''));
 		});
 		const source = incomingItems.concat(existingItems);
 		const deduped = [];
@@ -56616,6 +56768,7 @@ function getVisibleChatStackEl(id) {
 			saveState(FRIEND_ACTIVITY_CACHE_KEY, JSON.stringify({
 				items: (Array.isArray(window.friendActivityItems) ? window.friendActivityItems : []).slice(0, SOCIAL_FEED_CACHE_LIMIT),
 				lastReadId: Math.max(0, Number(window.__friendActivityLastReadId) || 0),
+				dismissedThroughId: Math.max(0, Number(window.__friendActivityDismissedThroughId) || 0),
 				friendSignature: String(window.__friendActivityFriendSignature || ''),
 				friendCount: Math.max(0, Number(window.__friendActivityFriendCount) || 0),
 				cachedAt: Date.now()
@@ -56647,6 +56800,7 @@ function getVisibleChatStackEl(id) {
 		window.__friendActivityRemoteReady = false;
 		window.__friendActivityRemoteError = '';
 		window.__friendActivityLastReadId = 0;
+		window.__friendActivityDismissedThroughId = 0;
 		window.__friendActivityFriendSignature = '';
 		window.__friendActivityFriendCount = 0;
 		try {
@@ -56655,6 +56809,7 @@ function getVisibleChatStackEl(id) {
 			if (cached && typeof cached === 'object') {
 				window.friendActivityItems = Array.isArray(cached.items) ? cached.items : [];
 				window.__friendActivityLastReadId = Math.max(0, Number(cached.lastReadId) || 0);
+				window.__friendActivityDismissedThroughId = Math.max(0, Number(cached.dismissedThroughId) || 0);
 				window.__friendActivityFriendSignature = String(cached.friendSignature || '');
 				window.__friendActivityFriendCount = Math.max(0, Number(cached.friendCount) || 0);
 				window.mergeFriendActivityItems([], false);
@@ -56809,10 +56964,14 @@ function getVisibleChatStackEl(id) {
 		const metaHtml = (p.meta || repeatHtml) ? '<div class="friend-activity-meta">' + (p.meta ? '<span class="friend-activity-meta-text">' + escapeRealtimeFeedHtml(p.meta) + '</span>' : '') + repeatHtml + '</div>' : '';
 		const isActionable = item.type === 'trophy' || item.type === 'online' || item.type === 'offline' || !!titleId;
 		const day = realtimeFeedDayLabel(item.createdAt);
-		return '<div class="friend-activity-item ' + p.cls + (isActionable ? ' is-actionable' : '') + (extraClass ? ' ' + extraClass : '') + '" data-activity-id="' + escapeRealtimeFeedHtml(item.id) + '" data-activity-day="' + escapeRealtimeFeedHtml(day) + '" style="--tile-idx:' + (index % 30) + '" onmouseenter="if(typeof playUiHover===\'function\') playUiHover()"' + (isActionable ? ' onclick="openFriendActivityItem(\'' + escapeRealtimeFeedHtml(item.id) + '\')"' : '') + '>' +
+		const safeId = escapeRealtimeFeedHtml(item.id);
+		return '<div class="notification-swipe-row friend-activity-swipe-row" data-activity-id="' + safeId + '">' +
+			'<div class="notification-swipe-action" aria-hidden="false"><button type="button" class="notification-swipe-delete friend-activity-swipe-delete" data-keyboard-nav="off" aria-label="Delete activity" title="Delete activity"><i class="fas fa-trash-alt"></i><span>Delete</span></button></div>' +
+			'<div class="notification-swipe-content">' +
+			'<div class="friend-activity-item ' + p.cls + (isActionable ? ' is-actionable' : '') + (extraClass ? ' ' + extraClass : '') + '" data-activity-id="' + safeId + '" data-activity-day="' + escapeRealtimeFeedHtml(day) + '" style="--tile-idx:' + (index % 30) + '" onmouseenter="if(typeof playUiHover===\'function\') playUiHover()"' + (isActionable ? ' role="button" tabindex="0"' : '') + '>' +
 			'<div class="friend-activity-avatar-wrap"><img class="friend-activity-avatar" src="' + escapeRealtimeFeedHtml(avatar) + '" alt="" onclick="event.stopPropagation(); if(typeof playUiClick===\'function\') playUiClick(); openProfileModal(decodeURIComponent(\'' + encodedActor + '\'))"><span class="friend-activity-badge"><i class="fas ' + p.icon + '"></i></span></div>' +
 			'<div class="friend-activity-main"><div><a class="friend-activity-user" onclick="event.stopPropagation(); if(typeof playUiClick===\'function\') playUiClick(); openProfileModal(decodeURIComponent(\'' + encodedActor + '\'))">' + escapeRealtimeFeedHtml(item.actor) + '</a> ' + actionHtml + '</div>' + metaHtml + '</div>' +
-			'<div class="friend-activity-time" title="' + escapeRealtimeFeedHtml(new Date(item.createdAt).toLocaleString()) + '">' + escapeRealtimeFeedHtml(realtimeFeedTimeLabel(item.createdAt)) + '</div></div>';
+			'<div class="friend-activity-time" title="' + escapeRealtimeFeedHtml(new Date(item.createdAt).toLocaleString()) + '">' + escapeRealtimeFeedHtml(realtimeFeedTimeLabel(item.createdAt)) + '</div></div></div></div>';
 	}
 
 	function cleanupFriendActivityDayHeaders(list) {
@@ -56829,7 +56988,9 @@ function getVisibleChatStackEl(id) {
 		const count = document.getElementById('friend-activity-count');
 		const empty = document.getElementById('friend-activity-empty');
 		const loading = document.getElementById('friend-activity-loading');
+		const dismissAll = document.getElementById('friend-activity-dismiss-all');
 		if (count) count.textContent = items.length ? '(' + items.length + ' ' + (items.length === 1 ? 'item' : 'items') + ')' : '';
+		if (dismissAll) { dismissAll.style.display = items.length ? 'inline-flex' : 'none'; dismissAll.disabled = window.__friendActivityClearBusy === true; }
 		if (items.length) {
 			if (loading) loading.style.display = 'none';
 			if (empty) empty.style.display = 'none';
@@ -56843,10 +57004,10 @@ function getVisibleChatStackEl(id) {
 		const authoritative = (Array.isArray(window.friendActivityItems) ? window.friendActivityItems : []).find(function(entry) { return String(entry && entry.id || '') === String(item.id || ''); });
 		if (!authoritative) return false;
 		const keepIds = new Set((Array.isArray(window.friendActivityItems) ? window.friendActivityItems : []).map(function(entry) { return String(entry && entry.id || ''); }).filter(Boolean));
-		list.querySelectorAll('.friend-activity-item[data-activity-id]').forEach(function(row) {
+		list.querySelectorAll('.friend-activity-swipe-row[data-activity-id]').forEach(function(row) {
 			if (!keepIds.has(String(row.dataset.activityId || ''))) row.remove();
 		});
-		const existing = list.querySelector('.friend-activity-item[data-activity-id="' + CSS.escape(String(authoritative.id || '')) + '"]');
+		const existing = list.querySelector('.friend-activity-swipe-row[data-activity-id="' + CSS.escape(String(authoritative.id || '')) + '"]');
 		if (existing) existing.remove();
 		cleanupFriendActivityDayHeaders(list);
 		const day = realtimeFeedDayLabel(authoritative.createdAt);
@@ -56858,7 +57019,7 @@ function getVisibleChatStackEl(id) {
 		updateFriendActivityChrome();
 		window.refreshFriendActivityIndicators();
 		const maxRendered = Math.max(SOCIAL_FEED_RENDER_BATCH_SIZE, Number(window.__friendActivityRenderLimit) || SOCIAL_FEED_RENDER_BATCH_SIZE);
-		Array.from(list.querySelectorAll('.friend-activity-item[data-activity-id]')).slice(maxRendered).forEach(function(row) { row.remove(); });
+		Array.from(list.querySelectorAll('.friend-activity-swipe-row[data-activity-id]')).slice(maxRendered).forEach(function(row) { row.remove(); });
 		cleanupFriendActivityDayHeaders(list);
 		if (highlight) {
 			const row = list.querySelector('.friend-activity-item[data-activity-id="' + CSS.escape(String(authoritative.id || '')) + '"]');
@@ -56876,12 +57037,14 @@ function getVisibleChatStackEl(id) {
 		const empty = document.getElementById('friend-activity-empty');
 		const loading = document.getElementById('friend-activity-loading');
 		if (!list) return;
+		setupFriendActivitySwipeInteractions();
 		window.mergeFriendActivityItems([], false);
 		const items = Array.isArray(window.friendActivityItems) ? window.friendActivityItems : [];
 		updateFriendActivityChrome();
 		if (!items.length) {
 			list.innerHTML = '';
 			delete list.dataset.realtimeFeedRenderSignature;
+			cancelFriendActivitySwipeHintPreview(true);
 			if (!window.__friendActivityRemoteReady && !window.__friendActivityRemoteError) {
 				if (loading) loading.style.display = 'block';
 				if (empty) empty.style.display = 'none';
@@ -56912,9 +57075,11 @@ function getVisibleChatStackEl(id) {
 		const canReuseDom = list.dataset.realtimeFeedRenderSignature === renderSignature && realtimeFeedDomMatchesState(list, '.friend-activity-item[data-activity-id]', 'data-activity-id', renderedItems);
 		if (canReuseDom) {
 			refreshRealtimeFeedTimeLabels('activity', list);
+			closeFriendActivitySwipeRows();
 			if (!isSilent) animateVisibleRealtimeFeedRows(list, '.friend-activity-item');
 			setupRealtimeFeedDomPaging('activity');
 			window.refreshFriendActivityIndicators();
+			scheduleFriendActivitySwipeHint();
 			if (window.isFriendActivityVisible()) window.markFriendActivityRead();
 			return;
 		}
@@ -56932,6 +57097,7 @@ function getVisibleChatStackEl(id) {
 		if (!isSilent) animateVisibleRealtimeFeedRows(list, '.friend-activity-item');
 		setupRealtimeFeedDomPaging('activity');
 		window.refreshFriendActivityIndicators();
+		scheduleFriendActivitySwipeHint();
 		if (window.isFriendActivityVisible()) window.markFriendActivityRead();
 	};
 
@@ -56974,11 +57140,17 @@ function getVisibleChatStackEl(id) {
 			window.__friendActivityRemoteError = '';
 			window.__friendActivityFriendCount = Math.max(0, Number(response.friendCount) || 0);
 			const serverReadId = Math.max(0, Number(response.lastReadId) || 0);
+			const serverDismissedThroughId = Math.max(0, Number(response.dismissedThroughId) || 0);
 			window.__friendActivityLastReadId = Math.max(localReadBeforeSync, serverReadId);
 
 			const previousIds = new Set((Array.isArray(window.friendActivityItems) ? window.friendActivityItems : []).map(function(item) { return String(item && item.id || ''); }).filter(Boolean));
 			const responseIsFull = response.delta !== true;
-			if (responseIsFull) window.__friendActivityRenderLimit = SOCIAL_FEED_RENDER_BATCH_SIZE;
+			if (responseIsFull) {
+				window.__friendActivityRenderLimit = SOCIAL_FEED_RENDER_BATCH_SIZE;
+				window.__friendActivityDismissedThroughId = serverDismissedThroughId;
+			} else {
+				window.__friendActivityDismissedThroughId = Math.max(Math.max(0, Number(window.__friendActivityDismissedThroughId) || 0), serverDismissedThroughId);
+			}
 			window.mergeFriendActivityItems(Array.isArray(response.items) ? response.items : [], responseIsFull);
 			const addedItems = getRealtimeFeedAddedItems(previousIds, window.friendActivityItems);
 
@@ -58422,6 +58594,410 @@ function getVisibleChatStackEl(id) {
     }
 
 
+
+
+	// Friend Activity uses the same swipe shell and motion language as Notifications,
+	// but dismissal state is private to the signed-in user and persisted by the server.
+	let friendActivitySwipeHintSeenThisVisit = false;
+	let friendActivitySwipeDragState = null;
+	let friendActivitySwipeHintTimer = null;
+	let friendActivitySwipeHintReturnTimer = null;
+	let friendActivitySwipeHintHideTimer = null;
+	let friendActivitySwipeHintSoundTimer = null;
+	let friendActivitySwipeHintRow = null;
+
+	function hideFriendActivitySwipeHint() {
+		const hint = document.getElementById('friend-activity-swipe-hint');
+		if (hint) hint.classList.remove('is-visible');
+	}
+
+	function cancelFriendActivitySwipeHintPreview(resetRow = true) {
+		clearTimeout(friendActivitySwipeHintTimer);
+		clearTimeout(friendActivitySwipeHintReturnTimer);
+		clearTimeout(friendActivitySwipeHintHideTimer);
+		clearTimeout(friendActivitySwipeHintSoundTimer);
+		friendActivitySwipeHintTimer = null;
+		friendActivitySwipeHintReturnTimer = null;
+		friendActivitySwipeHintHideTimer = null;
+		friendActivitySwipeHintSoundTimer = null;
+		const row = friendActivitySwipeHintRow;
+		friendActivitySwipeHintRow = null;
+		if (row && resetRow) {
+			row.classList.remove('is-swipe-hinting', 'is-swiping');
+			setNotificationSwipeOffset(row, 0, true);
+		}
+		hideFriendActivitySwipeHint();
+	}
+
+	function markFriendActivitySwipeHintSeen() {
+		friendActivitySwipeHintSeenThisVisit = true;
+	}
+
+	function scheduleFriendActivitySwipeHint() {
+		if (friendActivitySwipeHintSeenThisVisit) return;
+		if (typeof window.isFriendActivityVisible === 'function' && !window.isFriendActivityVisible()) return;
+		const list = document.getElementById('friend-activity-list');
+		if (!list || !list.querySelector('.friend-activity-swipe-row')) return;
+		clearTimeout(friendActivitySwipeHintTimer);
+		friendActivitySwipeHintTimer = setTimeout(function() {
+			friendActivitySwipeHintTimer = null;
+			if (friendActivitySwipeHintSeenThisVisit || (typeof window.isFriendActivityVisible === 'function' && !window.isFriendActivityVisible())) return;
+			const currentList = document.getElementById('friend-activity-list');
+			const row = currentList && currentList.querySelector('.friend-activity-swipe-row');
+			if (!row || currentList.querySelector('.friend-activity-swipe-row.is-open, .friend-activity-swipe-row.is-swiping')) return;
+			const hint = document.getElementById('friend-activity-swipe-hint');
+			friendActivitySwipeHintRow = row;
+			row.classList.add('is-swipe-hinting', 'is-swiping');
+			if (hint) hint.classList.add('is-visible');
+			markFriendActivitySwipeHintSeen();
+			requestAnimationFrame(function() {
+				requestAnimationFrame(function() {
+					if (friendActivitySwipeHintRow === row) setNotificationSwipeOffset(row, -NOTIFICATION_SWIPE_HINT_PEEK_PX, true);
+				});
+			});
+			friendActivitySwipeHintSoundTimer = setTimeout(function() {
+				friendActivitySwipeHintSoundTimer = null;
+				if (friendActivitySwipeHintRow === row && typeof playUiToggle === 'function') playUiToggle();
+			}, 620);
+			friendActivitySwipeHintReturnTimer = setTimeout(function() {
+				friendActivitySwipeHintReturnTimer = null;
+				if (friendActivitySwipeHintRow !== row) return;
+				setNotificationSwipeOffset(row, 0, true);
+				setTimeout(function() {
+					if (friendActivitySwipeHintRow === row) {
+						row.classList.remove('is-swipe-hinting', 'is-swiping');
+						friendActivitySwipeHintRow = null;
+					}
+				}, 900);
+			}, 1850);
+			friendActivitySwipeHintHideTimer = setTimeout(function() {
+				friendActivitySwipeHintHideTimer = null;
+				hideFriendActivitySwipeHint();
+			}, 5200);
+		}, 700);
+	}
+
+	function syncFriendActivitySwipeListState() {
+		const list = document.getElementById('friend-activity-list');
+		if (list) list.classList.toggle('has-open-swipe', !!list.querySelector('.friend-activity-swipe-row.is-open'));
+	}
+
+	function closeFriendActivitySwipeRow(row, animate = true) {
+		if (!row) return;
+		row.classList.remove('is-open', 'is-swiping');
+		setNotificationSwipeOffset(row, 0, animate);
+		syncFriendActivitySwipeListState();
+	}
+
+	function closeFriendActivitySwipeRows(exceptRow = null) {
+		const list = document.getElementById('friend-activity-list');
+		if (!list) return;
+		list.querySelectorAll('.friend-activity-swipe-row.is-open').forEach(function(row) {
+			if (row !== exceptRow) closeFriendActivitySwipeRow(row, true);
+		});
+		syncFriendActivitySwipeListState();
+	}
+
+	window.syncFriendActivityDomToState = function() {
+		const list = document.getElementById('friend-activity-list');
+		if (!list) return false;
+		const keepIds = new Set((Array.isArray(window.friendActivityItems) ? window.friendActivityItems : []).map(function(item) { return String(item && item.id || ''); }).filter(Boolean));
+		list.querySelectorAll('.friend-activity-swipe-row[data-activity-id]').forEach(function(row) {
+			if (!keepIds.has(String(row.dataset.activityId || ''))) row.remove();
+		});
+		cleanupFriendActivityDayHeaders(list);
+		updateFriendActivityChrome();
+		syncFriendActivitySwipeListState();
+		window.refreshFriendActivityIndicators();
+		if (!window.friendActivityItems.length) window.renderFriendActivity(true);
+		return true;
+	};
+
+	window.animateFriendActivityCascadeOut = function(rows, onComplete) {
+		const list = document.getElementById('friend-activity-list');
+		const finish = typeof onComplete === 'function' ? onComplete : function() {};
+		const cleanRows = Array.from(new Set((Array.isArray(rows) ? rows : []).filter(function(row) {
+			return row && row.isConnected && row.classList && row.classList.contains('friend-activity-swipe-row');
+		})));
+		if (!list || !cleanRows.length) { finish(); return 0; }
+
+		const viewportHeight = window.visualViewport ? window.visualViewport.height : window.innerHeight;
+		const viewportWidth = window.visualViewport ? window.visualViewport.width : window.innerWidth;
+		const visibleRows = cleanRows.filter(function(row) {
+			const rect = row.getBoundingClientRect();
+			return rect.bottom > 0 && rect.top < viewportHeight && rect.right > 0 && rect.left < viewportWidth;
+		});
+		const dismissStaggerMs = 90;
+		const dismissDurationMs = 800;
+		visibleRows.forEach(function(row, index) {
+			row.style.setProperty('--notification-dismiss-delay', (index * dismissStaggerMs) + 'ms');
+			row.classList.add('is-dismiss-all');
+		});
+		const rowSet = new Set(cleanRows);
+		const lastRowDelayMs = visibleRows.length ? ((visibleRows.length - 1) * dismissStaggerMs) : 0;
+		Array.from(list.querySelectorAll('.friend-activity-day')).forEach(function(day) {
+			const rect = day.getBoundingClientRect();
+			if (!(rect.bottom > 0 && rect.top < viewportHeight && rect.right > 0 && rect.left < viewportWidth)) return;
+			const dayRows = [];
+			let node = day.nextElementSibling;
+			while (node && !node.classList.contains('friend-activity-day')) {
+				if (node.classList.contains('friend-activity-swipe-row')) dayRows.push(node);
+				node = node.nextElementSibling;
+			}
+			if (!dayRows.length || !dayRows.every(function(row) { return rowSet.has(row); })) return;
+			day.style.setProperty('--notification-dismiss-delay', (lastRowDelayMs + 180) + 'ms');
+			day.classList.add('is-dismiss-all');
+		});
+		const duration = visibleRows.length ? (lastRowDelayMs + dismissDurationMs + 80) : 0;
+		setTimeout(finish, duration);
+		return duration;
+	};
+
+	window.removeFriendActivity = function(activityId, rowElement = null) {
+		const id = String(activityId || '').trim();
+		if (!id || window.__friendActivityDeleteBusy) return false;
+		const index = (Array.isArray(window.friendActivityItems) ? window.friendActivityItems : []).findIndex(function(item) { return String(item && item.id || '') === id; });
+		if (index < 0) return false;
+		if (!socketChat || !socketChat.connected) {
+			if (typeof showToastNotification === 'function') showToastNotification('Friend Activity', 'Reconnect to dismiss this activity.');
+			return false;
+		}
+		const expectedUser = String(localStorage.getItem('psn_username') || '').trim();
+		if (!expectedUser) return false;
+
+		window.__friendActivityDeleteBusy = true;
+		window.friendActivityItems.splice(index, 1);
+		window.writeFriendActivityCache();
+		window.refreshFriendActivityIndicators();
+		if (typeof playUiRemove === 'function') playUiRemove();
+		const row = rowElement && rowElement.classList ? rowElement : null;
+		const finishLocalDelete = function() {
+			window.__friendActivityDeleteBusy = false;
+			if (String(localStorage.getItem('psn_username') || '').trim().toLowerCase() === expectedUser.toLowerCase()) {
+				if (row && row.isConnected) row.remove();
+				window.syncFriendActivityDomToState();
+			}
+		};
+		if (row && typeof window.animateUserNotificationRowOut === 'function') window.animateUserNotificationRowOut(row, finishLocalDelete);
+		else setTimeout(finishLocalDelete, 0);
+
+		socketChat.emit('friend_activity_dismiss', { activityId:id }, function(response) {
+			if (String(localStorage.getItem('psn_username') || '').trim().toLowerCase() !== expectedUser.toLowerCase()) return;
+			if (!response || response.ok !== true) {
+				if (typeof showToastNotification === 'function') showToastNotification('Friend Activity', 'Could not dismiss the activity. Refreshing…');
+				window.__friendActivityDeleteBusy = false;
+				window.bootstrapFriendActivityRealtime({ forceFull:true, reason:'dismiss-recovery' });
+				return;
+			}
+			window.writeFriendActivityCache();
+			window.refreshFriendActivityIndicators();
+		});
+		return true;
+	};
+
+	window.dismissAllFriendActivity = function() {
+		if (window.__friendActivityClearBusy) return false;
+		const items = Array.isArray(window.friendActivityItems) ? window.friendActivityItems : [];
+		if (!items.length) return false;
+		if (!confirm('Do you want to clear all friend activity?')) return false;
+		if (!socketChat || !socketChat.connected) {
+			if (typeof showToastNotification === 'function') showToastNotification('Friend Activity', 'Reconnect to dismiss friend activity.');
+			return false;
+		}
+		const expectedUser = String(localStorage.getItem('psn_username') || '').trim();
+		if (!expectedUser) return false;
+		const clearThroughId = getRealtimeFeedMaxId(items);
+		if (!clearThroughId) return false;
+		const previousDismissedThroughId = Math.max(0, Number(window.__friendActivityDismissedThroughId) || 0);
+
+		window.__friendActivityClearBusy = true;
+		cancelFriendActivitySwipeHintPreview(true);
+		closeFriendActivitySwipeRows();
+		const button = document.getElementById('friend-activity-dismiss-all');
+		if (button) button.disabled = true;
+		if (typeof playUiRemove === 'function') playUiRemove();
+		const list = document.getElementById('friend-activity-list');
+		const rows = list ? Array.from(list.querySelectorAll('.friend-activity-swipe-row')) : [];
+		const cascadeMs = window.animateFriendActivityCascadeOut(rows);
+		const finishLocalClear = function() {
+			if (String(localStorage.getItem('psn_username') || '').trim().toLowerCase() !== expectedUser.toLowerCase()) return;
+			window.__friendActivityDismissedThroughId = Math.max(previousDismissedThroughId, clearThroughId);
+			window.__friendActivityLastReadId = Math.max(Math.max(0, Number(window.__friendActivityLastReadId) || 0), clearThroughId);
+			window.friendActivityItems = (Array.isArray(window.friendActivityItems) ? window.friendActivityItems : []).filter(function(item) { return Math.max(0, Number(item && item.id) || 0) > clearThroughId; });
+			window.writeFriendActivityCache();
+			window.refreshFriendActivityIndicators();
+			window.syncFriendActivityDomToState();
+		};
+		setTimeout(finishLocalClear, cascadeMs);
+
+		const releaseClearBusy = function() {
+			window.__friendActivityClearBusy = false;
+			const currentButton = document.getElementById('friend-activity-dismiss-all');
+			if (currentButton) currentButton.disabled = false;
+			updateFriendActivityChrome();
+		};
+		const clearFallbackTimer = setTimeout(releaseClearBusy, cascadeMs + 5200);
+		socketChat.emit('friend_activity_clear', { throughId:clearThroughId }, function(response) {
+			clearTimeout(clearFallbackTimer);
+			const currentUser = String(localStorage.getItem('psn_username') || '').trim();
+			if (!response || response.ok !== true) {
+				if (currentUser.toLowerCase() === expectedUser.toLowerCase()) {
+					window.__friendActivityDismissedThroughId = previousDismissedThroughId;
+					if (typeof showToastNotification === 'function') showToastNotification('Friend Activity', 'Could not dismiss friend activity. Refreshing…');
+					setTimeout(function() { window.bootstrapFriendActivityRealtime({ forceFull:true, reason:'clear-recovery' }); }, cascadeMs + 20);
+				}
+			} else if (currentUser.toLowerCase() === expectedUser.toLowerCase()) {
+				window.__friendActivityDismissedThroughId = Math.max(Math.max(0, Number(response.dismissedThroughId) || 0), clearThroughId);
+				window.__friendActivityLastReadId = Math.max(Math.max(0, Number(window.__friendActivityLastReadId) || 0), Math.max(0, Number(response.lastReadId) || clearThroughId));
+				window.writeFriendActivityCache();
+				window.refreshFriendActivityIndicators();
+			}
+			setTimeout(releaseClearBusy, cascadeMs + 40);
+		});
+		return true;
+	};
+
+	function setupFriendActivitySwipeInteractions() {
+		const list = document.getElementById('friend-activity-list');
+		if (!list || list.dataset.friendActivitySwipeBound === '1') return;
+		list.dataset.friendActivitySwipeBound = '1';
+
+		if (list.dataset.friendActivitySwipeHintScrollBound !== '1') {
+			list.dataset.friendActivitySwipeHintScrollBound = '1';
+			const cancelHintFromListScroll = function() {
+				if (typeof window.isFriendActivityVisible === 'function' && !window.isFriendActivityVisible()) return;
+				if (!friendActivitySwipeHintTimer && !friendActivitySwipeHintReturnTimer && !friendActivitySwipeHintHideTimer && !friendActivitySwipeHintSoundTimer && !friendActivitySwipeHintRow) return;
+				markFriendActivitySwipeHintSeen();
+				cancelFriendActivitySwipeHintPreview(true);
+			};
+			list.addEventListener('scroll', cancelHintFromListScroll, { passive:true });
+			list.addEventListener('wheel', cancelHintFromListScroll, { passive:true });
+		}
+
+		const beginDrag = function(target, clientX, clientY, inputType, inputId) {
+			if (target.closest('.friend-activity-swipe-row.is-swipe-hinting')) return false;
+			if (target.closest('.friend-activity-swipe-delete')) return false;
+			if (friendActivitySwipeHintRow || friendActivitySwipeHintTimer) {
+				markFriendActivitySwipeHintSeen();
+				cancelFriendActivitySwipeHintPreview(true);
+			}
+			const content = target.closest('.notification-swipe-content');
+			if (!content || !list.contains(content)) return false;
+			const row = content.closest('.friend-activity-swipe-row');
+			if (!row) return false;
+			const openRow = list.querySelector('.friend-activity-swipe-row.is-open');
+			const dismissedOtherOpenRow = !!(openRow && openRow !== row);
+			closeFriendActivitySwipeRows(row);
+			const startsOpen = row.classList.contains('is-open');
+			friendActivitySwipeDragState = { inputType, inputId, row, content, item:content.querySelector('.friend-activity-item'), startX:clientX, startY:clientY, baseOffset:startsOpen ? -NOTIFICATION_SWIPE_REVEAL_PX : 0, offset:startsOpen ? -NOTIFICATION_SWIPE_REVEAL_PX : 0, dragging:false, cancelled:false, dismissedOtherOpenRow, snapSoundPlayed:startsOpen };
+			return true;
+		};
+
+		const moveDrag = function(clientX, clientY, preventDefault) {
+			const state = friendActivitySwipeDragState;
+			if (!state || state.cancelled) return;
+			const dx = clientX - state.startX;
+			const dy = clientY - state.startY;
+			const absX = Math.abs(dx);
+			const absY = Math.abs(dy);
+			if (!state.dragging) {
+				if (absY > 8 && absY > absX) { state.cancelled = true; friendActivitySwipeDragState = null; return; }
+				if (absX < 8 || absX <= absY) return;
+				state.dragging = true;
+				state.row.classList.add('is-swiping');
+				if (state.item) state.item.classList.remove('mobile-pressed');
+			}
+			preventDefault();
+			state.offset = Math.max(-NOTIFICATION_SWIPE_REVEAL_PX, Math.min(0, state.baseOffset + dx));
+			setNotificationSwipeOffset(state.row, state.offset, false);
+			if (!state.snapSoundPlayed && state.offset <= -(NOTIFICATION_SWIPE_REVEAL_PX * .42)) {
+				state.snapSoundPlayed = true;
+				if (typeof playUiToggle === 'function') playUiToggle();
+			}
+		};
+
+		const finishDrag = function() {
+			const state = friendActivitySwipeDragState;
+			friendActivitySwipeDragState = null;
+			if (!state || state.cancelled) return;
+			if (state.dragging) {
+				const shouldOpen = state.offset <= -(NOTIFICATION_SWIPE_REVEAL_PX * .42);
+				state.row.classList.remove('is-swiping');
+				state.row.classList.toggle('is-open', shouldOpen);
+				setNotificationSwipeOffset(state.row, shouldOpen ? -NOTIFICATION_SWIPE_REVEAL_PX : 0, true);
+				syncFriendActivitySwipeListState();
+				state.row.dataset.notificationSwipeSuppressUntil = String(Date.now() + 350);
+			} else if (state.dismissedOtherOpenRow) {
+				state.row.dataset.notificationSwipeSuppressUntil = String(Date.now() + 350);
+			}
+		};
+
+		list.addEventListener('pointerdown', function(event) {
+			if (event.pointerType === 'touch' || (event.button !== undefined && event.button !== 0)) return;
+			if (!beginDrag(event.target, event.clientX, event.clientY, 'pointer', event.pointerId)) return;
+			try { event.target.closest('.notification-swipe-content')?.setPointerCapture(event.pointerId); } catch (err) {}
+		});
+		list.addEventListener('pointermove', function(event) {
+			const state = friendActivitySwipeDragState;
+			if (!state || state.inputType !== 'pointer' || state.inputId !== event.pointerId) return;
+			moveDrag(event.clientX, event.clientY, function() { event.preventDefault(); });
+		}, { passive:false });
+		const finishPointer = function(event) {
+			const state = friendActivitySwipeDragState;
+			if (!state || state.inputType !== 'pointer' || state.inputId !== event.pointerId) return;
+			const content = state.content;
+			finishDrag();
+			try { content.releasePointerCapture(event.pointerId); } catch (err) {}
+		};
+		list.addEventListener('pointerup', finishPointer);
+		list.addEventListener('pointercancel', finishPointer);
+		list.addEventListener('lostpointercapture', function(event) {
+			const state = friendActivitySwipeDragState;
+			if (state && state.inputType === 'pointer' && state.inputId === event.pointerId) finishPointer(event);
+		});
+		list.addEventListener('touchstart', function(event) {
+			if (event.touches.length !== 1) return;
+			const touch = event.touches[0];
+			beginDrag(event.target, touch.clientX, touch.clientY, 'touch', touch.identifier);
+		}, { passive:true });
+		list.addEventListener('touchmove', function(event) {
+			const state = friendActivitySwipeDragState;
+			if (!state || state.inputType !== 'touch') return;
+			const touch = Array.from(event.touches).find(function(item) { return item.identifier === state.inputId; });
+			if (touch) moveDrag(touch.clientX, touch.clientY, function() { event.preventDefault(); });
+		}, { passive:false });
+		const finishTouch = function(event) {
+			const state = friendActivitySwipeDragState;
+			if (!state || state.inputType !== 'touch') return;
+			const ended = Array.from(event.changedTouches || []).some(function(item) { return item.identifier === state.inputId; });
+			if (ended || event.type === 'touchcancel') finishDrag();
+		};
+		list.addEventListener('touchend', finishTouch, { passive:true });
+		list.addEventListener('touchcancel', finishTouch, { passive:true });
+		list.addEventListener('click', function(event) {
+			const hintingRow = event.target.closest('.friend-activity-swipe-row.is-swipe-hinting');
+			if (hintingRow) { event.preventDefault(); event.stopPropagation(); return; }
+			const deleteButton = event.target.closest('.friend-activity-swipe-delete');
+			if (deleteButton) {
+				event.preventDefault(); event.stopPropagation();
+				const row = deleteButton.closest('.friend-activity-swipe-row');
+				if (row) window.removeFriendActivity(row.dataset.activityId, row);
+				return;
+			}
+			const row = event.target.closest('.friend-activity-swipe-row');
+			if (!row) return;
+			if (Date.now() < Number(row.dataset.notificationSwipeSuppressUntil || 0)) { event.preventDefault(); event.stopPropagation(); return; }
+			if (row.classList.contains('is-open')) {
+				event.preventDefault(); event.stopPropagation(); closeFriendActivitySwipeRow(row, true); return;
+			}
+			const item = event.target.closest('.friend-activity-item.is-actionable');
+			if (!item || event.target.closest('button, a')) return;
+			const activityId = String(row.dataset.activityId || '').trim();
+			if (!activityId || typeof window.openFriendActivityItem !== 'function') return;
+			event.preventDefault(); event.stopPropagation(); window.openFriendActivityItem(activityId);
+		});
+		document.addEventListener('pointerdown', function(event) { if (!list.contains(event.target)) closeFriendActivitySwipeRows(); }, true);
+	}
 
 	window.bootstrapNotificationCenterRealtime = function(options = {}) {
 		window.restoreUserNotificationCache();

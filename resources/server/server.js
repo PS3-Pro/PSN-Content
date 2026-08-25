@@ -1045,8 +1045,17 @@ async function initDb() {
     CREATE TABLE IF NOT EXISTS friend_activity_read_state (
       user_name TEXT PRIMARY KEY,
       last_read_id BIGINT NOT NULL DEFAULT 0,
+      dismissed_through_id BIGINT NOT NULL DEFAULT 0,
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
+    ALTER TABLE friend_activity_read_state ADD COLUMN IF NOT EXISTS dismissed_through_id BIGINT NOT NULL DEFAULT 0;
+    CREATE TABLE IF NOT EXISTS friend_activity_dismissed (
+      user_name TEXT NOT NULL,
+      activity_id BIGINT NOT NULL REFERENCES friend_activity(id) ON DELETE CASCADE,
+      dismissed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (user_name, activity_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_friend_activity_dismissed_user_id ON friend_activity_dismissed(user_name, activity_id DESC);
     CREATE TABLE IF NOT EXISTS user_notifications (
       id BIGSERIAL PRIMARY KEY,
       user_name TEXT NOT NULL,
@@ -4640,6 +4649,8 @@ async function initProfileSyncNotifications() {
 
       if (message.channel === 'friend_activity_sync') {
         if (data.event) emitFriendActivityToLocalSubscribers(data.event);
+        if (data.dismissed && data.dismissed.userName) emitFriendActivityDismissedToLocalUser(data.dismissed.userName, data.dismissed.activityId);
+        if (data.cleared && data.cleared.userName) emitFriendActivityClearedToLocalUser(data.cleared.userName, data.cleared.throughId, data.cleared.lastReadId);
         return;
       }
 
@@ -4989,6 +5000,53 @@ async function notifyFriendActivityAcrossInstances(event) {
   }
 }
 
+function emitFriendActivityDismissedToLocalUser(userName, activityId, excludeSocketId = '') {
+  const name = normalizeFriendActivityName(userName);
+  const id = String(activityId || '').trim();
+  const excluded = String(excludeSocketId || '').trim();
+  if (!name || !/^\d+$/.test(id)) return;
+  const payload = { userName: name, activityId: id };
+  getSocketsByUserName(name).forEach(client => {
+    if (client && client.connected && (!excluded || client.id !== excluded)) client.emit('friend_activity_dismissed', payload);
+  });
+}
+
+function emitFriendActivityClearedToLocalUser(userName, throughId = 0, lastReadId = 0, excludeSocketId = '') {
+  const name = normalizeFriendActivityName(userName);
+  const excluded = String(excludeSocketId || '').trim();
+  const safeThroughId = Math.max(0, Math.floor(Number(throughId) || 0));
+  if (!name || !safeThroughId) return;
+  const payload = { userName: name, throughId: safeThroughId, lastReadId: Math.max(0, Math.floor(Number(lastReadId) || safeThroughId)) };
+  getSocketsByUserName(name).forEach(client => {
+    if (client && client.connected && (!excluded || client.id !== excluded)) client.emit('friend_activity_cleared', payload);
+  });
+}
+
+async function notifyFriendActivityDismissedAcrossInstances(userName, activityId) {
+  const name = normalizeFriendActivityName(userName);
+  const id = String(activityId || '').trim();
+  if (!name || !/^\d+$/.test(id)) return;
+  try {
+    await pool.query('SELECT pg_notify($1, $2)', ['friend_activity_sync', JSON.stringify({ dismissed: { userName: name, activityId: id }, instanceId: INSTANCE_ID })]);
+  } catch (err) {
+    console.error('[FRIEND ACTIVITY DISMISS SYNC ERROR]:', err);
+  }
+}
+
+async function notifyFriendActivityClearedAcrossInstances(userName, throughId = 0, lastReadId = 0) {
+  const name = normalizeFriendActivityName(userName);
+  const safeThroughId = Math.max(0, Math.floor(Number(throughId) || 0));
+  if (!name || !safeThroughId) return;
+  try {
+    await pool.query('SELECT pg_notify($1, $2)', ['friend_activity_sync', JSON.stringify({
+      cleared: { userName: name, throughId: safeThroughId, lastReadId: Math.max(0, Math.floor(Number(lastReadId) || safeThroughId)) },
+      instanceId: INSTANCE_ID
+    })]);
+  } catch (err) {
+    console.error('[FRIEND ACTIVITY CLEAR SYNC ERROR]:', err);
+  }
+}
+
 async function recordFriendActivity(actorName, type, rawData = {}, options = {}) {
   const actor = normalizeFriendActivityName(actorName);
   const eventType = normalizeText(type, '').toLowerCase();
@@ -5141,15 +5199,22 @@ function recordPresenceFriendActivity(name, type, at = Date.now()) {
   return recordAggregatedFriendActivity(name, type, {}, { at, groupWindowMs: FRIEND_ACTIVITY_PRESENCE_GROUP_MS });
 }
 
-async function getFriendActivityReadId(userName) {
+async function getFriendActivityState(userName) {
   const name = normalizeFriendActivityName(userName);
-  if (!name) return 0;
+  if (!name) return { lastReadId: 0, dismissedThroughId: 0 };
   const result = await queryDbWithRetry(
-    'SELECT last_read_id FROM friend_activity_read_state WHERE user_name = $1 LIMIT 1',
+    'SELECT last_read_id, dismissed_through_id FROM friend_activity_read_state WHERE user_name = $1 LIMIT 1',
     [name],
-    { attempts: 2, label: 'FRIEND ACTIVITY READ STATE' }
+    { attempts: 2, label: 'FRIEND ACTIVITY STATE' }
   );
-  return Math.max(0, Number(result.rows[0] && result.rows[0].last_read_id) || 0);
+  return {
+    lastReadId: Math.max(0, Number(result.rows[0] && result.rows[0].last_read_id) || 0),
+    dismissedThroughId: Math.max(0, Number(result.rows[0] && result.rows[0].dismissed_through_id) || 0)
+  };
+}
+
+async function getFriendActivityReadId(userName) {
+  return (await getFriendActivityState(userName)).lastReadId;
 }
 
 async function setFriendActivityReadId(userName, lastReadId) {
@@ -5157,8 +5222,8 @@ async function setFriendActivityReadId(userName, lastReadId) {
   const safeId = Math.max(0, Math.floor(Number(lastReadId) || 0));
   if (!name || !safeId) return 0;
   const result = await queryDbWithRetry(
-    `INSERT INTO friend_activity_read_state (user_name, last_read_id, updated_at)
-     VALUES ($1, $2, NOW())
+    `INSERT INTO friend_activity_read_state (user_name, last_read_id, dismissed_through_id, updated_at)
+     VALUES ($1, $2, 0, NOW())
      ON CONFLICT (user_name)
      DO UPDATE SET last_read_id = GREATEST(friend_activity_read_state.last_read_id, EXCLUDED.last_read_id), updated_at = NOW()
      RETURNING last_read_id`,
@@ -5168,13 +5233,61 @@ async function setFriendActivityReadId(userName, lastReadId) {
   return Math.max(0, Number(result.rows[0] && result.rows[0].last_read_id) || safeId);
 }
 
+async function dismissFriendActivityForUser(userName, activityId) {
+  const name = normalizeFriendActivityName(userName);
+  const id = String(activityId || '').trim();
+  if (!name || !/^\d+$/.test(id)) return { dismissed: false, activityId: '' };
+  const result = await queryDbWithRetry(
+    `INSERT INTO friend_activity_dismissed (user_name, activity_id, dismissed_at)
+     SELECT $1, fa.id, NOW() FROM friend_activity fa WHERE fa.id = $2::bigint
+     ON CONFLICT (user_name, activity_id)
+     DO UPDATE SET dismissed_at = friend_activity_dismissed.dismissed_at
+     RETURNING activity_id`,
+    [name, id],
+    { attempts: 2, label: 'FRIEND ACTIVITY DISMISS' }
+  );
+  const dismissed = !!result.rows[0];
+  return { dismissed, activityId: dismissed ? id : '' };
+}
+
+async function clearFriendActivityForUser(userName, throughId = 0) {
+  const name = normalizeFriendActivityName(userName);
+  const safeThroughId = Math.max(0, Math.floor(Number(throughId) || 0));
+  if (!name || !safeThroughId) {
+    const state = await getFriendActivityState(name);
+    return { throughId: safeThroughId, lastReadId: state.lastReadId, dismissedThroughId: state.dismissedThroughId };
+  }
+  return runDbTransactionWithRetry('FRIEND ACTIVITY CLEAR', async client => {
+    const stateResult = await client.query(
+      `INSERT INTO friend_activity_read_state (user_name, last_read_id, dismissed_through_id, updated_at)
+       VALUES ($1, $2, $2, NOW())
+       ON CONFLICT (user_name)
+       DO UPDATE SET
+         last_read_id = GREATEST(friend_activity_read_state.last_read_id, EXCLUDED.last_read_id),
+         dismissed_through_id = GREATEST(friend_activity_read_state.dismissed_through_id, EXCLUDED.dismissed_through_id),
+         updated_at = NOW()
+       RETURNING last_read_id, dismissed_through_id`,
+      [name, safeThroughId]
+    );
+    await client.query('DELETE FROM friend_activity_dismissed WHERE user_name = $1 AND activity_id <= $2::bigint', [name, safeThroughId]);
+    const row = stateResult.rows[0] || {};
+    return {
+      throughId: safeThroughId,
+      lastReadId: Math.max(0, Number(row.last_read_id) || safeThroughId),
+      dismissedThroughId: Math.max(0, Number(row.dismissed_through_id) || safeThroughId)
+    };
+  }, { attempts: 3, lockTimeoutMs: 1200, advisoryLockKey: `friend-activity-clear:${name.toLowerCase()}` });
+}
+
 async function getFriendActivityHistoryForUser(userName, afterId = 0, resolvedFriends = null) {
-  const friendRecords = Array.isArray(resolvedFriends) ? resolvedFriends : await getUserDataPayloadFromDb(userName, 'friends');
+  const name = normalizeFriendActivityName(userName);
+  const friendRecords = Array.isArray(resolvedFriends) ? resolvedFriends : await getUserDataPayloadFromDb(name, 'friends');
   const relationships = extractFriendActivityRelationships(friendRecords);
   const friendNames = relationships.map(friend => friend.name);
   const friendAddedAt = relationships.map(friend => Math.max(0, Math.floor(Number(friend.addedAt) || 0)));
   const safeAfterId = Math.max(0, Math.floor(Number(afterId) || 0));
-  if (!friendNames.length) return { friendNames, items: [], lastReadId: await getFriendActivityReadId(userName), delta: safeAfterId > 0 };
+  const state = await getFriendActivityState(name);
+  if (!friendNames.length) return { friendNames, items: [], lastReadId: state.lastReadId, dismissedThroughId: state.dismissedThroughId, delta: safeAfterId > 0 };
 
   const result = await queryDbWithRetry(
     `WITH friend_since(name, added_at_ms) AS (
@@ -5183,15 +5296,19 @@ async function getFriendActivityHistoryForUser(userName, afterId = 0, resolvedFr
      SELECT fa.id, fa.actor_name, fa.event_type, fa.data, fa.created_at
      FROM friend_activity fa
      JOIN friend_since fs ON fs.name = fa.actor_name
-     WHERE ($3::bigint = 0 OR fa.id > $3::bigint)
+     WHERE ($4::bigint = 0 OR fa.id > $4::bigint)
+       AND fa.id > $5::bigint
+       AND NOT EXISTS (
+         SELECT 1 FROM friend_activity_dismissed fad
+         WHERE fad.user_name = $3 AND fad.activity_id = fa.id
+       )
        AND (fs.added_at_ms <= 0 OR fa.created_at >= to_timestamp(fs.added_at_ms::double precision / 1000.0))
      ORDER BY fa.id DESC
-     LIMIT $4`,
-    [friendNames, friendAddedAt, safeAfterId, SOCIAL_HISTORY_MAX],
+     LIMIT $6`,
+    [friendNames, friendAddedAt, name, safeAfterId, state.dismissedThroughId, SOCIAL_HISTORY_MAX],
     { attempts: 2, label: safeAfterId > 0 ? 'FRIEND ACTIVITY DELTA' : 'FRIEND ACTIVITY READ' }
   );
-  const lastReadId = await getFriendActivityReadId(userName);
-  return { friendNames, items: result.rows.map(serializeFriendActivityRow).filter(Boolean), lastReadId, delta: safeAfterId > 0 };
+  return { friendNames, items: result.rows.map(serializeFriendActivityRow).filter(Boolean), lastReadId: state.lastReadId, dismissedThroughId: state.dismissedThroughId, delta: safeAfterId > 0 };
 }
 
 const USER_NOTIFICATION_TYPES = new Set(['mention', 'reply', 'reaction', 'trophy', 'catalog']);
@@ -6308,6 +6425,7 @@ async function deleteUserAccount(targetName, reason, adminName) {
   );
   await pool.query('DELETE FROM users WHERE name = $1', [targetName]);
   await pool.query('DELETE FROM friend_activity_read_state WHERE user_name = $1', [targetName]);
+  await pool.query('DELETE FROM friend_activity_dismissed WHERE user_name = $1', [targetName]);
   await pool.query('DELETE FROM friend_activity WHERE actor_name = $1', [targetName]);
   await pool.query('DELETE FROM user_notification_read_state WHERE user_name = $1', [targetName]);
   await pool.query('DELETE FROM user_notifications WHERE user_name = $1', [targetName]);
@@ -7216,6 +7334,7 @@ io.on('connection', (socket) => {
         items: result.items,
         friendCount: result.friendNames.length,
         lastReadId: result.lastReadId || 0,
+        dismissedThroughId: result.dismissedThroughId || 0,
         delta: result.delta === true,
       });
     } catch (err) {
@@ -7238,6 +7357,39 @@ io.on('connection', (socket) => {
     } catch (err) {
       console.error('[FRIEND ACTIVITY MARK READ ERROR]:', err && err.message ? err.message : err);
       respond({ ok: false, lastReadId: 0 });
+    }
+  });
+
+  socket.on('friend_activity_dismiss', async (data = {}, ack) => {
+    const respond = payload => { if (typeof ack === 'function' && socket.connected) { try { ack(payload); } catch (err) {} } };
+    const name = socket.userName;
+    if (!name || !userDatabase[name]) { respond({ ok: false, activityId: '', error: 'Profile is not available.' }); return; }
+    try {
+      const result = await dismissFriendActivityForUser(name, data && data.activityId);
+      if (!result.activityId) { respond({ ok: false, activityId: '', error: 'Invalid activity.' }); return; }
+      emitFriendActivityDismissedToLocalUser(name, result.activityId, socket.id);
+      deferServerTask('FRIEND ACTIVITY DISMISS SYNC', () => notifyFriendActivityDismissedAcrossInstances(name, result.activityId), 0);
+      respond({ ok: true, dismissed: result.dismissed === true, activityId: result.activityId });
+    } catch (err) {
+      console.error('[FRIEND ACTIVITY DISMISS ERROR]:', err && err.message ? err.message : err);
+      respond({ ok: false, activityId: '', error: 'Could not dismiss the activity.' });
+    }
+  });
+
+  socket.on('friend_activity_clear', async (data = {}, ack) => {
+    const respond = payload => { if (typeof ack === 'function' && socket.connected) { try { ack(payload); } catch (err) {} } };
+    const name = socket.userName;
+    if (!name || !userDatabase[name]) { respond({ ok: false, throughId: 0, lastReadId: 0, dismissedThroughId: 0, error: 'Profile is not available.' }); return; }
+    try {
+      const throughId = Math.max(0, Math.floor(Number(data && data.throughId) || 0));
+      if (!throughId) { respond({ ok: false, throughId: 0, lastReadId: 0, dismissedThroughId: 0, error: 'Invalid activity range.' }); return; }
+      const result = await clearFriendActivityForUser(name, throughId);
+      emitFriendActivityClearedToLocalUser(name, result.dismissedThroughId, result.lastReadId, socket.id);
+      deferServerTask('FRIEND ACTIVITY CLEAR SYNC', () => notifyFriendActivityClearedAcrossInstances(name, result.dismissedThroughId, result.lastReadId), 0);
+      respond({ ok: true, throughId: result.throughId || throughId, lastReadId: result.lastReadId || throughId, dismissedThroughId: result.dismissedThroughId || throughId });
+    } catch (err) {
+      console.error('[FRIEND ACTIVITY CLEAR ERROR]:', err && err.message ? err.message : err);
+      respond({ ok: false, throughId: 0, lastReadId: 0, dismissedThroughId: 0, error: 'Could not dismiss friend activity.' });
     }
   });
 
