@@ -9962,15 +9962,19 @@ P
 		});
 	};
 
-	window.addEventListener('resize', () => {
-		const picker = document.getElementById('new-psn-country-picker');
-		if (picker && picker.classList.contains('is-open')) positionNewProfileCountryPicker();
-	});
-	if (window.visualViewport) {
-		window.visualViewport.addEventListener('resize', () => {
+	let newProfileCountryPickerResizeFrame = 0;
+	function scheduleNewProfileCountryPickerPosition() {
+		if (newProfileCountryPickerResizeFrame) return;
+		newProfileCountryPickerResizeFrame = requestAnimationFrame(() => {
+			newProfileCountryPickerResizeFrame = 0;
 			const picker = document.getElementById('new-psn-country-picker');
 			if (picker && picker.classList.contains('is-open')) positionNewProfileCountryPicker();
 		});
+	}
+
+	window.addEventListener('resize', scheduleNewProfileCountryPickerPosition, { passive: true });
+	if (window.visualViewport) {
+		window.visualViewport.addEventListener('resize', scheduleNewProfileCountryPickerPosition, { passive: true });
 	}
 
 	window.filterNewProfileCountryPicker = function(query) {
@@ -13666,24 +13670,29 @@ P
 		`;
 	}
 
+	function invalidateExploreVirtualMetrics(container) {
+		if (!container) return;
+		container.__exploreVirtualMetrics = null;
+	}
+
 	function getExploreVirtualMetrics(container) {
+		if (container.__exploreVirtualMetrics) return container.__exploreVirtualMetrics;
+
 		const style = window.getComputedStyle ? getComputedStyle(container) : null;
 		const cssGap = style ? parseFloat(style.columnGap || style.gap || style.gridColumnGap) : 0;
 		const gap = Number.isFinite(cssGap) && cssGap > 0 ? cssGap : EXPLORE_VIRTUAL_DEFAULT_GAP;
-		let cardWidth = parseFloat(container.dataset.exploreVirtualCardWidth || '0');
+		let cardWidth = 0;
 		const sampleCard = container.querySelector('.game-card');
 		if (sampleCard) {
 			const rect = sampleCard.getBoundingClientRect();
-			if (rect && rect.width > 0) {
-				cardWidth = rect.width;
-				container.dataset.exploreVirtualCardWidth = String(cardWidth);
-			}
+			if (rect && rect.width > 0) cardWidth = rect.width;
 		}
 		if (!cardWidth || !Number.isFinite(cardWidth)) {
 			const isMobile = window.matchMedia && window.matchMedia('(max-width: 768px)').matches;
 			cardWidth = isMobile ? EXPLORE_VIRTUAL_MOBILE_CARD_WIDTH : EXPLORE_VIRTUAL_DESKTOP_CARD_WIDTH;
 		}
-		return { cardWidth, gap, step: cardWidth + gap };
+
+		return (container.__exploreVirtualMetrics = { cardWidth, gap, step: cardWidth + gap });
 	}
 
 	function getExploreVirtualSpacerWidth(count, metrics) {
@@ -13963,12 +13972,26 @@ P
 		container.addEventListener('scroll', () => scheduleExploreVirtualRender(container), { passive: true });
 		if (!window.__exploreVirtualResizeAttached) {
 			window.__exploreVirtualResizeAttached = true;
-			window.addEventListener('resize', () => refreshExploreVirtualCarousels(true), { passive: true });
+			window.addEventListener('resize', () => {
+				if (window.__exploreVirtualResizeFrame) cancelAnimationFrame(window.__exploreVirtualResizeFrame);
+				window.__exploreVirtualResizeFrame = requestAnimationFrame(() => {
+					window.__exploreVirtualResizeFrame = 0;
+					if (!exploreVirtualView || exploreVirtualView.style.display === 'none') {
+						forEachExploreVirtualContainer(invalidateExploreVirtualMetrics);
+						return;
+					}
+					forEachExploreVirtualContainer(current => {
+						invalidateExploreVirtualMetrics(current);
+						scheduleExploreVirtualRender(current, true);
+					});
+				});
+			}, { passive: true });
 		}
 	}
 
 	function setExploreVirtualData(container, cat, items, animateCards) {
 		if (!container) return;
+		invalidateExploreVirtualMetrics(container);
 		exploreVirtualContainers.add(container);
 		container.__exploreVirtualData = { cat, items: items || [], animateCards: !!animateCards, initialRevealDone: false, cardCache: new Map() };
 		container.dataset.exploreCat = cat;
@@ -13989,11 +14012,9 @@ P
 		return { top: 0, left: 0, right: window.innerWidth || document.documentElement.clientWidth || 0, bottom: window.innerHeight || document.documentElement.clientHeight || 0 };
 	}
 
-	function isExploreCardVisibleForReveal(card, container, margin = EXPLORE_REVEAL_VIEWPORT_MARGIN) {
-		if (!card || !container || !card.isConnected || !container.isConnected) return false;
+	function isExploreCardVisibleForReveal(card, containerRect, rootRect, margin = EXPLORE_REVEAL_VIEWPORT_MARGIN) {
+		if (!card || !card.isConnected || !containerRect || !rootRect) return false;
 		const cardRect = card.getBoundingClientRect();
-		const containerRect = container.getBoundingClientRect();
-		const rootRect = getExploreRevealRootRect();
 
 		return (
 			cardRect.right > containerRect.left - margin &&
@@ -14072,9 +14093,12 @@ P
 
 	function collectExploreVisibleRevealCards(containers, limit) {
 		const visibleCards = [];
+		const rootRect = getExploreRevealRootRect();
 		containers.forEach(container => {
+			if (!container || !container.isConnected) return;
+			const containerRect = container.getBoundingClientRect();
 			Array.from(container.querySelectorAll('.game-card[data-explore-reveal-pending="1"]')).forEach(card => {
-				if (!isExploreCardVisibleForReveal(card, container)) return;
+				if (!isExploreCardVisibleForReveal(card, containerRect, rootRect)) return;
 				if (visibleCards.length < limit) visibleCards.push(card);
 				else {
 					delete card.dataset.exploreRevealPending;
@@ -31044,6 +31068,7 @@ P
 	
 		scheduleNavigationLightsUpdate({ sidebar: true, profile: true, nav: true });
 		if (typeof window.adminSyncBackgroundTimers === 'function') window.adminSyncBackgroundTimers();
+		if (typeof window.syncRevivedPlayersOnlineUpdates === 'function') window.syncRevivedPlayersOnlineUpdates();
 		if (typeof onShown === 'function') onShown(viewId);
 	};
 
@@ -31059,50 +31084,44 @@ P
         games: document.getElementById('subview-games')
     };
 
+   function applyScrollButtonsVisibility() {
+        if (!scrollArea || !scrollBtnsContainer || !btnTop || !btnBottom) return;
+
+        const isConnected = window._lastConnectionState === true;
+
+        const isBrowse = scrollButtonViews.browse?.style.display === 'block';
+        const isWishlist = scrollButtonViews.wishlist?.style.display === 'block';
+        const isDownloads = scrollButtonViews.downloads?.style.display === 'block';
+
+        const isFavorites = scrollButtonViews.favorites?.style.display === 'flex' || scrollButtonViews.favorites?.style.display === 'block';
+        const isGames = scrollButtonViews.games?.style.display === 'flex' || scrollButtonViews.games?.style.display === 'block';
+        
+        const isLibraryAllowed = isConnected && (isFavorites || isGames);
+        const isAllowedView = isBrowse || isWishlist || isDownloads || isLibraryAllowed;
+
+        if (!isAllowedView) {
+            scrollBtnsContainer.style.display = 'none';
+            return;
+        }
+
+        if (scrollArea.scrollHeight <= scrollArea.clientHeight + 50) {
+            scrollBtnsContainer.style.display = 'none';
+            return;
+        }
+
+        scrollBtnsContainer.style.display = 'flex';
+        btnTop.style.display = scrollArea.scrollTop > 300 ? 'flex' : 'none';
+
+        const distanceToBottom = scrollArea.scrollHeight - scrollArea.scrollTop - scrollArea.clientHeight;
+        btnBottom.style.display = distanceToBottom > 300 ? 'flex' : 'none';
+    }
+
    let scrollButtonsVisibilityFrame = 0;
    window.updateScrollButtonsVisibility = function() {
         if (scrollButtonsVisibilityFrame) return;
         scrollButtonsVisibilityFrame = requestAnimationFrame(() => {
             scrollButtonsVisibilityFrame = 0;
-            if (!scrollArea || !scrollBtnsContainer || !btnTop || !btnBottom) return;
-
-            const isConnected = window._lastConnectionState === true;
-
-            const isBrowse = scrollButtonViews.browse?.style.display === 'block';
-            const isWishlist = scrollButtonViews.wishlist?.style.display === 'block';
-            const isDownloads = scrollButtonViews.downloads?.style.display === 'block';
-
-            const isFavorites = scrollButtonViews.favorites?.style.display === 'flex' || scrollButtonViews.favorites?.style.display === 'block';
-            const isGames = scrollButtonViews.games?.style.display === 'flex' || scrollButtonViews.games?.style.display === 'block';
-            
-            const isLibraryAllowed = isConnected && (isFavorites || isGames);
-
-            const isAllowedView = isBrowse || isWishlist || isDownloads || isLibraryAllowed;
-
-            if (!isAllowedView) {
-                scrollBtnsContainer.style.display = 'none';
-                return;
-            }
-
-            if (scrollArea.scrollHeight <= scrollArea.clientHeight + 50) {
-                scrollBtnsContainer.style.display = 'none';
-                return;
-            }
-
-            scrollBtnsContainer.style.display = 'flex';
-
-            if (scrollArea.scrollTop > 300) {
-                btnTop.style.display = "flex";
-            } else {
-                btnTop.style.display = "none";
-            }
-
-            const distanceToBottom = scrollArea.scrollHeight - scrollArea.scrollTop - scrollArea.clientHeight;
-            if (distanceToBottom > 300) {
-                btnBottom.style.display = "flex";
-            } else {
-                btnBottom.style.display = "none";
-            }
+            applyScrollButtonsVisibility();
         });
     };
 
@@ -31114,7 +31133,11 @@ P
             scrollUiFrame = 0;
             const scrolled = scrollArea.scrollTop > 90;
             browseToolbars.forEach(tb => tb.classList.toggle('scrolled', scrolled));
-            updateScrollButtonsVisibility();
+            if (scrollButtonsVisibilityFrame) {
+                cancelAnimationFrame(scrollButtonsVisibilityFrame);
+                scrollButtonsVisibilityFrame = 0;
+            }
+            applyScrollButtonsVisibility();
             if ((typeof isExploreVirtualViewportObserverActive !== 'function' || !isExploreVirtualViewportObserverActive()) && typeof refreshExploreVirtualCarousels === 'function') {
                 refreshExploreVirtualCarousels(false);
             }
@@ -31185,24 +31208,30 @@ P
         const container = document.getElementById(id);
         if (!container) return;
 
-        const containerStyle = getComputedStyle(container);
-        const gap = parseFloat(containerStyle.columnGap || containerStyle.gap) || 0;
-        const items = Array.from(container.children).filter((item) => {
-            if (item.classList.contains('explore-virtual-spacer')) return false;
-            const style = getComputedStyle(item);
-            return style.display !== 'none' && item.getBoundingClientRect().width > 0;
-        });
-        const referenceItem = items[0] || null;
-        const itemWidth = referenceItem ? referenceItem.getBoundingClientRect().width : 0;
-        const scrollAmount = Math.max(1, itemWidth + gap || container.clientWidth * 0.8);
+        const isExploreVirtual = container.dataset && container.dataset.exploreVirtual === '1' && container.__exploreVirtualData && typeof getExploreVirtualMetrics === 'function';
+        const virtualMetrics = isExploreVirtual ? getExploreVirtualMetrics(container) : null;
+        let scrollAmount = virtualMetrics ? virtualMetrics.step : 0;
+
+        if (!scrollAmount) {
+            const containerStyle = getComputedStyle(container);
+            const gap = parseFloat(containerStyle.columnGap || containerStyle.gap) || 0;
+            const items = Array.from(container.children).filter((item) => {
+                if (item.classList.contains('explore-virtual-spacer')) return false;
+                const style = getComputedStyle(item);
+                return style.display !== 'none' && item.getBoundingClientRect().width > 0;
+            });
+            const referenceItem = items[0] || null;
+            const itemWidth = referenceItem ? referenceItem.getBoundingClientRect().width : 0;
+            scrollAmount = Math.max(1, itemWidth + gap || container.clientWidth * 0.8);
+        }
+
         const currentLeft = Math.max(0, container.scrollLeft || 0);
         const targetLeft = Math.max(0, currentLeft + (scrollAmount * direction));
 
-        if (container.dataset && container.dataset.exploreVirtual === '1' && container.__exploreVirtualData && typeof pinExploreVirtualRange === 'function') {
-            const metrics = getExploreVirtualMetrics(container);
-            const currentStart = Math.floor(Math.min(currentLeft, targetLeft) / Math.max(1, metrics.step));
-            const targetStart = Math.floor(Math.max(currentLeft, targetLeft) / Math.max(1, metrics.step));
-            const baseVisibleCount = getExploreVirtualVisibleCount(container, metrics);
+        if (isExploreVirtual && typeof pinExploreVirtualRange === 'function') {
+            const currentStart = Math.floor(Math.min(currentLeft, targetLeft) / Math.max(1, virtualMetrics.step));
+            const targetStart = Math.floor(Math.max(currentLeft, targetLeft) / Math.max(1, virtualMetrics.step));
+            const baseVisibleCount = getExploreVirtualVisibleCount(container, virtualMetrics);
             pinExploreVirtualRange(container, currentStart, targetStart + baseVisibleCount + EXPLORE_VIRTUAL_BUFFER_CARDS + 2);
         }
 
@@ -33417,35 +33446,52 @@ P
 		}));
 	};
 
-	function scheduleRevivedPlayersOnlineUpdates() {
-		if (window.__revivedPlayersUpdatesScheduled) return;
-		window.__revivedPlayersUpdatesScheduled = true;
+	const REVIVED_PLAYERS_REFRESH_MS = 180000;
 
+	function startRevivedPlayersOnlineUpdates() {
+		if (window.__revivedPlayersOnlineInterval || document.hidden || !isRevivedPlayersOnlineViewActive()) return;
 		window.__revivedPlayersOnlineInterval = setInterval(() => {
-			if (document.hidden || !isRevivedPlayersOnlineViewActive()) return;
 			if (typeof window.updateRevivedPlayersOnline === 'function') window.updateRevivedPlayersOnline(false);
-		}, 180000);
+		}, REVIVED_PLAYERS_REFRESH_MS);
 	}
 
+	function stopRevivedPlayersOnlineUpdates() {
+		if (window.__revivedPlayersOnlineInterval) {
+			clearInterval(window.__revivedPlayersOnlineInterval);
+			window.__revivedPlayersOnlineInterval = null;
+		}
+		if (window.__revivedPlayersImmediateTimer) {
+			clearTimeout(window.__revivedPlayersImmediateTimer);
+			window.__revivedPlayersImmediateTimer = null;
+		}
+	}
+
+	window.syncRevivedPlayersOnlineUpdates = function() {
+		if (!document.hidden && isRevivedPlayersOnlineViewActive()) startRevivedPlayersOnlineUpdates();
+		else stopRevivedPlayersOnlineUpdates();
+	};
+
 	window.maybeStartRevivedPlayersOnlineUpdates = function(forceSkeleton = true) {
-		if (document.hidden || !isRevivedPlayersOnlineViewActive()) return;
-		scheduleRevivedPlayersOnlineUpdates();
+		if (document.hidden || !isRevivedPlayersOnlineViewActive()) {
+			window.syncRevivedPlayersOnlineUpdates();
+			return;
+		}
+		startRevivedPlayersOnlineUpdates();
 
 		if (window.__revivedPlayersImmediateTimer) clearTimeout(window.__revivedPlayersImmediateTimer);
 		const firstRun = !window.__revivedPlayersInitialLoaded;
 		window.__revivedPlayersInitialLoaded = true;
 
 		window.__revivedPlayersImmediateTimer = setTimeout(() => {
+			window.__revivedPlayersImmediateTimer = null;
 			if (document.hidden || !isRevivedPlayersOnlineViewActive()) return;
 			if (typeof window.updateRevivedPlayersOnline === 'function') window.updateRevivedPlayersOnline(forceSkeleton && firstRun);
 		}, firstRun ? 700 : 80);
 	};
 
-	if (document.readyState === 'loading') {
-		document.addEventListener('DOMContentLoaded', scheduleRevivedPlayersOnlineUpdates, { once: true });
-	} else {
-		scheduleRevivedPlayersOnlineUpdates();
-	}
+	document.addEventListener('visibilitychange', () => {
+		if (typeof window.syncRevivedPlayersOnlineUpdates === 'function') window.syncRevivedPlayersOnlineUpdates();
+	}, { passive: true });
 
 	window.isRevivedLoaded = false;
 	
