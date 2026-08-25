@@ -14062,12 +14062,12 @@ P
 		);
 	}
 
-	function resetExploreRevealCard(card, markPending = false, holdHidden = false) {
+	function resetExploreRevealCard(card, markPending = false) {
 		if (!card) return;
 		card.classList.remove('anim-reveal');
 		card.classList.add('no-anim');
 		card.style.animation = '';
-		card.style.opacity = holdHidden ? '0' : '';
+		card.style.opacity = '';
 		card.style.removeProperty('--tile-idx');
 		if (markPending) {
 			delete card.dataset.exploreRevealInteractionLock;
@@ -14088,7 +14088,7 @@ P
 		card.style.removeProperty('--tile-idx');
 	}
 
-	function runExploreRevealBatch(cards) {
+	function runExploreRevealBatch(cards, options = {}) {
 		if (!cards || !cards.length) return;
 
 		const carouselIndexes = new Map();
@@ -14109,7 +14109,7 @@ P
 			card.style.setProperty('--tile-idx', Math.min(index, 10));
 		});
 
-		requestAnimationFrame(() => {
+		const startReveal = () => {
 			cards.forEach(card => {
 				if (!card || !card.isConnected) return;
 				if (card.dataset.exploreRevealInteractionLock === '1' || card.matches(':hover')) {
@@ -14126,7 +14126,15 @@ P
 					}
 				}, { once: true });
 			});
-		});
+		};
+
+		if (options.immediate) {
+			const layoutCard = cards.find(card => card && card.isConnected);
+			if (layoutCard) void layoutCard.offsetWidth;
+			startReveal();
+		} else {
+			requestAnimationFrame(startReveal);
+		}
 	}
 
 	function collectExploreVisibleRevealCards(containers, limit) {
@@ -14152,16 +14160,20 @@ P
 		const exploreView = document.getElementById('view-explore');
 		if (!exploreView || exploreView.style.display === 'none') return;
 		if (window.__exploreBootRevealActive && !options.allowDuringBoot) return;
-		hideExploreBootSkeletons(exploreView);
+
+		const seamlessBootReveal = !!options.allowDuringBoot && !!exploreView.querySelector('.horizontal-scroll.explore-login-skeleton-mode');
 		if (typeof refreshExploreVirtualCarouselsNow === 'function') refreshExploreVirtualCarouselsNow(true);
+		if (!seamlessBootReveal) hideExploreBootSkeletons(exploreView);
 
 		const containers = Array.from(exploreView.querySelectorAll('.horizontal-scroll')).filter(container => container.querySelector('.game-card'));
-		if (!containers.length) return;
+		if (!containers.length) {
+			if (seamlessBootReveal) hideExploreBootSkeletons(exploreView);
+			return;
+		}
 
 		if (window.__exploreRevealReplayTimer) clearTimeout(window.__exploreRevealReplayTimer);
 		if (window.__exploreRevealReplayFrame) cancelAnimationFrame(window.__exploreRevealReplayFrame);
 
-		const holdHiddenUntilReveal = options.holdHiddenUntilReveal === true;
 		const revealContainers = [];
 		containers.forEach(container => {
 			const skipReturnReveal = container.dataset.exploreSkipNextReturnReveal === '1';
@@ -14171,23 +14183,36 @@ P
 				return;
 			}
 			revealContainers.push(container);
-			Array.from(container.querySelectorAll('.game-card')).forEach(card => resetExploreRevealCard(card, true, holdHiddenUntilReveal));
+			Array.from(container.querySelectorAll('.game-card')).forEach(card => resetExploreRevealCard(card, true));
 		});
-		if (!revealContainers.length) return;
+		if (!revealContainers.length) {
+			if (seamlessBootReveal) hideExploreBootSkeletons(exploreView);
+			return;
+		}
+
+		if (seamlessBootReveal) {
+			revealContainers.forEach(container => {
+				Array.from(container.querySelectorAll('.game-card[data-explore-reveal-pending="1"]')).forEach(card => {
+					card.style.animation = 'none';
+					card.style.opacity = '0';
+				});
+			});
+			hideExploreBootSkeletons(exploreView);
+		}
 
 		let attempts = 0;
-		const revealAfterLayout = () => {
+		const revealAfterLayout = (immediate = false) => {
 			window.__exploreRevealReplayFrame = 0;
 			if (!exploreView.isConnected || exploreView.style.display === 'none') return;
 
 			const firstVisibleCards = collectExploreVisibleRevealCards(revealContainers, EXPLORE_VISIBLE_REVEAL_LIMIT);
 			if (!firstVisibleCards.length && attempts < 4) {
 				attempts++;
-				window.__exploreRevealReplayFrame = requestAnimationFrame(revealAfterLayout);
+				window.__exploreRevealReplayFrame = requestAnimationFrame(() => revealAfterLayout(false));
 				return;
 			}
 
-			runExploreRevealBatch(firstVisibleCards);
+			runExploreRevealBatch(firstVisibleCards, { immediate });
 			revealContainers.forEach(container => {
 				Array.from(container.querySelectorAll('.game-card[data-explore-reveal-pending="1"]')).forEach(card => resetExploreRevealCard(card, false));
 			});
@@ -14198,17 +14223,22 @@ P
 			}, 1800);
 		};
 
+		if (seamlessBootReveal) {
+			revealAfterLayout(true);
+			return;
+		}
+
 		// Two frames guarantee that display/class changes and translated navigation layout
-		// are committed before card visibility is measured.
+		// are committed before card visibility is measured during normal view re-entry.
 		window.__exploreRevealReplayFrame = requestAnimationFrame(() => {
-			window.__exploreRevealReplayFrame = requestAnimationFrame(revealAfterLayout);
+			window.__exploreRevealReplayFrame = requestAnimationFrame(() => revealAfterLayout(false));
 		});
 	}
-
 
 	const SITE_DISCLAIMER_SESSION_PREFIX = 'psn_site_disclaimer_seen_session_v5_2_';
 	const SITE_DISCLAIMER_DAILY_PREFIX = 'psn_site_disclaimer_skip_today_v1_';
 	const SITE_DISCLAIMER_HOME_DELAY_MS = 500;
+
 	function setSiteDisclaimerPadPending(active) {
 		try {
 			if (document.body) document.body.classList.toggle('ps3-pad-disclaimer-pending', !!active);
@@ -14666,7 +14696,7 @@ P
 						if (typeof resetTimer === 'function') resetTimer();
 	
 						if (typeof replayExploreCardsReveal === 'function') {
-							replayExploreCardsReveal({ allowDuringBoot: true, holdHiddenUntilReveal: true });
+							replayExploreCardsReveal({ allowDuringBoot: true });
 						}
 						
 
@@ -17674,8 +17704,9 @@ P
 				if (typeof setupSkeletonAnimations === 'function') setupSkeletonAnimations(containerId);
 			}
 		} else {
+			const replacingTrendingSkeletons = !!container.querySelector('.skeleton-card, .pulse-skeleton');
 			container.innerHTML = html;
-			if (typeof setupRevealAnimations === 'function') setupRevealAnimations(containerId);
+			if (typeof setupRevealAnimations === 'function') setupRevealAnimations(containerId, { immediate: replacingTrendingSkeletons });
 		}
 	};
     
@@ -22124,6 +22155,7 @@ P
 	
 	window.renderGrid = function(isAppending = false, options = {}) {
 		const grid = document.getElementById('database-grid');
+		const replacingBrowseSkeletons = !isAppending && !!(grid && grid.querySelector('.skeleton-card'));
 		const requestedScrollTop = !isAppending && Number.isFinite(Number(options.restoreScrollTop))
 			? Math.max(0, Number(options.restoreScrollTop) || 0)
 			: null;
@@ -22558,7 +22590,10 @@ P
 				animateBrowseMotionLayout(grid, browseMotionSnapshot);
 			}
 			if (typeof setupRevealAnimations === 'function') {
-				setupRevealAnimations('database-grid', { selector: browseMotionSnapshot ? '.game-card[data-browse-filter-new="1"]' : '.game-card' });
+				setupRevealAnimations('database-grid', {
+					selector: browseMotionSnapshot ? '.game-card[data-browse-filter-new="1"]' : '.game-card',
+					immediate: replacingBrowseSkeletons
+				});
 			}
 			grid.querySelectorAll(':scope > .game-card[data-browse-filter-new="1"]').forEach(card => delete card.dataset.browseFilterNew);
 		}
@@ -22700,7 +22735,7 @@ P
             el.style.setProperty('--tile-idx', Math.min(index, 12));
         });
 
-        requestAnimationFrame(() => requestAnimationFrame(() => {
+        const startReveal = () => {
             visibleTargets.forEach(el => {
                 if (!el || !el.isConnected) return;
                 el.style.animation = '';
@@ -22715,7 +22750,15 @@ P
                 };
                 el.addEventListener('animationend', onRevealEnd);
             });
-        }));
+        };
+
+        if (options.immediate === true) {
+            const layoutTarget = visibleTargets.find(el => el && el.isConnected);
+            if (layoutTarget) void layoutTarget.offsetWidth;
+            startReveal();
+        } else {
+            requestAnimationFrame(() => requestAnimationFrame(startReveal));
+        }
     };
     
     document.addEventListener('DOMContentLoaded', () => {
@@ -34026,10 +34069,11 @@ P
 			</div>`;
 		});
 	
+		const replacingRevivedSkeletons = !!container.querySelector('.skeleton-card');
 		container.innerHTML = html;
 	
 		if (!isSilent && typeof setupRevealAnimations === 'function') {
-			setupRevealAnimations(containerId);
+			setupRevealAnimations(containerId, { immediate: replacingRevivedSkeletons });
 		}
 	
 		processedItems
@@ -35755,15 +35799,6 @@ P
 				updateConsoleLibraryStatusUI(lastScannedGames);
 			}
 
-			if (!hadCachedLocalGames && !window.isRestoringHistory && typeof setupRevealAnimations === 'function') {
-				requestAnimationFrame(() => requestAnimationFrame(() => {
-					const libraryView = document.getElementById('view-library');
-					const gamesSubview = document.getElementById('subview-games');
-					const libraryVisible = !!libraryView && window.getComputedStyle(libraryView).display !== 'none';
-					const gamesVisible = !!gamesSubview && window.getComputedStyle(gamesSubview).display !== 'none';
-					if (libraryVisible && gamesVisible && grid.querySelector('.game-card')) setupRevealAnimations('ps3-local-grid');
-				}));
-			}
 			
 			if (typeof window.broadcastProfileUpdate === 'function') {
 				setTimeout(() => window.broadcastProfileUpdate(), 900);
@@ -36190,6 +36225,7 @@ function formatLibraryLastPlayedBadge(game = {}) {
 		if (isSilent && typeof window.captureGridCoverCache === 'function') window.captureGridCoverCache(grid);
 		
 		const renderSignature = getLocalLibraryRenderSignature(games || []);
+		const replacingLibrarySkeletons = !appendProgressive && !!grid.querySelector('.skeleton-card');
 		const libraryPreviouslyRendered = Number(grid.dataset.progressiveGridRendered || 0);
 		const hasRenderedCards = !!grid.querySelector('.game-card');
 		const sameSignature = grid.dataset.localLibraryRenderSignature === renderSignature;
@@ -36401,8 +36437,9 @@ function formatLibraryLastPlayedBadge(game = {}) {
 		}
 		grid.dataset.progressiveGridRendered = String(libraryRenderEnd);
 	
-		if (!isSilent) {
-			setupRevealAnimations('ps3-local-grid');
+		if (!isSilent || replacingLibrarySkeletons) {
+			if (replacingLibrarySkeletons) window.__pendingMyGamesScanReveal = false;
+			setupRevealAnimations('ps3-local-grid', { immediate: replacingLibrarySkeletons });
 		}
 		setupProgressiveGridObserver('my-games', grid, libraryRenderEnd, games.length, () => renderLocalLibrary(games, isFiltering, true, 'append'));
 	}
