@@ -16832,6 +16832,69 @@ P
         return count === 1 ? 'Region' : 'Regions';
     }
 
+    function resetBrowseContextToCategoryRoot() {
+        if (typeof isBrowseContextualNavigationActive === 'function' && !isBrowseContextualNavigationActive()) return false;
+
+        let rootHistory = null;
+        let historyCursor = navHistory;
+        while (historyCursor && historyCursor.lockSearch === true) {
+            rootHistory = historyCursor;
+            historyCursor = historyCursor.parentHistory || null;
+        }
+
+        if (rootHistory) {
+            const catSelect = document.getElementById('cat-select');
+            const regionSelect = document.getElementById('region-select');
+            const missingRapToggle = document.getElementById('show-missing-rap-toggle');
+            const rootCategory = rootHistory.category || (catSelect ? catSelect.value : 'games');
+
+            if (catSelect) catSelect.value = rootCategory;
+            if (regionSelect) regionSelect.value = rootHistory.region || 'ALL';
+            if (missingRapToggle) missingRapToggle.checked = !!rootHistory.showMissingRap;
+            if (typeof activeLetter !== 'undefined') activeLetter = rootHistory.letter || 'ALL';
+
+            if (Array.isArray(rootHistory.consoles)) {
+                document.querySelectorAll('#console-filters input').forEach(cb => {
+                    cb.checked = rootHistory.consoles.includes(cb.value);
+                });
+            }
+
+            if (Array.isArray(rootHistory.appsFilters)) {
+                document.querySelectorAll('#app-filters input').forEach(cb => {
+                    cb.checked = rootHistory.appsFilters.includes(cb.value);
+                });
+            }
+
+            if (typeof renderLimit !== 'undefined' && Number.isFinite(Number(rootHistory.limit))) {
+                renderLimit = Math.max(1, Number(rootHistory.limit));
+            }
+
+            navHistory = rootHistory.parentHistory || null;
+
+            const cachedRootData = (window.psnStoreRenderCache && window.psnStoreRenderCache[rootCategory])
+                || (window.psnStoreCache && window.psnStoreCache[rootCategory]);
+            currentData = Array.isArray(cachedRootData) ? cachedRootData : [];
+        }
+
+        clearBrowseExpandedGroupTitle();
+        if (typeof window.cancelBrowseContextTransition === 'function') window.cancelBrowseContextTransition();
+        window.__browseAlphabetAvailability = null;
+        window.__browseMissingRapSearchCandidateCount = 0;
+        window.__browseCanFilterMissingRap = false;
+
+        if (typeof syncBrowseContextualSearchState === 'function') syncBrowseContextualSearchState();
+        const currentCategory = document.getElementById('cat-select')?.value || 'games';
+        if (typeof updateBrowseTypeFilterVisibility === 'function') updateBrowseTypeFilterVisibility(currentCategory);
+        if (typeof syncBrowseRegionSelectState === 'function') syncBrowseRegionSelectState(currentCategory);
+        if (typeof updateGroupTitleFilterVisibility === 'function') {
+            updateGroupTitleFilterVisibility(currentCategory, document.getElementById('region-select')?.value || 'ALL');
+        }
+        if (typeof renderLetterFilter === 'function') renderLetterFilter();
+
+        window.__browseNeedsCategoryRootRender = true;
+        return true;
+    }
+
     function resetBrowseToGamesMainScreen(options = {}) {
         navHistory = null;
         clearBrowseExpandedGroupTitle();
@@ -31581,6 +31644,7 @@ P
 		if (currentViewId === 'view-library' && viewId !== 'view-library' && typeof hideConsoleSensitiveValues === 'function') hideConsoleSensitiveValues();
 		const movingWithinBrowseContext = !!(currentViewId && browseContextViews.has(currentViewId) && browseContextViews.has(viewId));
 		const leavingBrowseContext = !!(currentViewId && browseContextViews.has(currentViewId) && !browseContextViews.has(viewId));
+		const leavingBrowseForStoreSibling = currentViewId === 'view-browse' && viewId !== 'view-browse' && browseContextViews.has(viewId);
 		if (!forceReset && currentView && currentView.id === viewId) {
 			window.__lastSwitchViewWasNoop = viewId;
 			return;
@@ -31600,6 +31664,9 @@ P
 		}
 
 		if (currentView) currentView.classList.remove('anim-out');
+		if (leavingBrowseForStoreSibling && !window.isRestoringHistory && typeof resetBrowseContextToCategoryRoot === 'function') {
+			resetBrowseContextToCategoryRoot();
+		}
 		if (currentViewId && currentViewId !== viewId && !window.isRestoringHistory && typeof window.resetStoreSearchForNavigation === 'function') {
 			window.resetStoreSearchForNavigation(currentViewId);
 		}
@@ -31886,6 +31953,15 @@ P
 	
 			if (!preventAutoLoad && viewId === 'view-browse') {
 				const openBrowse = () => {
+					if (window.__browseNeedsCategoryRootRender) {
+						window.__browseNeedsCategoryRootRender = false;
+						if (typeof currentData !== 'undefined' && currentData.length === 0) {
+							if (typeof fetchDatabase === 'function') fetchDatabase();
+						} else if (typeof applyFilters === 'function') {
+							applyFilters();
+						}
+						return;
+					}
 					if (forceReset) {
 						navHistory = null;
 						if (typeof resetAllFilters === 'function') resetAllFilters();
