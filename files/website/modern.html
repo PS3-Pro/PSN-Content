@@ -5050,7 +5050,8 @@ a:focus, button:focus, select:focus, input:focus, textarea:focus, [contenteditab
 /* ========================================================================== GLOBAL APP-LIKE SELECTION / CALLOUT / DRAG / ZOOM GUARDS ========================================================================== */
 html, body { touch-action: pan-x pan-y; }
 body, body * { -webkit-user-select: none !important; user-select: none !important; -webkit-touch-callout: none !important; }
-input, textarea, [contenteditable="true"], [contenteditable="true"] *, .psn-text-selectable, .psn-text-selectable * { -webkit-user-select: text !important; user-select: text !important; -webkit-touch-callout: default !important; }
+input, textarea, [contenteditable="true"], [contenteditable="true"] *, .psn-text-selectable, .psn-text-selectable *, [id^="msg-text-"], [id^="msg-text-"] * { -webkit-user-select: text !important; user-select: text !important; -webkit-touch-callout: default !important; }
+[id^="msg-text-"] .chat-translated-tag, [id^="msg-text-"] .chat-edited-tag, [id^="msg-text-"] .chat-translated-tag *, [id^="msg-text-"] .chat-edited-tag * { -webkit-user-select: none !important; user-select: none !important; -webkit-touch-callout: none !important; }
 img { -webkit-user-drag: none !important; user-drag: none !important; }
 @media (prefers-reduced-motion: reduce) {
 .profile-ps-list-symbol { animation: none !important; opacity: 1 !important; transform: none !important; }
@@ -9077,10 +9078,17 @@ P
 	window.safeLocalStorageSet = safeLocalStorageSet;
 
 	/* ========================================================================== GLOBAL POINTER / BROWSER INTERACTION GUARDS ========================================================================== */
-	const PSN_TEXT_SELECTION_ALLOWED_SELECTOR = 'input, textarea, [contenteditable="true"], .psn-text-selectable';
+	const PSN_TEXT_SELECTION_ALLOWED_SELECTOR = 'input, textarea, [contenteditable="true"], .psn-text-selectable, [id^="msg-text-"]';
+
+	function getPsnInteractionElement(target) {
+		if (!target) return null;
+		if (target.nodeType === 1) return target;
+		return target.parentElement || null;
+	}
 
 	function isPsnEditableTextTarget(target) {
-		return !!(target && target.closest && target.closest(PSN_TEXT_SELECTION_ALLOWED_SELECTOR));
+		const element = getPsnInteractionElement(target);
+		return !!(element && element.closest && element.closest(PSN_TEXT_SELECTION_ALLOWED_SELECTOR));
 	}
 
 	function blockSecondaryMouseInteraction(event) {
@@ -9471,6 +9479,7 @@ P
 	}
 
 	function markPrimaryPressed(target) {
+		if (isPsnEditableTextTarget(target)) return;
 		const pressed = target && target.closest ? target.closest(PSN_PRESS_TARGET_SELECTOR) : null;
 		if (!pressed || pressed.matches(':disabled,[aria-disabled="true"]')) return;
 		clearPrimaryPressed();
@@ -27223,7 +27232,7 @@ P
         }, true);
 
         document.addEventListener('pointerdown', event => {
-            if (!list.contains(event.target)) closeDownloadSwipeRows();
+            if (!list.contains(event.target) && list.classList.contains('has-open-swipe')) closeDownloadSwipeRows();
         }, true);
     }
 
@@ -46718,7 +46727,10 @@ function getVisibleChatStackEl(id) {
 	function rememberChatInputRange(range, input) {
 		if (!range || !input || !isChatRangeInsideInput(range, input)) return false;
 		chatInputSavedRange = range.cloneRange();
-		chatInputSavedSelectionOffsets = getChatRangeTextOffsets(input, range);
+		// A collapsed caret already survives focus changes through the cloned Range.
+		// Text offsets are only needed for a real selection, avoiding a full editor
+		// text walk on every mouse click / arrow-key caret move.
+		chatInputSavedSelectionOffsets = range.collapsed ? null : getChatRangeTextOffsets(input, range);
 		return true;
 	}
 
@@ -56268,11 +56280,14 @@ function getVisibleChatStackEl(id) {
 				updateToolbarStates();
 			};
 			chatInput.addEventListener('keyup', saveChatRangeAndToolbarState);
-			chatInput.addEventListener('mouseup', saveChatRangeAndToolbarState);
-			chatInput.addEventListener('click', saveChatRangeAndToolbarState);
 			document.addEventListener('selectionchange', () => {
 				const selection = window.getSelection();
-				if (selection && selection.rangeCount && isChatRangeInsideInput(selection.getRangeAt(0), chatInput)) saveChatInputRange();
+				if (!selection || !selection.rangeCount) return;
+				const range = selection.getRangeAt(0);
+				if (!isChatRangeInsideInput(range, chatInput)) return;
+				// Do not do toolbar work from the mouse path. The browser can place/paint
+				// the caret immediately; selection state is cached only for later toolbar use.
+				rememberChatInputRange(range, chatInput);
 			});
 		
 			chatInput.addEventListener('input', (e) => {
@@ -60644,7 +60659,7 @@ function getVisibleChatStackEl(id) {
             event.stopPropagation();
             window.openUserNotification(notificationId);
         });
-        document.addEventListener('pointerdown', function(event) { if (!list.contains(event.target)) closeNotificationSwipeRows(); }, true);
+        document.addEventListener('pointerdown', function(event) { if (!list.contains(event.target) && list.classList.contains('has-open-swipe')) closeNotificationSwipeRows(); }, true);
     }
 
 
@@ -61047,7 +61062,7 @@ function getVisibleChatStackEl(id) {
 				event.preventDefault(); event.stopPropagation(); closeFriendActivitySwipeRow(row, true);
 			}
 		}, true);
-		document.addEventListener('pointerdown', function(event) { if (!list.contains(event.target)) closeFriendActivitySwipeRows(); }, true);
+		document.addEventListener('pointerdown', function(event) { if (!list.contains(event.target) && list.classList.contains('has-open-swipe')) closeFriendActivitySwipeRows(); }, true);
 	}
 
 	window.bootstrapNotificationCenterRealtime = function(options = {}) {
@@ -63626,7 +63641,7 @@ function getVisibleChatStackEl(id) {
 	}
 	
 	document.addEventListener('mousedown', function(e) {
-		if (e.button !== 0) return;
+		if (e.button !== 0 || isPsnEditableTextTarget(e.target)) return;
 		const pulse = document.createElement("div");
 		pulse.classList.add("global-click-pulse");
 		
