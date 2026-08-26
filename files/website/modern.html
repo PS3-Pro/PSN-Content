@@ -400,6 +400,8 @@ select option { background-color: var(--bg-dark); }
 .letter-btn { background: rgba(0,0,0,0.4); border: 1px solid rgba(255,255,255,0.1); color: var(--text-muted); padding: 6px 12px; border-radius: 6px; font-size: 12px; font-weight: bold; cursor: pointer; transition: 0.2s; white-space: nowrap; }
 .letter-btn:hover { background: rgba(255,255,255,0.1); color: #fff; }
 .letter-btn.active { background: var(--ps-blue); border-color: var(--ps-blue); color: #fff; box-shadow: 0 0 10px var(--ps-neon); }
+.letter-btn.is-unavailable { opacity: .28; color: rgba(139,150,168,.55); background: rgba(0,0,0,.22); border-color: rgba(255,255,255,.055); box-shadow: none !important; filter: grayscale(1); pointer-events: none; cursor: default !important; transform: none !important; }
+.letter-btn.is-unavailable:hover { color: rgba(139,150,168,.55); background: rgba(0,0,0,.22); }
 .search-bar { display: none; background-color: rgba(18,24,36,0.7); border-radius: 20px; padding: 8px 15px; align-items: center; gap: 10px; width: 200px; border: 1px solid rgba(255,255,255,0.1); transition: all 0.3s ease; position: relative; z-index: 1; }
 .search-bar.browse-context-locked { display: none !important; }
 .search-bar:hover { border: 1px solid #ffffff !important; box-shadow: 0 0 10px rgba(255,255,255,0.2); }
@@ -18842,6 +18844,28 @@ P
 		}
 	};
 
+	const ENABLE_LETTER_GRAY_OUT = true; // true = gray/disable empty letters; false = keep all letters enabled
+
+	window.PSN_ALPHABET_FILTERS = window.PSN_ALPHABET_FILTERS || ['ALL', '#', '0-9', 'A','B','C','D','E','F','G','H','I','J','K','L','M','N','O','P','Q','R','S','T','U','V','W','X','Y','Z'];
+
+	window.getPsnAlphabetBucket = function(value) {
+		const firstChar = String(value || '').trim().charAt(0).toUpperCase();
+		if (!firstChar) return '';
+		if (/[A-Z]/.test(firstChar)) return firstChar;
+		if (/[0-9]/.test(firstChar)) return '0-9';
+		return '#';
+	};
+
+	window.getPsnAlphabetAvailability = function(items, nameGetter) {
+		const available = new Set();
+		(items || []).forEach(item => {
+			const value = typeof nameGetter === 'function' ? nameGetter(item) : item;
+			const bucket = window.getPsnAlphabetBucket(value);
+			if (bucket) available.add(bucket);
+		});
+		return available;
+	};
+
     function renderLetterFilter() {
         const container = document.getElementById('letter-filter');
         if (!container) return;
@@ -18851,17 +18875,20 @@ P
 
         container.classList.toggle('is-locked', locked);
 
-        const letters = ['ALL', '#', '0-9', 'A','B','C','D','E','F','G','H','I','J','K','L','M','N','O','P','Q','R','S','T','U','V','W','X','Y','Z'];
+        const letters = window.PSN_ALPHABET_FILTERS;
+		const availableLetters = window.__browseAlphabetAvailability instanceof Set ? window.__browseAlphabetAvailability : null;
         let html = '';
         letters.forEach(char => {
             const isCurrent = activeLetter === char;
             const isActive = isCurrent ? 'active' : '';
-            const isDisabled = locked && char !== 'ALL';
+			const isUnavailable = ENABLE_LETTER_GRAY_OUT && char !== 'ALL' && !!availableLetters && !availableLetters.has(char);
+            const isDisabled = (locked && char !== 'ALL') || isUnavailable;
             const disabledAttr = isDisabled ? ' disabled aria-disabled="true"' : '';
-            const canInteract = !locked && !isCurrent;
+            const canInteract = !isDisabled && !isCurrent;
             const enterAction = canInteract ? 'playUiArrow()' : '';
             const clickAction = canInteract ? `playUiLetterFilter(); setLetterFilter('${char}')` : '';
-			html += `<button class="letter-btn ${isActive}" data-no-translate="true" translate="no" style="backdrop-filter: blur(5px); -webkit-backdrop-filter: blur(5px);"${disabledAttr} onmouseenter="${enterAction}" onclick="${clickAction}">${char}</button>`;
+			const unavailableClass = isUnavailable ? ' is-unavailable' : '';
+			html += `<button class="letter-btn ${isActive}${unavailableClass}" data-no-translate="true" translate="no" style="backdrop-filter: blur(5px); -webkit-backdrop-filter: blur(5px);"${disabledAttr} onmouseenter="${enterAction}" onclick="${clickAction}">${char}</button>`;
         });
         container.innerHTML = html;
     }
@@ -21695,6 +21722,7 @@ P
 	
 		try {
 			currentData = await loadStoreCategoryData(cat, 'high');
+			window.__browseAlphabetAvailability = null;
 			
 			if(!window.isRestoringHistory && !navHistory && !document.getElementById('search-input').value) {
 				activeLetter = "ALL";
@@ -21830,7 +21858,7 @@ P
 				const nameMatch = searchKeys.nameNormalized.includes(termNormalized);
 				if (!(nameMatch || idMatch)) return false;
 			}
-		} else if (typeof activeLetter !== 'undefined' && activeLetter !== 'ALL') {
+		} else if (!context.ignoreLetter && typeof activeLetter !== 'undefined' && activeLetter !== 'ALL') {
 			const firstChar = cleanName.charAt(0).toUpperCase();
 			if (activeLetter === '#') { if (/[A-Z0-9]/.test(firstChar)) return false; }
 			else if (activeLetter === '0-9') { if (!/[0-9]/.test(firstChar)) return false; }
@@ -22773,6 +22801,21 @@ P
 		window.__browseSearchIncludesMissingRap = searchIncludesMissingRap;
 		window.__browseHiddenMissingRapCount = 0;
 		window.__browseAvailableMissingRapCount = 0;
+
+		const browseLetterContext = {
+			...browseFilterContext,
+			term: '',
+			termNormalized: '',
+			normalizedTermId: '',
+			isExactTitleIdSearch: false,
+			ignoreLetter: true
+		};
+		const browseLetterItems = (Array.isArray(currentData) ? currentData : []).filter(game =>
+			browseItemPassesFiltersBeforeMissingRap(game, browseLetterContext)
+		);
+		window.__browseAlphabetAvailability = window.getPsnAlphabetAvailability(browseLetterItems, game => game.cleanName);
+		if (ENABLE_LETTER_GRAY_OUT && !searchHasText && activeLetter !== 'ALL' && !window.__browseAlphabetAvailability.has(activeLetter)) activeLetter = 'ALL';
+		renderLetterFilter();
 
 		const browseFilterSource = searchCandidates || currentData;
 		filteredData = browseFilterSource.filter(game => {
@@ -33527,7 +33570,19 @@ P
 			return Object.assign({}, resolvedItem, { __wishlistDotKey: sourceDotKey || getWishlistDotKey(resolvedItem) });
 		});
 
-		const filteredWishlist = wishlistRenderItems.filter(game => {
+		const wishlistLetterItems = wishlistRenderItems.filter(game => {
+			if (catFilter !== "ALL") {
+				const itemCategory = (typeof window.getWishlistItemCategoryKey === 'function') ? window.getWishlistItemCategoryKey(game) : (game.category || 'games');
+				if (itemCategory !== catFilter) return false;
+			}
+			if (regionFilter !== "ALL" && game.region !== regionFilter) return false;
+			if (!activeConsoles.includes(game.cTag)) return false;
+			return true;
+		});
+		window.__wishlistAlphabetAvailability = window.getPsnAlphabetAvailability(wishlistLetterItems, game => game.cleanName);
+		if (ENABLE_LETTER_GRAY_OUT && !term && activeWishLetter !== 'ALL' && !window.__wishlistAlphabetAvailability.has(activeWishLetter)) activeWishLetter = 'ALL';
+
+		const filteredWishlist = wishlistLetterItems.filter(game => {
 			if (!term && typeof activeWishLetter !== 'undefined' && activeWishLetter !== "ALL") {
 				const firstChar = game.cleanName.charAt(0).toUpperCase();
 				if (activeWishLetter === '#') { if (/[A-Z0-9]/.test(firstChar)) return false; }
@@ -33539,12 +33594,6 @@ P
 				const idMatch = game.id.toLowerCase().includes(term);
 				if (!nameMatch && !idMatch) return false;
 			}
-			if (catFilter !== "ALL") {
-				const itemCategory = (typeof window.getWishlistItemCategoryKey === 'function') ? window.getWishlistItemCategoryKey(game) : (game.category || 'games');
-				if (itemCategory !== catFilter) return false;
-			}
-			if (regionFilter !== "ALL" && game.region !== regionFilter) return false;
-			if (!activeConsoles.includes(game.cTag)) return false;
 	
 			return true;
 		});
@@ -33753,11 +33802,18 @@ P
 		const container = document.getElementById('wish-letter-filter');
 		if (!container) return;
 		
-		const letters = ['ALL', '#', '0-9', 'A','B','C','D','E','F','G','H','I','J','K','L','M','N','O','P','Q','R','S','T','U','V','W','X','Y','Z'];
+		const letters = window.PSN_ALPHABET_FILTERS;
+		const availableLetters = window.__wishlistAlphabetAvailability instanceof Set ? window.__wishlistAlphabetAvailability : null;
 		let html = '';
 		letters.forEach(char => {
-			const isActive = activeWishLetter === char ? 'active' : '';
-			html += `<button class="letter-btn ${isActive}" data-no-translate="true" translate="no" onmouseenter="if('${char}' !== activeWishLetter) playUiArrow()" onclick="playUiLetterFilter(); setWishLetterFilter('${char}')">${char}</button>`;
+			const isCurrent = activeWishLetter === char;
+			const isActive = isCurrent ? 'active' : '';
+			const isUnavailable = ENABLE_LETTER_GRAY_OUT && char !== 'ALL' && !!availableLetters && !availableLetters.has(char);
+			const disabledAttr = isUnavailable ? ' disabled aria-disabled="true"' : '';
+			const unavailableClass = isUnavailable ? ' is-unavailable' : '';
+			const enterAction = !isCurrent && !isUnavailable ? 'playUiArrow()' : '';
+			const clickAction = !isCurrent && !isUnavailable ? `playUiLetterFilter(); setWishLetterFilter('${char}')` : '';
+			html += `<button class="letter-btn ${isActive}${unavailableClass}" data-no-translate="true" translate="no"${disabledAttr} onmouseenter="${enterAction}" onclick="${clickAction}">${char}</button>`;
 		});
 		container.innerHTML = html;
 	}
@@ -37620,7 +37676,7 @@ function formatLibraryLastPlayedBadge(game = {}) {
 	
 	let activeLibraryLetter = "ALL";
 	let activeFavoriteLibraryLetter = "ALL";
-	const LIBRARY_ALPHABET_FILTERS = ['ALL', '#', '0-9', 'A','B','C','D','E','F','G','H','I','J','K','L','M','N','O','P','Q','R','S','T','U','V','W','X','Y','Z'];
+	const LIBRARY_ALPHABET_FILTERS = window.PSN_ALPHABET_FILTERS;
 
 	function matchesLibraryAlphabetFilter(title, letter) {
 		if (!letter || letter === 'ALL') return true;
@@ -37630,22 +37686,55 @@ function formatLibraryLastPlayedBadge(game = {}) {
 		return firstChar === letter;
 	}
 
-	function renderLibraryAlphabetFilter(containerId, activeLetter, setterName) {
+	function getLibraryAlphabetSource(scope = 'library') {
+		const isFavorites = scope === 'favorites';
+		let source = Array.isArray(lastScannedGames) ? lastScannedGames : [];
+		if (isFavorites) {
+			const installedPaths = new Set(source.map(game => game && game.path).filter(Boolean));
+			source = (Array.isArray(favoritesLibrary) ? favoritesLibrary : []).filter(game => installedPaths.has(game.path));
+		}
+
+		const prefix = isFavorites ? 'fav' : 'library';
+		const activeConsoles = Array.from(document.querySelectorAll(`#${prefix}-console-filters input:checked`)).map(cb => cb.value);
+		const typeFilter = document.getElementById(`${prefix}-type-select`)?.value || 'ALL';
+		const regionFilter = document.getElementById(`${prefix}-region-select`)?.value || 'ALL';
+
+		return source.filter(game => {
+			const meta = getLibraryFilterMetadata(game);
+			if (!activeConsoles.includes(meta.console)) return false;
+			if (typeFilter !== 'ALL' && meta.category !== typeFilter) return false;
+			if (regionFilter !== 'ALL' && meta.region !== regionFilter) return false;
+			return true;
+		});
+	}
+
+	function renderLibraryAlphabetFilter(containerId, activeLetter, setterName, availableLetters) {
 		const container = document.getElementById(containerId);
 		if (!container) return;
 		container.innerHTML = LIBRARY_ALPHABET_FILTERS.map(char => {
-			const activeClass = activeLetter === char ? 'active' : '';
-			const hoverAction = activeLetter === char ? '' : 'playUiArrow()';
-			return `<button class="letter-btn ${activeClass}" data-no-translate="true" translate="no" onmouseenter="${hoverAction}" onclick="playUiLetterFilter(); ${setterName}('${char}')">${char}</button>`;
+			const isCurrent = activeLetter === char;
+			const activeClass = isCurrent ? 'active' : '';
+			const isUnavailable = ENABLE_LETTER_GRAY_OUT && char !== 'ALL' && availableLetters instanceof Set && !availableLetters.has(char);
+			const unavailableClass = isUnavailable ? ' is-unavailable' : '';
+			const disabledAttr = isUnavailable ? ' disabled aria-disabled="true"' : '';
+			const hoverAction = !isCurrent && !isUnavailable ? 'playUiArrow()' : '';
+			const clickAction = !isCurrent && !isUnavailable ? `playUiLetterFilter(); ${setterName}('${char}')` : '';
+			return `<button class="letter-btn ${activeClass}${unavailableClass}" data-no-translate="true" translate="no"${disabledAttr} onmouseenter="${hoverAction}" onclick="${clickAction}">${char}</button>`;
 		}).join('');
 	}
 
 	function renderLocalLibraryLetterFilter() {
-		renderLibraryAlphabetFilter('library-letter-filter', activeLibraryLetter, 'setLibraryLetterFilter');
+		window.__libraryAlphabetAvailability = window.getPsnAlphabetAvailability(getLibraryAlphabetSource('library'), game => game.title);
+		const term = document.getElementById('search-input')?.value.trim() || '';
+		if (ENABLE_LETTER_GRAY_OUT && !term && activeLibraryLetter !== 'ALL' && !window.__libraryAlphabetAvailability.has(activeLibraryLetter)) activeLibraryLetter = 'ALL';
+		renderLibraryAlphabetFilter('library-letter-filter', activeLibraryLetter, 'setLibraryLetterFilter', window.__libraryAlphabetAvailability);
 	}
 
 	function renderFavoriteLibraryLetterFilter() {
-		renderLibraryAlphabetFilter('fav-letter-filter', activeFavoriteLibraryLetter, 'setFavoriteLibraryLetterFilter');
+		window.__favoriteLibraryAlphabetAvailability = window.getPsnAlphabetAvailability(getLibraryAlphabetSource('favorites'), game => game.title);
+		const term = document.getElementById('search-input')?.value.trim() || '';
+		if (ENABLE_LETTER_GRAY_OUT && !term && activeFavoriteLibraryLetter !== 'ALL' && !window.__favoriteLibraryAlphabetAvailability.has(activeFavoriteLibraryLetter)) activeFavoriteLibraryLetter = 'ALL';
+		renderLibraryAlphabetFilter('fav-letter-filter', activeFavoriteLibraryLetter, 'setFavoriteLibraryLetterFilter', window.__favoriteLibraryAlphabetAvailability);
 	}
 
 	window.setLibraryLetterFilter = function(char) {
@@ -37732,12 +37821,18 @@ function formatLibraryLastPlayedBadge(game = {}) {
 		const typeFilter = document.getElementById('library-type-select')?.value || 'ALL';
 		const regionFilter = document.getElementById('library-region-select')?.value || 'ALL';
 	
-		const filtered = lastScannedGames.filter(game => {
+		const libraryLetterItems = lastScannedGames.filter(game => {
 			const meta = getLibraryFilterMetadata(game);
 			if (!activeConsoles.includes(meta.console)) return false;
 			if (typeFilter !== 'ALL' && meta.category !== typeFilter) return false;
 			if (regionFilter !== 'ALL' && meta.region !== regionFilter) return false;
+			return true;
+		});
+		window.__libraryAlphabetAvailability = window.getPsnAlphabetAvailability(libraryLetterItems, game => game.title);
+		if (ENABLE_LETTER_GRAY_OUT && !term && activeLibraryLetter !== 'ALL' && !window.__libraryAlphabetAvailability.has(activeLibraryLetter)) activeLibraryLetter = 'ALL';
+		renderLibraryAlphabetFilter('library-letter-filter', activeLibraryLetter, 'setLibraryLetterFilter', window.__libraryAlphabetAvailability);
 
+		const filtered = libraryLetterItems.filter(game => {
 			if (!term && activeLibraryLetter !== 'ALL' && !matchesLibraryAlphabetFilter(game.title, activeLibraryLetter)) return false;
 	
 			if (term) {
@@ -38051,10 +38146,7 @@ function formatLibraryLastPlayedBadge(game = {}) {
 		}
 
 		if (favToolbar) favToolbar.style.display = 'flex';
-		if (favLetterFilter) {
-			renderFavoriteLibraryLetterFilter();
-			favLetterFilter.style.display = 'flex';
-		}
+		if (favLetterFilter) favLetterFilter.style.display = 'flex';
 
 		const term = document.getElementById('search-input')?.value.toLowerCase().trim() || "";
 		const termNormalized = term.replace(/[^a-z0-9]/g, '');
@@ -38063,12 +38155,18 @@ function formatLibraryLastPlayedBadge(game = {}) {
 		const typeFilter = document.getElementById('fav-type-select')?.value || 'ALL';
 		const regionFilter = document.getElementById('fav-region-select')?.value || 'ALL';
 
-		const filteredFavs = activeFavs.filter(game => {
+		const favoriteLetterItems = activeFavs.filter(game => {
 			const meta = getLibraryFilterMetadata(game);
 			if (!activeConsoles.includes(meta.console)) return false;
 			if (typeFilter !== 'ALL' && meta.category !== typeFilter) return false;
 			if (regionFilter !== 'ALL' && meta.region !== regionFilter) return false;
+			return true;
+		});
+		window.__favoriteLibraryAlphabetAvailability = window.getPsnAlphabetAvailability(favoriteLetterItems, game => game.title);
+		if (ENABLE_LETTER_GRAY_OUT && !term && activeFavoriteLibraryLetter !== 'ALL' && !window.__favoriteLibraryAlphabetAvailability.has(activeFavoriteLibraryLetter)) activeFavoriteLibraryLetter = 'ALL';
+		renderLibraryAlphabetFilter('fav-letter-filter', activeFavoriteLibraryLetter, 'setFavoriteLibraryLetterFilter', window.__favoriteLibraryAlphabetAvailability);
 
+		const filteredFavs = favoriteLetterItems.filter(game => {
 			if (!term && activeFavoriteLibraryLetter !== 'ALL' && !matchesLibraryAlphabetFilter(game.title, activeFavoriteLibraryLetter)) return false;
 
 			if (term) {
