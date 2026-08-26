@@ -22534,6 +22534,35 @@ P
 		grid.querySelectorAll(':scope > .game-card[data-collection-filter-new="1"]').forEach(card => delete card.dataset.collectionFilterNew);
 	}
 
+	async function animateLibraryRefreshMotion(games) {
+		const grid = document.getElementById('ps3-local-grid');
+		const snapshot = captureCollectionFilterMotion('library');
+		if (!grid || !snapshot) {
+			renderLocalLibrary(games, false, true);
+			return;
+		}
+
+		if (!document.hidden && !browseMotionReduced() && typeof window.animateCategoryRemoveCard === 'function') {
+			const nextPaths = new Set((games || []).map(game => String(game?.path || '').trim()).filter(Boolean));
+			const viewport = getBrowseMotionViewportRect();
+			const removedVisibleCards = Array.from(grid.querySelectorAll(':scope > .game-card')).filter(card => {
+				const path = String(card.querySelector('.game-img')?.getAttribute('data-lib-path') || '').trim();
+				if (!path || nextPaths.has(path)) return false;
+				const rect = card.getBoundingClientRect();
+				return !!rect.width && !!rect.height && browseMotionRectVisible(rect, viewport, 48);
+			});
+			if (removedVisibleCards.length) {
+				await Promise.all(removedVisibleCards.map(card => new Promise(resolve => window.animateCategoryRemoveCard(card, resolve))));
+			}
+		}
+
+		renderLocalLibrary(games, false, true);
+		restoreCollectionFilterScroll(snapshot);
+		animateCollectionFilterMotion(snapshot);
+		revealCollectionFilterNewCards(snapshot);
+		requestAnimationFrame(() => restoreCollectionFilterScroll(snapshot));
+	}
+
 	window.applyCollectionToolbarFilterChange = function(scope) {
 		const config = getCollectionFilterMotionConfig(scope);
 		if (!config) return;
@@ -36792,7 +36821,10 @@ P
 				if (shouldRepaintLocalLibrary) markProfileListChanged('library');
 			}
 	
-			if (shouldRepaintLocalLibrary || !grid.querySelector('.game-card')) {
+			const hasRenderedLibraryCards = !!grid.querySelector('.game-card');
+			if (shouldRepaintLocalLibrary && hasRenderedLibraryCards) {
+				await animateLibraryRefreshMotion(lastScannedGames);
+			} else if (shouldRepaintLocalLibrary || !hasRenderedLibraryCards) {
 				renderLocalLibrary(lastScannedGames, false, true);
 			} else if (typeof updateConsoleLibraryStatusUI === 'function') {
 				updateConsoleLibraryStatusUI(lastScannedGames);
