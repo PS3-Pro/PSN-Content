@@ -1344,6 +1344,12 @@ body.is-ps3 #game-modal.no-gallery-active:not(.compact-no-summary):not(.help-mod
 	var g_pcPageSize = 500;
 	var g_ps3RenderLimit = 200;
     var g_ps3PageSize = 200;
+	var g_ps3LetterBuckets = {};
+	var g_ps3LetterBucketsSorted = {};
+	var g_ps3TitleIdIndex = {};
+	var g_ps3DeferredWorkTimer = null;
+	var g_classicDeferBaseGameIndex = false;
+	var g_forceNetworkReload = false;
 	
 	var f = document.forms.engine;
 	var PROXY_URL = "https://proxy.ps3-pro.workers.dev/";
@@ -2235,14 +2241,14 @@ body.is-ps3 #game-modal.no-gallery-active:not(.compact-no-summary):not(.help-mod
 		return /(^|[^A-Z0-9])OST([^A-Z0-9]|$)/.test(upperName);
 	}
 
-	function classicIsVideoName(name, contentId, titleId) {
+	function classicIsVideoName(name, contentId, titleId, knownSoundtrack, knownDemo) {
 		var text = String(name || "");
 		var cleanContentId = String(contentId || "").toUpperCase();
 		var cleanTitleId = String(titleId || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
 
 		if (!text && !cleanContentId) return false;
-		if (classicIsSoundtrackName(text)) return false;
-		if (RX_DEMO_CHK.test(text)) return false;
+		if (knownSoundtrack === true || (knownSoundtrack !== false && classicIsSoundtrackName(text))) return false;
+		if (knownDemo === true || (knownDemo !== false && RX_DEMO_CHK.test(text))) return false;
 		if (/\b(?:THE\s+)?(?:OFFICIAL\s+)?VIDEO\s*GAME\b|\bVIDEOGAME\b|\bVIDEO\s+POKER\b|\b(?:AMAZON\s+)?(?:INSTANT|PRIME|UNLIMITED)\s+VIDEO\b|\bVIDEO\s+EDITOR(?:\s+AND\s+UPLOADER)?\b|\bMOVIE\s+SERVICE\b/i.test(text)) return false;
 		if (/(?:MOVIEGAME|LEGOMOVIE|GVIDEOPOKE)/i.test(cleanContentId)) return false;
 		if (cleanTitleId && typeof DICT_APPS_FILTER !== "undefined" && DICT_APPS_FILTER[cleanTitleId] === 1) return false;
@@ -4108,7 +4114,7 @@ function classicIsGameToRelatedLoop(titleId, category) {
 		var cat = String(category || currentCategory || '');
 
 		if (classicIsChildContentCategory(cat)) {
-			classicEnsureBaseGameIndex();
+			if (!isPS3 || !g_classicDeferBaseGameIndex) classicEnsureBaseGameIndex();
 
 			if (classicHasRelatedBaseGame(id) && !classicIsGameToRelatedLoop(id, cat)) {
 				return '<a href="#" class="classic-title-id-link id-text" title="Open base game" onclick="return classicOpenBaseGameFromTitleId(\'' + id + '\', \'' + cat + '\');">' + label + '<i class="fas fa-arrow-up-right-from-square"></i></a>';
@@ -4571,90 +4577,98 @@ function restorePreviousState() {
 		xhr_h.send();
 	}
 
-	loadNoCoverIndexBackground();
-	loadCoverIndexBackground();
+	if (!isPS3) {
+		loadNoCoverIndexBackground();
+		loadCoverIndexBackground();
+	}
 
-	function loadDLCIndexBackground() {
-		if (g_dlcIndexLoaded) return;
+	function loadDLCIndexBackground(done) {
+		if (g_dlcIndexLoaded) { if (done) done(); return; }
 		var xhr_h = new XMLHttpRequest();
 		xhr_h.onreadystatechange = function() {
-			if (xhr_h.readyState == 4 && (xhr_h.status == 200 || xhr_h.status == 0)) {
-				var text_h = xhr_h.responseText; if (!text_h) return;
-				var map_h = g_dlcExists;
-
-				var pos_h = 0;
-				var len_h = text_h.length;
-				while (pos_h < len_h) {
-					var lineEnd_h = text_h.indexOf('\n', pos_h);
-					if (lineEnd_h === -1) lineEnd_h = len_h;
-					var line_h = text_h.substring(pos_h, lineEnd_h);
-					if (line_h.length && line_h.charCodeAt(line_h.length - 1) === 13) line_h = line_h.substring(0, line_h.length - 1);
-					var id_h = line_h.substr(0, 9);
-					if (id_h.length === 9) {
-						map_h[id_h] = true;
-						classicIndexLicenseDlcCandidate(line_h, id_h);
+			if (xhr_h.readyState != 4) return;
+			if (xhr_h.status == 200 || xhr_h.status == 0) {
+				var text_h = xhr_h.responseText;
+				if (text_h) {
+					var map_h = g_dlcExists;
+					var pos_h = 0;
+					var len_h = text_h.length;
+					while (pos_h < len_h) {
+						var lineEnd_h = text_h.indexOf('\n', pos_h);
+						if (lineEnd_h === -1) lineEnd_h = len_h;
+						var line_h = text_h.substring(pos_h, lineEnd_h);
+						if (line_h.length && line_h.charCodeAt(line_h.length - 1) === 13) line_h = line_h.substring(0, line_h.length - 1);
+						var id_h = line_h.substr(0, 9);
+						if (id_h.length === 9) {
+							map_h[id_h] = true;
+							classicIndexLicenseDlcCandidate(line_h, id_h);
+						}
+						if (lineEnd_h >= len_h) break;
+						pos_h = lineEnd_h + 1;
 					}
-					if (lineEnd_h >= len_h) break;
-					pos_h = lineEnd_h + 1;
+					g_dlcIndexLoaded = true;
+					if (!g_isFetching && typeof render === 'function' && classicNeedsMissingLicenseDlcRefresh()) render();
+					if (currentCategory === 'games' && !isPS3) injectExtraButtonsOnScreen();
 				}
-
-				g_dlcIndexLoaded = true;
-				if (!g_isFetching && typeof render === 'function' && classicNeedsMissingLicenseDlcRefresh()) render();
-				if (currentCategory === 'games') injectExtraButtonsOnScreen();
-				text_h = null;
 			}
+			xhr_h.onreadystatechange = null;
+			if (done) done();
 		};
 		xhr_h.open('GET', URL_DB_DLC, true); xhr_h.send();
 	}
 
-	function loadAvatarIndexBackground() {
-		if (g_avatarIndexLoaded) return;
+	function loadAvatarIndexBackground(done) {
+		if (g_avatarIndexLoaded) { if (done) done(); return; }
 		var xhr_h = new XMLHttpRequest();
 		xhr_h.onreadystatechange = function() {
-			if (xhr_h.readyState == 4 && (xhr_h.status == 200 || xhr_h.status == 0)) {
-				var text_h = xhr_h.responseText; if (!text_h) return;
-				var map_h = g_avatarExists;
-
-				var pos_h = 0;
-				var len_h = text_h.length;
-				while (pos_h < len_h) {
-					var id_h = text_h.substr(pos_h, 9);
-					if (id_h.length === 9) map_h[id_h] = true;
-					pos_h = text_h.indexOf('\n', pos_h);
-					if (pos_h === -1) break;
-					pos_h++;
+			if (xhr_h.readyState != 4) return;
+			if (xhr_h.status == 200 || xhr_h.status == 0) {
+				var text_h = xhr_h.responseText;
+				if (text_h) {
+					var map_h = g_avatarExists;
+					var pos_h = 0;
+					var len_h = text_h.length;
+					while (pos_h < len_h) {
+						var id_h = text_h.substr(pos_h, 9);
+						if (id_h.length === 9) map_h[id_h] = true;
+						pos_h = text_h.indexOf('\n', pos_h);
+						if (pos_h === -1) break;
+						pos_h++;
+					}
+					g_avatarIndexLoaded = true;
+					if (currentCategory === 'games' && !isPS3) injectExtraButtonsOnScreen();
 				}
-
-				g_avatarIndexLoaded = true;
-				if (currentCategory === 'games') injectExtraButtonsOnScreen();
-				text_h = null;
 			}
+			xhr_h.onreadystatechange = null;
+			if (done) done();
 		};
 		xhr_h.open('GET', URL_DB_AVATAR, true); xhr_h.send();
 	}
 
-	function loadThemeIndexBackground() {
-		if (g_themeIndexLoaded) return;
+	function loadThemeIndexBackground(done) {
+		if (g_themeIndexLoaded) { if (done) done(); return; }
 		var xhr_h = new XMLHttpRequest();
 		xhr_h.onreadystatechange = function() {
-			if (xhr_h.readyState == 4 && (xhr_h.status == 200 || xhr_h.status == 0)) {
-				var text_h = xhr_h.responseText; if (!text_h) return;
-				var map_h = g_themeExists;
-
-				var pos_h = 0;
-				var len_h = text_h.length;
-				while (pos_h < len_h) {
-					var id_h = text_h.substr(pos_h, 9);
-					if (id_h.length === 9) map_h[id_h] = true;
-					pos_h = text_h.indexOf('\n', pos_h);
-					if (pos_h === -1) break;
-					pos_h++;
+			if (xhr_h.readyState != 4) return;
+			if (xhr_h.status == 200 || xhr_h.status == 0) {
+				var text_h = xhr_h.responseText;
+				if (text_h) {
+					var map_h = g_themeExists;
+					var pos_h = 0;
+					var len_h = text_h.length;
+					while (pos_h < len_h) {
+						var id_h = text_h.substr(pos_h, 9);
+						if (id_h.length === 9) map_h[id_h] = true;
+						pos_h = text_h.indexOf('\n', pos_h);
+						if (pos_h === -1) break;
+						pos_h++;
+					}
+					g_themeIndexLoaded = true;
+					if (currentCategory === 'games' && !isPS3) injectExtraButtonsOnScreen();
 				}
-
-				g_themeIndexLoaded = true;
-				if (currentCategory === 'games') injectExtraButtonsOnScreen();
-				text_h = null;
 			}
+			xhr_h.onreadystatechange = null;
+			if (done) done();
 		};
 		xhr_h.open('GET', URL_DB_THEMES, true); xhr_h.send();
 	}
@@ -4683,6 +4697,35 @@ function restorePreviousState() {
 			}
 		};
 		xhr_h.open('GET', URL_DB_UPDATES, true); xhr_h.send();
+	}
+
+	function classicSchedulePs3PostListWork(cat) {
+		if (!isPS3) return;
+		if (g_ps3DeferredWorkTimer) clearTimeout(g_ps3DeferredWorkTimer);
+		g_ps3DeferredWorkTimer = setTimeout(function() {
+			g_ps3DeferredWorkTimer = null;
+			if (currentCategory !== cat || g_isFetching) return;
+
+			if (useCoverGUI) {
+				if (!g_noCoverIndexLoaded) loadNoCoverIndexBackground();
+				if (!g_coverIndexLoaded) loadCoverIndexBackground();
+			}
+
+			if (cat === 'games') {
+				loadDLCIndexBackground(function() {
+					loadAvatarIndexBackground(function() {
+						loadThemeIndexBackground(function() {
+							if (currentCategory === 'games') injectExtraButtonsOnScreen();
+						});
+					});
+				});
+			}
+
+			if (classicIsChildContentCategory(cat) && g_classicDeferBaseGameIndex) {
+				g_classicDeferBaseGameIndex = false;
+				classicEnsureBaseGameIndex();
+			}
+		}, 350);
 	}
 
 	function injectExtraButtonsOnScreen() {
@@ -5305,6 +5348,26 @@ function restorePreviousState() {
 			var isFilterLetter_h = (letter_f_h.length > 1 && letter_f_h[0] == '^');
 			var targetLetter_h = isFilterLetter_h ? letter_f_h.substring(1).toUpperCase() : "";
 
+			var searchLooksLikeTitleId_h = /^[a-z]{4}\d{5}$/i.test(searchValRaw_h);
+			var source_db_h = local_db_h;
+			var usingPs3LetterBucket_h = false;
+			var usingPs3TitleIndex_h = false;
+			if (is_ps3_h && isSearch_h && searchLooksLikeTitleId_h) {
+				source_db_h = g_ps3TitleIdIndex[searchValRaw_h.toUpperCase()] || [];
+				usingPs3TitleIndex_h = true;
+			} else if (is_ps3_h && isFilterLetter_h) {
+				var bucketKey_h = (letter_f_h === "^[0-9]") ? "[0-9]" : ((letter_f_h === "^[^0-9A-Z]") ? "#" : targetLetter_h);
+				source_db_h = g_ps3LetterBuckets[bucketKey_h] || [];
+				usingPs3LetterBucket_h = true;
+				if (!g_ps3LetterBucketsSorted[bucketKey_h] && source_db_h.length > 1) {
+					source_db_h.sort(function(a, b) {
+						var sa = a.sortName || "";
+						var sb = b.sortName || "";
+						return sa < sb ? -1 : (sa > sb ? 1 : 0);
+					});
+					g_ps3LetterBucketsSorted[bucketKey_h] = true;
+				}
+			}
 			var maxCollectLimit = is_ps3_h ? (isSearch_h ? 99 : 1500) : 99999;
 			var normalMatches_h = [];
 			var missingMatches_h = [];
@@ -5312,10 +5375,10 @@ function restorePreviousState() {
 			var totalCandidateCount_h = 0;
 			var searchCandidateMissingLicenseCount_h = 0;
 			var collectedCount_h = 0;
-			var dbLen = local_db_h.length;
+			var dbLen = source_db_h.length;
 
 			for (var i = 0; i < dbLen; i++) {
-				var row = local_db_h[i];
+				var row = source_db_h[i];
 				if (!row || !row[2] || !row[3] || row[3] === "MISSING") continue;
 
 				if (reg_f_h !== "ALL" && row[1] !== reg_f_h) continue;
@@ -5328,10 +5391,10 @@ function restorePreviousState() {
 
 				if (letter_f_h !== "") {
 					if (isSearch_h) {
-						if (row.searchId.indexOf(searchValRaw_h) === -1 && row.searchName.indexOf(searchValNormal_h) === -1) {
+						if (!usingPs3TitleIndex_h && row.searchId.indexOf(searchValRaw_h) === -1 && row.searchName.indexOf(searchValNormal_h) === -1) {
 							continue;
 						}
-					} else if (isFilterLetter_h) {
+					} else if (isFilterLetter_h && !usingPs3LetterBucket_h) {
 						var nameToComp = (row.cleanName || row[2]);
 						var firstChar = nameToComp.charAt(0).toUpperCase();
 
@@ -5364,7 +5427,6 @@ function restorePreviousState() {
 				}
 			}
 
-			var searchLooksLikeTitleId_h = /^[a-z]{4}\d{5}$/i.test(searchValRaw_h);
 			var hideMissingShellForSingleSearch_h = !!(isSearch_h && searchValRaw_h.length > 0 && searchCandidateMissingLicenseCount_h > 0 && totalCandidateCount_h <= 1);
 			var searchCanUseMissingLicenseFilter_h = !!(isSearch_h && searchValRaw_h.length > 0 && searchCandidateMissingLicenseCount_h > 0 && totalCandidateCount_h > 1);
 
@@ -5393,19 +5455,18 @@ function restorePreviousState() {
 			updateMissingLicenseFilterVisibility(availableMissingLicenses_h, isSearch_h, hideMissingShellForSingleSearch_h || hideMissingShellForSingleInternalLookup_h || (isSearch_h && !searchCanUseMissingLicenseFilter_h));
 
 			var matches_h = normalMatches_h;
-			if ((g_classicShowMissingLicenses || hideMissingShellForSingleSearch_h || hideMissingShellForSingleInternalLookup_h) && missingMatches_h.length > 0) {
-				matches_h = normalMatches_h.concat(missingMatches_h);
-			}
+			var includeMissing_h = (g_classicShowMissingLicenses || hideMissingShellForSingleSearch_h || hideMissingShellForSingleInternalLookup_h) && missingMatches_h.length > 0;
+			if (includeMissing_h) matches_h = normalMatches_h.concat(missingMatches_h);
 
-			if (classicTryNextBaseLookupCategory(cat_h, matches_h.length)) {
-				return;
-			}
+			if (classicTryNextBaseLookupCategory(cat_h, matches_h.length)) return;
 
-			matches_h.sort(function(a, b) {
-				var sortA = a.sortName || "";
-				var sortB = b.sortName || "";
-				return (sortA < sortB) ? -1 : (sortA > sortB ? 1 : 0);
-			});
+			if (!usingPs3LetterBucket_h || includeMissing_h) {
+				matches_h.sort(function(a, b) {
+					var sortA = a.sortName || "";
+					var sortB = b.sortName || "";
+					return (sortA < sortB) ? -1 : (sortA > sortB ? 1 : 0);
+				});
+			}
 
 			g_allMatches = matches_h;
 
@@ -5505,7 +5566,6 @@ function restorePreviousState() {
 			var start = 0;
 			var len = tsvData.length;
 			var is_ps3_h = isPS3;
-
 			var cat_h = currentCategory;
 			var is_games = (cat_h === "games");
 			var is_guides = (cat_h === "guides");
@@ -5517,8 +5577,6 @@ function restorePreviousState() {
 			var is_catalog_content = (is_game_catalog || is_guides || is_videos);
 			var is_games_or_apps = (is_games || is_apps);
 			var needs_tags = (is_catalog_content || is_apps);
-			var is_ps3_dlc = (isPS3 && cat_h === "dlcs"); 
-
 			var f_formatSize = formatFileSize;
 			var f_cleanName = cleanGameName;
 			var f_demo = RX_DEMO_CHK;
@@ -5526,123 +5584,83 @@ function restorePreviousState() {
 			var dict_apps = DICT_APPS_FILTER;
 			var name_cache_h = g_nameCache;
 			var temp_map_h = g_tempMap;
+			var partTestRegex = /\s*[\(\[\-]?\s*(?:Part|Pt\.?|Disco|Disc|Parte)\s*\d+\s*[\)\]\-]?/i;
+			var partCleanRegex = /\s*[\(\[\-]?\s*(?:Part|Pt\.?|Disco|Disc|Parte)\s*\d+\s*[\)\]\-]?/gi;
 
 			while (start < len) {
 				var end = tsvData.indexOf('\n', start);
 				if (end === -1) end = len;
-
 				var lineEnd = end;
 				if (lineEnd > start && tsvData.charCodeAt(lineEnd - 1) === 13) lineEnd--;
-
 				var line = tsvData.slice(start, lineEnd);
 				start = end + 1;
-
 				if (line.length < 15) continue;
 
 				var parts = line.split("\t");
 				var title_id = parts[0];
-
 				if (!title_id || title_id.length !== 9) continue;
-
 				var url = parts[3];
 				if (!url || url === "MISSING") continue;
-	
 				var rawName = parts[2];
 				if (!rawName) continue;
 
+				var isTestVersion = false;
+				if (is_games_or_apps || is_demos) {
+					isTestVersion = f_demo.test(rawName);
+					if (is_games_or_apps && isTestVersion) continue;
+					if (is_demos && !isTestVersion) continue;
+				}
 				var contentIdForType = parts[5] || "";
-				var isGuideItem = classicIsGuideName(rawName);
-				var isSoundtrackItem = classicIsSoundtrackName(rawName);
-				var isVideoItem = classicIsVideoName(rawName, contentIdForType, title_id);
 				if (is_guides) {
-					if (!isGuideItem) continue;
+					if (!classicIsGuideName(rawName)) continue;
 				} else if (is_soundtracks) {
-					if (!isSoundtrackItem) continue;
+					if (!classicIsSoundtrackName(rawName)) continue;
 				} else if (is_videos) {
-					if (!isVideoItem) continue;
-				} else if ((is_games || is_apps || is_demos) && (isGuideItem || isSoundtrackItem || isVideoItem)) {
-					continue;
+					if (!classicIsVideoName(rawName, contentIdForType, title_id)) continue;
+				} else if (is_games || is_apps || is_demos) {
+					var isGuideItem = classicIsGuideName(rawName);
+					var isSoundtrackItem = classicIsSoundtrackName(rawName);
+					var isVideoItem = classicIsVideoName(rawName, contentIdForType, title_id, isSoundtrackItem, isTestVersion);
+					if (isGuideItem || isSoundtrackItem || isVideoItem) continue;
 				}
 
 				if (is_games || is_apps || is_demos) classicMarkBaseGameId(title_id, cat_h);
-
 				if (is_games && rawName.indexOf("Nostalgia Vault") !== -1) {
 					rawName = rawName.replace(/\s*\(Nostalgia Vault\)/gi, "");
 					parts[2] = rawName;
 				}
 
-				var url_lc = url.toLowerCase();
-				var isDropbox = (url_lc.indexOf("dropbox.com") !== -1);
-				
-				var partRegex = /\s*[\(\[\-]?\s*(?:Part|Pt\.?|Disco|Disc|Parte)\s*\d+\s*[\)\]\-]?/gi;
-				var isSplitGame = partRegex.test(rawName);
-
-				var uniqueKey = title_id + "|" + url;
-
+				var isDropbox = false;
+				var isSplitGame = false;
 				if (is_game_catalog) {
-					if (isSplitGame) {
-						if (!is_ps3_h || !isDropbox) {
-							uniqueKey = "game_group_" + title_id;
-							rawName = rawName.replace(partRegex, "").replace(/^\s+|\s+$/g, '');
-							parts[2] = rawName; 
-						} else {
-							uniqueKey = "line_" + start;
-						}
-					} else {
-						uniqueKey = "best_version_" + title_id;
+					if (is_ps3_h) isDropbox = (url.toLowerCase().indexOf("dropbox.com") !== -1);
+					isSplitGame = partTestRegex.test(rawName);
+					if (isSplitGame && (!is_ps3_h || !isDropbox)) {
+						rawName = rawName.replace(partCleanRegex, "").replace(/^\s+|\s+$/g, '');
+						parts[2] = rawName;
 					}
 				}
-	
-				if (is_games_or_apps || is_demos) {
-					var isTestVersion = f_demo.test(rawName);
-					if (is_games_or_apps && isTestVersion) continue;
-					if (is_demos && !isTestVersion) continue;
-				}
 
-				var cTag = "ps3"; 
+				var cTag = "ps3";
 				var aTag = "media";
-
 				if (needs_tags) {
 					var upName = rawName.toUpperCase();
-					var tid = (title_id || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
-					var cid = (parts[5] || "").toUpperCase(); 
+					var tid = title_id.toUpperCase().replace(/[^A-Z0-9]/g, "");
+					var cid = contentIdForType.toUpperCase();
 					var isClassifiedById = false;
-
 					if (is_catalog_content) {
-						if (cid && cid.indexOf("NEOGEOSTATION") !== -1) {
-							cTag = "neogeo";
-							isClassifiedById = true;
-						} else if (tid.length >= 4) {
+						if (cid && cid.indexOf("NEOGEOSTATION") !== -1) { cTag = "neogeo"; isClassifiedById = true; }
+						else if (tid.length >= 4) {
 							var prefix2 = tid.substring(0, 2);
 							var prefix4 = tid.substring(0, 4);
 							var char3 = tid.charAt(3);
-
-							if (prefix2 === "NP" && (char3 === 'Z' || char3 === 'X')) {
-								cTag = "minis";
-								isClassifiedById = true;
-							} else if (prefix4 === "NPUF" || (prefix4 === "NPJJ" && tid.charAt(4) === '3')) {
-								cTag = "pce";
-								isClassifiedById = true;
-							} else if (prefix4 === "NPEF" || (prefix2 === "NP" && (char3 === 'J' || char3 === 'I' || char3 === 'E' || char3 === 'F'))) {
-								cTag = "psx";
-								isClassifiedById = true;
-							} else if (prefix2 === "UC" || prefix2 === "UL" || (prefix2 === "NP" && (char3 === 'G' || char3 === 'H'))) {
-								cTag = "psp";
-								isClassifiedById = true;
-							} else if (prefix2 === "SL" || prefix2 === "SC" || (prefix2 === "NP" && char3 === 'D')) {
-								cTag = "ps2";
-								isClassifiedById = true;
-							} 
-							else if (prefix2 === "NP") {
-								if (upName.indexOf("NEO") !== -1 || upName.indexOf("NEOGEO") !== -1) {
-									cTag = "neogeo";
-								} else {
-									cTag = "ps3";
-								}
-								isClassifiedById = true;
-							}
+							if (prefix2 === "NP" && (char3 === 'Z' || char3 === 'X')) { cTag = "minis"; isClassifiedById = true; }
+							else if (prefix4 === "NPUF" || (prefix4 === "NPJJ" && tid.charAt(4) === '3')) { cTag = "pce"; isClassifiedById = true; }
+							else if (prefix4 === "NPEF" || (prefix2 === "NP" && (char3 === 'J' || char3 === 'I' || char3 === 'E' || char3 === 'F'))) { cTag = "psx"; isClassifiedById = true; }
+							else if (prefix2 === "UC" || prefix2 === "UL" || (prefix2 === "NP" && (char3 === 'G' || char3 === 'H'))) { cTag = "psp"; isClassifiedById = true; }
+							else if (prefix2 === "SL" || prefix2 === "SC" || (prefix2 === "NP" && char3 === 'D')) { cTag = "ps2"; isClassifiedById = true; }
+							else if (prefix2 === "NP") { cTag = (upName.indexOf("NEO") !== -1 || upName.indexOf("NEOGEO") !== -1) ? "neogeo" : "ps3"; isClassifiedById = true; }
 						}
-
 						if (!isClassifiedById) {
 							if (upName.indexOf("PS2") !== -1) cTag = "ps2";
 							else if (upName.indexOf("PSX") !== -1 || upName.indexOf("PS1") !== -1) cTag = "psx";
@@ -5652,80 +5670,63 @@ function restorePreviousState() {
 							else if (upName.indexOf("NEO") !== -1 || upName.indexOf("NEOGEO") !== -1) cTag = "neogeo";
 						}
 					}
-
 					if (is_apps) {
 						if (upName.indexOf("FIRSTPLAY") !== -1 || upName.indexOf("FIRST PLAY") !== -1) aTag = "firstplay";
 						else if (upName.indexOf("QORE") !== -1) aTag = "qore";
 					}
-
 					var isAppItem = (dict_apps[title_id] === 1) || (aTag !== "media");
 					if (is_games && isAppItem) continue;
 					if (is_apps && !isAppItem) continue;
 				}
-				
+
 				parts.cTag = cTag;
 				parts.aTag = aTag;
-
-				if (typeof isUnofficialMode !== 'undefined' && isUnofficialMode || (is_ps3_h && cat_h === 'dlcs')) {
+				if ((typeof isUnofficialMode !== 'undefined' && isUnofficialMode) || (is_ps3_h && cat_h === 'dlcs')) {
 					parts.cleanName = rawName;
 				} else {
 					var cached = name_cache_h[rawName];
-					if (cached) {
-						parts.cleanName = cached;
-					} else {
-						parts.cleanName = f_cleanName(rawName, cat_h);
-						name_cache_h[rawName] = parts.cleanName;
-					}
+					if (cached) parts.cleanName = cached;
+					else { parts.cleanName = f_cleanName(rawName, cat_h); name_cache_h[rawName] = parts.cleanName; }
 				}
 
 				parts.sortName = (parts.cleanName || rawName).toLowerCase();
 				parts.searchName = parts.sortName.replace(/[^a-z0-9]/g, '').replace(/(.)\1+/g, '$1');
 				parts.searchId = title_id.toLowerCase();
+				var firstChar_h = (parts.cleanName || rawName).charAt(0).toUpperCase();
+				parts.firstKey = (firstChar_h >= '0' && firstChar_h <= '9') ? '[0-9]' : ((firstChar_h >= 'A' && firstChar_h <= 'Z') ? firstChar_h : '#');
+				var rap_h = String(parts[4] || '').replace(/^\s+|\s+$/g, '').toUpperCase();
+				parts.isMissingLicense = (rap_h === 'MISSING');
 
 				var sBytes = "";
 				for (var j = parts.length - 1; j >= 3; j--) {
 					var val = parts[j];
-					if (val && f_num_pat.test(val)) {
-						if (val.length > 4) { sBytes = val; break; }
-					}
+					if (val && val.length > 4 && f_num_pat.test(val)) { sBytes = val; break; }
 				}
-				parts.rawSize = parseInt(sBytes, 10) || 0; 
+				parts.rawSize = parseInt(sBytes, 10) || 0;
 				parts.formattedSize = f_formatSize(sBytes) || "N/A";
 
 				var uniqueKey = title_id + "|" + url;
-    
-				if (is_game_catalog) {
-					if (!is_ps3_h || !isDropbox) {
-						uniqueKey = "game_group_" + title_id;
+				if (is_game_catalog && (!is_ps3_h || !isDropbox)) uniqueKey = "game_group_" + title_id;
+				if (!temp_map_h[uniqueKey]) temp_map_h[uniqueKey] = parts;
+				else if (is_game_catalog) {
+					if (isSplitGame) {
+						var existingUrl = temp_map_h[uniqueKey][3];
+						if (existingUrl.indexOf(url) === -1) {
+							temp_map_h[uniqueKey][3] = existingUrl + "|" + url;
+							var totalBytes = (temp_map_h[uniqueKey].rawSize || 0) + (parts.rawSize || 0);
+							temp_map_h[uniqueKey].rawSize = totalBytes;
+							temp_map_h[uniqueKey].formattedSize = f_formatSize(totalBytes);
+						}
+					} else {
+						var incomingSize = parts.rawSize || 0;
+						var storedSize = temp_map_h[uniqueKey].rawSize || 0;
+						if (incomingSize > storedSize) temp_map_h[uniqueKey] = parts;
 					}
-				}
-			
-				if (!temp_map_h[uniqueKey]) {
-					temp_map_h[uniqueKey] = parts;
-				} else {
-					if (is_game_catalog) {
-						if (isSplitGame) {
-							var existingUrl = temp_map_h[uniqueKey][3];
-							if (existingUrl.indexOf(url) === -1) {
-								temp_map_h[uniqueKey][3] = existingUrl + "|" + url;
-								var totalBytes = (temp_map_h[uniqueKey].rawSize || 0) + (parts.rawSize || 0);
-								temp_map_h[uniqueKey].rawSize = totalBytes;
-								temp_map_h[uniqueKey].formattedSize = f_formatSize(totalBytes); 
-							}
-						} else {
-							var incomingSize = parts.rawSize || 0;
-							var storedSize = temp_map_h[uniqueKey].rawSize || 0;
-
-							if (incomingSize > storedSize) {
-								temp_map_h[uniqueKey] = parts;
-							}
-						}
-						
-						var existingRap = temp_map_h[uniqueKey][4];
-						if ((!existingRap || existingRap === "MISSING") && (parts[4] && parts[4] !== "MISSING")) {
-							temp_map_h[uniqueKey][4] = parts[4]; 
-							temp_map_h[uniqueKey][5] = parts[5]; 
-						}
+					var existingRap = temp_map_h[uniqueKey][4];
+					if ((!existingRap || existingRap === "MISSING") && (parts[4] && parts[4] !== "MISSING")) {
+						temp_map_h[uniqueKey][4] = parts[4];
+						temp_map_h[uniqueKey][5] = parts[5];
+						temp_map_h[uniqueKey].isMissingLicense = false;
 					}
 				}
 			}
@@ -5734,25 +5735,33 @@ function restorePreviousState() {
 		function finalizeDB() {
 			var db_local = [];
 			var temp_map = g_tempMap;
-			var keys = [];
 			var has_prop = Object.prototype.hasOwnProperty;
-
+			var make_ps3_indexes = isPS3;
+			var letter_buckets = {};
+			var title_index = {};
 			for (var k in temp_map) {
-				if (has_prop.call(temp_map, k)) {
-					keys.push(k);
+				if (!has_prop.call(temp_map, k)) continue;
+				var row = temp_map[k];
+				if (row) {
+					db_local.push(row);
+					if (make_ps3_indexes) {
+						var letterKey = row.firstKey || '#';
+						if (!letter_buckets[letterKey]) letter_buckets[letterKey] = [];
+						letter_buckets[letterKey].push(row);
+						var tidKey = String(row[0] || '').toUpperCase();
+						if (tidKey) {
+							if (!title_index[tidKey]) title_index[tidKey] = [];
+							title_index[tidKey].push(row);
+						}
+					}
 				}
+				temp_map[k] = null;
 			}
-
-			var total = keys.length;
-			for (var i = 0; i < total; i++) {
-				var key = keys[i];
-				db_local.push(temp_map[key]);
-				temp_map[key] = null;
-			}
-
 			DB = db_local;
-			g_tempMap = {}; 
-			keys = null;
+			g_ps3LetterBuckets = make_ps3_indexes ? letter_buckets : {};
+			g_ps3LetterBucketsSorted = {};
+			g_ps3TitleIdIndex = make_ps3_indexes ? title_index : {};
+			g_tempMap = {};
 			g_isFetching = false;
 		}
 
@@ -5770,6 +5779,9 @@ function restorePreviousState() {
 			if (g_allMatches) g_allMatches.length = 0;
 			if (g_cacheParts) g_cacheParts.length = 0;
 			g_tempMap = {};
+			g_ps3LetterBuckets = {};
+			g_ps3LetterBucketsSorted = {};
+			g_ps3TitleIdIndex = {};
 
 			var list_el = doc_h.getElementById('list');
 			var count_el = doc_h.getElementById('count');
@@ -5828,11 +5840,13 @@ function restorePreviousState() {
 					render();
 					checkStartupAlert();
 					attachScrollLogic();
+					g_forceNetworkReload = false;
+					if (is_ps3_h) classicSchedulePs3PostListWork(cat_h);
 					return; 
 				}
 
 				var urlToLoad = paths_h[currentIndex];
-				if (storage_h) { urlToLoad += "?t=" + new Date().getTime(); }
+				if ((!is_ps3_h && storage_h) || g_forceNetworkReload) { urlToLoad += "?t=" + new Date().getTime(); }
 
 				var xhr = new XMLHttpRequest();
 				g_activeXHR = xhr;
@@ -5869,6 +5883,7 @@ function restorePreviousState() {
 							alert("Error loading part " + (currentIndex + 1));
 							if (storage_h && f_obj_h) f_obj_h.fetch.disabled = false;
 							g_isFetching = false;
+							g_forceNetworkReload = false;
 							xhr = null;
 						}
 					}
@@ -5885,7 +5900,11 @@ function restorePreviousState() {
 
 			var is_grid = this.checked;
 			useCoverGUI = is_grid;
-			saveUIState(); 
+			saveUIState();
+			if (isPS3 && is_grid) {
+				if (!g_noCoverIndexLoaded) loadNoCoverIndexBackground();
+				if (!g_coverIndexLoaded) loadCoverIndexBackground();
+			} 
 
 			var doc = document;
 			var list = doc.getElementById('list');
@@ -5952,6 +5971,7 @@ function restorePreviousState() {
 
 			var countEl = doc.getElementById('count');
 			if (countEl) countEl.textContent = "Reloading | " + g_regionFilter;
+			g_forceNetworkReload = true;
 			
 			fetchDB();
 		}
@@ -6192,6 +6212,11 @@ function restorePreviousState() {
 		if (g_allMatches) g_allMatches.length = 0;
 		if (g_masterQueue) g_masterQueue.length = 0;
 		if (g_cacheParts) g_cacheParts.length = 0;
+		g_ps3LetterBuckets = {};
+		g_ps3LetterBucketsSorted = {};
+		g_ps3TitleIdIndex = {};
+		if (g_ps3DeferredWorkTimer) { clearTimeout(g_ps3DeferredWorkTimer); g_ps3DeferredWorkTimer = null; }
+		g_forceNetworkReload = false;
 
 		g_nameCache = {}; 
 		g_sonyHashCache = {};
@@ -6204,7 +6229,12 @@ function restorePreviousState() {
 
 		currentCategory = cat;
 
-		if (classicIsChildContentCategory(cat)) classicEnsureBaseGameIndex();
+		if (classicIsChildContentCategory(cat)) {
+			if (is_ps3_h) g_classicDeferBaseGameIndex = true;
+			else classicEnsureBaseGameIndex();
+		} else {
+			g_classicDeferBaseGameIndex = false;
+		}
 
 		g_navHistory = null;
 		classicSyncContextualSearchState();
@@ -6259,24 +6289,21 @@ function restorePreviousState() {
 
 		dbPaths = paths;
 
-		if (!g_noCoverIndexLoaded) loadNoCoverIndexBackground();
-
-		setTimeout(function() {
-			if (!g_coverIndexLoaded) loadCoverIndexBackground();
-		}, 50);
-
-		if (cat === 'games' || cat === 'apps') {
+		if (!is_ps3_h) {
+			if (!g_noCoverIndexLoaded) loadNoCoverIndexBackground();
 			setTimeout(function() {
-				if (!g_updateIndexLoaded) {
-					loadUpdateIndexBackground();
-				}
-		
-				if (cat === 'games') {
-					if (!g_dlcIndexLoaded) loadDLCIndexBackground();
-					if (!g_avatarIndexLoaded) loadAvatarIndexBackground();
-					if (!g_themeIndexLoaded) loadThemeIndexBackground();
-				}
-			}, 150);
+				if (!g_coverIndexLoaded) loadCoverIndexBackground();
+			}, 50);
+			if (cat === 'games' || cat === 'apps') {
+				setTimeout(function() {
+					if (!g_updateIndexLoaded) loadUpdateIndexBackground();
+					if (cat === 'games') {
+						if (!g_dlcIndexLoaded) loadDLCIndexBackground();
+						if (!g_avatarIndexLoaded) loadAvatarIndexBackground();
+						if (!g_themeIndexLoaded) loadThemeIndexBackground();
+					}
+				}, 150);
+			}
 		}
 
 		g_letterFilter = ""; 
@@ -9678,6 +9705,9 @@ function restorePreviousState() {
         g_allMatches = null;
         g_tempMap = null;
         g_cacheParts = null;
+        g_ps3LetterBuckets = null;
+        g_ps3LetterBucketsSorted = null;
+        g_ps3TitleIdIndex = null;
 
         var _gc = new Array(1000);
         _gc = null;
