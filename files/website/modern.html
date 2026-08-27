@@ -382,6 +382,7 @@ body:not(.psn-keyboard-nav-active) .psn-keyboard-focused { outline: none !import
 .browse-toolbar select:disabled, .browse-toolbar select.is-disabled { opacity: .5 !important; filter: grayscale(.55) !important; pointer-events: none !important; cursor: not-allowed !important; background: rgba(0,0,0,.22) !important; border-color: rgba(255,255,255,.08) !important; color: rgba(255,255,255,.45) !important; box-shadow: none !important; transform: none !important; }
 .browse-toolbar select:disabled:hover, .browse-toolbar select.is-disabled:hover { background: rgba(0,0,0,.22) !important; border-color: rgba(255,255,255,.08) !important; box-shadow: none !important; }
 .browse-toolbar select option { background-color: #0f141e; color: #fff; }
+#region-select option:disabled, #region-select option.is-unavailable { color: rgba(139,150,168,0.42) !important; background-color: rgba(0,0,0,0.28) !important; }
 .browse-toolbar select optgroup { background-color: #161d2b; color: var(--ps-blue); font-weight: bold; font-style: normal; }
 .browse-toolbar.scrolled { background: rgba(18,24,36,0.4); backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px); border-bottom: 1px solid rgba(255,255,255,0.05); }
 .toolbar-group { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
@@ -16900,6 +16901,7 @@ P
         clearBrowseExpandedGroupTitle();
         if (typeof window.cancelBrowseContextTransition === 'function') window.cancelBrowseContextTransition();
         window.__browseAlphabetAvailability = null;
+        window.__browseRegionAvailability = null;
         window.__browseMissingRapSearchCandidateCount = 0;
         window.__browseCanFilterMissingRap = false;
 
@@ -16991,6 +16993,22 @@ P
 
         const locked = isBrowseRegionSelectLocked(categoryOverride);
         if (locked) regionSelect.value = 'ALL';
+
+        const availableRegions = ENABLE_REGION_GRAY_OUT && !locked && window.__browseRegionAvailability instanceof Set
+            ? window.__browseRegionAvailability
+            : null;
+
+        Array.from(regionSelect.options).forEach(option => {
+            if (option.value === 'ALL') {
+                option.disabled = false;
+                option.classList.remove('is-unavailable');
+                return;
+            }
+
+            const unavailable = !!availableRegions && !availableRegions.has(option.value);
+            option.disabled = unavailable;
+            option.classList.toggle('is-unavailable', unavailable);
+        });
 
         regionSelect.disabled = locked;
         regionSelect.classList.toggle('is-disabled', locked);
@@ -18929,6 +18947,7 @@ P
 	};
 
 	const ENABLE_LETTER_GRAY_OUT = true; // true = gray/disable empty letters; false = keep all letters enabled
+	const ENABLE_REGION_GRAY_OUT = true; // true = gray/disable empty regions; false = keep all regions enabled
 
 	window.PSN_ALPHABET_FILTERS = window.PSN_ALPHABET_FILTERS || ['ALL', '#', '0-9', 'A','B','C','D','E','F','G','H','I','J','K','L','M','N','O','P','Q','R','S','T','U','V','W','X','Y','Z'];
 
@@ -21806,6 +21825,7 @@ P
 		try {
 			currentData = await loadStoreCategoryData(cat, 'high');
 			if (ENABLE_LETTER_GRAY_OUT) window.__browseAlphabetAvailability = null;
+			if (ENABLE_REGION_GRAY_OUT) window.__browseRegionAvailability = null;
 			
 			if(!window.isRestoringHistory && !navHistory && !document.getElementById('search-input').value) {
 				activeLetter = "ALL";
@@ -22901,6 +22921,20 @@ P
 			window.__browseAlphabetAvailability = window.getPsnAlphabetAvailability(browseLetterItems, game => game.cleanName);
 			if (!searchHasText && activeLetter !== 'ALL' && !window.__browseAlphabetAvailability.has(activeLetter)) activeLetter = 'ALL';
 			renderLetterFilter();
+		}
+
+		if (ENABLE_REGION_GRAY_OUT) {
+			const browseRegionContext = {
+				...browseFilterContext,
+				regionFilter: 'ALL'
+			};
+			const browseRegionItems = (Array.isArray(currentData) ? currentData : []).filter(game =>
+				browseItemPassesFiltersBeforeMissingRap(game, browseRegionContext)
+			);
+			window.__browseRegionAvailability = new Set(
+				browseRegionItems.map(game => String(game.region || '').toUpperCase()).filter(region => ['US', 'EU', 'JP', 'ASIA'].includes(region))
+			);
+			if (typeof syncBrowseRegionSelectState === 'function') syncBrowseRegionSelectState(currentCat);
 		}
 
 		const browseFilterSource = searchCandidates || currentData;
