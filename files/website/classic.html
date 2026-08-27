@@ -1177,6 +1177,7 @@ body.is-ps3 #game-modal.no-gallery-active:not(.compact-no-summary):not(.help-mod
 	var g_pendingScroll = null;
 	var g_isSearchActive = false;
 	var g_sonyHashCache = {}; 
+	var g_sonyHashOrder = [];
 	var g_allMatches = [];
 	var g_rowByContentId = {};
 	var g_visibleItemsByTitleId = {};
@@ -2180,9 +2181,11 @@ body.is-ps3 #game-modal.no-gallery-active:not(.compact-no-summary):not(.help-mod
 		cache_h[title_id] = result;
 
 		if (is_ps3_h) {
-			var keys = [];
-			for (var k in cache_h) { if (cache_h.hasOwnProperty(k)) keys.push(k); }
-			if (keys.length > 300) delete cache_h[keys[0]]; 
+			g_sonyHashOrder.push(title_id);
+			if (g_sonyHashOrder.length > 300) {
+				var oldest_h = g_sonyHashOrder.shift();
+				if (oldest_h) delete cache_h[oldest_h];
+			}
 		} else if (storage_h) {
 			try { storage_h.setItem("h_" + title_id, result); } catch(e) {}
 		}
@@ -3836,6 +3839,9 @@ body.is-ps3 #game-modal.no-gallery-active:not(.compact-no-summary):not(.help-mod
 	var g_classicBaseGameIndex = {};
 	var g_classicBaseGameIndexLoaded = false;
 	var g_classicBaseGameIndexLoading = false;
+	var g_classicBaseGameHelperLoaded = false;
+	var g_classicBaseGameHelperFailed = false;
+	var URL_DB_BASE_GAME_INDEX = "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/database/helpers/base_game_index.tsv";
 
 	function classicCleanTitleId(value) {
 		return String(value || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
@@ -4081,8 +4087,102 @@ body.is-ps3 #game-modal.no-gallery-active:not(.compact-no-summary):not(.help-mod
 	}
 
 
+
+	function classicParseBaseGameHelper(text_h) {
+		if (!text_h) return false;
+
+		var map_h = {};
+		var validCount_h = 0;
+		var pos_h = 0;
+		var len_h = text_h.length;
+
+		while (pos_h < len_h) {
+			var lineEnd_h = text_h.indexOf('\n', pos_h);
+			if (lineEnd_h === -1) lineEnd_h = len_h;
+			var line_h = text_h.substring(pos_h, lineEnd_h);
+			if (line_h.length && line_h.charCodeAt(line_h.length - 1) === 13) line_h = line_h.substring(0, line_h.length - 1);
+			pos_h = lineEnd_h + 1;
+
+			if (!line_h || line_h.charAt(0) === '#') continue;
+
+			var kind_h = line_h.charAt(0);
+			if ((kind_h !== 'G' && kind_h !== 'A' && kind_h !== 'D') || line_h.charAt(1) !== '\t') continue;
+
+			var t1_h = line_h.indexOf('\t', 2);
+			var titleId_h = t1_h === -1 ? line_h.substring(2) : line_h.substring(2, t1_h);
+			titleId_h = classicCleanTitleId(titleId_h);
+			if (titleId_h.length !== 9) continue;
+
+			var category_h = kind_h === 'G' ? 'games' : (kind_h === 'A' ? 'apps' : 'demos');
+
+			if (kind_h === 'G') {
+				var name_h = '';
+				var contentId_h = '';
+				if (t1_h !== -1) {
+					var t2_h = line_h.indexOf('\t', t1_h + 1);
+					if (t2_h === -1) {
+						name_h = line_h.substring(t1_h + 1);
+					} else {
+						name_h = line_h.substring(t1_h + 1, t2_h);
+						contentId_h = line_h.substring(t2_h + 1);
+					}
+				}
+
+				if (classicIsGuideName(name_h) || classicIsSoundtrackName(name_h) || classicIsVideoName(name_h, contentId_h, titleId_h)) continue;
+			}
+
+			var oldCat_h = map_h[titleId_h];
+			if (!oldCat_h || classicBaseCategoryPriority(category_h) > classicBaseCategoryPriority(oldCat_h)) {
+				map_h[titleId_h] = category_h;
+			}
+			validCount_h++;
+		}
+
+		if (validCount_h === 0) return false;
+		g_classicBaseGameIndex = map_h;
+		return true;
+	}
+
 	function classicEnsureBaseGameIndex() {
 		if (g_classicBaseGameIndexLoaded || g_classicBaseGameIndexLoading) return;
+
+		if (isPS3 && !g_classicBaseGameHelperFailed) {
+			g_classicBaseGameIndexLoading = true;
+
+			try {
+				var helperXhr_h = new XMLHttpRequest();
+				helperXhr_h.onreadystatechange = function() {
+					if (helperXhr_h.readyState !== 4) return;
+					helperXhr_h.onreadystatechange = null;
+
+					if ((helperXhr_h.status === 200 || helperXhr_h.status === 0) && classicParseBaseGameHelper(helperXhr_h.responseText || '')) {
+						g_classicBaseGameHelperLoaded = true;
+						g_classicBaseGameIndexLoaded = true;
+						g_classicBaseGameIndexLoading = false;
+
+						if (classicIsChildContentCategory(currentCategory)) {
+							classicRefreshVisibleTitleIdLinks();
+						}
+
+						helperXhr_h = null;
+						return;
+					}
+
+					g_classicBaseGameHelperFailed = true;
+					g_classicBaseGameIndexLoading = false;
+					helperXhr_h = null;
+					classicEnsureBaseGameIndex();
+				};
+
+				helperXhr_h.open('GET', URL_DB_BASE_GAME_INDEX, true);
+				helperXhr_h.send();
+			} catch (e) {
+				g_classicBaseGameHelperFailed = true;
+				g_classicBaseGameIndexLoading = false;
+				classicEnsureBaseGameIndex();
+			}
+			return;
+		}
 
 		g_classicBaseGameIndexLoading = true;
 
@@ -6540,6 +6640,7 @@ function restorePreviousState() {
 
 		g_nameCache = {}; 
 		g_sonyHashCache = {};
+		g_sonyHashOrder = [];
 
 		if (cat === 'dlcs' || isUnofficialMode) {
 			g_gamesLoadCount++;
@@ -6610,8 +6711,18 @@ function restorePreviousState() {
 			if (!g_coverIndexLoaded) loadCoverIndexBackground();
 		}, 50);
 
-		if (cat === 'games' && !g_childIndexLoaded && (!g_dlcIndexLoaded || !g_avatarIndexLoaded || !g_themeIndexLoaded)) {
-			setTimeout(loadChildContentIndexBackground, 20);
+		if (cat === 'games') {
+			if (is_ps3_h) {
+				if (!g_childIndexLoaded && (!g_dlcIndexLoaded || !g_avatarIndexLoaded || !g_themeIndexLoaded)) {
+					setTimeout(loadChildContentIndexBackground, 20);
+				}
+			} else {
+				setTimeout(function() {
+					if (!g_dlcIndexLoaded) loadDLCIndexBackground();
+					if (!g_avatarIndexLoaded) loadAvatarIndexBackground();
+					if (!g_themeIndexLoaded) loadThemeIndexBackground();
+				}, 150);
+			}
 		}
 
 		if (cat === 'games' || cat === 'apps') {
@@ -9903,6 +10014,7 @@ function restorePreviousState() {
 
 		g_nameCache = {}; 
 		g_sonyHashCache = {};
+		g_sonyHashOrder = [];
 		g_allMatches = [];
 		DB = [];
 		g_tempMap = {};
@@ -10009,6 +10121,7 @@ function restorePreviousState() {
 
         g_nameCache = null;
         g_sonyHashCache = null;
+        g_sonyHashOrder = null;
         g_domCache = null;
 
         if (DB) {
