@@ -514,8 +514,6 @@ select option { background-color: var(--bg-dark); }
 /* --- LARGE COLLECTION MEMORY / PAINT OPTIMIZATION (PC) --- */
 html.collection-memory-optimization-on #database-grid > .game-card, html.collection-memory-optimization-on #wishlist-grid > .game-card, html.collection-memory-optimization-on #ps3-local-grid > .game-card, html.collection-memory-optimization-on #ps3-favs-grid > .game-card { content-visibility: auto; contain-intrinsic-size: auto 280px; }
 html.collection-memory-optimization-on #downloads-list > .download-swipe-row { content-visibility: auto; contain-intrinsic-size: auto 76px; }
-html.collection-memory-optimization-on .collection-dom-recycled { content-visibility: visible !important; contain: layout paint style !important; contain-intrinsic-size: none !important; box-sizing: border-box !important; opacity: 1 !important; visibility: visible !important; background: var(--card-surface-bg) !important; background-image: none !important; border-color: rgba(255,255,255,0.03) !important; box-shadow: none !important; backdrop-filter: none !important; -webkit-backdrop-filter: none !important; animation: none !important; transform: none !important; filter: none !important; pointer-events: none !important; overflow: hidden !important; overflow-anchor: none !important; }
-html.collection-memory-optimization-on .collection-dom-recycled::before, html.collection-memory-optimization-on .collection-dom-recycled::after { content: none !important; display: none !important; animation: none !important; }
 .game-card { --card-glow-x: 50%; --card-glow-y: 38%; background-color: var(--card-surface-bg); border: 1px solid rgba(255,255,255,0.03); border-radius: 10px; overflow: hidden; cursor: pointer; display: flex; flex-direction: column; transform: translateY(0) translateZ(0); backface-visibility: hidden; transition: transform 0.3s ease-out,box-shadow 0.3s ease-out; backdrop-filter: var(--card-surface-blur); -webkit-backdrop-filter: var(--card-surface-blur); }
 .game-card.anim-reveal { opacity: 0; animation: tileReveal 0.4s ease-out forwards; animation-delay: calc(var(--tile-idx,0) * 0.04s); }
 #subview-games.collection-entry-reveal-prep #ps3-local-grid>.game-card, #subview-favs.collection-entry-reveal-prep #ps3-favs-grid>.game-card { opacity:0 !important; animation:none !important; }
@@ -6693,7 +6691,7 @@ img { -webkit-user-drag: none !important; user-drag: none !important; }
 				
 				<div class="setting-item" id="automatic-library-scan-setting" onmouseenter="playUiHover()">
 					<div>
-						<div style="font-size: 18px; color: #fff; font-weight: 500;">Automatic Library Scan</div>
+						<div style="font-size: 18px; color: #fff; font-weight: 500;">Library Scan</div>
 						<div style="font-size: 13px; color: var(--text-muted); margin-top: 6px;">
 							Set whether or not to automatically scan for installed games after the console connects. Manual Scan Games remains available when disabled.
 						</div>
@@ -6707,7 +6705,7 @@ img { -webkit-user-drag: none !important; user-drag: none !important; }
 				<div class="settings-section-label">Interface</div>
 				<div class="setting-item" id="interface-auto-translate-setting" onmouseenter="playUiHover()">
 					<div>
-						<div style="font-size: 18px; color: #fff; font-weight: 500;">Automatic Interface Translation</div>
+						<div style="font-size: 18px; color: #fff; font-weight: 500;">Interface Translation</div>
 						<div style="font-size: 13px; color: var(--text-muted); margin-top: 6px;">
 							Set whether or not to translate interface labels using the language configured on this device. Enabled by default; the login screen follows the last user preference. Chat messages use their own translation setting.
 						</div>
@@ -6736,7 +6734,7 @@ img { -webkit-user-drag: none !important; user-drag: none !important; }
 					<div>
 						<div style="font-size: 18px; color: #fff; font-weight: 500;">Memory Optimization</div>
 						<div style="font-size: 13px; color: var(--text-muted); margin-top: 6px;">
-							Set whether or not to reduce RAM usage in large collections by recycling off-screen cards and covers.
+							Set whether or not to reduce RAM usage in large collections by unloading off-screen cover images while keeping the card layout intact.
 						</div>
 					</div>
 					<label class="switch">
@@ -21081,397 +21079,13 @@ P
 		});
 	}
 
-	/* --- LARGE COLLECTION DOM RECYCLING ---
-	   Stable PC windowing: far cards keep a visible fixed-size outer shell. The card
-	   markup is kept as a lightweight string only while recycled, then released as
-	   soon as that card is restored. No whole-grid rebuilds are ever performed. */
-	const COLLECTION_DOM_SHELL_SELECTOR = '#database-grid > .game-card, #wishlist-grid > .game-card, #ps3-local-grid > .game-card, #ps3-favs-grid > .game-card, #downloads-list > .download-swipe-row';
-	const COLLECTION_DOM_MAIN_MARGIN = '2600px 0px 2600px 0px';
-	const COLLECTION_DOM_DOWNLOAD_MARGIN = '1600px 0px 1600px 0px';
-	const COLLECTION_DOM_MIN_GRID_ITEMS = 100;
-	const COLLECTION_DOM_MIN_DOWNLOAD_ITEMS = 70;
-	const COLLECTION_DOM_SCROLL_STOP_DELAY = 300;
-	const COLLECTION_DOM_IDLE_BATCH = 8;
-	const COLLECTION_DOM_STOP_BATCH = 12;
-	const collectionDomState = new WeakMap();
-	const collectionDomObservers = { main: null, downloads: null, mutations: null };
-	const collectionDomRoots = { main: null, downloads: null };
-	const collectionDomRecycleQueue = new Set();
-	let collectionDomRecycleTask = null;
-	let collectionDomStopTask = null;
-	let collectionDomRestoreSyncFrame = 0;
-	let collectionDomResizeTimer = null;
-	let collectionDomScrollStopTimer = null;
-	let collectionDomScrolling = false;
-
-	function isCollectionDomShell(node) {
-		return !!(node && node.nodeType === 1 && node.matches?.(COLLECTION_DOM_SHELL_SELECTOR));
-	}
-
-	function getCollectionDomObserverKey(shell) {
-		return shell?.closest?.('#downloads-list') ? 'downloads' : 'main';
-	}
-
-	function getCollectionDomMinItems(shell) {
-		return getCollectionDomObserverKey(shell) === 'downloads' ? COLLECTION_DOM_MIN_DOWNLOAD_ITEMS : COLLECTION_DOM_MIN_GRID_ITEMS;
-	}
-
-	function getCollectionDomSiblingCount(shell) {
-		const parent = shell?.parentElement;
-		if (!parent) return 0;
-		const selector = getCollectionDomObserverKey(shell) === 'downloads' ? ':scope > .download-swipe-row' : ':scope > .game-card';
-		try { return parent.querySelectorAll(selector).length; } catch (e) { return parent.children?.length || 0; }
-	}
-
-	function unregisterCollectionDomShell(shell) {
-		if (!shell || shell.nodeType !== 1) return;
-		collectionDomRecycleQueue.delete(shell);
-		const key = shell.dataset?.collectionDomObserver || '';
-		if (key && collectionDomObservers[key]) {
-			try { collectionDomObservers[key].unobserve(shell); } catch (e) {}
-		} else {
-			['main', 'downloads'].forEach(observerKey => {
-				try { collectionDomObservers[observerKey]?.unobserve(shell); } catch (e) {}
-			});
-		}
-		delete shell.dataset.collectionDomObserver;
-		collectionDomState.delete(shell);
-	}
-
-	function registerCollectionDomShell(shell) {
-		if (!isCollectionDomShell(shell) || shell.dataset.collectionDomObserver) return;
-		if (shell.classList.contains('skeleton-card')) return;
-		const key = getCollectionDomObserverKey(shell);
-		const observer = collectionDomObservers[key];
-		if (!observer) return;
-		shell.dataset.collectionDomObserver = key;
-		observer.observe(shell);
-	}
-
-	function forEachCollectionDomShell(node, callback) {
-		if (!node || typeof callback !== 'function') return;
-		if (node.nodeType === 1 && isCollectionDomShell(node)) callback(node);
-		if (node.querySelectorAll) node.querySelectorAll(COLLECTION_DOM_SHELL_SELECTOR).forEach(callback);
-	}
-
-	function getCollectionDomShellHeight(shell) {
-		const state = collectionDomState.get(shell);
-		const remembered = Math.max(0, Number(state?.lastHeight || 0));
-		if (remembered >= 20) return remembered;
-		const liveHeight = Math.max(0, Number(shell.offsetHeight || shell.getBoundingClientRect?.().height || 0));
-		return liveHeight;
-	}
-
-	function canRecycleCollectionDomShell(shell) {
-		if (window.__collectionMemoryOptimizationEnabled === false) return false;
-		if (!isCollectionDomShell(shell) || !shell.isConnected || shell.dataset.collectionDomRecycled === '1') return false;
-		if (getCollectionDomSiblingCount(shell) < getCollectionDomMinItems(shell)) return false;
-		if (shell.contains(document.activeElement)) return false;
-		if (shell.matches?.(':hover')) return false;
-		if (shell.classList.contains('is-open') || shell.classList.contains('is-swiping') || shell.classList.contains('category-wishlist-entry') || shell.classList.contains('category-favorites-entry') || shell.classList.contains('store-focus-evidence')) return false;
-		return getCollectionDomShellHeight(shell) >= 20;
-	}
-
-	function applyCollectionDomSizeLock(shell, height) {
-		if (!shell || height < 20) return;
-		const px = `${Math.ceil(height)}px`;
-		shell.style.setProperty('height', px, 'important');
-		shell.style.setProperty('min-height', px, 'important');
-		shell.style.setProperty('max-height', px, 'important');
-		shell.style.setProperty('block-size', px, 'important');
-		shell.style.setProperty('min-block-size', px, 'important');
-		shell.style.setProperty('max-block-size', px, 'important');
-		shell.style.setProperty('align-self', 'start', 'important');
-		if (getCollectionDomObserverKey(shell) === 'downloads') shell.style.setProperty('flex', `0 0 ${px}`, 'important');
-	}
-
-	function restoreCollectionDomOriginalStyle(shell, state) {
-		if (!shell) return;
-		if (state?.originalStyle === null || state?.originalStyle === undefined) shell.removeAttribute('style');
-		else shell.setAttribute('style', state.originalStyle);
-	}
-
-	function recycleCollectionDomShell(shell) {
-		if (!canRecycleCollectionDomShell(shell)) return false;
-		const height = getCollectionDomShellHeight(shell);
-		if (height < 20) return false;
-
-		/* Keep only text markup while the card is absent. This is much lighter than its
-		   live DOM tree and, unlike the previous approach, lets us restore this one card
-		   without rebuilding thousands of siblings. */
-		const html = shell.innerHTML;
-		if (!html) return false;
-		const previousState = collectionDomState.get(shell) || {};
-		const originalStyle = Object.prototype.hasOwnProperty.call(previousState, 'originalStyle')
-			? previousState.originalStyle
-			: shell.getAttribute('style');
-
-		forEachCollectionMemoryImage(shell, unregisterCollectionMemoryImage);
-		collectionDomState.set(shell, {
-			html,
-			originalStyle,
-			lastHeight: height,
-			observerKey: getCollectionDomObserverKey(shell)
-		});
-
-		shell.replaceChildren();
-		applyCollectionDomSizeLock(shell, height);
-		shell.dataset.collectionDomRecycled = '1';
-		shell.classList.add('collection-dom-recycled');
-		return true;
-	}
-
-	function syncRestoredCollectionDom() {
-		collectionDomRestoreSyncFrame = 0;
-		if (typeof window.applyContentDownloadCountsToCards === 'function') {
-			['database-grid', 'wishlist-grid', 'ps3-local-grid', 'ps3-favs-grid'].forEach(id => {
-				const root = document.getElementById(id);
-				if (root) window.applyContentDownloadCountsToCards(root);
-			});
-		}
-		if (typeof window.refreshVisibleWishlistCardsFromProfileSync === 'function') window.refreshVisibleWishlistCardsFromProfileSync();
-		if (typeof window.refreshVisibleFavoriteCardsFromProfileSync === 'function') window.refreshVisibleFavoriteCardsFromProfileSync();
-		if (typeof window.refreshBrowsePlayingCards === 'function') window.refreshBrowsePlayingCards();
-		document.querySelectorAll('#ps3-local-grid .my-games-playing-time, #ps3-favs-grid .my-games-playing-time').forEach(el => {
-			el.textContent = window.currentPs3PlayTime || '--:--:--';
-		});
-		if (typeof window.syncConsoleLibraryPlayingState === 'function') window.syncConsoleLibraryPlayingState();
-	}
-
-	function scheduleRestoredCollectionDomSync() {
-		if (collectionDomRestoreSyncFrame) return;
-		collectionDomRestoreSyncFrame = requestAnimationFrame(syncRestoredCollectionDom);
-	}
-
-	function restoreCollectionDomShell(shell) {
-		if (!isCollectionDomShell(shell) || shell.dataset.collectionDomRecycled !== '1') return false;
-		const state = collectionDomState.get(shell);
-		if (!state?.html) return false;
-
-		const html = state.html;
-		const lastHeight = Math.max(20, Number(state.lastHeight || 0));
-		restoreCollectionDomOriginalStyle(shell, state);
-		/* Keep the exact learned block size while restoring. This prevents a recycled
-		   grid row from collapsing for one frame and permanently shortening scrollHeight. */
-		applyCollectionDomSizeLock(shell, lastHeight);
-		shell.classList.remove('collection-dom-recycled');
-		delete shell.dataset.collectionDomRecycled;
-		shell.innerHTML = html;
-
-		/* Release the serialized payload immediately; never keep live DOM + snapshot. */
-		collectionDomState.set(shell, {
-			lastHeight,
-			observerKey: state.observerKey,
-			originalStyle: state.originalStyle
-		});
-
-		forEachCollectionMemoryImage(shell, img => {
-			registerCollectionMemoryImage(img);
-			if (typeof restoreCollectionImage === 'function') restoreCollectionImage(img);
-		});
-		scheduleRestoredCollectionDomSync();
-		return true;
-	}
-
-	function takeCollectionDomQueueBatch(limit) {
-		const batch = [];
-		for (const shell of collectionDomRecycleQueue) {
-			collectionDomRecycleQueue.delete(shell);
-			batch.push(shell);
-			if (batch.length >= limit) break;
-		}
-		return batch;
-	}
-
-	function runCollectionDomRecycleBatch(limit, deadline = null) {
-		if (window.__collectionMemoryOptimizationEnabled === false || collectionDomScrolling || !collectionDomRecycleQueue.size) return 0;
-		let processed = 0;
-		const batch = takeCollectionDomQueueBatch(limit);
-		for (const shell of batch) {
-			if (!shell?.isConnected || shell.dataset.collectionDomRecycled === '1') continue;
-			if (!canRecycleCollectionDomShell(shell)) continue;
-			recycleCollectionDomShell(shell);
-			processed++;
-			if (deadline && typeof deadline.timeRemaining === 'function' && deadline.timeRemaining() < 4) break;
-		}
-		return processed;
-	}
-
-	function runCollectionDomIdleQueue(deadline) {
-		collectionDomRecycleTask = null;
-		if (collectionDomScrolling) return;
-		runCollectionDomRecycleBatch(COLLECTION_DOM_IDLE_BATCH, deadline);
-		if (collectionDomRecycleQueue.size && !collectionDomScrolling) scheduleCollectionDomIdleQueue();
-	}
-
-	function scheduleCollectionDomIdleQueue() {
-		if (window.__collectionMemoryOptimizationEnabled === false || collectionDomRecycleTask || collectionDomScrolling || !collectionDomRecycleQueue.size) return;
-		if (typeof requestIdleCallback === 'function') {
-			collectionDomRecycleTask = requestIdleCallback(runCollectionDomIdleQueue, { timeout: 700 });
-		} else {
-			collectionDomRecycleTask = setTimeout(() => runCollectionDomIdleQueue(null), 32);
-		}
-	}
-
-	function runCollectionDomStopQueue() {
-		collectionDomStopTask = null;
-		if (collectionDomScrolling || !collectionDomRecycleQueue.size) return;
-		runCollectionDomRecycleBatch(COLLECTION_DOM_STOP_BATCH, null);
-		/* Yield one frame between batches so a long cleanup cannot lock Browse. */
-		if (collectionDomRecycleQueue.size && !collectionDomScrolling) {
-			collectionDomStopTask = setTimeout(runCollectionDomStopQueue, 42);
-		}
-	}
-
-	function scheduleCollectionDomStopQueue() {
-		if (window.__collectionMemoryOptimizationEnabled === false || collectionDomStopTask || collectionDomScrolling || !collectionDomRecycleQueue.size) return;
-		collectionDomStopTask = setTimeout(runCollectionDomStopQueue, 0);
-	}
-
-	function queueCollectionDomRecycle(shell) {
-		if (window.__collectionMemoryOptimizationEnabled === false) return;
-		if (!isCollectionDomShell(shell) || shell.dataset.collectionDomRecycled === '1') return;
-		collectionDomRecycleQueue.add(shell);
-		if (!collectionDomScrolling) scheduleCollectionDomIdleQueue();
-	}
-
-	function handleCollectionDomIntersection(entries) {
-		entries.forEach(entry => {
-			const shell = entry.target;
-			if (!shell?.isConnected) {
-				unregisterCollectionDomShell(shell);
-				return;
-			}
-			if (window.__collectionMemoryOptimizationEnabled === false) {
-				collectionDomRecycleQueue.delete(shell);
-				if (shell.dataset.collectionDomRecycled === '1') restoreCollectionDomShell(shell);
-				return;
-			}
-
-			const state = collectionDomState.get(shell) || {};
-			const isNear = entry.isIntersecting || entry.intersectionRatio > 0;
-			const measuredHeight = Math.max(0, Number(entry.boundingClientRect?.height || shell.offsetHeight || 0));
-			if (isNear && measuredHeight >= 20 && shell.dataset.collectionDomRecycled !== '1') {
-				collectionDomState.set(shell, { ...state, lastHeight: measuredHeight });
-			}
-
-			if (isNear) {
-				collectionDomRecycleQueue.delete(shell);
-				/* Restore this shell synchronously, well before it reaches the viewport. */
-				if (shell.dataset.collectionDomRecycled === '1') restoreCollectionDomShell(shell);
-			} else {
-				queueCollectionDomRecycle(shell);
-			}
-		});
-	}
-
-	function restoreAllCollectionDomShells() {
-		document.querySelectorAll(`${COLLECTION_DOM_SHELL_SELECTOR}[data-collection-dom-recycled="1"]`).forEach(restoreCollectionDomShell);
-	}
-	window.restoreAllCollectionDomShells = restoreAllCollectionDomShells;
-
-	function onCollectionDomScroll() {
-		collectionDomScrolling = true;
-		if (collectionDomStopTask) { clearTimeout(collectionDomStopTask); collectionDomStopTask = null; }
-		clearTimeout(collectionDomScrollStopTimer);
-		collectionDomScrollStopTimer = setTimeout(() => {
-			collectionDomScrolling = false;
-			/* Cleanup starts only after scroll settles; restoration itself remains immediate. */
-			scheduleCollectionDomStopQueue();
-		}, COLLECTION_DOM_SCROLL_STOP_DELAY);
-	}
-
-	function setupCollectionDomRecycler() {
-		if (window.__collectionMemoryOptimizationEnabled === false) return;
-		if (collectionDomObservers.mutations || typeof IntersectionObserver !== 'function') return;
-		const mainRoot = document.getElementById('scroll-area') || document.querySelector('.main-content') || document.querySelector('.content') || null;
-		const downloadsRoot = document.getElementById('downloads-list') || null;
-		collectionDomRoots.main = mainRoot;
-		collectionDomRoots.downloads = downloadsRoot;
-
-		collectionDomObservers.main = new IntersectionObserver(handleCollectionDomIntersection, {
-			root: mainRoot,
-			rootMargin: COLLECTION_DOM_MAIN_MARGIN,
-			threshold: 0.001
-		});
-		collectionDomObservers.downloads = new IntersectionObserver(handleCollectionDomIntersection, {
-			root: downloadsRoot,
-			rootMargin: COLLECTION_DOM_DOWNLOAD_MARGIN,
-			threshold: 0.001
-		});
-
-		document.querySelectorAll(COLLECTION_DOM_SHELL_SELECTOR).forEach(registerCollectionDomShell);
-		collectionDomObservers.mutations = new MutationObserver(mutations => {
-			for (const mutation of mutations) {
-				mutation.removedNodes.forEach(node => forEachCollectionDomShell(node, unregisterCollectionDomShell));
-				mutation.addedNodes.forEach(node => forEachCollectionDomShell(node, registerCollectionDomShell));
-			}
-		});
-		collectionDomObservers.mutations.observe(document.body, { childList: true, subtree: true });
-
-		if (mainRoot) mainRoot.addEventListener('scroll', onCollectionDomScroll, { passive: true });
-		if (downloadsRoot && downloadsRoot !== mainRoot) downloadsRoot.addEventListener('scroll', onCollectionDomScroll, { passive: true });
-
-		window.addEventListener('resize', onCollectionDomResize, { passive: true });
-	}
-
-	function onCollectionDomResize() {
-		clearTimeout(collectionDomResizeTimer);
-		collectionDomResizeTimer = setTimeout(() => {
-			restoreAllCollectionDomShells();
-			document.querySelectorAll(COLLECTION_DOM_SHELL_SELECTOR).forEach(shell => {
-				const state = collectionDomState.get(shell);
-				if (!state) return;
-				restoreCollectionDomOriginalStyle(shell, state);
-				collectionDomState.set(shell, { ...state, lastHeight: 0, html: undefined });
-			});
-		}, 180);
-	}
-
-	function cancelCollectionDomRecyclerTasks() {
-		clearTimeout(collectionDomScrollStopTimer);
-		clearTimeout(collectionDomStopTask);
-		clearTimeout(collectionDomResizeTimer);
-		collectionDomScrollStopTimer = null;
-		collectionDomStopTask = null;
-		collectionDomResizeTimer = null;
-		if (collectionDomRecycleTask) {
-			try { if (typeof cancelIdleCallback === 'function') cancelIdleCallback(collectionDomRecycleTask); } catch (e) {}
-			try { clearTimeout(collectionDomRecycleTask); } catch (e) {}
-			collectionDomRecycleTask = null;
-		}
-	}
-
-	function teardownCollectionDomRecycler() {
-		cancelCollectionDomRecyclerTasks();
-		collectionDomRecycleQueue.clear();
-		collectionDomScrolling = false;
-		restoreAllCollectionDomShells();
-		if (collectionDomRoots.main) collectionDomRoots.main.removeEventListener('scroll', onCollectionDomScroll);
-		if (collectionDomRoots.downloads && collectionDomRoots.downloads !== collectionDomRoots.main) collectionDomRoots.downloads.removeEventListener('scroll', onCollectionDomScroll);
-		window.removeEventListener('resize', onCollectionDomResize);
-		try { collectionDomObservers.main?.disconnect(); } catch (e) {}
-		try { collectionDomObservers.downloads?.disconnect(); } catch (e) {}
-		try { collectionDomObservers.mutations?.disconnect(); } catch (e) {}
-		collectionDomObservers.main = null;
-		collectionDomObservers.downloads = null;
-		collectionDomObservers.mutations = null;
-		collectionDomRoots.main = null;
-		collectionDomRoots.downloads = null;
-		document.querySelectorAll(COLLECTION_DOM_SHELL_SELECTOR).forEach(unregisterCollectionDomShell);
-	}
 
 	window.setCollectionMemoryOptimizationEnabled = function(enabled) {
 		const next = enabled !== false;
 		window.__collectionMemoryOptimizationEnabled = next;
 		document.documentElement.classList.toggle('collection-memory-optimization-on', next);
-		if (next) {
-			setupCollectionMemoryManager();
-			setupCollectionDomRecycler();
-		} else {
-			teardownCollectionDomRecycler();
-			teardownCollectionMemoryManager();
-		}
+		if (next) setupCollectionMemoryManager();
+		else teardownCollectionMemoryManager();
 	};
 
 	function bootCollectionMemoryOptimization() {
