@@ -1436,12 +1436,13 @@ function getLibraryLastPlayedTimestampServer(game = {}) {
 function isSameLibraryGameServer(first = {}, second = {}) {
   const firstTitleId = getLibraryGameTitleIdServer(first);
   const secondTitleId = getLibraryGameTitleIdServer(second);
-  if (firstTitleId && secondTitleId) return firstTitleId === secondTitleId;
+  if (firstTitleId && secondTitleId && firstTitleId === secondTitleId) return true;
 
   const firstPath = normalizeLibraryGamePathServer(first.path);
   const secondPath = normalizeLibraryGamePathServer(second.path);
   if (firstPath && secondPath && firstPath === secondPath) return true;
 
+  if (firstTitleId && secondTitleId) return false;
   const firstTitle = normalizeLibraryIdentityTextServer(first.title || first.name);
   const secondTitle = normalizeLibraryIdentityTextServer(second.title || second.name);
   return !!(firstTitle && secondTitle && firstTitle === secondTitle);
@@ -1526,7 +1527,7 @@ function findLibraryRecordMatchServer(item = {}, index = null) {
 
   if (titleId) {
     collect(index.byTitleId.get(titleId));
-    if (path) collect(index.byPath.get(path), true);
+    if (path) collect(index.byPath.get(path), false);
     if (title) collect(index.byTitle.get(title), true);
   } else {
     if (path) collect(index.byPath.get(path));

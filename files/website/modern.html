@@ -37099,6 +37099,8 @@ P
 			return;
 		}
 	
+		if (typeof window.ensureMutableProfileSectionReady === 'function' && !(await window.ensureMutableProfileSectionReady('library', 'library-refresh'))) return;
+
 		if (subviewGames) subviewGames.classList.remove('my-games-offline');
 		const hasRenderedLocalCards = !!(grid && grid.querySelector('.game-card'));
 		const hadCachedLocalGames = typeof lastScannedGames !== 'undefined' && lastScannedGames.length > 0;
@@ -37172,7 +37174,8 @@ P
 			let shouldRepaintLocalLibrary = false;
 			if (typeof lastScannedGames !== 'undefined') {
 				const previousSignature = getLocalLibraryDataSignature(lastScannedGames);
-				const mergedGames = mergeLibraryLastPlayedLists(discoveredGames, lastScannedGames).map(game => {
+				const historyFallback = mergeLibraryLastPlayedLists(lastScannedGames, favoritesLibrary || []);
+				const mergedGames = mergeLibraryLastPlayedLists(discoveredGames, historyFallback).map(game => {
 					if (!game.titleId) game.titleId = getLibraryGameTitleId(game) || null;
 					return game;
 				});
@@ -37401,12 +37404,13 @@ function formatLibraryLastPlayedBadge(game = {}) {
 	function isSameLibraryGameRecord(first = {}, second = {}) {
 		const firstTitleId = getLibraryGameTitleId(first);
 		const secondTitleId = getLibraryGameTitleId(second);
-		if (firstTitleId && secondTitleId) return firstTitleId === secondTitleId;
+		if (firstTitleId && secondTitleId && firstTitleId === secondTitleId) return true;
 
 		const firstPath = normalizeLibraryGamePath(first.path);
 		const secondPath = normalizeLibraryGamePath(second.path);
 		if (firstPath && secondPath && firstPath === secondPath) return true;
 
+		if (firstTitleId && secondTitleId) return false;
 		const firstTitle = normalizeLibraryIdentityText(first.title || first.name);
 		const secondTitle = normalizeLibraryIdentityText(second.title || second.name);
 		return !!(firstTitle && secondTitle && firstTitle === secondTitle);
@@ -37499,7 +37503,7 @@ function formatLibraryLastPlayedBadge(game = {}) {
 
 		if (titleId) {
 			collect(index.byTitleId.get(titleId), false);
-			if (path) collect(index.byPath.get(path), true);
+			if (path) collect(index.byPath.get(path), false);
 			if (title) collect(index.byTitle.get(title), true);
 		} else {
 			if (path) collect(index.byPath.get(path), false);
@@ -37651,25 +37655,10 @@ function formatLibraryLastPlayedBadge(game = {}) {
 		const cachedData = ensureLibraryCoverCache(game, gameId);
 		const currentPlaying = window.myCurrentPS3Status || { status: 'idle' };
 		const isPlaying = isConsoleLibraryGamePlaying(game, cachedData, currentPlaying);
-		const playingStateChanged = card.classList.contains('is-playing') !== isPlaying;
-		const imageContainer = card.querySelector('.game-img-container');
-
-		if (!playingStateChanged && imageContainer) {
-			const playingIndicator = imageContainer.querySelector('.playing-mid-indicator');
-			const playingTimeBadge = imageContainer.querySelector('.my-games-playing-time-badge');
-			const lastPlayedBadge = imageContainer.querySelector('.my-games-last-played-badge');
-			if (isPlaying) {
-				if (playingIndicator && playingTimeBadge && !lastPlayedBadge) return false;
-			} else {
-				const lastPlayedText = formatLibraryLastPlayedBadge(game);
-				const currentLastPlayedText = lastPlayedBadge?.querySelector('span')?.textContent || '';
-				if (!playingIndicator && !playingTimeBadge && ((!lastPlayedText && !lastPlayedBadge) || (lastPlayedText && currentLastPlayedText === lastPlayedText))) return false;
-			}
-		} else if (!playingStateChanged) {
-			return false;
-		}
+		if (card.classList.contains('is-playing') === isPlaying) return false;
 
 		card.classList.toggle('is-playing', isPlaying);
+		const imageContainer = card.querySelector('.game-img-container');
 		if (imageContainer) {
 			imageContainer.querySelectorAll('.playing-mid-indicator,.my-games-playing-time-badge,.my-games-last-played-badge').forEach(el => el.remove());
 			if (isPlaying) {
@@ -37681,7 +37670,6 @@ function formatLibraryLastPlayedBadge(game = {}) {
 			}
 		}
 
-		if (!playingStateChanged) return true;
 
 		let existsInStore = false;
 		let targetCategory = 'games';
@@ -37964,7 +37952,8 @@ function formatLibraryLastPlayedBadge(game = {}) {
 		setupProgressiveGridObserver('my-games', grid, libraryRenderEnd, games.length, () => renderLocalLibrary(games, isFiltering, true, 'append'));
 	}
 	
-	window.updateLibraryLastPlayed = function(title, titleId) {
+	window.updateLibraryLastPlayed = async function(title, titleId) {
+		if (typeof window.ensureMutableProfileSectionReady === 'function' && !(await window.ensureMutableProfileSectionReady('library', 'last-played-update'))) return;
 		if (!lastScannedGames || lastScannedGames.length === 0) return;
 		
 		let updated = false;
@@ -37974,16 +37963,21 @@ function formatLibraryLastPlayedBadge(game = {}) {
 		const timePart = now.getHours().toString().padStart(2, '0') + ':' + now.getMinutes().toString().padStart(2, '0');
 		const dateTime = `${datePart} - ${timePart}`;
 		const playingGame = { title, titleId, id: titleId, path: titleId || '' };
+		const exactTitleMatches = title ? lastScannedGames.filter(game => game && game.title === title) : [];
+		const canUseTitleFallback = exactTitleMatches.length === 1;
 	
 		lastScannedGames.forEach(game => {
-			if (!isSameLibraryGameRecord(game, playingGame)) return;
+			const matchedByIdentity = isSameLibraryGameRecord(game, playingGame);
+			const matchedByTitleFallback = !matchedByIdentity && canUseTitleFallback && game.title === title;
+			if (!matchedByIdentity && !matchedByTitleFallback) return;
 	
 			const storedTimestamp = Number(game.lastPlayedAt || 0);
 			const resolvedTitleId = getLibraryGameTitleId(playingGame);
-			if (game.lastPlayed !== dateTime || (resolvedTitleId && game.titleId !== resolvedTitleId) || !Number.isFinite(storedTimestamp) || storedTimestamp <= 0) {
+			const shouldUpdateTitleId = matchedByIdentity && resolvedTitleId && game.titleId !== resolvedTitleId;
+			if (game.lastPlayed !== dateTime || shouldUpdateTitleId || !Number.isFinite(storedTimestamp) || storedTimestamp <= 0) {
 				game.lastPlayed = dateTime;
 				game.lastPlayedAt = nowTimestamp;
-				game.titleId = resolvedTitleId || game.titleId || game.id || null;
+				if (shouldUpdateTitleId || !game.titleId) game.titleId = resolvedTitleId || game.titleId || game.id || null;
 				updated = true;
 			}
 		});
@@ -38352,8 +38346,13 @@ function formatLibraryLastPlayedBadge(game = {}) {
 		const titleEl = card.querySelector('.game-title');
 		if (!titleEl) return;
 		const gameTitle = titleEl.getAttribute('title');
+		const renderedPath = card.querySelector('.game-img')?.dataset.libPath || '';
+		const normalizedRenderedPath = normalizeLibraryGamePath(renderedPath);
 		
-		const realIndex = favoritesLibrary.findIndex(f => f.title === gameTitle);
+		const realIndex = favoritesLibrary.findIndex(f =>
+			(normalizedRenderedPath && normalizeLibraryGamePath(f && f.path) === normalizedRenderedPath) ||
+			(!normalizedRenderedPath && f && f.title === gameTitle)
+		);
 		if (realIndex === -1) return;
 		
 		const removedFavoriteItem = favoritesLibrary[realIndex];
@@ -38479,8 +38478,8 @@ function formatLibraryLastPlayedBadge(game = {}) {
 		if (offlineMsg) offlineMsg.style.display = 'none';
 		if (onlineContainer) onlineContainer.style.display = 'block';
 	
-		const installedLibraryPaths = new Set((lastScannedGames || []).map(installed => installed && installed.path).filter(Boolean));
-		const activeFavs = favoritesLibrary.filter(fav => installedLibraryPaths.has(fav.path));
+		const favoriteLibraryPaths = new Set((favoritesLibrary || []).map(fav => normalizeLibraryGamePath(fav && fav.path)).filter(Boolean));
+		const activeFavs = (lastScannedGames || []).filter(installed => installed && favoriteLibraryPaths.has(normalizeLibraryGamePath(installed.path)));
 	
 		if (activeFavs.length === 0) {
 			clearProgressiveGridObserver('favorites', grid);
@@ -51982,7 +51981,7 @@ function getVisibleChatStackEl(id) {
 
 	window.ensureMutableProfileSectionReady = async function(section, reason = 'mutation') {
 		const key = String(section || '').toLowerCase();
-		if (!['downloads','wishlist','favorites'].includes(key)) return true;
+		if (!['downloads','wishlist','favorites','library'].includes(key)) return true;
 		if (window.__psnOfflineModeActive === true || !socketChat || !socketChat.connected) return true;
 		if (!window.isProfileLoaded || typeof window.ensureProfileSectionHydrated !== 'function') return false;
 		const owner = String(localStorage.getItem('psn_username') || '').trim();
