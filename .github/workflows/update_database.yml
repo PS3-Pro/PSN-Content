@@ -20,6 +20,7 @@ jobs:
           BASE_DIR="resources/database/content/official"
           LATEST_DIR="resources/database/content/latest"
           EVENTS_DIR="resources/database/content/events"
+          HELPER_DIR="resources/database/helpers"
           PY_SCRIPT=".github/scripts/generate_latest_releases.py"
 
           clean_tsv() {
@@ -50,6 +51,7 @@ jobs:
           mkdir -p "$BASE_DIR/pending"
           mkdir -p "$LATEST_DIR"
           mkdir -p "$EVENTS_DIR/dlcs" "$EVENTS_DIR/avatars" "$EVENTS_DIR/themes"
+          mkdir -p "$HELPER_DIR"
 
           categories=("games" "avatars" "demos" "dlcs" "themes")
           for cat in "${categories[@]}"; do
@@ -76,6 +78,83 @@ jobs:
             mv "p_clean.tsv" "$BASE_DIR/pending/${cat}.tsv"
             rm "p_raw.tsv"
           done
+
+          echo "Generating compact PS3 Classic child-content helper..."
+
+          python - <<'PY'
+          import csv
+          from pathlib import Path
+
+          base_dir = Path("resources/database/content/official")
+          output = Path("resources/database/helpers/child_content_index.tsv")
+
+          def clean_field(value):
+              return str(value or "").replace("\t", " ").replace("\r", " ").replace("\n", " ").strip()
+
+          def valid_title_id(value):
+              value = clean_field(value).upper()
+              return value if len(value) == 9 else ""
+
+          def read_rows(path):
+              with path.open("r", encoding="utf-8-sig", errors="replace", newline="") as handle:
+                  for row in csv.reader(handle, delimiter="\t"):
+                      yield row
+
+          flags = {}
+          license_candidates = []
+
+          for row in read_rows(base_dir / "dlcs.tsv"):
+              if not row:
+                  continue
+
+              title_id = valid_title_id(row[0])
+              if not title_id:
+                  continue
+
+              flags.setdefault(title_id, set()).add("D")
+
+              # Same compact data the Classic already extracts from dlcs.tsv
+              # for its Missing Licenses matching.
+              if len(row) < 6:
+                  continue
+
+              pkg_url = clean_field(row[3])
+              if not pkg_url or pkg_url.upper() == "MISSING":
+                  continue
+
+              name = clean_field(row[2])
+              content_id = clean_field(row[5])
+              license_candidates.append((title_id, name, content_id))
+
+          for filename, flag in (("avatars.tsv", "A"), ("themes.tsv", "T")):
+              for row in read_rows(base_dir / filename):
+                  if not row:
+                      continue
+
+                  title_id = valid_title_id(row[0])
+                  if title_id:
+                      flags.setdefault(title_id, set()).add(flag)
+
+          output.parent.mkdir(parents=True, exist_ok=True)
+
+          with output.open("w", encoding="utf-8", newline="\n") as handle:
+              handle.write("# PS3 Classic child content index v1\n")
+              handle.write("# I\\tTITLE_ID\\tFLAGS(D/A/T)\n")
+              handle.write("# L\\tTITLE_ID\\tDLC_NAME\\tCONTENT_ID\n")
+
+              for title_id in sorted(flags):
+                  ordered_flags = "".join(flag for flag in "DAT" if flag in flags[title_id])
+                  handle.write("I\t{}\t{}\n".format(title_id, ordered_flags))
+
+              for title_id, name, content_id in license_candidates:
+                  handle.write("L\t{}\t{}\t{}\n".format(title_id, name, content_id))
+
+          print(
+              "Generated {} | Title IDs: {} | DLC license candidates: {}".format(
+                  output, len(flags), len(license_candidates)
+              )
+          )
+          PY
       - name: Commit and Push changes
         run: |
           git config --global user.name "PS3-Pro Bot"
@@ -84,6 +163,7 @@ jobs:
           git add resources/database/content/official/pending/*.tsv
           git add resources/database/content/latest/*.tsv
           git add resources/database/content/events
+          git add resources/database/helpers/child_content_index.tsv
 
           git diff-index --quiet HEAD || git commit -m "Auto-update: Synchronized with NoPayStation (Official & Pending)"
           git push
