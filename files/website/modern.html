@@ -382,7 +382,7 @@ body:not(.psn-keyboard-nav-active) .psn-keyboard-focused { outline: none !import
 .browse-toolbar select:disabled, .browse-toolbar select.is-disabled { opacity: .5 !important; filter: grayscale(.55) !important; pointer-events: none !important; cursor: not-allowed !important; background: rgba(0,0,0,.22) !important; border-color: rgba(255,255,255,.08) !important; color: rgba(255,255,255,.45) !important; box-shadow: none !important; transform: none !important; }
 .browse-toolbar select:disabled:hover, .browse-toolbar select.is-disabled:hover { background: rgba(0,0,0,.22) !important; border-color: rgba(255,255,255,.08) !important; box-shadow: none !important; }
 .browse-toolbar select option { background-color: #0f141e; color: #fff; }
-#region-select option:disabled, #region-select option.is-unavailable { color: rgba(139,150,168,0.42) !important; background-color: rgba(0,0,0,0.28) !important; }
+#region-select option:disabled, #region-select option.is-unavailable, #wish-region-select option:disabled, #wish-region-select option.is-unavailable, #library-region-select option:disabled, #library-region-select option.is-unavailable, #fav-region-select option:disabled, #fav-region-select option.is-unavailable { color: rgba(139,150,168,0.42) !important; background-color: rgba(0,0,0,0.28) !important; }
 .browse-toolbar select optgroup { background-color: #161d2b; color: var(--ps-blue); font-weight: bold; font-style: normal; }
 .browse-toolbar.scrolled { background: rgba(18,24,36,0.4); backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px); border-bottom: 1px solid rgba(255,255,255,0.05); }
 .toolbar-group { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
@@ -16997,18 +16997,7 @@ P
         const availableRegions = ENABLE_REGION_GRAY_OUT && !locked && window.__browseRegionAvailability instanceof Set
             ? window.__browseRegionAvailability
             : null;
-
-        Array.from(regionSelect.options).forEach(option => {
-            if (option.value === 'ALL') {
-                option.disabled = false;
-                option.classList.remove('is-unavailable');
-                return;
-            }
-
-            const unavailable = !!availableRegions && !availableRegions.has(option.value);
-            option.disabled = unavailable;
-            option.classList.toggle('is-unavailable', unavailable);
-        });
+        window.syncPsnRegionSelectAvailability(regionSelect, availableRegions);
 
         regionSelect.disabled = locked;
         regionSelect.classList.toggle('is-disabled', locked);
@@ -18967,6 +18956,38 @@ P
 			if (bucket) available.add(bucket);
 		});
 		return available;
+	};
+
+	window.getPsnRegionAvailability = function(items, regionGetter) {
+		const available = new Set();
+		(items || []).forEach(item => {
+			const value = typeof regionGetter === 'function' ? regionGetter(item) : (item && item.region);
+			const region = String(value || '').trim().toUpperCase();
+			if (region === 'US' || region === 'EU' || region === 'JP' || region === 'ASIA') available.add(region);
+		});
+		return available;
+	};
+
+	window.syncPsnRegionSelectAvailability = function(selectOrId, availableRegions) {
+		const select = typeof selectOrId === 'string' ? document.getElementById(selectOrId) : selectOrId;
+		if (!select) return 'ALL';
+		const availability = ENABLE_REGION_GRAY_OUT && availableRegions instanceof Set ? availableRegions : null;
+
+		Array.from(select.options).forEach(option => {
+			if (option.value === 'ALL') {
+				option.disabled = false;
+				option.classList.remove('is-unavailable');
+				return;
+			}
+			const unavailable = !!availability && !availability.has(option.value);
+			option.disabled = unavailable;
+			option.classList.toggle('is-unavailable', unavailable);
+		});
+
+		if (select.value !== 'ALL' && select.options[select.selectedIndex] && select.options[select.selectedIndex].disabled) {
+			select.value = 'ALL';
+		}
+		return select.value || 'ALL';
 	};
 
     function renderLetterFilter() {
@@ -22931,9 +22952,7 @@ P
 			const browseRegionItems = (Array.isArray(currentData) ? currentData : []).filter(game =>
 				browseItemPassesFiltersBeforeMissingRap(game, browseRegionContext)
 			);
-			window.__browseRegionAvailability = new Set(
-				browseRegionItems.map(game => String(game.region || '').toUpperCase()).filter(region => ['US', 'EU', 'JP', 'ASIA'].includes(region))
-			);
+			window.__browseRegionAvailability = window.getPsnRegionAvailability(browseRegionItems, game => game.region);
 			if (typeof syncBrowseRegionSelectState === 'function') syncBrowseRegionSelectState(currentCat);
 		}
 
@@ -33818,7 +33837,6 @@ P
 			}
 		}
 		
-		const regionFilter = wishRegionSelect?.value || "ALL";
 		const activeConsolesNodes = document.querySelectorAll('#wish-console-filters input:checked');
 		const activeConsoles = Array.from(activeConsolesNodes).map(cb => cb.value);
 	
@@ -33830,6 +33848,30 @@ P
 				: Object.assign({}, item, { category: resolvedCategory });
 			return Object.assign({}, resolvedItem, { __wishlistDotKey: sourceDotKey || getWishlistDotKey(resolvedItem) });
 		});
+
+		let regionFilter = wishRegionSelect?.value || "ALL";
+		if (wishRegionSelect) {
+			if (wishRegionSelect.disabled) {
+				window.syncPsnRegionSelectAvailability(wishRegionSelect, null);
+				regionFilter = 'ALL';
+			} else if (ENABLE_REGION_GRAY_OUT) {
+				const wishlistRegionItems = wishlistRenderItems.filter(game => {
+					if (catFilter !== 'ALL') {
+						const itemCategory = (typeof window.getWishlistItemCategoryKey === 'function') ? window.getWishlistItemCategoryKey(game) : (game.category || 'games');
+						if (itemCategory !== catFilter) return false;
+					}
+					if (!activeConsoles.includes(game.cTag)) return false;
+					if (!term && activeWishLetter !== 'ALL') {
+						const firstChar = String(game.cleanName || '').charAt(0).toUpperCase();
+						if (activeWishLetter === '#') { if (/[A-Z0-9]/.test(firstChar)) return false; }
+						else if (activeWishLetter === '0-9') { if (!/[0-9]/.test(firstChar)) return false; }
+						else if (firstChar !== activeWishLetter) return false;
+					}
+					return true;
+				});
+				regionFilter = window.syncPsnRegionSelectAvailability(wishRegionSelect, window.getPsnRegionAvailability(wishlistRegionItems, game => game.region));
+			}
+		}
 
 		const passesWishlistBaseFilters = game => {
 			if (catFilter !== "ALL") {
@@ -38104,7 +38146,19 @@ function formatLibraryLastPlayedBadge(game = {}) {
 		const activeConsolesNodes = document.querySelectorAll('#library-console-filters input:checked');
 		const activeConsoles = Array.from(activeConsolesNodes).map(cb => cb.value);
 		const typeFilter = document.getElementById('library-type-select')?.value || 'ALL';
-		const regionFilter = document.getElementById('library-region-select')?.value || 'ALL';
+		const libraryRegionSelect = document.getElementById('library-region-select');
+		let regionFilter = libraryRegionSelect?.value || 'ALL';
+
+		if (libraryRegionSelect && ENABLE_REGION_GRAY_OUT) {
+			const libraryRegionItems = lastScannedGames.filter(game => {
+				const meta = getLibraryFilterMetadata(game);
+				if (!activeConsoles.includes(meta.console)) return false;
+				if (typeFilter !== 'ALL' && meta.category !== typeFilter) return false;
+				if (!term && activeLibraryLetter !== 'ALL' && !matchesLibraryAlphabetFilter(game.title, activeLibraryLetter)) return false;
+				return true;
+			});
+			regionFilter = window.syncPsnRegionSelectAvailability(libraryRegionSelect, window.getPsnRegionAvailability(libraryRegionItems, game => getLibraryFilterMetadata(game).region));
+		}
 	
 		const passesLibraryBaseFilters = game => {
 			const meta = getLibraryFilterMetadata(game);
@@ -38444,7 +38498,19 @@ function formatLibraryLastPlayedBadge(game = {}) {
 		const activeConsolesNodes = document.querySelectorAll('#fav-console-filters input:checked');
 		const activeConsoles = Array.from(activeConsolesNodes).map(cb => cb.value);
 		const typeFilter = document.getElementById('fav-type-select')?.value || 'ALL';
-		const regionFilter = document.getElementById('fav-region-select')?.value || 'ALL';
+		const favRegionSelect = document.getElementById('fav-region-select');
+		let regionFilter = favRegionSelect?.value || 'ALL';
+
+		if (favRegionSelect && ENABLE_REGION_GRAY_OUT) {
+			const favoriteRegionItems = activeFavs.filter(game => {
+				const meta = getLibraryFilterMetadata(game);
+				if (!activeConsoles.includes(meta.console)) return false;
+				if (typeFilter !== 'ALL' && meta.category !== typeFilter) return false;
+				if (!term && activeFavoriteLibraryLetter !== 'ALL' && !matchesLibraryAlphabetFilter(game.title, activeFavoriteLibraryLetter)) return false;
+				return true;
+			});
+			regionFilter = window.syncPsnRegionSelectAvailability(favRegionSelect, window.getPsnRegionAvailability(favoriteRegionItems, game => getLibraryFilterMetadata(game).region));
+		}
 
 		const passesFavoriteBaseFilters = game => {
 			const meta = getLibraryFilterMetadata(game);
