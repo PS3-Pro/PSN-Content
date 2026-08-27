@@ -10699,7 +10699,7 @@ P
 	}
 
 	const PROFILE_SYNC_PENDING_STORAGE_SUFFIX = 'psn_profile_sync_pending_v1';
-	const PROFILE_SYNC_PERSISTENT_SECTIONS = ['trophies', 'downloads', 'wishlist', 'favorites', 'library', 'friends', 'recentlyvisited'];
+	const PROFILE_SYNC_PERSISTENT_SECTIONS = ['trophies', 'downloads', 'wishlist', 'favorites', 'library', 'friends', 'recentlyvisited', 'settings'];
 
 	function getPersistentProfileSyncStorageKey(username = localStorage.getItem('psn_username') || '') {
 		const name = String(username || '').trim();
@@ -10779,7 +10779,9 @@ P
 	function getLocalProfileSectionVersion(username, section) {
 		const pending = readPersistentProfileSyncPending(username);
 		let stamp = normalizeProfileListTimestamp(pending.sections[section]);
-		if (section !== 'trophies') {
+		if (section === 'settings') {
+			stamp = Math.max(stamp, getProfileSettingsUpdatedAtForUser(username));
+		} else if (section !== 'trophies') {
 			const key = getProfileListTimestampStorageKey(section);
 			stamp = Math.max(stamp, normalizeProfileListTimestamp(localStorage.getItem(`${username}_${key}`)));
 		}
@@ -10790,6 +10792,10 @@ P
 	}
 
 	function getIncomingProfileSectionVersion(section, userData = {}, payload = {}) {
+		if (section === 'settings') return normalizeProfileListTimestamp(
+			(userData.settingsData && (userData.settingsData.settingsUpdatedAt || userData.settingsData.settingsSyncedAt || userData.settingsData.settingsVersion)) ||
+			userData.settingsUpdatedAt || payload.settingsUpdatedAt
+		);
 		if (section === 'downloads') return Math.max(
 			normalizeProfileListTimestamp(userData.downloadsUpdatedAt || payload.downloadsUpdatedAt),
 			normalizeProfileListTimestamp(userData.downloadsClearedAt || payload.downloadsClearedAt)
@@ -10816,9 +10822,9 @@ P
 
 	function restorePersistentLocalProfileSection(username, section) {
 		if (!username) return;
+		if (section === 'settings') return;
 		if (section === 'trophies') {
 			window.userTrophies = parsePersistentLocalJson(`${username}_psn_user_trophies`, {});
-			if (typeof window.refreshTrophyRewardSidebarCounts === 'function') window.refreshTrophyRewardSidebarCounts();
 			return;
 		}
 		if (section === 'downloads') {
@@ -10876,7 +10882,8 @@ P
 			favorites: ['favoritesData', 'favorites', 'favoritesUpdatedAt'],
 			library: ['libraryData', 'library', 'libraryUpdatedAt'],
 			friends: ['friendsData', 'friendsUpdatedAt'],
-			recentlyvisited: ['recentlyVisitedData', 'recentlyVisited', 'recentlyVisitedUpdatedAt']
+			recentlyvisited: ['recentlyVisitedData', 'recentlyVisited', 'recentlyVisitedUpdatedAt'],
+			settings: ['settingsData', 'settingsUpdatedAt', 'themeColor', 'themeColorUpdatedAt', 'countryCode', 'country_code', 'country']
 		};
 		(fields[section] || []).forEach(key => { delete userData[key]; });
 		const syncState = getProfileSyncDirtyState();
@@ -11025,7 +11032,9 @@ P
 	window.markProfileSyncDirty = markProfileSyncDirty;
 
 	function markProfileSettingsChanged(stamp = Date.now()) {
-		const appliedStamp = setProfileSettingsUpdatedAtForUser(localStorage.getItem('psn_username') || '', stamp) || Date.now();
+		const username = localStorage.getItem('psn_username') || '';
+		const appliedStamp = setProfileSettingsUpdatedAtForUser(username, stamp) || Date.now();
+		if (typeof markPersistentProfileSyncPending === 'function') markPersistentProfileSyncPending('settings', appliedStamp, username);
 		if (typeof queueRealtimeSettingsUpdate === 'function') queueRealtimeSettingsUpdate('settings_changed');
 		return appliedStamp;
 	}
@@ -11097,6 +11106,14 @@ P
 	function buildPersistentProfileSyncReplayPayload(username, section) {
 		const requestId = `offline-sync-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 		const payload = { _syncRequestId: requestId, _syncReason: 'offline-replay', _syncSections: [section] };
+		if (section === 'settings') {
+			if (typeof getRuntimePluginSettingsPayload !== 'function') return null;
+			payload.settingsData = getRuntimePluginSettingsPayload();
+			payload.settingsData.settingsUpdatedAt = getProfileSettingsUpdatedAtForUser(username) || Date.now();
+			payload.themeColor = (typeof getRuntimeSettingsThemeColor === 'function') ? getRuntimeSettingsThemeColor() : (localStorage.getItem(`${username}_psn_theme_color`) || '#0070cc');
+			payload.themeColorUpdatedAt = (typeof getProfileThemeColorUpdatedAtForUser === 'function') ? getProfileThemeColorUpdatedAtForUser(username) : 0;
+			return payload;
+		}
 		if (section === 'trophies') {
 			const trophiesData = parsePersistentLocalJson(`${username}_psn_user_trophies`, {});
 			let totalXp = 0;
@@ -11192,12 +11209,12 @@ P
 					console.warn(`[PROFILE SYNC] Offline replay for ${section} was not acknowledged:`, response && response.error ? response.error : 'Unknown error');
 					continue;
 				}
-				const accepted = Array.isArray(response.acceptedSections) && response.acceptedSections.includes(section);
 				const wasRejected = Array.isArray(response.rejectedSections) && response.rejectedSections.includes(section);
+				const accepted = Array.isArray(response.acceptedSections) && response.acceptedSections.includes(section);
 				if (accepted || wasRejected) {
 					clearPersistentProfileSyncPending(section, username);
 					const syncState = getProfileSyncDirtyState();
-					if (syncState && syncState.dirty) syncState.dirty[section] = false;
+					if (syncState && syncState.dirty && Object.prototype.hasOwnProperty.call(syncState.dirty, section)) syncState.dirty[section] = false;
 				}
 				if (wasRejected) rejected.push(section);
 			}
@@ -11344,13 +11361,34 @@ P
 			if (!Number(settingsData.settingsUpdatedAt || 0) && typeof getProfileSettingsUpdatedAtForUser === 'function') {
 				settingsData.settingsUpdatedAt = getProfileSettingsUpdatedAtForUser(myName) || 0;
 			}
-			socketChat.emit('settings_realtime_update', {
+			const payload = {
 				settingsData,
 				themeColor: getRuntimeSettingsThemeColor(),
 				themeColorUpdatedAt: (typeof getProfileThemeColorUpdatedAtForUser === 'function') ? getProfileThemeColorUpdatedAtForUser(myName) : 0,
 				reason,
 				clientSentAt: Date.now()
-			});
+			};
+			const finish = (err, response) => {
+				if (!err && response && response.ok === true && (response.accepted === true || response.rejected === true)) {
+					if (typeof clearPersistentProfileSyncPending === 'function') clearPersistentProfileSyncPending('settings', myName);
+					return;
+				}
+				if (typeof window.replayPersistentProfileSyncPending === 'function' && socketChat && socketChat.connected) {
+					setTimeout(() => window.replayPersistentProfileSyncPending('settings-realtime-retry'), 900);
+				}
+			};
+			if (typeof socketChat.timeout === 'function') {
+				socketChat.timeout(4500).emit('settings_realtime_update', payload, (err, response) => finish(err, response));
+			} else {
+				let settled = false;
+				const timer = setTimeout(() => { if (!settled) { settled = true; finish(new Error('Settings acknowledgement timed out.'), null); } }, 4500);
+				socketChat.emit('settings_realtime_update', payload, response => {
+					if (settled) return;
+					settled = true;
+					clearTimeout(timer);
+					finish(null, response);
+				});
+			}
 			return true;
 		} catch (err) {
 			console.warn('[SETTINGS REALTIME] Could not emit realtime settings:', err);
@@ -11410,6 +11448,80 @@ P
 		const owner = getProfileNotificationRuntimeOwner(username);
 		const safeCategory = String(category || '').trim().toLowerCase();
 		return owner && safeCategory ? `${owner.toLowerCase()}|${safeCategory}` : '';
+	}
+
+	const PROFILE_NOTIFICATION_PENDING_STORAGE_SUFFIX = 'psn_notification_sync_pending_v1';
+	const PROFILE_NOTIFICATION_SYNC_CATEGORIES = ['downloads', 'wishlist', 'favorites', 'trophies'];
+
+	function getPersistentProfileNotificationPendingKey(username = localStorage.getItem('psn_username') || '') {
+		const owner = getProfileNotificationRuntimeOwner(username);
+		return owner ? `${owner}_${PROFILE_NOTIFICATION_PENDING_STORAGE_SUFFIX}` : '';
+	}
+
+	function readPersistentProfileNotificationPending(username = localStorage.getItem('psn_username') || '') {
+		const key = getPersistentProfileNotificationPendingKey(username);
+		const out = {};
+		if (!key) return out;
+		try {
+			const parsed = JSON.parse(localStorage.getItem(key) || '{}');
+			PROFILE_NOTIFICATION_SYNC_CATEGORIES.forEach(category => {
+				const stamp = normalizeProfileListTimestamp(parsed && parsed[category]);
+				if (stamp) out[category] = stamp;
+			});
+		} catch (err) {}
+		return out;
+	}
+
+	function writePersistentProfileNotificationPending(username, state) {
+		const key = getPersistentProfileNotificationPendingKey(username);
+		if (!key) return;
+		const clean = {};
+		PROFILE_NOTIFICATION_SYNC_CATEGORIES.forEach(category => {
+			const stamp = normalizeProfileListTimestamp(state && state[category]);
+			if (stamp) clean[category] = stamp;
+		});
+		if (!Object.keys(clean).length) localStorage.removeItem(key);
+		else safeLocalStorageSet(key, JSON.stringify(clean));
+	}
+
+	function markPersistentProfileNotificationPending(category, username = localStorage.getItem('psn_username') || '', stamp = Date.now()) {
+		const owner = getProfileNotificationRuntimeOwner(username);
+		if (!owner || !PROFILE_NOTIFICATION_SYNC_CATEGORIES.includes(category)) return 0;
+		const state = readPersistentProfileNotificationPending(owner);
+		state[category] = Math.max(normalizeProfileListTimestamp(state[category]), normalizeProfileListTimestamp(stamp) || Date.now());
+		writePersistentProfileNotificationPending(owner, state);
+		return state[category];
+	}
+
+	function clearPersistentProfileNotificationPending(category, username = localStorage.getItem('psn_username') || '') {
+		const owner = getProfileNotificationRuntimeOwner(username);
+		if (!owner) return;
+		const state = readPersistentProfileNotificationPending(owner);
+		delete state[category];
+		writePersistentProfileNotificationPending(owner, state);
+	}
+
+	function restorePersistentProfileNotificationPending(username = localStorage.getItem('psn_username') || '') {
+		const owner = getProfileNotificationRuntimeOwner(username);
+		if (!owner) return false;
+		const state = readPersistentProfileNotificationPending(owner);
+		let restored = false;
+		PROFILE_NOTIFICATION_SYNC_CATEGORIES.forEach(category => {
+			if (!normalizeProfileListTimestamp(state[category])) return;
+			const runtimeKey = getProfileNotificationRuntimeKey(category, owner);
+			if (!runtimeKey || window.__profileNotificationInFlight[runtimeKey] || window.__profileNotificationPendingOps[runtimeKey]) return;
+			const local = getProfileNotificationLocalCategoryState(category, { allowLegacyFallback: true });
+			const op = ensureProfileNotificationPendingOp(category, owner);
+			if (!op) return;
+			op.replacePending = true;
+			op.pendingItems = local.pendingItems.slice();
+			op.hasDot = true;
+			op.dot = !!local.dot;
+			if (category === 'trophies') { op.hasColor = true; op.color = local.color || ''; }
+			window.__profileNotificationPendingSyncCategories.add(runtimeKey);
+			restored = true;
+		});
+		return restored;
 	}
 
 	function createProfileNotificationMutationId(category) {
@@ -11522,7 +11634,10 @@ P
 
 			delete window.__profileNotificationInFlight[runtimeKey];
 			const hasQueuedLocalChanges = !!window.__profileNotificationPendingOps[runtimeKey];
-			if (!hasQueuedLocalChanges) window.__profileNotificationPendingSyncCategories.delete(runtimeKey);
+			if (!hasQueuedLocalChanges) {
+				window.__profileNotificationPendingSyncCategories.delete(runtimeKey);
+				clearPersistentProfileNotificationPending(category, owner);
+			}
 			const categoryState = response.categoryState || {};
 			const updatedAt = Number(categoryState.updatedAt || 0);
 			if (updatedAt) {
@@ -11571,6 +11686,7 @@ P
 		const runtimeKey = getProfileNotificationRuntimeKey(category, owner);
 		if (!category || !runtimeKey) return false;
 		if (!mergeProfileNotificationStorageChange(category, String(reason), previousValue, nextValue)) return false;
+		markPersistentProfileNotificationPending(category, owner);
 		window.__profileNotificationPendingSyncCategories.add(runtimeKey);
 		if (!window.__profileNotificationInFlight[runtimeKey]) {
 			clearTimeout(window.__profileNotificationSyncTimers[runtimeKey]);
@@ -11612,6 +11728,7 @@ P
 
 	function syncProfileNotificationStateMigration() {
 		if (!window.isProfileLoaded) return false;
+		restorePersistentProfileNotificationPending();
 		if (window.__profileNotificationStateNeedsMigration) {
 			window.__profileNotificationStateNeedsMigration = false;
 			seedProfileNotificationStateMigration();
@@ -11699,8 +11816,14 @@ P
 			categories.forEach(category => {
 				const incoming = state[category];
 				if (!incoming || typeof incoming !== 'object' || Array.isArray(incoming)) return;
-				if (window.__profileNotificationPendingSyncCategories && window.__profileNotificationPendingSyncCategories.has(getProfileNotificationRuntimeKey(category, name))) return;
+				const runtimeKey = getProfileNotificationRuntimeKey(category, name);
+				if (window.__profileNotificationPendingSyncCategories && window.__profileNotificationPendingSyncCategories.has(runtimeKey)) return;
 				const incomingUpdatedAt = Number(incoming.updatedAt || 0);
+				const durablePendingAt = normalizeProfileListTimestamp(readPersistentProfileNotificationPending(name)[category]);
+				if (durablePendingAt) {
+					if (!incomingUpdatedAt || incomingUpdatedAt <= durablePendingAt) return;
+					clearPersistentProfileNotificationPending(category, name);
+				}
 				const timeKey = getProfileNotificationUpdatedAtStorageKey(category);
 				const scopedTimeKey = `${name}_${timeKey}`;
 				const localUpdatedAt = Number(localStorage.getItem(scopedTimeKey) || (active ? loadState(timeKey) : 0) || 0);
@@ -12353,19 +12476,8 @@ P
 
 
 	function syncRuntimePluginPreferencesToServer() {
-		try {
-			if (window.__applyingRemoteProfileSync || window.__applyingRealtimeSettingsSync || window.__applyingSyncedProfileSettings) return false;
-			if (typeof socketChat === 'undefined' || !socketChat || !socketChat.connected) return false;
-			const myName = localStorage.getItem('psn_username');
-			if (!myName || myName === "null") return false;
-			const settingsData = getRuntimePluginSettingsPayload();
-			socketChat.emit('settings_realtime_update', { settingsData, themeColor: getRuntimeSettingsThemeColor(), reason: 'runtime_preferences', clientSentAt: Date.now() });
-			socketChat.emit('update_profile', { settingsData });
-			return true;
-		} catch (err) {
-			console.warn('[Runtime Plugins] Could not sync plugin preferences to server:', err);
-			return false;
-		}
+		if (typeof queueRealtimeSettingsUpdate === 'function') return queueRealtimeSettingsUpdate('runtime_preferences');
+		return typeof emitRealtimeSettingsUpdate === 'function' ? emitRealtimeSettingsUpdate('runtime_preferences') : false;
 	}
 	window.syncRuntimePluginPreferencesToServer = syncRuntimePluginPreferencesToServer;
 
@@ -14474,12 +14586,8 @@ P
 	}
 	function syncSiteDisclaimerSkipTodayToServer(username, stamp) {
 		try {
-			if (!window.isProfileLoaded || typeof socketChat === 'undefined' || !socketChat || !socketChat.connected) return false;
-			const settingsPayload = (typeof getRuntimePluginSettingsPayload === 'function') ? getRuntimePluginSettingsPayload() : {};
-			settingsPayload.siteDisclaimerSkipToday = String(stamp || getSiteDisclaimerTodayStamp());
-			settingsPayload.settingsUpdatedAt = (typeof markProfileSettingsChanged === 'function') ? markProfileSettingsChanged() : Date.now();
-			socketChat.emit('update_profile', { settingsData: settingsPayload });
-			return true;
+			if (typeof markProfileSettingsChanged === 'function') { markProfileSettingsChanged(); return true; }
+			return typeof queueRealtimeSettingsUpdate === 'function' ? queueRealtimeSettingsUpdate('site_disclaimer') : false;
 		} catch(e) { return false; }
 	}
 	function isSiteDisclaimerOpenOrOpening() {
@@ -26894,6 +27002,11 @@ P
 
 
 	window.refreshTrophyRewardSidebarCounts = function() {
+		if (window.__trophiesHydrated !== true) {
+			window.setSidebarCountPill('trophies', null);
+			window.setSidebarCountPill('rewards', null);
+			return;
+		}
 		const trophies = window.userTrophies && typeof window.userTrophies === 'object' ? Object.values(window.userTrophies).filter(trophy => trophy && trophy.unlocked === true).length : 0;
 		window.setSidebarCountPill('trophies', trophies);
 		const rewards = Array.isArray(window.REWARDS_DATA) ? window.REWARDS_DATA.filter(reward => reward && reward.req && window.userTrophies && window.userTrophies[reward.req] && window.userTrophies[reward.req].unlocked === true).length : null;
@@ -26903,8 +27016,9 @@ P
 	window.updateSidebarCountPills = function() {
 		const databaseCount = window.psnStoreCache && typeof window.psnStoreCache === 'object' ? Object.values(window.psnStoreCache).reduce((total, items) => total + (Array.isArray(items) ? items.length : 0), 0) : 0;
 		const revivedCount = Number.isFinite(window.revivedServersTotalCount) ? Math.max(0, window.revivedServersTotalCount) : null;
-		const trophyCount = window.userTrophies && typeof window.userTrophies === 'object' ? Object.values(window.userTrophies).filter(trophy => trophy && trophy.unlocked === true).length : 0;
-		const rewardsReady = Array.isArray(window.REWARDS_DATA);
+		const trophiesReady = window.__trophiesHydrated === true;
+		const trophyCount = trophiesReady && window.userTrophies && typeof window.userTrophies === 'object' ? Object.values(window.userTrophies).filter(trophy => trophy && trophy.unlocked === true).length : null;
+		const rewardsReady = trophiesReady && Array.isArray(window.REWARDS_DATA);
 		const counts = {
 			browse:databaseCount, wishlist:Array.isArray(window.wishlist)?window.wishlist.length:0, downloads:Array.isArray(window.downloadHistory)?window.downloadHistory.length:0,
 			revived:revivedCount, chat:Array.isArray(window.messageHistory)?window.messageHistory.length:0, friends:Array.isArray(window.friendsList)?window.friendsList.length:0,
@@ -37130,10 +37244,6 @@ P
 		} catch (ipStoreErr) {}
 		
 		if (typeof markProfileSettingsChanged === 'function') markProfileSettingsChanged();
-		if (typeof socketChat !== 'undefined' && socketChat && socketChat.connected) {
-			const settingsPayload = (typeof getRuntimePluginSettingsPayload === 'function') ? getRuntimePluginSettingsPayload() : null;
-			socketChat.emit('update_profile', settingsPayload ? { ps3_ip: ip, settingsData: settingsPayload } : { ps3_ip: ip });
-		}
 		
 		if (status) { status.innerText = "(Refreshing...)"; status.style.color = "orange"; }
 		if (libraryToolbar) {
@@ -42265,10 +42375,6 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 				if (activeUserForIpSync) safeLocalStorageSet(`${activeUserForIpSync}_ps3_ip`, ip);
 				safeLocalStorageSet('ps3_ip', ip);
 				if (typeof markProfileSettingsChanged === 'function') markProfileSettingsChanged();
-				if (typeof socketChat !== 'undefined' && socketChat && socketChat.connected) {
-					const settingsPayload = (typeof getRuntimePluginSettingsPayload === 'function') ? getRuntimePluginSettingsPayload() : null;
-					socketChat.emit('update_profile', settingsPayload ? { ps3_ip: ip, settingsData: settingsPayload } : { ps3_ip: ip });
-				}
 			} catch (ipSyncErr) { console.warn('[PS3 IP Sync] Could not sync connected IP:', ipSyncErr); }
 			_lastConnectionState = true; 
 	
@@ -51955,7 +52061,7 @@ function getVisibleChatStackEl(id) {
 	};
 	window.ensureProfileSectionHydrated = function(section, options = {}) {
 		const key = String(section || '').toLowerCase();
-		if (!PROFILE_SYNC_PERSISTENT_SECTIONS.includes(key) || key === 'recentlyvisited') return Promise.resolve(false);
+		if (!PROFILE_SYNC_PERSISTENT_SECTIONS.includes(key) || key === 'recentlyvisited' || key === 'settings') return Promise.resolve(false);
 		const owner = String(localStorage.getItem('psn_username') || '').trim();
 		const hydrationKey = window.getProfileHydrationKey(key, owner);
 		if (!owner || !hydrationKey) return Promise.resolve(false);
@@ -53287,6 +53393,7 @@ function getVisibleChatStackEl(id) {
 				window.userTrophies = userData.trophiesData;
 				safeLocalStorageSet(`${name}_psn_user_trophies`, JSON.stringify(userData.trophiesData));
 				window.__trophiesHydrated = true;
+				if (typeof window.refreshTrophyRewardSidebarCounts === 'function') window.refreshTrophyRewardSidebarCounts();
 			} else if (isLightAuthPayload) {
 				const localTrophies = localStorage.getItem(`${name}_psn_user_trophies`);
 				try {
@@ -53295,11 +53402,13 @@ function getVisibleChatStackEl(id) {
 					window.userTrophies = {};
 				}
 				if (!profileWasAlreadyLoaded) window.__trophiesHydrated = false;
+				if (window.__trophiesHydrated !== true && typeof window.refreshTrophyRewardSidebarCounts === 'function') window.refreshTrophyRewardSidebarCounts();
 			} else {
 				const localTrophies = localStorage.getItem(`${name}_psn_user_trophies`);
 				window.userTrophies = localTrophies ? JSON.parse(localTrophies) : {};
+				window.__trophiesHydrated = false;
+				if (typeof window.refreshTrophyRewardSidebarCounts === 'function') window.refreshTrophyRewardSidebarCounts();
 			}
-			if (typeof window.refreshTrophyRewardSidebarCounts === 'function') window.refreshTrophyRewardSidebarCounts();
 		
 			if (Array.isArray(userData.wishlistData)) {
 				window.wishlist = userData.wishlistData;
@@ -53346,6 +53455,13 @@ function getVisibleChatStackEl(id) {
 				if (typeof lastScannedGames !== 'undefined') { lastScannedGames = mergeLibraryLastPlayedLists(localLib ? JSON.parse(localLib) : [], []); window.lastScannedGames = lastScannedGames; }
 			}
 			if (!isLightAuthPayload && typeof updateConsoleLibraryStatusUI === 'function') updateConsoleLibraryStatusUI(window.lastScannedGames || []);
+
+			if (Array.isArray(userData.recentlyVisitedData)) {
+				window.recentlyVisitedGames = normalizeRecentlyVisitedGames(userData.recentlyVisitedData);
+				safeLocalStorageSet(getRecentlyVisitedStorageKey(name), JSON.stringify(window.recentlyVisitedGames));
+				applyProfileListUpdatedAtFromServer(name, 'recentlyvisited', userData.recentlyVisitedUpdatedAt);
+				if (typeof window.renderRecentlyVisited === 'function') window.renderRecentlyVisited();
+			}
 
 			if (Array.isArray(userData.friendsData)) {
 				window.friendsList = userData.friendsData;
@@ -53521,7 +53637,7 @@ function getVisibleChatStackEl(id) {
 						reason: shouldFinishInteractiveBoot ? 'pre_boot' : 'post_light_auth',
 						forceRefresh: false,
 						lazyHydrate: false,
-						sections: PROFILE_SYNC_PERSISTENT_SECTIONS.filter(section => section !== 'recentlyvisited'),
+						sections: PROFILE_SYNC_PERSISTENT_SECTIONS.filter(section => section !== 'recentlyvisited' && section !== 'settings'),
 						includeCore: true,
 						criticalReadyAck: false
 					};

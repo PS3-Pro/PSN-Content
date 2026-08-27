@@ -2030,7 +2030,8 @@ const PROFILE_REPLAY_SECTION_DATA_KEYS = {
   favorites: 'favoritesData',
   library: 'libraryData',
   friends: 'friendsData',
-  recentlyvisited: 'recentlyVisitedData'
+  recentlyvisited: 'recentlyVisitedData',
+  settings: 'settingsData'
 };
 
 function normalizeTimestampValue(value) {
@@ -6903,14 +6904,18 @@ io.on('connection', (socket) => {
     });
   });
 
-  socket.on('settings_realtime_update', async (payload = {}) => {
+  socket.on('settings_realtime_update', async (payload = {}, ack) => {
+    const respond = response => {
+      if (typeof ack !== 'function' || !socket.connected) return;
+      try { ack(response); } catch (err) {}
+    };
     const name = socket.userName;
-    if (!name || !userDatabase[name]) return;
+    if (!name || !userDatabase[name]) { respond({ ok: false, error: 'Profile is not available.' }); return; }
 
     const incomingSettingsData = (payload && payload.settingsData && typeof payload.settingsData === "object")
       ? { ...payload.settingsData }
       : ((payload && typeof payload === "object") ? { ...payload } : null);
-    if (!incomingSettingsData || Array.isArray(incomingSettingsData)) return;
+    if (!incomingSettingsData || Array.isArray(incomingSettingsData)) { respond({ ok: false, error: 'Invalid settings payload.' }); return; }
 
     const previousCountryCode = getUserCountryCode(userDatabase[name]);
     normalizeIncomingProfileCountry({}, incomingSettingsData);
@@ -6953,15 +6958,18 @@ io.on('connection', (socket) => {
     try {
       userCacheMeta[name] = Date.now();
       const savedUser = await patchUserData(name, settingsDbPatch, 'SETTINGS PATCH SAVE');
-      if (!savedUser) return;
+      if (!savedUser) { respond({ ok: false, error: 'Settings were not saved.' }); return; }
       if (countryChanged) invalidateOnlineListCache('settings-realtime-country');
     } catch (err) {
       console.error(`[DATABASE ERROR] Failed to save realtime settings for ${name}:`, err);
+      respond({ ok: false, error: 'Settings database save failed.' });
+      return;
     } finally {
       userProfileWriteInFlight.delete(name);
     }
 
-    const sourceSocketId = (mergedSettings.settingsRejected === true || mergedSettings.bannerRejected === true || themeMerge.rejected === true) ? null : socket.id;
+    const rejected = mergedSettings.settingsRejected === true || mergedSettings.bannerRejected === true || themeMerge.rejected === true;
+    const sourceSocketId = rejected ? null : socket.id;
     emitSettingsRealtimeSync(name, sourceSocketId, { reason: payload.reason || 'settings_realtime' });
 
     if (mergedSettings.bannerAccepted === true || themeMerge.accepted === true || countryChanged) {
@@ -6977,6 +6985,14 @@ io.on('connection', (socket) => {
         publicProfile: mergedSettings.bannerAccepted === true || themeMerge.accepted === true || countryChanged
       }
     ), 0);
+
+    respond({
+      ok: true,
+      accepted: !rejected,
+      rejected,
+      profileUpdatedAt: normalizeTimestampValue(userDatabase[name].profileUpdatedAt) || Date.now(),
+      settingsUpdatedAt: getProfileSettingsUpdatedAt(userDatabase[name].settingsData || {})
+    });
   });
 
   socket.on('update_profile', async (userData, ack) => {
@@ -7013,6 +7029,7 @@ io.on('connection', (socket) => {
     let shouldBroadcastProfileBanner = false;
     let shouldForceProfileSyncToSource = false;
     let profileThemeMerge = { accepted: false, rejected: false };
+    let settingsReplayStatus = null;
     const shouldEmitTrendingUpdate = profileUpdateTouchesTrending(userData || {});
     if (name && userDatabase[name]) {
         
@@ -7025,6 +7042,7 @@ io.on('connection', (socket) => {
             profileThemeMerge = reconcileIncomingThemeColor(workingUser, userData, incomingSettingsData || {});
             shouldBroadcastProfileBanner = mergedSettings.bannerAccepted === true || profileThemeMerge.accepted === true;
             shouldForceProfileSyncToSource = mergedSettings.settingsRejected === true || mergedSettings.bannerRejected === true || profileThemeMerge.rejected === true;
+            if (requestedSyncSections.includes('settings')) settingsReplayStatus = shouldForceProfileSyncToSource ? 'rejected' : 'accepted';
             delete userData.settingsData;
             delete userData.themeColor;
             delete userData.themeColorUpdatedAt;
@@ -7081,6 +7099,10 @@ io.on('connection', (socket) => {
         userData = reconcileIncomingProfileArrays(workingUser, userData || {});
         const replaySectionStatus = {};
         requestedSyncSections.forEach(section => {
+          if (section === 'settings') {
+            replaySectionStatus[section] = settingsReplayStatus || 'rejected';
+            return;
+          }
           const dataKey = PROFILE_REPLAY_SECTION_DATA_KEYS[section];
           replaySectionStatus[section] = dataKey && Object.prototype.hasOwnProperty.call(userData, dataKey) ? 'accepted' : 'rejected';
         });
@@ -7200,7 +7222,8 @@ io.on('connection', (socket) => {
             favorites: normalizeTimestampValue(workingUser.favoritesUpdatedAt),
             library: normalizeTimestampValue(workingUser.libraryUpdatedAt),
             friends: normalizeTimestampValue(workingUser.friendsUpdatedAt),
-            recentlyVisited: normalizeTimestampValue(workingUser.recentlyVisitedUpdatedAt)
+            recentlyVisited: normalizeTimestampValue(workingUser.recentlyVisitedUpdatedAt),
+            settings: getProfileSettingsUpdatedAt(workingUser.settingsData || {})
           }
         });
     }
