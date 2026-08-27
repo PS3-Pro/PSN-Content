@@ -4319,10 +4319,6 @@ function classicIsGameToRelatedLoop(titleId, category) {
 	var URL_DB_NOCOVER = "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/database/covers/blacklist.tsv";
 	var URL_DB_COVERS = "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/database/covers/index.tsv";
 	var URL_DB_UPDATES = "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/database/content/official/game_updates.tsv";
-	var URL_DB_CHILD_INDEX = "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/database/helpers/child_content_index.tsv";
-	var g_childIndexLoaded = false;
-	var g_childIndexLoading = false;
-	var g_childIndexFailed = false;
 
 	function openGameDLCs(id, focusTitle, focusContentId) { fetchSubDB(URL_DB_DLC, id, 'dlcs', 'ln-dlcs', 'DLCs', focusTitle, focusContentId); }
 	function openGameAvatars(id) { fetchSubDB(URL_DB_AVATAR, id, 'avatars', 'ln-avatar', 'Avatars'); }
@@ -4662,110 +4658,6 @@ function restorePreviousState() {
 
 	loadNoCoverIndexBackground();
 	loadCoverIndexBackground();
-
-	function classicParseChildContentIndex(text_h) {
-		if (!text_h) return false;
-
-		var dlc_h = {};
-		var avatar_h = {};
-		var theme_h = {};
-		var license_h = {};
-		var indexCount_h = 0;
-		var dlcCount_h = 0;
-		var candidateCount_h = 0;
-		var pos_h = 0;
-		var len_h = text_h.length;
-
-		while (pos_h < len_h) {
-			var lineEnd_h = text_h.indexOf('\n', pos_h);
-			if (lineEnd_h === -1) lineEnd_h = len_h;
-			var line_h = text_h.substring(pos_h, lineEnd_h);
-			if (line_h.length && line_h.charCodeAt(line_h.length - 1) === 13) line_h = line_h.substring(0, line_h.length - 1);
-			pos_h = lineEnd_h + 1;
-
-			if (!line_h || line_h.charAt(0) === '#') continue;
-
-			if (line_h.charAt(0) === 'I' && line_h.charAt(1) === '\t') {
-				var i1_h = line_h.indexOf('\t', 2);
-				if (i1_h === -1) continue;
-				var titleId_h = line_h.substring(2, i1_h);
-				var flags_h = line_h.substring(i1_h + 1);
-				if (titleId_h.length !== 9) continue;
-				if (flags_h.indexOf('D') !== -1) { dlc_h[titleId_h] = true; dlcCount_h++; }
-				if (flags_h.indexOf('A') !== -1) avatar_h[titleId_h] = true;
-				if (flags_h.indexOf('T') !== -1) theme_h[titleId_h] = true;
-				indexCount_h++;
-				continue;
-			}
-
-			if (line_h.charAt(0) === 'L' && line_h.charAt(1) === '\t') {
-				var l1_h = line_h.indexOf('\t', 2);
-				if (l1_h === -1) continue;
-				var l2_h = line_h.indexOf('\t', l1_h + 1);
-				if (l2_h === -1) continue;
-				var licenseTitleId_h = line_h.substring(2, l1_h);
-				if (licenseTitleId_h.length !== 9) continue;
-				var licenseName_h = line_h.substring(l1_h + 1, l2_h);
-				var licenseContentId_h = line_h.substring(l2_h + 1);
-				var candidates_h = license_h[licenseTitleId_h];
-				if (!candidates_h) candidates_h = license_h[licenseTitleId_h] = [];
-				candidates_h.push(licenseName_h || '', licenseContentId_h || '');
-				candidateCount_h++;
-			}
-		}
-
-		if (indexCount_h === 0 || (dlcCount_h > 0 && candidateCount_h === 0)) return false;
-
-		g_dlcExists = dlc_h;
-		g_avatarExists = avatar_h;
-		g_themeExists = theme_h;
-		g_classicLicenseDlcCandidates = license_h;
-		g_dlcIndexLoaded = true;
-		g_avatarIndexLoaded = true;
-		g_themeIndexLoaded = true;
-		return true;
-	}
-
-	function classicLoadLegacyChildIndexes() {
-		g_childIndexLoading = false;
-		g_childIndexFailed = true;
-		if (!g_dlcIndexLoaded) loadDLCIndexBackground();
-		if (!g_avatarIndexLoaded) loadAvatarIndexBackground();
-		if (!g_themeIndexLoaded) loadThemeIndexBackground();
-	}
-
-	function loadChildContentIndexBackground() {
-		if (g_childIndexLoaded || g_childIndexLoading) return;
-		if (g_childIndexFailed) {
-			classicLoadLegacyChildIndexes();
-			return;
-		}
-
-		g_childIndexLoading = true;
-		var xhr_h = new XMLHttpRequest();
-		xhr_h.onreadystatechange = function() {
-			if (xhr_h.readyState != 4) return;
-			xhr_h.onreadystatechange = null;
-			g_childIndexLoading = false;
-
-			if (xhr_h.status == 200 || xhr_h.status == 0) {
-				var text_h = xhr_h.responseText;
-				if (text_h && classicParseChildContentIndex(text_h)) {
-					g_childIndexLoaded = true;
-					if (!g_isFetching && typeof render === 'function' && classicNeedsMissingLicenseDlcRefresh()) render();
-					if (currentCategory === 'games') injectExtraButtonsOnScreen();
-					text_h = null;
-					xhr_h = null;
-					return;
-				}
-			}
-
-			xhr_h = null;
-			classicLoadLegacyChildIndexes();
-		};
-		xhr_h.open('GET', URL_DB_CHILD_INDEX, true);
-		xhr_h.send();
-	}
 
 	function loadDLCIndexBackground() {
 		if (g_dlcIndexLoaded) return;
@@ -6610,13 +6502,17 @@ function restorePreviousState() {
 			if (!g_coverIndexLoaded) loadCoverIndexBackground();
 		}, 50);
 
-		if (cat === 'games' && !g_childIndexLoaded && (!g_dlcIndexLoaded || !g_avatarIndexLoaded || !g_themeIndexLoaded)) {
-			setTimeout(loadChildContentIndexBackground, 20);
-		}
-
 		if (cat === 'games' || cat === 'apps') {
 			setTimeout(function() {
-				if (!g_updateIndexLoaded) loadUpdateIndexBackground();
+				if (!g_updateIndexLoaded) {
+					loadUpdateIndexBackground();
+				}
+		
+				if (cat === 'games') {
+					if (!g_dlcIndexLoaded) loadDLCIndexBackground();
+					if (!g_avatarIndexLoaded) loadAvatarIndexBackground();
+					if (!g_themeIndexLoaded) loadThemeIndexBackground();
+				}
 			}, 150);
 		}
 
