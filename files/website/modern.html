@@ -27292,13 +27292,6 @@ P
 			if (typeof window.refreshDownloadSummaryUI === 'function') window.refreshDownloadSummaryUI();
 			return;
 		}
-		const visibleDownloadCoverSrcByKey = new Map();
-		listContainer.querySelectorAll('.download-swipe-row').forEach(row => {
-			const key = String(row.getAttribute('data-download-key') || '');
-			const img = row.querySelector('.dl-mini-cover');
-			const src = img ? String(img.currentSrc || img.src || '') : '';
-			if (key && src) visibleDownloadCoverSrcByKey.set(key, src);
-		});
 		const normalizedHistoryResult = normalizeDownloadHistoryRecords(window.downloadHistory);
 		if (normalizedHistoryResult.changed) {
 			window.downloadHistory = normalizedHistoryResult.history;
@@ -27383,7 +27376,15 @@ P
 			const resolvedDlCategory = (typeof window.getProfileListItemCategory === 'function') ? window.getProfileListItemCategory(dl, 'downloads') : (dl.category || 'games');
 			const dlCoverData = (typeof window.getDownloadCoverData === 'function') ? window.getDownloadCoverData(dl, resolvedDlCategory) : { id: dl.titleId, titleId: dl.titleId, contentId: dl.contentId, cleanName: dl.cleanName || dl.name, cTag: dl.cTag || dl.console || 'ps3', category: resolvedDlCategory };
 			const dlFinalCategory = dlCoverData.category || resolvedDlCategory;
-			const coverImg = visibleDownloadCoverSrcByKey.get(String(downloadRealtimeKey || '')) || getItemCover(dlCoverData, dlFinalCategory);
+			const dlCoverKey = typeof window.getStoreCardCoverKey === 'function'
+				? window.getStoreCardCoverKey(dlFinalCategory, dlCoverData.id || dlCoverData.titleId || dl.titleId || dl.id, dlCoverData.contentId || dl.contentId)
+				: '';
+			const preferredDlCoverImg = getItemCover(dlCoverData, dlFinalCategory);
+			const cachedDlCoverImg = dlCoverKey && typeof window.getCachedCardCoverSrc === 'function'
+				? window.getCachedCardCoverSrc(dlCoverKey, dlFinalCategory, preferredDlCoverImg)
+				: '';
+			const coverImg = cachedDlCoverImg || preferredDlCoverImg;
+			const dlCoverKeyAttr = String(dlCoverKey || '').replace(/[&<>"]/g, ch => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;' })[ch]);
 			const githubCoverImg = getGithubItemCover(dlCoverData, dlFinalCategory);
 			const dlCoverName = String(dlCoverData.cleanName || dl.cleanName || dl.name || dl.titleId || '').replace(/"/g, '&quot;');
 			const dlCoverConsole = String(dlCoverData.cTag || dl.cTag || dl.console || 'ps3').replace(/"/g, '&quot;');
@@ -27438,7 +27439,7 @@ P
 							${dlStoreClickAttr}>
 					
 					<div class="dl-cover-wrap dl-cover-main">
-						<img src="${coverImg}" class="dl-mini-cover" loading="lazy" decoding="async" data-name="${dlCoverName}" data-console="${dlCoverConsole}" data-cover-category="${dlCoverCategory}" data-no-bing="${dlNoBingCover}" data-title-id="${dlCoverData.id || dlCoverData.titleId || ''}" data-content-id="${dlCoverData.contentId || ''}" data-region="${dlCoverData.region || ''}" data-github-cover="${String(githubCoverImg || '').replace(/"/g, '&quot;')}" onerror="handleCoverError(this, this.getAttribute('data-cover-category'))">
+						<img src="${coverImg}" class="dl-mini-cover" loading="lazy" decoding="async" data-cover-key="${dlCoverKeyAttr}" data-name="${dlCoverName}" data-console="${dlCoverConsole}" data-cover-category="${dlCoverCategory}" data-no-bing="${dlNoBingCover}" data-title-id="${dlCoverData.id || dlCoverData.titleId || ''}" data-content-id="${dlCoverData.contentId || ''}" data-region="${dlCoverData.region || ''}" data-github-cover="${String(githubCoverImg || '').replace(/"/g, '&quot;')}" onload="markCoverLoaded(this)" onerror="handleCoverError(this, this.getAttribute('data-cover-category'))">
 						${typeTagHtml}
 					</div>
 					
@@ -32731,6 +32732,9 @@ P
 		if (bootEssentialDbsPromise) {
 			try { await bootEssentialDbsPromise; } catch (e) {}
 		}
+		if (window.__wishlistCanonicalPromise) {
+			try { await window.__wishlistCanonicalPromise; } catch (e) {}
+		}
 	
 		exploreCache = { games: null, dlcs: null, avatars: null, demos: null };
 		currentData = []; 
@@ -32739,6 +32743,10 @@ P
 		window.__exploreWarmedBeforeLogin = false;
 		window.psnStorePrefetchReady = false;
 		window.psnStoreCache = {};
+		window.__wishlistCanonicalReady = false;
+		window.__wishlistCanonicalPromise = null;
+		window.__wishlistCanonicalRefreshScheduled = false;
+		window.__recentlyVisitedAvailabilityRefreshPending = false;
 		if (typeof window.invalidatePsnStoreLookup === 'function') window.invalidatePsnStoreLookup();
 		Object.keys(psnStoreRenderCache).forEach(key => delete psnStoreRenderCache[key]);
 		Object.keys(psnStoreRenderPromises).forEach(key => psnStoreRenderPromises[key] = null);
@@ -32756,6 +32764,13 @@ P
 				prefetchEssentialDbs({ priority: 'high', forceRefresh: true }),
 				populateExploreTab({ forceRefresh: true })
 			]);
+
+			window.__wishlistCanonicalReady = true;
+			window.__wishlistCanonicalPromise = null;
+			window.__wishlistCanonicalRefreshScheduled = false;
+			window.__recentlyVisitedAvailabilityRefreshPending = false;
+			if (typeof window.renderRecentlyVisited === 'function') window.renderRecentlyVisited();
+			if (typeof isPsnDomSectionVisible === 'function' && isPsnDomSectionVisible('view-wishlist') && typeof window.updateWishlistUI === 'function') window.updateWishlistUI(true);
 
 			if (typeof fetchDatabase === 'function') await fetchDatabase();
 			updateSyncTimestamp();
