@@ -19891,7 +19891,10 @@ P
 	
 			if (typeof renderFriendsList === 'function') {
 				runViewOpenWork('view-chat', () => {
-					if (friendsView && friendsView.style.display === 'flex') renderFriendsList('');
+					if (friendsView && friendsView.style.display === 'flex') {
+						renderFriendsList('');
+						if (typeof window.refreshFriendsPresenceMetadata === 'function') window.refreshFriendsPresenceMetadata();
+					}
 				});
 			}
 	
@@ -27670,7 +27673,11 @@ P
 			if (a.name === myName) return -1;
 			if (b.name === myName) return 1;
 			if (a.online !== b.online) return a.online ? -1 : 1;
-			if ((a.isAdmin ? 1 : 0) !== (b.isAdmin ? 1 : 0)) return (b.isAdmin ? 1 : 0) - (a.isAdmin ? 1 : 0);
+			const aRole = adminGetUserRole(a.name, a);
+			const bRole = adminGetUserRole(b.name, b);
+			const aRoleRank = aRole === 'admin' ? 0 : (aRole === 'mod' ? 1 : (aRole === 'trusted' ? 2 : 3));
+			const bRoleRank = bRole === 'admin' ? 0 : (bRole === 'mod' ? 1 : (bRole === 'trusted' ? 2 : 3));
+			if (aRoleRank !== bRoleRank) return aRoleRank - bRoleRank;
 			return a.name.localeCompare(b.name);
 		});
 	}
@@ -30817,7 +30824,8 @@ P
 		}
 
 		const incomingLastSeen = Number(user.lastSeen || user.last_seen || 0);
-		if (incomingLastSeen > 0) safeLocalStorageSet(`${name}_psn_lastSeen`, String(incomingLastSeen));
+		const storedLastSeen = Number(localStorage.getItem(`${name}_psn_lastSeen`)) || 0;
+		if (incomingLastSeen > storedLastSeen) safeLocalStorageSet(`${name}_psn_lastSeen`, String(incomingLastSeen));
 
 		if (explicitBan) {
 			safeLocalStorageSet(`${name}_psn_isBanned`, 'true');
@@ -46597,18 +46605,26 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 
 	let chatMentionKnownNamesFrameCache = null;
 	let chatMentionNameMatchIndexFrameCache = null;
+	let chatMentionSuggestionIndexCache = null;
+	let chatMentionSuggestionIndexBuiltAt = 0;
 	let chatMentionNameCacheResetFrame = 0;
 
-	function invalidateChatMentionNameCaches() {
+	function resetChatMentionFrameCaches() {
 		chatMentionKnownNamesFrameCache = null;
 		chatMentionNameMatchIndexFrameCache = null;
+	}
+
+	function invalidateChatMentionNameCaches() {
+		resetChatMentionFrameCaches();
+		chatMentionSuggestionIndexCache = null;
+		chatMentionSuggestionIndexBuiltAt = 0;
 	}
 
 	function scheduleChatMentionNameCacheReset() {
 		if (chatMentionNameCacheResetFrame) return;
 		chatMentionNameCacheResetFrame = requestAnimationFrame(() => {
 			chatMentionNameCacheResetFrame = 0;
-			invalidateChatMentionNameCaches();
+			resetChatMentionFrameCaches();
 		});
 	}
 
@@ -46711,6 +46727,22 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 		chatMentionKnownNamesFrameCache = Array.from(known);
 		scheduleChatMentionNameCacheReset();
 		return chatMentionKnownNamesFrameCache;
+	}
+
+	function getChatMentionSuggestionIndex() {
+		const now = Date.now();
+		if (chatMentionSuggestionIndexCache && (now - chatMentionSuggestionIndexBuiltAt) < 3000) return chatMentionSuggestionIndexCache;
+
+		const records = [];
+		getChatMentionNameMatchIndex().forEach((names, lower) => {
+			const hasCaseConflict = names.length > 1;
+			names.forEach(name => records.push({ name, lower, hasCaseConflict }));
+		});
+		records.sort((a, b) => a.name.localeCompare(b.name));
+
+		chatMentionSuggestionIndexCache = records;
+		chatMentionSuggestionIndexBuiltAt = now;
+		return records;
 	}
 
 	function getChatMentionNameMatchIndex() {
@@ -46888,11 +46920,19 @@ function getVisibleChatStackEl(id) {
 	let chatMentionSuggestionRenderToken = 0;
 	let chatMentionSuggestionFrame = 0;
 	let chatMentionSuggestionPendingQuery = '';
-	const CHAT_MENTION_INITIAL_RENDER_ROWS = 90;
-	const CHAT_MENTION_RENDER_CHUNK_ROWS = 180;
+	let chatMentionSuggestionLastQuery = '';
+	let chatMentionSuggestionLastSource = null;
+	let chatMentionSuggestionLastMatches = null;
+	const CHAT_MENTION_INITIAL_RENDER_ROWS = 70;
+	const CHAT_MENTION_RENDER_CHUNK_ROWS = 90;
 
 	function cancelChatMentionSuggestionRender() {
 		chatMentionSuggestionRenderToken++;
+		const box = document.getElementById('mention-suggestions');
+		if (box && box.__appendChatMentionRows) {
+			box.onscroll = null;
+			delete box.__appendChatMentionRows;
+		}
 	}
 
 	function cancelScheduledChatMentionSuggestions() {
@@ -46907,17 +46947,24 @@ function getVisibleChatStackEl(id) {
 		box.innerHTML = rows.slice(0, initialEnd).join('');
 		let index = initialEnd;
 
-		if (index >= rows.length) return;
-
 		const appendNextChunk = () => {
-			if (token !== chatMentionSuggestionRenderToken || !box.isConnected || box.style.display !== 'block' || box.classList.contains('command-suggestions')) return;
+			if (token !== chatMentionSuggestionRenderToken || !box.isConnected || box.classList.contains('command-suggestions') || index >= rows.length) return false;
 			const end = Math.min(rows.length, index + CHAT_MENTION_RENDER_CHUNK_ROWS);
 			box.insertAdjacentHTML('beforeend', rows.slice(index, end).join(''));
 			index = end;
-			if (index < rows.length) requestAnimationFrame(appendNextChunk);
+			return true;
 		};
 
-		requestAnimationFrame(appendNextChunk);
+		if (index >= rows.length) {
+			box.onscroll = null;
+			delete box.__appendChatMentionRows;
+			return;
+		}
+
+		box.__appendChatMentionRows = appendNextChunk;
+		box.onscroll = () => {
+			if (box.scrollTop + box.clientHeight >= box.scrollHeight - 70) appendNextChunk();
+		};
 	}
 
 	function scheduleMentionSuggestions(query) {
@@ -46947,51 +46994,34 @@ function getVisibleChatStackEl(id) {
 		}
 
 		const safeOnlineList = (typeof currentOnlineList !== 'undefined' && Array.isArray(currentOnlineList)) ? currentOnlineList : [];
-		const safeChatUsers = (typeof getKnownChatMentionNames === 'function') ? getKnownChatMentionNames() : ((typeof chatUsers !== 'undefined' && chatUsers) ? Array.from(chatUsers) : []);
-
 		const onlineNames = safeOnlineList
 			.filter(u => u && u.online === true)
-			.map(u => u.name ? u.name : u);
+			.map(u => String(u.name ? u.name : u));
+		const onlineExact = new Set(onlineNames);
+		const onlineLower = new Set(onlineNames.map(name => name.toLowerCase()));
+		const suggestionIndex = getChatMentionSuggestionIndex();
 
-		const allNamesFromList = safeOnlineList.map(u => u && u.name ? u.name : u);
-		const allPossibleUsers = Array.from(new Set([...allNamesFromList, ...safeChatUsers]));
+		let candidateRecords = suggestionIndex;
+		if (chatMentionSuggestionLastSource === suggestionIndex && chatMentionSuggestionLastMatches && queryLower.startsWith(chatMentionSuggestionLastQuery)) {
+			candidateRecords = chatMentionSuggestionLastMatches;
+		}
 
-		const onlineExact = new Set(onlineNames.map(u => String(u)));
-		const onlineLower = new Set(onlineNames.map(u => String(u).toLowerCase()));
-		const caseVariants = new Map();
-
-		allPossibleUsers.forEach(u => {
-			if (!u) return;
-			const value = String(u);
-			const lower = value.toLowerCase();
-			let variants = caseVariants.get(lower);
-			if (!variants) {
-				variants = new Set();
-				caseVariants.set(lower, variants);
-			}
-			variants.add(value);
-		});
+		const matchingRecords = queryLower
+			? candidateRecords.filter(record => record.lower.includes(queryLower))
+			: suggestionIndex;
+		chatMentionSuggestionLastQuery = queryLower;
+		chatMentionSuggestionLastSource = suggestionIndex;
+		chatMentionSuggestionLastMatches = matchingRecords;
 
 		const onlineFiltered = [];
 		const offlineFiltered = [];
-
-		allPossibleUsers.forEach(u => {
-			if (!u) return;
-			const strU = String(u);
-			const lowerU = strU.toLowerCase();
-
-			if (lowerU.includes(queryLower) && strU !== myName) {
-				const variants = caseVariants.get(lowerU);
-				const hasCaseConflict = !!(variants && variants.size > 1);
-				const isOnlineExact = onlineExact.has(strU);
-				const isOnlineSafeFallback = !hasCaseConflict && onlineLower.has(lowerU);
-				if (isOnlineExact || isOnlineSafeFallback) onlineFiltered.push(strU);
-				else offlineFiltered.push(strU);
-			}
+		matchingRecords.forEach(record => {
+			if (record.name === myName) return;
+			const isOnlineExact = onlineExact.has(record.name);
+			const isOnlineSafeFallback = !record.hasCaseConflict && onlineLower.has(record.lower);
+			if (isOnlineExact || isOnlineSafeFallback) onlineFiltered.push(record.name);
+			else offlineFiltered.push(record.name);
 		});
-
-		onlineFiltered.sort((a, b) => a.localeCompare(b));
-		offlineFiltered.sort((a, b) => a.localeCompare(b));
 
 		const suggestionRows = [];
 
@@ -47486,8 +47516,12 @@ function getVisibleChatStackEl(id) {
 
 	function activateChatSuggestionByIndex(box, index) {
 		box = box || document.getElementById('mention-suggestions');
-		const items = getActionableSuggestionItems(box);
+		let items = getActionableSuggestionItems(box);
 		if (!box || !items.length) return null;
+		if (index >= items.length && typeof box.__appendChatMentionRows === 'function') {
+			box.__appendChatMentionRows();
+			items = getActionableSuggestionItems(box);
+		}
 		box.querySelectorAll('.suggestion-item.active').forEach(item => item.classList.remove('active'));
 		selectedSuggestionIndex = (index + items.length) % items.length;
 		const activeItem = items[selectedSuggestionIndex];
@@ -47714,6 +47748,7 @@ function getVisibleChatStackEl(id) {
 	function showCommandTargetSuggestions(command, query) {
 		const box = ensureChatSuggestionBox();
 		if (!box) return;
+		if (typeof cancelChatMentionSuggestionRender === 'function') cancelChatMentionSuggestionRender();
 		box.classList.remove('command-suggestions');
 		command = String(command || '').toLowerCase();
 		if (!commandCanUse(command)) { box.style.display = 'none'; return; }
@@ -47744,6 +47779,7 @@ function getVisibleChatStackEl(id) {
 	function showRoleValueSuggestions(targetName, query) {
 		const box = ensureChatSuggestionBox();
 		if (!box) return;
+		if (typeof cancelChatMentionSuggestionRender === 'function') cancelChatMentionSuggestionRender();
 		box.classList.remove('command-suggestions');
 		if (!commandCanUse('role')) { box.style.display = 'none'; return; }
 		const roles = [
@@ -47830,6 +47866,7 @@ function getVisibleChatStackEl(id) {
     function showCommandSuggestions(query) {
 		const box = ensureChatSuggestionBox();
 		if (!box) return;
+		if (typeof cancelChatMentionSuggestionRender === 'function') cancelChatMentionSuggestionRender();
 		box.classList.add('command-suggestions');
 		box.classList.add('chat-align-toolbar');
 		box.dataset.chatToolbarPanel = 'command';
@@ -53896,6 +53933,7 @@ function getVisibleChatStackEl(id) {
 			
 			currentOnlineList = users;
 			window.currentOnlineList = users;
+			if (typeof invalidateChatMentionNameCaches === 'function') invalidateChatMentionNameCaches();
 			if (typeof window.syncPsnUserMeta === 'function') users.forEach(u => window.syncPsnUserMeta(u));
 			users.forEach(u => {
 				if (!u || !u.name) return;
@@ -54012,7 +54050,17 @@ function getVisibleChatStackEl(id) {
 			if (mentionDbChanged && typeof refreshMentionJumpButton === 'function') {
 				refreshMentionJumpButton();
 			}
-			if (Array.isArray(results) && typeof window.syncPsnUserMeta === 'function') results.forEach(u => window.syncPsnUserMeta(u));
+			if (Array.isArray(results)) {
+				window.__profileMetaFreshAt = window.__profileMetaFreshAt || {};
+				results.forEach(u => {
+					if (typeof window.syncPsnUserMeta === 'function') window.syncPsnUserMeta(u);
+					const resultName = String(u && (u.name || u.username || u.user || u.onlineId) || '').trim();
+					if (!resultName) return;
+					window.__profileMetaFreshAt[resultName.toLowerCase()] = Date.now();
+					const incomingStyle = (u.settingsData && (u.settingsData.profileCardStyle || u.settingsData.profileCardEffect)) || u.profileCardStyle || u.profileCardEffect || '';
+					if (incomingStyle && typeof writeProfileCardStyleForUser === 'function') writeProfileCardStyleForUser(resultName, incomingStyle, Number((u.settingsData && (u.settingsData.profileCardStyleUpdatedAt || u.settingsData.profileCardEffectUpdatedAt || u.settingsData.profileCardThemeUpdatedAt)) || u.profileCardStyleUpdatedAt || u.profileUpdatedAt || 0));
+				});
+			}
 			const openProfileTarget = document.getElementById('modal-sys-profile')?.dataset?.profileUsername || '';
 			if (openProfileTarget && Array.isArray(results) && results.some(u => (u && (u.name || u)) === openProfileTarget)) {
 				const profileModal = document.getElementById('modal-sys-profile');
@@ -54881,6 +54929,7 @@ function getVisibleChatStackEl(id) {
 					currentOnlineList.splice(onlineIndex, 1);
 				}
 				window.currentOnlineList = currentOnlineList;
+				if (typeof invalidateChatMentionNameCaches === 'function') invalidateChatMentionNameCaches();
 
 				const mergePresence = list => {
 					if (!Array.isArray(list)) return;
@@ -57984,10 +58033,13 @@ function getVisibleChatStackEl(id) {
 
 		const me = activeUsers.find(u => (u.name || u) === myName);
 		const others = activeUsers.filter(u => (u.name || u) !== myName);
+		const rolePriority = { admin: 3, mod: 2, trusted: 1, user: 0 };
 		others.sort((a, b) => {
-			const aAdmin = a.isAdmin ? 1 : 0;
-			const bAdmin = b.isAdmin ? 1 : 0;
-			return bAdmin - aAdmin;
+			const aName = a.name || a;
+			const bName = b.name || b;
+			const aRole = typeof window.getPsnUserRole === 'function' ? window.getPsnUserRole(aName, a) : (a.isAdmin ? 'admin' : 'user');
+			const bRole = typeof window.getPsnUserRole === 'function' ? window.getPsnUserRole(bName, b) : (b.isAdmin ? 'admin' : 'user');
+			return (rolePriority[bRole] || 0) - (rolePriority[aRole] || 0);
 		});
 
 		const orderedUsers = me ? [me, ...others] : others;
@@ -61764,6 +61816,47 @@ function getVisibleChatStackEl(id) {
 		}
 	};
 	
+	window.refreshFriendsPresenceMetadata = function(force = false) {
+		if (typeof socketChat === 'undefined' || !socketChat || !socketChat.connected || !Array.isArray(window.friendsList) || window.friendsList.length === 0) return false;
+		const now = Date.now();
+		if (window.__friendsPresenceRefreshInFlight === true) return false;
+		if (!force && now - Math.max(0, Number(window.__friendsPresenceRefreshCompletedAt) || 0) < 60000) return false;
+
+		const myName = localStorage.getItem('psn_username') || '';
+		const onlineNames = new Set((Array.isArray(currentOnlineList) ? currentOnlineList : []).filter(user => user && typeof user === 'object' && user.online === true).map(user => String(user.name || '').trim()).filter(Boolean));
+		const names = Array.from(new Set(window.friendsList.map(friend => String(friend && (friend.name || friend) || '').trim()).filter(name => name && name !== myName && !onlineNames.has(name))));
+		if (names.length === 0) { window.__friendsPresenceRefreshCompletedAt = now; return false; }
+
+		window.__friendsPresenceRefreshInFlight = true;
+		const token = (Number(window.__friendsPresenceRefreshToken) || 0) + 1;
+		window.__friendsPresenceRefreshToken = token;
+		let index = 0;
+
+		const finish = completed => {
+			if (window.__friendsPresenceRefreshToken !== token) return;
+			window.__friendsPresenceRefreshInFlight = false;
+			window.__friendsPresenceRefreshTimer = null;
+			if (completed) window.__friendsPresenceRefreshCompletedAt = Date.now();
+		};
+
+		const requestNext = () => {
+			if (window.__friendsPresenceRefreshToken !== token) return;
+			if (!socketChat || !socketChat.connected || (typeof isFriendsSubviewVisible === 'function' && !isFriendsSubviewVisible())) { finish(false); return; }
+			const searchValue = String(document.getElementById('search-input')?.value || '').trim();
+			if (searchValue) { finish(false); return; }
+			if (index >= names.length) { finish(true); return; }
+
+			const requestedName = names[index++];
+			window.__profileMetaLookupAt = window.__profileMetaLookupAt || {};
+			window.__profileMetaLookupAt[requestedName.toLowerCase()] = Date.now();
+			socketChat.emit('search_users', { query: requestedName, purpose: 'friends-presence' });
+			window.__friendsPresenceRefreshTimer = setTimeout(requestNext, 160);
+		};
+
+		requestNext();
+		return true;
+	};
+
 	window.renderFriendsList = function(filter = '', isSilent = false, progressiveMode = 'reset') {
 		if (typeof window.setSidebarCountPill === 'function') window.setSidebarCountPill('friends', Array.isArray(window.friendsList) ? window.friendsList.length : 0);
 		isSilent = isSilent || !!window.isRestoringHistory;
@@ -61882,26 +61975,22 @@ function getVisibleChatStackEl(id) {
 			const nameB = b.name || b;
 			const netA = onlineByName.get(nameA) || null;
 			const netB = onlineByName.get(nameB) || null;
-			
-			const onlineA = netA ? netA.online === true : false;
-			const onlineB = netB ? netB.online === true : false;
-			
-			const levelA = netA ? (netA.level || 1) : (a.level || 1);
-			const levelB = netB ? (netB.level || 1) : (b.level || 1);
-			
-			const lastSeenA = getKnownFriendLastSeen(nameA, a, netA);
-			const lastSeenB = getKnownFriendLastSeen(nameB, b, netB);
 
 			if (sortMode === 'status') {
+				const onlineA = netA ? netA.online === true : false;
+				const onlineB = netB ? netB.online === true : false;
 				if (onlineA === onlineB) return nameA.localeCompare(nameB);
 				return onlineA ? -1 : 1;
-			} else if (sortMode === 'level') {
-				return levelB - levelA;
-			} else if (sortMode === 'recent') {
-				return lastSeenB - lastSeenA;
-			} else {
-				return nameA.localeCompare(nameB);
 			}
+			if (sortMode === 'level') {
+				const levelA = netA ? (netA.level || 1) : (a.level || 1);
+				const levelB = netB ? (netB.level || 1) : (b.level || 1);
+				return levelB - levelA;
+			}
+			if (sortMode === 'recent') {
+				return getKnownFriendLastSeen(nameB, b, netB) - getKnownFriendLastSeen(nameA, a, netA);
+			}
+			return nameA.localeCompare(nameB);
 		};
 
 		filteredFriends.sort(sorterLogic);
@@ -61916,6 +62005,13 @@ function getVisibleChatStackEl(id) {
 			onlineOthers.reverse();
 			globalOffline.reverse();
 		}
+
+		const friendsTotalMatches = filteredFriends.length + onlineOthers.length + globalOffline.length;
+		const friendsProgressiveInitial = Math.max(1, Math.min(60, getProgressiveGridInitialLimit()));
+		const friendsProgressiveLoad = Math.max(1, Math.min(100, getProgressiveGridLoadAmount()));
+		const friendsUseProgressiveSearch = isSearching && friendsTotalMatches > friendsProgressiveInitial;
+		const friendsAppendProgressive = progressiveMode === 'append';
+		const friendsPreviouslyRendered = Number(grid.dataset.friendsProgressiveRendered || 0);
 
 		const friendsSignatureEntry = function(entry, group) {
 			const name = String(entry && (entry.name || entry) || '');
@@ -61937,25 +62033,37 @@ function getVisibleChatStackEl(id) {
 				String(!!(net && net.isBanned || entry && entry.isBanned || friend && friend.isBanned || search && search.isBanned))
 			].join('~');
 		};
-		const friendsSignatureFriend = filteredFriends.map(function(entry) { return friendsSignatureEntry(entry, 'friend'); }).join('||');
-		const friendsSignatureOnline = onlineOthers.map(function(entry) { return friendsSignatureEntry(entry, 'online'); }).join('||');
-		const friendsSignatureOffline = globalOffline.map(function(entry) { return friendsSignatureEntry(entry, 'offline'); }).join('||');
+
+		const friendsOrderSignature = getProgressiveGridSignature([
+			filteredFriends.map(entry => String(entry && (entry.name || entry) || '')).join('\u001f'),
+			onlineOthers.map(entry => String(entry && (entry.name || entry) || '')).join('\u001f'),
+			globalOffline.map(entry => String(entry && (entry.name || entry) || '')).join('\u001f')
+		]);
+		const friendsSignatureLimit = friendsUseProgressiveSearch
+			? Math.min(friendsTotalMatches, Math.max(friendsProgressiveInitial, friendsPreviouslyRendered || 0))
+			: friendsTotalMatches;
+		const friendsVisibleSignatureParts = [];
+		let signatureRemaining = friendsSignatureLimit;
+		const collectSignature = (entries, group) => {
+			if (signatureRemaining <= 0) return;
+			const end = Math.min(entries.length, signatureRemaining);
+			for (let i = 0; i < end; i++) friendsVisibleSignatureParts.push(friendsSignatureEntry(entries[i], group));
+			signatureRemaining -= end;
+		};
+		collectSignature(filteredFriends, 'friend');
+		collectSignature(onlineOthers, 'online');
+		collectSignature(globalOffline, 'offline');
+
 		const friendsProgressiveSignature = getProgressiveGridSignature([
 			searchTerm, sortMode, showOnlineOnly ? '1' : '0', showPlayingOnly ? '1' : '0', window.sortOrders && window.sortOrders.friends || 'asc',
-			friendsSignatureFriend, friendsSignatureOnline, friendsSignatureOffline
+			friendsOrderSignature
 		]);
 		const friendsRenderSignature = getProgressiveGridSignature([
 			searchTerm, sortMode, showOnlineOnly ? '1' : '0', showPlayingOnly ? '1' : '0', window.sortOrders && window.sortOrders.friends || 'asc',
-			Math.floor(Date.now() / 60000), friendsSignatureFriend, friendsSignatureOnline, friendsSignatureOffline
+			Math.floor(Date.now() / 60000), friendsOrderSignature, friendsVisibleSignatureParts.join('||')
 		]);
-		const friendsTotalMatches = filteredFriends.length + onlineOthers.length + globalOffline.length;
-		const friendsProgressiveInitial = Math.max(1, Math.min(60, getProgressiveGridInitialLimit()));
-		const friendsProgressiveLoad = Math.max(1, Math.min(100, getProgressiveGridLoadAmount()));
-		const friendsUseProgressiveSearch = isSearching && friendsTotalMatches > friendsProgressiveInitial;
-		const friendsAppendProgressive = progressiveMode === 'append';
 		const friendsSameSignature = grid.dataset.friendsRenderSignature === friendsRenderSignature;
 		const friendsSameProgressiveSignature = grid.dataset.friendsProgressiveSignature === friendsProgressiveSignature;
-		const friendsPreviouslyRendered = Number(grid.dataset.friendsProgressiveRendered || 0);
 		clearProgressiveGridObserver('friends-search', grid);
 
 		if (friendsUseProgressiveSearch) {
@@ -62579,24 +62687,30 @@ function getVisibleChatStackEl(id) {
 		const adminUser = Array.isArray(window.adminAllUsers) ? window.adminAllUsers.find(u => (u.name || u) === username) : null;
 		const searchUser = window.globalSearchResults ? window.globalSearchResults.find(u => (u.name || u) === username) : null;
 		const friendUser = Array.isArray(window.friendsList) ? window.friendsList.find(u => (u.name || u) === username) : null;
-		const networkProfileNeedsDetails = !!(networkUser && ['downloads','wishlist','favorites','trophies','library'].some(key => !Object.prototype.hasOwnProperty.call(networkUser, key)));
+		const profileDetailStorageKeys = { downloads: 'downloads', wishlist: 'wishlist', favorites: 'favs', trophies: 'trophies', library: 'library' };
+		const networkProfileNeedsDetails = !!(networkUser && Object.entries(profileDetailStorageKeys).some(([key, storageKey]) => !Object.prototype.hasOwnProperty.call(networkUser, key) && localStorage.getItem(`${username}_psn_${storageKey}`) === null));
 		if (!isMe && (!networkUser || networkProfileNeedsDetails) && !adminUser && !searchUser && typeof socketChat !== 'undefined' && socketChat && socketChat.connected) {
 			const now = Date.now();
 			const profileLookupKey = String(username || '').toLowerCase();
+			const cachedMetaFreshAt = Number(window.__profileMetaFreshAt && window.__profileMetaFreshAt[profileLookupKey] || 0);
 			window.__profileMetaLookupAt = window.__profileMetaLookupAt || {};
-			if (!window.__profileMetaLookupAt[profileLookupKey] || now - window.__profileMetaLookupAt[profileLookupKey] > 5000) {
+			if (now - cachedMetaFreshAt > 60000 && (!window.__profileMetaLookupAt[profileLookupKey] || now - window.__profileMetaLookupAt[profileLookupKey] > 5000)) {
 				window.__profileMetaLookupAt[profileLookupKey] = now;
 				socketChat.emit('search_users', username);
 			}
 		}
 		const profileMeta = { ...(friendUser || {}), ...(adminUser || {}), ...(searchUser || {}), ...(networkUser || {}) };
+		const cachedLastSeen = Number(localStorage.getItem(`${username}_psn_lastSeen`)) || 0;
+		const sourceLastSeen = Number(profileMeta.lastSeen || profileMeta.last_seen || 0);
+		if (cachedLastSeen > sourceLastSeen) profileMeta.lastSeen = cachedLastSeen;
 		const roleSource = profileMeta;
 		if (typeof applyProfileCardStyle === 'function') applyProfileCardStyle(getStoredProfileCardStyle(username, roleSource));
 		const profileRole = typeof window.getPsnUserRole === 'function' ? window.getPsnUserRole(username, roleSource) : (roleSource.isAdmin ? 'admin' : 'user');
 		const isTargetAdmin = (networkUser && networkUser.isAdmin === true) || profileRole === 'admin' || (localStorage.getItem(`${username}_psn_isAdmin`) === 'true');
 		const isTargetBanned = typeof window.isPsnUserBanned === 'function' ? window.isPsnUserBanned(username, roleSource) : ((roleSource && roleSource.isBanned === true) || profileRole === 'banned' || (localStorage.getItem(`${username}_psn_isBanned`) === 'true'));
         const adminTagHtml = typeof window.buildPsnRoleBadge === 'function' ? window.buildPsnRoleBadge(username, roleSource, 'profile') : (isTargetAdmin ? ` <span style="color:#ff4444; font-size:12px; font-weight:bold; font-style: italic; text-shadow: 0 0 8px rgba(255, 68, 68, 0.4); margin-left: 5px;">(Admin)</span>` : '');
-		const avatarUrl = (typeof getResolvedUserAvatar === 'function') ? getResolvedUserAvatar(username, profileMeta.avatar) : (profileMeta.avatar || localStorage.getItem(`${username}_psn_avatar`) || (isMe ? AVAILABLE_AVATARS[0] : "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/main/resources/interface/modern/images/avatars/default.png"));
+		const cachedAvatar = localStorage.getItem(`${username}_psn_avatar`) || '';
+		const avatarUrl = cachedAvatar || ((typeof getResolvedUserAvatar === 'function') ? getResolvedUserAvatar(username, profileMeta.avatar) : (profileMeta.avatar || (isMe ? AVAILABLE_AVATARS[0] : "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/main/resources/interface/modern/images/avatars/default.png")));
 		const joinedDate = profileMeta.joined || localStorage.getItem(`${username}_psn_joined`) || (isMe ? (localStorage.getItem(`${myName}_joined_date`) || "2026") : "---");
 		
 		const isFriend = window.friendsList && window.friendsList.some(f => f.name === username);
@@ -62669,15 +62783,16 @@ function getVisibleChatStackEl(id) {
 				isUserOnline = true;
 				statusIcon.classList.add('status-pulsing-full');
 			} else {
-				const timeAgo = typeof formatLastSeen === 'function' ? formatLastSeen(networkUser.lastSeen) : 'Offline';
-				statusText.innerText = `Last seen: ${timeAgo}`;
+				const offlineLastSeen = Math.max(Number(networkUser.lastSeen || networkUser.last_seen || 0), Number(profileMeta.lastSeen || profileMeta.last_seen || 0), Number(window.__presenceLastSeenByUser && window.__presenceLastSeenByUser[username] || 0), Number(localStorage.getItem(`${username}_psn_lastSeen`)) || 0);
+				const timeAgo = offlineLastSeen && typeof formatLastSeen === 'function' ? formatLastSeen(offlineLastSeen) : '';
+				statusText.innerText = timeAgo ? `Last seen: ${timeAgo}` : "Status: Offline";
 				statusContainer.style.color = "#8b96a8";
 				statusIcon.style.display = "block"; 
                 isUserOnline = false;
 				statusIcon.style.transform = "translateY(2px)";
 			}
 		} else {
-			const offlineLastSeen = profileMeta.lastSeen || localStorage.getItem(`${username}_psn_lastSeen`) || null;
+			const offlineLastSeen = Math.max(Number(profileMeta.lastSeen || profileMeta.last_seen || 0), Number(window.__presenceLastSeenByUser && window.__presenceLastSeenByUser[username] || 0), Number(localStorage.getItem(`${username}_psn_lastSeen`)) || 0);
 			const timeAgo = offlineLastSeen && typeof formatLastSeen === 'function' ? formatLastSeen(offlineLastSeen) : '';
 			statusText.innerText = timeAgo ? `Last seen: ${timeAgo}` : "Status: Offline";
 			statusContainer.style.color = "#8b96a8";
@@ -62728,15 +62843,17 @@ function getVisibleChatStackEl(id) {
 			let totalXp = calculateMyXp();
 			playerLevel = Math.floor(totalXp / 100) + 1;
 		} else {
-			playerLevel = profileMeta.level || localStorage.getItem(`${username}_psn_level`) || "1";
+			const cachedLevel = Number(localStorage.getItem(`${username}_psn_level`)) || 0;
+			playerLevel = Math.max(Number(profileMeta.level) || 0, cachedLevel, 1);
 		}
 		document.getElementById('card-level').innerText = playerLevel;
 	
 		const readProfileCount = (key, storageKey) => {
+			const storedRaw = localStorage.getItem(`${username}_psn_${storageKey}`);
+			const stored = storedRaw === null ? NaN : Number(storedRaw);
+			if (Number.isFinite(stored) && stored >= 0) return stored;
 			const direct = Number(profileMeta && profileMeta[key]);
-			if (Number.isFinite(direct) && direct >= 0) return direct;
-			const stored = Number(localStorage.getItem(`${username}_psn_${storageKey}`));
-			return Number.isFinite(stored) && stored >= 0 ? stored : 0;
+			return Number.isFinite(direct) && direct >= 0 ? direct : 0;
 		};
 		const countDownloads = isMe ? (window.downloadHistory?.length || 0) : readProfileCount('downloads', 'downloads');
 		const countWishlist = isMe ? (window.wishlist?.length || 0) : readProfileCount('wishlist', 'wishlist');
