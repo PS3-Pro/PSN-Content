@@ -29,8 +29,6 @@
 	<link rel="dns-prefetch" href="//raw.githubusercontent.com">
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
 	<script src="https://cdn.jsdelivr.net/particles.js/2.0.0/particles.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/chance/1.0.18/chance.min.js"></script>
 	<script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
 	<link href="https://cdnjs.cloudflare.com/ajax/libs/cropperjs/1.5.13/cropper.min.css" rel="stylesheet">
 	<meta name="theme-color" content="#0f1521">
@@ -32938,90 +32936,149 @@ P
 		if (typeof setupSkeletonAnimations === 'function') setupSkeletonAnimations(containerId);
 	}
     
-    function weightedRandomDistrib(peak, count) {
-        let prob = [], seq = [];
-        for (let i = 0; i < count; i++) {
-            prob.push(Math.pow(count - Math.abs(peak - i), 3));
-            seq.push(i);
-        }
-        return chance.weighted(seq, prob);
-    }
-
     function thanosSnapEffect(cardElement, onComplete) {
+        let completed = false;
+        const complete = () => {
+            if (completed) return;
+            completed = true;
+            if (typeof onComplete === 'function') onComplete();
+        };
+
+        if (!cardElement || !cardElement.isConnected) {
+            complete();
+            return;
+        }
+
+        const rect = cardElement.getBoundingClientRect();
+        if (!rect.width || !rect.height) {
+            complete();
+            return;
+        }
+
         cardElement.style.pointerEvents = 'none';
-        cardElement.style.transition = 'transform 0.15s cubic-bezier(0.175, 0.885, 0.32, 1.275), filter 0.15s';
+        cardElement.style.transition = 'transform .18s cubic-bezier(.175,.885,.32,1.275), filter .18s ease-out';
         cardElement.style.transform = 'scale(1)';
+        cardElement.style.opacity = '1';
         cardElement.style.filter = 'grayscale(1) brightness(1.2) contrast(1.1)';
 
+        const layerCount = 36;
+        const gridCols = 46;
+        const gridRows = 68;
+        const masks = Array.from({ length: layerCount }, () => []);
+        const cellW = 100 / gridCols;
+        const cellH = 100 / gridRows;
+
+        for (let row = 0; row < gridRows; row++) {
+            for (let col = 0; col < gridCols; col++) {
+                const progress = col / Math.max(1, gridCols - 1);
+                const center = progress * (layerCount - 1);
+                const spread = 8.2;
+                const randomOffset = (Math.random() + Math.random() + Math.random() - 1.5) * spread;
+                const layer = Math.max(0, Math.min(layerCount - 1, Math.round(center + randomOffset)));
+                const x = col * cellW;
+                const y = row * cellH;
+                masks[layer].push(`<rect x="${x.toFixed(3)}" y="${y.toFixed(3)}" width="${(cellW + .06).toFixed(3)}" height="${(cellH + .06).toFixed(3)}" rx=".16" ry=".16"/>`);
+            }
+        }
+
+        const originLeft = rect.left + window.scrollX;
+        const originTop = rect.top + window.scrollY;
+        const fragments = [];
+        let finishedLayers = 0;
+        const finishLayer = () => {
+            finishedLayers++;
+            if (finishedLayers >= fragments.length) complete();
+        };
+
+        const stripDuplicateIds = root => {
+            if (!root || root.nodeType !== 1) return;
+            root.removeAttribute('id');
+            root.querySelectorAll('[id]').forEach(el => el.removeAttribute('id'));
+            root.querySelectorAll('img').forEach(img => {
+                img.loading = 'eager';
+                img.decoding = 'sync';
+                img.draggable = false;
+            });
+        };
+
+        for (let i = 0; i < layerCount; i++) {
+            if (!masks[i].length) continue;
+
+            const clone = cardElement.cloneNode(true);
+            stripDuplicateIds(clone);
+            clone.classList.remove('category-remove-effect', 'wish-effect', 'wish-remove-effect', 'anim-reveal', 'category-wishlist-entry', 'category-new-highlight');
+            clone.setAttribute('aria-hidden', 'true');
+            clone.style.position = 'absolute';
+            clone.style.left = `${originLeft}px`;
+            clone.style.top = `${originTop}px`;
+            clone.style.width = `${rect.width}px`;
+            clone.style.height = `${rect.height}px`;
+            clone.style.margin = '0';
+            clone.style.opacity = '1';
+            clone.style.visibility = 'visible';
+            clone.style.pointerEvents = 'none';
+            clone.style.zIndex = '9999';
+            clone.style.transform = 'translate3d(0,0,0) scale(1)';
+            clone.style.transformOrigin = `${35 + Math.random() * 50}% ${25 + Math.random() * 55}%`;
+            clone.style.filter = 'grayscale(1) brightness(1.2) contrast(1.1)';
+            clone.style.transition = 'none';
+            clone.style.animation = 'none';
+            clone.style.willChange = 'transform, opacity, filter';
+            clone.style.contain = 'paint';
+
+            const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" preserveAspectRatio="none"><g fill="white">${masks[i].join('')}</g></svg>`;
+            const maskUrl = `url("data:image/svg+xml,${encodeURIComponent(svg)}")`;
+            clone.style.webkitMaskImage = maskUrl;
+            clone.style.maskImage = maskUrl;
+            clone.style.webkitMaskSize = '100% 100%';
+            clone.style.maskSize = '100% 100%';
+            clone.style.webkitMaskRepeat = 'no-repeat';
+            clone.style.maskRepeat = 'no-repeat';
+
+            document.body.appendChild(clone);
+            fragments.push({ clone, index: i });
+        }
+
+        if (!fragments.length) {
+            complete();
+            return;
+        }
+
+        const snapHoldMs = 650;
         setTimeout(() => {
-            html2canvas(cardElement, {
-                useCORS: true, 
-                backgroundColor: null,
-                scale: 1,
-                logging: false 
-            }).then(canvas => {
-                const ctx = canvas.getContext("2d");
-                const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-                const pixelArr = imageData.data;
-                const canvasCount = 32;
-                const imageDataArray = [];
+            if (cardElement && cardElement.isConnected) cardElement.style.visibility = 'hidden';
 
-                for (let i = 0; i < canvasCount; i++) {
-                    imageDataArray.push(new Uint8ClampedArray(pixelArr.length));
-                }
+            requestAnimationFrame(() => {
+                requestAnimationFrame(() => {
+                    fragments.forEach(({ clone, index }) => {
+                    const progress = index / Math.max(1, layerCount - 1);
+                    const eased = Math.pow(progress, .9);
+                    const angle = (Math.random() - .5) * (24 + eased * 28);
+                    const tx = 12 + eased * 112 + Math.random() * 42;
+                    const ty = -22 - eased * 102 - Math.random() * 74;
+                    const scale = .84 - eased * .12 + Math.random() * .045;
+                    const duration = 1.08 + eased * 1.18 + Math.random() * .18;
+                    const delay = eased * .34 + Math.random() * .045;
 
-                for (let i = 0; i < pixelArr.length; i += 4) {
-                    let p = Math.floor((i / pixelArr.length) * canvasCount);
-                    let a = imageDataArray[weightedRandomDistrib(p, canvasCount)];
-                    a[i] = pixelArr[i];
-                    a[i + 1] = pixelArr[i + 1];
-                    a[i + 2] = pixelArr[i + 2];
-                    a[i + 3] = pixelArr[i + 3];
-                }
-
-                cardElement.style.visibility = 'hidden';
-
-                const rect = cardElement.getBoundingClientRect();
-
-                for (let i = 0; i < canvasCount; i++) {
-                    let c = document.createElement("canvas");
-                    c.width = canvas.width;
-                    c.height = canvas.height;
-                    c.getContext("2d").putImageData(new ImageData(imageDataArray[i], canvas.width, canvas.height), 0, 0);
-                    
-                    c.style.position = "absolute";
-                    c.style.left = `${rect.left + window.scrollX}px`;
-                    c.style.top = `${rect.top + window.scrollY}px`;
-                    
-                    c.style.width = `${rect.width}px`;
-                    c.style.height = `${rect.height}px`;
-                    c.style.pointerEvents = "none";
-                    c.style.zIndex = 9999;
-                    
-                    const angle = (Math.random() - 0.5) * 45; 
-                    const tx = (Math.random() - 0.5) * 120;
-                    const ty = -100 - (Math.random() * 150);
-                    const duration = 1.0 + (i * 0.05);
-
-                    c.style.transition = `transform ${duration}s ease-out, opacity ${duration}s ease-out`;
-                    document.body.appendChild(c);
-
-                    requestAnimationFrame(() => {
-                        requestAnimationFrame(() => {
-                            c.style.transform = `rotate(${angle}deg) translate(${tx}px, ${ty}px)`;
-                            c.style.opacity = "0";
-                        });
-                    });
+                    clone.style.transition = `transform ${duration}s cubic-bezier(.12,.72,.22,1) ${delay}s, opacity ${duration}s cubic-bezier(.18,.72,.24,1) ${delay}s, filter ${duration}s ease-out ${delay}s`;
+                    clone.style.transform = `translate3d(${tx}px,${ty}px,0) rotate(${angle}deg) scale(${scale})`;
+                    clone.style.opacity = '0';
+                    clone.style.filter = `grayscale(1) brightness(${1.04 - eased * .14}) blur(${1.2 + eased * 3.2}px)`;
 
                     setTimeout(() => {
-                        c.remove();
-                        if (i === canvasCount - 1 && onComplete) onComplete();
-                    }, duration * 1000);
-                }
+                        clone.remove();
+                        finishLayer();
+                    }, Math.ceil((duration + delay) * 1000) + 120);
+                    });
+                });
             });
-        }, 0);
+        }, snapHoldMs);
+
+        setTimeout(() => {
+            fragments.forEach(({ clone }) => clone.remove());
+            complete();
+        }, snapHoldMs + 4300);
     }
-    
 
 	const WISHLIST_DOT_PENDING_KEY = 'psn_wish_dot_items';
 	const FAVORITES_DOT_PENDING_KEY = 'psn_fav_dot_items';
