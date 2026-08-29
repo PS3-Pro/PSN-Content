@@ -19732,6 +19732,10 @@ P
 		const searchInput = document.getElementById('search-input');
 		if (parentView) parentView.style.overflow = section === 'chat' ? 'hidden' : 'visible';
 
+		if (section !== 'activity' && activityView && activityView.style.display === 'flex' && typeof window.resetSocialFeedViewState === 'function') {
+			window.resetSocialFeedViewState('activity');
+		}
+
 		if(btnChat) btnChat.classList.remove('active');
 		if(btnFriends) btnFriends.classList.remove('active');
 		if(btnActivity) btnActivity.classList.remove('active');
@@ -31718,6 +31722,12 @@ P
 
 		if (currentView) {
 			if (currentView.id !== viewId && !window.isRestoringHistory) {
+				if (currentView.id === 'view-notifications' && typeof window.resetSocialFeedViewState === 'function') {
+					window.resetSocialFeedViewState('notifications');
+				}
+				if (currentView.id === 'view-chat' && document.getElementById('subview-activity')?.style.display === 'flex' && typeof window.resetSocialFeedViewState === 'function') {
+					window.resetSocialFeedViewState('activity');
+				}
 				if (leavingBrowseContext) {
 					if (typeof resetBrowseToGamesMainScreen === 'function') {
 						resetBrowseToGamesMainScreen({ clearData: true });
@@ -58851,29 +58861,44 @@ function getVisibleChatStackEl(id) {
 	window.__friendActivityRenderLimit = SOCIAL_FEED_RENDER_BATCH_SIZE;
 	window.__realtimeFeedOlderObservers = window.__realtimeFeedOlderObservers || {};
 
-	const FRIEND_ACTIVITY_FILTER_STORAGE_KEY = 'psn_friend_activity_filter';
-	const USER_NOTIFICATION_FILTER_STORAGE_KEY = 'psn_notification_filter';
-	const FRIEND_ACTIVITY_SORT_STORAGE_KEY = 'psn_friend_activity_sort_order';
-	const USER_NOTIFICATION_SORT_STORAGE_KEY = 'psn_notification_sort_order';
 	const FRIEND_ACTIVITY_FILTERS = new Set(['all','status','games','library','trophies','cheats']);
 	const USER_NOTIFICATION_FILTERS = new Set(['all','chat','trophies','content']);
 	const SOCIAL_FEED_SORT_ORDERS = new Set(['asc','desc']);
+	let friendActivityFilterValue = 'all';
+	let userNotificationFilterValue = 'all';
+	let friendActivitySortOrder = 'desc';
+	let userNotificationSortOrder = 'desc';
 
 	function getFriendActivityFilterValue() {
-		const value = String(loadState(FRIEND_ACTIVITY_FILTER_STORAGE_KEY) || 'all').toLowerCase();
-		return FRIEND_ACTIVITY_FILTERS.has(value) ? value : 'all';
+		return FRIEND_ACTIVITY_FILTERS.has(friendActivityFilterValue) ? friendActivityFilterValue : 'all';
 	}
 
 	function getUserNotificationFilterValue() {
-		const value = String(loadState(USER_NOTIFICATION_FILTER_STORAGE_KEY) || 'all').toLowerCase();
-		return USER_NOTIFICATION_FILTERS.has(value) ? value : 'all';
+		return USER_NOTIFICATION_FILTERS.has(userNotificationFilterValue) ? userNotificationFilterValue : 'all';
 	}
 
 	function getSocialFeedSortOrder(feed) {
-		const key = feed === 'activity' ? FRIEND_ACTIVITY_SORT_STORAGE_KEY : USER_NOTIFICATION_SORT_STORAGE_KEY;
-		const value = String(loadState(key) || 'desc').toLowerCase();
+		const value = feed === 'activity' ? friendActivitySortOrder : userNotificationSortOrder;
 		return SOCIAL_FEED_SORT_ORDERS.has(value) ? value : 'desc';
 	}
+
+	window.resetSocialFeedViewState = function(feed) {
+		const target = feed === 'activity' ? 'activity' : 'notifications';
+		if (target === 'activity') {
+			friendActivityFilterValue = 'all';
+			friendActivitySortOrder = 'desc';
+			window.__friendActivityRenderLimit = SOCIAL_FEED_RENDER_BATCH_SIZE;
+			const list = document.getElementById('friend-activity-list');
+			if (list) delete list.dataset.realtimeFeedRenderSignature;
+		} else {
+			userNotificationFilterValue = 'all';
+			userNotificationSortOrder = 'desc';
+			window.__userNotificationRenderLimit = SOCIAL_FEED_RENDER_BATCH_SIZE;
+			const list = document.getElementById('notification-center-list');
+			if (list) delete list.dataset.realtimeFeedRenderSignature;
+		}
+		syncSocialFeedFilterControls();
+	};
 
 	function sortSocialFeedItems(items, order) {
 		const direction = order === 'asc' ? 1 : -1;
@@ -58948,7 +58973,7 @@ function getVisibleChatStackEl(id) {
 
 	window.setFriendActivityFilter = function(value) {
 		const next = FRIEND_ACTIVITY_FILTERS.has(String(value || '').toLowerCase()) ? String(value).toLowerCase() : 'all';
-		saveState(FRIEND_ACTIVITY_FILTER_STORAGE_KEY, next);
+		friendActivityFilterValue = next;
 		window.__friendActivityRenderLimit = SOCIAL_FEED_RENDER_BATCH_SIZE;
 		const list = document.getElementById('friend-activity-list');
 		if (list) delete list.dataset.realtimeFeedRenderSignature;
@@ -58958,7 +58983,7 @@ function getVisibleChatStackEl(id) {
 
 	window.setNotificationFeedFilter = function(value) {
 		const next = USER_NOTIFICATION_FILTERS.has(String(value || '').toLowerCase()) ? String(value).toLowerCase() : 'all';
-		saveState(USER_NOTIFICATION_FILTER_STORAGE_KEY, next);
+		userNotificationFilterValue = next;
 		window.__userNotificationRenderLimit = SOCIAL_FEED_RENDER_BATCH_SIZE;
 		const list = document.getElementById('notification-center-list');
 		if (list) delete list.dataset.realtimeFeedRenderSignature;
@@ -58968,9 +58993,9 @@ function getVisibleChatStackEl(id) {
 
 	window.toggleSocialFeedSort = function(feed) {
 		const target = feed === 'activity' ? 'activity' : 'notifications';
-		const key = target === 'activity' ? FRIEND_ACTIVITY_SORT_STORAGE_KEY : USER_NOTIFICATION_SORT_STORAGE_KEY;
 		const next = getSocialFeedSortOrder(target) === 'desc' ? 'asc' : 'desc';
-		saveState(key, next);
+		if (target === 'activity') friendActivitySortOrder = next;
+		else userNotificationSortOrder = next;
 		if (typeof playUiClick === 'function') playUiClick();
 		if (target === 'activity') {
 			window.__friendActivityRenderLimit = SOCIAL_FEED_RENDER_BATCH_SIZE;
