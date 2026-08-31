@@ -710,6 +710,9 @@ let trendingBuildInFlight = null;
 let globalTrophyStatsCache = null;
 let globalTrophyStatsCacheAt = 0;
 let globalTrophyStatsBuildInFlight = null;
+const GAME_FRIEND_OWNERS_CACHE_MS = Math.max(5000, Math.min(120000, parseInt(process.env.GAME_FRIEND_OWNERS_CACHE_MS || '30000', 10) || 30000));
+const GAME_FRIEND_OWNERS_CACHE_MAX = Math.max(20, Math.min(1000, parseInt(process.env.GAME_FRIEND_OWNERS_CACHE_MAX || '300', 10) || 300));
+const gameFriendOwnersCache = new Map();
 let lastMemoryPressureLogAt = 0;
 let profileHydrationQueued = 0;
 let profileHydrationActive = 0;
@@ -3244,6 +3247,131 @@ async function getUserDataPayloadFromDb(targetName, type) {
   return payload;
 }
 
+
+
+function normalizeGameFriendOwnersTitleId(value) {
+  return getLibraryGameTitleIdServer({ titleId: value, id: value });
+}
+
+function getGameFriendOwnersCacheKey(userName, titleId) {
+  return `${normalizeText(userName, '').toLowerCase()}|${normalizeGameFriendOwnersTitleId(titleId)}`;
+}
+
+function clearGameFriendOwnersCache() {
+  gameFriendOwnersCache.clear();
+}
+
+function getCachedGameFriendOwnerNames(userName, titleId) {
+  const key = getGameFriendOwnersCacheKey(userName, titleId);
+  if (!key || key.endsWith('|')) return null;
+  const entry = gameFriendOwnersCache.get(key);
+  if (!entry) return null;
+  if (Date.now() - Number(entry.at || 0) > GAME_FRIEND_OWNERS_CACHE_MS) {
+    gameFriendOwnersCache.delete(key);
+    return null;
+  }
+  gameFriendOwnersCache.delete(key);
+  gameFriendOwnersCache.set(key, entry);
+  return Array.isArray(entry.names) ? entry.names.slice() : [];
+}
+
+function setCachedGameFriendOwnerNames(userName, titleId, names = []) {
+  const key = getGameFriendOwnersCacheKey(userName, titleId);
+  if (!key || key.endsWith('|')) return;
+  gameFriendOwnersCache.delete(key);
+  gameFriendOwnersCache.set(key, {
+    at: Date.now(),
+    names: [...new Set((Array.isArray(names) ? names : []).map(name => normalizeText(name, '')).filter(Boolean))].slice(0, 500)
+  });
+  while (gameFriendOwnersCache.size > GAME_FRIEND_OWNERS_CACHE_MAX) {
+    const oldestKey = gameFriendOwnersCache.keys().next().value;
+    if (oldestKey === undefined) break;
+    gameFriendOwnersCache.delete(oldestKey);
+  }
+}
+
+async function getGameFriendOwnersForUser(userName, rawTitleId) {
+  const viewerName = normalizeText(userName, '');
+  const titleId = normalizeGameFriendOwnersTitleId(rawTitleId);
+  if (!viewerName || !titleId) return [];
+
+  let ownerNames = getCachedGameFriendOwnerNames(viewerName, titleId);
+  if (ownerNames === null) {
+    const result = await queryDbWithRetry(
+      `WITH viewer AS (
+         SELECT CASE
+           WHEN jsonb_typeof(data->'friendsData') = 'array' THEN data->'friendsData'
+           ELSE '[]'::jsonb
+         END AS friends
+         FROM users
+         WHERE name = $1
+       ),
+       friend_names AS (
+         SELECT DISTINCT CASE
+           WHEN jsonb_typeof(friend.value) = 'object' THEN NULLIF(BTRIM(friend.value->>'name'), '')
+           WHEN jsonb_typeof(friend.value) = 'string' THEN NULLIF(BTRIM(friend.value #>> '{}'), '')
+           ELSE NULL
+         END AS name
+         FROM viewer
+         CROSS JOIN LATERAL jsonb_array_elements(viewer.friends) AS friend(value)
+       )
+       SELECT u.name
+       FROM friend_names f
+       JOIN users u ON u.name = f.name
+       WHERE f.name IS NOT NULL
+         AND EXISTS (
+           SELECT 1
+           FROM jsonb_array_elements(
+             CASE
+               WHEN jsonb_typeof(u.data->'libraryData') = 'array' THEN u.data->'libraryData'
+               ELSE '[]'::jsonb
+             END
+           ) AS library_item(value)
+           WHERE UPPER(COALESCE(
+             SUBSTRING(
+               CONCAT_WS(' ',
+                 library_item.value->>'titleId',
+                 library_item.value->>'id',
+                 library_item.value->>'path',
+                 library_item.value->>'title',
+                 library_item.value->>'name'
+               )
+               FROM '([A-Za-z]{4}[0-9]{5})'
+             ),
+             ''
+           )) = $2
+         )
+       ORDER BY u.name ASC`,
+      [viewerName, titleId],
+      { attempts: 2, label: 'GAME FRIEND OWNERS READ' }
+    );
+    ownerNames = (result.rows || []).map(row => normalizeText(row && row.name, '')).filter(Boolean);
+    setCachedGameFriendOwnerNames(viewerName, titleId, ownerNames);
+  }
+
+  return ownerNames.map(name => {
+    const user = userDatabase[name] || {};
+    const publicUser = getPublicUserData(name, user, false);
+    const ps3Status = publicUser.ps3Status && typeof publicUser.ps3Status === 'object' ? publicUser.ps3Status : null;
+    const playingTitleId = ps3Status ? getLibraryGameTitleIdServer({
+      titleId: ps3Status.titleId,
+      id: ps3Status.id,
+      path: ps3Status.path,
+      title: ps3Status.title
+    }) : '';
+    return {
+      name,
+      avatar: publicUser.avatar || DEFAULT_AVATAR,
+      online: publicUser.online === true,
+      lastSeen: publicUser.lastSeen || null,
+      playingNow: publicUser.online === true && !!ps3Status && ps3Status.status === 'playing' && playingTitleId === titleId
+    };
+  }).sort((a, b) => {
+    if (a.playingNow !== b.playingNow) return a.playingNow ? -1 : 1;
+    if (a.online !== b.online) return a.online ? -1 : 1;
+    return a.name.toLowerCase().localeCompare(b.name.toLowerCase());
+  });
+}
 
 async function getAuthUserRecordFromDb(name) {
   const safeName = normalizeText(name, '');
@@ -7165,6 +7293,9 @@ io.on('connection', (socket) => {
         }
 
         updateCompactUserCacheFromPatch(name, workingUser, profileDbPatch);
+        if (Object.prototype.hasOwnProperty.call(profileDbPatch, 'libraryData') || Object.prototype.hasOwnProperty.call(profileDbPatch, 'friendsData')) {
+          clearGameFriendOwnersCache();
+        }
         if (socket.__friendActivitySubscribed && Object.prototype.hasOwnProperty.call(profileDbPatch, 'friendsData')) {
           setFriendActivitySubscription(socket, workingUser.friendsData || []);
         }
@@ -7337,6 +7468,32 @@ io.on('connection', (socket) => {
     } catch (err) {
       console.error('[USER NOTIFICATION MARK READ ERROR]:', err && err.message ? err.message : err);
       respond({ ok: false, lastReadId: 0, unreadCount: 0 });
+    }
+  });
+
+  socket.on('request_game_friend_owners', async (data = {}, ack) => {
+    const respond = payload => {
+      if (typeof ack !== 'function' || !socket.connected) return;
+      try { ack(payload); } catch (err) {}
+    };
+    const name = socket.userName;
+    if (!name || !userDatabase[name]) {
+      respond({ ok: false, titleId: '', count: 0, owners: [], error: 'Profile is not available.' });
+      return;
+    }
+    const titleId = normalizeGameFriendOwnersTitleId(data && data.titleId);
+    if (!titleId) {
+      respond({ ok: false, titleId: '', count: 0, owners: [], error: 'Invalid Title ID.' });
+      return;
+    }
+    try {
+      const owners = await getGameFriendOwnersForUser(name, titleId);
+      const payload = { ok: true, titleId, count: owners.length, owners };
+      trackBandwidthPayload('game_friend_owners', payload, 1);
+      respond(payload);
+    } catch (err) {
+      console.error('[GAME FRIEND OWNERS ERROR]:', err && err.message ? err.message : err);
+      respond({ ok: false, titleId, count: 0, owners: [], error: 'Friend ownership is temporarily unavailable.' });
     }
   });
 
