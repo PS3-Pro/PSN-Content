@@ -710,9 +710,12 @@ let trendingBuildInFlight = null;
 let globalTrophyStatsCache = null;
 let globalTrophyStatsCacheAt = 0;
 let globalTrophyStatsBuildInFlight = null;
-const GAME_FRIEND_OWNERS_CACHE_MS = Math.max(5000, Math.min(120000, parseInt(process.env.GAME_FRIEND_OWNERS_CACHE_MS || '30000', 10) || 30000));
-const GAME_FRIEND_OWNERS_CACHE_MAX = Math.max(20, Math.min(1000, parseInt(process.env.GAME_FRIEND_OWNERS_CACHE_MAX || '300', 10) || 300));
-const gameFriendOwnersCache = new Map();
+const GAME_PLAYERS_SUMMARY_CACHE_MS = Math.max(5000, Math.min(120000, parseInt(process.env.GAME_PLAYERS_SUMMARY_CACHE_MS || '30000', 10) || 30000));
+const GAME_PLAYERS_SUMMARY_CACHE_MAX = Math.max(20, Math.min(1000, parseInt(process.env.GAME_PLAYERS_SUMMARY_CACHE_MAX || '300', 10) || 300));
+const GAME_PLAYERS_PAGE_SIZE = Math.max(10, Math.min(60, parseInt(process.env.GAME_PLAYERS_PAGE_SIZE || '30', 10) || 30));
+const gamePlayersSummaryCache = new Map();
+let gameOwnershipIndexReady = false;
+let gameOwnershipIndexBuildPromise = null;
 let lastMemoryPressureLogAt = 0;
 let profileHydrationQueued = 0;
 let profileHydrationActive = 0;
@@ -1035,6 +1038,15 @@ async function initDb() {
       value BIGINT NOT NULL DEFAULT 0,
       updated_at TIMESTAMPTZ DEFAULT NOW()
     );
+    CREATE TABLE IF NOT EXISTS user_game_ownership (
+      user_name TEXT NOT NULL REFERENCES users(name) ON DELETE CASCADE,
+      title_id TEXT NOT NULL,
+      in_library BOOLEAN NOT NULL DEFAULT FALSE,
+      downloaded BOOLEAN NOT NULL DEFAULT FALSE,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (user_name, title_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_user_game_ownership_title_id ON user_game_ownership(title_id);
     CREATE TABLE IF NOT EXISTS friend_activity (
       id BIGSERIAL PRIMARY KEY,
       actor_name TEXT NOT NULL,
@@ -1125,6 +1137,7 @@ async function initDb() {
     GROUP BY name
   `, [INSTANCE_ID], { attempts: 2, label: 'PRESENCE STARTUP CLEANUP' });
   await refreshAllUsersCacheFromDb({ preserveOnline: false });
+  await ensureGameOwnershipIndexReady();
 
   const startupOfflineRows = (startupRemovedPresence.rows || []).filter(row => row && row.name && userDatabase[row.name] && userDatabase[row.name].online !== true);
   for (const row of startupOfflineRows) {
@@ -3249,128 +3262,382 @@ async function getUserDataPayloadFromDb(targetName, type) {
 
 
 
-function normalizeGameFriendOwnersTitleId(value) {
+function normalizeGamePlayersTitleId(value) {
   return getLibraryGameTitleIdServer({ titleId: value, id: value });
 }
 
-function getGameFriendOwnersCacheKey(userName, titleId) {
-  return `${normalizeText(userName, '').toLowerCase()}|${normalizeGameFriendOwnersTitleId(titleId)}`;
+function clearGamePlayersSummaryCache() {
+  gamePlayersSummaryCache.clear();
 }
 
-function clearGameFriendOwnersCache() {
-  gameFriendOwnersCache.clear();
+function getGamePlayersSummaryCacheKey(userName, titleId) {
+  return `${normalizeText(userName, '').toLowerCase()}|${normalizeGamePlayersTitleId(titleId)}`;
 }
 
-function getCachedGameFriendOwnerNames(userName, titleId) {
-  const key = getGameFriendOwnersCacheKey(userName, titleId);
+function getCachedGamePlayersSummary(userName, titleId) {
+  const key = getGamePlayersSummaryCacheKey(userName, titleId);
   if (!key || key.endsWith('|')) return null;
-  const entry = gameFriendOwnersCache.get(key);
+  const entry = gamePlayersSummaryCache.get(key);
   if (!entry) return null;
-  if (Date.now() - Number(entry.at || 0) > GAME_FRIEND_OWNERS_CACHE_MS) {
-    gameFriendOwnersCache.delete(key);
+  if (Date.now() - Number(entry.at || 0) > GAME_PLAYERS_SUMMARY_CACHE_MS) {
+    gamePlayersSummaryCache.delete(key);
     return null;
   }
-  gameFriendOwnersCache.delete(key);
-  gameFriendOwnersCache.set(key, entry);
-  return Array.isArray(entry.names) ? entry.names.slice() : [];
+  gamePlayersSummaryCache.delete(key);
+  gamePlayersSummaryCache.set(key, entry);
+  return entry.summary && typeof entry.summary === 'object'
+    ? { ...entry.summary, preview: Array.isArray(entry.summary.preview) ? entry.summary.preview.map(item => ({ ...item })) : [] }
+    : null;
 }
 
-function setCachedGameFriendOwnerNames(userName, titleId, names = []) {
-  const key = getGameFriendOwnersCacheKey(userName, titleId);
+function setCachedGamePlayersSummary(userName, titleId, summary = {}) {
+  const key = getGamePlayersSummaryCacheKey(userName, titleId);
   if (!key || key.endsWith('|')) return;
-  gameFriendOwnersCache.delete(key);
-  gameFriendOwnersCache.set(key, {
+  gamePlayersSummaryCache.delete(key);
+  gamePlayersSummaryCache.set(key, {
     at: Date.now(),
-    names: [...new Set((Array.isArray(names) ? names : []).map(name => normalizeText(name, '')).filter(Boolean))].slice(0, 500)
+    summary: {
+      count: Math.max(0, Number(summary.count) || 0),
+      friendCount: Math.max(0, Number(summary.friendCount) || 0),
+      otherCount: Math.max(0, Number(summary.otherCount) || 0),
+      preview: Array.isArray(summary.preview) ? summary.preview.slice(0, 3).map(item => ({ ...item })) : []
+    }
   });
-  while (gameFriendOwnersCache.size > GAME_FRIEND_OWNERS_CACHE_MAX) {
-    const oldestKey = gameFriendOwnersCache.keys().next().value;
+  while (gamePlayersSummaryCache.size > GAME_PLAYERS_SUMMARY_CACHE_MAX) {
+    const oldestKey = gamePlayersSummaryCache.keys().next().value;
     if (oldestKey === undefined) break;
-    gameFriendOwnersCache.delete(oldestKey);
+    gamePlayersSummaryCache.delete(oldestKey);
   }
 }
 
-async function getGameFriendOwnersForUser(userName, rawTitleId) {
-  const viewerName = normalizeText(userName, '');
-  const titleId = normalizeGameFriendOwnersTitleId(rawTitleId);
-  if (!viewerName || !titleId) return [];
-
-  let ownerNames = getCachedGameFriendOwnerNames(viewerName, titleId);
-  if (ownerNames === null) {
-    const result = await queryDbWithRetry(
-      `WITH viewer AS (
-         SELECT CASE
-           WHEN jsonb_typeof(data->'friendsData') = 'array' THEN data->'friendsData'
-           ELSE '[]'::jsonb
-         END AS friends
-         FROM users
-         WHERE name = $1
-       ),
-       friend_names AS (
-         SELECT DISTINCT CASE
-           WHEN jsonb_typeof(friend.value) = 'object' THEN NULLIF(BTRIM(friend.value->>'name'), '')
-           WHEN jsonb_typeof(friend.value) = 'string' THEN NULLIF(BTRIM(friend.value #>> '{}'), '')
-           ELSE NULL
-         END AS name
-         FROM viewer
-         CROSS JOIN LATERAL jsonb_array_elements(viewer.friends) AS friend(value)
-       )
-       SELECT u.name
-       FROM friend_names f
-       JOIN users u ON u.name = f.name
-       WHERE f.name IS NOT NULL
-         AND EXISTS (
-           SELECT 1
-           FROM jsonb_array_elements(
-             CASE
-               WHEN jsonb_typeof(u.data->'libraryData') = 'array' THEN u.data->'libraryData'
-               ELSE '[]'::jsonb
-             END
-           ) AS library_item(value)
-           WHERE UPPER(COALESCE(
-             SUBSTRING(
-               CONCAT_WS(' ',
-                 library_item.value->>'titleId',
-                 library_item.value->>'id',
-                 library_item.value->>'path',
-                 library_item.value->>'title',
-                 library_item.value->>'name'
-               )
-               FROM '([A-Za-z]{4}[0-9]{5})'
-             ),
-             ''
-           )) = $2
-         )
-       ORDER BY u.name ASC`,
-      [viewerName, titleId],
-      { attempts: 2, label: 'GAME FRIEND OWNERS READ' }
-    );
-    ownerNames = (result.rows || []).map(row => normalizeText(row && row.name, '')).filter(Boolean);
-    setCachedGameFriendOwnerNames(viewerName, titleId, ownerNames);
-  }
-
-  return ownerNames.map(name => {
-    const user = userDatabase[name] || {};
-    const publicUser = getPublicUserData(name, user, false);
-    const ps3Status = publicUser.ps3Status && typeof publicUser.ps3Status === 'object' ? publicUser.ps3Status : null;
-    const playingTitleId = ps3Status ? getLibraryGameTitleIdServer({
-      titleId: ps3Status.titleId,
-      id: ps3Status.id,
-      path: ps3Status.path,
-      title: ps3Status.title
-    }) : '';
-    return {
-      name,
-      avatar: publicUser.avatar || DEFAULT_AVATAR,
-      online: publicUser.online === true,
-      lastSeen: publicUser.lastSeen || null,
-      playingNow: publicUser.online === true && !!ps3Status && ps3Status.status === 'playing' && playingTitleId === titleId
-    };
-  }).sort((a, b) => {
-    if (a.playingNow !== b.playingNow) return a.playingNow ? -1 : 1;
-    if (a.online !== b.online) return a.online ? -1 : 1;
-    return a.name.toLowerCase().localeCompare(b.name.toLowerCase());
+function getLibraryOwnershipTitleIds(libraryData = []) {
+  const ids = new Set();
+  (Array.isArray(libraryData) ? libraryData : []).forEach(item => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return;
+    const titleId = getLibraryGameTitleIdServer(item);
+    if (titleId) ids.add(titleId);
   });
+  return Array.from(ids);
+}
+
+function getDownloadOwnershipTitleIds(downloadsData = []) {
+  const ids = new Set();
+  const normalizedDownloads = normalizeDownloadHistoryRecordsServer(Array.isArray(downloadsData) ? downloadsData : []).history;
+  normalizedDownloads.forEach(item => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return;
+    const category = normalizeDownloadHistoryCategoryServer(item.category || item.rawCategory || 'games');
+    if (category !== 'games') return;
+    const titleId = normalizeGamePlayersTitleId(item.titleId || item.id);
+    if (titleId) ids.add(titleId);
+  });
+  return Array.from(ids);
+}
+
+async function rebuildGameOwnershipIndexFromProfiles() {
+  await runDbTransactionWithRetry('GAME OWNERSHIP INDEX REBUILD', async client => {
+    await client.query('TRUNCATE TABLE user_game_ownership');
+    await client.query(`
+      WITH ownership_rows AS (
+        SELECT
+          u.name AS user_name,
+          UPPER(COALESCE(
+            SUBSTRING(
+              CONCAT_WS(' ',
+                library_item.value->>'titleId',
+                library_item.value->>'id',
+                library_item.value->>'path',
+                library_item.value->>'title',
+                library_item.value->>'name'
+              )
+              FROM '([A-Za-z]{4}[0-9]{5})'
+            ),
+            ''
+          )) AS title_id,
+          TRUE AS in_library,
+          FALSE AS downloaded
+        FROM users u
+        CROSS JOIN LATERAL jsonb_array_elements(
+          CASE
+            WHEN jsonb_typeof(u.data->'libraryData') = 'array' THEN u.data->'libraryData'
+            ELSE '[]'::jsonb
+          END
+        ) AS library_item(value)
+
+        UNION ALL
+
+        SELECT
+          u.name AS user_name,
+          UPPER(COALESCE(
+            SUBSTRING(
+              CONCAT_WS(' ', download_item.value->>'titleId', download_item.value->>'id')
+              FROM '([A-Za-z]{4}[0-9]{5})'
+            ),
+            ''
+          )) AS title_id,
+          FALSE AS in_library,
+          TRUE AS downloaded
+        FROM users u
+        CROSS JOIN LATERAL jsonb_array_elements(
+          CASE
+            WHEN jsonb_typeof(u.data->'downloadsData') = 'array' THEN u.data->'downloadsData'
+            ELSE '[]'::jsonb
+          END
+        ) AS download_item(value)
+        WHERE regexp_replace(
+          lower(trim(COALESCE(NULLIF(download_item.value->>'category', ''), NULLIF(download_item.value->>'rawCategory', ''), 'games'))),
+          '[[:space:]-]+',
+          '_',
+          'g'
+        ) IN ('game', 'games')
+      )
+      INSERT INTO user_game_ownership (user_name, title_id, in_library, downloaded, updated_at)
+      SELECT
+        user_name,
+        title_id,
+        BOOL_OR(in_library),
+        BOOL_OR(downloaded),
+        NOW()
+      FROM ownership_rows
+      WHERE title_id <> ''
+      GROUP BY user_name, title_id
+    `);
+  }, { attempts: 3, lockTimeoutMs: 2000, advisoryLockKey: 'user_game_ownership_rebuild' });
+
+  clearGamePlayersSummaryCache();
+  const countResult = await queryDbWithRetry(
+    'SELECT COUNT(*)::int AS count FROM user_game_ownership',
+    [],
+    { attempts: 2, label: 'GAME OWNERSHIP INDEX COUNT' }
+  );
+  const count = Number(countResult.rows[0] && countResult.rows[0].count || 0);
+  console.log(`[GAME OWNERSHIP] Index rebuilt with ${count} user/game association(s).`);
+  return count;
+}
+
+async function ensureGameOwnershipIndexReady() {
+  if (gameOwnershipIndexReady) return true;
+  if (gameOwnershipIndexBuildPromise) return gameOwnershipIndexBuildPromise;
+
+  gameOwnershipIndexBuildPromise = (async () => {
+    const countResult = await queryDbWithRetry(
+      'SELECT COUNT(*)::int AS count FROM user_game_ownership',
+      [],
+      { attempts: 2, label: 'GAME OWNERSHIP INDEX READY CHECK' }
+    );
+    const count = Number(countResult.rows[0] && countResult.rows[0].count || 0);
+    if (count <= 0 && Object.keys(userDatabase || {}).length > 0) {
+      await rebuildGameOwnershipIndexFromProfiles();
+    }
+    gameOwnershipIndexReady = true;
+    return true;
+  })().finally(() => {
+    gameOwnershipIndexBuildPromise = null;
+  });
+
+  return gameOwnershipIndexBuildPromise;
+}
+
+async function syncUserGameOwnershipIndex(userName, changes = {}) {
+  const safeName = normalizeText(userName, '');
+  if (!safeName || !changes || typeof changes !== 'object') return;
+
+  const hasLibrary = Object.prototype.hasOwnProperty.call(changes, 'libraryData');
+  const hasDownloads = Object.prototype.hasOwnProperty.call(changes, 'downloadsData');
+  if (!hasLibrary && !hasDownloads) return;
+
+  const libraryIds = hasLibrary ? getLibraryOwnershipTitleIds(changes.libraryData) : [];
+  const downloadIds = hasDownloads ? getDownloadOwnershipTitleIds(changes.downloadsData) : [];
+
+  await runDbTransactionWithRetry('GAME OWNERSHIP INDEX SYNC', async client => {
+    if (hasLibrary) {
+      await client.query(
+        'UPDATE user_game_ownership SET in_library = FALSE, updated_at = NOW() WHERE user_name = $1 AND in_library = TRUE',
+        [safeName]
+      );
+      if (libraryIds.length) {
+        await client.query(
+          `INSERT INTO user_game_ownership (user_name, title_id, in_library, downloaded, updated_at)
+           SELECT $1, ids.title_id, TRUE, FALSE, NOW()
+           FROM jsonb_array_elements_text($2::jsonb) AS ids(title_id)
+           WHERE ids.title_id ~ '^[A-Z]{4}[0-9]{5}$'
+           ON CONFLICT (user_name, title_id)
+           DO UPDATE SET in_library = TRUE, updated_at = NOW()`,
+          [safeName, JSON.stringify(libraryIds)]
+        );
+      }
+    }
+
+    if (hasDownloads) {
+      await client.query(
+        'UPDATE user_game_ownership SET downloaded = FALSE, updated_at = NOW() WHERE user_name = $1 AND downloaded = TRUE',
+        [safeName]
+      );
+      if (downloadIds.length) {
+        await client.query(
+          `INSERT INTO user_game_ownership (user_name, title_id, in_library, downloaded, updated_at)
+           SELECT $1, ids.title_id, FALSE, TRUE, NOW()
+           FROM jsonb_array_elements_text($2::jsonb) AS ids(title_id)
+           WHERE ids.title_id ~ '^[A-Z]{4}[0-9]{5}$'
+           ON CONFLICT (user_name, title_id)
+           DO UPDATE SET downloaded = TRUE, updated_at = NOW()`,
+          [safeName, JSON.stringify(downloadIds)]
+        );
+      }
+    }
+
+    await client.query(
+      'DELETE FROM user_game_ownership WHERE user_name = $1 AND in_library = FALSE AND downloaded = FALSE',
+      [safeName]
+    );
+  }, { attempts: 3, lockTimeoutMs: 1200, advisoryLockKey: `user_game_ownership:${safeName}` });
+
+  clearGamePlayersSummaryCache();
+}
+
+function hydrateGamePlayerEntry(row, titleId) {
+  const name = normalizeText(row && (row.user_name || row.name), '');
+  const user = userDatabase[name] || {};
+  const publicUser = getPublicUserData(name, user, false);
+  const ps3Status = publicUser.ps3Status && typeof publicUser.ps3Status === 'object' ? publicUser.ps3Status : null;
+  const playingTitleId = ps3Status ? getLibraryGameTitleIdServer({
+    titleId: ps3Status.titleId,
+    id: ps3Status.id,
+    path: ps3Status.path,
+    title: ps3Status.title
+  }) : '';
+
+  return {
+    name,
+    avatar: publicUser.avatar || DEFAULT_AVATAR,
+    online: publicUser.online === true,
+    lastSeen: publicUser.lastSeen || null,
+    isFriend: row && row.is_friend === true,
+    inLibrary: row && row.in_library === true,
+    downloaded: row && row.downloaded === true,
+    playingNow: publicUser.online === true && !!ps3Status && ps3Status.status === 'playing' && playingTitleId === titleId
+  };
+}
+
+async function getGamePlayersSummaryForUser(userName, rawTitleId) {
+  const viewerName = normalizeText(userName, '');
+  const titleId = normalizeGamePlayersTitleId(rawTitleId);
+  if (!viewerName || !titleId) return { count: 0, friendCount: 0, otherCount: 0, preview: [] };
+
+  const cached = getCachedGamePlayersSummary(viewerName, titleId);
+  if (cached) return cached;
+  await ensureGameOwnershipIndexReady();
+
+  const result = await queryDbWithRetry(
+    `WITH viewer_friends AS (
+       SELECT DISTINCT CASE
+         WHEN jsonb_typeof(friend.value) = 'object' THEN NULLIF(BTRIM(friend.value->>'name'), '')
+         WHEN jsonb_typeof(friend.value) = 'string' THEN NULLIF(BTRIM(friend.value #>> '{}'), '')
+         ELSE NULL
+       END AS name
+       FROM users viewer
+       CROSS JOIN LATERAL jsonb_array_elements(
+         CASE
+           WHEN jsonb_typeof(viewer.data->'friendsData') = 'array' THEN viewer.data->'friendsData'
+           ELSE '[]'::jsonb
+         END
+       ) AS friend(value)
+       WHERE viewer.name = $1
+     ),
+     owners AS (
+       SELECT
+         ownership.user_name,
+         ownership.in_library,
+         ownership.downloaded,
+         (friend.name IS NOT NULL) AS is_friend
+       FROM user_game_ownership ownership
+       LEFT JOIN viewer_friends friend ON friend.name = ownership.user_name
+       WHERE ownership.title_id = $2
+         AND ownership.user_name <> $1
+     )
+     SELECT
+       user_name,
+       in_library,
+       downloaded,
+       is_friend,
+       COUNT(*) OVER()::int AS total_count,
+       COUNT(*) FILTER (WHERE is_friend) OVER()::int AS friend_count
+     FROM owners
+     ORDER BY is_friend DESC, user_name ASC
+     LIMIT 3`,
+    [viewerName, titleId],
+    { attempts: 2, label: 'GAME PLAYERS SUMMARY READ' }
+  );
+
+  const rows = result.rows || [];
+  const count = rows.length ? Math.max(0, Number(rows[0].total_count) || 0) : 0;
+  const friendCount = rows.length ? Math.max(0, Number(rows[0].friend_count) || 0) : 0;
+  const summary = {
+    count,
+    friendCount,
+    otherCount: Math.max(0, count - friendCount),
+    preview: rows.map(row => hydrateGamePlayerEntry(row, titleId)).filter(item => item.name)
+  };
+  setCachedGamePlayersSummary(viewerName, titleId, summary);
+  return summary;
+}
+
+async function getGamePlayersPageForUser(userName, rawTitleId, rawGroup, rawOffset, rawLimit) {
+  const viewerName = normalizeText(userName, '');
+  const titleId = normalizeGamePlayersTitleId(rawTitleId);
+  const group = rawGroup === 'friends' ? 'friends' : 'others';
+  const offset = Math.max(0, Math.min(100000, parseInt(rawOffset, 10) || 0));
+  const limit = Math.max(10, Math.min(GAME_PLAYERS_PAGE_SIZE, parseInt(rawLimit, 10) || GAME_PLAYERS_PAGE_SIZE));
+  if (!viewerName || !titleId) return { group, total: 0, offset, limit, hasMore: false, owners: [] };
+
+  await ensureGameOwnershipIndexReady();
+  const result = await queryDbWithRetry(
+    `WITH viewer_friends AS (
+       SELECT DISTINCT CASE
+         WHEN jsonb_typeof(friend.value) = 'object' THEN NULLIF(BTRIM(friend.value->>'name'), '')
+         WHEN jsonb_typeof(friend.value) = 'string' THEN NULLIF(BTRIM(friend.value #>> '{}'), '')
+         ELSE NULL
+       END AS name
+       FROM users viewer
+       CROSS JOIN LATERAL jsonb_array_elements(
+         CASE
+           WHEN jsonb_typeof(viewer.data->'friendsData') = 'array' THEN viewer.data->'friendsData'
+           ELSE '[]'::jsonb
+         END
+       ) AS friend(value)
+       WHERE viewer.name = $1
+     )
+     SELECT
+       ownership.user_name,
+       ownership.in_library,
+       ownership.downloaded,
+       (friend.name IS NOT NULL) AS is_friend,
+       COUNT(*) OVER()::int AS group_count
+     FROM user_game_ownership ownership
+     LEFT JOIN viewer_friends friend ON friend.name = ownership.user_name
+     WHERE ownership.title_id = $2
+       AND ownership.user_name <> $1
+       AND (
+         ($3 = 'friends' AND friend.name IS NOT NULL)
+         OR
+         ($3 = 'others' AND friend.name IS NULL)
+       )
+     ORDER BY ownership.user_name ASC
+     LIMIT $4 OFFSET $5`,
+    [viewerName, titleId, group, limit, offset],
+    { attempts: 2, label: 'GAME PLAYERS PAGE READ' }
+  );
+
+  const rows = result.rows || [];
+  const total = rows.length ? Math.max(0, Number(rows[0].group_count) || 0) : 0;
+  const owners = rows.map(row => hydrateGamePlayerEntry(row, titleId)).filter(item => item.name);
+  return {
+    group,
+    total,
+    offset,
+    limit,
+    hasMore: offset + owners.length < total,
+    owners
+  };
 }
 
 async function getAuthUserRecordFromDb(name) {
@@ -4907,6 +5174,9 @@ async function initProfileSyncNotifications() {
       if (data.changes && data.changes.counts === true) emitProfileCountsUpdate(name, refreshedUser);
       const changedKeys = data.changes && Array.isArray(data.changes.keys) ? data.changes.keys : [];
       const legacyBroadProfileChange = changedKeys.length === 0;
+      if (legacyBroadProfileChange || changedKeys.some(key => key === 'libraryData' || key === 'downloadsData' || key === 'friendsData')) {
+        clearGamePlayersSummaryCache();
+      }
       const syncChangedKeys = legacyBroadProfileChange ? null : changedKeys;
       if (hasLocalSession) {
         const localSockets = getSocketsByUserName(name).filter(client => !(data.sourceSocketId && client.id === data.sourceSocketId));
@@ -6565,6 +6835,7 @@ async function deleteUserAccount(targetName, reason, adminName) {
   delete userDatabase[targetName];
   delete userCacheMeta[targetName];
   fullUserCacheNames.delete(targetName);
+  clearGamePlayersSummaryCache();
   disconnectUserSessions(targetName, 'account_deleted', { reason: deleteReason, by: adminName || 'Admin' });
   await emitOnlineList();
 
@@ -7293,8 +7564,15 @@ io.on('connection', (socket) => {
         }
 
         updateCompactUserCacheFromPatch(name, workingUser, profileDbPatch);
-        if (Object.prototype.hasOwnProperty.call(profileDbPatch, 'libraryData') || Object.prototype.hasOwnProperty.call(profileDbPatch, 'friendsData')) {
-          clearGameFriendOwnersCache();
+        const gameOwnershipChanged = Object.prototype.hasOwnProperty.call(profileDbPatch, 'libraryData') || Object.prototype.hasOwnProperty.call(profileDbPatch, 'downloadsData');
+        if (gameOwnershipChanged || Object.prototype.hasOwnProperty.call(profileDbPatch, 'friendsData')) {
+          clearGamePlayersSummaryCache();
+        }
+        if (gameOwnershipChanged) {
+          const ownershipChanges = {};
+          if (Object.prototype.hasOwnProperty.call(profileDbPatch, 'libraryData')) ownershipChanges.libraryData = profileDbPatch.libraryData;
+          if (Object.prototype.hasOwnProperty.call(profileDbPatch, 'downloadsData')) ownershipChanges.downloadsData = profileDbPatch.downloadsData;
+          deferServerTask('GAME OWNERSHIP INDEX SYNC', () => syncUserGameOwnershipIndex(name, ownershipChanges), 0);
         }
         if (socket.__friendActivitySubscribed && Object.prototype.hasOwnProperty.call(profileDbPatch, 'friendsData')) {
           setFriendActivitySubscription(socket, workingUser.friendsData || []);
@@ -7471,29 +7749,40 @@ io.on('connection', (socket) => {
     }
   });
 
-  socket.on('request_game_friend_owners', async (data = {}, ack) => {
+  socket.on('request_game_owners', async (data = {}, ack) => {
     const respond = payload => {
       if (typeof ack !== 'function' || !socket.connected) return;
       try { ack(payload); } catch (err) {}
     };
     const name = socket.userName;
     if (!name || !userDatabase[name]) {
-      respond({ ok: false, titleId: '', count: 0, owners: [], error: 'Profile is not available.' });
+      respond({ ok: false, titleId: '', error: 'Profile is not available.' });
       return;
     }
-    const titleId = normalizeGameFriendOwnersTitleId(data && data.titleId);
+
+    const titleId = normalizeGamePlayersTitleId(data && data.titleId);
     if (!titleId) {
-      respond({ ok: false, titleId: '', count: 0, owners: [], error: 'Invalid Title ID.' });
+      respond({ ok: false, titleId: '', error: 'Invalid Title ID.' });
       return;
     }
+
+    const mode = data && data.mode === 'list' ? 'list' : 'summary';
     try {
-      const owners = await getGameFriendOwnersForUser(name, titleId);
-      const payload = { ok: true, titleId, count: owners.length, owners };
-      trackBandwidthPayload('game_friend_owners', payload, 1);
+      if (mode === 'list') {
+        const page = await getGamePlayersPageForUser(name, titleId, data && data.group, data && data.offset, data && data.limit);
+        const payload = { ok: true, titleId, mode, ...page };
+        trackBandwidthPayload('game_players_page', payload, 1);
+        respond(payload);
+        return;
+      }
+
+      const summary = await getGamePlayersSummaryForUser(name, titleId);
+      const payload = { ok: true, titleId, mode, ...summary };
+      trackBandwidthPayload('game_players_summary', payload, 1);
       respond(payload);
     } catch (err) {
-      console.error('[GAME FRIEND OWNERS ERROR]:', err && err.message ? err.message : err);
-      respond({ ok: false, titleId, count: 0, owners: [], error: 'Friend ownership is temporarily unavailable.' });
+      console.error('[GAME PLAYERS ERROR]:', err && err.message ? err.message : err);
+      respond({ ok: false, titleId, mode, error: 'Game player list is temporarily unavailable.' });
     }
   });
 
