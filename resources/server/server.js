@@ -1047,6 +1047,15 @@ async function initDb() {
       PRIMARY KEY (user_name, title_id)
     );
     CREATE INDEX IF NOT EXISTS idx_user_game_ownership_title_id ON user_game_ownership(title_id);
+    CREATE TABLE IF NOT EXISTS user_shared_game_match_seen (
+      user_name TEXT NOT NULL REFERENCES users(name) ON DELETE CASCADE,
+      actor_name TEXT NOT NULL REFERENCES users(name) ON DELETE CASCADE,
+      title_id TEXT NOT NULL,
+      first_source TEXT NOT NULL DEFAULT 'library',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (user_name, actor_name, title_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_user_shared_game_match_seen_actor ON user_shared_game_match_seen(actor_name, created_at DESC);
     CREATE TABLE IF NOT EXISTS friend_activity (
       id BIGSERIAL PRIMARY KEY,
       actor_name TEXT NOT NULL,
@@ -3333,6 +3342,260 @@ function getDownloadOwnershipTitleIds(downloadsData = []) {
   return Array.from(ids);
 }
 
+function getLibraryOwnershipEntryMap(libraryData = []) {
+  const entries = new Map();
+  (Array.isArray(libraryData) ? libraryData : []).forEach(item => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return;
+    const titleId = getLibraryGameTitleIdServer(item);
+    if (!titleId) return;
+    const title = normalizeText(item.title || item.name || item.cleanName || titleId, titleId).slice(0, 180) || titleId;
+    entries.set(titleId, { titleId, title, source: 'library' });
+  });
+  return entries;
+}
+
+function getDownloadOwnershipEntryMap(downloadsData = []) {
+  const entries = new Map();
+  const normalizedDownloads = normalizeDownloadHistoryRecordsServer(Array.isArray(downloadsData) ? downloadsData : []).history;
+  normalizedDownloads.forEach(item => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return;
+    const category = normalizeDownloadHistoryCategoryServer(item.category || item.rawCategory || 'games');
+    if (category !== 'games') return;
+    const titleId = normalizeGamePlayersTitleId(item.titleId || item.id);
+    if (!titleId) return;
+    const title = normalizeText(item.cleanName || item.title || item.name || titleId, titleId).slice(0, 180) || titleId;
+    entries.set(titleId, { titleId, title, source: 'download' });
+  });
+  return entries;
+}
+
+function collectNewSharedGameAcquisitions(previousLibraryData, nextLibraryData, previousDownloadsData, nextDownloadsData, options = {}) {
+  const hasLibrary = options.hasLibrary === true;
+  const hasDownloads = options.hasDownloads === true;
+  const previousLibrary = getLibraryOwnershipEntryMap(previousLibraryData);
+  const previousDownloads = getDownloadOwnershipEntryMap(previousDownloadsData);
+  const previousOwned = new Set([...previousLibrary.keys(), ...previousDownloads.keys()]);
+  const candidates = new Map();
+
+  const addCandidate = entry => {
+    if (!entry || !entry.titleId || previousOwned.has(entry.titleId)) return;
+    const current = candidates.get(entry.titleId);
+    if (!current) { candidates.set(entry.titleId, { ...entry }); return; }
+    current.title = current.title && current.title !== current.titleId ? current.title : entry.title;
+    if (current.source !== entry.source) current.source = 'mixed';
+  };
+
+  if (hasLibrary) getLibraryOwnershipEntryMap(nextLibraryData).forEach(addCandidate);
+  if (hasDownloads) getDownloadOwnershipEntryMap(nextDownloadsData).forEach(addCandidate);
+  return Array.from(candidates.values());
+}
+
+async function filterPreviouslyOwnedGameAcquisitions(userName, acquisitions = []) {
+  const name = normalizeText(userName, '');
+  const games = (Array.isArray(acquisitions) ? acquisitions : []).filter(item => normalizeGamePlayersTitleId(item && item.titleId));
+  if (!name || !games.length) return [];
+  await ensureGameOwnershipIndexReady();
+  const ids = [...new Set(games.map(item => normalizeGamePlayersTitleId(item.titleId)).filter(Boolean))];
+  const result = await queryDbWithRetry(
+    `SELECT title_id FROM user_game_ownership
+     WHERE user_name = $1
+       AND title_id = ANY($2::text[])
+       AND (in_library = TRUE OR downloaded = TRUE)`,
+    [name, ids],
+    { attempts: 2, label: 'GAME PREVIOUS OWNERSHIP FILTER' }
+  );
+  const existing = new Set((result.rows || []).map(row => normalizeGamePlayersTitleId(row.title_id)).filter(Boolean));
+  return games.filter(item => !existing.has(normalizeGamePlayersTitleId(item.titleId)));
+}
+
+async function isExistingGameOwner(userName, rawTitleId) {
+  const name = normalizeText(userName, '');
+  const titleId = normalizeGamePlayersTitleId(rawTitleId);
+  if (!name || !titleId) return false;
+  await ensureGameOwnershipIndexReady();
+  const result = await queryDbWithRetry(
+    `SELECT 1 FROM user_game_ownership
+     WHERE user_name = $1 AND title_id = $2 AND (in_library = TRUE OR downloaded = TRUE)
+     LIMIT 1`,
+    [name, titleId],
+    { attempts: 2, label: 'GAME OWNER EXISTS' }
+  );
+  return !!result.rows[0];
+}
+
+function getSharedGameRecipientMatchType(row = {}) {
+  if (row.in_library === true && row.downloaded === true) return 'owned';
+  if (row.in_library === true) return 'library';
+  if (row.downloaded === true) return 'download';
+  return row.wishlisted === true ? 'wishlist' : '';
+}
+
+async function findFriendSharedGameMatches(actorName, acquisitions = []) {
+  const actor = normalizeText(actorName, '');
+  const games = (Array.isArray(acquisitions) ? acquisitions : []).map(item => ({
+    titleId: normalizeGamePlayersTitleId(item && item.titleId),
+    title: normalizeText(item && item.title, '').slice(0, 180),
+    source: ['library', 'download', 'mixed'].includes(normalizeText(item && item.source, '').toLowerCase()) ? normalizeText(item.source, '').toLowerCase() : 'library'
+  })).filter(item => item.titleId);
+  if (!actor || !games.length) return [];
+  await ensureGameOwnershipIndexReady();
+
+  const result = await queryDbWithRetry(
+    `WITH acquired AS (
+       SELECT
+         UPPER(BTRIM(value->>'titleId')) AS title_id,
+         COALESCE(NULLIF(BTRIM(value->>'title'), ''), UPPER(BTRIM(value->>'titleId'))) AS title,
+         COALESCE(NULLIF(BTRIM(value->>'source'), ''), 'library') AS source
+       FROM jsonb_array_elements($2::jsonb) value
+       WHERE UPPER(BTRIM(value->>'titleId')) ~ '^[A-Z]{4}[0-9]{5}$'
+     ),
+     actor_friends AS (
+       SELECT DISTINCT CASE
+         WHEN jsonb_typeof(friend.value) = 'object' THEN NULLIF(BTRIM(friend.value->>'name'), '')
+         WHEN jsonb_typeof(friend.value) = 'string' THEN NULLIF(BTRIM(friend.value #>> '{}'), '')
+         ELSE NULL
+       END AS name
+       FROM users actor
+       CROSS JOIN LATERAL jsonb_array_elements(
+         CASE WHEN jsonb_typeof(actor.data->'friendsData') = 'array' THEN actor.data->'friendsData' ELSE '[]'::jsonb END
+       ) friend(value)
+       WHERE actor.name = $1
+     )
+     SELECT
+       friend.name AS user_name,
+       acquired.title_id,
+       acquired.title,
+       acquired.source,
+       COALESCE(ownership.in_library, FALSE) AS in_library,
+       COALESCE(ownership.downloaded, FALSE) AS downloaded,
+       COALESCE(wishlist.wishlisted, FALSE) AS wishlisted
+     FROM actor_friends friend
+     JOIN users recipient ON recipient.name = friend.name
+     CROSS JOIN acquired
+     LEFT JOIN user_game_ownership ownership
+       ON ownership.user_name = friend.name AND ownership.title_id = acquired.title_id
+     LEFT JOIN LATERAL (
+       SELECT TRUE AS wishlisted
+       FROM jsonb_array_elements(
+         CASE WHEN jsonb_typeof(recipient.data->'wishlistData') = 'array' THEN recipient.data->'wishlistData' ELSE '[]'::jsonb END
+       ) wish(value)
+       WHERE UPPER(COALESCE(
+         SUBSTRING(CONCAT_WS(' ', wish.value->>'titleId', wish.value->>'id', wish.value->>'contentId', wish.value->>'path') FROM '([A-Za-z]{4}[0-9]{5})'),
+         ''
+       )) = acquired.title_id
+         AND regexp_replace(
+           lower(trim(COALESCE(NULLIF(wish.value->>'category', ''), NULLIF(wish.value->>'rawCategory', ''), 'games'))),
+           '[[:space:]-]+',
+           '_',
+           'g'
+         ) IN ('game', 'games')
+       LIMIT 1
+     ) wishlist ON TRUE
+     WHERE friend.name IS NOT NULL
+       AND friend.name <> $1
+       AND (COALESCE(ownership.in_library, FALSE) OR COALESCE(ownership.downloaded, FALSE) OR COALESCE(wishlist.wishlisted, FALSE))`,
+    [actor, JSON.stringify(games)],
+    { attempts: 2, label: 'SHARED GAME FRIEND MATCH READ' }
+  );
+  return (result.rows || []).map(row => ({
+    userName: normalizeUserNotificationName(row.user_name),
+    titleId: normalizeGamePlayersTitleId(row.title_id),
+    title: normalizeText(row.title, row.title_id).slice(0, 180),
+    source: ['library', 'download', 'mixed'].includes(normalizeText(row.source, '').toLowerCase()) ? normalizeText(row.source, '').toLowerCase() : 'library',
+    inLibrary: row.in_library === true,
+    downloaded: row.downloaded === true,
+    wishlisted: row.wishlisted === true
+  })).filter(row => row.userName && row.titleId);
+}
+
+async function claimNewSharedGameMatches(actorName, matches = []) {
+  const actor = normalizeText(actorName, '');
+  const payload = (Array.isArray(matches) ? matches : []).map(row => ({
+    userName: normalizeUserNotificationName(row && row.userName),
+    actorName: actor,
+    titleId: normalizeGamePlayersTitleId(row && row.titleId),
+    source: ['library', 'download', 'mixed'].includes(normalizeText(row && row.source, '').toLowerCase()) ? normalizeText(row.source, '').toLowerCase() : 'library'
+  })).filter(row => row.userName && row.actorName && row.titleId);
+  if (!payload.length) return new Set();
+
+  const result = await queryDbWithRetry(
+    `INSERT INTO user_shared_game_match_seen (user_name, actor_name, title_id, first_source, created_at)
+     SELECT entry.user_name, entry.actor_name, entry.title_id, entry.source, NOW()
+     FROM jsonb_to_recordset($1::jsonb) AS entry(user_name text, actor_name text, title_id text, source text)
+     ON CONFLICT (user_name, actor_name, title_id) DO NOTHING
+     RETURNING user_name, title_id`,
+    [JSON.stringify(payload.map(row => ({ user_name: row.userName, actor_name: row.actorName, title_id: row.titleId, source: row.source })))],
+    { attempts: 3, label: 'SHARED GAME MATCH CLAIM' }
+  );
+  return new Set((result.rows || []).map(row => `${String(row.user_name || '').toLowerCase()}|${String(row.title_id || '').toUpperCase()}`));
+}
+
+async function notifyFriendsAboutSharedGameAcquisitions(actorName, acquisitions = [], options = {}) {
+  const actor = normalizeText(actorName, '');
+  const games = (Array.isArray(acquisitions) ? acquisitions : []).filter(item => normalizeGamePlayersTitleId(item && item.titleId));
+  if (!actor || !games.length) return 0;
+
+  const matches = await findFriendSharedGameMatches(actor, games);
+  if (!matches.length) return 0;
+  const claimed = await claimNewSharedGameMatches(actor, matches);
+  if (!claimed.size) return 0;
+
+  const byUser = new Map();
+  matches.forEach(row => {
+    const claimKey = `${row.userName.toLowerCase()}|${row.titleId}`;
+    if (!claimed.has(claimKey)) return;
+    const list = byUser.get(row.userName) || [];
+    list.push({
+      titleId: row.titleId,
+      title: row.title || row.titleId,
+      source: row.source,
+      matchType: getSharedGameRecipientMatchType({ in_library: row.inLibrary, downloaded: row.downloaded, wishlisted: row.wishlisted })
+    });
+    byUser.set(row.userName, list);
+  });
+
+  const at = normalizeTimestampValue(options.at) || Date.now();
+  let published = 0;
+  for (const [userName, userGames] of byUser.entries()) {
+    if (!userGames.length) continue;
+    const sources = new Set(userGames.map(game => game.source));
+    const overallSource = sources.size === 1 ? userGames[0].source : 'mixed';
+    const first = userGames[0];
+    const eventData = {
+      actor,
+      titleId: first.titleId,
+      title: first.title,
+      source: overallSource,
+      matchType: first.matchType,
+      count: userGames.length,
+      games: userGames.slice(0, 20)
+    };
+    const signature = `${userGames.slice(0, 20).map(game => game.titleId).sort().join(',')}:${userGames.length}`;
+    const event = await recordUserNotification(userName, 'game_match', eventData, {
+      at,
+      dedupeKey: `${userName.toLowerCase()}:notification:game-match:${actor.toLowerCase()}:${signature}`
+    });
+    if (event) published += 1;
+  }
+  return published;
+}
+
+async function recordLibraryAcquisitionActivity(actorName, acquisitions = [], at = Date.now()) {
+  const actor = normalizeFriendActivityName(actorName);
+  const games = (Array.isArray(acquisitions) ? acquisitions : []).filter(item => item && item.source !== 'download' && normalizeGamePlayersTitleId(item.titleId));
+  if (!actor || !games.length) return null;
+  const first = games[0];
+  return recordFriendActivity(actor, 'library', {
+    titleId: first.titleId,
+    title: first.title || first.titleId,
+    count: games.length,
+    games: games.slice(0, 8).map(game => ({ titleId: game.titleId, title: game.title || game.titleId }))
+  }, {
+    at,
+    dedupeKey: `${actor.toLowerCase()}:library-acquisition:${games.slice(0, 20).map(game => game.titleId).sort().join(',')}:${games.length}`
+  });
+}
+
 async function rebuildGameOwnershipIndexFromProfiles() {
   await runDbTransactionWithRetry('GAME OWNERSHIP INDEX REBUILD', async client => {
     await client.query('TRUNCATE TABLE user_game_ownership');
@@ -5237,7 +5500,7 @@ async function initProfileSyncNotifications() {
   }
 }
 
-const FRIEND_ACTIVITY_TYPES = new Set(['online', 'offline', 'playing', 'played', 'xmb', 'trophy', 'download', 'wishlist', 'favorite', 'cheat']);
+const FRIEND_ACTIVITY_TYPES = new Set(['online', 'offline', 'playing', 'played', 'xmb', 'trophy', 'download', 'library', 'wishlist', 'favorite', 'cheat']);
 const FRIEND_ACTIVITY_REPLACED_IDS_LIMIT = 60;
 const FRIEND_ACTIVITY_ROOM_PREFIX = 'friend-activity:';
 
@@ -5263,6 +5526,18 @@ function normalizeFriendActivityData(type, rawData = {}) {
       appVersion: normalizeText(source.appVersion, '').slice(0, 24),
       durationSeconds: type === 'played' ? Math.max(0, Math.min(60 * 60 * 24 * 7, Math.floor(Number(source.durationSeconds) || 0))) : 0,
       replacesId: type === 'played' ? normalizeText(source.replacesId, '').replace(/[^0-9]/g, '').slice(0, 32) : ''
+    };
+  }
+  if (type === 'library') {
+    const games = Array.isArray(source.games) ? source.games.slice(0, 8).map(item => ({
+      titleId: normalizeText(item && item.titleId, '').toUpperCase().slice(0, 32),
+      title: normalizeText(item && item.title, '').slice(0, 140)
+    })).filter(item => item.titleId || item.title) : [];
+    return {
+      titleId: normalizeText(source.titleId, '').toUpperCase().slice(0, 32),
+      title: normalizeText(source.title, '').slice(0, 140),
+      count: Math.max(1, Math.min(9999, Math.floor(Number(source.count) || games.length || 1))),
+      games
     };
   }
   if (type === 'download' || type === 'wishlist' || type === 'favorite') {
@@ -5309,6 +5584,9 @@ function normalizeFriendActivityData(type, rawData = {}) {
 function getFriendActivitySemanticKey(type, data = {}) {
   const eventType = normalizeText(type, '').toLowerCase();
   const source = data && typeof data === 'object' && !Array.isArray(data) ? data : {};
+  if (eventType === 'library') {
+    return [eventType, source.titleId || source.title || '', source.count || 1].map(value => String(value || '').toLowerCase()).join(':');
+  }
   if (eventType === 'download' || eventType === 'wishlist' || eventType === 'favorite') {
     return [eventType, source.action || 'add', source.contentId || source.titleId || source.title || ''].map(value => String(value || '').toLowerCase()).join(':');
   }
@@ -5715,7 +5993,7 @@ async function getFriendActivityHistoryForUser(userName, afterId = 0, resolvedFr
   return { friendNames, items: result.rows.map(serializeFriendActivityRow).filter(Boolean), lastReadId: state.lastReadId, dismissedThroughId: state.dismissedThroughId, delta: safeAfterId > 0 };
 }
 
-const USER_NOTIFICATION_TYPES = new Set(['mention', 'reply', 'reaction', 'trophy', 'catalog']);
+const USER_NOTIFICATION_TYPES = new Set(['mention', 'reply', 'reaction', 'trophy', 'catalog', 'game_match']);
 
 function normalizeUserNotificationName(value) {
   return normalizeText(value, '').slice(0, 80);
@@ -5747,6 +6025,29 @@ function normalizeUserNotificationData(type, rawData = {}) {
       trophyId: normalizeText(source.trophyId, '').slice(0, 80),
       title: normalizeText(source.title, 'Trophy').slice(0, 140),
       trophyType: ['bronze', 'silver', 'gold', 'platinum'].includes(trophyType) ? trophyType : 'bronze'
+    };
+  }
+  if (type === 'game_match') {
+    const sourceType = normalizeText(source.source, '').toLowerCase();
+    const matchType = normalizeText(source.matchType, '').toLowerCase();
+    const games = Array.isArray(source.games) ? source.games.slice(0, 20).map(item => {
+      const gameSource = normalizeText(item && item.source, '').toLowerCase();
+      const gameMatch = normalizeText(item && item.matchType, '').toLowerCase();
+      return {
+        titleId: normalizeText(item && item.titleId, '').toUpperCase().slice(0, 32),
+        title: normalizeText(item && item.title, '').slice(0, 180),
+        source: ['library', 'download', 'mixed'].includes(gameSource) ? gameSource : '',
+        matchType: ['library', 'download', 'owned', 'wishlist'].includes(gameMatch) ? gameMatch : ''
+      };
+    }).filter(item => item.titleId || item.title) : [];
+    return {
+      actor: normalizeUserNotificationName(source.actor),
+      titleId: normalizeText(source.titleId, '').toUpperCase().slice(0, 32),
+      title: normalizeText(source.title, '').slice(0, 180),
+      source: ['library', 'download', 'mixed'].includes(sourceType) ? sourceType : '',
+      matchType: ['library', 'download', 'owned', 'wishlist'].includes(matchType) ? matchType : '',
+      count: Math.max(1, Math.min(9999, Math.floor(Number(source.count) || games.length || 1))),
+      games
     };
   }
   if (type === 'catalog') {
@@ -7425,6 +7726,8 @@ io.on('connection', (socket) => {
     }
     if (!workingUser) { respond({ ok: false, requestId: syncRequestId, error: 'Profile could not be prepared.' }); return; }
     const previousPs3StatusForActivity = workingUser.ps3Status && typeof workingUser.ps3Status === 'object' ? { ...workingUser.ps3Status } : null;
+    const previousLibraryForSharedGameMatch = Array.isArray(workingUser.libraryData) ? workingUser.libraryData.slice() : [];
+    const previousDownloadsForSharedGameMatch = Array.isArray(workingUser.downloadsData) ? workingUser.downloadsData.slice() : [];
     const incomingPs3StatusForActivity = Object.prototype.hasOwnProperty.call(userData, 'ps3Status');
     const incomingSettingsData = (userData.settingsData && typeof userData.settingsData === "object") ? userData.settingsData : null;
     const previousCountryCode = name && userDatabase[name] ? getUserCountryCode(workingUser) : "";
@@ -7500,6 +7803,19 @@ io.on('connection', (socket) => {
 
         userData = reconcileIncomingDownloads(workingUser, userData || {});
         userData = reconcileIncomingProfileArrays(workingUser, userData || {});
+        let sharedGameAcquisitions = collectNewSharedGameAcquisitions(
+          previousLibraryForSharedGameMatch,
+          userData.libraryData,
+          previousDownloadsForSharedGameMatch,
+          userData.downloadsData,
+          {
+            hasLibrary: Object.prototype.hasOwnProperty.call(userData, 'libraryData'),
+            hasDownloads: Object.prototype.hasOwnProperty.call(userData, 'downloadsData')
+          }
+        );
+        if (sharedGameAcquisitions.length) {
+          sharedGameAcquisitions = await filterPreviouslyOwnedGameAcquisitions(name, sharedGameAcquisitions);
+        }
         const replaySectionStatus = {};
         requestedSyncSections.forEach(section => {
           if (section === 'settings') {
@@ -7577,6 +7893,13 @@ io.on('connection', (socket) => {
           if (Object.prototype.hasOwnProperty.call(profileDbPatch, 'libraryData')) ownershipChanges.libraryData = profileDbPatch.libraryData;
           if (Object.prototype.hasOwnProperty.call(profileDbPatch, 'downloadsData')) ownershipChanges.downloadsData = profileDbPatch.downloadsData;
           deferServerTask('GAME OWNERSHIP INDEX SYNC', () => syncUserGameOwnershipIndex(name, ownershipChanges), 0);
+        }
+        if (sharedGameAcquisitions.length) {
+          const acquisitionAt = workingUser.profileUpdatedAt || Date.now();
+          deferServerTask('SHARED GAME MATCH NOTIFICATIONS', () => notifyFriendsAboutSharedGameAcquisitions(name, sharedGameAcquisitions, { at: acquisitionAt }), 0);
+          if (Object.prototype.hasOwnProperty.call(profileDbPatch, 'libraryData')) {
+            deferServerTask('FRIEND ACTIVITY LIBRARY ACQUISITION', () => recordLibraryAcquisitionActivity(name, sharedGameAcquisitions, acquisitionAt), 0);
+          }
         }
         if (socket.__friendActivitySubscribed && Object.prototype.hasOwnProperty.call(profileDbPatch, 'friendsData')) {
           setFriendActivitySubscription(socket, workingUser.friendsData || []);
@@ -7883,6 +8206,7 @@ io.on('connection', (socket) => {
     const cheatSignature = normalizeText(data.cheatSignature, '').slice(0, 180);
     if (!titleId && !title) return;
 
+    const contentActionAt = Date.now();
     deferServerTask('FRIEND ACTIVITY CONTENT', () => recordAggregatedFriendActivity(name, type, {
       titleId,
       contentId,
@@ -7891,7 +8215,18 @@ io.on('connection', (socket) => {
       action,
       cheatCount,
       cheatSignature
-    }, { at: Date.now() }), 0);
+    }, { at: contentActionAt }), 0);
+
+    if (type === 'download' && action === 'add' && category === 'games' && normalizeGamePlayersTitleId(titleId)) {
+      deferServerTask('SHARED GAME DOWNLOAD MATCH', async () => {
+        if (await isExistingGameOwner(name, titleId)) return;
+        await notifyFriendsAboutSharedGameAcquisitions(name, [{
+          titleId: normalizeGamePlayersTitleId(titleId),
+          title: title || normalizeGamePlayersTitleId(titleId),
+          source: 'download'
+        }], { at: contentActionAt });
+      }, 0);
+    }
   });
 
   socket.on('friend_activity_trophy', (data = {}) => {
