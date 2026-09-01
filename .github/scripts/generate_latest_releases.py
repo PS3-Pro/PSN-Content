@@ -5,7 +5,7 @@ import re
 import sys
 
 
-LATEST_LIMIT = 50
+LATEST_LIMIT = 100
 EVENT_SCHEMA_VERSION = 1
 EVENT_INDEX_NAME = "index.json"
 EVENT_SEEN_NAME = ".seen_ids.txt"
@@ -278,7 +278,7 @@ def append_catalog_events(events_dir, event_type, events, seen, tracking_started
 
 
 def seed_catalog_events_from_latest(events_dir, event_type, latest_path, seen, source="legacy-latest", tracking_started_at_ms=0):
-    # First rollout seeds the current 50-item Recently Added window.
+    # First rollout seeds the current 100-item Recently Added window.
     # Clients baseline at trackingStartedAt, so old rows do not create retroactive spam.
     fallback_ms = max(0, int(tracking_started_at_ms or 0)) or int(utc_now().timestamp() * 1000)
     seed_events = []
