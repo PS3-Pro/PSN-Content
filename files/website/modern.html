@@ -20873,6 +20873,8 @@ P
 		const githubCover = normalizeCoverSrcForCache(imgElement?.getAttribute?.('data-github-cover') || '');
 		if (githubCover && githubCover === cleanSrc) return 'github';
 		if (/raw\.githubusercontent\.com\/PS3-Pro\/PSN-Content\/master\/resources\/database\/(?:covers\/uncompressed|avatars|themes)\//i.test(cleanSrc)) return 'github';
+		const webmanCover = normalizeCoverSrcForCache(imgElement?.getAttribute?.('data-webman-cover') || '');
+		if (webmanCover && webmanCover === cleanSrc) return 'webman';
 		return 'other';
 	}
 
@@ -20901,10 +20903,11 @@ P
 		if (source === 'fallback') return 0;
 		if ((cat === 'avatars' || cat === 'themes') && (source === 'sony' || source === 'bing')) return 0;
 		if (cat === 'library') {
-			if (source === 'other') return 600;
 			if (source === 'github') return 500;
 			if (source === 'psn') return 400;
 			if (source === 'sony') return 300;
+			if (source === 'webman') return 250;
+			if (source === 'other') return 225;
 			if (source === 'bing') return 200;
 			return 0;
 		}
@@ -21059,6 +21062,10 @@ P
 
 	window.markCoverLoaded = function(imgElement) {
 		if (!imgElement) return;
+		if (imgElement.__libraryWebmanFallbackTimer) {
+			clearTimeout(imgElement.__libraryWebmanFallbackTimer);
+			imgElement.__libraryWebmanFallbackTimer = null;
+		}
 		if (imgElement.dataset?.collectionImageRecycled === '1') return;
 		if (typeof window.markPsnStoreCoverEntry === 'function') window.markPsnStoreCoverEntry(imgElement);
 		imgElement.setAttribute('data-loaded', 'true');
@@ -21086,7 +21093,9 @@ P
 			const key = img.getAttribute('data-cover-key') || card.getAttribute('data-category-dot-key') || '';
 			const src = normalizeCoverSrcForCache(img.currentSrc || img.src);
 			const category = img.getAttribute('data-cover-category') || card.getAttribute('data-store-category') || '';
-			if (key && src) window.rememberCardCoverSrc(key, src, category, img);
+			const webmanCover = normalizeCoverSrcForCache(img.getAttribute('data-webman-cover') || '');
+			const isLibraryWebmanCover = String(category || '').toLowerCase() === 'library' && webmanCover && webmanCover === src;
+			if (key && src && !isLibraryWebmanCover) window.rememberCardCoverSrc(key, src, category, img);
 			const libPath = img.getAttribute('data-lib-path') || '';
 			if (libPath && src && window.libCoverCache && window.libCoverCache[libPath]) {
 				window.libCoverCache[libPath].resolvedCover = src;
@@ -21413,6 +21422,7 @@ P
 		const psnImage = window.getPsnStoreApiUrl(titleId, contentId, region, true);
 		if (!psnImage) return false;
 		imgElement.setAttribute('data-psn-store-tried', 'true');
+		if (normalizeCoverSrcForCache(imgElement.currentSrc || imgElement.src) === normalizeCoverSrcForCache(psnImage)) return false;
 		imgElement.src = psnImage;
 		return true;
 	};
@@ -21426,9 +21436,11 @@ P
 		const titleId = imgElement.getAttribute('data-title-id') || card?.getAttribute('data-title-id') || '';
 		const hash = generateSonyHash(String(titleId || '').trim());
 		if (!hash) return false;
+		const sonyIcon = `https://raw.githubusercontent.com/PS3-Pro/Recently-Played-Games/master/np/${hash}/ICON0.PNG`;
 		imgElement.setAttribute('data-sony-icon-tried', 'true');
+		if (normalizeCoverSrcForCache(imgElement.currentSrc || imgElement.src) === normalizeCoverSrcForCache(sonyIcon)) return false;
 		imgElement.setAttribute('data-cover-source', 'sony-icon0');
-		imgElement.src = `https://raw.githubusercontent.com/PS3-Pro/Recently-Played-Games/master/np/${hash}/ICON0.PNG`;
+		imgElement.src = sonyIcon;
 		return true;
 	};
 
@@ -21486,7 +21498,11 @@ P
 	};
 
 	window.getOnlineCoverFallback = function(imgElement) {
-	    if (imgElement.getAttribute('data-bing-tried') === 'true') {
+	    let gameName = imgElement.getAttribute('data-name') || '';
+	    let consoleTag = imgElement.getAttribute('data-console') || 'ps3';
+	    const bingCover = window.getBingCoverFallbackUrl(gameName, consoleTag);
+	    const currentSrc = normalizeCoverSrcForCache(imgElement.currentSrc || imgElement.src);
+	    if (imgElement.getAttribute('data-bing-tried') === 'true' || currentSrc === normalizeCoverSrcForCache(bingCover)) {
 	        imgElement.onerror = null;
 	        imgElement.src = FALLBACK_IMG;
 	        imgElement.setAttribute('data-loaded', 'true');
@@ -21494,9 +21510,7 @@ P
 	    }
 	
 	    imgElement.setAttribute('data-bing-tried', 'true');
-	    let gameName = imgElement.getAttribute('data-name') || '';
-	    let consoleTag = imgElement.getAttribute('data-console') || 'ps3';
-	    imgElement.src = window.getBingCoverFallbackUrl(gameName, consoleTag);
+	    imgElement.src = bingCover;
 	};
 	
 	window.sortOrders = {
@@ -37908,19 +37922,16 @@ P
 	function ensureLibraryCoverCache(game = {}, gameId = '') {
 		const path = String(game.path || '');
 		const titleId = String(gameId || getLibraryGameTitleId(game) || '').trim().toUpperCase();
-		const webmanCover = getUsableLibraryWebmanCover(game);
-		const githubCover = getLibraryGithubCover(game, titleId);
 		const entry = window.libCoverCache[path] || {};
 		entry.id = titleId || entry.id || null;
-		entry.webmanCover = webmanCover;
-		entry.githubCover = githubCover;
-		if (!entry.cover) entry.cover = webmanCover || githubCover || FALLBACK_IMG;
+		entry.githubCover = getLibraryGithubCover(game, titleId);
+		entry.webmanCover = getUsableLibraryWebmanCover(game);
 		window.libCoverCache[path] = entry;
 		return entry;
 	}
 
 	function getLibraryPreferredCover(game = {}, cachedData = {}) {
-		return getUsableLibraryWebmanCover(game) || cachedData.webmanCover || cachedData.githubCover || getLibraryGithubCover(game, cachedData.id) || '';
+		return cachedData.githubCover || getLibraryGithubCover(game, cachedData.id) || '';
 	}
 
 	window.tryLibraryGithubCover = function(imgElement) {
@@ -37934,14 +37945,38 @@ P
 		return true;
 	};
 
+	window.tryLibraryWebmanCover = function(imgElement) {
+		if (!imgElement || imgElement.getAttribute('data-library-webman-tried') === 'true') return false;
+		const webmanCover = normalizeCoverSrcForCache(imgElement.getAttribute('data-webman-cover') || '');
+		const currentSrc = normalizeCoverSrcForCache(imgElement.currentSrc || imgElement.src);
+		imgElement.setAttribute('data-library-webman-tried', 'true');
+		if (!webmanCover || webmanCover === currentSrc) return false;
+		if (imgElement.__libraryWebmanFallbackTimer) clearTimeout(imgElement.__libraryWebmanFallbackTimer);
+		imgElement.setAttribute('data-cover-source', 'webman');
+		imgElement.src = webmanCover;
+		imgElement.__libraryWebmanFallbackTimer = setTimeout(() => {
+			imgElement.__libraryWebmanFallbackTimer = null;
+			if (!imgElement.isConnected) return;
+			const activeSrc = normalizeCoverSrcForCache(imgElement.currentSrc || imgElement.src);
+			if (activeSrc !== webmanCover || (imgElement.complete && Number(imgElement.naturalWidth || 0) > 0)) return;
+			getOnlineCoverFallback(imgElement);
+		}, 2500);
+		return true;
+	};
+
 	window.handleLibraryCoverError = function(imgElement) {
 		if (!imgElement) return;
+		if (imgElement.__libraryWebmanFallbackTimer) {
+			clearTimeout(imgElement.__libraryWebmanFallbackTimer);
+			imgElement.__libraryWebmanFallbackTimer = null;
+		}
 		const failedCoverKey = imgElement.getAttribute('data-cover-key') || '';
 		const failedCoverSrc = imgElement.currentSrc || imgElement.src || '';
 		if (failedCoverKey && typeof window.forgetCardCoverSrc === 'function') window.forgetCardCoverSrc(failedCoverKey, failedCoverSrc);
 		if (window.tryLibraryGithubCover && window.tryLibraryGithubCover(imgElement)) return;
 		if (window.tryPsnStoreCover && window.tryPsnStoreCover(imgElement, 'library')) return;
 		if (window.trySonyIconCoverAfterGithub && window.trySonyIconCoverAfterGithub(imgElement, 'library')) return;
+		if (window.tryLibraryWebmanCover && window.tryLibraryWebmanCover(imgElement)) return;
 		getOnlineCoverFallback(imgElement);
 	};
 	
@@ -38560,10 +38595,10 @@ function formatLibraryLastPlayedBadge(game = {}) {
 			const localCoverKey = (exactStoreMatch && typeof window.getStoreCardCoverKey === 'function')
 				? window.getStoreCardCoverKey(targetCategory, storeSearchId, coverContentId)
 				: ((typeof window.getLibraryCardCoverKey === 'function') ? window.getLibraryCardCoverKey(game, cachedData) : (game.path || cachedData.id || game.title || ''));
-			const preferredLibraryCover = getUsableLibraryWebmanCover(game) || cachedData.webmanCover || resolvedLibraryGithubCover || getLibraryPreferredCover(game, cachedData);
-			let displayCover = cachedData.webmanCover || ((typeof window.getCachedCardCoverSrc === 'function' ? window.getCachedCardCoverSrc(localCoverKey, 'library', preferredLibraryCover) : '') || preferredLibraryCover);
+			const preferredLibraryCover = resolvedLibraryGithubCover || getLibraryPreferredCover(game, cachedData);
+			let displayCover = (typeof window.getCachedCardCoverSrc === 'function' ? window.getCachedCardCoverSrc(localCoverKey, 'library', preferredLibraryCover) : '') || preferredLibraryCover;
 			if ((!displayCover || displayCover === FALLBACK_IMG || /NOCOVER00\.JPG/i.test(String(displayCover))) && game.title) {
-				displayCover = resolvedLibraryGithubCover || cachedData.githubCover || 'data:image/png;base64,BING';
+				displayCover = 'data:image/png;base64,BING';
 			}
 			const libraryCopyId = String(resolvedLibraryCoverId || '').trim();
 			const libraryCopyIdHtml = libraryCopyId && !/^(?:UNKNOW|UNKNOWN|NO ID)$/i.test(libraryCopyId)
@@ -39393,10 +39428,10 @@ function formatLibraryLastPlayedBadge(game = {}) {
 			const favoriteCoverKey = (exactStoreMatch && typeof window.getStoreCardCoverKey === 'function')
 				? window.getStoreCardCoverKey(targetCategory, storeSearchId, coverContentId)
 				: ((typeof window.getLibraryCardCoverKey === 'function') ? window.getLibraryCardCoverKey(game, cachedData) : favDotKey);
-			const preferredLibraryCover = getUsableLibraryWebmanCover(game) || cachedData.webmanCover || resolvedFavoriteGithubCover || getLibraryPreferredCover(game, cachedData);
-			let displayCover = cachedData.webmanCover || ((typeof window.getCachedCardCoverSrc === 'function' ? window.getCachedCardCoverSrc(favoriteCoverKey, 'library', preferredLibraryCover) : '') || preferredLibraryCover);
+			const preferredLibraryCover = resolvedFavoriteGithubCover || getLibraryPreferredCover(game, cachedData);
+			let displayCover = (typeof window.getCachedCardCoverSrc === 'function' ? window.getCachedCardCoverSrc(favoriteCoverKey, 'library', preferredLibraryCover) : '') || preferredLibraryCover;
 			if ((!displayCover || displayCover === FALLBACK_IMG || /NOCOVER00\.JPG/i.test(String(displayCover))) && game.title) {
-				displayCover = resolvedFavoriteGithubCover || cachedData.githubCover || 'data:image/png;base64,BING';
+				displayCover = 'data:image/png;base64,BING';
 			}
 			const favoriteCopyId = String(resolvedFavoriteCoverId || '').trim();
 			const favoriteCopyIdHtml = favoriteCopyId && !/^(?:UNKNOW|UNKNOWN|NO ID)$/i.test(favoriteCopyId)
