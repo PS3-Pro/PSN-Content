@@ -2587,7 +2587,7 @@ function getPublicUserData(username, user = {}, includeAdminFields = false) {
 
 
 const COMPACT_PROFILE_SETTING_KEYS = new Set([
-  'audio', 'ux', 'hapticFeedback', 'haptics', 'cardBlur', 'cardBlurEnabled', 'gameCardBlur',
+  'audio', 'ux', 'hapticFeedback', 'haptics', 'cardBlur', 'cardBlurEnabled', 'gameCardBlur', 'recentlyVisitedVisible',
   'chatSound', 'chatAutoTranslate', 'interfaceAutoTranslate', 'ps3Ip', 'companionPlugin',
   'fpsCounterPlugin', 'fpsCounter', 'consoleFanMode', 'consoleFanSpeed', 'consoleFanTarget',
   'performanceMode', 'performanceRsx', 'performanceVram', 'siteDisclaimerSkipToday',
