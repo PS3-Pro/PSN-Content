@@ -49807,6 +49807,89 @@ function getVisibleChatStackEl(id) {
 		return normalizedList;
 	}
 
+	function handleChatListEnter(input, event) {
+		const selection = window.getSelection();
+		if (!input || !event || !selection || selection.rangeCount !== 1) return false;
+
+		const range = selection.getRangeAt(0);
+		if (!range.collapsed || !isChatRangeInsideInput(range, input)) return false;
+
+		const listItem = getChatClosestElement(range.startContainer, input, ['li']);
+		if (!listItem) return false;
+
+		const list = listItem.parentElement;
+		if (!list || !list.tagName || !['ul', 'ol'].includes(list.tagName.toLowerCase()) || !input.contains(list)) return false;
+
+		const itemText = String(listItem.innerText || listItem.textContent || '').replace(/\u200B/g, '').trim();
+		if (itemText) {
+			try {
+				event.preventDefault();
+
+				const tailRange = document.createRange();
+				tailRange.selectNodeContents(listItem);
+				tailRange.setStart(range.startContainer, range.startOffset);
+				const trailingContent = tailRange.extractContents();
+
+				const nextItem = document.createElement('li');
+				nextItem.appendChild(trailingContent);
+
+				const currentText = String(listItem.innerText || listItem.textContent || '').replace(/\u200B/g, '').trim();
+				const nextText = String(nextItem.innerText || nextItem.textContent || '').replace(/\u200B/g, '').trim();
+				if (!currentText && !listItem.querySelector('br')) listItem.appendChild(document.createElement('br'));
+				if (!nextText && !nextItem.querySelector('br')) nextItem.appendChild(document.createElement('br'));
+
+				list.insertBefore(nextItem, listItem.nextSibling);
+
+				const newRange = document.createRange();
+				newRange.selectNodeContents(nextItem);
+				newRange.collapse(true);
+				selection.removeAllRanges();
+				selection.addRange(newRange);
+				rememberChatInputRange(newRange, input);
+
+				input.dispatchEvent(new Event('input', { bubbles: true }));
+				if (typeof updateToolbarStates === 'function') requestAnimationFrame(updateToolbarStates);
+				return true;
+			} catch(e) {
+				return true;
+			}
+		}
+
+		try {
+			event.preventDefault();
+			const parent = list.parentNode;
+			if (!parent) return true;
+
+			const trailingList = list.cloneNode(false);
+			while (listItem.nextSibling) trailingList.appendChild(listItem.nextSibling);
+			list.removeChild(listItem);
+
+			const plainLine = document.createElement('div');
+			plainLine.appendChild(document.createElement('br'));
+
+			if (list.children.length) {
+				parent.insertBefore(plainLine, list.nextSibling);
+			} else {
+				parent.insertBefore(plainLine, list);
+				parent.removeChild(list);
+			}
+			if (trailingList.children.length) parent.insertBefore(trailingList, plainLine.nextSibling);
+
+			const newRange = document.createRange();
+			newRange.selectNodeContents(plainLine);
+			newRange.collapse(true);
+			selection.removeAllRanges();
+			selection.addRange(newRange);
+			rememberChatInputRange(newRange, input);
+
+			input.dispatchEvent(new Event('input', { bubbles: true }));
+			if (typeof updateToolbarStates === 'function') requestAnimationFrame(updateToolbarStates);
+			return true;
+		} catch(e) {
+			return true;
+		}
+	}
+
 	function removeChatBulletListElement(input, listEl, selection, preservedRange) {
 		if (!input || !listEl || !selection || listEl.tagName.toLowerCase() !== 'ul') return false;
 
@@ -57713,7 +57796,9 @@ function getVisibleChatStackEl(id) {
 		}
 
 		const input = document.getElementById('chat-input');
-		if (e.target !== input) return;
+		const eventPath = (typeof e.composedPath === 'function') ? e.composedPath() : [];
+		const isChatInputEvent = !!(input && (e.target === input || input.contains(e.target) || eventPath.includes(input)));
+		if (!isChatInputEvent) return;
 	
 		const suggestionsBox = document.getElementById('mention-suggestions');
 		const isSuggesting = suggestionsBox && suggestionsBox.style.display === 'block';
@@ -57757,7 +57842,12 @@ function getVisibleChatStackEl(id) {
 		
 		if (e.key === "Enter" && !isSuggesting) {
 			const isMobile = window.innerWidth <= 768;
-			if (e.shiftKey || isMobile) {
+			const isChatNewLineGesture = e.shiftKey || isMobile;
+			if (isChatNewLineGesture && typeof handleChatListEnter === 'function' && handleChatListEnter(input, e)) {
+				if (typeof playUiInput === 'function') playUiInput();
+				return;
+			}
+			if (isChatNewLineGesture) {
 				if (typeof playUiInput === 'function') playUiInput();
 			} else {
 				e.preventDefault();
