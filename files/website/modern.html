@@ -43856,6 +43856,45 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 		if (!options || options.sync !== false) queueTrophyProfileSync('saveTrophies');
 	}
 	
+	window.showPsnTopPopup = function(options = {}) {
+		const container = document.getElementById('trophy-container');
+		if (!container) return null;
+
+		const popup = document.createElement('div');
+		popup.className = 'trophy-popup';
+
+		const icon = document.createElement(options.iconTag === 'span' ? 'span' : 'i');
+		icon.className = `${String(options.iconClass || 'fas fa-bell').trim()} trophy-popup-icon`;
+		icon.setAttribute('aria-hidden', 'true');
+		if (options.color) icon.style.color = String(options.color);
+
+		const copy = document.createElement('div');
+		copy.className = 'trophy-popup-text';
+		const title = document.createElement('h4');
+		title.textContent = String(options.title || 'Notification');
+		if (options.color) title.style.color = String(options.color);
+		const body = document.createElement('p');
+		const lead = String(options.lead || '').trim();
+		if (lead) {
+			const strong = document.createElement('b');
+			strong.textContent = lead;
+			body.appendChild(strong);
+			body.appendChild(document.createTextNode(` ${String(options.text || '')}`));
+		} else {
+			body.textContent = String(options.text || '');
+		}
+		copy.append(title, body);
+		popup.append(icon, copy);
+		container.appendChild(popup);
+
+		requestAnimationFrame(() => { requestAnimationFrame(() => { popup.classList.add('show'); }); });
+		setTimeout(() => {
+			popup.classList.remove('show');
+			setTimeout(() => popup.remove(), 500);
+		}, Math.max(1000, Number(options.duration) || 4000));
+		return popup;
+	};
+
 	function showTrophyPopup(trophy) {
 		if (trophy.type === 'platinum') {
 			playSystemSound('sound-trophy-platinum', 1.0);
@@ -43864,27 +43903,12 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 			playSystemSound('sound-trophy-standard', 1);
 			if (typeof playNotificationHaptic === 'function') playNotificationHaptic('success');
 		}
-		
-		const container = document.getElementById('trophy-container');
-		if (!container) return;
-	
-		const popup = document.createElement('div');
-		popup.className = 'trophy-popup';
-		popup.innerHTML = `
-			<span class="ps-trophy-icon ps-trophy-${trophy.type} trophy-popup-icon" aria-hidden="true"></span>
-			<div class="trophy-popup-text">
-				<h4>Trophy Earned!</h4>
-				<p>${trophy.title}</p>
-			</div>
-		`;
-		
-		container.appendChild(popup);
-		requestAnimationFrame(() => { requestAnimationFrame(() => { popup.classList.add('show'); }); });
-		
-		setTimeout(() => {
-			popup.classList.remove('show');
-			setTimeout(() => popup.remove(), 500);
-		}, 4000);
+		window.showPsnTopPopup({
+			iconTag: 'span',
+			iconClass: `ps-trophy-icon ps-trophy-${trophy.type}`,
+			title: 'Trophy Earned!',
+			text: trophy.title
+		});
 	}
 	
 	window.checkTrophyProgress = function(trophyId, currentAmount) {
@@ -52027,51 +52051,34 @@ function getVisibleChatStackEl(id) {
     function showChatNotification(userName, isMention, isGlobalPing, globalPingRole = '', reactionEmoji = '') {
         if (typeof isChatNotificationSessionReady === 'function' && !isChatNotificationSessionReady()) return;
 
-        const container = document.getElementById('trophy-container');
-        if (!container) return;
-    
-        const notification = document.createElement('div');
-        notification.className = 'trophy-popup'; 
-    
         let highlightColor = '#0070cc';
         let titleText = 'NEW MESSAGE';
-        let bodyText = `<b>${userName}</b> replied to you`;
-    
+        let actionText = 'replied to you';
+
         if (isGlobalPing) {
             const visual = typeof getChatGlobalPingVisual === 'function' ? getChatGlobalPingVisual(globalPingRole || (typeof getChatGlobalPingRole === 'function' ? getChatGlobalPingRole({ user: userName, isGlobalPing: true }, userName) : 'admin')) : { title: 'ADMIN ALERT', color: '#ff4444' };
             highlightColor = visual.color;
             titleText = visual.title;
-            bodyText = `<b>${userName}</b> notified everyone`;
+            actionText = 'notified everyone';
         } else if (isMention) {
             highlightColor = '#ffcc00';
             titleText = 'NEW MENTION';
-            bodyText = `<b>${userName}</b> mentioned you`;
+            actionText = 'mentioned you';
         } else if (reactionEmoji) {
             highlightColor = '#ff4fa3';
             titleText = 'NEW REACTION';
-            bodyText = `<b>${userName}</b> reacted ${reactionEmoji} to your message`;
+            actionText = `reacted ${reactionEmoji} to your message`;
         }
-    
-        notification.innerHTML = `
-            <i class="fas fa-comment-dots trophy-popup-icon" style="color: ${highlightColor}"></i>
-            <div class="trophy-popup-text">
-                <h4 style="color: ${highlightColor}">${titleText}</h4>
-                <p>${bodyText}</p>
-            </div>
-        `;
-    
-        container.appendChild(notification);
-        
-        requestAnimationFrame(() => { 
-            requestAnimationFrame(() => { 
-                notification.classList.add('show'); 
-            }); 
-        });
-    
-        setTimeout(() => {
-            notification.classList.remove('show');
-            setTimeout(() => notification.remove(), 500);
-        }, 4000);
+
+        if (typeof window.showPsnTopPopup === 'function') {
+            window.showPsnTopPopup({
+                iconClass: 'fas fa-comment-dots',
+                color: highlightColor,
+                title: titleText,
+                lead: userName,
+                text: actionText
+            });
+        }
     }
     
 	window.uploadToCloudinary = async function(file, attempt = 0) {
@@ -55286,6 +55293,20 @@ function getVisibleChatStackEl(id) {
 					if (!chatVisible) {
 						const reactionEmoji = String(item.data && item.data.emoji || '❤').trim() || '❤';
 						showChatNotification(String(item.data && item.data.actor || 'Someone').trim() || 'Someone', false, false, '', reactionEmoji);
+					}
+				}
+				if (isFreshUnread && item.type === 'game_match' && typeof window.showPsnTopPopup === 'function') {
+					const notificationsVisible = typeof window.isNotificationCenterVisible === 'function' && window.isNotificationCenterVisible();
+					if (!notificationsVisible) {
+						const presentation = getUserNotificationPresentation(item);
+						const count = Math.max(1, Number(item.data && item.data.count) || 1);
+						window.showPsnTopPopup({
+							iconClass: `fas ${presentation.badgeIcon || 'fa-user-group'}`,
+							color: '#00d49a',
+							title: count > 1 ? 'SHARED GAMES' : 'SHARED GAME',
+							lead: String(item.data && item.data.actor || 'Someone').trim() || 'Someone',
+							text: presentation.title
+						});
 					}
 				}
 				if (typeof window.isNotificationCenterVisible === 'function' && window.isNotificationCenterVisible() && window.__userNotificationClearBusy !== true) {
