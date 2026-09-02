@@ -2564,6 +2564,7 @@ function getPublicUserData(username, user = {}, includeAdminFields = false) {
     online: !!user.online,
     lastSeen: user.lastSeen || null,
     ps3Status: user.ps3Status || null,
+    profileUpdatedAt: normalizeTimestampValue(user.profileUpdatedAt),
     profileCardStyle: getUserProfileCardStyle(user),
     profileCardEffect: getUserProfileCardStyle(user),
     settingsData: getPublicProfileSettings(user),
@@ -8808,6 +8809,12 @@ io.on('connection', (socket) => {
       await ensureUserCacheReady();
       if (purpose === 'mentions') {
         socket.emit('mention_users_results', searchUserNamesFromCache(query));
+        return;
+      }
+      if (purpose === 'profile') {
+        const targetName = normalizeText(request && request.targetName || query, '');
+        const refreshedUser = targetName ? await refreshSingleUserSummaryFromDb(targetName, { invalidateOnlineList: false }) : null;
+        socket.emit('global_search_results', refreshedUser ? [getPublicUserData(targetName, refreshedUser, false)] : []);
         return;
       }
       if (purpose === 'admin') {
