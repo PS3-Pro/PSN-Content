@@ -2288,9 +2288,13 @@ body.is-admin #btn-toolbar-cmd, body.is-mod #btn-toolbar-cmd { display: flex !im
 .user-notification-main { min-width:0; }
 .user-notification-title { color:#fff; font-size:13px; font-weight:650; line-height:1.35; }
 .user-notification-title strong { font-weight:850; }
+.user-notification-profile-link { cursor:pointer; text-decoration:none; text-underline-offset:2px; transition:color .16s ease,text-decoration-color .16s ease; }
+.user-notification-profile-link:hover { color:#fff; text-decoration:underline; text-decoration-color:color-mix(in srgb,var(--notification-accent) 78%,#fff); }
 .user-notification-preview { margin-top:4px; color:rgba(255,255,255,.64); font-size:11.5px; line-height:1.4; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 .user-notification-meta { margin-top:4px; display:flex; align-items:center; gap:7px; color:var(--text-muted); font-size:9.5px; font-weight:650; letter-spacing:.25px; }
 .user-notification-time { align-self:center; color:rgba(255,255,255,.38); font-size:10px; white-space:nowrap; }
+.user-notification-lfg-actions { min-width:68px; gap:8px; margin-left:2px; }
+.user-notification-item.is-lfg .user-notification-time-inline { color:rgba(255,255,255,.38); font-weight:500; white-space:nowrap; }
 .user-notification-unread-dot { position:absolute; top:11px; right:11px; width:6px; height:6px; border-radius:50%; background:var(--notification-accent); box-shadow:0 0 9px var(--notification-accent); }
 .notification-swipe-row { position:relative; flex:0 0 auto; width:100%; min-width:0; overflow:visible; border-radius:10px; transition:opacity .22s ease,filter .22s ease; }
 .notification-swipe-row:hover { z-index:10; }
@@ -2347,6 +2351,8 @@ body.is-admin #btn-toolbar-cmd, body.is-mod #btn-toolbar-cmd { display: flex !im
 .user-notification-time { grid-column:3; justify-self:end; align-self:center; margin:0; font-size:9px; }
 .user-notification-title { font-size:12px; }
 .user-notification-preview { font-size:10.5px; }
+.user-notification-lfg-actions { min-width:59px; gap:5px; margin-left:0; }
+.user-notification-item.is-lfg .user-notification-lfg-actions .btn-mini-round { width:27px; height:27px; flex:0 0 27px; font-size:11px; }
 .user-notification-unread-dot { top:7px; right:7px; }
 .notification-center-state { padding:70px 22px; }
 }
@@ -61708,6 +61714,28 @@ function getVisibleChatStackEl(id) {
 		}
 	};
 
+	function isUserNotificationFriend(name) {
+		return Array.isArray(window.friendsList) && window.friendsList.some(function(friend) {
+			return String(friend && (friend.name || friend) || '') === String(name || '');
+		});
+	}
+
+	function syncUserNotificationLfgFriendButtons(name) {
+		name = String(name || '').trim();
+		if (!name) return;
+		const isFriend = isUserNotificationFriend(name);
+		document.querySelectorAll('#notification-center-list .user-notification-lfg-friend').forEach(function(button) {
+			let actor = '';
+			try { actor = decodeURIComponent(String(button.dataset.notificationActor || '')); } catch (err) { actor = String(button.dataset.notificationActor || ''); }
+			if (actor !== name) return;
+			button.classList.toggle('btn-friend-add', !isFriend);
+			button.classList.toggle('btn-friend-remove', isFriend);
+			button.title = isFriend ? 'Remove Friend' : 'Add Friend';
+			button.setAttribute('aria-label', (isFriend ? 'Remove Friend ' : 'Add Friend ') + name);
+			button.innerHTML = '<i class="fas ' + (isFriend ? 'fa-user-minus' : 'fa-user-plus') + '"></i>';
+		});
+	}
+
 	function buildUserNotificationRowHtml(item, index = 0, extraClass = '') {
 		const p = getUserNotificationPresentation(item);
 		const lastReadId = Math.max(0, Number(window.__userNotificationLastReadId) || 0);
@@ -61718,16 +61746,34 @@ function getVisibleChatStackEl(id) {
 			const catalogTitleId = normalizeCatalogOwnedTitleId(item.data && (item.data.gameTitleId || item.data.titleId || item.data.contentId));
 			if (catalogTitleId && typeof getOptimizedCover === 'function') avatar = getOptimizedCover(catalogTitleId) || avatar;
 		}
-		const encodedActor = encodeURIComponent(actor);
-		const avatarAction = actor ? ' onclick="event.stopPropagation(); if(typeof playUiClick===\'function\') playUiClick(); openProfileModal(decodeURIComponent(\'' + encodedActor + '\'))"' : '';
-		const titleHtml = actor && item.type !== 'trophy' ? '<strong>' + escapeRealtimeFeedHtml(actor) + '</strong> ' + escapeRealtimeFeedHtml(p.title) : escapeRealtimeFeedHtml(p.title);
+		const encodedActor = encodeURIComponent(actor).replace(/'/g, '%27');
+		const encodedAvatar = encodeURIComponent(avatar).replace(/'/g, '%27');
+		const isLfgSocial = item.type === 'lfg' && actor && actor !== (localStorage.getItem('psn_username') || '');
+		const profileAttr = actor ? ' data-notification-profile="' + encodedActor + '"' : '';
+		const actorHtml = actor && item.type !== 'trophy'
+			? '<strong' + (isLfgSocial ? ' class="user-notification-profile-link"' + profileAttr : '') + '>' + escapeRealtimeFeedHtml(actor) + '</strong> '
+			: '';
+		const titleHtml = actorHtml + escapeRealtimeFeedHtml(p.title);
+		const timeLabel = escapeRealtimeFeedHtml(realtimeFeedTimeLabel(item.createdAt));
+		const timeTitle = escapeRealtimeFeedHtml(new Date(item.createdAt).toLocaleString());
+		let sideHtml = '<div class="user-notification-time" title="' + timeTitle + '">' + timeLabel + '</div>';
+		let metaHtml = '<div class="user-notification-meta"><span>' + escapeRealtimeFeedHtml(p.meta) + '</span></div>';
+		if (isLfgSocial) {
+			const isFriend = isUserNotificationFriend(actor);
+			const friendTitle = isFriend ? 'Remove Friend' : 'Add Friend';
+			metaHtml = '<div class="user-notification-meta"><span>' + escapeRealtimeFeedHtml(p.meta) + '</span><span>•</span><span class="user-notification-time-inline" title="' + timeTitle + '">' + timeLabel + '</span></div>';
+			sideHtml = '<div class="online-user-actions user-notification-lfg-actions">' +
+				'<button type="button" class="btn-mini-round user-notification-lfg-message" data-notification-action="message" data-notification-actor="' + encodedActor + '" title="Chat" aria-label="Chat with ' + escapeRealtimeFeedHtml(actor) + '" onmouseenter="if(typeof playUiArrow===\'function\') playUiArrow()"><i class="fas fa-comment-dots"></i></button>' +
+				'<button type="button" class="btn-mini-round user-notification-lfg-friend ' + (isFriend ? 'btn-friend-remove' : 'btn-friend-add') + '" data-notification-action="friend" data-notification-actor="' + encodedActor + '" data-notification-avatar="' + encodedAvatar + '" title="' + friendTitle + '" aria-label="' + friendTitle + ' ' + escapeRealtimeFeedHtml(actor) + '" onmouseenter="if(typeof playUiArrow===\'function\') playUiArrow()"><i class="fas ' + (isFriend ? 'fa-user-minus' : 'fa-user-plus') + '"></i></button>' +
+			'</div>';
+		}
 		const day = realtimeFeedDayLabel(item.createdAt);
 		return '<div class="notification-swipe-row" data-notification-id="' + escapeRealtimeFeedHtml(item.id) + '" data-notification-day="' + escapeRealtimeFeedHtml(day) + '">' +
 			'<div class="notification-swipe-action" aria-hidden="false"><button type="button" class="notification-swipe-delete" data-keyboard-nav="off" title="Delete notification" aria-label="Delete notification"><i class="fas fa-trash-alt"></i><span>Delete</span></button></div>' +
 			'<div class="notification-swipe-content"><div class="user-notification-item ' + p.cls + (isUnread ? ' is-unread' : '') + (extraClass ? ' ' + extraClass : '') + '" style="--tile-idx:' + (index % 30) + '" onmouseenter="if(!this.classList.contains(\'is-message-deleted\') && !this.closest(\'.notification-swipe-row\')?.classList.contains(\'is-open\') && !this.closest(\'.notification-swipe-row\')?.classList.contains(\'is-swiping\') && typeof playUiHover===\'function\') playUiHover()">' +
-			'<div class="user-notification-avatar-wrap"><img class="user-notification-avatar" src="' + escapeRealtimeFeedHtml(avatar) + '" alt=""' + avatarAction + '><span class="user-notification-badge"><i class="fas ' + p.badgeIcon + '"></i></span></div>' +
-			'<div class="user-notification-main"><div class="user-notification-title">' + titleHtml + '</div>' + (p.preview ? '<div class="user-notification-preview">' + escapeRealtimeFeedHtml(p.preview) + '</div>' : '') + '<div class="user-notification-meta"><span>' + escapeRealtimeFeedHtml(p.meta) + '</span></div></div>' +
-			'<div class="user-notification-time" title="' + escapeRealtimeFeedHtml(new Date(item.createdAt).toLocaleString()) + '">' + escapeRealtimeFeedHtml(realtimeFeedTimeLabel(item.createdAt)) + '</div>' + (isUnread ? '<span class="user-notification-unread-dot"></span>' : '') + '</div></div></div>';
+			'<div class="user-notification-avatar-wrap"><img class="user-notification-avatar" src="' + escapeRealtimeFeedHtml(avatar) + '" alt=""' + profileAttr + '><span class="user-notification-badge"><i class="fas ' + p.badgeIcon + '"></i></span></div>' +
+			'<div class="user-notification-main"><div class="user-notification-title">' + titleHtml + '</div>' + (p.preview ? '<div class="user-notification-preview">' + escapeRealtimeFeedHtml(p.preview) + '</div>' : '') + metaHtml + '</div>' +
+			sideHtml + (isUnread ? '<span class="user-notification-unread-dot"></span>' : '') + '</div></div></div>';
 	}
 
 	function cleanupUserNotificationDayHeaders(list) {
@@ -62268,6 +62314,7 @@ function getVisibleChatStackEl(id) {
         const beginDrag = function(target, clientX, clientY, inputType, inputId) {
             if (target.closest('.notification-swipe-row.is-swipe-hinting')) return false;
             if (target.closest('.notification-swipe-delete')) return false;
+            if (target.closest('button, a[href], [role="button"], [data-notification-profile]')) return false;
             if (notificationSwipeHintRow || notificationSwipeHintTimer) {
                 markNotificationSwipeHintSeen();
                 cancelNotificationSwipeHintPreview(true);
@@ -62376,6 +62423,40 @@ function getVisibleChatStackEl(id) {
                 if (row) window.removeUserNotification(row.dataset.notificationId, row);
                 return;
             }
+
+            const profileTarget = event.target.closest('[data-notification-profile]');
+            if (profileTarget) {
+                event.preventDefault();
+                event.stopPropagation();
+                const encodedName = String(profileTarget.dataset.notificationProfile || '');
+                if (encodedName && typeof openProfileModal === 'function') {
+                    if (typeof playUiClick === 'function') playUiClick();
+                    openProfileModal(encodedName);
+                }
+                return;
+            }
+
+            const socialAction = event.target.closest('[data-notification-action]');
+            if (socialAction) {
+                event.preventDefault();
+                event.stopPropagation();
+                let actor = '';
+                let avatar = '';
+                try { actor = decodeURIComponent(String(socialAction.dataset.notificationActor || '')); } catch (err) { actor = String(socialAction.dataset.notificationActor || ''); }
+                try { avatar = decodeURIComponent(String(socialAction.dataset.notificationAvatar || '')); } catch (err) { avatar = String(socialAction.dataset.notificationAvatar || ''); }
+                if (!actor) return;
+                if (typeof playUiClick === 'function') playUiClick();
+                if (socialAction.dataset.notificationAction === 'message') {
+                    if (typeof window.mentionUserInChat === 'function') window.mentionUserInChat(actor, { silent:true });
+                    return;
+                }
+                if (socialAction.dataset.notificationAction === 'friend' && typeof window.toggleFriend === 'function') {
+                    window.toggleFriend(actor, avatar, socialAction);
+                    syncUserNotificationLfgFriendButtons(actor);
+                }
+                return;
+            }
+
             const row = event.target.closest('.notification-swipe-row');
             if (!row) return;
             if (Date.now() < Number(row.dataset.notificationSwipeSuppressUntil || 0)) { event.preventDefault(); event.stopPropagation(); return; }
