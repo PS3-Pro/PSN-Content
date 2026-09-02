@@ -8273,15 +8273,32 @@ io.on('connection', (socket) => {
       return;
     }
 
-    const titleId = normalizeGamePlayersTitleId(data && data.titleId);
-    if (!titleId) {
-      respond({ ok: false, titleId: '', error: 'Invalid Title ID.' });
-      return;
-    }
-
     const requestedMode = normalizeText(data && data.mode, '').toLowerCase();
-    const mode = requestedMode === 'list' ? 'list' : (requestedMode === 'lfg' ? 'lfg' : 'summary');
+    const mode = requestedMode === 'mine' ? 'mine' : (requestedMode === 'list' ? 'list' : (requestedMode === 'lfg' ? 'lfg' : 'summary'));
+    let titleId = '';
     try {
+      if (mode === 'mine') {
+        const result = await queryDbWithRetry(
+          `SELECT title_id
+           FROM user_game_looking_for_group
+           WHERE user_name = $1
+           ORDER BY created_at DESC`,
+          [name],
+          { attempts: 2, label: 'LOOKING FOR GROUP OWN STATE' }
+        );
+        const titleIds = (result.rows || []).map(row => normalizeGamePlayersTitleId(row.title_id)).filter(Boolean);
+        const payload = { ok: true, mode, titleIds };
+        trackBandwidthPayload('game_players_lfg_mine', payload, 1);
+        respond(payload);
+        return;
+      }
+
+      titleId = normalizeGamePlayersTitleId(data && data.titleId);
+      if (!titleId) {
+        respond({ ok: false, titleId: '', mode, error: 'Invalid Title ID.' });
+        return;
+      }
+
       if (mode === 'lfg') {
         const result = await setGameLookingForGroup(name, titleId, data && data.enabled === true, data && data.title);
         if (!result || result.ok !== true) {
@@ -8291,6 +8308,10 @@ io.on('connection', (socket) => {
         const summary = await getGamePlayersSummaryForUser(name, titleId);
         const payload = { ok: true, titleId, mode, enabled: result.enabled === true, ...summary };
         trackBandwidthPayload('game_players_lfg', payload, 1);
+        const statePayload = { titleId, enabled: result.enabled === true };
+        const stateRecipients = getSocketsByUserName(name).filter(client => client && client.connected);
+        trackBandwidthPayload('game_lfg_state', statePayload, stateRecipients.length);
+        stateRecipients.forEach(client => client.emit('game_lfg_state', statePayload));
         respond(payload);
         return;
       }
