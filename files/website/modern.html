@@ -25153,13 +25153,88 @@ P
         return count;
     }
 
+    window.stashGamePlayersModalForProfile = function() {
+        const modal = document.getElementById('modal-sys-list');
+        const body = document.getElementById('list-modal-body');
+        const titleEl = document.getElementById('list-modal-title');
+        if (!modal || !body || !titleEl || modal.dataset.profileTarget !== '__game_players__' || !modal.classList.contains('show')) return false;
+
+        if (window.__gamePlayersProfileReturnState) return true;
+        ['lfg', 'friends', 'others'].forEach(group => clearProgressiveGridObserver(`game-players-${group}`));
+
+        const bodyFragment = document.createDocumentFragment();
+        while (body.firstChild) bodyFragment.appendChild(body.firstChild);
+        const dataset = {};
+        Object.keys(modal.dataset).forEach(key => { dataset[key] = modal.dataset[key]; });
+
+        window.__gamePlayersProfileReturnState = {
+            bodyFragment,
+            titleHtml: titleEl.innerHTML,
+            scrollTop: body.scrollTop,
+            dataset,
+            state: window.__gamePlayersModalState,
+            lastProfileListRender: window.__lastProfileListRender
+        };
+
+        modal.style.opacity = '0';
+        modal.style.pointerEvents = 'none';
+        return true;
+    };
+
+    window.restoreGamePlayersModalAfterProfile = function() {
+        const snapshot = window.__gamePlayersProfileReturnState;
+        const modal = document.getElementById('modal-sys-list');
+        const body = document.getElementById('list-modal-body');
+        const titleEl = document.getElementById('list-modal-title');
+        if (!snapshot || !modal || !body || !titleEl) return false;
+
+        if (window.__activeProfileListRequest && window.__activeProfileListRequest.timeoutId) clearTimeout(window.__activeProfileListRequest.timeoutId);
+        window.__activeProfileListRequest = null;
+        if (typeof window.cancelProfileListResize === 'function') window.cancelProfileListResize(body);
+
+        body.innerHTML = '';
+        body.appendChild(snapshot.bodyFragment);
+        titleEl.innerHTML = snapshot.titleHtml;
+        Object.keys(modal.dataset).forEach(key => { delete modal.dataset[key]; });
+        Object.keys(snapshot.dataset || {}).forEach(key => { modal.dataset[key] = snapshot.dataset[key]; });
+        window.__gamePlayersModalState = snapshot.state || null;
+        window.__lastProfileListRender = snapshot.lastProfileListRender || null;
+
+        modal.style.display = 'flex';
+        modal.style.opacity = '';
+        modal.style.pointerEvents = '';
+        modal.classList.add('show');
+
+        const state = window.__gamePlayersModalState;
+        if (state && modal.dataset.gamePlayersToken === state.token && modal.dataset.profileTarget === '__game_players__') {
+            ['lfg', 'friends', 'others'].forEach(group => {
+                const groupState = state.groups && state.groups[group];
+                const list = modal.querySelector(`[data-game-player-list="${group}"]`);
+                if (groupState && list && groupState.loaded) setupGamePlayersGroupPaging(group, list, groupState);
+            });
+        }
+
+        const targetScroll = Math.max(0, Number(snapshot.scrollTop) || 0);
+        const previousBehavior = body.style.scrollBehavior;
+        body.style.scrollBehavior = 'auto';
+        requestAnimationFrame(() => {
+            body.scrollTop = targetScroll;
+            requestAnimationFrame(() => {
+                body.scrollTop = targetScroll;
+                body.style.scrollBehavior = previousBehavior || 'smooth';
+            });
+        });
+
+        window.__gamePlayersProfileReturnState = null;
+        return true;
+    };
+
     window.openGamePlayerProfile = function(encodedName) {
         let name = '';
         try { name = decodeURIComponent(String(encodedName || '')); } catch (err) { name = String(encodedName || ''); }
-        closeSysModal(null, 'modal-sys-list');
-        setTimeout(() => {
-            if (typeof openProfileModal === 'function') openProfileModal(name);
-        }, 320);
+        const profileModal = document.getElementById('modal-sys-profile');
+        if (window.stashGamePlayersModalForProfile() && profileModal) profileModal.dataset.returnToGamePlayers = 'true';
+        if (typeof openProfileModal === 'function') openProfileModal(name);
     };
 
     window.openGamePlayerChat = function(name) {
@@ -63943,6 +64018,10 @@ function getVisibleChatStackEl(id) {
 						onlineModal.style.pointerEvents = '';
 					}
 				}
+				if (modalId === 'modal-sys-profile' && modal.dataset.returnToGamePlayers === "true") {
+					modal.dataset.returnToGamePlayers = "false";
+					if (typeof window.restoreGamePlayersModalAfterProfile === 'function') window.restoreGamePlayersModalAfterProfile();
+				}
 				
 			}, 300);
 		}
@@ -64714,6 +64793,10 @@ function getVisibleChatStackEl(id) {
 		const modal = document.getElementById('modal-sys-list');
 		const body = document.getElementById('list-modal-body');
 		const titleEl = document.getElementById('list-modal-title');
+		if (modal) {
+			modal.style.opacity = '';
+			modal.style.pointerEvents = '';
+		}
 
 		if (window.__activeProfileListRequest && window.__activeProfileListRequest.timeoutId) {
 			clearTimeout(window.__activeProfileListRequest.timeoutId);
