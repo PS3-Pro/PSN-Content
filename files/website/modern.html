@@ -24868,7 +24868,7 @@ P
             const ps3 = onlineRecord.ps3Status && typeof onlineRecord.ps3Status === 'object' ? onlineRecord.ps3Status : null;
             source.playingNow = !!(source.online && ps3 && ps3.status === 'playing' && normalizeGamePlayersTitleId(ps3.titleId || ps3.id || ps3.title) === titleId);
         }
-        if (typeof getResolvedUserAvatar === 'function') source.avatar = getResolvedUserAvatar(name, source.avatar || '');
+        if (typeof getResolvedUserAvatar === 'function') source.avatar = getResolvedUserAvatar(name, source.avatar || '', { preferredAvatarIsFresh: true });
         if (typeof window.syncPsnUserMeta === 'function') window.syncPsnUserMeta(source);
         return source;
     }
@@ -25042,7 +25042,7 @@ P
                 .map(owner => getFreshGamePlayer(owner, titleId))
                 .filter(Boolean)
                 .slice(0, 3);
-            const avatarsHtml = preview.map(owner => `<img class="game-player-owner-avatar" src="${escapeGamePlayersHtml(owner.avatar || '')}" alt="${escapeGamePlayersHtml(owner.name || '')}">`).join('');
+            const avatarsHtml = preview.map(owner => `<img class="game-player-owner-avatar" data-user="${escapeGamePlayersHtml(owner.name || '')}" src="${escapeGamePlayersHtml(owner.avatar || '')}" alt="${escapeGamePlayersHtml(owner.name || '')}">`).join('');
             const copy = count === 1 ? '1 player has this game' : `${count} players have this game`;
             const remaining = Math.max(0, count - preview.length);
             const moreHtml = remaining ? `<span class="game-player-owners-more">+${remaining}</span>` : '';
@@ -29108,7 +29108,7 @@ P
 						<div class="admin-user-row online-user-item${rowClass}" style="--tile-idx:${idx % 50};">
 							<div class="admin-user-main" onclick="adminOpenUserProfile('${encodedName}')">
 								<div class="admin-user-avatar-wrap">
-									<img src="${adminEscapeHtml(avatar)}" class="online-user-avatar" alt="" loading="lazy" decoding="async" style="border-color: ${avatarBorder}; border-width: 2px; border-style: solid;">
+									<img src="${adminEscapeHtml(avatar)}" class="online-user-avatar" data-user="${safeName}" alt="" loading="lazy" decoding="async" style="border-color: ${avatarBorder}; border-width: 2px; border-style: solid;">
 									<div class="admin-user-level-badge"><i class="fas fa-star"></i><span>${level}</span></div>
 								</div>
 								<div class="admin-user-info online-user-info">
@@ -31759,12 +31759,17 @@ P
 		const avatar = typeof user.avatar === 'string' ? user.avatar.trim() : '';
 		if (avatar) {
 			const storedAvatar = localStorage.getItem(`${name}_psn_avatar`) || '';
-			if (storedAvatar !== avatar) {
-				safeLocalStorageSet(`${name}_psn_avatar`, avatar);
-				document.querySelectorAll('.chat-avatar-status[data-user]').forEach(img => {
-					if (img.getAttribute('data-user') === name && img.src !== avatar) img.src = avatar;
-				});
+			if (storedAvatar !== avatar) safeLocalStorageSet(`${name}_psn_avatar`, avatar);
+			if (Array.isArray(window.friendsList)) {
+				const friend = window.friendsList.find(entry => String(entry && (entry.name || entry) || '') === name);
+				if (friend && typeof friend === 'object' && friend.avatar !== avatar) {
+					friend.avatar = avatar;
+					if (typeof saveState === 'function' && typeof STORAGE_KEY_FRIENDS !== 'undefined') saveState(STORAGE_KEY_FRIENDS, JSON.stringify(window.friendsList));
+				}
 			}
+			document.querySelectorAll('img[data-user]').forEach(img => {
+				if (img.getAttribute('data-user') === name && img.src !== avatar) img.src = avatar;
+			});
 		}
 		const incomingLevel = Number(user.level);
 		if (Number.isFinite(incomingLevel) && incomingLevel > 0) safeLocalStorageSet(`${name}_psn_level`, String(incomingLevel));
@@ -53370,7 +53375,12 @@ function getVisibleChatStackEl(id) {
 				);
 			}
 
-			if (userData.avatar) { safeLocalStorageSet(`${name}_psn_avatar`, userData.avatar); const sidebarAvatar = document.querySelector('.user-avatar'); if (sidebarAvatar) sidebarAvatar.style.backgroundImage = `url('${userData.avatar}')`; }
+			if (userData.avatar) {
+				if (typeof window.syncPsnUserMeta === 'function') window.syncPsnUserMeta({ name, avatar: userData.avatar, profileUpdatedAt: incomingProfileUpdatedAt || 0 });
+				else safeLocalStorageSet(`${name}_psn_avatar`, userData.avatar);
+				const sidebarAvatar = document.querySelector('.user-avatar');
+				if (sidebarAvatar) sidebarAvatar.style.backgroundImage = `url('${userData.avatar}')`;
+			}
 			if (userData.joined) safeLocalStorageSet(`${name}_joined_date`, userData.joined);
 			const incomingCountryCode = normalizeProfileCountryCode(userData.countryCode || userData.country_code || userData.country || payload.countryCode || payload.country_code || payload.country);
 			if (incomingCountryCode) {
@@ -59310,7 +59320,7 @@ function getVisibleChatStackEl(id) {
 			<div style="display: flex; align-items: center; gap: 12px; flex: 1; cursor: pointer;" 
 					onmouseenter="if(typeof playUiHover === 'function') playUiHover()" 
 					onclick="if(typeof playUiClick === 'function') playUiClick(); openProfileModal('${encodeURIComponent(username)}')">
-				<img src="${userAvatar}" class="online-user-avatar" style="border-color: ${avatarBorder}; border-width: 2px; border-style: solid;">
+				<img src="${userAvatar}" class="online-user-avatar" data-user="${username}" style="border-color: ${avatarBorder}; border-width: 2px; border-style: solid;">
 				<div class="online-user-info">
 					<span class="online-user-name" style="${isMe ? 'color: #0070cc; font-weight: 900;' : (isTargetAdmin ? 'color: #ff4444; font-weight: bold;' : 'color: #fff;')}">
 						${username}${isMe ? ' <span style="font-size:10px; opacity: 0.8; margin-left: 3px;">(You)</span>' : ''}${inlineNameRoleHtml}
@@ -59451,7 +59461,7 @@ function getVisibleChatStackEl(id) {
 
 		let itemsHtml = `<div class="seen-by-title">Seen by: ${users.length}</div>`;
 		users.forEach(user => {
-			const avatar = localStorage.getItem(`${user}_psn_avatar`) || "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/main/resources/interface/modern/images/avatars/default.png";
+			const avatar = (typeof getResolvedUserAvatar === 'function') ? getResolvedUserAvatar(user) : (localStorage.getItem(`${user}_psn_avatar`) || "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/main/resources/interface/modern/images/avatars/default.png");
 			const seenDateValue = seenAtMap[user];
 			const encodedUser = encodeURIComponent(user);
 			let seenTime = "";
@@ -59467,7 +59477,7 @@ function getVisibleChatStackEl(id) {
 			}
 			itemsHtml += `
 				<div class="seen-user-item" data-seen-user="${encodedUser}">
-					<img src="${avatar}" class="seen-user-avatar">
+					<img src="${avatar}" class="seen-user-avatar" data-user="${escapeRealtimeFeedHtml(user)}">
 					<div style="min-width:0; flex:1; display:flex; flex-direction:column; gap:2px;">
 						<span class="seen-user-name">${user}</span>
 						${seenTime ? `<span style="font-size:9px; color:rgba(255,255,255,.48); line-height:1;">Seen ${seenTime}</span>` : ''}
@@ -59854,10 +59864,10 @@ function getVisibleChatStackEl(id) {
 				votersHtml += `<div style="font-size: 10px; font-weight: bold; color: var(--ps-blue); text-transform: uppercase; margin-bottom: 5px; margin-top: 10px; padding-bottom: 3px; border-bottom: 1px solid rgba(255,255,255,0.05); display: flex; justify-content: space-between; align-items: center;"><span>${opt.text}</span> <span style="color:#888; font-size:9px;">(${opt.voters.length})</span></div>`;
 				
 				opt.voters.forEach(voter => {
-					const avatar = localStorage.getItem(`${voter}_psn_avatar`) || "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/main/resources/interface/modern/images/avatars/default.png";
+					const avatar = (typeof getResolvedUserAvatar === 'function') ? getResolvedUserAvatar(voter) : (localStorage.getItem(`${voter}_psn_avatar`) || "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/main/resources/interface/modern/images/avatars/default.png");
 					votersHtml += `
 						<div onclick="openProfileModal('${voter}')" style="cursor:pointer; display: flex; align-items: center; justify-content: flex-start; gap: 10px; padding: 6px 10px; background: rgba(255,255,255,0.02); border-radius: 6px; margin-bottom: 4px; transition: 0.2s;" onmouseenter="this.style.background='rgba(255,255,255,0.08)'" onmouseleave="this.style.background='rgba(255,255,255,0.02)'">
-							<img src="${avatar}" style="width: 24px; height: 24px; border-radius: 50%; object-fit: cover; border: 1px solid rgba(255,255,255,0.1); flex-shrink: 0; margin: 0 !important; display: block !important;">
+							<img src="${avatar}" data-user="${typeof escapeRealtimeFeedHtml === 'function' ? escapeRealtimeFeedHtml(voter) : voter}" style="width: 24px; height: 24px; border-radius: 50%; object-fit: cover; border: 1px solid rgba(255,255,255,0.1); flex-shrink: 0; margin: 0 !important; display: block !important;">
 							<span style="font-size: 11px; color: #fff; font-weight: 500; text-align: left;">${voter}</span>
 						</div>`;
 				});
@@ -60815,7 +60825,7 @@ function getVisibleChatStackEl(id) {
 			'<div class="notification-swipe-action" aria-hidden="false"><button type="button" class="notification-swipe-delete friend-activity-swipe-delete" data-keyboard-nav="off" aria-label="Delete activity" title="Delete activity"><i class="fas fa-trash-alt"></i><span>Delete</span></button></div>' +
 			'<div class="notification-swipe-content">' +
 			'<div class="friend-activity-item ' + p.cls + (isActionable ? ' is-actionable' : '') + (extraClass ? ' ' + extraClass : '') + '" data-activity-id="' + safeId + '" data-activity-day="' + escapeRealtimeFeedHtml(day) + '" style="--tile-idx:' + (index % 30) + '" onmouseenter="if(typeof playUiHover===\'function\') playUiHover()"' + (isActionable ? ' onclick="openFriendActivityItem(\'' + escapeRealtimeFeedHtml(item.id) + '\')"' : '') + '>' +
-			'<div class="friend-activity-avatar-wrap"><img class="friend-activity-avatar" src="' + escapeRealtimeFeedHtml(avatar) + '" alt="" onclick="event.stopPropagation(); if(typeof playUiClick===\'function\') playUiClick(); openProfileModal(decodeURIComponent(\'' + encodedActor + '\'))"><span class="friend-activity-badge"><i class="fas ' + p.icon + '"></i></span></div>' +
+			'<div class="friend-activity-avatar-wrap"><img class="friend-activity-avatar" data-user="' + escapeRealtimeFeedHtml(item.actor) + '" src="' + escapeRealtimeFeedHtml(avatar) + '" alt="" onclick="event.stopPropagation(); if(typeof playUiClick===\'function\') playUiClick(); openProfileModal(decodeURIComponent(\'' + encodedActor + '\'))"><span class="friend-activity-badge"><i class="fas ' + p.icon + '"></i></span></div>' +
 			'<div class="friend-activity-main"><div><a class="friend-activity-user" onclick="event.stopPropagation(); if(typeof playUiClick===\'function\') playUiClick(); openProfileModal(decodeURIComponent(\'' + encodedActor + '\'))">' + escapeRealtimeFeedHtml(item.actor) + '</a> ' + actionHtml + '</div>' + metaHtml + '</div>' +
 			'<div class="friend-activity-time" title="' + escapeRealtimeFeedHtml(new Date(item.createdAt).toLocaleString()) + '">' + escapeRealtimeFeedHtml(realtimeFeedTimeLabel(item.createdAt)) + '</div></div></div></div>';
 	}
@@ -61914,7 +61924,7 @@ function getVisibleChatStackEl(id) {
 		return '<div class="notification-swipe-row" data-notification-id="' + escapeRealtimeFeedHtml(item.id) + '" data-notification-day="' + escapeRealtimeFeedHtml(day) + '">' +
 			'<div class="notification-swipe-action" aria-hidden="false"><button type="button" class="notification-swipe-delete" data-keyboard-nav="off" title="Delete notification" aria-label="Delete notification"><i class="fas fa-trash-alt"></i><span>Delete</span></button></div>' +
 			'<div class="notification-swipe-content"><div class="user-notification-item ' + p.cls + (isUnread ? ' is-unread' : '') + (extraClass ? ' ' + extraClass : '') + '" style="--tile-idx:' + (index % 30) + '" onmouseenter="if(!this.classList.contains(\'is-message-deleted\') && !this.closest(\'.notification-swipe-row\')?.classList.contains(\'is-open\') && !this.closest(\'.notification-swipe-row\')?.classList.contains(\'is-swiping\') && typeof playUiHover===\'function\') playUiHover()">' +
-			'<div class="user-notification-avatar-wrap"><img class="user-notification-avatar" src="' + escapeRealtimeFeedHtml(avatar) + '" alt=""' + profileAttr + '><span class="user-notification-badge"><i class="fas ' + p.badgeIcon + '"></i></span></div>' +
+			'<div class="user-notification-avatar-wrap"><img class="user-notification-avatar" data-user="' + escapeRealtimeFeedHtml(actor) + '" src="' + escapeRealtimeFeedHtml(avatar) + '" alt=""' + profileAttr + '><span class="user-notification-badge"><i class="fas ' + p.badgeIcon + '"></i></span></div>' +
 			'<div class="user-notification-main"><div class="user-notification-title">' + titleHtml + '</div>' + (p.preview ? '<div class="user-notification-preview">' + escapeRealtimeFeedHtml(p.preview) + '</div>' : '') + metaHtml + '</div>' +
 			sideHtml + (isUnread ? '<span class="user-notification-unread-dot"></span>' : '') + '</div></div></div>';
 	}
@@ -63111,18 +63121,22 @@ function getVisibleChatStackEl(id) {
 		const searchUser = lookupContext && lookupContext.globalSearchByName instanceof Map
 			? (lookupContext.globalSearchByName.get(name) || null)
 			: (window.globalSearchResults ? window.globalSearchResults.find(u => (u.name || u) === name) : null);
+		const adminUser = Array.isArray(window.adminAllUsers) ? window.adminAllUsers.find(u => (u.name || u) === name) : null;
 		const friendData = lookupContext && lookupContext.friendByName instanceof Map
 			? (lookupContext.friendByName.get(name) || null)
 			: (window.friendsList ? window.friendsList.find(f => (f.name || f) === name) : null);
 		const savedAvatar = localStorage.getItem(`${name}_psn_avatar`);
 		const firstAvatar = (typeof AVAILABLE_AVATARS !== 'undefined' && AVAILABLE_AVATARS[0]) ? AVAILABLE_AVATARS[0] : DEFAULT_AVATAR;
+		const freshPreferred = !!(lookupContext && lookupContext.preferredAvatarIsFresh);
 
 		return [
 			netUser?.avatar,
 			searchUser?.avatar,
+			adminUser?.avatar,
+			freshPreferred ? preferredAvatar : '',
 			savedAvatar,
 			friendData?.avatar,
-			preferredAvatar,
+			freshPreferred ? '' : preferredAvatar,
 			firstAvatar,
 			DEFAULT_AVATAR
 		].find(src => typeof src === 'string' && src.trim() !== '') || DEFAULT_AVATAR;
@@ -63633,7 +63647,7 @@ function getVisibleChatStackEl(id) {
 				onclick="if(typeof playUiClick === 'function') playUiClick(); openProfileModal('${encodeURIComponent(name)}')">
 				
 				<div class="friend-avatar-level-wrap">
-					<img src="${avatar}" class="online-user-avatar" style="border-color: ${finalAvatarBorder}; border-width: 2px; border-style: solid;">
+					<img src="${avatar}" class="online-user-avatar" data-user="${name}" style="border-color: ${finalAvatarBorder}; border-width: 2px; border-style: solid;">
 					<div class="friend-level-badge">
 						<i class="fas fa-star"></i>
 						<span>${playerLevel}</span>
@@ -64089,7 +64103,8 @@ function getVisibleChatStackEl(id) {
 			}
 		}
 		const profileMeta = { ...(friendUser || {}), ...(adminUser || {}), ...(searchUser || {}), ...(networkUser || {}) };
-		if (!isMe && Object.keys(profileMeta).length && typeof window.syncPsnUserMeta === 'function') {
+		const hasFreshProfileMeta = !!(networkUser || adminUser || searchUser);
+		if (!isMe && hasFreshProfileMeta && typeof window.syncPsnUserMeta === 'function') {
 			window.syncPsnUserMeta({ name: username, ...profileMeta });
 		}
 		const cachedLastSeen = Number(localStorage.getItem(`${username}_psn_lastSeen`)) || 0;
@@ -64101,8 +64116,9 @@ function getVisibleChatStackEl(id) {
 		const isTargetAdmin = (networkUser && networkUser.isAdmin === true) || profileRole === 'admin' || (localStorage.getItem(`${username}_psn_isAdmin`) === 'true');
 		const isTargetBanned = typeof window.isPsnUserBanned === 'function' ? window.isPsnUserBanned(username, roleSource) : ((roleSource && roleSource.isBanned === true) || profileRole === 'banned' || (localStorage.getItem(`${username}_psn_isBanned`) === 'true'));
         const adminTagHtml = typeof window.buildPsnRoleBadge === 'function' ? window.buildPsnRoleBadge(username, roleSource, 'profile') : (isTargetAdmin ? ` <span style="color:#ff4444; font-size:12px; font-weight:bold; font-style: italic; text-shadow: 0 0 8px rgba(255, 68, 68, 0.4); margin-left: 5px;">(Admin)</span>` : '');
-		const cachedAvatar = localStorage.getItem(`${username}_psn_avatar`) || '';
-		const avatarUrl = cachedAvatar || ((typeof getResolvedUserAvatar === 'function') ? getResolvedUserAvatar(username, profileMeta.avatar) : (profileMeta.avatar || (isMe ? AVAILABLE_AVATARS[0] : "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/main/resources/interface/modern/images/avatars/default.png")));
+		const avatarUrl = (typeof getResolvedUserAvatar === 'function')
+			? getResolvedUserAvatar(username, profileMeta.avatar || '', { preferredAvatarIsFresh: hasFreshProfileMeta })
+			: (profileMeta.avatar || localStorage.getItem(`${username}_psn_avatar`) || (isMe ? AVAILABLE_AVATARS[0] : "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/main/resources/interface/modern/images/avatars/default.png"));
 		const joinedDate = profileMeta.joined || localStorage.getItem(`${username}_psn_joined`) || (isMe ? (localStorage.getItem(`${myName}_joined_date`) || "2026") : "---");
 		
 		const isFriend = window.friendsList && window.friendsList.some(f => f.name === username);
@@ -64112,7 +64128,8 @@ function getVisibleChatStackEl(id) {
 		}
 		
 		document.getElementById('card-username').innerHTML = `<span id="profile-name-val" data-no-translate="true" translate="no">${username}</span>${adminTagHtml} ${friendIconHtml}`;
-		document.getElementById('card-avatar').src = avatarUrl;
+		const profileAvatarImg = document.getElementById('card-avatar');
+		if (profileAvatarImg) { profileAvatarImg.src = avatarUrl; profileAvatarImg.dataset.user = username; }
 		
 		const avatarContainer = document.getElementById('profile-avatar-container');
 		if (avatarContainer) {
