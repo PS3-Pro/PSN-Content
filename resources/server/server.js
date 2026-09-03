@@ -1108,22 +1108,6 @@ async function initDb() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       PRIMARY KEY (user_name, event_key)
     );
-    DO $$
-    BEGIN
-      IF to_regclass('public.user_game_looking_to_play') IS NOT NULL THEN
-        INSERT INTO user_game_looking_for_group (user_name, title_id, title, created_at)
-        SELECT user_name, title_id, title, created_at FROM user_game_looking_to_play
-        ON CONFLICT (user_name, title_id) DO NOTHING;
-        DROP TABLE user_game_looking_to_play;
-      END IF;
-    END $$;
-    UPDATE user_notifications
-    SET event_type = 'lfg',
-        dedupe_key = CASE
-          WHEN dedupe_key IS NULL THEN NULL
-          ELSE REPLACE(dedupe_key, ':notification:play-interest:', ':notification:lfg:')
-        END
-    WHERE event_type = 'play_interest';
   `);
 
   await queryDbWithRetry(
