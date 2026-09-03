@@ -3,7 +3,6 @@ name: Update Server Dependencies
 on:
   schedule:
     # 04:00 UTC = 01:00 America/Sao_Paulo
-    # Kept after the existing database/avatar jobs to reduce push conflicts.
     - cron: '0 4 * * *'
   workflow_dispatch:
 
@@ -18,6 +17,10 @@ jobs:
   update-server-dependencies:
     runs-on: ubuntu-latest
 
+    defaults:
+      run:
+        working-directory: resources/server
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -31,35 +34,33 @@ jobs:
           cache: 'npm'
           cache-dependency-path: 'resources/server/package-lock.json'
 
-      - name: Validate current server dependencies
-        working-directory: resources/server
+      - name: Validate current server
         run: |
           npm ci --omit=dev
           node --check server.js
 
-      - name: Apply safe security updates
-        working-directory: resources/server
-        shell: bash
+      - name: Update compatible dependencies
         run: |
-          echo "=== Audit before update ==="
-          npm audit --omit=dev || true
+          npm update --package-lock-only --omit=dev
 
-          echo "=== Applying SemVer-compatible security fixes ==="
-          npm audit fix --package-lock-only --omit=dev || true
+      - name: Apply compatible security fixes
+        continue-on-error: true
+        run: |
+          npm audit fix --package-lock-only --omit=dev
 
-      - name: Validate updated lockfile
-        working-directory: resources/server
+      - name: Validate updated dependency tree
         run: |
           rm -rf node_modules
           npm ci --omit=dev
           node --check server.js
 
-      - name: Show final security audit
-        working-directory: resources/server
-        continue-on-error: true
-        run: npm audit --omit=dev
+      - name: Show dependency changes
+        run: |
+          npm outdated || true
+          npm audit --omit=dev || true
 
-      - name: Commit and push safe dependency updates
+      - name: Commit and push dependency updates
+        working-directory: .
         shell: bash
         run: |
           git config --global user.name "PS3-Pro Bot"
@@ -69,11 +70,12 @@ jobs:
 
           if git diff --cached --quiet; then
             echo "Server dependencies are already up to date."
-            exit 0
+          else
+            git commit -m "Auto-update: Server dependencies"
+            git pull --rebase origin main
+            git push origin main
           fi
 
-          git commit -m "Auto-update: Server security dependencies"
-
-          # Another scheduled workflow may have pushed while this job was running.
-          git pull --rebase origin main
-          git push origin main
+      - name: Fail if vulnerabilities still remain
+        run: |
+          npm audit --omit=dev --audit-level=low
