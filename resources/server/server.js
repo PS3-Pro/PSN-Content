@@ -3611,6 +3611,27 @@ async function getLookingForGroupDiscoveryForUser(userName, rawAudience) {
   }).filter(item => item.titleId && (audience === 'friends' ? item.friends.length > 0 : item.playerCount > 0));
 }
 
+
+async function getLookingForGroupCommunityTitleIds(userName) {
+  const viewerName = normalizeText(userName, '');
+  if (!viewerName) return [];
+
+  await ensureGameOwnershipIndexReady();
+  const result = await queryDbWithRetry(
+    `SELECT DISTINCT interest.title_id
+     FROM user_game_looking_for_group interest
+     JOIN user_game_ownership ownership
+       ON ownership.user_name = interest.user_name AND ownership.title_id = interest.title_id
+     WHERE interest.user_name <> $1
+       AND (ownership.in_library = TRUE OR ownership.downloaded = TRUE)
+     ORDER BY interest.title_id ASC`,
+    [viewerName],
+    { attempts: 2, label: 'LOOKING FOR GROUP COMMUNITY GAME IDS' }
+  );
+
+  return (result.rows || []).map(row => normalizeGamePlayersTitleId(row.title_id)).filter(Boolean);
+}
+
 function getSharedGameRecipientMatchType(row = {}) {
   if (row.in_library === true && row.downloaded === true) return 'owned';
   if (row.in_library === true) return 'library';
@@ -8337,7 +8358,7 @@ io.on('connection', (socket) => {
     }
 
     const requestedMode = normalizeText(data && data.mode, '').toLowerCase();
-    const mode = requestedMode === 'mine' ? 'mine' : (requestedMode === 'friends' ? 'friends' : (requestedMode === 'others' ? 'others' : (requestedMode === 'list' ? 'list' : (requestedMode === 'lfg' ? 'lfg' : 'summary'))));
+    const mode = requestedMode === 'mine' ? 'mine' : (requestedMode === 'friends' ? 'friends' : (requestedMode === 'others' ? 'others' : (requestedMode === 'community' ? 'community' : (requestedMode === 'list' ? 'list' : (requestedMode === 'lfg' ? 'lfg' : 'summary')))));
     let titleId = '';
     try {
       if (mode === 'mine') {
@@ -8352,6 +8373,14 @@ io.on('connection', (socket) => {
         const titleIds = (result.rows || []).map(row => normalizeGamePlayersTitleId(row.title_id)).filter(Boolean);
         const payload = { ok: true, mode, titleIds };
         trackBandwidthPayload('game_players_lfg_mine', payload, 1);
+        respond(payload);
+        return;
+      }
+
+      if (mode === 'community') {
+        const titleIds = await getLookingForGroupCommunityTitleIds(name);
+        const payload = { ok: true, mode, titleIds };
+        trackBandwidthPayload('game_players_lfg_community', payload, 1);
         respond(payload);
         return;
       }
