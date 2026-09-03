@@ -27,65 +27,135 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Update Node 24 pin
+      - name: Detect latest official Node.js LTS
+        id: node_lts
         shell: bash
         run: |
           set -euo pipefail
 
-          LATEST_NODE_24="$(
-            curl -fsSL https://nodejs.org/dist/index.json             | jq -r '.[].version | select(startswith("v24.")) | ltrimstr("v")'             | sort -V             | tail -n 1
+          NODE_INDEX="$(curl -fsSL https://nodejs.org/dist/index.json)"
+
+          # Node's index is newest-first. Only releases whose "lts" field is set
+          # are considered eligible for automatic major upgrades.
+          LATEST_LTS="$(
+            printf '%s' "$NODE_INDEX" \
+            | jq -r '[.[] | select(.lts != false and .lts != null)][0].version | ltrimstr("v")'
           )"
 
-          if [ -z "$LATEST_NODE_24" ]; then
-            echo "Could not determine latest Node 24 release."
+          if [ -z "$LATEST_LTS" ] || [ "$LATEST_LTS" = "null" ]; then
+            echo "Could not determine latest official Node.js LTS."
             exit 1
           fi
 
+          LTS_MAJOR="${LATEST_LTS%%.*}"
+          NEXT_MAJOR="$((LTS_MAJOR + 1))"
           CURRENT_NODE="$(tr -d '[:space:]' < .node-version)"
+          CURRENT_MAJOR="${CURRENT_NODE%%.*}"
 
-          echo "Current Node: $CURRENT_NODE"
-          echo "Latest Node 24: $LATEST_NODE_24"
+          echo "Current pinned Node: $CURRENT_NODE"
+          echo "Latest official LTS: $LATEST_LTS"
 
-          if [ "$CURRENT_NODE" != "$LATEST_NODE_24" ]; then
-            printf '%s\n' "$LATEST_NODE_24" > .node-version
-            echo "Updated .node-version to $LATEST_NODE_24"
+          if [ "$CURRENT_MAJOR" != "$LTS_MAJOR" ]; then
+            echo "Candidate LTS major upgrade: Node $CURRENT_MAJOR -> Node $LTS_MAJOR"
+          elif [ "$CURRENT_NODE" != "$LATEST_LTS" ]; then
+            echo "Candidate LTS patch/minor update: $CURRENT_NODE -> $LATEST_LTS"
           else
-            echo "Node 24 is already current."
+            echo "Node.js LTS pin is already current."
           fi
 
-      - name: Set up Node.js
+          echo "version=$LATEST_LTS" >> "$GITHUB_OUTPUT"
+          echo "major=$LTS_MAJOR" >> "$GITHUB_OUTPUT"
+          echo "next_major=$NEXT_MAJOR" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare candidate Node.js LTS update
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          NODE_VERSION="${{ steps.node_lts.outputs.version }}"
+          NODE_MAJOR="${{ steps.node_lts.outputs.major }}"
+          NEXT_MAJOR="${{ steps.node_lts.outputs.next_major }}"
+
+          printf '%s\n' "$NODE_VERSION" > .node-version
+          npm pkg set "engines.node=>=${NODE_MAJOR} <${NEXT_MAJOR}"
+
+          if [ -f Dockerfile ]; then
+            sed -E -i "1s|^FROM node:[^ ]+|FROM node:${NODE_MAJOR}-slim|" Dockerfile
+          fi
+
+          echo "Candidate .node-version: $(cat .node-version)"
+          echo "Candidate engine: $(node -p "require('./package.json').engines.node")"
+          head -n 1 Dockerfile 2>/dev/null || true
+
+      - name: Set up candidate Node.js LTS
         uses: actions/setup-node@v7
         with:
           node-version-file: 'resources/server/.node-version'
+          check-latest: true
           cache: 'npm'
           cache-dependency-path: 'resources/server/package-lock.json'
 
-      - name: Validate current server
+      - name: Sync candidate lockfile
         run: |
-          npm ci --omit=dev
-          node --check server.js
+          set -euo pipefail
+          npm install --package-lock-only --omit=dev
 
-      - name: Update compatible dependencies
+      - name: Update compatible npm dependencies
         run: |
+          set -euo pipefail
           npm update --package-lock-only --omit=dev
+          npm audit fix --package-lock-only --omit=dev || true
 
-      - name: Apply compatible security fixes
-        continue-on-error: true
+      - name: Clean-install candidate tree
         run: |
-          npm audit fix --package-lock-only --omit=dev
-
-      - name: Validate updated dependency tree
-        run: |
+          set -euo pipefail
           rm -rf node_modules
           npm ci --omit=dev
+
+      - name: Validate dependency tree
+        run: |
+          set -euo pipefail
+          npm ls --omit=dev
+
+      - name: Validate server syntax
+        run: |
+          set -euo pipefail
           node --check server.js
 
-      - name: Show dependency status
+      - name: Runtime compatibility smoke test
         run: |
-          npm outdated || true
-          npm audit --omit=dev || true
+          set -euo pipefail
+          node <<'NODE'
+          const bcrypt = require('bcrypt');
+          require('express');
+          require('pg');
+          require('socket.io');
 
-      - name: Commit and push safe updates
+          const password = 'psn-server-runtime-smoke-test';
+          const hash = bcrypt.hashSync(password, 4);
+
+          if (!bcrypt.compareSync(password, hash)) {
+            throw new Error('bcrypt runtime smoke test failed');
+          }
+
+          console.log('Runtime smoke test OK');
+          console.log('Node:', process.version);
+          NODE
+
+      - name: Security audit candidate
+        run: |
+          set -euo pipefail
+          npm audit --omit=dev --audit-level=low
+
+      - name: Show final candidate status
+        run: |
+          node --version
+          npm --version
+          npm outdated || true
+
+      # This step is reached only if install, dependency-tree, syntax,
+      # native-module smoke test and security audit all passed.
+      - name: Commit and push validated update
         working-directory: .
         shell: bash
         run: |
@@ -94,17 +164,17 @@ jobs:
           git config --global user.name "PS3-Pro Bot"
           git config --global user.email "bot@ps3pro.com"
 
-          git add             resources/server/.node-version             resources/server/package.json             resources/server/package-lock.json
+          git add \
+            resources/server/.node-version \
+            resources/server/package.json \
+            resources/server/package-lock.json \
+            resources/server/Dockerfile
 
           if git diff --cached --quiet; then
             echo "Server runtime and dependencies are already up to date."
             exit 0
           fi
 
-          git commit -m "Auto-update: Server runtime and dependencies"
+          git commit -m "Auto-update: Validated server LTS runtime and dependencies"
           git pull --rebase origin main
           git push origin main
-
-      - name: Fail if vulnerabilities remain
-        run: |
-          npm audit --omit=dev --audit-level=low
