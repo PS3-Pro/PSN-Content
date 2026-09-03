@@ -2762,6 +2762,7 @@ body.chat-selection-mode .chat-message-actions .chat-delete-action:not(.chat-del
 .download-item.anim-reveal { opacity: 0; animation: downloadDrop .5s cubic-bezier(.175,.885,.32,1.275) both; animation-delay: calc(var(--tile-idx,0)*.05s); }
 .guide-anim-reveal { opacity: 0; animation: guideRevealPop .5s cubic-bezier(.175,.885,.32,1.275) both; animation-delay: calc(var(--tile-idx,0)*.08s); }
 .online-user-item.anim-reveal { opacity: 0; animation: friendPopReveal .4s cubic-bezier(.175,.885,.32,1.275) both; animation-delay: calc(var(--tile-idx,0)*.04s); }
+#subview-friends.friends-reveal-prep #friends-list-grid .online-user-item:not(.anim-reveal) { opacity: 0 !important; }
 .friend-activity-item.anim-reveal { opacity:0; animation:friendPopReveal .36s cubic-bezier(.2,.8,.2,1) backwards; animation-delay:calc(var(--tile-idx,0)*.025s); }
 .user-notification-item.anim-reveal { opacity:0; animation:friendPopReveal .34s cubic-bezier(.2,.8,.2,1) backwards; animation-delay:calc(var(--tile-idx,0)*.022s); }
 #friends-list-grid .online-user-item.friend-removing { pointer-events: none !important; animation: friendRemoveItem .78s cubic-bezier(.22,.61,.36,1) forwards !important; transform-origin: center center; will-change: transform,opacity,filter; z-index: 20; }
@@ -12983,7 +12984,7 @@ P
         } catch (e) { console.error("Erro no Sync:", e); }
         
         if (typeof psnMarkTrophyViewsDirty === 'function') psnMarkTrophyViewsDirty();
-        if (window.renderTrophiesView && typeof psnIsViewVisible === 'function' && psnIsViewVisible('view-trophies')) window.renderTrophiesView(true);
+        if (typeof window.refreshTrophiesWithMotion === 'function' && typeof psnIsViewVisible === 'function' && psnIsViewVisible('view-trophies')) window.refreshTrophiesWithMotion({ revealNew:false });
         if (typeof window.refreshWishlistSummaryUI === 'function') window.refreshWishlistSummaryUI();
         if (typeof window.refreshDownloadSummaryUI === 'function') window.refreshDownloadSummaryUI();
         if (typeof window.refreshFavoritesSummaryUI === 'function') window.refreshFavoritesSummaryUI();
@@ -20050,6 +20051,11 @@ P
 		const searchInput = document.getElementById('search-input');
 		if (parentView) parentView.style.overflow = section === 'chat' ? 'hidden' : 'visible';
 
+		if (section !== 'friends' && friendsView) {
+			window.__friendsEntryRevealToken = (Number(window.__friendsEntryRevealToken) || 0) + 1;
+			friendsView.classList.remove('friends-reveal-prep');
+		}
+
 		if (section !== 'activity' && activityView && activityView.style.display === 'flex' && typeof window.resetSocialFeedViewState === 'function') {
 			window.resetSocialFeedViewState('activity');
 		}
@@ -20192,7 +20198,18 @@ P
 				activityView.classList.remove('anim-up');
 			}
 			if(playTogetherView) { playTogetherView.style.display = 'none'; playTogetherView.classList.remove('anim-up'); }
+			const friendsGrid = document.getElementById('friends-list-grid');
+			const friendsRevealToken = (window.__friendsEntryRevealToken = (Number(window.__friendsEntryRevealToken) || 0) + 1);
 			if(friendsView) {
+				/* Keep cached cards in the reveal start state on every entry, including
+				   same-signature reentries where renderFriendsList reuses the existing DOM. */
+				friendsView.classList.add('friends-reveal-prep');
+				if (friendsGrid) {
+					friendsGrid.querySelectorAll(':scope > .online-user-item').forEach(card => {
+						if (typeof resetRevealTargetToStatic === 'function') resetRevealTargetToStatic(card, 'anim-reveal');
+						else { card.classList.remove('anim-reveal'); card.classList.add('no-anim'); }
+					});
+				}
 				friendsView.style.display = 'flex';
 				restartEntryAnimationWithoutReflow(friendsView);
 			}
@@ -20213,11 +20230,27 @@ P
 	
 			if (typeof renderFriendsList === 'function') {
 				runViewOpenWork('view-chat', () => {
+					if (window.__friendsEntryRevealToken !== friendsRevealToken) return;
 					if (friendsView && friendsView.style.display === 'flex') {
-						renderFriendsList('');
+						/* Build/reuse the cards silently first, then arm exactly one reveal while
+						   friends-reveal-prep guarantees that no static frame can be painted. */
+						renderFriendsList('', true);
+						if (friendsGrid && typeof setupRevealAnimations === 'function') {
+							setupRevealAnimations(friendsGrid, { selector: ':scope > .online-user-item' });
+						}
 						if (typeof window.refreshFriendsPresenceMetadata === 'function') window.refreshFriendsPresenceMetadata();
 					}
+
+					requestAnimationFrame(() => {
+						requestAnimationFrame(() => {
+							if (window.__friendsEntryRevealToken === friendsRevealToken && friendsView) {
+								friendsView.classList.remove('friends-reveal-prep');
+							}
+						});
+					});
 				});
+			} else if (friendsView) {
+				friendsView.classList.remove('friends-reveal-prep');
 			}
 	
 		} else if (section === 'activity') {
@@ -20263,7 +20296,7 @@ P
 		}
 	}
 
-	window.showSocialSection = function(section) {
+	window.showSocialSection = function(section, _skipSubviewExit = false) {
 		const parentView = document.getElementById('view-chat');
 		const chatView = document.getElementById('subview-chat');
 		const friendsView = document.getElementById('subview-friends');
@@ -20276,10 +20309,71 @@ P
 			return;
 		}
 
-		if (section === 'chat' && chatView && chatView.style.display === 'flex') return;
-		if (section === 'friends' && friendsView && friendsView.style.display === 'flex') return;
-		if (section === 'activity' && activityView && activityView.style.display === 'flex') return;
-		if (section === 'playTogether' && playTogetherView && playTogetherView.style.display === 'flex') return;
+		const targetView = section === 'friends'
+			? friendsView
+			: section === 'activity'
+				? activityView
+				: section === 'playTogether'
+					? playTogetherView
+					: chatView;
+
+		if (targetView && targetView.style.display !== 'none') return;
+
+		const currentSubview = [chatView, friendsView, activityView, playTogetherView].find(el => el && el !== targetView && el.style.display !== 'none');
+		const reduceSocialMotion = !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+		if (!_skipSubviewExit && !window.isRestoringHistory && !reduceSocialMotion && currentSubview) {
+			if (currentSubview.dataset.socialSubviewExiting === '1') return;
+			currentSubview.dataset.socialSubviewExiting = '1';
+			currentSubview.__psnEntryAnimationToken = (Number(currentSubview.__psnEntryAnimationToken) || 0) + 1;
+			currentSubview.classList.remove('anim-up', 'anim-out', 'view-entry-prep');
+
+			let exitFinished = false;
+			let exitFallbackTimer = null;
+			let directExitAnimation = null;
+			const finishSubviewExit = () => {
+				if (exitFinished) return;
+				exitFinished = true;
+				if (exitFallbackTimer) clearTimeout(exitFallbackTimer);
+				currentSubview.removeEventListener('animationend', handleSubviewExitEnd);
+				if (directExitAnimation) {
+					try { directExitAnimation.cancel(); } catch (e) {}
+				}
+				delete currentSubview.dataset.socialSubviewExiting;
+				currentSubview.style.willChange = '';
+				if (!currentSubview.isConnected) return;
+				currentSubview.classList.remove('anim-out');
+				currentSubview.style.display = 'none';
+				window.showSocialSection(section, true);
+			};
+			const handleSubviewExitEnd = event => {
+				if (event.target !== currentSubview) return;
+				finishSubviewExit();
+			};
+
+			/* Global Chat is a heavy composited surface (virtualized messages + backdrop filters).
+			   Drive its exit directly so the transition cannot be swallowed by its render layer. */
+			if (currentSubview === chatView && typeof currentSubview.animate === 'function') {
+				currentSubview.style.willChange = 'transform, opacity, filter';
+				directExitAnimation = currentSubview.animate([
+					{ opacity: 1, transform: 'translateY(0) scale(1)', filter: 'none' },
+					{ opacity: 0, transform: 'translateY(-8px) scale(.985)', filter: 'blur(4px)' }
+				], {
+					duration: 160,
+					easing: 'cubic-bezier(.4,0,1,1)',
+					fill: 'forwards'
+				});
+				directExitAnimation.id = 'psn-social-chat-exit';
+				directExitAnimation.finished.then(finishSubviewExit).catch(() => {});
+				exitFallbackTimer = setTimeout(finishSubviewExit, 220);
+				return;
+			}
+
+			void currentSubview.offsetWidth;
+			currentSubview.classList.add('anim-out');
+			currentSubview.addEventListener('animationend', handleSubviewExitEnd);
+			exitFallbackTimer = setTimeout(finishSubviewExit, 220);
+			return;
+		}
 
 		applySocialSection(section);
 	}
@@ -22903,6 +22997,7 @@ P
 			gridId: 'trophy-grid-container',
 			itemSelector: ':scope > .trophy-card',
 			pendingClass: '',
+			captureAllLayout: true,
 			render: () => {
 				if (typeof window.renderTrophiesView === 'function') window.renderTrophiesView(true, { replayEntry:false });
 			}
@@ -22983,16 +23078,18 @@ P
 		const canAnimate = !document.hidden && !browseMotionReduced() && typeof Element.prototype.animate === 'function';
 		const viewport = canAnimate ? getBrowseMotionViewportRect() : null;
 
-		/* Keep identity for the whole rendered collection, but capture FLIP geometry only
-		   around the real viewport. Offscreen filter changes therefore cannot pull cards
-		   into a long relayout animation, while visible survivors still move smoothly. */
+		/* Keep identity for the whole rendered collection. Most collections capture FLIP
+		   geometry only around the viewport; Trophies captures the full vertical layout
+		   because reversing the order can bring cards from the opposite end of the list. */
 		Array.from(grid.querySelectorAll(config.itemSelector)).forEach((card, index) => {
 			const key = getCollectionFilterMotionCardKey(card);
 			if (!key) return;
 			snapshot.existingKeys.add(key);
 			if (!canAnimate) return;
-			const rect = card.getBoundingClientRect();
-			if (!rect.width || !rect.height || !browseMotionRectVisible(rect, viewport, 48)) return;
+			if (!config.captureAllLayout) {
+				const rect = card.getBoundingClientRect();
+				if (!rect.width || !rect.height || !browseMotionRectVisible(rect, viewport, 48)) return;
+			}
 			snapshot.entries.set(key, {
 				index,
 				layoutLeft: Number(card.offsetLeft) || 0,
@@ -23122,6 +23219,27 @@ P
 		animateCollectionFilterMotion(snapshot);
 		if (options.revealNew !== false) revealCollectionFilterNewCards(snapshot);
 		requestAnimationFrame(() => restoreCollectionFilterScroll(snapshot));
+	};
+
+	window.refreshTrophiesWithMotion = function(options = {}) {
+		const trophyView = document.getElementById('view-trophies');
+		const grid = document.getElementById('trophy-grid-container');
+		const isVisible = !!trophyView && (trophyView.style.display === 'block' || trophyView.style.display === 'flex');
+
+		if (!isVisible) {
+			if (typeof psnMarkTrophyViewsDirty === 'function') psnMarkTrophyViewsDirty();
+			return;
+		}
+
+		const canFlip = grid && grid.dataset.rendered === '1' && typeof window.applyCollectionToolbarFilterChange === 'function';
+		if (canFlip) {
+			window.applyCollectionToolbarFilterChange('trophies', { revealNew: options.revealNew === true });
+			return;
+		}
+
+		if (typeof window.renderTrophiesView === 'function') {
+			window.renderTrophiesView(true, { replayEntry:false, force: options.force === true });
+		}
 	};
 
 	(function setupPremiumCardPointerLight() {
@@ -33513,10 +33631,12 @@ P
 
 	function restartEntryAnimationWithoutReflow(el) {
 		if (!el) return;
+		const entryToken = (Number(el.__psnEntryAnimationToken) || 0) + 1;
+		el.__psnEntryAnimationToken = entryToken;
 		el.classList.remove('anim-up');
 		el.classList.add('view-entry-prep');
 		requestAnimationFrame(() => {
-			if (!el.isConnected) return;
+			if (!el.isConnected || el.__psnEntryAnimationToken !== entryToken) return;
 			el.classList.remove('view-entry-prep');
 			el.classList.add('anim-up');
 		});
@@ -45409,7 +45529,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 		saveState('psn_user_trophies', JSON.stringify(window.userTrophies));
 		if (typeof window.refreshTrophyRewardSidebarCounts === 'function') window.refreshTrophyRewardSidebarCounts();
 		if (typeof psnMarkTrophyViewsDirty === 'function') psnMarkTrophyViewsDirty();
-		if (typeof renderTrophiesView === 'function' && psnIsViewVisible('view-trophies')) renderTrophiesView(false);
+		if (typeof window.refreshTrophiesWithMotion === 'function' && psnIsViewVisible('view-trophies')) window.refreshTrophiesWithMotion({ revealNew:false });
 		if (typeof renderRewardsView === 'function' && psnIsViewVisible('view-rewards')) renderRewardsView();
 		if (!options || options.sync !== false) queueTrophyProfileSync('saveTrophies');
 	}
@@ -45510,7 +45630,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 
 				if (typeof showTrophyPopup === 'function') showTrophyPopup(trophy);
 				
-				renderTrophiesView(true); 
+				if (typeof window.refreshTrophiesWithMotion === 'function') window.refreshTrophiesWithMotion({ revealNew:false }); 
 				
 				saveState('psn_last_trophy_color', TROPHY_COLORS[trophy.type]);
 				
@@ -54385,7 +54505,7 @@ function getVisibleChatStackEl(id) {
 			}
 
 			if (profileSyncChanges.library && typeof updateConsoleLibraryStatusUI === 'function') updateConsoleLibraryStatusUI(window.lastScannedGames || []);
-			if (profileSyncChanges.trophies && typeof renderTrophiesView === 'function' && typeof psnIsViewVisible === 'function' && psnIsViewVisible('view-trophies')) renderTrophiesView(true);
+			if (profileSyncChanges.trophies && typeof window.refreshTrophiesWithMotion === 'function' && typeof psnIsViewVisible === 'function' && psnIsViewVisible('view-trophies')) window.refreshTrophiesWithMotion({ revealNew:false });
 			if (profileSyncChanges.wishlist) {
 				if (typeof window.refreshWishlistSummaryUI === 'function') window.refreshWishlistSummaryUI();
 				if (profileSyncVisibleUiState.wishlist !== true && typeof updateWishlistUI === 'function' && isPsnDomSectionVisible('view-wishlist')) updateWishlistUI(true);
@@ -57371,7 +57491,7 @@ function getVisibleChatStackEl(id) {
 				const currentSort = sortSelect ? sortSelect.value : 'default';
 
 				if (currentSort === 'rarity') {
-					if (typeof renderTrophiesView === 'function') renderTrophiesView(true);
+					if (typeof window.refreshTrophiesWithMotion === 'function') window.refreshTrophiesWithMotion({ revealNew:false });
 				} else {
 					Object.keys(stats).forEach(id => {
 						const card = document.getElementById(`trophy-card-${id}`);
