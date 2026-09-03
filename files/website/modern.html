@@ -5657,14 +5657,15 @@ img { -webkit-user-drag: none !important; user-drag: none !important; }
 				<li id="nav-guides" onmouseenter="playUiHover()" onclick="playUiClick(); switchView('view-guides'); toggleSidebar(true)">
 					<i class="fas fa-book"></i> <span class="interface-compact-label sidebar-press-label" data-sidebar-press-label>Help</span>
 				</li>
-				<li id="nav-admin-footer" class="admin-sidebar-entry" onmouseenter="playUiHover()" onclick="playUiClick(); openAdminPanel('view-admin'); toggleSidebar(true)">
-					<i class="fas fa-shield-alt"></i> <span class="interface-compact-label sidebar-press-label" data-sidebar-press-label>Control Panel</span>
-				</li>
 				<li id="nav-notifications" onmouseenter="playUiHover()" onclick="playUiClick(); switchView('view-notifications'); toggleSidebar(true)">
 					<i class="fas fa-bell"></i> <span class="interface-compact-label sidebar-press-label" data-sidebar-press-label>Notifications</span>
 					<span id="sidebar-count-notifications" class="sidebar-count-pill is-empty" title="0 notifications" style="display:none;">0</span>
 					<span id="notifications-dot" class="notification-dot" title="New notifications"></span>
 				</li>
+				<li id="nav-admin-footer" class="admin-sidebar-entry" onmouseenter="playUiHover()" onclick="playUiClick(); openAdminPanel('view-admin'); toggleSidebar(true)">
+					<i class="fas fa-shield-alt"></i> <span class="interface-compact-label sidebar-press-label" data-sidebar-press-label>Control Panel</span>
+				</li>
+				
 				<li id="nav-settings" onmouseenter="playUiHover()" onclick="playUiClick(); switchView('view-settings'); toggleSidebar(true)">
 					<i class="fas fa-cog"></i> <span class="interface-compact-label sidebar-press-label" data-sidebar-press-label>Settings</span>
 				</li>
@@ -25689,7 +25690,20 @@ P
         return filtered;
     }
 
-    function getRemotePlayTogetherEntries(filter, state) {
+    function getRemotePlayTogetherEntries(filter, state, activeUser = '') {
+        let friendCountsByTitleId = null;
+        if (filter === 'others') {
+            const friendState = getSocialPlayTogetherRemoteState('friends', activeUser);
+            if (friendState && friendState.loaded === true && Array.isArray(friendState.entries)) {
+                friendCountsByTitleId = new Map();
+                friendState.entries.forEach(item => {
+                    const titleId = normalizeGamePlayersTitleId(item && item.titleId);
+                    if (!titleId) return;
+                    const friends = Array.isArray(item && item.friends) ? item.friends.map(name => String(name || '').trim()).filter(Boolean) : [];
+                    if (friends.length) friendCountsByTitleId.set(titleId, friends.length);
+                });
+            }
+        }
         return (Array.isArray(state && state.entries) ? state.entries : [])
             .map(item => {
                 const game = getPlayTogetherGameEntry(item && item.titleId, item && item.title);
@@ -25697,7 +25711,8 @@ P
                     const friends = Array.isArray(item && item.friends) ? item.friends.map(name => String(name || '').trim()).filter(Boolean) : [];
                     return { ...game, friends, playerCount: friends.length, updatedAt: Number(item && item.updatedAt) || 0 };
                 }
-                return { ...game, playerCount: Math.max(0, Number(item && item.playerCount) || 0), updatedAt: Number(item && item.updatedAt) || 0 };
+                const friendCount = friendCountsByTitleId ? Math.max(0, Number(friendCountsByTitleId.get(game.id)) || 0) : 0;
+                return { ...game, playerCount: Math.max(0, Number(item && item.playerCount) || 0), friendCount, updatedAt: Number(item && item.updatedAt) || 0 };
             })
             .filter(item => item.id && item.playerCount > 0);
     }
@@ -25708,6 +25723,7 @@ P
             entry.title,
             entry.contentId,
             Number(entry.playerCount || 0),
+            Number(entry.friendCount || 0),
             Array.isArray(entry.friends) ? entry.friends.join(',') : '',
             Number(entry.updatedAt || 0)
         ].join(':')).join('|');
@@ -25727,7 +25743,7 @@ P
             ? (!!activeUser && window.__viewerPlayTogetherUser === activeUser && window.__viewerPlayTogetherLoaded === true)
             : (!!activeUser && remoteState && remoteState.user === activeUser && remoteState.loaded === true);
         const rawEntries = ready
-            ? (filter === 'me' ? getViewerPlayTogetherEntries() : getRemotePlayTogetherEntries(filter, remoteState))
+            ? (filter === 'me' ? getViewerPlayTogetherEntries() : getRemotePlayTogetherEntries(filter, remoteState, activeUser))
             : [];
         const entries = ready ? applyPlayTogetherListFilters(rawEntries) : [];
         const availability = getSocialPlayTogetherAvailability(activeUser);
@@ -25816,8 +25832,14 @@ P
                     pillText = friendCount + ' ' + (friendCount === 1 ? 'Friend' : 'Friends');
                 } else if (filter === 'others') {
                     const playerCount = Math.max(1, Number(entry.playerCount) || 1);
-                    statusText = playerCount === 1 ? '1 player wants to play' : playerCount + ' players want to play';
-                    pillText = playerCount + ' ' + (playerCount === 1 ? 'Player' : 'Players');
+                    const friendCount = Math.max(0, Number(entry.friendCount) || 0);
+                    const totalPlayerCount = playerCount + friendCount;
+                    if (friendCount > 0) {
+                        statusText = playerCount + ' ' + (playerCount === 1 ? 'player' : 'players') + ' and ' + friendCount + ' ' + (friendCount === 1 ? 'friend' : 'friends') + ' want to play';
+                    } else {
+                        statusText = playerCount === 1 ? '1 player wants to play' : playerCount + ' players want to play';
+                    }
+                    pillText = totalPlayerCount + ' ' + (totalPlayerCount === 1 ? 'Player' : 'Players');
                 }
                 return `
                     <div class="friend-activity-item is-download is-actionable play-together-social-item" data-filter-motion-key="playTogether:${escapeHtml(entry.id)}" style="--tile-idx:${index % 12}" onmouseenter="if(typeof playUiHover==='function') playUiHover()" onclick="window.__preserveSocialPlayTogetherFilterOnce=true; if(typeof playUiClick==='function') playUiClick(); searchGameOnSite(decodeURIComponent('${encodedId}'), 'playTogether', 'games', decodeURIComponent('${encodedTitle}'), decodeURIComponent('${encodedContentId}'))">
@@ -25906,6 +25928,7 @@ P
     window.refreshSocialPlayTogetherTitles = function(rawFilter, force = false) {
         const filter = normalizePlayTogetherSocialFilter(rawFilter);
         if (filter === 'me') return window.refreshViewerPlayTogetherTitles(force);
+        if (filter === 'others') window.refreshSocialPlayTogetherTitles('friends', force);
         if (typeof socketChat === 'undefined' || !socketChat || !socketChat.connected || window.isProfileLoaded !== true) return false;
         const activeUser = String(localStorage.getItem('psn_username') || '');
         if (!activeUser) return false;
@@ -25925,7 +25948,9 @@ P
             state.fetchedAt = Date.now();
             const availability = getSocialPlayTogetherAvailability(requestUser);
             if (availability.user === requestUser && availability.loaded === true) availability[filter] = state.entries.length;
-            if (isSocialPlayTogetherSubviewVisible() && window.__socialPlayTogetherFilter === filter && typeof window.renderPlayTogetherSocialPanel === 'function') {
+            const activeFilter = normalizePlayTogetherSocialFilter(window.__socialPlayTogetherFilter);
+            const affectsVisibleFilter = activeFilter === filter || (filter === 'friends' && activeFilter === 'others');
+            if (isSocialPlayTogetherSubviewVisible() && affectsVisibleFilter && typeof window.renderPlayTogetherSocialPanel === 'function') {
                 window.renderPlayTogetherSocialPanel(false);
             }
         });
