@@ -3548,6 +3548,69 @@ async function setGameLookingForGroup(userName, rawTitleId, enabled, rawTitle) {
   return { ok: true, enabled: await isGameLookingForGroup(name, titleId) };
 }
 
+
+async function getLookingForGroupDiscoveryForUser(userName, rawAudience) {
+  const viewerName = normalizeText(userName, '');
+  const audience = rawAudience === 'friends' ? 'friends' : (rawAudience === 'others' ? 'others' : '');
+  if (!viewerName || !audience) return [];
+
+  await ensureGameOwnershipIndexReady();
+  const result = await queryDbWithRetry(
+    `WITH viewer_friends AS (
+       SELECT DISTINCT CASE
+         WHEN jsonb_typeof(friend.value) = 'object' THEN NULLIF(BTRIM(friend.value->>'name'), '')
+         WHEN jsonb_typeof(friend.value) = 'string' THEN NULLIF(BTRIM(friend.value #>> '{}'), '')
+         ELSE NULL
+       END AS name
+       FROM users viewer
+       CROSS JOIN LATERAL jsonb_array_elements(
+         CASE
+           WHEN jsonb_typeof(viewer.data->'friendsData') = 'array' THEN viewer.data->'friendsData'
+           ELSE '[]'::jsonb
+         END
+       ) AS friend(value)
+       WHERE viewer.name = $1
+     )
+     SELECT
+       interest.title_id,
+       MAX(interest.title) AS title,
+       COUNT(*)::int AS player_count,
+       ARRAY_AGG(interest.user_name ORDER BY interest.user_name ASC) FILTER (WHERE $2 = 'friends') AS friends,
+       MAX(interest.created_at) AS updated_at
+     FROM user_game_looking_for_group interest
+     JOIN user_game_ownership ownership
+       ON ownership.user_name = interest.user_name AND ownership.title_id = interest.title_id
+     LEFT JOIN viewer_friends friend ON friend.name = interest.user_name
+     WHERE interest.user_name <> $1
+       AND (ownership.in_library = TRUE OR ownership.downloaded = TRUE)
+       AND (
+         ($2 = 'friends' AND friend.name IS NOT NULL)
+         OR
+         ($2 = 'others' AND friend.name IS NULL)
+       )
+     GROUP BY interest.title_id
+     ORDER BY MAX(interest.created_at) DESC, interest.title_id ASC`,
+    [viewerName, audience],
+    { attempts: 2, label: audience === 'friends' ? 'LOOKING FOR GROUP FRIEND STATE' : 'LOOKING FOR GROUP OTHER PLAYER STATE' }
+  );
+
+  return (result.rows || []).map(row => {
+    const titleId = normalizeGamePlayersTitleId(row.title_id);
+    const playerCount = Math.max(0, Number(row.player_count) || 0);
+    const item = {
+      titleId,
+      title: normalizeText(row.title, titleId).slice(0, 180) || titleId,
+      updatedAt: normalizeTimestampValue(row.updated_at)
+    };
+    if (audience === 'friends') {
+      item.friends = (Array.isArray(row.friends) ? row.friends : []).map(friendName => normalizeText(friendName, '')).filter(Boolean);
+    } else {
+      item.playerCount = playerCount;
+    }
+    return item;
+  }).filter(item => item.titleId && (audience === 'friends' ? item.friends.length > 0 : item.playerCount > 0));
+}
+
 function getSharedGameRecipientMatchType(row = {}) {
   if (row.in_library === true && row.downloaded === true) return 'owned';
   if (row.in_library === true) return 'library';
@@ -8274,7 +8337,7 @@ io.on('connection', (socket) => {
     }
 
     const requestedMode = normalizeText(data && data.mode, '').toLowerCase();
-    const mode = requestedMode === 'mine' ? 'mine' : (requestedMode === 'list' ? 'list' : (requestedMode === 'lfg' ? 'lfg' : 'summary'));
+    const mode = requestedMode === 'mine' ? 'mine' : (requestedMode === 'friends' ? 'friends' : (requestedMode === 'others' ? 'others' : (requestedMode === 'list' ? 'list' : (requestedMode === 'lfg' ? 'lfg' : 'summary'))));
     let titleId = '';
     try {
       if (mode === 'mine') {
@@ -8289,6 +8352,14 @@ io.on('connection', (socket) => {
         const titleIds = (result.rows || []).map(row => normalizeGamePlayersTitleId(row.title_id)).filter(Boolean);
         const payload = { ok: true, mode, titleIds };
         trackBandwidthPayload('game_players_lfg_mine', payload, 1);
+        respond(payload);
+        return;
+      }
+
+      if (mode === 'friends' || mode === 'others') {
+        const items = await getLookingForGroupDiscoveryForUser(name, mode);
+        const payload = { ok: true, mode, items };
+        trackBandwidthPayload(mode === 'friends' ? 'game_players_lfg_friends' : 'game_players_lfg_others', payload, 1);
         respond(payload);
         return;
       }
