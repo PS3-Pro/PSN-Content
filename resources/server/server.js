@@ -3483,12 +3483,12 @@ async function notifyPlayTogetherPlayers(actorName, rawTitleId, rawTitle) {
   const at = Date.now();
   for (let offset = 0; offset < recipients.length; offset += 8) {
     const batch = recipients.slice(offset, offset + 8);
-    const events = await Promise.all(batch.map(userName => recordUserNotification(userName, 'playTogether', {
+    const events = await Promise.all(batch.map(userName => recordUserNotification(userName, 'play_together', {
       actor,
       titleId,
       title
     }, {
-      dedupeKey: `${userName.toLowerCase()}:notification:playTogether:${actor.toLowerCase()}:${titleId.toLowerCase()}`,
+      dedupeKey: `${userName.toLowerCase()}:notification:play_together:${actor.toLowerCase()}:${titleId.toLowerCase()}`,
       at
     })));
     published += events.filter(Boolean).length;
@@ -3527,6 +3527,57 @@ async function setGamePlayTogether(userName, rawTitleId, enabled, rawTitle) {
   return { ok: true, enabled: await isGamePlayTogether(name, titleId) };
 }
 
+
+async function getPlayTogetherOverviewForUser(userName) {
+  const viewerName = normalizeText(userName, '');
+  if (!viewerName) return { titleIds: [], availability: { me: 0, friends: 0, others: 0 } };
+
+  const result = await queryDbWithRetry(
+    `WITH viewer_friends AS (
+       SELECT DISTINCT CASE
+         WHEN jsonb_typeof(friend.value) = 'object' THEN NULLIF(BTRIM(friend.value->>'name'), '')
+         WHEN jsonb_typeof(friend.value) = 'string' THEN NULLIF(BTRIM(friend.value #>> '{}'), '')
+         ELSE NULL
+       END AS name
+       FROM users viewer
+       CROSS JOIN LATERAL jsonb_array_elements(
+         CASE
+           WHEN jsonb_typeof(viewer.data->'friendsData') = 'array' THEN viewer.data->'friendsData'
+           ELSE '[]'::jsonb
+         END
+       ) AS friend(value)
+       WHERE viewer.name = $1
+     ),
+     mine AS (
+       SELECT title_id, created_at
+       FROM user_game_play_together
+       WHERE user_name = $1
+     ),
+     remote AS (
+       SELECT interest.title_id, (friend.name IS NOT NULL) AS is_friend
+       FROM user_game_play_together interest
+       LEFT JOIN viewer_friends friend ON friend.name = interest.user_name
+       WHERE interest.user_name <> $1
+     )
+     SELECT
+       ARRAY(SELECT title_id FROM mine ORDER BY created_at DESC, title_id ASC) AS title_ids,
+       (SELECT COUNT(*)::int FROM mine) AS me_count,
+       (SELECT COUNT(DISTINCT title_id)::int FROM remote WHERE is_friend) AS friends_count,
+       (SELECT COUNT(DISTINCT title_id)::int FROM remote WHERE NOT is_friend) AS others_count`,
+    [viewerName],
+    { attempts: 2, label: 'PLAY TOGETHER OVERVIEW' }
+  );
+
+  const row = result.rows && result.rows[0] ? result.rows[0] : {};
+  return {
+    titleIds: (Array.isArray(row.title_ids) ? row.title_ids : []).map(normalizeGamePlayersTitleId).filter(Boolean),
+    availability: {
+      me: Math.max(0, Number(row.me_count) || 0),
+      friends: Math.max(0, Number(row.friends_count) || 0),
+      others: Math.max(0, Number(row.others_count) || 0)
+    }
+  };
+}
 
 async function getPlayTogetherDiscoveryForUser(userName, rawAudience) {
   const viewerName = normalizeText(userName, '');
@@ -6284,7 +6335,7 @@ async function getFriendActivityHistoryForUser(userName, afterId = 0, resolvedFr
   return { friendNames, items: result.rows.map(serializeFriendActivityRow).filter(Boolean), lastReadId: state.lastReadId, dismissedThroughId: state.dismissedThroughId, delta: safeAfterId > 0 };
 }
 
-const USER_NOTIFICATION_TYPES = new Set(['mention', 'reply', 'reaction', 'trophy', 'catalog', 'game_match', 'playTogether']);
+const USER_NOTIFICATION_TYPES = new Set(['mention', 'reply', 'reaction', 'trophy', 'catalog', 'game_match', 'play_together']);
 
 function normalizeUserNotificationName(value) {
   return normalizeText(value, '').slice(0, 80);
@@ -6318,7 +6369,7 @@ function normalizeUserNotificationData(type, rawData = {}) {
       trophyType: ['bronze', 'silver', 'gold', 'platinum'].includes(trophyType) ? trophyType : 'bronze'
     };
   }
-  if (type === 'playTogether') {
+  if (type === 'play_together') {
     return {
       actor: normalizeUserNotificationName(source.actor),
       titleId: normalizeText(source.titleId, '').toUpperCase().slice(0, 32),
@@ -8386,20 +8437,12 @@ io.on('connection', (socket) => {
     }
 
     const requestedMode = normalizeText(data && data.mode, '').toLowerCase();
-    const mode = requestedMode === 'mine' ? 'mine' : (requestedMode === 'friends' ? 'friends' : (requestedMode === 'others' ? 'others' : (requestedMode === 'community' ? 'community' : (requestedMode === 'list' ? 'list' : (requestedMode === 'playTogether' ? 'playTogether' : 'summary')))));
+    const mode = requestedMode === 'mine' ? 'mine' : (requestedMode === 'friends' ? 'friends' : (requestedMode === 'others' ? 'others' : (requestedMode === 'community' ? 'community' : (requestedMode === 'list' ? 'list' : ((requestedMode === 'playtogether' || requestedMode === 'play_together') ? 'playTogether' : 'summary')))));
     let titleId = '';
     try {
       if (mode === 'mine') {
-        const result = await queryDbWithRetry(
-          `SELECT title_id
-           FROM user_game_play_together
-           WHERE user_name = $1
-           ORDER BY created_at DESC`,
-          [name],
-          { attempts: 2, label: 'PLAY TOGETHER OWN STATE' }
-        );
-        const titleIds = (result.rows || []).map(row => normalizeGamePlayersTitleId(row.title_id)).filter(Boolean);
-        const payload = { ok: true, mode, titleIds };
+        const overview = await getPlayTogetherOverviewForUser(name);
+        const payload = { ok: true, mode, titleIds: overview.titleIds, availability: overview.availability };
         trackBandwidthPayload('game_players_play_together_mine', payload, 1);
         respond(payload);
         return;

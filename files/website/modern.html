@@ -7492,7 +7492,7 @@ img { -webkit-user-drag: none !important; user-drag: none !important; }
 						<div>Play Together <span id="social-play-together-count"></span></div>
 						<i class="fas fa-headset"></i>
 					</h2>
-					<div id="social-play-together-filter-toolbar" class="browse-toolbar" style="margin-bottom:20px;">
+					<div id="social-play-together-filter-toolbar" class="browse-toolbar" style="display:none; margin-bottom:20px;">
 						<div class="toolbar-group">
 							<select id="social-play-together-owned-filter" onmouseenter="playUiArrow()" onmousedown="if(typeof playUiDropdown === 'function') playUiDropdown(event)" onchange="setPlayTogetherOwnedFilter(this.value)">
 								<option value="all">All</option>
@@ -20249,9 +20249,8 @@ P
 			if(searchInput) searchInput.value = '';
 			window.__socialPlayTogetherRevealPending = true;
 			if (typeof window.renderPlayTogetherSocialPanel === 'function') window.renderPlayTogetherSocialPanel(false);
-			if (window.__socialPlayTogetherFilter === 'me') {
-				if (typeof window.refreshViewerPlayTogetherTitles === 'function') window.refreshViewerPlayTogetherTitles(false);
-			} else if (typeof window.refreshSocialPlayTogetherTitles === 'function') {
+			if (typeof window.refreshViewerPlayTogetherTitles === 'function') window.refreshViewerPlayTogetherTitles(false);
+			if (window.__socialPlayTogetherFilter !== 'me' && typeof window.refreshSocialPlayTogetherTitles === 'function') {
 				window.refreshSocialPlayTogetherTitles(window.__socialPlayTogetherFilter, false);
 			}
 		}
@@ -25277,10 +25276,51 @@ P
         ? window.__collectionPlayTogetherMatchState
         : { titleIds: new Set(), loaded: false, fetchedAt: 0, requestInFlight: false, user: '' };
     window.__socialPlayTogetherRemoteStates = window.__socialPlayTogetherRemoteStates && typeof window.__socialPlayTogetherRemoteStates === 'object' ? window.__socialPlayTogetherRemoteStates : {};
+    window.__socialPlayTogetherAvailability = window.__socialPlayTogetherAvailability && typeof window.__socialPlayTogetherAvailability === 'object'
+        ? window.__socialPlayTogetherAvailability
+        : { user: '', loaded: false, me: 0, friends: 0, others: 0 };
     window.__socialPlayTogetherRevealPending = false;
 
     function normalizePlayTogetherSocialFilter(rawFilter) {
         return rawFilter === 'friends' || rawFilter === 'others' ? rawFilter : 'me';
+    }
+
+    function makeSocialPlayTogetherAvailability(activeUser = '') {
+        return { user: activeUser, loaded: false, me: 0, friends: 0, others: 0 };
+    }
+
+    function getSocialPlayTogetherAvailability(activeUser = '') {
+        let state = window.__socialPlayTogetherAvailability;
+        if (!state || typeof state !== 'object' || (activeUser && state.user !== activeUser)) {
+            state = makeSocialPlayTogetherAvailability(activeUser);
+            window.__socialPlayTogetherAvailability = state;
+        }
+        return state;
+    }
+
+    function setSocialPlayTogetherAvailability(activeUser, rawAvailability) {
+        const state = getSocialPlayTogetherAvailability(activeUser);
+        const source = rawAvailability && typeof rawAvailability === 'object' ? rawAvailability : {};
+        state.user = activeUser;
+        state.loaded = true;
+        state.me = Math.max(0, Number(source.me) || 0);
+        state.friends = Math.max(0, Number(source.friends) || 0);
+        state.others = Math.max(0, Number(source.others) || 0);
+        return state;
+    }
+
+    function syncPlayTogetherSocialToolbarVisibility(activeUser = '') {
+        const toolbar = document.getElementById('social-play-together-filter-toolbar');
+        if (!toolbar) return false;
+        const state = getSocialPlayTogetherAvailability(activeUser);
+        const ready = !!activeUser && state.user === activeUser && state.loaded === true;
+        const hasAny = ready && (state.me + state.friends + state.others > 0);
+        const nextDisplay = hasAny ? 'flex' : 'none';
+        if (toolbar.style.display !== nextDisplay) {
+            toolbar.style.display = nextDisplay;
+            if (typeof window.refreshPsnPageEmptyStates === 'function') window.refreshPsnPageEmptyStates();
+        }
+        return hasAny;
     }
 
     window.__socialPlayTogetherFilter = normalizePlayTogetherSocialFilter(window.__socialPlayTogetherFilter);
@@ -25560,18 +25600,29 @@ P
             ? (filter === 'me' ? getViewerPlayTogetherEntries() : getRemotePlayTogetherEntries(filter, remoteState))
             : [];
         const entries = ready ? applyPlayTogetherListFilters(rawEntries) : [];
+        const availability = getSocialPlayTogetherAvailability(activeUser);
+        const availabilityReady = !!activeUser && availability.user === activeUser && availability.loaded === true;
+        const globallyEmpty = availabilityReady && (availability.me + availability.friends + availability.others === 0);
         syncPlayTogetherSocialFilterControls();
+        syncPlayTogetherSocialToolbarVisibility(activeUser);
         if (typeof window.syncAlphabeticalSortButtonState === 'function') window.syncAlphabeticalSortButtonState('playTogether', ready ? entries.length : 0);
 
-        count.textContent = ready
-            ? '(' + (window.formatUiCount ? window.formatUiCount(entries.length, 'game', 'games') : (entries.length + ' ' + (entries.length === 1 ? 'game' : 'games'))) + ')'
-            : '(Loading...)';
+        count.textContent = globallyEmpty
+            ? ''
+            : (ready
+                ? '(' + (window.formatUiCount ? window.formatUiCount(entries.length, 'game', 'games') : (entries.length + ' ' + (entries.length === 1 ? 'game' : 'games'))) + ')'
+                : '(Loading...)');
 
         const loadingStrong = loading.querySelector('strong');
         const loadingText = loading.querySelector('p');
         const emptyStrong = empty.querySelector('strong');
         const emptyText = empty.querySelector('p');
-        if (filter === 'friends') {
+        if (globallyEmpty) {
+            if (loadingStrong) loadingStrong.textContent = 'Loading Play Together';
+            if (loadingText) loadingText.textContent = 'Checking for active games.';
+            if (emptyStrong) emptyStrong.textContent = 'No active Play Together games.';
+            if (emptyText) emptyText.textContent = 'Open any game and enable Play Together to have it appear here.';
+        } else if (filter === 'friends') {
             if (loadingStrong) loadingStrong.textContent = 'Loading friends’ Play Together games';
             if (loadingText) loadingText.textContent = 'Checking which games your friends are looking for players in.';
             if (emptyStrong) emptyStrong.textContent = 'No friends want to play right now.';
@@ -25599,7 +25650,7 @@ P
         if (!entries.length) {
             list.innerHTML = '';
             delete list.dataset.socialPlayTogetherRenderSignature;
-            if (window.__socialPlayTogetherOwnedFilter === 'owned' && rawEntries.length) {
+            if (!globallyEmpty && window.__socialPlayTogetherOwnedFilter === 'owned' && rawEntries.length) {
                 if (emptyStrong) emptyStrong.textContent = 'No Owned Games';
                 if (emptyText) emptyText.textContent = 'None of the current Play Together games are in My Games.';
             }
@@ -25673,11 +25724,14 @@ P
             window.__viewerPlayTogetherLoaded = false;
             window.__viewerPlayTogetherFetchedAt = 0;
             window.__viewerPlayTogetherUser = activeUser;
+            window.__socialPlayTogetherAvailability = makeSocialPlayTogetherAvailability(activeUser);
             resetAllSocialPlayTogetherRemoteStates(activeUser);
         }
         const hadTitle = window.__viewerPlayTogetherTitleIds.has(titleId);
         if (enabled === true) window.__viewerPlayTogetherTitleIds.add(titleId);
         else window.__viewerPlayTogetherTitleIds.delete(titleId);
+        const availability = getSocialPlayTogetherAvailability(activeUser);
+        if (availability.user === activeUser && availability.loaded === true) availability.me = window.__viewerPlayTogetherTitleIds.size;
         const changed = hadTitle !== (enabled === true);
         if (render && changed) refreshViewerPlayTogetherVisibleCollections();
         return changed;
@@ -25692,6 +25746,7 @@ P
             window.__viewerPlayTogetherLoaded = false;
             window.__viewerPlayTogetherFetchedAt = 0;
             window.__viewerPlayTogetherUser = activeUser;
+            window.__socialPlayTogetherAvailability = makeSocialPlayTogetherAvailability(activeUser);
             resetAllSocialPlayTogetherRemoteStates(activeUser);
         }
         if (window.__viewerPlayTogetherRequestInFlight) return false;
@@ -25708,9 +25763,12 @@ P
             window.__viewerPlayTogetherTitleIds = nextSet;
             window.__viewerPlayTogetherLoaded = true;
             window.__viewerPlayTogetherFetchedAt = Date.now();
+            let availability = getSocialPlayTogetherAvailability(requestUser);
+            if (response.availability && typeof response.availability === 'object') availability = setSocialPlayTogetherAvailability(requestUser, response.availability);
+            availability.me = nextSet.size;
             if (typeof window.setSidebarCountPill === 'function') window.setSidebarCountPill('playTogether', nextSet.size);
             if (changed) refreshViewerPlayTogetherVisibleCollections();
-            else if (isSocialPlayTogetherSubviewVisible() && window.__socialPlayTogetherFilter === 'me' && typeof window.renderPlayTogetherSocialPanel === 'function') window.renderPlayTogetherSocialPanel(false);
+            if (isSocialPlayTogetherSubviewVisible() && (window.__socialPlayTogetherFilter !== 'me' || !changed) && typeof window.renderPlayTogetherSocialPanel === 'function') window.renderPlayTogetherSocialPanel(false);
         });
         return true;
     };
@@ -25735,6 +25793,8 @@ P
             state.entries = response.items;
             state.loaded = true;
             state.fetchedAt = Date.now();
+            const availability = getSocialPlayTogetherAvailability(requestUser);
+            if (availability.user === requestUser && availability.loaded === true) availability[filter] = state.entries.length;
             if (isSocialPlayTogetherSubviewVisible() && window.__socialPlayTogetherFilter === filter && typeof window.renderPlayTogetherSocialPanel === 'function') {
                 window.renderPlayTogetherSocialPanel(false);
             }
@@ -56881,7 +56941,7 @@ function getVisibleChatStackEl(id) {
 						showChatNotification(String(item.data && item.data.actor || 'Someone').trim() || 'Someone', false, false, '', reactionEmoji);
 					}
 				}
-				if (isFreshUnread && (item.type === 'game_match' || item.type === 'playTogether') && typeof window.showPsnTopPopup === 'function') {
+				if (isFreshUnread && (item.type === 'game_match' || item.type === 'play_together') && typeof window.showPsnTopPopup === 'function') {
 					const notificationsVisible = typeof window.isNotificationCenterVisible === 'function' && window.isNotificationCenterVisible();
 					if (!notificationsVisible) {
 						const presentation = getUserNotificationPresentation(item);
@@ -56889,7 +56949,7 @@ function getVisibleChatStackEl(id) {
 						window.showPsnTopPopup({
 							iconClass: `fas ${presentation.badgeIcon || 'fa-user-group'}`,
 							color: '#00d49a',
-							title: item.type === 'playTogether' ? 'PLAY TOGETHER' : (count > 1 ? 'SHARED GAMES' : 'SHARED GAME'),
+							title: item.type === 'play_together' ? 'PLAY TOGETHER' : (count > 1 ? 'SHARED GAMES' : 'SHARED GAME'),
 							lead: String(item.data && item.data.actor || 'Someone').trim() || 'Someone',
 							text: presentation.title
 						});
@@ -61080,7 +61140,7 @@ function getVisibleChatStackEl(id) {
 		if (filter === 'all') return true;
 		if (filter === 'chat') return type === 'mention' || type === 'reply' || type === 'reaction';
 		if (filter === 'trophies') return type === 'trophy';
-		if (filter === 'content') return type === 'catalog' || type === 'game_match' || type === 'playTogether';
+		if (filter === 'content') return type === 'catalog' || type === 'game_match' || type === 'play_together';
 		return true;
 	}
 
@@ -61975,7 +62035,7 @@ function getVisibleChatStackEl(id) {
 	function normalizeUserNotificationItem(raw) {
 		if (!raw || typeof raw !== 'object') return null;
 		const type = String(raw.type || '').toLowerCase();
-		if (!['mention','reply','reaction','trophy','catalog','game_match','playTogether'].includes(type)) return null;
+		if (!['mention','reply','reaction','trophy','catalog','game_match','play_together'].includes(type)) return null;
 		const data = raw.data && typeof raw.data === 'object' && !Array.isArray(raw.data) ? raw.data : {};
 		return { id:String(raw.id || ''), user:String(raw.user || ''), type:type, data:data, createdAt:Number(raw.createdAt || Date.now()) || Date.now() };
 	}
@@ -62376,7 +62436,7 @@ function getVisibleChatStackEl(id) {
 		if (item.type === 'reply') return { badgeIcon:messageDeleted ? 'fa-comment-slash' : 'fa-comments', cls:'is-reply' + (messageDeleted ? ' is-message-deleted' : ''), title:'replied to your message', meta:'Global Chat', preview:messageDeleted ? 'Message deleted' : (data.text || '') };
 		if (item.type === 'mention') return { badgeIcon:messageDeleted ? 'fa-comment-slash' : 'fa-comments', cls:'is-mention' + (messageDeleted ? ' is-message-deleted' : ''), title:'mentioned you', meta:'Global Chat', preview:messageDeleted ? 'Message deleted' : (data.text || '') };
 		if (item.type === 'reaction') return { badgeIcon:messageDeleted ? 'fa-comment-slash' : 'fa-comments', cls:'is-reaction' + (messageDeleted ? ' is-message-deleted' : ''), title:'reacted ' + String(data.emoji || '❤') + ' to your message', meta:'Global Chat', preview:messageDeleted ? 'Message deleted' : (data.text || '') };
-		if (item.type === 'playTogether') {
+		if (item.type === 'play_together') {
 			const gameTitle = String(data.title || data.titleId || 'a game').trim() || 'a game';
 			return { badgeIcon:'fa-headset', cls:'is-play-together', title:'also wants to play ' + gameTitle, meta:'Play Together', preview:'You both want to play this game.' };
 		}
@@ -62723,7 +62783,7 @@ function getVisibleChatStackEl(id) {
 			openChatMessageFromUserNotification(item);
 			return;
 		}
-		if (item.type === 'playTogether') {
+		if (item.type === 'play_together') {
 			const titleId = normalizeGamePlayersTitleId(data.titleId || '');
 			if (titleId && typeof searchGameOnSite === 'function') searchGameOnSite(titleId, 'notifications', 'games', String(data.title || ''), '');
 			return;
@@ -62785,7 +62845,7 @@ function getVisibleChatStackEl(id) {
 		}
 		const encodedActor = encodeURIComponent(actor).replace(/'/g, '%27');
 		const encodedAvatar = encodeURIComponent(avatar).replace(/'/g, '%27');
-		const isPlayTogetherSocial = item.type === 'playTogether' && actor && actor !== (localStorage.getItem('psn_username') || '');
+		const isPlayTogetherSocial = item.type === 'play_together' && actor && actor !== (localStorage.getItem('psn_username') || '');
 		const profileAttr = actor ? ' data-notification-profile="' + encodedActor + '"' : '';
 		const actorHtml = actor && item.type !== 'trophy'
 			? '<strong' + (isPlayTogetherSocial ? ' class="user-notification-profile-link"' + profileAttr : '') + '>' + escapeRealtimeFeedHtml(actor) + '</strong> '
