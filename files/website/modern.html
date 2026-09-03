@@ -5657,15 +5657,13 @@ img { -webkit-user-drag: none !important; user-drag: none !important; }
 				<li id="nav-guides" onmouseenter="playUiHover()" onclick="playUiClick(); switchView('view-guides'); toggleSidebar(true)">
 					<i class="fas fa-book"></i> <span class="interface-compact-label sidebar-press-label" data-sidebar-press-label>Help</span>
 				</li>
-
-				<li id="nav-admin-footer" class="admin-sidebar-entry" onmouseenter="playUiHover()" onclick="playUiClick(); openAdminPanel('view-admin'); toggleSidebar(true)">
-					<i class="fas fa-shield-alt"></i> <span class="interface-compact-label sidebar-press-label" data-sidebar-press-label>Control Panel</span>
-				</li>
-				
 				<li id="nav-notifications" onmouseenter="playUiHover()" onclick="playUiClick(); switchView('view-notifications'); toggleSidebar(true)">
 					<i class="fas fa-bell"></i> <span class="interface-compact-label sidebar-press-label" data-sidebar-press-label>Notifications</span>
 					<span id="sidebar-count-notifications" class="sidebar-count-pill is-empty" title="0 notifications" style="display:none;">0</span>
 					<span id="notifications-dot" class="notification-dot" title="New notifications"></span>
+				</li>
+				<li id="nav-admin-footer" class="admin-sidebar-entry" onmouseenter="playUiHover()" onclick="playUiClick(); openAdminPanel('view-admin'); toggleSidebar(true)">
+					<i class="fas fa-shield-alt"></i> <span class="interface-compact-label sidebar-press-label" data-sidebar-press-label>Control Panel</span>
 				</li>
 				
 				<li id="nav-settings" onmouseenter="playUiHover()" onclick="playUiClick(); switchView('view-settings'); toggleSidebar(true)">
@@ -20950,16 +20948,19 @@ P
         t = t.replace(/\S+/g, function(word, offset, sourceText) {
             let cleanWord = word.replace(/^[\(\[\{]+|[\)\]\}\.\,\:\;]+$/g, '');
             if (cleanWord === "") return word;
-            const lowerWord = cleanWord.toLowerCase();
-            const hasIntentionalCasing = /[a-z]/.test(cleanWord) && /[A-Z]/.test(cleanWord) && !/^[A-Z][a-z]+(?:['’][a-z]+)?$/.test(cleanWord);
-            const hasCompactCodeCasing = /[A-Z]/.test(cleanWord) && /\d/.test(cleanWord) && !/[a-z]/.test(cleanWord) && /^[A-Z0-9]+$/.test(cleanWord);
+            const trailingTrademark = cleanWord.match(/([™®]+)$/);
+            const trademarkSuffix = trailingTrademark ? trailingTrademark[1] : '';
+            const casingWord = trademarkSuffix ? cleanWord.slice(0, -trademarkSuffix.length) : cleanWord;
+            const lowerWord = casingWord.toLowerCase();
+            const hasIntentionalCasing = /[a-z]/.test(casingWord) && /[A-Z]/.test(casingWord) && !/^[A-Z][a-z]+(?:['’][a-z]+)?$/.test(casingWord);
+            const hasCompactCodeCasing = /[A-Z]/.test(casingWord) && /\d/.test(casingWord) && !/[a-z]/.test(casingWord) && /^[A-Z0-9]+$/.test(casingWord);
             const previousText = String(sourceText || '').slice(0, offset);
             const beginsSubtitle = /(?:[:;!?]\s*|[-–—]\s+)$/.test(previousText);
             let replacer = "";
-            if (hasIntentionalCasing || hasCompactCodeCasing) replacer = cleanWord;
-            else if (DICT_UPPER_WORDS[lowerWord]) replacer = lowerWord.toUpperCase();
-            else if (DICT_MINOR_WORDS[lowerWord] && offset > 0 && !beginsSubtitle) replacer = lowerWord;
-            else replacer = lowerWord.charAt(0).toUpperCase() + lowerWord.slice(1);
+            if (DICT_UPPER_WORDS[lowerWord]) replacer = lowerWord.toUpperCase() + trademarkSuffix;
+            else if (hasIntentionalCasing || hasCompactCodeCasing) replacer = casingWord + trademarkSuffix;
+            else if (DICT_MINOR_WORDS[lowerWord] && offset > 0 && !beginsSubtitle) replacer = lowerWord + trademarkSuffix;
+            else replacer = lowerWord.charAt(0).toUpperCase() + lowerWord.slice(1) + trademarkSuffix;
             return word.replace(cleanWord, replacer);
         });
 
@@ -61844,6 +61845,38 @@ function getVisibleChatStackEl(id) {
 		return key.replace(/_/g, ' ').replace(/\b\w/g, function(char) { return char.toUpperCase(); });
 	}
 
+	const friendActivityLibraryTitleCache = new Map();
+	function getFriendActivityLibraryGameDisplayName(game) {
+		const source = game && typeof game === 'object' ? game : {};
+		const titleId = String(source.titleId || source.id || '').trim();
+		const rawTitle = String(source.title || source.cleanName || source.name || titleId || '').trim();
+		if (!titleId && !rawTitle) return '';
+		const cacheKey = titleId.toUpperCase() + '|' + rawTitle;
+		if (friendActivityLibraryTitleCache.has(cacheKey)) return friendActivityLibraryTitleCache.get(cacheKey);
+
+		let canonicalTitle = '';
+		if (titleId && typeof window.findPsnStoreItemById === 'function') {
+			const indexed = window.findPsnStoreItemById(titleId);
+			const storeItem = indexed && indexed.item;
+			canonicalTitle = String(storeItem && (storeItem.cleanName || storeItem.title || storeItem.name) || '').trim();
+		}
+		if (!canonicalTitle && typeof window.sanitizeDownloadCoverRecord === 'function') {
+			try {
+				const resolved = window.sanitizeDownloadCoverRecord({ titleId, id:titleId, title:rawTitle, name:rawTitle, category:'games' }, 'library');
+				canonicalTitle = String(resolved && (resolved.cleanName || resolved.name || resolved.title) || '').trim();
+			} catch (err) {}
+		}
+
+		const displayTitle = canonicalTitle || rawTitle;
+		friendActivityLibraryTitleCache.set(cacheKey, displayTitle);
+		return displayTitle;
+	}
+
+	window.addEventListener('psnStorePrefetchReady', function() {
+		friendActivityLibraryTitleCache.clear();
+		if (typeof window.isFriendActivityVisible === 'function' && window.isFriendActivityVisible() && typeof window.renderFriendActivity === 'function') window.renderFriendActivity(true);
+	});
+
 	function getFriendActivityPresentation(item) {
 		const data = item.data || {};
 		if (item.type === 'online') return { icon:'fa-circle', cls:'is-online', message:'connected.', meta:'Connected to PlayStation™ Network' };
@@ -61857,7 +61890,7 @@ function getVisibleChatStackEl(id) {
 		if (item.type === 'library') {
 			const count = Math.max(1, Number(data.count) || 1);
 			const games = Array.isArray(data.games) ? data.games : [];
-			const preview = games.slice(0, 3).map(function(game) { return String(game && (game.title || game.titleId) || '').trim(); }).filter(Boolean);
+			const preview = games.slice(0, 3).map(getFriendActivityLibraryGameDisplayName).filter(Boolean);
 			const extra = Math.max(0, count - preview.length);
 			return { icon:'fa-gamepad', cls:'is-library', message:count === 1 ? 'added' : ('added ' + count + ' games to their Library'), suffix:count === 1 ? ' to their Library' : '', meta:count === 1 ? (data.titleId || '') : (preview.join(', ') + (extra ? ' +' + extra + ' more' : '')) };
 		}
@@ -61889,7 +61922,8 @@ function getVisibleChatStackEl(id) {
 			return;
 		}
 		if (item.type === 'library' && Math.max(1, Number(data.count) || 1) === 1 && String(data.titleId || '').trim()) {
-			window.openFriendActivityGame(data.titleId, data.title || '', 'games', '');
+			const libraryGame = (Array.isArray(data.games) && data.games[0]) || data;
+			window.openFriendActivityGame(data.titleId, getFriendActivityLibraryGameDisplayName(libraryGame) || data.title || '', 'games', '');
 			return;
 		}
 		if (item.type === 'trophy') {
@@ -61912,7 +61946,8 @@ function getVisibleChatStackEl(id) {
 		const p = getFriendActivityPresentation(item);
 		const encodedActor = encodeURIComponent(item.actor);
 		const avatar = typeof getResolvedUserAvatar === 'function' ? getResolvedUserAvatar(item.actor) : 'https://raw.githubusercontent.com/PS3-Pro/PSN-Content/main/resources/interface/modern/images/avatars/default.png';
-		const title = String(item.data && item.data.title || '').trim();
+		const rawTitle = String(item.data && item.data.title || '').trim();
+		const title = item.type === 'library' ? (getFriendActivityLibraryGameDisplayName((item.data && Array.isArray(item.data.games) && item.data.games[0]) || item.data || {}) || rawTitle) : rawTitle;
 		const titleId = String(item.data && item.data.titleId || '').trim();
 		const contentId = String(item.data && item.data.contentId || '').trim();
 		const category = String(item.data && item.data.category || '').trim();
