@@ -454,8 +454,8 @@ select option { background-color: var(--bg-dark); }
 #group-titles-filter.is-hidden { display: none !important; }
 #group-titles-filter { margin-top: 0; }
 #group-titles-filter.group-titles-separated, #library-lfg-filter.group-titles-separated { margin-left: 6px; padding-left: 14px; border-left: 1px solid rgba(255,255,255,.16); }
-#browse-sort-btn.is-disabled, #browse-sort-btn:disabled { opacity: .42 !important; filter: grayscale(.65) !important; pointer-events: none !important; cursor: not-allowed !important; transform: none !important; box-shadow: none !important; border-color: rgba(255,255,255,.08) !important; background: rgba(0,0,0,.22) !important; color: rgba(255,255,255,.45) !important; }
-#browse-sort-btn.is-disabled i, #browse-sort-btn:disabled i { opacity: .65 !important; }
+#browse-sort-btn:is(.is-disabled,:disabled), #wishlist-sort-btn:is(.is-disabled,:disabled), #library-sort-btn:is(.is-disabled,:disabled), #fav-sort-btn:is(.is-disabled,:disabled), #friends-sort-btn:is(.is-disabled,:disabled), #lfg-sort-btn:is(.is-disabled,:disabled) { opacity: .42 !important; filter: grayscale(.65) !important; pointer-events: none !important; cursor: not-allowed !important; transform: none !important; box-shadow: none !important; border-color: rgba(255,255,255,.08) !important; background: rgba(0,0,0,.22) !important; color: rgba(255,255,255,.45) !important; }
+#browse-sort-btn:is(.is-disabled,:disabled) i, #wishlist-sort-btn:is(.is-disabled,:disabled) i, #library-sort-btn:is(.is-disabled,:disabled) i, #fav-sort-btn:is(.is-disabled,:disabled) i, #friends-sort-btn:is(.is-disabled,:disabled) i, #lfg-sort-btn:is(.is-disabled,:disabled) i { opacity: .65 !important; }
 #browse-surprise-btn, .collection-surprise-btn { width: 35px; height: 35px; flex: 0 0 35px; display: inline-flex; align-items: center; justify-content: center; padding: 0; border-radius: 6px; border: 1px solid rgba(255,255,255,.1); background: rgba(0,0,0,.4); color: rgba(255,255,255,.88); outline: none; transition: background .2s ease,border-color .2s ease,color .2s ease,box-shadow .2s ease,transform .2s ease,filter .2s ease; }
 #browse-surprise-btn:hover, .collection-surprise-btn:hover { background: rgba(255,255,255,.1); border-color: rgba(255,255,255,.4); color: #fff; box-shadow: none; }
 #browse-surprise-btn i, .collection-surprise-btn i { font-size: 13px; transform-origin: center; }
@@ -17529,22 +17529,40 @@ P
         regionSelect.title = locked ? 'Region filter is locked in this view' : '';
     }
 
-    function setBrowseSortButtonEnabled(enabled, disabledReason = 'count') {
-        const btn = document.getElementById('browse-sort-btn');
+    window.setAlphabeticalSortButtonEnabled = function(view, enabled, disabledReason = 'count') {
+        const btn = document.getElementById(`${view}-sort-btn`);
         if (!btn) return;
 
         btn.disabled = !enabled;
         btn.classList.toggle('is-disabled', !enabled);
         btn.setAttribute('aria-disabled', enabled ? 'false' : 'true');
-        btn.title = enabled
-            ? 'Toggle A-Z sort'
-            : (disabledReason === 'regions' ? 'A-Z sort is not needed in Regions view' : 'A-Z sort is only available with more than one item');
-    }
+
+        if (!enabled) {
+            btn.title = disabledReason === 'regions'
+                ? 'A-Z sort is not needed in Regions view'
+                : 'A-Z sort is only available with more than one item';
+            return;
+        }
+
+        if (view === 'lfg') btn.title = window.sortOrders?.lfg === 'desc' ? 'Z–A' : 'A–Z';
+        else if (view === 'browse') btn.title = 'Toggle A-Z sort';
+        else if (view === 'friends' && document.getElementById('friends-sort-select')?.value !== 'alpha') btn.title = '';
+        else btn.title = 'Toggle A-Z sort';
+    };
+
+    window.syncAlphabeticalSortButtonState = function(view, itemCount) {
+        if (view === 'friends' && document.getElementById('friends-sort-select')?.value !== 'alpha') {
+            window.setAlphabeticalSortButtonEnabled(view, true);
+            return;
+        }
+        const count = Number.isFinite(Number(itemCount)) ? Number(itemCount) : 0;
+        window.setAlphabeticalSortButtonEnabled(view, count > 1);
+    };
 
     function syncBrowseSortButtonState(itemCount) {
         const count = Number.isFinite(Number(itemCount)) ? Number(itemCount) : 0;
         const inRegionsView = !!browseExpandedGroupTitle;
-        setBrowseSortButtonEnabled(!inRegionsView && count > 1, inRegionsView ? 'regions' : 'count');
+        window.setAlphabeticalSortButtonEnabled('browse', !inRegionsView && count > 1, inRegionsView ? 'regions' : 'count');
     }
 
     function updateGroupTitleFilterVisibility(categoryOverride = null, regionOverride = null) {
@@ -17813,7 +17831,7 @@ P
         if (!groupItems.length) return;
 
         if (typeof playUiClick === 'function') playUiClick();
-        if (typeof setBrowseSortButtonEnabled === 'function') setBrowseSortButtonEnabled(false, 'regions');
+        if (typeof window.setAlphabeticalSortButtonEnabled === 'function') window.setAlphabeticalSortButtonEnabled('browse', false, 'regions');
 
         runBrowseContextTransition(() => {
             const scrollArea = document.getElementById('scroll-area') || document.querySelector('.content');
@@ -25405,6 +25423,7 @@ P
             : [];
         const entries = ready ? applyLookingForGroupListFilters(rawEntries) : [];
         syncLookingForGroupSocialFilterControls();
+        if (typeof window.syncAlphabeticalSortButtonState === 'function') window.syncAlphabeticalSortButtonState('lfg', ready ? entries.length : 0);
 
         count.textContent = ready
             ? '(' + (window.formatUiCount ? window.formatUiCount(entries.length, 'game', 'games') : (entries.length + ' ' + (entries.length === 1 ? 'game' : 'games'))) + ')'
@@ -35503,6 +35522,7 @@ P
 		}
 	
 		if (window.wishlist.length === 0) {
+			if (typeof window.syncAlphabeticalSortButtonState === 'function') window.syncAlphabeticalSortButtonState('wishlist', 0);
 			clearProgressiveGridObserver('wishlist', grid);
 			delete grid.dataset.progressiveGridSignature;
 			delete grid.dataset.progressiveGridRendered;
@@ -35634,6 +35654,8 @@ P
 		} else {
 			filteredWishlist = wishlistRenderItems.filter(game => passesWishlistBaseFilters(game) && passesWishlistLetterSearch(game));
 		}
+
+		if (typeof window.syncAlphabeticalSortButtonState === 'function') window.syncAlphabeticalSortButtonState('wishlist', filteredWishlist.length);
 
 		filteredWishlist.sort((a, b) => (a.cleanName || '').localeCompare(b.cleanName || ''));
 		
@@ -39946,7 +39968,10 @@ function formatLibraryLastPlayedBadge(game = {}) {
 	}
 
 	window.applyLibraryFilters = function(isSilent = false) {
-		if (!lastScannedGames || lastScannedGames.length === 0) return;
+		if (!lastScannedGames || lastScannedGames.length === 0) {
+			if (typeof window.syncAlphabeticalSortButtonState === 'function') window.syncAlphabeticalSortButtonState('library', 0);
+			return;
+		}
 	
 		const term = document.getElementById('search-input').value.toLowerCase().trim();
 		const termNormalized = term.replace(/[^a-z0-9]/g, '');
@@ -40007,6 +40032,8 @@ function formatLibraryLastPlayedBadge(game = {}) {
 		} else {
 			filtered = lastScannedGames.filter(game => passesLibraryBaseFilters(game) && passesLibraryLetterSearch(game));
 		}
+
+		if (typeof window.syncAlphabeticalSortButtonState === 'function') window.syncAlphabeticalSortButtonState('library', filtered.length);
 
 		filtered.sort((a, b) => a.title.localeCompare(b.title));
 		
@@ -40290,6 +40317,7 @@ function formatLibraryLastPlayedBadge(game = {}) {
 		const activeFavs = (lastScannedGames || []).filter(installed => installed && favoriteLibraryPaths.has(normalizeLibraryGamePath(installed.path)));
 	
 		if (activeFavs.length === 0) {
+			if (typeof window.syncAlphabeticalSortButtonState === 'function') window.syncAlphabeticalSortButtonState('fav', 0);
 			clearProgressiveGridObserver('favorites', grid);
 			grid.dataset.progressiveGridRendered = '0';
 			if (countSpan) {
@@ -40362,6 +40390,8 @@ function formatLibraryLastPlayedBadge(game = {}) {
 		} else {
 			filteredFavs = activeFavs.filter(game => passesFavoriteBaseFilters(game) && passesFavoriteLetterSearch(game));
 		}
+
+		if (typeof window.syncAlphabeticalSortButtonState === 'function') window.syncAlphabeticalSortButtonState('fav', filteredFavs.length);
 
 		filteredFavs.sort((a, b) => a.title.localeCompare(b.title));
 		
@@ -64033,6 +64063,7 @@ function getVisibleChatStackEl(id) {
 		}) : [];
 	
 		if (window.friendsList.length === 0 && !isSearching) {
+			if (typeof window.syncAlphabeticalSortButtonState === 'function') window.syncAlphabeticalSortButtonState('friends', 0);
 			if (emptyMsg) emptyMsg.style.display = 'block';
 			if (container) {
 				container.classList.remove('friends-filter-empty');
@@ -64081,6 +64112,7 @@ function getVisibleChatStackEl(id) {
 		}
 
 		const friendsTotalMatches = filteredFriends.length + onlineOthers.length + globalOffline.length;
+		if (typeof window.syncAlphabeticalSortButtonState === 'function') window.syncAlphabeticalSortButtonState('friends', friendsTotalMatches);
 		const friendsProgressiveInitial = Math.max(1, Math.min(60, getProgressiveGridInitialLimit()));
 		const friendsProgressiveLoad = Math.max(1, Math.min(100, getProgressiveGridLoadAmount()));
 		const friendsUseProgressiveSearch = isSearching && friendsTotalMatches > friendsProgressiveInitial;
