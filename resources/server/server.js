@@ -1047,14 +1047,14 @@ async function initDb() {
       PRIMARY KEY (user_name, title_id)
     );
     CREATE INDEX IF NOT EXISTS idx_user_game_ownership_title_id ON user_game_ownership(title_id);
-    CREATE TABLE IF NOT EXISTS user_game_looking_for_group (
+    CREATE TABLE IF NOT EXISTS user_game_play_together (
       user_name TEXT NOT NULL REFERENCES users(name) ON DELETE CASCADE,
       title_id TEXT NOT NULL,
       title TEXT NOT NULL DEFAULT '',
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       PRIMARY KEY (user_name, title_id)
     );
-    CREATE INDEX IF NOT EXISTS idx_user_game_looking_for_group_title ON user_game_looking_for_group(title_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_user_game_play_together_title ON user_game_play_together(title_id, created_at DESC);
     CREATE TABLE IF NOT EXISTS user_shared_game_match_seen (
       user_name TEXT NOT NULL REFERENCES users(name) ON DELETE CASCADE,
       actor_name TEXT NOT NULL REFERENCES users(name) ON DELETE CASCADE,
@@ -3326,10 +3326,12 @@ function setCachedGamePlayersSummary(userName, titleId, summary = {}) {
       count: Math.max(0, Number(summary.count) || 0),
       friendCount: Math.max(0, Number(summary.friendCount) || 0),
       otherCount: Math.max(0, Number(summary.otherCount) || 0),
-      lfgCount: Math.max(0, Number(summary.lfgCount) || 0),
-      lfgFriendCount: Math.max(0, Number(summary.lfgFriendCount) || 0),
+      playTogetherCount: Math.max(0, Number(summary.playTogetherCount) || 0),
+      playTogetherFriendCount: Math.max(0, Number(summary.playTogetherFriendCount) || 0),
+      playTogetherOwnerCount: Math.max(0, Number(summary.playTogetherOwnerCount) || 0),
+      playTogetherOwnerFriendCount: Math.max(0, Number(summary.playTogetherOwnerFriendCount) || 0),
       viewerOwns: summary.viewerOwns === true,
-      viewerLookingForGroup: summary.viewerLookingForGroup === true,
+      viewerPlayTogether: summary.viewerPlayTogether === true,
       preview: Array.isArray(summary.preview) ? summary.preview.slice(0, 3).map(item => ({ ...item })) : []
     }
   });
@@ -3444,19 +3446,19 @@ async function isExistingGameOwner(userName, rawTitleId) {
   return !!result.rows[0];
 }
 
-async function isGameLookingForGroup(userName, rawTitleId) {
+async function isGamePlayTogether(userName, rawTitleId) {
   const name = normalizeText(userName, '');
   const titleId = normalizeGamePlayersTitleId(rawTitleId);
   if (!name || !titleId) return false;
   const result = await queryDbWithRetry(
-    'SELECT 1 FROM user_game_looking_for_group WHERE user_name = $1 AND title_id = $2 LIMIT 1',
+    'SELECT 1 FROM user_game_play_together WHERE user_name = $1 AND title_id = $2 LIMIT 1',
     [name, titleId],
-    { attempts: 2, label: 'LOOKING FOR GROUP STATE' }
+    { attempts: 2, label: 'PLAY TOGETHER STATE' }
   );
   return !!result.rows[0];
 }
 
-async function notifyLookingForGroupPlayers(actorName, rawTitleId, rawTitle) {
+async function notifyPlayTogetherPlayers(actorName, rawTitleId, rawTitle) {
   const actor = normalizeUserNotificationName(actorName);
   const titleId = normalizeGamePlayersTitleId(rawTitleId);
   const title = normalizeText(rawTitle, titleId).slice(0, 180) || titleId;
@@ -3464,15 +3466,12 @@ async function notifyLookingForGroupPlayers(actorName, rawTitleId, rawTitle) {
 
   const result = await queryDbWithRetry(
     `SELECT DISTINCT interest.user_name
-     FROM user_game_looking_for_group interest
-     JOIN user_game_ownership ownership
-       ON ownership.user_name = interest.user_name AND ownership.title_id = interest.title_id
+     FROM user_game_play_together interest
      WHERE interest.title_id = $1
        AND interest.user_name <> $2
-       AND (ownership.in_library = TRUE OR ownership.downloaded = TRUE)
      ORDER BY interest.user_name ASC`,
     [titleId, actor],
-    { attempts: 2, label: 'LOOKING FOR GROUP MATCH' }
+    { attempts: 2, label: 'PLAY TOGETHER MATCH' }
   );
 
   const recipients = (result.rows || [])
@@ -3484,12 +3483,12 @@ async function notifyLookingForGroupPlayers(actorName, rawTitleId, rawTitle) {
   const at = Date.now();
   for (let offset = 0; offset < recipients.length; offset += 8) {
     const batch = recipients.slice(offset, offset + 8);
-    const events = await Promise.all(batch.map(userName => recordUserNotification(userName, 'lfg', {
+    const events = await Promise.all(batch.map(userName => recordUserNotification(userName, 'playTogether', {
       actor,
       titleId,
       title
     }, {
-      dedupeKey: `${userName.toLowerCase()}:notification:lfg:${actor.toLowerCase()}:${titleId.toLowerCase()}`,
+      dedupeKey: `${userName.toLowerCase()}:notification:playTogether:${actor.toLowerCase()}:${titleId.toLowerCase()}`,
       at
     })));
     published += events.filter(Boolean).length;
@@ -3497,48 +3496,43 @@ async function notifyLookingForGroupPlayers(actorName, rawTitleId, rawTitle) {
   return published;
 }
 
-async function setGameLookingForGroup(userName, rawTitleId, enabled, rawTitle) {
+async function setGamePlayTogether(userName, rawTitleId, enabled, rawTitle) {
   const name = normalizeText(userName, '');
   const titleId = normalizeGamePlayersTitleId(rawTitleId);
   const title = normalizeText(rawTitle, titleId).slice(0, 180) || titleId;
   if (!name || !titleId) return { ok: false, error: 'Invalid game.' };
 
-  await ensureGameOwnershipIndexReady();
   if (enabled === true) {
-    if (!(await isExistingGameOwner(name, titleId))) {
-      return { ok: false, error: 'You need this game in your Library or Downloads first.' };
-    }
     const insertResult = await queryDbWithRetry(
-      `INSERT INTO user_game_looking_for_group (user_name, title_id, title, created_at)
+      `INSERT INTO user_game_play_together (user_name, title_id, title, created_at)
        VALUES ($1, $2, $3, NOW())
        ON CONFLICT (user_name, title_id) DO NOTHING
        RETURNING user_name`,
       [name, titleId, title],
-      { attempts: 2, label: 'LOOKING FOR GROUP ENABLE' }
+      { attempts: 2, label: 'PLAY TOGETHER ENABLE' }
     );
     clearGamePlayersSummaryCache(titleId);
     if (insertResult.rows[0]) {
-      deferServerTask('LOOKING FOR GROUP NOTIFICATIONS', () => notifyLookingForGroupPlayers(name, titleId, title), 0);
+      deferServerTask('PLAY TOGETHER NOTIFICATIONS', () => notifyPlayTogetherPlayers(name, titleId, title), 0);
     }
   } else {
     await queryDbWithRetry(
-      'DELETE FROM user_game_looking_for_group WHERE user_name = $1 AND title_id = $2',
+      'DELETE FROM user_game_play_together WHERE user_name = $1 AND title_id = $2',
       [name, titleId],
-      { attempts: 2, label: 'LOOKING FOR GROUP DISABLE' }
+      { attempts: 2, label: 'PLAY TOGETHER DISABLE' }
     );
     clearGamePlayersSummaryCache(titleId);
   }
 
-  return { ok: true, enabled: await isGameLookingForGroup(name, titleId) };
+  return { ok: true, enabled: await isGamePlayTogether(name, titleId) };
 }
 
 
-async function getLookingForGroupDiscoveryForUser(userName, rawAudience) {
+async function getPlayTogetherDiscoveryForUser(userName, rawAudience) {
   const viewerName = normalizeText(userName, '');
   const audience = rawAudience === 'friends' ? 'friends' : (rawAudience === 'others' ? 'others' : '');
   if (!viewerName || !audience) return [];
 
-  await ensureGameOwnershipIndexReady();
   const result = await queryDbWithRetry(
     `WITH viewer_friends AS (
        SELECT DISTINCT CASE
@@ -3561,12 +3555,9 @@ async function getLookingForGroupDiscoveryForUser(userName, rawAudience) {
        COUNT(*)::int AS player_count,
        ARRAY_AGG(interest.user_name ORDER BY interest.user_name ASC) FILTER (WHERE $2 = 'friends') AS friends,
        MAX(interest.created_at) AS updated_at
-     FROM user_game_looking_for_group interest
-     JOIN user_game_ownership ownership
-       ON ownership.user_name = interest.user_name AND ownership.title_id = interest.title_id
+     FROM user_game_play_together interest
      LEFT JOIN viewer_friends friend ON friend.name = interest.user_name
      WHERE interest.user_name <> $1
-       AND (ownership.in_library = TRUE OR ownership.downloaded = TRUE)
        AND (
          ($2 = 'friends' AND friend.name IS NOT NULL)
          OR
@@ -3575,7 +3566,7 @@ async function getLookingForGroupDiscoveryForUser(userName, rawAudience) {
      GROUP BY interest.title_id
      ORDER BY MAX(interest.created_at) DESC, interest.title_id ASC`,
     [viewerName, audience],
-    { attempts: 2, label: audience === 'friends' ? 'LOOKING FOR GROUP FRIEND STATE' : 'LOOKING FOR GROUP OTHER PLAYER STATE' }
+    { attempts: 2, label: audience === 'friends' ? 'PLAY TOGETHER FRIEND STATE' : 'PLAY TOGETHER OTHER PLAYER STATE' }
   );
 
   return (result.rows || []).map(row => {
@@ -3596,21 +3587,17 @@ async function getLookingForGroupDiscoveryForUser(userName, rawAudience) {
 }
 
 
-async function getLookingForGroupCommunityTitleIds(userName) {
+async function getPlayTogetherCommunityTitleIds(userName) {
   const viewerName = normalizeText(userName, '');
   if (!viewerName) return [];
 
-  await ensureGameOwnershipIndexReady();
   const result = await queryDbWithRetry(
     `SELECT DISTINCT interest.title_id
-     FROM user_game_looking_for_group interest
-     JOIN user_game_ownership ownership
-       ON ownership.user_name = interest.user_name AND ownership.title_id = interest.title_id
+     FROM user_game_play_together interest
      WHERE interest.user_name <> $1
-       AND (ownership.in_library = TRUE OR ownership.downloaded = TRUE)
      ORDER BY interest.title_id ASC`,
     [viewerName],
-    { attempts: 2, label: 'LOOKING FOR GROUP COMMUNITY GAME IDS' }
+    { attempts: 2, label: 'PLAY TOGETHER COMMUNITY GAME IDS' }
   );
 
   return (result.rows || []).map(row => normalizeGamePlayersTitleId(row.title_id)).filter(Boolean);
@@ -3859,17 +3846,6 @@ async function rebuildGameOwnershipIndexFromProfiles() {
     `);
   }, { attempts: 3, lockTimeoutMs: 2000, advisoryLockKey: 'user_game_ownership_rebuild' });
 
-  await queryDbWithRetry(
-    `DELETE FROM user_game_looking_for_group interest
-     WHERE NOT EXISTS (
-       SELECT 1 FROM user_game_ownership ownership
-       WHERE ownership.user_name = interest.user_name
-         AND ownership.title_id = interest.title_id
-         AND (ownership.in_library = TRUE OR ownership.downloaded = TRUE)
-     )`,
-    [],
-    { attempts: 2, label: 'LOOKING FOR GROUP OWNERSHIP CLEANUP' }
-  );
   clearGamePlayersSummaryCache();
   const countResult = await queryDbWithRetry(
     'SELECT COUNT(*)::int AS count FROM user_game_ownership',
@@ -3956,17 +3932,6 @@ async function syncUserGameOwnershipIndex(userName, changes = {}) {
       'DELETE FROM user_game_ownership WHERE user_name = $1 AND in_library = FALSE AND downloaded = FALSE',
       [safeName]
     );
-    await client.query(
-      `DELETE FROM user_game_looking_for_group interest
-       WHERE interest.user_name = $1
-         AND NOT EXISTS (
-           SELECT 1 FROM user_game_ownership ownership
-           WHERE ownership.user_name = interest.user_name
-             AND ownership.title_id = interest.title_id
-             AND (ownership.in_library = TRUE OR ownership.downloaded = TRUE)
-         )`,
-      [safeName]
-    );
   }, { attempts: 3, lockTimeoutMs: 1200, advisoryLockKey: `user_game_ownership:${safeName}` });
 
   clearGamePlayersSummaryCache();
@@ -3996,7 +3961,7 @@ function hydrateGamePlayerEntry(row, titleId) {
     isFriend: row && row.is_friend === true,
     inLibrary: row && row.in_library === true,
     downloaded: row && row.downloaded === true,
-    lookingForGroup: row && row.looking_for_group === true,
+    playTogether: row && row.play_together === true,
     playingNow: publicUser.online === true && !!ps3Status && ps3Status.status === 'playing' && playingTitleId === titleId
   };
 }
@@ -4004,7 +3969,7 @@ function hydrateGamePlayerEntry(row, titleId) {
 async function getGamePlayersSummaryForUser(userName, rawTitleId) {
   const viewerName = normalizeText(userName, '');
   const titleId = normalizeGamePlayersTitleId(rawTitleId);
-  if (!viewerName || !titleId) return { count: 0, friendCount: 0, otherCount: 0, lfgCount: 0, lfgFriendCount: 0, viewerOwns: false, viewerLookingForGroup: false, preview: [] };
+  if (!viewerName || !titleId) return { count: 0, friendCount: 0, otherCount: 0, playTogetherCount: 0, playTogetherFriendCount: 0, playTogetherOwnerCount: 0, playTogetherOwnerFriendCount: 0, viewerOwns: false, viewerPlayTogether: false, preview: [] };
 
   const cached = getCachedGamePlayersSummary(viewerName, titleId);
   if (cached) return cached;
@@ -4031,56 +3996,95 @@ async function getGamePlayersSummaryForUser(userName, rawTitleId) {
          ownership.user_name,
          ownership.in_library,
          ownership.downloaded,
-         (friend.name IS NOT NULL) AS is_friend,
-         (interest.user_name IS NOT NULL) AS looking_for_group
+         (friend.name IS NOT NULL) AS is_friend
        FROM user_game_ownership ownership
        LEFT JOIN viewer_friends friend ON friend.name = ownership.user_name
-       LEFT JOIN user_game_looking_for_group interest
-         ON interest.user_name = ownership.user_name AND interest.title_id = ownership.title_id
        WHERE ownership.title_id = $2
          AND ownership.user_name <> $1
          AND (ownership.in_library = TRUE OR ownership.downloaded = TRUE)
+     ),
+     play_together AS (
+       SELECT
+         interest.user_name,
+         (friend.name IS NOT NULL) AS is_friend,
+         (ownership.user_name IS NOT NULL) AS owns_game
+       FROM user_game_play_together interest
+       LEFT JOIN viewer_friends friend ON friend.name = interest.user_name
+       LEFT JOIN user_game_ownership ownership
+         ON ownership.user_name = interest.user_name
+        AND ownership.title_id = interest.title_id
+        AND (ownership.in_library = TRUE OR ownership.downloaded = TRUE)
+       WHERE interest.title_id = $2
+         AND interest.user_name <> $1
+     ),
+     metrics AS (
+       SELECT
+         (SELECT COUNT(*)::int FROM owners) AS total_count,
+         (SELECT COUNT(*)::int FROM owners WHERE is_friend) AS friend_count,
+         (SELECT COUNT(*)::int FROM play_together) AS play_together_count,
+         (SELECT COUNT(*)::int FROM play_together WHERE is_friend) AS play_together_friend_count,
+         (SELECT COUNT(*)::int FROM play_together WHERE owns_game) AS play_together_owner_count,
+         (SELECT COUNT(*)::int FROM play_together WHERE owns_game AND is_friend) AS play_together_owner_friend_count,
+         EXISTS (
+           SELECT 1 FROM user_game_ownership own
+           WHERE own.user_name = $1 AND own.title_id = $2 AND (own.in_library = TRUE OR own.downloaded = TRUE)
+         ) AS viewer_owns,
+         EXISTS (
+           SELECT 1 FROM user_game_play_together mine
+           WHERE mine.user_name = $1 AND mine.title_id = $2
+         ) AS viewer_play_together
      )
      SELECT
-       user_name,
-       in_library,
-       downloaded,
-       is_friend,
-       looking_for_group,
-       COUNT(*) OVER()::int AS total_count,
-       COUNT(*) FILTER (WHERE is_friend) OVER()::int AS friend_count,
-       COUNT(*) FILTER (WHERE looking_for_group) OVER()::int AS lfg_count,
-       COUNT(*) FILTER (WHERE is_friend AND looking_for_group) OVER()::int AS lfg_friend_count,
-       EXISTS (
-         SELECT 1 FROM user_game_ownership own
-         WHERE own.user_name = $1 AND own.title_id = $2 AND (own.in_library = TRUE OR own.downloaded = TRUE)
-       ) AS viewer_owns,
-       EXISTS (
-         SELECT 1 FROM user_game_looking_for_group mine
-         WHERE mine.user_name = $1 AND mine.title_id = $2
-       ) AS viewer_lfg
-     FROM owners
-     ORDER BY looking_for_group DESC, is_friend DESC, user_name ASC
-     LIMIT 3`,
+       owner.user_name,
+       owner.in_library,
+       owner.downloaded,
+       owner.is_friend,
+       CASE
+         WHEN owner.user_name IS NULL THEN FALSE
+         ELSE EXISTS (SELECT 1 FROM play_together pt WHERE pt.user_name = owner.user_name)
+       END AS play_together,
+       metrics.total_count,
+       metrics.friend_count,
+       metrics.play_together_count,
+       metrics.play_together_friend_count,
+       metrics.play_together_owner_count,
+       metrics.play_together_owner_friend_count,
+       metrics.viewer_owns,
+       metrics.viewer_play_together
+     FROM metrics
+     LEFT JOIN LATERAL (
+       SELECT candidate.*
+       FROM owners candidate
+       ORDER BY
+         CASE WHEN EXISTS (SELECT 1 FROM play_together pt WHERE pt.user_name = candidate.user_name) THEN 0 ELSE 1 END,
+         candidate.is_friend DESC,
+         candidate.user_name ASC
+       LIMIT 3
+     ) owner ON TRUE`,
     [viewerName, titleId],
     { attempts: 2, label: 'GAME PLAYERS SUMMARY READ' }
   );
 
   const rows = result.rows || [];
-  const count = rows.length ? Math.max(0, Number(rows[0].total_count) || 0) : 0;
-  const friendCount = rows.length ? Math.max(0, Number(rows[0].friend_count) || 0) : 0;
-  const lfgCount = rows.length ? Math.max(0, Number(rows[0].lfg_count) || 0) : 0;
-  const lfgFriendCount = rows.length ? Math.max(0, Number(rows[0].lfg_friend_count) || 0) : 0;
-  const viewerOwns = rows.length ? rows[0].viewer_owns === true : await isExistingGameOwner(viewerName, titleId);
-  const viewerLookingForGroup = rows.length ? rows[0].viewer_lfg === true : (viewerOwns ? await isGameLookingForGroup(viewerName, titleId) : false);
+  const first = rows[0] || {};
+  const count = Math.max(0, Number(first.total_count) || 0);
+  const friendCount = Math.max(0, Number(first.friend_count) || 0);
+  const playTogetherCount = Math.max(0, Number(first.play_together_count) || 0);
+  const playTogetherFriendCount = Math.max(0, Number(first.play_together_friend_count) || 0);
+  const playTogetherOwnerCount = Math.max(0, Number(first.play_together_owner_count) || 0);
+  const playTogetherOwnerFriendCount = Math.max(0, Number(first.play_together_owner_friend_count) || 0);
+  const viewerOwns = first.viewer_owns === true;
+  const viewerPlayTogether = first.viewer_play_together === true;
   const summary = {
     count,
     friendCount,
     otherCount: Math.max(0, count - friendCount),
-    lfgCount,
-    lfgFriendCount,
+    playTogetherCount,
+    playTogetherFriendCount,
+    playTogetherOwnerCount,
+    playTogetherOwnerFriendCount,
     viewerOwns,
-    viewerLookingForGroup,
+    viewerPlayTogether,
     preview: rows.map(row => hydrateGamePlayerEntry(row, titleId)).filter(item => item.name)
   };
   setCachedGamePlayersSummary(viewerName, titleId, summary);
@@ -4090,56 +4094,96 @@ async function getGamePlayersSummaryForUser(userName, rawTitleId) {
 async function getGamePlayersPageForUser(userName, rawTitleId, rawGroup, rawOffset, rawLimit) {
   const viewerName = normalizeText(userName, '');
   const titleId = normalizeGamePlayersTitleId(rawTitleId);
-  const group = rawGroup === 'lfg' ? 'lfg' : (rawGroup === 'friends' ? 'friends' : 'others');
+  const group = rawGroup === 'playTogether' ? 'playTogether' : (rawGroup === 'friends' ? 'friends' : 'others');
   const offset = Math.max(0, Math.min(100000, parseInt(rawOffset, 10) || 0));
   const limit = Math.max(10, Math.min(GAME_PLAYERS_PAGE_SIZE, parseInt(rawLimit, 10) || GAME_PLAYERS_PAGE_SIZE));
   if (!viewerName || !titleId) return { group, total: 0, offset, limit, hasMore: false, owners: [] };
 
   await ensureGameOwnershipIndexReady();
-  const result = await queryDbWithRetry(
-    `WITH viewer_friends AS (
-       SELECT DISTINCT CASE
-         WHEN jsonb_typeof(friend.value) = 'object' THEN NULLIF(BTRIM(friend.value->>'name'), '')
-         WHEN jsonb_typeof(friend.value) = 'string' THEN NULLIF(BTRIM(friend.value #>> '{}'), '')
-         ELSE NULL
-       END AS name
-       FROM users viewer
-       CROSS JOIN LATERAL jsonb_array_elements(
-         CASE
-           WHEN jsonb_typeof(viewer.data->'friendsData') = 'array' THEN viewer.data->'friendsData'
-           ELSE '[]'::jsonb
-         END
-       ) AS friend(value)
-       WHERE viewer.name = $1
-     )
-     SELECT
-       ownership.user_name,
-       ownership.in_library,
-       ownership.downloaded,
-       (friend.name IS NOT NULL) AS is_friend,
-       (interest.user_name IS NOT NULL) AS looking_for_group,
-       COUNT(*) OVER()::int AS group_count
-     FROM user_game_ownership ownership
-     LEFT JOIN viewer_friends friend ON friend.name = ownership.user_name
-     LEFT JOIN user_game_looking_for_group interest
-       ON interest.user_name = ownership.user_name AND interest.title_id = ownership.title_id
-     WHERE ownership.title_id = $2
-       AND ownership.user_name <> $1
-       AND (ownership.in_library = TRUE OR ownership.downloaded = TRUE)
-       AND (
-         ($3 = 'lfg' AND interest.user_name IS NOT NULL)
-         OR
-         ($3 = 'friends' AND friend.name IS NOT NULL AND interest.user_name IS NULL)
-         OR
-         ($3 = 'others' AND friend.name IS NULL AND interest.user_name IS NULL)
+  let result;
+
+  if (group === 'playTogether') {
+    result = await queryDbWithRetry(
+      `WITH viewer_friends AS (
+         SELECT DISTINCT CASE
+           WHEN jsonb_typeof(friend.value) = 'object' THEN NULLIF(BTRIM(friend.value->>'name'), '')
+           WHEN jsonb_typeof(friend.value) = 'string' THEN NULLIF(BTRIM(friend.value #>> '{}'), '')
+           ELSE NULL
+         END AS name
+         FROM users viewer
+         CROSS JOIN LATERAL jsonb_array_elements(
+           CASE
+             WHEN jsonb_typeof(viewer.data->'friendsData') = 'array' THEN viewer.data->'friendsData'
+             ELSE '[]'::jsonb
+           END
+         ) AS friend(value)
+         WHERE viewer.name = $1
        )
-     ORDER BY
-       CASE WHEN $3 = 'lfg' AND friend.name IS NOT NULL THEN 0 ELSE 1 END,
-       ownership.user_name ASC
-     LIMIT $4 OFFSET $5`,
-    [viewerName, titleId, group, limit, offset],
-    { attempts: 2, label: 'GAME PLAYERS PAGE READ' }
-  );
+       SELECT
+         interest.user_name,
+         COALESCE(ownership.in_library, FALSE) AS in_library,
+         COALESCE(ownership.downloaded, FALSE) AS downloaded,
+         (friend.name IS NOT NULL) AS is_friend,
+         TRUE AS play_together,
+         COUNT(*) OVER()::int AS group_count
+       FROM user_game_play_together interest
+       LEFT JOIN user_game_ownership ownership
+         ON ownership.user_name = interest.user_name
+        AND ownership.title_id = interest.title_id
+        AND (ownership.in_library = TRUE OR ownership.downloaded = TRUE)
+       LEFT JOIN viewer_friends friend ON friend.name = interest.user_name
+       WHERE interest.title_id = $2
+         AND interest.user_name <> $1
+       ORDER BY
+         CASE WHEN friend.name IS NOT NULL THEN 0 ELSE 1 END,
+         interest.user_name ASC
+       LIMIT $3 OFFSET $4`,
+      [viewerName, titleId, limit, offset],
+      { attempts: 2, label: 'GAME PLAY TOGETHER PAGE READ' }
+    );
+  } else {
+    result = await queryDbWithRetry(
+      `WITH viewer_friends AS (
+         SELECT DISTINCT CASE
+           WHEN jsonb_typeof(friend.value) = 'object' THEN NULLIF(BTRIM(friend.value->>'name'), '')
+           WHEN jsonb_typeof(friend.value) = 'string' THEN NULLIF(BTRIM(friend.value #>> '{}'), '')
+           ELSE NULL
+         END AS name
+         FROM users viewer
+         CROSS JOIN LATERAL jsonb_array_elements(
+           CASE
+             WHEN jsonb_typeof(viewer.data->'friendsData') = 'array' THEN viewer.data->'friendsData'
+             ELSE '[]'::jsonb
+           END
+         ) AS friend(value)
+         WHERE viewer.name = $1
+       )
+       SELECT
+         ownership.user_name,
+         ownership.in_library,
+         ownership.downloaded,
+         (friend.name IS NOT NULL) AS is_friend,
+         FALSE AS play_together,
+         COUNT(*) OVER()::int AS group_count
+       FROM user_game_ownership ownership
+       LEFT JOIN viewer_friends friend ON friend.name = ownership.user_name
+       LEFT JOIN user_game_play_together interest
+         ON interest.user_name = ownership.user_name AND interest.title_id = ownership.title_id
+       WHERE ownership.title_id = $2
+         AND ownership.user_name <> $1
+         AND (ownership.in_library = TRUE OR ownership.downloaded = TRUE)
+         AND interest.user_name IS NULL
+         AND (
+           ($3 = 'friends' AND friend.name IS NOT NULL)
+           OR
+           ($3 = 'others' AND friend.name IS NULL)
+         )
+       ORDER BY ownership.user_name ASC
+       LIMIT $4 OFFSET $5`,
+      [viewerName, titleId, group, limit, offset],
+      { attempts: 2, label: 'GAME PLAYERS PAGE READ' }
+    );
+  }
 
   const rows = result.rows || [];
   const total = rows.length ? Math.max(0, Number(rows[0].group_count) || 0) : 0;
@@ -6240,7 +6284,7 @@ async function getFriendActivityHistoryForUser(userName, afterId = 0, resolvedFr
   return { friendNames, items: result.rows.map(serializeFriendActivityRow).filter(Boolean), lastReadId: state.lastReadId, dismissedThroughId: state.dismissedThroughId, delta: safeAfterId > 0 };
 }
 
-const USER_NOTIFICATION_TYPES = new Set(['mention', 'reply', 'reaction', 'trophy', 'catalog', 'game_match', 'lfg']);
+const USER_NOTIFICATION_TYPES = new Set(['mention', 'reply', 'reaction', 'trophy', 'catalog', 'game_match', 'playTogether']);
 
 function normalizeUserNotificationName(value) {
   return normalizeText(value, '').slice(0, 80);
@@ -6274,7 +6318,7 @@ function normalizeUserNotificationData(type, rawData = {}) {
       trophyType: ['bronze', 'silver', 'gold', 'platinum'].includes(trophyType) ? trophyType : 'bronze'
     };
   }
-  if (type === 'lfg') {
+  if (type === 'playTogether') {
     return {
       actor: normalizeUserNotificationName(source.actor),
       titleId: normalizeText(source.titleId, '').toUpperCase().slice(0, 32),
@@ -8342,37 +8386,37 @@ io.on('connection', (socket) => {
     }
 
     const requestedMode = normalizeText(data && data.mode, '').toLowerCase();
-    const mode = requestedMode === 'mine' ? 'mine' : (requestedMode === 'friends' ? 'friends' : (requestedMode === 'others' ? 'others' : (requestedMode === 'community' ? 'community' : (requestedMode === 'list' ? 'list' : (requestedMode === 'lfg' ? 'lfg' : 'summary')))));
+    const mode = requestedMode === 'mine' ? 'mine' : (requestedMode === 'friends' ? 'friends' : (requestedMode === 'others' ? 'others' : (requestedMode === 'community' ? 'community' : (requestedMode === 'list' ? 'list' : (requestedMode === 'playTogether' ? 'playTogether' : 'summary')))));
     let titleId = '';
     try {
       if (mode === 'mine') {
         const result = await queryDbWithRetry(
           `SELECT title_id
-           FROM user_game_looking_for_group
+           FROM user_game_play_together
            WHERE user_name = $1
            ORDER BY created_at DESC`,
           [name],
-          { attempts: 2, label: 'LOOKING FOR GROUP OWN STATE' }
+          { attempts: 2, label: 'PLAY TOGETHER OWN STATE' }
         );
         const titleIds = (result.rows || []).map(row => normalizeGamePlayersTitleId(row.title_id)).filter(Boolean);
         const payload = { ok: true, mode, titleIds };
-        trackBandwidthPayload('game_players_lfg_mine', payload, 1);
+        trackBandwidthPayload('game_players_play_together_mine', payload, 1);
         respond(payload);
         return;
       }
 
       if (mode === 'community') {
-        const titleIds = await getLookingForGroupCommunityTitleIds(name);
+        const titleIds = await getPlayTogetherCommunityTitleIds(name);
         const payload = { ok: true, mode, titleIds };
-        trackBandwidthPayload('game_players_lfg_community', payload, 1);
+        trackBandwidthPayload('game_players_play_together_community', payload, 1);
         respond(payload);
         return;
       }
 
       if (mode === 'friends' || mode === 'others') {
-        const items = await getLookingForGroupDiscoveryForUser(name, mode);
+        const items = await getPlayTogetherDiscoveryForUser(name, mode);
         const payload = { ok: true, mode, items };
-        trackBandwidthPayload(mode === 'friends' ? 'game_players_lfg_friends' : 'game_players_lfg_others', payload, 1);
+        trackBandwidthPayload(mode === 'friends' ? 'game_players_play_together_friends' : 'game_players_play_together_others', payload, 1);
         respond(payload);
         return;
       }
@@ -8383,19 +8427,19 @@ io.on('connection', (socket) => {
         return;
       }
 
-      if (mode === 'lfg') {
-        const result = await setGameLookingForGroup(name, titleId, data && data.enabled === true, data && data.title);
+      if (mode === 'playTogether') {
+        const result = await setGamePlayTogether(name, titleId, data && data.enabled === true, data && data.title);
         if (!result || result.ok !== true) {
-          respond({ ok: false, titleId, mode, error: result && result.error ? result.error : 'Could not update Looking for Group.' });
+          respond({ ok: false, titleId, mode, error: result && result.error ? result.error : 'Could not update Play Together.' });
           return;
         }
         const summary = await getGamePlayersSummaryForUser(name, titleId);
         const payload = { ok: true, titleId, mode, enabled: result.enabled === true, ...summary };
-        trackBandwidthPayload('game_players_lfg', payload, 1);
+        trackBandwidthPayload('game_players_play_together', payload, 1);
         const statePayload = { titleId, enabled: result.enabled === true };
         const stateRecipients = getSocketsByUserName(name).filter(client => client && client.connected);
-        trackBandwidthPayload('game_lfg_state', statePayload, stateRecipients.length);
-        stateRecipients.forEach(client => client.emit('game_lfg_state', statePayload));
+        trackBandwidthPayload('game_play_together_state', statePayload, stateRecipients.length);
+        stateRecipients.forEach(client => client.emit('game_play_together_state', statePayload));
         respond(payload);
         return;
       }
