@@ -20027,6 +20027,8 @@ P
 		}
 	};
 	
+	let friendsEntryRevealToken = 0;
+
 	function applySocialSection(section) {
 		if (section !== 'chat' && typeof hideChatSuggestions === 'function') hideChatSuggestions();
 
@@ -20052,7 +20054,7 @@ P
 		if (parentView) parentView.style.overflow = section === 'chat' ? 'hidden' : 'visible';
 
 		if (section !== 'friends' && friendsView) {
-			window.__friendsEntryRevealToken = (Number(window.__friendsEntryRevealToken) || 0) + 1;
+			friendsEntryRevealToken++;
 			friendsView.classList.remove('friends-reveal-prep');
 		}
 
@@ -20199,10 +20201,9 @@ P
 			}
 			if(playTogetherView) { playTogetherView.style.display = 'none'; playTogetherView.classList.remove('anim-up'); }
 			const friendsGrid = document.getElementById('friends-list-grid');
-			const friendsRevealToken = (window.__friendsEntryRevealToken = (Number(window.__friendsEntryRevealToken) || 0) + 1);
+			const friendsRevealToken = ++friendsEntryRevealToken;
 			if(friendsView) {
-				/* Keep cached cards in the reveal start state on every entry, including
-				   same-signature reentries where renderFriendsList reuses the existing DOM. */
+				/* Keep cached cards hidden until the entry reveal is armed. */
 				friendsView.classList.add('friends-reveal-prep');
 				if (friendsGrid) {
 					friendsGrid.querySelectorAll(':scope > .online-user-item').forEach(card => {
@@ -20230,10 +20231,9 @@ P
 	
 			if (typeof renderFriendsList === 'function') {
 				runViewOpenWork('view-chat', () => {
-					if (window.__friendsEntryRevealToken !== friendsRevealToken) return;
+					if (friendsEntryRevealToken !== friendsRevealToken) return;
 					if (friendsView && friendsView.style.display === 'flex') {
-						/* Build/reuse the cards silently first, then arm exactly one reveal while
-						   friends-reveal-prep guarantees that no static frame can be painted. */
+						/* Reuse the DOM silently, then arm a single reveal. */
 						renderFriendsList('', true);
 						if (friendsGrid && typeof setupRevealAnimations === 'function') {
 							setupRevealAnimations(friendsGrid, { selector: ':scope > .online-user-item' });
@@ -20243,7 +20243,7 @@ P
 
 					requestAnimationFrame(() => {
 						requestAnimationFrame(() => {
-							if (window.__friendsEntryRevealToken === friendsRevealToken && friendsView) {
+							if (friendsEntryRevealToken === friendsRevealToken && friendsView) {
 								friendsView.classList.remove('friends-reveal-prep');
 							}
 						});
@@ -20334,7 +20334,6 @@ P
 				if (exitFinished) return;
 				exitFinished = true;
 				if (exitFallbackTimer) clearTimeout(exitFallbackTimer);
-				currentSubview.removeEventListener('animationend', handleSubviewExitEnd);
 				if (directExitAnimation) {
 					try { directExitAnimation.cancel(); } catch (e) {}
 				}
@@ -20345,13 +20344,8 @@ P
 				currentSubview.style.display = 'none';
 				window.showSocialSection(section, true);
 			};
-			const handleSubviewExitEnd = event => {
-				if (event.target !== currentSubview) return;
-				finishSubviewExit();
-			};
 
-			/* Global Chat is a heavy composited surface (virtualized messages + backdrop filters).
-			   Drive its exit directly so the transition cannot be swallowed by its render layer. */
+			/* Global Chat uses a direct exit animation to stay smooth on its composited surface. */
 			if (currentSubview === chatView && typeof currentSubview.animate === 'function') {
 				currentSubview.style.willChange = 'transform, opacity, filter';
 				directExitAnimation = currentSubview.animate([
@@ -20362,7 +20356,6 @@ P
 					easing: 'cubic-bezier(.4,0,1,1)',
 					fill: 'forwards'
 				});
-				directExitAnimation.id = 'psn-social-chat-exit';
 				directExitAnimation.finished.then(finishSubviewExit).catch(() => {});
 				exitFallbackTimer = setTimeout(finishSubviewExit, 220);
 				return;
@@ -20370,14 +20363,13 @@ P
 
 			void currentSubview.offsetWidth;
 			currentSubview.classList.add('anim-out');
-			currentSubview.addEventListener('animationend', handleSubviewExitEnd);
-			exitFallbackTimer = setTimeout(finishSubviewExit, 220);
+			if (typeof waitForPsnAnimationEnd === 'function') waitForPsnAnimationEnd(currentSubview, finishSubviewExit, 220);
+			else exitFallbackTimer = setTimeout(finishSubviewExit, 220);
 			return;
 		}
 
 		applySocialSection(section);
-	}
-;
+	};
 	
 	function getHistoryReturnViewId(history) {
 		if (!history) return 'view-browse';
@@ -23132,10 +23124,11 @@ P
 			const dx = oldEntry.layoutLeft - (Number(card.offsetLeft) || 0);
 			const dy = oldEntry.layoutTop - (Number(card.offsetTop) || 0);
 			if (Math.abs(dx) < .5 && Math.abs(dy) < .5) return;
-			/* Friends cards reserve transform for their native reveal/hover states.
-			   Animate the independent translate property there so a pure reorder never
-			   falls back to, or visually collides with, the entry reveal. */
-			const motionFrames = snapshot.scope === 'friends'
+			/* Friends and Trophies reserve transform for their native card states.
+			   Use the independent translate property so FLIP cannot be overridden by
+			   reveal/hover rules (Trophies also keep transform:none !important in no-anim). */
+			const useIndependentTranslate = snapshot.scope === 'friends' || snapshot.scope === 'trophies';
+			const motionFrames = useIndependentTranslate
 				? [{ translate: `${dx}px ${dy}px` }, { translate: '0px 0px' }]
 				: [{ transform: `translate3d(${dx}px,${dy}px,0)` }, { transform: 'translate3d(0,0,0)' }];
 			const animation = card.animate(motionFrames, {
