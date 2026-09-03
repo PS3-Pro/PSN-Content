@@ -1,4 +1,4 @@
-name: Update Server Dependencies
+name: Update Server Runtime & Dependencies
 
 on:
   schedule:
@@ -10,11 +10,11 @@ permissions:
   contents: write
 
 concurrency:
-  group: update-server-dependencies
+  group: update-server-runtime-dependencies
   cancel-in-progress: false
 
 jobs:
-  update-server-dependencies:
+  update-server:
     runs-on: ubuntu-latest
 
     defaults:
@@ -26,6 +26,32 @@ jobs:
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
+
+      - name: Update Node 24 pin
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          LATEST_NODE_24="$(
+            curl -fsSL https://nodejs.org/dist/index.json             | jq -r '.[].version | select(startswith("v24.")) | ltrimstr("v")'             | sort -V             | tail -n 1
+          )"
+
+          if [ -z "$LATEST_NODE_24" ]; then
+            echo "Could not determine latest Node 24 release."
+            exit 1
+          fi
+
+          CURRENT_NODE="$(tr -d '[:space:]' < .node-version)"
+
+          echo "Current Node: $CURRENT_NODE"
+          echo "Latest Node 24: $LATEST_NODE_24"
+
+          if [ "$CURRENT_NODE" != "$LATEST_NODE_24" ]; then
+            printf '%s\n' "$LATEST_NODE_24" > .node-version
+            echo "Updated .node-version to $LATEST_NODE_24"
+          else
+            echo "Node 24 is already current."
+          fi
 
       - name: Set up Node.js
         uses: actions/setup-node@v7
@@ -54,28 +80,31 @@ jobs:
           npm ci --omit=dev
           node --check server.js
 
-      - name: Show dependency changes
+      - name: Show dependency status
         run: |
           npm outdated || true
           npm audit --omit=dev || true
 
-      - name: Commit and push dependency updates
+      - name: Commit and push safe updates
         working-directory: .
         shell: bash
         run: |
+          set -euo pipefail
+
           git config --global user.name "PS3-Pro Bot"
           git config --global user.email "bot@ps3pro.com"
 
-          git add resources/server/package.json resources/server/package-lock.json
+          git add             resources/server/.node-version             resources/server/package.json             resources/server/package-lock.json
 
           if git diff --cached --quiet; then
-            echo "Server dependencies are already up to date."
-          else
-            git commit -m "Auto-update: Server dependencies"
-            git pull --rebase origin main
-            git push origin main
+            echo "Server runtime and dependencies are already up to date."
+            exit 0
           fi
 
-      - name: Fail if vulnerabilities still remain
+          git commit -m "Auto-update: Server runtime and dependencies"
+          git pull --rebase origin main
+          git push origin main
+
+      - name: Fail if vulnerabilities remain
         run: |
           npm audit --omit=dev --audit-level=low
