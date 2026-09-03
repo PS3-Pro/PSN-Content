@@ -1,0 +1,79 @@
+name: Update Server Dependencies
+
+on:
+  schedule:
+    # 04:00 UTC = 01:00 America/Sao_Paulo
+    # Kept after the existing database/avatar jobs to reduce push conflicts.
+    - cron: '0 4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-server-dependencies
+  cancel-in-progress: false
+
+jobs:
+  update-server-dependencies:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version-file: 'resources/server/.node-version'
+          cache: 'npm'
+          cache-dependency-path: 'resources/server/package-lock.json'
+
+      - name: Validate current server dependencies
+        working-directory: resources/server
+        run: |
+          npm ci --omit=dev
+          node --check server.js
+
+      - name: Apply safe security updates
+        working-directory: resources/server
+        shell: bash
+        run: |
+          echo "=== Audit before update ==="
+          npm audit --omit=dev || true
+
+          echo "=== Applying SemVer-compatible security fixes ==="
+          npm audit fix --package-lock-only --omit=dev || true
+
+      - name: Validate updated lockfile
+        working-directory: resources/server
+        run: |
+          rm -rf node_modules
+          npm ci --omit=dev
+          node --check server.js
+
+      - name: Show final security audit
+        working-directory: resources/server
+        continue-on-error: true
+        run: npm audit --omit=dev
+
+      - name: Commit and push safe dependency updates
+        shell: bash
+        run: |
+          git config --global user.name "PS3-Pro Bot"
+          git config --global user.email "bot@ps3pro.com"
+
+          git add resources/server/package.json resources/server/package-lock.json
+
+          if git diff --cached --quiet; then
+            echo "Server dependencies are already up to date."
+            exit 0
+          fi
+
+          git commit -m "Auto-update: Server security dependencies"
+
+          # Another scheduled workflow may have pushed while this job was running.
+          git pull --rebase origin main
+          git push origin main
