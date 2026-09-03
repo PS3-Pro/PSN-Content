@@ -7552,7 +7552,7 @@ img { -webkit-user-drag: none !important; user-drag: none !important; }
 
 				<div class="browse-toolbar" id="trophy-toolbar" style="margin-left: calc(var(--page-gutter) * -1); margin-right: calc(var(--page-gutter) * -1); padding-left: var(--page-gutter); padding-right: var(--page-gutter); margin-bottom: 20px;">
 					<div class="toolbar-group">
-						<select id="trophy-filter-select" onmouseenter="playUiArrow()" onmousedown="playUiDropdown(event)" onchange="applyCollectionToolbarFilterChange('trophies')">
+						<select id="trophy-filter-select" onmouseenter="playUiArrow()" onmousedown="playUiDropdown(event)" onchange="applyCollectionToolbarFilterChange('trophies', { revealVisibleIfStatic:true })">
 							<option value="all">All Trophies</option>
 							<option value="unlocked">Unlocked</option>
 							<option value="locked">Locked</option>
@@ -7560,7 +7560,7 @@ img { -webkit-user-drag: none !important; user-drag: none !important; }
 							<option value="reward">Rewards</option>
 						</select>
 
-						<select id="trophy-sort-select" onmouseenter="playUiArrow()" onmousedown="playUiDropdown(event)" onchange="resetSortToDefault('trophy'); applyCollectionToolbarFilterChange('trophies', { revealNew:false })">
+						<select id="trophy-sort-select" onmouseenter="playUiArrow()" onmousedown="playUiDropdown(event)" onchange="resetSortToDefault('trophy'); applyCollectionToolbarFilterChange('trophies', { revealNew:false, revealVisibleIfStatic:true })">
 							<option value="default">Category / Group</option>
 							<option value="grade">Trophy Grade</option>
 							<option value="rarity">Rarity</option>
@@ -7573,10 +7573,10 @@ img { -webkit-user-drag: none !important; user-drag: none !important; }
 					</div>
 					<div class="toolbar-group">
 						<div class="filter-checkboxes" id="trophy-grade-filters">
-							<label onmouseenter="playUiArrow()"><input type="checkbox" value="platinum" checked onchange="applyCollectionToolbarFilterChange('trophies')"><span class="ps-trophy-icon ps-trophy-platinum" aria-hidden="true"></span> Platinum</label>
-							<label onmouseenter="playUiArrow()"><input type="checkbox" value="gold" checked onchange="applyCollectionToolbarFilterChange('trophies')"><span class="ps-trophy-icon ps-trophy-gold" aria-hidden="true"></span> Gold</label>
-							<label onmouseenter="playUiArrow()"><input type="checkbox" value="silver" checked onchange="applyCollectionToolbarFilterChange('trophies')"><span class="ps-trophy-icon ps-trophy-silver" aria-hidden="true"></span> Silver</label>
-							<label onmouseenter="playUiArrow()"><input type="checkbox" value="bronze" checked onchange="applyCollectionToolbarFilterChange('trophies')"><span class="ps-trophy-icon ps-trophy-bronze" aria-hidden="true"></span> Bronze</label>
+							<label onmouseenter="playUiArrow()"><input type="checkbox" value="platinum" checked onchange="applyCollectionToolbarFilterChange('trophies', { revealVisibleIfStatic:true })"><span class="ps-trophy-icon ps-trophy-platinum" aria-hidden="true"></span> Platinum</label>
+							<label onmouseenter="playUiArrow()"><input type="checkbox" value="gold" checked onchange="applyCollectionToolbarFilterChange('trophies', { revealVisibleIfStatic:true })"><span class="ps-trophy-icon ps-trophy-gold" aria-hidden="true"></span> Gold</label>
+							<label onmouseenter="playUiArrow()"><input type="checkbox" value="silver" checked onchange="applyCollectionToolbarFilterChange('trophies', { revealVisibleIfStatic:true })"><span class="ps-trophy-icon ps-trophy-silver" aria-hidden="true"></span> Silver</label>
+							<label onmouseenter="playUiArrow()"><input type="checkbox" value="bronze" checked onchange="applyCollectionToolbarFilterChange('trophies', { revealVisibleIfStatic:true })"><span class="ps-trophy-icon ps-trophy-bronze" aria-hidden="true"></span> Bronze</label>
 						</div>
 					</div>
 				</div>
@@ -21972,7 +21972,7 @@ P
 			else if (typeof window.renderPlayTogetherSocialPanel === 'function') window.renderPlayTogetherSocialPanel(false);
 		}
 		if (view === 'trophy') {
-			if (typeof window.applyCollectionToolbarFilterChange === 'function') window.applyCollectionToolbarFilterChange('trophies', { revealNew:false });
+			if (typeof window.applyCollectionToolbarFilterChange === 'function') window.applyCollectionToolbarFilterChange('trophies', { revealNew:false, orderFlip:true, revealVisibleIfStatic:true });
 			else renderTrophiesView(true, { replayEntry:false });
 		}
 	};
@@ -22989,7 +22989,6 @@ P
 			gridId: 'trophy-grid-container',
 			itemSelector: ':scope > .trophy-card',
 			pendingClass: '',
-			captureAllLayout: true,
 			render: () => {
 				if (typeof window.renderTrophiesView === 'function') window.renderTrophiesView(true, { replayEntry:false });
 			}
@@ -23051,7 +23050,7 @@ P
 		});
 	}
 
-	function captureCollectionFilterMotion(scope) {
+	function captureCollectionFilterMotion(scope, options = {}) {
 		const config = getCollectionFilterMotionConfig(scope);
 		const grid = config ? document.getElementById(config.gridId) : null;
 		if (!config || !grid) return null;
@@ -23059,29 +23058,31 @@ P
 		cancelCollectionFilterMotionAnimations(grid, config.itemSelector);
 		settleCollectionFilterReveals(grid);
 		const scrollArea = document.getElementById('scroll-area') || document.querySelector('.content');
+		const boundedOrderFlip = scope === 'trophies' && options.orderFlip === true;
 		const snapshot = {
 			scope,
 			gridId: config.gridId,
 			scrollTop: scrollArea ? Math.max(0, Number(scrollArea.scrollTop) || 0) : 0,
 			existingKeys: new Set(),
-			entries: new Map()
+			entries: new Map(),
+			orderIndexes: boundedOrderFlip ? new Map() : null,
+			boundedOrderFlip
 		};
 
 		const canAnimate = !document.hidden && !browseMotionReduced() && typeof Element.prototype.animate === 'function';
 		const viewport = canAnimate ? getBrowseMotionViewportRect() : null;
 
-		/* Keep identity for the whole rendered collection. Most collections capture FLIP
-		   geometry only around the viewport; Trophies captures the full vertical layout
-		   because reversing the order can bring cards from the opposite end of the list. */
+		/* Keep identity for the whole collection, but only capture geometry near the
+		   viewport. Trophies order reversal stores indexes for direction without
+		   animating or measuring offscreen travel. */
 		Array.from(grid.querySelectorAll(config.itemSelector)).forEach((card, index) => {
 			const key = getCollectionFilterMotionCardKey(card);
 			if (!key) return;
 			snapshot.existingKeys.add(key);
+			if (snapshot.orderIndexes) snapshot.orderIndexes.set(key, index);
 			if (!canAnimate) return;
-			if (!config.captureAllLayout) {
-				const rect = card.getBoundingClientRect();
-				if (!rect.width || !rect.height || !browseMotionRectVisible(rect, viewport, 48)) return;
-			}
+			const rect = card.getBoundingClientRect();
+			if (!rect.width || !rect.height || !browseMotionRectVisible(rect, viewport, 48)) return;
 			snapshot.entries.set(key, {
 				index,
 				layoutLeft: Number(card.offsetLeft) || 0,
@@ -23105,10 +23106,10 @@ P
 	}
 
 	function animateCollectionFilterMotion(snapshot) {
-		if (!snapshot || !snapshot.entries || !snapshot.entries.size || document.hidden || browseMotionReduced() || typeof Element.prototype.animate !== 'function') return;
+		if (!snapshot || document.hidden || browseMotionReduced() || typeof Element.prototype.animate !== 'function') return 0;
 		const config = getCollectionFilterMotionConfig(snapshot.scope);
 		const grid = document.getElementById(snapshot.gridId);
-		if (!config || !grid) return;
+		if (!config || !grid) return 0;
 		const viewport = getBrowseMotionViewportRect();
 		const duration = 440;
 		const delayStep = 12;
@@ -23117,12 +23118,27 @@ P
 		Array.from(grid.querySelectorAll(config.itemSelector)).forEach((card, index) => {
 			const key = getCollectionFilterMotionCardKey(card);
 			const oldEntry = key ? snapshot.entries.get(key) : null;
-			if (!oldEntry || oldEntry.index === index) return;
+			const oldIndex = key && snapshot.orderIndexes ? snapshot.orderIndexes.get(key) : null;
+			if (!oldEntry && !Number.isInteger(oldIndex)) return;
+			if ((oldEntry ? oldEntry.index : oldIndex) === index) return;
 			const nextRect = card.getBoundingClientRect();
-			if (!browseMotionRectVisible(nextRect, viewport, 48)) return;
-			/* Layout coordinates ignore entrance/hover transforms, so FLIP cannot inherit another animation's offset. */
-			const dx = oldEntry.layoutLeft - (Number(card.offsetLeft) || 0);
-			const dy = oldEntry.layoutTop - (Number(card.offsetTop) || 0);
+			if (!nextRect.width || !nextRect.height || !browseMotionRectVisible(nextRect, viewport, 48)) return;
+
+			let dx = 0;
+			let dy = 0;
+			if (oldEntry) {
+				/* Layout coordinates ignore entrance/hover transforms, so FLIP cannot inherit another animation's offset. */
+				dx = oldEntry.layoutLeft - (Number(card.offsetLeft) || 0);
+				dy = oldEntry.layoutTop - (Number(card.offsetTop) || 0);
+			}
+
+			if (snapshot.boundedOrderFlip) {
+				const maxTravel = Math.max(80, nextRect.height * 1.3);
+				if (!oldEntry && Number.isInteger(oldIndex)) dy = oldIndex > index ? maxTravel : -maxTravel;
+				dx = Math.max(-maxTravel, Math.min(maxTravel, dx));
+				dy = Math.max(-maxTravel, Math.min(maxTravel, dy));
+			}
+
 			if (Math.abs(dx) < .5 && Math.abs(dy) < .5) return;
 			/* Friends and Trophies reserve transform for their native card states.
 			   Use the independent translate property so FLIP cannot be overridden by
@@ -23139,13 +23155,15 @@ P
 			});
 			animation.id = 'psn-collection-filter-relayout';
 		});
+
+		return movedIndex;
 	}
 
 	function revealCollectionFilterNewCards(snapshot) {
-		if (!snapshot || !snapshot.existingKeys) return;
+		if (!snapshot || !snapshot.existingKeys) return 0;
 		const config = getCollectionFilterMotionConfig(snapshot.scope);
 		const grid = document.getElementById(snapshot.gridId);
-		if (!config || !grid) return;
+		if (!config || !grid) return 0;
 		const markedTargets = [];
 
 		Array.from(grid.querySelectorAll(config.itemSelector)).forEach(card => {
@@ -23168,6 +23186,7 @@ P
 			target.addEventListener('animationend', clearMarker, { once:true });
 			setTimeout(clearMarker, 1800);
 		});
+		return markedTargets.length;
 	}
 
 	async function animateLibraryRefreshMotion(games) {
@@ -23202,15 +23221,19 @@ P
 	window.applyCollectionToolbarFilterChange = function(scope, options = {}) {
 		const config = getCollectionFilterMotionConfig(scope);
 		if (!config) return;
-		const snapshot = captureCollectionFilterMotion(scope);
+		const snapshot = captureCollectionFilterMotion(scope, options);
 		config.render();
 		if (!snapshot) return;
 
 		/* A rebuild can temporarily shrink scrollHeight and let the browser clamp scrollTop.
 		   Restore before measuring the new card positions so FLIP uses the real viewport. */
 		restoreCollectionFilterScroll(snapshot);
-		animateCollectionFilterMotion(snapshot);
-		if (options.revealNew !== false) revealCollectionFilterNewCards(snapshot);
+		const movedCount = animateCollectionFilterMotion(snapshot);
+		const revealedCount = options.revealNew !== false ? revealCollectionFilterNewCards(snapshot) : 0;
+		if (options.revealVisibleIfStatic === true && movedCount === 0 && revealedCount === 0 && typeof window.setupRevealAnimations === 'function') {
+			const grid = document.getElementById(snapshot.gridId);
+			if (grid) window.setupRevealAnimations(grid, { selector: config.itemSelector, animClass: 'anim-reveal', immediate: true });
+		}
 		requestAnimationFrame(() => restoreCollectionFilterScroll(snapshot));
 	};
 
