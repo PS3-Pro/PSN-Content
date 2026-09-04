@@ -321,7 +321,8 @@ body { margin: 0; font-family: -apple-system,BlinkMacSystemFont,"Segoe UI",Robot
 .sidebar-menu li:has(>.sidebar-count-pill:not(.is-empty))>.notification-dot { right: 17px; top: 10px; width: 6px; height: 6px; z-index: 2; }
 @keyframes sidebarCountPillLiveBump{0%,100%{transform:scale(1);}34%,62%{transform:translateY(-1px) scale(1.12);background-color:#fff;color:#07111f;border-color:#fff;box-shadow:0 7px 20px rgba(0,0,0,.24),0 0 18px rgba(255,255,255,.24),inset 0 1px 0 #fff;}}
 @keyframes modalCountPillLiveBump{0%,100%{transform:scale(1);}22%,78%{transform:translateY(-1px) scale(1.12);background-color:#fff;color:#07111f;border-color:#fff;box-shadow:0 7px 20px rgba(0,0,0,.24),0 0 18px rgba(255,255,255,.24),inset 0 1px 0 #fff;}}
-.sidebar-count-pill.count-pill-live-bump, #online-count-wrapper.count-pill-live-bump { animation: sidebarCountPillLiveBump .48s cubic-bezier(.22,1,.36,1); }
+.sidebar-count-pill.count-pill-live-bump, #online-count-wrapper.count-pill-live-bump, #view-browse .content-download-card-count.count-pill-live-bump { animation: sidebarCountPillLiveBump .48s cubic-bezier(.22,1,.36,1); }
+#view-browse .content-download-card-count.count-pill-live-bump i { animation: onlineCountTextLiveBump .48s cubic-bezier(.22,1,.36,1); }
 #modal-sys-online .profile-list-modal-count.count-pill-live-bump, #modal-sys-list .profile-list-modal-count.count-pill-live-bump, #modal-sys-list .game-player-section-count.count-pill-live-bump, #game-modal .game-player-owners.count-pill-live-bump, #game-modal .game-play-together-btn.count-pill-live-bump { animation: modalCountPillLiveBump .65s cubic-bezier(.22,1,.36,1); }
 #online-count-wrapper.count-pill-live-bump #online-count { animation: onlineCountTextLiveBump .48s cubic-bezier(.22,1,.36,1); }
 @keyframes onlineCountTextLiveBump{0%,100%{color:#fff;}34%,62%{color:#07111f;}}
@@ -22888,15 +22889,28 @@ P
 
 	window.__contentDownloadCountPendingKeys = window.__contentDownloadCountPendingKeys instanceof Set ? window.__contentDownloadCountPendingKeys : new Set();
 	window.__contentDownloadCountQueuedKeys = window.__contentDownloadCountQueuedKeys instanceof Set ? window.__contentDownloadCountQueuedKeys : new Set();
+	window.__contentDownloadCountRefreshAfterPending = window.__contentDownloadCountRefreshAfterPending instanceof Map ? window.__contentDownloadCountRefreshAfterPending : new Map();
 	window.__contentDownloadCountRequestTimer = window.__contentDownloadCountRequestTimer || null;
 
-	window.requestContentDownloadCounts = function(rawKeys = []) {
+	window.requestContentDownloadCounts = function(rawKeys = [], options = {}) {
 		if (!(typeof socketChat !== 'undefined' && socketChat && socketChat.connected)) return false;
-		const keys = [...new Set((Array.isArray(rawKeys) ? rawKeys : [])
+		const force = options.force === true;
+		const normalizedKeys = [...new Set((Array.isArray(rawKeys) ? rawKeys : [])
 			.map(value => String(value || '').trim())
 			.filter(Boolean))]
-			.filter(key => !Object.prototype.hasOwnProperty.call(window.contentDownloadCounts || {}, key) && !window.__contentDownloadCountPendingKeys.has(key))
 			.slice(0, 200);
+
+		if (force) {
+			normalizedKeys.forEach(key => {
+				if (!window.__contentDownloadCountPendingKeys.has(key)) return;
+				const queued = window.__contentDownloadCountRefreshAfterPending.get(key) || {};
+				window.__contentDownloadCountRefreshAfterPending.set(key, { animate: queued.animate === true || options.animate === true });
+			});
+		}
+
+		const keys = normalizedKeys
+			.filter(key => !window.__contentDownloadCountPendingKeys.has(key))
+			.filter(key => force || !Object.prototype.hasOwnProperty.call(window.contentDownloadCounts || {}, key));
 		if (!keys.length) return false;
 
 		keys.forEach(key => window.__contentDownloadCountPendingKeys.add(key));
@@ -22904,7 +22918,17 @@ P
 		const release = () => {
 			if (settled) return;
 			settled = true;
-			keys.forEach(key => window.__contentDownloadCountPendingKeys.delete(key));
+			const refreshKeys = [];
+			let animateRefresh = false;
+			keys.forEach(key => {
+				window.__contentDownloadCountPendingKeys.delete(key);
+				const queued = window.__contentDownloadCountRefreshAfterPending.get(key);
+				if (!queued) return;
+				window.__contentDownloadCountRefreshAfterPending.delete(key);
+				refreshKeys.push(key);
+				if (queued.animate === true) animateRefresh = true;
+			});
+			if (refreshKeys.length) setTimeout(() => window.requestContentDownloadCounts(refreshKeys, { force: true, animate: animateRefresh }), 0);
 		};
 		const timeout = setTimeout(() => {
 			release();
@@ -22915,7 +22939,7 @@ P
 			clearTimeout(timeout);
 			release();
 			if (payload && payload.success !== false && typeof window.setContentDownloadCounts === 'function') {
-				window.setContentDownloadCounts(payload, { partial: true });
+				window.setContentDownloadCounts(payload, { partial: true, animate: options.animate === true, onlyKeys: keys });
 			}
 		});
 		return true;
@@ -22945,8 +22969,12 @@ P
 		}
 	};
 
-	window.applyContentDownloadCountsToCards = function(root = document) {
+	window.applyContentDownloadCountsToCards = function(root = document, options = {}) {
 		if (!root || !root.querySelectorAll) return;
+		const onlyKeys = Array.isArray(options.keys) && options.keys.length
+			? new Set(options.keys.map(value => String(value || '').trim()).filter(Boolean))
+			: null;
+		const animate = options.animate === true;
 		const missingKeys = [];
 		root.querySelectorAll('.content-download-card-count').forEach(element => {
 			const key = window.getContentDownloadCountKey(
@@ -22959,6 +22987,7 @@ P
 				element.hidden = true;
 				return;
 			}
+			if (onlyKeys && !onlyKeys.has(key)) return;
 
 			const hasCount = Object.prototype.hasOwnProperty.call(window.contentDownloadCounts || {}, key);
 			if (!hasCount) {
@@ -22968,10 +22997,19 @@ P
 			}
 
 			const count = Math.max(0, Number(window.contentDownloadCounts[key]) || 0);
+			const nextValue = String(count);
+			const hadInitialized = element.dataset.downloadCountInitialized === '1' && element.dataset.downloadCountKey === key;
+			const previousValue = element.dataset.downloadCountValue ?? '';
 			const value = element.querySelector('span');
 			if (value) value.textContent = window.formatContentDownloadCount(count);
 			element.title = `${count.toLocaleString('en-US')} ${count === 1 ? 'user downloaded' : 'users downloaded'} this content`;
 			element.hidden = false;
+			element.dataset.downloadCountInitialized = '1';
+			element.dataset.downloadCountKey = key;
+			element.dataset.downloadCountValue = nextValue;
+			if (animate && hadInitialized && previousValue !== nextValue && typeof window.animateCountPillFeedback === 'function') {
+				window.animateCountPillFeedback(element);
+			}
 		});
 		if (missingKeys.length) window.scheduleContentDownloadCountRequest(missingKeys);
 	};
@@ -22984,6 +23022,7 @@ P
 
 		const partial = options.partial === true || (payload && payload.partial === true);
 		const counts = partial ? (window.contentDownloadCounts || Object.create(null)) : Object.create(null);
+		const appliedKeys = [];
 		Object.entries(rawCounts).forEach(([rawKey, rawValue]) => {
 			const key = String(rawKey || '').trim();
 			const value = rawValue && typeof rawValue === 'object'
@@ -22991,13 +23030,15 @@ P
 				: rawValue;
 			if (!key || !Number.isFinite(Number(value))) return;
 			counts[key] = Math.max(0, Number(value) || 0);
+			appliedKeys.push(key);
 			if (window.__contentDownloadCountPendingKeys) window.__contentDownloadCountPendingKeys.delete(key);
 		});
 
 		window.contentDownloadCounts = counts;
 		window.contentDownloadCountsReady = true;
 		try { localStorage.removeItem(CONTENT_DOWNLOAD_COUNTS_CACHE_KEY); } catch (err) {}
-		window.applyContentDownloadCountsToCards(document);
+		const requestedKeys = Array.isArray(options.onlyKeys) ? options.onlyKeys : appliedKeys;
+		window.applyContentDownloadCountsToCards(document, { keys: partial ? requestedKeys : null, animate: options.animate === true });
 		return true;
 	};
 
@@ -58069,6 +58110,29 @@ function getVisibleChatStackEl(id) {
 		
 		socketChat.on('content_download_counts', payload => {
 			if (typeof window.setContentDownloadCounts === 'function') window.setContentDownloadCounts(payload || {});
+		});
+
+		socketChat.on('content_download_counts_changed', payload => {
+			if (!payload || typeof window.requestContentDownloadCounts !== 'function' || typeof window.getContentDownloadCountKey !== 'function') return;
+			const changedKeys = [...new Set((Array.isArray(payload.keys) ? payload.keys : [])
+				.map(value => String(value || '').trim())
+				.filter(Boolean))];
+			if (!changedKeys.length) return;
+
+			const cachedKeys = window.contentDownloadCounts || Object.create(null);
+			const renderedKeys = new Set();
+			document.querySelectorAll('.content-download-card-count').forEach(element => {
+				const key = window.getContentDownloadCountKey(
+					element.dataset.downloadCategory,
+					element.dataset.downloadTitleId,
+					element.dataset.downloadContentId,
+					element.dataset.downloadName
+				);
+				if (key) renderedKeys.add(key);
+			});
+
+			const relevantKeys = changedKeys.filter(key => Object.prototype.hasOwnProperty.call(cachedKeys, key) || renderedKeys.has(key));
+			if (relevantKeys.length) window.requestContentDownloadCounts(relevantKeys, { force: true, animate: true });
 		});
 
 		socketChat.on('trending_data', (data) => {

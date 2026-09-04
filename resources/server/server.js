@@ -1274,6 +1274,7 @@ function normalizeDownloadHistoryCategoryServer(value) {
   const raw = normalizeText(value, 'games').toLowerCase().replace(/[\s-]+/g, '_');
   const aliases = {
     game: 'games', app: 'apps', demo: 'demos', dlc: 'dlcs', update: 'updates',
+    guide: 'guides', soundtrack: 'soundtracks', video: 'videos', movie: 'videos', movies: 'videos',
     avatar: 'avatars', theme: 'themes', homebrew: 'homebrew_games', port: 'ports',
     prototype: 'prototypes', emulator: 'emulators', launcher: 'launchers', tool: 'tools',
     dev_tool: 'dev_tools', manager: 'backup_manager'
@@ -3014,6 +3015,92 @@ const CONTENT_DOWNLOAD_COUNT_REQUEST_MAX = Math.max(25, Math.min(500, parseInt(p
 const contentDownloadCountCache = new Map();
 let contentDownloadCountQueryQueue = Promise.resolve();
 
+function getContentDownloadCountKeyServer(item = {}) {
+  if (!item || typeof item !== 'object' || Array.isArray(item)) return '';
+  const category = normalizeDownloadHistoryCategoryServer(item.category || item.rawCategory || 'games');
+  const invalidId = value => /^(MISSING|N\/A|NONE|NULL|UNDEFINED)$/.test(value);
+  const rawTitleId = normalizeText(item.titleId || item.id, '').toUpperCase();
+  const rawContentId = normalizeText(item.contentId || item.contentID, '').toUpperCase();
+  const titleId = rawTitleId && !invalidId(rawTitleId) ? rawTitleId : '';
+  const contentId = rawContentId && !invalidId(rawContentId) ? rawContentId : '';
+  const normalizedName = normalizeDownloadHistoryNameServer(item.cleanName || item.name || item.title || item.rawName);
+
+  if (category === 'games' && titleId) return `${category}|T:${titleId}`;
+  if (contentId) return `${category}|C:${contentId}`;
+  if (titleId && normalizedName) return `${category}|T:${titleId}|N:${normalizedName}`;
+  if (titleId) return `${category}|T:${titleId}`;
+  if (normalizedName) return `${category}|N:${normalizedName}`;
+  return '';
+}
+
+function getContentDownloadCountKeySetServer(history = []) {
+  const keys = new Set();
+  const normalized = normalizeDownloadHistoryRecordsServer(Array.isArray(history) ? history : []).history;
+  normalized.forEach(item => {
+    const key = getContentDownloadCountKeyServer(item);
+    if (key) keys.add(key);
+  });
+  return keys;
+}
+
+function getChangedContentDownloadCountKeysServer(previousHistory = [], nextHistory = []) {
+  const previous = getContentDownloadCountKeySetServer(previousHistory);
+  const next = getContentDownloadCountKeySetServer(nextHistory);
+  const changed = [];
+  previous.forEach(key => { if (!next.has(key)) changed.push(key); });
+  next.forEach(key => { if (!previous.has(key)) changed.push(key); });
+  return changed;
+}
+
+function invalidateContentDownloadCountKeys(rawKeys = []) {
+  [...new Set((Array.isArray(rawKeys) ? rawKeys : [rawKeys]).map(value => String(value || '').trim()).filter(Boolean))]
+    .forEach(key => contentDownloadCountCache.delete(key));
+}
+
+function emitContentDownloadCountsChanged(rawKeys = [], options = {}) {
+  const keys = [...new Set((Array.isArray(rawKeys) ? rawKeys : [rawKeys])
+    .map(value => String(value || '').trim())
+    .filter(value => value && value.length <= 512))];
+  if (!keys.length) return 0;
+
+  const recipients = Array.from(io.sockets.sockets.values()).filter(client => client && client.connected);
+  if (!recipients.length) return 0;
+  let deliveries = 0;
+  for (let index = 0; index < keys.length; index += 100) {
+    const payload = {
+      keys: keys.slice(index, index + 100),
+      reason: normalizeText(options.reason, 'download').slice(0, 32) || 'download',
+      updatedAt: Date.now()
+    };
+    trackBandwidthPayload('content_download_counts_changed', payload, recipients.length);
+    recipients.forEach(client => client.emit('content_download_counts_changed', payload));
+    deliveries += recipients.length;
+  }
+  return deliveries;
+}
+
+async function notifyContentDownloadCountsChangedAcrossInstances(rawKeys = [], options = {}) {
+  const keys = [...new Set((Array.isArray(rawKeys) ? rawKeys : [rawKeys])
+    .map(value => String(value || '').trim())
+    .filter(value => value && value.length <= 512))];
+  if (!keys.length) return;
+
+  // Keep each PostgreSQL NOTIFY payload comfortably below its ~8 KB limit.
+  for (let index = 0; index < keys.length; index += 10) {
+    const payload = {
+      keys: keys.slice(index, index + 10),
+      reason: normalizeText(options.reason, 'download').slice(0, 32) || 'download',
+      instanceId: INSTANCE_ID,
+      updatedAt: Date.now()
+    };
+    try {
+      await pool.query('SELECT pg_notify($1, $2)', ['content_download_counts_sync', JSON.stringify(payload)]);
+    } catch (err) {
+      console.error('[CONTENT DOWNLOAD COUNTS NOTIFY ERROR]:', err && err.message ? err.message : err);
+    }
+  }
+}
+
 function runSerializedContentDownloadCountQuery(task) {
   const run = contentDownloadCountQueryQueue.catch(() => null).then(task);
   contentDownloadCountQueryQueue = run.then(() => null, () => null);
@@ -3084,6 +3171,11 @@ async function getContentDownloadCountsForKeys(rawKeys = []) {
               WHEN 'demo' THEN 'demos'
               WHEN 'dlc' THEN 'dlcs'
               WHEN 'update' THEN 'updates'
+              WHEN 'guide' THEN 'guides'
+              WHEN 'soundtrack' THEN 'soundtracks'
+              WHEN 'video' THEN 'videos'
+              WHEN 'movie' THEN 'videos'
+              WHEN 'movies' THEN 'videos'
               WHEN 'avatar' THEN 'avatars'
               WHEN 'theme' THEN 'themes'
               WHEN 'homebrew' THEN 'homebrew_games'
@@ -5750,7 +5842,7 @@ async function initProfileSyncNotifications() {
   profileSyncNotifyClient = client;
 
   client.on('notification', async (message) => {
-    if (!message || !['profile_sync', 'presence_sync', 'ps3_playtime_sync', 'admin_state_sync', 'friend_activity_sync', 'user_notification_sync', 'game_players_sync'].includes(message.channel)) return;
+    if (!message || !['profile_sync', 'presence_sync', 'ps3_playtime_sync', 'admin_state_sync', 'friend_activity_sync', 'user_notification_sync', 'game_players_sync', 'content_download_counts_sync'].includes(message.channel)) return;
 
     try {
       const data = JSON.parse(message.payload || '{}');
@@ -5766,6 +5858,14 @@ async function initProfileSyncNotifications() {
           actorName: data.actorName,
           targetUser: data.targetUser
         });
+        return;
+      }
+
+      if (message.channel === 'content_download_counts_sync') {
+        const keys = Array.isArray(data.keys) ? data.keys.map(value => String(value || '').trim()).filter(Boolean) : [];
+        if (!keys.length) return;
+        invalidateContentDownloadCountKeys(keys);
+        emitContentDownloadCountsChanged(keys, { reason: data.reason });
         return;
       }
 
@@ -5945,6 +6045,7 @@ async function initProfileSyncNotifications() {
     await client.query('LISTEN friend_activity_sync');
     await client.query('LISTEN user_notification_sync');
     await client.query('LISTEN game_players_sync');
+    await client.query('LISTEN content_download_counts_sync');
     console.log('[PROFILE SYNC] Postgres LISTEN enabled.');
     console.log('[PRESENCE SYNC] Postgres LISTEN enabled.');
     console.log('[PS3 PLAYTIME SYNC] Postgres LISTEN enabled.');
@@ -5952,6 +6053,7 @@ async function initProfileSyncNotifications() {
     console.log('[FRIEND ACTIVITY] Postgres LISTEN enabled.');
     console.log('[NOTIFICATIONS] Postgres LISTEN enabled.');
     console.log('[GAME PLAYERS] Postgres LISTEN enabled.');
+    console.log('[CONTENT DOWNLOAD COUNTS] Postgres LISTEN enabled.');
   } catch (err) {
     if (profileSyncNotifyClient === client) profileSyncNotifyClient = null;
     console.error('[PROFILE LISTEN INIT ERROR]:', err && err.message ? err.message : err);
@@ -8394,6 +8496,14 @@ io.on('connection', (socket) => {
         }
 
         updateCompactUserCacheFromPatch(name, workingUser, profileDbPatch);
+        const contentDownloadCountChangedKeys = Object.prototype.hasOwnProperty.call(profileDbPatch, 'downloadsData')
+          ? getChangedContentDownloadCountKeysServer(previousDownloadsForSharedGameMatch, profileDbPatch.downloadsData)
+          : [];
+        if (contentDownloadCountChangedKeys.length) {
+          invalidateContentDownloadCountKeys(contentDownloadCountChangedKeys);
+          emitContentDownloadCountsChanged(contentDownloadCountChangedKeys, { reason: 'downloads' });
+          deferServerTask('CONTENT DOWNLOAD COUNTS NOTIFY', () => notifyContentDownloadCountsChangedAcrossInstances(contentDownloadCountChangedKeys, { reason: 'downloads' }), 0);
+        }
         const gameOwnershipChanged = Object.prototype.hasOwnProperty.call(profileDbPatch, 'libraryData') || Object.prototype.hasOwnProperty.call(profileDbPatch, 'downloadsData');
         const friendsChangedForGamePlayers = Object.prototype.hasOwnProperty.call(profileDbPatch, 'friendsData');
         if (gameOwnershipChanged || friendsChangedForGamePlayers) {
