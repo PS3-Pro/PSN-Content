@@ -3296,6 +3296,53 @@ function clearGamePlayersSummaryCache(rawTitleId = '') {
   }
 }
 
+function emitGamePlayersSummaryChanged(rawTitleIds = [], options = {}) {
+  const all = options.all === true;
+  const titleIds = [...new Set((Array.isArray(rawTitleIds) ? rawTitleIds : [rawTitleIds])
+    .map(normalizeGamePlayersTitleId)
+    .filter(Boolean))];
+  if (!all && !titleIds.length) return 0;
+
+  const payload = {
+    ...(all ? { all: true } : { titleIds }),
+    reason: normalizeText(options.reason, 'update').slice(0, 32) || 'update',
+    updatedAt: Date.now()
+  };
+  if (options.actorName) payload.actorName = normalizeText(options.actorName, '').slice(0, 120);
+
+  const excludeSocketId = normalizeText(options.excludeSocketId, '');
+  const targetUser = normalizeText(options.targetUser, '');
+  const recipients = targetUser
+    ? getSocketsByUserName(targetUser).filter(client => client && client.connected && (!excludeSocketId || client.id !== excludeSocketId))
+    : Array.from(io.sockets.sockets.values()).filter(client => client && client.connected && (!excludeSocketId || client.id !== excludeSocketId));
+
+  if (!recipients.length) return 0;
+  trackBandwidthPayload('game_players_summary_changed', payload, recipients.length);
+  recipients.forEach(client => client.emit('game_players_summary_changed', payload));
+  return recipients.length;
+}
+
+async function notifyGamePlayersSummaryChangedAcrossInstances(rawTitleIds = [], options = {}) {
+  const all = options.all === true;
+  const titleIds = [...new Set((Array.isArray(rawTitleIds) ? rawTitleIds : [rawTitleIds])
+    .map(normalizeGamePlayersTitleId)
+    .filter(Boolean))];
+  if (!all && !titleIds.length) return;
+  const payload = {
+    ...(all ? { all: true } : { titleIds }),
+    reason: normalizeText(options.reason, 'update').slice(0, 32) || 'update',
+    actorName: normalizeText(options.actorName, '').slice(0, 120),
+    targetUser: normalizeText(options.targetUser, '').slice(0, 120),
+    instanceId: INSTANCE_ID,
+    updatedAt: Date.now()
+  };
+  try {
+    await pool.query('SELECT pg_notify($1, $2)', ['game_players_sync', JSON.stringify(payload)]);
+  } catch (err) {
+    console.error('[GAME PLAYERS NOTIFY ERROR]:', err && err.message ? err.message : err);
+  }
+}
+
 function getGamePlayersSummaryCacheKey(userName, titleId) {
   return `${normalizeText(userName, '').toLowerCase()}|${normalizeGamePlayersTitleId(titleId)}`;
 }
@@ -3496,12 +3543,13 @@ async function notifyPlayTogetherPlayers(actorName, rawTitleId, rawTitle) {
   return published;
 }
 
-async function setGamePlayTogether(userName, rawTitleId, enabled, rawTitle) {
+async function setGamePlayTogether(userName, rawTitleId, enabled, rawTitle, options = {}) {
   const name = normalizeText(userName, '');
   const titleId = normalizeGamePlayersTitleId(rawTitleId);
   const title = normalizeText(rawTitle, titleId).slice(0, 180) || titleId;
   if (!name || !titleId) return { ok: false, error: 'Invalid game.' };
 
+  let changed = false;
   if (enabled === true) {
     const insertResult = await queryDbWithRetry(
       `INSERT INTO user_game_play_together (user_name, title_id, title, created_at)
@@ -3511,20 +3559,32 @@ async function setGamePlayTogether(userName, rawTitleId, enabled, rawTitle) {
       [name, titleId, title],
       { attempts: 2, label: 'PLAY TOGETHER ENABLE' }
     );
-    clearGamePlayersSummaryCache(titleId);
-    if (insertResult.rows[0]) {
+    changed = !!insertResult.rows[0];
+    if (changed) {
+      clearGamePlayersSummaryCache(titleId);
       deferServerTask('PLAY TOGETHER NOTIFICATIONS', () => notifyPlayTogetherPlayers(name, titleId, title), 0);
     }
   } else {
-    await queryDbWithRetry(
+    const deleteResult = await queryDbWithRetry(
       'DELETE FROM user_game_play_together WHERE user_name = $1 AND title_id = $2',
       [name, titleId],
       { attempts: 2, label: 'PLAY TOGETHER DISABLE' }
     );
-    clearGamePlayersSummaryCache(titleId);
+    changed = deleteResult.rowCount > 0;
+    if (changed) clearGamePlayersSummaryCache(titleId);
   }
 
-  return { ok: true, enabled: await isGamePlayTogether(name, titleId) };
+  const currentEnabled = await isGamePlayTogether(name, titleId);
+  if (changed) {
+    const changeOptions = {
+      reason: 'play_together',
+      actorName: name,
+      excludeSocketId: options.sourceSocketId
+    };
+    emitGamePlayersSummaryChanged([titleId], changeOptions);
+    deferServerTask('GAME PLAYERS NOTIFY', () => notifyGamePlayersSummaryChangedAcrossInstances([titleId], changeOptions), 0);
+  }
+  return { ok: true, enabled: currentEnabled, changed };
 }
 
 
@@ -3931,16 +3991,51 @@ async function ensureGameOwnershipIndexReady() {
   return gameOwnershipIndexBuildPromise;
 }
 
-async function syncUserGameOwnershipIndex(userName, changes = {}) {
+async function syncUserGameOwnershipIndex(userName, changes = {}, options = {}) {
   const safeName = normalizeText(userName, '');
-  if (!safeName || !changes || typeof changes !== 'object') return;
+  if (!safeName || !changes || typeof changes !== 'object') return [];
 
   const hasLibrary = Object.prototype.hasOwnProperty.call(changes, 'libraryData');
   const hasDownloads = Object.prototype.hasOwnProperty.call(changes, 'downloadsData');
-  if (!hasLibrary && !hasDownloads) return;
+  if (!hasLibrary && !hasDownloads) return [];
 
   const libraryIds = hasLibrary ? getLibraryOwnershipTitleIds(changes.libraryData) : [];
   const downloadIds = hasDownloads ? getDownloadOwnershipTitleIds(changes.downloadsData) : [];
+  const previousResult = await queryDbWithRetry(
+    'SELECT title_id, in_library, downloaded FROM user_game_ownership WHERE user_name = $1',
+    [safeName],
+    { attempts: 2, label: 'GAME OWNERSHIP INDEX DIFF' }
+  );
+  const previous = new Map();
+  (previousResult.rows || []).forEach(row => {
+    const titleId = normalizeGamePlayersTitleId(row.title_id);
+    if (titleId) previous.set(titleId, { inLibrary: row.in_library === true, downloaded: row.downloaded === true });
+  });
+
+  const next = new Map(Array.from(previous, ([titleId, flags]) => [titleId, { ...flags }]));
+  if (hasLibrary) {
+    next.forEach(flags => { flags.inLibrary = false; });
+    libraryIds.forEach(titleId => {
+      const flags = next.get(titleId) || { inLibrary: false, downloaded: false };
+      flags.inLibrary = true;
+      next.set(titleId, flags);
+    });
+  }
+  if (hasDownloads) {
+    next.forEach(flags => { flags.downloaded = false; });
+    downloadIds.forEach(titleId => {
+      const flags = next.get(titleId) || { inLibrary: false, downloaded: false };
+      flags.downloaded = true;
+      next.set(titleId, flags);
+    });
+  }
+
+  const changedTitleIds = [...new Set([...previous.keys(), ...next.keys()])].filter(titleId => {
+    const before = previous.get(titleId) || { inLibrary: false, downloaded: false };
+    const after = next.get(titleId) || { inLibrary: false, downloaded: false };
+    return before.inLibrary !== after.inLibrary || before.downloaded !== after.downloaded;
+  });
+  if (!changedTitleIds.length) return [];
 
   await runDbTransactionWithRetry('GAME OWNERSHIP INDEX SYNC', async client => {
     if (hasLibrary) {
@@ -3985,7 +4080,15 @@ async function syncUserGameOwnershipIndex(userName, changes = {}) {
     );
   }, { attempts: 3, lockTimeoutMs: 1200, advisoryLockKey: `user_game_ownership:${safeName}` });
 
-  clearGamePlayersSummaryCache();
+  changedTitleIds.forEach(clearGamePlayersSummaryCache);
+  const changeOptions = {
+    reason: 'ownership',
+    actorName: safeName,
+    excludeSocketId: options.sourceSocketId
+  };
+  emitGamePlayersSummaryChanged(changedTitleIds, changeOptions);
+  deferServerTask('GAME PLAYERS NOTIFY', () => notifyGamePlayersSummaryChangedAcrossInstances(changedTitleIds, changeOptions), 0);
+  return changedTitleIds;
 }
 
 function hydrateGamePlayerEntry(row, titleId) {
@@ -5647,11 +5750,24 @@ async function initProfileSyncNotifications() {
   profileSyncNotifyClient = client;
 
   client.on('notification', async (message) => {
-    if (!message || !['profile_sync', 'presence_sync', 'ps3_playtime_sync', 'admin_state_sync', 'friend_activity_sync', 'user_notification_sync'].includes(message.channel)) return;
+    if (!message || !['profile_sync', 'presence_sync', 'ps3_playtime_sync', 'admin_state_sync', 'friend_activity_sync', 'user_notification_sync', 'game_players_sync'].includes(message.channel)) return;
 
     try {
       const data = JSON.parse(message.payload || '{}');
       if (data.instanceId === INSTANCE_ID) return;
+
+      if (message.channel === 'game_players_sync') {
+        const titleIds = Array.isArray(data.titleIds) ? data.titleIds.map(normalizeGamePlayersTitleId).filter(Boolean) : [];
+        if (data.all === true) clearGamePlayersSummaryCache();
+        else titleIds.forEach(clearGamePlayersSummaryCache);
+        emitGamePlayersSummaryChanged(titleIds, {
+          all: data.all === true,
+          reason: data.reason,
+          actorName: data.actorName,
+          targetUser: data.targetUser
+        });
+        return;
+      }
 
       if (message.channel === 'friend_activity_sync') {
         if (data.event) emitFriendActivityToLocalSubscribers(data.event);
@@ -5828,12 +5944,14 @@ async function initProfileSyncNotifications() {
     await client.query('LISTEN admin_state_sync');
     await client.query('LISTEN friend_activity_sync');
     await client.query('LISTEN user_notification_sync');
+    await client.query('LISTEN game_players_sync');
     console.log('[PROFILE SYNC] Postgres LISTEN enabled.');
     console.log('[PRESENCE SYNC] Postgres LISTEN enabled.');
     console.log('[PS3 PLAYTIME SYNC] Postgres LISTEN enabled.');
     console.log('[ADMIN STATE SYNC] Postgres LISTEN enabled.');
     console.log('[FRIEND ACTIVITY] Postgres LISTEN enabled.');
     console.log('[NOTIFICATIONS] Postgres LISTEN enabled.');
+    console.log('[GAME PLAYERS] Postgres LISTEN enabled.');
   } catch (err) {
     if (profileSyncNotifyClient === client) profileSyncNotifyClient = null;
     console.error('[PROFILE LISTEN INIT ERROR]:', err && err.message ? err.message : err);
@@ -8277,14 +8395,20 @@ io.on('connection', (socket) => {
 
         updateCompactUserCacheFromPatch(name, workingUser, profileDbPatch);
         const gameOwnershipChanged = Object.prototype.hasOwnProperty.call(profileDbPatch, 'libraryData') || Object.prototype.hasOwnProperty.call(profileDbPatch, 'downloadsData');
-        if (gameOwnershipChanged || Object.prototype.hasOwnProperty.call(profileDbPatch, 'friendsData')) {
+        const friendsChangedForGamePlayers = Object.prototype.hasOwnProperty.call(profileDbPatch, 'friendsData');
+        if (gameOwnershipChanged || friendsChangedForGamePlayers) {
           clearGamePlayersSummaryCache();
+        }
+        if (friendsChangedForGamePlayers) {
+          const friendChangeOptions = { all: true, reason: 'friends', targetUser: name };
+          emitGamePlayersSummaryChanged([], friendChangeOptions);
+          deferServerTask('GAME PLAYERS FRIEND NOTIFY', () => notifyGamePlayersSummaryChangedAcrossInstances([], friendChangeOptions), 0);
         }
         if (gameOwnershipChanged) {
           const ownershipChanges = {};
           if (Object.prototype.hasOwnProperty.call(profileDbPatch, 'libraryData')) ownershipChanges.libraryData = profileDbPatch.libraryData;
           if (Object.prototype.hasOwnProperty.call(profileDbPatch, 'downloadsData')) ownershipChanges.downloadsData = profileDbPatch.downloadsData;
-          deferServerTask('GAME OWNERSHIP INDEX SYNC', () => syncUserGameOwnershipIndex(name, ownershipChanges), 0);
+          deferServerTask('GAME OWNERSHIP INDEX SYNC', () => syncUserGameOwnershipIndex(name, ownershipChanges, { sourceSocketId: socket.id }), 0);
         }
         if (sharedGameAcquisitions.length) {
           const acquisitionAt = workingUser.profileUpdatedAt || Date.now();
@@ -8514,7 +8638,7 @@ io.on('connection', (socket) => {
       }
 
       if (mode === 'playTogether') {
-        const result = await setGamePlayTogether(name, titleId, data && data.enabled === true, data && data.title);
+        const result = await setGamePlayTogether(name, titleId, data && data.enabled === true, data && data.title, { sourceSocketId: socket.id });
         if (!result || result.ok !== true) {
           respond({ ok: false, titleId, mode, error: result && result.error ? result.error : 'Could not update Play Together.' });
           return;

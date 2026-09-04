@@ -322,7 +322,7 @@ body { margin: 0; font-family: -apple-system,BlinkMacSystemFont,"Segoe UI",Robot
 @keyframes sidebarCountPillLiveBump{0%,100%{transform:scale(1);}34%,62%{transform:translateY(-1px) scale(1.12);background-color:#fff;color:#07111f;border-color:#fff;box-shadow:0 7px 20px rgba(0,0,0,.24),0 0 18px rgba(255,255,255,.24),inset 0 1px 0 #fff;}}
 @keyframes modalCountPillLiveBump{0%,100%{transform:scale(1);}22%,78%{transform:translateY(-1px) scale(1.12);background-color:#fff;color:#07111f;border-color:#fff;box-shadow:0 7px 20px rgba(0,0,0,.24),0 0 18px rgba(255,255,255,.24),inset 0 1px 0 #fff;}}
 .sidebar-count-pill.count-pill-live-bump, #online-count-wrapper.count-pill-live-bump { animation: sidebarCountPillLiveBump .48s cubic-bezier(.22,1,.36,1); }
-#modal-sys-online .profile-list-modal-count.count-pill-live-bump, #modal-sys-list .profile-list-modal-count.count-pill-live-bump, #modal-sys-list .game-player-section-count.count-pill-live-bump { animation: modalCountPillLiveBump .65s cubic-bezier(.22,1,.36,1); }
+#modal-sys-online .profile-list-modal-count.count-pill-live-bump, #modal-sys-list .profile-list-modal-count.count-pill-live-bump, #modal-sys-list .game-player-section-count.count-pill-live-bump, #game-modal .game-player-owners.count-pill-live-bump, #game-modal .game-play-together-btn.count-pill-live-bump { animation: modalCountPillLiveBump .65s cubic-bezier(.22,1,.36,1); }
 #online-count-wrapper.count-pill-live-bump #online-count { animation: onlineCountTextLiveBump .48s cubic-bezier(.22,1,.36,1); }
 @keyframes onlineCountTextLiveBump{0%,100%{color:#fff;}34%,62%{color:#07111f;}}
 @keyframes profileStatCountLiveBump{0%,100%{transform:scale(1);}22%,78%{transform:translateY(-1px) scale(1.035);box-shadow:0 7px 20px rgba(0,0,0,.24),0 0 18px rgba(255,255,255,.20);}}
@@ -26235,6 +26235,7 @@ P
             pill.type = 'button';
             pill.className = 'game-player-owners';
             pill.onmouseenter = () => { if (typeof playUiHover === 'function') playUiHover(); };
+            pill.innerHTML = '<i class="fas fa-user-group game-player-owners-icon"></i><span class="game-player-owners-label"></span><span class="game-player-owners-avatars"></span><span class="game-player-owners-more" hidden></span><span class="game-player-owners-mobile"><i class="fas fa-user-group"></i><span></span></span>';
             social.appendChild(pill);
         }
 
@@ -26245,11 +26246,11 @@ P
             playTogetherButton.className = 'game-play-together-btn';
             playTogetherButton.onmouseenter = () => { if (typeof playUiHover === 'function') playUiHover(); };
             playTogetherButton.onclick = () => window.toggleGamePlayTogether(playTogetherButton);
+            playTogetherButton.innerHTML = '<i class="fas fa-handshake"></i><span class="game-play-together-label">Play Together</span>';
             social.appendChild(playTogetherButton);
         }
 
         const count = Math.max(0, Number(summary && summary.count) || 0);
-        const viewerOwns = summary && summary.viewerOwns === true;
         const canPlayTogether = String(modalRoot.dataset.storeCategory || '').toLowerCase() === 'games' && !!titleId;
         const active = summary && summary.viewerPlayTogether === true;
         const playTogetherCount = Math.max(0, Number(summary && summary.playTogetherCount) || 0);
@@ -26259,15 +26260,48 @@ P
                 .map(owner => getFreshGamePlayer(owner, titleId))
                 .filter(Boolean)
                 .slice(0, 3);
-            const avatarsHtml = preview.map(owner => `<img class="game-player-owner-avatar" data-user="${escapeGamePlayersHtml(owner.name || '')}" src="${escapeGamePlayersHtml(owner.avatar || '')}" alt="${escapeGamePlayersHtml(owner.name || '')}">`).join('');
             const copy = count === 1 ? '1 player has this game' : `${count} players have this game`;
-            const remaining = Math.max(0, count - preview.length);
-            const moreHtml = remaining ? `<span class="game-player-owners-more">+${remaining}</span>` : '';
             const friendCount = Math.max(0, Number(summary.friendCount) || 0);
             const friendCopy = friendCount ? ` · ${friendCount} friend${friendCount === 1 ? '' : 's'}` : '';
             const playTogetherCopy = playTogetherCount ? ` · ${playTogetherCount} ${playTogetherCount === 1 ? 'player wants' : 'players want'} to play` : '';
+            const ownerContext = `game-owners:${titleId}`;
+            const previousOwnerCount = pill.dataset.liveGamePlayerCount ?? '';
+            const hadOwnerCount = pill.dataset.liveGamePlayerContext === ownerContext && previousOwnerCount !== '';
+            pill.dataset.liveGamePlayerCount = String(count);
+            pill.dataset.liveGamePlayerContext = ownerContext;
+            const label = pill.querySelector('.game-player-owners-label');
+            const labelWasInitialized = !!(label && label.dataset.liveCountInitialized === '1' && label.dataset.liveCountOwner === ownerContext);
+            if (label && typeof window.setLiveCountText === 'function') window.setLiveCountText(label, copy, count, ownerContext);
+            else if (label) label.textContent = copy;
+            if (hadOwnerCount && previousOwnerCount !== String(count) && !labelWasInitialized && typeof window.animateCountPillFeedback === 'function') window.animateCountPillFeedback(pill);
 
-            pill.innerHTML = `<i class="fas fa-user-group game-player-owners-icon"></i><span class="game-player-owners-label">${copy}</span><span class="game-player-owners-avatars">${avatarsHtml}</span>${moreHtml}<span class="game-player-owners-mobile"><i class="fas fa-user-group"></i><span>${count}</span></span>`;
+            const avatars = pill.querySelector('.game-player-owners-avatars');
+            if (avatars) {
+                const existingByName = new Map(Array.from(avatars.querySelectorAll('.game-player-owner-avatar')).map(img => [String(img.dataset.user || ''), img]));
+                const keepNames = new Set();
+                preview.forEach(owner => {
+                    const name = String(owner.name || '');
+                    if (!name) return;
+                    keepNames.add(name);
+                    let img = existingByName.get(name);
+                    if (!img) {
+                        img = document.createElement('img');
+                        img.className = 'game-player-owner-avatar';
+                        img.dataset.user = name;
+                        img.alt = name;
+                    }
+                    const avatar = String(owner.avatar || '');
+                    if (avatar && img.getAttribute('src') !== avatar) img.src = avatar;
+                    avatars.appendChild(img);
+                });
+                existingByName.forEach((img, name) => { if (!keepNames.has(name)) img.remove(); });
+            }
+
+            const remaining = Math.max(0, count - preview.length);
+            const more = pill.querySelector('.game-player-owners-more');
+            if (more) { more.textContent = remaining ? `+${remaining}` : ''; more.hidden = !remaining; }
+            const mobileValue = pill.querySelector('.game-player-owners-mobile span');
+            if (mobileValue) mobileValue.textContent = String(count);
             pill.setAttribute('aria-label', `${copy}${friendCopy}${playTogetherCopy}`);
             pill.title = `${copy}${friendCopy}${playTogetherCopy}`;
             pill.onclick = () => {
@@ -26277,15 +26311,46 @@ P
             pill.classList.add('is-visible');
         } else {
             pill.classList.remove('is-visible');
-            pill.innerHTML = '';
             pill.onclick = null;
             pill.removeAttribute('aria-label');
             pill.removeAttribute('title');
         }
 
         if (canPlayTogether) {
-            const countHtml = playTogetherCount ? `<span class="game-play-together-count" title="${playTogetherCount} ${playTogetherCount === 1 ? 'player wants' : 'players want'} to play">${playTogetherCount}</span>` : '';
             const controlTitle = active ? 'Turn off Play Together for this game' : 'Turn on Play Together for this game';
+            const icon = playTogetherButton.querySelector('i');
+            if (icon) icon.className = `fas ${active ? 'fa-check' : 'fa-handshake'}`;
+            let controlLabel = playTogetherButton.querySelector('.game-play-together-label');
+            if (!controlLabel) {
+                controlLabel = document.createElement('span');
+                controlLabel.className = 'game-play-together-label';
+                controlLabel.textContent = 'Play Together';
+                playTogetherButton.appendChild(controlLabel);
+            }
+            const previousCount = playTogetherButton.dataset.liveGamePlayerCount ?? '';
+            const previousContext = playTogetherButton.dataset.liveGamePlayerContext || '';
+            const liveContext = `game-play-together:${titleId}`;
+            const hadLiveCount = previousContext === liveContext && previousCount !== '';
+            playTogetherButton.dataset.liveGamePlayerCount = String(playTogetherCount);
+            playTogetherButton.dataset.liveGamePlayerContext = liveContext;
+
+            let countNode = playTogetherButton.querySelector('.game-play-together-count');
+            if (playTogetherCount) {
+                const countNodeWasNew = !countNode;
+                if (!countNode) {
+                    countNode = document.createElement('span');
+                    countNode.className = 'game-play-together-count';
+                    playTogetherButton.appendChild(countNode);
+                }
+                countNode.title = `${playTogetherCount} ${playTogetherCount === 1 ? 'player wants' : 'players want'} to play`;
+                if (typeof window.setLiveCountText === 'function') window.setLiveCountText(countNode, String(playTogetherCount), playTogetherCount, liveContext);
+                else countNode.textContent = String(playTogetherCount);
+                if (countNodeWasNew && hadLiveCount && previousCount !== String(playTogetherCount) && typeof window.animateCountPillFeedback === 'function') window.animateCountPillFeedback(playTogetherButton);
+            } else if (countNode) {
+                countNode.remove();
+                if (hadLiveCount && previousCount !== '0' && typeof window.animateCountPillFeedback === 'function') window.animateCountPillFeedback(playTogetherButton);
+            }
+
             playTogetherButton.dataset.titleId = titleId;
             playTogetherButton.dataset.gameTitle = gameTitle || titleId;
             playTogetherButton.dataset.active = active ? '1' : '0';
@@ -26294,13 +26359,11 @@ P
             playTogetherButton.title = controlTitle;
             playTogetherButton.setAttribute('aria-pressed', active ? 'true' : 'false');
             playTogetherButton.setAttribute('aria-label', controlTitle);
-            playTogetherButton.innerHTML = `<i class="fas ${active ? 'fa-check' : 'fa-handshake'}"></i><span class="game-play-together-label">Play Together</span>${countHtml}`;
             playTogetherButton.classList.add('is-visible');
         } else {
             playTogetherButton.classList.remove('is-visible', 'is-active');
             playTogetherButton.disabled = false;
             playTogetherButton.dataset.active = '0';
-            playTogetherButton.innerHTML = '';
             playTogetherButton.removeAttribute('title');
             playTogetherButton.removeAttribute('aria-label');
             playTogetherButton.removeAttribute('aria-pressed');
@@ -26348,6 +26411,18 @@ P
 
             card.classList.add('game-player-card');
             card.classList.toggle('is-play-together', owner.playTogether === true);
+            card.dataset.gamePlayerName = name;
+            card.dataset.gamePlayerSignature = [
+                name,
+                String(owner.avatar || ''),
+                owner.online === true ? '1' : '0',
+                String(owner.lastSeen || ''),
+                owner.isFriend === true ? '1' : '0',
+                owner.playTogether === true ? '1' : '0',
+                owner.inLibrary === true ? '1' : '0',
+                owner.downloaded === true ? '1' : '0',
+                owner.playingNow === true ? '1' : '0'
+            ].join('|');
 
             const profileTarget = card.firstElementChild;
             if (profileTarget) {
@@ -26621,6 +26696,231 @@ P
             if (typeof window.scheduleInterfaceTranslationAfterUiChange === 'function') window.scheduleInterfaceTranslationAfterUiChange(activeModal);
         });
     }
+
+    function getGamePlayersLiveMetrics(summary = {}) {
+        const friendCount = Math.max(0, Number(summary.friendCount) || 0);
+        const totalCount = Math.max(0, Number(summary.count) || 0);
+        const otherCount = Math.max(0, Number(summary.otherCount) || totalCount - friendCount);
+        const playTogetherCount = Math.max(0, Number(summary.playTogetherCount) || 0);
+        const playTogetherOwnerCount = Math.min(totalCount, Math.max(0, Number(summary.playTogetherOwnerCount) || 0));
+        const playTogetherOwnerFriendCount = Math.min(friendCount, Math.max(0, Number(summary.playTogetherOwnerFriendCount) || 0));
+        const remainingFriendCount = Math.max(0, friendCount - playTogetherOwnerFriendCount);
+        const remainingOtherCount = Math.max(0, otherCount - Math.max(0, playTogetherOwnerCount - playTogetherOwnerFriendCount));
+        return {
+            playTogether: playTogetherCount,
+            friends: remainingFriendCount,
+            others: remainingOtherCount,
+            unique: playTogetherCount + remainingFriendCount + remainingOtherCount,
+            otherSectionLabel: friendCount ? 'Other users' : 'Players',
+            showOtherHeader: friendCount > 0 || playTogetherCount > 0
+        };
+    }
+
+    function ensureGamePlayersLiveSection(body, group, label, count, showHeader) {
+        if (!body) return null;
+        let section = body.querySelector(`.game-player-section[data-game-player-group="${group}"]`);
+        if (count <= 0) {
+            if (section) section.remove();
+            return null;
+        }
+        if (!section) {
+            const staging = document.createElement('div');
+            staging.innerHTML = gamePlayerSectionHtml(group, label, count, showHeader);
+            section = staging.firstElementChild;
+            const order = ['playTogether', 'friends', 'others'];
+            const position = order.indexOf(group);
+            const next = order.slice(position + 1).map(nextGroup => body.querySelector(`.game-player-section[data-game-player-group="${nextGroup}"]`)).find(Boolean);
+            if (next) body.insertBefore(section, next);
+            else body.appendChild(section);
+        }
+
+        let header = section.querySelector(':scope > .game-player-section-header');
+        if (showHeader) {
+            if (!header) {
+                const icon = group === 'playTogether' ? 'fa-handshake' : (group === 'friends' ? 'fa-user-friends' : 'fa-users');
+                header = document.createElement('div');
+                header.className = 'game-player-section-header';
+                header.innerHTML = `<i class="fas ${icon}"></i><span></span><span class="game-player-section-count"></span>`;
+                section.insertBefore(header, section.firstChild);
+            }
+            const labelNode = header.querySelector('span:not(.game-player-section-count)');
+            if (labelNode) labelNode.textContent = label;
+            const countNode = header.querySelector('.game-player-section-count');
+            if (countNode && typeof window.setLiveCountText === 'function') window.setLiveCountText(countNode, String(count), count, `game-players-section:${group}`);
+            else if (countNode) countNode.textContent = String(count);
+        } else if (header) {
+            header.remove();
+        }
+        return section;
+    }
+
+    function fetchGamePlayersLoadedRange(state, group, wantedCount, callback) {
+        const wanted = Math.max(0, Number(wantedCount) || 0);
+        if (!state || !wanted) { callback({ owners: [], total: 0 }); return; }
+        const owners = [];
+        let offset = 0;
+        let total = 0;
+        const next = () => {
+            const activeState = window.__gamePlayersModalState;
+            const modal = document.getElementById('modal-sys-list');
+            if (!activeState || activeState !== state || !modal || modal.dataset.gamePlayersToken !== state.token || modal.dataset.profileTarget !== '__game_players__') { callback(null); return; }
+            if (offset >= wanted || (total > 0 && offset >= total)) { callback({ owners: owners.slice(0, wanted), total }); return; }
+            requestGamePlayers({ mode: 'list', titleId: state.titleId, group, offset, limit: GAME_PLAYERS_PAGE_SIZE }, response => {
+                if (!response || response.ok !== true || normalizeGamePlayersTitleId(response.titleId) !== state.titleId || response.group !== group) { callback(null); return; }
+                const page = Array.isArray(response.owners) ? response.owners : [];
+                total = Math.max(0, Number(response.total) || 0);
+                owners.push(...page);
+                offset = Math.max(offset + page.length, Math.max(0, Number(response.offset) || 0) + page.length);
+                if (!page.length || response.hasMore !== true || offset >= wanted) callback({ owners: owners.slice(0, wanted), total });
+                else next();
+            });
+        };
+        next();
+    }
+
+    function reconcileGamePlayersLiveList(list, owners, titleId) {
+        if (!list) return 0;
+        const staging = document.createElement('div');
+        appendGamePlayerCards(staging, owners, titleId, 0);
+        const desired = Array.from(staging.children);
+        const existing = Array.from(list.querySelectorAll(':scope > .game-player-card'));
+        const existingByName = new Map(existing.map(card => [String(card.dataset.gamePlayerName || ''), card]));
+        const desiredNames = new Set();
+        let cursor = list.firstElementChild;
+
+        desired.forEach(desiredCard => {
+            const name = String(desiredCard.dataset.gamePlayerName || '');
+            if (!name) return;
+            desiredNames.add(name);
+            let card = existingByName.get(name) || null;
+            if (card && card.dataset.gamePlayerSignature !== desiredCard.dataset.gamePlayerSignature) {
+                card.replaceWith(desiredCard);
+                card = desiredCard;
+            } else if (!card) {
+                card = desiredCard;
+            }
+            if (card !== cursor) list.insertBefore(card, cursor);
+            cursor = card.nextElementSibling;
+        });
+        existing.forEach(card => {
+            const name = String(card.dataset.gamePlayerName || '');
+            if (!desiredNames.has(name) && card.isConnected) card.remove();
+        });
+        return desired.length;
+    }
+
+    window.refreshOpenGamePlayersModalLive = function(summary) {
+        const state = window.__gamePlayersModalState;
+        const modal = document.getElementById('modal-sys-list');
+        const body = document.getElementById('list-modal-body');
+        const titleEl = document.getElementById('list-modal-title');
+        if (!state || !modal || !body || !titleEl || modal.dataset.profileTarget !== '__game_players__' || modal.dataset.gamePlayersToken !== state.token || !modal.classList.contains('show')) return false;
+        if (normalizeGamePlayersTitleId(state.titleId) !== normalizeGamePlayersTitleId(modal.dataset.gamePlayers)) return false;
+
+        const metrics = getGamePlayersLiveMetrics(summary || {});
+        state.otherSectionLabel = metrics.otherSectionLabel;
+        state.showOtherHeader = metrics.showOtherHeader;
+        const titleCount = titleEl.querySelector('.profile-list-modal-count');
+        if (titleCount && typeof window.setLiveCountText === 'function') window.setLiveCountText(titleCount, `${metrics.unique} ${metrics.unique === 1 ? 'player' : 'players'}`, metrics.unique, `game-players-modal:${state.titleId}`);
+
+        const config = {
+            playTogether: { total: metrics.playTogether, label: 'Play Together', showHeader: true },
+            friends: { total: metrics.friends, label: 'Friends', showHeader: true },
+            others: { total: metrics.others, label: metrics.otherSectionLabel, showHeader: metrics.showOtherHeader }
+        };
+
+        Object.entries(config).forEach(([group, meta]) => {
+            const groupState = state.groups[group] || (state.groups[group] = { total: 0, offset: 0, loading: false, loaded: true, hasMore: false, initialDone: true, initialOwners: [], error: false });
+            const previousList = body.querySelector(`[data-game-player-list="${group}"]`);
+            const renderedCount = previousList ? previousList.querySelectorAll(':scope > .game-player-card').length : 0;
+            groupState.total = meta.total;
+            const section = ensureGamePlayersLiveSection(body, group, meta.label, meta.total, meta.showHeader);
+            if (!section) {
+                groupState.offset = 0;
+                groupState.hasMore = false;
+                groupState.loaded = true;
+                groupState.initialDone = true;
+                return;
+            }
+            const list = section.querySelector(`[data-game-player-list="${group}"]`);
+            const wanted = Math.min(meta.total, Math.max(renderedCount, Math.min(meta.total, GAME_PLAYERS_PAGE_SIZE)));
+            fetchGamePlayersLoadedRange(state, group, wanted, result => {
+                const activeState = window.__gamePlayersModalState;
+                const activeModal = document.getElementById('modal-sys-list');
+                if (!result || activeState !== state || !activeModal || activeModal.dataset.gamePlayersToken !== state.token || activeModal.dataset.profileTarget !== '__game_players__') return;
+                const liveSection = activeModal.querySelector(`.game-player-section[data-game-player-group="${group}"]`);
+                const liveList = liveSection ? liveSection.querySelector(`[data-game-player-list="${group}"]`) : null;
+                if (!liveList) return;
+                const rendered = reconcileGamePlayersLiveList(liveList, result.owners, state.titleId);
+                groupState.total = Math.max(0, Number(result.total) || meta.total);
+                groupState.offset = rendered;
+                groupState.loaded = true;
+                groupState.initialDone = true;
+                groupState.loading = false;
+                groupState.error = false;
+                groupState.hasMore = rendered < groupState.total;
+                setupGamePlayersGroupPaging(group, liveList, groupState);
+            });
+        });
+        if (typeof window.scheduleInterfaceTranslationAfterUiChange === 'function') window.scheduleInterfaceTranslationAfterUiChange(modal);
+        return true;
+    };
+
+    window.__gamePlayersLiveRefreshTimers = window.__gamePlayersLiveRefreshTimers || Object.create(null);
+    window.handleGamePlayersSummaryChanged = function(payload = {}) {
+        const gameModal = document.getElementById('game-modal');
+        const listModal = document.getElementById('modal-sys-list');
+        const gameTitleId = gameModal && gameModal.classList.contains('show') ? normalizeGamePlayersTitleId(gameModal.dataset.titleId) : '';
+        const listTitleId = listModal && listModal.classList.contains('show') && listModal.dataset.profileTarget === '__game_players__' ? normalizeGamePlayersTitleId(listModal.dataset.gamePlayers) : '';
+        const changed = payload && payload.all === true
+            ? [gameTitleId, listTitleId].filter(Boolean)
+            : (Array.isArray(payload && payload.titleIds) ? payload.titleIds.map(normalizeGamePlayersTitleId).filter(Boolean) : []);
+        const titleIds = [...new Set(changed)];
+        titleIds.forEach(titleId => { if (window.__gamePlayersSummaryCache) delete window.__gamePlayersSummaryCache[titleId]; });
+
+        titleIds.forEach(titleId => {
+            if (titleId !== gameTitleId && titleId !== listTitleId) return;
+            clearTimeout(window.__gamePlayersLiveRefreshTimers[titleId]);
+            window.__gamePlayersLiveRefreshTimers[titleId] = setTimeout(() => {
+                delete window.__gamePlayersLiveRefreshTimers[titleId];
+                requestGamePlayers({ mode: 'summary', titleId }, response => {
+                    if (!response || response.ok !== true || normalizeGamePlayersTitleId(response.titleId) !== titleId) return;
+                    const summary = {
+                        count: Math.max(0, Number(response.count) || 0),
+                        friendCount: Math.max(0, Number(response.friendCount) || 0),
+                        otherCount: Math.max(0, Number(response.otherCount) || 0),
+                        playTogetherCount: Math.max(0, Number(response.playTogetherCount) || 0),
+                        playTogetherFriendCount: Math.max(0, Number(response.playTogetherFriendCount) || 0),
+                        playTogetherOwnerCount: Math.max(0, Number(response.playTogetherOwnerCount) || 0),
+                        playTogetherOwnerFriendCount: Math.max(0, Number(response.playTogetherOwnerFriendCount) || 0),
+                        viewerOwns: response.viewerOwns === true,
+                        viewerPlayTogether: response.viewerPlayTogether === true,
+                        preview: Array.isArray(response.preview) ? response.preview : []
+                    };
+                    setGamePlayersSummaryCacheEntry(titleId, summary);
+                    const currentGameModal = document.getElementById('game-modal');
+                    if (currentGameModal && currentGameModal.classList.contains('show') && normalizeGamePlayersTitleId(currentGameModal.dataset.titleId) === titleId) {
+                        const gameTitle = String(currentGameModal.querySelector('.game-play-together-btn')?.dataset.gameTitle || '').trim() || titleId;
+                        renderGamePlayersPill(currentGameModal, titleId, gameTitle, summary);
+                    }
+                    const currentListModal = document.getElementById('modal-sys-list');
+                    if (currentListModal && currentListModal.classList.contains('show') && currentListModal.dataset.profileTarget === '__game_players__' && normalizeGamePlayersTitleId(currentListModal.dataset.gamePlayers) === titleId) {
+                        window.refreshOpenGamePlayersModalLive(summary);
+                    }
+                });
+            }, 90);
+        });
+
+        if (payload && payload.reason === 'play_together') {
+            const activeUser = String(localStorage.getItem('psn_username') || '');
+            if (window.__collectionPlayTogetherMatchState && window.__collectionPlayTogetherMatchState.user === activeUser) window.__collectionPlayTogetherMatchState.loaded = false;
+            Object.values(window.__socialPlayTogetherRemoteStates || {}).forEach(state => { if (state && state.user === activeUser) state.loaded = false; });
+            if (typeof isSocialPlayTogetherSubviewVisible === 'function' && isSocialPlayTogetherSubviewVisible() && typeof window.refreshSocialPlayTogetherTitles === 'function') {
+                window.refreshSocialPlayTogetherTitles(window.__socialPlayTogetherFilter || 'friends', true);
+            }
+        }
+        return titleIds.length > 0;
+    };
 
     window.openGamePlayersModal = function(rawTitleId, gameTitle = '', suppliedSummary = null) {
         const titleId = normalizeGamePlayersTitleId(rawTitleId);
@@ -28916,7 +29216,7 @@ P
 		void pill.offsetWidth;
 		pill.classList.add('count-pill-live-bump');
 		clearTimeout(pill.__countPillBumpTimer);
-		const isModalFeedback = !!pill.closest('#modal-sys-online, #modal-sys-list, #modal-sys-profile');
+		const isModalFeedback = !!pill.closest('#modal-sys-online, #modal-sys-list, #modal-sys-profile, #game-modal');
 		pill.__countPillBumpTimer = setTimeout(() => {
 			pill.classList.remove('count-pill-live-bump');
 			pill.__countPillBumpTimer = 0;
@@ -28940,6 +29240,8 @@ P
 			let feedbackTarget = element;
 			if (element.id === 'online-count') feedbackTarget = document.getElementById('online-count-wrapper') || element;
 			else if (element.classList.contains('player-stat-value')) feedbackTarget = element.closest('.player-stat-box') || element;
+			else if (element.classList.contains('game-player-owners-label')) feedbackTarget = element.closest('.game-player-owners') || element;
+			else if (element.classList.contains('game-play-together-count')) feedbackTarget = element.closest('.game-play-together-btn') || element;
 			window.animateCountPillFeedback(feedbackTarget);
 		}
 		element.dataset.liveCountInitialized = '1';
@@ -57831,6 +58133,10 @@ function getVisibleChatStackEl(id) {
 		socketChat.on('game_play_together_state', payload => {
 			if (!payload || typeof window.setViewerPlayTogetherTitleState !== 'function') return;
 			window.setViewerPlayTogetherTitleState(payload.titleId, payload.enabled === true);
+		});
+
+		socketChat.on('game_players_summary_changed', payload => {
+			if (typeof window.handleGamePlayersSummaryChanged === 'function') window.handleGamePlayersSummaryChanged(payload || {});
 		});
 
 		socketChat.on('connect_error', () => {
