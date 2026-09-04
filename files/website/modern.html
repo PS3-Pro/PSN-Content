@@ -26593,7 +26593,13 @@ P
         ];
         const nextPillPresentationSignature = typeof window.getLiveRenderSignature === 'function' ? window.getLiveRenderSignature(pillPresentation) : JSON.stringify(pillPresentation);
         const controlIsPending = !!playTogetherButton.dataset.playTogetherPending;
-        if (!controlIsPending && social.dataset.gamePlayersPillSignature === nextPillPresentationSignature) return;
+        const shouldShowSocial = count > 0 || canPlayTogether;
+        if (!controlIsPending && social.dataset.gamePlayersPillSignature === nextPillPresentationSignature) {
+            // A matching data signature is only a true no-op when the effective visibility also
+            // matches. The modal loader can intentionally hide this wrapper between games/reopens.
+            if (social.classList.contains('is-visible') !== shouldShowSocial) social.classList.toggle('is-visible', shouldShowSocial);
+            return;
+        }
         if (!controlIsPending) social.dataset.gamePlayersPillSignature = nextPillPresentationSignature;
 
         if (count) {
@@ -27368,8 +27374,10 @@ P
         const titleId = normalizeGamePlayersTitleId(rawTitleId);
         if (!modalRoot) return;
         const social = modalRoot.querySelector('.game-player-social');
-        if (social) social.classList.remove('is-visible');
-        if (String(category || '').toLowerCase() !== 'games' || !titleId) return;
+        if (String(category || '').toLowerCase() !== 'games' || !titleId) {
+            if (social && social.classList.contains('is-visible')) social.classList.remove('is-visible');
+            return;
+        }
 
         const requestToken = `${titleId}|${Date.now()}|${Math.random().toString(36).slice(2, 7)}`;
         modalRoot.dataset.gamePlayersToken = requestToken;
@@ -27378,6 +27386,11 @@ P
             renderGamePlayersPill(modalRoot, titleId, gameTitle, cached.summary);
             return;
         }
+
+        // Only hide the previous game's social controls while a genuinely new summary is loading.
+        // Cached reopens must keep the existing DOM visible; otherwise the render signature can
+        // correctly say "same data" while the parent was just hidden by this function.
+        if (social && social.classList.contains('is-visible')) social.classList.remove('is-visible');
 
         requestGamePlayers({ mode: 'summary', titleId }, response => {
             if (!modalRoot.isConnected || modalRoot.dataset.gamePlayersToken !== requestToken) return;
