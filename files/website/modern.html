@@ -320,7 +320,17 @@ body { margin: 0; font-family: -apple-system,BlinkMacSystemFont,"Segoe UI",Robot
 .sidebar-menu li>.sidebar-count-pill:hover { color: #07111f; background-color: #fff; border-color: #fff; box-shadow: 0 6px 18px rgba(0,0,0,.24),0 0 16px rgba(255,255,255,.22); }
 .sidebar-menu li:has(>.sidebar-count-pill:not(.is-empty))>.notification-dot { right: 17px; top: 10px; width: 6px; height: 6px; z-index: 2; }
 @keyframes sidebarCountPillLiveBump{0%,100%{transform:scale(1);}34%,62%{transform:translateY(-1px) scale(1.12);background-color:#fff;color:#07111f;border-color:#fff;box-shadow:0 7px 20px rgba(0,0,0,.24),0 0 18px rgba(255,255,255,.24),inset 0 1px 0 #fff;}}
-.sidebar-count-pill.count-pill-live-bump { animation: sidebarCountPillLiveBump .48s cubic-bezier(.22,1,.36,1); }
+@keyframes modalCountPillLiveBump{0%,100%{transform:scale(1);}22%,78%{transform:translateY(-1px) scale(1.12);background-color:#fff;color:#07111f;border-color:#fff;box-shadow:0 7px 20px rgba(0,0,0,.24),0 0 18px rgba(255,255,255,.24),inset 0 1px 0 #fff;}}
+.sidebar-count-pill.count-pill-live-bump, #online-count-wrapper.count-pill-live-bump { animation: sidebarCountPillLiveBump .48s cubic-bezier(.22,1,.36,1); }
+#modal-sys-online .profile-list-modal-count.count-pill-live-bump, #modal-sys-list .profile-list-modal-count.count-pill-live-bump, #modal-sys-list .game-player-section-count.count-pill-live-bump { animation: modalCountPillLiveBump .65s cubic-bezier(.22,1,.36,1); }
+#online-count-wrapper.count-pill-live-bump #online-count { animation: onlineCountTextLiveBump .48s cubic-bezier(.22,1,.36,1); }
+@keyframes onlineCountTextLiveBump{0%,100%{color:#fff;}34%,62%{color:#07111f;}}
+@keyframes profileStatCountLiveBump{0%,100%{transform:scale(1);}22%,78%{transform:translateY(-1px) scale(1.035);box-shadow:0 7px 20px rgba(0,0,0,.24),0 0 18px rgba(255,255,255,.20);}}
+@keyframes profileStatCountLiveFlash{0%,100%{opacity:0;}22%,78%{opacity:1;}}
+@keyframes profileStatCountTextLiveFlash{0%,100%{filter:none;}22%,78%{filter:brightness(0);}}
+#modal-sys-profile .player-stat-box.count-pill-live-bump { animation:profileStatCountLiveBump .65s cubic-bezier(.22,1,.36,1); }
+#modal-sys-profile .player-stat-box.count-pill-live-bump::before { background:#fff; transform:scale(1); animation:profileStatCountLiveFlash .65s cubic-bezier(.22,1,.36,1); }
+#modal-sys-profile .player-stat-box.count-pill-live-bump .player-stat-value, #modal-sys-profile .player-stat-box.count-pill-live-bump .player-stat-label { animation:profileStatCountTextLiveFlash .65s cubic-bezier(.22,1,.36,1); }
 .user-profile { padding: 20px 20px calc(20px + env(safe-area-inset-bottom,0px)) 20px; border-top: 1px solid rgba(255,255,255,0.05); display: flex; align-items: center; gap: 15px; }
 .profile-btn-group { display: flex; justify-content: space-evenly; width: 100%; margin-top: 0px; gap: 25px; padding-top: 10px; }
 
@@ -28906,10 +28916,33 @@ P
 		void pill.offsetWidth;
 		pill.classList.add('count-pill-live-bump');
 		clearTimeout(pill.__countPillBumpTimer);
+		const isModalFeedback = !!pill.closest('#modal-sys-online, #modal-sys-list, #modal-sys-profile');
 		pill.__countPillBumpTimer = setTimeout(() => {
 			pill.classList.remove('count-pill-live-bump');
 			pill.__countPillBumpTimer = 0;
-		}, 460);
+		}, isModalFeedback ? 700 : 460);
+		return true;
+	};
+
+
+	window.setLiveCountText = function(target, text, rawValue, contextKey = '') {
+		const element = typeof target === 'string' ? document.getElementById(target) : target;
+		if (!element) return false;
+		const activeUser = String(localStorage.getItem('psn_username') || '');
+		const liveContext = String(contextKey || activeUser);
+		const nextValue = String(rawValue ?? text ?? '');
+		const previousValue = element.dataset.liveCountValue ?? '';
+		const hadInitialized = element.dataset.liveCountInitialized === '1' && (element.dataset.liveCountOwner || '') === liveContext;
+		element.textContent = String(text ?? '');
+		element.dataset.liveCountValue = nextValue;
+		element.dataset.liveCountOwner = liveContext;
+		if (hadInitialized && previousValue !== nextValue && typeof window.animateCountPillFeedback === 'function') {
+			let feedbackTarget = element;
+			if (element.id === 'online-count') feedbackTarget = document.getElementById('online-count-wrapper') || element;
+			else if (element.classList.contains('player-stat-value')) feedbackTarget = element.closest('.player-stat-box') || element;
+			window.animateCountPillFeedback(feedbackTarget);
+		}
+		element.dataset.liveCountInitialized = '1';
 		return true;
 	};
 
@@ -46716,7 +46749,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
         });
         const countElement = document.getElementById('online-count');
         if (countElement && window.__pendingOnlineCountText) {
-            countElement.innerText = window.__pendingOnlineCountText;
+            window.setLiveCountText(countElement, window.__pendingOnlineCountText, Number.parseInt(window.__pendingOnlineCountText, 10) || 0);
             window.__pendingOnlineCountText = '';
         }
 
@@ -46834,12 +46867,12 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
         window.currentOnlineList = currentOnlineList;
 
         const countElement = document.getElementById('online-count');
-        if (countElement) countElement.innerText = '0 Online';
+        if (countElement) window.setLiveCountText(countElement, '0 Online', 0);
 
         const onlinePlayersTitle = document.getElementById('online-players-title-label');
         if (onlinePlayersTitle) onlinePlayersTitle.textContent = 'Online Players';
         const onlinePlayersTitleCount = document.getElementById('online-players-title-count');
-        if (onlinePlayersTitleCount) onlinePlayersTitleCount.textContent = '0 players';
+        if (onlinePlayersTitleCount) window.setLiveCountText(onlinePlayersTitleCount, '0 players', 0);
 
         if (typeof applyChatPresenceUiRefresh === 'function') applyChatPresenceUiRefresh([]);
 
@@ -56076,7 +56109,7 @@ function getVisibleChatStackEl(id) {
 				window.currentOnlineList = currentOnlineList;
 				const countElement = document.getElementById('online-count');
 				const activeUsersCount = currentOnlineList.filter(u => u && u.online === true).length;
-				if (countElement) countElement.innerText = `${activeUsersCount} Online`;
+				if (countElement) window.setLiveCountText(countElement, `${activeUsersCount} Online`, activeUsersCount);
 				if (typeof applyChatPresenceUiRefresh === 'function') applyChatPresenceUiRefresh(currentOnlineList);
 				const onlineModal = document.getElementById('modal-sys-online');
 				if (onlineModal && (onlineModal.style.display === 'flex' || onlineModal.classList.contains('show')) && typeof renderOnlineList === 'function') renderOnlineList();
@@ -56430,7 +56463,7 @@ function getVisibleChatStackEl(id) {
 			const deferChatPresenceUi = typeof isChatScreenVisibleForRead === 'function' && isChatScreenVisibleForRead() && typeof isChatPresenceUiReady === 'function' && !isChatPresenceUiReady();
 			if (countElement) {
 				if (deferChatPresenceUi) window.__pendingOnlineCountText = onlineCountText;
-				else countElement.innerText = onlineCountText;
+				else window.setLiveCountText(countElement, onlineCountText, activeUsersCount);
 			}
 		
 			const modal = document.getElementById('modal-sys-online');
@@ -57472,7 +57505,7 @@ function getVisibleChatStackEl(id) {
 				}
 
 				const countElement = document.getElementById('online-count');
-				if (countElement) countElement.innerText = `${currentOnlineList.filter(user => user && user.online === true).length} Online`;
+				if (countElement) { const activeCount = currentOnlineList.filter(user => user && user.online === true).length; window.setLiveCountText(countElement, `${activeCount} Online`, activeCount); }
 
 				const profileModal = document.getElementById('modal-sys-profile');
 				const openedUser = profileModal?.dataset?.profileUsername || document.getElementById('profile-name-val')?.innerText || '';
@@ -57562,7 +57595,10 @@ function getVisibleChatStackEl(id) {
 					Object.entries(countFields).forEach(([field, meta]) => {
 						if (!Object.prototype.hasOwnProperty.call(data, field)) return;
 						const el = document.getElementById(meta[1]);
-						if (el) el.innerText = String(Math.max(0, Number(data[field]) || 0));
+						const value = Math.max(0, Number(data[field]) || 0);
+						if (!el) return;
+						if (typeof window.setLiveCountText === 'function') window.setLiveCountText(el, String(value), value, `profile:${name}`);
+						else el.innerText = String(value);
 					});
 				}
 
@@ -57571,11 +57607,18 @@ function getVisibleChatStackEl(id) {
 				const listModal = document.getElementById('modal-sys-list');
 				const listOpen = !!(listModal && (listModal.style.display === 'flex' || listModal.style.display === 'block' || listModal.classList.contains('show')) && listModal.dataset.profileTarget === name);
 				const myName = localStorage.getItem('psn_username') || '';
-				if (listOpen && name !== myName && socketChat && socketChat.connected) {
-					const listType = String(listModal.dataset.profileListType || '');
-					const fieldForList = { wishlist: 'wishlist', downloads: 'downloads', favs: 'favorites', favorites: 'favorites', library: 'library', trophies: 'trophies' }[listType] || '';
-					if (fieldForList && Object.prototype.hasOwnProperty.call(data, fieldForList)) {
-						window.__profileRealtimeListRefreshTimers = window.__profileRealtimeListRefreshTimers || {};
+				const listType = listOpen ? String(listModal.dataset.profileListType || '') : '';
+				const fieldForList = { wishlist: 'wishlist', downloads: 'downloads', favs: 'favorites', favorites: 'favorites', library: 'library', trophies: 'trophies' }[listType] || '';
+				const hasLiveListCount = !!(fieldForList && Object.prototype.hasOwnProperty.call(data, fieldForList));
+				if (listOpen && hasLiveListCount) {
+					const value = Math.max(0, Number(data[fieldForList]) || 0);
+					const countPill = document.getElementById('list-modal-title')?.querySelector('.profile-list-modal-count');
+					if (countPill && typeof window.setLiveCountText === 'function') {
+						window.setLiveCountText(countPill, `${value} ${value === 1 ? 'item' : 'items'}`, value, `profile-list:${name}:${listType}`);
+					}
+				}
+				if (listOpen && hasLiveListCount && name !== myName && socketChat && socketChat.connected) {
+					window.__profileRealtimeListRefreshTimers = window.__profileRealtimeListRefreshTimers || {};
 						const timerKey = `${name}|${listType}`;
 						clearTimeout(window.__profileRealtimeListRefreshTimers[timerKey]);
 						window.__profileRealtimeListRefreshTimers[timerKey] = setTimeout(() => {
@@ -57595,7 +57638,6 @@ function getVisibleChatStackEl(id) {
 							};
 							socketChat.emit('request_user_data', { targetName: name, type: listType, requestId });
 						}, 250);
-					}
 				}
 			} catch (err) {
 				console.warn('[PROFILE COUNTS] Could not apply realtime counters:', err);
@@ -60510,11 +60552,11 @@ function getVisibleChatStackEl(id) {
 		}
 	
 		const activeUsers = currentOnlineList.filter(u => u.online === true);
-		if (countElement) countElement.innerText = `${activeUsers.length} Online`;
+		if (countElement) window.setLiveCountText(countElement, `${activeUsers.length} Online`, activeUsers.length);
 		const onlinePlayersTitle = document.getElementById('online-players-title-label');
 		if (onlinePlayersTitle) onlinePlayersTitle.textContent = activeUsers.length === 1 ? 'Online Player' : 'Online Players';
 		const onlinePlayersTitleCount = document.getElementById('online-players-title-count');
-		if (onlinePlayersTitleCount) onlinePlayersTitleCount.textContent = `${activeUsers.length} ${activeUsers.length === 1 ? 'player' : 'players'}`;
+		if (onlinePlayersTitleCount) window.setLiveCountText(onlinePlayersTitleCount, `${activeUsers.length} ${activeUsers.length === 1 ? 'player' : 'players'}`, activeUsers.length);
 	
 		renderOnlineList();
 	
@@ -60565,7 +60607,7 @@ function getVisibleChatStackEl(id) {
 		const onlinePlayersTitle = document.getElementById('online-players-title-label');
 		if (onlinePlayersTitle) onlinePlayersTitle.textContent = activeUsers.length === 1 ? 'Online Player' : 'Online Players';
 		const onlinePlayersTitleCount = document.getElementById('online-players-title-count');
-		if (onlinePlayersTitleCount) onlinePlayersTitleCount.textContent = `${activeUsers.length} ${activeUsers.length === 1 ? 'player' : 'players'}`;
+		if (onlinePlayersTitleCount) window.setLiveCountText(onlinePlayersTitleCount, `${activeUsers.length} ${activeUsers.length === 1 ? 'player' : 'players'}`, activeUsers.length);
 
 		const me = activeUsers.find(u => (u.name || u) === myName);
 		const others = activeUsers.filter(u => (u.name || u) !== myName);
@@ -65643,11 +65685,17 @@ function getVisibleChatStackEl(id) {
 		const countTrophies = isMe ? Object.keys(window.userTrophies || {}).filter(id => window.userTrophies[id].unlocked).length : readProfileCount('trophies', 'trophies');
 		const countLibrary = isMe ? (typeof lastScannedGames !== 'undefined' ? lastScannedGames.length : 0) : readProfileCount('library', 'library');
 	
-		document.getElementById('card-downloads').innerText = countDownloads;
-		document.getElementById('card-wishlist').innerText = countWishlist;
-		document.getElementById('card-favs').innerText = countFavs;
-		if (document.getElementById('card-trophies')) document.getElementById('card-trophies').innerText = countTrophies;
-		if (document.getElementById('card-library')) document.getElementById('card-library').innerText = countLibrary;
+		const setProfileStatCount = (id, value) => {
+			const el = document.getElementById(id);
+			if (!el) return;
+			if (typeof window.setLiveCountText === 'function') window.setLiveCountText(el, String(value), value, `profile:${username}`);
+			else el.innerText = String(value);
+		};
+		setProfileStatCount('card-downloads', countDownloads);
+		setProfileStatCount('card-wishlist', countWishlist);
+		setProfileStatCount('card-favs', countFavs);
+		setProfileStatCount('card-trophies', countTrophies);
+		setProfileStatCount('card-library', countLibrary);
 	
 		if (profileModal) {
 			profileModal.style.display = 'flex';
@@ -66424,6 +66472,58 @@ function getVisibleChatStackEl(id) {
 		return { items: grouped, sharedCount: shared.length, otherCount: other.length };
 	};
 
+
+	window.getProfileListDomSignature = function(value) {
+		let raw = '';
+		try {
+			raw = typeof window.getProfileSyncComparableSignature === 'function'
+				? window.getProfileSyncComparableSignature(value)
+				: JSON.stringify(value == null ? null : value);
+		} catch (e) {
+			raw = String(value == null ? '' : value);
+		}
+		let hash = 2166136261;
+		for (let i = 0; i < raw.length; i++) {
+			hash ^= raw.charCodeAt(i);
+			hash = Math.imul(hash, 16777619);
+		}
+		return (hash >>> 0).toString(36);
+	};
+
+	window.reconcileProfileListHtml = function(body, html) {
+		if (!body || body.querySelector('.profile-ps-list-loader')) return false;
+		const staging = document.createElement('div');
+		staging.innerHTML = String(html || '');
+		const desiredNodes = Array.from(staging.children);
+		const existingNodes = Array.from(body.children);
+		if (!desiredNodes.length || desiredNodes.some(node => !node.dataset.profileListKey) || existingNodes.some(node => !node.dataset.profileListKey)) return false;
+
+		const existingByKey = new Map();
+		existingNodes.forEach(node => existingByKey.set(node.dataset.profileListKey, node));
+		const desiredKeys = new Set(desiredNodes.map(node => node.dataset.profileListKey));
+		const savedScrollTop = body.scrollTop;
+		let cursor = body.firstElementChild;
+
+		desiredNodes.forEach(desiredNode => {
+			const key = desiredNode.dataset.profileListKey;
+			let node = existingByKey.get(key) || null;
+			if (node && node.dataset.profileListSignature !== desiredNode.dataset.profileListSignature) {
+				node.replaceWith(desiredNode);
+				node = desiredNode;
+			} else if (!node) {
+				node = desiredNode;
+			}
+			if (node !== cursor) body.insertBefore(node, cursor);
+			cursor = node.nextElementSibling;
+		});
+
+		existingNodes.forEach(node => {
+			if (!desiredKeys.has(node.dataset.profileListKey) && node.isConnected) node.remove();
+		});
+		body.scrollTop = savedScrollTop;
+		return true;
+	};
+
 	window.renderFetchedList = function(targetUser, listType, rawData) {
 		const body = document.getElementById('list-modal-body');
 		const titleEl = document.getElementById('list-modal-title');
@@ -66432,6 +66532,13 @@ function getVisibleChatStackEl(id) {
 		const profileListRenderSignature = (typeof window.getProfileSyncComparableSignature === 'function') ? window.getProfileSyncComparableSignature(rawData || []) : JSON.stringify(rawData || []);
 		const lastProfileListRender = window.__lastProfileListRender;
 		const bodyHasProfileListLoader = !!(body && body.querySelector && body.querySelector('.profile-ps-list-loader'));
+		const isLiveProfileListRefresh = !!(lastProfileListRender
+			&& lastProfileListRender.targetUser === targetUser
+			&& lastProfileListRender.listType === listType
+			&& body
+			&& body.innerHTML
+			&& !bodyHasProfileListLoader
+			&& !window.pendingProfileListScroll);
 		if (lastProfileListRender
 			&& lastProfileListRender.targetUser === targetUser
 			&& lastProfileListRender.listType === listType
@@ -66448,7 +66555,7 @@ function getVisibleChatStackEl(id) {
 		
 		
 
-		if (!window.pendingProfileListScroll) {
+		if (!window.pendingProfileListScroll && !isLiveProfileListRefresh) {
 			body.scrollTop = 0;
 		}
 	
@@ -66470,11 +66577,30 @@ function getVisibleChatStackEl(id) {
 			if (listType === 'downloads') dataArray = normalizeDownloadHistoryRecords(dataArray).history;
 		}
 	
-		titleEl.innerHTML = window.getPlayerListTitleHtml(targetUser, listMeta, dataArray.length);
+		let titleCountPill = titleEl ? titleEl.querySelector('.profile-list-modal-count') : null;
+		if (!isLiveProfileListRefresh || !titleCountPill) {
+			titleEl.innerHTML = window.getPlayerListTitleHtml(targetUser, listMeta, dataArray.length);
+			titleCountPill = titleEl.querySelector('.profile-list-modal-count');
+		}
+		if (titleCountPill && typeof window.setLiveCountText === 'function') {
+			window.setLiveCountText(titleCountPill, `${dataArray.length} ${dataArray.length === 1 ? 'item' : 'items'}`, dataArray.length, `profile-list:${targetUser}:${listType}`);
+		}
 		const sharedGrouping = (!isMe && !isTrophyView && typeof window.decorateRemoteProfileListWithSharedGroups === 'function')
 			? window.decorateRemoteProfileListWithSharedGroups(targetUser, listType, dataArray)
 			: null;
 		const renderItems = sharedGrouping && Array.isArray(sharedGrouping.items) ? sharedGrouping.items : dataArray;
+		const profileListBaseKeys = renderItems.map((item, index) => {
+			if (item && item.__profileListGroupDivider === true) return `group:${item.tone || 'other'}`;
+			if (isTrophyView) return `trophy:${String(item && item.id || index)}`;
+			const comparableKey = typeof window.getComparableProfileListItemKey === 'function' ? window.getComparableProfileListItemKey(item, listType) : '';
+			return comparableKey || `row:${index}`;
+		});
+		const profileListBaseKeyCounts = new Map();
+		profileListBaseKeys.forEach(key => profileListBaseKeyCounts.set(key, (profileListBaseKeyCounts.get(key) || 0) + 1));
+		const getProfileListDomKey = index => {
+			const baseKey = profileListBaseKeys[index] || `row:${index}`;
+			return (profileListBaseKeyCounts.get(baseKey) || 0) > 1 ? `${baseKey}#${index}` : baseKey;
+		};
 
 		if (dataArray.length === 0) {
 			const emptyHtml = `<div style="text-align:center; padding: 40px; color: var(--text-muted); font-size: 13px;">No items in this ${listMeta.title.toLowerCase()} yet.</div>`;
@@ -66505,13 +66631,15 @@ function getVisibleChatStackEl(id) {
 		const pModal = document.getElementById('modal-sys-profile');
 		const returnToOnline = (pModal && pModal.dataset.returnToOnline === "true") ? "true" : "false";
 	
-		const buildProfileListItemsHtml = function(items) {
+		const buildProfileListItemsHtml = function(items, startIndex = 0) {
 			let html = '';
-			items.forEach(item => {
+			items.forEach((item, itemIndex) => {
+				const profileListIndex = startIndex + itemIndex;
+				const profileListDomKey = window.escapePlayerListText(getProfileListDomKey(profileListIndex));
+				const profileListDomSignature = window.getProfileListDomSignature(item);
 				if (item && item.__profileListGroupDivider === true) {
-					html += typeof window.getProfileListGroupDividerHtml === 'function'
-						? window.getProfileListGroupDividerHtml(item)
-						: '';
+					const dividerHtml = typeof window.getProfileListGroupDividerHtml === 'function' ? window.getProfileListGroupDividerHtml(item) : '';
+					html += dividerHtml.replace('<div ', `<div data-profile-list-key="${profileListDomKey}" data-profile-list-signature="${profileListDomSignature}" `);
 					return;
 				}
 				if (isTrophyView) {
@@ -66524,7 +66652,7 @@ function getVisibleChatStackEl(id) {
 					const trophyIconMarkup = isLocked ? '<i class="fas fa-lock" style="color: rgba(255,255,255,0.28);"></i>' : `<span class="ps-trophy-icon ps-trophy-${item.type}" aria-hidden="true"></span>`;
 					const trophyDate = item.unlockDate ? item.unlockDate.split(' - ')[0] : 'Locked';
 					html += `
-						<div class="trophy-card social-list-item ${lockClass}" style="--trophy-rgb: ${cardRgb};" onmouseenter="if(typeof playUiHover === 'function') playUiHover()">
+						<div class="trophy-card social-list-item ${lockClass}" data-profile-list-key="${profileListDomKey}" data-profile-list-signature="${profileListDomSignature}" style="--trophy-rgb: ${cardRgb};" onmouseenter="if(typeof playUiHover === 'function') playUiHover()">
 							<div class="trophy-card-icon" style="background: rgba(0,0,0,0.28); border-radius: 6px; border: 1px solid rgba(255,255,255,0.06);">${trophyIconMarkup}</div>
 							<div class="trophy-card-info"><h3>${item.title || 'Trophy'}</h3><p>${item.desc || 'Unlocked Achievement'}</p></div>
 							<div class="trophy-date"><div style="color: ${color}; font-weight: bold; font-size: 10px; margin-bottom: 5px;">${(item.type || 'trophy').toUpperCase()}</div><i class="far fa-clock"></i> ${trophyDate}</div>
@@ -66683,7 +66811,7 @@ function getVisibleChatStackEl(id) {
 					const profileUnavailableClass = profileStoreUnavailable ? ' profile-list-item-unavailable' : '';
 					const profileHoverAttr = profileStoreUnavailable ? '' : `onmouseenter="if(typeof playUiHover === 'function') playUiHover()"`;
 					html += `
-						<div class="download-item social-list-item ${typeClass}${profileUnavailableClass}" ${profileHoverAttr} ${clickAction} ${cursorStyle}>
+						<div class="download-item social-list-item ${typeClass}${profileUnavailableClass}" data-profile-list-key="${profileListDomKey}" data-profile-list-signature="${profileListDomSignature}" ${profileHoverAttr} ${clickAction} ${cursorStyle}>
 							<div style="display: flex; align-items: center; gap: 15px;">
 								<div class="dl-cover-wrap dl-cover-social">
 									${profileCoverImgHtml}
@@ -66706,14 +66834,19 @@ function getVisibleChatStackEl(id) {
 		const shouldBatchProfileList = dataArray.length > 120;
 		const profileListBatchSize = 60;
 		const savedProfileListScroll = window.pendingProfileListScroll != null ? Math.max(0, Number(window.pendingProfileListScroll) || 0) : null;
-		let renderedProfileListCount = shouldBatchProfileList ? Math.min(profileListBatchSize, renderItems.length) : renderItems.length;
-		let html = buildProfileListItemsHtml(renderItems.slice(0, renderedProfileListCount));
+		const existingRenderedCount = isLiveProfileListRefresh && body
+			? body.querySelectorAll(':scope > [data-profile-list-key]').length
+			: 0;
+		let renderedProfileListCount = shouldBatchProfileList
+			? Math.min(renderItems.length, Math.max(profileListBatchSize, existingRenderedCount))
+			: renderItems.length;
+		let html = buildProfileListItemsHtml(renderItems.slice(0, renderedProfileListCount), 0);
 
-		window.swapProfileListLoaderToContent(body, html, targetUser, listType, function() {
+		const finalizeProfileListContent = function() {
 			const appendNextProfileListBatch = function() {
 				if (!shouldBatchProfileList || renderedProfileListCount >= renderItems.length) return false;
 				const nextCount = Math.min(renderItems.length, renderedProfileListCount + profileListBatchSize);
-				const nextHtml = buildProfileListItemsHtml(renderItems.slice(renderedProfileListCount, nextCount));
+				const nextHtml = buildProfileListItemsHtml(renderItems.slice(renderedProfileListCount, nextCount), renderedProfileListCount);
 				body.insertAdjacentHTML('beforeend', nextHtml);
 				renderedProfileListCount = nextCount;
 				return renderedProfileListCount < renderItems.length;
@@ -66753,7 +66886,14 @@ function getVisibleChatStackEl(id) {
 					body.style.scrollBehavior = previousBehavior || 'smooth';
 				});
 			}
-		});
+		};
+
+		if (isLiveProfileListRefresh && typeof window.reconcileProfileListHtml === 'function' && window.reconcileProfileListHtml(body, html)) {
+			finalizeProfileListContent();
+			return;
+		}
+
+		window.swapProfileListLoaderToContent(body, html, targetUser, listType, finalizeProfileListContent);
 	};
 
     function applyThemeColorPreview(color) {
