@@ -24628,7 +24628,7 @@ P
 			
 			grid.insertAdjacentHTML('beforeend', htmlChunks.join(''));
 		} else {
-			grid.innerHTML += htmlChunks.join('');
+			grid.insertAdjacentHTML('beforeend', htmlChunks.join(''));
 
 			/* A toolbar filter rebuild can momentarily clamp the scroll position while the grid is empty.
 			   Restore it before FLIP/reveal measurements so surviving cards animate from the correct viewport. */
@@ -33549,11 +33549,12 @@ P
 		if (typeof adminUpdateChatControlsBanner === 'function') adminUpdateChatControlsBanner();
 		return true;
 	}
+	const adminChatControlActionIds = ['btn-attach-file', 'btn-gif-picker', 'btn-emoji-picker', 'btn-chat-send'];
+	const adminChatControlToolbarIds = ['btn-toolbar-at', 'btn-toolbar-cmd', 'btn-create-poll', 'btn-bold', 'btn-italic', 'btn-strike', 'btn-bullet'];
+	const adminChatControlAllIds = [...adminChatControlToolbarIds, ...adminChatControlActionIds];
+	const adminChatControlToolbarIdSet = new Set(adminChatControlToolbarIds);
+
 	function adminSetChatComposerButtonState(isDisabledForUser, reasonText = 'Chat controls active', lockToolbar = false) {
-		const actionIds = ['btn-attach-file', 'btn-gif-picker', 'btn-emoji-picker', 'btn-chat-send'];
-		const toolbarIds = ['btn-toolbar-at', 'btn-toolbar-cmd', 'btn-create-poll', 'btn-bold', 'btn-italic', 'btn-strike', 'btn-bullet'];
-		const idsToManage = Array.from(new Set([...(lockToolbar ? toolbarIds : []), ...actionIds]));
-		const allKnownIds = Array.from(new Set([...toolbarIds, ...actionIds]));
 		
 		const applyButtonState = (btn, shouldDisable) => {
 			if (!btn) return;
@@ -33577,10 +33578,10 @@ P
 			}
 		};
 
-		allKnownIds.forEach(id => {
+		adminChatControlAllIds.forEach(id => {
 			const btn = document.getElementById(id);
-			const shouldDisable = idsToManage.includes(id) && !!isDisabledForUser;
-			applyButtonState(btn, shouldDisable);
+			const managed = !adminChatControlToolbarIdSet.has(id) || lockToolbar;
+			applyButtonState(btn, managed && !!isDisabledForUser);
 		});
 
 		const fileInput = document.getElementById('chat-file-input');
@@ -33816,9 +33817,9 @@ P
 		return adminChatControlsAreActive(state) || adminIsViewVisible('view-admin');
 	}
 
-	function adminEnsureChatControlsVisualTicker(state = null) {
-		const active = adminChatControlsAreActive(state);
-		const shouldRun = active && !document.hidden;
+	function adminEnsureChatControlsVisualTicker() {
+		const state = (typeof adminGetChatControlsUiState === 'function') ? adminGetChatControlsUiState() : {};
+		const shouldRun = !document.hidden && !state.locked && !state.canBypass && Number(state.slowSeconds || 0) > 0 && Number(state.waitMs || 0) > 0;
 
 		if (window.adminChatControlsVisualTicker && !shouldRun) {
 			clearInterval(window.adminChatControlsVisualTicker);
@@ -33827,11 +33828,12 @@ P
 
 		if (!window.adminChatControlsVisualTicker && shouldRun) {
 			window.adminChatControlsVisualTicker = setInterval(() => {
-				if (document.hidden || !adminChatControlsAreActive()) {
+				if (document.hidden) {
 					adminEnsureChatControlsVisualTicker();
 					return;
 				}
 				if (typeof adminLightChatControlsUiTick === 'function') adminLightChatControlsUiTick();
+				adminEnsureChatControlsVisualTicker();
 			}, 1000);
 		}
 	}
@@ -39536,6 +39538,7 @@ P
 
 	window.__localPs3PlayTimeClock = window.__localPs3PlayTimeClock || { baseSeconds: -1, baseAt: 0, titleId: '' };
 	window.__localPs3PlayTimeTicker = window.__localPs3PlayTimeTicker || null;
+	window.__localPs3PlayTimeTargets = Array.isArray(window.__localPs3PlayTimeTargets) ? window.__localPs3PlayTimeTargets : [];
 
 	function getActiveLocalPs3TitleId() {
 		const status = window.myCurrentPS3Status;
@@ -39562,22 +39565,28 @@ P
 
 	function getVisibleLocalPs3PlayTimeTargets() {
 		const targets = [];
+		const registerTarget = (el, host, root = host) => {
+			if (!el) return;
+			el.__localPs3PlayTimeHost = host || null;
+			el.__localPs3PlayTimeRoot = root || host || null;
+			targets.push(el);
+		};
 		const profileModal = document.getElementById('modal-sys-profile');
 		if (profileModal && profileModal.classList.contains('show') && profileModal.style.display !== 'none') {
 			const profileTime = document.querySelector('#profile-playing-time[data-playtime-local="1"]');
-			if (profileTime) targets.push(profileTime);
+			registerTarget(profileTime, profileModal);
 		}
 		const libraryView = document.getElementById('view-library');
 		if (!libraryView || libraryView.style.display === 'none') return targets;
 		const gamesView = document.getElementById('subview-games');
 		if (gamesView && gamesView.style.display !== 'none') {
 			const gameTime = document.querySelector('#ps3-local-grid .game-card.is-playing .my-games-playing-time');
-			if (gameTime) targets.push(gameTime);
+			registerTarget(gameTime, gamesView, libraryView);
 		}
 		const favsView = document.getElementById('subview-favs');
 		if (favsView && favsView.style.display !== 'none') {
 			const favTime = document.querySelector('#ps3-favs-grid .game-card.is-playing .my-games-playing-time');
-			if (favTime) targets.push(favTime);
+			registerTarget(favTime, favsView, libraryView);
 		}
 		return targets;
 	}
@@ -39608,8 +39617,27 @@ P
 		return liveTargets.length > 0;
 	}
 
+	function getCachedLocalPs3PlayTimeTargets() {
+		let targets = Array.isArray(window.__localPs3PlayTimeTargets) ? window.__localPs3PlayTimeTargets : [];
+		const targetIsUsable = el => {
+			if (!el || !el.isConnected) return false;
+			const host = el.__localPs3PlayTimeHost;
+			const root = el.__localPs3PlayTimeRoot;
+			if (host && (!host.isConnected || host.style.display === 'none')) return false;
+			if (host?.id === 'modal-sys-profile' && !host.classList.contains('show')) return false;
+			if (root && (!root.isConnected || root.style.display === 'none')) return false;
+			return true;
+		};
+		if (!targets.length || targets.some(el => !targetIsUsable(el))) {
+			targets = getVisibleLocalPs3PlayTimeTargets();
+			window.__localPs3PlayTimeTargets = targets;
+		}
+		return targets;
+	}
+
 	function startLocalPs3PlayTimeTicker() {
-		let targets = getVisibleLocalPs3PlayTimeTargets();
+		const targets = getVisibleLocalPs3PlayTimeTargets();
+		window.__localPs3PlayTimeTargets = targets;
 		if (!isLocalPs3PlayTimeTickerNeeded(targets)) {
 			stopLocalPs3PlayTimeTicker();
 			return false;
@@ -39617,18 +39645,19 @@ P
 		refreshLocalPs3PlayTimeDisplays(targets);
 		if (window.__localPs3PlayTimeTicker) return true;
 		window.__localPs3PlayTimeTicker = setInterval(() => {
-			targets = getVisibleLocalPs3PlayTimeTargets();
-			if (!isLocalPs3PlayTimeTickerNeeded(targets)) {
+			const liveTargets = getCachedLocalPs3PlayTimeTargets();
+			if (!isLocalPs3PlayTimeTickerNeeded(liveTargets)) {
 				stopLocalPs3PlayTimeTicker();
 				return;
 			}
-			refreshLocalPs3PlayTimeDisplays(targets);
+			refreshLocalPs3PlayTimeDisplays(liveTargets);
 		}, 1000);
 		return true;
 	}
 
 	function refreshLocalPs3PlayTimeTickerState() {
 		const targets = getVisibleLocalPs3PlayTimeTargets();
+		window.__localPs3PlayTimeTargets = targets;
 		if (!isLocalPs3PlayTimeTickerNeeded(targets)) {
 			stopLocalPs3PlayTimeTicker();
 			return false;
@@ -39660,6 +39689,7 @@ P
 
 	function resetLocalPs3PlayTimeClock(clearValue = false) {
 		stopLocalPs3PlayTimeTicker();
+		window.__localPs3PlayTimeTargets = [];
 		window.__localPs3PlayTimeClock = { baseSeconds: -1, baseAt: 0, titleId: '' };
 		if (clearValue) window.currentPs3PlayTime = '--:--:--';
 	}
@@ -60748,7 +60778,10 @@ function getVisibleChatStackEl(id) {
 		socketChat.emit('chat_message', data);
 		if (!canModerate) {
 			safeLocalStorageSet('psn_chat_last_sent_at', String(Date.now()));
-			if (typeof adminUpdateChatControlsBanner === 'function') setTimeout(adminUpdateChatControlsBanner, 0);
+			if (typeof adminUpdateChatControlsBanner === 'function') setTimeout(() => {
+				adminUpdateChatControlsBanner();
+				if (typeof adminEnsureChatControlsVisualTicker === 'function') adminEnsureChatControlsVisualTicker();
+			}, 0);
 		}
 	
 		let messagesSent = parseInt(localStorage.getItem('psn_chat_msgs_sent') || '0') + 1;

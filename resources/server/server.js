@@ -8055,7 +8055,9 @@ function startBackgroundTasks() {
   setInterval(syncAdminStateIntervalTask, 15000);
   setInterval(presenceHeartbeatIntervalTask, PRESENCE_HEARTBEAT_MS);
   setInterval(chatPollIntervalTask, CHAT_SYNC_INTERVAL_MS);
-  setInterval(() => logMemoryPressureIfNeeded('periodic'), 15000);
+  // Periodic pressure logs are already throttled to at most once every 30s. Checking at the
+  // same cadence avoids an extra process.memoryUsage() sample that can never produce a log.
+  setInterval(() => logMemoryPressureIfNeeded('periodic'), 30000);
   if (ENABLE_PROFILE_PERIODIC_SYNC) {
     setInterval(profileSyncIntervalTask, PROFILE_SYNC_INTERVAL_MS);
   } else {
