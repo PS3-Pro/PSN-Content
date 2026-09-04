@@ -8339,7 +8339,7 @@ io.on('connection', (socket) => {
     if (!workingUser) { respond({ ok: false, requestId: syncRequestId, error: 'Profile could not be prepared.' }); return; }
     const previousPs3StatusForActivity = workingUser.ps3Status && typeof workingUser.ps3Status === 'object' ? { ...workingUser.ps3Status } : null;
     const previousLibraryForSharedGameMatch = Array.isArray(workingUser.libraryData) ? workingUser.libraryData.slice() : [];
-    const previousDownloadsForSharedGameMatch = Array.isArray(workingUser.downloadsData) ? workingUser.downloadsData.slice() : [];
+    const previousDownloadsData = Array.isArray(workingUser.downloadsData) ? workingUser.downloadsData.slice() : [];
     const incomingPs3StatusForActivity = Object.prototype.hasOwnProperty.call(userData, 'ps3Status');
     const incomingSettingsData = (userData.settingsData && typeof userData.settingsData === "object") ? userData.settingsData : null;
     const previousCountryCode = name && userDatabase[name] ? getUserCountryCode(workingUser) : "";
@@ -8418,7 +8418,7 @@ io.on('connection', (socket) => {
         let sharedGameAcquisitions = collectNewSharedGameAcquisitions(
           previousLibraryForSharedGameMatch,
           userData.libraryData,
-          previousDownloadsForSharedGameMatch,
+          previousDownloadsData,
           userData.downloadsData,
           {
             hasLibrary: Object.prototype.hasOwnProperty.call(userData, 'libraryData'),
@@ -8497,7 +8497,7 @@ io.on('connection', (socket) => {
 
         updateCompactUserCacheFromPatch(name, workingUser, profileDbPatch);
         const contentDownloadCountChangedKeys = Object.prototype.hasOwnProperty.call(profileDbPatch, 'downloadsData')
-          ? getChangedContentDownloadCountKeysServer(previousDownloadsForSharedGameMatch, profileDbPatch.downloadsData)
+          ? getChangedContentDownloadCountKeysServer(previousDownloadsData, profileDbPatch.downloadsData)
           : [];
         if (contentDownloadCountChangedKeys.length) {
           invalidateContentDownloadCountKeys(contentDownloadCountChangedKeys);
