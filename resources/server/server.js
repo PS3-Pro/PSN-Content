@@ -83,6 +83,7 @@ const poolOptions = {
 if (PG_MAX_USES > 0) poolOptions.maxUses = PG_MAX_USES;
 const pool = new Pool(poolOptions);
 let profileSyncNotifyClient = null;
+let profileSyncListenReady = false;
 let profileSyncReconnectTimer = null;
 
 let onlineListCache = null;
@@ -909,6 +910,8 @@ let lastKnownOnlineList = [];
 let adminStateLastRefreshAt = 0;
 let adminStateRefreshInFlight = null;
 let adminStateConnectionLimitWarnedAt = 0;
+let serverLogFallbackRefreshAt = 0;
+const SERVER_LOG_FALLBACK_REFRESH_MS = 120000;
 
 async function refreshAdminStateFromDb() {
   try {
@@ -5519,6 +5522,7 @@ async function addServerLog(type, message, detail = {}, user = "Server") {
   }
 
   emitToAdmins('admin_server_log', entry);
+  deferServerTask('SERVER LOG NOTIFY', () => notifyServerLogAcrossInstances(entry), 0);
   return entry;
 }
 
@@ -5927,6 +5931,16 @@ async function notifyAdminStateAcrossInstances(key, state) {
   }
 }
 
+async function notifyServerLogAcrossInstances(entry) {
+  if (!entry || !entry.id) return;
+  const payload = { entry, instanceId: INSTANCE_ID, at: Date.now() };
+  try {
+    await pool.query('SELECT pg_notify($1, $2)', ['server_log_sync', JSON.stringify(payload)]);
+  } catch (err) {
+    console.error('[SERVER LOG NOTIFY ERROR]:', err);
+  }
+}
+
 async function initProfileSyncNotifications() {
   if (profileSyncNotifyClient) return;
 
@@ -5934,7 +5948,7 @@ async function initProfileSyncNotifications() {
   profileSyncNotifyClient = client;
 
   client.on('notification', async (message) => {
-    if (!message || !['profile_sync', 'presence_sync', 'ps3_playtime_sync', 'admin_state_sync', 'friend_activity_sync', 'user_notification_sync', 'game_players_sync', 'content_download_counts_sync'].includes(message.channel)) return;
+    if (!message || !['profile_sync', 'presence_sync', 'ps3_playtime_sync', 'admin_state_sync', 'server_log_sync', 'friend_activity_sync', 'user_notification_sync', 'game_players_sync', 'content_download_counts_sync'].includes(message.channel)) return;
 
     try {
       const data = JSON.parse(message.payload || '{}');
@@ -5958,6 +5972,16 @@ async function initProfileSyncNotifications() {
         if (!keys.length) return;
         invalidateContentDownloadCountKeys(keys);
         emitContentDownloadCountsChanged(keys, { reason: data.reason });
+        return;
+      }
+
+      if (message.channel === 'server_log_sync') {
+        const entry = data.entry && typeof data.entry === 'object' ? data.entry : null;
+        if (!entry || !entry.id) return;
+        if (serverLog.some(existing => existing && existing.id === entry.id)) return;
+        serverLog.unshift(entry);
+        serverLog = serverLog.slice(0, 120);
+        emitToAdmins('admin_server_log', entry);
         return;
       }
 
@@ -6175,12 +6199,14 @@ async function initProfileSyncNotifications() {
 
   client.on('error', (err) => {
     console.error('[PROFILE LISTEN CONNECTION ERROR]:', err && err.message ? err.message : err);
+    profileSyncListenReady = false;
     if (profileSyncNotifyClient === client) profileSyncNotifyClient = null;
     client.end().catch(() => {});
     scheduleProfileSyncReconnect(isPgConnectionLimitError(err) ? 15000 : 5000);
   });
 
   client.on('end', () => {
+    profileSyncListenReady = false;
     if (profileSyncNotifyClient === client) profileSyncNotifyClient = null;
     scheduleProfileSyncReconnect(5000);
   });
@@ -6191,19 +6217,23 @@ async function initProfileSyncNotifications() {
     await client.query('LISTEN presence_sync');
     await client.query('LISTEN ps3_playtime_sync');
     await client.query('LISTEN admin_state_sync');
+    await client.query('LISTEN server_log_sync');
     await client.query('LISTEN friend_activity_sync');
     await client.query('LISTEN user_notification_sync');
     await client.query('LISTEN game_players_sync');
     await client.query('LISTEN content_download_counts_sync');
+    profileSyncListenReady = true;
     console.log('[PROFILE SYNC] Postgres LISTEN enabled.');
     console.log('[PRESENCE SYNC] Postgres LISTEN enabled.');
     console.log('[PS3 PLAYTIME SYNC] Postgres LISTEN enabled.');
     console.log('[ADMIN STATE SYNC] Postgres LISTEN enabled.');
+    console.log('[SERVER LOG SYNC] Postgres LISTEN enabled.');
     console.log('[FRIEND ACTIVITY] Postgres LISTEN enabled.');
     console.log('[NOTIFICATIONS] Postgres LISTEN enabled.');
     console.log('[GAME PLAYERS] Postgres LISTEN enabled.');
     console.log('[CONTENT DOWNLOAD COUNTS] Postgres LISTEN enabled.');
   } catch (err) {
+    profileSyncListenReady = false;
     if (profileSyncNotifyClient === client) profileSyncNotifyClient = null;
     console.error('[PROFILE LISTEN INIT ERROR]:', err && err.message ? err.message : err);
     await client.end().catch(() => {});
@@ -7917,13 +7947,18 @@ async function syncAdminStateAcrossInstances() {
   const previousChatControls = JSON.stringify(normalizeChatControls(adminState.chatControls || {}));
   const previousPinnedAnnouncement = JSON.stringify(adminState.pinnedAnnouncement || null);
   const adminConnected = hasAdminSockets();
-  const previousServerLog = adminConnected ? JSON.stringify(serverLog) : "";
 
   await refreshAdminStateThrottled(8000);
 
   if (adminConnected) {
-    await refreshServerLogFromDb();
-    if (JSON.stringify(serverLog) !== previousServerLog) emitToAdmins('admin_server_log_list', serverLog);
+    const now = Date.now();
+    const shouldFallbackRefreshServerLog = !profileSyncListenReady || !serverLogFallbackRefreshAt || now - serverLogFallbackRefreshAt >= SERVER_LOG_FALLBACK_REFRESH_MS;
+    if (shouldFallbackRefreshServerLog) {
+      const previousServerLog = JSON.stringify(serverLog);
+      await refreshServerLogFromDb();
+      serverLogFallbackRefreshAt = Date.now();
+      if (JSON.stringify(serverLog) !== previousServerLog) emitToAdmins('admin_server_log_list', serverLog);
+    }
   }
 
   const maintenanceChanged = JSON.stringify(normalizeMaintenanceState(adminState.maintenance || {})) !== previousMaintenance;

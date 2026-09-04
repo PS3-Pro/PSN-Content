@@ -36735,30 +36735,55 @@ P
 		if (!config || !button || !grid) return;
 		const count = window.getVisibleSurpriseCards(grid).length;
 		const enabled = count > 1;
-		button.disabled = !enabled;
-		button.classList.toggle('is-disabled', !enabled);
-		button.setAttribute('aria-disabled', enabled ? 'false' : 'true');
-		button.title = enabled ? config.title : 'Surprise Me needs at least two visible items';
+		const disabled = !enabled;
+		if (button.disabled !== disabled) button.disabled = disabled;
+		if (button.classList.contains('is-disabled') !== disabled) button.classList.toggle('is-disabled', disabled);
+		const nextAriaDisabled = enabled ? 'false' : 'true';
+		if (button.getAttribute('aria-disabled') !== nextAriaDisabled) button.setAttribute('aria-disabled', nextAriaDisabled);
+		const nextTitle = enabled ? config.title : 'Surprise Me needs at least two visible items';
+		if (button.title !== nextTitle) button.title = nextTitle;
 	};
 
 	(function setupCollectionSurpriseButtonSync() {
-		const scopes = ['wishlist', 'library', 'favorites'];
+		const gridScopes = { 'wishlist-grid': 'wishlist', 'ps3-local-grid': 'library', 'ps3-favs-grid': 'favorites' };
+		const scopes = Object.values(gridScopes);
+		const pendingScopes = new Set();
 		let frame = 0;
 		const sync = () => {
 			frame = 0;
-			scopes.forEach(scope => window.syncCollectionSurpriseButtonState(scope));
+			const targets = Array.from(pendingScopes);
+			pendingScopes.clear();
+			targets.forEach(scope => window.syncCollectionSurpriseButtonState(scope));
 		};
-		const schedule = () => {
+		const schedule = scope => {
+			if (scope) pendingScopes.add(scope);
 			if (frame) return;
 			frame = requestAnimationFrame(sync);
 		};
 		const bind = () => {
-			['wishlist-grid', 'ps3-local-grid', 'ps3-favs-grid'].forEach(id => {
+			Object.entries(gridScopes).forEach(([id, scope]) => {
 				const grid = document.getElementById(id);
 				if (!grid) return;
-				new MutationObserver(schedule).observe(grid, { childList: true, subtree: true, attributes: true, attributeFilter: ['class', 'style'] });
+				new MutationObserver(mutations => {
+					for (const mutation of mutations) {
+						if (mutation.type === 'childList') {
+							if (mutation.target === grid) { schedule(scope); return; }
+							const changedCardStructure = [...mutation.addedNodes, ...mutation.removedNodes].some(node =>
+								node && node.nodeType === 1 && (node.matches?.('.game-card') || node.querySelector?.('.game-card'))
+							);
+							if (changedCardStructure) { schedule(scope); return; }
+							continue;
+						}
+						if (mutation.type === 'attributes' && mutation.target?.matches?.('.game-card')) {
+							// Class changes may alter remove/filter states. Inline style is intentionally not
+							// observed: pointer-light animation writes CSS variables to card.style every frame.
+							schedule(scope);
+							return;
+						}
+					}
+				}).observe(grid, { childList: true, subtree: true, attributes: true, attributeFilter: ['class'] });
 			});
-			schedule();
+			scopes.forEach(schedule);
 		};
 		if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', bind, { once: true });
 		else bind();
@@ -36771,12 +36796,15 @@ P
 		const contextual = typeof isBrowseContextualNavigationActive === 'function' && isBrowseContextualNavigationActive();
 		const enabled = count > 1 && !contextual;
 
-		button.disabled = !enabled;
-		button.classList.toggle('is-disabled', !enabled);
-		button.setAttribute('aria-disabled', enabled ? 'false' : 'true');
-		button.title = enabled
+		const disabled = !enabled;
+		if (button.disabled !== disabled) button.disabled = disabled;
+		if (button.classList.contains('is-disabled') !== disabled) button.classList.toggle('is-disabled', disabled);
+		const nextAriaDisabled = enabled ? 'false' : 'true';
+		if (button.getAttribute('aria-disabled') !== nextAriaDisabled) button.setAttribute('aria-disabled', nextAriaDisabled);
+		const nextTitle = enabled
 			? 'Surprise Me'
 			: (contextual ? 'Surprise Me is unavailable in this contextual view' : 'Surprise Me needs at least two loaded items');
+		if (button.title !== nextTitle) button.title = nextTitle;
 	};
 
 	window.revealPendingStoreFocus = function() {
@@ -69811,7 +69839,6 @@ function getVisibleChatStackEl(id) {
 <script id="ps3-pad-page-js">
 (function () {
     const HOLDABLE = new Set(['up', 'down', 'left', 'right', 'l1', 'l2', 'r1', 'r2', 'l3', 'r3', 'triangle', 'square', 'circle', 'cross']);
-    let padRefreshTimer = null;
     let manualCloseUntilPortrait = false;
     let manualPadOpen = false;
     let padOpenedByButton = false;
@@ -69920,15 +69947,11 @@ function getVisibleChatStackEl(id) {
         }
 
         if (!nextOpen) {
-            if (wasOpen || padRefreshTimer) {
+            if (wasOpen) {
                 releaseKeyboardPadKeys();
                 closePadKeyboardSettings();
                 setPadKeyboardGuideOpen(false);
                 if (document.body.style.overflow !== previousOverflow) document.body.style.overflow = previousOverflow;
-            }
-            if (padRefreshTimer) {
-                clearInterval(padRefreshTimer);
-                padRefreshTimer = null;
             }
             return wasOpen;
         }
@@ -69939,7 +69962,6 @@ function getVisibleChatStackEl(id) {
             const nextStatusText = ip ? `Connected • ${ip}` : 'Connected';
             if (status.textContent !== nextStatusText) status.textContent = nextStatusText;
         }
-        if (!padRefreshTimer) padRefreshTimer = setInterval(refreshPadPage, 700);
         return !wasOpen;
     }
 
@@ -71744,7 +71766,19 @@ function getVisibleChatStackEl(id) {
 
 	if (window.MutationObserver) {
 		var root = document.getElementById('database-grid') || document.body;
-		var observer = new MutationObserver(function(){ if (!window.__baseGameTitleIdLinkDecorating) processUiSoon(); });
+		var relevantUiSelector = '.game-card[data-title-id],.grouped-title-card[data-group-title-ids],.grouped-title-card[data-group-single-title-id],.modal-info-text,.game-id,.btn-upd,.btn-dlc,.btn-avt,.btn-thm';
+		var mutationTouchesRelevantUi = function(mutation) {
+			if (!mutation || mutation.type !== 'childList') return false;
+			if (mutation.target === root || mutation.target?.id === 'game-modal') return true;
+			var nodes = Array.prototype.slice.call(mutation.addedNodes || []).concat(Array.prototype.slice.call(mutation.removedNodes || []));
+			return nodes.some(function(node) {
+				return !!(node && node.nodeType === 1 && (node.matches?.(relevantUiSelector) || node.querySelector?.(relevantUiSelector)));
+			});
+		};
+		var observer = new MutationObserver(function(mutations){
+			if (window.__baseGameTitleIdLinkDecorating) return;
+			if (mutations.some(mutationTouchesRelevantUi)) processUiSoon();
+		});
 		observer.observe(root, { childList: true, subtree: true });
 
 		var modal = document.getElementById('game-modal');
@@ -71771,15 +71805,18 @@ function getVisibleChatStackEl(id) {
 
 		const previous = nav.getAttribute('c-active') || '1';
 		const next = tabToOption[tab];
+		const activeOption = nav.querySelector('.nps-liquid-switcher__option.active');
+		const domAlreadyCurrent = previous === next && activeOption?.getAttribute('data-tab') === tab && !!activeOption.querySelector('.nps-liquid-switcher__input:checked');
+		if (domAlreadyCurrent) return;
 
-		nav.setAttribute('c-previous', previous);
-		nav.setAttribute('c-active', next);
+		if (nav.getAttribute('c-previous') !== previous) nav.setAttribute('c-previous', previous);
+		if (nav.getAttribute('c-active') !== next) nav.setAttribute('c-active', next);
 
 		nav.querySelectorAll('.nps-liquid-switcher__option').forEach(option => {
 			const input = option.querySelector('.nps-liquid-switcher__input');
 			const isActive = option.getAttribute('data-tab') === tab;
-			option.classList.toggle('active', isActive);
-			if (input) input.checked = isActive;
+			if (option.classList.contains('active') !== isActive) option.classList.toggle('active', isActive);
+			if (input && input.checked !== isActive) input.checked = isActive;
 		});
 	}
 
