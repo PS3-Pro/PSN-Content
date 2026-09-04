@@ -14189,6 +14189,126 @@ P
 		syncRecentlyVisitedDiscoverCards();
 	}
 
+
+	/* Preserve stable DOM nodes during live/list refreshes so only changed items are replaced. */
+	window.getLiveRenderSignature = function(value) {
+		let raw = '';
+		try { raw = typeof value === 'string' ? value : JSON.stringify(value == null ? null : value); }
+		catch (err) { raw = String(value == null ? '' : value); }
+		let hash = 2166136261;
+		for (let i = 0; i < raw.length; i++) {
+			hash ^= raw.charCodeAt(i);
+			hash = Math.imul(hash, 16777619);
+		}
+		return (hash >>> 0).toString(36);
+	};
+
+	window.escapeLiveRenderAttr = function(value) {
+		return String(value == null ? '' : value).replace(/[&<>"]/g, ch => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;' })[ch]);
+	};
+
+	window.captureLiveRenderNodes = function(container, selector = ':scope > [data-live-render-key]') {
+		if (!container) return null;
+		const nodes = new Map();
+		Array.from(container.querySelectorAll(selector)).forEach(node => {
+			const key = String(node.dataset.liveRenderKey || '').trim();
+			if (key && !nodes.has(key)) nodes.set(key, node);
+		});
+		return { nodes, scrollTop: container.scrollTop, scrollLeft: container.scrollLeft };
+	};
+
+	window.restoreLiveRenderNodes = function(container, snapshot, selector = ':scope > [data-live-render-key]', options = {}) {
+		if (!container || !snapshot || !(snapshot.nodes instanceof Map) || !snapshot.nodes.size) return 0;
+		let reused = 0;
+		Array.from(container.querySelectorAll(selector)).forEach(nextNode => {
+			const key = String(nextNode.dataset.liveRenderKey || '').trim();
+			const previousNode = key ? snapshot.nodes.get(key) : null;
+			if (!previousNode) return;
+			const previousSignature = String(previousNode.dataset.liveRenderSignature || '');
+			const nextSignature = String(nextNode.dataset.liveRenderSignature || '');
+			let shouldReuse = !!(previousSignature && nextSignature && previousSignature === nextSignature);
+			if (typeof options.onReuse === 'function') {
+				const decision = options.onReuse(previousNode, nextNode, key, shouldReuse);
+				if (decision === true) shouldReuse = true;
+				else if (decision === false) shouldReuse = false;
+			}
+			if (!shouldReuse) return;
+			const nextTileIndex = nextNode.style && nextNode.style.getPropertyValue ? nextNode.style.getPropertyValue('--tile-idx') : '';
+			if (nextTileIndex && previousNode.style && previousNode.style.setProperty) previousNode.style.setProperty('--tile-idx', nextTileIndex);
+			if (options.markReused === true) previousNode.dataset.liveRenderReused = '1';
+			previousNode.dataset.liveRenderSignature = nextSignature || previousSignature;
+			nextNode.replaceWith(previousNode);
+			reused++;
+		});
+		if (options.preserveScroll === true) {
+			container.scrollTop = snapshot.scrollTop;
+			container.scrollLeft = snapshot.scrollLeft;
+		}
+		return reused;
+	};
+
+	window.clearLiveRenderReuseMarks = function(container) {
+		if (!container) return;
+		container.querySelectorAll('[data-live-render-reused="1"]').forEach(node => delete node.dataset.liveRenderReused);
+	};
+
+	window.getLiveRenderMatches = function(root, selector = '[data-live-render-key]') {
+		if (!root || typeof root.querySelectorAll !== 'function') return [];
+		const rawSelector = String(selector || '[data-live-render-key]').trim();
+		const directMatch = rawSelector.match(/^:scope\s*>\s*(.+)$/);
+		const query = directMatch ? directMatch[1] : rawSelector;
+		return Array.from(root.querySelectorAll(query)).filter(node => !directMatch || node.parentNode === root);
+	};
+
+	window.reconcileLiveRenderFragment = function(container, fragment, selector = '[data-live-render-key]', options = {}) {
+		if (!container || !fragment) return { reused: 0, inserted: 0, removed: 0 };
+		const previousNodes = new Map();
+		window.getLiveRenderMatches(container, selector).forEach(node => {
+			const key = String(node.dataset.liveRenderKey || '').trim();
+			if (key && !previousNodes.has(key)) previousNodes.set(key, node);
+		});
+		const oldKeys = new Set(previousNodes.keys());
+		const nextNodes = window.getLiveRenderMatches(fragment, selector);
+		let reused = 0;
+		let inserted = 0;
+		nextNodes.forEach(nextNode => {
+			const key = String(nextNode.dataset.liveRenderKey || '').trim();
+			const previousNode = key ? previousNodes.get(key) : null;
+			if (!previousNode) { if (key) inserted++; return; }
+			const previousSignature = String(previousNode.dataset.liveRenderSignature || '');
+			const nextSignature = String(nextNode.dataset.liveRenderSignature || '');
+			let shouldReuse = !!(previousSignature && nextSignature && previousSignature === nextSignature);
+			if (typeof options.onReuse === 'function') {
+				const decision = options.onReuse(previousNode, nextNode, key, shouldReuse);
+				if (decision === true) shouldReuse = true;
+				else if (decision === false) shouldReuse = false;
+			}
+			if (!shouldReuse) return;
+			const nextTileIndex = nextNode.style && nextNode.style.getPropertyValue ? nextNode.style.getPropertyValue('--tile-idx') : '';
+			if (nextTileIndex && previousNode.style && previousNode.style.setProperty) previousNode.style.setProperty('--tile-idx', nextTileIndex);
+			if (options.markReused === true) previousNode.dataset.liveRenderReused = '1';
+			previousNode.dataset.liveRenderSignature = nextSignature || previousSignature;
+			oldKeys.delete(key);
+			nextNode.replaceWith(previousNode);
+			reused++;
+		});
+		const scrollTop = container.scrollTop;
+		const scrollLeft = container.scrollLeft;
+		container.replaceChildren(fragment);
+		if (options.preserveScroll === true) {
+			container.scrollTop = scrollTop;
+			container.scrollLeft = scrollLeft;
+		}
+		return { reused, inserted, removed: oldKeys.size };
+	};
+
+	window.reconcileLiveRenderHtml = function(container, html, selector = '[data-live-render-key]', options = {}) {
+		if (!container) return { reused: 0, inserted: 0, removed: 0 };
+		const template = document.createElement('template');
+		template.innerHTML = String(html || '');
+		return window.reconcileLiveRenderFragment(container, template.content, selector, options);
+	};
+
 	window.renderRecentlyVisited = function() {
 		const section = document.getElementById('recently-visited-section');
 		const container = document.getElementById('recently-visited-grid');
@@ -14244,8 +14364,20 @@ P
 
 		clearRecentlyVisitedVirtualState(container);
 		container.querySelectorAll('.recently-visited-placeholder').forEach(node => node.remove());
+		const recentTemplate = document.createElement('template');
+		recentTemplate.innerHTML = nextRecentlyVisitedHtml;
+		window.getLiveRenderMatches(recentTemplate.content, ':scope > .game-card').forEach((card, index) => {
+			const item = items[index];
+			if (!item) return;
+			card.dataset.liveRenderKey = `recent:${getRecentlyVisitedItemKey(item)}`;
+			card.dataset.liveRenderSignature = typeof window.getLiveRenderSignature === 'function' ? window.getLiveRenderSignature(item) : '';
+		});
+		if (typeof window.reconcileLiveRenderFragment === 'function') {
+			window.reconcileLiveRenderFragment(container, recentTemplate.content, ':scope > .game-card[data-live-render-key]');
+		} else {
+			container.replaceChildren(recentTemplate.content);
+		}
 		container.scrollLeft = 0;
-		container.innerHTML = nextRecentlyVisitedHtml;
 		container.__recentlyVisitedRenderHtml = nextRecentlyVisitedHtml;
 		container.querySelectorAll('.game-img').forEach(img => {
 			if (img.complete && img.naturalWidth > 0) {
@@ -29313,13 +29445,16 @@ P
 		if (!element) return false;
 		const activeUser = String(localStorage.getItem('psn_username') || '');
 		const liveContext = String(contextKey || activeUser);
-		const nextValue = String(rawValue ?? text ?? '');
+		const nextText = String(text ?? '');
+		const nextValue = String(rawValue ?? nextText);
 		const previousValue = element.dataset.liveCountValue ?? '';
+		const previousText = element.dataset.liveCountText ?? String(element.textContent ?? '');
 		const hadInitialized = element.dataset.liveCountInitialized === '1' && (element.dataset.liveCountOwner || '') === liveContext;
-		element.textContent = String(text ?? '');
+		element.textContent = nextText;
 		element.dataset.liveCountValue = nextValue;
+		element.dataset.liveCountText = nextText;
 		element.dataset.liveCountOwner = liveContext;
-		if (hadInitialized && previousValue !== nextValue && typeof window.animateCountPillFeedback === 'function') {
+		if (hadInitialized && previousValue !== nextValue && previousText !== nextText && typeof window.animateCountPillFeedback === 'function') {
 			let feedbackTarget = element;
 			if (element.id === 'online-count') feedbackTarget = document.getElementById('online-count-wrapper') || element;
 			else if (element.classList.contains('player-stat-value')) feedbackTarget = element.closest('.player-stat-box') || element;
@@ -30150,10 +30285,13 @@ P
 			const dlStoreStatusHtml = dlStoreUnavailable
 				? `<div class="profile-list-search-status profile-list-search-status--missing"><span class="profile-list-search-id">${dlSearchIdRaw}</span><span class="profile-list-search-sep"> - </span><span class="profile-list-search-missing">NOT FOUND</span></div>`
 				: (dlStoreAvailable ? `<div class="profile-list-search-status">SEARCH</div>` : `<div class="profile-list-search-status" style="color:var(--text-muted);">CHECKING</div>`);
+			const downloadLiveSignature = typeof window.getLiveRenderSignature === 'function'
+				? window.getLiveRenderSignature([downloadRealtimeKey, dl.sizeText || '', dl.sentToPs3 === true ? 1 : 0, dlDisplayName, dlFinalCategory, dl.contentId || '', coverImg || '', dlStoreAvailable ? 1 : 0, dlStoreUnavailable ? 1 : 0, identity.titleId || '', identity.titleId && typeof window.isViewerPlayTogetherTitle === 'function' && window.isViewerPlayTogetherTitle(identity.titleId) ? 1 : 0, dl.isNew === true ? 1 : 0])
+				: '';
 	
 			const revealClass = 'no-anim';
 			return `
-				<div class="download-swipe-row${dlStoreUnavailable ? ' store-download-unavailable-row' : ''}" data-download-index="${index}" data-download-key="${downloadRealtimeKeyAttr}">
+				<div class="download-swipe-row${dlStoreUnavailable ? ' store-download-unavailable-row' : ''}" data-download-index="${index}" data-download-key="${downloadRealtimeKeyAttr}" data-live-render-key="download:${downloadRealtimeKeyAttr}" data-live-render-signature="${window.escapeLiveRenderAttr ? window.escapeLiveRenderAttr(downloadLiveSignature) : downloadLiveSignature}">
 					<div class="download-swipe-action" aria-hidden="false">
 						<button type="button" class="download-swipe-delete" title="Remove from download history" aria-label="Remove ${dlDisplayName.replace(/"/g, '&quot;')} from download history">
 							<i class="fas fa-trash-alt"></i><span>Delete</span>
@@ -30182,14 +30320,45 @@ P
 				</div>
 			`;
 		}).join('');
-		if (downloadCanAppend) listContainer.insertAdjacentHTML('beforeend', downloadRowsHtml);
-		else listContainer.innerHTML = downloadRowsHtml;
+		if (downloadCanAppend) {
+			listContainer.insertAdjacentHTML('beforeend', downloadRowsHtml);
+		} else if (typeof window.reconcileLiveRenderHtml === 'function') {
+			window.reconcileLiveRenderHtml(listContainer, downloadRowsHtml, ':scope > .download-swipe-row[data-live-render-key]', {
+				preserveScroll: true,
+				markReused: true,
+				onReuse(previousRow, nextRow, key, sameSignature) {
+					if (!sameSignature) return false;
+					previousRow.dataset.downloadIndex = nextRow.dataset.downloadIndex || previousRow.dataset.downloadIndex || '';
+					const previousItem = previousRow.querySelector('.download-item');
+					const nextItem = nextRow.querySelector('.download-item');
+					if (previousItem && nextItem) previousItem.style.setProperty('--tile-idx', nextItem.style.getPropertyValue('--tile-idx') || '0');
+					const recordKey = String(previousRow.dataset.downloadKey || '').trim();
+					const record = downloadRenderEntries.find(entry => String(getDownloadNotificationItemKey(entry.item) || '') === recordKey)?.item || null;
+					if (record) {
+						const countValue = typeof getDownloadHistoryItemCount === 'function' ? getDownloadHistoryItemCount(record) : Math.max(1, Number(record.downloadCount) || 1);
+						const dateText = countValue > 1 ? `Last download: ${record.date || ''}` : String(record.date || '');
+						const dateNode = previousRow.querySelector('.dl-date');
+						if (dateNode) {
+							const icon = dateNode.querySelector('i');
+							dateNode.textContent = '';
+							if (icon) dateNode.appendChild(icon);
+							dateNode.appendChild(document.createTextNode(dateText));
+						}
+						if (typeof window.syncLiveDownloadCountPill === 'function') window.syncLiveDownloadCountPill(previousRow, countValue, `downloads-history:${recordKey}`);
+					}
+					return true;
+				}
+			});
+		} else {
+			listContainer.innerHTML = downloadRowsHtml;
+		}
 		listContainer.dataset.downloadRenderSignature = downloadRenderSignature;
 		listContainer.dataset.downloadStructureSignature = downloadStructureSignature;
 		listContainer.dataset.progressiveGridRendered = String(downloadRenderEnd);
 		if (!isSilentRender && typeof setupRevealAnimations === 'function') {
-			setupRevealAnimations(listContainer, { selector:'.download-item', root:listContainer, margin:18, immediate:isEntryRender, animClass:'anim-reveal' });
+			setupRevealAnimations(listContainer, { selector:'.download-swipe-row:not([data-live-render-reused="1"]) .download-item', root:listContainer, margin:18, immediate:isEntryRender, animClass:'anim-reveal' });
 		}
+		if (typeof window.clearLiveRenderReuseMarks === 'function') window.clearLiveRenderReuseMarks(listContainer);
 		setupProgressiveGridObserver('downloads', listContainer, downloadRenderEnd, downloadRenderEntries.length, () => window.updateDownloadUI(true, 'append'), listContainer);
 		scheduleDownloadSwipeHint();
 	};
@@ -36594,6 +36763,9 @@ P
 		const activeUser = localStorage.getItem('psn_username');
 		
 		if (!grid) return;
+		const wishlistLiveSnapshot = (!appendProgressive && typeof window.captureLiveRenderNodes === 'function')
+			? window.captureLiveRenderNodes(grid, ':scope > .game-card[data-live-render-key]')
+			: null;
 		const wishlistViewIsActive = isPsnDomSectionVisible('view-wishlist');
 		if (!wishlistViewIsActive) {
 			if (typeof window.refreshWishlistSummaryUI === 'function') window.refreshWishlistSummaryUI();
@@ -36795,7 +36967,6 @@ P
 			return;
 		}
 		if (!wishlistCanAppend) {
-			grid.innerHTML = '';
 			grid.dataset.progressiveGridSignature = wishlistProgressiveSignature;
 			grid.dataset.progressiveGridRendered = '0';
 		}
@@ -36894,11 +37065,15 @@ P
 			const isStoreUnavailable = game.__storeUnavailable === true;
 			const unavailableClass = isStoreUnavailable ? ' store-item-unavailable' : '';
 			const wishlistIdentityAttr = escapeCategoryDotAttr(game.__wishlistIdentityKey || '');
+			const wishlistLiveKey = String(wishDotKey || game.contentId || game.id || `wishlist-${i}`);
+			const wishlistLiveSignature = typeof window.getLiveRenderSignature === 'function'
+				? window.getLiveRenderSignature([resolvedWishCategory, game.id || '', game.contentId || '', game.cleanName || '', game.size || '', game.cTag || '', game.region || '', imgUrl || '', githubCoverUrl || '', isStoreUnavailable ? 1 : 0, shouldShowWishTypeTag ? 1 : 0, isPendingWishlistReveal ? 1 : 0])
+				: '';
 			const wishlistCardClick = isStoreUnavailable
 				? 'playUiError();'
 				: `playUiClick(); searchGameOnSite('${game.id}', 'wishlist', '${resolvedWishCategory}', '${(game.cleanName || '').replace(/'/g, "\\'")}', '${(game.contentId || '').replace(/'/g, "\\'")}')`;
 			html += `
-			<div class="game-card ${animClass} ${isSilent ? 'no-img-fade' : ''} ${isPendingWishlistReveal ? 'category-wishlist-entry' : ''} is-wishlisted${unavailableClass}" data-content-id="${game.contentId || ''}" data-store-category="${resolvedWishCategory}" data-wishlist-title-id="${game.id || ''}" data-wishlist-category="${resolvedWishCategory}" data-wishlist-identity-key="${wishlistIdentityAttr}" data-category-dot-key="${escapeCategoryDotAttr(wishDotKey)}" style="--tile-idx: ${i % 50};" onmouseenter="const __hoverTarget = document.elementFromPoint(event.clientX, event.clientY); if(!__hoverTarget || !__hoverTarget.closest('.btn-mini,.btn-mini-round,.fav-btn,.wish-btn,.action-btn,button,a')) playUiHover(); this.classList.remove('anim-reveal'); this.classList.add('no-anim');" onclick="${wishlistCardClick}">
+			<div class="game-card ${animClass} ${isSilent ? 'no-img-fade' : ''} ${isPendingWishlistReveal ? 'category-wishlist-entry' : ''} is-wishlisted${unavailableClass}" data-content-id="${game.contentId || ''}" data-store-category="${resolvedWishCategory}" data-wishlist-title-id="${game.id || ''}" data-wishlist-category="${resolvedWishCategory}" data-wishlist-identity-key="${wishlistIdentityAttr}" data-category-dot-key="${escapeCategoryDotAttr(wishDotKey)}" data-live-render-key="wishlist:${escapeCategoryDotAttr(wishlistLiveKey)}" data-live-render-signature="${escapeCategoryDotAttr(wishlistLiveSignature)}" style="--tile-idx: ${i % 50};" onmouseenter="const __hoverTarget = document.elementFromPoint(event.clientX, event.clientY); if(!__hoverTarget || !__hoverTarget.closest('.btn-mini,.btn-mini-round,.fav-btn,.wish-btn,.action-btn,button,a')) playUiHover(); this.classList.remove('anim-reveal'); this.classList.add('no-anim');" onclick="${wishlistCardClick}">
 				<div class="game-img-container">
 					<div class="console-tag ${tagClass}">${game.cTag.toUpperCase()}</div>
 					<div class="region-tag">${game.region}</div>
@@ -36927,8 +37102,14 @@ P
 			</div>`;
 		}
 		
-		if (wishlistCanAppend) grid.insertAdjacentHTML('beforeend', html);
-		else grid.innerHTML = html;
+		if (wishlistCanAppend) {
+			grid.insertAdjacentHTML('beforeend', html);
+		} else if (typeof window.reconcileLiveRenderHtml === 'function') {
+			window.reconcileLiveRenderHtml(grid, html, ':scope > .game-card[data-live-render-key]', { preserveScroll: true, markReused: true });
+		} else {
+			grid.innerHTML = html;
+			if (wishlistLiveSnapshot && typeof window.restoreLiveRenderNodes === 'function') window.restoreLiveRenderNodes(grid, wishlistLiveSnapshot, ':scope > .game-card[data-live-render-key]', { preserveScroll: true, markReused: true });
+		}
 		grid.dataset.progressiveGridRendered = String(wishlistRenderEnd);
 		if (typeof window.refreshStoreInstalledChecks === 'function') window.refreshStoreInstalledChecks();
 	
@@ -36937,11 +37118,12 @@ P
 		}
 	
 		if (!isSilent) {
-			setupRevealAnimations('wishlist-grid', { selector: '.game-card:not(.category-wishlist-entry)' });
+			setupRevealAnimations('wishlist-grid', { selector: '.game-card:not(.category-wishlist-entry):not([data-live-render-reused="1"])' });
 		}
 		if (pendingWishlistRevealKeys && pendingWishlistRevealKeys.length && typeof window.revealCategoryPendingCards === 'function') {
 			window.revealCategoryPendingCards('wishlist', pendingWishlistRevealKeys);
 		}
+		if (typeof window.clearLiveRenderReuseMarks === 'function') window.clearLiveRenderReuseMarks(grid);
 		if (wishlistRenderEnd >= filteredWishlist.length) window.__wishlistProgressivePendingKeys = [];
 		setupProgressiveGridObserver('wishlist', grid, wishlistRenderEnd, filteredWishlist.length, () => window.updateWishlistUI(true, 'append'));
 	};
@@ -41550,7 +41732,6 @@ function formatLibraryLastPlayedBadge(game = {}) {
 			return;
 		}
 		if (!favoritesCanAppend) {
-			grid.innerHTML = "";
 			grid.dataset.progressiveGridSignature = favoritesProgressiveSignature;
 			grid.dataset.progressiveGridRendered = '0';
 		}
@@ -41618,6 +41799,7 @@ function formatLibraryLastPlayedBadge(game = {}) {
 		const favoritesRenderEnd = favoritesCanAppend
 			? Math.min(filteredFavs.length, favoritesRenderedBefore + getProgressiveGridLoadAmount())
 			: Math.min(filteredFavs.length, favoritesResetTarget);
+		const favoritesRenderTarget = favoritesCanAppend ? grid : document.createDocumentFragment();
 
 		for (let i = favoritesRenderedBefore; i < favoritesRenderEnd; i++) {
 			const game = filteredFavs[i];
@@ -41690,6 +41872,10 @@ function formatLibraryLastPlayedBadge(game = {}) {
 			card.className = `game-card ${animClass} ${isSilent ? "no-img-fade" : ""} ${isPendingFavoriteReveal ? 'category-favorites-entry' : ''} ${activeClass} is-favorited is-installed-on-ps3`;
 			card.style.setProperty('--tile-idx', i % 50);
 			card.setAttribute('data-category-dot-key', favDotKey);
+			card.dataset.liveRenderKey = `favorite:${String(favDotKey || game.path || game.title || i)}`;
+			card.dataset.liveRenderSignature = typeof window.getLiveRenderSignature === 'function'
+				? window.getLiveRenderSignature([game.path || '', game.title || '', resolvedFavoriteCoverId || '', displayCover || '', resolvedFavoriteGithubCover || '', consoleType, region, activeClass, lastPlayedBadgeText || '', existsInStore ? 1 : 0, targetCategory, storeSearchId || '', detailsAvailable ? 1 : 0, buttonsHtml, isPendingFavoriteReveal ? 1 : 0])
+				: '';
 			card.dataset.libraryDetails = detailsAvailable ? 'available' : 'unavailable';
 			card.setAttribute("onclick", "if(!event.target.closest('.btn-mini,.btn-mini-round,.fav-btn,.wish-btn,.action-btn,button,a')) openConsoleLibraryDetails(this);");
 			card.setAttribute("onmouseenter", "const __hoverTarget = document.elementFromPoint(event.clientX, event.clientY); if(!__hoverTarget || !__hoverTarget.closest('.btn-mini,.btn-mini-round,.fav-btn,.wish-btn,.action-btn,button,a')) playUiHover(); this.classList.remove('anim-reveal'); this.classList.add('no-anim');");
@@ -41719,18 +41905,26 @@ function formatLibraryLastPlayedBadge(game = {}) {
 					</div>
 					${buttonsHtml}
 				</div>`;
-			grid.appendChild(card);
+			favoritesRenderTarget.appendChild(card);
+		}
+		if (!favoritesCanAppend) {
+			if (typeof window.reconcileLiveRenderFragment === 'function') {
+				window.reconcileLiveRenderFragment(grid, favoritesRenderTarget, ':scope > .game-card[data-live-render-key]', { preserveScroll: true, markReused: true });
+			} else {
+				grid.replaceChildren(favoritesRenderTarget);
+			}
 		}
 		grid.dataset.progressiveGridRendered = String(favoritesRenderEnd);
 	
 		// First materialization reveals here. Re-entry of an already rendered Favorites grid
 		// is replayed by showLibrarySection before paint; background/cache refreshes stay static.
 		if (!isSilent && !favoritesHasRenderedCards) {
-			setupRevealAnimations('ps3-favs-grid', { selector: '.game-card:not(.category-favorites-entry)' });
+			setupRevealAnimations('ps3-favs-grid', { selector: '.game-card:not(.category-favorites-entry):not([data-live-render-reused="1"])' });
 		}
 		if (pendingFavoritesRevealKeys && pendingFavoritesRevealKeys.length && typeof window.revealCategoryPendingCards === 'function') {
 			window.revealCategoryPendingCards('favorites', pendingFavoritesRevealKeys);
 		}
+		if (typeof window.clearLiveRenderReuseMarks === 'function') window.clearLiveRenderReuseMarks(grid);
 		if (favoritesRenderEnd >= filteredFavs.length) window.__favoritesProgressivePendingKeys = [];
 		setupProgressiveGridObserver('favorites', grid, favoritesRenderEnd, filteredFavs.length, () => window.updateFavoritesLibraryUI(true, 'append'));
 	};
@@ -48490,6 +48684,9 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
                     window.__chatVirtualLoadingOlder = false;
                     window.__chatOlderLoadCooldownUntil = Date.now() + 220;
                     if (typeof hideChatLazyInlineLoading === 'function') hideChatLazyInlineLoading(0);
+                    requestAnimationFrame(() => {
+                        if (typeof refreshMentionJumpButton === 'function') refreshMentionJumpButton();
+                    });
                 }
             };
             requestAnimationFrame(() => requestAnimationFrame(renderOlder));
@@ -57002,9 +57199,6 @@ function getVisibleChatStackEl(id) {
 				});
 				if (changed) {
 					saveState(STORAGE_KEY_FRIENDS, JSON.stringify(window.friendsList));
-					if (typeof isFriendsSubviewVisible === 'function' && isFriendsSubviewVisible()) {
-						renderFriendsList(document.getElementById('search-input')?.value || '', true);
-					}
 				}
 			}
 		
@@ -59548,6 +59742,11 @@ function getVisibleChatStackEl(id) {
         const countEl = document.getElementById('mention-jump-count');
         if (!btn) return;
 
+        // Older-message virtual batches temporarily move/rebuild rows while preserving the user's viewport.
+        // Keep the last stable mention count untouched until that batch finishes, so the badge cannot flash
+        // from a transient DOM count that never became a real visible count change.
+        if (window.__chatVirtualLoadingOlder) return;
+
         if (typeof isChatPreparingMessages === 'function' && isChatPreparingMessages()) {
             hideMentionJumpButtonImmediately();
             return;
@@ -59561,7 +59760,7 @@ function getVisibleChatStackEl(id) {
             btn.style.opacity = '1';
             if (countEl) {
                 const visibleCount = count > 99 ? '99+' : String(count);
-                countEl.style.display = count > 1 ? 'flex' : 'none';
+                countEl.style.display = 'flex';
                 if (typeof window.setLiveCountText === 'function') window.setLiveCountText(countEl, visibleCount, count, 'chat-mention-jump');
                 else countEl.textContent = visibleCount;
             }
@@ -59569,8 +59768,9 @@ function getVisibleChatStackEl(id) {
             btn.style.opacity = '0';
             if (countEl) {
                 countEl.style.display = 'none';
-                if (typeof window.setLiveCountText === 'function') window.setLiveCountText(countEl, '', 0, 'chat-mention-jump');
-                else countEl.textContent = '';
+                // Hiding the badge is not a visible count transition. Preserve the last shown value
+                // in setLiveCountText's dataset so showing the same number again does not flash.
+                countEl.textContent = '';
             }
             setTimeout(() => { if (btn.style.opacity === '0') btn.style.display = 'none'; }, 300);
         }
@@ -59638,8 +59838,9 @@ function getVisibleChatStackEl(id) {
             else badge.textContent = visibleCount;
         } else {
             badge.style.display = 'none';
-            if (typeof window.setLiveCountText === 'function') window.setLiveCountText(badge, '', 0, 'chat-unread-jump');
-            else badge.textContent = '';
+            // Same protection as mentions: hidden/zero is not a visible number change. Keep the last
+            // shown count as the comparison baseline so scrolling cannot create a false flash.
+            badge.textContent = '';
         }
         return count;
     }
@@ -61128,14 +61329,19 @@ function getVisibleChatStackEl(id) {
 		const renderSignature = getOnlineListRenderSignature(orderedUsers, myName);
 		if (container.dataset.onlineRenderSignature === renderSignature && container.childElementCount > 0) return;
 		container.dataset.onlineRenderSignature = renderSignature;
-		container.innerHTML = '';
 	
 		if (orderedUsers.length === 0) {
 			container.innerHTML = '<div style="text-align:center; padding:20px; color:var(--text-muted);">No users online.</div>';
 			return;
 		}
 
-		orderedUsers.forEach(user => renderUserItem(container, user, (user.name || user) === myName));
+		const nextOnlineFragment = document.createDocumentFragment();
+		orderedUsers.forEach(user => renderUserItem(nextOnlineFragment, user, (user.name || user) === myName));
+		if (typeof window.reconcileLiveRenderFragment === 'function') {
+			window.reconcileLiveRenderFragment(container, nextOnlineFragment, ':scope > .online-user-item[data-live-render-key]', { preserveScroll: true });
+		} else {
+			container.replaceChildren(nextOnlineFragment);
+		}
 	}
 		
 	function renderUserItem(container, userObj, isMe) {
@@ -61185,6 +61391,10 @@ function getVisibleChatStackEl(id) {
 		const div = document.createElement('div');
 		div.className = `online-user-item role-${userRole}${isTargetBanned ? ' is-banned' : ''}`;
 		div.id = `user-row-${targetSocketId}`; 
+		div.dataset.liveRenderKey = `online:${username}`;
+		div.dataset.liveRenderSignature = typeof window.getLiveRenderSignature === 'function'
+			? window.getLiveRenderSignature(getOnlineListRenderSignature([userObj], localStorage.getItem('psn_username')))
+			: '';
 		div.style.cssText = "display: flex; align-items: center; justify-content: space-between; padding: 12px 18px; transition: all 0.3s ease;";
 		
 		if (isMe) div.style.background = "rgba(0, 112, 204, 0.15)";
@@ -61227,7 +61437,8 @@ function getVisibleChatStackEl(id) {
 				`}
 			</div>
 		`;
-		container.appendChild(div);
+		if (container) container.appendChild(div);
+		return div;
 	}
 	
 	window.updateSpecificUserRow = function(socketId, username) {
@@ -65178,6 +65389,9 @@ function getVisibleChatStackEl(id) {
 		const titleHeader = document.getElementById('friends-title-val');
 		
 		if (!grid) return;
+		const friendsLiveSnapshot = (isSilent && progressiveMode !== 'append' && typeof window.captureLiveRenderNodes === 'function')
+			? window.captureLiveRenderNodes(grid, ':scope > .online-user-item[data-live-render-key]')
+			: null;
 	
 		if (titleHeader) {
 			const totalFriends = window.friendsList ? window.friendsList.length : 0;
@@ -65427,6 +65641,9 @@ function getVisibleChatStackEl(id) {
 			}
 
 			grid.dataset.friendsProgressiveRendered = String(renderEnd);
+			if (!canAppendSearch && friendsLiveSnapshot && typeof window.restoreLiveRenderNodes === 'function') {
+				window.restoreLiveRenderNodes(grid, friendsLiveSnapshot, ':scope > .online-user-item[data-live-render-key]', { preserveScroll: true });
+			}
 			if (!isSilent && typeof setupRevealAnimations === 'function') setupRevealAnimations('friends-list-grid');
 			setupProgressiveGridObserver('friends-search', grid, renderEnd, friendsTotalMatches, () => window.renderFriendsList(searchTerm, true, 'append'));
 			return;
@@ -65492,6 +65709,9 @@ function getVisibleChatStackEl(id) {
 				</div>`;
 		}
 
+		if (friendsLiveSnapshot && typeof window.restoreLiveRenderNodes === 'function') {
+			window.restoreLiveRenderNodes(grid, friendsLiveSnapshot, ':scope > .online-user-item[data-live-render-key]', { preserveScroll: true });
+		}
 		if (!isSilent && typeof setupRevealAnimations === 'function') {
 			setupRevealAnimations('friends-list-grid');
 		}
@@ -65566,6 +65786,10 @@ function getVisibleChatStackEl(id) {
 		const card = document.createElement('div');
 		card.className = `online-user-item ${animationClass} role-${userRole}${isTargetBanned ? ' is-banned' : ''}`;
 		card.dataset.filterMotionKey = `user:${name}`;
+		card.dataset.liveRenderKey = `friend:${name}`;
+		card.dataset.liveRenderSignature = typeof window.getLiveRenderSignature === 'function'
+			? window.getLiveRenderSignature([name, avatar, statusColor, statusText, isOnline ? 1 : 0, isFriend ? 1 : 0, playerLevel, userRole, isTargetBanned ? 1 : 0, animationClass, String(netUser && netUser.id || ''), String(netUser && netUser.ps3Status && netUser.ps3Status.status || ''), String(netUser && netUser.ps3Status && netUser.ps3Status.title || '')])
+			: '';
 		card.setAttribute('style', `--tile-idx: ${idx % 50}; padding: 15px; background: rgba(255,255,255,0.03); border-radius: 8px; margin-bottom: 8px; display: flex; align-items: center; justify-content: space-between; backdrop-filter: blur(5px);`);
 		card.setAttribute("onmouseenter", "this.classList.remove('anim-reveal'); this.classList.add('no-anim');");
 	
