@@ -7955,27 +7955,34 @@ const io = new Server(server, {
 const ADMIN_STATE_LISTEN_FALLBACK_MS = Math.max(30000, parseInt(process.env.ADMIN_STATE_LISTEN_FALLBACK_MS || '60000', 10) || 60000);
 
 async function syncAdminStateAcrossInstances() {
-  const previousMaintenance = JSON.stringify(normalizeMaintenanceState(adminState.maintenance || {}));
-  const previousChatControls = JSON.stringify(normalizeChatControls(adminState.chatControls || {}));
-  const previousPinnedAnnouncement = JSON.stringify(adminState.pinnedAnnouncement || null);
   const adminConnected = hasAdminSockets();
   const now = Date.now();
+  const shouldRefreshAdminState = !profileSyncListenReady || !adminStateLastRefreshAt || now - adminStateLastRefreshAt >= ADMIN_STATE_LISTEN_FALLBACK_MS;
+  const shouldRefreshServerLog = adminConnected && (!profileSyncListenReady || !serverLogFallbackRefreshAt || now - serverLogFallbackRefreshAt >= SERVER_LOG_FALLBACK_REFRESH_MS);
 
-  // LISTEN/NOTIFY is authoritative during normal operation. Keep this timer as a safety net,
-  // but avoid rereading the tiny admin_state table every 15 seconds when the listener is healthy.
-  if (!profileSyncListenReady || !adminStateLastRefreshAt || now - adminStateLastRefreshAt >= ADMIN_STATE_LISTEN_FALLBACK_MS) {
+  // Most 15-second ticks are only a safety check while LISTEN/NOTIFY is healthy. If neither
+  // fallback is due, there is no DB work or state reconciliation to perform at all.
+  if (!shouldRefreshAdminState && !shouldRefreshServerLog) return;
+
+  let previousMaintenance = '';
+  let previousChatControls = '';
+  let previousPinnedAnnouncement = '';
+  if (shouldRefreshAdminState) {
+    previousMaintenance = JSON.stringify(normalizeMaintenanceState(adminState.maintenance || {}));
+    previousChatControls = JSON.stringify(normalizeChatControls(adminState.chatControls || {}));
+    previousPinnedAnnouncement = JSON.stringify(adminState.pinnedAnnouncement || null);
     await refreshAdminStateThrottled(8000);
   }
 
-  if (adminConnected) {
-    const shouldFallbackRefreshServerLog = !profileSyncListenReady || !serverLogFallbackRefreshAt || now - serverLogFallbackRefreshAt >= SERVER_LOG_FALLBACK_REFRESH_MS;
-    if (shouldFallbackRefreshServerLog) {
-      const previousServerLog = JSON.stringify(serverLog);
-      await refreshServerLogFromDb();
-      serverLogFallbackRefreshAt = Date.now();
-      if (JSON.stringify(serverLog) !== previousServerLog) emitToAdmins('admin_server_log_list', serverLog);
-    }
+  if (shouldRefreshServerLog) {
+    const previousServerLog = JSON.stringify(serverLog);
+    await refreshServerLogFromDb();
+    serverLogFallbackRefreshAt = Date.now();
+    if (JSON.stringify(serverLog) !== previousServerLog) emitToAdmins('admin_server_log_list', serverLog);
   }
+
+  // A server-log-only fallback cannot have changed admin state in this function.
+  if (!shouldRefreshAdminState) return;
 
   const maintenanceChanged = JSON.stringify(normalizeMaintenanceState(adminState.maintenance || {})) !== previousMaintenance;
   const chatControlsChanged = JSON.stringify(normalizeChatControls(adminState.chatControls || {})) !== previousChatControls;
