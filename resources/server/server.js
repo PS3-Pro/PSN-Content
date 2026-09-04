@@ -2927,18 +2927,11 @@ function startUserCacheWarmup() {
     return;
   }
 
-  setInterval(() => {
-    refreshAllUsersCacheFromDb()
-      .catch(err => console.error('[USER CACHE REFRESH ERROR]:', err));
-  }, USER_CACHE_REFRESH_INTERVAL_MS);
-
-  setInterval(() => {
-    const age = Date.now() - userCacheLastFullRefresh;
-    if (!userCacheLastFullRefresh || age > USER_CACHE_WARMUP_INTERVAL_MS) {
-      refreshAllUsersCacheFromDb()
-        .catch(err => console.error('[USER CACHE WARMUP ERROR]:', err));
-    }
-  }, USER_CACHE_WARMUP_INTERVAL_MS);
+  // One non-overlapping refresh cadence is enough. The old second "warmup" interval checked
+  // whether this same 30s task had refreshed within 120s, so it was redundant during healthy
+  // operation and could start another full users-table read while a slow refresh was still running.
+  const refreshUserCacheTask = runNonOverlappingTask('USER CACHE REFRESH', refreshAllUsersCacheFromDb);
+  setInterval(refreshUserCacheTask, USER_CACHE_REFRESH_INTERVAL_MS);
 }
 
 function getEmptyUserDataPayload(type) {
@@ -3445,14 +3438,20 @@ function emitGamePlayersSummaryChanged(rawTitleIds = [], options = {}) {
 
   const excludeSocketId = normalizeText(options.excludeSocketId, '');
   const targetUser = normalizeText(options.targetUser, '');
-  const recipients = targetUser
-    ? getSocketsByUserName(targetUser).filter(client => client && client.connected && (!excludeSocketId || client.id !== excludeSocketId))
-    : Array.from(io.sockets.sockets.values()).filter(client => client && client.connected && (!excludeSocketId || client.id !== excludeSocketId));
+  if (targetUser) {
+    const recipients = getSocketsByUserName(targetUser).filter(client => client && client.connected && (!excludeSocketId || client.id !== excludeSocketId));
+    if (!recipients.length) return 0;
+    trackBandwidthPayload('game_players_summary_changed', payload, recipients.length);
+    recipients.forEach(client => client.emit('game_players_summary_changed', payload));
+    return recipients.length;
+  }
 
-  if (!recipients.length) return 0;
-  trackBandwidthPayload('game_players_summary_changed', payload, recipients.length);
-  recipients.forEach(client => client.emit('game_players_summary_changed', payload));
-  return recipients.length;
+  const recipientCount = Math.max(0, io.sockets.sockets.size - (excludeSocketId && io.sockets.sockets.has(excludeSocketId) ? 1 : 0));
+  if (!recipientCount) return 0;
+  trackBandwidthPayload('game_players_summary_changed', payload, recipientCount);
+  if (excludeSocketId) io.except(excludeSocketId).emit('game_players_summary_changed', payload);
+  else io.emit('game_players_summary_changed', payload);
+  return recipientCount;
 }
 
 async function notifyGamePlayersSummaryChangedAcrossInstances(rawTitleIds = [], options = {}) {
@@ -5212,8 +5211,10 @@ async function recordChatSyncChange(changeType, messageId = '', message = null) 
       SELECT revision, epoch, $1, $2, $3::jsonb FROM next_state
       RETURNING revision, epoch, change_type, message_id, message
     )
-    SELECT revision, epoch, change_type, message_id, message FROM inserted
-  `, [type, String(messageId || ''), cleanMessage], { attempts: 2, label: 'CHAT SYNC CHANGE SAVE' });
+    SELECT revision, epoch, change_type, message_id, message,
+           pg_notify('chat_sync_notify', $4) AS notified
+    FROM inserted
+  `, [type, String(messageId || ''), cleanMessage, JSON.stringify({ instanceId: INSTANCE_ID, reason: type })], { attempts: 2, label: 'CHAT SYNC CHANGE SAVE' });
 
   if (!result.rows.length) throw new Error('Chat sync state is unavailable.');
   const row = result.rows[0];
@@ -5269,6 +5270,7 @@ async function resetChatSyncEpoch() {
     await client.query('UPDATE chat_sync_state SET epoch = $1, revision = 0, updated_at = NOW() WHERE id = 1', [nextEpoch]);
     await client.query('DELETE FROM chat_changes');
     await client.query('TRUNCATE chat_seen_events RESTART IDENTITY');
+    await client.query('SELECT pg_notify($1, $2)', ['chat_sync_notify', JSON.stringify({ instanceId: INSTANCE_ID, reason: 'reset' })]);
     await client.query('COMMIT');
     chatSyncState = { epoch: nextEpoch, revision: 0 };
   } catch (err) {
@@ -5948,11 +5950,16 @@ async function initProfileSyncNotifications() {
   profileSyncNotifyClient = client;
 
   client.on('notification', async (message) => {
-    if (!message || !['profile_sync', 'presence_sync', 'ps3_playtime_sync', 'admin_state_sync', 'server_log_sync', 'friend_activity_sync', 'user_notification_sync', 'game_players_sync', 'content_download_counts_sync'].includes(message.channel)) return;
+    if (!message || !['profile_sync', 'presence_sync', 'ps3_playtime_sync', 'admin_state_sync', 'server_log_sync', 'friend_activity_sync', 'user_notification_sync', 'game_players_sync', 'content_download_counts_sync', 'chat_sync_notify'].includes(message.channel)) return;
 
     try {
       const data = JSON.parse(message.payload || '{}');
       if (data.instanceId === INSTANCE_ID) return;
+
+      if (message.channel === 'chat_sync_notify') {
+        chatSyncWakeRequested = true;
+        return;
+      }
 
       if (message.channel === 'game_players_sync') {
         const titleIds = Array.isArray(data.titleIds) ? data.titleIds.map(normalizeGamePlayersTitleId).filter(Boolean) : [];
@@ -6222,6 +6229,7 @@ async function initProfileSyncNotifications() {
     await client.query('LISTEN user_notification_sync');
     await client.query('LISTEN game_players_sync');
     await client.query('LISTEN content_download_counts_sync');
+    await client.query('LISTEN chat_sync_notify');
     profileSyncListenReady = true;
     console.log('[PROFILE SYNC] Postgres LISTEN enabled.');
     console.log('[PRESENCE SYNC] Postgres LISTEN enabled.');
@@ -6232,6 +6240,7 @@ async function initProfileSyncNotifications() {
     console.log('[NOTIFICATIONS] Postgres LISTEN enabled.');
     console.log('[GAME PLAYERS] Postgres LISTEN enabled.');
     console.log('[CONTENT DOWNLOAD COUNTS] Postgres LISTEN enabled.');
+    console.log('[CHAT SYNC] Postgres LISTEN wakeups enabled.');
   } catch (err) {
     profileSyncListenReady = false;
     if (profileSyncNotifyClient === client) profileSyncNotifyClient = null;
@@ -7942,16 +7951,22 @@ const io = new Server(server, {
   maxHttpBufferSize: 1e7
 });
 
+const ADMIN_STATE_LISTEN_FALLBACK_MS = Math.max(30000, parseInt(process.env.ADMIN_STATE_LISTEN_FALLBACK_MS || '60000', 10) || 60000);
+
 async function syncAdminStateAcrossInstances() {
   const previousMaintenance = JSON.stringify(normalizeMaintenanceState(adminState.maintenance || {}));
   const previousChatControls = JSON.stringify(normalizeChatControls(adminState.chatControls || {}));
   const previousPinnedAnnouncement = JSON.stringify(adminState.pinnedAnnouncement || null);
   const adminConnected = hasAdminSockets();
+  const now = Date.now();
 
-  await refreshAdminStateThrottled(8000);
+  // LISTEN/NOTIFY is authoritative during normal operation. Keep this timer as a safety net,
+  // but avoid rereading the tiny admin_state table every 15 seconds when the listener is healthy.
+  if (!profileSyncListenReady || !adminStateLastRefreshAt || now - adminStateLastRefreshAt >= ADMIN_STATE_LISTEN_FALLBACK_MS) {
+    await refreshAdminStateThrottled(8000);
+  }
 
   if (adminConnected) {
-    const now = Date.now();
     const shouldFallbackRefreshServerLog = !profileSyncListenReady || !serverLogFallbackRefreshAt || now - serverLogFallbackRefreshAt >= SERVER_LOG_FALLBACK_REFRESH_MS;
     if (shouldFallbackRefreshServerLog) {
       const previousServerLog = JSON.stringify(serverLog);
@@ -8004,9 +8019,21 @@ function getPostAuthRemainingDelay(socket, totalDelayMs) {
 }
 
 
+const CHAT_SYNC_LISTEN_FALLBACK_MS = Math.max(15000, parseInt(process.env.CHAT_SYNC_LISTEN_FALLBACK_MS || '30000', 10) || 30000);
+let chatSyncWakeRequested = false;
+let chatSyncLastFallbackAt = 0;
+
+async function runChatSyncFallback() {
+  const now = Date.now();
+  if (profileSyncListenReady && !chatSyncWakeRequested && chatSyncLastFallbackAt && now - chatSyncLastFallbackAt < CHAT_SYNC_LISTEN_FALLBACK_MS) return;
+  chatSyncWakeRequested = false;
+  chatSyncLastFallbackAt = now;
+  await syncChatAcrossInstances();
+}
+
 const syncAdminStateIntervalTask = runNonOverlappingTask('ADMIN STATE SYNC', syncAdminStateAcrossInstances);
 const presenceHeartbeatIntervalTask = runNonOverlappingTask('PRESENCE HEARTBEAT', heartbeatPresenceSessions);
-const chatPollIntervalTask = runNonOverlappingTask('CHAT POLL', syncChatAcrossInstances);
+const chatPollIntervalTask = runNonOverlappingTask('CHAT POLL', runChatSyncFallback);
 const profileSyncIntervalTask = runNonOverlappingTask('PROFILE SYNC', syncActiveProfilesAcrossInstances);
 
 let backgroundTasksStarted = false;

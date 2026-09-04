@@ -10423,6 +10423,8 @@ P
 			button.__countrySearchText = `${item.name} ${item.code}`.toLocaleLowerCase(locale);
 		});
 		container.__countryOptionButtons = buttons;
+		container.__countryEmptyNode = container.querySelector(':scope > .country-picker-empty');
+		delete container.dataset.countryOptionsRenderSignature;
 		container.dataset.countryOptionsLocale = locale;
 		container.dataset.countryOptionsSelect = onSelectName;
 		return buttons;
@@ -10432,18 +10434,32 @@ P
 		if (!container) return;
 		const locale = getCountryOptionsLocale();
 		const search = String(query || '').trim().toLocaleLowerCase(locale);
+		const normalizedSelected = normalizeProfileCountryCode(selectedCode);
+		const renderSignature = `${locale}|${onSelectName}|${search}|${normalizedSelected}`;
 		const buttons = ensureCountryOptionsDom(container, onSelectName);
+		if (container.dataset.countryOptionsRenderSignature === renderSignature) return;
+		container.dataset.countryOptionsRenderSignature = renderSignature;
 		let visibleCount = 0;
 		buttons.forEach(button => {
 			const code = button.dataset.countryCode || '';
 			const visible = !search || String(button.__countrySearchText || '').includes(search);
-			button.hidden = !visible;
-			button.classList.toggle('is-selected', code === selectedCode);
-			button.setAttribute('aria-selected', code === selectedCode ? 'true' : 'false');
+			const nextHidden = !visible;
+			if (button.hidden !== nextHidden) button.hidden = nextHidden;
+			const selected = code === normalizedSelected;
+			if (button.classList.contains('is-selected') !== selected) button.classList.toggle('is-selected', selected);
+			const nextAriaSelected = selected ? 'true' : 'false';
+			if (button.getAttribute('aria-selected') !== nextAriaSelected) button.setAttribute('aria-selected', nextAriaSelected);
 			if (visible) visibleCount++;
 		});
-		const empty = container.querySelector(':scope > .country-picker-empty');
-		if (empty) empty.hidden = visibleCount !== 0;
+		let empty = container.__countryEmptyNode;
+		if (!empty || !empty.isConnected) {
+			empty = container.querySelector(':scope > .country-picker-empty');
+			container.__countryEmptyNode = empty || null;
+		}
+		if (empty) {
+			const nextHidden = visibleCount !== 0;
+			if (empty.hidden !== nextHidden) empty.hidden = nextHidden;
+		}
 	}
 
 	function setNewProfileCountry(value, userChanged = false) {
@@ -10452,10 +10468,17 @@ P
 		const flag = document.getElementById('new-psn-country-flag');
 		const label = document.getElementById('new-psn-country-value');
 		const picker = document.getElementById('new-psn-country-picker');
-		if (input) input.value = code;
-		if (flag) { flag.src = getProfileCountryFlagUrl(code); flag.alt = `${getProfileCountryName(code)} flag`; }
-		if (label) label.textContent = `${getProfileCountryName(code)} (${code})`;
-		if (picker && userChanged) picker.dataset.userChanged = '1';
+		if (input && input.value !== code) input.value = code;
+		const countryName = getProfileCountryName(code);
+		if (flag) {
+			const nextSrc = getProfileCountryFlagUrl(code);
+			const nextAlt = `${countryName} flag`;
+			if (flag.getAttribute('src') !== nextSrc) flag.src = nextSrc;
+			if (flag.alt !== nextAlt) flag.alt = nextAlt;
+		}
+		const nextLabel = `${countryName} (${code})`;
+		if (label && label.textContent !== nextLabel) label.textContent = nextLabel;
+		if (picker && userChanged && picker.dataset.userChanged !== '1') picker.dataset.userChanged = '1';
 	}
 
 	function shouldAutoFocusCountrySearch() {
@@ -10473,11 +10496,12 @@ P
 		const options = document.getElementById('new-psn-country-options');
 		if (!picker || !button || !menu || !options) return;
 
-		picker.classList.remove('opens-up');
-		menu.style.removeProperty('max-height');
-		options.style.removeProperty('--country-picker-options-height');
-
-		if (window.innerWidth <= 768) return;
+		if (window.innerWidth <= 768) {
+			if (picker.classList.contains('opens-up')) picker.classList.remove('opens-up');
+			if (menu.style.maxHeight) menu.style.removeProperty('max-height');
+			if (options.style.getPropertyValue('--country-picker-options-height')) options.style.removeProperty('--country-picker-options-height');
+			return;
+		}
 
 		const rect = button.getBoundingClientRect();
 		const viewportHeight = window.visualViewport ? window.visualViewport.height : window.innerHeight;
@@ -10492,10 +10516,12 @@ P
 		const menuHeight = Math.max(145, Math.min(preferredMenuHeight, availableSpace));
 		const fixedMenuChrome = 61;
 		const optionsHeight = Math.max(82, menuHeight - fixedMenuChrome);
+		const nextMenuHeight = `${menuHeight}px`;
+		const nextOptionsHeight = `${optionsHeight}px`;
 
-		picker.classList.toggle('opens-up', opensUp);
-		menu.style.maxHeight = `${menuHeight}px`;
-		options.style.setProperty('--country-picker-options-height', `${optionsHeight}px`);
+		if (picker.classList.contains('opens-up') !== opensUp) picker.classList.toggle('opens-up', opensUp);
+		if (menu.style.maxHeight !== nextMenuHeight) menu.style.maxHeight = nextMenuHeight;
+		if (options.style.getPropertyValue('--country-picker-options-height') !== nextOptionsHeight) options.style.setProperty('--country-picker-options-height', nextOptionsHeight);
 	}
 
 	function closeNewProfileCountryPicker() {
@@ -22177,15 +22203,15 @@ P
 		return !!key && window.__psnStoreCoverEntryCache[key] === true && window.__psnStoreNoSummaryCache[key] !== true;
 	};
 
+	const psnStoreDescriptionDecoder = document.createElement('textarea');
 	window.cleanPsnStoreDescription = function(value) {
 		const html = String(value || '')
 			.replace(/<br\s*\/?\s*>/gi, '\n')
 			.replace(/<\/p\s*>/gi, '\n\n')
 			.replace(/<p(?:\s[^>]*)?>/gi, '')
 			.replace(/<[^>]+>/g, '');
-		const textarea = document.createElement('textarea');
-		textarea.innerHTML = html;
-		const clean = textarea.value.replace(/\r/g, '').replace(/[ \t]+\n/g, '\n').replace(/\n[ \t]+/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+		if (psnStoreDescriptionDecoder.innerHTML !== html) psnStoreDescriptionDecoder.innerHTML = html;
+		const clean = psnStoreDescriptionDecoder.value.replace(/\r/g, '').replace(/[ \t]+\n/g, '\n').replace(/\n[ \t]+/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
 		if (/^item\s+not\s+found\b/i.test(clean)) return '';
 		return clean;
 	};
@@ -30218,7 +30244,10 @@ P
         list.addEventListener('touchmove', event => {
             const state = downloadSwipeDragState;
             if (!state || state.inputType !== 'touch') return;
-            const touch = Array.from(event.touches).find(item => item.identifier === state.inputId);
+            let touch = null;
+            for (let i = 0; i < event.touches.length; i++) {
+                if (event.touches[i].identifier === state.inputId) { touch = event.touches[i]; break; }
+            }
             if (!touch) return;
             moveDownloadSwipeDrag(touch.clientX, touch.clientY, () => event.preventDefault());
         }, { passive: false });
@@ -30226,7 +30255,11 @@ P
         const finishTouchSwipe = event => {
             const state = downloadSwipeDragState;
             if (!state || state.inputType !== 'touch') return;
-            const ended = Array.from(event.changedTouches || []).some(item => item.identifier === state.inputId);
+            let ended = false;
+            const changedTouches = event.changedTouches || [];
+            for (let i = 0; i < changedTouches.length; i++) {
+                if (changedTouches[i].identifier === state.inputId) { ended = true; break; }
+            }
             if (ended || event.type === 'touchcancel') finishDownloadSwipeDrag();
         };
 
@@ -35673,7 +35706,16 @@ P
 
     /* Content changes can alter scrollHeight; style changes from hover/animations must not
        wake this observer on every frame. View-size changes are covered by ResizeObserver. */
-    const scrollObserver = new MutationObserver(updateScrollButtonsVisibility);
+    const scrollObserver = new MutationObserver(mutations => {
+        // Decorative pointer-light nodes are injected on hover and never affect scrollHeight.
+        // Ignore batches made exclusively of those nodes instead of waking scroll-button layout work.
+        const relevant = mutations.some(mutation => {
+            const changedNodes = [...mutation.addedNodes, ...mutation.removedNodes];
+            if (!changedNodes.length) return false;
+            return changedNodes.some(node => !(node && node.nodeType === 1 && node.matches?.('.psn-card-pointer-light')));
+        });
+        if (relevant) updateScrollButtonsVisibility();
+    });
     scrollObserver.observe(scrollArea, { childList: true, subtree: true });
 
     if (typeof ResizeObserver === 'function') {
@@ -65970,13 +66012,20 @@ function getVisibleChatStackEl(id) {
         list.addEventListener('touchmove', function(event) {
             const state = notificationSwipeDragState;
             if (!state || state.inputType !== 'touch') return;
-            const touch = Array.from(event.touches).find(function(item) { return item.identifier === state.inputId; });
+            let touch = null;
+            for (let i = 0; i < event.touches.length; i++) {
+                if (event.touches[i].identifier === state.inputId) { touch = event.touches[i]; break; }
+            }
             if (touch) moveDrag(touch.clientX, touch.clientY, function() { event.preventDefault(); });
         }, { passive:false });
         const finishTouch = function(event) {
             const state = notificationSwipeDragState;
             if (!state || state.inputType !== 'touch') return;
-            const ended = Array.from(event.changedTouches || []).some(function(item) { return item.identifier === state.inputId; });
+            let ended = false;
+            const changedTouches = event.changedTouches || [];
+            for (let i = 0; i < changedTouches.length; i++) {
+                if (changedTouches[i].identifier === state.inputId) { ended = true; break; }
+            }
             if (ended || event.type === 'touchcancel') finishDrag();
         };
         list.addEventListener('touchend', finishTouch, { passive:true });
@@ -66417,13 +66466,20 @@ function getVisibleChatStackEl(id) {
 		list.addEventListener('touchmove', function(event) {
 			const state = friendActivitySwipeDragState;
 			if (!state || state.inputType !== 'touch') return;
-			const touch = Array.from(event.touches).find(function(item) { return item.identifier === state.inputId; });
+			let touch = null;
+			for (let i = 0; i < event.touches.length; i++) {
+				if (event.touches[i].identifier === state.inputId) { touch = event.touches[i]; break; }
+			}
 			if (touch) moveDrag(touch.clientX, touch.clientY, function() { event.preventDefault(); });
 		}, { passive:false });
 		const finishTouch = function(event) {
 			const state = friendActivitySwipeDragState;
 			if (!state || state.inputType !== 'touch') return;
-			const ended = Array.from(event.changedTouches || []).some(function(item) { return item.identifier === state.inputId; });
+			let ended = false;
+			const changedTouches = event.changedTouches || [];
+			for (let i = 0; i < changedTouches.length; i++) {
+				if (changedTouches[i].identifier === state.inputId) { ended = true; break; }
+			}
 			if (ended || event.type === 'touchcancel') finishDrag();
 		};
 		list.addEventListener('touchend', finishTouch, { passive:true });
@@ -69077,7 +69133,9 @@ function getVisibleChatStackEl(id) {
 				};
 				if (savedProfileListScroll != null) ensureScrollTargetRendered(savedProfileListScroll);
 
-				const handleProfileListBatchScroll = function() {
+				let profileListBatchFrame = 0;
+				const runProfileListBatchScroll = function() {
+					profileListBatchFrame = 0;
 					if (renderedProfileListCount >= renderItems.length) {
 						body.removeEventListener('scroll', handleProfileListBatchScroll);
 						if (body.__profileListBatchScrollHandler === handleProfileListBatchScroll) body.__profileListBatchScrollHandler = null;
@@ -69085,6 +69143,10 @@ function getVisibleChatStackEl(id) {
 					}
 					const preloadDistance = Math.max(700, body.clientHeight * 1.5);
 					if (body.scrollTop + body.clientHeight >= body.scrollHeight - preloadDistance) appendNextProfileListBatch();
+				};
+				const handleProfileListBatchScroll = function() {
+					if (profileListBatchFrame) return;
+					profileListBatchFrame = requestAnimationFrame(runProfileListBatchScroll);
 				};
 				body.__profileListBatchScrollHandler = handleProfileListBatchScroll;
 				body.addEventListener('scroll', handleProfileListBatchScroll, { passive: true });
@@ -69113,9 +69175,14 @@ function getVisibleChatStackEl(id) {
 	};
 
     function applyThemeColorPreview(color) {
-		document.documentElement.style.setProperty('--ps-blue', color);
-		document.documentElement.style.setProperty('--ps-neon', color + '66');
-		if (typeof updateDynamicCursor === 'function') updateDynamicCursor(color);
+		const nextColor = String(color || '#0070cc').toLowerCase();
+		if (window.__activeThemePreviewColor === nextColor) return false;
+		window.__activeThemePreviewColor = nextColor;
+		if (document.documentElement.style.getPropertyValue('--ps-blue') !== nextColor) document.documentElement.style.setProperty('--ps-blue', nextColor);
+		const nextNeon = nextColor + '66';
+		if (document.documentElement.style.getPropertyValue('--ps-neon') !== nextNeon) document.documentElement.style.setProperty('--ps-neon', nextNeon);
+		if (typeof updateDynamicCursor === 'function') updateDynamicCursor(nextColor);
+		return true;
 	}
 
 	function setTheme(color, btnElement) {
@@ -69126,11 +69193,10 @@ function getVisibleChatStackEl(id) {
 
 		applyThemeColorPreview(safeColor);
 
-		document.querySelectorAll('.theme-btn').forEach(b => b.classList.remove('active'));
-
-		if (btnElement) {
-			btnElement.classList.add('active');
-		}
+		document.querySelectorAll('.theme-btn').forEach(b => {
+			const shouldBeActive = b === btnElement;
+			if (b.classList.contains('active') !== shouldBeActive) b.classList.toggle('active', shouldBeActive);
+		});
 	}
 
 	function revertThemePreview() {
@@ -70674,11 +70740,14 @@ function getVisibleChatStackEl(id) {
             const buttonCenterX = buttonRect.left + (buttonRect.width / 2);
             const tailX = Math.max(18, Math.min(hintRect.width - 18, buttonCenterX - left));
 
-            hint.classList.toggle('ps3-pad-drag-hint-above', fitsAbove);
-            hint.classList.toggle('ps3-pad-drag-hint-below', !fitsAbove);
-            hint.style.left = `${left}px`;
-            hint.style.top = `${top}px`;
-            hint.style.setProperty('--ps3-pad-tail-x', `${tailX}px`);
+            if (hint.classList.contains('ps3-pad-drag-hint-above') !== fitsAbove) hint.classList.toggle('ps3-pad-drag-hint-above', fitsAbove);
+            if (hint.classList.contains('ps3-pad-drag-hint-below') === fitsAbove) hint.classList.toggle('ps3-pad-drag-hint-below', !fitsAbove);
+            const leftValue = `${left}px`;
+            const topValue = `${top}px`;
+            const tailValue = `${tailX}px`;
+            if (hint.style.left !== leftValue) hint.style.left = leftValue;
+            if (hint.style.top !== topValue) hint.style.top = topValue;
+            if (hint.style.getPropertyValue('--ps3-pad-tail-x') !== tailValue) hint.style.setProperty('--ps3-pad-tail-x', tailValue);
         }
 
         function hideHint() {
@@ -70717,9 +70786,7 @@ function getVisibleChatStackEl(id) {
         }
 
         function schedulePosition() {
-            if (!hint.classList.contains('is-visible')) return;
-            if (resizeFrame) cancelAnimationFrame(resizeFrame);
-
+            if (!hint.classList.contains('is-visible') || resizeFrame) return;
             resizeFrame = requestAnimationFrame(function () {
                 resizeFrame = null;
                 positionHint();
@@ -70796,7 +70863,7 @@ function getVisibleChatStackEl(id) {
         }
 
         function scheduleAppearanceSound() {
-            if (syncFrame) cancelAnimationFrame(syncFrame);
+            if (syncFrame) return;
             syncFrame = requestAnimationFrame(syncAppearanceSound);
         }
 
@@ -73099,11 +73166,47 @@ function getVisibleChatStackEl(id) {
         }, { passive: true });
     }
 
+    function disconnectInterfaceTranslationObservers() {
+        if (state.observer) state.observer.disconnect();
+        state.observer = null;
+        if (state.visibilityObservers && state.visibilityObservers.size) {
+            state.visibilityObservers.forEach(observer => { try { observer.disconnect(); } catch (err) {} });
+            state.visibilityObservers.clear();
+        }
+    }
+
+    function observeInterfaceTranslationVisibilityHosts(root = document.body) {
+        if (!window.MutationObserver || !root) return;
+        if (!state.visibilityObservers) state.visibilityObservers = new Map();
+        const register = host => {
+            if (!host || host.nodeType !== Node.ELEMENT_NODE || state.visibilityObservers.has(host) || !isInterfaceTranslationVisibilityHost(host)) return;
+            const observer = new MutationObserver(() => {
+                if (state.enabled && host.isConnected && isElementVisible(host)) scheduleInterfaceTranslationScan(host);
+            });
+            observer.observe(host, { attributes: true, attributeFilter: ['class', 'style', 'hidden', 'open', 'aria-hidden'] });
+            state.visibilityObservers.set(host, observer);
+        };
+        if (root.nodeType === Node.ELEMENT_NODE) register(root);
+        if (root.querySelectorAll) root.querySelectorAll(INTERFACE_TRANSLATE_VISIBILITY_HOST_SELECTOR).forEach(register);
+    }
+
+    function cleanupInterfaceTranslationVisibilityHosts() {
+        if (!state.visibilityObservers || !state.visibilityObservers.size) return;
+        state.visibilityObservers.forEach((observer, host) => {
+            if (host && host.isConnected) return;
+            try { observer.disconnect(); } catch (err) {}
+            state.visibilityObservers.delete(host);
+        });
+    }
+
     function startInterfaceTranslationObserver() {
         if (!window.MutationObserver) return;
-        if (state.observer) state.observer.disconnect();
+        disconnectInterfaceTranslationObservers();
+        state.visibilityObservers = new Map();
+        observeInterfaceTranslationVisibilityHosts(document.body);
         state.observer = new MutationObserver(mutations => {
             if (!state.enabled) return;
+            let removedVisibilityHost = false;
             for (const mutation of mutations) {
                 if (mutation.type === 'characterData') {
                     applyImmediateInterfaceTranslationToTextNode(mutation.target, state.target);
@@ -73113,29 +73216,28 @@ function getVisibleChatStackEl(id) {
                 if (mutation.type === 'attributes') {
                     const target = mutation.target;
                     const attr = mutation.attributeName || '';
-                    if (attr === 'placeholder' || attr === 'data-placeholder' || attr === 'title' || attr === 'aria-label') {
-                        if (!applyImmediateInterfaceTranslationToAttribute(target, attr, state.target)) scheduleInterfaceTranslationScan(target);
-                    } else if (isInterfaceTranslationVisibilityHost(target) && isElementVisible(target)) {
-                        // Hidden views and modals are translated when they actually become visible.
-                        scheduleInterfaceTranslationScan(target);
-                    }
+                    if (!applyImmediateInterfaceTranslationToAttribute(target, attr, state.target)) scheduleInterfaceTranslationScan(target);
                     continue;
                 }
                 if (mutation.addedNodes && mutation.addedNodes.length) {
                     mutation.addedNodes.forEach(node => {
                         applyImmediateInterfaceTranslations(node);
+                        observeInterfaceTranslationVisibilityHosts(node);
                         scheduleInterfaceTranslationScan(node);
                     });
                 }
+                if (mutation.removedNodes && mutation.removedNodes.length) removedVisibilityHost = true;
             }
+            if (removedVisibilityHost) cleanupInterfaceTranslationVisibilityHosts();
         });
-        // Observe visibility only on view/modal hosts in the callback; ordinary card hover changes are ignored.
+        // Translation attributes/text stay global. Visibility attributes are observed only on actual
+        // view/modal hosts, so card hover/style/class churn cannot wake the translation observer.
         state.observer.observe(document.body, {
             childList: true,
             subtree: true,
             characterData: true,
             attributes: true,
-            attributeFilter: ['placeholder', 'data-placeholder', 'title', 'aria-label', 'class', 'style', 'hidden', 'open', 'aria-hidden']
+            attributeFilter: ['placeholder', 'data-placeholder', 'title', 'aria-label']
         });
     }
 
@@ -73179,7 +73281,7 @@ function getVisibleChatStackEl(id) {
         }
 
         if (state.enabled && (state.target !== target || state.locale !== locale)) {
-            if (state.observer) state.observer.disconnect();
+            disconnectInterfaceTranslationObservers();
             restoreInterfaceTranslations();
         }
 
@@ -73217,7 +73319,7 @@ function getVisibleChatStackEl(id) {
         resetInterfaceTranslationPendingWork();
         clearTimeout(state.fixedCardResizeTimer);
         state.fixedCardResizeTimer = null;
-        if (state.observer) state.observer.disconnect();
+        disconnectInterfaceTranslationObservers();
         restoreInterfaceTranslations();
         if (typeof window.restorePsnWelcomeMessageSource === 'function') window.restorePsnWelcomeMessageSource();
         document.documentElement.lang = 'en';
@@ -74423,35 +74525,52 @@ function getVisibleChatStackEl(id) {
     document.addEventListener('DOMContentLoaded', window.refreshPsnPageEmptyStates, { once: true });
 
     /* Empty/loading states can appear, disappear or toggle asynchronously.
-       Track only those transitions; the height custom property itself must not create a refresh loop. */
+       Observe visual attributes only on the empty-state nodes themselves. A subtree-wide style
+       observer used to wake for unrelated card hover/glow/style writes throughout the page. */
     if (typeof MutationObserver === 'function') {
-        const displaySnapshot = new WeakMap();
         const observerRoot = document.getElementById('scroll-area') || document.body;
-        const containsEmptyState = node => !!(node && node.nodeType === 1 && (
-            node.matches?.('.psn-page-empty-state') || node.querySelector?.('.psn-page-empty-state')
-        ));
-
-        document.querySelectorAll('.psn-page-empty-state').forEach(state => {
-            displaySnapshot.set(state, String(state.style.display || ''));
+        const observedEmptyStates = new WeakSet();
+        const emptyStateVisualSnapshot = new WeakMap();
+        const getEmptyStateVisualSignature = state => `${String(state?.style?.display || '')}|${String(state?.className || '')}|${state?.hidden ? '1' : '0'}`;
+        const emptyStateStyleObserver = new MutationObserver(mutations => {
+            let needsRefresh = false;
+            for (const mutation of mutations) {
+                const state = mutation.target;
+                const nextSignature = getEmptyStateVisualSignature(state);
+                if (emptyStateVisualSnapshot.get(state) === nextSignature) continue;
+                emptyStateVisualSnapshot.set(state, nextSignature);
+                needsRefresh = true;
+            }
+            if (needsRefresh) window.refreshPsnPageEmptyStates();
         });
+
+        const observeEmptyState = state => {
+            if (!state || state.nodeType !== 1 || observedEmptyStates.has(state)) return;
+            observedEmptyStates.add(state);
+            emptyStateVisualSnapshot.set(state, getEmptyStateVisualSignature(state));
+            emptyStateStyleObserver.observe(state, { attributes: true, attributeFilter: ['style', 'class', 'hidden'] });
+        };
+        const observeEmptyStatesIn = node => {
+            if (!node || node.nodeType !== 1) return false;
+            let found = false;
+            if (node.matches?.('.psn-page-empty-state')) { observeEmptyState(node); found = true; }
+            node.querySelectorAll?.('.psn-page-empty-state').forEach(state => { observeEmptyState(state); found = true; });
+            return found;
+        };
+
+        document.querySelectorAll('.psn-page-empty-state').forEach(observeEmptyState);
 
         if (observerRoot) {
             new MutationObserver(mutations => {
                 let needsRefresh = false;
                 for (const mutation of mutations) {
-                    if (mutation.type === 'childList') {
-                        needsRefresh = [...mutation.addedNodes].some(containsEmptyState) || [...mutation.removedNodes].some(containsEmptyState);
-                    } else if (mutation.type === 'attributes') {
-                        const target = mutation.target;
-                        const inlineDisplay = target && target.style ? String(target.style.display || '') : '';
-                        const previousDisplay = displaySnapshot.get(target);
-                        displaySnapshot.set(target, inlineDisplay);
-                        if (previousDisplay !== inlineDisplay && containsEmptyState(target)) needsRefresh = true;
+                    for (const node of mutation.addedNodes) if (observeEmptyStatesIn(node)) needsRefresh = true;
+                    for (const node of mutation.removedNodes) {
+                        if (node && node.nodeType === 1 && (node.matches?.('.psn-page-empty-state') || node.querySelector?.('.psn-page-empty-state'))) needsRefresh = true;
                     }
-                    if (needsRefresh) break;
                 }
                 if (needsRefresh) window.refreshPsnPageEmptyStates();
-            }).observe(observerRoot, { childList: true, subtree: true, attributes: true, attributeFilter: ['style'] });
+            }).observe(observerRoot, { childList: true, subtree: true });
         }
     }
 })();
