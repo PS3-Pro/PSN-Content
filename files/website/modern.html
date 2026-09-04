@@ -9440,7 +9440,11 @@ P
 	function safeLocalStorageSet(key, value) {
 		const cleanKey = String(key || '');
 		if (!cleanKey) return false;
-		const rawSet = () => Storage.prototype.setItem.call(window.localStorage, cleanKey, String(value));
+		const nextValue = String(value);
+		try {
+			if (Storage.prototype.getItem.call(window.localStorage, cleanKey) === nextValue) return true;
+		} catch (err) {}
+		const rawSet = () => Storage.prototype.setItem.call(window.localStorage, cleanKey, nextValue);
 		try {
 			rawSet();
 			return true;
@@ -11676,7 +11680,8 @@ P
 			window.downloadHistory.forEach(item => {
 				if (!item || typeof item !== 'object') return;
 				const key = getDownloadNotificationItemKey(item);
-				item.isNew = !!(key && downloadSet.has(key));
+				const nextIsNew = !!(key && downloadSet.has(key));
+				if (item.isNew !== nextIsNew) item.isNew = nextIsNew;
 			});
 		}
 
@@ -11685,7 +11690,8 @@ P
 			Object.keys(window.userTrophies).forEach(id => {
 				const state = window.userTrophies[id];
 				if (!state || typeof state !== 'object') return;
-				state.isNew = state.unlocked === true && trophySet.has(String(id));
+				const nextIsNew = state.unlocked === true && trophySet.has(String(id));
+				if (state.isNew !== nextIsNew) state.isNew = nextIsNew;
 			});
 		}
 	}
@@ -12238,13 +12244,14 @@ P
 				applyProfileNotificationPendingEffects(downloadPending, trophyPending);
 				if (typeof window.refreshCategoryDot === 'function') { window.refreshCategoryDot('wishlist'); window.refreshCategoryDot('favorites'); }
 				const dlDot = document.getElementById('dl-dot');
-				if (dlDot) dlDot.style.display = loadState('psn_dl_dot') === 'true' ? 'block' : 'none';
+				if (dlDot) { const nextDisplay = loadState('psn_dl_dot') === 'true' ? 'block' : 'none'; if (dlDot.style.display !== nextDisplay) dlDot.style.display = nextDisplay; }
 				const trophyDotEl = document.getElementById('trophy-dot');
 				if (trophyDotEl) {
 					const trophyDotVisible = loadState('psn_trophy_dot') === 'true';
-					trophyDotEl.style.display = trophyDotVisible ? 'block' : 'none';
+					const nextDisplay = trophyDotVisible ? 'block' : 'none';
+					if (trophyDotEl.style.display !== nextDisplay) trophyDotEl.style.display = nextDisplay;
 					const color = loadState('psn_last_trophy_color') || '';
-					if (trophyDotVisible && color) trophyDotEl.style.background = color;
+					if (trophyDotVisible && color && trophyDotEl.dataset.liveDotColor !== color) { trophyDotEl.dataset.liveDotColor = color; trophyDotEl.style.background = color; }
 				}
 			}
 		} finally {
@@ -12372,7 +12379,8 @@ P
 			performanceMode: readSyncedSettingForUser(name, STORAGE_KEY_PERFORMANCE_MODE, "balanced") || "balanced",
 			performanceRsx: readSyncedSettingForUser(name, STORAGE_KEY_PERFORMANCE_RSX, "500") || "500",
 			performanceVram: readSyncedSettingForUser(name, STORAGE_KEY_PERFORMANCE_VRAM, "650") || "650",
-			countryCode: normalizeProfileCountryCode(readSyncedSettingForUser(name, STORAGE_KEY_PROFILE_COUNTRY, ""))
+			countryCode: normalizeProfileCountryCode(readSyncedSettingForUser(name, STORAGE_KEY_PROFILE_COUNTRY, "")),
+			ps3Ip: normalizeSyncedTextValue(localStorage.getItem(`${name}_ps3_ip`) || (name === (localStorage.getItem('psn_username') || '') ? localStorage.getItem('ps3_ip') : '') || '', '')
 		};
 
 		const next = {
@@ -12383,9 +12391,9 @@ P
 			cardBlur: normalizeSyncedToggleValue(incomingSettings.cardBlur ?? incomingSettings.cardBlurEnabled ?? incomingSettings.gameCardBlur, previous.cardBlur || "0"),
 			recentlyVisitedVisible: normalizeSyncedToggleValue(incomingSettings.recentlyVisitedVisible, previous.recentlyVisitedVisible || "1"),
 			collectionMemoryOptimization: normalizeSyncedToggleValue(incomingSettings.collectionMemoryOptimization ?? incomingSettings.memoryOptimization ?? incomingSettings.largeCollectionOptimization, previous.collectionMemoryOptimization || "1"),
-			chatAutoTranslate: String(incomingSettings.chatAutoTranslate) === "1" ? "1" : "0",
+			chatAutoTranslate: Object.prototype.hasOwnProperty.call(incomingSettings, 'chatAutoTranslate') ? (String(incomingSettings.chatAutoTranslate) === "1" ? "1" : "0") : previous.chatAutoTranslate,
 			interfaceAutoTranslate: Object.prototype.hasOwnProperty.call(incomingSettings, "interfaceAutoTranslate") ? (String(incomingSettings.interfaceAutoTranslate) === "1" ? "1" : "0") : previous.interfaceAutoTranslate,
-			ps3Ip: normalizeSyncedTextValue(incomingSettings.ps3Ip, ""),
+			ps3Ip: (Object.prototype.hasOwnProperty.call(incomingSettings, 'ps3Ip') || Object.prototype.hasOwnProperty.call(incomingSettings, 'ps3_ip')) ? normalizeSyncedTextValue(incomingSettings.ps3Ip ?? incomingSettings.ps3_ip, "") : previous.ps3Ip,
 			companionPlugin: normalizeSyncedToggleValue(incomingSettings.companionPlugin, previous.companionPlugin || "1"),
 			fpsCounterPlugin: normalizeSyncedToggleValue(incomingSettings.fpsCounterPlugin ?? incomingSettings.fpsCounter, previous.fpsCounterPlugin || "0"),
 			automaticLibraryScan: normalizeSyncedToggleValue(incomingSettings.automaticLibraryScan ?? incomingSettings.autoLibraryScan, previous.automaticLibraryScan || "1"),
@@ -12405,6 +12413,38 @@ P
 		const serverAuthoritative = options.serverAuthoritative === true;
 		if (!serverAuthoritative && incomingSettingsUpdatedAt && currentSettingsUpdatedAt && incomingSettingsUpdatedAt < currentSettingsUpdatedAt) return null;
 		if (incomingSettingsUpdatedAt && typeof setProfileSettingsUpdatedAtForUser === 'function') setProfileSettingsUpdatedAtForUser(name, incomingSettingsUpdatedAt);
+
+		/* Realtime/profile re-syncs can legitimately repeat the same settings snapshot.
+		   Compare effective values before touching toggles, classes, cursors, plugins or console UI. */
+		const currentProfileCardStyleForNoop = (typeof readProfileCardStyleLocalValue === 'function')
+			? ((typeof normalizeProfileCardStyle === 'function') ? normalizeProfileCardStyle(readProfileCardStyleLocalValue(name, 'default')) : readProfileCardStyleLocalValue(name, 'default'))
+			: 'default';
+		const incomingProfileCardStyleForNoopRaw = incomingSettings.profileCardStyle || incomingSettings.profileCardEffect || incomingSettings.profileCardTheme || '';
+		const nextProfileCardStyleForNoop = incomingProfileCardStyleForNoopRaw
+			? ((typeof normalizeProfileCardStyle === 'function') ? normalizeProfileCardStyle(incomingProfileCardStyleForNoopRaw) : String(incomingProfileCardStyleForNoopRaw))
+			: currentProfileCardStyleForNoop;
+		const currentThemeColorForNoop = String(localStorage.getItem(`${name}_psn_theme_color`) || (name === (localStorage.getItem('psn_username') || '') ? localStorage.getItem('psn_theme_color') : '') || '#0070cc').trim().toLowerCase();
+		const incomingThemeColorForNoop = normalizeSyncedTextValue(incomingSettings.themeColor || options.themeColor || options.userData?.themeColor || options.payload?.themeColor || '', '').toLowerCase();
+		const nextThemeColorForNoop = incomingThemeColorForNoop || currentThemeColorForNoop;
+		const currentDisclaimerForNoop = (typeof getSiteDisclaimerDailyKey === 'function') ? String(localStorage.getItem(getSiteDisclaimerDailyKey(name)) || '') : '';
+		const incomingDisclaimerForNoop = String(incomingSettings.siteDisclaimerSkipToday || '').trim();
+		const nextDisclaimerForNoop = /^\d{4}-\d{2}-\d{2}$/.test(incomingDisclaimerForNoop) ? incomingDisclaimerForNoop : currentDisclaimerForNoop;
+		const settingsKeysForNoop = Object.keys(next);
+		const currentSettingsValueSignature = typeof window.getLiveRenderSignature === 'function'
+			? window.getLiveRenderSignature([settingsKeysForNoop.map(key => [key, previous[key]]), currentProfileCardStyleForNoop, currentThemeColorForNoop, currentDisclaimerForNoop])
+			: JSON.stringify([settingsKeysForNoop.map(key => [key, previous[key]]), currentProfileCardStyleForNoop, currentThemeColorForNoop, currentDisclaimerForNoop]);
+		const nextSettingsValueSignature = typeof window.getLiveRenderSignature === 'function'
+			? window.getLiveRenderSignature([settingsKeysForNoop.map(key => [key, next[key]]), nextProfileCardStyleForNoop, nextThemeColorForNoop, nextDisclaimerForNoop])
+			: JSON.stringify([settingsKeysForNoop.map(key => [key, next[key]]), nextProfileCardStyleForNoop, nextThemeColorForNoop, nextDisclaimerForNoop]);
+		const canSkipRepeatedRemoteSettings = options.source === 'settings_realtime_sync' || (options.source === 'profile_sync' && window.__initialProfileSyncInProgress !== true);
+		if (canSkipRepeatedRemoteSettings && currentSettingsValueSignature === nextSettingsValueSignature) {
+			const sameStyleUpdatedAt = Number(incomingSettings.profileCardStyleUpdatedAt || incomingSettings.profileCardEffectUpdatedAt || incomingSettings.profileCardThemeUpdatedAt || options.userData?.profileCardStyleUpdatedAt || options.payload?.profileCardStyleUpdatedAt || options.incomingProfileUpdatedAt || 0);
+			if (sameStyleUpdatedAt && typeof setProfileCardStyleUpdatedAtForUser === 'function') setProfileCardStyleUpdatedAtForUser(name, sameStyleUpdatedAt);
+			const sameThemeUpdatedAt = Number(incomingSettings.themeColorUpdatedAt || incomingSettings.themeUpdatedAt || options.userData?.themeColorUpdatedAt || options.payload?.themeColorUpdatedAt || 0);
+			if (sameThemeUpdatedAt && typeof setProfileThemeColorUpdatedAtForUser === 'function') setProfileThemeColorUpdatedAtForUser(name, sameThemeUpdatedAt);
+			return next;
+		}
+
 		if (typeof applySiteDisclaimerSkipTodayFromSettings === 'function') applySiteDisclaimerSkipTodayFromSettings(name, incomingSettings.siteDisclaimerSkipToday);
 
 		writeSyncedSettingForUser(name, STORAGE_KEY_AUDIO, next.audio);
@@ -30962,10 +31002,14 @@ P
 			`;
 			const renderAdminUsersHtml = html => {
 				if (list.__adminPlayersHtml === html && list.childNodes.length > 0) return false;
-				const previousScrollTop = list.scrollTop;
 				list.__adminPlayersHtml = html;
-				list.innerHTML = html;
-				if (previousScrollTop > 0) list.scrollTop = previousScrollTop;
+				if (typeof window.reconcileLiveRenderHtml === 'function') {
+					window.reconcileLiveRenderHtml(list, html, ':scope > .admin-user-row[data-live-render-key]', { preserveScroll: true, markReused: true });
+				} else {
+					const previousScrollTop = list.scrollTop;
+					list.innerHTML = html;
+					if (previousScrollTop > 0) list.scrollTop = previousScrollTop;
+				}
 				return true;
 			};
 			const userFilterLabels = {
@@ -31048,9 +31092,12 @@ P
 					const banActionButton = isBanned
 						? `<button class="btn-mini-round admin-unban-action" title="Unban user" ${isMe ? 'disabled' : ''} onclick="event.stopPropagation(); adminUnbanUser('${encodedName}', '${encodedSocketId}')"><i class="fas fa-unlock"></i></button>`
 						: `<button class="btn-mini-round admin-ban-action" title="Ban user" ${isProtected ? 'disabled' : ''} onclick="event.stopPropagation(); adminBanUser('${encodedName}', '${encodedSocketId}')"><i class="fas fa-ban"></i></button>`;
+					const adminUserLiveSignature = typeof window.getLiveRenderSignature === 'function'
+						? window.getLiveRenderSignature([name, avatar, socketId, isMe ? 1 : 0, isOnline ? 1 : 0, sessionCount, isTargetAdmin ? 1 : 0, isBanned ? 1 : 0, level, role, isFriend ? 1 : 0, statusText, avatarBorder, ps3 ? String(ps3.status || '') : '', ps3 ? String(ps3.title || '') : ''])
+						: '';
 
 					return `
-						<div class="admin-user-row online-user-item${rowClass}" style="--tile-idx:${idx % 50};">
+						<div class="admin-user-row online-user-item${rowClass}" data-live-render-key="admin:${encodedName}" data-live-render-signature="${adminUserLiveSignature}" style="--tile-idx:${idx % 50};">
 							<div class="admin-user-main" onclick="adminOpenUserProfile('${encodedName}')">
 								<div class="admin-user-avatar-wrap">
 									<img src="${adminEscapeHtml(avatar)}" class="online-user-avatar" data-user="${safeName}" alt="" loading="lazy" decoding="async" style="border-color: ${avatarBorder}; border-width: 2px; border-style: solid;">
@@ -32556,7 +32603,11 @@ P
 		const scheduleLabel = adminMaintenancePublicScheduleLabel(state);
 		const scheduleNote = scheduleLabel ? `<p class="admin-maintenance-schedule-note">Scheduled maintenance: ${adminEscapeHtml(scheduleLabel)}</p>` : '';
 		const adminAccess = canShowAdminAccess ? `<div class="admin-maintenance-actions"><button class="admin-maintenance-login-btn" onclick="adminMaintenanceLoginBypass()"><i class="fas fa-user-shield" style="font-size:12px;margin:0 6px 0 0;color:#00d4ff;filter:none;"></i> Admin Login</button></div>` : '';
-		overlay.innerHTML = `<div class="admin-maintenance-box"><i class="fas fa-tools"></i><h2>Maintenance Mode</h2><p>${adminEscapeHtml(state.message)}</p>${countdown}${scheduleNote}${adminAccess}</div>`;
+		const nextMaintenanceHtml = `<div class="admin-maintenance-box"><i class="fas fa-tools"></i><h2>Maintenance Mode</h2><p>${adminEscapeHtml(state.message)}</p>${countdown}${scheduleNote}${adminAccess}</div>`;
+		if (overlay.__adminMaintenanceHtml !== nextMaintenanceHtml || overlay.innerHTML !== nextMaintenanceHtml) {
+			overlay.__adminMaintenanceHtml = nextMaintenanceHtml;
+			overlay.innerHTML = nextMaintenanceHtml;
+		}
 		adminShowMaintenanceOverlay(overlay);
 	}
 
@@ -33485,6 +33536,11 @@ P
 
 		const hint = document.getElementById('admin-chat-control-hint');
 		if (hint) hint.remove();
+		const connectedForSignature = !!(typeof socketChat !== 'undefined' && socketChat && socketChat.connected);
+		const signatureWait = Math.ceil((Number(state.waitMs) || 0) / 1000);
+		window.__adminLightChatControlsUiSignature = typeof window.getLiveRenderSignature === 'function'
+			? window.getLiveRenderSignature([!!state.locked, Number(state.slowSeconds || 0), String(state.by || ''), !!state.canBypass, signatureWait, connectedForSignature ? 1 : 0])
+			: JSON.stringify([!!state.locked, Number(state.slowSeconds || 0), String(state.by || ''), !!state.canBypass, signatureWait, connectedForSignature]);
 	}
 
 	function adminChatControlsAreActive(state = null) {
@@ -33719,7 +33775,7 @@ P
 				}
 			}
 			document.querySelectorAll('img[data-user]').forEach(img => {
-				if (img.getAttribute('data-user') === name && img.src !== avatar) img.src = avatar;
+				if (img.getAttribute('data-user') === name && img.getAttribute('src') !== avatar) img.setAttribute('src', avatar);
 			});
 		}
 		const incomingLevel = Number(user.level);
@@ -34224,37 +34280,113 @@ P
 		socketChat.io?.on?.('reconnect_attempt', () => syncAdminHealth('connecting'));
 		socketChat.io?.on?.('reconnect', () => syncAdminHealth('online'));
 		socketChat.on('admin_server_log_list', list => {
-			adminSetServerLog(Array.isArray(list) ? list : []);
+			const nextList = Array.isArray(list) ? list.filter(Boolean).slice(0, 120) : [];
+			const previousList = adminGetServerLog();
+			const unchanged = typeof window.getLiveRenderSignature === 'function' ? window.getLiveRenderSignature(previousList) === window.getLiveRenderSignature(nextList) : JSON.stringify(previousList) === JSON.stringify(nextList);
+			if (unchanged) return;
+			adminSetServerLog(nextList);
 			adminSchedulePanelRender();
 		});
 		socketChat.on('admin_server_log', item => {
 			if (item) adminAddServerLog(item);
 		});
-		socketChat.on('admin_chat_controls', data => { adminSetChatControls({ ...(data || {}), source: 'server', serverSynced: true }, false); adminSchedulePanelRender(); });
-		socketChat.on('chat_controls', data => { adminSetChatControls({ ...(data || {}), source: 'server', serverSynced: true }, false); adminSchedulePanelRender(); });
-		socketChat.on('admin_chat_controls_state', data => { adminSetChatControls({ ...(data || {}), source: 'server', serverSynced: true }, false); adminSchedulePanelRender(); });
+		const applyAdminChatControlsRealtime = data => {
+			const raw = data && typeof data === 'object' ? data : {};
+			const comparable = [!!raw.locked, Math.max(0, Math.min(600, parseInt(raw.slowSeconds || 0, 10) || 0)), String(raw.by || ''), String(raw.at || '')];
+			const signature = typeof window.getLiveRenderSignature === 'function' ? window.getLiveRenderSignature(comparable) : JSON.stringify(comparable);
+			const current = typeof window.adminGetChatControls === 'function' ? window.adminGetChatControls() : null;
+			const currentComparable = current ? [!!current.locked, Math.max(0, Math.min(600, parseInt(current.slowSeconds || 0, 10) || 0)), String(current.by || ''), String(current.at || '')] : null;
+			const currentSignature = currentComparable ? (typeof window.getLiveRenderSignature === 'function' ? window.getLiveRenderSignature(currentComparable) : JSON.stringify(currentComparable)) : '';
+			if (window.__adminChatControlsRealtimeSignature === signature || currentSignature === signature) {
+				window.__adminChatControlsRealtimeSignature = signature;
+				if (typeof adminSetChatControlsSyncState === 'function') adminSetChatControlsSyncState('synced');
+				return false;
+			}
+			window.__adminChatControlsRealtimeSignature = signature;
+			adminSetChatControls({ ...raw, source: 'server', serverSynced: true }, false);
+			adminSchedulePanelRender();
+			return true;
+		};
+		socketChat.on('admin_chat_controls', applyAdminChatControlsRealtime);
+		socketChat.on('chat_controls', applyAdminChatControlsRealtime);
+		socketChat.on('admin_chat_controls_state', applyAdminChatControlsRealtime);
 		socketChat.on('chat_blocked', data => {
 			if (data && data.controls) adminSetChatControls({ ...data.controls, source: 'server', serverSynced: true }, false);
 			if (typeof adminUpdateChatControlsBanner === 'function') adminUpdateChatControlsBanner();
 		});
 		socketChat.on('admin_state', data => {
-			if (data && data.chatControls) adminSetChatControls({ ...data.chatControls, source: 'server', serverSynced: true }, false);
-			if (data && data.maintenance) adminSetMaintenanceState(data.maintenance, false);
-			if (data && data.pinnedAnnouncement !== undefined) adminSetPinnedAnnouncementState(data.pinnedAnnouncement && !data.pinnedAnnouncement.clear ? data.pinnedAnnouncement : null, false);
-			if (data && Array.isArray(data.serverLog)) adminSetServerLog(data.serverLog);
-			if (data && Number.isFinite(Number(data.registeredUsers))) window.adminRegisteredUsers = Math.max(0, Number(data.registeredUsers));
-			if (data && data.countryStats && typeof data.countryStats === 'object') window.adminCountryStats = data.countryStats;
+			if (!data || typeof data !== 'object') return;
+			let changed = false;
+			if (data.chatControls) {
+				const controls = data.chatControls;
+				const comparable = [!!controls.locked, Math.max(0, Math.min(600, parseInt(controls.slowSeconds || 0, 10) || 0)), String(controls.by || ''), String(controls.at || '')];
+				const signature = typeof window.getLiveRenderSignature === 'function' ? window.getLiveRenderSignature(comparable) : JSON.stringify(comparable);
+				const current = typeof window.adminGetChatControls === 'function' ? window.adminGetChatControls() : null;
+				const currentComparable = current ? [!!current.locked, Math.max(0, Math.min(600, parseInt(current.slowSeconds || 0, 10) || 0)), String(current.by || ''), String(current.at || '')] : null;
+				const currentSignature = currentComparable ? (typeof window.getLiveRenderSignature === 'function' ? window.getLiveRenderSignature(currentComparable) : JSON.stringify(currentComparable)) : '';
+				window.__adminChatControlsRealtimeSignature = signature;
+				if (currentSignature !== signature) { adminSetChatControls({ ...controls, source: 'server', serverSynced: true }, false); changed = true; }
+				else if (typeof adminSetChatControlsSyncState === 'function') adminSetChatControlsSyncState('synced');
+			}
+			if (data.maintenance) {
+				const nextMaintenance = adminNormalizeMaintenanceState(data.maintenance);
+				const currentMaintenance = adminGetMaintenanceState();
+				const sameMaintenance = (typeof window.getLiveRenderSignature === 'function' ? window.getLiveRenderSignature(currentMaintenance) === window.getLiveRenderSignature(nextMaintenance) : JSON.stringify(currentMaintenance) === JSON.stringify(nextMaintenance));
+				if (!sameMaintenance) { adminSetMaintenanceState(nextMaintenance, false); changed = true; }
+			}
+			if (data.pinnedAnnouncement !== undefined) {
+				const nextPinned = data.pinnedAnnouncement && !data.pinnedAnnouncement.clear ? { ...data.pinnedAnnouncement, color: adminNormalizeAnnouncementColor(data.pinnedAnnouncement.color) } : null;
+				const currentPinned = adminGetPinnedAnnouncement();
+				const pinnedSignature = typeof window.getLiveRenderSignature === 'function' ? window.getLiveRenderSignature(nextPinned) : JSON.stringify(nextPinned);
+				window.__adminPinnedAnnouncementRealtimeSignature = pinnedSignature;
+				const samePinned = (typeof window.getLiveRenderSignature === 'function' ? window.getLiveRenderSignature(currentPinned) === pinnedSignature : JSON.stringify(currentPinned) === JSON.stringify(nextPinned));
+				if (!samePinned) { adminSetPinnedAnnouncementState(nextPinned, false); changed = true; }
+			}
+			if (Array.isArray(data.serverLog)) {
+				const nextServerLog = data.serverLog.filter(Boolean).slice(0, 120);
+				const currentServerLog = adminGetServerLog();
+				const sameLog = (typeof window.getLiveRenderSignature === 'function' ? window.getLiveRenderSignature(currentServerLog) === window.getLiveRenderSignature(nextServerLog) : JSON.stringify(currentServerLog) === JSON.stringify(nextServerLog));
+				if (!sameLog) { adminSetServerLog(nextServerLog); changed = true; }
+			}
+			if (Number.isFinite(Number(data.registeredUsers))) {
+				const nextRegisteredUsers = Math.max(0, Number(data.registeredUsers));
+				if (Number(window.adminRegisteredUsers || 0) !== nextRegisteredUsers) { window.adminRegisteredUsers = nextRegisteredUsers; changed = true; }
+			}
+			if (data.countryStats && typeof data.countryStats === 'object') {
+				const sameCountryStats = (typeof window.getLiveRenderSignature === 'function' ? window.getLiveRenderSignature(window.adminCountryStats || null) === window.getLiveRenderSignature(data.countryStats) : JSON.stringify(window.adminCountryStats || null) === JSON.stringify(data.countryStats));
+				if (!sameCountryStats) { window.adminCountryStats = data.countryStats; changed = true; }
+			}
+			if (changed) adminSchedulePanelRender();
+		});
+		socketChat.on('admin_pinned_announcement', data => {
+			const nextPinned = data && !data.clear ? { ...data, color: adminNormalizeAnnouncementColor(data.color) } : null;
+			const signature = typeof window.getLiveRenderSignature === 'function' ? window.getLiveRenderSignature(nextPinned) : JSON.stringify(nextPinned);
+			const currentPinned = adminGetPinnedAnnouncement();
+			const currentSignature = typeof window.getLiveRenderSignature === 'function' ? window.getLiveRenderSignature(currentPinned) : JSON.stringify(currentPinned);
+			if (window.__adminPinnedAnnouncementRealtimeSignature === signature || currentSignature === signature) { window.__adminPinnedAnnouncementRealtimeSignature = signature; return; }
+			window.__adminPinnedAnnouncementRealtimeSignature = signature;
+			adminSetPinnedAnnouncementState(nextPinned, false);
 			adminSchedulePanelRender();
 		});
-		socketChat.on('admin_pinned_announcement', data => { adminSetPinnedAnnouncementState(data && !data.clear ? data : null, false); adminSchedulePanelRender(); });
-		socketChat.on('reports_list', reports => { adminSetReports(Array.isArray(reports) ? reports : []); adminSchedulePanelRender(); });
+		socketChat.on('reports_list', reports => {
+			const nextReports = Array.isArray(reports) ? reports.slice(0, 100) : [];
+			const previousReports = adminGetReports();
+			const unchanged = typeof window.getLiveRenderSignature === 'function' ? window.getLiveRenderSignature(previousReports) === window.getLiveRenderSignature(nextReports) : JSON.stringify(previousReports) === JSON.stringify(nextReports);
+			if (unchanged) return;
+			adminSetReports(nextReports);
+			adminSchedulePanelRender();
+		});
 		const handleLiveReport = report => adminAddIncomingReport(report, false);
 		socketChat.on('admin_report_created', handleLiveReport);
 		socketChat.on('admin_moderation_log', item => {
 			if (item) adminAddLog(item.type || 'server', item.message || 'Server moderation event', item.detail || {}, item);
 		});
 		socketChat.on('admin_moderation_log_list', list => {
-			adminSetModerationLog(Array.isArray(list) ? list : []);
+			const nextList = Array.isArray(list) ? list.filter(Boolean).slice(0, 100) : [];
+			const previousList = adminGetModerationLog();
+			const unchanged = typeof window.getLiveRenderSignature === 'function' ? window.getLiveRenderSignature(previousList) === window.getLiveRenderSignature(nextList) : JSON.stringify(previousList) === JSON.stringify(nextList);
+			if (unchanged) return;
+			adminSetModerationLog(nextList);
 			if (document.getElementById('view-admin')?.style.display === 'block') adminSchedulePanelRender();
 		});
 	}
@@ -34271,6 +34403,13 @@ P
 
 	function adminLightChatControlsUiTick() {
 		if (document.hidden || !adminShouldRefreshChatControlsUi()) return;
+		const state = (typeof adminGetChatControlsUiState === 'function') ? adminGetChatControlsUiState() : {};
+		const connected = !!(typeof socketChat !== 'undefined' && socketChat && socketChat.connected);
+		const wait = Math.ceil((Number(state.waitMs) || 0) / 1000);
+		const signature = typeof window.getLiveRenderSignature === 'function'
+			? window.getLiveRenderSignature([!!state.locked, Number(state.slowSeconds || 0), String(state.by || ''), !!state.canBypass, wait, connected ? 1 : 0])
+			: JSON.stringify([!!state.locked, Number(state.slowSeconds || 0), String(state.by || ''), !!state.canBypass, wait, connected]);
+		if (window.__adminLightChatControlsUiSignature === signature) return;
 		adminUpdateChatControlsBanner();
 	}
 
@@ -36064,7 +36203,7 @@ P
 		const shouldShow = pendingKeys.length > 0 && (!isViewActive || keepWhileActive);
 
 		saveState(boolKey, shouldShow ? 'true' : 'false');
-		if (dot) dot.style.display = shouldShow ? 'block' : 'none';
+		if (dot) { const nextDisplay = shouldShow ? 'block' : 'none'; if (dot.style.display !== nextDisplay) dot.style.display = nextDisplay; }
 		return shouldShow;
 	};
 
@@ -37714,6 +37853,21 @@ P
 		if (n !== null) window.revivedPlayerCountCache[key] = n;
 
 		const badges = document.querySelectorAll(`[data-revived-player-badge="${key}"]`);
+		if (n !== null && Number.isFinite(oldValue) && n === oldValue && badges.length > 0) {
+			const expectedLabel = n === 1 ? 'PLAYER' : 'PLAYERS';
+			const alreadySettled = Array.from(badges).every(badge => {
+				const countEl = getRevivedPlayerCountElement(badge, key);
+				const featuredLabelEl = badge.querySelector('.featured-revived-player-label');
+				return !!countEl
+					&& countEl.textContent === String(n)
+					&& !badge.classList.contains('is-loading')
+					&& !badge.classList.contains('is-error')
+					&& !badge.classList.contains('is-offline')
+					&& badge.classList.contains('is-zero') === (n === 0)
+					&& (!featuredLabelEl || featuredLabelEl.textContent === expectedLabel);
+			});
+			if (alreadySettled) return;
+		}
 		badges.forEach(badge => {
 			const countEl = getRevivedPlayerCountElement(badge, key);
 			if (!countEl) return;
@@ -38917,8 +39071,9 @@ P
 	function setPs3ConnectingVisual() {
 		const globalIcon = document.getElementById('global-status-icon');
 		if (!globalIcon) return;
-		globalIcon.className = "fas fa-circle-notch fa-spin status-dot-base status-dot-connecting";
-		globalIcon.style.color = "orange";
+		const nextClass = "fas fa-circle-notch fa-spin status-dot-base status-dot-connecting";
+		if (globalIcon.className !== nextClass) globalIcon.className = nextClass;
+		if (globalIcon.dataset.ps3StatusColor !== 'orange') { globalIcon.dataset.ps3StatusColor = 'orange'; globalIcon.style.color = "orange"; }
 		syncBrowseRemoteDownloadStatusFromIpDot();
 	}
 
@@ -38928,8 +39083,9 @@ P
 		const statusText = document.getElementById('browse-remote-status-text');
 		const globalIcon = document.getElementById('global-status-icon');
 		const isConnected = !!(globalIcon && globalIcon.classList.contains('status-dot-connected'));
-		if (statusText) statusText.innerText = isConnected ? "Connected" : "Disconnected";
-		status.classList.toggle('is-connected', isConnected);
+		const nextText = isConnected ? "Connected" : "Disconnected";
+		if (statusText && statusText.innerText !== nextText) statusText.innerText = nextText;
+		if (status.classList.contains('is-connected') !== isConnected) status.classList.toggle('is-connected', isConnected);
 		if (typeof window.setSidebarCountPill === 'function') { window.setSidebarCountPill('games', Array.isArray(window.lastScannedGames) ? window.lastScannedGames.length : 0); window.setSidebarCountPill('favorites', Array.isArray(window.favoritesLibrary) ? window.favoritesLibrary.length : 0); }
 	}
 	
@@ -39222,14 +39378,15 @@ P
 	});
 
 	function applyPs3DisconnectedUi(favDot, globalIcon, btnConnect, btnShutdown) {
-		if (favDot) favDot.style.display = 'none';
+		if (favDot && favDot.style.display !== 'none') favDot.style.display = 'none';
 		if (globalIcon) {
-			globalIcon.style.color = '#ff4444';
-			globalIcon.className = 'fas fa-circle status-dot-base status-dot-disconnected';
+			if (globalIcon.dataset.ps3StatusColor !== '#ff4444') { globalIcon.dataset.ps3StatusColor = '#ff4444'; globalIcon.style.color = '#ff4444'; }
+			const nextClass = 'fas fa-circle status-dot-base status-dot-disconnected';
+			if (globalIcon.className !== nextClass) globalIcon.className = nextClass;
 		}
 		syncBrowseRemoteDownloadStatusFromIpDot();
-		if (btnConnect) btnConnect.style.display = 'flex';
-		if (btnShutdown) btnShutdown.style.display = 'none';
+		if (btnConnect && btnConnect.style.display !== 'flex') btnConnect.style.display = 'flex';
+		if (btnShutdown && btnShutdown.style.display !== 'none') btnShutdown.style.display = 'none';
 		if (_lastConnectionState !== false) {
 			const wasConnectedBeforeOffline = _lastConnectionState === true;
 			_lastConnectionState = false;
@@ -39303,12 +39460,13 @@ P
 			ps3ConnectionMisses = 0;
 
 			if (globalIcon) {
-				globalIcon.style.color = "#4caf50";
-				globalIcon.className = "fas fa-circle status-dot-base status-dot-connected";
+				if (globalIcon.dataset.ps3StatusColor !== '#4caf50') { globalIcon.dataset.ps3StatusColor = '#4caf50'; globalIcon.style.color = "#4caf50"; }
+				const nextClass = "fas fa-circle status-dot-base status-dot-connected";
+				if (globalIcon.className !== nextClass) globalIcon.className = nextClass;
 			}
 			syncBrowseRemoteDownloadStatusFromIpDot();
-			if (btnConnect) btnConnect.style.display = 'none';
-			if (btnShutdown) btnShutdown.style.display = 'flex';
+			if (btnConnect && btnConnect.style.display !== 'none') btnConnect.style.display = 'none';
+			if (btnShutdown && btnShutdown.style.display !== 'flex') btnShutdown.style.display = 'flex';
 
 			if (_lastConnectionState !== true) {
 				_lastConnectionState = true;
@@ -39329,7 +39487,7 @@ P
 				}
 			}
 
-			if (shouldManageSearch && searchBar) {
+			if (shouldManageSearch && searchBar && searchBar.style.display !== 'flex') {
 				searchBar.style.display = 'flex';
 			}
 
@@ -39395,7 +39553,7 @@ P
 				return;
 			}
 
-			if (shouldManageSearch && searchBar) {
+			if (shouldManageSearch && searchBar && searchBar.style.display !== 'none') {
 				searchBar.style.display = 'none';
 			}
 
@@ -47450,14 +47608,11 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
             const isOnline = (dotUser === myChatName && socketOnline)
                 ? true
                 : !!(dotUserData && typeof dotUserData === 'object' && dotUserData.online === true);
-
-            if (isOnline) {
-                dot.classList.add('status-pulsing-soft');
-                dot.style.color = '#4caf50';
-            } else {
-                dot.classList.remove('status-pulsing-soft');
-                dot.style.color = 'rgba(255, 255, 255, 0.2)';
-            }
+            const nextPresenceState = isOnline ? 'online' : 'offline';
+            if (dot.dataset.presenceState === nextPresenceState) return;
+            dot.dataset.presenceState = nextPresenceState;
+            dot.classList.toggle('status-pulsing-soft', isOnline);
+            dot.style.color = isOnline ? '#4caf50' : 'rgba(255, 255, 255, 0.2)';
         });
 
         document.querySelectorAll('.chat-avatar-status').forEach(img => {
@@ -47466,8 +47621,8 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
             const isMe = (imgUser === myChatName);
 
             const isMessageAvatar = !!(img.closest && img.closest('[id^="msg-row-"]'));
-            if (!isMe && uData && uData.avatar && img.src !== uData.avatar && (canHydrateMessageAvatars || !isMessageAvatar)) {
-                img.src = uData.avatar;
+            if (!isMe && uData && uData.avatar && img.getAttribute('src') !== uData.avatar && (canHydrateMessageAvatars || !isMessageAvatar)) {
+                img.setAttribute('src', uData.avatar);
             }
 
             const isOnline = isMe ? socketOnline : (uData && uData.online === true);
@@ -47485,7 +47640,10 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
                 }
             }
 
-            if (img.style.borderColor !== newBorderColor) img.style.borderColor = newBorderColor;
+            if (img.dataset.presenceBorder !== newBorderColor) {
+                img.dataset.presenceBorder = newBorderColor;
+                img.style.borderColor = newBorderColor;
+            }
         });
 
         if (!canHydrateMessageAvatars && avatarHydrationBlockedUntil) {
@@ -54990,13 +55148,17 @@ function getVisibleChatStackEl(id) {
 						isWished = window.isWishlistItemSaved({ id: titleId, titleId, contentId, category }, category);
 					}
 
-					card.classList.toggle('is-wishlisted', isWished);
+					const nextWishlistClass = !!isWished;
+					if (card.classList.contains('is-wishlisted') !== nextWishlistClass) card.classList.toggle('is-wishlisted', nextWishlistClass);
 					const btn = card.querySelector('.wish-btn');
 					const icon = btn ? btn.querySelector('i') : null;
-					if (btn) btn.title = isWished ? 'Remove from Wishlist' : 'Add to Wishlist';
+					const nextWishTitle = isWished ? 'Remove from Wishlist' : 'Add to Wishlist';
+					if (btn && btn.title !== nextWishTitle) btn.title = nextWishTitle;
 					if (icon) {
-						icon.className = isWished ? 'fas fa-heart' : 'far fa-heart';
-						icon.style.color = isWished ? '#ff4444' : 'rgba(255,255,255,0.6)';
+						const nextWishIconClass = isWished ? 'fas fa-heart' : 'far fa-heart';
+						const nextWishIconColor = isWished ? '#ff4444' : 'rgba(255,255,255,0.6)';
+						if (icon.className !== nextWishIconClass) icon.className = nextWishIconClass;
+						if (icon.style.color !== nextWishIconColor) icon.style.color = nextWishIconColor;
 					}
 				});
 			});
@@ -55018,10 +55180,13 @@ function getVisibleChatStackEl(id) {
 			const category = String(modal.dataset.storeCategory || btn.getAttribute('data-store-category') || 'games').trim();
 			const isWished = window.isWishlistItemSaved({ id: titleId, titleId, contentId, category }, category);
 			const icon = btn.querySelector('i');
-			btn.title = isWished ? 'Remove from Wishlist' : 'Add to Wishlist';
+			const nextWishTitle = isWished ? 'Remove from Wishlist' : 'Add to Wishlist';
+			if (btn.title !== nextWishTitle) btn.title = nextWishTitle;
 			if (icon) {
-				icon.className = isWished ? 'fas fa-heart' : 'far fa-heart';
-				icon.style.color = isWished ? '#ff4444' : 'rgba(255,255,255,0.6)';
+				const nextWishIconClass = isWished ? 'fas fa-heart' : 'far fa-heart';
+				const nextWishIconColor = isWished ? '#ff4444' : 'rgba(255,255,255,0.6)';
+				if (icon.className !== nextWishIconClass) icon.className = nextWishIconClass;
+				if (icon.style.color !== nextWishIconColor) icon.style.color = nextWishIconColor;
 			}
 		} catch (err) {
 			console.warn('[PROFILE SYNC] Could not refresh game modal wishlist button:', err);
@@ -55048,13 +55213,17 @@ function getVisibleChatStackEl(id) {
 					const canShowFavoriteBorder = isMyGamesCard || isBrowseCard || (!!card.querySelector('.fav-btn') && !card.closest('#view-explore'));
 					const allowFavoriteHighlight = !isBrowseCard || browseFavoriteHighlightActive;
 					const isFav = allowFavoriteHighlight && ((!!path && favoriteKeys.has(path)) || (!!title && favoriteKeys.has(title)) || (!!titleId && favoriteKeys.has(titleId)));
-					card.classList.toggle('is-favorited', canShowFavoriteBorder && isFav);
+					const nextFavoriteClass = !!(canShowFavoriteBorder && isFav);
+					if (card.classList.contains('is-favorited') !== nextFavoriteClass) card.classList.toggle('is-favorited', nextFavoriteClass);
 					const btn = card.querySelector('.fav-btn');
 					const icon = btn ? btn.querySelector('i') : null;
-					if (btn) btn.title = isFav ? 'Remove from Favorites' : 'Add to Favorites';
+					const nextFavTitle = isFav ? 'Remove from Favorites' : 'Add to Favorites';
+					if (btn && btn.title !== nextFavTitle) btn.title = nextFavTitle;
 					if (icon) {
-						icon.className = isFav ? 'fas fa-star' : 'far fa-star';
-						icon.style.color = isFav ? '#ffcc00' : 'rgba(255,255,255,0.6)';
+						const nextFavIconClass = isFav ? 'fas fa-star' : 'far fa-star';
+						const nextFavIconColor = isFav ? '#ffcc00' : 'rgba(255,255,255,0.6)';
+						if (icon.className !== nextFavIconClass) icon.className = nextFavIconClass;
+						if (icon.style.color !== nextFavIconColor) icon.style.color = nextFavIconColor;
 					}
 				});
 			});
@@ -55211,7 +55380,7 @@ function getVisibleChatStackEl(id) {
 
 			if (typeof window.refreshVisibleFavoriteCardsFromProfileSync === 'function') window.refreshVisibleFavoriteCardsFromProfileSync();
 		}
-		if (typeof window.applyProfileSyncNotificationDots === 'function') window.applyProfileSyncNotificationDots(previousState, userData);
+		if ((changes.wishlist || changes.downloads || changes.favorites || changes.trophies) && typeof window.applyProfileSyncNotificationDots === 'function') window.applyProfileSyncNotificationDots(previousState, userData);
 		return handled;
 	};
 
@@ -55395,7 +55564,7 @@ function getVisibleChatStackEl(id) {
 					if (typeof psnMarkTrophyViewsDirty === 'function') psnMarkTrophyViewsDirty();
 				}
 				window.__trophiesHydrated = true;
-				if (typeof window.refreshTrophyRewardSidebarCounts === 'function') window.refreshTrophyRewardSidebarCounts();
+				if ((profileSyncChanges.trophies || window.__initialProfileSyncInProgress === true) && typeof window.refreshTrophyRewardSidebarCounts === 'function') window.refreshTrophyRewardSidebarCounts();
 			}
 			if (profileSyncChanges.wishlist && Array.isArray(userData.wishlistData)) { window.wishlist = userData.wishlistData; safeLocalStorageSet(`${name}_psn_wishlist_db`, JSON.stringify(userData.wishlistData)); applyProfileListUpdatedAtFromServer(name, 'wishlist', userData.wishlistUpdatedAt); }
 			if (profileSyncChanges.downloads && Array.isArray(userData.downloadsData)) { applyIncomingDownloadHistoryForProfile(name, userData, payload); }
@@ -55422,10 +55591,11 @@ function getVisibleChatStackEl(id) {
 			}
 
 			if (userData.avatar) {
+				const previousAvatar = localStorage.getItem(`${name}_psn_avatar`) || '';
 				if (typeof window.syncPsnUserMeta === 'function') window.syncPsnUserMeta({ name, avatar: userData.avatar, profileUpdatedAt: incomingProfileUpdatedAt || 0 });
 				else safeLocalStorageSet(`${name}_psn_avatar`, userData.avatar);
 				const sidebarAvatar = document.querySelector('.user-avatar');
-				if (sidebarAvatar) sidebarAvatar.style.backgroundImage = `url('${userData.avatar}')`;
+				if (sidebarAvatar && previousAvatar !== userData.avatar) sidebarAvatar.style.backgroundImage = `url('${userData.avatar}')`;
 			}
 			if (userData.joined) safeLocalStorageSet(`${name}_joined_date`, userData.joined);
 			const incomingCountryCode = normalizeProfileCountryCode(userData.countryCode || userData.country_code || userData.country || payload.countryCode || payload.country_code || payload.country);
@@ -55478,14 +55648,24 @@ function getVisibleChatStackEl(id) {
 			const hasRoleSync = Object.prototype.hasOwnProperty.call(userData, 'role');
 			const hasAdminSync = Object.prototype.hasOwnProperty.call(userData, 'isAdmin');
 			const hasModeratorSync = Object.prototype.hasOwnProperty.call(userData, 'isModerator');
+			let profileRoleVisualChanged = false;
 			if (hasRoleSync || hasAdminSync || hasModeratorSync) {
-				const incomingRole = String(userData.role || (userData.isAdmin ? 'admin' : '')).toLowerCase();
+				const incomingRoleRaw = String(userData.role || (userData.isAdmin ? 'admin' : '')).toLowerCase();
+				const incomingRole = incomingRoleRaw === 'moderator' ? 'mod' : incomingRoleRaw;
+				const previousStoredRoleRaw = String(localStorage.getItem(`${name}_psn_role`) || 'user').toLowerCase();
+				const previousStoredRole = previousStoredRoleRaw === 'moderator' ? 'mod' : previousStoredRoleRaw;
+				const nextStoredRole = incomingRole && incomingRole !== 'user' ? incomingRole : 'user';
+				const previousAdminClass = document.body.classList.contains('is-admin');
+				const previousModClass = document.body.classList.contains('is-mod');
+				const nextAdminClass = userData.isAdmin === true || incomingRole === 'admin';
+				const nextModClass = userData.isModerator === true || incomingRole === 'mod';
+				profileRoleVisualChanged = (hasRoleSync && previousStoredRole !== nextStoredRole) || ((hasAdminSync || hasRoleSync) && previousAdminClass !== nextAdminClass) || ((hasModeratorSync || hasRoleSync) && previousModClass !== nextModClass);
 				if (hasRoleSync) {
-					if (incomingRole && incomingRole !== 'user') safeLocalStorageSet(`${name}_psn_role`, incomingRole === 'moderator' ? 'mod' : incomingRole);
-					else localStorage.removeItem(`${name}_psn_role`);
+					if (nextStoredRole !== 'user') safeLocalStorageSet(`${name}_psn_role`, nextStoredRole);
+					else if (localStorage.getItem(`${name}_psn_role`) !== null) localStorage.removeItem(`${name}_psn_role`);
 				}
-				if (hasAdminSync || hasRoleSync) document.body.classList.toggle('is-admin', userData.isAdmin === true || incomingRole === 'admin');
-				if (hasModeratorSync || hasRoleSync) document.body.classList.toggle('is-mod', userData.isModerator === true || incomingRole === 'mod' || incomingRole === 'moderator');
+				if (hasAdminSync || hasRoleSync) document.body.classList.toggle('is-admin', nextAdminClass);
+				if (hasModeratorSync || hasRoleSync) document.body.classList.toggle('is-mod', nextModClass);
 			}
 
 			if (profileSyncChanges.library && typeof updateConsoleLibraryStatusUI === 'function') updateConsoleLibraryStatusUI(window.lastScannedGames || []);
@@ -55509,7 +55689,7 @@ function getVisibleChatStackEl(id) {
 				}
 				if (typeof window.friendActivityFriendsChanged === 'function') window.friendActivityFriendsChanged();
 			}
-			if (typeof updateAdminVisibility === 'function') updateAdminVisibility();
+			if ((window.__initialProfileSyncInProgress === true || profileRoleVisualChanged) && typeof updateAdminVisibility === 'function') updateAdminVisibility();
 			if (typeof window.refreshCategoryDot === 'function') {
 				if (profileSyncChanges.wishlist) window.refreshCategoryDot('wishlist');
 				if (profileSyncChanges.favorites) window.refreshCategoryDot('favorites');
@@ -55520,8 +55700,7 @@ function getVisibleChatStackEl(id) {
 			const profileModal = document.getElementById('modal-sys-profile');
 			const ownProfileOpen = !!(profileModal && profileModal.dataset.profileUsername === name && (profileModal.style.display === 'flex' || profileModal.style.display === 'block' || profileModal.classList.contains('show')));
 			if (ownProfileOpen) {
-				const rolePatch = Object.prototype.hasOwnProperty.call(userData, 'role') || Object.prototype.hasOwnProperty.call(userData, 'isAdmin') || Object.prototype.hasOwnProperty.call(userData, 'isModerator');
-				if (rolePatch && typeof openProfileModal === 'function') {
+				if (profileRoleVisualChanged && typeof openProfileModal === 'function') {
 					openProfileModal(encodeURIComponent(name));
 				} else {
 					if (userData.avatar) {
@@ -56602,8 +56781,12 @@ function getVisibleChatStackEl(id) {
 		});
 		
 		socketChat.on('pinned_list', (list) => {
-			pinnedMessages = list;
-			if (list.length > 0) currentPinIndex = list.length - 1;
+			const nextPinned = Array.isArray(list) ? list : [];
+			const previousSignature = typeof window.getLiveRenderSignature === 'function' ? window.getLiveRenderSignature(Array.isArray(pinnedMessages) ? pinnedMessages : []) : JSON.stringify(Array.isArray(pinnedMessages) ? pinnedMessages : []);
+			const nextSignature = typeof window.getLiveRenderSignature === 'function' ? window.getLiveRenderSignature(nextPinned) : JSON.stringify(nextPinned);
+			if (previousSignature === nextSignature) return;
+			pinnedMessages = nextPinned;
+			if (nextPinned.length > 0) currentPinIndex = nextPinned.length - 1;
 			renderPinnedBar();
 		});
 		
@@ -56616,6 +56799,13 @@ function getVisibleChatStackEl(id) {
 			const banSignal = role === 'banned' || data.isBanned === true || data.banned === true;
 			if (role === 'banned') role = 'user';
 			const roleTargetName = String(data.targetName || data.name || data.username || data.user || '').trim();
+			const roleStateOwner = roleTargetName || myName || '__self__';
+			window.__roleUpdatedRealtimeSignatureByUser = window.__roleUpdatedRealtimeSignatureByUser || Object.create(null);
+			const roleStateSignature = typeof window.getLiveRenderSignature === 'function'
+				? window.getLiveRenderSignature([role, data.isAdmin === true ? 1 : 0, data.isModerator === true ? 1 : 0, banSignal ? 1 : 0, explicitUnbanSignal ? 1 : 0])
+				: JSON.stringify([role, data.isAdmin === true, data.isModerator === true, banSignal, explicitUnbanSignal]);
+			if (window.__roleUpdatedRealtimeSignatureByUser[roleStateOwner] === roleStateSignature) return;
+			window.__roleUpdatedRealtimeSignatureByUser[roleStateOwner] = roleStateSignature;
 			if (banSignal && (!roleTargetName || roleTargetName === myName)) {
 				if (typeof handleCurrentUserBanned === 'function') handleCurrentUserBanned(data);
 				return;
@@ -57297,7 +57487,7 @@ function getVisibleChatStackEl(id) {
 				adminSchedulePanelRender();
 			}
 		
-			if (isVisible) renderOnlineList();
+			if (isVisible && onlineSnapshotChanged) renderOnlineList();
 		
 			const friendsSubviewVisibleForOnlineList = typeof isFriendsSubviewVisible === 'function' && isFriendsSubviewVisible();
 		
@@ -57360,6 +57550,10 @@ function getVisibleChatStackEl(id) {
 		socketChat.on('admin_users_results', function(payload) {
 			clearTimeout(window.adminUsersRenderTimer);
 			window.adminUsersRenderTimer = null;
+			const wasAdminUsersLoading = window.adminUsersLoading === true;
+			const previousAdminUsersStateSignature = typeof window.getLiveRenderSignature === 'function'
+				? window.getLiveRenderSignature([window.adminAllUsers || [], Number(window.adminUsersResultTotal || 0), window.adminCountryStats || null])
+				: JSON.stringify([window.adminAllUsers || [], Number(window.adminUsersResultTotal || 0), window.adminCountryStats || null]);
 			const results = payload && Array.isArray(payload.results) ? payload.results : [];
 			const offset = Math.max(0, Number(payload && payload.offset) || 0);
 			const total = Math.max(0, Number(payload && payload.total) || 0);
@@ -57374,13 +57568,21 @@ function getVisibleChatStackEl(id) {
 			if (payload && payload.countryStats && typeof payload.countryStats === 'object') window.adminCountryStats = payload.countryStats;
 			window.adminRenderLimit = Math.max(adminGetUsersBatchSize(), Array.isArray(window.adminAllUsers) ? window.adminAllUsers.length : 0);
 			window.adminUsersLoading = false;
-			if (Array.isArray(results) && typeof window.syncPsnUserMeta === 'function') results.forEach(user => window.syncPsnUserMeta(user));
-			if (document.getElementById('view-admin')?.style.display === 'block' && typeof renderAdminPanel === 'function') adminSchedulePanelRender();
+			const nextAdminUsersStateSignature = typeof window.getLiveRenderSignature === 'function'
+				? window.getLiveRenderSignature([window.adminAllUsers || [], Number(window.adminUsersResultTotal || 0), window.adminCountryStats || null])
+				: JSON.stringify([window.adminAllUsers || [], Number(window.adminUsersResultTotal || 0), window.adminCountryStats || null]);
+			const adminUsersStateChanged = previousAdminUsersStateSignature !== nextAdminUsersStateSignature;
+			if (adminUsersStateChanged && Array.isArray(results) && typeof window.syncPsnUserMeta === 'function') results.forEach(user => window.syncPsnUserMeta(user));
+			if ((adminUsersStateChanged || wasAdminUsersLoading) && document.getElementById('view-admin')?.style.display === 'block' && typeof renderAdminPanel === 'function') adminSchedulePanelRender();
 		});
 
 
 		socketChat.on('global_search_results', function(results) {
 			const previousGlobalSearchResults = Array.isArray(window.globalSearchResults) ? window.globalSearchResults : [];
+			const nextGlobalSearchResults = Array.isArray(results) ? results : [];
+			const previousGlobalSearchSignature = typeof window.getLiveRenderSignature === 'function' ? window.getLiveRenderSignature(previousGlobalSearchResults) : JSON.stringify(previousGlobalSearchResults);
+			const nextGlobalSearchSignature = typeof window.getLiveRenderSignature === 'function' ? window.getLiveRenderSignature(nextGlobalSearchResults) : JSON.stringify(nextGlobalSearchResults);
+			const globalSearchResultsChanged = previousGlobalSearchSignature !== nextGlobalSearchSignature;
 			window.globalSearchResults = results;
 			const mentionDbChanged = (typeof mergeChatMentionDatabaseUsers === 'function') ? mergeChatMentionDatabaseUsers(results) : false;
 			const chatVisibleForMentionResults = typeof isChatScreenVisibleForRead === 'function' && isChatScreenVisibleForRead();
@@ -57405,17 +57607,52 @@ function getVisibleChatStackEl(id) {
 			if (openProfileTarget && Array.isArray(results)) {
 				const previousOpenProfileResult = previousGlobalSearchResults.find(u => (u && (u.name || u)) === openProfileTarget) || null;
 				const nextOpenProfileResult = results.find(u => (u && (u.name || u)) === openProfileTarget) || null;
-				const previousOpenProfileSignature = typeof window.getLiveRenderSignature === 'function' ? window.getLiveRenderSignature(previousOpenProfileResult) : JSON.stringify(previousOpenProfileResult);
-				const nextOpenProfileSignature = typeof window.getLiveRenderSignature === 'function' ? window.getLiveRenderSignature(nextOpenProfileResult) : JSON.stringify(nextOpenProfileResult);
-				if (nextOpenProfileResult && previousOpenProfileSignature !== nextOpenProfileSignature) {
-					const profileModal = document.getElementById('modal-sys-profile');
-					if (profileModal && (profileModal.style.display === 'flex' || profileModal.classList.contains('show')) && typeof openProfileModal === 'function') {
+				const profileModal = document.getElementById('modal-sys-profile');
+				const profileVisible = !!(profileModal && (profileModal.style.display === 'flex' || profileModal.style.display === 'block' || profileModal.classList.contains('show')));
+				if (nextOpenProfileResult && profileVisible) {
+					const getRoleState = user => {
+						const rawRole = String(user && user.role || '').toLowerCase();
+						return [rawRole === 'moderator' ? 'mod' : rawRole, user && user.isAdmin === true ? 1 : 0, user && user.isModerator === true ? 1 : 0, user && (user.isBanned === true || user.banned === true) ? 1 : 0];
+					};
+					const previousRoleState = getRoleState(previousOpenProfileResult);
+					const nextRoleState = getRoleState(nextOpenProfileResult);
+					const roleStateChanged = JSON.stringify(previousRoleState) !== JSON.stringify(nextRoleState);
+					if (roleStateChanged && typeof openProfileModal === 'function') {
 						setTimeout(() => openProfileModal(encodeURIComponent(openProfileTarget)), 0);
+					} else {
+						const nextAvatar = String(nextOpenProfileResult.avatar || '').trim();
+						const cardAvatar = document.getElementById('card-avatar');
+						if (cardAvatar && nextAvatar && cardAvatar.getAttribute('src') !== nextAvatar) cardAvatar.setAttribute('src', nextAvatar);
+						if (typeof patchOpenProfilePresenceStatus === 'function') patchOpenProfilePresenceStatus(nextOpenProfileResult, Number(nextOpenProfileResult.lastSeen || 0));
+						const previousCountry = typeof normalizeProfileCountryCode === 'function' ? normalizeProfileCountryCode(previousOpenProfileResult && (previousOpenProfileResult.countryCode || previousOpenProfileResult.country_code || previousOpenProfileResult.country || (previousOpenProfileResult.settingsData && (previousOpenProfileResult.settingsData.countryCode || previousOpenProfileResult.settingsData.country_code || previousOpenProfileResult.settingsData.country))) || '') : '';
+						const nextCountry = typeof normalizeProfileCountryCode === 'function' ? normalizeProfileCountryCode(nextOpenProfileResult.countryCode || nextOpenProfileResult.country_code || nextOpenProfileResult.country || (nextOpenProfileResult.settingsData && (nextOpenProfileResult.settingsData.countryCode || nextOpenProfileResult.settingsData.country_code || nextOpenProfileResult.settingsData.country)) || '') : '';
+						if (nextCountry && previousCountry !== nextCountry && typeof renderProfileCountry === 'function') renderProfileCountry(openProfileTarget, nextOpenProfileResult, true);
+						const previousStyleRaw = previousOpenProfileResult && ((previousOpenProfileResult.settingsData && (previousOpenProfileResult.settingsData.profileCardStyle || previousOpenProfileResult.settingsData.profileCardEffect)) || previousOpenProfileResult.profileCardStyle || previousOpenProfileResult.profileCardEffect || '');
+						const nextStyleRaw = (nextOpenProfileResult.settingsData && (nextOpenProfileResult.settingsData.profileCardStyle || nextOpenProfileResult.settingsData.profileCardEffect)) || nextOpenProfileResult.profileCardStyle || nextOpenProfileResult.profileCardEffect || '';
+						const previousStyle = previousStyleRaw && typeof normalizeProfileCardStyle === 'function' ? normalizeProfileCardStyle(previousStyleRaw) : String(previousStyleRaw || '');
+						const nextStyle = nextStyleRaw && typeof normalizeProfileCardStyle === 'function' ? normalizeProfileCardStyle(nextStyleRaw) : String(nextStyleRaw || '');
+						if (nextStyle && previousStyle !== nextStyle && typeof refreshOpenProfileCardStyleForUser === 'function') refreshOpenProfileCardStyleForUser(openProfileTarget);
+						const levelEl = document.getElementById('card-level');
+						const nextLevel = Math.max(0, Number(nextOpenProfileResult.level) || 0);
+						if (levelEl && nextLevel > 0 && levelEl.textContent !== String(nextLevel)) levelEl.textContent = String(nextLevel);
+						if (nextOpenProfileResult.joined) {
+							const joinedEl = document.getElementById('card-joined');
+							const nextJoined = `Joined: ${nextOpenProfileResult.joined}`;
+							if (joinedEl && joinedEl.textContent !== nextJoined) joinedEl.textContent = nextJoined;
+						}
+						[['card-downloads','downloads'],['card-wishlist','wishlist'],['card-favs','favorites'],['card-trophies','trophies'],['card-library','library']].forEach(([id, field]) => {
+							if (!Object.prototype.hasOwnProperty.call(nextOpenProfileResult, field)) return;
+							const el = document.getElementById(id);
+							const value = Math.max(0, Number(nextOpenProfileResult[field]) || 0);
+							if (!el) return;
+							if (typeof window.setLiveCountText === 'function') window.setLiveCountText(el, String(value), value, `profile:${openProfileTarget}`);
+							else if (el.textContent !== String(value)) el.textContent = String(value);
+						});
 					}
 				}
 			}
 			const term = document.getElementById('search-input').value;
-			if (typeof isFriendsSubviewVisible === 'function' && isFriendsSubviewVisible()) {
+			if (globalSearchResultsChanged && typeof isFriendsSubviewVisible === 'function' && isFriendsSubviewVisible()) {
 				if (typeof window.applyCollectionToolbarFilterChange === 'function') window.applyCollectionToolbarFilterChange('friends', { revealNew:true });
 				else renderFriendsList(term, true);
 			}
@@ -58053,6 +58290,12 @@ function getVisibleChatStackEl(id) {
 
 				const updatedAt = Number(data.playTimeUpdatedAt || 0) || Date.now();
 				const incomingTitleId = String(data.titleId || '').toUpperCase().trim();
+				window.__ps3PlaytimeRealtimeState = window.__ps3PlaytimeRealtimeState || Object.create(null);
+				const playtimeStateKey = `${name.toLowerCase()}|${incomingTitleId}`;
+				const previousPlaytimeState = window.__ps3PlaytimeRealtimeState[playtimeStateKey] || null;
+				if (previousPlaytimeState && Number(previousPlaytimeState.updatedAt || 0) > updatedAt) return;
+				if (previousPlaytimeState && previousPlaytimeState.playTime === playTime && Number(previousPlaytimeState.updatedAt || 0) === updatedAt) return;
+				window.__ps3PlaytimeRealtimeState[playtimeStateKey] = { playTime, updatedAt };
 
 				const applyToList = list => {
 					if (!Array.isArray(list)) return;
@@ -58060,6 +58303,7 @@ function getVisibleChatStackEl(id) {
 					if (!user || typeof user !== 'object' || !user.ps3Status || user.ps3Status.status !== 'playing') return;
 					const currentTitleId = String(user.ps3Status.titleId || '').toUpperCase().trim();
 					if (incomingTitleId && currentTitleId && incomingTitleId !== currentTitleId) return;
+					if (String(user.ps3Status.playTime || '') === playTime && Number(user.ps3Status.playTimeUpdatedAt || 0) === updatedAt) return;
 					user.ps3Status = { ...user.ps3Status, playTime, playTimeUpdatedAt: updatedAt };
 				};
 
@@ -58072,7 +58316,7 @@ function getVisibleChatStackEl(id) {
 					if (friend && typeof friend === 'object' && friend.ps3Status && friend.ps3Status.status === 'playing') {
 						const currentTitleId = String(friend.ps3Status.titleId || '').toUpperCase().trim();
 						if (!incomingTitleId || !currentTitleId || incomingTitleId === currentTitleId) {
-							friend.ps3Status = { ...friend.ps3Status, playTime, playTimeUpdatedAt: updatedAt };
+							if (String(friend.ps3Status.playTime || '') !== playTime || Number(friend.ps3Status.playTimeUpdatedAt || 0) !== updatedAt) friend.ps3Status = { ...friend.ps3Status, playTime, playTimeUpdatedAt: updatedAt };
 						}
 					}
 				}
@@ -58083,10 +58327,14 @@ function getVisibleChatStackEl(id) {
 				if (profileVisible && openedUser === name) {
 					const el = document.getElementById('profile-playing-time');
 					if (el && el.dataset.playtimeLocal !== '1') {
-						el.dataset.playtimeBase = playTime;
-						el.dataset.playtimeUpdatedAt = String(updatedAt);
-						el.textContent = playTime;
-						startProfilePlayTimeTicker();
+						const nextUpdatedAt = String(updatedAt);
+						const playtimeDomChanged = el.dataset.playtimeBase !== playTime || el.dataset.playtimeUpdatedAt !== nextUpdatedAt || el.textContent !== playTime;
+						if (playtimeDomChanged) {
+							el.dataset.playtimeBase = playTime;
+							el.dataset.playtimeUpdatedAt = nextUpdatedAt;
+							if (el.textContent !== playTime) el.textContent = playTime;
+							startProfilePlayTimeTicker();
+						}
 					}
 				}
 			} catch (err) {
@@ -58450,21 +58698,23 @@ function getVisibleChatStackEl(id) {
 					if (previousStoredValue !== value) safeLocalStorageSet(storageKey, String(value));
 				});
 				window.__profileCountsValuesByUser[name] = nextCountValues;
-				if (changedCountFields.size === 0) return;
 
 				const updateCachedUser = list => {
 					if (!Array.isArray(list)) return;
 					const user = list.find(item => item && (item.name || item) === name);
 					if (!user || typeof user !== 'object') return;
-					changedCountFields.forEach(field => {
-						user[field] = Math.max(0, Number(data[field]) || 0);
+					Object.keys(countFields).forEach(field => {
+						if (!Object.prototype.hasOwnProperty.call(data, field)) return;
+						const nextValue = Math.max(0, Number(data[field]) || 0);
+						if (Number(user[field] || 0) !== nextValue) user[field] = nextValue;
 					});
-					if (data.profileUpdatedAt) user.profileUpdatedAt = Number(data.profileUpdatedAt) || user.profileUpdatedAt;
+					if (data.profileUpdatedAt && Number(user.profileUpdatedAt || 0) !== Number(data.profileUpdatedAt)) user.profileUpdatedAt = Number(data.profileUpdatedAt) || user.profileUpdatedAt;
 				};
 
 				updateCachedUser(window.currentOnlineList);
 				updateCachedUser(window.globalSearchResults);
 				updateCachedUser(window.adminAllUsers);
+				if (changedCountFields.size === 0) return;
 				const myNameForCounts = localStorage.getItem('psn_username') || '';
 				if (name === myNameForCounts && typeof window.setSidebarCountPill === 'function') {
 					if (changedCountFields.has('downloads')) window.setSidebarCountPill('downloads', data.downloads);
@@ -58553,6 +58803,11 @@ function getVisibleChatStackEl(id) {
 						if (incomingStyleUpdatedAt) user.profileCardStyleUpdatedAt = incomingStyleUpdatedAt;
 						if (data.profileUpdatedAt) user.profileUpdatedAt = data.profileUpdatedAt;
 					}
+				}
+				if (countryChanged) {
+					const profileModal = document.getElementById('modal-sys-profile');
+					const profileOpen = !!(profileModal && profileModal.dataset.profileUsername === name && (profileModal.style.display === 'flex' || profileModal.style.display === 'block' || profileModal.classList.contains('show')));
+					if (profileOpen && typeof renderProfileCountry === 'function') renderProfileCountry(name, data, true);
 				}
 				if (styleChanged && typeof refreshOpenProfileCardStyleForUser === 'function') refreshOpenProfileCardStyleForUser(name);
 			} catch (err) {
@@ -58682,15 +58937,21 @@ function getVisibleChatStackEl(id) {
 		});
 
 		socketChat.on('trending_data', (data) => {
-			window.__trendingUnavailable = !!(data && data.unavailable === true);
+			const nextUnavailable = !!(data && data.unavailable === true);
+			const nextTrendingSignature = typeof window.getLiveRenderSignature === 'function'
+				? window.getLiveRenderSignature([nextUnavailable, data && data.topDownloads || [], data && data.topWishlist || []])
+				: JSON.stringify([nextUnavailable, data && data.topDownloads || [], data && data.topWishlist || []]);
+			const trendingVisualChanged = window.__trendingRealtimeSignature !== nextTrendingSignature;
+			window.__trendingRealtimeSignature = nextTrendingSignature;
+			window.__trendingUnavailable = nextUnavailable;
 			window.__pendingTrendingData = data;
 			if (data && data.contentDownloadCounts && typeof window.setContentDownloadCounts === 'function') {
 				window.setContentDownloadCounts(data.contentDownloadCounts);
 			}
-			if (typeof renderCachedTrendingIfVisible === 'function') {
+			if (trendingVisualChanged && typeof renderCachedTrendingIfVisible === 'function') {
 				renderCachedTrendingIfVisible();
 			}
-			if (window.__trendingUnavailable && typeof isTrendingViewVisible === 'function' && isTrendingViewVisible()) {
+			if (trendingVisualChanged && window.__trendingUnavailable && typeof isTrendingViewVisible === 'function' && isTrendingViewVisible()) {
 				clearTimeout(window.__trendingRecoveryTimer);
 				window.__trendingRecoveryTimer = setTimeout(() => {
 					if (socketChat && socketChat.connected && isTrendingViewVisible()) socketChat.emit('request_trending');
@@ -65894,13 +66155,16 @@ function getVisibleChatStackEl(id) {
 			const search = globalSearchByName.get(name) || null;
 			const ps3 = net && net.ps3Status ? net.ps3Status : null;
 			const avatar = getResolvedUserAvatar(name, String(entry && entry.avatar || ''), friendLookupContext);
+			const friendIsOnline = !!(net && net.online === true);
+			const knownLastSeen = getKnownFriendLastSeen(name, friend || entry, net);
+			const friendLastSeenText = friendIsOnline ? '' : (typeof formatLastSeen === 'function' ? formatLastSeen(knownLastSeen) : String(knownLastSeen));
 			return [
 				group, name, avatar,
-				String(net && net.online === true),
+				String(friendIsOnline),
 				String(ps3 && ps3.status || ''),
 				String(ps3 && ps3.title || ''),
 				String(net && net.level || entry && entry.level || friend && friend.level || search && search.level || ''),
-				String(getKnownFriendLastSeen(name, friend || entry, net)),
+				String(friendLastSeenText),
 				String(net && net.role || entry && entry.role || friend && friend.role || search && search.role || ''),
 				String(!!(net && net.isAdmin || entry && entry.isAdmin || friend && friend.isAdmin || search && search.isAdmin)),
 				String(!!(net && net.isModerator || entry && entry.isModerator || friend && friend.isModerator || search && search.isModerator)),
@@ -65934,7 +66198,7 @@ function getVisibleChatStackEl(id) {
 		]);
 		const friendsRenderSignature = getProgressiveGridSignature([
 			searchTerm, sortMode, showOnlineOnly ? '1' : '0', showPlayingOnly ? '1' : '0', window.sortOrders && window.sortOrders.friends || 'asc',
-			Math.floor(Date.now() / 60000), friendsOrderSignature, friendsVisibleSignatureParts.join('||')
+			friendsOrderSignature, friendsVisibleSignatureParts.join('||')
 		]);
 		const friendsSameSignature = grid.dataset.friendsRenderSignature === friendsRenderSignature;
 		const friendsSameProgressiveSignature = grid.dataset.friendsProgressiveSignature === friendsProgressiveSignature;
@@ -66989,44 +67253,46 @@ function getVisibleChatStackEl(id) {
 			config.borderColor = "orange";
 		}
 	
-		if (sText) sText.innerText = config.text;
-		if (sCont) sCont.style.color = config.color;
+		if (sText && sText.innerText !== config.text) sText.innerText = config.text;
+		if (sCont && sCont.dataset.globalStatusColor !== config.color) { sCont.dataset.globalStatusColor = config.color; sCont.style.color = config.color; }
 		
 		if (sIcon) {
-			sIcon.className = config.icon;
-			sIcon.classList.remove('status-pulsing-full');
-			if (state === 'online') sIcon.classList.add('status-pulsing-full');
+			const nextIconClass = `${config.icon}${state === 'online' ? ' status-pulsing-full' : ''}`;
+			if (sIcon.className !== nextIconClass) sIcon.className = nextIconClass;
 		}
 	
-		if (sidebarAvatar) {
+		if (sidebarAvatar && sidebarAvatar.dataset.globalStatusBorder !== config.borderColor) {
+			sidebarAvatar.dataset.globalStatusBorder = config.borderColor;
 			sidebarAvatar.style.border = `2px solid ${config.borderColor}`;
-			sidebarAvatar.style.boxSizing = "border-box";
+			if (sidebarAvatar.style.boxSizing !== "border-box") sidebarAvatar.style.boxSizing = "border-box";
 		}
 	
 		if (gIcon) {
-			const isPs3Active = window.myCurrentPS3Status && (window.myCurrentPS3Status.status === 'playing' || window.myCurrentPS3Status.status === 'idle');
-			gIcon.classList.remove('status-pulsing-soft');
-			if (isPs3Active) {
-				gIcon.style.color = "#4caf50";
-				gIcon.classList.add('status-pulsing-soft');
-			} else {
-				gIcon.style.color = "#ff4444";
+			const isPs3Active = !!(window.myCurrentPS3Status && (window.myCurrentPS3Status.status === 'playing' || window.myCurrentPS3Status.status === 'idle'));
+			const nextGlobalPresenceState = isPs3Active ? 'active' : 'inactive';
+			if (gIcon.dataset.globalPresenceState !== nextGlobalPresenceState) {
+				gIcon.dataset.globalPresenceState = nextGlobalPresenceState;
+				gIcon.classList.toggle('status-pulsing-soft', isPs3Active);
+				const nextColor = isPs3Active ? "#4caf50" : "#ff4444";
+				gIcon.dataset.ps3StatusColor = nextColor;
+				gIcon.style.color = nextColor;
 			}
 		}
 	
 		if (isMyProfileOpen && mText) {
-			mText.innerText = `Status: ${config.text}`;
-			if (mCont) mCont.style.color = config.color;
+			const nextProfileStatusText = `Status: ${config.text}`;
+			if (mText.innerText !== nextProfileStatusText) mText.innerText = nextProfileStatusText;
+			if (mCont && mCont.dataset.globalStatusColor !== config.color) { mCont.dataset.globalStatusColor = config.color; mCont.style.color = config.color; }
 			
 			if (mIcon) {
-				mIcon.className = config.icon;
-				mIcon.classList.remove('status-pulsing-full');
-				if (state === 'online') mIcon.classList.add('status-pulsing-full');
-				mIcon.style.display = "block";
+				const nextModalIconClass = `${config.icon}${state === 'online' ? ' status-pulsing-full' : ''}`;
+				if (mIcon.className !== nextModalIconClass) mIcon.className = nextModalIconClass;
+				if (mIcon.style.display !== "block") mIcon.style.display = "block";
 			}
 	
 			const cardAvatar = document.getElementById('card-avatar');
-			if (cardAvatar) {
+			if (cardAvatar && cardAvatar.dataset.globalStatusBorder !== config.borderColor) {
+				cardAvatar.dataset.globalStatusBorder = config.borderColor;
 				cardAvatar.style.borderColor = config.borderColor;
 			}
 	
@@ -67034,19 +67300,19 @@ function getVisibleChatStackEl(id) {
 			if (playingElem) {
 				const ps3 = window.myCurrentPS3Status;
 				if (state === 'online' && ps3 && (ps3.status === 'playing' || ps3.status === 'idle')) {
-					playingElem.style.display = 'flex';
-					
+					if (playingElem.style.display !== 'flex') playingElem.style.display = 'flex';
 					if (ps3.status === 'playing') {
-						playingElem.style.color = "var(--ps-blue)";
-						playingElem.style.fontWeight = "bold";
-						playingElem.innerHTML = buildProfilePlayingMarkup(ps3, true);
-						startProfilePlayTimeTicker();
+						if (playingElem.dataset.profilePlayingColor !== 'blue') { playingElem.dataset.profilePlayingColor = 'blue'; playingElem.style.color = "var(--ps-blue)"; }
+						if (playingElem.style.fontWeight !== "bold") playingElem.style.fontWeight = "bold";
+						const nextPlayingHtml = buildProfilePlayingMarkup(ps3, true);
+						if (playingElem.innerHTML !== nextPlayingHtml) { playingElem.innerHTML = nextPlayingHtml; startProfilePlayTimeTicker(); }
 					} else {
-						playingElem.style.color = "#ffa500";
-						playingElem.style.fontWeight = "bold";
-						playingElem.innerHTML = `📺 On XMB™`;
+						if (playingElem.dataset.profilePlayingColor !== 'xmb') { playingElem.dataset.profilePlayingColor = 'xmb'; playingElem.style.color = "#ffa500"; }
+						if (playingElem.style.fontWeight !== "bold") playingElem.style.fontWeight = "bold";
+						const xmbHtml = `📺 On XMB™`;
+						if (playingElem.innerHTML !== xmbHtml) playingElem.innerHTML = xmbHtml;
 					}
-				} else {
+				} else if (playingElem.style.display !== 'none') {
 					playingElem.style.display = 'none';
 				}
 			}
@@ -68866,11 +69132,13 @@ function getVisibleChatStackEl(id) {
             previousOverflow = document.body.style.overflow || '';
         }
 
-        document.body.classList.toggle('ps3-pad-page-active', open);
+        if (document.body.classList.contains('ps3-pad-page-active') !== !!open) document.body.classList.toggle('ps3-pad-page-active', !!open);
 
         if (page) {
-            page.setAttribute('aria-hidden', open ? 'false' : 'true');
-            page.classList.toggle('opened-by-button', !!(open && padOpenedByButton));
+            const nextAriaHidden = open ? 'false' : 'true';
+            if (page.getAttribute('aria-hidden') !== nextAriaHidden) page.setAttribute('aria-hidden', nextAriaHidden);
+            const nextOpenedByButton = !!(open && padOpenedByButton);
+            if (page.classList.contains('opened-by-button') !== nextOpenedByButton) page.classList.toggle('opened-by-button', nextOpenedByButton);
         }
 
         if (!open) {
@@ -68885,7 +69153,8 @@ function getVisibleChatStackEl(id) {
             const status = document.getElementById('ps3-pad-page-status');
 
             if (status) {
-                status.textContent = ip ? `Connected • ${ip}` : 'Connected';
+                const nextStatusText = ip ? `Connected • ${ip}` : 'Connected';
+                if (status.textContent !== nextStatusText) status.textContent = nextStatusText;
             }
 
             if (!padRefreshTimer) {
