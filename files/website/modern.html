@@ -22130,11 +22130,18 @@ P
 					});
 					return;
 				}
-				mutation.removedNodes.forEach(node => forEachCollectionMemoryImage(node, unregisterCollectionMemoryImage));
+				mutation.removedNodes.forEach(node => {
+					if (!node || node.nodeType !== 1) return;
+					if (node.dataset?.collectionMemoryObserver) unregisterCollectionMemoryImage(node);
+					node.querySelectorAll?.('[data-collection-memory-observer]').forEach(unregisterCollectionMemoryImage);
+				});
 				mutation.addedNodes.forEach(node => forEachCollectionMemoryImage(node, registerCollectionMemoryImage));
 			});
 		});
-		collectionMemoryObservers.mutations.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['src'] });
+		['database-grid', 'wishlist-grid', 'ps3-local-grid', 'ps3-favs-grid', 'downloads-list'].forEach(id => {
+			const root = document.getElementById(id);
+			if (root) collectionMemoryObservers.mutations.observe(root, { childList: true, subtree: true, attributes: true, attributeFilter: ['src'] });
+		});
 
 		document.addEventListener('load', onCollectionMemoryImageLoad, true);
 	}
@@ -30498,6 +30505,7 @@ P
 			const index = entry.sourceIndex;
 			let dl = entry.item;
 			dl = (typeof window.sanitizeDownloadCoverRecord === 'function') ? window.sanitizeDownloadCoverRecord(dl, 'downloads') : dl;
+			const identity = getDownloadPlayTogetherIdentity(dl);
 			const newClass = dl.isNew ? 'is-new' : '';
 			const downloadRealtimeKey = getDownloadNotificationItemKey(dl);
 			const downloadRealtimeKeyAttr = String(downloadRealtimeKey || '').replace(/[&<>"]/g, ch => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;' })[ch]);
@@ -39616,9 +39624,14 @@ P
 	}
 
 	function refreshLocalPs3PlayTimeTickerState() {
-		if (isLocalPs3PlayTimeTickerNeeded()) return startLocalPs3PlayTimeTicker();
-		stopLocalPs3PlayTimeTicker();
-		return false;
+		const targets = getVisibleLocalPs3PlayTimeTargets();
+		if (!isLocalPs3PlayTimeTickerNeeded(targets)) {
+			stopLocalPs3PlayTimeTicker();
+			return false;
+		}
+		refreshLocalPs3PlayTimeDisplays(targets);
+		if (window.__localPs3PlayTimeTicker) return true;
+		return startLocalPs3PlayTimeTicker();
 	}
 
 	function syncLocalPs3PlayTimeClock(playTime, updatedAt = Date.now(), titleId = '') {
@@ -39890,7 +39903,11 @@ P
 			const timeoutId = setTimeout(() => controller.abort(), 3000);
 			const res = await fetch(`http://${ip}/cpursx.ps3`, { signal: controller.signal, cache: 'no-store' });
 			const html = await res.text();
-			if (typeof updateConsoleDashboardFromWebmanHtml === 'function') updateConsoleDashboardFromWebmanHtml(html, true);
+			window.__latestWebmanHealthHtml = html;
+			const monitorLiveVisible = typeof isVisibleConsoleLibrarySection === 'function'
+				? (isVisibleConsoleLibrarySection('view-library') && isVisibleConsoleLibrarySection('subview-monitor'))
+				: false;
+			if (monitorLiveVisible && typeof updateConsoleDashboardFromWebmanHtml === 'function') updateConsoleDashboardFromWebmanHtml(html, true);
 			clearTimeout(timeoutId);
 
 			ps3ConnectionMisses = 0;
@@ -40020,6 +40037,7 @@ P
 		syncBrowseRemoteDownloadStatusFromIpDot();
 		if (typeof updateAutomaticLibraryScanStatus === 'function') updateAutomaticLibraryScanStatus(isConnected);
 		if (typeof window.refreshVisibleFavoriteCardsFromProfileSync === 'function') window.refreshVisibleFavoriteCardsFromProfileSync();
+		if (typeof window.refreshStoreInstalledChecks === 'function') window.refreshStoreInstalledChecks();
 
 		if (!isVisibleConsoleLibrarySection('view-library')) return;
 
@@ -45973,7 +45991,10 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 		navMonitor?.classList.add('active');
 		
 		if (searchBar) searchBar.style.display = 'none';
-		libraryOpenWork = () => { if (typeof updateConsoleDashboardUI === 'function') updateConsoleDashboardUI(); };
+		libraryOpenWork = () => {
+			if (window.__latestWebmanHealthHtml && typeof updateConsoleDashboardFromWebmanHtml === 'function') updateConsoleDashboardFromWebmanHtml(window.__latestWebmanHealthHtml, true);
+			if (typeof updateConsoleDashboardUI === 'function') updateConsoleDashboardUI();
+		};
 	}
 	else if (type === 'files') {
 		nextView = filesView;
@@ -71318,23 +71339,38 @@ function getVisibleChatStackEl(id) {
 		return cleanId(item && (item.id || item.titleId || item.titleID || item.titleid));
 	}
 
+	var relatedBaseGameIndex = null;
+	var relatedBaseGameIndexState = '';
+
+	function getRelatedBaseGameIndex(){
+		var cache = window.psnStoreCache || {};
+		var cats = ['games', 'apps', 'demos'];
+		var state = cats.map(function(cat){
+			var bucket = cache[cat];
+			return cat + ':' + (Array.isArray(bucket) ? bucket.length : -1) + ':' + String(bucket && bucket.__relatedIndexVersion || '');
+		}).join('|');
+		if (relatedBaseGameIndex && relatedBaseGameIndexState === state) return relatedBaseGameIndex;
+
+		var index = new Map();
+		for (var c = 0; c < cats.length; c++) {
+			var cat = cats[c];
+			var bucket = cache[cat];
+			if (!Array.isArray(bucket)) continue;
+			for (var i = 0; i < bucket.length; i++) {
+				var item = bucket[i];
+				var id = getItemId(item);
+				if (id && !index.has(id)) index.set(id, { category: cat, item: item });
+			}
+		}
+		relatedBaseGameIndex = index;
+		relatedBaseGameIndexState = state;
+		return index;
+	}
+
 	function findRelatedBaseGame(titleId){
 		var id = cleanId(titleId);
 		if (!id || !window.psnStoreCache) return null;
-
-		var cats = ['games', 'apps', 'demos'];
-		for (var c = 0; c < cats.length; c++) {
-			var cat = cats[c];
-			var bucket = window.psnStoreCache[cat];
-			if (!Array.isArray(bucket)) continue;
-
-			for (var i = 0; i < bucket.length; i++) {
-				var item = bucket[i];
-				if (getItemId(item) === id) return { category: cat, item: item };
-			}
-		}
-
-		return null;
+		return getRelatedBaseGameIndex().get(id) || null;
 	}
 
 	function getRelatedName(related, fallbackId){
@@ -71851,11 +71887,6 @@ function getVisibleChatStackEl(id) {
 		var modal = document.getElementById('game-modal');
 		if (modal) observer.observe(modal, { childList: true, subtree: true });
 
-		var statusIcon = document.getElementById('global-status-icon');
-		if (statusIcon) {
-			var installedStatusObserver = new MutationObserver(function(){ if (!window.__baseGameTitleIdLinkDecorating) processUiSoon(); });
-			installedStatusObserver.observe(statusIcon, { attributes: true, attributeFilter: ['class', 'style'] });
-		}
 	}
 
 	window.addEventListener('load', processUiSoon);
