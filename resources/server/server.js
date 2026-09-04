@@ -5958,6 +5958,7 @@ async function initProfileSyncNotifications() {
 
       if (message.channel === 'chat_sync_notify') {
         chatSyncWakeRequested = true;
+        scheduleImmediateChatSyncFromNotify();
         return;
       }
 
@@ -8022,10 +8023,21 @@ function getPostAuthRemainingDelay(socket, totalDelayMs) {
 const CHAT_SYNC_LISTEN_FALLBACK_MS = Math.max(15000, parseInt(process.env.CHAT_SYNC_LISTEN_FALLBACK_MS || '30000', 10) || 30000);
 let chatSyncWakeRequested = false;
 let chatSyncLastFallbackAt = 0;
+let chatSyncImmediateScheduled = false;
+
+function scheduleImmediateChatSyncFromNotify() {
+  if (chatSyncImmediateScheduled) return;
+  chatSyncImmediateScheduled = true;
+  setImmediate(() => {
+    chatSyncImmediateScheduled = false;
+    chatPollIntervalTask();
+  });
+}
 
 async function runChatSyncFallback() {
   const now = Date.now();
-  if (profileSyncListenReady && !chatSyncWakeRequested && chatSyncLastFallbackAt && now - chatSyncLastFallbackAt < CHAT_SYNC_LISTEN_FALLBACK_MS) return;
+  const wasWakeRequested = chatSyncWakeRequested;
+  if (profileSyncListenReady && !wasWakeRequested && chatSyncLastFallbackAt && now - chatSyncLastFallbackAt < CHAT_SYNC_LISTEN_FALLBACK_MS) return;
   chatSyncWakeRequested = false;
   chatSyncLastFallbackAt = now;
   await syncChatAcrossInstances();
@@ -10074,7 +10086,10 @@ io.on('connection', (socket) => {
 
   socket.on('admin_request_chat_controls', async (data, callback) => {
     try {
-      await refreshAdminStateThrottled(3000);
+      const visualSync = !!(data && data.visualSync === true);
+      const now = Date.now();
+      const shouldRefreshFromDb = !visualSync || !profileSyncListenReady || !adminStateLastRefreshAt || now - adminStateLastRefreshAt >= ADMIN_STATE_LISTEN_FALLBACK_MS;
+      if (shouldRefreshFromDb) await refreshAdminStateThrottled(3000);
       const payload = adminState.chatControls || normalizeChatControls({});
       const comparable = [!!payload.locked, Math.max(0, Math.min(600, parseInt(payload.slowSeconds || 0, 10) || 0)), String(payload.by || ''), String(payload.at || '')];
       const stateSignature = stableStringifySmall(comparable);
