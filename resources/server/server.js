@@ -88,6 +88,10 @@ let profileSyncReconnectTimer = null;
 let onlineListCache = null;
 let onlineListCacheAt = 0;
 let lastBroadcastOnlineListSignature = "";
+const lastProfileCountsSignatureByUser = new Map();
+const lastPublicProfileSignatureByUser = new Map();
+let lastBroadcastTrendingSignature = "";
+let lastBroadcastGlobalTrophyStatsSignature = "";
 
 function invalidateOnlineListCache(reason = "") {
   onlineListCache = null;
@@ -2334,8 +2338,18 @@ function mergeProfileSettingsByTimestamp(currentSettings = {}, incomingSettings 
 }
 
 function emitPublicProfileBannerUpdate(name, user = null) {
-  if (!name || !user) return;
+  if (!name || !user) return false;
   const settingsData = getPublicProfileSettings(user);
+  const publicSignature = stableStringifySmall([
+    settingsData.profileCardStyle || '',
+    settingsData.profileCardEffect || '',
+    normalizeTimestampValue(settingsData.profileCardStyleUpdatedAt) || 0,
+    settingsData.themeColor || '',
+    normalizeTimestampValue(settingsData.themeColorUpdatedAt) || 0,
+    settingsData.countryCode || ''
+  ]);
+  if (lastPublicProfileSignatureByUser.get(name) === publicSignature) return false;
+  lastPublicProfileSignatureByUser.set(name, publicSignature);
   io.emit("profile_public_update", {
     name,
     profileUpdatedAt: normalizeTimestampValue(user.profileUpdatedAt) || Date.now(),
@@ -2347,6 +2361,7 @@ function emitPublicProfileBannerUpdate(name, user = null) {
     themeColorUpdatedAt: settingsData.themeColorUpdatedAt,
     countryCode: settingsData.countryCode
   });
+  return true;
 }
 
 function getProfileArrayPayload(value) {
@@ -2719,7 +2734,11 @@ function scheduleTrophyStatsRefreshBroadcast(delayMs = 1500) {
       if (globalTrophyStatsBuildInFlight) await globalTrophyStatsBuildInFlight.catch(() => null);
       invalidateGlobalTrophyStatsCache();
       const stats = await getGlobalTrophyStats({ force: true });
-      io.emit('global_trophy_stats', stats);
+      const statsSignature = stableStringifySmall(stats || {});
+      if (statsSignature !== lastBroadcastGlobalTrophyStatsSignature) {
+        lastBroadcastGlobalTrophyStatsSignature = statsSignature;
+        io.emit('global_trophy_stats', stats);
+      }
     } catch (err) {
       console.error('[TROPHY STATS SCHEDULED REFRESH ERROR]:', err);
     }
@@ -3273,8 +3292,15 @@ async function emitTrendingFromDb(targetSocket = null, options = {}) {
       const estimate = estimateValueBytes(trendingViewPayload, { maxNodes: 20000, maxBytes: 8 * 1024 * 1024 });
       logMemoryTrace('trending:send', `target=${targetSocket && targetSocket.userName ? targetSocket.userName : 'broadcast'} items=${(trendingViewPayload.topDownloads || []).length + (trendingViewPayload.topWishlist || []).length} approx=${formatApproxBytes(estimate.bytes)}${estimate.truncated ? '+' : ''}`);
     }
-    if (targetSocket && targetSocket.connected) targetSocket.emit('trending_data', trendingViewPayload);
-    else io.emit('trending_data', trendingViewPayload);
+    if (targetSocket && targetSocket.connected) {
+      targetSocket.emit('trending_data', trendingViewPayload);
+    } else {
+      const trendingSignature = stableStringifySmall(trendingViewPayload);
+      if (trendingSignature !== lastBroadcastTrendingSignature) {
+        lastBroadcastTrendingSignature = trendingSignature;
+        io.emit('trending_data', trendingViewPayload);
+      }
+    }
     return payload;
   } catch (err) {
     console.error('[TRENDING DB EMIT ERROR]:', err);
@@ -5671,9 +5697,9 @@ function emitProfileSyncPatchFromUser(name, user = {}, changedKeys = [], sourceS
 }
 
 function emitProfileCountsUpdate(name, user = null) {
-  if (!name) return;
+  if (!name) return false;
   const source = user || userDatabase[name];
-  if (!source) return;
+  if (!source) return false;
   const payload = {
     name,
     downloads: Array.isArray(source.downloadsData) ? source.downloadsData.length : Number(source.downloads || 0),
@@ -5683,8 +5709,12 @@ function emitProfileCountsUpdate(name, user = null) {
     library: Array.isArray(source.libraryData) ? source.libraryData.length : Number(source.library || 0),
     profileUpdatedAt: normalizeTimestampValue(source.profileUpdatedAt) || Date.now()
   };
+  const countsSignature = stableStringifySmall([payload.downloads, payload.wishlist, payload.favorites, payload.trophies, payload.library]);
+  if (lastProfileCountsSignatureByUser.get(name) === countsSignature) return false;
+  lastProfileCountsSignatureByUser.set(name, countsSignature);
   trackBandwidthPayload('profile_counts_update', payload, io.sockets.sockets.size);
   io.emit('profile_counts_update', payload);
+  return true;
 }
 
 function buildPresenceUpdatePayload(name, user = null) {
@@ -5984,6 +6014,10 @@ async function initProfileSyncNotifications() {
         if (incomingTitleId && currentTitleId && incomingTitleId !== currentTitleId) return;
 
         const updatedAt = normalizeTimestampValue(data.playTimeUpdatedAt) || Date.now();
+        const currentUpdatedAt = normalizeTimestampValue(currentStatus.playTimeUpdatedAt) || 0;
+        const currentPlayTime = normalizePs3PlayTimeServer(currentStatus.playTime);
+        if (currentUpdatedAt && updatedAt < currentUpdatedAt) return;
+        if (currentUpdatedAt === updatedAt && currentPlayTime === playTime) return;
         userDatabase[name].ps3Status = {
           ...currentStatus,
           playTime,
@@ -7805,7 +7839,9 @@ const io = new Server(server, {
 });
 
 async function syncAdminStateAcrossInstances() {
-  const previous = JSON.stringify(adminState);
+  const previousMaintenance = JSON.stringify(normalizeMaintenanceState(adminState.maintenance || {}));
+  const previousChatControls = JSON.stringify(normalizeChatControls(adminState.chatControls || {}));
+  const previousPinnedAnnouncement = JSON.stringify(adminState.pinnedAnnouncement || null);
   const adminConnected = hasAdminSockets();
   const previousServerLog = adminConnected ? JSON.stringify(serverLog) : "";
 
@@ -7813,17 +7849,22 @@ async function syncAdminStateAcrossInstances() {
 
   if (adminConnected) {
     await refreshServerLogFromDb();
-
-    if (JSON.stringify(serverLog) !== previousServerLog) {
-      emitToAdmins('admin_server_log_list', serverLog);
-    }
+    if (JSON.stringify(serverLog) !== previousServerLog) emitToAdmins('admin_server_log_list', serverLog);
   }
 
-  if (JSON.stringify(adminState) === previous) return;
+  const maintenanceChanged = JSON.stringify(normalizeMaintenanceState(adminState.maintenance || {})) !== previousMaintenance;
+  const chatControlsChanged = JSON.stringify(normalizeChatControls(adminState.chatControls || {})) !== previousChatControls;
+  const pinnedAnnouncementChanged = JSON.stringify(adminState.pinnedAnnouncement || null) !== previousPinnedAnnouncement;
+  if (!maintenanceChanged && !chatControlsChanged && !pinnedAnnouncementChanged) return;
 
-  io.emit('maintenance_mode', adminState.maintenance);
-  io.emit('chat_controls', adminState.chatControls);
-  io.emit('admin_pinned_announcement', adminState.pinnedAnnouncement || { clear: true });
+  if (maintenanceChanged) io.emit('maintenance_mode', adminState.maintenance);
+  if (chatControlsChanged) {
+    io.emit('chat_controls', adminState.chatControls);
+    io.emit('admin_chat_controls', adminState.chatControls);
+    emitToAdmins('admin_chat_controls_state', adminState.chatControls);
+  }
+  if (pinnedAnnouncementChanged) io.emit('admin_pinned_announcement', adminState.pinnedAnnouncement || { clear: true });
+
   emitToAdmins('admin_state', {
     maintenance: adminState.maintenance,
     chatControls: adminState.chatControls,
@@ -8813,10 +8854,12 @@ io.on('connection', (socket) => {
         const summary = await getGamePlayersSummaryForUser(name, titleId);
         const payload = { ok: true, titleId, mode, enabled: result.enabled === true, ...summary };
         trackBandwidthPayload('game_players_play_together', payload, 1);
-        const statePayload = { titleId, enabled: result.enabled === true };
-        const stateRecipients = getSocketsByUserName(name).filter(client => client && client.connected);
-        trackBandwidthPayload('game_play_together_state', statePayload, stateRecipients.length);
-        stateRecipients.forEach(client => client.emit('game_play_together_state', statePayload));
+        if (result.changed === true) {
+          const statePayload = { titleId, enabled: result.enabled === true };
+          const stateRecipients = getSocketsByUserName(name).filter(client => client && client.connected);
+          trackBandwidthPayload('game_play_together_state', statePayload, stateRecipients.length);
+          stateRecipients.forEach(client => client.emit('game_play_together_state', statePayload));
+        }
         respond(payload);
         return;
       }
@@ -9831,6 +9874,16 @@ io.on('connection', (socket) => {
         by: socket.userName || (data && data.by) || "Admin",
         at: new Date().toISOString()
       });
+      const currentMaintenance = normalizeMaintenanceState(adminState.maintenance || {});
+      const maintenanceComparable = state => stableStringifySmall([
+        !!state.manualEnabled,
+        String(state.message || ''),
+        state.scheduleSuppressedUntil || null,
+        state.schedule || null
+      ]);
+      if (maintenanceComparable(currentMaintenance) === maintenanceComparable(nextMaintenance)) {
+        return respond({ success: true, state: currentMaintenance, unchanged: true });
+      }
 
       await saveAdminState(ADMIN_STATE_KEYS.maintenance, nextMaintenance);
       adminState.maintenance = nextMaintenance;
@@ -9871,9 +9924,14 @@ io.on('connection', (socket) => {
     try {
       await refreshAdminStateThrottled(3000);
       const payload = adminState.chatControls || normalizeChatControls({});
-      socket.emit('chat_controls', payload);
-      if (socket.isAdmin === true) socket.emit('admin_chat_controls_state', payload);
-      if (typeof callback === 'function') callback({ success: true, state: payload });
+      const comparable = [!!payload.locked, Math.max(0, Math.min(600, parseInt(payload.slowSeconds || 0, 10) || 0)), String(payload.by || ''), String(payload.at || '')];
+      const stateSignature = stableStringifySmall(comparable);
+      const visualSyncUnchanged = data && data.visualSync === true && String(data.stateSignature || '') === stateSignature;
+      if (!visualSyncUnchanged) {
+        socket.emit('chat_controls', payload);
+        if (socket.isAdmin === true && !(data && data.visualSync === true)) socket.emit('admin_chat_controls_state', payload);
+      }
+      if (typeof callback === 'function') callback({ success: true, state: payload, unchanged: visualSyncUnchanged });
     } catch (err) {
       console.error('[ADMIN CHAT CONTROLS REQUEST ERROR]:', err);
       if (typeof callback === 'function') callback({ success: false, message: 'Server error while loading chat controls.' });
@@ -9897,9 +9955,13 @@ io.on('connection', (socket) => {
         countryStats: socket.isAdmin === true ? getAdminCountryStats() : { total: 0, known: 0, unknown: 0, countries: [] }
       };
       socket.emit('admin_state', payload);
-      socket.emit('maintenance_mode', adminState.maintenance);
-      socket.emit('chat_controls', adminState.chatControls);
-      socket.emit('admin_pinned_announcement', adminState.pinnedAnnouncement || { clear: true });
+      /* Modern clients can request the combined payload only. Keep the legacy component
+         events for older callers that do not advertise combinedOnly. */
+      if (!(data && data.combinedOnly === true)) {
+        socket.emit('maintenance_mode', adminState.maintenance);
+        socket.emit('chat_controls', adminState.chatControls);
+        socket.emit('admin_pinned_announcement', adminState.pinnedAnnouncement || { clear: true });
+      }
       if (typeof callback === 'function') callback({ success: true, state: payload });
     } catch (err) {
       console.error('[ADMIN STATE REQUEST ERROR]:', err);
@@ -9912,11 +9974,16 @@ io.on('connection', (socket) => {
     try {
       if (socket.isAdmin !== true) return respond({ success: false, message: "Admin only." });
 
-      adminState.chatControls = normalizeChatControls({
+      const nextChatControls = normalizeChatControls({
         ...(data || {}),
         by: socket.userName || (data && data.by) || "Admin",
         at: new Date().toISOString()
       });
+      const currentChatControls = normalizeChatControls(adminState.chatControls || {});
+      if (!!currentChatControls.locked === !!nextChatControls.locked && Number(currentChatControls.slowSeconds || 0) === Number(nextChatControls.slowSeconds || 0)) {
+        return respond({ success: true, state: currentChatControls, unchanged: true });
+      }
+      adminState.chatControls = nextChatControls;
 
       await saveAdminState(ADMIN_STATE_KEYS.chatControls, adminState.chatControls);
       deferServerTask('ADMIN CHAT CONTROLS NOTIFY', () => notifyAdminStateAcrossInstances(ADMIN_STATE_KEYS.chatControls, adminState.chatControls), 0);
@@ -9946,13 +10013,19 @@ io.on('connection', (socket) => {
       if (socket.isAdmin !== true) return respond({ success: false, message: "Admin only." });
 
       const shouldClear = !data || data.clear || !normalizeText(data.text, "");
-      adminState.pinnedAnnouncement = shouldClear ? null : {
+      const nextPinnedAnnouncement = shouldClear ? null : {
         id: data.id || `admin-announcement-${Date.now()}`,
         text: normalizeText(data.text, ""),
         color: /^#[0-9a-f]{6}$/i.test(normalizeText(data.color, "")) ? normalizeText(data.color, "").toLowerCase() : "#ffcc00",
         by: socket.userName || data.by || "Admin",
         at: data.at || new Date().toISOString()
       };
+      const currentPinnedAnnouncement = adminState.pinnedAnnouncement || null;
+      const pinnedUnchanged = shouldClear
+        ? currentPinnedAnnouncement === null
+        : !!(currentPinnedAnnouncement && normalizeText(currentPinnedAnnouncement.text, '') === nextPinnedAnnouncement.text && normalizeText(currentPinnedAnnouncement.color, '#ffcc00').toLowerCase() === nextPinnedAnnouncement.color);
+      if (pinnedUnchanged) return respond({ success: true, announcement: currentPinnedAnnouncement, unchanged: true });
+      adminState.pinnedAnnouncement = nextPinnedAnnouncement;
 
       await saveAdminState(ADMIN_STATE_KEYS.pinnedAnnouncement, adminState.pinnedAnnouncement || { clear: true });
       deferServerTask('ADMIN PINNED NOTIFY', () => notifyAdminStateAcrossInstances(ADMIN_STATE_KEYS.pinnedAnnouncement, adminState.pinnedAnnouncement || { clear: true }), 0);
@@ -10132,6 +10205,10 @@ io.on('connection', (socket) => {
         const msg = messageHistory[msgIndex];
         if (msg.type === 'poll' && msg.content) {
             const poll = msg.content;
+            const targetOption = poll.options[data.optionIndex];
+            if (!targetOption) return;
+            const currentVoteIndex = poll.options.findIndex(opt => Array.isArray(opt && opt.voters) && opt.voters.includes(data.user));
+            if (currentVoteIndex === data.optionIndex) return;
             
             poll.options.forEach(opt => {
                 if (opt.voters) {
@@ -10139,8 +10216,8 @@ io.on('connection', (socket) => {
                 }
             });
 
-            if (!poll.options[data.optionIndex].voters) poll.options[data.optionIndex].voters = [];
-            poll.options[data.optionIndex].voters.push(data.user);
+            if (!targetOption.voters) targetOption.voters = [];
+            targetOption.voters.push(data.user);
             
             poll.totalVotes = poll.options.reduce((sum, opt) => sum + (opt.voters ? opt.voters.length : 0), 0);
 
@@ -10205,6 +10282,12 @@ io.on('connection', (socket) => {
         if (canEditTarget) {
             const wasEditedByStaff = (!isOwner && canModerate);
             const wasEditedByAdmin = (!isOwner && isAdmin);
+            const nextText = String(data.newText == null ? '' : data.newText);
+            const nextType = data.content ? (data.type || 'image') : msg.type;
+            const textUnchanged = String(msg.text == null ? '' : msg.text) === nextText;
+            const contentUnchanged = !data.content || stableStringifySmall(msg.content || null) === stableStringifySmall(data.content || null);
+            const typeUnchanged = !data.content || String(msg.type || '') === String(nextType || '');
+            if (textUnchanged && contentUnchanged && typeUnchanged) return;
             
             msg.text = data.newText;
             msg.edited = true;

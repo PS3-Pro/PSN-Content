@@ -12194,6 +12194,9 @@ P
 			if (name === activeName || name === loginName) window.__profileNotificationStateNeedsMigration = true;
 			return false;
 		}
+		window.__profileNotificationStateSignatures = window.__profileNotificationStateSignatures || Object.create(null);
+		const notificationStateSignature = typeof window.getLiveRenderSignature === 'function' ? window.getLiveRenderSignature(state) : JSON.stringify(state);
+		if (!fromLegacy && window.__profileNotificationStateSignatures[name] === notificationStateSignature) return false;
 
 		window.__profileNotificationStateNeedsMigration = fromLegacy || Number(state.version || 0) < Number(PROFILE_NOTIFICATION_STATE_VERSION);
 		const categories = ['downloads', 'wishlist', 'favorites', 'trophies'];
@@ -12257,6 +12260,7 @@ P
 		} finally {
 			window.__applyingProfileNotificationState = false;
 		}
+		if (!fromLegacy) window.__profileNotificationStateSignatures[name] = notificationStateSignature;
 		return true;
 	}
 	window.applyProfileNotificationStateFromServer = applyProfileNotificationStateFromServer;
@@ -26415,6 +26419,7 @@ P
             if (!response || response.ok !== true || response.mode !== 'mine' || !Array.isArray(response.titleIds)) return;
             const nextSet = new Set(response.titleIds.map(normalizeGamePlayersTitleId).filter(Boolean));
             const previousSet = window.__viewerPlayTogetherTitleIds;
+            const wasLoaded = window.__viewerPlayTogetherLoaded === true;
             const changed = previousSet.size !== nextSet.size || Array.from(previousSet).some(titleId => !nextSet.has(titleId));
             window.__viewerPlayTogetherTitleIds = nextSet;
             window.__viewerPlayTogetherLoaded = true;
@@ -26424,7 +26429,8 @@ P
             availability.me = nextSet.size;
             if (typeof window.setSidebarCountPill === 'function') window.setSidebarCountPill('playTogether', nextSet.size);
             if (changed) refreshViewerPlayTogetherVisibleCollections();
-            if (isSocialPlayTogetherSubviewVisible() && (window.__socialPlayTogetherFilter !== 'me' || !changed) && typeof window.renderPlayTogetherSocialPanel === 'function') window.renderPlayTogetherSocialPanel(false);
+            const activeSocialFilter = normalizePlayTogetherSocialFilter(window.__socialPlayTogetherFilter);
+            if (isSocialPlayTogetherSubviewVisible() && activeSocialFilter === 'me' && (!wasLoaded || changed) && typeof window.renderPlayTogetherSocialPanel === 'function') window.renderPlayTogetherSocialPanel(false);
         });
         return true;
     };
@@ -26447,14 +26453,18 @@ P
             state.requestInFlight = false;
             if (String(localStorage.getItem('psn_username') || '') !== requestUser) return;
             if (!response || response.ok !== true || response.mode !== filter || !Array.isArray(response.items)) return;
-            state.entries = response.items;
+            const wasLoaded = state.loaded === true;
+            const previousEntriesSignature = typeof window.getLiveRenderSignature === 'function' ? window.getLiveRenderSignature(state.entries || []) : JSON.stringify(state.entries || []);
+            const nextEntriesSignature = typeof window.getLiveRenderSignature === 'function' ? window.getLiveRenderSignature(response.items) : JSON.stringify(response.items);
+            const entriesChanged = previousEntriesSignature !== nextEntriesSignature;
+            if (entriesChanged) state.entries = response.items;
             state.loaded = true;
             state.fetchedAt = Date.now();
             const availability = getSocialPlayTogetherAvailability(requestUser);
             if (availability.user === requestUser && availability.loaded === true) availability[filter] = state.entries.length;
             const activeFilter = normalizePlayTogetherSocialFilter(window.__socialPlayTogetherFilter);
             const affectsVisibleFilter = activeFilter === filter || (filter === 'friends' && activeFilter === 'others');
-            if (isSocialPlayTogetherSubviewVisible() && affectsVisibleFilter && typeof window.renderPlayTogetherSocialPanel === 'function') {
+            if (isSocialPlayTogetherSubviewVisible() && affectsVisibleFilter && (!wasLoaded || entriesChanged) && typeof window.renderPlayTogetherSocialPanel === 'function') {
                 window.renderPlayTogetherSocialPanel(false);
             }
         });
@@ -26470,6 +26480,8 @@ P
 
         const nextEnabled = button.dataset.active !== '1';
         const previousSummaryEntry = getGamePlayersSummaryCacheEntry(titleId);
+        const social = modalRoot.querySelector('.game-player-social');
+        if (social) delete social.dataset.gamePlayersPillSignature;
         button.disabled = true;
         button.innerHTML = `<i class="fas fa-circle-notch fa-spin"></i><span class="game-play-together-label">${nextEnabled ? 'Enabling...' : 'Disabling...'}</span>`;
         if (typeof playUiClick === 'function') playUiClick();
@@ -26548,6 +26560,22 @@ P
         const canPlayTogether = String(modalRoot.dataset.storeCategory || '').toLowerCase() === 'games' && !!titleId;
         const active = summary && summary.viewerPlayTogether === true;
         const playTogetherCount = Math.max(0, Number(summary && summary.playTogetherCount) || 0);
+        const pillPresentation = [
+            titleId || '', gameTitle || '', count,
+            Math.max(0, Number(summary && summary.friendCount) || 0),
+            Math.max(0, Number(summary && summary.otherCount) || 0),
+            playTogetherCount,
+            Math.max(0, Number(summary && summary.playTogetherFriendCount) || 0),
+            Math.max(0, Number(summary && summary.playTogetherOwnerCount) || 0),
+            Math.max(0, Number(summary && summary.playTogetherOwnerFriendCount) || 0),
+            summary && summary.viewerOwns === true ? 1 : 0,
+            active ? 1 : 0, canPlayTogether ? 1 : 0,
+            (Array.isArray(summary && summary.preview) ? summary.preview : []).slice(0, 3).map(owner => [owner && owner.name || '', owner && owner.avatar || '', owner && owner.online === true ? 1 : 0, owner && owner.isFriend === true ? 1 : 0])
+        ];
+        const nextPillPresentationSignature = typeof window.getLiveRenderSignature === 'function' ? window.getLiveRenderSignature(pillPresentation) : JSON.stringify(pillPresentation);
+        const controlIsTransient = playTogetherButton.disabled === true || !!playTogetherButton.querySelector('.fa-spin');
+        if (!controlIsTransient && social.dataset.gamePlayersPillSignature === nextPillPresentationSignature) return;
+        social.dataset.gamePlayersPillSignature = nextPillPresentationSignature;
 
         if (count) {
             const preview = (Array.isArray(summary.preview) ? summary.preview : [])
@@ -26573,6 +26601,7 @@ P
             if (avatars) {
                 const existingByName = new Map(Array.from(avatars.querySelectorAll('.game-player-owner-avatar')).map(img => [String(img.dataset.user || ''), img]));
                 const keepNames = new Set();
+                let cursor = avatars.firstElementChild;
                 preview.forEach(owner => {
                     const name = String(owner.name || '');
                     if (!name) return;
@@ -26585,8 +26614,9 @@ P
                         img.alt = name;
                     }
                     const avatar = String(owner.avatar || '');
-                    if (avatar && img.getAttribute('src') !== avatar) img.src = avatar;
-                    avatars.appendChild(img);
+                    if (avatar && img.getAttribute('src') !== avatar) img.setAttribute('src', avatar);
+                    if (img !== cursor) avatars.insertBefore(img, cursor);
+                    cursor = img.nextElementSibling;
                 });
                 existingByName.forEach((img, name) => { if (!keepNames.has(name)) img.remove(); });
             }
@@ -33234,12 +33264,15 @@ P
 		}
 		try {
 			adminSetChatControlsSyncState('syncing');
-			socketChat.emit('admin_request_chat_controls', { at: Date.now() });
+			const requestedAt = Date.now();
 			if (document.body.classList.contains('is-admin')) {
-				socketChat.emit('admin_request_admin_state', { at: Date.now() });
-				socketChat.emit('admin_request_server_log');
+				/* One combined request already contains chat controls, maintenance, pinned, reports,
+				   server log and country stats. Do not ask for the overlapping pieces again. */
+				socketChat.emit('admin_request_admin_state', { at: requestedAt, combinedOnly: true });
+			} else {
+				socketChat.emit('admin_request_chat_controls', { at: requestedAt });
 			}
-			window.adminChatControlsLastRequested = Date.now();
+			window.adminChatControlsLastRequested = requestedAt;
 			setTimeout(() => {
 				if (window.adminChatControlsSyncState === 'syncing' && Date.now() - (window.adminChatControlsLastRequested || 0) > 2400) {
 					adminSetChatControlsSyncState((typeof socketChat !== 'undefined' && socketChat && socketChat.connected) ? 'live' : 'offline');
@@ -33642,7 +33675,9 @@ P
 	function adminEmitChatControlsVisualSync() {
 		try {
 			if (typeof socketChat !== 'undefined' && socketChat && socketChat.connected) {
-				socketChat.emit('admin_request_chat_controls', { visualSync: true, at: Date.now() });
+				const state = typeof window.adminGetChatControls === 'function' ? window.adminGetChatControls() : {};
+				const stateSignature = JSON.stringify([!!state.locked, Math.max(0, Math.min(600, parseInt(state.slowSeconds || 0, 10) || 0)), String(state.by || ''), String(state.at || '')]);
+				socketChat.emit('admin_request_chat_controls', { visualSync: true, stateSignature, at: Date.now() });
 				return true;
 			}
 		} catch (e) {}
@@ -33674,8 +33709,13 @@ P
 	}
 
 	function adminSendChatControlsToServer(nextState, localLogMessage = '') {
+		const currentControls = typeof window.adminGetChatControls === 'function' ? window.adminGetChatControls() : { locked:false, slowSeconds:0 };
+		const nextLocked = nextState && nextState.locked === true;
+		const nextSlowSeconds = Math.max(0, Math.min(600, parseInt(nextState && nextState.slowSeconds || 0, 10) || 0));
+		const controlsAlreadySynced = window.adminChatControlsSyncState === 'synced' || window.adminChatControlsSyncState === 'live';
+		if (controlsAlreadySynced && !!currentControls.locked === nextLocked && Math.max(0, parseInt(currentControls.slowSeconds || 0, 10) || 0) === nextSlowSeconds) return currentControls;
 		adminSetChatControlsSyncState('syncing');
-		const optimistic = adminSetChatControls({ ...nextState, source: 'pending' }, false);
+		const optimistic = adminSetChatControls({ ...nextState, locked:nextLocked, slowSeconds:nextSlowSeconds, source: 'pending' }, false);
 		if (!(typeof socketChat !== 'undefined' && socketChat && socketChat.connected)) {
 			if (typeof playUiError === 'function') playUiError();
 			adminSetChatControlsSyncState('offline');
@@ -35439,20 +35479,22 @@ P
         const isAllowedView = isBrowse || isWishlist || isDownloads || isLibraryAllowed;
 
         if (!isAllowedView) {
-            scrollBtnsContainer.style.display = 'none';
+            if (scrollBtnsContainer.style.display !== 'none') scrollBtnsContainer.style.display = 'none';
             return;
         }
 
         if (scrollArea.scrollHeight <= scrollArea.clientHeight + 50) {
-            scrollBtnsContainer.style.display = 'none';
+            if (scrollBtnsContainer.style.display !== 'none') scrollBtnsContainer.style.display = 'none';
             return;
         }
 
-        scrollBtnsContainer.style.display = 'flex';
-        btnTop.style.display = scrollArea.scrollTop > 300 ? 'flex' : 'none';
+        if (scrollBtnsContainer.style.display !== 'flex') scrollBtnsContainer.style.display = 'flex';
+        const nextTopDisplay = scrollArea.scrollTop > 300 ? 'flex' : 'none';
+        if (btnTop.style.display !== nextTopDisplay) btnTop.style.display = nextTopDisplay;
 
         const distanceToBottom = scrollArea.scrollHeight - scrollArea.scrollTop - scrollArea.clientHeight;
-        btnBottom.style.display = distanceToBottom > 300 ? 'flex' : 'none';
+        const nextBottomDisplay = distanceToBottom > 300 ? 'flex' : 'none';
+        if (btnBottom.style.display !== nextBottomDisplay) btnBottom.style.display = nextBottomDisplay;
     }
 
    let scrollButtonsVisibilityFrame = 0;
@@ -35471,7 +35513,9 @@ P
         scrollUiFrame = requestAnimationFrame(() => {
             scrollUiFrame = 0;
             const scrolled = scrollArea.scrollTop > 90;
-            browseToolbars.forEach(tb => tb.classList.toggle('scrolled', scrolled));
+            browseToolbars.forEach(tb => {
+                if (tb.classList.contains('scrolled') !== scrolled) tb.classList.toggle('scrolled', scrolled);
+            });
             if (scrollButtonsVisibilityFrame) {
                 cancelAnimationFrame(scrollButtonsVisibilityFrame);
                 scrollButtonsVisibilityFrame = 0;
@@ -44959,7 +45003,12 @@ function formatLibraryLastPlayedBadge(game = {}) {
 		const total = parseConsoleNumber(text, /Total[^0-9]{0,30}(\d+(?:[\.,]\d+)?)\s*GB/i);
 		const liveMode = parseConsoleFanModeFromText(text, loadState(STORAGE_KEY_CONSOLE_FAN_MODE) || 'dynamic');
 		const livePerformanceClocks = parseConsolePerformanceClocksFromText(text);
-		updateConsoleRuntimeUI(parseConsoleRuntimeFromWebmanHtml(html));
+		const nextRuntime = parseConsoleRuntimeFromWebmanHtml(html);
+		const nextRuntimeSignature = typeof window.getLiveRenderSignature === 'function' ? window.getLiveRenderSignature(nextRuntime) : JSON.stringify(nextRuntime);
+		if (window.__consoleRuntimeLiveSignature !== nextRuntimeSignature) {
+			window.__consoleRuntimeLiveSignature = nextRuntimeSignature;
+			updateConsoleRuntimeUI(nextRuntime);
+		}
 		const nextSystemInfo = parseConsoleSystemInfoFromWebmanHtml(html);
 		const nextSystemInfoSignature = typeof window.getLiveRenderSignature === 'function' ? window.getLiveRenderSignature(nextSystemInfo) : JSON.stringify(nextSystemInfo);
 		if (window.__consoleSystemInfoLiveSignature !== nextSystemInfoSignature) {
@@ -44968,7 +45017,14 @@ function formatLibraryLastPlayedBadge(game = {}) {
 		}
 		/* Library mapping is independent from the 5s webMAN health ping.
 		   It is refreshed when the library actually changes or when System Monitor opens. */
-		if (cpu || rsx) updateConsoleTempsUI(cpu || 64, rsx || 61);
+		if (cpu || rsx) {
+			const nextTempState = [cpu || 64, rsx || 61];
+			const nextTempSignature = typeof window.getLiveRenderSignature === 'function' ? window.getLiveRenderSignature(nextTempState) : JSON.stringify(nextTempState);
+			if (window.__consoleTempsLiveSignature !== nextTempSignature) {
+				window.__consoleTempsLiveSignature = nextTempSignature;
+				updateConsoleTempsUI(nextTempState[0], nextTempState[1]);
+			}
+		}
 		if (!isConsoleCoolingUiHeld()) {
 			if (target && String(loadState(STORAGE_KEY_CONSOLE_FAN_TARGET) || '') !== String(target)) saveState(STORAGE_KEY_CONSOLE_FAN_TARGET, String(target));
 			if (fan || target) updateConsoleFanUI(fan || loadState(STORAGE_KEY_CONSOLE_FAN_SPEED) || 35, liveMode, target || null);
@@ -47581,16 +47637,20 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 		const input = document.getElementById('chat-input');
 
 		if (sendBtn) {
-			sendBtn.classList.toggle('chat-upload-waiting', isPending);
-			sendBtn.setAttribute('aria-disabled', isPending ? 'true' : 'false');
-			sendBtn.title = isPending ? 'Wait for the image upload/update to finish' : '';
+			if (sendBtn.classList.contains('chat-upload-waiting') !== isPending) sendBtn.classList.toggle('chat-upload-waiting', isPending);
+			const nextAriaDisabled = isPending ? 'true' : 'false';
+			if (sendBtn.getAttribute('aria-disabled') !== nextAriaDisabled) sendBtn.setAttribute('aria-disabled', nextAriaDisabled);
+			const nextTitle = isPending ? 'Wait for the image upload/update to finish' : '';
+			if (sendBtn.title !== nextTitle) sendBtn.title = nextTitle;
 		}
 
-		if (input) input.classList.toggle('chat-upload-waiting', isPending);
+		if (input && input.classList.contains('chat-upload-waiting') !== isPending) input.classList.toggle('chat-upload-waiting', isPending);
 
 		if (attachBtn) {
-			attachBtn.classList.toggle('is-active', isPending || pendingImages.length > 0);
-			attachBtn.innerHTML = '<i class="fas fa-paperclip"></i>';
+			const nextActive = isPending || pendingImages.length > 0;
+			if (attachBtn.classList.contains('is-active') !== nextActive) attachBtn.classList.toggle('is-active', nextActive);
+			const nextAttachHtml = '<i class="fas fa-paperclip"></i>';
+			if (attachBtn.innerHTML !== nextAttachHtml) attachBtn.innerHTML = nextAttachHtml;
 		}
 	}
 
@@ -47826,8 +47886,9 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
     }
     window.isChatPresenceUiReady = isChatPresenceUiReady;
 
-    function applyChatPresenceUiRefresh(users = window.currentOnlineList || []) {
+    function applyChatPresenceUiRefresh(users = window.currentOnlineList || [], onlyUserName = '') {
         if (!Array.isArray(users)) users = [];
+        const targetUserName = String(onlyUserName || '').trim();
         const onlineUserByName = new Map();
         users.forEach(user => {
             const name = user && typeof user === 'object' ? user.name : user;
@@ -47845,7 +47906,10 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
         const isChatVisibleForPresence = typeof isChatScreenVisibleForRead === 'function' && isChatScreenVisibleForRead();
         const canHydrateMessageAvatars = !isChatVisibleForPresence || !avatarHydrationBlockedUntil || Date.now() >= avatarHydrationBlockedUntil;
 
-        document.querySelectorAll('.chat-status-dot').forEach(dot => {
+        const statusDots = targetUserName
+            ? document.querySelectorAll(`.chat-status-dot[data-user="${targetUserName}"]`)
+            : document.querySelectorAll('.chat-status-dot');
+        statusDots.forEach(dot => {
             const dotUser = dot.getAttribute('data-user');
             const dotUserData = onlineUserByName.get(dotUser);
             const isOnline = (dotUser === myChatName && socketOnline)
@@ -47858,7 +47922,10 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
             dot.style.color = isOnline ? '#4caf50' : 'rgba(255, 255, 255, 0.2)';
         });
 
-        document.querySelectorAll('.chat-avatar-status').forEach(img => {
+        const statusAvatars = targetUserName
+            ? document.querySelectorAll(`.chat-avatar-status[data-user="${targetUserName}"]`)
+            : document.querySelectorAll('.chat-avatar-status');
+        statusAvatars.forEach(img => {
             const imgUser = img.getAttribute('data-user');
             const uData = onlineUserByName.get(imgUser);
             const isMe = (imgUser === myChatName);
@@ -47891,6 +47958,9 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 
         if (!canHydrateMessageAvatars && avatarHydrationBlockedUntil) {
             window.__pendingChatPresenceUiRefresh = true;
+            window.__pendingChatPresenceUserNames = window.__pendingChatPresenceUserNames instanceof Set ? window.__pendingChatPresenceUserNames : new Set();
+            if (targetUserName && window.__pendingChatPresenceFullRefresh !== true) window.__pendingChatPresenceUserNames.add(targetUserName);
+            else { window.__pendingChatPresenceFullRefresh = true; window.__pendingChatPresenceUserNames.clear(); }
             clearTimeout(window.__pendingChatPresenceUiTimer);
             window.__pendingChatPresenceUiTimer = setTimeout(flushPendingChatPresenceUiRefresh, Math.max(180, avatarHydrationBlockedUntil - Date.now() + 60));
         }
@@ -47904,8 +47974,15 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
             window.__pendingChatPresenceUiTimer = setTimeout(flushPendingChatPresenceUiRefresh, 160);
             return;
         }
+        const fullRefresh = window.__pendingChatPresenceFullRefresh === true;
+        const pendingNames = window.__pendingChatPresenceUserNames instanceof Set ? Array.from(window.__pendingChatPresenceUserNames) : [];
         window.__pendingChatPresenceUiRefresh = false;
-        if (typeof applyChatPresenceUiRefresh === 'function') applyChatPresenceUiRefresh(window.currentOnlineList || []);
+        window.__pendingChatPresenceFullRefresh = false;
+        if (window.__pendingChatPresenceUserNames instanceof Set) window.__pendingChatPresenceUserNames.clear();
+        if (typeof applyChatPresenceUiRefresh === 'function') {
+            if (fullRefresh || !pendingNames.length) applyChatPresenceUiRefresh(window.currentOnlineList || []);
+            else pendingNames.forEach(name => applyChatPresenceUiRefresh(window.currentOnlineList || [], name));
+        }
         if (typeof isFriendsSubviewVisible === 'function' && isFriendsSubviewVisible()) {
             if (typeof window.applyCollectionToolbarFilterChange === 'function') window.applyCollectionToolbarFilterChange('friends', { revealNew:false });
             else if (typeof renderFriendsList === 'function') renderFriendsList(document.getElementById('search-input')?.value || '', true);
@@ -47913,8 +47990,12 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
     }
     window.flushPendingChatPresenceUiRefresh = flushPendingChatPresenceUiRefresh;
 
-    function scheduleChatPresenceUiRefresh() {
+    function scheduleChatPresenceUiRefresh(onlyUserName = '') {
         window.__pendingChatPresenceUiRefresh = true;
+        window.__pendingChatPresenceUserNames = window.__pendingChatPresenceUserNames instanceof Set ? window.__pendingChatPresenceUserNames : new Set();
+        const targetUserName = String(onlyUserName || '').trim();
+        if (targetUserName && window.__pendingChatPresenceFullRefresh !== true) window.__pendingChatPresenceUserNames.add(targetUserName);
+        else { window.__pendingChatPresenceFullRefresh = true; window.__pendingChatPresenceUserNames.clear(); }
         clearTimeout(window.__pendingChatPresenceUiTimer);
         window.__pendingChatPresenceUiTimer = setTimeout(flushPendingChatPresenceUiRefresh, 160);
     }
@@ -49227,7 +49308,8 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
             const dateRect = floatingDate.getBoundingClientRect();
             top = Math.max(top, dateRect.bottom - hostRect.top + 8);
         }
-        loader.style.top = `${Math.round(top)}px`;
+        const nextTop = `${Math.round(top)}px`;
+        if (loader.style.top !== nextTop) loader.style.top = nextTop;
         return true;
     }
     window.positionChatLazyInlineLoading = positionChatLazyInlineLoading;
@@ -49254,12 +49336,15 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
             host.appendChild(loader);
         }
         const title = loader.querySelector('.chat-lazy-inline-title');
-        if (title) title.textContent = String(text || 'Loading older messages');
+        const nextTitle = String(text || 'Loading older messages');
+        if (title && title.textContent !== nextTitle) title.textContent = nextTitle;
         positionChatLazyInlineLoading();
-        requestAnimationFrame(() => positionChatLazyInlineLoading());
-        loader.dataset.shownAt = String(Date.now());
-        loader.dataset.active = '1';
-        loader.classList.add('show');
+        if (loader.dataset.active !== '1' || !loader.classList.contains('show')) {
+            requestAnimationFrame(() => positionChatLazyInlineLoading());
+            loader.dataset.shownAt = String(Date.now());
+            loader.dataset.active = '1';
+            loader.classList.add('show');
+        }
         return loader;
     }
     window.showChatLazyInlineLoading = showChatLazyInlineLoading;
@@ -50027,13 +50112,14 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 			const info = getRelativeCalendarInfo(timestamp);
 			if (!info) return;
 			const label = getChatDateLabel(timestamp);
-			divider.dataset.label = label;
-			divider.dataset.chatDayOffset = String(info.diffInDays);
+			const dayOffset = String(info.diffInDays);
+			if (divider.dataset.label !== label) divider.dataset.label = label;
+			if (divider.dataset.chatDayOffset !== dayOffset) divider.dataset.chatDayOffset = dayOffset;
 			const span = divider.querySelector('span');
 			if (span && span.textContent !== label) span.textContent = label;
 		});
-		box.dataset.lastLabel = 'HIDDEN_TOP';
-		box.dataset.lastFloatingLabel = '';
+		if (box.dataset.lastLabel !== 'HIDDEN_TOP') box.dataset.lastLabel = 'HIDDEN_TOP';
+		if (box.dataset.lastFloatingLabel !== '') box.dataset.lastFloatingLabel = '';
 		if (typeof box.onscroll === 'function') box.onscroll();
 	};
 	
@@ -50061,10 +50147,10 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 
 		box.onscroll = () => {
 			const dividers = box.querySelectorAll('.date-divider');
-			if (dividers.length === 0) { 
-				floatingPill.style.display = 'none'; 
+			if (dividers.length === 0) {
+				if (floatingPill.style.display !== 'none') floatingPill.style.display = 'none';
 				if (typeof positionChatLazyInlineLoading === 'function') positionChatLazyInlineLoading();
-				return; 
+				return;
 			}
 	
 			let pinHeight = (pinContainer && pinContainer.style.display !== 'none') ? pinContainer.offsetHeight : 0;
@@ -50075,29 +50161,31 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 			let anyDividerPassed = false;
 	
 			dividers.forEach(div => {
-				if (div.offsetTop <= box.scrollTop + threshold) {
+				const passed = div.offsetTop <= box.scrollTop + threshold;
+				if (passed) {
 					currentLabel = div.getAttribute('data-label') || '';
 					currentIsToday = div.dataset.chatDayOffset === '0';
 					anyDividerPassed = true;
-					div.style.opacity = "0";
-				} else {
-					div.style.opacity = "1";
 				}
+				const nextOpacity = passed ? '0' : '1';
+				if (div.style.opacity !== nextOpacity) div.style.opacity = nextOpacity;
 			});
 
-			box.dataset.lastLabel = currentLabel;
+			if (box.dataset.lastLabel !== currentLabel) box.dataset.lastLabel = currentLabel;
 	
 			if (anyDividerPassed && !currentIsToday && currentLabel !== "HIDDEN_TOP") {
-				floatingPill.querySelector('span').innerText = currentLabel;
-				floatingPill.style.display = 'flex';
-				floatingPill.style.top = threshold + 'px';
+				const floatingSpan = floatingPill.querySelector('span');
+				if (floatingSpan && floatingSpan.innerText !== currentLabel) floatingSpan.innerText = currentLabel;
+				if (floatingPill.style.display !== 'flex') floatingPill.style.display = 'flex';
+				const nextTop = threshold + 'px';
+				if (floatingPill.style.top !== nextTop) floatingPill.style.top = nextTop;
 				if (box.dataset.lastFloatingLabel !== currentLabel) {
 					box.dataset.lastFloatingLabel = currentLabel;
 					if (typeof playUiChatDatePill === 'function') playUiChatDatePill();
 				}
 			} else {
-				box.dataset.lastFloatingLabel = "";
-				floatingPill.style.display = 'none';
+				if (box.dataset.lastFloatingLabel !== '') box.dataset.lastFloatingLabel = '';
+				if (floatingPill.style.display !== 'none') floatingPill.style.display = 'none';
 			}
 			if (typeof positionChatLazyInlineLoading === 'function') positionChatLazyInlineLoading();
 		};
@@ -55856,6 +55944,13 @@ function getVisibleChatStackEl(id) {
 			recentlyVisited: Array.isArray(userData.recentlyVisitedData) ? readRecentlyVisitedGames().slice() : []
 		};
 		const profileSyncChanges = (typeof window.getRemoteProfileSyncChanges === 'function') ? window.getRemoteProfileSyncChanges(userData, previousProfileSyncState) : { trophies: true, wishlist: true, downloads: true, favorites: true, library: true, friends: true, recentlyVisited: true, anyList: true };
+		const previousProfileCountryCode = normalizeProfileCountryCode(localStorage.getItem(`${name}_${STORAGE_KEY_PROFILE_COUNTRY}`) || '');
+		const incomingProfileCountryCode = normalizeProfileCountryCode(userData.countryCode || userData.country_code || userData.country || payload.countryCode || payload.country_code || payload.country || (userData.settingsData && (userData.settingsData.countryCode || userData.settingsData.country_code || userData.settingsData.country)));
+		const profileCountryChanged = !!(incomingProfileCountryCode && previousProfileCountryCode !== incomingProfileCountryCode);
+		const previousProfileCardStyle = typeof readProfileCardStyleLocalValue === 'function' ? readProfileCardStyleLocalValue(name, 'default') : '';
+		const incomingProfileCardStyleRaw = userData.settingsData && (userData.settingsData.profileCardStyle || userData.settingsData.profileCardEffect || userData.settingsData.profileCardTheme) || '';
+		const incomingProfileCardStyle = incomingProfileCardStyleRaw && typeof normalizeProfileCardStyle === 'function' ? normalizeProfileCardStyle(incomingProfileCardStyleRaw) : String(incomingProfileCardStyleRaw || '');
+		const profileCardStyleChanged = !!(incomingProfileCardStyle && previousProfileCardStyle !== incomingProfileCardStyle);
 
 
 		window.__applyingRemoteProfileSync = true;
@@ -55905,7 +56000,7 @@ function getVisibleChatStackEl(id) {
 				if (sidebarAvatar && previousAvatar !== userData.avatar) sidebarAvatar.style.backgroundImage = `url('${userData.avatar}')`;
 			}
 			if (userData.joined) safeLocalStorageSet(`${name}_joined_date`, userData.joined);
-			const incomingCountryCode = normalizeProfileCountryCode(userData.countryCode || userData.country_code || userData.country || payload.countryCode || payload.country_code || payload.country);
+			const incomingCountryCode = incomingProfileCountryCode;
 			if (incomingCountryCode) {
 				safeLocalStorageSet(`${name}_${STORAGE_KEY_PROFILE_COUNTRY}`, incomingCountryCode);
 				if (name === (localStorage.getItem('psn_username') || '')) saveState(STORAGE_KEY_PROFILE_COUNTRY, incomingCountryCode);
@@ -55971,8 +56066,8 @@ function getVisibleChatStackEl(id) {
 					if (nextStoredRole !== 'user') safeLocalStorageSet(`${name}_psn_role`, nextStoredRole);
 					else if (localStorage.getItem(`${name}_psn_role`) !== null) localStorage.removeItem(`${name}_psn_role`);
 				}
-				if (hasAdminSync || hasRoleSync) document.body.classList.toggle('is-admin', nextAdminClass);
-				if (hasModeratorSync || hasRoleSync) document.body.classList.toggle('is-mod', nextModClass);
+				if ((hasAdminSync || hasRoleSync) && document.body.classList.contains('is-admin') !== nextAdminClass) document.body.classList.toggle('is-admin', nextAdminClass);
+				if ((hasModeratorSync || hasRoleSync) && document.body.classList.contains('is-mod') !== nextModClass) document.body.classList.toggle('is-mod', nextModClass);
 			}
 
 			if (profileSyncChanges.library && typeof updateConsoleLibraryStatusUI === 'function') updateConsoleLibraryStatusUI(window.lastScannedGames || []);
@@ -56020,9 +56115,9 @@ function getVisibleChatStackEl(id) {
 						if (cardJoined && cardJoined.innerText !== joinedText) cardJoined.innerText = joinedText;
 					}
 					const hasCountryPatch = Object.prototype.hasOwnProperty.call(userData, 'countryCode') || Object.prototype.hasOwnProperty.call(userData, 'country_code') || Object.prototype.hasOwnProperty.call(userData, 'country') || !!(userData.settingsData && (Object.prototype.hasOwnProperty.call(userData.settingsData, 'countryCode') || Object.prototype.hasOwnProperty.call(userData.settingsData, 'country_code') || Object.prototype.hasOwnProperty.call(userData.settingsData, 'country')));
-					if (hasCountryPatch && typeof renderProfileCountry === 'function') renderProfileCountry(name, userData, true);
+					if (hasCountryPatch && profileCountryChanged && typeof renderProfileCountry === 'function') renderProfileCountry(name, userData, true);
 					const hasStylePatch = !!(userData.settingsData && (userData.settingsData.profileCardStyle || userData.settingsData.profileCardEffect || userData.settingsData.profileCardTheme));
-					if (hasStylePatch && typeof refreshOpenProfileCardStyleForUser === 'function') refreshOpenProfileCardStyleForUser(name);
+					if (hasStylePatch && profileCardStyleChanged && typeof refreshOpenProfileCardStyleForUser === 'function') refreshOpenProfileCardStyleForUser(name);
 					const profileCountUpdates = [];
 					if (profileSyncChanges.downloads) profileCountUpdates.push(['card-downloads', Array.isArray(window.downloadHistory) ? window.downloadHistory.length : 0]);
 					if (profileSyncChanges.wishlist) profileCountUpdates.push(['card-wishlist', Array.isArray(window.wishlist) ? window.wishlist.length : 0]);
@@ -57901,17 +57996,19 @@ function getVisibleChatStackEl(id) {
 			}
 			if (Array.isArray(results)) {
 				window.__profileMetaFreshAt = window.__profileMetaFreshAt || {};
+				const freshAt = Date.now();
 				results.forEach(u => {
-					if (typeof window.syncPsnUserMeta === 'function') window.syncPsnUserMeta(u);
 					const resultName = String(u && (u.name || u.username || u.user || u.onlineId) || '').trim();
 					if (!resultName) return;
-					window.__profileMetaFreshAt[resultName.toLowerCase()] = Date.now();
+					window.__profileMetaFreshAt[resultName.toLowerCase()] = freshAt;
+					if (!globalSearchResultsChanged) return;
+					if (typeof window.syncPsnUserMeta === 'function') window.syncPsnUserMeta(u);
 					const incomingStyle = (u.settingsData && (u.settingsData.profileCardStyle || u.settingsData.profileCardEffect)) || u.profileCardStyle || u.profileCardEffect || '';
 					if (incomingStyle && typeof writeProfileCardStyleForUser === 'function') writeProfileCardStyleForUser(resultName, incomingStyle, Number((u.settingsData && (u.settingsData.profileCardStyleUpdatedAt || u.settingsData.profileCardEffectUpdatedAt || u.settingsData.profileCardThemeUpdatedAt)) || u.profileCardStyleUpdatedAt || u.profileUpdatedAt || 0));
 				});
 			}
 			const openProfileTarget = document.getElementById('modal-sys-profile')?.dataset?.profileUsername || '';
-			if (openProfileTarget && Array.isArray(results)) {
+			if (globalSearchResultsChanged && openProfileTarget && Array.isArray(results)) {
 				const previousOpenProfileResult = previousGlobalSearchResults.find(u => (u && (u.name || u)) === openProfileTarget) || null;
 				const nextOpenProfileResult = results.find(u => (u && (u.name || u)) === openProfileTarget) || null;
 				const profileModal = document.getElementById('modal-sys-profile');
@@ -59024,7 +59121,7 @@ function getVisibleChatStackEl(id) {
 				const onlineModal = document.getElementById('modal-sys-online');
 				if (onlineModal && (onlineModal.style.display === 'flex' || onlineModal.classList.contains('show')) && typeof renderOnlineList === 'function') renderOnlineList();
 				if (document.getElementById('view-admin')?.style.display === 'block' && typeof renderAdminPanel === 'function') adminSchedulePanelRender();
-				if (typeof applyChatPresenceUiRefresh === 'function') applyChatPresenceUiRefresh(currentOnlineList);
+				if (typeof applyChatPresenceUiRefresh === 'function') applyChatPresenceUiRefresh(currentOnlineList, name);
 			} catch (err) {
 				console.warn('[PRESENCE] Could not apply realtime presence update:', err);
 			}
@@ -59171,12 +59268,18 @@ function getVisibleChatStackEl(id) {
 				if (Array.isArray(window.currentOnlineList)) {
 					const user = window.currentOnlineList.find(u => (u.name || u) === name);
 					if (user) {
-						user.profileCardStyle = incomingStyle || user.profileCardStyle;
-						user.profileCardEffect = incomingStyle || user.profileCardEffect;
-						if (hasIncomingCountry) user.countryCode = incomingCountryCode;
-						user.settingsData = { ...(user.settingsData || {}), ...(data.settingsData || {}), ...(hasIncomingCountry ? { countryCode: incomingCountryCode } : {}) };
-						if (incomingStyleUpdatedAt) user.profileCardStyleUpdatedAt = incomingStyleUpdatedAt;
-						if (data.profileUpdatedAt) user.profileUpdatedAt = data.profileUpdatedAt;
+						if (styleChanged) { user.profileCardStyle = incomingStyle; user.profileCardEffect = incomingStyle; }
+						if (countryChanged) user.countryCode = incomingCountryCode;
+						const incomingPublicSettings = { ...(data.settingsData || {}), ...(hasIncomingCountry ? { countryCode: incomingCountryCode } : {}) };
+						if (Object.keys(incomingPublicSettings).length) {
+							const currentSettings = user.settingsData || {};
+							const nextSettings = { ...currentSettings, ...incomingPublicSettings };
+							const currentSettingsSignature = typeof window.getLiveRenderSignature === 'function' ? window.getLiveRenderSignature(currentSettings) : JSON.stringify(currentSettings);
+							const nextSettingsSignature = typeof window.getLiveRenderSignature === 'function' ? window.getLiveRenderSignature(nextSettings) : JSON.stringify(nextSettings);
+							if (currentSettingsSignature !== nextSettingsSignature) user.settingsData = nextSettings;
+						}
+						if (incomingStyleUpdatedAt && Number(user.profileCardStyleUpdatedAt || 0) !== incomingStyleUpdatedAt) user.profileCardStyleUpdatedAt = incomingStyleUpdatedAt;
+						if (data.profileUpdatedAt && Number(user.profileUpdatedAt || 0) !== Number(data.profileUpdatedAt)) user.profileUpdatedAt = data.profileUpdatedAt;
 					}
 				}
 				if (countryChanged) {
@@ -59225,8 +59328,11 @@ function getVisibleChatStackEl(id) {
 				return;
 			}
 
+			const wasInitialProfileSync = window.__initialProfileSyncInProgress === true;
+			const unchangedProfileSync = payload.unchanged === true;
+			const shouldRunProfileCompletionWork = wasInitialProfileSync || !unchangedProfileSync;
 			window.__initialProfileSyncInProgress = false;
-			if (typeof window.syncProfileNotificationStateMigration === 'function') setTimeout(window.syncProfileNotificationStateMigration, 0);
+			if (shouldRunProfileCompletionWork && typeof window.syncProfileNotificationStateMigration === 'function') setTimeout(window.syncProfileNotificationStateMigration, 0);
 			const libraryMigrationUser = String(window.__libraryFirstSeenMigrationUser || '').trim();
 			if (window.__libraryFirstSeenMigrationDirty === true && (!libraryMigrationUser || libraryMigrationUser === myName) && typeof lastScannedGames !== 'undefined' && Array.isArray(lastScannedGames)) {
 				window.__libraryFirstSeenMigrationDirty = false;
@@ -59235,7 +59341,7 @@ function getVisibleChatStackEl(id) {
 				if (typeof markProfileListChanged === 'function') markProfileListChanged('library');
 				if (typeof window.broadcastProfileUpdate === 'function') setTimeout(function() { window.broadcastProfileUpdate({ silentIndicator:true }); }, 180);
 			}
-			if (typeof window.scheduleCatalogNotificationScan === 'function') window.scheduleCatalogNotificationScan({ reason:'profile-sync-complete', delayMs:1200 });
+			if (shouldRunProfileCompletionWork && typeof window.scheduleCatalogNotificationScan === 'function') window.scheduleCatalogNotificationScan({ reason:'profile-sync-complete', delayMs:1200 });
 			const gate = window.__postAuthChatGate;
 			if (gate && gate.name === myName) {
 				gate.profileComplete = true;
@@ -60416,42 +60522,52 @@ function getVisibleChatStackEl(id) {
 
 	function updateChatSelectionUi() {
 		const ids = window.selectedChatMessageIds || new Set();
+		let selectionLayoutChanged = false;
 
 		document.querySelectorAll('[id^="msg-row-"]').forEach(row => {
 			const msgId = row.id.replace('msg-row-', '');
 			const canDelete = canCurrentUserDeleteChatRow(row);
-			row.setAttribute('data-can-delete', canDelete ? 'true' : 'false');
+			const canDeleteText = canDelete ? 'true' : 'false';
+			if (row.getAttribute('data-can-delete') !== canDeleteText) row.setAttribute('data-can-delete', canDeleteText);
 			if (!canDelete && ids.has(String(msgId))) ids.delete(String(msgId));
-			row.classList.toggle('is-chat-selected', ids.has(String(msgId)));
+			const selected = ids.has(String(msgId));
+			if (row.classList.contains('is-chat-selected') !== selected) row.classList.toggle('is-chat-selected', selected);
 		});
 
 		const count = ids.size;
-		window.chatSelectionMode = count > 0;
-		if (document.body) document.body.classList.toggle('chat-selection-mode', window.chatSelectionMode);
+		const nextSelectionMode = count > 0;
+		if (window.chatSelectionMode !== nextSelectionMode) window.chatSelectionMode = nextSelectionMode;
+		if (document.body && document.body.classList.contains('chat-selection-mode') !== nextSelectionMode) document.body.classList.toggle('chat-selection-mode', nextSelectionMode);
 
 		let preview = document.getElementById('chat-selection-preview');
 		const chatInput = document.getElementById('chat-input');
 
 		if (count > 0 && !preview && chatInput) {
-			chatInput.parentNode.style.position = 'relative';
+			if (chatInput.parentNode.style.position !== 'relative') chatInput.parentNode.style.position = 'relative';
 			preview = document.createElement('div');
 			preview.id = 'chat-selection-preview';
 			chatInput.parentNode.insertBefore(preview, chatInput);
+			selectionLayoutChanged = true;
 		}
 
 		if (preview && count > 0) {
 			const label = count === 1 ? '1 selected message' : `${count} selected messages`;
-			preview.innerHTML = `
-				<div class="chat-selection-info">
-					<div id="chat-selected-count" class="chat-selected-count"><i class="fas fa-check-circle"></i>${label}</div>
-				</div>
-				<button class="chat-selection-clear-btn" type="button" onclick="clearChatMessageSelection()" onmouseenter="if(typeof playUiArrow === 'function') playUiArrow()" title="Clear selection" aria-label="Clear selection">&times;</button>
-			`;
+			if (preview.dataset.selectionCount !== String(count)) {
+				preview.dataset.selectionCount = String(count);
+				selectionLayoutChanged = true;
+				preview.innerHTML = `
+					<div class="chat-selection-info">
+						<div id="chat-selected-count" class="chat-selected-count"><i class="fas fa-check-circle"></i>${label}</div>
+					</div>
+					<button class="chat-selection-clear-btn" type="button" onclick="clearChatMessageSelection()" onmouseenter="if(typeof playUiArrow === 'function') playUiArrow()" title="Clear selection" aria-label="Clear selection">&times;</button>
+				`;
+			}
 		} else if (preview && count === 0) {
 			preview.remove();
+			selectionLayoutChanged = true;
 		}
 
-		if (typeof updateJumpButtonPosition === 'function') updateJumpButtonPosition();
+		if (selectionLayoutChanged && typeof updateJumpButtonPosition === 'function') updateJumpButtonPosition();
 	}
 
 	function clearChatMessageSelection() {
