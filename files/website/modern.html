@@ -10624,8 +10624,8 @@ P
 		const code = resolveProfileCountryCode(username, sourceUser);
 		const countryName = code ? getProfileCountryName(code) : 'Detecting…';
 		if (row.style.display !== 'flex') row.style.display = 'flex';
-		row.classList.toggle('is-editable', !!isMe);
-		row.classList.toggle('is-pending', !code);
+		if (row.classList.contains('is-editable') !== !!isMe) row.classList.toggle('is-editable', !!isMe);
+		if (row.classList.contains('is-pending') !== !code) row.classList.toggle('is-pending', !code);
 		if (row.dataset.countryCode !== code) row.dataset.countryCode = code;
 		if (label.textContent !== 'Localization:') label.textContent = 'Localization:';
 		if (nameText.textContent !== countryName) nameText.textContent = countryName;
@@ -10636,7 +10636,10 @@ P
 			if (flag.alt !== nextAlt) flag.alt = nextAlt;
 			if (flag.style.display !== 'block') flag.style.display = 'block';
 			if (flag.style.visibility !== 'visible') flag.style.visibility = 'visible';
-			flag.onerror = function() { this.style.visibility = 'hidden'; };
+			if (flag.dataset.countryErrorBound !== '1') {
+				flag.dataset.countryErrorBound = '1';
+				flag.onerror = function() { this.style.visibility = 'hidden'; };
+			}
 		} else {
 			if (flag.hasAttribute('src')) flag.removeAttribute('src');
 			if (flag.alt) flag.alt = '';
@@ -25860,10 +25863,22 @@ P
             callback(null);
             return;
         }
-        if (typeof socketChat.timeout === 'function') {
-            socketChat.timeout(5000).emit('request_game_owners', payload, (err, response) => callback(err ? null : response));
-        } else {
-            socketChat.emit('request_game_owners', payload, response => callback(response));
+        let settled = false;
+        const finish = response => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(fallbackTimer);
+            callback(response || null);
+        };
+        const fallbackTimer = setTimeout(() => finish(null), 6500);
+        try {
+            if (typeof socketChat.timeout === 'function') {
+                socketChat.timeout(5000).emit('request_game_owners', payload, (err, response) => finish(err ? null : response));
+            } else {
+                socketChat.emit('request_game_owners', payload, response => finish(response));
+            }
+        } catch (err) {
+            finish(null);
         }
     }
 
@@ -26482,11 +26497,15 @@ P
         const previousSummaryEntry = getGamePlayersSummaryCacheEntry(titleId);
         const social = modalRoot.querySelector('.game-player-social');
         if (social) delete social.dataset.gamePlayersPillSignature;
+        const requestToken = `${titleId}:${Date.now()}:${Math.random().toString(36).slice(2, 7)}`;
+        button.dataset.playTogetherPending = requestToken;
         button.disabled = true;
         button.innerHTML = `<i class="fas fa-circle-notch fa-spin"></i><span class="game-play-together-label">${nextEnabled ? 'Enabling...' : 'Disabling...'}</span>`;
         if (typeof playUiClick === 'function') playUiClick();
 
         requestGamePlayers({ mode: 'playTogether', titleId, title: gameTitle, enabled: nextEnabled }, response => {
+            if (button.dataset.playTogetherPending !== requestToken) return;
+            delete button.dataset.playTogetherPending;
             if (!modalRoot.isConnected || normalizeGamePlayersTitleId(modalRoot.dataset.titleId) !== titleId) return;
             if (!response || response.ok !== true || normalizeGamePlayersTitleId(response.titleId) !== titleId) {
                 button.disabled = false;
@@ -26573,9 +26592,9 @@ P
             (Array.isArray(summary && summary.preview) ? summary.preview : []).slice(0, 3).map(owner => [owner && owner.name || '', owner && owner.avatar || '', owner && owner.online === true ? 1 : 0, owner && owner.isFriend === true ? 1 : 0])
         ];
         const nextPillPresentationSignature = typeof window.getLiveRenderSignature === 'function' ? window.getLiveRenderSignature(pillPresentation) : JSON.stringify(pillPresentation);
-        const controlIsTransient = playTogetherButton.disabled === true || !!playTogetherButton.querySelector('.fa-spin');
-        if (!controlIsTransient && social.dataset.gamePlayersPillSignature === nextPillPresentationSignature) return;
-        social.dataset.gamePlayersPillSignature = nextPillPresentationSignature;
+        const controlIsPending = !!playTogetherButton.dataset.playTogetherPending;
+        if (!controlIsPending && social.dataset.gamePlayersPillSignature === nextPillPresentationSignature) return;
+        if (!controlIsPending) social.dataset.gamePlayersPillSignature = nextPillPresentationSignature;
 
         if (count) {
             const preview = (Array.isArray(summary.preview) ? summary.preview : [])
@@ -26640,7 +26659,7 @@ P
             pill.removeAttribute('title');
         }
 
-        if (canPlayTogether) {
+        if (canPlayTogether && !controlIsPending) {
             const controlTitle = active ? 'Turn off Play Together for this game' : 'Turn on Play Together for this game';
             const icon = playTogetherButton.querySelector('i');
             if (icon) icon.className = `fas ${active ? 'fa-check' : 'fa-handshake'}`;
@@ -26648,9 +26667,9 @@ P
             if (!controlLabel) {
                 controlLabel = document.createElement('span');
                 controlLabel.className = 'game-play-together-label';
-                controlLabel.textContent = 'Play Together';
                 playTogetherButton.appendChild(controlLabel);
             }
+            if (controlLabel.textContent !== 'Play Together') controlLabel.textContent = 'Play Together';
             const previousCount = playTogetherButton.dataset.liveGamePlayerCount ?? '';
             const previousContext = playTogetherButton.dataset.liveGamePlayerContext || '';
             const liveContext = `game-play-together:${titleId}`;
@@ -26675,22 +26694,25 @@ P
                 if (hadLiveCount && previousCount !== '0' && typeof window.animateCountPillFeedback === 'function') window.animateCountPillFeedback(playTogetherButton);
             }
 
-            playTogetherButton.dataset.titleId = titleId;
-            playTogetherButton.dataset.gameTitle = gameTitle || titleId;
-            playTogetherButton.dataset.active = active ? '1' : '0';
-            playTogetherButton.disabled = false;
-            playTogetherButton.classList.toggle('is-active', active);
-            playTogetherButton.title = controlTitle;
-            playTogetherButton.setAttribute('aria-pressed', active ? 'true' : 'false');
-            playTogetherButton.setAttribute('aria-label', controlTitle);
-            playTogetherButton.classList.add('is-visible');
-        } else {
-            playTogetherButton.classList.remove('is-visible', 'is-active');
-            playTogetherButton.disabled = false;
-            playTogetherButton.dataset.active = '0';
-            playTogetherButton.removeAttribute('title');
-            playTogetherButton.removeAttribute('aria-label');
-            playTogetherButton.removeAttribute('aria-pressed');
+            if (playTogetherButton.dataset.titleId !== titleId) playTogetherButton.dataset.titleId = titleId;
+            const nextGameTitle = gameTitle || titleId;
+            if (playTogetherButton.dataset.gameTitle !== nextGameTitle) playTogetherButton.dataset.gameTitle = nextGameTitle;
+            const nextActiveValue = active ? '1' : '0';
+            if (playTogetherButton.dataset.active !== nextActiveValue) playTogetherButton.dataset.active = nextActiveValue;
+            if (playTogetherButton.disabled) playTogetherButton.disabled = false;
+            if (playTogetherButton.classList.contains('is-active') !== active) playTogetherButton.classList.toggle('is-active', active);
+            if (playTogetherButton.title !== controlTitle) playTogetherButton.title = controlTitle;
+            const nextPressed = active ? 'true' : 'false';
+            if (playTogetherButton.getAttribute('aria-pressed') !== nextPressed) playTogetherButton.setAttribute('aria-pressed', nextPressed);
+            if (playTogetherButton.getAttribute('aria-label') !== controlTitle) playTogetherButton.setAttribute('aria-label', controlTitle);
+            if (!playTogetherButton.classList.contains('is-visible')) playTogetherButton.classList.add('is-visible');
+        } else if (!canPlayTogether) {
+            if (playTogetherButton.classList.contains('is-visible') || playTogetherButton.classList.contains('is-active')) playTogetherButton.classList.remove('is-visible', 'is-active');
+            if (playTogetherButton.disabled) playTogetherButton.disabled = false;
+            if (playTogetherButton.dataset.active !== '0') playTogetherButton.dataset.active = '0';
+            if (playTogetherButton.hasAttribute('title')) playTogetherButton.removeAttribute('title');
+            if (playTogetherButton.hasAttribute('aria-label')) playTogetherButton.removeAttribute('aria-label');
+            if (playTogetherButton.hasAttribute('aria-pressed')) playTogetherButton.removeAttribute('aria-pressed');
         }
 
         social.classList.toggle('is-visible', count > 0 || canPlayTogether);
@@ -58030,7 +58052,7 @@ function getVisibleChatStackEl(id) {
 						if (typeof patchOpenProfilePresenceStatus === 'function') patchOpenProfilePresenceStatus(nextOpenProfileResult, Number(nextOpenProfileResult.lastSeen || 0));
 						const previousCountry = typeof normalizeProfileCountryCode === 'function' ? normalizeProfileCountryCode(previousOpenProfileResult && (previousOpenProfileResult.countryCode || previousOpenProfileResult.country_code || previousOpenProfileResult.country || (previousOpenProfileResult.settingsData && (previousOpenProfileResult.settingsData.countryCode || previousOpenProfileResult.settingsData.country_code || previousOpenProfileResult.settingsData.country))) || '') : '';
 						const nextCountry = typeof normalizeProfileCountryCode === 'function' ? normalizeProfileCountryCode(nextOpenProfileResult.countryCode || nextOpenProfileResult.country_code || nextOpenProfileResult.country || (nextOpenProfileResult.settingsData && (nextOpenProfileResult.settingsData.countryCode || nextOpenProfileResult.settingsData.country_code || nextOpenProfileResult.settingsData.country)) || '') : '';
-						if (nextCountry && previousCountry !== nextCountry && typeof renderProfileCountry === 'function') renderProfileCountry(openProfileTarget, nextOpenProfileResult, true);
+						if (nextCountry && previousCountry !== nextCountry && typeof renderProfileCountry === 'function') renderProfileCountry(openProfileTarget, nextOpenProfileResult, openProfileTarget === String(localStorage.getItem('psn_username') || ''));
 						const previousStyleRaw = previousOpenProfileResult && ((previousOpenProfileResult.settingsData && (previousOpenProfileResult.settingsData.profileCardStyle || previousOpenProfileResult.settingsData.profileCardEffect)) || previousOpenProfileResult.profileCardStyle || previousOpenProfileResult.profileCardEffect || '');
 						const nextStyleRaw = (nextOpenProfileResult.settingsData && (nextOpenProfileResult.settingsData.profileCardStyle || nextOpenProfileResult.settingsData.profileCardEffect)) || nextOpenProfileResult.profileCardStyle || nextOpenProfileResult.profileCardEffect || '';
 						const previousStyle = previousStyleRaw && typeof normalizeProfileCardStyle === 'function' ? normalizeProfileCardStyle(previousStyleRaw) : String(previousStyleRaw || '');
@@ -59254,6 +59276,7 @@ function getVisibleChatStackEl(id) {
 			try {
 				const name = data.name || '';
 				if (!name) return;
+				const myName = String(localStorage.getItem('psn_username') || '');
 				const incomingStyle = (data.settingsData && (data.settingsData.profileCardStyle || data.settingsData.profileCardEffect)) || data.profileCardStyle || data.profileCardEffect || '';
 				const incomingStyleUpdatedAt = Number((data.settingsData && (data.settingsData.profileCardStyleUpdatedAt || data.settingsData.profileCardEffectUpdatedAt || data.settingsData.profileCardThemeUpdatedAt)) || data.profileCardStyleUpdatedAt || data.profileUpdatedAt || 0);
 				const hasIncomingCountry = Object.prototype.hasOwnProperty.call(data, 'countryCode') || Object.prototype.hasOwnProperty.call(data, 'country_code') || Object.prototype.hasOwnProperty.call(data, 'country') || !!(data.settingsData && (Object.prototype.hasOwnProperty.call(data.settingsData, 'countryCode') || Object.prototype.hasOwnProperty.call(data.settingsData, 'country_code') || Object.prototype.hasOwnProperty.call(data.settingsData, 'country')));
@@ -59285,7 +59308,7 @@ function getVisibleChatStackEl(id) {
 				if (countryChanged) {
 					const profileModal = document.getElementById('modal-sys-profile');
 					const profileOpen = !!(profileModal && profileModal.dataset.profileUsername === name && (profileModal.style.display === 'flex' || profileModal.style.display === 'block' || profileModal.classList.contains('show')));
-					if (profileOpen && typeof renderProfileCountry === 'function') renderProfileCountry(name, data, true);
+					if (profileOpen && typeof renderProfileCountry === 'function') renderProfileCountry(name, data, name === myName);
 				}
 				if (styleChanged && typeof refreshOpenProfileCardStyleForUser === 'function') refreshOpenProfileCardStyleForUser(name);
 			} catch (err) {
@@ -60671,6 +60694,9 @@ function getVisibleChatStackEl(id) {
             });
         }
 
+        // querySelectorAll already returns the message rows in DOM/chronological order.
+        // Avoid sorting them by offsetTop here: this runs from the scroll path and the extra
+        // layout reads were forcing needless geometry work for every pending-mention refresh.
         return Array.from(box.querySelectorAll('[id^="msg-row-"]'))
             .filter(row => {
                 const msgId = row.id.replace('msg-row-', '');
@@ -60680,8 +60706,7 @@ function getVisibleChatStackEl(id) {
                 const textNode = row.querySelector('[id^="msg-text-"]');
                 const text = msg && typeof msg.text === 'string' ? msg.text : (textNode ? textNode.textContent : row.textContent || '');
                 return (typeof chatTextMentionsUser === 'function' ? chatTextMentionsUser(text, myName) : text.includes(`@${myName}`)) || (msg && msg.isGlobalPing === true) || /@everyone\b/.test(text);
-            })
-            .sort((a, b) => a.offsetTop - b.offsetTop);
+            });
     }
 
     function getPendingChatMentionRows() {
@@ -60715,6 +60740,7 @@ function getVisibleChatStackEl(id) {
         const btn = document.getElementById('btn-mention-jump');
         const countEl = document.getElementById('mention-jump-count');
         if (!btn) return;
+        let positionChanged = false;
         if (window.__chatVirtualLoadingOlder || window.__chatVirtualLoadingNewer) return;
         if (typeof isChatPreparingMessages === 'function' && isChatPreparingMessages()) {
             hideMentionJumpButtonImmediately();
@@ -60724,28 +60750,33 @@ function getVisibleChatStackEl(id) {
         const count = pending.length;
         if (count > 0) {
             if (window.__chatMentionHideTimer) { clearTimeout(window.__chatMentionHideTimer); window.__chatMentionHideTimer = null; }
-            if (btn.style.display !== 'flex') btn.style.display = 'flex';
+            if (btn.style.display !== 'flex') { btn.style.display = 'flex'; positionChanged = true; }
             if (btn.style.opacity !== '1') btn.style.opacity = '1';
             if (countEl) {
                 const visibleCount = count > 99 ? '99+' : String(count);
-                if (countEl.style.display !== 'flex') countEl.style.display = 'flex';
+                if (countEl.style.display !== 'flex') { countEl.style.display = 'flex'; positionChanged = true; }
+                const previousVisibleCount = String(countEl.textContent || '');
                 if (typeof window.setLiveCountText === 'function') window.setLiveCountText(countEl, visibleCount, count, 'chat-mention-jump');
                 else if (countEl.textContent !== visibleCount) countEl.textContent = visibleCount;
+                if (previousVisibleCount !== visibleCount) positionChanged = true;
             }
         } else {
             if (btn.style.opacity !== '0') btn.style.opacity = '0';
             if (countEl) {
-                if (countEl.style.display !== 'none') countEl.style.display = 'none';
-                if (countEl.textContent) countEl.textContent = '';
+                if (countEl.style.display !== 'none') { countEl.style.display = 'none'; positionChanged = true; }
+                if (countEl.textContent) { countEl.textContent = ''; positionChanged = true; }
             }
             if (btn.style.display !== 'none' && !window.__chatMentionHideTimer) {
                 window.__chatMentionHideTimer = setTimeout(() => {
                     window.__chatMentionHideTimer = null;
-                    if (btn.style.opacity === '0' && btn.style.display !== 'none') btn.style.display = 'none';
+                    if (btn.style.opacity === '0' && btn.style.display !== 'none') {
+                        btn.style.display = 'none';
+                        if (typeof updateJumpButtonPosition === 'function') updateJumpButtonPosition();
+                    }
                 }, 300);
             }
         }
-        if (typeof updateJumpButtonPosition === 'function') updateJumpButtonPosition();
+        if (positionChanged && typeof updateJumpButtonPosition === 'function') updateJumpButtonPosition();
     }
 
     function jumpToNextChatMention() {
@@ -60840,11 +60871,11 @@ function getVisibleChatStackEl(id) {
         return (box.scrollHeight - box.scrollTop - box.clientHeight) <= threshold;
     }
 
-    function setJumpBottomButtonVisible(show) {
+    function setJumpBottomButtonVisible(show, knownUnreadCount = null) {
         const btn = document.getElementById('btn-jump-bottom');
         if (!btn) return;
 
-        const unreadCount = typeof updateJumpBottomUnreadBadge === 'function' ? updateJumpBottomUnreadBadge() : 0;
+        const unreadCount = Number.isFinite(knownUnreadCount) ? Math.max(0, Number(knownUnreadCount) || 0) : (typeof updateJumpBottomUnreadBadge === 'function' ? updateJumpBottomUnreadBadge() : 0);
         const shouldShow = !!(show || unreadCount > 0);
         if (shouldShow) {
             if (window.__chatJumpBottomHideTimer) { clearTimeout(window.__chatJumpBottomHideTimer); window.__chatJumpBottomHideTimer = null; }
@@ -60857,7 +60888,10 @@ function getVisibleChatStackEl(id) {
             if (btn.style.display !== 'none' && !window.__chatJumpBottomHideTimer) {
                 window.__chatJumpBottomHideTimer = setTimeout(() => {
                     window.__chatJumpBottomHideTimer = null;
-                    if (btn.style.opacity === '0' && btn.style.display !== 'none') btn.style.display = 'none';
+                    if (btn.style.opacity === '0' && btn.style.display !== 'none') {
+                        btn.style.display = 'none';
+                        if (typeof updateJumpButtonPosition === 'function') updateJumpButtonPosition();
+                    }
                 }, 300);
             }
         }
@@ -60912,7 +60946,7 @@ function getVisibleChatStackEl(id) {
         const unreadCount = typeof updateJumpBottomUnreadBadge === 'function' ? updateJumpBottomUnreadBadge() : 0;
         const history = Array.isArray(window.messageHistory) ? window.messageHistory : [];
         const hasMoreNewer = history.length > 0 && Number(window.__chatVirtualEndIndex || 0) > 0 && Number(window.__chatVirtualEndIndex || 0) < history.length;
-        setJumpBottomButtonVisible(!nearBottom || unreadCount > 0 || hasMoreNewer);
+        setJumpBottomButtonVisible(!nearBottom || unreadCount > 0 || hasMoreNewer, unreadCount);
 
         if (nearBottom && !document.getElementById('unread-divider') && typeof refreshChatNotificationDot === 'function') {
             refreshChatNotificationDot();
@@ -72701,10 +72735,24 @@ function getVisibleChatStackEl(id) {
             if (countrySearch && typeof window.filterNewProfileCountryPicker === 'function') window.filterNewProfileCountryPicker(countrySearch.value || '');
             const profileSearch = document.getElementById('profile-country-dialog-search');
             if (profileSearch && typeof window.filterProfileCountryDialog === 'function') window.filterProfileCountryDialog(profileSearch.value || '');
-            const activeName = localStorage.getItem('psn_username') || '';
+            const activeName = String(localStorage.getItem('psn_username') || '');
             const profileModal = document.getElementById('modal-sys-profile');
             if (profileModal && profileModal.classList.contains('active') && typeof renderProfileCountry === 'function') {
-                renderProfileCountry(activeName, { countryCode: loadState(STORAGE_KEY_PROFILE_COUNTRY), settingsData: { countryCode: loadState(STORAGE_KEY_PROFILE_COUNTRY) } }, true);
+                const profileName = String(profileModal.dataset.profileUsername || activeName);
+                const isMe = !!activeName && profileName === activeName;
+                let sourceUser = null;
+                if (isMe) {
+                    const ownCountry = loadState(STORAGE_KEY_PROFILE_COUNTRY);
+                    sourceUser = { countryCode: ownCountry, settingsData: { countryCode: ownCountry } };
+                } else {
+                    const pools = [window.currentOnlineList, window.globalSearchResults, window.friendsList];
+                    for (const pool of pools) {
+                        if (!Array.isArray(pool)) continue;
+                        sourceUser = pool.find(user => String(user && (user.name || user) || '') === profileName) || null;
+                        if (sourceUser) break;
+                    }
+                }
+                renderProfileCountry(profileName, sourceUser, isMe);
             }
         } catch (err) {}
     }

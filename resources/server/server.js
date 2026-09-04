@@ -3693,7 +3693,6 @@ async function setGamePlayTogether(userName, rawTitleId, enabled, rawTitle, opti
     if (changed) clearGamePlayersSummaryCache(titleId);
   }
 
-  const currentEnabled = await isGamePlayTogether(name, titleId);
   if (changed) {
     const changeOptions = {
       reason: 'play_together',
@@ -3703,7 +3702,9 @@ async function setGamePlayTogether(userName, rawTitleId, enabled, rawTitle, opti
     emitGamePlayersSummaryChanged([titleId], changeOptions);
     deferServerTask('GAME PLAYERS NOTIFY', () => notifyGamePlayersSummaryChangedAcrossInstances([titleId], changeOptions), 0);
   }
-  return { ok: true, enabled: currentEnabled, changed };
+  // INSERT ... ON CONFLICT / DELETE rowCount already tells us the requested state is settled.
+  // The handler immediately reads the authoritative summary, so avoid a second standalone DB read here.
+  return { ok: true, enabled: enabled === true, changed };
 }
 
 
@@ -8852,10 +8853,11 @@ io.on('connection', (socket) => {
           return;
         }
         const summary = await getGamePlayersSummaryForUser(name, titleId);
-        const payload = { ok: true, titleId, mode, enabled: result.enabled === true, ...summary };
+        const confirmedEnabled = summary.viewerPlayTogether === true;
+        const payload = { ok: true, titleId, mode, enabled: confirmedEnabled, ...summary };
         trackBandwidthPayload('game_players_play_together', payload, 1);
         if (result.changed === true) {
-          const statePayload = { titleId, enabled: result.enabled === true };
+          const statePayload = { titleId, enabled: confirmedEnabled };
           const stateRecipients = getSocketsByUserName(name).filter(client => client && client.connected);
           trackBandwidthPayload('game_play_together_state', statePayload, stateRecipients.length);
           stateRecipients.forEach(client => client.emit('game_play_together_state', statePayload));
