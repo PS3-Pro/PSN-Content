@@ -10030,7 +10030,16 @@ io.on('connection', (socket) => {
         try {
             await pool.query("UPDATE chat SET message = $1 WHERE message->>'time' = $2", [cleanChatMessage(msg), msg.time]);
             const syncChange = await recordChatSyncChangeSafe('upsert', messageId || String(new Date(msg.time).getTime()), msg);
-            const reactionPayload = { msgId: messageId, emoji, user: actor };
+            const finalReaction = Array.isArray(msg.reactions) ? msg.reactions.find(r => r && r.emoji === emoji) : null;
+            const finalUsers = finalReaction && Array.isArray(finalReaction.users) ? Array.from(new Set(finalReaction.users.map(user => String(user || '').trim()).filter(Boolean))) : [];
+            const reactionPayload = {
+                msgId: messageId,
+                emoji,
+                user: actor,
+                action: reactionAdded ? 'add' : (reactionRemoved ? 'remove' : 'sync'),
+                count: finalUsers.length,
+                users: finalUsers
+            };
             io.emit('message_reaction', reactionPayload);
             if (syncChange) emitChatSyncChange(syncChange);
 
