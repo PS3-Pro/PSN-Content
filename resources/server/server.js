@@ -9326,6 +9326,32 @@ io.on('connection', (socket) => {
     }
   });
   
+  socket.on('request_friends_presence', async (request = {}, callback) => {
+    const respond = payload => { if (typeof callback === 'function') { try { callback(payload); } catch (err) {} } };
+    try {
+      await ensureUserCacheReady();
+      const requested = Array.isArray(request && request.names) ? request.names : [];
+      const uniqueNames = [];
+      const seen = new Set();
+      requested.slice(0, 500).forEach(value => {
+        const name = normalizeText(value, '');
+        const key = name.toLowerCase();
+        if (!name || !key || seen.has(key)) return;
+        seen.add(key);
+        uniqueNames.push({ name, key });
+      });
+      const cacheNames = new Map(Object.keys(userDatabase).map(name => [name.toLowerCase(), name]));
+      const users = uniqueNames.map(item => {
+        const exactName = cacheNames.get(item.key);
+        return exactName ? getPublicUserData(exactName, userDatabase[exactName], false) : null;
+      }).filter(Boolean);
+      respond({ success: true, users, serverTime: Date.now() });
+    } catch (err) {
+      console.error('[FRIENDS PRESENCE ERROR]:', err);
+      respond({ success: false, users: [] });
+    }
+  });
+
   socket.on('request_admin_user_sessions', async (data = {}, callback) => {
     const respond = payload => { if (typeof callback === 'function') { try { callback(payload); } catch (err) {} } };
     if (socket.isAdmin !== true) { respond({ ok: false, error: 'Admin access required.' }); return; }
