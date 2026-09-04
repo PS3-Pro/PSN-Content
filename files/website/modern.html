@@ -14285,9 +14285,10 @@ P
 			}
 			if (!shouldReuse) return;
 			const nextTileIndex = nextNode.style && nextNode.style.getPropertyValue ? nextNode.style.getPropertyValue('--tile-idx') : '';
-			if (nextTileIndex && previousNode.style && previousNode.style.setProperty) previousNode.style.setProperty('--tile-idx', nextTileIndex);
-			if (options.markReused === true) previousNode.dataset.liveRenderReused = '1';
-			previousNode.dataset.liveRenderSignature = nextSignature || previousSignature;
+			if (nextTileIndex && previousNode.style && previousNode.style.setProperty && previousNode.style.getPropertyValue('--tile-idx') !== nextTileIndex) previousNode.style.setProperty('--tile-idx', nextTileIndex);
+			if (options.markReused === true && previousNode.dataset.liveRenderReused !== '1') previousNode.dataset.liveRenderReused = '1';
+			const resolvedSignature = nextSignature || previousSignature;
+			if (previousNode.dataset.liveRenderSignature !== resolvedSignature) previousNode.dataset.liveRenderSignature = resolvedSignature;
 			nextNode.replaceWith(previousNode);
 			reused++;
 		});
@@ -14320,6 +14321,7 @@ P
 		});
 		const oldKeys = new Set(previousNodes.keys());
 		const nextNodes = window.getLiveRenderMatches(fragment, selector);
+		const reusedByNextNode = new Map();
 		let reused = 0;
 		let inserted = 0;
 		nextNodes.forEach(nextNode => {
@@ -14336,19 +14338,35 @@ P
 			}
 			if (!shouldReuse) return;
 			const nextTileIndex = nextNode.style && nextNode.style.getPropertyValue ? nextNode.style.getPropertyValue('--tile-idx') : '';
-			if (nextTileIndex && previousNode.style && previousNode.style.setProperty) previousNode.style.setProperty('--tile-idx', nextTileIndex);
-			if (options.markReused === true) previousNode.dataset.liveRenderReused = '1';
-			previousNode.dataset.liveRenderSignature = nextSignature || previousSignature;
+			if (nextTileIndex && previousNode.style && previousNode.style.setProperty && previousNode.style.getPropertyValue('--tile-idx') !== nextTileIndex) previousNode.style.setProperty('--tile-idx', nextTileIndex);
+			if (options.markReused === true && previousNode.dataset.liveRenderReused !== '1') previousNode.dataset.liveRenderReused = '1';
+			const resolvedSignature = nextSignature || previousSignature;
+			if (previousNode.dataset.liveRenderSignature !== resolvedSignature) previousNode.dataset.liveRenderSignature = resolvedSignature;
+			reusedByNextNode.set(nextNode, previousNode);
 			oldKeys.delete(key);
-			nextNode.replaceWith(previousNode);
 			reused++;
 		});
+
+		/* Build the desired child sequence before moving anything. Reused nodes stay mounted in
+		   the live container until their actual position changes, so identical snapshots do not
+		   detach/re-attach images or trigger avoidable MutationObserver/layout work. */
+		const desiredNodes = Array.from(fragment.childNodes).map(node => reusedByNextNode.get(node) || node);
 		const scrollTop = container.scrollTop;
 		const scrollLeft = container.scrollLeft;
-		container.replaceChildren(fragment);
+		let cursor = container.firstChild;
+		desiredNodes.forEach(node => {
+			if (node === cursor) { cursor = cursor.nextSibling; return; }
+			container.insertBefore(node, cursor);
+			cursor = node.nextSibling;
+		});
+		while (cursor) {
+			const next = cursor.nextSibling;
+			cursor.remove();
+			cursor = next;
+		}
 		if (options.preserveScroll === true) {
-			container.scrollTop = scrollTop;
-			container.scrollLeft = scrollLeft;
+			if (container.scrollTop !== scrollTop) container.scrollTop = scrollTop;
+			if (container.scrollLeft !== scrollLeft) container.scrollLeft = scrollLeft;
 		}
 		return { reused, inserted, removed: oldKeys.size };
 	};
@@ -30917,8 +30935,8 @@ P
 			return;
 		}
 
-		content.style.display = 'flex';
-		if (lock) lock.style.display = 'none';
+		if (content.style.display !== 'flex') content.style.display = 'flex';
+		if (lock && lock.style.display !== 'none') lock.style.display = 'none';
 
 		const allKnownUsers = adminGetAllKnownUsers();
 		const data = adminGetDiagnostics(allKnownUsers);
@@ -30943,14 +30961,7 @@ P
 		setTextContentById('admin-kv-trophies', data.trophiesUnlocked);
 		setTextContentById('admin-last-refresh', new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }));
 
-		const connectionPill = document.getElementById('admin-connection-pill');
-		if (connectionPill) {
-			const connected = !!(typeof socketChat !== 'undefined' && socketChat && socketChat.connected);
-			const nextClass = connected ? 'admin-pill online' : 'admin-pill danger';
-			const nextHtml = connected ? '<i class="fas fa-circle"></i> Socket Online' : '<i class="fas fa-circle"></i> Socket Offline';
-			if (connectionPill.className !== nextClass) connectionPill.className = nextClass;
-			if (connectionPill.innerHTML !== nextHtml) connectionPill.innerHTML = nextHtml;
-		}
+		adminRenderConnectionPill();
 
 		const list = document.getElementById('admin-online-list');
 		if (list && (!adminEntryActive || list.closest('.admin-card')?.classList.contains('admin-entry-visible'))) {
@@ -30979,18 +30990,16 @@ P
 			if (countPill) {
 				const authoritativeTotal = (!filter && userFilterMode === 'all') ? (Number(window.adminRegisteredUsers) || 0) : resultTotal;
 				const denominator = Math.max(authoritativeTotal, resultTotal, visibleUsers.length);
-				countPill.textContent = `Showing ${visibleUsers.length}/${denominator}`;
+				const nextCountText = `Showing ${visibleUsers.length}/${denominator}`;
+				if (countPill.textContent !== nextCountText) countPill.textContent = nextCountText;
 			}
 			if (note) {
-				if (window.adminUsersLoading) {
-					note.innerHTML = '<i class="fas fa-circle-notch fa-spin"></i> Loading user batch...';
-				} else if (!hasLoadedUserBatch) {
-					note.innerHTML = '<i class="fas fa-layer-group"></i> Users load in batches. The Load field controls how many the server sends per request.';
-				} else if (hiddenCount > 0) {
-					note.innerHTML = `<i class="fas fa-layer-group"></i> Showing ${visibleUsers.length} users now. ${hiddenCount} more available.`;
-				} else {
-					note.innerHTML = '<i class="fas fa-check-circle"></i> User list loaded.';
-				}
+				let nextNoteHtml = '';
+				if (window.adminUsersLoading) nextNoteHtml = '<i class="fas fa-circle-notch fa-spin"></i> Loading user batch...';
+				else if (!hasLoadedUserBatch) nextNoteHtml = '<i class="fas fa-layer-group"></i> Users load in batches. The Load field controls how many the server sends per request.';
+				else if (hiddenCount > 0) nextNoteHtml = `<i class="fas fa-layer-group"></i> Showing ${visibleUsers.length} users now. ${hiddenCount} more available.`;
+				else nextNoteHtml = '<i class="fas fa-check-circle"></i> User list loaded.';
+				if (note.innerHTML !== nextNoteHtml) note.innerHTML = nextNoteHtml;
 			}
 
 			const buildAdminUsersEmpty = (title, desc, icon = 'fa-users') => `
@@ -32051,10 +32060,17 @@ P
 				return item.type === type && item.message === message && item.admin === actor && Math.abs(itemTime - entryTime) < 5000;
 			});
 		}
-		if (replaceIndex > -1) log[replaceIndex] = { ...log[replaceIndex], ...entry, id: id || log[replaceIndex].id || '' };
-		else log.unshift(entry);
+		if (replaceIndex > -1) {
+			const nextEntry = { ...log[replaceIndex], ...entry, id: id || log[replaceIndex].id || '' };
+			const sameEntry = typeof window.getLiveRenderSignature === 'function'
+				? window.getLiveRenderSignature(log[replaceIndex]) === window.getLiveRenderSignature(nextEntry)
+				: JSON.stringify(log[replaceIndex]) === JSON.stringify(nextEntry);
+			if (sameEntry) return false;
+			log[replaceIndex] = nextEntry;
+		} else log.unshift(entry);
 		adminSetModerationLog(log);
 		if (document.getElementById('view-admin')?.style.display === 'block') adminSchedulePanelRender();
+		return true;
 	}
 
 
@@ -32079,10 +32095,17 @@ P
 			time
 		};
 		const existing = entry.id ? log.findIndex(row => row && row.id === entry.id) : -1;
-		if (existing > -1) log[existing] = { ...log[existing], ...entry };
-		else log.unshift(entry);
+		if (existing > -1) {
+			const nextEntry = { ...log[existing], ...entry };
+			const sameEntry = typeof window.getLiveRenderSignature === 'function'
+				? window.getLiveRenderSignature(log[existing]) === window.getLiveRenderSignature(nextEntry)
+				: JSON.stringify(log[existing]) === JSON.stringify(nextEntry);
+			if (sameEntry) return false;
+			log[existing] = nextEntry;
+		} else log.unshift(entry);
 		adminSetServerLog(log);
 		if (document.getElementById('view-admin')?.style.display === 'block') adminSchedulePanelRender();
+		return true;
 	}
 
 	window.adminClearServerLog = function() {
@@ -32259,8 +32282,14 @@ P
 		try {
 			socketChat.timeout(5000).emit('request_maintenance_state', { at: Date.now(), reason }, (err, response) => {
 				if (err || !response || response.success === false || !response.state) return;
-				adminSetMaintenanceState(response.state, false);
-				if (document.getElementById('view-admin')?.style.display === 'block') renderAdminPanel();
+				const nextState = adminNormalizeMaintenanceState(response.state || {});
+				const currentState = adminGetMaintenanceState();
+				const same = typeof window.getLiveRenderSignature === 'function'
+					? window.getLiveRenderSignature(currentState) === window.getLiveRenderSignature(nextState)
+					: JSON.stringify(currentState) === JSON.stringify(nextState);
+				if (same) return;
+				adminSetMaintenanceState(nextState, false);
+				if (document.getElementById('view-admin')?.style.display === 'block') adminSchedulePanelRender();
 			});
 			return true;
 		} catch (err) {
@@ -32453,9 +32482,10 @@ P
 	}
 
 	function adminSetMaintenanceRevealPending(pending) {
-		if (!document.body) return;
-		document.body.classList.toggle('admin-maintenance-reveal-pending', !!pending);
-	}
+        if (!document.body) return;
+        const next = !!pending;
+        if (document.body.classList.contains('admin-maintenance-reveal-pending') !== next) document.body.classList.toggle('admin-maintenance-reveal-pending', next);
+    }
 
 	function adminClearMaintenanceLoginRevealDelay() {
 		if (adminMaintenanceLoginRevealTimer) {
@@ -32935,8 +32965,16 @@ P
 		const label = document.getElementById('admin-pinned-announcement-color-value');
 		const swatch = document.querySelector('#admin-pinned-announcement-color-trigger .admin-pinned-color-swatch');
 		if (input && input.value.toLowerCase() !== color) input.value = color;
-		if (label) { label.textContent = color.toUpperCase(); label.style.color = color; }
-		if (swatch) { swatch.style.background = color; swatch.style.boxShadow = `0 0 9px ${color}55`; }
+		if (label) {
+			const nextText = color.toUpperCase();
+			if (label.textContent !== nextText) label.textContent = nextText;
+			if (label.dataset.previewColor !== color) { label.dataset.previewColor = color; label.style.color = color; }
+		}
+		if (swatch && swatch.dataset.previewColor !== color) {
+			swatch.dataset.previewColor = color;
+			swatch.style.background = color;
+			swatch.style.boxShadow = `0 0 9px ${color}55`;
+		}
 	};
 
 	document.addEventListener('keydown', function(event) {
@@ -33053,12 +33091,14 @@ P
 		}
 
 		if (entryPending) {
-			bar.setAttribute('aria-hidden', 'true');
+			if (bar.getAttribute('aria-hidden') !== 'true') bar.setAttribute('aria-hidden', 'true');
 			return;
 		}
 
-		bar.classList.toggle('is-scroll-hidden', !atTop);
-		bar.setAttribute('aria-hidden', atTop ? 'false' : 'true');
+		const nextScrollHidden = !atTop;
+		if (bar.classList.contains('is-scroll-hidden') !== nextScrollHidden) bar.classList.toggle('is-scroll-hidden', nextScrollHidden);
+		const nextAriaHidden = atTop ? 'false' : 'true';
+		if (bar.getAttribute('aria-hidden') !== nextAriaHidden) bar.setAttribute('aria-hidden', nextAriaHidden);
 	}
 
 	function adminInstallAnnouncementScrollHandler() {
@@ -33122,10 +33162,11 @@ P
 		let bar = document.getElementById('admin-pinned-announcement-bar');
 		if (!data || !data.text) {
 			if (bar) bar.remove();
-			return;
+			return false;
 		}
 		const color = adminNormalizeAnnouncementColor(data.color);
 		const rgb = adminAnnouncementColorRgb(color);
+		let created = false;
 		if (!bar) {
 			bar = document.createElement('div');
 			bar.id = 'admin-pinned-announcement-bar';
@@ -33134,12 +33175,18 @@ P
 			bar.setAttribute('aria-hidden', 'true');
 			document.body.appendChild(bar);
 			adminScheduleAnnouncementEntry(bar);
+			created = true;
 		}
-		bar.style.border = `1px solid rgba(${rgb.r},${rgb.g},${rgb.b},.35)`;
-		bar.style.boxShadow = `0 10px 30px rgba(0,0,0,.45),0 0 18px rgba(${rgb.r},${rgb.g},${rgb.b},.12)`;
-		bar.innerHTML = `<i class="fas fa-thumbtack" style="color:${color};transform:rotate(45deg);filter:drop-shadow(0 0 5px rgba(${rgb.r},${rgb.g},${rgb.b},.45));"></i><span class="admin-pinned-announcement-text">${adminEscapeHtml(data.text)}</span>`;
+		const signature = typeof window.getLiveRenderSignature === 'function' ? window.getLiveRenderSignature([String(data.text || ''), color]) : JSON.stringify([String(data.text || ''), color]);
+		if (bar.dataset.announcementSignature !== signature) {
+			bar.dataset.announcementSignature = signature;
+			bar.style.border = `1px solid rgba(${rgb.r},${rgb.g},${rgb.b},.35)`;
+			bar.style.boxShadow = `0 10px 30px rgba(0,0,0,.45),0 0 18px rgba(${rgb.r},${rgb.g},${rgb.b},.12)`;
+			bar.innerHTML = `<i class="fas fa-thumbtack" style="color:${color};transform:rotate(45deg);filter:drop-shadow(0 0 5px rgba(${rgb.r},${rgb.g},${rgb.b},.45));"></i><span class="admin-pinned-announcement-text">${adminEscapeHtml(data.text)}</span>`;
+		}
 		adminInstallAnnouncementScrollHandler();
 		adminSyncAnnouncementBannerVisibility();
+		return created || bar.dataset.announcementSignature === signature;
 	}
 
 	window.adminSetPinnedAnnouncement = function() {
@@ -33188,8 +33235,10 @@ P
 		try {
 			adminSetChatControlsSyncState('syncing');
 			socketChat.emit('admin_request_chat_controls', { at: Date.now() });
-			socketChat.emit('admin_request_admin_state', { at: Date.now() });
+			if (document.body.classList.contains('is-admin')) {
+				socketChat.emit('admin_request_admin_state', { at: Date.now() });
 				socketChat.emit('admin_request_server_log');
+			}
 			window.adminChatControlsLastRequested = Date.now();
 			setTimeout(() => {
 				if (window.adminChatControlsSyncState === 'syncing' && Date.now() - (window.adminChatControlsLastRequested || 0) > 2400) {
@@ -33313,19 +33362,21 @@ P
 			if (!btn) return;
 			if (!btn.dataset.originalTitle) btn.dataset.originalTitle = btn.title || '';
 			if (btn.dataset.originalTabindex === undefined) btn.dataset.originalTabindex = btn.getAttribute('tabindex') || '';
-			
-			btn.classList.toggle('chat-control-disabled-btn', !!shouldDisable);
-			btn.setAttribute('aria-disabled', shouldDisable ? 'true' : 'false');
-			btn.disabled = !!shouldDisable;
-			
-			if (shouldDisable) {
-				btn.setAttribute('tabindex', '-1');
-				btn.title = reasonText;
-				btn.classList.remove('active', 'is-active');
+			const disabled = !!shouldDisable;
+			if (btn.classList.contains('chat-control-disabled-btn') !== disabled) btn.classList.toggle('chat-control-disabled-btn', disabled);
+			const nextAriaDisabled = disabled ? 'true' : 'false';
+			if (btn.getAttribute('aria-disabled') !== nextAriaDisabled) btn.setAttribute('aria-disabled', nextAriaDisabled);
+			if (btn.disabled !== disabled) btn.disabled = disabled;
+			if (disabled) {
+				if (btn.getAttribute('tabindex') !== '-1') btn.setAttribute('tabindex', '-1');
+				if (btn.title !== reasonText) btn.title = reasonText;
+				if (btn.classList.contains('active') || btn.classList.contains('is-active')) btn.classList.remove('active', 'is-active');
 			} else {
-				if (btn.dataset.originalTabindex) btn.setAttribute('tabindex', btn.dataset.originalTabindex);
-				else btn.removeAttribute('tabindex');
-				btn.title = btn.dataset.originalTitle || '';
+				const originalTabindex = btn.dataset.originalTabindex || '';
+				if (originalTabindex) { if (btn.getAttribute('tabindex') !== originalTabindex) btn.setAttribute('tabindex', originalTabindex); }
+				else if (btn.hasAttribute('tabindex')) btn.removeAttribute('tabindex');
+				const originalTitle = btn.dataset.originalTitle || '';
+				if (btn.title !== originalTitle) btn.title = originalTitle;
 			}
 		};
 
@@ -33336,13 +33387,21 @@ P
 		});
 
 		const fileInput = document.getElementById('chat-file-input');
-		if (fileInput) fileInput.disabled = !!isDisabledForUser;
+		const nextFileDisabled = !!isDisabledForUser;
+		if (fileInput && fileInput.disabled !== nextFileDisabled) fileInput.disabled = nextFileDisabled;
 
 		const toolbar = document.getElementById('chat-toolbar-container');
-		if (toolbar) toolbar.classList.toggle('chat-toolbar-locked', !!lockToolbar && !!isDisabledForUser);
+		const nextToolbarLocked = !!lockToolbar && !!isDisabledForUser;
+		const previousComposerDisabled = toolbar ? toolbar.dataset.chatControlDisabled === '1' : false;
+		if (toolbar) {
+			if (toolbar.classList.contains('chat-toolbar-locked') !== nextToolbarLocked) toolbar.classList.toggle('chat-toolbar-locked', nextToolbarLocked);
+			const nextDisabledMarker = nextFileDisabled ? '1' : '0';
+			if (toolbar.dataset.chatControlDisabled !== nextDisabledMarker) toolbar.dataset.chatControlDisabled = nextDisabledMarker;
+		}
 
-		if (isDisabledForUser) {
-			document.getElementById('mention-suggestions')?.style && (document.getElementById('mention-suggestions').style.display = 'none');
+		if (isDisabledForUser && !previousComposerDisabled) {
+			const suggestions = document.getElementById('mention-suggestions');
+			if (suggestions && suggestions.style.display !== 'none') suggestions.style.display = 'none';
 			if (typeof closeChatInputPickers === 'function') closeChatInputPickers();
 		}
 	}
@@ -33388,7 +33447,8 @@ P
 			if (el.parentNode !== tagBox || tagBox.children[index] !== el) tagBox.appendChild(el);
 		});
 
-		tagBox.style.display = tagList.length ? 'flex' : 'none';
+		const nextTagBoxDisplay = tagList.length ? 'flex' : 'none';
+		if (tagBox.style.display !== nextTagBoxDisplay) tagBox.style.display = nextTagBoxDisplay;
 	}
 
 
@@ -33418,9 +33478,11 @@ P
 				offline: { text: 'Offline', icon: 'fa-cloud-slash', kind: 'offline' }
 			};
 			const meta = syncMap[syncState] || syncMap.live;
-			syncEl.className = adminChatControlPillClass(meta.kind);
-			syncEl.dataset.kind = meta.kind;
-			syncEl.innerHTML = `<i class="fas ${meta.icon}"></i> ${meta.text}`;
+			const nextClass = adminChatControlPillClass(meta.kind);
+			const nextHtml = `<i class="fas ${meta.icon}"></i> ${meta.text}`;
+			if (syncEl.className !== nextClass) syncEl.className = nextClass;
+			if (syncEl.dataset.kind !== meta.kind) syncEl.dataset.kind = meta.kind;
+			if (syncEl.innerHTML !== nextHtml) syncEl.innerHTML = nextHtml;
 		}
 	}
 
@@ -33428,8 +33490,14 @@ P
 	function setChatInputInterfacePlaceholder(input, source) {
 		if (!input) return;
 		const original = String(source || '');
+		const translationEnabled = (typeof window.isInterfaceAutoTranslateEnabled === 'function') ? !!window.isInterfaceAutoTranslateEnabled() : false;
+		const languageKey = `${translationEnabled ? 'on' : 'off'}:${(typeof window.getInterfaceTranslationTargetLang === 'function') ? String(window.getInterfaceTranslationTargetLang() || 'en') : 'en'}`;
+		const previousSource = input.dataset.interfacePlaceholderSource || '';
+		const previousLanguage = input.dataset.interfacePlaceholderLanguage || '';
+		if (previousSource === original && previousLanguage === languageKey && input.hasAttribute('data-placeholder')) return;
 		const token = String((Number(input.dataset.interfacePlaceholderToken || 0) + 1));
 		input.dataset.interfacePlaceholderSource = original;
+		input.dataset.interfacePlaceholderLanguage = languageKey;
 		input.dataset.interfacePlaceholderToken = token;
 
 		const apply = value => {
@@ -33474,26 +33542,30 @@ P
 		const wait = Math.ceil((state.waitMs || 0) / 1000);
 
 		if (input) {
-			input.classList.remove('chat-control-locked', 'chat-control-slow', 'chat-control-bypass', 'chat-control-waiting', 'chat-connection-unavailable');
-			setChatInputInterfacePlaceholder(input, 'Type a message');
+			const controlClasses = ['chat-control-locked', 'chat-control-slow', 'chat-control-bypass', 'chat-control-waiting', 'chat-connection-unavailable'];
+			const desiredClasses = new Set();
+			let desiredEditable = 'true';
+			let desiredPlaceholder = 'Type a message';
+			if (isLockedForUser) { desiredClasses.add('chat-control-locked'); desiredEditable = 'false'; }
+			else if (isSlowWaitingForUser) { desiredClasses.add('chat-control-slow'); desiredClasses.add('chat-control-waiting'); desiredEditable = 'false'; desiredPlaceholder = 'Slow mode cooldown...'; }
+			else if (isConnectionUnavailable) { desiredClasses.add('chat-connection-unavailable'); desiredEditable = 'false'; desiredPlaceholder = 'Reconnecting...'; }
+			else if (isActive && state.canBypass) desiredClasses.add('chat-control-bypass');
+			else if (state.locked) desiredClasses.add('chat-control-locked');
+			else if (state.slowSeconds > 0) desiredClasses.add('chat-control-slow');
+			controlClasses.forEach(className => {
+				const shouldHave = desiredClasses.has(className);
+				if (input.classList.contains(className) !== shouldHave) input.classList.toggle(className, shouldHave);
+			});
+			if (input.getAttribute('contenteditable') !== desiredEditable) input.setAttribute('contenteditable', desiredEditable);
+			setChatInputInterfacePlaceholder(input, desiredPlaceholder);
 
 			if (isLockedForUser) {
-				input.classList.add('chat-control-locked');
-				input.setAttribute('contenteditable', 'false');
-				if (!input.dataset.adminLockedDraft) input.dataset.adminLockedDraft = input.innerHTML || '';
-				input.innerHTML = '';
+				if (input.dataset.adminLockedDraft === undefined) input.dataset.adminLockedDraft = input.innerHTML || '';
+				if (input.innerHTML) input.innerHTML = '';
 			} else if (isSlowWaitingForUser) {
-				input.classList.add('chat-control-slow', 'chat-control-waiting');
-				input.setAttribute('contenteditable', 'false');
-				setChatInputInterfacePlaceholder(input, 'Slow mode cooldown...');
-				if (!input.dataset.adminSlowDraft) input.dataset.adminSlowDraft = input.innerHTML || '';
-				input.innerHTML = '';
-			} else if (isConnectionUnavailable) {
-				input.classList.add('chat-connection-unavailable');
-				input.setAttribute('contenteditable', 'false');
-				setChatInputInterfacePlaceholder(input, 'Reconnecting...');
-			} else {
-				input.setAttribute('contenteditable', 'true');
+				if (input.dataset.adminSlowDraft === undefined) input.dataset.adminSlowDraft = input.innerHTML || '';
+				if (input.innerHTML) input.innerHTML = '';
+			} else if (!isConnectionUnavailable) {
 				if (input.dataset.adminLockedDraft !== undefined) {
 					if (!input.innerHTML.trim() && input.dataset.adminLockedDraft) input.innerHTML = input.dataset.adminLockedDraft;
 					delete input.dataset.adminLockedDraft;
@@ -33501,13 +33573,6 @@ P
 				if (input.dataset.adminSlowDraft !== undefined) {
 					if (!input.innerHTML.trim() && input.dataset.adminSlowDraft) input.innerHTML = input.dataset.adminSlowDraft;
 					delete input.dataset.adminSlowDraft;
-				}
-				if (isActive && state.canBypass) {
-					input.classList.add('chat-control-bypass');
-				} else if (state.locked) {
-					input.classList.add('chat-control-locked');
-				} else if (state.slowSeconds > 0) {
-					input.classList.add('chat-control-slow');
 				}
 			}
 		}
@@ -33529,9 +33594,9 @@ P
 		if (typeof adminUpdateChatControlsPanelStatus === 'function') adminUpdateChatControlsPanelStatus();
 
 		if (inline) {
-			inline.className = 'chat-control-inline-banner';
-			inline.style.display = 'none';
-			inline.innerHTML = '';
+			if (inline.className !== 'chat-control-inline-banner') inline.className = 'chat-control-inline-banner';
+			if (inline.style.display !== 'none') inline.style.display = 'none';
+			if (inline.innerHTML) inline.innerHTML = '';
 		}
 
 		const hint = document.getElementById('admin-chat-control-hint');
@@ -33551,7 +33616,7 @@ P
 	function adminShouldRunChatControlsRealtimeSync(state = null) {
 		if (document.hidden) return false;
 		if (!(typeof socketChat !== 'undefined' && socketChat && socketChat.connected)) return false;
-		return adminChatControlsAreActive(state) || adminIsViewVisible('view-chat') || adminIsViewVisible('view-admin');
+		return adminChatControlsAreActive(state) || adminIsViewVisible('view-admin');
 	}
 
 	function adminEnsureChatControlsVisualTicker(state = null) {
@@ -33569,7 +33634,7 @@ P
 					adminEnsureChatControlsVisualTicker();
 					return;
 				}
-				if (typeof adminUpdateChatControlsBanner === 'function') adminUpdateChatControlsBanner();
+				if (typeof adminLightChatControlsUiTick === 'function') adminLightChatControlsUiTick();
 			}, 1000);
 		}
 	}
@@ -33597,7 +33662,7 @@ P
 				return;
 			}
 			adminEmitChatControlsVisualSync();
-		}, 2500);
+		}, 15000);
 		return true;
 	}
 
@@ -33962,20 +34027,29 @@ P
 	}
 
 	function adminAddIncomingReport(report, silent = false) {
-		if (!report) return;
+		if (!report) return false;
 		const incoming = { ...(report || {}), time: (report && report.time) || new Date().toISOString() };
 		const incomingKey = adminReportKey(incoming);
-		const reports = adminGetReports().filter(r => adminReportKey(r) !== incomingKey);
+		const currentReports = adminGetReports();
+		const existingIndex = currentReports.findIndex(r => adminReportKey(r) === incomingKey);
+		if (existingIndex > -1) {
+			const previous = currentReports[existingIndex];
+			const same = typeof window.getLiveRenderSignature === 'function'
+				? window.getLiveRenderSignature(previous) === window.getLiveRenderSignature(incoming)
+				: JSON.stringify(previous) === JSON.stringify(incoming);
+			if (same) return false;
+		}
+		const reports = currentReports.filter(r => adminReportKey(r) !== incomingKey);
 		reports.unshift(incoming);
 		adminSetReports(reports);
 
-		if (!silent && document.body.classList.contains('is-admin')) {
-			if (typeof showToastNotification === 'function') {
-				showToastNotification('New Report', `${incoming.reporter || 'Someone'} reported a message.`);
-			}
+		const isNewReport = existingIndex < 0;
+		if (isNewReport && !silent && document.body.classList.contains('is-admin')) {
+			if (typeof showToastNotification === 'function') showToastNotification('New Report', `${incoming.reporter || 'Someone'} reported a message.`);
 			if (typeof playUiError === 'function') playUiError();
 		}
 		if (document.getElementById('view-admin')?.style.display === 'block') adminSchedulePanelRender();
+		return true;
 	}
 
 	window.adminRequestReports = function(silent = false) {
@@ -34031,40 +34105,92 @@ P
 		if (typeof playUiError === 'function') playUiError();
 	};
 
-	window.adminRefreshHealth = function(playSound = false, renderPanel = true) {
-		window.adminHealth = window.adminHealth || {};
-		const socketState = adminGetRealtimeSocketState();
-		window.adminHealth.lastChecked = new Date().toISOString();
-		window.adminHealth.socketState = socketState;
-		window.adminHealth.socketConnected = socketState === 'online';
-		window.adminHealth.socketConnecting = socketState === 'connecting';
-		window.adminHealth.socketId = (typeof socketChat !== 'undefined' && socketChat && socketChat.id) ? socketChat.id : '-';
-		window.adminHealth.transport = (typeof socketChat !== 'undefined' && socketChat?.io?.engine?.transport?.name) ? socketChat.io.engine.transport.name : '-';
-		window.adminHealth.server = adminGetDisplayServer();
-		window.adminHealth.loadedItems = adminGetLoadedItemsCount();
-		window.adminHealth.uptime = Math.max(0, Math.round((Date.now() - (window.adminPageStartTime || Date.now())) / 1000));
-		window.adminHealth.latency = null;
-		if (typeof adminInstallSocketListeners === 'function') adminInstallSocketListeners();
 
-		if (window.adminHealth.socketConnected && typeof socketChat !== 'undefined' && socketChat && typeof socketChat.timeout === 'function') {
-			const started = Date.now();
-			try {
-				socketChat.timeout(1600).emit('admin_ping', { sentAt: started }, () => {
-					window.adminHealth.latency = Date.now() - started;
-					if (renderPanel && document.getElementById('view-admin')?.style.display === 'block') adminSchedulePanelRender();
-				});
-			} catch (e) {}
-		}
-		if (playSound && typeof playUiSuccess === 'function') playUiSuccess();
-		if (renderPanel) renderAdminPanel();
-	};
+	function adminRenderConnectionPill() {
+		const connectionPill = document.getElementById('admin-connection-pill');
+		if (!connectionPill) return false;
+		const connected = !!(typeof socketChat !== 'undefined' && socketChat && socketChat.connected);
+		const nextClass = connected ? 'admin-pill online' : 'admin-pill danger';
+		const nextHtml = connected ? '<i class="fas fa-circle"></i> Socket Online' : '<i class="fas fa-circle"></i> Socket Offline';
+		let changed = false;
+		if (connectionPill.className !== nextClass) { connectionPill.className = nextClass; changed = true; }
+		if (connectionPill.innerHTML !== nextHtml) { connectionPill.innerHTML = nextHtml; changed = true; }
+		return changed;
+	}
 
 	function adminFormatSeconds(seconds) {
 		seconds = parseInt(seconds || 0, 10) || 0;
 		const m = Math.floor(seconds / 60);
-		const s = seconds % 60;
-		return m ? `${m}m ${s}s` : `${s}s`;
+		const sec = seconds % 60;
+		return m ? `${m}m ${sec}s` : `${sec}s`;
 	}
+
+	function adminRenderHealthCard() {
+		const healthList = document.getElementById('admin-health-list');
+		const healthStrip = document.getElementById('admin-health-strip');
+		if (!healthList && !healthStrip) return false;
+		const health = window.adminHealth || {};
+		const liveSocketState = health.socketState || adminGetRealtimeSocketState();
+		const socketMeta = adminGetSocketStateMeta(liveSocketState);
+		const latencyText = liveSocketState === 'online'
+			? (health.latency === null || health.latency === undefined ? 'Pending' : health.latency + 'ms')
+			: (liveSocketState === 'connecting' ? 'Waiting...' : '-');
+		let changed = false;
+		if (healthList) {
+			changed = setAdminHtmlIfChanged(healthList, `
+				<div class="admin-kv"><span>Socket</span><strong>${socketMeta.label}</strong></div>
+				<div class="admin-kv"><span>Latency</span><strong${/^\d/.test(latencyText) ? ' data-live-value="true" translate="no"' : ''}>${latencyText}</strong></div>
+				<div class="admin-kv"><span>Transport</span><strong data-live-value="true" translate="no">${adminEscapeHtml(health.transport || '-')}</strong></div>
+				<div class="admin-kv"><span>Server</span><strong data-live-value="true" translate="no">${adminEscapeHtml(health.server || adminGetDisplayServer())}</strong></div>
+				<div class="admin-kv"><span>Page uptime</span><strong data-live-value="true" translate="no">${adminFormatSeconds(health.uptime || 0)}</strong></div>`) || changed;
+		}
+		if (healthStrip) {
+			changed = setAdminHtmlIfChanged(healthStrip, `
+				<span class="admin-status-chip ${socketMeta.className}"><i class="${socketMeta.icon}"></i> ${socketMeta.shortLabel}</span>
+				<span class="admin-status-chip ${health.loadedItems ? 'online' : 'warning'}"><i class="fas fa-database"></i> <span data-live-value="true" translate="no">${health.loadedItems || 0}</span> <span>items</span></span>`) || changed;
+		}
+		return changed;
+	}
+
+	window.adminRefreshHealth = function(playSound = false, renderPanel = true) {
+		window.adminHealth = window.adminHealth || {};
+		const health = window.adminHealth;
+		const socketState = adminGetRealtimeSocketState();
+		const nextSocketId = (typeof socketChat !== 'undefined' && socketChat && socketChat.id) ? socketChat.id : '-';
+		const nextTransport = (typeof socketChat !== 'undefined' && socketChat?.io?.engine?.transport?.name) ? socketChat.io.engine.transport.name : '-';
+		const nextServer = adminGetDisplayServer();
+		const nextLoadedItems = adminGetLoadedItemsCount();
+		const nextUptime = Math.max(0, Math.round((Date.now() - (window.adminPageStartTime || Date.now())) / 1000));
+		const healthChanged = health.socketState !== socketState || health.socketId !== nextSocketId || health.transport !== nextTransport || health.server !== nextServer || Number(health.loadedItems || 0) !== Number(nextLoadedItems || 0) || Number(health.uptime || 0) !== nextUptime;
+		health.lastChecked = new Date().toISOString();
+		health.socketState = socketState;
+		health.socketConnected = socketState === 'online';
+		health.socketConnecting = socketState === 'connecting';
+		health.socketId = nextSocketId;
+		health.transport = nextTransport;
+		health.server = nextServer;
+		health.loadedItems = nextLoadedItems;
+		health.uptime = nextUptime;
+		if (typeof adminInstallSocketListeners === 'function') adminInstallSocketListeners();
+
+		if (health.socketConnected && typeof socketChat !== 'undefined' && socketChat && typeof socketChat.timeout === 'function') {
+			const started = Date.now();
+			try {
+				socketChat.timeout(1600).emit('admin_ping', { sentAt: started }, () => {
+					const nextLatency = Date.now() - started;
+					const latencyChanged = Number(health.latency) !== nextLatency;
+					health.latency = nextLatency;
+					if (latencyChanged && document.getElementById('view-admin')?.style.display === 'block') adminRenderHealthCard();
+				});
+			} catch (e) {}
+		}
+		if (playSound && typeof playUiSuccess === 'function') playUiSuccess();
+		if (renderPanel && healthChanged && document.getElementById('view-admin')?.style.display === 'block') {
+			adminRenderConnectionPill();
+			adminRenderHealthCard();
+		}
+		return healthChanged;
+	};
 
 	function adminRenderControlPanels(visibleOnly = false) {
 		const cardCanRender = el => !visibleOnly || !!el?.closest('.admin-card')?.classList.contains('admin-entry-visible');
@@ -34072,46 +34198,66 @@ P
 		const maintInput = document.getElementById('admin-maintenance-message');
 		if (cardCanRender(maintInput)) {
 			const maintenance = adminGetMaintenanceState();
-			if (maintInput && document.activeElement !== maintInput) maintInput.value = maintenance.message || maintInput.value;
+			if (maintInput && document.activeElement !== maintInput) {
+				const nextValue = maintenance.message || maintInput.value;
+				if (maintInput.value !== nextValue) maintInput.value = nextValue;
+			}
 			const schedule = adminNormalizeMaintenanceSchedule(maintenance.schedule || {});
 			const scheduleEnabled = document.getElementById('admin-maintenance-schedule-enabled');
-			if (scheduleEnabled) scheduleEnabled.checked = !!schedule.enabled;
+			if (scheduleEnabled && scheduleEnabled.checked !== !!schedule.enabled) scheduleEnabled.checked = !!schedule.enabled;
 			const scheduleStart = document.getElementById('admin-maintenance-start-time');
-			if (scheduleStart && document.activeElement !== scheduleStart) scheduleStart.value = schedule.startTime || '02:00';
+			if (scheduleStart && document.activeElement !== scheduleStart) {
+				const nextValue = schedule.startTime || '02:00';
+				if (scheduleStart.value !== nextValue) scheduleStart.value = nextValue;
+			}
 			const scheduleEnd = document.getElementById('admin-maintenance-end-time');
-			if (scheduleEnd && document.activeElement !== scheduleEnd) scheduleEnd.value = schedule.endTime || '03:00';
-			document.querySelectorAll('.admin-maintenance-day').forEach(cb => { cb.checked = schedule.days.includes(parseInt(cb.value, 10)); });
+			if (scheduleEnd && document.activeElement !== scheduleEnd) {
+				const nextValue = schedule.endTime || '03:00';
+				if (scheduleEnd.value !== nextValue) scheduleEnd.value = nextValue;
+			}
+			document.querySelectorAll('.admin-maintenance-day').forEach(cb => {
+				const nextChecked = schedule.days.includes(parseInt(cb.value, 10));
+				if (cb.checked !== nextChecked) cb.checked = nextChecked;
+			});
 			const scheduleStatus = document.getElementById('admin-maintenance-schedule-status');
 			if (scheduleStatus) {
 				const label = adminMaintenanceScheduleLabel(schedule);
 				const countdown = maintenance.activeUntil ? adminFormatMaintenanceTimeLeft(maintenance.activeUntil) : '';
 				const suppressedCountdown = maintenance.scheduleSuppressedUntil ? adminFormatMaintenanceTimeLeft(maintenance.scheduleSuppressedUntil) : '';
-				scheduleStatus.innerHTML = schedule.enabled
+				const nextHtml = schedule.enabled
 					? `<i class="fas fa-calendar-check"></i> ${adminEscapeHtml(label)}${maintenance.scheduledActive && countdown ? ` • Live again in ${adminEscapeHtml(countdown)}` : (suppressedCountdown ? ` • Current window skipped (${adminEscapeHtml(suppressedCountdown)})` : '')}`
 					: 'Schedule is off.';
+				if (scheduleStatus.innerHTML !== nextHtml) scheduleStatus.innerHTML = nextHtml;
 			}
 			const maintPill = document.getElementById('admin-maintenance-pill');
 			if (maintPill) {
-				maintPill.className = maintenance.enabled ? 'admin-pill danger' : (schedule.enabled ? 'admin-pill warning' : 'admin-pill online');
-				maintPill.innerHTML = maintenance.manualEnabled
+				const nextClass = maintenance.enabled ? 'admin-pill danger' : (schedule.enabled ? 'admin-pill warning' : 'admin-pill online');
+				const nextHtml = maintenance.manualEnabled
 					? '<i class="fas fa-circle"></i> Manual Active'
 					: (maintenance.scheduledActive ? '<i class="fas fa-calendar-day"></i> Scheduled Active' : (schedule.enabled ? '<i class="fas fa-calendar-alt"></i> Scheduled' : '<i class="fas fa-circle"></i> Off'));
+				if (maintPill.className !== nextClass) maintPill.className = nextClass;
+				if (maintPill.innerHTML !== nextHtml) maintPill.innerHTML = nextHtml;
 			}
 			const maintBtn = document.getElementById('admin-maintenance-toggle');
 			if (maintBtn && !window.__adminMaintenanceCommitInFlight) {
-				maintBtn.disabled = false;
-				maintBtn.style.pointerEvents = '';
-				maintBtn.style.opacity = '';
-				maintBtn.className = maintenance.enabled ? 'admin-action-btn danger' : 'admin-action-btn warning';
-				maintBtn.innerHTML = maintenance.enabled ? '<i class="fas fa-power-off"></i> Disable Now' : '<i class="fas fa-power-off"></i> Enable Now';
+				if (maintBtn.disabled) maintBtn.disabled = false;
+				if (maintBtn.style.pointerEvents) maintBtn.style.pointerEvents = '';
+				if (maintBtn.style.opacity) maintBtn.style.opacity = '';
+				const nextClass = maintenance.enabled ? 'admin-action-btn danger' : 'admin-action-btn warning';
+				const nextHtml = maintenance.enabled ? '<i class="fas fa-power-off"></i> Disable Now' : '<i class="fas fa-power-off"></i> Enable Now';
+				if (maintBtn.className !== nextClass) maintBtn.className = nextClass;
+				if (maintBtn.innerHTML !== nextHtml) maintBtn.innerHTML = nextHtml;
 			}
 
 			const pinned = adminGetPinnedAnnouncement();
 			const pinnedStatus = document.getElementById('admin-pinned-status');
-			if (pinnedStatus) pinnedStatus.innerHTML = pinned?.text ? `<i class="fas fa-thumbtack"></i> ${adminEscapeHtml(pinned.text)}` : 'No custom announcement pinned.';
+			if (pinnedStatus) {
+				const nextHtml = pinned?.text ? `<i class="fas fa-thumbtack"></i> ${adminEscapeHtml(pinned.text)}` : 'No custom announcement pinned.';
+				if (pinnedStatus.innerHTML !== nextHtml) pinnedStatus.innerHTML = nextHtml;
+			}
 			const pinnedColor = adminNormalizeAnnouncementColor(pinned?.color || '#ffcc00');
 			const pinnedColorInput = document.getElementById('admin-pinned-announcement-color');
-			if (pinnedColorInput && document.activeElement !== pinnedColorInput) pinnedColorInput.value = pinnedColor;
+			if (pinnedColorInput && document.activeElement !== pinnedColorInput && pinnedColorInput.value !== pinnedColor) pinnedColorInput.value = pinnedColor;
 			if (typeof window.adminPreviewPinnedAnnouncementColor === 'function') window.adminPreviewPinnedAnnouncementColor(pinnedColor);
 		}
 
@@ -34119,40 +34265,21 @@ P
 		if (cardCanRender(lockToggle)) {
 			const controls = window.adminGetChatControls();
 			const slowInput = document.getElementById('admin-slowmode-seconds');
-			if (lockToggle) lockToggle.checked = !!controls.locked;
-			if (slowInput && document.activeElement !== slowInput) slowInput.value = controls.slowSeconds || 0;
+			if (lockToggle && lockToggle.checked !== !!controls.locked) lockToggle.checked = !!controls.locked;
+			if (slowInput && document.activeElement !== slowInput && String(slowInput.value) !== String(controls.slowSeconds || 0)) slowInput.value = controls.slowSeconds || 0;
 			const chatPill = document.getElementById('admin-chat-controls-pill');
 			if (chatPill) {
 				const active = controls.locked || controls.slowSeconds > 0;
-				chatPill.className = controls.locked ? 'admin-pill danger' : (active ? 'admin-pill warning' : 'admin-pill online');
-				chatPill.innerHTML = controls.locked ? '<i class="fas fa-lock"></i> Locked' : (controls.slowSeconds > 0 ? `<i class="fas fa-clock"></i> Slow ${controls.slowSeconds}s` : '<i class="fas fa-lock-open"></i> Open');
+				const nextClass = controls.locked ? 'admin-pill danger' : (active ? 'admin-pill warning' : 'admin-pill online');
+				const nextHtml = controls.locked ? '<i class="fas fa-lock"></i> Locked' : (controls.slowSeconds > 0 ? `<i class="fas fa-clock"></i> Slow ${controls.slowSeconds}s` : '<i class="fas fa-lock-open"></i> Open');
+				if (chatPill.className !== nextClass) chatPill.className = nextClass;
+				if (chatPill.innerHTML !== nextHtml) chatPill.innerHTML = nextHtml;
 			}
 			if (typeof adminUpdateChatControlsPanelStatus === 'function') adminUpdateChatControlsPanelStatus();
 		}
 
 		const healthList = document.getElementById('admin-health-list');
-		if (cardCanRender(healthList)) {
-			const health = window.adminHealth || {};
-			const liveSocketState = health.socketState || adminGetRealtimeSocketState();
-			const socketMeta = adminGetSocketStateMeta(liveSocketState);
-			const latencyText = liveSocketState === 'online'
-				? (health.latency === null || health.latency === undefined ? 'Pending' : health.latency + 'ms')
-				: (liveSocketState === 'connecting' ? 'Waiting...' : '-');
-			if (healthList) {
-				setAdminHtmlIfChanged(healthList, `
-					<div class="admin-kv"><span>Socket</span><strong>${socketMeta.label}</strong></div>
-					<div class="admin-kv"><span>Latency</span><strong${/^\d/.test(latencyText) ? ' data-live-value="true" translate="no"' : ''}>${latencyText}</strong></div>
-					<div class="admin-kv"><span>Transport</span><strong data-live-value="true" translate="no">${adminEscapeHtml(health.transport || '-')}</strong></div>
-					<div class="admin-kv"><span>Server</span><strong data-live-value="true" translate="no">${adminEscapeHtml(health.server || adminGetDisplayServer())}</strong></div>
-					<div class="admin-kv"><span>Page uptime</span><strong data-live-value="true" translate="no">${adminFormatSeconds(health.uptime || 0)}</strong></div>`);
-			}
-			const healthStrip = document.getElementById('admin-health-strip');
-			if (healthStrip) {
-				setAdminHtmlIfChanged(healthStrip, `
-					<span class="admin-status-chip ${socketMeta.className}"><i class="${socketMeta.icon}"></i> ${socketMeta.shortLabel}</span>
-					<span class="admin-status-chip ${health.loadedItems ? 'online' : 'warning'}"><i class="fas fa-database"></i> <span data-live-value="true" translate="no">${health.loadedItems || 0}</span> <span>items</span></span>`);
-			}
-		}
+		if (cardCanRender(healthList)) adminRenderHealthCard();
 
 		const reportsEl = document.getElementById('admin-report-center');
 		if (reportsEl && cardCanRender(reportsEl)) {
@@ -34182,47 +34309,41 @@ P
 		const serverLogEl = document.getElementById('admin-server-log');
 		if (serverLogEl && cardCanRender(serverLogEl)) {
 			const log = adminGetServerLog();
-			if (!log.length) {
-				setAdminHtmlIfChanged(serverLogEl, '<div class="admin-empty">No server events yet. Logins and disconnects will appear here.</div>');
-			} else {
-				setAdminHtmlIfChanged(serverLogEl, log.slice(0, 200).map(item => {
-					const time = adminFormatLogTimestamp(item.time);
-					const userName = String(item.user || 'Server');
-					const detail = item.detail && typeof item.detail === 'object' ? item.detail : {};
-					const targetName = String(detail.targetName || detail.targetUser || '');
-					const msgId = detail.msgId ? String(detail.msgId) : '';
-					const userHtml = userName && userName !== 'Server' && userName !== 'System'
-						? `<b class="admin-log-user-link" onclick="event.stopPropagation(); adminOpenUserProfile('${encodeURIComponent(userName)}')">${adminEscapeHtml(userName)}</b>`
-						: `<b>${adminEscapeHtml(userName)}</b>`;
-					const targetHtml = targetName && targetName !== userName
-						? `<span class="admin-log-target-sep"><i class="fas fa-chevron-right"></i></span><b class="admin-log-user-link" onclick="event.stopPropagation(); adminOpenUserProfile('${encodeURIComponent(targetName)}')">${adminEscapeHtml(targetName)}</b>`
-						: '';
-					return `<div class="admin-log-item${msgId ? ' admin-log-jumpable' : ''}"${msgId ? ` onclick="adminJumpToReportedMessage('${adminEscapeAttr(msgId)}', 'Server Log')"` : ''}><div class="admin-log-head"><div class="admin-log-main"><span class="admin-server-log-type">${adminEscapeHtml(item.type || 'server')}</span>${userHtml}${targetHtml}</div><span class="admin-log-time">${adminEscapeHtml(time)}</span></div><div class="admin-log-message">${adminEscapeHtml(item.message || '')}</div></div>`;
-				}).join(''));
-			}
+			if (!log.length) setAdminHtmlIfChanged(serverLogEl, '<div class="admin-empty">No server events yet. Logins and disconnects will appear here.</div>');
+			else setAdminHtmlIfChanged(serverLogEl, log.slice(0, 200).map(item => {
+				const time = adminFormatLogTimestamp(item.time);
+				const userName = String(item.user || 'Server');
+				const detail = item.detail && typeof item.detail === 'object' ? item.detail : {};
+				const targetName = String(detail.targetName || detail.targetUser || '');
+				const msgId = detail.msgId ? String(detail.msgId) : '';
+				const userHtml = userName && userName !== 'Server' && userName !== 'System'
+					? `<b class="admin-log-user-link" onclick="event.stopPropagation(); adminOpenUserProfile('${encodeURIComponent(userName)}')">${adminEscapeHtml(userName)}</b>`
+					: `<b>${adminEscapeHtml(userName)}</b>`;
+				const targetHtml = targetName && targetName !== userName
+					? `<span class="admin-log-target-sep"><i class="fas fa-chevron-right"></i></span><b class="admin-log-user-link" onclick="event.stopPropagation(); adminOpenUserProfile('${encodeURIComponent(targetName)}')">${adminEscapeHtml(targetName)}</b>`
+					: '';
+				return `<div class="admin-log-item${msgId ? ' admin-log-jumpable' : ''}"${msgId ? ` onclick="adminJumpToReportedMessage('${adminEscapeAttr(msgId)}', 'Server Log')"` : ''}><div class="admin-log-head"><div class="admin-log-main"><span class="admin-server-log-type">${adminEscapeHtml(item.type || 'server')}</span>${userHtml}${targetHtml}</div><span class="admin-log-time">${adminEscapeHtml(time)}</span></div><div class="admin-log-message">${adminEscapeHtml(item.message || '')}</div></div>`;
+			}).join(''));
 		}
 
 		const modLog = document.getElementById('admin-moderation-log');
 		if (modLog && cardCanRender(modLog)) {
 			const log = adminGetModerationLog();
-			if (!log.length) {
-				setAdminHtmlIfChanged(modLog, '<div class="admin-empty">No moderation actions logged yet.</div>');
-			} else {
-				setAdminHtmlIfChanged(modLog, log.slice(0, 200).map(item => {
-					const time = adminFormatLogTimestamp(item.time);
-					const adminName = String(item.admin || 'Admin');
-					const detail = item.detail && typeof item.detail === 'object' ? item.detail : {};
-					const targetName = String(detail.targetName || detail.targetUser || '');
-					const msgId = detail.msgId ? String(detail.msgId) : '';
-					const adminHtml = adminName && adminName !== 'System'
-						? `<b class="admin-log-user-link" onclick="event.stopPropagation(); adminOpenUserProfile('${encodeURIComponent(adminName)}')">${adminEscapeHtml(adminName)}</b>`
-						: `<b>${adminEscapeHtml(adminName)}</b>`;
-					const targetHtml = targetName && targetName !== adminName
-						? `<span class="admin-log-target-sep"><i class="fas fa-chevron-right"></i></span><b class="admin-log-user-link" onclick="event.stopPropagation(); adminOpenUserProfile('${encodeURIComponent(targetName)}')">${adminEscapeHtml(targetName)}</b>`
-						: '';
-					return `<div class="admin-log-item${msgId ? ' admin-log-jumpable' : ''}"${msgId ? ` onclick="adminJumpToReportedMessage('${adminEscapeAttr(msgId)}', 'Moderation Log')"` : ''}><div class="admin-log-head"><div class="admin-log-main"><span class="admin-log-type">${adminEscapeHtml(item.type || 'log')}</span>${adminHtml}${targetHtml}</div><span class="admin-log-time">${adminEscapeHtml(time)}</span></div><div class="admin-log-message">${adminEscapeHtml(item.message || '')}</div></div>`;
-				}).join(''));
-			}
+			if (!log.length) setAdminHtmlIfChanged(modLog, '<div class="admin-empty">No moderation actions logged yet.</div>');
+			else setAdminHtmlIfChanged(modLog, log.slice(0, 200).map(item => {
+				const time = adminFormatLogTimestamp(item.time);
+				const adminName = String(item.admin || 'Admin');
+				const detail = item.detail && typeof item.detail === 'object' ? item.detail : {};
+				const targetName = String(detail.targetName || detail.targetUser || '');
+				const msgId = detail.msgId ? String(detail.msgId) : '';
+				const adminHtml = adminName && adminName !== 'System'
+					? `<b class="admin-log-user-link" onclick="event.stopPropagation(); adminOpenUserProfile('${encodeURIComponent(adminName)}')">${adminEscapeHtml(adminName)}</b>`
+					: `<b>${adminEscapeHtml(adminName)}</b>`;
+				const targetHtml = targetName && targetName !== adminName
+					? `<span class="admin-log-target-sep"><i class="fas fa-chevron-right"></i></span><b class="admin-log-user-link" onclick="event.stopPropagation(); adminOpenUserProfile('${encodeURIComponent(targetName)}')">${adminEscapeHtml(targetName)}</b>`
+					: '';
+				return `<div class="admin-log-item${msgId ? ' admin-log-jumpable' : ''}"${msgId ? ` onclick="adminJumpToReportedMessage('${adminEscapeAttr(msgId)}', 'Moderation Log')"` : ''}><div class="admin-log-head"><div class="admin-log-main"><span class="admin-log-type">${adminEscapeHtml(item.type || 'log')}</span>${adminHtml}${targetHtml}</div><span class="admin-log-time">${adminEscapeHtml(time)}</span></div><div class="admin-log-message">${adminEscapeHtml(item.message || '')}</div></div>`;
+			}).join(''));
 		}
 
 		if (!visibleOnly) {
@@ -34237,8 +34358,15 @@ P
 		if (window.adminMaintenanceListenersSocket === socketChat) return;
 		window.adminMaintenanceListenersSocket = socketChat;
 		const applyMaintenanceState = data => {
-			adminSetMaintenanceState(data || {}, false);
+			const nextState = adminNormalizeMaintenanceState(data || {});
+			const currentState = adminGetMaintenanceState();
+			const same = typeof window.getLiveRenderSignature === 'function'
+				? window.getLiveRenderSignature(currentState) === window.getLiveRenderSignature(nextState)
+				: JSON.stringify(currentState) === JSON.stringify(nextState);
+			if (same) return false;
+			adminSetMaintenanceState(nextState, false);
 			if (document.getElementById('view-admin')?.style.display === 'block') adminSchedulePanelRender();
+			return true;
 		};
 		socketChat.on('maintenance_mode', applyMaintenanceState);
 		socketChat.on('connect', () => {
@@ -34254,13 +34382,20 @@ P
 		window.adminSocketListenersSocket = socketChat;
 		const syncAdminHealth = (state) => {
 			window.adminHealth = window.adminHealth || {};
-			window.adminHealth.socketState = state || adminGetRealtimeSocketState();
-			window.adminHealth.socketConnected = window.adminHealth.socketState === 'online';
-			window.adminHealth.socketConnecting = window.adminHealth.socketState === 'connecting';
+			const nextState = state || adminGetRealtimeSocketState();
+			const nextSocketId = socketChat?.id || '-';
+			const nextTransport = socketChat?.io?.engine?.transport?.name || '-';
+			const visualChanged = window.adminHealth.socketState !== nextState || window.adminHealth.socketId !== nextSocketId || window.adminHealth.transport !== nextTransport;
+			window.adminHealth.socketState = nextState;
+			window.adminHealth.socketConnected = nextState === 'online';
+			window.adminHealth.socketConnecting = nextState === 'connecting';
 			window.adminHealth.lastChecked = new Date().toISOString();
-			window.adminHealth.socketId = socketChat?.id || '-';
-			window.adminHealth.transport = socketChat?.io?.engine?.transport?.name || '-';
-			if (document.getElementById('view-admin')?.style.display === 'block') adminSchedulePanelRender();
+			window.adminHealth.socketId = nextSocketId;
+			window.adminHealth.transport = nextTransport;
+			if (visualChanged && document.getElementById('view-admin')?.style.display === 'block') {
+				adminRenderConnectionPill();
+				adminRenderHealthCard();
+			}
 		};
 		socketChat.on('connect', () => {
 			syncAdminHealth('online');
@@ -34442,7 +34577,7 @@ P
 		adminInstallMaintenanceSocketListeners();
 		if (window.isProfileLoaded === true) adminInstallSocketListeners();
 		adminRefreshHealth(false);
-		if (typeof window.adminRequestReports === 'function' && (!window.adminLastReportsRequestAt || Date.now() - window.adminLastReportsRequestAt > 4500)) {
+		if (typeof window.adminRequestReports === 'function' && (!window.adminLastReportsRequestAt || Date.now() - window.adminLastReportsRequestAt > 30000)) {
 			window.adminRequestReports(true);
 		}
 	}
@@ -37868,6 +38003,29 @@ P
 			});
 			if (alreadySettled) return;
 		}
+		if (n === null && badges.length > 0) {
+			if (Number.isFinite(oldValue)) {
+				const expectedLabel = oldValue === 1 ? 'PLAYER' : 'PLAYERS';
+				const cachedFallbackSettled = Array.from(badges).every(badge => {
+					const countEl = getRevivedPlayerCountElement(badge, key);
+					const featuredLabelEl = badge.querySelector('.featured-revived-player-label');
+					return !!countEl
+						&& countEl.textContent === String(oldValue)
+						&& badge.classList.contains('has-value')
+						&& !badge.classList.contains('is-loading')
+						&& !badge.classList.contains('is-error')
+						&& badge.classList.contains('is-zero') === (oldValue === 0)
+						&& (!featuredLabelEl || featuredLabelEl.textContent === expectedLabel);
+				});
+				if (cachedFallbackSettled) return;
+			} else {
+				const errorSettled = Array.from(badges).every(badge => {
+					const countEl = getRevivedPlayerCountElement(badge, key);
+					return !!countEl && countEl.textContent === '?' && badge.classList.contains('is-error') && !badge.classList.contains('is-loading');
+				});
+				if (errorSettled) return;
+			}
+		}
 		badges.forEach(badge => {
 			const countEl = getRevivedPlayerCountElement(badge, key);
 			if (!countEl) return;
@@ -37878,7 +38036,7 @@ P
 			if (n !== null) {
 				if (typeof window.setLiveCountText === 'function') window.setLiveCountText(countEl, String(n), n, `revived-player:${key}`);
 				else if (countEl.textContent !== String(n)) countEl.textContent = String(n);
-				if (featuredLabelEl) featuredLabelEl.textContent = n === 1 ? 'PLAYER' : 'PLAYERS';
+				if (featuredLabelEl) { const nextLabel = n === 1 ? 'PLAYER' : 'PLAYERS'; if (featuredLabelEl.textContent !== nextLabel) featuredLabelEl.textContent = nextLabel; }
 				if (n === 0) badge.classList.add('is-zero');
 				return;
 			}
@@ -37886,7 +38044,7 @@ P
 			if (Number.isFinite(oldValue)) {
 				if (typeof window.setLiveCountText === 'function') window.setLiveCountText(countEl, String(oldValue), oldValue, `revived-player:${key}`);
 				else if (countEl.textContent !== String(oldValue)) countEl.textContent = String(oldValue);
-				if (featuredLabelEl) featuredLabelEl.textContent = oldValue === 1 ? 'PLAYER' : 'PLAYERS';
+				if (featuredLabelEl) { const nextLabel = oldValue === 1 ? 'PLAYER' : 'PLAYERS'; if (featuredLabelEl.textContent !== nextLabel) featuredLabelEl.textContent = nextLabel; }
 				badge.classList.add('has-value');
 				if (oldValue === 0) badge.classList.add('is-zero');
 				return;
@@ -39147,12 +39305,13 @@ P
 		if (!status || status.status !== 'playing') return false;
 		const value = getLocalPs3PlayTimeDisplayValue();
 		if (!normalizePs3PlayTimeClient(value)) return false;
-		window.currentPs3PlayTime = value;
+		let changed = false;
+		if (window.currentPs3PlayTime !== value) { window.currentPs3PlayTime = value; changed = true; }
 
 		document.querySelectorAll('#profile-playing-time[data-playtime-local="1"], #ps3-local-grid .game-card.is-playing .my-games-playing-time, #ps3-favs-grid .game-card.is-playing .my-games-playing-time').forEach(el => {
-			el.textContent = value;
+			if (el.textContent !== value) { el.textContent = value; changed = true; }
 		});
-		return true;
+		return changed;
 	}
 
 	function stopLocalPs3PlayTimeTicker() {
@@ -39331,7 +39490,8 @@ P
 
 		const updatedAt = Number(el.dataset.playtimeUpdatedAt || 0);
 		const elapsed = updatedAt > 0 ? Math.max(0, Math.floor((Date.now() - updatedAt) / 1000)) : 0;
-		el.textContent = formatPs3PlayTimeSeconds(base + elapsed);
+		const nextText = formatPs3PlayTimeSeconds(base + elapsed);
+		if (el.textContent !== nextText) el.textContent = nextText;
 		return true;
 	}
 
@@ -43015,6 +43175,12 @@ function formatLibraryLastPlayedBadge(game = {}) {
 	function updateConsoleStorageUI(freeGb = 127.4, totalGb = 321, devices = null) {
 		freeGb = Number(freeGb) || 127.4;
 		totalGb = Number(totalGb) || 321;
+		const resolvedDevices = Array.isArray(devices) ? devices : getConsolePreviewStorageDevices(freeGb, totalGb);
+		const storageSignature = typeof window.getLiveRenderSignature === 'function'
+			? window.getLiveRenderSignature([freeGb, totalGb, resolvedDevices])
+			: JSON.stringify([freeGb, totalGb, resolvedDevices]);
+		const storageSignatureHost = document.getElementById('console-storage-devices');
+		if (storageSignatureHost && storageSignatureHost.dataset.consoleStorageUiSignature === storageSignature) return false;
 		const usedGb = Math.max(0, totalGb - freeGb);
 		const usedPct = clampConsoleValue(Math.round((usedGb / totalGb) * 100), 0, 100);
 		setTextContentById('console-storage-free', freeGb.toFixed(freeGb >= 100 ? 0 : 1));
@@ -43031,7 +43197,9 @@ function formatLibraryLastPlayedBadge(game = {}) {
 				barEl.style.background = nextBackground;
 			}
 		}
-		renderConsoleStorageDevices(Array.isArray(devices) ? devices : getConsolePreviewStorageDevices(freeGb, totalGb));
+		renderConsoleStorageDevices(resolvedDevices);
+		if (storageSignatureHost) storageSignatureHost.dataset.consoleStorageUiSignature = storageSignature;
+		return true;
 	}
 
     function normalizeConsoleRuntimeCount(value) {
@@ -43199,7 +43367,7 @@ function formatLibraryLastPlayedBadge(game = {}) {
     function hideConsoleSensitiveValues() {
         ['console-psid', 'console-idps'].forEach(id => {
             const el = document.getElementById(id);
-            if (!el) return;
+            if (!el || el.dataset.sensitiveVisible === '0') return;
             el.dataset.sensitiveVisible = '0';
             syncConsoleSensitiveValue(id, el.dataset.sensitiveValue || '--');
         });
@@ -44921,15 +45089,22 @@ function formatLibraryLastPlayedBadge(game = {}) {
 	}
 
 	function setFpsCounterRuntimeState({ detected = false, loaded = false, slot = null, stateChecked = false, path = '' } = {}) {
-		fpsCounterPluginDetected = !!detected;
-		fpsCounterPluginLoaded = !!loaded;
-		fpsCounterPluginSlot = (Number.isFinite(Number(slot)) && Number(slot) >= 0) ? Number(slot) : null;
+		const nextDetected = !!detected;
+		const nextLoaded = !!loaded;
+		const nextSlot = (Number.isFinite(Number(slot)) && Number(slot) >= 0) ? Number(slot) : null;
+		const nextStateChecked = !!stateChecked;
+		const nextPath = path ? String(path).replace(/\\/g, '/') : fpsCounterResolvedPluginPath;
+		const changed = fpsCounterPluginDetected !== nextDetected || fpsCounterPluginLoaded !== nextLoaded || fpsCounterPluginSlot !== nextSlot || fpsCounterDetectionChecked !== true || fpsCounterPluginStateChecked !== nextStateChecked || fpsCounterResolvedPluginPath !== nextPath;
+		fpsCounterPluginDetected = nextDetected;
+		fpsCounterPluginLoaded = nextLoaded;
+		fpsCounterPluginSlot = nextSlot;
 		fpsCounterDetectionChecked = true;
-		fpsCounterPluginStateChecked = !!stateChecked;
-		if (path) fpsCounterResolvedPluginPath = String(path).replace(/\\/g, '/');
+		fpsCounterPluginStateChecked = nextStateChecked;
+		if (fpsCounterResolvedPluginPath !== nextPath) fpsCounterResolvedPluginPath = nextPath;
 
 		// Runtime detection must never overwrite the saved/profile preference.
-		updateFpsCounterStatus();
+		if (changed) updateFpsCounterStatus();
+		return changed;
 	}
 
 	function syncFpsCounterFromPluginList(plugins = [], detectedOverride = null, detectedPath = '') {
@@ -44982,28 +45157,31 @@ function formatLibraryLastPlayedBadge(game = {}) {
 		const unknown = isFpsCounterStateUnknownOnConnected();
 
 		if (toggle) {
-			toggle.checked = missing ? desired : enabled;
-			toggle.disabled = !!busy;
+			const nextChecked = missing ? desired : enabled;
+			const nextDisabled = !!busy;
+			if (toggle.checked !== nextChecked) toggle.checked = nextChecked;
+			if (toggle.disabled !== nextDisabled) toggle.disabled = nextDisabled;
 		}
 
 		if (control) {
-			control.classList.toggle('is-on', !missing && enabled);
-			control.classList.toggle('is-busy', !!busy);
-			control.classList.toggle('is-missing', missing);
-			if (missing) {
-				control.title = `FPS Counter plugin was not found. Saved preference: ${desired ? 'ON' : 'OFF'}.`;
-			} else if (unknown) {
-				control.title = `${getFpsCounterPluginName()} exists, but the active state could not be read from Plugin Manager.`;
-			} else {
-				control.title = enabled
-					? `FPS Counter is loaded in VSH${fpsCounterPluginSlot !== null ? ` slot ${fpsCounterPluginSlot}` : ''}. Click to unload ${getFpsCounterPluginName()}.`
-					: `FPS Counter is installed but not loaded. Click to load ${getFpsCounterPluginName()}.`;
-			}
+			const nextOn = !missing && enabled;
+			if (control.classList.contains('is-on') !== nextOn) control.classList.toggle('is-on', nextOn);
+			if (control.classList.contains('is-busy') !== !!busy) control.classList.toggle('is-busy', !!busy);
+			if (control.classList.contains('is-missing') !== missing) control.classList.toggle('is-missing', missing);
+			let nextTitle = '';
+			if (missing) nextTitle = `FPS Counter plugin was not found. Saved preference: ${desired ? 'ON' : 'OFF'}.`;
+			else if (unknown) nextTitle = `${getFpsCounterPluginName()} exists, but the active state could not be read from Plugin Manager.`;
+			else nextTitle = enabled
+				? `FPS Counter is loaded in VSH${fpsCounterPluginSlot !== null ? ` slot ${fpsCounterPluginSlot}` : ''}. Click to unload ${getFpsCounterPluginName()}.`
+				: `FPS Counter is installed but not loaded. Click to load ${getFpsCounterPluginName()}.`;
+			if (control.title !== nextTitle) control.title = nextTitle;
 		}
 
 		if (status) {
-			status.innerHTML = text || (missing ? 'MISSING' : (unknown ? 'READY' : (enabled ? 'ON' : 'OFF')));
-			status.style.color = color || (missing ? '#ff7777' : (unknown ? '#ffcc00' : (enabled ? '#4caf50' : 'var(--text-muted)')));
+			const nextHtml = text || (missing ? 'MISSING' : (unknown ? 'READY' : (enabled ? 'ON' : 'OFF')));
+			const nextColor = color || (missing ? '#ff7777' : (unknown ? '#ffcc00' : (enabled ? '#4caf50' : 'var(--text-muted)')));
+			if (status.innerHTML !== nextHtml) status.innerHTML = nextHtml;
+			if (status.dataset.fpsStatusColor !== nextColor) { status.dataset.fpsStatusColor = nextColor; status.style.color = nextColor; }
 		}
 	}
 
@@ -47470,42 +47648,74 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 
 	function markVisibleChatAsRead() {
 		const myName = localStorage.getItem('psn_username') || "Guest";
-		const latestTime = (window.messageHistory || []).reduce((latest, msg) => {
+		const history = Array.isArray(window.messageHistory) ? window.messageHistory : [];
+		const latestTime = history.reduce((latest, msg) => {
 			const msgTime = new Date(msg && msg.time).getTime();
 			return Number.isFinite(msgTime) ? Math.max(latest, msgTime) : latest;
-		}, Date.now());
-		saveState('psn_last_chat_read', String(Math.max(Date.now(), latestTime)));
-		saveState('psn_chat_dot', 'false');
+		}, 0);
+		const previousRead = parseInt(loadState('psn_last_chat_read') || '0', 10) || 0;
+		const readChanged = latestTime > previousRead;
+		if (readChanged) saveState('psn_last_chat_read', String(Math.max(Date.now(), latestTime)));
+		if (loadState('psn_chat_dot') !== 'false') saveState('psn_chat_dot', 'false');
 
 		const dot = document.getElementById('chat-dot');
-		if (dot) dot.style.display = 'none';
+		if (dot && dot.style.display !== 'none') dot.style.display = 'none';
 		if (typeof updateJumpBottomUnreadBadge === 'function') updateJumpBottomUnreadBadge(0);
 
-		if (typeof broadcastProfileUpdate === 'function') broadcastProfileUpdate({ silentIndicator:true });
+		if (readChanged && typeof broadcastProfileUpdate === 'function') broadcastProfileUpdate({ silentIndicator:true });
 
-		if (window.messageHistory && typeof socketChat !== 'undefined' && socketChat && socketChat.connected) {
-			window.messageHistory.forEach(m => {
-				if (m && m.user !== myName) {
-					const hasSeen = m.seenBy && m.seenBy.includes(myName);
-					if (!hasSeen) {
-						const msgId = new Date(m.time).getTime();
-						if (Number.isFinite(msgId)) socketChat.emit('mark_as_read', { msgId: msgId, user: myName });
-					}
-				}
+		if (history.length && typeof socketChat !== 'undefined' && socketChat && socketChat.connected) {
+			window.__chatSeenEmitPending = window.__chatSeenEmitPending instanceof Map ? window.__chatSeenEmitPending : new Map();
+			const now = Date.now();
+			history.forEach(m => {
+				if (!m || m.user === myName) return;
+				const hasSeen = Array.isArray(m.seenBy) && m.seenBy.includes(myName);
+				if (hasSeen) return;
+				const msgId = new Date(m.time).getTime();
+				if (!Number.isFinite(msgId)) return;
+				const key = String(msgId);
+				const pendingAt = Number(window.__chatSeenEmitPending.get(key) || 0);
+				if (pendingAt && now - pendingAt < 5000) return;
+				window.__chatSeenEmitPending.set(key, now);
+				socketChat.emit('mark_as_read', { msgId, user: myName });
 			});
 		}
+		return readChanged;
 	}
 
+    function getChatMessageRenderSignature(msg = {}) {
+        const comparable = [
+            String(new Date(msg && msg.time).getTime() || (msg && msg.time) || ''),
+            String(msg && msg.user || ''),
+            String(msg && msg.avatar || ''),
+            String(msg && msg.type || 'text'),
+            String(msg && msg.text || ''),
+            msg && msg.replyTo || null,
+            msg && msg.content || null,
+            Array.isArray(msg && msg.reactions) ? msg.reactions : [],
+            msg && msg.edited === true ? 1 : 0,
+            msg && msg.editedByAdmin === true ? 1 : 0,
+            msg && msg.editedByMod === true ? 1 : 0,
+            msg && msg.isGlobalPing === true ? 1 : 0,
+            String(msg && msg.globalPingRole || ''),
+            msg && msg.isAdmin === true ? 1 : 0,
+            msg && msg.isModerator === true ? 1 : 0,
+            msg && (msg.isBanned === true || msg.banned === true) ? 1 : 0
+        ];
+        return typeof window.getLiveRenderSignature === 'function' ? window.getLiveRenderSignature(comparable) : JSON.stringify(comparable);
+    }
+
+    function getChatHistoryDataSignature(history) {
+        const comparable = (Array.isArray(history) ? history : []).map(msg => [
+            getChatMessageRenderSignature(msg),
+            Array.isArray(msg && msg.seenBy) ? msg.seenBy : [],
+            msg && msg.seenAt && typeof msg.seenAt === 'object' ? msg.seenAt : {}
+        ]);
+        return typeof window.getLiveRenderSignature === 'function' ? window.getLiveRenderSignature(comparable) : JSON.stringify(comparable);
+    }
+
     function getChatHistoryRenderSignature(history) {
-        return (Array.isArray(history) ? history : []).map(msg => {
-            const timeKey = String(new Date(msg && msg.time).getTime() || (msg && msg.time) || '');
-            const textKey = String((msg && msg.text) || '').length;
-            const editKey = msg && msg.edited ? '1' : '0';
-            const globalKey = msg && (msg.isGlobalPing === true || (typeof isChatGlobalPingMessage === 'function' && isChatGlobalPingMessage(msg, msg.user))) ? '1' : '0';
-            const typeKey = String((msg && msg.type) || 'text');
-            const contentKey = Array.isArray(msg && msg.content) ? msg.content.length : ((msg && msg.content) ? '1' : '0');
-            return `${timeKey}:${textKey}:${editKey}:${globalKey}:${typeKey}:${contentKey}`;
-        }).join('|');
+        return (Array.isArray(history) ? history : []).map(msg => getChatMessageRenderSignature(msg)).join('|');
     }
 
     function updateChatHistoryRenderSignature() {
@@ -48299,17 +48509,25 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 
     function refreshChatSeenDomForMessage(msgId) {
         const id = String(msgId || '');
-        if (!id) return;
+        if (!id) return false;
         const msg = Array.isArray(window.messageHistory) ? window.messageHistory.find(item => String(new Date(item && item.time).getTime()) === id) : null;
         const checkCont = document.getElementById(`check-${id}`);
-        if (!msg || !checkCont) return;
+        if (!msg || !checkCont) return false;
         const seenList = Array.isArray(msg.seenBy) ? msg.seenBy : [];
         const seenAtMap = msg.seenAt && typeof msg.seenAt === 'object' && !Array.isArray(msg.seenAt) ? msg.seenAt : {};
-        checkCont.querySelectorAll('i').forEach(c => { c.style.color = '#4caf50'; if (seenList.length) c.style.display = 'block'; });
-        checkCont.setAttribute('data-seen-list', seenList.join(', '));
-        checkCont.setAttribute('data-seen-count', String(seenList.length));
-        checkCont.setAttribute('data-seen-at', encodeURIComponent(JSON.stringify(seenAtMap)));
+        const nextSeenList = seenList.join(', ');
+        const nextSeenCount = String(seenList.length);
+        const nextSeenAt = encodeURIComponent(JSON.stringify(seenAtMap));
+        if (checkCont.getAttribute('data-seen-list') === nextSeenList && checkCont.getAttribute('data-seen-count') === nextSeenCount && checkCont.getAttribute('data-seen-at') === nextSeenAt) return false;
+        checkCont.querySelectorAll('i').forEach(c => {
+            if (c.style.color !== '#4caf50') c.style.color = '#4caf50';
+            if (seenList.length && c.style.display !== 'block') c.style.display = 'block';
+        });
+        checkCont.setAttribute('data-seen-list', nextSeenList);
+        checkCont.setAttribute('data-seen-count', nextSeenCount);
+        checkCont.setAttribute('data-seen-at', nextSeenAt);
         checkCont.setAttribute('title', `Seen by: ${seenList.length}`);
+        return true;
     }
     window.refreshChatSeenDomForMessage = refreshChatSeenDomForMessage;
 
@@ -48323,10 +48541,16 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
         }
         const cursor = Math.max(0, Number(event.cursor) || 0);
         if (cursor && cursor <= Math.max(0, Number(window.__chatSeenCursor) || 0)) return true;
+        const beforeSignature = getChatHistoryDataSignature(window.messageHistory || []);
         applyChatSeenEventsToHistory(window.messageHistory || [], [event]);
         if (cursor) window.__chatSeenCursor = cursor;
-        refreshChatSeenDomForMessage(event.msgId);
-        scheduleChatPersistentCacheWrite();
+        const myName = localStorage.getItem('psn_username') || '';
+        if (event.reader && myName && String(event.reader) === myName && window.__chatSeenEmitPending instanceof Map) window.__chatSeenEmitPending.delete(String(event.msgId || ''));
+        const changed = beforeSignature !== getChatHistoryDataSignature(window.messageHistory || []);
+        if (changed) {
+            refreshChatSeenDomForMessage(event.msgId);
+            scheduleChatPersistentCacheWrite();
+        }
         return true;
     }
     window.applyRealtimeChatSeenChange = applyRealtimeChatSeenChange;
@@ -48383,6 +48607,10 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
         const responseEpoch = String(response.epoch || '');
         const responseRevision = Math.max(0, Number(response.revision) || 0);
         const responseSeenCursor = Math.max(0, Number(response.seenCursor) || 0);
+        const previousEpoch = String(window.__chatCacheEpoch || '');
+        const previousRevision = Math.max(0, Number(window.__chatCacheRevision) || 0);
+        const previousSeenCursor = Math.max(0, Number(window.__chatSeenCursor) || 0);
+        const previousDataSignature = getChatHistoryDataSignature(window.messageHistory || []);
         const wasInitialSyncPending = window.__chatInitialSnapshotPending === true;
         const pendingSyncChanges = wasInitialSyncPending && Array.isArray(window.__chatInitialPendingSyncChanges)
             ? window.__chatInitialPendingSyncChanges.filter(change => {
@@ -48400,6 +48628,9 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
         if (pendingSyncChanges.length) nextHistory = mergeChatSyncChanges(nextHistory, pendingSyncChanges);
         const combinedSeenEvents = (Array.isArray(response.seenEvents) ? response.seenEvents : []).concat(pendingSeenEvents);
         applyChatSeenEventsToHistory(nextHistory, combinedSeenEvents);
+        const nextDataSignature = getChatHistoryDataSignature(nextHistory);
+        const historyDataChanged = previousDataSignature !== nextDataSignature;
+
         window.__chatCacheEpoch = responseEpoch;
         const pendingRevision = pendingSyncChanges.reduce((max, change) => Math.max(max, Math.max(0, Number(change && change.revision) || 0)), 0);
         window.__chatCacheRevision = Math.max(responseRevision, pendingRevision);
@@ -48415,9 +48646,11 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
             window.__chatCacheReadyForWrite = true;
             window.__chatCacheHydratedHasCache = true;
         }
-        const hasMessageChanges = mode === 'snapshot' || (Array.isArray(response.changes) && response.changes.length > 0) || pendingSyncChanges.length > 0;
-        if (hasMessageChanges) handleChatHistorySnapshot(nextHistory);
-        else {
+
+        const hasSyncMessageChanges = (Array.isArray(response.changes) && response.changes.length > 0) || pendingSyncChanges.length > 0;
+        if (mode === 'snapshot' || hasSyncMessageChanges) {
+            handleChatHistorySnapshot(nextHistory);
+        } else if (historyDataChanged) {
             window.messageHistory = nextHistory;
             if (typeof window.setSidebarCountPill === 'function') window.setSidebarCountPill('chat', nextHistory.length);
             window.__chatHistoryReceived = true;
@@ -48427,11 +48660,18 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
             if (typeof updateChatHistoryRenderSignature === 'function') updateChatHistoryRenderSignature();
             const seenIds = new Set(combinedSeenEvents.map(event => String(event && event.msgId || '')).filter(Boolean));
             seenIds.forEach(id => refreshChatSeenDomForMessage(id));
-            if (wasInitialSyncPending && typeof isChatScreenVisibleForRead === 'function' && isChatScreenVisibleForRead() && typeof renderDeferredChatHistory === 'function') {
-                Promise.resolve(renderDeferredChatHistory({ reason: 'chat-sync-ready', force: true, forceBottom: false, showLoading: false })).catch(() => {});
-            }
+        } else {
+            window.__chatHistoryReceived = true;
+            window.__chatHistoryRequesting = false;
+            window.__chatHistoryRequestRetries = 0;
+            clearTimeout(window.__chatHistoryRequestWatchdog);
         }
-        scheduleChatPersistentCacheWrite(0);
+
+        if (wasInitialSyncPending && typeof isChatScreenVisibleForRead === 'function' && isChatScreenVisibleForRead() && window.__chatHistoryDomRendered !== true && typeof renderDeferredChatHistory === 'function') {
+            Promise.resolve(renderDeferredChatHistory({ reason: 'chat-sync-ready', force: true, forceBottom: false, showLoading: false })).catch(() => {});
+        }
+        const syncMetaChanged = previousEpoch !== String(window.__chatCacheEpoch || '') || previousRevision !== Math.max(0, Number(window.__chatCacheRevision) || 0) || previousSeenCursor !== Math.max(0, Number(window.__chatSeenCursor) || 0);
+        if (historyDataChanged || syncMetaChanged || wasInitialSyncPending) scheduleChatPersistentCacheWrite(0);
         return true;
     }
     window.applyChatSyncResponse = applyChatSyncResponse;
@@ -48468,6 +48708,14 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 
 
     function handleChatHistorySnapshot(history, respond = null) {
+        const hadPersistentCache = window.__chatPersistentCacheAvailable === true;
+        const previousHistory = Array.isArray(window.messageHistory) ? window.messageHistory : [];
+        const previousDataSignature = getChatHistoryDataSignature(previousHistory);
+        const normalizedHistory = typeof normalizeChatHistoryPayload === 'function' ? normalizeChatHistoryPayload(history) : (Array.isArray(history) ? history : []);
+        const incomingDataSignature = getChatHistoryDataSignature(normalizedHistory);
+        const historyDataChanged = previousDataSignature !== incomingDataSignature;
+        window.__lastChatHistorySnapshotChanged = historyDataChanged || !hadPersistentCache;
+
         window.__chatInitialSnapshotPending = false;
         window.__chatPersistentCacheAvailable = true;
         window.__chatCacheReadyForWrite = true;
@@ -48477,7 +48725,6 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
         window.__chatHistoryRequestRetries = 0;
         clearTimeout(window.__chatHistoryRequestWatchdog);
 
-        const normalizedHistory = typeof normalizeChatHistoryPayload === 'function' ? normalizeChatHistoryPayload(history) : (Array.isArray(history) ? history : []);
         const incomingSignature = getChatHistoryRenderSignature(normalizedHistory);
         const sameRenderedHistory = window.__chatHistoryDomRendered === true && window.__chatHistoryRenderSignature === incomingSignature;
         const box = document.getElementById('chat-messages');
@@ -48492,43 +48739,48 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
             try { respond({ ok: true, received: normalizedHistory.length, rendered: sameRenderedHistory }); } catch (e) {}
         };
 
-        window.messageHistory = normalizedHistory;
-        if (typeof window.setSidebarCountPill === 'function') window.setSidebarCountPill('chat', normalizedHistory.length);
-        window.__chatVirtualStartIndex = 0;
-        window.__chatVirtualEndIndex = normalizedHistory.length;
-        if (typeof registerChatUsersFromHistory === 'function') registerChatUsersFromHistory(window.messageHistory);
+        if (historyDataChanged) {
+            window.messageHistory = normalizedHistory;
+            if (typeof window.setSidebarCountPill === 'function') window.setSidebarCountPill('chat', normalizedHistory.length);
+            window.__chatVirtualStartIndex = 0;
+            window.__chatVirtualEndIndex = normalizedHistory.length;
+            if (typeof registerChatUsersFromHistory === 'function') registerChatUsersFromHistory(window.messageHistory);
+        } else {
+            if (typeof window.setSidebarCountPill === 'function') window.setSidebarCountPill('chat', normalizedHistory.length);
+            window.__chatVirtualStartIndex = Math.max(0, Math.min(Number(window.__chatVirtualStartIndex || 0), normalizedHistory.length));
+            window.__chatVirtualEndIndex = Math.max(window.__chatVirtualStartIndex, Math.min(Number(window.__chatVirtualEndIndex || normalizedHistory.length), normalizedHistory.length));
+        }
         acknowledgeSnapshot();
 
-        if (chatVisible && hasRenderedRows && !hasActiveLoader && !sameRenderedHistory) {
+        let snapshotRepairNeeded = false;
+        if (historyDataChanged && chatVisible && hasRenderedRows && !hasActiveLoader && !sameRenderedHistory) {
             const syncedIncrementally = typeof syncRenderedChatHistoryIncrementally === 'function' && syncRenderedChatHistoryIncrementally(normalizedHistory);
             if (!syncedIncrementally) {
-                window.__chatHistoryDomRendered = true;
-                window.__chatHistoryRenderSignature = incomingSignature;
+                window.__chatHistoryDomRendered = false;
+                snapshotRepairNeeded = true;
             }
         } else {
-            if (!sameRenderedHistory) window.__chatHistoryDomRendered = false;
-            window.__chatHistoryRenderSignature = incomingSignature;
+            if (!sameRenderedHistory && historyDataChanged) window.__chatHistoryDomRendered = false;
+            if (sameRenderedHistory || !historyDataChanged) window.__chatHistoryRenderSignature = incomingSignature;
         }
 
         let renderPromise = null;
         if (chatVisible) {
-            if (!sameRenderedHistory && (!hasRenderedRows || hasActiveLoader)) {
-                if (typeof renderDeferredChatHistory === 'function') {
-                    renderPromise = renderDeferredChatHistory({ reason: 'chat_history', force: true, forceBottom: false, showLoading: hasActiveLoader });
-                }
+            if (snapshotRepairNeeded && typeof renderDeferredChatHistory === 'function') {
+                renderPromise = renderDeferredChatHistory({ reason: 'chat_snapshot_repair', force: true, forceBottom: false, showLoading: false });
+            } else if (historyDataChanged && !sameRenderedHistory && (!hasRenderedRows || hasActiveLoader)) {
+                if (typeof renderDeferredChatHistory === 'function') renderPromise = renderDeferredChatHistory({ reason: 'chat_history', force: true, forceBottom: false, showLoading: hasActiveLoader });
             }
-        } else if (box && !box.querySelector('[id^="msg-row-"]')) {
+        } else if (box && !box.querySelector('[id^="msg-row-"]') && box.innerHTML) {
             box.innerHTML = '';
         }
 
-        if (typeof refreshChatNotificationDot === 'function') refreshChatNotificationDot();
-        if (typeof refreshMentionJumpButton === 'function') refreshMentionJumpButton();
-
-        if (renderPromise && typeof renderPromise.then === 'function') {
-            Promise.resolve(renderPromise).catch(err => {
-                console.error('[chat] history render promise failed:', err);
-            });
+        if (historyDataChanged || !hadPersistentCache) {
+            if (typeof refreshChatNotificationDot === 'function') refreshChatNotificationDot();
+            if (typeof refreshMentionJumpButton === 'function') refreshMentionJumpButton();
         }
+
+        if (renderPromise && typeof renderPromise.then === 'function') Promise.resolve(renderPromise).catch(err => console.error('[chat] history render promise failed:', err));
         return renderPromise || Promise.resolve(true);
     }
     window.handleChatHistorySnapshot = handleChatHistorySnapshot;
@@ -49197,11 +49449,33 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
     }
     window.loadNewerChatMessages = loadNewerChatMessages;
 
+    function syncRenderedChatMessageSignature(msgId) {
+        const id = String(msgId || '');
+        if (!id) return false;
+        const row = document.getElementById(`msg-row-${id}`);
+        const msg = Array.isArray(window.messageHistory) ? window.messageHistory.find(item => getChatMessageTimeKey(item) === id) : null;
+        if (!row || !msg) return false;
+        const nextSignature = getChatMessageRenderSignature(msg);
+        if (row.getAttribute('data-chat-render-signature') === nextSignature) return false;
+        row.setAttribute('data-chat-render-signature', nextSignature);
+        return true;
+    }
+    window.syncRenderedChatMessageSignature = syncRenderedChatMessageSignature;
+
     function syncRenderedChatHistoryIncrementally(history = []) {
         const box = document.getElementById('chat-messages');
         if (!box || !Array.isArray(history) || history.length === 0) return false;
         const rows = Array.from(box.querySelectorAll('[id^="msg-row-"]'));
         if (!rows.length) return false;
+
+        const historyById = new Map(history.map(msg => [getChatMessageTimeKey(msg), msg]).filter(([id]) => !!id));
+        for (const row of rows) {
+            const rowId = String(row.getAttribute('data-chat-msg-id') || row.id || '').replace(/^msg-row-/, '');
+            const currentMessage = historyById.get(rowId);
+            if (!currentMessage) return false;
+            const rowSignature = String(row.getAttribute('data-chat-render-signature') || '');
+            if (!rowSignature || rowSignature !== getChatMessageRenderSignature(currentMessage)) return false;
+        }
 
         const existingIds = new Set(rows.map(row => String(row.id || '').replace('msg-row-', '')).filter(Boolean));
         const renderedTimes = rows.map(row => parseInt(String(row.id || '').replace('msg-row-', ''), 10)).filter(Number.isFinite);
@@ -51387,99 +51661,75 @@ function getVisibleChatStackEl(id) {
 	}
 	
 	window.updateJumpButtonPosition = function() {
-		requestAnimationFrame(() => {
-			const jumpButtons = [document.getElementById('btn-jump-bottom'), document.getElementById('btn-mention-jump')].filter(Boolean);
-			const selectionPrev = document.getElementById('chat-selection-preview');
-			const replyPrev = document.getElementById('reply-preview');
-			const editPrev = document.getElementById('edit-preview');
-			const imgPrev = document.getElementById('pending-image-preview');
-			const typingInd = document.getElementById('typing-indicator-container');
-			const mentionBox = document.getElementById('mention-suggestions');
-			const chatInput = document.getElementById('chat-input');
-	
-			if (!jumpButtons.length) return;
-
-			const subviewChat = document.getElementById('subview-chat');
-			const chatMessages = document.getElementById('chat-messages');
-			const jumpParent = jumpButtons[0].offsetParent || document.querySelector('#subview-chat .file-manager-container');
-			if (subviewChat && chatMessages && jumpParent) {
-				const parentRect = jumpParent.getBoundingClientRect();
-				const chatRect = chatMessages.getBoundingClientRect();
-				const shouldAlignToAvatar = parentRect.width <= 1120 || window.innerWidth <= 1400;
-
-				if (shouldAlignToAvatar && parentRect.width > 0 && chatRect.width > 0) {
-					let avatarCenterX = null;
-					const chatMidX = chatRect.left + (chatRect.width * 0.55);
-					chatMessages.querySelectorAll('.chat-avatar-status').forEach(avatar => {
-						const rect = avatar.getBoundingClientRect();
-						if (!rect.width || !rect.height) return;
-						const centerX = rect.left + (rect.width / 2);
-						if (centerX < chatMidX) return;
-						if (avatarCenterX === null || centerX > avatarCenterX) avatarCenterX = centerX;
-					});
-
-					if (avatarCenterX !== null) {
-						const buttonWidth = jumpButtons[0].offsetWidth || 38;
-						const right = Math.max(8, Math.round(parentRect.right - avatarCenterX - (buttonWidth / 2)));
-						subviewChat.style.setProperty('--chat-jump-button-right', right + 'px');
-					} else {
-						subviewChat.style.removeProperty('--chat-jump-button-right');
-					}
-				} else {
-					subviewChat.style.removeProperty('--chat-jump-button-right');
-				}
-			}
-	
-			let stackOffset = 50;
-			const margin = 8;
-			let arrowJump = 0;
-	
-			if (typingInd && typingInd.style.opacity === '1') {
-				typingInd.style.bottom = `calc(100% + ${stackOffset}px)`;
-				stackOffset += typingInd.offsetHeight + margin;
-			}
-			
-			if (selectionPrev) {
-				selectionPrev.style.bottom = `calc(100% + ${stackOffset}px)`;
-				const h = selectionPrev.offsetHeight + margin;
-				stackOffset += h;
-				arrowJump += h;
-			}
-
-			if (replyPrev) {
-				replyPrev.style.bottom = `calc(100% + ${stackOffset}px)`;
-				const h = replyPrev.offsetHeight + margin;
-				stackOffset += h;
-				arrowJump += h; 
-			}
-	
-			if (editPrev) {
-				editPrev.style.bottom = `calc(100% + ${stackOffset}px)`;
-				const h = editPrev.offsetHeight + margin;
-				stackOffset += h;
-				arrowJump += h;
-			}
-	
-			if (imgPrev) {
-				imgPrev.style.bottom = `calc(100% + ${stackOffset}px)`;
-				stackOffset += imgPrev.offsetHeight + margin;
-			}
-	
-			if (mentionBox && mentionBox.style.display === 'block') {
-				positionChatSuggestionBox(mentionBox, mentionBox.classList.contains('command-suggestions') ? 'command' : 'mention');
-			}
-	
-			if (chatInput) {
-				const growth = Math.max(0, chatInput.offsetHeight - 45);
-				arrowJump += growth;
-			}
-	
-			jumpButtons.forEach(btn => {
-				btn.style.transition = "transform 0.2s ease-out";
-				btn.style.transform = `translateY(-${arrowJump}px)`;
-			});
-		});
-	};
+        if (window.__chatJumpButtonPositionFrame) return;
+        window.__chatJumpButtonPositionFrame = requestAnimationFrame(() => {
+            window.__chatJumpButtonPositionFrame = null;
+            const jumpButtons = [document.getElementById('btn-jump-bottom'), document.getElementById('btn-mention-jump')].filter(Boolean);
+            const selectionPrev = document.getElementById('chat-selection-preview');
+            const replyPrev = document.getElementById('reply-preview');
+            const editPrev = document.getElementById('edit-preview');
+            const imgPrev = document.getElementById('pending-image-preview');
+            const typingInd = document.getElementById('typing-indicator-container');
+            const mentionBox = document.getElementById('mention-suggestions');
+            const chatInput = document.getElementById('chat-input');
+            if (!jumpButtons.length) return;
+            const setStyleIfChanged = (el, prop, value) => { if (el && el.style[prop] !== value) el.style[prop] = value; };
+            const subviewChat = document.getElementById('subview-chat');
+            const chatMessages = document.getElementById('chat-messages');
+            const jumpParent = jumpButtons[0].offsetParent || document.querySelector('#subview-chat .file-manager-container');
+            if (subviewChat && chatMessages && jumpParent) {
+                const parentRect = jumpParent.getBoundingClientRect();
+                const chatRect = chatMessages.getBoundingClientRect();
+                const shouldAlignToAvatar = parentRect.width <= 1120 || window.innerWidth <= 1400;
+                if (shouldAlignToAvatar && parentRect.width > 0 && chatRect.width > 0) {
+                    let avatarCenterX = null;
+                    const chatMidX = chatRect.left + (chatRect.width * 0.55);
+                    chatMessages.querySelectorAll('.chat-avatar-status').forEach(avatar => {
+                        const rect = avatar.getBoundingClientRect();
+                        if (!rect.width || !rect.height) return;
+                        const centerX = rect.left + (rect.width / 2);
+                        if (centerX < chatMidX) return;
+                        if (avatarCenterX === null || centerX > avatarCenterX) avatarCenterX = centerX;
+                    });
+                    if (avatarCenterX !== null) {
+                        const buttonWidth = jumpButtons[0].offsetWidth || 38;
+                        const right = `${Math.max(8, Math.round(parentRect.right - avatarCenterX - (buttonWidth / 2)))}px`;
+                        if (subviewChat.style.getPropertyValue('--chat-jump-button-right') !== right) subviewChat.style.setProperty('--chat-jump-button-right', right);
+                    } else if (subviewChat.style.getPropertyValue('--chat-jump-button-right')) subviewChat.style.removeProperty('--chat-jump-button-right');
+                } else if (subviewChat.style.getPropertyValue('--chat-jump-button-right')) subviewChat.style.removeProperty('--chat-jump-button-right');
+            }
+            let stackOffset = 50;
+            const margin = 8;
+            let arrowJump = 0;
+            if (typingInd && typingInd.style.opacity === '1') {
+                setStyleIfChanged(typingInd, 'bottom', `calc(100% + ${stackOffset}px)`);
+                stackOffset += typingInd.offsetHeight + margin;
+            }
+            if (selectionPrev) {
+                setStyleIfChanged(selectionPrev, 'bottom', `calc(100% + ${stackOffset}px)`);
+                const h = selectionPrev.offsetHeight + margin; stackOffset += h; arrowJump += h;
+            }
+            if (replyPrev) {
+                setStyleIfChanged(replyPrev, 'bottom', `calc(100% + ${stackOffset}px)`);
+                const h = replyPrev.offsetHeight + margin; stackOffset += h; arrowJump += h;
+            }
+            if (editPrev) {
+                setStyleIfChanged(editPrev, 'bottom', `calc(100% + ${stackOffset}px)`);
+                const h = editPrev.offsetHeight + margin; stackOffset += h; arrowJump += h;
+            }
+            if (imgPrev) {
+                setStyleIfChanged(imgPrev, 'bottom', `calc(100% + ${stackOffset}px)`);
+                stackOffset += imgPrev.offsetHeight + margin;
+            }
+            if (mentionBox && mentionBox.style.display === 'block') positionChatSuggestionBox(mentionBox, mentionBox.classList.contains('command-suggestions') ? 'command' : 'mention');
+            if (chatInput) arrowJump += Math.max(0, chatInput.offsetHeight - 45);
+            const nextTransform = `translateY(-${arrowJump}px)`;
+            jumpButtons.forEach(btn => {
+                setStyleIfChanged(btn, 'transition', 'transform 0.2s ease-out');
+                setStyleIfChanged(btn, 'transform', nextTransform);
+            });
+        });
+    };
 
 	if (!window.__chatJumpButtonResizeAlignAttached) {
 		window.__chatJumpButtonResizeAlignAttached = true;
@@ -54723,8 +54973,9 @@ function getVisibleChatStackEl(id) {
 			}
 		}
 	
+		const chatRenderSignature = getChatMessageRenderSignature(msg);
 		const msgHtml = `
-		<div id="msg-row-${msgId}"${renderIndexAttr} data-chat-msg-id="${msgId}" class="${messageEntryClass} ${msg.type === 'poll' ? 'msg-row-poll' : ''}" data-user="${encodedUser}" data-can-delete="${canDeleteThisMsg ? 'true' : 'false'}" onclick="if(window.chatSelectionMode && typeof toggleChatMessageSelection === 'function') toggleChatMessageSelection(event, '${msgId}')" style="display: flex; flex-direction: ${flexDir}; align-self: ${alignSelf}; max-width: min(85%, 450px); margin-bottom: 12px; gap: 10px; transition: all 0.3s ease;${outgoingEntryInitialStyle}">
+		<div id="msg-row-${msgId}"${renderIndexAttr} data-chat-msg-id="${msgId}" data-chat-render-signature="${chatRenderSignature}" class="${messageEntryClass} ${msg.type === 'poll' ? 'msg-row-poll' : ''}" data-user="${encodedUser}" data-can-delete="${canDeleteThisMsg ? 'true' : 'false'}" onclick="if(window.chatSelectionMode && typeof toggleChatMessageSelection === 'function') toggleChatMessageSelection(event, '${msgId}')" style="display: flex; flex-direction: ${flexDir}; align-self: ${alignSelf}; max-width: min(85%, 450px); margin-bottom: 12px; gap: 10px; transition: all 0.3s ease;${outgoingEntryInitialStyle}">
 			<img src="${userAvatar}" class="chat-avatar-clickable chat-avatar-status" 
 				data-user="${userName}" 
 				onerror="this.onerror=null; this.src='https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/interface/modern/images/avatars/default.png';" 
@@ -57795,6 +58046,7 @@ function getVisibleChatStackEl(id) {
 				}
 			}
 			if (!domChanged && !storedChanged) return;
+			if (storedChanged && typeof syncRenderedChatMessageSignature === 'function') syncRenderedChatMessageSignature(data.msgId);
 			const msgRow = document.getElementById(`msg-row-${data.msgId}`);
 			if (msgRow && domChanged) {
 				const avatarImg = msgRow.querySelector('.chat-avatar-status');
@@ -57816,7 +58068,7 @@ function getVisibleChatStackEl(id) {
 
         socketChat.on('chat_history', function(history, respond) {
             const result = handleChatHistorySnapshot(history, respond);
-            scheduleChatPersistentCacheWrite();
+            if (window.__lastChatHistorySnapshotChanged !== false) scheduleChatPersistentCacheWrite();
             return result;
         });
 
@@ -58006,6 +58258,8 @@ function getVisibleChatStackEl(id) {
 					}
 				}
 				
+				if (typeof syncRenderedChatMessageSignature === 'function') syncRenderedChatMessageSignature(data.msgId);
+				if (typeof updateChatHistoryRenderSignature === 'function') updateChatHistoryRenderSignature();
 				if (typeof refreshChatNotificationDot === 'function') refreshChatNotificationDot();
 				return;
 			}
@@ -58131,6 +58385,7 @@ function getVisibleChatStackEl(id) {
 				}
 			}
 			
+			if (typeof syncRenderedChatMessageSignature === 'function') syncRenderedChatMessageSignature(data.msgId);
 			updateChatHistoryRenderSignature();
 			if (typeof refreshChatNotificationDot === 'function') refreshChatNotificationDot();
 			if (typeof refreshMentionJumpButton === 'function') refreshMentionJumpButton();
@@ -58327,6 +58582,8 @@ function getVisibleChatStackEl(id) {
 		});
 	
 		socketChat.on('message_seen', function(data) {
+			const myNameForSeen = localStorage.getItem('psn_username') || '';
+			if (myNameForSeen && Array.isArray(data && data.seenBy) && data.seenBy.includes(myNameForSeen) && window.__chatSeenEmitPending instanceof Map) window.__chatSeenEmitPending.delete(String(data.msgId || ''));
 			const checkCont = document.getElementById(`check-${data.msgId}`);
 			const seenList = Array.isArray(data.seenBy) ? data.seenBy : [];
 			const seenAtMap = (data.seenAt && typeof data.seenAt === 'object') ? data.seenAt : {};
@@ -58854,7 +59111,7 @@ function getVisibleChatStackEl(id) {
 					});
 				}
 
-				if (document.getElementById('view-admin')?.style.display === 'block' && typeof renderAdminPanel === 'function') adminSchedulePanelRender();
+				if (name === myNameForCounts && document.getElementById('view-admin')?.style.display === 'block' && typeof renderAdminPanel === 'function') adminSchedulePanelRender();
 
 				const listModal = document.getElementById('modal-sys-list');
 				const listOpen = !!(listModal && (listModal.style.display === 'flex' || listModal.style.display === 'block' || listModal.classList.contains('show')) && listModal.dataset.profileTarget === name);
@@ -59228,37 +59485,23 @@ function getVisibleChatStackEl(id) {
 			if (typeof markVisibleChatAsRead === 'function') markVisibleChatAsRead();
 			return;
 		}
-	
 		const lastReadStr = loadState('psn_last_chat_read');
 		const lastReadTime = lastReadStr ? parseInt(lastReadStr) : 0;
-		
 		const newMessages = (window.messageHistory || messageHistory || []).filter(m => {
 			const msgTime = new Date(m && m.time).getTime();
 			return Number.isFinite(msgTime) && msgTime > lastReadTime && m.user !== myName;
 		});
-	
 		if (!dot) return;
-	
-		if (newMessages.length === 0) {
-			dot.style.display = 'none';
-			saveState('psn_chat_dot', 'false');
-		} else {
-			dot.style.display = 'block';
-			saveState('psn_chat_dot', 'true');
-	
+		const visible = newMessages.length > 0;
+		const nextDisplay = visible ? 'block' : 'none';
+		if (dot.style.display !== nextDisplay) dot.style.display = nextDisplay;
+		const nextStored = visible ? 'true' : 'false';
+		if (loadState('psn_chat_dot') !== nextStored) saveState('psn_chat_dot', nextStored);
+		if (visible) {
 			const hasGlobal = newMessages.some(m => m.isGlobalPing);
-			const hasMention = newMessages.some(m => 
-				(m.text && (typeof chatTextMentionsUser === 'function' ? chatTextMentionsUser(m.text, myName) : m.text.includes(`@${myName}`))) || 
-				(m.replyTo && m.replyTo.user === myName)
-			);
-	
-			if (hasGlobal) {
-				dot.style.backgroundColor = '#ff4444';
-			} else if (hasMention) {
-				dot.style.backgroundColor = '#ffcc00';
-			} else {
-				dot.style.backgroundColor = 'var(--ps-blue)';
-			}
+			const hasMention = newMessages.some(m => (m.text && (typeof chatTextMentionsUser === 'function' ? chatTextMentionsUser(m.text, myName) : m.text.includes(`@${myName}`))) || (m.replyTo && m.replyTo.user === myName));
+			const nextColor = hasGlobal ? '#ff4444' : (hasMention ? '#ffcc00' : 'var(--ps-blue)');
+			if (dot.dataset.chatDotColor !== nextColor) { dot.dataset.chatDotColor = nextColor; dot.style.backgroundColor = nextColor; }
 		}
 		if (typeof updateJumpBottomUnreadBadge === 'function') updateJumpBottomUnreadBadge(newMessages.length);
 	};
@@ -59417,14 +59660,18 @@ function getVisibleChatStackEl(id) {
 		}
 
 		if (typingUsers.size === 0) {
-			container.style.opacity = '0';
-			if (typeof updateJumpButtonPosition === 'function') updateJumpButtonPosition();
+			const typingWasVisible = container.style.opacity !== '0' || !!container.dataset.typingUsersSignature;
+			if (container.dataset.typingUsersSignature) container.dataset.typingUsersSignature = '';
+			if (container.style.opacity !== '0') container.style.opacity = '0';
+			if (typingWasVisible && typeof updateJumpButtonPosition === 'function') updateJumpButtonPosition();
 			return;
 		}
 
-		container.style.opacity = '1';
-
-		const usersArr = Array.from(typingUsers.entries()); 
+		const usersArr = Array.from(typingUsers.entries());
+		const typingSignature = typeof window.getLiveRenderSignature === 'function' ? window.getLiveRenderSignature(usersArr) : JSON.stringify(usersArr);
+		if (container.dataset.typingUsersSignature === typingSignature && container.style.opacity === '1') return;
+		if (container.style.opacity !== '1') container.style.opacity = '1';
+		container.dataset.typingUsersSignature = typingSignature;
 		
 		let avatarsHtml = usersArr.slice(0, 3).map(([name, avatar], i) => 
 			`<img src="${avatar}" style="width: 22px; height: 22px; border-radius: 50%; border: 2px solid #0a0f19; margin-left: ${i > 0 ? '-10px' : '0'}; position: relative; z-index: ${5 - i}; object-fit: cover;">`
@@ -60340,51 +60587,48 @@ function getVisibleChatStackEl(id) {
     function hideMentionJumpButtonImmediately() {
         const btn = document.getElementById('btn-mention-jump');
         const countEl = document.getElementById('mention-jump-count');
+        if (window.__chatMentionHideTimer) { clearTimeout(window.__chatMentionHideTimer); window.__chatMentionHideTimer = null; }
         if (btn) {
-            btn.style.opacity = '0';
-            btn.style.display = 'none';
+            if (btn.style.opacity !== '0') btn.style.opacity = '0';
+            if (btn.style.display !== 'none') btn.style.display = 'none';
         }
-        if (countEl) countEl.style.display = 'none';
+        if (countEl && countEl.style.display !== 'none') countEl.style.display = 'none';
     }
 
     function refreshMentionJumpButton() {
         const btn = document.getElementById('btn-mention-jump');
         const countEl = document.getElementById('mention-jump-count');
         if (!btn) return;
-
-        // Older-message virtual batches temporarily move/rebuild rows while preserving the user's viewport.
-        // Keep the last stable mention count untouched until that batch finishes, so the badge cannot flash
-        // from a transient DOM count that never became a real visible count change.
         if (window.__chatVirtualLoadingOlder || window.__chatVirtualLoadingNewer) return;
-
         if (typeof isChatPreparingMessages === 'function' && isChatPreparingMessages()) {
             hideMentionJumpButtonImmediately();
             return;
         }
-
         const pending = getPendingChatMentionRows();
         const count = pending.length;
-
         if (count > 0) {
-            btn.style.display = 'flex';
-            btn.style.opacity = '1';
+            if (window.__chatMentionHideTimer) { clearTimeout(window.__chatMentionHideTimer); window.__chatMentionHideTimer = null; }
+            if (btn.style.display !== 'flex') btn.style.display = 'flex';
+            if (btn.style.opacity !== '1') btn.style.opacity = '1';
             if (countEl) {
                 const visibleCount = count > 99 ? '99+' : String(count);
-                countEl.style.display = 'flex';
+                if (countEl.style.display !== 'flex') countEl.style.display = 'flex';
                 if (typeof window.setLiveCountText === 'function') window.setLiveCountText(countEl, visibleCount, count, 'chat-mention-jump');
-                else countEl.textContent = visibleCount;
+                else if (countEl.textContent !== visibleCount) countEl.textContent = visibleCount;
             }
         } else {
-            btn.style.opacity = '0';
+            if (btn.style.opacity !== '0') btn.style.opacity = '0';
             if (countEl) {
-                countEl.style.display = 'none';
-                // Hiding the badge is not a visible count transition. Preserve the last shown value
-                // in setLiveCountText's dataset so showing the same number again does not flash.
-                countEl.textContent = '';
+                if (countEl.style.display !== 'none') countEl.style.display = 'none';
+                if (countEl.textContent) countEl.textContent = '';
             }
-            setTimeout(() => { if (btn.style.opacity === '0') btn.style.display = 'none'; }, 300);
+            if (btn.style.display !== 'none' && !window.__chatMentionHideTimer) {
+                window.__chatMentionHideTimer = setTimeout(() => {
+                    window.__chatMentionHideTimer = null;
+                    if (btn.style.opacity === '0' && btn.style.display !== 'none') btn.style.display = 'none';
+                }, 300);
+            }
         }
-
         if (typeof updateJumpButtonPosition === 'function') updateJumpButtonPosition();
     }
 
@@ -60446,14 +60690,14 @@ function getVisibleChatStackEl(id) {
         const count = Number.isFinite(forcedCount) ? forcedCount : getChatUnreadMessageCount();
         if (count > 0) {
             const visibleCount = count > 99 ? '99+' : String(count);
-            badge.style.display = 'flex';
+            if (badge.style.display !== 'flex') badge.style.display = 'flex';
             if (typeof window.setLiveCountText === 'function') window.setLiveCountText(badge, visibleCount, count, 'chat-unread-jump');
-            else badge.textContent = visibleCount;
+            else if (badge.textContent !== visibleCount) badge.textContent = visibleCount;
         } else {
-            badge.style.display = 'none';
+            if (badge.style.display !== 'none') badge.style.display = 'none';
             // Same protection as mentions: hidden/zero is not a visible number change. Keep the last
             // shown count as the comparison baseline so scrolling cannot create a false flash.
-            badge.textContent = '';
+            if (badge.textContent) badge.textContent = '';
         }
         return count;
     }
@@ -60485,15 +60729,21 @@ function getVisibleChatStackEl(id) {
         if (!btn) return;
 
         const unreadCount = typeof updateJumpBottomUnreadBadge === 'function' ? updateJumpBottomUnreadBadge() : 0;
-        const shouldShow = show || unreadCount > 0;
-
+        const shouldShow = !!(show || unreadCount > 0);
         if (shouldShow) {
-            btn.style.display = 'flex';
-            btn.style.opacity = '1';
-            if (typeof updateJumpButtonPosition === 'function') updateJumpButtonPosition();
+            if (window.__chatJumpBottomHideTimer) { clearTimeout(window.__chatJumpBottomHideTimer); window.__chatJumpBottomHideTimer = null; }
+            let changed = false;
+            if (btn.style.display !== 'flex') { btn.style.display = 'flex'; changed = true; }
+            if (btn.style.opacity !== '1') { btn.style.opacity = '1'; changed = true; }
+            if (changed && typeof updateJumpButtonPosition === 'function') updateJumpButtonPosition();
         } else {
-            btn.style.opacity = '0';
-            setTimeout(() => { if (btn.style.opacity === '0') btn.style.display = 'none'; }, 300);
+            if (btn.style.opacity !== '0') btn.style.opacity = '0';
+            if (btn.style.display !== 'none' && !window.__chatJumpBottomHideTimer) {
+                window.__chatJumpBottomHideTimer = setTimeout(() => {
+                    window.__chatJumpBottomHideTimer = null;
+                    if (btn.style.opacity === '0' && btn.style.display !== 'none') btn.style.display = 'none';
+                }, 300);
+            }
         }
     }
 
@@ -61872,7 +62122,7 @@ function getVisibleChatStackEl(id) {
 		const activeUsers = currentOnlineList.filter(u => u.online === true);
 		if (countElement) window.setLiveCountText(countElement, `${activeUsers.length} Online`, activeUsers.length);
 		const onlinePlayersTitle = document.getElementById('online-players-title-label');
-		if (onlinePlayersTitle) onlinePlayersTitle.textContent = activeUsers.length === 1 ? 'Online Player' : 'Online Players';
+		if (onlinePlayersTitle) { const nextTitle = activeUsers.length === 1 ? 'Online Player' : 'Online Players'; if (onlinePlayersTitle.textContent !== nextTitle) onlinePlayersTitle.textContent = nextTitle; }
 		const onlinePlayersTitleCount = document.getElementById('online-players-title-count');
 		if (onlinePlayersTitleCount) window.setLiveCountText(onlinePlayersTitleCount, `${activeUsers.length} ${activeUsers.length === 1 ? 'player' : 'players'}`, activeUsers.length);
 	
@@ -61923,7 +62173,7 @@ function getVisibleChatStackEl(id) {
 	
 		const activeUsers = currentOnlineList.filter(u => u.online === true);
 		const onlinePlayersTitle = document.getElementById('online-players-title-label');
-		if (onlinePlayersTitle) onlinePlayersTitle.textContent = activeUsers.length === 1 ? 'Online Player' : 'Online Players';
+		if (onlinePlayersTitle) { const nextTitle = activeUsers.length === 1 ? 'Online Player' : 'Online Players'; if (onlinePlayersTitle.textContent !== nextTitle) onlinePlayersTitle.textContent = nextTitle; }
 		const onlinePlayersTitleCount = document.getElementById('online-players-title-count');
 		if (onlinePlayersTitleCount) window.setLiveCountText(onlinePlayersTitleCount, `${activeUsers.length} ${activeUsers.length === 1 ? 'player' : 'players'}`, activeUsers.length);
 
@@ -66027,29 +66277,34 @@ function getVisibleChatStackEl(id) {
 		const nextSignature = String(nextCard.dataset.liveRenderSignature || '');
 		if (nextSignature && previousCard.dataset.liveRenderSignature === nextSignature) {
 			const nextTileIndex = nextCard.style.getPropertyValue('--tile-idx');
-			if (nextTileIndex) previousCard.style.setProperty('--tile-idx', nextTileIndex);
+			if (nextTileIndex && previousCard.style.getPropertyValue('--tile-idx') !== nextTileIndex) previousCard.style.setProperty('--tile-idx', nextTileIndex);
 			return previousCard;
 		}
 
 		const preserveRemoving = previousCard.classList.contains('friend-removing');
 		const preserveReveal = previousCard.classList.contains('anim-reveal') && !nextCard.classList.contains('friend-adding');
-		previousCard.className = nextCard.className;
-		if (preserveRemoving) previousCard.classList.add('friend-removing');
-		if (preserveReveal) { previousCard.classList.remove('no-anim'); previousCard.classList.add('anim-reveal'); }
-		previousCard.dataset.filterMotionKey = nextCard.dataset.filterMotionKey || previousCard.dataset.filterMotionKey || '';
-		previousCard.dataset.liveRenderKey = nextCard.dataset.liveRenderKey || previousCard.dataset.liveRenderKey || '';
-		previousCard.dataset.liveRenderSignature = nextSignature;
+		if (previousCard.className !== nextCard.className) previousCard.className = nextCard.className;
+		if (preserveRemoving && !previousCard.classList.contains('friend-removing')) previousCard.classList.add('friend-removing');
+		if (preserveReveal) {
+			if (previousCard.classList.contains('no-anim')) previousCard.classList.remove('no-anim');
+			if (!previousCard.classList.contains('anim-reveal')) previousCard.classList.add('anim-reveal');
+		}
+		const nextFilterMotionKey = nextCard.dataset.filterMotionKey || previousCard.dataset.filterMotionKey || '';
+		const nextLiveRenderKey = nextCard.dataset.liveRenderKey || previousCard.dataset.liveRenderKey || '';
+		if (previousCard.dataset.filterMotionKey !== nextFilterMotionKey) previousCard.dataset.filterMotionKey = nextFilterMotionKey;
+		if (previousCard.dataset.liveRenderKey !== nextLiveRenderKey) previousCard.dataset.liveRenderKey = nextLiveRenderKey;
+		if (previousCard.dataset.liveRenderSignature !== nextSignature) previousCard.dataset.liveRenderSignature = nextSignature;
 		const nextTileIndex = nextCard.style.getPropertyValue('--tile-idx');
-		if (nextTileIndex) previousCard.style.setProperty('--tile-idx', nextTileIndex);
+		if (nextTileIndex && previousCard.style.getPropertyValue('--tile-idx') !== nextTileIndex) previousCard.style.setProperty('--tile-idx', nextTileIndex);
 
 		const previousAvatar = previousCard.querySelector('.online-user-avatar');
 		const nextAvatar = nextCard.querySelector('.online-user-avatar');
 		if (previousAvatar && nextAvatar) {
 			const nextSrc = nextAvatar.getAttribute('src') || '';
 			if (nextSrc && previousAvatar.getAttribute('src') !== nextSrc) previousAvatar.setAttribute('src', nextSrc);
-			previousAvatar.style.borderColor = nextAvatar.style.borderColor;
-			previousAvatar.style.borderWidth = nextAvatar.style.borderWidth;
-			previousAvatar.style.borderStyle = nextAvatar.style.borderStyle;
+			if (previousAvatar.style.borderColor !== nextAvatar.style.borderColor) previousAvatar.style.borderColor = nextAvatar.style.borderColor;
+			if (previousAvatar.style.borderWidth !== nextAvatar.style.borderWidth) previousAvatar.style.borderWidth = nextAvatar.style.borderWidth;
+			if (previousAvatar.style.borderStyle !== nextAvatar.style.borderStyle) previousAvatar.style.borderStyle = nextAvatar.style.borderStyle;
 		}
 
 		const previousLevel = previousCard.querySelector('.friend-level-badge span');
@@ -66063,9 +66318,10 @@ function getVisibleChatStackEl(id) {
 		const previousAction = previousCard.querySelector('.btn-friend-add, .btn-friend-remove');
 		const nextAction = nextCard.querySelector('.btn-friend-add, .btn-friend-remove');
 		if (previousAction && nextAction) {
-			previousAction.className = nextAction.className;
-			previousAction.title = nextAction.title;
-			previousAction.setAttribute('onclick', nextAction.getAttribute('onclick') || '');
+			if (previousAction.className !== nextAction.className) previousAction.className = nextAction.className;
+			if (previousAction.title !== nextAction.title) previousAction.title = nextAction.title;
+			const nextOnclick = nextAction.getAttribute('onclick') || '';
+			if ((previousAction.getAttribute('onclick') || '') !== nextOnclick) previousAction.setAttribute('onclick', nextOnclick);
 		}
 
 		return previousCard;
@@ -66127,7 +66383,11 @@ function getVisibleChatStackEl(id) {
 			const totalFriends = window.friendsList ? window.friendsList.length : 0;
 			const friendsLabel = totalFriends === 1 ? 'Friend' : 'Friends';
 			const playersLabel = totalFriends === 1 ? 'player' : 'players';
-			titleHeader.innerHTML = `${friendsLabel} <span class="friends-title-count" style="color: var(--ps-blue); font-size: 14px; margin-left: 10px; font-weight: normal; opacity: 0.8;">(${totalFriends} ${playersLabel})</span>`;
+			const nextTitleCount = String(totalFriends);
+			if (titleHeader.dataset.friendsTitleCount !== nextTitleCount) {
+				titleHeader.dataset.friendsTitleCount = nextTitleCount;
+				titleHeader.innerHTML = `${friendsLabel} <span class="friends-title-count" style="color: var(--ps-blue); font-size: 14px; margin-left: 10px; font-weight: normal; opacity: 0.8;">(${totalFriends} ${playersLabel})</span>`;
+			}
 		}
 	
 		const sortMode = document.getElementById('friends-sort-select')?.value || 'status';
@@ -66250,7 +66510,7 @@ function getVisibleChatStackEl(id) {
 		globalOffline.sort(sorterLogic);
 
 		const friendsFilterEmpty = (isSearching || showOnlineOnly || showPlayingOnly) && filteredFriends.length === 0 && onlineOthers.length === 0 && globalOffline.length === 0;
-		if (container) container.classList.toggle('friends-filter-empty', friendsFilterEmpty);
+		if (container && container.classList.contains('friends-filter-empty') !== friendsFilterEmpty) container.classList.toggle('friends-filter-empty', friendsFilterEmpty);
 
 		if (window.sortOrders && window.sortOrders.friends === 'desc') {
 			filteredFriends.reverse();
@@ -66337,7 +66597,8 @@ function getVisibleChatStackEl(id) {
 				? Math.max(friendsProgressiveInitial, friendsPreviouslyRendered)
 				: friendsProgressiveInitial;
 			const renderEnd = Math.min(friendsTotalMatches, canAppendSearch ? renderStart + friendsProgressiveLoad : resetTarget);
-			if (!canAppendSearch) grid.innerHTML = '';
+			const progressiveRenderTarget = (!canAppendSearch && isSilent) ? document.createElement('div') : grid;
+			if (!canAppendSearch && !isSilent) grid.innerHTML = '';
 			grid.dataset.friendsRenderSignature = friendsRenderSignature;
 			grid.dataset.friendsProgressiveSignature = friendsProgressiveSignature;
 
@@ -66345,34 +66606,39 @@ function getVisibleChatStackEl(id) {
 			const onlineEnd = friendEnd + onlineOthers.length;
 			for (let position = renderStart; position < renderEnd; position++) {
 				if (position < friendEnd) {
-					if (position === 0) grid.insertAdjacentHTML('beforeend', `<div class="search-divider" style="margin-top: -10px;">FRIENDS (${filteredFriends.length})</div>`);
+					if (position === 0) progressiveRenderTarget.insertAdjacentHTML('beforeend', `<div class="search-divider" style="margin-top: -10px;">FRIENDS (${filteredFriends.length})</div>`);
 					const f = filteredFriends[position];
 					const fName = f.name || f;
 					const net = onlineByName.get(fName) || null;
 					const isOn = net && net.online === true;
 					const knownLastSeen = getKnownFriendLastSeen(fName, f, net);
-					grid.appendChild(createUserCardElement(fName, f.avatar, isOn ? '#4caf50' : '#8b96a8', isOn ? 'Online' : `Last seen: ${formatLastSeen(knownLastSeen)}`, isOn, true, position, true, friendLookupContext));
+					progressiveRenderTarget.appendChild(createUserCardElement(fName, f.avatar, isOn ? '#4caf50' : '#8b96a8', isOn ? 'Online' : `Last seen: ${formatLastSeen(knownLastSeen)}`, isOn, true, position, true, friendLookupContext));
 				} else if (position < onlineEnd) {
 					const localIndex = position - friendEnd;
 					if (localIndex === 0) {
 						const extraStyle = filteredFriends.length > 0 ? '' : 'margin-top: -10px;';
-						grid.insertAdjacentHTML('beforeend', `<div class="search-divider online-header" style="${extraStyle}">PLAYERS ONLINE (${onlineOthers.length})</div>`);
+						progressiveRenderTarget.insertAdjacentHTML('beforeend', `<div class="search-divider online-header" style="${extraStyle}">PLAYERS ONLINE (${onlineOthers.length})</div>`);
 					}
 					const u = onlineOthers[localIndex];
 					const uName = u.name || u;
-					grid.appendChild(createUserCardElement(uName, u.avatar, '#4caf50', 'Online Now', true, false, localIndex + 100, true, friendLookupContext));
+					progressiveRenderTarget.appendChild(createUserCardElement(uName, u.avatar, '#4caf50', 'Online Now', true, false, localIndex + 100, true, friendLookupContext));
 				} else {
 					const localIndex = position - onlineEnd;
 					if (localIndex === 0) {
 						const extraStyle = (filteredFriends.length > 0 || onlineOthers.length > 0) ? '' : 'margin-top: -10px;';
-						grid.insertAdjacentHTML('beforeend', `<div class="search-divider" style="${extraStyle} color: #8b96a8;">PLAYERS OFFLINE (${globalOffline.length})</div>`);
+						progressiveRenderTarget.insertAdjacentHTML('beforeend', `<div class="search-divider" style="${extraStyle} color: #8b96a8;">PLAYERS OFFLINE (${globalOffline.length})</div>`);
 					}
 					const u = globalOffline[localIndex];
 					const uName = u.name || u;
-					grid.appendChild(createUserCardElement(uName, u.avatar, '#8b96a8', 'Offline', false, false, localIndex + 500, true, friendLookupContext));
+					progressiveRenderTarget.appendChild(createUserCardElement(uName, u.avatar, '#8b96a8', 'Offline', false, false, localIndex + 500, true, friendLookupContext));
 				}
 			}
 
+			if (!canAppendSearch && isSilent && typeof window.reconcileLiveRenderFragment === 'function') {
+				window.reconcileLiveRenderFragment(grid, progressiveRenderTarget, ':scope > .online-user-item[data-live-render-key]', { preserveScroll:true });
+			} else if (!canAppendSearch && isSilent) {
+				grid.replaceChildren(...Array.from(progressiveRenderTarget.childNodes));
+			}
 			grid.dataset.friendsProgressiveRendered = String(renderEnd);
 			if (!isSilent && typeof setupRevealAnimations === 'function') setupRevealAnimations('friends-list-grid');
 			setupProgressiveGridObserver('friends-search', grid, renderEnd, friendsTotalMatches, () => window.renderFriendsList(searchTerm, true, 'append'));
@@ -69189,9 +69455,9 @@ function getVisibleChatStackEl(id) {
         const userLogged = padSessionActive || isPadUserLoggedIn();
         const consoleConnected = isPs3LinkedForPad();
 
-        document.body.classList.toggle('ps3-pad-mobile-capable', true);
-        document.body.classList.toggle('ps3-pad-user-logged', userLogged);
-        document.body.classList.toggle('ps3-pad-console-connected', consoleConnected);
+        if (!document.body.classList.contains('ps3-pad-mobile-capable')) document.body.classList.add('ps3-pad-mobile-capable');
+        if (document.body.classList.contains('ps3-pad-user-logged') !== userLogged) document.body.classList.toggle('ps3-pad-user-logged', userLogged);
+        if (document.body.classList.contains('ps3-pad-console-connected') !== consoleConnected) document.body.classList.toggle('ps3-pad-console-connected', consoleConnected);
 
        if (!consoleConnected && (document.body.classList.contains('ps3-pad-page-active') || manualPadOpen || padHistoryActive)) {
             closePadDueToDisconnect();
@@ -69246,51 +69512,45 @@ function getVisibleChatStackEl(id) {
             open = false;
         }
 
-        if (open && !document.body.classList.contains('ps3-pad-page-active')) {
-            previousOverflow = document.body.style.overflow || '';
-        }
-
-        if (document.body.classList.contains('ps3-pad-page-active') !== !!open) document.body.classList.toggle('ps3-pad-page-active', !!open);
+        const nextOpen = !!open;
+        const wasOpen = document.body.classList.contains('ps3-pad-page-active');
+        if (nextOpen && !wasOpen) previousOverflow = document.body.style.overflow || '';
+        if (wasOpen !== nextOpen) document.body.classList.toggle('ps3-pad-page-active', nextOpen);
 
         if (page) {
-            const nextAriaHidden = open ? 'false' : 'true';
+            const nextAriaHidden = nextOpen ? 'false' : 'true';
             if (page.getAttribute('aria-hidden') !== nextAriaHidden) page.setAttribute('aria-hidden', nextAriaHidden);
-            const nextOpenedByButton = !!(open && padOpenedByButton);
+            const nextOpenedByButton = !!(nextOpen && padOpenedByButton);
             if (page.classList.contains('opened-by-button') !== nextOpenedByButton) page.classList.toggle('opened-by-button', nextOpenedByButton);
         }
 
-        if (!open) {
-            releaseKeyboardPadKeys();
-            closePadKeyboardSettings();
-            setPadKeyboardGuideOpen(false);
-            document.body.style.overflow = previousOverflow;
+        if (!nextOpen) {
+            if (wasOpen || padRefreshTimer) {
+                releaseKeyboardPadKeys();
+                closePadKeyboardSettings();
+                setPadKeyboardGuideOpen(false);
+                if (document.body.style.overflow !== previousOverflow) document.body.style.overflow = previousOverflow;
+            }
+            if (padRefreshTimer) {
+                clearInterval(padRefreshTimer);
+                padRefreshTimer = null;
+            }
+            return wasOpen;
         }
 
-        if (open) {
-            const ip = getPadPs3Ip();
-            const status = document.getElementById('ps3-pad-page-status');
-
-            if (status) {
-                const nextStatusText = ip ? `Connected • ${ip}` : 'Connected';
-                if (status.textContent !== nextStatusText) status.textContent = nextStatusText;
-            }
-
-            if (!padRefreshTimer) {
-                padRefreshTimer = setInterval(refreshPadPage, 700);
-            }
-        } else if (padRefreshTimer) {
-            clearInterval(padRefreshTimer);
-            padRefreshTimer = null;
+        const ip = getPadPs3Ip();
+        const status = document.getElementById('ps3-pad-page-status');
+        if (status) {
+            const nextStatusText = ip ? `Connected • ${ip}` : 'Connected';
+            if (status.textContent !== nextStatusText) status.textContent = nextStatusText;
         }
+        if (!padRefreshTimer) padRefreshTimer = setInterval(refreshPadPage, 700);
+        return !wasOpen;
     }
 
     function refreshPadPage() {
         if (!isPs3LinkedForPad()) {
-            if (document.body.classList.contains('ps3-pad-page-active') || manualPadOpen || padHistoryActive) {
-                closePadDueToDisconnect();
-            } else {
-                setPadPageOpen(false);
-            }
+            if (document.body.classList.contains('ps3-pad-page-active') || manualPadOpen || padHistoryActive) closePadDueToDisconnect();
             return;
         }
 

@@ -45,7 +45,8 @@ const VALID_PROFILE_COUNTRY_CODES = new Set(['AD','AE','AF','AG','AI','AL','AM',
 const ADMIN_STATE_KEYS = {
   maintenance: "maintenance",
   chatControls: "chat_controls",
-  pinnedAnnouncement: "pinned_announcement"
+  pinnedAnnouncement: "pinned_announcement",
+  reports: "reports"
 };
 
 // Aiven PostgreSQL Free has a small connection budget; keep the app pool at 5 max.
@@ -5894,7 +5895,10 @@ async function initProfileSyncNotifications() {
       if (message.channel === 'admin_state_sync') {
         const key = normalizeText(data.key, '');
         if (key === ADMIN_STATE_KEYS.maintenance) {
-          adminState.maintenance = normalizeMaintenanceState(data.state || {});
+          const nextMaintenance = normalizeMaintenanceState(data.state || {});
+          const previousMaintenance = normalizeMaintenanceState(adminState.maintenance || {});
+          if (JSON.stringify(previousMaintenance) === JSON.stringify(nextMaintenance)) return;
+          adminState.maintenance = nextMaintenance;
           adminStateLastRefreshAt = Date.now();
           io.emit('maintenance_mode', adminState.maintenance);
           emitToAdmins('admin_state', {
@@ -5906,6 +5910,58 @@ async function initProfileSyncNotifications() {
             registeredUsers: Object.keys(userDatabase).length,
             countryStats: getAdminCountryStats()
           });
+          return;
+        }
+        if (key === ADMIN_STATE_KEYS.chatControls) {
+          const nextChatControls = normalizeChatControls(data.state || {});
+          const previousChatControls = normalizeChatControls(adminState.chatControls || {});
+          if (JSON.stringify(previousChatControls) === JSON.stringify(nextChatControls)) return;
+          adminState.chatControls = nextChatControls;
+          adminStateLastRefreshAt = Date.now();
+          io.emit('chat_controls', adminState.chatControls);
+          io.emit('admin_chat_controls', adminState.chatControls);
+          emitToAdmins('admin_chat_controls_state', adminState.chatControls);
+          emitToAdmins('admin_state', {
+            maintenance: adminState.maintenance,
+            chatControls: adminState.chatControls,
+            pinnedAnnouncement: adminState.pinnedAnnouncement || null,
+            reports: adminReports,
+            serverLog,
+            registeredUsers: Object.keys(userDatabase).length,
+            countryStats: getAdminCountryStats()
+          });
+          return;
+        }
+        if (key === ADMIN_STATE_KEYS.pinnedAnnouncement) {
+          const incoming = data.state && data.state.clear ? null : (data.state || null);
+          const nextPinnedAnnouncement = incoming && normalizeText(incoming.text, '') ? {
+            id: incoming.id || `admin-announcement-${Date.now()}`,
+            text: normalizeText(incoming.text, ''),
+            color: /^#[0-9a-f]{6}$/i.test(normalizeText(incoming.color, '')) ? normalizeText(incoming.color, '').toLowerCase() : '#ffcc00',
+            by: normalizeText(incoming.by, 'Admin'),
+            at: incoming.at || new Date().toISOString()
+          } : null;
+          if (JSON.stringify(adminState.pinnedAnnouncement || null) === JSON.stringify(nextPinnedAnnouncement)) return;
+          adminState.pinnedAnnouncement = nextPinnedAnnouncement;
+          adminStateLastRefreshAt = Date.now();
+          io.emit('admin_pinned_announcement', adminState.pinnedAnnouncement || { clear: true });
+          emitToAdmins('admin_state', {
+            maintenance: adminState.maintenance,
+            chatControls: adminState.chatControls,
+            pinnedAnnouncement: adminState.pinnedAnnouncement || null,
+            reports: adminReports,
+            serverLog,
+            registeredUsers: Object.keys(userDatabase).length,
+            countryStats: getAdminCountryStats()
+          });
+          return;
+        }
+        if (key === ADMIN_STATE_KEYS.reports) {
+          const previousReportsSignature = JSON.stringify(Array.isArray(adminReports) ? adminReports : []);
+          await refreshReportsFromDb();
+          const nextReportsSignature = JSON.stringify(Array.isArray(adminReports) ? adminReports : []);
+          if (previousReportsSignature !== nextReportsSignature) emitToAdmins('reports_list', adminReports);
+          return;
         }
         return;
       }
@@ -7737,6 +7793,7 @@ async function createReport(data = {}, reporterName = "Unknown") {
   );
 
   emitToAdmins('admin_report_created', report);
+  deferServerTask('ADMIN REPORTS NOTIFY', () => notifyAdminStateAcrossInstances(ADMIN_STATE_KEYS.reports, { changedAt: Date.now() }), 0);
   return report;
 }
 
@@ -9862,6 +9919,7 @@ io.on('connection', (socket) => {
       });
 
       await saveAdminState(ADMIN_STATE_KEYS.chatControls, adminState.chatControls);
+      deferServerTask('ADMIN CHAT CONTROLS NOTIFY', () => notifyAdminStateAcrossInstances(ADMIN_STATE_KEYS.chatControls, adminState.chatControls), 0);
       io.emit('chat_controls', adminState.chatControls);
       io.emit('admin_chat_controls', adminState.chatControls);
       emitToAdmins('admin_chat_controls_state', adminState.chatControls);
@@ -9897,6 +9955,7 @@ io.on('connection', (socket) => {
       };
 
       await saveAdminState(ADMIN_STATE_KEYS.pinnedAnnouncement, adminState.pinnedAnnouncement || { clear: true });
+      deferServerTask('ADMIN PINNED NOTIFY', () => notifyAdminStateAcrossInstances(ADMIN_STATE_KEYS.pinnedAnnouncement, adminState.pinnedAnnouncement || { clear: true }), 0);
       io.emit('admin_pinned_announcement', adminState.pinnedAnnouncement || { clear: true });
       await addModerationLog(shouldClear ? 'unpin' : 'pin', shouldClear ? 'Cleared pinned announcement' : 'Pinned announcement', adminState.pinnedAnnouncement || {}, socket.userName || 'Admin');
       respond({ success: true, announcement: adminState.pinnedAnnouncement });
@@ -9957,6 +10016,7 @@ io.on('connection', (socket) => {
       adminReports = [];
       await pool.query('UPDATE reports SET resolved = true');
       emitToAdmins('reports_list', adminReports);
+      deferServerTask('ADMIN REPORTS CLEAR NOTIFY', () => notifyAdminStateAcrossInstances(ADMIN_STATE_KEYS.reports, { changedAt: Date.now() }), 0);
       await addModerationLog('reports', 'Cleared report center', {}, socket.userName || 'Admin');
       respond({ success: true });
     } catch (err) {
@@ -9976,6 +10036,7 @@ io.on('connection', (socket) => {
       adminReports = adminReports.filter(r => String(r.id || r.time) !== String(reportId));
       await pool.query('UPDATE reports SET resolved = true WHERE id = $1', [reportId]);
       emitToAdmins('reports_list', adminReports);
+      deferServerTask('ADMIN REPORTS RESOLVE NOTIFY', () => notifyAdminStateAcrossInstances(ADMIN_STATE_KEYS.reports, { changedAt: Date.now() }), 0);
       await addModerationLog('reports', 'Resolved report', { reportId }, socket.userName || 'Admin');
       respond({ success: true });
     } catch (err) {
