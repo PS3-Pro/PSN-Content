@@ -12199,7 +12199,31 @@ P
 		}
 		window.__profileNotificationStateSignatures = window.__profileNotificationStateSignatures || Object.create(null);
 		const notificationStateSignature = typeof window.getLiveRenderSignature === 'function' ? window.getLiveRenderSignature(state) : JSON.stringify(state);
-		if (!fromLegacy && window.__profileNotificationStateSignatures[name] === notificationStateSignature) return false;
+		if (!fromLegacy && window.__profileNotificationStateSignatures[name] === notificationStateSignature) {
+			const storageKeys = {
+				downloads: ['psn_dl_dot_items', 'psn_dl_dot'],
+				wishlist: ['psn_wish_dot_items', 'psn_wish_dot'],
+				favorites: ['psn_fav_dot_items', 'psn_fav_dot'],
+				trophies: ['psn_trophy_dot_items', 'psn_trophy_dot', 'psn_last_trophy_color']
+			};
+			const localMirrorMatches = ['downloads', 'wishlist', 'favorites', 'trophies'].every(category => {
+				const incoming = state[category];
+				if (!incoming || typeof incoming !== 'object' || Array.isArray(incoming)) return true;
+				const keys = storageKeys[category];
+				const localPending = normalizeProfileNotificationPendingValue(readSyncedSettingForUser(name, keys[0], '[]'));
+				const localDotRaw = readSyncedSettingForUser(name, keys[1], 'false');
+				const localDot = localDotRaw === true || String(localDotRaw) === '1' || String(localDotRaw).toLowerCase() === 'true';
+				const incomingPending = normalizeProfileNotificationPendingValue(incoming.pendingItems);
+				const incomingDot = incoming.dot === true || String(incoming.dot) === '1' || String(incoming.dot).toLowerCase() === 'true';
+				if (JSON.stringify(localPending) !== JSON.stringify(incomingPending) || localDot !== incomingDot) return false;
+				if (category === 'trophies' && String(readSyncedSettingForUser(name, keys[2], '') || '') !== String(incoming.color || '')) return false;
+				const updatedAtKey = getProfileNotificationUpdatedAtStorageKey(category);
+				const localUpdatedAt = Math.max(0, Number(readSyncedSettingForUser(name, updatedAtKey, 0)) || 0);
+				const incomingUpdatedAt = Math.max(0, Number(incoming.updatedAt || 0) || 0);
+				return !incomingUpdatedAt || localUpdatedAt === incomingUpdatedAt;
+			});
+			if (localMirrorMatches) return false;
+		}
 
 		window.__profileNotificationStateNeedsMigration = fromLegacy || Number(state.version || 0) < Number(PROFILE_NOTIFICATION_STATE_VERSION);
 		const categories = ['downloads', 'wishlist', 'favorites', 'trophies'];
@@ -34619,7 +34643,18 @@ P
 		const signature = typeof window.getLiveRenderSignature === 'function'
 			? window.getLiveRenderSignature([!!state.locked, Number(state.slowSeconds || 0), String(state.by || ''), !!state.canBypass, wait, connected ? 1 : 0])
 			: JSON.stringify([!!state.locked, Number(state.slowSeconds || 0), String(state.by || ''), !!state.canBypass, wait, connected]);
-		if (window.__adminLightChatControlsUiSignature === signature) return;
+		if (window.__adminLightChatControlsUiSignature === signature) {
+			const input = document.getElementById('chat-input');
+			const shouldLock = !!state.locked && !state.canBypass;
+			const shouldWait = !state.locked && !state.canBypass && Number(state.slowSeconds || 0) > 0 && Number(state.waitMs || 0) > 0;
+			const shouldOffline = !connected;
+			const expectedEditable = (shouldLock || shouldWait || shouldOffline) ? 'false' : 'true';
+			const inputLooksCurrent = !input || (input.getAttribute('contenteditable') === expectedEditable
+				&& input.classList.contains('chat-control-locked') === shouldLock
+				&& input.classList.contains('chat-control-waiting') === shouldWait
+				&& input.classList.contains('chat-connection-unavailable') === shouldOffline);
+			if (inputLooksCurrent) return;
+		}
 		adminUpdateChatControlsBanner();
 	}
 
@@ -43259,7 +43294,8 @@ function formatLibraryLastPlayedBadge(game = {}) {
 			? window.getLiveRenderSignature([freeGb, totalGb, resolvedDevices])
 			: JSON.stringify([freeGb, totalGb, resolvedDevices]);
 		const storageSignatureHost = document.getElementById('console-storage-devices');
-		if (storageSignatureHost && storageSignatureHost.dataset.consoleStorageUiSignature === storageSignature) return false;
+		const storageRowsIntact = !storageSignatureHost || storageSignatureHost.querySelectorAll(':scope > .console-storage-device-row').length === resolvedDevices.length;
+		if (storageSignatureHost && storageSignatureHost.dataset.consoleStorageUiSignature === storageSignature && storageRowsIntact) return false;
 		const usedGb = Math.max(0, totalGb - freeGb);
 		const usedPct = clampConsoleValue(Math.round((usedGb / totalGb) * 100), 0, 100);
 		setTextContentById('console-storage-free', freeGb.toFixed(freeGb >= 100 ? 0 : 1));
@@ -44146,7 +44182,12 @@ function formatLibraryLastPlayedBadge(game = {}) {
 		const targetLabel = document.getElementById('console-target-temp-label');
 		const wrap = document.getElementById('console-fan-wrap');
 		const signature = `${savedMode}|${roundedSpeed}|${roundedTarget}`;
-		if (wrap && wrap.dataset.consoleFanUiSignature === signature) return false;
+		const expectedLabelText = savedMode === 'syscon' ? 'SYS' : `${roundedSpeed}%`;
+		const fanDomMatches = (!label || label.textContent === expectedLabelText)
+			&& (!slider || String(slider.value) === String(roundedSpeed))
+			&& (!targetInput || String(targetInput.value) === String(roundedTarget))
+			&& (!wrap || String(wrap.dataset.mode || '') === savedMode);
+		if (wrap && wrap.dataset.consoleFanUiSignature === signature && fanDomMatches) return false;
 		const duration = Math.max(0.28, 2.35 - (savedSpeed / 50));
 		const labelText = savedMode === 'syscon' ? 'SYS' : `${roundedSpeed}%`;
 		if (label && label.textContent !== labelText) label.textContent = labelText;
@@ -57221,7 +57262,12 @@ function getVisibleChatStackEl(id) {
 			const nextPinned = Array.isArray(list) ? list : [];
 			const previousSignature = typeof window.getLiveRenderSignature === 'function' ? window.getLiveRenderSignature(Array.isArray(pinnedMessages) ? pinnedMessages : []) : JSON.stringify(Array.isArray(pinnedMessages) ? pinnedMessages : []);
 			const nextSignature = typeof window.getLiveRenderSignature === 'function' ? window.getLiveRenderSignature(nextPinned) : JSON.stringify(nextPinned);
-			if (previousSignature === nextSignature) return;
+			if (previousSignature === nextSignature) {
+				const pinContainer = document.getElementById('pinned-messages-container');
+				const shouldShowPin = nextPinned.length > 0;
+				const pinDomMatches = !pinContainer || ((pinContainer.style.display !== 'none') === shouldShowPin);
+				if (pinDomMatches) return;
+			}
 			pinnedMessages = nextPinned;
 			if (nextPinned.length > 0) currentPinIndex = nextPinned.length - 1;
 			renderPinnedBar();
@@ -59092,7 +59138,25 @@ function getVisibleChatStackEl(id) {
 				window.__presencePayloadSignatureByUser = window.__presencePayloadSignatureByUser || {};
 				const effectivePresenceUser = getEffectivePresenceUser(name, { ...data, online, lastSeen });
 				const presenceSignature = getPresenceVisualSignature(effectivePresenceUser);
-				if (window.__presencePayloadSignatureByUser[name] === presenceSignature) return;
+				if (window.__presencePayloadSignatureByUser[name] === presenceSignature) {
+					const listPresenceMatches = (list, removeWhenOffline = false) => {
+						if (!Array.isArray(list)) return true;
+						const item = list.find(user => user && (user.name || user) === name);
+						if (!item) return !online || !removeWhenOffline;
+						if (removeWhenOffline && !online) return false;
+						if (typeof item !== 'object') return false;
+						const comparable = getEffectivePresenceUser(name, item);
+						return getPresenceVisualSignature(comparable) === presenceSignature;
+					};
+					const profileModal = document.getElementById('modal-sys-profile');
+					const openedUser = profileModal?.dataset?.profileUsername || document.getElementById('profile-name-val')?.innerText || '';
+					const profileVisibleForTarget = !!(profileModal && openedUser === name && (profileModal.style.display === 'flex' || profileModal.style.display === 'block' || profileModal.classList.contains('show')));
+					const cachedStateMatches = listPresenceMatches(window.currentOnlineList, true)
+						&& listPresenceMatches(window.globalSearchResults)
+						&& listPresenceMatches(window.adminAllUsers)
+						&& listPresenceMatches(window.friendsList);
+					if (cachedStateMatches && !profileVisibleForTarget) return;
+				}
 				window.__presencePayloadSignatureByUser[name] = presenceSignature;
 				window.__presenceComparableUserByName[name] = effectivePresenceUser;
 				if (typeof window.syncPsnUserMeta === 'function') window.syncPsnUserMeta({ ...data, lastSeen });
@@ -67634,16 +67698,20 @@ function getVisibleChatStackEl(id) {
 		Array.from(grid.children).forEach(option => {
 			if (!option.classList || !option.classList.contains('avatar-option')) return;
 			const selected = option.dataset.avatarUrl === current && !option.classList.contains('locked');
-			option.classList.toggle('selected', selected);
+			if (option.classList.contains('selected') !== selected) option.classList.toggle('selected', selected);
 			const image = option.querySelector('img');
-			if (image && !option.classList.contains('locked')) image.style.opacity = selected ? '1' : '0.6';
+			if (image && !option.classList.contains('locked')) {
+				const nextOpacity = selected ? '1' : '0.6';
+				if (image.style.opacity !== nextOpacity) image.style.opacity = nextOpacity;
+			}
 		});
 	}
 
 	function ensureAvatarSelectionGrid(grid, options) {
 		if (!grid) return;
 		const signature = options.map(item => `${item.url}|${item.isReward ? 1 : 0}|${item.isLocked ? 1 : 0}|${item.rewardTitle || ''}`).join('\n');
-		if (grid.dataset.avatarOptionsReady === '1' && grid.__avatarOptionsSignature === signature) return;
+		const avatarNodesIntact = grid.querySelectorAll(':scope > .avatar-option').length === options.length;
+		if (grid.dataset.avatarOptionsReady === '1' && grid.__avatarOptionsSignature === signature && avatarNodesIntact) return;
 		grid.innerHTML = '';
 		const fragment = document.createDocumentFragment();
 		options.forEach(avatarObj => {
