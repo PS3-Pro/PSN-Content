@@ -88,6 +88,7 @@ let profileSyncReconnectTimer = null;
 let onlineListCache = null;
 let onlineListCacheAt = 0;
 let lastBroadcastOnlineListSignature = "";
+const adminSockets = new Set();
 const lastProfileCountsSignatureByUser = new Map();
 const lastPublicProfileSignatureByUser = new Map();
 let lastBroadcastTrendingSignature = "";
@@ -141,9 +142,19 @@ function getOnlineCountFromList(list = []) {
   return Array.isArray(list) ? list.reduce((count, user) => count + (user && user.online === true ? 1 : 0), 0) : 0;
 }
 
+function setSocketAdminState(socket, isAdmin) {
+  if (!socket) return false;
+  const nextAdmin = isAdmin === true;
+  if (socket.isAdmin !== nextAdmin) socket.isAdmin = nextAdmin;
+  if (nextAdmin && socket.connected) adminSockets.add(socket);
+  else adminSockets.delete(socket);
+  return nextAdmin;
+}
+
 function hasAdminSockets() {
-  for (const client of io.sockets.sockets.values()) {
+  for (const client of adminSockets) {
     if (client && client.connected && client.isAdmin === true) return true;
+    adminSockets.delete(client);
   }
   return false;
 }
@@ -846,8 +857,8 @@ function getPayloadItemCount(value) {
   return value === null || value === undefined ? 0 : 1;
 }
 
-function getMemoryDiagnosticSnapshot() {
-  const mem = process.memoryUsage();
+function getMemoryDiagnosticSnapshot(memoryUsage = null) {
+  const mem = memoryUsage || process.memoryUsage();
   return {
     heapMb: mem.heapUsed / 1024 / 1024,
     heapTotalMb: mem.heapTotal / 1024 / 1024,
@@ -874,7 +885,7 @@ function logMemoryPressureIfNeeded(reason = 'periodic') {
   const now = Date.now();
   if (reason === 'periodic' && now - lastMemoryPressureLogAt < 30000) return;
   lastMemoryPressureLogAt = now;
-  const snap = getMemoryDiagnosticSnapshot();
+  const snap = getMemoryDiagnosticSnapshot(mem);
   console.log(`[MEMORY] ${reason} heap ${heapMb.toFixed(1)} MB / ${(mem.heapTotal / 1024 / 1024).toFixed(1)} MB, rss ${(mem.rss / 1024 / 1024).toFixed(1)} MB, sockets ${snap.sockets}, writeBuffer ${snap.writeBufferPackets}, hydration ${snap.profileHydrationActive}/${snap.profileHydrationQueued}, profile-sync ${snap.profileSyncActiveSockets}, compact users ${Object.keys(userDatabase).length}, full-cache ${fullUserCacheNames.size}, trend cache ${trendingCache ? 'yes' : 'no'}, content-count cache ${contentDownloadCountCache ? contentDownloadCountCache.size : 0}`);
 }
 let trendingRefreshTimer = null;
@@ -3083,8 +3094,8 @@ function emitContentDownloadCountsChanged(rawKeys = [], options = {}) {
     .filter(value => value && value.length <= 512))];
   if (!keys.length) return 0;
 
-  const recipients = Array.from(io.sockets.sockets.values()).filter(client => client && client.connected);
-  if (!recipients.length) return 0;
+  const recipientCount = io.sockets.sockets.size;
+  if (!recipientCount) return 0;
   let deliveries = 0;
   for (let index = 0; index < keys.length; index += 100) {
     const payload = {
@@ -3092,9 +3103,9 @@ function emitContentDownloadCountsChanged(rawKeys = [], options = {}) {
       reason: normalizeText(options.reason, 'download').slice(0, 32) || 'download',
       updatedAt: Date.now()
     };
-    trackBandwidthPayload('content_download_counts_changed', payload, recipients.length);
-    recipients.forEach(client => client.emit('content_download_counts_changed', payload));
-    deliveries += recipients.length;
+    trackBandwidthPayload('content_download_counts_changed', payload, recipientCount);
+    io.emit('content_download_counts_changed', payload);
+    deliveries += recipientCount;
   }
   return deliveries;
 }
@@ -5161,9 +5172,10 @@ function emitChatSeenSyncChange(event) {
     seenAt: event.seenAt || ''
   };
   const recipients = new Set([String(event.sender || ''), String(event.reader || '')].filter(Boolean));
-  io.sockets.sockets.forEach(client => {
-    if (!client || !client.connected || !client.userName || !recipients.has(String(client.userName))) return;
-    client.emit('chat_seen_sync_change', payload);
+  recipients.forEach(name => {
+    getSocketsByUserName(name).forEach(client => {
+      if (client && client.connected) client.emit('chat_seen_sync_change', payload);
+    });
   });
 }
 
@@ -5375,13 +5387,23 @@ async function syncChatAcrossInstances() {
     );
 
     if (newRows.rows.length > 0) {
+      const existingDbIds = new Set();
+      const existingMessageTimes = new Set();
+      messageHistory.forEach(message => {
+        const dbId = Number(message && message._dbId) || 0;
+        if (dbId) existingDbIds.add(dbId);
+        if (message && message.time) existingMessageTimes.add(message.time);
+      });
       for (const row of newRows.rows) {
         const dbId = Number(row.id) || 0;
-        if (messageHistory.some(m => Number(m._dbId) === dbId || (m.time && row.message && m.time === row.message.time))) {
+        const messageTime = row.message && row.message.time;
+        if (existingDbIds.has(dbId) || (messageTime && existingMessageTimes.has(messageTime))) {
           lastChatDbId = Math.max(lastChatDbId, dbId);
           continue;
         }
         const message = attachChatDbId({ ...(row.message || {}) }, dbId);
+        if (dbId) existingDbIds.add(dbId);
+        if (messageTime) existingMessageTimes.add(messageTime);
         messageHistory.push(message);
         if (messageHistory.length > MAX_CHAT_HISTORY) messageHistory.shift();
         lastChatDbId = Math.max(lastChatDbId, dbId);
@@ -5395,20 +5417,24 @@ async function syncChatAcrossInstances() {
     }
 
     if (messageHistory.length > 0) {
-      const meta = await queryDbWithRetry('SELECT COUNT(*)::int AS total, COALESCE(MAX(id), 0)::int AS max_id FROM chat', [], { attempts: 2, label: 'CHAT SYNC META' });
-      const total = Number(meta.rows[0]?.total || 0);
-      const maxId = Number(meta.rows[0]?.max_id || 0);
-      if (total === 0) {
+      // We only need to know whether the table is empty or its highest id moved backwards
+      // (TRUNCATE/reset on another instance). An indexed top-id lookup is far cheaper than
+      // COUNT(*) + MAX(id) on every 3-second idle poll.
+      const meta = await queryDbWithRetry('SELECT id AS max_id FROM chat ORDER BY id DESC LIMIT 1', [], { attempts: 2, label: 'CHAT SYNC META' });
+      if (!meta.rows.length) {
         messageHistory = [];
         lastChatDbId = 0;
         io.emit('chat_cleared', { by: 'Server Sync' });
-      } else if (maxId < lastChatDbId) {
-        await refreshChatHistoryFromDb();
-        const publicHistory = getPublicChatHistory();
-        io.sockets.sockets.forEach(client => {
-          if (!client || !client.connected || client.__chatInitialFullSyncInFlight === true) return;
-          client.emit('chat_history', publicHistory);
-        });
+      } else {
+        const maxId = Number(meta.rows[0]?.max_id || 0);
+        if (maxId < lastChatDbId) {
+          await refreshChatHistoryFromDb();
+          const publicHistory = getPublicChatHistory();
+          io.sockets.sockets.forEach(client => {
+            if (!client || !client.connected || client.__chatInitialFullSyncInFlight === true) return;
+            client.emit('chat_history', publicHistory);
+          });
+        }
       }
     }
   } catch (err) {
@@ -5440,9 +5466,13 @@ async function emitAdminState(socket) {
 }
 
 function emitToAdmins(event, payload) {
-  io.sockets.sockets.forEach(client => {
-    if (client.isAdmin === true) client.emit(event, payload);
-  });
+  for (const client of adminSockets) {
+    if (!client || !client.connected || client.isAdmin !== true) {
+      adminSockets.delete(client);
+      continue;
+    }
+    client.emit(event, payload);
+  }
 }
 
 async function addModerationLog(type, message, detail = {}, admin = "System") {
@@ -5492,11 +5522,43 @@ async function addServerLog(type, message, detail = {}, user = "Server") {
   return entry;
 }
 
+const socketsByUserName = new Map();
+
+function unindexSocketUser(socket) {
+  if (!socket) return;
+  const indexedName = normalizeText(socket.__indexedUserName, '');
+  if (!indexedName) return;
+  const set = socketsByUserName.get(indexedName);
+  if (set) {
+    set.delete(socket);
+    if (!set.size) socketsByUserName.delete(indexedName);
+  }
+  socket.__indexedUserName = '';
+}
+
+function indexSocketUser(socket, name) {
+  if (!socket) return;
+  const safeName = normalizeText(name, '');
+  const previousName = normalizeText(socket.__indexedUserName, '');
+  if (previousName && previousName !== safeName) unindexSocketUser(socket);
+  socket.userName = safeName;
+  if (!safeName) return;
+  let set = socketsByUserName.get(safeName);
+  if (!set) { set = new Set(); socketsByUserName.set(safeName, set); }
+  set.add(socket);
+  socket.__indexedUserName = safeName;
+}
+
 function getSocketsByUserName(name) {
+  const safeName = normalizeText(name, '');
+  const set = safeName ? socketsByUserName.get(safeName) : null;
+  if (!set || !set.size) return [];
   const sockets = [];
-  io.sockets.sockets.forEach(client => {
-    if (client.userName === name) sockets.push(client);
-  });
+  for (const client of set) {
+    if (client && client.userName === safeName) sockets.push(client);
+    else set.delete(client);
+  }
+  if (!set.size) socketsByUserName.delete(safeName);
   return sockets;
 }
 
@@ -5809,9 +5871,7 @@ function emitSettingsRealtimeSync(name, sourceSocketId = null, extra = {}) {
 
 
 async function syncActiveProfilesAcrossInstances() {
-  const activeNames = [...new Set(Array.from(io.sockets.sockets.values())
-    .filter(client => client.connected && client.userName)
-    .map(client => client.userName))];
+  const activeNames = Array.from(socketsByUserName.keys()).filter(name => getSocketsByUserName(name).length > 0);
 
   for (const name of activeNames) {
     const localVersion = normalizeTimestampValue(userDatabase[name] && userDatabase[name].profileUpdatedAt);
@@ -6035,9 +6095,7 @@ async function initProfileSyncNotifications() {
         return;
       }
 
-      const hasLocalSession = Array.from(io.sockets.sockets.values()).some(activeSocket => (
-        activeSocket.connected && activeSocket.userName === name
-      ));
+      const hasLocalSession = getSocketsByUserName(name).some(activeSocket => activeSocket && activeSocket.connected);
 
       if (message.channel === 'presence_sync') {
         if (!userDatabase[name]) await refreshSingleUserSummaryFromDb(name);
@@ -7289,7 +7347,7 @@ function disconnectUserSessions(name, eventName = 'user_kicked', payload = {}) {
   getSocketsByUserName(name).forEach(client => {
     if (isPasswordResetDisconnect) {
       client.__passwordResetRevoked = true;
-      client.isAdmin = false;
+      setSocketAdminState(client, false);
       client.isModerator = false;
     }
     client.emit(eventName, payload);
@@ -7486,11 +7544,6 @@ async function markPresenceOfflineIfNoActiveSessions(name, lastSeen = Date.now()
 }
 
 async function syncPresenceOnlineFromDb() {
-  const previousOnlineState = new Map(Object.entries(userDatabase).map(([username, user]) => [
-    username,
-    { online: user && user.online === true, id: user && user.id || null, lastSeen: Number(user && user.lastSeen || 0), revision: Math.max(0, Number(user && user.presenceRevision) || 0) }
-  ]));
-
   const expiredRes = await queryDbWithRetry(`
     WITH expired AS (
       DELETE FROM presence_sessions
@@ -7511,6 +7564,20 @@ async function syncPresenceOnlineFromDb() {
     GROUP BY name
   `, [], { attempts: 2, label: 'PRESENCE READ' });
   const activeByName = new Map(presenceRes.rows.map(row => [row.name, row]));
+  const presenceCandidateNames = new Set();
+  presenceRes.rows.forEach(row => { if (row && row.name) presenceCandidateNames.add(row.name); });
+  expiredRes.rows.forEach(row => { if (row && row.name) presenceCandidateNames.add(row.name); });
+  const previousOnlineState = new Map();
+  presenceCandidateNames.forEach(username => {
+    const user = userDatabase[username];
+    if (!user) return;
+    previousOnlineState.set(username, {
+      online: user.online === true,
+      id: user.id || null,
+      lastSeen: Number(user.lastSeen || 0),
+      revision: Math.max(0, Number(user.presenceRevision) || 0)
+    });
+  });
 
   presenceRes.rows.forEach(row => {
     const username = row.name;
@@ -7540,13 +7607,14 @@ async function syncPresenceOnlineFromDb() {
   }
 
   let presenceChanged = false;
-  Object.entries(userDatabase).forEach(([username, user]) => {
+  presenceCandidateNames.forEach(username => {
+    const user = userDatabase[username];
     const previous = previousOnlineState.get(username);
-    if (!previous) return;
-    const onlineChanged = previous.online !== (user && user.online === true);
-    const activeSessionChanged = user && user.online === true && String(user.id || '') !== String(previous.id || '');
-    const offlineLastSeenChanged = user && user.online !== true && Number(user.lastSeen || 0) > previous.lastSeen;
-    const revisionChanged = Math.max(0, Number(user && user.presenceRevision) || 0) > previous.revision;
+    if (!user || !previous) return;
+    const onlineChanged = previous.online !== (user.online === true);
+    const activeSessionChanged = user.online === true && String(user.id || '') !== String(previous.id || '');
+    const offlineLastSeenChanged = user.online !== true && Number(user.lastSeen || 0) > previous.lastSeen;
+    const revisionChanged = Math.max(0, Number(user.presenceRevision) || 0) > previous.revision;
     if (!onlineChanged && !activeSessionChanged && !offlineLastSeenChanged && !revisionChanged) return;
     presenceChanged = true;
     const payload = emitPresenceUpdate(username, user);
@@ -7595,23 +7663,28 @@ async function emitOnlineList(targetSocket = null, options = {}) {
 }
 
 async function heartbeatPresenceSessions() {
-  const activeSockets = [];
-  io.sockets.sockets.forEach(client => {
-    if (client.connected && client.userName) activeSockets.push(client);
-  });
+  const socketIds = [];
+  const names = [];
+  const instanceIds = [];
+  const heartbeatAt = Date.now();
 
-  if (activeSockets.length > 0) {
-    const socketIds = [];
-    const names = [];
-    const instanceIds = [];
-
-    activeSockets.forEach(client => {
+  // Presence only concerns authenticated/indexed users. Avoid walking pre-auth and maintenance
+  // sockets from the global Socket.IO map every heartbeat.
+  for (const [indexedName, set] of socketsByUserName) {
+    for (const client of set) {
+      if (!client || !client.connected || client.userName !== indexedName) {
+        set.delete(client);
+        continue;
+      }
       socketIds.push(client.id);
-      names.push(client.userName);
+      names.push(indexedName);
       instanceIds.push(INSTANCE_ID);
-      if (userDatabase[client.userName]) userDatabase[client.userName].lastSeen = Date.now();
-    });
+      if (userDatabase[indexedName]) userDatabase[indexedName].lastSeen = heartbeatAt;
+    }
+    if (!set.size) socketsByUserName.delete(indexedName);
+  }
 
+  if (socketIds.length > 0) {
     // Session metadata is static enough to write on connect/recovery. Heartbeats only refresh
     // presence timestamps, preserving the existing data JSON instead of resending user-agent data.
     await queryDbWithRetry(
@@ -7654,7 +7727,7 @@ async function setUserRole(targetName, role, adminName) {
   await saveUser(targetName);
 
   getSocketsByUserName(targetName).forEach(client => {
-    client.isAdmin = isUserAdmin(targetName, userDatabase[targetName]);
+    setSocketAdminState(client, isUserAdmin(targetName, userDatabase[targetName]));
     client.role = getUserRole(targetName, userDatabase[targetName]);
     client.emit('role_updated', {
       role: client.role,
@@ -7918,6 +7991,7 @@ function startBackgroundTasks() {
 
 io.on('connection', (socket) => {
   console.log('[NETWORK] Socket connected. ID: ' + socket.id);
+  socket.once('disconnecting', () => { unindexSocketUser(socket); adminSockets.delete(socket); });
   deferServerTask('CONNECTION INIT', () => emitAdminState(socket), 0);
 
   socket.on('authenticate_user', async (data = {}) => {
@@ -8057,8 +8131,8 @@ io.on('connection', (socket) => {
         
         if (match) {
           socket.__passwordResetRevoked = false;
-          socket.userName = name;
-          socket.isAdmin = isAdmin;
+          indexSocketUser(socket, name);
+          setSocketAdminState(socket, isAdmin);
           socket.role = getUserRole(name, dbUser);
 
           const serverUser = buildCompactUserSummary(name, dbUser);
@@ -8134,8 +8208,8 @@ io.on('connection', (socket) => {
       } else {
         const hash = await bcrypt.hash(password, 10);
         socket.__passwordResetRevoked = false;
-        socket.userName = name;
-        socket.isAdmin = isAdmin;
+        indexSocketUser(socket, name);
+        setSocketAdminState(socket, isAdmin);
 
         userDatabase[name] = normalizeUserRecord(name, {
           ...safeUserData,
@@ -9199,23 +9273,31 @@ io.on('connection', (socket) => {
   });
 
   socket.on('request_online_list', async () => {
+    // Reconnect/login paths can request the same snapshot several times before the
+    // post-auth delay expires. Keep one targeted send pending per socket.
+    if (socket.__onlineListRequestPending === true) return;
+    socket.__onlineListRequestPending = true;
+
     const sendOnlineList = async () => {
-      await emitOnlineList(socket);
+      try {
+        if (!socket.connected) return;
+        await emitOnlineList(socket);
+      } catch (err) {
+        console.error('[REQUEST ONLINE LIST ERROR]:', err);
+        if (socket.connected && Array.isArray(lastKnownOnlineList) && lastKnownOnlineList.length > 0) {
+          socket.emit('online_list', lastKnownOnlineList);
+        }
+      } finally {
+        socket.__onlineListRequestPending = false;
+      }
     };
 
-    try {
-      const remaining = getPostAuthRemainingDelay(socket, POST_AUTH_ONLINE_LIST_DELAY_MS);
-      if (remaining > 0) {
-        deferServerTask('REQUEST ONLINE LIST', sendOnlineList, remaining);
-        return;
-      }
-      await sendOnlineList();
-    } catch (err) {
-      console.error('[REQUEST ONLINE LIST ERROR]:', err);
-      if (Array.isArray(lastKnownOnlineList) && lastKnownOnlineList.length > 0) {
-        socket.emit('online_list', lastKnownOnlineList);
-      }
+    const remaining = getPostAuthRemainingDelay(socket, POST_AUTH_ONLINE_LIST_DELAY_MS);
+    if (remaining > 0) {
+      deferServerTask('REQUEST ONLINE LIST', sendOnlineList, remaining);
+      return;
     }
+    await sendOnlineList();
   });
 
   socket.on('chat_render_error', (data = {}) => {
@@ -9735,7 +9817,13 @@ io.on('connection', (socket) => {
     const respond = typeof callback === 'function' ? callback : () => {};
 
     try {
-      await pool.query(`DELETE FROM presence_sessions WHERE last_seen < NOW() - INTERVAL '${PRESENCE_TTL_SECONDS} seconds'`);
+      if (data && data.latencyOnly === true) {
+        return respond({
+          success: true,
+          serverTime: new Date().toISOString(),
+          uptimeSeconds: Math.floor((Date.now() - SERVER_STARTED_AT) / 1000)
+        });
+      }
 
       const statsRes = await pool.query(`
         SELECT
