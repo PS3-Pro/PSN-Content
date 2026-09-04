@@ -7957,6 +7957,49 @@ io.on('connection', (socket) => {
     });
   });
 
+  socket.on('record_explore_visit', async (payload = {}, ack) => {
+    const respond = response => {
+      if (typeof ack !== 'function' || !socket.connected) return;
+      try { ack(response); } catch (err) {}
+    };
+    const name = socket.userName;
+    if (!name || !userDatabase[name]) { respond({ ok: false, error: 'Profile is not available.' }); return; }
+
+    try {
+      const visitState = await runDbTransactionWithRetry(
+        'EXPLORE VISIT SAVE',
+        async client => {
+          const currentResult = await client.query(
+            `SELECT data->>'exploreLastVisitAt' AS explore_last_visit_at
+             FROM users
+             WHERE name = $1
+             LIMIT 1
+             FOR UPDATE`,
+            [name]
+          );
+          if (!currentResult.rows.length) return null;
+          const previousVisitAt = normalizeTimestampValue(currentResult.rows[0].explore_last_visit_at);
+          const visitAt = Date.now();
+          await client.query(
+            `UPDATE users
+             SET data = COALESCE(data, '{}'::jsonb) || jsonb_build_object('exploreLastVisitAt', $2::bigint)
+             WHERE name = $1`,
+            [name, visitAt]
+          );
+          return { previousVisitAt, visitAt };
+        },
+        { attempts: 3, lockTimeoutMs: 1200, advisoryLockKey: `explore-visit:${name}` }
+      );
+
+      if (!visitState) { respond({ ok: false, error: 'Profile is not available.' }); return; }
+      userDatabase[name].exploreLastVisitAt = visitState.visitAt;
+      respond({ ok: true, previousVisitAt: visitState.previousVisitAt, visitAt: visitState.visitAt });
+    } catch (err) {
+      console.error('[EXPLORE VISIT SAVE ERROR]:', err && err.message ? err.message : err);
+      respond({ ok: false, error: 'Explore visit could not be saved.' });
+    }
+  });
+
   socket.on('settings_realtime_update', async (payload = {}, ack) => {
     const respond = response => {
       if (typeof ack !== 'function' || !socket.connected) return;

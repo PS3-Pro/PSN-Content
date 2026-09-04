@@ -319,6 +319,8 @@ body { margin: 0; font-family: -apple-system,BlinkMacSystemFont,"Segoe UI",Robot
 .sidebar-menu li.active>.sidebar-count-pill { color: #fff; background-color: rgba(255,255,255,.12); border-color: rgba(255,255,255,.18); box-shadow: 0 0 10px rgba(255,255,255,.055); }
 .sidebar-menu li>.sidebar-count-pill:hover { color: #07111f; background-color: #fff; border-color: #fff; box-shadow: 0 6px 18px rgba(0,0,0,.24),0 0 16px rgba(255,255,255,.22); }
 .sidebar-menu li:has(>.sidebar-count-pill:not(.is-empty))>.notification-dot { right: 17px; top: 10px; width: 6px; height: 6px; z-index: 2; }
+@keyframes sidebarCountPillLiveBump{0%,100%{transform:scale(1);}34%,62%{transform:translateY(-1px) scale(1.12);background-color:#fff;color:#07111f;border-color:#fff;box-shadow:0 7px 20px rgba(0,0,0,.24),0 0 18px rgba(255,255,255,.24),inset 0 1px 0 #fff;}}
+.sidebar-count-pill.count-pill-live-bump { animation: sidebarCountPillLiveBump .48s cubic-bezier(.22,1,.36,1); }
 .user-profile { padding: 20px 20px calc(20px + env(safe-area-inset-bottom,0px)) 20px; border-top: 1px solid rgba(255,255,255,0.05); display: flex; align-items: center; gap: 15px; }
 .profile-btn-group { display: flex; justify-content: space-evenly; width: 100%; margin-top: 0px; gap: 25px; padding-top: 10px; }
 
@@ -1101,6 +1103,12 @@ html.collection-memory-optimization-on #downloads-list > .download-swipe-row { c
 .section-header h2 { font-size: 16px; font-weight: 500; color: #fff; margin: 0; text-transform: uppercase; letter-spacing: 0.5px; }
 .section-header a { color: var(--text-muted); text-decoration: none; font-size: 12px; font-weight: bold; transition: 0.2s; }
 .section-header a:hover { color: #fff; }
+.section-header-meta { display:inline-flex; align-items:center; gap:8px; flex-wrap:nowrap; justify-content:flex-end; min-width:0; margin-left:auto; }
+.explore-visit-filter-host.filter-checkboxes { display:inline-flex; align-items:center; flex-wrap:nowrap; gap:0; margin:0; }
+.explore-visit-pill { font-family:inherit; white-space:nowrap; }
+.explore-visit-filter-host.filter-checkboxes label.explore-visit-pill { padding:2px 8px !important; border-radius:10px !important; font-size:9px !important; font-weight:600 !important; letter-spacing:.5px !important; line-height:1.15 !important; }
+.explore-visit-pill.is-hidden { display:none !important; }
+@media (max-width: 768px) { .explore-section .section-header:has(.section-header-meta) { align-items:flex-end; gap:8px; flex-wrap:nowrap; } .explore-section .section-header:has(.section-header-meta) h2 { min-width:0; white-space:nowrap; } .explore-section .section-header-meta { width:auto; flex:0 0 auto; margin-left:auto; justify-content:flex-end; flex-wrap:nowrap; } .explore-visit-filter-host.filter-checkboxes { flex:0 0 auto; flex-wrap:nowrap !important; gap:0 !important; justify-content:flex-end !important; margin:0 !important; } }
 .promo-card { background: linear-gradient(135deg,#bf953f 0%,#fcf6ba 45%,#b38728 100%); border-radius: 12px; padding: 25px; display: flex; flex-direction: column; justify-content: center; transition: all 0.4s cubic-bezier(0.175,0.885,0.32,1.275); position: relative; overflow: hidden; box-shadow: 0 5px 15px rgba(0,0,0,0.3); min-height: 160px; }
 .promo-card:hover { transform: translateY(-6px) scale(1.02); box-shadow: 0 12px 25px rgba(184,134,11,0.5); }
 .promo-card:hover .promo-icon { transform: scale(1.2) rotate(-5deg); color: rgba(0,0,0,0.15); }
@@ -14303,6 +14311,185 @@ P
 		return `${n} ${n === 1 ? singular : plural}`;
 	};
 
+	const STORAGE_KEY_EXPLORE_LAST_VISIT_AT = 'psn_explore_last_visit_at';
+
+	function primeExploreVisitSession() {
+		const activeUser = String(localStorage.getItem('psn_username') || '');
+		if (window.__exploreVisitSessionPrimed === true && window.__exploreVisitSessionOwner === activeUser) return;
+		const previousVisitAt = normalizeProfileListTimestamp(loadState(STORAGE_KEY_EXPLORE_LAST_VISIT_AT));
+		window.__explorePreviousVisitAt = previousVisitAt;
+		window.__exploreCurrentVisitAt = Date.now();
+		window.__exploreVisitSessionPrimed = true;
+		window.__exploreVisitSessionOwner = activeUser;
+		window.__exploreVisitServerSynced = false;
+		window.__exploreVisitSyncPromise = null;
+		saveState(STORAGE_KEY_EXPLORE_LAST_VISIT_AT, String(window.__exploreCurrentVisitAt));
+	}
+
+	function refreshExploreVisitPillsFromCurrentData() {
+		['latest-games-grid', 'latest-dlcs-grid', 'latest-avatars-grid', 'latest-demos-grid'].forEach(containerId => {
+			const container = document.getElementById(containerId);
+			const items = container && container.__exploreVirtualData && Array.isArray(container.__exploreVirtualData.items)
+				? container.__exploreVirtualData.items
+				: null;
+			if (!items || typeof window.updateExploreVisitPill !== 'function') return;
+			window.updateExploreVisitPill(containerId, items);
+			if (container.__exploreVirtualData) {
+				container.__exploreVirtualData.cardCache = new Map();
+				delete container.dataset.exploreVirtualStart;
+				delete container.dataset.exploreVirtualEnd;
+				renderExploreVirtualWindow(container, true);
+			}
+		});
+	}
+
+	window.syncExploreVisitSession = function(reason = 'explore') {
+		primeExploreVisitSession();
+		const activeUser = String(localStorage.getItem('psn_username') || '');
+		if (!activeUser || activeUser === 'null' || activeUser === 'undefined') return Promise.resolve(false);
+		if (window.__exploreVisitServerSynced === true && window.__exploreVisitSessionOwner === activeUser) return Promise.resolve(true);
+		if (window.__exploreVisitSyncPromise && window.__exploreVisitSessionOwner === activeUser) return window.__exploreVisitSyncPromise;
+		if (!window.isProfileLoaded || typeof socketChat === 'undefined' || !socketChat || !socketChat.connected) return Promise.resolve(false);
+
+		const localFallbackPrevious = normalizeProfileListTimestamp(window.__explorePreviousVisitAt || 0);
+		window.__exploreVisitSyncPromise = new Promise(resolve => {
+			let settled = false;
+			const finish = response => {
+				if (settled) return;
+				settled = true;
+				window.__exploreVisitSyncPromise = null;
+				if (!response || response.ok !== true || String(localStorage.getItem('psn_username') || '') !== activeUser) { resolve(false); return; }
+				const serverPrevious = normalizeProfileListTimestamp(response.previousVisitAt);
+				const visitAt = normalizeProfileListTimestamp(response.visitAt) || Date.now();
+				window.__explorePreviousVisitAt = serverPrevious || localFallbackPrevious;
+				window.__exploreCurrentVisitAt = visitAt;
+				window.__exploreVisitServerSynced = true;
+				saveState(STORAGE_KEY_EXPLORE_LAST_VISIT_AT, String(visitAt));
+				refreshExploreVisitPillsFromCurrentData();
+				resolve(true);
+			};
+			try {
+				const payload = { reason, clientSentAt: Date.now() };
+				if (typeof socketChat.timeout === 'function') {
+					socketChat.timeout(5000).emit('record_explore_visit', payload, (err, response) => finish(err ? null : response));
+				} else {
+					const timer = setTimeout(() => finish(null), 5000);
+					socketChat.emit('record_explore_visit', payload, response => { clearTimeout(timer); finish(response); });
+				}
+			} catch (err) {
+				finish(null);
+			}
+		});
+		return window.__exploreVisitSyncPromise;
+	};
+
+	function getExploreVisitPillElement(containerId) {
+		const container = document.getElementById(containerId);
+		if (!container) return null;
+		const section = container.closest('.explore-section');
+		const header = section ? section.querySelector('.section-header') : null;
+		if (!header) return null;
+		let meta = header.querySelector('.section-header-meta');
+		if (!meta) {
+			meta = document.createElement('div');
+			meta.className = 'section-header-meta';
+			header.appendChild(meta);
+		}
+		let pill = meta.querySelector(`.explore-visit-pill[data-container-id="${containerId}"]`);
+		if (!pill) {
+			let host = meta.querySelector('.explore-visit-filter-host');
+			if (!host) {
+				host = document.createElement('span');
+				host.className = 'explore-visit-filter-host filter-checkboxes';
+				meta.appendChild(host);
+			}
+			pill = document.createElement('label');
+			pill.className = 'explore-visit-pill is-hidden';
+			pill.dataset.containerId = containerId;
+			pill.setAttribute('role', 'button');
+			pill.setAttribute('tabindex', '0');
+			pill.setAttribute('aria-pressed', 'false');
+			pill.innerHTML = '<input type="checkbox" checked disabled aria-hidden="true"><span class="explore-visit-pill-value">0 NEW</span>';
+			pill.onclick = event => { event.preventDefault(); window.toggleExploreVisitHighlights(containerId); };
+			pill.onkeydown = event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); window.toggleExploreVisitHighlights(containerId); } };
+			host.appendChild(pill);
+		}
+		return pill;
+	}
+
+	window.toggleExploreVisitHighlights = function(containerId, forceState = null) {
+		const container = document.getElementById(containerId);
+		if (!container) return false;
+		const section = container.closest('.explore-section');
+		const pill = getExploreVisitPillElement(containerId);
+		if (!section || !pill || pill.classList.contains('is-hidden')) return false;
+		const shouldActivate = forceState === null ? !section.classList.contains('show-visit-highlights') : !!forceState;
+		section.classList.toggle('show-visit-highlights', shouldActivate);
+		pill.classList.toggle('is-active', shouldActivate);
+		pill.setAttribute('aria-pressed', shouldActivate ? 'true' : 'false');
+		if (!shouldActivate) return true;
+		if (container.__exploreVirtualData) {
+			delete container.dataset.exploreReturnResetting;
+			delete container.dataset.exploreSkipNextReturnReveal;
+			try { container.scrollTo({ left: 0, behavior: 'smooth' }); } catch (e) { container.scrollLeft = 0; }
+			renderExploreVirtualWindow(container, true);
+		} else {
+			try { container.scrollTo({ left: 0, behavior: 'smooth' }); } catch (e) { container.scrollLeft = 0; }
+		}
+		return true;
+	};
+
+	window.updateExploreVisitPill = function(containerId, items = []) {
+		primeExploreVisitSession();
+		const pill = getExploreVisitPillElement(containerId);
+		const container = document.getElementById(containerId);
+		const section = container ? container.closest('.explore-section') : null;
+		if (!pill || !container || !section) return 0;
+		const previousVisitAt = Number(window.__explorePreviousVisitAt || 0) || 0;
+		let count = 0;
+		if (previousVisitAt > 0 && Array.isArray(items) && items.length) {
+			items.forEach(item => {
+				const dateValue = Number(item && item.dateValue || 0) || 0;
+				const isNewSinceVisit = previousVisitAt > 0 && dateValue > previousVisitAt;
+				if (item) item.__newSinceVisit = isNewSinceVisit;
+				if (isNewSinceVisit) count++;
+			});
+		} else if (Array.isArray(items)) {
+			items.forEach(item => { if (item) item.__newSinceVisit = false; });
+		}
+		container.dataset.newSinceVisitCount = String(count);
+		if (count < 1) {
+			pill.classList.add('is-hidden');
+			pill.classList.remove('is-active');
+			pill.setAttribute('aria-pressed', 'false');
+			section.classList.remove('show-visit-highlights');
+			pill.title = '';
+			pill.setAttribute('aria-label', '');
+			return 0;
+		}
+		const text = `${count} NEW SINCE LAST VISIT`;
+		const label = `${count} ${count === 1 ? 'new item' : 'new items'} since your last visit`;
+		const valueNode = pill.querySelector('.explore-visit-pill-value');
+		if (valueNode) valueNode.textContent = text;
+		pill.title = label + '. Click to highlight.';
+		pill.setAttribute('aria-label', pill.title);
+		pill.classList.remove('is-hidden');
+		return count;
+	};
+
+	window.animateCountPillFeedback = function(pill) {
+		if (!pill || !pill.isConnected || pill.style.display === 'none' || pill.classList.contains('is-empty')) return false;
+		pill.classList.remove('count-pill-live-bump');
+		void pill.offsetWidth;
+		pill.classList.add('count-pill-live-bump');
+		clearTimeout(pill.__countPillBumpTimer);
+		pill.__countPillBumpTimer = setTimeout(() => {
+			pill.classList.remove('count-pill-live-bump');
+			pill.__countPillBumpTimer = 0;
+		}, 460);
+		return true;
+	};
+
 	window.updateCountAwareSectionTitle = function(containerId, explicitCount = null) {
 		const config = COUNT_AWARE_SECTION_TITLES[containerId];
 		const container = document.getElementById(containerId);
@@ -14442,6 +14629,10 @@ P
 		const template = document.createElement('template');
 		template.innerHTML = buildExploreCardHTML(game, cat, idx, animateCards).trim();
 		const card = template.content.firstElementChild;
+		if (card && game && game.__newSinceVisit) {
+			card.classList.add('explore-card-new-since-visit');
+			card.dataset.newSinceVisit = '1';
+		}
 		const img = card ? card.querySelector('.game-img') : null;
 		if (img && img.complete && img.naturalWidth > 0) {
 			requestAnimationFrame(() => {
@@ -14718,6 +14909,7 @@ P
 		container.dataset.exploreCat = cat;
 		container.dataset.countAwareTotal = String((items || []).length);
 		if (typeof window.updateCountAwareSectionTitle === 'function') window.updateCountAwareSectionTitle(container.id, (items || []).length);
+		if (typeof window.updateExploreVisitPill === 'function') window.updateExploreVisitPill(container.id, items || []);
 		container.dataset.exploreVirtual = '1';
 		delete container.dataset.exploreVirtualStart;
 		delete container.dataset.exploreVirtualEnd;
@@ -18280,6 +18472,8 @@ P
 	}
 
     async function populateExploreTab(options = {}) {
+		if (typeof primeExploreVisitSession === 'function') primeExploreVisitSession();
+		if (typeof window.syncExploreVisitSession === 'function') window.syncExploreVisitSession('explore').catch(() => {});
 		if (typeof window.renderRecentlyVisited === 'function') window.renderRecentlyVisited();
 		// Never block Recently Added on cover indexes. Persistent cover decisions are used immediately
 		// and the shared background preload keeps future resolutions canonical without delaying cards.
@@ -28719,17 +28913,22 @@ P
 	window.setSidebarCountPill = function(type, rawCount) {
 		const pill = document.getElementById(`sidebar-count-${type}`);
 		if (!pill) return;
-		pill.dataset.rawCount = (rawCount === null || rawCount === undefined) ? '' : String(Math.max(0, Number(rawCount) || 0));
+		const activeUser = String(localStorage.getItem('psn_username') || '');
+		const previousRawCount = pill.dataset.rawCount ?? '';
+		const hadInitialized = pill.dataset.countInitialized === '1' && (pill.dataset.countOwner || '') === activeUser;
+		const nextRawCount = (rawCount === null || rawCount === undefined) ? '' : String(Math.max(0, Number(rawCount) || 0));
 		const labels = { browse:'database item', wishlist:'wishlist item', playTogether:'Play Together game', downloads:'download', revived:'server', chat:'chat message', friends:'friend', activity:'activity', notifications:'notification', trophies:'trophy', rewards:'reward', games:'game', favorites:'favorite' };
 		const globalIcon = document.getElementById('global-status-icon');
 		const consoleConnected = !!(globalIcon && globalIcon.classList.contains('status-dot-connected'));
 		const consoleOnly = type === 'games' || type === 'favorites';
-		if (consoleOnly && !consoleConnected) { pill.classList.add('is-empty'); pill.style.display='none'; return; }
-		if (rawCount === null || rawCount === undefined) { pill.classList.add('is-empty'); pill.style.display='none'; return; }
+		pill.dataset.rawCount = nextRawCount;
+		pill.dataset.countOwner = activeUser;
+		if (consoleOnly && !consoleConnected) { pill.classList.add('is-empty'); pill.style.display='none'; pill.dataset.countInitialized = '1'; return; }
+		if (rawCount === null || rawCount === undefined) { pill.classList.add('is-empty'); pill.style.display='none'; pill.dataset.countInitialized = '1'; return; }
 		const count = Math.max(0, Number(rawCount) || 0);
 		const isEmpty = count < 1;
 		pill.classList.toggle('is-empty', isEmpty);
-		if (isEmpty) { pill.style.display='none'; pill.textContent='0'; return; }
+		if (isEmpty) { pill.style.display='none'; pill.textContent='0'; pill.dataset.countInitialized = '1'; return; }
 		pill.style.display='';
 		if (type === 'browse' && count >= 1000) {
 			const divisor = count >= 1000000 ? 1000000 : 1000;
@@ -28742,6 +28941,10 @@ P
 		const suffix = type === 'trophies' ? ' earned' : (type === 'rewards' ? ' unlocked' : '');
 		pill.title = `${count.toLocaleString('en-US')} ${label}${suffix}`;
 		pill.setAttribute('aria-label', pill.title);
+		if (hadInitialized && previousRawCount !== nextRawCount && typeof window.animateCountPillFeedback === 'function') {
+			window.animateCountPillFeedback(pill);
+		}
+		pill.dataset.countInitialized = '1';
 	};
 
 
@@ -55980,6 +56183,7 @@ function getVisibleChatStackEl(id) {
 			if (isLightAuthPayload && initialProfileSyncOk && !profileWasAlreadyLoaded) {
 				window.isProfileLoaded = true;
 			}
+			if (typeof window.syncExploreVisitSession === 'function') window.syncExploreVisitSession('auth-success').catch(() => {});
 			if (typeof window.refreshViewerPlayTogetherTitles === 'function') window.refreshViewerPlayTogetherTitles(true);
 
 			if (typeof window.bootstrapFriendActivityRealtime === 'function') {
