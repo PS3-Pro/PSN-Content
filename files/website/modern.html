@@ -72059,7 +72059,8 @@ function getVisibleChatStackEl(id) {
     const INTERFACE_TRANSLATE_REQUEST_TIMEOUT = 12000;
     const INTERFACE_TRANSLATE_VISIBILITY_HOST_SELECTOR = [
         '[id^="view-"]', '[id^="subview-"]', '.sys-modal-overlay', '.modal-overlay',
-        '[role="dialog"]', '.tab-content', '.ps5-auth-container', '.profile-country-dialog'
+        '[role="dialog"]', '.tab-content', '.ps5-auth-container', '.profile-country-dialog',
+        '.sidebar-menu[class*="menu-group-"]'
     ].join(',');
     // Small hidden menus are translated eagerly so their first opening never flashes English.
     const INTERFACE_TRANSLATE_EAGER_ROOT_SELECTOR = '#profile-dropdown';
@@ -72873,6 +72874,7 @@ function getVisibleChatStackEl(id) {
         if (!node || node.nodeType !== Node.TEXT_NODE || state.pendingNodes.has(node) || shouldSkipNode(node)) return;
         const parent = node.parentElement;
         const allowHidden = options.allowHidden === true;
+        const skipFit = options.skipFit === true;
         if (!parent || !parent.isConnected || (!allowHidden && !isElementVisible(parent))) return;
 
         const current = String(node.nodeValue || '');
@@ -72887,7 +72889,7 @@ function getVisibleChatStackEl(id) {
         const trailing = match ? match[3] : '';
         if (!shouldTranslateInterfaceText(core, node)) return;
 
-        captureInterfaceFixedCard(node);
+        if (!skipFit) captureInterfaceFixedCard(node);
         const protectedSource = prepareInterfaceProtectedTranslation(core, node);
         state.pendingNodes.add(node);
         enqueueInterfaceTranslation({
@@ -72905,9 +72907,11 @@ function getVisibleChatStackEl(id) {
                 const next = leading + translatedCore + trailing;
                 state.textRecords.set(node, { original: sourceValue, translated: next, target, pendingOriginal: '' });
                 node.nodeValue = next;
-                fitCompactInterfaceLabel(node);
-                fitFixedInterfaceLabelForNode(node);
-                fitInterfaceFixedCardForNode(node);
+                if (!skipFit) {
+                    fitCompactInterfaceLabel(node);
+                    fitFixedInterfaceLabelForNode(node);
+                    fitInterfaceFixedCardForNode(node);
+                }
             }
         });
     }
@@ -72992,8 +72996,9 @@ function getVisibleChatStackEl(id) {
         });
     }
 
-    function applyImmediateInterfaceTranslationToTextNode(node, target) {
+    function applyImmediateInterfaceTranslationToTextNode(node, target, options = {}) {
         if (!node || node.nodeType !== Node.TEXT_NODE || shouldSkipNode(node)) return false;
+        const skipFit = options.skipFit === true;
         const parent = node.parentElement;
         if (!parent || !parent.isConnected) return false;
         const current = String(node.nodeValue || '');
@@ -73014,9 +73019,11 @@ function getVisibleChatStackEl(id) {
             const next = leading + immediate + trailing;
             state.textRecords.set(node, { original: current, translated: next, target, pendingOriginal: '' });
             node.nodeValue = next;
-            fitCompactInterfaceLabel(node);
-            fitFixedInterfaceLabelForNode(node);
-            fitInterfaceFixedCardForNode(node);
+            if (!skipFit) {
+                fitCompactInterfaceLabel(node);
+                fitFixedInterfaceLabelForNode(node);
+                fitInterfaceFixedCardForNode(node);
+            }
             return true;
         }
 
@@ -73047,6 +73054,32 @@ function getVisibleChatStackEl(id) {
             applyImmediateInterfaceTranslationToTextNode(node, target);
             node = walker.nextNode();
         }
+    }
+
+    function scanNewBrowseCardInterfaceFast(card) {
+        if (!state.enabled || !card || card.nodeType !== Node.ELEMENT_NODE || !card.isConnected) return false;
+        if (!card.matches?.('#database-grid > .game-card')) return false;
+        const target = state.target;
+        const generation = state.generation;
+        if (!target || target === 'en') return true;
+
+        const walker = document.createTreeWalker(card, NodeFilter.SHOW_TEXT, {
+            acceptNode(node) {
+                return shouldSkipNode(node) ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT;
+            }
+        });
+        let textNode = walker.nextNode();
+        while (textNode) {
+            if (!applyImmediateInterfaceTranslationToTextNode(textNode, target, { skipFit: true })) {
+                translateTextNode(textNode, target, generation, { allowHidden: true, skipFit: true });
+            }
+            textNode = walker.nextNode();
+        }
+
+        const attributeSelector = '[placeholder],[data-placeholder],[title],[aria-label]';
+        if (card.matches(attributeSelector)) translateElementAttributes(card, target, generation, { allowHidden: true });
+        card.querySelectorAll(attributeSelector).forEach(el => translateElementAttributes(el, target, generation, { allowHidden: true }));
+        return true;
     }
 
     function scanEagerInterfaceRoot(root) {
@@ -73127,10 +73160,11 @@ function getVisibleChatStackEl(id) {
         if (state.scanTimer) return;
         state.scanTimer = setTimeout(() => {
             state.scanTimer = null;
-            const roots = Array.from(state.pendingRoots);
+            const roots = Array.from(state.pendingRoots).filter(root => root && root.isConnected);
             state.pendingRoots.clear();
+            if (!roots.length) return;
             const compactRoots = roots.filter((item, index) => !roots.some((other, otherIndex) => otherIndex !== index && other.contains && other.contains(item)));
-            (compactRoots.length ? compactRoots : [document.body]).forEach(scanVisibleInterface);
+            compactRoots.forEach(scanVisibleInterface);
         }, 28);
     }
     window.scheduleInterfaceTranslationScan = scheduleInterfaceTranslationScan;
@@ -73211,9 +73245,13 @@ function getVisibleChatStackEl(id) {
     function scheduleInterfaceTranslationAfterUiChange(root = document.body) {
         if (!state.enabled) return;
         const candidate = root && root.isConnected ? root : document.body;
-        requestAnimationFrame(() => scheduleInterfaceTranslationScan(candidate));
+        requestAnimationFrame(() => {
+            if (candidate.isConnected) scheduleInterfaceTranslationScan(candidate);
+        });
         clearTimeout(state.postUiTimer);
-        state.postUiTimer = setTimeout(() => scheduleInterfaceTranslationScan(document.body), 160);
+        state.postUiTimer = setTimeout(() => {
+            if (candidate.isConnected) scheduleInterfaceTranslationScan(candidate);
+        }, 160);
     }
     window.scheduleInterfaceTranslationAfterUiChange = scheduleInterfaceTranslationAfterUiChange;
 
@@ -73227,31 +73265,18 @@ function getVisibleChatStackEl(id) {
             if (select) scheduleInterfaceTranslationScan(select);
         }, true);
 
-        document.addEventListener('click', event => {
-            if (!state.enabled) return;
-            const origin = event.target && event.target.nodeType === Node.ELEMENT_NODE ? event.target : event.target?.parentElement;
-            if (!origin || !origin.closest) return;
-            const trigger = origin.closest('a, button, [role="button"], [onclick], .sidebar-menu li, .profile-item, .game-card, .setting-item, input[type="checkbox"], select');
-            if (!trigger) return;
-            scheduleInterfaceTranslationAfterUiChange(document.body);
-        }, true);
+        // Do not rescan the interface on every click. Browse card navigation, Go Back and the page
+        // scroll buttons do not create untranslated static UI by themselves; their real DOM/visibility
+        // changes are already handled by the targeted observers below. The old generic click hook
+        // scheduled two document.body scans and could fight smooth scrolling/context transitions.
 
-        document.addEventListener('transitionend', event => {
+        const scheduleCurrentInterfaceViewTranslation = () => {
             if (!state.enabled) return;
-            const origin = event.target && event.target.nodeType === Node.ELEMENT_NODE ? event.target : null;
-            const host = origin && origin.closest ? origin.closest(INTERFACE_TRANSLATE_VISIBILITY_HOST_SELECTOR) : null;
-            if (host && isElementVisible(host)) scheduleInterfaceTranslationScan(host);
-        }, true);
-
-        document.addEventListener('animationend', event => {
-            if (!state.enabled) return;
-            const origin = event.target && event.target.nodeType === Node.ELEMENT_NODE ? event.target : null;
-            const host = origin && origin.closest ? origin.closest(INTERFACE_TRANSLATE_VISIBILITY_HOST_SELECTOR) : null;
-            if (host && isElementVisible(host)) scheduleInterfaceTranslationScan(host);
-        }, true);
-
-        window.addEventListener('popstate', () => scheduleInterfaceTranslationAfterUiChange(document.body));
-        window.addEventListener('hashchange', () => scheduleInterfaceTranslationAfterUiChange(document.body));
+            const visibleView = Array.from(document.querySelectorAll('[id^="view-"]')).find(view => isElementVisible(view));
+            scheduleInterfaceTranslationAfterUiChange(visibleView || document.body);
+        };
+        window.addEventListener('popstate', scheduleCurrentInterfaceViewTranslation);
+        window.addEventListener('hashchange', scheduleCurrentInterfaceViewTranslation);
         window.addEventListener('resize', () => {
             if (!state.enabled) return;
             clearTimeout(state.fixedCardResizeTimer);
@@ -73275,8 +73300,12 @@ function getVisibleChatStackEl(id) {
         if (!state.visibilityObservers) state.visibilityObservers = new Map();
         const register = host => {
             if (!host || host.nodeType !== Node.ELEMENT_NODE || state.visibilityObservers.has(host) || !isInterfaceTranslationVisibilityHost(host)) return;
+            let wasVisible = isElementVisible(host);
             const observer = new MutationObserver(() => {
-                if (state.enabled && host.isConnected && isElementVisible(host)) scheduleInterfaceTranslationScan(host);
+                if (!host.isConnected) return;
+                const visible = isElementVisible(host);
+                if (state.enabled && visible && !wasVisible) scheduleInterfaceTranslationScan(host);
+                wasVisible = visible;
             });
             observer.observe(host, { attributes: true, attributeFilter: ['class', 'style', 'hidden', 'open', 'aria-hidden'] });
             state.visibilityObservers.set(host, observer);
@@ -73304,8 +73333,9 @@ function getVisibleChatStackEl(id) {
             let removedVisibilityHost = false;
             for (const mutation of mutations) {
                 if (mutation.type === 'characterData') {
-                    applyImmediateInterfaceTranslationToTextNode(mutation.target, state.target);
-                    scheduleInterfaceTranslationScan(mutation.target.parentElement);
+                    if (!applyImmediateInterfaceTranslationToTextNode(mutation.target, state.target)) {
+                        scheduleInterfaceTranslationScan(mutation.target.parentElement);
+                    }
                     continue;
                 }
                 if (mutation.type === 'attributes') {
@@ -73316,8 +73346,20 @@ function getVisibleChatStackEl(id) {
                 }
                 if (mutation.addedNodes && mutation.addedNodes.length) {
                     mutation.addedNodes.forEach(node => {
-                        applyImmediateInterfaceTranslations(node);
+                        if (!node) return;
+                        if (node.nodeType === Node.TEXT_NODE) {
+                            // Pretty-printed card HTML creates whitespace text nodes between cards. Scanning
+                            // their parent used to promote the pending root to the whole database grid.
+                            if (!normalizeInterfaceSourceText(node.nodeValue || '')) return;
+                            if (!applyImmediateInterfaceTranslationToTextNode(node, state.target)) {
+                                scheduleInterfaceTranslationScan(node.parentElement);
+                            }
+                            return;
+                        }
+                        if (node.nodeType !== Node.ELEMENT_NODE) return;
                         observeInterfaceTranslationVisibilityHosts(node);
+                        if (scanNewBrowseCardInterfaceFast(node)) return;
+                        applyImmediateInterfaceTranslations(node);
                         scheduleInterfaceTranslationScan(node);
                     });
                 }
