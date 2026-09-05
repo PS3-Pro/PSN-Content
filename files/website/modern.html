@@ -18876,13 +18876,16 @@ P
 		return !!(view && view.style.display === 'block');
 	}
 
-	function renderCachedTrendingIfVisible() {
+	function renderCachedTrendingIfVisible(options = {}) {
 		if (!isTrendingViewVisible() || !window.__pendingTrendingData) return;
 		if (typeof renderTrendingCarousel === 'function') {
-			renderTrendingCarousel('trending-dl-grid', window.__pendingTrendingData.topDownloads, 'fas fa-download');
-			renderTrendingCarousel('trending-wish-grid', window.__pendingTrendingData.topWishlist, 'fas fa-heart');
+			renderTrendingCarousel('trending-dl-grid', window.__pendingTrendingData.topDownloads, 'fas fa-download', options);
+			renderTrendingCarousel('trending-wish-grid', window.__pendingTrendingData.topWishlist, 'fas fa-heart', options);
 		}
 	}
+
+	/* TRENDING REALTIME SOURCE: the server already rebuilds + broadcasts authoritative
+	   trending_data after wishlist/download changes. Do not request it again from count events. */
 
 	window.applyOptimisticTrendingDelta = function(type, titleId, delta) {
 		const data = window.__pendingTrendingData;
@@ -18893,6 +18896,7 @@ P
 		const isWishlist = type === 'wishlist';
 		const listKey = isWishlist ? 'topWishlist' : 'topDownloads';
 		const containerId = isWishlist ? 'trending-wish-grid' : 'trending-dl-grid';
+		const iconClass = isWishlist ? 'fas fa-heart' : 'fas fa-download';
 		const list = Array.isArray(data[listKey]) ? data[listKey] : [];
 		const item = list.find(entry => String(entry && entry.id || '').trim().toUpperCase() === normalizedId);
 		if (!item) return false;
@@ -18903,8 +18907,14 @@ P
 			.sort((a, b) => (Number(b.count) || 0) - (Number(a.count) || 0) || String(a.id || '').localeCompare(String(b.id || '')))
 			.slice(0, 50);
 
-		if (window.trendingCache) delete window.trendingCache[containerId];
-		if (isTrendingViewVisible()) renderCachedTrendingIfVisible();
+		/* TRENDING LIVE PATCH: never rebuild both carousels for one local count change.
+		   Reconcile only the affected strip; hidden history DOM is patched before Go Back too. */
+		if (typeof window.renderTrendingCarousel === 'function') {
+			window.renderTrendingCarousel(containerId, data[listKey], iconClass, {
+				realtime: isTrendingViewVisible(),
+				prewarm: !isTrendingViewVisible()
+			});
+		}
 		return true;
 	};
 
@@ -18913,7 +18923,7 @@ P
 		const key = window.getContentDownloadCountKey(category, titleId, contentId, name);
 		if (!key) return false;
 		window.contentDownloadCounts[key] = Math.max(0, (Number(window.contentDownloadCounts[key]) || 0) + (Number(delta) || 0));
-		if (typeof window.applyContentDownloadCountsToCards === 'function') window.applyContentDownloadCountsToCards(document);
+		if (typeof window.applyContentDownloadCountsToCards === 'function') window.applyContentDownloadCountsToCards(document, { keys:[key], animate:true });
 		return true;
 	};
 
@@ -18974,6 +18984,212 @@ P
 		return resolved;
 	}
 
+	const TRENDING_ALLOWED_CATEGORIES = ['games', 'guides', 'soundtracks', 'videos', 'homebrew_games', 'ports', 'prototypes'];
+
+	function getTrendingRankVisual(displayRank) {
+		let rankClass = '';
+		let badgeStyle = 'position: absolute; bottom: 8px; left: 8px; z-index: 5; font-weight: 900; font-size: 10px; padding: 2px 8px; border-radius: 4px; display: flex; align-items: center; gap: 4px; backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px);';
+		let fireIcon = '';
+		if (displayRank === 0) {
+			rankClass = 'rank-gold-glow';
+			badgeStyle += 'background: linear-gradient(135deg, #bf953f, #fcf6ba, #b38728); color: #000; border: 1px solid #fff; box-shadow: 0 0 10px rgba(255,204,0,0.5);';
+			fireIcon = '<i class="fas fa-fire" style="color: #ff4500; font-size: 9px; animation: pulse-dot 1s infinite;"></i>';
+		} else if (displayRank === 1) {
+			rankClass = 'rank-silver-glow';
+			badgeStyle += 'background: linear-gradient(135deg, #757f9a, #d7dde8, #757f9a); color: #000; border: 1px solid #fff;';
+		} else if (displayRank === 2) {
+			rankClass = 'rank-bronze-glow';
+			badgeStyle += 'background: linear-gradient(135deg, #804a00, #cd7f32, #592d00); color: #fff; border: 1px solid rgba(255,255,255,0.3);';
+		} else {
+			badgeStyle += 'background: rgba(0, 0, 0, 0.5); color: #fff; border: 1px solid rgba(255, 255, 255, 0.2);';
+		}
+		return { rankClass, badgeStyle, fireIcon };
+	}
+
+	function getTrendingStatColor(iconClass) {
+		if (String(iconClass || '').includes('heart')) return '#ff4444';
+		if (String(iconClass || '').includes('download')) return '#ffff00';
+		return 'var(--text-muted)';
+	}
+
+	function getTrendingDisplayEntries(topList) {
+		const entries = [];
+		for (const item of (Array.isArray(topList) ? topList : [])) {
+			if (entries.length >= 30) break;
+			const resolved = getTrendingResolvedStoreItem(item && item.id, TRENDING_ALLOWED_CATEGORIES);
+			if (!resolved || !resolved.item) continue;
+			entries.push({ item, gameData:resolved.item, gameCategory:resolved.category || 'games' });
+		}
+		return entries;
+	}
+
+	function buildTrendingCardHtml(entry, displayRank, iconClass, statColor) {
+		const { item, gameData, gameCategory } = entry;
+		const coverKey = typeof window.getStoreCardCoverKey === 'function'
+			? window.getStoreCardCoverKey(gameCategory, gameData.id || gameData.titleId, gameData.contentId)
+			: '';
+		const preferredCoverUrl = getItemCover(gameData, gameCategory);
+		const cachedCoverUrl = coverKey && typeof window.getCachedCardCoverSrc === 'function'
+			? window.getCachedCardCoverSrc(coverKey, gameCategory, preferredCoverUrl)
+			: '';
+		const imgUrl = cachedCoverUrl || preferredCoverUrl;
+		const githubCoverUrl = getGithubItemCover(gameData, gameCategory);
+		const coverKeyAttr = String(coverKey || '').replace(/[&<>"]/g, ch => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;' })[ch]);
+		const { rankClass, badgeStyle, fireIcon } = getTrendingRankVisual(displayRank);
+		const consoleClasses = ['ps3', 'ps2', 'psx', 'psp', 'minis', 'pce', 'neogeo'];
+		const tagClass = consoleClasses.includes(gameData.cTag) ? `tag-${gameData.cTag}` : 'tag-default';
+		const consoleName = (gameData.cTag || 'PS3').toUpperCase();
+		const region = gameData.region || '??';
+		const title = gameData.cleanName || gameData.title;
+		const trendingId = String(item && item.id || gameData.id || gameData.titleId || '').trim().toUpperCase();
+		return `
+			<div class="game-card no-anim ${rankClass}" style="--tile-idx: ${displayRank};" data-trending-id="${trendingId.replace(/"/g, '&quot;')}"
+				onclick="playUiClick(); searchGameOnSite('${gameData.id}')"
+				onmouseenter="const __hoverTarget = document.elementFromPoint(event.clientX, event.clientY); if(!__hoverTarget || !__hoverTarget.closest('.btn-mini,.btn-mini-round,.fav-btn,.wish-btn,.action-btn,button,a')) playUiHover(); this.classList.remove('anim-reveal'); this.classList.add('no-anim');">
+				<div class="game-img-container">
+					<div class="console-tag ${tagClass}">${consoleName}</div>
+					<div class="region-tag">${region}</div>
+					<div class="trending-rank-badge" style="${badgeStyle}">${fireIcon} #${displayRank + 1}</div>
+					<img src="${imgUrl}" class="game-img" loading="lazy" decoding="async" data-cover-key="${coverKeyAttr}" data-cover-category="${gameCategory}" data-name="${String(title || '').replace(/"/g, '&quot;')}" data-console="${gameData.cTag}" data-github-cover="${String(githubCoverUrl || '').replace(/"/g, '&quot;')}" data-title-id="${gameData.id || gameData.titleId || ''}" data-content-id="${gameData.contentId || ''}" data-region="${gameData.region || ''}" onload="markCoverLoaded(this)" onerror="handleCoverError(this, '${gameCategory}')">
+				</div>
+				<div class="game-info" style="padding: 10px; min-height: 0;">
+					<div style="display: flex; flex-direction: column; justify-content: space-between; height: 100%;">
+						<div>
+							<h3 class="game-title" title="${title}">${title}</h3>
+							<div class="trending-count-line" style="font-size: 11px; color: ${statColor}; font-weight: bold; margin-top: 4px; text-shadow: 0 0 10px ${statColor}44;">
+								<i class="${iconClass}" style="margin-right: 2px;"></i> <span class="trending-count-value">${Math.max(0, Number(item && item.count) || 0)}</span> users
+							</div>
+						</div>
+						<div style="margin-top: 12px; display: flex; align-items: center; gap: 6px;">
+							<span style="font-size: 10px; font-weight: 800; color: var(--ps-blue); letter-spacing: 1.2px;">GO TO STORE</span>
+							<i class="fas fa-chevron-right" style="font-size: 8px; color: var(--ps-blue); opacity: 0.8;"></i>
+						</div>
+					</div>
+				</div>
+			</div>`;
+	}
+
+	function patchTrendingCardNode(card, entry, displayRank, iconClass, statColor) {
+		if (!card || !entry) return;
+		const trendingId = String(entry.item && entry.item.id || entry.gameData.id || entry.gameData.titleId || '').trim().toUpperCase();
+		if (card.dataset.trendingId !== trendingId) card.dataset.trendingId = trendingId;
+		card.style.setProperty('--tile-idx', displayRank);
+		card.classList.remove('rank-gold-glow', 'rank-silver-glow', 'rank-bronze-glow');
+		const visual = getTrendingRankVisual(displayRank);
+		if (visual.rankClass) card.classList.add(visual.rankClass);
+		const badge = card.querySelector('.trending-rank-badge');
+		if (badge) {
+			if (badge.getAttribute('style') !== visual.badgeStyle) badge.setAttribute('style', visual.badgeStyle);
+			const nextBadge = `${visual.fireIcon} #${displayRank + 1}`;
+			if (badge.innerHTML !== nextBadge) badge.innerHTML = nextBadge;
+		}
+		const countLine = card.querySelector('.trending-count-line');
+		if (countLine) {
+			const nextStyle = `font-size: 11px; color: ${statColor}; font-weight: bold; margin-top: 4px; text-shadow: 0 0 10px ${statColor}44;`;
+			if (countLine.getAttribute('style') !== nextStyle) countLine.setAttribute('style', nextStyle);
+			const icon = countLine.querySelector('i');
+			if (icon && icon.className !== iconClass) icon.className = iconClass;
+			const value = countLine.querySelector('.trending-count-value');
+			const nextCount = String(Math.max(0, Number(entry.item && entry.item.count) || 0));
+			if (value && value.textContent !== nextCount) value.textContent = nextCount;
+		}
+	}
+
+	function createTrendingCardNode(entry, displayRank, iconClass, statColor) {
+		const template = document.createElement('template');
+		template.innerHTML = buildTrendingCardHtml(entry, displayRank, iconClass, statColor).trim();
+		return template.content.firstElementChild;
+	}
+
+	function reconcileTrendingCarousel(containerId, topList, iconClass) {
+		const container = document.getElementById(containerId);
+		if (!container || !container.querySelector(':scope > .game-card')) return false;
+		const entries = getTrendingDisplayEntries(topList);
+		if (!entries.length) return false;
+		const statColor = getTrendingStatColor(iconClass);
+		const currentCards = Array.from(container.querySelectorAll(':scope > .game-card'));
+		const byId = new Map();
+		const currentIds = [];
+		for (const card of currentCards) {
+			const id = String(card.dataset.trendingId || card.querySelector('.game-img')?.dataset?.titleId || '').trim().toUpperCase();
+			currentIds.push(id);
+			if (id && !byId.has(id)) byId.set(id, card);
+		}
+
+		const desiredIds = entries.map(entry => String(entry.item && entry.item.id || entry.gameData.id || entry.gameData.titleId || '').trim().toUpperCase());
+		const orderChanged = currentIds.length !== desiredIds.length || currentIds.some((id, index) => id !== desiredIds[index]);
+		const shouldFlipRank = orderChanged && isTrendingViewVisible() && !document.hidden &&
+			typeof Element.prototype.animate === 'function' && !(typeof browseMotionReduced === 'function' && browseMotionReduced());
+		const firstPositions = shouldFlipRank ? new Map() : null;
+		if (firstPositions) {
+			/* TRENDING RANK FLIP: measure only when order actually changes.
+			   Count-only realtime updates stay layout-free and touch only the number. */
+			for (const card of currentCards) {
+				firstPositions.set(card, { left: Number(card.offsetLeft) || 0, top: Number(card.offsetTop) || 0 });
+			}
+		}
+
+		const desiredCards = [];
+		for (let rank = 0; rank < entries.length; rank++) {
+			const entry = entries[rank];
+			const id = desiredIds[rank];
+			let card = byId.get(id) || null;
+			if (card) byId.delete(id);
+			else card = createTrendingCardNode(entry, rank, iconClass, statColor);
+			if (!card) continue;
+			patchTrendingCardNode(card, entry, rank, iconClass, statColor);
+			desiredCards.push(card);
+		}
+		for (const node of Array.from(container.children)) {
+			if (!node.classList?.contains('game-card')) node.remove();
+		}
+		for (const card of byId.values()) card.remove();
+
+		/* If ranking did not change, a count update performs zero card moves.
+		   When ranking changes, only nodes that are out of position are moved. */
+		const currentOrder = Array.from(container.querySelectorAll(':scope > .game-card'));
+		const sameOrder = currentOrder.length === desiredCards.length && currentOrder.every((card, index) => card === desiredCards[index]);
+		if (!sameOrder) {
+			for (let index = 0; index < desiredCards.length; index++) {
+				const desired = desiredCards[index];
+				const current = container.children[index] || null;
+				if (current !== desired) container.insertBefore(desired, current);
+			}
+
+			if (firstPositions) {
+				let movedIndex = 0;
+				for (const card of desiredCards) {
+					const first = firstPositions.get(card);
+					if (!first) continue; // new Top entry: no previous position to FLIP from
+					const dx = first.left - (Number(card.offsetLeft) || 0);
+					const dy = first.top - (Number(card.offsetTop) || 0);
+					if (Math.abs(dx) < .5 && Math.abs(dy) < .5) continue;
+					for (const animation of card.getAnimations()) {
+						if (animation.id === 'psn-trending-rank-flip') animation.cancel();
+					}
+					const useIndependentTranslate = card.style && ('translate' in card.style);
+					const frames = useIndependentTranslate
+						? [{ translate: `${dx}px ${dy}px` }, { translate: '0px 0px' }]
+						: [{ transform: `translate3d(${dx}px,${dy}px,0)` }, { transform: 'translate3d(0,0,0)' }];
+					const animation = card.animate(frames, {
+						duration: 460,
+						delay: Math.min(movedIndex++, 6) * 10,
+						easing: 'cubic-bezier(.2,.8,.2,1)',
+						fill: 'none'
+					});
+					animation.id = 'psn-trending-rank-flip';
+				}
+			}
+		}
+		container.dataset.countAwareTotal = String(desiredCards.length);
+		container.dataset.trendingPrewarmed = isTrendingViewVisible() ? '0' : '1';
+		if (!window.trendingCache) window.trendingCache = {};
+		window.trendingCache[containerId] = JSON.stringify(topList);
+		if (typeof window.updateCountAwareSectionTitle === 'function') window.updateCountAwareSectionTitle(containerId, desiredCards.length);
+		return true;
+	}
+	window.reconcileTrendingCarousel = reconcileTrendingCarousel;
+
 	window.renderTrendingCarousel = async function(containerId, topList, iconClass, options = {}) {
 		const container = document.getElementById(containerId);
 		if (!container) return;
@@ -18992,6 +19208,9 @@ P
 			if (typeof window.updateCountAwareSectionTitle === 'function') window.updateCountAwareSectionTitle(containerId, cachedTotal);
 			return;
 		}
+		/* Realtime/prewarm updates reconcile existing nodes in place. This preserves covers, hover state,
+		   horizontal scroll and reveal state instead of flashing the whole Trending strip. */
+		if ((options.realtime === true || prewarmOnly) && reconcileTrendingCarousel(containerId, topList, iconClass)) return;
 		window.trendingCache[containerId] = cacheKey;
 	
 		if (!topList || topList.length === 0) {
@@ -19006,95 +19225,14 @@ P
 			return;
 		}
 	
-		let statColor = 'var(--text-muted)';
-		if (iconClass.includes('heart')) {
-			statColor = '#ff4444';
-		} else if (iconClass.includes('download')) {
-			statColor = '#ffff00';
-		}
-	
+		const statColor = getTrendingStatColor(iconClass);
 		let html = '';
-		let displayRank = 0; 
-		
-		const allowedCats = ['games', 'guides', 'soundtracks', 'videos', 'homebrew_games', 'ports', 'prototypes'];
-		
-		for (const item of topList) {
-			if (displayRank >= 30) break;
-	
-			const resolvedTrendingItem = getTrendingResolvedStoreItem(item.id, allowedCats);
-			const gameData = resolvedTrendingItem ? resolvedTrendingItem.item : null;
-			const gameCategory = resolvedTrendingItem ? resolvedTrendingItem.category : 'games';
-	
-			if (gameData) {
-				// Use the exact same shared cover key, cached decision and fallback metadata as Browse/Explore.
-				const coverKey = typeof window.getStoreCardCoverKey === 'function'
-					? window.getStoreCardCoverKey(gameCategory, gameData.id || gameData.titleId, gameData.contentId)
-					: '';
-				const preferredCoverUrl = getItemCover(gameData, gameCategory);
-				const cachedCoverUrl = coverKey && typeof window.getCachedCardCoverSrc === 'function'
-					? window.getCachedCardCoverSrc(coverKey, gameCategory, preferredCoverUrl)
-					: '';
-				const imgUrl = cachedCoverUrl || preferredCoverUrl;
-				const githubCoverUrl = getGithubItemCover(gameData, gameCategory);
-				const coverKeyAttr = String(coverKey || '').replace(/[&<>"]/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[ch]);
-				
-				let rankClass = "";
-				let badgeStyle = `position: absolute; bottom: 8px; left: 8px; z-index: 5; font-weight: 900; font-size: 10px; padding: 2px 8px; border-radius: 4px; display: flex; align-items: center; gap: 4px; backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px);`;
-				let fireIcon = "";
-	
-				if (displayRank === 0) {
-					rankClass = "rank-gold-glow";
-					badgeStyle += "background: linear-gradient(135deg, #bf953f, #fcf6ba, #b38728); color: #000; border: 1px solid #fff; box-shadow: 0 0 10px rgba(255,204,0,0.5);";
-					fireIcon = '<i class="fas fa-fire" style="color: #ff4500; font-size: 9px; animation: pulse-dot 1s infinite;"></i>';
-				} else if (displayRank === 1) {
-					rankClass = "rank-silver-glow";
-					badgeStyle += "background: linear-gradient(135deg, #757f9a, #d7dde8, #757f9a); color: #000; border: 1px solid #fff;";
-				} else if (displayRank === 2) {
-					rankClass = "rank-bronze-glow";
-					badgeStyle += "background: linear-gradient(135deg, #804a00, #cd7f32, #592d00); color: #fff; border: 1px solid rgba(255,255,255,0.3);";
-				} else {
-					badgeStyle += "background: rgba(0, 0, 0, 0.5); color: #fff; border: 1px solid rgba(255, 255, 255, 0.2);";
-				}
-	
-				const consoleClasses = ['ps3', 'ps2', 'psx', 'psp', 'minis', 'pce', 'neogeo'];
-				const tagClass = consoleClasses.includes(gameData.cTag) ? `tag-${gameData.cTag}` : 'tag-default';
-				const consoleName = (gameData.cTag || "PS3").toUpperCase();
-				const region = gameData.region || "??";
-	
-				html += `
-					<div class="game-card no-anim ${rankClass}" style="--tile-idx: ${displayRank};"
-						onclick="playUiClick(); searchGameOnSite('${gameData.id}')" 
-						onmouseenter="const __hoverTarget = document.elementFromPoint(event.clientX, event.clientY); if(!__hoverTarget || !__hoverTarget.closest('.btn-mini,.btn-mini-round,.fav-btn,.wish-btn,.action-btn,button,a')) playUiHover(); this.classList.remove('anim-reveal'); this.classList.add('no-anim');">
-						<div class="game-img-container">
-							<div class="console-tag ${tagClass}">${consoleName}</div>
-							<div class="region-tag">${region}</div>
-							
-							<div style="${badgeStyle}">
-								${fireIcon} #${displayRank + 1}
-							</div>
-	
-							<img src="${imgUrl}" class="game-img" loading="lazy" decoding="async" data-cover-key="${coverKeyAttr}" data-cover-category="${gameCategory}" data-name="${(gameData.cleanName || gameData.title).replace(/"/g, '&quot;')}" data-console="${gameData.cTag}" data-github-cover="${String(githubCoverUrl || '').replace(/"/g, '&quot;')}" data-title-id="${gameData.id || gameData.titleId || ''}" data-content-id="${gameData.contentId || ''}" data-region="${gameData.region || ''}" onload="markCoverLoaded(this)" onerror="handleCoverError(this, '${gameCategory}')">
-						</div>
-						<div class="game-info" style="padding: 10px; min-height: 0;">
-							<div style="display: flex; flex-direction: column; justify-content: space-between; height: 100%;">
-								<div>
-									<h3 class="game-title" title="${gameData.cleanName || gameData.title}">${gameData.cleanName || gameData.title}</h3>
-									<div style="font-size: 11px; color: ${statColor}; font-weight: bold; margin-top: 4px; text-shadow: 0 0 10px ${statColor}44;">
-										<i class="${iconClass}" style="margin-right: 2px;"></i> ${item.count} users
-									</div>
-								</div>
-								<div style="margin-top: 12px; display: flex; align-items: center; gap: 6px;">
-									<span style="font-size: 10px; font-weight: 800; color: var(--ps-blue); letter-spacing: 1.2px;">GO TO STORE</span>
-									<i class="fas fa-chevron-right" style="font-size: 8px; color: var(--ps-blue); opacity: 0.8;"></i>
-								</div>
-							</div>
-						</div>
-					</div>
-				`;
-				displayRank++; 
-			}
+		const displayEntries = getTrendingDisplayEntries(topList);
+		for (let displayRank = 0; displayRank < displayEntries.length; displayRank++) {
+			html += buildTrendingCardHtml(displayEntries[displayRank], displayRank, iconClass, statColor);
 		}
-	
+		const displayRank = displayEntries.length;
+
 		container.dataset.countAwareTotal = String(displayRank);
 		if (typeof window.updateCountAwareSectionTitle === 'function') window.updateCountAwareSectionTitle(containerId, displayRank);
 
@@ -21606,10 +21744,10 @@ P
 			switchView('view-browse', false, true);
 			autoSyncUI('browse');
 
-            const finishBrowseHistoryRestore = () => {
+            const finishBrowseHistoryRestore = (allowOpen = true) => {
                 window.isRestoringHistory = false;
                 window.__browseHistoryRestoreScrollTop = null;
-                if (!openId || typeof filteredData === 'undefined') return;
+                if (!allowOpen || !openId || typeof filteredData === 'undefined') return;
                 const wantedId = String(openId || '').toUpperCase().trim();
                 const wantedContentId = String(openContentId || '').toUpperCase().trim();
                 let idx = -1;
@@ -21648,7 +21786,7 @@ P
                     restoreScroll: scroll,
                     skipMotionCapture: true,
                     reuseLoadedCovers: true
-                }).then(finishBrowseHistoryRestore);
+                }).then(result => finishBrowseHistoryRestore(result !== false));
 			} else {
                 finishBrowseHistoryRestore();
 			}
@@ -23008,7 +23146,9 @@ P
 		return psnStoreRenderPromises[cat];
 	}
 
+    let browseDatabaseRequestToken = 0;
     async function fetchDatabase(options = {}) {
+        const browseRequestToken = ++browseDatabaseRequestToken;
 		window.g_animCutoffFound = false;
 		const restoreOptions = options && typeof options === 'object' ? options : {};
 		const preserveRenderedGrid = restoreOptions.preserveRenderedGrid === true;
@@ -23020,6 +23160,22 @@ P
 	
 		const cat = document.getElementById('cat-select').value;
 		const selectEl = document.getElementById('cat-select');
+        const browseWasVisibleAtStart = typeof isPsnDomSectionVisible === 'function'
+            ? isPsnDomSectionVisible('view-browse')
+            : !!(document.getElementById('view-browse') && document.getElementById('view-browse').style.display !== 'none');
+        const browseRequestStillCurrent = () => {
+            if (browseRequestToken !== browseDatabaseRequestToken) return false;
+            if ((document.getElementById('cat-select')?.value || '') !== cat) return false;
+            /* Hidden callers such as Admin/Sync are allowed to refresh the Store cache. A request
+               that started from the visible Store becomes stale as soon as the user leaves it. */
+            if (browseWasVisibleAtStart && typeof isPsnDomSectionVisible === 'function' && !isPsnDomSectionVisible('view-browse')) return false;
+            return true;
+        };
+        const releaseOwnedBrowseFlags = () => {
+            if (browseRequestToken !== browseDatabaseRequestToken) return;
+            window.__browseSkipMotionCaptureOnce = false;
+            window.__browseReuseLoadedCoversOnNextFilter = false;
+        };
         const displayTitle = document.getElementById('display-title');
         const nextDisplayTitle = selectEl && selectEl.options[selectEl.selectedIndex] ? selectEl.options[selectEl.selectedIndex].text : '';
 		if (displayTitle && displayTitle.innerText !== nextDisplayTitle) displayTitle.innerText = nextDisplayTitle;
@@ -23035,7 +23191,12 @@ P
 	
 		try {
             const cachedCategoryData = (window.psnStoreRenderCache && window.psnStoreRenderCache[cat]) || (window.psnStoreCache && window.psnStoreCache[cat]);
-			currentData = Array.isArray(cachedCategoryData) ? cachedCategoryData : await loadStoreCategoryData(cat, 'high');
+            const nextCategoryData = Array.isArray(cachedCategoryData) ? cachedCategoryData : await loadStoreCategoryData(cat, 'high');
+            if (!browseRequestStillCurrent()) {
+                releaseOwnedBrowseFlags();
+                return false;
+            }
+			currentData = nextCategoryData;
 			if (ENABLE_LETTER_GRAY_OUT) window.__browseAlphabetAvailability = null;
 			if (ENABLE_REGION_GRAY_OUT) window.__browseRegionAvailability = null;
 			
@@ -23043,8 +23204,12 @@ P
 				activeLetter = "ALL";
 			}
 			
+            if (!browseRequestStillCurrent()) {
+                releaseOwnedBrowseFlags();
+                return false;
+            }
 			applyFilters();
-			if (hasRestoreScroll) {
+			if (hasRestoreScroll && browseRequestStillCurrent()) {
 				const sa = document.getElementById('scroll-area') || document.querySelector('.content');
 				if (sa) {
 					const oldBehavior = sa.style.scrollBehavior;
@@ -23053,12 +23218,18 @@ P
 					sa.style.scrollBehavior = oldBehavior;
 				}
 			}
+            return true;
 	
 		} catch (err) {
-            window.__browseSkipMotionCaptureOnce = false;
-            window.__browseReuseLoadedCoversOnNextFilter = false;
-			grid.innerHTML = `<div class="loader" style="color: red;">Failed to load data.</div>`;
+            if (!browseRequestStillCurrent()) {
+                releaseOwnedBrowseFlags();
+                return false;
+            }
+            releaseOwnedBrowseFlags();
+            const browseVisibleNow = typeof isPsnDomSectionVisible === 'function' ? isPsnDomSectionVisible('view-browse') : true;
+            if (browseVisibleNow) grid.innerHTML = `<div class="loader" style="color: red;">Failed to load data.</div>`;
 			console.error(err);
+            return false;
 		}
     }
 
@@ -23504,6 +23675,34 @@ P
 	window.__contentDownloadCountRefreshAfterPending = window.__contentDownloadCountRefreshAfterPending instanceof Map ? window.__contentDownloadCountRefreshAfterPending : new Map();
 	window.__contentDownloadCountRequestTimer = window.__contentDownloadCountRequestTimer || null;
 
+	window.__contentDownloadCountElementsByKey = window.__contentDownloadCountElementsByKey instanceof Map ? window.__contentDownloadCountElementsByKey : new Map();
+	function registerContentDownloadCountElement(element, key) {
+		if (!element || !key) return;
+		const previousKey = element.dataset.downloadCountRegistryKey || '';
+		if (previousKey && previousKey !== key) {
+			const previousSet = window.__contentDownloadCountElementsByKey.get(previousKey);
+			if (previousSet) {
+				previousSet.delete(element);
+				if (!previousSet.size) window.__contentDownloadCountElementsByKey.delete(previousKey);
+			}
+		}
+		let set = window.__contentDownloadCountElementsByKey.get(key);
+		if (!set) window.__contentDownloadCountElementsByKey.set(key, (set = new Set()));
+		set.add(element);
+		if (element.dataset.downloadCountRegistryKey !== key) element.dataset.downloadCountRegistryKey = key;
+	}
+	window.hasRegisteredContentDownloadCountKey = function(key) {
+		const set = window.__contentDownloadCountElementsByKey.get(String(key || ''));
+		if (!set || !set.size) return false;
+		let found = false;
+		for (const element of Array.from(set)) {
+			if (!element || !element.isConnected) set.delete(element);
+			else found = true;
+		}
+		if (!set.size) window.__contentDownloadCountElementsByKey.delete(String(key || ''));
+		return found;
+	};
+
 	window.requestContentDownloadCounts = function(rawKeys = [], options = {}) {
 		if (!(typeof socketChat !== 'undefined' && socketChat && socketChat.connected)) return false;
 		const force = options.force === true;
@@ -23544,7 +23743,7 @@ P
 		};
 		const timeout = setTimeout(() => {
 			release();
-			if (typeof window.applyContentDownloadCountsToCards === 'function') window.applyContentDownloadCountsToCards(document);
+			if (typeof window.applyContentDownloadCountsToCards === 'function') window.applyContentDownloadCountsToCards(document, { keys });
 		}, 10000);
 
 		socketChat.emit('request_content_download_counts', { keys }, payload => {
@@ -23588,7 +23787,26 @@ P
 			: null;
 		const animate = options.animate === true;
 		const missingKeys = [];
-		root.querySelectorAll('.content-download-card-count').forEach(element => {
+		let elements = null;
+
+		/* CONTENT COUNT REGISTRY: realtime updates touch only pills registered for changed keys.
+		   Full DOM scans remain only for first-time/root hydration. */
+		if (root === document && onlyKeys && window.__contentDownloadCountElementsByKey.size) {
+			const targeted = [];
+			for (const key of onlyKeys) {
+				const set = window.__contentDownloadCountElementsByKey.get(key);
+				if (!set) continue;
+				for (const element of Array.from(set)) {
+					if (!element || !element.isConnected) set.delete(element);
+					else targeted.push(element);
+				}
+				if (!set.size) window.__contentDownloadCountElementsByKey.delete(key);
+			}
+			elements = targeted;
+		}
+		if (!elements) elements = Array.from(root.querySelectorAll('.content-download-card-count'));
+
+		for (const element of elements) {
 			const key = window.getContentDownloadCountKey(
 				element.dataset.downloadCategory,
 				element.dataset.downloadTitleId,
@@ -23597,15 +23815,16 @@ P
 			);
 			if (!key) {
 				element.hidden = true;
-				return;
+				continue;
 			}
-			if (onlyKeys && !onlyKeys.has(key)) return;
+			registerContentDownloadCountElement(element, key);
+			if (onlyKeys && !onlyKeys.has(key)) continue;
 
 			const hasCount = Object.prototype.hasOwnProperty.call(window.contentDownloadCounts || {}, key);
 			if (!hasCount) {
 				element.hidden = true;
 				if (!window.__contentDownloadCountPendingKeys.has(key) && !window.__contentDownloadCountQueuedKeys.has(key)) missingKeys.push(key);
-				return;
+				continue;
 			}
 
 			const count = Math.max(0, Number(window.contentDownloadCounts[key]) || 0);
@@ -23624,7 +23843,7 @@ P
 			if (animate && hadInitialized && previousValue !== nextValue && typeof window.animateCountPillFeedback === 'function') {
 				window.animateCountPillFeedback(element);
 			}
-		});
+		}
 		if (missingKeys.length) window.scheduleContentDownloadCountRequest(missingKeys);
 	};
 
@@ -23660,7 +23879,7 @@ P
 		try { localStorage.removeItem(CONTENT_DOWNLOAD_COUNTS_CACHE_KEY); } catch (err) {}
 		if (changedKeys.length === 0) return false;
 		const requestedKeys = Array.isArray(options.onlyKeys) ? options.onlyKeys.filter(key => changedKeys.includes(key)) : changedKeys;
-		window.applyContentDownloadCountsToCards(document, { keys: partial ? requestedKeys : null, animate: options.animate === true });
+		window.applyContentDownloadCountsToCards(document, { keys: requestedKeys, animate: options.animate === true });
 		return true;
 	};
 
@@ -31656,7 +31875,7 @@ P
 
 	function adminSchedulePanelRender(forceFull = false) {
 		if (typeof scheduleViewOpenWork === 'function') {
-			scheduleViewOpenWork('view-admin', () => { if (typeof renderAdminPanel === 'function') renderAdminPanel({ forceFull }); });
+			scheduleViewOpenWork('view-admin', () => { if (typeof renderAdminPanel === 'function') renderAdminPanel({ forceFull }); }, 0, 'admin-render');
 			return;
 		}
 		if (document.getElementById('view-admin')?.style.display === 'block' && typeof renderAdminPanel === 'function') renderAdminPanel({ forceFull });
@@ -32462,7 +32681,7 @@ P
 		adminCloseBroadcastPopovers();
 		adminUpdateBroadcastPreview();
 		if (typeof playUiSuccess === 'function') playUiSuccess();
-		setTimeout(renderAdminPanel, 250);
+		setTimeout(() => { if (document.getElementById('view-admin')?.style.display === 'block') adminSchedulePanelRender(); }, 250);
 	};
 
 	window.adminForceReloadAll = function() {
@@ -32500,7 +32719,7 @@ P
 				}
 				if (typeof playUiSuccess === 'function') playUiSuccess();
 				adminAddLog('clear_chat', `Cleared global chat history${response && response.backedUpCount !== undefined ? ` (${response.backedUpCount} messages backed up)` : ''}`);
-				setTimeout(renderAdminPanel, 500);
+				setTimeout(() => { if (document.getElementById('view-admin')?.style.display === 'block') adminSchedulePanelRender(); }, 500);
 			});
 		} else {
 			if (typeof playUiError === 'function') playUiError();
@@ -35688,34 +35907,48 @@ P
 	window.getPsnNavigationEpoch = () => psnNavigationEpoch;
 	window.isPsnNavigationEpochCurrent = epoch => Number(epoch) === psnNavigationEpoch;
 
-	function cancelScheduledViewOpenWork(viewId) {
-		const handle = viewOpenWorkHandles.get(viewId);
-		if (!handle) return;
-		if (handle.raf) cancelAnimationFrame(handle.raf);
-		if (handle.timer) clearTimeout(handle.timer);
-		viewOpenWorkHandles.delete(viewId);
+	/* VIEW WORK CHANNELS: one view can own independent jobs (entry, admin render, etc.)
+	   without those jobs cancelling each other. Leaving the view still cancels every channel. */
+	function getViewOpenWorkKey(viewId, channel = 'main') {
+		return `${viewId}::${String(channel || 'main')}`;
 	}
 
-	function cancelStaleViewOpenWork(targetViewId) {
-		for (const viewId of Array.from(viewOpenWorkHandles.keys())) {
-			if (viewId !== targetViewId) cancelScheduledViewOpenWork(viewId);
+	function cancelScheduledViewOpenWork(viewId, channel = null) {
+		for (const [workKey, handle] of Array.from(viewOpenWorkHandles.entries())) {
+			if (!handle || handle.viewId !== viewId) continue;
+			if (channel !== null && handle.channel !== String(channel || 'main')) continue;
+			if (handle.raf) cancelAnimationFrame(handle.raf);
+			if (handle.timer) clearTimeout(handle.timer);
+			viewOpenWorkHandles.delete(workKey);
 		}
 	}
 
-	function scheduleViewOpenWork(viewId, work, delay = 0) {
+	function cancelStaleViewOpenWork(targetViewId) {
+		for (const [workKey, handle] of Array.from(viewOpenWorkHandles.entries())) {
+			if (handle && handle.viewId !== targetViewId) {
+				if (handle.raf) cancelAnimationFrame(handle.raf);
+				if (handle.timer) clearTimeout(handle.timer);
+				viewOpenWorkHandles.delete(workKey);
+			}
+		}
+	}
+
+	function scheduleViewOpenWork(viewId, work, delay = 0, channel = 'main') {
 		if (typeof work !== 'function') return 0;
-		cancelScheduledViewOpenWork(viewId);
-		const token = (viewOpenWorkTokens.get(viewId) || 0) + 1;
+		const normalizedChannel = String(channel || 'main');
+		const workKey = getViewOpenWorkKey(viewId, normalizedChannel);
+		cancelScheduledViewOpenWork(viewId, normalizedChannel);
+		const token = (viewOpenWorkTokens.get(workKey) || 0) + 1;
 		const navigationEpoch = psnNavigationEpoch;
-		viewOpenWorkTokens.set(viewId, token);
-		const handle = { raf: 0, timer: 0 };
-		viewOpenWorkHandles.set(viewId, handle);
+		viewOpenWorkTokens.set(workKey, token);
+		const handle = { raf: 0, timer: 0, viewId, channel: normalizedChannel };
+		viewOpenWorkHandles.set(workKey, handle);
 		handle.raf = requestAnimationFrame(() => {
 			handle.raf = 0;
 			handle.timer = setTimeout(() => {
 				handle.timer = 0;
-				if (viewOpenWorkHandles.get(viewId) === handle) viewOpenWorkHandles.delete(viewId);
-				if (viewOpenWorkTokens.get(viewId) !== token) return;
+				if (viewOpenWorkHandles.get(workKey) === handle) viewOpenWorkHandles.delete(workKey);
+				if (viewOpenWorkTokens.get(workKey) !== token) return;
 				if (navigationEpoch !== psnNavigationEpoch) return;
 				if (!isPsnDomSectionVisible(viewId)) return;
 				work();
@@ -35725,13 +35958,13 @@ P
 	}
 	window.scheduleViewOpenWork = scheduleViewOpenWork;
 
-	function runViewOpenWork(viewId, work, immediate = false) {
+	function runViewOpenWork(viewId, work, immediate = false, channel = 'main') {
 		if (typeof work !== 'function') return 0;
 		if (immediate || window.isRestoringHistory) {
 			work();
 			return 0;
 		}
-		return scheduleViewOpenWork(viewId, work);
+		return scheduleViewOpenWork(viewId, work, 0, channel);
 	}
 	window.runViewOpenWork = runViewOpenWork;
 
@@ -36342,8 +36575,13 @@ P
 				const isFriendsActive = PSN_STATIC_NAV_DOM.navFriends?.classList.contains('active');
 				if (typeof showSocialSection === 'function') showSocialSection(isFriendsActive ? 'friends' : 'chat');
 	
+				const chatOpenEpoch = typeof window.getPsnNavigationEpoch === 'function' ? window.getPsnNavigationEpoch() : null;
 				setTimeout(() => {
+					if (chatOpenEpoch !== null && typeof window.isPsnNavigationEpochCurrent === 'function' && !window.isPsnNavigationEpochCurrent(chatOpenEpoch)) return;
+					if (!isPsnDomSectionVisible('view-chat') || PSN_STATIC_NAV_DOM.subviewChat?.style.display === 'none') return;
 					const doChatScroll = () => {
+						if (chatOpenEpoch !== null && typeof window.isPsnNavigationEpochCurrent === 'function' && !window.isPsnNavigationEpochCurrent(chatOpenEpoch)) return;
+						if (!isPsnDomSectionVisible('view-chat') || PSN_STATIC_NAV_DOM.subviewChat?.style.display === 'none') return;
 						if (typeof scrollChatToUnreadOrBottom === 'function') scrollChatToUnreadOrBottom({ restoreSmooth: true, setupDivider: true });
 					};
 					if (window.__chatLazyRenderPromise && typeof window.__chatLazyRenderPromise.then === 'function') window.__chatLazyRenderPromise.then(doChatScroll);
@@ -38591,6 +38829,7 @@ P
 		window.applyCollectionToolbarFilterChange('wishlist');
 	}
 	
+	let onlineScrollResetToken = 0;
 	window.showOnlineSection = function(section, force = false, noScrollToTop = false) {
 		const targetNavItem = section === 'featured' ? PSN_STATIC_NAV_DOM.navOnlineFeatured : PSN_STATIC_NAV_DOM.navOnlineRevived;
 	
@@ -38624,12 +38863,17 @@ P
 			navRev?.classList.add('active');
 		}
 
+		const onlineScrollToken = ++onlineScrollResetToken;
 		if (!noScrollToTop) {
             const _saOnline = PSN_STATIC_NAV_DOM.scrollArea;
             if (_saOnline && _saOnline.scrollTop !== 0) {
                 _saOnline.style.scrollBehavior = 'auto';
                 _saOnline.scrollTop = 0;
-                setTimeout(() => { if (_saOnline.isConnected) _saOnline.style.scrollBehavior = 'smooth'; }, 50);
+                setTimeout(() => {
+                    if (onlineScrollToken !== onlineScrollResetToken) return;
+                    if (!isPsnDomSectionVisible('view-online') || !targetView || targetView.style.display === 'none') return;
+                    if (_saOnline.isConnected) _saOnline.style.scrollBehavior = 'smooth';
+                }, 50);
             }
         }
 
@@ -39432,8 +39676,13 @@ P
 		window.prefetchRevivedServersTSV().catch(() => {});
 	}, 0);
 
+	let revivedRenderToken = 0;
 	window.loadRevivedServersFromTSV = async function () {
 		if (window.isRevivedLoaded) return;
+		const renderToken = ++revivedRenderToken;
+		const revivedStillVisible = () => renderToken === revivedRenderToken
+			&& isPsnDomSectionVisible('view-online')
+			&& (PSN_STATIC_NAV_DOM.onlineRevived?.style.display === 'block' || PSN_STATIC_NAV_DOM.onlineRevived?.style.display === 'flex');
 	
 		const container = document.getElementById('dynamic-servers-container');
 		if (!container) return;
@@ -39468,6 +39717,7 @@ P
 	
 		try {
 			const text = await window.prefetchRevivedServersTSV();
+			if (!revivedStillVisible()) return;
 			const lines = text.split('\n');
 			container.innerHTML = '';
 	
@@ -39482,6 +39732,7 @@ P
 			};
 	
 			for (const [index, line] of lines.entries()) {
+				if (!revivedStillVisible()) return;
 				if (index === 0 || line.trim().length < 5) continue;
 	
 				const parts = line.split('\t');
@@ -39568,7 +39819,7 @@ P
 					</div>
 				</div>`);
 	
-				renderPromises.push(renderServerGamesCards(gridId, ids));
+				renderPromises.push(renderServerGamesCards(gridId, ids, false, { isCurrent: revivedStillVisible }));
 			}
 			if (revivedServerTitleEl) revivedServerTitleEl.textContent = revivedServerCount === 1 ? 'Revived Server' : 'Revived Servers';
 			if (revivedServerCountEl) revivedServerCountEl.textContent = `(${window.formatUiCount ? window.formatUiCount(revivedServerCount, 'item', 'items') : `${revivedServerCount} ${revivedServerCount === 1 ? 'item' : 'items'}`})`;
@@ -39576,9 +39827,11 @@ P
 			if (typeof window.setSidebarCountPill === 'function') window.setSidebarCountPill('revived', revivedServerCount);
 	
 			await Promise.all(renderPromises);
+			if (!revivedStillVisible()) return;
 	
 			window.isRevivedLoaded = true;
 		} catch (error) {
+			if (!revivedStillVisible()) return;
 			if (revivedServerTitleEl) revivedServerTitleEl.textContent = 'Revived Servers';
 			if (revivedServerCountEl) revivedServerCountEl.textContent = '(0 items)';
 			window.revivedServersTotalCount = 0;
@@ -39630,6 +39883,8 @@ P
 		isSilent = isSilent || !!window.isRestoringHistory;
 		const container = document.getElementById(containerId);
 		if (!container) return;
+		const isCurrentRender = options && typeof options.isCurrent === 'function' ? options.isCurrent : null;
+		if (isCurrentRender && !isCurrentRender()) return;
 	
 		const animClass = "no-anim";
 		let processedItems = [];
@@ -39787,6 +40042,7 @@ P
 			</div>`;
 		});
 	
+		if (isCurrentRender && !isCurrentRender()) return;
 		const replacingRevivedSkeletons = !!container.querySelector('.skeleton-card');
 		container.innerHTML = html;
 	
@@ -39794,10 +40050,12 @@ P
 			setupRevealAnimations(containerId, { immediate: replacingRevivedSkeletons });
 		}
 	
+		if (isCurrentRender && !isCurrentRender()) return;
 		processedItems
 			.filter(item => item.needsNameLookup)
 			.forEach(async (item) => {
 				const fetchedName = await getGameName(item.id);
+				if (isCurrentRender && !isCurrentRender()) return;
 	
 				if (!fetchedName || fetchedName === item.id) return;
 	
@@ -40727,6 +40985,7 @@ P
 	});
 
 	function applyPs3DisconnectedUi(favDot, globalIcon, btnConnect, btnShutdown) {
+		if (typeof window.invalidatePS3LibraryRefresh === 'function') window.invalidatePS3LibraryRefresh();
 		if (favDot && favDot.style.display !== 'none') favDot.style.display = 'none';
 		if (globalIcon) {
 			if (globalIcon.dataset.ps3StatusColor !== '#ff4444') { globalIcon.dataset.ps3StatusColor = '#ff4444'; globalIcon.style.color = '#ff4444'; }
@@ -41657,8 +41916,18 @@ P
 	}
 	window.renderPS3LibraryOfflineState = renderPS3LibraryOfflineState;
 
+	let ps3LibraryRefreshToken = 0;
+	window.invalidatePS3LibraryRefresh = function() { ps3LibraryRefreshToken++; };
+
 	async function refreshPS3Library() {
+		const refreshToken = ++ps3LibraryRefreshToken;
 		const ip = document.getElementById('ps3-ip').value;
+		const refreshUser = String(localStorage.getItem('psn_username') || '');
+		const refreshStillCurrent = () => refreshToken === ps3LibraryRefreshToken
+			&& String(document.getElementById('ps3-ip')?.value || '') === String(ip || '')
+			&& String(localStorage.getItem('psn_username') || '') === refreshUser;
+		const libraryGamesVisibleNow = () => document.getElementById('view-library')?.style.display === 'block'
+			&& ['block','flex'].includes(document.getElementById('subview-games')?.style.display || '');
 		const status = document.getElementById('library-status');
 		const grid = document.getElementById('ps3-local-grid');
 		const globalIcon = document.getElementById('global-status-icon');
@@ -41689,8 +41958,9 @@ P
 		}
 	
 		if (typeof window.ensureMutableProfileSectionReady === 'function' && !(await window.ensureMutableProfileSectionReady('library', 'library-refresh'))) return;
+		if (!refreshStillCurrent()) return;
 
-		if (subviewGames) subviewGames.classList.remove('my-games-offline');
+		if (subviewGames && libraryGamesVisibleNow()) subviewGames.classList.remove('my-games-offline');
 		const hasRenderedLocalCards = !!(grid && grid.querySelector('.game-card'));
 		const hadCachedLocalGames = typeof lastScannedGames !== 'undefined' && lastScannedGames.length > 0;
 		if (hadCachedLocalGames) {
@@ -41729,6 +41999,7 @@ P
 		try {
 			const response = await fetch(`http://${ip}/index.ps3`, { cache: 'no-store' });
 			const rawHtml = await response.text();
+			if (!refreshStillCurrent() || (typeof _lastConnectionState !== 'undefined' && _lastConnectionState !== true)) return;
 			const parser = new DOMParser();
 			const doc = parser.parseFromString(rawHtml, 'text/html');
 			const gameContainers = Array.from(doc.querySelectorAll('.gc'));
@@ -41771,48 +42042,43 @@ P
 				if (shouldRepaintLocalLibrary) markProfileListChanged('library');
 			}
 	
-			const hasRenderedLibraryCards = !!grid.querySelector('.game-card');
-			if (shouldRepaintLocalLibrary && hasRenderedLibraryCards) {
-				await animateLibraryRefreshMotion(lastScannedGames);
-			} else if (shouldRepaintLocalLibrary || !hasRenderedLibraryCards) {
-				renderLocalLibrary(lastScannedGames, false, true);
-			} else if (typeof updateConsoleLibraryStatusUI === 'function') {
-				updateConsoleLibraryStatusUI(lastScannedGames);
+			if (!refreshStillCurrent()) return;
+			let shouldCommitLibraryDom = libraryGamesVisibleNow();
+			if (shouldCommitLibraryDom) {
+				const hasRenderedLibraryCards = !!grid.querySelector('.game-card');
+				if (shouldRepaintLocalLibrary && hasRenderedLibraryCards) {
+					await animateLibraryRefreshMotion(lastScannedGames);
+					if (!refreshStillCurrent()) return;
+					shouldCommitLibraryDom = libraryGamesVisibleNow();
+				} else if (shouldRepaintLocalLibrary || !hasRenderedLibraryCards) {
+					renderLocalLibrary(lastScannedGames, false, true);
+				} else if (typeof updateConsoleLibraryStatusUI === 'function') {
+					updateConsoleLibraryStatusUI(lastScannedGames);
+				}
 			}
 
-			
 			if (typeof window.broadcastProfileUpdate === 'function') {
 				setTimeout(() => window.broadcastProfileUpdate(), 900);
 			}
 	
 			ps3LibraryLastRefreshAt = Date.now();
-			if (actions) actions.style.display = 'flex';
-			if (typeof updateFpsCounterStatus === 'function') updateFpsCounterStatus();
-			if (status) { status.innerText = `(${window.formatUiCount ? window.formatUiCount(discoveredGames.length, 'item', 'items') : `${discoveredGames.length} ${discoveredGames.length === 1 ? 'item' : 'items'}`})`; status.style.color = "var(--ps-blue)"; }
-			
-			if (globalIcon) {
-				globalIcon.style.color = "#4caf50";
-				globalIcon.className = "fas fa-circle status-dot-base status-dot-connected";
-			}
-			
-			if (searchBar && canToggleSearch) {
-				searchBar.style.display = 'flex';
-			}
-
-			if (!ps3LibraryScanInProgress && typeof revealMyGamesAfterPendingScan === 'function') {
-				revealMyGamesAfterPendingScan();
+			if (shouldCommitLibraryDom) {
+				if (actions) actions.style.display = 'flex';
+				if (typeof updateFpsCounterStatus === 'function') updateFpsCounterStatus();
+				if (status) { status.innerText = `(${window.formatUiCount ? window.formatUiCount(discoveredGames.length, 'item', 'items') : `${discoveredGames.length} ${discoveredGames.length === 1 ? 'item' : 'items'}`})`; status.style.color = "var(--ps-blue)"; }
+				if (searchBar && canToggleSearch) searchBar.style.display = 'flex';
+				if (!ps3LibraryScanInProgress && typeof revealMyGamesAfterPendingScan === 'function') revealMyGamesAfterPendingScan();
 			}
 	
 		} catch (err) {
+			if (!refreshStillCurrent()) return;
 			console.error("Connection Error:", err);
 	
-			if (status) { status.innerText = "(Failed to sync)"; status.style.color = "#ff4444"; }
+			if (libraryGamesVisibleNow() && status) { status.innerText = "(Failed to sync)"; status.style.color = "#ff4444"; }
 			
-			if (searchBar && canToggleSearch) {
-				searchBar.style.display = 'none';
-			}
+			if (libraryGamesVisibleNow() && searchBar && canToggleSearch) searchBar.style.display = 'none';
 			
-			if (!lastScannedGames || lastScannedGames.length === 0) {
+			if (libraryGamesVisibleNow() && (!lastScannedGames || lastScannedGames.length === 0)) {
 				grid.innerHTML = `
 				<div class="psn-page-empty-state" style="grid-column: 1/-1; text-align: center; color: #888; padding: 100px 50px; background: rgba(0,0,0,0.2); border-radius: 12px; border: 1px dashed rgba(255,255,255,0.05); margin-top: 10px;">
 					<i class="fas fa-unlink" style="font-size: 50px; margin-bottom: 20px; opacity: 0.2;"></i>
@@ -46979,6 +47245,7 @@ function formatLibraryLastPlayedBadge(game = {}) {
 	};
 
 let pendingLibrarySubviewSwitch = null;
+let libraryScrollResetToken = 0;
 window.showLibrarySection = function(type, noScrollToTop = false, isSilent = false, _skipSubviewExit = false) {
 	if (type !== 'monitor' && typeof hideConsoleSensitiveValues === 'function') hideConsoleSensitiveValues();
 	const libraryRoot = PSN_STATIC_NAV_DOM.libraryView;
@@ -47208,12 +47475,15 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 	if (window.isRestoringHistory || isSilent) runLibraryContentWork();
 	else runViewOpenWork('view-library', runLibraryContentWork);
 
+	const libraryScrollToken = ++libraryScrollResetToken;
 	const shouldSkipLibraryScrollReset = !!noScrollToTop || !!window.isRestoringHistory || !!window.__preserveLibraryScrollOnce;
 	if (!shouldSkipLibraryScrollReset) {
 		const scrollArea = PSN_STATIC_NAV_DOM.scrollArea;
 
 		if (scrollArea && scrollArea.scrollTop !== 0) {
 			const scrollLibraryToTop = () => {
+				if (libraryScrollToken !== libraryScrollResetToken) return;
+				if (!libraryRoot || libraryRoot.style.display === 'none' || !nextView || nextView.style.display === 'none') return;
 				if (!scrollArea.isConnected) return;
 				if (scrollArea.style.scrollBehavior !== 'auto') scrollArea.style.scrollBehavior = 'auto';
 				if (scrollArea.scrollTop !== 0) scrollArea.scrollTop = 0;
@@ -47225,6 +47495,8 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 			setTimeout(scrollLibraryToTop, 250);
 
 			setTimeout(() => {
+				if (libraryScrollToken !== libraryScrollResetToken) return;
+				if (!libraryRoot || libraryRoot.style.display === 'none' || !nextView || nextView.style.display === 'none') return;
 				if (scrollArea.isConnected && scrollArea.style.scrollBehavior !== 'smooth') scrollArea.style.scrollBehavior = 'smooth';
 			}, 300);
 		}
@@ -47572,6 +47844,8 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 	let fileManagerLastReadAt = 0;
 	let fileManagerLastReadPath = '';
 	let fileManagerLastReadIp = '';
+	let fileManagerRequestToken = 0;
+	let fileManagerFetchController = null;
 	
 	function refreshFiles() {
 		if (typeof playUiClick === 'function') playUiClick();
@@ -47618,7 +47892,14 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 	}
 	
 	async function explorePath(path) {
+		const requestToken = ++fileManagerRequestToken;
+		if (fileManagerFetchController) { try { fileManagerFetchController.abort(); } catch (e) {} }
+		fileManagerFetchController = null;
 		const ip = document.getElementById('ps3-ip').value;
+		const requestStillCurrent = () => requestToken === fileManagerRequestToken
+			&& String(document.getElementById('ps3-ip')?.value || '') === String(ip || '')
+			&& isPsnDomSectionVisible('view-library')
+			&& (PSN_STATIC_NAV_DOM.libraryFiles?.style.display === 'block' || PSN_STATIC_NAV_DOM.libraryFiles?.style.display === 'flex');
 		const status = document.getElementById('files-status');
 		const listContainer = document.getElementById('file-browser-list');
 		const globalIcon = document.getElementById('global-status-icon');
@@ -47659,6 +47940,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 		if (status) { status.innerText = "(Reading files...)"; status.style.color = "orange"; }
 	
 		const controller = new AbortController();
+		fileManagerFetchController = controller;
 		const timeoutId = setTimeout(() => controller.abort(), 5000);
 	
 		try {
@@ -47666,6 +47948,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 			clearTimeout(timeoutId);
 			if (!response.ok) throw new Error(`HTTP ${response.status}`);
 			const html = await response.text();
+			if (!requestStillCurrent()) return;
 			currentPath = path;
 			fileManagerLastReadAt = Date.now();
 			fileManagerLastReadPath = path;
@@ -47683,7 +47966,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 			}, '');
 			if (pathContainer.innerHTML !== breadcrumbHtml) pathContainer.innerHTML = breadcrumbHtml;
 	
-			listContainer.innerHTML = "";
+			const listFragment = document.createDocumentFragment();
 			if (status) { status.innerText = `(${path})`; status.style.color = "var(--ps-blue)"; }
 	
 			const allFileLinks = Array.from(doc.querySelectorAll('a.w'));
@@ -47707,7 +47990,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 				const row = document.createElement('div');
 				row.className = "file-row anim-reveal";
 				row.innerHTML = `<div class="file-name" style="cursor:pointer; display: flex; align-items: center; gap: 10px;" onclick="openFileManagerPath('${fullPath}')"><i class="fas fa-folder folder-type"></i> <span class="name-text" style="font-size: 13px;">${name}</span></div><div class="file-size" style="white-space: nowrap; font-size: 11px; color: #aaa;">${sizeText}</div><div class="col-actions" style="display: flex; gap: 5px; flex-wrap: nowrap; justify-content: flex-end;">${path !== '/' ? `<button class="btn-mini" onclick="event.stopPropagation(); startRename(this, '${fullPath}')"><i class="fas fa-edit" style="color:#000"></i></button><button class="btn-mini" onclick="event.stopPropagation(); deleteFile('${fullPath}')"><i class="fas fa-trash" style="color:#ff4444"></i></button>` : ''}</div>`;
-				listContainer.appendChild(row);
+				listFragment.appendChild(row);
 			});
 	
 			allFileLinks.forEach(link => {
@@ -47783,12 +48066,18 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 						<button class="btn-mini" onclick="event.stopPropagation(); startRename(this, '${fullPath}')"><i class="fas fa-edit" style="color:#000"></i></button>
 						<button class="btn-mini" onclick="event.stopPropagation(); deleteFile('${fullPath}')"><i class="fas fa-trash" style="color:#ff4444"></i></button>
 					</div>`;
-				listContainer.appendChild(row);
+				listFragment.appendChild(row);
 			});
+			if (!requestStillCurrent()) return;
+			listContainer.replaceChildren(listFragment);
 	
 		} catch (e) {
 			clearTimeout(timeoutId);
+			if (e && e.name === 'AbortError') return;
+			if (!requestStillCurrent()) return;
 			if (status) { status.innerText = `(Erro: Access Denied)`; status.style.color = "#ff4444"; }
+		} finally {
+			if (fileManagerFetchController === controller) fileManagerFetchController = null;
 		}
 	}
 	
@@ -60176,7 +60465,7 @@ function getVisibleChatStackEl(id) {
 			
 			if (typeof scheduleChatPersistentCacheWrite === 'function') scheduleChatPersistentCacheWrite(0);
 			if (typeof refreshChatNotificationDot === 'function') refreshChatNotificationDot();
-			if (isAdminPanelVisible && typeof renderAdminPanel === 'function') setTimeout(renderAdminPanel, 350);
+			if (isAdminPanelVisible && typeof renderAdminPanel === 'function') setTimeout(() => { if (document.getElementById('view-admin')?.style.display === 'block') adminSchedulePanelRender(); }, 350);
 		});
 	
 		socketChat.on('message_seen', function(data) {
@@ -60927,18 +61216,10 @@ function getVisibleChatStackEl(id) {
 			if (!changedKeys.length) return;
 
 			const cachedKeys = window.contentDownloadCounts || Object.create(null);
-			const renderedKeys = new Set();
-			document.querySelectorAll('.content-download-card-count').forEach(element => {
-				const key = window.getContentDownloadCountKey(
-					element.dataset.downloadCategory,
-					element.dataset.downloadTitleId,
-					element.dataset.downloadContentId,
-					element.dataset.downloadName
-				);
-				if (key) renderedKeys.add(key);
-			});
-
-			const relevantKeys = changedKeys.filter(key => Object.prototype.hasOwnProperty.call(cachedKeys, key) || renderedKeys.has(key));
+			const relevantKeys = changedKeys.filter(key =>
+				Object.prototype.hasOwnProperty.call(cachedKeys, key) ||
+				(typeof window.hasRegisteredContentDownloadCountKey === 'function' && window.hasRegisteredContentDownloadCountKey(key))
+			);
 			if (relevantKeys.length) window.requestContentDownloadCounts(relevantKeys, { force: true, animate: true });
 		});
 
@@ -60955,7 +61236,7 @@ function getVisibleChatStackEl(id) {
 				window.setContentDownloadCounts(data.contentDownloadCounts);
 			}
 			if (trendingVisualChanged && typeof renderCachedTrendingIfVisible === 'function') {
-				renderCachedTrendingIfVisible();
+				renderCachedTrendingIfVisible({ realtime:true });
 				if (!isTrendingViewVisible() && typeof scheduleTrendingPrewarm === 'function') scheduleTrendingPrewarm();
 			}
 			if (trendingVisualChanged && window.__trendingUnavailable && typeof isTrendingViewVisible === 'function' && isTrendingViewVisible()) {
