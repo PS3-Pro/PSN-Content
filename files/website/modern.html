@@ -154,6 +154,7 @@ button:disabled, [disabled], [aria-disabled="true"], .chat-delete-action-disable
    but do not blur the entire subtree; visible cards still run adminCardBoot with their own blur. */
 @keyframes admin-view-enter{0%{opacity:0;transform:scale(.99);}100%{opacity:1;transform:scale(1);}}
 @keyframes explore-view-enter{0%{opacity: 0; transform: translateY(15px) scale(0.99); filter: blur(4px);}100%{opacity: 1; transform: translateY(0) scale(1); filter: none;}}
+@keyframes psn-heavy-view-enter{0%{opacity:0;transform:scale(.99);filter:blur(4px);}100%{opacity:1;transform:scale(1);filter:none;}}
 @keyframes guideRevealPop{from{opacity: 0; transform: scale(.9) translateY(20px);}to{opacity: 1; transform: scale(1) translateY(0);}}
 @keyframes wishUnheartPulse{0%{transform: translate(.5px,.5px) scale(1.15) rotate(0deg); opacity: 1; filter: drop-shadow(0 0 0 rgba(255,68,68,0));}18%{transform: translate(.5px,.5px) scale(1.34) rotate(-8deg); filter: drop-shadow(0 0 8px rgba(255,68,68,.8));}38%{transform: translate(.5px,.5px) scale(1.18) rotate(8deg);}62%{transform: translate(.5px,.5px) scale(.92) rotate(-4deg); filter: drop-shadow(0 0 12px rgba(255,68,68,.9));}82%{transform: translate(.5px,.5px) scale(1.08) rotate(0deg); opacity: .85;}100%{transform: translate(.5px,.5px) scale(1); opacity: .75; filter: drop-shadow(0 0 0 rgba(255,68,68,0));}}
 @keyframes categoryRemoveItem{0%{opacity: 1; transform: scale(1); filter: brightness(1);}24%{opacity: 1; transform: scale(1.09); filter: brightness(1.18);}46%{opacity: .88; transform: scale(.90); filter: brightness(1.05) grayscale(.12);}72%{opacity: .38; transform: scale(.70); filter: brightness(.92) grayscale(.55) blur(2px);}100%{opacity: 0; transform: scale(.54); filter: brightness(.82) grayscale(1) blur(6px);}}
@@ -2752,6 +2753,8 @@ body.chat-selection-mode .chat-message-actions .chat-delete-action:not(.chat-del
 .anim-up { transform-origin: top center; animation: view-enter 0.4s cubic-bezier(0.2,0.8,0.2,1) forwards !important; }
 #view-admin.anim-up { animation: admin-view-enter 0.4s cubic-bezier(0.2,0.8,0.2,1) forwards !important; }
 #view-explore.anim-up { animation: explore-view-enter 0.4s cubic-bezier(0.2,0.8,0.2,1) forwards !important; }
+#view-trending.anim-up, #view-wishlist.anim-up { animation: psn-heavy-view-enter .4s cubic-bezier(.2,.8,.2,1) forwards !important; }
+#view-admin.anim-up, #view-explore.anim-up, #view-trending.anim-up, #view-wishlist.anim-up { will-change:transform,opacity,filter; backface-visibility:hidden; }
 
 /* ========================================================================== SIDEBAR SLIDER (GLOBAL VERTICAL SLIDE) ========================================================================== */
 .sidebar-menu li.active { border-left: 3px solid var(--text-main); border-left-color: transparent !important; background: transparent !important; color: var(--text-main) !important; }
@@ -10765,6 +10768,20 @@ P
     if (!window.wishlist) window.wishlist = [];
     if (!window.downloadHistory) window.downloadHistory = [];
     if (!window.favoritesLibrary) window.favoritesLibrary = [];
+
+    /* LIBRARY FAST-PATH REVISIONS: My Games/Favorites can skip filtering, metadata lookup and
+       sorting when neither the source data nor its filter dependencies changed. Bump only on
+       real data mutations; normal tab switches therefore stay O(1) before the cached reveal. */
+    window.__libraryDataRevision = Number(window.__libraryDataRevision || 0);
+    window.__favoritesDataRevision = Number(window.__favoritesDataRevision || 0);
+    window.__psnStoreCacheRevision = Number(window.__psnStoreCacheRevision || 0);
+    window.bumpLibraryCollectionRevision = function(scope = 'all') {
+        if (scope === 'library' || scope === 'all') window.__libraryDataRevision++;
+        if (scope === 'favorites' || scope === 'all') window.__favoritesDataRevision++;
+    };
+    window.bumpPsnStoreCacheRevision = function() {
+        window.__psnStoreCacheRevision++;
+    };
     
     function getAllUsers() {
         const users = localStorage.getItem(GLOBAL_USERS_KEY);
@@ -11258,6 +11275,7 @@ P
 		if (section === 'favorites') {
 			const raw = parsePersistentLocalJson(`${username}_ps3_library_favs`, []);
 			window.favoritesLibrary = Array.isArray(raw) ? raw : [];
+			if (typeof window.bumpLibraryCollectionRevision === 'function') window.bumpLibraryCollectionRevision('favorites');
 			return;
 		}
 		if (section === 'library') {
@@ -11265,6 +11283,7 @@ P
 			const list = Array.isArray(raw) ? raw : [];
 			if (typeof lastScannedGames !== 'undefined') lastScannedGames = list;
 			window.lastScannedGames = list;
+			if (typeof window.bumpLibraryCollectionRevision === 'function') window.bumpLibraryCollectionRevision('library');
 			return;
 		}
 		if (section === 'friends') {
@@ -13068,9 +13087,11 @@ P
                 window.downloadHistory = JSON.parse(loadState(COOKIE_NAME_HISTORY) || "[]");
                 normalizeAndStoreDownloadHistory(activeUser, window.downloadHistory, { markChanged: true, broadcast: true });
                 window.favoritesLibrary = JSON.parse(loadState(STORAGE_KEY_FAVS) || "[]");
+                if (typeof window.bumpLibraryCollectionRevision === 'function') window.bumpLibraryCollectionRevision('favorites');
 				window.friendsList = JSON.parse(loadState(STORAGE_KEY_FRIENDS) || "[]");
                 lastScannedGames = mergeLibraryLastPlayedLists(JSON.parse(loadState('psn_local_library') || "[]"), []);
                 window.lastScannedGames = lastScannedGames;
+                if (typeof window.bumpLibraryCollectionRevision === 'function') window.bumpLibraryCollectionRevision('library');
             }
 
             if (typeof writeCategoryDotPending === 'function') {
@@ -14310,6 +14331,7 @@ P
 	function syncRecentlyVisitedLayout() {
 		syncRecentlyVisitedPlaceholders();
 		syncRecentlyVisitedDiscoverCards();
+		window.__recentlyVisitedLayoutDirty = false;
 	}
 
 
@@ -14538,7 +14560,7 @@ P
 			if (window.__recentlyVisitedResizeFrame) return;
 			window.__recentlyVisitedResizeFrame = requestAnimationFrame(() => {
 				window.__recentlyVisitedResizeFrame = 0;
-				if (!recentlyVisitedExploreView || recentlyVisitedExploreView.style.display === 'none') return;
+				if (!recentlyVisitedExploreView || recentlyVisitedExploreView.style.display === 'none') { window.__recentlyVisitedLayoutDirty = true; return; }
 				syncRecentlyVisitedLayout();
 			});
 		}, { passive: true });
@@ -15340,6 +15362,7 @@ P
 		if (window.__exploreBootRevealActive && !options.allowDuringBoot) return;
 
 		const seamlessBootReveal = !!options.allowDuringBoot && !!exploreView.querySelector('.horizontal-scroll.explore-login-skeleton-mode');
+		const preArmedReturnReveal = options.preArmed === true;
 		if (typeof refreshExploreVirtualCarouselsNow === 'function') refreshExploreVirtualCarouselsNow(true);
 		if (!seamlessBootReveal) hideExploreBootSkeletons(exploreView);
 
@@ -15361,7 +15384,9 @@ P
 				return;
 			}
 			revealContainers.push(container);
-			Array.from(container.querySelectorAll('.game-card')).forEach(card => resetExploreRevealCard(card, true));
+			if (!preArmedReturnReveal) {
+				Array.from(container.querySelectorAll('.game-card')).forEach(card => resetExploreRevealCard(card, true));
+			}
 		});
 		if (!revealContainers.length) {
 			if (seamlessBootReveal) hideExploreBootSkeletons(exploreView);
@@ -18805,11 +18830,47 @@ P
 				fetchLatestForExplore('avatars', 'latest-avatars-grid', options),
 				fetchLatestForExplore('demos', 'latest-demos-grid', options)
 			]);
+			window.__explorePopulateReady = true;
 		} finally {
 			window.__explorePopulateAnimateCards = previousExplorePopulateAnimate;
 		}
     }
 	
+	let trendingPrewarmHandle = 0;
+	let trendingCoverIndexWarmPromise = null;
+	function warmTrendingCoverIndexes() {
+		if (trendingCoverIndexWarmPromise || typeof loadBackgroundIndexes !== 'function') return trendingCoverIndexWarmPromise;
+		trendingCoverIndexWarmPromise = Promise.resolve(loadBackgroundIndexes('high')).catch(e => {
+			console.warn('[System] Cover indexes unavailable for Trending.', e);
+			trendingCoverIndexWarmPromise = null;
+		});
+		return trendingCoverIndexWarmPromise;
+	}
+
+	function cancelTrendingPrewarm() {
+		if (!trendingPrewarmHandle) return;
+		if (typeof cancelIdleCallback === 'function') cancelIdleCallback(trendingPrewarmHandle);
+		else clearTimeout(trendingPrewarmHandle);
+		trendingPrewarmHandle = 0;
+	}
+
+	function scheduleTrendingPrewarm() {
+		cancelTrendingPrewarm();
+		if (!window.__pendingTrendingData || isTrendingViewVisible()) return;
+		const signature = window.__trendingRealtimeSignature;
+		const run = () => {
+			trendingPrewarmHandle = 0;
+			if (isTrendingViewVisible() || signature !== window.__trendingRealtimeSignature || !window.__pendingTrendingData) return;
+			if (typeof renderTrendingCarousel === 'function') {
+				renderTrendingCarousel('trending-dl-grid', window.__pendingTrendingData.topDownloads, 'fas fa-download', { prewarm:true });
+				renderTrendingCarousel('trending-wish-grid', window.__pendingTrendingData.topWishlist, 'fas fa-heart', { prewarm:true });
+			}
+		};
+		if (typeof requestIdleCallback === 'function') trendingPrewarmHandle = requestIdleCallback(run, { timeout: 1200 });
+		else trendingPrewarmHandle = setTimeout(run, 260);
+	}
+	window.scheduleTrendingPrewarm = scheduleTrendingPrewarm;
+
 	function isTrendingViewVisible() {
 		const view = document.getElementById('view-trending');
 		return !!(view && view.style.display === 'block');
@@ -18885,14 +18946,13 @@ P
 		}
 	};
 
-	window.renderTrendingCarousel = async function(containerId, topList, iconClass) {
+	window.renderTrendingCarousel = async function(containerId, topList, iconClass, options = {}) {
 		const container = document.getElementById(containerId);
 		if (!container) return;
 
-		// Trending renders immediately from the persistent shared cover cache while indexes warm in parallel.
-		if (typeof loadBackgroundIndexes === 'function') {
-			loadBackgroundIndexes('high').catch(e => console.warn('[System] Cover indexes unavailable for Trending.', e));
-		}
+		// One shared index warmup is enough for both carousels; hidden prewarm skips it entirely.
+		const prewarmOnly = options && options.prewarm === true;
+		if (!prewarmOnly) warmTrendingCoverIndexes();
 	
 		const skeletonHTML = getCardSkeletonHTML(5);
 	
@@ -18900,7 +18960,8 @@ P
 		const cacheKey = JSON.stringify(topList);
 		
 		if (window.trendingCache[containerId] === cacheKey && container.querySelector('.game-card')) {
-			if (typeof window.updateCountAwareSectionTitle === 'function') window.updateCountAwareSectionTitle(containerId, container.querySelectorAll('.game-card').length);
+			const cachedTotal = Math.max(0, Number(container.dataset.countAwareTotal) || 0);
+			if (typeof window.updateCountAwareSectionTitle === 'function') window.updateCountAwareSectionTitle(containerId, cachedTotal);
 			return;
 		}
 		window.trendingCache[containerId] = cacheKey;
@@ -19000,7 +19061,7 @@ P
 								${fireIcon} #${displayRank + 1}
 							</div>
 	
-							<img src="${imgUrl}" class="game-img" decoding="async" data-cover-key="${coverKeyAttr}" data-cover-category="${gameCategory}" data-name="${(gameData.cleanName || gameData.title).replace(/"/g, '&quot;')}" data-console="${gameData.cTag}" data-github-cover="${String(githubCoverUrl || '').replace(/"/g, '&quot;')}" data-title-id="${gameData.id || gameData.titleId || ''}" data-content-id="${gameData.contentId || ''}" data-region="${gameData.region || ''}" onload="markCoverLoaded(this)" onerror="handleCoverError(this, '${gameCategory}')">
+							<img src="${imgUrl}" class="game-img" loading="lazy" decoding="async" data-cover-key="${coverKeyAttr}" data-cover-category="${gameCategory}" data-name="${(gameData.cleanName || gameData.title).replace(/"/g, '&quot;')}" data-console="${gameData.cTag}" data-github-cover="${String(githubCoverUrl || '').replace(/"/g, '&quot;')}" data-title-id="${gameData.id || gameData.titleId || ''}" data-content-id="${gameData.contentId || ''}" data-region="${gameData.region || ''}" onload="markCoverLoaded(this)" onerror="handleCoverError(this, '${gameCategory}')">
 						</div>
 						<div class="game-info" style="padding: 10px; min-height: 0;">
 							<div style="display: flex; flex-direction: column; justify-content: space-between; height: 100%;">
@@ -19035,7 +19096,10 @@ P
 		} else {
 			const replacingTrendingSkeletons = !!container.querySelector('.skeleton-card, .pulse-skeleton');
 			container.innerHTML = html;
-			if (typeof setupRevealAnimations === 'function') setupRevealAnimations(containerId, { immediate: replacingTrendingSkeletons });
+			container.dataset.trendingPrewarmed = prewarmOnly ? '1' : '0';
+			/* Only the first strip can be visible. Measuring all 30 horizontal cards for reveal
+			   made Trending entry cost grow with history for no visual benefit. */
+			if (!prewarmOnly && typeof setupRevealAnimations === 'function') setupRevealAnimations(containerId, { immediate: replacingTrendingSkeletons, selector: ':scope > .game-card:nth-child(-n+8)' });
 		}
 	};
     
@@ -22920,6 +22984,7 @@ P
 			const data = await buildStoreCategoryData(cat, texts, priority, paths);
 			psnStoreRenderCache[cat] = data;
 			window.psnStoreCache[cat] = data;
+			if (typeof window.bumpPsnStoreCacheRevision === 'function') window.bumpPsnStoreCacheRevision();
 			if (typeof window.invalidatePsnStoreLookup === 'function') window.invalidatePsnStoreLookup();
 			return data;
 		})().finally(() => {
@@ -31308,10 +31373,14 @@ P
 			adminResetPanelScrolls();
 			if (typeof adminResetBroadcastDraftState === 'function') adminResetBroadcastDraftState();
 		};
-		/* ADMIN EXIT PERF: cleanup is invisible after leaving Admin, so keep it off the
-		   destination view's first paint/entry animation whenever the browser supports idle work. */
-		if (typeof requestIdleCallback === 'function') adminExitCleanupIdle = requestIdleCallback(run, { timeout: 700 });
-		else adminExitCleanupTimer = setTimeout(run, 120);
+		/* ADMIN EXIT PERF v50: do not let requestIdleCallback fire inside the destination
+		   view's 400ms entrance. Arm cleanup only after that animation has settled. */
+		adminExitCleanupTimer = setTimeout(() => {
+			adminExitCleanupTimer = 0;
+			if (document.getElementById('view-admin')?.style.display === 'block') return;
+			if (typeof requestIdleCallback === 'function') adminExitCleanupIdle = requestIdleCallback(run, { timeout: 500 });
+			else adminExitCleanupTimer = setTimeout(run, 40);
+		}, 430);
 	}
 	window.adminScheduleExitCleanup = adminScheduleExitCleanup;
 
@@ -31374,11 +31443,14 @@ P
 
 
 	let adminEntryHydrationToken = 0;
+	let adminEntryHydrationIdle = 0;
 	const adminEntryHydrationTimers = new Set();
 	function adminCancelEntryHydration() {
 		adminEntryHydrationToken++;
 		for (const timer of adminEntryHydrationTimers) clearTimeout(timer);
 		adminEntryHydrationTimers.clear();
+		if (adminEntryHydrationIdle && typeof cancelIdleCallback === 'function') cancelIdleCallback(adminEntryHydrationIdle);
+		adminEntryHydrationIdle = 0;
 	}
 	window.adminCancelEntryHydration = adminCancelEntryHydration;
 
@@ -31397,14 +31469,23 @@ P
 			adminEntryHydrationTimers.add(timer);
 		};
 
-		/* ADMIN ENTRY PERF: the transition gets the main thread first. Refresh/network work
-		   is intentionally staggered just after it finishes instead of landing in one burst. */
-		later(0, () => { if (typeof adminRefreshHealth === 'function') adminRefreshHealth(false, false); });
-		later(35, () => { if (typeof socketChat !== 'undefined' && socketChat && socketChat.connected) socketChat.emit('admin_request_moderation_log'); });
-		later(70, () => { if (typeof window.adminRequestChatControlsState === 'function') window.adminRequestChatControlsState(); });
-		later(105, () => { if (typeof window.adminRequestReports === 'function') window.adminRequestReports(true); });
-		later(140, () => { if (typeof window.adminRequestUsersList === 'function') window.adminRequestUsersList(true, true); });
-		later(180, () => { if (window.__adminDeferredFullRender && typeof adminSchedulePanelRender === 'function') adminSchedulePanelRender(true); });
+		/* ADMIN ENTRY PERF v50: the 400ms transition owns the main thread. The first complete
+		   dashboard render is idle-scheduled after animationend, then network refreshes are
+		   staggered so cached DOM is never rebuilt in the same burst as incoming responses. */
+		const renderCachedDashboard = () => {
+			adminEntryHydrationIdle = 0;
+			if (stillCurrent() && typeof adminSchedulePanelRender === 'function') adminSchedulePanelRender(true);
+		};
+		later(55, () => {
+			if (!stillCurrent()) return;
+			if (typeof requestIdleCallback === 'function') adminEntryHydrationIdle = requestIdleCallback(renderCachedDashboard, { timeout: 180 });
+			else renderCachedDashboard();
+		});
+		later(140, () => { if (typeof adminRefreshHealth === 'function') adminRefreshHealth(false, false); });
+		later(195, () => { if (typeof socketChat !== 'undefined' && socketChat && socketChat.connected) socketChat.emit('admin_request_moderation_log'); });
+		later(250, () => { if (typeof window.adminRequestChatControlsState === 'function') window.adminRequestChatControlsState(); });
+		later(315, () => { if (typeof window.adminRequestReports === 'function') window.adminRequestReports(true); });
+		later(380, () => { if (typeof window.adminRequestUsersList === 'function') window.adminRequestUsersList(true, true); });
 	}
 	window.adminScheduleEntryHydration = adminScheduleEntryHydration;
 
@@ -35607,7 +35688,7 @@ P
 		}
 	}
 
-	function scheduleViewOpenWork(viewId, work) {
+	function scheduleViewOpenWork(viewId, work, delay = 0) {
 		if (typeof work !== 'function') return 0;
 		cancelScheduledViewOpenWork(viewId);
 		const token = (viewOpenWorkTokens.get(viewId) || 0) + 1;
@@ -35624,7 +35705,7 @@ P
 				if (navigationEpoch !== psnNavigationEpoch) return;
 				if (!isPsnDomSectionVisible(viewId)) return;
 				work();
-			}, 0);
+			}, Math.max(0, Number(delay) || 0));
 		});
 		return token;
 	}
@@ -35653,6 +35734,26 @@ P
 		});
 	}
 	window.restartEntryAnimationWithoutReflow = restartEntryAnimationWithoutReflow;
+
+	/* REVEAL PRE-ARM: cached cards must be hidden BEFORE their view becomes visible.
+	   This preserves the original reveal without the one-frame "cards -> disappear -> reveal" flash. */
+	function preArmCachedCardReveal(container, selector, animClass = 'anim-reveal') {
+		if (!container || !container.querySelectorAll) return false;
+		const targets = container.querySelectorAll(selector);
+		if (!targets.length) return false;
+		let armed = false;
+		for (let i = 0; i < targets.length; i++) {
+			const el = targets[i];
+			if (!el || el.classList.contains('skeleton-card')) continue;
+			el.classList.remove(animClass, 'no-anim');
+			el.style.animation = 'none';
+			el.style.opacity = '0';
+			el.style.transform = '';
+			el.style.setProperty('--tile-idx', Math.min(i, 12));
+			armed = true;
+		}
+		return armed;
+	}
 
 
 	window.switchView = function(viewId, forceReset = false, preventAutoLoad = false, onShown = null, _skipExit = false) {
@@ -35869,6 +35970,49 @@ P
 			prepareChatOpenRenderBeforePaint('switch-view-open-chat');
 		}
 
+		let preArmedWishlistReveal = false;
+		let preArmedTrendingDlReveal = false;
+		let preArmedTrendingWishReveal = false;
+		let preArmedExploreReveal = false;
+		if (!window.isRestoringHistory && viewId === 'view-wishlist') {
+			const wishlistGrid = document.getElementById('wishlist-grid');
+			const currentWishlistSignature = typeof window.getWishlistEntrySignature === 'function' ? window.getWishlistEntrySignature() : '';
+			const hasPendingWishlistReveal = !!(window.__categoryPendingRevealKeys && Array.isArray(window.__categoryPendingRevealKeys.wishlist) && window.__categoryPendingRevealKeys.wishlist.length);
+			if (!hasPendingWishlistReveal && wishlistGrid && currentWishlistSignature && wishlistGrid.__wishlistEntrySignature === currentWishlistSignature) {
+				preArmedWishlistReveal = preArmCachedCardReveal(wishlistGrid, ':scope > .game-card:nth-child(-n+18)');
+			}
+		}
+		if (!window.isRestoringHistory && viewId === 'view-trending' && window.__pendingTrendingData) {
+			const dlGrid = document.getElementById('trending-dl-grid');
+			const wishGrid = document.getElementById('trending-wish-grid');
+			const dlKey = JSON.stringify(window.__pendingTrendingData.topDownloads || []);
+			const wishKey = JSON.stringify(window.__pendingTrendingData.topWishlist || []);
+			const canReuseDl = !!(dlGrid && window.trendingCache && window.trendingCache['trending-dl-grid'] === dlKey && dlGrid.querySelector(':scope > .game-card'));
+			const canReuseWish = !!(wishGrid && window.trendingCache && window.trendingCache['trending-wish-grid'] === wishKey && wishGrid.querySelector(':scope > .game-card'));
+			if (canReuseDl) preArmedTrendingDlReveal = preArmCachedCardReveal(dlGrid, ':scope > .game-card:nth-child(-n+8)');
+			if (canReuseWish) preArmedTrendingWishReveal = preArmCachedCardReveal(wishGrid, ':scope > .game-card:nth-child(-n+8)');
+		}
+		/* EXPLORE RETURN REVEAL: cache/fast-resume must keep the same visual entry behavior.
+		   Pre-arm while hidden so returning from any tab never shows static cards for one frame. */
+		if (!window.isRestoringHistory && viewId === 'view-explore' && !window.__exploreBootRevealActive && typeof resetExploreRevealCard === 'function') {
+			const exploreView = document.getElementById('view-explore');
+			if (exploreView) {
+				const exploreContainers = exploreView.querySelectorAll('.horizontal-scroll');
+				for (let i = 0; i < exploreContainers.length; i++) {
+					const container = exploreContainers[i];
+					const cards = container.querySelectorAll('.game-card');
+					if (!cards.length) continue;
+					for (let j = 0; j < cards.length; j++) {
+						const card = cards[j];
+						resetExploreRevealCard(card, true);
+						card.style.animation = 'none';
+						card.style.opacity = '0';
+					}
+					preArmedExploreReveal = true;
+				}
+			}
+		}
+
 		if (target) {
 			if (viewId === 'view-rewards') target.classList.add('rewards-reveal-prep');
 			if (viewId === 'view-browse' && typeof window.syncBrowseSurpriseButtonState === 'function') {
@@ -35890,6 +36034,16 @@ P
                 if (typeof syncRevealVisibilityClass === 'function') syncRevealVisibilityClass(target, '.admin-card', 'admin-entry-visible', 24);
 			}
 			restartEntryAnimationWithoutReflow(target);
+
+			/* Start cached-card reveal in the same opening task. Because cards were pre-armed while
+			   hidden, there is no visible frame where old cards can flash before the reveal. */
+			if (preArmedWishlistReveal && typeof setupRevealAnimations === 'function') {
+				setupRevealAnimations('wishlist-grid', { selector: ':scope > .game-card:nth-child(-n+18)', immediate: true });
+			}
+			if (typeof setupRevealAnimations === 'function') {
+				if (preArmedTrendingDlReveal) setupRevealAnimations('trending-dl-grid', { selector: ':scope > .game-card:nth-child(-n+8)', immediate: true });
+				if (preArmedTrendingWishReveal) setupRevealAnimations('trending-wish-grid', { selector: ':scope > .game-card:nth-child(-n+8)', immediate: true });
+			}
 			
 			if (!window.isRestoringHistory) {
 				let carousels;
@@ -35901,11 +36055,15 @@ P
 				}
 				carousels.forEach(c => {
 					if (viewId === 'view-explore' && c.dataset && c.dataset.exploreVirtual === '1' && typeof smoothResetExploreVirtualCarouselToStart === 'function') {
-						smoothResetExploreVirtualCarouselToStart(c);
+						const virtualStart = parseInt(c.dataset.exploreVirtualStart || '0', 10) || 0;
+						if ((c.scrollLeft || 0) > 1 || virtualStart > 0) smoothResetExploreVirtualCarouselToStart(c);
 					} else if (c.scrollLeft !== 0) {
 						c.scrollLeft = 0;
 					}
 				});
+			}
+			if (preArmedExploreReveal && typeof replayExploreCardsReveal === 'function') {
+				replayExploreCardsReveal({ preArmed: true });
 			}
 		}
 	
@@ -35936,7 +36094,7 @@ P
 	
 		if (typeof window.ensureProfileSectionHydrated === 'function') {
 			if (viewId === 'view-downloads') window.ensureProfileSectionHydrated('downloads', { reason:'open-downloads' });
-			else if (viewId === 'view-wishlist') window.ensureProfileSectionHydrated('wishlist', { reason:'open-wishlist' });
+			else if (viewId === 'view-wishlist') { /* hydrated with the Wishlist render work below (single-flight scheduler) */ }
 			else if (viewId === 'view-trophies') window.ensureProfileSectionHydrated('trophies', { reason:'open-trophies' });
 			else if (viewId === 'view-library') {
 				window.ensureProfileSectionHydrated('library', { reason:'open-library' });
@@ -35946,17 +36104,18 @@ P
 		}
 
 		if (viewId === 'view-trending') {
+			cancelTrendingPrewarm();
 			document.getElementById('nav-trending')?.classList.add('active');
-			runViewOpenWork('view-trending', () => {
+			/* TRENDING ENTRY PERF: cached/prewarmed cards are already in the hidden DOM. If this is
+			   the first visit, keep the existing skeleton visible while the 400ms view entrance runs. */
+			scheduleViewOpenWork('view-trending', () => {
 				if (typeof renderCachedTrendingIfVisible === 'function') renderCachedTrendingIfVisible();
-				['trending-dl-grid', 'trending-wish-grid'].forEach(id => {
+				for (const id of ['trending-dl-grid', 'trending-wish-grid']) {
 					const container = document.getElementById(id);
-					if (!container) return;
+					if (!container) continue;
 					if (typeof setupSkeletonAnimations === 'function') setupSkeletonAnimations(id);
-					container.querySelectorAll('.game-card').forEach(card => resetRevealTargetToStatic(card, 'anim-reveal'));
-					if (typeof setupRevealAnimations === 'function') setupRevealAnimations(id);
-				});
-			});
+				}
+			}, 360);
 		}
 
 		if (viewId === 'view-library' && typeof window.refreshVisibleFavoriteCardsFromProfileSync === 'function') {
@@ -36021,8 +36180,9 @@ P
 			}
 			
 			if (viewId === 'view-wishlist') {
+				let capturedWishlistPending = [];
 				if (typeof window.captureCategoryPendingReveal === 'function') {
-					window.captureCategoryPendingReveal('wishlist');
+					capturedWishlistPending = window.captureCategoryPendingReveal('wishlist') || [];
 				}
 				
 				if (!window.isRestoringHistory && !movingWithinBrowseContext) {
@@ -36032,7 +36192,15 @@ P
 				}
 				if (typeof updateWishlistUI === 'function') {
 					if (window.isRestoringHistory) updateWishlistUI();
-					else scheduleViewOpenWork('view-wishlist', () => updateWishlistUI());
+					else {
+						const wishlistGrid = document.getElementById('wishlist-grid');
+						const hasReusableWishlistDom = !!(wishlistGrid && Number(wishlistGrid.dataset.progressiveGridRendered || 0) > 0 && wishlistGrid.querySelector(':scope > .game-card'));
+						const wishlistOpenDelay = hasReusableWishlistDom && capturedWishlistPending.length === 0 ? 360 : 0;
+						scheduleViewOpenWork('view-wishlist', () => {
+							updateWishlistUI();
+							if (typeof window.ensureProfileSectionHydrated === 'function') window.ensureProfileSectionHydrated('wishlist', { reason:'open-wishlist' });
+						}, wishlistOpenDelay);
+					}
 				}
 			}
 	
@@ -36073,24 +36241,25 @@ P
 			setPsnStyleIfChanged(searchBar, 'display', 'none');
 	
 			if (viewId === 'view-explore') {
-				runViewOpenWork('view-explore', () => {
-					if (typeof syncRecentlyVisitedLayout === 'function') syncRecentlyVisitedLayout();
-					if (typeof populateExploreTab === 'function') {
-						const exploreTarget = document.getElementById('view-explore');
-						const hasExploreCards = !!(exploreTarget && exploreTarget.querySelector('.horizontal-scroll .game-card'));
-						const exploreLoad = hasExploreCards
-							? Promise.resolve()
-							: (window.__exploreFastLoadPromise || populateExploreTab({ animateCards: true, reason: 'switch-fast' }));
-						if (!window.__exploreFastLoadPromise && exploreLoad && typeof exploreLoad.then === 'function') window.__exploreFastLoadPromise = exploreLoad;
-						if (exploreLoad && typeof exploreLoad.then === 'function') {
-							exploreLoad.then(() => {
+				const exploreTarget = document.getElementById('view-explore');
+				const hasExploreCards = window.__explorePopulateReady === true || !!(exploreTarget && exploreTarget.querySelector('.horizontal-scroll .game-card'));
+				if (hasExploreCards) window.__explorePopulateReady = true;
+				const exploreNeedsLayout = window.__recentlyVisitedLayoutDirty === true || !document.getElementById('recently-visited-grid')?.dataset.recentlyVisitedLayoutSignature;
+				if (!hasExploreCards || exploreNeedsLayout) {
+					scheduleViewOpenWork('view-explore', () => {
+						if (exploreNeedsLayout && typeof syncRecentlyVisitedLayout === 'function') syncRecentlyVisitedLayout();
+						if (!window.__explorePopulateReady && typeof populateExploreTab === 'function') {
+							const exploreLoad = window.__exploreFastLoadPromise || populateExploreTab({ animateCards: true, reason: 'switch-fast' });
+							if (!window.__exploreFastLoadPromise && exploreLoad && typeof exploreLoad.then === 'function') window.__exploreFastLoadPromise = exploreLoad;
+							if (exploreLoad && typeof exploreLoad.then === 'function') exploreLoad.then(() => {
 								const target = document.getElementById('view-explore');
 								if (target && target.style.display !== 'none' && typeof replayExploreCardsReveal === 'function') replayExploreCardsReveal({ allowDuringBoot: true });
 							}).catch(err => console.warn('Explore refresh failed:', err));
 						}
-					}
-				});
-				if (typeof updateBanner === 'function') { updateBanner(false); startAutoSlide(); }
+					}, hasExploreCards ? 360 : 0);
+				}
+				if (typeof window.resumeExploreHeroFast === 'function') window.resumeExploreHeroFast();
+				else if (typeof updateBanner === 'function') { updateBanner(false); startAutoSlide(); }
 			} 
 			else if (viewId === 'view-online') {
 				if (!preventAutoLoad && typeof showOnlineSection === 'function') runViewOpenWork('view-online', () => showOnlineSection('featured', true));
@@ -36800,6 +36969,18 @@ P
 		}
 	}
 	
+	window.resumeExploreHeroFast = function() {
+		const track = document.getElementById('carousel-track');
+		if (!track) return;
+		if (!heroGeometryCache || !track.style.transform) updateBanner(false);
+		else {
+			const slides = heroSlides.length ? heroSlides : Array.from(track.querySelectorAll('.hero-slide'));
+			if (!heroSlides.length) heroSlides = slides;
+			primeHeroImages(slides, currentIndex);
+		}
+		startAutoSlide();
+	};
+
 	function nextSlide(resetAutoTimer = true) {
 		if (isTransitioning) return;
 		isTransitioning = true;
@@ -36935,6 +37116,7 @@ P
 		window.__exploreWarmedBeforeLogin = false;
 		window.psnStorePrefetchReady = false;
 		window.psnStoreCache = {};
+		if (typeof window.bumpPsnStoreCacheRevision === 'function') window.bumpPsnStoreCacheRevision();
 		window.__wishlistCanonicalReady = false;
 		window.__wishlistCanonicalPromise = null;
 		window.__wishlistCanonicalRefreshScheduled = false;
@@ -37949,6 +38131,47 @@ P
 	};
 
 
+	function getWishlistSourceRevision() {
+		const key = typeof getProfileListTimestampStorageKey === 'function' ? getProfileListTimestampStorageKey('wishlist') : 'psn_wishlist_updated_at';
+		return String(loadState(key) || '0');
+	}
+
+	function getWishlistEntrySignature() {
+		const searchInput = document.getElementById('search-input');
+		const cat = document.getElementById('wish-cat-select');
+		const region = document.getElementById('wish-region-select');
+		const consoles = typeof getStoreFilterCheckedValues === 'function' ? getStoreFilterCheckedValues('#wish-console-filters input') : [];
+		return [
+			getWishlistSourceRevision(), Array.isArray(window.wishlist) ? window.wishlist.length : 0, window.__wishlistCanonicalReady === true ? 1 : 0,
+			String(searchInput?.value || '').trim().toLowerCase(), cat?.value || 'ALL', region?.value || 'ALL',
+			consoles.join(','), typeof activeWishLetter !== 'undefined' ? activeWishLetter : 'ALL', window.sortOrders?.wishlist || 'asc'
+		].join('~');
+	}
+	window.getWishlistEntrySignature = getWishlistEntrySignature;
+
+	function getNormalizedWishlistRenderItems() {
+		const list = Array.isArray(window.wishlist) ? window.wishlist : [];
+		const signature = `${getWishlistSourceRevision()}|${list.length}|${window.__wishlistCanonicalReady === true ? 1 : 0}`;
+		const cached = window.__wishlistNormalizedRenderCache;
+		if (cached && cached.signature === signature && cached.source === list && Array.isArray(cached.items)) return cached.items;
+		const items = list.map(item => {
+			const resolvedCategory = (typeof window.getWishlistItemCategoryKey === 'function') ? window.getWishlistItemCategoryKey(item) : (item.category || 'games');
+			const sourceDotKey = getWishlistDotKey(item);
+			const sourceIdentityKey = (typeof window.getWishlistIdentityKey === 'function')
+				? window.getWishlistIdentityKey(item, item.rawCategory || item.category || resolvedCategory)
+				: '';
+			const resolvedItem = (typeof window.getWishlistCanonicalStoreItem === 'function')
+				? window.getWishlistCanonicalStoreItem(item, resolvedCategory)
+				: Object.assign({}, item, { category: resolvedCategory });
+			return Object.assign({}, resolvedItem, {
+				__wishlistDotKey: sourceDotKey || getWishlistDotKey(resolvedItem),
+				__wishlistIdentityKey: sourceIdentityKey
+			});
+		});
+		window.__wishlistNormalizedRenderCache = { signature, source:list, items };
+		return items;
+	}
+
 	window.updateWishlistUI = async function(isSilent = false, progressiveMode = 'reset') {
 		if (typeof window.setSidebarCountPill === 'function') window.setSidebarCountPill('wishlist', Array.isArray(window.wishlist) ? window.wishlist.length : 0);
 		isSilent = isSilent || !!window.isRestoringHistory;
@@ -37963,14 +38186,24 @@ P
 		const activeUser = localStorage.getItem('psn_username');
 		
 		if (!grid) return;
-		const wishlistLiveSnapshot = (!appendProgressive && typeof window.captureLiveRenderNodes === 'function')
-			? window.captureLiveRenderNodes(grid, ':scope > .game-card[data-live-render-key]')
-			: null;
 		const wishlistViewIsActive = isPsnDomSectionVisible('view-wishlist');
 		if (!wishlistViewIsActive) {
 			if (typeof window.refreshWishlistSummaryUI === 'function') window.refreshWishlistSummaryUI();
 			return;
 		}
+
+		const hasPendingWishlistReveal = !!(window.__categoryPendingRevealKeys && Array.isArray(window.__categoryPendingRevealKeys.wishlist) && window.__categoryPendingRevealKeys.wishlist.length);
+		const wishlistEntrySignature = getWishlistEntrySignature();
+		const hasReusableWishlistDom = Number(grid.dataset.progressiveGridRendered || 0) > 0 && !!grid.querySelector(':scope > .game-card');
+		if (!appendProgressive && !hasPendingWishlistReveal && hasReusableWishlistDom && grid.__wishlistEntrySignature === wishlistEntrySignature) {
+			// Cached DOM was already revealed by switchView before this delayed refresh runs.
+			return;
+		}
+		grid.__wishlistEntrySignature = wishlistEntrySignature;
+
+		const wishlistLiveSnapshot = (!appendProgressive && typeof window.captureLiveRenderNodes === 'function')
+			? window.captureLiveRenderNodes(grid, ':scope > .game-card[data-live-render-key]')
+			: null;
 		if (isSilent && typeof window.captureGridCoverCache === 'function') window.captureGridCoverCache(grid);
 
 		if (window.wishlist.length > 0 && typeof window.scheduleWishlistCanonicalRefresh === 'function') {
@@ -38036,23 +38269,9 @@ P
 			}
 		}
 		
-		const activeConsolesNodes = document.querySelectorAll('#wish-console-filters input:checked');
-		const activeConsoles = Array.from(activeConsolesNodes).map(cb => cb.value);
+		const activeConsoles = typeof getStoreFilterCheckedValues === 'function' ? getStoreFilterCheckedValues('#wish-console-filters input') : [];
 	
-		const wishlistRenderItems = window.wishlist.map(item => {
-			const resolvedCategory = (typeof window.getWishlistItemCategoryKey === 'function') ? window.getWishlistItemCategoryKey(item) : (item.category || 'games');
-			const sourceDotKey = getWishlistDotKey(item);
-			const sourceIdentityKey = (typeof window.getWishlistIdentityKey === 'function')
-				? window.getWishlistIdentityKey(item, item.rawCategory || item.category || resolvedCategory)
-				: '';
-			const resolvedItem = (typeof window.getWishlistCanonicalStoreItem === 'function')
-				? window.getWishlistCanonicalStoreItem(item, resolvedCategory)
-				: Object.assign({}, item, { category: resolvedCategory });
-			return Object.assign({}, resolvedItem, {
-				__wishlistDotKey: sourceDotKey || getWishlistDotKey(resolvedItem),
-				__wishlistIdentityKey: sourceIdentityKey
-			});
-		});
+		const wishlistRenderItems = getNormalizedWishlistRenderItems();
 
 		let regionFilter = wishRegionSelect?.value || "ALL";
 		if (wishRegionSelect) {
@@ -39830,6 +40049,7 @@ P
 			window.wishlist = [];
 			window.downloadHistory = [];
 			window.favoritesLibrary = [];
+			if (typeof window.bumpLibraryCollectionRevision === 'function') window.bumpLibraryCollectionRevision('favorites');
 			window.userNotificationItems = [];
 			window.__userNotificationCacheLoaded = false;
 			window.__userNotificationCacheUser = '';
@@ -39902,7 +40122,8 @@ P
 			window.wishlist = [];
 			window.downloadHistory = [];
 			window.favoritesLibrary = [];
-			if (typeof lastScannedGames !== 'undefined') { lastScannedGames = []; window.lastScannedGames = lastScannedGames; }
+			if (typeof window.bumpLibraryCollectionRevision === 'function') window.bumpLibraryCollectionRevision('favorites');
+			if (typeof lastScannedGames !== 'undefined') { lastScannedGames = []; window.lastScannedGames = lastScannedGames; if (typeof window.bumpLibraryCollectionRevision === 'function') window.bumpLibraryCollectionRevision('library'); }
 			navHistory = null;
 	
 			if (typeof socketChat !== 'undefined' && socketChat) {
@@ -41518,6 +41739,7 @@ P
 	
 				lastScannedGames = mergedGames;
 				window.lastScannedGames = lastScannedGames;
+				if (typeof window.bumpLibraryCollectionRevision === 'function') window.bumpLibraryCollectionRevision('library');
 				if (typeof window.refreshStoreInstalledChecks === 'function') window.refreshStoreInstalledChecks();
 				shouldRepaintLocalLibrary = previousSignature !== getLocalLibraryDataSignature(lastScannedGames);
 				if (shouldRepaintLocalLibrary) markProfileListChanged('library');
@@ -42134,6 +42356,7 @@ function formatLibraryLastPlayedBadge(game = {}) {
 		if (!isFiltering && !appendProgressive) {
 			lastScannedGames = mergeLibraryLastPlayedLists(games || [], lastScannedGames || []);
 			window.lastScannedGames = lastScannedGames;
+			if (typeof window.bumpLibraryCollectionRevision === 'function') window.bumpLibraryCollectionRevision('library');
 			saveState('psn_local_library', JSON.stringify(lastScannedGames));
 		}
 		if (typeof updateConsoleLibraryStatusUI === 'function') updateConsoleLibraryStatusUI(lastScannedGames);
@@ -42395,6 +42618,7 @@ function formatLibraryLastPlayedBadge(game = {}) {
 		if (matchedAny) window.__libraryLastPlayedAppliedSignature = touchSignature;
 	
 		if (updated) {
+			if (typeof window.bumpLibraryCollectionRevision === 'function') window.bumpLibraryCollectionRevision('library');
 			saveState('psn_local_library', JSON.stringify(lastScannedGames));
 			markProfileListChanged('library');
 			
@@ -42418,6 +42642,85 @@ function formatLibraryLastPlayedBadge(game = {}) {
 	let activeFavoriteLibraryLetter = "ALL";
 	const LIBRARY_ALPHABET_FILTERS = ['ALL', '#', '0-9', 'A','B','C','D','E','F','G','H','I','J','K','L','M','N','O','P','Q','R','S','T','U','V','W','X','Y','Z'];
 
+	/* MY GAMES / FAVORITES FAST-PATH: cache only derived data. Source revisions above make
+	   invalidation explicit, so tab re-entry can skip N-item metadata/filter/sort work safely. */
+	const libraryCollectionFastCache = {
+		library: { inputSignature: '', filtered: null },
+		favorites: { inputSignature: '', filtered: null, activeSourceSignature: '', activeFavs: null }
+	};
+	const libraryAlphabetFastCache = {
+		library: { inputSignature: '', availability: null },
+		favorites: { inputSignature: '', availability: null }
+	};
+	let libraryFilterMetadataFastRevision = '';
+	let libraryFilterMetadataFastCache = new WeakMap();
+
+	function getStaticCheckedValues(inputs) {
+		const values = [];
+		for (const input of inputs || []) if (input && input.checked) values.push(input.value);
+		return values;
+	}
+
+	function getLibraryPlayTogetherFastSignature() {
+		const matchState = window.__collectionPlayTogetherMatchState;
+		return [
+			Number(window.__viewerPlayTogetherFetchedAt || 0),
+			window.__viewerPlayTogetherTitleIds instanceof Set ? window.__viewerPlayTogetherTitleIds.size : 0,
+			Number(matchState?.fetchedAt || 0),
+			matchState?.titleIds instanceof Set ? matchState.titleIds.size : 0
+		].join(':');
+	}
+
+	function getLibraryFilterFastSignature(scope = 'library') {
+		const isFavorites = scope === 'favorites';
+		const prefix = isFavorites ? 'fav' : 'library';
+		const consoles = getStaticCheckedValues(isFavorites ? PSN_STATIC_FAVORITE_CONSOLE_FILTERS : PSN_STATIC_LIBRARY_CONSOLE_FILTERS);
+		const term = String(PSN_STATIC_NAV_DOM.searchInput?.value || '').toLowerCase().trim();
+		const type = document.getElementById(`${prefix}-type-select`)?.value || 'ALL';
+		const region = document.getElementById(`${prefix}-region-select`)?.value || 'ALL';
+		const playTogether = document.getElementById(isFavorites ? 'fav-play-together-only-toggle' : 'library-play-together-only-toggle')?.checked === true;
+		const letter = isFavorites ? activeFavoriteLibraryLetter : activeLibraryLetter;
+		const sort = window.sortOrders?.[isFavorites ? 'fav' : 'library'] || 'asc';
+		return [
+			Number(window.__libraryDataRevision || 0),
+			Number(window.__favoritesDataRevision || 0),
+			Number(window.__psnStoreCacheRevision || 0),
+			term, consoles.join(','), type, region, playTogether ? 1 : 0, letter || 'ALL', sort,
+			getLibraryPlayTogetherFastSignature()
+		].join('|');
+	}
+
+	function getLibraryAlphabetFastSignature(scope = 'library') {
+		const isFavorites = scope === 'favorites';
+		const prefix = isFavorites ? 'fav' : 'library';
+		const consoles = getStaticCheckedValues(isFavorites ? PSN_STATIC_FAVORITE_CONSOLE_FILTERS : PSN_STATIC_LIBRARY_CONSOLE_FILTERS);
+		return [
+			Number(window.__libraryDataRevision || 0),
+			isFavorites ? Number(window.__favoritesDataRevision || 0) : 0,
+			Number(window.__psnStoreCacheRevision || 0),
+			consoles.join(','),
+			document.getElementById(`${prefix}-type-select`)?.value || 'ALL',
+			document.getElementById(`${prefix}-region-select`)?.value || 'ALL',
+			document.getElementById(isFavorites ? 'fav-play-together-only-toggle' : 'library-play-together-only-toggle')?.checked === true ? 1 : 0,
+			getLibraryPlayTogetherFastSignature()
+		].join('|');
+	}
+
+	function getCachedLibraryFilterMetadata(game = {}) {
+		const revision = `${Number(window.__libraryDataRevision || 0)}:${Number(window.__psnStoreCacheRevision || 0)}`;
+		if (revision !== libraryFilterMetadataFastRevision) {
+			libraryFilterMetadataFastRevision = revision;
+			libraryFilterMetadataFastCache = new WeakMap();
+		}
+		if (!game || typeof game !== 'object') return getLibraryFilterMetadata(game);
+		let meta = libraryFilterMetadataFastCache.get(game);
+		if (!meta) {
+			meta = getLibraryFilterMetadata(game);
+			libraryFilterMetadataFastCache.set(game, meta);
+		}
+		return meta;
+	}
+
 	function matchesLibraryAlphabetFilter(title, letter) {
 		if (!letter || letter === 'ALL') return true;
 		const firstChar = String(title || '').trim().charAt(0).toUpperCase();
@@ -42435,14 +42738,14 @@ function formatLibraryLastPlayedBadge(game = {}) {
 		}
 
 		const prefix = isFavorites ? 'fav' : 'library';
-		const activeConsoles = Array.from(document.querySelectorAll(`#${prefix}-console-filters input:checked`)).map(cb => cb.value);
+		const activeConsoles = getStaticCheckedValues(isFavorites ? PSN_STATIC_FAVORITE_CONSOLE_FILTERS : PSN_STATIC_LIBRARY_CONSOLE_FILTERS);
 		const typeFilter = document.getElementById(`${prefix}-type-select`)?.value || 'ALL';
 		const regionFilter = document.getElementById(`${prefix}-region-select`)?.value || 'ALL';
 		const playTogetherToggleId = isFavorites ? 'fav-play-together-only-toggle' : 'library-play-together-only-toggle';
 		const playTogetherMatchesOnly = document.getElementById(playTogetherToggleId)?.checked === true;
 
 		return source.filter(game => {
-			const meta = getLibraryFilterMetadata(game);
+			const meta = getCachedLibraryFilterMetadata(game);
 			if (!activeConsoles.includes(meta.console)) return false;
 			if (typeFilter !== 'ALL' && meta.category !== typeFilter) return false;
 			if (regionFilter !== 'ALL' && meta.region !== regionFilter) return false;
@@ -42459,6 +42762,10 @@ function formatLibraryLastPlayedBadge(game = {}) {
 		if (!container) return;
 
 		const availability = ENABLE_LETTER_GRAY_OUT && availableLetters instanceof Set ? availableLetters : null;
+		const availabilitySignature = availability ? LIBRARY_ALPHABET_FILTERS.filter(char => char === 'ALL' || availability.has(char)).join(',') : '*';
+		const renderSignature = `${activeLetter || 'ALL'}|${availabilitySignature}`;
+		if (container.dataset.libraryAlphabetRenderSignature === renderSignature && container.children.length) return;
+		container.dataset.libraryAlphabetRenderSignature = renderSignature;
 		container.innerHTML = LIBRARY_ALPHABET_FILTERS.map(char => {
 			const isCurrent = activeLetter === char;
 			const isUnavailable = char !== 'ALL' && !!availability && !availability.has(char);
@@ -42476,7 +42783,12 @@ function formatLibraryLastPlayedBadge(game = {}) {
 			renderLibraryAlphabetFilter('library-letter-filter', activeLibraryLetter, 'setLibraryLetterFilter');
 			return;
 		}
-		window.__libraryAlphabetAvailability = window.getPsnAlphabetAvailability(getLibraryAlphabetSource('library'), game => game.title);
+		const availabilitySignature = getLibraryAlphabetFastSignature('library');
+		if (libraryAlphabetFastCache.library.inputSignature !== availabilitySignature || !(libraryAlphabetFastCache.library.availability instanceof Set)) {
+			libraryAlphabetFastCache.library.inputSignature = availabilitySignature;
+			libraryAlphabetFastCache.library.availability = window.getPsnAlphabetAvailability(getLibraryAlphabetSource('library'), game => game.title);
+		}
+		window.__libraryAlphabetAvailability = libraryAlphabetFastCache.library.availability;
 		const term = document.getElementById('search-input')?.value.trim() || '';
 		if (!term && activeLibraryLetter !== 'ALL' && !window.__libraryAlphabetAvailability.has(activeLibraryLetter)) activeLibraryLetter = 'ALL';
 		renderLibraryAlphabetFilter('library-letter-filter', activeLibraryLetter, 'setLibraryLetterFilter', window.__libraryAlphabetAvailability);
@@ -42487,7 +42799,12 @@ function formatLibraryLastPlayedBadge(game = {}) {
 			renderLibraryAlphabetFilter('fav-letter-filter', activeFavoriteLibraryLetter, 'setFavoriteLibraryLetterFilter');
 			return;
 		}
-		window.__favoriteLibraryAlphabetAvailability = window.getPsnAlphabetAvailability(getLibraryAlphabetSource('favorites'), game => game.title);
+		const availabilitySignature = getLibraryAlphabetFastSignature('favorites');
+		if (libraryAlphabetFastCache.favorites.inputSignature !== availabilitySignature || !(libraryAlphabetFastCache.favorites.availability instanceof Set)) {
+			libraryAlphabetFastCache.favorites.inputSignature = availabilitySignature;
+			libraryAlphabetFastCache.favorites.availability = window.getPsnAlphabetAvailability(getLibraryAlphabetSource('favorites'), game => game.title);
+		}
+		window.__favoriteLibraryAlphabetAvailability = libraryAlphabetFastCache.favorites.availability;
 		const term = document.getElementById('search-input')?.value.trim() || '';
 		if (!term && activeFavoriteLibraryLetter !== 'ALL' && !window.__favoriteLibraryAlphabetAvailability.has(activeFavoriteLibraryLetter)) activeFavoriteLibraryLetter = 'ALL';
 		renderLibraryAlphabetFilter('fav-letter-filter', activeFavoriteLibraryLetter, 'setFavoriteLibraryLetterFilter', window.__favoriteLibraryAlphabetAvailability);
@@ -42571,26 +42888,27 @@ function formatLibraryLastPlayedBadge(game = {}) {
 			if (typeof window.syncAlphabeticalSortButtonState === 'function') window.syncAlphabeticalSortButtonState('library', 0);
 			return;
 		}
+
+		const grid = PSN_STATIC_NAV_DOM.localGrid;
+		const fastInputSignature = getLibraryFilterFastSignature('library');
+		const fastEntry = libraryCollectionFastCache.library;
+		if (grid && grid.children.length && fastEntry.inputSignature === fastInputSignature && Array.isArray(fastEntry.filtered)) {
+			const renderedCount = Number(grid.dataset.progressiveGridRendered || grid.querySelectorAll(':scope > .game-card').length);
+			if (fastEntry.filtered.length > renderedCount) {
+				setupProgressiveGridObserver('my-games', grid, renderedCount, fastEntry.filtered.length, () => renderLocalLibrary(fastEntry.filtered, true, true, 'append'));
+			}
+			return;
+		}
 	
 		const term = document.getElementById('search-input').value.toLowerCase().trim();
 		const termNormalized = term.replace(/[^a-z0-9]/g, '');
 	
-		const activeConsolesNodes = document.querySelectorAll('#library-console-filters input:checked');
-		const activeConsoles = Array.from(activeConsolesNodes).map(cb => cb.value);
+		const activeConsoles = getStaticCheckedValues(PSN_STATIC_LIBRARY_CONSOLE_FILTERS);
 		const typeFilter = document.getElementById('library-type-select')?.value || 'ALL';
 		const playTogetherMatchesOnly = document.getElementById('library-play-together-only-toggle')?.checked === true;
 		const libraryRegionSelect = document.getElementById('library-region-select');
 		let regionFilter = libraryRegionSelect?.value || 'ALL';
-		const libraryFilterMetaCache = new WeakMap();
-		const getFilterMeta = game => {
-			if (!game || typeof game !== 'object') return getLibraryFilterMetadata(game);
-			let meta = libraryFilterMetaCache.get(game);
-			if (!meta) {
-				meta = getLibraryFilterMetadata(game);
-				libraryFilterMetaCache.set(game, meta);
-			}
-			return meta;
-		};
+		const getFilterMeta = getCachedLibraryFilterMetadata;
 
 		if (libraryRegionSelect && ENABLE_REGION_GRAY_OUT) {
 			const libraryRegionItems = lastScannedGames.filter(game => {
@@ -42649,6 +42967,9 @@ function formatLibraryLastPlayedBadge(game = {}) {
 		if (window.sortOrders && window.sortOrders.library === 'desc') {
 			filtered.reverse();
 		}
+
+		fastEntry.inputSignature = getLibraryFilterFastSignature('library');
+		fastEntry.filtered = filtered;
 		
 		const status = document.getElementById('library-status');
 		if (status && lastScannedGames.length > 0) {
@@ -42697,6 +43018,7 @@ function formatLibraryLastPlayedBadge(game = {}) {
 			playUiRemove();
 			const removedFavoriteItem = favoritesLibrary[favIndex] || game;
 			favoritesLibrary.splice(favIndex, 1);
+			if (typeof window.bumpLibraryCollectionRevision === 'function') window.bumpLibraryCollectionRevision('favorites');
 			if (typeof window.emitFriendActivityContentAction === 'function') window.emitFriendActivityContentAction('favorite', favoriteActivityItem(removedFavoriteItem), 'remove');
 			if (typeof window.setSidebarCountPill === 'function') window.setSidebarCountPill('favorites', favoritesLibrary.length);
 			btn.style.pointerEvents = 'none';
@@ -42736,6 +43058,7 @@ function formatLibraryLastPlayedBadge(game = {}) {
 				itemToAdd.date = `${datePart} - ${timePart}`;
 			}
 			favoritesLibrary.push(itemToAdd);
+			if (typeof window.bumpLibraryCollectionRevision === 'function') window.bumpLibraryCollectionRevision('favorites');
 			if (typeof window.emitFriendActivityContentAction === 'function') window.emitFriendActivityContentAction('favorite', favoriteActivityItem(itemToAdd), 'add');
 			if (typeof window.setSidebarCountPill === 'function') window.setSidebarCountPill('favorites', favoritesLibrary.length);
 			if (card) card.classList.add('is-favorited');
@@ -42801,6 +43124,7 @@ function formatLibraryLastPlayedBadge(game = {}) {
 		
 		const removedFavoriteItem = favoritesLibrary[realIndex];
 		favoritesLibrary.splice(realIndex, 1);
+		if (typeof window.bumpLibraryCollectionRevision === 'function') window.bumpLibraryCollectionRevision('favorites');
 		if (removedFavoriteItem && typeof window.emitFriendActivityContentAction === 'function') {
 			const image = card.querySelector('.game-img');
 			window.emitFriendActivityContentAction('favorite', {
@@ -42921,9 +43245,34 @@ function formatLibraryLastPlayedBadge(game = {}) {
 	
 		if (offlineMsg) offlineMsg.style.display = 'none';
 		if (onlineContainer) onlineContainer.style.display = 'block';
-	
-		const favoriteLibraryPaths = new Set((favoritesLibrary || []).map(fav => normalizeLibraryGamePath(fav && fav.path)).filter(Boolean));
-		const activeFavs = (lastScannedGames || []).filter(installed => installed && favoriteLibraryPaths.has(normalizeLibraryGamePath(installed.path)));
+
+		const fastEntry = libraryCollectionFastCache.favorites;
+		const fastInputSignature = getLibraryFilterFastSignature('favorites');
+		const favoritesHasPendingReveal = !!(pendingFavoritesRevealKeys && pendingFavoritesRevealKeys.length);
+		if (!appendProgressive && !favoritesHasPendingReveal && grid.children.length && fastEntry.inputSignature === fastInputSignature && Array.isArray(fastEntry.filtered)) {
+			if (favToolbar && fastEntry.filtered.length) favToolbar.style.display = 'flex';
+			if (favLetterFilter && fastEntry.filtered.length) favLetterFilter.style.display = 'flex';
+			const renderedCount = Number(grid.dataset.progressiveGridRendered || grid.querySelectorAll(':scope > .game-card').length);
+			if (fastEntry.filtered.length > renderedCount) {
+				setupProgressiveGridObserver('favorites', grid, renderedCount, fastEntry.filtered.length, () => window.updateFavoritesLibraryUI(true, 'append'));
+			}
+			return;
+		}
+
+		const activeSourceSignature = `${Number(window.__libraryDataRevision || 0)}:${Number(window.__favoritesDataRevision || 0)}`;
+		let activeFavs;
+		if (fastEntry.activeSourceSignature === activeSourceSignature && Array.isArray(fastEntry.activeFavs)) {
+			activeFavs = fastEntry.activeFavs;
+		} else {
+			const favoriteLibraryPaths = new Set();
+			for (const fav of (favoritesLibrary || [])) {
+				const path = normalizeLibraryGamePath(fav && fav.path);
+				if (path) favoriteLibraryPaths.add(path);
+			}
+			activeFavs = (lastScannedGames || []).filter(installed => installed && favoriteLibraryPaths.has(normalizeLibraryGamePath(installed.path)));
+			fastEntry.activeSourceSignature = activeSourceSignature;
+			fastEntry.activeFavs = activeFavs;
+		}
 	
 		if (activeFavs.length === 0) {
 			if (typeof window.syncAlphabeticalSortButtonState === 'function') window.syncAlphabeticalSortButtonState('fav', 0);
@@ -42955,22 +43304,12 @@ function formatLibraryLastPlayedBadge(game = {}) {
 
 		const term = document.getElementById('search-input')?.value.toLowerCase().trim() || "";
 		const termNormalized = term.replace(/[^a-z0-9]/g, '');
-		const activeConsolesNodes = document.querySelectorAll('#fav-console-filters input:checked');
-		const activeConsoles = Array.from(activeConsolesNodes).map(cb => cb.value);
+		const activeConsoles = getStaticCheckedValues(PSN_STATIC_FAVORITE_CONSOLE_FILTERS);
 		const typeFilter = document.getElementById('fav-type-select')?.value || 'ALL';
 		const playTogetherMatchesOnly = document.getElementById('fav-play-together-only-toggle')?.checked === true;
 		const favRegionSelect = document.getElementById('fav-region-select');
 		let regionFilter = favRegionSelect?.value || 'ALL';
-		const favoriteFilterMetaCache = new WeakMap();
-		const getFavoriteFilterMeta = game => {
-			if (!game || typeof game !== 'object') return getLibraryFilterMetadata(game);
-			let meta = favoriteFilterMetaCache.get(game);
-			if (!meta) {
-				meta = getLibraryFilterMetadata(game);
-				favoriteFilterMetaCache.set(game, meta);
-			}
-			return meta;
-		};
+		const getFavoriteFilterMeta = getCachedLibraryFilterMetadata;
 
 		if (favRegionSelect && ENABLE_REGION_GRAY_OUT) {
 			const favoriteRegionItems = activeFavs.filter(game => {
@@ -43039,6 +43378,12 @@ function formatLibraryLastPlayedBadge(game = {}) {
 				return bRank - aRank;
 			});
 		}
+
+		/* Pending reveal ordering is intentionally not cached as the stable re-entry state. */
+		if (!pendingFavoritesRevealKeys || !pendingFavoritesRevealKeys.length) {
+			fastEntry.inputSignature = getLibraryFilterFastSignature('favorites');
+			fastEntry.filtered = filteredFavs;
+		}
 		
 		if (countSpan) {
 			countSpan.innerText = `(${window.formatUiCount ? window.formatUiCount(filteredFavs.length, 'item', 'items') : `${filteredFavs.length} ${filteredFavs.length === 1 ? 'item' : 'items'}`})`;
@@ -43069,7 +43414,6 @@ function formatLibraryLastPlayedBadge(game = {}) {
 		const favoritesSameSignature = grid.dataset.progressiveGridSignature === favoritesProgressiveSignature;
 		const favoritesCanAppend = appendProgressive && favoritesSameSignature;
 		const favoritesHasRenderedCards = !!grid.querySelector(':scope > .game-card');
-		const favoritesHasPendingReveal = !!(pendingFavoritesRevealKeys && pendingFavoritesRevealKeys.length);
 		clearProgressiveGridObserver('favorites', grid);
 		if (!appendProgressive && favoritesHasRenderedCards && favoritesSameSignature && !favoritesHasPendingReveal) {
 			const renderedCount = Number(grid.dataset.progressiveGridRendered || grid.querySelectorAll(':scope > .game-card').length);
@@ -57030,10 +57374,11 @@ function getVisibleChatStackEl(id) {
 			}
 			if (profileSyncChanges.wishlist && Array.isArray(userData.wishlistData)) { window.wishlist = userData.wishlistData; safeLocalStorageSet(`${name}_psn_wishlist_db`, JSON.stringify(userData.wishlistData)); applyProfileListUpdatedAtFromServer(name, 'wishlist', userData.wishlistUpdatedAt); }
 			if (profileSyncChanges.downloads && Array.isArray(userData.downloadsData)) { applyIncomingDownloadHistoryForProfile(name, userData, payload); }
-			if (profileSyncChanges.favorites && Array.isArray(userData.favoritesData)) { window.favoritesLibrary = userData.favoritesData; safeLocalStorageSet(`${name}_ps3_library_favs`, JSON.stringify(userData.favoritesData)); applyProfileListUpdatedAtFromServer(name, 'favorites', userData.favoritesUpdatedAt); }
+			if (profileSyncChanges.favorites && Array.isArray(userData.favoritesData)) { window.favoritesLibrary = userData.favoritesData;
+				if (typeof window.bumpLibraryCollectionRevision === 'function') window.bumpLibraryCollectionRevision('favorites'); safeLocalStorageSet(`${name}_ps3_library_favs`, JSON.stringify(userData.favoritesData)); applyProfileListUpdatedAtFromServer(name, 'favorites', userData.favoritesUpdatedAt); }
 			if (profileSyncChanges.library && Array.isArray(userData.libraryData)) {
 				const mergedLibraryData = mergeLibraryLastPlayedLists(userData.libraryData, (typeof lastScannedGames !== 'undefined' && Array.isArray(lastScannedGames)) ? lastScannedGames : []);
-				if (typeof lastScannedGames !== 'undefined') { lastScannedGames = mergedLibraryData; window.lastScannedGames = lastScannedGames; }
+				if (typeof lastScannedGames !== 'undefined') { lastScannedGames = mergedLibraryData; window.lastScannedGames = lastScannedGames; if (typeof window.bumpLibraryCollectionRevision === 'function') window.bumpLibraryCollectionRevision('library'); }
 				safeLocalStorageSet(`${name}_psn_local_library`, JSON.stringify(mergedLibraryData));
 				applyProfileListUpdatedAtFromServer(name, 'library', userData.libraryUpdatedAt);
 			}
@@ -58373,26 +58718,28 @@ function getVisibleChatStackEl(id) {
 
 			if (Array.isArray(userData.favoritesData)) {
 				window.favoritesLibrary = userData.favoritesData;
+				if (typeof window.bumpLibraryCollectionRevision === 'function') window.bumpLibraryCollectionRevision('favorites');
 				safeLocalStorageSet(`${name}_ps3_library_favs`, JSON.stringify(userData.favoritesData));
 				applyProfileListUpdatedAtFromServer(name, 'favorites', userData.favoritesUpdatedAt);
 			} else if (isLightAuthPayload) {
-				if (!Array.isArray(window.favoritesLibrary)) window.favoritesLibrary = [];
+				if (!Array.isArray(window.favoritesLibrary)) { window.favoritesLibrary = []; if (typeof window.bumpLibraryCollectionRevision === 'function') window.bumpLibraryCollectionRevision('favorites'); }
 			} else {
 				const localFavs = localStorage.getItem(`${name}_ps3_library_favs`);
 				window.favoritesLibrary = localFavs ? JSON.parse(localFavs) : [];
+				if (typeof window.bumpLibraryCollectionRevision === 'function') window.bumpLibraryCollectionRevision('favorites');
 			}
 
 			if (Array.isArray(userData.libraryData)) {
 				const currentLibraryData = (typeof lastScannedGames !== 'undefined' && Array.isArray(lastScannedGames)) ? lastScannedGames : [];
 				const mergedLibraryData = mergeLibraryLastPlayedLists(userData.libraryData, currentLibraryData);
-				if (typeof lastScannedGames !== 'undefined') { lastScannedGames = mergedLibraryData; window.lastScannedGames = lastScannedGames; }
+				if (typeof lastScannedGames !== 'undefined') { lastScannedGames = mergedLibraryData; window.lastScannedGames = lastScannedGames; if (typeof window.bumpLibraryCollectionRevision === 'function') window.bumpLibraryCollectionRevision('library'); }
 				safeLocalStorageSet(`${name}_psn_local_library`, JSON.stringify(mergedLibraryData));
 				applyProfileListUpdatedAtFromServer(name, 'library', userData.libraryUpdatedAt);
 			} else if (isLightAuthPayload) {
-				if (typeof lastScannedGames !== 'undefined' && !Array.isArray(lastScannedGames)) { lastScannedGames = []; window.lastScannedGames = lastScannedGames; }
+				if (typeof lastScannedGames !== 'undefined' && !Array.isArray(lastScannedGames)) { lastScannedGames = []; window.lastScannedGames = lastScannedGames; if (typeof window.bumpLibraryCollectionRevision === 'function') window.bumpLibraryCollectionRevision('library'); }
 			} else {
 				const localLib = localStorage.getItem(`${name}_psn_local_library`);
-				if (typeof lastScannedGames !== 'undefined') { lastScannedGames = mergeLibraryLastPlayedLists(localLib ? JSON.parse(localLib) : [], []); window.lastScannedGames = lastScannedGames; }
+				if (typeof lastScannedGames !== 'undefined') { lastScannedGames = mergeLibraryLastPlayedLists(localLib ? JSON.parse(localLib) : [], []); window.lastScannedGames = lastScannedGames; if (typeof window.bumpLibraryCollectionRevision === 'function') window.bumpLibraryCollectionRevision('library'); }
 			}
 			if (!isLightAuthPayload && typeof updateConsoleLibraryStatusUI === 'function') updateConsoleLibraryStatusUI(window.lastScannedGames || []);
 
@@ -60536,6 +60883,7 @@ function getVisibleChatStackEl(id) {
 			}
 			if (trendingVisualChanged && typeof renderCachedTrendingIfVisible === 'function') {
 				renderCachedTrendingIfVisible();
+				if (!isTrendingViewVisible() && typeof scheduleTrendingPrewarm === 'function') scheduleTrendingPrewarm();
 			}
 			if (trendingVisualChanged && window.__trendingUnavailable && typeof isTrendingViewVisible === 'function' && isTrendingViewVisible()) {
 				clearTimeout(window.__trendingRecoveryTimer);
@@ -70510,7 +70858,6 @@ function getVisibleChatStackEl(id) {
 			const finishedAdminEntry = e.animationName === 'admin-view-enter' && e.target.id === 'view-admin';
 			e.target.classList.remove('anim-up');
 			if (finishedAdminEntry) {
-				if (typeof adminSchedulePanelRender === 'function') adminSchedulePanelRender(true);
 				if (typeof adminScheduleEntryHydration === 'function') adminScheduleEntryHydration();
 			}
 		}
