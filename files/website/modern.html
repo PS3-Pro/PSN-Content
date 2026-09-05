@@ -18946,6 +18946,34 @@ P
 		}
 	};
 
+	let trendingStoreResolveCacheRevision = -1;
+	const trendingStoreResolveCache = new Map();
+	function getTrendingResolvedStoreItem(itemId, allowedCats) {
+		const revision = Number(window.__psnStoreCacheRevision || 0);
+		if (revision !== trendingStoreResolveCacheRevision) {
+			trendingStoreResolveCacheRevision = revision;
+			trendingStoreResolveCache.clear();
+		}
+		const normalizedId = String(itemId || '').trim().toUpperCase();
+		if (!normalizedId) return null;
+		if (trendingStoreResolveCache.has(normalizedId)) return trendingStoreResolveCache.get(normalizedId);
+		let resolved = null;
+		const indexed = typeof window.findPsnStoreItemById === 'function' ? window.findPsnStoreItemById(normalizedId) : null;
+		if (indexed && allowedCats.includes(indexed.category)) {
+			resolved = { item:indexed.item, category:indexed.category };
+		} else if (window.psnStoreCache) {
+			for (const cat of allowedCats) {
+				if (!window.psnStoreCache[cat]) continue;
+				const match = typeof window.findPsnStoreExactMatchInCategory === 'function'
+					? window.findPsnStoreExactMatchInCategory(cat, [normalizedId], [])
+					: window.psnStoreCache[cat].find(g => g.id === normalizedId || g.titleId === normalizedId);
+				if (match) { resolved = { item:match, category:cat }; break; }
+			}
+		}
+		trendingStoreResolveCache.set(normalizedId, resolved);
+		return resolved;
+	}
+
 	window.renderTrendingCarousel = async function(containerId, topList, iconClass, options = {}) {
 		const container = document.getElementById(containerId);
 		if (!container) return;
@@ -18993,25 +19021,9 @@ P
 		for (const item of topList) {
 			if (displayRank >= 30) break;
 	
-			let gameData = null;
-			let gameCategory = 'games';
-			const indexedStoreItem = typeof window.findPsnStoreItemById === 'function' ? window.findPsnStoreItemById(item.id) : null;
-			if (indexedStoreItem && allowedCats.includes(indexedStoreItem.category)) {
-				gameData = indexedStoreItem.item;
-				gameCategory = indexedStoreItem.category;
-			}
-			if (!gameData && window.psnStoreCache) {
-				for (const cat of allowedCats) {
-					if (!window.psnStoreCache[cat]) continue;
-					gameData = (typeof window.findPsnStoreExactMatchInCategory === 'function')
-						? window.findPsnStoreExactMatchInCategory(cat, [item.id], [])
-						: window.psnStoreCache[cat].find(g => g.id === item.id || g.titleId === item.id);
-					if (gameData) {
-						gameCategory = cat;
-						break;
-					}
-				}
-			}
+			const resolvedTrendingItem = getTrendingResolvedStoreItem(item.id, allowedCats);
+			const gameData = resolvedTrendingItem ? resolvedTrendingItem.item : null;
+			const gameCategory = resolvedTrendingItem ? resolvedTrendingItem.category : 'games';
 	
 			if (gameData) {
 				// Use the exact same shared cover key, cached decision and fallback metadata as Browse/Explore.
@@ -21040,8 +21052,10 @@ P
 		if (typeof updateSidebarLight === 'function') {
 			scheduleNavigationLightsUpdate({ sidebar: true });
 		}
-		if (section === 'chat' && typeof adminUpdateChatControlsBanner === 'function') {
-			setTimeout(adminUpdateChatControlsBanner, 80);
+		if (section === 'chat') {
+			if (typeof window.invalidateChatJumpAvatarGeometry === 'function') window.invalidateChatJumpAvatarGeometry();
+			if (typeof window.updateJumpButtonPosition === 'function') window.updateJumpButtonPosition();
+			if (typeof adminUpdateChatControlsBanner === 'function') setTimeout(adminUpdateChatControlsBanner, 80);
 		}
 	}
 
@@ -35498,7 +35512,7 @@ P
 		const wishRegion = document.getElementById('wish-region-select');
 		if (wishCat) wishCat.value = 'ALL';
 		if (wishRegion) wishRegion.value = 'ALL';
-		document.querySelectorAll('#wish-console-filters input').forEach(cb => cb.checked = true);
+		getStoreFilterInputs('#wish-console-filters input').forEach(cb => { if (!cb.checked) cb.checked = true; });
 		if (typeof activeWishLetter !== 'undefined') activeWishLetter = 'ALL';
 		if (typeof resetSortToDefault === 'function') resetSortToDefault('wishlist');
 		if (typeof renderWishLetterFilter === 'function') renderWishLetterFilter();
@@ -36118,9 +36132,6 @@ P
 			}, 360);
 		}
 
-		if (viewId === 'view-library' && typeof window.refreshVisibleFavoriteCardsFromProfileSync === 'function') {
-			runViewOpenWork('view-library', () => window.refreshVisibleFavoriteCardsFromProfileSync());
-		}
 	
 		if (PSN_PROFILE_UTIL_VIEW_IDS.has(viewId)) {
 			if (!navigationPrepared) PSN_STATIC_MENU_GROUPS.forEach(g => { if (g.style.display !== 'none') g.style.display = 'none'; });
@@ -38163,9 +38174,14 @@ P
 			const resolvedItem = (typeof window.getWishlistCanonicalStoreItem === 'function')
 				? window.getWishlistCanonicalStoreItem(item, resolvedCategory)
 				: Object.assign({}, item, { category: resolvedCategory });
+			const resolvedName = String(resolvedItem.cleanName || resolvedItem.title || resolvedItem.name || '');
+			const resolvedId = String(resolvedItem.id || resolvedItem.titleId || '');
 			return Object.assign({}, resolvedItem, {
 				__wishlistDotKey: sourceDotKey || getWishlistDotKey(resolvedItem),
-				__wishlistIdentityKey: sourceIdentityKey
+				__wishlistIdentityKey: sourceIdentityKey,
+				// HOT FILTER CACHE: canonical wishlist items keep lowercase keys until source revision changes.
+				__wishlistSearchNameLower: resolvedName.toLowerCase(),
+				__wishlistSearchIdLower: resolvedId.toLowerCase()
 			});
 		});
 		window.__wishlistNormalizedRenderCache = { signature, source:list, items };
@@ -38270,6 +38286,7 @@ P
 		}
 		
 		const activeConsoles = typeof getStoreFilterCheckedValues === 'function' ? getStoreFilterCheckedValues('#wish-console-filters input') : [];
+		const activeConsoleSet = new Set(activeConsoles);
 	
 		const wishlistRenderItems = getNormalizedWishlistRenderItems();
 
@@ -38284,7 +38301,7 @@ P
 						const itemCategory = (typeof window.getWishlistItemCategoryKey === 'function') ? window.getWishlistItemCategoryKey(game) : (game.category || 'games');
 						if (itemCategory !== catFilter) return false;
 					}
-					if (!activeConsoles.includes(game.cTag)) return false;
+					if (!activeConsoleSet.has(game.cTag)) return false;
 					if (!term && activeWishLetter !== 'ALL') {
 						const firstChar = String(game.cleanName || '').charAt(0).toUpperCase();
 						if (activeWishLetter === '#') { if (/[A-Z0-9]/.test(firstChar)) return false; }
@@ -38303,7 +38320,7 @@ P
 				if (itemCategory !== catFilter) return false;
 			}
 			if (regionFilter !== "ALL" && game.region !== regionFilter) return false;
-			return activeConsoles.includes(game.cTag);
+			return activeConsoleSet.has(game.cTag);
 		};
 		const passesWishlistLetterSearch = game => {
 			if (!term && typeof activeWishLetter !== 'undefined' && activeWishLetter !== "ALL") {
@@ -38313,9 +38330,9 @@ P
 				else if (firstChar !== activeWishLetter) return false;
 			}
 			if (term) {
-				const nameMatch = game.cleanName.toLowerCase().includes(term);
-				const idMatch = game.id.toLowerCase().includes(term);
-				if (!nameMatch && !idMatch) return false;
+				const nameLower = game.__wishlistSearchNameLower || String(game.cleanName || '').toLowerCase();
+				const idLower = game.__wishlistSearchIdLower || String(game.id || '').toLowerCase();
+				if (!nameLower.includes(term) && !idLower.includes(term)) return false;
 			}
 			return true;
 		};
@@ -41605,6 +41622,41 @@ P
 		}
 	};
 	
+	/* MY GAMES OFFLINE COMMIT:
+	   Offline state is cheap and must be committed before the subview becomes visible.
+	   This prevents deferred Library work from exposing stale grid HTML from an older render. */
+	function renderPS3LibraryOfflineState(noIp = false) {
+		const status = PSN_STATIC_NAV_DOM.libraryStatus || document.getElementById('library-status');
+		const grid = PSN_STATIC_NAV_DOM.localGrid || document.getElementById('ps3-local-grid');
+		const actions = document.querySelector('.library-actions');
+		const subviewGames = PSN_STATIC_NAV_DOM.libraryGames || document.getElementById('subview-games');
+		const libraryLetterFilter = document.getElementById('library-letter-filter');
+		const libraryToolbar = document.getElementById('library-console-filters')?.closest('.browse-toolbar');
+		const searchBar = PSN_STATIC_NAV_DOM.searchBar || document.getElementById('search-input')?.closest('.search-bar');
+
+		if (subviewGames) subviewGames.classList.add('my-games-offline');
+		if (status) { status.innerText = '(Disconnected)'; status.style.color = '#ff4444'; }
+		if (actions) actions.style.display = 'none';
+		if (libraryToolbar) libraryToolbar.style.display = 'none';
+		if (libraryLetterFilter) libraryLetterFilter.style.display = 'none';
+		if (searchBar) searchBar.style.display = 'none';
+		if (!grid) return;
+
+		const nextHtml = noIp ? `
+			<div class="psn-page-empty-state" style="grid-column: 1/-1; text-align: center; color: #888; padding: 100px 50px; background: rgba(0,0,0,0.2); border-radius: 12px; border: 1px dashed rgba(255,255,255,0.05); margin-top: 10px; backdrop-filter: blur(5px);">
+				<i class="fas fa-gamepad" style="font-size: 50px; margin-bottom: 20px; opacity: 0.2;"></i>
+				<div style="font-size: 18px;">Console Not Connected</div>
+				<p style="font-size: 13px; color: var(--text-muted);">Please enter your PS3™ IP in the top header and click the connect icon to list your games.</p>
+			</div>` : `
+			<div class="psn-page-empty-state" style="grid-column: 1/-1; text-align: center; color: #888; padding: 100px 50px; background: rgba(0,0,0,0.2); border-radius: 12px; border: 1px dashed rgba(255,255,255,0.05); margin-top: 10px; backdrop-filter: blur(5px)">
+				<i class="fas fa-power-off" style="font-size: 50px; margin-bottom: 20px; opacity: 0.2;"></i>
+				<div style="font-size: 18px;">Console Offline</div>
+				<p style="font-size: 13px; color: var(--text-muted);">Please click the connect button in the header when the PS3™ is turned on.</p>
+			</div>`;
+		if (grid.innerHTML !== nextHtml) grid.innerHTML = nextHtml;
+	}
+	window.renderPS3LibraryOfflineState = renderPS3LibraryOfflineState;
+
 	async function refreshPS3Library() {
 		const ip = document.getElementById('ps3-ip').value;
 		const status = document.getElementById('library-status');
@@ -41625,40 +41677,14 @@ P
 		const canToggleSearch = isLibraryActive && isGamesActive;
 	
 		if (!ip) {
-			if (subviewGames) subviewGames.classList.add('my-games-offline');
-			if (status) { status.innerText = "(Disconnected)"; status.style.color = "#ff4444"; }
-			if (actions) actions.style.display = 'none';
-			if (libraryToolbar) libraryToolbar.style.display = 'none';
-			if (libraryLetterFilter) libraryLetterFilter.style.display = 'none';
-			
-			if (searchBar && canToggleSearch) searchBar.style.display = 'none';
-			
-			grid.innerHTML = `
-			<div class="psn-page-empty-state" style="grid-column: 1/-1; text-align: center; color: #888; padding: 100px 50px; background: rgba(0,0,0,0.2); border-radius: 12px; border: 1px dashed rgba(255,255,255,0.05); margin-top: 10px; backdrop-filter: blur(5px);">
-				<i class="fas fa-gamepad" style="font-size: 50px; margin-bottom: 20px; opacity: 0.2;"></i>
-				<div style="font-size: 18px;">Console Not Connected</div>
-				<p style="font-size: 13px; color: var(--text-muted);">Please enter your PS3™ IP in the top header and click the connect icon to list your games.</p>
-			</div>`;
+			renderPS3LibraryOfflineState(true);
 			return;
 		}
 	
 		const isConnected = globalIcon && (globalIcon.classList.contains('status-dot-connected') || globalIcon.style.color === "rgb(76, 175, 80)");
 	
 		if (!isConnected) {
-			if (subviewGames) subviewGames.classList.add('my-games-offline');
-			if (status) { status.innerText = "(Disconnected)"; status.style.color = "#ff4444"; }
-			if (actions) actions.style.display = 'none';
-			if (libraryToolbar) libraryToolbar.style.display = 'none'; 
-			if (libraryLetterFilter) libraryLetterFilter.style.display = 'none';
-			
-			if (searchBar && canToggleSearch) searchBar.style.display = 'none';
-			
-			grid.innerHTML = `
-			<div class="psn-page-empty-state" style="grid-column: 1/-1; text-align: center; color: #888; padding: 100px 50px; background: rgba(0,0,0,0.2); border-radius: 12px; border: 1px dashed rgba(255,255,255,0.05); margin-top: 10px; backdrop-filter: blur(5px)">
-				<i class="fas fa-power-off" style="font-size: 50px; margin-bottom: 20px; opacity: 0.2;"></i>
-				<div style="font-size: 18px;">Console Offline</div>
-				<p style="font-size: 13px; color: var(--text-muted);">Please click the connect button in the header when the PS3™ is turned on.</p>
-			</div>`;
+			renderPS3LibraryOfflineState(false);
 			return;
 		}
 	
@@ -42721,6 +42747,31 @@ function formatLibraryLastPlayedBadge(game = {}) {
 		return meta;
 	}
 
+	let librarySearchMetadataFastRevision = '';
+	let librarySearchMetadataFastCache = new WeakMap();
+	function getCachedLibrarySearchMetadata(game = {}) {
+		const revision = String(Number(window.__libraryDataRevision || 0));
+		if (revision !== librarySearchMetadataFastRevision) {
+			librarySearchMetadataFastRevision = revision;
+			librarySearchMetadataFastCache = new WeakMap();
+		}
+		if (!game || typeof game !== 'object') return { nameNormalized:'', idNormalized:'', pathLower:'', pathNormalized:'' };
+		let meta = librarySearchMetadataFastCache.get(game);
+		if (!meta) {
+			const titleLower = String(game.title || '').toLowerCase();
+			const idLower = String(game.id || game.titleId || getLibraryGameTitleId(game) || '').toLowerCase();
+			const pathLower = String(game.path || '').toLowerCase();
+			meta = {
+				nameNormalized: titleLower.replace(/[^a-z0-9]/g, ''),
+				idNormalized: idLower.replace(/[^a-z0-9]/g, ''),
+				pathLower,
+				pathNormalized: pathLower.replace(/[^a-z0-9]/g, '')
+			};
+			librarySearchMetadataFastCache.set(game, meta);
+		}
+		return meta;
+	}
+
 	function matchesLibraryAlphabetFilter(title, letter) {
 		if (!letter || letter === 'ALL') return true;
 		const firstChar = String(title || '').trim().charAt(0).toUpperCase();
@@ -42739,6 +42790,7 @@ function formatLibraryLastPlayedBadge(game = {}) {
 
 		const prefix = isFavorites ? 'fav' : 'library';
 		const activeConsoles = getStaticCheckedValues(isFavorites ? PSN_STATIC_FAVORITE_CONSOLE_FILTERS : PSN_STATIC_LIBRARY_CONSOLE_FILTERS);
+		const activeConsoleSet = new Set(activeConsoles);
 		const typeFilter = document.getElementById(`${prefix}-type-select`)?.value || 'ALL';
 		const regionFilter = document.getElementById(`${prefix}-region-select`)?.value || 'ALL';
 		const playTogetherToggleId = isFavorites ? 'fav-play-together-only-toggle' : 'library-play-together-only-toggle';
@@ -42746,7 +42798,7 @@ function formatLibraryLastPlayedBadge(game = {}) {
 
 		return source.filter(game => {
 			const meta = getCachedLibraryFilterMetadata(game);
-			if (!activeConsoles.includes(meta.console)) return false;
+			if (!activeConsoleSet.has(meta.console)) return false;
 			if (typeFilter !== 'ALL' && meta.category !== typeFilter) return false;
 			if (regionFilter !== 'ALL' && meta.region !== regionFilter) return false;
 			if (playTogetherMatchesOnly) {
@@ -42904,6 +42956,7 @@ function formatLibraryLastPlayedBadge(game = {}) {
 		const termNormalized = term.replace(/[^a-z0-9]/g, '');
 	
 		const activeConsoles = getStaticCheckedValues(PSN_STATIC_LIBRARY_CONSOLE_FILTERS);
+		const activeConsoleSet = new Set(activeConsoles);
 		const typeFilter = document.getElementById('library-type-select')?.value || 'ALL';
 		const playTogetherMatchesOnly = document.getElementById('library-play-together-only-toggle')?.checked === true;
 		const libraryRegionSelect = document.getElementById('library-region-select');
@@ -42913,7 +42966,7 @@ function formatLibraryLastPlayedBadge(game = {}) {
 		if (libraryRegionSelect && ENABLE_REGION_GRAY_OUT) {
 			const libraryRegionItems = lastScannedGames.filter(game => {
 				const meta = getFilterMeta(game);
-				if (!activeConsoles.includes(meta.console)) return false;
+				if (!activeConsoleSet.has(meta.console)) return false;
 				if (typeFilter !== 'ALL' && meta.category !== typeFilter) return false;
 				if (playTogetherMatchesOnly) {
 					const titleId = normalizeGamePlayersTitleId(getLibraryGameTitleId(game));
@@ -42927,7 +42980,7 @@ function formatLibraryLastPlayedBadge(game = {}) {
 	
 		const passesLibraryBaseFilters = game => {
 			const meta = getFilterMeta(game);
-			if (!activeConsoles.includes(meta.console)) return false;
+			if (!activeConsoleSet.has(meta.console)) return false;
 			if (typeFilter !== 'ALL' && meta.category !== typeFilter) return false;
 			if (regionFilter !== 'ALL' && meta.region !== regionFilter) return false;
 			if (playTogetherMatchesOnly) {
@@ -42939,12 +42992,8 @@ function formatLibraryLastPlayedBadge(game = {}) {
 		const passesLibraryLetterSearch = game => {
 			if (!term && activeLibraryLetter !== 'ALL' && !matchesLibraryAlphabetFilter(game.title, activeLibraryLetter)) return false;
 			if (term) {
-				const nameNormalized = game.title.toLowerCase().replace(/[^a-z0-9]/g, '');
-				const idNormalized = game.id ? game.id.toLowerCase().replace(/[^a-z0-9]/g, '') : '';
-				const nameMatch = nameNormalized.includes(termNormalized);
-				const pathMatch = game.path.toLowerCase().includes(termNormalized);
-				const idMatch = idNormalized.includes(termNormalized);
-				if (!nameMatch && !pathMatch && !idMatch) return false;
+				const searchMeta = getCachedLibrarySearchMetadata(game);
+				if (!searchMeta.nameNormalized.includes(termNormalized) && !searchMeta.pathLower.includes(termNormalized) && !searchMeta.idNormalized.includes(termNormalized)) return false;
 			}
 			return true;
 		};
@@ -43305,6 +43354,7 @@ function formatLibraryLastPlayedBadge(game = {}) {
 		const term = document.getElementById('search-input')?.value.toLowerCase().trim() || "";
 		const termNormalized = term.replace(/[^a-z0-9]/g, '');
 		const activeConsoles = getStaticCheckedValues(PSN_STATIC_FAVORITE_CONSOLE_FILTERS);
+		const activeConsoleSet = new Set(activeConsoles);
 		const typeFilter = document.getElementById('fav-type-select')?.value || 'ALL';
 		const playTogetherMatchesOnly = document.getElementById('fav-play-together-only-toggle')?.checked === true;
 		const favRegionSelect = document.getElementById('fav-region-select');
@@ -43314,7 +43364,7 @@ function formatLibraryLastPlayedBadge(game = {}) {
 		if (favRegionSelect && ENABLE_REGION_GRAY_OUT) {
 			const favoriteRegionItems = activeFavs.filter(game => {
 				const meta = getFavoriteFilterMeta(game);
-				if (!activeConsoles.includes(meta.console)) return false;
+				if (!activeConsoleSet.has(meta.console)) return false;
 				if (typeFilter !== 'ALL' && meta.category !== typeFilter) return false;
 				if (playTogetherMatchesOnly) {
 					const titleId = normalizeGamePlayersTitleId(getLibraryGameTitleId(game));
@@ -43328,7 +43378,7 @@ function formatLibraryLastPlayedBadge(game = {}) {
 
 		const passesFavoriteBaseFilters = game => {
 			const meta = getFavoriteFilterMeta(game);
-			if (!activeConsoles.includes(meta.console)) return false;
+			if (!activeConsoleSet.has(meta.console)) return false;
 			if (typeFilter !== 'ALL' && meta.category !== typeFilter) return false;
 			if (regionFilter !== 'ALL' && meta.region !== regionFilter) return false;
 			if (playTogetherMatchesOnly) {
@@ -43340,10 +43390,8 @@ function formatLibraryLastPlayedBadge(game = {}) {
 		const passesFavoriteLetterSearch = game => {
 			if (!term && activeFavoriteLibraryLetter !== 'ALL' && !matchesLibraryAlphabetFilter(game.title, activeFavoriteLibraryLetter)) return false;
 			if (term) {
-				const nameNormalized = game.title.toLowerCase().replace(/[^a-z0-9]/g, '');
-				const idNormalized = String(game.id || game.titleId || getLibraryGameTitleId(game) || '').toLowerCase().replace(/[^a-z0-9]/g, '');
-				const pathNormalized = String(game.path || '').toLowerCase().replace(/[^a-z0-9]/g, '');
-				if (!nameNormalized.includes(termNormalized) && !idNormalized.includes(termNormalized) && !pathNormalized.includes(termNormalized)) return false;
+				const searchMeta = getCachedLibrarySearchMetadata(game);
+				if (!searchMeta.nameNormalized.includes(termNormalized) && !searchMeta.idNormalized.includes(termNormalized) && !searchMeta.pathNormalized.includes(termNormalized)) return false;
 			}
 			return true;
 		};
@@ -47084,6 +47132,13 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 		
 		setPsnStyleIfChanged(searchBar, 'display', isConnected ? 'flex' : 'none');
 		
+		/* Offline My Games is not deferred: commit the correct empty state before first paint.
+		   Connected scans/filtering still use the scheduled hot path below. */
+		if (!isConnected && typeof renderPS3LibraryOfflineState === 'function') {
+			const hasPs3Ip = !!String(PSN_STATIC_NAV_DOM.ps3Ip?.value || '').trim();
+			renderPS3LibraryOfflineState(!hasPs3Ip);
+		}
+		
 		const existingLibraryCards = PSN_STATIC_NAV_DOM.localGrid?.querySelector('.game-card') || null;
 		const hasExistingLibraryCards = !!existingLibraryCards;
 		const hasCachedLibraryGames = Array.isArray(window.lastScannedGames) && window.lastScannedGames.length > 0;
@@ -47092,11 +47147,11 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 		// Fresh scan results reveal when they materialize. Cached cards replay their entry reveal
 		// through the pre-paint collection guard below, so they never flash fully visible first.
 		if (!window.isRestoringHistory) window.__pendingMyGamesScanReveal = enteringDuringLibraryScan && !hasExistingLibraryCards && !hasCachedLibraryGames;
-		libraryOpenWork = () => {
+		libraryOpenWork = isConnected ? () => {
 			const canReuseRecentLibrary = !!existingLibraryCards && hasCachedLibraryGames && ps3LibraryLastRefreshAt > 0 && (Date.now() - ps3LibraryLastRefreshAt) < PS3_LIBRARY_REENTRY_CACHE_MS;
 			if ((window.isRestoringHistory || isSilent || canReuseRecentLibrary) && existingLibraryCards && typeof applyLibraryFilters === 'function') applyLibraryFilters(true);
 			else if (typeof refreshPS3Library === 'function') refreshPS3Library();
-		};
+		} : null;
 	}
 
 	if (type === 'favorites') {
@@ -53147,6 +53202,10 @@ function getVisibleChatStackEl(id) {
 		if (typeof playUiClick === 'function') playUiClick();
 	}
 	
+	let chatJumpAvatarGeometryDirty = true;
+	let chatJumpAvatarRight = '';
+	window.invalidateChatJumpAvatarGeometry = function() { chatJumpAvatarGeometryDirty = true; };
+
 	window.updateJumpButtonPosition = function() {
         if (window.__chatJumpButtonPositionFrame) return;
         window.__chatJumpButtonPositionFrame = requestAnimationFrame(() => {
@@ -53164,26 +53223,38 @@ function getVisibleChatStackEl(id) {
             const subviewChat = document.getElementById('subview-chat');
             const chatMessages = document.getElementById('chat-messages');
             const jumpParent = jumpButtons[0].offsetParent || document.querySelector('#subview-chat .file-manager-container');
-            if (subviewChat && chatMessages && jumpParent) {
+            /* CHAT JUMP GEOMETRY CACHE: typing/reply previews only affect vertical stacking.
+               Re-measure avatar X alignment only after chat DOM/layout invalidation. */
+            if (subviewChat && chatMessages && jumpParent && chatJumpAvatarGeometryDirty) {
+                chatJumpAvatarGeometryDirty = false;
                 const parentRect = jumpParent.getBoundingClientRect();
                 const chatRect = chatMessages.getBoundingClientRect();
                 const shouldAlignToAvatar = parentRect.width <= 1120 || window.innerWidth <= 1400;
+                let nextRight = '';
                 if (shouldAlignToAvatar && parentRect.width > 0 && chatRect.width > 0) {
                     let avatarCenterX = null;
                     const chatMidX = chatRect.left + (chatRect.width * 0.55);
-                    chatMessages.querySelectorAll('.chat-avatar-status').forEach(avatar => {
-                        const rect = avatar.getBoundingClientRect();
-                        if (!rect.width || !rect.height) return;
+                    const avatars = chatMessages.querySelectorAll('.chat-avatar-status');
+                    for (let i = 0; i < avatars.length; i++) {
+                        const rect = avatars[i].getBoundingClientRect();
+                        if (!rect.width || !rect.height) continue;
                         const centerX = rect.left + (rect.width / 2);
-                        if (centerX < chatMidX) return;
+                        if (centerX < chatMidX) continue;
                         if (avatarCenterX === null || centerX > avatarCenterX) avatarCenterX = centerX;
-                    });
+                    }
                     if (avatarCenterX !== null) {
                         const buttonWidth = jumpButtons[0].offsetWidth || 38;
-                        const right = `${Math.max(8, Math.round(parentRect.right - avatarCenterX - (buttonWidth / 2)))}px`;
-                        if (subviewChat.style.getPropertyValue('--chat-jump-button-right') !== right) subviewChat.style.setProperty('--chat-jump-button-right', right);
-                    } else if (subviewChat.style.getPropertyValue('--chat-jump-button-right')) subviewChat.style.removeProperty('--chat-jump-button-right');
-                } else if (subviewChat.style.getPropertyValue('--chat-jump-button-right')) subviewChat.style.removeProperty('--chat-jump-button-right');
+                        nextRight = `${Math.max(8, Math.round(parentRect.right - avatarCenterX - (buttonWidth / 2)))}px`;
+                    }
+                }
+                chatJumpAvatarRight = nextRight;
+                if (nextRight) {
+                    if (subviewChat.style.getPropertyValue('--chat-jump-button-right') !== nextRight) subviewChat.style.setProperty('--chat-jump-button-right', nextRight);
+                } else if (subviewChat.style.getPropertyValue('--chat-jump-button-right')) {
+                    subviewChat.style.removeProperty('--chat-jump-button-right');
+                }
+            } else if (subviewChat && chatJumpAvatarRight && subviewChat.style.getPropertyValue('--chat-jump-button-right') !== chatJumpAvatarRight) {
+                subviewChat.style.setProperty('--chat-jump-button-right', chatJumpAvatarRight);
             }
             let stackOffset = 50;
             const margin = 8;
@@ -53221,9 +53292,11 @@ function getVisibleChatStackEl(id) {
 	if (!window.__chatJumpButtonResizeAlignAttached) {
 		window.__chatJumpButtonResizeAlignAttached = true;
 		window.addEventListener('resize', () => {
+			if (typeof window.invalidateChatJumpAvatarGeometry === 'function') window.invalidateChatJumpAvatarGeometry();
 			if (typeof window.updateJumpButtonPosition === 'function') window.updateJumpButtonPosition();
 		}, { passive: true });
 		window.addEventListener('orientationchange', () => {
+			if (typeof window.invalidateChatJumpAvatarGeometry === 'function') window.invalidateChatJumpAvatarGeometry();
 			if (typeof window.updateJumpButtonPosition === 'function') window.updateJumpButtonPosition();
 		}, { passive: true });
 	}
@@ -62147,6 +62220,7 @@ function getVisibleChatStackEl(id) {
             for (const mutation of mutations) {
                 if (mutation.type === 'attributes' || mutation.addedNodes.length || mutation.removedNodes.length) {
                     invalidateChatMentionJumpRowsCache();
+                    if (typeof window.invalidateChatJumpAvatarGeometry === 'function') window.invalidateChatJumpAvatarGeometry();
                     break;
                 }
             }
