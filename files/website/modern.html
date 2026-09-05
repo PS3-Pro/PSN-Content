@@ -20997,23 +20997,21 @@ P
 		restoreOriginScroll();
 	
 		const syncGlobalUI = (activeTabId, showGroupSelector, sidebarActiveId = null) => {
-			document.querySelectorAll('.top-nav a').forEach(a => a.classList.remove('active'));
+			PSN_STATIC_TOP_NAV_LINKS.forEach(a => { if (a.classList.contains('active')) a.classList.remove('active'); });
 			if (activeTabId) {
 				const tab = document.getElementById(activeTabId);
 				if (tab) tab.classList.add('active');
 			}
 	
-			const groups = ['.menu-group-home', '.menu-group-library', '.menu-group-store', '.menu-group-chat', '.menu-group-trophies', '.menu-group-online', '.menu-group-admin'];
-			groups.forEach(selector => {
-				const el = document.querySelector(selector);
-				if (el) el.style.display = 'none';
+			Object.values(PSN_MENU_GROUP_BY_TAB).forEach(group => {
+				if (group && group.style.display !== 'none') group.style.display = 'none';
 			});
 			if (showGroupSelector) {
 				const targetGroup = document.querySelector(showGroupSelector);
 				if (targetGroup) targetGroup.style.display = 'block';
 			}
 	
-			document.querySelectorAll('.sidebar-menu li').forEach(li => li.classList.remove('active'));
+			PSN_STATIC_SIDEBAR_ITEMS.forEach(li => { if (li.classList.contains('active')) li.classList.remove('active'); });
 			if (sidebarActiveId) {
 				const sideItem = document.getElementById(sidebarActiveId);
 				if (sideItem) sideItem.classList.add('active');
@@ -21064,16 +21062,16 @@ P
 				syncGlobalUI('top-nav-store', '.menu-group-store', side);
 			} else if (viewName === 'guides' || viewName === 'notifications' || viewName === 'settings') {
 				if (oldHistory.savedTopNav) {
-					document.querySelectorAll('.top-nav a').forEach(a => a.classList.remove('active'));
+					PSN_STATIC_TOP_NAV_LINKS.forEach(a => { if (a.classList.contains('active')) a.classList.remove('active'); });
 					document.getElementById(oldHistory.savedTopNav)?.classList.add('active');
 				}
 				if (oldHistory.savedSideGroup) {
-					document.querySelectorAll('[class*="menu-group-"]').forEach(g => g.style.display = 'none');
+					PSN_STATIC_MENU_GROUPS.forEach(g => { if (g.style.display !== 'none') g.style.display = 'none'; });
 					const targetGroup = document.querySelector('.' + oldHistory.savedSideGroup);
 					if (targetGroup) targetGroup.style.display = 'block';
 				}
 				
-				document.querySelectorAll('.sidebar-menu li').forEach(li => li.classList.remove('active'));
+				PSN_STATIC_SIDEBAR_ITEMS.forEach(li => { if (li.classList.contains('active')) li.classList.remove('active'); });
 				document.getElementById('nav-' + viewName)?.classList.add('active');
 				
 				setTimeout(() => {
@@ -35643,7 +35641,7 @@ P
 			}
 			else if (viewId === 'view-admin') {
 				document.getElementById('top-nav-admin')?.classList.remove('active');
-				document.querySelectorAll('.sidebar-menu li').forEach(el => el.classList.remove('active'));
+				PSN_STATIC_SIDEBAR_ITEMS.forEach(el => { if (el.classList.contains('active')) el.classList.remove('active'); });
 				document.getElementById('nav-admin-footer')?.classList.add('active');
 				runViewOpenWork('view-admin', () => { if (typeof renderAdminPanel === 'function') renderAdminPanel(); });
 			}
@@ -39203,7 +39201,7 @@ P
 			if (typeof resetAllFilters === 'function') resetAllFilters();
 			const catSelect = document.getElementById('cat-select');
 			if (catSelect) catSelect.value = 'games';
-			document.querySelectorAll('.top-nav a').forEach(a => a.classList.remove('active'));
+			PSN_STATIC_TOP_NAV_LINKS.forEach(a => { if (a.classList.contains('active')) a.classList.remove('active'); });
 	
 			switchTab('home');
 	
@@ -39380,7 +39378,7 @@ P
 								if (typeof resetAllFilters === 'function') resetAllFilters();
 								const catSelect = document.getElementById('cat-select');
 								if (catSelect) catSelect.value = 'games';
-								document.querySelectorAll('.top-nav a').forEach(a => a.classList.remove('active'));
+								PSN_STATIC_TOP_NAV_LINKS.forEach(a => { if (a.classList.contains('active')) a.classList.remove('active'); });
 								if (typeof switchTab === 'function') switchTab('home');
 	
 								const chatMessages = document.getElementById('chat-messages');
@@ -50413,20 +50411,43 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 		}
 	}
 
-	function formatChatDatePart(date, locale, options) {
+	const chatDateTimeFormatters = new Map();
+	const chatRelativeTimeFormatters = new Map();
+
+	function getChatDateTimeFormatter(locale, options) {
+		const safeLocale = locale || 'en';
+		const key = safeLocale + '|' + JSON.stringify(options || {});
+		let formatter = chatDateTimeFormatters.get(key);
+		if (formatter) return formatter;
 		try {
-			return new Intl.DateTimeFormat(locale || 'en', options).format(date);
+			formatter = new Intl.DateTimeFormat(safeLocale, options);
 		} catch (err) {
-			return new Intl.DateTimeFormat('en', options).format(date);
+			formatter = new Intl.DateTimeFormat('en', options);
 		}
+		chatDateTimeFormatters.set(key, formatter);
+		return formatter;
+	}
+
+	function formatChatDatePart(date, locale, options) {
+		return getChatDateTimeFormatter(locale, options).format(date);
+	}
+
+	function getChatRelativeTimeFormatter(locale) {
+		const safeLocale = locale || 'en';
+		let formatter = chatRelativeTimeFormatters.get(safeLocale);
+		if (formatter) return formatter;
+		try {
+			formatter = new Intl.RelativeTimeFormat(safeLocale, { numeric: 'auto' });
+		} catch (err) {
+			try { formatter = new Intl.RelativeTimeFormat('en', { numeric: 'auto' }); } catch (fallbackErr) { return null; }
+		}
+		chatRelativeTimeFormatters.set(safeLocale, formatter);
+		return formatter;
 	}
 
 	function formatChatRelativeDay(value, locale) {
-		try {
-			return new Intl.RelativeTimeFormat(locale || 'en', { numeric: 'auto' }).format(value, 'day');
-		} catch (err) {
-			return value === 0 ? 'Today' : (value === -1 ? 'Yesterday' : '');
-		}
+		const formatter = getChatRelativeTimeFormatter(locale);
+		return formatter ? formatter.format(value, 'day') : (value === 0 ? 'Today' : (value === -1 ? 'Yesterday' : ''));
 	}
 
 	function getRelativeCalendarInfo(timestamp) {
@@ -50457,8 +50478,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 		};
 	}
 
-	function getChatDateLabel(dateStr) {
-		const info = getRelativeCalendarInfo(dateStr);
+	function getChatDateLabelFromInfo(info) {
 		if (!info) return "";
 		if (info.diffInDays <= 0) return info.todayLabel;
 		if (info.diffInDays === 1) return info.yesterdayLabel;
@@ -50466,9 +50486,13 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 		return info.fullDate;
 	}
 
+	function getChatDateLabel(dateStr) {
+		return getChatDateLabelFromInfo(getRelativeCalendarInfo(dateStr));
+	}
+
 	function createChatDateDivider(timestamp) {
 		const info = getRelativeCalendarInfo(timestamp);
-		const label = info ? getChatDateLabel(timestamp) : '';
+		const label = getChatDateLabelFromInfo(info);
 		const divider = document.createElement('div');
 		const span = document.createElement('span');
 		divider.className = 'date-divider';
@@ -50492,7 +50516,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 			const timestamp = Number(divider.dataset.chatDateTimestamp || 0);
 			const info = getRelativeCalendarInfo(timestamp);
 			if (!info) return;
-			const label = getChatDateLabel(timestamp);
+			const label = getChatDateLabelFromInfo(info);
 			const dayOffset = String(info.diffInDays);
 			if (divider.dataset.label !== label) divider.dataset.label = label;
 			if (divider.dataset.chatDayOffset !== dayOffset) divider.dataset.chatDayOffset = dayOffset;
@@ -50528,31 +50552,53 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 
 		const dividers = box.getElementsByClassName('date-divider');
 		const floatingSpan = floatingPill.querySelector('span');
+		let lastPassedIndex = -1;
+		let lastDividerCount = -1;
+		let lastPassedDivider = null;
 		const applyStickyDateScroll = () => {
-			if (dividers.length === 0) {
+			const dividerCount = dividers.length;
+			if (dividerCount === 0) {
+				lastPassedIndex = -1;
+				lastDividerCount = 0;
+				lastPassedDivider = null;
 				if (floatingPill.style.display !== 'none') floatingPill.style.display = 'none';
 				if (typeof positionChatLazyInlineLoading === 'function') positionChatLazyInlineLoading();
 				return;
 			}
 	
 			let pinHeight = (pinContainer && pinContainer.style.display !== 'none') ? pinContainer.offsetHeight : 0;
-			let threshold = pinHeight + 15; 
-	
-			let currentLabel = "HIDDEN_TOP";
-			let currentIsToday = false;
-			let anyDividerPassed = false;
-	
-			for (let i = 0; i < dividers.length; i++) {
-				const div = dividers[i];
-				const passed = div.offsetTop <= box.scrollTop + threshold;
-				if (passed) {
-					currentLabel = div.getAttribute('data-label') || '';
-					currentIsToday = div.dataset.chatDayOffset === '0';
-					anyDividerPassed = true;
+			let threshold = pinHeight + 15;
+			const cutoff = box.scrollTop + threshold;
+			const dividerSetChanged = lastDividerCount !== dividerCount || (lastPassedIndex >= 0 && dividers[lastPassedIndex] !== lastPassedDivider);
+
+			if (dividerSetChanged) {
+				lastPassedIndex = -1;
+				for (let i = 0; i < dividerCount; i++) {
+					const div = dividers[i];
+					const passed = div.offsetTop <= cutoff;
+					if (passed) lastPassedIndex = i;
+					const nextOpacity = passed ? '0' : '1';
+					if (div.style.opacity !== nextOpacity) div.style.opacity = nextOpacity;
 				}
-				const nextOpacity = passed ? '0' : '1';
-				if (div.style.opacity !== nextOpacity) div.style.opacity = nextOpacity;
+				lastDividerCount = dividerCount;
+			} else {
+				while (lastPassedIndex + 1 < dividerCount && dividers[lastPassedIndex + 1].offsetTop <= cutoff) {
+					lastPassedIndex++;
+					const div = dividers[lastPassedIndex];
+					if (div.style.opacity !== '0') div.style.opacity = '0';
+				}
+				while (lastPassedIndex >= 0 && dividers[lastPassedIndex].offsetTop > cutoff) {
+					const div = dividers[lastPassedIndex];
+					if (div.style.opacity !== '1') div.style.opacity = '1';
+					lastPassedIndex--;
+				}
 			}
+
+			lastPassedDivider = lastPassedIndex >= 0 ? dividers[lastPassedIndex] : null;
+			const anyDividerPassed = lastPassedIndex >= 0;
+			const currentDivider = anyDividerPassed ? dividers[lastPassedIndex] : null;
+			const currentLabel = currentDivider ? (currentDivider.getAttribute('data-label') || '') : "HIDDEN_TOP";
+			const currentIsToday = !!(currentDivider && currentDivider.dataset.chatDayOffset === '0');
 
 			if (box.dataset.lastLabel !== currentLabel) box.dataset.lastLabel = currentLabel;
 	
@@ -72086,7 +72132,7 @@ function getVisibleChatStackEl(id) {
 
 		if (window.MutationObserver && !window.__npsLiquidTopNavObserver) {
 			const observer = new MutationObserver(syncNpsLiquidFromDesktopNav);
-			document.querySelectorAll('.top-nav a').forEach(tab => {
+			PSN_STATIC_TOP_NAV_LINKS.forEach(tab => {
 				observer.observe(tab, { attributes: true, attributeFilter: ['class'] });
 			});
 			window.__npsLiquidTopNavObserver = observer;
