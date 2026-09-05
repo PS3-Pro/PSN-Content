@@ -11141,22 +11141,38 @@ P
 		return name && name !== 'null' && name !== 'undefined' ? `${name}_${PROFILE_SYNC_PENDING_STORAGE_SUFFIX}` : '';
 	}
 
+	/* PROFILE SYNC PENDING CACHE: this state is consulted repeatedly during every incoming
+	   profile packet. Keep the parsed canonical form in memory and invalidate on cross-tab writes. */
+	window.__persistentProfileSyncPendingCache = window.__persistentProfileSyncPendingCache instanceof Map ? window.__persistentProfileSyncPendingCache : new Map();
+	function clonePersistentProfileSyncPending(state, username = '') {
+		return {
+			version: 1,
+			username: String(username || (state && state.username) || ''),
+			updatedAt: normalizeProfileListTimestamp(state && state.updatedAt),
+			sections: { ...((state && state.sections) || {}) }
+		};
+	}
 	function readPersistentProfileSyncPending(username = localStorage.getItem('psn_username') || '') {
 		const key = getPersistentProfileSyncStorageKey(username);
 		const empty = { version: 1, username: String(username || ''), updatedAt: 0, sections: {} };
 		if (!key) return empty;
+		const raw = localStorage.getItem(key) || '';
+		const cached = window.__persistentProfileSyncPendingCache.get(key);
+		if (cached && cached.raw === raw && cached.state) return clonePersistentProfileSyncPending(cached.state, username);
+		let state = empty;
 		try {
-			const parsed = JSON.parse(localStorage.getItem(key) || 'null');
-			if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return empty;
-			const sections = {};
-			PROFILE_SYNC_PERSISTENT_SECTIONS.forEach(section => {
-				const stamp = normalizeProfileListTimestamp(parsed.sections && parsed.sections[section]);
-				if (stamp) sections[section] = stamp;
-			});
-			return { version: 1, username: String(username || ''), updatedAt: normalizeProfileListTimestamp(parsed.updatedAt), sections };
-		} catch (err) {
-			return empty;
-		}
+			const parsed = raw ? JSON.parse(raw) : null;
+			if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+				const sections = {};
+				PROFILE_SYNC_PERSISTENT_SECTIONS.forEach(section => {
+					const stamp = normalizeProfileListTimestamp(parsed.sections && parsed.sections[section]);
+					if (stamp) sections[section] = stamp;
+				});
+				state = { version: 1, username: String(username || ''), updatedAt: normalizeProfileListTimestamp(parsed.updatedAt), sections };
+			}
+		} catch (err) {}
+		window.__persistentProfileSyncPendingCache.set(key, { raw, state });
+		return clonePersistentProfileSyncPending(state, username);
 	}
 	window.readPersistentProfileSyncPending = readPersistentProfileSyncPending;
 
@@ -11171,9 +11187,19 @@ P
 		});
 		if (!Object.keys(cleanSections).length) {
 			localStorage.removeItem(key);
+			window.__persistentProfileSyncPendingCache.set(key, { raw: '', state: { version: 1, username: String(username || ''), updatedAt: 0, sections: {} } });
 			return;
 		}
-		safeLocalStorageSet(key, JSON.stringify({ version: 1, username: String(username || ''), updatedAt: Date.now(), sections: cleanSections }));
+		const canonical = { version: 1, username: String(username || ''), updatedAt: Date.now(), sections: cleanSections };
+		const raw = JSON.stringify(canonical);
+		if (localStorage.getItem(key) !== raw) safeLocalStorageSet(key, raw);
+		window.__persistentProfileSyncPendingCache.set(key, { raw, state: canonical });
+	}
+	if (!window.__persistentProfileSyncPendingStorageListenerInstalled) {
+		window.__persistentProfileSyncPendingStorageListenerInstalled = true;
+		window.addEventListener('storage', event => {
+			if (event && event.key && event.key.endsWith(`_${PROFILE_SYNC_PENDING_STORAGE_SUFFIX}`)) window.__persistentProfileSyncPendingCache.delete(event.key);
+		});
 	}
 
 	function shouldPersistProfileSyncPendingNow() {
@@ -11211,8 +11237,8 @@ P
 	}
 	window.clearPersistentProfileSyncPending = clearPersistentProfileSyncPending;
 
-	function getLocalProfileSectionVersion(username, section) {
-		const pending = readPersistentProfileSyncPending(username);
+	function getLocalProfileSectionVersion(username, section, pendingState = null) {
+		const pending = pendingState || readPersistentProfileSyncPending(username);
 		let stamp = normalizeProfileListTimestamp(pending.sections[section]);
 		if (section === 'settings') {
 			stamp = Math.max(stamp, getProfileSettingsUpdatedAtForUser(username));
@@ -11299,13 +11325,14 @@ P
 		}
 	}
 
-	function protectPendingProfileSectionFromIncoming(username, section, userData = {}, payload = {}) {
-		const pending = readPersistentProfileSyncPending(username);
+	function protectPendingProfileSectionFromIncoming(username, section, userData = {}, payload = {}, pendingState = null) {
+		const pending = pendingState || readPersistentProfileSyncPending(username);
 		if (!normalizeProfileListTimestamp(pending.sections[section])) return false;
-		const localVersion = getLocalProfileSectionVersion(username, section);
+		const localVersion = getLocalProfileSectionVersion(username, section, pending);
 		const incomingVersion = getIncomingProfileSectionVersion(section, userData, payload);
 		if (section !== 'trophies' && incomingVersion && incomingVersion > localVersion) {
-			clearPersistentProfileSyncPending(section, username);
+			delete pending.sections[section];
+			writePersistentProfileSyncPending(username, pending);
 			const syncState = window.__profileSyncDirtyState && window.__profileSyncDirtyState.username === username ? window.__profileSyncDirtyState : null;
 			if (syncState && syncState.dirty) syncState.dirty[section] = false;
 			return false;
@@ -11331,9 +11358,12 @@ P
 	window.prepareIncomingProfileForPersistentPending = function(username, userData = {}, payload = {}) {
 		const name = String(username || '').trim();
 		if (!name || !userData || typeof userData !== 'object') return [];
+		const pending = readPersistentProfileSyncPending(name);
+		const pendingSections = pending && pending.sections ? pending.sections : {};
 		const protectedSections = [];
 		PROFILE_SYNC_PERSISTENT_SECTIONS.forEach(section => {
-			if (protectPendingProfileSectionFromIncoming(name, section, userData, payload)) protectedSections.push(section);
+			if (!normalizeProfileListTimestamp(pendingSections[section])) return;
+			if (protectPendingProfileSectionFromIncoming(name, section, userData, payload, pending)) protectedSections.push(section);
 		});
 		return protectedSections;
 	};
@@ -11522,7 +11552,9 @@ P
 	function setProfileListUpdatedAtForUser(username, type, value) {
 		const timestamp = normalizeProfileListTimestamp(value);
 		if (!username || username === "null" || !timestamp) return 0;
-		safeLocalStorageSet(`${username}_${getProfileListTimestampStorageKey(type)}`, String(timestamp));
+		const storageKey = `${username}_${getProfileListTimestampStorageKey(type)}`;
+		const serialized = String(timestamp);
+		if (localStorage.getItem(storageKey) !== serialized) safeLocalStorageSet(storageKey, serialized);
 		return timestamp;
 	}
 
@@ -57814,13 +57846,19 @@ function getVisibleChatStackEl(id) {
 	window.getProfileSyncVisibleCardRoots = function() {
 		const roots = [];
 		try {
-			PSN_STATIC_VIEW_SECTIONS.forEach(view => {
-				if (window.getComputedStyle(view).display !== 'none') roots.push(view);
-			});
+			/* PROFILE SYNC VISIBLE ROOTS: navigation already tracks the current view. Do not force
+			   style resolution across every hidden view on each realtime profile packet. */
+			const activeView = typeof getCurrentPsnViewElement === 'function' ? getCurrentPsnViewElement() : null;
+			if (activeView) roots.push(activeView);
+			else {
+				for (const view of PSN_STATIC_VIEW_SECTIONS) {
+					if (view && (view.style.display === 'block' || view.style.display === 'flex')) { roots.push(view); break; }
+				}
+			}
 
 			document.querySelectorAll('.modal-overlay, .sys-modal').forEach(modal => {
 				const shown = modal.classList.contains('show') || modal.style.display === 'flex' || modal.style.display === 'block';
-				if (shown) roots.push(modal);
+				if (shown && !roots.includes(modal)) roots.push(modal);
 			});
 		} catch (err) {}
 
@@ -58094,59 +58132,56 @@ function getVisibleChatStackEl(id) {
 
 
 	window.normalizeProfileSyncComparableValue = function(value) {
-		if (Array.isArray(value)) {
-			return value.map(item => window.normalizeProfileSyncComparableValue(item));
-		}
-
+		if (Array.isArray(value)) return value.map(item => window.normalizeProfileSyncComparableValue(item));
 		if (value && typeof value === 'object') {
 			const out = {};
 			Object.keys(value).sort().forEach(key => {
-				if (key === 'profileUpdatedAt') return;
-				if (key === 'wishlistUpdatedAt') return;
-				if (key === 'downloadsUpdatedAt') return;
-				if (key === 'downloadsClearedAt') return;
-				if (key === 'favoritesUpdatedAt') return;
-				if (key === 'libraryUpdatedAt') return;
-				if (key === 'friendsUpdatedAt') return;
+				if (key === 'profileUpdatedAt' || key === 'wishlistUpdatedAt' || key === 'downloadsUpdatedAt' || key === 'downloadsClearedAt' || key === 'favoritesUpdatedAt' || key === 'libraryUpdatedAt' || key === 'friendsUpdatedAt') return;
 				out[key] = window.normalizeProfileSyncComparableValue(value[key]);
 			});
 			return out;
 		}
-
-		if (value === undefined) return null;
-		return value;
+		return value === undefined ? null : value;
 	};
 
 	window.getProfileSyncComparableSignature = function(value) {
-		try {
-			return JSON.stringify(window.normalizeProfileSyncComparableValue(value));
-		} catch (err) {
-			try {
-				return JSON.stringify(value);
-			} catch (err2) {
-				return String(value);
-			}
-		}
+		try { return JSON.stringify(window.normalizeProfileSyncComparableValue(value)); }
+		catch (err) { try { return JSON.stringify(value); } catch (err2) { return String(value); } }
 	};
-
 
 	window.hasProfileSyncDataChanged = function(previousValue, incomingValue) {
-		try {
-			return window.getProfileSyncComparableSignature(previousValue) !== window.getProfileSyncComparableSignature(incomingValue);
-		} catch (err) {
-			return true;
-		}
+		try { return window.getProfileSyncComparableSignature(previousValue) !== window.getProfileSyncComparableSignature(incomingValue); }
+		catch (err) { return true; }
 	};
 
-	window.getRemoteProfileSyncChanges = function(userData = {}, previousState = {}) {
+	window.getRemoteProfileSyncChanges = function(userData = {}, previousState = {}, payload = {}, username = '') {
 		const changes = { trophies: false, wishlist: false, downloads: false, favorites: false, library: false, friends: false, recentlyVisited: false };
-		if (userData.trophiesData && typeof userData.trophiesData === 'object' && !Array.isArray(userData.trophiesData)) changes.trophies = window.hasProfileSyncDataChanged(previousState.trophies || {}, userData.trophiesData || {});
-		if (Array.isArray(userData.wishlistData)) changes.wishlist = window.hasProfileSyncDataChanged(previousState.wishlist || [], userData.wishlistData || []);
-		if (Array.isArray(userData.downloadsData)) changes.downloads = window.hasProfileSyncDataChanged(previousState.downloads || [], userData.downloadsData || []) || Number(userData.downloadsClearedAt || 0) > Number(previousState.downloadsClearedAt || 0);
-		if (Array.isArray(userData.favoritesData)) changes.favorites = window.hasProfileSyncDataChanged(previousState.favorites || [], userData.favoritesData || []);
-		if (Array.isArray(userData.libraryData)) changes.library = window.hasProfileSyncDataChanged(previousState.library || [], userData.libraryData || []);
-		if (Array.isArray(userData.friendsData)) changes.friends = window.hasProfileSyncDataChanged(previousState.friends || [], userData.friendsData || []);
-		if (Array.isArray(userData.recentlyVisitedData)) changes.recentlyVisited = window.hasProfileSyncDataChanged(previousState.recentlyVisited || [], userData.recentlyVisitedData || []);
+		const owner = String(username || localStorage.getItem('psn_username') || '').trim();
+		const pending = owner ? readPersistentProfileSyncPending(owner) : null;
+		const versionedChanged = (section, previousValue, incomingValue) => {
+			const incomingVersion = getIncomingProfileSectionVersion(section, userData, payload);
+			const localVersion = owner ? getLocalProfileSectionVersion(owner, section, pending) : 0;
+			/* Section timestamps are the protocol authority. If both sides have versions we can
+			   decide in O(1); deep normalization/stringify remains only for legacy zero-version data.
+			   A lower incoming version is stale and must never roll a newer local section backwards. */
+			if (incomingVersion && localVersion) {
+				if (incomingVersion < localVersion) return false;
+				if (incomingVersion > localVersion) return true;
+				if (Array.isArray(previousValue) && Array.isArray(incomingValue) && previousValue.length !== incomingValue.length) return true;
+				return false;
+			}
+			return window.hasProfileSyncDataChanged(previousValue, incomingValue);
+		};
+
+		if (userData.trophiesData && typeof userData.trophiesData === 'object' && !Array.isArray(userData.trophiesData)) {
+			changes.trophies = window.hasProfileSyncDataChanged(previousState.trophies || {}, userData.trophiesData || {});
+		}
+		if (Array.isArray(userData.wishlistData)) changes.wishlist = versionedChanged('wishlist', previousState.wishlist || [], userData.wishlistData || []);
+		if (Array.isArray(userData.downloadsData)) changes.downloads = versionedChanged('downloads', previousState.downloads || [], userData.downloadsData || []);
+		if (Array.isArray(userData.favoritesData)) changes.favorites = versionedChanged('favorites', previousState.favorites || [], userData.favoritesData || []);
+		if (Array.isArray(userData.libraryData)) changes.library = versionedChanged('library', previousState.library || [], userData.libraryData || []);
+		if (Array.isArray(userData.friendsData)) changes.friends = versionedChanged('friends', previousState.friends || [], userData.friendsData || []);
+		if (Array.isArray(userData.recentlyVisitedData)) changes.recentlyVisited = versionedChanged('recentlyvisited', previousState.recentlyVisited || [], userData.recentlyVisitedData || []);
 		changes.anyList = changes.trophies || changes.wishlist || changes.downloads || changes.favorites || changes.library || changes.friends || changes.recentlyVisited;
 		return changes;
 	};
@@ -58246,17 +58281,19 @@ function getVisibleChatStackEl(id) {
 		const lastAppliedProfileUpdatedAt = Number(window.__lastAppliedProfileUpdatedAt || 0);
 		if (incomingProfileUpdatedAt && lastAppliedProfileUpdatedAt && incomingProfileUpdatedAt < lastAppliedProfileUpdatedAt) return;
 
+		/* PROFILE SYNC SNAPSHOT: incoming sections replace the live references; keeping the old
+		   references is enough for realtime diffs. Avoid cloning potentially thousands of items. */
 		const previousProfileSyncState = {
-			trophies: (userData.trophiesData && window.userTrophies && typeof window.userTrophies === 'object') ? JSON.parse(JSON.stringify(window.userTrophies)) : {},
-			wishlist: Array.isArray(userData.wishlistData) && Array.isArray(window.wishlist) ? window.wishlist.slice() : [],
-			downloads: Array.isArray(userData.downloadsData) && Array.isArray(window.downloadHistory) ? window.downloadHistory.slice() : [],
+			trophies: (userData.trophiesData && window.userTrophies && typeof window.userTrophies === 'object') ? window.userTrophies : {},
+			wishlist: Array.isArray(userData.wishlistData) && Array.isArray(window.wishlist) ? window.wishlist : [],
+			downloads: Array.isArray(userData.downloadsData) && Array.isArray(window.downloadHistory) ? window.downloadHistory : [],
 			downloadsClearedAt: Array.isArray(userData.downloadsData) ? Number(localStorage.getItem(`${name}_psn_downloads_cleared_at`) || localStorage.getItem('psn_downloads_cleared_at') || 0) : 0,
-			favorites: Array.isArray(userData.favoritesData) && Array.isArray(window.favoritesLibrary) ? window.favoritesLibrary.slice() : [],
-			library: Array.isArray(userData.libraryData) && Array.isArray(window.lastScannedGames || lastScannedGames) ? (window.lastScannedGames || lastScannedGames).slice() : [],
-			friends: Array.isArray(userData.friendsData) && Array.isArray(window.friendsList) ? window.friendsList.slice() : [],
-			recentlyVisited: Array.isArray(userData.recentlyVisitedData) ? readRecentlyVisitedGames().slice() : []
+			favorites: Array.isArray(userData.favoritesData) && Array.isArray(window.favoritesLibrary) ? window.favoritesLibrary : [],
+			library: Array.isArray(userData.libraryData) && Array.isArray(window.lastScannedGames || lastScannedGames) ? (window.lastScannedGames || lastScannedGames) : [],
+			friends: Array.isArray(userData.friendsData) && Array.isArray(window.friendsList) ? window.friendsList : [],
+			recentlyVisited: Array.isArray(userData.recentlyVisitedData) ? readRecentlyVisitedGames() : []
 		};
-		const profileSyncChanges = (typeof window.getRemoteProfileSyncChanges === 'function') ? window.getRemoteProfileSyncChanges(userData, previousProfileSyncState) : { trophies: true, wishlist: true, downloads: true, favorites: true, library: true, friends: true, recentlyVisited: true, anyList: true };
+		const profileSyncChanges = (typeof window.getRemoteProfileSyncChanges === 'function') ? window.getRemoteProfileSyncChanges(userData, previousProfileSyncState, payload, name) : { trophies: true, wishlist: true, downloads: true, favorites: true, library: true, friends: true, recentlyVisited: true, anyList: true };
 		const previousProfileCountryCode = normalizeProfileCountryCode(localStorage.getItem(`${name}_${STORAGE_KEY_PROFILE_COUNTRY}`) || '');
 		const incomingProfileCountryCode = normalizeProfileCountryCode(userData.countryCode || userData.country_code || userData.country || payload.countryCode || payload.country_code || payload.country || (userData.settingsData && (userData.settingsData.countryCode || userData.settingsData.country_code || userData.settingsData.country)));
 		const profileCountryChanged = !!(incomingProfileCountryCode && previousProfileCountryCode !== incomingProfileCountryCode);
@@ -58416,9 +58453,8 @@ function getVisibleChatStackEl(id) {
 			const profileModal = document.getElementById('modal-sys-profile');
 			const ownProfileOpen = !!(profileModal && profileModal.dataset.profileUsername === name && (profileModal.style.display === 'flex' || profileModal.style.display === 'block' || profileModal.classList.contains('show')));
 			if (ownProfileOpen) {
-				if (profileRoleVisualChanged && typeof openProfileModal === 'function') {
-					openProfileModal(encodeURIComponent(name));
-				} else {
+				if (profileRoleVisualChanged && typeof window.patchOpenProfileRoleBadge === 'function') window.patchOpenProfileRoleBadge(name, userData);
+				{
 					if (userData.avatar) {
 						const cardAvatar = document.getElementById('card-avatar');
 						if (cardAvatar && cardAvatar.getAttribute('src') !== userData.avatar) cardAvatar.setAttribute('src', userData.avatar);
@@ -61851,16 +61887,16 @@ function getVisibleChatStackEl(id) {
 				if (payload.sourceSocketId && socketChat && payload.sourceSocketId === socketChat.id) { respond({ ok: true, ignored: true }); return; }
 				if (typeof window.applyRemoteProfileSync === 'function') window.applyRemoteProfileSync(payload);
 				const userData = payload.userData || payload.data || {};
-				let section = 'core';
-				if (userData.trophiesData) section = 'trophiesData';
-				else if (Array.isArray(userData.downloadsData)) section = 'downloadsData';
-				else if (Array.isArray(userData.wishlistData)) section = 'wishlistData';
-				else if (Array.isArray(userData.favoritesData)) section = 'favoritesData';
-				else if (Array.isArray(userData.libraryData)) section = 'libraryData';
-				else if (Array.isArray(userData.friendsData)) section = 'friendsData';
-				else if (Array.isArray(userData.recentlyVisitedData)) section = 'recentlyVisitedData';
-				if (typeof window.markProfileSectionHydrated === 'function' && section !== 'core') window.markProfileSectionHydrated(section);
-				respond({ ok: true, section });
+				const hydratedSections = [];
+				if (userData.trophiesData && typeof userData.trophiesData === 'object') hydratedSections.push('trophiesData');
+				if (Array.isArray(userData.downloadsData)) hydratedSections.push('downloadsData');
+				if (Array.isArray(userData.wishlistData)) hydratedSections.push('wishlistData');
+				if (Array.isArray(userData.favoritesData)) hydratedSections.push('favoritesData');
+				if (Array.isArray(userData.libraryData)) hydratedSections.push('libraryData');
+				if (Array.isArray(userData.friendsData)) hydratedSections.push('friendsData');
+				if (Array.isArray(userData.recentlyVisitedData)) hydratedSections.push('recentlyVisitedData');
+				if (typeof window.markProfileSectionHydrated === 'function') hydratedSections.forEach(section => window.markProfileSectionHydrated(section));
+				respond({ ok: true, section: hydratedSections[0] || 'core', sections: hydratedSections });
 			} catch (err) {
 				console.warn('[PROFILE SYNC] Could not acknowledge profile data:', err);
 				respond({ ok: false, error: err && err.message ? err.message : 'Profile data could not be applied.' });
