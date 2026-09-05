@@ -712,6 +712,29 @@ app.get('/api/metadata/steam/details', async (req, res) => {
 });
 
 let userDatabase = {};
+let userNameIndexDirty = true;
+let userNameIndexAlpha = [];
+let userNameIndexByLength = [];
+let userNameLookupLower = new Map();
+
+function markUserNameIndexDirty() {
+  userNameIndexDirty = true;
+}
+
+function rebuildUserNameIndexes() {
+  const entries = Object.keys(userDatabase)
+    .filter(Boolean)
+    .map(name => ({ name, lower: name.toLowerCase() }));
+  userNameIndexAlpha = entries.slice().sort((a, b) => a.lower.localeCompare(b.lower));
+  userNameIndexByLength = entries.slice().sort((a, b) => (b.name.length - a.name.length) || a.lower.localeCompare(b.lower));
+  userNameLookupLower = new Map(entries.map(entry => [entry.lower, entry.name]));
+  userNameIndexDirty = false;
+}
+
+function ensureUserNameIndexes() {
+  if (userNameIndexDirty) rebuildUserNameIndexes();
+}
+
 let userCacheMeta = {};
 let userCacheLastFullRefresh = 0;
 let userCacheRefreshInFlight = null;
@@ -2762,6 +2785,7 @@ function scheduleTrophyStatsRefreshBroadcast(delayMs = 1500) {
 async function refreshSingleUserSummaryFromDb(name, options = {}) {
   const safeName = normalizeText(name, '');
   if (!safeName) return null;
+  const hadCachedUser = Object.prototype.hasOwnProperty.call(userDatabase, safeName);
 
   const userRes = await queryDbWithRetry(`
     SELECT
@@ -2778,6 +2802,7 @@ async function refreshSingleUserSummaryFromDb(name, options = {}) {
 
   if (!userRes.rows.length) {
     delete userDatabase[safeName];
+    if (hadCachedUser) markUserNameIndexDirty();
     delete userCacheMeta[safeName];
     fullUserCacheNames.delete(safeName);
     invalidateOnlineListCache('single-user-summary-missing');
@@ -2800,6 +2825,7 @@ async function refreshSingleUserSummaryFromDb(name, options = {}) {
     id: preserveOnline ? (localUser.id || summaryData.id || null) : (summaryData.id || null),
     lastSeen: preserveOnline ? (localUser.lastSeen || summaryData.lastSeen || null) : (summaryData.lastSeen || null)
   };
+  if (!hadCachedUser) markUserNameIndexDirty();
   fullUserCacheNames.delete(safeName);
   userCacheMeta[safeName] = Date.now();
   if (options.invalidateOnlineList !== false) invalidateOnlineListCache('single-user-summary-refresh');
@@ -2857,6 +2883,7 @@ async function refreshAllUsersCacheFromDb(options = {}) {
     });
 
     userDatabase = nextDatabase;
+    markUserNameIndexDirty();
     userCacheMeta = nextMeta;
     fullUserCacheNames.clear();
     nextFullNames.forEach(name => fullUserCacheNames.add(name));
@@ -2888,11 +2915,13 @@ async function refreshAllUsersCacheFromDb(options = {}) {
 async function refreshSingleUserCacheFromDb(name, options = {}) {
   const safeName = normalizeText(name, "");
   if (!safeName) return null;
+  const hadCachedUser = Object.prototype.hasOwnProperty.call(userDatabase, safeName);
   if (userProfileWriteInFlight.has(safeName) && options.forceDuringWrite !== true) return userDatabase[safeName] || null;
 
   const userRes = await queryDbWithRetry('SELECT data FROM users WHERE name = $1', [safeName], { attempts: 3, label: 'USER PROFILE READ' });
   if (!userRes.rows.length) {
     delete userDatabase[safeName];
+    if (hadCachedUser) markUserNameIndexDirty();
     delete userCacheMeta[safeName];
     invalidateOnlineListCache("single-user-missing");
     return null;
@@ -2908,6 +2937,7 @@ async function refreshSingleUserCacheFromDb(name, options = {}) {
     id: preserveOnline ? (localUser.id || dbUser.id || null) : (dbUser.id || null),
     lastSeen: preserveOnline ? (localUser.lastSeen || dbUser.lastSeen || null) : (dbUser.lastSeen || null)
   };
+  if (!hadCachedUser) markUserNameIndexDirty();
   userCacheMeta[safeName] = Date.now();
   fullUserCacheNames.add(safeName);
   invalidateOnlineListCache("single-user-refresh");
@@ -2963,10 +2993,13 @@ function searchUserNamesFromCache(query) {
   const searchTerm = normalizeText(query, '').toLowerCase();
   const isAllCommand = (searchTerm === '@all' || searchTerm === '*');
   if (!isAllCommand && searchTerm.length < 2) return [];
-  return Object.keys(userDatabase)
-    .filter(username => isAllCommand || username.toLowerCase().includes(searchTerm))
-    .sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()))
-    .map(name => name);
+  ensureUserNameIndexes();
+  if (isAllCommand) return userNameIndexAlpha.map(entry => entry.name);
+  const matches = [];
+  for (const entry of userNameIndexAlpha) {
+    if (entry.lower.includes(searchTerm)) matches.push(entry.name);
+  }
+  return matches;
 }
 
 function searchUsersFromCache(query, includeAdminFields = false, includeAllMatches = false) {
@@ -2974,10 +3007,14 @@ function searchUsersFromCache(query, includeAdminFields = false, includeAllMatch
   const isAllCommand = (searchTerm === '@all' || searchTerm === '*');
   if (!isAllCommand && searchTerm.length < 2) return [];
 
-  const matches = Object.keys(userDatabase)
-    .filter(username => isAllCommand || username.toLowerCase().includes(searchTerm))
-    .sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()));
-  const visibleMatches = (isAllCommand || includeAllMatches) ? matches : matches.slice(0, 15);
+  ensureUserNameIndexes();
+  const visibleMatches = [];
+  const limit = (isAllCommand || includeAllMatches) ? Infinity : 15;
+  for (const entry of userNameIndexAlpha) {
+    if (!isAllCommand && !entry.lower.includes(searchTerm)) continue;
+    visibleMatches.push(entry.name);
+    if (visibleMatches.length >= limit) break;
+  }
   return visibleMatches.map(username => getPublicUserData(username, userDatabase[username], includeAdminFields));
 }
 
@@ -7222,8 +7259,8 @@ function resolveKnownNotificationUserName(value) {
   const requested = normalizeUserNotificationName(value);
   if (!requested) return '';
   if (userDatabase[requested]) return requested;
-  const lower = requested.toLowerCase();
-  return Object.keys(userDatabase).find(name => name.toLowerCase() === lower) || '';
+  ensureUserNameIndexes();
+  return userNameLookupLower.get(requested.toLowerCase()) || '';
 }
 
 function getChatNotificationPreview(text) {
@@ -7241,13 +7278,13 @@ function extractChatMentionTargets(text, senderName) {
   const senderLower = String(senderName || '').toLowerCase();
   const occupied = [];
   const found = [];
-  const names = Object.keys(userDatabase)
-    .filter(name => name && name.toLowerCase() !== senderLower)
-    .sort((a, b) => b.length - a.length);
+  ensureUserNameIndexes();
   const isBoundary = ch => !ch || /[\s.,!?;:()\[\]{}<>"'`]/.test(ch);
 
-  names.forEach(name => {
-    const needle = `@${name.toLowerCase()}`;
+  userNameIndexByLength.forEach(entry => {
+    if (!entry.name || entry.lower === senderLower) return;
+    const name = entry.name;
+    const needle = `@${entry.lower}`;
     let from = 0;
     while (from < lowerSource.length) {
       const index = lowerSource.indexOf(needle, from);
@@ -7790,12 +7827,14 @@ function resolveCommandTarget(rawArgs = "", options = {}) {
   const allowOnlyBanned = options.onlyBanned === true;
   const withoutAt = args.startsWith('@') ? args.slice(1).trim() : args;
   const lowerArgs = withoutAt.toLowerCase();
-  const names = Object.keys(userDatabase)
-    .filter(name => !allowOnlyBanned || isUserBanned(userDatabase[name]))
-    .sort((a, b) => b.length - a.length);
+  ensureUserNameIndexes();
+  const names = allowOnlyBanned
+    ? userNameIndexByLength.filter(entry => isUserBanned(userDatabase[entry.name]))
+    : userNameIndexByLength;
 
-  for (const name of names) {
-    const lowerName = name.toLowerCase();
+  for (const entry of names) {
+    const name = entry.name;
+    const lowerName = entry.lower;
     if (lowerArgs === lowerName || lowerArgs.startsWith(`${lowerName} `)) {
       return {
         targetName: name,
@@ -7805,10 +7844,10 @@ function resolveCommandTarget(rawArgs = "", options = {}) {
   }
 
   const firstToken = withoutAt.split(/\s+/)[0] || "";
-  const exact = names.find(name => name.toLowerCase() === firstToken.toLowerCase());
-  if (exact) {
+  const exactEntry = names.find(entry => entry.lower === firstToken.toLowerCase());
+  if (exactEntry) {
     return {
-      targetName: exact,
+      targetName: exactEntry.name,
       rest: withoutAt.slice(firstToken.length).trim()
     };
   }
@@ -7911,6 +7950,7 @@ async function deleteUserAccount(targetName, reason, adminName) {
   await notifyProfileSyncAcrossInstances(targetName, null, Date.now());
 
   delete userDatabase[targetName];
+  markUserNameIndexDirty();
   delete userCacheMeta[targetName];
   fullUserCacheNames.delete(targetName);
   clearGamePlayersSummaryCache();
@@ -8219,6 +8259,7 @@ io.on('connection', (socket) => {
           socket.role = getUserRole(name, dbUser);
 
           const serverUser = buildCompactUserSummary(name, dbUser);
+          const authCacheHadUser = Object.prototype.hasOwnProperty.call(userDatabase, name);
 
           userDatabase[name] = {
             ...serverUser,
@@ -8230,6 +8271,7 @@ io.on('connection', (socket) => {
             banned: isUserBanned(serverUser),
             profileUpdatedAt: normalizeTimestampValue(serverUser.profileUpdatedAt)
           };
+          if (!authCacheHadUser) markUserNameIndexDirty();
           USER_HEAVY_CACHE_KEYS.forEach(key => delete userDatabase[name][key]);
           userCacheMeta[name] = Date.now();
           fullUserCacheNames.delete(name);
@@ -8321,6 +8363,7 @@ io.on('connection', (socket) => {
           migratedAt: new Date().toISOString(),
           profileUpdatedAt: Date.now()
         });
+        markUserNameIndexDirty();
         socket.role = getUserRole(name, userDatabase[name]);
         socket.profileSyncV2 = supportsProfileSyncV2;
         socket.profileSyncAckV1 = supportsProfileSyncAckV1;
@@ -9607,9 +9650,12 @@ io.on('connection', (socket) => {
         seen.add(key);
         uniqueNames.push({ name, key });
       });
-      const cacheNames = new Map(Object.keys(userDatabase).map(name => [name.toLowerCase(), name]));
+      // v31 already maintains a case-insensitive username index for mentions/admin search.
+      // Reuse it here instead of rebuilding a lowercase Map of every registered user for each
+      // friends-presence request.
+      ensureUserNameIndexes();
       const users = uniqueNames.map(item => {
-        const exactName = cacheNames.get(item.key);
+        const exactName = userNameLookupLower.get(item.key);
         return exactName ? getPublicUserData(exactName, userDatabase[exactName], false) : null;
       }).filter(Boolean);
       respond({ success: true, users, serverTime: Date.now() });
