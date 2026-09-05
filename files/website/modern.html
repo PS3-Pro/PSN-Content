@@ -30163,6 +30163,7 @@ P
 	};
 
 	window.refreshOpenProfileListCovers = function() {
+		window.__profileListVisualRevision = Number(window.__profileListVisualRevision || 0) + 1;
 		const modal = document.getElementById('modal-sys-list');
 		const last = window.__lastProfileListRender;
 		if (!modal || !last || !['downloads', 'wishlist', 'library', 'favs', 'favorites'].includes(last.listType)) return;
@@ -70883,6 +70884,9 @@ function getVisibleChatStackEl(id) {
 			return;
 		}
 
+		if (responseType === 'downloads' && Array.isArray(data.rawData) && window.__profileListNormalizedDownloadSources) {
+			window.__profileListNormalizedDownloadSources.add(data.rawData);
+		}
 		if (typeof renderFetchedList === 'function') {
 			renderFetchedList(responseTarget, responseType, data.rawData);
 		}
@@ -71008,7 +71012,7 @@ function getVisibleChatStackEl(id) {
 		const normalized = window.normalizeProfileListGroupingType(listType);
 		if (normalized === 'wishlist') return Array.isArray(window.wishlist) ? window.wishlist : [];
 		if (normalized === 'downloads') {
-			if (typeof normalizeDownloadHistoryRecords === 'function') return normalizeDownloadHistoryRecords(window.downloadHistory || []).history;
+			// Live downloadHistory is canonicalized at mutation/profile-sync time; do not regroup it again for profile grouping.
 			return Array.isArray(window.downloadHistory) ? window.downloadHistory : [];
 		}
 		if (normalized === 'favs') return Array.isArray(window.favoritesLibrary) ? window.favoritesLibrary : [];
@@ -71072,21 +71076,18 @@ function getVisibleChatStackEl(id) {
 
 	window.decorateRemoteProfileListWithSharedGroups = function(targetUser, listType, dataArray) {
 		const normalized = window.normalizeProfileListGroupingType(listType);
-		const source = Array.isArray(dataArray) ? dataArray.slice() : [];
+		const source = Array.isArray(dataArray) ? dataArray : [];
 		const currentUser = localStorage.getItem('psn_username') || 'Guest';
 		if (!source.length || !targetUser || targetUser === currentUser) return { items: source, sharedCount: 0, otherCount: source.length };
 		if (!['library', 'wishlist', 'downloads', 'favs'].includes(normalized)) return { items: source, sharedCount: 0, otherCount: source.length };
 
-		const ownData = window.getOwnProfileListDataForComparison(normalized);
-		if (!Array.isArray(ownData) || !ownData.length) return { items: source, sharedCount: 0, otherCount: source.length };
-
-		const ownKeys = new Set(ownData.map(item => window.getComparableProfileListItemKey(item, normalized)).filter(Boolean));
+		const ownKeys = window.getProfileListOwnComparableKeySet(normalized);
 		if (!ownKeys.size) return { items: source, sharedCount: 0, otherCount: source.length };
 
 		const shared = [];
 		const other = [];
 		source.forEach(item => {
-			const key = window.getComparableProfileListItemKey(item, normalized);
+			const key = window.getCachedComparableProfileListItemKey(item, normalized);
 			(key && ownKeys.has(key) ? shared : other).push(item);
 		});
 
@@ -71103,7 +71104,179 @@ function getVisibleChatStackEl(id) {
 	};
 
 
-	window.getProfileListDomSignature = function(value) {
+
+	/* PROFILE LIST PERF v67:
+	   - list-level render tokens avoid deep array signatures when a reliable section revision/reference exists
+	   - shared-item grouping caches the viewer's comparable-key Set
+	   - row HTML caches keep unchanged profile-list rows out of the expensive cover/store-resolution path
+	*/
+	window.__profileListObjectIds = window.__profileListObjectIds || new WeakMap();
+	window.__profileListObjectIdSeq = Number(window.__profileListObjectIdSeq || 0);
+	window.__profileListDomSignatureCache = window.__profileListDomSignatureCache || new WeakMap();
+	window.__profileListComparableKeyCache = window.__profileListComparableKeyCache || new WeakMap();
+	window.__profileListRowHtmlCaches = window.__profileListRowHtmlCaches || new Map();
+	window.__profileListSharedOwnKeyCache = window.__profileListSharedOwnKeyCache || new Map();
+	window.__profileListNormalizedDownloadSources = window.__profileListNormalizedDownloadSources || new WeakSet();
+	window.__profileListNormalizedDownloadCache = window.__profileListNormalizedDownloadCache || new WeakMap();
+	window.__profileListVisualRevision = Number(window.__profileListVisualRevision || 0);
+
+	window.getProfileListObjectId = function(value) {
+		if (!value || (typeof value !== 'object' && typeof value !== 'function')) return 'primitive';
+		let id = window.__profileListObjectIds.get(value);
+		if (!id) {
+			id = ++window.__profileListObjectIdSeq;
+			window.__profileListObjectIds.set(value, id);
+		}
+		return String(id);
+	};
+
+	window.getProfileListRenderToken = function(targetUser, listType, rawData) {
+		const normalized = window.normalizeProfileListGroupingType(listType);
+		if (normalized === 'trophies') return { token: '', reliable: false };
+		const currentUser = localStorage.getItem('psn_username') || 'Guest';
+		const length = Array.isArray(rawData) ? rawData.length : (rawData && typeof rawData === 'object' ? Object.keys(rawData).length : 0);
+		const refId = window.getProfileListObjectId(rawData);
+		if (targetUser === currentUser) {
+			const timestampType = normalized === 'favs' ? 'favorites' : normalized;
+			if (['downloads', 'wishlist', 'favorites', 'library'].includes(timestampType)) {
+				const stampKey = `${targetUser}_${getProfileListTimestampStorageKey(timestampType)}`;
+				const stamp = normalizeProfileListTimestamp(localStorage.getItem(stampKey));
+				if (stamp) {
+					const structuralRevision = timestampType === 'library'
+						? Number(window.__libraryDataRevision || 0)
+						: (timestampType === 'favorites' ? Number(window.__favoritesDataRevision || 0) : 0);
+					return { token: `self:${timestampType}:${stamp}:${structuralRevision}:${length}:${refId}`, reliable: true };
+				}
+			}
+			return { token: '', reliable: false };
+		}
+		// Remote profile-list arrays are immutable snapshots: every server/cache fetch gives renderFetchedList a fresh array.
+		if (rawData && typeof rawData === 'object') return { token: `remote:${normalized}:${length}:${refId}`, reliable: true };
+		return { token: '', reliable: false };
+	};
+
+	window.getProfileListItemQuickFingerprint = function(item, listType) {
+		if (!item || typeof item !== 'object') return String(item == null ? '' : item);
+		const normalized = window.normalizeProfileListGroupingType(listType);
+		if (item.__profileListGroupDivider === true) return `group|${item.tone || ''}|${item.label || ''}|${Number(item.count) || 0}`;
+		if (normalized === 'trophies') {
+			return [
+				item.id, item.title, item.desc, item.type, item.unlocked ? 1 : 0, item.unlockDate,
+				item.hidden ? 1 : 0, item.rarity, item.rarityPercent
+			].join('\x1f');
+		}
+		return [
+			item.titleId, item.titleID, item.titleid, item.id,
+			item.contentId, item.contentID, item.cleanName, item.name, item.title, item.rawName,
+			item.category, item.rawCategory, item.cTag, item.console, item.region,
+			item.path, item.cover, item.noBingCover ? 1 : 0,
+			item.date, item.lastPlayed, item.lastDownloadedAt, item.downloadCount,
+			item.sentToPs3 ? 1 : 0, item.sizeText, item.size, item.sizeBytes
+		].join('\x1f');
+	};
+
+	window.getCachedComparableProfileListItemKey = function(item, listType) {
+		if (!item || typeof item !== 'object') return '';
+		const normalized = window.normalizeProfileListGroupingType(listType);
+		const fingerprint = window.getProfileListItemQuickFingerprint(item, normalized);
+		let byType = window.__profileListComparableKeyCache.get(item);
+		if (!byType) {
+			byType = Object.create(null);
+			window.__profileListComparableKeyCache.set(item, byType);
+		}
+		const cached = byType[normalized];
+		if (cached && cached.fingerprint === fingerprint) return cached.key;
+		const key = window.getComparableProfileListItemKey(item, normalized);
+		byType[normalized] = { fingerprint, key };
+		return key;
+	};
+
+	window.getProfileListRowHtmlCache = function(ownerKey) {
+		const caches = window.__profileListRowHtmlCaches;
+		let cache = caches.get(ownerKey);
+		if (!cache) {
+			cache = new Map();
+			caches.set(ownerKey, cache);
+		} else {
+			// refresh LRU order
+			caches.delete(ownerKey);
+			caches.set(ownerKey, cache);
+		}
+		while (caches.size > 4) {
+			const oldest = caches.keys().next().value;
+			if (oldest === undefined) break;
+			caches.delete(oldest);
+		}
+		return cache;
+	};
+
+	window.getProfileListOwnComparisonToken = function(listType, data) {
+		const normalized = window.normalizeProfileListGroupingType(listType);
+		const currentUser = localStorage.getItem('psn_username') || 'Guest';
+		const timestampType = normalized === 'favs' ? 'favorites' : normalized;
+		const length = Array.isArray(data) ? data.length : 0;
+		let stamp = 0;
+		if (['downloads', 'wishlist', 'favorites', 'library'].includes(timestampType)) {
+			stamp = normalizeProfileListTimestamp(localStorage.getItem(`${currentUser}_${getProfileListTimestampStorageKey(timestampType)}`));
+		}
+		const structuralRevision = timestampType === 'library'
+			? Number(window.__libraryDataRevision || 0)
+			: (timestampType === 'favorites' ? Number(window.__favoritesDataRevision || 0) : 0);
+		return `${timestampType}:${stamp}:${structuralRevision}:${length}:${window.getProfileListObjectId(data)}`;
+	};
+
+	window.getProfileListOwnComparableKeySet = function(listType) {
+		const normalized = window.normalizeProfileListGroupingType(listType);
+		const ownData = window.getOwnProfileListDataForComparison(normalized);
+		const token = window.getProfileListOwnComparisonToken(normalized, ownData);
+		const cached = window.__profileListSharedOwnKeyCache.get(normalized);
+		if (cached && cached.token === token) return cached.keys;
+		const keys = new Set();
+		for (let i = 0; i < ownData.length; i++) {
+			const key = window.getCachedComparableProfileListItemKey(ownData[i], normalized);
+			if (key) keys.add(key);
+		}
+		window.__profileListSharedOwnKeyCache.set(normalized, { token, keys });
+		return keys;
+	};
+
+	window.getPreparedProfileDownloadsForRender = function(targetUser, rawData, isMe) {
+		const source = Array.isArray(rawData) ? rawData : [];
+		if (isMe || window.__profileListNormalizedDownloadSources.has(source)) return source;
+		const cached = window.__profileListNormalizedDownloadCache.get(source);
+		if (cached) return cached;
+		const normalized = (typeof normalizeDownloadHistoryRecords === 'function')
+			? normalizeDownloadHistoryRecords(source).history
+			: source;
+		if (normalized && typeof normalized === 'object') window.__profileListNormalizedDownloadSources.add(normalized);
+		window.__profileListNormalizedDownloadCache.set(source, normalized);
+		return normalized;
+	};
+
+	window.getProfileListDownloadStableSignature = function(item) {
+		const raw = [
+			item && item.titleId, item && item.titleID, item && item.titleid, item && item.id,
+			item && item.contentId, item && item.contentID, item && item.cleanName, item && item.name,
+			item && item.title, item && item.rawName, item && item.category, item && item.rawCategory,
+			item && item.cTag, item && item.console, item && item.region, item && item.path,
+			item && item.cover, item && item.noBingCover ? 1 : 0,
+			item && item.sentToPs3 ? 1 : 0, item && item.sizeText, item && item.size, item && item.sizeBytes
+		].join('\x1f');
+		let hash = 2166136261;
+		for (let i = 0; i < raw.length; i++) {
+			hash ^= raw.charCodeAt(i);
+			hash = Math.imul(hash, 16777619);
+		}
+		return (hash >>> 0).toString(36);
+	};
+
+	window.getProfileListDomSignature = function(value, quickFingerprint = '') {
+		const cacheable = !!(value && typeof value === 'object');
+		const fingerprint = String(quickFingerprint || '');
+		if (cacheable && fingerprint) {
+			const cached = window.__profileListDomSignatureCache.get(value);
+			if (cached && cached.fingerprint === fingerprint) return cached.signature;
+		}
 		let raw = '';
 		try {
 			raw = typeof window.getProfileSyncComparableSignature === 'function'
@@ -71117,7 +71290,9 @@ function getVisibleChatStackEl(id) {
 			hash ^= raw.charCodeAt(i);
 			hash = Math.imul(hash, 16777619);
 		}
-		return (hash >>> 0).toString(36);
+		const signature = (hash >>> 0).toString(36);
+		if (cacheable && fingerprint) window.__profileListDomSignatureCache.set(value, { fingerprint, signature });
+		return signature;
 	};
 
 	window.reconcileProfileListHtml = function(body, html, options = {}) {
@@ -71204,7 +71379,12 @@ function getVisibleChatStackEl(id) {
 		const titleEl = document.getElementById('list-modal-title');
 		const myName = localStorage.getItem('psn_username') || "Guest";
 		const isMe = (targetUser === myName);
-		const profileListRenderSignature = (typeof window.getProfileSyncComparableSignature === 'function') ? window.getProfileSyncComparableSignature(rawData || []) : JSON.stringify(rawData || []);
+		const profileListRenderTokenState = (typeof window.getProfileListRenderToken === 'function')
+			? window.getProfileListRenderToken(targetUser, listType, rawData)
+			: { token: '', reliable: false };
+		const profileListRenderSignature = profileListRenderTokenState.reliable
+			? profileListRenderTokenState.token
+			: ((typeof window.getProfileSyncComparableSignature === 'function') ? window.getProfileSyncComparableSignature(rawData || []) : JSON.stringify(rawData || []));
 		const lastProfileListRender = window.__lastProfileListRender;
 		const bodyHasProfileListLoader = !!(body && body.querySelector && body.querySelector('.profile-ps-list-loader'));
 		const isLiveProfileListRefresh = !!(lastProfileListRender
@@ -71249,7 +71429,7 @@ function getVisibleChatStackEl(id) {
 			dataArray.sort((a, b) => weight[a.type] - weight[b.type]);
 		} else {
 			dataArray = Array.isArray(rawData) ? rawData : [];
-			if (listType === 'downloads') dataArray = normalizeDownloadHistoryRecords(dataArray).history;
+			if (listType === 'downloads') dataArray = window.getPreparedProfileDownloadsForRender(targetUser, dataArray, isMe);
 		}
 	
 		let titleCountPill = titleEl ? titleEl.querySelector('.profile-list-modal-count') : null;
@@ -71267,7 +71447,7 @@ function getVisibleChatStackEl(id) {
 		const profileListBaseKeys = renderItems.map((item, index) => {
 			if (item && item.__profileListGroupDivider === true) return `group:${item.tone || 'other'}`;
 			if (isTrophyView) return `trophy:${String(item && item.id || index)}`;
-			const comparableKey = typeof window.getComparableProfileListItemKey === 'function' ? window.getComparableProfileListItemKey(item, listType) : '';
+			const comparableKey = typeof window.getCachedComparableProfileListItemKey === 'function' ? window.getCachedComparableProfileListItemKey(item, listType) : '';
 			return comparableKey || `row:${index}`;
 		});
 		const profileListBaseKeyCounts = new Map();
@@ -71305,26 +71485,43 @@ function getVisibleChatStackEl(id) {
 		
 		const pModal = document.getElementById('modal-sys-profile');
 		const returnToOnline = (pModal && pModal.dataset.returnToOnline === "true") ? "true" : "false";
+		const profileListRowCacheOwner = `${targetUser}|${listType}`;
+		const profileListRowCache = window.getProfileListRowHtmlCache(profileListRowCacheOwner);
+		const profileListRowContextToken = [
+			profileListRowCacheOwner,
+			isMe ? 'self' : 'remote',
+			bgView,
+			returnToOnline,
+			Number(window.__psnStoreCacheRevision || 0),
+			Number(window.__libraryDataRevision || 0),
+			Number(window.__profileListVisualRevision || 0)
+		].join('|');
 	
 		const buildProfileListItemsHtml = function(items, startIndex = 0) {
 			let html = '';
 			items.forEach((item, itemIndex) => {
 				const profileListIndex = startIndex + itemIndex;
 				const profileListDomKey = window.escapePlayerListText(getProfileListDomKey(profileListIndex));
-				const profileListDomSignature = window.getProfileListDomSignature(item);
+				const profileListQuickFingerprint = window.getProfileListItemQuickFingerprint(item, listType);
+				const profileListDomSignature = window.getProfileListDomSignature(item, profileListQuickFingerprint);
 				let profileListStableSignature = profileListDomSignature;
 				if (listType === 'downloads' && item && typeof item === 'object' && !Array.isArray(item) && item.__profileListGroupDivider !== true) {
-					const stableItem = { ...item };
-					delete stableItem.downloadCount;
-					delete stableItem.lastDownloadedAt;
-					delete stableItem.date;
-					profileListStableSignature = window.getProfileListDomSignature(stableItem);
+					profileListStableSignature = window.getProfileListDownloadStableSignature(item);
 				}
 				if (item && item.__profileListGroupDivider === true) {
 					const dividerHtml = typeof window.getProfileListGroupDividerHtml === 'function' ? window.getProfileListGroupDividerHtml(item) : '';
 					html += dividerHtml.replace('<div ', `<div data-profile-list-key="${profileListDomKey}" data-profile-list-signature="${profileListDomSignature}" `);
 					return;
 				}
+				const cachedProfileListRow = profileListRowCache.get(profileListDomKey);
+				if (cachedProfileListRow
+					&& cachedProfileListRow.signature === profileListDomSignature
+					&& cachedProfileListRow.stableSignature === profileListStableSignature
+					&& cachedProfileListRow.context === profileListRowContextToken) {
+					html += cachedProfileListRow.html;
+					return;
+				}
+				const profileListRowHtmlStart = html.length;
 				if (isTrophyView) {
 					const colors = { bronze: '#cd7f32', silver: '#c0c0c0', gold: '#ffcc00', platinum: '#00f0ff' };
 					const rgbColors = { bronze: '205, 127, 50', silver: '192, 192, 192', gold: '255, 204, 0', platinum: '0, 240, 255' };
@@ -71505,6 +71702,13 @@ function getVisibleChatStackEl(id) {
 							<div class="dl-side-info" style="text-align: right;"><span class="dl-size-tag" style="font-size: 12px; color: var(--text-muted);">${item.sizeText || item.size || ''}</span>${searchTagHtml}</div>
 						</div>`;
 				}
+				const generatedProfileListRowHtml = html.slice(profileListRowHtmlStart);
+				profileListRowCache.set(profileListDomKey, {
+					signature: profileListDomSignature,
+					stableSignature: profileListStableSignature,
+					context: profileListRowContextToken,
+					html: generatedProfileListRowHtml
+				});
 			});
 			return html;
 		};
