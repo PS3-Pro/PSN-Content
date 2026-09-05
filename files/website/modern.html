@@ -35022,6 +35022,28 @@ P
 		return `<span class="user-role-pill role-${role}${ctxClass}" title="${window.getPsnRoleLabel(role)}"><i class="fas ${window.getPsnRoleIcon(role)}"></i>${window.getPsnRoleLabel(role)}</span>`;
 	};
 
+	window.patchOpenProfileRoleBadge = function(username, user = {}) {
+		const modal = document.getElementById('modal-sys-profile');
+		const nameEl = document.getElementById('profile-name-val');
+		if (!modal || !nameEl || String(modal.dataset.profileUsername || '') !== String(username || '')) return false;
+		const host = nameEl.parentElement;
+		if (!host) return false;
+		const oldBadge = host.querySelector('.user-role-pill.profile-role');
+		const badgeHtml = typeof window.buildPsnRoleBadge === 'function' ? window.buildPsnRoleBadge(username, user, 'profile') : '';
+		let nextBadge = null;
+		if (badgeHtml) {
+			const staging = document.createElement('div');
+			staging.innerHTML = badgeHtml;
+			nextBadge = staging.firstElementChild;
+		}
+		if (!nextBadge) { if (oldBadge) oldBadge.remove(); return !!oldBadge; }
+		if (oldBadge) {
+			if (oldBadge.outerHTML === nextBadge.outerHTML) return false;
+			oldBadge.replaceWith(nextBadge);
+		} else nameEl.insertAdjacentElement('afterend', nextBadge);
+		return true;
+	};
+
 	window.syncPsnUserMeta = function(user, options = {}) {
 		if (!user || typeof user !== 'object') return;
 		const name = user.name || user.user || user.username || user.onlineId;
@@ -48767,6 +48789,47 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 	window.__lastRewardsRenderSignature = '';
 	window.__rewardRequirementSetCache = { source: null, length: -1, set: new Set() };
 	window.__rewardDefinitionSignatureCache = { source: null, length: -1, signature: '[]' };
+	window.__trophyIdCache = { source: null, ids: [] };
+	window.__trophyRewardByReqCache = { source: null, length: -1, map: new Map() };
+	window.__trophyGradeInputsCache = null;
+
+	function psnGetTrophyIds() {
+		const source = typeof TROPHY_DATA !== 'undefined' ? TROPHY_DATA : {};
+		const cached = window.__trophyIdCache;
+		if (cached && cached.source === source) return cached.ids;
+		const ids = Object.keys(source);
+		window.__trophyIdCache = { source, ids };
+		return ids;
+	}
+
+	function psnGetRewardByRequirementMap() {
+		const rewards = Array.isArray(window.REWARDS_DATA) ? window.REWARDS_DATA : [];
+		const cached = window.__trophyRewardByReqCache;
+		if (cached && cached.source === rewards && cached.length === rewards.length) return cached.map;
+		const map = new Map();
+		for (let i = 0; i < rewards.length; i++) {
+			const reward = rewards[i];
+			if (reward && reward.req && !map.has(reward.req)) map.set(reward.req, reward);
+		}
+		window.__trophyRewardByReqCache = { source: rewards, length: rewards.length, map };
+		return map;
+	}
+
+	function getTrophyRarityMeta(realPercent) {
+		const pct = Math.max(0, Number(realPercent) || 0.1);
+		let rarityText = 'Common';
+		let t1Color = 'rgba(255,255,255,0.15)', t2Color = 'rgba(255,255,255,0.15)', t3Color = 'rgba(255,255,255,0.15)', t4Color = 'rgba(255,255,255,0.15)';
+		if (pct <= 5) { rarityText = 'Ultra Rare'; t1Color = '#00f0ff'; }
+		else if (pct <= 15) { rarityText = 'Very Rare'; t2Color = '#ffcc00'; }
+		else if (pct <= 35) { rarityText = 'Rare'; t3Color = '#c0c0c0'; }
+		else t4Color = '#cd7f32';
+		return { pct, rarityText, t1Color, t2Color, t3Color, t4Color };
+	}
+
+	function getTrophyRarityHtml(realPercent) {
+		const meta = getTrophyRarityMeta(realPercent);
+		return `<svg viewBox="0 0 24 24" width="14" height="14" style="margin-right: 4px; transform: translateY(2px); flex-shrink: 0;"><path d="M12,1 L15,7 L9,7 Z" fill="${meta.t1Color}" /><path d="M8.5,8 L15.5,8 L17.5,12 L6.5,12 Z" fill="${meta.t2Color}" /><path d="M6,13 L18,13 L20,17 L4,17 Z" fill="${meta.t3Color}" /><path d="M3.5,18 L20.5,18 L23,23 L1,23 Z" fill="${meta.t4Color}" /></svg>${meta.rarityText}<span style="opacity: 0.3; margin: 0 6px; transform: translateY(-1px);">|</span>Earned by ${meta.pct.toFixed(1)}% of players`;
+	}
 
 	function psnGetRewardRequirementSet() {
 		const rewards = Array.isArray(window.REWARDS_DATA) ? window.REWARDS_DATA : [];
@@ -48800,7 +48863,9 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 	function psnTrophyRenderSignature() {
 		const filterSelect = document.getElementById('trophy-filter-select');
 		const sortSelect = document.getElementById('trophy-sort-select');
-		const grades = Array.from(document.querySelectorAll('#trophy-grade-filters input:checked')).map(cb => cb.value);
+		if (!Array.isArray(window.__trophyGradeInputsCache) || window.__trophyGradeInputsCache.some(input => !input || !input.isConnected)) window.__trophyGradeInputsCache = Array.from(document.querySelectorAll('#trophy-grade-filters input'));
+		const grades = [];
+		for (let i = 0; i < window.__trophyGradeInputsCache.length; i++) { const input = window.__trophyGradeInputsCache[i]; if (input && input.checked) grades.push(input.value); }
 		try {
 			return JSON.stringify({
 				trophies: window.userTrophies || {},
@@ -49033,7 +49098,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 		if (!window.userTrophies) window.userTrophies = {};
 		if (!window.globalTrophyStats) window.globalTrophyStats = {};
 		
-		const allIds = Object.keys(TROPHY_DATA);
+		const allIds = psnGetTrophyIds();
 		let counts = { bronze: 0, silver: 0, gold: 0, platinum: 0 };
 		let totalUnlocked = 0;
 		allIds.forEach(id => {
@@ -49049,7 +49114,9 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 		if (toolbar) toolbar.style.display = allIds.length ? '' : 'none';
 		const filterSelect = document.getElementById('trophy-filter-select');
 		const currentFilter = filterSelect ? filterSelect.value : 'all';
-		const selectedGrades = new Set(Array.from(document.querySelectorAll('#trophy-grade-filters input:checked')).map(cb => cb.value));
+		if (!Array.isArray(window.__trophyGradeInputsCache) || window.__trophyGradeInputsCache.some(input => !input || !input.isConnected)) window.__trophyGradeInputsCache = Array.from(document.querySelectorAll('#trophy-grade-filters input'));
+		const selectedGrades = new Set();
+		for (let i = 0; i < window.__trophyGradeInputsCache.length; i++) { const input = window.__trophyGradeInputsCache[i]; if (input && input.checked) selectedGrades.add(input.value); }
 		const sortSelect = document.getElementById('trophy-sort-select');
 		const currentSort = sortSelect ? sortSelect.value : 'default';
 		
@@ -49078,35 +49145,34 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 			return true;
 		});
 		const trophyGroupOrder = { 'Platinum': 1, 'System & Usage': 2, 'Social & Chat': 3, 'Store & Wishlist': 4, 'Downloads & Content': 5, 'Local Library': 6 };
+		const trophySortMeta = new Map();
+		for (let i = 0; i < filteredIds.length; i++) {
+			const id = filteredIds[i];
+			const trophy = TROPHY_DATA[id] || {};
+			const state = window.userTrophies[id] || { unlocked:false, progress:0 };
+			trophySortMeta.set(id, {
+				trophy, state,
+				pct: Number(window.globalTrophyStats[id] || 0.1),
+				unlockTime: state.unlocked && state.unlockDate ? (new Date(state.unlockDate).getTime() || 0) : 0,
+				groupWeight: trophyGroupOrder[trophy.group] || 999,
+				gradeWeight: TROPHY_WEIGHT[trophy.type] || 999
+			});
+		}
 		const sortedIds = filteredIds.sort((a, b) => {
-			const tA = TROPHY_DATA[a];
-			const tB = TROPHY_DATA[b];
-			const stateA = window.userTrophies[a] || { unlocked: false, progress: 0 };
-			const stateB = window.userTrophies[b] || { unlocked: false, progress: 0 };
-			const pctA = window.globalTrophyStats[a] || 0.1;
-			const pctB = window.globalTrophyStats[b] || 0.1;
-
+			const aMeta = trophySortMeta.get(a);
+			const bMeta = trophySortMeta.get(b);
 			let result = 0;
-
-			if (currentSort === 'rarity') {
-				result = pctA - pctB;
-			} else if (currentSort === 'date') {
-				if (!stateA.unlocked && !stateB.unlocked) result = 0;
-				else if (!stateA.unlocked) result = 1;
-				else if (!stateB.unlocked) result = -1;
-				else result = new Date(stateB.unlockDate) - new Date(stateA.unlockDate);
-			} else if (currentSort === 'grade') {
-				result = TROPHY_WEIGHT[tA.type] - TROPHY_WEIGHT[tB.type];
-			} else {
-				if (trophyGroupOrder[tA.group] !== trophyGroupOrder[tB.group]) {
-					result = trophyGroupOrder[tA.group] - trophyGroupOrder[tB.group];
-				} else {
-					result = TROPHY_WEIGHT[tA.type] - TROPHY_WEIGHT[tB.type];
-				}
-			}
-			
+			if (currentSort === 'rarity') result = aMeta.pct - bMeta.pct;
+			else if (currentSort === 'date') {
+				if (!aMeta.state.unlocked && !bMeta.state.unlocked) result = 0;
+				else if (!aMeta.state.unlocked) result = 1;
+				else if (!bMeta.state.unlocked) result = -1;
+				else result = bMeta.unlockTime - aMeta.unlockTime;
+			} else if (currentSort === 'grade') result = aMeta.gradeWeight - bMeta.gradeWeight;
+			else result = aMeta.groupWeight !== bMeta.groupWeight ? aMeta.groupWeight - bMeta.groupWeight : aMeta.gradeWeight - bMeta.gradeWeight;
 			return result * sortMultiplier;
 		});
+		const rewardByRequirement = psnGetRewardByRequirementMap();
 		
 		let html = '';
 		
@@ -49124,42 +49190,19 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 			const progressPct = Math.min((state.progress / t.max) * 100, 100);
 			const unlockDateText = state.unlockDate ? state.unlockDate : "";
 
-			let realPercent = window.globalTrophyStats[id] || 0.1;
-			
-			let rarityText = "Common";
-			let t1Color = 'rgba(255,255,255,0.15)', t2Color = 'rgba(255,255,255,0.15)', t3Color = 'rgba(255,255,255,0.15)', t4Color = 'rgba(255,255,255,0.15)';
+			const realPercent = Number(window.globalTrophyStats[id] || 0.1);
+			const rarityMarkup = getTrophyRarityHtml(realPercent);
 
-			if (realPercent <= 5) {
-				rarityText = "Ultra Rare";
-				t1Color = '#00f0ff';
-			} else if (realPercent <= 15) {
-				rarityText = "Very Rare";
-				t2Color = '#ffcc00';
-			} else if (realPercent <= 35) {
-				rarityText = "Rare";
-				t3Color = '#c0c0c0';
-			} else {
-				t4Color = '#cd7f32';
-			}
-			
-			const rarityTriangleSvg = `
-			<svg viewBox="0 0 24 24" width="14" height="14" style="margin-right: 4px; transform: translateY(2px); flex-shrink: 0;">
-				<path d="M12,1 L15,7 L9,7 Z" fill="${t1Color}" />
-				<path d="M8.5,8 L15.5,8 L17.5,12 L6.5,12 Z" fill="${t2Color}" />
-				<path d="M6,13 L18,13 L20,17 L4,17 Z" fill="${t3Color}" />
-				<path d="M3.5,18 L20.5,18 L23,23 L1,23 Z" fill="${t4Color}" />
-			</svg>`;
-			
 			const typeText = t.type.charAt(0).toUpperCase() + t.type.slice(1);
 			const tierIconMarkup = isLocked ? '<i class="fas fa-lock" style="color: rgba(255,255,255,0.2); font-size: 24px;"></i>' : `<span class="ps-trophy-icon ps-trophy-${t.type}" aria-hidden="true"></span>`;
 			const tierMiniIconMarkup = isLocked ? '<i class="fas fa-lock" style="color: rgba(255,255,255,0.2); font-size: 10px;"></i>' : `<span class="ps-trophy-icon ps-trophy-${t.type} trophy-tier-mini-icon" aria-hidden="true"></span>`;
 			
 			const rgbColors = { bronze: '205, 127, 50', silver: '192, 192, 192', gold: '255, 204, 0', platinum: '0, 240, 255' };
 			const cardRgb = rgbColors[t.type] || '255, 255, 255';
-			const associatedReward = (window.REWARDS_DATA || []).find(r => r.req === id);
+			const associatedReward = rewardByRequirement.get(id) || null;
 			
 			html += `
-				<div id="trophy-card-${id}" class="trophy-card ${lockClass} ${newClass} ${animClass}" data-filter-motion-key="trophy:${id}"
+				<div id="trophy-card-${id}" class="trophy-card ${lockClass} ${newClass} ${animClass}" data-trophy-id="${id}" data-filter-motion-key="trophy:${id}"
 					style="--tile-idx: ${animIndex}; --trophy-rgb: ${cardRgb}; display: flex; align-items: stretch; width: 100%; border-radius: 8px; cursor: default; overflow: hidden; padding: 0;"
 					onmouseenter="if(typeof playUiHover === 'function') playUiHover(); this.classList.remove('anim-reveal'); this.classList.add('no-anim');">
 					
@@ -49176,12 +49219,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 								${typeText}
 							</div>
 							
-							<div style="margin-top: 5px; color: #8b96a8; font-size: 11px; display: flex; align-items: center; font-weight: 500;">
-								${rarityTriangleSvg}
-								${rarityText} 
-								<span style="opacity: 0.3; margin: 0 6px; transform: translateY(-1px);">|</span> 
-								Earned by ${realPercent.toFixed(1)}% of players
-							</div>
+							<div class="trophy-rarity-meta" style="margin-top: 5px; color: #8b96a8; font-size: 11px; display: flex; align-items: center; font-weight: 500;">${rarityMarkup}</div>
 						</div>
 					</div>
 					
@@ -49617,13 +49655,114 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 		if (typeof updateJumpBottomUnreadBadge === 'function') updateJumpBottomUnreadBadge();
 	}
 
+	/* CHAT HISTORY INDEX: keep O(1) message lookup/dedupe for live chat. */
+	window.__chatHistoryContentRevision = Math.max(0, Number(window.__chatHistoryContentRevision) || 0);
+	window.__chatMessageIndexState = window.__chatMessageIndexState || null;
+	window.__chatMessageRenderSignatureCache = window.__chatMessageRenderSignatureCache instanceof WeakMap ? window.__chatMessageRenderSignatureCache : new WeakMap();
+	window.__chatMessageRenderVersion = window.__chatMessageRenderVersion instanceof WeakMap ? window.__chatMessageRenderVersion : new WeakMap();
+
+	function getChatIndexedMessageKey(msg) {
+		if (!msg) return '';
+		const time = new Date(msg.time).getTime();
+		return String(Number.isFinite(time) ? time : (msg.time || ''));
+	}
+
+	function rebuildChatMessageIndexes(history = window.messageHistory || []) {
+		const list = Array.isArray(history) ? history : [];
+		const byId = new Map();
+		const ids = new Set();
+		for (let i = 0; i < list.length; i++) {
+			const msg = list[i];
+			const key = getChatIndexedMessageKey(msg);
+			if (!key) continue;
+			byId.set(key, msg);
+			ids.add(key);
+		}
+		window.__chatMessageIndexState = { history:list, length:list.length, firstKey:list.length ? getChatIndexedMessageKey(list[0]) : '', lastKey:list.length ? getChatIndexedMessageKey(list[list.length - 1]) : '', byId, ids };
+		return window.__chatMessageIndexState;
+	}
+
+	function ensureChatMessageIndexes(history = window.messageHistory || []) {
+		const list = Array.isArray(history) ? history : [];
+		const state = window.__chatMessageIndexState;
+		const firstKey = list.length ? getChatIndexedMessageKey(list[0]) : '';
+		const lastKey = list.length ? getChatIndexedMessageKey(list[list.length - 1]) : '';
+		if (!state || state.history !== list || state.length !== list.length || state.firstKey !== firstKey || state.lastKey !== lastKey) return rebuildChatMessageIndexes(list);
+		return state;
+	}
+
+	function getChatMessageByIdFast(msgId) {
+		const key = String(msgId || '');
+		return key ? (ensureChatMessageIndexes(window.messageHistory || []).byId.get(key) || null) : null;
+	}
+	window.getChatMessageByIdFast = getChatMessageByIdFast;
+
+	function markChatMessageRenderDirty(msg) {
+		if (msg && typeof msg === 'object') {
+			const next = Math.max(0, Number(window.__chatMessageRenderVersion.get(msg)) || 0) + 1;
+			window.__chatMessageRenderVersion.set(msg, next);
+			window.__chatMessageRenderSignatureCache.delete(msg);
+		}
+		window.__chatHistoryContentRevision = Math.max(0, Number(window.__chatHistoryContentRevision) || 0) + 1;
+		window.__chatHistoryRenderSignatureCache = null;
+		window.__chatUnreadSummarySignature = '';
+		window.__chatLatestTimeScanSignature = '';
+	}
+	window.markChatMessageRenderDirty = markChatMessageRenderDirty;
+
+	function getChatReadScanSignature(history) {
+		if (!Array.isArray(history) || !history.length) return '0';
+		const first = history[0];
+		const last = history[history.length - 1];
+		const firstTime = String((first && first.time) || '');
+		const lastTime = String((last && last.time) || '');
+		return `${history.length}|${firstTime}|${lastTime}|${String(window.__chatCacheEpoch || '')}|${Number(window.__chatCacheRevision || 0)}|${Number(window.__chatHistoryContentRevision || 0)}`;
+	}
+
+	function getLatestChatHistoryTime(history) {
+		if (!Array.isArray(history) || !history.length) return 0;
+		const signature = getChatReadScanSignature(history);
+		if (window.__chatLatestTimeScanSignature === signature) return Math.max(0, Number(window.__chatLatestTimeCached) || 0);
+		let latestTime = 0;
+		/* History is chronological. Walk backward and stop on the first valid timestamp instead of
+		   reducing the entire history on every near-bottom scroll frame. */
+		for (let i = history.length - 1; i >= 0; i--) {
+			const msgTime = new Date(history[i] && history[i].time).getTime();
+			if (Number.isFinite(msgTime)) { latestTime = msgTime; break; }
+		}
+		window.__chatLatestTimeScanSignature = signature;
+		window.__chatLatestTimeCached = latestTime;
+		return latestTime;
+	}
+
+	function getChatUnreadSummaryCached(history, myName, lastReadTime) {
+		const signature = `${myName}|${getChatReadScanSignature(history)}|${Math.max(0, Number(lastReadTime) || 0)}`;
+		if (window.__chatUnreadSummarySignature === signature && window.__chatUnreadSummaryCached) return window.__chatUnreadSummaryCached;
+		let unreadCount = 0;
+		let hasGlobal = false;
+		let hasMention = false;
+		for (let i = history.length - 1; i >= 0; i--) {
+			const m = history[i];
+			const msgTime = new Date(m && m.time).getTime();
+			if (!Number.isFinite(msgTime)) continue;
+			if (msgTime <= lastReadTime) break;
+			if (!m || m.user === myName) continue;
+			unreadCount++;
+			if (!hasGlobal && m.isGlobalPing) hasGlobal = true;
+			if (!hasMention && ((m.text && (typeof chatTextMentionsUser === 'function' ? chatTextMentionsUser(m.text, myName) : m.text.includes(`@${myName}`))) || (m.replyTo && m.replyTo.user === myName))) hasMention = true;
+		}
+		const summary = { unreadCount, hasGlobal, hasMention };
+		window.__chatUnreadSummarySignature = signature;
+		window.__chatUnreadSummaryCached = summary;
+		return summary;
+	}
+
 	function markVisibleChatAsRead() {
 		const myName = localStorage.getItem('psn_username') || "Guest";
 		const history = Array.isArray(window.messageHistory) ? window.messageHistory : [];
-		const latestTime = history.reduce((latest, msg) => {
-			const msgTime = new Date(msg && msg.time).getTime();
-			return Number.isFinite(msgTime) ? Math.max(latest, msgTime) : latest;
-		}, 0);
+		const historySignature = getChatReadScanSignature(history);
+		const seenScanSignature = `${myName}|${historySignature}`;
+		const latestTime = getLatestChatHistoryTime(history);
 		const previousRead = parseInt(loadState('psn_last_chat_read') || '0', 10) || 0;
 		const readChanged = latestTime > previousRead;
 		if (readChanged) saveState('psn_last_chat_read', String(Math.max(Date.now(), latestTime)));
@@ -49635,26 +49774,35 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 
 		if (readChanged && typeof broadcastProfileUpdate === 'function') broadcastProfileUpdate({ silentIndicator:true });
 
-		if (history.length && typeof socketChat !== 'undefined' && socketChat && socketChat.connected) {
+		/* Seen-by sync is expensive with a long history. The old path scanned every loaded message on
+		   every scroll frame near the bottom. Scan once per actual history/revision change instead. */
+		if (history.length && typeof socketChat !== 'undefined' && socketChat && socketChat.connected && window.__chatSeenScanSignature !== seenScanSignature) {
+			window.__chatSeenScanSignature = seenScanSignature;
 			window.__chatSeenEmitPending = window.__chatSeenEmitPending instanceof Map ? window.__chatSeenEmitPending : new Map();
 			const now = Date.now();
-			history.forEach(m => {
-				if (!m || m.user === myName) return;
+			for (let i = 0; i < history.length; i++) {
+				const m = history[i];
+				if (!m || m.user === myName) continue;
 				const hasSeen = Array.isArray(m.seenBy) && m.seenBy.includes(myName);
-				if (hasSeen) return;
+				if (hasSeen) continue;
 				const msgId = new Date(m.time).getTime();
-				if (!Number.isFinite(msgId)) return;
+				if (!Number.isFinite(msgId)) continue;
 				const key = String(msgId);
 				const pendingAt = Number(window.__chatSeenEmitPending.get(key) || 0);
-				if (pendingAt && now - pendingAt < 5000) return;
+				if (pendingAt && now - pendingAt < 5000) continue;
 				window.__chatSeenEmitPending.set(key, now);
 				socketChat.emit('mark_as_read', { msgId, user: myName });
-			});
+			}
 		}
 		return readChanged;
 	}
 
+
     function getChatMessageRenderSignature(msg = {}) {
+        if (!msg || typeof msg !== 'object') return '';
+        const version = Math.max(0, Number(window.__chatMessageRenderVersion && window.__chatMessageRenderVersion.get(msg)) || 0);
+        const cached = window.__chatMessageRenderSignatureCache && window.__chatMessageRenderSignatureCache.get(msg);
+        if (cached && cached.version === version) return cached.signature;
         const comparable = [
             String(new Date(msg && msg.time).getTime() || (msg && msg.time) || ''),
             String(msg && msg.user || ''),
@@ -49673,7 +49821,9 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
             msg && msg.isModerator === true ? 1 : 0,
             msg && (msg.isBanned === true || msg.banned === true) ? 1 : 0
         ];
-        return typeof window.getLiveRenderSignature === 'function' ? window.getLiveRenderSignature(comparable) : JSON.stringify(comparable);
+        const signature = typeof window.getLiveRenderSignature === 'function' ? window.getLiveRenderSignature(comparable) : JSON.stringify(comparable);
+        window.__chatMessageRenderSignatureCache.set(msg, { version, signature });
+        return signature;
     }
 
     function getChatHistoryDataSignature(history) {
@@ -49686,7 +49836,16 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
     }
 
     function getChatHistoryRenderSignature(history) {
-        return (Array.isArray(history) ? history : []).map(msg => getChatMessageRenderSignature(msg)).join('|');
+        const list = Array.isArray(history) ? history : [];
+        const isCurrentHistory = list === window.messageHistory;
+        const revision = Math.max(0, Number(window.__chatHistoryContentRevision) || 0);
+        const cache = window.__chatHistoryRenderSignatureCache;
+        if (isCurrentHistory && cache && cache.history === list && cache.length === list.length && cache.revision === revision) return cache.signature;
+        const parts = new Array(list.length);
+        for (let i = 0; i < list.length; i++) parts[i] = getChatMessageRenderSignature(list[i]);
+        const signature = parts.join('|');
+        if (isCurrentHistory) window.__chatHistoryRenderSignatureCache = { history:list, length:list.length, revision, signature };
+        return signature;
     }
 
     function updateChatHistoryRenderSignature() {
@@ -50486,32 +50645,46 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 
     function mergeChatSyncChanges(history = [], changes = []) {
         let merged = normalizeChatHistoryPayload(history || []).slice();
+        const indexById = new Map();
+        for (let i = 0; i < merged.length; i++) {
+            const key = String(new Date(merged[i] && merged[i].time).getTime() || (merged[i] && merged[i].time) || '');
+            if (key) indexById.set(key, i);
+        }
+        let hasDeletedSlots = false;
         (Array.isArray(changes) ? changes : []).forEach(change => {
             if (!change || typeof change !== 'object') return;
             const msgId = String(change.msgId || '');
             if (String(change.type || '') === 'delete') {
-                merged = merged.filter(msg => String(new Date(msg && msg.time).getTime()) !== msgId);
+                const index = indexById.get(msgId);
+                if (index !== undefined && merged[index]) { merged[index] = null; indexById.delete(msgId); hasDeletedSlots = true; }
                 return;
             }
             if (String(change.type || '') !== 'upsert' || !change.message) return;
             const incoming = normalizeChatHistoryPayload([change.message])[0] || change.message;
             const incomingId = String(new Date(incoming && incoming.time).getTime() || msgId);
-            const index = merged.findIndex(msg => String(new Date(msg && msg.time).getTime()) === incomingId);
-            if (index > -1) merged[index] = incoming;
-            else merged.push(incoming);
+            const index = indexById.get(incomingId);
+            if (index !== undefined && merged[index]) merged[index] = incoming;
+            else { indexById.set(incomingId, merged.length); merged.push(incoming); }
         });
+        if (hasDeletedSlots) merged = merged.filter(Boolean);
         merged.sort((a, b) => (new Date(a && a.time).getTime() || 0) - (new Date(b && b.time).getTime() || 0));
         return normalizeChatHistoryPayload(merged).slice(-MAX_CHAT_HISTORY);
     }
 
     function applyChatSeenEventsToHistory(history = [], events = []) {
         const target = Array.isArray(history) ? history : [];
+        let byId = null;
+        if (target === window.messageHistory) byId = ensureChatMessageIndexes(target).byId;
+        else {
+            byId = new Map();
+            for (let i = 0; i < target.length; i++) { const key = getChatIndexedMessageKey(target[i]); if (key) byId.set(key, target[i]); }
+        }
         (Array.isArray(events) ? events : []).forEach(event => {
             if (!event || typeof event !== 'object') return;
             const msgId = String(event.msgId || '');
             const reader = String(event.reader || '');
             if (!msgId || !reader) return;
-            const msg = target.find(item => String(new Date(item && item.time).getTime()) === msgId);
+            const msg = byId.get(msgId);
             if (!msg) return;
             if (!Array.isArray(msg.seenBy)) msg.seenBy = [];
             if (!msg.seenBy.includes(reader)) msg.seenBy.push(reader);
@@ -50525,7 +50698,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
     function refreshChatSeenDomForMessage(msgId) {
         const id = String(msgId || '');
         if (!id) return false;
-        const msg = Array.isArray(window.messageHistory) ? window.messageHistory.find(item => String(new Date(item && item.time).getTime()) === id) : null;
+        const msg = typeof getChatMessageByIdFast === 'function' ? getChatMessageByIdFast(id) : (Array.isArray(window.messageHistory) ? window.messageHistory.find(item => String(new Date(item && item.time).getTime()) === id) : null);
         const checkCont = document.getElementById(`check-${id}`);
         if (!msg || !checkCont) return false;
         const seenList = Array.isArray(msg.seenBy) ? msg.seenBy : [];
@@ -50556,14 +50729,24 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
         }
         const cursor = Math.max(0, Number(event.cursor) || 0);
         if (cursor && cursor <= Math.max(0, Number(window.__chatSeenCursor) || 0)) return true;
-        const beforeSignature = getChatHistoryDataSignature(window.messageHistory || []);
-        applyChatSeenEventsToHistory(window.messageHistory || [], [event]);
+        const msgId = String(event.msgId || '');
+        const reader = String(event.reader || '');
+        const msg = typeof getChatMessageByIdFast === 'function' ? getChatMessageByIdFast(msgId) : null;
+        let changed = false;
+        if (msg && reader) {
+            if (!Array.isArray(msg.seenBy)) msg.seenBy = [];
+            if (!msg.seenBy.includes(reader)) { msg.seenBy.push(reader); changed = true; }
+            if (!msg.seenAt || typeof msg.seenAt !== 'object' || Array.isArray(msg.seenAt)) { msg.seenAt = {}; changed = true; }
+            if (event.seenAt) {
+                const nextSeenAt = String(event.seenAt);
+                if (String(msg.seenAt[reader] || '') !== nextSeenAt) { msg.seenAt[reader] = nextSeenAt; changed = true; }
+            }
+        }
         if (cursor) window.__chatSeenCursor = cursor;
         const myName = localStorage.getItem('psn_username') || '';
-        if (event.reader && myName && String(event.reader) === myName && window.__chatSeenEmitPending instanceof Map) window.__chatSeenEmitPending.delete(String(event.msgId || ''));
-        const changed = beforeSignature !== getChatHistoryDataSignature(window.messageHistory || []);
+        if (event.reader && myName && String(event.reader) === myName && window.__chatSeenEmitPending instanceof Map) window.__chatSeenEmitPending.delete(msgId);
         if (changed) {
-            refreshChatSeenDomForMessage(event.msgId);
+            refreshChatSeenDomForMessage(msgId);
             scheduleChatPersistentCacheWrite();
         }
         return true;
@@ -50601,6 +50784,9 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
             window.__chatCacheReadyForWrite = true;
             window.__chatInitialSnapshotPending = holdForServer;
             window.messageHistory = cachedHistory;
+            window.__chatHistoryContentRevision = Math.max(0, Number(window.__chatHistoryContentRevision) || 0) + 1;
+            rebuildChatMessageIndexes(window.messageHistory);
+            window.__chatHistoryRenderSignatureCache = null;
             if (typeof window.setSidebarCountPill === 'function') window.setSidebarCountPill('chat', cachedHistory.length);
             window.__chatVirtualStartIndex = Math.max(0, cachedHistory.length - getChatVirtualInitialLimit());
             window.__chatVirtualEndIndex = cachedHistory.length;
@@ -50667,6 +50853,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
             handleChatHistorySnapshot(nextHistory);
         } else if (historyDataChanged) {
             window.messageHistory = nextHistory;
+            rebuildChatMessageIndexes(window.messageHistory);
             if (typeof window.setSidebarCountPill === 'function') window.setSidebarCountPill('chat', nextHistory.length);
             window.__chatHistoryReceived = true;
             window.__chatHistoryRequesting = false;
@@ -50711,6 +50898,9 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
         }
         if (incomingRevision <= currentRevision) return true;
         window.messageHistory = mergeChatSyncChanges(window.messageHistory || [], [change]);
+        window.__chatHistoryContentRevision = Math.max(0, Number(window.__chatHistoryContentRevision) || 0) + 1;
+        rebuildChatMessageIndexes(window.messageHistory);
+        window.__chatHistoryRenderSignatureCache = null;
         if (typeof window.setSidebarCountPill === 'function') window.setSidebarCountPill('chat', window.messageHistory.length);
         window.__chatCacheEpoch = incomingEpoch;
         window.__chatCacheRevision = incomingRevision;
@@ -50756,6 +50946,9 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 
         if (historyDataChanged) {
             window.messageHistory = normalizedHistory;
+            window.__chatHistoryContentRevision = Math.max(0, Number(window.__chatHistoryContentRevision) || 0) + 1;
+            rebuildChatMessageIndexes(window.messageHistory);
+            window.__chatHistoryRenderSignatureCache = null;
             if (typeof window.setSidebarCountPill === 'function') window.setSidebarCountPill('chat', normalizedHistory.length);
             window.__chatVirtualStartIndex = 0;
             window.__chatVirtualEndIndex = normalizedHistory.length;
@@ -55103,147 +55296,176 @@ function getVisibleChatStackEl(id) {
 
 
 
+    /* REACTION PICKER LIFECYCLE: this popover is anchored to a message. Any scroll/resize
+       invalidates that context, so close it instead of leaving a fixed picker floating behind.
+       Cleanup also owns the delayed outside-listener bind so rapid open/close cannot leak handlers. */
+    function closeReactionPickerElement(picker, options = {}) {
+        if (!picker || picker.dataset.reactionPickerClosed === '1') return false;
+        picker.dataset.reactionPickerClosed = '1';
+        if (picker.__reactionOutsideBindTimer) {
+            clearTimeout(picker.__reactionOutsideBindTimer);
+            picker.__reactionOutsideBindTimer = null;
+        }
+        if (typeof picker.__reactionCleanupOutside === 'function') picker.__reactionCleanupOutside();
+        if (picker.__reactionRemoveTimer) {
+            clearTimeout(picker.__reactionRemoveTimer);
+            picker.__reactionRemoveTimer = null;
+        }
+        picker.classList.remove('show');
+        if (options.immediate === true) {
+            if (picker.parentNode) picker.remove();
+        } else {
+            picker.__reactionRemoveTimer = setTimeout(() => {
+                picker.__reactionRemoveTimer = null;
+                if (picker.parentNode) picker.remove();
+            }, 200);
+        }
+        return true;
+    }
+
+    window.closeActivePicker = function(options = {}) {
+        const picker = document.getElementById('active-reaction-picker');
+        return closeReactionPickerElement(picker, options || {});
+    };
+
     function openReactionPicker(event, msgId) {
-		if (event) {
-			event.preventDefault();
-			event.stopPropagation();
-		}
+        if (event) {
+            event.preventDefault();
+            event.stopPropagation();
+        }
 
-		const myName = localStorage.getItem('psn_username') || "Guest";
-		const oldPicker = document.getElementById('active-reaction-picker');
+        const myName = localStorage.getItem('psn_username') || "Guest";
+        const oldPicker = document.getElementById('active-reaction-picker');
 
-		if (oldPicker && oldPicker.dataset.msgId === String(msgId)) {
-			window.closeActivePicker();
-			if (typeof playUiBack === 'function') playUiBack();
-			return;
-		}
-		if (oldPicker) oldPicker.remove();
+        if (oldPicker && oldPicker.dataset.msgId === String(msgId)) {
+            window.closeActivePicker();
+            if (typeof playUiBack === 'function') playUiBack();
+            return;
+        }
+        /* Important: use the owner's cleanup rather than raw .remove(). The old implementation
+           could leave its delayed outside-click listener alive after switching messages quickly. */
+        if (oldPicker) window.closeActivePicker({ immediate:true });
 
-		const picker = document.createElement('div');
-		picker.id = 'active-reaction-picker';
-		picker.className = 'reaction-picker';
-		picker.dataset.msgId = msgId;
-		picker.style.transformOrigin = "bottom center";
+        const picker = document.createElement('div');
+        picker.id = 'active-reaction-picker';
+        picker.className = 'reaction-picker';
+        picker.dataset.msgId = msgId;
+        picker.style.transformOrigin = "bottom center";
 
-		let myReactions = [];
-		const reactionBox = document.getElementById(`reactions-${msgId}`);
-		if (reactionBox) {
-			const pills = reactionBox.querySelectorAll('.reaction-pill');
-			pills.forEach(pill => {
-				const usersArr = (pill.getAttribute('data-users') || "").split(', ');
-				if (usersArr.includes(myName)) myReactions.push(pill.getAttribute('data-emoji'));
-			});
-		}
+        let myReactions = [];
+        const reactionBox = document.getElementById(`reactions-${msgId}`);
+        if (reactionBox) {
+            const pills = reactionBox.querySelectorAll('.reaction-pill');
+            pills.forEach(pill => {
+                const usersArr = (pill.getAttribute('data-users') || "").split(', ');
+                if (usersArr.includes(myName)) myReactions.push(pill.getAttribute('data-emoji'));
+            });
+        }
 
-		const emojis = ['👍', '❤️', '😂', '😮', '😢', '🔥'];
-		picker.innerHTML = emojis.map(e => {
-			const isSelected = myReactions.includes(e);
-			const selectedClass = isSelected ? " is-selected" : "";
-			return `<span class="reaction-option${selectedClass}" data-emoji="${e}" tabindex="0">${e}</span>`;
-		}).join('');
+        const emojis = ['👍', '❤️', '😂', '😮', '😢', '🔥'];
+        picker.innerHTML = emojis.map(e => {
+            const isSelected = myReactions.includes(e);
+            const selectedClass = isSelected ? " is-selected" : "";
+            return `<span class="reaction-option${selectedClass}" data-emoji="${e}" tabindex="0">${e}</span>`;
+        }).join('');
 
-		document.body.appendChild(picker);
+        document.body.appendChild(picker);
 
-		const pickReaction = (pickEvent) => {
-			if (pickEvent) {
-				pickEvent.preventDefault();
-				pickEvent.stopPropagation();
-			}
-			const option = pickEvent && pickEvent.currentTarget ? pickEvent.currentTarget : null;
-			const emoji = option ? option.getAttribute('data-emoji') : '';
-			if (!emoji) return;
-			const now = (window.performance && performance.now) ? performance.now() : Date.now();
-			if (picker.__reactionPickedAt && (now - picker.__reactionPickedAt) < 650) return;
-			picker.__reactionPickedAt = now;
-			sendReaction(msgId, emoji);
-			window.closeActivePicker();
-		};
+        const pickReaction = (pickEvent) => {
+            if (pickEvent) {
+                pickEvent.preventDefault();
+                pickEvent.stopPropagation();
+            }
+            const option = pickEvent && pickEvent.currentTarget ? pickEvent.currentTarget : null;
+            const emoji = option ? option.getAttribute('data-emoji') : '';
+            if (!emoji) return;
+            const now = (window.performance && performance.now) ? performance.now() : Date.now();
+            if (picker.__reactionPickedAt && (now - picker.__reactionPickedAt) < 650) return;
+            picker.__reactionPickedAt = now;
+            sendReaction(msgId, emoji);
+            window.closeActivePicker();
+        };
 
-		picker.querySelectorAll('.reaction-option').forEach(option => {
-			option.addEventListener('mouseenter', () => {
-				if (typeof playUiHover === 'function') playUiHover();
-			});
-			option.addEventListener('pointerdown', (pickEvent) => {
-				if (pickEvent.pointerType === 'mouse') return;
-				pickReaction(pickEvent);
-			});
-			option.addEventListener('click', pickReaction);
-			option.addEventListener('keydown', (pickEvent) => {
-				if (pickEvent.key === 'Enter' || pickEvent.key === ' ') pickReaction(pickEvent);
-			});
-		});
+        picker.querySelectorAll('.reaction-option').forEach(option => {
+            option.addEventListener('mouseenter', () => {
+                if (typeof playUiHover === 'function') playUiHover();
+            });
+            option.addEventListener('pointerdown', (pickEvent) => {
+                if (pickEvent.pointerType === 'mouse') return;
+                pickReaction(pickEvent);
+            });
+            option.addEventListener('click', pickReaction);
+            option.addEventListener('keydown', (pickEvent) => {
+                if (pickEvent.key === 'Enter' || pickEvent.key === ' ') pickReaction(pickEvent);
+            });
+        });
 
-		const anchor = (event && event.currentTarget && event.currentTarget.getBoundingClientRect)
-			? event.currentTarget
-			: (event && event.target && event.target.closest ? event.target.closest('.fa-smile, .reaction-pill, .chat-message-actions') : null);
-		const anchorRect = anchor && anchor.getBoundingClientRect ? anchor.getBoundingClientRect() : null;
-		const viewportWidth = window.innerWidth || document.documentElement.clientWidth || 0;
-		const viewportHeight = window.innerHeight || document.documentElement.clientHeight || 0;
-		const isMobile = !!(window.matchMedia && window.matchMedia('(max-width: 768px)').matches);
-		const edgeGap = isMobile ? 12 : 8;
-		const pickerWidth = picker.offsetWidth;
-		const pickerHeight = picker.offsetHeight;
+        const anchor = (event && event.currentTarget && event.currentTarget.getBoundingClientRect)
+            ? event.currentTarget
+            : (event && event.target && event.target.closest ? event.target.closest('.fa-smile, .reaction-pill, .chat-message-actions') : null);
+        const anchorRect = anchor && anchor.getBoundingClientRect ? anchor.getBoundingClientRect() : null;
+        const viewportWidth = window.innerWidth || document.documentElement.clientWidth || 0;
+        const viewportHeight = window.innerHeight || document.documentElement.clientHeight || 0;
+        const isMobile = !!(window.matchMedia && window.matchMedia('(max-width: 768px)').matches);
+        const edgeGap = isMobile ? 12 : 8;
+        const pickerWidth = picker.offsetWidth;
+        const pickerHeight = picker.offsetHeight;
 
-		let left;
-		if (isMobile) {
-			const chatShell = document.querySelector('#view-chat .file-manager-container') || document.getElementById('view-chat');
-			const shellRect = chatShell && chatShell.getBoundingClientRect ? chatShell.getBoundingClientRect() : null;
-			left = shellRect && shellRect.width > 0
-				? shellRect.left + ((shellRect.width - pickerWidth) / 2)
-				: ((viewportWidth - pickerWidth) / 2);
-		} else {
-			const anchorCenter = anchorRect
-				? anchorRect.left + (anchorRect.width / 2)
-				: (event && typeof event.clientX === 'number' ? event.clientX : (viewportWidth / 2));
-			left = anchorCenter - (pickerWidth / 2);
-		}
-		left = Math.max(edgeGap, Math.min(left, viewportWidth - pickerWidth - edgeGap));
+        let left;
+        if (isMobile) {
+            const chatShell = document.querySelector('#view-chat .file-manager-container') || document.getElementById('view-chat');
+            const shellRect = chatShell && chatShell.getBoundingClientRect ? chatShell.getBoundingClientRect() : null;
+            left = shellRect && shellRect.width > 0
+                ? shellRect.left + ((shellRect.width - pickerWidth) / 2)
+                : ((viewportWidth - pickerWidth) / 2);
+        } else {
+            const anchorCenter = anchorRect
+                ? anchorRect.left + (anchorRect.width / 2)
+                : (event && typeof event.clientX === 'number' ? event.clientX : (viewportWidth / 2));
+            left = anchorCenter - (pickerWidth / 2);
+        }
+        left = Math.max(edgeGap, Math.min(left, viewportWidth - pickerWidth - edgeGap));
 
-		let top = anchorRect
-			? anchorRect.top - pickerHeight - 10
-			: (event && typeof event.clientY === 'number' ? event.clientY - pickerHeight - 10 : (viewportHeight / 2) - pickerHeight - 10);
-		if (top < edgeGap) top = anchorRect ? anchorRect.bottom + 10 : edgeGap;
-		if (top + pickerHeight > viewportHeight - edgeGap) top = Math.max(edgeGap, viewportHeight - pickerHeight - edgeGap);
+        let top = anchorRect
+            ? anchorRect.top - pickerHeight - 10
+            : (event && typeof event.clientY === 'number' ? event.clientY - pickerHeight - 10 : (viewportHeight / 2) - pickerHeight - 10);
+        if (top < edgeGap) top = anchorRect ? anchorRect.bottom + 10 : edgeGap;
+        if (top + pickerHeight > viewportHeight - edgeGap) top = Math.max(edgeGap, viewportHeight - pickerHeight - edgeGap);
 
-		picker.style.left = `${Math.round(left)}px`;
-		picker.style.top = `${Math.round(top)}px`;
+        picker.style.left = `${Math.round(left)}px`;
+        picker.style.top = `${Math.round(top)}px`;
 
-		requestAnimationFrame(() => picker.classList.add('show'));
-		if (typeof playUiClick === 'function') playUiClick();
+        requestAnimationFrame(() => {
+            if (picker.isConnected && picker.dataset.reactionPickerClosed !== '1') picker.classList.add('show');
+        });
+        if (typeof playUiClick === 'function') playUiClick();
 
-		let outsideHandlersBound = false;
-		const removeOutsideHandlers = () => {
-			if (!outsideHandlersBound) return;
-			window.removeEventListener('pointerdown', handleOutsideInteraction, true);
-			window.removeEventListener('click', handleOutsideInteraction, true);
-			outsideHandlersBound = false;
-		};
-		const handleOutsideInteraction = (outsideEvent) => {
-			const p = document.getElementById('active-reaction-picker');
-			if (!p) {
-				removeOutsideHandlers();
-				return;
-			}
-			if (p.contains(outsideEvent.target)) return;
-			if (anchor && anchor.contains && anchor.contains(outsideEvent.target)) return;
-			window.closeActivePicker();
-		};
-
-		window.closeActivePicker = () => {
-			removeOutsideHandlers();
-			const p = document.getElementById('active-reaction-picker');
-			if (p) {
-				p.classList.remove('show');
-				setTimeout(() => { if (p.parentNode) p.remove(); }, 200);
-			}
-		};
-
-		setTimeout(() => {
-			window.addEventListener('pointerdown', handleOutsideInteraction, true);
-			window.addEventListener('click', handleOutsideInteraction, true);
-			outsideHandlersBound = true;
-		}, 10);
-	}
+        let outsideHandlersBound = false;
+        const handleOutsideInteraction = (outsideEvent) => {
+            const active = document.getElementById('active-reaction-picker');
+            if (active !== picker) {
+                cleanupOutsideHandlers();
+                return;
+            }
+            if (picker.contains(outsideEvent.target)) return;
+            if (anchor && anchor.contains && anchor.contains(outsideEvent.target)) return;
+            window.closeActivePicker();
+        };
+        const cleanupOutsideHandlers = () => {
+            if (!outsideHandlersBound) return;
+            window.removeEventListener('pointerdown', handleOutsideInteraction, true);
+            window.removeEventListener('click', handleOutsideInteraction, true);
+            outsideHandlersBound = false;
+        };
+        picker.__reactionCleanupOutside = cleanupOutsideHandlers;
+        picker.__reactionOutsideBindTimer = setTimeout(() => {
+            picker.__reactionOutsideBindTimer = null;
+            if (!picker.isConnected || picker.dataset.reactionPickerClosed === '1' || document.getElementById('active-reaction-picker') !== picker) return;
+            window.addEventListener('pointerdown', handleOutsideInteraction, true);
+            window.addEventListener('click', handleOutsideInteraction, true);
+            outsideHandlersBound = true;
+        }, 10);
+    }
 
 	let isEmojiPickerBuilt = false;
 	const CHAT_EMOJI_COLUMNS = 8;
@@ -59310,7 +59532,9 @@ function getVisibleChatStackEl(id) {
 				return;
 			}
 			if (roleTargetName && roleTargetName !== myName) {
-					if (typeof window.syncPsnUserMeta === 'function') window.syncPsnUserMeta({ name: roleTargetName, role, isAdmin: data.isAdmin === true, isBanned: banSignal ? true : (explicitUnbanSignal ? false : undefined) });
+					const roleMeta = { name: roleTargetName, role, isAdmin: data.isAdmin === true, isModerator: data.isModerator === true, isBanned: banSignal ? true : (explicitUnbanSignal ? false : undefined) };
+					if (typeof window.syncPsnUserMeta === 'function') window.syncPsnUserMeta(roleMeta);
+					if (typeof window.patchOpenProfileRoleBadge === 'function') window.patchOpenProfileRoleBadge(roleTargetName, roleMeta);
 					if (document.getElementById('view-admin')?.style.display === 'block' && typeof renderAdminPanel === 'function') adminSchedulePanelRender();
 					if (window.messageHistory && window.messageHistory.length > 0 && typeof scheduleChatHistorySoftRerender === 'function') {
 						scheduleChatHistorySoftRerender('role-updated-target', false);
@@ -60212,10 +60436,9 @@ function getVisibleChatStackEl(id) {
 					};
 					const previousRoleState = getRoleState(previousOpenProfileResult);
 					const nextRoleState = getRoleState(nextOpenProfileResult);
-					const roleStateChanged = JSON.stringify(previousRoleState) !== JSON.stringify(nextRoleState);
-					if (roleStateChanged && typeof openProfileModal === 'function') {
-						setTimeout(() => openProfileModal(encodeURIComponent(openProfileTarget)), 0);
-					} else {
+					const roleStateChanged = previousRoleState.length !== nextRoleState.length || previousRoleState.some((value, index) => value !== nextRoleState[index]);
+					if (roleStateChanged && typeof window.patchOpenProfileRoleBadge === 'function') window.patchOpenProfileRoleBadge(openProfileTarget, nextOpenProfileResult);
+					{
 						const nextAvatar = String(nextOpenProfileResult.avatar || '').trim();
 						const cardAvatar = document.getElementById('card-avatar');
 						if (cardAvatar && nextAvatar && cardAvatar.getAttribute('src') !== nextAvatar) cardAvatar.setAttribute('src', nextAvatar);
@@ -60335,7 +60558,12 @@ function getVisibleChatStackEl(id) {
 				}
 			}
 			if (!domChanged && !storedChanged) return;
-			if (storedChanged && typeof syncRenderedChatMessageSignature === 'function') syncRenderedChatMessageSignature(data.msgId);
+			if (storedChanged) {
+				const storedMsg = typeof getChatMessageByIdFast === 'function' ? getChatMessageByIdFast(data.msgId) : null;
+				if (typeof markChatMessageRenderDirty === 'function') markChatMessageRenderDirty(storedMsg);
+				if (typeof syncRenderedChatMessageSignature === 'function') syncRenderedChatMessageSignature(data.msgId);
+				if (typeof updateChatHistoryRenderSignature === 'function') updateChatHistoryRenderSignature();
+			}
 			const msgRow = document.getElementById(`msg-row-${data.msgId}`);
 			if (msgRow && domChanged) {
 				const avatarImg = msgRow.querySelector('.chat-avatar-status');
@@ -60364,12 +60592,21 @@ function getVisibleChatStackEl(id) {
 		socketChat.on('chat_message', function(data) {
 			if (!window.messageHistory) window.messageHistory = [];
 			const incomingKey = String(new Date(data && data.time).getTime() || data?.time || '');
-			const alreadyRendered = incomingKey && window.messageHistory.some(m => String(new Date(m && m.time).getTime() || m?.time || '') === incomingKey);
-			if (alreadyRendered) return;
+			const chatIndex = ensureChatMessageIndexes(window.messageHistory);
+			if (incomingKey && chatIndex.ids.has(incomingKey)) return;
 			window.messageHistory.push(data);
+			if (incomingKey) { chatIndex.ids.add(incomingKey); chatIndex.byId.set(incomingKey, data); }
+			chatIndex.length = window.messageHistory.length;
+			chatIndex.lastKey = incomingKey || getChatIndexedMessageKey(data);
+			window.__chatHistoryContentRevision = Math.max(0, Number(window.__chatHistoryContentRevision) || 0) + 1;
+			window.__chatHistoryRenderSignatureCache = null;
 			if (typeof window.setSidebarCountPill === 'function') window.setSidebarCountPill('chat', window.messageHistory.length);
 			if (window.messageHistory.length > MAX_CHAT_HISTORY) {
-				window.messageHistory.shift();
+				const shiftedMessage = window.messageHistory.shift();
+				const shiftedKey = getChatIndexedMessageKey(shiftedMessage);
+				if (shiftedKey) { chatIndex.ids.delete(shiftedKey); chatIndex.byId.delete(shiftedKey); }
+				chatIndex.length = window.messageHistory.length;
+				chatIndex.firstKey = window.messageHistory.length ? getChatIndexedMessageKey(window.messageHistory[0]) : '';
 				window.__chatVirtualStartIndex = Math.max(0, Number(window.__chatVirtualStartIndex || 0) - 1);
 				window.__chatVirtualEndIndex = Math.max(window.__chatVirtualStartIndex, Number(window.__chatVirtualEndIndex || 0) - 1);
 			}
@@ -60499,7 +60736,7 @@ function getVisibleChatStackEl(id) {
 		});
 	
 		socketChat.on('message_edited', function(data) {
-			const existingEditedMsg = Array.isArray(window.messageHistory) ? window.messageHistory.find(m => String(new Date(m && m.time).getTime()) === String(data.msgId)) : null;
+			const existingEditedMsg = typeof getChatMessageByIdFast === 'function' ? getChatMessageByIdFast(data.msgId) : (Array.isArray(window.messageHistory) ? window.messageHistory.find(m => String(new Date(m && m.time).getTime()) === String(data.msgId)) : null);
 			const sameChatPayload = (left, right) => {
 				if (typeof window.getLiveRenderSignature === 'function') return window.getLiveRenderSignature(left) === window.getLiveRenderSignature(right);
 				try { return JSON.stringify(left) === JSON.stringify(right); } catch (e) { return left === right; }
@@ -60521,7 +60758,7 @@ function getVisibleChatStackEl(id) {
 			if (data.type === 'poll') {
 				const isPollContentEdit = String(data.newText == null ? '' : data.newText) === '';
 				if (window.messageHistory) {
-					const msg = window.messageHistory.find(m => String(new Date(m.time).getTime()) === String(data.msgId));
+					const msg = typeof getChatMessageByIdFast === 'function' ? getChatMessageByIdFast(data.msgId) : window.messageHistory.find(m => String(new Date(m.time).getTime()) === String(data.msgId));
 					if (msg) {
 						msg.type = 'poll';
 						msg.content = data.content;
@@ -60547,6 +60784,7 @@ function getVisibleChatStackEl(id) {
 					}
 				}
 				
+				if (typeof markChatMessageRenderDirty === 'function') markChatMessageRenderDirty(existingEditedMsg);
 				if (typeof syncRenderedChatMessageSignature === 'function') syncRenderedChatMessageSignature(data.msgId);
 				if (typeof updateChatHistoryRenderSignature === 'function') updateChatHistoryRenderSignature();
 				if (typeof refreshChatNotificationDot === 'function') refreshChatNotificationDot();
@@ -60561,7 +60799,7 @@ function getVisibleChatStackEl(id) {
 			if (globalRoleAfterEdit === 'moderator') globalRoleAfterEdit = 'mod';
 
 			if (window.messageHistory) {
-				const msg = window.messageHistory.find(m => String(new Date(m.time).getTime()) === String(data.msgId));
+				const msg = typeof getChatMessageByIdFast === 'function' ? getChatMessageByIdFast(data.msgId) : window.messageHistory.find(m => String(new Date(m.time).getTime()) === String(data.msgId));
 				if (msg) {
 					wasGlobalBeforeEdit = typeof isChatGlobalPingMessage === 'function' ? isChatGlobalPingMessage(msg, msg.user) : msg.isGlobalPing === true;
 					globalRoleBeforeEdit = wasGlobalBeforeEdit && typeof getChatGlobalPingRole === 'function' ? getChatGlobalPingRole(msg, msg.user) : '';
@@ -60585,6 +60823,8 @@ function getVisibleChatStackEl(id) {
 					editedHistoryMsg = msg;
 				}
 			}
+
+			if (editedHistoryMsg && typeof markChatMessageRenderDirty === 'function') markChatMessageRenderDirty(editedHistoryMsg);
 
 			if (wasGlobalBeforeEdit !== isGlobalAfterEdit || (isGlobalAfterEdit && globalRoleBeforeEdit && globalRoleBeforeEdit !== globalRoleAfterEdit)) {
 				if (!wasGlobalBeforeEdit && isGlobalAfterEdit && editedHistoryMsg) {
@@ -61448,8 +61688,7 @@ function getVisibleChatStackEl(id) {
 				let previousCountValues = window.__profileCountsValuesByUser[name] && typeof window.__profileCountsValuesByUser[name] === 'object' ? window.__profileCountsValuesByUser[name] : null;
 				if (!previousCountValues) {
 					previousCountValues = {};
-					const findCachedUser = list => Array.isArray(list) ? (list.find(item => item && (item.name || item) === name) || null) : null;
-					const cachedUser = findCachedUser(window.currentOnlineList) || findCachedUser(window.globalSearchResults) || findCachedUser(window.adminAllUsers);
+					const cachedUser = typeof window.findPsnUserByName === 'function' ? window.findPsnUserByName(name) : null;
 					Object.entries(countFields).forEach(([field, meta]) => {
 						const raw = localStorage.getItem(`${name}_psn_${meta[0]}`);
 						if (raw !== null) previousCountValues[field] = Math.max(0, Number(raw) || 0);
@@ -61462,18 +61701,25 @@ function getVisibleChatStackEl(id) {
 				Object.entries(countFields).forEach(([field, meta]) => {
 					if (!Object.prototype.hasOwnProperty.call(data, field)) return;
 					const value = Math.max(0, Number(data[field]) || 0);
-					if (!Object.prototype.hasOwnProperty.call(previousCountValues, field) || Number(previousCountValues[field]) !== value) changedCountFields.add(field);
+					const fieldChanged = !Object.prototype.hasOwnProperty.call(previousCountValues, field) || Number(previousCountValues[field]) !== value;
+					if (fieldChanged) {
+						changedCountFields.add(field);
+						/* previousCountValues is seeded from storage once, so an unchanged realtime count does not
+						   need another localStorage read/write on every server notification. */
+						safeLocalStorageSet(`${name}_psn_${meta[0]}`, String(value));
+					}
 					nextCountValues[field] = value;
-					const storageKey = `${name}_psn_${meta[0]}`;
-					const previousRaw = localStorage.getItem(storageKey);
-					const previousStoredValue = previousRaw === null ? null : Math.max(0, Number(previousRaw) || 0);
-					if (previousStoredValue !== value) safeLocalStorageSet(storageKey, String(value));
 				});
 				window.__profileCountsValuesByUser[name] = nextCountValues;
 
-				const updateCachedUser = list => {
+				const updateCachedUser = (poolKey, list) => {
 					if (!Array.isArray(list)) return;
-					const user = list.find(item => item && (item.name || item) === name);
+					let user = null;
+					if (poolKey === 'online' && window.__currentOnlineUserByName instanceof Map) user = window.__currentOnlineUserByName.get(name) || null;
+					else if (poolKey === 'admin' && window.__adminAllUsersIndexByName instanceof Map && window.__adminAllUsersIndexSource === list) {
+						const index = window.__adminAllUsersIndexByName.get(name.toLowerCase());
+						if (index !== undefined) user = list[index] || null;
+					} else if (typeof window.getPsnNamedPoolUser === 'function') user = window.getPsnNamedPoolUser(poolKey, list, name);
 					if (!user || typeof user !== 'object') return;
 					Object.keys(countFields).forEach(field => {
 						if (!Object.prototype.hasOwnProperty.call(data, field)) return;
@@ -61483,9 +61729,9 @@ function getVisibleChatStackEl(id) {
 					if (data.profileUpdatedAt && Number(user.profileUpdatedAt || 0) !== Number(data.profileUpdatedAt)) user.profileUpdatedAt = Number(data.profileUpdatedAt) || user.profileUpdatedAt;
 				};
 
-				updateCachedUser(window.currentOnlineList);
-				updateCachedUser(window.globalSearchResults);
-				updateCachedUser(window.adminAllUsers);
+				updateCachedUser('online', window.currentOnlineList);
+				updateCachedUser('search', window.globalSearchResults);
+				updateCachedUser('admin', window.adminAllUsers);
 				if (changedCountFields.size === 0) return;
 				const myNameForCounts = localStorage.getItem('psn_username') || '';
 				if (name === myNameForCounts && typeof window.setSidebarCountPill === 'function') {
@@ -61745,52 +61991,68 @@ function getVisibleChatStackEl(id) {
 			}
 		});
 
+        /* TROPHY RARITY REALTIME: update only changed rarity labels and, when sorting by rarity,
+           reorder the existing card nodes with FLIP instead of rebuilding the whole trophy grid. */
+        window.applyTrophyRarityStatsIncremental = function(stats, changedIds = []) {
+            const view = document.getElementById('view-trophies');
+            const grid = document.getElementById('trophy-grid-container');
+            if (!view || !grid || !(view.style.display === 'block' || view.style.display === 'flex') || grid.dataset.rendered !== '1') return false;
+            const cards = Array.from(grid.querySelectorAll(':scope > .trophy-card[data-trophy-id]'));
+            if (!cards.length) return false;
+            const changedSet = new Set((Array.isArray(changedIds) ? changedIds : []).map(String));
+            for (let i = 0; i < cards.length; i++) {
+                const card = cards[i];
+                const id = String(card.dataset.trophyId || '');
+                if (!id || (changedSet.size && !changedSet.has(id))) continue;
+                const rarity = card.querySelector('.trophy-rarity-meta');
+                if (!rarity) continue;
+                const nextHtml = getTrophyRarityHtml(Number(stats && stats[id] || 0.1));
+                if (rarity.innerHTML !== nextHtml) rarity.innerHTML = nextHtml;
+            }
+
+            const sortSelect = document.getElementById('trophy-sort-select');
+            if (!sortSelect || sortSelect.value !== 'rarity') {
+                window.__trophyViewsDirty = false;
+                window.__lastTrophyRenderSignature = typeof psnTrophyRenderSignature === 'function' ? psnTrophyRenderSignature() : window.__lastTrophyRenderSignature;
+                return true;
+            }
+            const snapshot = typeof captureCollectionFilterMotion === 'function' ? captureCollectionFilterMotion('trophies', { orderFlip:true }) : null;
+            const currentIndex = new Map(cards.map((card, index) => [card, index]));
+            const multiplier = ((window.sortOrders && window.sortOrders.trophy) || 'desc') === 'asc' ? -1 : 1;
+            cards.sort((a, b) => {
+                const aPct = Number(stats && stats[a.dataset.trophyId] || 0.1);
+                const bPct = Number(stats && stats[b.dataset.trophyId] || 0.1);
+                const diff = (aPct - bPct) * multiplier;
+                return diff || (currentIndex.get(a) - currentIndex.get(b));
+            });
+            const fragment = document.createDocumentFragment();
+            cards.forEach(card => fragment.appendChild(card));
+            grid.appendChild(fragment);
+            if (snapshot) {
+                if (typeof restoreCollectionFilterScroll === 'function') restoreCollectionFilterScroll(snapshot);
+                if (typeof animateCollectionFilterMotion === 'function') animateCollectionFilterMotion(snapshot);
+                requestAnimationFrame(() => { if (typeof restoreCollectionFilterScroll === 'function') restoreCollectionFilterScroll(snapshot); });
+            }
+            window.__trophyViewsDirty = false;
+            window.__lastTrophyRenderSignature = typeof psnTrophyRenderSignature === 'function' ? psnTrophyRenderSignature() : window.__lastTrophyRenderSignature;
+            return true;
+        };
+
         socketChat.on('global_trophy_stats', function(stats) {
-			stats = stats && typeof stats === 'object' ? stats : {};
-			const previousStats = window.globalTrophyStats && typeof window.globalTrophyStats === 'object' ? window.globalTrophyStats : {};
-			const changedTrophyStatIds = [...new Set([...Object.keys(previousStats), ...Object.keys(stats)])].filter(id => Number(previousStats[id] || 0.1) !== Number(stats[id] || 0.1));
-			window.globalTrophyStats = stats;
-			if (changedTrophyStatIds.length === 0) return;
-			if (document.getElementById('view-trophies')?.style.display === 'block') {
-				const sortSelect = document.getElementById('trophy-sort-select');
-				const currentSort = sortSelect ? sortSelect.value : 'default';
+            stats = stats && typeof stats === 'object' ? stats : {};
+            const previousStats = window.globalTrophyStats && typeof window.globalTrophyStats === 'object' ? window.globalTrophyStats : {};
+            const keySet = new Set(Object.keys(previousStats));
+            Object.keys(stats).forEach(key => keySet.add(key));
+            const changedTrophyStatIds = [];
+            keySet.forEach(id => { if (Number(previousStats[id] || 0.1) !== Number(stats[id] || 0.1)) changedTrophyStatIds.push(id); });
+            window.globalTrophyStats = stats;
+            if (changedTrophyStatIds.length === 0) return;
+            if (document.getElementById('view-trophies')?.style.display === 'block') {
+                const appliedIncrementally = typeof window.applyTrophyRarityStatsIncremental === 'function' && window.applyTrophyRarityStatsIncremental(stats, changedTrophyStatIds);
+                if (!appliedIncrementally && typeof window.refreshTrophiesWithMotion === 'function') window.refreshTrophiesWithMotion({ revealNew:false });
+            } else window.__trophyViewsDirty = true;
+        });
 
-				if (currentSort === 'rarity') {
-					if (typeof window.refreshTrophiesWithMotion === 'function') window.refreshTrophiesWithMotion({ revealNew:false });
-				} else {
-					changedTrophyStatIds.forEach(id => {
-						const card = document.getElementById(`trophy-card-${id}`);
-						if (card) {
-							let realPercent = stats[id] || 0.1;
-							let rarityText = "Common";
-							let t1Color = 'rgba(255,255,255,0.15)', t2Color = 'rgba(255,255,255,0.15)', t3Color = 'rgba(255,255,255,0.15)', t4Color = 'rgba(255,255,255,0.15)';
-
-							if (realPercent <= 5) { rarityText = "Ultra Rare"; t1Color = '#00f0ff'; }
-							else if (realPercent <= 15) { rarityText = "Very Rare"; t2Color = '#ffcc00'; }
-							else if (realPercent <= 35) { rarityText = "Rare"; t3Color = '#c0c0c0'; }
-							else { t4Color = '#cd7f32'; }
-
-							const infoDiv = card.querySelector('.trophy-card-info');
-							if (infoDiv && infoDiv.children.length >= 3) {
-								const rarityContainer = infoDiv.children[2];
-								rarityContainer.innerHTML = `
-									<svg viewBox="0 0 24 24" width="14" height="14" style="margin-right: 4px; transform: translateY(2px); flex-shrink: 0;">
-										<path d="M12,1 L15,7 L9,7 Z" fill="${t1Color}" />
-										<path d="M8.5,8 L15.5,8 L17.5,12 L6.5,12 Z" fill="${t2Color}" />
-										<path d="M6,13 L18,13 L20,17 L4,17 Z" fill="${t3Color}" />
-										<path d="M3.5,18 L20.5,18 L23,23 L1,23 Z" fill="${t4Color}" />
-									</svg>
-									${rarityText} 
-									<span style="opacity: 0.3; margin: 0 6px; transform: translateY(-1px);">|</span> 
-									Earned by ${realPercent.toFixed(1)}% of players
-								`;
-							}
-						}
-					});
-				}
-			}
-		});
-	
 		socketChat.on('game_play_together_state', payload => {
 			if (!payload || typeof window.setViewerPlayTogetherTitleState !== 'function') return;
 			window.setViewerPlayTogetherTitleState(payload.titleId, payload.enabled === true);
@@ -61899,19 +62161,10 @@ function getVisibleChatStackEl(id) {
 		const lastReadStr = loadState('psn_last_chat_read');
 		const lastReadTime = lastReadStr ? parseInt(lastReadStr) : 0;
 		const history = Array.isArray(window.messageHistory) ? window.messageHistory : (Array.isArray(messageHistory) ? messageHistory : []);
-		let unreadCount = 0;
-		let hasGlobal = false;
-		let hasMention = false;
-		for (let i = history.length - 1; i >= 0; i--) {
-			const m = history[i];
-			const msgTime = new Date(m && m.time).getTime();
-			if (!Number.isFinite(msgTime)) continue;
-			if (msgTime <= lastReadTime) break;
-			if (!m || m.user === myName) continue;
-			unreadCount++;
-			if (!hasGlobal && m.isGlobalPing) hasGlobal = true;
-			if (!hasMention && ((m.text && (typeof chatTextMentionsUser === 'function' ? chatTextMentionsUser(m.text, myName) : m.text.includes(`@${myName}`))) || (m.replyTo && m.replyTo.user === myName))) hasMention = true;
-		}
+		const unreadSummary = getChatUnreadSummaryCached(history, myName, lastReadTime);
+		const unreadCount = unreadSummary.unreadCount;
+		const hasGlobal = unreadSummary.hasGlobal;
+		const hasMention = unreadSummary.hasMention;
 		if (!dot) return;
 		const visible = unreadCount > 0;
 		const nextDisplay = visible ? 'block' : 'none';
@@ -63128,17 +63381,7 @@ function getVisibleChatStackEl(id) {
         if (!lastReadTime) return 0;
 
         const history = Array.isArray(window.messageHistory) ? window.messageHistory : [];
-        let count = 0;
-        // History is chronological. Walk backward and stop as soon as we cross the read cursor;
-        // in the common zero-unread case this turns a full-history scan into one or two checks.
-        for (let i = history.length - 1; i >= 0; i--) {
-            const msg = history[i];
-            const msgTime = new Date(msg && msg.time).getTime();
-            if (!Number.isFinite(msgTime)) continue;
-            if (msgTime <= lastReadTime) break;
-            if (msg && msg.user !== myName) count++;
-        }
-        return count;
+        return getChatUnreadSummaryCached(history, myName, lastReadTime).unreadCount;
     }
 
     function updateJumpBottomUnreadBadge(forcedCount) {
@@ -63255,6 +63498,8 @@ function getVisibleChatStackEl(id) {
     let chatScrollUiFrame = 0;
     const chatMessagesScrollBox = document.getElementById('chat-messages');
     if (chatMessagesScrollBox) chatMessagesScrollBox.addEventListener('scroll', function() {
+        /* Context popover: once the message moves, the fixed reaction picker is no longer anchored. */
+        if (document.getElementById('active-reaction-picker') && typeof window.closeActivePicker === 'function') window.closeActivePicker();
         if (chatScrollUiFrame) return;
         chatScrollUiFrame = requestAnimationFrame(() => {
             chatScrollUiFrame = 0;
