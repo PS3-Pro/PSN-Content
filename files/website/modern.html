@@ -22493,10 +22493,37 @@ P
 	/* --- LARGE COLLECTION IMAGE RECYCLING (BROWSE / WISHLIST / MY GAMES / FAVORITES / DOWNLOADS) --- */
 	window.__collectionImageRecyclePlaceholder = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
 	const COLLECTION_MEMORY_IMAGE_SELECTOR = '#database-grid .game-img, #wishlist-grid .game-img, #ps3-local-grid .game-img, #ps3-favs-grid .game-img, #downloads-list .dl-mini-cover';
-	const collectionMemoryObservers = { main: null, downloads: null, mutations: null };
+	const COLLECTION_MEMORY_ROOT_IDS = ['database-grid', 'wishlist-grid', 'ps3-local-grid', 'ps3-favs-grid', 'downloads-list'];
+	const COLLECTION_MEMORY_ROOT_SELECTOR = COLLECTION_MEMORY_ROOT_IDS.map(id => `#${id}`).join(',');
+	const COLLECTION_MEMORY_LOCAL_IMAGE_SELECTOR = '.game-img, .dl-mini-cover';
+	const collectionMemoryObservers = { main: null, downloads: null, mutations: null, inactiveMutations: null };
+	const collectionMemoryTrackedImages = new Set();
+	let collectionMemoryActiveRootId = '';
 
 	function isCollectionMemoryImage(img) {
 		return !!(img && img.nodeType === 1 && img.matches?.(COLLECTION_MEMORY_IMAGE_SELECTOR));
+	}
+
+	function getCollectionMemoryRoot(node) {
+		if (!node || node.nodeType !== 1) return null;
+		return node.matches?.(COLLECTION_MEMORY_ROOT_SELECTOR) ? node : (node.closest?.(COLLECTION_MEMORY_ROOT_SELECTOR) || null);
+	}
+
+	function getCurrentCollectionMemoryActiveRootId() {
+		/* switchView commits the active top-level view with inline display:block. Reading that
+		   state avoids layout/style calculation on every navigation. */
+		const activeView = document.querySelector('.view-section[style*="display: block"]');
+		if (!activeView) return '';
+		if (activeView.id === 'view-browse') return 'database-grid';
+		if (activeView.id === 'view-wishlist') return 'wishlist-grid';
+		if (activeView.id === 'view-downloads') return 'downloads-list';
+		if (activeView.id !== 'view-library') return '';
+
+		const favs = document.getElementById('subview-favs');
+		if (favs && favs.style.display !== 'none') return 'ps3-favs-grid';
+		const games = document.getElementById('subview-games');
+		if (games && games.style.display !== 'none') return 'ps3-local-grid';
+		return '';
 	}
 
 	function getCollectionMemorySavedSrc(img) {
@@ -22562,30 +22589,44 @@ P
 				try { collectionMemoryObservers[observerKey]?.unobserve(img); } catch (e) {}
 			});
 		}
+		collectionMemoryTrackedImages.delete(img);
 		delete img.dataset.collectionMemoryObserver;
 	}
 
 	function registerCollectionMemoryImage(img) {
 		if (!isCollectionMemoryImage(img) || img.dataset.collectionMemoryObserver) return;
+		const root = getCollectionMemoryRoot(img);
+		if (!root || root.id !== collectionMemoryActiveRootId) return;
 		img.loading = 'lazy';
 		img.decoding = 'async';
 		const key = getCollectionMemoryObserverKey(img);
 		const observer = collectionMemoryObservers[key];
 		if (!observer) return;
 		img.dataset.collectionMemoryObserver = key;
+		collectionMemoryTrackedImages.add(img);
 		observer.observe(img);
 	}
 
 	function forEachCollectionMemoryImage(node, callback) {
 		if (!node || typeof callback !== 'function') return;
 		if (node.nodeType === 1 && isCollectionMemoryImage(node)) callback(node);
-		if (node.querySelectorAll) node.querySelectorAll(COLLECTION_MEMORY_IMAGE_SELECTOR).forEach(callback);
+		if (node.querySelectorAll) {
+			node.querySelectorAll(COLLECTION_MEMORY_LOCAL_IMAGE_SELECTOR).forEach(img => {
+				if (isCollectionMemoryImage(img)) callback(img);
+			});
+		}
 	}
 
 	function handleCollectionMemoryIntersection(entries) {
 		entries.forEach(entry => {
 			const img = entry.target;
 			if (!img?.isConnected) {
+				unregisterCollectionMemoryImage(img);
+				return;
+			}
+			const root = getCollectionMemoryRoot(img);
+			if (!root || root.id !== collectionMemoryActiveRootId) {
+				recycleCollectionImage(img);
 				unregisterCollectionMemoryImage(img);
 				return;
 			}
@@ -22606,6 +22647,109 @@ P
 		if (src && src !== window.__collectionImageRecyclePlaceholder) img.dataset.collectionImageRecycleSrc = src;
 	}
 
+	function recycleCollectionMemoryRoot(root) {
+		if (!root) return;
+		root.querySelectorAll(COLLECTION_MEMORY_LOCAL_IMAGE_SELECTOR).forEach(img => {
+			if (!isCollectionMemoryImage(img)) return;
+			unregisterCollectionMemoryImage(img);
+			recycleCollectionImage(img);
+		});
+	}
+
+	function recycleTrackedCollectionMemoryRoot(rootId) {
+		if (!rootId || !collectionMemoryTrackedImages.size) return;
+		for (const img of Array.from(collectionMemoryTrackedImages)) {
+			if (!img?.isConnected) {
+				unregisterCollectionMemoryImage(img);
+				continue;
+			}
+			const root = getCollectionMemoryRoot(img);
+			if (!root || root.id !== rootId) continue;
+			recycleCollectionImage(img);
+			unregisterCollectionMemoryImage(img);
+		}
+	}
+
+	function handleActiveCollectionMemoryMutations(mutations) {
+		mutations.forEach(mutation => {
+			if (mutation.type === 'attributes') {
+				const img = mutation.target;
+				if (!isCollectionMemoryImage(img) || img.dataset.collectionImageRecycled !== '1') return;
+				const src = String(img.getAttribute('src') || '').trim();
+				if (!src || src === window.__collectionImageRecyclePlaceholder) return;
+				img.dataset.collectionImageRecycleSrc = src;
+				queueMicrotask(() => {
+					if (img.isConnected && img.dataset.collectionImageRecycled === '1' && img.getAttribute('src') !== window.__collectionImageRecyclePlaceholder) {
+						img.src = window.__collectionImageRecyclePlaceholder;
+					}
+				});
+				return;
+			}
+			mutation.removedNodes.forEach(node => {
+				if (!node || node.nodeType !== 1) return;
+				if (node.dataset?.collectionMemoryObserver) unregisterCollectionMemoryImage(node);
+				node.querySelectorAll?.('[data-collection-memory-observer]').forEach(unregisterCollectionMemoryImage);
+			});
+			mutation.addedNodes.forEach(node => forEachCollectionMemoryImage(node, registerCollectionMemoryImage));
+		});
+	}
+
+	function handleInactiveCollectionMemoryMutations(mutations) {
+		/* Hidden collections only watch direct row/card replacement. No subtree/attribute tracking:
+		   newly rendered hidden cards are recycled once, while ordinary decoration inside them is free. */
+		mutations.forEach(mutation => {
+			mutation.removedNodes.forEach(node => {
+				if (!node || node.nodeType !== 1) return;
+				if (node.dataset?.collectionMemoryObserver) unregisterCollectionMemoryImage(node);
+				node.querySelectorAll?.('[data-collection-memory-observer]').forEach(unregisterCollectionMemoryImage);
+			});
+			mutation.addedNodes.forEach(node => forEachCollectionMemoryImage(node, img => {
+				unregisterCollectionMemoryImage(img);
+				recycleCollectionImage(img);
+			}));
+		});
+	}
+
+	function syncCollectionMemoryActiveContext(options = {}) {
+		const forceScanAll = options === true || !!options.forceScanAll;
+		const activeObserver = collectionMemoryObservers.mutations;
+		const inactiveObserver = collectionMemoryObservers.inactiveMutations;
+		if (!activeObserver || !inactiveObserver) return;
+
+		/* Do not lose a DOM batch that landed in the same task as navigation. */
+		try {
+			const pendingActive = activeObserver.takeRecords();
+			if (pendingActive.length) handleActiveCollectionMemoryMutations(pendingActive);
+			const pendingInactive = inactiveObserver.takeRecords();
+			if (pendingInactive.length) handleInactiveCollectionMemoryMutations(pendingInactive);
+		} catch (e) {}
+		try { activeObserver.disconnect(); } catch (e) {}
+		try { inactiveObserver.disconnect(); } catch (e) {}
+		if (document.hidden || window.__collectionMemoryOptimizationEnabled === false) return;
+
+		const nextRootId = getCurrentCollectionMemoryActiveRootId();
+		const previousRootId = collectionMemoryActiveRootId;
+		const contextChanged = nextRootId !== previousRootId;
+
+		if (contextChanged && previousRootId) recycleTrackedCollectionMemoryRoot(previousRootId);
+		collectionMemoryActiveRootId = nextRootId;
+
+		for (const rootId of COLLECTION_MEMORY_ROOT_IDS) {
+			const root = document.getElementById(rootId);
+			if (!root) continue;
+			if (rootId === nextRootId) {
+				activeObserver.observe(root, { childList: true, subtree: true, attributes: true, attributeFilter: ['src'] });
+				/* A context switch only scans the collection being opened. */
+				if (contextChanged || forceScanAll) root.querySelectorAll(COLLECTION_MEMORY_LOCAL_IMAGE_SELECTOR).forEach(img => { if (isCollectionMemoryImage(img)) registerCollectionMemoryImage(img); });
+			} else {
+				/* Direct children only: hidden grids stay recycled without observing every inner mutation. */
+				inactiveObserver.observe(root, { childList: true });
+				if (forceScanAll) recycleCollectionMemoryRoot(root);
+			}
+		}
+	}
+	window.syncCollectionMemoryActiveContext = syncCollectionMemoryActiveContext;
+
 	function setupCollectionMemoryManager() {
 		if (window.__collectionMemoryOptimizationEnabled === false) return;
 		if (collectionMemoryObservers.mutations || typeof IntersectionObserver !== 'function') return;
@@ -22622,48 +22766,17 @@ P
 			rootMargin: '1200px 0px 1200px 0px',
 			threshold: 0.01
 		});
+		collectionMemoryObservers.mutations = new MutationObserver(handleActiveCollectionMemoryMutations);
+		collectionMemoryObservers.inactiveMutations = new MutationObserver(handleInactiveCollectionMemoryMutations);
 
-		document.querySelectorAll(COLLECTION_MEMORY_IMAGE_SELECTOR).forEach(registerCollectionMemoryImage);
-
-		collectionMemoryObservers.mutations = new MutationObserver(mutations => {
-			mutations.forEach(mutation => {
-				if (mutation.type === 'attributes') {
-					const img = mutation.target;
-					if (!isCollectionMemoryImage(img) || img.dataset.collectionImageRecycled !== '1') return;
-					const src = String(img.getAttribute('src') || '').trim();
-					if (!src || src === window.__collectionImageRecyclePlaceholder) return;
-					img.dataset.collectionImageRecycleSrc = src;
-					queueMicrotask(() => {
-						if (img.isConnected && img.dataset.collectionImageRecycled === '1' && img.getAttribute('src') !== window.__collectionImageRecyclePlaceholder) {
-							img.src = window.__collectionImageRecyclePlaceholder;
-						}
-					});
-					return;
-				}
-				mutation.removedNodes.forEach(node => {
-					if (!node || node.nodeType !== 1) return;
-					if (node.dataset?.collectionMemoryObserver) unregisterCollectionMemoryImage(node);
-					node.querySelectorAll?.('[data-collection-memory-observer]').forEach(unregisterCollectionMemoryImage);
-				});
-				mutation.addedNodes.forEach(node => forEachCollectionMemoryImage(node, registerCollectionMemoryImage));
-			});
-		});
-		syncCollectionMemoryMutationObserverActivity();
-
+		/* Initial pass: active collection is observed; every hidden collection is recycled once. */
+		syncCollectionMemoryActiveContext({ forceScanAll: true });
 		document.addEventListener('load', onCollectionMemoryImageLoad, true);
 	}
 
-	function syncCollectionMemoryMutationObserverActivity() {
-		const observer = collectionMemoryObservers.mutations;
-		if (!observer) return;
-		try { observer.disconnect(); } catch (e) {}
-		if (document.hidden || window.__collectionMemoryOptimizationEnabled === false) return;
-		['database-grid', 'wishlist-grid', 'ps3-local-grid', 'ps3-favs-grid', 'downloads-list'].forEach(id => {
-			const root = document.getElementById(id);
-			if (root) observer.observe(root, { childList: true, subtree: true, attributes: true, attributeFilter: ['src'] });
-		});
-		/* Any rows created by realtime/cache work while the tab slept are registered once on wake. */
-		document.querySelectorAll(COLLECTION_MEMORY_IMAGE_SELECTOR).forEach(registerCollectionMemoryImage);
+	function syncCollectionMemoryMutationObserverActivity(forceScanAll = false) {
+		if (!collectionMemoryObservers.mutations) return;
+		syncCollectionMemoryActiveContext({ forceScanAll });
 	}
 
 	function teardownCollectionMemoryManager() {
@@ -22671,9 +22784,13 @@ P
 		try { collectionMemoryObservers.main?.disconnect(); } catch (e) {}
 		try { collectionMemoryObservers.downloads?.disconnect(); } catch (e) {}
 		try { collectionMemoryObservers.mutations?.disconnect(); } catch (e) {}
+		try { collectionMemoryObservers.inactiveMutations?.disconnect(); } catch (e) {}
 		collectionMemoryObservers.main = null;
 		collectionMemoryObservers.downloads = null;
 		collectionMemoryObservers.mutations = null;
+		collectionMemoryObservers.inactiveMutations = null;
+		collectionMemoryTrackedImages.clear();
+		collectionMemoryActiveRootId = '';
 		document.removeEventListener('load', onCollectionMemoryImageLoad, true);
 		document.querySelectorAll(COLLECTION_MEMORY_IMAGE_SELECTOR).forEach(img => {
 			delete img.dataset.collectionMemoryObserver;
@@ -22681,7 +22798,6 @@ P
 			delete img.dataset.collectionImageRecycleSrc;
 		});
 	}
-
 
 	window.setCollectionMemoryOptimizationEnabled = function(enabled) {
 		const next = enabled !== false;
@@ -22703,7 +22819,7 @@ P
 	document.addEventListener('visibilitychange', () => {
 		if (window.__collectionMemoryOptimizationEnabled === false) return;
 		if (!collectionMemoryObservers.mutations && !document.hidden) setupCollectionMemoryManager();
-		else syncCollectionMemoryMutationObserverActivity();
+		else syncCollectionMemoryMutationObserverActivity(!document.hidden);
 	}, { passive: true });
 
 
@@ -25147,6 +25263,7 @@ P
 						<p style="font-size: 13px; color: var(--text-muted); margin-bottom: ${actionBtn ? '20px' : '0'};">${emptyDesc}</p>
 						${actionBtn}
 					</div>`);
+				if (typeof window.registerPsnPageEmptyStates === 'function') window.registerPsnPageEmptyStates(grid.lastElementChild);
 				return;
 			}
 		}
@@ -31311,6 +31428,7 @@ P
 					<div style="font-size: 18px;">No download history.</div>
 					<p style="font-size: 13px; color: var(--text-muted);">Packages you download will appear here.</p>
 				</div>`;
+			if (typeof window.registerPsnPageEmptyStates === 'function') window.registerPsnPageEmptyStates(listContainer.firstElementChild);
 			if(statCount) statCount.innerText = "0";
 			if(statSize) statSize.innerText = "0 KB";
 			if(globalCount) globalCount.innerText = "(0 items)";
@@ -34469,6 +34587,10 @@ P
 		scrollArea.__adminAnnouncementScrollInstalled = true;
 		let scheduled = false;
 		scrollArea.addEventListener('scroll', () => {
+			/* This handler is session-wide because announcements can appear later, but do not
+			   wake a frame on every page scroll when there is no active banner to update. */
+			const bar = document.getElementById('admin-pinned-announcement-bar');
+			if (!bar || bar.classList.contains('is-auth-exiting')) return;
 			if (scheduled) return;
 			scheduled = true;
 			requestAnimationFrame(() => {
@@ -36706,6 +36828,7 @@ P
 			}
 			target.style.display = 'block';
             psnCurrentViewCache = target;
+            if (typeof window.refreshInterfaceTranslationContext === 'function') window.refreshInterfaceTranslationContext(target, { immediate: true, scan: true });
 			if (typeof window.refreshLocalPs3PlayTimeTickerState === 'function') {
 				const profileModalOpen = !!(PSN_STATIC_NAV_DOM.profileModal && PSN_STATIC_NAV_DOM.profileModal.classList.contains('show') && PSN_STATIC_NAV_DOM.profileModal.style.display !== 'none');
 				if (viewId === 'view-library' || window.__localPs3PlayTimeTicker || profileModalOpen) window.refreshLocalPs3PlayTimeTickerState();
@@ -37067,6 +37190,8 @@ P
         if (typeof window.updateScrollButtonsVisibility === 'function') window.updateScrollButtonsVisibility(true);
 		if (typeof window.adminSyncBackgroundTimers === 'function') window.adminSyncBackgroundTimers();
 		if (typeof window.syncRevivedPlayersOnlineUpdates === 'function') window.syncRevivedPlayersOnlineUpdates();
+		if (typeof window.syncCollectionMemoryActiveContext === 'function') window.syncCollectionMemoryActiveContext();
+		if (typeof window.syncCollectionSurpriseObserverContext === 'function') window.syncCollectionSurpriseObserverContext();
 		if (typeof onShown === 'function') onShown(viewId);
 	};
 
@@ -37135,20 +37260,20 @@ P
        the floating buttons. Hidden grids can still receive realtime/cache updates, but those
        mutations do not need to wake scroll UI work until the user actually opens that view. */
     const scrollButtonMutationRoots = {
-        browse: scrollButtonViews.browse,
-        wishlist: scrollButtonViews.wishlist,
-        downloads: scrollButtonViews.downloads,
-        games: scrollButtonViews.games,
-        favorites: scrollButtonViews.favorites
+        browse: document.getElementById('database-grid'),
+        wishlist: document.getElementById('wishlist-grid'),
+        downloads: document.getElementById('downloads-list'),
+        games: document.getElementById('ps3-local-grid'),
+        favorites: document.getElementById('ps3-favs-grid')
     };
-    const isScrollButtonRelevantMutationNode = node => !(node && node.nodeType === 1 && node.matches?.('.psn-card-pointer-light'));
     const scrollObserver = new MutationObserver(mutations => {
+        /* The active grid/list owns its cards as direct children. Internal card decoration
+           cannot change the main scroll contract by itself; ResizeObserver handles real
+           geometry changes. Only row/card insertion/removal needs this wake-up. */
         for (const mutation of mutations) {
-            for (const node of mutation.addedNodes || []) {
-                if (isScrollButtonRelevantMutationNode(node)) { updateScrollButtonsVisibility(); return; }
-            }
-            for (const node of mutation.removedNodes || []) {
-                if (isScrollButtonRelevantMutationNode(node)) { updateScrollButtonsVisibility(); return; }
+            if ((mutation.addedNodes && mutation.addedNodes.length) || (mutation.removedNodes && mutation.removedNodes.length)) {
+                updateScrollButtonsVisibility();
+                return;
             }
         }
     });
@@ -37174,7 +37299,7 @@ P
         if (scrollLayoutObserver) scrollLayoutObserver.disconnect();
         scrollObservedRoot = nextRoot || null;
         if (!scrollObservedRoot) return;
-        scrollObserver.observe(scrollObservedRoot, { childList: true, subtree: true });
+        scrollObserver.observe(scrollObservedRoot, { childList: true });
         if (scrollLayoutObserver) scrollLayoutObserver.observe(scrollObservedRoot);
     }
 
@@ -38337,9 +38462,11 @@ P
 
 	(function setupCollectionSurpriseButtonSync() {
 		const gridScopes = { 'wishlist-grid': 'wishlist', 'ps3-local-grid': 'library', 'ps3-favs-grid': 'favorites' };
-		const scopes = Object.values(gridScopes);
+		const scopeGridIds = { wishlist: 'wishlist-grid', library: 'ps3-local-grid', favorites: 'ps3-favs-grid' };
 		const pendingScopes = new Set();
 		let frame = 0;
+		let observedGrid = null;
+		let observedScope = '';
 		const sync = () => {
 			frame = 0;
 			const targets = Array.from(pendingScopes);
@@ -38351,36 +38478,70 @@ P
 			if (frame) return;
 			frame = requestAnimationFrame(sync);
 		};
+
+		const getActiveScope = () => {
+			if (document.hidden) return '';
+			const wishlistView = document.getElementById('view-wishlist');
+			if (wishlistView?.style.display === 'block') return 'wishlist';
+			const libraryView = document.getElementById('view-library');
+			if (libraryView?.style.display !== 'block') return '';
+			const favs = document.getElementById('subview-favs');
+			if (favs && favs.style.display !== 'none') return 'favorites';
+			const games = document.getElementById('subview-games');
+			if (games && games.style.display !== 'none') return 'library';
+			return '';
+		};
+
+		const observer = new MutationObserver(mutations => {
+			if (!observedScope || !observedGrid) return;
+			for (const mutation of mutations) {
+				if (mutation.type === 'childList') {
+					if (mutation.target === observedGrid) { schedule(observedScope); return; }
+					const touchesGameCard = node => !!(node && node.nodeType === 1 && (node.matches?.('.game-card') || node.querySelector?.('.game-card')));
+					for (const node of mutation.addedNodes || []) { if (touchesGameCard(node)) { schedule(observedScope); return; } }
+					for (const node of mutation.removedNodes || []) { if (touchesGameCard(node)) { schedule(observedScope); return; } }
+					continue;
+				}
+				if (mutation.type === 'attributes' && mutation.target?.matches?.('.game-card')) {
+					/* Active filtering/removal can change whether two usable cards remain. */
+					schedule(observedScope);
+					return;
+				}
+			}
+		});
+
+		window.syncCollectionSurpriseObserverContext = function() {
+			/* Preserve a mutation that landed in the same task as navigation before sleeping
+			   the old collection. */
+			try {
+				const pending = observer.takeRecords();
+				if (pending.length && observedScope) schedule(observedScope);
+			} catch (e) {}
+
+			const nextScope = getActiveScope();
+			const nextGrid = nextScope ? document.getElementById(scopeGridIds[nextScope]) : null;
+			if (nextScope === observedScope && nextGrid === observedGrid && nextGrid && !document.hidden) {
+				schedule(nextScope);
+				return;
+			}
+
+			try { observer.disconnect(); } catch (e) {}
+			observedScope = nextScope;
+			observedGrid = nextGrid || null;
+			if (!observedGrid || !observedScope || document.hidden) return;
+
+			/* Only the visible collection pays subtree/class observation. Hidden Wishlist/My Games/
+			   Favorites are synchronized once when opened instead of waking in the background. */
+			observer.observe(observedGrid, { childList: true, subtree: true, attributes: true, attributeFilter: ['class'] });
+			schedule(observedScope);
+		};
+
 		const bind = () => {
-			Object.entries(gridScopes).forEach(([id, scope]) => {
-				const grid = document.getElementById(id);
-				if (!grid) return;
-				new MutationObserver(mutations => {
-					for (const mutation of mutations) {
-						if (mutation.type === 'childList') {
-							if (mutation.target === grid) { schedule(scope); return; }
-							const touchesGameCard = node => !!(node && node.nodeType === 1 && (node.matches?.('.game-card') || node.querySelector?.('.game-card')));
-							let changedCardStructure = false;
-							for (const node of mutation.addedNodes || []) { if (touchesGameCard(node)) { changedCardStructure = true; break; } }
-							if (!changedCardStructure) {
-								for (const node of mutation.removedNodes || []) { if (touchesGameCard(node)) { changedCardStructure = true; break; } }
-							}
-							if (changedCardStructure) { schedule(scope); return; }
-							continue;
-						}
-						if (mutation.type === 'attributes' && mutation.target?.matches?.('.game-card')) {
-							// Class changes may alter remove/filter states. Inline style is intentionally not
-							// observed: pointer-light animation writes CSS variables to card.style every frame.
-							schedule(scope);
-							return;
-						}
-					}
-				}).observe(grid, { childList: true, subtree: true, attributes: true, attributeFilter: ['class'] });
-			});
-			scopes.forEach(schedule);
+			window.syncCollectionSurpriseObserverContext();
 		};
 		if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', bind, { once: true });
 		else bind();
+		document.addEventListener('visibilitychange', () => window.syncCollectionSurpriseObserverContext(), { passive: true });
 	})();
 
 	window.syncBrowseSurpriseButtonState = function(itemCount) {
@@ -38943,6 +39104,7 @@ P
 					<div style="font-size: 18px;">Your wishlist is empty.</div>
 					<p style="font-size: 13px; color: var(--text-muted);">Save games you want to download later!</p>
 				</div>`;
+			if (typeof window.registerPsnPageEmptyStates === 'function') window.registerPsnPageEmptyStates(grid.firstElementChild);
 			if (countSpan) countSpan.innerText = "(0 items)";
 			if (dot) dot.style.display = 'none';
 			
@@ -39165,6 +39327,7 @@ P
 					<p style="font-size: 13px; color: var(--text-muted); margin-bottom: 20px;">${emptyDesc}</p>
 					${actionBtn}
 				</div>`;
+			if (typeof window.registerPsnPageEmptyStates === 'function') window.registerPsnPageEmptyStates(grid.firstElementChild);
 			
 			if (typeof renderWishLetterFilter === 'function') renderWishLetterFilter();
 			return;
@@ -42403,6 +42566,7 @@ P
 				<p style="font-size: 13px; color: var(--text-muted);">Please click the connect button in the header when the PS3™ is turned on.</p>
 			</div>`;
 		if (grid.innerHTML !== nextHtml) grid.innerHTML = nextHtml;
+		if (typeof window.registerPsnPageEmptyStates === 'function') window.registerPsnPageEmptyStates(grid.firstElementChild);
 	}
 	window.renderPS3LibraryOfflineState = renderPS3LibraryOfflineState;
 
@@ -42575,6 +42739,7 @@ P
 					<div style="font-size: 18px;">Connection failed.</div>
 					<p style="font-size: 13px; color: var(--text-muted);">Could not connect to PS3™. webMAN might be busy or the IP changed.</p>
 				</div>`;
+				if (typeof window.registerPsnPageEmptyStates === 'function') window.registerPsnPageEmptyStates(grid.firstElementChild);
 			}
 		}
 	}
@@ -43202,6 +43367,7 @@ function formatLibraryLastPlayedBadge(game = {}) {
 				<p style="font-size: 13px; color: var(--text-muted); margin-bottom: 20px;">${emptyDesc}</p>
 				${actionBtn}
 			</div>`;
+			if (typeof window.registerPsnPageEmptyStates === 'function') window.registerPsnPageEmptyStates(grid.firstElementChild);
 			return;
 		}
 	
@@ -43213,6 +43379,7 @@ function formatLibraryLastPlayedBadge(game = {}) {
 				<div style="font-size: 18px;">No games found.</div>
 				<p style="font-size: 13px; color: var(--text-muted);">We couldn't find any installed games on this console.</p>
 			</div>`;
+			if (typeof window.registerPsnPageEmptyStates === 'function') window.registerPsnPageEmptyStates(grid.firstElementChild);
 			return;
 		}
 	
@@ -44094,6 +44261,7 @@ function formatLibraryLastPlayedBadge(game = {}) {
 				<div style="font-size: 18px;">No active favorites found.</div>
 				<p style="font-size: 13px; color: var(--text-muted);">Mark your installed games with a star or check if your USB/HDD is pluged in.</p>
 			</div>`;
+			if (typeof window.registerPsnPageEmptyStates === 'function') window.registerPsnPageEmptyStates(grid.firstElementChild);
 			
 			if (dot) dot.style.display = 'none';
 			return;
@@ -44280,6 +44448,7 @@ function formatLibraryLastPlayedBadge(game = {}) {
 				<p style="font-size: 13px; color: var(--text-muted); margin-bottom: 20px;">${emptyDesc}</p>
 				${actionBtn}
 			</div>`;
+			if (typeof window.registerPsnPageEmptyStates === 'function') window.registerPsnPageEmptyStates(grid.firstElementChild);
 			return;
 		}
 
@@ -47940,6 +48109,8 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 		// Library subviews switch by toggling the parent display directly. Empty states only
 		// observe their own visual attributes, so recalculate once after the subview becomes visible.
 		if (typeof window.refreshPsnPageEmptyStates === 'function') window.refreshPsnPageEmptyStates();
+		if (typeof window.syncCollectionMemoryActiveContext === 'function') window.syncCollectionMemoryActiveContext();
+		if (typeof window.syncCollectionSurpriseObserverContext === 'function') window.syncCollectionSurpriseObserverContext();
 		if (typeof window.updateScrollButtonsVisibility === 'function') window.updateScrollButtonsVisibility(true);
 	}
 
@@ -49502,6 +49673,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 		}
 
 		grid.innerHTML = html;
+		if (grid.firstElementChild?.classList.contains('psn-page-empty-state') && typeof window.registerPsnPageEmptyStates === 'function') window.registerPsnPageEmptyStates(grid.firstElementChild);
 		grid.dataset.rendered = '1';
 		if (!isSilent && options.replayEntry !== false && typeof setupRevealAnimations === 'function') {
 			setupRevealAnimations('trophy-grid-container', { selector: '.trophy-card' });
@@ -50197,14 +50369,63 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
     }
     window.isChatPresenceUiReady = isChatPresenceUiReady;
 
-    function applyChatPresenceUiRefresh(users = window.currentOnlineList || [], onlyUserName = '') {
-        if (!Array.isArray(users)) users = [];
-        const targetUserName = String(onlyUserName || '').trim();
-        const onlineUserByName = new Map();
-        users.forEach(user => {
-            const name = user && typeof user === 'object' ? user.name : user;
-            if (name && !onlineUserByName.has(name)) onlineUserByName.set(name, user);
+    function normalizeChatPresenceTargetNames(targets) {
+        if (targets == null || targets === '') return null;
+        const names = new Set();
+        if (typeof targets === 'string') {
+            const clean = targets.trim();
+            if (clean) names.add(clean);
+        } else if (targets instanceof Set || Array.isArray(targets)) {
+            targets.forEach(value => {
+                const clean = String(value || '').trim();
+                if (clean) names.add(clean);
+            });
+        } else if (targets && typeof targets[Symbol.iterator] === 'function') {
+            for (const value of targets) {
+                const clean = String(value || '').trim();
+                if (clean) names.add(clean);
+            }
+        }
+        return names.size ? names : null;
+    }
+
+    function getChatPresenceNodes(selector, targetNames = null) {
+        if (!(targetNames instanceof Set) || !targetNames.size) return document.querySelectorAll(selector);
+        /* A small realtime delta is cheaper as a handful of targeted queries than walking every
+           avatar/status node in a long chat. Large snapshots deliberately fall back to one full scan. */
+        if (targetNames.size > 12) return document.querySelectorAll(selector);
+        const nodes = [];
+        const canEscape = typeof CSS !== 'undefined' && CSS && typeof CSS.escape === 'function';
+        if (canEscape) {
+            targetNames.forEach(name => {
+                document.querySelectorAll(`${selector}[data-user="${CSS.escape(name)}"]`).forEach(node => nodes.push(node));
+            });
+            return nodes;
+        }
+        document.querySelectorAll(selector).forEach(node => {
+            if (targetNames.has(String(node.getAttribute('data-user') || ''))) nodes.push(node);
         });
+        return nodes;
+    }
+
+    function applyChatPresenceUiRefresh(users = window.currentOnlineList || [], targetUsers = '') {
+        if (!Array.isArray(users)) users = [];
+        let targetNames = normalizeChatPresenceTargetNames(targetUsers);
+        /* Once most of the snapshot changed, two full DOM queries are cheaper than N targeted ones. */
+        if (targetNames && targetNames.size > 12) targetNames = null;
+
+        const canUseCurrentIndex = users === window.currentOnlineList || (typeof currentOnlineList !== 'undefined' && users === currentOnlineList);
+        let onlineUserByName = canUseCurrentIndex && window.__currentOnlineUserByName instanceof Map
+            ? window.__currentOnlineUserByName
+            : null;
+        if (!onlineUserByName) {
+            onlineUserByName = new Map();
+            users.forEach(user => {
+                const name = user && typeof user === 'object' ? user.name : user;
+                if (name && !onlineUserByName.has(name)) onlineUserByName.set(name, user);
+            });
+        }
+
         const countElement = document.getElementById('online-count');
         if (countElement && window.__pendingOnlineCountText) {
             window.setLiveCountText(countElement, window.__pendingOnlineCountText, Number.parseInt(window.__pendingOnlineCountText, 10) || 0);
@@ -50217,9 +50438,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
         const isChatVisibleForPresence = typeof isChatScreenVisibleForRead === 'function' && isChatScreenVisibleForRead();
         const canHydrateMessageAvatars = !isChatVisibleForPresence || !avatarHydrationBlockedUntil || Date.now() >= avatarHydrationBlockedUntil;
 
-        const statusDots = targetUserName
-            ? document.querySelectorAll(`.chat-status-dot[data-user="${targetUserName}"]`)
-            : document.querySelectorAll('.chat-status-dot');
+        const statusDots = getChatPresenceNodes('.chat-status-dot', targetNames);
         statusDots.forEach(dot => {
             const dotUser = dot.getAttribute('data-user');
             const dotUserData = onlineUserByName.get(dotUser);
@@ -50233,9 +50452,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
             dot.style.color = isOnline ? '#4caf50' : 'rgba(255, 255, 255, 0.2)';
         });
 
-        const statusAvatars = targetUserName
-            ? document.querySelectorAll(`.chat-avatar-status[data-user="${targetUserName}"]`)
-            : document.querySelectorAll('.chat-avatar-status');
+        const statusAvatars = getChatPresenceNodes('.chat-avatar-status', targetNames);
         statusAvatars.forEach(img => {
             const imgUser = img.getAttribute('data-user');
             const uData = onlineUserByName.get(imgUser);
@@ -50270,8 +50487,12 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
         if (!canHydrateMessageAvatars && avatarHydrationBlockedUntil) {
             window.__pendingChatPresenceUiRefresh = true;
             window.__pendingChatPresenceUserNames = window.__pendingChatPresenceUserNames instanceof Set ? window.__pendingChatPresenceUserNames : new Set();
-            if (targetUserName && window.__pendingChatPresenceFullRefresh !== true) window.__pendingChatPresenceUserNames.add(targetUserName);
-            else { window.__pendingChatPresenceFullRefresh = true; window.__pendingChatPresenceUserNames.clear(); }
+            if (targetNames && window.__pendingChatPresenceFullRefresh !== true) {
+                targetNames.forEach(name => window.__pendingChatPresenceUserNames.add(name));
+            } else {
+                window.__pendingChatPresenceFullRefresh = true;
+                window.__pendingChatPresenceUserNames.clear();
+            }
             clearTimeout(window.__pendingChatPresenceUiTimer);
             window.__pendingChatPresenceUiTimer = setTimeout(flushPendingChatPresenceUiRefresh, Math.max(180, avatarHydrationBlockedUntil - Date.now() + 60));
         }
@@ -50292,7 +50513,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
         if (window.__pendingChatPresenceUserNames instanceof Set) window.__pendingChatPresenceUserNames.clear();
         if (typeof applyChatPresenceUiRefresh === 'function') {
             if (fullRefresh || !pendingNames.length) applyChatPresenceUiRefresh(window.currentOnlineList || []);
-            else pendingNames.forEach(name => applyChatPresenceUiRefresh(window.currentOnlineList || [], name));
+            else applyChatPresenceUiRefresh(window.currentOnlineList || [], pendingNames);
         }
         if (typeof isFriendsSubviewVisible === 'function' && isFriendsSubviewVisible()) {
             if (typeof window.applyCollectionToolbarFilterChange === 'function') window.applyCollectionToolbarFilterChange('friends', { revealNew:false });
@@ -50301,12 +50522,20 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
     }
     window.flushPendingChatPresenceUiRefresh = flushPendingChatPresenceUiRefresh;
 
-    function scheduleChatPresenceUiRefresh(onlyUserName = '') {
+    function scheduleChatPresenceUiRefresh(targetUsers = '') {
         window.__pendingChatPresenceUiRefresh = true;
         window.__pendingChatPresenceUserNames = window.__pendingChatPresenceUserNames instanceof Set ? window.__pendingChatPresenceUserNames : new Set();
-        const targetUserName = String(onlyUserName || '').trim();
-        if (targetUserName && window.__pendingChatPresenceFullRefresh !== true) window.__pendingChatPresenceUserNames.add(targetUserName);
-        else { window.__pendingChatPresenceFullRefresh = true; window.__pendingChatPresenceUserNames.clear(); }
+        const targetNames = normalizeChatPresenceTargetNames(targetUsers);
+        if (targetNames && targetNames.size <= 12 && window.__pendingChatPresenceFullRefresh !== true) {
+            targetNames.forEach(name => window.__pendingChatPresenceUserNames.add(name));
+            if (window.__pendingChatPresenceUserNames.size > 12) {
+                window.__pendingChatPresenceFullRefresh = true;
+                window.__pendingChatPresenceUserNames.clear();
+            }
+        } else {
+            window.__pendingChatPresenceFullRefresh = true;
+            window.__pendingChatPresenceUserNames.clear();
+        }
         clearTimeout(window.__pendingChatPresenceUiTimer);
         window.__pendingChatPresenceUiTimer = setTimeout(flushPendingChatPresenceUiRefresh, 160);
     }
@@ -60464,19 +60693,24 @@ function getVisibleChatStackEl(id) {
 			window.__currentOnlineActiveNames = activeOnlineNames;
 			if (window.__psnNamedPoolLookupCache) delete window.__psnNamedPoolLookupCache.online;
 			if (onlineSnapshotChanged && typeof invalidateChatMentionNameCaches === 'function') invalidateChatMentionNameCaches();
-			if (onlineSnapshotChanged && typeof window.syncPsnUserMetaBatch === 'function') {
+			if (onlineSnapshotChanged) {
+				/* ONLINE SNAPSHOT DELTA: after the O(n) snapshot ingest above, all downstream work scales
+				   with the users that actually changed instead of walking the whole online array again. */
 				const changedUsers = [];
-				for (let i = 0; i < users.length; i++) {
-					const u = users[i];
-					if (u && changedPresenceNames.has(String(u.name || ''))) changedUsers.push(u);
+				changedPresenceNames.forEach(userName => {
+					const u = onlineUserByName.get(userName) || null;
+					if (u) changedUsers.push(u);
+				});
+				if (changedUsers.length && typeof window.syncPsnUserMetaBatch === 'function') {
+					window.syncPsnUserMetaBatch(changedUsers, { skipFriendUpdate:true });
+				} else if (changedUsers.length && typeof window.syncPsnUserMeta === 'function') {
+					changedUsers.forEach(u => window.syncPsnUserMeta(u, { skipFriendUpdate:true }));
 				}
-				if (changedUsers.length) window.syncPsnUserMetaBatch(changedUsers, { skipFriendUpdate:true });
-			} else if (onlineSnapshotChanged && typeof window.syncPsnUserMeta === 'function') users.forEach(u => { if (u && changedPresenceNames.has(String(u.name || ''))) window.syncPsnUserMeta(u, { skipFriendUpdate:true }); });
-			if (onlineSnapshotChanged) users.forEach(u => {
-				if (!u || !u.name || !changedPresenceNames.has(String(u.name))) return;
-				const incomingStyle = (u.settingsData && (u.settingsData.profileCardStyle || u.settingsData.profileCardEffect)) || u.profileCardStyle || u.profileCardEffect || '';
-				if (incomingStyle && typeof writeProfileCardStyleForUser === 'function') writeProfileCardStyleForUser(u.name, incomingStyle);
-			});
+				changedUsers.forEach(u => {
+					const incomingStyle = (u.settingsData && (u.settingsData.profileCardStyle || u.settingsData.profileCardEffect)) || u.profileCardStyle || u.profileCardEffect || '';
+					if (incomingStyle && typeof writeProfileCardStyleForUser === 'function') writeProfileCardStyleForUser(u.name, incomingStyle);
+				});
+			}
 			const openedProfileUserForBanner = document.getElementById('modal-sys-profile')?.dataset?.profileUsername || document.getElementById('profile-name-val')?.innerText || '';
 			if (onlineSnapshotChanged && openedProfileUserForBanner && changedPresenceNames.has(openedProfileUserForBanner) && typeof refreshOpenProfileCardStyleForUser === 'function') refreshOpenProfileCardStyleForUser(openedProfileUserForBanner);
 			if (onlineSnapshotChanged && document.getElementById('view-admin')?.style.display === 'block' && typeof adminSchedulePanelRender === 'function') {
@@ -60502,15 +60736,17 @@ function getVisibleChatStackEl(id) {
 			if (onlineSnapshotChanged && window.friendsList && window.friendsList.length > 0) {
 				let changed = false;
 				let touched = false;
-				window.friendsList.forEach(friend => {
-					if (!friend || !changedPresenceNames.has(String(friend.name || ''))) return;
+				const friendMap = typeof window.getPsnNamedPoolMap === 'function' ? window.getPsnNamedPoolMap('friends', window.friendsList) : null;
+				changedPresenceNames.forEach(userName => {
+					const friend = friendMap ? friendMap.get(userName) : null;
+					if (!friend || typeof friend !== 'object') return;
 					touched = true;
-					const netData = onlineUserByName.get(friend.name) || null;
+					const netData = onlineUserByName.get(userName) || null;
 					if (netData && netData.lastSeen !== friend.lastSeen) {
 						friend.lastSeen = netData.lastSeen;
 						changed = true;
 					}
-					const resolvedFriendAvatar = (typeof getResolvedUserAvatar === 'function') ? getResolvedUserAvatar(friend.name, netData?.avatar || friend.avatar) : (netData?.avatar || friend.avatar);
+					const resolvedFriendAvatar = (typeof getResolvedUserAvatar === 'function') ? getResolvedUserAvatar(userName, netData?.avatar || friend.avatar) : (netData?.avatar || friend.avatar);
 					if (resolvedFriendAvatar && friend.avatar !== resolvedFriendAvatar) {
 						friend.avatar = resolvedFriendAvatar;
 						changed = true;
@@ -60529,9 +60765,12 @@ function getVisibleChatStackEl(id) {
 			}
 		
 			if (deferChatPresenceUi) {
-				if (typeof scheduleChatPresenceUiRefresh === 'function') scheduleChatPresenceUiRefresh();
+				if (typeof scheduleChatPresenceUiRefresh === 'function') {
+					if (onlineSnapshotChanged && changedPresenceNames.size && changedPresenceNames.size <= 12) scheduleChatPresenceUiRefresh(changedPresenceNames);
+					else scheduleChatPresenceUiRefresh();
+				}
 			} else if (onlineSnapshotChanged && typeof applyChatPresenceUiRefresh === 'function') {
-				applyChatPresenceUiRefresh(users);
+				applyChatPresenceUiRefresh(users, changedPresenceNames);
 			}
 
 		});
@@ -61385,7 +61624,7 @@ function getVisibleChatStackEl(id) {
 				}
 			}
 			if (window.messageHistory) {
-				const msg = window.messageHistory.find(m => String(new Date(m.time).getTime()) === String(data.msgId));
+				const msg = typeof getChatMessageByIdFast === 'function' ? getChatMessageByIdFast(data.msgId) : window.messageHistory.find(m => String(new Date(m.time).getTime()) === String(data.msgId));
 				if (msg) {
 					const previousSeenSignature = typeof window.getLiveRenderSignature === 'function' ? window.getLiveRenderSignature([msg.seenBy || [], msg.seenAt || {}]) : JSON.stringify([msg.seenBy || [], msg.seenAt || {}]);
 					const nextSeenSignature = typeof window.getLiveRenderSignature === 'function' ? window.getLiveRenderSignature([seenList, seenAtMap]) : JSON.stringify([seenList, seenAtMap]);
@@ -61454,29 +61693,27 @@ function getVisibleChatStackEl(id) {
 				if (previousPlaytimeState && previousPlaytimeState.playTime === playTime && Number(previousPlaytimeState.updatedAt || 0) === updatedAt) return;
 				window.__ps3PlaytimeRealtimeState[playtimeStateKey] = { playTime, updatedAt };
 
-				const applyToList = list => {
-					if (!Array.isArray(list)) return;
-					const user = list.find(item => item && (item.name || item) === name);
+				const applyToUser = user => {
 					if (!user || typeof user !== 'object' || !user.ps3Status || user.ps3Status.status !== 'playing') return;
 					const currentTitleId = String(user.ps3Status.titleId || '').toUpperCase().trim();
 					if (incomingTitleId && currentTitleId && incomingTitleId !== currentTitleId) return;
 					if (String(user.ps3Status.playTime || '') === playTime && Number(user.ps3Status.playTimeUpdatedAt || 0) === updatedAt) return;
 					user.ps3Status = { ...user.ps3Status, playTime, playTimeUpdatedAt: updatedAt };
 				};
-
-				applyToList(window.currentOnlineList);
-				applyToList(window.globalSearchResults);
-				applyToList(window.adminAllUsers);
-
-				if (Array.isArray(window.friendsList)) {
-					const friend = window.friendsList.find(item => item && (item.name || item) === name);
-					if (friend && typeof friend === 'object' && friend.ps3Status && friend.ps3Status.status === 'playing') {
-						const currentTitleId = String(friend.ps3Status.titleId || '').toUpperCase().trim();
-						if (!incomingTitleId || !currentTitleId || incomingTitleId === currentTitleId) {
-							if (String(friend.ps3Status.playTime || '') !== playTime || Number(friend.ps3Status.playTimeUpdatedAt || 0) !== updatedAt) friend.ps3Status = { ...friend.ps3Status, playTime, playTimeUpdatedAt: updatedAt };
-						}
-					}
-				}
+				const onlineUser = window.__currentOnlineUserByName instanceof Map
+					? (window.__currentOnlineUserByName.get(name) || null)
+					: (typeof window.getPsnNamedPoolUser === 'function' ? window.getPsnNamedPoolUser('online', window.currentOnlineList, name) : null);
+				const searchUser = typeof window.getPsnNamedPoolUser === 'function' ? window.getPsnNamedPoolUser('search', window.globalSearchResults, name) : null;
+				let adminUser = null;
+				if (window.__adminAllUsersIndexByName instanceof Map && Array.isArray(window.adminAllUsers) && window.__adminAllUsersIndexSource === window.adminAllUsers) {
+					const adminIndex = window.__adminAllUsersIndexByName.get(name.toLowerCase());
+					if (adminIndex !== undefined) adminUser = window.adminAllUsers[adminIndex] || null;
+				} else if (typeof window.getPsnNamedPoolUser === 'function') adminUser = window.getPsnNamedPoolUser('admin', window.adminAllUsers, name);
+				const friendUser = typeof window.getPsnNamedPoolUser === 'function' ? window.getPsnNamedPoolUser('friends', window.friendsList, name) : null;
+				applyToUser(onlineUser);
+				applyToUser(searchUser);
+				applyToUser(adminUser);
+				applyToUser(friendUser);
 
 				const profileModal = document.getElementById('modal-sys-profile');
 				const openedUser = profileModal?.dataset?.profileUsername || document.getElementById('profile-name-val')?.innerText || '';
@@ -61499,22 +61736,92 @@ function getVisibleChatStackEl(id) {
 			}
 		});
 
+		/* REALTIME FEED LOOKUP INDEX: individual socket events should not scan cached feeds just
+		   to answer "do I already have id X?". The cache automatically rebuilds when merge/clear
+		   replaces the array; in-place notification updates keep the same stable index. */
+		window.__realtimeFeedIdIndexCache = window.__realtimeFeedIdIndexCache || Object.create(null);
+		window.getRealtimeFeedIdIndex = function(cacheKey, list) {
+			if (!Array.isArray(list)) return new Map();
+			const root = window.__realtimeFeedIdIndexCache;
+			let cache = root[cacheKey];
+			if (!cache || cache.source !== list || cache.length !== list.length) {
+				const map = new Map();
+				for (let i = 0; i < list.length; i++) {
+					const id = String(list[i] && list[i].id || '');
+					if (id && !map.has(id)) map.set(id, i);
+				}
+				cache = root[cacheKey] = { source:list, length:list.length, map };
+			}
+			return cache.map;
+		};
+
+		window.insertRealtimeUserNotification = function(item) {
+			if (!item || typeof item !== 'object') return false;
+			const list = Array.isArray(window.userNotificationItems) ? window.userNotificationItems : [];
+			const id = String(item.id || '');
+			/* Legacy/cache entries without a server id keep the old merge/dedupe semantics. */
+			if (!id) {
+				if (typeof window.mergeUserNotificationItems === 'function') window.mergeUserNotificationItems([item], false);
+				return true;
+			}
+			const indexMap = window.getRealtimeFeedIdIndex('notifications', list);
+			const existingIndex = id ? indexMap.get(id) : undefined;
+			if (existingIndex !== undefined) {
+				list[existingIndex] = item;
+				return true;
+			}
+			const itemId = Number(item.id) || 0;
+			const itemCreatedAt = Number(item.createdAt) || 0;
+			let insertAt = list.length;
+			for (let i = 0; i < list.length; i++) {
+				const other = list[i] || {};
+				const otherId = Number(other.id) || 0;
+				const otherCreatedAt = Number(other.createdAt) || 0;
+				if (itemId > otherId || (itemId === otherId && itemCreatedAt > otherCreatedAt)) { insertAt = i; break; }
+			}
+			list.splice(insertAt, 0, item);
+			if (typeof SOCIAL_FEED_CACHE_LIMIT !== 'undefined' && list.length > SOCIAL_FEED_CACHE_LIMIT) list.length = SOCIAL_FEED_CACHE_LIMIT;
+			window.userNotificationItems = list;
+			delete window.__realtimeFeedIdIndexCache.notifications;
+			return true;
+		};
+
 		socketChat.on('friend_activity_event', function(rawEvent = {}) {
 			try {
 				const item = normalizeFriendActivityItem(rawEvent);
 				if (!item) return;
-				const existingItem = Array.isArray(window.friendActivityItems) ? (window.friendActivityItems.find(function(existing) { return String(existing && existing.id || '') === String(item.id || ''); }) || null) : null;
-				const known = !!existingItem;
 				window.__friendActivitySubscribed = true;
 				window.__friendActivityRemoteReady = true;
-				if (existingItem) {
-					const previousSignature = typeof window.getLiveRenderSignature === 'function' ? window.getLiveRenderSignature(existingItem) : JSON.stringify(existingItem);
-					const nextSignature = typeof window.getLiveRenderSignature === 'function' ? window.getLiveRenderSignature(item) : JSON.stringify(item);
-					if (previousSignature === nextSignature) return;
+
+				/* Single realtime events use the incremental path. Batch/full sync still goes through
+				   mergeFriendActivityItems(), which remains the canonical fallback for legacy data. */
+				const result = typeof window.insertRealtimeFriendActivityItem === 'function'
+					? window.insertRealtimeFriendActivityItem(item)
+					: null;
+				if (!result) {
+					const friendItems = Array.isArray(window.friendActivityItems) ? window.friendActivityItems : [];
+					const existingFriendIndex = window.getRealtimeFeedIdIndex('friendActivity', friendItems).get(String(item.id || ''));
+					const existingItem = existingFriendIndex !== undefined ? (friendItems[existingFriendIndex] || null) : null;
+					if (existingItem) {
+						const previousSignature = typeof window.getLiveRenderSignature === 'function' ? window.getLiveRenderSignature(existingItem) : JSON.stringify(existingItem);
+						const nextSignature = typeof window.getLiveRenderSignature === 'function' ? window.getLiveRenderSignature(item) : JSON.stringify(item);
+						if (previousSignature === nextSignature) return;
+					}
+					if (typeof window.mergeFriendActivityItems === 'function') window.mergeFriendActivityItems([item], false);
 				}
-				if (typeof window.mergeFriendActivityItems === 'function') window.mergeFriendActivityItems([item], false);
+
+				const changed = !result || result.changed !== false;
+				if (!changed) return;
 				if (typeof window.isFriendActivityVisible === 'function' && window.isFriendActivityVisible()) {
-					if (!known && typeof window.applyFriendActivityRealtimeDom === 'function') window.applyFriendActivityRealtimeDom(item, true);
+					const matchesVisibleFilter = typeof friendActivityMatchesFilter === 'function' ? friendActivityMatchesFilter(item) : true;
+					if (result && result.requiresFullDomSync) {
+						if (typeof window.renderFriendActivity === 'function') window.renderFriendActivity(true);
+					} else if ((!result || result.incomingVisible !== false) && matchesVisibleFilter && typeof window.applyFriendActivityRealtimeDom === 'function') {
+						window.applyFriendActivityRealtimeDom(item, true);
+					} else {
+						if (typeof updateFriendActivityChrome === 'function') updateFriendActivityChrome();
+						if (typeof window.refreshFriendActivityIndicators === 'function') window.refreshFriendActivityIndicators();
+					}
 					if (typeof window.markFriendActivityRead === 'function') window.markFriendActivityRead();
 				} else if (typeof window.refreshFriendActivityIndicators === 'function') {
 					window.refreshFriendActivityIndicators();
@@ -61583,7 +61890,9 @@ function getVisibleChatStackEl(id) {
 			try {
 				const item = normalizeUserNotificationItem(rawEvent);
 				if (!item) return;
-				const existingItem = Array.isArray(window.userNotificationItems) ? (window.userNotificationItems.find(function(existing) { return String(existing && existing.id || '') === String(item.id || ''); }) || null) : null;
+				const notificationItems = Array.isArray(window.userNotificationItems) ? window.userNotificationItems : [];
+				const existingNotificationIndex = window.getRealtimeFeedIdIndex('notifications', notificationItems).get(String(item.id || ''));
+				const existingItem = existingNotificationIndex !== undefined ? (notificationItems[existingNotificationIndex] || null) : null;
 				const known = !!existingItem;
 				window.__userNotificationRemoteReady = true;
 				if (existingItem) {
@@ -61592,7 +61901,8 @@ function getVisibleChatStackEl(id) {
 					if (previousSignature === nextSignature) return;
 				}
 				const isFreshUnread = !known && Math.max(0, Number(item.id) || 0) > Math.max(0, Number(window.__userNotificationLastReadId) || 0);
-				if (typeof window.mergeUserNotificationItems === 'function') window.mergeUserNotificationItems([item], false);
+				if (typeof window.insertRealtimeUserNotification === 'function') window.insertRealtimeUserNotification(item);
+				else if (typeof window.mergeUserNotificationItems === 'function') window.mergeUserNotificationItems([item], false);
 				if (isFreshUnread) {
 					window.__userNotificationUnreadCount = Math.max(0, Number(window.__userNotificationUnreadCount) || 0) + 1;
 				}
@@ -61633,7 +61943,9 @@ function getVisibleChatStackEl(id) {
 			try {
 				const item = normalizeUserNotificationItem(rawEvent);
 				if (!item) return;
-				const index = (Array.isArray(window.userNotificationItems) ? window.userNotificationItems : []).findIndex(function(existing) { return String(existing && existing.id || '') === String(item.id || ''); });
+				const notificationItems = Array.isArray(window.userNotificationItems) ? window.userNotificationItems : [];
+				const indexedNotification = window.getRealtimeFeedIdIndex('notifications', notificationItems).get(String(item.id || ''));
+				const index = indexedNotification === undefined ? -1 : indexedNotification;
 				if (index < 0) return;
 				const previousItem = window.userNotificationItems[index];
 				const previousItemSignature = typeof window.getLiveRenderSignature === 'function' ? window.getLiveRenderSignature(previousItem) : JSON.stringify(previousItem);
@@ -61741,7 +62053,7 @@ function getVisibleChatStackEl(id) {
 			state.frame = requestAnimationFrame(() => {
 				state.frame = 0;
 				const names = state.names;
-				const oneName = names.size === 1 ? names.values().next().value : '';
+				const changedNames = names.size ? Array.from(names) : [];
 				if (state.persistFriends && typeof saveState === 'function' && typeof STORAGE_KEY_FRIENDS !== 'undefined') {
 					saveState(STORAGE_KEY_FRIENDS, JSON.stringify(window.friendsList || []));
 				}
@@ -61760,7 +62072,7 @@ function getVisibleChatStackEl(id) {
 					if (onlineModal && (onlineModal.style.display === 'flex' || onlineModal.classList.contains('show')) && typeof renderOnlineList === 'function') renderOnlineList();
 				}
 				if (state.admin && document.getElementById('view-admin')?.style.display === 'block' && typeof adminSchedulePanelRender === 'function') adminSchedulePanelRender();
-				if (state.chat && typeof applyChatPresenceUiRefresh === 'function') applyChatPresenceUiRefresh(currentOnlineList, oneName);
+				if (state.chat && typeof applyChatPresenceUiRefresh === 'function') applyChatPresenceUiRefresh(currentOnlineList, changedNames);
 				state.friends = state.online = state.admin = state.chat = state.count = state.persistFriends = false;
 				names.clear();
 			});
@@ -62058,7 +62370,9 @@ function getVisibleChatStackEl(id) {
 				if (countryChanged) safeLocalStorageSet(`${name}_${STORAGE_KEY_PROFILE_COUNTRY}`, incomingCountryCode);
 				if (incomingStyle && typeof writeProfileCardStyleForUser === 'function') writeProfileCardStyleForUser(name, incomingStyle, incomingStyleUpdatedAt);
 				if (Array.isArray(window.currentOnlineList)) {
-					const user = window.currentOnlineList.find(u => (u.name || u) === name);
+					const user = window.__currentOnlineUserByName instanceof Map
+						? (window.__currentOnlineUserByName.get(name) || null)
+						: (typeof window.getPsnNamedPoolUser === 'function' ? window.getPsnNamedPoolUser('online', window.currentOnlineList, name) : null);
 					if (user) {
 						if (styleChanged) { user.profileCardStyle = incomingStyle; user.profileCardEffect = incomingStyle; }
 						if (countryChanged) user.countryCode = incomingCountryCode;
@@ -66489,14 +66803,29 @@ function getVisibleChatStackEl(id) {
 		return names;
 	}
 
+	let friendActivityAddedAtIndexCache = null;
+	function invalidateFriendActivityAddedAtIndex() {
+		friendActivityAddedAtIndexCache = null;
+	}
+	window.invalidateFriendActivityAddedAtIndex = invalidateFriendActivityAddedAtIndex;
+
+	function getFriendActivityAddedAtIndex() {
+		const list = Array.isArray(window.friendsList) ? window.friendsList : [];
+		if (friendActivityAddedAtIndexCache && friendActivityAddedAtIndexCache.source === list && friendActivityAddedAtIndexCache.length === list.length) return friendActivityAddedAtIndexCache.map;
+		const map = new Map();
+		list.forEach(function(item) {
+			const name = String(item && typeof item === 'object' ? item.name : item || '').trim().toLowerCase();
+			if (!name || map.has(name)) return;
+			map.set(name, Math.max(0, Number(item && typeof item === 'object' ? item.addedAt : 0) || 0));
+		});
+		friendActivityAddedAtIndexCache = { source:list, length:list.length, map:map };
+		return map;
+	}
+
 	function getFriendActivityAddedAtForActor(actorName) {
 		const target = String(actorName || '').trim().toLowerCase();
-		if (!target || !Array.isArray(window.friendsList)) return 0;
-		const friend = window.friendsList.find(function(item) {
-			const name = String(item && typeof item === 'object' ? item.name : item || '').trim().toLowerCase();
-			return name === target;
-		});
-		return Math.max(0, Number(friend && typeof friend === 'object' ? friend.addedAt : 0) || 0);
+		if (!target) return 0;
+		return Math.max(0, Number(getFriendActivityAddedAtIndex().get(target)) || 0);
 	}
 
 	function getFriendActivityFriendSignature() {
@@ -66517,9 +66846,58 @@ function getVisibleChatStackEl(id) {
 		return !!(view && view.style.display === 'flex');
 	};
 
+	function isFriendActivityRepeatableItem(item) {
+		return ['download','wishlist','favorite','cheat'].includes(String(item && item.type || '').toLowerCase());
+	}
+
+	function compareFriendActivityCanonicalOrder(a, b) {
+		const idDiff = (Number(b && b.id) || 0) - (Number(a && a.id) || 0);
+		return idDiff || ((Number(b && b.createdAt) || 0) - (Number(a && a.createdAt) || 0));
+	}
+
+	function findFriendActivityCanonicalInsertIndex(list, item) {
+		let low = 0;
+		let high = Array.isArray(list) ? list.length : 0;
+		while (low < high) {
+			const mid = (low + high) >> 1;
+			if (compareFriendActivityCanonicalOrder(item, list[mid]) < 0) high = mid;
+			else low = mid + 1;
+		}
+		return low;
+	}
+
+	function invalidateFriendActivityRealtimeIndexes() {
+		if (window.__realtimeFeedIdIndexCache) delete window.__realtimeFeedIdIndexCache.friendActivity;
+	}
+
+	function dedupeFriendActivityNonRepeatableInPlace(list) {
+		if (!Array.isArray(list) || list.length < 2) return [];
+		const removedIds = [];
+		let previousSemanticKey = '';
+		let previousCreatedAt = 0;
+		for (let index = 0; index < list.length;) {
+			const item = list[index];
+			if (isFriendActivityRepeatableItem(item)) { index++; continue; }
+			const semanticKey = getFriendActivitySemanticKey(item);
+			const createdAt = Math.max(0, Number(item && item.createdAt) || 0);
+			if (semanticKey && semanticKey === previousSemanticKey && Math.abs(previousCreatedAt - createdAt) <= 60000) {
+				const removed = list.splice(index, 1)[0];
+				if (removed && removed.id) removedIds.push(String(removed.id));
+				continue;
+			}
+			previousSemanticKey = semanticKey;
+			previousCreatedAt = createdAt;
+			index++;
+		}
+		return removedIds;
+	}
+
+	window.__friendActivityItemsCanonical = window.__friendActivityItemsCanonical === true;
 	window.mergeFriendActivityItems = function(incoming, replace) {
+		const rawIncoming = Array.isArray(incoming) ? incoming : [];
+		if (replace !== true && rawIncoming.length === 0 && window.__friendActivityItemsCanonical === true) return Array.isArray(window.friendActivityItems) ? window.friendActivityItems : [];
 		const dismissedThroughId = Math.max(0, Number(window.__friendActivityDismissedThroughId) || 0);
-		const incomingItems = (Array.isArray(incoming) ? incoming : []).map(normalizeFriendActivityItem).filter(Boolean).filter(function(item) {
+		const incomingItems = rawIncoming.map(normalizeFriendActivityItem).filter(Boolean).filter(function(item) {
 			if (Math.max(0, Number(item && item.id) || 0) <= dismissedThroughId) return false;
 			const addedAt = getFriendActivityAddedAtForActor(item.actor);
 			return !addedAt || Math.max(0, Number(item.createdAt) || 0) >= addedAt;
@@ -66542,15 +66920,12 @@ function getVisibleChatStackEl(id) {
 		const repeatableIndex = new Map();
 		let previousSemanticKey = '';
 		let previousCreatedAt = 0;
-		source.sort(function(a,b){
-			const idDiff = (Number(b.id) || 0) - (Number(a.id) || 0);
-			return idDiff || b.createdAt - a.createdAt;
-		}).forEach(function(item) {
+		source.sort(compareFriendActivityCanonicalOrder).forEach(function(item) {
 			const key = getFriendActivityItemKey(item);
 			if (!key || seen.has(key)) return;
 			seen.add(key);
 			const semanticKey = getFriendActivitySemanticKey(item);
-			if (['download','wishlist','favorite','cheat'].includes(item.type) && semanticKey) {
+			if (isFriendActivityRepeatableItem(item) && semanticKey) {
 				if (repeatableIndex.has(semanticKey)) {
 					const target = deduped[repeatableIndex.get(semanticKey)];
 					target.data = Object.assign({}, target.data || {}, {
@@ -66570,7 +66945,120 @@ function getVisibleChatStackEl(id) {
 			previousCreatedAt = createdAt;
 		});
 		window.friendActivityItems = deduped.slice(0, SOCIAL_FEED_CACHE_LIMIT);
+		window.__friendActivityItemsCanonical = true;
+		invalidateFriendActivityRealtimeIndexes();
 		return window.friendActivityItems;
+	};
+
+	/* Fast path for one server-pushed activity. The existing feed is already canonical, so a
+	   single event only needs targeted replacement/grouping + binary insertion. Full/batch
+	   sync keeps using mergeFriendActivityItems() as the correctness fallback. */
+	window.insertRealtimeFriendActivityItem = function(rawItem) {
+		const item = normalizeFriendActivityItem(rawItem);
+		if (!item || !String(item.id || '')) {
+			if (item) window.mergeFriendActivityItems([item], false);
+			return item ? { changed:true, incomingVisible:true, requiresFullDomSync:true, fast:false } : { changed:false, incomingVisible:false, fast:false };
+		}
+		const dismissedThroughId = Math.max(0, Number(window.__friendActivityDismissedThroughId) || 0);
+		if (Math.max(0, Number(item.id) || 0) <= dismissedThroughId) return { changed:false, incomingVisible:false, fast:true };
+		const addedAt = getFriendActivityAddedAtForActor(item.actor);
+		if (addedAt && Math.max(0, Number(item.createdAt) || 0) < addedAt) return { changed:false, incomingVisible:false, fast:true };
+
+		if (window.__friendActivityItemsCanonical !== true) {
+			window.mergeFriendActivityItems([item], false);
+			return { changed:true, incomingVisible:true, requiresFullDomSync:true, fast:false };
+		}
+
+		const list = Array.isArray(window.friendActivityItems) ? window.friendActivityItems : (window.friendActivityItems = []);
+		const id = String(item.id || '');
+		const existingIndex = window.getRealtimeFeedIdIndex ? window.getRealtimeFeedIdIndex('friendActivity', list).get(id) : undefined;
+		if (existingIndex !== undefined) {
+			const existing = list[existingIndex] || null;
+			const previousSignature = typeof window.getLiveRenderSignature === 'function' ? window.getLiveRenderSignature(existing) : JSON.stringify(existing);
+			const nextSignature = typeof window.getLiveRenderSignature === 'function' ? window.getLiveRenderSignature(item) : JSON.stringify(item);
+			if (previousSignature === nextSignature) return { changed:false, incomingVisible:true, authoritativeItem:existing, fast:true };
+			window.mergeFriendActivityItems([item], false);
+			return { changed:true, incomingVisible:true, requiresFullDomSync:true, fast:false };
+		}
+
+		const replacedIds = new Set();
+		if (item.type === 'played') {
+			const replacesId = String(item.data && item.data.replacesId || '');
+			if (replacesId) replacedIds.add(replacesId);
+		}
+		const replaces = item.data && Array.isArray(item.data.replacesIds) ? item.data.replacesIds : [];
+		replaces.forEach(function(value) { const replaceId = String(value || ''); if (replaceId) replacedIds.add(replaceId); });
+
+		let structuralChange = false;
+		if (replacedIds.size) {
+			const idIndex = window.getRealtimeFeedIdIndex ? window.getRealtimeFeedIdIndex('friendActivity', list) : new Map();
+			const removeIndexes = [];
+			replacedIds.forEach(function(replaceId) {
+				const index = idIndex.get(replaceId);
+				if (index !== undefined) removeIndexes.push(index);
+			});
+			removeIndexes.sort(function(a,b) { return b - a; }).forEach(function(index) { list.splice(index, 1); structuralChange = true; });
+			if (structuralChange) dedupeFriendActivityNonRepeatableInPlace(list);
+		}
+
+		const semanticKey = getFriendActivitySemanticKey(item);
+		let incomingVisible = true;
+		let authoritativeItem = item;
+		let insertAt = -1;
+
+		if (isFriendActivityRepeatableItem(item) && semanticKey) {
+			let groupedIndex = -1;
+			for (let index = 0; index < list.length; index++) {
+				const candidate = list[index];
+				if (isFriendActivityRepeatableItem(candidate) && getFriendActivitySemanticKey(candidate) === semanticKey) { groupedIndex = index; break; }
+			}
+			if (groupedIndex >= 0) {
+				const existing = list[groupedIndex];
+				const repeatCount = Math.min(9999, getFriendActivityRepeatCount(existing) + getFriendActivityRepeatCount(item));
+				if (compareFriendActivityCanonicalOrder(item, existing) < 0) {
+					authoritativeItem = Object.assign({}, item, { data:Object.assign({}, item.data || {}, { repeatCount:repeatCount }) });
+					list.splice(groupedIndex, 1);
+					insertAt = findFriendActivityCanonicalInsertIndex(list, authoritativeItem);
+					list.splice(insertAt, 0, authoritativeItem);
+				} else {
+					authoritativeItem = Object.assign({}, existing, { data:Object.assign({}, existing.data || {}, { repeatCount:repeatCount }) });
+					list[groupedIndex] = authoritativeItem;
+					incomingVisible = false;
+					insertAt = groupedIndex;
+				}
+				structuralChange = true;
+			} else {
+				authoritativeItem = Object.assign({}, item, { data:Object.assign({}, item.data || {}, { repeatCount:getFriendActivityRepeatCount(item) }) });
+				insertAt = findFriendActivityCanonicalInsertIndex(list, authoritativeItem);
+				list.splice(insertAt, 0, authoritativeItem);
+				structuralChange = true;
+			}
+		} else {
+			insertAt = findFriendActivityCanonicalInsertIndex(list, item);
+			list.splice(insertAt, 0, item);
+			structuralChange = true;
+			const removedIds = dedupeFriendActivityNonRepeatableInPlace(list);
+			if (removedIds.includes(id)) incomingVisible = false;
+			else authoritativeItem = item;
+		}
+
+		if (list.length > SOCIAL_FEED_CACHE_LIMIT) list.length = SOCIAL_FEED_CACHE_LIMIT;
+		window.friendActivityItems = list;
+		window.__friendActivityItemsCanonical = true;
+		invalidateFriendActivityRealtimeIndexes();
+
+		if (!incomingVisible && !replacedIds.size && !isFriendActivityRepeatableItem(item)) {
+			/* The new non-repeatable was immediately suppressed by the existing 60s semantic
+			   rule, so the authoritative feed did not actually change. */
+			return { changed:false, incomingVisible:false, authoritativeItem:null, fast:true };
+		}
+		return {
+			changed:structuralChange,
+			incomingVisible:incomingVisible,
+			authoritativeItem:authoritativeItem,
+			requiresFullDomSync:!incomingVisible || insertAt > 0,
+			fast:true
+		};
 	};
 
 	window.writeFriendActivityCache = function() {
@@ -66588,12 +67076,13 @@ function getVisibleChatStackEl(id) {
 	};
 
 	window.refreshFriendActivityIndicators = function() {
-		if (typeof window.setSidebarCountPill === 'function') window.setSidebarCountPill('activity', Array.isArray(window.friendActivityItems) ? window.friendActivityItems.length : 0);
+		const items = Array.isArray(window.friendActivityItems) ? window.friendActivityItems : [];
+		if (typeof window.setSidebarCountPill === 'function') window.setSidebarCountPill('activity', items.length);
 		const dot = document.getElementById('activity-dot');
 		const lastReadId = Math.max(0, Number(window.__friendActivityLastReadId) || 0);
-		const unread = (Array.isArray(window.friendActivityItems) ? window.friendActivityItems : []).some(function(item) {
-			return Math.max(0, Number(item && item.id) || 0) > lastReadId;
-		});
+		/* mergeFriendActivityItems keeps the feed newest-first, so unread detection is O(1). */
+		const newestId = items.length ? Math.max(0, Number(items[0] && items[0].id) || 0) : 0;
+		const unread = newestId > lastReadId;
 		if (dot) dot.style.display = unread ? 'block' : 'none';
 		try { saveState('psn_friend_activity_dot', unread ? 'true' : 'false'); } catch (err) {}
 	};
@@ -66607,6 +67096,8 @@ function getVisibleChatStackEl(id) {
 		window.__friendActivityCacheLoaded = true;
 		window.__friendActivityCacheUser = activeUser;
 		window.friendActivityItems = [];
+		window.__friendActivityItemsCanonical = false;
+		invalidateFriendActivityRealtimeIndexes();
 		window.__friendActivitySubscribed = false;
 		window.__friendActivityRemoteReady = false;
 		window.__friendActivityRemoteError = '';
@@ -66619,6 +67110,8 @@ function getVisibleChatStackEl(id) {
 			const cached = raw ? JSON.parse(raw) : null;
 			if (cached && typeof cached === 'object') {
 				window.friendActivityItems = Array.isArray(cached.items) ? cached.items : [];
+				window.__friendActivityItemsCanonical = false;
+				invalidateFriendActivityRealtimeIndexes();
 				window.__friendActivityLastReadId = Math.max(0, Number(cached.lastReadId) || 0);
 				window.__friendActivityDismissedThroughId = Math.max(0, Number(cached.dismissedThroughId) || 0);
 				window.__friendActivityFriendSignature = String(cached.friendSignature || '');
@@ -67078,6 +67571,7 @@ function getVisibleChatStackEl(id) {
 	};
 
 	window.friendActivityFriendsChanged = function() {
+		invalidateFriendActivityAddedAtIndex();
 		window.__friendActivityRemoteReady = false;
 		if (typeof window.invalidateSocialPlayTogetherRemote === 'function') { window.invalidateSocialPlayTogetherRemote('friends'); window.invalidateSocialPlayTogetherRemote('others'); }
 		window.refreshFriendActivityIndicators();
@@ -69797,6 +70291,7 @@ function getVisibleChatStackEl(id) {
 					<p style="font-size: 13px; color: var(--text-muted); margin-bottom: 20px;">${emptyMessage}</p>
 					${isSearching ? `<button class="action-btn" style="margin: 0 auto;" onmouseenter="playUiHover()" onclick="clearGlobalSearch()"><i class="fas fa-times"></i> Clear Search</button>` : ''}
 				</div>`;
+			if (typeof window.registerPsnPageEmptyStates === 'function') window.registerPsnPageEmptyStates(friendsRenderTarget.firstElementChild);
 		}
 
 		if (isSilent) reconcileFriendsLiveGrid(grid, friendsRenderTarget);
@@ -70261,7 +70756,8 @@ function getVisibleChatStackEl(id) {
 			}
 			if (modalId === 'modal-sys-list') {
 				const listBody = document.getElementById('list-modal-body');
-				if (listBody && listBody.__profileListBatchScrollHandler) {
+				if (listBody && typeof window.cleanupProfileListBatchPaging === 'function') window.cleanupProfileListBatchPaging(listBody);
+				else if (listBody && listBody.__profileListBatchScrollHandler) {
 					listBody.removeEventListener('scroll', listBody.__profileListBatchScrollHandler);
 					listBody.__profileListBatchScrollHandler = null;
 				}
@@ -70871,7 +71367,8 @@ function getVisibleChatStackEl(id) {
 				modal.classList.add('show');
 				body.scrollTop = targetScroll;
 				body.style.scrollBehavior = previousBehavior || 'smooth';
-				if (typeof body.__profileListBatchScrollHandler === 'function') body.__profileListBatchScrollHandler();
+				if (typeof body.__profileListBatchKick === 'function') body.__profileListBatchKick();
+				else if (typeof body.__profileListBatchScrollHandler === 'function') body.__profileListBatchScrollHandler();
 			});
 		});
 		return true;
@@ -71593,6 +72090,26 @@ function getVisibleChatStackEl(id) {
 		return true;
 	};
 
+	window.cleanupProfileListBatchPaging = function(body) {
+		if (!body) return;
+		if (body.__profileListBatchObserver) {
+			try { body.__profileListBatchObserver.disconnect(); } catch (err) {}
+			body.__profileListBatchObserver = null;
+		}
+		if (body.__profileListBatchScrollHandler) {
+			try { body.removeEventListener('scroll', body.__profileListBatchScrollHandler); } catch (err) {}
+			body.__profileListBatchScrollHandler = null;
+		}
+		if (body.__profileListBatchFrame) {
+			try { cancelAnimationFrame(body.__profileListBatchFrame); } catch (err) {}
+			body.__profileListBatchFrame = 0;
+		}
+		const sentinel = body.__profileListBatchSentinel;
+		if (sentinel && sentinel.isConnected) sentinel.remove();
+		body.__profileListBatchSentinel = null;
+		body.__profileListBatchKick = null;
+	};
+
 	window.renderFetchedList = function(targetUser, listType, rawData) {
 		const body = document.getElementById('list-modal-body');
 		const titleEl = document.getElementById('list-modal-title');
@@ -71932,10 +72449,7 @@ function getVisibleChatStackEl(id) {
 			return html;
 		};
 
-		if (body && body.__profileListBatchScrollHandler) {
-			body.removeEventListener('scroll', body.__profileListBatchScrollHandler);
-			body.__profileListBatchScrollHandler = null;
-		}
+		if (body && typeof window.cleanupProfileListBatchPaging === 'function') window.cleanupProfileListBatchPaging(body);
 
 		const shouldBatchProfileList = dataArray.length > 120;
 		const profileListBatchSize = 60;
@@ -71949,11 +72463,14 @@ function getVisibleChatStackEl(id) {
 		let html = buildProfileListItemsHtml(renderItems.slice(0, renderedProfileListCount), 0);
 
 		const finalizeProfileListContent = function() {
+			let profileListBatchSentinel = null;
 			const appendNextProfileListBatch = function() {
 				if (!shouldBatchProfileList || renderedProfileListCount >= renderItems.length) return false;
 				const nextCount = Math.min(renderItems.length, renderedProfileListCount + profileListBatchSize);
 				const nextHtml = buildProfileListItemsHtml(renderItems.slice(renderedProfileListCount, nextCount), renderedProfileListCount);
-				body.insertAdjacentHTML('beforeend', nextHtml);
+				const activeSentinel = profileListBatchSentinel && profileListBatchSentinel.isConnected ? profileListBatchSentinel : null;
+				if (activeSentinel) activeSentinel.insertAdjacentHTML('beforebegin', nextHtml);
+				else body.insertAdjacentHTML('beforeend', nextHtml);
 				renderedProfileListCount = nextCount;
 				return renderedProfileListCount < renderItems.length;
 			};
@@ -71967,24 +72484,65 @@ function getVisibleChatStackEl(id) {
 				};
 				if (savedProfileListScroll != null) ensureScrollTargetRendered(savedProfileListScroll);
 
-				let profileListBatchFrame = 0;
-				const runProfileListBatchScroll = function() {
-					profileListBatchFrame = 0;
-					if (renderedProfileListCount >= renderItems.length) {
-						body.removeEventListener('scroll', handleProfileListBatchScroll);
-						if (body.__profileListBatchScrollHandler === handleProfileListBatchScroll) body.__profileListBatchScrollHandler = null;
+				const preloadDistance = Math.max(700, Math.round((body.clientHeight || 0) * 1.5));
+				const finishProfileListPaging = function() {
+					if (body.__profileListBatchObserver) {
+						try { body.__profileListBatchObserver.disconnect(); } catch (err) {}
+						body.__profileListBatchObserver = null;
+					}
+					if (body.__profileListBatchScrollHandler) {
+						try { body.removeEventListener('scroll', body.__profileListBatchScrollHandler); } catch (err) {}
+						body.__profileListBatchScrollHandler = null;
+					}
+					if (profileListBatchSentinel && profileListBatchSentinel.isConnected) profileListBatchSentinel.remove();
+					body.__profileListBatchSentinel = null;
+					body.__profileListBatchKick = null;
+				};
+
+				profileListBatchSentinel = document.createElement('div');
+				profileListBatchSentinel.className = 'profile-list-batch-sentinel';
+				profileListBatchSentinel.setAttribute('aria-hidden', 'true');
+				profileListBatchSentinel.style.cssText = 'height:1px;width:100%;pointer-events:none;opacity:0;flex:0 0 1px;';
+				body.appendChild(profileListBatchSentinel);
+				body.__profileListBatchSentinel = profileListBatchSentinel;
+
+				const runProfileListBatchCheck = function() {
+					body.__profileListBatchFrame = 0;
+					if (!body.isConnected || !profileListBatchSentinel || !profileListBatchSentinel.isConnected || renderedProfileListCount >= renderItems.length) {
+						finishProfileListPaging();
 						return;
 					}
-					const preloadDistance = Math.max(700, body.clientHeight * 1.5);
-					if (body.scrollTop + body.clientHeight >= body.scrollHeight - preloadDistance) appendNextProfileListBatch();
+					const bodyRect = body.getBoundingClientRect();
+					const sentinelRect = profileListBatchSentinel.getBoundingClientRect();
+					const nearViewport = sentinelRect.top <= bodyRect.bottom + preloadDistance && sentinelRect.bottom >= bodyRect.top - preloadDistance;
+					if (!nearViewport) return;
+					const hasMore = appendNextProfileListBatch();
+					if (!hasMore) {
+						finishProfileListPaging();
+						return;
+					}
+					// One batch per frame keeps cover/store row construction away from the scroll event itself.
+					body.__profileListBatchFrame = requestAnimationFrame(runProfileListBatchCheck);
 				};
-				const handleProfileListBatchScroll = function() {
-					if (profileListBatchFrame) return;
-					profileListBatchFrame = requestAnimationFrame(runProfileListBatchScroll);
+				const kickProfileListBatchPaging = function() {
+					if (body.__profileListBatchFrame) return;
+					body.__profileListBatchFrame = requestAnimationFrame(runProfileListBatchCheck);
 				};
-				body.__profileListBatchScrollHandler = handleProfileListBatchScroll;
-				body.addEventListener('scroll', handleProfileListBatchScroll, { passive: true });
-				requestAnimationFrame(handleProfileListBatchScroll);
+				body.__profileListBatchKick = kickProfileListBatchPaging;
+
+				if (typeof IntersectionObserver === 'function') {
+					const observer = new IntersectionObserver(entries => {
+						if (entries.some(entry => entry.isIntersecting)) kickProfileListBatchPaging();
+					}, { root: body, rootMargin: `${preloadDistance}px 0px ${preloadDistance}px 0px`, threshold: 0 });
+					body.__profileListBatchObserver = observer;
+					observer.observe(profileListBatchSentinel);
+				} else {
+					// Compatibility fallback for engines without IntersectionObserver.
+					const handleProfileListBatchScroll = function() { kickProfileListBatchPaging(); };
+					body.__profileListBatchScrollHandler = handleProfileListBatchScroll;
+					body.addEventListener('scroll', handleProfileListBatchScroll, { passive: true });
+				}
+				requestAnimationFrame(kickProfileListBatchPaging);
 			}
 
 			if (window.pendingProfileListScroll != null) {
@@ -74529,10 +75087,18 @@ function getVisibleChatStackEl(id) {
 		return span;
 	}
 
-	function decorateCards(scopeRoot){
+	function getScopedDecoratorNodes(scope, selector){
+		var nodes = [];
+		if (!scope || typeof selector !== 'string') return nodes;
+		if (scope.nodeType === 1 && scope.matches?.(selector)) nodes.push(scope);
+		if (typeof scope.querySelectorAll === 'function') scope.querySelectorAll(selector).forEach(function(node){ nodes.push(node); });
+		return nodes;
+	}
+
+	function decorateCards(scopeRoot, installedTitleIdsOverride){
 		var scope = scopeRoot && typeof scopeRoot.querySelectorAll === 'function' ? scopeRoot : document;
-		var cards = scope.querySelectorAll('.game-card[data-title-id]');
-		var installedTitleIds = getConnectedInstalledTitleIds();
+		var cards = getScopedDecoratorNodes(scope, '.game-card[data-title-id]');
+		var installedTitleIds = arguments.length > 1 ? installedTitleIdsOverride : getConnectedInstalledTitleIds();
 		for (var i = 0; i < cards.length; i++) {
 			var card = cards[i];
 			var cat = String(card.getAttribute('data-store-category') || getCurrentCategory() || '').trim();
@@ -74583,7 +75149,7 @@ function getVisibleChatStackEl(id) {
 			span.addEventListener('click', span.__baseGameClickHandler);
 		}
 
-		var groupedCards = scope.querySelectorAll('.grouped-title-card[data-group-title-ids], .grouped-title-card[data-group-single-title-id]');
+		var groupedCards = getScopedDecoratorNodes(scope, '.grouped-title-card[data-group-title-ids], .grouped-title-card[data-group-single-title-id]');
 		for (var g = 0; g < groupedCards.length; g++) {
 			var groupedCard = groupedCards[g];
 			var groupedId = cleanId(groupedCard.getAttribute('data-group-single-title-id'));
@@ -74599,7 +75165,7 @@ function getVisibleChatStackEl(id) {
 			}
 		}
 
-		var wishlistCards = scope.querySelectorAll('.game-card[data-wishlist-title-id]');
+		var wishlistCards = getScopedDecoratorNodes(scope, '.game-card[data-wishlist-title-id]');
 		for (var w = 0; w < wishlistCards.length; w++) {
 			var wishlistCard = wishlistCards[w];
 			var wishlistId = cleanId(wishlistCard.getAttribute('data-wishlist-title-id'));
@@ -74686,37 +75252,72 @@ function getVisibleChatStackEl(id) {
 		}
 	}
 
-	/* BASE-GAME / INSTALLED DECORATOR SCOPE: DOM mutations from Browse only rescan Browse.
-	   Explicit refreshStoreInstalledChecks() calls remain global, and a global request widens any
-	   already queued scoped pass instead of being lost behind the shared animation-frame debounce. */
-	function processUiSoon(scopeRoot){
-		var requestedScope = scopeRoot && typeof scopeRoot.querySelectorAll === 'function' ? scopeRoot : document;
-		var pendingScope = window.__baseGameTitleIdLinkPendingScope;
-		if (!pendingScope) window.__baseGameTitleIdLinkPendingScope = requestedScope;
-		else if (pendingScope !== requestedScope) window.__baseGameTitleIdLinkPendingScope = document;
+	/* BASE-GAME / INSTALLED DECORATOR SCOPE: explicit/global refreshes may still reconcile a
+	   whole view, but DOM bursts are queued as independent card scopes. Different cards added in
+	   the same frame no longer widen the pending work to document and trigger a full-grid scan. */
+	function getPendingDecoratorScopes(){
+		if (!(window.__baseGameTitleIdLinkPendingScopes instanceof Set)) window.__baseGameTitleIdLinkPendingScopes = new Set();
+		return window.__baseGameTitleIdLinkPendingScopes;
+	}
 
-		if (window.__baseGameTitleIdLinkSafePending || window.__baseGameTitleIdLinkDecorating) return;
+	function queueDecoratorScope(scopeRoot){
+		var requestedScope = scopeRoot && typeof scopeRoot.querySelectorAll === 'function' ? scopeRoot : document;
+		var pendingScopes = getPendingDecoratorScopes();
+		if (requestedScope === document) {
+			pendingScopes.clear();
+			pendingScopes.add(document);
+			return;
+		}
+		if (pendingScopes.has(document)) return;
+		for (var existing of Array.from(pendingScopes)) {
+			if (existing === requestedScope) return;
+			try {
+				if (existing && typeof existing.contains === 'function' && existing.contains(requestedScope)) return;
+				if (requestedScope && typeof requestedScope.contains === 'function' && requestedScope.contains(existing)) pendingScopes.delete(existing);
+			} catch (e) {}
+		}
+		pendingScopes.add(requestedScope);
+	}
+
+	function scheduleDecoratorRunner(){
+		var pendingScopes = getPendingDecoratorScopes();
+		if (!pendingScopes.size || window.__baseGameTitleIdLinkSafePending || window.__baseGameTitleIdLinkDecorating) return;
 		window.__baseGameTitleIdLinkSafePending = true;
 
 		var runner = function(){
 			window.__baseGameTitleIdLinkSafePending = false;
 			window.__baseGameTitleIdLinkDecorating = true;
-			var runScope = window.__baseGameTitleIdLinkPendingScope || document;
-			window.__baseGameTitleIdLinkPendingScope = null;
+			var scopes = Array.from(getPendingDecoratorScopes());
+			getPendingDecoratorScopes().clear();
 			try {
 				cleanupStaleRelatedNavigation();
-				decorateCards(runScope);
-				decorateModal();
+				/* Resolve the installed-title Set once for the whole frame, even when dozens of
+				   individual cards arrived together. */
+				var installedTitleIds = getConnectedInstalledTitleIds();
+				var modalElement = document.getElementById('game-modal');
+				var shouldDecorateModal = false;
+				for (var i = 0; i < scopes.length; i++) {
+					var runScope = scopes[i];
+					if (!runScope || (runScope !== document && runScope.nodeType === 1 && !runScope.isConnected)) continue;
+					decorateCards(runScope, installedTitleIds);
+					if (runScope === document || runScope === modalElement || (modalElement && typeof runScope.contains === 'function' && runScope.contains(modalElement))) shouldDecorateModal = true;
+				}
+				if (shouldDecorateModal) decorateModal();
 			} catch (err) {
 				console.warn('[BaseGameTitleIdLink] skipped:', err);
 			} finally {
 				window.__baseGameTitleIdLinkDecorating = false;
-				if (window.__baseGameTitleIdLinkPendingScope) processUiSoon(window.__baseGameTitleIdLinkPendingScope);
+				if (getPendingDecoratorScopes().size) scheduleDecoratorRunner();
 			}
 		};
 
 		if (typeof requestAnimationFrame === 'function') requestAnimationFrame(runner);
 		else setTimeout(runner, 0);
+	}
+
+	function processUiSoon(scopeRoot){
+		queueDecoratorScope(scopeRoot);
+		scheduleDecoratorRunner();
 	}
 
 	window.refreshStoreInstalledChecks = processUiSoon;
@@ -74783,34 +75384,84 @@ function getVisibleChatStackEl(id) {
 
 	if (window.MutationObserver) {
 		var root = document.getElementById('database-grid') || document.body;
+		var browseDecoratorView = document.getElementById('view-browse');
 		var relevantUiSelector = '.game-card[data-title-id],.grouped-title-card[data-group-title-ids],.grouped-title-card[data-group-single-title-id],.modal-info-text,.game-id,.btn-upd,.btn-dlc,.btn-avt,.btn-thm';
+		var browseCardScopeSelector = '.game-card[data-title-id],.grouped-title-card[data-group-title-ids],.grouped-title-card[data-group-single-title-id]';
 		var nodeTouchesRelevantUi = function(node) {
-			return !!(node && node.nodeType === 1 && (node.matches?.(relevantUiSelector) || node.querySelector?.(relevantUiSelector)));
+			return !!(node && (node.nodeType === 1 || node.nodeType === 11) && (node.matches?.(relevantUiSelector) || node.querySelector?.(relevantUiSelector)));
 		};
-		var mutationTouchesRelevantUi = function(mutation) {
-			if (!mutation || mutation.type !== 'childList') return false;
-			if (mutation.target === root || mutation.target?.id === 'game-modal') return true;
-			for (const node of mutation.addedNodes || []) if (nodeTouchesRelevantUi(node)) return true;
-			for (const node of mutation.removedNodes || []) if (nodeTouchesRelevantUi(node)) return true;
-			return false;
+		var collectBrowseDecoratorScopes = function(node, scopes){
+			if (!node || !scopes || (node.nodeType !== 1 && node.nodeType !== 11)) return;
+			if (node.nodeType === 1) {
+				if (node.matches?.(browseCardScopeSelector)) scopes.add(node);
+				var owner = node.closest?.(browseCardScopeSelector);
+				if (owner && root.contains(owner)) scopes.add(owner);
+			}
+			node.querySelectorAll?.(browseCardScopeSelector).forEach(function(card){ scopes.add(card); });
 		};
 		var observer = new MutationObserver(function(mutations){
 			if (window.__baseGameTitleIdLinkDecorating) return;
+			var browseScopes = new Set();
+			var modalChanged = false;
 			for (const mutation of mutations) {
-				if (mutationTouchesRelevantUi(mutation)) { processUiSoon(root); break; }
+				if (!mutation || mutation.type !== 'childList') continue;
+				if (modal && (mutation.target === modal || modal.contains(mutation.target))) {
+					if (mutation.target === modal || Array.from(mutation.addedNodes || []).some(nodeTouchesRelevantUi)) modalChanged = true;
+					continue;
+				}
+				if (!browseGridObserverActive || !(mutation.target === root || root.contains(mutation.target))) continue;
+				/* Removed card/button nodes need no decoration. Only additions can introduce work;
+				   if the addition happened inside an existing card, queue that card as the scope. */
+				for (const node of mutation.addedNodes || []) collectBrowseDecoratorScopes(node, browseScopes);
 			}
+			if (modalChanged) processUiSoon(modal);
+			browseScopes.forEach(function(scope){ processUiSoon(scope); });
 		});
+
 		var modal = document.getElementById('game-modal');
-		var syncObserverActivity = function(){
-			try { observer.disconnect(); } catch (e) {}
-			if (document.hidden) return;
-			observer.observe(root, { childList: true, subtree: true });
-			if (modal) observer.observe(modal, { childList: true, subtree: true });
+		var browseGridObserverActive = false;
+		var modalObserverActive = false;
+		var isBrowseDecoratorViewVisible = function(){
+			if (!browseDecoratorView) return false;
+			try {
+				if (typeof getCurrentPsnViewElement === 'function') return getCurrentPsnViewElement() === browseDecoratorView;
+			} catch (e) {}
+			return browseDecoratorView.style.display === 'block' || browseDecoratorView.style.display === 'flex';
 		};
-		syncObserverActivity();
+		var syncObserverActivity = function(forceRefresh = false){
+			var shouldObserveGrid = !document.hidden && isBrowseDecoratorViewVisible();
+			var shouldObserveModal = !document.hidden && !!modal;
+			if (!forceRefresh && shouldObserveGrid === browseGridObserverActive && shouldObserveModal === modalObserverActive) return;
+			try { observer.disconnect(); } catch (e) {}
+			browseGridObserverActive = false;
+			modalObserverActive = false;
+			if (document.hidden) return;
+			if (shouldObserveGrid) {
+				observer.observe(root, { childList: true, subtree: true });
+				browseGridObserverActive = true;
+			}
+			if (shouldObserveModal) {
+				observer.observe(modal, { childList: true, subtree: true });
+				modalObserverActive = true;
+			}
+		};
+		syncObserverActivity(true);
+
+		/* The heavy database-grid observer sleeps on Home/Trending/Chat/Library/etc. A tiny
+		   visibility observer on the Browse view re-arms it and reconciles once on entry. */
+		if (browseDecoratorView) {
+			var browseVisibilityObserver = new MutationObserver(function(){
+				var wasActive = browseGridObserverActive;
+				syncObserverActivity();
+				if (!wasActive && browseGridObserverActive) processUiSoon(root);
+			});
+			browseVisibilityObserver.observe(browseDecoratorView, { attributes: true, attributeFilter: ['style', 'class', 'hidden'] });
+		}
+
 		document.addEventListener('visibilitychange', function(){
-			syncObserverActivity();
-			if (!document.hidden) processUiSoon(root);
+			var shouldRefreshBrowse = !document.hidden && isBrowseDecoratorViewVisible();
+			syncObserverActivity(true);
+			if (shouldRefreshBrowse) processUiSoon(root);
 		}, { passive:true });
 
 	}
@@ -74935,10 +75586,23 @@ function getVisibleChatStackEl(id) {
     const INTERFACE_TRANSLATE_MAX_CONCURRENT = 6;
     const INTERFACE_TRANSLATE_CHUNK_LENGTH = 680;
     const INTERFACE_TRANSLATE_REQUEST_TIMEOUT = 12000;
+    const INTERFACE_TRANSLATE_EXPLORE_SLICE_BUDGET_MS = 4.25;
+    const INTERFACE_TRANSLATE_EXPLORE_SLICE_MAX_NODES = 110;
+    const INTERFACE_TRANSLATE_EXPLORE_PRIORITY_SELECTOR = [
+        '.hero-game-description', '.section-header h2', '.section-header h3',
+        '.explore-visit-pill', '.explore-section > h2', '.explore-section > h3'
+    ].join(',');
     const INTERFACE_TRANSLATE_VISIBILITY_HOST_SELECTOR = [
         '[id^="view-"]', '[id^="subview-"]', '.sys-modal-overlay', '.modal-overlay',
         '[role="dialog"]', '.tab-content', '.ps5-auth-container', '.profile-country-dialog',
         '.sidebar-menu[class*="menu-group-"]'
+    ].join(',');
+    const INTERFACE_TRANSLATE_GLOBAL_VISIBILITY_HOST_SELECTOR = [
+        '.sys-modal-overlay', '.modal-overlay', '[role="dialog"]', '.profile-country-dialog',
+        '.ps5-overlay-screen', '.ps5-auth-container', '#site-disclaimer-modal'
+    ].join(',');
+    const INTERFACE_TRANSLATE_APP_CHROME_SELECTOR = [
+        '.global-main-header', '.sidebar', '.nps-liquid-switcher'
     ].join(',');
     // Small hidden menus are translated eagerly so their first opening never flashes English.
     const INTERFACE_TRANSLATE_EAGER_ROOT_SELECTOR = '#profile-dropdown';
@@ -74978,6 +75642,9 @@ function getVisibleChatStackEl(id) {
         cache: Object.create(null),
         cacheLoadedFor: '',
         observer: null,
+        portalObserver: null,
+        contextRoots: new Set(),
+        contextRefreshTimer: null,
         scanTimer: null,
         pendingRoots: new Set(),
         queue: [],
@@ -74989,7 +75656,11 @@ function getVisibleChatStackEl(id) {
         fixedCardRecords: new Map(),
         fixedCardResizeTimer: null,
         dynamicTemplates: new Map(),
-        statusRenderToken: 0
+        statusRenderToken: 0,
+        exploreScanToken: 0,
+        exploreScanHandle: null,
+        exploreScanHandleType: '',
+        exploreScanRoot: null
     };
     window.__interfaceTranslationState = state;
     if (!(state.pendingRoots instanceof Set)) state.pendingRoots = new Set();
@@ -74998,9 +75669,16 @@ function getVisibleChatStackEl(id) {
     if (!(state.optionRecords instanceof Map)) state.optionRecords = new Map();
     if (!(state.fixedCardRecords instanceof Map)) state.fixedCardRecords = new Map();
     if (!(state.dynamicTemplates instanceof Map)) state.dynamicTemplates = new Map();
+    if (!(state.contextRoots instanceof Set)) state.contextRoots = new Set();
+    if (!Object.prototype.hasOwnProperty.call(state, 'portalObserver')) state.portalObserver = null;
+    if (!Object.prototype.hasOwnProperty.call(state, 'contextRefreshTimer')) state.contextRefreshTimer = null;
     if (!Object.prototype.hasOwnProperty.call(state, 'layoutTimer')) state.layoutTimer = null;
     if (!Object.prototype.hasOwnProperty.call(state, 'fixedCardResizeTimer')) state.fixedCardResizeTimer = null;
     if (!Object.prototype.hasOwnProperty.call(state, 'statusRenderToken')) state.statusRenderToken = 0;
+    if (!Object.prototype.hasOwnProperty.call(state, 'exploreScanToken')) state.exploreScanToken = 0;
+    if (!Object.prototype.hasOwnProperty.call(state, 'exploreScanHandle')) state.exploreScanHandle = null;
+    if (!Object.prototype.hasOwnProperty.call(state, 'exploreScanHandleType')) state.exploreScanHandleType = '';
+    if (!Object.prototype.hasOwnProperty.call(state, 'exploreScanRoot')) state.exploreScanRoot = null;
     try {
         Object.keys(localStorage).forEach(key => {
             if (/^psn_interface_translate_cache_v\d+_/.test(key) && !key.startsWith(INTERFACE_TRANSLATE_CACHE_PREFIX)) {
@@ -76036,9 +76714,116 @@ function getVisibleChatStackEl(id) {
         }
     }
 
+    function isExploreInterfaceTranslationRoot(root) {
+        const base = root && root.nodeType === Node.TEXT_NODE ? root.parentElement : root;
+        return !!(base && base.nodeType === Node.ELEMENT_NODE && base.id === 'view-explore');
+    }
+
+    function cancelExploreInterfaceTranslationScan() {
+        state.exploreScanToken = (Number(state.exploreScanToken) || 0) + 1;
+        if (state.exploreScanHandle !== null) {
+            try {
+                if (state.exploreScanHandleType === 'idle' && typeof cancelIdleCallback === 'function') cancelIdleCallback(state.exploreScanHandle);
+                else if (state.exploreScanHandleType === 'raf' && typeof cancelAnimationFrame === 'function') cancelAnimationFrame(state.exploreScanHandle);
+                else clearTimeout(state.exploreScanHandle);
+            } catch (err) {}
+        }
+        state.exploreScanHandle = null;
+        state.exploreScanHandleType = '';
+        state.exploreScanRoot = null;
+    }
+
+    function scanExploreInterfacePriority(root) {
+        if (!state.enabled || !root || !root.isConnected || !isElementVisible(root)) return;
+        const seen = new Set();
+        const process = el => {
+            if (!el || !el.isConnected || seen.has(el) || shouldSkipNode(el) || !isElementVisible(el)) return;
+            seen.add(el);
+            // These are deliberately tiny roots. Cached phrases land synchronously; an uncached phrase
+            // is queued without walking every game card before the Explore entry animation starts.
+            scanVisibleInterface(el);
+        };
+        try {
+            root.querySelectorAll(INTERFACE_TRANSLATE_EXPLORE_PRIORITY_SELECTOR).forEach(process);
+        } catch (err) {}
+    }
+
+    function scheduleExploreInterfaceTranslationScan(root) {
+        if (!state.enabled || !root || !root.isConnected || state.target === 'en') return;
+        cancelExploreInterfaceTranslationScan();
+        const token = state.exploreScanToken;
+        const generation = state.generation;
+        const target = state.target;
+        state.exploreScanRoot = root;
+
+        const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT | NodeFilter.SHOW_ELEMENT, {
+            acceptNode(node) {
+                if (node !== root && shouldSkipNode(node)) return NodeFilter.FILTER_REJECT;
+                if (node.nodeType === Node.ELEMENT_NODE && node !== root && !isElementVisible(node)) return NodeFilter.FILTER_REJECT;
+                return NodeFilter.FILTER_ACCEPT;
+            }
+        });
+        let node = walker.currentNode;
+
+        const scheduleNext = (first = false) => {
+            if (token !== state.exploreScanToken || generation !== state.generation || !state.enabled || !root.isConnected || document.hidden) return;
+            if (first && typeof requestAnimationFrame === 'function') {
+                state.exploreScanHandleType = 'raf';
+                state.exploreScanHandle = requestAnimationFrame(runSlice);
+                return;
+            }
+            if (typeof requestIdleCallback === 'function') {
+                state.exploreScanHandleType = 'idle';
+                state.exploreScanHandle = requestIdleCallback(runSlice, { timeout: 80 });
+            } else {
+                state.exploreScanHandleType = 'timeout';
+                state.exploreScanHandle = setTimeout(runSlice, 16);
+            }
+        };
+
+        const runSlice = deadline => {
+            state.exploreScanHandle = null;
+            state.exploreScanHandleType = '';
+            if (token !== state.exploreScanToken || generation !== state.generation || !state.enabled || state.target !== target || !root.isConnected || document.hidden) return;
+
+            const started = performance && typeof performance.now === 'function' ? performance.now() : Date.now();
+            let processed = 0;
+            while (node) {
+                const current = node;
+                node = walker.nextNode();
+                if (current.nodeType === Node.TEXT_NODE) {
+                    if (!applyImmediateInterfaceTranslationToTextNode(current, target, { skipFit: true })) {
+                        translateTextNode(current, target, generation, { skipFit: true });
+                    }
+                } else if (current.nodeType === Node.ELEMENT_NODE) {
+                    translateElementAttributes(current, target, generation);
+                    if (current.tagName === 'SELECT') translateSelectOptions(current, target, generation);
+                    else if (current.tagName === 'OPTION') translateSelectOption(current, target, generation);
+                }
+                processed++;
+                const now = performance && typeof performance.now === 'function' ? performance.now() : Date.now();
+                const idleLow = deadline && typeof deadline.timeRemaining === 'function' && !deadline.didTimeout && deadline.timeRemaining() < 1;
+                if (processed >= INTERFACE_TRANSLATE_EXPLORE_SLICE_MAX_NODES || (now - started) >= INTERFACE_TRANSLATE_EXPLORE_SLICE_BUDGET_MS || idleLow) break;
+            }
+
+            if (node) scheduleNext(false);
+            else if (token === state.exploreScanToken) {
+                state.exploreScanRoot = null;
+                state.exploreScanHandle = null;
+                state.exploreScanHandleType = '';
+            }
+        };
+
+        scheduleNext(true);
+    }
+
     function scheduleInterfaceTranslationScan(root) {
         if (!state.enabled) return;
         const candidate = root && root.nodeType === Node.TEXT_NODE ? root.parentElement : root;
+        if (isExploreInterfaceTranslationRoot(candidate)) {
+            scheduleExploreInterfaceTranslationScan(candidate);
+            return;
+        }
         if (candidate && candidate.isConnected) state.pendingRoots.add(candidate);
         if (state.scanTimer) return;
         state.scanTimer = setTimeout(() => {
@@ -76125,9 +76910,11 @@ function getVisibleChatStackEl(id) {
         catch (err) { return false; }
     }
 
-    function scheduleInterfaceTranslationAfterUiChange(root = document.body) {
+    function scheduleInterfaceTranslationAfterUiChange(root = null) {
         if (!state.enabled) return;
-        const candidate = root && root.isConnected ? root : document.body;
+        const activeView = typeof getCurrentPsnViewElement === 'function' ? getCurrentPsnViewElement() : null;
+        const candidate = root && root !== document.body && root.isConnected ? root : (activeView || Array.from(state.contextRoots || [])[0] || null);
+        if (!candidate) return;
         requestAnimationFrame(() => {
             if (candidate.isConnected) scheduleInterfaceTranslationScan(candidate);
         });
@@ -76156,7 +76943,7 @@ function getVisibleChatStackEl(id) {
         const scheduleCurrentInterfaceViewTranslation = () => {
             if (!state.enabled) return;
             const visibleView = typeof getCurrentPsnViewElement === 'function' ? getCurrentPsnViewElement() : null;
-            scheduleInterfaceTranslationAfterUiChange(visibleView || document.body);
+            refreshInterfaceTranslationContext(visibleView, { immediate: true, scan: true });
         };
         window.addEventListener('popstate', scheduleCurrentInterfaceViewTranslation);
         window.addEventListener('hashchange', scheduleCurrentInterfaceViewTranslation);
@@ -76172,13 +76959,16 @@ function getVisibleChatStackEl(id) {
     function disconnectInterfaceTranslationObservers() {
         if (state.observer) state.observer.disconnect();
         state.observer = null;
+        if (state.portalObserver) state.portalObserver.disconnect();
+        state.portalObserver = null;
+        state.contextRoots.clear();
         if (state.visibilityObservers && state.visibilityObservers.size) {
             state.visibilityObservers.forEach(observer => { try { observer.disconnect(); } catch (err) {} });
             state.visibilityObservers.clear();
         }
     }
 
-    function observeInterfaceTranslationVisibilityHosts(root = document.body) {
+    function observeInterfaceTranslationVisibilityHosts(root = null) {
         if (!window.MutationObserver || !root) return;
         if (!state.visibilityObservers) state.visibilityObservers = new Map();
         const register = host => {
@@ -76187,14 +76977,32 @@ function getVisibleChatStackEl(id) {
             const observer = new MutationObserver(() => {
                 if (!host.isConnected) return;
                 const visible = isElementVisible(host);
-                if (state.enabled && visible && !wasVisible) scheduleInterfaceTranslationScan(host);
+                if (state.enabled && visible && !wasVisible) {
+                    scheduleInterfaceTranslationScan(host);
+                    if (host.matches?.(INTERFACE_TRANSLATE_GLOBAL_VISIBILITY_HOST_SELECTOR)) scheduleInterfaceTranslationContextRefresh();
+                } else if (state.enabled && !visible && wasVisible && host.matches?.(INTERFACE_TRANSLATE_GLOBAL_VISIBILITY_HOST_SELECTOR)) {
+                    scheduleInterfaceTranslationContextRefresh();
+                }
                 wasVisible = visible;
             });
             observer.observe(host, { attributes: true, attributeFilter: ['class', 'style', 'hidden', 'open', 'aria-hidden'] });
             state.visibilityObservers.set(host, observer);
         };
         if (root.nodeType === Node.ELEMENT_NODE) register(root);
+        // Explore has no nested subviews/dialog hosts; walking every carousel/card here only to prove that
+        // is wasted work on each Home return. Body-level portals are discovered by the shallow portal observer.
+        if (root.nodeType === Node.ELEMENT_NODE && root.id === 'view-explore') return;
         if (root.querySelectorAll) root.querySelectorAll(INTERFACE_TRANSLATE_VISIBILITY_HOST_SELECTOR).forEach(register);
+    }
+
+    function observeGlobalInterfaceTranslationVisibilityHosts() {
+        if (!document.querySelectorAll) return;
+        document.querySelectorAll(INTERFACE_TRANSLATE_GLOBAL_VISIBILITY_HOST_SELECTOR).forEach(host => {
+            // Hosts inside top-level views are owned by the active-view observer. Hidden views therefore
+            // keep zero translation tracking until navigation promotes that view into the active context.
+            if (host.closest?.('[id^="view-"]')) return;
+            observeInterfaceTranslationVisibilityHosts(host);
+        });
     }
 
     function cleanupInterfaceTranslationVisibilityHosts() {
@@ -76206,76 +77014,158 @@ function getVisibleChatStackEl(id) {
         });
     }
 
-    function startInterfaceTranslationObserver() {
-        if (!window.MutationObserver || document.hidden) return;
-        disconnectInterfaceTranslationObservers();
-        state.visibilityObservers = new Map();
-        observeInterfaceTranslationVisibilityHosts(document.body);
-        state.observer = new MutationObserver(mutations => {
-            if (!state.enabled) return;
-            let removedVisibilityHost = false;
-            for (const mutation of mutations) {
-                if (mutation.type === 'characterData') {
-                    if (!applyImmediateInterfaceTranslationToTextNode(mutation.target, state.target)) {
-                        scheduleInterfaceTranslationScan(mutation.target.parentElement);
+    function getInterfaceTranslationContextRoots(preferredView = null) {
+        const roots = [];
+        const push = root => {
+            if (!root || root.nodeType !== Node.ELEMENT_NODE || !root.isConnected || !isElementVisible(root) || shouldSkipNode(root)) return;
+            if (!roots.includes(root)) roots.push(root);
+        };
+
+        if (!hasAuthenticatedInterfaceTranslationUser()) {
+            push(document.getElementById('ps5-boot-container'));
+        } else {
+            document.querySelectorAll(INTERFACE_TRANSLATE_APP_CHROME_SELECTOR).forEach(push);
+            const view = preferredView && preferredView.isConnected ? preferredView : (typeof getCurrentPsnViewElement === 'function' ? getCurrentPsnViewElement() : null);
+            push(view);
+        }
+
+        document.querySelectorAll(INTERFACE_TRANSLATE_GLOBAL_VISIBILITY_HOST_SELECTOR).forEach(host => {
+            if (!isElementVisible(host)) return;
+            const activeView = preferredView && preferredView.isConnected ? preferredView : (typeof getCurrentPsnViewElement === 'function' ? getCurrentPsnViewElement() : null);
+            if (activeView && activeView.contains(host)) return;
+            push(host);
+        });
+
+        // Keep only the outermost roots. This prevents a visible dialog nested inside the active view
+        // from being observed twice while still allowing body-level portals to have their own scope.
+        return roots.filter((root, index) => !roots.some((other, otherIndex) => otherIndex !== index && other.contains && other.contains(root)));
+    }
+
+    function handleInterfaceTranslationMutations(mutations) {
+        if (!state.enabled) return;
+        let removedVisibilityHost = false;
+        for (const mutation of mutations) {
+            if (mutation.type === 'attributes') {
+                const target = mutation.target;
+                const attr = mutation.attributeName || '';
+                if (!applyImmediateInterfaceTranslationToAttribute(target, attr, state.target)) scheduleInterfaceTranslationScan(target);
+                continue;
+            }
+            if (mutation.addedNodes && mutation.addedNodes.length) {
+                mutation.addedNodes.forEach(node => {
+                    if (!node) return;
+                    if (node.nodeType === Node.TEXT_NODE) {
+                        if (!normalizeInterfaceSourceText(node.nodeValue || '')) return;
+                        if (!applyImmediateInterfaceTranslationToTextNode(node, state.target)) scheduleInterfaceTranslationScan(node.parentElement);
+                        return;
                     }
-                    continue;
-                }
-                if (mutation.type === 'attributes') {
-                    const target = mutation.target;
-                    const attr = mutation.attributeName || '';
-                    if (!applyImmediateInterfaceTranslationToAttribute(target, attr, state.target)) scheduleInterfaceTranslationScan(target);
-                    continue;
-                }
-                if (mutation.addedNodes && mutation.addedNodes.length) {
-                    mutation.addedNodes.forEach(node => {
-                        if (!node) return;
-                        if (node.nodeType === Node.TEXT_NODE) {
-                            // Pretty-printed card HTML creates whitespace text nodes between cards. Scanning
-                            // their parent used to promote the pending root to the whole database grid.
-                            if (!normalizeInterfaceSourceText(node.nodeValue || '')) return;
-                            if (!applyImmediateInterfaceTranslationToTextNode(node, state.target)) {
-                                scheduleInterfaceTranslationScan(node.parentElement);
-                            }
-                            return;
-                        }
-                        if (node.nodeType !== Node.ELEMENT_NODE) return;
-                        // Common game cards can never introduce a view/modal visibility host. Handle them
-                        // first so every infinite-scroll/virtualized card does not query its whole subtree
-                        // for host selectors before taking the lightweight cached-translation path.
-                        if (scanNewBrowseCardInterfaceFast(node)) return;
-                        observeInterfaceTranslationVisibilityHosts(node);
-                        applyImmediateInterfaceTranslations(node);
-                        scheduleInterfaceTranslationScan(node);
-                    });
-                }
-                if (!removedVisibilityHost && mutation.removedNodes && mutation.removedNodes.length) {
-                    for (const node of mutation.removedNodes) {
-                        if (!node || node.nodeType !== Node.ELEMENT_NODE) continue;
-                        if (state.visibilityObservers?.has(node) || node.matches?.(INTERFACE_TRANSLATE_VISIBILITY_HOST_SELECTOR) || node.querySelector?.(INTERFACE_TRANSLATE_VISIBILITY_HOST_SELECTOR)) {
-                            removedVisibilityHost = true;
-                            break;
-                        }
+                    if (node.nodeType !== Node.ELEMENT_NODE || shouldSkipNode(node)) return;
+                    if (scanNewBrowseCardInterfaceFast(node)) return;
+                    observeInterfaceTranslationVisibilityHosts(node);
+                    applyImmediateInterfaceTranslations(node);
+                    scheduleInterfaceTranslationScan(node);
+                });
+            }
+            if (!removedVisibilityHost && mutation.removedNodes && mutation.removedNodes.length) {
+                for (const node of mutation.removedNodes) {
+                    if (!node || node.nodeType !== Node.ELEMENT_NODE) continue;
+                    if (state.visibilityObservers?.has(node) || node.matches?.(INTERFACE_TRANSLATE_VISIBILITY_HOST_SELECTOR) || node.querySelector?.(INTERFACE_TRANSLATE_VISIBILITY_HOST_SELECTOR)) {
+                        removedVisibilityHost = true;
+                        break;
                     }
                 }
             }
-            if (removedVisibilityHost) cleanupInterfaceTranslationVisibilityHosts();
-        });
-        // Translation attributes/text stay global. Visibility attributes are observed only on actual
-        // view/modal hosts, so card hover/style/class churn cannot wake the translation observer.
-        state.observer.observe(document.body, {
-            childList: true,
-            subtree: true,
-            characterData: true,
-            attributes: true,
-            attributeFilter: ['placeholder', 'data-placeholder', 'title', 'aria-label']
-        });
+        }
+        if (removedVisibilityHost) cleanupInterfaceTranslationVisibilityHosts();
     }
+
+    function handleInterfaceTranslationPortalMutations(mutations) {
+        if (!state.enabled) return;
+        let needsContextRefresh = false;
+        for (const mutation of mutations) {
+            if (!mutation.addedNodes?.length && !mutation.removedNodes?.length) continue;
+            mutation.addedNodes?.forEach(node => {
+                if (!node || node.nodeType !== Node.ELEMENT_NODE || shouldSkipNode(node)) return;
+                observeInterfaceTranslationVisibilityHosts(node);
+                const isGlobalHost = node.matches?.(INTERFACE_TRANSLATE_GLOBAL_VISIBILITY_HOST_SELECTOR) || !!node.querySelector?.(INTERFACE_TRANSLATE_GLOBAL_VISIBILITY_HOST_SELECTOR);
+                if (isElementVisible(node)) {
+                    applyImmediateInterfaceTranslations(node);
+                    scheduleInterfaceTranslationScan(node);
+                }
+                if (isGlobalHost) needsContextRefresh = true;
+            });
+            mutation.removedNodes?.forEach(node => {
+                if (!node || node.nodeType !== Node.ELEMENT_NODE) return;
+                if (state.contextRoots.has(node) || state.visibilityObservers?.has(node) || node.matches?.(INTERFACE_TRANSLATE_GLOBAL_VISIBILITY_HOST_SELECTOR)) needsContextRefresh = true;
+            });
+        }
+        if (needsContextRefresh) scheduleInterfaceTranslationContextRefresh();
+    }
+
+    function startInterfaceTranslationObserver(preferredView = null) {
+        if (!window.MutationObserver || document.hidden || !state.enabled || state.target === 'en') return;
+        disconnectInterfaceTranslationObservers();
+        state.visibilityObservers = new Map();
+
+        const roots = getInterfaceTranslationContextRoots(preferredView);
+        state.contextRoots = new Set(roots);
+        state.observer = new MutationObserver(handleInterfaceTranslationMutations);
+        roots.forEach(root => {
+            observeInterfaceTranslationVisibilityHosts(root);
+            state.observer.observe(root, {
+                childList: true,
+                subtree: true,
+                attributes: true,
+                attributeFilter: ['placeholder', 'data-placeholder', 'title', 'aria-label']
+            });
+        });
+        // Hidden body-level dialogs are not part of the expensive subtree observer. They get only a
+        // tiny host-attribute observer so opening one can promote it into the active translation context.
+        observeGlobalInterfaceTranslationVisibilityHosts();
+
+        // The only remaining body observer is intentionally shallow. It discovers portals/toasts that
+        // are appended directly to <body>; ordinary card/message mutations inside the app never reach it.
+        state.portalObserver = new MutationObserver(handleInterfaceTranslationPortalMutations);
+        state.portalObserver.observe(document.body, { childList: true });
+    }
+
+    function scheduleInterfaceTranslationContextRefresh(preferredView = null) {
+        if (!state.enabled || state.target === 'en' || document.hidden) return;
+        clearTimeout(state.contextRefreshTimer);
+        state.contextRefreshTimer = setTimeout(() => {
+            state.contextRefreshTimer = null;
+            refreshInterfaceTranslationContext(preferredView, { immediate: true, scan: true });
+        }, 0);
+    }
+
+    function refreshInterfaceTranslationContext(preferredView = null, options = {}) {
+        if (!state.enabled || state.target === 'en' || document.hidden) return false;
+        startInterfaceTranslationObserver(preferredView);
+        const roots = Array.from(state.contextRoots).filter(root => root && root.isConnected && isElementVisible(root));
+        let exploreRoot = null;
+        roots.forEach(root => {
+            if (isExploreInterfaceTranslationRoot(root)) {
+                exploreRoot = root;
+                return;
+            }
+            if (options.immediate !== false) applyImmediateInterfaceTranslations(root);
+            if (options.scan !== false) scheduleInterfaceTranslationScan(root);
+        });
+        if (exploreRoot) {
+            if (options.immediate !== false) scanExploreInterfacePriority(exploreRoot);
+            if (options.scan !== false) scheduleExploreInterfaceTranslationScan(exploreRoot);
+        } else {
+            cancelExploreInterfaceTranslationScan();
+        }
+        return !!roots.length;
+    }
+    window.refreshInterfaceTranslationContext = refreshInterfaceTranslationContext;
 
     document.addEventListener('visibilitychange', () => {
         if (!state.enabled || state.target === 'en') return;
         if (document.hidden) {
             disconnectInterfaceTranslationObservers();
+            cancelExploreInterfaceTranslationScan();
             clearTimeout(state.scanTimer);
             clearTimeout(state.postUiTimer);
             state.scanTimer = null;
@@ -76283,9 +77173,8 @@ function getVisibleChatStackEl(id) {
             state.pendingRoots.clear();
             return;
         }
-        if (!state.observer) startInterfaceTranslationObserver();
         const visibleView = typeof getCurrentPsnViewElement === 'function' ? getCurrentPsnViewElement() : null;
-        scheduleInterfaceTranslationAfterUiChange(visibleView || document.body);
+        refreshInterfaceTranslationContext(visibleView, { immediate: true, scan: true });
     }, { passive: true });
 
     function refreshInterfaceTranslationDependentUi() {
@@ -76298,10 +77187,13 @@ function getVisibleChatStackEl(id) {
     }
 
     function resetInterfaceTranslationPendingWork() {
+        cancelExploreInterfaceTranslationScan();
         clearTimeout(state.scanTimer);
         clearTimeout(state.postUiTimer);
+        clearTimeout(state.contextRefreshTimer);
         state.scanTimer = null;
         state.postUiTimer = null;
+        state.contextRefreshTimer = null;
         state.pendingRoots.clear();
         state.queue.length = 0;
         state.pendingNodes = new WeakSet();
@@ -76319,10 +77211,10 @@ function getVisibleChatStackEl(id) {
             refreshInterfaceTranslationDependentUi();
             if (target !== 'en') {
                 installInterfaceTranslationUiHooks();
-                if (!state.observer) startInterfaceTranslationObserver();
+                const visibleView = typeof getCurrentPsnViewElement === 'function' ? getCurrentPsnViewElement() : null;
+                refreshInterfaceTranslationContext(visibleView, { immediate: true, scan: true });
                 warmEagerInterfaceRoots();
                 if (typeof window.warmNativeDialogTranslations === 'function') window.warmNativeDialogTranslations();
-                scheduleInterfaceTranslationAfterUiChange(document.body);
             }
             return;
         }
@@ -76342,12 +77234,12 @@ function getVisibleChatStackEl(id) {
         refreshInterfaceTranslationDependentUi();
         if (target !== 'en') {
             installInterfaceTranslationUiHooks();
-            startInterfaceTranslationObserver();
+            const visibleView = typeof getCurrentPsnViewElement === 'function' ? getCurrentPsnViewElement() : null;
+            refreshInterfaceTranslationContext(visibleView, { immediate: true, scan: true });
             warmEagerInterfaceRoots();
             if (typeof window.warmPsnWelcomeMessageTranslations === 'function') window.warmPsnWelcomeMessageTranslations();
             if (typeof window.refreshPsnWelcomeMessageTranslation === 'function') window.refreshPsnWelcomeMessageTranslation();
             if (typeof window.warmNativeDialogTranslations === 'function') window.warmNativeDialogTranslations();
-            scheduleInterfaceTranslationAfterUiChange(document.body);
         }
     }
 
@@ -77331,6 +78223,7 @@ function getVisibleChatStackEl(id) {
 		const animationOwner = new WeakMap();
 		const pausedByScheduler = new WeakSet();
 		const pendingSyncTargets = new Set();
+		const INFINITE_ANIMATION_HOST_ATTR = 'data-psn-infinite-animation-host';
 		let syncFrame = 0;
 		let cleanupFrame = 0;
 
@@ -77362,6 +78255,7 @@ function getVisibleChatStackEl(id) {
 			});
 			record.animations.clear();
 			records.delete(el);
+			try { el.removeAttribute(INFINITE_ANIMATION_HOST_ATTR); } catch (e) {}
 		}
 
 		function applyRecordState(el) {
@@ -77417,7 +78311,8 @@ function getVisibleChatStackEl(id) {
 				/* Start optimistic: never pause a visible element before IntersectionObserver's first result. */
 				record = { animations: new Set(), inView: true };
 				records.set(host, record);
-				try { viewportObserver.observe(host); } catch (e) { records.delete(host); return; }
+				try { host.setAttribute(INFINITE_ANIMATION_HOST_ATTR, '1'); } catch (e) {}
+				try { viewportObserver.observe(host); } catch (e) { records.delete(host); try { host.removeAttribute(INFINITE_ANIMATION_HOST_ATTR); } catch (err) {} return; }
 			}
 
 			record.animations.add(animation);
@@ -77488,11 +78383,22 @@ function getVisibleChatStackEl(id) {
 			try { animationCleanupObserver.disconnect(); } catch (e) {}
 			if (!document.hidden) animationCleanupObserver.observe(document.body, { subtree: true, childList: true });
 		}
+		function cleanupRemovedInfiniteAnimationTree(node) {
+			if (!node) return;
+			if (node.nodeType === 1 && records.has(node)) cleanupRecord(node);
+			if (!node.querySelectorAll) return;
+			node.querySelectorAll(`[${INFINITE_ANIMATION_HOST_ATTR}]`).forEach(el => {
+				if (records.has(el)) cleanupRecord(el);
+			});
+		}
+
 		if (document.body && typeof MutationObserver === 'function') {
 			animationCleanupObserver = new MutationObserver(mutations => {
-                for (const mutation of mutations) {
-                    if (mutation.removedNodes && mutation.removedNodes.length) { queueDisconnectedCleanup(); break; }
-                }
+				/* A normal DOM removal no longer schedules an O(number-of-animation-hosts) registry scan.
+				   Registered hosts carry a tiny marker, so only the detached subtree is inspected. */
+				for (const mutation of mutations) {
+					for (const node of mutation.removedNodes || []) cleanupRemovedInfiniteAnimationTree(node);
+				}
 			});
 			syncAnimationCleanupObserverActivity();
 		}
@@ -77604,14 +78510,16 @@ function getVisibleChatStackEl(id) {
     window.addEventListener('orientationchange', window.refreshPsnPageEmptyStates, { passive: true });
     document.addEventListener('DOMContentLoaded', window.refreshPsnPageEmptyStates, { once: true });
 
-    /* Empty/loading states can appear, disappear or toggle asynchronously.
-       Observe visual attributes only on the empty-state nodes themselves. A subtree-wide style
-       observer used to wake for unrelated card hover/glow/style writes throughout the page. */
+    /* Empty/loading states are now event-driven. Static states are registered once; dynamic
+       renderers register the exact state they create. This removes the old subtree-wide
+       discovery observer on #scroll-area, so normal card/list churn no longer wakes this system. */
     if (typeof MutationObserver === 'function') {
-        const observerRoot = document.getElementById('scroll-area') || document.body;
         const observedEmptyStates = new WeakSet();
+        const dynamicEmptyStates = new WeakSet();
         const emptyStateVisualSnapshot = new WeakMap();
+        const dynamicHostObservers = new Map();
         const getEmptyStateVisualSignature = state => `${String(state?.style?.display || '')}|${String(state?.className || '')}|${state?.hidden ? '1' : '0'}`;
+
         const emptyStateStyleObserver = new MutationObserver(mutations => {
             let needsRefresh = false;
             for (const mutation of mutations) {
@@ -77624,51 +78532,93 @@ function getVisibleChatStackEl(id) {
             if (needsRefresh) window.refreshPsnPageEmptyStates();
         });
 
-        const observeEmptyState = state => {
-            if (!state || state.nodeType !== 1 || observedEmptyStates.has(state)) return;
-            observedEmptyStates.add(state);
+        function disconnectDynamicHostObserver(host) {
+            const observer = dynamicHostObservers.get(host);
+            if (!observer) return;
+            try { observer.disconnect(); } catch (e) {}
+            dynamicHostObservers.delete(host);
+        }
+
+        function ensureDynamicHostObserver(host) {
+            if (!host || document.hidden || dynamicHostObservers.has(host)) return;
+            const observer = new MutationObserver(() => {
+                let hasDynamicEmpty = false;
+                for (const state of Array.from(psnPageEmptyStateRegistry)) {
+                    if (!state.isConnected) {
+                        psnPageEmptyStateRegistry.delete(state);
+                        continue;
+                    }
+                    if (dynamicEmptyStates.has(state) && state.parentElement === host) {
+                        hasDynamicEmpty = true;
+                        break;
+                    }
+                }
+                if (!hasDynamicEmpty) disconnectDynamicHostObserver(host);
+                window.refreshPsnPageEmptyStates();
+            });
+            observer.observe(host, { childList: true });
+            dynamicHostObservers.set(host, observer);
+        }
+
+        const observeEmptyState = (state, dynamic = false) => {
+            if (!state || state.nodeType !== 1 || !state.classList?.contains('psn-page-empty-state')) return false;
             psnPageEmptyStateRegistry.add(state);
+            if (dynamic) dynamicEmptyStates.add(state);
             emptyStateVisualSnapshot.set(state, getEmptyStateVisualSignature(state));
-            emptyStateStyleObserver.observe(state, { attributes: true, attributeFilter: ['style', 'class', 'hidden'] });
+            if (!observedEmptyStates.has(state)) observedEmptyStates.add(state);
+            if (!document.hidden) {
+                try { emptyStateStyleObserver.observe(state, { attributes: true, attributeFilter: ['style', 'class', 'hidden'] }); } catch (e) {}
+                if (dynamic) ensureDynamicHostObserver(state.parentElement);
+            }
+            return true;
         };
-        const observeEmptyStatesIn = node => {
-            if (!node || node.nodeType !== 1) return false;
+
+        const registerEmptyStatesIn = (root, dynamic = true) => {
+            if (!root) return false;
             let found = false;
-            if (node.matches?.('.psn-page-empty-state')) { observeEmptyState(node); found = true; }
-            node.querySelectorAll?.('.psn-page-empty-state').forEach(state => { observeEmptyState(state); found = true; });
+            if (root.nodeType === 1 && root.classList?.contains('psn-page-empty-state')) {
+                found = observeEmptyState(root, dynamic) || found;
+            }
+            /* Normally dynamic renderers pass the exact state, so this descendant scan is only
+               a compatibility path for callers that pass a small container. */
+            root.querySelectorAll?.('.psn-page-empty-state').forEach(state => {
+                found = observeEmptyState(state, dynamic) || found;
+            });
             return found;
         };
 
-        document.querySelectorAll('.psn-page-empty-state').forEach(observeEmptyState);
+        window.registerPsnPageEmptyStates = function(root) {
+            const found = registerEmptyStatesIn(root, true);
+            if (found) window.refreshPsnPageEmptyStates();
+            return found;
+        };
 
-        let emptyStateDiscoveryObserver = null;
-        if (observerRoot) {
-            emptyStateDiscoveryObserver = new MutationObserver(mutations => {
-                let needsRefresh = false;
-                for (const mutation of mutations) {
-                    for (const node of mutation.addedNodes) if (observeEmptyStatesIn(node)) needsRefresh = true;
-                    for (const node of mutation.removedNodes) {
-                        if (node && node.nodeType === 1 && (node.matches?.('.psn-page-empty-state') || node.querySelector?.('.psn-page-empty-state'))) needsRefresh = true;
-                    }
-                }
-                if (needsRefresh) window.refreshPsnPageEmptyStates();
-            });
-        }
+        /* Static markup is discovered once. Its visibility changes are handled by the per-state
+           attribute observer, without any child-list observer on the surrounding page. */
+        document.querySelectorAll('.psn-page-empty-state').forEach(state => observeEmptyState(state, false));
 
         function syncEmptyStateObserverActivity() {
             try { emptyStateStyleObserver.disconnect(); } catch (e) {}
-            try { emptyStateDiscoveryObserver?.disconnect(); } catch (e) {}
+            dynamicHostObservers.forEach(observer => { try { observer.disconnect(); } catch (e) {} });
+            dynamicHostObservers.clear();
             if (document.hidden) return;
-            /* Re-discover states created while sleeping, then re-arm only the state nodes themselves. */
-            document.querySelectorAll('.psn-page-empty-state').forEach(observeEmptyState);
-            psnPageEmptyStateRegistry.forEach(state => {
-                if (!state?.isConnected) return;
-                emptyStateVisualSnapshot.set(state, getEmptyStateVisualSignature(state));
-                emptyStateStyleObserver.observe(state, { attributes: true, attributeFilter: ['style', 'class', 'hidden'] });
+
+            /* One wake-up reconciliation covers states created while the tab was suspended. */
+            document.querySelectorAll('.psn-page-empty-state').forEach(state => {
+                const dynamic = dynamicEmptyStates.has(state);
+                observeEmptyState(state, dynamic);
             });
-            if (observerRoot && emptyStateDiscoveryObserver) emptyStateDiscoveryObserver.observe(observerRoot, { childList: true, subtree: true });
+            for (const state of Array.from(psnPageEmptyStateRegistry)) {
+                if (!state?.isConnected) {
+                    psnPageEmptyStateRegistry.delete(state);
+                    continue;
+                }
+                emptyStateVisualSnapshot.set(state, getEmptyStateVisualSignature(state));
+                try { emptyStateStyleObserver.observe(state, { attributes: true, attributeFilter: ['style', 'class', 'hidden'] }); } catch (e) {}
+                if (dynamicEmptyStates.has(state)) ensureDynamicHostObserver(state.parentElement);
+            }
         }
-        syncEmptyStateObserverActivity();
+
         document.addEventListener('visibilitychange', () => {
             syncEmptyStateObserverActivity();
             if (!document.hidden) window.refreshPsnPageEmptyStates();
