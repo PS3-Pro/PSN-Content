@@ -24361,6 +24361,11 @@ P
 		let activeRect = null;
 		let activeRectAt = 0;
 		let activeLight = null;
+		let pendingClientX = 0;
+		let pendingClientY = 0;
+		let pointerInputDirty = false;
+		let forceRectNextFrame = false;
+		let snapToPointerNextFrame = false;
 
 		function ensurePointerLight(card) {
 			let light = card.querySelector(':scope > .psn-card-pointer-light');
@@ -24379,31 +24384,54 @@ P
 			activeRect = null;
 			activeRectAt = 0;
 			activeLight = null;
+			pointerInputDirty = false;
+			forceRectNextFrame = false;
+			snapToPointerNextFrame = false;
+		}
+
+		/* POINTER LIGHT FRAME COALESCING: pointer hardware can dispatch far more events than
+		   the display can paint. Keep the latest coordinates and do geometry + style work once
+		   per animation frame, while preserving the old 120ms rect refresh for moving cards. */
+		function queuePointerLightTarget(event, forceRect = false, snap = false) {
+			if (!activeCard || !event) return;
+			pendingClientX = event.clientX;
+			pendingClientY = event.clientY;
+			pointerInputDirty = true;
+			if (forceRect) forceRectNextFrame = true;
+			if (snap) snapToPointerNextFrame = true;
+			if (!frame) frame = requestAnimationFrame(renderPointerLight);
 		}
 
 		function renderPointerLight() {
 			frame = 0;
 			if (!activeCard || !activeCard.isConnected) return stopPointerLight();
+
+			if (pointerInputDirty) {
+				const now = (window.performance && performance.now) ? performance.now() : Date.now();
+				if (forceRectNextFrame || !activeRect || (now - activeRectAt) > 120) {
+					activeRect = activeCard.getBoundingClientRect();
+					activeRectAt = now;
+				}
+				if (activeRect && activeRect.width && activeRect.height) {
+					targetX = pendingClientX - activeRect.left;
+					targetY = pendingClientY - activeRect.top;
+					if (snapToPointerNextFrame) {
+						currentX = targetX;
+						currentY = targetY;
+					}
+				}
+				pointerInputDirty = false;
+				forceRectNextFrame = false;
+				snapToPointerNextFrame = false;
+			}
+
 			currentX += (targetX - currentX) * .18;
 			currentY += (targetY - currentY) * .18;
 			const nextGlowX = `${currentX.toFixed(2)}px`;
 			const nextGlowY = `${currentY.toFixed(2)}px`;
 			if (activeCard.__psnGlowX !== nextGlowX) { activeCard.__psnGlowX = nextGlowX; activeCard.style.setProperty('--card-glow-x', nextGlowX); }
 			if (activeCard.__psnGlowY !== nextGlowY) { activeCard.__psnGlowY = nextGlowY; activeCard.style.setProperty('--card-glow-y', nextGlowY); }
-			if (Math.abs(targetX - currentX) > .15 || Math.abs(targetY - currentY) > .15) frame = requestAnimationFrame(renderPointerLight);
-		}
-
-		function updatePointerLightTarget(event, forceRect = false) {
-			if (!activeCard || !activeCard.isConnected) return stopPointerLight();
-			const now = (window.performance && performance.now) ? performance.now() : Date.now();
-			if (forceRect || !activeRect || (now - activeRectAt) > 120) {
-				activeRect = activeCard.getBoundingClientRect();
-				activeRectAt = now;
-			}
-			if (!activeRect.width || !activeRect.height) return;
-			targetX = event.clientX - activeRect.left;
-			targetY = event.clientY - activeRect.top;
-			if (!frame) frame = requestAnimationFrame(renderPointerLight);
+			if (pointerInputDirty || Math.abs(targetX - currentX) > .15 || Math.abs(targetY - currentY) > .15) frame = requestAnimationFrame(renderPointerLight);
 		}
 
 		document.addEventListener('pointerover', event => {
@@ -24414,16 +24442,14 @@ P
 			activeLight = ensurePointerLight(card);
 			activeRect = null;
 			activeRectAt = 0;
-			updatePointerLightTarget(event, true);
-			currentX = targetX;
-			currentY = targetY;
+			queuePointerLightTarget(event, true, true);
 		}, { passive: true });
 
 		document.addEventListener('pointermove', event => {
 			if (!activeCard) return;
 			const target = event.target;
 			if (!target || !activeCard.contains(target)) return stopPointerLight();
-			updatePointerLightTarget(event);
+			queuePointerLightTarget(event);
 		}, { passive: true });
 
 		document.addEventListener('pointerout', event => {
@@ -24438,7 +24464,8 @@ P
 			activeRect = null;
 			activeRectAt = 0;
 		};
-		document.getElementById('scroll-area')?.addEventListener('scroll', invalidatePointerRect, { passive: true });
+		/* Capture scroll from the main viewport and nested horizontal carousels with one listener. */
+		document.addEventListener('scroll', () => { if (activeCard) invalidatePointerRect(); }, { passive: true, capture: true });
 		window.addEventListener('resize', invalidatePointerRect, { passive: true });
 	})();
 
@@ -30542,6 +30569,7 @@ P
     const DOWNLOAD_SWIPE_HINT_PEEK_PX = 82;
     let downloadSwipeHintSeenThisVisit = false;
     let downloadSwipeDragState = null;
+    let downloadSwipeMoveFrame = 0;
     let downloadSwipeHintTimer = null;
     let downloadSwipeHintReturnTimer = null;
     let downloadSwipeHintHideTimer = null;
@@ -30699,6 +30727,8 @@ P
         } else {
             cancelDownloadSwipeHintPreview(false);
         }
+        if (downloadSwipeMoveFrame) cancelAnimationFrame(downloadSwipeMoveFrame);
+        downloadSwipeMoveFrame = 0;
         downloadSwipeDragState = null;
 
         const list = document.getElementById('downloads-list');
@@ -30812,6 +30842,22 @@ P
             return true;
         };
 
+        const renderDownloadSwipeDragFrame = () => {
+            downloadSwipeMoveFrame = 0;
+            const state = downloadSwipeDragState;
+            if (!state || state.cancelled || !state.dragging) return;
+            setDownloadSwipeOffset(state.row, state.offset, false);
+        };
+
+        const scheduleDownloadSwipeDragFrame = () => {
+            if (!downloadSwipeMoveFrame) downloadSwipeMoveFrame = requestAnimationFrame(renderDownloadSwipeDragFrame);
+        };
+
+        const cancelDownloadSwipeDragFrame = () => {
+            if (downloadSwipeMoveFrame) cancelAnimationFrame(downloadSwipeMoveFrame);
+            downloadSwipeMoveFrame = 0;
+        };
+
         const moveDownloadSwipeDrag = (clientX, clientY, preventDefault) => {
             const state = downloadSwipeDragState;
             if (!state || state.cancelled) return;
@@ -30823,6 +30869,7 @@ P
             if (!state.dragging) {
                 if (absY > 8 && absY > absX) {
                     state.cancelled = true;
+                    cancelDownloadSwipeDragFrame();
                     downloadSwipeDragState = null;
                     return;
                 }
@@ -30837,7 +30884,7 @@ P
 
             preventDefault();
             state.offset = Math.max(-DOWNLOAD_SWIPE_REVEAL_PX, Math.min(0, state.baseOffset + dx));
-            setDownloadSwipeOffset(state.row, state.offset, false);
+            scheduleDownloadSwipeDragFrame();
             if (!state.snapSoundPlayed && state.offset <= -(DOWNLOAD_SWIPE_REVEAL_PX * .42)) {
                 state.snapSoundPlayed = true;
                 if (typeof playUiToggle === 'function') playUiToggle();
@@ -30846,6 +30893,7 @@ P
 
         const finishDownloadSwipeDrag = () => {
             const state = downloadSwipeDragState;
+            cancelDownloadSwipeDragFrame();
             downloadSwipeDragState = null;
             if (!state || state.cancelled) return;
 
@@ -32422,12 +32470,49 @@ P
 		setTimeout(() => document.getElementById('admin-broadcast-mention-search')?.focus(), 30);
 	};
 
+	let adminBroadcastMentionSearchRevision = -1;
+	let adminBroadcastMentionSearchIndex = [];
+
+	function adminGetBroadcastMentionSearchIndex() {
+		if (adminBroadcastMentionSearchRevision === adminKnownUsersRevision && adminBroadcastMentionSearchIndex.length) return adminBroadcastMentionSearchIndex;
+		adminBroadcastMentionSearchIndex = [];
+		const users = adminGetAllKnownUsers();
+		for (let i = 0; i < users.length; i++) {
+			const user = users[i];
+			if (!user || !user.name) continue;
+			adminBroadcastMentionSearchIndex.push({ user, lowerName:String(user.name).toLowerCase() });
+		}
+		adminBroadcastMentionSearchRevision = adminKnownUsersRevision;
+		return adminBroadcastMentionSearchIndex;
+	}
+
+	function adminEnsureBroadcastMentionPickerShell(picker) {
+		let input = document.getElementById('admin-broadcast-mention-search');
+		let results = picker.querySelector('.admin-mention-results');
+		if (input && results && picker.contains(input)) return { input, results };
+		picker.innerHTML = `
+			<input id="admin-broadcast-mention-search" class="admin-mention-search" placeholder="Search user to mention..." onfocus="if(typeof playUiTextField === 'function') playUiTextField()" onblur="if(typeof playUiBack === 'function') playUiBack()" onkeydown="adminFieldKeydown(event)" oninput="adminRenderBroadcastMentionPicker(this.value)">
+			<div class="admin-mention-results"></div>`;
+		input = document.getElementById('admin-broadcast-mention-search');
+		results = picker.querySelector('.admin-mention-results');
+		return { input, results };
+	}
+
 	window.adminRenderBroadcastMentionPicker = function(term = '') {
 		const picker = document.getElementById('admin-broadcast-mention-picker');
 		if (!picker) return;
-		const users = adminGetAllKnownUsers()
-			.filter(u => u && u.name && u.name.toLowerCase().includes(String(term || '').toLowerCase()))
-			.slice(0, 40);
+		const shell = adminEnsureBroadcastMentionPickerShell(picker);
+		if (!shell.results) return;
+		const normalizedTerm = String(term || '').toLowerCase();
+		if (shell.input && document.activeElement !== shell.input && shell.input.value !== String(term || '')) shell.input.value = String(term || '');
+
+		const users = [];
+		const index = adminGetBroadcastMentionSearchIndex();
+		for (let i = 0; i < index.length && users.length < 40; i++) {
+			const entry = index[i];
+			if (!normalizedTerm || entry.lowerName.includes(normalizedTerm)) users.push(entry.user);
+		}
+
 		const list = users.length ? users.map(u => {
 			const name = adminEscapeHtml(u.name);
 			const encoded = encodeURIComponent(u.name);
@@ -32438,9 +32523,7 @@ P
 				<span class="admin-mention-state">${u.online ? 'online' : 'offline'}</span>
 			</div>`;
 		}).join('') : '<div class="admin-empty" style="padding:14px;">No users found.</div>';
-		picker.innerHTML = `
-			<input id="admin-broadcast-mention-search" class="admin-mention-search" placeholder="Search user to mention..." value="${adminEscapeHtml(term)}" onfocus="if(typeof playUiTextField === 'function') playUiTextField()" onblur="if(typeof playUiBack === 'function') playUiBack()" onkeydown="adminFieldKeydown(event)" oninput="adminRenderBroadcastMentionPicker(this.value)">
-			<div class="admin-mention-results">${list}</div>`;
+		if (shell.results.innerHTML !== list) shell.results.innerHTML = list;
 	};
 
 	window.adminSelectBroadcastMention = function(encodedName) {
@@ -33874,19 +33957,26 @@ P
 		if (!state || !overlay) return;
 		const color = adminHsvToHex(state.h, state.s, state.v);
 		state.color = color;
-		const sv = document.getElementById('admin-pinned-color-sv');
-		const svCursor = document.getElementById('admin-pinned-color-sv-cursor');
-		const hueCursor = document.getElementById('admin-pinned-color-hue-cursor');
-		const swatch = document.getElementById('admin-pinned-color-preview-swatch');
-		const value = document.getElementById('admin-pinned-color-preview-value');
-		const hex = document.getElementById('admin-pinned-color-hex');
+		let refs = overlay.__adminPinnedColorRefs;
+		if (!refs) {
+			refs = overlay.__adminPinnedColorRefs = {
+				sv: document.getElementById('admin-pinned-color-sv'),
+				svCursor: document.getElementById('admin-pinned-color-sv-cursor'),
+				hueCursor: document.getElementById('admin-pinned-color-hue-cursor'),
+				swatch: document.getElementById('admin-pinned-color-preview-swatch'),
+				value: document.getElementById('admin-pinned-color-preview-value'),
+				hex: document.getElementById('admin-pinned-color-hex'),
+				presets: Array.from(overlay.querySelectorAll('.admin-color-picker-preset'))
+			};
+		}
+		const { sv, svCursor, hueCursor, swatch, value, hex } = refs;
 		if (sv) sv.style.backgroundColor = `hsl(${state.h},100%,50%)`;
 		if (svCursor) { svCursor.style.left = `${state.s * 100}%`; svCursor.style.top = `${(1 - state.v) * 100}%`; }
 		if (hueCursor) hueCursor.style.left = `${(state.h / 360) * 100}%`;
 		if (swatch) { swatch.style.background = color; swatch.style.boxShadow = `0 0 15px ${color}55`; }
 		if (value) { value.textContent = color.toUpperCase(); value.style.color = color; }
 		if (hex && document.activeElement !== hex) hex.value = color.toUpperCase();
-		overlay.querySelectorAll('.admin-color-picker-preset').forEach(btn => btn.classList.toggle('active', String(btn.dataset.color || '').toLowerCase() === color));
+		refs.presets.forEach(btn => btn.classList.toggle('active', String(btn.dataset.color || '').toLowerCase() === color));
 	}
 
 	function adminPinnedPickerSetHex(value) {
@@ -33899,15 +33989,15 @@ P
 		return true;
 	}
 
-	function adminPinnedPickerUpdateFromPointer(type, event) {
+	function adminPinnedPickerUpdateFromPointer(type, point, rect, el) {
 		const state = window.__adminPinnedColorPickerState;
-		if (!state) return;
-		const el = event.currentTarget;
-		const rect = el.getBoundingClientRect();
-		const x = Math.max(0, Math.min(rect.width, event.clientX - rect.left));
-		const y = Math.max(0, Math.min(rect.height, event.clientY - rect.top));
-		if (type === 'sv') { state.s = rect.width ? x / rect.width : 0; state.v = rect.height ? 1 - (y / rect.height) : 0; }
-		else state.h = rect.width ? (x / rect.width) * 360 : 0;
+		if (!state || !point) return;
+		const liveRect = rect || (el ? el.getBoundingClientRect() : null);
+		if (!liveRect) return;
+		const x = Math.max(0, Math.min(liveRect.width, point.clientX - liveRect.left));
+		const y = Math.max(0, Math.min(liveRect.height, point.clientY - liveRect.top));
+		if (type === 'sv') { state.s = liveRect.width ? x / liveRect.width : 0; state.v = liveRect.height ? 1 - (y / liveRect.height) : 0; }
+		else state.h = liveRect.width ? (x / liveRect.width) * 360 : 0;
 		adminPinnedPickerSyncVisuals();
 	}
 
@@ -33915,14 +34005,49 @@ P
 		if (!el || el.__adminPinnedPickerBound) return;
 		el.__adminPinnedPickerBound = true;
 		let dragging = false;
+		let dragRect = null;
+		let moveFrame = 0;
+		let pendingPoint = null;
+		const renderMove = () => {
+			moveFrame = 0;
+			if (!dragging || !pendingPoint) return;
+			const point = pendingPoint;
+			pendingPoint = null;
+			adminPinnedPickerUpdateFromPointer(type, point, dragRect, el);
+		};
+		const flushMove = () => {
+			if (moveFrame) cancelAnimationFrame(moveFrame);
+			moveFrame = 0;
+			if (pendingPoint) {
+				const point = pendingPoint;
+				pendingPoint = null;
+				adminPinnedPickerUpdateFromPointer(type, point, dragRect, el);
+			}
+		};
 		el.addEventListener('pointerdown', event => {
 			dragging = true;
+			dragRect = el.getBoundingClientRect();
 			try { el.setPointerCapture(event.pointerId); } catch (e) {}
-			adminPinnedPickerUpdateFromPointer(type, event);
+			adminPinnedPickerUpdateFromPointer(type, event, dragRect, el);
 		});
-		el.addEventListener('pointermove', event => { if (dragging) adminPinnedPickerUpdateFromPointer(type, event); });
-		el.addEventListener('pointerup', event => { dragging = false; try { el.releasePointerCapture(event.pointerId); } catch (e) {} });
-		el.addEventListener('pointercancel', () => { dragging = false; });
+		el.addEventListener('pointermove', event => {
+			if (!dragging) return;
+			pendingPoint = { clientX:event.clientX, clientY:event.clientY };
+			if (!moveFrame) moveFrame = requestAnimationFrame(renderMove);
+		});
+		el.addEventListener('pointerup', event => {
+			flushMove();
+			dragging = false;
+			dragRect = null;
+			try { el.releasePointerCapture(event.pointerId); } catch (e) {}
+		});
+		el.addEventListener('pointercancel', () => {
+			if (moveFrame) cancelAnimationFrame(moveFrame);
+			moveFrame = 0;
+			pendingPoint = null;
+			dragging = false;
+			dragRect = null;
+		});
 	}
 
 	function adminEnsurePinnedColorPicker() {
@@ -55104,6 +55229,8 @@ function getVisibleChatStackEl(id) {
 		rasterMetrics.forEach(metric => {
 			metric.canvas = document.getElementById(metric.canvasId);
 			metric.hover = metric.canvas && metric.canvas.parentElement ? metric.canvas.parentElement.querySelector('.chat-emoji-hover-preview') : null;
+			metric.hoverGlyph = metric.hover ? metric.hover.querySelector('.chat-emoji-hover-glyph') : null;
+			if (metric.canvas) metric.canvas.__emojiRasterMetric = metric;
 		});
 
 		const rasterizeEmojiCategory = function(metric) {
@@ -55159,14 +55286,16 @@ function getVisibleChatStackEl(id) {
 
 		const metricFromCanvas = function(canvas) {
 			if (!canvas) return null;
+			if (canvas.__emojiRasterMetric) return canvas.__emojiRasterMetric;
 			const index = Math.max(0, Number(String(canvas.id || '').replace('chat-emoji-canvas-', '')) || 0);
 			return rasterMetrics[index] || null;
 		};
 
-		const getEmojiCellFromPointer = function(metric, event) {
+		const getEmojiCellFromPointer = function(metric, event, forceRect = false) {
 			if (!metric || !metric.canvas || !event) return null;
-			const rect = metric.canvas.getBoundingClientRect();
-			if (!rect.width || !rect.height) return null;
+			if (forceRect || !metric.pointerRect) metric.pointerRect = metric.canvas.getBoundingClientRect();
+			const rect = metric.pointerRect;
+			if (!rect || !rect.width || !rect.height) return null;
 			const scaleX = CHAT_EMOJI_CANVAS_WIDTH_PX / rect.width;
 			const scaleY = metric.gridHeight / rect.height;
 			const x = (event.clientX - rect.left) * scaleX;
@@ -55191,33 +55320,57 @@ function getVisibleChatStackEl(id) {
 		};
 
 		if (contentArea) {
-			contentArea.addEventListener('scroll', function() { hideEmojiHover(); scheduleEmojiNavSync(); }, { passive:true });
-			contentArea.addEventListener('pointermove', function(event) {
-				if (event.pointerType && event.pointerType !== 'mouse' && event.pointerType !== 'pen') return;
-				const canvas = event.target && event.target.closest ? event.target.closest('.chat-emoji-canvas') : null;
-				const metric = metricFromCanvas(canvas);
-				const cell = getEmojiCellFromPointer(metric, event);
+			let emojiHoverFrame = 0;
+			let pendingEmojiHover = null;
+			const invalidateEmojiPointerRects = function() {
+				for (let i = 0; i < rasterMetrics.length; i++) rasterMetrics[i].pointerRect = null;
+			};
+			const renderEmojiHoverFrame = function() {
+				emojiHoverFrame = 0;
+				const pending = pendingEmojiHover;
+				pendingEmojiHover = null;
+				if (!pending) return;
+				const metric = metricFromCanvas(pending.canvas);
+				const cell = getEmojiCellFromPointer(metric, pending);
 				if (!metric || !cell || !metric.hover) { hideEmojiHover(); return; }
 				if (activeHoverMetric && activeHoverMetric !== metric) hideEmojiHover(activeHoverMetric);
 				const cellKey = `${cell.row}:${cell.col}:${cell.emoji}`;
 				if (activeHoverMetric === metric && activeHoverCellKey === cellKey && metric.hover.classList.contains('is-visible')) return;
 				activeHoverMetric = metric;
 				activeHoverCellKey = cellKey;
-				const hoverGlyph = metric.hover.querySelector('.chat-emoji-hover-glyph');
+				const hoverGlyph = metric.hoverGlyph;
 				if (hoverGlyph && hoverGlyph.textContent !== cell.emoji) hoverGlyph.textContent = cell.emoji;
 				const nextLeft = (cell.col * CHAT_EMOJI_COLUMN_STEP_PX) + 'px';
 				const nextTop = (cell.row * CHAT_EMOJI_ROW_STEP_PX) + 'px';
 				if (metric.hover.style.left !== nextLeft) metric.hover.style.left = nextLeft;
 				if (metric.hover.style.top !== nextTop) metric.hover.style.top = nextTop;
 				if (!metric.hover.classList.contains('is-visible')) metric.hover.classList.add('is-visible');
+			};
+			contentArea.addEventListener('scroll', function() { invalidateEmojiPointerRects(); hideEmojiHover(); scheduleEmojiNavSync(); }, { passive:true });
+			contentArea.addEventListener('pointermove', function(event) {
+				if (event.pointerType && event.pointerType !== 'mouse' && event.pointerType !== 'pen') return;
+				const canvas = event.target && event.target.closest ? event.target.closest('.chat-emoji-canvas') : null;
+				pendingEmojiHover = canvas ? { canvas, clientX:event.clientX, clientY:event.clientY } : null;
+				if (!canvas) { hideEmojiHover(); return; }
+				if (!emojiHoverFrame) emojiHoverFrame = requestAnimationFrame(renderEmojiHoverFrame);
 			}, { passive:true });
-			contentArea.addEventListener('pointerleave', function() { hideEmojiHover(); }, { passive:true });
+			contentArea.addEventListener('pointerleave', function() {
+				pendingEmojiHover = null;
+				if (emojiHoverFrame) cancelAnimationFrame(emojiHoverFrame);
+				emojiHoverFrame = 0;
+				hideEmojiHover();
+			}, { passive:true });
+			window.addEventListener('resize', invalidateEmojiPointerRects, { passive:true });
+			if (typeof ResizeObserver === 'function') {
+				const emojiPointerResizeObserver = new ResizeObserver(invalidateEmojiPointerRects);
+				emojiPointerResizeObserver.observe(contentArea);
+			}
 
 			const pickEmoji = function(event) {
 				if (event.button !== undefined && event.button !== 0) return;
 				const canvas = event.target && event.target.closest ? event.target.closest('.chat-emoji-canvas') : null;
 				const metric = metricFromCanvas(canvas);
-				const cell = getEmojiCellFromPointer(metric, event);
+				const cell = getEmojiCellFromPointer(metric, event, true);
 				if (!cell) return;
 				event.preventDefault();
 				insertEmojiToInput(cell.emoji);
@@ -66010,16 +66163,17 @@ function getVisibleChatStackEl(id) {
 			if (window.isFriendActivityVisible()) window.markFriendActivityRead();
 			return;
 		}
-		list.innerHTML = '';
 		let currentDay = '';
+		const friendActivityHtml = [];
 		renderedItems.forEach(function(item,index) {
 			const day = realtimeFeedDayLabel(item.createdAt);
 			if (day !== currentDay) {
 				currentDay = day;
-				list.insertAdjacentHTML('beforeend', '<div class="friend-activity-day" data-activity-day="' + escapeRealtimeFeedHtml(day) + '">' + escapeRealtimeFeedHtml(day) + '</div>');
+				friendActivityHtml.push('<div class="friend-activity-day" data-activity-day="' + escapeRealtimeFeedHtml(day) + '">' + escapeRealtimeFeedHtml(day) + '</div>');
 			}
-			list.insertAdjacentHTML('beforeend', buildFriendActivityItemHtml(item, index, 'no-anim'));
+			friendActivityHtml.push(buildFriendActivityItemHtml(item, index, 'no-anim'));
 		});
+		list.innerHTML = friendActivityHtml.join('');
 		list.dataset.realtimeFeedRenderSignature = renderSignature;
 		if (!isSilent) animateVisibleRealtimeFeedRows(list, '.friend-activity-item');
 		setupRealtimeFeedDomPaging('activity');
@@ -67236,16 +67390,17 @@ function getVisibleChatStackEl(id) {
 			scheduleNotificationSwipeHint();
 			return;
 		}
-		list.innerHTML = '';
 		let currentDay = '';
+		const notificationHtml = [];
 		renderedItems.forEach(function(item,index) {
 			const day = realtimeFeedDayLabel(item.createdAt);
 			if (day !== currentDay) {
 				currentDay = day;
-				list.insertAdjacentHTML('beforeend', '<div class="notification-center-day" data-notification-day="' + escapeRealtimeFeedHtml(day) + '">' + escapeRealtimeFeedHtml(day) + '</div>');
+				notificationHtml.push('<div class="notification-center-day" data-notification-day="' + escapeRealtimeFeedHtml(day) + '">' + escapeRealtimeFeedHtml(day) + '</div>');
 			}
-			list.insertAdjacentHTML('beforeend', buildUserNotificationRowHtml(item, index, 'no-anim'));
+			notificationHtml.push(buildUserNotificationRowHtml(item, index, 'no-anim'));
 		});
+		list.innerHTML = notificationHtml.join('');
 		list.dataset.realtimeFeedRenderSignature = renderSignature;
 		if (!isSilent) animateVisibleRealtimeFeedRows(list, '.user-notification-item');
 		setupRealtimeFeedDomPaging('notifications');
@@ -67257,6 +67412,7 @@ function getVisibleChatStackEl(id) {
     const NOTIFICATION_SWIPE_HINT_PEEK_PX = 82;
     let notificationSwipeHintSeenThisVisit = false;
     let notificationSwipeDragState = null;
+    let notificationSwipeMoveFrame = 0;
     let notificationSwipeHintTimer = null;
     let notificationSwipeHintReturnTimer = null;
     let notificationSwipeHintHideTimer = null;
@@ -67555,6 +67711,20 @@ function getVisibleChatStackEl(id) {
             return true;
         };
 
+        const renderNotificationSwipeDragFrame = function() {
+            notificationSwipeMoveFrame = 0;
+            const state = notificationSwipeDragState;
+            if (!state || state.cancelled || !state.dragging) return;
+            setNotificationSwipeOffset(state.row, state.offset, false);
+        };
+        const scheduleNotificationSwipeDragFrame = function() {
+            if (!notificationSwipeMoveFrame) notificationSwipeMoveFrame = requestAnimationFrame(renderNotificationSwipeDragFrame);
+        };
+        const cancelNotificationSwipeDragFrame = function() {
+            if (notificationSwipeMoveFrame) cancelAnimationFrame(notificationSwipeMoveFrame);
+            notificationSwipeMoveFrame = 0;
+        };
+
         const moveDrag = function(clientX, clientY, preventDefault) {
             const state = notificationSwipeDragState;
             if (!state || state.cancelled) return;
@@ -67563,7 +67733,7 @@ function getVisibleChatStackEl(id) {
             const absX = Math.abs(dx);
             const absY = Math.abs(dy);
             if (!state.dragging) {
-                if (absY > 8 && absY > absX) { state.cancelled = true; notificationSwipeDragState = null; return; }
+                if (absY > 8 && absY > absX) { state.cancelled = true; cancelNotificationSwipeDragFrame(); notificationSwipeDragState = null; return; }
                 if (absX < 8 || absX <= absY) return;
                 state.dragging = true;
                 state.row.classList.add('is-swiping');
@@ -67571,7 +67741,7 @@ function getVisibleChatStackEl(id) {
             }
             preventDefault();
             state.offset = Math.max(-NOTIFICATION_SWIPE_REVEAL_PX, Math.min(0, state.baseOffset + dx));
-            setNotificationSwipeOffset(state.row, state.offset, false);
+            scheduleNotificationSwipeDragFrame();
             if (!state.snapSoundPlayed && state.offset <= -(NOTIFICATION_SWIPE_REVEAL_PX * .42)) {
                 state.snapSoundPlayed = true;
                 if (typeof playUiToggle === 'function') playUiToggle();
@@ -67580,6 +67750,7 @@ function getVisibleChatStackEl(id) {
 
         const finishDrag = function() {
             const state = notificationSwipeDragState;
+            cancelNotificationSwipeDragFrame();
             notificationSwipeDragState = null;
             if (!state || state.cancelled) return;
             if (state.dragging) {
@@ -67713,6 +67884,7 @@ function getVisibleChatStackEl(id) {
 	// but dismissal state is private to the signed-in user and persisted by the server.
 	let friendActivitySwipeHintSeenThisVisit = false;
 	let friendActivitySwipeDragState = null;
+	let friendActivitySwipeMoveFrame = 0;
 	let friendActivitySwipeHintTimer = null;
 	let friendActivitySwipeHintReturnTimer = null;
 	let friendActivitySwipeHintHideTimer = null;
@@ -68007,6 +68179,20 @@ function getVisibleChatStackEl(id) {
 			return true;
 		};
 
+		const renderFriendActivitySwipeDragFrame = function() {
+			friendActivitySwipeMoveFrame = 0;
+			const state = friendActivitySwipeDragState;
+			if (!state || state.cancelled || !state.dragging) return;
+			setNotificationSwipeOffset(state.row, state.offset, false);
+		};
+		const scheduleFriendActivitySwipeDragFrame = function() {
+			if (!friendActivitySwipeMoveFrame) friendActivitySwipeMoveFrame = requestAnimationFrame(renderFriendActivitySwipeDragFrame);
+		};
+		const cancelFriendActivitySwipeDragFrame = function() {
+			if (friendActivitySwipeMoveFrame) cancelAnimationFrame(friendActivitySwipeMoveFrame);
+			friendActivitySwipeMoveFrame = 0;
+		};
+
 		const moveDrag = function(clientX, clientY, preventDefault) {
 			const state = friendActivitySwipeDragState;
 			if (!state || state.cancelled) return;
@@ -68015,7 +68201,7 @@ function getVisibleChatStackEl(id) {
 			const absX = Math.abs(dx);
 			const absY = Math.abs(dy);
 			if (!state.dragging) {
-				if (absY > 8 && absY > absX) { state.cancelled = true; friendActivitySwipeDragState = null; return; }
+				if (absY > 8 && absY > absX) { state.cancelled = true; cancelFriendActivitySwipeDragFrame(); friendActivitySwipeDragState = null; return; }
 				if (absX < 8 || absX <= absY) return;
 				state.dragging = true;
 				if (state.inputType === 'pointer' && state.content && typeof state.content.setPointerCapture === 'function') {
@@ -68026,7 +68212,7 @@ function getVisibleChatStackEl(id) {
 			}
 			preventDefault();
 			state.offset = Math.max(-NOTIFICATION_SWIPE_REVEAL_PX, Math.min(0, state.baseOffset + dx));
-			setNotificationSwipeOffset(state.row, state.offset, false);
+			scheduleFriendActivitySwipeDragFrame();
 			if (!state.snapSoundPlayed && state.offset <= -(NOTIFICATION_SWIPE_REVEAL_PX * .42)) {
 				state.snapSoundPlayed = true;
 				if (typeof playUiToggle === 'function') playUiToggle();
@@ -68035,6 +68221,7 @@ function getVisibleChatStackEl(id) {
 
 		const finishDrag = function() {
 			const state = friendActivitySwipeDragState;
+			cancelFriendActivitySwipeDragFrame();
 			friendActivitySwipeDragState = null;
 			if (!state || state.cancelled) return;
 			if (state.dragging) {
@@ -71827,6 +72014,9 @@ function getVisibleChatStackEl(id) {
         let pointerId = null;
         let currentDir = null;
         let analogHoldActive = false;
+        let dragGeometry = null;
+        let moveFrame = 0;
+        let pendingPoint = null;
 
         function maxRadius() {
             return (analog.clientWidth / 2) - (knob.clientWidth / 2) - 8;
@@ -71848,6 +72038,10 @@ function getVisibleChatStackEl(id) {
         }
 
         function reset() {
+            if (moveFrame) cancelAnimationFrame(moveFrame);
+            moveFrame = 0;
+            pendingPoint = null;
+            dragGeometry = null;
             knob.style.transform = 'translate(-50%, -50%)';
             stopAnalogHold();
             currentDir = null;
@@ -71871,13 +72065,20 @@ function getVisibleChatStackEl(id) {
             }
         }
 
-        function move(clientX, clientY) {
+        function captureAnalogGeometry() {
             const rect = analog.getBoundingClientRect();
-            const centerX = rect.left + rect.width / 2;
-            const centerY = rect.top + rect.height / 2;
-            let dx = clientX - centerX;
-            let dy = clientY - centerY;
-            const max = maxRadius();
+            return {
+                centerX: rect.left + rect.width / 2,
+                centerY: rect.top + rect.height / 2,
+                max: maxRadius()
+            };
+        }
+
+        function move(clientX, clientY) {
+            const geometry = dragGeometry || (dragGeometry = captureAnalogGeometry());
+            let dx = clientX - geometry.centerX;
+            let dy = clientY - geometry.centerY;
+            const max = geometry.max;
             const distance = Math.hypot(dx, dy) || 1;
 
             if (distance > max) {
@@ -71889,9 +72090,18 @@ function getVisibleChatStackEl(id) {
             updateDirection(dx, dy, max);
         }
 
+        function renderAnalogMove() {
+            moveFrame = 0;
+            if (pointerId === null || !pendingPoint) return;
+            const point = pendingPoint;
+            pendingPoint = null;
+            move(point.x, point.y);
+        }
+
         analog.addEventListener('pointerdown', function (event) {
             event.preventDefault();
             pointerId = event.pointerId;
+            dragGeometry = captureAnalogGeometry();
             analog.setPointerCapture(pointerId);
             move(event.clientX, event.clientY);
         }, { passive: false });
@@ -71899,7 +72109,8 @@ function getVisibleChatStackEl(id) {
         analog.addEventListener('pointermove', function (event) {
             if (event.pointerId !== pointerId) return;
             event.preventDefault();
-            move(event.clientX, event.clientY);
+            pendingPoint = { x:event.clientX, y:event.clientY };
+            if (!moveFrame) moveFrame = requestAnimationFrame(renderAnalogMove);
         }, { passive: false });
 
         const end = function (event) {
@@ -72716,6 +72927,23 @@ function getVisibleChatStackEl(id) {
         let startLeft = 0;
         let startTop = 0;
         let moved = false;
+        let dragMoveFrame = 0;
+        let pendingDragPoint = null;
+
+        const applyPendingLauncherDrag = function() {
+            if (dragMoveFrame) cancelAnimationFrame(dragMoveFrame);
+            dragMoveFrame = 0;
+            if (!pendingDragPoint) return;
+            const point = pendingDragPoint;
+            pendingDragPoint = null;
+            const dx = point.x - startX;
+            const dy = point.y - startY;
+            const pos = clampLauncherToViewport(startLeft + dx, startTop + dy);
+            button.style.left = `${pos.x}px`;
+            button.style.top = `${pos.y}px`;
+            button.style.right = 'auto';
+            button.style.bottom = 'auto';
+        };
 
         button.addEventListener('pointerdown', function (event) {
             event.preventDefault();
@@ -72728,6 +72956,9 @@ function getVisibleChatStackEl(id) {
             startLeft = rect.left;
             startTop = rect.top;
             moved = false;
+            pendingDragPoint = null;
+            if (dragMoveFrame) cancelAnimationFrame(dragMoveFrame);
+            dragMoveFrame = 0;
 
             button.classList.add('ps3-pad-dragging');
             button.setPointerCapture(pointerId);
@@ -72747,18 +72978,18 @@ function getVisibleChatStackEl(id) {
                 moved = true;
             }
 
-            const pos = clampLauncherToViewport(startLeft + dx, startTop + dy);
-
-            button.style.left = `${pos.x}px`;
-            button.style.top = `${pos.y}px`;
-            button.style.right = 'auto';
-            button.style.bottom = 'auto';
+            pendingDragPoint = { x:event.clientX, y:event.clientY };
+            if (!dragMoveFrame) dragMoveFrame = requestAnimationFrame(function() {
+                dragMoveFrame = 0;
+                applyPendingLauncherDrag();
+            });
         }, { passive: false });
 
         function endDrag(event) {
             if (event.pointerId !== pointerId) return;
             event.preventDefault();
 
+            applyPendingLauncherDrag();
             const wasMoved = moved;
             pointerId = null;
             button.classList.remove('ps3-pad-dragging');
