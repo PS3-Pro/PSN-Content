@@ -22393,14 +22393,16 @@ P
 		}
 	};
 
+	/* COVER CACHE CAPTURE: callers defer this O(n) scan until they know the grid will actually be replaced. */
 	window.captureGridCoverCache = function(grid) {
 		if (!grid) return;
-		grid.querySelectorAll('.game-card').forEach(card => {
-			const img = card.querySelector('.game-img');
-			if (!img) return;
-			const key = img.getAttribute('data-cover-key') || card.getAttribute('data-category-dot-key') || '';
+		/* Query images directly: the old card -> querySelector(.game-img) path performed one
+		   extra selector lookup per card right before a grid replacement. */
+		grid.querySelectorAll('.game-img').forEach(img => {
+			const card = img.closest?.('.game-card');
+			const key = img.getAttribute('data-cover-key') || card?.getAttribute('data-category-dot-key') || '';
 			const src = normalizeCoverSrcForCache(img.currentSrc || img.src);
-			const category = img.getAttribute('data-cover-category') || card.getAttribute('data-store-category') || '';
+			const category = img.getAttribute('data-cover-category') || card?.getAttribute('data-store-category') || '';
 			const webmanCover = normalizeCoverSrcForCache(img.getAttribute('data-webman-cover') || '');
 			const isLibraryWebmanCover = String(category || '').toLowerCase() === 'library' && webmanCover && webmanCover === src;
 			if (key && src && !isLibraryWebmanCover) window.rememberCardCoverSrc(key, src, category, img);
@@ -36679,16 +36681,19 @@ P
             return;
         }
 
-        if (scrollArea.scrollHeight <= scrollArea.clientHeight + 50) {
+        const scrollTop = scrollArea.scrollTop;
+        const scrollHeight = scrollArea.scrollHeight;
+        const clientHeight = scrollArea.clientHeight;
+        if (scrollHeight <= clientHeight + 50) {
             if (scrollBtnsContainer.style.display !== 'none') scrollBtnsContainer.style.display = 'none';
             return;
         }
 
         if (scrollBtnsContainer.style.display !== 'flex') scrollBtnsContainer.style.display = 'flex';
-        const nextTopDisplay = scrollArea.scrollTop > 300 ? 'flex' : 'none';
+        const nextTopDisplay = scrollTop > 300 ? 'flex' : 'none';
         if (btnTop.style.display !== nextTopDisplay) btnTop.style.display = nextTopDisplay;
 
-        const distanceToBottom = scrollArea.scrollHeight - scrollArea.scrollTop - scrollArea.clientHeight;
+        const distanceToBottom = scrollHeight - scrollTop - clientHeight;
         const nextBottomDisplay = distanceToBottom > 300 ? 'flex' : 'none';
         if (btnBottom.style.display !== nextBottomDisplay) btnBottom.style.display = nextBottomDisplay;
     }
@@ -37781,6 +37786,23 @@ P
 		});
 	};
 
+	/* SURPRISE BUTTON HOT PATH: the passive state sync only needs to know whether
+	   two usable cards exist. Stop after the second match instead of scanning the
+	   whole collection during reveal/filter/live class changes. */
+	window.hasAtLeastTwoVisibleSurpriseCards = function(grid) {
+		if (!grid) return false;
+		let visibleCount = 0;
+		const children = grid.children || [];
+		for (let i = 0; i < children.length; i++) {
+			const card = children[i];
+			if (!card || !card.matches?.('.game-card') || card.classList.contains('category-remove-effect')) continue;
+			const style = window.getComputedStyle ? window.getComputedStyle(card) : null;
+			if (style && (style.display === 'none' || style.visibility === 'hidden')) continue;
+			if (++visibleCount >= 2) return true;
+		}
+		return false;
+	};
+
 	window.getSurpriseCardKey = function(card) {
 		if (!card) return '';
 		const image = card.querySelector('.game-img');
@@ -37858,8 +37880,9 @@ P
 		const button = config ? document.getElementById(config.buttonId) : null;
 		const grid = config ? document.getElementById(config.gridId) : null;
 		if (!config || !button || !grid) return;
-		const count = window.getVisibleSurpriseCards(grid).length;
-		const enabled = count > 1;
+		const enabled = typeof window.hasAtLeastTwoVisibleSurpriseCards === 'function'
+			? window.hasAtLeastTwoVisibleSurpriseCards(grid)
+			: window.getVisibleSurpriseCards(grid).length > 1;
 		const disabled = !enabled;
 		if (button.disabled !== disabled) button.disabled = disabled;
 		if (button.classList.contains('is-disabled') !== disabled) button.classList.toggle('is-disabled', disabled);
@@ -38458,7 +38481,6 @@ P
 		const wishlistLiveSnapshot = (!appendProgressive && typeof window.captureLiveRenderNodes === 'function')
 			? window.captureLiveRenderNodes(grid, ':scope > .game-card[data-live-render-key]')
 			: null;
-		if (isSilent && typeof window.captureGridCoverCache === 'function') window.captureGridCoverCache(grid);
 
 		if (window.wishlist.length > 0 && typeof window.scheduleWishlistCanonicalRefresh === 'function') {
 			window.scheduleWishlistCanonicalRefresh();
@@ -38640,6 +38662,7 @@ P
 			setupProgressiveGridObserver('wishlist', grid, reusedRenderEnd, filteredWishlist.length, () => window.updateWishlistUI(true, 'append'));
 			return;
 		}
+		if (isSilent && !wishlistCanAppend && typeof window.captureGridCoverCache === 'function') window.captureGridCoverCache(grid);
 		if (!wishlistCanAppend) {
 			grid.dataset.progressiveGridSignature = wishlistProgressiveSignature;
 			grid.dataset.progressiveGridRendered = '0';
@@ -42623,7 +42646,6 @@ function formatLibraryLastPlayedBadge(game = {}) {
 		const appendProgressive = progressiveMode === 'append';
 		const grid = PSN_STATIC_NAV_DOM.localGrid;
 		if (!grid) return;
-		if (isSilent && typeof window.captureGridCoverCache === 'function') window.captureGridCoverCache(grid);
 		
 		const renderSignature = getLocalLibraryRenderSignature(games || []);
 		const replacingLibrarySkeletons = !appendProgressive && !!grid.querySelector('.skeleton-card');
@@ -42637,7 +42659,7 @@ function formatLibraryLastPlayedBadge(game = {}) {
 			setupProgressiveGridObserver('my-games', grid, renderedCount, (games || []).length, () => renderLocalLibrary(games, isFiltering, true, 'append'));
 			return;
 		}
-		
+		if (isSilent && !canAppend && typeof window.captureGridCoverCache === 'function') window.captureGridCoverCache(grid);
 		clearProgressiveGridObserver('my-games', grid);
 		if (!canAppend) {
 			grid.innerHTML = "";
@@ -43498,7 +43520,6 @@ function formatLibraryLastPlayedBadge(game = {}) {
 			if (typeof window.refreshFavoritesSummaryUI === 'function') window.refreshFavoritesSummaryUI();
 			return;
 		}
-		if (isSilent && typeof window.captureGridCoverCache === 'function') window.captureGridCoverCache(grid);
 	
 		let pendingFavoritesRevealKeys;
 		if (appendProgressive) {
@@ -43734,6 +43755,7 @@ function formatLibraryLastPlayedBadge(game = {}) {
 			setupProgressiveGridObserver('favorites', grid, renderedCount, filteredFavs.length, () => window.updateFavoritesLibraryUI(true, 'append'));
 			return;
 		}
+		if (isSilent && !favoritesCanAppend && typeof window.captureGridCoverCache === 'function') window.captureGridCoverCache(grid);
 		if (!favoritesCanAppend) {
 			grid.dataset.progressiveGridSignature = favoritesProgressiveSignature;
 			grid.dataset.progressiveGridRendered = '0';
@@ -59607,6 +59629,8 @@ function getVisibleChatStackEl(id) {
 			}
 
 			window.__presencePayloadSignatureByUser = window.__presencePayloadSignatureByUser || {};
+			window.__presenceRevisionByUser = window.__presenceRevisionByUser || {};
+			window.__presenceLastSeenByUser = window.__presenceLastSeenByUser || {};
 			const changedPresenceNames = new Set();
 			const nextOnlineNames = new Set();
 			const onlineUserByName = new Map();
@@ -59617,6 +59641,10 @@ function getVisibleChatStackEl(id) {
 				nextOnlineNames.add(userName);
 				onlineUserByName.set(userName, user);
 				if (user && user.online === true) activeUsersCount++;
+				const revision = Math.max(0, Number(user && user.presenceRevision) || 0);
+				const lastSeen = Math.max(0, Number(user && user.lastSeen) || 0);
+				if (revision) window.__presenceRevisionByUser[userName] = Math.max(Number(window.__presenceRevisionByUser[userName] || 0), revision);
+				if (lastSeen) window.__presenceLastSeenByUser[userName] = Math.max(Number(window.__presenceLastSeenByUser[userName] || 0), lastSeen);
 				const effectiveUser = getEffectivePresenceUser(userName, user);
 				const nextSignature = getPresenceVisualSignature(effectiveUser);
 				if (window.__presencePayloadSignatureByUser[userName] !== nextSignature) changedPresenceNames.add(userName);
@@ -59632,15 +59660,6 @@ function getVisibleChatStackEl(id) {
 			const onlineSnapshotChanged = changedPresenceNames.size > 0;
 
 			window.__chatOnlineListReceived = true;
-			window.__presenceRevisionByUser = window.__presenceRevisionByUser || {};
-			window.__presenceLastSeenByUser = window.__presenceLastSeenByUser || {};
-			users.forEach(u => {
-				if (!u || !u.name) return;
-				const revision = Math.max(0, Number(u.presenceRevision) || 0);
-				const lastSeen = Math.max(0, Number(u.lastSeen) || 0);
-				if (revision) window.__presenceRevisionByUser[u.name] = Math.max(Number(window.__presenceRevisionByUser[u.name] || 0), revision);
-				if (lastSeen) window.__presenceLastSeenByUser[u.name] = Math.max(Number(window.__presenceLastSeenByUser[u.name] || 0), lastSeen);
-			});
 
 			window.__activeOnlineCount = activeUsersCount;
 			const onlineCountText = `${activeUsersCount} Online`;
@@ -59687,8 +59706,10 @@ function getVisibleChatStackEl(id) {
 			let friendsPresenceChanged = false;
 			if (onlineSnapshotChanged && window.friendsList && window.friendsList.length > 0) {
 				let changed = false;
+				let touched = false;
 				window.friendsList.forEach(friend => {
 					if (!friend || !changedPresenceNames.has(String(friend.name || ''))) return;
+					touched = true;
 					const netData = onlineUserByName.get(friend.name) || null;
 					if (netData && netData.lastSeen !== friend.lastSeen) {
 						friend.lastSeen = netData.lastSeen;
@@ -59701,7 +59722,7 @@ function getVisibleChatStackEl(id) {
 					}
 				});
 				if (changed) saveState(STORAGE_KEY_FRIENDS, JSON.stringify(window.friendsList));
-				friendsPresenceChanged = changed || window.friendsList.some(friend => friend && changedPresenceNames.has(String(friend.name || '')));
+				friendsPresenceChanged = changed || touched;
 			}
 
 			/* Apply the online snapshot once, after friend metadata has been merged.
@@ -59729,34 +59750,93 @@ function getVisibleChatStackEl(id) {
 			if (mentionDbChanged && typeof refreshMentionJumpButton === 'function') refreshMentionJumpButton();
 		});
 
+		/* ADMIN USERS BATCH INDEX: avoid hashing/rebuilding the entire accumulated user list
+		   whenever one server page arrives. Work scales with the incoming batch instead. */
+		const getAdminBatchUserSignature = user => typeof window.getLiveRenderSignature === 'function'
+			? window.getLiveRenderSignature(user || null)
+			: JSON.stringify(user || null);
+		const rebuildAdminUsersBatchIndex = list => {
+			const index = new Map();
+			for (let i = 0; i < list.length; i++) {
+				const key = String(list[i] && list[i].name || '').toLowerCase();
+				if (key && !index.has(key)) index.set(key, i);
+			}
+			window.__adminAllUsersIndexByName = index;
+			window.__adminAllUsersIndexSource = list;
+			return index;
+		};
+
 		socketChat.on('admin_users_results', function(payload) {
 			clearTimeout(window.adminUsersRenderTimer);
 			window.adminUsersRenderTimer = null;
 			const wasAdminUsersLoading = window.adminUsersLoading === true;
-			const previousAdminUsersStateSignature = typeof window.getLiveRenderSignature === 'function'
-				? window.getLiveRenderSignature([window.adminAllUsers || [], Number(window.adminUsersResultTotal || 0), window.adminCountryStats || null])
-				: JSON.stringify([window.adminAllUsers || [], Number(window.adminUsersResultTotal || 0), window.adminCountryStats || null]);
 			const results = payload && Array.isArray(payload.results) ? payload.results : [];
 			const offset = Math.max(0, Number(payload && payload.offset) || 0);
 			const total = Math.max(0, Number(payload && payload.total) || 0);
+			const previousTotal = Math.max(0, Number(window.adminUsersResultTotal) || 0);
+			const previousCountrySignature = typeof window.getLiveRenderSignature === 'function'
+				? window.getLiveRenderSignature(window.adminCountryStats || null)
+				: JSON.stringify(window.adminCountryStats || null);
+			const nextCountryStats = payload && payload.countryStats && typeof payload.countryStats === 'object' ? payload.countryStats : window.adminCountryStats;
+			const nextCountrySignature = typeof window.getLiveRenderSignature === 'function'
+				? window.getLiveRenderSignature(nextCountryStats || null)
+				: JSON.stringify(nextCountryStats || null);
+
+			let list = Array.isArray(window.adminAllUsers) ? window.adminAllUsers : [];
+			let adminUsersStateChanged = previousTotal !== total || previousCountrySignature !== nextCountrySignature;
+			const changedResultUsers = [];
+
 			if (offset === 0) {
-				window.adminAllUsers = results;
-				if (typeof window.adminInvalidateKnownUsersCache === 'function') window.adminInvalidateKnownUsersCache();
+				let same = list.length === results.length;
+				if (same) {
+					for (let i = 0; i < results.length; i++) {
+						const previousUser = list[i];
+						const nextUser = results[i];
+						if (String(previousUser && previousUser.name || '').toLowerCase() !== String(nextUser && nextUser.name || '').toLowerCase() || getAdminBatchUserSignature(previousUser) !== getAdminBatchUserSignature(nextUser)) {
+							same = false;
+							break;
+						}
+					}
+				}
+				if (!same) {
+					list = results;
+					window.adminAllUsers = list;
+					rebuildAdminUsersBatchIndex(list);
+					adminUsersStateChanged = true;
+					changedResultUsers.push(...results);
+				} else if (!(window.__adminAllUsersIndexByName instanceof Map) || window.__adminAllUsersIndexSource !== list) {
+					rebuildAdminUsersBatchIndex(list);
+				}
 			} else {
-				const merged = new Map((Array.isArray(window.adminAllUsers) ? window.adminAllUsers : []).map(user => [String(user && user.name || '').toLowerCase(), user]));
-				results.forEach(user => { const key = String(user && user.name || '').toLowerCase(); if (key) merged.set(key, user); });
-				window.adminAllUsers = Array.from(merged.values());
-				if (typeof window.adminInvalidateKnownUsersCache === 'function') window.adminInvalidateKnownUsersCache();
+				let index = window.__adminAllUsersIndexByName;
+				if (!(index instanceof Map) || window.__adminAllUsersIndexSource !== list) index = rebuildAdminUsersBatchIndex(list);
+				for (const user of results) {
+					const key = String(user && user.name || '').toLowerCase();
+					if (!key) continue;
+					const existingIndex = index.get(key);
+					if (existingIndex === undefined) {
+						index.set(key, list.length);
+						list.push(user);
+						changedResultUsers.push(user);
+						adminUsersStateChanged = true;
+						continue;
+					}
+					const previousUser = list[existingIndex];
+					if (getAdminBatchUserSignature(previousUser) === getAdminBatchUserSignature(user)) continue;
+					list[existingIndex] = user;
+					changedResultUsers.push(user);
+					adminUsersStateChanged = true;
+				}
+				window.adminAllUsers = list;
+				window.__adminAllUsersIndexSource = list;
 			}
+
 			window.adminUsersResultTotal = total;
-			if (payload && payload.countryStats && typeof payload.countryStats === 'object') window.adminCountryStats = payload.countryStats;
+			if (nextCountryStats && typeof nextCountryStats === 'object') window.adminCountryStats = nextCountryStats;
 			window.adminRenderLimit = Math.max(adminGetUsersBatchSize(), Array.isArray(window.adminAllUsers) ? window.adminAllUsers.length : 0);
 			window.adminUsersLoading = false;
-			const nextAdminUsersStateSignature = typeof window.getLiveRenderSignature === 'function'
-				? window.getLiveRenderSignature([window.adminAllUsers || [], Number(window.adminUsersResultTotal || 0), window.adminCountryStats || null])
-				: JSON.stringify([window.adminAllUsers || [], Number(window.adminUsersResultTotal || 0), window.adminCountryStats || null]);
-			const adminUsersStateChanged = previousAdminUsersStateSignature !== nextAdminUsersStateSignature;
-			if (adminUsersStateChanged && Array.isArray(results) && typeof window.syncPsnUserMeta === 'function') results.forEach(user => window.syncPsnUserMeta(user));
+			if (adminUsersStateChanged && typeof window.adminInvalidateKnownUsersCache === 'function') window.adminInvalidateKnownUsersCache();
+			if (changedResultUsers.length && typeof window.syncPsnUserMeta === 'function') changedResultUsers.forEach(user => window.syncPsnUserMeta(user));
 			if ((adminUsersStateChanged || wasAdminUsersLoading) && document.getElementById('view-admin')?.style.display === 'block' && typeof renderAdminPanel === 'function') adminSchedulePanelRender();
 		});
 
@@ -72866,8 +72946,15 @@ function getVisibleChatStackEl(id) {
 		if (!statusIcon || !statusIcon.classList.contains('status-dot-connected')) return null;
 
 		var games = Array.isArray(window.lastScannedGames) ? window.lastScannedGames : [];
-		var ids = new Set();
+		var revision = Number(window.__libraryDataRevision || 0);
+		var cached = window.__connectedInstalledTitleIdsCache;
+		if (cached && cached.games === games && cached.revision === revision && cached.length === games.length && cached.ids instanceof Set) {
+			return cached.ids;
+		}
 
+		/* INSTALLED TITLE INDEX: progressive Browse decoration reuses this Set until the
+		   scanned Library actually changes instead of rebuilding it for every DOM batch. */
+		var ids = new Set();
 		for (var i = 0; i < games.length; i++) {
 			var game = games[i] || {};
 			var candidates = [game.titleId, game.id, game.path, game.title];
@@ -72878,7 +72965,7 @@ function getVisibleChatStackEl(id) {
 				break;
 			}
 		}
-
+		window.__connectedInstalledTitleIdsCache = { games: games, revision: revision, length: games.length, ids: ids };
 		return ids;
 	}
 
@@ -73188,8 +73275,9 @@ function getVisibleChatStackEl(id) {
 		return span;
 	}
 
-	function decorateCards(){
-		var cards = document.querySelectorAll('.game-card[data-title-id]');
+	function decorateCards(scopeRoot){
+		var scope = scopeRoot && typeof scopeRoot.querySelectorAll === 'function' ? scopeRoot : document;
+		var cards = scope.querySelectorAll('.game-card[data-title-id]');
 		var installedTitleIds = getConnectedInstalledTitleIds();
 		for (var i = 0; i < cards.length; i++) {
 			var card = cards[i];
@@ -73241,7 +73329,7 @@ function getVisibleChatStackEl(id) {
 			span.addEventListener('click', span.__baseGameClickHandler);
 		}
 
-		var groupedCards = document.querySelectorAll('.grouped-title-card[data-group-title-ids], .grouped-title-card[data-group-single-title-id]');
+		var groupedCards = scope.querySelectorAll('.grouped-title-card[data-group-title-ids], .grouped-title-card[data-group-single-title-id]');
 		for (var g = 0; g < groupedCards.length; g++) {
 			var groupedCard = groupedCards[g];
 			var groupedId = cleanId(groupedCard.getAttribute('data-group-single-title-id'));
@@ -73257,7 +73345,7 @@ function getVisibleChatStackEl(id) {
 			}
 		}
 
-		var wishlistCards = document.querySelectorAll('#wishlist-grid .game-card[data-wishlist-title-id]');
+		var wishlistCards = scope.querySelectorAll('.game-card[data-wishlist-title-id]');
 		for (var w = 0; w < wishlistCards.length; w++) {
 			var wishlistCard = wishlistCards[w];
 			var wishlistId = cleanId(wishlistCard.getAttribute('data-wishlist-title-id'));
@@ -73344,21 +73432,32 @@ function getVisibleChatStackEl(id) {
 		}
 	}
 
-	function processUiSoon(){
+	/* BASE-GAME / INSTALLED DECORATOR SCOPE: DOM mutations from Browse only rescan Browse.
+	   Explicit refreshStoreInstalledChecks() calls remain global, and a global request widens any
+	   already queued scoped pass instead of being lost behind the shared animation-frame debounce. */
+	function processUiSoon(scopeRoot){
+		var requestedScope = scopeRoot && typeof scopeRoot.querySelectorAll === 'function' ? scopeRoot : document;
+		var pendingScope = window.__baseGameTitleIdLinkPendingScope;
+		if (!pendingScope) window.__baseGameTitleIdLinkPendingScope = requestedScope;
+		else if (pendingScope !== requestedScope) window.__baseGameTitleIdLinkPendingScope = document;
+
 		if (window.__baseGameTitleIdLinkSafePending || window.__baseGameTitleIdLinkDecorating) return;
 		window.__baseGameTitleIdLinkSafePending = true;
 
 		var runner = function(){
 			window.__baseGameTitleIdLinkSafePending = false;
 			window.__baseGameTitleIdLinkDecorating = true;
+			var runScope = window.__baseGameTitleIdLinkPendingScope || document;
+			window.__baseGameTitleIdLinkPendingScope = null;
 			try {
 				cleanupStaleRelatedNavigation();
-				decorateCards();
+				decorateCards(runScope);
 				decorateModal();
 			} catch (err) {
 				console.warn('[BaseGameTitleIdLink] skipped:', err);
 			} finally {
 				window.__baseGameTitleIdLinkDecorating = false;
+				if (window.__baseGameTitleIdLinkPendingScope) processUiSoon(window.__baseGameTitleIdLinkPendingScope);
 			}
 		};
 
@@ -73444,7 +73543,7 @@ function getVisibleChatStackEl(id) {
 		var observer = new MutationObserver(function(mutations){
 			if (window.__baseGameTitleIdLinkDecorating) return;
 			for (const mutation of mutations) {
-				if (mutationTouchesRelevantUi(mutation)) { processUiSoon(); break; }
+				if (mutationTouchesRelevantUi(mutation)) { processUiSoon(root); break; }
 			}
 		});
 		observer.observe(root, { childList: true, subtree: true });
