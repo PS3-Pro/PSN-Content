@@ -13738,6 +13738,13 @@ P
 		}
 	
 		currentLoginUser = name;
+		const accountJoinedDate = new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+		const accountAvatar = (typeof selectedAvatarUrl === 'string' && selectedAvatarUrl.trim()) ? selectedAvatarUrl.trim() : AVAILABLE_AVATARS[0];
+		/* NEW ACCOUNT IDENTITY GUARD: persist the identity chosen in the creation flow before
+		   authentication. A compact/stale auth response must never replace it with placeholders. */
+		safeLocalStorageSet(`${name}_psn_avatar`, accountAvatar);
+		safeLocalStorageSet(`${name}_joined_date`, accountJoinedDate);
+		window.__pendingNewAccountIdentity = { name, avatar: accountAvatar, joined: accountJoinedDate, createdAt: Date.now() };
 		const authPayload = {
 			name: name,
 			password: pass,
@@ -13749,8 +13756,9 @@ P
 			chatHistoryPullV1: true,
 			adminMaintenanceBypass: document.body.classList.contains('admin-maintenance-login-bypass'),
 			userData: {
-				avatar: selectedAvatarUrl,
-				joined: new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }),
+				avatar: accountAvatar,
+				joined: accountJoinedDate,
+				createdAt: new Date().toISOString(),
 				countryCode: countryCode,
 				level: 1,
 				xp: 0,
@@ -34909,40 +34917,78 @@ P
 
 
 
+	/* USER LOOKUP INDEX: Chat/Profile/role checks call this path constantly. Keep O(1) maps
+	   instead of scanning Online + Admin + Search + Friends on every badge/message. */
+	window.__psnNamedPoolLookupCache = window.__psnNamedPoolLookupCache || Object.create(null);
+	window.getPsnNamedPoolMap = function(poolKey, pool) {
+		if (!Array.isArray(pool)) return new Map();
+		const cacheRoot = window.__psnNamedPoolLookupCache;
+		let cache = cacheRoot[poolKey];
+		if (!cache || cache.source !== pool || cache.length !== pool.length) {
+			const map = new Map();
+			for (let i = 0; i < pool.length; i++) {
+				const item = pool[i];
+				const itemName = String((item && (item.name || item)) || '');
+				if (itemName && !map.has(itemName)) map.set(itemName, item);
+			}
+			cache = cacheRoot[poolKey] = { source:pool, length:pool.length, map };
+		}
+		return cache.map;
+	};
+
+	window.getPsnNamedPoolUser = function(poolKey, pool, name) {
+		if (!Array.isArray(pool) || !name) return null;
+		const found = window.getPsnNamedPoolMap(poolKey, pool).get(name);
+		return found && typeof found === 'object' ? found : null;
+	};
+
 	window.findPsnUserByName = function(name) {
 		name = String(name || '');
-		const pools = [window.currentOnlineList, window.adminAllUsers, window.globalSearchResults, window.friendsList];
-		for (const pool of pools) {
-			if (!Array.isArray(pool)) continue;
-			const found = pool.find(u => String((u && (u.name || u)) || '') === name);
-			if (found && typeof found === 'object') return found;
+		if (!name) return null;
+		if (window.__currentOnlineUserByName instanceof Map) {
+			const online = window.__currentOnlineUserByName.get(name);
+			if (online && typeof online === 'object') return online;
 		}
-		return null;
+		const adminIndex = window.__adminAllUsersIndexByName;
+		const adminList = window.adminAllUsers;
+		if (adminIndex instanceof Map && Array.isArray(adminList) && window.__adminAllUsersIndexSource === adminList) {
+			const index = adminIndex.get(name.toLowerCase());
+			if (index !== undefined && adminList[index] && typeof adminList[index] === 'object') return adminList[index];
+		}
+		return window.getPsnNamedPoolUser('online', window.currentOnlineList, name)
+			|| window.getPsnNamedPoolUser('search', window.globalSearchResults, name)
+			|| window.getPsnNamedPoolUser('friends', window.friendsList, name)
+			|| window.getPsnNamedPoolUser('admin', window.adminAllUsers, name)
+			|| null;
 	};
 
 	window.isPsnUserBanned = function(name, user = null) {
 		name = String(name || '');
 		const u = user || window.findPsnUserByName(name) || {};
 		const userRoleRaw = String((u && u.role) || '').toLowerCase();
-		const localRoleRaw = String(localStorage.getItem(`${name}_psn_role`) || '').toLowerCase();
 		const hasExplicitUnban = !!(u && (u.isBanned === false || u.banned === false || (u.role && userRoleRaw !== 'banned')));
 		const hasExplicitBan = !!(u && (u.isBanned === true || u.banned === true || userRoleRaw === 'banned'));
-
+		if (hasExplicitBan) return true;
 		if (hasExplicitUnban) {
 			localStorage.removeItem(`${name}_psn_isBanned`);
-			if (localRoleRaw === 'banned') localStorage.removeItem(`${name}_psn_role`);
+			if (localStorage.getItem(`${name}_psn_role`) === 'banned') localStorage.removeItem(`${name}_psn_role`);
+			return false;
 		}
-
-		return hasExplicitBan || (!hasExplicitUnban && (localRoleRaw === 'banned' || localStorage.getItem(`${name}_psn_isBanned`) === 'true'));
+		return String(localStorage.getItem(`${name}_psn_role`) || '').toLowerCase() === 'banned' || localStorage.getItem(`${name}_psn_isBanned`) === 'true';
 	};
 
 	window.getPsnUserRole = function(name, user = null) {
 		const u = user || window.findPsnUserByName(name) || {};
-		const localRole = localStorage.getItem(`${name}_psn_role`);
-		let role = (u && u.role) ? String(u.role).toLowerCase() : (localRole ? String(localRole).toLowerCase() : '');
+		let role = (u && u.role) ? String(u.role).toLowerCase() : '';
 		if (role === 'moderator') role = 'mod';
 		if (role === 'banned') role = '';
 		if (!role && u && u.isAdmin) role = 'admin';
+		if (!role) {
+			const localRole = localStorage.getItem(`${name}_psn_role`);
+			role = localRole ? String(localRole).toLowerCase() : '';
+			if (role === 'moderator') role = 'mod';
+			if (role === 'banned') role = '';
+		}
 		if (!role && localStorage.getItem(`${name}_psn_isAdmin`) === 'true') role = 'admin';
 		return ['admin', 'mod', 'trusted', 'user'].includes(role) ? role : 'user';
 	};
@@ -34976,10 +35022,12 @@ P
 		return `<span class="user-role-pill role-${role}${ctxClass}" title="${window.getPsnRoleLabel(role)}"><i class="fas ${window.getPsnRoleIcon(role)}"></i>${window.getPsnRoleLabel(role)}</span>`;
 	};
 
-	window.syncPsnUserMeta = function(user) {
+	window.syncPsnUserMeta = function(user, options = {}) {
 		if (!user || typeof user !== 'object') return;
 		const name = user.name || user.user || user.username || user.onlineId;
 		if (!name || name === 'Guest') return;
+		let friendAvatarChanged = false;
+		let avatarChanged = false;
 		const rawUserRole = String(user.role || '').toLowerCase();
 		const explicitUnban = user.isBanned === false || user.banned === false || (user.role && rawUserRole !== 'banned');
 		const explicitBan = user.isBanned === true || user.banned === true || rawUserRole === 'banned';
@@ -34992,17 +35040,22 @@ P
 		const avatar = typeof user.avatar === 'string' ? user.avatar.trim() : '';
 		if (avatar) {
 			const storedAvatar = localStorage.getItem(`${name}_psn_avatar`) || '';
-			if (storedAvatar !== avatar) safeLocalStorageSet(`${name}_psn_avatar`, avatar);
-			if (Array.isArray(window.friendsList)) {
-				const friend = window.friendsList.find(entry => String(entry && (entry.name || entry) || '') === name);
+			avatarChanged = storedAvatar !== avatar;
+			if (avatarChanged) safeLocalStorageSet(`${name}_psn_avatar`, avatar);
+			if (options.skipFriendUpdate !== true && Array.isArray(window.friendsList)) {
+				const friend = window.getPsnNamedPoolUser ? window.getPsnNamedPoolUser('friends', window.friendsList, name) : window.friendsList.find(entry => String(entry && (entry.name || entry) || '') === name);
 				if (friend && typeof friend === 'object' && friend.avatar !== avatar) {
 					friend.avatar = avatar;
-					if (typeof saveState === 'function' && typeof STORAGE_KEY_FRIENDS !== 'undefined') saveState(STORAGE_KEY_FRIENDS, JSON.stringify(window.friendsList));
+					friendAvatarChanged = true;
+					if (options.deferFriendPersist !== true && typeof saveState === 'function' && typeof STORAGE_KEY_FRIENDS !== 'undefined') saveState(STORAGE_KEY_FRIENDS, JSON.stringify(window.friendsList));
 				}
 			}
-			document.querySelectorAll('img[data-user]').forEach(img => {
-				if (img.getAttribute('data-user') === name && img.getAttribute('src') !== avatar) img.setAttribute('src', avatar);
-			});
+			if (options.skipDomAvatarUpdate !== true) {
+				const escapedUserName = (window.CSS && typeof CSS.escape === 'function') ? CSS.escape(name) : name.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+				document.querySelectorAll(`img[data-user="${escapedUserName}"]`).forEach(img => {
+					if (img.getAttribute('src') !== avatar) img.setAttribute('src', avatar);
+				});
+			}
 		}
 		const incomingLevel = Number(user.level);
 		if (Number.isFinite(incomingLevel) && incomingLevel > 0) safeLocalStorageSet(`${name}_psn_level`, String(incomingLevel));
@@ -35042,7 +35095,33 @@ P
 			user.isBanned = false;
 			user.banned = false;
 		}
+		if (options.deferAdminInvalidation !== true && typeof window.adminInvalidateKnownUsersCache === 'function') window.adminInvalidateKnownUsersCache();
+		return { friendAvatarChanged, avatarChanged };
+	};
+
+	window.syncPsnUserMetaBatch = function(users, options = {}) {
+		if (!Array.isArray(users) || !users.length || typeof window.syncPsnUserMeta !== 'function') return false;
+		let friendAvatarChanged = false;
+		const avatarByUser = new Map();
+		const batchOptions = { ...options, deferFriendPersist:true, deferAdminInvalidation:true, skipDomAvatarUpdate:true };
+		for (let i = 0; i < users.length; i++) {
+			const user = users[i];
+			const result = window.syncPsnUserMeta(user, batchOptions);
+			if (result && result.friendAvatarChanged) friendAvatarChanged = true;
+			const userName = String(user && (user.name || user.user || user.username || user.onlineId) || '');
+			const avatar = String(user && user.avatar || '').trim();
+			if (userName && avatar && ((result && result.avatarChanged) || options.forceAvatarDomSync === true)) avatarByUser.set(userName, avatar);
+		}
+		/* One DOM pass for the whole realtime batch instead of one selector traversal per user. */
+		if (avatarByUser.size) {
+			document.querySelectorAll('img[data-user]').forEach(img => {
+				const avatar = avatarByUser.get(img.getAttribute('data-user') || '');
+				if (avatar && img.getAttribute('src') !== avatar) img.setAttribute('src', avatar);
+			});
+		}
+		if (friendAvatarChanged && options.skipFriendUpdate !== true && typeof saveState === 'function' && typeof STORAGE_KEY_FRIENDS !== 'undefined') saveState(STORAGE_KEY_FRIENDS, JSON.stringify(window.friendsList || []));
 		if (typeof window.adminInvalidateKnownUsersCache === 'function') window.adminInvalidateKnownUsersCache();
+		return friendAvatarChanged;
 	};
 
 	function adminGetUserRole(name, user = {}) {
@@ -49833,27 +49912,49 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
     }
     window.scheduleChatPresenceUiRefresh = scheduleChatPresenceUiRefresh;
 
+    /* SELF PRESENCE FAST PATH: this helper is called from Online renders and reconnect paths.
+       Do not clone the whole list or mutate lastSeen just because the UI rendered again. */
     function forceCurrentAuthenticatedUserOnline(users = []) {
-        const list = Array.isArray(users) ? users.slice() : [];
+        const source = Array.isArray(users) ? users : [];
         const myName = localStorage.getItem('psn_username') || '';
         const socketOnline = typeof socketChat !== 'undefined' && socketChat && socketChat.connected;
         const sessionReady = window.isProfileLoaded === true && myName && myName !== 'null' && myName !== 'undefined' && socketOnline;
-        if (!sessionReady) return list;
+        if (!sessionReady) return source;
 
-        const existingIndex = list.findIndex(u => (u && (u.name || u)) === myName);
-        const existing = existingIndex >= 0 && list[existingIndex] && typeof list[existingIndex] === 'object' ? list[existingIndex] : {};
+        let existingIndex = -1;
+        let existing = null;
+        if (source === window.currentOnlineList && window.__currentOnlineUserByName instanceof Map) {
+            existing = window.__currentOnlineUserByName.get(myName) || null;
+            if (existing) existingIndex = source.indexOf(existing);
+        }
+        if (existingIndex < 0) {
+            existingIndex = source.findIndex(u => (u && (u.name || u)) === myName);
+            existing = existingIndex >= 0 && source[existingIndex] && typeof source[existingIndex] === 'object' ? source[existingIndex] : null;
+        }
+
+        const desiredId = socketChat.id || (existing && existing.id) || null;
+        const desiredAvatar = (existing && existing.avatar) || localStorage.getItem(`${myName}_psn_avatar`) || (typeof AVAILABLE_AVATARS !== 'undefined' ? AVAILABLE_AVATARS[0] : '');
+        const desiredLevel = (existing && existing.level) || Number(localStorage.getItem(`${myName}_psn_level`) || 1) || 1;
+        const desiredJoined = (existing && existing.joined) || localStorage.getItem(`${myName}_joined_date`) || '2026';
+        const desiredCountry = (existing && existing.countryCode) || normalizeProfileCountryCode(localStorage.getItem(`${myName}_${STORAGE_KEY_PROFILE_COUNTRY}`));
+        if (existing && existing.online === true && String(existing.id || '') === String(desiredId || '')
+            && String(existing.avatar || '') === String(desiredAvatar || '')
+            && Number(existing.level || 1) === Number(desiredLevel || 1)
+            && String(existing.joined || '') === String(desiredJoined || '')
+            && String(existing.countryCode || '') === String(desiredCountry || '')) return source;
+
+        const list = source.slice();
         const selfRecord = {
-            ...existing,
+            ...(existing || {}),
             name: myName,
-            id: socketChat.id || existing.id || null,
-            avatar: existing.avatar || localStorage.getItem(`${myName}_psn_avatar`) || (typeof AVAILABLE_AVATARS !== 'undefined' ? AVAILABLE_AVATARS[0] : ''),
+            id: desiredId,
+            avatar: desiredAvatar,
             online: true,
-            lastSeen: Date.now(),
-            level: existing.level || Number(localStorage.getItem(`${myName}_psn_level`) || 1) || 1,
-            joined: existing.joined || localStorage.getItem(`${myName}_joined_date`) || '2026',
-            countryCode: existing.countryCode || normalizeProfileCountryCode(localStorage.getItem(`${myName}_${STORAGE_KEY_PROFILE_COUNTRY}`))
+            lastSeen: Number(existing && existing.lastSeen) || Date.now(),
+            level: desiredLevel,
+            joined: desiredJoined,
+            countryCode: desiredCountry
         };
-
         if (existingIndex >= 0) list[existingIndex] = selfRecord;
         else list.push(selfRecord);
         return list;
@@ -50917,10 +51018,20 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
         if (!box || !Array.isArray(history)) return false;
         const previousEntryAnimationState = window.__chatDisableMessageEntryAnimation;
         const previousRenderTargetBox = window.__chatRenderTargetBox || null;
+        const previousBatchContext = window.__chatRenderBatchContext || null;
         window.__chatRenderTargetBox = box;
         if (options.animateMessages === false) window.__chatDisableMessageEntryAnimation = true;
         try {
             const myName = options.myName || localStorage.getItem('psn_username') || 'Guest';
+            const batchContext = {
+                myName,
+                isAdmin: document.body.classList.contains('is-admin'),
+                trackedUsers: new Set(),
+                userMetaByName: new Map(),
+                avatarByName: new Map(),
+                mentionRefreshNeeded: false
+            };
+            window.__chatRenderBatchContext = batchContext;
             const lastReadTime = Number(options.lastReadTime || 0);
             const firstUnreadIndex = Number.isFinite(options.firstUnreadIndex) ? options.firstUnreadIndex : getChatFirstUnreadIndex(history, lastReadTime, myName);
             const allowUnreadDivider = options.allowUnreadDivider !== false;
@@ -50930,7 +51041,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
             for (let index = Math.max(0, startIndex); index < Math.min(endIndex, history.length); index++) {
                 const data = history[index];
                 if (!data) continue;
-                if (typeof trackUser === 'function') trackUser(data.user);
+                if (data.user && data.user !== 'Guest') batchContext.trackedUsers.add(data.user);
                 const msgRawDate = new Date(data.time).toDateString();
                 if (msgRawDate !== window.lastChatRawDate) {
                     const divider = createChatDateDivider(data.time);
@@ -50956,10 +51067,13 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
                     }
                 }
             }
+            if (batchContext.trackedUsers.size) trackUsersBatch(batchContext.trackedUsers);
+            if (batchContext.mentionRefreshNeeded && typeof refreshMentionJumpButton === 'function') refreshMentionJumpButton();
             return true;
         } finally {
             window.__chatDisableMessageEntryAnimation = previousEntryAnimationState;
             window.__chatRenderTargetBox = previousRenderTargetBox;
+            window.__chatRenderBatchContext = previousBatchContext;
         }
     }
 
@@ -52215,11 +52329,28 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
     
     function trackUser(username) {
         if (!username || username === "Guest") return;
+        const batchContext = window.__chatRenderBatchContext || null;
+        if (batchContext && batchContext.trackedUsers instanceof Set) {
+            batchContext.trackedUsers.add(username);
+            return;
+        }
         const previousSize = chatUsers.size;
         chatUsers.add(username);
         if (chatUsers.size !== previousSize && typeof invalidateChatMentionNameCaches === 'function') {
             invalidateChatMentionNameCaches();
         }
+    }
+
+    function trackUsersBatch(usernames) {
+        if (!usernames || typeof usernames[Symbol.iterator] !== 'function') return false;
+        let changed = false;
+        for (const username of usernames) {
+            if (!username || username === 'Guest' || chatUsers.has(username)) continue;
+            chatUsers.add(username);
+            changed = true;
+        }
+        if (changed && typeof invalidateChatMentionNameCaches === 'function') invalidateChatMentionNameCaches();
+        return changed;
     }
     
 
@@ -56803,8 +56934,9 @@ function getVisibleChatStackEl(id) {
 		const box = renderTarget && renderTarget.nodeType === 1 ? renderTarget : document.getElementById('chat-messages');
 		if (!box) return;
 	
-		const myName = localStorage.getItem('psn_username');
-		const isAdmin = document.body.classList.contains('is-admin');
+		const batchContext = window.__chatRenderBatchContext || null;
+		const myName = batchContext && batchContext.myName ? batchContext.myName : localStorage.getItem('psn_username');
+		const isAdmin = batchContext ? batchContext.isAdmin === true : document.body.classList.contains('is-admin');
 		
 		let cleanText = (typeof msg === 'object' && msg.text) ? msg.text : (typeof msg === 'string' ? msg : "");
 		cleanText = normalizeChatListSpacingHtml(cleanText);
@@ -56826,9 +56958,18 @@ function getVisibleChatStackEl(id) {
 		const encodedText = encodeURIComponent(cleanText).replace(/'/g, "%27");
 		const encodedUser = encodeURIComponent(userName).replace(/'/g, "%27");
 	
-		trackUser(userName);
+		if (batchContext && batchContext.trackedUsers instanceof Set) batchContext.trackedUsers.add(userName);
+		else trackUser(userName);
 	
-		const senderRoleSource = Object.assign({}, (typeof msg === 'object' ? msg : {}), window.findPsnUserByName ? (window.findPsnUserByName(userName) || {}) : {});
+		let liveSenderMeta = null;
+		if (batchContext && batchContext.userMetaByName instanceof Map) {
+			if (batchContext.userMetaByName.has(userName)) liveSenderMeta = batchContext.userMetaByName.get(userName);
+			else {
+				liveSenderMeta = window.findPsnUserByName ? (window.findPsnUserByName(userName) || null) : null;
+				batchContext.userMetaByName.set(userName, liveSenderMeta);
+			}
+		} else liveSenderMeta = window.findPsnUserByName ? (window.findPsnUserByName(userName) || null) : null;
+		const senderRoleSource = Object.assign({}, (typeof msg === 'object' ? msg : {}), liveSenderMeta || {});
 		const senderRole = typeof window.getPsnUserRole === 'function' ? window.getPsnUserRole(userName, senderRoleSource) : (msg.isAdmin ? 'admin' : (msg.isModerator ? 'mod' : 'user'));
 		const senderIsAdmin = msg.isAdmin === true || senderRole === 'admin';
 		const senderIsBanned = typeof window.isPsnUserBanned === 'function' ? window.isPsnUserBanned(userName, senderRoleSource) : (senderRoleSource.isBanned === true || senderRoleSource.banned === true);
@@ -56906,9 +57047,16 @@ function getVisibleChatStackEl(id) {
 		const canPinThisMsg = typeof window.canModerateChat === 'function' ? window.canModerateChat(userName, senderRoleSource) : isAdmin;
 		const senderRoleBadgeHtml = typeof window.buildPsnRoleBadge === 'function' ? window.buildPsnRoleBadge(userName, senderRoleSource, 'chat') : '';
 		const isPersonalMention = !isAuthor && myName && ((typeof chatTextMentionsUser === 'function' ? chatTextMentionsUser(cleanText, myName) : cleanText.includes(`@${myName}`)) || (replyData && replyData.user === myName));
-		const userAvatar = (typeof getResolvedUserAvatar === 'function')
-			? getResolvedUserAvatar(userName, (typeof msg === 'object' && msg.avatar) ? msg.avatar : '')
-			: ((typeof msg === 'object' && msg.avatar) ? msg.avatar : (localStorage.getItem(`${userName}_psn_avatar`) || "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/interface/modern/images/avatars/default.png"));
+		const preferredMessageAvatar = (typeof msg === 'object' && msg.avatar) ? msg.avatar : '';
+		let userAvatar = '';
+		if (!preferredMessageAvatar && batchContext && batchContext.avatarByName instanceof Map && batchContext.avatarByName.has(userName)) {
+			userAvatar = batchContext.avatarByName.get(userName) || '';
+		} else {
+			userAvatar = (typeof getResolvedUserAvatar === 'function')
+				? getResolvedUserAvatar(userName, preferredMessageAvatar)
+				: (preferredMessageAvatar || (localStorage.getItem(`${userName}_psn_avatar`) || "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/interface/modern/images/avatars/default.png"));
+			if (!preferredMessageAvatar && batchContext && batchContext.avatarByName instanceof Map) batchContext.avatarByName.set(userName, userAvatar);
+		}
 		const date = new Date(msgTimeValue);
 		const timeStr = date.getHours().toString().padStart(2, '0') + ':' + date.getMinutes().toString().padStart(2, '0');
 	
@@ -57003,6 +57151,7 @@ function getVisibleChatStackEl(id) {
 		}
 	
 		const chatRenderSignature = getChatMessageRenderSignature(msg);
+		const isPinnedThisMsg = pinnedMessages.some(p => p.id === String(msgId));
 		const msgHtml = `
 		<div id="msg-row-${msgId}"${renderIndexAttr} data-chat-msg-id="${msgId}" data-chat-render-signature="${chatRenderSignature}" data-chat-mention-me="${(isPersonalMention || isGlobal) ? '1' : '0'}" class="${messageEntryClass} ${msg.type === 'poll' ? 'msg-row-poll' : ''}" data-user="${encodedUser}" data-can-delete="${canDeleteThisMsg ? 'true' : 'false'}" onclick="if(window.chatSelectionMode && typeof toggleChatMessageSelection === 'function') toggleChatMessageSelection(event, '${msgId}')" style="display: flex; flex-direction: ${flexDir}; align-self: ${alignSelf}; max-width: min(85%, 450px); margin-bottom: 12px; gap: 10px; transition: all 0.3s ease;${outgoingEntryInitialStyle}">
 			<img src="${userAvatar}" class="chat-avatar-clickable chat-avatar-status" 
@@ -57079,11 +57228,11 @@ function getVisibleChatStackEl(id) {
 						
 					${canPinThisMsg ? `
 					<i id="pin-icon-${msgId}" class="fas fa-thumbtack" 
-						style="cursor: pointer; opacity: ${pinnedMessages.some(p => p.id === String(msgId)) ? '1' : '0.4'}; color: #4caf50; font-size: 12.5px; transition: all 0.2s; margin-left: 2px; transform: rotate(45deg); filter: ${pinnedMessages.some(p => p.id === String(msgId)) ? 'drop-shadow(0 0 8px rgba(76, 175, 80, 0.9))' : 'none'};" 
+						style="cursor: pointer; opacity: ${isPinnedThisMsg ? '1' : '0.4'}; color: #4caf50; font-size: 12.5px; transition: all 0.2s; margin-left: 2px; transform: rotate(45deg); filter: ${isPinnedThisMsg ? 'drop-shadow(0 0 8px rgba(76, 175, 80, 0.9))' : 'none'};" 
 						onmouseenter="if(typeof playUiArrow === 'function') playUiArrow()"
 						onmouseover="this.style.opacity='1'; this.style.transform='scale(1.2) rotate(45deg)'; this.style.filter='drop-shadow(0 0 8px rgba(76, 175, 80, 0.9))';" 
 						onmouseout="this.style.opacity=pinnedMessages.some(p => p.id === '${msgId}') ? '1' : '0.4'; this.style.transform='scale(1) rotate(45deg)'; this.style.filter=pinnedMessages.some(p => p.id === '${msgId}') ? 'drop-shadow(0 0 8px rgba(76, 175, 80, 0.9))' : 'none';" 
-						onclick="togglePinMessage('${msgId}')" title="${pinnedMessages.some(p => p.id === String(msgId)) ? 'Unpin Message' : 'Pin Message'}"></i>
+						onclick="togglePinMessage('${msgId}')" title="${isPinnedThisMsg ? 'Unpin Message' : 'Pin Message'}"></i>
 				` : ''}
 	
 					${canDeleteThisMsg ? `
@@ -57114,7 +57263,8 @@ function getVisibleChatStackEl(id) {
 			setTimeout(() => fetchLinkMetadata(firstLink[0], `lp-${msgId}`), 350);
 		}
 		if (box.children.length > MAX_CHAT_HISTORY) box.removeChild(box.children[1]);
-		if (typeof refreshMentionJumpButton === 'function') refreshMentionJumpButton();
+		if (batchContext) batchContext.mentionRefreshNeeded = true;
+		else if (typeof refreshMentionJumpButton === 'function') refreshMentionJumpButton();
 	}
 	
 	function escapePinnedChatPreviewText(value) {
@@ -59189,7 +59339,21 @@ function getVisibleChatStackEl(id) {
 			if (typeof window.clearLoginServerAttempt === 'function') window.clearLoginServerAttempt();
 			window.__psnAutoReauthInProgress = false;
 			window.__psnAutoReauthUser = null;
-			const { name, userData, isAdmin, role, isModerator } = data;
+			const { name, isAdmin, role, isModerator } = data;
+			const userData = (data && data.userData && typeof data.userData === 'object') ? data.userData : {};
+			const pendingIdentity = window.__pendingNewAccountIdentity;
+			const pendingIdentityMatches = !!(pendingIdentity && pendingIdentity.name === name);
+			let pendingIdentityRepairNeeded = false;
+			if (pendingIdentityMatches) {
+				const incomingAvatar = String(userData.avatar || '').trim();
+				const incomingJoined = String(userData.joined || '').trim();
+				const avatarIsPlaceholder = !incomingAvatar || /\/avatars\/default\.png(?:[?#]|$)/i.test(incomingAvatar);
+				const joinedIsPlaceholder = !incomingJoined || /^\d{4}$/.test(incomingJoined);
+				if (avatarIsPlaceholder && pendingIdentity.avatar) { userData.avatar = pendingIdentity.avatar; pendingIdentityRepairNeeded = true; }
+				if (joinedIsPlaceholder && pendingIdentity.joined) { userData.joined = pendingIdentity.joined; pendingIdentityRepairNeeded = true; }
+				if (pendingIdentityRepairNeeded) window.__pendingNewAccountIdentityRepair = { ...pendingIdentity };
+				else { window.__pendingNewAccountIdentity = null; window.__pendingNewAccountIdentityRepair = null; }
+			}
 			if (typeof window.prepareIncomingProfileForPersistentPending === 'function' && userData && typeof userData === 'object') {
 				window.prepareIncomingProfileForPersistentPending(name, userData, data || {});
 			}
@@ -59736,9 +59900,8 @@ function getVisibleChatStackEl(id) {
 
 		const getEffectivePresenceUser = function(name, patch = {}) {
 			const cleanName = String(name || patch.name || '').trim();
-			const findUser = list => Array.isArray(list) ? (list.find(item => item && (item.name || item) === cleanName) || null) : null;
 			window.__presenceComparableUserByName = window.__presenceComparableUserByName || {};
-			const base = window.__presenceComparableUserByName[cleanName] || findUser(currentOnlineList) || findUser(window.friendsList) || findUser(window.globalSearchResults) || findUser(window.adminAllUsers) || {};
+			const base = window.__presenceComparableUserByName[cleanName] || (typeof window.findPsnUserByName === 'function' ? window.findPsnUserByName(cleanName) : null) || {};
 			return { ...base, ...patch, name: cleanName || patch.name || base.name || '' };
 		};
 
@@ -59787,13 +59950,14 @@ function getVisibleChatStackEl(id) {
 			const changedPresenceNames = new Set();
 			const nextOnlineNames = new Set();
 			const onlineUserByName = new Map();
+			const activeOnlineNames = new Set();
 			let activeUsersCount = 0;
 			users.forEach(user => {
 				const userName = String(user && (user.name || user) || '').trim();
 				if (!userName) return;
 				nextOnlineNames.add(userName);
 				onlineUserByName.set(userName, user);
-				if (user && user.online === true) activeUsersCount++;
+				if (user && user.online === true) { activeUsersCount++; activeOnlineNames.add(userName); }
 				const revision = Math.max(0, Number(user && user.presenceRevision) || 0);
 				const lastSeen = Math.max(0, Number(user && user.lastSeen) || 0);
 				if (revision) window.__presenceRevisionByUser[userName] = Math.max(Number(window.__presenceRevisionByUser[userName] || 0), revision);
@@ -59827,9 +59991,18 @@ function getVisibleChatStackEl(id) {
 			
 			currentOnlineList = users;
 			window.currentOnlineList = users;
-			if (onlineSnapshotChanged && typeof window.adminInvalidateKnownUsersCache === 'function') window.adminInvalidateKnownUsersCache();
+			window.__currentOnlineUserByName = onlineUserByName;
+			window.__currentOnlineActiveNames = activeOnlineNames;
+			if (window.__psnNamedPoolLookupCache) delete window.__psnNamedPoolLookupCache.online;
 			if (onlineSnapshotChanged && typeof invalidateChatMentionNameCaches === 'function') invalidateChatMentionNameCaches();
-			if (onlineSnapshotChanged && typeof window.syncPsnUserMeta === 'function') users.forEach(u => { if (u && changedPresenceNames.has(String(u.name || ''))) window.syncPsnUserMeta(u); });
+			if (onlineSnapshotChanged && typeof window.syncPsnUserMetaBatch === 'function') {
+				const changedUsers = [];
+				for (let i = 0; i < users.length; i++) {
+					const u = users[i];
+					if (u && changedPresenceNames.has(String(u.name || ''))) changedUsers.push(u);
+				}
+				if (changedUsers.length) window.syncPsnUserMetaBatch(changedUsers, { skipFriendUpdate:true });
+			} else if (onlineSnapshotChanged && typeof window.syncPsnUserMeta === 'function') users.forEach(u => { if (u && changedPresenceNames.has(String(u.name || ''))) window.syncPsnUserMeta(u, { skipFriendUpdate:true }); });
 			if (onlineSnapshotChanged) users.forEach(u => {
 				if (!u || !u.name || !changedPresenceNames.has(String(u.name))) return;
 				const incomingStyle = (u.settingsData && (u.settingsData.profileCardStyle || u.settingsData.profileCardEffect)) || u.profileCardStyle || u.profileCardEffect || '';
@@ -59989,7 +60162,8 @@ function getVisibleChatStackEl(id) {
 			window.adminRenderLimit = Math.max(adminGetUsersBatchSize(), Array.isArray(window.adminAllUsers) ? window.adminAllUsers.length : 0);
 			window.adminUsersLoading = false;
 			if (adminUsersStateChanged && typeof window.adminInvalidateKnownUsersCache === 'function') window.adminInvalidateKnownUsersCache();
-			if (changedResultUsers.length && typeof window.syncPsnUserMeta === 'function') changedResultUsers.forEach(user => window.syncPsnUserMeta(user));
+			if (changedResultUsers.length && typeof window.syncPsnUserMetaBatch === 'function') window.syncPsnUserMetaBatch(changedResultUsers);
+			else if (changedResultUsers.length && typeof window.syncPsnUserMeta === 'function') changedResultUsers.forEach(user => window.syncPsnUserMeta(user));
 			if ((adminUsersStateChanged || wasAdminUsersLoading) && document.getElementById('view-admin')?.style.display === 'block' && typeof renderAdminPanel === 'function') adminSchedulePanelRender();
 		});
 
@@ -60012,15 +60186,18 @@ function getVisibleChatStackEl(id) {
 			if (Array.isArray(results)) {
 				window.__profileMetaFreshAt = window.__profileMetaFreshAt || {};
 				const freshAt = Date.now();
+				const metaUsersToSync = [];
 				results.forEach(u => {
 					const resultName = String(u && (u.name || u.username || u.user || u.onlineId) || '').trim();
 					if (!resultName) return;
 					window.__profileMetaFreshAt[resultName.toLowerCase()] = freshAt;
 					if (!globalSearchResultsChanged) return;
-					if (typeof window.syncPsnUserMeta === 'function') window.syncPsnUserMeta(u);
+					metaUsersToSync.push(u);
 					const incomingStyle = (u.settingsData && (u.settingsData.profileCardStyle || u.settingsData.profileCardEffect)) || u.profileCardStyle || u.profileCardEffect || '';
 					if (incomingStyle && typeof writeProfileCardStyleForUser === 'function') writeProfileCardStyleForUser(resultName, incomingStyle, Number((u.settingsData && (u.settingsData.profileCardStyleUpdatedAt || u.settingsData.profileCardEffectUpdatedAt || u.settingsData.profileCardThemeUpdatedAt)) || u.profileCardStyleUpdatedAt || u.profileUpdatedAt || 0));
 				});
+				if (metaUsersToSync.length && typeof window.syncPsnUserMetaBatch === 'function') window.syncPsnUserMetaBatch(metaUsersToSync);
+				else if (metaUsersToSync.length && typeof window.syncPsnUserMeta === 'function') metaUsersToSync.forEach(user => window.syncPsnUserMeta(user));
 			}
 			const openProfileTarget = document.getElementById('modal-sys-profile')?.dataset?.profileUsername || '';
 			if (globalSearchResultsChanged && openProfileTarget && Array.isArray(results)) {
@@ -61061,6 +61238,66 @@ function getVisibleChatStackEl(id) {
 			}
 		});
 
+
+		/* PRESENCE BURST COALESCER: data is merged synchronously, expensive UI/persistence
+		   work is flushed once per painted frame even if many users update together. */
+		window.__presenceBurstUiState = window.__presenceBurstUiState || { frame:0, friends:false, online:false, admin:false, chat:false, count:false, persistFriends:false, names:new Set() };
+		window.schedulePresenceBurstUi = function(flags = {}) {
+			const state = window.__presenceBurstUiState;
+			if (flags.friends) state.friends = true;
+			if (flags.online) state.online = true;
+			if (flags.admin) state.admin = true;
+			if (flags.chat) state.chat = true;
+			if (flags.count) state.count = true;
+			if (flags.persistFriends) state.persistFriends = true;
+			const name = String(flags.name || '').trim();
+			if (name) state.names.add(name);
+			if (state.frame) return;
+			state.frame = requestAnimationFrame(() => {
+				state.frame = 0;
+				const names = state.names;
+				const oneName = names.size === 1 ? names.values().next().value : '';
+				if (state.persistFriends && typeof saveState === 'function' && typeof STORAGE_KEY_FRIENDS !== 'undefined') {
+					saveState(STORAGE_KEY_FRIENDS, JSON.stringify(window.friendsList || []));
+				}
+				if (state.count) {
+					const countElement = document.getElementById('online-count');
+					const activeCount = Math.max(0, Number(window.__activeOnlineCount) || 0);
+					if (countElement && typeof window.setLiveCountText === 'function') window.setLiveCountText(countElement, `${activeCount} Online`, activeCount);
+				}
+				if (state.friends && typeof isFriendsSubviewVisible === 'function' && isFriendsSubviewVisible() && typeof renderFriendsList === 'function') {
+					const searchTerm = document.getElementById('search-input')?.value || '';
+					if (typeof window.applyCollectionToolbarFilterChange === 'function') window.applyCollectionToolbarFilterChange('friends', { revealNew:true });
+					else renderFriendsList(searchTerm, true);
+				}
+				if (state.online) {
+					const onlineModal = document.getElementById('modal-sys-online');
+					if (onlineModal && (onlineModal.style.display === 'flex' || onlineModal.classList.contains('show')) && typeof renderOnlineList === 'function') renderOnlineList();
+				}
+				if (state.admin && document.getElementById('view-admin')?.style.display === 'block' && typeof adminSchedulePanelRender === 'function') adminSchedulePanelRender();
+				if (state.chat && typeof applyChatPresenceUiRefresh === 'function') applyChatPresenceUiRefresh(currentOnlineList, oneName);
+				state.friends = state.online = state.admin = state.chat = state.count = state.persistFriends = false;
+				names.clear();
+			});
+		};
+
+		window.__presenceMetaPendingByName = window.__presenceMetaPendingByName instanceof Map ? window.__presenceMetaPendingByName : new Map();
+		window.queuePresenceUserMetaSync = function(user) {
+			if (!user || typeof user !== 'object') return;
+			const name = String(user.name || user.user || user.username || user.onlineId || '').trim();
+			if (!name) return;
+			window.__presenceMetaPendingByName.set(name, user);
+			if (window.__presenceMetaSyncFrame) return;
+			window.__presenceMetaSyncFrame = requestAnimationFrame(() => {
+				window.__presenceMetaSyncFrame = 0;
+				const users = Array.from(window.__presenceMetaPendingByName.values());
+				window.__presenceMetaPendingByName.clear();
+				if (!users.length) return;
+				if (typeof window.syncPsnUserMetaBatch === 'function') window.syncPsnUserMetaBatch(users, { skipFriendUpdate:true });
+				else if (typeof window.syncPsnUserMeta === 'function') users.forEach(item => window.syncPsnUserMeta(item, { skipFriendUpdate:true }));
+			});
+		};
+
 		socketChat.on('presence_update', function(data = {}) {
 			try {
 				const name = String(data.name || '').trim();
@@ -61081,9 +61318,11 @@ function getVisibleChatStackEl(id) {
 				const effectivePresenceUser = getEffectivePresenceUser(name, { ...data, online, lastSeen });
 				const presenceSignature = getPresenceVisualSignature(effectivePresenceUser);
 				if (window.__presencePayloadSignatureByUser[name] === presenceSignature) {
-					const listPresenceMatches = (list, removeWhenOffline = false) => {
+					const listPresenceMatches = (poolKey, list, removeWhenOffline = false) => {
 						if (!Array.isArray(list)) return true;
-						const item = list.find(user => user && (user.name || user) === name);
+						const item = poolKey === 'online' && window.__currentOnlineUserByName instanceof Map
+							? (window.__currentOnlineUserByName.get(name) || null)
+							: (typeof window.getPsnNamedPoolUser === 'function' ? window.getPsnNamedPoolUser(poolKey, list, name) : list.find(user => user && (user.name || user) === name));
 						if (!item) return !online || !removeWhenOffline;
 						if (removeWhenOffline && !online) return false;
 						if (typeof item !== 'object') return false;
@@ -61093,43 +61332,59 @@ function getVisibleChatStackEl(id) {
 					const profileModal = document.getElementById('modal-sys-profile');
 					const openedUser = profileModal?.dataset?.profileUsername || document.getElementById('profile-name-val')?.innerText || '';
 					const profileVisibleForTarget = !!(profileModal && openedUser === name && (profileModal.style.display === 'flex' || profileModal.style.display === 'block' || profileModal.classList.contains('show')));
-					const cachedStateMatches = listPresenceMatches(window.currentOnlineList, true)
-						&& listPresenceMatches(window.globalSearchResults)
-						&& listPresenceMatches(window.adminAllUsers)
-						&& listPresenceMatches(window.friendsList);
+					const cachedStateMatches = listPresenceMatches('online', window.currentOnlineList, true)
+						&& listPresenceMatches('search', window.globalSearchResults)
+						&& listPresenceMatches('admin', window.adminAllUsers)
+						&& listPresenceMatches('friends', window.friendsList);
 					if (cachedStateMatches && !profileVisibleForTarget) return;
 				}
 				window.__presencePayloadSignatureByUser[name] = presenceSignature;
 				window.__presenceComparableUserByName[name] = effectivePresenceUser;
-				if (typeof window.syncPsnUserMeta === 'function') window.syncPsnUserMeta({ ...data, lastSeen });
+				if (typeof window.queuePresenceUserMetaSync === 'function') window.queuePresenceUserMetaSync({ ...data, lastSeen });
+				else if (typeof window.syncPsnUserMeta === 'function') window.syncPsnUserMeta({ ...data, lastSeen }, { skipFriendUpdate:true });
 
 				if (!Array.isArray(currentOnlineList)) currentOnlineList = [];
-				const onlineIndex = currentOnlineList.findIndex(user => user && (user.name || user) === name);
-				const wasOnline = onlineIndex >= 0 && !!(currentOnlineList[onlineIndex] && currentOnlineList[onlineIndex].online === true);
+				let onlineMap = window.__currentOnlineUserByName instanceof Map ? window.__currentOnlineUserByName : null;
+				if (!onlineMap) {
+					onlineMap = typeof window.getPsnNamedPoolMap === 'function' ? new Map(window.getPsnNamedPoolMap('online', currentOnlineList)) : new Map();
+					window.__currentOnlineUserByName = onlineMap;
+				}
+				let onlineRecord = onlineMap.get(name) || null;
+				const wasOnline = !!(onlineRecord && onlineRecord.online === true);
 				if (online) {
-					if (onlineIndex >= 0) currentOnlineList[onlineIndex] = { ...currentOnlineList[onlineIndex], ...data, online: true };
-					else currentOnlineList.push({ ...data, online: true });
-				} else if (onlineIndex >= 0) {
-					currentOnlineList.splice(onlineIndex, 1);
+					if (onlineRecord && typeof onlineRecord === 'object') Object.assign(onlineRecord, data, { online:true, lastSeen });
+					else {
+						onlineRecord = { ...data, online:true, lastSeen };
+						currentOnlineList.push(onlineRecord);
+						onlineMap.set(name, onlineRecord);
+					}
+				} else if (onlineRecord) {
+					const onlineIndex = currentOnlineList.indexOf(onlineRecord);
+					if (onlineIndex >= 0) currentOnlineList.splice(onlineIndex, 1);
+					onlineMap.delete(name);
 				}
 				window.currentOnlineList = currentOnlineList;
-				if (typeof window.adminInvalidateKnownUsersCache === 'function') window.adminInvalidateKnownUsersCache();
-				if (typeof invalidateChatMentionNameCaches === 'function') invalidateChatMentionNameCaches();
+				window.__currentOnlineActiveNames = window.__currentOnlineActiveNames instanceof Set ? window.__currentOnlineActiveNames : new Set();
+				if (online) window.__currentOnlineActiveNames.add(name);
+				else window.__currentOnlineActiveNames.delete(name);
+				if (wasOnline !== online && typeof invalidateChatMentionNameCaches === 'function') invalidateChatMentionNameCaches();
 
-				const mergePresence = list => {
-					if (!Array.isArray(list)) return;
-					const item = list.find(user => user && (user.name || user) === name);
-					if (!item || typeof item !== 'object') return;
-					Object.assign(item, data, { online });
-				};
-				mergePresence(window.globalSearchResults);
-				mergePresence(window.adminAllUsers);
+				const searchUser = typeof window.getPsnNamedPoolUser === 'function' ? window.getPsnNamedPoolUser('search', window.globalSearchResults, name) : null;
+				if (searchUser && typeof searchUser === 'object') Object.assign(searchUser, data, { online });
+				let adminUser = null;
+				if (window.__adminAllUsersIndexByName instanceof Map && Array.isArray(window.adminAllUsers) && window.__adminAllUsersIndexSource === window.adminAllUsers) {
+					const adminIndex = window.__adminAllUsersIndexByName.get(name.toLowerCase());
+					if (adminIndex !== undefined) adminUser = window.adminAllUsers[adminIndex] || null;
+				} else if (typeof window.getPsnNamedPoolUser === 'function') adminUser = window.getPsnNamedPoolUser('admin', window.adminAllUsers, name);
+				if (adminUser && typeof adminUser === 'object') Object.assign(adminUser, data, { online });
 
-				const presenceFriend = Array.isArray(window.friendsList) ? (window.friendsList.find(item => item && (item.name || item) === name) || null) : null;
+				const presenceFriend = typeof window.getPsnNamedPoolUser === 'function'
+					? window.getPsnNamedPoolUser('friends', window.friendsList, name)
+					: (Array.isArray(window.friendsList) ? (window.friendsList.find(item => item && (item.name || item) === name) || null) : null);
 				const isPresenceFriend = !!presenceFriend;
+				let friendChanged = false;
 				if (presenceFriend && typeof presenceFriend === 'object') {
 					const friend = presenceFriend;
-					let friendChanged = false;
 					if (friend.lastSeen !== lastSeen) { friend.lastSeen = lastSeen; friendChanged = true; }
 					if (data.avatar && friend.avatar !== data.avatar) { friend.avatar = data.avatar; friendChanged = true; }
 					if (data.level && friend.level !== data.level) { friend.level = data.level; friendChanged = true; }
@@ -61140,15 +61395,12 @@ function getVisibleChatStackEl(id) {
 						const nextStatusSignature = typeof window.getLiveRenderSignature === 'function' ? window.getLiveRenderSignature(nextStatus) : JSON.stringify(nextStatus);
 						if (previousStatusSignature !== nextStatusSignature) { friend.ps3Status = nextStatus; friendChanged = true; }
 					}
-					if (friendChanged) saveState(STORAGE_KEY_FRIENDS, JSON.stringify(window.friendsList));
 				}
 
 				let activeCount = Number(window.__activeOnlineCount);
 				if (!Number.isFinite(activeCount) || activeCount < 0) activeCount = currentOnlineList.reduce((count, user) => count + (user && user.online === true ? 1 : 0), 0);
 				else if (wasOnline !== online) activeCount = Math.max(0, activeCount + (online ? 1 : -1));
 				window.__activeOnlineCount = activeCount;
-				const countElement = document.getElementById('online-count');
-				if (countElement) window.setLiveCountText(countElement, `${activeCount} Online`, activeCount);
 
 				const profileModal = document.getElementById('modal-sys-profile');
 				const openedUser = profileModal?.dataset?.profileUsername || document.getElementById('profile-name-val')?.innerText || '';
@@ -61159,15 +61411,17 @@ function getVisibleChatStackEl(id) {
 					patchOpenProfilePresenceStatus({ ...data, online }, lastSeen);
 				}
 
-				if (isPresenceFriend && typeof isFriendsSubviewVisible === 'function' && isFriendsSubviewVisible() && typeof renderFriendsList === 'function') {
-					if (typeof window.applyCollectionToolbarFilterChange === 'function') window.applyCollectionToolbarFilterChange('friends', { revealNew:true });
-					else renderFriendsList(document.getElementById('search-input')?.value || '', true);
+				if (typeof window.schedulePresenceBurstUi === 'function') {
+					window.schedulePresenceBurstUi({
+						name,
+						friends:isPresenceFriend,
+						online:true,
+						admin:true,
+						chat:true,
+						count:wasOnline !== online,
+						persistFriends:friendChanged
+					});
 				}
-
-				const onlineModal = document.getElementById('modal-sys-online');
-				if (onlineModal && (onlineModal.style.display === 'flex' || onlineModal.classList.contains('show')) && typeof renderOnlineList === 'function') renderOnlineList();
-				if (document.getElementById('view-admin')?.style.display === 'block' && typeof renderAdminPanel === 'function') adminSchedulePanelRender();
-				if (typeof applyChatPresenceUiRefresh === 'function') applyChatPresenceUiRefresh(currentOnlineList, name);
 			} catch (err) {
 				console.warn('[PRESENCE] Could not apply realtime presence update:', err);
 			}
@@ -61379,6 +61633,17 @@ function getVisibleChatStackEl(id) {
 			const unchangedProfileSync = payload.unchanged === true;
 			const shouldRunProfileCompletionWork = wasInitialProfileSync || !unchangedProfileSync;
 			window.__initialProfileSyncInProgress = false;
+			const pendingIdentityRepair = window.__pendingNewAccountIdentityRepair;
+			if (pendingIdentityRepair && pendingIdentityRepair.name === myName) {
+				/* If an older/stale server ever returned generic identity fields during signup, repair the
+				   authoritative profile only after full hydration so the repair cannot race the initial pull. */
+				safeLocalStorageSet(`${myName}_psn_avatar`, pendingIdentityRepair.avatar);
+				safeLocalStorageSet(`${myName}_joined_date`, pendingIdentityRepair.joined);
+				window.__pendingNewAccountIdentity = null;
+				window.__pendingNewAccountIdentityRepair = null;
+				window.__profileBaseSyncPending = true;
+				if (typeof window.broadcastProfileUpdate === 'function') setTimeout(() => window.broadcastProfileUpdate({ silentIndicator:true }), 0);
+			}
 			if (shouldRunProfileCompletionWork && typeof window.syncProfileNotificationStateMigration === 'function') setTimeout(window.syncProfileNotificationStateMigration, 0);
 			const libraryMigrationUser = String(window.__libraryFirstSeenMigrationUser || '').trim();
 			if (window.__libraryFirstSeenMigrationDirty === true && (!libraryMigrationUser || libraryMigrationUser === myName) && typeof lastScannedGames !== 'undefined' && Array.isArray(lastScannedGames)) {
@@ -64328,13 +64593,22 @@ function getVisibleChatStackEl(id) {
 			socketChat.emit('request_online_list');
 		}
 		if (typeof forceCurrentAuthenticatedUserOnline === 'function') {
-			currentOnlineList = forceCurrentAuthenticatedUserOnline(currentOnlineList);
-			window.currentOnlineList = currentOnlineList;
-			if (typeof window.adminInvalidateKnownUsersCache === 'function') window.adminInvalidateKnownUsersCache();
+			const forcedOnlineList = forceCurrentAuthenticatedUserOnline(currentOnlineList);
+			if (forcedOnlineList !== currentOnlineList) {
+				currentOnlineList = forcedOnlineList;
+				window.currentOnlineList = currentOnlineList;
+				const nextMap = typeof window.getPsnNamedPoolMap === 'function' ? new Map(window.getPsnNamedPoolMap('online', currentOnlineList)) : new Map();
+				window.__currentOnlineUserByName = nextMap;
+				window.__currentOnlineActiveNames = new Set(Array.from(nextMap).filter(([, user]) => user && user.online === true).map(([name]) => name));
+				if (typeof window.adminInvalidateKnownUsersCache === 'function') window.adminInvalidateKnownUsersCache();
+			}
 		}
 	
-		let activeUserCount = 0;
-		for (const user of (Array.isArray(currentOnlineList) ? currentOnlineList : [])) if (user && user.online === true) activeUserCount++;
+		let activeUserCount = Number(window.__activeOnlineCount);
+		if (!Number.isFinite(activeUserCount) || activeUserCount < 0) {
+			activeUserCount = 0;
+			for (const user of (Array.isArray(currentOnlineList) ? currentOnlineList : [])) if (user && user.online === true) activeUserCount++;
+		}
 		if (countElement) window.setLiveCountText(countElement, `${activeUserCount} Online`, activeUserCount);
 		const onlinePlayersTitle = PSN_STATIC_NAV_DOM.onlinePlayersTitle;
 		if (onlinePlayersTitle) { const nextTitle = activeUserCount === 1 ? 'Online Player' : 'Online Players'; if (onlinePlayersTitle.textContent !== nextTitle) onlinePlayersTitle.textContent = nextTitle; }
@@ -64352,20 +64626,35 @@ function getVisibleChatStackEl(id) {
 		});
 	}
 
-	function getOnlineListRenderSignature(users, myName, friendNames = null) {
+	function buildOnlineListRenderContext(users, myName, friendNames = null) {
 		const canModerate = document.body.classList.contains('is-admin') ? '1' : '0';
 		const parts = [canModerate];
+		const roleByName = new Map();
+		const bannedByName = new Map();
+		const avatarByName = new Map();
+		const itemSignatureByName = new Map();
 		for (const userObj of (users || [])) {
 			const username = String(userObj && (userObj.name || userObj) || '');
 			const userRole = typeof window.getPsnUserRole === 'function' ? window.getPsnUserRole(username, userObj) : (userObj && userObj.isAdmin ? 'admin' : 'user');
 			const isTargetBanned = typeof window.isPsnUserBanned === 'function' ? window.isPsnUserBanned(username, userObj) : !!(userObj && (userObj.isBanned === true || userRole === 'banned'));
-			const isFriend = friendNames instanceof Set ? friendNames.has(username) : !!(window.friendsList && window.friendsList.some(friend => friend && friend.name === username));
-			const cachedAvatar = localStorage.getItem(`${username}_psn_avatar`);
-			const avatar = typeof getResolvedUserAvatar === 'function' ? getResolvedUserAvatar(username, userObj && (userObj.avatar || cachedAvatar)) : (userObj && userObj.avatar || cachedAvatar || '');
+			const isFriend = friendNames instanceof Set ? friendNames.has(username) : false;
+			const preferredAvatar = String(userObj && userObj.avatar || '');
+			const avatar = typeof getResolvedUserAvatar === 'function'
+				? getResolvedUserAvatar(username, preferredAvatar)
+				: (preferredAvatar || localStorage.getItem(`${username}_psn_avatar`) || '');
 			const ps3 = userObj && userObj.ps3Status ? userObj.ps3Status : null;
-			parts.push([username, String(userObj && userObj.id || ''), username === myName ? 'me' : '', userRole, isTargetBanned ? '1' : '0', isFriend ? '1' : '0', String(avatar || ''), ps3 ? String(ps3.status || '') : '', ps3 ? String(ps3.title || '') : ''].join('~'));
+			const itemSignature = [username, String(userObj && userObj.id || ''), username === myName ? 'me' : '', userRole, isTargetBanned ? '1' : '0', isFriend ? '1' : '0', String(avatar || ''), ps3 ? String(ps3.status || '') : '', ps3 ? String(ps3.title || '') : ''].join('~');
+			roleByName.set(username, userRole);
+			bannedByName.set(username, isTargetBanned);
+			avatarByName.set(username, avatar);
+			itemSignatureByName.set(username, itemSignature);
+			parts.push(itemSignature);
 		}
-		return parts.join('|');
+		return { renderSignature:parts.join('|'), roleByName, bannedByName, avatarByName, itemSignatureByName, friendNames, myName, canModerate:canModerate === '1' };
+	}
+
+	function getOnlineListRenderSignature(users, myName, friendNames = null) {
+		return buildOnlineListRenderContext(users, myName, friendNames).renderSignature;
 	}
 
 	function renderOnlineList() {
@@ -64374,15 +64663,21 @@ function getVisibleChatStackEl(id) {
 		
 		const myName = localStorage.getItem('psn_username');
 		if (typeof forceCurrentAuthenticatedUserOnline === 'function') {
-			currentOnlineList = forceCurrentAuthenticatedUserOnline(currentOnlineList);
-			window.currentOnlineList = currentOnlineList;
-			if (typeof window.adminInvalidateKnownUsersCache === 'function') window.adminInvalidateKnownUsersCache();
+			const forcedOnlineList = forceCurrentAuthenticatedUserOnline(currentOnlineList);
+			if (forcedOnlineList !== currentOnlineList) {
+				currentOnlineList = forcedOnlineList;
+				window.currentOnlineList = currentOnlineList;
+				const nextMap = typeof window.getPsnNamedPoolMap === 'function' ? new Map(window.getPsnNamedPoolMap('online', currentOnlineList)) : new Map();
+				window.__currentOnlineUserByName = nextMap;
+				window.__currentOnlineActiveNames = new Set(Array.from(nextMap).filter(([, user]) => user && user.online === true).map(([name]) => name));
+				if (typeof window.adminInvalidateKnownUsersCache === 'function') window.adminInvalidateKnownUsersCache();
+			}
 		}
-		const friendNames = new Set();
-		for (const friend of (Array.isArray(window.friendsList) ? window.friendsList : [])) {
-			const name = friend && (friend.name || friend);
-			if (name) friendNames.add(String(name));
-		}
+		const friendList = Array.isArray(window.friendsList) ? window.friendsList : [];
+		const friendMap = typeof window.getPsnNamedPoolMap === 'function' ? window.getPsnNamedPoolMap('friends', friendList) : new Map();
+		const friendNames = window.__friendsNameSetSource === friendList && window.__friendsNameSetLength === friendList.length && window.__friendsNameSet instanceof Set
+			? window.__friendsNameSet
+			: (window.__friendsNameSetSource = friendList, window.__friendsNameSetLength = friendList.length, window.__friendsNameSet = new Set(friendMap.keys()));
 		let me = null;
 		const others = [];
 		let activeCount = 0;
@@ -64398,16 +64693,21 @@ function getVisibleChatStackEl(id) {
 		if (onlinePlayersTitleCount) window.setLiveCountText(onlinePlayersTitleCount, `${activeCount} ${activeCount === 1 ? 'player' : 'players'}`, activeCount);
 
 		const rolePriority = { admin: 3, mod: 2, trusted: 1, user: 0 };
+		const sortRoleByName = new Map();
+		for (const user of others) {
+			const name = String(user && (user.name || user) || '');
+			const role = typeof window.getPsnUserRole === 'function' ? window.getPsnUserRole(name, user) : (user && user.isAdmin ? 'admin' : 'user');
+			sortRoleByName.set(name, role);
+		}
 		others.sort((a, b) => {
-			const aName = a.name || a;
-			const bName = b.name || b;
-			const aRole = typeof window.getPsnUserRole === 'function' ? window.getPsnUserRole(aName, a) : (a.isAdmin ? 'admin' : 'user');
-			const bRole = typeof window.getPsnUserRole === 'function' ? window.getPsnUserRole(bName, b) : (b.isAdmin ? 'admin' : 'user');
-			return (rolePriority[bRole] || 0) - (rolePriority[aRole] || 0);
+			const aName = String(a && (a.name || a) || '');
+			const bName = String(b && (b.name || b) || '');
+			return (rolePriority[sortRoleByName.get(bName)] || 0) - (rolePriority[sortRoleByName.get(aName)] || 0);
 		});
 
 		const orderedUsers = me ? [me, ...others] : others;
-		const renderSignature = getOnlineListRenderSignature(orderedUsers, myName, friendNames);
+		const onlineRenderContext = buildOnlineListRenderContext(orderedUsers, myName, friendNames);
+		const renderSignature = onlineRenderContext.renderSignature;
 		if (container.dataset.onlineRenderSignature === renderSignature && container.childElementCount > 0) return;
 		container.dataset.onlineRenderSignature = renderSignature;
 	
@@ -64417,7 +64717,7 @@ function getVisibleChatStackEl(id) {
 		}
 
 		const nextOnlineFragment = document.createDocumentFragment();
-		for (const user of orderedUsers) renderUserItem(nextOnlineFragment, user, (user.name || user) === myName, friendNames);
+		for (const user of orderedUsers) renderUserItem(nextOnlineFragment, user, (user.name || user) === myName, friendNames, onlineRenderContext);
 		if (typeof window.reconcileLiveRenderFragment === 'function') {
 			window.reconcileLiveRenderFragment(container, nextOnlineFragment, ':scope > .online-user-item[data-live-render-key]', { preserveScroll: true });
 		} else {
@@ -64425,16 +64725,21 @@ function getVisibleChatStackEl(id) {
 		}
 	}
 		
-	function renderUserItem(container, userObj, isMe, friendNames = null) {
+	function renderUserItem(container, userObj, isMe, friendNames = null, renderContext = null) {
 		const username = userObj.name || userObj;
 		const targetSocketId = userObj.id; 
 		const isAdmin = document.body.classList.contains('is-admin');
-		const userRole = typeof window.getPsnUserRole === 'function' ? window.getPsnUserRole(username, userObj) : (userObj.isAdmin ? 'admin' : 'user');
+		const userRole = renderContext && renderContext.roleByName instanceof Map && renderContext.roleByName.has(username)
+			? renderContext.roleByName.get(username)
+			: (typeof window.getPsnUserRole === 'function' ? window.getPsnUserRole(username, userObj) : (userObj.isAdmin ? 'admin' : 'user'));
 		const isTargetAdmin = userObj.isAdmin === true || userRole === 'admin';
-		const isTargetBanned = typeof window.isPsnUserBanned === 'function' ? window.isPsnUserBanned(username, userObj) : (userObj.isBanned === true || userRole === 'banned');
+		const isTargetBanned = renderContext && renderContext.bannedByName instanceof Map && renderContext.bannedByName.has(username)
+			? renderContext.bannedByName.get(username)
+			: (typeof window.isPsnUserBanned === 'function' ? window.isPsnUserBanned(username, userObj) : (userObj.isBanned === true || userRole === 'banned'));
 	
-		const cachedAvatar = localStorage.getItem(`${username}_psn_avatar`);
-		const userAvatar = (typeof getResolvedUserAvatar === 'function') ? getResolvedUserAvatar(username, userObj.avatar || cachedAvatar) : (userObj.avatar || cachedAvatar || AVAILABLE_AVATARS[0]);
+		const userAvatar = renderContext && renderContext.avatarByName instanceof Map && renderContext.avatarByName.has(username)
+			? renderContext.avatarByName.get(username)
+			: ((typeof getResolvedUserAvatar === 'function') ? getResolvedUserAvatar(username, userObj.avatar || '') : (userObj.avatar || localStorage.getItem(`${username}_psn_avatar`) || AVAILABLE_AVATARS[0]));
 		const isFriend = friendNames instanceof Set ? friendNames.has(username) : !!(window.friendsList && window.friendsList.some(f => f && (f.name || f) === username));
 	
 		const ps3 = userObj.ps3Status || null;
@@ -64473,9 +64778,8 @@ function getVisibleChatStackEl(id) {
 		div.className = `online-user-item role-${userRole}${isTargetBanned ? ' is-banned' : ''}`;
 		div.id = `user-row-${targetSocketId}`; 
 		div.dataset.liveRenderKey = `online:${username}`;
-		div.dataset.liveRenderSignature = typeof window.getLiveRenderSignature === 'function'
-			? window.getLiveRenderSignature(getOnlineListRenderSignature([userObj], localStorage.getItem('psn_username'), friendNames))
-			: '';
+		const itemSignature = renderContext && renderContext.itemSignatureByName instanceof Map ? (renderContext.itemSignatureByName.get(username) || '') : getOnlineListRenderSignature([userObj], renderContext && renderContext.myName || localStorage.getItem('psn_username'), friendNames);
+		div.dataset.liveRenderSignature = typeof window.getLiveRenderSignature === 'function' ? window.getLiveRenderSignature(itemSignature) : itemSignature;
 		div.style.cssText = "display: flex; align-items: center; justify-content: space-between; padding: 12px 18px; transition: all 0.3s ease;";
 		
 		if (isMe) div.style.background = "rgba(0, 112, 204, 0.15)";
@@ -68387,33 +68691,41 @@ function getVisibleChatStackEl(id) {
     // ==========================================================================
 	function getResolvedUserAvatar(name, preferredAvatar = '', lookupContext = null) {
 		const DEFAULT_AVATAR = "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/main/resources/interface/modern/images/avatars/default.png";
-		const netUser = lookupContext && lookupContext.onlineByName instanceof Map
-			? (lookupContext.onlineByName.get(name) || null)
-			: (typeof currentOnlineList !== 'undefined' ? currentOnlineList.find(u => (u.name || u) === name) : null);
-		const searchUser = lookupContext && lookupContext.globalSearchByName instanceof Map
-			? (lookupContext.globalSearchByName.get(name) || null)
-			: (window.globalSearchResults ? window.globalSearchResults.find(u => (u.name || u) === name) : null);
-		const adminUser = Array.isArray(window.adminAllUsers) ? window.adminAllUsers.find(u => (u.name || u) === name) : null;
-		const friendData = lookupContext && lookupContext.friendByName instanceof Map
-			? (lookupContext.friendByName.get(name) || null)
-			: (window.friendsList ? window.friendsList.find(f => (f.name || f) === name) : null);
-		const savedAvatar = localStorage.getItem(`${name}_psn_avatar`);
-		const firstAvatar = (typeof AVAILABLE_AVATARS !== 'undefined' && AVAILABLE_AVATARS[0]) ? AVAILABLE_AVATARS[0] : DEFAULT_AVATAR;
+		const validAvatar = value => (typeof value === 'string' && value.trim()) ? value.trim() : '';
 		const freshPreferred = !!(lookupContext && lookupContext.preferredAvatarIsFresh);
 		const preferFriendData = !!(lookupContext && lookupContext.preferFriendData);
 
-		return [
-			netUser?.avatar,
-			preferFriendData ? friendData?.avatar : '',
-			searchUser?.avatar,
-			adminUser?.avatar,
-			freshPreferred ? preferredAvatar : '',
-			savedAvatar,
-			preferFriendData ? '' : friendData?.avatar,
-			freshPreferred ? '' : preferredAvatar,
-			firstAvatar,
-			DEFAULT_AVATAR
-		].find(src => typeof src === 'string' && src.trim() !== '') || DEFAULT_AVATAR;
+		const netUser = lookupContext && lookupContext.onlineByName instanceof Map
+			? (lookupContext.onlineByName.get(name) || null)
+			: (window.__currentOnlineUserByName instanceof Map ? (window.__currentOnlineUserByName.get(name) || null) : (typeof window.getPsnNamedPoolUser === 'function' ? window.getPsnNamedPoolUser('online', typeof currentOnlineList !== 'undefined' ? currentOnlineList : [], name) : null));
+		let avatar = validAvatar(netUser && netUser.avatar);
+		if (avatar) return avatar;
+
+		const friendData = lookupContext && lookupContext.friendByName instanceof Map
+			? (lookupContext.friendByName.get(name) || null)
+			: (typeof window.getPsnNamedPoolUser === 'function' ? window.getPsnNamedPoolUser('friends', window.friendsList, name) : null);
+		if (preferFriendData) { avatar = validAvatar(friendData && friendData.avatar); if (avatar) return avatar; }
+
+		const searchUser = lookupContext && lookupContext.globalSearchByName instanceof Map
+			? (lookupContext.globalSearchByName.get(name) || null)
+			: (typeof window.getPsnNamedPoolUser === 'function' ? window.getPsnNamedPoolUser('search', window.globalSearchResults, name) : null);
+		avatar = validAvatar(searchUser && searchUser.avatar);
+		if (avatar) return avatar;
+
+		let adminUser = null;
+		if (window.__adminAllUsersIndexByName instanceof Map && Array.isArray(window.adminAllUsers) && window.__adminAllUsersIndexSource === window.adminAllUsers) {
+			const adminIndex = window.__adminAllUsersIndexByName.get(String(name || '').toLowerCase());
+			if (adminIndex !== undefined) adminUser = window.adminAllUsers[adminIndex] || null;
+		} else if (typeof window.getPsnNamedPoolUser === 'function') adminUser = window.getPsnNamedPoolUser('admin', window.adminAllUsers, name);
+		avatar = validAvatar(adminUser && adminUser.avatar);
+		if (avatar) return avatar;
+
+		if (freshPreferred) { avatar = validAvatar(preferredAvatar); if (avatar) return avatar; }
+		avatar = validAvatar(localStorage.getItem(`${name}_psn_avatar`));
+		if (avatar) return avatar;
+		if (!preferFriendData) { avatar = validAvatar(friendData && friendData.avatar); if (avatar) return avatar; }
+		if (!freshPreferred) { avatar = validAvatar(preferredAvatar); if (avatar) return avatar; }
+		return (typeof AVAILABLE_AVATARS !== 'undefined' && validAvatar(AVAILABLE_AVATARS[0])) || DEFAULT_AVATAR;
 	}
 
 	window.getResolvedUserAvatar = getResolvedUserAvatar;
@@ -68679,26 +68991,23 @@ function getVisibleChatStackEl(id) {
 		const onlineList = Array.isArray(currentOnlineList) ? currentOnlineList : [];
 		const friendList = Array.isArray(window.friendsList) ? window.friendsList : [];
 		const globalSearchList = Array.isArray(window.globalSearchResults) ? window.globalSearchResults : [];
-		const onlineByName = new Map();
-		onlineList.forEach(user => {
-			const name = user && typeof user === 'object' ? user.name : user;
-			if (name && !onlineByName.has(name)) onlineByName.set(name, user);
-		});
-		const friendByName = new Map();
-		friendList.forEach(friend => {
-			const name = friend && typeof friend === 'object' ? friend.name : friend;
-			if (name && !friendByName.has(name)) friendByName.set(name, friend);
-		});
-		const friendNames = new Set(friendByName.keys());
-		const onlineNames = new Set();
-		for (const [name, user] of onlineByName) {
-			if (user && typeof user === 'object' && user.online === true) onlineNames.add(name);
-		}
-		const globalSearchByName = new Map();
-		globalSearchList.forEach(user => {
-			const name = user && typeof user === 'object' ? user.name : user;
-			if (name && !globalSearchByName.has(name)) globalSearchByName.set(name, user);
-		});
+		/* FRIENDS LOOKUP REUSE: these maps are already maintained by the realtime/user-meta layer.
+		   Rebuilding three maps on every search/filter keystroke was pure O(n) overhead. */
+		const onlineByName = window.__currentOnlineUserByName instanceof Map
+			? window.__currentOnlineUserByName
+			: (typeof window.getPsnNamedPoolMap === 'function' ? window.getPsnNamedPoolMap('online', onlineList) : new Map());
+		const friendByName = typeof window.getPsnNamedPoolMap === 'function'
+			? window.getPsnNamedPoolMap('friends', friendList)
+			: new Map(friendList.map(friend => [String(friend && (friend.name || friend) || ''), friend]).filter(entry => entry[0]));
+		const friendNames = window.__friendsNameSetSource === friendList && window.__friendsNameSetLength === friendList.length && window.__friendsNameSet instanceof Set
+			? window.__friendsNameSet
+			: (window.__friendsNameSetSource = friendList, window.__friendsNameSetLength = friendList.length, window.__friendsNameSet = new Set(friendByName.keys()));
+		const onlineNames = window.__currentOnlineActiveNames instanceof Set
+			? window.__currentOnlineActiveNames
+			: new Set(Array.from(onlineByName).filter(([, user]) => user && typeof user === 'object' && user.online === true).map(([name]) => name));
+		const globalSearchByName = typeof window.getPsnNamedPoolMap === 'function'
+			? window.getPsnNamedPoolMap('search', globalSearchList)
+			: new Map(globalSearchList.map(user => [String(user && (user.name || user) || ''), user]).filter(entry => entry[0]));
 		const friendLookupContext = { onlineByName, friendByName, globalSearchByName, preferFriendData: true };
 		const getKnownFriendLastSeen = (name, friendRecord = null, networkRecord = null) => {
 			const searchRecord = globalSearchByName.get(name) || null;
@@ -69525,10 +69834,16 @@ function getVisibleChatStackEl(id) {
 		const profileCardStyleBtn = document.getElementById('profile-card-style-btn');
 		if (profileCardStyleBtn) profileCardStyleBtn.classList.toggle('is-visible', isMe);
 		
-		const networkUser = typeof currentOnlineList !== 'undefined' ? currentOnlineList.find(u => (u.name || u) === username) : null;
-		const adminUser = Array.isArray(window.adminAllUsers) ? window.adminAllUsers.find(u => (u.name || u) === username) : null;
-		const searchUser = window.globalSearchResults ? window.globalSearchResults.find(u => (u.name || u) === username) : null;
-		const friendUser = Array.isArray(window.friendsList) ? window.friendsList.find(u => (u.name || u) === username) : null;
+		const networkUser = window.__currentOnlineUserByName instanceof Map
+			? (window.__currentOnlineUserByName.get(username) || null)
+			: (typeof window.getPsnNamedPoolUser === 'function' ? window.getPsnNamedPoolUser('online', typeof currentOnlineList !== 'undefined' ? currentOnlineList : [], username) : (typeof currentOnlineList !== 'undefined' ? currentOnlineList.find(u => (u.name || u) === username) : null));
+		let adminUser = null;
+		if (window.__adminAllUsersIndexByName instanceof Map && Array.isArray(window.adminAllUsers) && window.__adminAllUsersIndexSource === window.adminAllUsers) {
+			const adminIndex = window.__adminAllUsersIndexByName.get(username.toLowerCase());
+			if (adminIndex !== undefined) adminUser = window.adminAllUsers[adminIndex] || null;
+		} else if (typeof window.getPsnNamedPoolUser === 'function') adminUser = window.getPsnNamedPoolUser('admin', window.adminAllUsers, username);
+		const searchUser = typeof window.getPsnNamedPoolUser === 'function' ? window.getPsnNamedPoolUser('search', window.globalSearchResults, username) : (window.globalSearchResults ? window.globalSearchResults.find(u => (u.name || u) === username) : null);
+		const friendUser = typeof window.getPsnNamedPoolUser === 'function' ? window.getPsnNamedPoolUser('friends', window.friendsList, username) : (Array.isArray(window.friendsList) ? window.friendsList.find(u => (u.name || u) === username) : null);
 		if (!isMe && typeof socketChat !== 'undefined' && socketChat && socketChat.connected) {
 			const now = Date.now();
 			const profileLookupKey = String(username || '').toLowerCase();
@@ -69542,7 +69857,9 @@ function getVisibleChatStackEl(id) {
 		const profileMeta = { ...(friendUser || {}), ...(adminUser || {}), ...(searchUser || {}), ...(networkUser || {}) };
 		const hasFreshProfileMeta = !!(networkUser || adminUser || searchUser);
 		if (!isMe && hasFreshProfileMeta && typeof window.syncPsnUserMeta === 'function') {
-			window.syncPsnUserMeta({ name: username, ...profileMeta });
+			/* Opening one profile should not scan every rendered avatar in the document. Fresh
+			   pools are already synced; this call only persists any newer metadata fallback. */
+			window.syncPsnUserMeta({ name: username, ...profileMeta }, { skipDomAvatarUpdate:true, deferAdminInvalidation:true });
 		}
 		const cachedLastSeen = Number(localStorage.getItem(`${username}_psn_lastSeen`)) || 0;
 		const sourceLastSeen = Number(profileMeta.lastSeen || profileMeta.last_seen || 0);
@@ -69558,7 +69875,9 @@ function getVisibleChatStackEl(id) {
 			: (profileMeta.avatar || localStorage.getItem(`${username}_psn_avatar`) || (isMe ? AVAILABLE_AVATARS[0] : "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/main/resources/interface/modern/images/avatars/default.png"));
 		const joinedDate = profileMeta.joined || localStorage.getItem(`${username}_psn_joined`) || (isMe ? (localStorage.getItem(`${myName}_joined_date`) || "2026") : "---");
 		
-		const isFriend = window.friendsList && window.friendsList.some(f => f.name === username);
+		const profileFriendList = Array.isArray(window.friendsList) ? window.friendsList : [];
+		const profileFriendMap = typeof window.getPsnNamedPoolMap === 'function' ? window.getPsnNamedPoolMap('friends', profileFriendList) : null;
+		const isFriend = profileFriendMap instanceof Map ? profileFriendMap.has(username) : profileFriendList.some(f => f && f.name === username);
 		let friendIconHtml = '';
 		if (!isMe) {
 			friendIconHtml = `<button class="btn-profile-friend ${isFriend ? 'is-friend' : 'not-friend'}" onclick="event.stopPropagation(); toggleFriend('${username}', '${avatarUrl}'); openProfileModal('${encodeURIComponent(username)}');"><i class="fas ${isFriend ? 'fa-user-minus' : 'fa-user-plus'}"></i></button>`;
