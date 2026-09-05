@@ -150,6 +150,9 @@ button:disabled, [disabled], [aria-disabled="true"], .chat-delete-action-disable
 @keyframes titleIdCopySuccessPop{0%{transform:scale(.86);}48%{transform:scale(1.15);}100%{transform:scale(1);}}
 @keyframes titleIdCopySuccessFrame{0%{opacity:.95;transform:scale(.88);}70%{opacity:.38;transform:scale(1.24);}100%{opacity:0;transform:scale(1.34);}}
 @keyframes view-enter{0%{opacity: 0; transform: scale(0.99); filter: blur(4px);}100%{opacity: 1; transform: scale(1); filter: none;}}
+/* ADMIN PERF: the Admin view contains many backdrop-filter cards. Keep the same scale/fade entry,
+   but do not blur the entire subtree; visible cards still run adminCardBoot with their own blur. */
+@keyframes admin-view-enter{0%{opacity:0;transform:scale(.99);}100%{opacity:1;transform:scale(1);}}
 @keyframes explore-view-enter{0%{opacity: 0; transform: translateY(15px) scale(0.99); filter: blur(4px);}100%{opacity: 1; transform: translateY(0) scale(1); filter: none;}}
 @keyframes guideRevealPop{from{opacity: 0; transform: scale(.9) translateY(20px);}to{opacity: 1; transform: scale(1) translateY(0);}}
 @keyframes wishUnheartPulse{0%{transform: translate(.5px,.5px) scale(1.15) rotate(0deg); opacity: 1; filter: drop-shadow(0 0 0 rgba(255,68,68,0));}18%{transform: translate(.5px,.5px) scale(1.34) rotate(-8deg); filter: drop-shadow(0 0 8px rgba(255,68,68,.8));}38%{transform: translate(.5px,.5px) scale(1.18) rotate(8deg);}62%{transform: translate(.5px,.5px) scale(.92) rotate(-4deg); filter: drop-shadow(0 0 12px rgba(255,68,68,.9));}82%{transform: translate(.5px,.5px) scale(1.08) rotate(0deg); opacity: .85;}100%{transform: translate(.5px,.5px) scale(1); opacity: .75; filter: drop-shadow(0 0 0 rgba(255,68,68,0));}}
@@ -2745,7 +2748,9 @@ body.chat-selection-mode .chat-message-actions .chat-delete-action:not(.chat-del
 
 /* ========================================================================== PAGE ENTRANCE (FADE-IN UP & EXCEPTIONS) ========================================================================== */
 .view-entry-prep { opacity:0 !important; transform:scale(.99) !important; filter:blur(4px) !important; }
+#view-admin.view-entry-prep { filter:none !important; }
 .anim-up { transform-origin: top center; animation: view-enter 0.4s cubic-bezier(0.2,0.8,0.2,1) forwards !important; }
+#view-admin.anim-up { animation: admin-view-enter 0.4s cubic-bezier(0.2,0.8,0.2,1) forwards !important; }
 #view-explore.anim-up { animation: explore-view-enter 0.4s cubic-bezier(0.2,0.8,0.2,1) forwards !important; }
 
 /* ========================================================================== SIDEBAR SLIDER (GLOBAL VERTICAL SLIDE) ========================================================================== */
@@ -31140,7 +31145,18 @@ P
 		});
 	}
 
+	let adminKnownUsersRevision = 0;
+	let adminKnownUsersCacheRevision = -1;
+	let adminKnownUsersCache = null;
+	let adminKnownUsersOnlineSnapshot = [];
+	function adminInvalidateKnownUsersCache() {
+		adminKnownUsersRevision++;
+		adminKnownUsersCache = null;
+	}
+	window.adminInvalidateKnownUsersCache = adminInvalidateKnownUsersCache;
+
 	function adminGetAllKnownUsers() {
+		if (adminKnownUsersCache && adminKnownUsersCacheRevision === adminKnownUsersRevision) return adminKnownUsersCache;
 		const map = new Map();
 		const myName = localStorage.getItem('psn_username') || '';
 		const onlineList = (typeof currentOnlineList !== 'undefined' && Array.isArray(currentOnlineList)) ? currentOnlineList : [];
@@ -31149,7 +31165,7 @@ P
 		for (const user of adminUsers) adminMergeUserIntoMap(map, user, 'database');
 		for (const user of onlineList) adminMergeUserIntoMap(map, user, 'online');
 
-		return Array.from(map.values()).sort((a, b) => {
+		const result = Array.from(map.values()).sort((a, b) => {
 			if (a.name === myName) return -1;
 			if (b.name === myName) return 1;
 			if (a.online !== b.online) return a.online ? -1 : 1;
@@ -31160,6 +31176,13 @@ P
 			if (aRoleRank !== bRoleRank) return aRoleRank - bRoleRank;
 			return a.name.localeCompare(b.name);
 		});
+		adminKnownUsersCache = result;
+		adminKnownUsersOnlineSnapshot = [];
+		for (const user of result) {
+			if (user && user.online === true) adminKnownUsersOnlineSnapshot.push({ name: user.name || user, id: user.id || null, isAdmin: !!user.isAdmin, isBanned: !!user.isBanned, ps3Status: user.ps3Status || null });
+		}
+		adminKnownUsersCacheRevision = adminKnownUsersRevision;
+		return result;
 	}
 
 
@@ -31179,8 +31202,15 @@ P
 		const myName = localStorage.getItem('psn_username') || 'Guest';
 		const loadedItems = adminGetLoadedItemsCount();
 		const allKnownUsers = Array.isArray(allKnownUsersOverride) ? allKnownUsersOverride : adminGetAllKnownUsers();
-		const onlineUsers = [];
-		for (const user of allKnownUsers) if (user && user.online === true) onlineUsers.push(user);
+		let onlineUsers;
+		if (allKnownUsers === adminKnownUsersCache && adminKnownUsersCacheRevision === adminKnownUsersRevision) {
+			onlineUsers = adminKnownUsersOnlineSnapshot;
+		} else {
+			onlineUsers = [];
+			for (const user of allKnownUsers) {
+				if (user && user.online === true) onlineUsers.push({ name: user.name || user, id: user.id || null, isAdmin: !!user.isAdmin, isBanned: !!user.isBanned, ps3Status: user.ps3Status || null });
+			}
+		}
 		let trophyCount = 0;
 		if (window.userTrophies) {
 			for (const key in window.userTrophies) if (window.userTrophies[key] && window.userTrophies[key].unlocked) trophyCount++;
@@ -31193,7 +31223,7 @@ P
 			server: adminGetDisplayServer(),
 			ps3Ip: localStorage.getItem('ps3_ip') || '',
 			registeredUsers: Math.max(allKnownUsers.length, Number(window.adminRegisteredUsers) || 0),
-			onlineUsers: onlineUsers.map(u => ({ name: u.name || u, id: u.id || null, isAdmin: !!u.isAdmin, isBanned: !!u.isBanned, ps3Status: u.ps3Status || null })),
+			onlineUsers,
 			messagesCached: window.messageHistory ? window.messageHistory.length : 0,
 			pinnedMessages: typeof pinnedMessages !== 'undefined' && Array.isArray(pinnedMessages) ? pinnedMessages.length : 0,
 			loadedItems: loadedItems,
@@ -31256,6 +31286,35 @@ P
         }
 	}
 
+	let adminExitCleanupTimer = 0;
+	let adminExitCleanupIdle = 0;
+	function adminCancelScheduledExitCleanup() {
+		if (adminExitCleanupTimer) clearTimeout(adminExitCleanupTimer);
+		adminExitCleanupTimer = 0;
+		if (adminExitCleanupIdle && typeof cancelIdleCallback === 'function') cancelIdleCallback(adminExitCleanupIdle);
+		adminExitCleanupIdle = 0;
+	}
+	function adminRunExitCleanup() {
+		adminCancelScheduledExitCleanup();
+		adminResetPanelScrolls();
+		if (typeof adminResetBroadcastDraftState === 'function') adminResetBroadcastDraftState();
+	}
+	function adminScheduleExitCleanup() {
+		adminCancelScheduledExitCleanup();
+		const run = () => {
+			adminExitCleanupTimer = 0;
+			adminExitCleanupIdle = 0;
+			if (document.getElementById('view-admin')?.style.display === 'block') return;
+			adminResetPanelScrolls();
+			if (typeof adminResetBroadcastDraftState === 'function') adminResetBroadcastDraftState();
+		};
+		/* ADMIN EXIT PERF: cleanup is invisible after leaving Admin, so keep it off the
+		   destination view's first paint/entry animation whenever the browser supports idle work. */
+		if (typeof requestIdleCallback === 'function') adminExitCleanupIdle = requestIdleCallback(run, { timeout: 700 });
+		else adminExitCleanupTimer = setTimeout(run, 120);
+	}
+	window.adminScheduleExitCleanup = adminScheduleExitCleanup;
+
 	function adminResetUsersPanelState() {
 		const batchSize = adminGetUsersBatchSize();
 		if (window.adminRenderLimit !== batchSize) window.adminRenderLimit = batchSize;
@@ -31314,15 +31373,52 @@ P
 	};
 
 
+	let adminEntryHydrationToken = 0;
+	const adminEntryHydrationTimers = new Set();
+	function adminCancelEntryHydration() {
+		adminEntryHydrationToken++;
+		for (const timer of adminEntryHydrationTimers) clearTimeout(timer);
+		adminEntryHydrationTimers.clear();
+	}
+	window.adminCancelEntryHydration = adminCancelEntryHydration;
+
+	function adminScheduleEntryHydration() {
+		adminCancelEntryHydration();
+		const token = adminEntryHydrationToken;
+		const navigationEpoch = typeof window.getPsnNavigationEpoch === 'function' ? window.getPsnNavigationEpoch() : null;
+		const stillCurrent = () => token === adminEntryHydrationToken
+			&& document.getElementById('view-admin')?.style.display === 'block'
+			&& (navigationEpoch === null || typeof window.isPsnNavigationEpochCurrent !== 'function' || window.isPsnNavigationEpochCurrent(navigationEpoch));
+		const later = (delay, work) => {
+			const timer = setTimeout(() => {
+				adminEntryHydrationTimers.delete(timer);
+				if (stillCurrent()) work();
+			}, delay);
+			adminEntryHydrationTimers.add(timer);
+		};
+
+		/* ADMIN ENTRY PERF: the transition gets the main thread first. Refresh/network work
+		   is intentionally staggered just after it finishes instead of landing in one burst. */
+		later(0, () => { if (typeof adminRefreshHealth === 'function') adminRefreshHealth(false, false); });
+		later(35, () => { if (typeof socketChat !== 'undefined' && socketChat && socketChat.connected) socketChat.emit('admin_request_moderation_log'); });
+		later(70, () => { if (typeof window.adminRequestChatControlsState === 'function') window.adminRequestChatControlsState(); });
+		later(105, () => { if (typeof window.adminRequestReports === 'function') window.adminRequestReports(true); });
+		later(140, () => { if (typeof window.adminRequestUsersList === 'function') window.adminRequestUsersList(true, true); });
+		later(180, () => { if (window.__adminDeferredFullRender && typeof adminSchedulePanelRender === 'function') adminSchedulePanelRender(true); });
+	}
+	window.adminScheduleEntryHydration = adminScheduleEntryHydration;
+
 	window.openAdminPanel = function() {
 		if (!adminGuard()) return;
+		/* If an earlier exit cleanup is still pending, finish it before Admin becomes visible
+		   again so the same reset behavior is preserved. */
+		if (adminExitCleanupTimer || adminExitCleanupIdle) adminRunExitCleanup();
 
 		/* Admin now behaves like Help/Settings: it lives in the sidebar footer,
 		   so it does not steal the top tab or swap the current sidebar group.
-		   Keep Admin data work off the outgoing view's animation hot path. */
+		   Keep Admin data/network work off both the outgoing and incoming animations. */
 		switchView('view-admin', false, true, () => {
 			adminInstallSocketListeners();
-			adminRefreshHealth(false, false);
 			adminResetUsersPanelState();
 		});
 
@@ -31463,15 +31559,15 @@ P
 		return true;
 	}
 
-	function adminSchedulePanelRender() {
+	function adminSchedulePanelRender(forceFull = false) {
 		if (typeof scheduleViewOpenWork === 'function') {
-			scheduleViewOpenWork('view-admin', () => { if (typeof renderAdminPanel === 'function') renderAdminPanel(); });
+			scheduleViewOpenWork('view-admin', () => { if (typeof renderAdminPanel === 'function') renderAdminPanel({ forceFull }); });
 			return;
 		}
-		if (document.getElementById('view-admin')?.style.display === 'block' && typeof renderAdminPanel === 'function') renderAdminPanel();
+		if (document.getElementById('view-admin')?.style.display === 'block' && typeof renderAdminPanel === 'function') renderAdminPanel({ forceFull });
 	}
 
-	window.renderAdminPanel = function() {
+	window.renderAdminPanel = function(options = {}) {
 		const content = document.getElementById('admin-dashboard-content');
 		const lock = document.getElementById('admin-access-lock');
 		const adminView = document.getElementById('view-admin');
@@ -31486,6 +31582,18 @@ P
 
 		if (content.style.display !== 'flex') content.style.display = 'flex';
 		if (lock && lock.style.display !== 'none') lock.style.display = 'none';
+
+		const forceFull = options && options.forceFull === true;
+		if (adminEntryActive && !forceFull) {
+			/* ADMIN ENTRY PERF: do not normalize/sort the complete user database or rebuild long
+			   logs while the view itself is animating. Existing/static card content stays visible
+			   for the 400ms transition and a full render is queued at animation end. */
+			window.__adminDeferredFullRender = true;
+			adminRenderConnectionPill();
+			if (typeof adminRenderHealthCard === 'function') adminRenderHealthCard();
+			return;
+		}
+		window.__adminDeferredFullRender = false;
 
 		const allKnownUsers = adminGetAllKnownUsers();
 		const data = adminGetDiagnostics(allKnownUsers);
@@ -31519,6 +31627,21 @@ P
 			const filter = (filterInput ? filterInput.value : '').trim().toLowerCase();
 			const userFilterMode = adminGetUserFilterMode();
 			adminSyncUserFilterControls();
+			const fastBatchSize = adminGetUsersBatchSize();
+			const fastRenderLimit = Math.max(1, parseInt(window.adminRenderLimit || fastBatchSize, 10) || fastBatchSize);
+			const fastFriends = Array.isArray(window.friendsList) ? window.friendsList : [];
+			let fastFriendSignature = '';
+			for (const friend of fastFriends) fastFriendSignature += `${String(friend && (friend.name || friend) || '')}|`;
+			const adminUsersFastSignature = [
+				adminKnownUsersRevision, filter, userFilterMode, fastRenderLimit, window.adminUsersLoading ? 1 : 0,
+				Number(window.adminUsersResultTotal || 0), Number(window.adminRegisteredUsers || 0),
+				Array.isArray(window.adminAllUsers) ? window.adminAllUsers.length : 0, fastFriendSignature, myName,
+				Math.floor(Date.now() / 60000)
+			].join('~');
+			if (list.__adminUsersFastSignature === adminUsersFastSignature && list.childNodes.length > 0) {
+				// User source/filter state is unchanged; unrelated Admin updates do not rebuild this list.
+			} else {
+				list.__adminUsersFastSignature = adminUsersFastSignature;
 			const filteredUsers = [];
 			for (const u of allKnownUsers) {
 				const name = String(u && u.name || '').toLowerCase();
@@ -31708,6 +31831,7 @@ P
 					parts.push(`<button class="admin-load-more" onclick="adminShowMoreUsers()" onmouseenter="if(typeof playUiHover === 'function') playUiHover()"><i class="fas fa-chevron-down"></i> Show ${nextBatch} more users (${hiddenCount} hidden)</button>`);
 				}
 				renderAdminUsersHtml(parts.join(''));
+			}
 			}
 
 		}
@@ -32398,6 +32522,7 @@ P
 			const list = window[key];
 			if (Array.isArray(list)) list.forEach(updateRecord);
 		});
+		if (typeof window.adminInvalidateKnownUsersCache === 'function') window.adminInvalidateKnownUsersCache();
 	};
 
 	window.adminUnbanUser = function(encodedName, socketId = '') {
@@ -32491,6 +32616,7 @@ P
 				window[key] = window[key].filter(user => String(user && (user.name || user.username || user.user || '')).trim() !== name);
 			}
 		});
+		if (typeof window.adminInvalidateKnownUsersCache === 'function') window.adminInvalidateKnownUsersCache();
 		try {
 			if (localStorage.getItem('psn_username') === name) localStorage.removeItem('psn_username');
 			localStorage.removeItem(`${name}_psn_password`);
@@ -32600,13 +32726,22 @@ P
 		if (typeof playUiSuccess === 'function') playUiSuccess();
 	}
 
+	let adminModerationLogCacheRaw = null;
+	let adminModerationLogCache = [];
 	function adminGetModerationLog() {
-		return adminSafeParseJson(localStorage.getItem('psn_admin_moderation_log'), []);
+		const raw = localStorage.getItem('psn_admin_moderation_log');
+		if (raw === adminModerationLogCacheRaw) return adminModerationLogCache;
+		adminModerationLogCacheRaw = raw;
+		adminModerationLogCache = adminSafeParseJson(raw, []);
+		return adminModerationLogCache;
 	}
 
 	function adminSetModerationLog(log) {
 		const clean = Array.isArray(log) ? log.filter(Boolean).slice(0, 100) : [];
-		safeLocalStorageSet('psn_admin_moderation_log', JSON.stringify(clean));
+		const raw = JSON.stringify(clean);
+		adminModerationLogCacheRaw = raw;
+		adminModerationLogCache = clean;
+		safeLocalStorageSet('psn_admin_moderation_log', raw);
 	}
 
 	function adminAddLog(type, message, detail = {}, meta = {}) {
@@ -32638,13 +32773,22 @@ P
 	}
 
 
+	let adminServerLogCacheRaw = null;
+	let adminServerLogCache = [];
 	function adminGetServerLog() {
-		return adminSafeParseJson(localStorage.getItem('psn_admin_server_log'), []);
+		const raw = localStorage.getItem('psn_admin_server_log');
+		if (raw === adminServerLogCacheRaw) return adminServerLogCache;
+		adminServerLogCacheRaw = raw;
+		adminServerLogCache = adminSafeParseJson(raw, []);
+		return adminServerLogCache;
 	}
 
 	function adminSetServerLog(log = []) {
 		const clean = Array.isArray(log) ? log.filter(Boolean).slice(0, 120) : [];
-		safeLocalStorageSet('psn_admin_server_log', JSON.stringify(clean));
+		const raw = JSON.stringify(clean);
+		adminServerLogCacheRaw = raw;
+		adminServerLogCache = clean;
+		safeLocalStorageSet('psn_admin_server_log', raw);
 	}
 
 	function adminAddServerLog(item = {}) {
@@ -34457,6 +34601,7 @@ P
 			user.isBanned = false;
 			user.banned = false;
 		}
+		if (typeof window.adminInvalidateKnownUsersCache === 'function') window.adminInvalidateKnownUsersCache();
 	};
 
 	function adminGetUserRole(name, user = {}) {
@@ -34495,6 +34640,7 @@ P
 			const list = window[key];
 			if (Array.isArray(list)) list.forEach(updateRecord);
 		});
+		if (typeof window.adminInvalidateKnownUsersCache === 'function') window.adminInvalidateKnownUsersCache();
 
 		if (typeof socketChat !== 'undefined' && socketChat && socketChat.connected) {
 			socketChat.emit('admin_set_role', { targetName: name, role: normalized, adminUser: localStorage.getItem('psn_username') || 'Admin' });
@@ -34588,13 +34734,23 @@ P
 		adminAddLog('export', 'Exported admin settings');
 	};
 
+	let adminReportsFallbackRaw = null;
+	let adminReportsFallbackCache = [];
 	function adminGetReports() {
-		return Array.isArray(window.adminReports) ? window.adminReports : adminSafeParseJson(localStorage.getItem('psn_admin_reports'), []);
+		if (Array.isArray(window.adminReports)) return window.adminReports;
+		const raw = localStorage.getItem('psn_admin_reports');
+		if (raw === adminReportsFallbackRaw) return adminReportsFallbackCache;
+		adminReportsFallbackRaw = raw;
+		adminReportsFallbackCache = adminSafeParseJson(raw, []);
+		return adminReportsFallbackCache;
 	}
 
 	function adminSetReports(reports) {
 		window.adminReports = Array.isArray(reports) ? reports.slice(0, 100) : [];
-		safeLocalStorageSet('psn_admin_reports', JSON.stringify(window.adminReports));
+		const raw = JSON.stringify(window.adminReports);
+		adminReportsFallbackRaw = raw;
+		adminReportsFallbackCache = window.adminReports;
+		safeLocalStorageSet('psn_admin_reports', raw);
 	}
 
 	function adminReportKey(report) {
@@ -34860,9 +35016,13 @@ P
 		const reportsEl = document.getElementById('admin-report-center');
 		if (reportsEl && cardCanRender(reportsEl)) {
 			const reports = adminGetReports();
-			if (!reports.length) {
+			if (reportsEl.__adminReportsSource === reports && reportsEl.childNodes.length > 0) {
+				// Source array is immutable-by-replacement; no need to rebuild the same report HTML.
+			} else if (!reports.length) {
+				reportsEl.__adminReportsSource = reports;
 				setAdminHtmlIfChanged(reportsEl, '<div class="admin-empty"><i class="fas fa-flag" style="color:#ffcc00;margin-right:6px;"></i>No reports yet. Users can report messages with the flag icon in chat. Refresh asks the server for pending reports.</div>');
 			} else {
+				reportsEl.__adminReportsSource = reports;
 				setAdminHtmlIfChanged(reportsEl, reports.slice(0, 20).map((r, idx) => {
 					const id = r.id || r.time || idx;
 					const time = r.time ? adminFormatLogTimestamp(r.time) : 'Unknown time';
@@ -34885,8 +35045,14 @@ P
 		const serverLogEl = document.getElementById('admin-server-log');
 		if (serverLogEl && cardCanRender(serverLogEl)) {
 			const log = adminGetServerLog();
-			if (!log.length) setAdminHtmlIfChanged(serverLogEl, '<div class="admin-empty">No server events yet. Logins and disconnects will appear here.</div>');
-			else setAdminHtmlIfChanged(serverLogEl, log.slice(0, 200).map(item => {
+			if (serverLogEl.__adminLogSource === log && serverLogEl.childNodes.length > 0) {
+				// unchanged
+			} else if (!log.length) {
+				serverLogEl.__adminLogSource = log;
+				setAdminHtmlIfChanged(serverLogEl, '<div class="admin-empty">No server events yet. Logins and disconnects will appear here.</div>');
+			} else {
+				serverLogEl.__adminLogSource = log;
+				setAdminHtmlIfChanged(serverLogEl, log.slice(0, 200).map(item => {
 				const time = adminFormatLogTimestamp(item.time);
 				const userName = String(item.user || 'Server');
 				const detail = item.detail && typeof item.detail === 'object' ? item.detail : {};
@@ -34899,14 +35065,21 @@ P
 					? `<span class="admin-log-target-sep"><i class="fas fa-chevron-right"></i></span><b class="admin-log-user-link" onclick="event.stopPropagation(); adminOpenUserProfile('${encodeURIComponent(targetName)}')">${adminEscapeHtml(targetName)}</b>`
 					: '';
 				return `<div class="admin-log-item${msgId ? ' admin-log-jumpable' : ''}"${msgId ? ` onclick="adminJumpToReportedMessage('${adminEscapeAttr(msgId)}', 'Server Log')"` : ''}><div class="admin-log-head"><div class="admin-log-main"><span class="admin-server-log-type">${adminEscapeHtml(item.type || 'server')}</span>${userHtml}${targetHtml}</div><span class="admin-log-time">${adminEscapeHtml(time)}</span></div><div class="admin-log-message">${adminEscapeHtml(item.message || '')}</div></div>`;
-			}).join(''));
+				}).join(''));
+			}
 		}
 
 		const modLog = document.getElementById('admin-moderation-log');
 		if (modLog && cardCanRender(modLog)) {
 			const log = adminGetModerationLog();
-			if (!log.length) setAdminHtmlIfChanged(modLog, '<div class="admin-empty">No moderation actions logged yet.</div>');
-			else setAdminHtmlIfChanged(modLog, log.slice(0, 200).map(item => {
+			if (modLog.__adminLogSource === log && modLog.childNodes.length > 0) {
+				// unchanged
+			} else if (!log.length) {
+				modLog.__adminLogSource = log;
+				setAdminHtmlIfChanged(modLog, '<div class="admin-empty">No moderation actions logged yet.</div>');
+			} else {
+				modLog.__adminLogSource = log;
+				setAdminHtmlIfChanged(modLog, log.slice(0, 200).map(item => {
 				const time = adminFormatLogTimestamp(item.time);
 				const adminName = String(item.admin || 'Admin');
 				const detail = item.detail && typeof item.detail === 'object' ? item.detail : {};
@@ -34919,7 +35092,8 @@ P
 					? `<span class="admin-log-target-sep"><i class="fas fa-chevron-right"></i></span><b class="admin-log-user-link" onclick="event.stopPropagation(); adminOpenUserProfile('${encodeURIComponent(targetName)}')">${adminEscapeHtml(targetName)}</b>`
 					: '';
 				return `<div class="admin-log-item${msgId ? ' admin-log-jumpable' : ''}"${msgId ? ` onclick="adminJumpToReportedMessage('${adminEscapeAttr(msgId)}', 'Moderation Log')"` : ''}><div class="admin-log-head"><div class="admin-log-main"><span class="admin-log-type">${adminEscapeHtml(item.type || 'log')}</span>${adminHtml}${targetHtml}</div><span class="admin-log-time">${adminEscapeHtml(time)}</span></div><div class="admin-log-message">${adminEscapeHtml(item.message || '')}</div></div>`;
-			}).join(''));
+				}).join(''));
+			}
 		}
 
 		if (!visibleOnly) {
@@ -35275,7 +35449,7 @@ P
 		const startFilter = computed && computed.filter !== 'none' ? computed.filter : 'none';
 		const isExploreExit = currentView.id === 'view-explore';
 		const exitDuration = 160;
-		const endFilter = isExploreExit ? 'none' : 'blur(4px)';
+		const endFilter = (isExploreExit || currentView.id === 'view-admin') ? 'none' : 'blur(4px)';
 
 		currentView.classList.remove('anim-up', 'anim-out');
 
@@ -35547,8 +35721,11 @@ P
 		if (currentView) {
 			if (currentView.id !== viewId && !window.isRestoringHistory) {
 				if (currentView.id === 'view-admin') {
-					if (typeof adminResetPanelScrolls === 'function') adminResetPanelScrolls();
-					if (typeof adminResetBroadcastDraftState === 'function') adminResetBroadcastDraftState();
+					if (typeof adminCancelEntryHydration === 'function') adminCancelEntryHydration();
+					clearTimeout(window.adminUserSearchTimer);
+					clearTimeout(window.adminUsersRenderTimer);
+					window.adminUsersRenderTimer = null;
+					if (typeof adminScheduleExitCleanup === 'function') adminScheduleExitCleanup();
 				}
 				if (currentView.id === 'view-notifications' && typeof window.resetSocialFeedViewState === 'function') {
 					window.resetSocialFeedViewState('notifications');
@@ -48853,6 +49030,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
         window.__pendingOnlineCountText = '';
         currentOnlineList = [];
         window.currentOnlineList = currentOnlineList;
+        if (typeof window.adminInvalidateKnownUsersCache === 'function') window.adminInvalidateKnownUsersCache();
 
         const countElement = document.getElementById('online-count');
         if (countElement) window.setLiveCountText(countElement, '0 Online', 0);
@@ -58329,6 +58507,7 @@ function getVisibleChatStackEl(id) {
 			if (typeof forceCurrentAuthenticatedUserOnline === 'function') {
 				currentOnlineList = forceCurrentAuthenticatedUserOnline(currentOnlineList);
 				window.currentOnlineList = currentOnlineList;
+				if (typeof window.adminInvalidateKnownUsersCache === 'function') window.adminInvalidateKnownUsersCache();
 				const countElement = document.getElementById('online-count');
 				const activeUsersCount = currentOnlineList.filter(u => u && u.online === true).length;
 				if (countElement) window.setLiveCountText(countElement, `${activeUsersCount} Online`, activeUsersCount);
@@ -58767,6 +58946,7 @@ function getVisibleChatStackEl(id) {
 			
 			currentOnlineList = users;
 			window.currentOnlineList = users;
+			if (onlineSnapshotChanged && typeof window.adminInvalidateKnownUsersCache === 'function') window.adminInvalidateKnownUsersCache();
 			if (onlineSnapshotChanged && typeof invalidateChatMentionNameCaches === 'function') invalidateChatMentionNameCaches();
 			if (onlineSnapshotChanged && typeof window.syncPsnUserMeta === 'function') users.forEach(u => { if (u && changedPresenceNames.has(String(u.name || ''))) window.syncPsnUserMeta(u); });
 			if (onlineSnapshotChanged) users.forEach(u => {
@@ -58852,10 +59032,12 @@ function getVisibleChatStackEl(id) {
 			const total = Math.max(0, Number(payload && payload.total) || 0);
 			if (offset === 0) {
 				window.adminAllUsers = results;
+				if (typeof window.adminInvalidateKnownUsersCache === 'function') window.adminInvalidateKnownUsersCache();
 			} else {
 				const merged = new Map((Array.isArray(window.adminAllUsers) ? window.adminAllUsers : []).map(user => [String(user && user.name || '').toLowerCase(), user]));
 				results.forEach(user => { const key = String(user && user.name || '').toLowerCase(); if (key) merged.set(key, user); });
 				window.adminAllUsers = Array.from(merged.values());
+				if (typeof window.adminInvalidateKnownUsersCache === 'function') window.adminInvalidateKnownUsersCache();
 			}
 			window.adminUsersResultTotal = total;
 			if (payload && payload.countryStats && typeof payload.countryStats === 'object') window.adminCountryStats = payload.countryStats;
@@ -59989,6 +60171,7 @@ function getVisibleChatStackEl(id) {
 					currentOnlineList.splice(onlineIndex, 1);
 				}
 				window.currentOnlineList = currentOnlineList;
+				if (typeof window.adminInvalidateKnownUsersCache === 'function') window.adminInvalidateKnownUsersCache();
 				if (typeof invalidateChatMentionNameCaches === 'function') invalidateChatMentionNameCaches();
 
 				const mergePresence = list => {
@@ -63211,6 +63394,7 @@ function getVisibleChatStackEl(id) {
 		if (typeof forceCurrentAuthenticatedUserOnline === 'function') {
 			currentOnlineList = forceCurrentAuthenticatedUserOnline(currentOnlineList);
 			window.currentOnlineList = currentOnlineList;
+			if (typeof window.adminInvalidateKnownUsersCache === 'function') window.adminInvalidateKnownUsersCache();
 		}
 	
 		let activeUserCount = 0;
@@ -63256,6 +63440,7 @@ function getVisibleChatStackEl(id) {
 		if (typeof forceCurrentAuthenticatedUserOnline === 'function') {
 			currentOnlineList = forceCurrentAuthenticatedUserOnline(currentOnlineList);
 			window.currentOnlineList = currentOnlineList;
+			if (typeof window.adminInvalidateKnownUsersCache === 'function') window.adminInvalidateKnownUsersCache();
 		}
 		const friendNames = new Set();
 		for (const friend of (Array.isArray(window.friendsList) ? window.friendsList : [])) {
@@ -70321,17 +70506,12 @@ function getVisibleChatStackEl(id) {
     });
 	
 	document.addEventListener('animationend', (e) => {
-		if (['view-enter', 'explore-view-enter', 'online-view-enter'].includes(e.animationName)) {
-			const finishedAdminEntry = e.animationName === 'view-enter' && e.target.id === 'view-admin';
+		if (['view-enter', 'admin-view-enter', 'explore-view-enter', 'online-view-enter'].includes(e.animationName)) {
+			const finishedAdminEntry = e.animationName === 'admin-view-enter' && e.target.id === 'view-admin';
 			e.target.classList.remove('anim-up');
 			if (finishedAdminEntry) {
-				if (typeof adminSchedulePanelRender === 'function') adminSchedulePanelRender();
-				if (typeof socketChat !== 'undefined' && socketChat && socketChat.connected) {
-					socketChat.emit('admin_request_moderation_log');
-					if (typeof window.adminRequestChatControlsState === 'function') window.adminRequestChatControlsState();
-					if (typeof window.adminRequestReports === 'function') window.adminRequestReports(true);
-					if (typeof window.adminRequestUsersList === 'function') window.adminRequestUsersList(true, true);
-				}
+				if (typeof adminSchedulePanelRender === 'function') adminSchedulePanelRender(true);
+				if (typeof adminScheduleEntryHydration === 'function') adminScheduleEntryHydration();
 			}
 		}
 	});
