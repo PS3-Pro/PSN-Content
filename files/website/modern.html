@@ -28445,6 +28445,81 @@ P
         });
     };
 
+
+	function getGameModalSummarySkeletonHtml() {
+		return `
+			<span style="font-size: 10px; color: var(--text-muted); font-weight: bold; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px; display: block;"><i class="fas fa-align-left" style="margin-right: 4px;"></i> Summary</span>
+			<div class="pulse-skeleton" style="width: 100%; height: 14px; margin-bottom: 8px; border-radius: 2px;"></div>
+			<div class="pulse-skeleton" style="width: 95%; height: 14px; margin-bottom: 8px; border-radius: 2px;"></div>
+			<div class="pulse-skeleton" style="width: 40%; height: 14px; border-radius: 2px;"></div>
+		`;
+	}
+
+	function getGameModalBadgesSkeletonHtml() {
+		return `
+			<div class="rawg-alt2-panel rawg-alt2-loading">
+				<div class="rawg-alt2-top">
+					<div class="pulse-skeleton rawg-alt2-studio-skeleton"></div>
+					<div class="rawg-alt2-tagline">
+						<div class="pulse-skeleton rawg-chip-skeleton"></div>
+						<div class="pulse-skeleton rawg-chip-skeleton"></div>
+						<div class="pulse-skeleton rawg-chip-skeleton"></div>
+						<div class="pulse-skeleton rawg-chip-skeleton"></div>
+					</div>
+				</div>
+			</div>
+		`;
+	}
+
+	function getGameModalScreenshotsSkeletonHtml() {
+		return `
+			<div id="modal-screenshots-divider" class="modal-divider"></div>
+			<span style="font-size: 10px; color: var(--text-muted); font-weight: bold; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 6px;">
+				<i class="fas fa-camera" style="margin-right: 4px;"></i> Screenshots
+			</span>
+			<div class="carousel-wrapper" id="dynamic-carousel-wrapper">
+				<button class="scroll-arrow left-arrow" onmouseenter="playUiArrow()" onclick="moveModalScroll(-1)"><i class="fas fa-chevron-left"></i></button>
+				<div class="horizontal-scroll" id="modal-screenshots" style="height: 113px; min-height: 113px; padding: 0; margin: 0;">
+					<div class="pulse-skeleton modal-screenshot-skeleton"></div>
+					<div class="pulse-skeleton modal-screenshot-skeleton"></div>
+					<div class="pulse-skeleton modal-screenshot-skeleton"></div>
+				</div>
+				<button class="scroll-arrow right-arrow" onmouseenter="playUiArrow()" onclick="moveModalScroll(1)"><i class="fas fa-chevron-right"></i></button>
+			</div>
+		`;
+	}
+
+	function primeGameModalMetadataLoadingUi(modalRoot = document.getElementById('game-modal'), options = {}) {
+		if (!modalRoot) return;
+		const summaryContainer = modalRoot.querySelector('#modal-summary');
+		const badgesContainer = modalRoot.querySelector('#modal-badges');
+		const extraMetaContainer = modalRoot.querySelector('#modal-extra-meta');
+		const screenshotsWrapper = modalRoot.querySelector('#modal-screenshots-wrapper');
+		if (summaryContainer) summaryContainer.innerHTML = getGameModalSummarySkeletonHtml();
+		if (badgesContainer) {
+			badgesContainer.classList.add('rawg-badge-row');
+			badgesContainer.innerHTML = getGameModalBadgesSkeletonHtml();
+		}
+		if (extraMetaContainer) extraMetaContainer.innerHTML = '';
+		if (options.screenshots !== false && screenshotsWrapper) {
+			const oldScreenshots = screenshotsWrapper.querySelector('#modal-screenshots');
+			if (oldScreenshots) disarmModalScreenshotSkeletonSizing(oldScreenshots);
+			screenshotsWrapper.style.display = 'flex';
+			screenshotsWrapper.innerHTML = getGameModalScreenshotsSkeletonHtml();
+			const screenshots = screenshotsWrapper.querySelector('#modal-screenshots');
+			if (screenshots) armModalScreenshotSkeletonSizing(screenshots);
+		}
+	}
+
+	function isCurrentGameModalHydration(modalRoot, token, game, category) {
+		if (!modalRoot || !modalRoot.isConnected) return false;
+		if (String(modalRoot.dataset.openHydrationToken || '') !== String(token || '')) return false;
+		if (String(modalRoot.dataset.storeCategory || '') !== String(category || '')) return false;
+		if (String(modalRoot.dataset.titleId || '') !== String((game && (game.id || game.titleId)) || '')) return false;
+		if (String(modalRoot.dataset.contentId || '') !== String((game && game.contentId) || '')) return false;
+		return true;
+	}
+
     window.openModal = function(index, forcedPsnStoreSummary = '', forceCompactDlc = false, originCard = null, modalOptions = null) {
 		if (typeof playUiModal === 'function') playUiModal();
 	
@@ -28458,12 +28533,17 @@ P
 		const modalBody = modal.querySelector('.sys-modal-body');
 		const modalHeader = modal.querySelector('.sys-modal-header h2');
 		
+		let hydrationToken = '';
 		if (modal && game) {
-			modal.dataset.titleId = game.id || '';
+			modal.dataset.titleId = game.id || game.titleId || '';
 			modal.dataset.contentId = game.contentId || '';
 			modal.dataset.storeCategory = currentCat || '';
 			modal.dataset.modalIndex = String(index);
+			hydrationToken = `${Date.now()}|${currentCat}|${String(game.id || game.titleId || '')}|${String(game.contentId || '')}|${Math.random().toString(36).slice(2, 7)}`;
+			modal.dataset.openHydrationToken = hydrationToken;
 		}
+		// Keep the old first-paint behavior: the accent is resolved before the modal is shown,
+		// so no border/glow appears one frame late.
 		if (modal && game && typeof window.syncGameModalTileAccent === 'function') window.syncGameModalTileAccent(originCard, game, currentCat);
 		
 		let iconClass = 'fas fa-gamepad';
@@ -28681,7 +28761,10 @@ P
 					});
 				}
 			} else {
-				fetchGameSummary(game.cleanName, game.id, game.contentId || '', game.region || '');
+				// First-paint parity: build the complete loading state and let cached/local metadata
+				// resolve before the modal is shown. Network continuations remain asynchronous.
+				primeGameModalMetadataLoadingUi(modal, { screenshots: true });
+				fetchGameSummary(game.cleanName, game.id || game.titleId || '', game.contentId || '', game.region || '', { prepared: true, requestToken: hydrationToken });
 				if (showModalTrophies) updateModalTrophyStatus(game, currentCat);
 			}
 		} else {
@@ -28747,8 +28830,11 @@ P
 		if (typeof window.scheduleInterfaceTranslationAfterUiChange === 'function') window.scheduleInterfaceTranslationAfterUiChange(modal);
 		requestAnimationFrame(() => {
 			requestAnimationFrame(() => {
+				if (!isCurrentGameModalHydration(modal, hydrationToken, game, currentCat)) return;
 				modal.classList.add('show');
-				if (shouldRecordRecentlyVisited) setTimeout(() => window.recordRecentlyVisitedGame(game, currentCat), 450);
+				if (shouldRecordRecentlyVisited) setTimeout(() => {
+					if (isCurrentGameModalHydration(modal, hydrationToken, game, currentCat)) window.recordRecentlyVisitedGame(game, currentCat);
+				}, 450);
 			});
 		});
 	}
@@ -28763,6 +28849,7 @@ P
 			if (options.silent !== true && typeof playUiBack === 'function') playUiBack();
 			modal.classList.remove('show');
 			delete modal.dataset.gamePlayersToken;
+			delete modal.dataset.openHydrationToken;
 			modalTrophyLookupToken++;
 	
 			setTimeout(() => {
@@ -29069,11 +29156,20 @@ P
 		}
 	}
 
-	window.fetchGameSummary = async function(gameName, gameId, contentId = '', region = '') {
+	window.fetchGameSummary = async function(gameName, gameId, contentId = '', region = '', options = {}) {
 		const summaryContainer = document.getElementById('modal-summary');
 		const screenshotsWrapper = document.getElementById('modal-screenshots-wrapper');
 		const badgesContainer = document.getElementById('modal-badges');
 		const modalRoot = document.getElementById('game-modal');
+		const requestToken = String((options && options.requestToken) || '');
+		const isCurrentRequest = () => !requestToken || (
+			modalRoot &&
+			modalRoot.isConnected &&
+			String(modalRoot.dataset.openHydrationToken || '') === requestToken &&
+			String(modalRoot.dataset.titleId || '') === String(gameId || '') &&
+			String(modalRoot.dataset.contentId || '') === String(contentId || '')
+		);
+		if (!isCurrentRequest()) return;
 		if (modalRoot) setGameModalNoScreenshots(modalRoot, false);
 
 		const extraMetaContainer = document.getElementById('modal-extra-meta');
@@ -29119,6 +29215,7 @@ P
 		const buildRawgChip = (label, icon, className = '') => `<span class="rawg-chip ${className}"><i class="fas ${icon}"></i>${modalSafeText(label)}</span>`;
 
 		const renderRawgExtraMeta = (detailsData = {}, badgeHtml = '') => {
+			if (!isCurrentRequest()) return;
 			if (extraMetaContainer) extraMetaContainer.innerHTML = '';
 			if (!badgesContainer) return;
 			const extra = getRawgExtraData(detailsData);
@@ -29143,6 +29240,7 @@ P
 		};
 
 		const renderPsnStoreExtraMeta = (psnStoreData = null) => {
+			if (!isCurrentRequest()) return false;
 			if (!badgesContainer || !window.extractPsnStoreProductMeta) return false;
 			const psnMeta = window.extractPsnStoreProductMeta(psnStoreData);
 			if (!psnMeta.provider && !psnMeta.releaseYear) return false;
@@ -29157,51 +29255,10 @@ P
 			return true;
 		};
 	
-		if (badgesContainer) {
-			badgesContainer.classList.add('rawg-badge-row');
-			badgesContainer.innerHTML = `
-				<div class="rawg-alt2-panel rawg-alt2-loading">
-					<div class="rawg-alt2-top">
-						<div class="pulse-skeleton rawg-alt2-studio-skeleton"></div>
-						<div class="rawg-alt2-tagline">
-							<div class="pulse-skeleton rawg-chip-skeleton"></div>
-							<div class="pulse-skeleton rawg-chip-skeleton"></div>
-							<div class="pulse-skeleton rawg-chip-skeleton"></div>
-							<div class="pulse-skeleton rawg-chip-skeleton"></div>
-						</div>
-					</div>
-				</div>
-			`;
+		if (!(options && options.prepared === true)) {
+			primeGameModalMetadataLoadingUi(modalRoot, { screenshots: true });
 		}
-		if (extraMetaContainer) extraMetaContainer.innerHTML = '';
-		
-		summaryContainer.innerHTML = `
-			<span style="font-size: 10px; color: var(--text-muted); font-weight: bold; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px; display: block;"><i class="fas fa-align-left" style="margin-right: 4px;"></i> Summary</span>
-			<div class="pulse-skeleton" style="width: 100%; height: 14px; margin-bottom: 8px; border-radius: 2px;"></div>
-			<div class="pulse-skeleton" style="width: 95%; height: 14px; margin-bottom: 8px; border-radius: 2px;"></div>
-			<div class="pulse-skeleton" style="width: 40%; height: 14px; border-radius: 2px;"></div>
-		`;
-	
-		if (screenshotsWrapper) {
-			screenshotsWrapper.style.display = 'flex';
-			disarmModalScreenshotSkeletonSizing(screenshotsWrapper.querySelector('#modal-screenshots'));
-			
-			screenshotsWrapper.innerHTML = `
-				<div id="modal-screenshots-divider" class="modal-divider"></div>
-				<span style="font-size: 10px; color: var(--text-muted); font-weight: bold; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 6px;">
-					<i class="fas fa-camera" style="margin-right: 4px;"></i> Screenshots
-				</span>
-				<div class="carousel-wrapper" id="dynamic-carousel-wrapper"> <button class="scroll-arrow left-arrow" onmouseenter="playUiArrow()" onclick="moveModalScroll(-1)"><i class="fas fa-chevron-left"></i></button>
-					<div class="horizontal-scroll" id="modal-screenshots" style="height: 113px; min-height: 113px; padding: 0; margin: 0;">
-						<div class="pulse-skeleton modal-screenshot-skeleton"></div>
-						<div class="pulse-skeleton modal-screenshot-skeleton"></div>
-						<div class="pulse-skeleton modal-screenshot-skeleton"></div>
-					</div>
-					<button class="scroll-arrow right-arrow" onmouseenter="playUiArrow()" onclick="moveModalScroll(1)"><i class="fas fa-chevron-right"></i></button>
-				</div>
-			`;
-			armModalScreenshotSkeletonSizing(screenshotsWrapper.querySelector('#modal-screenshots'));
-		}
+		if (!isCurrentRequest()) return;
 		
 		const fetchWithTimeout = async (url, ms = 3500, options = {}) => {
 			const controller = new AbortController();
@@ -29237,6 +29294,7 @@ P
 		let hasPsnStoreMeta = false;
 		try {
 			const psnStoreData = await window.fetchPsnStoreMetadata(gameId, contentId, region);
+			if (!isCurrentRequest()) return;
 			psnStoreSummary = window.extractPsnStoreDescription ? window.extractPsnStoreDescription(psnStoreData) : window.cleanPsnStoreDescription(psnStoreData?.long_desc || psnStoreData?.short_desc || '');
 			psnStoreMeta = window.extractPsnStoreProductMeta ? window.extractPsnStoreProductMeta(psnStoreData) : psnStoreMeta;
 			hasPsnStoreMeta = renderPsnStoreExtraMeta(psnStoreData);
@@ -29296,6 +29354,7 @@ P
 		const renderMergedMetadata = () => renderRawgExtraMeta(mergedMetadata, buildMergedBadgeHtml());
 		let renderedScreenshotUrls = [];
 		const renderExternalScreenshots = (imageUrls = []) => {
+			if (!isCurrentRequest()) return false;
 			const incomingImages = Array.from(new Set((Array.isArray(imageUrls) ? imageUrls : []).map(url => String(url || '').trim()).filter(Boolean)));
 			if (!scrContainer || !incomingImages.length) return false;
 
@@ -29329,6 +29388,7 @@ P
 		};
 
 		const renderExternalMetadata = (detailsData = {}, imageUrls = [], options = {}) => {
+			if (!isCurrentRequest()) return false;
 			const renderedScreenshots = renderExternalScreenshots(imageUrls);
 			if (options.metadata === false) return renderedScreenshots;
 			const metadataChanged = mergeMetadataDetails(detailsData);
@@ -29345,6 +29405,7 @@ P
 
 		rawgSearchLoop:
 		for (const searchSpec of metadataSearchSpecs) {
+			if (!isCurrentRequest()) return;
 			for (let attempt = 0; attempt < RAWG_KEYS.length; attempt++) {
 				const activeKey = RAWG_KEYS[currentRawgKeyIndex];
 				try {
@@ -29390,6 +29451,7 @@ P
 
 		igdbSearchLoop:
 		for (const searchSpec of metadataSearchSpecs) {
+			if (!isCurrentRequest()) return;
 			try {
 				const igdbHeaders = {};
 				if (IGDB_CLIENT_ID && IGDB_CLIENT_SECRET) {
@@ -29422,6 +29484,7 @@ P
 
 		steamSearchLoop:
 		for (const searchSpec of metadataSearchSpecs) {
+			if (!isCurrentRequest()) return;
 			try {
 				const response = await fetchMetadataProxy(`/api/metadata/steam/search?q=${encodeURIComponent(searchSpec.query)}`, 6500);
 				let data = {};
@@ -29479,6 +29542,7 @@ P
 			} catch (error) {}
 		}
 
+		if (!isCurrentRequest()) return;
 		if (!psnStoreSummary && !externalSummaryResolved) summaryContainer.innerHTML = summaryTitleHtml + 'No description available.';
 		if (badgesContainer && !hasPsnStoreMeta && !externalMetadataResolved) { badgesContainer.innerHTML = ''; badgesContainer.classList.remove('rawg-badge-row'); }
 		if (extraMetaContainer && !externalMetadataResolved) extraMetaContainer.innerHTML = '';
@@ -37187,6 +37251,7 @@ P
 		}
 	
 		scheduleNavigationLightsUpdate({ sidebar: true, profile: true, nav: true });
+        if (typeof window.syncBrowseToolbarScrollState === 'function') window.syncBrowseToolbarScrollState(viewId, true);
         if (typeof window.updateScrollButtonsVisibility === 'function') window.updateScrollButtonsVisibility(true);
 		if (typeof window.adminSyncBackgroundTimers === 'function') window.adminSyncBackgroundTimers();
 		if (typeof window.syncRevivedPlayersOnlineUpdates === 'function') window.syncRevivedPlayersOnlineUpdates();
@@ -37316,26 +37381,69 @@ P
         });
     };
 
+    /* MAIN SCROLL HOT PATH: only views that actually consume main-scroll work should wake JS.
+       Explore normally virtualizes with IntersectionObserver, so it does not need a RAF on every
+       vertical scroll. Chat/Settings/Admin/etc. have no work here at all. */
     const browseToolbars = Array.from(document.querySelectorAll('.browse-toolbar'));
-    let lastBrowseToolbarScrolled = null;
+    const browseToolbarsByView = new Map();
+    browseToolbars.forEach(toolbar => {
+        const ownerView = toolbar.closest('.view-section');
+        if (!ownerView || !ownerView.id) return;
+        if (!browseToolbarsByView.has(ownerView.id)) browseToolbarsByView.set(ownerView.id, []);
+        browseToolbarsByView.get(ownerView.id).push(toolbar);
+    });
+    const scrollButtonMainViewIds = new Set(['view-browse', 'view-wishlist', 'view-downloads', 'view-library']);
+    const browseToolbarScrollState = new Map();
+
+    function getMainScrollActiveViewId() {
+        const cached = psnCurrentViewCache;
+        if (cached && cached.isConnected && cached.style.display !== 'none') return cached.id || '';
+        const current = typeof getCurrentPsnViewElement === 'function' ? getCurrentPsnViewElement() : null;
+        return current?.id || '';
+    }
+
+    function syncBrowseToolbarScrollState(viewId = getMainScrollActiveViewId(), force = false) {
+        const toolbars = browseToolbarsByView.get(viewId);
+        if (!toolbars || !toolbars.length || !scrollArea) return false;
+        const scrolled = scrollArea.scrollTop > 90;
+        if (!force && browseToolbarScrollState.get(viewId) === scrolled) return false;
+        browseToolbarScrollState.set(viewId, scrolled);
+        toolbars.forEach(toolbar => {
+            if (toolbar.classList.contains('scrolled') !== scrolled) toolbar.classList.toggle('scrolled', scrolled);
+        });
+        return true;
+    }
+    window.syncBrowseToolbarScrollState = syncBrowseToolbarScrollState;
+
     let scrollUiFrame = 0;
     scrollArea.addEventListener("scroll", () => {
+        const activeViewId = getMainScrollActiveViewId();
+        const hasToolbarWork = browseToolbarsByView.has(activeViewId);
+        const canHaveScrollButtons = scrollButtonMainViewIds.has(activeViewId);
+        const needsExploreFallback = activeViewId === 'view-explore'
+            && (typeof isExploreVirtualViewportObserverActive !== 'function' || !isExploreVirtualViewportObserverActive())
+            && typeof refreshExploreVirtualCarousels === 'function';
+
+        /* Common path: no toolbar, no floating collection buttons and Explore has its IO observer.
+           Return before scheduling a frame. */
+        if (!hasToolbarWork && !canHaveScrollButtons && !needsExploreFallback) return;
         if (scrollUiFrame) return;
         scrollUiFrame = requestAnimationFrame(() => {
             scrollUiFrame = 0;
-            const scrolled = scrollArea.scrollTop > 90;
-            if (scrolled !== lastBrowseToolbarScrolled) {
-                lastBrowseToolbarScrolled = scrolled;
-                browseToolbars.forEach(tb => {
-                    if (tb.classList.contains('scrolled') !== scrolled) tb.classList.toggle('scrolled', scrolled);
-                });
+            const currentViewId = getMainScrollActiveViewId();
+            if (browseToolbarsByView.has(currentViewId)) syncBrowseToolbarScrollState(currentViewId);
+
+            if (scrollButtonMainViewIds.has(currentViewId) && isScrollButtonRelevantViewVisible()) {
+                if (scrollButtonsVisibilityFrame) {
+                    cancelAnimationFrame(scrollButtonsVisibilityFrame);
+                    scrollButtonsVisibilityFrame = 0;
+                }
+                applyScrollButtonsVisibility();
             }
-            if (scrollButtonsVisibilityFrame) {
-                cancelAnimationFrame(scrollButtonsVisibilityFrame);
-                scrollButtonsVisibilityFrame = 0;
-            }
-            if (isScrollButtonRelevantViewVisible()) applyScrollButtonsVisibility();
-            if ((typeof isExploreVirtualViewportObserverActive !== 'function' || !isExploreVirtualViewportObserverActive()) && typeof refreshExploreVirtualCarousels === 'function') {
+
+            if (currentViewId === 'view-explore'
+                && (typeof isExploreVirtualViewportObserverActive !== 'function' || !isExploreVirtualViewportObserverActive())
+                && typeof refreshExploreVirtualCarousels === 'function') {
                 refreshExploreVirtualCarousels(false);
             }
         });
