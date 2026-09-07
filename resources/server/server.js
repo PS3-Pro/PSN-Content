@@ -934,6 +934,8 @@ let adminStateRefreshInFlight = null;
 let adminStateConnectionLimitWarnedAt = 0;
 let serverLogFallbackRefreshAt = 0;
 const SERVER_LOG_FALLBACK_REFRESH_MS = 120000;
+const MODERATION_LOG_HISTORY_MAX = 200;
+const SERVER_LOG_HISTORY_MAX = 200;
 
 async function refreshAdminStateFromDb() {
   try {
@@ -973,7 +975,7 @@ async function refreshAdminStateThrottled(maxAgeMs = 3000) {
 
 async function refreshModerationLogFromDb() {
   try {
-    const modLogRes = await pool.query('SELECT entry FROM moderation_log ORDER BY created_at DESC LIMIT 100');
+    const modLogRes = await pool.query(`SELECT entry FROM moderation_log ORDER BY created_at DESC LIMIT ${MODERATION_LOG_HISTORY_MAX}`);
     moderationLog = modLogRes.rows.map(r => r.entry);
   } catch (err) {
     console.error('[ADMIN LOG REFRESH ERROR]:', err);
@@ -983,7 +985,7 @@ async function refreshModerationLogFromDb() {
 
 async function refreshServerLogFromDb() {
   try {
-    const logRes = await pool.query('SELECT entry FROM server_log ORDER BY created_at DESC LIMIT 120');
+    const logRes = await pool.query(`SELECT entry FROM server_log ORDER BY created_at DESC LIMIT ${SERVER_LOG_HISTORY_MAX}`);
     serverLog = logRes.rows.map(r => r.entry);
   } catch (err) {
     console.error('[SERVER LOG REFRESH ERROR]:', err);
@@ -1228,10 +1230,10 @@ async function initDb() {
   const reportsRes = await queryDbWithRetry('SELECT data FROM reports WHERE resolved = false ORDER BY created_at DESC LIMIT 100', [], { attempts: 2, label: 'REPORTS READ' });
   adminReports = reportsRes.rows.map(r => r.data);
 
-  const modLogRes = await pool.query('SELECT entry FROM moderation_log ORDER BY created_at DESC LIMIT 100');
+  const modLogRes = await pool.query(`SELECT entry FROM moderation_log ORDER BY created_at DESC LIMIT ${MODERATION_LOG_HISTORY_MAX}`);
   moderationLog = modLogRes.rows.map(r => r.entry);
 
-  const serverLogRes = await pool.query('SELECT entry FROM server_log ORDER BY created_at DESC LIMIT 120');
+  const serverLogRes = await pool.query(`SELECT entry FROM server_log ORDER BY created_at DESC LIMIT ${SERVER_LOG_HISTORY_MAX}`);
   serverLog = serverLogRes.rows.map(r => r.entry);
 
   console.log(`[DB] Database initialized. ${messageHistory.length} messages, ${pinnedMessages.length} pins, ${Object.keys(userDatabase).length} users loaded.`);
@@ -5516,7 +5518,7 @@ async function addModerationLog(type, message, detail = {}, admin = "System") {
   };
 
   moderationLog.unshift(entry);
-  moderationLog = moderationLog.slice(0, 100);
+  moderationLog = moderationLog.slice(0, MODERATION_LOG_HISTORY_MAX);
 
   try {
     await pool.query('INSERT INTO moderation_log (entry) VALUES ($1)', [entry]);
@@ -5540,7 +5542,7 @@ async function addServerLog(type, message, detail = {}, user = "Server") {
   };
 
   serverLog.unshift(entry);
-  serverLog = serverLog.slice(0, 120);
+  serverLog = serverLog.slice(0, SERVER_LOG_HISTORY_MAX);
 
   try {
     await pool.query('INSERT INTO server_log (entry) VALUES ($1)', [entry]);
@@ -6013,7 +6015,7 @@ async function initProfileSyncNotifications() {
         if (!entry || !entry.id) return;
         if (serverLog.some(existing => existing && existing.id === entry.id)) return;
         serverLog.unshift(entry);
-        serverLog = serverLog.slice(0, 120);
+        serverLog = serverLog.slice(0, SERVER_LOG_HISTORY_MAX);
         emitToAdmins('admin_server_log', entry);
         return;
       }

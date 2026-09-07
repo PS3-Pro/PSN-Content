@@ -24550,7 +24550,6 @@ P
 
 		window.contentDownloadCounts = counts;
 		window.contentDownloadCountsReady = true;
-		try { localStorage.removeItem(CONTENT_DOWNLOAD_COUNTS_CACHE_KEY); } catch (err) {}
 		if (changedKeys.length === 0) return false;
 		const requestedKeys = Array.isArray(options.onlyKeys) ? options.onlyKeys.filter(key => changedKeys.includes(key)) : changedKeys;
 		window.applyContentDownloadCountsToCards(document, { keys: requestedKeys, animate: options.animate === true });
@@ -29118,18 +29117,7 @@ P
                 delete window.__gamePlayersLiveRefreshTimers[titleId];
                 requestGamePlayers({ mode: 'summary', titleId }, response => {
                     if (!response || response.ok !== true || normalizeGamePlayersTitleId(response.titleId) !== titleId) return;
-                    const summary = {
-                        count: Math.max(0, Number(response.count) || 0),
-                        friendCount: Math.max(0, Number(response.friendCount) || 0),
-                        otherCount: Math.max(0, Number(response.otherCount) || 0),
-                        playTogetherCount: Math.max(0, Number(response.playTogetherCount) || 0),
-                        playTogetherFriendCount: Math.max(0, Number(response.playTogetherFriendCount) || 0),
-                        playTogetherOwnerCount: Math.max(0, Number(response.playTogetherOwnerCount) || 0),
-                        playTogetherOwnerFriendCount: Math.max(0, Number(response.playTogetherOwnerFriendCount) || 0),
-                        viewerOwns: response.viewerOwns === true,
-                        viewerPlayTogether: response.viewerPlayTogether === true,
-                        preview: Array.isArray(response.preview) ? response.preview : []
-                    };
+                    const summary = normalizeGamePlayersMutationSummary(response);
                     setGamePlayersSummaryCacheEntry(titleId, summary);
                     const currentGameModal = document.getElementById('game-modal');
                     if (currentGameModal && currentGameModal.classList.contains('show') && normalizeGamePlayersTitleId(currentGameModal.dataset.titleId) === titleId) {
@@ -29276,18 +29264,7 @@ P
         requestGamePlayers({ mode: 'summary', titleId }, response => {
             if (!modalRoot.isConnected || modalRoot.dataset.gamePlayersToken !== requestToken) return;
             if (!response || response.ok !== true || normalizeGamePlayersTitleId(response.titleId) !== titleId) return;
-            const summary = {
-                count: Math.max(0, Number(response.count) || 0),
-                friendCount: Math.max(0, Number(response.friendCount) || 0),
-                otherCount: Math.max(0, Number(response.otherCount) || 0),
-                playTogetherCount: Math.max(0, Number(response.playTogetherCount) || 0),
-                playTogetherFriendCount: Math.max(0, Number(response.playTogetherFriendCount) || 0),
-                playTogetherOwnerCount: Math.max(0, Number(response.playTogetherOwnerCount) || 0),
-                playTogetherOwnerFriendCount: Math.max(0, Number(response.playTogetherOwnerFriendCount) || 0),
-                viewerOwns: response.viewerOwns === true,
-                viewerPlayTogether: response.viewerPlayTogether === true,
-                preview: Array.isArray(response.preview) ? response.preview : []
-            };
+            const summary = normalizeGamePlayersMutationSummary(response);
             setGamePlayersSummaryCacheEntry(titleId, summary);
             renderGamePlayersPill(modalRoot, titleId, gameTitle, summary);
         });
@@ -34520,6 +34497,7 @@ P
 		if (typeof playUiSuccess === 'function') playUiSuccess();
 	}
 
+	const ADMIN_MODERATION_LOG_MAX = 200;
 	let adminModerationLogCacheRaw = null;
 	let adminModerationLogCache = [];
 	function adminGetModerationLog() {
@@ -34531,7 +34509,7 @@ P
 	}
 
 	function adminSetModerationLog(log) {
-		const clean = Array.isArray(log) ? log.filter(Boolean).slice(0, 100) : [];
+		const clean = Array.isArray(log) ? log.filter(Boolean).slice(0, ADMIN_MODERATION_LOG_MAX) : [];
 		const raw = JSON.stringify(clean);
 		adminModerationLogCacheRaw = raw;
 		adminModerationLogCache = clean;
@@ -34567,6 +34545,7 @@ P
 	}
 
 
+	const ADMIN_SERVER_LOG_MAX = 200;
 	let adminServerLogCacheRaw = null;
 	let adminServerLogCache = [];
 	function adminGetServerLog() {
@@ -34578,7 +34557,7 @@ P
 	}
 
 	function adminSetServerLog(log = []) {
-		const clean = Array.isArray(log) ? log.filter(Boolean).slice(0, 120) : [];
+		const clean = Array.isArray(log) ? log.filter(Boolean).slice(0, ADMIN_SERVER_LOG_MAX) : [];
 		const raw = JSON.stringify(clean);
 		adminServerLogCacheRaw = raw;
 		adminServerLogCache = clean;
@@ -37191,7 +37170,7 @@ P
 				setAdminHtmlIfChanged(serverLogEl, '<div class="admin-empty">No server events yet. Logins and disconnects will appear here.</div>');
 			} else {
 				serverLogEl.__adminLogSource = log;
-				setAdminHtmlIfChanged(serverLogEl, log.slice(0, 200).map(item => {
+				setAdminHtmlIfChanged(serverLogEl, log.slice(0, ADMIN_SERVER_LOG_MAX).map(item => {
 				const time = adminFormatLogTimestamp(item.time);
 				const userName = String(item.user || 'Server');
 				const detail = item.detail && typeof item.detail === 'object' ? item.detail : {};
@@ -37218,7 +37197,7 @@ P
 				setAdminHtmlIfChanged(modLog, '<div class="admin-empty">No moderation actions logged yet.</div>');
 			} else {
 				modLog.__adminLogSource = log;
-				setAdminHtmlIfChanged(modLog, log.slice(0, 200).map(item => {
+				setAdminHtmlIfChanged(modLog, log.slice(0, ADMIN_MODERATION_LOG_MAX).map(item => {
 				const time = adminFormatLogTimestamp(item.time);
 				const adminName = String(item.admin || 'Admin');
 				const detail = item.detail && typeof item.detail === 'object' ? item.detail : {};
@@ -37304,7 +37283,7 @@ P
 		socketChat.io?.on?.('reconnect_attempt', () => syncAdminHealth('connecting'));
 		socketChat.io?.on?.('reconnect', () => syncAdminHealth('online'));
 		socketChat.on('admin_server_log_list', list => {
-			const nextList = Array.isArray(list) ? list.filter(Boolean).slice(0, 120) : [];
+			const nextList = Array.isArray(list) ? list.filter(Boolean).slice(0, ADMIN_SERVER_LOG_MAX) : [];
 			const previousList = adminGetServerLog();
 			const unchanged = typeof window.getLiveRenderSignature === 'function' ? window.getLiveRenderSignature(previousList) === window.getLiveRenderSignature(nextList) : JSON.stringify(previousList) === JSON.stringify(nextList);
 			if (unchanged) return;
@@ -37367,7 +37346,7 @@ P
 				if (!samePinned) { adminSetPinnedAnnouncementState(nextPinned, false); changed = true; }
 			}
 			if (Array.isArray(data.serverLog)) {
-				const nextServerLog = data.serverLog.filter(Boolean).slice(0, 120);
+				const nextServerLog = data.serverLog.filter(Boolean).slice(0, ADMIN_SERVER_LOG_MAX);
 				const currentServerLog = adminGetServerLog();
 				const sameLog = (typeof window.getLiveRenderSignature === 'function' ? window.getLiveRenderSignature(currentServerLog) === window.getLiveRenderSignature(nextServerLog) : JSON.stringify(currentServerLog) === JSON.stringify(nextServerLog));
 				if (!sameLog) { adminSetServerLog(nextServerLog); changed = true; }
@@ -37406,7 +37385,7 @@ P
 			if (item) adminAddLog(item.type || 'server', item.message || 'Server moderation event', item.detail || {}, item);
 		});
 		socketChat.on('admin_moderation_log_list', list => {
-			const nextList = Array.isArray(list) ? list.filter(Boolean).slice(0, 100) : [];
+			const nextList = Array.isArray(list) ? list.filter(Boolean).slice(0, ADMIN_MODERATION_LOG_MAX) : [];
 			const previousList = adminGetModerationLog();
 			const unchanged = typeof window.getLiveRenderSignature === 'function' ? window.getLiveRenderSignature(previousList) === window.getLiveRenderSignature(nextList) : JSON.stringify(previousList) === JSON.stringify(nextList);
 			if (unchanged) return;
@@ -44043,6 +44022,13 @@ P
 	
 				lastScannedGames = mergedGames;
 				window.lastScannedGames = lastScannedGames;
+				/* A successful webMAN scan is authoritative for installed paths. Keep favorite paths too,
+				   but release cover metadata for games that are neither installed nor favorited anymore. */
+				if (window.libCoverCache && typeof window.libCoverCache === 'object') {
+					const liveLibraryCoverPaths = new Set(mergedGames.map(game => String(game && game.path || '')).filter(Boolean));
+					(Array.isArray(favoritesLibrary) ? favoritesLibrary : []).forEach(game => { const path = String(game && game.path || ''); if (path) liveLibraryCoverPaths.add(path); });
+					Object.keys(window.libCoverCache).forEach(path => { if (!liveLibraryCoverPaths.has(path)) delete window.libCoverCache[path]; });
+				}
 				if (typeof window.bumpLibraryCollectionRevision === 'function') window.bumpLibraryCollectionRevision('library');
 				if (typeof window.refreshStoreInstalledChecks === 'function') window.refreshStoreInstalledChecks();
 				shouldRepaintLocalLibrary = previousSignature !== getLocalLibraryDataSignature(lastScannedGames);
@@ -50825,7 +50811,9 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 		const daysCount = accessedDays.length;
 		const hour = new Date().getHours();
 	
+		if (window.dailyTrophyDelay) clearTimeout(window.dailyTrophyDelay);
 		window.dailyTrophyDelay = setTimeout(() => {
+			window.dailyTrophyDelay = null;
 			const currentUser = localStorage.getItem('psn_username');
 			if (currentUser !== expectedUser) return;
 
@@ -51573,6 +51561,13 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 			window.__chatSeenScanSignature = seenScanSignature;
 			window.__chatSeenEmitPending = window.__chatSeenEmitPending instanceof Map ? window.__chatSeenEmitPending : new Map();
 			const now = Date.now();
+			/* Entries only suppress duplicate mark_as_read emits for 5 seconds. Drop expired keys
+			   before the next history scan so messages that already rolled out of the 1000-item
+			   window cannot leave dead msgIds retained for the rest of the session. */
+			for (const [pendingKey, pendingValue] of window.__chatSeenEmitPending) {
+				const pendingAt = Number(pendingValue || 0);
+				if (!pendingAt || now - pendingAt >= 5000) window.__chatSeenEmitPending.delete(pendingKey);
+			}
 			for (let i = 0; i < history.length; i++) {
 				const m = history[i];
 				if (!m || m.user === myName) continue;
@@ -54567,6 +54562,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 	
 		const observer = new IntersectionObserver((entries) => {
 			if (entries[0].isIntersecting) {
+				observer.disconnect();
 				setTimeout(() => {
 					if (divider) {
 						const currentHeight = divider.scrollHeight + "px";
@@ -59571,6 +59567,33 @@ function getVisibleChatStackEl(id) {
 		return Array.isArray(list) ? list.slice() : [];
 	}
 
+	function deleteChatAuxMessageCaches(msgId, preservePinned = false) {
+		const key = String(msgId || '');
+		if (!key || (preservePinned && typeof isChatMessagePinnedFast === 'function' && isChatMessagePinnedFast(key))) return false;
+		let changed = false;
+		if (window.chatTranslationCache && Object.prototype.hasOwnProperty.call(window.chatTranslationCache, key)) {
+			delete window.chatTranslationCache[key];
+			changed = true;
+		}
+		if (window.__chatImageGroups && Object.prototype.hasOwnProperty.call(window.__chatImageGroups, key)) {
+			delete window.__chatImageGroups[key];
+			changed = true;
+		}
+		return changed;
+	}
+
+	function pruneChatAuxMessageCaches() {
+		const keepIds = new Set(window.__chatPinnedIdSet instanceof Set ? window.__chatPinnedIdSet : []);
+		(Array.isArray(window.messageHistory) ? window.messageHistory : []).forEach(msg => {
+			const key = typeof getChatIndexedMessageKey === 'function' ? getChatIndexedMessageKey(msg) : '';
+			if (key) keepIds.add(String(key));
+		});
+		[window.chatTranslationCache, window.__chatImageGroups].forEach(cache => {
+			if (!cache || typeof cache !== 'object') return;
+			Object.keys(cache).forEach(key => { if (!keepIds.has(String(key))) delete cache[key]; });
+		});
+	}
+
 	function openChatImageGroupModal(msgId, index) {
 		const list = getChatImageGroup(msgId);
 		if (list.length && typeof openImageModal === 'function') openImageModal(index || 0, list);
@@ -62274,6 +62297,7 @@ function getVisibleChatStackEl(id) {
 			}
 			pinnedMessages = nextPinned;
 			rebuildChatPinnedIdIndex(nextPinned);
+			if (typeof pruneChatAuxMessageCaches === 'function') pruneChatAuxMessageCaches();
 			if (nextPinned.length > 0) currentPinIndex = nextPinned.length - 1;
 			renderPinnedBar();
 		});
@@ -62685,7 +62709,11 @@ function getVisibleChatStackEl(id) {
 			if (typeof scheduleSavedPs3Reconnect === 'function') scheduleSavedPs3Reconnect(name, 1400);
 
 			if ((!isLightAuthPayload || initialProfileSyncOk) && window.__trophiesHydrated === true) {
+				if (window.dailyTrophyTimer) clearTimeout(window.dailyTrophyTimer);
+				const dailyTrophyUser = name;
 				window.dailyTrophyTimer = setTimeout(() => {
+					window.dailyTrophyTimer = null;
+					if (localStorage.getItem('psn_username') !== dailyTrophyUser) return;
 					if (typeof checkDailyTrophies === 'function') checkDailyTrophies();
 				}, 2000);
 			}
@@ -62963,6 +62991,9 @@ function getVisibleChatStackEl(id) {
 				if (!userName || nextOnlineNames.has(userName)) return;
 				changedPresenceNames.add(userName);
 				delete window.__presencePayloadSignatureByUser[userName];
+				/* The comparable snapshot is only an Online-list merge base. Once the user leaves
+				   that list, friends/search/fresh metadata can reconstruct it on demand. */
+				if (window.__presenceComparableUserByName) delete window.__presenceComparableUserByName[userName];
 			});
 			const onlineSnapshotChanged = changedPresenceNames.size > 0;
 
@@ -63416,7 +63447,7 @@ function getVisibleChatStackEl(id) {
 				if (shiftedKey) {
 					chatIndex.ids.delete(shiftedKey);
 					chatIndex.byId.delete(shiftedKey);
-					if (window.chatTranslationCache && !isChatMessagePinnedFast(shiftedKey)) delete window.chatTranslationCache[shiftedKey];
+					if (typeof deleteChatAuxMessageCaches === 'function') deleteChatAuxMessageCaches(shiftedKey, true);
 				}
 				chatIndex.length = window.messageHistory.length;
 				chatIndex.firstKey = window.messageHistory.length ? getChatIndexedMessageKey(window.messageHistory[0]) : '';
@@ -63781,7 +63812,7 @@ function getVisibleChatStackEl(id) {
 			if (window.messageHistory) {
 				if (typeof removeChatMessageByIdFast === 'function') removeChatMessageByIdFast(msgId);
 				else window.messageHistory = window.messageHistory.filter(m => String(new Date(m.time).getTime()) !== String(msgId));
-				if (window.chatTranslationCache) delete window.chatTranslationCache[String(msgId)];
+				if (typeof deleteChatAuxMessageCaches === 'function') deleteChatAuxMessageCaches(msgId);
 				if (typeof window.setSidebarCountPill === 'function') window.setSidebarCountPill('chat', window.messageHistory.length);
 			}
 		
@@ -63945,6 +63976,8 @@ function getVisibleChatStackEl(id) {
 		
 			window.messageHistory = [];
 			if (window.chatTranslationCache) window.chatTranslationCache = {};
+			if (window.__chatImageGroups) window.__chatImageGroups = {};
+			if (window.__chatSeenEmitPending instanceof Map) window.__chatSeenEmitPending.clear();
 			if (typeof clearChatRenderedMessageIndex === 'function') clearChatRenderedMessageIndex();
 			if (typeof window.setSidebarCountPill === 'function') window.setSidebarCountPill('chat', 0);
 			window.__chatCacheEpoch = incomingChatEpoch;
@@ -64595,6 +64628,7 @@ function getVisibleChatStackEl(id) {
 						persistFriends:friendChanged
 					});
 				}
+				if (!online && window.__presenceComparableUserByName) delete window.__presenceComparableUserByName[name];
 			} catch (err) {
 				console.warn('[PRESENCE] Could not apply realtime presence update:', err);
 			}
@@ -65384,6 +65418,27 @@ function getVisibleChatStackEl(id) {
 	};
 
 	window.resetPsnSessionRuntimeState = function(options = {}) {
+		const runtimeName = String(options.username || localStorage.getItem('psn_username') || (typeof currentLoginUser !== 'undefined' ? currentLoginUser : '') || '').trim();
+		if (runtimeName) {
+			if (window.__freshPsnUserMetaByName instanceof Map) window.__freshPsnUserMetaByName.delete(runtimeName.toLowerCase());
+			['__roleUpdatedRealtimeSignatureByUser', '__presenceRevisionByUser', '__presenceLastSeenByUser', '__presencePayloadSignatureByUser', '__profileCountsRevisionByUser', '__profileCountsValuesByUser', '__presenceComparableUserByName'].forEach(cacheName => {
+				const cache = window[cacheName];
+				if (cache && typeof cache === 'object') delete cache[runtimeName];
+			});
+		}
+		if (window.__psnUserMetaRefreshTimer) clearTimeout(window.__psnUserMetaRefreshTimer);
+		window.__psnUserMetaRefreshTimer = null;
+		if (window.__psnUserMetaRefreshQueue instanceof Set) window.__psnUserMetaRefreshQueue.clear();
+		if (window.__presenceMetaSyncFrame) cancelAnimationFrame(window.__presenceMetaSyncFrame);
+		window.__presenceMetaSyncFrame = 0;
+		if (window.__presenceMetaPendingByName instanceof Map) window.__presenceMetaPendingByName.clear();
+		const presenceBurst = window.__presenceBurstUiState;
+		if (presenceBurst && typeof presenceBurst === 'object') {
+			if (presenceBurst.frame) cancelAnimationFrame(presenceBurst.frame);
+			presenceBurst.frame = 0;
+			presenceBurst.friends = presenceBurst.online = presenceBurst.admin = presenceBurst.chat = presenceBurst.count = presenceBurst.persistFriends = false;
+			if (presenceBurst.names instanceof Set) presenceBurst.names.clear();
+		}
 		window.isProfileLoaded = false;
 		if (typeof window.resetProfileClientSyncRuntime === 'function') window.resetProfileClientSyncRuntime();
 		window.__trophiesHydrated = false;
@@ -65393,6 +65448,8 @@ function getVisibleChatStackEl(id) {
 		if (options.clearTrophyTimers === true) {
 			if (window.dailyTrophyTimer) clearTimeout(window.dailyTrophyTimer);
 			if (window.dailyTrophyDelay) clearTimeout(window.dailyTrophyDelay);
+			window.dailyTrophyTimer = null;
+			window.dailyTrophyDelay = null;
 		}
 		window.isBooting = false;
 		if (typeof isLoggingIn !== 'undefined') isLoggingIn = false;
@@ -65412,7 +65469,7 @@ function getVisibleChatStackEl(id) {
 			localStorage.removeItem('psn_admin_secret');
 		} catch (e) {}
 		document.body.classList.remove('is-admin', 'is-mod', 'is-banned-user', 'admin-maintenance-login-bypass');
-		window.resetPsnSessionRuntimeState();
+		window.resetPsnSessionRuntimeState({ clearTrophyTimers: true, username: name });
 		if (typeof window.psnResetLoginUiState === 'function') window.psnResetLoginUiState(name);
 		if (typeof adminUpdateMaintenanceOverlay === 'function') setTimeout(adminUpdateMaintenanceOverlay, 0);
 		if (options.disconnect !== false && typeof socketChat !== 'undefined' && socketChat) {
@@ -74677,6 +74734,7 @@ function getVisibleChatStackEl(id) {
 		};
 
 		if (dataArray.length === 0) {
+			if (window.__profileListRowHtmlCaches instanceof Map) window.__profileListRowHtmlCaches.delete(`${targetUser}|${listType}`);
 			const emptyHtml = `<div style="text-align:center; padding: 40px; color: var(--text-muted); font-size: 13px;">No items in this ${listMeta.title.toLowerCase()} yet.</div>`;
 			window.swapProfileListLoaderToContent(body, emptyHtml, targetUser, listType);
 			return;
@@ -74706,6 +74764,13 @@ function getVisibleChatStackEl(id) {
 		const returnToOnline = (pModal && pModal.dataset.returnToOnline === "true") ? "true" : "false";
 		const profileListRowCacheOwner = `${targetUser}|${listType}`;
 		const profileListRowCache = window.getProfileListRowHtmlCache(profileListRowCacheOwner);
+		if (profileListRowCache.size) {
+			const currentProfileListRowKeys = new Set();
+			for (let i = 0; i < renderItems.length; i++) currentProfileListRowKeys.add(getProfileListDomKey(i));
+			for (const cachedKey of Array.from(profileListRowCache.keys())) {
+				if (!currentProfileListRowKeys.has(cachedKey)) profileListRowCache.delete(cachedKey);
+			}
+		}
 		const profileListRowContextToken = [
 			profileListRowCacheOwner,
 			isMe ? 'self' : 'remote',
@@ -81035,7 +81100,14 @@ function getVisibleChatStackEl(id) {
                         break;
                     }
                 }
-                if (!hasDynamicEmpty) disconnectDynamicHostObserver(host);
+                if (!hasDynamicEmpty) {
+                    disconnectDynamicHostObserver(host);
+                    /* A shared MutationObserver keeps every target it was asked to observe until
+                       disconnect(). Reconcile immediately when a dynamic host loses its last empty
+                       state so removed state nodes are not retained until the next tab visibility
+                       change. The existing sync path re-observes only currently connected states. */
+                    syncEmptyStateObserverActivity();
+                }
                 window.refreshPsnPageEmptyStates();
             });
             observer.observe(host, { childList: true });
