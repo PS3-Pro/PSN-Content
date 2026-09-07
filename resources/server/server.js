@@ -934,8 +934,8 @@ let adminStateRefreshInFlight = null;
 let adminStateConnectionLimitWarnedAt = 0;
 let serverLogFallbackRefreshAt = 0;
 const SERVER_LOG_FALLBACK_REFRESH_MS = 120000;
-const MODERATION_LOG_HISTORY_MAX = 200;
-const SERVER_LOG_HISTORY_MAX = 200;
+const MODERATION_LOG_HISTORY_MAX = 100;
+const SERVER_LOG_HISTORY_MAX = 100;
 
 async function refreshAdminStateFromDb() {
   try {
