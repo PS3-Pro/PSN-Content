@@ -1360,7 +1360,7 @@ html.collection-memory-optimization-on #downloads-list > .download-swipe-row { c
 .dl-cover-wrap .dl-type-chip i { display: none; }
 .wish-type-chip-cover { position: absolute; left: 8px; bottom: 8px; z-index: 12; display: flex !important; align-items: center !important; justify-content: center !important; height: 18px; max-width: calc(100% - 48px); padding: 0 8px; font-size: 7px; line-height: 18px; letter-spacing: 0.65px; overflow: hidden; text-overflow: ellipsis; box-shadow: 0 5px 14px rgba(0,0,0,0.55); background-color: rgba(4,8,14,0.72); }
 .wish-type-chip-cover i { display: none; }
-#wish-cat-select option:disabled, #wish-cat-select option.wish-type-unavailable { color: rgba(139,150,168,0.42) !important; background-color: rgba(0,0,0,0.28) !important; }
+#cat-select option:disabled, #cat-select option.is-unavailable, #wish-cat-select option:disabled, #wish-cat-select option.wish-type-unavailable, #library-type-select option:disabled, #library-type-select option.is-unavailable, #fav-type-select option:disabled, #fav-type-select option.is-unavailable { color: rgba(139,150,168,0.42) !important; background-color: rgba(0,0,0,0.28) !important; }
 /* --- SETTINGS TOGGLE CONTROLS --- */
 .switch { position: relative; display: inline-block; width: 44px; height: 24px; flex-shrink: 0; }
 .switch input { opacity: 0; width: 0; height: 0; }
@@ -18299,7 +18299,7 @@ P
         return ['games', 'soundtracks', 'videos', 'apps', 'demos', 'updates'].includes(category) && region === 'ALL';
     }
 
-    function updateBrowseTypeFilterVisibility(categoryOverride = null, allowShow = true) {
+    function updateBrowseTypeFilterVisibility(categoryOverride = null) {
         const catEl = document.getElementById('cat-select');
         const category = categoryOverride !== null ? categoryOverride : (catEl ? catEl.value : '');
         const inContextualView = !!browseExpandedGroupTitle || !!(navHistory && navHistory.lockSearch === true);
@@ -18308,10 +18308,8 @@ P
         const showConsoleFilters = !inContextualView && category === 'games';
         const showAppFilters = !inContextualView && category === 'apps';
 
-        // Category changes hide invalid controls immediately, but never expose the next category's
-        // controls before the native select has visually committed its new value.
-        if (consoleFilters && (!showConsoleFilters || allowShow)) consoleFilters.style.display = showConsoleFilters ? 'flex' : 'none';
-        if (appFilters && (!showAppFilters || allowShow)) appFilters.style.display = showAppFilters ? 'flex' : 'none';
+        if (consoleFilters) consoleFilters.style.display = showConsoleFilters ? 'flex' : 'none';
+        if (appFilters) appFilters.style.display = showAppFilters ? 'flex' : 'none';
     }
 
     function isBrowseRegionSelectLocked(categoryOverride = null) {
@@ -18375,7 +18373,7 @@ P
         window.setAlphabeticalSortButtonEnabled('browse', !inRegionsView && count > 1, inRegionsView ? 'regions' : 'count');
     }
 
-    function updateGroupTitleFilterVisibility(categoryOverride = null, regionOverride = null, allowShow = true) {
+    function updateGroupTitleFilterVisibility(categoryOverride = null, regionOverride = null) {
         const wrap = getBrowseGroupTitleWrap();
         const toggle = getBrowseGroupTitleToggle();
         if (!wrap) return;
@@ -18393,10 +18391,6 @@ P
             if (!allowedHere) clearBrowseExpandedGroupTitle();
             return;
         }
-
-        // During the native category-select handoff, preserve an already-visible valid control but
-        // do not reveal a previously-hidden Group Titles pill until the category render takes over.
-        if (!allowShow && wrap.classList.contains('is-hidden')) return;
 
         wrap.classList.remove('is-hidden');
         wrap.classList.toggle('group-titles-separated', category === 'games' || category === 'apps');
@@ -20679,6 +20673,85 @@ P
 		}
 		return select.value || 'ALL';
 	};
+
+
+	window.getPsnTypeAvailability = function(items, categoryGetter) {
+		const counts = new Map();
+		(items || []).forEach(item => {
+			const raw = typeof categoryGetter === 'function' ? categoryGetter(item) : (item && (item.category || item.rawCategory));
+			const category = String(raw || '').trim().toLowerCase();
+			if (!category) return;
+			counts.set(category, (counts.get(category) || 0) + 1);
+		});
+		return counts;
+	};
+
+	window.syncPsnTypeSelectAvailability = function(selectOrId, counts, options = {}) {
+		const select = typeof selectOrId === 'string' ? document.getElementById(selectOrId) : selectOrId;
+		if (!select || !(counts instanceof Map)) return select ? select.value : '';
+		const allValue = Object.prototype.hasOwnProperty.call(options, 'allValue') ? options.allValue : 'ALL';
+		const fallbackValue = Object.prototype.hasOwnProperty.call(options, 'fallbackValue') ? options.fallbackValue : allValue;
+		const autoFallback = options.autoFallback !== false;
+		const unavailableClass = String(options.unavailableClass || 'is-unavailable');
+		const knownCategories = options.knownCategories instanceof Set ? options.knownCategories : null;
+		const emptyTitle = String(options.emptyTitle || 'No items of this type');
+		const itemLabel = String(options.itemLabel || 'item');
+		const allTitle = String(options.allTitle || 'Show every type');
+
+		Array.from(select.options).forEach(option => {
+			const value = String(option.value || '').trim();
+			if (allValue !== null && value === allValue) {
+				option.disabled = false;
+				option.classList.remove(unavailableClass, 'is-unavailable');
+				option.title = allTitle;
+				return;
+			}
+			const normalized = value.toLowerCase();
+			const known = !knownCategories || knownCategories.has(normalized);
+			const count = counts.get(normalized) || 0;
+			const unavailable = known && count <= 0;
+			option.disabled = unavailable;
+			option.classList.toggle(unavailableClass, unavailable);
+			option.classList.toggle('is-unavailable', unavailable);
+			if (!known) option.title = '';
+			else option.title = unavailable ? emptyTitle : `${count} ${itemLabel}${count === 1 ? '' : 's'}`;
+		});
+
+		const selected = select.options[select.selectedIndex];
+		if (autoFallback && selected && selected.disabled && fallbackValue !== null) {
+			const fallback = Array.from(select.options).find(option => option.value === fallbackValue && !option.disabled);
+			if (fallback) select.value = fallbackValue;
+		}
+		return select.value || '';
+	};
+
+	window.syncBrowseTypeFilterAvailability = function() {
+		const select = document.getElementById('cat-select');
+		if (!select) return;
+		const counts = new Map();
+		const knownCategories = new Set();
+		Array.from(select.options).forEach(option => {
+			const category = String(option.value || '').trim().toLowerCase();
+			if (!category) return;
+			const renderKnown = !!window.psnStoreRenderCache && Object.prototype.hasOwnProperty.call(window.psnStoreRenderCache, category);
+			const publicKnown = !!window.psnStoreCache && Object.prototype.hasOwnProperty.call(window.psnStoreCache, category);
+			if (!renderKnown && !publicKnown) return; // Never gray a category that has not finished loading yet.
+			knownCategories.add(category);
+			const bucket = (renderKnown ? window.psnStoreRenderCache[category] : window.psnStoreCache[category]);
+			counts.set(category, Array.isArray(bucket) ? bucket.length : 0);
+		});
+		window.syncPsnTypeSelectAvailability(select, counts, {
+			allValue: null,
+			autoFallback: false,
+			knownCategories,
+			emptyTitle: 'No content in this category',
+			itemLabel: 'item'
+		});
+	};
+
+	window.addEventListener('psnStorePrefetchReady', () => {
+		if (typeof window.syncBrowseTypeFilterAvailability === 'function') window.syncBrowseTypeFilterAvailability();
+	});
 
     function renderLetterFilter() {
         const container = document.getElementById('letter-filter');
@@ -23789,6 +23862,7 @@ P
 			const data = await buildStoreCategoryData(cat, texts, priority, paths);
 			psnStoreRenderCache[cat] = data;
 			window.psnStoreCache[cat] = data;
+			if (typeof window.syncBrowseTypeFilterAvailability === 'function') window.syncBrowseTypeFilterAvailability();
 			if (typeof window.bumpPsnStoreCacheRevision === 'function') window.bumpPsnStoreCacheRevision();
 			if (typeof window.invalidatePsnStoreLookup === 'function') window.invalidatePsnStoreLookup();
 			return data;
@@ -24714,9 +24788,9 @@ P
 		const familyCounts = new Map();
 		const cards = Array.from(grid.querySelectorAll(':scope > .game-card'));
 
-		/* Identity is kept for every rendered card so an existing offscreen card is never
-		   mistaken for a new reveal. Geometry is captured only around the actual viewport;
-		   filters that affect content far away therefore cannot make the visible grid jump. */
+		/* Keep identity for every rendered card. Small fully-rendered categories can afford a
+		   complete geometry snapshot, which gives A-Z a real FLIP even when cards swap across
+		   several rows. Large categories stay viewport-bounded for performance. */
 		cards.forEach(card => {
 			const key = getBrowseMotionCardKey(card);
 			if (key) existingKeys.add(key);
@@ -24724,14 +24798,19 @@ P
 			if (family) familyCounts.set(family, (familyCounts.get(family) || 0) + 1);
 		});
 
-		const candidateRange = getBrowseMotionViewportCandidateRange(grid, cards, viewport, 48);
+		const captureAllGeometry = cards.length <= DEFAULT_RENDER_LIMIT;
+		const candidateRange = captureAllGeometry
+			? { start: 0, end: cards.length, rectCache: new WeakMap(), columns: Math.max(1, getBrowseMotionGridColumnCount(grid)) }
+			: getBrowseMotionViewportCandidateRange(grid, cards, viewport, 48);
 		for (let index = candidateRange.start; index < candidateRange.end; index++) {
 			const card = cards[index];
 			const key = getBrowseMotionCardKey(card);
 			if (!key) continue;
-			const rect = candidateRange.rectCache.get(card) || card.getBoundingClientRect();
-			if (!candidateRange.rectCache.has(card)) candidateRange.rectCache.set(card, rect);
-			if (!rect.width || !rect.height || !browseMotionRectVisible(rect, viewport, 48)) continue;
+			if (!captureAllGeometry) {
+				const rect = candidateRange.rectCache.get(card) || card.getBoundingClientRect();
+				if (!candidateRange.rectCache.has(card)) candidateRange.rectCache.set(card, rect);
+				if (!rect.width || !rect.height || !browseMotionRectVisible(rect, viewport, 48)) continue;
+			}
 			const entry = {
 				index,
 				layoutLeft: Number(card.offsetLeft) || 0,
@@ -24922,24 +25001,26 @@ P
 		settleCollectionFilterReveals(grid);
 		const scrollArea = document.getElementById('scroll-area') || document.querySelector('.content');
 		const boundedOrderFlip = scope === 'trophies' && options.orderFlip === true;
+		const adaptiveCardMotion = scope === 'wishlist' || scope === 'library' || scope === 'favorites';
 		const snapshot = {
 			scope,
 			gridId: config.gridId,
 			scrollTop: scrollArea ? Math.max(0, Number(scrollArea.scrollTop) || 0) : 0,
 			existingKeys: new Set(),
 			entries: new Map(),
-			orderIndexes: boundedOrderFlip ? new Map() : null,
-			boundedOrderFlip
+			orderIndexes: (boundedOrderFlip || adaptiveCardMotion) ? new Map() : null,
+			boundedOrderFlip,
+			adaptiveCardMotion
 		};
 
 		const canAnimate = !document.hidden && !browseMotionReduced() && typeof Element.prototype.animate === 'function';
 		const viewport = canAnimate ? getBrowseMotionViewportRect() : null;
 		snapshot.viewport = viewport;
 
-		/* Keep identity/indexes for the whole collection so new-card and Trophy order
-		   semantics stay identical. Geometry is bounded to rows around the viewport: all
-		   collection layouts are DOM-ordered vertical grids/lists, so the same binary row
-		   search used by Browse safely avoids measuring distant cards. */
+		/* Identity/indexes are cheap and cover the whole rendered collection. For card grids,
+		   small sets capture complete geometry so A-Z/filter relayouts get a true FLIP across
+		   every row. Large sets keep geometry viewport-bounded; cards entering without old
+		   geometry reveal instead, avoiding both distant layout reads and dead visual swaps. */
 		const cards = Array.from(grid.querySelectorAll(config.itemSelector));
 		cards.forEach((card, index) => {
 			const key = getCollectionFilterMotionCardKey(card);
@@ -24949,14 +25030,19 @@ P
 		});
 
 		if (canAnimate && cards.length) {
-			const candidateRange = getBrowseMotionViewportCandidateRange(grid, cards, viewport, 48);
+			const captureAllGeometry = adaptiveCardMotion && cards.length <= DEFAULT_RENDER_LIMIT;
+			const candidateRange = captureAllGeometry
+				? { start: 0, end: cards.length, rectCache: new WeakMap() }
+				: getBrowseMotionViewportCandidateRange(grid, cards, viewport, 48);
 			for (let index = candidateRange.start; index < candidateRange.end; index++) {
 				const card = cards[index];
 				const key = getCollectionFilterMotionCardKey(card);
 				if (!key) continue;
-				const rect = candidateRange.rectCache.get(card) || card.getBoundingClientRect();
-				if (!candidateRange.rectCache.has(card)) candidateRange.rectCache.set(card, rect);
-				if (!rect.width || !rect.height || !browseMotionRectVisible(rect, viewport, 48)) continue;
+				if (!captureAllGeometry) {
+					const rect = candidateRange.rectCache.get(card) || card.getBoundingClientRect();
+					if (!candidateRange.rectCache.has(card)) candidateRange.rectCache.set(card, rect);
+					if (!rect.width || !rect.height || !browseMotionRectVisible(rect, viewport, 48)) continue;
+				}
 				snapshot.entries.set(key, {
 					index,
 					layoutLeft: Number(card.offsetLeft) || 0,
@@ -25047,7 +25133,10 @@ P
 
 		Array.from(grid.querySelectorAll(config.itemSelector)).forEach(card => {
 			const key = getCollectionFilterMotionCardKey(card);
-			if (!key || snapshot.existingKeys.has(key)) return;
+			if (!key) return;
+			const lacksOldGeometry = !snapshot.entries || !snapshot.entries.has(key);
+			const genuinelyNew = !snapshot.existingKeys.has(key);
+			if (snapshot.adaptiveCardMotion ? !lacksOldGeometry : !genuinelyNew) return;
 			if (config.pendingClass && card.classList.contains(config.pendingClass)) return;
 			const revealTarget = typeof config.revealTarget === 'function' ? config.revealTarget(card) : card;
 			if (!revealTarget) return;
@@ -26165,8 +26254,6 @@ P
 			}
 
 			if (browseMotionSnapshot) {
-				const previousKeys = browseMotionSnapshot.existingKeys || new Set(browseMotionSnapshot.entries ? browseMotionSnapshot.entries.keys() : []);
-				const previousFamilies = browseMotionSnapshot.existingFamilies || new Set();
 				const cards = Array.from(grid.querySelectorAll(':scope > .game-card'));
 				const currentFamilyCounts = new Map();
 				cards.forEach(card => {
@@ -26176,8 +26263,11 @@ P
 				cards.forEach(card => {
 					const key = getBrowseMotionCardKey(card);
 					const family = getBrowseMotionCardFamily(card);
-					const familyContinues = !!family && currentFamilyCounts.get(family) === 1 && previousFamilies.has(family);
-					if ((!key || !previousKeys.has(key)) && !familyContinues) card.dataset.browseFilterNew = '1';
+					const hasKeyGeometry = !!key && !!browseMotionSnapshot.entries && browseMotionSnapshot.entries.has(key);
+					const hasFamilyGeometry = !!family && currentFamilyCounts.get(family) === 1 && !!browseMotionSnapshot.familyEntries && browseMotionSnapshot.familyEntries.has(family);
+					/* If the card is entering the visible result without old geometry, FLIP cannot know
+					   where it came from. Mark it for reveal instead of leaving a dead visual swap. */
+					if (!hasKeyGeometry && !hasFamilyGeometry) card.dataset.browseFilterNew = '1';
 				});
 			}
 			if (browseMotionSnapshot && typeof animateBrowseMotionLayout === 'function') {
@@ -26485,14 +26575,11 @@ P
         if (typeof syncBrowseContextualSearchState === 'function') syncBrowseContextualSearchState('view-browse');
         document.getElementById('search-input').value = "";
         document.getElementById('region-select').value = "ALL";
-        // Hide controls that are invalid for the new category immediately, but do not expose
-        // category-specific controls before the native select has visually committed the choice.
-        // The normal fetch/apply path performs the full reveal after the deferred category handoff.
-        if (typeof updateBrowseTypeFilterVisibility === 'function') updateBrowseTypeFilterVisibility(cat, false);
-        if (typeof updateGroupTitleFilterVisibility === 'function') updateGroupTitleFilterVisibility(cat, 'ALL', false);
+        /* Keep the currently committed right-side toolbar intact while the category skeleton is
+           on screen. applyFilters() commits type filters, Group Titles and Missing Licenses from
+           the new category together, so no intermediate control can push another one sideways. */
 		window.__browseMissingRapSearchCandidateCount = 0;
 		window.__browseCanFilterMissingRap = false;
-		if (typeof primeMissingRapFilterShell === 'function') primeMissingRapFilterShell();
         activeLetter = "ALL";
         // Preserve the original immediate A-Z feedback; the final render still refreshes availability once.
         renderLetterFilter();
@@ -40292,34 +40379,18 @@ P
 
 	window.updateWishlistTypeFilterAvailability = function() {
 		const select = document.getElementById('wish-cat-select');
-		if (!select || !Array.isArray(window.wishlist)) return;
-
-		const counts = {};
-		window.wishlist.forEach(item => {
-			const key = (typeof window.getWishlistItemCategoryKey === 'function')
+		if (!select || !Array.isArray(window.wishlist) || typeof window.getPsnTypeAvailability !== 'function' || typeof window.syncPsnTypeSelectAvailability !== 'function') return;
+		const counts = window.getPsnTypeAvailability(window.wishlist, item => (
+			typeof window.getWishlistItemCategoryKey === 'function'
 				? window.getWishlistItemCategoryKey(item)
-				: (item.category || 'games');
-
-			counts[key] = (counts[key] || 0) + 1;
+				: (item.category || 'games')
+		));
+		window.syncPsnTypeSelectAvailability(select, counts, {
+			unavailableClass: 'wish-type-unavailable',
+			allTitle: 'Show every wishlist type',
+			emptyTitle: 'No items of this type in your wishlist',
+			itemLabel: 'wishlist item'
 		});
-
-		Array.from(select.options).forEach(option => {
-			if (option.value === 'ALL') {
-				option.disabled = false;
-				option.classList.remove('wish-type-unavailable');
-				option.title = 'Show every wishlist type';
-				return;
-			}
-
-			const hasItems = (counts[option.value] || 0) > 0;
-			option.disabled = !hasItems;
-			option.classList.toggle('wish-type-unavailable', !hasItems);
-			option.title = hasItems ? `${counts[option.value]} item${counts[option.value] === 1 ? '' : 's'} in this type` : 'No items of this type in your wishlist';
-		});
-
-		if (select.value !== 'ALL' && select.options[select.selectedIndex] && select.options[select.selectedIndex].disabled) {
-			select.value = 'ALL';
-		}
 	};
 
 
@@ -45056,6 +45127,34 @@ function formatLibraryLastPlayedBadge(game = {}) {
 		return meta;
 	}
 
+
+	const libraryTypeAvailabilityFastCache = {
+		library: { signature: '', counts: null },
+		favorites: { signature: '', counts: null }
+	};
+
+	function syncLibraryTypeFilterAvailability(scope, items) {
+		if (typeof window.getPsnTypeAvailability !== 'function' || typeof window.syncPsnTypeSelectAvailability !== 'function') return;
+		const isFavorites = scope === 'favorites';
+		const cache = libraryTypeAvailabilityFastCache[isFavorites ? 'favorites' : 'library'];
+		const source = Array.isArray(items) ? items : [];
+		const signature = [
+			Number(window.__libraryDataRevision || 0),
+			isFavorites ? Number(window.__favoritesDataRevision || 0) : 0,
+			Number(window.__psnStoreCacheRevision || 0),
+			source.length
+		].join(':');
+		if (cache.signature !== signature || !(cache.counts instanceof Map)) {
+			cache.signature = signature;
+			cache.counts = window.getPsnTypeAvailability(source, game => getCachedLibraryFilterMetadata(game).category);
+		}
+		window.syncPsnTypeSelectAvailability(isFavorites ? 'fav-type-select' : 'library-type-select', cache.counts, {
+			allTitle: isFavorites ? 'Show every favorite type' : 'Show every installed type',
+			emptyTitle: isFavorites ? 'No active favorites of this type' : 'No installed items of this type',
+			itemLabel: isFavorites ? 'favorite' : 'installed item'
+		});
+	}
+
 	let librarySearchMetadataFastRevision = '';
 	let librarySearchMetadataFastCache = new WeakMap();
 	function getCachedLibrarySearchMetadata(game = {}) {
@@ -45266,6 +45365,7 @@ function formatLibraryLastPlayedBadge(game = {}) {
 	
 		const activeConsoles = getStaticCheckedValues(PSN_STATIC_LIBRARY_CONSOLE_FILTERS);
 		const activeConsoleSet = new Set(activeConsoles);
+		syncLibraryTypeFilterAvailability('library', lastScannedGames);
 		const typeFilter = document.getElementById('library-type-select')?.value || 'ALL';
 		const playTogetherMatchesOnly = document.getElementById('library-play-together-only-toggle')?.checked === true;
 		const libraryRegionSelect = document.getElementById('library-region-select');
@@ -45664,6 +45764,7 @@ function formatLibraryLastPlayedBadge(game = {}) {
 		const termNormalized = term.replace(/[^a-z0-9]/g, '');
 		const activeConsoles = getStaticCheckedValues(PSN_STATIC_FAVORITE_CONSOLE_FILTERS);
 		const activeConsoleSet = new Set(activeConsoles);
+		syncLibraryTypeFilterAvailability('favorites', activeFavs);
 		const typeFilter = document.getElementById('fav-type-select')?.value || 'ALL';
 		const playTogetherMatchesOnly = document.getElementById('fav-play-together-only-toggle')?.checked === true;
 		const favRegionSelect = document.getElementById('fav-region-select');
