@@ -7909,7 +7909,8 @@ async function deleteUserAccount(targetName, reason, adminName) {
     name: targetName,
     reason: deleteReason,
     deletedBy: adminName || "Admin",
-    deletedAt
+    deletedAt,
+    presenceRevision: Math.max(0, Number(userDatabase[targetName] && userDatabase[targetName].presenceRevision) || 0)
   };
 
   await pool.query(
@@ -8115,6 +8116,7 @@ io.on('connection', (socket) => {
         logMemoryTrace('auth:record', `user=${name} socket=${socket.id} keys=${Object.keys(dbUser).length} approx=${formatApproxBytes(authEstimate.bytes)}${authEstimate.truncated ? '+' : ''}`);
       }
       let wasDeletedAccount = false;
+      let deletedAccountPresenceRevision = 0;
 
       const isHardcodedAdmin = ADMIN_USERS.includes(name);
       const isAdmin = isUserAdmin(name, dbUser);
@@ -8123,8 +8125,9 @@ io.on('connection', (socket) => {
         const deletedRes = await queryDbWithRetry('SELECT data FROM deleted_accounts WHERE name = $1', [name], { attempts: 3, label: 'AUTH DELETED ACCOUNT LOOKUP' });
         if (deletedRes.rows.length > 0) {
           wasDeletedAccount = true;
+          const deletedData = deletedRes.rows[0].data || {};
+          deletedAccountPresenceRevision = Math.max(0, Number(deletedData.presenceRevision) || 0);
           if (isNewAccount !== true) {
-            const deletedData = deletedRes.rows[0].data || {};
             const reason = normalizeText(deletedData.reason, 'This account was deleted by an administrator.');
             socket.emit('auth_error', `${reason} Use Create New Account again or choose another Online ID.`);
             return;
@@ -8325,6 +8328,7 @@ io.on('connection', (socket) => {
           id: socket.id,
           online: true,
           lastSeen: Date.now(),
+          presenceRevision: deletedAccountPresenceRevision,
           avatar: safeUserData.avatar || DEFAULT_AVATAR,
           joined: safeUserData.joined || '2026',
           settingsData: normalizeProfileRealtimeSettings(safeUserData.settingsData || { audio: "1", ux: "1", cardBlur: "0", chatSound: "1", settingsUpdatedAt: Date.now(), profileCardStyle: "default", profileCardEffect: "default", ps3Ip: "", companionPlugin: "1", fpsCounterPlugin: "0", consoleFanMode: "dynamic", consoleFanSpeed: "35", consoleFanTarget: "68", performanceMode: "balanced", performanceRsx: "650", performanceVram: "850" }),
