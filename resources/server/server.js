@@ -58,8 +58,10 @@ const PG_STATEMENT_TIMEOUT_MS = Math.max(5000, parseInt(process.env.PG_STATEMENT
 const PG_MAX_USES = Math.max(0, parseInt(process.env.PG_MAX_USES || "0", 10) || 0);
 const ONLINE_LIST_CACHE_MS = Math.max(250, parseInt(process.env.ONLINE_LIST_CACHE_MS || "1200", 10) || 1200);
 const ONLINE_LIST_UNCHANGED_SKIP_ENABLED = process.env.ONLINE_LIST_SKIP_UNCHANGED !== "0";
-// Shared server-side retention/feed cap. Rendering batches are client-side only.
+// Server-owned content limits. Clients receive these values and never hardcode their own copies.
 const SOCIAL_HISTORY_MAX = 500;
+const TRENDING_MAX_ITEMS = 50;
+const ADMIN_REPORTS_HISTORY_MAX = 100;
 
 const pgConnectionOptions = {
   connectionString: process.env.DATABASE_URL,
@@ -934,8 +936,14 @@ let adminStateRefreshInFlight = null;
 let adminStateConnectionLimitWarnedAt = 0;
 let serverLogFallbackRefreshAt = 0;
 const SERVER_LOG_FALLBACK_REFRESH_MS = 120000;
-const MODERATION_LOG_HISTORY_MAX = 100;
-const SERVER_LOG_HISTORY_MAX = 100;
+// Single source of truth for both admin log histories. Clients receive this from the server.
+const ADMIN_LOG_HISTORY_MAX = 100;
+const MODERATION_LOG_HISTORY_MAX = ADMIN_LOG_HISTORY_MAX;
+const SERVER_LOG_HISTORY_MAX = ADMIN_LOG_HISTORY_MAX;
+
+function getAdminLogLimits() {
+  return { moderation: MODERATION_LOG_HISTORY_MAX, server: SERVER_LOG_HISTORY_MAX };
+}
 
 async function refreshAdminStateFromDb() {
   try {
@@ -1227,7 +1235,7 @@ async function initDb() {
 
   await refreshAdminStateFromDb();
 
-  const reportsRes = await queryDbWithRetry('SELECT data FROM reports WHERE resolved = false ORDER BY created_at DESC LIMIT 100', [], { attempts: 2, label: 'REPORTS READ' });
+  const reportsRes = await queryDbWithRetry(`SELECT data FROM reports WHERE resolved = false ORDER BY created_at DESC LIMIT ${ADMIN_REPORTS_HISTORY_MAX}`, [], { attempts: 2, label: 'REPORTS READ' });
   adminReports = reportsRes.rows.map(r => r.data);
 
   const modLogRes = await pool.query(`SELECT entry FROM moderation_log ORDER BY created_at DESC LIMIT ${MODERATION_LOG_HISTORY_MAX}`);
@@ -1830,6 +1838,16 @@ function isUserBanned(userData = null) {
 }
 
 const RECENTLY_VISITED_MAX_ITEMS = 10;
+
+function getClientContentLimits() {
+  return {
+    recentlyVisited: RECENTLY_VISITED_MAX_ITEMS,
+    gamePlayersPage: GAME_PLAYERS_PAGE_SIZE,
+    socialHistory: SOCIAL_HISTORY_MAX,
+    trending: TRENDING_MAX_ITEMS,
+    adminReports: ADMIN_REPORTS_HISTORY_MAX
+  };
+}
 
 function normalizeRecentlyVisitedRecordsServer(records = []) {
   const seen = new Set();
@@ -3046,14 +3064,14 @@ async function calculateTrendingFromDb() {
       WHERE raw_category IN ('game','games') AND title_id <> ''
       GROUP BY title_id
       ORDER BY count DESC, title_id ASC
-      LIMIT 50
+      LIMIT ${TRENDING_MAX_ITEMS}
     ), top_wishlist AS (
       SELECT title_id AS key, COUNT(*)::int AS count
       FROM wishlist_items
       WHERE title_id <> ''
       GROUP BY title_id
       ORDER BY count DESC, title_id ASC
-      LIMIT 50
+      LIMIT ${TRENDING_MAX_ITEMS}
     )
     SELECT 'game' AS kind, key, count FROM top_games
     UNION ALL
@@ -3324,6 +3342,7 @@ function buildTrendingViewPayload(payload = {}) {
   return {
     topDownloads: Array.isArray(payload.topDownloads) ? payload.topDownloads : [],
     topWishlist: Array.isArray(payload.topWishlist) ? payload.topWishlist : [],
+    maxItems: TRENDING_MAX_ITEMS,
     ...(payload.stale === true ? { stale: true } : {}),
     ...(payload.unavailable === true ? { unavailable: true } : {})
   };
@@ -3404,7 +3423,7 @@ async function getUserFromDb(name) {
 }
 
 async function refreshReportsFromDb() {
-  const reportsRes = await pool.query('SELECT data FROM reports WHERE resolved = false ORDER BY created_at DESC LIMIT 100');
+  const reportsRes = await pool.query(`SELECT data FROM reports WHERE resolved = false ORDER BY created_at DESC LIMIT ${ADMIN_REPORTS_HISTORY_MAX}`);
   adminReports = reportsRes.rows.map(r => r.data);
   return adminReports;
 }
@@ -4411,7 +4430,7 @@ async function getGamePlayersPageForUser(userName, rawTitleId, rawGroup, rawOffs
   const group = rawGroup === 'playTogether' ? 'playTogether' : (rawGroup === 'friends' ? 'friends' : 'others');
   const offset = Math.max(0, Math.min(100000, parseInt(rawOffset, 10) || 0));
   const limit = Math.max(10, Math.min(GAME_PLAYERS_PAGE_SIZE, parseInt(rawLimit, 10) || GAME_PLAYERS_PAGE_SIZE));
-  if (!viewerName || !titleId) return { group, total: 0, offset, limit, hasMore: false, owners: [] };
+  if (!viewerName || !titleId) return { group, total: 0, offset, limit, pageSize: GAME_PLAYERS_PAGE_SIZE, hasMore: false, owners: [] };
 
   await ensureGameOwnershipIndexReady();
   let result;
@@ -4507,6 +4526,7 @@ async function getGamePlayersPageForUser(userName, rawTitleId, rawGroup, rawOffs
     total,
     offset,
     limit,
+    pageSize: GAME_PLAYERS_PAGE_SIZE,
     hasMore: offset + owners.length < total,
     owners
   };
@@ -4847,6 +4867,7 @@ function emitChatHistoryToSocket(socket) {
     }
 
     const startedAt = Date.now();
+    socket.emit('chat_config', { maxHistory: MAX_CHAT_HISTORY });
     if (requiresAck) {
       const result = await new Promise((resolve, reject) => {
         let settled = false;
@@ -5489,10 +5510,13 @@ async function emitAdminState(socket) {
       reports: adminReports,
       serverLog,
       registeredUsers: Object.keys(userDatabase).length,
-      countryStats: getAdminCountryStats()
+      countryStats: getAdminCountryStats(),
+      logLimits: getAdminLogLimits(),
+      contentLimits: getClientContentLimits()
     });
     socket.emit('admin_chat_controls_state', adminState.chatControls);
     socket.emit('reports_list', adminReports);
+    socket.emit('admin_log_limits', getAdminLogLimits());
     socket.emit('admin_server_log_list', serverLog);
   }
 }
@@ -6058,7 +6082,8 @@ async function initProfileSyncNotifications() {
             reports: adminReports,
             serverLog,
             registeredUsers: Object.keys(userDatabase).length,
-            countryStats: getAdminCountryStats()
+            countryStats: getAdminCountryStats(),
+      logLimits: getAdminLogLimits()
           });
           return;
         }
@@ -6078,7 +6103,8 @@ async function initProfileSyncNotifications() {
             reports: adminReports,
             serverLog,
             registeredUsers: Object.keys(userDatabase).length,
-            countryStats: getAdminCountryStats()
+            countryStats: getAdminCountryStats(),
+      logLimits: getAdminLogLimits()
           });
           return;
         }
@@ -6102,7 +6128,8 @@ async function initProfileSyncNotifications() {
             reports: adminReports,
             serverLog,
             registeredUsers: Object.keys(userDatabase).length,
-            countryStats: getAdminCountryStats()
+            countryStats: getAdminCountryStats(),
+      logLimits: getAdminLogLimits()
           });
           return;
         }
@@ -8027,7 +8054,8 @@ async function syncAdminStateAcrossInstances() {
     reports: adminConnected ? adminReports : [],
     serverLog: adminConnected ? serverLog : [],
     registeredUsers: Object.keys(userDatabase).length,
-    countryStats: getAdminCountryStats()
+    countryStats: getAdminCountryStats(),
+      logLimits: getAdminLogLimits()
   });
 }
 
@@ -8097,6 +8125,7 @@ function startBackgroundTasks() {
 
 io.on('connection', (socket) => {
   console.log('[NETWORK] Socket connected. ID: ' + socket.id);
+  socket.emit('content_limits', getClientContentLimits());
   socket.once('disconnecting', () => { unindexSocketUser(socket); adminSockets.delete(socket); });
   deferServerTask('CONNECTION INIT', () => emitAdminState(socket), 0);
 
@@ -8283,6 +8312,7 @@ io.on('connection', (socket) => {
               role: getUserRole(name, userDatabase[name]),
               isModerator: isUserModerator(name, userDatabase[name]),
               serverAuthoritative: true,
+              contentLimits: getClientContentLimits(),
               lightAuth: true,
               fullProfileDeferred: true
             });
@@ -8298,7 +8328,8 @@ io.on('connection', (socket) => {
               isAdmin: isAdmin,
               role: getUserRole(name, fullAuthUser),
               isModerator: isUserModerator(name, fullAuthUser),
-              serverAuthoritative: true
+              serverAuthoritative: true,
+              contentLimits: getClientContentLimits()
             });
           }
 
@@ -8384,6 +8415,7 @@ io.on('connection', (socket) => {
           role: getUserRole(name, userDatabase[name]),
           isModerator: isUserModerator(name, userDatabase[name]),
           serverAuthoritative: true,
+          contentLimits: getClientContentLimits(),
           ...(supportsProfileSyncV2 ? { lightAuth: true, fullProfileDeferred: true } : {})
         });
         compactCachedUser(name);
@@ -8930,6 +8962,7 @@ io.on('connection', (socket) => {
         items: result.items,
         lastReadId: result.lastReadId || 0,
         unreadCount: result.unreadCount || 0,
+        maxHistory: SOCIAL_HISTORY_MAX,
         delta: result.delta === true,
       });
     } catch (err) {
@@ -9088,6 +9121,7 @@ io.on('connection', (socket) => {
         friendCount: result.friendNames.length,
         lastReadId: result.lastReadId || 0,
         dismissedThroughId: result.dismissedThroughId || 0,
+        maxHistory: SOCIAL_HISTORY_MAX,
         delta: result.delta === true,
       });
     } catch (err) {
@@ -10101,7 +10135,8 @@ io.on('connection', (socket) => {
         reports: adminReports,
         serverLog,
         registeredUsers: Object.keys(userDatabase).length,
-        countryStats: getAdminCountryStats()
+        countryStats: getAdminCountryStats(),
+      logLimits: getAdminLogLimits()
       });
       deferServerTask('ADMIN MAINTENANCE NOTIFY', () => notifyAdminStateAcrossInstances(ADMIN_STATE_KEYS.maintenance, nextMaintenance), 0);
       deferServerTask('ADMIN MAINTENANCE LOG', () => addModerationLog(nextMaintenance.enabled ? 'maintenance_on' : 'maintenance_off', nextMaintenance.enabled ? 'Enabled maintenance mode' : 'Disabled maintenance mode', nextMaintenance, socket.userName || 'Admin'), 0);
@@ -10160,7 +10195,8 @@ io.on('connection', (socket) => {
         reports: socket.isAdmin === true ? adminReports : [],
         serverLog: socket.isAdmin === true ? serverLog : [],
         registeredUsers: socket.isAdmin === true ? Object.keys(userDatabase).length : 0,
-        countryStats: socket.isAdmin === true ? getAdminCountryStats() : { total: 0, known: 0, unknown: 0, countries: [] }
+        countryStats: socket.isAdmin === true ? getAdminCountryStats() : { total: 0, known: 0, unknown: 0, countries: [] },
+        logLimits: getAdminLogLimits()
       };
       socket.emit('admin_state', payload);
       /* Modern clients can request the combined payload only. Keep the legacy component
@@ -10205,7 +10241,8 @@ io.on('connection', (socket) => {
         reports: adminReports,
         serverLog,
         registeredUsers: Object.keys(userDatabase).length,
-        countryStats: getAdminCountryStats()
+        countryStats: getAdminCountryStats(),
+      logLimits: getAdminLogLimits()
       });
       await addModerationLog('chat_controls', `Updated chat controls: ${adminState.chatControls.locked ? 'locked' : 'open'}, slow ${adminState.chatControls.slowSeconds}s`, adminState.chatControls, socket.userName || 'Admin');
       respond({ success: true, state: adminState.chatControls });
@@ -10249,6 +10286,7 @@ io.on('connection', (socket) => {
   socket.on('admin_request_moderation_log', async () => {
     if (socket.isAdmin === true) {
       await refreshModerationLogFromDb();
+      socket.emit('admin_log_limits', getAdminLogLimits());
       socket.emit('admin_moderation_log_list', moderationLog);
     }
   });
@@ -10267,6 +10305,7 @@ io.on('connection', (socket) => {
   socket.on('admin_request_server_log', async () => {
     if (socket.isAdmin === true) {
       await refreshServerLogFromDb();
+      socket.emit('admin_log_limits', getAdminLogLimits());
       socket.emit('admin_server_log_list', serverLog);
     }
   });

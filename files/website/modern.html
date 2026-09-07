@@ -14237,7 +14237,54 @@ P
 		return String(value || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'");
 	}
 
-	const RECENTLY_VISITED_MAX_ITEMS = 10;
+	const PSN_SERVER_CONTENT_LIMITS_CACHE_KEY = 'psn_server_content_limits_v1';
+	window.__psnServerContentLimits = window.__psnServerContentLimits && typeof window.__psnServerContentLimits === 'object'
+		? window.__psnServerContentLimits
+		: Object.create(null);
+
+	window.getPsnServerContentLimit = function(key) {
+		const value = Math.floor(Number(window.__psnServerContentLimits && window.__psnServerContentLimits[key]) || 0);
+		return value > 0 ? value : 0;
+	};
+
+	window.trimPsnServerLimitedArray = function(items, key) {
+		const source = Array.isArray(items) ? items : [];
+		const limit = window.getPsnServerContentLimit(key);
+		return limit > 0 ? source.slice(0, limit) : source.slice();
+	};
+
+	window.applyPsnServerContentLimits = function(rawLimits = {}) {
+		if (!rawLimits || typeof rawLimits !== 'object' || Array.isArray(rawLimits)) return false;
+		const keys = ['recentlyVisited', 'gamePlayersPage', 'socialHistory', 'trending', 'adminReports'];
+		let changed = false;
+		keys.forEach(key => {
+			const value = Math.floor(Number(rawLimits[key]) || 0);
+			if (value <= 0 || window.__psnServerContentLimits[key] === value) return;
+			window.__psnServerContentLimits[key] = value;
+			changed = true;
+		});
+		if (!changed) return false;
+		try {
+			const raw = JSON.stringify(window.__psnServerContentLimits);
+			if (typeof safeLocalStorageSet === 'function') safeLocalStorageSet(PSN_SERVER_CONTENT_LIMITS_CACHE_KEY, raw);
+			else localStorage.setItem(PSN_SERVER_CONTENT_LIMITS_CACHE_KEY, raw);
+		} catch (err) {}
+
+		if (Array.isArray(window.recentlyVisitedGames)) window.recentlyVisitedGames = window.trimPsnServerLimitedArray(window.recentlyVisitedGames, 'recentlyVisited');
+		if (Array.isArray(window.friendActivityItems)) window.friendActivityItems = window.trimPsnServerLimitedArray(window.friendActivityItems, 'socialHistory');
+		if (Array.isArray(window.userNotificationItems)) window.userNotificationItems = window.trimPsnServerLimitedArray(window.userNotificationItems, 'socialHistory');
+		if (Array.isArray(window.adminReports)) window.adminReports = window.trimPsnServerLimitedArray(window.adminReports, 'adminReports');
+		if (window.__pendingTrendingData && typeof window.__pendingTrendingData === 'object') {
+			window.__pendingTrendingData.topDownloads = window.trimPsnServerLimitedArray(window.__pendingTrendingData.topDownloads, 'trending');
+			window.__pendingTrendingData.topWishlist = window.trimPsnServerLimitedArray(window.__pendingTrendingData.topWishlist, 'trending');
+		}
+		return true;
+	};
+
+	try {
+		const cachedLimits = JSON.parse(localStorage.getItem(PSN_SERVER_CONTENT_LIMITS_CACHE_KEY) || '{}');
+		window.applyPsnServerContentLimits(cachedLimits);
+	} catch (err) {}
 
 	function getRecentlyVisitedStorageKey(username = localStorage.getItem('psn_username') || '') {
 		const safeUser = String(username || '').trim();
@@ -14290,7 +14337,7 @@ P
 			seen.add(key);
 			normalized.push(item);
 		});
-		return normalized.slice(0, RECENTLY_VISITED_MAX_ITEMS);
+		return window.trimPsnServerLimitedArray(normalized, 'recentlyVisited');
 	}
 
 	function readRecentlyVisitedGames() {
@@ -19282,10 +19329,12 @@ P
 		if (!item) return false;
 
 		item.count = Math.max(0, (Number(item.count) || 0) + amount);
-		data[listKey] = list
-			.filter(entry => (Number(entry && entry.count) || 0) > 0)
-			.sort((a, b) => (Number(b.count) || 0) - (Number(a.count) || 0) || String(a.id || '').localeCompare(String(b.id || '')))
-			.slice(0, 50);
+		data[listKey] = window.trimPsnServerLimitedArray(
+			list
+				.filter(entry => (Number(entry && entry.count) || 0) > 0)
+				.sort((a, b) => (Number(b.count) || 0) - (Number(a.count) || 0) || String(a.id || '').localeCompare(String(b.id || ''))),
+			'trending'
+		);
 
 		/* TRENDING LIVE PATCH: never rebuild both carousels for one local count change.
 		   Reconcile only the affected strip; hidden history DOM is patched before Go Back too. */
@@ -27688,7 +27737,7 @@ P
 
     const GAME_PLAYERS_CLIENT_CACHE_MS = 30000;
     const GAME_PLAYERS_CLIENT_CACHE_MAX = 256;
-    const GAME_PLAYERS_PAGE_SIZE = 30;
+    const getGamePlayersPageSize = () => typeof window.getPsnServerContentLimit === 'function' ? window.getPsnServerContentLimit('gamePlayersPage') : 0;
     window.__gamePlayersSummaryCache = window.__gamePlayersSummaryCache || Object.create(null);
     window.__gamePlayersModalState = window.__gamePlayersModalState || null;
 
@@ -29028,7 +29077,7 @@ P
             titleId: state.titleId,
             group,
             offset: append ? groupState.offset : 0,
-            limit: GAME_PLAYERS_PAGE_SIZE
+            ...(getGamePlayersPageSize() > 0 ? { limit: getGamePlayersPageSize() } : {})
         }, response => {
             const activeState = window.__gamePlayersModalState;
             const activeModal = document.getElementById('modal-sys-list');
@@ -29047,6 +29096,7 @@ P
                 return;
             }
 
+            if (Number(response.pageSize || response.limit) > 0 && typeof window.applyPsnServerContentLimits === 'function') window.applyPsnServerContentLimits({ gamePlayersPage: Number(response.pageSize || response.limit) });
             const owners = Array.isArray(response.owners) ? response.owners : [];
             groupState.loaded = true;
             groupState.offset = Math.max(0, Number(response.offset) || 0) + owners.length;
@@ -29134,8 +29184,9 @@ P
             const modal = document.getElementById('modal-sys-list');
             if (!activeState || activeState !== state || !modal || modal.dataset.gamePlayersToken !== state.token || modal.dataset.profileTarget !== '__game_players__') { callback(null); return; }
             if (offset >= wanted || (total > 0 && offset >= total)) { callback({ owners: owners.slice(0, wanted), total }); return; }
-            requestGamePlayers({ mode: 'list', titleId: state.titleId, group, offset, limit: GAME_PLAYERS_PAGE_SIZE }, response => {
+            requestGamePlayers({ mode: 'list', titleId: state.titleId, group, offset, ...(getGamePlayersPageSize() > 0 ? { limit: getGamePlayersPageSize() } : {}) }, response => {
                 if (!response || response.ok !== true || normalizeGamePlayersTitleId(response.titleId) !== state.titleId || response.group !== group) { callback(null); return; }
+                if (Number(response.pageSize || response.limit) > 0 && typeof window.applyPsnServerContentLimits === 'function') window.applyPsnServerContentLimits({ gamePlayersPage: Number(response.pageSize || response.limit) });
                 const page = Array.isArray(response.owners) ? response.owners : [];
                 total = Math.max(0, Number(response.total) || 0);
                 owners.push(...page);
@@ -29212,7 +29263,8 @@ P
                 return;
             }
             const list = section.querySelector(`[data-game-player-list="${group}"]`);
-            const wanted = Math.min(meta.total, Math.max(renderedCount, Math.min(meta.total, GAME_PLAYERS_PAGE_SIZE)));
+            const serverPageSize = getGamePlayersPageSize();
+            const wanted = Math.min(meta.total, Math.max(renderedCount, serverPageSize > 0 ? Math.min(meta.total, serverPageSize) : renderedCount));
             fetchGamePlayersLoadedRange(state, group, wanted, result => {
                 const activeState = window.__gamePlayersModalState;
                 const activeModal = document.getElementById('modal-sys-list');
@@ -34634,7 +34686,34 @@ P
 		if (typeof playUiSuccess === 'function') playUiSuccess();
 	}
 
-	const ADMIN_MODERATION_LOG_MAX = 200;
+	let adminLogLimits = { moderation: null, server: null };
+	function adminNormalizeLogLimit(value) {
+		const parsed = parseInt(value, 10);
+		return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+	}
+	function adminGetLogLimit(kind) {
+		return kind === 'server' ? adminLogLimits.server : adminLogLimits.moderation;
+	}
+	function adminTrimLog(log, kind) {
+		const clean = Array.isArray(log) ? log.filter(Boolean) : [];
+		const limit = adminGetLogLimit(kind);
+		return limit ? clean.slice(0, limit) : clean;
+	}
+	function adminApplyLogLimits(limits) {
+		if (!limits || typeof limits !== 'object') return false;
+		const nextModeration = adminNormalizeLogLimit(limits.moderation);
+		const nextServer = adminNormalizeLogLimit(limits.server);
+		let changed = false;
+		if (nextModeration && nextModeration !== adminLogLimits.moderation) { adminLogLimits.moderation = nextModeration; changed = true; }
+		if (nextServer && nextServer !== adminLogLimits.server) { adminLogLimits.server = nextServer; changed = true; }
+		if (!changed) return false;
+		const moderationLog = adminGetModerationLog();
+		const serverLog = adminGetServerLog();
+		if (adminLogLimits.moderation && moderationLog.length > adminLogLimits.moderation) adminSetModerationLog(moderationLog);
+		if (adminLogLimits.server && serverLog.length > adminLogLimits.server) adminSetServerLog(serverLog);
+		return true;
+	}
+
 	let adminModerationLogCacheRaw = null;
 	let adminModerationLogCache = [];
 	function adminGetModerationLog() {
@@ -34646,7 +34725,7 @@ P
 	}
 
 	function adminSetModerationLog(log) {
-		const clean = Array.isArray(log) ? log.filter(Boolean).slice(0, ADMIN_MODERATION_LOG_MAX) : [];
+		const clean = adminTrimLog(log, 'moderation');
 		const raw = JSON.stringify(clean);
 		adminModerationLogCacheRaw = raw;
 		adminModerationLogCache = clean;
@@ -34682,7 +34761,6 @@ P
 	}
 
 
-	const ADMIN_SERVER_LOG_MAX = 200;
 	let adminServerLogCacheRaw = null;
 	let adminServerLogCache = [];
 	function adminGetServerLog() {
@@ -34694,7 +34772,7 @@ P
 	}
 
 	function adminSetServerLog(log = []) {
-		const clean = Array.isArray(log) ? log.filter(Boolean).slice(0, ADMIN_SERVER_LOG_MAX) : [];
+		const clean = adminTrimLog(log, 'server');
 		const raw = JSON.stringify(clean);
 		adminServerLogCacheRaw = raw;
 		adminServerLogCache = clean;
@@ -37009,7 +37087,7 @@ P
 	}
 
 	function adminSetReports(reports) {
-		window.adminReports = Array.isArray(reports) ? reports.slice(0, 100) : [];
+		window.adminReports = window.trimPsnServerLimitedArray(Array.isArray(reports) ? reports : [], 'adminReports');
 		const raw = JSON.stringify(window.adminReports);
 		adminReportsFallbackRaw = raw;
 		adminReportsFallbackCache = window.adminReports;
@@ -37307,7 +37385,7 @@ P
 				setAdminHtmlIfChanged(serverLogEl, '<div class="admin-empty">No server events yet. Logins and disconnects will appear here.</div>');
 			} else {
 				serverLogEl.__adminLogSource = log;
-				setAdminHtmlIfChanged(serverLogEl, log.slice(0, ADMIN_SERVER_LOG_MAX).map(item => {
+				setAdminHtmlIfChanged(serverLogEl, adminTrimLog(log, 'server').map(item => {
 				const time = adminFormatLogTimestamp(item.time);
 				const userName = String(item.user || 'Server');
 				const detail = item.detail && typeof item.detail === 'object' ? item.detail : {};
@@ -37334,7 +37412,7 @@ P
 				setAdminHtmlIfChanged(modLog, '<div class="admin-empty">No moderation actions logged yet.</div>');
 			} else {
 				modLog.__adminLogSource = log;
-				setAdminHtmlIfChanged(modLog, log.slice(0, ADMIN_MODERATION_LOG_MAX).map(item => {
+				setAdminHtmlIfChanged(modLog, adminTrimLog(log, 'moderation').map(item => {
 				const time = adminFormatLogTimestamp(item.time);
 				const adminName = String(item.admin || 'Admin');
 				const detail = item.detail && typeof item.detail === 'object' ? item.detail : {};
@@ -37419,8 +37497,11 @@ P
 		socketChat.on('connect_error', () => { adminSetChatControlsSyncState('offline'); syncAdminHealth('connecting'); });
 		socketChat.io?.on?.('reconnect_attempt', () => syncAdminHealth('connecting'));
 		socketChat.io?.on?.('reconnect', () => syncAdminHealth('online'));
+		socketChat.on('admin_log_limits', limits => {
+			if (adminApplyLogLimits(limits) && document.getElementById('view-admin')?.style.display === 'block') adminSchedulePanelRender();
+		});
 		socketChat.on('admin_server_log_list', list => {
-			const nextList = Array.isArray(list) ? list.filter(Boolean).slice(0, ADMIN_SERVER_LOG_MAX) : [];
+			const nextList = adminTrimLog(list, 'server');
 			const previousList = adminGetServerLog();
 			const unchanged = typeof window.getLiveRenderSignature === 'function' ? window.getLiveRenderSignature(previousList) === window.getLiveRenderSignature(nextList) : JSON.stringify(previousList) === JSON.stringify(nextList);
 			if (unchanged) return;
@@ -37456,7 +37537,8 @@ P
 		});
 		socketChat.on('admin_state', data => {
 			if (!data || typeof data !== 'object') return;
-			let changed = false;
+			if (data.contentLimits && typeof window.applyPsnServerContentLimits === 'function') window.applyPsnServerContentLimits(data.contentLimits);
+			let changed = adminApplyLogLimits(data.logLimits);
 			if (data.chatControls) {
 				const controls = data.chatControls;
 				const comparable = [!!controls.locked, Math.max(0, Math.min(600, parseInt(controls.slowSeconds || 0, 10) || 0)), String(controls.by || ''), String(controls.at || '')];
@@ -37483,7 +37565,7 @@ P
 				if (!samePinned) { adminSetPinnedAnnouncementState(nextPinned, false); changed = true; }
 			}
 			if (Array.isArray(data.serverLog)) {
-				const nextServerLog = data.serverLog.filter(Boolean).slice(0, ADMIN_SERVER_LOG_MAX);
+				const nextServerLog = adminTrimLog(data.serverLog, 'server');
 				const currentServerLog = adminGetServerLog();
 				const sameLog = (typeof window.getLiveRenderSignature === 'function' ? window.getLiveRenderSignature(currentServerLog) === window.getLiveRenderSignature(nextServerLog) : JSON.stringify(currentServerLog) === JSON.stringify(nextServerLog));
 				if (!sameLog) { adminSetServerLog(nextServerLog); changed = true; }
@@ -37509,7 +37591,7 @@ P
 			adminSchedulePanelRender();
 		});
 		socketChat.on('reports_list', reports => {
-			const nextReports = Array.isArray(reports) ? reports.slice(0, 100) : [];
+			const nextReports = window.trimPsnServerLimitedArray(Array.isArray(reports) ? reports : [], 'adminReports');
 			const previousReports = adminGetReports();
 			const unchanged = typeof window.getLiveRenderSignature === 'function' ? window.getLiveRenderSignature(previousReports) === window.getLiveRenderSignature(nextReports) : JSON.stringify(previousReports) === JSON.stringify(nextReports);
 			if (unchanged) return;
@@ -37522,7 +37604,7 @@ P
 			if (item) adminAddLog(item.type || 'server', item.message || 'Server moderation event', item.detail || {}, item);
 		});
 		socketChat.on('admin_moderation_log_list', list => {
-			const nextList = Array.isArray(list) ? list.filter(Boolean).slice(0, ADMIN_MODERATION_LOG_MAX) : [];
+			const nextList = adminTrimLog(list, 'moderation');
 			const previousList = adminGetModerationLog();
 			const unchanged = typeof window.getLiveRenderSignature === 'function' ? window.getLiveRenderSignature(previousList) === window.getLiveRenderSignature(nextList) : JSON.stringify(previousList) === JSON.stringify(nextList);
 			if (unchanged) return;
@@ -51475,7 +51557,18 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 	];
 	let currentServerIndex = 0;
 
-	const MAX_CHAT_HISTORY = 1000;
+	window.__chatServerMaxHistory = 0;
+	function setChatHistoryLimitFromServer(value) {
+		const limit = Math.floor(Number(value) || 0);
+		if (limit > 0) window.__chatServerMaxHistory = limit;
+		return getChatHistoryLimit();
+	}
+	function getChatHistoryLimit() {
+		const limit = Math.floor(Number(window.__chatServerMaxHistory) || 0);
+		return limit > 0 ? limit : Infinity;
+	}
+	window.setChatHistoryLimitFromServer = setChatHistoryLimitFromServer;
+	window.getChatHistoryLimit = getChatHistoryLimit;
     let socketChat;
 	window.__psnPreAuthMaintenanceSocket = false;
 	let currentOnlineList = [];
@@ -52724,7 +52817,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
             revision: Math.max(0, Number(window.__chatCacheRevision) || 0),
             seenCursor: Math.max(0, Number(window.__chatSeenCursor) || 0),
             complete: true,
-            messages: normalizeChatHistoryPayload(window.messageHistory || []).slice(-MAX_CHAT_HISTORY),
+            messages: normalizeChatHistoryPayload(window.messageHistory || []).slice(-getChatHistoryLimit()),
             savedAt: Date.now()
         };
         return new Promise(resolve => {
@@ -52788,7 +52881,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
         });
         if (hasDeletedSlots) merged = merged.filter(Boolean);
         merged.sort((a, b) => (new Date(a && a.time).getTime() || 0) - (new Date(b && b.time).getTime() || 0));
-        return normalizeChatHistoryPayload(merged).slice(-MAX_CHAT_HISTORY);
+        return normalizeChatHistoryPayload(merged).slice(-getChatHistoryLimit());
     }
 
     function applyChatSeenEventsToHistory(history = [], events = [], changeState = null) {
@@ -52926,7 +53019,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
                 window.__chatInitialSnapshotPending = true;
                 return { hydrated: true, cached: false };
             }
-            const cachedHistory = normalizeChatHistoryPayload(record.messages).slice(-MAX_CHAT_HISTORY);
+            const cachedHistory = normalizeChatHistoryPayload(record.messages).slice(-getChatHistoryLimit());
             window.__chatCacheEpoch = String(record.epoch || '');
             window.__chatCacheRevision = Math.max(0, Number(record.revision) || 0);
             window.__chatSeenCursor = Math.max(0, Number(record.seenCursor) || 0);
@@ -52953,6 +53046,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 
     function applyChatSyncResponse(response = {}) {
         if (!response || response.syncV1 !== true || response.success === false) return false;
+        setChatHistoryLimitFromServer(response.maxHistory);
         const mode = String(response.mode || 'changes');
         const responseEpoch = String(response.epoch || '');
         const responseRevision = Math.max(0, Number(response.revision) || 0);
@@ -52974,7 +53068,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
             : [];
         const responseChanges = Array.isArray(response.changes) ? response.changes : [];
         let nextHistory = mode === 'snapshot'
-            ? normalizeChatHistoryPayload(response.messages || []).slice(-MAX_CHAT_HISTORY)
+            ? normalizeChatHistoryPayload(response.messages || []).slice(-getChatHistoryLimit())
             : mergeChatSyncChanges(previousHistory, responseChanges);
         if (pendingSyncChanges.length) nextHistory = mergeChatSyncChanges(nextHistory, pendingSyncChanges);
         const combinedSeenEvents = (Array.isArray(response.seenEvents) ? response.seenEvents : []).concat(pendingSeenEvents);
@@ -60449,7 +60543,7 @@ function getVisibleChatStackEl(id) {
 		if (firstLink && !isImage && !ytId && chatViewVisibleForPreview && !window.__loginRevealBusy) {
 			setTimeout(() => fetchLinkMetadata(firstLink[0], `lp-${msgId}`, box), 350);
 		}
-		if (box.children.length > MAX_CHAT_HISTORY) box.removeChild(box.children[1]);
+		if (box.children.length > getChatHistoryLimit()) box.removeChild(box.children[1]);
 		if (batchContext) batchContext.mentionRefreshNeeded = true;
 		else if (typeof refreshMentionJumpButton === 'function') refreshMentionJumpButton();
 	}
@@ -62400,6 +62494,9 @@ function getVisibleChatStackEl(id) {
 			timeout: preAuthMaintenance ? 8000 : 12000,
 			closeOnBeforeunload: false
 		})
+		socketChat.on('content_limits', limits => {
+			if (typeof window.applyPsnServerContentLimits === 'function') window.applyPsnServerContentLimits(limits || {});
+		});
 		if (typeof adminInstallMaintenanceSocketListeners === 'function') adminInstallMaintenanceSocketListeners();
 		if (typeof adminUpdateChatControlsBanner === 'function') adminUpdateChatControlsBanner();
 		
@@ -62530,6 +62627,7 @@ function getVisibleChatStackEl(id) {
 		});
 		
 		socketChat.on('auth_success', async (data) => {
+			if (data && data.contentLimits && typeof window.applyPsnServerContentLimits === 'function') window.applyPsnServerContentLimits(data.contentLimits);
 			if (typeof promoteServerConnectionForAuthenticatedUse === 'function') promoteServerConnectionForAuthenticatedUse();
 			if (typeof adminInstallSocketListeners === 'function') adminInstallSocketListeners();
 			if (typeof window.clearLoginServerAttempt === 'function') window.clearLoginServerAttempt();
@@ -63587,6 +63685,10 @@ function getVisibleChatStackEl(id) {
 			}
 		});
 
+        socketChat.on('chat_config', function(config = {}) {
+            setChatHistoryLimitFromServer(config.maxHistory);
+        });
+
         socketChat.on('chat_sync_change', function(change) {
             if (typeof applyRealtimeChatSyncChange === 'function') applyRealtimeChatSyncChange(change || {});
         });
@@ -63622,7 +63724,7 @@ function getVisibleChatStackEl(id) {
 			chatIndex.lastKey = incomingKey || getChatIndexedMessageKey(data);
 			window.__chatHistoryContentRevision = Math.max(0, Number(window.__chatHistoryContentRevision) || 0) + 1;
 			if (typeof window.setSidebarCountPill === 'function') window.setSidebarCountPill('chat', window.messageHistory.length);
-			if (window.messageHistory.length > MAX_CHAT_HISTORY) {
+			if (window.messageHistory.length > getChatHistoryLimit()) {
 				const shiftedMessage = window.messageHistory.shift();
 				const shiftedKey = getChatIndexedMessageKey(shiftedMessage);
 				if (shiftedKey) {
@@ -64370,7 +64472,8 @@ function getVisibleChatStackEl(id) {
 				if (itemId > otherId || (itemId === otherId && itemCreatedAt > otherCreatedAt)) { insertAt = i; break; }
 			}
 			list.splice(insertAt, 0, item);
-			if (typeof SOCIAL_FEED_CACHE_LIMIT !== 'undefined' && list.length > SOCIAL_FEED_CACHE_LIMIT) list.length = SOCIAL_FEED_CACHE_LIMIT;
+			const socialLimit = typeof window.getPsnServerContentLimit === 'function' ? window.getPsnServerContentLimit('socialHistory') : 0;
+			if (socialLimit > 0 && list.length > socialLimit) list.length = socialLimit;
 			window.userNotificationItems = list;
 			delete window.__realtimeFeedIdIndexCache.notifications;
 			return true;
@@ -65118,6 +65221,7 @@ function getVisibleChatStackEl(id) {
 		});
 
 		socketChat.on('trending_data', (data) => {
+			if (data && Number(data.maxItems) > 0 && typeof window.applyPsnServerContentLimits === 'function') window.applyPsnServerContentLimits({ trending: Number(data.maxItems) });
 			const nextUnavailable = !!(data && data.unavailable === true);
 			const nextTrendingSignature = `${nextUnavailable ? '1' : '0'}|${getTrendingListSignature(data && data.topDownloads || [])}|${getTrendingListSignature(data && data.topWishlist || [])}`;
 			const trendingVisualChanged = window.__trendingRealtimeSignature !== nextTrendingSignature;
@@ -69135,7 +69239,6 @@ function getVisibleChatStackEl(id) {
 	// FRIEND ACTIVITY
 	// ==========================================================================
 	const FRIEND_ACTIVITY_CACHE_KEY = 'psn_friend_activity_cache_v1';
-	const SOCIAL_FEED_CACHE_LIMIT = 500;
 	const SOCIAL_FEED_RENDER_BATCH_SIZE = 60;
 	window.friendActivityItems = Array.isArray(window.friendActivityItems) ? window.friendActivityItems : [];
 	window.__friendActivitySubscribed = false;
@@ -69674,7 +69777,7 @@ function getVisibleChatStackEl(id) {
 			previousSemanticKey = semanticKey;
 			previousCreatedAt = createdAt;
 		});
-		window.friendActivityItems = deduped.slice(0, SOCIAL_FEED_CACHE_LIMIT);
+		window.friendActivityItems = window.trimPsnServerLimitedArray(deduped, 'socialHistory');
 		window.__friendActivityItemsCanonical = true;
 		invalidateFriendActivityRealtimeIndexes();
 		return window.friendActivityItems;
@@ -69772,7 +69875,8 @@ function getVisibleChatStackEl(id) {
 			else authoritativeItem = item;
 		}
 
-		if (list.length > SOCIAL_FEED_CACHE_LIMIT) list.length = SOCIAL_FEED_CACHE_LIMIT;
+		const socialLimit = typeof window.getPsnServerContentLimit === 'function' ? window.getPsnServerContentLimit('socialHistory') : 0;
+		if (socialLimit > 0 && list.length > socialLimit) list.length = socialLimit;
 		window.friendActivityItems = list;
 		window.__friendActivityItemsCanonical = true;
 		invalidateFriendActivityRealtimeIndexes();
@@ -69795,7 +69899,7 @@ function getVisibleChatStackEl(id) {
 		if (!localStorage.getItem('psn_username')) return;
 		try {
 			saveState(FRIEND_ACTIVITY_CACHE_KEY, JSON.stringify({
-				items: (Array.isArray(window.friendActivityItems) ? window.friendActivityItems : []).slice(0, SOCIAL_FEED_CACHE_LIMIT),
+				items: window.trimPsnServerLimitedArray(Array.isArray(window.friendActivityItems) ? window.friendActivityItems : [], 'socialHistory'),
 				lastReadId: Math.max(0, Number(window.__friendActivityLastReadId) || 0),
 				dismissedThroughId: Math.max(0, Number(window.__friendActivityDismissedThroughId) || 0),
 				friendSignature: String(window.__friendActivityFriendSignature || ''),
@@ -70253,6 +70357,7 @@ function getVisibleChatStackEl(id) {
 				}
 				return;
 			}
+			if (Number(response.maxHistory) > 0 && typeof window.applyPsnServerContentLimits === 'function') window.applyPsnServerContentLimits({ socialHistory: Number(response.maxHistory) });
 			window.__friendActivitySubscribed = true;
 			window.__friendActivityRemoteReady = true;
 			window.__friendActivityRemoteError = '';
@@ -70650,7 +70755,7 @@ function getVisibleChatStackEl(id) {
 			seen.add(key);
 			merged.push(item);
 		});
-		window.userNotificationItems = merged.slice(0, SOCIAL_FEED_CACHE_LIMIT);
+		window.userNotificationItems = window.trimPsnServerLimitedArray(merged, 'socialHistory');
 		return window.userNotificationItems;
 	};
 
@@ -70658,7 +70763,7 @@ function getVisibleChatStackEl(id) {
 		if (!localStorage.getItem('psn_username')) return;
 		try {
 			saveState(USER_NOTIFICATION_CACHE_KEY, JSON.stringify({
-				items:(Array.isArray(window.userNotificationItems) ? window.userNotificationItems : []).slice(0, SOCIAL_FEED_CACHE_LIMIT),
+				items:window.trimPsnServerLimitedArray(Array.isArray(window.userNotificationItems) ? window.userNotificationItems : [], 'socialHistory'),
 				lastReadId:Math.max(0, Number(window.__userNotificationLastReadId) || 0),
 				unreadCount:Math.max(0, Number(window.__userNotificationUnreadCount) || 0),
 				cachedAt:Date.now()
@@ -72347,6 +72452,7 @@ function getVisibleChatStackEl(id) {
 				}
 				return;
 			}
+			if (Number(response.maxHistory) > 0 && typeof window.applyPsnServerContentLimits === 'function') window.applyPsnServerContentLimits({ socialHistory: Number(response.maxHistory) });
 			window.__userNotificationRemoteReady = true;
 			window.__userNotificationRemoteError = '';
 			const serverReadId = Math.max(0, Number(response.lastReadId) || 0);
