@@ -38,7 +38,6 @@ const POST_AUTH_ONLINE_LIST_DELAY_MS = Math.max(0, parseInt(process.env.POST_AUT
 const POST_AUTH_PROFILE_SYNC_DELAY_MS = Math.max(0, parseInt(process.env.POST_AUTH_PROFILE_SYNC_DELAY_MS ?? "0", 10) || 0);
 const USER_CACHE_REFRESH_INTERVAL_MS = 30000;
 const PASSWORD_RESET_WINDOW_MS = 10 * 60 * 1000;
-const USER_CACHE_WARMUP_INTERVAL_MS = 120000;
 const DEFAULT_MAINTENANCE_MESSAGE = "The service is under maintenance. Please try again soon.";
 const VALID_USER_ROLES = new Set(["user", "trusted", "mod", "admin"]);
 const VALID_PROFILE_COUNTRY_CODES = new Set(['AD','AE','AF','AG','AI','AL','AM','AO','AQ','AR','AS','AT','AU','AW','AX','AZ','BA','BB','BD','BE','BF','BG','BH','BI','BJ','BL','BM','BN','BO','BQ','BR','BS','BT','BV','BW','BY','BZ','CA','CC','CD','CF','CG','CH','CI','CK','CL','CM','CN','CO','CR','CU','CV','CW','CX','CY','CZ','DE','DJ','DK','DM','DO','DZ','EC','EE','EG','EH','ER','ES','ET','FI','FJ','FK','FM','FO','FR','GA','GB','GD','GE','GF','GG','GH','GI','GL','GM','GN','GP','GQ','GR','GS','GT','GU','GW','GY','HK','HM','HN','HR','HT','HU','ID','IE','IL','IM','IN','IO','IQ','IR','IS','IT','JE','JM','JO','JP','KE','KG','KH','KI','KM','KN','KP','KR','KW','KY','KZ','LA','LB','LC','LI','LK','LR','LS','LT','LU','LV','LY','MA','MC','MD','ME','MF','MG','MH','MK','ML','MM','MN','MO','MP','MQ','MR','MS','MT','MU','MV','MW','MX','MY','MZ','NA','NC','NE','NF','NG','NI','NL','NO','NP','NR','NU','NZ','OM','PA','PE','PF','PG','PH','PK','PL','PM','PN','PR','PS','PT','PW','PY','QA','RE','RO','RS','RU','RW','SA','SB','SC','SD','SE','SG','SH','SI','SJ','SK','SL','SM','SN','SO','SR','SS','ST','SV','SX','SY','SZ','TC','TD','TF','TG','TH','TJ','TK','TL','TM','TN','TO','TR','TT','TV','TW','TZ','UA','UG','UM','US','UY','UZ','VA','VC','VE','VG','VI','VN','VU','WF','WS','YE','YT','ZA','ZM','ZW']);
@@ -51,7 +50,7 @@ const ADMIN_STATE_KEYS = {
 
 // Aiven PostgreSQL Free has a small connection budget; keep the app pool at 5 max.
 // One additional dedicated PostgreSQL Client is used for LISTEN/NOTIFY outside this pool.
-const PG_POOL_MAX = Math.max(1, Math.min(10, parseInt(process.env.PG_POOL_MAX || process.env.DB_POOL_MAX || "8", 10) || 8));
+const PG_POOL_MAX = Math.max(1, Math.min(5, parseInt(process.env.PG_POOL_MAX || process.env.DB_POOL_MAX || "5", 10) || 5));
 const PG_CONNECTION_TIMEOUT_MS = Math.max(3000, parseInt(process.env.PG_CONNECTION_TIMEOUT_MS || "10000", 10) || 10000);
 const PG_IDLE_TIMEOUT_MS = Math.max(30000, parseInt(process.env.PG_IDLE_TIMEOUT_MS || "120000", 10) || 120000);
 const PG_QUERY_TIMEOUT_MS = Math.max(5000, parseInt(process.env.PG_QUERY_TIMEOUT_MS || "25000", 10) || 25000);
@@ -3662,20 +3661,9 @@ async function isExistingGameOwner(userName, rawTitleId) {
   return !!result.rows[0];
 }
 
-async function isGamePlayTogether(userName, rawTitleId) {
-  const name = normalizeText(userName, '');
-  const titleId = normalizeGamePlayersTitleId(rawTitleId);
-  if (!name || !titleId) return false;
-  const result = await queryDbWithRetry(
-    'SELECT 1 FROM user_game_play_together WHERE user_name = $1 AND title_id = $2 LIMIT 1',
-    [name, titleId],
-    { attempts: 2, label: 'PLAY TOGETHER STATE' }
-  );
-  return !!result.rows[0];
-}
 
 async function notifyPlayTogetherPlayers(actorName, rawTitleId, rawTitle) {
-  const actor = normalizeUserNotificationName(actorName);
+  const actor = normalizeSocialUserName(actorName);
   const titleId = normalizeGamePlayersTitleId(rawTitleId);
   const title = normalizeText(rawTitle, titleId).slice(0, 180) || titleId;
   if (!actor || !titleId) return 0;
@@ -3691,7 +3679,7 @@ async function notifyPlayTogetherPlayers(actorName, rawTitleId, rawTitle) {
   );
 
   const recipients = (result.rows || [])
-    .map(row => normalizeUserNotificationName(row.user_name))
+    .map(row => normalizeSocialUserName(row.user_name))
     .filter(Boolean);
   if (!recipients.length) return 0;
 
@@ -3959,7 +3947,7 @@ async function findFriendSharedGameMatches(actorName, acquisitions = []) {
     { attempts: 2, label: 'SHARED GAME FRIEND MATCH READ' }
   );
   return (result.rows || []).map(row => ({
-    userName: normalizeUserNotificationName(row.user_name),
+    userName: normalizeSocialUserName(row.user_name),
     titleId: normalizeGamePlayersTitleId(row.title_id),
     title: normalizeText(row.title, row.title_id).slice(0, 180),
     source: ['library', 'download', 'mixed'].includes(normalizeText(row.source, '').toLowerCase()) ? normalizeText(row.source, '').toLowerCase() : 'library',
@@ -3972,7 +3960,7 @@ async function findFriendSharedGameMatches(actorName, acquisitions = []) {
 async function claimNewSharedGameMatches(actorName, matches = []) {
   const actor = normalizeText(actorName, '');
   const payload = (Array.isArray(matches) ? matches : []).map(row => ({
-    userName: normalizeUserNotificationName(row && row.userName),
+    userName: normalizeSocialUserName(row && row.userName),
     actorName: actor,
     titleId: normalizeGamePlayersTitleId(row && row.titleId),
     source: ['library', 'download', 'mixed'].includes(normalizeText(row && row.source, '').toLowerCase()) ? normalizeText(row.source, '').toLowerCase() : 'library'
@@ -4042,7 +4030,7 @@ async function notifyFriendsAboutSharedGameAcquisitions(actorName, acquisitions 
 }
 
 async function recordLibraryAcquisitionActivity(actorName, acquisitions = [], at = Date.now()) {
-  const actor = normalizeFriendActivityName(actorName);
+  const actor = normalizeSocialUserName(actorName);
   const games = (Array.isArray(acquisitions) ? acquisitions : []).filter(item => item && item.source !== 'download' && normalizeGamePlayersTitleId(item.titleId));
   if (!actor || !games.length) return null;
   const first = games[0];
@@ -6039,7 +6027,7 @@ async function initProfileSyncNotifications() {
 
       if (message.channel === 'user_notification_sync') {
         if (data.event) emitUserNotificationToLocalUser(data.event);
-        if (Array.isArray(data.updatedEvents)) data.updatedEvents.forEach(event => emitUserNotificationUpdatedToLocalUser(event));
+        if (Array.isArray(data.updatedEvents)) data.updatedEvents.forEach(event => emitUserNotificationToLocalUser(event, 'user_notification_updated'));
         if (data.readState && data.readState.userName) {
           emitUserNotificationReadStateToLocalUser(data.readState.userName, data.readState.lastReadId, data.readState.unreadCount);
         }
@@ -6292,7 +6280,7 @@ const FRIEND_ACTIVITY_TYPES = new Set(['online', 'offline', 'playing', 'played',
 const FRIEND_ACTIVITY_REPLACED_IDS_LIMIT = 60;
 const FRIEND_ACTIVITY_ROOM_PREFIX = 'friend-activity:';
 
-function normalizeFriendActivityName(value) {
+function normalizeSocialUserName(value) {
   return normalizeText(value, '').slice(0, 80);
 }
 
@@ -6391,7 +6379,7 @@ function getFriendActivitySemanticKey(type, data = {}) {
 function serializeFriendActivityRow(row = {}) {
   const type = normalizeText(row.event_type || row.type, '').toLowerCase();
   if (!FRIEND_ACTIVITY_TYPES.has(type)) return null;
-  const actor = normalizeFriendActivityName(row.actor_name || row.actor);
+  const actor = normalizeSocialUserName(row.actor_name || row.actor);
   if (!actor) return null;
   const createdAtRaw = row.created_at instanceof Date ? row.created_at.getTime() : Number(row.created_at || row.createdAt || Date.now());
   return {
@@ -6404,7 +6392,7 @@ function serializeFriendActivityRow(row = {}) {
 }
 
 function friendActivityRoom(actorName) {
-  return `${FRIEND_ACTIVITY_ROOM_PREFIX}${normalizeFriendActivityName(actorName).toLowerCase()}`;
+  return `${FRIEND_ACTIVITY_ROOM_PREFIX}${normalizeSocialUserName(actorName).toLowerCase()}`;
 }
 
 function extractFriendActivityRelationships(list) {
@@ -6412,7 +6400,7 @@ function extractFriendActivityRelationships(list) {
   const relationships = [];
   const seen = new Set();
   list.forEach(item => {
-    const name = normalizeFriendActivityName(item && typeof item === 'object' ? item.name : item);
+    const name = normalizeSocialUserName(item && typeof item === 'object' ? item.name : item);
     const key = name.toLowerCase();
     if (!name || seen.has(key)) return;
     seen.add(key);
@@ -6471,7 +6459,7 @@ async function notifyFriendActivityAcrossInstances(event) {
 }
 
 function emitFriendActivityDismissedToLocalUser(userName, activityId, excludeSocketId = '') {
-  const name = normalizeFriendActivityName(userName);
+  const name = normalizeSocialUserName(userName);
   const id = String(activityId || '').trim();
   const excluded = String(excludeSocketId || '').trim();
   if (!name || !/^\d+$/.test(id)) return;
@@ -6482,7 +6470,7 @@ function emitFriendActivityDismissedToLocalUser(userName, activityId, excludeSoc
 }
 
 function emitFriendActivityClearedToLocalUser(userName, throughId = 0, lastReadId = 0, excludeSocketId = '') {
-  const name = normalizeFriendActivityName(userName);
+  const name = normalizeSocialUserName(userName);
   const excluded = String(excludeSocketId || '').trim();
   const safeThroughId = Math.max(0, Math.floor(Number(throughId) || 0));
   if (!name || !safeThroughId) return;
@@ -6493,7 +6481,7 @@ function emitFriendActivityClearedToLocalUser(userName, throughId = 0, lastReadI
 }
 
 async function notifyFriendActivityDismissedAcrossInstances(userName, activityId) {
-  const name = normalizeFriendActivityName(userName);
+  const name = normalizeSocialUserName(userName);
   const id = String(activityId || '').trim();
   if (!name || !/^\d+$/.test(id)) return;
   try {
@@ -6504,7 +6492,7 @@ async function notifyFriendActivityDismissedAcrossInstances(userName, activityId
 }
 
 async function notifyFriendActivityClearedAcrossInstances(userName, throughId = 0, lastReadId = 0) {
-  const name = normalizeFriendActivityName(userName);
+  const name = normalizeSocialUserName(userName);
   const safeThroughId = Math.max(0, Math.floor(Number(throughId) || 0));
   if (!name || !safeThroughId) return;
   try {
@@ -6518,7 +6506,7 @@ async function notifyFriendActivityClearedAcrossInstances(userName, throughId = 
 }
 
 async function recordFriendActivity(actorName, type, rawData = {}, options = {}) {
-  const actor = normalizeFriendActivityName(actorName);
+  const actor = normalizeSocialUserName(actorName);
   const eventType = normalizeText(type, '').toLowerCase();
   if (!actor || !FRIEND_ACTIVITY_TYPES.has(eventType)) return null;
   const data = normalizeFriendActivityData(eventType, rawData);
@@ -6584,7 +6572,7 @@ function getFriendActivityRepeatCount(data = {}) {
 }
 
 async function recordAggregatedFriendActivity(actorName, type, rawData = {}, options = {}) {
-  const actor = normalizeFriendActivityName(actorName);
+  const actor = normalizeSocialUserName(actorName);
   const eventType = normalizeText(type, '').toLowerCase();
   if (!actor || !['online', 'offline', 'download', 'wishlist', 'favorite', 'cheat'].includes(eventType)) return null;
   const baseData = normalizeFriendActivityData(eventType, rawData);
@@ -6670,7 +6658,7 @@ function recordPresenceFriendActivity(name, type, at = Date.now()) {
 }
 
 async function getFriendActivityState(userName) {
-  const name = normalizeFriendActivityName(userName);
+  const name = normalizeSocialUserName(userName);
   if (!name) return { lastReadId: 0, dismissedThroughId: 0 };
   const result = await queryDbWithRetry(
     'SELECT last_read_id, dismissed_through_id FROM friend_activity_read_state WHERE user_name = $1 LIMIT 1',
@@ -6683,12 +6671,9 @@ async function getFriendActivityState(userName) {
   };
 }
 
-async function getFriendActivityReadId(userName) {
-  return (await getFriendActivityState(userName)).lastReadId;
-}
 
 async function setFriendActivityReadId(userName, lastReadId) {
-  const name = normalizeFriendActivityName(userName);
+  const name = normalizeSocialUserName(userName);
   const safeId = Math.max(0, Math.floor(Number(lastReadId) || 0));
   if (!name || !safeId) return 0;
   const result = await queryDbWithRetry(
@@ -6704,7 +6689,7 @@ async function setFriendActivityReadId(userName, lastReadId) {
 }
 
 async function dismissFriendActivityForUser(userName, activityId) {
-  const name = normalizeFriendActivityName(userName);
+  const name = normalizeSocialUserName(userName);
   const id = String(activityId || '').trim();
   if (!name || !/^\d+$/.test(id)) return { dismissed: false, activityId: '' };
   const result = await queryDbWithRetry(
@@ -6721,7 +6706,7 @@ async function dismissFriendActivityForUser(userName, activityId) {
 }
 
 async function clearFriendActivityForUser(userName, throughId = 0) {
-  const name = normalizeFriendActivityName(userName);
+  const name = normalizeSocialUserName(userName);
   const safeThroughId = Math.max(0, Math.floor(Number(throughId) || 0));
   if (!name || !safeThroughId) {
     const state = await getFriendActivityState(name);
@@ -6750,7 +6735,7 @@ async function clearFriendActivityForUser(userName, throughId = 0) {
 }
 
 async function getFriendActivityHistoryForUser(userName, afterId = 0, resolvedFriends = null) {
-  const name = normalizeFriendActivityName(userName);
+  const name = normalizeSocialUserName(userName);
   const friendRecords = Array.isArray(resolvedFriends) ? resolvedFriends : await getUserDataPayloadFromDb(name, 'friends');
   const relationships = extractFriendActivityRelationships(friendRecords);
   const friendNames = relationships.map(friend => friend.name);
@@ -6783,15 +6768,11 @@ async function getFriendActivityHistoryForUser(userName, afterId = 0, resolvedFr
 
 const USER_NOTIFICATION_TYPES = new Set(['mention', 'reply', 'reaction', 'trophy', 'catalog', 'game_match', 'play_together']);
 
-function normalizeUserNotificationName(value) {
-  return normalizeText(value, '').slice(0, 80);
-}
-
 function normalizeUserNotificationData(type, rawData = {}) {
   const source = rawData && typeof rawData === 'object' && !Array.isArray(rawData) ? rawData : {};
   if (type === 'mention' || type === 'reply') {
     return {
-      actor: normalizeUserNotificationName(source.actor),
+      actor: normalizeSocialUserName(source.actor),
       messageId: normalizeText(source.messageId, '').slice(0, 100),
       text: normalizeText(source.text, '').slice(0, 280),
       messageDeleted: source.messageDeleted === true
@@ -6799,8 +6780,8 @@ function normalizeUserNotificationData(type, rawData = {}) {
   }
   if (type === 'reaction') {
     return {
-      actor: normalizeUserNotificationName(source.actor),
-      messageUser: normalizeUserNotificationName(source.messageUser),
+      actor: normalizeSocialUserName(source.actor),
+      messageUser: normalizeSocialUserName(source.messageUser),
       messageId: normalizeText(source.messageId, '').slice(0, 100),
       emoji: normalizeText(source.emoji, '').slice(0, 24),
       text: normalizeText(source.text, '').slice(0, 280),
@@ -6817,7 +6798,7 @@ function normalizeUserNotificationData(type, rawData = {}) {
   }
   if (type === 'play_together') {
     return {
-      actor: normalizeUserNotificationName(source.actor),
+      actor: normalizeSocialUserName(source.actor),
       titleId: normalizeText(source.titleId, '').toUpperCase().slice(0, 32),
       title: normalizeText(source.title, source.titleId || 'a game').slice(0, 180)
     };
@@ -6836,7 +6817,7 @@ function normalizeUserNotificationData(type, rawData = {}) {
       };
     }).filter(item => item.titleId || item.title) : [];
     return {
-      actor: normalizeUserNotificationName(source.actor),
+      actor: normalizeSocialUserName(source.actor),
       titleId: normalizeText(source.titleId, '').toUpperCase().slice(0, 32),
       title: normalizeText(source.title, '').slice(0, 180),
       source: ['library', 'download', 'mixed'].includes(sourceType) ? sourceType : '',
@@ -6868,7 +6849,7 @@ function normalizeUserNotificationData(type, rawData = {}) {
 function serializeUserNotificationRow(row = {}) {
   const type = normalizeText(row.event_type || row.type, '').toLowerCase();
   if (!USER_NOTIFICATION_TYPES.has(type)) return null;
-  const user = normalizeUserNotificationName(row.user_name || row.user);
+  const user = normalizeSocialUserName(row.user_name || row.user);
   if (!user) return null;
   const createdAtRaw = row.created_at instanceof Date ? row.created_at.getTime() : Number(row.created_at || row.createdAt || Date.now());
   return {
@@ -6880,24 +6861,17 @@ function serializeUserNotificationRow(row = {}) {
   };
 }
 
-function emitUserNotificationToLocalUser(event) {
+function emitUserNotificationToLocalUser(event, socketEvent = 'user_notification_event') {
   const safeEvent = serializeUserNotificationRow(event);
   if (!safeEvent) return;
+  const eventName = socketEvent === 'user_notification_updated' ? 'user_notification_updated' : 'user_notification_event';
   const recipients = getSocketsByUserName(safeEvent.user).filter(client => client && client.connected);
-  trackBandwidthPayload('user_notification_event', safeEvent, recipients.length);
-  recipients.forEach(client => client.emit('user_notification_event', safeEvent));
-}
-
-function emitUserNotificationUpdatedToLocalUser(event) {
-  const safeEvent = serializeUserNotificationRow(event);
-  if (!safeEvent) return;
-  const recipients = getSocketsByUserName(safeEvent.user).filter(client => client && client.connected);
-  trackBandwidthPayload('user_notification_updated', safeEvent, recipients.length);
-  recipients.forEach(client => client.emit('user_notification_updated', safeEvent));
+  trackBandwidthPayload(eventName, safeEvent, recipients.length);
+  recipients.forEach(client => client.emit(eventName, safeEvent));
 }
 
 function emitUserNotificationReadStateToLocalUser(userName, lastReadId, unreadCount = 0) {
-  const name = normalizeUserNotificationName(userName);
+  const name = normalizeSocialUserName(userName);
   if (!name) return;
   const payload = {
     lastReadId: Math.max(0, Math.floor(Number(lastReadId) || 0)),
@@ -6909,7 +6883,7 @@ function emitUserNotificationReadStateToLocalUser(userName, lastReadId, unreadCo
 }
 
 function emitUserNotificationDeletedToLocalUser(userName, notificationId, unreadCount = 0, excludeSocketId = '') {
-  const name = normalizeUserNotificationName(userName);
+  const name = normalizeSocialUserName(userName);
   const id = String(notificationId || '').trim();
   const excluded = String(excludeSocketId || '').trim();
   if (!name || !/^\d+$/.test(id)) return;
@@ -6920,7 +6894,7 @@ function emitUserNotificationDeletedToLocalUser(userName, notificationId, unread
 }
 
 function emitUserNotificationsClearedToLocalUser(userName, throughId = 0, unreadCount = 0, excludeSocketId = '') {
-  const name = normalizeUserNotificationName(userName);
+  const name = normalizeSocialUserName(userName);
   const excluded = String(excludeSocketId || '').trim();
   const safeThroughId = Math.max(0, Math.floor(Number(throughId) || 0));
   if (!name) return;
@@ -6966,7 +6940,7 @@ async function notifyUserNotificationsUpdatedAcrossInstances(events) {
 }
 
 async function notifyUserNotificationReadStateAcrossInstances(userName, lastReadId, unreadCount = 0) {
-  const name = normalizeUserNotificationName(userName);
+  const name = normalizeSocialUserName(userName);
   if (!name) return;
   try {
     await pool.query('SELECT pg_notify($1, $2)', ['user_notification_sync', JSON.stringify({
@@ -6979,7 +6953,7 @@ async function notifyUserNotificationReadStateAcrossInstances(userName, lastRead
 }
 
 async function notifyUserNotificationDeletedAcrossInstances(userName, notificationId, unreadCount = 0) {
-  const name = normalizeUserNotificationName(userName);
+  const name = normalizeSocialUserName(userName);
   const id = String(notificationId || '').trim();
   if (!name || !/^\d+$/.test(id)) return;
   try {
@@ -6993,7 +6967,7 @@ async function notifyUserNotificationDeletedAcrossInstances(userName, notificati
 }
 
 async function notifyUserNotificationsClearedAcrossInstances(userName, throughId = 0, unreadCount = 0) {
-  const name = normalizeUserNotificationName(userName);
+  const name = normalizeSocialUserName(userName);
   const safeThroughId = Math.max(0, Math.floor(Number(throughId) || 0));
   if (!name) return;
   try {
@@ -7009,7 +6983,7 @@ async function notifyUserNotificationsClearedAcrossInstances(userName, throughId
 async function publishStoredUserNotification(row) {
   const event = serializeUserNotificationRow(row);
   if (!event) return null;
-  const user = normalizeUserNotificationName(event.user);
+  const user = normalizeSocialUserName(event.user);
   if (!user) return null;
 
   deferServerTask('USER NOTIFICATION RETENTION', async () => {
@@ -7034,7 +7008,7 @@ async function publishStoredUserNotification(row) {
 }
 
 async function recordUserNotification(userName, type, rawData = {}, options = {}) {
-  const user = normalizeUserNotificationName(userName);
+  const user = normalizeSocialUserName(userName);
   const eventType = normalizeText(type, '').toLowerCase();
   if (!user || !USER_NOTIFICATION_TYPES.has(eventType)) return null;
   const data = normalizeUserNotificationData(eventType, rawData);
@@ -7078,15 +7052,15 @@ function runSerializedChatReactionNotificationMutation(key, task) {
 
 function getChatReactionNotificationDedupeKey(messageId, messageOwner, actor, emoji) {
   const id = normalizeText(messageId, '').slice(0, 100);
-  const owner = normalizeUserNotificationName(messageOwner).toLowerCase();
-  const reactingUser = normalizeUserNotificationName(actor).toLowerCase();
+  const owner = normalizeSocialUserName(messageOwner).toLowerCase();
+  const reactingUser = normalizeSocialUserName(actor).toLowerCase();
   const reactionEmoji = normalizeText(emoji, '').slice(0, 24);
   if (!id || !owner || !reactingUser || !reactionEmoji) return '';
   return `chat-reaction:${id}:${owner}:${reactingUser}:${reactionEmoji}`;
 }
 
 async function removeChatReactionNotification(messageOwner, messageId, actor, emoji) {
-  const owner = normalizeUserNotificationName(messageOwner);
+  const owner = normalizeSocialUserName(messageOwner);
   const dedupeKey = getChatReactionNotificationDedupeKey(messageId, owner, actor, emoji);
   if (!owner || !dedupeKey) return false;
   try {
@@ -7126,7 +7100,7 @@ async function markChatMessageNotificationsDeleted(messageId) {
     );
     const events = result.rows.map(serializeUserNotificationRow).filter(Boolean);
     if (!events.length) return 0;
-    events.forEach(emitUserNotificationUpdatedToLocalUser);
+    events.forEach(event => emitUserNotificationToLocalUser(event, 'user_notification_updated'));
     deferServerTask('CHAT NOTIFICATION MESSAGE DELETE SYNC', () => notifyUserNotificationsUpdatedAcrossInstances(events), 0);
     return events.length;
   } catch (err) {
@@ -7136,7 +7110,7 @@ async function markChatMessageNotificationsDeleted(messageId) {
 }
 
 async function recordCatalogNotification(userName, rawData = {}) {
-  const user = normalizeUserNotificationName(userName);
+  const user = normalizeSocialUserName(userName);
   if (!user) return null;
   const data = normalizeUserNotificationData('catalog', rawData);
   const eventIdentity = normalizeText(data.eventKey || data.contentId, '').slice(0, 180);
@@ -7171,7 +7145,7 @@ async function recordCatalogNotification(userName, rawData = {}) {
 }
 
 async function getUserNotificationReadId(userName) {
-  const name = normalizeUserNotificationName(userName);
+  const name = normalizeSocialUserName(userName);
   if (!name) return 0;
   const result = await queryDbWithRetry(
     'SELECT last_read_id FROM user_notification_read_state WHERE user_name = $1 LIMIT 1',
@@ -7182,7 +7156,7 @@ async function getUserNotificationReadId(userName) {
 }
 
 async function setUserNotificationReadId(userName, lastReadId) {
-  const name = normalizeUserNotificationName(userName);
+  const name = normalizeSocialUserName(userName);
   const safeId = Math.max(0, Math.floor(Number(lastReadId) || 0));
   if (!name || !safeId) return 0;
   const result = await queryDbWithRetry(
@@ -7198,7 +7172,7 @@ async function setUserNotificationReadId(userName, lastReadId) {
 }
 
 async function getUserNotificationUnreadCount(userName, lastReadId = null) {
-  const name = normalizeUserNotificationName(userName);
+  const name = normalizeSocialUserName(userName);
   if (!name) return 0;
   const readId = lastReadId === null ? await getUserNotificationReadId(name) : Math.max(0, Number(lastReadId) || 0);
   const result = await queryDbWithRetry(
@@ -7210,7 +7184,7 @@ async function getUserNotificationUnreadCount(userName, lastReadId = null) {
 }
 
 async function deleteUserNotification(userName, notificationId) {
-  const name = normalizeUserNotificationName(userName);
+  const name = normalizeSocialUserName(userName);
   const id = String(notificationId || '').trim();
   if (!name || !/^\d+$/.test(id)) return { deleted: false, notificationId: '', unreadCount: 0 };
   const result = await queryDbWithRetry(
@@ -7223,7 +7197,7 @@ async function deleteUserNotification(userName, notificationId) {
 }
 
 async function clearUserNotifications(userName, throughId = 0) {
-  const name = normalizeUserNotificationName(userName);
+  const name = normalizeSocialUserName(userName);
   const safeThroughId = Math.max(0, Math.floor(Number(throughId) || 0));
   if (!name || !safeThroughId) return { deletedCount: 0, throughId: safeThroughId, unreadCount: await getUserNotificationUnreadCount(name) };
   const result = await queryDbWithRetry(
@@ -7236,7 +7210,7 @@ async function clearUserNotifications(userName, throughId = 0) {
 }
 
 async function getUserNotificationHistory(userName, afterId = 0) {
-  const name = normalizeUserNotificationName(userName);
+  const name = normalizeSocialUserName(userName);
   const safeAfterId = Math.max(0, Math.floor(Number(afterId) || 0));
   if (!name) return { items: [], lastReadId: 0, unreadCount: 0, delta: safeAfterId > 0 };
   const result = safeAfterId > 0
@@ -7256,7 +7230,7 @@ async function getUserNotificationHistory(userName, afterId = 0) {
 }
 
 function resolveKnownNotificationUserName(value) {
-  const requested = normalizeUserNotificationName(value);
+  const requested = normalizeSocialUserName(value);
   if (!requested) return '';
   if (userDatabase[requested]) return requested;
   ensureUserNameIndexes();
@@ -7303,7 +7277,7 @@ function extractChatMentionTargets(text, senderName) {
 }
 
 async function recordChatUserNotifications(message = {}) {
-  const sender = normalizeUserNotificationName(message.user);
+  const sender = normalizeSocialUserName(message.user);
   if (!sender) return;
   const preview = getChatNotificationPreview(message.text || '');
   const messageAt = new Date(message.time).getTime();
@@ -7338,7 +7312,7 @@ function ps3PlayTimeToSeconds(value) {
 }
 
 async function finalizeFriendPlayingActivity(actorName, previousStatus, at = Date.now()) {
-  const actor = normalizeFriendActivityName(actorName);
+  const actor = normalizeSocialUserName(actorName);
   const previous = previousStatus && typeof previousStatus === 'object' ? previousStatus : {};
   const titleId = normalizeText(previous.titleId, '').toUpperCase().slice(0, 32);
   const title = normalizeText(previous.title, '').slice(0, 140);
@@ -7437,7 +7411,7 @@ function disconnectUserSessions(name, eventName = 'user_kicked', payload = {}) {
 const pendingFriendOfflineTimers = new Map();
 
 function cancelFriendActivityOffline(name) {
-  const key = normalizeFriendActivityName(name).toLowerCase();
+  const key = normalizeSocialUserName(name).toLowerCase();
   if (!key) return;
   const timer = pendingFriendOfflineTimers.get(key);
   if (timer) clearTimeout(timer);
@@ -7445,7 +7419,7 @@ function cancelFriendActivityOffline(name) {
 }
 
 function scheduleFriendActivityOffline(name, lastSeen = Date.now(), reason = 'disconnect') {
-  const actor = normalizeFriendActivityName(name);
+  const actor = normalizeSocialUserName(name);
   const key = actor.toLowerCase();
   const at = normalizeTimestampValue(lastSeen) || Date.now();
   if (!actor) return;
@@ -7940,6 +7914,10 @@ async function deleteUserAccount(targetName, reason, adminName) {
     'INSERT INTO deleted_accounts (name, data, deleted_at) VALUES ($1, $2, NOW()) ON CONFLICT (name) DO UPDATE SET data = $2, deleted_at = NOW()',
     [targetName, deletedData]
   );
+  // Account deletion bypasses the normal disconnect presence cleanup after userDatabase is removed.
+  // Cancel any grace-period offline event and remove every persisted session explicitly.
+  cancelFriendActivityOffline(targetName);
+  await pool.query('DELETE FROM presence_sessions WHERE name = $1', [targetName]);
   await pool.query('DELETE FROM users WHERE name = $1', [targetName]);
   await pool.query('DELETE FROM friend_activity_read_state WHERE user_name = $1', [targetName]);
   await pool.query('DELETE FROM friend_activity_dismissed WHERE user_name = $1', [targetName]);
@@ -7953,6 +7931,8 @@ async function deleteUserAccount(targetName, reason, adminName) {
   markUserNameIndexDirty();
   delete userCacheMeta[targetName];
   fullUserCacheNames.delete(targetName);
+  lastProfileCountsSignatureByUser.delete(targetName);
+  lastPublicProfileSignatureByUser.delete(targetName);
   clearGamePlayersSummaryCache();
   disconnectUserSessions(targetName, 'account_deleted', { reason: deleteReason, by: adminName || 'Admin' });
   await emitOnlineList();
@@ -10355,7 +10335,7 @@ io.on('connection', (socket) => {
   socket.on('message_reaction', async (data = {}) => {
     const messageId = String(data.msgId || '');
     const emoji = normalizeText(data.emoji, '').slice(0, 24);
-    const actor = normalizeUserNotificationName(socket.userName || data.user);
+    const actor = normalizeSocialUserName(socket.userName || data.user);
     if (!messageId || !emoji || !actor) return;
 
     const msg = messageHistory.find(m => String(new Date(m.time).getTime()) === messageId);
