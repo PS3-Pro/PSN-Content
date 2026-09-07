@@ -12666,7 +12666,7 @@ P
 		if (next.ps3Ip === "") {
 			try {
 				if (typeof _lastConnectionState !== 'undefined') _lastConnectionState = false;
-				if (typeof connectionMonitorTimer !== 'undefined' && connectionMonitorTimer) { clearInterval(connectionMonitorTimer); connectionMonitorTimer = null; }
+				if (typeof stopConnectionMonitorRuntime === 'function') stopConnectionMonitorRuntime();
 				const globalIcon = document.getElementById('global-status-icon');
 				if (globalIcon) {
 					globalIcon.className = "fas fa-circle status-dot-base status-dot-disconnected";
@@ -15561,6 +15561,13 @@ P
 			}
 
 			if (returnRevealCloaked) {
+				/* Interaction locks only belong to the previous Explore visit. The cached/pre-armed
+				   return path reuses the same card DOM, so release stale locks only for the visible
+				   batch that is about to reveal; :hover can immediately settle the card again now. */
+				firstVisibleCards.forEach(card => {
+					if (card?.dataset?.exploreRevealInteractionLock === '1') delete card.dataset.exploreRevealInteractionLock;
+				});
+
 				/* Interrupted reveals can leave only a tiny exceptional set with an active class/inline
 				   opacity. Settle those, arm the visible batch under the cloak, then expose the view. */
 				const staleCards = exploreView.querySelectorAll(
@@ -18292,15 +18299,19 @@ P
         return ['games', 'soundtracks', 'videos', 'apps', 'demos', 'updates'].includes(category) && region === 'ALL';
     }
 
-    function updateBrowseTypeFilterVisibility(categoryOverride = null) {
+    function updateBrowseTypeFilterVisibility(categoryOverride = null, allowShow = true) {
         const catEl = document.getElementById('cat-select');
         const category = categoryOverride !== null ? categoryOverride : (catEl ? catEl.value : '');
         const inContextualView = !!browseExpandedGroupTitle || !!(navHistory && navHistory.lockSearch === true);
         const consoleFilters = document.getElementById('console-filters');
         const appFilters = document.getElementById('app-filters');
+        const showConsoleFilters = !inContextualView && category === 'games';
+        const showAppFilters = !inContextualView && category === 'apps';
 
-        if (consoleFilters) consoleFilters.style.display = (!inContextualView && category === 'games') ? 'flex' : 'none';
-        if (appFilters) appFilters.style.display = (!inContextualView && category === 'apps') ? 'flex' : 'none';
+        // Category changes hide invalid controls immediately, but never expose the next category's
+        // controls before the native select has visually committed its new value.
+        if (consoleFilters && (!showConsoleFilters || allowShow)) consoleFilters.style.display = showConsoleFilters ? 'flex' : 'none';
+        if (appFilters && (!showAppFilters || allowShow)) appFilters.style.display = showAppFilters ? 'flex' : 'none';
     }
 
     function isBrowseRegionSelectLocked(categoryOverride = null) {
@@ -18364,7 +18375,7 @@ P
         window.setAlphabeticalSortButtonEnabled('browse', !inRegionsView && count > 1, inRegionsView ? 'regions' : 'count');
     }
 
-    function updateGroupTitleFilterVisibility(categoryOverride = null, regionOverride = null) {
+    function updateGroupTitleFilterVisibility(categoryOverride = null, regionOverride = null, allowShow = true) {
         const wrap = getBrowseGroupTitleWrap();
         const toggle = getBrowseGroupTitleToggle();
         if (!wrap) return;
@@ -18382,6 +18393,10 @@ P
             if (!allowedHere) clearBrowseExpandedGroupTitle();
             return;
         }
+
+        // During the native category-select handoff, preserve an already-visible valid control but
+        // do not reveal a previously-hidden Group Titles pill until the category render takes over.
+        if (!allowShow && wrap.classList.contains('is-hidden')) return;
 
         wrap.classList.remove('is-hidden');
         wrap.classList.toggle('group-titles-separated', category === 'games' || category === 'apps');
@@ -21011,9 +21026,9 @@ P
 			if (catSelect) catSelect.value = category;
 			if (searchInput) searchInput.value = titleId;
 
-			if (typeof updateBrowseTypeFilterVisibility === 'function') {
-				updateBrowseTypeFilterVisibility(category);
-			}
+			if (typeof updateBrowseTypeFilterVisibility === 'function') updateBrowseTypeFilterVisibility(category);
+			if (typeof updateGroupTitleFilterVisibility === 'function') updateGroupTitleFilterVisibility(category, document.getElementById('region-select')?.value || 'ALL');
+			if (typeof syncBrowseRegionSelectState === 'function') syncBrowseRegionSelectState(category);
 
 			if (typeof renderLetterFilter === 'function') {
 				activeLetter = "ALL"; 
@@ -22136,6 +22151,8 @@ P
 			if (missingRapToggle) missingRapToggle.checked = !!history.showMissingRap;
 			
 			if (typeof updateBrowseTypeFilterVisibility === 'function') updateBrowseTypeFilterVisibility(history.category);
+			if (typeof updateGroupTitleFilterVisibility === 'function') updateGroupTitleFilterVisibility(history.category, history.region || 'ALL');
+			if (typeof syncBrowseRegionSelectState === 'function') syncBrowseRegionSelectState(history.category);
 	
 			if (typeof activeLetter !== 'undefined') {
 				activeLetter = history.letter || "ALL";
@@ -26466,10 +26483,13 @@ P
         navHistory = null; 
         if (typeof clearBrowseExpandedGroupTitle === 'function') clearBrowseExpandedGroupTitle();
         if (typeof syncBrowseContextualSearchState === 'function') syncBrowseContextualSearchState('view-browse');
-        if (typeof updateBrowseTypeFilterVisibility === 'function') updateBrowseTypeFilterVisibility(cat);
-        
         document.getElementById('search-input').value = "";
         document.getElementById('region-select').value = "ALL";
+        // Hide controls that are invalid for the new category immediately, but do not expose
+        // category-specific controls before the native select has visually committed the choice.
+        // The normal fetch/apply path performs the full reveal after the deferred category handoff.
+        if (typeof updateBrowseTypeFilterVisibility === 'function') updateBrowseTypeFilterVisibility(cat, false);
+        if (typeof updateGroupTitleFilterVisibility === 'function') updateGroupTitleFilterVisibility(cat, 'ALL', false);
 		window.__browseMissingRapSearchCandidateCount = 0;
 		window.__browseCanFilterMissingRap = false;
 		if (typeof primeMissingRapFilterShell === 'function') primeMissingRapFilterShell();
@@ -26960,6 +26980,8 @@ P
 
 			document.getElementById('cat-select').value = category;
 			if (typeof updateBrowseTypeFilterVisibility === 'function') updateBrowseTypeFilterVisibility(category);
+			if (typeof updateGroupTitleFilterVisibility === 'function') updateGroupTitleFilterVisibility(category, 'ALL');
+			if (typeof syncBrowseRegionSelectState === 'function') syncBrowseRegionSelectState(category);
             // Same visible reset as before, without re-running the rest of the deferred filter UI.
             if (typeof renderLetterFilter === 'function') renderLetterFilter();
 
@@ -42459,6 +42481,8 @@ P
 	let connectionMonitorTimer = null;
 	let _lastConnectionState = null;
 	let ps3PingInFlight = false;
+	let ps3PingAbortController = null;
+	let ps3PingRequestRevision = 0;
 	let ps3ConnectionMisses = 0;
 	let ps3AutoScanBusy = false;
 	let ps3AutoScanTimer = null;
@@ -42998,13 +43022,32 @@ P
 			(Number(a.playTimeUpdatedAt || 0) || 0) === (Number(b.playTimeUpdatedAt || 0) || 0);
 	}
 
+	function stopConnectionMonitorRuntime() {
+		if (connectionMonitorTimer) {
+			clearInterval(connectionMonitorTimer);
+			connectionMonitorTimer = null;
+		}
+		ps3PingRequestRevision++;
+		if (ps3PingAbortController) {
+			try { ps3PingAbortController.abort(); } catch (e) {}
+			ps3PingAbortController = null;
+		}
+		ps3PingInFlight = false;
+	}
+
 	async function pingConsole() {
 		if (ps3PingInFlight) return;
 		if (typeof isUserSessionReadyForConsole === 'function' && !isUserSessionReadyForConsole()) return;
 		ps3PingInFlight = true;
+		const pingRevision = ps3PingRequestRevision;
+		const pingUsername = String(localStorage.getItem('psn_username') || '').trim();
 
 		const ipInput = document.getElementById('ps3-ip');
 		const ip = String(ipInput?.value || '').trim();
+		const isCurrentPing = () => pingRevision === ps3PingRequestRevision
+			&& String(localStorage.getItem('psn_username') || '').trim() === pingUsername
+			&& String(document.getElementById('ps3-ip')?.value || '').trim() === ip
+			&& (typeof isUserSessionReadyForConsole !== 'function' || isUserSessionReadyForConsole());
 		if (!ip) {
 			ps3PingInFlight = false;
 			ps3ConnectionMisses = 0;
@@ -43052,17 +43095,20 @@ P
 		const isGamesSubActive = gamesSubview?.style.display === 'block' || gamesSubview?.style.display === 'flex';
 		const shouldManageSearch = isLibraryActive && isGamesSubActive;
 
+		let controller = null;
 		try {
-			const controller = new AbortController();
+			controller = new AbortController();
+			ps3PingAbortController = controller;
 			const timeoutId = setTimeout(() => controller.abort(), 3000);
 			const res = await fetch(`http://${ip}/cpursx.ps3`, { signal: controller.signal, cache: 'no-store' });
 			const html = await res.text();
+			clearTimeout(timeoutId);
+			if (!isCurrentPing()) return;
 			window.__latestWebmanHealthHtml = html;
 			const monitorLiveVisible = typeof isVisibleConsoleLibrarySection === 'function'
 				? (isVisibleConsoleLibrarySection('view-library') && isVisibleConsoleLibrarySection('subview-monitor'))
 				: false;
 			if (monitorLiveVisible && typeof updateConsoleDashboardFromWebmanHtml === 'function') updateConsoleDashboardFromWebmanHtml(html, true);
-			clearTimeout(timeoutId);
 
 			ps3ConnectionMisses = 0;
 
@@ -43154,6 +43200,7 @@ P
 			}
 
 		} catch (err) {
+			if (!isCurrentPing()) return;
 			ps3ConnectionMisses++;
 
 			if (_lastConnectionState === true && ps3ConnectionMisses < PS3_OFFLINE_MISSES_REQUIRED) {
@@ -43181,7 +43228,8 @@ P
 			}
 			applyPs3DisconnectedUi(favDot, globalIcon, btnConnect, btnShutdown);
 		} finally {
-			ps3PingInFlight = false;
+			if (ps3PingAbortController === controller) ps3PingAbortController = null;
+			if (pingRevision === ps3PingRequestRevision) ps3PingInFlight = false;
 		}
 	}
 	
@@ -43224,7 +43272,7 @@ P
 	
 	function startConnectionMonitor() {
 		if (typeof isUserSessionReadyForConsole === 'function' && !isUserSessionReadyForConsole()) return;
-		if (connectionMonitorTimer) clearInterval(connectionMonitorTimer);
+		stopConnectionMonitorRuntime();
 		pingConsole();
 		connectionMonitorTimer = setInterval(pingConsole, 5000);
 	}
@@ -49716,7 +49764,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 			searchBar.style.display = 'none';
 		}
 	
-		if (connectionMonitorTimer) { clearInterval(connectionMonitorTimer); connectionMonitorTimer = null; }
+		stopConnectionMonitorRuntime();
 		ps3ConnectionMisses = 0;
 		ps3AutoScanBusy = false;
 		companionPluginLastLoadAt = 0;
@@ -49778,7 +49826,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 			fetch(`http://${ip}/shutdown.ps3`, { mode: 'no-cors' }).catch(e => console.log("Shutdown sent"));
 			
 			setTimeout(() => {
-				if (connectionMonitorTimer) { clearInterval(connectionMonitorTimer); connectionMonitorTimer = null; }
+				stopConnectionMonitorRuntime();
 				ps3ConnectionMisses = (typeof PS3_OFFLINE_MISSES_REQUIRED !== 'undefined') ? PS3_OFFLINE_MISSES_REQUIRED : 3;
 				const wasConnectedBeforeOffline = _lastConnectionState === true;
 				_lastConnectionState = false;
@@ -65439,6 +65487,11 @@ function getVisibleChatStackEl(id) {
 			presenceBurst.friends = presenceBurst.online = presenceBurst.admin = presenceBurst.chat = presenceBurst.count = presenceBurst.persistFriends = false;
 			if (presenceBurst.names instanceof Set) presenceBurst.names.clear();
 		}
+		if (typeof stopConnectionMonitorRuntime === 'function') stopConnectionMonitorRuntime();
+		if (typeof stopLocalPs3PlayTimeTicker === 'function') stopLocalPs3PlayTimeTicker();
+		if (typeof stopProfilePlayTimeTicker === 'function') stopProfilePlayTimeTicker();
+		window.myCurrentPS3Status = null;
+		window.__latestWebmanHealthHtml = '';
 		window.isProfileLoaded = false;
 		if (typeof window.resetProfileClientSyncRuntime === 'function') window.resetProfileClientSyncRuntime();
 		window.__trophiesHydrated = false;
