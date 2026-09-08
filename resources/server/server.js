@@ -773,8 +773,9 @@ let profileHydrationQueued = 0;
 let profileHydrationActive = 0;
 let profileSyncActiveSockets = 0;
 const MEMORY_TRACE_ENABLED = String(process.env.MEMORY_TRACE || 'false').trim().toLowerCase() === 'true';
-const CHAT_MEMORY_TRACE_ENABLED = !['0','false','off','no'].includes(String(process.env.CHAT_MEMORY_TRACE ?? 'true').trim().toLowerCase());
+const CHAT_MEMORY_TRACE_ENABLED = ['1','true','on','yes'].includes(String(process.env.CHAT_MEMORY_TRACE ?? '').trim().toLowerCase());
 let chatMemoryTraceSequence = 0;
+const CHAT_MEMORY_TRACE_NOOP = Object.freeze({ id:'', stage:() => {}, finish:() => {} });
 
 function getSocketWriteBufferLength(socket) {
   try {
@@ -1018,7 +1019,7 @@ function formatChatTraceMeta(meta = {}) {
 }
 
 function createChatMemoryTrace(operation, socket = null, meta = {}) {
-  if (!CHAT_MEMORY_TRACE_ENABLED) return { id:'', stage:() => {}, finish:() => {} };
+  if (!CHAT_MEMORY_TRACE_ENABLED) return CHAT_MEMORY_TRACE_NOOP;
   const actor = getChatTraceActorContext(socket);
   const id = `${String(operation || 'chat')}-${Date.now().toString(36)}-${(++chatMemoryTraceSequence).toString(36)}`;
   const startedAt = Date.now();
@@ -1090,7 +1091,7 @@ function summarizeChatDeleteTracePayload(rawTargets = []) {
 }
 
 if (CHAT_MEMORY_TRACE_ENABLED) {
-  console.log('[CHAT MEM] diagnostics enabled (set CHAT_MEMORY_TRACE=false to disable after testing).');
+  console.log('[CHAT MEM] diagnostics enabled via CHAT_MEMORY_TRACE.');
 }
 
 let chatTraceTrafficCounters = Object.create(null);
@@ -10516,10 +10517,12 @@ io.on('connection', (socket) => {
 
     recordChatTraceTraffic('send', 1);
     if (socket.isAdmin === true) recordChatTraceTraffic('sendAdmin', 1);
-    const incomingTraceStats = summarizeChatTracePayload(incoming);
-    const chatTrace = createChatMemoryTrace('send', socket, incomingTraceStats);
-    const sanitizedTraceStats = summarizeChatTracePayload(messageData);
-    chatTrace.stage('sanitized', { storedPayload:sanitizedTraceStats.payload, storedType:sanitizedTraceStats.type, storedTextBytes:sanitizedTraceStats.textBytes, storedContentCount:sanitizedTraceStats.contentCount, storedContentBytes:sanitizedTraceStats.contentBytes });
+    const incomingTraceStats = CHAT_MEMORY_TRACE_ENABLED ? summarizeChatTracePayload(incoming) : null;
+    const chatTrace = createChatMemoryTrace('send', socket, incomingTraceStats || {});
+    if (CHAT_MEMORY_TRACE_ENABLED) {
+      const sanitizedTraceStats = summarizeChatTracePayload(messageData);
+      chatTrace.stage('sanitized', { storedPayload:sanitizedTraceStats.payload, storedType:sanitizedTraceStats.type, storedTextBytes:sanitizedTraceStats.textBytes, storedContentCount:sanitizedTraceStats.contentCount, storedContentBytes:sanitizedTraceStats.contentBytes });
+    }
 
     messageData.isAdmin = isAdmin;
     messageData.role = actorRole;
@@ -10528,7 +10531,7 @@ io.on('connection', (socket) => {
 
     try {
       const savedMessage = cleanChatMessage(messageData);
-      chatTrace.stage('before_db_insert', { savedPayload:summarizeChatTracePayload(savedMessage).payload });
+      chatTrace.stage('before_db_insert', CHAT_MEMORY_TRACE_ENABLED ? { savedPayload:summarizeChatTracePayload(savedMessage).payload } : {});
       const savedRes = await pool.query('INSERT INTO chat (message) VALUES ($1) RETURNING id', [savedMessage]);
       chatTrace.stage('after_db_insert');
       attachChatDbId(messageData, savedRes.rows[0]?.id);
@@ -11137,7 +11140,7 @@ io.on('connection', (socket) => {
     const ids = Array.isArray(data && data.msgIds) ? data.msgIds : [];
     recordChatTraceTraffic('seenBatch', 1);
     recordChatTraceTraffic('seenIds', ids.length);
-    const trace = createChatMemoryTrace('seen_batch', socket, { ids:ids.length, request:formatChatTraceBytes(ids.reduce((sum, id) => sum + chatTraceByteLength(id), 0)) });
+    const trace = createChatMemoryTrace('seen_batch', socket, CHAT_MEMORY_TRACE_ENABLED ? { ids:ids.length, request:formatChatTraceBytes(ids.reduce((sum, id) => sum + chatTraceByteLength(id), 0)) } : {});
     socket.__chatSeenBatchInFlight = true;
     try {
       trace.stage('before_process');
@@ -11240,7 +11243,7 @@ io.on('connection', (socket) => {
     recordChatTraceTraffic('deleteBatch', 1);
     recordChatTraceTraffic('deleteIds', rawTargets.length);
     if (socket.isAdmin === true) recordChatTraceTraffic('deleteBatchAdmin', 1);
-    const deleteTrace = createChatMemoryTrace('delete_batch', socket, summarizeChatDeleteTracePayload(rawTargets));
+    const deleteTrace = createChatMemoryTrace('delete_batch', socket, CHAT_MEMORY_TRACE_ENABLED ? summarizeChatDeleteTracePayload(rawTargets) : {});
     socket.__chatBatchDeleteInFlight = true;
     try {
       deleteTrace.stage('before_resolve');
@@ -11339,7 +11342,7 @@ io.on('connection', (socket) => {
     if (!msgId) return respond({ success: false, message: 'Invalid message.' });
     recordChatTraceTraffic('deleteSingle', 1);
     if (socket.isAdmin === true) recordChatTraceTraffic('deleteSingleAdmin', 1);
-    const deleteTrace = createChatMemoryTrace('delete_single', socket, { request:formatChatTraceBytes(chatTraceByteLength(msgId) + chatTraceByteLength(data && data.msgTime)) });
+    const deleteTrace = createChatMemoryTrace('delete_single', socket, CHAT_MEMORY_TRACE_ENABLED ? { request:formatChatTraceBytes(chatTraceByteLength(msgId) + chatTraceByteLength(data && data.msgTime)) } : {});
 
     try {
       deleteTrace.stage('before_resolve');
