@@ -1,3 +1,6 @@
+// ============================================================================
+// Dependencies & HTTP bootstrap
+// ============================================================================
 const express = require('express');
 const http = require('http');
 const https = require('https');
@@ -8,12 +11,17 @@ const bcrypt = require('bcrypt');
 const app = express();
 const server = http.createServer(app);
 
-
+// ============================================================================
+// Core identity & defaults
+// ============================================================================
 const ADMIN_USERS = ["Luan Teles", "Goku Cheats", "JumpSuit"];
 
 const DEFAULT_AVATAR = "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/interface/modern/images/avatars/default.png";
 
-const MAX_CHAT_HISTORY = 1000; 
+// ============================================================================
+// Chat limits & payload guards
+// ============================================================================
+const MAX_CHAT_HISTORY = 1000;
 const CHAT_SYNC_CHANGE_LOG_MAX = Math.max(1000, Math.min(20000, parseInt(process.env.CHAT_SYNC_CHANGE_LOG_MAX || "5000", 10) || 5000));
 const CHAT_SYNC_MAX_DELTA = Math.max(100, Math.min(5000, parseInt(process.env.CHAT_SYNC_MAX_DELTA || "1500", 10) || 1500));
 const CHAT_BATCH_DELETE_MAX = 100;
@@ -28,6 +36,9 @@ const CHAT_POLL_OPTIONS_MAX = 20;
 const CHAT_POLL_OPTION_TEXT_MAX = 4096;
 const CHAT_POLL_VOTERS_MAX = 5000;
 
+// ============================================================================
+// Runtime, presence & application limits
+// ============================================================================
 const SERVER_STARTED_AT = Date.now();
 const INSTANCE_ID = process.env.RENDER_INSTANCE_ID || process.env.RAILWAY_REPLICA_ID || process.env.HOSTNAME || `instance-${Math.random().toString(36).slice(2, 10)}`;
 const PRESENCE_TTL_SECONDS = 90;
@@ -51,7 +62,29 @@ const USER_CACHE_REFRESH_INTERVAL_MS = 30000;
 const PASSWORD_RESET_WINDOW_MS = 10 * 60 * 1000;
 const DEFAULT_MAINTENANCE_MESSAGE = "The service is under maintenance. Please try again soon.";
 const VALID_USER_ROLES = new Set(["user", "trusted", "mod", "admin"]);
-const VALID_PROFILE_COUNTRY_CODES = new Set(['AD','AE','AF','AG','AI','AL','AM','AO','AQ','AR','AS','AT','AU','AW','AX','AZ','BA','BB','BD','BE','BF','BG','BH','BI','BJ','BL','BM','BN','BO','BQ','BR','BS','BT','BV','BW','BY','BZ','CA','CC','CD','CF','CG','CH','CI','CK','CL','CM','CN','CO','CR','CU','CV','CW','CX','CY','CZ','DE','DJ','DK','DM','DO','DZ','EC','EE','EG','EH','ER','ES','ET','FI','FJ','FK','FM','FO','FR','GA','GB','GD','GE','GF','GG','GH','GI','GL','GM','GN','GP','GQ','GR','GS','GT','GU','GW','GY','HK','HM','HN','HR','HT','HU','ID','IE','IL','IM','IN','IO','IQ','IR','IS','IT','JE','JM','JO','JP','KE','KG','KH','KI','KM','KN','KP','KR','KW','KY','KZ','LA','LB','LC','LI','LK','LR','LS','LT','LU','LV','LY','MA','MC','MD','ME','MF','MG','MH','MK','ML','MM','MN','MO','MP','MQ','MR','MS','MT','MU','MV','MW','MX','MY','MZ','NA','NC','NE','NF','NG','NI','NL','NO','NP','NR','NU','NZ','OM','PA','PE','PF','PG','PH','PK','PL','PM','PN','PR','PS','PT','PW','PY','QA','RE','RO','RS','RU','RW','SA','SB','SC','SD','SE','SG','SH','SI','SJ','SK','SL','SM','SN','SO','SR','SS','ST','SV','SX','SY','SZ','TC','TD','TF','TG','TH','TJ','TK','TL','TM','TN','TO','TR','TT','TV','TW','TZ','UA','UG','UM','US','UY','UZ','VA','VC','VE','VG','VI','VN','VU','WF','WS','YE','YT','ZA','ZM','ZW']);
+const VALID_PROFILE_COUNTRY_CODES = new Set([
+  'AD', 'AE', 'AF', 'AG', 'AI', 'AL', 'AM', 'AO', 'AQ', 'AR', 'AS', 'AT',
+  'AU', 'AW', 'AX', 'AZ', 'BA', 'BB', 'BD', 'BE', 'BF', 'BG', 'BH', 'BI',
+  'BJ', 'BL', 'BM', 'BN', 'BO', 'BQ', 'BR', 'BS', 'BT', 'BV', 'BW', 'BY',
+  'BZ', 'CA', 'CC', 'CD', 'CF', 'CG', 'CH', 'CI', 'CK', 'CL', 'CM', 'CN',
+  'CO', 'CR', 'CU', 'CV', 'CW', 'CX', 'CY', 'CZ', 'DE', 'DJ', 'DK', 'DM',
+  'DO', 'DZ', 'EC', 'EE', 'EG', 'EH', 'ER', 'ES', 'ET', 'FI', 'FJ', 'FK',
+  'FM', 'FO', 'FR', 'GA', 'GB', 'GD', 'GE', 'GF', 'GG', 'GH', 'GI', 'GL',
+  'GM', 'GN', 'GP', 'GQ', 'GR', 'GS', 'GT', 'GU', 'GW', 'GY', 'HK', 'HM',
+  'HN', 'HR', 'HT', 'HU', 'ID', 'IE', 'IL', 'IM', 'IN', 'IO', 'IQ', 'IR',
+  'IS', 'IT', 'JE', 'JM', 'JO', 'JP', 'KE', 'KG', 'KH', 'KI', 'KM', 'KN',
+  'KP', 'KR', 'KW', 'KY', 'KZ', 'LA', 'LB', 'LC', 'LI', 'LK', 'LR', 'LS',
+  'LT', 'LU', 'LV', 'LY', 'MA', 'MC', 'MD', 'ME', 'MF', 'MG', 'MH', 'MK',
+  'ML', 'MM', 'MN', 'MO', 'MP', 'MQ', 'MR', 'MS', 'MT', 'MU', 'MV', 'MW',
+  'MX', 'MY', 'MZ', 'NA', 'NC', 'NE', 'NF', 'NG', 'NI', 'NL', 'NO', 'NP',
+  'NR', 'NU', 'NZ', 'OM', 'PA', 'PE', 'PF', 'PG', 'PH', 'PK', 'PL', 'PM',
+  'PN', 'PR', 'PS', 'PT', 'PW', 'PY', 'QA', 'RE', 'RO', 'RS', 'RU', 'RW',
+  'SA', 'SB', 'SC', 'SD', 'SE', 'SG', 'SH', 'SI', 'SJ', 'SK', 'SL', 'SM',
+  'SN', 'SO', 'SR', 'SS', 'ST', 'SV', 'SX', 'SY', 'SZ', 'TC', 'TD', 'TF',
+  'TG', 'TH', 'TJ', 'TK', 'TL', 'TM', 'TN', 'TO', 'TR', 'TT', 'TV', 'TW',
+  'TZ', 'UA', 'UG', 'UM', 'US', 'UY', 'UZ', 'VA', 'VC', 'VE', 'VG', 'VI',
+  'VN', 'VU', 'WF', 'WS', 'YE', 'YT', 'ZA', 'ZM', 'ZW'
+]);
 const ADMIN_STATE_KEYS = {
   maintenance: "maintenance",
   chatControls: "chat_controls",
@@ -59,6 +92,9 @@ const ADMIN_STATE_KEYS = {
   reports: "reports"
 };
 
+// ============================================================================
+// PostgreSQL pool & shared server limits
+// ============================================================================
 // Aiven PostgreSQL Free has a small connection budget; keep the app pool at 5 max.
 // One additional dedicated PostgreSQL Client is used for LISTEN/NOTIFY outside this pool.
 const PG_POOL_MAX = Math.max(1, Math.min(5, parseInt(process.env.PG_POOL_MAX || process.env.DB_POOL_MAX || "5", 10) || 5));
@@ -107,6 +143,9 @@ const lastPublicProfileSignatureByUser = new Map();
 let lastBroadcastTrendingSignature = "";
 let lastBroadcastGlobalTrophyStatsSignature = "";
 
+// ============================================================================
+// Core cache, database reliability & runtime helpers
+// ============================================================================
 function invalidateOnlineListCache(reason = "") {
   onlineListCache = null;
   onlineListCacheAt = 0;
@@ -283,6 +322,9 @@ function runNonOverlappingTask(taskName, taskFn) {
   };
 }
 
+// ============================================================================
+// Keep-alive & lightweight HTTP endpoints
+// ============================================================================
 let keepAliveInterval = null;
 
 function getKeepAlivePingUrl(rawUrl) {
@@ -429,7 +471,9 @@ app.post('/api/site-visits', async (req, res) => {
   }
 });
 
-
+// ============================================================================
+// Metadata proxy: IGDB / Steam
+// ============================================================================
 const DEFAULT_IGDB_CLIENT_ID = String(process.env.IGDB_CLIENT_ID || process.env.TWITCH_CLIENT_ID || '').trim();
 const DEFAULT_IGDB_CLIENT_SECRET = String(process.env.IGDB_CLIENT_SECRET || process.env.TWITCH_CLIENT_SECRET || '').trim();
 const METADATA_PROXY_TIMEOUT_MS = Math.max(2500, parseInt(process.env.METADATA_PROXY_TIMEOUT_MS || '8000', 10) || 8000);
@@ -723,6 +767,9 @@ app.get('/api/metadata/steam/details', async (req, res) => {
   }
 });
 
+// ============================================================================
+// User cache, profile data, database schema & statistics
+// ============================================================================
 let userDatabase = {};
 let userNameIndexDirty = true;
 let userNameIndexAlpha = [];
@@ -1214,7 +1261,6 @@ async function refreshServerLogFromDb() {
   return serverLog;
 }
 
-
 async function initDb() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
@@ -1443,7 +1489,7 @@ async function initDb() {
 
   await backfillRecentChatSeenEventsFromLegacyMessages();
   await refreshChatHistoryFromDb();
-  
+
   const pinnedRes = await pool.query('SELECT data FROM pinned_messages ORDER BY id ASC');
   pinnedMessages = pinnedRes.rows.map(r => r.data);
 
@@ -1525,11 +1571,9 @@ async function calculateGlobalTrophyStatsFromDb() {
   return stats;
 }
 
-
 function normalizeText(value, fallback = "") {
   return String(value === undefined || value === null ? fallback : value).trim();
 }
-
 
 function normalizeDownloadHistoryNameServer(value) {
   return normalizeText(value, '').toLowerCase().replace(/&amp;/g, '&').replace(/[^a-z0-9]+/g, '');
@@ -1676,7 +1720,6 @@ function normalizeDownloadHistoryRecordsServer(history = []) {
   if (grouped.length !== source.length) changed = true;
   return { history: grouped, changed };
 }
-
 
 function normalizeLibraryIdentityTextServer(value) {
   return normalizeText(value, '')
@@ -2125,8 +2168,6 @@ function normalizeUserRecord(name, userData = {}) {
   return normalized;
 }
 
-
-
 const PROFILE_NOTIFICATION_STATE_VERSION = 1;
 const PROFILE_NOTIFICATION_CATEGORIES = new Set(['downloads', 'wishlist', 'favorites', 'trophies']);
 
@@ -2272,10 +2313,6 @@ function hasObjectPayload(value) {
   return !!(value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).length > 0);
 }
 
-
-
-
-
 function countUnlockedTrophiesPayload(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return 0;
   return Object.values(value).reduce((count, trophy) => {
@@ -2284,7 +2321,6 @@ function countUnlockedTrophiesPayload(value) {
     return count + (unlocked === 'true' || unlocked === '1' || unlocked === 'yes' ? 1 : 0);
   }, 0);
 }
-
 
 function shouldAcceptIncomingTrophies(currentUser = {}, incomingUser = {}) {
   if (!incomingUser || !hasObjectPayload(incomingUser.trophiesData)) return false;
@@ -2646,7 +2682,6 @@ function normalizeProfileArrayListServer(key, value, existing = []) {
   return list;
 }
 
-
 function stampNewFriendAddedAtServer(existingList = [], incomingList = []) {
   const existingByName = new Map();
   getProfileArrayPayload(existingList).forEach(item => {
@@ -2679,7 +2714,6 @@ function stampNewFriendAddedAtServer(existingList = [], incomingList = []) {
 function hasOwnPayload(target = {}, key = '') {
   return Object.prototype.hasOwnProperty.call(target || {}, key);
 }
-
 
 function normalizeProfileArrayPayloads(target = {}) {
   Object.keys(PROFILE_ARRAY_SYNC_KEYS).forEach(key => {
@@ -2736,9 +2770,6 @@ function reconcileIncomingProfileArrays(currentUser = {}, incomingUser = {}) {
 
   return incomingUser;
 }
-
-
-
 
 function reconcileIncomingDownloads(currentUser = {}, incomingUser = {}) {
   const currentClearAt = normalizeTimestampValue(currentUser.downloadsClearedAt);
@@ -2856,7 +2887,6 @@ function getPublicUserData(username, user = {}, includeAdminFields = false) {
 
   return safe;
 }
-
 
 const COMPACT_PROFILE_SETTING_KEYS = new Set([
   'audio', 'ux', 'hapticFeedback', 'haptics', 'cardBlur', 'cardBlurEnabled', 'gameCardBlur', 'recentlyVisitedVisible',
@@ -3064,7 +3094,6 @@ async function refreshSingleUserSummaryFromDb(name, options = {}) {
   if (options.invalidateOnlineList !== false) invalidateOnlineListCache('single-user-summary-refresh');
   return userDatabase[safeName];
 }
-
 
 async function refreshAllUsersCacheFromDb(options = {}) {
   if (userCacheRefreshInFlight) return userCacheRefreshInFlight;
@@ -3631,7 +3660,6 @@ function withTimeout(promise, ms, fallbackValue) {
   ]);
 }
 
-
 async function getUserFromDb(name) {
   return await refreshSingleUserCacheFromDb(name, { forceDuringWrite: true });
 }
@@ -3674,8 +3702,6 @@ async function getUserDataPayloadFromDb(targetName, type) {
   if (dataKey === 'recentlyVisitedData') return normalizeRecentlyVisitedRecordsServer(payload);
   return payload;
 }
-
-
 
 function normalizeGamePlayersTitleId(value) {
   return getLibraryGameTitleIdServer({ titleId: value, id: value });
@@ -3896,7 +3922,6 @@ async function isExistingGameOwner(userName, rawTitleId) {
   return !!result.rows[0];
 }
 
-
 async function notifyPlayTogetherPlayers(actorName, rawTitleId, rawTitle) {
   const actor = normalizeSocialUserName(actorName);
   const titleId = normalizeGamePlayersTitleId(rawTitleId);
@@ -3979,7 +4004,6 @@ async function setGamePlayTogether(userName, rawTitleId, enabled, rawTitle, opti
   // The handler immediately reads the authoritative summary, so avoid a second standalone DB read here.
   return { ok: true, enabled: enabled === true, changed };
 }
-
 
 async function getPlayTogetherOverviewForUser(userName) {
   const viewerName = normalizeText(userName, '');
@@ -4089,7 +4113,6 @@ async function getPlayTogetherDiscoveryForUser(userName, rawAudience) {
     return item;
   }).filter(item => item.titleId && (audience === 'friends' ? item.friends.length > 0 : item.playerCount > 0));
 }
-
 
 async function getPlayTogetherCommunityTitleIds(userName) {
   const viewerName = normalizeText(userName, '');
@@ -5227,6 +5250,9 @@ async function saveAdminState(key, data) {
   );
 }
 
+// ============================================================================
+// Chat history, seen state, sync & deletion
+// ============================================================================
 function cleanChatMessage(message = {}) {
   const clean = { ...(message || {}) };
   delete clean._dbId;
@@ -5518,7 +5544,6 @@ async function emitLegacyChatSeenCompat(events = []) {
   }
 }
 
-
 async function refreshChatSyncStateFromDb() {
   const result = await queryDbWithRetry(
     'SELECT epoch, revision FROM chat_sync_state WHERE id = 1',
@@ -5799,7 +5824,6 @@ function emitChatBatchDeleteRealtime(batch = {}) {
   trace.finish({ v2Clients, legacyClients, legacyPackets:legacyClients * msgIds.length });
 }
 
-
 function removeChatMessagesFromMemory(msgIds = []) {
   const ids = new Set((Array.isArray(msgIds) ? msgIds : [msgIds]).map(id => String(id || '')).filter(Boolean));
   if (!ids.size || !Array.isArray(messageHistory) || !messageHistory.length) return 0;
@@ -5999,6 +6023,9 @@ async function syncChatAcrossInstances() {
   }
 }
 
+// ============================================================================
+// Admin state, logs, socket indexes & profile realtime sync
+// ============================================================================
 async function emitAdminState(socket) {
   socket.emit('maintenance_mode', adminState.maintenance);
   socket.emit('chat_controls', adminState.chatControls);
@@ -6065,7 +6092,6 @@ async function addModerationLog(type, message, detail = {}, admin = "System") {
   if (chatDeleteTrace) chatDeleteTrace.finish({ adminRecipients:Array.from(adminSockets).filter(client => client && client.connected && client.isAdmin === true).length });
   return entry;
 }
-
 
 async function addServerLog(type, message, detail = {}, user = "Server") {
   const entry = {
@@ -6148,7 +6174,6 @@ async function getActivePresenceCountsForNames(names = []) {
   return counts;
 }
 
-
 function getPresenceDeviceLabel(userAgent = '') {
   const ua = String(userAgent || '').toLowerCase();
   if (!ua) return 'Unknown';
@@ -6198,7 +6223,6 @@ async function getActivePresenceSessionsForName(name) {
     ps3Connected: livePs3Connected
   }));
 }
-
 
 function buildFullProfileSyncPayload(name, user = {}, sourceSocketId = null, options = {}) {
   const safe = options.normalized === true ? user : normalizeUserRecord(name, user || {});
@@ -6250,7 +6274,6 @@ function buildFullProfileSyncPayload(name, user = {}, sourceSocketId = null, opt
     }
   };
 }
-
 
 const PROFILE_SYNC_PATCH_KEYS = new Set([
   'id', 'name', 'avatar', 'joined', 'countryCode', 'role', 'isAdmin', 'isModerator', 'banned',
@@ -6412,7 +6435,6 @@ function profileUpdateTouchesPublicCounts(userData = {}) {
   return !!(userData && Object.entries(PROFILE_HEAVY_SECTION_META).some(([dataKey, meta]) => meta.publicCount !== false && incomingTouchesHeavyProfileSection(userData, dataKey, meta)));
 }
 
-
 function emitSettingsRealtimeSync(name, sourceSocketId = null, extra = {}) {
   if (!name || !userDatabase[name]) return;
   const safe = normalizeUserRecord(name, userDatabase[name] || {});
@@ -6438,7 +6460,6 @@ function emitSettingsRealtimeSync(name, sourceSocketId = null, extra = {}) {
   });
 }
 
-
 async function syncActiveProfilesAcrossInstances() {
   const activeNames = Array.from(socketsByUserName.keys()).filter(name => getSocketsByUserName(name).length > 0);
 
@@ -6461,7 +6482,6 @@ async function syncActiveProfilesAcrossInstances() {
     emitPublicProfileBannerUpdate(name, refreshedUser);
   }
 }
-
 
 async function notifyProfileSyncAcrossInstances(name, sourceSocketId = null, profileUpdatedAt = Date.now(), changes = {}) {
   if (!name) return;
@@ -6595,7 +6615,7 @@ async function initProfileSyncNotifications() {
             serverLog,
             registeredUsers: Object.keys(userDatabase).length,
             countryStats: getAdminCountryStats(),
-      logLimits: getAdminLogLimits()
+            logLimits: getAdminLogLimits()
           });
           return;
         }
@@ -6616,7 +6636,7 @@ async function initProfileSyncNotifications() {
             serverLog,
             registeredUsers: Object.keys(userDatabase).length,
             countryStats: getAdminCountryStats(),
-      logLimits: getAdminLogLimits()
+            logLimits: getAdminLogLimits()
           });
           return;
         }
@@ -6641,7 +6661,7 @@ async function initProfileSyncNotifications() {
             serverLog,
             registeredUsers: Object.keys(userDatabase).length,
             countryStats: getAdminCountryStats(),
-      logLimits: getAdminLogLimits()
+            logLimits: getAdminLogLimits()
           });
           return;
         }
@@ -6817,6 +6837,9 @@ async function initProfileSyncNotifications() {
   }
 }
 
+// ============================================================================
+// Friend activity
+// ============================================================================
 const FRIEND_ACTIVITY_TYPES = new Set(['online', 'offline', 'playing', 'played', 'xmb', 'trophy', 'download', 'library', 'wishlist', 'favorite', 'cheat']);
 const FRIEND_ACTIVITY_REPLACED_IDS_LIMIT = 60;
 const FRIEND_ACTIVITY_ROOM_PREFIX = 'friend-activity:';
@@ -7212,7 +7235,6 @@ async function getFriendActivityState(userName) {
   };
 }
 
-
 async function setFriendActivityReadId(userName, lastReadId) {
   const name = normalizeSocialUserName(userName);
   const safeId = Math.max(0, Math.floor(Number(lastReadId) || 0));
@@ -7307,6 +7329,9 @@ async function getFriendActivityHistoryForUser(userName, afterId = 0, resolvedFr
   return { friendNames, items: result.rows.map(serializeFriendActivityRow).filter(Boolean), lastReadId: state.lastReadId, dismissedThroughId: state.dismissedThroughId, delta: safeAfterId > 0 };
 }
 
+// ============================================================================
+// User notifications & chat notification routing
+// ============================================================================
 const USER_NOTIFICATION_TYPES = new Set(['mention', 'reply', 'reaction', 'trophy', 'catalog', 'game_match', 'play_together']);
 
 function normalizeUserNotificationData(type, rawData = {}) {
@@ -7860,6 +7885,9 @@ async function recordChatUserNotifications(message = {}) {
   })));
 }
 
+// ============================================================================
+// Presence, PS3 activity, moderation & reports
+// ============================================================================
 function ps3PlayTimeToSeconds(value) {
   const playTime = normalizePs3PlayTimeServer(value);
   if (!playTime) return 0;
@@ -8350,7 +8378,6 @@ async function setUserRole(targetName, role, adminName) {
   return { success: true, role: getUserRole(targetName, userDatabase[targetName]), banned: isUserBanned(userDatabase[targetName]) };
 }
 
-
 function resolveCommandTarget(rawArgs = "", options = {}) {
   const args = normalizeText(rawArgs, "");
   if (!args) return { targetName: "", rest: "" };
@@ -8523,8 +8550,9 @@ async function createReport(data = {}, reporterName = "Unknown") {
   return report;
 }
 
-
-
+// ============================================================================
+// Socket.IO server, cross-instance sync & background tasks
+// ============================================================================
 const io = new Server(server, {
   cors: { origin: "*", methods: ["GET", "POST"] },
   maxHttpBufferSize: 1e7
@@ -8583,7 +8611,7 @@ async function syncAdminStateAcrossInstances() {
     serverLog: adminConnected ? serverLog : [],
     registeredUsers: Object.keys(userDatabase).length,
     countryStats: getAdminCountryStats(),
-      logLimits: getAdminLogLimits()
+    logLimits: getAdminLogLimits()
   });
 }
 
@@ -8604,7 +8632,6 @@ function getPostAuthRemainingDelay(socket, totalDelayMs) {
   if (!start) return 0;
   return Math.max(0, totalDelayMs - (Date.now() - start));
 }
-
 
 const CHAT_SYNC_LISTEN_FALLBACK_MS = Math.max(15000, parseInt(process.env.CHAT_SYNC_LISTEN_FALLBACK_MS || '30000', 10) || 30000);
 let chatSyncWakeRequested = false;
@@ -8651,17 +8678,23 @@ function startBackgroundTasks() {
   }
 }
 
+// ============================================================================
+// Client connection & event handlers
+// ============================================================================
 io.on('connection', (socket) => {
   console.log('[NETWORK] Socket connected. ID: ' + socket.id);
   socket.emit('content_limits', getClientContentLimits());
   socket.once('disconnecting', () => { unindexSocketUser(socket); adminSockets.delete(socket); });
   deferServerTask('CONNECTION INIT', () => emitAdminState(socket), 0);
 
+  // --------------------------------------------------------------------------
+  // Authentication & account session
+  // --------------------------------------------------------------------------
   socket.on('authenticate_user', async (data = {}) => {
     try {
       const { name, password, isNewAccount, adminMaintenanceBypass, passwordResetSubmission } = data;
       const safeUserData = (data.userData && typeof data.userData === 'object') ? data.userData : {};
-      
+
       const supportsProfileSyncV2 = data && data.profileSyncV2 === true;
       const supportsProfileSyncAckV1 = data && data.profileSyncAckV1 === true;
       const supportsChatHistoryAckV1 = data && data.chatHistoryAckV1 === true;
@@ -8795,7 +8828,7 @@ io.on('connection', (socket) => {
         }
 
         const match = await bcrypt.compare(password, dbUser.passwordHash);
-        
+
         if (match) {
           socket.__passwordResetRevoked = false;
           indexSocketUser(socket, name);
@@ -8825,7 +8858,7 @@ io.on('connection', (socket) => {
           socket.chatHistoryPullV1 = supportsChatHistoryPullV1;
           socket.chatBatchDeleteV2 = supportsChatBatchDeleteV2;
           socket.chatSeenBatchV1 = supportsChatSeenBatchV1;
-          
+
           markSocketAuthenticated(socket);
           invalidateOnlineListCache('auth-existing-db');
           deferServerTask('AUTH EXISTING PRESENCE', () => upsertPresenceForSocket(socket, name), 250);
@@ -8935,7 +8968,7 @@ io.on('connection', (socket) => {
         if (wasDeletedAccount) {
           await pool.query('DELETE FROM deleted_accounts WHERE name = $1', [name]);
         }
-        
+
         console.log(`[NETWORK] ${name} created a new account. Admin: ${isAdmin}`);
         logMemoryTrace('auth:created', `user=${name} socket=${socket.id}`);
         deferServerTask('AUTH SIGNUP LOG', async () => {
@@ -8965,7 +8998,9 @@ io.on('connection', (socket) => {
     }
   });
 
-
+  // --------------------------------------------------------------------------
+  // Profile state, settings & realtime profile sync
+  // --------------------------------------------------------------------------
   socket.on('profile_notification_state_update', async (payload = {}, ack) => {
     const respond = response => {
       if (typeof ack !== 'function' || !socket.connected) return;
@@ -9201,7 +9236,7 @@ io.on('connection', (socket) => {
     let settingsReplayStatus = null;
     const shouldEmitTrendingUpdate = profileUpdateTouchesTrending(userData || {});
     if (name && userDatabase[name]) {
-        
+
         if (incomingSettingsData) {
             const mergedSettings = mergeProfileSettingsByTimestamp(workingUser.settingsData || {}, incomingSettingsData, {
                 currentFallback: normalizeTimestampValue(workingUser.profileUpdatedAt),
@@ -9290,7 +9325,7 @@ io.on('connection', (socket) => {
         });
         if (requestedSyncSections.some(section => replaySectionStatus[section] === 'rejected')) shouldForceProfileSyncToSource = true;
         const publicCountsChanged = profileUpdateTouchesPublicCounts(userData);
-        
+
         Object.assign(workingUser, userData);
         const currentCountryCode = getUserCountryCode(workingUser);
         if (currentCountryCode) {
@@ -9442,6 +9477,9 @@ io.on('connection', (socket) => {
     }
   });
 
+  // --------------------------------------------------------------------------
+  // Notifications, game ownership & friend activity
+  // --------------------------------------------------------------------------
   socket.on('catalog_notification_candidate', async (data = {}, ack) => {
     const respond = payload => { if (typeof ack === 'function' && socket.connected) { try { ack(payload); } catch (err) {} } };
     const name = socket.userName;
@@ -9806,6 +9844,9 @@ io.on('connection', (socket) => {
     deferServerTask('PS3 PLAYTIME NOTIFY', () => notifyPs3PlayTimeAcrossInstances(payload), 0);
   });
 
+  // --------------------------------------------------------------------------
+  // User data, search, presence & public statistics
+  // --------------------------------------------------------------------------
   socket.on('request_user_data', async (data = {}) => {
     const { targetName, type, requestId } = data;
     try {
@@ -9980,6 +10021,9 @@ io.on('connection', (socket) => {
     await sendOnlineList();
   });
 
+  // --------------------------------------------------------------------------
+  // Chat history & synchronization
+  // --------------------------------------------------------------------------
   socket.on('chat_render_error', (data = {}) => {
     try {
       const stage = normalizeText(data.stage, 'unknown').slice(0, 40);
@@ -10189,7 +10233,7 @@ io.on('connection', (socket) => {
       else socket.emit('global_search_results', []);
     }
   });
-  
+
   socket.on('request_friends_presence', async (request = {}, callback) => {
     const respond = payload => { if (typeof callback === 'function') { try { callback(payload); } catch (err) {} } };
     try {
@@ -10291,6 +10335,9 @@ io.on('connection', (socket) => {
     callback({ success: false, message: "Invalid code." });
   });
 
+  // --------------------------------------------------------------------------
+  // Chat messages & commands
+  // --------------------------------------------------------------------------
   socket.on('chat_message', async (msg, callback) => {
     const respond = typeof callback === 'function' ? callback : () => {};
     if (socket.__passwordResetRevoked === true) {
@@ -10571,7 +10618,9 @@ io.on('connection', (socket) => {
     }
   });
 
-
+  // --------------------------------------------------------------------------
+  // Administration & moderation controls
+  // --------------------------------------------------------------------------
   socket.on('admin_ping' , async (data, callback) => {
     const respond = typeof callback === 'function' ? callback : () => {};
 
@@ -10746,7 +10795,7 @@ io.on('connection', (socket) => {
         serverLog,
         registeredUsers: Object.keys(userDatabase).length,
         countryStats: getAdminCountryStats(),
-      logLimits: getAdminLogLimits()
+        logLimits: getAdminLogLimits()
       });
       deferServerTask('ADMIN MAINTENANCE NOTIFY', () => notifyAdminStateAcrossInstances(ADMIN_STATE_KEYS.maintenance, nextMaintenance), 0);
       deferServerTask('ADMIN MAINTENANCE LOG', () => addModerationLog(nextMaintenance.enabled ? 'maintenance_on' : 'maintenance_off', nextMaintenance.enabled ? 'Enabled maintenance mode' : 'Disabled maintenance mode', nextMaintenance, socket.userName || 'Admin'), 0);
@@ -10852,7 +10901,7 @@ io.on('connection', (socket) => {
         serverLog,
         registeredUsers: Object.keys(userDatabase).length,
         countryStats: getAdminCountryStats(),
-      logLimits: getAdminLogLimits()
+        logLimits: getAdminLogLimits()
       });
       await addModerationLog('chat_controls', `Updated chat controls: ${adminState.chatControls.locked ? 'locked' : 'open'}, slow ${adminState.chatControls.slowSeconds}s`, adminState.chatControls, socket.userName || 'Admin');
       respond({ success: true, state: adminState.chatControls });
@@ -10975,6 +11024,9 @@ io.on('connection', (socket) => {
     }
   });
 
+  // --------------------------------------------------------------------------
+  // Reports, reactions, polls, seen state & editing
+  // --------------------------------------------------------------------------
   socket.on('report_message', async (data, callback) => {
     const respond = typeof callback === 'function' ? callback : () => {};
     try {
@@ -10985,7 +11037,6 @@ io.on('connection', (socket) => {
       respond({ success: false, message: "Server error while creating report." });
     }
   });
-
 
   socket.on('message_reaction', async (data = {}) => {
     const messageId = String(data.msgId || '');
@@ -11066,7 +11117,7 @@ io.on('connection', (socket) => {
             if (!targetOption) return;
             const currentVoteIndex = poll.options.findIndex(opt => Array.isArray(opt && opt.voters) && opt.voters.includes(data.user));
             if (currentVoteIndex === data.optionIndex) return;
-            
+
             poll.options.forEach(opt => {
                 if (opt.voters) {
                     opt.voters = opt.voters.filter(u => u !== data.user);
@@ -11075,22 +11126,22 @@ io.on('connection', (socket) => {
 
             if (!targetOption.voters) targetOption.voters = [];
             targetOption.voters.push(data.user);
-            
+
             poll.totalVotes = poll.options.reduce((sum, opt) => sum + (opt.voters ? opt.voters.length : 0), 0);
 
             try {
                 await pool.query("UPDATE chat SET message = $1 WHERE message->>'time' = $2", [cleanChatMessage(msg), msg.time]);
                 const syncChange = await recordChatSyncChangeSafe('upsert', String(data.msgId || new Date(msg.time).getTime()), msg);
-                
-                io.emit('message_edited', { 
-                    msgId: data.msgId, 
-                    newText: msg.text, 
-                    type: 'poll', 
+
+                io.emit('message_edited', {
+                    msgId: data.msgId,
+                    newText: msg.text,
+                    type: 'poll',
                     content: poll,
-                    editedByAdmin: msg.editedByAdmin 
+                    editedByAdmin: msg.editedByAdmin
                 });
                 if (syncChange) emitChatSyncChange(syncChange);
-                
+
                 const pinned = pinnedMessages.find(p => p.id === data.msgId);
                 if (pinned) {
                     pinned.content = poll;
@@ -11165,71 +11216,72 @@ io.on('connection', (socket) => {
     }
   });
 
-
   socket.on('edit_message', async (data) => {
     const msgIndex = messageHistory.findIndex(m => String(new Date(m.time).getTime()) === String(data.msgId));
     if (msgIndex > -1) {
-        const isAdmin = socket.isAdmin === true;
-        const canModerate = canModerateSocket(socket);
-        const actorRole = getActorRole(socket);
-        const msg = messageHistory[msgIndex];
-        const isOwner = msg.user === socket.userName;
-        const canEditTarget = isOwner || (canModerate && canModerateTarget(socket, msg.user));
+      const isAdmin = socket.isAdmin === true;
+      const canModerate = canModerateSocket(socket);
+      const actorRole = getActorRole(socket);
+      const msg = messageHistory[msgIndex];
+      const isOwner = msg.user === socket.userName;
+      const canEditTarget = isOwner || (canModerate && canModerateTarget(socket, msg.user));
 
-        if (canEditTarget) {
-            const wasEditedByStaff = (!isOwner && canModerate);
-            const wasEditedByAdmin = (!isOwner && isAdmin);
-            const nextText = String(data.newText == null ? '' : data.newText);
-            const nextType = data.content ? (data.type || 'image') : msg.type;
-            const textUnchanged = String(msg.text == null ? '' : msg.text) === nextText;
-            const contentUnchanged = !data.content || stableStringifySmall(msg.content || null) === stableStringifySmall(data.content || null);
-            const typeUnchanged = !data.content || String(msg.type || '') === String(nextType || '');
-            if (textUnchanged && contentUnchanged && typeUnchanged) return;
-            
-            msg.text = data.newText;
-            msg.edited = true;
-            msg.editedByAdmin = wasEditedByAdmin;
-            msg.editedByMod = wasEditedByStaff && !wasEditedByAdmin;
-            if (wasEditedByStaff) {
-              msg.editedBy = socket.userName;
-              msg.editedByRole = actorRole;
-            }
+      if (canEditTarget) {
+        const wasEditedByStaff = (!isOwner && canModerate);
+        const wasEditedByAdmin = (!isOwner && isAdmin);
+        const nextText = String(data.newText == null ? '' : data.newText);
+        const nextType = data.content ? (data.type || 'image') : msg.type;
+        const textUnchanged = String(msg.text == null ? '' : msg.text) === nextText;
+        const contentUnchanged = !data.content || stableStringifySmall(msg.content || null) === stableStringifySmall(data.content || null);
+        const typeUnchanged = !data.content || String(msg.type || '') === String(nextType || '');
+        if (textUnchanged && contentUnchanged && typeUnchanged) return;
 
-            if (data.content) {
-                msg.type = data.type || 'image';
-                msg.content = data.content;
-            }
-            
-            try {
-                await pool.query("UPDATE chat SET message = $1 WHERE message->>'time' = $2", [cleanChatMessage(msg), msg.time]);
-                const syncChange = await recordChatSyncChangeSafe('upsert', String(data.msgId || new Date(msg.time).getTime()), msg);
-                io.emit('message_edited', { 
-                    msgId: data.msgId, 
-                    newText: data.newText, 
-                    type: msg.type, 
-                    content: msg.content,
-                    editedByAdmin: wasEditedByAdmin,
-                    editedByMod: msg.editedByMod === true,
-                    editedBy: msg.editedBy || null,
-                    editedByRole: msg.editedByRole || null 
-                });
-                if (syncChange) emitChatSyncChange(syncChange);
-
-                const pinned = pinnedMessages.find(p => p.id === data.msgId);
-                if (pinned) {
-                    pinned.text = data.newText;
-                    pinned.type = msg.type || 'text';
-                    pinned.content = msg.content || null;
-                    
-                    await pool.query('UPDATE pinned_messages SET data = $1 WHERE message_id = $2', [pinned, data.msgId]);
-                    io.emit('pinned_list', pinnedMessages);
-                }
-
-            } catch (err) { console.error("Edit Sync Error:", err); }
+        msg.text = data.newText;
+        msg.edited = true;
+        msg.editedByAdmin = wasEditedByAdmin;
+        msg.editedByMod = wasEditedByStaff && !wasEditedByAdmin;
+        if (wasEditedByStaff) {
+          msg.editedBy = socket.userName;
+          msg.editedByRole = actorRole;
         }
+
+        if (data.content) {
+          msg.type = data.type || 'image';
+          msg.content = data.content;
+        }
+
+        try {
+          await pool.query("UPDATE chat SET message = $1 WHERE message->>'time' = $2", [cleanChatMessage(msg), msg.time]);
+          const syncChange = await recordChatSyncChangeSafe('upsert', String(data.msgId || new Date(msg.time).getTime()), msg);
+          io.emit('message_edited', {
+            msgId: data.msgId,
+            newText: data.newText,
+            type: msg.type,
+            content: msg.content,
+            editedByAdmin: wasEditedByAdmin,
+            editedByMod: msg.editedByMod === true,
+            editedBy: msg.editedBy || null,
+            editedByRole: msg.editedByRole || null
+          });
+          if (syncChange) emitChatSyncChange(syncChange);
+
+          const pinned = pinnedMessages.find(p => p.id === data.msgId);
+          if (pinned) {
+            pinned.text = data.newText;
+            pinned.type = msg.type || 'text';
+            pinned.content = msg.content || null;
+
+            await pool.query('UPDATE pinned_messages SET data = $1 WHERE message_id = $2', [pinned, data.msgId]);
+            io.emit('pinned_list', pinnedMessages);
+          }
+        } catch (err) { console.error("Edit Sync Error:", err); }
+      }
     }
   });
 
+  // --------------------------------------------------------------------------
+  // Chat deletion, clear, kick & pinning
+  // --------------------------------------------------------------------------
   socket.on('delete_messages', async (data = {}, callback) => {
     const respond = typeof callback === 'function' ? callback : () => {};
     if (socket.__chatBatchDeleteInFlight === true) return respond({ success: false, message: 'A message delete is already running.' });
@@ -11335,7 +11387,6 @@ io.on('connection', (socket) => {
     }
   });
 
-
   socket.on('delete_message', async (data = {}, callback) => {
     const respond = typeof callback === 'function' ? callback : () => {};
     const msgId = normalizeText(data && data.msgId, '').slice(0, 100);
@@ -11403,7 +11454,6 @@ io.on('connection', (socket) => {
     }
   });
 
-
   socket.on('clear_chat', async (data = {}, callback) => {
     const respond = typeof callback === 'function' ? callback : () => {};
     if (socket.isAdmin !== true) return respond({ success: false, message: 'Admin only.' });
@@ -11431,8 +11481,8 @@ io.on('connection', (socket) => {
             targetSocket.emit('user_kicked', { by: socket.userName, role: getActorRole(socket) });
             socket.emit('kick_success', { targetId: data.targetId, targetName });
             await addModerationLog('kick', `Kicked ${targetName}`, { targetId: data.targetId, targetName }, socket.userName || 'Moderator');
-            
-            setTimeout(() => { 
+
+            setTimeout(() => {
                 if (targetSocket.connected) {
                     targetSocket.disconnect(true);
                 }
@@ -11445,15 +11495,15 @@ io.on('connection', (socket) => {
     if (canModerateSocket(socket)) {
       const msg = messageHistory.find(m => String(new Date(m.time).getTime()) === String(data.msgId));
       if (msg && !pinnedMessages.find(p => p.id === data.msgId)) {
-        const pinData = { 
-            id: data.msgId, 
-            text: msg.text || "", 
-            user: msg.user, 
-            type: msg.type || 'text', 
-            content: msg.content || null 
+        const pinData = {
+            id: data.msgId,
+            text: msg.text || "",
+            user: msg.user,
+            type: msg.type || 'text',
+            content: msg.content || null
         };
         pinnedMessages.push(pinData);
-        
+
         try {
           await pool.query('INSERT INTO pinned_messages (message_id, data) VALUES ($1, $2) ON CONFLICT (message_id) DO UPDATE SET data = $2', [data.msgId, pinData]);
           io.emit('pinned_list', pinnedMessages);
@@ -11466,7 +11516,7 @@ io.on('connection', (socket) => {
   socket.on('unpin_message', async (data) => {
     if (canModerateSocket(socket)) {
       pinnedMessages = pinnedMessages.filter(p => p.id !== data.msgId);
-      
+
       try {
         await pool.query('DELETE FROM pinned_messages WHERE message_id = $1', [data.msgId]);
       } catch (e) { console.error("Unpin DB Error:", e); }
@@ -11476,6 +11526,9 @@ io.on('connection', (socket) => {
     }
   });
 
+  // --------------------------------------------------------------------------
+  // Typing presence & disconnect cleanup
+  // --------------------------------------------------------------------------
   socket.on('typing_start', () => {
     const name = socket.userName;
     if (name && userDatabase[name]) {
@@ -11529,6 +11582,9 @@ io.on('connection', (socket) => {
   });
 });
 
+// ============================================================================
+// Server startup
+// ============================================================================
 const PORT = process.env.PORT || 3000;
 let startupInFlight = false;
 let startupRetryTimer = null;
