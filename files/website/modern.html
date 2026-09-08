@@ -5332,7 +5332,7 @@ img { -webkit-user-drag: none !important; user-drag: none !important; }
 		</div>
 		<div id="user-select-screen">
 			<h2 id="welcome-msg">Welcome to NoPayStation™ Network Database</h2>
-			<p style="opacity: 0.5; font-size: 1rem; letter-spacing: 2px; font-weight: 400;">Who's using this device?</p>
+			<p id="user-select-subtitle" style="opacity: 0.5; font-size: 1rem; letter-spacing: 2px; font-weight: 400;">Who's using this device?</p>
 			
 			<div class="user-grid-ps5" id="ps5-user-grid">
 			</div>
@@ -10935,6 +10935,43 @@ P
 	}
 	window.getPsnWelcomeMessageSource = getPsnWelcomeMessageSource;
 
+	window.setPsnUserSelectSubtitle = function(sourceText = '', options = {}) {
+		const subtitle = document.getElementById('user-select-subtitle');
+		if (!subtitle) return null;
+		const source = String(sourceText || '');
+		const renderToken = String((Number(subtitle.dataset.psnSubtitleRenderToken || 0) || 0) + 1);
+		subtitle.dataset.psnSubtitleRenderToken = renderToken;
+		subtitle.dataset.psnSubtitleSource = encodeURIComponent(source);
+
+		const applyText = displayText => {
+			if (!subtitle.isConnected || subtitle.dataset.psnSubtitleRenderToken !== renderToken) return;
+			subtitle.textContent = String(displayText || source);
+		};
+
+		const immediate = typeof window.getImmediateInterfaceDisplayText === 'function'
+			? window.getImmediateInterfaceDisplayText(source, subtitle)
+			: '';
+		applyText(immediate || source);
+
+		if (!immediate && options.translate !== false && typeof window.resolveInterfaceDisplayText === 'function') {
+			window.resolveInterfaceDisplayText(source, subtitle).then(applyText).catch(() => {});
+		}
+		return subtitle;
+	};
+
+	window.restorePsnUserSelectSubtitle = function() {
+		const maintenanceAdminOnly = document.body.classList.contains('admin-maintenance-login-bypass') && typeof adminGetLocalAdminUsers === 'function';
+		const urlAdminBootstrap = maintenanceAdminOnly && typeof adminMaintenanceUrlBypassEnabled === 'function' && adminMaintenanceUrlBypassEnabled();
+		const users = maintenanceAdminOnly ? adminGetLocalAdminUsers() : (typeof getAllUsers === 'function' ? getAllUsers() : []);
+		const showAdminBootstrapCard = maintenanceAdminOnly && urlAdminBootstrap && users.length === 0;
+		const sourceText = maintenanceAdminOnly
+			? (showAdminBootstrapCard
+				? 'Maintenance mode is active. Use ?bypass or &admin in the URL, then create or log into an admin account.'
+				: 'Maintenance mode is active. Select a local admin profile to continue.')
+			: "Who's using this device?";
+		return window.setPsnUserSelectSubtitle(sourceText);
+	};
+
 	function preparePsnWelcomeMessageHost(content, sourceText, ownerName = '') {
 		if (!content) return;
 		if (ownerName) content.setAttribute('data-interface-owner-name', encodeURIComponent(ownerName));
@@ -11014,7 +11051,7 @@ P
 		const showAdminBootstrapCard = maintenanceAdminOnly && urlAdminBootstrap && users.length === 0;
 		const userGrid = document.getElementById('ps5-user-grid');
 		const welcomeMsg = document.getElementById('welcome-msg');
-		const subtitle = document.querySelector('#user-select-screen p');
+		const subtitle = document.getElementById('user-select-subtitle');
 		const lastUser = localStorage.getItem('psn_username');
 		const manageBtn = document.getElementById('manage-profiles-btn');
 		const emptyProfileHint = document.getElementById('ps5-empty-profile-hint');
@@ -11050,7 +11087,7 @@ P
 		const oldController = document.getElementById('ps5-controller-indicator');
 		if (oldController) oldController.remove();
 		if (subtitle) {
-			subtitle.innerText = maintenanceAdminOnly ? (showAdminBootstrapCard ? 'Maintenance mode is active. Use ?bypass or &admin in the URL, then create or log into an admin account.' : 'Maintenance mode is active. Select a local admin profile to continue.') : 'Who\47s using this device?';
+			window.restorePsnUserSelectSubtitle();
 			subtitle.insertAdjacentHTML('afterend', `
 				<div id="ps5-controller-indicator" style="display: flex; flex-direction: column; align-items: center; margin-top: 15px; margin-bottom: 25px; opacity: 0.8;">
 					<i class="fas fa-gamepad" style="font-size: 24px; color: #fff;"></i>
@@ -13853,6 +13890,7 @@ P
 	let isLoggingIn = false; 
 
 	function playLoginAnimation(username) {
+		if (typeof window.setPsnUserSelectSubtitle === 'function') window.setPsnUserSelectSubtitle('Preparing your session...');
 		const userGrid = document.getElementById('ps5-user-grid');
 		if (userGrid) userGrid.style.pointerEvents = 'none';
 
@@ -14034,6 +14072,7 @@ P
 			const textSpan = window.setPsnWelcomeMessage(users.length > 0 ? 'welcome-back' : 'welcome');
 			if (textSpan) textSpan.style.opacity = '1';
 		}
+		if (typeof window.restorePsnUserSelectSubtitle === 'function') window.restorePsnUserSelectSubtitle();
 	
 		if (typeof playUiBack === 'function') playUiBack();
 		const loginOverlay = document.getElementById('login-input-overlay');
@@ -65863,6 +65902,7 @@ function getVisibleChatStackEl(id) {
 				const textSpan = window.setPsnWelcomeMessage(users.length > 0 ? 'welcome-back' : 'welcome');
 				if (textSpan) textSpan.style.opacity = '1';
 			}
+			if (typeof window.restorePsnUserSelectSubtitle === 'function') window.restorePsnUserSelectSubtitle();
 		} catch (e) {
 			console.warn('Could not reset login UI state:', e);
 		}
@@ -79474,7 +79514,8 @@ function getVisibleChatStackEl(id) {
         [
             'Welcome to NoPayStation™ Network Database',
             'Welcome Back to NoPayStation™ Network Database',
-            `Logging in as ${previewName}...`
+            `Logging in as ${previewName}...`,
+            'Preparing your session...'
         ].forEach(source => window.resolveInterfaceDisplayText(source, fakeHost).catch(() => {}));
     };
 
