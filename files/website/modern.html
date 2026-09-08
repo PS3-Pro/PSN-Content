@@ -52643,10 +52643,15 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
         clearTimeout(window.__chatHistoryRequestWatchdog);
 
         const run = (async () => {
-            const cacheState = await hydrateChatHistoryFromPersistentCache({
-                renderIfVisible: !needsInitialServerSync,
-                holdForServer: needsInitialServerSync
-            });
+            const realtimeGapRepair = reason === 'chat-sync-gap';
+            /* A realtime repair already has authoritative live DOM/history to preserve. Reading
+               IndexedDB here can only replace that newer in-memory state with an older cache. */
+            const cacheState = realtimeGapRepair
+                ? { hydrated: true, cached: window.__chatPersistentCacheAvailable === true }
+                : await hydrateChatHistoryFromPersistentCache({
+                    renderIfVisible: !needsInitialServerSync,
+                    holdForServer: needsInitialServerSync
+                });
             const hasPersistentCache = !!(cacheState && cacheState.cached === true);
             const needsStableFullSnapshot = needsInitialServerSync && !hasPersistentCache;
             if (needsInitialServerSync) {
@@ -53144,7 +53149,10 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
         const currentEpoch = String(window.__chatCacheEpoch || '');
         const currentRevision = Math.max(0, Number(window.__chatCacheRevision) || 0);
         if (!currentEpoch || currentEpoch !== incomingEpoch || incomingRevision > currentRevision + 1) {
-            window.__chatHistoryReceived = false;
+            /* Realtime gaps are repairable sync state, not an initial chat load.
+               Keep the already-rendered history live and reconcile silently in background;
+               marking history as "not received" here made normal send/delete mutations flash
+               the full Preparing messages state. */
             window.__chatHistoryRequesting = false;
             setTimeout(() => { if (typeof requestChatHistoryNow === 'function') requestChatHistoryNow('chat-sync-gap'); }, 0);
             return false;
@@ -63705,6 +63713,9 @@ function getVisibleChatStackEl(id) {
 
 		socketChat.on('chat_message', function(data) {
 			if (!window.messageHistory) window.messageHistory = [];
+			const historyLengthBeforeAppend = window.messageHistory.length;
+			const virtualEndBeforeAppend = Math.max(0, Number(window.__chatVirtualEndIndex || 0));
+			const virtualWindowWasAtTail = historyLengthBeforeAppend === 0 || virtualEndBeforeAppend >= historyLengthBeforeAppend;
 			const incomingKey = String(new Date(data && data.time).getTime() || data?.time || '');
 			const chatIndex = ensureChatMessageIndexes(window.messageHistory);
 			if (incomingKey && chatIndex.ids.has(incomingKey)) return;
@@ -63738,6 +63749,10 @@ function getVisibleChatStackEl(id) {
 				window.__chatVirtualStartIndex = Math.max(0, Number(window.__chatVirtualStartIndex || 0) - 1);
 				window.__chatVirtualEndIndex = Math.max(window.__chatVirtualStartIndex, Number(window.__chatVirtualEndIndex || 0) - 1);
 			}
+			/* A live append extends the current virtual window when that window already owned the
+			   history tail. Without this, jumpToBottom() sees a stale end index and rebuilds the
+			   entire chat with "Loading latest messages" after every sent message. */
+			if (virtualWindowWasAtTail) window.__chatVirtualEndIndex = window.messageHistory.length;
 			if (typeof scheduleChatPersistentCacheWrite === 'function') scheduleChatPersistentCacheWrite();
 		
 			if (typeof trackUser === 'function') trackUser(data.user);
