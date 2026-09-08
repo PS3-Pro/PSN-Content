@@ -10954,10 +10954,38 @@ P
 		const immediate = typeof window.getImmediateInterfaceDisplayText === 'function'
 			? window.getImmediateInterfaceDisplayText(source, subtitle)
 			: '';
-		applyText(immediate || source);
+		const translationPromise = immediate
+			? Promise.resolve(immediate)
+			: (options.translate !== false && typeof window.resolveInterfaceDisplayText === 'function'
+				? window.resolveInterfaceDisplayText(source, subtitle).catch(() => source)
+				: Promise.resolve(source));
 
+		if (options.animate === true) {
+			const restingOpacity = subtitle.dataset.psnSubtitleRestingOpacity || subtitle.style.opacity || '0.5';
+			subtitle.dataset.psnSubtitleRestingOpacity = restingOpacity;
+			subtitle.style.transition = 'opacity 0.25s ease';
+			subtitle.style.opacity = '0';
+
+			const fadeOutDone = new Promise(resolve => setTimeout(resolve, 250));
+			const translationReady = Promise.race([
+				translationPromise,
+				new Promise(resolve => setTimeout(() => resolve(source), 650))
+			]);
+
+			Promise.all([fadeOutDone, translationReady]).then(([, displayText]) => {
+				if (!subtitle.isConnected || subtitle.dataset.psnSubtitleRenderToken !== renderToken) return;
+				applyText(displayText);
+				requestAnimationFrame(() => {
+					if (subtitle.dataset.psnSubtitleRenderToken === renderToken) subtitle.style.opacity = restingOpacity;
+				});
+			});
+			return subtitle;
+		}
+
+		if (subtitle.dataset.psnSubtitleRestingOpacity) subtitle.style.opacity = subtitle.dataset.psnSubtitleRestingOpacity;
+		applyText(immediate || source);
 		if (!immediate && options.translate !== false && typeof window.resolveInterfaceDisplayText === 'function') {
-			window.resolveInterfaceDisplayText(source, subtitle).then(applyText).catch(() => {});
+			translationPromise.then(applyText).catch(() => {});
 		}
 		return subtitle;
 	};
@@ -13893,7 +13921,7 @@ P
 	let isLoggingIn = false; 
 
 	function playLoginAnimation(username) {
-		if (typeof window.setPsnUserSelectSubtitle === 'function') window.setPsnUserSelectSubtitle('Preparing your session...');
+		if (typeof window.setPsnUserSelectSubtitle === 'function') window.setPsnUserSelectSubtitle('Preparing your session...', { animate: true });
 		const userGrid = document.getElementById('ps5-user-grid');
 		if (userGrid) userGrid.style.pointerEvents = 'none';
 
