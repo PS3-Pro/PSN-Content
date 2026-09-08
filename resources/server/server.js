@@ -17,6 +17,16 @@ const MAX_CHAT_HISTORY = 1000;
 const CHAT_SYNC_CHANGE_LOG_MAX = Math.max(1000, Math.min(20000, parseInt(process.env.CHAT_SYNC_CHANGE_LOG_MAX || "5000", 10) || 5000));
 const CHAT_SYNC_MAX_DELTA = Math.max(100, Math.min(5000, parseInt(process.env.CHAT_SYNC_MAX_DELTA || "1500", 10) || 1500));
 const CHAT_BATCH_DELETE_MAX = 100;
+const CHAT_SEEN_BATCH_MAX = MAX_CHAT_HISTORY;
+const CHAT_MESSAGE_TEXT_MAX = 64 * 1024;
+const CHAT_MESSAGE_MEDIA_MAX = 20;
+const CHAT_MESSAGE_URL_MAX = 4096;
+const CHAT_REPLY_TEXT_MAX = 8192;
+const CHAT_AVATAR_REF_MAX = 4096;
+const CHAT_POLL_QUESTION_MAX = 8192;
+const CHAT_POLL_OPTIONS_MAX = 20;
+const CHAT_POLL_OPTION_TEXT_MAX = 4096;
+const CHAT_POLL_VOTERS_MAX = 5000;
 
 const SERVER_STARTED_AT = Date.now();
 const INSTANCE_ID = process.env.RENDER_INSTANCE_ID || process.env.RAILWAY_REPLICA_ID || process.env.HOSTNAME || `instance-${Math.random().toString(36).slice(2, 10)}`;
@@ -763,6 +773,8 @@ let profileHydrationQueued = 0;
 let profileHydrationActive = 0;
 let profileSyncActiveSockets = 0;
 const MEMORY_TRACE_ENABLED = String(process.env.MEMORY_TRACE || 'false').trim().toLowerCase() === 'true';
+const CHAT_MEMORY_TRACE_ENABLED = !['0','false','off','no'].includes(String(process.env.CHAT_MEMORY_TRACE ?? 'true').trim().toLowerCase());
+let chatMemoryTraceSequence = 0;
 
 function getSocketWriteBufferLength(socket) {
   try {
@@ -902,6 +914,205 @@ function logMemoryTrace(reason, details = '') {
   const snap = getMemoryDiagnosticSnapshot();
   const suffix = details ? ` ${details}` : '';
   console.log(`[MEMORY TRACE] ${reason} heap=${snap.heapMb.toFixed(1)}/${snap.heapTotalMb.toFixed(1)}MB rss=${snap.rssMb.toFixed(1)}MB sockets=${snap.sockets} writeBuffer=${snap.writeBufferPackets} hydration=${snap.profileHydrationActive}/${snap.profileHydrationQueued} profileSync=${snap.profileSyncActiveSockets}${suffix}`);
+}
+
+function chatTraceByteLength(value) {
+  if (value === null || value === undefined) return 0;
+  try { return Buffer.byteLength(String(value), 'utf8'); }
+  catch (err) { return String(value).length; }
+}
+
+function estimateChatTracePayloadBytes(value, maxNodes = 5000) {
+  let bytes = 0;
+  let nodes = 0;
+  let truncated = false;
+  const seen = new WeakSet();
+  const stack = [value];
+  while (stack.length) {
+    if (nodes >= maxNodes) { truncated = true; break; }
+    const current = stack.pop();
+    nodes++;
+    if (current === null || current === undefined) { bytes += 4; continue; }
+    const type = typeof current;
+    if (type === 'string') { bytes += chatTraceByteLength(current); continue; }
+    if (type === 'number' || type === 'bigint') { bytes += 8; continue; }
+    if (type === 'boolean') { bytes += 4; continue; }
+    if (type !== 'object') continue;
+    if (seen.has(current)) continue;
+    seen.add(current);
+    if (Array.isArray(current)) {
+      for (let i = current.length - 1; i >= 0; i--) stack.push(current[i]);
+      continue;
+    }
+    const keys = Object.keys(current);
+    for (let i = keys.length - 1; i >= 0; i--) {
+      const key = keys[i];
+      bytes += chatTraceByteLength(key);
+      stack.push(current[key]);
+    }
+  }
+  return { bytes, nodes, truncated };
+}
+
+function formatChatTraceBytes(bytes) {
+  const value = Math.max(0, Number(bytes) || 0);
+  if (value >= 1024 * 1024) return `${(value / 1024 / 1024).toFixed(2)}MB`;
+  if (value >= 1024) return `${(value / 1024).toFixed(1)}KB`;
+  return `${Math.round(value)}B`;
+}
+
+function getChatTraceMemorySnapshot() {
+  const mem = process.memoryUsage();
+  let maxRssBytes = 0;
+  try { maxRssBytes = Math.max(0, Number(process.resourceUsage().maxRSS) || 0) * 1024; } catch (err) {}
+  return {
+    rss: Math.max(0, Number(mem.rss) || 0),
+    heapUsed: Math.max(0, Number(mem.heapUsed) || 0),
+    heapTotal: Math.max(0, Number(mem.heapTotal) || 0),
+    external: Math.max(0, Number(mem.external) || 0),
+    arrayBuffers: Math.max(0, Number(mem.arrayBuffers) || 0),
+    processMaxRss: maxRssBytes
+  };
+}
+
+function getChatTraceSocketStats() {
+  let sockets = 0;
+  let admins = 0;
+  let moderators = 0;
+  let initialSync = 0;
+  try {
+    io.sockets.sockets.forEach(client => {
+      if (!client || !client.connected) return;
+      sockets++;
+      if (client.isAdmin === true) admins++;
+      else if (getActorRole(client) === 'mod') moderators++;
+      if (client.__chatInitialFullSyncInFlight === true) initialSync++;
+    });
+  } catch (err) {}
+  return { sockets, admins, moderators, initialSync, writeBuffer: getTotalSocketWriteBufferLength() };
+}
+
+function getChatTraceActorContext(socket) {
+  if (!socket) return { actor: 'system', role: 'system', admin: false, socketId: '' };
+  let role = 'user';
+  try { role = getActorRole(socket) || (socket.isAdmin === true ? 'admin' : 'user'); } catch (err) { role = socket.isAdmin === true ? 'admin' : 'user'; }
+  return {
+    actor: normalizeText(socket.userName, '') || 'unknown',
+    role,
+    admin: socket.isAdmin === true,
+    socketId: String(socket.id || '')
+  };
+}
+
+function formatChatTraceMeta(meta = {}) {
+  const parts = [];
+  for (const [key, raw] of Object.entries(meta || {})) {
+    if (raw === undefined || raw === null || raw === '') continue;
+    let value = raw;
+    if (typeof value === 'string') value = value.replace(/[\r\n\t]+/g, ' ').slice(0, 180);
+    else if (typeof value === 'number' && !Number.isFinite(value)) continue;
+    else if (typeof value === 'object') continue;
+    parts.push(`${key}=${value}`);
+  }
+  return parts.length ? ` ${parts.join(' ')}` : '';
+}
+
+function createChatMemoryTrace(operation, socket = null, meta = {}) {
+  if (!CHAT_MEMORY_TRACE_ENABLED) return { id:'', stage:() => {}, finish:() => {} };
+  const actor = getChatTraceActorContext(socket);
+  const id = `${String(operation || 'chat')}-${Date.now().toString(36)}-${(++chatMemoryTraceSequence).toString(36)}`;
+  const startedAt = Date.now();
+  const start = getChatTraceMemorySnapshot();
+  let peakRss = start.rss;
+  let peakHeap = start.heapUsed;
+  let peakExternal = start.external;
+  let peakArrayBuffers = start.arrayBuffers;
+  const log = (stage, extra = {}) => {
+    const current = getChatTraceMemorySnapshot();
+    peakRss = Math.max(peakRss, current.rss);
+    peakHeap = Math.max(peakHeap, current.heapUsed);
+    peakExternal = Math.max(peakExternal, current.external);
+    peakArrayBuffers = Math.max(peakArrayBuffers, current.arrayBuffers);
+    const sockets = getChatTraceSocketStats();
+    const mb = value => (value / 1024 / 1024).toFixed(1);
+    const safeActor = String(actor.actor || '').replace(/["\r\n]/g, '').slice(0, 80);
+    console.log(`[CHAT MEM] id=${id} op=${operation} stage=${stage} +${Date.now()-startedAt}ms actor="${safeActor}" role=${actor.role} admin=${actor.admin ? 1 : 0} rss=${mb(current.rss)}MB dRss=${mb(current.rss-start.rss)}MB peakRssDelta=${mb(peakRss-start.rss)}MB heap=${mb(current.heapUsed)}/${mb(current.heapTotal)}MB dHeap=${mb(current.heapUsed-start.heapUsed)}MB external=${mb(current.external)}MB dExternal=${mb(current.external-start.external)}MB arrayBuf=${mb(current.arrayBuffers)}MB dArrayBuf=${mb(current.arrayBuffers-start.arrayBuffers)}MB processMaxRss=${mb(current.processMaxRss)}MB sockets=${sockets.sockets} admins=${sockets.admins} mods=${sockets.moderators} initialSync=${sockets.initialSync} writeBuffer=${sockets.writeBuffer} history=${Array.isArray(messageHistory) ? messageHistory.length : 0} pinned=${Array.isArray(pinnedMessages) ? pinnedMessages.length : 0}${formatChatTraceMeta({ ...meta, ...extra })}`);
+  };
+  log('entry');
+  return { id, stage:log, finish:(extra={}) => log('done', extra) };
+}
+
+function summarizeChatTracePayload(payload = {}) {
+  const source = payload && typeof payload === 'object' ? payload : { text: payload };
+  const estimate = estimateChatTracePayloadBytes(source);
+  const content = source.content;
+  let contentCount = 0;
+  let contentBytes = 0;
+  let pollOptions = 0;
+  let pollVoters = 0;
+  if (Array.isArray(content)) {
+    contentCount = content.length;
+    for (const item of content) contentBytes += chatTraceByteLength(item);
+  } else if (content && typeof content === 'object') {
+    pollOptions = Array.isArray(content.options) ? content.options.length : 0;
+    if (Array.isArray(content.options)) {
+      for (const option of content.options) {
+        if (!option || typeof option !== 'object') continue;
+        pollVoters += Array.isArray(option.voters) ? option.voters.length : 0;
+      }
+    }
+  }
+  const reply = source.replyTo && typeof source.replyTo === 'object' ? source.replyTo : null;
+  return {
+    payload: formatChatTraceBytes(estimate.bytes),
+    payloadNodes: estimate.nodes,
+    payloadTruncated: estimate.truncated ? 1 : 0,
+    rawKeys: Object.keys(source).length,
+    type: normalizeText(source.type, 'text').slice(0, 24),
+    textBytes: chatTraceByteLength(source.text),
+    avatarBytes: chatTraceByteLength(source.avatar),
+    replyBytes: reply ? chatTraceByteLength(reply.user) + chatTraceByteLength(reply.text) + chatTraceByteLength(reply.id) : 0,
+    contentCount,
+    contentBytes,
+    pollOptions,
+    pollVoters
+  };
+}
+
+function summarizeChatDeleteTracePayload(rawTargets = []) {
+  const targets = Array.isArray(rawTargets) ? rawTargets : [];
+  let bytes = 0;
+  for (const raw of targets) {
+    const item = raw && typeof raw === 'object' ? raw : { id: raw };
+    bytes += chatTraceByteLength(item.id || item.msgId) + chatTraceByteLength(item.time || item.msgTime);
+  }
+  return { selected:targets.length, request:formatChatTraceBytes(bytes) };
+}
+
+if (CHAT_MEMORY_TRACE_ENABLED) {
+  console.log('[CHAT MEM] diagnostics enabled (set CHAT_MEMORY_TRACE=false to disable after testing).');
+}
+
+let chatTraceTrafficCounters = Object.create(null);
+let chatTraceTrafficTimer = null;
+function recordChatTraceTraffic(key, count = 1) {
+  if (!CHAT_MEMORY_TRACE_ENABLED) return;
+  const safeKey = String(key || '').replace(/[^A-Za-z0-9_-]/g, '').slice(0, 40);
+  if (!safeKey) return;
+  chatTraceTrafficCounters[safeKey] = (Number(chatTraceTrafficCounters[safeKey]) || 0) + Math.max(0, Number(count) || 0);
+  if (chatTraceTrafficTimer) return;
+  chatTraceTrafficTimer = setTimeout(() => {
+    chatTraceTrafficTimer = null;
+    const counters = chatTraceTrafficCounters;
+    chatTraceTrafficCounters = Object.create(null);
+    const parts = Object.entries(counters).filter(([, value]) => Number(value) > 0).map(([name, value]) => `${name}=${value}`);
+    if (!parts.length) return;
+    const mem = getChatTraceMemorySnapshot();
+    const sockets = getChatTraceSocketStats();
+    const mb = value => (value / 1024 / 1024).toFixed(1);
+    console.log(`[CHAT TRAFFIC] window=1s ${parts.join(' ')} rss=${mb(mem.rss)}MB heap=${mb(mem.heapUsed)}/${mb(mem.heapTotal)}MB external=${mb(mem.external)}MB arrayBuf=${mb(mem.arrayBuffers)}MB sockets=${sockets.sockets} admins=${sockets.admins} mods=${sockets.moderators} writeBuffer=${sockets.writeBuffer} history=${Array.isArray(messageHistory) ? messageHistory.length : 0}`);
+  }, 1000);
+  if (typeof chatTraceTrafficTimer.unref === 'function') chatTraceTrafficTimer.unref();
 }
 
 function logMemoryPressureIfNeeded(reason = 'periodic') {
@@ -1229,6 +1440,7 @@ async function initDb() {
     }
   }
 
+  await backfillRecentChatSeenEventsFromLegacyMessages();
   await refreshChatHistoryFromDb();
   
   const pinnedRes = await pool.query('SELECT data FROM pinned_messages ORDER BY id ASC');
@@ -4860,7 +5072,7 @@ function emitChatHistoryToSocket(socket) {
 
   const run = chatHistoryEmitQueue.catch(() => null).then(async () => {
     if (!socket.connected) return;
-    const history = getPublicChatHistoryForUser(socket.userName || '');
+    const history = await getPublicChatHistoryWithSeenForUser(socket.userName || '');
     const requiresAck = socket.chatHistoryAckV1 === true;
     if (MEMORY_TRACE_ENABLED) {
       const estimate = estimateValueBytes(history, { maxNodes: 100000, maxBytes: 64 * 1024 * 1024 });
@@ -5017,92 +5229,9 @@ async function saveAdminState(key, data) {
 function cleanChatMessage(message = {}) {
   const clean = { ...(message || {}) };
   delete clean._dbId;
+  delete clean.seenBy;
+  delete clean.seenAt;
   return clean;
-}
-
-const pendingSeenMessageWrites = new Map();
-let seenMessageFlushTimer = null;
-let seenMessageFlushInFlight = false;
-const SEEN_MESSAGE_FLUSH_DELAY_MS = 180;
-const SEEN_MESSAGE_BATCH_SIZE = 150;
-
-function getSeenMessageWriteKey(entry = {}) {
-  const id = Number(entry.id || 0);
-  if (id > 0) return `id:${id}`;
-  const time = String(entry.time || '');
-  return time ? `time:${time}` : '';
-}
-
-function scheduleSeenMessageFlush(delayMs = SEEN_MESSAGE_FLUSH_DELAY_MS) {
-  if (seenMessageFlushTimer || seenMessageFlushInFlight || !pendingSeenMessageWrites.size) return;
-  seenMessageFlushTimer = setTimeout(() => {
-    seenMessageFlushTimer = null;
-    flushPendingSeenMessageWrites().catch(err => console.error('[SEEN BATCH ERROR]:', err));
-  }, Math.max(0, Number(delayMs) || 0));
-}
-
-function queueSeenMessagePersist(message = {}) {
-  const entry = {
-    id: Number(message && message._dbId) || 0,
-    time: String(message && message.time || ''),
-    message: cleanChatMessage(message)
-  };
-  const key = getSeenMessageWriteKey(entry);
-  if (!key) return false;
-  pendingSeenMessageWrites.set(key, entry);
-  scheduleSeenMessageFlush(pendingSeenMessageWrites.size >= SEEN_MESSAGE_BATCH_SIZE ? 0 : SEEN_MESSAGE_FLUSH_DELAY_MS);
-  return true;
-}
-
-async function flushPendingSeenMessageWrites() {
-  if (seenMessageFlushInFlight || !pendingSeenMessageWrites.size) return;
-  seenMessageFlushInFlight = true;
-
-  const batchEntries = Array.from(pendingSeenMessageWrites.entries()).slice(0, SEEN_MESSAGE_BATCH_SIZE);
-  batchEntries.forEach(([key]) => pendingSeenMessageWrites.delete(key));
-  const batch = batchEntries.map(([, entry]) => entry);
-
-  try {
-    const byId = batch.filter(entry => entry.id > 0);
-    const byTime = batch.filter(entry => entry.id <= 0 && entry.time);
-
-    if (byId.length) {
-      const payload = byId.map(entry => ({ id: entry.id, message: entry.message }));
-      await queryDbWithRetry(`
-        WITH updates AS (
-          SELECT id, message
-          FROM jsonb_to_recordset($1::jsonb) AS x(id bigint, message jsonb)
-        )
-        UPDATE chat AS c
-        SET message = updates.message
-        FROM updates
-        WHERE c.id = updates.id
-      `, [JSON.stringify(payload)], { attempts: 2, label: 'SEEN BATCH SAVE' });
-    }
-
-    if (byTime.length) {
-      const payload = byTime.map(entry => ({ msg_time: entry.time, message: entry.message }));
-      await queryDbWithRetry(`
-        WITH updates AS (
-          SELECT msg_time, message
-          FROM jsonb_to_recordset($1::jsonb) AS x(msg_time text, message jsonb)
-        )
-        UPDATE chat AS c
-        SET message = updates.message
-        FROM updates
-        WHERE c.message->>'time' = updates.msg_time
-      `, [JSON.stringify(payload)], { attempts: 2, label: 'SEEN BATCH SAVE' });
-    }
-  } catch (err) {
-    batch.forEach(entry => {
-      const key = getSeenMessageWriteKey(entry);
-      if (key && !pendingSeenMessageWrites.has(key)) pendingSeenMessageWrites.set(key, entry);
-    });
-    console.error(`[SEEN BATCH ERROR] Failed to persist ${batch.length} seen update(s):`, err);
-  } finally {
-    seenMessageFlushInFlight = false;
-    if (pendingSeenMessageWrites.size) scheduleSeenMessageFlush(120);
-  }
 }
 
 function attachChatDbId(message, dbId) {
@@ -5121,44 +5250,102 @@ function getPublicChatHistory() {
 }
 
 function getPublicChatMessageForUser(message, userName = '') {
-  const targetUser = String(userName || '');
-  const clean = cleanChatMessage(message);
-  if (!targetUser || String(clean.user || '') === targetUser) return clean;
-
-  const seenBy = Array.isArray(clean.seenBy) ? clean.seenBy : [];
-  const wasSeenByTarget = seenBy.includes(targetUser);
-  clean.seenBy = wasSeenByTarget ? [targetUser] : [];
-
-  const seenAt = clean.seenAt && typeof clean.seenAt === 'object' && !Array.isArray(clean.seenAt) ? clean.seenAt : {};
-  clean.seenAt = wasSeenByTarget && seenAt[targetUser] ? { [targetUser]: seenAt[targetUser] } : {};
-  return clean;
+  return cleanChatMessage(message);
 }
 
 function getPublicChatHistoryForUser(userName = '') {
   return messageHistory.map(message => getPublicChatMessageForUser(message, userName));
 }
 
-function getChatSeenSnapshotForUser(userName = '') {
+function getCurrentChatMessageIds() {
+  const ids = [];
+  for (const message of messageHistory) {
+    if (!message || !message.time) continue;
+    const msgId = String(new Date(message.time).getTime());
+    if (msgId && msgId !== 'NaN') ids.push(msgId);
+  }
+  return ids;
+}
+
+async function backfillRecentChatSeenEventsFromLegacyMessages() {
+  try {
+    await queryDbWithRetry(
+      `WITH recent AS (
+         SELECT message
+         FROM chat
+         WHERE jsonb_typeof(message->'seenBy') = 'array'
+           AND COALESCE(message->>'time', '') <> ''
+           AND COALESCE(message->>'user', '') <> ''
+         ORDER BY id DESC
+         LIMIT $1
+       ),
+       legacy AS (
+         SELECT
+           (ROUND(EXTRACT(EPOCH FROM (recent.message->>'time')::timestamptz) * 1000)::bigint)::text AS message_id,
+           recent.message->>'user' AS sender,
+           seen.reader,
+           COALESCE(NULLIF(recent.message->'seenAt'->>seen.reader, '')::timestamptz, NOW()) AS seen_at
+         FROM recent
+         CROSS JOIN LATERAL jsonb_array_elements_text(recent.message->'seenBy') AS seen(reader)
+         WHERE COALESCE(seen.reader, '') <> ''
+       )
+       INSERT INTO chat_seen_events (message_id, sender, reader, seen_at)
+       SELECT message_id, sender, reader, seen_at
+       FROM legacy
+       ON CONFLICT (message_id, reader) DO NOTHING`,
+      [MAX_CHAT_HISTORY],
+      { attempts: 2, label: 'CHAT SEEN LEGACY BACKFILL' }
+    );
+  } catch (err) {
+    console.warn('[CHAT SEEN LEGACY BACKFILL] Skipped:', err && err.message ? err.message : err);
+  }
+}
+
+async function getChatSeenSnapshotForUser(userName = '') {
   const targetUser = String(userName || '');
   if (!targetUser) return [];
-  const events = [];
-  messageHistory.forEach(message => {
-    if (!message || !message.time) return;
-    const msgId = String(new Date(message.time).getTime());
-    if (!msgId || msgId === 'NaN') return;
-    const seenBy = Array.isArray(message.seenBy) ? message.seenBy : [];
-    const seenAt = message.seenAt && typeof message.seenAt === 'object' && !Array.isArray(message.seenAt) ? message.seenAt : {};
-    if (String(message.user || '') === targetUser) {
-      seenBy.forEach(reader => {
-        const name = String(reader || '');
-        if (!name) return;
-        events.push({ msgId, reader: name, seenAt: String(seenAt[name] || '') });
-      });
-      return;
-    }
-    if (seenBy.includes(targetUser)) events.push({ msgId, reader: targetUser, seenAt: String(seenAt[targetUser] || '') });
-  });
-  return events;
+  const messageIds = getCurrentChatMessageIds();
+  if (!messageIds.length) return [];
+  const res = await queryDbWithRetry(
+    `SELECT id, message_id, sender, reader, seen_at
+     FROM chat_seen_events
+     WHERE message_id = ANY($1::text[])
+       AND (sender = $2 OR reader = $2)
+     ORDER BY id ASC`,
+    [messageIds, targetUser],
+    { attempts: 2, label: 'CHAT SEEN SNAPSHOT READ' }
+  );
+  return (res.rows || []).map(row => ({
+    eventId: Math.max(0, Number(row.id) || 0),
+    msgId: String(row.message_id || ''),
+    sender: String(row.sender || ''),
+    reader: String(row.reader || ''),
+    seenAt: row.seen_at ? new Date(row.seen_at).toISOString() : ''
+  })).filter(event => event.eventId && event.msgId && event.reader);
+}
+
+async function getPublicChatHistoryWithSeenForUser(userName = '') {
+  const targetUser = String(userName || '');
+  const history = getPublicChatHistoryForUser(targetUser);
+  if (!targetUser || !history.length) return history;
+  const events = await getChatSeenSnapshotForUser(targetUser);
+  if (!events.length) return history;
+
+  const byId = new Map();
+  for (const message of history) {
+    if (!message || !message.time) continue;
+    const id = String(new Date(message.time).getTime());
+    if (id && id !== 'NaN') byId.set(id, message);
+  }
+  for (const event of events) {
+    const message = byId.get(String(event.msgId || ''));
+    if (!message) continue;
+    if (!Array.isArray(message.seenBy)) message.seenBy = [];
+    if (!message.seenAt || typeof message.seenAt !== 'object' || Array.isArray(message.seenAt)) message.seenAt = {};
+    if (!message.seenBy.includes(event.reader)) message.seenBy.push(event.reader);
+    if (event.seenAt) message.seenAt[event.reader] = event.seenAt;
+  }
+  return history;
 }
 
 async function getChatSeenSyncForUser(userName = '', cursor = 0) {
@@ -5168,7 +5355,7 @@ async function getChatSeenSyncForUser(userName = '', cursor = 0) {
   const maxId = Math.max(0, Number(maxRes.rows[0]?.max_id) || 0);
 
   if (!safeCursor || safeCursor > maxId) {
-    return { mode: 'snapshot', cursor: maxId, events: getChatSeenSnapshotForUser(targetUser) };
+    return { mode: 'snapshot', cursor: maxId, events: await getChatSeenSnapshotForUser(targetUser) };
   }
 
   const res = await queryDbWithRetry(
@@ -5177,7 +5364,7 @@ async function getChatSeenSyncForUser(userName = '', cursor = 0) {
     { attempts: 2, label: 'CHAT SEEN DELTA READ' }
   );
   if (res.rows.length > 2000) {
-    return { mode: 'snapshot', cursor: maxId, events: getChatSeenSnapshotForUser(targetUser) };
+    return { mode: 'snapshot', cursor: maxId, events: await getChatSeenSnapshotForUser(targetUser) };
   }
   return {
     mode: 'changes',
@@ -5185,50 +5372,151 @@ async function getChatSeenSyncForUser(userName = '', cursor = 0) {
     events: res.rows.map(row => ({
       eventId: Math.max(0, Number(row.id) || 0),
       msgId: String(row.message_id || ''),
+      sender: String(row.sender || ''),
       reader: String(row.reader || ''),
       seenAt: row.seen_at ? new Date(row.seen_at).toISOString() : ''
     }))
   };
 }
 
-async function recordChatSeenEvent(msgId = '', sender = '', reader = '', seenAt = '') {
-  const safeMsgId = String(msgId || '');
-  const safeSender = String(sender || '');
-  const safeReader = String(reader || '');
-  if (!safeMsgId || !safeSender || !safeReader) return null;
-  const result = await queryDbWithRetry(`
-    INSERT INTO chat_seen_events (message_id, sender, reader, seen_at)
-    VALUES ($1, $2, $3, COALESCE($4::timestamptz, NOW()))
-    ON CONFLICT (message_id, reader) DO UPDATE SET seen_at = EXCLUDED.seen_at
-    RETURNING id, message_id, sender, reader, seen_at
-  `, [safeMsgId, safeSender, safeReader, seenAt || null], { attempts: 2, label: 'CHAT SEEN EVENT SAVE' });
-  const row = result.rows[0];
-  if (!row) return null;
-  return {
+async function recordChatSeenEventsBatch(entries = [], readerName = '') {
+  const reader = normalizeText(readerName, '').slice(0, 120);
+  if (!reader) return [];
+  const ids = [];
+  const senders = [];
+  const seen = new Set();
+  for (const entry of Array.isArray(entries) ? entries : []) {
+    const msgId = normalizeText(entry && (entry.msgId || entry.id), '').slice(0, 100);
+    const sender = normalizeText(entry && entry.sender, '').slice(0, 120);
+    if (!msgId || !sender || sender === reader || seen.has(msgId)) continue;
+    seen.add(msgId);
+    ids.push(msgId);
+    senders.push(sender);
+    if (ids.length >= CHAT_SEEN_BATCH_MAX) break;
+  }
+  if (!ids.length) return [];
+
+  const res = await queryDbWithRetry(
+    `WITH input AS (
+       SELECT msg_id, sender
+       FROM unnest($1::text[], $2::text[]) AS x(msg_id, sender)
+     ),
+     inserted AS (
+       INSERT INTO chat_seen_events (message_id, sender, reader, seen_at)
+       SELECT input.msg_id, input.sender, $3, NOW()
+       FROM input
+       ON CONFLICT (message_id, reader) DO NOTHING
+       RETURNING id, message_id, sender, reader, seen_at
+     )
+     SELECT id, message_id, sender, reader, seen_at
+     FROM inserted
+     ORDER BY id ASC`,
+    [ids, senders, reader],
+    { attempts: 2, label: ids.length > 1 ? 'CHAT SEEN BATCH SAVE' : 'CHAT SEEN EVENT SAVE' }
+  );
+
+  return (res.rows || []).map(row => ({
     eventId: Math.max(0, Number(row.id) || 0),
-    msgId: String(row.message_id || safeMsgId),
-    sender: String(row.sender || safeSender),
-    reader: String(row.reader || safeReader),
-    seenAt: row.seen_at ? new Date(row.seen_at).toISOString() : String(seenAt || '')
-  };
+    msgId: String(row.message_id || ''),
+    sender: String(row.sender || ''),
+    reader: String(row.reader || reader),
+    seenAt: row.seen_at ? new Date(row.seen_at).toISOString() : ''
+  })).filter(event => event.eventId && event.msgId && event.reader);
 }
 
-function emitChatSeenSyncChange(event) {
-  if (!event || !event.eventId || !event.msgId || !event.reader) return;
-  const payload = {
-    seenSyncV1: true,
-    cursor: event.eventId,
-    msgId: event.msgId,
-    reader: event.reader,
-    seenAt: event.seenAt || ''
-  };
-  const recipients = new Set([String(event.sender || ''), String(event.reader || '')].filter(Boolean));
-  recipients.forEach(name => {
-    getSocketsByUserName(name).forEach(client => {
-      if (client && client.connected) client.emit('chat_seen_sync_change', payload);
-    });
-  });
+function emitChatSeenSyncEvents(events = []) {
+  const cleanEvents = (Array.isArray(events) ? events : [events])
+    .filter(event => event && event.eventId && event.msgId && event.reader)
+    .sort((a, b) => a.eventId - b.eventId);
+  if (!cleanEvents.length) return;
+
+  const byRecipient = new Map();
+  for (const event of cleanEvents) {
+    const payload = {
+      seenSyncV1: true,
+      cursor: event.eventId,
+      msgId: event.msgId,
+      reader: event.reader,
+      seenAt: event.seenAt || ''
+    };
+    const recipients = new Set([String(event.sender || ''), String(event.reader || '')].filter(Boolean));
+    for (const name of recipients) {
+      if (!byRecipient.has(name)) byRecipient.set(name, []);
+      byRecipient.get(name).push(payload);
+    }
+  }
+
+  for (const [name, payloads] of byRecipient) {
+    const sockets = getSocketsByUserName(name);
+    for (const client of sockets) {
+      if (!client || !client.connected) continue;
+      if (client.chatSeenBatchV1 === true && payloads.length > 1) {
+        client.emit('chat_seen_sync_batch', {
+          seenSyncV1: true,
+          cursor: payloads[payloads.length - 1].cursor,
+          events: payloads
+        });
+      } else {
+        payloads.forEach(payload => client.emit('chat_seen_sync_change', payload));
+      }
+    }
+  }
 }
+
+async function emitLegacyChatSeenCompat(events = []) {
+  const cleanEvents = (Array.isArray(events) ? events : [events]).filter(event => event && event.msgId && event.reader);
+  if (!cleanEvents.length) return;
+
+  const senderIds = new Set();
+  for (const event of cleanEvents) {
+    const senderSockets = getSocketsByUserName(String(event.sender || '')).filter(client => client && client.connected && client.chatBatchDeleteV2 !== true);
+    if (senderSockets.length) senderIds.add(String(event.msgId || ''));
+  }
+
+  let fullByMessage = new Map();
+  if (senderIds.size) {
+    const res = await queryDbWithRetry(
+      `SELECT message_id, reader, seen_at
+       FROM chat_seen_events
+       WHERE message_id = ANY($1::text[])
+       ORDER BY id ASC`,
+      [Array.from(senderIds)],
+      { attempts: 2, label: 'CHAT SEEN LEGACY READ' }
+    );
+    for (const row of res.rows || []) {
+      const msgId = String(row.message_id || '');
+      const reader = String(row.reader || '');
+      if (!msgId || !reader) continue;
+      if (!fullByMessage.has(msgId)) fullByMessage.set(msgId, { seenBy: [], seenAt: {} });
+      const state = fullByMessage.get(msgId);
+      if (!state.seenBy.includes(reader)) state.seenBy.push(reader);
+      if (row.seen_at) state.seenAt[reader] = new Date(row.seen_at).toISOString();
+    }
+  }
+
+  for (const event of cleanEvents) {
+    const msgId = String(event.msgId || '');
+    const sender = String(event.sender || '');
+    const reader = String(event.reader || '');
+    const seenAt = String(event.seenAt || '');
+
+    if (sender && senderIds.has(msgId)) {
+      const state = fullByMessage.get(msgId) || { seenBy: [reader], seenAt: seenAt ? { [reader]: seenAt } : {} };
+      getSocketsByUserName(sender).forEach(client => {
+        if (client && client.connected && client.chatBatchDeleteV2 !== true) client.emit('message_seen', { msgId, seenBy: state.seenBy, seenAt: state.seenAt });
+      });
+    }
+
+    if (reader && reader !== sender) {
+      getSocketsByUserName(reader).forEach(client => {
+        if (client && client.connected && client.chatBatchDeleteV2 !== true) {
+          client.emit('message_seen', { msgId, seenBy: [reader], seenAt: seenAt ? { [reader]: seenAt } : {} });
+        }
+      });
+    }
+  }
+}
+
 
 async function refreshChatSyncStateFromDb() {
   const result = await queryDbWithRetry(
@@ -5327,15 +5615,19 @@ async function resolveChatDeleteTargetsForSocket(socket, rawTargets = []) {
     const wantedTimes = Array.from(new Set(missingTargets.map(target => target.time).filter(Boolean)));
     if (wantedTimes.length) {
       const dbResult = await queryDbWithRetry(
-        `SELECT message FROM chat WHERE message->>'time' = ANY($1::text[])`,
+        `SELECT message->>'time' AS msg_time, message->>'user' AS msg_user
+         FROM chat
+         WHERE message->>'time' = ANY($1::text[])`,
         [wantedTimes],
         { attempts: 2, label: 'CHAT DELETE RECOVERY LOOKUP' }
       );
       for (const row of dbResult.rows || []) {
-        const msg = row && row.message && typeof row.message === 'object' ? row.message : null;
-        if (!msg || !msg.time) continue;
-        const id = String(new Date(msg.time).getTime());
-        if (wantedIds.has(id) && !messageById.has(id)) messageById.set(id, msg);
+        const msgTime = String(row && row.msg_time || '');
+        if (!msgTime) continue;
+        const id = String(new Date(msgTime).getTime());
+        if (wantedIds.has(id) && !messageById.has(id)) {
+          messageById.set(id, { time: msgTime, user: String(row && row.msg_user || '') });
+        }
       }
     }
   }
@@ -5360,7 +5652,7 @@ async function resolveChatDeleteTargetsForSocket(socket, rawTargets = []) {
   return { approved, deniedIds, alreadyDeletedIds };
 }
 
-async function deleteChatMessagesWithSyncBatch(entries = []) {
+async function deleteChatMessagesWithSyncBatch(entries = [], trace = null) {
   const normalizedEntries = [];
   const seenIds = new Set();
   for (const entry of Array.isArray(entries) ? entries : []) {
@@ -5375,18 +5667,20 @@ async function deleteChatMessagesWithSyncBatch(entries = []) {
       isOwner: entry && entry.isOwner === true
     });
   }
-  if (!normalizedEntries.length) return { deletedEntries: [], changes: [] };
+  if (!normalizedEntries.length) return { deletedEntries: [], changes: [], epoch: '', startRevision: 0, endRevision: 0 };
 
   const result = await runDbTransactionWithRetry('CHAT BATCH DELETE', async client => {
+    if (trace && typeof trace.stage === 'function') trace.stage('db_before_delete', { entries: normalizedEntries.length });
     const deleteResult = await client.query(
       `DELETE FROM chat
        WHERE message->>'time' = ANY($1::text[])
        RETURNING message->>'time' AS msg_time`,
       [normalizedEntries.map(entry => entry.time)]
     );
+    if (trace && typeof trace.stage === 'function') trace.stage('db_after_delete', { deletedRows: (deleteResult.rows || []).length });
     const deletedTimes = new Set((deleteResult.rows || []).map(row => String(row.msg_time || '')).filter(Boolean));
     const deletedEntries = normalizedEntries.filter(entry => deletedTimes.has(entry.time));
-    if (!deletedEntries.length) return { epoch: '', endRevision: 0, deletedEntries: [], rows: [] };
+    if (!deletedEntries.length) return { epoch: '', startRevision: 0, endRevision: 0, deletedEntries: [], ids: [] };
 
     const ids = deletedEntries.map(entry => entry.id);
     const stateResult = await client.query(
@@ -5397,38 +5691,41 @@ async function deleteChatMessagesWithSyncBatch(entries = []) {
       [ids.length]
     );
     if (!stateResult.rows.length) throw new Error('Chat sync state is unavailable.');
+    if (trace && typeof trace.stage === 'function') trace.stage('db_after_revision_reserve', { revisions: ids.length });
 
     const epoch = String(stateResult.rows[0].epoch || '');
     const endRevision = Math.max(0, Number(stateResult.rows[0].revision) || 0);
     const startRevision = Math.max(1, endRevision - ids.length + 1);
-    const insertResult = await client.query(
+    await client.query(
       `INSERT INTO chat_changes (revision, epoch, change_type, message_id, message)
        SELECT $1::bigint + input.ord - 1, $2, 'delete', input.msg_id, NULL::jsonb
        FROM unnest($3::text[]) WITH ORDINALITY AS input(msg_id, ord)
-       ORDER BY input.ord
-       RETURNING revision, epoch, change_type, message_id, message`,
+       ORDER BY input.ord`,
       [startRevision, epoch, ids]
     );
+    if (trace && typeof trace.stage === 'function') trace.stage('db_after_change_rows', { changes: ids.length });
     await client.query('SELECT pg_notify($1, $2)', [
       'chat_sync_notify',
-      JSON.stringify({ instanceId: INSTANCE_ID, reason: 'delete_batch', count: ids.length })
+      JSON.stringify({ instanceId: INSTANCE_ID, reason: 'delete_batch', count: ids.length, revision: endRevision })
     ]);
-    return { epoch, endRevision, deletedEntries, rows: insertResult.rows || [] };
+    if (trace && typeof trace.stage === 'function') trace.stage('db_after_notify', { changes: ids.length });
+    return { epoch, startRevision, endRevision, deletedEntries, ids };
   }, { attempts: 3, lockTimeoutMs: 2000 });
 
-  const changes = (result && Array.isArray(result.rows) ? result.rows : [])
-    .map(row => ({
-      epoch: String(row.epoch || result.epoch || ''),
-      revision: Math.max(0, Number(row.revision) || 0),
-      type: String(row.change_type || 'delete'),
-      msgId: String(row.message_id || ''),
-      message: null
-    }))
-    .filter(change => change.epoch && change.revision && change.msgId)
-    .sort((a, b) => a.revision - b.revision);
+  const ids = result && Array.isArray(result.ids) ? result.ids : [];
+  const startRevision = Math.max(0, Number(result && result.startRevision) || 0);
+  const endRevision = Math.max(0, Number(result && result.endRevision) || 0);
+  const epoch = String(result && result.epoch || '');
+  const changes = ids.map((msgId, index) => ({
+    epoch,
+    revision: startRevision + index,
+    type: 'delete',
+    msgId: String(msgId || ''),
+    message: null
+  })).filter(change => change.epoch && change.revision && change.msgId);
 
-  if (result && result.epoch && result.endRevision) {
-    chatSyncState = { epoch: String(result.epoch), revision: Math.max(0, Number(result.endRevision) || 0) };
+  if (epoch && endRevision) {
+    chatSyncState = { epoch, revision: endRevision };
     const pruneBefore = chatSyncState.revision - CHAT_SYNC_CHANGE_LOG_MAX;
     if (pruneBefore > 0) {
       pool.query('DELETE FROM chat_changes WHERE epoch = $1 AND revision <= $2', [chatSyncState.epoch, pruneBefore]).catch(err => {
@@ -5439,7 +5736,10 @@ async function deleteChatMessagesWithSyncBatch(entries = []) {
 
   return {
     deletedEntries: result && Array.isArray(result.deletedEntries) ? result.deletedEntries : [],
-    changes
+    changes,
+    epoch,
+    startRevision,
+    endRevision
   };
 }
 
@@ -5458,6 +5758,59 @@ function emitChatSyncChange(change) {
     trackBandwidthPayload('chat_sync_change', payload, 1);
     client.emit('chat_sync_change', payload);
   });
+}
+
+function emitChatBatchDeleteRealtime(batch = {}) {
+  const msgIds = Array.from(new Set((Array.isArray(batch.msgIds) ? batch.msgIds : [])
+    .map(id => normalizeText(id, '').slice(0, 100))
+    .filter(Boolean)));
+  const epoch = String(batch.epoch || '');
+  const startRevision = Math.max(0, Number(batch.startRevision) || 0);
+  const endRevision = Math.max(0, Number(batch.endRevision || batch.revision) || 0);
+  if (!msgIds.length) return;
+  const trace = createChatMemoryTrace('delete_batch_realtime', null, { deleted:msgIds.length, startRevision, endRevision });
+
+  const compactPayload = {
+    syncV1: true,
+    epoch,
+    startRevision,
+    revision: endRevision,
+    msgIds
+  };
+
+  let v2Clients = 0;
+  let legacyClients = 0;
+  io.sockets.sockets.forEach(client => {
+    if (!client || !client.connected || !client.userName) return;
+    if (client.chatBatchDeleteV2 === true) {
+      v2Clients++;
+      trackBandwidthPayload('chat_messages_deleted', compactPayload, 1);
+      client.emit('chat_messages_deleted', compactPayload);
+      return;
+    }
+
+    legacyClients++;
+    // Legacy clients do not understand the compact event. Keep their visible chat correct
+    // without also sending N sync packets; their existing gap repair will reconcile revisions
+    // on the next sync-sensitive mutation or reconnect.
+    for (const msgId of msgIds) client.emit('message_deleted', msgId);
+  });
+  trace.finish({ v2Clients, legacyClients, legacyPackets:legacyClients * msgIds.length });
+}
+
+
+function removeChatMessagesFromMemory(msgIds = []) {
+  const ids = new Set((Array.isArray(msgIds) ? msgIds : [msgIds]).map(id => String(id || '')).filter(Boolean));
+  if (!ids.size || !Array.isArray(messageHistory) || !messageHistory.length) return 0;
+  let removed = 0;
+  for (let i = messageHistory.length - 1; i >= 0; i--) {
+    const msg = messageHistory[i];
+    if (!msg || !msg.time) continue;
+    if (!ids.has(String(new Date(msg.time).getTime()))) continue;
+    messageHistory.splice(i, 1);
+    removed++;
+  }
+  return removed;
 }
 
 async function resetChatSyncEpoch() {
@@ -5482,7 +5835,7 @@ async function resetChatSyncEpoch() {
 
 async function getChatSyncSnapshotForUser(userName = '') {
   const result = await queryDbWithRetry(
-    'SELECT id, message, (COUNT(*) OVER())::int AS total_count FROM chat ORDER BY id DESC LIMIT $1',
+    "SELECT id, message - 'seenBy' - 'seenAt' AS message, (COUNT(*) OVER())::int AS total_count FROM chat ORDER BY id DESC LIMIT $1",
     [MAX_CHAT_HISTORY],
     { attempts: 2, label: 'CHAT SYNC SNAPSHOT READ' }
   );
@@ -5555,7 +5908,7 @@ function sanitizeChatSyncChangeForUser(row, userName = '') {
 }
 
 async function refreshChatHistoryFromDb() {
-  const chatRes = await pool.query('SELECT id, message FROM chat ORDER BY id DESC LIMIT $1', [MAX_CHAT_HISTORY]);
+  const chatRes = await pool.query("SELECT id, message - 'seenBy' - 'seenAt' AS message FROM chat ORDER BY id DESC LIMIT $1", [MAX_CHAT_HISTORY]);
   const rows = chatRes.rows.reverse();
   messageHistory = rows.map(row => attachChatDbId({ ...(row.message || {}) }, row.id));
   lastChatDbId = rows.length ? Math.max(...rows.map(row => Number(row.id) || 0)) : 0;
@@ -5584,7 +5937,7 @@ async function clearChatHistorySafely(byUser = "Admin", reason = "manual clear")
 async function syncChatAcrossInstances() {
   try {
     const newRows = await queryDbWithRetry(
-      'SELECT id, message FROM chat WHERE id > $1 ORDER BY id ASC LIMIT $2',
+      "SELECT id, message - 'seenBy' - 'seenAt' AS message FROM chat WHERE id > $1 ORDER BY id ASC LIMIT $2",
       [lastChatDbId, MAX_CHAT_HISTORY],
       { attempts: 2, label: 'CHAT SYNC READ' }
     );
@@ -5682,6 +6035,9 @@ function emitToAdmins(event, payload) {
 }
 
 async function addModerationLog(type, message, detail = {}, admin = "System") {
+  const chatDeleteTrace = (type === 'delete_message' || type === 'delete_messages')
+    ? createChatMemoryTrace('moderation_log', null, { logType:type, by:normalizeText(admin, '').slice(0, 80), detailKeys:Object.keys(detail || {}).length })
+    : null;
   const entry = {
     id: `log-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     type,
@@ -5693,14 +6049,19 @@ async function addModerationLog(type, message, detail = {}, admin = "System") {
 
   moderationLog.unshift(entry);
   moderationLog = moderationLog.slice(0, MODERATION_LOG_HISTORY_MAX);
+  if (chatDeleteTrace) chatDeleteTrace.stage('after_memory_log', { moderationHistory:moderationLog.length });
 
   try {
+    if (chatDeleteTrace) chatDeleteTrace.stage('before_db_insert');
     await pool.query('INSERT INTO moderation_log (entry) VALUES ($1)', [entry]);
+    if (chatDeleteTrace) chatDeleteTrace.stage('after_db_insert');
   } catch (err) {
     console.error('[ADMIN LOG ERROR]:', err);
   }
 
+  if (chatDeleteTrace) chatDeleteTrace.stage('before_admin_emit');
   emitToAdmins('admin_moderation_log', entry);
+  if (chatDeleteTrace) chatDeleteTrace.finish({ adminRecipients:Array.from(adminSockets).filter(client => client && client.connected && client.isAdmin === true).length });
   return entry;
 }
 
@@ -7268,7 +7629,9 @@ async function markChatMessagesNotificationsDeleted(messageIds = []) {
     .map(id => normalizeText(id, '').slice(0, 100))
     .filter(Boolean)));
   if (!ids.length) return 0;
+  const trace = createChatMemoryTrace('delete_notifications', null, { ids:ids.length });
   try {
+    trace.stage('before_db_update');
     const result = await queryDbWithRetry(
       `UPDATE user_notifications
        SET data = data || jsonb_build_object('messageDeleted', true, 'text', '')
@@ -7279,12 +7642,20 @@ async function markChatMessagesNotificationsDeleted(messageIds = []) {
       [ids],
       { attempts: 2, label: ids.length > 1 ? 'CHAT NOTIFICATION MESSAGE BATCH DELETE' : 'CHAT NOTIFICATION MESSAGE DELETE' }
     );
+    trace.stage('after_db_update', { rows:(result.rows || []).length });
     const events = result.rows.map(serializeUserNotificationRow).filter(Boolean);
-    if (!events.length) return 0;
+    if (!events.length) { trace.finish({ events:0 }); return 0; }
     events.forEach(event => emitUserNotificationToLocalUser(event, 'user_notification_updated'));
-    deferServerTask('CHAT NOTIFICATION MESSAGE DELETE SYNC', () => notifyUserNotificationsUpdatedAcrossInstances(events), 0);
+    trace.stage('after_local_emit', { events:events.length });
+    deferServerTask('CHAT NOTIFICATION MESSAGE DELETE SYNC', async () => {
+      const deferredTrace = createChatMemoryTrace('delete_notification_cross_instance', null, { events:events.length });
+      try { await notifyUserNotificationsUpdatedAcrossInstances(events); deferredTrace.finish({ ok:1 }); }
+      catch (err) { deferredTrace.finish({ ok:0 }); throw err; }
+    }, 0);
+    trace.finish({ events:events.length });
     return events.length;
   } catch (err) {
+    trace.finish({ error:1 });
     console.error('[CHAT NOTIFICATION MESSAGE DELETE ERROR]:', err && err.message ? err.message : err);
     return 0;
   }
@@ -8294,7 +8665,9 @@ io.on('connection', (socket) => {
       const supportsProfileSyncAckV1 = data && data.profileSyncAckV1 === true;
       const supportsChatHistoryAckV1 = data && data.chatHistoryAckV1 === true;
       const supportsChatHistoryPullV1 = data && data.chatHistoryPullV1 === true;
-      logMemoryTrace('auth:start', `user=${name || ''} socket=${socket.id} new=${isNewAccount === true} v2=${supportsProfileSyncV2} ack=${supportsProfileSyncAckV1} chatAck=${supportsChatHistoryAckV1} chatPull=${supportsChatHistoryPullV1}`);
+      const supportsChatBatchDeleteV2 = data && data.chatBatchDeleteV2 === true;
+      const supportsChatSeenBatchV1 = data && data.chatSeenBatchV1 === true;
+      logMemoryTrace('auth:start', `user=${name || ''} socket=${socket.id} new=${isNewAccount === true} v2=${supportsProfileSyncV2} ack=${supportsProfileSyncAckV1} chatAck=${supportsChatHistoryAckV1} chatPull=${supportsChatHistoryPullV1} chatBatch=${supportsChatBatchDeleteV2} seenBatch=${supportsChatSeenBatchV1}`);
       let dbUser = await getAuthUserRecordFromDb(name);
       if (dbUser) {
         const authEstimate = estimateValueBytes(dbUser, { maxNodes: 10000, maxBytes: 8 * 1024 * 1024 });
@@ -8449,6 +8822,8 @@ io.on('connection', (socket) => {
           socket.profileSyncAckV1 = supportsProfileSyncAckV1;
           socket.chatHistoryAckV1 = supportsChatHistoryAckV1;
           socket.chatHistoryPullV1 = supportsChatHistoryPullV1;
+          socket.chatBatchDeleteV2 = supportsChatBatchDeleteV2;
+          socket.chatSeenBatchV1 = supportsChatSeenBatchV1;
           
           markSocketAuthenticated(socket);
           invalidateOnlineListCache('auth-existing-db');
@@ -8542,6 +8917,8 @@ io.on('connection', (socket) => {
         socket.profileSyncAckV1 = supportsProfileSyncAckV1;
         socket.chatHistoryAckV1 = supportsChatHistoryAckV1;
         socket.chatHistoryPullV1 = supportsChatHistoryPullV1;
+        socket.chatBatchDeleteV2 = supportsChatBatchDeleteV2;
+        socket.chatSeenBatchV1 = supportsChatSeenBatchV1;
         normalizeProfileArrayPayloads(userDatabase[name]);
         userCacheMeta[name] = Date.now();
         fullUserCacheNames.delete(name);
@@ -9921,13 +10298,65 @@ io.on('connection', (socket) => {
       respond(blocked);
       return;
     }
-    let messageData = { ...(typeof msg === 'object' ? msg : { text: msg }), time: new Date().toISOString(), seenBy: [], seenAt: {} };
+    const incoming = (msg && typeof msg === 'object') ? msg : { text: msg };
     const isAdmin = socket.isAdmin === true;
     const canModerate = canModerateSocket(socket);
     const actorRole = getActorRole(socket);
-    const senderName = socket.userName || messageData.user;
+    const senderName = socket.userName || normalizeText(incoming.user, '').slice(0, 120);
+    const text = String(incoming.text == null ? '' : incoming.text).slice(0, CHAT_MESSAGE_TEXT_MAX);
+    const incomingType = normalizeText(incoming.type, 'text').toLowerCase();
+    let messageType = 'text';
+    let safeContent = null;
+    if (incomingType === 'poll' && incoming.content && typeof incoming.content === 'object' && !Array.isArray(incoming.content)) {
+      const rawPoll = incoming.content;
+      const rawOptions = Array.isArray(rawPoll.options) ? rawPoll.options : [];
+      const options = rawOptions.slice(0, CHAT_POLL_OPTIONS_MAX).map(option => {
+        const rawOption = option && typeof option === 'object' ? option : { text: option };
+        const voters = Array.from(new Set((Array.isArray(rawOption.voters) ? rawOption.voters : [])
+          .map(name => normalizeText(name, '').slice(0, 120))
+          .filter(Boolean))).slice(0, CHAT_POLL_VOTERS_MAX);
+        return {
+          text: String(rawOption.text == null ? '' : rawOption.text).slice(0, CHAT_POLL_OPTION_TEXT_MAX),
+          voters
+        };
+      }).filter(option => option.text);
+      safeContent = {
+        question: String(rawPoll.question == null ? '' : rawPoll.question).slice(0, CHAT_POLL_QUESTION_MAX),
+        options,
+        totalVotes: options.reduce((sum, option) => sum + option.voters.length, 0)
+      };
+      messageType = 'poll';
+    } else {
+      const rawContent = Array.isArray(incoming.content) ? incoming.content : [];
+      const media = rawContent.slice(0, CHAT_MESSAGE_MEDIA_MAX)
+        .map(value => normalizeText(value, '').slice(0, CHAT_MESSAGE_URL_MAX))
+        .filter(value => /^https?:\/\//i.test(value));
+      if (media.length) {
+        messageType = 'image';
+        safeContent = media;
+      }
+    }
+    const rawReply = incoming.replyTo && typeof incoming.replyTo === 'object' ? incoming.replyTo : null;
+    const replyTo = rawReply ? {
+      user: normalizeText(rawReply.user, '').slice(0, 120),
+      text: String(rawReply.text == null ? '' : rawReply.text).slice(0, CHAT_REPLY_TEXT_MAX),
+      id: normalizeText(rawReply.id, '').slice(0, 100)
+    } : null;
+    const profileAvatar = normalizeText(userDatabase[senderName] && userDatabase[senderName].avatar, '');
+    const incomingAvatar = normalizeText(incoming.avatar, '');
+    const avatarRef = (profileAvatar || incomingAvatar).slice(0, CHAT_AVATAR_REF_MAX);
+    const messageData = {
+      text,
+      user: senderName,
+      ...(avatarRef && !/^data:/i.test(avatarRef) ? { avatar: avatarRef } : {}),
+      replyTo: replyTo && (replyTo.user || replyTo.text || replyTo.id) ? replyTo : null,
+      type: messageType,
+      content: safeContent,
+      isGlobalPing: incoming.isGlobalPing === true,
+      globalPingRole: normalizeText(incoming.globalPingRole, '').slice(0, 32),
+      time: new Date().toISOString()
+    };
 
-    const text = normalizeText(messageData.text, "");
     const lowerText = text.toLowerCase();
 
     if (senderName && userDatabase[senderName] && isUserBanned(userDatabase[senderName]) && !ADMIN_USERS.includes(senderName)) {
@@ -10085,6 +10514,13 @@ io.on('connection', (socket) => {
       socket.lastChatAt = Date.now();
     }
 
+    recordChatTraceTraffic('send', 1);
+    if (socket.isAdmin === true) recordChatTraceTraffic('sendAdmin', 1);
+    const incomingTraceStats = summarizeChatTracePayload(incoming);
+    const chatTrace = createChatMemoryTrace('send', socket, incomingTraceStats);
+    const sanitizedTraceStats = summarizeChatTracePayload(messageData);
+    chatTrace.stage('sanitized', { storedPayload:sanitizedTraceStats.payload, storedType:sanitizedTraceStats.type, storedTextBytes:sanitizedTraceStats.textBytes, storedContentCount:sanitizedTraceStats.contentCount, storedContentBytes:sanitizedTraceStats.contentBytes });
+
     messageData.isAdmin = isAdmin;
     messageData.role = actorRole;
     messageData.isModerator = actorRole === 'mod';
@@ -10092,24 +10528,39 @@ io.on('connection', (socket) => {
 
     try {
       const savedMessage = cleanChatMessage(messageData);
+      chatTrace.stage('before_db_insert', { savedPayload:summarizeChatTracePayload(savedMessage).payload });
       const savedRes = await pool.query('INSERT INTO chat (message) VALUES ($1) RETURNING id', [savedMessage]);
+      chatTrace.stage('after_db_insert');
       attachChatDbId(messageData, savedRes.rows[0]?.id);
       lastChatDbId = Math.max(lastChatDbId, messageData._dbId || 0);
 
       messageHistory.push(messageData);
       if (messageHistory.length > MAX_CHAT_HISTORY) messageHistory.shift();
+      chatTrace.stage('after_history_push', { historySize:messageHistory.length });
 
       const publicMessage = cleanChatMessage(messageData);
       deferServerTask('CHAT USER NOTIFICATIONS', () => recordChatUserNotifications(publicMessage), 0);
+      chatTrace.stage('before_sync_change');
       const syncChange = await recordChatSyncChangeSafe('upsert', String(new Date(messageData.time).getTime()), publicMessage);
+      chatTrace.stage('after_sync_change', { revision:Number(syncChange && syncChange.revision)||0 });
+      let liveRecipients = 0;
+      chatTrace.stage('before_chat_broadcast');
       io.sockets.sockets.forEach(client => {
         if (!client || !client.connected) return;
         if (client.__chatInitialFullSyncInFlight === true) return;
+        liveRecipients++;
         client.emit('chat_message', publicMessage);
       });
-      if (syncChange) emitChatSyncChange(syncChange);
+      chatTrace.stage('after_chat_broadcast', { liveRecipients });
+      if (syncChange) {
+        chatTrace.stage('before_sync_broadcast');
+        emitChatSyncChange(syncChange);
+        chatTrace.stage('after_sync_broadcast');
+      }
+      chatTrace.finish({ liveRecipients, revision:Number(syncChange && syncChange.revision)||0 });
       respond({ success: true, message: publicMessage });
     } catch (err) {
+      chatTrace.finish({ error:1 });
       console.error('[CHAT SAVE ERROR]:', err);
       const failed = { success: false, reason: 'database', message: 'Message was not saved. Please try again.' };
       socket.emit('chat_blocked', failed);
@@ -10648,29 +11099,69 @@ io.on('connection', (socket) => {
     }
   });
 
-  socket.on('mark_as_read', (data) => {
-    const msg = messageHistory.find(m => String(new Date(m.time).getTime()) === String(data.msgId));
-    if (msg && msg.user !== data.user) {
-        if (!msg.seenBy) msg.seenBy = [];
-        if (!msg.seenAt || typeof msg.seenAt !== 'object' || Array.isArray(msg.seenAt)) msg.seenAt = {};
-        if (!msg.seenBy.includes(data.user)) {
-            msg.seenBy.push(data.user);
-            msg.seenAt[data.user] = new Date().toISOString();
-            const fullSeenPayload = { msgId: data.msgId, seenBy: msg.seenBy, seenAt: msg.seenAt };
-            getSocketsByUserName(msg.user).forEach(client => {
-                if (client && client.connected) client.emit('message_seen', fullSeenPayload);
-            });
-            const readerSeenPayload = { msgId: data.msgId, seenBy: [data.user], seenAt: { [data.user]: msg.seenAt[data.user] } };
-            getSocketsByUserName(data.user).forEach(client => {
-                if (client && client.connected && client.userName !== msg.user) client.emit('message_seen', readerSeenPayload);
-            });
-            queueSeenMessagePersist(msg);
-            recordChatSeenEvent(data.msgId, msg.user, data.user, msg.seenAt[data.user])
-              .then(event => { if (event) emitChatSeenSyncChange(event); })
-              .catch(err => console.error('[CHAT SEEN SYNC ERROR]:', err && err.message ? err.message : err));
-        }
+  async function processChatSeenBatchForSocket(rawIds = []) {
+    const reader = normalizeText(socket.userName, '').slice(0, 120);
+    if (!reader) return { success: false, seen: 0, seenIds: [] };
+
+    const ids = [];
+    const requested = new Set();
+    for (const value of Array.isArray(rawIds) ? rawIds : [rawIds]) {
+      const id = normalizeText(value && typeof value === 'object' ? (value.msgId || value.id) : value, '').slice(0, 100);
+      if (!id || requested.has(id)) continue;
+      requested.add(id);
+      ids.push(id);
+      if (ids.length >= CHAT_SEEN_BATCH_MAX) break;
+    }
+    if (!ids.length) return { success: true, seen: 0, seenIds: [] };
+
+    const targets = [];
+    for (const msg of messageHistory) {
+      if (!msg || !msg.time || !msg.user) continue;
+      const msgId = String(new Date(msg.time).getTime());
+      if (!requested.has(msgId) || String(msg.user) === reader) continue;
+      targets.push({ msgId, sender: String(msg.user) });
+    }
+    if (!targets.length) return { success: true, seen: 0, seenIds: [] };
+
+    const events = await recordChatSeenEventsBatch(targets, reader);
+    if (events.length) {
+      emitChatSeenSyncEvents(events);
+      deferServerTask('CHAT SEEN LEGACY COMPAT', () => emitLegacyChatSeenCompat(events), 0);
+    }
+    return { success: true, seen: targets.length, newSeen: events.length, seenIds: targets.map(target => target.msgId) };
+  }
+
+  socket.on('mark_messages_as_read', async (data = {}, callback) => {
+    const respond = typeof callback === 'function' ? callback : () => {};
+    if (socket.__chatSeenBatchInFlight === true) return respond({ success: false, busy: true, seen: 0, seenIds: [] });
+    const ids = Array.isArray(data && data.msgIds) ? data.msgIds : [];
+    recordChatTraceTraffic('seenBatch', 1);
+    recordChatTraceTraffic('seenIds', ids.length);
+    const trace = createChatMemoryTrace('seen_batch', socket, { ids:ids.length, request:formatChatTraceBytes(ids.reduce((sum, id) => sum + chatTraceByteLength(id), 0)) });
+    socket.__chatSeenBatchInFlight = true;
+    try {
+      trace.stage('before_process');
+      const result = await processChatSeenBatchForSocket(ids);
+      trace.finish({ seen:Number(result && result.seen)||0, newSeen:Number(result && result.newSeen)||0 });
+      respond(result);
+    } catch (err) {
+      trace.finish({ error:1 });
+      console.error('[CHAT SEEN BATCH ERROR]:', err && err.message ? err.message : err);
+      respond({ success: false, seen: 0, seenIds: [] });
+    } finally {
+      socket.__chatSeenBatchInFlight = false;
     }
   });
+
+  socket.on('mark_as_read', async (data = {}) => {
+    recordChatTraceTraffic('legacySeen', 1);
+    try {
+      await processChatSeenBatchForSocket([data && data.msgId]);
+    } catch (err) {
+      console.error('[CHAT SEEN ERROR]:', err && err.message ? err.message : err);
+    }
+  });
+
 
   socket.on('edit_message', async (data) => {
     const msgIndex = messageHistory.findIndex(m => String(new Date(m.time).getTime()) === String(data.msgId));
@@ -10746,22 +11237,33 @@ io.on('connection', (socket) => {
     if (!rawTargets.length) return respond({ success: false, message: 'No messages selected.' });
     if (rawTargets.length > CHAT_BATCH_DELETE_MAX) return respond({ success: false, message: `You can delete up to ${CHAT_BATCH_DELETE_MAX} messages at once.` });
 
+    recordChatTraceTraffic('deleteBatch', 1);
+    recordChatTraceTraffic('deleteIds', rawTargets.length);
+    if (socket.isAdmin === true) recordChatTraceTraffic('deleteBatchAdmin', 1);
+    const deleteTrace = createChatMemoryTrace('delete_batch', socket, summarizeChatDeleteTracePayload(rawTargets));
     socket.__chatBatchDeleteInFlight = true;
     try {
+      deleteTrace.stage('before_resolve');
       const resolution = await resolveChatDeleteTargetsForSocket(socket, rawTargets);
       const approved = Array.isArray(resolution.approved) ? resolution.approved : [];
       const deniedIds = Array.isArray(resolution.deniedIds) ? resolution.deniedIds : [];
       const alreadyDeletedIds = Array.isArray(resolution.alreadyDeletedIds) ? resolution.alreadyDeletedIds : [];
+      const moderatedApproved = approved.reduce((count, entry) => count + (entry && entry.isOwner === true ? 0 : 1), 0);
+      deleteTrace.stage('after_resolve', { approved:approved.length, moderated:moderatedApproved, denied:deniedIds.length, alreadyDeleted:alreadyDeletedIds.length });
 
       if (!approved.length) {
         alreadyDeletedIds.forEach(msgId => socket.emit('message_deleted', msgId));
         if (alreadyDeletedIds.length) {
+          deleteTrace.finish({ deleted:0, healed:alreadyDeletedIds.length, denied:deniedIds.length });
           return respond({ success: true, deleted: 0, deletedIds: [], alreadyDeleted: alreadyDeletedIds.length, alreadyDeletedIds, denied: deniedIds.length, deniedIds });
         }
+        deleteTrace.finish({ deleted:0, denied:deniedIds.length });
         return respond({ success: false, message: 'None of the selected messages can be deleted.', denied: deniedIds.length, deniedIds });
       }
 
-      const batchResult = await deleteChatMessagesWithSyncBatch(approved);
+      deleteTrace.stage('before_db_batch', { approved:approved.length });
+      const batchResult = await deleteChatMessagesWithSyncBatch(approved, deleteTrace);
+      deleteTrace.stage('after_db_batch');
       const deletedEntries = batchResult && Array.isArray(batchResult.deletedEntries) ? batchResult.deletedEntries : [];
       const deletedIds = deletedEntries.map(entry => entry.id);
       const deletedIdSet = new Set(deletedIds);
@@ -10769,18 +11271,19 @@ io.on('connection', (socket) => {
       const staleIds = Array.from(new Set([...alreadyDeletedIds, ...racedAlreadyDeletedIds]));
 
       if (deletedIds.length) {
-        messageHistory = messageHistory.filter(msg => {
-          if (!msg || !msg.time) return true;
-          return !deletedIdSet.has(String(new Date(msg.time).getTime()));
+        deleteTrace.stage('before_memory_remove', { deleted:deletedIds.length });
+        const removedFromMemory = removeChatMessagesFromMemory(deletedIds);
+        deleteTrace.stage('after_memory_remove', { removedFromMemory });
+        deleteTrace.stage('before_realtime', { deleted:deletedIds.length });
+        emitChatBatchDeleteRealtime({
+          msgIds: deletedIds,
+          epoch: batchResult.epoch,
+          startRevision: batchResult.startRevision,
+          endRevision: batchResult.endRevision
         });
-
-        const syncById = new Map((batchResult.changes || []).map(change => [String(change.msgId || ''), change]));
-        for (const msgId of deletedIds) {
-          io.emit('message_deleted', msgId);
-          const syncChange = syncById.get(String(msgId));
-          if (syncChange) emitChatSyncChange(syncChange);
-        }
+        deleteTrace.stage('after_realtime', { deleted:deletedIds.length });
         deferServerTask('CHAT NOTIFICATION MESSAGE BATCH DELETE', () => markChatMessagesNotificationsDeleted(deletedIds), 0);
+        deleteTrace.stage('after_notification_schedule');
 
         const pinnedIds = new Set(deletedIds);
         const hadPinned = pinnedMessages.some(pin => pin && pinnedIds.has(String(pin.id)));
@@ -10796,6 +11299,7 @@ io.on('connection', (socket) => {
 
         const moderatedEntries = deletedEntries.filter(entry => !entry.isOwner);
         if (moderatedEntries.length) {
+          deleteTrace.stage('before_moderation_schedule', { moderated:moderatedEntries.length });
           const targetUsers = Array.from(new Set(moderatedEntries.map(entry => entry.user).filter(Boolean)));
           deferServerTask('CHAT BATCH MODERATION LOG', () => addModerationLog(
             'delete_messages',
@@ -10803,10 +11307,12 @@ io.on('connection', (socket) => {
             { msgIds: moderatedEntries.map(entry => entry.id), targetUsers },
             socket.userName || 'Moderator'
           ), 0);
+          deleteTrace.stage('after_moderation_schedule', { moderated:moderatedEntries.length });
         }
       }
 
       staleIds.forEach(msgId => socket.emit('message_deleted', msgId));
+      deleteTrace.finish({ deleted:deletedIds.length, healed:staleIds.length, denied:deniedIds.length });
       respond({
         success: deletedIds.length > 0 || staleIds.length > 0,
         deleted: deletedIds.length,
@@ -10818,6 +11324,7 @@ io.on('connection', (socket) => {
         ...(deletedIds.length || staleIds.length ? {} : { message: 'None of the selected messages can be deleted.' })
       });
     } catch (err) {
+      deleteTrace.finish({ error:1 });
       console.error('[CHAT BATCH DELETE ERROR]:', err && err.message ? err.message : err);
       respond({ success: false, message: 'Could not delete the selected messages.' });
     } finally {
@@ -10830,35 +11337,52 @@ io.on('connection', (socket) => {
     const respond = typeof callback === 'function' ? callback : () => {};
     const msgId = normalizeText(data && data.msgId, '').slice(0, 100);
     if (!msgId) return respond({ success: false, message: 'Invalid message.' });
+    recordChatTraceTraffic('deleteSingle', 1);
+    if (socket.isAdmin === true) recordChatTraceTraffic('deleteSingleAdmin', 1);
+    const deleteTrace = createChatMemoryTrace('delete_single', socket, { request:formatChatTraceBytes(chatTraceByteLength(msgId) + chatTraceByteLength(data && data.msgTime)) });
 
     try {
+      deleteTrace.stage('before_resolve');
       const resolution = await resolveChatDeleteTargetsForSocket(socket, [{ id: msgId, time: data && data.msgTime }]);
       const approved = Array.isArray(resolution.approved) ? resolution.approved : [];
       const alreadyDeletedIds = Array.isArray(resolution.alreadyDeletedIds) ? resolution.alreadyDeletedIds : [];
+      deleteTrace.stage('after_resolve', { approved:approved.length, alreadyDeleted:alreadyDeletedIds.length });
       if (!approved.length) {
         if (alreadyDeletedIds.includes(msgId)) {
           socket.emit('message_deleted', msgId);
+          deleteTrace.finish({ deleted:0, healed:1 });
           return respond({ success: true, deleted: false, alreadyDeleted: true, msgId });
         }
+        deleteTrace.finish({ deleted:0, denied:1 });
         return respond({ success: false, message: 'You cannot delete this message.' });
       }
 
       const entry = approved[0];
-      const batchResult = await deleteChatMessagesWithSyncBatch([entry]);
+      deleteTrace.stage('before_db_batch', { moderated:entry && entry.isOwner === true ? 0 : 1 });
+      const batchResult = await deleteChatMessagesWithSyncBatch([entry], deleteTrace);
+      deleteTrace.stage('after_db_batch');
       const deletedEntry = batchResult && Array.isArray(batchResult.deletedEntries) ? batchResult.deletedEntries[0] : null;
       if (!deletedEntry) {
         socket.emit('message_deleted', msgId);
+        deleteTrace.finish({ deleted:0, healed:1 });
         return respond({ success: true, deleted: false, alreadyDeleted: true, msgId });
       }
 
-      messageHistory = messageHistory.filter(msg => !msg || !msg.time || String(new Date(msg.time).getTime()) !== msgId);
+      deleteTrace.stage('before_memory_remove');
+      const removedFromMemory = removeChatMessagesFromMemory([msgId]);
+      deleteTrace.stage('after_memory_remove', { removedFromMemory });
+      deleteTrace.stage('before_realtime');
       io.emit('message_deleted', msgId);
       const syncChange = Array.isArray(batchResult.changes) ? batchResult.changes.find(change => String(change.msgId || '') === msgId) : null;
       if (syncChange) emitChatSyncChange(syncChange);
+      deleteTrace.stage('after_realtime', { revision:Number(syncChange && syncChange.revision)||0 });
       deferServerTask('CHAT NOTIFICATION MESSAGE DELETE', () => markChatMessageNotificationsDeleted(msgId), 0);
+      deleteTrace.stage('after_notification_schedule');
 
       if (!deletedEntry.isOwner) {
+        deleteTrace.stage('before_moderation_schedule');
         deferServerTask('CHAT DELETE MODERATION LOG', () => addModerationLog('delete_message', `Deleted message from ${deletedEntry.user}`, { msgId, targetUser: deletedEntry.user }, socket.userName || 'Moderator'), 0);
+        deleteTrace.stage('after_moderation_schedule');
       }
 
       const isPinned = pinnedMessages.find(p => p && String(p.id) === msgId);
@@ -10867,8 +11391,10 @@ io.on('connection', (socket) => {
         deferServerTask('PINNED MESSAGE DELETE', () => queryDbWithRetry('DELETE FROM pinned_messages WHERE message_id = $1', [msgId], { attempts: 2, label: 'PINNED MESSAGE DELETE' }), 0);
         io.emit('pinned_list', pinnedMessages);
       }
+      deleteTrace.finish({ deleted:1, moderated:deletedEntry.isOwner === true ? 0 : 1 });
       respond({ success: true, deleted: true, alreadyDeleted: false, msgId });
     } catch (err) {
+      deleteTrace.finish({ error:1 });
       console.error('[CHAT DELETE ERROR]:', err && err.message ? err.message : err);
       respond({ success: false, message: 'Could not delete the message.' });
     }

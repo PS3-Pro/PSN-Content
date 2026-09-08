@@ -13799,6 +13799,8 @@ P
 			profileSyncAckV1: true,
 			chatHistoryAckV1: true,
 			chatHistoryPullV1: true,
+			chatBatchDeleteV2: true,
+			chatSeenBatchV1: true,
 			adminMaintenanceBypass: document.body.classList.contains('admin-maintenance-login-bypass'),
 			userData: {
 				avatar: accountAvatar,
@@ -13958,6 +13960,8 @@ P
 					profileSyncAckV1: true,
 					chatHistoryAckV1: true,
 					chatHistoryPullV1: true,
+					chatBatchDeleteV2: true,
+					chatSeenBatchV1: true,
 					adminMaintenanceBypass: document.body.classList.contains('admin-maintenance-login-bypass')
 				};
 
@@ -14082,6 +14086,8 @@ P
 				profileSyncAckV1: true,
 				chatHistoryAckV1: true,
 				chatHistoryPullV1: true,
+				chatBatchDeleteV2: true,
+				chatSeenBatchV1: true,
 				passwordResetSubmission: isPasswordResetSubmission,
 				adminMaintenanceBypass: document.body.classList.contains('admin-maintenance-login-bypass')
 			};
@@ -51882,6 +51888,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 				const pendingAt = Number(pendingValue || 0);
 				if (!pendingAt || now - pendingAt >= 5000) window.__chatSeenEmitPending.delete(pendingKey);
 			}
+			const unseenIds = [];
 			for (let i = 0; i < history.length; i++) {
 				const m = history[i];
 				if (!m || m.user === myName) continue;
@@ -51893,7 +51900,42 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 				const pendingAt = Number(window.__chatSeenEmitPending.get(key) || 0);
 				if (pendingAt && now - pendingAt < 5000) continue;
 				window.__chatSeenEmitPending.set(key, now);
-				socketChat.emit('mark_as_read', { msgId, user: myName });
+				unseenIds.push(key);
+			}
+			if (unseenIds.length) {
+				const confirmSeen = response => {
+					if (!response || response.success !== true) return;
+					const confirmed = Array.isArray(response.seenIds) ? response.seenIds.map(String) : unseenIds;
+					const confirmedAt = new Date().toISOString();
+					let changed = false;
+					for (const id of confirmed) {
+						window.__chatSeenEmitPending.delete(id);
+						const message = typeof getChatMessageByIdFast === 'function' ? getChatMessageByIdFast(id) : null;
+						if (!message || message.user === myName) continue;
+						if (!Array.isArray(message.seenBy)) message.seenBy = [];
+						let messageChanged = false;
+						if (!message.seenBy.includes(myName)) { message.seenBy.push(myName); changed = true; messageChanged = true; }
+						if (!message.seenAt || typeof message.seenAt !== 'object' || Array.isArray(message.seenAt)) message.seenAt = {};
+						if (!message.seenAt[myName]) { message.seenAt[myName] = confirmedAt; changed = true; messageChanged = true; }
+						if (messageChanged && typeof markChatMessageSeenDataDirty === 'function') markChatMessageSeenDataDirty(message);
+					}
+					if (changed && typeof scheduleChatPersistentCacheWrite === 'function') scheduleChatPersistentCacheWrite();
+				};
+				const retrySeen = () => {
+					for (const id of unseenIds) window.__chatSeenEmitPending.delete(id);
+					window.__chatSeenScanSignature = '';
+					setTimeout(() => {
+						if (typeof isChatScreenVisibleForRead === 'function' && isChatScreenVisibleForRead() && typeof markVisibleChatAsRead === 'function') markVisibleChatAsRead();
+					}, 300);
+				};
+				if (typeof socketChat.timeout === 'function') socketChat.timeout(8000).emit('mark_messages_as_read', { msgIds: unseenIds }, (err, response) => {
+					if (err || !response || response.success !== true) { retrySeen(); return; }
+					confirmSeen(response);
+				});
+				else socketChat.emit('mark_messages_as_read', { msgIds: unseenIds }, response => {
+					if (!response || response.success !== true) { retrySeen(); return; }
+					confirmSeen(response);
+				});
 			}
 		}
 		return readChanged;
@@ -62398,6 +62440,8 @@ function getVisibleChatStackEl(id) {
 		payload.profileSyncAckV1 = true;
 		payload.chatHistoryAckV1 = true;
 		payload.chatHistoryPullV1 = true;
+		payload.chatBatchDeleteV2 = true;
+		payload.chatSeenBatchV1 = true;
 		window.clearLoginServerAttempt();
 		enableServerAutomaticReconnect();
 
@@ -62590,7 +62634,9 @@ function getVisibleChatStackEl(id) {
 					profileSyncV2: true,
 					profileSyncAckV1: true,
 					chatHistoryAckV1: true,
-					chatHistoryPullV1: true
+					chatHistoryPullV1: true,
+					chatBatchDeleteV2: true,
+					chatSeenBatchV1: true
 				});
 			}
 			if (profileRealtimeConnectionWasLost) {
@@ -63745,6 +63791,12 @@ function getVisibleChatStackEl(id) {
             if (typeof applyRealtimeChatSeenChange === 'function') applyRealtimeChatSeenChange(event || {});
         });
 
+        socketChat.on('chat_seen_sync_batch', function(batch = {}) {
+            if (typeof applyRealtimeChatSeenChange !== 'function') return;
+            const events = Array.isArray(batch && batch.events) ? batch.events.slice().sort((a, b) => (Number(a && a.cursor) || 0) - (Number(b && b.cursor) || 0)) : [];
+            for (const event of events) applyRealtimeChatSeenChange(event || {});
+        });
+
         socketChat.on('chat_history', function(history, respond) {
             const result = handleChatHistorySnapshot(history, respond);
             if (window.__lastChatHistorySnapshotChanged !== false) scheduleChatPersistentCacheWrite();
@@ -64141,60 +64193,110 @@ function getVisibleChatStackEl(id) {
 			if (typeof refreshMentionJumpButton === 'function') refreshMentionJumpButton();
 		});
 	
-		socketChat.on('message_deleted', function(msgId) {
-			const hadDeletedMessage = typeof getChatMessageByIdFast === 'function'
-				? !!getChatMessageByIdFast(msgId)
-				: (Array.isArray(window.messageHistory) && window.messageHistory.some(m => String(new Date(m && m.time).getTime()) === String(msgId)));
-			const renderedEntry = typeof getChatRenderedMessageEntry === 'function' ? getChatRenderedMessageEntry(msgId) : null;
-			const existingDeletedRow = renderedEntry ? renderedEntry.row : document.getElementById(`msg-row-${msgId}`);
-			const deletingActiveEdit = typeof editingMsgId !== 'undefined' && String(editingMsgId) === String(msgId);
-			const deletingActiveReply = typeof currentReply !== 'undefined' && currentReply && String(currentReply.id) === String(msgId);
-			if (!hadDeletedMessage && (!existingDeletedRow || existingDeletedRow.dataset.chatDeletePending === '1') && !deletingActiveEdit && !deletingActiveReply) return;
-			if (window.messageHistory) {
-				if (typeof removeChatMessageByIdFast === 'function') removeChatMessageByIdFast(msgId);
-				else window.messageHistory = window.messageHistory.filter(m => String(new Date(m.time).getTime()) !== String(msgId));
-				if (typeof deleteChatAuxMessageCaches === 'function') deleteChatAuxMessageCaches(msgId);
-				if (typeof window.setSidebarCountPill === 'function') window.setSidebarCountPill('chat', window.messageHistory.length);
-			}
-		
-			if (typeof editingMsgId !== 'undefined' && String(editingMsgId) === String(msgId)) {
-				if (typeof cancelEditMessage === 'function') cancelEditMessage();
-			}
-		
-			if (typeof currentReply !== 'undefined' && currentReply && String(currentReply.id) === String(msgId)) {
-				if (typeof cancelReply === 'function') cancelReply();
-			}
-		
-			const msgRow = existingDeletedRow;
-			if (msgRow) {
-				msgRow.dataset.chatDeletePending = '1';
-				msgRow.classList.remove('msg-anim');
-		
-				void msgRow.offsetWidth; 
-		
-				msgRow.style.opacity = '0';
-				msgRow.style.transform = 'scale(0.8) translateX(30px)';
-				msgRow.style.pointerEvents = 'none';
-		
-				setTimeout(() => { 
-					if (typeof forgetChatRenderedMessage === 'function') forgetChatRenderedMessage(msgId, msgRow);
-					if (msgRow.parentNode) msgRow.remove(); 
-				}, 400);
-			}
-		
-			if (window.selectedChatMessageIds && typeof window.selectedChatMessageIds.delete === 'function') {
-				window.selectedChatMessageIds.delete(String(msgId));
-			}
-			if (typeof updateChatSelectionUi === 'function') updateChatSelectionUi();
-			updateChatHistoryRenderSignature();
-			if (typeof refreshChatNotificationDot === 'function') {
-				refreshChatNotificationDot();
-			}
-			if (typeof refreshMentionJumpButton === 'function') {
-				refreshMentionJumpButton();
-			}
-		});
-	
+        function applyChatDeletedMessageIds(rawIds, options = {}) {
+            const msgIds = Array.from(new Set((Array.isArray(rawIds) ? rawIds : [rawIds])
+                .map(id => String(id || ''))
+                .filter(Boolean)));
+            if (!msgIds.length) return false;
+
+            const idSet = new Set(msgIds);
+            const rowsToRemove = [];
+            let deletingActiveEdit = false;
+            let deletingActiveReply = false;
+            let relevant = false;
+
+            for (const msgId of msgIds) {
+                const hadMessage = typeof getChatMessageByIdFast === 'function'
+                    ? !!getChatMessageByIdFast(msgId)
+                    : (Array.isArray(window.messageHistory) && window.messageHistory.some(m => String(new Date(m && m.time).getTime()) === msgId));
+                const renderedEntry = typeof getChatRenderedMessageEntry === 'function' ? getChatRenderedMessageEntry(msgId) : null;
+                const row = renderedEntry ? renderedEntry.row : document.getElementById(`msg-row-${msgId}`);
+                const editingThis = typeof editingMsgId !== 'undefined' && String(editingMsgId) === msgId;
+                const replyingThis = typeof currentReply !== 'undefined' && currentReply && String(currentReply.id) === msgId;
+                if (hadMessage || (row && row.dataset.chatDeletePending !== '1') || editingThis || replyingThis) relevant = true;
+                if (row && row.dataset.chatDeletePending !== '1') rowsToRemove.push([msgId, row]);
+                if (editingThis) deletingActiveEdit = true;
+                if (replyingThis) deletingActiveReply = true;
+            }
+
+            let historyChanged = false;
+            if (Array.isArray(window.messageHistory) && window.messageHistory.length) {
+                const history = window.messageHistory;
+                for (let i = history.length - 1; i >= 0; i--) {
+                    const messageId = String(new Date(history[i] && history[i].time).getTime());
+                    if (!idSet.has(messageId)) continue;
+                    history.splice(i, 1);
+                    historyChanged = true;
+                }
+                if (historyChanged) {
+                    window.__chatHistoryContentRevision = Math.max(0, Number(window.__chatHistoryContentRevision) || 0) + 1;
+                    if (typeof rebuildChatMessageIndexes === 'function') rebuildChatMessageIndexes(history);
+                    window.__chatVirtualStartIndex = Math.min(Math.max(0, Number(window.__chatVirtualStartIndex || 0)), history.length);
+                    window.__chatVirtualEndIndex = Math.min(Math.max(window.__chatVirtualStartIndex, Number(window.__chatVirtualEndIndex || 0)), history.length);
+                    if (typeof window.setSidebarCountPill === 'function') window.setSidebarCountPill('chat', history.length);
+                }
+            }
+
+            for (const msgId of msgIds) {
+                if (typeof deleteChatAuxMessageCaches === 'function') deleteChatAuxMessageCaches(msgId);
+                if (window.selectedChatMessageIds && typeof window.selectedChatMessageIds.delete === 'function') window.selectedChatMessageIds.delete(msgId);
+            }
+
+            if (deletingActiveEdit && typeof cancelEditMessage === 'function') cancelEditMessage();
+            if (deletingActiveReply && typeof cancelReply === 'function') cancelReply();
+
+            for (const [msgId, msgRow] of rowsToRemove) {
+                msgRow.dataset.chatDeletePending = '1';
+                msgRow.classList.remove('msg-anim');
+                void msgRow.offsetWidth;
+                msgRow.style.opacity = '0';
+                msgRow.style.transform = 'scale(0.8) translateX(30px)';
+                msgRow.style.pointerEvents = 'none';
+                setTimeout(() => {
+                    if (typeof forgetChatRenderedMessage === 'function') forgetChatRenderedMessage(msgId, msgRow);
+                    if (msgRow.parentNode) msgRow.remove();
+                }, 400);
+            }
+
+            if (!relevant && !historyChanged) return false;
+            if (typeof updateChatSelectionUi === 'function') updateChatSelectionUi();
+            updateChatHistoryRenderSignature();
+            if (typeof refreshChatNotificationDot === 'function') refreshChatNotificationDot();
+            if (typeof refreshMentionJumpButton === 'function') refreshMentionJumpButton();
+            if (options.persist !== false && typeof scheduleChatPersistentCacheWrite === 'function') scheduleChatPersistentCacheWrite();
+            return true;
+        }
+
+        socketChat.on('message_deleted', function(msgId) {
+            applyChatDeletedMessageIds([msgId]);
+        });
+
+        socketChat.on('chat_messages_deleted', function(batch = {}) {
+            const msgIds = Array.isArray(batch && batch.msgIds) ? batch.msgIds : [];
+            if (!msgIds.length) return;
+
+            applyChatDeletedMessageIds(msgIds, { persist: false });
+
+            if (batch && batch.syncV1 === true && batch.epoch) {
+                const incomingEpoch = String(batch.epoch || '');
+                const startRevision = Math.max(0, Number(batch.startRevision) || 0);
+                const endRevision = Math.max(0, Number(batch.revision || batch.endRevision) || 0);
+                const currentEpoch = String(window.__chatCacheEpoch || '');
+                const currentRevision = Math.max(0, Number(window.__chatCacheRevision) || 0);
+
+                if (currentEpoch === incomingEpoch && endRevision > 0 && currentRevision >= Math.max(0, startRevision - 1)) {
+                    if (endRevision > currentRevision) window.__chatCacheRevision = endRevision;
+                } else if (endRevision > currentRevision || currentEpoch !== incomingEpoch) {
+                    window.__chatHistoryRequesting = false;
+                    setTimeout(() => {
+                        if (typeof requestChatHistoryNow === 'function') requestChatHistoryNow('chat-sync-gap');
+                    }, 0);
+                }
+            }
+
+            if (typeof scheduleChatPersistentCacheWrite === 'function') scheduleChatPersistentCacheWrite();
+        });
+
 		socketChat.on('user_kicked', (data = {}) => {
 			isKicked = true;
 			const myName = localStorage.getItem('psn_username') || '';
