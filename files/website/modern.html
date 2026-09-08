@@ -28435,6 +28435,7 @@ P
         const availability = getSocialPlayTogetherAvailability(activeUser);
         if (availability.user === activeUser && availability.loaded === true) availability.me = window.__viewerPlayTogetherTitleIds.size;
         const changed = hadTitle !== (enabled === true);
+        if (enabled === true && typeof checkTrophyProgress === 'function') checkTrophyProgress('play_together', 1);
         if (render && changed) refreshViewerPlayTogetherVisibleCollections();
         return changed;
     };
@@ -43377,6 +43378,7 @@ P
 			}
 
 			if (currentStatus.status === 'playing') {
+				if (typeof checkTrophyProgress === 'function') checkTrophyProgress('play_game_connected', 1);
 				// Seed/refresh the clock from webMAN on every health ping, even when no
 				// playtime UI is visible. Remote presence therefore stays authoritative.
 				const polledPlayTime = parseCurrentPs3PlayTimeFromWebmanHtml(html);
@@ -50729,6 +50731,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 		usage_14: { id: 'usage_14', title: 'PSN Resident', desc: 'Access the store on 14 different days.', type: 'gold', max: 14, group: 'System & Usage' },
 		night_owl: { id: 'night_owl', title: 'Night Owl', desc: 'Access the database after midnight.', type: 'bronze', max: 1, group: 'System & Usage' },
 		connect_ps3: { id: 'connect_ps3', title: 'Connection Established', desc: 'Successfully connect the site to your PS3™.', type: 'bronze', max: 1, group: 'System & Usage' },
+		play_game_connected: { id: 'play_game_connected', title: 'Now Playing', desc: 'Play a game on your PS3™ while connected to the site.', type: 'bronze', max: 1, group: 'System & Usage' },
 		sync_db: { id: 'sync_db', title: 'Always Updated', desc: 'Manually sync the database in settings.', type: 'bronze', max: 1, group: 'System & Usage' },
 		unlock_all: { id: 'unlock_all', title: "Gotta Unlock 'em All!", desc: 'Unlock all games by installing the License Pack.', type: 'gold', max: 1, group: 'System & Usage' },
 		avatar_premium: { id: 'avatar_premium', title: 'Premium Identity', desc: 'Equip an exclusive reward avatar.', type: 'silver', max: 1, group: 'System & Usage' },
@@ -50744,6 +50747,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 		friend_1: { id: 'friend_1', title: 'Socializing', desc: 'Add your first friend to the list.', type: 'bronze', max: 1, group: 'Social & Chat' },
 		friend_10: { id: 'friend_10', title: 'Popular', desc: 'Have 10 friends on your list.', type: 'silver', max: 10, group: 'Social & Chat' },
 		friend_25: { id: 'friend_25', title: 'Networker', desc: 'Have 25 friends on your list.', type: 'gold', max: 25, group: 'Social & Chat' },
+		play_together: { id: 'play_together', title: 'Better Together', desc: 'Enable Play Together for a game.', type: 'bronze', max: 1, group: 'Social & Chat' },
 
 		wishlist_1: { id: 'wishlist_1', title: 'Window Shopper', desc: 'Add 1 game to your Wishlist.', type: 'bronze', max: 1, group: 'Store & Wishlist' },
 		wishlist_10: { id: 'wishlist_10', title: 'Wish Collector', desc: 'Have 10 games in your Wishlist simultaneously.', type: 'silver', max: 10, group: 'Store & Wishlist' },
@@ -51560,8 +51564,44 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 	window.__chatServerMaxHistory = 0;
 	function setChatHistoryLimitFromServer(value) {
 		const limit = Math.floor(Number(value) || 0);
-		if (limit > 0) window.__chatServerMaxHistory = limit;
-		return getChatHistoryLimit();
+		if (limit <= 0) return getChatHistoryLimit();
+		window.__chatServerMaxHistory = limit;
+
+		/* The server owns this limit. If it is lowered while a client already has a larger
+		   persistent/live history, adopt the new cap immediately instead of waiting for one
+		   message at a time to age out. Keep the visible chat in place while the existing
+		   soft render reconciles any rows that fell outside the new retained history. */
+		const history = Array.isArray(window.messageHistory) ? window.messageHistory : null;
+		if (history && history.length > limit) {
+			const overflow = history.length - limit;
+			const removed = history.splice(0, overflow);
+			removed.forEach(msg => {
+				const key = typeof getChatIndexedMessageKey === 'function' ? getChatIndexedMessageKey(msg) : '';
+				if (key && typeof deleteChatAuxMessageCaches === 'function') deleteChatAuxMessageCaches(key, true);
+			});
+
+			const previousStart = Math.max(0, Number(window.__chatVirtualStartIndex || 0));
+			const previousEnd = Math.max(0, Number(window.__chatVirtualEndIndex || 0));
+			window.__chatVirtualStartIndex = Math.max(0, previousStart - overflow);
+			window.__chatVirtualEndIndex = Math.max(
+				window.__chatVirtualStartIndex,
+				Math.min(history.length, Math.max(0, previousEnd - overflow))
+			);
+			window.__chatHistoryContentRevision = Math.max(0, Number(window.__chatHistoryContentRevision) || 0) + 1;
+			if (typeof rebuildChatMessageIndexes === 'function') rebuildChatMessageIndexes(history);
+			if (typeof window.setSidebarCountPill === 'function') window.setSidebarCountPill('chat', history.length);
+			if (typeof updateChatHistoryRenderSignature === 'function') updateChatHistoryRenderSignature();
+			if (typeof scheduleChatPersistentCacheWrite === 'function') scheduleChatPersistentCacheWrite(0);
+
+			const chatVisible = typeof isChatScreenVisibleForRead === 'function' && isChatScreenVisibleForRead();
+			const box = document.getElementById('chat-messages');
+			if (chatVisible && box && box.querySelector('[id^="msg-row-"]') && typeof scheduleChatHistorySoftRerender === 'function') {
+				scheduleChatHistorySoftRerender('chat-server-history-limit', false);
+			} else if (!chatVisible) {
+				window.__chatHistoryDomRendered = false;
+			}
+		}
+		return limit;
 	}
 	function getChatHistoryLimit() {
 		const limit = Math.floor(Number(window.__chatServerMaxHistory) || 0);
@@ -63735,19 +63775,22 @@ function getVisibleChatStackEl(id) {
 			chatIndex.lastKey = incomingKey || getChatIndexedMessageKey(data);
 			window.__chatHistoryContentRevision = Math.max(0, Number(window.__chatHistoryContentRevision) || 0) + 1;
 			if (typeof window.setSidebarCountPill === 'function') window.setSidebarCountPill('chat', window.messageHistory.length);
-			if (window.messageHistory.length > getChatHistoryLimit()) {
-				const shiftedMessage = window.messageHistory.shift();
-				const shiftedKey = getChatIndexedMessageKey(shiftedMessage);
-				if (shiftedKey) {
+			const chatHistoryLimit = getChatHistoryLimit();
+			const historyOverflow = Number.isFinite(chatHistoryLimit) ? Math.max(0, window.messageHistory.length - chatHistoryLimit) : 0;
+			if (historyOverflow > 0) {
+				const shiftedMessages = window.messageHistory.splice(0, historyOverflow);
+				shiftedMessages.forEach(shiftedMessage => {
+					const shiftedKey = getChatIndexedMessageKey(shiftedMessage);
+					if (!shiftedKey) return;
 					chatIndex.ids.delete(shiftedKey);
 					chatIndex.byId.delete(shiftedKey);
 					if (typeof deleteChatAuxMessageCaches === 'function') deleteChatAuxMessageCaches(shiftedKey, true);
-				}
+				});
 				chatIndex.length = window.messageHistory.length;
 				chatIndex.firstKey = window.messageHistory.length ? getChatIndexedMessageKey(window.messageHistory[0]) : '';
 				chatIndex.positionsById = null;
-				window.__chatVirtualStartIndex = Math.max(0, Number(window.__chatVirtualStartIndex || 0) - 1);
-				window.__chatVirtualEndIndex = Math.max(window.__chatVirtualStartIndex, Number(window.__chatVirtualEndIndex || 0) - 1);
+				window.__chatVirtualStartIndex = Math.max(0, Number(window.__chatVirtualStartIndex || 0) - historyOverflow);
+				window.__chatVirtualEndIndex = Math.max(window.__chatVirtualStartIndex, Number(window.__chatVirtualEndIndex || 0) - historyOverflow);
 			}
 			/* A live append extends the current virtual window when that window already owned the
 			   history tail. Without this, jumpToBottom() sees a stale end index and rebuilds the
@@ -66497,14 +66540,38 @@ function getVisibleChatStackEl(id) {
 			return;
 		}
 
-		let deleted = 0;
-		validIds.forEach(id => {
-			if (emitDeleteChatMessage(id)) deleted++;
-		});
+		if (!(typeof socketChat !== 'undefined' && socketChat && socketChat.connected)) {
+			if (typeof playUiError === 'function') playUiError();
+			return;
+		}
 
-		if (deleted > 0) {
+		const selectedSet = new Set(validIds.map(String));
+		if (typeof editingMsgId !== 'undefined' && editingMsgId && selectedSet.has(String(editingMsgId)) && typeof cancelEditMessage === 'function') cancelEditMessage();
+		if (typeof currentReply !== 'undefined' && currentReply && selectedSet.has(String(currentReply.id)) && typeof cancelReply === 'function') cancelReply();
+
+		let settled = false;
+		const finish = response => {
+			if (settled) return;
+			settled = true;
+			if (!response || response.success !== true) {
+				if (typeof playUiError === 'function') playUiError();
+				if (response && response.message && typeof window.showToastNotification === 'function') window.showToastNotification('Delete messages', response.message);
+				return;
+			}
 			if (typeof playUiRemove === 'function') playUiRemove();
 			clearChatMessageSelection();
+		};
+
+		try {
+			const payload = { msgIds: validIds, user: localStorage.getItem('psn_username') || '' };
+			if (typeof socketChat.timeout === 'function') {
+				socketChat.timeout(10000).emit('delete_messages', payload, (err, response) => finish(err ? null : response));
+			} else {
+				socketChat.emit('delete_messages', payload, response => finish(response));
+				setTimeout(() => finish(null), 10000);
+			}
+		} catch (err) {
+			finish(null);
 		}
 	}
 

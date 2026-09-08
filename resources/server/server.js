@@ -16,6 +16,7 @@ const DEFAULT_AVATAR = "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/ma
 const MAX_CHAT_HISTORY = 1000; 
 const CHAT_SYNC_CHANGE_LOG_MAX = Math.max(1000, Math.min(20000, parseInt(process.env.CHAT_SYNC_CHANGE_LOG_MAX || "5000", 10) || 5000));
 const CHAT_SYNC_MAX_DELTA = Math.max(100, Math.min(5000, parseInt(process.env.CHAT_SYNC_MAX_DELTA || "1500", 10) || 1500));
+const CHAT_BATCH_DELETE_MAX = 100;
 
 const SERVER_STARTED_AT = Date.now();
 const INSTANCE_ID = process.env.RENDER_INSTANCE_ID || process.env.RAILWAY_REPLICA_ID || process.env.HOSTNAME || `instance-${Math.random().toString(36).slice(2, 10)}`;
@@ -5293,6 +5294,89 @@ async function recordChatSyncChangeSafe(changeType, messageId = '', message = nu
   }
 }
 
+async function deleteChatMessagesWithSyncBatch(entries = []) {
+  const normalizedEntries = [];
+  const seenIds = new Set();
+  for (const entry of Array.isArray(entries) ? entries : []) {
+    const id = normalizeText(entry && entry.id, '').slice(0, 100);
+    const time = String(entry && entry.time || '');
+    if (!id || !time || seenIds.has(id)) continue;
+    seenIds.add(id);
+    normalizedEntries.push({
+      id,
+      time,
+      user: String(entry && entry.user || ''),
+      isOwner: entry && entry.isOwner === true
+    });
+  }
+  if (!normalizedEntries.length) return { deletedEntries: [], changes: [] };
+
+  const result = await runDbTransactionWithRetry('CHAT BATCH DELETE', async client => {
+    const deleteResult = await client.query(
+      `DELETE FROM chat
+       WHERE message->>'time' = ANY($1::text[])
+       RETURNING message->>'time' AS msg_time`,
+      [normalizedEntries.map(entry => entry.time)]
+    );
+    const deletedTimes = new Set((deleteResult.rows || []).map(row => String(row.msg_time || '')).filter(Boolean));
+    const deletedEntries = normalizedEntries.filter(entry => deletedTimes.has(entry.time));
+    if (!deletedEntries.length) return { epoch: '', endRevision: 0, deletedEntries: [], rows: [] };
+
+    const ids = deletedEntries.map(entry => entry.id);
+    const stateResult = await client.query(
+      `UPDATE chat_sync_state
+       SET revision = revision + $1::bigint, updated_at = NOW()
+       WHERE id = 1
+       RETURNING epoch, revision`,
+      [ids.length]
+    );
+    if (!stateResult.rows.length) throw new Error('Chat sync state is unavailable.');
+
+    const epoch = String(stateResult.rows[0].epoch || '');
+    const endRevision = Math.max(0, Number(stateResult.rows[0].revision) || 0);
+    const startRevision = Math.max(1, endRevision - ids.length + 1);
+    const insertResult = await client.query(
+      `INSERT INTO chat_changes (revision, epoch, change_type, message_id, message)
+       SELECT $1::bigint + input.ord - 1, $2, 'delete', input.msg_id, NULL::jsonb
+       FROM unnest($3::text[]) WITH ORDINALITY AS input(msg_id, ord)
+       ORDER BY input.ord
+       RETURNING revision, epoch, change_type, message_id, message`,
+      [startRevision, epoch, ids]
+    );
+    await client.query('SELECT pg_notify($1, $2)', [
+      'chat_sync_notify',
+      JSON.stringify({ instanceId: INSTANCE_ID, reason: 'delete_batch', count: ids.length })
+    ]);
+    return { epoch, endRevision, deletedEntries, rows: insertResult.rows || [] };
+  }, { attempts: 3, lockTimeoutMs: 2000 });
+
+  const changes = (result && Array.isArray(result.rows) ? result.rows : [])
+    .map(row => ({
+      epoch: String(row.epoch || result.epoch || ''),
+      revision: Math.max(0, Number(row.revision) || 0),
+      type: String(row.change_type || 'delete'),
+      msgId: String(row.message_id || ''),
+      message: null
+    }))
+    .filter(change => change.epoch && change.revision && change.msgId)
+    .sort((a, b) => a.revision - b.revision);
+
+  if (result && result.epoch && result.endRevision) {
+    chatSyncState = { epoch: String(result.epoch), revision: Math.max(0, Number(result.endRevision) || 0) };
+    const pruneBefore = chatSyncState.revision - CHAT_SYNC_CHANGE_LOG_MAX;
+    if (pruneBefore > 0) {
+      pool.query('DELETE FROM chat_changes WHERE epoch = $1 AND revision <= $2', [chatSyncState.epoch, pruneBefore]).catch(err => {
+        if (process.env.DEBUG_CHAT_SYNC === '1') console.warn('[CHAT SYNC PRUNE ERROR]:', err && err.message ? err.message : err);
+      });
+    }
+  }
+
+  return {
+    deletedEntries: result && Array.isArray(result.deletedEntries) ? result.deletedEntries : [],
+    changes
+  };
+}
+
 function emitChatSyncChange(change) {
   if (!change || !change.epoch || !change.revision) return;
   io.sockets.sockets.forEach(client => {
@@ -7113,19 +7197,21 @@ async function removeChatReactionNotification(messageOwner, messageId, actor, em
   }
 }
 
-async function markChatMessageNotificationsDeleted(messageId) {
-  const id = normalizeText(messageId, '').slice(0, 100);
-  if (!id) return 0;
+async function markChatMessagesNotificationsDeleted(messageIds = []) {
+  const ids = Array.from(new Set((Array.isArray(messageIds) ? messageIds : [messageIds])
+    .map(id => normalizeText(id, '').slice(0, 100))
+    .filter(Boolean)));
+  if (!ids.length) return 0;
   try {
     const result = await queryDbWithRetry(
       `UPDATE user_notifications
        SET data = data || jsonb_build_object('messageDeleted', true, 'text', '')
        WHERE event_type IN ('mention', 'reply', 'reaction')
-         AND data->>'messageId' = $1
+         AND data->>'messageId' = ANY($1::text[])
          AND COALESCE(data->>'messageDeleted', 'false') <> 'true'
        RETURNING id, user_name, event_type, data, created_at`,
-      [id],
-      { attempts: 2, label: 'CHAT NOTIFICATION MESSAGE DELETE' }
+      [ids],
+      { attempts: 2, label: ids.length > 1 ? 'CHAT NOTIFICATION MESSAGE BATCH DELETE' : 'CHAT NOTIFICATION MESSAGE DELETE' }
     );
     const events = result.rows.map(serializeUserNotificationRow).filter(Boolean);
     if (!events.length) return 0;
@@ -7136,6 +7222,10 @@ async function markChatMessageNotificationsDeleted(messageId) {
     console.error('[CHAT NOTIFICATION MESSAGE DELETE ERROR]:', err && err.message ? err.message : err);
     return 0;
   }
+}
+
+async function markChatMessageNotificationsDeleted(messageId) {
+  return markChatMessagesNotificationsDeleted([messageId]);
 }
 
 async function recordCatalogNotification(userName, rawData = {}) {
@@ -7983,7 +8073,7 @@ async function createReport(data = {}, reporterName = "Unknown") {
   };
 
   adminReports.unshift(report);
-  adminReports = adminReports.slice(0, 100);
+  adminReports = adminReports.slice(0, ADMIN_REPORTS_HISTORY_MAX);
 
   await pool.query(
     'INSERT INTO reports (id, data, resolved) VALUES ($1, $2, false) ON CONFLICT (id) DO UPDATE SET data = $2, resolved = false',
@@ -10579,6 +10669,96 @@ io.on('connection', (socket) => {
         }
     }
   });
+
+  socket.on('delete_messages', async (data = {}, callback) => {
+    const respond = typeof callback === 'function' ? callback : () => {};
+    if (socket.__chatBatchDeleteInFlight === true) return respond({ success: false, message: 'A message delete is already running.' });
+
+    const rawIds = Array.isArray(data && data.msgIds) ? data.msgIds : [];
+    if (!rawIds.length) return respond({ success: false, message: 'No messages selected.' });
+    if (rawIds.length > CHAT_BATCH_DELETE_MAX) return respond({ success: false, message: `You can delete up to ${CHAT_BATCH_DELETE_MAX} messages at once.` });
+
+    const requestedIds = Array.from(new Set(rawIds.map(id => normalizeText(id, '').slice(0, 100)).filter(Boolean)));
+    if (!requestedIds.length) return respond({ success: false, message: 'No valid messages selected.' });
+
+    const requestedSet = new Set(requestedIds);
+    const canModerate = canModerateSocket(socket);
+    const approved = [];
+    const deniedIds = [];
+
+    for (const msg of messageHistory) {
+      if (!msg || !msg.time) continue;
+      const msgId = String(new Date(msg.time).getTime());
+      if (!requestedSet.has(msgId)) continue;
+      const isOwner = msg.user === socket.userName;
+      if (isOwner || (canModerate && canModerateTarget(socket, msg.user))) {
+        approved.push({ id: msgId, time: String(msg.time), user: String(msg.user || ''), isOwner });
+      } else {
+        deniedIds.push(msgId);
+      }
+    }
+
+    if (!approved.length) return respond({ success: false, message: 'None of the selected messages can be deleted.' });
+
+    socket.__chatBatchDeleteInFlight = true;
+    try {
+      const batchResult = await deleteChatMessagesWithSyncBatch(approved);
+      const deletedEntries = batchResult && Array.isArray(batchResult.deletedEntries) ? batchResult.deletedEntries : [];
+      const deletedIds = deletedEntries.map(entry => entry.id);
+      if (!deletedIds.length) return respond({ success: false, message: 'The selected messages were already removed.' });
+
+      const deletedIdSet = new Set(deletedIds);
+      messageHistory = messageHistory.filter(msg => {
+        if (!msg || !msg.time) return true;
+        return !deletedIdSet.has(String(new Date(msg.time).getTime()));
+      });
+
+      const syncById = new Map((batchResult.changes || []).map(change => [String(change.msgId || ''), change]));
+      for (const msgId of deletedIds) {
+        io.emit('message_deleted', msgId);
+        const syncChange = syncById.get(String(msgId));
+        if (syncChange) emitChatSyncChange(syncChange);
+      }
+      deferServerTask('CHAT NOTIFICATION MESSAGE BATCH DELETE', () => markChatMessagesNotificationsDeleted(deletedIds), 0);
+
+      const pinnedIds = new Set(deletedIds);
+      const hadPinned = pinnedMessages.some(pin => pin && pinnedIds.has(String(pin.id)));
+      if (hadPinned) {
+        pinnedMessages = pinnedMessages.filter(pin => !pin || !pinnedIds.has(String(pin.id)));
+        io.emit('pinned_list', pinnedMessages);
+        deferServerTask('PINNED MESSAGE BATCH DELETE', () => queryDbWithRetry(
+          'DELETE FROM pinned_messages WHERE message_id = ANY($1::text[])',
+          [deletedIds],
+          { attempts: 2, label: 'PINNED MESSAGE BATCH DELETE' }
+        ), 0);
+      }
+
+      const moderatedEntries = deletedEntries.filter(entry => !entry.isOwner);
+      if (moderatedEntries.length) {
+        const targetUsers = Array.from(new Set(moderatedEntries.map(entry => entry.user).filter(Boolean)));
+        deferServerTask('CHAT BATCH MODERATION LOG', () => addModerationLog(
+          'delete_messages',
+          `Deleted ${moderatedEntries.length} selected message${moderatedEntries.length === 1 ? '' : 's'}`,
+          { msgIds: moderatedEntries.map(entry => entry.id), targetUsers },
+          socket.userName || 'Moderator'
+        ), 0);
+      }
+
+      respond({
+        success: true,
+        deleted: deletedIds.length,
+        deletedIds,
+        denied: deniedIds.length,
+        deniedIds
+      });
+    } catch (err) {
+      console.error('[CHAT BATCH DELETE ERROR]:', err && err.message ? err.message : err);
+      respond({ success: false, message: 'Could not delete the selected messages.' });
+    } finally {
+      socket.__chatBatchDeleteInFlight = false;
+    }
+  });
+
 
   socket.on('delete_message', async (data) => {
     const msgIndex = messageHistory.findIndex(m => String(new Date(m.time).getTime()) === String(data.msgId));
