@@ -79471,7 +79471,7 @@ function getVisibleChatStackEl(id) {
     // Keep this list narrow: no game grids or large hidden views are walked here.
     const INTERFACE_TRANSLATE_EAGER_ROOT_SELECTOR = [
         '#profile-dropdown', '#user-select-screen', '.menu-group-home',
-        '#view-explore > .hero-carousel', '#view-explore .explore-right-col',
+        '#view-explore > .hero-carousel',
         '#view-explore .explore-left-col > .explore-section > .section-header',
         '#view-trending > h2', '#view-trending .section-header'
     ].join(',');
@@ -80334,7 +80334,10 @@ function getVisibleChatStackEl(id) {
         const trailing = match ? match[3] : '';
         if (!shouldTranslateInterfaceText(core, node)) return;
 
-        if (!skipFit) captureInterfaceFixedCard(node);
+        // Side promo cards must be measured in their original language before
+        // translated text can change their geometry. The helper is a cheap no-op
+        // for every node outside the fixed-card contexts.
+        captureInterfaceFixedCard(node);
         const protectedSource = prepareInterfaceProtectedTranslation(core, node);
         state.pendingNodes.add(node);
         enqueueInterfaceTranslation({
@@ -80355,8 +80358,8 @@ function getVisibleChatStackEl(id) {
                 if (!skipFit) {
                     fitCompactInterfaceLabel(node);
                     fitFixedInterfaceLabelForNode(node);
-                    fitInterfaceFixedCardForNode(node);
                 }
+                fitInterfaceFixedCardForNode(node);
             }
         });
     }
@@ -80461,6 +80464,9 @@ function getVisibleChatStackEl(id) {
         const trailing = match ? match[3] : '';
         if (!shouldTranslateInterfaceText(core, node)) return false;
 
+        // Capture the English/original geometry before a cached translation is
+        // applied synchronously. Outside side promo cards this returns immediately.
+        captureInterfaceFixedCard(node);
         const protectedSource = prepareInterfaceProtectedTranslation(core, node);
         let immediate = getImmediateInterfaceTranslation(protectedSource.source, target);
         if (immediate) immediate = protectedSource.restore(String(immediate || ''));
@@ -80474,8 +80480,8 @@ function getVisibleChatStackEl(id) {
             if (!skipFit) {
                 fitCompactInterfaceLabel(node);
                 fitFixedInterfaceLabelForNode(node);
-                fitInterfaceFixedCardForNode(node);
             }
+            fitInterfaceFixedCardForNode(node);
             return true;
         }
 
@@ -80567,9 +80573,31 @@ function getVisibleChatStackEl(id) {
         }
     }
 
+    function warmInterfaceTranslationCacheOnly(root) {
+        if (!state.enabled || !root || !root.isConnected || state.target === 'en') return;
+        const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+            acceptNode(node) {
+                return shouldSkipNode(node) ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT;
+            }
+        });
+        let node = walker.nextNode();
+        while (node) {
+            const source = String(node.nodeValue || '').trim();
+            if (shouldTranslateInterfaceText(source, node)) {
+                window.resolveInterfaceDisplayText(source, node.parentElement).catch(() => {});
+            }
+            node = walker.nextNode();
+        }
+    }
+
     function warmEagerInterfaceRoots() {
         if (!state.enabled || !document.querySelectorAll) return;
         document.querySelectorAll(INTERFACE_TRANSLATE_EAGER_ROOT_SELECTOR).forEach(scanEagerInterfaceRoot);
+
+        // Side promo cards need their original rendered height for the fixed-card
+        // typography guard. Warm only their translation cache while Explore is hidden.
+        const exploreSideCards = document.querySelector('#view-explore .explore-right-col');
+        if (exploreSideCards) warmInterfaceTranslationCacheOnly(exploreSideCards);
     }
     window.warmEagerInterfaceRoots = warmEagerInterfaceRoots;
 
@@ -80632,6 +80660,7 @@ function getVisibleChatStackEl(id) {
             seen.add(el);
             // These are deliberately tiny roots. Cached phrases land synchronously; an uncached phrase
             // is queued without walking every game card before the Explore entry animation starts.
+            applyImmediateInterfaceTranslations(el);
             scanVisibleInterface(el);
         };
         try {
