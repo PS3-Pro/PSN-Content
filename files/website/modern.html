@@ -3835,6 +3835,9 @@ body.ps3-pad-page-active #ps3-pad-page { display: block; }
 .ps3-pad-page-status::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: #28e76f; box-shadow: 0 0 12px rgba(40,231,111,.85); }
 .ps3-pad-page-hint { display: none; align-items: center; justify-content: flex-end; min-width: 0; max-width: 240px; height: clamp(28px,6vmin,36px); padding: 0 clamp(10px,2.4vmin,14px); border-radius: 999px; background: rgba(8,14,26,.38); border: 1px solid rgba(255,255,255,.08); color: rgba(255,255,255,.58); font-size: clamp(9px,1.8vmin,11px); font-weight: 800; letter-spacing: .65px; text-transform: uppercase; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px); }
 .ps3-pad-page-tools { justify-self: end; display: flex; align-items: center; justify-content: flex-end; gap: 12px; min-width: 0; pointer-events: auto; }
+.ps3-pad-physical-status { display: none; align-items: center; gap: 6px; height: clamp(26px,5.4vmin,32px); padding: 0 clamp(8px,1.8vmin,11px); border-radius: 999px; background: rgba(8,14,26,.38); border: 1px solid rgba(255,255,255,.08); color: rgba(255,255,255,.66); font-size: clamp(8px,1.55vmin,10px); font-weight: 800; letter-spacing: .55px; white-space: nowrap; backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px); }
+.ps3-pad-physical-status.is-connected { display: inline-flex; }
+.ps3-pad-physical-status i { font-size: clamp(10px,1.9vmin,12px); color: rgba(255,255,255,.88); }
 #ps3-pad-page .ps3-pad-mode-control { position: absolute; left: 50%; top: calc(100% + clamp(24px,4.4vmin,34px)); transform: translateX(-50%); margin-top: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: clamp(7px,1.2vmin,10px); }
 #ps3-pad-page .ps3-pad-mode-label { color: rgba(255,255,255,.68); font-size: clamp(8px,1.55vmin,10px); font-weight: 850; line-height: 1; letter-spacing: clamp(.8px,.2vmin,1.25px); white-space: nowrap; text-transform: uppercase; text-shadow: 0 1px 7px rgba(0,0,0,.42); }
 #ps3-pad-page .ps3-pad-mode-toggle { --pad-mode-toggle-width: clamp(40px,7.8vmin,48px); --pad-mode-toggle-knob: clamp(13px,2.6vmin,16px); position: relative !important; display: block; flex: 0 0 auto; width: var(--pad-mode-toggle-width); min-width: var(--pad-mode-toggle-width); height: calc(var(--pad-mode-toggle-knob) + 8px); margin: 0 !important; padding: 0 !important; border-radius: 999px; border: 1px solid rgba(255,255,255,.15); background: rgba(255,255,255,.11); box-shadow: inset 0 1px 2px rgba(0,0,0,.24),0 6px 14px rgba(0,0,0,.18),inset 0 1px 0 rgba(255,255,255,.05); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); cursor: pointer; pointer-events: auto; transition: transform .16s ease,filter .16s ease,background .2s ease,border-color .2s ease,box-shadow .2s ease; }
@@ -76418,6 +76421,9 @@ function getVisibleChatStackEl(id) {
 
         <div class="ps3-pad-page-tools">
             <div class="ps3-pad-page-hint" aria-hidden="true">Keyboard • ESC closes</div>
+            <div class="ps3-pad-physical-status" id="ps3-pad-physical-status" aria-hidden="true" title="">
+                <i class="fa-solid fa-gamepad"></i><span>PAD</span>
+            </div>
             <button class="ps3-pad-key-settings-btn" id="ps3-pad-key-settings-btn" type="button" aria-label="Customize keyboard shortcuts" title="Customize keyboard shortcuts">
                 <i class="fa-solid fa-gear"></i>
             </button>
@@ -76519,7 +76525,23 @@ function getVisibleChatStackEl(id) {
 (function () {
     const HOLDABLE = new Set(['up', 'down', 'left', 'right', 'l1', 'l2', 'r1', 'r2', 'l3', 'r3', 'triangle', 'square', 'circle', 'cross']);
     const PAD_GAME_MODE_STORAGE_KEY = 'psn_virtual_pad_game_mode';
+    const PHYSICAL_PAD_AXIS_DEADZONE = 0.42;
+    const PHYSICAL_PAD_BUTTON_MAP = {
+        0: 'cross', 1: 'circle', 2: 'square', 3: 'triangle',
+        4: 'l1', 5: 'r1', 6: 'l2', 7: 'r2',
+        8: 'select', 9: 'start', 10: 'l3', 11: 'r3',
+        12: 'up', 13: 'down', 14: 'left', 15: 'right', 16: 'psbtn'
+    };
     let padGameMode = false;
+    let physicalPadIndex = null;
+    let physicalPadFrame = 0;
+    let physicalPadCurrentHoldKey = null;
+    let physicalPadResumeTimer = 0;
+    const physicalPadActiveInputs = new Map();
+    const physicalPadInputOrder = [];
+    const physicalPadButtonStates = new Map();
+    const physicalPadAnalogStates = { left: null, right: null };
+    let physicalPadEventsBound = false;
     let manualCloseUntilPortrait = false;
     let manualPadOpen = false;
     let padOpenedByButton = false;
@@ -76630,7 +76652,9 @@ function getVisibleChatStackEl(id) {
         if (!nextOpen) {
             if (wasOpen) {
                 releaseKeyboardPadKeys();
+                stopPhysicalGamepadPolling(false);
                 releaseHold();
+                updatePhysicalPadStatus(null);
                 closePadKeyboardSettings();
                 setPadKeyboardGuideOpen(false);
                 if (document.body.style.overflow !== previousOverflow) document.body.style.overflow = previousOverflow;
@@ -76644,6 +76668,7 @@ function getVisibleChatStackEl(id) {
             const nextStatusText = ip ? `Connected • ${ip}` : 'Connected';
             if (status.textContent !== nextStatusText) status.textContent = nextStatusText;
         }
+        startPhysicalGamepadPolling();
         return !wasOpen;
     }
 
@@ -76692,6 +76717,282 @@ function getVisibleChatStackEl(id) {
         sendPadPath('/pad.ps3?release');
     }
 
+    function getBrowserGamepads() {
+        try {
+            return typeof navigator.getGamepads === 'function' ? Array.from(navigator.getGamepads() || []) : [];
+        } catch (err) {
+            return [];
+        }
+    }
+
+    function getPhysicalGamepad() {
+        const pads = getBrowserGamepads();
+
+        if (physicalPadIndex !== null) {
+            const selected = pads[physicalPadIndex];
+            if (selected && selected.connected !== false) return selected;
+            physicalPadIndex = null;
+        }
+
+        const next = pads.find(function (pad) {
+            return pad && pad.connected !== false && pad.mapping === 'standard';
+        }) || pads.find(function (pad) {
+            return pad && pad.connected !== false;
+        }) || null;
+
+        if (next) physicalPadIndex = next.index;
+        return next;
+    }
+
+    function updatePhysicalPadStatus(gamepad) {
+        const status = document.getElementById('ps3-pad-physical-status');
+        if (!status) return;
+
+        const connected = !!gamepad;
+        status.classList.toggle('is-connected', connected);
+        status.setAttribute('aria-hidden', connected ? 'false' : 'true');
+
+        if (!connected) {
+            status.title = '';
+            return;
+        }
+
+        const name = String(gamepad.id || 'Physical controller').replace(/\s+/g, ' ').trim();
+        status.title = name;
+        const label = status.querySelector('span');
+        if (label) label.textContent = `PAD ${Number(gamepad.index) + 1}`;
+    }
+
+    function setPhysicalPadButtonVisual(command, active) {
+        const button = getKeyboardPadButton(command);
+        if (button) button.classList.toggle('ps3-pad-keyboard-active', !!active);
+    }
+
+    function physicalEntryUsesHold(entry) {
+        return !!entry && (entry.type === 'analog' || HOLDABLE.has(entry.command));
+    }
+
+    function dispatchPhysicalPadEntry(key, entry) {
+        if (!entry) return;
+
+        if (entry.type === 'analog') {
+            sendAnalogHold(entry.stick, entry.direction);
+            physicalPadCurrentHoldKey = key;
+            return;
+        }
+
+        if (padGameMode || HOLDABLE.has(entry.command)) {
+            sendHold(entry.command);
+            physicalPadCurrentHoldKey = key;
+            return;
+        }
+
+        sendTap(entry.command);
+
+        // A normal-mode tap can temporarily replace a held virtual-pad state.
+        // Restore the most recent still-held physical input after webMAN's short tap pulse.
+        if (physicalPadResumeTimer) clearTimeout(physicalPadResumeTimer);
+        physicalPadResumeTimer = setTimeout(function () {
+            physicalPadResumeTimer = 0;
+            if (!padGameMode && document.body.classList.contains('ps3-pad-page-active')) {
+                restartLastPhysicalPadHold();
+            }
+        }, 90);
+    }
+
+    function restartLastPhysicalPadHold() {
+        if (padGameMode) return;
+
+        for (let i = physicalPadInputOrder.length - 1; i >= 0; i--) {
+            const key = physicalPadInputOrder[i];
+            const entry = physicalPadActiveInputs.get(key);
+            if (!entry || !physicalEntryUsesHold(entry)) continue;
+            dispatchPhysicalPadEntry(key, entry);
+            return;
+        }
+
+        physicalPadCurrentHoldKey = null;
+    }
+
+    function pressPhysicalPadInput(key, entry) {
+        if (!key || !entry || physicalPadActiveInputs.has(key)) return;
+
+        physicalPadActiveInputs.set(key, entry);
+        const oldIndex = physicalPadInputOrder.indexOf(key);
+        if (oldIndex !== -1) physicalPadInputOrder.splice(oldIndex, 1);
+        physicalPadInputOrder.push(key);
+
+        if (entry.type === 'button') setPhysicalPadButtonVisual(entry.command, true);
+        dispatchPhysicalPadEntry(key, entry);
+    }
+
+    function releasePhysicalPadInput(key) {
+        const entry = physicalPadActiveInputs.get(key);
+        if (!entry) return;
+
+        physicalPadActiveInputs.delete(key);
+        const orderIndex = physicalPadInputOrder.indexOf(key);
+        if (orderIndex !== -1) physicalPadInputOrder.splice(orderIndex, 1);
+
+        if (entry.type === 'button') setPhysicalPadButtonVisual(entry.command, false);
+
+        // webMAN Game Mode deliberately keeps the last command active after release.
+        if (padGameMode) return;
+
+        if (physicalPadCurrentHoldKey === key && physicalEntryUsesHold(entry)) {
+            releaseHold();
+            physicalPadCurrentHoldKey = null;
+            restartLastPhysicalPadHold();
+        }
+    }
+
+    function resetPhysicalGamepadInputState(sendRelease = false) {
+        if (physicalPadResumeTimer) {
+            clearTimeout(physicalPadResumeTimer);
+            physicalPadResumeTimer = 0;
+        }
+
+        physicalPadActiveInputs.forEach(function (entry) {
+            if (entry && entry.type === 'button') setPhysicalPadButtonVisual(entry.command, false);
+        });
+
+        physicalPadActiveInputs.clear();
+        physicalPadInputOrder.length = 0;
+        physicalPadButtonStates.clear();
+        physicalPadAnalogStates.left = null;
+        physicalPadAnalogStates.right = null;
+        physicalPadCurrentHoldKey = null;
+
+        if (sendRelease) releaseHold();
+    }
+
+    function getPhysicalPadDirection(x, y) {
+        const horizontal = Math.abs(x) >= PHYSICAL_PAD_AXIS_DEADZONE ? (x > 0 ? 'right' : 'left') : '';
+        const vertical = Math.abs(y) >= PHYSICAL_PAD_AXIS_DEADZONE ? (y > 0 ? 'down' : 'up') : '';
+
+        if (horizontal && vertical) return `${vertical}_${horizontal}`;
+        return horizontal || vertical || null;
+    }
+
+    function syncPhysicalPadAnalog(stick, direction) {
+        const key = `analog:${stick}`;
+        const previous = physicalPadAnalogStates[stick];
+        if (previous === direction) return;
+
+        if (previous) releasePhysicalPadInput(key);
+        physicalPadAnalogStates[stick] = direction;
+
+        if (direction) {
+            pressPhysicalPadInput(key, {
+                type: 'analog',
+                stick: stick,
+                direction: direction
+            });
+        }
+    }
+
+    function updatePhysicalGamepad(gamepad) {
+        if (!gamepad) return;
+
+        Object.entries(PHYSICAL_PAD_BUTTON_MAP).forEach(function ([indexText, command]) {
+            const index = Number(indexText);
+            const button = gamepad.buttons && gamepad.buttons[index];
+            const pressed = !!(button && (button.pressed || Number(button.value || 0) > 0.35));
+            const previous = physicalPadButtonStates.get(index) === true;
+            if (pressed === previous) return;
+
+            physicalPadButtonStates.set(index, pressed);
+            const key = `button:${index}`;
+
+            if (pressed) {
+                pressPhysicalPadInput(key, { type: 'button', command: command });
+            } else {
+                releasePhysicalPadInput(key);
+            }
+        });
+
+        const axes = Array.isArray(gamepad.axes) ? gamepad.axes : [];
+        syncPhysicalPadAnalog('left', getPhysicalPadDirection(Number(axes[0] || 0), Number(axes[1] || 0)));
+        syncPhysicalPadAnalog('right', getPhysicalPadDirection(Number(axes[2] || 0), Number(axes[3] || 0)));
+    }
+
+    function physicalGamepadLoop() {
+        physicalPadFrame = 0;
+
+        if (document.hidden || !document.body.classList.contains('ps3-pad-page-active') || !isPs3LinkedForPad()) {
+            return;
+        }
+
+        const gamepad = getPhysicalGamepad();
+        updatePhysicalPadStatus(gamepad);
+
+        if (!gamepad) return;
+
+        updatePhysicalGamepad(gamepad);
+        physicalPadFrame = requestAnimationFrame(physicalGamepadLoop);
+    }
+
+    function startPhysicalGamepadPolling() {
+        if (physicalPadFrame || document.hidden || !document.body.classList.contains('ps3-pad-page-active')) return;
+
+        const gamepad = getPhysicalGamepad();
+        updatePhysicalPadStatus(gamepad);
+
+        // Do not keep a 60 Hz loop alive when no physical controller exists.
+        // gamepadconnected will start it as soon as the browser exposes one.
+        if (!gamepad) return;
+
+        physicalPadFrame = requestAnimationFrame(physicalGamepadLoop);
+    }
+
+    function stopPhysicalGamepadPolling(sendRelease = false) {
+        if (physicalPadFrame) cancelAnimationFrame(physicalPadFrame);
+        physicalPadFrame = 0;
+        resetPhysicalGamepadInputState(sendRelease);
+    }
+
+    function bindPhysicalGamepadEvents() {
+        if (physicalPadEventsBound || !('getGamepads' in navigator)) return;
+        physicalPadEventsBound = true;
+
+        window.addEventListener('gamepadconnected', function (event) {
+            const gamepad = event.gamepad || null;
+            if (!gamepad) return;
+            if (physicalPadIndex === null) physicalPadIndex = gamepad.index;
+            updatePhysicalPadStatus(getPhysicalGamepad());
+            startPhysicalGamepadPolling();
+        });
+
+        window.addEventListener('gamepaddisconnected', function (event) {
+            if (event.gamepad && physicalPadIndex === event.gamepad.index) {
+                physicalPadIndex = null;
+                stopPhysicalGamepadPolling(true);
+                updatePhysicalPadStatus(getPhysicalGamepad());
+                startPhysicalGamepadPolling();
+            }
+        });
+
+        document.addEventListener('visibilitychange', function () {
+            if (document.hidden) {
+                stopPhysicalGamepadPolling(true);
+            } else if (document.body.classList.contains('ps3-pad-page-active')) {
+                startPhysicalGamepadPolling();
+            }
+        });
+
+        window.addEventListener('blur', function () {
+            if (document.body.classList.contains('ps3-pad-page-active')) {
+                stopPhysicalGamepadPolling(true);
+            }
+        });
+
+        window.addEventListener('focus', function () {
+            if (document.body.classList.contains('ps3-pad-page-active')) {
+                startPhysicalGamepadPolling();
+            }
+        });
+    }
+
     function loadPadGameMode() {
         try { padGameMode = localStorage.getItem(PAD_GAME_MODE_STORAGE_KEY) === '1'; }
         catch (err) { padGameMode = false; }
@@ -76714,9 +77015,11 @@ function getVisibleChatStackEl(id) {
         const next = enabled === true;
         if (padGameMode === next) return;
         releaseHold();
+        resetPhysicalGamepadInputState(false);
         padGameMode = next;
         try { localStorage.setItem(PAD_GAME_MODE_STORAGE_KEY, padGameMode ? '1' : '0'); } catch (err) {}
         updatePadGameModeUi();
+        startPhysicalGamepadPolling();
     }
 
     function bindPadGameModeToggle() {
@@ -77837,6 +78140,7 @@ function getVisibleChatStackEl(id) {
         bindPadKeyboardSettings();
         bindPadKeyboardGuideHandle();
         setupPadPageAudioFeedback();
+        bindPhysicalGamepadEvents();
         document.querySelectorAll('[data-ps3-pad-command]').forEach(bindPadButton);
         document.querySelectorAll('.ps3-pad-analog').forEach(bindPadAnalog);
         bindPadKeyboard();
