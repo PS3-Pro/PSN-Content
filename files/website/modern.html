@@ -76605,6 +76605,7 @@ function getVisibleChatStackEl(id) {
     const HOLDABLE = new Set(['up', 'down', 'left', 'right', 'l1', 'l2', 'r1', 'r2', 'l3', 'r3', 'triangle', 'square', 'circle', 'cross']);
     const PAD_GAME_MODE_STORAGE_KEY = 'psn_virtual_pad_game_mode';
     const PHYSICAL_PAD_AXIS_DEADZONE = 0.42;
+    const PHYSICAL_PAD_HOLD_DELAY = 170;
     const PHYSICAL_PAD_BUTTON_MAP = {
         0: 'cross', 1: 'circle', 2: 'square', 3: 'triangle',
         4: 'l1', 5: 'r1', 6: 'l2', 7: 'r2',
@@ -76620,6 +76621,8 @@ function getVisibleChatStackEl(id) {
     const physicalPadInputOrder = [];
     const physicalPadButtonStates = new Map();
     const physicalPadAnalogStates = { left: null, right: null };
+    const physicalPadAnalogNeutralTimers = { left: 0, right: 0 };
+    const physicalPadHoldTimers = new Map();
     let physicalPadEventsBound = false;
     let manualCloseUntilPortrait = false;
     let manualPadOpen = false;
@@ -76794,6 +76797,11 @@ function getVisibleChatStackEl(id) {
         sendPadPath(`/pad.ps3?${prefix}_${encodeURIComponent(direction)}_hold`);
     }
 
+    function sendAnalogTap(stick, direction) {
+        const prefix = stick === 'right' ? 'AnalogR' : 'AnalogL';
+        sendPadPath(`/pad.ps3?${prefix}_${encodeURIComponent(direction)}`);
+    }
+
     function releaseHold() {
         sendPadPath('/pad.ps3?release');
     }
@@ -76853,25 +76861,65 @@ function getVisibleChatStackEl(id) {
         return !!entry && (entry.type === 'analog' || HOLDABLE.has(entry.command));
     }
 
-    function dispatchPhysicalPadEntry(key, entry) {
+    function clearPhysicalPadHoldTimer(key) {
+        const timer = physicalPadHoldTimers.get(key);
+        if (timer) clearTimeout(timer);
+        physicalPadHoldTimers.delete(key);
+    }
+
+    function sendPhysicalPadPulse(entry) {
         if (!entry) return;
+        if (entry.type === 'analog') {
+            sendAnalogTap(entry.stick, entry.direction);
+            return;
+        }
+        sendTap(entry.command);
+    }
+
+    function promotePhysicalPadHold(key, entry) {
+        clearPhysicalPadHoldTimer(key);
+
+        const current = physicalPadActiveInputs.get(key);
+        if (!current || current !== entry || padGameMode) return;
 
         if (entry.type === 'analog') {
             sendAnalogHold(entry.stick, entry.direction);
-            physicalPadCurrentHoldKey = key;
+        } else {
+            sendHold(entry.command);
+        }
+        physicalPadCurrentHoldKey = key;
+    }
+
+    function schedulePhysicalPadHold(key, entry) {
+        clearPhysicalPadHoldTimer(key);
+        physicalPadHoldTimers.set(key, setTimeout(function () {
+            physicalPadHoldTimers.delete(key);
+            promotePhysicalPadHold(key, entry);
+        }, PHYSICAL_PAD_HOLD_DELAY));
+    }
+
+    function dispatchPhysicalPadEntry(key, entry) {
+        if (!entry) return;
+
+        if (padGameMode) {
+            if (entry.type === 'analog') sendAnalogHold(entry.stick, entry.direction);
+            else if (HOLDABLE.has(entry.command)) sendHold(entry.command);
+            else sendTap(entry.command);
+
+            if (physicalEntryUsesHold(entry)) physicalPadCurrentHoldKey = key;
             return;
         }
 
-        if (padGameMode || HOLDABLE.has(entry.command)) {
-            sendHold(entry.command);
-            physicalPadCurrentHoldKey = key;
+        if (physicalEntryUsesHold(entry)) {
+            // XMB/Normal: quick press = one pulse. A real hold is promoted only
+            // after the input remains pressed for a short moment.
+            sendPhysicalPadPulse(entry);
+            schedulePhysicalPadHold(key, entry);
             return;
         }
 
         sendTap(entry.command);
 
-        // A normal-mode tap can temporarily replace a held virtual-pad state.
-        // Restore the most recent still-held physical input after webMAN's short tap pulse.
         if (physicalPadResumeTimer) clearTimeout(physicalPadResumeTimer);
         physicalPadResumeTimer = setTimeout(function () {
             physicalPadResumeTimer = 0;
@@ -76882,17 +76930,19 @@ function getVisibleChatStackEl(id) {
     }
 
     function restartLastPhysicalPadHold() {
-        if (padGameMode) return;
+        if (padGameMode || physicalPadCurrentHoldKey) return;
 
         for (let i = physicalPadInputOrder.length - 1; i >= 0; i--) {
             const key = physicalPadInputOrder[i];
             const entry = physicalPadActiveInputs.get(key);
             if (!entry || !physicalEntryUsesHold(entry)) continue;
-            dispatchPhysicalPadEntry(key, entry);
+
+            clearPhysicalPadHoldTimer(key);
+            if (entry.type === 'analog') sendAnalogHold(entry.stick, entry.direction);
+            else sendHold(entry.command);
+            physicalPadCurrentHoldKey = key;
             return;
         }
-
-        physicalPadCurrentHoldKey = null;
     }
 
     function pressPhysicalPadInput(key, entry) {
@@ -76907,19 +76957,39 @@ function getVisibleChatStackEl(id) {
         dispatchPhysicalPadEntry(key, entry);
     }
 
+    function replacePhysicalPadInput(key, entry) {
+        if (!key || !entry) return;
+
+        clearPhysicalPadHoldTimer(key);
+        physicalPadActiveInputs.set(key, entry);
+
+        // Preserve the smooth direction replacement from the version that
+        // already improved analog reversals.
+        if (padGameMode || physicalPadCurrentHoldKey === key) {
+            if (entry.type === 'analog') sendAnalogHold(entry.stick, entry.direction);
+            else sendHold(entry.command);
+            physicalPadCurrentHoldKey = key;
+            return;
+        }
+
+        dispatchPhysicalPadEntry(key, entry);
+    }
+
     function releasePhysicalPadInput(key) {
         const entry = physicalPadActiveInputs.get(key);
         if (!entry) return;
 
+        clearPhysicalPadHoldTimer(key);
         physicalPadActiveInputs.delete(key);
         const orderIndex = physicalPadInputOrder.indexOf(key);
         if (orderIndex !== -1) physicalPadInputOrder.splice(orderIndex, 1);
 
         if (entry.type === 'button') setPhysicalPadButtonVisual(entry.command, false);
 
-        // webMAN Game Mode deliberately keeps the last command active after release.
+        // Game Mode intentionally keeps the last command active after release.
         if (padGameMode) return;
 
+        // If the press ended before promotion, only the one-shot pulse was sent.
         if (physicalPadCurrentHoldKey === key && physicalEntryUsesHold(entry)) {
             releaseHold();
             physicalPadCurrentHoldKey = null;
@@ -76933,6 +77003,11 @@ function getVisibleChatStackEl(id) {
             physicalPadResumeTimer = 0;
         }
 
+        physicalPadHoldTimers.forEach(function (timer) {
+            clearTimeout(timer);
+        });
+        physicalPadHoldTimers.clear();
+
         physicalPadActiveInputs.forEach(function (entry) {
             if (entry && entry.type === 'button') setPhysicalPadButtonVisual(entry.command, false);
         });
@@ -76940,8 +77015,13 @@ function getVisibleChatStackEl(id) {
         physicalPadActiveInputs.clear();
         physicalPadInputOrder.length = 0;
         physicalPadButtonStates.clear();
-        physicalPadAnalogStates.left = null;
-        physicalPadAnalogStates.right = null;
+        ['left', 'right'].forEach(function (stick) {
+            if (physicalPadAnalogNeutralTimers[stick]) {
+                clearTimeout(physicalPadAnalogNeutralTimers[stick]);
+                physicalPadAnalogNeutralTimers[stick] = 0;
+            }
+            physicalPadAnalogStates[stick] = null;
+        });
         physicalPadCurrentHoldKey = null;
         resetPhysicalPadAnalogVisuals();
 
@@ -76992,18 +77072,48 @@ function getVisibleChatStackEl(id) {
     function syncPhysicalPadAnalog(stick, direction) {
         const key = `analog:${stick}`;
         const previous = physicalPadAnalogStates[stick];
-        if (previous === direction) return;
-
-        if (previous) releasePhysicalPadInput(key);
-        physicalPadAnalogStates[stick] = direction;
+        const pendingNeutral = physicalPadAnalogNeutralTimers[stick];
 
         if (direction) {
+            if (pendingNeutral) {
+                clearTimeout(pendingNeutral);
+                physicalPadAnalogNeutralTimers[stick] = 0;
+            }
+
+            if (previous === direction) return;
+            physicalPadAnalogStates[stick] = direction;
+
+            // Crossing the physical stick through its center should replace the
+            // previous direction directly instead of briefly releasing it.
+            if (previous && physicalPadActiveInputs.has(key)) {
+                replacePhysicalPadInput(key, {
+                    type: 'analog',
+                    stick: stick,
+                    direction: direction
+                });
+                return;
+            }
+
             pressPhysicalPadInput(key, {
                 type: 'analog',
                 stick: stick,
                 direction: direction
             });
+            return;
         }
+
+        if (!previous || pendingNeutral) return;
+
+        // A real analog stick necessarily crosses the deadzone when reversing
+        // direction. Give that neutral crossing a short grace period; only a
+        // stable center is treated as an actual release.
+        physicalPadAnalogNeutralTimers[stick] = setTimeout(function () {
+            physicalPadAnalogNeutralTimers[stick] = 0;
+            if (physicalPadAnalogStates[stick] !== previous) return;
+
+            physicalPadAnalogStates[stick] = null;
+            releasePhysicalPadInput(key);
+        }, 65);
     }
 
     function updatePhysicalGamepad(gamepad) {
@@ -77262,10 +77372,20 @@ function getVisibleChatStackEl(id) {
         }
 
         function startAnalogHold(direction) {
-            stopAnalogHold();
-            if (!direction) return;
+            if (!direction) {
+                stopAnalogHold();
+                return;
+            }
 
             const stick = analog.getAttribute('data-ps3-pad-stick') || 'left';
+
+            // While the stick is already held, send the replacement direction
+            // directly. Avoid a release/new-hold request race on fast reversals.
+            if (analogHoldActive) {
+                sendAnalogHold(stick, direction);
+                return;
+            }
+
             analogHoldActive = true;
             sendAnalogHold(stick, direction);
         }
