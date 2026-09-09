@@ -80221,6 +80221,9 @@ function getVisibleChatStackEl(id) {
         'NoPayStation™', 'NoPayStation', 'PlayStation', 'Discord',
         'PSNSTATUSSTART', 'PSNSTATUSEND'
     ];
+    const INTERFACE_TRANSLATE_PROTECTED_WORDS = [
+        'Homebrew', 'Homebrews', 'Port', 'Ports'
+    ];
 
     function escapeInterfaceTranslationRegExp(value) {
         return String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -80240,14 +80243,22 @@ function getVisibleChatStackEl(id) {
     function prepareInterfaceProtectedTranslation(source, node = null) {
         let prepared = String(source || '');
         const replacements = [];
+        const reserveMatcher = (matcher, prefix) => {
+            prepared = prepared.replace(matcher, match => {
+                const token = `PSN${prefix}XQ${replacements.length}TOKEN`;
+                replacements.push({ token, value: match });
+                return token;
+            });
+        };
         const reserve = (value, prefix) => {
             const cleanValue = String(value || '');
             if (!cleanValue) return;
-            const matcher = new RegExp(escapeInterfaceTranslationRegExp(cleanValue), 'gi');
-            if (!matcher.test(prepared)) return;
-            const token = `PSN${prefix}XQ${replacements.length}TOKEN`;
-            prepared = prepared.replace(matcher, token);
-            replacements.push({ token, value: cleanValue });
+            reserveMatcher(new RegExp(escapeInterfaceTranslationRegExp(cleanValue), 'gi'), prefix);
+        };
+        const reserveWord = (value, prefix) => {
+            const cleanValue = String(value || '');
+            if (!cleanValue) return;
+            reserveMatcher(new RegExp(`\\b${escapeInterfaceTranslationRegExp(cleanValue)}\\b`, 'gi'), prefix);
         };
 
         // Usernames are placeholders rather than frozen DOM fragments. This lets the
@@ -80255,6 +80266,7 @@ function getVisibleChatStackEl(id) {
         // “Biblioteca do Luan” without ever sending the username to the translator.
         reserve(getInterfaceOwnerName(node), 'OWNER');
         INTERFACE_TRANSLATE_PROTECTED_TERMS.forEach(term => reserve(term, 'BRAND'));
+        INTERFACE_TRANSLATE_PROTECTED_WORDS.forEach(term => reserveWord(term, 'TERM'));
 
         return {
             source: prepared,
@@ -80359,16 +80371,18 @@ function getVisibleChatStackEl(id) {
 
         const source = existing && current === existing.translated ? existing.original : current;
         if (!shouldTranslateInterfaceText(source, option)) return;
+        const protectedSource = prepareInterfaceProtectedTranslation(source, option);
 
         state.pendingNodes.add(option);
         enqueueInterfaceTranslation({
             node: option,
-            source,
+            source: protectedSource.source,
             target,
             generation,
             apply: translated => {
-                state.optionRecords.set(option, { original: source, translated, target });
-                option.textContent = translated;
+                const restoredTranslation = protectedSource.restore(String(translated || ''));
+                state.optionRecords.set(option, { original: source, translated: restoredTranslation, target });
+                option.textContent = restoredTranslation;
                 // The browser redraws the selected label from the option text automatically.
                 const select = option.parentElement;
                 if (select && select.tagName === 'SELECT') {
@@ -80447,7 +80461,9 @@ function getVisibleChatStackEl(id) {
         const trailing = match ? match[3] : '';
         if (!shouldTranslateInterfaceText(core, node)) return false;
 
-        let immediate = getImmediateInterfaceTranslation(core, target);
+        const protectedSource = prepareInterfaceProtectedTranslation(core, node);
+        let immediate = getImmediateInterfaceTranslation(protectedSource.source, target);
+        if (immediate) immediate = protectedSource.restore(String(immediate || ''));
         if (!immediate && existing && existing.target === target) {
             immediate = deriveInterfaceDynamicTranslation(existing.original, existing.translated, current);
         }
