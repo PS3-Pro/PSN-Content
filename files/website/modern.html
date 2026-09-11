@@ -33921,7 +33921,7 @@ P
 					if (ps3 && isOnline) {
 						if (ps3.status === 'playing') {
 							avatarBorder = isMe ? 'var(--ps-blue)' : (isTargetAdmin ? '#ff4444' : '#FF1493');
-							playingHtml = `<div class="admin-user-playing" style="color: ${isMe ? 'var(--ps-blue)' : (isTargetAdmin ? '#ff4444' : '#FF1493')};"><span class="profile-playing-label">🎮 Playing:</span> <span class="playing-game-title" data-no-translate="true" translate="no">${adminEscapeHtml(ps3.title || 'Unknown Title')}</span></div>`;
+							playingHtml = `<div class="admin-user-playing" style="color: ${isMe ? 'var(--ps-blue)' : (isTargetAdmin ? '#ff4444' : '#FF1493')};">🎮 Playing: ${adminEscapeHtml(ps3.title || 'Unknown Title')}</div>`;
 						} else if (ps3.status === 'idle') {
 							avatarBorder = isMe ? 'var(--ps-blue)' : '#ffa500';
 							playingHtml = '<div class="admin-user-playing" style="color: #ffa500; opacity: 0.9;">📺 On XMB™</div>';
@@ -43325,6 +43325,39 @@ P
 		const updatedAt = isMe ? 0 : (Number(ps3 && ps3.playTimeUpdatedAt) || 0);
 		const displayValue = raw || '--:--:--';
 		return ` <span class="profile-playing-time-pill" title="Time played in the current game session" style="white-space:nowrap; display:inline-flex; align-items:center; gap:3px; margin-left:7px; color:#17202b; font-size:.82em; font-weight:700; line-height:1; background:rgba(255,255,255,.94); border:1px solid rgba(255,255,255,.98); border-radius:999px; padding:2px 6px; box-shadow:0 1px 4px rgba(0,0,0,.18),inset 0 1px 0 #fff; vertical-align:middle; transform:translateY(2px);"><i class="far fa-clock" style="font-size:.92em;"></i><span id="profile-playing-time" data-playtime-local="${isMe ? '1' : '0'}" data-playtime-base="${displayValue}" data-playtime-updated-at="${updatedAt}">${displayValue}</span></span>`;
+	}
+
+	function renderProfilePs3Status(user = {}, isMe = false, baseBorderColor = '') {
+		const playingElem = document.getElementById('card-playing');
+		const avatar = document.getElementById('card-avatar');
+		if (!playingElem) return baseBorderColor;
+		const online = user.online === true;
+		const ps3 = user.ps3Status && typeof user.ps3Status === 'object' ? user.ps3Status : null;
+		const status = String(ps3 && ps3.status || '');
+		let borderColor = baseBorderColor || (online ? '#4caf50' : '#8b96a8');
+
+		if (!online || !ps3 || (status !== 'playing' && status !== 'idle')) {
+			if (playingElem.style.display !== 'none') playingElem.style.display = 'none';
+			if (typeof stopProfilePlayTimeTicker === 'function') stopProfilePlayTimeTicker();
+		} else {
+			playingElem.style.display = 'flex';
+			playingElem.style.fontWeight = 'bold';
+			if (status === 'playing') {
+				borderColor = isMe ? 'var(--ps-blue)' : '#FF1493';
+				playingElem.style.color = borderColor;
+				const nextPlayingHtml = buildProfilePlayingMarkup(ps3, isMe);
+				if (playingElem.innerHTML !== nextPlayingHtml) playingElem.innerHTML = nextPlayingHtml;
+				if (typeof startProfilePlayTimeTicker === 'function') startProfilePlayTimeTicker();
+			} else {
+				borderColor = '#ffa500';
+				playingElem.style.color = borderColor;
+				const xmbHtml = `📺 On XMB™`;
+				if (playingElem.innerHTML !== xmbHtml) playingElem.innerHTML = xmbHtml;
+				if (typeof stopProfilePlayTimeTicker === 'function') stopProfilePlayTimeTicker();
+			}
+		}
+		if (avatar) avatar.style.borderColor = borderColor;
+		return borderColor;
 	}
 
 	function refreshProfilePlayTimeTicker() {
@@ -63556,6 +63589,15 @@ function getVisibleChatStackEl(id) {
 			if (online) statusIcon.classList.add('status-pulsing-full');
 		};
 
+		const patchOpenProfilePs3Status = function(user = {}) {
+			const profileModal = document.getElementById('modal-sys-profile');
+			if (!profileModal || (profileModal.style.display !== 'flex' && profileModal.style.display !== 'block' && !profileModal.classList.contains('show'))) return;
+			const openedUser = profileModal.dataset.profileUsername || document.getElementById('profile-name-val')?.innerText || '';
+			const userName = String(user && (user.name || user.username || user.user || user.onlineId) || '').trim();
+			if (!openedUser || !userName || openedUser !== userName || openedUser === String(localStorage.getItem('psn_username') || '')) return;
+			renderProfilePs3Status(user, false);
+		};
+
 		socketChat.on('online_list', function(users) {
 			const countElement = document.getElementById('online-count');
 			if (!Array.isArray(users)) return;
@@ -63666,6 +63708,7 @@ function getVisibleChatStackEl(id) {
 					const cardAvatar = document.getElementById('card-avatar');
 					if (cardAvatar && openedUserData.avatar && cardAvatar.getAttribute('src') !== openedUserData.avatar) cardAvatar.setAttribute('src', openedUserData.avatar);
 					patchOpenProfilePresenceStatus(openedUserData);
+					patchOpenProfilePs3Status(openedUserData);
 				}
 			}
 		
@@ -63862,7 +63905,10 @@ function getVisibleChatStackEl(id) {
 						const nextAvatar = String(nextOpenProfileResult.avatar || '').trim();
 						const cardAvatar = document.getElementById('card-avatar');
 						if (cardAvatar && nextAvatar && cardAvatar.getAttribute('src') !== nextAvatar) cardAvatar.setAttribute('src', nextAvatar);
-						if (typeof patchOpenProfilePresenceStatus === 'function') patchOpenProfilePresenceStatus(nextOpenProfileResult, Number(nextOpenProfileResult.lastSeen || 0));
+						const liveProfilePresence = window.__currentOnlineUserByName instanceof Map ? (window.__currentOnlineUserByName.get(openProfileTarget) || null) : null;
+						const authoritativeProfilePresence = liveProfilePresence || nextOpenProfileResult;
+						if (typeof patchOpenProfilePresenceStatus === 'function') patchOpenProfilePresenceStatus(authoritativeProfilePresence, Number(authoritativeProfilePresence.lastSeen || 0));
+						if (typeof patchOpenProfilePs3Status === 'function') patchOpenProfilePs3Status(authoritativeProfilePresence);
 						const previousCountry = typeof normalizeProfileCountryCode === 'function' ? normalizeProfileCountryCode(previousOpenProfileResult && (previousOpenProfileResult.countryCode || previousOpenProfileResult.country_code || previousOpenProfileResult.country || (previousOpenProfileResult.settingsData && (previousOpenProfileResult.settingsData.countryCode || previousOpenProfileResult.settingsData.country_code || previousOpenProfileResult.settingsData.country))) || '') : '';
 						const nextCountry = typeof normalizeProfileCountryCode === 'function' ? normalizeProfileCountryCode(nextOpenProfileResult.countryCode || nextOpenProfileResult.country_code || nextOpenProfileResult.country || (nextOpenProfileResult.settingsData && (nextOpenProfileResult.settingsData.countryCode || nextOpenProfileResult.settingsData.country_code || nextOpenProfileResult.settingsData.country)) || '') : '';
 						if (nextCountry && previousCountry !== nextCountry && typeof renderProfileCountry === 'function') renderProfileCountry(openProfileTarget, nextOpenProfileResult, openProfileTarget === String(localStorage.getItem('psn_username') || ''));
@@ -64822,6 +64868,8 @@ function getVisibleChatStackEl(id) {
 							if (el.textContent !== playTime) el.textContent = playTime;
 							startProfilePlayTimeTicker();
 						}
+					} else if (onlineUser && onlineUser.ps3Status && onlineUser.ps3Status.status === 'playing') {
+						renderProfilePs3Status(onlineUser, false);
 					}
 				}
 			} catch (err) {
@@ -65299,7 +65347,9 @@ function getVisibleChatStackEl(id) {
 				if (profileVisible && openedUser === name) {
 					const cardAvatar = document.getElementById('card-avatar');
 					if (cardAvatar && data.avatar && cardAvatar.getAttribute('src') !== data.avatar) cardAvatar.setAttribute('src', data.avatar);
-					patchOpenProfilePresenceStatus({ ...data, online }, lastSeen);
+					const liveProfileUser = onlineRecord && typeof onlineRecord === 'object' ? onlineRecord : { ...data, name, online, lastSeen };
+					patchOpenProfilePresenceStatus(liveProfileUser, lastSeen);
+					patchOpenProfilePs3Status(liveProfileUser);
 				}
 
 				if (typeof window.schedulePresenceBurstUi === 'function') {
@@ -68819,7 +68869,7 @@ function getVisibleChatStackEl(id) {
 				const accentColor = isMe ? "#0070cc" : (isTargetAdmin ? "#ff4444" : "#FF1493");
 				playingStatusHtml = `
 					<span style="color: ${accentColor}; font-size: 10px; display: block; font-weight: bold; margin-top: 2px; letter-spacing: 0.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 180px;">
-						<span class="profile-playing-label">🎮 Playing:</span> <span class="playing-game-title" data-no-translate="true" translate="no">${escapeProfilePlayingText(ps3.title || 'Unknown Game')}</span>
+						🎮 Playing: ${ps3.title}
 					</span>`;
 			} else if (ps3.status === 'idle') {
 				playingStatusHtml = `
@@ -73636,7 +73686,7 @@ function getVisibleChatStackEl(id) {
 			if (netUser.ps3Status.status === 'playing') {
 				const accentColor = isMe ? "var(--ps-blue)" : (isTargetAdmin ? "#ff4444" : "#FF1493");
 				playingHtml = `<div style="color: ${accentColor}; font-size: 10px; font-weight: bold; margin-top: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 180px;">
-					<span class="profile-playing-label">🎮 Playing:</span> <span class="playing-game-title" data-no-translate="true" translate="no">${escapeProfilePlayingText(netUser.ps3Status.title || 'Unknown Game')}</span>
+					🎮 Playing: ${netUser.ps3Status.title}
 				</div>`;
 			} else if (netUser.ps3Status.status === 'idle') {
 				playingHtml = `<div style="color: #ffa500; font-size: 10px; margin-top: 4px; font-weight: bold; opacity: 0.9;">
@@ -74133,6 +74183,9 @@ function getVisibleChatStackEl(id) {
 			}
 		}
 		const profileMeta = { ...(friendUser || {}), ...(adminUser || {}), ...(searchUser || {}), ...(networkUser || {}), ...(sharedFreshMeta || {}) };
+		/* Live presence is authoritative for PS3 state. Cached/search profile metadata may be
+		   newer for avatar/counts, but must never overwrite the current Playing/XMB state. */
+		if (networkUser && Object.prototype.hasOwnProperty.call(networkUser, 'ps3Status')) profileMeta.ps3Status = networkUser.ps3Status || null;
 		const hasFreshProfileMeta = !!(sharedFreshMeta || networkUser || adminUser || searchUser);
 		if (!isMe && hasFreshProfileMeta && typeof window.syncPsnUserMeta === 'function') {
 			/* Opening one profile should not scan every rendered avatar in the document. Fresh
@@ -74252,34 +74305,8 @@ function getVisibleChatStackEl(id) {
 	
 		let finalBorderColor = isMe ? "#4caf50" : statusContainer.style.color;
 	
-		let ps3 = isMe ? window.myCurrentPS3Status : (profileMeta.ps3Status || null);
-	
-		if (isUserOnline && ps3 && (ps3.status === 'playing' || ps3.status === 'idle')) {
-			playingElem.style.display = 'flex';
-			
-			if (ps3.status === 'playing') {
-				const accentColor = isMe ? "var(--ps-blue)" : "#FF1493";
-				playingElem.style.color = accentColor;
-				playingElem.style.fontWeight = "bold";
-				
-				if (!isMe) finalBorderColor = "#FF1493"; 
-				if (isMe) finalBorderColor = "var(--ps-blue)"; 
-				
-				playingElem.innerHTML = buildProfilePlayingMarkup(ps3, isMe);
-				startProfilePlayTimeTicker();
-				} else {
-				playingElem.style.color = "#ffa500"; 
-				playingElem.style.fontWeight = "bold";
-				
-				playingElem.innerHTML = `📺 On XMB™`;
-				
-				finalBorderColor = "#ffa500";
-			}
-		} else {
-			playingElem.style.display = 'none';
-		}
-		
-		document.getElementById('card-avatar').style.borderColor = finalBorderColor;
+		const ps3 = isMe ? window.myCurrentPS3Status : (profileMeta.ps3Status || null);
+		finalBorderColor = renderProfilePs3Status({ name:username, online:isUserOnline, ps3Status:ps3 }, isMe, finalBorderColor) || finalBorderColor;
 
 		let playerLevel = 1;
 		if (isMe) {
