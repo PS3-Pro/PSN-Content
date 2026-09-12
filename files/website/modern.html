@@ -703,7 +703,9 @@ html.collection-memory-optimization-on #downloads-list > .download-swipe-row { c
 .admin-content-report-card>.admin-card-title { flex: 0 0 auto; }
 .admin-content-report-list, .admin-content-block-list { display: flex; flex-direction: column; gap: 8px; min-height: 0; overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; padding-right: 3px; }
 .admin-content-report-list { flex: 1 1 0; }
-.admin-content-report-list>.admin-empty, .admin-content-block-list>.admin-empty { min-height: 100%; box-sizing: border-box; display: grid; place-items: center; }
+.admin-content-report-list>.admin-empty, .admin-content-block-list>.admin-empty { min-height: 100%; box-sizing: border-box; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 9px; }
+.admin-content-report-list>.admin-empty>i, .admin-content-block-list>.admin-empty>i { margin: 0 !important; line-height: 1; font-size: 24px; opacity: .88; }
+.admin-content-report-list>.admin-empty>span, .admin-content-block-list>.admin-empty>span { display: block; line-height: 1.35; }
 .admin-content-blocks-section { margin-top: 14px; padding-top: 12px; border-top: 1px solid rgba(255,255,255,.07); flex: 0 0 150px; min-height: 0; display: flex; flex-direction: column; }
 .admin-content-block-list { flex: 1 1 0; }
 .admin-content-report-item { padding: 12px; border-radius: 10px; background: rgba(255,255,255,.035); border: 1px solid rgba(255,255,255,.075); display: grid; grid-template-columns: minmax(0,1fr) auto; gap: 10px 12px; }
@@ -38152,7 +38154,7 @@ P
 		if (contentReportsEl.__adminContentReportsSource !== reports || contentReportsEl.childNodes.length === 0) {
 			contentReportsEl.__adminContentReportsSource = reports;
 			if (!reports.length) {
-				setAdminHtmlIfChanged(contentReportsEl, '<div class="admin-empty"><i class="far fa-flag" style="color:#ffb35c;margin-right:6px;"></i>No Store problems reported.</div>');
+				setAdminHtmlIfChanged(contentReportsEl, '<div class="admin-empty"><i class="far fa-flag" style="color:#ffb35c;"></i><span>No Store problems reported.</span></div>');
 			} else {
 				setAdminHtmlIfChanged(contentReportsEl, reports.map(group => {
 					const reportKey = String(group.reportKey || group.id || '');
@@ -38186,7 +38188,7 @@ P
 		if (contentBlocksEl.__adminContentBlocksSource !== blocks || contentBlocksEl.childNodes.length === 0) {
 			contentBlocksEl.__adminContentBlocksSource = blocks;
 			if (!blocks.length) {
-				setAdminHtmlIfChanged(contentBlocksEl, '<div class="admin-empty">Nothing is blocked from the Store.</div>');
+				setAdminHtmlIfChanged(contentBlocksEl, '<div class="admin-empty"><i class="fas fa-eye-slash" style="color:#ff6666;"></i><span>Nothing is blocked from the Store.</span></div>');
 			} else {
 				setAdminHtmlIfChanged(contentBlocksEl, blocks.map(item => {
 					const reportKey = String(item.reportKey || '');
@@ -38548,6 +38550,34 @@ P
 				adminSetContentReports(nextReports);
 				if (document.getElementById('view-admin')?.style.display === 'block') adminRenderContentReportPanels();
 			});
+			socketChat.on('content_report_admin_delta', delta => {
+				if (!delta || typeof delta !== 'object') return;
+				const reportKey = String(delta.reportKey || delta.group?.reportKey || '').trim();
+				if (!reportKey) return;
+				const current = adminGetContentReports();
+				const index = current.findIndex(item => String(item && item.reportKey || '') === reportKey);
+				let next = current;
+				if (delta.action === 'remove') {
+					if (index < 0) return;
+					next = current.slice();
+					next.splice(index, 1);
+				} else if (delta.action === 'upsert' && delta.group && typeof delta.group === 'object') {
+					if (index >= 0 && typeof window.getLiveRenderSignature === 'function' && window.getLiveRenderSignature(current[index]) === window.getLiveRenderSignature(delta.group)) {
+						if (delta.notice && document.body.classList.contains('is-admin') && typeof showToastNotification === 'function') showToastNotification('New Store Report', `${delta.notice.reporter || 'Someone'} reported ${delta.notice.name || delta.notice.titleId || 'Store content'}.`);
+						return;
+					}
+					next = current.slice();
+					if (index >= 0) next.splice(index, 1);
+					next.unshift(delta.group);
+					next = next.slice(0, 100);
+				} else return;
+				adminSetContentReports(next);
+				if (document.getElementById('view-admin')?.style.display === 'block') adminRenderContentReportPanels();
+				if (delta.notice && document.body.classList.contains('is-admin')) {
+					if (typeof showToastNotification === 'function') showToastNotification('New Store Report', `${delta.notice.reporter || 'Someone'} reported ${delta.notice.name || delta.notice.titleId || 'Store content'}.`);
+					if (typeof playUiError === 'function') playUiError();
+				}
+			});
 			socketChat.on('content_blocks_list', blocks => {
 				const nextBlocks = Array.isArray(blocks) ? blocks.slice(0, 1000) : [];
 				const current = adminGetContentBlocks();
@@ -38564,11 +38594,6 @@ P
 				if (delta.action === 'upsert' && delta.block && typeof delta.block === 'object') blocks.unshift({ ...delta.block, reportKey });
 				adminSetContentBlocks(blocks);
 				if (document.getElementById('view-admin')?.style.display === 'block') adminRenderContentReportPanels();
-			});
-			socketChat.on('admin_content_report_created', report => {
-				if (!report || !document.body.classList.contains('is-admin')) return;
-				if (typeof showToastNotification === 'function') showToastNotification('New Store Report', `${report.reporter || 'Someone'} reported ${report.name || report.titleId || 'Store content'}.`);
-				if (typeof playUiError === 'function') playUiError();
 			});
 		socketChat.on('reports_list', reports => {
 			const nextReports = window.trimPsnServerLimitedArray(Array.isArray(reports) ? reports : [], 'adminReports');

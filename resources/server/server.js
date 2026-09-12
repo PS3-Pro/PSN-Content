@@ -3954,10 +3954,11 @@ async function getUserContentReport(userName, reportKey) {
   };
 }
 
-function emitContentReportMineDeltaToUsers(rawReporter, delta = {}) {
+function emitContentReportMineDeltaToUsers(rawReporter, delta = {}, options = {}) {
   const reporter = normalizeText(rawReporter, '');
   if (!reporter) return 0;
-  const sockets = getSocketsByUserName(reporter).filter(client => client && client.connected);
+  const excludeSocketId = normalizeText(options.excludeSocketId, '');
+  const sockets = getSocketsByUserName(reporter).filter(client => client && client.connected && (!excludeSocketId || client.id !== excludeSocketId));
   if (!sockets.length) return 0;
   const action = delta.action === 'remove' ? 'remove' : 'upsert';
   const reportKey = normalizeText(delta.reportKey || (delta.report && delta.report.reportKey), '');
@@ -3975,16 +3976,24 @@ async function publishContentReportsChanged(options = {}) {
   const reportKey = normalizeText(options.reportKey || clearedReportKey, '');
   const mineAction = options.mineAction === 'remove' ? 'remove' : (options.mineAction === 'upsert' ? 'upsert' : '');
   const mineReport = options.mineReport && typeof options.mineReport === 'object' ? options.mineReport : null;
+  const adminNotice = options.adminNotice && typeof options.adminNotice === 'object' ? options.adminNotice : null;
+  const sourceSocketId = normalizeText(options.sourceSocketId, '');
+  let adminDelta = null;
 
   if (clearedReportKey) {
     adminContentReports = (Array.isArray(adminContentReports) ? adminContentReports : []).filter(item => item && item.reportKey !== clearedReportKey);
+    adminDelta = { action: 'remove', reportKey: clearedReportKey };
   } else if (reportKey && hasAdminSockets()) {
-    await refreshContentReportGroupFromDb(reportKey);
+    const group = await refreshContentReportGroupFromDb(reportKey);
+    adminDelta = group ? { action: 'upsert', reportKey, group } : { action: 'remove', reportKey };
   } else if (!reportKey && hasAdminSockets()) {
     await refreshContentReportsFromDb();
   }
 
-  if (hasAdminSockets()) emitToAdmins('content_reports_list', adminContentReports);
+  if (hasAdminSockets()) {
+    if (adminDelta) emitToAdmins('content_report_admin_delta', adminNotice ? { ...adminDelta, notice: adminNotice } : adminDelta);
+    else emitToAdmins('content_reports_list', adminContentReports);
+  }
 
   const state = {
     changedAt: Date.now(),
@@ -3992,12 +4001,13 @@ async function publishContentReportsChanged(options = {}) {
     reportKey,
     clearedReportKey,
     mineAction,
-    ...(mineAction === 'upsert' && mineReport ? { mineReport } : {})
+    ...(mineAction === 'upsert' && mineReport ? { mineReport } : {}),
+    ...(adminNotice ? { adminNotice } : {})
   };
   deferServerTask('CONTENT REPORTS NOTIFY', () => notifyAdminStateAcrossInstances(ADMIN_STATE_KEYS.contentReports, state), 0);
 
   if (reporter && mineAction) {
-    emitContentReportMineDeltaToUsers(reporter, { action: mineAction, reportKey, report: mineReport });
+    emitContentReportMineDeltaToUsers(reporter, { action: mineAction, reportKey, report: mineReport }, { excludeSocketId: sourceSocketId });
   }
   if (clearedReportKey) io.emit('content_report_cleared', { reportKey: clearedReportKey });
 }
@@ -7046,10 +7056,17 @@ async function initProfileSyncNotifications() {
           const changedReportKey = normalizeText(state.reportKey || state.clearedReportKey, '');
           const clearedReportKey = normalizeText(state.clearedReportKey, '');
           if (hasAdminSockets()) {
-            if (clearedReportKey) adminContentReports = (Array.isArray(adminContentReports) ? adminContentReports : []).filter(item => item && item.reportKey !== clearedReportKey);
-            else if (changedReportKey) await refreshContentReportGroupFromDb(changedReportKey);
-            else await refreshContentReportsFromDb();
-            emitToAdmins('content_reports_list', adminContentReports);
+            if (clearedReportKey) {
+              adminContentReports = (Array.isArray(adminContentReports) ? adminContentReports : []).filter(item => item && item.reportKey !== clearedReportKey);
+              emitToAdmins('content_report_admin_delta', { action: 'remove', reportKey: clearedReportKey });
+            } else if (changedReportKey) {
+              const group = await refreshContentReportGroupFromDb(changedReportKey);
+              const adminDelta = group ? { action: 'upsert', reportKey: changedReportKey, group } : { action: 'remove', reportKey: changedReportKey };
+              emitToAdmins('content_report_admin_delta', state.adminNotice ? { ...adminDelta, notice: state.adminNotice } : adminDelta);
+            } else {
+              await refreshContentReportsFromDb();
+              emitToAdmins('content_reports_list', adminContentReports);
+            }
           }
           const reporter = normalizeText(state.reporter, '');
           const mineAction = state.mineAction === 'remove' ? 'remove' : (state.mineAction === 'upsert' ? 'upsert' : '');
@@ -11449,8 +11466,10 @@ io.on('connection', (socket) => {
 
       const reportState = await queryDbWithRetry(
         `SELECT
-           (SELECT id FROM content_reports WHERE reporter = $1 AND report_key = $2 LIMIT 1) AS existing_id,
-           (SELECT COUNT(*)::int FROM content_reports WHERE reporter = $1) AS report_count`,
+           MAX(CASE WHEN report_key = $2 THEN id ELSE NULL END) AS existing_id,
+           COUNT(*)::int AS report_count
+         FROM content_reports
+         WHERE reporter = $1`,
         [reporter, identity.reportKey],
         { attempts: 2, label: 'CONTENT REPORT STATE' }
       );
@@ -11483,13 +11502,13 @@ io.on('connection', (socket) => {
         updatedAt: row.updated_at ? new Date(row.updated_at).toISOString() : new Date().toISOString()
       };
 
-      await publishContentReportsChanged({ reporter, reportKey: identity.reportKey, mineAction: 'upsert', mineReport: report });
-      emitToAdmins('admin_content_report_created', {
-        ...identity,
+      await publishContentReportsChanged({
         reporter,
-        reason: report.reason,
-        details: report.details,
-        time: report.updatedAt
+        reportKey: identity.reportKey,
+        mineAction: 'upsert',
+        mineReport: report,
+        adminNotice: { ...identity, reporter, reason: report.reason, details: report.details, time: report.updatedAt },
+        sourceSocketId: socket.id
       });
       respond({ success: true, report, updated: !!existingId });
     } catch (err) {
@@ -11510,7 +11529,7 @@ io.on('connection', (socket) => {
         [reporter, identity.reportKey],
         { attempts: 3, label: 'CONTENT REPORT REMOVE' }
       );
-      await publishContentReportsChanged({ reporter, reportKey: identity.reportKey, mineAction: 'remove' });
+      await publishContentReportsChanged({ reporter, reportKey: identity.reportKey, mineAction: 'remove', sourceSocketId: socket.id });
       respond({ success: true, removed: result.rowCount > 0 });
     } catch (err) {
       console.error('[CONTENT REPORT REMOVE ERROR]:', err);
