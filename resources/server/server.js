@@ -89,7 +89,9 @@ const ADMIN_STATE_KEYS = {
   maintenance: "maintenance",
   chatControls: "chat_controls",
   pinnedAnnouncement: "pinned_announcement",
-  reports: "reports"
+  reports: "reports",
+  contentReports: "content_reports",
+  contentBlocks: "content_blocks"
 };
 
 // ============================================================================
@@ -109,6 +111,11 @@ const ONLINE_LIST_UNCHANGED_SKIP_ENABLED = process.env.ONLINE_LIST_SKIP_UNCHANGE
 const SOCIAL_HISTORY_MAX = 500;
 const TRENDING_MAX_ITEMS = 50;
 const ADMIN_REPORTS_HISTORY_MAX = 100;
+const ADMIN_CONTENT_REPORTS_HISTORY_MAX = 100;
+const CONTENT_REPORT_ROWS_MAX = 1000;
+const CONTENT_REPORTS_PER_USER_MAX = 100;
+const CONTENT_REPORT_DETAILS_MAX = 1200;
+const CONTENT_BLOCKS_MAX = 1000;
 
 const pgConnectionOptions = {
   connectionString: process.env.DATABASE_URL,
@@ -1190,6 +1197,8 @@ let adminState = {
 let moderationLog = [];
 let serverLog = [];
 let adminReports = [];
+let adminContentReports = [];
+let blockedStoreContent = [];
 let lastKnownOnlineList = [];
 let adminStateLastRefreshAt = 0;
 let adminStateRefreshInFlight = null;
@@ -1321,6 +1330,34 @@ async function initDb() {
       resolved BOOLEAN DEFAULT FALSE,
       created_at TIMESTAMPTZ DEFAULT NOW()
     );
+    CREATE TABLE IF NOT EXISTS content_reports (
+      id TEXT PRIMARY KEY,
+      reporter TEXT NOT NULL,
+      report_key TEXT NOT NULL,
+      category TEXT NOT NULL,
+      title_id TEXT NOT NULL,
+      content_id TEXT NOT NULL DEFAULT '',
+      content_name TEXT NOT NULL DEFAULT '',
+      region TEXT NOT NULL DEFAULT '',
+      reason TEXT NOT NULL,
+      details TEXT NOT NULL DEFAULT '',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE(reporter, report_key)
+    );
+    CREATE INDEX IF NOT EXISTS idx_content_reports_report_key ON content_reports(report_key, updated_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_content_reports_reporter ON content_reports(reporter, updated_at DESC);
+    CREATE TABLE IF NOT EXISTS content_blocks (
+      report_key TEXT PRIMARY KEY,
+      category TEXT NOT NULL,
+      title_id TEXT NOT NULL,
+      content_id TEXT NOT NULL DEFAULT '',
+      content_name TEXT NOT NULL DEFAULT '',
+      region TEXT NOT NULL DEFAULT '',
+      blocked_by TEXT NOT NULL DEFAULT '',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_content_blocks_title_id ON content_blocks(title_id);
     CREATE TABLE IF NOT EXISTS deleted_accounts (
       name TEXT PRIMARY KEY,
       data JSONB,
@@ -1497,6 +1534,8 @@ async function initDb() {
 
   const reportsRes = await queryDbWithRetry(`SELECT data FROM reports WHERE resolved = false ORDER BY created_at DESC LIMIT ${ADMIN_REPORTS_HISTORY_MAX}`, [], { attempts: 2, label: 'REPORTS READ' });
   adminReports = reportsRes.rows.map(r => r.data);
+  await refreshContentReportsFromDb();
+  await refreshBlockedStoreContentFromDb();
 
   const modLogRes = await pool.query(`SELECT entry FROM moderation_log ORDER BY created_at DESC LIMIT ${MODERATION_LOG_HISTORY_MAX}`);
   moderationLog = modLogRes.rows.map(r => r.entry);
@@ -3668,6 +3707,227 @@ async function refreshReportsFromDb() {
   const reportsRes = await pool.query(`SELECT data FROM reports WHERE resolved = false ORDER BY created_at DESC LIMIT ${ADMIN_REPORTS_HISTORY_MAX}`);
   adminReports = reportsRes.rows.map(r => r.data);
   return adminReports;
+}
+
+const CONTENT_REPORT_REASON_IDS = new Set(['game_not_working', 'broken_download', 'license_issue', 'wrong_content', 'other']);
+
+function normalizeStoreContentCategory(value) {
+  return normalizeText(value, 'games').toLowerCase().replace(/[\s-]+/g, '_').replace(/[^a-z0-9_]/g, '').slice(0, 40) || 'games';
+}
+
+function normalizeStoreContentTitleId(value) {
+  return normalizeText(value, '').toUpperCase().replace(/[^A-Z0-9._-]/g, '').slice(0, 40);
+}
+
+function normalizeStoreContentId(value) {
+  return normalizeText(value, '').replace(/[\r\n\t]+/g, ' ').slice(0, 220);
+}
+
+function normalizeStoreContentName(value) {
+  return normalizeText(value, '').replace(/[\r\n\t]+/g, ' ').slice(0, 220);
+}
+
+function normalizeStoreContentRegion(value) {
+  return normalizeText(value, '').replace(/[\r\n\t]+/g, ' ').slice(0, 32);
+}
+
+function normalizeContentReportDetails(value) {
+  return String(value === undefined || value === null ? '' : value)
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n')
+    .trim()
+    .slice(0, CONTENT_REPORT_DETAILS_MAX);
+}
+
+function normalizeContentReportReason(value) {
+  const reason = normalizeText(value, '').toLowerCase();
+  return CONTENT_REPORT_REASON_IDS.has(reason) ? reason : '';
+}
+
+function getStoreContentReportKey(data = {}) {
+  const category = normalizeStoreContentCategory(data.category || data.storeCategory);
+  const titleId = normalizeStoreContentTitleId(data.titleId || data.id);
+  const contentId = normalizeStoreContentId(data.contentId);
+  if (!titleId && !contentId) return '';
+  return `${category}|${titleId}|${contentId}`;
+}
+
+function normalizeStoreContentIdentity(data = {}) {
+  return {
+    reportKey: getStoreContentReportKey(data),
+    category: normalizeStoreContentCategory(data.category || data.storeCategory),
+    titleId: normalizeStoreContentTitleId(data.titleId || data.id),
+    contentId: normalizeStoreContentId(data.contentId),
+    name: normalizeStoreContentName(data.name || data.contentName || data.title),
+    region: normalizeStoreContentRegion(data.region)
+  };
+}
+
+function getPublicBlockedStoreContent() {
+  return (Array.isArray(blockedStoreContent) ? blockedStoreContent : []).map(item => ({
+    reportKey: item.reportKey,
+    category: item.category,
+    titleId: item.titleId,
+    contentId: item.contentId
+  }));
+}
+
+function isStoreContentBlockedByKey(reportKey) {
+  const key = normalizeText(reportKey, '');
+  return !!key && (Array.isArray(blockedStoreContent) ? blockedStoreContent : []).some(item => item && item.reportKey === key);
+}
+
+async function refreshContentReportsFromDb() {
+  const result = await queryDbWithRetry(
+    `SELECT id, reporter, report_key, category, title_id, content_id, content_name, region, reason, details, created_at, updated_at
+     FROM content_reports
+     ORDER BY updated_at DESC
+     LIMIT ${CONTENT_REPORT_ROWS_MAX}`,
+    [],
+    { attempts: 2, label: 'CONTENT REPORTS READ' }
+  );
+
+  const groups = new Map();
+  for (const row of result.rows || []) {
+    const reportKey = normalizeText(row.report_key, '');
+    if (!reportKey) continue;
+    let group = groups.get(reportKey);
+    if (!group) {
+      group = {
+        id: reportKey,
+        reportKey,
+        category: normalizeStoreContentCategory(row.category),
+        titleId: normalizeStoreContentTitleId(row.title_id),
+        contentId: normalizeStoreContentId(row.content_id),
+        name: normalizeStoreContentName(row.content_name),
+        region: normalizeStoreContentRegion(row.region),
+        reportCount: 0,
+        reporters: [],
+        updatedAt: row.updated_at ? new Date(row.updated_at).toISOString() : new Date().toISOString()
+      };
+      groups.set(reportKey, group);
+    }
+    group.reportCount += 1;
+    group.reporters.push({
+      reporter: normalizeText(row.reporter, 'Unknown'),
+      reason: normalizeContentReportReason(row.reason) || 'other',
+      details: normalizeContentReportDetails(row.details),
+      time: row.updated_at ? new Date(row.updated_at).toISOString() : (row.created_at ? new Date(row.created_at).toISOString() : new Date().toISOString())
+    });
+  }
+
+  adminContentReports = Array.from(groups.values())
+    .sort((a, b) => new Date(b.updatedAt || 0).getTime() - new Date(a.updatedAt || 0).getTime())
+    .slice(0, ADMIN_CONTENT_REPORTS_HISTORY_MAX);
+  return adminContentReports;
+}
+
+async function refreshBlockedStoreContentFromDb() {
+  const result = await queryDbWithRetry(
+    `SELECT report_key, category, title_id, content_id, content_name, region, blocked_by, created_at
+     FROM content_blocks
+     ORDER BY created_at DESC
+     LIMIT ${CONTENT_BLOCKS_MAX}`,
+    [],
+    { attempts: 2, label: 'CONTENT BLOCKS READ' }
+  );
+  blockedStoreContent = (result.rows || []).map(row => ({
+    reportKey: normalizeText(row.report_key, ''),
+    category: normalizeStoreContentCategory(row.category),
+    titleId: normalizeStoreContentTitleId(row.title_id),
+    contentId: normalizeStoreContentId(row.content_id),
+    name: normalizeStoreContentName(row.content_name),
+    region: normalizeStoreContentRegion(row.region),
+    blockedBy: normalizeText(row.blocked_by, 'Admin'),
+    time: row.created_at ? new Date(row.created_at).toISOString() : new Date().toISOString()
+  })).filter(item => item.reportKey);
+  return blockedStoreContent;
+}
+
+async function getUserContentReports(userName) {
+  const reporter = normalizeText(userName, '');
+  if (!reporter) return [];
+  const result = await queryDbWithRetry(
+    `SELECT report_key, category, title_id, content_id, reason, details, updated_at
+     FROM content_reports
+     WHERE reporter = $1
+     ORDER BY updated_at DESC
+     LIMIT $2`,
+    [reporter, CONTENT_REPORTS_PER_USER_MAX],
+    { attempts: 2, label: 'USER CONTENT REPORTS READ' }
+  );
+  return (result.rows || []).map(row => ({
+    reportKey: normalizeText(row.report_key, ''),
+    category: normalizeStoreContentCategory(row.category),
+    titleId: normalizeStoreContentTitleId(row.title_id),
+    contentId: normalizeStoreContentId(row.content_id),
+    reason: normalizeContentReportReason(row.reason) || 'other',
+    details: normalizeContentReportDetails(row.details),
+    updatedAt: row.updated_at ? new Date(row.updated_at).toISOString() : new Date().toISOString()
+  })).filter(item => item.reportKey);
+}
+
+async function getUserContentReport(userName, reportKey) {
+  const reporter = normalizeText(userName, '');
+  const key = normalizeText(reportKey, '');
+  if (!reporter || !key) return null;
+  const result = await queryDbWithRetry(
+    `SELECT report_key, category, title_id, content_id, reason, details, updated_at
+     FROM content_reports
+     WHERE reporter = $1 AND report_key = $2
+     LIMIT 1`,
+    [reporter, key],
+    { attempts: 2, label: 'USER CONTENT REPORT READ' }
+  );
+  const row = result.rows && result.rows[0];
+  if (!row) return null;
+  return {
+    reportKey: normalizeText(row.report_key, ''),
+    category: normalizeStoreContentCategory(row.category),
+    titleId: normalizeStoreContentTitleId(row.title_id),
+    contentId: normalizeStoreContentId(row.content_id),
+    reason: normalizeContentReportReason(row.reason) || 'other',
+    details: normalizeContentReportDetails(row.details),
+    updatedAt: row.updated_at ? new Date(row.updated_at).toISOString() : new Date().toISOString()
+  };
+}
+
+async function emitContentReportsMineToUsers(rawReporters = []) {
+  const reporters = [...new Set((Array.isArray(rawReporters) ? rawReporters : [rawReporters])
+    .map(value => normalizeText(value, ''))
+    .filter(Boolean))];
+  if (!reporters.length) return;
+
+  await Promise.all(reporters.map(async reporter => {
+    const sockets = getSocketsByUserName(reporter).filter(client => client && client.connected);
+    if (!sockets.length) return;
+    const mine = await getUserContentReports(reporter);
+    sockets.forEach(client => client.emit('content_reports_mine', mine));
+  }));
+}
+
+async function publishContentReportsChanged(options = {}) {
+  await refreshContentReportsFromDb();
+  emitToAdmins('content_reports_list', adminContentReports);
+
+  const reporter = normalizeText(options.reporter, '');
+  const clearedReportKey = normalizeText(options.clearedReportKey, '');
+  deferServerTask('CONTENT REPORTS NOTIFY', () => notifyAdminStateAcrossInstances(ADMIN_STATE_KEYS.contentReports, {
+    changedAt: Date.now(),
+    reporter,
+    clearedReportKey
+  }), 0);
+
+  if (reporter) await emitContentReportsMineToUsers([reporter]);
+  if (clearedReportKey) io.emit('content_report_cleared', { reportKey: clearedReportKey });
+}
+
+async function publishContentBlocksChanged() {
+  await refreshBlockedStoreContentFromDb();
+  const publicBlocks = getPublicBlockedStoreContent();
+  io.emit('content_blocks_state', publicBlocks);
+  emitToAdmins('content_blocks_list', blockedStoreContent);
+  deferServerTask('CONTENT BLOCKS NOTIFY', () => notifyAdminStateAcrossInstances(ADMIN_STATE_KEYS.contentBlocks, { changedAt: Date.now() }), 0);
 }
 
 async function searchUsersFromDb(query, includeAdminFields = false, includeAllMatches = false) {
@@ -6030,15 +6290,20 @@ async function emitAdminState(socket) {
   socket.emit('maintenance_mode', adminState.maintenance);
   socket.emit('chat_controls', adminState.chatControls);
   socket.emit('admin_pinned_announcement', adminState.pinnedAnnouncement || { clear: true });
+  socket.emit('content_blocks_state', getPublicBlockedStoreContent());
 
   if (socket.isAdmin === true) {
     await refreshReportsFromDb();
+    await refreshContentReportsFromDb();
+    await refreshBlockedStoreContentFromDb();
     await refreshServerLogFromDb();
     socket.emit('admin_state', {
       maintenance: adminState.maintenance,
       chatControls: adminState.chatControls,
       pinnedAnnouncement: adminState.pinnedAnnouncement || null,
       reports: adminReports,
+      contentReports: adminContentReports,
+      blockedContent: blockedStoreContent,
       serverLog,
       registeredUsers: Object.keys(userDatabase).length,
       countryStats: getAdminCountryStats(),
@@ -6047,6 +6312,8 @@ async function emitAdminState(socket) {
     });
     socket.emit('admin_chat_controls_state', adminState.chatControls);
     socket.emit('reports_list', adminReports);
+    socket.emit('content_reports_list', adminContentReports);
+    socket.emit('content_blocks_list', blockedStoreContent);
     socket.emit('admin_log_limits', getAdminLogLimits());
     socket.emit('admin_server_log_list', serverLog);
   }
@@ -6670,6 +6937,27 @@ async function initProfileSyncNotifications() {
           await refreshReportsFromDb();
           const nextReportsSignature = JSON.stringify(Array.isArray(adminReports) ? adminReports : []);
           if (previousReportsSignature !== nextReportsSignature) emitToAdmins('reports_list', adminReports);
+          return;
+        }
+        if (key === ADMIN_STATE_KEYS.contentReports) {
+          const previousSignature = JSON.stringify(Array.isArray(adminContentReports) ? adminContentReports : []);
+          await refreshContentReportsFromDb();
+          const nextSignature = JSON.stringify(Array.isArray(adminContentReports) ? adminContentReports : []);
+          if (previousSignature !== nextSignature) emitToAdmins('content_reports_list', adminContentReports);
+          const reporter = normalizeText(data && data.state && data.state.reporter, '');
+          if (reporter) await emitContentReportsMineToUsers([reporter]);
+          const clearedReportKey = normalizeText(data && data.state && data.state.clearedReportKey, '');
+          if (clearedReportKey) io.emit('content_report_cleared', { reportKey: clearedReportKey });
+          return;
+        }
+        if (key === ADMIN_STATE_KEYS.contentBlocks) {
+          const previousSignature = JSON.stringify(Array.isArray(blockedStoreContent) ? blockedStoreContent : []);
+          await refreshBlockedStoreContentFromDb();
+          const nextSignature = JSON.stringify(Array.isArray(blockedStoreContent) ? blockedStoreContent : []);
+          if (previousSignature !== nextSignature) {
+            io.emit('content_blocks_state', getPublicBlockedStoreContent());
+            emitToAdmins('content_blocks_list', blockedStoreContent);
+          }
           return;
         }
         return;
@@ -8510,6 +8798,8 @@ async function deleteUserAccount(targetName, reason, adminName) {
   await pool.query('DELETE FROM user_notification_read_state WHERE user_name = $1', [targetName]);
   await pool.query('DELETE FROM user_notifications WHERE user_name = $1', [targetName]);
   await pool.query('DELETE FROM user_catalog_notification_seen WHERE user_name = $1', [targetName]);
+  const deletedContentReports = await pool.query('DELETE FROM content_reports WHERE reporter = $1', [targetName]);
+  if (deletedContentReports.rowCount > 0) await publishContentReportsChanged();
   await notifyProfileSyncAcrossInstances(targetName, null, Date.now());
 
   delete userDatabase[targetName];
@@ -10845,6 +11135,8 @@ io.on('connection', (socket) => {
       await refreshAdminStateThrottled(3000);
       if (socket.isAdmin === true) {
         await refreshReportsFromDb();
+        await refreshContentReportsFromDb();
+        await refreshBlockedStoreContentFromDb();
         await refreshServerLogFromDb();
       }
       const payload = {
@@ -10852,6 +11144,8 @@ io.on('connection', (socket) => {
         chatControls: adminState.chatControls,
         pinnedAnnouncement: adminState.pinnedAnnouncement || null,
         reports: socket.isAdmin === true ? adminReports : [],
+        contentReports: socket.isAdmin === true ? adminContentReports : [],
+        blockedContent: socket.isAdmin === true ? blockedStoreContent : [],
         serverLog: socket.isAdmin === true ? serverLog : [],
         registeredUsers: socket.isAdmin === true ? Object.keys(userDatabase).length : 0,
         countryStats: socket.isAdmin === true ? getAdminCountryStats() : { total: 0, known: 0, unknown: 0, countries: [] },
@@ -10978,6 +11272,234 @@ io.on('connection', (socket) => {
       console.error('[SERVER LOG CLEAR ERROR]:', err);
     }
     emitToAdmins('admin_server_log_list', serverLog);
+  });
+
+  socket.on('content_blocks_request', async (data, callback) => {
+    const respond = typeof callback === 'function' ? callback : () => {};
+    try {
+      const blocks = getPublicBlockedStoreContent();
+      socket.emit('content_blocks_state', blocks);
+      respond({ success: true, blocks });
+    } catch (err) {
+      console.error('[CONTENT BLOCKS REQUEST ERROR]:', err);
+      respond({ success: false, message: 'Could not load blocked Store content.' });
+    }
+  });
+
+  socket.on('content_report_request_mine', async (data, callback) => {
+    const respond = typeof callback === 'function' ? callback : () => {};
+    try {
+      const reporter = normalizeText(socket.userName, '');
+      if (!reporter || !userDatabase[reporter]) return respond({ success: false, authenticated: false, reports: [] });
+      const reports = await getUserContentReports(reporter);
+      socket.emit('content_reports_mine', reports);
+      respond({ success: true, reports });
+    } catch (err) {
+      console.error('[CONTENT REPORT MINE ERROR]:', err);
+      respond({ success: false, message: 'Could not load your Store reports.' });
+    }
+  });
+
+  socket.on('content_report_get', async (data, callback) => {
+    const respond = typeof callback === 'function' ? callback : () => {};
+    try {
+      const reporter = normalizeText(socket.userName, '');
+      if (!reporter || !userDatabase[reporter]) return respond({ success: false, authenticated: false });
+      const identity = normalizeStoreContentIdentity(data || {});
+      if (!identity.reportKey) return respond({ success: false, message: 'Invalid content.' });
+      const report = await getUserContentReport(reporter, identity.reportKey);
+      respond({ success: true, report, blocked: isStoreContentBlockedByKey(identity.reportKey) });
+    } catch (err) {
+      console.error('[CONTENT REPORT GET ERROR]:', err);
+      respond({ success: false, message: 'Could not load this report.' });
+    }
+  });
+
+  socket.on('content_report_submit', async (data, callback) => {
+    const respond = typeof callback === 'function' ? callback : () => {};
+    try {
+      const reporter = normalizeText(socket.userName, '');
+      if (!reporter || !userDatabase[reporter]) return respond({ success: false, authenticated: false, message: 'Sign in before reporting content.' });
+
+      const identity = normalizeStoreContentIdentity(data || {});
+      const reason = normalizeContentReportReason(data && data.reason);
+      const details = normalizeContentReportDetails(data && data.details);
+      if (!identity.reportKey || (!identity.titleId && !identity.contentId)) return respond({ success: false, message: 'Invalid Store content.' });
+      if (!reason) return respond({ success: false, message: 'Choose a report reason.' });
+      if (reason === 'other' && !details) return respond({ success: false, message: 'Describe the problem before sending the report.' });
+      if (isStoreContentBlockedByKey(identity.reportKey)) return respond({ success: false, blocked: true, message: 'This content is already blocked from the Store.' });
+
+      const existing = await queryDbWithRetry(
+        'SELECT id FROM content_reports WHERE reporter = $1 AND report_key = $2 LIMIT 1',
+        [reporter, identity.reportKey],
+        { attempts: 2, label: 'CONTENT REPORT EXISTS' }
+      );
+      if (!existing.rows.length) {
+        const countRes = await queryDbWithRetry(
+          'SELECT COUNT(*)::int AS count FROM content_reports WHERE reporter = $1',
+          [reporter],
+          { attempts: 2, label: 'CONTENT REPORT USER COUNT' }
+        );
+        if (Number(countRes.rows[0] && countRes.rows[0].count || 0) >= CONTENT_REPORTS_PER_USER_MAX) {
+          return respond({ success: false, message: `You can keep up to ${CONTENT_REPORTS_PER_USER_MAX} active Store reports.` });
+        }
+      }
+
+      const reportId = existing.rows.length
+        ? normalizeText(existing.rows[0].id, '')
+        : `content-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+      const result = await queryDbWithRetry(
+        `INSERT INTO content_reports (id, reporter, report_key, category, title_id, content_id, content_name, region, reason, details, created_at, updated_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW(),NOW())
+         ON CONFLICT (reporter, report_key)
+         DO UPDATE SET category = EXCLUDED.category, title_id = EXCLUDED.title_id, content_id = EXCLUDED.content_id,
+                       content_name = EXCLUDED.content_name, region = EXCLUDED.region, reason = EXCLUDED.reason,
+                       details = EXCLUDED.details, updated_at = NOW()
+         RETURNING report_key, category, title_id, content_id, reason, details, updated_at`,
+        [reportId, reporter, identity.reportKey, identity.category, identity.titleId, identity.contentId, identity.name, identity.region, reason, reason === 'other' ? details : ''],
+        { attempts: 3, label: 'CONTENT REPORT UPSERT' }
+      );
+      const row = result.rows[0] || {};
+      const report = {
+        reportKey: normalizeText(row.report_key, identity.reportKey),
+        category: normalizeStoreContentCategory(row.category || identity.category),
+        titleId: normalizeStoreContentTitleId(row.title_id || identity.titleId),
+        contentId: normalizeStoreContentId(row.content_id || identity.contentId),
+        reason: normalizeContentReportReason(row.reason || reason) || reason,
+        details: normalizeContentReportDetails(row.details),
+        updatedAt: row.updated_at ? new Date(row.updated_at).toISOString() : new Date().toISOString()
+      };
+
+      await publishContentReportsChanged({ reporter });
+      emitToAdmins('admin_content_report_created', {
+        ...identity,
+        reporter,
+        reason: report.reason,
+        details: report.details,
+        time: report.updatedAt
+      });
+      respond({ success: true, report, updated: existing.rows.length > 0 });
+    } catch (err) {
+      console.error('[CONTENT REPORT SUBMIT ERROR]:', err);
+      respond({ success: false, message: 'Server error while saving the Store report.' });
+    }
+  });
+
+  socket.on('content_report_remove', async (data, callback) => {
+    const respond = typeof callback === 'function' ? callback : () => {};
+    try {
+      const reporter = normalizeText(socket.userName, '');
+      if (!reporter || !userDatabase[reporter]) return respond({ success: false, authenticated: false });
+      const identity = normalizeStoreContentIdentity(data || {});
+      if (!identity.reportKey) return respond({ success: false, message: 'Invalid content.' });
+      const result = await queryDbWithRetry(
+        'DELETE FROM content_reports WHERE reporter = $1 AND report_key = $2 RETURNING id',
+        [reporter, identity.reportKey],
+        { attempts: 3, label: 'CONTENT REPORT REMOVE' }
+      );
+      await publishContentReportsChanged({ reporter });
+      respond({ success: true, removed: result.rowCount > 0 });
+    } catch (err) {
+      console.error('[CONTENT REPORT REMOVE ERROR]:', err);
+      respond({ success: false, message: 'Server error while removing the Store report.' });
+    }
+  });
+
+  socket.on('admin_request_content_reports', async (data, callback) => {
+    const respond = typeof callback === 'function' ? callback : () => {};
+    try {
+      if (socket.isAdmin !== true) return respond({ success: false, message: 'Admin only.' });
+      await refreshContentReportsFromDb();
+      await refreshBlockedStoreContentFromDb();
+      socket.emit('content_reports_list', adminContentReports);
+      socket.emit('content_blocks_list', blockedStoreContent);
+      respond({ success: true, reports: adminContentReports, blockedContent: blockedStoreContent });
+    } catch (err) {
+      console.error('[ADMIN CONTENT REPORTS REQUEST ERROR]:', err);
+      respond({ success: false, message: 'Could not load Store reports.' });
+    }
+  });
+
+  socket.on('admin_resolve_content_report', async (data, callback) => {
+    const respond = typeof callback === 'function' ? callback : () => {};
+    try {
+      if (socket.isAdmin !== true) return respond({ success: false, message: 'Admin only.' });
+      const reportKey = normalizeText(data && data.reportKey, '');
+      if (!reportKey) return respond({ success: false, message: 'Missing content report key.' });
+      const group = (Array.isArray(adminContentReports) ? adminContentReports : []).find(item => item && item.reportKey === reportKey) || null;
+      await queryDbWithRetry('DELETE FROM content_reports WHERE report_key = $1', [reportKey], { attempts: 3, label: 'ADMIN CONTENT REPORT RESOLVE' });
+      await publishContentReportsChanged({ clearedReportKey: reportKey });
+      await addModerationLog('content_report_resolve', 'Resolved Store content report', { reportKey, reports: Math.max(0, Number(group && group.reportCount) || 0) }, socket.userName || 'Admin');
+      respond({ success: true });
+    } catch (err) {
+      console.error('[ADMIN CONTENT REPORT RESOLVE ERROR]:', err);
+      respond({ success: false, message: 'Could not resolve the Store report.' });
+    }
+  });
+
+  socket.on('admin_block_store_content', async (data, callback) => {
+    const respond = typeof callback === 'function' ? callback : () => {};
+    try {
+      if (socket.isAdmin !== true) return respond({ success: false, message: 'Admin only.' });
+      const requestedKey = normalizeText(data && data.reportKey, '');
+      if (!requestedKey) return respond({ success: false, message: 'Missing content key.' });
+      let group = (Array.isArray(adminContentReports) ? adminContentReports : []).find(item => item && item.reportKey === requestedKey) || null;
+      if (!group) {
+        const source = await queryDbWithRetry(
+          `SELECT report_key, category, title_id, content_id, content_name, region
+           FROM content_reports WHERE report_key = $1 ORDER BY updated_at DESC LIMIT 1`,
+          [requestedKey],
+          { attempts: 2, label: 'ADMIN CONTENT BLOCK SOURCE' }
+        );
+        const row = source.rows && source.rows[0];
+        if (row) group = {
+          reportKey: row.report_key,
+          category: row.category,
+          titleId: row.title_id,
+          contentId: row.content_id,
+          name: row.content_name,
+          region: row.region
+        };
+      }
+      const identity = normalizeStoreContentIdentity(group || data || {});
+      if (!identity.reportKey || identity.reportKey !== requestedKey) return respond({ success: false, message: 'This report is no longer available.' });
+
+      await runDbTransactionWithRetry('ADMIN CONTENT BLOCK', async client => {
+        await client.query(
+          `INSERT INTO content_blocks (report_key, category, title_id, content_id, content_name, region, blocked_by, created_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,NOW())
+           ON CONFLICT (report_key)
+           DO UPDATE SET category = EXCLUDED.category, title_id = EXCLUDED.title_id, content_id = EXCLUDED.content_id,
+                         content_name = EXCLUDED.content_name, region = EXCLUDED.region, blocked_by = EXCLUDED.blocked_by, created_at = NOW()`,
+          [identity.reportKey, identity.category, identity.titleId, identity.contentId, identity.name, identity.region, socket.userName || 'Admin']
+        );
+        await client.query('DELETE FROM content_reports WHERE report_key = $1', [identity.reportKey]);
+      }, { advisoryLockKey: `content-block:${identity.reportKey}` });
+      await publishContentReportsChanged({ clearedReportKey: identity.reportKey });
+      await publishContentBlocksChanged();
+      await addModerationLog('content_block', `Blocked ${identity.titleId || identity.contentId} from Store`, identity, socket.userName || 'Admin');
+      respond({ success: true, block: blockedStoreContent.find(item => item.reportKey === identity.reportKey) || identity });
+    } catch (err) {
+      console.error('[ADMIN CONTENT BLOCK ERROR]:', err);
+      respond({ success: false, message: 'Could not block this Store content.' });
+    }
+  });
+
+  socket.on('admin_unblock_store_content', async (data, callback) => {
+    const respond = typeof callback === 'function' ? callback : () => {};
+    try {
+      if (socket.isAdmin !== true) return respond({ success: false, message: 'Admin only.' });
+      const reportKey = normalizeText(data && data.reportKey, '');
+      if (!reportKey) return respond({ success: false, message: 'Missing content key.' });
+      const previous = (Array.isArray(blockedStoreContent) ? blockedStoreContent : []).find(item => item && item.reportKey === reportKey) || null;
+      await queryDbWithRetry('DELETE FROM content_blocks WHERE report_key = $1', [reportKey], { attempts: 3, label: 'ADMIN CONTENT UNBLOCK' });
+      await publishContentBlocksChanged();
+      await addModerationLog('content_unblock', `Unblocked ${previous && (previous.titleId || previous.contentId) || reportKey} from Store`, previous || { reportKey }, socket.userName || 'Admin');
+      respond({ success: true });
+    } catch (err) {
+      console.error('[ADMIN CONTENT UNBLOCK ERROR]:', err);
+      respond({ success: false, message: 'Could not unblock this Store content.' });
+    }
   });
 
   socket.on('admin_request_reports', async () => {
