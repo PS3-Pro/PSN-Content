@@ -1620,6 +1620,12 @@ input:checked+.slider:before { transform: translateX(20px); }
 .game-trophy-info h3 { margin: 0; color: #fff; font-size: 15px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
 .game-trophy-grade-line { margin-top: 6px; color: #ccc; font-size: 11px; display: flex; align-items: center; gap: 6px; font-weight: 800; text-transform: uppercase; letter-spacing: .35px; }
 .game-trophy-grade-line i { font-size: 10px; color: var(--trophy-color); filter: drop-shadow(0 0 5px rgba(var(--trophy-rgb),.45)); }
+.game-trophy-guide-btn { position: absolute; right: 12px; top: 50%; transform: translateY(-50%); width: 30px; height: 30px; display: inline-flex; align-items: center; justify-content: center; padding: 0; border: 1px solid rgba(255,255,255,.14); border-radius: 50%; background: rgba(0,0,0,.20); color: rgba(255,255,255,.86); font: inherit; cursor: pointer; box-shadow: inset 0 1px 0 rgba(255,255,255,.04); transition: background .18s ease,border-color .18s ease,color .18s ease,box-shadow .18s ease,transform .18s ease; }
+.game-trophy-guide-btn i { color: #ff4a4a !important; font-size: 12px !important; filter: drop-shadow(0 0 5px rgba(255,55,55,.28)) !important; }
+.game-trophy-guide-btn:is(:hover,.psn-hover-stable) { color: #fff; background: rgba(255,255,255,.12); border-color: rgba(255,255,255,.42); box-shadow: 0 5px 14px rgba(0,0,0,.22),0 0 12px rgba(255,55,55,.10); }
+.game-trophy-guide-btn:is(.psn-primary-pressed,.mobile-pressed) { transform: translateY(-50%) scale(.94); }
+.game-trophy-right.has-guide .game-trophy-desc { padding-right: 46px; }
+#trailer-modal.trophy-guide-player { z-index: 7000 !important; }
 .game-trophy-grade-icon { width: 14px; height: 14px; min-width: 14px; object-fit: contain; flex: 0 0 14px; filter: drop-shadow(0 0 5px rgba(var(--trophy-rgb),.45)); }
 .game-trophy-counts .game-trophy-grade-icon { width: 13px; height: 13px; min-width: 13px; flex-basis: 13px; }
 .game-trophy-hidden { color: var(--trophy-color); font-size: 8px; display: inline-flex; align-items: center; gap: 3px; font-weight: 700; letter-spacing: .25px; opacity: .72; }
@@ -4785,6 +4791,8 @@ button[onclick="sendChatMessage()"] { padding: 0 15px !important; height: 38px !
 .game-trophy-divider { width: calc(100% - 24px); height: 1px; margin: 0 auto; }
 .game-trophy-right { width: 100%; padding: 9px 12px 12px; background: rgba(0,0,0,.08); }
 .game-trophy-desc { font-size: 11px; line-height: 1.35; -webkit-line-clamp: 4; padding-right: 0; }
+.game-trophy-right.has-guide .game-trophy-desc { padding-right: 42px; }
+.game-trophy-guide-btn { right: 10px; width: 28px; height: 28px; }
 
 #game-modal .rawg-alt2-panel { height: 57px !important; min-height: 57px !important; box-sizing: border-box !important; }
 
@@ -20210,7 +20218,7 @@ P
 	}
 
 	function isRepoRapFallbackCandidate(game, category = '') {
-		if (!game || normalizeRapMarker(game.rap) !== 'MISSING') return false;
+		if (!game || game.isExternalSource === true || normalizeRapMarker(game.rap) !== 'MISSING') return false;
 		if (!getLicenseRepoRapContentId(game)) return false;
 
 		const resolvedCategory = String(category || game.category || game.rawCategory || '').trim().toLowerCase();
@@ -24215,6 +24223,7 @@ P
 			if (!text) continue;
 			const sourceUrl = String(sourcePaths[textIndex] || '');
 			const sourceIsExplicitDemo = /(?:^|\/)(?:pending\/)?demos\.tsv(?:[?#]|$)/i.test(sourceUrl);
+			const sourceIsExternal = /\/resources\/database\/content\/external\//i.test(sourceUrl);
 			const sharedRows = getSharedStoreTsvRows(sourceUrl, text);
 			const lines = sharedRows || text.split('\n');
 
@@ -24226,6 +24235,7 @@ P
 				if (!analysis.valid) continue;
 
 				const { id, region, pkgUrl, rap, contentId, version } = analysis;
+				const storeRap = sourceIsExternal ? 'NOT REQUIRED' : rap;
 				let rawName = analysis.rawName;
 				let isGuide = analysis.isGuide;
 				let isSoundtrack = analysis.isSoundtrack;
@@ -24274,7 +24284,7 @@ P
 				if (!tempGroupMap[uniqueKey]) {
 					tempGroupMap[uniqueKey] = {
 						id, titleId: id, region, rawName, title: rawName, name: rawName, cleanName, category: cat,
-						cTag, aTag, url: pkgUrl, rap, contentId,
+						cTag, aTag, url: pkgUrl, rap: storeRap, contentId, isExternalSource: sourceIsExternal,
 						sizeBytes: rawSizeBytes, version, isSplit
 					};
 				} else {
@@ -24295,16 +24305,17 @@ P
 								name: rawName,
 								cleanName,
 								version,
-								rap,
+								rap: storeRap,
 								contentId,
 								cTag,
-								aTag
+								aTag,
+								isExternalSource: sourceIsExternal
 							});
 						}
 					}
 
-					if (!hasDirectRapValue(existing.rap) && hasDirectRapValue(rap)) {
-						existing.rap = rap;
+					if (!existing.isExternalSource && !hasDirectRapValue(existing.rap) && hasDirectRapValue(storeRap)) {
+						existing.rap = storeRap;
 						existing.contentId = contentId;
 					}
 				}
@@ -24524,7 +24535,7 @@ P
 	window.ensureStorePrefetchBeforeLogin = ensureStorePrefetchBeforeLogin;
 
 	function isMissingRapItem(game, category = '') {
-		if (!game || normalizeRapMarker(game.rap) !== 'MISSING') return false;
+		if (!game || game.isExternalSource === true || normalizeRapMarker(game.rap) !== 'MISSING') return false;
 
 		const resolvedCategory = String(
 			category || game.category || game.rawCategory || document.getElementById('cat-select')?.value || ''
@@ -28039,8 +28050,9 @@ P
 						</div>
 					</div>
 					<div class="game-trophy-divider"></div>
-					<div class="game-trophy-right">
+					<div class="game-trophy-right${isHidden ? '' : ' has-guide'}">
 						<div class="game-trophy-desc">${escapeGameTrophyHtml(trophyDesc)}</div>
+						${isHidden ? '' : `<button type="button" class="game-trophy-guide-btn" data-guide-game="${escapeGameTrophyHtml(game.title)}" data-guide-trophy="${escapeGameTrophyHtml(trophyName)}" data-guide-platform="${escapeGameTrophyHtml(game.platform || 'PS3')}" title="Search trophy guide on YouTube" aria-label="Search trophy guide on YouTube" onmouseenter="if(typeof playUiArrow === 'function') playUiArrow();" onclick="return playTrophyGuideFromButton(this,event)"><i class="fab fa-youtube" aria-hidden="true"></i></button>`}
 					</div>
 				</div>
 			`;
@@ -31657,6 +31669,7 @@ P
 	window.trailerLoadingMore = false;
 	window.trailerNoMoreResults = false;
 	window.trailerLastQuery = '';
+	window.__trailerRequestToken = 0;
 	const TRAILER_PAGE_SIZE = 10;
 
 	function trailerNormalizeResult(item, fallbackTitle) {
@@ -31744,11 +31757,13 @@ P
 		if (window.trailerNoMoreResults) return false;
 		if (!window.trailerNextPageToken) return false;
 
+		const requestToken = window.__trailerRequestToken;
 		window.trailerLoadingMore = true;
 		trailerSetInfo({ title: 'Loading more...', videoId: '--' });
 
 		const beforeCount = window.trailerResults.length;
 		const page = await fetchYouTubeVideoPage(window.trailerLastQuery, TRAILER_PAGE_SIZE, window.trailerNextPageToken);
+		if (requestToken !== window.__trailerRequestToken) return false;
 
 		window.trailerLoadingMore = false;
 
@@ -31858,7 +31873,17 @@ P
 
 		window.trailerCurrentGameName = title || 'Media Player';
 
-		if (nodes.titleEl) nodes.titleEl.innerText = 'Searching video';
+		if (nodes.titleEl) {
+			const isTrophyGuide = !!(nodes.modal && nodes.modal.classList.contains('trophy-guide-player'));
+			if (isTrophyGuide) {
+				nodes.titleEl.setAttribute('data-no-translate', 'true');
+				nodes.titleEl.setAttribute('translate', 'no');
+			} else {
+				nodes.titleEl.removeAttribute('data-no-translate');
+				nodes.titleEl.removeAttribute('translate');
+			}
+			nodes.titleEl.innerText = 'Searching video';
+		}
 		if (nodes.iframe) nodes.iframe.src = '';
 
 		trailerSetInfo({ title: 'Searching video', videoId: '--' });
@@ -31878,7 +31903,64 @@ P
 		}
 	}
 
+	window.playTrophyGuideFromButton = function(button, event) {
+		if (event) {
+			event.preventDefault();
+			event.stopPropagation();
+		}
+		if (!button) return false;
+		if (typeof playUiClick === 'function') playUiClick();
+		const gameTitle = String(button.dataset.guideGame || '').trim();
+		const trophyName = String(button.dataset.guideTrophy || '').trim();
+		const platform = String(button.dataset.guidePlatform || 'PS3').trim();
+		if (!gameTitle || !trophyName) return false;
+		window.playTrophyGuide(gameTitle, trophyName, platform);
+		return false;
+	};
+
+	window.playTrophyGuide = async function(gameTitle, trophyName, platform = 'PS3') {
+		const safeGame = String(gameTitle || '').trim();
+		const safeTrophy = String(trophyName || '').trim();
+		const safePlatform = String(platform || '').trim();
+		if (!safeGame || !safeTrophy) return;
+
+		const requestToken = ++window.__trailerRequestToken;
+		const nodes = trailerGetNodes();
+		if (nodes.modal) nodes.modal.classList.add('trophy-guide-player');
+		trailerOpenShell(`${safeGame} · ${safeTrophy}`);
+
+		window.trailerResults = [];
+		window.trailerIndex = 0;
+		window.trailerCurrentGameName = `${safeGame} · ${safeTrophy}`;
+		window.trailerNextPageToken = '';
+		window.trailerLoadingMore = false;
+		window.trailerNoMoreResults = false;
+		window.trailerLastQuery = encodeURIComponent(`${safeGame} ${safeTrophy} trophy guide ${safePlatform}`.trim());
+
+		const page = await fetchYouTubeVideoPage(window.trailerLastQuery, TRAILER_PAGE_SIZE, '');
+		if (requestToken !== window.__trailerRequestToken) return;
+		if (!page || page.error || !page.videos || !page.videos.length) {
+			const currentNodes = trailerGetNodes();
+			if (currentNodes.titleEl) currentNodes.titleEl.innerText = 'No guide found';
+			trailerSetInfo({ title: 'No result', videoId: '--' });
+			setTimeout(() => {
+				if (requestToken === window.__trailerRequestToken && currentNodes.modal && currentNodes.modal.classList.contains('show')) closeTrailer();
+			}, 1000);
+			return;
+		}
+
+		trailerAppendResults(page.videos || []);
+		window.trailerNextPageToken = page.nextPageToken || '';
+		window.trailerNoMoreResults = !window.trailerNextPageToken;
+		window.trailerIndex = 0;
+		trailerLoadIndex(0);
+		if (typeof window.checkTrophyProgress === 'function') window.checkTrophyProgress('trophy_guide', 1);
+	};
+
 	window.playTrailer = async function(gameName) {
+		const requestToken = ++window.__trailerRequestToken;
+		const trailerModal = document.getElementById('trailer-modal');
+		if (trailerModal) trailerModal.classList.remove('trophy-guide-player');
 		let watchedTrailers = parseInt(loadState('psn_trailers_watched') || '0') + 1;
 		saveState('psn_trailers_watched', watchedTrailers);
 		checkTrophyProgress('trailer_10', watchedTrailers);
@@ -31896,6 +31978,7 @@ P
 		window.trailerLastQuery = encodeURIComponent(safeName + ' PS3 gameplay trailer');
 
 		const page = await fetchYouTubeVideoPage(window.trailerLastQuery, TRAILER_PAGE_SIZE, '');
+		if (requestToken !== window.__trailerRequestToken) return;
 
 		if (!page || page.error || !page.videos || !page.videos.length) {
 			const nodes = trailerGetNodes();
@@ -31905,7 +31988,7 @@ P
 			trailerSetInfo({ title: 'No result', videoId: '--' });
 
 			setTimeout(() => {
-				if (nodes.modal && nodes.modal.classList.contains('show')) {
+				if (requestToken === window.__trailerRequestToken && nodes.modal && nodes.modal.classList.contains('show')) {
 					closeTrailer();
 				}
 			}, 1000);
@@ -31963,6 +32046,9 @@ P
 
 
 	window.playTrailerDirect = function(videoId) {
+		window.__trailerRequestToken++;
+		const trailerModal = document.getElementById('trailer-modal');
+		if (trailerModal) trailerModal.classList.remove('trophy-guide-player');
 		trailerOpenShell('Youtube Video');
 
 		window.trailerResults = [{ videoId: videoId, title: 'Youtube Video' }];
@@ -31981,6 +32067,8 @@ P
 
 		const clickedClose = e && e.target && (e.target.classList.contains('sys-modal-close') || (e.target.closest && e.target.closest('.sys-modal-close')));
 		if (!e || clickedClose) {
+			window.__trailerRequestToken++;
+			window.trailerLoadingMore = false;
 
 			if (typeof playUiBack === 'function') playUiBack();
 
@@ -31988,7 +32076,13 @@ P
 
 			setTimeout(() => {
 				modal.style.display = 'none';
+				modal.classList.remove('trophy-guide-player');
 
+				const titleEl = document.getElementById('trailer-title');
+				if (titleEl) {
+					titleEl.removeAttribute('data-no-translate');
+					titleEl.removeAttribute('translate');
+				}
 				const iframe = document.getElementById('trailer-iframe');
 				if (iframe) iframe.src = '';
 			}, 300);
@@ -52133,6 +52227,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 		night_owl: { id: 'night_owl', title: 'Night Owl', desc: 'Access the database after midnight.', type: 'bronze', max: 1, group: 'System & Usage' },
 		connect_ps3: { id: 'connect_ps3', title: 'Connection Established', desc: 'Successfully connect the site to your PS3™.', type: 'bronze', max: 1, group: 'System & Usage' },
 		play_game_connected: { id: 'play_game_connected', title: 'Now Playing', desc: 'Play a game on your PS3™ while connected to the site.', type: 'bronze', max: 1, group: 'System & Usage' },
+		trophy_guide: { id: 'trophy_guide', title: 'Need a Hand?', desc: 'View a trophy guide.', type: 'bronze', max: 1, group: 'System & Usage' },
 		sync_db: { id: 'sync_db', title: 'Always Updated', desc: 'Manually sync the database in settings.', type: 'bronze', max: 1, group: 'System & Usage' },
 		unlock_all: { id: 'unlock_all', title: "Gotta Unlock 'em All!", desc: 'Unlock all games by installing the License Pack.', type: 'gold', max: 1, group: 'System & Usage' },
 		avatar_premium: { id: 'avatar_premium', title: 'Premium Identity', desc: 'Equip an exclusive reward avatar.', type: 'silver', max: 1, group: 'System & Usage' },
