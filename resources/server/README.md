@@ -15,4 +15,4 @@ npm start
 
 4. Environment Variables
 ------------------------
-DATABASE_URL postgres://avnadmin:AVNS_diDjED5pOCNw3YEEGG0@pg-10640ae4-luan-cb1c.l.aivencloud.com:13289/defaultdb
+DATABASE_URL
