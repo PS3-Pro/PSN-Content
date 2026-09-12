@@ -1199,6 +1199,7 @@ let serverLog = [];
 let adminReports = [];
 let adminContentReports = [];
 let blockedStoreContent = [];
+let blockedStoreContentKeys = new Set();
 let lastKnownOnlineList = [];
 let adminStateLastRefreshAt = 0;
 let adminStateRefreshInFlight = null;
@@ -3774,22 +3775,13 @@ function getPublicBlockedStoreContent() {
 
 function isStoreContentBlockedByKey(reportKey) {
   const key = normalizeText(reportKey, '');
-  return !!key && (Array.isArray(blockedStoreContent) ? blockedStoreContent : []).some(item => item && item.reportKey === key);
+  return !!key && blockedStoreContentKeys.has(key);
 }
 
-async function refreshContentReportsFromDb() {
-  const result = await queryDbWithRetry(
-    `SELECT id, reporter, report_key, category, title_id, content_id, content_name, region, reason, details, created_at, updated_at
-     FROM content_reports
-     ORDER BY updated_at DESC
-     LIMIT ${CONTENT_REPORT_ROWS_MAX}`,
-    [],
-    { attempts: 2, label: 'CONTENT REPORTS READ' }
-  );
-
+function buildAdminContentReportGroups(rows = []) {
   const groups = new Map();
-  for (const row of result.rows || []) {
-    const reportKey = normalizeText(row.report_key, '');
+  for (const row of (Array.isArray(rows) ? rows : [])) {
+    const reportKey = normalizeText(row && row.report_key, '');
     if (!reportKey) continue;
     let group = groups.get(reportKey);
     if (!group) {
@@ -3815,11 +3807,41 @@ async function refreshContentReportsFromDb() {
       time: row.updated_at ? new Date(row.updated_at).toISOString() : (row.created_at ? new Date(row.created_at).toISOString() : new Date().toISOString())
     });
   }
+  return Array.from(groups.values())
+    .sort((a, b) => new Date(b.updatedAt || 0).getTime() - new Date(a.updatedAt || 0).getTime());
+}
 
-  adminContentReports = Array.from(groups.values())
+async function refreshContentReportsFromDb() {
+  const result = await queryDbWithRetry(
+    `SELECT id, reporter, report_key, category, title_id, content_id, content_name, region, reason, details, created_at, updated_at
+     FROM content_reports
+     ORDER BY updated_at DESC
+     LIMIT ${CONTENT_REPORT_ROWS_MAX}`,
+    [],
+    { attempts: 2, label: 'CONTENT REPORTS READ' }
+  );
+  adminContentReports = buildAdminContentReportGroups(result.rows).slice(0, ADMIN_CONTENT_REPORTS_HISTORY_MAX);
+  return adminContentReports;
+}
+
+async function refreshContentReportGroupFromDb(rawReportKey) {
+  const reportKey = normalizeText(rawReportKey, '');
+  if (!reportKey) return null;
+  const result = await queryDbWithRetry(
+    `SELECT id, reporter, report_key, category, title_id, content_id, content_name, region, reason, details, created_at, updated_at
+     FROM content_reports
+     WHERE report_key = $1
+     ORDER BY updated_at DESC`,
+    [reportKey],
+    { attempts: 2, label: 'CONTENT REPORT GROUP READ' }
+  );
+  const group = buildAdminContentReportGroups(result.rows)[0] || null;
+  const next = (Array.isArray(adminContentReports) ? adminContentReports : []).filter(item => item && item.reportKey !== reportKey);
+  if (group) next.push(group);
+  adminContentReports = next
     .sort((a, b) => new Date(b.updatedAt || 0).getTime() - new Date(a.updatedAt || 0).getTime())
     .slice(0, ADMIN_CONTENT_REPORTS_HISTORY_MAX);
-  return adminContentReports;
+  return group;
 }
 
 async function refreshBlockedStoreContentFromDb() {
@@ -3841,6 +3863,7 @@ async function refreshBlockedStoreContentFromDb() {
     blockedBy: normalizeText(row.blocked_by, 'Admin'),
     time: row.created_at ? new Date(row.created_at).toISOString() : new Date().toISOString()
   })).filter(item => item.reportKey);
+  blockedStoreContentKeys = new Set(blockedStoreContent.map(item => item.reportKey));
   return blockedStoreContent;
 }
 
@@ -3907,14 +3930,17 @@ async function emitContentReportsMineToUsers(rawReporters = []) {
 }
 
 async function publishContentReportsChanged(options = {}) {
-  await refreshContentReportsFromDb();
-  emitToAdmins('content_reports_list', adminContentReports);
-
   const reporter = normalizeText(options.reporter, '');
   const clearedReportKey = normalizeText(options.clearedReportKey, '');
+  const reportKey = normalizeText(options.reportKey || clearedReportKey, '');
+  if (reportKey) await refreshContentReportGroupFromDb(reportKey);
+  else await refreshContentReportsFromDb();
+  emitToAdmins('content_reports_list', adminContentReports);
+
   deferServerTask('CONTENT REPORTS NOTIFY', () => notifyAdminStateAcrossInstances(ADMIN_STATE_KEYS.contentReports, {
     changedAt: Date.now(),
     reporter,
+    reportKey,
     clearedReportKey
   }), 0);
 
@@ -6312,8 +6338,6 @@ async function emitAdminState(socket) {
     });
     socket.emit('admin_chat_controls_state', adminState.chatControls);
     socket.emit('reports_list', adminReports);
-    socket.emit('content_reports_list', adminContentReports);
-    socket.emit('content_blocks_list', blockedStoreContent);
     socket.emit('admin_log_limits', getAdminLogLimits());
     socket.emit('admin_server_log_list', serverLog);
   }
@@ -6941,7 +6965,9 @@ async function initProfileSyncNotifications() {
         }
         if (key === ADMIN_STATE_KEYS.contentReports) {
           const previousSignature = JSON.stringify(Array.isArray(adminContentReports) ? adminContentReports : []);
-          await refreshContentReportsFromDb();
+          const changedReportKey = normalizeText(data && data.state && (data.state.reportKey || data.state.clearedReportKey), '');
+          if (changedReportKey) await refreshContentReportGroupFromDb(changedReportKey);
+          else await refreshContentReportsFromDb();
           const nextSignature = JSON.stringify(Array.isArray(adminContentReports) ? adminContentReports : []);
           if (previousSignature !== nextSignature) emitToAdmins('content_reports_list', adminContentReports);
           const reporter = normalizeText(data && data.state && data.state.reporter, '');
@@ -11329,25 +11355,20 @@ io.on('connection', (socket) => {
       if (reason === 'other' && !details) return respond({ success: false, message: 'Describe the problem before sending the report.' });
       if (isStoreContentBlockedByKey(identity.reportKey)) return respond({ success: false, blocked: true, message: 'This content is already blocked from the Store.' });
 
-      const existing = await queryDbWithRetry(
-        'SELECT id FROM content_reports WHERE reporter = $1 AND report_key = $2 LIMIT 1',
+      const reportState = await queryDbWithRetry(
+        `SELECT
+           (SELECT id FROM content_reports WHERE reporter = $1 AND report_key = $2 LIMIT 1) AS existing_id,
+           (SELECT COUNT(*)::int FROM content_reports WHERE reporter = $1) AS report_count`,
         [reporter, identity.reportKey],
-        { attempts: 2, label: 'CONTENT REPORT EXISTS' }
+        { attempts: 2, label: 'CONTENT REPORT STATE' }
       );
-      if (!existing.rows.length) {
-        const countRes = await queryDbWithRetry(
-          'SELECT COUNT(*)::int AS count FROM content_reports WHERE reporter = $1',
-          [reporter],
-          { attempts: 2, label: 'CONTENT REPORT USER COUNT' }
-        );
-        if (Number(countRes.rows[0] && countRes.rows[0].count || 0) >= CONTENT_REPORTS_PER_USER_MAX) {
-          return respond({ success: false, message: `You can keep up to ${CONTENT_REPORTS_PER_USER_MAX} active Store reports.` });
-        }
+      const existingId = normalizeText(reportState.rows[0] && reportState.rows[0].existing_id, '');
+      const reportCount = Math.max(0, Number(reportState.rows[0] && reportState.rows[0].report_count || 0));
+      if (!existingId && reportCount >= CONTENT_REPORTS_PER_USER_MAX) {
+        return respond({ success: false, message: `You can keep up to ${CONTENT_REPORTS_PER_USER_MAX} active Store reports.` });
       }
 
-      const reportId = existing.rows.length
-        ? normalizeText(existing.rows[0].id, '')
-        : `content-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+      const reportId = existingId || `content-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
       const result = await queryDbWithRetry(
         `INSERT INTO content_reports (id, reporter, report_key, category, title_id, content_id, content_name, region, reason, details, created_at, updated_at)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW(),NOW())
@@ -11370,7 +11391,7 @@ io.on('connection', (socket) => {
         updatedAt: row.updated_at ? new Date(row.updated_at).toISOString() : new Date().toISOString()
       };
 
-      await publishContentReportsChanged({ reporter });
+      await publishContentReportsChanged({ reporter, reportKey: identity.reportKey });
       emitToAdmins('admin_content_report_created', {
         ...identity,
         reporter,
@@ -11378,7 +11399,7 @@ io.on('connection', (socket) => {
         details: report.details,
         time: report.updatedAt
       });
-      respond({ success: true, report, updated: existing.rows.length > 0 });
+      respond({ success: true, report, updated: !!existingId });
     } catch (err) {
       console.error('[CONTENT REPORT SUBMIT ERROR]:', err);
       respond({ success: false, message: 'Server error while saving the Store report.' });
@@ -11397,7 +11418,7 @@ io.on('connection', (socket) => {
         [reporter, identity.reportKey],
         { attempts: 3, label: 'CONTENT REPORT REMOVE' }
       );
-      await publishContentReportsChanged({ reporter });
+      await publishContentReportsChanged({ reporter, reportKey: identity.reportKey });
       respond({ success: true, removed: result.rowCount > 0 });
     } catch (err) {
       console.error('[CONTENT REPORT REMOVE ERROR]:', err);
@@ -11428,7 +11449,7 @@ io.on('connection', (socket) => {
       if (!reportKey) return respond({ success: false, message: 'Missing content report key.' });
       const group = (Array.isArray(adminContentReports) ? adminContentReports : []).find(item => item && item.reportKey === reportKey) || null;
       await queryDbWithRetry('DELETE FROM content_reports WHERE report_key = $1', [reportKey], { attempts: 3, label: 'ADMIN CONTENT REPORT RESOLVE' });
-      await publishContentReportsChanged({ clearedReportKey: reportKey });
+      await publishContentReportsChanged({ reportKey, clearedReportKey: reportKey });
       await addModerationLog('content_report_resolve', 'Resolved Store content report', { reportKey, reports: Math.max(0, Number(group && group.reportCount) || 0) }, socket.userName || 'Admin');
       respond({ success: true });
     } catch (err) {
@@ -11475,7 +11496,7 @@ io.on('connection', (socket) => {
         );
         await client.query('DELETE FROM content_reports WHERE report_key = $1', [identity.reportKey]);
       }, { advisoryLockKey: `content-block:${identity.reportKey}` });
-      await publishContentReportsChanged({ clearedReportKey: identity.reportKey });
+      await publishContentReportsChanged({ reportKey: identity.reportKey, clearedReportKey: identity.reportKey });
       await publishContentBlocksChanged();
       await addModerationLog('content_block', `Blocked ${identity.titleId || identity.contentId} from Store`, identity, socket.userName || 'Admin');
       respond({ success: true, block: blockedStoreContent.find(item => item.reportKey === identity.reportKey) || identity });
