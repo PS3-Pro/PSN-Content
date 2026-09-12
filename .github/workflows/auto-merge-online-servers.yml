@@ -1,0 +1,413 @@
+name: Auto-merge Online Server PRs
+
+on:
+  pull_request_target:
+    branches:
+      - main
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+    paths:
+      - resources/database/content/online_servers.tsv
+
+# pull_request_target is intentional here:
+# - the workflow itself always comes from the trusted base branch
+# - we DO NOT checkout or execute code from the PR
+# - the PR is inspected only through the GitHub API
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: online-server-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  validate-and-auto-merge:
+    name: Validate online server PR
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Validate PR scope and new server rows
+        id: validate
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const allowedPath = 'resources/database/content/online_servers.tsv';
+            const expectedHeader = [
+              'Server Name',
+              'Server Link',
+              'DNS',
+              'Instructions',
+              'GAME IDs'
+            ];
+
+            function fail(message) {
+              core.setFailed(message);
+              throw new Error(message);
+            }
+
+            // Never run code from the contributor's branch. Only inspect metadata/content via API.
+            const changedFiles = await github.paginate(github.rest.pulls.listFiles, {
+              owner,
+              repo,
+              pull_number: pr.number,
+              per_page: 100
+            });
+
+            const changedPaths = changedFiles.map(file => file.filename);
+
+            if (changedPaths.length !== 1 || changedPaths[0] !== allowedPath) {
+              fail(
+                `Automatic merge is restricted to exactly one file: ${allowedPath}. ` +
+                `Changed files: ${changedPaths.join(', ') || '(none)'}`
+              );
+            }
+
+            if (changedFiles[0].status === 'removed') {
+              fail(`${allowedPath} cannot be removed.`);
+            }
+
+            async function readRepoFile(fileOwner, fileRepo, ref) {
+              const response = await github.rest.repos.getContent({
+                owner: fileOwner,
+                repo: fileRepo,
+                path: allowedPath,
+                ref
+              });
+
+              const data = response.data;
+
+              if (Array.isArray(data) || !data || data.type !== 'file') {
+                fail(`Could not read ${allowedPath} as a file.`);
+              }
+
+              if (!data.content) {
+                fail(`${allowedPath} is too large or GitHub did not return its content.`);
+              }
+
+              const text = Buffer
+                .from(String(data.content).replace(/\n/g, ''), 'base64')
+                .toString('utf8');
+
+              if (Buffer.byteLength(text, 'utf8') > 512 * 1024) {
+                fail(`${allowedPath} is larger than the 512 KiB safety limit.`);
+              }
+
+              return text.replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n');
+            }
+
+            const headRepo = pr.head.repo;
+            if (!headRepo) {
+              fail('The PR source repository is no longer available.');
+            }
+
+            const baseText = await readRepoFile(owner, repo, pr.base.sha);
+            const headText = await readRepoFile(
+              headRepo.owner.login,
+              headRepo.name,
+              pr.head.sha
+            );
+
+            function parseDatabase(text, sourceName) {
+              const lines = String(text).split('\n');
+              while (lines.length && lines[lines.length - 1] === '') lines.pop();
+
+              if (!lines.length) {
+                fail(`${sourceName}: database is empty.`);
+              }
+
+              const header = lines.shift().split('\t');
+              if (
+                header.length !== expectedHeader.length ||
+                header.some((value, index) => value !== expectedHeader[index])
+              ) {
+                fail(
+                  `${sourceName}: invalid header. Expected exactly: ` +
+                  expectedHeader.join(' | ')
+                );
+              }
+
+              // Some legacy instructions contain a real newline inside the TSV field.
+              // Build a logical record until four TAB separators have been collected.
+              const records = [];
+              let buffer = [];
+              let startLine = 2;
+              let tabCount = 0;
+
+              const flush = () => {
+                if (!buffer.length) return;
+
+                const raw = buffer.join('\n');
+                const columns = raw.split('\t');
+
+                if (columns.length !== 5) {
+                  fail(
+                    `${sourceName}: logical row starting at line ${startLine} ` +
+                    `has ${columns.length} columns; expected 5.`
+                  );
+                }
+
+                records.push({
+                  startLine,
+                  raw,
+                  columns
+                });
+
+                buffer = [];
+                tabCount = 0;
+              };
+
+              for (let index = 0; index < lines.length; index++) {
+                const line = lines[index];
+
+                if (!buffer.length && line.trim() === '') continue;
+
+                if (!buffer.length) startLine = index + 2;
+
+                buffer.push(line);
+                tabCount += (line.match(/\t/g) || []).length;
+
+                if (tabCount === 4) {
+                  flush();
+                } else if (tabCount > 4) {
+                  fail(
+                    `${sourceName}: row starting at line ${startLine} contains too many TAB separators.`
+                  );
+                }
+              }
+
+              if (buffer.length) {
+                fail(`${sourceName}: incomplete TSV row starting at line ${startLine}.`);
+              }
+
+              return records;
+            }
+
+            const baseRecords = parseDatabase(baseText, 'Base branch');
+            const headRecords = parseDatabase(headText, 'PR');
+
+            // Existing records must remain byte-for-byte identical at field level.
+            // This keeps automatic merge limited to ADDING servers. Updates/removals
+            // still go through normal manual review.
+            function canonical(record) {
+              return JSON.stringify(record.columns);
+            }
+
+            const remainingBase = new Map();
+            for (const record of baseRecords) {
+              const key = canonical(record);
+              remainingBase.set(key, (remainingBase.get(key) || 0) + 1);
+            }
+
+            const addedRecords = [];
+
+            for (const record of headRecords) {
+              const key = canonical(record);
+              const count = remainingBase.get(key) || 0;
+
+              if (count > 0) {
+                if (count === 1) remainingBase.delete(key);
+                else remainingBase.set(key, count - 1);
+              } else {
+                addedRecords.push(record);
+              }
+            }
+
+            if (remainingBase.size > 0) {
+              fail(
+                'This PR changes or removes an existing online-server entry. ' +
+                'Automatic merge only accepts new rows; existing entries require manual review.'
+              );
+            }
+
+            if (addedRecords.length < 1) {
+              fail('No new online-server row was added.');
+            }
+
+            if (addedRecords.length > 10) {
+              fail('Automatic merge accepts at most 10 new server rows per PR.');
+            }
+
+            function extractHttpUrl(value) {
+              const text = String(value || '').trim();
+
+              const markdown = text.match(
+                /^\[(https?:\/\/[^\]\s]+)\]\((https?:\/\/[^)\s]+)\)$/
+              );
+
+              if (markdown) {
+                // Existing database convention normally repeats the same URL in
+                // label and target. Require that for new automatic contributions.
+                if (markdown[1] !== markdown[2]) return null;
+                return markdown[2];
+              }
+
+              if (/^https?:\/\/[^\s<>"']+$/.test(text)) {
+                return text;
+              }
+
+              return null;
+            }
+
+            function isValidHttpUrl(value) {
+              const raw = extractHttpUrl(value);
+              if (!raw) return false;
+
+              try {
+                const parsed = new URL(raw);
+                return (
+                  (parsed.protocol === 'http:' || parsed.protocol === 'https:') &&
+                  !!parsed.hostname
+                );
+              } catch {
+                return false;
+              }
+            }
+
+            function isValidIPv4(value) {
+              const text = String(value || '').trim();
+              if (!text) return true;
+
+              const parts = text.split('.');
+              if (parts.length !== 4) return false;
+
+              return parts.every(part => {
+                if (!/^\d{1,3}$/.test(part)) return false;
+                const number = Number(part);
+                return number >= 0 && number <= 255 && String(number) === String(Number(part));
+              });
+            }
+
+            function containsUnsafeMarkup(value) {
+              const text = String(value || '');
+              return (
+                /[<>]/.test(text) ||
+                /(?:javascript|data|vbscript)\s*:/i.test(text) ||
+                /on(?:error|load|click|mouseover)\s*=/i.test(text)
+              );
+            }
+
+            const seenNewRows = new Set();
+            const acceptedNames = [];
+
+            for (const record of addedRecords) {
+              const [rawName, rawLink, rawDns, rawInstructions, rawGameIds] = record.columns;
+
+              const name = rawName.trim();
+              const link = rawLink.trim();
+              const dns = rawDns.trim();
+              const instructions = rawInstructions.trim();
+              const gameIdsText = rawGameIds.trim();
+
+              if (!name || name.length > 120) {
+                fail(`Line ${record.startLine}: Server Name must be 1-120 characters.`);
+              }
+
+              if (containsUnsafeMarkup(name)) {
+                fail(`Line ${record.startLine}: Server Name contains unsafe markup.`);
+              }
+
+              if (!link || link.length > 600 || !isValidHttpUrl(link)) {
+                fail(
+                  `Line ${record.startLine}: Server Link must be a valid http/https URL ` +
+                  `or [URL](URL) Markdown link.`
+                );
+              }
+
+              if (containsUnsafeMarkup(link)) {
+                fail(`Line ${record.startLine}: Server Link contains unsafe markup.`);
+              }
+
+              if (!isValidIPv4(dns)) {
+                fail(
+                  `Line ${record.startLine}: DNS must be blank or a valid IPv4 address.`
+                );
+              }
+
+              if (!instructions || instructions.length > 12000) {
+                fail(
+                  `Line ${record.startLine}: Instructions must be present and at most 12000 characters.`
+                );
+              }
+
+              if (containsUnsafeMarkup(instructions)) {
+                fail(`Line ${record.startLine}: Instructions contain unsafe markup.`);
+              }
+
+              // Avoid control characters while still allowing newline instructions.
+              if (/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/.test(instructions)) {
+                fail(`Line ${record.startLine}: Instructions contain unsupported control characters.`);
+              }
+
+              const gameIds = gameIdsText
+                .split(',')
+                .map(value => value.trim())
+                .filter(Boolean);
+
+              if (!gameIds.length || gameIds.length > 200) {
+                fail(
+                  `Line ${record.startLine}: GAME IDs must contain 1-200 comma-separated Title IDs.`
+                );
+              }
+
+              const duplicateIds = gameIds.filter(
+                (value, index) => gameIds.indexOf(value) !== index
+              );
+
+              if (duplicateIds.length) {
+                fail(
+                  `Line ${record.startLine}: duplicate GAME IDs: ` +
+                  [...new Set(duplicateIds)].join(', ')
+                );
+              }
+
+              for (const id of gameIds) {
+                if (!/^[A-Z]{4}\d{5}$/.test(id)) {
+                  fail(
+                    `Line ${record.startLine}: invalid GAME ID "${id}". ` +
+                    `Expected 4 uppercase letters + 5 digits, e.g. BLUS12345.`
+                  );
+                }
+              }
+
+              const newRowKey = JSON.stringify([
+                name.toLowerCase(),
+                link,
+                dns,
+                instructions,
+                [...gameIds].sort()
+              ]);
+
+              if (seenNewRows.has(newRowKey)) {
+                fail(`Line ${record.startLine}: duplicate new server row in this PR.`);
+              }
+
+              seenNewRows.add(newRowKey);
+              acceptedNames.push(name);
+            }
+
+            await core.summary
+              .addHeading('Online server PR validation')
+              .addRaw(`Validated ${addedRecords.length} new server row(s).`)
+              .addEOL()
+              .addList(acceptedNames)
+              .addRaw('Existing rows were not changed or removed.')
+              .write();
+
+            core.setOutput('count', String(addedRecords.length));
+            core.setOutput('names', acceptedNames.join(', '));
+
+      - name: Enable automatic squash merge
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: |
+          echo "Validation passed for: ${{ steps.validate.outputs.names }}"
+          gh pr merge --auto --squash "$PR_URL"
