@@ -115,6 +115,7 @@ const ADMIN_CONTENT_REPORTS_HISTORY_MAX = 100;
 const CONTENT_REPORT_ROWS_MAX = 1000;
 const CONTENT_REPORTS_PER_USER_MAX = 100;
 const CONTENT_REPORT_DETAILS_MAX = 1200;
+const CONTENT_REPORT_REPORTERS_PREVIEW_MAX = 100;
 const CONTENT_BLOCKS_MAX = 1000;
 
 const pgConnectionOptions = {
@@ -139,6 +140,7 @@ if (PG_MAX_USES > 0) poolOptions.maxUses = PG_MAX_USES;
 const pool = new Pool(poolOptions);
 let profileSyncNotifyClient = null;
 let profileSyncListenReady = false;
+let profileSyncListenerHadGap = false;
 let profileSyncReconnectTimer = null;
 
 let onlineListCache = null;
@@ -1332,6 +1334,8 @@ async function initDb() {
       resolved BOOLEAN DEFAULT FALSE,
       created_at TIMESTAMPTZ DEFAULT NOW()
     );
+    CREATE INDEX IF NOT EXISTS idx_reports_resolved_created_at ON reports(resolved, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_reports_open_reporter_msg ON reports ((data->>'reporter'), (data->>'msgId')) WHERE resolved = false;
     CREATE TABLE IF NOT EXISTS content_reports (
       id TEXT PRIMARY KEY,
       reporter TEXT NOT NULL,
@@ -3706,7 +3710,11 @@ async function getUserFromDb(name) {
 }
 
 async function refreshReportsFromDb() {
-  const reportsRes = await pool.query(`SELECT data FROM reports WHERE resolved = false ORDER BY created_at DESC LIMIT ${ADMIN_REPORTS_HISTORY_MAX}`);
+  const reportsRes = await queryDbWithRetry(
+    `SELECT data FROM reports WHERE resolved = false ORDER BY created_at DESC LIMIT ${ADMIN_REPORTS_HISTORY_MAX}`,
+    [],
+    { attempts: 2, label: 'ADMIN REPORTS READ' }
+  );
   adminReports = reportsRes.rows.map(r => r.data);
   return adminReports;
 }
@@ -3821,6 +3829,7 @@ function buildAdminContentReportGroups(rows = []) {
   for (const row of (Array.isArray(rows) ? rows : [])) {
     const reportKey = normalizeText(row && row.report_key, '');
     if (!reportKey) continue;
+    const reportedTotal = Math.max(0, Number(row && row.report_total_count) || 0);
     let group = groups.get(reportKey);
     if (!group) {
       group = {
@@ -3831,19 +3840,21 @@ function buildAdminContentReportGroups(rows = []) {
         contentId: normalizeStoreContentId(row.content_id),
         name: normalizeStoreContentName(row.content_name),
         region: normalizeStoreContentRegion(row.region),
-        reportCount: 0,
+        reportCount: reportedTotal || 0,
         reporters: [],
         updatedAt: row.updated_at ? new Date(row.updated_at).toISOString() : new Date().toISOString()
       };
       groups.set(reportKey, group);
     }
-    group.reportCount += 1;
-    group.reporters.push({
-      reporter: normalizeText(row.reporter, 'Unknown'),
-      reason: normalizeContentReportReason(row.reason) || 'other',
-      details: normalizeContentReportDetails(row.details),
-      time: row.updated_at ? new Date(row.updated_at).toISOString() : (row.created_at ? new Date(row.created_at).toISOString() : new Date().toISOString())
-    });
+    if (!reportedTotal) group.reportCount += 1;
+    if (group.reporters.length < CONTENT_REPORT_REPORTERS_PREVIEW_MAX) {
+      group.reporters.push({
+        reporter: normalizeText(row.reporter, 'Unknown'),
+        reason: normalizeContentReportReason(row.reason) || 'other',
+        details: normalizeContentReportDetails(row.details),
+        time: row.updated_at ? new Date(row.updated_at).toISOString() : (row.created_at ? new Date(row.created_at).toISOString() : new Date().toISOString())
+      });
+    }
   }
   return Array.from(groups.values())
     .sort((a, b) => new Date(b.updatedAt || 0).getTime() - new Date(a.updatedAt || 0).getTime());
@@ -3866,11 +3877,13 @@ async function refreshContentReportGroupFromDb(rawReportKey) {
   const reportKey = normalizeText(rawReportKey, '');
   if (!reportKey) return null;
   const result = await queryDbWithRetry(
-    `SELECT id, reporter, report_key, category, title_id, content_id, content_name, region, reason, details, created_at, updated_at
+    `SELECT id, reporter, report_key, category, title_id, content_id, content_name, region, reason, details, created_at, updated_at,
+            COUNT(*) OVER()::int AS report_total_count
      FROM content_reports
      WHERE report_key = $1
-     ORDER BY updated_at DESC`,
-    [reportKey],
+     ORDER BY updated_at DESC
+     LIMIT $2`,
+    [reportKey, CONTENT_REPORT_REPORTERS_PREVIEW_MAX],
     { attempts: 2, label: 'CONTENT REPORT GROUP READ' }
   );
   const group = buildAdminContentReportGroups(result.rows)[0] || null;
@@ -3979,19 +3992,20 @@ async function publishContentReportsChanged(options = {}) {
   const adminNotice = options.adminNotice && typeof options.adminNotice === 'object' ? options.adminNotice : null;
   const sourceSocketId = normalizeText(options.sourceSocketId, '');
   let adminDelta = null;
+  const adminsConnected = hasAdminSockets();
 
   if (clearedReportKey) {
     adminContentReports = (Array.isArray(adminContentReports) ? adminContentReports : []).filter(item => item && item.reportKey !== clearedReportKey);
     adminDelta = { action: 'remove', reportKey: clearedReportKey };
-  } else if (reportKey && hasAdminSockets()) {
+  } else if (reportKey && adminsConnected) {
     const group = await refreshContentReportGroupFromDb(reportKey);
     adminDelta = group ? { action: 'upsert', reportKey, group } : { action: 'remove', reportKey };
-  } else if (!reportKey && hasAdminSockets()) {
+  } else if (!reportKey && adminsConnected) {
     await refreshContentReportsFromDb();
   }
 
-  if (hasAdminSockets()) {
-    if (adminDelta) emitToAdmins('content_report_admin_delta', adminNotice ? { ...adminDelta, notice: adminNotice } : adminDelta);
+  if (adminsConnected) {
+    if (adminDelta) emitToAdmins('content_report_admin_delta', adminNotice ? { ...adminDelta, notice: adminNotice, sourceSocketId } : adminDelta);
     else emitToAdmins('content_reports_list', adminContentReports);
   }
 
@@ -4001,6 +4015,7 @@ async function publishContentReportsChanged(options = {}) {
     reportKey,
     clearedReportKey,
     mineAction,
+    sourceSocketId,
     ...(mineAction === 'upsert' && mineReport ? { mineReport } : {}),
     ...(adminNotice ? { adminNotice } : {})
   };
@@ -6401,6 +6416,7 @@ async function syncChatAcrossInstances() {
 // Admin state, logs, socket indexes & profile realtime sync
 // ============================================================================
 async function emitAdminState(socket) {
+  if (socket.isAdmin === true) await refreshBlockedStoreContentFromDb();
   socket.emit('maintenance_mode', adminState.maintenance);
   socket.emit('chat_controls', adminState.chatControls);
   socket.emit('admin_pinned_announcement', adminState.pinnedAnnouncement || { clear: true });
@@ -6409,7 +6425,6 @@ async function emitAdminState(socket) {
   if (socket.isAdmin === true) {
     await refreshReportsFromDb();
     await refreshContentReportsFromDb();
-    await refreshBlockedStoreContentFromDb();
     await refreshServerLogFromDb();
     socket.emit('admin_state', {
       maintenance: adminState.maintenance,
@@ -6424,10 +6439,14 @@ async function emitAdminState(socket) {
       logLimits: getAdminLogLimits(),
       contentLimits: getClientContentLimits()
     });
-    socket.emit('admin_chat_controls_state', adminState.chatControls);
-    socket.emit('reports_list', adminReports);
-    socket.emit('admin_log_limits', getAdminLogLimits());
-    socket.emit('admin_server_log_list', serverLog);
+    // Modern clients consume the combined admin_state payload. Preserve the component
+    // events only for legacy clients that do not advertise profile-sync v2.
+    if (socket.profileSyncV2 !== true) {
+      socket.emit('admin_chat_controls_state', adminState.chatControls);
+      socket.emit('reports_list', adminReports);
+      socket.emit('admin_log_limits', getAdminLogLimits());
+      socket.emit('admin_server_log_list', serverLog);
+    }
   }
 }
 
@@ -6874,6 +6893,9 @@ async function notifyProfileSyncAcrossInstances(name, sourceSocketId = null, pro
       trophies: changes && changes.trophies === true,
       counts: changes && changes.counts === true,
       publicProfile: changes && changes.publicProfile === true,
+      deleted: changes && changes.deleted === true,
+      deleteReason: changes && changes.deleted === true ? normalizeText(changes.deleteReason, '').slice(0, 500) : '',
+      deletedBy: changes && changes.deleted === true ? normalizeText(changes.deletedBy, '').slice(0, 120) : '',
       keys: Array.isArray(changes && changes.keys) ? [...new Set(changes.keys.filter(key => PROFILE_SYNC_PATCH_KEYS.has(key)))] : []
     }
   };
@@ -6902,6 +6924,22 @@ async function notifyServerLogAcrossInstances(entry) {
     await pool.query('SELECT pg_notify($1, $2)', ['server_log_sync', JSON.stringify(payload)]);
   } catch (err) {
     console.error('[SERVER LOG NOTIFY ERROR]:', err);
+  }
+}
+
+async function recoverModerationSyncAfterListenGap() {
+  try {
+    await refreshBlockedStoreContentFromDb();
+    io.emit('content_blocks_state', getPublicBlockedStoreContent());
+
+    if (hasAdminSockets()) {
+      await Promise.all([refreshReportsFromDb(), refreshContentReportsFromDb()]);
+      emitToAdmins('reports_list', adminReports);
+      emitToAdmins('content_reports_list', adminContentReports);
+      emitToAdmins('content_blocks_list', blockedStoreContent);
+    }
+  } catch (err) {
+    console.error('[MODERATION SYNC RECOVERY ERROR]:', err && err.message ? err.message : err);
   }
 }
 
@@ -7062,7 +7100,7 @@ async function initProfileSyncNotifications() {
             } else if (changedReportKey) {
               const group = await refreshContentReportGroupFromDb(changedReportKey);
               const adminDelta = group ? { action: 'upsert', reportKey: changedReportKey, group } : { action: 'remove', reportKey: changedReportKey };
-              emitToAdmins('content_report_admin_delta', state.adminNotice ? { ...adminDelta, notice: state.adminNotice } : adminDelta);
+              emitToAdmins('content_report_admin_delta', state.adminNotice ? { ...adminDelta, notice: state.adminNotice, sourceSocketId: normalizeText(state.sourceSocketId, '') } : adminDelta);
             } else {
               await refreshContentReportsFromDb();
               emitToAdmins('content_reports_list', adminContentReports);
@@ -7160,8 +7198,18 @@ async function initProfileSyncNotifications() {
 
       const refreshedUser = await refreshSingleUserSummaryFromDb(name, { invalidateOnlineList: false });
       if (!refreshedUser) {
-        invalidateOnlineListCache("profile-sync-listen-missing");
-        deferServerTask('PROFILE LISTEN ONLINE LIST', () => emitOnlineList(), 1000);
+        if (data.changes && data.changes.deleted === true) {
+          clearDeletedUserRuntimeState(name);
+          disconnectUserSessions(name, 'account_deleted', {
+            reason: normalizeText(data.changes.deleteReason, '') || 'Account deleted by administrator.',
+            by: normalizeText(data.changes.deletedBy, '') || 'Admin'
+          });
+          invalidateOnlineListCache('account-deleted-profile-sync');
+          deferServerTask('ACCOUNT DELETE ONLINE LIST', () => emitOnlineList(), 0);
+        } else {
+          invalidateOnlineListCache("profile-sync-listen-missing");
+          deferServerTask('PROFILE LISTEN ONLINE LIST', () => emitOnlineList(), 1000);
+        }
         return;
       }
 
@@ -7216,6 +7264,7 @@ async function initProfileSyncNotifications() {
 
   client.on('error', (err) => {
     console.error('[PROFILE LISTEN CONNECTION ERROR]:', err && err.message ? err.message : err);
+    profileSyncListenerHadGap = true;
     profileSyncListenReady = false;
     if (profileSyncNotifyClient === client) profileSyncNotifyClient = null;
     client.end().catch(() => {});
@@ -7223,6 +7272,7 @@ async function initProfileSyncNotifications() {
   });
 
   client.on('end', () => {
+    profileSyncListenerHadGap = true;
     profileSyncListenReady = false;
     if (profileSyncNotifyClient === client) profileSyncNotifyClient = null;
     scheduleProfileSyncReconnect(5000);
@@ -7240,7 +7290,10 @@ async function initProfileSyncNotifications() {
     await client.query('LISTEN game_players_sync');
     await client.query('LISTEN content_download_counts_sync');
     await client.query('LISTEN chat_sync_notify');
+    const shouldRecoverModerationSync = profileSyncListenerHadGap;
+    profileSyncListenerHadGap = false;
     profileSyncListenReady = true;
+    if (shouldRecoverModerationSync) deferServerTask('MODERATION LISTEN RECOVERY', recoverModerationSyncAfterListenGap, 0);
     console.log('[PROFILE SYNC] Postgres LISTEN enabled.');
     console.log('[PRESENCE SYNC] Postgres LISTEN enabled.');
     console.log('[PS3 PLAYTIME SYNC] Postgres LISTEN enabled.');
@@ -7252,6 +7305,7 @@ async function initProfileSyncNotifications() {
     console.log('[CONTENT DOWNLOAD COUNTS] Postgres LISTEN enabled.');
     console.log('[CHAT SYNC] Postgres LISTEN wakeups enabled.');
   } catch (err) {
+    profileSyncListenerHadGap = true;
     profileSyncListenReady = false;
     if (profileSyncNotifyClient === client) profileSyncNotifyClient = null;
     console.error('[PROFILE LISTEN INIT ERROR]:', err && err.message ? err.message : err);
@@ -8403,9 +8457,10 @@ function getPs3FriendActivityTransitions(previousStatus, currentStatus) {
 
 function disconnectUserSessions(name, eventName = 'user_kicked', payload = {}) {
   const isPasswordResetDisconnect = eventName === 'password_reset_by_admin';
+  const revokePrivileges = isPasswordResetDisconnect || eventName === 'account_deleted';
   getSocketsByUserName(name).forEach(client => {
-    if (isPasswordResetDisconnect) {
-      client.__passwordResetRevoked = true;
+    if (revokePrivileges) {
+      if (isPasswordResetDisconnect) client.__passwordResetRevoked = true;
       setSocketAdminState(client, false);
       client.isModerator = false;
     }
@@ -8414,6 +8469,23 @@ function disconnectUserSessions(name, eventName = 'user_kicked', payload = {}) {
       if (client.connected) client.disconnect(true);
     }, isPasswordResetDisconnect ? 120 : 1200);
   });
+}
+
+function clearDeletedUserRuntimeState(name) {
+  const safeName = normalizeText(name, '');
+  if (!safeName) return false;
+  const hadCachedUser = Object.prototype.hasOwnProperty.call(userDatabase, safeName);
+  cancelFriendActivityOffline(safeName);
+  delete userDatabase[safeName];
+  if (hadCachedUser) markUserNameIndexDirty();
+  delete userCacheMeta[safeName];
+  fullUserCacheNames.delete(safeName);
+  userProfileWriteInFlight.delete(safeName);
+  lastProfileCountsSignatureByUser.delete(safeName);
+  lastPublicProfileSignatureByUser.delete(safeName);
+  clearGamePlayersSummaryCache();
+  invalidateOnlineListCache('account-deleted-runtime');
+  return hadCachedUser;
 }
 
 const pendingFriendOfflineTimers = new Map();
@@ -8910,66 +8982,80 @@ async function deleteUserAccount(targetName, reason, adminName) {
 
   const deletedAt = new Date().toISOString();
   const deleteReason = normalizeText(reason, "Account deleted by administrator.") || "Account deleted by administrator.";
+  const deletedBy = adminName || "Admin";
   const deletedData = {
     name: targetName,
     reason: deleteReason,
-    deletedBy: adminName || "Admin",
+    deletedBy,
     deletedAt,
     presenceRevision: Math.max(0, Number(userDatabase[targetName] && userDatabase[targetName].presenceRevision) || 0)
   };
 
-  await pool.query(
-    'INSERT INTO deleted_accounts (name, data, deleted_at) VALUES ($1, $2, NOW()) ON CONFLICT (name) DO UPDATE SET data = $2, deleted_at = NOW()',
-    [targetName, deletedData]
-  );
-  // Account deletion bypasses the normal disconnect presence cleanup after userDatabase is removed.
-  // Cancel any grace-period offline event and remove every persisted session explicitly.
-  cancelFriendActivityOffline(targetName);
-  await pool.query('DELETE FROM presence_sessions WHERE name = $1', [targetName]);
-  await pool.query('DELETE FROM users WHERE name = $1', [targetName]);
-  await pool.query('DELETE FROM friend_activity_read_state WHERE user_name = $1', [targetName]);
-  await pool.query('DELETE FROM friend_activity_dismissed WHERE user_name = $1', [targetName]);
-  await pool.query('DELETE FROM friend_activity WHERE actor_name = $1', [targetName]);
-  await pool.query('DELETE FROM user_notification_read_state WHERE user_name = $1', [targetName]);
-  await pool.query('DELETE FROM user_notifications WHERE user_name = $1', [targetName]);
-  await pool.query('DELETE FROM user_catalog_notification_seen WHERE user_name = $1', [targetName]);
-  const deletedContentReports = await pool.query('DELETE FROM content_reports WHERE reporter = $1', [targetName]);
-  if (deletedContentReports.rowCount > 0) await publishContentReportsChanged();
-  await notifyProfileSyncAcrossInstances(targetName, null, Date.now());
+  const dbDelete = await runDbTransactionWithRetry('DELETE USER ACCOUNT', async client => {
+    const existingUser = await client.query('SELECT name FROM users WHERE name = $1 FOR UPDATE', [targetName]);
+    if (!existingUser.rows.length) return { missing: true, deletedReportCount: 0 };
 
-  delete userDatabase[targetName];
-  markUserNameIndexDirty();
-  delete userCacheMeta[targetName];
-  fullUserCacheNames.delete(targetName);
-  lastProfileCountsSignatureByUser.delete(targetName);
-  lastPublicProfileSignatureByUser.delete(targetName);
-  clearGamePlayersSummaryCache();
-  disconnectUserSessions(targetName, 'account_deleted', { reason: deleteReason, by: adminName || 'Admin' });
+    await client.query(
+      'INSERT INTO deleted_accounts (name, data, deleted_at) VALUES ($1, $2, NOW()) ON CONFLICT (name) DO UPDATE SET data = $2, deleted_at = NOW()',
+      [targetName, deletedData]
+    );
+
+    // Account deletion bypasses normal disconnect cleanup. Keep all account-owned DB
+    // removals in the same transaction so a transient failure cannot leave half a deletion.
+    const deletedContentReports = await client.query('DELETE FROM content_reports WHERE reporter = $1 RETURNING report_key', [targetName]);
+    await client.query('DELETE FROM presence_sessions WHERE name = $1', [targetName]);
+    await client.query('DELETE FROM users WHERE name = $1', [targetName]);
+    await client.query('DELETE FROM friend_activity_read_state WHERE user_name = $1', [targetName]);
+    await client.query('DELETE FROM friend_activity_dismissed WHERE user_name = $1', [targetName]);
+    await client.query('DELETE FROM friend_activity WHERE actor_name = $1', [targetName]);
+    await client.query('DELETE FROM user_notification_read_state WHERE user_name = $1', [targetName]);
+    await client.query('DELETE FROM user_notifications WHERE user_name = $1', [targetName]);
+    await client.query('DELETE FROM user_catalog_notification_seen WHERE user_name = $1', [targetName]);
+
+    return { missing: false, deletedReportCount: Math.max(0, Number(deletedContentReports.rowCount) || 0) };
+  }, { advisoryLockKey: `content-report-user:${targetName.toLowerCase()}` });
+
+  if (dbDelete && dbDelete.missing) return { success: false, message: "User not found." };
+  if (dbDelete && dbDelete.deletedReportCount > 0) await publishContentReportsChanged();
+
+  // Tell every server instance explicitly that this profile was deleted. Remote instances
+  // must revoke any surviving admin/mod session immediately instead of merely dropping cache.
+  await notifyProfileSyncAcrossInstances(targetName, null, Date.now(), {
+    deleted: true,
+    deleteReason,
+    deletedBy
+  });
+
+  clearDeletedUserRuntimeState(targetName);
+  disconnectUserSessions(targetName, 'account_deleted', { reason: deleteReason, by: deletedBy });
   await emitOnlineList();
 
   return { success: true, targetName, reason: deleteReason };
 }
 
 async function createReport(data = {}, reporterName = "Unknown") {
+  const now = new Date();
   const report = {
-    id: normalizeText(data.id, `report-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`),
-    reporter: normalizeText(data.reporter, reporterName),
-    targetUser: normalizeText(data.targetUser || data.user, ""),
-    msgId: data.msgId || null,
-    reason: normalizeText(data.reason, "No reason provided."),
-    messageText: normalizeText(data.messageText || data.text, ""),
-    time: data.time || new Date().toISOString(),
+    id: `report-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    reporter: normalizeText(reporterName, "Unknown").slice(0, 80),
+    targetUser: normalizeText(data.targetUser || data.user, "").replace(/[\r\n\t]+/g, ' ').slice(0, 80),
+    msgId: normalizeText(data.msgId, '').replace(/[\r\n\t]+/g, '').slice(0, 128) || null,
+    reason: normalizeText(data.reason, "No reason provided.").replace(/[\r\n\t]+/g, ' ').slice(0, 1000) || "No reason provided.",
+    messageText: normalizeText(data.messageText || data.text, "").replace(/[\r\n\t]+/g, ' ').slice(0, 320),
+    time: now.toISOString(),
     status: "open"
   };
 
-  adminReports.unshift(report);
-  adminReports = adminReports.slice(0, ADMIN_REPORTS_HISTORY_MAX);
-
-  await pool.query(
-    'INSERT INTO reports (id, data, resolved) VALUES ($1, $2, false) ON CONFLICT (id) DO UPDATE SET data = $2, resolved = false',
-    [report.id, report]
+  await queryDbWithRetry(
+    'INSERT INTO reports (id, data, resolved) VALUES ($1, $2, false)',
+    [report.id, report],
+    { attempts: 3, label: 'MESSAGE REPORT CREATE' }
   );
 
+  // Only publish/cache after PostgreSQL accepted the report so admins never see a ghost
+  // item that disappears on the next refresh after a failed write.
+  adminReports.unshift(report);
+  adminReports = adminReports.slice(0, ADMIN_REPORTS_HISTORY_MAX);
   emitToAdmins('admin_report_created', report);
   deferServerTask('ADMIN REPORTS NOTIFY', () => notifyAdminStateAcrossInstances(ADMIN_STATE_KEYS.reports, { changedAt: Date.now() }), 0);
   return report;
@@ -11453,6 +11539,9 @@ io.on('connection', (socket) => {
   socket.on('content_report_submit', async (data, callback) => {
     const respond = typeof callback === 'function' ? callback : () => {};
     try {
+      const now = Date.now();
+      if (now - Number(socket.__lastContentReportMutationAt || 0) < 600) return respond({ success: false, rateLimited: true, message: 'Please wait a moment before changing another Store report.' });
+      socket.__lastContentReportMutationAt = now;
       const reporter = normalizeText(socket.userName, '');
       if (!reporter || !userDatabase[reporter]) return respond({ success: false, authenticated: false, message: 'Sign in before reporting content.' });
 
@@ -11464,34 +11553,74 @@ io.on('connection', (socket) => {
       if (reason === 'other' && !details) return respond({ success: false, message: 'Describe the problem before sending the report.' });
       if (isStoreContentBlockedByKey(identity.reportKey)) return respond({ success: false, blocked: true, message: 'This content is already blocked from the Store.' });
 
-      const reportState = await queryDbWithRetry(
-        `SELECT
-           MAX(CASE WHEN report_key = $2 THEN id ELSE NULL END) AS existing_id,
-           COUNT(*)::int AS report_count
-         FROM content_reports
-         WHERE reporter = $1`,
-        [reporter, identity.reportKey],
-        { attempts: 2, label: 'CONTENT REPORT STATE' }
-      );
-      const existingId = normalizeText(reportState.rows[0] && reportState.rows[0].existing_id, '');
-      const reportCount = Math.max(0, Number(reportState.rows[0] && reportState.rows[0].report_count || 0));
-      if (!existingId && reportCount >= CONTENT_REPORTS_PER_USER_MAX) {
-        return respond({ success: false, message: `You can keep up to ${CONTENT_REPORTS_PER_USER_MAX} active Store reports.` });
-      }
+      const saveResult = await runDbTransactionWithRetry('CONTENT REPORT UPSERT', async client => {
+        // Serialize the user's quota/account state, then serialize this content key with admin block/resolve.
+        // Rechecking the account inside the lock prevents an in-flight submit from surviving account deletion.
+        const accountResult = await client.query('SELECT 1 FROM users WHERE name = $1 LIMIT 1', [reporter]);
+        if (!accountResult.rows.length) return { accountMissing: true };
+        await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`content-report-key:${identity.reportKey}`]);
 
-      const reportId = existingId || `content-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
-      const result = await queryDbWithRetry(
-        `INSERT INTO content_reports (id, reporter, report_key, category, title_id, content_id, content_name, region, reason, details, created_at, updated_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW(),NOW())
-         ON CONFLICT (reporter, report_key)
-         DO UPDATE SET category = EXCLUDED.category, title_id = EXCLUDED.title_id, content_id = EXCLUDED.content_id,
-                       content_name = EXCLUDED.content_name, region = EXCLUDED.region, reason = EXCLUDED.reason,
-                       details = EXCLUDED.details, updated_at = NOW()
-         RETURNING report_key, category, title_id, content_id, reason, details, updated_at`,
-        [reportId, reporter, identity.reportKey, identity.category, identity.titleId, identity.contentId, identity.name, identity.region, reason, reason === 'other' ? details : ''],
-        { attempts: 3, label: 'CONTENT REPORT UPSERT' }
-      );
-      const row = result.rows[0] || {};
+        const blockedResult = await client.query('SELECT 1 FROM content_blocks WHERE report_key = $1 LIMIT 1', [identity.reportKey]);
+        if (blockedResult.rows.length) return { blocked: true };
+
+        const reportState = await client.query(
+          `SELECT
+             MAX(id) FILTER (WHERE report_key = $2) AS existing_id,
+             MAX(reason) FILTER (WHERE report_key = $2) AS existing_reason,
+             MAX(details) FILTER (WHERE report_key = $2) AS existing_details,
+             MAX(content_name) FILTER (WHERE report_key = $2) AS existing_name,
+             MAX(region) FILTER (WHERE report_key = $2) AS existing_region,
+             MAX(updated_at) FILTER (WHERE report_key = $2) AS existing_updated_at,
+             COUNT(*)::int AS report_count
+           FROM content_reports
+           WHERE reporter = $1`,
+          [reporter, identity.reportKey]
+        );
+        const stateRow = reportState.rows[0] || {};
+        const existingId = normalizeText(stateRow.existing_id, '');
+        const reportCount = Math.max(0, Number(stateRow.report_count || 0));
+        if (!existingId && reportCount >= CONTENT_REPORTS_PER_USER_MAX) return { limitReached: true };
+
+        const normalizedDetails = reason === 'other' ? details : '';
+        if (existingId
+          && normalizeContentReportReason(stateRow.existing_reason) === reason
+          && normalizeContentReportDetails(stateRow.existing_details) === normalizedDetails
+          && normalizeStoreContentName(stateRow.existing_name) === identity.name
+          && normalizeStoreContentRegion(stateRow.existing_region) === identity.region) {
+          return {
+            existingId,
+            unchanged: true,
+            row: {
+              report_key: identity.reportKey,
+              category: identity.category,
+              title_id: identity.titleId,
+              content_id: identity.contentId,
+              reason,
+              details: normalizedDetails,
+              updated_at: stateRow.existing_updated_at || new Date()
+            }
+          };
+        }
+
+        const reportId = existingId || `content-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+        const result = await client.query(
+          `INSERT INTO content_reports (id, reporter, report_key, category, title_id, content_id, content_name, region, reason, details, created_at, updated_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW(),NOW())
+           ON CONFLICT (reporter, report_key)
+           DO UPDATE SET category = EXCLUDED.category, title_id = EXCLUDED.title_id, content_id = EXCLUDED.content_id,
+                         content_name = EXCLUDED.content_name, region = EXCLUDED.region, reason = EXCLUDED.reason,
+                         details = EXCLUDED.details, updated_at = NOW()
+           RETURNING report_key, category, title_id, content_id, reason, details, updated_at`,
+          [reportId, reporter, identity.reportKey, identity.category, identity.titleId, identity.contentId, identity.name, identity.region, reason, normalizedDetails]
+        );
+        return { existingId, row: result.rows[0] || {} };
+      }, { advisoryLockKey: `content-report-user:${reporter.toLowerCase()}` });
+
+      if (saveResult && saveResult.accountMissing) return respond({ success: false, authenticated: false, message: 'Your account is no longer available.' });
+      if (saveResult && saveResult.blocked) return respond({ success: false, blocked: true, message: 'This content is already blocked from the Store.' });
+      if (saveResult && saveResult.limitReached) return respond({ success: false, message: `You can keep up to ${CONTENT_REPORTS_PER_USER_MAX} active Store reports.` });
+      const existingId = normalizeText(saveResult && saveResult.existingId, '');
+      const row = saveResult && saveResult.row || {};
       const report = {
         reportKey: normalizeText(row.report_key, identity.reportKey),
         category: normalizeStoreContentCategory(row.category || identity.category),
@@ -11502,15 +11631,17 @@ io.on('connection', (socket) => {
         updatedAt: row.updated_at ? new Date(row.updated_at).toISOString() : new Date().toISOString()
       };
 
-      await publishContentReportsChanged({
-        reporter,
-        reportKey: identity.reportKey,
-        mineAction: 'upsert',
-        mineReport: report,
-        adminNotice: { ...identity, reporter, reason: report.reason, details: report.details, time: report.updatedAt },
-        sourceSocketId: socket.id
-      });
-      respond({ success: true, report, updated: !!existingId });
+      if (!(saveResult && saveResult.unchanged)) {
+        await publishContentReportsChanged({
+          reporter,
+          reportKey: identity.reportKey,
+          mineAction: 'upsert',
+          mineReport: report,
+          adminNotice: { ...identity, reporter, reason: report.reason, details: report.details, time: report.updatedAt, updated: !!existingId },
+          sourceSocketId: socket.id
+        });
+      }
+      respond({ success: true, report, updated: !!existingId, unchanged: !!(saveResult && saveResult.unchanged) });
     } catch (err) {
       console.error('[CONTENT REPORT SUBMIT ERROR]:', err);
       respond({ success: false, message: 'Server error while saving the Store report.' });
@@ -11520,17 +11651,20 @@ io.on('connection', (socket) => {
   socket.on('content_report_remove', async (data, callback) => {
     const respond = typeof callback === 'function' ? callback : () => {};
     try {
+      const now = Date.now();
+      if (now - Number(socket.__lastContentReportMutationAt || 0) < 600) return respond({ success: false, rateLimited: true, message: 'Please wait a moment before changing another Store report.' });
+      socket.__lastContentReportMutationAt = now;
       const reporter = normalizeText(socket.userName, '');
       if (!reporter || !userDatabase[reporter]) return respond({ success: false, authenticated: false });
       const identity = normalizeStoreContentIdentity(data || {});
       if (!identity.reportKey) return respond({ success: false, message: 'Invalid content.' });
-      const result = await queryDbWithRetry(
-        'DELETE FROM content_reports WHERE reporter = $1 AND report_key = $2 RETURNING id',
-        [reporter, identity.reportKey],
-        { attempts: 3, label: 'CONTENT REPORT REMOVE' }
-      );
-      await publishContentReportsChanged({ reporter, reportKey: identity.reportKey, mineAction: 'remove', sourceSocketId: socket.id });
-      respond({ success: true, removed: result.rowCount > 0 });
+      const result = await runDbTransactionWithRetry('CONTENT REPORT REMOVE', async client => {
+        await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`content-report-key:${identity.reportKey}`]);
+        return client.query('DELETE FROM content_reports WHERE reporter = $1 AND report_key = $2 RETURNING id', [reporter, identity.reportKey]);
+      }, { advisoryLockKey: `content-report-user:${reporter.toLowerCase()}` });
+      const removed = result.rowCount > 0;
+      if (removed) await publishContentReportsChanged({ reporter, reportKey: identity.reportKey, mineAction: 'remove', sourceSocketId: socket.id });
+      respond({ success: true, removed });
     } catch (err) {
       console.error('[CONTENT REPORT REMOVE ERROR]:', err);
       respond({ success: false, message: 'Server error while removing the Store report.' });
@@ -11561,10 +11695,14 @@ io.on('connection', (socket) => {
       const reportKey = normalizeText(data && data.reportKey, '');
       if (!reportKey) return respond({ success: false, message: 'Missing content report key.' });
       const group = (Array.isArray(adminContentReports) ? adminContentReports : []).find(item => item && item.reportKey === reportKey) || null;
-      await queryDbWithRetry('DELETE FROM content_reports WHERE report_key = $1', [reportKey], { attempts: 3, label: 'ADMIN CONTENT REPORT RESOLVE' });
+      const result = await runDbTransactionWithRetry('ADMIN CONTENT REPORT RESOLVE', async client => {
+        return client.query('DELETE FROM content_reports WHERE report_key = $1 RETURNING id', [reportKey]);
+      }, { advisoryLockKey: `content-report-key:${reportKey}` });
+      const removedCount = Math.max(0, Number(result && result.rowCount) || 0);
+      if (!removedCount && !group) return respond({ success: true, unchanged: true });
       await publishContentReportsChanged({ reportKey, clearedReportKey: reportKey });
-      await addModerationLog('content_report_resolve', 'Resolved Store content report', { reportKey, reports: Math.max(0, Number(group && group.reportCount) || 0) }, socket.userName || 'Admin');
-      respond({ success: true });
+      if (removedCount) await addModerationLog('content_report_resolve', 'Resolved Store content report', { reportKey, reports: Math.max(removedCount, Number(group && group.reportCount) || 0) }, socket.userName || 'Admin');
+      respond({ success: true, resolved: removedCount > 0 });
     } catch (err) {
       console.error('[ADMIN CONTENT REPORT RESOLVE ERROR]:', err);
       respond({ success: false, message: 'Could not resolve the Store report.' });
@@ -11577,6 +11715,8 @@ io.on('connection', (socket) => {
       if (socket.isAdmin !== true) return respond({ success: false, message: 'Admin only.' });
       const requestedKey = normalizeText(data && data.reportKey, '');
       if (!requestedKey) return respond({ success: false, message: 'Missing content key.' });
+      const alreadyBlocked = blockedStoreContentByKey.get(requestedKey) || null;
+      if (alreadyBlocked) return respond({ success: true, unchanged: true, block: alreadyBlocked });
       let group = (Array.isArray(adminContentReports) ? adminContentReports : []).find(item => item && item.reportKey === requestedKey) || null;
       if (!group) {
         const source = await queryDbWithRetry(
@@ -11608,7 +11748,7 @@ io.on('connection', (socket) => {
           [identity.reportKey, identity.category, identity.titleId, identity.contentId, identity.name, identity.region, socket.userName || 'Admin']
         );
         await client.query('DELETE FROM content_reports WHERE report_key = $1', [identity.reportKey]);
-      }, { advisoryLockKey: `content-block:${identity.reportKey}` });
+      }, { advisoryLockKey: `content-report-key:${identity.reportKey}` });
       await publishContentReportsChanged({ reportKey: identity.reportKey, clearedReportKey: identity.reportKey });
       const blockedEntry = { ...identity, blockedBy: socket.userName || 'Admin', time: new Date().toISOString() };
       await publishContentBlocksChanged({ upsertBlock: blockedEntry });
@@ -11627,20 +11767,30 @@ io.on('connection', (socket) => {
       const reportKey = normalizeText(data && data.reportKey, '');
       if (!reportKey) return respond({ success: false, message: 'Missing content key.' });
       const previous = blockedStoreContentByKey.get(reportKey) || null;
-      await queryDbWithRetry('DELETE FROM content_blocks WHERE report_key = $1', [reportKey], { attempts: 3, label: 'ADMIN CONTENT UNBLOCK' });
+      const result = await runDbTransactionWithRetry('ADMIN CONTENT UNBLOCK', async client => {
+        return client.query('DELETE FROM content_blocks WHERE report_key = $1 RETURNING report_key', [reportKey]);
+      }, { advisoryLockKey: `content-report-key:${reportKey}` });
+      const removed = Number(result.rowCount) > 0;
+      if (!removed && !previous) return respond({ success: true, unchanged: true });
       await publishContentBlocksChanged({ removeReportKey: reportKey });
-      await addModerationLog('content_unblock', `Unblocked ${previous && (previous.titleId || previous.contentId) || reportKey} from Store`, previous || { reportKey }, socket.userName || 'Admin');
-      respond({ success: true });
+      if (removed) await addModerationLog('content_unblock', `Unblocked ${previous && (previous.titleId || previous.contentId) || reportKey} from Store`, previous || { reportKey }, socket.userName || 'Admin');
+      respond({ success: true, unblocked: removed });
     } catch (err) {
       console.error('[ADMIN CONTENT UNBLOCK ERROR]:', err);
       respond({ success: false, message: 'Could not unblock this Store content.' });
     }
   });
 
-  socket.on('admin_request_reports', async () => {
-    if (socket.isAdmin === true) {
+  socket.on('admin_request_reports', async (data, callback) => {
+    const respond = typeof callback === 'function' ? callback : () => {};
+    try {
+      if (socket.isAdmin !== true) return respond({ success: false, message: 'Admin only.', reports: [] });
       await refreshReportsFromDb();
-      socket.emit('reports_list', adminReports);
+      if (!(data && data.callbackOnly === true)) socket.emit('reports_list', adminReports);
+      respond({ success: true, reports: adminReports });
+    } catch (err) {
+      console.error('[ADMIN REPORTS REQUEST ERROR]:', err);
+      respond({ success: false, message: 'Could not load pending reports.' });
     }
   });
 
@@ -11649,12 +11799,20 @@ io.on('connection', (socket) => {
     try {
       if (socket.isAdmin !== true) return respond({ success: false, message: "Admin only." });
 
+      const hadCachedReports = Array.isArray(adminReports) && adminReports.length > 0;
+      const result = await queryDbWithRetry(
+        'UPDATE reports SET resolved = true WHERE resolved = false RETURNING id',
+        [],
+        { attempts: 3, label: 'ADMIN REPORTS CLEAR' }
+      );
+      const resolvedCount = Math.max(0, Number(result.rowCount) || 0);
+      if (!resolvedCount && !hadCachedReports) return respond({ success: true, unchanged: true, resolvedCount: 0 });
+
       adminReports = [];
-      await pool.query('UPDATE reports SET resolved = true');
       emitToAdmins('reports_list', adminReports);
       deferServerTask('ADMIN REPORTS CLEAR NOTIFY', () => notifyAdminStateAcrossInstances(ADMIN_STATE_KEYS.reports, { changedAt: Date.now() }), 0);
-      await addModerationLog('reports', 'Cleared report center', {}, socket.userName || 'Admin');
-      respond({ success: true });
+      if (resolvedCount) await addModerationLog('reports', 'Cleared report center', { reports: resolvedCount }, socket.userName || 'Admin');
+      respond({ success: true, resolvedCount });
     } catch (err) {
       console.error('[ADMIN CLEAR REPORTS ERROR]:', err);
       respond({ success: false, message: "Server error while clearing reports." });
@@ -11669,12 +11827,20 @@ io.on('connection', (socket) => {
       const reportId = normalizeText(data && data.reportId, "");
       if (!reportId) return respond({ success: false, message: "Missing report id." });
 
-      adminReports = adminReports.filter(r => String(r.id || r.time) !== String(reportId));
-      await pool.query('UPDATE reports SET resolved = true WHERE id = $1', [reportId]);
+      const hadCachedReport = (Array.isArray(adminReports) ? adminReports : []).some(r => String(r.id || r.time) === String(reportId));
+      const result = await queryDbWithRetry(
+        'UPDATE reports SET resolved = true WHERE id = $1 AND resolved = false RETURNING id',
+        [reportId],
+        { attempts: 3, label: 'ADMIN REPORT RESOLVE' }
+      );
+      const resolved = Number(result.rowCount) > 0;
+      if (!resolved && !hadCachedReport) return respond({ success: true, unchanged: true, resolved: false });
+
+      adminReports = (Array.isArray(adminReports) ? adminReports : []).filter(r => String(r.id || r.time) !== String(reportId));
       emitToAdmins('reports_list', adminReports);
       deferServerTask('ADMIN REPORTS RESOLVE NOTIFY', () => notifyAdminStateAcrossInstances(ADMIN_STATE_KEYS.reports, { changedAt: Date.now() }), 0);
-      await addModerationLog('reports', 'Resolved report', { reportId }, socket.userName || 'Admin');
-      respond({ success: true });
+      if (resolved) await addModerationLog('reports', 'Resolved report', { reportId }, socket.userName || 'Admin');
+      respond({ success: true, resolved });
     } catch (err) {
       console.error('[ADMIN RESOLVE REPORT ERROR]:', err);
       respond({ success: false, message: "Server error while resolving report." });
@@ -11687,7 +11853,32 @@ io.on('connection', (socket) => {
   socket.on('report_message', async (data, callback) => {
     const respond = typeof callback === 'function' ? callback : () => {};
     try {
-      const report = await createReport(data || {}, socket.userName || 'Unknown');
+      const reporter = normalizeText(socket.userName, '');
+      if (!reporter || !userDatabase[reporter]) return respond({ success: false, authenticated: false, message: 'Sign in before reporting a message.' });
+      const msgId = normalizeText(data && data.msgId, '').replace(/[^0-9]/g, '').slice(0, 32);
+      const reason = normalizeText(data && data.reason, '').replace(/[\r\n\t]+/g, ' ').slice(0, 1000);
+      if (!msgId || !reason) return respond({ success: false, message: 'Missing report message or reason.' });
+      const targetMessage = messageHistory.find(message => String(new Date(message && message.time).getTime()) === msgId);
+      if (!targetMessage) return respond({ success: false, message: 'That message is no longer available to report.' });
+      const now = Date.now();
+      if (now - Number(socket.__lastMessageReportAt || 0) < 1500) return respond({ success: false, rateLimited: true, message: 'Please wait a moment before sending another report.' });
+      socket.__lastMessageReportAt = now;
+
+      const existingReport = await queryDbWithRetry(
+        `SELECT data FROM reports
+         WHERE resolved = false AND data->>'reporter' = $1 AND data->>'msgId' = $2
+         ORDER BY created_at DESC LIMIT 1`,
+        [reporter, msgId],
+        { attempts: 2, label: 'MESSAGE REPORT DEDUPE' }
+      );
+      if (existingReport.rows.length) return respond({ success: true, unchanged: true, report: existingReport.rows[0].data || null });
+
+      const report = await createReport({
+        msgId,
+        targetUser: normalizeText(targetMessage.user, ''),
+        messageText: normalizeText(targetMessage.text, ''),
+        reason
+      }, reporter);
       respond({ success: true, report });
     } catch (err) {
       console.error('[REPORT ERROR]:', err);

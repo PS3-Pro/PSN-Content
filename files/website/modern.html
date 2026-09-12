@@ -11051,6 +11051,7 @@ P
 			];
 			
 			keysToClear.forEach(key => localStorage.removeItem(`${username}_${key}`));
+			if (typeof window.clearContentReportMineCacheForUser === 'function') window.clearContentReportMineCacheForUser(username);
 			if (localStorage.getItem('psn_username') === username) localStorage.removeItem('psn_username');
 			
 			if (typeof playUiRemove === 'function') playUiRemove();
@@ -14912,13 +14913,16 @@ P
 
 		const savedItems = readRecentlyVisitedGames();
 		const availabilityReady = window.__wishlistCanonicalReady === true;
-		const items = savedItems.map(item => {
+		const resolvedItems = savedItems.map(item => {
 			if (!availabilityReady || typeof window.findSavedStoreItemExact !== 'function') return item;
 			const result = window.findSavedStoreItemExact(item, 'games');
 			if (!result.ready) return item;
 			if (!result.match) return Object.assign({}, item, { __storeUnavailable: true });
 			return Object.assign({}, item, result.match.item, { category: result.match.category || 'games', __storeUnavailable: false });
-		}).filter(item => typeof window.isStoreContentBlocked !== 'function' || !window.isStoreContentBlocked(item, item && (item.category || item.rawCategory) || 'games'));
+		});
+		const items = (typeof window.hasStoreContentBlocks === 'function' && window.hasStoreContentBlocks())
+			? resolvedItems.filter(item => !window.isStoreContentBlocked(item, item && (item.category || item.rawCategory) || 'games'))
+			: resolvedItems;
 
 		if (!availabilityReady && savedItems.length && typeof window.ensureWishlistCanonicalDataInBackground === 'function' && !window.__recentlyVisitedAvailabilityRefreshPending) {
 			window.__recentlyVisitedAvailabilityRefreshPending = true;
@@ -15680,7 +15684,7 @@ P
 	function setExploreVirtualData(container, cat, items, animateCards) {
 		if (!container) return;
 		const sourceItems = Array.isArray(items) ? items : [];
-		const visibleItems = typeof window.isStoreContentBlocked === 'function'
+		const visibleItems = (typeof window.hasStoreContentBlocks === 'function' && window.hasStoreContentBlocks())
 			? sourceItems.filter(item => !window.isStoreContentBlocked(item, cat))
 			: sourceItems;
 		invalidateExploreVirtualMetrics(container);
@@ -19791,7 +19795,7 @@ P
 			const resolved = getTrendingResolvedStoreItem(item && item.id, TRENDING_ALLOWED_CATEGORIES);
 			if (!resolved || !resolved.item) continue;
 			const resolvedCategory = resolved.category || 'games';
-			if (typeof window.isStoreContentBlocked === 'function' && window.isStoreContentBlocked(resolved.item, resolvedCategory)) continue;
+			if (typeof window.hasStoreContentBlocks === 'function' && window.hasStoreContentBlocks() && window.isStoreContentBlocked(resolved.item, resolvedCategory)) continue;
 			entries.push({ item, gameData:resolved.item, gameCategory:resolvedCategory });
 		}
 		return entries;
@@ -24541,7 +24545,10 @@ P
 		const regionFilter = context.regionFilter || 'ALL';
 		const activeConsoles = Array.isArray(context.activeConsoles) ? context.activeConsoles : [];
 		const currentCat = context.currentCat || '';
-		if (typeof window.isStoreContentBlocked === 'function' && window.isStoreContentBlocked(game, currentCat)) return false;
+		if (context.hasBlockedStoreContent) {
+			const blockedKey = getClientStoreContentKey(game, currentCat);
+			if (blockedKey && context.blockedStoreContentMap.has(blockedKey)) return false;
+		}
 		const cleanName = String(game.cleanName || '');
 		const searchKeys = getBrowseSearchKeys(game);
 
@@ -24603,6 +24610,8 @@ P
 			activeConsoles,
 			activeConsolesSet: new Set(activeConsoles),
 			currentCat,
+			blockedStoreContentMap: window.__storeBlockedContentMap instanceof Map ? window.__storeBlockedContentMap : new Map(),
+			hasBlockedStoreContent: !!(window.__storeBlockedContentMap instanceof Map && window.__storeBlockedContentMap.size),
             showFirstPlay,
             showQore,
             showMedia
@@ -29960,13 +29969,17 @@ P
 	}
 
     window.openModal = function(index, forcedPsnStoreSummary = '', forceCompactDlc = false, originCard = null, modalOptions = null) {
-		if (typeof playUiModal === 'function') playUiModal();
-	
 		const modalOpts = modalOptions && typeof modalOptions === 'object' ? modalOptions : {};
 		const modalInfoOnly = modalOpts.infoOnly === true;
 		const game = modalOpts.game || filteredData[index];
 		const catSelect = document.getElementById('cat-select');
 		const currentCat = modalOpts.category || catSelect.value;
+		if (!modalInfoOnly && game && typeof window.hasStoreContentBlocks === 'function' && window.hasStoreContentBlocks() && window.isStoreContentBlocked(game, currentCat)) {
+			if (typeof playUiError === 'function') playUiError();
+			if (typeof showToastNotification === 'function') showToastNotification('Store', 'This content is no longer available in the Store.');
+			return false;
+		}
+		if (typeof playUiModal === 'function') playUiModal();
 		const modal = document.getElementById('game-modal');
 		if (modal) setGameModalNoScreenshots(modal, false);
 		const modalBody = modal.querySelector('.sys-modal-body');
@@ -30352,14 +30365,45 @@ P
 	}
 
 	function getContentReportActiveUserName() {
+		const authenticatedName = String(localStorage.getItem('psn_username') || '').trim();
+		if (authenticatedName) return authenticatedName;
 		if (typeof currentLoginUser !== 'undefined' && String(currentLoginUser || '').trim()) return String(currentLoginUser).trim();
-		return String(localStorage.getItem('psn_username') || '').trim();
+		return '';
 	}
 
 	function getContentReportCacheStorageKey(userName = getContentReportActiveUserName()) {
 		const name = String(userName || '').trim().toLowerCase();
 		return name ? `${CONTENT_REPORT_CACHE_PREFIX}${name}` : '';
 	}
+
+	let gameReportCloseTimer = null;
+
+	window.resetContentReportMineRuntime = function() {
+		window.__contentReportMineMap = new Map();
+		window.__contentReportMineRemoteReady = false;
+		if (gameReportCloseTimer) { clearTimeout(gameReportCloseTimer); gameReportCloseTimer = null; }
+		const reportModal = document.getElementById('game-report-modal');
+		if (reportModal) {
+			reportModal.classList.remove('show');
+			reportModal.style.display = 'none';
+			reportModal.dataset.busy = '0';
+			reportModal.dataset.userTouched = '0';
+			delete reportModal.dataset.selectedReason;
+			delete reportModal.dataset.reportKey;
+			delete reportModal.dataset.hasExistingReport;
+			delete reportModal.dataset.requestToken;
+		}
+		if (typeof window.syncGameModalReportButtonState === 'function') window.syncGameModalReportButtonState();
+	};
+
+	window.clearContentReportMineCacheForUser = function(userName) {
+		const key = getContentReportCacheStorageKey(userName);
+		if (key) {
+			try { localStorage.removeItem(key); } catch (err) {}
+		}
+		const activeName = String(getContentReportActiveUserName() || '').trim().toLowerCase();
+		if (!userName || activeName === String(userName || '').trim().toLowerCase()) window.resetContentReportMineRuntime();
+	};
 
 	function persistContentReportMineCache(userName = getContentReportActiveUserName()) {
 		const key = getContentReportCacheStorageKey(userName);
@@ -30385,6 +30429,10 @@ P
 	};
 
 	window.applyContentReportsMine = function(reports, userName = getContentReportActiveUserName()) {
+		const targetUser = String(userName || '').trim();
+		const authenticatedUser = String(localStorage.getItem('psn_username') || '').trim();
+		if (targetUser && (!authenticatedUser || targetUser.toLowerCase() !== authenticatedUser.toLowerCase())) return false;
+		if (!targetUser && !authenticatedUser) return false;
 		const next = new Map();
 		for (const report of (Array.isArray(reports) ? reports : [])) {
 			const reportKey = String(report && report.reportKey || '').trim();
@@ -30392,8 +30440,14 @@ P
 		}
 		window.__contentReportMineMap = next;
 		window.__contentReportMineRemoteReady = true;
-		persistContentReportMineCache(userName);
+		persistContentReportMineCache(targetUser || authenticatedUser);
 		if (typeof window.syncGameModalReportButtonState === 'function') window.syncGameModalReportButtonState();
+		const reportModal = document.getElementById('game-report-modal');
+		if (reportModal && reportModal.style.display !== 'none' && reportModal.dataset.userTouched !== '1') {
+			const reportKey = String(reportModal.dataset.reportKey || '').trim();
+			if (reportKey && typeof syncGameReportForm === 'function') syncGameReportForm(window.__contentReportMineMap.get(reportKey) || null);
+		}
+		return true;
 	};
 
 	function setCachedContentReport(report) {
@@ -30435,7 +30489,24 @@ P
 		return reportKey ? (window.__contentReportMineMap.get(reportKey) || null) : null;
 	}
 
+	function closeOpenBlockedStoreContentIfNeeded() {
+		const modal = document.getElementById('game-modal');
+		if (!modal || modal.style.display === 'none' || !window.__storeBlockedContentMap.size) return false;
+		const reportKey = getClientStoreContentKey({
+			category: modal.dataset.storeCategory || 'games',
+			titleId: modal.dataset.titleId || '',
+			contentId: modal.dataset.contentId || ''
+		});
+		if (!reportKey || !window.__storeBlockedContentMap.has(reportKey)) return false;
+		const reportModal = document.getElementById('game-report-modal');
+		if (reportModal && reportModal.style.display !== 'none' && typeof window.closeGameReportModal === 'function') window.closeGameReportModal(null, true);
+		if (typeof window.closeModal === 'function') window.closeModal(null, { silent: true });
+		if (typeof showToastNotification === 'function') showToastNotification('Store', 'This content is no longer available in the Store.');
+		return true;
+	}
+
 	function refreshVisibleStoreViewsAfterContentBlockChange() {
+		closeOpenBlockedStoreContentIfNeeded();
 		const browseVisible = typeof isPsnDomSectionVisible === 'function' ? isPsnDomSectionVisible('view-browse') : document.getElementById('view-browse')?.style.display === 'block';
 		if (browseVisible && typeof applyFilters === 'function') {
 			const scrollArea = document.getElementById('scroll-area') || document.querySelector('.content');
@@ -30447,8 +30518,13 @@ P
 		}
 		const exploreVisible = typeof isPsnDomSectionVisible === 'function' ? isPsnDomSectionVisible('view-explore') : document.getElementById('view-explore')?.style.display === 'block';
 		if (exploreVisible) {
+			window.__exploreContentBlocksDirty = false;
 			if (typeof window.renderRecentlyVisited === 'function') window.renderRecentlyVisited();
-			if (typeof populateExploreTab === 'function') Promise.resolve(populateExploreTab({ animateCards: false })).catch(() => {});
+			if (typeof populateExploreTab === 'function') Promise.resolve(populateExploreTab({ animateCards: false, reason: 'content-blocks-live' })).catch(() => { window.__exploreContentBlocksDirty = true; });
+		} else {
+			/* Explore keeps virtual carousel data while hidden. Mark it dirty instead of doing
+			   invisible work so the next entry refreshes before stale cards can be reused. */
+			window.__exploreContentBlocksDirty = true;
 		}
 		const trendingVisible = typeof isPsnDomSectionVisible === 'function' ? isPsnDomSectionVisible('view-trending') : document.getElementById('view-trending')?.style.display === 'block';
 		if (trendingVisible && typeof renderCachedTrendingIfVisible === 'function') renderCachedTrendingIfVisible({ realtime: true });
@@ -30490,8 +30566,12 @@ P
 		return true;
 	};
 
+	window.hasStoreContentBlocks = function() {
+		return !!(window.__storeBlockedContentMap && window.__storeBlockedContentMap.size);
+	};
+
 	window.isStoreContentBlocked = function(game, category = '') {
-		if (!game) return false;
+		if (!game || !window.__storeBlockedContentMap || window.__storeBlockedContentMap.size === 0) return false;
 		const key = getClientStoreContentKey(game, category || game.category || game.rawCategory || 'games');
 		return !!key && window.__storeBlockedContentMap.has(key);
 	};
@@ -30558,8 +30638,11 @@ P
 		const modal = document.getElementById('game-report-modal');
 		if (!modal || modal.style.display === 'none') return;
 		if (silent !== true && typeof playUiBack === 'function') playUiBack();
+		if (gameReportCloseTimer) clearTimeout(gameReportCloseTimer);
+		delete modal.dataset.requestToken;
 		modal.classList.remove('show');
-		setTimeout(() => {
+		gameReportCloseTimer = setTimeout(() => {
+			gameReportCloseTimer = null;
 			modal.style.display = 'none';
 			modal.dataset.busy = '0';
 			modal.dataset.userTouched = '0';
@@ -30576,6 +30659,7 @@ P
 
 	window.openGameReportModal = function(event) {
 		if (event) event.stopPropagation();
+		if (gameReportCloseTimer) { clearTimeout(gameReportCloseTimer); gameReportCloseTimer = null; }
 		if (typeof playUiClick === 'function') playUiClick();
 		const payload = getCurrentGameReportPayload();
 		if (!payload || !payload.reportKey) return false;
@@ -30589,13 +30673,27 @@ P
 		modal.dataset.reportKey = payload.reportKey;
 		modal.dataset.userTouched = '0';
 		modal.dataset.busy = '0';
+		delete modal.dataset.requestToken;
 		syncGameReportForm(getCachedContentReport(payload));
 		modal.style.display = 'flex';
 		requestAnimationFrame(() => requestAnimationFrame(() => modal.classList.add('show')));
 
 		if (window.__contentReportMineRemoteReady !== true && typeof socketChat !== 'undefined' && socketChat && socketChat.connected) {
+			const requestUser = String(localStorage.getItem('psn_username') || '').trim().toLowerCase();
 			socketChat.emit('content_report_get', payload, response => {
+				if (requestUser !== String(localStorage.getItem('psn_username') || '').trim().toLowerCase()) return;
 				if (!response || response.success !== true) return;
+				if (response.blocked === true) {
+					removeCachedContentReport(payload.reportKey);
+					window.syncGameModalReportButtonState();
+					if (modal.style.display !== 'none' && modal.dataset.reportKey === payload.reportKey) window.closeGameReportModal(null, true);
+					const gameModal = document.getElementById('game-modal');
+					if (gameModal && gameModal.style.display !== 'none' && getCurrentGameReportPayload()?.reportKey === payload.reportKey) {
+						if (typeof window.closeModal === 'function') window.closeModal(null, { silent: true });
+						if (typeof showToastNotification === 'function') showToastNotification('Store', 'This content is no longer available in the Store.');
+					}
+					return;
+				}
 				if (response.report) setCachedContentReport(response.report);
 				else removeCachedContentReport(payload.reportKey);
 				window.syncGameModalReportButtonState();
@@ -30641,8 +30739,13 @@ P
 			return false;
 		}
 		setGameReportBusy(true);
+		const requestUser = String(localStorage.getItem('psn_username') || '').trim().toLowerCase();
+		const requestToken = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+		modal.dataset.requestToken = requestToken;
 		socketChat.emit('content_report_submit', { ...base, reason, details }, response => {
-			setGameReportBusy(false);
+			if (requestUser !== String(localStorage.getItem('psn_username') || '').trim().toLowerCase()) return;
+			const ownsOpenReportModal = modal.dataset.requestToken === requestToken;
+			if (ownsOpenReportModal) setGameReportBusy(false);
 			if (!response || response.success !== true || !response.report) {
 				if (typeof playUiError === 'function') playUiError();
 				if (typeof showToastNotification === 'function') showToastNotification('Report', response && response.message ? response.message : 'Could not save the report.');
@@ -30652,7 +30755,7 @@ P
 			window.syncGameModalReportButtonState();
 			if (typeof playUiSuccess === 'function') playUiSuccess();
 			if (typeof showToastNotification === 'function') showToastNotification(response.updated ? 'Report Updated' : 'Report Sent', CONTENT_REPORT_REASON_LABELS[response.report.reason] || 'Report saved.');
-			window.closeGameReportModal(null, true);
+			if (ownsOpenReportModal) window.closeGameReportModal(null, true);
 		});
 		return true;
 	};
@@ -30668,8 +30771,13 @@ P
 			return false;
 		}
 		setGameReportBusy(true);
+		const requestUser = String(localStorage.getItem('psn_username') || '').trim().toLowerCase();
+		const requestToken = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+		modal.dataset.requestToken = requestToken;
 		socketChat.emit('content_report_remove', payload, response => {
-			setGameReportBusy(false);
+			if (requestUser !== String(localStorage.getItem('psn_username') || '').trim().toLowerCase()) return;
+			const ownsOpenReportModal = modal.dataset.requestToken === requestToken;
+			if (ownsOpenReportModal) setGameReportBusy(false);
 			if (!response || response.success !== true) {
 				if (typeof playUiError === 'function') playUiError();
 				if (typeof showToastNotification === 'function') showToastNotification('Report', response && response.message ? response.message : 'Could not remove the report.');
@@ -30679,7 +30787,7 @@ P
 			window.syncGameModalReportButtonState();
 			if (typeof playUiRemove === 'function') playUiRemove();
 			if (typeof showToastNotification === 'function') showToastNotification('Report Removed', 'Your report was removed.');
-			window.closeGameReportModal(null, true);
+			if (ownsOpenReportModal) window.closeGameReportModal(null, true);
 		});
 		return true;
 	};
@@ -33988,7 +34096,7 @@ P
 		adminSetUsersBatchSize(next);
 	};
 
-    const PSN_ADMIN_SCROLL_PANELS = ['admin-online-list', 'admin-country-list', 'admin-report-center', 'admin-server-log', 'admin-moderation-log', 'admin-recent-activity']
+    const PSN_ADMIN_SCROLL_PANELS = ['admin-online-list', 'admin-country-list', 'admin-report-center', 'admin-content-report-center', 'admin-content-block-list', 'admin-server-log', 'admin-moderation-log', 'admin-recent-activity']
         .map(id => document.getElementById(id)).filter(Boolean);
     const PSN_ADMIN_USER_FILTER_INPUTS = Array.from(document.querySelectorAll('#admin-user-filters input[name="admin-user-filter"]'));
 
@@ -34129,7 +34237,12 @@ P
 			else renderCachedDashboard();
 		});
 		later(140, () => { if (typeof adminRefreshHealth === 'function') adminRefreshHealth(false, false); });
-		later(195, () => { if (typeof socketChat !== 'undefined' && socketChat && socketChat.connected) socketChat.emit('admin_request_moderation_log'); });
+		later(195, () => {
+			if (typeof socketChat === 'undefined' || !socketChat || !socketChat.connected) return;
+			if (window.adminLastModerationLogRequestAt && Date.now() - Number(window.adminLastModerationLogRequestAt || 0) < 30000) return;
+			window.adminLastModerationLogRequestAt = Date.now();
+			socketChat.emit('admin_request_moderation_log');
+		});
 		later(250, () => { if (typeof window.adminRequestChatControlsState === 'function') window.adminRequestChatControlsState(); });
 		later(285, () => { if (typeof window.adminRequestContentReports === 'function') window.adminRequestContentReports(true); });
 		later(315, () => { if (typeof window.adminRequestReports === 'function') window.adminRequestReports(true); });
@@ -35382,6 +35495,7 @@ P
 		});
 		if (typeof window.adminInvalidateKnownUsersCache === 'function') window.adminInvalidateKnownUsersCache();
 		try {
+			if (typeof window.clearContentReportMineCacheForUser === 'function') window.clearContentReportMineCacheForUser(name);
 			if (localStorage.getItem('psn_username') === name) localStorage.removeItem('psn_username');
 			localStorage.removeItem(`${name}_psn_password`);
 			localStorage.removeItem(`${name}_psn_isAdmin`);
@@ -37888,6 +38002,7 @@ P
 
 	function adminSetReports(reports) {
 		window.adminReports = window.trimPsnServerLimitedArray(Array.isArray(reports) ? reports : [], 'adminReports');
+		window.__adminMessageReportCount = window.adminReports.length;
 		const raw = JSON.stringify(window.adminReports);
 		adminReportsFallbackRaw = raw;
 		adminReportsFallbackCache = window.adminReports;
@@ -37906,6 +38021,12 @@ P
 
 	function adminSetContentReports(reports) {
 		window.adminContentReports = Array.isArray(reports) ? reports.slice(0, 100) : [];
+		let total = 0;
+		for (const group of window.adminContentReports) {
+			const reporters = Array.isArray(group && group.reporters) ? group.reporters.length : 0;
+			total += Math.max(1, Number(group && group.reportCount) || reporters || 1);
+		}
+		window.__adminStoreReportCount = total;
 		window.adminContentReportsLastSyncAt = Date.now();
 		if (typeof window.updateAdminReportSidebarPill === 'function') window.updateAdminReportSidebarPill();
 	}
@@ -37916,12 +38037,8 @@ P
 			window.setSidebarCountPill('admin', null);
 			return;
 		}
-		const messageReports = Array.isArray(window.adminReports) ? window.adminReports.length : 0;
-		const storeReports = (Array.isArray(window.adminContentReports) ? window.adminContentReports : []).reduce((total, group) => {
-			const reporters = Array.isArray(group && group.reporters) ? group.reporters.length : 0;
-			const count = Math.max(1, Number(group && group.reportCount) || reporters || 1);
-			return total + count;
-		}, 0);
+		const messageReports = Number.isFinite(Number(window.__adminMessageReportCount)) ? Math.max(0, Number(window.__adminMessageReportCount)) : adminGetReports().length;
+		const storeReports = Number.isFinite(Number(window.__adminStoreReportCount)) ? Math.max(0, Number(window.__adminStoreReportCount)) : 0;
 		window.setSidebarCountPill('admin', messageReports + storeReports);
 	};
 
@@ -37931,7 +38048,7 @@ P
 
 	function adminSetContentBlocks(blocks) {
 		window.adminContentBlocks = Array.isArray(blocks) ? blocks.slice(0, 1000) : [];
-		window.adminContentReportsLastSyncAt = Date.now();
+		window.adminContentBlocksLastSyncAt = Date.now();
 	}
 
 	function adminContentReportReasonLabel(reason) {
@@ -37953,19 +38070,24 @@ P
 			if (Array.isArray(response.reports)) adminSetContentReports(response.reports);
 			if (Array.isArray(response.blockedContent)) adminSetContentBlocks(response.blockedContent);
 			if (document.getElementById('view-admin')?.style.display === 'block') adminRenderContentReportPanels();
+			if (!silent && typeof playUiSuccess === 'function') playUiSuccess();
 		});
-		if (!silent && typeof playUiSuccess === 'function') playUiSuccess();
 	};
 
 	window.adminResolveContentReport = function(reportKey) {
 		if (!adminGuard() || !reportKey) return;
-		if (typeof socketChat === 'undefined' || !socketChat || !socketChat.connected) return;
+		if (typeof socketChat === 'undefined' || !socketChat || !socketChat.connected) {
+			if (typeof playUiError === 'function') playUiError();
+			if (typeof showToastNotification === 'function') showToastNotification('Store Reports', 'Connect to the server before resolving a report.');
+			return;
+		}
 		socketChat.emit('admin_resolve_content_report', { reportKey }, response => {
 			if (!response || response.success !== true) {
 				if (typeof playUiError === 'function') playUiError();
 				if (typeof showToastNotification === 'function') showToastNotification('Store Reports', response && response.message ? response.message : 'Could not resolve the report.');
 				return;
 			}
+			if (response.unchanged === true) return;
 			if (typeof playUiSuccess === 'function') playUiSuccess();
 		});
 	};
@@ -37975,13 +38097,18 @@ P
 		const report = adminGetContentReports().find(item => String(item && item.reportKey || '') === String(reportKey));
 		const label = report && (report.name || report.titleId || report.contentId) ? String(report.name || report.titleId || report.contentId) : 'this content';
 		if (!confirm(`Block ${label} from the Store? It will disappear from the Store for everyone until you unblock it.`)) return;
-		if (typeof socketChat === 'undefined' || !socketChat || !socketChat.connected) return;
+		if (typeof socketChat === 'undefined' || !socketChat || !socketChat.connected) {
+			if (typeof playUiError === 'function') playUiError();
+			if (typeof showToastNotification === 'function') showToastNotification('Store Block', 'Connect to the server before blocking content.');
+			return;
+		}
 		socketChat.emit('admin_block_store_content', { reportKey }, response => {
 			if (!response || response.success !== true) {
 				if (typeof playUiError === 'function') playUiError();
 				if (typeof showToastNotification === 'function') showToastNotification('Store Block', response && response.message ? response.message : 'Could not block the content.');
 				return;
 			}
+			if (response.unchanged === true) return;
 			if (typeof playUiRemove === 'function') playUiRemove();
 			if (typeof showToastNotification === 'function') showToastNotification('Store Block', 'Content blocked from the Store.');
 		});
@@ -37989,13 +38116,18 @@ P
 
 	window.adminUnblockStoreContent = function(reportKey) {
 		if (!adminGuard() || !reportKey) return;
-		if (typeof socketChat === 'undefined' || !socketChat || !socketChat.connected) return;
+		if (typeof socketChat === 'undefined' || !socketChat || !socketChat.connected) {
+			if (typeof playUiError === 'function') playUiError();
+			if (typeof showToastNotification === 'function') showToastNotification('Store Block', 'Connect to the server before restoring content.');
+			return;
+		}
 		socketChat.emit('admin_unblock_store_content', { reportKey }, response => {
 			if (!response || response.success !== true) {
 				if (typeof playUiError === 'function') playUiError();
 				if (typeof showToastNotification === 'function') showToastNotification('Store Block', response && response.message ? response.message : 'Could not unblock the content.');
 				return;
 			}
+			if (response.unchanged === true) return;
 			if (typeof playUiSuccess === 'function') playUiSuccess();
 			if (typeof showToastNotification === 'function') showToastNotification('Store Block', 'Content restored to the Store.');
 		});
@@ -38023,40 +38155,73 @@ P
 			if (typeof showToastNotification === 'function') showToastNotification('New Report', `${incoming.reporter || 'Someone'} reported a message.`);
 			if (typeof playUiError === 'function') playUiError();
 		}
-		if (document.getElementById('view-admin')?.style.display === 'block') adminSchedulePanelRender();
+		if (document.getElementById('view-admin')?.style.display === 'block') adminRenderMessageReportCenter();
 		return true;
 	}
 
 	window.adminRequestReports = function(silent = false) {
 		if (!adminGuard(!silent)) return;
-		if (typeof socketChat !== 'undefined' && socketChat && socketChat.connected) {
-			window.adminLastReportsRequestAt = Date.now();
-			socketChat.emit('admin_request_reports');
-			if (!silent && typeof playUiSuccess === 'function') playUiSuccess();
-		} else if (!silent) {
-			if (typeof playUiError === 'function') playUiError();
-			alert('Socket is offline. Showing local reports only.');
+		if (silent && window.adminLastReportsRequestAt && Date.now() - Number(window.adminLastReportsRequestAt || 0) < 30000) return true;
+		if (typeof socketChat === 'undefined' || !socketChat || !socketChat.connected) {
+			if (!silent && typeof playUiError === 'function') playUiError();
+			if (!silent && typeof showToastNotification === 'function') showToastNotification('Report Center', 'Socket is offline. Showing the last synced reports.');
+			return false;
 		}
-		if (!silent) renderAdminPanel();
+		window.adminLastReportsRequestAt = Date.now();
+		socketChat.emit('admin_request_reports', { callbackOnly: true }, response => {
+			if (!response || response.success !== true) {
+				if (!silent && typeof playUiError === 'function') playUiError();
+				return;
+			}
+			if (Array.isArray(response.reports)) adminSetReports(response.reports);
+			if (document.getElementById('view-admin')?.style.display === 'block') adminRenderMessageReportCenter();
+			if (!silent && typeof playUiSuccess === 'function') playUiSuccess();
+		});
+		return true;
 	};
 
 	window.adminClearReports = function() {
 		if (!adminGuard()) return;
+		if (typeof socketChat === 'undefined' || !socketChat || !socketChat.connected) {
+			if (typeof playUiError === 'function') playUiError();
+			if (typeof showToastNotification === 'function') showToastNotification('Report Center', 'Connect to the server before clearing reports.');
+			return;
+		}
 		if (!confirm('Clear all pending reports? With the updated server this also resolves them in the database.')) return;
+		const previousReports = adminGetReports();
 		adminSetReports([]);
-		if (typeof socketChat !== 'undefined' && socketChat && socketChat.connected) socketChat.emit('admin_clear_reports');
-		adminAddLog('reports', 'Cleared report center');
-		renderAdminPanel();
-		if (typeof playUiRemove === 'function') playUiRemove();
+		if (document.getElementById('view-admin')?.style.display === 'block') adminRenderMessageReportCenter();
+		socketChat.emit('admin_clear_reports', {}, response => {
+			if (response && response.success === true) {
+				if (typeof playUiRemove === 'function') playUiRemove();
+				return;
+			}
+			adminSetReports(previousReports);
+			if (document.getElementById('view-admin')?.style.display === 'block') adminRenderMessageReportCenter();
+			if (typeof playUiError === 'function') playUiError();
+			if (typeof window.adminRequestReports === 'function') window.adminRequestReports(true);
+		});
 	};
 
 	window.adminResolveReport = function(reportId) {
 		if (!adminGuard()) return;
-		const reports = adminGetReports().filter(r => String(r.id || r.time) !== String(reportId));
+		if (typeof socketChat === 'undefined' || !socketChat || !socketChat.connected) {
+			if (typeof playUiError === 'function') playUiError();
+			if (typeof showToastNotification === 'function') showToastNotification('Report Center', 'Connect to the server before resolving a report.');
+			return;
+		}
+		const previousReports = adminGetReports();
+		const reports = previousReports.filter(r => String(r.id || r.time) !== String(reportId));
+		if (reports.length === previousReports.length) return;
 		adminSetReports(reports);
-		if (typeof socketChat !== 'undefined' && socketChat && socketChat.connected) socketChat.emit('admin_resolve_report', { reportId });
-		adminAddLog('reports', 'Resolved report', { reportId });
-		renderAdminPanel();
+		if (document.getElementById('view-admin')?.style.display === 'block') adminRenderMessageReportCenter();
+		socketChat.emit('admin_resolve_report', { reportId }, response => {
+			if (response && response.success === true) return;
+			adminSetReports(previousReports);
+			if (document.getElementById('view-admin')?.style.display === 'block') adminRenderMessageReportCenter();
+			if (typeof playUiError === 'function') playUiError();
+			if (typeof window.adminRequestReports === 'function') window.adminRequestReports(true);
+		});
 	};
 
 	window.adminJumpToReportedMessage = function(msgId, sourceLabel = 'Admin Panel') {
@@ -38168,60 +38333,96 @@ P
 	};
 
 
-	function adminRenderContentReportPanels(cardCanRender = () => true) {
-	const contentReportsEl = document.getElementById('admin-content-report-center');
-	if (contentReportsEl && cardCanRender(contentReportsEl)) {
-		const reports = adminGetContentReports();
-		const countEl = document.getElementById('admin-content-report-count');
-		if (countEl) countEl.textContent = String(reports.length);
-		if (contentReportsEl.__adminContentReportsSource !== reports || contentReportsEl.childNodes.length === 0) {
-			contentReportsEl.__adminContentReportsSource = reports;
-			if (!reports.length) {
-				setAdminHtmlIfChanged(contentReportsEl, '<div class="admin-empty"><i class="far fa-flag" style="color:#ffb35c;"></i><span>No Store problems reported.</span></div>');
-			} else {
-				setAdminHtmlIfChanged(contentReportsEl, reports.map(group => {
-					const reportKey = String(group.reportKey || group.id || '');
-					const title = String(group.name || group.titleId || group.contentId || 'Store content');
-					const titleId = String(group.titleId || '');
-					const contentId = String(group.contentId || '');
-					const category = String(group.category || '').replace(/_/g, ' ');
-					const region = String(group.region || '');
-					const reporters = Array.isArray(group.reporters) ? group.reporters : [];
-					const detailsHtml = reporters.map(entry => {
-						const reporter = String(entry.reporter || 'Unknown');
-						const reporterHtml = reporter && reporter !== 'Unknown'
-							? `<b class="admin-log-user-link" onclick="event.stopPropagation(); adminOpenUserProfile('${encodeURIComponent(reporter)}')">${adminEscapeHtml(reporter)}</b>`
-							: `<b>${adminEscapeHtml(reporter)}</b>`;
-						const time = entry.time ? adminFormatLogTimestamp(entry.time) : '';
-						const detailText = String(entry.details || '').trim();
-						return `<div class="admin-content-report-detail"><div class="admin-content-report-detail-head">${reporterHtml}<span class="admin-content-report-detail-reason">${adminEscapeHtml(adminContentReportReasonLabel(entry.reason))}</span>${time ? `<span class="admin-content-report-detail-time">${adminEscapeHtml(time)}</span>` : ''}</div>${detailText ? `<div class="admin-content-report-detail-text">${adminEscapeHtml(detailText)}</div>` : ''}</div>`;
-					}).join('');
-					const meta = [titleId, contentId, region, category].filter(Boolean).map(value => `<span class="admin-content-report-pill" data-no-translate="true" translate="no">${adminEscapeHtml(value)}</span>`).join('');
-					return `<div class="admin-content-report-item"><div class="admin-content-report-main"><div class="admin-content-report-head"><span class="admin-content-report-title" data-no-translate="true" translate="no">${adminEscapeHtml(title)}</span><span class="admin-content-report-pill count">${Math.max(1, Number(group.reportCount) || reporters.length || 1)} report${Math.max(1, Number(group.reportCount) || reporters.length || 1) === 1 ? '' : 's'}</span></div><div class="admin-content-report-meta">${meta}</div><div class="admin-content-report-details">${detailsHtml || '<div class="admin-content-report-detail">No reporter details available.</div>'}</div></div><div class="admin-content-report-actions"><button class="btn-mini-round report-resolve" onclick="event.stopPropagation(); adminResolveContentReport('${adminEscapeAttr(reportKey)}')" title="Resolve"><i class="fas fa-check"></i></button><button class="btn-mini-round report-block" onclick="event.stopPropagation(); adminBlockStoreContent('${adminEscapeAttr(reportKey)}')" title="Block from Store"><i class="fas fa-eye-slash"></i></button></div></div>`;
-				}).join(''));
-			}
+	function adminRenderMessageReportCenter(cardCanRender = () => true) {
+		const reportsEl = document.getElementById('admin-report-center');
+		if (!reportsEl || !cardCanRender(reportsEl)) return;
+
+		const reports = adminGetReports();
+		if (reportsEl.__adminReportsSource === reports && reportsEl.childNodes.length > 0) return;
+		reportsEl.__adminReportsSource = reports;
+
+		if (!reports.length) {
+			setAdminHtmlIfChanged(reportsEl, '<div class="admin-empty"><i class="fas fa-flag" style="color:#ffcc00;margin-right:6px;"></i>No reports yet. Users can report messages with the flag icon in chat. Refresh asks the server for pending reports.</div>');
+			return;
 		}
+
+		setAdminHtmlIfChanged(reportsEl, reports.map((r, idx) => {
+			const id = r.id || r.time || idx;
+			const time = r.time ? adminFormatLogTimestamp(r.time) : 'Unknown time';
+			const reporter = String(r.reporter || 'Unknown');
+			const targetUser = String(r.targetUser || r.target || r.user || '');
+			const reportText = r.messageText || r.text || '';
+			const reporterHtml = reporter && reporter !== 'Unknown'
+				? `<b class="admin-log-user-link" onclick="event.stopPropagation(); adminOpenUserProfile('${encodeURIComponent(reporter)}')">${adminEscapeHtml(reporter)}</b>`
+				: `<b>${adminEscapeHtml(reporter)}</b>`;
+			const targetHtml = targetUser
+				? `<b class="admin-log-user-link" onclick="event.stopPropagation(); adminOpenUserProfile('${encodeURIComponent(targetUser)}')">${adminEscapeHtml(targetUser)}</b>`
+				: '<b>message</b>';
+			const bodyJump = r.msgId ? ` onclick="adminJumpToReportedMessage('${adminEscapeAttr(r.msgId)}', 'Report Center')"` : '';
+			const jumpBtn = r.msgId ? `<button class="btn-mini-round report-jump" onclick="event.stopPropagation(); adminJumpToReportedMessage('${adminEscapeAttr(r.msgId)}', 'Report Center')" title="Jump to message"><i class="fas fa-location-arrow"></i></button>` : '';
+			return `<div class="admin-report-item"><i class="fas fa-flag"></i><div class="admin-report-body"${bodyJump}>${reporterHtml} reported ${targetHtml}<br><span data-no-translate="true" translate="no">${adminEscapeHtml(r.reason || 'No reason provided.')}</span><br>${reportText ? `<span data-no-translate="true" translate="no" style="opacity:.82;">${adminEscapeHtml(String(reportText).slice(0, 140))}</span><br>` : ''}<span style="opacity:.65;">${adminEscapeHtml(time)}</span></div><div class="admin-report-actions">${jumpBtn}<button class="btn-mini-round report-resolve" onclick="event.stopPropagation(); adminResolveReport('${adminEscapeAttr(id)}')" title="Resolve"><i class="fas fa-check"></i></button></div></div>`;
+		}).join(''));
 	}
 
-	const contentBlocksEl = document.getElementById('admin-content-block-list');
-	if (contentBlocksEl && cardCanRender(contentBlocksEl)) {
-		const blocks = adminGetContentBlocks();
-		const countEl = document.getElementById('admin-content-block-count');
-		if (countEl) countEl.textContent = String(blocks.length);
-		if (contentBlocksEl.__adminContentBlocksSource !== blocks || contentBlocksEl.childNodes.length === 0) {
-			contentBlocksEl.__adminContentBlocksSource = blocks;
-			if (!blocks.length) {
-				setAdminHtmlIfChanged(contentBlocksEl, '<div class="admin-empty"><i class="fas fa-eye-slash" style="color:#ff6666;"></i><span>Nothing is blocked from the Store.</span></div>');
-			} else {
-				setAdminHtmlIfChanged(contentBlocksEl, blocks.map(item => {
-					const reportKey = String(item.reportKey || '');
-					const title = String(item.name || item.titleId || item.contentId || 'Store content');
-					const meta = [item.titleId, item.contentId, item.region, String(item.category || '').replace(/_/g, ' ')].filter(Boolean).join(' • ');
-					return `<div class="admin-content-block-item"><i class="fas fa-eye-slash"></i><div class="admin-content-block-copy"><b data-no-translate="true" translate="no">${adminEscapeHtml(title)}</b><span data-no-translate="true" translate="no">${adminEscapeHtml(meta)}</span></div><button class="btn-mini-round content-unblock" onclick="event.stopPropagation(); adminUnblockStoreContent('${adminEscapeAttr(reportKey)}')" title="Restore to Store"><i class="fas fa-eye"></i></button></div>`;
-				}).join(''));
+	function adminRenderContentReportPanels(cardCanRender = () => true) {
+		const contentReportsEl = document.getElementById('admin-content-report-center');
+		if (contentReportsEl && cardCanRender(contentReportsEl)) {
+			const reports = adminGetContentReports();
+			const countEl = document.getElementById('admin-content-report-count');
+			if (countEl) countEl.textContent = String(Math.max(0, Number(window.__adminStoreReportCount) || 0));
+
+			if (contentReportsEl.__adminContentReportsSource !== reports || contentReportsEl.childNodes.length === 0) {
+				contentReportsEl.__adminContentReportsSource = reports;
+				if (!reports.length) {
+					setAdminHtmlIfChanged(contentReportsEl, '<div class="admin-empty"><i class="far fa-flag" style="color:#ffb35c;"></i><span>No Store problems reported.</span></div>');
+				} else {
+					setAdminHtmlIfChanged(contentReportsEl, reports.map(group => {
+						const reportKey = String(group.reportKey || group.id || '');
+						const title = String(group.name || group.titleId || group.contentId || 'Store content');
+						const titleId = String(group.titleId || '');
+						const contentId = String(group.contentId || '');
+						const category = String(group.category || '').replace(/_/g, ' ');
+						const region = String(group.region || '');
+						const reporters = Array.isArray(group.reporters) ? group.reporters : [];
+						const detailsHtml = reporters.map(entry => {
+							const reporter = String(entry.reporter || 'Unknown');
+							const reporterHtml = reporter && reporter !== 'Unknown'
+								? `<b class="admin-log-user-link" onclick="event.stopPropagation(); adminOpenUserProfile('${encodeURIComponent(reporter)}')">${adminEscapeHtml(reporter)}</b>`
+								: `<b>${adminEscapeHtml(reporter)}</b>`;
+							const time = entry.time ? adminFormatLogTimestamp(entry.time) : '';
+							const detailText = String(entry.details || '').trim();
+							return `<div class="admin-content-report-detail"><div class="admin-content-report-detail-head">${reporterHtml}<span class="admin-content-report-detail-reason">${adminEscapeHtml(adminContentReportReasonLabel(entry.reason))}</span>${time ? `<span class="admin-content-report-detail-time">${adminEscapeHtml(time)}</span>` : ''}</div>${detailText ? `<div class="admin-content-report-detail-text" data-no-translate="true" translate="no">${adminEscapeHtml(detailText)}</div>` : ''}</div>`;
+						}).join('');
+						const hiddenReporterCount = Math.max(0, (Number(group.reportCount) || 0) - reporters.length);
+						const reporterPreviewNote = hiddenReporterCount ? `<div class="admin-content-report-detail"><span>+${hiddenReporterCount} more reporter${hiddenReporterCount === 1 ? '' : 's'} not shown in the preview.</span></div>` : '';
+						const meta = [titleId, contentId, region, category].filter(Boolean).map(value => `<span class="admin-content-report-pill" data-no-translate="true" translate="no">${adminEscapeHtml(value)}</span>`).join('');
+						const reportCount = Math.max(1, Number(group.reportCount) || reporters.length || 1);
+						return `<div class="admin-content-report-item"><div class="admin-content-report-main"><div class="admin-content-report-head"><span class="admin-content-report-title" data-no-translate="true" translate="no">${adminEscapeHtml(title)}</span><span class="admin-content-report-pill count">${reportCount} report${reportCount === 1 ? '' : 's'}</span></div><div class="admin-content-report-meta">${meta}</div><div class="admin-content-report-details">${(detailsHtml + reporterPreviewNote) || '<div class="admin-content-report-detail">No reporter details available.</div>'}</div></div><div class="admin-content-report-actions"><button class="btn-mini-round report-resolve" onclick="event.stopPropagation(); adminResolveContentReport('${adminEscapeAttr(reportKey)}')" title="Resolve"><i class="fas fa-check"></i></button><button class="btn-mini-round report-block" onclick="event.stopPropagation(); adminBlockStoreContent('${adminEscapeAttr(reportKey)}')" title="Block from Store"><i class="fas fa-eye-slash"></i></button></div></div>`;
+					}).join(''));
+				}
 			}
 		}
-	}
+
+		const contentBlocksEl = document.getElementById('admin-content-block-list');
+		if (contentBlocksEl && cardCanRender(contentBlocksEl)) {
+			const blocks = adminGetContentBlocks();
+			const countEl = document.getElementById('admin-content-block-count');
+			if (countEl) countEl.textContent = String(blocks.length);
+
+			if (contentBlocksEl.__adminContentBlocksSource !== blocks || contentBlocksEl.childNodes.length === 0) {
+				contentBlocksEl.__adminContentBlocksSource = blocks;
+				if (!blocks.length) {
+					setAdminHtmlIfChanged(contentBlocksEl, '<div class="admin-empty"><i class="fas fa-eye-slash" style="color:#ff6666;"></i><span>Nothing is blocked from the Store.</span></div>');
+				} else {
+					setAdminHtmlIfChanged(contentBlocksEl, blocks.map(item => {
+						const reportKey = String(item.reportKey || '');
+						const title = String(item.name || item.titleId || item.contentId || 'Store content');
+						const meta = [item.titleId, item.contentId, item.region, String(item.category || '').replace(/_/g, ' ')].filter(Boolean).join(' • ');
+						return `<div class="admin-content-block-item"><i class="fas fa-eye-slash"></i><div class="admin-content-block-copy"><b data-no-translate="true" translate="no">${adminEscapeHtml(title)}</b><span data-no-translate="true" translate="no">${adminEscapeHtml(meta)}</span></div><button class="btn-mini-round content-unblock" onclick="event.stopPropagation(); adminUnblockStoreContent('${adminEscapeAttr(reportKey)}')" title="Restore to Store"><i class="fas fa-eye"></i></button></div>`;
+					}).join(''));
+				}
+			}
+		}
 	}
 
 	function adminRenderControlPanels(visibleOnly = false) {
@@ -38305,34 +38506,7 @@ P
 		const healthList = document.getElementById('admin-health-list');
 		if (cardCanRender(healthList)) adminRenderHealthCard();
 
-		const reportsEl = document.getElementById('admin-report-center');
-		if (reportsEl && cardCanRender(reportsEl)) {
-			const reports = adminGetReports();
-			if (reportsEl.__adminReportsSource === reports && reportsEl.childNodes.length > 0) {
-				// Source array is immutable-by-replacement; no need to rebuild the same report HTML.
-			} else if (!reports.length) {
-				reportsEl.__adminReportsSource = reports;
-				setAdminHtmlIfChanged(reportsEl, '<div class="admin-empty"><i class="fas fa-flag" style="color:#ffcc00;margin-right:6px;"></i>No reports yet. Users can report messages with the flag icon in chat. Refresh asks the server for pending reports.</div>');
-			} else {
-				reportsEl.__adminReportsSource = reports;
-				setAdminHtmlIfChanged(reportsEl, reports.slice(0, 20).map((r, idx) => {
-					const id = r.id || r.time || idx;
-					const time = r.time ? adminFormatLogTimestamp(r.time) : 'Unknown time';
-					const reporter = String(r.reporter || 'Unknown');
-					const targetUser = String(r.targetUser || r.target || r.user || '');
-					const reportText = r.messageText || r.text || '';
-					const reporterHtml = reporter && reporter !== 'Unknown'
-						? `<b class="admin-log-user-link" onclick="event.stopPropagation(); adminOpenUserProfile('${encodeURIComponent(reporter)}')">${adminEscapeHtml(reporter)}</b>`
-						: `<b>${adminEscapeHtml(reporter)}</b>`;
-					const targetHtml = targetUser
-						? `<b class="admin-log-user-link" onclick="event.stopPropagation(); adminOpenUserProfile('${encodeURIComponent(targetUser)}')">${adminEscapeHtml(targetUser)}</b>`
-						: '<b>message</b>';
-					const bodyJump = r.msgId ? ` onclick="adminJumpToReportedMessage('${adminEscapeAttr(r.msgId)}', 'Report Center')"` : '';
-					const jumpBtn = r.msgId ? `<button class="btn-mini-round report-jump" onclick="event.stopPropagation(); adminJumpToReportedMessage('${adminEscapeAttr(r.msgId)}', 'Report Center')" title="Jump to message"><i class="fas fa-location-arrow"></i></button>` : '';
-					return `<div class="admin-report-item"><i class="fas fa-flag"></i><div class="admin-report-body"${bodyJump}>${reporterHtml} reported ${targetHtml}<br>${adminEscapeHtml(r.reason || 'No reason provided.')}<br>${reportText ? `<span style="opacity:.82;">${adminEscapeHtml(String(reportText).slice(0, 140))}</span><br>` : ''}<span style="opacity:.65;">${adminEscapeHtml(time)}</span></div><div class="admin-report-actions">${jumpBtn}<button class="btn-mini-round report-resolve" onclick="event.stopPropagation(); adminResolveReport('${adminEscapeAttr(id)}')" title="Resolve"><i class="fas fa-check"></i></button></div></div>`;
-				}).join(''));
-			}
-		}
+		adminRenderMessageReportCenter(cardCanRender);
 
 
 		adminRenderContentReportPanels(cardCanRender);
@@ -38501,6 +38675,7 @@ P
 			if (!data || typeof data !== 'object') return;
 			if (data.contentLimits && typeof window.applyPsnServerContentLimits === 'function') window.applyPsnServerContentLimits(data.contentLimits);
 			let changed = adminApplyLogLimits(data.logLimits);
+			let messagePanelChanged = false;
 			let contentPanelChanged = false;
 			if (data.chatControls) {
 				const controls = data.chatControls;
@@ -38527,12 +38702,22 @@ P
 				const samePinned = (typeof window.getLiveRenderSignature === 'function' ? window.getLiveRenderSignature(currentPinned) === pinnedSignature : JSON.stringify(currentPinned) === JSON.stringify(nextPinned));
 				if (!samePinned) { adminSetPinnedAnnouncementState(nextPinned, false); changed = true; }
 			}
+			if (Array.isArray(data.reports)) {
+				window.adminLastReportsRequestAt = Date.now();
+				const nextReports = window.trimPsnServerLimitedArray(data.reports, 'adminReports');
+				const currentReports = adminGetReports();
+				const sameReports = typeof window.getLiveRenderSignature === 'function' ? window.getLiveRenderSignature(currentReports) === window.getLiveRenderSignature(nextReports) : JSON.stringify(currentReports) === JSON.stringify(nextReports);
+				if (!sameReports) { adminSetReports(nextReports); messagePanelChanged = true; }
+			}
 			if (Array.isArray(data.contentReports)) {
+				window.adminContentReportsLastSyncAt = Date.now();
 				const currentContentReports = adminGetContentReports();
 				const sameContentReports = typeof window.getLiveRenderSignature === 'function' ? window.getLiveRenderSignature(currentContentReports) === window.getLiveRenderSignature(data.contentReports) : JSON.stringify(currentContentReports) === JSON.stringify(data.contentReports);
 				if (!sameContentReports) { adminSetContentReports(data.contentReports); contentPanelChanged = true; }
 			}
 			if (Array.isArray(data.blockedContent)) {
+				window.adminContentBlocksLastSyncAt = Date.now();
+				if (typeof window.applyStoreContentBlocks === 'function') window.applyStoreContentBlocks(data.blockedContent);
 				const currentBlocks = adminGetContentBlocks();
 				const sameBlocks = typeof window.getLiveRenderSignature === 'function' ? window.getLiveRenderSignature(currentBlocks) === window.getLiveRenderSignature(data.blockedContent) : JSON.stringify(currentBlocks) === JSON.stringify(data.blockedContent);
 				if (!sameBlocks) { adminSetContentBlocks(data.blockedContent); contentPanelChanged = true; }
@@ -38552,7 +38737,10 @@ P
 				if (!sameCountryStats) { window.adminCountryStats = data.countryStats; changed = true; }
 			}
 			if (changed) adminSchedulePanelRender();
-			else if (contentPanelChanged && document.getElementById('view-admin')?.style.display === 'block') adminRenderContentReportPanels();
+			else if (document.getElementById('view-admin')?.style.display === 'block') {
+				if (messagePanelChanged) adminRenderMessageReportCenter();
+				if (contentPanelChanged) adminRenderContentReportPanels();
+			}
 		});
 		socketChat.on('admin_pinned_announcement', data => {
 			const nextPinned = data && !data.clear ? { ...data, color: adminNormalizeAnnouncementColor(data.color) } : null;
@@ -38566,6 +38754,7 @@ P
 		});
 
 			socketChat.on('content_reports_list', reports => {
+				window.adminContentReportsLastSyncAt = Date.now();
 				const nextReports = Array.isArray(reports) ? reports.slice(0, 100) : [];
 				const current = adminGetContentReports();
 				const unchanged = typeof window.getLiveRenderSignature === 'function' ? window.getLiveRenderSignature(current) === window.getLiveRenderSignature(nextReports) : JSON.stringify(current) === JSON.stringify(nextReports);
@@ -38577,6 +38766,7 @@ P
 				if (!delta || typeof delta !== 'object') return;
 				const reportKey = String(delta.reportKey || delta.group?.reportKey || '').trim();
 				if (!reportKey) return;
+				const shouldShowNotice = !!(delta.notice && document.body.classList.contains('is-admin') && (!delta.sourceSocketId || !socketChat || delta.sourceSocketId !== socketChat.id));
 				const current = adminGetContentReports();
 				const index = current.findIndex(item => String(item && item.reportKey || '') === reportKey);
 				let next = current;
@@ -38586,7 +38776,10 @@ P
 					next.splice(index, 1);
 				} else if (delta.action === 'upsert' && delta.group && typeof delta.group === 'object') {
 					if (index >= 0 && typeof window.getLiveRenderSignature === 'function' && window.getLiveRenderSignature(current[index]) === window.getLiveRenderSignature(delta.group)) {
-						if (delta.notice && document.body.classList.contains('is-admin') && typeof showToastNotification === 'function') showToastNotification('New Store Report', `${delta.notice.reporter || 'Someone'} reported ${delta.notice.name || delta.notice.titleId || 'Store content'}.`);
+						if (shouldShowNotice && typeof showToastNotification === 'function') {
+							const updated = delta.notice.updated === true;
+							showToastNotification(updated ? 'Store Report Updated' : 'New Store Report', `${delta.notice.reporter || 'Someone'} ${updated ? 'updated a report for' : 'reported'} ${delta.notice.name || delta.notice.titleId || 'Store content'}.`);
+						}
 						return;
 					}
 					next = current.slice();
@@ -38596,12 +38789,14 @@ P
 				} else return;
 				adminSetContentReports(next);
 				if (document.getElementById('view-admin')?.style.display === 'block') adminRenderContentReportPanels();
-				if (delta.notice && document.body.classList.contains('is-admin')) {
-					if (typeof showToastNotification === 'function') showToastNotification('New Store Report', `${delta.notice.reporter || 'Someone'} reported ${delta.notice.name || delta.notice.titleId || 'Store content'}.`);
-					if (typeof playUiError === 'function') playUiError();
+				if (shouldShowNotice) {
+					const updated = delta.notice.updated === true;
+					if (typeof showToastNotification === 'function') showToastNotification(updated ? 'Store Report Updated' : 'New Store Report', `${delta.notice.reporter || 'Someone'} ${updated ? 'updated a report for' : 'reported'} ${delta.notice.name || delta.notice.titleId || 'Store content'}.`);
+					if (!updated && typeof playUiError === 'function') playUiError();
 				}
 			});
 			socketChat.on('content_blocks_list', blocks => {
+				window.adminContentBlocksLastSyncAt = Date.now();
 				const nextBlocks = Array.isArray(blocks) ? blocks.slice(0, 1000) : [];
 				const current = adminGetContentBlocks();
 				const unchanged = typeof window.getLiveRenderSignature === 'function' ? window.getLiveRenderSignature(current) === window.getLiveRenderSignature(nextBlocks) : JSON.stringify(current) === JSON.stringify(nextBlocks);
@@ -38613,18 +38808,36 @@ P
 				if (!delta || typeof delta !== 'object') return;
 				const reportKey = String(delta.reportKey || delta.block?.reportKey || '').trim();
 				if (!reportKey) return;
-				let blocks = adminGetContentBlocks().filter(item => String(item && item.reportKey || '') !== reportKey);
-				if (delta.action === 'upsert' && delta.block && typeof delta.block === 'object') blocks.unshift({ ...delta.block, reportKey });
-				adminSetContentBlocks(blocks);
+				const current = adminGetContentBlocks();
+				const index = current.findIndex(item => String(item && item.reportKey || '') === reportKey);
+				if (delta.action === 'remove') {
+					if (index < 0) return;
+					const next = current.slice();
+					next.splice(index, 1);
+					adminSetContentBlocks(next);
+				} else if (delta.action === 'upsert' && delta.block && typeof delta.block === 'object') {
+					const nextBlock = { ...delta.block, reportKey };
+					if (index >= 0) {
+						const unchanged = typeof window.getLiveRenderSignature === 'function'
+							? window.getLiveRenderSignature(current[index]) === window.getLiveRenderSignature(nextBlock)
+							: JSON.stringify(current[index]) === JSON.stringify(nextBlock);
+						if (unchanged) return;
+					}
+					const next = current.slice();
+					if (index >= 0) next.splice(index, 1);
+					next.unshift(nextBlock);
+					adminSetContentBlocks(next);
+				} else return;
 				if (document.getElementById('view-admin')?.style.display === 'block') adminRenderContentReportPanels();
 			});
 		socketChat.on('reports_list', reports => {
+			window.adminLastReportsRequestAt = Date.now();
 			const nextReports = window.trimPsnServerLimitedArray(Array.isArray(reports) ? reports : [], 'adminReports');
 			const previousReports = adminGetReports();
 			const unchanged = typeof window.getLiveRenderSignature === 'function' ? window.getLiveRenderSignature(previousReports) === window.getLiveRenderSignature(nextReports) : JSON.stringify(previousReports) === JSON.stringify(nextReports);
 			if (unchanged) return;
 			adminSetReports(nextReports);
-			adminSchedulePanelRender();
+			if (document.getElementById('view-admin')?.style.display === 'block') adminRenderMessageReportCenter();
 		});
 		const handleLiveReport = report => adminAddIncomingReport(report, false);
 		socketChat.on('admin_report_created', handleLiveReport);
@@ -38632,6 +38845,7 @@ P
 			if (item) adminAddLog(item.type || 'server', item.message || 'Server moderation event', item.detail || {}, item);
 		});
 		socketChat.on('admin_moderation_log_list', list => {
+			window.adminLastModerationLogRequestAt = Date.now();
 			const nextList = adminTrimLog(list, 'moderation');
 			const previousList = adminGetModerationLog();
 			const unchanged = typeof window.getLiveRenderSignature === 'function' ? window.getLiveRenderSignature(previousList) === window.getLiveRenderSignature(nextList) : JSON.stringify(previousList) === JSON.stringify(nextList);
@@ -39541,10 +39755,14 @@ P
 				const hasExploreCards = window.__explorePopulateReady === true || !!(exploreTarget && exploreTarget.querySelector('.horizontal-scroll .game-card'));
 				if (hasExploreCards) window.__explorePopulateReady = true;
 				const exploreNeedsLayout = window.__recentlyVisitedLayoutDirty === true || !document.getElementById('recently-visited-grid')?.dataset.recentlyVisitedLayoutSignature;
-				if (!hasExploreCards || exploreNeedsLayout) {
+				const exploreBlocksDirty = window.__exploreContentBlocksDirty === true;
+				if (!hasExploreCards || exploreNeedsLayout || exploreBlocksDirty) {
 					scheduleViewOpenWork('view-explore', () => {
 						if (exploreNeedsLayout && typeof syncRecentlyVisitedLayout === 'function') syncRecentlyVisitedLayout();
-						if (!window.__explorePopulateReady && typeof populateExploreTab === 'function') {
+						if (exploreBlocksDirty && typeof populateExploreTab === 'function') {
+							window.__exploreContentBlocksDirty = false;
+							Promise.resolve(populateExploreTab({ animateCards: false, reason: 'content-blocks-return' })).catch(err => { window.__exploreContentBlocksDirty = true; console.warn('Explore refresh failed:', err); });
+						} else if (!window.__explorePopulateReady && typeof populateExploreTab === 'function') {
 							const exploreLoad = window.__exploreFastLoadPromise || populateExploreTab({ animateCards: true, reason: 'switch-fast' });
 							if (!window.__exploreFastLoadPromise && exploreLoad && typeof exploreLoad.then === 'function') window.__exploreFastLoadPromise = exploreLoad;
 							if (exploreLoad && typeof exploreLoad.then === 'function') exploreLoad.then(() => {
@@ -39552,7 +39770,7 @@ P
 								if (target && target.style.display !== 'none' && typeof replayExploreCardsReveal === 'function') replayExploreCardsReveal({ allowDuringBoot: true });
 							}).catch(err => console.warn('Explore refresh failed:', err));
 						}
-					}, hasExploreCards ? 360 : 0);
+					}, exploreBlocksDirty ? 0 : (hasExploreCards ? 360 : 0));
 				}
 				if (typeof window.resumeExploreHeroFast === 'function') window.resumeExploreHeroFast();
 				else if (typeof updateBanner === 'function') { updateBanner(false); startAutoSlide(); }
@@ -43431,6 +43649,7 @@ P
     function switchUser() {
 		if (document.body) document.body.classList.add('ps3-pad-session-exiting');
 		if (typeof window.adminDismissAnnouncementForSessionExit === 'function') window.adminDismissAnnouncementForSessionExit();
+		if (typeof window.resetContentReportMineRuntime === 'function') window.resetContentReportMineRuntime();
 		window.resetPsnSessionRuntimeState({ clearTrophyTimers: true, disableBackgroundMusicPlayback: true });
 		if (typeof prepareUserSelectReturn === 'function') prepareUserSelectReturn();
 		const userGrid = document.getElementById('ps5-user-grid');
@@ -43581,6 +43800,7 @@ P
 			}
 	
 			const myName = localStorage.getItem('psn_username');
+			if (typeof window.resetContentReportMineRuntime === 'function') window.resetContentReportMineRuntime();
 			if (myName) localStorage.removeItem(`${myName}_psn_password`);
 			localStorage.removeItem('psn_username');
 			localStorage.removeItem('psn_admin_secret');
@@ -63914,15 +64134,15 @@ function getVisibleChatStackEl(id) {
 				else if (delta.action === 'upsert' && delta.report) setCachedContentReport({ ...delta.report, reportKey });
 				if (typeof window.syncGameModalReportButtonState === 'function') window.syncGameModalReportButtonState();
 				const reportModal = document.getElementById('game-report-modal');
-				if (reportModal && reportModal.style.display !== 'none' && String(reportModal.dataset.reportKey || '') === reportKey && typeof syncGameReportForm === 'function') syncGameReportForm(getCachedContentReport({ reportKey }));
+				if (reportModal && reportModal.style.display !== 'none' && reportModal.dataset.userTouched !== '1' && String(reportModal.dataset.reportKey || '') === reportKey && typeof syncGameReportForm === 'function') syncGameReportForm(getCachedContentReport({ reportKey }));
 			});
 			socketChat.on('content_report_cleared', data => {
 				const reportKey = String(data && data.reportKey || '').trim();
 				if (!reportKey) return;
-				if (typeof dropCachedContentReport === 'function') dropCachedContentReport(reportKey);
+				removeCachedContentReport(reportKey);
 				if (typeof window.syncGameModalReportButtonState === 'function') window.syncGameModalReportButtonState();
 				const reportModal = document.getElementById('game-report-modal');
-				if (reportModal && reportModal.style.display !== 'none' && String(reportModal.dataset.reportKey || '') === reportKey && typeof syncGameReportForm === 'function') syncGameReportForm(null);
+				if (reportModal && reportModal.style.display !== 'none' && reportModal.dataset.userTouched !== '1' && String(reportModal.dataset.reportKey || '') === reportKey && typeof syncGameReportForm === 'function') syncGameReportForm(null);
 			});
 
 		socketChat.on('auth_success', async (data) => {
@@ -64106,9 +64326,6 @@ function getVisibleChatStackEl(id) {
 			if (isAdmin) {
 				document.body.classList.add('is-admin');
 				safeLocalStorageSet(`${name}_psn_isAdmin`, 'true');
-				if (typeof socketChat !== 'undefined' && socketChat && socketChat.connected) {
-					socketChat.emit('admin_request_server_log');
-				}
 			} else {
 				document.body.classList.remove('is-admin');
 				localStorage.removeItem(`${name}_psn_isAdmin`);
@@ -64127,6 +64344,7 @@ function getVisibleChatStackEl(id) {
 			if (typeof window.restoreContentReportMineCache === 'function') window.restoreContentReportMineCache(name);
 			if (typeof socketChat !== 'undefined' && socketChat && socketChat.connected) {
 				socketChat.emit('content_report_request_mine', { callbackOnly: true }, response => {
+					if (String(localStorage.getItem('psn_username') || '').trim().toLowerCase() !== String(name || '').trim().toLowerCase()) return;
 					if (response && response.success === true && Array.isArray(response.reports) && typeof window.applyContentReportsMine === 'function') window.applyContentReportsMine(response.reports, name);
 			});
 			}
@@ -65542,6 +65760,7 @@ function getVisibleChatStackEl(id) {
 		socketChat.on('account_deleted', (data = {}) => {
 			const myName = localStorage.getItem('psn_username') || (typeof currentLoginUser !== 'undefined' ? currentLoginUser : '') || '';
 			if (myName && typeof deleteChatPersistentCacheForUser === 'function') deleteChatPersistentCacheForUser(myName).catch(() => {});
+			if (myName && typeof window.clearContentReportMineCacheForUser === 'function') window.clearContentReportMineCacheForUser(myName);
 			try {
 				if (myName && typeof getAllUsers === 'function' && typeof GLOBAL_USERS_KEY !== 'undefined') {
 					const users = getAllUsers().filter(user => user !== myName);
@@ -67149,6 +67368,7 @@ function getVisibleChatStackEl(id) {
 			localStorage.removeItem('psn_admin_secret');
 		} catch (e) {}
 		document.body.classList.remove('is-admin', 'is-mod', 'is-banned-user', 'admin-maintenance-login-bypass');
+		if (typeof window.resetContentReportMineRuntime === 'function') window.resetContentReportMineRuntime();
 		window.resetPsnSessionRuntimeState({ clearTrophyTimers: true, username: name });
 		if (typeof window.psnResetLoginUiState === 'function') window.psnResetLoginUiState(name);
 		if (typeof adminUpdateMaintenanceOverlay === 'function') setTimeout(adminUpdateMaintenanceOverlay, 0);
@@ -67694,7 +67914,6 @@ function getVisibleChatStackEl(id) {
 
     window.reportChatMessage = function(msgId, targetUser, messageText) {
         if (!msgId) return;
-        const myName = localStorage.getItem('psn_username') || 'Unknown';
         const safeTarget = targetUser || 'message';
         const reason = prompt(`Report message from ${safeTarget}. Reason:`, 'Spam / abuse / inappropriate content');
         if (reason === null) {
@@ -67707,15 +67926,9 @@ function getVisibleChatStackEl(id) {
             alert('Please enter a report reason.');
             return;
         }
-        const cleanMessageText = String(messageText || '').replace(/<[^>]*>/g, ' ').slice(0, 320);
         const payload = {
-            id: `report-${msgId}-${Date.now()}`,
             msgId: String(msgId),
-            reporter: myName,
-            targetUser: safeTarget,
-            messageText: cleanMessageText,
-            reason: cleanReason,
-            time: new Date().toISOString()
+            reason: cleanReason
         };
         if (typeof socketChat !== 'undefined' && socketChat && socketChat.connected) {
             socketChat.emit('report_message', payload, (res) => {
@@ -68506,7 +68719,7 @@ function getVisibleChatStackEl(id) {
 	
 			if (gameReportModal && gameReportModal.style.display === 'flex') {
 				e.preventDefault();
-				e.stopPropagation();
+				e.stopImmediatePropagation();
 				if (typeof window.closeGameReportModal === 'function') window.closeGameReportModal(null);
 				return;
 			}
