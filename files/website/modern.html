@@ -2495,6 +2495,10 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 .action-btn.confirm { background: #0070cc; border: none; padding: 10px 35px; border-radius: 4px; font-size: 0.7rem; letter-spacing: 2px; font-weight: 700; }
 .action-btn.cancel { background: transparent; border: 1px solid rgba(255,255,255,0.1); padding: 10px 35px; border-radius: 4px; font-size: 0.7rem; letter-spacing: 2px; }
 .user-avatar { width: 40px; height: 40px; border-radius: 50%; background-size: cover; background-position: center; background-color: transparent; flex-shrink: 0; }
+.sidebar-avatar-wrap { width:40px; height:40px; flex:0 0 40px; position:relative; overflow:visible; }
+.sidebar-avatar-wrap .user-avatar { width:100%; height:100%; }
+.sidebar-playtime-pill { position:absolute; left:50%; bottom:-6px; transform:translateX(-50%); z-index:3; display:none; align-items:center; justify-content:center; min-width:28px; max-width:52px; height:15px; padding:0 4px; box-sizing:border-box; white-space:nowrap; overflow:hidden; border-radius:999px; border:1px solid rgba(255,255,255,.58); background:rgba(7,13,24,.96); color:#fff; box-shadow:0 2px 6px rgba(0,0,0,.55),0 0 7px rgba(0,112,204,.24); font-size:8.5px; font-weight:800; line-height:13px; letter-spacing:.1px; font-variant-numeric:tabular-nums; pointer-events:none; }
+.sidebar-playtime-pill.is-visible { display:inline-flex; }
 
 .new-user-label.hover-only { opacity: 0; }
 .new-user-card { transition: opacity 0.28s ease,transform 0.34s cubic-bezier(0.22,1,0.36,1),filter 0.28s ease !important; transform-origin: center center; }
@@ -5766,7 +5770,10 @@ img { -webkit-user-drag: none !important; user-drag: none !important; }
 	
 			<div class="user-profile" style="display: flex; flex-direction: column; padding: 20px; border-top: 1px solid rgba(255, 255, 255, 0.05);">
 				<div id="user-profile-trigger" style="display: flex; align-items: center; gap: 15px; position: relative; cursor: pointer; padding: 8px; border-radius: 8px; transition: background 0.2s;" onmouseenter="playUiHover()">
-					<div class="user-avatar"></div>
+					<div class="sidebar-avatar-wrap">
+						<div class="user-avatar"></div>
+						<span id="sidebar-playtime-pill" class="sidebar-playtime-pill" data-no-translate="true" translate="no" aria-hidden="true"><span id="sidebar-playtime-value" data-playtime-format="compact">&lt;1m</span></span>
+					</div>
 					<div class="profile-trigger-info" style="flex-grow: 1;">
 						<div style="font-size: 11px; color: var(--text-muted);">PSN ID:</div>
 						<div id="sidebar-user-name" data-no-translate="true" translate="no" style="font-size: 13px; font-weight: bold; color: #fff; margin-bottom: 2px;">User Name</div>
@@ -16705,6 +16712,9 @@ P
                 sidebar.classList.add('active');
                 overlay.classList.add('active');
             }
+        }
+        if (typeof window.refreshLocalPs3PlayTimeTickerState === 'function') {
+            requestAnimationFrame(() => window.refreshLocalPs3PlayTimeTickerState());
         }
     };
 
@@ -43112,6 +43122,39 @@ P
 		return formatPs3PlayTimeSeconds(clock.baseSeconds + elapsed);
 	}
 
+	function formatCompactPs3PlayTime(value) {
+		const seconds = ps3PlayTimeToSeconds(value);
+		if (seconds < 0) return '';
+		if (seconds < 60) return '<1m';
+		const hours = Math.floor(seconds / 3600);
+		const minutes = Math.floor((seconds % 3600) / 60);
+		if (hours > 0) return minutes > 0 ? `${hours}h ${minutes}m` : `${hours}h`;
+		return `${minutes}m`;
+	}
+
+	function isSidebarPlayTimeVisible() {
+		const pill = document.getElementById('sidebar-playtime-pill');
+		if (!pill || !pill.classList.contains('is-visible')) return false;
+		const sidebar = pill.closest('.sidebar');
+		if (!sidebar) return false;
+		if (window.innerWidth <= 768 && !sidebar.classList.contains('active')) return false;
+		const rect = pill.getBoundingClientRect();
+		return rect.width > 0 && rect.height > 0 && rect.bottom > 0 && rect.right > 0 && rect.top < window.innerHeight && rect.left < window.innerWidth;
+	}
+
+	function syncSidebarPs3PlayTimeBadge() {
+		const pill = document.getElementById('sidebar-playtime-pill');
+		const valueEl = document.getElementById('sidebar-playtime-value');
+		if (!pill || !valueEl) return false;
+		const playing = !!(window.myCurrentPS3Status && window.myCurrentPS3Status.status === 'playing');
+		pill.classList.toggle('is-visible', playing);
+		pill.setAttribute('aria-hidden', playing ? 'false' : 'true');
+		if (!playing) return false;
+		const compact = formatCompactPs3PlayTime(getLocalPs3PlayTimeDisplayValue());
+		if (compact && valueEl.textContent !== compact) valueEl.textContent = compact;
+		return true;
+	}
+
 	function getVisibleLocalPs3PlayTimeTargets() {
 		const targets = [];
 		const registerTarget = (el, host, root = host) => {
@@ -43120,6 +43163,9 @@ P
 			el.__localPs3PlayTimeRoot = root || host || null;
 			targets.push(el);
 		};
+		syncSidebarPs3PlayTimeBadge();
+		const sidebarTime = document.getElementById('sidebar-playtime-value');
+		if (sidebarTime && isSidebarPlayTimeVisible()) registerTarget(sidebarTime, document.getElementById('user-profile-trigger'), document.querySelector('.sidebar'));
 		const profileModal = document.getElementById('modal-sys-profile');
 		if (profileModal && profileModal.classList.contains('show') && profileModal.style.display !== 'none') {
 			const profileTime = document.querySelector('#profile-playing-time[data-playtime-local="1"]');
@@ -43149,7 +43195,9 @@ P
 		if (window.currentPs3PlayTime !== value) { window.currentPs3PlayTime = value; changed = true; }
 		const liveTargets = Array.isArray(targets) ? targets : getVisibleLocalPs3PlayTimeTargets();
 		liveTargets.forEach(el => {
-			if (el && el.textContent !== value) { el.textContent = value; changed = true; }
+			if (!el) return;
+			const targetValue = el.dataset && el.dataset.playtimeFormat === 'compact' ? formatCompactPs3PlayTime(value) : value;
+			if (targetValue && el.textContent !== targetValue) { el.textContent = targetValue; changed = true; }
 		});
 		return changed;
 	}
@@ -43223,6 +43271,7 @@ P
 	}
 
 	function refreshLocalPs3PlayTimeTickerState() {
+		syncSidebarPs3PlayTimeBadge();
 		const targets = getVisibleLocalPs3PlayTimeTargets();
 		window.__localPs3PlayTimeTargets = targets;
 		if (!isLocalPs3PlayTimeTickerNeeded(targets)) {
@@ -43259,6 +43308,7 @@ P
 		window.__localPs3PlayTimeTargets = [];
 		window.__localPs3PlayTimeClock = { baseSeconds: -1, baseAt: 0, titleId: '' };
 		if (clearValue) window.currentPs3PlayTime = '--:--:--';
+		syncSidebarPs3PlayTimeBadge();
 	}
 
 	window.getLocalPs3PlayTimeDisplayValue = getLocalPs3PlayTimeDisplayValue;
@@ -43267,6 +43317,7 @@ P
 	window.startLocalPs3PlayTimeTicker = startLocalPs3PlayTimeTicker;
 	window.stopLocalPs3PlayTimeTicker = stopLocalPs3PlayTimeTicker;
 	window.refreshLocalPs3PlayTimeTickerState = refreshLocalPs3PlayTimeTickerState;
+	window.syncSidebarPs3PlayTimeBadge = syncSidebarPs3PlayTimeBadge;
 
 	function syncPs3PlayTimePresence(playTime) {
 		const status = window.myCurrentPS3Status;
