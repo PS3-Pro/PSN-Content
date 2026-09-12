@@ -1200,6 +1200,7 @@ let adminReports = [];
 let adminContentReports = [];
 let blockedStoreContent = [];
 let blockedStoreContentKeys = new Set();
+let blockedStoreContentByKey = new Map();
 let lastKnownOnlineList = [];
 let adminStateLastRefreshAt = 0;
 let adminStateRefreshInFlight = null;
@@ -3778,6 +3779,43 @@ function isStoreContentBlockedByKey(reportKey) {
   return !!key && blockedStoreContentKeys.has(key);
 }
 
+
+function normalizeBlockedStoreContentEntry(data = {}) {
+  const identity = normalizeStoreContentIdentity(data);
+  if (!identity.reportKey) return null;
+  return {
+    reportKey: identity.reportKey,
+    category: identity.category,
+    titleId: identity.titleId,
+    contentId: identity.contentId,
+    name: identity.name,
+    region: identity.region,
+    blockedBy: normalizeText(data.blockedBy || data.blocked_by, 'Admin'),
+    time: data.time || data.createdAt || data.created_at || new Date().toISOString()
+  };
+}
+
+function upsertBlockedStoreContentCache(rawEntry) {
+  const entry = normalizeBlockedStoreContentEntry(rawEntry || {});
+  if (!entry) return null;
+  const next = (Array.isArray(blockedStoreContent) ? blockedStoreContent : []).filter(item => item && item.reportKey !== entry.reportKey);
+  next.unshift(entry);
+  blockedStoreContent = next.slice(0, CONTENT_BLOCKS_MAX);
+  blockedStoreContentKeys.add(entry.reportKey);
+  blockedStoreContentByKey.set(entry.reportKey, entry);
+  return entry;
+}
+
+function removeBlockedStoreContentCache(rawReportKey) {
+  const reportKey = normalizeText(rawReportKey, '');
+  if (!reportKey) return null;
+  const previous = blockedStoreContentByKey.get(reportKey) || null;
+  blockedStoreContent = (Array.isArray(blockedStoreContent) ? blockedStoreContent : []).filter(item => item && item.reportKey !== reportKey);
+  blockedStoreContentKeys.delete(reportKey);
+  blockedStoreContentByKey.delete(reportKey);
+  return previous;
+}
+
 function buildAdminContentReportGroups(rows = []) {
   const groups = new Map();
   for (const row of (Array.isArray(rows) ? rows : [])) {
@@ -3864,6 +3902,7 @@ async function refreshBlockedStoreContentFromDb() {
     time: row.created_at ? new Date(row.created_at).toISOString() : new Date().toISOString()
   })).filter(item => item.reportKey);
   blockedStoreContentKeys = new Set(blockedStoreContent.map(item => item.reportKey));
+  blockedStoreContentByKey = new Map(blockedStoreContent.map(item => [item.reportKey, item]));
   return blockedStoreContent;
 }
 
@@ -3915,45 +3954,84 @@ async function getUserContentReport(userName, reportKey) {
   };
 }
 
-async function emitContentReportsMineToUsers(rawReporters = []) {
-  const reporters = [...new Set((Array.isArray(rawReporters) ? rawReporters : [rawReporters])
-    .map(value => normalizeText(value, ''))
-    .filter(Boolean))];
-  if (!reporters.length) return;
-
-  await Promise.all(reporters.map(async reporter => {
-    const sockets = getSocketsByUserName(reporter).filter(client => client && client.connected);
-    if (!sockets.length) return;
-    const mine = await getUserContentReports(reporter);
-    sockets.forEach(client => client.emit('content_reports_mine', mine));
-  }));
+function emitContentReportMineDeltaToUsers(rawReporter, delta = {}) {
+  const reporter = normalizeText(rawReporter, '');
+  if (!reporter) return 0;
+  const sockets = getSocketsByUserName(reporter).filter(client => client && client.connected);
+  if (!sockets.length) return 0;
+  const action = delta.action === 'remove' ? 'remove' : 'upsert';
+  const reportKey = normalizeText(delta.reportKey || (delta.report && delta.report.reportKey), '');
+  if (!reportKey) return 0;
+  const payload = action === 'remove'
+    ? { action, reportKey }
+    : { action, reportKey, report: delta.report || null };
+  sockets.forEach(client => client.emit('content_report_mine_delta', payload));
+  return sockets.length;
 }
 
 async function publishContentReportsChanged(options = {}) {
   const reporter = normalizeText(options.reporter, '');
   const clearedReportKey = normalizeText(options.clearedReportKey, '');
   const reportKey = normalizeText(options.reportKey || clearedReportKey, '');
-  if (reportKey) await refreshContentReportGroupFromDb(reportKey);
-  else await refreshContentReportsFromDb();
-  emitToAdmins('content_reports_list', adminContentReports);
+  const mineAction = options.mineAction === 'remove' ? 'remove' : (options.mineAction === 'upsert' ? 'upsert' : '');
+  const mineReport = options.mineReport && typeof options.mineReport === 'object' ? options.mineReport : null;
 
-  deferServerTask('CONTENT REPORTS NOTIFY', () => notifyAdminStateAcrossInstances(ADMIN_STATE_KEYS.contentReports, {
+  if (clearedReportKey) {
+    adminContentReports = (Array.isArray(adminContentReports) ? adminContentReports : []).filter(item => item && item.reportKey !== clearedReportKey);
+  } else if (reportKey && hasAdminSockets()) {
+    await refreshContentReportGroupFromDb(reportKey);
+  } else if (!reportKey && hasAdminSockets()) {
+    await refreshContentReportsFromDb();
+  }
+
+  if (hasAdminSockets()) emitToAdmins('content_reports_list', adminContentReports);
+
+  const state = {
     changedAt: Date.now(),
     reporter,
     reportKey,
-    clearedReportKey
-  }), 0);
+    clearedReportKey,
+    mineAction,
+    ...(mineAction === 'upsert' && mineReport ? { mineReport } : {})
+  };
+  deferServerTask('CONTENT REPORTS NOTIFY', () => notifyAdminStateAcrossInstances(ADMIN_STATE_KEYS.contentReports, state), 0);
 
-  if (reporter) await emitContentReportsMineToUsers([reporter]);
+  if (reporter && mineAction) {
+    emitContentReportMineDeltaToUsers(reporter, { action: mineAction, reportKey, report: mineReport });
+  }
   if (clearedReportKey) io.emit('content_report_cleared', { reportKey: clearedReportKey });
 }
 
-async function publishContentBlocksChanged() {
-  await refreshBlockedStoreContentFromDb();
+async function publishContentBlocksChanged(options = {}) {
+  const upsertBlock = options.upsertBlock && typeof options.upsertBlock === 'object' ? options.upsertBlock : null;
+  const removeReportKey = normalizeText(options.removeReportKey, '');
+  let delta = null;
+
+  if (upsertBlock) {
+    const entry = upsertBlockedStoreContentCache(upsertBlock);
+    if (entry) delta = { action: 'upsert', reportKey: entry.reportKey, block: entry };
+  } else if (removeReportKey) {
+    removeBlockedStoreContentCache(removeReportKey);
+    delta = { action: 'remove', reportKey: removeReportKey };
+  } else {
+    await refreshBlockedStoreContentFromDb();
+  }
+
+  if (delta) {
+    const publicDelta = delta.action === 'upsert'
+      ? { action: 'upsert', reportKey: delta.reportKey, block: { reportKey: delta.block.reportKey, category: delta.block.category, titleId: delta.block.titleId, contentId: delta.block.contentId } }
+      : { action: 'remove', reportKey: delta.reportKey };
+    io.emit('content_block_delta', publicDelta);
+    if (hasAdminSockets()) emitToAdmins('content_block_admin_delta', delta);
+    deferServerTask('CONTENT BLOCKS NOTIFY', () => notifyAdminStateAcrossInstances(ADMIN_STATE_KEYS.contentBlocks, { changedAt: Date.now(), delta }), 0);
+    return blockedStoreContent;
+  }
+
   const publicBlocks = getPublicBlockedStoreContent();
   io.emit('content_blocks_state', publicBlocks);
-  emitToAdmins('content_blocks_list', blockedStoreContent);
+  if (hasAdminSockets()) emitToAdmins('content_blocks_list', blockedStoreContent);
   deferServerTask('CONTENT BLOCKS NOTIFY', () => notifyAdminStateAcrossInstances(ADMIN_STATE_KEYS.contentBlocks, { changedAt: Date.now() }), 0);
+  return blockedStoreContent;
 }
 
 async function searchUsersFromDb(query, includeAdminFields = false, includeAllMatches = false) {
@@ -6964,25 +7042,39 @@ async function initProfileSyncNotifications() {
           return;
         }
         if (key === ADMIN_STATE_KEYS.contentReports) {
-          const previousSignature = JSON.stringify(Array.isArray(adminContentReports) ? adminContentReports : []);
-          const changedReportKey = normalizeText(data && data.state && (data.state.reportKey || data.state.clearedReportKey), '');
-          if (changedReportKey) await refreshContentReportGroupFromDb(changedReportKey);
-          else await refreshContentReportsFromDb();
-          const nextSignature = JSON.stringify(Array.isArray(adminContentReports) ? adminContentReports : []);
-          if (previousSignature !== nextSignature) emitToAdmins('content_reports_list', adminContentReports);
-          const reporter = normalizeText(data && data.state && data.state.reporter, '');
-          if (reporter) await emitContentReportsMineToUsers([reporter]);
-          const clearedReportKey = normalizeText(data && data.state && data.state.clearedReportKey, '');
+          const state = data && data.state && typeof data.state === 'object' ? data.state : {};
+          const changedReportKey = normalizeText(state.reportKey || state.clearedReportKey, '');
+          const clearedReportKey = normalizeText(state.clearedReportKey, '');
+          if (hasAdminSockets()) {
+            if (clearedReportKey) adminContentReports = (Array.isArray(adminContentReports) ? adminContentReports : []).filter(item => item && item.reportKey !== clearedReportKey);
+            else if (changedReportKey) await refreshContentReportGroupFromDb(changedReportKey);
+            else await refreshContentReportsFromDb();
+            emitToAdmins('content_reports_list', adminContentReports);
+          }
+          const reporter = normalizeText(state.reporter, '');
+          const mineAction = state.mineAction === 'remove' ? 'remove' : (state.mineAction === 'upsert' ? 'upsert' : '');
+          if (reporter && mineAction) emitContentReportMineDeltaToUsers(reporter, { action: mineAction, reportKey: changedReportKey, report: state.mineReport || null });
           if (clearedReportKey) io.emit('content_report_cleared', { reportKey: clearedReportKey });
           return;
         }
         if (key === ADMIN_STATE_KEYS.contentBlocks) {
-          const previousSignature = JSON.stringify(Array.isArray(blockedStoreContent) ? blockedStoreContent : []);
-          await refreshBlockedStoreContentFromDb();
-          const nextSignature = JSON.stringify(Array.isArray(blockedStoreContent) ? blockedStoreContent : []);
-          if (previousSignature !== nextSignature) {
+          const state = data && data.state && typeof data.state === 'object' ? data.state : {};
+          const delta = state.delta && typeof state.delta === 'object' ? state.delta : null;
+          if (delta && delta.action === 'upsert' && delta.block) {
+            const entry = upsertBlockedStoreContentCache(delta.block);
+            if (!entry) return;
+            io.emit('content_block_delta', { action: 'upsert', reportKey: entry.reportKey, block: { reportKey: entry.reportKey, category: entry.category, titleId: entry.titleId, contentId: entry.contentId } });
+            if (hasAdminSockets()) emitToAdmins('content_block_admin_delta', { action: 'upsert', reportKey: entry.reportKey, block: entry });
+          } else if (delta && delta.action === 'remove') {
+            const reportKey = normalizeText(delta.reportKey, '');
+            if (!reportKey) return;
+            removeBlockedStoreContentCache(reportKey);
+            io.emit('content_block_delta', { action: 'remove', reportKey });
+            if (hasAdminSockets()) emitToAdmins('content_block_admin_delta', { action: 'remove', reportKey });
+          } else {
+            await refreshBlockedStoreContentFromDb();
             io.emit('content_blocks_state', getPublicBlockedStoreContent());
-            emitToAdmins('content_blocks_list', blockedStoreContent);
+            if (hasAdminSockets()) emitToAdmins('content_blocks_list', blockedStoreContent);
           }
           return;
         }
@@ -11304,7 +11396,7 @@ io.on('connection', (socket) => {
     const respond = typeof callback === 'function' ? callback : () => {};
     try {
       const blocks = getPublicBlockedStoreContent();
-      socket.emit('content_blocks_state', blocks);
+      if (!(data && data.callbackOnly === true)) socket.emit('content_blocks_state', blocks);
       respond({ success: true, blocks });
     } catch (err) {
       console.error('[CONTENT BLOCKS REQUEST ERROR]:', err);
@@ -11318,7 +11410,7 @@ io.on('connection', (socket) => {
       const reporter = normalizeText(socket.userName, '');
       if (!reporter || !userDatabase[reporter]) return respond({ success: false, authenticated: false, reports: [] });
       const reports = await getUserContentReports(reporter);
-      socket.emit('content_reports_mine', reports);
+      if (!(data && data.callbackOnly === true)) socket.emit('content_reports_mine', reports);
       respond({ success: true, reports });
     } catch (err) {
       console.error('[CONTENT REPORT MINE ERROR]:', err);
@@ -11391,7 +11483,7 @@ io.on('connection', (socket) => {
         updatedAt: row.updated_at ? new Date(row.updated_at).toISOString() : new Date().toISOString()
       };
 
-      await publishContentReportsChanged({ reporter, reportKey: identity.reportKey });
+      await publishContentReportsChanged({ reporter, reportKey: identity.reportKey, mineAction: 'upsert', mineReport: report });
       emitToAdmins('admin_content_report_created', {
         ...identity,
         reporter,
@@ -11418,7 +11510,7 @@ io.on('connection', (socket) => {
         [reporter, identity.reportKey],
         { attempts: 3, label: 'CONTENT REPORT REMOVE' }
       );
-      await publishContentReportsChanged({ reporter, reportKey: identity.reportKey });
+      await publishContentReportsChanged({ reporter, reportKey: identity.reportKey, mineAction: 'remove' });
       respond({ success: true, removed: result.rowCount > 0 });
     } catch (err) {
       console.error('[CONTENT REPORT REMOVE ERROR]:', err);
@@ -11432,8 +11524,10 @@ io.on('connection', (socket) => {
       if (socket.isAdmin !== true) return respond({ success: false, message: 'Admin only.' });
       await refreshContentReportsFromDb();
       await refreshBlockedStoreContentFromDb();
-      socket.emit('content_reports_list', adminContentReports);
-      socket.emit('content_blocks_list', blockedStoreContent);
+      if (!(data && data.callbackOnly === true)) {
+        socket.emit('content_reports_list', adminContentReports);
+        socket.emit('content_blocks_list', blockedStoreContent);
+      }
       respond({ success: true, reports: adminContentReports, blockedContent: blockedStoreContent });
     } catch (err) {
       console.error('[ADMIN CONTENT REPORTS REQUEST ERROR]:', err);
@@ -11497,9 +11591,10 @@ io.on('connection', (socket) => {
         await client.query('DELETE FROM content_reports WHERE report_key = $1', [identity.reportKey]);
       }, { advisoryLockKey: `content-block:${identity.reportKey}` });
       await publishContentReportsChanged({ reportKey: identity.reportKey, clearedReportKey: identity.reportKey });
-      await publishContentBlocksChanged();
+      const blockedEntry = { ...identity, blockedBy: socket.userName || 'Admin', time: new Date().toISOString() };
+      await publishContentBlocksChanged({ upsertBlock: blockedEntry });
       await addModerationLog('content_block', `Blocked ${identity.titleId || identity.contentId} from Store`, identity, socket.userName || 'Admin');
-      respond({ success: true, block: blockedStoreContent.find(item => item.reportKey === identity.reportKey) || identity });
+      respond({ success: true, block: blockedStoreContentByKey.get(identity.reportKey) || blockedEntry });
     } catch (err) {
       console.error('[ADMIN CONTENT BLOCK ERROR]:', err);
       respond({ success: false, message: 'Could not block this Store content.' });
@@ -11512,9 +11607,9 @@ io.on('connection', (socket) => {
       if (socket.isAdmin !== true) return respond({ success: false, message: 'Admin only.' });
       const reportKey = normalizeText(data && data.reportKey, '');
       if (!reportKey) return respond({ success: false, message: 'Missing content key.' });
-      const previous = (Array.isArray(blockedStoreContent) ? blockedStoreContent : []).find(item => item && item.reportKey === reportKey) || null;
+      const previous = blockedStoreContentByKey.get(reportKey) || null;
       await queryDbWithRetry('DELETE FROM content_blocks WHERE report_key = $1', [reportKey], { attempts: 3, label: 'ADMIN CONTENT UNBLOCK' });
-      await publishContentBlocksChanged();
+      await publishContentBlocksChanged({ removeReportKey: reportKey });
       await addModerationLog('content_unblock', `Unblocked ${previous && (previous.titleId || previous.contentId) || reportKey} from Store`, previous || { reportKey }, socket.userName || 'Admin');
       respond({ success: true });
     } catch (err) {
