@@ -46702,7 +46702,11 @@ function formatLibraryLastPlayedBadge(game = {}) {
 
 	async function companionCancelPs3Dialog(ip) {
 		if (!ip) return false;
-		return companionWebmanCommand(ip, COMPANION_PS3_CANCEL_COMMAND, 7000);
+		const padPageActive = !!(document.body && document.body.classList.contains('ps3-pad-page-active'));
+		const command = padPageActive
+			? COMPANION_PS3_CANCEL_COMMAND
+			: `${COMPANION_PS3_CANCEL_COMMAND};/pad.ps3?off`;
+		return companionWebmanCommand(ip, command, 7000);
 	}
 
 	async function companionFileExists(ip, path) {
@@ -76783,7 +76787,6 @@ function getVisibleChatStackEl(id) {
        if (!userLogged && document.body.classList.contains('ps3-pad-page-active')) {
             manualPadOpen = false;
             padOpenedByButton = false;
-            releaseHold();
             setPadPageOpen(false);
         }
     }
@@ -76846,7 +76849,7 @@ function getVisibleChatStackEl(id) {
             if (wasOpen) {
                 releaseKeyboardPadKeys();
                 stopPhysicalGamepadPolling(false);
-                releaseHold();
+                disableVirtualPadSession();
                 updatePhysicalPadStatus(null);
                 setPhysicalKeyboardPillDetected(false);
                 closePadControllerInfo();
@@ -76885,14 +76888,36 @@ function getVisibleChatStackEl(id) {
         setPadPageOpen(shouldOpenPadPage(linked), linked);
     }
 
-    function sendPadPath(path) {
+    function isVirtualPadPageActive() {
+        return !!(document.body && document.body.classList.contains('ps3-pad-page-active'));
+    }
+
+    function sendPadPath(path, options = null) {
+        const opts = options && typeof options === 'object' ? options : {};
+        if (!opts.allowInactive && !isVirtualPadPageActive()) return false;
+
         const ip = getPadPs3Ip();
-        if (!ip) return;
+        if (!ip) return false;
 
         const cleanIp = ip.replace(/^https?:\/\//i, '').replace(/\/$/, '');
         try {
-            fetch(`http://${cleanIp}${path}`, { mode: 'no-cors', cache: 'no-store' }).catch(function () {});
-        } catch (err) {}
+            fetch(`http://${cleanIp}${path}`, {
+                mode: 'no-cors',
+                cache: 'no-store',
+                keepalive: opts.keepalive === true
+            }).catch(function () {});
+            return true;
+        } catch (err) {
+            return false;
+        }
+    }
+
+    function disableVirtualPadSession(options = null) {
+        const opts = options && typeof options === 'object' ? options : {};
+        return sendPadPath('/pad.ps3?off', {
+            allowInactive: true,
+            keepalive: opts.keepalive === true
+        });
     }
 
     function sendTap(command) {
@@ -77317,22 +77342,29 @@ function getVisibleChatStackEl(id) {
 
         document.addEventListener('visibilitychange', function () {
             if (document.hidden) {
-                stopPhysicalGamepadPolling(true);
-            } else if (document.body.classList.contains('ps3-pad-page-active')) {
+                const wasPadActive = isVirtualPadPageActive();
+                stopPhysicalGamepadPolling(false);
+                if (wasPadActive) disableVirtualPadSession();
+            } else if (isVirtualPadPageActive()) {
                 startPhysicalGamepadPolling();
             }
         });
 
         window.addEventListener('blur', function () {
-            if (document.body.classList.contains('ps3-pad-page-active')) {
-                stopPhysicalGamepadPolling(true);
+            if (isVirtualPadPageActive()) {
+                stopPhysicalGamepadPolling(false);
+                disableVirtualPadSession();
             }
         });
 
         window.addEventListener('focus', function () {
-            if (document.body.classList.contains('ps3-pad-page-active')) {
+            if (isVirtualPadPageActive()) {
                 startPhysicalGamepadPolling();
             }
+        });
+
+        window.addEventListener('pagehide', function () {
+            if (isVirtualPadPageActive()) disableVirtualPadSession({ keepalive: true });
         });
     }
 
@@ -78015,7 +78047,6 @@ function getVisibleChatStackEl(id) {
         manualPadOpen = false;
         padOpenedByButton = false;
         padHistoryActive = false;
-        releaseHold();
         setPadPageOpen(false);
         restorePreviousOrientation();
     }
@@ -78034,7 +78065,6 @@ function getVisibleChatStackEl(id) {
         manualPadOpen = false;
         padOpenedByButton = false;
         padHistoryActive = false;
-        releaseHold();
         setPadPageOpen(false);
         restorePreviousOrientation();
     }
@@ -78643,7 +78673,16 @@ function getVisibleChatStackEl(id) {
 
         const globalStatusIcon = document.getElementById('global-status-icon');
         if (globalStatusIcon && window.MutationObserver) {
+            let padConsoleWasConnected = isPs3LinkedForPad();
+            if (padConsoleWasConnected && !isVirtualPadPageActive()) disableVirtualPadSession();
+
             const connectionObserver = new MutationObserver(function () {
+                const padConsoleConnected = isPs3LinkedForPad();
+                if (padConsoleConnected && !padConsoleWasConnected && !isVirtualPadPageActive()) {
+                    disableVirtualPadSession();
+                }
+                padConsoleWasConnected = padConsoleConnected;
+
                 markMobilePadCapability();
                 if (document.body.classList.contains('ps3-pad-page-active') || manualPadOpen || padHistoryActive) {
                     refreshPadPage();
