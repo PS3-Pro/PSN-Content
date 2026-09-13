@@ -52588,6 +52588,28 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 		}, 1500);
 	};
 	
+	function psnGetTrophyUnlockTime(state) {
+		if (!state || !state.unlocked) return 0;
+		const raw = String(state.unlockDate || '').trim();
+		if (!raw) return 0;
+
+		// Trophy dates are stored for display as "Sep 12, 2026 - 20:53".
+		// Parse that format explicitly instead of relying on Date.parse/new Date,
+		// which treats the separator as invalid in Chromium/Node.
+		const match = raw.match(/^([A-Za-z]{3})\s+(\d{1,2}),\s+(\d{4})\s+-\s+(\d{1,2}):(\d{2})$/);
+		if (match) {
+			const months = { Jan:0, Feb:1, Mar:2, Apr:3, May:4, Jun:5, Jul:6, Aug:7, Sep:8, Oct:9, Nov:10, Dec:11 };
+			const month = months[match[1]];
+			if (month !== undefined) {
+				const time = new Date(Number(match[3]), month, Number(match[2]), Number(match[4]), Number(match[5]), 0, 0).getTime();
+				if (Number.isFinite(time)) return time;
+			}
+		}
+
+		const fallback = Date.parse(raw);
+		return Number.isFinite(fallback) ? fallback : 0;
+	}
+
 	window.renderTrophiesView = function(isSilent = false, options = {}) {
 		isSilent = isSilent || !!window.isRestoringHistory;
 		const grid = document.getElementById('trophy-grid-container');
@@ -52655,7 +52677,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 			trophySortMeta.set(id, {
 				trophy, state,
 				pct: Number(window.globalTrophyStats[id] || 0.1),
-				unlockTime: state.unlocked && state.unlockDate ? (new Date(state.unlockDate).getTime() || 0) : 0,
+				unlockTime: psnGetTrophyUnlockTime(state),
 				groupWeight: trophyGroupOrder[trophy.group] || 999,
 				gradeWeight: TROPHY_WEIGHT[trophy.type] || 999
 			});
@@ -52664,13 +52686,19 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 			const aMeta = trophySortMeta.get(a);
 			const bMeta = trophySortMeta.get(b);
 			let result = 0;
+			if (currentSort === 'date') {
+				const aUnlocked = aMeta.state.unlocked === true;
+				const bUnlocked = bMeta.state.unlocked === true;
+				// Locked trophies have no earned date, so keep them at the bottom
+				// regardless of which direction the earned-date sort is using.
+				if (aUnlocked !== bUnlocked) return aUnlocked ? -1 : 1;
+				if (!aUnlocked) return 0;
+				return currentOrder === 'asc'
+					? aMeta.unlockTime - bMeta.unlockTime
+					: bMeta.unlockTime - aMeta.unlockTime;
+			}
 			if (currentSort === 'rarity') result = aMeta.pct - bMeta.pct;
-			else if (currentSort === 'date') {
-				if (!aMeta.state.unlocked && !bMeta.state.unlocked) result = 0;
-				else if (!aMeta.state.unlocked) result = 1;
-				else if (!bMeta.state.unlocked) result = -1;
-				else result = bMeta.unlockTime - aMeta.unlockTime;
-			} else if (currentSort === 'grade') result = aMeta.gradeWeight - bMeta.gradeWeight;
+			else if (currentSort === 'grade') result = aMeta.gradeWeight - bMeta.gradeWeight;
 			else result = aMeta.groupWeight !== bMeta.groupWeight ? aMeta.groupWeight - bMeta.groupWeight : aMeta.gradeWeight - bMeta.gradeWeight;
 			return result * sortMultiplier;
 		});
