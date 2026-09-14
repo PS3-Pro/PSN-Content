@@ -91,7 +91,8 @@ const ADMIN_STATE_KEYS = {
   pinnedAnnouncement: "pinned_announcement",
   reports: "reports",
   contentReports: "content_reports",
-  contentBlocks: "content_blocks"
+  contentBlocks: "content_blocks",
+  metadataOverrides: "content_metadata_overrides"
 };
 
 // ============================================================================
@@ -1203,6 +1204,14 @@ let adminContentReports = [];
 let blockedStoreContent = [];
 let blockedStoreContentKeys = new Set();
 let blockedStoreContentByKey = new Map();
+let contentMetadataOverrides = [];
+let contentMetadataOverridesByKey = new Map();
+let contentMetadataOverridesOrderDirty = false;
+let contentMetadataOverridesPublicCache = null;
+let contentMetadataOverridesRefreshPromise = null;
+let contentMetadataOverridesMutationRevision = 0;
+let contentMetadataOverridesLastDbRefreshAt = 0;
+const CONTENT_METADATA_OVERRIDES_DB_FRESH_MS = 30000;
 let lastKnownOnlineList = [];
 let adminStateLastRefreshAt = 0;
 let adminStateRefreshInFlight = null;
@@ -1364,6 +1373,18 @@ async function initDb() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
     CREATE INDEX IF NOT EXISTS idx_content_blocks_title_id ON content_blocks(title_id);
+    CREATE TABLE IF NOT EXISTS content_metadata_overrides (
+      metadata_key TEXT PRIMARY KEY,
+      category TEXT NOT NULL,
+      title_id TEXT NOT NULL,
+      content_id TEXT NOT NULL DEFAULT '',
+      data JSONB NOT NULL DEFAULT '{}'::jsonb,
+      updated_by TEXT NOT NULL DEFAULT '',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_content_metadata_overrides_title_id ON content_metadata_overrides(title_id);
+    CREATE INDEX IF NOT EXISTS idx_content_metadata_overrides_updated_at ON content_metadata_overrides(updated_at DESC);
     CREATE TABLE IF NOT EXISTS deleted_accounts (
       name TEXT PRIMARY KEY,
       data JSONB,
@@ -1542,6 +1563,7 @@ async function initDb() {
   adminReports = reportsRes.rows.map(r => r.data);
   await refreshContentReportsFromDb();
   await refreshBlockedStoreContentFromDb();
+  await refreshContentMetadataOverridesFromDb();
 
   const modLogRes = await pool.query(`SELECT entry FROM moderation_log ORDER BY created_at DESC LIMIT ${MODERATION_LOG_HISTORY_MAX}`);
   moderationLog = modLogRes.rows.map(r => r.entry);
@@ -3780,6 +3802,250 @@ function getPublicBlockedStoreContent() {
     titleId: item.titleId,
     contentId: item.contentId
   }));
+}
+
+function normalizeContentMetadataString(value, maxLength = 220) {
+  return String(value === undefined || value === null ? '' : value)
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n')
+    .trim()
+    .slice(0, maxLength);
+}
+
+function normalizeContentMetadataList(value, maxItems = 20, maxLength = 80) {
+  const raw = Array.isArray(value) ? value : String(value || '').split(',');
+  const seen = new Set();
+  const out = [];
+  for (const item of raw) {
+    const clean = normalizeContentMetadataString(item, maxLength).replace(/\s+/g, ' ');
+    if (!clean) continue;
+    const key = clean.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(clean);
+    if (out.length >= maxItems) break;
+  }
+  return out;
+}
+
+function normalizeContentMetadataOverride(data = {}) {
+  const identity = normalizeStoreContentIdentity(data);
+  if (!identity.reportKey) return null;
+  const rawScore = data.score;
+  let score = null;
+  if (rawScore !== '' && rawScore !== null && rawScore !== undefined) {
+    const number = Number(rawScore);
+    if (Number.isFinite(number)) score = Math.max(0, Math.min(100, Math.round(number)));
+  }
+  const rawYear = normalizeContentMetadataString(data.year, 4);
+  const year = /^(?:19|20)\d{2}$/.test(rawYear) ? rawYear : '';
+  let coverUrl = normalizeContentMetadataString(data.coverUrl || data.cover, 1200);
+  if (coverUrl && !/^https?:\/\//i.test(coverUrl)) coverUrl = '';
+  const entry = {
+    metadataKey: identity.reportKey,
+    category: identity.category,
+    titleId: identity.titleId,
+    contentId: identity.contentId,
+    title: normalizeContentMetadataString(data.title || data.displayTitle, 220).replace(/[\r\n\t]+/g, ' '),
+    summary: normalizeContentMetadataString(data.summary || data.description, 5000),
+    coverUrl,
+    score,
+    year,
+    genres: normalizeContentMetadataList(data.genres, 8, 60),
+    tags: normalizeContentMetadataList(data.tags, 16, 60),
+    cast: normalizeContentMetadataList(data.cast, 20, 90),
+    director: normalizeContentMetadataString(data.director, 160).replace(/[\r\n\t]+/g, ' '),
+    updatedBy: normalizeText(data.updatedBy || data.updated_by, '').slice(0, 120),
+    updatedAt: data.updatedAt || data.updated_at || new Date().toISOString()
+  };
+  entry.hasValues = !!(entry.title || entry.summary || entry.coverUrl || entry.score !== null || entry.year || entry.genres.length || entry.tags.length || entry.cast.length || entry.director);
+  const updatedAtMs = Date.parse(entry.updatedAt || '');
+  Object.defineProperty(entry, '__metadataUpdatedAtMs', { value: Number.isFinite(updatedAtMs) ? updatedAtMs : 0, configurable: true });
+  return entry;
+}
+
+function normalizeContentMetadataOverrideRow(row = {}) {
+  const payload = row.data && typeof row.data === 'object' ? row.data : {};
+  return normalizeContentMetadataOverride({
+    ...payload,
+    category: row.category,
+    titleId: row.title_id,
+    contentId: row.content_id,
+    updatedBy: row.updated_by,
+    updatedAt: row.updated_at ? new Date(row.updated_at).toISOString() : new Date().toISOString()
+  });
+}
+
+function getContentMetadataOverrideUpdatedAtMs(entry) {
+  if (!entry) return 0;
+  const cached = Number(entry.__metadataUpdatedAtMs);
+  if (Number.isFinite(cached)) return cached;
+  const value = Date.parse(entry.updatedAt || '');
+  return Number.isFinite(value) ? value : 0;
+}
+
+function contentMetadataOverrideEntryEquals(a, b) {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  if (a.metadataKey !== b.metadataKey || a.category !== b.category || a.titleId !== b.titleId || a.contentId !== b.contentId
+      || a.title !== b.title || a.summary !== b.summary || a.coverUrl !== b.coverUrl || a.score !== b.score || a.year !== b.year
+      || a.director !== b.director || a.updatedBy !== b.updatedBy || a.updatedAt !== b.updatedAt) return false;
+  const sameList = (left, right) => {
+    if (left === right) return true;
+    if (!Array.isArray(left) || !Array.isArray(right) || left.length !== right.length) return false;
+    for (let i = 0; i < left.length; i++) if (left[i] !== right[i]) return false;
+    return true;
+  };
+  return sameList(a.genres, b.genres) && sameList(a.tags, b.tags) && sameList(a.cast, b.cast);
+}
+
+function contentMetadataOverrideMapEquals(left, right) {
+  if (left === right) return true;
+  if (!(left instanceof Map) || !(right instanceof Map) || left.size !== right.size) return false;
+  for (const [key, entry] of right) if (!contentMetadataOverrideEntryEquals(left.get(key), entry)) return false;
+  return true;
+}
+
+function invalidateContentMetadataOverridesSnapshot() {
+  contentMetadataOverridesOrderDirty = true;
+  contentMetadataOverridesPublicCache = null;
+}
+
+function getOrderedContentMetadataOverrides() {
+  if (contentMetadataOverridesOrderDirty) {
+    contentMetadataOverrides = Array.from(contentMetadataOverridesByKey.values()).sort((a, b) => getContentMetadataOverrideUpdatedAtMs(b) - getContentMetadataOverrideUpdatedAtMs(a));
+    contentMetadataOverridesOrderDirty = false;
+  }
+  return contentMetadataOverrides;
+}
+
+function setContentMetadataOverrideCache(rawEntry) {
+  const alreadyNormalized = !!(rawEntry && typeof rawEntry === 'object' && rawEntry.metadataKey && typeof rawEntry.hasValues === 'boolean' && Object.prototype.hasOwnProperty.call(rawEntry, '__metadataUpdatedAtMs'));
+  const entry = alreadyNormalized ? rawEntry : normalizeContentMetadataOverride(rawEntry || {});
+  if (!entry || !entry.hasValues) return null;
+  const previous = contentMetadataOverridesByKey.get(entry.metadataKey) || null;
+  if (previous && contentMetadataOverrideEntryEquals(previous, entry)) return previous;
+  contentMetadataOverridesByKey.set(entry.metadataKey, entry);
+  contentMetadataOverridesMutationRevision++;
+  contentMetadataOverridesLastDbRefreshAt = Date.now();
+  invalidateContentMetadataOverridesSnapshot();
+  return entry;
+}
+
+function removeContentMetadataOverrideCache(rawKey) {
+  const key = normalizeText(rawKey, '');
+  if (!key) return null;
+  const previous = contentMetadataOverridesByKey.get(key) || null;
+  if (!previous) return null;
+  contentMetadataOverridesByKey.delete(key);
+  contentMetadataOverridesMutationRevision++;
+  contentMetadataOverridesLastDbRefreshAt = Date.now();
+  invalidateContentMetadataOverridesSnapshot();
+  return previous;
+}
+
+async function refreshContentMetadataOverridesFromDb(options = {}) {
+  const maxAgeMs = Math.max(0, Number(options && options.maxAgeMs) || 0);
+  if (maxAgeMs > 0 && contentMetadataOverridesLastDbRefreshAt && Date.now() - contentMetadataOverridesLastDbRefreshAt < maxAgeMs) return getOrderedContentMetadataOverrides();
+  if (contentMetadataOverridesRefreshPromise) return contentMetadataOverridesRefreshPromise;
+  const refreshRevision = contentMetadataOverridesMutationRevision;
+  const refreshPromise = (async () => {
+    const result = await queryDbWithRetry(
+      `SELECT metadata_key, category, title_id, content_id, data, updated_by, updated_at
+       FROM content_metadata_overrides
+       ORDER BY updated_at DESC`,
+      [],
+      { attempts: 2, label: 'CONTENT METADATA OVERRIDES READ' }
+    );
+    const nextByKey = new Map();
+    const nextOrdered = [];
+    for (const row of (result.rows || [])) {
+      const entry = normalizeContentMetadataOverrideRow(row);
+      if (!entry || !entry.hasValues || nextByKey.has(entry.metadataKey)) continue;
+      nextByKey.set(entry.metadataKey, entry);
+      nextOrdered.push(entry);
+    }
+    // A realtime/admin mutation may land while this SELECT is in flight. Do not let an
+    // older snapshot overwrite the newer in-memory delta; the next explicit refresh can
+    // reconcile from PostgreSQL without causing a visible rollback in the meantime.
+    if (contentMetadataOverridesMutationRevision !== refreshRevision) return getOrderedContentMetadataOverrides();
+    if (contentMetadataOverrideMapEquals(contentMetadataOverridesByKey, nextByKey)) {
+      contentMetadataOverridesLastDbRefreshAt = Date.now();
+      return getOrderedContentMetadataOverrides();
+    }
+    contentMetadataOverridesByKey = nextByKey;
+    contentMetadataOverrides = nextOrdered;
+    contentMetadataOverridesMutationRevision++;
+    contentMetadataOverridesOrderDirty = false;
+    contentMetadataOverridesPublicCache = null;
+    contentMetadataOverridesLastDbRefreshAt = Date.now();
+    return contentMetadataOverrides;
+  })();
+  contentMetadataOverridesRefreshPromise = refreshPromise;
+  try {
+    return await refreshPromise;
+  } finally {
+    if (contentMetadataOverridesRefreshPromise === refreshPromise) contentMetadataOverridesRefreshPromise = null;
+  }
+}
+
+function toPublicContentMetadataOverride(entry) {
+  if (!entry) return null;
+  // Socket payloads are intentionally sparse. Clients normalize missing optional fields back
+  // to their empty defaults, so there is no reason to resend empty strings/arrays on every sync.
+  const out = {
+    metadataKey: entry.metadataKey, category: entry.category, titleId: entry.titleId, contentId: entry.contentId,
+    updatedAt: entry.updatedAt
+  };
+  if (entry.title) out.title = entry.title;
+  if (entry.summary) out.summary = entry.summary;
+  if (entry.coverUrl) out.coverUrl = entry.coverUrl;
+  if (entry.score !== null && entry.score !== undefined) out.score = entry.score;
+  if (entry.year) out.year = entry.year;
+  if (Array.isArray(entry.genres) && entry.genres.length) out.genres = entry.genres;
+  if (Array.isArray(entry.tags) && entry.tags.length) out.tags = entry.tags;
+  if (Array.isArray(entry.cast) && entry.cast.length) out.cast = entry.cast;
+  if (entry.director) out.director = entry.director;
+  if (entry.updatedBy) out.updatedBy = entry.updatedBy;
+  return out;
+}
+
+function getPublicContentMetadataOverrides() {
+  if (contentMetadataOverridesPublicCache) return contentMetadataOverridesPublicCache;
+  // Keep server-only bookkeeping (hasValues / cached timestamps) off every socket payload.
+  contentMetadataOverridesPublicCache = getOrderedContentMetadataOverrides().map(toPublicContentMetadataOverride);
+  return contentMetadataOverridesPublicCache;
+}
+
+function getContentMetadataOverridesSyncMeta() {
+  return {
+    metadataInstanceId: INSTANCE_ID,
+    metadataRevision: contentMetadataOverridesMutationRevision
+  };
+}
+
+async function publishContentMetadataOverridesChanged(options = {}) {
+  const upsertOverride = options.upsertOverride && typeof options.upsertOverride === 'object' ? options.upsertOverride : null;
+  const removeKey = normalizeText(options.removeKey, '');
+  let delta = null;
+  if (upsertOverride) {
+    const entry = setContentMetadataOverrideCache(upsertOverride);
+    if (entry) delta = { action: 'upsert', metadataKey: entry.metadataKey, override: toPublicContentMetadataOverride(entry) };
+  } else if (removeKey) {
+    removeContentMetadataOverrideCache(removeKey);
+    delta = { action: 'remove', metadataKey: removeKey };
+  } else {
+    await refreshContentMetadataOverridesFromDb();
+  }
+  if (delta) {
+    io.emit('content_metadata_override_delta', { ...delta, ...getContentMetadataOverridesSyncMeta() });
+    deferServerTask('CONTENT METADATA OVERRIDES NOTIFY', () => notifyAdminStateAcrossInstances(ADMIN_STATE_KEYS.metadataOverrides, { changedAt: Date.now(), delta }), 0);
+    return true;
+  }
+  const list = getPublicContentMetadataOverrides();
+  io.emit('content_metadata_overrides_state', list, getContentMetadataOverridesSyncMeta());
+  deferServerTask('CONTENT METADATA OVERRIDES NOTIFY', () => notifyAdminStateAcrossInstances(ADMIN_STATE_KEYS.metadataOverrides, { changedAt: Date.now() }), 0);
+  return true;
 }
 
 function isStoreContentBlockedByKey(reportKey) {
@@ -6416,11 +6682,12 @@ async function syncChatAcrossInstances() {
 // Admin state, logs, socket indexes & profile realtime sync
 // ============================================================================
 async function emitAdminState(socket) {
-  if (socket.isAdmin === true) await refreshBlockedStoreContentFromDb();
+  if (socket.isAdmin === true) await Promise.all([refreshBlockedStoreContentFromDb(), refreshContentMetadataOverridesFromDb({ maxAgeMs: profileSyncListenReady ? CONTENT_METADATA_OVERRIDES_DB_FRESH_MS : 0 })]);
   socket.emit('maintenance_mode', adminState.maintenance);
   socket.emit('chat_controls', adminState.chatControls);
   socket.emit('admin_pinned_announcement', adminState.pinnedAnnouncement || { clear: true });
   socket.emit('content_blocks_state', getPublicBlockedStoreContent());
+  if (!(socket.isAdmin === true && socket.profileSyncV2 === true)) socket.emit('content_metadata_overrides_state', getPublicContentMetadataOverrides(), getContentMetadataOverridesSyncMeta());
 
   if (socket.isAdmin === true) {
     await refreshReportsFromDb();
@@ -6433,6 +6700,9 @@ async function emitAdminState(socket) {
       reports: adminReports,
       contentReports: adminContentReports,
       blockedContent: blockedStoreContent,
+      metadataOverrides: getPublicContentMetadataOverrides(),
+      metadataOverridesInstanceId: INSTANCE_ID,
+      metadataOverridesRevision: contentMetadataOverridesMutationRevision,
       serverLog,
       registeredUsers: Object.keys(userDatabase).length,
       countryStats: getAdminCountryStats(),
@@ -6929,8 +7199,9 @@ async function notifyServerLogAcrossInstances(entry) {
 
 async function recoverModerationSyncAfterListenGap() {
   try {
-    await refreshBlockedStoreContentFromDb();
+    await Promise.all([refreshBlockedStoreContentFromDb(), refreshContentMetadataOverridesFromDb()]);
     io.emit('content_blocks_state', getPublicBlockedStoreContent());
+    io.emit('content_metadata_overrides_state', getPublicContentMetadataOverrides(), getContentMetadataOverridesSyncMeta());
 
     if (hasAdminSockets()) {
       await Promise.all([refreshReportsFromDb(), refreshContentReportsFromDb()]);
@@ -7110,6 +7381,28 @@ async function initProfileSyncNotifications() {
           const mineAction = state.mineAction === 'remove' ? 'remove' : (state.mineAction === 'upsert' ? 'upsert' : '');
           if (reporter && mineAction) emitContentReportMineDeltaToUsers(reporter, { action: mineAction, reportKey: changedReportKey, report: state.mineReport || null });
           if (clearedReportKey) io.emit('content_report_cleared', { reportKey: clearedReportKey });
+          return;
+        }
+        if (key === ADMIN_STATE_KEYS.metadataOverrides) {
+          const state = data && data.state && typeof data.state === 'object' ? data.state : {};
+          const delta = state.delta && typeof state.delta === 'object' ? state.delta : null;
+          if (delta && delta.action === 'upsert' && delta.override) {
+            const normalizedEntry = normalizeContentMetadataOverride(delta.override);
+            if (!normalizedEntry || !normalizedEntry.hasValues) return;
+            const previous = contentMetadataOverridesByKey.get(normalizedEntry.metadataKey) || null;
+            if (previous && contentMetadataOverrideEntryEquals(previous, normalizedEntry)) return;
+            const entry = setContentMetadataOverrideCache(normalizedEntry);
+            if (entry) io.emit('content_metadata_override_delta', { action: 'upsert', metadataKey: entry.metadataKey, override: toPublicContentMetadataOverride(entry), ...getContentMetadataOverridesSyncMeta() });
+          } else if (delta && delta.action === 'remove') {
+            const metadataKey = normalizeText(delta.metadataKey, '');
+            if (!metadataKey) return;
+            const removed = removeContentMetadataOverrideCache(metadataKey);
+            if (!removed) return;
+            io.emit('content_metadata_override_delta', { action: 'remove', metadataKey, ...getContentMetadataOverridesSyncMeta() });
+          } else {
+            await refreshContentMetadataOverridesFromDb();
+            io.emit('content_metadata_overrides_state', getPublicContentMetadataOverrides(), getContentMetadataOverridesSyncMeta());
+          }
           return;
         }
         if (key === ADMIN_STATE_KEYS.contentBlocks) {
@@ -11358,6 +11651,7 @@ io.on('connection', (socket) => {
         await refreshReportsFromDb();
         await refreshContentReportsFromDb();
         await refreshBlockedStoreContentFromDb();
+        await refreshContentMetadataOverridesFromDb({ maxAgeMs: profileSyncListenReady ? CONTENT_METADATA_OVERRIDES_DB_FRESH_MS : 0 });
         await refreshServerLogFromDb();
       }
       const payload = {
@@ -11367,6 +11661,7 @@ io.on('connection', (socket) => {
         reports: socket.isAdmin === true ? adminReports : [],
         contentReports: socket.isAdmin === true ? adminContentReports : [],
         blockedContent: socket.isAdmin === true ? blockedStoreContent : [],
+        metadataOverrides: socket.isAdmin === true ? getPublicContentMetadataOverrides() : [],
         serverLog: socket.isAdmin === true ? serverLog : [],
         registeredUsers: socket.isAdmin === true ? Object.keys(userDatabase).length : 0,
         countryStats: socket.isAdmin === true ? getAdminCountryStats() : { total: 0, known: 0, unknown: 0, countries: [] },
@@ -11504,6 +11799,100 @@ io.on('connection', (socket) => {
     } catch (err) {
       console.error('[CONTENT BLOCKS REQUEST ERROR]:', err);
       respond({ success: false, message: 'Could not load blocked Store content.' });
+    }
+  });
+
+  socket.on('content_metadata_overrides_request', async (data, callback) => {
+    const respond = typeof callback === 'function' ? callback : () => {};
+    try {
+      const userName = normalizeText(socket.userName, '');
+      if (!userName || !userDatabase[userName]) return respond({ success: false, authenticated: false, overrides: [] });
+      const overrides = getPublicContentMetadataOverrides();
+      const syncMeta = getContentMetadataOverridesSyncMeta();
+      if (!(data && data.callbackOnly === true)) socket.emit('content_metadata_overrides_state', overrides, syncMeta);
+      respond({ success: true, overrides, ...syncMeta });
+    } catch (err) {
+      console.error('[CONTENT METADATA OVERRIDES REQUEST ERROR]:', err);
+      respond({ success: false, message: 'Could not load metadata corrections.', overrides: [] });
+    }
+  });
+
+  socket.on('admin_request_content_metadata_overrides', async (data, callback) => {
+    const respond = typeof callback === 'function' ? callback : () => {};
+    try {
+      if (socket.isAdmin !== true) return respond({ success: false, message: 'Admin only.', overrides: [] });
+      const force = data && data.force === true;
+      await refreshContentMetadataOverridesFromDb(force ? {} : { maxAgeMs: CONTENT_METADATA_OVERRIDES_DB_FRESH_MS });
+      const syncMeta = getContentMetadataOverridesSyncMeta();
+      const knownInstanceId = normalizeText(data && data.knownInstanceId, '');
+      const knownRevision = Number(data && data.knownRevision);
+      const unchanged = !force && knownInstanceId === syncMeta.metadataInstanceId && Number.isFinite(knownRevision) && knownRevision === syncMeta.metadataRevision;
+      if (unchanged) return respond({ success: true, unchanged: true, ...syncMeta });
+      const overrides = getPublicContentMetadataOverrides();
+      if (!(data && data.callbackOnly === true)) socket.emit('content_metadata_overrides_state', overrides, syncMeta);
+      respond({ success: true, overrides, ...syncMeta });
+    } catch (err) {
+      console.error('[ADMIN CONTENT METADATA OVERRIDES REQUEST ERROR]:', err);
+      respond({ success: false, message: 'Could not load metadata corrections.', overrides: [] });
+    }
+  });
+
+  socket.on('admin_upsert_content_metadata_override', async (data, callback) => {
+    const respond = typeof callback === 'function' ? callback : () => {};
+    try {
+      if (socket.isAdmin !== true) return respond({ success: false, message: 'Admin only.' });
+      const normalized = normalizeContentMetadataOverride({ ...(data || {}), updatedBy: socket.userName || 'Admin' });
+      if (!normalized || !normalized.metadataKey) return respond({ success: false, message: 'Invalid Store content.' });
+      if (!normalized.hasValues) return respond({ success: false, message: 'Add at least one metadata correction before saving.' });
+      const payload = {
+        title: normalized.title, summary: normalized.summary, coverUrl: normalized.coverUrl, score: normalized.score, year: normalized.year,
+        genres: normalized.genres, tags: normalized.tags, cast: normalized.cast, director: normalized.director
+      };
+      const result = await queryDbWithRetry(
+        `INSERT INTO content_metadata_overrides (metadata_key, category, title_id, content_id, data, updated_by, created_at, updated_at)
+         VALUES ($1,$2,$3,$4,$5::jsonb,$6,NOW(),NOW())
+         ON CONFLICT (metadata_key)
+         DO UPDATE SET category = EXCLUDED.category, title_id = EXCLUDED.title_id, content_id = EXCLUDED.content_id,
+                       data = EXCLUDED.data, updated_by = EXCLUDED.updated_by, updated_at = NOW()
+         WHERE content_metadata_overrides.category IS DISTINCT FROM EXCLUDED.category
+            OR content_metadata_overrides.title_id IS DISTINCT FROM EXCLUDED.title_id
+            OR content_metadata_overrides.content_id IS DISTINCT FROM EXCLUDED.content_id
+            OR content_metadata_overrides.data IS DISTINCT FROM EXCLUDED.data
+         RETURNING metadata_key, category, title_id, content_id, data, updated_by, updated_at`,
+        [normalized.metadataKey, normalized.category, normalized.titleId, normalized.contentId, JSON.stringify(payload), socket.userName || 'Admin'],
+        { attempts: 3, label: 'ADMIN CONTENT METADATA UPSERT' }
+      );
+      if (!result.rows || !result.rows.length) {
+        const existing = contentMetadataOverridesByKey.get(normalized.metadataKey) || normalized;
+        return respond({ success: true, unchanged: true, override: toPublicContentMetadataOverride(existing), ...getContentMetadataOverridesSyncMeta() });
+      }
+      const entry = normalizeContentMetadataOverrideRow(result.rows[0] || {});
+      if (!entry || !entry.hasValues) return respond({ success: false, message: 'Could not normalize the saved correction.' });
+      await publishContentMetadataOverridesChanged({ upsertOverride: entry });
+      await addModerationLog('metadata_override', `Updated metadata override for ${entry.titleId || entry.contentId}`, { metadataKey: entry.metadataKey, fields: Object.keys(payload).filter(key => Array.isArray(payload[key]) ? payload[key].length : payload[key] !== '' && payload[key] !== null) }, socket.userName || 'Admin');
+      respond({ success: true, override: toPublicContentMetadataOverride(entry), ...getContentMetadataOverridesSyncMeta() });
+    } catch (err) {
+      console.error('[ADMIN CONTENT METADATA UPSERT ERROR]:', err);
+      respond({ success: false, message: 'Could not save the metadata correction.' });
+    }
+  });
+
+  socket.on('admin_remove_content_metadata_override', async (data, callback) => {
+    const respond = typeof callback === 'function' ? callback : () => {};
+    try {
+      if (socket.isAdmin !== true) return respond({ success: false, message: 'Admin only.' });
+      const metadataKey = normalizeText(data && (data.metadataKey || data.reportKey), '');
+      if (!metadataKey) return respond({ success: false, message: 'Missing metadata key.' });
+      const previous = contentMetadataOverridesByKey.get(metadataKey) || null;
+      const result = await queryDbWithRetry('DELETE FROM content_metadata_overrides WHERE metadata_key = $1 RETURNING metadata_key', [metadataKey], { attempts: 3, label: 'ADMIN CONTENT METADATA REMOVE' });
+      const removed = Number(result.rowCount) > 0;
+      if (!removed && !previous) return respond({ success: true, unchanged: true, ...getContentMetadataOverridesSyncMeta() });
+      await publishContentMetadataOverridesChanged({ removeKey: metadataKey });
+      if (removed) await addModerationLog('metadata_override_remove', `Removed metadata override for ${previous && (previous.titleId || previous.contentId) || metadataKey}`, previous || { metadataKey }, socket.userName || 'Admin');
+      respond({ success: true, removed, ...getContentMetadataOverridesSyncMeta() });
+    } catch (err) {
+      console.error('[ADMIN CONTENT METADATA REMOVE ERROR]:', err);
+      respond({ success: false, message: 'Could not remove the metadata correction.' });
     }
   });
 
