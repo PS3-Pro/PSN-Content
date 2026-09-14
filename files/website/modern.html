@@ -709,6 +709,7 @@ html.collection-memory-optimization-on #downloads-list > .download-swipe-row { c
 .admin-content-report-card>.admin-card-title { flex: 0 0 auto; }
 .admin-content-report-list, .admin-content-block-list { display: flex; flex-direction: column; gap: 8px; min-height: 0; overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; padding-right: 3px; }
 .admin-content-report-list { flex: 1 1 0; }
+.admin-content-report-list>.admin-content-report-item, .admin-content-block-list>.admin-content-block-item { flex: 0 0 auto; }
 .admin-content-report-list>.admin-empty, .admin-content-block-list>.admin-empty { min-height: 100%; box-sizing: border-box; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 9px; }
 .admin-content-report-list>.admin-empty>i, .admin-content-block-list>.admin-empty>i { margin: 0 !important; line-height: 1; font-size: 24px; opacity: .88; }
 .admin-content-report-list>.admin-empty>span, .admin-content-block-list>.admin-empty>span { display: block; line-height: 1.35; }
@@ -3059,6 +3060,7 @@ body:not(.is-admin) #view-admin { display: none !important; }
 .admin-metadata-editor-status { min-height:52px; display:flex; align-items:center; gap:10px; padding:10px 12px; border:1px solid rgba(255,255,255,.075); border-radius:10px; background:rgba(0,0,0,.18); color:var(--text-muted); font-size:10px; line-height:1.4; }
 .admin-metadata-editor-status>i { flex:0 0 auto; color:#66ccff; font-size:15px; }
 .admin-metadata-editor-status strong { color:#fff; }
+.admin-metadata-status-note { display:block; margin-top:6px; }
 .admin-metadata-actions { display:flex; flex-wrap:wrap; gap:8px; }
 .admin-metadata-actions .admin-action-btn { min-width:132px; }
 .admin-metadata-side { min-width:0; display:flex; flex-direction:column; gap:10px; }
@@ -3507,6 +3509,8 @@ body.admin-maintenance-reveal-pending #user-select-screen, body.admin-maintenanc
 .admin-maintenance-days label:has(input:checked), .admin-maintenance-scheduler .admin-pill-toggle:has(input:checked) { color: #fff; border-color: rgba(0,212,255,0.38); background: rgba(0,112,204,0.12); }
 .admin-time-stepper, .admin-number-stepper { position: relative; display: flex; align-items: stretch; width: 100%; }
 .admin-number-stepper { max-width: 118px; flex: 0 0 118px; }
+.admin-number-stepper.admin-metadata-score-stepper { max-width: none; flex: 1 1 auto; }
+.admin-number-stepper.admin-metadata-score-stepper .admin-number-input { text-align: left; }
 .admin-slow-stepper { margin-left: auto; }
 .admin-time-stepper .admin-time-input, .admin-number-stepper .admin-number-input { width: 100%; padding-right: 44px; font-variant-numeric: tabular-nums; appearance: auto; -webkit-appearance: auto; text-align: center; }
 .admin-time-stepper input[type="time"]::-webkit-calendar-picker-indicator { opacity: 0; display: none; }
@@ -7597,7 +7601,7 @@ img { -webkit-user-drag: none !important; user-drag: none !important; }
 									</div>
 									<label class="admin-metadata-field"><span>Summary / Description</span><textarea id="admin-metadata-summary" class="admin-input" maxlength="5000" data-no-translate="true" translate="no" placeholder="Leave blank to keep provider metadata"></textarea></label>
 									<div class="admin-metadata-field-grid three">
-										<label class="admin-metadata-field"><span>Score (0–100)</span><input id="admin-metadata-score" class="admin-input" type="number" min="0" max="100" step="1" placeholder="Auto"></label>
+										<label class="admin-metadata-field"><span>Score (0–100)</span><div class="admin-number-stepper admin-metadata-score-stepper"><input id="admin-metadata-score" class="admin-input admin-number-input" type="number" min="0" max="100" step="1" placeholder="Auto"><div class="admin-time-arrows"><button type="button" onclick="adminAdjustNumberInput('admin-metadata-score', 1, 0, 100)" title="Increase score"><i class="fas fa-chevron-up"></i></button><button type="button" onclick="adminAdjustNumberInput('admin-metadata-score', -1, 0, 100)" title="Decrease score"><i class="fas fa-chevron-down"></i></button></div></div></label>
 										<label class="admin-metadata-field"><span>Year</span><input id="admin-metadata-year" class="admin-input" inputmode="numeric" maxlength="4" placeholder="Auto"></label>
 										<label class="admin-metadata-field"><span>Director</span><input id="admin-metadata-director" class="admin-input" maxlength="160" data-no-translate="true" translate="no" placeholder="Optional"></label>
 									</div>
@@ -23254,14 +23258,30 @@ P
 	window.__contentMetadataOverridesServerInstanceId = String(window.__contentMetadataOverridesServerInstanceId || '');
 	window.__contentMetadataOverridesServerRevision = Number.isFinite(Number(window.__contentMetadataOverridesServerRevision)) ? Number(window.__contentMetadataOverridesServerRevision) : -1;
 
-	window.updateContentMetadataOverridesSyncMeta = function(meta = {}) {
-		if (!meta || typeof meta !== 'object') return false;
+	function getContentMetadataOverridesSyncPosition(meta = {}) {
+		if (!meta || typeof meta !== 'object') return null;
 		const instanceId = String(meta.metadataInstanceId || meta.instanceId || '').trim();
-		const rawRevision = meta.metadataRevision ?? meta.revision;
-		const revision = Number(rawRevision);
-		if (!instanceId || !Number.isFinite(revision) || revision < 0) return false;
-		window.__contentMetadataOverridesServerInstanceId = instanceId;
-		window.__contentMetadataOverridesServerRevision = revision;
+		const revision = Number(meta.metadataRevision ?? meta.revision);
+		return instanceId && Number.isFinite(revision) && revision >= 0 ? { instanceId, revision } : null;
+	}
+
+	window.isContentMetadataOverridesSyncCurrent = function(meta = {}) {
+		const incoming = getContentMetadataOverridesSyncPosition(meta);
+		if (!incoming) return false;
+		return incoming.instanceId === String(window.__contentMetadataOverridesServerInstanceId || '')
+			&& Number(window.__contentMetadataOverridesServerRevision) >= incoming.revision;
+	};
+
+	window.updateContentMetadataOverridesSyncMeta = function(meta = {}) {
+		const incoming = getContentMetadataOverridesSyncPosition(meta);
+		if (!incoming) return false;
+		const currentInstanceId = String(window.__contentMetadataOverridesServerInstanceId || '');
+		const currentRevision = Number(window.__contentMetadataOverridesServerRevision);
+		// Socket callbacks can finish out of order. Never move a revision backwards on the
+		// same server instance; a newer revision already implies every earlier delta.
+		if (incoming.instanceId === currentInstanceId && Number.isFinite(currentRevision) && incoming.revision < currentRevision) return false;
+		window.__contentMetadataOverridesServerInstanceId = incoming.instanceId;
+		window.__contentMetadataOverridesServerRevision = incoming.revision;
 		return true;
 	};
 
@@ -23315,12 +23335,27 @@ P
 		return parsed;
 	}
 
+	function normalizeContentMetadataListClient(value, max = 20) {
+		if (value === undefined || value === null || value === '') return [];
+		const rawList = Array.isArray(value) ? value : String(value).split(',');
+		if (!rawList.length) return [];
+		const seen = new Set();
+		const out = [];
+		for (const rawItem of rawList) {
+			const item = String(rawItem || '').trim();
+			if (!item || seen.has(item)) continue;
+			seen.add(item);
+			out.push(item);
+			if (out.length >= max) break;
+		}
+		return out;
+	}
+
 	function normalizeContentMetadataOverrideClient(raw = {}) {
 		if (!raw || typeof raw !== 'object') return null;
 		const metadataKey = String(raw.metadataKey || raw.reportKey || getContentMetadataOverrideKeyClient(raw)).trim();
 		if (!metadataKey) return null;
 		const parsedKey = parseContentMetadataOverrideKeyClient(metadataKey);
-		const list = (value, max = 20) => Array.from(new Set((Array.isArray(value) ? value : String(value || '').split(',')).map(item => String(item || '').trim()).filter(Boolean))).slice(0, max);
 		const scoreNumber = raw.score === '' || raw.score === null || raw.score === undefined ? null : Number(raw.score);
 		const entry = {
 			metadataKey,
@@ -23332,7 +23367,7 @@ P
 			coverUrl: /^https?:\/\//i.test(String(raw.coverUrl || raw.cover || '').trim()) ? String(raw.coverUrl || raw.cover || '').trim().slice(0, 1200) : '',
 			score: Number.isFinite(scoreNumber) ? Math.max(0, Math.min(100, Math.round(scoreNumber))) : null,
 			year: /^(?:19|20)\d{2}$/.test(String(raw.year || '').trim()) ? String(raw.year || '').trim() : '',
-			genres: list(raw.genres, 8), tags: list(raw.tags, 16), cast: list(raw.cast, 20),
+			genres: normalizeContentMetadataListClient(raw.genres, 8), tags: normalizeContentMetadataListClient(raw.tags, 16), cast: normalizeContentMetadataListClient(raw.cast, 20),
 			director: String(raw.director || '').trim().slice(0, 160),
 			updatedBy: String(raw.updatedBy || raw.updated_by || '').trim(),
 			updatedAt: String(raw.updatedAt || raw.updated_at || '')
@@ -23472,7 +23507,7 @@ P
 			const category = card.getAttribute('data-store-category') || card.getAttribute('data-wishlist-category') || img?.getAttribute('data-cover-category') || card.getAttribute('data-category') || 'games';
 			const key = getContentMetadataOverrideKeyClient({ titleId, contentId }, category);
 			if (!key || (metadataKey && key !== metadataKey)) continue;
-			const override = window.getContentMetadataOverride(key);
+			const override = window.__contentMetadataOverridesMap instanceof Map ? (window.__contentMetadataOverridesMap.get(key) || null) : null;
 			let loaded;
 			const needLoaded = (updateTitle && !override?.title) || (updateCover && !override?.coverUrl);
 			if (needLoaded) {
@@ -38651,7 +38686,8 @@ P
 	}
 
 	function adminSetMetadataOverrides(overrides, syncMeta = null) {
-		const changed = typeof window.applyContentMetadataOverrides === 'function' ? window.applyContentMetadataOverrides(Array.isArray(overrides) ? overrides : []) : false;
+		const alreadyCurrent = !!(syncMeta && typeof window.isContentMetadataOverridesSyncCurrent === 'function' && window.isContentMetadataOverridesSyncCurrent(syncMeta));
+		const changed = !alreadyCurrent && typeof window.applyContentMetadataOverrides === 'function' ? window.applyContentMetadataOverrides(Array.isArray(overrides) ? overrides : []) : false;
 		if (syncMeta && typeof window.updateContentMetadataOverridesSyncMeta === 'function') window.updateContentMetadataOverridesSyncMeta(syncMeta);
 		window.adminMetadataOverridesLastSyncAt = Date.now();
 		return changed;
@@ -38719,27 +38755,93 @@ P
 		if (el) el.innerHTML = `<i class="fas ${icon}"></i><span>${html}</span>`;
 	}
 
-	function adminUpdateMetadataPreview(item = null, category = '', override = null) {
+	const ADMIN_METADATA_CATEGORY_LABELS = Object.freeze({
+		games:'Games', dlcs:'DLCs', apps:'Apps', demos:'Demos', updates:'Updates', avatars:'Avatars', themes:'Themes', guides:'Guides', soundtracks:'Soundtracks', videos:'Videos',
+		homebrew_games:'Homebrews', ports:'Ports', tools:'Tools', dev_tools:'Dev Tools', emulators:'Emulators', backup_manager:'Backup Managers', launchers:'Launchers', legacy:'Legacy', prototypes:'Prototypes', no_psn:'NoPSN'
+	});
+
+	function adminMetadataCategoryLabel(category = '') {
+		const cat = normalizeContentMetadataCategoryClient(category || 'games');
+		return ADMIN_METADATA_CATEGORY_LABELS[cat] || cat.replace(/_/g, ' ').replace(/\b\w/g, char => char.toUpperCase());
+	}
+
+	function adminMetadataIdentityText(category = '', titleId = '', contentId = '') {
+		return [adminMetadataCategoryLabel(category), String(titleId || '').trim(), String(contentId || '').trim()].filter(Boolean).join(' • ');
+	}
+
+	function adminResetMetadataPreviewCoverFallback(image) {
+		if (!image) return;
+		['data-psn-store-tried','data-sony-icon-tried','data-github-cover-tried','data-bing-tried','data-cover-source'].forEach(attr => image.removeAttribute(attr));
+	}
+
+	window.adminMetadataPreviewCoverLoaded = function(image) {
+		if (!image) return;
+		if (typeof window.markCoverLoaded === 'function') window.markCoverLoaded(image);
+		const src = String(image.currentSrc || image.src || '').trim();
+		if (src) window.__adminMetadataEditorResolvedCover = src;
+	};
+
+	window.adminMetadataPreviewCoverError = function(image) {
+		if (!image) return;
+		window.__adminMetadataEditorResolvedCover = '';
+		if (typeof window.handleCoverError === 'function') {
+			window.handleCoverError(image, image.getAttribute('data-cover-category') || 'games');
+			return;
+		}
+		image.onerror = null;
+		image.src = 'https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/database/covers/uncompressed/NOCOVER00.JPG';
+	};
+
+	function adminUpdateMetadataPreview(item = null, category = '', override = null, resolvedCover = '') {
 		const image = document.getElementById('admin-metadata-cover-preview');
 		const titleEl = document.getElementById('admin-metadata-preview-title');
 		const metaEl = document.getElementById('admin-metadata-preview-meta');
+		const cat = normalizeContentMetadataCategoryClient(category || override?.category || item?.category || 'games');
+		const titleId = normalizeContentMetadataTitleIdClient(item?.id || item?.titleId || override?.titleId || '');
+		const contentId = normalizeContentMetadataContentIdClient(item?.contentId || override?.contentId || '');
+		const previewKey = getContentMetadataOverrideKeyClient({ titleId, contentId }, cat);
 		const effectiveTitle = String(override?.title || item?.__metadataBaseCleanName || item?.cleanName || item?.title || item?.name || 'No item loaded');
 		if (titleEl) titleEl.textContent = effectiveTitle;
 		if (image) {
-			const cover = override?.coverUrl || (item && typeof getItemCover === 'function' ? getItemCover(item, category) : '') || 'https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/database/covers/uncompressed/NOCOVER00.JPG';
-			if (image.src !== cover) image.src = cover;
+			// Reattach on every preview assignment because the shared fallback pipeline may null onerror after its final fallback.
+			image.onload = () => window.adminMetadataPreviewCoverLoaded?.(image);
+			image.onerror = () => window.adminMetadataPreviewCoverError?.(image);
+			const directCover = item && typeof getItemCover === 'function' ? getItemCover(item, cat) : '';
+			const coverKey = typeof window.getStoreCardCoverKey === 'function' ? window.getStoreCardCoverKey(cat, titleId, contentId) : '';
+			const cachedCover = coverKey && typeof window.getCachedCardCoverSrc === 'function' ? window.getCachedCardCoverSrc(coverKey, cat, '') : '';
+			const primaryCover = String(override?.coverUrl || resolvedCover || cachedCover || directCover || 'https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/database/covers/uncompressed/NOCOVER00.JPG').trim();
+			const previewIdentity = `${previewKey}|${primaryCover}`;
+			if (image.dataset.metadataPreviewIdentity !== previewIdentity) {
+				adminResetMetadataPreviewCoverFallback(image);
+				image.dataset.metadataPreviewIdentity = previewIdentity;
+			}
+			image.setAttribute('data-cover-key', coverKey || '');
+			image.setAttribute('data-cover-category', cat);
+			image.setAttribute('data-name', effectiveTitle);
+			image.setAttribute('data-console', item?.cTag || 'PS3');
+			image.setAttribute('data-title-id', titleId);
+			image.setAttribute('data-content-id', contentId);
+			image.setAttribute('data-region', item?.region || override?.region || '');
+			image.setAttribute('data-github-cover', item && typeof getGithubItemCover === 'function' ? getGithubItemCover(item, cat) : '');
+			const current = String(image.currentSrc || image.getAttribute('src') || '').trim();
+			if (current !== primaryCover) image.src = primaryCover;
 		}
 		if (metaEl) {
-			const parts = [category, item?.id || item?.titleId || override?.titleId || '', item?.contentId || override?.contentId || ''].filter(Boolean);
-			metaEl.textContent = parts.length ? parts.join(' • ') : 'Load an item to preview its effective metadata.';
+			const hasIdentity = !!(item || override || titleId || contentId);
+			const identityText = hasIdentity ? adminMetadataIdentityText(cat, titleId, contentId) : '';
+			metaEl.textContent = identityText || 'Load an item to preview its effective metadata.';
 		}
 	}
 
-	function adminPopulateMetadataEditor(item, category, override = null) {
+	function adminPopulateMetadataEditor(item, category, override = null, resolvedCover = '') {
 		const cat = normalizeContentMetadataCategoryClient(category || override?.category || item?.category || 'games');
 		const titleId = normalizeContentMetadataTitleIdClient(item?.id || item?.titleId || override?.titleId || '');
 		const contentId = normalizeContentMetadataContentIdClient(item?.contentId || override?.contentId || '');
 		const key = getContentMetadataOverrideKeyClient({ titleId, contentId }, cat);
+		const previousKey = String(window.__adminMetadataEditorPreviewKey || '');
+		const carriedResolvedCover = previousKey === key ? String(window.__adminMetadataEditorResolvedCover || '') : '';
+		window.__adminMetadataEditorPreviewKey = key;
+		window.__adminMetadataEditorResolvedCover = String(resolvedCover || carriedResolvedCover || '');
 		const setValue = (id, value) => { const el = document.getElementById(id); if (el) el.value = value ?? ''; };
 		setValue('admin-metadata-category', cat); setValue('admin-metadata-title-id', titleId); setValue('admin-metadata-content-id', contentId);
 		setValue('admin-metadata-title', override?.title || ''); setValue('admin-metadata-cover', override?.coverUrl || ''); setValue('admin-metadata-summary', override?.summary || '');
@@ -38748,12 +38850,12 @@ P
 		const status = document.getElementById('admin-metadata-editor-status');
 		if (status) status.dataset.metadataKey = key;
 		const originalTitle = String(item?.__metadataBaseCleanName || item?.cleanName || item?.title || item?.name || override?.title || titleId || contentId || 'Store content');
-		adminSetMetadataEditorStatus(`<strong data-no-translate="true" translate="no">${adminEscapeHtml(originalTitle)}</strong><br><span data-no-translate="true" translate="no">${adminEscapeHtml(key)}</span>${override ? '<br>Editing the active server override.' : '<br>No override yet. Blank fields keep the original/provider value.'}`, override ? 'fa-pen' : 'fa-circle-info');
+		adminSetMetadataEditorStatus(`<strong data-no-translate="true" translate="no">${adminEscapeHtml(originalTitle)}</strong><br><span data-no-translate="true" translate="no">${adminEscapeHtml(adminMetadataIdentityText(cat, titleId, contentId))}</span><span class="admin-metadata-status-note">${override ? 'Editing the active server override.' : 'No override yet. Blank fields keep the original/provider value.'}</span>`, override ? 'fa-pen' : 'fa-circle-info');
 		const removeBtn = document.getElementById('admin-metadata-remove-current');
 		if (removeBtn) removeBtn.style.display = override ? '' : 'none';
 		window.__adminMetadataEditorItem = item || null;
 		window.__adminMetadataEditorCategory = cat;
-		adminUpdateMetadataPreview(item, cat, override);
+		adminUpdateMetadataPreview(item, cat, override, window.__adminMetadataEditorResolvedCover);
 	}
 
 	window.adminLoadMetadataOverride = async function(options = {}) {
@@ -38763,8 +38865,9 @@ P
 		let contentId = normalizeContentMetadataContentIdClient(document.getElementById('admin-metadata-content-id')?.value || options.contentId || '');
 		if (!titleId && !contentId) { if (typeof playUiError === 'function') playUiError(); adminSetMetadataEditorStatus('Enter a Title ID or Content ID first.', 'fa-triangle-exclamation'); return null; }
 		adminSetMetadataEditorStatus('Loading Store item…', 'fa-spinner fa-spin');
-		const found = await adminFindMetadataStoreItem(category, titleId, contentId);
-		let item = found.matches[0] || null;
+		let item = options.item && typeof options.item === 'object' ? options.item : null;
+		const found = item ? { category, matches:[item] } : await adminFindMetadataStoreItem(category, titleId, contentId);
+		if (!item) item = found.matches[0] || null;
 		if (!contentId && found.matches.length > 1) {
 			// This only needs to know whether there is exactly one override for the Title ID.
 			// Iterate the Map directly and stop at two matches instead of sorting the whole Admin list.
@@ -38782,7 +38885,7 @@ P
 		const key = getContentMetadataOverrideKeyClient({ titleId: item?.id || item?.titleId || titleId, contentId }, category);
 		const override = window.getContentMetadataOverride ? window.getContentMetadataOverride(key) : null;
 		if (!item && !override) { if (typeof playUiError === 'function') playUiError(); adminSetMetadataEditorStatus('No matching Store item was found in this category.', 'fa-triangle-exclamation'); return null; }
-		adminPopulateMetadataEditor(item, category, override);
+		adminPopulateMetadataEditor(item, category, override, options.resolvedCover || '');
 		return { item, category, override, key };
 	};
 
@@ -38794,7 +38897,7 @@ P
 		['admin-metadata-title-id','admin-metadata-content-id','admin-metadata-title','admin-metadata-cover','admin-metadata-summary','admin-metadata-score','admin-metadata-year','admin-metadata-director','admin-metadata-genres','admin-metadata-tags','admin-metadata-cast'].forEach(id => { const el = document.getElementById(id); if (el) el.value = ''; });
 		const status = document.getElementById('admin-metadata-editor-status'); if (status) status.dataset.metadataKey = '';
 		const removeBtn = document.getElementById('admin-metadata-remove-current'); if (removeBtn) removeBtn.style.display = 'none';
-		window.__adminMetadataEditorItem = null; window.__adminMetadataEditorCategory = '';
+		window.__adminMetadataEditorItem = null; window.__adminMetadataEditorCategory = ''; window.__adminMetadataEditorPreviewKey = ''; window.__adminMetadataEditorResolvedCover = '';
 		adminSetMetadataEditorStatus('Choose a Store item to create a correction. The original TSV/database is never modified.');
 		adminUpdateMetadataPreview();
 	};
@@ -38819,8 +38922,24 @@ P
 		adminSetMetadataEditorStatus('Saving correction…', 'fa-spinner fa-spin');
 		socketChat.emit('admin_upsert_content_metadata_override', payload, response => {
 			if (!response || response.success !== true || !response.override) { if (typeof playUiError === 'function') playUiError(); adminSetMetadataEditorStatus(adminEscapeHtml(response?.message || 'Could not save the correction.'), 'fa-triangle-exclamation'); return; }
+			const alreadySynced = typeof window.isContentMetadataOverridesSyncCurrent === 'function' && window.isContentMetadataOverridesSyncCurrent(response);
+			const responseKey = String(response.override.metadataKey || '').trim();
+			let localMatchesResponse = false;
+			// Successful writes broadcast their delta before this ack, so the common path does
+			// not need to normalize/compare the same override a second time. Only an unchanged
+			// save needs the extra reconciliation check because no realtime delta was emitted.
+			if (alreadySynced && response.unchanged && responseKey && window.__contentMetadataOverridesMap instanceof Map) {
+				const localEntry = window.__contentMetadataOverridesMap.get(responseKey) || null;
+				const responseEntry = typeof normalizeContentMetadataOverrideClient === 'function' ? normalizeContentMetadataOverrideClient(response.override) : null;
+				localMatchesResponse = !!(localEntry && responseEntry && contentMetadataOverrideEntryEquals(localEntry, responseEntry));
+			}
+			// The server broadcasts the delta before its ack. Normally that event already did
+			// the work; only reconcile locally when the ack beat/missed the event, or when an
+			// unchanged save reveals stale/missing local state.
+			if ((!alreadySynced || (response.unchanged && !localMatchesResponse)) && typeof window.applyContentMetadataOverrideDelta === 'function') {
+				window.applyContentMetadataOverrideDelta({ action:'upsert', metadataKey:responseKey, override:response.override });
+			}
 			if (typeof window.updateContentMetadataOverridesSyncMeta === 'function') window.updateContentMetadataOverridesSyncMeta(response);
-			if (!response.unchanged && typeof window.applyContentMetadataOverrideDelta === 'function') window.applyContentMetadataOverrideDelta({ action:'upsert', metadataKey:response.override.metadataKey, override:response.override });
 			const item = window.__adminMetadataEditorItem || getLoadedMetadataStoreItemByKey(response.override.metadataKey)?.item || null;
 			adminPopulateMetadataEditor(item, response.override.category, response.override);
 			if (response.unchanged) {
@@ -38841,17 +38960,19 @@ P
 		if (!confirm('Remove this metadata override and return to the original/provider metadata?')) return;
 		socketChat.emit('admin_remove_content_metadata_override', { metadataKey:key }, response => {
 			if (!response || response.success !== true) { if (typeof playUiError === 'function') playUiError(); if (typeof showToastNotification === 'function') showToastNotification('Metadata Corrections',response?.message || 'Could not remove the override.'); return; }
+			const alreadySynced = typeof window.isContentMetadataOverridesSyncCurrent === 'function' && window.isContentMetadataOverridesSyncCurrent(response);
+			const localHasEntry = window.__contentMetadataOverridesMap instanceof Map && window.__contentMetadataOverridesMap.has(key);
+			if ((!alreadySynced || (response.unchanged && localHasEntry)) && typeof window.applyContentMetadataOverrideDelta === 'function') window.applyContentMetadataOverrideDelta({ action:'remove', metadataKey:key });
 			if (typeof window.updateContentMetadataOverridesSyncMeta === 'function') window.updateContentMetadataOverridesSyncMeta(response);
-			if (!response.unchanged && typeof window.applyContentMetadataOverrideDelta === 'function') window.applyContentMetadataOverrideDelta({ action:'remove', metadataKey:key });
 			if (String(status?.dataset.metadataKey || '') === key) adminClearMetadataEditor();
 			if (typeof playUiSuccess === 'function') playUiSuccess();
 			if (typeof showToastNotification === 'function') showToastNotification('Metadata Corrections', response.unchanged ? 'The override was already removed.' : 'Override removed. Original/provider metadata restored.');
 		});
 	};
 
-	window.adminOpenMetadataOverrideEditor = function(category, titleId, contentId = '') {
+	window.adminOpenMetadataOverrideEditor = function(category, titleId, contentId = '', options = {}) {
 		if (!adminGuard()) return;
-		window.__adminMetadataPendingOpen = { category, titleId, contentId };
+		window.__adminMetadataPendingOpen = { category, titleId, contentId, item:options.item || null, resolvedCover:String(options.resolvedCover || '') };
 		const gameModal = document.getElementById('game-modal');
 		if (gameModal && gameModal.style.display !== 'none' && typeof closeModal === 'function') closeModal();
 		if (typeof openAdminPanel === 'function') openAdminPanel();
@@ -38862,7 +38983,7 @@ P
 			window.__adminMetadataPendingOpen = null;
 			const set = (id,value) => { const el=document.getElementById(id); if(el) el.value=value || ''; };
 			set('admin-metadata-category', normalizeContentMetadataCategoryClient(pending.category)); set('admin-metadata-title-id', normalizeContentMetadataTitleIdClient(pending.titleId)); set('admin-metadata-content-id', normalizeContentMetadataContentIdClient(pending.contentId));
-			adminLoadMetadataOverride();
+			adminLoadMetadataOverride({ item:pending.item || null, resolvedCover:pending.resolvedCover || '' });
 			card?.scrollIntoView({ behavior:'smooth', block:'center' });
 		};
 		setTimeout(() => applyPending(0), 80);
@@ -38872,7 +38993,14 @@ P
 		if (event) { event.preventDefault(); event.stopPropagation(); }
 		const modal = document.getElementById('game-modal');
 		if (!modal) return;
-		adminOpenMetadataOverrideEditor(modal.dataset.storeCategory || 'games', modal.dataset.titleId || '', modal.dataset.contentId || '');
+		const category = modal.dataset.storeCategory || 'games';
+		const titleId = modal.dataset.titleId || '';
+		const contentId = modal.dataset.contentId || '';
+		const key = getContentMetadataOverrideKeyClient({ titleId, contentId }, category);
+		const loaded = key ? getLoadedMetadataStoreItemByKey(key) : null;
+		const modalImage = modal.querySelector('.modal-img');
+		const resolvedCover = modalImage && modalImage.complete && Number(modalImage.naturalWidth || 0) > 0 ? String(modalImage.currentSrc || modalImage.src || '').trim() : '';
+		adminOpenMetadataOverrideEditor(category, titleId, contentId, { item:loaded?.item || null, resolvedCover });
 	};
 
 	function adminMetadataOverrideDisplayTitle(entry) {
@@ -38886,7 +39014,7 @@ P
 		if (!entry) return '';
 		const fields = [['title',entry.title],['cover',entry.coverUrl],['summary',entry.summary],['score',entry.score !== null && entry.score !== undefined ? entry.score : ''],['year',entry.year],['genres',entry.genres?.length],['tags',entry.tags?.length],['director',entry.director],['cast',entry.cast?.length]].filter(([,value]) => value !== '' && value !== null && value !== undefined && value !== 0).map(([name]) => `<span>${name}</span>`).join('');
 		const title = adminMetadataOverrideDisplayTitle(entry);
-		return `<div class="admin-metadata-item" data-metadata-key="${adminEscapeHtml(entry.metadataKey)}"><div class="admin-metadata-item-main"><div class="admin-metadata-item-title" data-no-translate="true" translate="no">${adminEscapeHtml(title)}</div><div class="admin-metadata-item-meta" data-no-translate="true" translate="no">${adminEscapeHtml([entry.category,entry.titleId,entry.contentId].filter(Boolean).join(' • '))}</div><div class="admin-metadata-item-fields">${fields}</div></div><div class="admin-metadata-item-actions"><button class="btn-mini-round metadata-edit" data-category="${adminEscapeHtml(entry.category)}" data-title-id="${adminEscapeHtml(entry.titleId)}" data-content-id="${adminEscapeHtml(entry.contentId)}" onclick="event.stopPropagation(); adminOpenMetadataOverrideEditor(this.dataset.category,this.dataset.titleId,this.dataset.contentId)" onmouseenter="if(typeof playUiHover === 'function') playUiHover()" title="Edit correction"><i class="fas fa-pen"></i></button><button class="btn-mini-round metadata-remove" data-metadata-key="${adminEscapeHtml(entry.metadataKey)}" onclick="event.stopPropagation(); adminRemoveMetadataOverride(this.dataset.metadataKey)" onmouseenter="if(typeof playUiHover === 'function') playUiHover()" title="Remove correction"><i class="fas fa-trash"></i></button></div></div>`;
+		return `<div class="admin-metadata-item" data-metadata-key="${adminEscapeHtml(entry.metadataKey)}"><div class="admin-metadata-item-main"><div class="admin-metadata-item-title" data-no-translate="true" translate="no">${adminEscapeHtml(title)}</div><div class="admin-metadata-item-meta" data-no-translate="true" translate="no">${adminEscapeHtml(adminMetadataIdentityText(entry.category, entry.titleId, entry.contentId))}</div><div class="admin-metadata-item-fields">${fields}</div></div><div class="admin-metadata-item-actions"><button class="btn-mini-round metadata-edit" data-category="${adminEscapeHtml(entry.category)}" data-title-id="${adminEscapeHtml(entry.titleId)}" data-content-id="${adminEscapeHtml(entry.contentId)}" onclick="event.stopPropagation(); adminOpenMetadataOverrideEditor(this.dataset.category,this.dataset.titleId,this.dataset.contentId)" onmouseenter="if(typeof playUiHover === 'function') playUiHover()" title="Edit correction"><i class="fas fa-pen"></i></button><button class="btn-mini-round metadata-remove" data-metadata-key="${adminEscapeHtml(entry.metadataKey)}" onclick="event.stopPropagation(); adminRemoveMetadataOverride(this.dataset.metadataKey)" onmouseenter="if(typeof playUiHover === 'function') playUiHover()" title="Remove correction"><i class="fas fa-trash"></i></button></div></div>`;
 	}
 
 	window.adminPatchMetadataOverrideDelta = function(metadataKey = '', action = '') {
@@ -38897,11 +39025,19 @@ P
 		const map = window.__contentMetadataOverridesMap instanceof Map ? window.__contentMetadataOverridesMap : new Map();
 		const countEl = document.getElementById('admin-metadata-count');
 		if (countEl) countEl.textContent = String(map.size);
-		let existing = null;
-		for (const child of listEl.children) {
-			if (child.classList?.contains('admin-metadata-item') && child.dataset.metadataKey === key) { existing = child; break; }
-		}
 		const entry = action === 'remove' ? null : (map.get(key) || null);
+		const entryTime = Number(entry?.__metadataUpdatedAtMs || 0);
+		let existing = null;
+		let before = null;
+		for (const child of listEl.children) {
+			if (!child.classList?.contains('admin-metadata-item')) continue;
+			const childKey = String(child.dataset.metadataKey || '');
+			if (childKey === key) { existing = child; continue; }
+			if (entry && !before) {
+				const other = map.get(childKey);
+				if (other && entryTime > Number(other.__metadataUpdatedAtMs || 0)) before = child;
+			}
+		}
 		if (existing) existing.remove();
 		if (!entry) {
 			if (!map.size) setAdminHtmlIfChanged(listEl,'<div class="admin-empty"><i class="fas fa-wand-magic-sparkles"></i><span>No metadata corrections yet.<br>Provider/database values are being used everywhere.</span></div>');
@@ -38909,13 +39045,6 @@ P
 			return true;
 		}
 		listEl.querySelector('.admin-empty')?.remove();
-		const entryTime = Number(entry.__metadataUpdatedAtMs || 0);
-		let before = null;
-		for (const child of listEl.children) {
-			if (!child.classList?.contains('admin-metadata-item')) continue;
-			const other = map.get(String(child.dataset.metadataKey || ''));
-			if (other && entryTime > Number(other.__metadataUpdatedAtMs || 0)) { before = child; break; }
-		}
 		const html = adminBuildMetadataOverrideItemHtml(entry);
 		if (before) before.insertAdjacentHTML('beforebegin', html);
 		else listEl.insertAdjacentHTML('beforeend', html);
@@ -38926,13 +39055,12 @@ P
 	window.adminRenderMetadataOverrides = function(cardCanRender = () => true) {
 		const listEl = document.getElementById('admin-metadata-list');
 		if (!listEl || !cardCanRender(listEl)) return;
-		const map = window.__contentMetadataOverridesMap instanceof Map ? window.__contentMetadataOverridesMap : new Map();
-		const countEl = document.getElementById('admin-metadata-count'); if (countEl) countEl.textContent = String(map.size);
 		const renderRevision = String(window.__contentMetadataOverridesRevision || 0);
-		// Delta patches already leave the list at the current revision. Check that before
-		// rebuilding/sorting the cached array, otherwise a later dashboard render pays O(n log n)
-		// only to discover that no DOM work is needed.
+		// Delta patches already leave both the list and count at the current revision. Bail out
+		// before touching the Map/count DOM or rebuilding the sorted array on dashboard rerenders.
 		if (listEl.dataset.renderRevision === renderRevision && listEl.childNodes.length) return;
+		const map = window.__contentMetadataOverridesMap instanceof Map ? window.__contentMetadataOverridesMap : new Map();
+		const countEl = document.getElementById('admin-metadata-count'); if (countEl && countEl.textContent !== String(map.size)) countEl.textContent = String(map.size);
 		const overrides = adminGetMetadataOverrides();
 		listEl.dataset.renderRevision = renderRevision;
 		if (!overrides.length) { setAdminHtmlIfChanged(listEl,'<div class="admin-empty"><i class="fas fa-wand-magic-sparkles"></i><span>No metadata corrections yet.<br>Provider/database values are being used everywhere.</span></div>'); return; }
@@ -65188,12 +65316,18 @@ function getVisibleChatStackEl(id) {
 		
 
 			socketChat.on('content_metadata_overrides_state', (overrides, syncMeta) => {
-				if (typeof window.applyContentMetadataOverrides === 'function') window.applyContentMetadataOverrides(overrides);
+				// Full snapshots can be echoed by reconnect/recovery/admin flows. If this exact
+				// server revision is already applied, skip normalization + Map diff entirely.
+				const alreadyCurrent = typeof window.isContentMetadataOverridesSyncCurrent === 'function' && window.isContentMetadataOverridesSyncCurrent(syncMeta || {});
+				if (!alreadyCurrent && typeof window.applyContentMetadataOverrides === 'function') window.applyContentMetadataOverrides(overrides);
 				if (typeof window.updateContentMetadataOverridesSyncMeta === 'function') window.updateContentMetadataOverridesSyncMeta(syncMeta || {});
 				if (document.body.classList.contains('is-admin')) window.adminMetadataOverridesLastSyncAt = Date.now();
 			});
 			socketChat.on('content_metadata_override_delta', delta => {
-				if (typeof window.applyContentMetadataOverrideDelta === 'function') window.applyContentMetadataOverrideDelta(delta);
+				// Same-instance revisions are monotonic. A duplicate/stale delta needs no
+				// normalization or entry comparison once a newer revision is already present.
+				const alreadyCurrent = typeof window.isContentMetadataOverridesSyncCurrent === 'function' && window.isContentMetadataOverridesSyncCurrent(delta || {});
+				if (!alreadyCurrent && typeof window.applyContentMetadataOverrideDelta === 'function') window.applyContentMetadataOverrideDelta(delta);
 				if (typeof window.updateContentMetadataOverridesSyncMeta === 'function') window.updateContentMetadataOverridesSyncMeta(delta || {});
 				if (document.body.classList.contains('is-admin')) window.adminMetadataOverridesLastSyncAt = Date.now();
 			});
