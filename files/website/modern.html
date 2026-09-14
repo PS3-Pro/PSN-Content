@@ -7607,7 +7607,7 @@ img { -webkit-user-drag: none !important; user-drag: none !important; }
 									</div>
 									<div id="admin-metadata-editor-status" class="admin-metadata-editor-status"><i class="fas fa-circle-info"></i><span>Choose a Store item to create a correction. The original TSV/database is never modified.</span></div>
 									<div class="admin-metadata-field-grid">
-										<label class="admin-metadata-field"><span>Display Title</span><input id="admin-metadata-title" class="admin-input" maxlength="220" data-no-translate="true" translate="no" placeholder="Leave blank to use the database title"></label>
+										<label class="admin-metadata-field"><span>Game Name</span><input id="admin-metadata-title" class="admin-input" maxlength="220" data-no-translate="true" translate="no" placeholder="Correct the name shown from the database"></label>
 										<label class="admin-metadata-field"><span>Cover / Poster URL</span><input id="admin-metadata-cover" class="admin-input" maxlength="1200" data-no-translate="true" translate="no" placeholder="https://..."></label>
 									</div>
 									<label class="admin-metadata-field"><span>Summary / Description</span><textarea id="admin-metadata-summary" class="admin-input" maxlength="5000" data-no-translate="true" translate="no" placeholder="Leave blank to keep provider metadata"></textarea></label>
@@ -31672,6 +31672,7 @@ P
 
 	function captureGameModalResolvedMetadataSnapshot(modalRoot) {
 		if (!modalRoot) return null;
+		modalRoot.__resolvedProviderMetadataReady = true;
 		const summary = modalRoot.querySelector('#modal-summary');
 		const badges = modalRoot.querySelector('#modal-badges');
 		const extraMeta = modalRoot.querySelector('#modal-extra-meta');
@@ -31692,6 +31693,7 @@ P
 
 	function applyGameModalResolvedMetadataSnapshot(modalRoot, snapshot) {
 		if (!modalRoot || !snapshot) return false;
+		modalRoot.__resolvedProviderMetadataReady = true;
 		const summary = modalRoot.querySelector('#modal-summary');
 		const badges = modalRoot.querySelector('#modal-badges');
 		const extraMeta = modalRoot.querySelector('#modal-extra-meta');
@@ -31851,7 +31853,10 @@ P
 			String(modalRoot.dataset.contentId || '') === String(contentId || '')
 		);
 		if (!isCurrentRequest()) return;
-		if (modalRoot) setGameModalNoScreenshots(modalRoot, false);
+		if (modalRoot) {
+			modalRoot.__resolvedProviderMetadataReady = false;
+			setGameModalNoScreenshots(modalRoot, false);
+		}
 
 		const extraMetaContainer = modalRoot?.querySelector('#modal-extra-meta') || document.getElementById('modal-extra-meta');
 		const metadataCategory = String(modalRoot?.dataset.storeCategory || 'games');
@@ -38915,6 +38920,7 @@ P
 		else if (Array.isArray(override?.tags) && override.tags.length) effective.tags = override.tags.slice();
 		if (override?.director) effective.director = override.director;
 		if (Array.isArray(override?.cast) && override.cast.length) effective.cast = override.cast.slice();
+		effective.__providerResolved = modal.__resolvedProviderMetadataReady === true;
 		return effective;
 	}
 
@@ -39066,7 +39072,7 @@ P
 		const titleId = normalizeContentMetadataTitleIdClient(item?.id || item?.titleId || override?.titleId || '');
 		const contentId = normalizeContentMetadataContentIdClient(item?.contentId || override?.contentId || '');
 		const baseEffective = suppliedEffective && typeof suppliedEffective === 'object' ? { ...suppliedEffective } : {};
-		if (cat !== 'games' || typeof window.fetchGameSummary !== 'function' || !titleId) return baseEffective;
+		if (baseEffective.__providerResolved === true || cat !== 'games' || typeof window.fetchGameSummary !== 'function' || !titleId) return baseEffective;
 		const gameName = String(item?.__metadataBaseCleanName || item?.cleanName || item?.title || item?.name || override?.title || titleId).trim();
 		const region = String(item?.region || override?.region || '').trim();
 		const lookupRoot = adminCreateMetadataLookupRoot(cat, titleId, contentId, gameName);
@@ -39158,6 +39164,8 @@ P
 
 	window.adminClearMetadataEditor = function() {
 		window.__adminMetadataEditorLoadToken = '';
+		window.__adminMetadataPendingOpen = null;
+		window.__adminMetadataEditorOpenToken = Number(window.__adminMetadataEditorOpenToken || 0) + 1;
 		adminSetMetadataEditorLoading(false);
 		const category = document.getElementById('admin-metadata-category'); if (category) category.value = 'games';
 		['admin-metadata-title-id','admin-metadata-content-id','admin-metadata-title','admin-metadata-cover','admin-metadata-summary','admin-metadata-score','admin-metadata-year','admin-metadata-director','admin-metadata-genres','admin-metadata-tags','admin-metadata-cast'].forEach(id => { const el = document.getElementById(id); if (el) el.value = ''; });
@@ -39249,13 +39257,21 @@ P
 
 	window.adminOpenMetadataOverrideEditor = function(category, titleId, contentId = '', options = {}) {
 		if (!adminGuard()) return;
+		const openToken = Number(window.__adminMetadataEditorOpenToken || 0) + 1;
+		window.__adminMetadataEditorOpenToken = openToken;
 		window.__adminMetadataPendingOpen = { category, titleId, contentId, item:options.item || null, resolvedCover:String(options.resolvedCover || ''), effectiveMetadata:options.effectiveMetadata && typeof options.effectiveMetadata === 'object' ? options.effectiveMetadata : null };
 		const gameModal = document.getElementById('game-modal');
 		if (gameModal && gameModal.style.display !== 'none' && typeof closeModal === 'function') closeModal();
 		if (typeof openAdminPanel === 'function') openAdminPanel();
 		const applyPending = (attempt = 0) => {
+			if (Number(window.__adminMetadataEditorOpenToken || 0) !== openToken) return;
 			const card = document.querySelector('.admin-metadata-card');
-			if ((!card || document.getElementById('view-admin')?.style.display !== 'block') && attempt < 12) return setTimeout(() => applyPending(attempt + 1), 60);
+			const adminVisible = document.getElementById('view-admin')?.style.display === 'block';
+			if (!card || !adminVisible) {
+				if (attempt < 12) return setTimeout(() => applyPending(attempt + 1), 60);
+				if (Number(window.__adminMetadataEditorOpenToken || 0) === openToken) window.__adminMetadataPendingOpen = null;
+				return;
+			}
 			const pending = window.__adminMetadataPendingOpen; if (!pending) return;
 			window.__adminMetadataPendingOpen = null;
 			const set = (id,value) => { const el=document.getElementById(id); if(el) el.value=value || ''; };
