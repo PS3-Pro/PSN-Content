@@ -3078,6 +3078,9 @@ body:not(.is-admin) #view-admin { display: none !important; }
 .admin-metadata-item-main { min-width:0; }
 .admin-metadata-item-title { color:#fff; font-size:11px; font-weight:850; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 .admin-metadata-item-meta { margin-top:4px; color:rgba(255,255,255,.42); font-size:8px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.admin-metadata-item-editor { margin-top:4px; display:flex; align-items:center; gap:5px; min-width:0; color:rgba(255,255,255,.48); font-size:8px; line-height:1.2; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.admin-metadata-item-editor i { flex:0 0 auto; color:#66ccff; font-size:7px; opacity:.9; }
+.admin-metadata-item-editor strong { color:rgba(255,255,255,.78); font-weight:850; overflow:hidden; text-overflow:ellipsis; }
 .admin-metadata-item-fields { margin-top:5px; display:flex; flex-wrap:wrap; gap:4px; }
 .admin-metadata-item-fields span { min-height:17px; padding:0 5px; display:inline-flex; align-items:center; border-radius:999px; border:1px solid rgba(102,204,255,.17); background:rgba(102,204,255,.055); color:rgba(174,225,255,.82); font-size:7.5px; font-weight:850; text-transform:uppercase; letter-spacing:.35px; }
 .admin-metadata-item-actions { display:flex; gap:5px; }
@@ -38797,6 +38800,141 @@ P
 		return [adminMetadataCategoryLabel(category), String(titleId || '').trim(), String(contentId || '').trim()].filter(Boolean).join(' • ');
 	}
 
+
+	const ADMIN_METADATA_EDIT_FIELDS = Object.freeze(['title','coverUrl','summary','score','year','director','genres','tags','cast']);
+
+	function adminMetadataOverrideValueSnapshot(override = null) {
+		return {
+			title:String(override?.title || '').trim(),
+			coverUrl:String(override?.coverUrl || '').trim(),
+			summary:String(override?.summary || '').trim(),
+			score:override?.score === null || override?.score === undefined || override?.score === '' ? '' : String(Math.round(Number(override.score))),
+			year:String(override?.year || '').trim(),
+			director:String(override?.director || '').trim(),
+			genres:adminMetadataNormalizeListInput(Array.isArray(override?.genres) ? override.genres.join(', ') : '', 8),
+			tags:adminMetadataNormalizeListInput(Array.isArray(override?.tags) ? override.tags.join(', ') : '', 16),
+			cast:adminMetadataNormalizeListInput(Array.isArray(override?.cast) ? override.cast.join(', ') : '', 20)
+		};
+	}
+
+	function adminMetadataNormalizeEditorValue(field, value) {
+		if (field === 'genres') return adminMetadataNormalizeListInput(Array.isArray(value) ? value.join(', ') : value, 8);
+		if (field === 'tags') return adminMetadataNormalizeListInput(Array.isArray(value) ? value.join(', ') : value, 16);
+		if (field === 'cast') return adminMetadataNormalizeListInput(Array.isArray(value) ? value.join(', ') : value, 20);
+		if (field === 'score') {
+			if (value === '' || value === null || value === undefined) return '';
+			const number = Number(value);
+			return Number.isFinite(number) ? String(Math.max(0, Math.min(100, Math.round(number)))) : '';
+		}
+		return String(value === undefined || value === null ? '' : value).trim();
+	}
+
+	function adminMetadataEditorValueEquals(field, first, second) {
+		const a = adminMetadataNormalizeEditorValue(field, first);
+		const b = adminMetadataNormalizeEditorValue(field, second);
+		if (Array.isArray(a) || Array.isArray(b)) return Array.isArray(a) && Array.isArray(b) && a.length === b.length && a.every((value, index) => value === b[index]);
+		return a === b;
+	}
+
+	function adminMetadataPlainTextWithoutIcons(element) {
+		if (!element) return '';
+		const clone = element.cloneNode(true);
+		clone.querySelectorAll('i').forEach(icon => icon.remove());
+		return String(clone.textContent || '').replace(/\s+/g, ' ').trim();
+	}
+
+	function adminCaptureEffectiveMetadataFromModal(modal, override = null, resolvedCover = '') {
+		if (!modal) return null;
+		const effective = {};
+		const modalTitle = String(modal.dataset.gameName || '').trim();
+		if (modalTitle) effective.title = modalTitle;
+
+		const image = modal.querySelector('.modal-img');
+		const cover = String(resolvedCover || image?.currentSrc || image?.src || '').trim();
+		if (/^https?:\/\//i.test(cover)) effective.coverUrl = cover;
+
+		const summary = modal.querySelector('#modal-summary');
+		if (summary && !summary.querySelector('.pulse-skeleton')) {
+			const clone = summary.cloneNode(true);
+			const heading = clone.querySelector(':scope > span');
+			if (heading) heading.remove();
+			clone.querySelectorAll('br').forEach(br => br.replaceWith('\n'));
+			const summaryText = String(clone.textContent || '').replace(/[ \t]+\n/g, '\n').replace(/\n[ \t]+/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+			if (summaryText && !/^No description available\.?$/i.test(summaryText)) effective.summary = summaryText;
+		}
+
+		const scoreText = adminMetadataPlainTextWithoutIcons(modal.querySelector('.rawg-chip-score'));
+		const scoreMatch = scoreText.match(/\b(?:100|[1-9]?\d)\b/);
+		if (scoreMatch) effective.score = scoreMatch[0];
+		const yearText = adminMetadataPlainTextWithoutIcons(modal.querySelector('.rawg-chip-year'));
+		const yearMatch = yearText.match(/\b(?:19|20)\d{2}\b/);
+		if (yearMatch) effective.year = yearMatch[0];
+
+		const genres = Array.from(modal.querySelectorAll('.rawg-chip-genre')).map(adminMetadataPlainTextWithoutIcons).filter(Boolean);
+		if (genres.length) effective.genres = genres;
+
+		// Tags, director and cast are not fully represented by provider chips in the modal.
+		// Preserve any active explicit override for those fields rather than inferring partial data.
+		if (Array.isArray(override?.tags) && override.tags.length) effective.tags = override.tags.slice();
+		if (override?.director) effective.director = override.director;
+		if (Array.isArray(override?.cast) && override.cast.length) effective.cast = override.cast.slice();
+		return effective;
+	}
+
+	function adminBuildEffectiveMetadataValues(item = null, category = '', override = null, resolvedCover = '', suppliedEffective = null) {
+		const supplied = suppliedEffective && typeof suppliedEffective === 'object' ? suppliedEffective : {};
+		const has = key => Object.prototype.hasOwnProperty.call(supplied, key);
+		const cat = normalizeContentMetadataCategoryClient(category || override?.category || item?.category || 'games');
+		const directCover = item && typeof getItemCover === 'function' ? String(getItemCover(item, cat) || '').trim() : '';
+		const fallbackCover = [override?.coverUrl, resolvedCover, directCover].map(value => String(value || '').trim()).find(value => /^https?:\/\//i.test(value)) || '';
+		const releasedText = String(item?.released || item?.releaseDate || item?.date || item?.year || '').trim();
+		const releasedYear = (releasedText.match(/\b(?:19|20)\d{2}\b/) || [])[0] || '';
+		const itemGenres = Array.isArray(item?.genres) ? item.genres.map(value => typeof value === 'string' ? value : value?.name).filter(Boolean) : [];
+		const itemTags = Array.isArray(item?.tags) ? item.tags.map(value => typeof value === 'string' ? value : value?.name).filter(Boolean) : [];
+		return {
+			title:adminMetadataNormalizeEditorValue('title', has('title') ? supplied.title : (override?.title || item?.cleanName || item?.title || item?.name || item?.rawName || '')),
+			coverUrl:adminMetadataNormalizeEditorValue('coverUrl', has('coverUrl') ? supplied.coverUrl : fallbackCover),
+			summary:adminMetadataNormalizeEditorValue('summary', has('summary') ? supplied.summary : (override?.summary || item?.summary || item?.description || item?.long_desc || item?.short_desc || '')),
+			score:adminMetadataNormalizeEditorValue('score', has('score') ? supplied.score : (override?.score ?? item?.score ?? item?.metacritic ?? '')),
+			year:adminMetadataNormalizeEditorValue('year', has('year') ? supplied.year : (override?.year || releasedYear)),
+			director:adminMetadataNormalizeEditorValue('director', has('director') ? supplied.director : (override?.director || item?.director || '')),
+			genres:adminMetadataNormalizeEditorValue('genres', has('genres') ? supplied.genres : ((Array.isArray(override?.genres) && override.genres.length) ? override.genres : itemGenres)),
+			tags:adminMetadataNormalizeEditorValue('tags', has('tags') ? supplied.tags : ((Array.isArray(override?.tags) && override.tags.length) ? override.tags : itemTags)),
+			cast:adminMetadataNormalizeEditorValue('cast', has('cast') ? supplied.cast : ((Array.isArray(override?.cast) && override.cast.length) ? override.cast : (Array.isArray(item?.cast) ? item.cast : [])))
+		};
+	}
+
+	function adminBuildMetadataOverridePayloadForSave(currentPayload) {
+		const payload = { ...currentPayload };
+		const currentKey = getContentMetadataOverrideKeyClient({ titleId:payload.titleId, contentId:payload.contentId }, payload.category);
+		if (!currentKey || currentKey !== String(window.__adminMetadataEditorSnapshotKey || '')) return payload;
+		const effective = window.__adminMetadataEditorInitialEffective || {};
+		const existing = window.__adminMetadataEditorInitialOverride || {};
+		for (const field of ADMIN_METADATA_EDIT_FIELDS) {
+			const current = adminMetadataNormalizeEditorValue(field, payload[field]);
+			const initialEffective = adminMetadataNormalizeEditorValue(field, effective[field]);
+			const initialOverride = adminMetadataNormalizeEditorValue(field, existing[field]);
+			payload[field] = adminMetadataEditorValueEquals(field, current, initialEffective) ? initialOverride : current;
+		}
+		return payload;
+	}
+
+	function adminMetadataOverrideHasValues(values = {}) {
+		return !!(values.title || values.coverUrl || values.summary || values.score !== '' || values.year || values.director || (values.genres && values.genres.length) || (values.tags && values.tags.length) || (values.cast && values.cast.length));
+	}
+
+	function adminMetadataAuditHtml(entry) {
+		const editor = String(entry?.updatedBy || '').trim();
+		if (!editor) return '';
+		const timestamp = String(entry?.updatedAt || '').trim();
+		let title = `Edited by ${editor}`;
+		if (timestamp) {
+			const date = new Date(timestamp);
+			if (!Number.isNaN(date.getTime())) title += ` • ${date.toLocaleString()}`;
+		}
+		return `<div class="admin-metadata-item-editor" data-no-translate="true" translate="no" title="${adminEscapeHtml(title)}"><i class="fas fa-user-pen"></i><span>Edited by <strong>${adminEscapeHtml(editor)}</strong></span></div>`;
+	}
+
 	function adminResetMetadataPreviewCoverFallback(image) {
 		if (!image) return;
 		['data-psn-store-tried','data-sony-icon-tried','data-github-cover-tried','data-bing-tried','data-cover-source'].forEach(attr => image.removeAttribute(attr));
@@ -38861,7 +38999,7 @@ P
 		}
 	}
 
-	function adminPopulateMetadataEditor(item, category, override = null, resolvedCover = '') {
+	function adminPopulateMetadataEditor(item, category, override = null, resolvedCover = '', effectiveMetadata = null) {
 		const cat = normalizeContentMetadataCategoryClient(category || override?.category || item?.category || 'games');
 		const titleId = normalizeContentMetadataTitleIdClient(item?.id || item?.titleId || override?.titleId || '');
 		const contentId = normalizeContentMetadataContentIdClient(item?.contentId || override?.contentId || '');
@@ -38870,15 +39008,21 @@ P
 		const carriedResolvedCover = previousKey === key ? String(window.__adminMetadataEditorResolvedCover || '') : '';
 		window.__adminMetadataEditorPreviewKey = key;
 		window.__adminMetadataEditorResolvedCover = String(resolvedCover || carriedResolvedCover || '');
+		const effective = adminBuildEffectiveMetadataValues(item, cat, override, window.__adminMetadataEditorResolvedCover, effectiveMetadata);
+		const initialOverride = adminMetadataOverrideValueSnapshot(override);
+		window.__adminMetadataEditorSnapshotKey = key;
+		window.__adminMetadataEditorInitialEffective = effective;
+		window.__adminMetadataEditorInitialOverride = initialOverride;
 		const setValue = (id, value) => { const el = document.getElementById(id); if (el) el.value = value ?? ''; };
 		setValue('admin-metadata-category', cat); setValue('admin-metadata-title-id', titleId); setValue('admin-metadata-content-id', contentId);
-		setValue('admin-metadata-title', override?.title || ''); setValue('admin-metadata-cover', override?.coverUrl || ''); setValue('admin-metadata-summary', override?.summary || '');
-		setValue('admin-metadata-score', override?.score ?? ''); setValue('admin-metadata-year', override?.year || ''); setValue('admin-metadata-director', override?.director || '');
-		setValue('admin-metadata-genres', Array.isArray(override?.genres) ? override.genres.join(', ') : ''); setValue('admin-metadata-tags', Array.isArray(override?.tags) ? override.tags.join(', ') : ''); setValue('admin-metadata-cast', Array.isArray(override?.cast) ? override.cast.join(', ') : '');
+		setValue('admin-metadata-title', effective.title); setValue('admin-metadata-cover', effective.coverUrl); setValue('admin-metadata-summary', effective.summary);
+		setValue('admin-metadata-score', effective.score); setValue('admin-metadata-year', effective.year); setValue('admin-metadata-director', effective.director);
+		setValue('admin-metadata-genres', effective.genres.join(', ')); setValue('admin-metadata-tags', effective.tags.join(', ')); setValue('admin-metadata-cast', effective.cast.join(', '));
 		const status = document.getElementById('admin-metadata-editor-status');
 		if (status) status.dataset.metadataKey = key;
 		const originalTitle = String(item?.__metadataBaseCleanName || item?.cleanName || item?.title || item?.name || override?.title || titleId || contentId || 'Store content');
-		adminSetMetadataEditorStatus(`<strong data-no-translate="true" translate="no">${adminEscapeHtml(originalTitle)}</strong><br><span data-no-translate="true" translate="no">${adminEscapeHtml(adminMetadataIdentityText(cat, titleId, contentId))}</span><span class="admin-metadata-status-note">${override ? 'Editing the active server override.' : 'No override yet. Blank fields keep the original/provider value.'}</span>`, override ? 'fa-pen' : 'fa-circle-info');
+		const editorNote = override?.updatedBy ? ` Last edited by <strong data-no-translate="true" translate="no">${adminEscapeHtml(override.updatedBy)}</strong>.` : '';
+		adminSetMetadataEditorStatus(`<strong data-no-translate="true" translate="no">${adminEscapeHtml(originalTitle)}</strong><br><span data-no-translate="true" translate="no">${adminEscapeHtml(adminMetadataIdentityText(cat, titleId, contentId))}</span><span class="admin-metadata-status-note">${override ? 'Editing the active server override.' : 'Current effective metadata is loaded.'}${editorNote} Only values you change become new overrides.</span>`, override ? 'fa-pen' : 'fa-circle-info');
 		const removeBtn = document.getElementById('admin-metadata-remove-current');
 		if (removeBtn) removeBtn.style.display = override ? '' : 'none';
 		window.__adminMetadataEditorItem = item || null;
@@ -38913,7 +39057,7 @@ P
 		const key = getContentMetadataOverrideKeyClient({ titleId: item?.id || item?.titleId || titleId, contentId }, category);
 		const override = window.getContentMetadataOverride ? window.getContentMetadataOverride(key) : null;
 		if (!item && !override) { if (typeof playUiError === 'function') playUiError(); adminSetMetadataEditorStatus('No matching Store item was found in this category.', 'fa-triangle-exclamation'); return null; }
-		adminPopulateMetadataEditor(item, category, override, options.resolvedCover || '');
+		adminPopulateMetadataEditor(item, category, override, options.resolvedCover || '', options.effectiveMetadata || null);
 		return { item, category, override, key };
 	};
 
@@ -38925,7 +39069,7 @@ P
 		['admin-metadata-title-id','admin-metadata-content-id','admin-metadata-title','admin-metadata-cover','admin-metadata-summary','admin-metadata-score','admin-metadata-year','admin-metadata-director','admin-metadata-genres','admin-metadata-tags','admin-metadata-cast'].forEach(id => { const el = document.getElementById(id); if (el) el.value = ''; });
 		const status = document.getElementById('admin-metadata-editor-status'); if (status) status.dataset.metadataKey = '';
 		const removeBtn = document.getElementById('admin-metadata-remove-current'); if (removeBtn) removeBtn.style.display = 'none';
-		window.__adminMetadataEditorItem = null; window.__adminMetadataEditorCategory = ''; window.__adminMetadataEditorPreviewKey = ''; window.__adminMetadataEditorResolvedCover = '';
+		window.__adminMetadataEditorItem = null; window.__adminMetadataEditorCategory = ''; window.__adminMetadataEditorPreviewKey = ''; window.__adminMetadataEditorResolvedCover = ''; window.__adminMetadataEditorSnapshotKey = ''; window.__adminMetadataEditorInitialEffective = null; window.__adminMetadataEditorInitialOverride = null;
 		adminSetMetadataEditorStatus('Choose a Store item to create a correction. The original TSV/database is never modified.');
 		adminUpdateMetadataPreview();
 	};
@@ -38943,10 +39087,16 @@ P
 		if (typeof socketChat === 'undefined' || !socketChat || !socketChat.connected) { if (typeof playUiError === 'function') playUiError(); if (typeof showToastNotification === 'function') showToastNotification('Metadata Corrections','Connect to the server before saving.'); return; }
 		let payload = adminCollectMetadataOverridePayload();
 		if (!payload.titleId && !payload.contentId) { const loaded = await adminLoadMetadataOverride(); if (!loaded) return; payload = adminCollectMetadataOverridePayload(); }
+		payload = adminBuildMetadataOverridePayloadForSave(payload);
 		if (payload.coverUrl && !/^https?:\/\//i.test(payload.coverUrl)) { if (typeof playUiError === 'function') playUiError(); adminSetMetadataEditorStatus('Cover URL must start with http:// or https://.', 'fa-triangle-exclamation'); return; }
 		if (payload.year && !/^(?:19|20)\d{2}$/.test(payload.year)) { if (typeof playUiError === 'function') playUiError(); adminSetMetadataEditorStatus('Year must be a four-digit year from 1900–2099.', 'fa-triangle-exclamation'); return; }
-		const hasValue = payload.title || payload.coverUrl || payload.summary || payload.score !== '' || payload.year || payload.director || payload.genres.length || payload.tags.length || payload.cast.length;
-		if (!hasValue) { if (typeof playUiError === 'function') playUiError(); adminSetMetadataEditorStatus('Add at least one correction before saving.', 'fa-triangle-exclamation'); return; }
+		const hasValue = adminMetadataOverrideHasValues(payload);
+		if (!hasValue) {
+			const hadOverride = adminMetadataOverrideHasValues(window.__adminMetadataEditorInitialOverride || {});
+			if (hadOverride) { if (typeof playUiError === 'function') playUiError(); adminSetMetadataEditorStatus('All correction fields are empty. Use Remove Override to restore the original/provider metadata.', 'fa-triangle-exclamation'); }
+			else adminSetMetadataEditorStatus('No changes to save.', 'fa-circle-check');
+			return;
+		}
 		adminSetMetadataEditorStatus('Saving correction…', 'fa-spinner fa-spin');
 		socketChat.emit('admin_upsert_content_metadata_override', payload, response => {
 			if (!response || response.success !== true || !response.override) { if (typeof playUiError === 'function') playUiError(); adminSetMetadataEditorStatus(adminEscapeHtml(response?.message || 'Could not save the correction.'), 'fa-triangle-exclamation'); return; }
@@ -38970,7 +39120,8 @@ P
 			if (typeof window.updateContentMetadataOverridesSyncMeta === 'function') window.updateContentMetadataOverridesSyncMeta(response);
 			if (response.unchanged) {
 				const item = window.__adminMetadataEditorItem || getLoadedMetadataStoreItemByKey(response.override.metadataKey)?.item || null;
-				adminPopulateMetadataEditor(item, response.override.category, response.override);
+				const effective = window.__adminMetadataEditorInitialEffective || null;
+				adminPopulateMetadataEditor(item, response.override.category, response.override, window.__adminMetadataEditorResolvedCover || '', effective);
 				adminSetMetadataEditorStatus('No changes to save.', 'fa-circle-check');
 				return;
 			}
@@ -39003,7 +39154,7 @@ P
 
 	window.adminOpenMetadataOverrideEditor = function(category, titleId, contentId = '', options = {}) {
 		if (!adminGuard()) return;
-		window.__adminMetadataPendingOpen = { category, titleId, contentId, item:options.item || null, resolvedCover:String(options.resolvedCover || '') };
+		window.__adminMetadataPendingOpen = { category, titleId, contentId, item:options.item || null, resolvedCover:String(options.resolvedCover || ''), effectiveMetadata:options.effectiveMetadata && typeof options.effectiveMetadata === 'object' ? options.effectiveMetadata : null };
 		const gameModal = document.getElementById('game-modal');
 		if (gameModal && gameModal.style.display !== 'none' && typeof closeModal === 'function') closeModal();
 		if (typeof openAdminPanel === 'function') openAdminPanel();
@@ -39014,7 +39165,7 @@ P
 			window.__adminMetadataPendingOpen = null;
 			const set = (id,value) => { const el=document.getElementById(id); if(el) el.value=value || ''; };
 			set('admin-metadata-category', normalizeContentMetadataCategoryClient(pending.category)); set('admin-metadata-title-id', normalizeContentMetadataTitleIdClient(pending.titleId)); set('admin-metadata-content-id', normalizeContentMetadataContentIdClient(pending.contentId));
-			adminLoadMetadataOverride({ item:pending.item || null, resolvedCover:pending.resolvedCover || '' });
+			adminLoadMetadataOverride({ item:pending.item || null, resolvedCover:pending.resolvedCover || '', effectiveMetadata:pending.effectiveMetadata || null });
 			card?.scrollIntoView({ behavior:'smooth', block:'center' });
 		};
 		setTimeout(() => applyPending(0), 80);
@@ -39029,9 +39180,11 @@ P
 		const contentId = modal.dataset.contentId || '';
 		const key = getContentMetadataOverrideKeyClient({ titleId, contentId }, category);
 		const loaded = key ? getLoadedMetadataStoreItemByKey(key) : null;
+		const override = key && typeof window.getContentMetadataOverride === 'function' ? window.getContentMetadataOverride(key) : null;
 		const modalImage = modal.querySelector('.modal-img');
 		const resolvedCover = modalImage && modalImage.complete && Number(modalImage.naturalWidth || 0) > 0 ? String(modalImage.currentSrc || modalImage.src || '').trim() : '';
-		adminOpenMetadataOverrideEditor(category, titleId, contentId, { item:loaded?.item || null, resolvedCover });
+		const effectiveMetadata = adminCaptureEffectiveMetadataFromModal(modal, override, resolvedCover);
+		adminOpenMetadataOverrideEditor(category, titleId, contentId, { item:loaded?.item || null, resolvedCover, effectiveMetadata });
 	};
 
 	function adminMetadataOverrideDisplayTitle(entry) {
@@ -39045,7 +39198,8 @@ P
 		if (!entry) return '';
 		const fields = [['title',entry.title],['cover',entry.coverUrl],['summary',entry.summary],['score',entry.score !== null && entry.score !== undefined ? entry.score : ''],['year',entry.year],['genres',entry.genres?.length],['tags',entry.tags?.length],['director',entry.director],['cast',entry.cast?.length]].filter(([,value]) => value !== '' && value !== null && value !== undefined && value !== 0).map(([name]) => `<span>${name}</span>`).join('');
 		const title = adminMetadataOverrideDisplayTitle(entry);
-		return `<div class="admin-metadata-item" data-metadata-key="${adminEscapeHtml(entry.metadataKey)}"><div class="admin-metadata-item-main"><div class="admin-metadata-item-title" data-no-translate="true" translate="no">${adminEscapeHtml(title)}</div><div class="admin-metadata-item-meta" data-no-translate="true" translate="no">${adminEscapeHtml(adminMetadataIdentityText(entry.category, entry.titleId, entry.contentId))}</div><div class="admin-metadata-item-fields">${fields}</div></div><div class="admin-metadata-item-actions"><button class="btn-mini-round metadata-edit" data-category="${adminEscapeHtml(entry.category)}" data-title-id="${adminEscapeHtml(entry.titleId)}" data-content-id="${adminEscapeHtml(entry.contentId)}" onclick="event.stopPropagation(); adminOpenMetadataOverrideEditor(this.dataset.category,this.dataset.titleId,this.dataset.contentId)" onmouseenter="if(typeof playUiHover === 'function') playUiHover()" title="Edit correction"><i class="fas fa-pen"></i></button><button class="btn-mini-round metadata-remove" data-metadata-key="${adminEscapeHtml(entry.metadataKey)}" onclick="event.stopPropagation(); adminRemoveMetadataOverride(this.dataset.metadataKey)" onmouseenter="if(typeof playUiHover === 'function') playUiHover()" title="Remove correction"><i class="fas fa-trash"></i></button></div></div>`;
+		const audit = adminMetadataAuditHtml(entry);
+		return `<div class="admin-metadata-item" data-metadata-key="${adminEscapeHtml(entry.metadataKey)}"><div class="admin-metadata-item-main"><div class="admin-metadata-item-title" data-no-translate="true" translate="no">${adminEscapeHtml(title)}</div><div class="admin-metadata-item-meta" data-no-translate="true" translate="no">${adminEscapeHtml(adminMetadataIdentityText(entry.category, entry.titleId, entry.contentId))}</div>${audit}<div class="admin-metadata-item-fields">${fields}</div></div><div class="admin-metadata-item-actions"><button class="btn-mini-round metadata-edit" data-category="${adminEscapeHtml(entry.category)}" data-title-id="${adminEscapeHtml(entry.titleId)}" data-content-id="${adminEscapeHtml(entry.contentId)}" onclick="event.stopPropagation(); adminOpenMetadataOverrideEditor(this.dataset.category,this.dataset.titleId,this.dataset.contentId)" onmouseenter="if(typeof playUiHover === 'function') playUiHover()" title="Edit correction"><i class="fas fa-pen"></i></button><button class="btn-mini-round metadata-remove" data-metadata-key="${adminEscapeHtml(entry.metadataKey)}" onclick="event.stopPropagation(); adminRemoveMetadataOverride(this.dataset.metadataKey)" onmouseenter="if(typeof playUiHover === 'function') playUiHover()" title="Remove correction"><i class="fas fa-trash"></i></button></div></div>`;
 	}
 
 	window.adminPatchMetadataOverrideDelta = function(metadataKey = '', action = '') {
