@@ -7160,9 +7160,6 @@ img { -webkit-user-drag: none !important; user-drag: none !important; }
 					<div>
 						<div style="font-size: 18px; color: #fff; font-weight: 500;">Update Database</div>
 						<div style="font-size: 13px; color: var(--text-muted); margin-top: 6px;">Force a synchronization to get the latest entries and covers.</div>
-						<div id="last-sync-display" style="font-size: 11px; color: var(--ps-blue); margin-top: 8px; font-weight: bold; opacity: 0.8;">
-							<i class="far fa-clock"></i> LAST SYNC: NEVER
-						</div>
 					</div>
 					<button class="action-btn" id="btn-sync-db" onclick="clearAppCache()" style="margin-top: 0; min-width: 140px; justify-content: center;">
 						<i class="fas fa-sync-alt"></i> SYNC NOW
@@ -15443,8 +15440,12 @@ P
 		const consoleClasses = ['ps3', 'ps2', 'psx', 'psp', 'minis', 'pce', 'neogeo'];
 		const tagClass = consoleClasses.includes(game.cTag) ? `tag-${game.cTag}` : 'tag-default';
 		const consoleName = String(game.cTag || '').toUpperCase();
-		const safeName = escapeExploreHtmlText(game.cleanName);
-		const safeNameAttr = escapeExploreHtmlAttr(game.cleanName);
+		const rawExploreName = game.cleanName || game.title || game.name || '';
+		const effectiveExploreName = typeof window.getEffectiveContentTitle === 'function'
+			? (window.getEffectiveContentTitle(game, cat, rawExploreName) || rawExploreName)
+			: rawExploreName;
+		const safeName = escapeExploreHtmlText(effectiveExploreName);
+		const safeNameAttr = escapeExploreHtmlAttr(effectiveExploreName);
 		const safeDate = escapeExploreHtmlText(game.date || '');
 		const safeRegion = escapeExploreHtmlText(game.region || '');
 		const safeIdText = escapeExploreHtmlText(game.id || '');
@@ -17783,7 +17784,9 @@ P
             browseCardStaticMetaCache.set(game, byCategory);
         }
         const cat = String(category || game.category || '');
-        if (byCategory.has(cat)) return byCategory.get(cat);
+        const metadataRevision = Number(window.__contentMetadataOverridesRevision || 0);
+        const cachedStatic = byCategory.get(cat);
+        if (cachedStatic && cachedStatic.metadataRevision === metadataRevision) return cachedStatic.meta;
 
         const coverKey = typeof window.getStoreCardCoverKey === 'function'
             ? window.getStoreCardCoverKey(cat, game.id || game.titleId, game.contentId)
@@ -17816,7 +17819,7 @@ P
             displayVersion,
             versionTagHtml: displayVersion ? ` <span style="color:#FF1493; font-size:11px; vertical-align: middle;">[v${displayVersion}]</span>` : ''
         };
-        byCategory.set(cat, meta);
+        byCategory.set(cat, { metadataRevision, meta });
         return meta;
     }
 
@@ -23420,9 +23423,47 @@ P
 		return key;
 	}
 
+	window.__contentMetadataOverrideTitleIndex = window.__contentMetadataOverrideTitleIndex instanceof Map ? window.__contentMetadataOverrideTitleIndex : new Map();
+	window.__contentMetadataOverrideTitleIndexRevision = Number(window.__contentMetadataOverrideTitleIndexRevision || -1);
+
+	function getContentMetadataOverrideTitleIndex() {
+		const revision = Number(window.__contentMetadataOverridesRevision || 0);
+		if (window.__contentMetadataOverrideTitleIndexRevision === revision && window.__contentMetadataOverrideTitleIndex instanceof Map) return window.__contentMetadataOverrideTitleIndex;
+		const index = new Map();
+		const map = window.__contentMetadataOverridesMap instanceof Map ? window.__contentMetadataOverridesMap : new Map();
+		for (const entry of map.values()) {
+			if (!entry || !entry.titleId) continue;
+			const indexKey = `${normalizeContentMetadataCategoryClient(entry.category || 'games')}|${normalizeContentMetadataTitleIdClient(entry.titleId)}`;
+			if (!index.has(indexKey)) {
+				index.set(indexKey, entry);
+				continue;
+			}
+			const previous = index.get(indexKey);
+			// An override without Content ID is intentionally title-wide and wins as fallback.
+			if (previous && !previous.contentId) continue;
+			if (!entry.contentId) index.set(indexKey, entry);
+			else index.set(indexKey, null); // Multiple content-specific entries: do not guess.
+		}
+		window.__contentMetadataOverrideTitleIndex = index;
+		window.__contentMetadataOverrideTitleIndexRevision = revision;
+		return index;
+	}
+
 	window.getContentMetadataOverride = function(data = {}, categoryOverride = '') {
 		const key = getCachedContentMetadataOverrideKeyClient(data, categoryOverride);
-		return key ? (window.__contentMetadataOverridesMap.get(key) || null) : null;
+		const map = window.__contentMetadataOverridesMap instanceof Map ? window.__contentMetadataOverridesMap : new Map();
+		const exact = key ? (map.get(key) || null) : null;
+		if (exact) return exact;
+		if (!data || typeof data !== 'object') return null;
+		const titleId = normalizeContentMetadataTitleIdClient(data.titleId || data.id || '');
+		if (!titleId) return null;
+		const category = normalizeContentMetadataCategoryClient(categoryOverride || data.category || data.storeCategory || data.rawCategory || 'games');
+		return getContentMetadataOverrideTitleIndex().get(`${category}|${titleId}`) || null;
+	};
+
+	window.getEffectiveContentTitle = function(data = {}, categoryOverride = '', fallback = '') {
+		const override = typeof window.getContentMetadataOverride === 'function' ? window.getContentMetadataOverride(data, categoryOverride) : null;
+		return String(override?.title || data?.cleanName || data?.title || data?.name || fallback || '').trim();
 	};
 
 	window.applyContentMetadataOverrideToItem = function(item, category = '') {
@@ -23550,6 +23591,38 @@ P
 		}
 	};
 
+	window.refreshContentMetadataOverrideConsumers = function(metadataKey = '', changeFlags = null) {
+		const updateTitle = !changeFlags || changeFlags.title === true;
+		const updateCover = !changeFlags || changeFlags.cover === true;
+		if (!updateTitle && !updateCover) return;
+
+		if (typeof isSocialPlayTogetherSubviewVisible === 'function' && isSocialPlayTogetherSubviewVisible() && typeof window.renderPlayTogetherSocialPanel === 'function') {
+			window.renderPlayTogetherSocialPanel(true);
+		}
+		if (typeof isPsnDomSectionVisible === 'function' && isPsnDomSectionVisible('view-downloads') && typeof window.updateDownloadUI === 'function') {
+			window.updateDownloadUI(true, 'reset');
+		}
+		if (typeof isPsnDomSectionVisible === 'function' && isPsnDomSectionVisible('view-wishlist') && typeof window.updateWishlistUI === 'function') {
+			window.updateWishlistUI(true, 'reset');
+		}
+		if (typeof isPsnDomSectionVisible === 'function' && isPsnDomSectionVisible('view-explore') && typeof window.renderRecentlyVisited === 'function') {
+			window.renderRecentlyVisited();
+		}
+		if (typeof isPsnDomSectionVisible === 'function' && isPsnDomSectionVisible('view-library')) {
+			if (isPsnDomSectionVisible('subview-games') && typeof window.applyLibraryFilters === 'function') window.applyLibraryFilters(true);
+			if (isPsnDomSectionVisible('subview-favs') && typeof window.updateFavoritesLibraryUI === 'function') window.updateFavoritesLibraryUI(true, 'reset');
+		}
+
+		const profileListModal = document.getElementById('modal-sys-list');
+		const lastProfileListRender = window.__lastProfileListRender;
+		if (profileListModal && profileListModal.classList.contains('show') && lastProfileListRender && typeof window.renderFetchedList === 'function') {
+			window.__lastProfileListRender = null;
+			window.renderFetchedList(lastProfileListRender.targetUser, lastProfileListRender.listType, lastProfileListRender.rawData);
+		}
+		if (typeof window.isFriendActivityVisible === 'function' && window.isFriendActivityVisible() && typeof window.renderFriendActivity === 'function') window.renderFriendActivity(true);
+		if (typeof window.isNotificationCenterVisible === 'function' && window.isNotificationCenterVisible() && typeof window.renderNotificationCenter === 'function') window.renderNotificationCenter(true);
+	};
+
 	function contentMetadataOverrideArrayEquals(a, b) {
 		if (a === b) return true;
 		if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
@@ -23612,6 +23685,12 @@ P
 		const current = window.__contentMetadataOverridesMap instanceof Map ? window.__contentMetadataOverridesMap : new Map();
 		const diff = getContentMetadataOverrideChangedKeys(current, next);
 		if (!diff.changed) return false;
+		if (diff.coverChanged && typeof window.forgetContentMetadataOverrideCoverCaches === 'function') {
+			for (const [key, previous] of current) {
+				const replacement = next.get(key) || null;
+				if (previous?.coverUrl && previous.coverUrl !== replacement?.coverUrl) window.forgetContentMetadataOverrideCoverCaches(previous.coverUrl);
+			}
+		}
 		window.__contentMetadataOverridesMap = next;
 		window.__contentMetadataOverridesRevision = Number(window.__contentMetadataOverridesRevision || 0) + 1;
 		if (!diff.overflow && diff.changedKeys.length) {
@@ -23639,6 +23718,7 @@ P
 			}
 			if (diff.titleChanged || diff.coverChanged) window.refreshContentMetadataOverrideDom('', { title:diff.titleChanged, cover:diff.coverChanged });
 		}
+		if (diff.titleChanged || diff.coverChanged) window.refreshContentMetadataOverrideConsumers('', { title:diff.titleChanged, cover:diff.coverChanged });
 		if (document.getElementById('view-admin')?.style.display === 'block' && typeof adminRenderMetadataOverrides === 'function') adminRenderMetadataOverrides();
 		return true;
 	};
@@ -23664,12 +23744,18 @@ P
 		window.__contentMetadataOverridesMap = map;
 		window.__contentMetadataOverridesRevision = Number(window.__contentMetadataOverridesRevision || 0) + 1;
 		const ui = getContentMetadataOverrideUiChangeFlags(previous, nextEntry);
+		if (ui.cover && previous?.coverUrl && previous.coverUrl !== nextEntry?.coverUrl && typeof window.forgetContentMetadataOverrideCoverCaches === 'function') {
+			window.forgetContentMetadataOverrideCoverCaches(previous.coverUrl);
+		}
 		if (ui.title) {
 			markContentMetadataOverrideKeysChanged([key]);
 			if (typeof window.reapplyContentMetadataOverrideKeyToLoadedData === 'function') window.reapplyContentMetadataOverrideKeyToLoadedData(key);
 			invalidateContentMetadataStoreLookup(key);
 		}
-		if (ui.title || ui.cover) window.refreshContentMetadataOverrideDom(key, ui);
+		if (ui.title || ui.cover) {
+			window.refreshContentMetadataOverrideDom(key, ui);
+			window.refreshContentMetadataOverrideConsumers(key, ui);
+		}
 		if (document.getElementById('view-admin')?.style.display === 'block') {
 			if (typeof adminPatchMetadataOverrideDelta === 'function') adminPatchMetadataOverrideDelta(key, delta.action);
 			else if (typeof adminRenderMetadataOverrides === 'function') adminRenderMetadataOverrides();
@@ -23757,6 +23843,27 @@ P
 			window.__contentMetadataOverrideCoverSrcSetRevision = revision;
 		}
 		return window.__contentMetadataOverrideCoverSrcSet.has(cleanSrc);
+	};
+
+	window.forgetContentMetadataOverrideCoverCaches = function(rawSrc) {
+		const src = normalizeCoverSrcForCache(rawSrc);
+		if (!src) return false;
+		let changed = false;
+		const cache = window.__cardCoverSrcCache || {};
+		for (const [key, entry] of Object.entries(cache)) {
+			const cachedSrc = normalizeCoverSrcForCache(entry && typeof entry === 'object' ? entry.src : entry);
+			if (cachedSrc !== src) continue;
+			delete cache[key];
+			changed = true;
+		}
+		if (changed && typeof persistCardCoverSrcCacheSoon === 'function') persistCardCoverSrcCacheSoon();
+		for (const entry of Object.values(window.libCoverCache || {})) {
+			if (normalizeCoverSrcForCache(entry?.resolvedCover || '') === src) delete entry.resolvedCover;
+		}
+		document.querySelectorAll('[data-collection-image-recycle-src]').forEach(img => {
+			if (normalizeCoverSrcForCache(img.dataset?.collectionImageRecycleSrc || '') === src) delete img.dataset.collectionImageRecycleSrc;
+		});
+		return changed;
 	};
 
 	function getCoverCacheCategory(key, category, imgElement) {
@@ -23908,6 +24015,9 @@ P
 		key = String(key || '').trim();
 		src = normalizeCoverSrcForCache(src);
 		if (!key || !src) return;
+		// Metadata overrides are authoritative live data; keeping them in the generic persistent
+		// cover cache can resurrect an old override after it is changed or removed.
+		if (typeof window.isContentMetadataOverrideCoverSrc === 'function' && window.isContentMetadataOverrideCoverSrc(src)) return;
 		const cat = getCoverCacheCategory(key, category, imgElement);
 		const source = getCoverCacheSource(src, imgElement);
 		const priority = getCoverCachePriority(cat, src, imgElement);
@@ -27198,7 +27308,8 @@ P
 			const cachedCoverUrl = coverKey && typeof window.getCachedCardCoverSrc === 'function'
 				? window.getCachedCardCoverSrc(coverKey, currentCat, preferredCoverUrl)
 				: '';
-			const imgUrl = reusableBrowseCoverUrls.get(String(coverKey || '')) || cachedCoverUrl || preferredCoverUrl;
+			const preferredCoverIsOverride = typeof window.isContentMetadataOverrideCoverSrc === 'function' && window.isContentMetadataOverrideCoverSrc(preferredCoverUrl);
+			const imgUrl = preferredCoverIsOverride ? preferredCoverUrl : (reusableBrowseCoverUrls.get(String(coverKey || '')) || cachedCoverUrl || preferredCoverUrl);
 			const githubCoverUrl = cardStatic ? cardStatic.githubCoverUrl : getGithubItemCover(game, currentCat);
 			const coverKeyAttr = cardStatic ? cardStatic.coverKeyAttr : String(coverKey || '').replace(/[&<>"]/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[ch]);
 			const githubCoverAttr = cardStatic ? cardStatic.githubCoverAttr : String(githubCoverUrl || '').replace(/"/g, '&quot;');
@@ -29179,11 +29290,13 @@ P
         const id = normalizeGamePlayersTitleId(rawId);
         const storeMatch = typeof window.findPsnStoreItemById === 'function' ? window.findPsnStoreItemById(id) : null;
         const gameData = storeMatch && storeMatch.item ? storeMatch.item : null;
-        const title = String((gameData && (gameData.cleanName || gameData.title || gameData.name)) || fallbackTitle || ((window.gameNameCache && window.gameNameCache[id]) || id || 'Unknown Game')).trim() || id;
         const contentId = String((gameData && (gameData.contentId || gameData.contentID)) || '');
+        const identity = gameData || { id, titleId:id, contentId, category:'games' };
+        const titleFallback = fallbackTitle || ((window.gameNameCache && window.gameNameCache[id]) || id || 'Unknown Game');
+        const title = typeof window.getEffectiveContentTitle === 'function' ? (window.getEffectiveContentTitle(identity, 'games', titleFallback) || id) : String((gameData && (gameData.cleanName || gameData.title || gameData.name)) || titleFallback).trim();
         const coverKey = typeof window.getStoreCardCoverKey === 'function' ? window.getStoreCardCoverKey('games', id, contentId) : id;
-        const githubCover = typeof getOptimizedCover === 'function' ? getOptimizedCover(id) : '';
-        const cover = (typeof window.getCachedCardCoverSrc === 'function' ? window.getCachedCardCoverSrc(coverKey, 'games', githubCover) : '') || githubCover || 'https://raw.githubusercontent.com/PS3-Pro/PSN-Content/main/resources/interface/modern/images/placeholder.png';
+        const preferredCover = typeof getItemCover === 'function' ? getItemCover(identity, 'games') : (typeof getOptimizedCover === 'function' ? getOptimizedCover(id) : '');
+        const cover = (typeof window.getCachedCardCoverSrc === 'function' ? window.getCachedCardCoverSrc(coverKey, 'games', preferredCover) : '') || preferredCover || 'https://raw.githubusercontent.com/PS3-Pro/PSN-Content/main/resources/interface/modern/images/placeholder.png';
         return { id, title, cover, contentId };
     }
 
@@ -29243,7 +29356,7 @@ P
     }
 
     function getPlayTogetherSocialRenderSignature(filter, entries) {
-        return filter + '|' + (window.__socialPlayTogetherOwnedFilter === 'owned' ? 'owned' : 'all') + '|' + ((window.sortOrders && window.sortOrders.playTogether) || 'asc') + '|' + entries.map(entry => [
+        return filter + '|' + (window.__socialPlayTogetherOwnedFilter === 'owned' ? 'owned' : 'all') + '|' + ((window.sortOrders && window.sortOrders.playTogether) || 'asc') + '|' + Number(window.__contentMetadataOverridesRevision || 0) + '|' + entries.map(entry => [
             entry.id,
             entry.title,
             entry.contentId,
@@ -33251,12 +33364,13 @@ P
 		const cat = itemFinalCategory || itemCoverData.category || item.category || 'games';
 		const savedCover = String(itemCoverData.cover || item.cover || '').trim();
 
-		if (!smartCoverLists.includes(normalizedList)) {
-			return (typeof getOptimizedCover === 'function' && itemCoverId && isNaN(itemCoverId)) ? getOptimizedCover(itemCoverId) : (savedCover || FALLBACK_IMG);
+		if (typeof getItemCover === 'function' && itemCoverId && isNaN(itemCoverId)) {
+			const effectiveCover = getItemCover({ ...itemCoverData, id: itemCoverId, titleId: itemCoverId }, cat);
+			if (effectiveCover && (smartCoverLists.includes(normalizedList) || (typeof window.isContentMetadataOverrideCoverSrc === 'function' && window.isContentMetadataOverrideCoverSrc(effectiveCover)))) return effectiveCover;
 		}
 
-		if (typeof getItemCover === 'function' && itemCoverId && isNaN(itemCoverId)) {
-			return getItemCover({ ...itemCoverData, id: itemCoverId, titleId: itemCoverId }, cat);
+		if (!smartCoverLists.includes(normalizedList)) {
+			return (typeof getOptimizedCover === 'function' && itemCoverId && isNaN(itemCoverId)) ? getOptimizedCover(itemCoverId) : (savedCover || FALLBACK_IMG);
 		}
 
 		const canUseSavedCover = !!savedCover && savedCover !== FALLBACK_IMG && (!window.isPrivateOrLocalCoverUrl(savedCover) || isMe);
@@ -34326,7 +34440,8 @@ P
 		if(statSize) statSize.innerText = formatSizeFromBytes(totalBytes);
 		if(globalCount) globalCount.innerText = `(${window.formatUiCount ? window.formatUiCount(window.downloadHistory.length, 'item', 'items') : `${window.downloadHistory.length} ${window.downloadHistory.length === 1 ? 'item' : 'items'}`})`;
 
-		const downloadRenderSignature = downloadRenderEntries.map(entry => {
+		const metadataOverrideRevision = Number(window.__contentMetadataOverridesRevision || 0);
+		const downloadRenderSignature = metadataOverrideRevision + '|' + downloadRenderEntries.map(entry => {
 			const dl = entry.item;
 			const identity = getDownloadPlayTogetherIdentity(dl);
 			return [
@@ -34335,7 +34450,7 @@ P
 				identity.titleId && typeof window.isViewerPlayTogetherTitle === 'function' && window.isViewerPlayTogetherTitle(identity.titleId) ? 1 : 0
 			].join('~');
 		}).join('|');
-		const downloadStructureSignature = downloadRenderEntries.map(entry => {
+		const downloadStructureSignature = metadataOverrideRevision + '|' + downloadRenderEntries.map(entry => {
 			const dl = entry.item;
 			const identity = getDownloadPlayTogetherIdentity(dl);
 			return [
@@ -34421,12 +34536,22 @@ P
 			const coverImg = cachedDlCoverImg || preferredDlCoverImg;
 			const dlCoverKeyAttr = String(dlCoverKey || '').replace(/[&<>"]/g, ch => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;' })[ch]);
 			const githubCoverImg = getGithubItemCover(dlCoverData, dlFinalCategory);
-			const dlCoverName = String(dlCoverData.cleanName || dl.cleanName || dl.name || dl.titleId || '').replace(/"/g, '&quot;');
+			const rawDlDisplayName = dlCoverData.cleanName || dl.cleanName || dl.name || '';
+			const dlDisplayIdentity = {
+				...dlCoverData,
+				id: dlCoverData.id || dlCoverData.titleId || dl.titleId || dl.id || '',
+				titleId: dlCoverData.titleId || dlCoverData.id || dl.titleId || dl.id || '',
+				contentId: dlCoverData.contentId || dl.contentId || dl.contentID || '',
+				category: dlFinalCategory
+			};
+			const dlDisplayName = typeof window.getEffectiveContentTitle === 'function'
+				? (window.getEffectiveContentTitle(dlDisplayIdentity, dlFinalCategory, rawDlDisplayName) || rawDlDisplayName)
+				: rawDlDisplayName;
+			const dlCoverName = String(dlDisplayName || dl.titleId || '').replace(/"/g, '&quot;');
 			const dlCoverConsole = String(dlCoverData.cTag || dl.cTag || dl.console || 'ps3').replace(/"/g, '&quot;');
 			const dlCoverCategoryRaw = String(dlFinalCategory || 'games');
 			const dlCoverCategory = dlCoverCategoryRaw.replace(/"/g, '&quot;');
 			const dlNoBingCover = (dlCoverCategoryRaw === 'avatars' || dlCoverCategoryRaw === 'themes') ? 'true' : 'false';
-			const dlDisplayName = dlCoverData.cleanName || dl.cleanName || dl.name || '';
 			const typeMeta = window.getDownloadTypeMeta(dlFinalCategory, dlCoverData);
 			const typeTagHtml = window.getDownloadTypeTagHtml(dlFinalCategory, dlCoverData);
 			const typeClass = `dl-kind-${typeMeta.cls || 'default'}`;
@@ -41601,21 +41726,10 @@ P
 	
 		console.log("[System] Starting boot cache jobs in background...");
 		if (typeof startBootPreloads === 'function') {
-			startBootPreloads('dom-ready').then(() => {
-				if (typeof updateSyncTimestamp === 'function') updateSyncTimestamp();
-			}).catch(e => console.warn('[System] Boot sync timestamp update skipped.', e));
+			startBootPreloads('dom-ready').catch(e => console.warn('[System] Boot preload skipped.', e));
 		}
 	
 		renderLetterFilter();
-		
-		const savedSync = loadState("psn_last_sync");
-		const syncDisplay = document.getElementById('last-sync-display');
-	
-		if (savedSync && syncDisplay) {
-			syncDisplay.innerHTML = `<i class="far fa-clock"></i> LAST SYNC: ${savedSync}`;
-		} else {
-			updateSyncTimestamp();
-		}
 		
 		switchView('view-explore', false, true);
 	});
@@ -42131,26 +42245,7 @@ P
 	document.addEventListener('DOMContentLoaded', initCarousel);
 	document.addEventListener('visibilitychange', handleHeroVisibilityChange);
 	
-	function updateSyncTimestamp() {
-		const now = new Date();
-		
-		const datePart = now.toLocaleDateString('en-US', { 
-			month: 'short', 
-			day: 'numeric', 
-			year: 'numeric' 
-		});
-	
-		const timePart = now.getHours().toString().padStart(2, '0') + ":" + 
-						now.getMinutes().toString().padStart(2, '0');
-	
-		const fullStatus = `${datePart} - ${timePart}`;
-	
-		saveState("psn_last_sync", fullStatus);
-		
-		const display = document.getElementById('last-sync-display');
-		if(display) display.innerHTML = `<i class="far fa-clock"></i> LAST SYNC: ${fullStatus}`;
-	}
-	
+
 	async function clearAppCache() {
 		const btn = document.getElementById('btn-sync-db');
 		if (!btn) return;
@@ -42207,7 +42302,6 @@ P
 			if (typeof isPsnDomSectionVisible === 'function' && isPsnDomSectionVisible('view-wishlist') && typeof window.updateWishlistUI === 'function') window.updateWishlistUI(true);
 
 			if (typeof fetchDatabase === 'function') await fetchDatabase();
-			updateSyncTimestamp();
 			playUiSuccess();
 			
 			checkTrophyProgress('sync_db', 1);
@@ -43479,6 +43573,7 @@ P
 			activeConsoles.join(','),
 			typeof activeWishLetter !== 'undefined' ? activeWishLetter : 'ALL',
 			window.sortOrders?.wishlist || 'asc',
+			Number(window.__contentMetadataOverridesRevision || 0),
 			filteredWishlist.map(game => getWishlistDotKey(game)).join('|')
 		]);
 		const wishlistCanAppend = appendProgressive && grid.dataset.progressiveGridSignature === wishlistProgressiveSignature;
@@ -43583,7 +43678,10 @@ P
 				? window.getCachedCardCoverSrc(coverKey, resolvedWishCategory, wishlistCanonicalReady ? preferredWishCoverUrl : '')
 				: '';
 			const savedWishCoverUrl = normalizeCoverSrcForCache(game.cover || '');
-			const imgUrl = cachedWishCoverUrl || savedWishCoverUrl || preferredWishCoverUrl;
+			const preferredWishCoverIsOverride = typeof window.isContentMetadataOverrideCoverSrc === 'function' && window.isContentMetadataOverrideCoverSrc(preferredWishCoverUrl);
+			const imgUrl = preferredWishCoverIsOverride
+				? preferredWishCoverUrl
+				: (wishlistCanonicalReady ? (cachedWishCoverUrl || preferredWishCoverUrl || savedWishCoverUrl) : (cachedWishCoverUrl || savedWishCoverUrl || preferredWishCoverUrl));
 			const coverWriteKey = (wishlistCanonicalReady || cachedWishCoverUrl) ? coverKey : `wishlist|${wishDotKey}`;
 			const githubCoverUrl = getGithubItemCover(game, resolvedWishCategory);
 			const tagClass = `tag-${game.cTag}`;
@@ -43595,12 +43693,16 @@ P
 			const unavailableClass = isStoreUnavailable ? ' store-item-unavailable' : '';
 			const wishlistIdentityAttr = escapeCategoryDotAttr(game.__wishlistIdentityKey || '');
 			const wishlistLiveKey = String(wishDotKey || game.contentId || game.id || `wishlist-${i}`);
+			const rawWishlistDisplayName = game.cleanName || game.title || game.name || '';
+			const wishlistDisplayName = typeof window.getEffectiveContentTitle === 'function'
+				? (window.getEffectiveContentTitle(game, resolvedWishCategory, rawWishlistDisplayName) || rawWishlistDisplayName)
+				: rawWishlistDisplayName;
 			const wishlistLiveSignature = typeof window.getLiveRenderSignature === 'function'
-				? window.getLiveRenderSignature([resolvedWishCategory, game.id || '', game.contentId || '', game.cleanName || '', game.size || '', game.cTag || '', game.region || '', imgUrl || '', githubCoverUrl || '', isStoreUnavailable ? 1 : 0, shouldShowWishTypeTag ? 1 : 0, isPendingWishlistReveal ? 1 : 0])
+				? window.getLiveRenderSignature([resolvedWishCategory, game.id || '', game.contentId || '', wishlistDisplayName, game.size || '', game.cTag || '', game.region || '', imgUrl || '', githubCoverUrl || '', isStoreUnavailable ? 1 : 0, shouldShowWishTypeTag ? 1 : 0, isPendingWishlistReveal ? 1 : 0])
 				: '';
 			const wishlistCardClick = isStoreUnavailable
 				? 'playUiError();'
-				: `playUiClick(); searchGameOnSite('${game.id}', 'wishlist', '${resolvedWishCategory}', '${(game.cleanName || '').replace(/'/g, "\\'")}', '${(game.contentId || '').replace(/'/g, "\\'")}')`;
+				: `playUiClick(); searchGameOnSite('${game.id}', 'wishlist', '${resolvedWishCategory}', '${String(wishlistDisplayName || '').replace(/'/g, "\\'")}', '${(game.contentId || '').replace(/'/g, "\\'")}')`;
 			html += `
 			<div class="game-card ${animClass} ${isSilent ? 'no-img-fade' : ''} ${isPendingWishlistReveal ? 'category-wishlist-entry' : ''} is-wishlisted${unavailableClass}" data-content-id="${game.contentId || ''}" data-store-category="${resolvedWishCategory}" data-wishlist-title-id="${game.id || ''}" data-wishlist-category="${resolvedWishCategory}" data-wishlist-identity-key="${wishlistIdentityAttr}" data-category-dot-key="${escapeCategoryDotAttr(wishDotKey)}" data-live-render-key="wishlist:${escapeCategoryDotAttr(wishlistLiveKey)}" data-live-render-signature="${escapeCategoryDotAttr(wishlistLiveSignature)}" style="--tile-idx: ${i % 50};" onmouseenter="const __hoverTarget = document.elementFromPoint(event.clientX, event.clientY); if(!__hoverTarget || !__hoverTarget.closest('.btn-mini,.btn-mini-round,.fav-btn,.wish-btn,.action-btn,button,a')) playUiHover(); this.classList.remove('anim-reveal'); this.classList.add('no-anim');" onclick="${wishlistCardClick}">
 				<div class="game-img-container">
@@ -43610,12 +43712,12 @@ P
 					<div class="wish-btn" title="Remove from Wishlist" onclick="toggleWishlist(event, '${game.id}')">
 						<i class="fas fa-heart" style="color: #ff4444; font-size: 14px;"></i>
 					</div>
-					<img src="${imgUrl}" class="game-img" loading="lazy" decoding="async" data-cover-key="${escapeCategoryDotAttr(coverWriteKey)}" data-cover-category="${resolvedWishCategory}" data-name="${(game.cleanName || '').replace(/"/g, '&quot;')}" data-console="${game.cTag}" data-github-cover="${String(githubCoverUrl || '').replace(/"/g, '&quot;')}" data-title-id="${game.id || ''}" data-content-id="${game.contentId || ''}" data-region="${game.region || ''}" onload="markCoverLoaded(this)" onerror="handleCoverError(this, '${resolvedWishCategory}')">
+					<img src="${imgUrl}" class="game-img" loading="lazy" decoding="async" data-cover-key="${escapeCategoryDotAttr(coverWriteKey)}" data-cover-category="${resolvedWishCategory}" data-name="${String(wishlistDisplayName || '').replace(/"/g, '&quot;')}" data-console="${game.cTag}" data-github-cover="${String(githubCoverUrl || '').replace(/"/g, '&quot;')}" data-title-id="${game.id || ''}" data-content-id="${game.contentId || ''}" data-region="${game.region || ''}" onload="markCoverLoaded(this)" onerror="handleCoverError(this, '${resolvedWishCategory}')">
 				</div>
 				<div class="game-info" style="padding: 10px; min-height: 0;">
 					<div style="display: flex; flex-direction: column; justify-content: space-between; height: 100%;">
 						<div>
-							<h3 class="game-title">${game.cleanName}</h3>
+							<h3 class="game-title">${wishlistDisplayName}</h3>
 							<div class="game-meta-info">
 								<span class="game-id">${game.id}</span>
 								<span class="game-size">${game.size || 'N/A'}</span>
@@ -44799,12 +44901,16 @@ P
 				}
 			}
 
-			let displayName =
+			const rawDisplayName =
 				gameData?.cleanName ||
 				gameData?.title ||
 				gameData?.name ||
 				window.gameNameCache?.[id] ||
 				`Unknown (${id})`;
+			const displayIdentity = gameData || { id, titleId:id, category:'games' };
+			const displayName = typeof window.getEffectiveContentTitle === 'function'
+				? (window.getEffectiveContentTitle(displayIdentity, 'games', rawDisplayName) || rawDisplayName)
+				: rawDisplayName;
 	
 			processedItems.push({
 				id,
@@ -44836,12 +44942,14 @@ P
 			const contentId = item.gameData?.contentId || item.gameData?.contentID || '';
 			const region = item.gameData?.region || '';
 			const githubCoverUrl = getOptimizedCover(id);
+			const coverIdentity = item.gameData || { id, titleId:id, contentId, category:'games' };
+			const preferredCoverUrl = typeof getItemCover === 'function' ? getItemCover(coverIdentity, 'games') : githubCoverUrl;
 			const coverKey = (typeof window.getStoreCardCoverKey === 'function')
 				? window.getStoreCardCoverKey('games', id, contentId)
 				: id;
 			const imgUrl = (typeof window.getCachedCardCoverSrc === 'function'
-				? window.getCachedCardCoverSrc(coverKey, 'games', githubCoverUrl)
-				: '') || githubCoverUrl;
+				? window.getCachedCardCoverSrc(coverKey, 'games', preferredCoverUrl)
+				: '') || preferredCoverUrl || githubCoverUrl;
 			const safeDisplayName = escapeHtml(item.displayName);
 			const safeCoverSearchName = escapeHtml(item.needsNameLookup ? id : item.displayName);
 			const safeConsoleTag = escapeHtml(consoleTag);
@@ -47454,7 +47562,8 @@ function formatLibraryLastPlayedBadge(game = {}) {
 		return [
 			getLocalLibraryDataSignature(games),
 			getLocalLibraryFavoritesSignature(),
-			playTogetherSignature
+			playTogetherSignature,
+			Number(window.__contentMetadataOverridesRevision || 0)
 		].join('::');
 	}
 	
@@ -47834,9 +47943,14 @@ function formatLibraryLastPlayedBadge(game = {}) {
 			const coverContentId = exactStoreMatch?.item?.contentId || exactStoreMatch?.item?.contentID || '';
 			const coverRegion = exactStoreMatch?.item?.region || '';
 			const resolvedLibraryCoverId = storeSearchId || cachedData.id || '';
+			const resolvedLibraryCoverIdentity = exactStoreMatch?.item || { id:resolvedLibraryCoverId, titleId:resolvedLibraryCoverId, contentId:coverContentId, category:targetCategory };
 			const resolvedLibraryGithubCover = (exactStoreMatch && resolvedLibraryCoverId && typeof getGithubItemCover === 'function')
 				? getGithubItemCover(Object.assign({}, exactStoreMatch.item, { id: resolvedLibraryCoverId, titleId: resolvedLibraryCoverId }), targetCategory)
 				: (cachedData.githubCover || '');
+			const resolvedLibraryEffectiveCover = typeof getItemCover === 'function' ? getItemCover(resolvedLibraryCoverIdentity, targetCategory) : resolvedLibraryGithubCover;
+			const resolvedLibraryDisplayTitle = typeof window.getEffectiveContentTitle === 'function'
+				? (window.getEffectiveContentTitle(resolvedLibraryCoverIdentity, targetCategory, coverSearchName || game.title) || game.title)
+				: (coverSearchName || game.title);
 
 			const buttonsHtml = buildConsoleLibraryCardActions(game, {
 				currentPlaying, cachedData, isPlaying: isThisGamePlaying, ip, region,
@@ -47846,7 +47960,9 @@ function formatLibraryLastPlayedBadge(game = {}) {
 			const localCoverKey = (exactStoreMatch && typeof window.getStoreCardCoverKey === 'function')
 				? window.getStoreCardCoverKey(targetCategory, storeSearchId, coverContentId)
 				: ((typeof window.getLibraryCardCoverKey === 'function') ? window.getLibraryCardCoverKey(game, cachedData) : (game.path || cachedData.id || game.title || ''));
-			const preferredLibraryCover = resolvedLibraryGithubCover || getLibraryPreferredCover(game, cachedData);
+			const preferredLibraryCover = (typeof window.isContentMetadataOverrideCoverSrc === 'function' && window.isContentMetadataOverrideCoverSrc(resolvedLibraryEffectiveCover))
+				? resolvedLibraryEffectiveCover
+				: (resolvedLibraryGithubCover || getLibraryPreferredCover(game, cachedData) || resolvedLibraryEffectiveCover);
 			let displayCover = (typeof window.getCachedCardCoverSrc === 'function' ? window.getCachedCardCoverSrc(localCoverKey, 'library', preferredLibraryCover) : '') || preferredLibraryCover;
 			if ((!displayCover || displayCover === FALLBACK_IMG || /NOCOVER00\.JPG/i.test(String(displayCover))) && game.title) {
 				displayCover = 'data:image/png;base64,BING';
@@ -47872,7 +47988,7 @@ function formatLibraryLastPlayedBadge(game = {}) {
 						<i class="far fa-clock"></i><span class="my-games-playing-time">${typeof getLocalPs3PlayTimeDisplayValue === 'function' ? getLocalPs3PlayTimeDisplayValue() : (window.currentPs3PlayTime || "--:--:--")}</span>
 					</div>` : ""}
 					${lastPlayedBadgeHtml}
-					<img src="${escapeCategoryDotAttr(displayCover)}" class="game-img" loading="lazy" decoding="async" data-cover-key="${escapeCategoryDotAttr(localCoverKey)}" data-cover-category="library" data-title-id="${escapeCategoryDotAttr(resolvedLibraryCoverId)}" data-github-cover="${escapeCategoryDotAttr(resolvedLibraryGithubCover || cachedData.githubCover || '')}" data-webman-cover="${escapeCategoryDotAttr(cachedData.webmanCover || '')}" data-lib-path="${String(game.path || '').replace(/"/g, '&quot;')}" data-name="${String(coverSearchName || game.title || '').replace(/"/g, '&quot;')}" data-console="${String(coverConsoleTag || consoleType).replace(/"/g, '&quot;')}" data-content-id="${escapeCategoryDotAttr(coverContentId)}" data-region="${escapeCategoryDotAttr(coverRegion)}" onload="markCoverLoaded(this)" onerror="handleLibraryCoverError(this)">
+					<img src="${escapeCategoryDotAttr(displayCover)}" class="game-img" loading="lazy" decoding="async" data-cover-key="${escapeCategoryDotAttr(localCoverKey)}" data-cover-category="library" data-title-id="${escapeCategoryDotAttr(resolvedLibraryCoverId)}" data-github-cover="${escapeCategoryDotAttr(resolvedLibraryGithubCover || cachedData.githubCover || '')}" data-webman-cover="${escapeCategoryDotAttr(cachedData.webmanCover || '')}" data-lib-path="${String(game.path || '').replace(/"/g, '&quot;')}" data-name="${String(resolvedLibraryDisplayTitle || coverSearchName || game.title || '').replace(/"/g, '&quot;')}" data-console="${String(coverConsoleTag || consoleType).replace(/"/g, '&quot;')}" data-content-id="${escapeCategoryDotAttr(coverContentId)}" data-region="${escapeCategoryDotAttr(coverRegion)}" onload="markCoverLoaded(this)" onerror="handleLibraryCoverError(this)">
 					${isPlayTogether ? '<div class="collection-play-together-pill" title="Play Together is active"><i class="fas fa-handshake"></i><span>Play Together</span></div>' : ''}
 					<div class="console-tag ${tagClass}">${consoleType}</div>
 					<div class="region-tag">${region}</div>
@@ -47883,7 +47999,7 @@ function formatLibraryLastPlayedBadge(game = {}) {
 				</div>
 				<div class="game-info">
 					<div>
-						<h3 class="game-title" title="${game.title}">${game.title}</h3>
+						<h3 class="game-title" title="${String(resolvedLibraryDisplayTitle || game.title).replace(/"/g, '&quot;')}">${resolvedLibraryDisplayTitle || game.title}</h3>
 						<div class="game-meta-info" style="margin-top: 4px; display: flex; align-items: center;">
 							<span class="game-id-copy-wrap"><span class="game-id">${resolvedLibraryCoverId || 'UNKNOW'}</span>${libraryCopyIdHtml}</span>
 						</div>
@@ -48058,6 +48174,7 @@ function formatLibraryLastPlayedBadge(game = {}) {
 			Number(window.__libraryDataRevision || 0),
 			Number(window.__favoritesDataRevision || 0),
 			Number(window.__psnStoreCacheRevision || 0),
+			Number(window.__contentMetadataOverridesRevision || 0),
 			term, consoles.join(','), type, region, isFavorites ? getFavoriteInstallStatusFilter() : '', playTogether ? 1 : 0, letter || 'ALL', sort,
 			getLibraryPlayTogetherFastSignature()
 		].join('|');
@@ -48071,6 +48188,7 @@ function formatLibraryLastPlayedBadge(game = {}) {
 			Number(window.__libraryDataRevision || 0),
 			isFavorites ? Number(window.__favoritesDataRevision || 0) : 0,
 			Number(window.__psnStoreCacheRevision || 0),
+			Number(window.__contentMetadataOverridesRevision || 0),
 			consoles.join(','),
 			document.getElementById(`${prefix}-type-select`)?.value || 'ALL',
 			document.getElementById(`${prefix}-region-select`)?.value || 'ALL',
@@ -48837,6 +48955,7 @@ function formatLibraryLastPlayedBadge(game = {}) {
 			playTogetherMatchesOnly ? 'playTogether' : 'all',
 			activeFavoriteLibraryLetter,
 			window.sortOrders?.fav || 'asc',
+			Number(window.__contentMetadataOverridesRevision || 0),
 			filteredFavs.map(game => game.__favoriteInstalled === true ? '1' : '0').join(''),
 			getLocalLibraryDataSignature(filteredFavs)
 		]);
@@ -48976,9 +49095,14 @@ function formatLibraryLastPlayedBadge(game = {}) {
 			const coverContentId = exactStoreMatch?.item?.contentId || exactStoreMatch?.item?.contentID || '';
 			const coverRegion = exactStoreMatch?.item?.region || '';
 			const resolvedFavoriteCoverId = storeSearchId || cachedData.id || '';
+			const resolvedFavoriteCoverIdentity = exactStoreMatch?.item || { id:resolvedFavoriteCoverId, titleId:resolvedFavoriteCoverId, contentId:coverContentId, category:targetCategory };
 			const resolvedFavoriteGithubCover = (exactStoreMatch && resolvedFavoriteCoverId && typeof getGithubItemCover === 'function')
 				? getGithubItemCover(Object.assign({}, exactStoreMatch.item, { id: resolvedFavoriteCoverId, titleId: resolvedFavoriteCoverId }), targetCategory)
 				: (cachedData.githubCover || '');
+			const resolvedFavoriteEffectiveCover = typeof getItemCover === 'function' ? getItemCover(resolvedFavoriteCoverIdentity, targetCategory) : resolvedFavoriteGithubCover;
+			const resolvedFavoriteDisplayTitle = typeof window.getEffectiveContentTitle === 'function'
+				? (window.getEffectiveContentTitle(resolvedFavoriteCoverIdentity, targetCategory, coverSearchName || game.title) || game.title)
+				: (coverSearchName || game.title);
 
 			const buttonsHtml = buildConsoleLibraryCardActions(game, {
 				currentPlaying, cachedData, isPlaying: isThisGamePlaying, isInstalled: isInstalledFavorite, ip, region,
@@ -48991,7 +49115,9 @@ function formatLibraryLastPlayedBadge(game = {}) {
 			const favoriteCoverKey = (exactStoreMatch && typeof window.getStoreCardCoverKey === 'function')
 				? window.getStoreCardCoverKey(targetCategory, storeSearchId, coverContentId)
 				: ((typeof window.getLibraryCardCoverKey === 'function') ? window.getLibraryCardCoverKey(game, cachedData) : favDotKey);
-			const preferredLibraryCover = resolvedFavoriteGithubCover || getLibraryPreferredCover(game, cachedData);
+			const preferredLibraryCover = (typeof window.isContentMetadataOverrideCoverSrc === 'function' && window.isContentMetadataOverrideCoverSrc(resolvedFavoriteEffectiveCover))
+				? resolvedFavoriteEffectiveCover
+				: (resolvedFavoriteGithubCover || getLibraryPreferredCover(game, cachedData) || resolvedFavoriteEffectiveCover);
 			let displayCover = (typeof window.getCachedCardCoverSrc === 'function' ? window.getCachedCardCoverSrc(favoriteCoverKey, 'library', preferredLibraryCover) : '') || preferredLibraryCover;
 			if ((!displayCover || displayCover === FALLBACK_IMG || /NOCOVER00\.JPG/i.test(String(displayCover))) && game.title) {
 				displayCover = 'data:image/png;base64,BING';
@@ -49020,7 +49146,7 @@ function formatLibraryLastPlayedBadge(game = {}) {
 						<i class="far fa-clock"></i><span class="my-games-playing-time">${typeof getLocalPs3PlayTimeDisplayValue === 'function' ? getLocalPs3PlayTimeDisplayValue() : (window.currentPs3PlayTime || "--:--:--")}</span>
 					</div>` : ""}
 					${lastPlayedBadgeHtml}
-					<img src="${escapeCategoryDotAttr(displayCover)}" class="game-img" loading="lazy" decoding="async" data-cover-key="${escapeCategoryDotAttr(favoriteCoverKey)}" data-cover-category="library" data-title-id="${escapeCategoryDotAttr(resolvedFavoriteCoverId)}" data-github-cover="${escapeCategoryDotAttr(resolvedFavoriteGithubCover || cachedData.githubCover || '')}" data-webman-cover="${escapeCategoryDotAttr(cachedData.webmanCover || '')}" data-lib-path="${game.path.replace(/"/g, '&quot;')}" data-name="${String(coverSearchName || game.title || '').replace(/"/g, '&quot;')}" data-console="${String(coverConsoleTag || consoleType).replace(/"/g, '&quot;')}" data-content-id="${escapeCategoryDotAttr(coverContentId)}" data-region="${escapeCategoryDotAttr(coverRegion)}" onload="markCoverLoaded(this)" onerror="handleLibraryCoverError(this)">
+					<img src="${escapeCategoryDotAttr(displayCover)}" class="game-img" loading="lazy" decoding="async" data-cover-key="${escapeCategoryDotAttr(favoriteCoverKey)}" data-cover-category="library" data-title-id="${escapeCategoryDotAttr(resolvedFavoriteCoverId)}" data-github-cover="${escapeCategoryDotAttr(resolvedFavoriteGithubCover || cachedData.githubCover || '')}" data-webman-cover="${escapeCategoryDotAttr(cachedData.webmanCover || '')}" data-lib-path="${game.path.replace(/"/g, '&quot;')}" data-name="${String(resolvedFavoriteDisplayTitle || coverSearchName || game.title || '').replace(/"/g, '&quot;')}" data-console="${String(coverConsoleTag || consoleType).replace(/"/g, '&quot;')}" data-content-id="${escapeCategoryDotAttr(coverContentId)}" data-region="${escapeCategoryDotAttr(coverRegion)}" onload="markCoverLoaded(this)" onerror="handleLibraryCoverError(this)">
 					<div class="console-tag ${tagClass}">${consoleType}</div>
 					<div class="region-tag">${region}</div>
 					<div class="card-details-hint${detailsAvailable ? '' : ' is-unavailable'}" aria-hidden="true"><i class="fas fa-circle-info"></i><span>${detailsAvailable ? 'Details' : 'Details not available'}</span></div>
@@ -49030,7 +49156,7 @@ function formatLibraryLastPlayedBadge(game = {}) {
 				</div>
 				<div class="game-info">
 					<div>
-						<h3 class="game-title" title="${game.title}">${game.title}</h3>
+						<h3 class="game-title" title="${String(resolvedFavoriteDisplayTitle || game.title).replace(/"/g, '&quot;')}">${resolvedFavoriteDisplayTitle || game.title}</h3>
 						<div class="game-meta-info" style="margin-top: 4px; display: flex; align-items: center;">
 							<span class="game-id-copy-wrap"><span class="game-id${isInstalledFavorite ? ' is-installed-on-ps3' : ''}" title="${isInstalledFavorite ? 'Installed on PS3™' : 'Not detected in latest scan'}">${resolvedFavoriteCoverId || 'NO ID'}</span>${favoriteCopyIdHtml}</span>
 						</div>
@@ -73313,10 +73439,13 @@ function getVisibleChatStackEl(id) {
 		const encodedActor = encodeURIComponent(item.actor);
 		const avatar = typeof getResolvedUserAvatar === 'function' ? getResolvedUserAvatar(item.actor) : 'https://raw.githubusercontent.com/PS3-Pro/PSN-Content/main/resources/interface/modern/images/avatars/default.png';
 		const rawTitle = String(item.data && item.data.title || '').trim();
-		const title = item.type === 'library' ? (getFriendActivityLibraryGameDisplayName((item.data && Array.isArray(item.data.games) && item.data.games[0]) || item.data || {}) || rawTitle) : rawTitle;
 		const titleId = String(item.data && item.data.titleId || '').trim();
 		const contentId = String(item.data && item.data.contentId || '').trim();
 		const category = String(item.data && item.data.category || '').trim();
+		const activityTitleFallback = item.type === 'library' ? (getFriendActivityLibraryGameDisplayName((item.data && Array.isArray(item.data.games) && item.data.games[0]) || item.data || {}) || rawTitle) : rawTitle;
+		const title = titleId && typeof window.getEffectiveContentTitle === 'function'
+			? (window.getEffectiveContentTitle({ id:titleId, titleId, contentId, category:category || 'games', title:activityTitleFallback }, category || 'games', activityTitleFallback) || activityTitleFallback)
+			: activityTitleFallback;
 		let actionHtml = escapeRealtimeFeedHtml(p.message);
 		if ((['playing','played','download','wishlist','favorite','cheat'].includes(item.type) || (item.type === 'library' && Math.max(1, Number(item.data && item.data.count) || 1) === 1)) && title) {
 			const encodedTitle = encodeURIComponent(title);
@@ -74019,7 +74148,8 @@ function getVisibleChatStackEl(id) {
 		if (item.type === 'mention') return { badgeIcon:messageDeleted ? 'fa-comment-slash' : 'fa-comments', cls:'is-mention' + (messageDeleted ? ' is-message-deleted' : ''), title:'mentioned you', meta:'Global Chat', preview:messageDeleted ? 'Message deleted' : (data.text || '') };
 		if (item.type === 'reaction') return { badgeIcon:messageDeleted ? 'fa-comment-slash' : 'fa-comments', cls:'is-reaction' + (messageDeleted ? ' is-message-deleted' : ''), title:'reacted ' + String(data.emoji || '❤') + ' to your message', meta:'Global Chat', preview:messageDeleted ? 'Message deleted' : (data.text || '') };
 		if (item.type === 'play_together') {
-			const gameTitle = String(data.title || data.titleId || 'a game').trim() || 'a game';
+			const notificationTitleId = normalizeGamePlayersTitleId(data.titleId || '');
+			const gameTitle = notificationTitleId && typeof window.getEffectiveContentTitle === 'function' ? (window.getEffectiveContentTitle({ id:notificationTitleId, titleId:notificationTitleId, contentId:data.contentId || '', category:'games', title:data.title || '' }, 'games', data.title || notificationTitleId || 'a game') || 'a game') : (String(data.title || data.titleId || 'a game').trim() || 'a game');
 			return { badgeIcon:'fa-handshake', cls:'is-play-together', title:'also wants to play ' + gameTitle, meta:'Play Together', preview:'You both want to play this game.' };
 		}
 		if (item.type === 'game_match') {
@@ -74027,7 +74157,8 @@ function getVisibleChatStackEl(id) {
 			const source = String(data.source || '').toLowerCase();
 			const games = Array.isArray(data.games) ? data.games : [];
 			const first = games[0] || data;
-			const gameTitle = String(first.title || data.title || data.titleId || 'a game').trim() || 'a game';
+			const matchTitleId = normalizeGamePlayersTitleId(first.titleId || data.titleId || '');
+			const gameTitle = matchTitleId && typeof window.getEffectiveContentTitle === 'function' ? (window.getEffectiveContentTitle({ id:matchTitleId, titleId:matchTitleId, contentId:first.contentId || data.contentId || '', category:'games', title:first.title || data.title || '' }, 'games', first.title || data.title || matchTitleId || 'a game') || 'a game') : (String(first.title || data.title || data.titleId || 'a game').trim() || 'a game');
 			const matchType = String(first.matchType || data.matchType || '').toLowerCase();
 			let matchText = 'You have this game too.';
 			if (matchType === 'wishlist') matchText = 'This game is on your Wishlist.';
@@ -74324,12 +74455,13 @@ function getVisibleChatStackEl(id) {
 		const shownGames = games.slice(0, 20);
 		body.innerHTML = shownGames.map(function(game) {
 			const titleId = String(game.titleId || '').trim().toUpperCase();
-			const title = String(game.title || titleId || 'Game').trim() || 'Game';
+			const sharedIdentity = { id:titleId, titleId, contentId:String(game.contentId || game.contentID || ''), category:'games', title:game.title || '' };
+			const title = typeof window.getEffectiveContentTitle === 'function' ? (window.getEffectiveContentTitle(sharedIdentity, 'games', game.title || titleId || 'Game') || 'Game') : (String(game.title || titleId || 'Game').trim() || 'Game');
 			const source = String(game.source || data.source || '').toLowerCase();
 			const matchType = String(game.matchType || '').toLowerCase();
 			const sourceLabel = source === 'download' ? 'Downloaded by ' + actor : (source === 'library' ? 'Added to ' + actor + "'s Library" : actor + ' got this game');
 			const matchLabel = matchType === 'wishlist' ? 'On your Wishlist' : (matchType === 'library' ? 'In your Library' : (matchType === 'download' ? 'You downloaded it too' : 'You have it too'));
-			const cover = titleId && typeof getOptimizedCover === 'function' ? (getOptimizedCover(titleId) || '') : '';
+			const cover = titleId && typeof getItemCover === 'function' ? (getItemCover(sharedIdentity, 'games') || '') : (titleId && typeof getOptimizedCover === 'function' ? (getOptimizedCover(titleId) || '') : '');
 			const encodedId = encodeURIComponent(titleId);
 			const encodedTitle = encodeURIComponent(title);
 			return '<div class="download-item social-list-item" style="cursor:pointer" onmouseenter="if(typeof playUiHover===\'function\') playUiHover()" onclick="if(typeof playUiClick===\'function\') playUiClick(); closeSysModal(null, \'modal-sys-list\', {silent:true}); setTimeout(function(){ if(typeof searchGameOnSite===\'function\') searchGameOnSite(decodeURIComponent(\'' + encodedId + '\'), \'notifications\', \'games\', decodeURIComponent(\'' + encodedTitle + '\'), \'\'); }, 320)">' +
@@ -74414,7 +74546,8 @@ function getVisibleChatStackEl(id) {
 		let avatar = typeof getResolvedUserAvatar === 'function' ? getResolvedUserAvatar(actor) : 'https://raw.githubusercontent.com/PS3-Pro/PSN-Content/main/resources/interface/modern/images/avatars/default.png';
 		if (item.type === 'catalog') {
 			const catalogTitleId = normalizeGamePlayersTitleId(item.data && (item.data.gameTitleId || item.data.titleId || item.data.contentId));
-			if (catalogTitleId && typeof getOptimizedCover === 'function') avatar = getOptimizedCover(catalogTitleId) || avatar;
+			if (catalogTitleId && typeof getItemCover === 'function') avatar = getItemCover({ id:catalogTitleId, titleId:catalogTitleId, category:'games' }, 'games') || avatar;
+			else if (catalogTitleId && typeof getOptimizedCover === 'function') avatar = getOptimizedCover(catalogTitleId) || avatar;
 		}
 		const encodedActor = encodeURIComponent(actor).replace(/'/g, '%27');
 		const encodedAvatar = encodeURIComponent(avatar).replace(/'/g, '%27');
@@ -78096,9 +78229,11 @@ function getVisibleChatStackEl(id) {
 		const profileListRenderTokenState = (typeof window.getProfileListRenderToken === 'function')
 			? window.getProfileListRenderToken(targetUser, listType, rawData)
 			: { token: '', reliable: false };
-		const profileListRenderSignature = profileListRenderTokenState.reliable
+		const profileListMetadataRevision = Number(window.__contentMetadataOverridesRevision || 0);
+		const profileListRenderSignatureBase = profileListRenderTokenState.reliable
 			? profileListRenderTokenState.token
 			: ((typeof window.getProfileSyncComparableSignature === 'function') ? window.getProfileSyncComparableSignature(rawData || []) : JSON.stringify(rawData || []));
+		const profileListRenderSignature = `${profileListRenderSignatureBase}|metadata:${profileListMetadataRevision}`;
 		const lastProfileListRender = window.__lastProfileListRender;
 		const bodyHasProfileListLoader = !!(body && body.querySelector && body.querySelector('.profile-ps-list-loader'));
 		const isLiveProfileListRefresh = !!(lastProfileListRender
@@ -78216,6 +78351,7 @@ function getVisibleChatStackEl(id) {
 			returnToOnline,
 			Number(window.__psnStoreCacheRevision || 0),
 			Number(window.__libraryDataRevision || 0),
+			Number(window.__contentMetadataOverridesRevision || 0),
 			Number(window.__profileListVisualRevision || 0)
 		].join('|');
 	
@@ -78262,8 +78398,11 @@ function getVisibleChatStackEl(id) {
 				} else {
 					if (['downloads', 'wishlist', 'library', 'favs', 'favorites'].includes(listType) && typeof window.sanitizeDownloadCoverRecord === 'function') item = window.sanitizeDownloadCoverRecord(item, listType);
 					const realId = item.titleId || item.id;
-					const itemName = item.cleanName || item.name || item.title || "Unknown Game";
 					const itemTypeCategory = (typeof window.getProfileListItemCategory === 'function') ? window.getProfileListItemCategory(item, listType) : (item.category || 'games');
+					const rawItemName = item.cleanName || item.name || item.title || "Unknown Game";
+					const itemName = realId && typeof window.getEffectiveContentTitle === 'function'
+						? (window.getEffectiveContentTitle({ ...item, id:realId, titleId:realId }, itemTypeCategory, rawItemName) || rawItemName)
+						: rawItemName;
 					const itemPathUpper = String(item.path || '').toUpperCase();
 					const profileUsesBingCover = ['downloads', 'wishlist', 'library', 'favs', 'favorites'].includes(listType);
 					const itemCoverData = (typeof window.getDownloadCoverData === 'function') ? window.getDownloadCoverData(item, itemTypeCategory, listType) : { id: realId, titleId: realId, contentId: item.contentId, cleanName: itemName, cTag: item.cTag || item.console || 'ps3', category: itemTypeCategory };
@@ -78284,7 +78423,7 @@ function getVisibleChatStackEl(id) {
 						? window.getCachedCardCoverSrc(profileCoverKey, itemFinalCategory, itemCover)
 						: '') || itemCover;
 					const itemGithubCover = (typeof window.getGithubItemCover === 'function' && itemCoverId && isNaN(itemCoverId)) ? window.getGithubItemCover(itemCoverData, itemFinalCategory) : FALLBACK_IMG;
-					const itemCoverName = window.escapePlayerListText(itemCoverData.cleanName || itemName);
+					const itemCoverName = window.escapePlayerListText(itemName || itemCoverData.cleanName || '');
 					const itemCoverConsole = window.escapePlayerListText(itemConsoleTag);
 					const itemCoverCategoryRaw = String(itemFinalCategory || itemTypeCategory || 'games');
 					const itemCoverCategory = itemCoverCategoryRaw.replace(/"/g, '&quot;');
