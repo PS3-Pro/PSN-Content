@@ -3069,6 +3069,14 @@ body:not(.is-admin) #view-admin { display: none !important; }
 .admin-metadata-preview-copy { min-width:0; }
 .admin-metadata-preview-title { color:#fff; font-size:12px; font-weight:850; line-height:1.25; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .admin-metadata-preview-meta { margin-top:5px; color:var(--text-muted); font-size:9px; line-height:1.45; overflow-wrap:anywhere; }
+@keyframes adminMetadataTextSkeleton { 0% { background-position: 180% 0; } 100% { background-position: -80% 0; } }
+.admin-metadata-editor.is-metadata-loading > .admin-metadata-field .admin-input, .admin-metadata-editor.is-metadata-loading > .admin-metadata-field-grid .admin-input { color:transparent !important; caret-color:transparent !important; text-shadow:none !important; pointer-events:none; border-color:rgba(255,255,255,.075) !important; background-image:linear-gradient(100deg,rgba(255,255,255,.035) 20%,rgba(255,255,255,.115) 38%,rgba(255,255,255,.035) 56%) !important; background-size:240% 100% !important; animation:adminMetadataTextSkeleton 1.15s ease-in-out infinite; }
+.admin-metadata-editor.is-metadata-loading > .admin-metadata-field textarea.admin-input { min-height:96px; }
+.admin-metadata-editor.is-metadata-loading .admin-metadata-actions .admin-action-btn.primary { opacity:.5; pointer-events:none; }
+.admin-metadata-preview.is-metadata-loading img { opacity:.24; filter:saturate(.55) brightness(.72); }
+.admin-metadata-preview.is-metadata-loading .admin-metadata-preview-title, .admin-metadata-preview.is-metadata-loading .admin-metadata-preview-meta { color:transparent !important; border-radius:5px; background-image:linear-gradient(100deg,rgba(255,255,255,.04) 20%,rgba(255,255,255,.13) 38%,rgba(255,255,255,.04) 56%); background-size:240% 100%; animation:adminMetadataTextSkeleton 1.15s ease-in-out infinite; }
+.admin-metadata-preview.is-metadata-loading .admin-metadata-preview-title { width:min(88%,230px); min-height:14px; }
+.admin-metadata-preview.is-metadata-loading .admin-metadata-preview-meta { width:min(72%,190px); min-height:10px; margin-top:9px; }
 .admin-metadata-list-head { display:flex; align-items:center; justify-content:space-between; gap:10px; padding-bottom:7px; border-bottom:1px solid rgba(255,255,255,.07); color:rgba(255,255,255,.72); font-size:10px; font-weight:850; letter-spacing:.65px; text-transform:uppercase; }
 .admin-metadata-list { height:360px; min-height:240px; overflow-y:auto; display:flex; flex-direction:column; gap:7px; padding:4px 3px 0 0; scrollbar-gutter:stable; }
 .admin-metadata-list>.admin-empty { min-height:100%; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:9px; text-align:center; }
@@ -31453,15 +31461,18 @@ P
 
 	function setGameModalNoScreenshots(modalRoot, enabled) {
 		if (!modalRoot) return;
+		const isVisibleGameModalRoot = modalRoot === document.getElementById('game-modal');
 		if (!enabled) {
 			modalRoot.classList.remove('modal-no-screenshots');
-			clearTimeout(modalSummaryResizeAlignTimer);
-			clearModalSummaryAlignedHeight(modalRoot);
+			if (isVisibleGameModalRoot) {
+				clearTimeout(modalSummaryResizeAlignTimer);
+				clearModalSummaryAlignedHeight(modalRoot);
+			}
 			return;
 		}
 
 		modalRoot.classList.add('modal-no-screenshots');
-		scheduleModalSummaryAlignment();
+		if (isVisibleGameModalRoot) scheduleModalSummaryAlignment();
 	}
 
 	window.addEventListener('resize', scheduleModalSummaryAlignment);
@@ -31665,11 +31676,15 @@ P
 		const badges = modalRoot.querySelector('#modal-badges');
 		const extraMeta = modalRoot.querySelector('#modal-extra-meta');
 		const screenshots = modalRoot.querySelector('#modal-screenshots');
+		const resolvedMetadata = modalRoot.__resolvedProviderMetadata && typeof modalRoot.__resolvedProviderMetadata === 'object'
+			? JSON.parse(JSON.stringify(modalRoot.__resolvedProviderMetadata))
+			: null;
 		return {
 			summaryHtml: summary ? summary.innerHTML : '',
 			badgesHtml: badges ? badges.innerHTML : '',
 			badgesRawgRow: !!(badges && badges.classList.contains('rawg-badge-row')),
 			extraMetaHtml: extraMeta ? extraMeta.innerHTML : '',
+			resolvedMetadata,
 			screenshotUrls: screenshots ? Array.from(screenshots.querySelectorAll('.screenshot-item')).map(img => String(img.currentSrc || img.src || '')).filter(Boolean).slice(0, 8) : [],
 			noScreenshots: modalRoot.classList.contains('modal-no-screenshots')
 		};
@@ -31691,6 +31706,9 @@ P
 			extraMeta.innerHTML = snapshot.extraMetaHtml || '';
 			extraMeta.classList.toggle('metadata-people-visible', !!String(snapshot.extraMetaHtml || '').trim());
 		}
+		modalRoot.__resolvedProviderMetadata = snapshot.resolvedMetadata && typeof snapshot.resolvedMetadata === 'object'
+			? JSON.parse(JSON.stringify(snapshot.resolvedMetadata))
+			: null;
 		const urls = Array.isArray(snapshot.screenshotUrls) ? snapshot.screenshotUrls.filter(Boolean).slice(0, 8) : [];
 		if (urls.length && screenshots) {
 			disarmModalScreenshotSkeletonSizing(screenshots);
@@ -31820,10 +31838,10 @@ P
 	}
 
 	window.fetchGameSummary = async function(gameName, gameId, contentId = '', region = '', options = {}) {
-		const summaryContainer = document.getElementById('modal-summary');
-		const screenshotsWrapper = document.getElementById('modal-screenshots-wrapper');
-		const badgesContainer = document.getElementById('modal-badges');
-		const modalRoot = document.getElementById('game-modal');
+		const modalRoot = options && options.modalRoot ? options.modalRoot : document.getElementById('game-modal');
+		const summaryContainer = modalRoot?.querySelector('#modal-summary') || document.getElementById('modal-summary');
+		const screenshotsWrapper = modalRoot?.querySelector('#modal-screenshots-wrapper') || document.getElementById('modal-screenshots-wrapper');
+		const badgesContainer = modalRoot?.querySelector('#modal-badges') || document.getElementById('modal-badges');
 		const requestToken = String((options && options.requestToken) || '');
 		const isCurrentRequest = () => !requestToken || (
 			modalRoot &&
@@ -31835,7 +31853,7 @@ P
 		if (!isCurrentRequest()) return;
 		if (modalRoot) setGameModalNoScreenshots(modalRoot, false);
 
-		const extraMetaContainer = document.getElementById('modal-extra-meta');
+		const extraMetaContainer = modalRoot?.querySelector('#modal-extra-meta') || document.getElementById('modal-extra-meta');
 		const metadataCategory = String(modalRoot?.dataset.storeCategory || 'games');
 		const contentMetadataOverride = typeof window.getContentMetadataOverride === 'function' ? window.getContentMetadataOverride({ titleId: gameId, contentId }, metadataCategory) : null;
 		const modalSafeText = (value) => String(value === undefined || value === null ? '' : value).replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;' }[char]));
@@ -31953,7 +31971,7 @@ P
 			return 'skip-query';
 		};
 
-		const scrContainer = document.getElementById('modal-screenshots');
+		const scrContainer = modalRoot?.querySelector('#modal-screenshots') || document.getElementById('modal-screenshots');
 		const metadataLookupTitle = cleanMetadataCatalogTitle(gameName) || gameName;
 		const metadataPlatformHint = getMetadataPlatformHint(gameName);
 		const editionPolicy = getMetadataEditionPolicy(metadataLookupTitle);
@@ -31986,6 +32004,18 @@ P
 			metacritic: contentMetadataOverride?.score !== null && contentMetadataOverride?.score !== undefined ? Number(contentMetadataOverride.score) : 0,
 			released: contentMetadataOverride?.year || psnStoreMeta.releaseDate || psnStoreMeta.releaseYear || ''
 		};
+		const syncResolvedProviderMetadata = () => {
+			if (!modalRoot || !isCurrentRequest()) return;
+			modalRoot.__resolvedProviderMetadata = {
+				titleId:String(gameId || '').trim().toUpperCase(),
+				contentId:String(contentId || '').trim().toUpperCase(),
+				genres:getRawgNames(mergedMetadata.genres || [], 8),
+				tags:getRawgNames(mergedMetadata.tags || [], 80),
+				score:Number(mergedMetadata.metacritic) > 0 ? Math.round(Number(mergedMetadata.metacritic)) : '',
+				year:(String(mergedMetadata.released || '').match(/\b(?:19|20)\d{2}\b/) || [])[0] || ''
+			};
+		};
+		syncResolvedProviderMetadata();
 		const mergeMetadataDetails = (detailsData = {}) => {
 				const sourceDevelopers = getRawgNames(detailsData.developers || [], 2);
 			const sourcePublishers = getRawgNames(detailsData.publishers || [], 1);
@@ -32031,7 +32061,7 @@ P
 			extraMetaContainer.innerHTML = people.join('');
 			extraMetaContainer.classList.toggle('metadata-people-visible', people.length > 0);
 		};
-		const renderMergedMetadata = () => { renderRawgExtraMeta(mergedMetadata, buildMergedBadgeHtml()); renderMetadataPeopleOverride(); };
+		const renderMergedMetadata = () => { syncResolvedProviderMetadata(); renderRawgExtraMeta(mergedMetadata, buildMergedBadgeHtml()); renderMetadataPeopleOverride(); };
 		if (contentMetadataOverride) renderMergedMetadata();
 		let renderedScreenshotUrls = [];
 		const renderExternalScreenshots = (imageUrls = []) => {
@@ -38873,9 +38903,16 @@ P
 		const genres = Array.from(modal.querySelectorAll('.rawg-chip-genre')).map(adminMetadataPlainTextWithoutIcons).filter(Boolean);
 		if (genres.length) effective.genres = genres;
 
-		// Tags, director and cast are not fully represented by provider chips in the modal.
-		// Preserve any active explicit override for those fields rather than inferring partial data.
-		if (Array.isArray(override?.tags) && override.tags.length) effective.tags = override.tags.slice();
+		// Provider tags are kept on the modal as resolved metadata because the visible mode chips
+		// intentionally show only a small subset (Single Player, Multiplayer, etc.).
+		const resolvedMetadata = modal.__resolvedProviderMetadata && typeof modal.__resolvedProviderMetadata === 'object' ? modal.__resolvedProviderMetadata : null;
+		const resolvedTitleId = normalizeContentMetadataTitleIdClient(resolvedMetadata?.titleId || '');
+		const resolvedContentId = normalizeContentMetadataContentIdClient(resolvedMetadata?.contentId || '');
+		const modalTitleId = normalizeContentMetadataTitleIdClient(modal.dataset.titleId || '');
+		const modalContentId = normalizeContentMetadataContentIdClient(modal.dataset.contentId || '');
+		const resolvedMatchesModal = !!resolvedMetadata && (!resolvedTitleId || resolvedTitleId === modalTitleId) && (!resolvedContentId || resolvedContentId === modalContentId);
+		if (resolvedMatchesModal && Array.isArray(resolvedMetadata.tags) && resolvedMetadata.tags.length) effective.tags = resolvedMetadata.tags.slice();
+		else if (Array.isArray(override?.tags) && override.tags.length) effective.tags = override.tags.slice();
 		if (override?.director) effective.director = override.director;
 		if (Array.isArray(override?.cast) && override.cast.length) effective.cast = override.cast.slice();
 		return effective;
@@ -38999,6 +39036,50 @@ P
 		}
 	}
 
+	const ADMIN_METADATA_VALUE_INPUT_IDS = Object.freeze(['admin-metadata-title','admin-metadata-cover','admin-metadata-summary','admin-metadata-score','admin-metadata-year','admin-metadata-director','admin-metadata-genres','admin-metadata-tags','admin-metadata-cast']);
+
+	function adminSetMetadataEditorLoading(loading, message = 'Loading current metadata…') {
+		const active = loading === true;
+		window.__adminMetadataEditorLoading = active;
+		const editor = document.querySelector('.admin-metadata-editor');
+		const preview = document.getElementById('admin-metadata-preview');
+		if (editor) { editor.classList.toggle('is-metadata-loading', active); editor.setAttribute('aria-busy', active ? 'true' : 'false'); }
+		if (preview) preview.classList.toggle('is-metadata-loading', active);
+		ADMIN_METADATA_VALUE_INPUT_IDS.forEach(id => { const el = document.getElementById(id); if (el) el.disabled = active; });
+		const save = document.querySelector('.admin-metadata-actions .admin-action-btn.primary');
+		if (save) save.disabled = active;
+		if (active) adminSetMetadataEditorStatus(adminEscapeHtml(message), 'fa-spinner fa-spin');
+	}
+
+	function adminCreateMetadataLookupRoot(category, titleId, contentId, gameName = '') {
+		const root = document.createElement('div');
+		root.dataset.storeCategory = normalizeContentMetadataCategoryClient(category || 'games');
+		root.dataset.titleId = normalizeContentMetadataTitleIdClient(titleId || '');
+		root.dataset.contentId = normalizeContentMetadataContentIdClient(contentId || '');
+		root.dataset.gameName = String(gameName || '').trim();
+		root.innerHTML = '<div id="modal-extra-meta"></div><div id="modal-badges"></div><div id="modal-summary"></div><div id="modal-screenshots-wrapper"><div id="modal-screenshots"></div></div>';
+		return root;
+	}
+
+	async function adminResolveMetadataEditorEffective(item, category, override = null, resolvedCover = '', suppliedEffective = null) {
+		const cat = normalizeContentMetadataCategoryClient(category || override?.category || item?.category || 'games');
+		const titleId = normalizeContentMetadataTitleIdClient(item?.id || item?.titleId || override?.titleId || '');
+		const contentId = normalizeContentMetadataContentIdClient(item?.contentId || override?.contentId || '');
+		const baseEffective = suppliedEffective && typeof suppliedEffective === 'object' ? { ...suppliedEffective } : {};
+		if (cat !== 'games' || typeof window.fetchGameSummary !== 'function' || !titleId) return baseEffective;
+		const gameName = String(item?.__metadataBaseCleanName || item?.cleanName || item?.title || item?.name || override?.title || titleId).trim();
+		const region = String(item?.region || override?.region || '').trim();
+		const lookupRoot = adminCreateMetadataLookupRoot(cat, titleId, contentId, gameName);
+		try {
+			await window.fetchGameSummary(gameName, titleId, contentId, region, { prepared:true, modalRoot:lookupRoot });
+			const fetched = adminCaptureEffectiveMetadataFromModal(lookupRoot, override, resolvedCover) || {};
+			return { ...baseEffective, ...fetched };
+		} catch (error) {
+			console.warn('[Admin Metadata] Provider lookup failed:', error);
+			return baseEffective;
+		}
+	}
+
 	function adminPopulateMetadataEditor(item, category, override = null, resolvedCover = '', effectiveMetadata = null) {
 		const cat = normalizeContentMetadataCategoryClient(category || override?.category || item?.category || 'games');
 		const titleId = normalizeContentMetadataTitleIdClient(item?.id || item?.titleId || override?.titleId || '');
@@ -39032,33 +39113,43 @@ P
 
 	window.adminLoadMetadataOverride = async function(options = {}) {
 		if (!adminGuard()) return null;
+		const loadToken = `${Date.now()}:${Math.random().toString(36).slice(2,8)}`;
+		window.__adminMetadataEditorLoadToken = loadToken;
 		const category = normalizeContentMetadataCategoryClient(document.getElementById('admin-metadata-category')?.value || options.category || 'games');
 		const titleId = normalizeContentMetadataTitleIdClient(document.getElementById('admin-metadata-title-id')?.value || options.titleId || '');
 		let contentId = normalizeContentMetadataContentIdClient(document.getElementById('admin-metadata-content-id')?.value || options.contentId || '');
-		if (!titleId && !contentId) { if (typeof playUiError === 'function') playUiError(); adminSetMetadataEditorStatus('Enter a Title ID or Content ID first.', 'fa-triangle-exclamation'); return null; }
-		adminSetMetadataEditorStatus('Loading Store item…', 'fa-spinner fa-spin');
-		let item = options.item && typeof options.item === 'object' ? options.item : null;
-		const found = item ? { category, matches:[item] } : await adminFindMetadataStoreItem(category, titleId, contentId);
-		if (!item) item = found.matches[0] || null;
-		if (!contentId && found.matches.length > 1) {
-			// This only needs to know whether there is exactly one override for the Title ID.
-			// Iterate the Map directly and stop at two matches instead of sorting the whole Admin list.
-			const sameOverrides = [];
-			for (const entry of (window.__contentMetadataOverridesMap instanceof Map ? window.__contentMetadataOverridesMap.values() : [])) {
-				if (entry.category !== category || entry.titleId !== titleId) continue;
-				sameOverrides.push(entry);
-				if (sameOverrides.length > 1) break;
+		if (!titleId && !contentId) { window.__adminMetadataEditorLoadToken = ''; adminSetMetadataEditorLoading(false); if (typeof playUiError === 'function') playUiError(); adminSetMetadataEditorStatus('Enter a Title ID or Content ID first.', 'fa-triangle-exclamation'); return null; }
+		adminSetMetadataEditorLoading(true, 'Loading Store item and provider metadata…');
+		try {
+			let item = options.item && typeof options.item === 'object' ? options.item : null;
+			const found = item ? { category, matches:[item] } : await adminFindMetadataStoreItem(category, titleId, contentId);
+			if (window.__adminMetadataEditorLoadToken !== loadToken) return null;
+			if (!item) item = found.matches[0] || null;
+			if (!contentId && found.matches.length > 1) {
+				const sameOverrides = [];
+				for (const entry of (window.__contentMetadataOverridesMap instanceof Map ? window.__contentMetadataOverridesMap.values() : [])) {
+					if (entry.category !== category || entry.titleId !== titleId) continue;
+					sameOverrides.push(entry);
+					if (sameOverrides.length > 1) break;
+				}
+				if (sameOverrides.length === 1) contentId = sameOverrides[0].contentId || '';
+				else { if (typeof playUiError === 'function') playUiError(); adminSetMetadataEditorStatus(`This Title ID has ${found.matches.length} entries. Enter the Content ID so the correction targets only one item.`, 'fa-triangle-exclamation'); return null; }
+				item = found.matches.find(row => normalizeContentMetadataContentIdClient(row?.contentId) === contentId) || item;
 			}
-			if (sameOverrides.length === 1) contentId = sameOverrides[0].contentId || '';
-			else { if (typeof playUiError === 'function') playUiError(); adminSetMetadataEditorStatus(`This Title ID has ${found.matches.length} entries. Enter the Content ID so the correction targets only one item.`, 'fa-triangle-exclamation'); return null; }
-			item = found.matches.find(row => normalizeContentMetadataContentIdClient(row?.contentId) === contentId) || item;
+			if (item && !contentId) contentId = normalizeContentMetadataContentIdClient(item.contentId || '');
+			const key = getContentMetadataOverrideKeyClient({ titleId:item?.id || item?.titleId || titleId, contentId }, category);
+			const override = window.getContentMetadataOverride ? window.getContentMetadataOverride(key) : null;
+			if (!item && !override) { if (typeof playUiError === 'function') playUiError(); adminSetMetadataEditorStatus('No matching Store item was found in this category.', 'fa-triangle-exclamation'); return null; }
+
+			const directCover = item && typeof getItemCover === 'function' ? String(getItemCover(item, category) || '').trim() : '';
+			const resolvedCover = String(options.resolvedCover || directCover || '').trim();
+			const effectiveMetadata = await adminResolveMetadataEditorEffective(item, category, override, resolvedCover, options.effectiveMetadata || null);
+			if (window.__adminMetadataEditorLoadToken !== loadToken) return null;
+			adminPopulateMetadataEditor(item, category, override, resolvedCover, effectiveMetadata);
+			return { item, category, override, key };
+		} finally {
+			if (window.__adminMetadataEditorLoadToken === loadToken) adminSetMetadataEditorLoading(false);
 		}
-		if (item && !contentId) contentId = normalizeContentMetadataContentIdClient(item.contentId || '');
-		const key = getContentMetadataOverrideKeyClient({ titleId: item?.id || item?.titleId || titleId, contentId }, category);
-		const override = window.getContentMetadataOverride ? window.getContentMetadataOverride(key) : null;
-		if (!item && !override) { if (typeof playUiError === 'function') playUiError(); adminSetMetadataEditorStatus('No matching Store item was found in this category.', 'fa-triangle-exclamation'); return null; }
-		adminPopulateMetadataEditor(item, category, override, options.resolvedCover || '', options.effectiveMetadata || null);
-		return { item, category, override, key };
 	};
 
 	window.adminMetadataFieldKeydown = function(event) {
@@ -39066,6 +39157,9 @@ P
 	};
 
 	window.adminClearMetadataEditor = function() {
+		window.__adminMetadataEditorLoadToken = '';
+		adminSetMetadataEditorLoading(false);
+		const category = document.getElementById('admin-metadata-category'); if (category) category.value = 'games';
 		['admin-metadata-title-id','admin-metadata-content-id','admin-metadata-title','admin-metadata-cover','admin-metadata-summary','admin-metadata-score','admin-metadata-year','admin-metadata-director','admin-metadata-genres','admin-metadata-tags','admin-metadata-cast'].forEach(id => { const el = document.getElementById(id); if (el) el.value = ''; });
 		const status = document.getElementById('admin-metadata-editor-status'); if (status) status.dataset.metadataKey = '';
 		const removeBtn = document.getElementById('admin-metadata-remove-current'); if (removeBtn) removeBtn.style.display = 'none';
@@ -39084,6 +39178,7 @@ P
 
 	window.adminSaveMetadataOverride = async function() {
 		if (!adminGuard()) return;
+		if (window.__adminMetadataEditorLoading === true) return;
 		if (typeof socketChat === 'undefined' || !socketChat || !socketChat.connected) { if (typeof playUiError === 'function') playUiError(); if (typeof showToastNotification === 'function') showToastNotification('Metadata Corrections','Connect to the server before saving.'); return; }
 		let payload = adminCollectMetadataOverridePayload();
 		if (!payload.titleId && !payload.contentId) { const loaded = await adminLoadMetadataOverride(); if (!loaded) return; payload = adminCollectMetadataOverridePayload(); }
@@ -40688,6 +40783,7 @@ P
 		if (currentView) {
 			if (currentView.id !== viewId && !window.isRestoringHistory) {
 				if (currentView.id === 'view-admin') {
+					if (typeof window.adminClearMetadataEditor === 'function') window.adminClearMetadataEditor();
 					if (typeof adminCancelEntryHydration === 'function') adminCancelEntryHydration();
 					clearTimeout(window.adminUserSearchTimer);
 					clearTimeout(window.adminUsersRenderTimer);
