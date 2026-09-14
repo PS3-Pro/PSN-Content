@@ -3070,7 +3070,7 @@ body:not(.is-admin) #view-admin { display: none !important; }
 .admin-metadata-preview-title { color:#fff; font-size:12px; font-weight:850; line-height:1.25; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .admin-metadata-preview-meta { margin-top:5px; color:var(--text-muted); font-size:9px; line-height:1.45; overflow-wrap:anywhere; }
 .admin-metadata-list-head { display:flex; align-items:center; justify-content:space-between; gap:10px; padding-bottom:7px; border-bottom:1px solid rgba(255,255,255,.07); color:rgba(255,255,255,.72); font-size:10px; font-weight:850; letter-spacing:.65px; text-transform:uppercase; }
-.admin-metadata-list { height:360px; min-height:240px; overflow-y:auto; display:flex; flex-direction:column; gap:7px; padding-right:3px; scrollbar-gutter:stable; }
+.admin-metadata-list { height:360px; min-height:240px; overflow-y:auto; display:flex; flex-direction:column; gap:7px; padding:4px 3px 0 0; scrollbar-gutter:stable; }
 .admin-metadata-list>.admin-empty { min-height:100%; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:9px; text-align:center; }
 .admin-metadata-list>.admin-empty i { font-size:23px; color:#66ccff; opacity:.8; }
 .admin-metadata-item { position:relative; overflow:hidden; display:grid; grid-template-columns:minmax(0,1fr) auto; gap:9px; align-items:center; padding:10px 11px; border:1px solid rgba(255,255,255,.07); border-radius:9px; background:rgba(255,255,255,.035); transition:transform .2s ease,background .2s ease,border-color .2s ease,box-shadow .2s ease; }
@@ -23722,6 +23722,23 @@ P
 		return src;
 	}
 
+	window.isContentMetadataOverrideCoverSrc = function(src) {
+		const cleanSrc = normalizeCoverSrcForCache(src);
+		const map = window.__contentMetadataOverridesMap;
+		if (!cleanSrc || !(map instanceof Map) || !map.size) return false;
+		const revision = Number(window.__contentMetadataOverridesRevision || 0);
+		if (!(window.__contentMetadataOverrideCoverSrcSet instanceof Set) || Number(window.__contentMetadataOverrideCoverSrcSetRevision) !== revision) {
+			const next = new Set();
+			for (const entry of map.values()) {
+				const cover = normalizeCoverSrcForCache(entry?.coverUrl || '');
+				if (cover) next.add(cover);
+			}
+			window.__contentMetadataOverrideCoverSrcSet = next;
+			window.__contentMetadataOverrideCoverSrcSetRevision = revision;
+		}
+		return window.__contentMetadataOverrideCoverSrcSet.has(cleanSrc);
+	};
+
 	function getCoverCacheCategory(key, category, imgElement) {
 		let cat = String(category || imgElement?.getAttribute?.('data-cover-category') || '').trim().toLowerCase();
 		if (!cat) {
@@ -23894,6 +23911,9 @@ P
 	window.getCachedCardCoverSrc = function(key, category, preferredSrc) {
 		key = String(key || '').trim();
 		if (!key || !window.__cardCoverSrcCache) return '';
+		// A server metadata correction is authoritative. Never let a previously resolved
+		// GitHub/PSN/Bing cover from the persistent card cache outrank the override.
+		if (preferredSrc && typeof window.isContentMetadataOverrideCoverSrc === 'function' && window.isContentMetadataOverrideCoverSrc(preferredSrc)) return '';
 		const entry = window.__cardCoverSrcCache[key];
 		if (entry && isCardCoverCacheEntryExpired(entry)) {
 			delete window.__cardCoverSrcCache[key];
@@ -30614,10 +30634,13 @@ P
 			? window.captureStoreNavigationCover(originCard, currentCat, game.id || game.titleId, game.contentId)
 			: '';
 		const preferredModalCoverImg = getItemCover(game, currentCat);
+		const preferredModalCoverIsOverride = typeof window.isContentMetadataOverrideCoverSrc === 'function' && window.isContentMetadataOverrideCoverSrc(preferredModalCoverImg);
 		const cachedModalCoverImg = modalCoverKey && typeof window.getCachedCardCoverSrc === 'function'
 			? window.getCachedCardCoverSrc(modalCoverKey, currentCat, preferredModalCoverImg)
 			: '';
-		const coverImg = originCoverImg || cachedModalCoverImg || preferredModalCoverImg;
+		// Navigation normally reuses the already loaded card cover for an instant modal.
+		// When an override exists, however, the corrected cover must win over that old image.
+		const coverImg = preferredModalCoverIsOverride ? preferredModalCoverImg : (originCoverImg || cachedModalCoverImg || preferredModalCoverImg);
 		const githubCoverImg = getGithubItemCover(game, currentCat);
 		const modalCoverKeyAttr = modalSafeText(modalCoverKey);
 		const modalDisplayName = currentCat === 'videos' && browseExpandedGroupTitle
@@ -38940,12 +38963,15 @@ P
 				window.applyContentMetadataOverrideDelta({ action:'upsert', metadataKey:responseKey, override:response.override });
 			}
 			if (typeof window.updateContentMetadataOverridesSyncMeta === 'function') window.updateContentMetadataOverridesSyncMeta(response);
-			const item = window.__adminMetadataEditorItem || getLoadedMetadataStoreItemByKey(response.override.metadataKey)?.item || null;
-			adminPopulateMetadataEditor(item, response.override.category, response.override);
 			if (response.unchanged) {
+				const item = window.__adminMetadataEditorItem || getLoadedMetadataStoreItemByKey(response.override.metadataKey)?.item || null;
+				adminPopulateMetadataEditor(item, response.override.category, response.override);
 				adminSetMetadataEditorStatus('No changes to save.', 'fa-circle-check');
 				return;
 			}
+			// A successful correction is already represented in Active Overrides; leave the
+			// editor ready for the next item instead of keeping the submitted values around.
+			adminClearMetadataEditor();
 			if (typeof playUiSuccess === 'function') playUiSuccess();
 			if (typeof showToastNotification === 'function') showToastNotification('Metadata Corrections','Correction saved and synced to connected users.');
 		});

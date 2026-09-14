@@ -3813,7 +3813,8 @@ function normalizeContentMetadataString(value, maxLength = 220) {
 }
 
 function normalizeContentMetadataList(value, maxItems = 20, maxLength = 80) {
-  const raw = Array.isArray(value) ? value : String(value || '').split(',');
+  if (value === undefined || value === null || value === '' || (Array.isArray(value) && value.length === 0)) return [];
+  const raw = Array.isArray(value) ? value : String(value).split(',');
   const seen = new Set();
   const out = [];
   for (const item of raw) {
@@ -3884,19 +3885,22 @@ function getContentMetadataOverrideUpdatedAtMs(entry) {
   return Number.isFinite(value) ? value : 0;
 }
 
+function contentMetadataOverrideArrayEquals(left, right) {
+  if (left === right) return true;
+  if (!Array.isArray(left) || !Array.isArray(right) || left.length !== right.length) return false;
+  for (let i = 0; i < left.length; i++) if (left[i] !== right[i]) return false;
+  return true;
+}
+
 function contentMetadataOverrideEntryEquals(a, b) {
   if (a === b) return true;
   if (!a || !b) return false;
   if (a.metadataKey !== b.metadataKey || a.category !== b.category || a.titleId !== b.titleId || a.contentId !== b.contentId
       || a.title !== b.title || a.summary !== b.summary || a.coverUrl !== b.coverUrl || a.score !== b.score || a.year !== b.year
       || a.director !== b.director || a.updatedBy !== b.updatedBy || a.updatedAt !== b.updatedAt) return false;
-  const sameList = (left, right) => {
-    if (left === right) return true;
-    if (!Array.isArray(left) || !Array.isArray(right) || left.length !== right.length) return false;
-    for (let i = 0; i < left.length; i++) if (left[i] !== right[i]) return false;
-    return true;
-  };
-  return sameList(a.genres, b.genres) && sameList(a.tags, b.tags) && sameList(a.cast, b.cast);
+  return contentMetadataOverrideArrayEquals(a.genres, b.genres)
+      && contentMetadataOverrideArrayEquals(a.tags, b.tags)
+      && contentMetadataOverrideArrayEquals(a.cast, b.cast);
 }
 
 function contentMetadataOverrideMapEquals(left, right) {
@@ -3991,6 +3995,7 @@ async function refreshContentMetadataOverridesFromDb(options = {}) {
 
 function toPublicContentMetadataOverride(entry) {
   if (!entry) return null;
+  if (entry.__publicContentMetadataOverride) return entry.__publicContentMetadataOverride;
   // Socket payloads are intentionally sparse. Clients normalize missing optional fields back
   // to their empty defaults, so there is no reason to resend empty strings/arrays on every sync.
   const out = {
@@ -4007,6 +4012,7 @@ function toPublicContentMetadataOverride(entry) {
   if (Array.isArray(entry.cast) && entry.cast.length) out.cast = entry.cast;
   if (entry.director) out.director = entry.director;
   if (entry.updatedBy) out.updatedBy = entry.updatedBy;
+  try { Object.defineProperty(entry, '__publicContentMetadataOverride', { value: out, configurable: true }); } catch (e) {}
   return out;
 }
 
@@ -11662,6 +11668,8 @@ io.on('connection', (socket) => {
         contentReports: socket.isAdmin === true ? adminContentReports : [],
         blockedContent: socket.isAdmin === true ? blockedStoreContent : [],
         metadataOverrides: socket.isAdmin === true ? getPublicContentMetadataOverrides() : [],
+        metadataOverridesInstanceId: socket.isAdmin === true ? INSTANCE_ID : '',
+        metadataOverridesRevision: socket.isAdmin === true ? contentMetadataOverridesMutationRevision : -1,
         serverLog: socket.isAdmin === true ? serverLog : [],
         registeredUsers: socket.isAdmin === true ? Object.keys(userDatabase).length : 0,
         countryStats: socket.isAdmin === true ? getAdminCountryStats() : { total: 0, known: 0, unknown: 0, countries: [] },
@@ -11822,10 +11830,18 @@ io.on('connection', (socket) => {
     try {
       if (socket.isAdmin !== true) return respond({ success: false, message: 'Admin only.', overrides: [] });
       const force = data && data.force === true;
-      await refreshContentMetadataOverridesFromDb(force ? {} : { maxAgeMs: CONTENT_METADATA_OVERRIDES_DB_FRESH_MS });
-      const syncMeta = getContentMetadataOverridesSyncMeta();
       const knownInstanceId = normalizeText(data && data.knownInstanceId, '');
       const knownRevision = Number(data && data.knownRevision);
+      const now = Date.now();
+      const cacheFresh = profileSyncListenReady && contentMetadataOverridesLastDbRefreshAt && now - contentMetadataOverridesLastDbRefreshAt < CONTENT_METADATA_OVERRIDES_DB_FRESH_MS;
+      // Most silent Admin refreshes arrive seconds after admin_state/realtime sync. If the
+      // listener is healthy and the client already has this exact revision, answer without
+      // sorting the cache or touching PostgreSQL.
+      if (!force && cacheFresh && knownInstanceId === INSTANCE_ID && Number.isFinite(knownRevision) && knownRevision === contentMetadataOverridesMutationRevision) {
+        return respond({ success: true, unchanged: true, ...getContentMetadataOverridesSyncMeta() });
+      }
+      await refreshContentMetadataOverridesFromDb(force || !profileSyncListenReady ? {} : { maxAgeMs: CONTENT_METADATA_OVERRIDES_DB_FRESH_MS });
+      const syncMeta = getContentMetadataOverridesSyncMeta();
       const unchanged = !force && knownInstanceId === syncMeta.metadataInstanceId && Number.isFinite(knownRevision) && knownRevision === syncMeta.metadataRevision;
       if (unchanged) return respond({ success: true, unchanged: true, ...syncMeta });
       const overrides = getPublicContentMetadataOverrides();
