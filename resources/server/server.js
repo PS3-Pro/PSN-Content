@@ -8,7 +8,7 @@ const { Server } = require("socket.io");
 const { Pool, Client } = require('pg');
 const bcrypt = require('bcrypt');
 const crypto = require('crypto');
-const zlib = require('zlib');
+const { spawn } = require('child_process');
 
 const app = express();
 const server = http.createServer(app);
@@ -142,10 +142,9 @@ const poolOptions = {
 if (PG_MAX_USES > 0) poolOptions.maxUses = PG_MAX_USES;
 const pool = new Pool(poolOptions);
 
-// One-time, admin-issued download tokens for streamed PostgreSQL backups.
-// The actual database is never buffered into Socket.IO or kept in server memory.
+// One-time, admin-issued download tokens for native pg_dump backups.
+// The SQL stream never passes through Socket.IO and is never buffered as a whole in memory.
 const ADMIN_POSTGRES_BACKUP_TOKEN_TTL_MS = 60 * 1000;
-const ADMIN_POSTGRES_BACKUP_BATCH_SIZE = Math.max(50, Math.min(1000, parseInt(process.env.ADMIN_POSTGRES_BACKUP_BATCH_SIZE || "500", 10) || 500));
 const adminPostgresBackupTokens = new Map();
 let adminPostgresBackupActive = false;
 
@@ -155,8 +154,22 @@ function cleanupAdminPostgresBackupTokens(now = Date.now()) {
   }
 }
 
-function quotePgIdentifier(value) {
-  return `"${String(value || '').replace(/"/g, '""')}"`;
+function getPgDumpConnectionEnv() {
+  const raw = String(process.env.DATABASE_URL || '').trim();
+  if (!raw) throw new Error('DATABASE_URL is not configured.');
+  const parsed = new URL(raw);
+  const database = decodeURIComponent(String(parsed.pathname || '').replace(/^\/+/, ''));
+  if (!parsed.hostname || !database) throw new Error('DATABASE_URL is invalid.');
+  const sslMode = String(parsed.searchParams.get('sslmode') || process.env.PGSSLMODE || 'require').trim();
+  return {
+    ...process.env,
+    PGHOST: parsed.hostname,
+    PGPORT: parsed.port || '5432',
+    PGDATABASE: database,
+    PGUSER: decodeURIComponent(parsed.username || ''),
+    PGPASSWORD: decodeURIComponent(parsed.password || ''),
+    PGSSLMODE: sslMode || 'require'
+  };
 }
 let profileSyncNotifyClient = null;
 let profileSyncListenReady = false;
@@ -446,9 +459,9 @@ function startKeepAlivePings() {
   if (typeof keepAliveInterval.unref === 'function') keepAliveInterval.unref();
 }
 
-// Streams a consistent, compressed logical backup of every table in the public schema.
+// Streams a native, readable PostgreSQL plain-SQL backup using pg_dump.
 // Access is granted only by a short-lived, single-use token issued to an authenticated admin socket.
-app.get('/api/admin/postgres-backup', async (req, res) => {
+app.get('/api/admin/postgres-backup', (req, res) => {
   cleanupAdminPostgresBackupTokens();
   const token = String(req.query && req.query.token || '').trim();
   const grant = token ? adminPostgresBackupTokens.get(token) : null;
@@ -461,124 +474,95 @@ app.get('/api/admin/postgres-backup', async (req, res) => {
   if (adminPostgresBackupActive) {
     return res.status(409).json({ ok: false, error: 'Another PostgreSQL backup is already running.' });
   }
-  adminPostgresBackupActive = true;
 
-  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-  const filename = `psn-postgres-backup-${stamp}.json.gz`;
-  res.status(200);
-  res.setHeader('Content-Type', 'application/gzip');
-  res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
-  res.setHeader('Pragma', 'no-cache');
-  res.setHeader('X-Content-Type-Options', 'nosniff');
-
-  const gzip = zlib.createGzip({ level: 6 });
-  gzip.pipe(res);
-  const writeBackupChunk = async chunk => {
-    if (res.destroyed || gzip.destroyed) throw new Error('Backup download was interrupted.');
-    if (gzip.write(chunk)) return;
-    await new Promise((resolve, reject) => {
-      const onDrain = () => { cleanup(); resolve(); };
-      const onClose = () => { cleanup(); reject(new Error('Backup download was interrupted.')); };
-      const onError = err => { cleanup(); reject(err); };
-      const cleanup = () => {
-        gzip.off('drain', onDrain);
-        gzip.off('close', onClose);
-        gzip.off('error', onError);
-      };
-      gzip.once('drain', onDrain);
-      gzip.once('close', onClose);
-      gzip.once('error', onError);
-    });
-  };
-  let client = null;
-  let transactionOpen = false;
-  let completed = false;
-
+  let pgEnv;
   try {
-    client = await pool.connect();
-    await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');
-    transactionOpen = true;
-
-    const [dbInfoRes, tablesRes, sequencesRes] = await Promise.all([
-      client.query('SELECT current_database() AS database, current_user AS db_user, version() AS version'),
-      client.query(`SELECT tablename FROM pg_tables WHERE schemaname = 'public' ORDER BY tablename`),
-      client.query(`SELECT schemaname, sequencename, start_value, min_value, max_value, increment_by, cycle, cache_size, last_value FROM pg_sequences WHERE schemaname = 'public' ORDER BY sequencename`)
-    ]);
-
-    const dbInfo = dbInfoRes.rows && dbInfoRes.rows[0] ? dbInfoRes.rows[0] : {};
-    const tables = (tablesRes.rows || []).map(row => String(row.tablename || '')).filter(Boolean);
-    const sequences = sequencesRes.rows || [];
-
-    await writeBackupChunk('{');
-    await writeBackupChunk(`"format":${JSON.stringify('psn-content-postgres-json-v1')},`);
-    await writeBackupChunk(`"createdAt":${JSON.stringify(new Date().toISOString())},`);
-    await writeBackupChunk(`"database":${JSON.stringify(dbInfo.database || '')},`);
-    await writeBackupChunk(`"serverVersion":${JSON.stringify(dbInfo.version || '')},`);
-    await writeBackupChunk(`"sequences":${JSON.stringify(sequences)},`);
-    await writeBackupChunk('"tables":{');
-
-    let firstTable = true;
-    for (const tableName of tables) {
-      if (res.destroyed) throw new Error('Backup download was interrupted.');
-      if (!firstTable) await writeBackupChunk(',');
-      firstTable = false;
-
-      const columnsRes = await client.query(
-        `SELECT column_name, data_type, udt_name, is_nullable, column_default, ordinal_position
-         FROM information_schema.columns
-         WHERE table_schema = 'public' AND table_name = $1
-         ORDER BY ordinal_position`,
-        [tableName]
-      );
-
-      await writeBackupChunk(`${JSON.stringify(tableName)}:{"columns":${JSON.stringify(columnsRes.rows || [])},"rows":[`);
-      let firstRow = true;
-      let offset = 0;
-      const tableSql = `${quotePgIdentifier('public')}.${quotePgIdentifier(tableName)}`;
-
-      while (true) {
-        if (res.destroyed) throw new Error('Backup download was interrupted.');
-        const rowsRes = await client.query(
-          `SELECT * FROM ${tableSql} OFFSET $1 LIMIT $2`,
-          [offset, ADMIN_POSTGRES_BACKUP_BATCH_SIZE]
-        );
-        const rows = rowsRes.rows || [];
-        for (const row of rows) {
-          if (!firstRow) await writeBackupChunk(',');
-          firstRow = false;
-          await writeBackupChunk(JSON.stringify(row));
-        }
-        if (rows.length < ADMIN_POSTGRES_BACKUP_BATCH_SIZE) break;
-        offset += rows.length;
-      }
-      await writeBackupChunk(']}');
-    }
-
-    await client.query('COMMIT');
-    transactionOpen = false;
-    gzip.end('}}');
-    completed = true;
-    console.log(`[ADMIN POSTGRES BACKUP] ${grant.actor || 'Admin'} downloaded ${tables.length} public table(s).`);
+    pgEnv = getPgDumpConnectionEnv();
   } catch (err) {
-    console.error('[ADMIN POSTGRES BACKUP ERROR]:', err && err.message ? err.message : err);
-    if (client && transactionOpen) {
-      try { await client.query('ROLLBACK'); } catch (rollbackErr) {}
-      transactionOpen = false;
-    }
-    if (!res.headersSent) {
-      res.status(500).json({ ok: false, error: 'Could not create PostgreSQL backup.' });
-    } else {
-      try { gzip.destroy(err instanceof Error ? err : new Error(String(err))); } catch (gzipErr) {}
-      if (!res.destroyed) res.destroy();
-    }
-  } finally {
-    if (client) client.release();
-    adminPostgresBackupActive = false;
-    if (!completed && !gzip.destroyed) {
-      try { gzip.destroy(); } catch (err) {}
-    }
+    console.error('[ADMIN POSTGRES BACKUP CONFIG ERROR]:', err && err.message ? err.message : err);
+    return res.status(500).json({ ok: false, error: 'PostgreSQL backup is not configured correctly.' });
   }
+
+  adminPostgresBackupActive = true;
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const filename = `psn-postgres-backup-${stamp}.sql`;
+  const pgDumpBin = String(process.env.PG_DUMP_BIN || 'pg_dump').trim() || 'pg_dump';
+  const args = [
+    '--format=plain',
+    '--encoding=UTF8',
+    '--no-owner',
+    '--no-privileges',
+    '--no-tablespaces',
+    '--schema=public'
+  ];
+
+  const dump = spawn(pgDumpBin, args, {
+    env: pgEnv,
+    stdio: ['ignore', 'pipe', 'pipe'],
+    windowsHide: true
+  });
+
+  let headersStarted = false;
+  let finished = false;
+  let stderr = '';
+
+  const finish = () => {
+    if (finished) return;
+    finished = true;
+    adminPostgresBackupActive = false;
+  };
+
+  dump.stderr.on('data', chunk => {
+    if (stderr.length >= 32768) return;
+    stderr += String(chunk || '').slice(0, 32768 - stderr.length);
+  });
+
+  dump.once('spawn', () => {
+    headersStarted = true;
+    res.status(200);
+    res.setHeader('Content-Type', 'application/sql; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    dump.stdout.pipe(res);
+  });
+
+  dump.once('error', err => {
+    finish();
+    console.error('[ADMIN POSTGRES BACKUP ERROR]:', err && err.message ? err.message : err);
+    if (!headersStarted && !res.headersSent) {
+      const missingPgDump = err && err.code === 'ENOENT';
+      return res.status(missingPgDump ? 503 : 500).json({
+        ok: false,
+        error: missingPgDump
+          ? 'pg_dump is not installed on this server. Install PostgreSQL client tools or set PG_DUMP_BIN.'
+          : 'Could not start PostgreSQL backup.'
+      });
+    }
+    if (!res.destroyed) res.destroy(err);
+  });
+
+  dump.once('close', (code, signal) => {
+    finish();
+    if (code === 0) {
+      console.log(`[ADMIN POSTGRES BACKUP] ${grant.actor || 'Admin'} downloaded a plain SQL backup.`);
+      return;
+    }
+    const detail = stderr.trim().slice(0, 1200);
+    console.error(`[ADMIN POSTGRES BACKUP ERROR] pg_dump exited with code ${code}${signal ? ` signal ${signal}` : ''}${detail ? `: ${detail}` : ''}`);
+    if (!headersStarted && !res.headersSent) {
+      res.status(500).json({ ok: false, error: 'pg_dump could not create the PostgreSQL backup.' });
+    } else if (!res.destroyed) {
+      res.destroy(new Error('PostgreSQL backup was interrupted.'));
+    }
+  });
+
+  res.once('close', () => {
+    if (finished) return;
+    try { dump.kill('SIGTERM'); } catch (err) {}
+    finish();
+  });
 });
 
 app.get('/ping', (req, res) => {
@@ -11602,7 +11586,7 @@ io.on('connection', (socket) => {
         expiresInMs: ADMIN_POSTGRES_BACKUP_TOKEN_TTL_MS
       });
       try {
-        await addServerLog('admin_backup', 'PostgreSQL backup link created', { format: 'json.gz', expiresInMs: ADMIN_POSTGRES_BACKUP_TOKEN_TTL_MS }, socket.userName || 'Admin');
+        await addServerLog('admin_backup', 'PostgreSQL backup link created', { format: 'plain-sql', expiresInMs: ADMIN_POSTGRES_BACKUP_TOKEN_TTL_MS }, socket.userName || 'Admin');
       } catch (logErr) {}
     } catch (err) {
       console.error('[ADMIN POSTGRES BACKUP TOKEN ERROR]:', err);
