@@ -7,6 +7,8 @@ const https = require('https');
 const { Server } = require("socket.io");
 const { Pool, Client } = require('pg');
 const bcrypt = require('bcrypt');
+const crypto = require('crypto');
+const zlib = require('zlib');
 
 const app = express();
 const server = http.createServer(app);
@@ -139,6 +141,23 @@ const poolOptions = {
 };
 if (PG_MAX_USES > 0) poolOptions.maxUses = PG_MAX_USES;
 const pool = new Pool(poolOptions);
+
+// One-time, admin-issued download tokens for streamed PostgreSQL backups.
+// The actual database is never buffered into Socket.IO or kept in server memory.
+const ADMIN_POSTGRES_BACKUP_TOKEN_TTL_MS = 60 * 1000;
+const ADMIN_POSTGRES_BACKUP_BATCH_SIZE = Math.max(50, Math.min(1000, parseInt(process.env.ADMIN_POSTGRES_BACKUP_BATCH_SIZE || "500", 10) || 500));
+const adminPostgresBackupTokens = new Map();
+let adminPostgresBackupActive = false;
+
+function cleanupAdminPostgresBackupTokens(now = Date.now()) {
+  for (const [token, entry] of adminPostgresBackupTokens) {
+    if (!entry || Number(entry.expiresAt || 0) <= now) adminPostgresBackupTokens.delete(token);
+  }
+}
+
+function quotePgIdentifier(value) {
+  return `"${String(value || '').replace(/"/g, '""')}"`;
+}
 let profileSyncNotifyClient = null;
 let profileSyncListenReady = false;
 let profileSyncListenerHadGap = false;
@@ -426,6 +445,141 @@ function startKeepAlivePings() {
   keepAliveInterval = setInterval(runKeepAlive, KEEP_ALIVE_INTERVAL_MS);
   if (typeof keepAliveInterval.unref === 'function') keepAliveInterval.unref();
 }
+
+// Streams a consistent, compressed logical backup of every table in the public schema.
+// Access is granted only by a short-lived, single-use token issued to an authenticated admin socket.
+app.get('/api/admin/postgres-backup', async (req, res) => {
+  cleanupAdminPostgresBackupTokens();
+  const token = String(req.query && req.query.token || '').trim();
+  const grant = token ? adminPostgresBackupTokens.get(token) : null;
+  if (!grant || Number(grant.expiresAt || 0) <= Date.now()) {
+    if (token) adminPostgresBackupTokens.delete(token);
+    return res.status(403).json({ ok: false, error: 'Backup link is invalid or expired.' });
+  }
+  adminPostgresBackupTokens.delete(token); // single use
+
+  if (adminPostgresBackupActive) {
+    return res.status(409).json({ ok: false, error: 'Another PostgreSQL backup is already running.' });
+  }
+  adminPostgresBackupActive = true;
+
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const filename = `psn-postgres-backup-${stamp}.json.gz`;
+  res.status(200);
+  res.setHeader('Content-Type', 'application/gzip');
+  res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+
+  const gzip = zlib.createGzip({ level: 6 });
+  gzip.pipe(res);
+  const writeBackupChunk = async chunk => {
+    if (res.destroyed || gzip.destroyed) throw new Error('Backup download was interrupted.');
+    if (gzip.write(chunk)) return;
+    await new Promise((resolve, reject) => {
+      const onDrain = () => { cleanup(); resolve(); };
+      const onClose = () => { cleanup(); reject(new Error('Backup download was interrupted.')); };
+      const onError = err => { cleanup(); reject(err); };
+      const cleanup = () => {
+        gzip.off('drain', onDrain);
+        gzip.off('close', onClose);
+        gzip.off('error', onError);
+      };
+      gzip.once('drain', onDrain);
+      gzip.once('close', onClose);
+      gzip.once('error', onError);
+    });
+  };
+  let client = null;
+  let transactionOpen = false;
+  let completed = false;
+
+  try {
+    client = await pool.connect();
+    await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');
+    transactionOpen = true;
+
+    const [dbInfoRes, tablesRes, sequencesRes] = await Promise.all([
+      client.query('SELECT current_database() AS database, current_user AS db_user, version() AS version'),
+      client.query(`SELECT tablename FROM pg_tables WHERE schemaname = 'public' ORDER BY tablename`),
+      client.query(`SELECT schemaname, sequencename, start_value, min_value, max_value, increment_by, cycle, cache_size, last_value FROM pg_sequences WHERE schemaname = 'public' ORDER BY sequencename`)
+    ]);
+
+    const dbInfo = dbInfoRes.rows && dbInfoRes.rows[0] ? dbInfoRes.rows[0] : {};
+    const tables = (tablesRes.rows || []).map(row => String(row.tablename || '')).filter(Boolean);
+    const sequences = sequencesRes.rows || [];
+
+    await writeBackupChunk('{');
+    await writeBackupChunk(`"format":${JSON.stringify('psn-content-postgres-json-v1')},`);
+    await writeBackupChunk(`"createdAt":${JSON.stringify(new Date().toISOString())},`);
+    await writeBackupChunk(`"database":${JSON.stringify(dbInfo.database || '')},`);
+    await writeBackupChunk(`"serverVersion":${JSON.stringify(dbInfo.version || '')},`);
+    await writeBackupChunk(`"sequences":${JSON.stringify(sequences)},`);
+    await writeBackupChunk('"tables":{');
+
+    let firstTable = true;
+    for (const tableName of tables) {
+      if (res.destroyed) throw new Error('Backup download was interrupted.');
+      if (!firstTable) await writeBackupChunk(',');
+      firstTable = false;
+
+      const columnsRes = await client.query(
+        `SELECT column_name, data_type, udt_name, is_nullable, column_default, ordinal_position
+         FROM information_schema.columns
+         WHERE table_schema = 'public' AND table_name = $1
+         ORDER BY ordinal_position`,
+        [tableName]
+      );
+
+      await writeBackupChunk(`${JSON.stringify(tableName)}:{"columns":${JSON.stringify(columnsRes.rows || [])},"rows":[`);
+      let firstRow = true;
+      let offset = 0;
+      const tableSql = `${quotePgIdentifier('public')}.${quotePgIdentifier(tableName)}`;
+
+      while (true) {
+        if (res.destroyed) throw new Error('Backup download was interrupted.');
+        const rowsRes = await client.query(
+          `SELECT * FROM ${tableSql} OFFSET $1 LIMIT $2`,
+          [offset, ADMIN_POSTGRES_BACKUP_BATCH_SIZE]
+        );
+        const rows = rowsRes.rows || [];
+        for (const row of rows) {
+          if (!firstRow) await writeBackupChunk(',');
+          firstRow = false;
+          await writeBackupChunk(JSON.stringify(row));
+        }
+        if (rows.length < ADMIN_POSTGRES_BACKUP_BATCH_SIZE) break;
+        offset += rows.length;
+      }
+      await writeBackupChunk(']}');
+    }
+
+    await client.query('COMMIT');
+    transactionOpen = false;
+    gzip.end('}}');
+    completed = true;
+    console.log(`[ADMIN POSTGRES BACKUP] ${grant.actor || 'Admin'} downloaded ${tables.length} public table(s).`);
+  } catch (err) {
+    console.error('[ADMIN POSTGRES BACKUP ERROR]:', err && err.message ? err.message : err);
+    if (client && transactionOpen) {
+      try { await client.query('ROLLBACK'); } catch (rollbackErr) {}
+      transactionOpen = false;
+    }
+    if (!res.headersSent) {
+      res.status(500).json({ ok: false, error: 'Could not create PostgreSQL backup.' });
+    } else {
+      try { gzip.destroy(err instanceof Error ? err : new Error(String(err))); } catch (gzipErr) {}
+      if (!res.destroyed) res.destroy();
+    }
+  } finally {
+    if (client) client.release();
+    adminPostgresBackupActive = false;
+    if (!completed && !gzip.destroyed) {
+      try { gzip.destroy(); } catch (err) {}
+    }
+  }
+});
 
 app.get('/ping', (req, res) => {
   res.send('Server is Awake!');
@@ -11431,6 +11585,31 @@ io.on('connection', (socket) => {
   // --------------------------------------------------------------------------
   // Administration & moderation controls
   // --------------------------------------------------------------------------
+  socket.on('admin_create_postgres_backup', async (data, callback) => {
+    const respond = typeof callback === 'function' ? callback : () => {};
+    try {
+      if (socket.isAdmin !== true) return respond({ success: false, message: 'Admin only.' });
+      if (adminPostgresBackupActive) return respond({ success: false, message: 'Another PostgreSQL backup is already running.' });
+      cleanupAdminPostgresBackupTokens();
+      const token = crypto.randomBytes(32).toString('hex');
+      adminPostgresBackupTokens.set(token, {
+        actor: socket.userName || 'Admin',
+        expiresAt: Date.now() + ADMIN_POSTGRES_BACKUP_TOKEN_TTL_MS
+      });
+      respond({
+        success: true,
+        url: `/api/admin/postgres-backup?token=${encodeURIComponent(token)}`,
+        expiresInMs: ADMIN_POSTGRES_BACKUP_TOKEN_TTL_MS
+      });
+      try {
+        await addServerLog('admin_backup', 'PostgreSQL backup link created', { format: 'json.gz', expiresInMs: ADMIN_POSTGRES_BACKUP_TOKEN_TTL_MS }, socket.userName || 'Admin');
+      } catch (logErr) {}
+    } catch (err) {
+      console.error('[ADMIN POSTGRES BACKUP TOKEN ERROR]:', err);
+      respond({ success: false, message: 'Could not prepare PostgreSQL backup.' });
+    }
+  });
+
   socket.on('admin_ping' , async (data, callback) => {
     const respond = typeof callback === 'function' ? callback : () => {};
 

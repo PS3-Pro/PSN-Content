@@ -7521,7 +7521,8 @@ img { -webkit-user-drag: none !important; user-drag: none !important; }
 									<div class="admin-btn-row" style="margin-top:0;">
 										<button class="admin-action-btn" onclick="adminReloadDatabase()" onmouseenter="if(typeof playUiHover === 'function') playUiHover()"><i class="fas fa-database"></i> Reload DB</button>
 										<button class="admin-action-btn ghost" onclick="adminClearCoverCache()" onmouseenter="if(typeof playUiHover === 'function') playUiHover()"><i class="fas fa-image"></i> Cover Cache</button>
-										<button class="admin-action-btn ghost" onclick="adminExportUsers()" onmouseenter="if(typeof playUiHover === 'function') playUiHover()"><i class="fas fa-users"></i> Export Users</button>
+										<button class="admin-action-btn ghost" onclick="adminExportUsers()" onmouseenter="if(typeof playUiHover === 'function') playUiHover()"><i class="fas fa-users"></i> Export All Users</button>
+										<button class="admin-action-btn ghost" onclick="adminDownloadPostgresBackup()" onmouseenter="if(typeof playUiHover === 'function') playUiHover()" title="Download a compressed backup of all PostgreSQL public tables"><i class="fas fa-download"></i> PostgreSQL Backup</button>
 										<button class="admin-action-btn ghost" onclick="adminExportSettings()" onmouseenter="if(typeof playUiHover === 'function') playUiHover()"><i class="fas fa-sliders-h"></i> Export Settings</button>
 									</div>
 								</div>
@@ -34833,17 +34834,12 @@ P
 	}
 	window.adminInvalidateKnownUsersCache = adminInvalidateKnownUsersCache;
 
-	function adminGetAllKnownUsers() {
-		if (adminKnownUsersCache && adminKnownUsersCacheRevision === adminKnownUsersRevision) return adminKnownUsersCache;
+	function adminBuildKnownUsers(databaseUsers = [], onlineUsers = []) {
 		const map = new Map();
 		const myName = localStorage.getItem('psn_username') || '';
-		const onlineList = (typeof currentOnlineList !== 'undefined' && Array.isArray(currentOnlineList)) ? currentOnlineList : [];
-		const adminUsers = Array.isArray(window.adminAllUsers) ? window.adminAllUsers : [];
-
-		for (const user of adminUsers) adminMergeUserIntoMap(map, user, 'database');
-		for (const user of onlineList) adminMergeUserIntoMap(map, user, 'online');
-
-		const result = Array.from(map.values()).sort((a, b) => {
+		for (const user of (Array.isArray(databaseUsers) ? databaseUsers : [])) adminMergeUserIntoMap(map, user, 'database');
+		for (const user of (Array.isArray(onlineUsers) ? onlineUsers : [])) adminMergeUserIntoMap(map, user, 'online');
+		return Array.from(map.values()).sort((a, b) => {
 			if (a.name === myName) return -1;
 			if (b.name === myName) return 1;
 			if (a.online !== b.online) return a.online ? -1 : 1;
@@ -34854,6 +34850,13 @@ P
 			if (aRoleRank !== bRoleRank) return aRoleRank - bRoleRank;
 			return a.name.localeCompare(b.name);
 		});
+	}
+
+	function adminGetAllKnownUsers() {
+		if (adminKnownUsersCache && adminKnownUsersCacheRevision === adminKnownUsersRevision) return adminKnownUsersCache;
+		const onlineList = (typeof currentOnlineList !== 'undefined' && Array.isArray(currentOnlineList)) ? currentOnlineList : [];
+		const adminUsers = Array.isArray(window.adminAllUsers) ? window.adminAllUsers : [];
+		const result = adminBuildKnownUsers(adminUsers, onlineList);
 		adminKnownUsersCache = result;
 		adminKnownUsersOnlineSnapshot = [];
 		for (const user of result) {
@@ -38941,11 +38944,150 @@ P
 		}
 	};
 
-	window.adminExportUsers = function() {
+	function adminRequestUsersExportPage(offset = 0, limit = 1000) {
+		return new Promise((resolve, reject) => {
+			if (typeof socketChat === 'undefined' || !socketChat || !socketChat.connected) {
+				reject(new Error('Socket is offline.'));
+				return;
+			}
+			if (window.__adminUsersExportPageWaiter) {
+				reject(new Error('Another user export page is still pending.'));
+				return;
+			}
+			const safeOffset = Math.max(0, Number(offset) || 0);
+			const safeLimit = Math.max(1, Math.min(1000, Number(limit) || 1000));
+			const timer = setTimeout(() => {
+				const waiter = window.__adminUsersExportPageWaiter;
+				if (waiter && waiter.offset === safeOffset) window.__adminUsersExportPageWaiter = null;
+				reject(new Error('Timed out while loading all users.'));
+			}, 15000);
+			window.__adminUsersExportPageWaiter = { offset: safeOffset, resolve, reject, timer };
+			// @all is intentionally reserved for the export path. The normal Admin list uses '*',
+			// so export pages cannot be confused with visible-list refresh responses.
+			socketChat.emit('search_users', { query: '@all', purpose: 'admin', filter: 'all', offset: safeOffset, limit: safeLimit });
+		});
+	}
+
+	window.adminExportUsers = async function() {
 		if (!adminGuard()) return;
-		adminDownloadJson(`psn-admin-users-${new Date().toISOString().replace(/[:.]/g, '-')}.json`, adminGetAllKnownUsers());
-		adminAddLog('export', 'Exported users list');
-		adminToast('Export Users', 'Users list exported.');
+		if (window.__adminUsersExportInFlight) {
+			adminToast('Export All Users', 'A full user export is already running.');
+			return;
+		}
+		if (typeof socketChat === 'undefined' || !socketChat || !socketChat.connected) {
+			if (typeof playUiError === 'function') playUiError();
+			adminToast('Export All Users', 'Server is offline. Full export requires the registered-user database.');
+			return;
+		}
+
+		window.__adminUsersExportInFlight = true;
+		adminToast('Export All Users', 'Loading every registered user from the server...');
+		try {
+			const pageSize = 1000;
+			let offset = 0;
+			let total = null;
+			const databaseUsers = [];
+
+			while (total === null || offset < total) {
+				const payload = await adminRequestUsersExportPage(offset, pageSize);
+				const results = payload && Array.isArray(payload.results) ? payload.results : [];
+				const pageOffset = Math.max(0, Number(payload && payload.offset) || 0);
+				const reportedTotal = Math.max(0, Number(payload && payload.total) || 0);
+				if (total === null) total = reportedTotal;
+				else total = Math.max(total, reportedTotal);
+				if (pageOffset !== offset) throw new Error('Unexpected user export page.');
+				databaseUsers.push(...results);
+				if (!results.length) break;
+				offset += results.length;
+			}
+
+			if (total !== null && databaseUsers.length < total) {
+				throw new Error(`Incomplete user export (${databaseUsers.length}/${total}).`);
+			}
+
+			const onlineList = (typeof currentOnlineList !== 'undefined' && Array.isArray(currentOnlineList)) ? currentOnlineList : [];
+			const users = adminBuildKnownUsers(databaseUsers, onlineList);
+			adminDownloadJson(`psn-admin-users-${new Date().toISOString().replace(/[:.]/g, '-')}.json`, users);
+			adminAddLog('export', `Exported all users (${users.length})`);
+			if (typeof playUiSuccess === 'function') playUiSuccess();
+			adminToast('Export All Users', `${users.length} registered user${users.length === 1 ? '' : 's'} exported.`);
+		} catch (err) {
+			console.error('Full users export failed:', err);
+			if (typeof playUiError === 'function') playUiError();
+			adminToast('Export All Users', err && err.message ? err.message : 'Could not export all registered users.');
+		} finally {
+			const waiter = window.__adminUsersExportPageWaiter;
+			if (waiter && waiter.timer) clearTimeout(waiter.timer);
+			window.__adminUsersExportPageWaiter = null;
+			window.__adminUsersExportInFlight = false;
+		}
+	};
+
+
+	function adminGetActiveServerBaseUrl() {
+		try {
+			if (typeof serverUrls !== 'undefined' && Array.isArray(serverUrls) && serverUrls.length) {
+				const index = typeof currentServerIndex !== 'undefined' ? Math.max(0, Number(currentServerIndex) || 0) : 0;
+				return String(serverUrls[index] || serverUrls[0] || '').replace(/\/+$/, '');
+			}
+		} catch (err) {}
+		return '';
+	}
+
+	window.adminDownloadPostgresBackup = function() {
+		if (!adminGuard()) return;
+		if (window.__adminPostgresBackupRequestInFlight) {
+			adminToast('PostgreSQL Backup', 'A backup request is already being prepared.');
+			return;
+		}
+		if (typeof socketChat === 'undefined' || !socketChat || !socketChat.connected) {
+			if (typeof playUiError === 'function') playUiError();
+			adminToast('PostgreSQL Backup', 'Server is offline. Connect before creating a database backup.');
+			return;
+		}
+
+		const serverBase = adminGetActiveServerBaseUrl();
+		if (!serverBase) {
+			if (typeof playUiError === 'function') playUiError();
+			adminToast('PostgreSQL Backup', 'Could not resolve the active server address.');
+			return;
+		}
+
+		window.__adminPostgresBackupRequestInFlight = true;
+		adminToast('PostgreSQL Backup', 'Preparing a secure one-time download...');
+		let settled = false;
+		const timer = setTimeout(() => {
+			if (settled) return;
+			settled = true;
+			window.__adminPostgresBackupRequestInFlight = false;
+			if (typeof playUiError === 'function') playUiError();
+			adminToast('PostgreSQL Backup', 'The server took too long to prepare the backup link.');
+		}, 15000);
+
+		socketChat.emit('admin_create_postgres_backup', {}, response => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			window.__adminPostgresBackupRequestInFlight = false;
+			if (!response || response.success !== true || !response.url) {
+				if (typeof playUiError === 'function') playUiError();
+				adminToast('PostgreSQL Backup', response && response.message ? response.message : 'Could not prepare the PostgreSQL backup.');
+				return;
+			}
+
+			const path = String(response.url || '').trim();
+			const downloadUrl = /^https?:\/\//i.test(path) ? path : `${serverBase}${path.startsWith('/') ? '' : '/'}${path}`;
+			const frame = document.createElement('iframe');
+			frame.style.display = 'none';
+			frame.setAttribute('aria-hidden', 'true');
+			frame.src = downloadUrl;
+			document.body.appendChild(frame);
+			setTimeout(() => { try { frame.remove(); } catch (err) {} }, 2 * 60 * 1000);
+
+			adminAddLog('export', 'Started PostgreSQL backup download');
+			if (typeof playUiSuccess === 'function') playUiSuccess();
+			adminToast('PostgreSQL Backup', 'Full database backup started. The file is compressed as JSON.GZ.');
+		});
 	};
 
 	window.adminExportSettings = function() {
@@ -66717,6 +66859,13 @@ function getVisibleChatStackEl(id) {
 		};
 
 		socketChat.on('admin_users_results', function(payload) {
+			const exportWaiter = window.__adminUsersExportPageWaiter;
+			if (exportWaiter && String(payload && payload.query || '').toLowerCase() === '@all' && String(payload && payload.filter || 'all').toLowerCase() === 'all' && Math.max(0, Number(payload && payload.offset) || 0) === exportWaiter.offset) {
+				clearTimeout(exportWaiter.timer);
+				window.__adminUsersExportPageWaiter = null;
+				exportWaiter.resolve(payload);
+				return;
+			}
 			clearTimeout(window.adminUsersRenderTimer);
 			window.adminUsersRenderTimer = null;
 			const wasAdminUsersLoading = window.adminUsersLoading === true;
