@@ -7326,7 +7326,7 @@ img { -webkit-user-drag: none !important; user-drag: none !important; }
 						<p class="admin-hero-subtitle">Manage chat, online users, global announcements, database/cache health and quick diagnostics from one protected place.</p>
 						<div class="admin-quick-actions">
 							<button class="admin-action-btn" onclick="adminRequestUsersList()" onmouseenter="if(typeof playUiHover === 'function') playUiHover()"><i class="fas fa-satellite-dish"></i> Refresh Users</button>
-							<button class="admin-action-btn success" onclick="renderAdminPanel()" onmouseenter="if(typeof playUiHover === 'function') playUiHover()"><i class="fas fa-sync-alt"></i> Refresh Panel</button>
+							<button class="admin-action-btn success" onclick="adminRefreshPanel()" onmouseenter="if(typeof playUiHover === 'function') playUiHover()"><i class="fas fa-sync-alt"></i> Refresh Panel</button>
 							<button class="admin-action-btn warning" onclick="adminForceReloadAll()" onmouseenter="if(typeof playUiHover === 'function') playUiHover()"><i class="fas fa-bolt"></i> Force Reload</button>
 						</div>
 					</div>
@@ -7512,7 +7512,7 @@ img { -webkit-user-drag: none !important; user-drag: none !important; }
 										<div class="admin-kv"><span>Trophies</span><strong id="admin-kv-trophies">0</strong></div>
 									</div>
 									<div class="admin-btn-row">
-										<button class="admin-action-btn" onclick="if(typeof clearAppCache === 'function') clearAppCache(); renderAdminPanel();" onmouseenter="if(typeof playUiHover === 'function') playUiHover()"><i class="fas fa-cloud-download-alt"></i> Sync DB</button>
+										<button class="admin-action-btn" onclick="adminSyncDatabase()" onmouseenter="if(typeof playUiHover === 'function') playUiHover()"><i class="fas fa-cloud-download-alt"></i> Sync DB</button>
 										<button class="admin-action-btn ghost" onclick="adminExportDiagnostics()" onmouseenter="if(typeof playUiHover === 'function') playUiHover()"><i class="fas fa-file-export"></i> Export Report</button>
 									</div>
 								</div>
@@ -24675,22 +24675,19 @@ P
 		getOnlineCoverFallback(imgElement);
 	};
 	
-	window.getBingCoverFallbackUrl = function(gameName, consoleTag, rawTitleId = '') {
+	window.getBingCoverFallbackUrl = function(gameName, consoleTag) {
 		gameName = String(gameName || '').trim();
 		let searchConsole = String(consoleTag || 'ps3').trim().toUpperCase();
 		if (searchConsole === 'PSX') searchConsole = 'PS1';
 		if (!gameName) gameName = 'PlayStation game';
-		const titleIdMatch = String(rawTitleId || '').trim().toUpperCase().match(/[A-Z]{4}\d{5}/);
-		const titleId = titleIdMatch ? titleIdMatch[0] : '';
-		const query = encodeURIComponent(`${gameName}${titleId ? ` ${titleId}` : ''} ${searchConsole} high-quality official game front cover art`);
+		const query = encodeURIComponent(`${gameName} ${searchConsole} high-quality official game front cover art`);
 		return `https://tse4.mm.bing.net/th?q=${query}`;
 	};
 
 	window.getOnlineCoverFallback = function(imgElement) {
 	    let gameName = imgElement.getAttribute('data-name') || '';
 	    let consoleTag = imgElement.getAttribute('data-console') || 'ps3';
-	    const titleId = imgElement.getAttribute('data-title-id') || '';
-	    const bingCover = window.getBingCoverFallbackUrl(gameName, consoleTag, titleId);
+	    const bingCover = window.getBingCoverFallbackUrl(gameName, consoleTag);
 	    const currentSrc = normalizeCoverSrcForCache(imgElement.currentSrc || imgElement.src);
 	    if (imgElement.getAttribute('data-bing-tried') === 'true' || currentSrc === normalizeCoverSrcForCache(bingCover)) {
 	        imgElement.onerror = null;
@@ -34924,6 +34921,15 @@ P
 		return false;
 	}
 
+	function adminToast(title, description = '') {
+		if (typeof window.showToastNotification === 'function') {
+			window.showToastNotification(String(title || 'Admin Panel'), String(description || ''));
+			return true;
+		}
+		return false;
+	}
+	window.adminToast = adminToast;
+
 	function adminGetUsersBatchSize() {
 		const input = document.getElementById('admin-user-batch-size');
 		const stored = localStorage.getItem('psn_admin_users_batch_size');
@@ -35627,12 +35633,15 @@ P
 				socketChat.emit('search_users', { query, purpose: 'admin', filter, offset, limit: batchSize });
 			}
 
-			if (!silent && typeof playUiSuccess === 'function') playUiSuccess();
+			if (!silent) {
+				if (typeof playUiSuccess === 'function') playUiSuccess();
+				adminToast('Users', includeRegistered ? 'User list refresh requested.' : 'Online users refresh requested.');
+			}
 		} else {
 			window.adminUsersLoading = false;
 			if (!silent) {
 				if (typeof playUiError === 'function') playUiError();
-				alert('Socket is offline. Showing only locally cached users.');
+				adminToast('Users', 'Socket is offline. Showing only locally cached users.');
 			}
 		}
 		clearTimeout(window.adminUsersRenderTimer);
@@ -36107,6 +36116,7 @@ P
 		adminCloseBroadcastPopovers();
 		adminUpdateBroadcastPreview();
 		if (typeof playUiSuccess === 'function') playUiSuccess();
+		adminToast('Broadcast', 'Alert sent to everyone.');
 		setTimeout(() => { if (document.getElementById('view-admin')?.style.display === 'block') adminSchedulePanelRender(); }, 250);
 	};
 
@@ -36123,6 +36133,7 @@ P
 			if (typeof showReloadAnimation === 'function') showReloadAnimation(false);
 			if (typeof playUiSuccess === 'function') playUiSuccess();
 			adminAddLog('reload', 'Forced reload for everyone');
+			adminToast('Force Reload', 'Reload command sent to connected users.');
 		} else {
 			if (typeof playUiError === 'function') playUiError();
 			alert('Socket is offline. Cannot force reload.');
@@ -36145,6 +36156,7 @@ P
 				}
 				if (typeof playUiSuccess === 'function') playUiSuccess();
 				adminAddLog('clear_chat', `Cleared global chat history${response && response.backedUpCount !== undefined ? ` (${response.backedUpCount} messages backed up)` : ''}`);
+				adminToast('Global Chat', response && response.backedUpCount !== undefined ? `Chat cleared. ${response.backedUpCount} message${response.backedUpCount === 1 ? '' : 's'} backed up.` : 'Chat history cleared.');
 				setTimeout(() => { if (document.getElementById('view-admin')?.style.display === 'block') adminSchedulePanelRender(); }, 500);
 			});
 		} else {
@@ -36431,6 +36443,7 @@ P
 		a.remove();
 		URL.revokeObjectURL(url);
 		if (typeof playUiSuccess === 'function') playUiSuccess();
+		adminToast('Diagnostics', 'Report exported.');
 	};
 
 	window.adminCopyDiagnostics = async function() {
@@ -36439,9 +36452,11 @@ P
 		try {
 			await navigator.clipboard.writeText(text);
 			if (typeof playUiSuccess === 'function') playUiSuccess();
+			adminToast('Diagnostics', 'Copied to clipboard.');
 		} catch (e) {
 			console.log(text);
-			alert('Clipboard blocked by the browser. Diagnostics were printed in the console.');
+			if (typeof playUiError === 'function') playUiError();
+			adminToast('Diagnostics', 'Clipboard was blocked. The report was printed in the console.');
 		}
 	};
 
@@ -36594,6 +36609,7 @@ P
 		}
 		renderAdminPanel();
 		if (typeof playUiRemove === 'function') playUiRemove();
+		adminToast('Server Log', 'Server log cleared.');
 	};
 
 	window.adminClearModerationLog = function() {
@@ -36605,6 +36621,7 @@ P
 		}
 		renderAdminPanel();
 		if (typeof playUiRemove === 'function') playUiRemove();
+		adminToast('Moderation Log', 'Moderation log cleared.');
 	};
 
 	function adminDefaultMaintenanceSchedule() {
@@ -36800,6 +36817,7 @@ P
 				if (options.logType) adminAddLog(options.logType, options.logMessage || 'Updated maintenance state', confirmed);
 				renderAdminPanel();
 				if (typeof playUiSuccess === 'function') playUiSuccess();
+				adminToast('Maintenance', options.logMessage || 'Maintenance settings updated.');
 				resolve(confirmed);
 			};
 			try {
@@ -37259,6 +37277,7 @@ P
 			socketChat.emit('chat_message', { text, user: myName, avatar: myAvatar, type: 'text', content: null, isGlobalPing: true });
 			adminAddLog('broadcast', 'Sent maintenance broadcast');
 			if (typeof playUiSuccess === 'function') playUiSuccess();
+			adminToast('Maintenance', 'Maintenance notice broadcast sent.');
 		} else {
 			if (typeof playUiError === 'function') playUiError();
 			alert('Socket is offline. Cannot broadcast maintenance notice.');
@@ -37728,6 +37747,7 @@ P
 		adminAddLog('pin', 'Pinned announcement', { text, color });
 		renderAdminPanel();
 		if (typeof playUiSuccess === 'function') playUiSuccess();
+		adminToast('Pinned Announcement', 'Announcement pinned.');
 	};
 
 	window.adminClearPinnedAnnouncement = function() {
@@ -37736,6 +37756,7 @@ P
 		adminAddLog('unpin', 'Cleared pinned announcement');
 		renderAdminPanel();
 		if (typeof playUiRemove === 'function') playUiRemove();
+		adminToast('Pinned Announcement', 'Announcement cleared.');
 	};
 
 	window.adminGetChatControls = function() {
@@ -38231,6 +38252,7 @@ P
 			if (localLogMessage) adminAddLog('chat_controls', localLogMessage, serverState);
 			renderAdminPanel();
 			if (typeof playUiSuccess === 'function') playUiSuccess();
+			adminToast('Chat Controls', nextLocked || nextSlowSeconds > 0 ? 'Chat controls applied.' : 'Chat controls reset.');
 		};
 
 		try {
@@ -38799,36 +38821,123 @@ P
 		if (typeof playUiArrow === 'function') playUiArrow();
 	};
 
-	window.adminReloadDatabase = async function() {
+	window.adminRefreshPanel = function() {
 		if (!adminGuard()) return;
+		renderAdminPanel();
+		if (typeof playUiSuccess === 'function') playUiSuccess();
+		adminToast('Admin Panel', 'Panel refreshed.');
+	};
+
+	window.adminSyncDatabase = async function() {
+		if (!adminGuard()) return;
+		if (window.__adminSyncDatabaseInFlight) {
+			adminToast('Database Sync', 'A database sync is already running.');
+			return false;
+		}
+		window.__adminSyncDatabaseInFlight = true;
+		adminToast('Database Sync', 'Syncing database and indexes...');
 		try {
-			if (typeof fetchDatabase === 'function') await fetchDatabase();
-			else if (typeof clearAppCache === 'function') clearAppCache();
-			adminAddLog('content', 'Reloaded database/cache');
-			if (typeof playUiSuccess === 'function') playUiSuccess();
+			const ok = typeof clearAppCache === 'function' ? await clearAppCache() : false;
 			renderAdminPanel();
+			if (ok === false) {
+				if (typeof playUiError === 'function') playUiError();
+				adminToast('Database Sync', 'Database sync failed. Check the console for details.');
+				return false;
+			}
+			adminAddLog('content', 'Synced database/cache');
+			adminToast('Database Sync', 'Database and indexes updated.');
+			return true;
 		} catch (err) {
-			console.error('Admin DB reload failed:', err);
+			console.error('Admin DB sync failed:', err);
 			if (typeof playUiError === 'function') playUiError();
-			alert('Database reload failed. Check console.');
+			adminToast('Database Sync', 'Database sync failed. Check the console for details.');
+			return false;
+		} finally {
+			window.__adminSyncDatabaseInFlight = false;
 		}
 	};
 
-	window.adminClearCoverCache = function() {
+	window.adminReloadDatabase = async function() {
 		if (!adminGuard()) return;
+		if (window.__adminReloadDatabaseInFlight) {
+			adminToast('Database', 'Database reload is already running.');
+			return false;
+		}
+		window.__adminReloadDatabaseInFlight = true;
+		adminToast('Database', 'Reloading database...');
 		try {
+			if (typeof fetchDatabase === 'function') await fetchDatabase();
+			else if (typeof clearAppCache === 'function') {
+				const ok = await clearAppCache();
+				if (ok === false) throw new Error('Database cache reload failed.');
+			} else throw new Error('No database reload function is available.');
+			adminAddLog('content', 'Reloaded database/cache');
+			if (typeof playUiSuccess === 'function') playUiSuccess();
+			adminToast('Database', 'Database reloaded.');
+			renderAdminPanel();
+			return true;
+		} catch (err) {
+			console.error('Admin DB reload failed:', err);
+			if (typeof playUiError === 'function') playUiError();
+			adminToast('Database', 'Database reload failed. Check the console for details.');
+			return false;
+		} finally {
+			window.__adminReloadDatabaseInFlight = false;
+		}
+	};
+
+	window.adminClearCoverCache = async function() {
+		if (!adminGuard()) return;
+		if (window.__adminCoverCacheClearInFlight) {
+			adminToast('Cover Cache', 'Cover cache cleanup is already running.');
+			return false;
+		}
+		window.__adminCoverCacheClearInFlight = true;
+		adminToast('Cover Cache', 'Clearing resolved covers and reloading indexes...');
+		try {
+			const resolvedCount = Object.keys(window.__cardCoverSrcCache || {}).length;
+			const libraryCount = Object.keys(window.libCoverCache || {}).length;
+			clearTimeout(window.__cardCoverSrcCacheSaveTimer);
+			window.__cardCoverSrcCacheSaveTimer = null;
+			window.__cardCoverSrcCache = {};
+
+			// Remove every persisted version, not just the currently active one.
+			for (let i = localStorage.length - 1; i >= 0; i--) {
+				const key = localStorage.key(i);
+				if (key && /^psn_card_cover_src_cache_v\d+$/i.test(key)) localStorage.removeItem(key);
+			}
+
+			// My Games / Favorites keep a separate in-memory resolution cache.
+			if (window.libCoverCache && typeof window.libCoverCache === 'object') {
+				Object.keys(window.libCoverCache).forEach(key => delete window.libCoverCache[key]);
+			}
+
+			// Existing DOM nodes may carry completed fallback attempts. Clear those markers so
+			// the next render/load is allowed to resolve covers again from the beginning.
+			document.querySelectorAll('[data-cover-key], [data-lib-path]').forEach(node => {
+				['data-psn-store-tried','data-sony-icon-tried','data-github-cover-tried','data-library-github-tried','data-library-webman-tried','data-bing-tried','data-bing-cover-tried','data-online-cover-tried'].forEach(attr => node.removeAttribute(attr));
+			});
+
 			if (typeof sysData !== 'undefined') {
 				sysData.coversLoaded = false;
 				if (sysData.covers && typeof sysData.covers.clear === 'function') sysData.covers.clear();
 				if (sysData.noCovers && typeof sysData.noCovers.clear === 'function') sysData.noCovers.clear();
 			}
-			if (typeof loadBackgroundIndexes === 'function') loadBackgroundIndexes();
-			adminAddLog('content', 'Cleared cover index cache');
+
+			if (typeof loadBackgroundIndexes === 'function') await loadBackgroundIndexes('high', { forceRefresh: true });
+			adminAddLog('content', 'Cleared resolved cover cache and reloaded cover indexes');
 			if (typeof playUiSuccess === 'function') playUiSuccess();
+			const clearedCount = resolvedCount + libraryCount;
+			adminToast('Cover Cache', `${clearedCount} cached cover resolution${clearedCount === 1 ? '' : 's'} cleared. Cover indexes reloaded.`);
 			renderAdminPanel();
+			return true;
 		} catch (err) {
 			console.error('Cover cache reset failed:', err);
 			if (typeof playUiError === 'function') playUiError();
+			adminToast('Cover Cache', 'Could not clear the cover cache. Check the console for details.');
+			return false;
+		} finally {
+			window.__adminCoverCacheClearInFlight = false;
 		}
 	};
 
@@ -38836,6 +38945,7 @@ P
 		if (!adminGuard()) return;
 		adminDownloadJson(`psn-admin-users-${new Date().toISOString().replace(/[:.]/g, '-')}.json`, adminGetAllKnownUsers());
 		adminAddLog('export', 'Exported users list');
+		adminToast('Export Users', 'Users list exported.');
 	};
 
 	window.adminExportSettings = function() {
@@ -38850,6 +38960,7 @@ P
 		};
 		adminDownloadJson(`psn-admin-settings-${new Date().toISOString().replace(/[:.]/g, '-')}.json`, data);
 		adminAddLog('export', 'Exported admin settings');
+		adminToast('Export Settings', 'Admin settings exported.');
 	};
 
 	let adminReportsFallbackRaw = null;
@@ -38916,9 +39027,17 @@ P
 			if (response.unchanged === true) {
 				if (typeof window.updateContentMetadataOverridesSyncMeta === 'function') window.updateContentMetadataOverridesSyncMeta(response);
 				window.adminMetadataOverridesLastSyncAt = Date.now();
+				if (!silent) {
+					if (typeof playUiSuccess === 'function') playUiSuccess();
+					adminToast('Metadata Corrections', 'Corrections are already up to date.');
+				}
 				return;
 			}
 			adminSetMetadataOverrides(response.overrides || [], response);
+			if (!silent) {
+				if (typeof playUiSuccess === 'function') playUiSuccess();
+				adminToast('Metadata Corrections', 'Corrections refreshed.');
+			}
 		});
 	};
 
@@ -39593,18 +39712,27 @@ P
 		if (!adminGuard(!silent)) return;
 		if (silent && Date.now() - Number(window.adminContentReportsLastSyncAt || 0) < 30000) return true;
 		if (typeof socketChat === 'undefined' || !socketChat || !socketChat.connected) {
-			if (!silent && typeof playUiError === 'function') playUiError();
+			if (!silent) {
+				if (typeof playUiError === 'function') playUiError();
+				adminToast('Store Reports', 'Socket is offline. Showing the last synced reports.');
+			}
 			return;
 		}
 		socketChat.emit('admin_request_content_reports', { callbackOnly: true }, response => {
 			if (!response || response.success !== true) {
-				if (!silent && typeof playUiError === 'function') playUiError();
+				if (!silent) {
+					if (typeof playUiError === 'function') playUiError();
+					adminToast('Store Reports', response?.message || 'Could not refresh Store reports.');
+				}
 				return;
 			}
 			if (Array.isArray(response.reports)) adminSetContentReports(response.reports);
 			if (Array.isArray(response.blockedContent)) adminSetContentBlocks(response.blockedContent);
 			if (document.getElementById('view-admin')?.style.display === 'block') adminRenderContentReportPanels();
-			if (!silent && typeof playUiSuccess === 'function') playUiSuccess();
+			if (!silent) {
+				if (typeof playUiSuccess === 'function') playUiSuccess();
+				adminToast('Store Reports', 'Store reports refreshed.');
+			}
 		});
 	};
 
@@ -39725,12 +39853,18 @@ P
 		window.adminLastReportsRequestAt = Date.now();
 		socketChat.emit('admin_request_reports', { callbackOnly: true }, response => {
 			if (!response || response.success !== true) {
-				if (!silent && typeof playUiError === 'function') playUiError();
+				if (!silent) {
+					if (typeof playUiError === 'function') playUiError();
+					adminToast('Report Center', response?.message || 'Could not refresh reports.');
+				}
 				return;
 			}
 			if (Array.isArray(response.reports)) adminSetReports(response.reports);
 			if (document.getElementById('view-admin')?.style.display === 'block') adminRenderMessageReportCenter();
-			if (!silent && typeof playUiSuccess === 'function') playUiSuccess();
+			if (!silent) {
+				if (typeof playUiSuccess === 'function') playUiSuccess();
+				adminToast('Report Center', 'Reports refreshed.');
+			}
 		});
 		return true;
 	};
@@ -39749,6 +39883,7 @@ P
 		socketChat.emit('admin_clear_reports', {}, response => {
 			if (response && response.success === true) {
 				if (typeof playUiRemove === 'function') playUiRemove();
+				adminToast('Report Center', 'Pending reports cleared.');
 				return;
 			}
 			adminSetReports(previousReports);
@@ -39893,7 +40028,10 @@ P
 				});
 			} catch (e) {}
 		}
-		if (playSound && typeof playUiSuccess === 'function') playUiSuccess();
+		if (playSound) {
+			if (typeof playUiSuccess === 'function') playUiSuccess();
+			adminToast('System Health', 'Health status refreshed.');
+		}
 		if (renderPanel && healthChanged && document.getElementById('view-admin')?.style.display === 'block') {
 			adminRenderConnectionPill();
 			adminRenderHealthCard();
@@ -42251,7 +42389,7 @@ P
 
 	async function clearAppCache() {
 		const btn = document.getElementById('btn-sync-db');
-		if (!btn) return;
+		if (!btn) return false;
 		const originalHTML = btn.innerHTML;
 	
 		btn.disabled = true;
@@ -42319,6 +42457,7 @@ P
 				btn.style.borderColor = '';
 				btn.style.color = '';
 			}, 3000);
+			return true;
 	
 		} catch (e) {
 			console.error("Sync Error:", e);
@@ -42327,6 +42466,7 @@ P
 				btn.disabled = false;
 				btn.innerHTML = originalHTML;
 			}, 3000);
+			return false;
 		}
 	}
 	
