@@ -2416,6 +2416,8 @@ body.is-admin #btn-toolbar-cmd, body.is-mod #btn-toolbar-cmd { display: flex !im
 .play-together-social-item .play-together-social-meta-row { margin-top:4px; display:flex; align-items:center; gap:7px; min-width:0; color:var(--text-muted); font-size:10px; white-space:nowrap; }
 .play-together-social-item .play-together-social-status { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .play-together-social-item .play-together-social-pill { flex:0 0 auto; display:inline-flex; align-items:center; justify-content:center; height:17px; padding:0 7px; border-radius:999px; border:1px solid rgba(0,212,154,.22); background:rgba(0,212,154,.08); color:#00d49a; font-size:8px; font-weight:900; letter-spacing:.3px; text-transform:uppercase; box-shadow:inset 0 1px 0 rgba(255,255,255,.05); }
+.play-together-social-item .play-together-social-pill.is-actionable { cursor:pointer; pointer-events:auto; }
+.play-together-social-item .play-together-social-pill.is-actionable:is(.psn-primary-pressed,.mobile-pressed) { transform:translateY(1px) scale(.94); filter:brightness(.84); box-shadow:inset 0 2px 5px rgba(0,0,0,.34); transition-duration:.06s; }
 .play-together-social-disable-btn { flex:0 0 auto; display:inline-flex; align-items:center; justify-content:center; gap:5px; min-width:62px; height:27px; padding:0 8px; border:1px solid rgba(255,68,68,.30); border-radius:8px; background:rgba(255,68,68,.075); color:#ff7474; font:inherit; font-size:8px; font-weight:900; letter-spacing:.55px; line-height:1; text-transform:uppercase; cursor:pointer; box-shadow:inset 0 1px 0 rgba(255,255,255,.035); transition:background .18s ease,border-color .18s ease,color .18s ease,transform .08s ease,opacity .18s ease; }
 .play-together-social-disable-btn:hover { background:rgba(255,68,68,.14); border-color:rgba(255,68,68,.58); color:#ff9696; }
 .play-together-social-disable-btn:active { transform:scale(.96); }
@@ -29399,6 +29401,77 @@ P
         return { statusText, pillText, pillValue };
     }
 
+    window.openPlayTogetherPlayersFromSocial = function(rawTitleId, gameTitle = '') {
+        const titleId = normalizeGamePlayersTitleId(rawTitleId);
+        if (!titleId) return;
+        if (typeof playUiClick === 'function') playUiClick();
+
+        const cached = getGamePlayersSummaryCacheEntry(titleId);
+        const cachedSummary = cached && cached.summary ? cached.summary : null;
+        if (cachedSummary && (Number(cachedSummary.count) > 0 || Number(cachedSummary.playTogetherCount) > 0)) {
+            window.openGamePlayersModal(titleId, String(gameTitle || '').trim() || titleId, cachedSummary);
+            return;
+        }
+
+        window.__playTogetherSocialPlayerOpenPending = window.__playTogetherSocialPlayerOpenPending instanceof Set
+            ? window.__playTogetherSocialPlayerOpenPending
+            : new Set();
+        if (window.__playTogetherSocialPlayerOpenPending.has(titleId)) return;
+        window.__playTogetherSocialPlayerOpenPending.add(titleId);
+
+        requestGamePlayers({ mode: 'summary', titleId }, response => {
+            window.__playTogetherSocialPlayerOpenPending.delete(titleId);
+            if (!response || response.ok !== true || normalizeGamePlayersTitleId(response.titleId) !== titleId) {
+                if (typeof playUiError === 'function') playUiError();
+                return;
+            }
+            const summary = normalizeGamePlayersMutationSummary(response);
+            setGamePlayersSummaryCacheEntry(titleId, summary);
+            if (Number(summary.count) <= 0 && Number(summary.playTogetherCount) <= 0) {
+                if (typeof playUiError === 'function') playUiError();
+                return;
+            }
+            window.openGamePlayersModal(titleId, String(gameTitle || '').trim() || titleId, summary);
+        });
+    };
+
+    function handlePlayTogetherSocialPillClick(event) {
+        if (event) {
+            event.preventDefault();
+            event.stopPropagation();
+        }
+        window.openPlayTogetherPlayersFromSocial(this.dataset.playTogetherTitleId || '', this.dataset.playTogetherTitle || '');
+    }
+
+    function handlePlayTogetherSocialPillKeydown(event) {
+        if (!event || (event.key !== 'Enter' && event.key !== ' ')) return;
+        handlePlayTogetherSocialPillClick.call(this, event);
+    }
+
+    function syncPlayTogetherSocialPillAction(pill, entry, presentation) {
+        if (!pill) return;
+        const actionable = presentation && presentation.pillValue !== null;
+        if (!actionable) {
+            pill.classList.remove('is-actionable');
+            pill.removeAttribute('role');
+            pill.removeAttribute('tabindex');
+            pill.removeAttribute('title');
+            delete pill.dataset.playTogetherTitleId;
+            delete pill.dataset.playTogetherTitle;
+            pill.onclick = null;
+            pill.onkeydown = null;
+            return;
+        }
+        pill.classList.add('is-actionable');
+        pill.setAttribute('role', 'button');
+        pill.tabIndex = 0;
+        pill.title = 'View Play Together players';
+        pill.dataset.playTogetherTitleId = String(entry && entry.id || '');
+        pill.dataset.playTogetherTitle = String(entry && entry.title || '');
+        pill.onclick = handlePlayTogetherSocialPillClick;
+        pill.onkeydown = handlePlayTogetherSocialPillKeydown;
+    }
+
     window.renderPlayTogetherSocialPanel = function(isSilent = false) {
         const list = document.getElementById('social-play-together-list');
         const loading = document.getElementById('social-play-together-loading');
@@ -29547,6 +29620,7 @@ P
                 pill.dataset.liveCountOwner = `play-together-social:${filter}:${entry.id}`;
                 pill.dataset.liveCountInitialized = '1';
             }
+            syncPlayTogetherSocialPillAction(pill, entry, presentation);
         });
 
         Array.from(list.querySelectorAll(':scope > .play-together-social-item[data-play-together-title-id]')).forEach(row => {
