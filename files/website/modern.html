@@ -3677,7 +3677,9 @@ body.admin-maintenance-reveal-pending #user-select-screen, body.admin-maintenanc
 .license-pack-catalog-row + .license-pack-catalog-row { margin-top: 3px; }
 .license-pack-catalog-row:is(:hover,.psn-hover-stable) { background: rgba(0,112,204,.12); border-color: rgba(0,188,255,.16); }
 .license-pack-catalog-main { min-width: 0; }
-.license-pack-catalog-name { color: #fff; font-size: 12px; font-weight: 800; line-height: 1.25; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.license-pack-catalog-name { display: block; width: 100%; max-width: 100%; margin: 0; padding: 0; border: 0; background: transparent; color: #fff; font-family: inherit; font-size: 12px; font-weight: 800; line-height: 1.25; text-align: left; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; cursor: pointer; appearance: none; -webkit-appearance: none; transition: color .18s ease,text-decoration-color .18s ease; }
+.license-pack-catalog-name:is(:hover,.psn-hover-stable) { color: #dff5ff; text-decoration: underline; text-decoration-color: rgba(0,188,255,.65); text-underline-offset: 2px; }
+.license-pack-catalog-name:focus-visible { outline: 1px solid rgba(0,188,255,.55); outline-offset: 3px; border-radius: 3px; }
 .license-pack-catalog-meta { display: flex; align-items: center; gap: 7px; min-width: 0; margin-top: 5px; color: rgba(255,255,255,.42); font-size: 9.5px; font-weight: 750; white-space: nowrap; overflow: hidden; }
 .license-pack-catalog-type { flex: 0 0 auto; color: rgba(0,212,255,.72); font-weight: 900; letter-spacing: .2px; }
 .license-pack-catalog-id { min-width: 0; color: rgba(255,255,255,.68); font-weight: 900; letter-spacing: .35px; overflow: hidden; text-overflow: ellipsis; }
@@ -9192,15 +9194,8 @@ P
 						<input id="license-pack-catalog-search" class="country-picker-search" type="search" inputmode="search" placeholder="Search name or ID" autocomplete="off" oninput="scheduleLicensePackCatalogFilter()" onfocus="if(typeof playUiTextField === 'function') playUiTextField()" onblur="if(typeof playUiBack === 'function') playUiBack()" onkeydown="if(typeof handleCountrySearchKeySound === 'function') handleCountrySearchKeySound(event)">
 						<button type="button" class="country-picker-search-clear" data-haptic="light" aria-label="Clear content search" title="Clear search" onclick="clearLicensePackCatalogSearch(event)"><i class="fas fa-times-circle" aria-hidden="true"></i></button>
 					</div>
-					<select id="license-pack-catalog-type" class="license-pack-catalog-filter" aria-label="Filter content type" onchange="filterLicensePackCatalog(); if(typeof playUiClick==='function') playUiClick()">
+					<select id="license-pack-catalog-category" class="license-pack-catalog-filter" aria-label="Filter Browse category" onchange="filterLicensePackCatalog(); if(typeof playUiClick==='function') playUiClick()">
 						<option value="all">All Content</option>
-						<option value="game">Games</option>
-						<option value="dlc">DLCs</option>
-						<option value="theme">Themes</option>
-						<option value="avatar">Avatars</option>
-						<option value="demo">Demos</option>
-						<option value="psp-game">PSP Games</option>
-						<option value="psp-dlc">PSP DLCs</option>
 					</select>
 				</div>
 				<div id="license-pack-catalog-list" class="license-pack-catalog-list" role="list"></div>
@@ -17669,6 +17664,60 @@ P
             return 'missing';
         }
 
+        const LICENSE_PACK_BROWSE_CATEGORY_ORDER = ['apps', 'avatars', 'demos', 'dlcs', 'games', 'guides', 'soundtracks', 'videos', 'themes'];
+        const LICENSE_PACK_BROWSE_CATEGORY_LABELS = {
+            apps: 'Apps', avatars: 'Avatars', demos: 'Demos', dlcs: 'DLCs', games: 'Games',
+            guides: 'Guides', soundtracks: 'Soundtracks', videos: 'Videos', themes: 'Themes'
+        };
+
+        function resolveLicensePackBrowseCategory(entry) {
+            const type = String(entry?.type || '').trim().toLowerCase();
+            const name = String(entry?.name || '').trim();
+            const titleId = String(entry?.titleId || '').trim().toUpperCase();
+            const contentId = String(entry?.contentId || '').trim();
+
+            if (type === 'dlc' || type === 'psp-dlc') return 'dlcs';
+            if (type === 'theme') return 'themes';
+            if (type === 'avatar') return 'avatars';
+            if (type === 'demo') {
+                return (typeof isTrialToFullTitle === 'function' && isTrialToFullTitle(name)) ? 'games' : 'demos';
+            }
+            if (type === 'psp-game') return 'games';
+
+            // PS3_GAMES.tsv feeds several Browse categories. Reuse the same classifiers already used by Browse.
+            if (/\b(?:guidebook|guide|play\s*view)\b/i.test(name)) return 'guides';
+            if (typeof isPsnSoundtrackTitle === 'function' && isPsnSoundtrackTitle(name)) return 'soundtracks';
+            if (typeof isPsnVideoItem === 'function' && isPsnVideoItem(name, contentId, titleId)) return 'videos';
+            if (typeof isDemoLikeTitle === 'function' && isDemoLikeTitle(name)) return 'demos';
+
+            const upperName = name.toUpperCase();
+            const appTag = (upperName.includes('FIRSTPLAY') || upperName.includes('FIRST PLAY'))
+                ? 'firstplay'
+                : (upperName.includes('QORE') ? 'qore' : 'media');
+            const knownAppId = typeof DICT_APPS_FILTER !== 'undefined' && DICT_APPS_FILTER[titleId] === 1;
+            if (knownAppId || appTag !== 'media') return 'apps';
+
+            return 'games';
+        }
+
+        function getLicensePackBrowseCategoryLabel(category) {
+            return LICENSE_PACK_BROWSE_CATEGORY_LABELS[category] || 'Content';
+        }
+
+        function syncLicensePackCatalogCategoryOptions(rows) {
+            const select = document.getElementById('license-pack-catalog-category');
+            if (!select) return;
+            const previous = String(select.value || 'all');
+            const available = new Set((Array.isArray(rows) ? rows : []).map(item => item?.browseCategory).filter(Boolean));
+            const options = ['<option value="all">All Content</option>'];
+            for (const category of LICENSE_PACK_BROWSE_CATEGORY_ORDER) {
+                if (!available.has(category)) continue;
+                options.push(`<option value="${category}">${getLicensePackBrowseCategoryLabel(category)}</option>`);
+            }
+            select.innerHTML = options.join('');
+            select.value = available.has(previous) ? previous : 'all';
+        }
+
         function normalizeLicensePackCatalogEntry(item) {
             if (!item || typeof item !== 'object') return null;
             const name = String(item.name ?? item.n ?? item.Name ?? '').trim();
@@ -17685,7 +17734,8 @@ P
             if (!name && !titleId && !contentId) return null;
             const displayId = titleId || contentId || '—';
             const entry = { name, titleId, contentId, displayId, region, type, typeLabel, platform, pending, status, licenseFile };
-            entry.search = normalizeLicensePackSearchText(`${name} ${titleId} ${contentId} ${region} ${type} ${typeLabel} ${platform}`);
+            entry.browseCategory = resolveLicensePackBrowseCategory(entry);
+            entry.search = normalizeLicensePackSearchText(`${name} ${titleId} ${contentId} ${region} ${type} ${typeLabel} ${platform} ${entry.browseCategory} ${getLicensePackBrowseCategoryLabel(entry.browseCategory)}`);
             return entry;
         }
 
@@ -17707,6 +17757,7 @@ P
                     const rows = sourceRows.map(normalizeLicensePackCatalogEntry).filter(Boolean);
                     if (!rows.length) throw new Error('License catalog is empty');
                     licensePackCatalog = rows;
+                    syncLicensePackCatalogCategoryOptions(rows);
                     return rows;
                 } finally {
                     clearTimeout(timeoutId);
@@ -17724,13 +17775,8 @@ P
             }
         }
 
-        function getLicensePackCatalogTypeLabel(item) {
-            if (item.typeLabel) return item.typeLabel;
-            const labels = {
-                'game': 'Games', 'dlc': 'DLCs', 'theme': 'Themes', 'avatar': 'Avatars', 'demo': 'Demos',
-                'psp-game': 'PSP Games', 'psp-dlc': 'PSP DLCs'
-            };
-            return labels[item.type] || item.platform || 'Content';
+        function getLicensePackCatalogCategoryLabel(item) {
+            return getLicensePackBrowseCategoryLabel(item?.browseCategory);
         }
 
         function escapeLicensePackHtml(value) {
@@ -17787,6 +17833,23 @@ P
         }
         window.downloadLicensePackItemLicense = downloadLicensePackItemLicense;
 
+        function openLicensePackCatalogItemInBrowse(button, event) {
+            if (event) { event.preventDefault(); event.stopPropagation(); }
+            const category = String(button?.dataset?.browseCategory || 'games').trim() || 'games';
+            const titleId = String(button?.dataset?.titleId || '').trim();
+            const contentId = String(button?.dataset?.contentId || '').trim();
+            const name = String(button?.dataset?.contentName || '').trim();
+            const searchTerm = titleId || name || contentId;
+            if (!searchTerm || typeof window.switchAndSearch !== 'function') return;
+
+            if (typeof playUiClick === 'function') playUiClick();
+            closeLicensePackCatalogModal();
+            requestAnimationFrame(() => {
+                window.switchAndSearch(category, searchTerm, false, contentId);
+            });
+        }
+        window.openLicensePackCatalogItemInBrowse = openLicensePackCatalogItemInBrowse;
+
         function appendLicensePackCatalogRows(reset = false) {
             const list = document.getElementById('license-pack-catalog-list');
             if (!list) return;
@@ -17803,15 +17866,15 @@ P
             for (let i = licensePackCatalogRendered; i < end; i++) {
                 const item = licensePackCatalogFiltered[i];
                 const meta = getLicensePackCatalogStatusMeta(item.status);
-                const typeLabel = getLicensePackCatalogTypeLabel(item);
+                const categoryLabel = getLicensePackCatalogCategoryLabel(item);
                 const statusControl = item.status === 'available' && item.licenseFile
                     ? `<button type="button" class="license-pack-catalog-status available is-downloadable" data-license-file="${escapeLicensePackHtml(item.licenseFile)}" title="Download license" aria-label="Download license for ${escapeLicensePackHtml(item.name || item.displayId)}" onmouseenter="if(typeof playUiHover==='function') playUiHover()" onclick="downloadLicensePackItemLicense(this,event)"><i class="fas ${meta.icon}"></i>${meta.label}</button>`
                     : `<span class="license-pack-catalog-status ${meta.cls}"><i class="fas ${meta.icon}"></i>${meta.label}</span>`;
                 html += `<div class="license-pack-catalog-row" role="listitem" onmouseenter="if(typeof playUiHover==='function') playUiHover()">
                     <div class="license-pack-catalog-main">
-                        <div class="license-pack-catalog-name" title="${escapeLicensePackHtml(item.name)}">${escapeLicensePackHtml(item.name || item.displayId)}</div>
+                        <button type="button" class="license-pack-catalog-name" title="Open in Browse" data-browse-category="${escapeLicensePackHtml(item.browseCategory)}" data-title-id="${escapeLicensePackHtml(item.titleId)}" data-content-id="${escapeLicensePackHtml(item.contentId)}" data-content-name="${escapeLicensePackHtml(item.name)}" onclick="openLicensePackCatalogItemInBrowse(this,event)">${escapeLicensePackHtml(item.name || item.displayId)}</button>
                         <div class="license-pack-catalog-meta">
-                            <span class="license-pack-catalog-type">${escapeLicensePackHtml(typeLabel)}</span>
+                            <span class="license-pack-catalog-type">${escapeLicensePackHtml(categoryLabel)}</span>
                             <span class="license-pack-catalog-id" title="${escapeLicensePackHtml(item.contentId || item.displayId)}">${escapeLicensePackHtml(item.displayId)}</span>
                             ${item.region ? `<span class="license-pack-catalog-region">${escapeLicensePackHtml(item.region)}</span>` : ''}
                             ${item.pending ? '<span class="license-pack-catalog-pending">Pending</span>' : ''}
@@ -17845,12 +17908,12 @@ P
             }
             if (!licensePackCatalog) return;
             const search = document.getElementById('license-pack-catalog-search');
-            const typeSelect = document.getElementById('license-pack-catalog-type');
+            const categorySelect = document.getElementById('license-pack-catalog-category');
             const list = document.getElementById('license-pack-catalog-list');
             const query = normalizeLicensePackSearchText(search ? search.value : '');
-            const type = String(typeSelect ? typeSelect.value : 'all');
+            const category = String(categorySelect ? categorySelect.value : 'all');
             const scopedRows = licensePackCatalog.filter(item => {
-                if (type !== 'all' && item.type !== type) return false;
+                if (category !== 'all' && item.browseCategory !== category) return false;
                 return !query || item.search.includes(query);
             });
             updateLicensePackCatalogSummary(scopedRows);
@@ -17889,10 +17952,10 @@ P
             }
             const modal = document.getElementById('license-pack-catalog-modal');
             const search = document.getElementById('license-pack-catalog-search');
-            const typeSelect = document.getElementById('license-pack-catalog-type');
+            const categorySelect = document.getElementById('license-pack-catalog-category');
             const list = document.getElementById('license-pack-catalog-list');
             if (search) search.value = '';
-            if (typeSelect) typeSelect.value = 'all';
+            if (categorySelect) categorySelect.value = 'all';
             licensePackCatalogStatusFilter = 'available';
             if (licensePackCatalog) licensePackCatalogFiltered = licensePackCatalog.filter(item => item.status === 'available');
             licensePackCatalogRendered = 0;
@@ -17913,7 +17976,6 @@ P
             const modal = document.getElementById('license-pack-catalog-modal');
             const list = document.getElementById('license-pack-catalog-list');
             const search = document.getElementById('license-pack-catalog-search');
-            const typeSelect = document.getElementById('license-pack-catalog-type');
             if (!modal || !list) return;
 
             const openToken = ++licensePackCatalogOpenToken;
@@ -17927,6 +17989,7 @@ P
 
             const summary = document.getElementById('license-pack-catalog-summary');
             if (licensePackCatalog) {
+                syncLicensePackCatalogCategoryOptions(licensePackCatalog);
                 filterLicensePackCatalog();
                 requestAnimationFrame(() => { if (list) list.scrollTop = 0; });
                 if (window.matchMedia && window.matchMedia('(pointer:fine)').matches && search) {
