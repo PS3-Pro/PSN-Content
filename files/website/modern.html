@@ -3684,6 +3684,7 @@ body.admin-maintenance-reveal-pending #user-select-screen, body.admin-maintenanc
 .license-pack-catalog-type { flex: 0 0 auto; color: rgba(0,212,255,.72); font-weight: 900; letter-spacing: .2px; }
 .license-pack-catalog-id { min-width: 0; color: rgba(255,255,255,.68); font-weight: 900; letter-spacing: .35px; overflow: hidden; text-overflow: ellipsis; }
 .license-pack-catalog-region { flex: 0 0 auto; color: rgba(255,255,255,.42); }
+.license-pack-catalog-pending { display: none !important; }
 .license-pack-catalog-status { flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center; gap: 6px; min-height: 25px; padding: 0 9px; border-radius: 999px; border: 1px solid rgba(255,255,255,.12); background: rgba(255,255,255,.05); color: rgba(255,255,255,.72); font-family: inherit; font-size: 8.5px; font-weight: 950; letter-spacing: .55px; line-height: 1; text-transform: uppercase; white-space: nowrap; appearance: none; -webkit-appearance: none; }
 .license-pack-catalog-status.available { color: #aaf2be; background: rgba(76,175,80,.10); border-color: rgba(76,175,80,.28); }
 .license-pack-catalog-status.available.is-downloadable { cursor: pointer; transition: transform .16s ease,background .2s ease,border-color .2s ease,box-shadow .2s ease,color .2s ease,filter .16s ease; }
@@ -17718,9 +17719,46 @@ P
         }
 
         function repairLicensePackCatalogText(value) {
-            return String(value || '')
-                .replace(/â„¢/g, '™')
+            let text = String(value || '').trim();
+            if (!text) return '';
+
+            text = text
                 .replace(/Γäó/g, '™')
+                .replace(/ΓÇô/g, '–')
+                .replace(/ΓÇö/g, '—')
+                .replace(/ΓÇÖ/g, '’');
+
+            const cp1252Bytes = {
+                '€':0x80,'‚':0x82,'ƒ':0x83,'„':0x84,'…':0x85,'†':0x86,'‡':0x87,
+                'ˆ':0x88,'‰':0x89,'Š':0x8A,'‹':0x8B,'Œ':0x8C,'Ž':0x8E,
+                '‘':0x91,'’':0x92,'“':0x93,'”':0x94,'•':0x95,'–':0x96,'—':0x97,
+                '˜':0x98,'™':0x99,'š':0x9A,'›':0x9B,'œ':0x9C,'ž':0x9E,'Ÿ':0x9F
+            };
+            const decodeMojibakePass = input => {
+                if (!/[ÃÂâð]/.test(input)) return input;
+                const bytes = [];
+                for (const ch of input) {
+                    const code = ch.charCodeAt(0);
+                    if (code <= 0xFF) bytes.push(code);
+                    else if (Object.prototype.hasOwnProperty.call(cp1252Bytes, ch)) bytes.push(cp1252Bytes[ch]);
+                    else return input;
+                }
+                try {
+                    const encoded = bytes.map(byte => '%' + byte.toString(16).padStart(2, '0')).join('');
+                    return decodeURIComponent(encoded);
+                } catch (e) {
+                    return input;
+                }
+            };
+
+            for (let pass = 0; pass < 2; pass++) {
+                const repaired = decodeMojibakePass(text);
+                if (repaired === text) break;
+                text = repaired;
+            }
+
+            return text
+                .replace(/â„¢/g, '™')
                 .replace(/â€“/g, '–')
                 .replace(/â€”/g, '—')
                 .replace(/â€™/g, '’')
@@ -17755,7 +17793,8 @@ P
                 const controller = typeof AbortController === 'function' ? new AbortController() : null;
                 const timeoutId = setTimeout(() => { if (controller) controller.abort(); }, 12000);
                 try {
-                    const response = await fetch(LICENSE_PACK_CATALOG_URL, {
+                    const catalogRequestUrl = `${LICENSE_PACK_CATALOG_URL}${LICENSE_PACK_CATALOG_URL.includes('?') ? '&' : '?'}v=${Date.now()}`;
+                    const response = await fetch(catalogRequestUrl, {
                         cache: 'no-store',
                         signal: controller ? controller.signal : undefined
                     });
