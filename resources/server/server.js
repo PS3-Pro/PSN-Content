@@ -4011,12 +4011,11 @@ function normalizeContentMetadataOverride(data = {}) {
     year,
     genres: normalizeContentMetadataList(data.genres, 8, 60),
     tags: normalizeContentMetadataList(data.tags, 16, 60),
-    cast: normalizeContentMetadataList(data.cast, 20, 90),
     director: normalizeContentMetadataString(data.director, 160).replace(/[\r\n\t]+/g, ' '),
     updatedBy: normalizeText(data.updatedBy || data.updated_by, '').slice(0, 120),
     updatedAt: data.updatedAt || data.updated_at || new Date().toISOString()
   };
-  entry.hasValues = !!(entry.title || entry.summary || entry.coverUrl || entry.score !== null || entry.year || entry.genres.length || entry.tags.length || entry.cast.length || entry.director);
+  entry.hasValues = !!(entry.title || entry.summary || entry.coverUrl || entry.score !== null || entry.year || entry.genres.length || entry.tags.length || entry.director);
   const updatedAtMs = Date.parse(entry.updatedAt || '');
   Object.defineProperty(entry, '__metadataUpdatedAtMs', { value: Number.isFinite(updatedAtMs) ? updatedAtMs : 0, configurable: true });
   return entry;
@@ -4035,12 +4034,11 @@ function normalizeContentMetadataOverrideRow(row = {}) {
 }
 
 
-const CONTENT_METADATA_EDIT_FIELDS = Object.freeze(['title','coverUrl','summary','score','year','director','genres','tags','cast']);
+const CONTENT_METADATA_EDIT_FIELDS = Object.freeze(['title','coverUrl','summary','score','year','director','genres','tags']);
 
 function normalizeContentMetadataSuggestionField(field, rawValue, strict = false) {
   if (field === 'genres') return { ok: true, value: normalizeContentMetadataList(rawValue, 8, 60) };
   if (field === 'tags') return { ok: true, value: normalizeContentMetadataList(rawValue, 16, 60) };
-  if (field === 'cast') return { ok: true, value: normalizeContentMetadataList(rawValue, 20, 90) };
   if (field === 'score') {
     if (rawValue === '' || rawValue === null || rawValue === undefined) return { ok: true, value: '' };
     const number = Number(rawValue);
@@ -4215,8 +4213,7 @@ function contentMetadataOverrideEntryEquals(a, b) {
       || a.title !== b.title || a.summary !== b.summary || a.coverUrl !== b.coverUrl || a.score !== b.score || a.year !== b.year
       || a.director !== b.director || a.updatedBy !== b.updatedBy || a.updatedAt !== b.updatedAt) return false;
   return contentMetadataOverrideArrayEquals(a.genres, b.genres)
-      && contentMetadataOverrideArrayEquals(a.tags, b.tags)
-      && contentMetadataOverrideArrayEquals(a.cast, b.cast);
+      && contentMetadataOverrideArrayEquals(a.tags, b.tags);
 }
 
 function contentMetadataOverrideMapEquals(left, right) {
@@ -4325,7 +4322,6 @@ function toPublicContentMetadataOverride(entry) {
   if (entry.year) out.year = entry.year;
   if (Array.isArray(entry.genres) && entry.genres.length) out.genres = entry.genres;
   if (Array.isArray(entry.tags) && entry.tags.length) out.tags = entry.tags;
-  if (Array.isArray(entry.cast) && entry.cast.length) out.cast = entry.cast;
   if (entry.director) out.director = entry.director;
   if (entry.updatedBy) out.updatedBy = entry.updatedBy;
   try { Object.defineProperty(entry, '__publicContentMetadataOverride', { value: out, configurable: true }); } catch (e) {}
@@ -4350,7 +4346,7 @@ function getContentMetadataOverridesSyncMeta() {
 async function saveContentMetadataOverrideToDb(normalized, updatedBy, client = null) {
   const payload = {
     title: normalized.title, summary: normalized.summary, coverUrl: normalized.coverUrl, score: normalized.score, year: normalized.year,
-    genres: normalized.genres, tags: normalized.tags, cast: normalized.cast, director: normalized.director
+    genres: normalized.genres, tags: normalized.tags, director: normalized.director
   };
   const sql = `INSERT INTO content_metadata_overrides (metadata_key, category, title_id, content_id, data, updated_by, created_at, updated_at)
      VALUES ($1,$2,$3,$4,$5::jsonb,$6,NOW(),NOW())
