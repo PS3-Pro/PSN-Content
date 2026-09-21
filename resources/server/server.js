@@ -94,7 +94,8 @@ const ADMIN_STATE_KEYS = {
   reports: "reports",
   contentReports: "content_reports",
   contentBlocks: "content_blocks",
-  metadataOverrides: "content_metadata_overrides"
+  metadataOverrides: "content_metadata_overrides",
+  metadataSuggestions: "content_metadata_suggestions"
 };
 
 // ============================================================================
@@ -120,6 +121,8 @@ const CONTENT_REPORTS_PER_USER_MAX = 100;
 const CONTENT_REPORT_DETAILS_MAX = 1200;
 const CONTENT_REPORT_REPORTERS_PREVIEW_MAX = 100;
 const CONTENT_BLOCKS_MAX = 1000;
+const CONTENT_METADATA_SUGGESTIONS_MAX = 200;
+const CONTENT_METADATA_SUGGESTIONS_PER_USER_MAX = 50;
 
 const pgConnectionOptions = {
   connectionString: process.env.DATABASE_URL,
@@ -1523,6 +1526,22 @@ async function initDb() {
     );
     CREATE INDEX IF NOT EXISTS idx_content_metadata_overrides_title_id ON content_metadata_overrides(title_id);
     CREATE INDEX IF NOT EXISTS idx_content_metadata_overrides_updated_at ON content_metadata_overrides(updated_at DESC);
+    CREATE TABLE IF NOT EXISTS content_metadata_suggestions (
+      id BIGSERIAL PRIMARY KEY,
+      metadata_key TEXT NOT NULL,
+      category TEXT NOT NULL,
+      title_id TEXT NOT NULL,
+      content_id TEXT NOT NULL DEFAULT '',
+      content_name TEXT NOT NULL DEFAULT '',
+      base_data JSONB NOT NULL DEFAULT '{}'::jsonb,
+      data JSONB NOT NULL DEFAULT '{}'::jsonb,
+      changed_fields JSONB NOT NULL DEFAULT '[]'::jsonb,
+      submitted_by TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE(submitted_by, metadata_key)
+    );
+    CREATE INDEX IF NOT EXISTS idx_content_metadata_suggestions_updated_at ON content_metadata_suggestions(updated_at DESC);
     CREATE TABLE IF NOT EXISTS deleted_accounts (
       name TEXT PRIMARY KEY,
       data JSONB,
@@ -4015,6 +4034,165 @@ function normalizeContentMetadataOverrideRow(row = {}) {
   });
 }
 
+
+const CONTENT_METADATA_EDIT_FIELDS = Object.freeze(['title','coverUrl','summary','score','year','director','genres','tags','cast']);
+
+function normalizeContentMetadataSuggestionField(field, rawValue, strict = false) {
+  if (field === 'genres') return { ok: true, value: normalizeContentMetadataList(rawValue, 8, 60) };
+  if (field === 'tags') return { ok: true, value: normalizeContentMetadataList(rawValue, 16, 60) };
+  if (field === 'cast') return { ok: true, value: normalizeContentMetadataList(rawValue, 20, 90) };
+  if (field === 'score') {
+    if (rawValue === '' || rawValue === null || rawValue === undefined) return { ok: true, value: '' };
+    const number = Number(rawValue);
+    if (!Number.isFinite(number) || number < 0 || number > 100) return strict ? { ok: false, message: 'Score must be between 0 and 100.' } : { ok: true, value: '' };
+    return { ok: true, value: String(Math.round(number)) };
+  }
+  if (field === 'year') {
+    const value = normalizeContentMetadataString(rawValue, 4);
+    if (value && !/^(?:19|20)\d{2}$/.test(value)) return strict ? { ok: false, message: 'Year must be a four-digit year from 1900–2099.' } : { ok: true, value };
+    return { ok: true, value };
+  }
+  if (field === 'coverUrl') {
+    const value = normalizeContentMetadataString(rawValue, 1200);
+    if (value && !/^https?:\/\//i.test(value)) return strict ? { ok: false, message: 'Cover URL must start with http:// or https://.' } : { ok: true, value };
+    return { ok: true, value };
+  }
+  if (field === 'summary') return { ok: true, value: normalizeContentMetadataString(rawValue, 5000) };
+  if (field === 'title') return { ok: true, value: normalizeContentMetadataString(rawValue, 220).replace(/[\r\n\t]+/g, ' ') };
+  if (field === 'director') return { ok: true, value: normalizeContentMetadataString(rawValue, 160).replace(/[\r\n\t]+/g, ' ') };
+  return { ok: true, value: '' };
+}
+
+function contentMetadataSuggestionValueEquals(left, right) {
+  if (Array.isArray(left) || Array.isArray(right)) {
+    return Array.isArray(left) && Array.isArray(right) && left.length === right.length && left.every((value, index) => value === right[index]);
+  }
+  return String(left === undefined || left === null ? '' : left) === String(right === undefined || right === null ? '' : right);
+}
+
+function normalizeContentMetadataSuggestion(data = {}) {
+  const identity = normalizeStoreContentIdentity(data);
+  if (!identity.reportKey) return { error: 'Invalid Store content.' };
+  const rawChanges = data.changes && typeof data.changes === 'object' && !Array.isArray(data.changes) ? data.changes : {};
+  const rawBaseData = data.baseData && typeof data.baseData === 'object' && !Array.isArray(data.baseData) ? data.baseData : {};
+  const changes = {};
+  const baseData = {};
+  const changedFields = [];
+
+  for (const field of CONTENT_METADATA_EDIT_FIELDS) {
+    if (!Object.prototype.hasOwnProperty.call(rawChanges, field)) continue;
+    const next = normalizeContentMetadataSuggestionField(field, rawChanges[field], true);
+    if (!next.ok) return { error: next.message || `Invalid ${field}.` };
+    const previous = normalizeContentMetadataSuggestionField(field, rawBaseData[field], false);
+    if (contentMetadataSuggestionValueEquals(previous.value, next.value)) continue;
+    changes[field] = next.value;
+    baseData[field] = previous.value;
+    changedFields.push(field);
+  }
+
+  if (!changedFields.length) return { error: 'Change at least one metadata field before sending.' };
+  return {
+    metadataKey: identity.reportKey,
+    category: identity.category,
+    titleId: identity.titleId,
+    contentId: identity.contentId,
+    contentName: identity.name || normalizeContentMetadataString(data.contentName || data.name || data.title, 220),
+    changes,
+    baseData,
+    changedFields
+  };
+}
+
+function normalizeContentMetadataSuggestionRow(row = {}) {
+  const rawChanges = row.data && typeof row.data === 'object' && !Array.isArray(row.data) ? row.data : {};
+  const rawBaseData = row.base_data && typeof row.base_data === 'object' && !Array.isArray(row.base_data) ? row.base_data : {};
+  const rawFields = Array.isArray(row.changed_fields) ? row.changed_fields : [];
+  const changes = {};
+  const baseData = {};
+  const changedFields = [];
+  for (const field of CONTENT_METADATA_EDIT_FIELDS) {
+    if (!rawFields.includes(field) && !Object.prototype.hasOwnProperty.call(rawChanges, field)) continue;
+    const next = normalizeContentMetadataSuggestionField(field, rawChanges[field], false);
+    const previous = normalizeContentMetadataSuggestionField(field, rawBaseData[field], false);
+    if (contentMetadataSuggestionValueEquals(previous.value, next.value)) continue;
+    changes[field] = next.value;
+    baseData[field] = previous.value;
+    changedFields.push(field);
+  }
+  if (!changedFields.length) return null;
+  return {
+    id: Number(row.id) || 0,
+    metadataKey: normalizeText(row.metadata_key, ''),
+    category: normalizeStoreContentCategory(row.category),
+    titleId: normalizeStoreContentTitleId(row.title_id),
+    contentId: normalizeStoreContentId(row.content_id),
+    contentName: normalizeStoreContentName(row.content_name),
+    changes,
+    baseData,
+    changedFields,
+    submittedBy: normalizeText(row.submitted_by, '').slice(0, 120),
+    createdAt: row.created_at ? new Date(row.created_at).toISOString() : '',
+    updatedAt: row.updated_at ? new Date(row.updated_at).toISOString() : ''
+  };
+}
+
+function toPublicContentMetadataSuggestion(entry) {
+  if (!entry) return null;
+  return {
+    id: Number(entry.id) || 0,
+    metadataKey: entry.metadataKey,
+    category: entry.category,
+    titleId: entry.titleId,
+    contentId: entry.contentId,
+    contentName: entry.contentName,
+    changes: entry.changes,
+    baseData: entry.baseData,
+    changedFields: entry.changedFields,
+    submittedBy: entry.submittedBy,
+    createdAt: entry.createdAt,
+    updatedAt: entry.updatedAt
+  };
+}
+
+async function getContentMetadataSuggestions(limit = CONTENT_METADATA_SUGGESTIONS_MAX) {
+  const safeLimit = Math.max(1, Math.min(CONTENT_METADATA_SUGGESTIONS_MAX, Number(limit) || CONTENT_METADATA_SUGGESTIONS_MAX));
+  const result = await queryDbWithRetry(
+    `SELECT id, metadata_key, category, title_id, content_id, content_name, base_data, data, changed_fields, submitted_by, created_at, updated_at
+     FROM content_metadata_suggestions
+     ORDER BY updated_at DESC
+     LIMIT $1`,
+    [safeLimit],
+    { attempts: 2, label: 'CONTENT METADATA SUGGESTIONS READ' }
+  );
+  return (result.rows || []).map(normalizeContentMetadataSuggestionRow).filter(Boolean).map(toPublicContentMetadataSuggestion);
+}
+
+async function getContentMetadataSuggestionById(id) {
+  const suggestionId = Math.max(0, parseInt(id, 10) || 0);
+  if (!suggestionId) return null;
+  const result = await queryDbWithRetry(
+    `SELECT id, metadata_key, category, title_id, content_id, content_name, base_data, data, changed_fields, submitted_by, created_at, updated_at
+     FROM content_metadata_suggestions
+     WHERE id = $1
+     LIMIT 1`,
+    [suggestionId],
+    { attempts: 2, label: 'CONTENT METADATA SUGGESTION READ' }
+  );
+  return toPublicContentMetadataSuggestion(normalizeContentMetadataSuggestionRow(result.rows && result.rows[0] || {}));
+}
+
+function applyContentMetadataSuggestionPatch(existingData = {}, suggestion = null) {
+  const next = existingData && typeof existingData === 'object' && !Array.isArray(existingData) ? { ...existingData } : {};
+  if (!suggestion) return next;
+  for (const field of (suggestion.changedFields || [])) {
+    const value = suggestion.changes ? suggestion.changes[field] : undefined;
+    const empty = value === '' || value === null || value === undefined || (Array.isArray(value) && value.length === 0);
+    if (empty) delete next[field];
+    else next[field] = value;
+  }
+  return next;
+}
+
 function getContentMetadataOverrideUpdatedAtMs(entry) {
   if (!entry) return 0;
   const cached = Number(entry.__metadataUpdatedAtMs);
@@ -4166,6 +4344,41 @@ function getContentMetadataOverridesSyncMeta() {
     metadataInstanceId: INSTANCE_ID,
     metadataRevision: contentMetadataOverridesMutationRevision
   };
+}
+
+
+async function saveContentMetadataOverrideToDb(normalized, updatedBy, client = null) {
+  const payload = {
+    title: normalized.title, summary: normalized.summary, coverUrl: normalized.coverUrl, score: normalized.score, year: normalized.year,
+    genres: normalized.genres, tags: normalized.tags, cast: normalized.cast, director: normalized.director
+  };
+  const sql = `INSERT INTO content_metadata_overrides (metadata_key, category, title_id, content_id, data, updated_by, created_at, updated_at)
+     VALUES ($1,$2,$3,$4,$5::jsonb,$6,NOW(),NOW())
+     ON CONFLICT (metadata_key)
+     DO UPDATE SET category = EXCLUDED.category, title_id = EXCLUDED.title_id, content_id = EXCLUDED.content_id,
+                   data = EXCLUDED.data, updated_by = EXCLUDED.updated_by, updated_at = NOW()
+     WHERE content_metadata_overrides.category IS DISTINCT FROM EXCLUDED.category
+        OR content_metadata_overrides.title_id IS DISTINCT FROM EXCLUDED.title_id
+        OR content_metadata_overrides.content_id IS DISTINCT FROM EXCLUDED.content_id
+        OR content_metadata_overrides.data IS DISTINCT FROM EXCLUDED.data
+     RETURNING metadata_key, category, title_id, content_id, data, updated_by, updated_at`;
+  const params = [normalized.metadataKey, normalized.category, normalized.titleId, normalized.contentId, JSON.stringify(payload), normalizeText(updatedBy, 'Admin').slice(0, 120)];
+  const result = client
+    ? await client.query(sql, params)
+    : await queryDbWithRetry(sql, params, { attempts: 3, label: 'CONTENT METADATA UPSERT' });
+  if (result.rows && result.rows.length) {
+    const entry = normalizeContentMetadataOverrideRow(result.rows[0]);
+    return { unchanged: false, entry, payload };
+  }
+  const existingResult = client
+    ? await client.query(`SELECT metadata_key, category, title_id, content_id, data, updated_by, updated_at FROM content_metadata_overrides WHERE metadata_key = $1 LIMIT 1`, [normalized.metadataKey])
+    : await queryDbWithRetry(
+        `SELECT metadata_key, category, title_id, content_id, data, updated_by, updated_at FROM content_metadata_overrides WHERE metadata_key = $1 LIMIT 1`,
+        [normalized.metadataKey],
+        { attempts: 2, label: 'CONTENT METADATA UPSERT VERIFY' }
+      );
+  const existing = normalizeContentMetadataOverrideRow(existingResult.rows && existingResult.rows[0] || {});
+  return { unchanged: true, entry: existing && existing.hasValues ? existing : normalized, payload };
 }
 
 async function publishContentMetadataOverridesChanged(options = {}) {
@@ -7348,10 +7561,15 @@ async function recoverModerationSyncAfterListenGap() {
     io.emit('content_metadata_overrides_state', getPublicContentMetadataOverrides(), getContentMetadataOverridesSyncMeta());
 
     if (hasAdminSockets()) {
-      await Promise.all([refreshReportsFromDb(), refreshContentReportsFromDb()]);
+      const [, , metadataSuggestions] = await Promise.all([
+        refreshReportsFromDb(),
+        refreshContentReportsFromDb(),
+        getContentMetadataSuggestions()
+      ]);
       emitToAdmins('reports_list', adminReports);
       emitToAdmins('content_reports_list', adminContentReports);
       emitToAdmins('content_blocks_list', blockedStoreContent);
+      emitToAdmins('admin_metadata_suggestions_state', metadataSuggestions);
     }
   } catch (err) {
     console.error('[MODERATION SYNC RECOVERY ERROR]:', err && err.message ? err.message : err);
@@ -7546,6 +7764,20 @@ async function initProfileSyncNotifications() {
           } else {
             await refreshContentMetadataOverridesFromDb();
             io.emit('content_metadata_overrides_state', getPublicContentMetadataOverrides(), getContentMetadataOverridesSyncMeta());
+          }
+          return;
+        }
+        if (key === ADMIN_STATE_KEYS.metadataSuggestions) {
+          const state = data && data.state && typeof data.state === 'object' ? data.state : {};
+          const delta = state.delta && typeof state.delta === 'object' ? state.delta : null;
+          if (!hasAdminSockets()) return;
+          if (delta && delta.action === 'remove') {
+            emitToAdmins('admin_metadata_suggestion_delta', { action: 'remove', id: Number(delta.id) || 0 });
+          } else if (delta && delta.action === 'refresh' && Number(delta.id) > 0) {
+            const suggestion = await getContentMetadataSuggestionById(delta.id);
+            emitToAdmins('admin_metadata_suggestion_delta', suggestion ? { action: 'upsert', suggestion } : { action: 'remove', id: Number(delta.id) || 0 });
+          } else {
+            emitToAdmins('admin_metadata_suggestions_state', await getContentMetadataSuggestions());
           }
           return;
         }
@@ -9440,6 +9672,7 @@ async function deleteUserAccount(targetName, reason, adminName) {
     // Account deletion bypasses normal disconnect cleanup. Keep all account-owned DB
     // removals in the same transaction so a transient failure cannot leave half a deletion.
     const deletedContentReports = await client.query('DELETE FROM content_reports WHERE reporter = $1 RETURNING report_key', [targetName]);
+    const deletedMetadataSuggestions = await client.query('DELETE FROM content_metadata_suggestions WHERE submitted_by = $1 RETURNING id', [targetName]);
     await client.query('DELETE FROM presence_sessions WHERE name = $1', [targetName]);
     await client.query('DELETE FROM users WHERE name = $1', [targetName]);
     await client.query('DELETE FROM friend_activity_read_state WHERE user_name = $1', [targetName]);
@@ -9449,11 +9682,19 @@ async function deleteUserAccount(targetName, reason, adminName) {
     await client.query('DELETE FROM user_notifications WHERE user_name = $1', [targetName]);
     await client.query('DELETE FROM user_catalog_notification_seen WHERE user_name = $1', [targetName]);
 
-    return { missing: false, deletedReportCount: Math.max(0, Number(deletedContentReports.rowCount) || 0) };
+    return {
+      missing: false,
+      deletedReportCount: Math.max(0, Number(deletedContentReports.rowCount) || 0),
+      deletedMetadataSuggestionIds: (deletedMetadataSuggestions.rows || []).map(row => Number(row.id) || 0).filter(Boolean)
+    };
   }, { advisoryLockKey: `content-report-user:${targetName.toLowerCase()}` });
 
   if (dbDelete && dbDelete.missing) return { success: false, message: "User not found." };
   if (dbDelete && dbDelete.deletedReportCount > 0) await publishContentReportsChanged();
+  if (dbDelete && Array.isArray(dbDelete.deletedMetadataSuggestionIds) && dbDelete.deletedMetadataSuggestionIds.length) {
+    dbDelete.deletedMetadataSuggestionIds.forEach(id => emitToAdmins('admin_metadata_suggestion_delta', { action: 'remove', id }));
+    deferServerTask('CONTENT METADATA SUGGESTION DELETE USER NOTIFY', () => notifyAdminStateAcrossInstances(ADMIN_STATE_KEYS.metadataSuggestions, { changedAt: Date.now() }), 0);
+  }
 
   // Tell every server instance explicitly that this profile was deleted. Remote instances
   // must revoke any surviving admin/mod session immediately instead of merely dropping cache.
@@ -12016,6 +12257,197 @@ io.on('connection', (socket) => {
     }
   });
 
+
+  socket.on('metadata_suggestion_submit', async (data, callback) => {
+    const respond = typeof callback === 'function' ? callback : () => {};
+    try {
+      const now = Date.now();
+      if (now - Number(socket.__lastMetadataSuggestionMutationAt || 0) < 800) {
+        return respond({ success: false, rateLimited: true, message: 'Please wait a moment before sending another metadata suggestion.' });
+      }
+      socket.__lastMetadataSuggestionMutationAt = now;
+      const submittedBy = normalizeText(socket.userName, '');
+      if (!submittedBy || !userDatabase[submittedBy]) return respond({ success: false, authenticated: false, message: 'Sign in before suggesting metadata.' });
+      const normalized = normalizeContentMetadataSuggestion(data || {});
+      if (!normalized || normalized.error) return respond({ success: false, message: normalized && normalized.error || 'Invalid metadata suggestion.' });
+
+      const saveResult = await runDbTransactionWithRetry('CONTENT METADATA SUGGESTION UPSERT', async client => {
+        const account = await client.query('SELECT 1 FROM users WHERE name = $1 LIMIT 1 FOR UPDATE', [submittedBy]);
+        if (!account.rows.length) {
+          const accountError = new Error('Sign in before suggesting metadata.');
+          accountError.code = 'METADATA_SUGGESTION_ACCOUNT';
+          throw accountError;
+        }
+        const existing = await client.query(
+          'SELECT id FROM content_metadata_suggestions WHERE submitted_by = $1 AND metadata_key = $2 LIMIT 1 FOR UPDATE',
+          [submittedBy, normalized.metadataKey]
+        );
+        if (!existing.rows.length) {
+          const countResult = await client.query('SELECT COUNT(*)::int AS count FROM content_metadata_suggestions WHERE submitted_by = $1', [submittedBy]);
+          if (Number(countResult.rows[0] && countResult.rows[0].count || 0) >= CONTENT_METADATA_SUGGESTIONS_PER_USER_MAX) {
+            const quotaError = new Error('You have too many pending metadata suggestions. Wait for an administrator to review them.');
+            quotaError.code = 'METADATA_SUGGESTION_QUOTA';
+            throw quotaError;
+          }
+        }
+        const result = await client.query(
+          `INSERT INTO content_metadata_suggestions
+             (metadata_key, category, title_id, content_id, content_name, base_data, data, changed_fields, submitted_by, created_at, updated_at)
+           VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7::jsonb,$8::jsonb,$9,NOW(),NOW())
+           ON CONFLICT (submitted_by, metadata_key)
+           DO UPDATE SET category = EXCLUDED.category, title_id = EXCLUDED.title_id, content_id = EXCLUDED.content_id,
+                         content_name = EXCLUDED.content_name, base_data = EXCLUDED.base_data, data = EXCLUDED.data,
+                         changed_fields = EXCLUDED.changed_fields, updated_at = NOW()
+           RETURNING id, metadata_key, category, title_id, content_id, content_name, base_data, data, changed_fields, submitted_by, created_at, updated_at`,
+          [
+            normalized.metadataKey, normalized.category, normalized.titleId, normalized.contentId, normalized.contentName,
+            JSON.stringify(normalized.baseData), JSON.stringify(normalized.changes), JSON.stringify(normalized.changedFields), submittedBy
+          ]
+        );
+        return { row: result.rows[0] || null, updated: existing.rows.length > 0 };
+      }, { advisoryLockKey: `metadata-suggestion:${submittedBy}` });
+
+      const suggestion = normalizeContentMetadataSuggestionRow(saveResult && saveResult.row || {});
+      if (!suggestion) return respond({ success: false, message: 'Could not normalize the metadata suggestion.' });
+      const publicSuggestion = toPublicContentMetadataSuggestion(suggestion);
+      const delta = { action: 'upsert', suggestion: publicSuggestion };
+      emitToAdmins('admin_metadata_suggestion_delta', delta);
+      deferServerTask('CONTENT METADATA SUGGESTION NOTIFY', () => notifyAdminStateAcrossInstances(ADMIN_STATE_KEYS.metadataSuggestions, { changedAt: Date.now(), delta: { action: 'refresh', id: publicSuggestion.id } }), 0);
+      respond({ success: true, updated: saveResult.updated === true, suggestion: publicSuggestion });
+    } catch (err) {
+      if (err && err.code === 'METADATA_SUGGESTION_QUOTA') return respond({ success: false, message: err.message });
+      if (err && err.code === 'METADATA_SUGGESTION_ACCOUNT') return respond({ success: false, authenticated: false, message: err.message });
+      console.error('[CONTENT METADATA SUGGESTION SUBMIT ERROR]:', err);
+      respond({ success: false, message: 'Could not send the metadata suggestion.' });
+    }
+  });
+
+  socket.on('admin_request_content_metadata_suggestions', async (data, callback) => {
+    const respond = typeof callback === 'function' ? callback : () => {};
+    try {
+      if (socket.isAdmin !== true) return respond({ success: false, message: 'Admin only.', suggestions: [] });
+      const suggestions = await getContentMetadataSuggestions();
+      if (!(data && data.callbackOnly === true)) socket.emit('admin_metadata_suggestions_state', suggestions);
+      respond({ success: true, suggestions });
+    } catch (err) {
+      console.error('[ADMIN CONTENT METADATA SUGGESTIONS REQUEST ERROR]:', err);
+      respond({ success: false, message: 'Could not load metadata suggestions.', suggestions: [] });
+    }
+  });
+
+  socket.on('admin_approve_content_metadata_suggestion', async (data, callback) => {
+    const respond = typeof callback === 'function' ? callback : () => {};
+    try {
+      if (socket.isAdmin !== true) return respond({ success: false, message: 'Admin only.' });
+      const suggestionId = Math.max(0, parseInt(data && data.id, 10) || 0);
+      if (!suggestionId) return respond({ success: false, message: 'Invalid metadata suggestion.' });
+
+      const outcome = await runDbTransactionWithRetry('CONTENT METADATA SUGGESTION APPROVE', async client => {
+        const suggestionResult = await client.query(
+          `SELECT id, metadata_key, category, title_id, content_id, content_name, base_data, data, changed_fields, submitted_by, created_at, updated_at
+           FROM content_metadata_suggestions WHERE id = $1 LIMIT 1 FOR UPDATE`,
+          [suggestionId]
+        );
+        if (!suggestionResult.rows.length) return null;
+        const suggestion = normalizeContentMetadataSuggestionRow(suggestionResult.rows[0]);
+        if (!suggestion) {
+          await client.query('DELETE FROM content_metadata_suggestions WHERE id = $1', [suggestionId]);
+          return { suggestion: null, removeSuggestionOnly: true };
+        }
+
+        const existingResult = await client.query(
+          'SELECT data FROM content_metadata_overrides WHERE metadata_key = $1 LIMIT 1 FOR UPDATE',
+          [suggestion.metadataKey]
+        );
+        const existingData = existingResult.rows[0] && existingResult.rows[0].data && typeof existingResult.rows[0].data === 'object'
+          ? existingResult.rows[0].data
+          : {};
+        const mergedData = applyContentMetadataSuggestionPatch(existingData, suggestion);
+        const normalizedOverride = normalizeContentMetadataOverride({
+          ...mergedData,
+          category: suggestion.category,
+          titleId: suggestion.titleId,
+          contentId: suggestion.contentId,
+          updatedBy: socket.userName || 'Admin'
+        });
+
+        let overrideEntry = null;
+        let removedOverride = false;
+        let unchanged = false;
+        if (normalizedOverride && normalizedOverride.hasValues) {
+          const saved = await saveContentMetadataOverrideToDb(normalizedOverride, socket.userName || 'Admin', client);
+          overrideEntry = saved.entry;
+          unchanged = saved.unchanged === true;
+        } else {
+          const deleted = await client.query('DELETE FROM content_metadata_overrides WHERE metadata_key = $1 RETURNING metadata_key', [suggestion.metadataKey]);
+          removedOverride = Number(deleted.rowCount) > 0;
+        }
+        await client.query('DELETE FROM content_metadata_suggestions WHERE id = $1', [suggestionId]);
+        return { suggestion, overrideEntry, removedOverride, unchanged };
+      }, { advisoryLockKey: `metadata-suggestion-review:${suggestionId}` });
+
+      if (!outcome) return respond({ success: false, notFound: true, message: 'This suggestion was already reviewed.' });
+      const removeDelta = { action: 'remove', id: suggestionId };
+      emitToAdmins('admin_metadata_suggestion_delta', removeDelta);
+      deferServerTask('CONTENT METADATA SUGGESTION REVIEW NOTIFY', () => notifyAdminStateAcrossInstances(ADMIN_STATE_KEYS.metadataSuggestions, { changedAt: Date.now(), delta: removeDelta }), 0);
+
+      if (outcome.overrideEntry && !outcome.unchanged) await publishContentMetadataOverridesChanged({ upsertOverride: outcome.overrideEntry });
+      else if (outcome.removedOverride && outcome.suggestion) await publishContentMetadataOverridesChanged({ removeKey: outcome.suggestion.metadataKey });
+
+      if (outcome.suggestion) {
+        await addModerationLog(
+          'metadata_suggestion_approve',
+          `Approved metadata suggestion for ${outcome.suggestion.titleId || outcome.suggestion.contentId}`,
+          { suggestionId, metadataKey: outcome.suggestion.metadataKey, submittedBy: outcome.suggestion.submittedBy, fields: outcome.suggestion.changedFields },
+          socket.userName || 'Admin'
+        );
+      }
+      respond({
+        success: true,
+        id: suggestionId,
+        override: outcome.overrideEntry ? toPublicContentMetadataOverride(outcome.overrideEntry) : null,
+        removedOverride: outcome.removedOverride === true,
+        unchanged: outcome.unchanged === true,
+        ...getContentMetadataOverridesSyncMeta()
+      });
+    } catch (err) {
+      console.error('[ADMIN CONTENT METADATA SUGGESTION APPROVE ERROR]:', err);
+      respond({ success: false, message: 'Could not approve the metadata suggestion.' });
+    }
+  });
+
+  socket.on('admin_reject_content_metadata_suggestion', async (data, callback) => {
+    const respond = typeof callback === 'function' ? callback : () => {};
+    try {
+      if (socket.isAdmin !== true) return respond({ success: false, message: 'Admin only.' });
+      const suggestionId = Math.max(0, parseInt(data && data.id, 10) || 0);
+      if (!suggestionId) return respond({ success: false, message: 'Invalid metadata suggestion.' });
+      const result = await queryDbWithRetry(
+        `DELETE FROM content_metadata_suggestions WHERE id = $1
+         RETURNING id, metadata_key, category, title_id, content_id, content_name, base_data, data, changed_fields, submitted_by, created_at, updated_at`,
+        [suggestionId],
+        { attempts: 3, label: 'ADMIN CONTENT METADATA SUGGESTION REJECT' }
+      );
+      if (!result.rows.length) return respond({ success: false, notFound: true, message: 'This suggestion was already reviewed.' });
+      const suggestion = normalizeContentMetadataSuggestionRow(result.rows[0]);
+      const delta = { action: 'remove', id: suggestionId };
+      emitToAdmins('admin_metadata_suggestion_delta', delta);
+      deferServerTask('CONTENT METADATA SUGGESTION REJECT NOTIFY', () => notifyAdminStateAcrossInstances(ADMIN_STATE_KEYS.metadataSuggestions, { changedAt: Date.now(), delta }), 0);
+      if (suggestion) {
+        await addModerationLog(
+          'metadata_suggestion_reject',
+          `Rejected metadata suggestion for ${suggestion.titleId || suggestion.contentId}`,
+          { suggestionId, metadataKey: suggestion.metadataKey, submittedBy: suggestion.submittedBy, fields: suggestion.changedFields },
+          socket.userName || 'Admin'
+        );
+      }
+      respond({ success: true, id: suggestionId });
+    } catch (err) {
+      console.error('[ADMIN CONTENT METADATA SUGGESTION REJECT ERROR]:', err);
+      respond({ success: false, message: 'Could not reject the metadata suggestion.' });
+    }
+  });
+
   socket.on('admin_upsert_content_metadata_override', async (data, callback) => {
     const respond = typeof callback === 'function' ? callback : () => {};
     try {
@@ -12023,33 +12455,14 @@ io.on('connection', (socket) => {
       const normalized = normalizeContentMetadataOverride({ ...(data || {}), updatedBy: socket.userName || 'Admin' });
       if (!normalized || !normalized.metadataKey) return respond({ success: false, message: 'Invalid Store content.' });
       if (!normalized.hasValues) return respond({ success: false, message: 'Add at least one metadata correction before saving.' });
-      const payload = {
-        title: normalized.title, summary: normalized.summary, coverUrl: normalized.coverUrl, score: normalized.score, year: normalized.year,
-        genres: normalized.genres, tags: normalized.tags, cast: normalized.cast, director: normalized.director
-      };
-      const result = await queryDbWithRetry(
-        `INSERT INTO content_metadata_overrides (metadata_key, category, title_id, content_id, data, updated_by, created_at, updated_at)
-         VALUES ($1,$2,$3,$4,$5::jsonb,$6,NOW(),NOW())
-         ON CONFLICT (metadata_key)
-         DO UPDATE SET category = EXCLUDED.category, title_id = EXCLUDED.title_id, content_id = EXCLUDED.content_id,
-                       data = EXCLUDED.data, updated_by = EXCLUDED.updated_by, updated_at = NOW()
-         WHERE content_metadata_overrides.category IS DISTINCT FROM EXCLUDED.category
-            OR content_metadata_overrides.title_id IS DISTINCT FROM EXCLUDED.title_id
-            OR content_metadata_overrides.content_id IS DISTINCT FROM EXCLUDED.content_id
-            OR content_metadata_overrides.data IS DISTINCT FROM EXCLUDED.data
-         RETURNING metadata_key, category, title_id, content_id, data, updated_by, updated_at`,
-        [normalized.metadataKey, normalized.category, normalized.titleId, normalized.contentId, JSON.stringify(payload), socket.userName || 'Admin'],
-        { attempts: 3, label: 'ADMIN CONTENT METADATA UPSERT' }
-      );
-      if (!result.rows || !result.rows.length) {
-        const existing = contentMetadataOverridesByKey.get(normalized.metadataKey) || normalized;
-        return respond({ success: true, unchanged: true, override: toPublicContentMetadataOverride(existing), ...getContentMetadataOverridesSyncMeta() });
-      }
-      const entry = normalizeContentMetadataOverrideRow(result.rows[0] || {});
+      const saved = await saveContentMetadataOverrideToDb(normalized, socket.userName || 'Admin');
+      const entry = saved.entry;
       if (!entry || !entry.hasValues) return respond({ success: false, message: 'Could not normalize the saved correction.' });
-      await publishContentMetadataOverridesChanged({ upsertOverride: entry });
-      await addModerationLog('metadata_override', `Updated metadata override for ${entry.titleId || entry.contentId}`, { metadataKey: entry.metadataKey, fields: Object.keys(payload).filter(key => Array.isArray(payload[key]) ? payload[key].length : payload[key] !== '' && payload[key] !== null) }, socket.userName || 'Admin');
-      respond({ success: true, override: toPublicContentMetadataOverride(entry), ...getContentMetadataOverridesSyncMeta() });
+      if (!saved.unchanged) {
+        await publishContentMetadataOverridesChanged({ upsertOverride: entry });
+        await addModerationLog('metadata_override', `Updated metadata override for ${entry.titleId || entry.contentId}`, { metadataKey: entry.metadataKey, fields: Object.keys(saved.payload).filter(key => Array.isArray(saved.payload[key]) ? saved.payload[key].length : saved.payload[key] !== '' && saved.payload[key] !== null) }, socket.userName || 'Admin');
+      }
+      respond({ success: true, unchanged: saved.unchanged === true, override: toPublicContentMetadataOverride(entry), ...getContentMetadataOverridesSyncMeta() });
     } catch (err) {
       console.error('[ADMIN CONTENT METADATA UPSERT ERROR]:', err);
       respond({ success: false, message: 'Could not save the metadata correction.' });
