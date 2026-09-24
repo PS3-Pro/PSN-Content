@@ -38,6 +38,105 @@ const CHAT_POLL_OPTIONS_MAX = 20;
 const CHAT_POLL_OPTION_TEXT_MAX = 4096;
 const CHAT_POLL_VOTERS_MAX = 5000;
 
+// Per-user repeated-message protection. The repeat scan reuses the bounded in-memory
+// chat history; only active cooldowns need their own tiny runtime map.
+const CHAT_SPAM_REPEAT_WINDOW_MS = Math.max(10000, Math.min(5 * 60 * 1000, parseInt(process.env.CHAT_SPAM_REPEAT_WINDOW_MS || "60000", 10) || 60000));
+const CHAT_SPAM_WARNING_COUNT = 3;
+const CHAT_SPAM_TRIGGER_COUNT = 5;
+const CHAT_SPAM_COOLDOWN_SECONDS = Math.max(1, Math.min(60, parseInt(process.env.CHAT_SPAM_COOLDOWN_SECONDS || "10", 10) || 10));
+const CHAT_SPAM_COOLDOWN_DURATION_MS = Math.max(60000, Math.min(30 * 60 * 1000, parseInt(process.env.CHAT_SPAM_COOLDOWN_DURATION_MS || "300000", 10) || 300000));
+const CHAT_SPAM_COOLDOWN_MAX_USERS = 2048;
+const chatSpamCooldownByUser = new Map();
+
+function normalizeChatSpamComparableText(value) {
+  return String(value == null ? '' : value)
+    .replace(/<br\s*\/?\s*>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;|&#160;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+}
+
+function getChatSpamCooldownKey(name) {
+  return normalizeText(name, '').trim().toLowerCase();
+}
+
+function pruneChatSpamCooldowns(now = Date.now()) {
+  for (const [key, state] of chatSpamCooldownByUser) {
+    if (!state || Number(state.activeUntil || 0) <= now) chatSpamCooldownByUser.delete(key);
+  }
+  while (chatSpamCooldownByUser.size > CHAT_SPAM_COOLDOWN_MAX_USERS) {
+    chatSpamCooldownByUser.delete(chatSpamCooldownByUser.keys().next().value);
+  }
+}
+
+function getChatSpamCooldownState(name, now = Date.now()) {
+  const key = getChatSpamCooldownKey(name);
+  if (!key) return null;
+  const state = chatSpamCooldownByUser.get(key) || null;
+  if (!state) return null;
+  if (Number(state.activeUntil || 0) <= now) {
+    chatSpamCooldownByUser.delete(key);
+    return null;
+  }
+  return state;
+}
+
+function setChatSpamCooldownState(name, state) {
+  const key = getChatSpamCooldownKey(name);
+  if (!key || !state) return null;
+  chatSpamCooldownByUser.delete(key);
+  chatSpamCooldownByUser.set(key, state);
+  pruneChatSpamCooldowns();
+  return state;
+}
+
+function buildChatSpamCooldownPayload(state, now = Date.now(), extra = {}) {
+  const activeUntil = Number(state && state.activeUntil || 0);
+  const nextAllowedAt = Number(state && state.nextAllowedAt || 0);
+  const active = activeUntil > now;
+  return {
+    active,
+    cooldownSeconds: CHAT_SPAM_COOLDOWN_SECONDS,
+    durationSeconds: Math.round(CHAT_SPAM_COOLDOWN_DURATION_MS / 1000),
+    activeRemainingSeconds: active ? Math.max(1, Math.ceil((activeUntil - now) / 1000)) : 0,
+    waitSeconds: active ? Math.max(0, Math.ceil((nextAllowedAt - now) / 1000)) : 0,
+    ...extra
+  };
+}
+
+function emitChatSpamCooldownState(socket, state = null, extra = {}) {
+  if (!socket || !socket.connected) return;
+  const now = Date.now();
+  const current = state || getChatSpamCooldownState(socket.userName, now);
+  socket.emit('chat_spam_cooldown', current
+    ? buildChatSpamCooldownPayload(current, now, extra)
+    : { active:false, cooldownSeconds:CHAT_SPAM_COOLDOWN_SECONDS, durationSeconds:Math.round(CHAT_SPAM_COOLDOWN_DURATION_MS / 1000), activeRemainingSeconds:0, waitSeconds:0, ...extra });
+}
+
+function emitChatSpamCooldownStateToUser(name, state = null, extra = {}) {
+  const sockets = typeof getSocketsByUserName === 'function' ? getSocketsByUserName(name) : [];
+  if (!sockets.length) return;
+  sockets.forEach(client => emitChatSpamCooldownState(client, state, extra));
+}
+
+function countRecentRepeatedChatMessages(senderName, comparableText, now = Date.now()) {
+  if (!senderName || !comparableText || !Array.isArray(messageHistory) || !messageHistory.length) return 0;
+  let count = 0;
+  for (let index = messageHistory.length - 1; index >= 0; index--) {
+    const entry = messageHistory[index];
+    if (!entry || typeof entry !== 'object') continue;
+    const sentAt = Date.parse(entry.time || '') || 0;
+    if (sentAt && now - sentAt > CHAT_SPAM_REPEAT_WINDOW_MS) break;
+    if (String(entry.user || '') !== String(senderName)) continue;
+    if (String(entry.type || 'text').toLowerCase() !== 'text') continue;
+    if (normalizeChatSpamComparableText(entry.text) === comparableText) count++;
+  }
+  return count;
+}
+
 // ============================================================================
 // Runtime, presence & application limits
 // ============================================================================
@@ -3986,6 +4085,22 @@ function normalizeContentMetadataList(value, maxItems = 20, maxLength = 80) {
   return out;
 }
 
+function normalizeContentMetadataUrlList(value, maxItems = 8, maxLength = 1600) {
+  if (value === undefined || value === null || value === '') return [];
+  const raw = Array.isArray(value) ? value : String(value).split(/\r?\n/);
+  const seen = new Set();
+  const out = [];
+  for (const item of raw) {
+    const clean = normalizeContentMetadataString(item, maxLength).replace(/[\r\n\t]+/g, '').trim();
+    if (!clean || !/^https?:\/\//i.test(clean)) continue;
+    if (seen.has(clean)) continue;
+    seen.add(clean);
+    out.push(clean);
+    if (out.length >= maxItems) break;
+  }
+  return out;
+}
+
 function normalizeContentMetadataOverride(data = {}) {
   const identity = normalizeStoreContentIdentity(data);
   if (!identity.reportKey) return null;
@@ -3999,6 +4114,8 @@ function normalizeContentMetadataOverride(data = {}) {
   const year = /^(?:19|20)\d{2}$/.test(rawYear) ? rawYear : '';
   let coverUrl = normalizeContentMetadataString(data.coverUrl || data.cover, 1200);
   if (coverUrl && !/^https?:\/\//i.test(coverUrl)) coverUrl = '';
+  const hasScreenshotsOverride = Object.prototype.hasOwnProperty.call(data, 'screenshots') && data.screenshots !== null && data.screenshots !== undefined;
+  const screenshots = hasScreenshotsOverride ? normalizeContentMetadataUrlList(data.screenshots, 8, 1600) : null;
   const entry = {
     metadataKey: identity.reportKey,
     category: identity.category,
@@ -4011,11 +4128,12 @@ function normalizeContentMetadataOverride(data = {}) {
     year,
     genres: normalizeContentMetadataList(data.genres, 8, 60),
     tags: normalizeContentMetadataList(data.tags, 16, 60),
+    screenshots,
     director: normalizeContentMetadataString(data.director, 160).replace(/[\r\n\t]+/g, ' '),
     updatedBy: normalizeText(data.updatedBy || data.updated_by, '').slice(0, 120),
     updatedAt: data.updatedAt || data.updated_at || new Date().toISOString()
   };
-  entry.hasValues = !!(entry.title || entry.summary || entry.coverUrl || entry.score !== null || entry.year || entry.genres.length || entry.tags.length || entry.director);
+  entry.hasValues = !!(entry.title || entry.summary || entry.coverUrl || entry.score !== null || entry.year || entry.genres.length || entry.tags.length || entry.director || Array.isArray(entry.screenshots));
   const updatedAtMs = Date.parse(entry.updatedAt || '');
   Object.defineProperty(entry, '__metadataUpdatedAtMs', { value: Number.isFinite(updatedAtMs) ? updatedAtMs : 0, configurable: true });
   return entry;
@@ -4034,11 +4152,20 @@ function normalizeContentMetadataOverrideRow(row = {}) {
 }
 
 
-const CONTENT_METADATA_EDIT_FIELDS = Object.freeze(['title','coverUrl','summary','score','year','director','genres','tags']);
+const CONTENT_METADATA_EDIT_FIELDS = Object.freeze(['title','coverUrl','summary','score','year','director','genres','tags','screenshots']);
 
 function normalizeContentMetadataSuggestionField(field, rawValue, strict = false) {
   if (field === 'genres') return { ok: true, value: normalizeContentMetadataList(rawValue, 8, 60) };
   if (field === 'tags') return { ok: true, value: normalizeContentMetadataList(rawValue, 16, 60) };
+  if (field === 'screenshots') {
+    const raw = Array.isArray(rawValue) ? rawValue : String(rawValue === undefined || rawValue === null ? '' : rawValue).split(/\r?\n/);
+    const nonEmpty = raw.map(value => normalizeContentMetadataString(value, 1600).replace(/[\r\n\t]+/g, '').trim()).filter(Boolean);
+    if (strict) {
+      if (nonEmpty.length > 8) return { ok: false, message: 'Use up to 8 screenshot URLs.' };
+      if (nonEmpty.some(value => !/^https?:\/\//i.test(value))) return { ok: false, message: 'Every screenshot URL must start with http:// or https://.' };
+    }
+    return { ok: true, value: normalizeContentMetadataUrlList(nonEmpty, 8, 1600) };
+  }
   if (field === 'score') {
     if (rawValue === '' || rawValue === null || rawValue === undefined) return { ok: true, value: '' };
     const number = Number(rawValue);
@@ -4184,6 +4311,10 @@ function applyContentMetadataSuggestionPatch(existingData = {}, suggestion = nul
   if (!suggestion) return next;
   for (const field of (suggestion.changedFields || [])) {
     const value = suggestion.changes ? suggestion.changes[field] : undefined;
+    if (field === 'screenshots') {
+      next.screenshots = Array.isArray(value) ? value.slice(0, 8) : [];
+      continue;
+    }
     const empty = value === '' || value === null || value === undefined || (Array.isArray(value) && value.length === 0);
     if (empty) delete next[field];
     else next[field] = value;
@@ -4212,7 +4343,9 @@ function contentMetadataOverrideEntryEquals(a, b) {
   if (a.metadataKey !== b.metadataKey || a.category !== b.category || a.titleId !== b.titleId || a.contentId !== b.contentId
       || a.title !== b.title || a.summary !== b.summary || a.coverUrl !== b.coverUrl || a.score !== b.score || a.year !== b.year
       || a.director !== b.director || a.updatedBy !== b.updatedBy || a.updatedAt !== b.updatedAt) return false;
-  return contentMetadataOverrideArrayEquals(a.genres, b.genres)
+  const screenshotsEqual = (a.screenshots === null && b.screenshots === null) || contentMetadataOverrideArrayEquals(a.screenshots, b.screenshots);
+  return screenshotsEqual
+      && contentMetadataOverrideArrayEquals(a.genres, b.genres)
       && contentMetadataOverrideArrayEquals(a.tags, b.tags);
 }
 
@@ -4322,6 +4455,7 @@ function toPublicContentMetadataOverride(entry) {
   if (entry.year) out.year = entry.year;
   if (Array.isArray(entry.genres) && entry.genres.length) out.genres = entry.genres;
   if (Array.isArray(entry.tags) && entry.tags.length) out.tags = entry.tags;
+  if (Array.isArray(entry.screenshots)) out.screenshots = entry.screenshots;
   if (entry.director) out.director = entry.director;
   if (entry.updatedBy) out.updatedBy = entry.updatedBy;
   try { Object.defineProperty(entry, '__publicContentMetadataOverride', { value: out, configurable: true }); } catch (e) {}
@@ -4348,6 +4482,7 @@ async function saveContentMetadataOverrideToDb(normalized, updatedBy, client = n
     title: normalized.title, summary: normalized.summary, coverUrl: normalized.coverUrl, score: normalized.score, year: normalized.year,
     genres: normalized.genres, tags: normalized.tags, director: normalized.director
   };
+  if (Array.isArray(normalized.screenshots)) payload.screenshots = normalized.screenshots;
   const sql = `INSERT INTO content_metadata_overrides (metadata_key, category, title_id, content_id, data, updated_by, created_at, updated_at)
      VALUES ($1,$2,$3,$4,$5::jsonb,$6,NOW(),NOW())
      ON CONFLICT (metadata_key)
@@ -10083,6 +10218,7 @@ io.on('connection', (socket) => {
             });
           }
 
+          emitChatSpamCooldownState(socket);
           socket.emit('pinned_list', pinnedMessages);
           if (!supportsProfileSyncV2) deferServerTask('POST AUTH CHAT HISTORY', () => emitChatHistoryToSocket(socket), POST_AUTH_CHAT_HISTORY_DELAY_MS);
           deferServerTask('POST AUTH ADMIN STATE', () => emitAdminState(socket), socket.isAdmin === true ? POST_AUTH_ADMIN_STATE_DELAY_MS : 120);
@@ -10172,6 +10308,7 @@ io.on('connection', (socket) => {
         });
         compactCachedUser(name);
 
+        emitChatSpamCooldownState(socket);
         socket.emit('pinned_list', pinnedMessages);
         if (!supportsProfileSyncV2) deferServerTask('POST AUTH CHAT HISTORY', () => emitChatHistoryToSocket(socket), POST_AUTH_CHAT_HISTORY_DELAY_MS);
         deferServerTask('POST AUTH ADMIN STATE', () => emitAdminState(socket), socket.isAdmin === true ? POST_AUTH_ADMIN_STATE_DELAY_MS : 120);
@@ -11745,7 +11882,35 @@ io.on('connection', (socket) => {
         }
       }
       socket.lastChatAt = Date.now();
+
+      const spamNow = Date.now();
+      const activeSpamCooldown = getChatSpamCooldownState(senderName, spamNow);
+      if (activeSpamCooldown) {
+        const waitMs = Number(activeSpamCooldown.nextAllowedAt || 0) - spamNow;
+        if (waitMs > 0) {
+          const payload = buildChatSpamCooldownPayload(activeSpamCooldown, spamNow, { blocked:true });
+          const blocked = {
+            success: false,
+            reason: 'spam_cooldown',
+            waitSeconds: payload.waitSeconds,
+            spamCooldown: payload,
+            message: `Spam protection is active. Wait ${payload.waitSeconds}s before sending another message.`
+          };
+          socket.emit('chat_spam_cooldown', payload);
+          socket.emit('chat_blocked', blocked);
+          respond(blocked);
+          return;
+        }
+        // Reserve the next 10-second slot before the async database write so rapid parallel
+        // sends cannot slip through the per-user cooldown.
+        activeSpamCooldown.nextAllowedAt = spamNow + (CHAT_SPAM_COOLDOWN_SECONDS * 1000);
+        setChatSpamCooldownState(senderName, activeSpamCooldown);
+        emitChatSpamCooldownStateToUser(senderName, activeSpamCooldown, { continued:true });
+      }
     }
+
+    const spamComparableText = (!canModerate && messageType === 'text') ? normalizeChatSpamComparableText(text) : '';
+    const spamRepeatCount = spamComparableText ? (countRecentRepeatedChatMessages(senderName, spamComparableText, Date.now()) + 1) : 0;
 
     recordChatTraceTraffic('send', 1);
     if (socket.isAdmin === true) recordChatTraceTraffic('sendAdmin', 1);
@@ -11793,6 +11958,25 @@ io.on('connection', (socket) => {
         chatTrace.stage('after_sync_broadcast');
       }
       chatTrace.finish({ liveRecipients, revision:Number(syncChange && syncChange.revision)||0 });
+
+      if (!canModerate && spamComparableText) {
+        if (spamRepeatCount === CHAT_SPAM_WARNING_COUNT) {
+          socket.emit('chat_spam_warning', {
+            count: spamRepeatCount,
+            triggerCount: CHAT_SPAM_TRIGGER_COUNT,
+            windowSeconds: Math.round(CHAT_SPAM_REPEAT_WINDOW_MS / 1000),
+            message: 'Repeated messages may be considered spam.'
+          });
+        } else if (spamRepeatCount >= CHAT_SPAM_TRIGGER_COUNT && !getChatSpamCooldownState(senderName)) {
+          const spamActivatedAt = Date.now();
+          const spamState = setChatSpamCooldownState(senderName, {
+            activeUntil: spamActivatedAt + CHAT_SPAM_COOLDOWN_DURATION_MS,
+            nextAllowedAt: spamActivatedAt + (CHAT_SPAM_COOLDOWN_SECONDS * 1000)
+          });
+          emitChatSpamCooldownStateToUser(senderName, spamState, { activated:true, repeatCount:spamRepeatCount });
+        }
+      }
+
       respond({ success: true, message: publicMessage });
     } catch (err) {
       chatTrace.finish({ error:1 });
@@ -12456,7 +12640,7 @@ io.on('connection', (socket) => {
       if (!entry || !entry.hasValues) return respond({ success: false, message: 'Could not normalize the saved correction.' });
       if (!saved.unchanged) {
         await publishContentMetadataOverridesChanged({ upsertOverride: entry });
-        await addModerationLog('metadata_override', `Updated metadata override for ${entry.titleId || entry.contentId}`, { metadataKey: entry.metadataKey, fields: Object.keys(saved.payload).filter(key => Array.isArray(saved.payload[key]) ? saved.payload[key].length : saved.payload[key] !== '' && saved.payload[key] !== null) }, socket.userName || 'Admin');
+        await addModerationLog('metadata_override', `Updated metadata override for ${entry.titleId || entry.contentId}`, { metadataKey: entry.metadataKey, fields: Object.keys(saved.payload).filter(key => key === 'screenshots' ? Array.isArray(saved.payload[key]) : (Array.isArray(saved.payload[key]) ? saved.payload[key].length : saved.payload[key] !== '' && saved.payload[key] !== null)) }, socket.userName || 'Admin');
       }
       respond({ success: true, unchanged: saved.unchanged === true, override: toPublicContentMetadataOverride(entry), ...getContentMetadataOverridesSyncMeta() });
     } catch (err) {

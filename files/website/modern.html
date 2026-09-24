@@ -39062,6 +39062,55 @@ P
 		return adminSafeParseJson(localStorage.getItem('psn_admin_chat_controls'), { locked: false, slowSeconds: 0, by: '', at: null });
 	};
 
+	// Per-user spam cooldown is server-authoritative. Keep only a lightweight local mirror
+	// so the composer can show the same countdown behavior as the existing global Slow Mode.
+	window.__chatSpamCooldownState = window.__chatSpamCooldownState && typeof window.__chatSpamCooldownState === 'object'
+		? window.__chatSpamCooldownState
+		: { activeUntil:0, nextAllowedAt:0, cooldownSeconds:10 };
+
+	window.getChatSpamCooldownUiState = function() {
+		const now = Date.now();
+		const state = window.__chatSpamCooldownState || {};
+		const activeUntil = Math.max(0, Number(state.activeUntil) || 0);
+		if (!activeUntil || activeUntil <= now) {
+			if (activeUntil) window.__chatSpamCooldownState = { activeUntil:0, nextAllowedAt:0, cooldownSeconds:Math.max(1, Number(state.cooldownSeconds) || 10) };
+			return { active:false, waitMs:0, activeMs:0, cooldownSeconds:Math.max(1, Number(state.cooldownSeconds) || 10) };
+		}
+		return {
+			active:true,
+			waitMs:Math.max(0, (Number(state.nextAllowedAt) || 0) - now),
+			activeMs:Math.max(0, activeUntil - now),
+			cooldownSeconds:Math.max(1, Number(state.cooldownSeconds) || 10)
+		};
+	};
+
+	window.setChatSpamCooldownState = function(data = {}) {
+		const now = Date.now();
+		const active = data && data.active === true;
+		const cooldownSeconds = Math.max(1, Number(data.cooldownSeconds) || Number(window.__chatSpamCooldownState?.cooldownSeconds) || 10);
+		if (window.__chatSpamExpiryTimer) { clearTimeout(window.__chatSpamExpiryTimer); window.__chatSpamExpiryTimer = null; }
+		if (!active) {
+			window.__chatSpamCooldownState = { activeUntil:0, nextAllowedAt:0, cooldownSeconds };
+		} else {
+			const activeRemainingSeconds = Math.max(1, Number(data.activeRemainingSeconds) || Number(data.durationSeconds) || 300);
+			const waitSeconds = Math.max(0, Number(data.waitSeconds) || 0);
+			window.__chatSpamCooldownState = {
+				activeUntil:now + (activeRemainingSeconds * 1000),
+				nextAllowedAt:now + (waitSeconds * 1000),
+				cooldownSeconds
+			};
+			window.__chatSpamExpiryTimer = setTimeout(() => {
+				window.__chatSpamExpiryTimer = null;
+				window.__chatSpamCooldownState = { activeUntil:0, nextAllowedAt:0, cooldownSeconds };
+				if (typeof adminUpdateChatControlsBanner === 'function') adminUpdateChatControlsBanner();
+				if (typeof adminEnsureChatControlsVisualTicker === 'function') adminEnsureChatControlsVisualTicker();
+			}, (activeRemainingSeconds * 1000) + 80);
+		}
+		if (typeof adminUpdateChatControlsBanner === 'function') adminUpdateChatControlsBanner();
+		if (typeof adminEnsureChatControlsVisualTicker === 'function') adminEnsureChatControlsVisualTicker();
+		return window.getChatSpamCooldownUiState();
+	};
+
 
 	function adminSetChatControlsSyncState(state) {
 		const clean = ['local', 'syncing', 'synced', 'live', 'offline'].includes(String(state || '').toLowerCase()) ? String(state).toLowerCase() : 'local';
@@ -39174,7 +39223,10 @@ P
 		const slowSeconds = Math.max(0, parseInt(controls.slowSeconds || 0, 10) || 0);
 		const lastSent = parseInt(localStorage.getItem('psn_chat_last_sent_at') || '0', 10) || 0;
 		const waitMs = slowSeconds > 0 ? Math.max(0, slowSeconds * 1000 - (Date.now() - lastSent)) : 0;
-		return { ...controls, slowSeconds, canBypass, by, waitMs };
+		const spam = !canBypass && typeof window.getChatSpamCooldownUiState === 'function'
+			? window.getChatSpamCooldownUiState()
+			: { active:false, waitMs:0, activeMs:0, cooldownSeconds:10 };
+		return { ...controls, slowSeconds, canBypass, by, waitMs, spamActive:!!spam.active, spamWaitMs:Number(spam.waitMs) || 0, spamActiveMs:Number(spam.activeMs) || 0, spamCooldownSeconds:Number(spam.cooldownSeconds) || 10 };
 	}
 
 
@@ -39367,32 +39419,36 @@ P
 		const input = document.getElementById('chat-input');
 		if (!input) return;
 		const source = input.dataset.interfacePlaceholderSource ||
-			(input.classList.contains('chat-connection-unavailable') ? 'Reconnecting...' : (input.classList.contains('chat-control-waiting') ? 'Slow mode cooldown...' : 'Type a message'));
+			(input.classList.contains('chat-connection-unavailable') ? 'Reconnecting...' : (input.classList.contains('chat-spam-waiting') ? 'Spam cooldown...' : (input.classList.contains('chat-control-waiting') ? 'Slow mode cooldown...' : 'Type a message')));
 		setChatInputInterfacePlaceholder(input, source);
 	};
 
 	function adminUpdateChatControlsBanner() {
 		const state = adminGetChatControlsUiState();
-		const isActive = !!state.locked || state.slowSeconds > 0;
+		const isActive = !!state.locked || state.slowSeconds > 0 || state.spamActive;
 		const isLockedForUser = !!state.locked && !state.canBypass;
-		const isSlowWaitingForUser = !state.locked && !state.canBypass && state.slowSeconds > 0 && state.waitMs > 0;
+		const isSpamWaitingForUser = !state.locked && !state.canBypass && state.spamActive && state.spamWaitMs > 0;
+		const isSlowWaitingForUser = !state.locked && !state.canBypass && !isSpamWaitingForUser && state.slowSeconds > 0 && state.waitMs > 0;
 		const isConnectionUnavailable = !(typeof socketChat !== 'undefined' && socketChat && socketChat.connected);
-		const isDisabledForUser = isLockedForUser || isSlowWaitingForUser || isConnectionUnavailable;
+		const isDisabledForUser = isLockedForUser || isSpamWaitingForUser || isSlowWaitingForUser || isConnectionUnavailable;
 		const input = document.getElementById('chat-input');
 		const tagBox = document.getElementById('chat-mode-status-tags');
 		const wait = Math.ceil((state.waitMs || 0) / 1000);
+		const spamWait = Math.ceil((state.spamWaitMs || 0) / 1000);
 
 		if (input) {
-			const controlClasses = ['chat-control-locked', 'chat-control-slow', 'chat-control-bypass', 'chat-control-waiting', 'chat-connection-unavailable'];
+			const controlClasses = ['chat-control-locked', 'chat-control-slow', 'chat-control-bypass', 'chat-control-waiting', 'chat-spam-active', 'chat-spam-waiting', 'chat-connection-unavailable'];
 			const desiredClasses = new Set();
 			let desiredEditable = 'true';
 			let desiredPlaceholder = 'Type a message';
+			if (state.spamActive) desiredClasses.add('chat-spam-active');
 			if (isLockedForUser) { desiredClasses.add('chat-control-locked'); desiredEditable = 'false'; }
+			else if (isSpamWaitingForUser) { desiredClasses.add('chat-control-slow'); desiredClasses.add('chat-control-waiting'); desiredClasses.add('chat-spam-waiting'); desiredEditable = 'false'; desiredPlaceholder = 'Spam cooldown...'; }
 			else if (isSlowWaitingForUser) { desiredClasses.add('chat-control-slow'); desiredClasses.add('chat-control-waiting'); desiredEditable = 'false'; desiredPlaceholder = 'Slow mode cooldown...'; }
 			else if (isConnectionUnavailable) { desiredClasses.add('chat-connection-unavailable'); desiredEditable = 'false'; desiredPlaceholder = 'Reconnecting...'; }
 			else if (isActive && state.canBypass) desiredClasses.add('chat-control-bypass');
 			else if (state.locked) desiredClasses.add('chat-control-locked');
-			else if (state.slowSeconds > 0) desiredClasses.add('chat-control-slow');
+			else if (state.slowSeconds > 0 || state.spamActive) desiredClasses.add('chat-control-slow');
 			controlClasses.forEach(className => {
 				const shouldHave = desiredClasses.has(className);
 				if (input.classList.contains(className) !== shouldHave) input.classList.toggle(className, shouldHave);
@@ -39403,6 +39459,9 @@ P
 			if (isLockedForUser) {
 				if (input.dataset.adminLockedDraft === undefined) input.dataset.adminLockedDraft = input.innerHTML || '';
 				if (input.innerHTML) input.innerHTML = '';
+			} else if (isSpamWaitingForUser) {
+				if (input.dataset.adminSpamDraft === undefined) input.dataset.adminSpamDraft = input.innerHTML || '';
+				if (input.innerHTML) input.innerHTML = '';
 			} else if (isSlowWaitingForUser) {
 				if (input.dataset.adminSlowDraft === undefined) input.dataset.adminSlowDraft = input.innerHTML || '';
 				if (input.innerHTML) input.innerHTML = '';
@@ -39411,6 +39470,10 @@ P
 					if (!input.innerHTML.trim() && input.dataset.adminLockedDraft) input.innerHTML = input.dataset.adminLockedDraft;
 					delete input.dataset.adminLockedDraft;
 				}
+				if (input.dataset.adminSpamDraft !== undefined) {
+					if (!input.innerHTML.trim() && input.dataset.adminSpamDraft) input.innerHTML = input.dataset.adminSpamDraft;
+					delete input.dataset.adminSpamDraft;
+				}
 				if (input.dataset.adminSlowDraft !== undefined) {
 					if (!input.innerHTML.trim() && input.dataset.adminSlowDraft) input.innerHTML = input.dataset.adminSlowDraft;
 					delete input.dataset.adminSlowDraft;
@@ -39418,7 +39481,7 @@ P
 			}
 		}
 
-		adminSetChatComposerButtonState(isDisabledForUser, isLockedForUser ? `Chat locked by ${state.by || 'Admin'}` : (isSlowWaitingForUser ? `Slow mode: wait ${wait}s` : (isConnectionUnavailable ? 'Reconnecting to chat...' : 'Chat controls active')), isLockedForUser);
+		adminSetChatComposerButtonState(isDisabledForUser, isLockedForUser ? `Chat locked by ${state.by || 'Admin'}` : (isSpamWaitingForUser ? `Spam cooldown: wait ${spamWait}s` : (isSlowWaitingForUser ? `Slow mode: wait ${wait}s` : (isConnectionUnavailable ? 'Reconnecting to chat...' : 'Chat controls active'))), isLockedForUser);
 
 		if (tagBox) {
 			const tagList = [];
@@ -39428,6 +39491,10 @@ P
 				const slowLabel = (!state.canBypass && wait > 0) ? `${wait}s` : `Slow ${state.slowSeconds}s`;
 				tagList.push({ kind: 'slow', icon: 'fa-clock', text: slowLabel });
 			}
+			if (state.spamActive) {
+				const spamLabel = spamWait > 0 ? `Spam ${spamWait}s` : `Spam ${state.spamCooldownSeconds}s`;
+				tagList.push({ kind: 'slow', icon: 'fa-shield-halved', text: spamLabel });
+			}
 			if (isActive && state.canBypass) tagList.push({ kind: 'bypass', icon: 'fa-shield-alt', text: 'Bypass' });
 			adminSyncChatControlTags(tagBox, tagList);
 		}
@@ -39436,9 +39503,10 @@ P
 
 		const connectedForSignature = !!(typeof socketChat !== 'undefined' && socketChat && socketChat.connected);
 		const signatureWait = Math.ceil((Number(state.waitMs) || 0) / 1000);
+		const signatureSpamWait = Math.ceil((Number(state.spamWaitMs) || 0) / 1000);
 		window.__adminLightChatControlsUiSignature = typeof window.getLiveRenderSignature === 'function'
-			? window.getLiveRenderSignature([!!state.locked, Number(state.slowSeconds || 0), String(state.by || ''), !!state.canBypass, signatureWait, connectedForSignature ? 1 : 0])
-			: JSON.stringify([!!state.locked, Number(state.slowSeconds || 0), String(state.by || ''), !!state.canBypass, signatureWait, connectedForSignature]);
+			? window.getLiveRenderSignature([!!state.locked, Number(state.slowSeconds || 0), String(state.by || ''), !!state.canBypass, signatureWait, !!state.spamActive, signatureSpamWait, connectedForSignature ? 1 : 0])
+			: JSON.stringify([!!state.locked, Number(state.slowSeconds || 0), String(state.by || ''), !!state.canBypass, signatureWait, !!state.spamActive, signatureSpamWait, connectedForSignature]);
 	}
 
 	function adminChatControlsAreActive(state = null) {
@@ -39460,7 +39528,9 @@ P
 
 	function adminEnsureChatControlsVisualTicker() {
 		const state = (typeof adminGetChatControlsUiState === 'function') ? adminGetChatControlsUiState() : {};
-		const shouldRun = !document.hidden && adminIsChatControlsVisualContextVisible() && !state.locked && !state.canBypass && Number(state.slowSeconds || 0) > 0 && Number(state.waitMs || 0) > 0;
+		const slowWaiting = Number(state.slowSeconds || 0) > 0 && Number(state.waitMs || 0) > 0;
+		const spamWaiting = state.spamActive && Number(state.spamWaitMs || 0) > 0;
+		const shouldRun = !document.hidden && adminIsChatControlsVisualContextVisible() && !state.locked && !state.canBypass && (slowWaiting || spamWaiting);
 
 		if (window.adminChatControlsVisualTicker && !shouldRun) {
 			clearInterval(window.adminChatControlsVisualTicker);
@@ -42055,8 +42125,22 @@ P
 		socketChat.on('admin_chat_controls', applyAdminChatControlsRealtime);
 		socketChat.on('chat_controls', applyAdminChatControlsRealtime);
 		socketChat.on('admin_chat_controls_state', applyAdminChatControlsRealtime);
+		socketChat.on('chat_spam_warning', data => {
+			const triggerCount = Math.max(4, Number(data && data.triggerCount) || 5);
+			const count = Math.max(1, Number(data && data.count) || 3);
+			const remaining = Math.max(1, triggerCount - count);
+			if (typeof showToastNotification === 'function') showToastNotification('Spam Warning', `Repeated messages may be considered spam. ${remaining} more ${remaining === 1 ? 'repeat' : 'repeats'} will activate a 10-second cooldown for 5 minutes.`);
+		});
+		socketChat.on('chat_spam_cooldown', data => {
+			if (typeof window.setChatSpamCooldownState === 'function') window.setChatSpamCooldownState(data || {});
+			if (data && data.activated === true) {
+				if (typeof playUiError === 'function') playUiError();
+				if (typeof showToastNotification === 'function') showToastNotification('Spam Protection', '10-second message cooldown activated for 5 minutes.');
+			}
+		});
 		socketChat.on('chat_blocked', data => {
 			if (data && data.controls) adminSetChatControls({ ...data.controls, source: 'server', serverSynced: true }, false);
+			if (data && data.reason === 'spam_cooldown' && data.spamCooldown && typeof window.setChatSpamCooldownState === 'function') window.setChatSpamCooldownState(data.spamCooldown);
 			if (typeof adminUpdateChatControlsBanner === 'function') adminUpdateChatControlsBanner();
 		});
 		socketChat.on('admin_state', data => {
@@ -42283,18 +42367,22 @@ P
 		const state = (typeof adminGetChatControlsUiState === 'function') ? adminGetChatControlsUiState() : {};
 		const connected = !!(typeof socketChat !== 'undefined' && socketChat && socketChat.connected);
 		const wait = Math.ceil((Number(state.waitMs) || 0) / 1000);
+		const spamWait = Math.ceil((Number(state.spamWaitMs) || 0) / 1000);
 		const signature = typeof window.getLiveRenderSignature === 'function'
-			? window.getLiveRenderSignature([!!state.locked, Number(state.slowSeconds || 0), String(state.by || ''), !!state.canBypass, wait, connected ? 1 : 0])
-			: JSON.stringify([!!state.locked, Number(state.slowSeconds || 0), String(state.by || ''), !!state.canBypass, wait, connected]);
+			? window.getLiveRenderSignature([!!state.locked, Number(state.slowSeconds || 0), String(state.by || ''), !!state.canBypass, wait, !!state.spamActive, spamWait, connected ? 1 : 0])
+			: JSON.stringify([!!state.locked, Number(state.slowSeconds || 0), String(state.by || ''), !!state.canBypass, wait, !!state.spamActive, spamWait, connected]);
 		if (window.__adminLightChatControlsUiSignature === signature) {
 			const input = document.getElementById('chat-input');
 			const shouldLock = !!state.locked && !state.canBypass;
-			const shouldWait = !state.locked && !state.canBypass && Number(state.slowSeconds || 0) > 0 && Number(state.waitMs || 0) > 0;
+			const shouldSpamWait = !state.locked && !state.canBypass && state.spamActive && Number(state.spamWaitMs || 0) > 0;
+			const shouldSlowWait = !state.locked && !state.canBypass && !shouldSpamWait && Number(state.slowSeconds || 0) > 0 && Number(state.waitMs || 0) > 0;
+			const shouldWait = shouldSpamWait || shouldSlowWait;
 			const shouldOffline = !connected;
 			const expectedEditable = (shouldLock || shouldWait || shouldOffline) ? 'false' : 'true';
 			const inputLooksCurrent = !input || (input.getAttribute('contenteditable') === expectedEditable
 				&& input.classList.contains('chat-control-locked') === shouldLock
 				&& input.classList.contains('chat-control-waiting') === shouldWait
+				&& input.classList.contains('chat-spam-waiting') === shouldSpamWait
 				&& input.classList.contains('chat-connection-unavailable') === shouldOffline);
 			if (inputLooksCurrent) return;
 		}
@@ -71135,6 +71223,16 @@ function getVisibleChatStackEl(id) {
 		const myAvatar = localStorage.getItem(`${myName}_psn_avatar`) || "";
 		const isAdmin = document.body.classList.contains('is-admin');
 		const canModerate = typeof window.canModerateSession === 'function' ? window.canModerateSession() : isAdmin;
+
+		if (!canModerate && typeof window.getChatSpamCooldownUiState === 'function') {
+			const spamState = window.getChatSpamCooldownUiState();
+			if (spamState.active && spamState.waitMs > 0) {
+				if (typeof playUiError === 'function') playUiError();
+				if (typeof adminUpdateChatControlsBanner === 'function') adminUpdateChatControlsBanner();
+				if (typeof adminEnsureChatControlsVisualTicker === 'function') adminEnsureChatControlsVisualTicker();
+				return;
+			}
+		}
 
 		if (!canModerate && typeof window.adminGetChatControls === 'function') {
 			const controls = window.adminGetChatControls();
