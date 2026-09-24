@@ -33186,6 +33186,14 @@ P
 	const GAME_MODAL_RESOLVED_CACHE_TTL = 30 * 60 * 1000;
 	const GAME_MODAL_RESOLVED_CACHE_MAX = 72;
 	const gameModalResolvedMetadataCache = new Map();
+	const GAME_MODAL_RESOLVED_IDB_NAME = 'psn_game_modal_metadata_cache';
+	const GAME_MODAL_RESOLVED_IDB_VERSION = 1;
+	const GAME_MODAL_RESOLVED_IDB_STORE = 'snapshots';
+	const GAME_MODAL_RESOLVED_IDB_MAX = 120;
+	let gameModalResolvedIdbPromise = null;
+	const gameModalResolvedPersistentReads = new Map();
+	const gameModalResolvedPendingWrites = new Map();
+	let gameModalResolvedWriteHandle = 0;
 	const GAME_MODAL_METADATA_HTTP_CACHE_TTL = 20 * 60 * 1000;
 	const GAME_MODAL_METADATA_HTTP_CACHE_MAX = 180;
 	const gameModalMetadataHttpCache = new Map();
@@ -33199,6 +33207,14 @@ P
 		return `${cid || tid || name}|${tid}|${reg}|${name}|meta:${String(metadataRevision || '')}`;
 	}
 
+	function rememberGameModalResolvedMetadataEntry(cacheKey, entry) {
+		if (!cacheKey || !entry || !entry.snapshot) return null;
+		gameModalResolvedMetadataCache.delete(cacheKey);
+		gameModalResolvedMetadataCache.set(cacheKey, entry);
+		while (gameModalResolvedMetadataCache.size > GAME_MODAL_RESOLVED_CACHE_MAX) gameModalResolvedMetadataCache.delete(gameModalResolvedMetadataCache.keys().next().value);
+		return entry.snapshot;
+	}
+
 	function getGameModalResolvedMetadataSnapshot(cacheKey) {
 		const entry = cacheKey ? gameModalResolvedMetadataCache.get(cacheKey) : null;
 		if (!entry) return null;
@@ -33206,16 +33222,121 @@ P
 			gameModalResolvedMetadataCache.delete(cacheKey);
 			return null;
 		}
-		gameModalResolvedMetadataCache.delete(cacheKey);
-		gameModalResolvedMetadataCache.set(cacheKey, entry);
-		return entry.snapshot || null;
+		return rememberGameModalResolvedMetadataEntry(cacheKey, entry);
+	}
+
+	function openGameModalResolvedMetadataDb() {
+		if (gameModalResolvedIdbPromise) return gameModalResolvedIdbPromise;
+		if (typeof indexedDB === 'undefined') return Promise.resolve(null);
+		gameModalResolvedIdbPromise = new Promise(resolve => {
+			let request;
+			try { request = indexedDB.open(GAME_MODAL_RESOLVED_IDB_NAME, GAME_MODAL_RESOLVED_IDB_VERSION); }
+			catch (error) { resolve(null); return; }
+			request.onupgradeneeded = () => {
+				const db = request.result;
+				if (!db.objectStoreNames.contains(GAME_MODAL_RESOLVED_IDB_STORE)) {
+					const store = db.createObjectStore(GAME_MODAL_RESOLVED_IDB_STORE, { keyPath: 'key' });
+					store.createIndex('at', 'at', { unique: false });
+				}
+			};
+			request.onsuccess = () => resolve(request.result);
+			request.onerror = () => resolve(null);
+			request.onblocked = () => resolve(null);
+		});
+		return gameModalResolvedIdbPromise;
+	}
+
+	function deleteGameModalResolvedPersistentEntry(cacheKey) {
+		if (!cacheKey) return;
+		openGameModalResolvedMetadataDb().then(db => {
+			if (!db) return;
+			try { db.transaction(GAME_MODAL_RESOLVED_IDB_STORE, 'readwrite').objectStore(GAME_MODAL_RESOLVED_IDB_STORE).delete(cacheKey); }
+			catch (error) {}
+		}).catch(() => {});
+	}
+
+	async function getGameModalResolvedPersistentMetadataSnapshot(cacheKey) {
+		if (!cacheKey || typeof indexedDB === 'undefined') return null;
+		if (gameModalResolvedPersistentReads.has(cacheKey)) return gameModalResolvedPersistentReads.get(cacheKey);
+
+		const pending = (async () => {
+			const db = await openGameModalResolvedMetadataDb();
+			if (!db) return null;
+			const entry = await new Promise(resolve => {
+				try {
+					const request = db.transaction(GAME_MODAL_RESOLVED_IDB_STORE, 'readonly').objectStore(GAME_MODAL_RESOLVED_IDB_STORE).get(cacheKey);
+					request.onsuccess = () => resolve(request.result || null);
+					request.onerror = () => resolve(null);
+				} catch (error) { resolve(null); }
+			});
+			if (!entry || !entry.snapshot) return null;
+			if (Date.now() - Number(entry.at || 0) > GAME_MODAL_RESOLVED_CACHE_TTL) {
+				deleteGameModalResolvedPersistentEntry(cacheKey);
+				return null;
+			}
+			return rememberGameModalResolvedMetadataEntry(cacheKey, { at: Number(entry.at) || Date.now(), snapshot: entry.snapshot });
+		})();
+		gameModalResolvedPersistentReads.set(cacheKey, pending);
+		try { return await pending; }
+		finally { gameModalResolvedPersistentReads.delete(cacheKey); }
+	}
+
+	async function flushGameModalResolvedMetadataWrites() {
+		gameModalResolvedWriteHandle = 0;
+		if (!gameModalResolvedPendingWrites.size) return;
+		const entries = Array.from(gameModalResolvedPendingWrites.values());
+		gameModalResolvedPendingWrites.clear();
+		const db = await openGameModalResolvedMetadataDb();
+		if (!db) return;
+		try {
+			const tx = db.transaction(GAME_MODAL_RESOLVED_IDB_STORE, 'readwrite');
+			const store = tx.objectStore(GAME_MODAL_RESOLVED_IDB_STORE);
+			entries.forEach(entry => store.put(entry));
+			await new Promise(resolve => { tx.oncomplete = resolve; tx.onerror = resolve; tx.onabort = resolve; });
+		} catch (error) {}
+
+		/* Prune in the background. Reads stay O(1); cleanup only runs after new provider data is saved. */
+		try {
+			const tx = db.transaction(GAME_MODAL_RESOLVED_IDB_STORE, 'readwrite');
+			const store = tx.objectStore(GAME_MODAL_RESOLVED_IDB_STORE);
+			const index = store.index('at');
+			const rows = [];
+			const now = Date.now();
+			await new Promise(resolve => {
+				const cursorRequest = index.openCursor();
+				cursorRequest.onsuccess = () => {
+					const cursor = cursorRequest.result;
+					if (!cursor) {
+						if (rows.length > GAME_MODAL_RESOLVED_IDB_MAX) {
+							rows.slice(0, rows.length - GAME_MODAL_RESOLVED_IDB_MAX).forEach(row => store.delete(row.key));
+						}
+						resolve();
+						return;
+					}
+					const value = cursor.value || {};
+					if (now - Number(value.at || 0) > GAME_MODAL_RESOLVED_CACHE_TTL) cursor.delete();
+					else rows.push({ key: value.key, at: Number(value.at || 0) });
+					cursor.continue();
+				};
+				cursorRequest.onerror = resolve;
+			});
+		} catch (error) {}
+	}
+
+	function scheduleGameModalResolvedMetadataWrite(cacheKey, entry) {
+		if (!cacheKey || !entry || !entry.snapshot || typeof indexedDB === 'undefined') return;
+		gameModalResolvedPendingWrites.set(cacheKey, { key: cacheKey, at: Number(entry.at) || Date.now(), snapshot: entry.snapshot });
+		if (gameModalResolvedWriteHandle) return;
+		const run = () => { flushGameModalResolvedMetadataWrites().catch(() => {}); };
+		if (typeof requestIdleCallback === 'function') gameModalResolvedWriteHandle = requestIdleCallback(run, { timeout: 1200 });
+		else gameModalResolvedWriteHandle = setTimeout(run, 0);
 	}
 
 	function setGameModalResolvedMetadataSnapshot(cacheKey, snapshot) {
 		if (!cacheKey || !snapshot) return;
-		gameModalResolvedMetadataCache.delete(cacheKey);
-		gameModalResolvedMetadataCache.set(cacheKey, { at: Date.now(), snapshot });
-		while (gameModalResolvedMetadataCache.size > GAME_MODAL_RESOLVED_CACHE_MAX) gameModalResolvedMetadataCache.delete(gameModalResolvedMetadataCache.keys().next().value);
+		const entry = { at: Date.now(), snapshot };
+		rememberGameModalResolvedMetadataEntry(cacheKey, entry);
+		scheduleGameModalResolvedMetadataWrite(cacheKey, entry);
 	}
 
 	function captureGameModalResolvedMetadataSnapshot(modalRoot) {
@@ -33496,7 +33617,10 @@ P
 		}
 		if (!isCurrentRequest()) return;
 		const resolvedMetadataCacheKey = getGameModalResolvedMetadataCacheKey(gameName, gameId, contentId, region, contentMetadataOverride?.updatedAt || 'base');
-		const resolvedMetadataSnapshot = getGameModalResolvedMetadataSnapshot(resolvedMetadataCacheKey);
+		let resolvedMetadataSnapshot = getGameModalResolvedMetadataSnapshot(resolvedMetadataCacheKey);
+		if (!resolvedMetadataSnapshot) {
+			resolvedMetadataSnapshot = await getGameModalResolvedPersistentMetadataSnapshot(resolvedMetadataCacheKey);
+		}
 		if (resolvedMetadataSnapshot) {
 			// Yield out of the click stack just like the existing async metadata path; cached reopens
 			// can still land before paint without adding work to the synchronous modal build.
