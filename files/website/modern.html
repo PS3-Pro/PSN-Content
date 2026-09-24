@@ -666,6 +666,32 @@ html.collection-memory-optimization-on #downloads-list > .download-swipe-row { c
 #game-modal .modal-title-share-btn i { font-size: 12px; transition: transform .18s ease,color .18s ease; }
 #game-modal .modal-title-share-btn:hover { color:#66ccff !important; filter:drop-shadow(0 0 7px rgba(102,204,255,.22)); }
 #game-modal .modal-title-share-btn:hover i { transform:translateY(-.35px) scale(1.07); }
+
+.shared-content-link-modal { z-index: 14120 !important; padding: 18px; }
+.shared-content-link-modal .shared-content-link-card { width: min(92vw,500px); max-width: 500px; }
+.shared-content-link-modal .shared-content-link-body { padding: 24px; display: grid; grid-template-columns: 54px minmax(0,1fr); gap: 16px; align-items: start; }
+.shared-content-link-icon { width: 54px; height: 54px; display: grid; place-items: center; border-radius: 14px; border: 1px solid rgba(102,204,255,.25); background: rgba(102,204,255,.09); color: #66ccff; font-size: 20px; box-shadow: inset 0 1px 0 rgba(255,255,255,.04); }
+.shared-content-link-copy { min-width: 0; }
+.shared-content-link-kicker { margin: 1px 0 6px; color: #66ccff; font-size: 9px; font-weight: 900; letter-spacing: 1.05px; }
+.shared-content-link-copy h3 { margin: 0 0 8px; color: #fff; font-size: 17px; line-height: 1.28; overflow-wrap: anywhere; }
+.shared-content-link-copy p { margin: 0; color: var(--text-muted); font-size: 12.5px; line-height: 1.55; }
+.shared-content-link-meta { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 12px; }
+.shared-content-link-meta span { display: inline-flex; align-items: center; min-height: 22px; padding: 0 8px; border-radius: 999px; border: 1px solid rgba(255,255,255,.09); background: rgba(255,255,255,.045); color: rgba(255,255,255,.72); font-size: 8.5px; font-weight: 800; letter-spacing: .35px; }
+.shared-content-link-error { min-height: 0; margin-top: 10px; color: #ff7777; font-size: 11px; font-weight: 700; line-height: 1.4; }
+.shared-content-link-error:empty { display: none; }
+.shared-content-link-actions { grid-column: 1 / -1; display: flex; justify-content: flex-end; gap: 10px; margin-top: 4px; padding-top: 16px; border-top: 1px solid rgba(255,255,255,.07); }
+.shared-content-link-actions .action-btn { margin: 0; min-height: 36px; justify-content: center; }
+.shared-content-link-cancel { background: rgba(255,255,255,.035) !important; border-color: rgba(255,255,255,.1) !important; color: rgba(255,255,255,.75) !important; }
+.shared-content-link-go { background: rgba(0,112,204,.22) !important; border-color: rgba(0,112,204,.58) !important; color: #fff !important; }
+@media (max-width: 520px) {
+    .shared-content-link-modal { padding: 12px; }
+    .shared-content-link-modal .shared-content-link-card { width: calc(100vw - 24px); }
+    .shared-content-link-modal .shared-content-link-body { grid-template-columns: 44px minmax(0,1fr); gap: 12px; padding: 18px 16px 16px; }
+    .shared-content-link-icon { width: 44px; height: 44px; border-radius: 12px; font-size: 17px; }
+    .shared-content-link-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+    .shared-content-link-actions .action-btn { width: 100%; padding-left: 10px; padding-right: 10px; font-size: 9px; }
+}
+
 #game-modal .modal-title-metadata-btn { color: rgba(255,255,255,.42) !important; transition: color .18s ease,filter .18s ease,transform .18s ease !important; }
 #game-modal .modal-title-metadata-btn i { font-size: 12px; transition: transform .18s ease,color .18s ease; }
 #game-modal .modal-title-metadata-btn:hover { color:#66ccff !important; filter:drop-shadow(0 0 7px rgba(102,204,255,.22)); }
@@ -31872,8 +31898,10 @@ P
 
 
 	const PSN_CONTENT_DEEP_LINK_KEYS = Object.freeze(['content', 'tid', 'cid', 'ver', 'region', 'name']);
-	let psnContentDeepLinkOpenPromise = null;
-	let psnContentDeepLinkLastFailure = '';
+	const PSN_CONTENT_SHARED_PENDING_KEY = 'psn_shared_content_pending_v1';
+	let psnContentSharedPendingMemory = null;
+	let psnContentSharedPromptOpen = false;
+	let psnContentSharedNavigationPromise = null;
 
 	function getPsnContentHashParams() {
 		try { return new URLSearchParams(String(window.location.hash || '').replace(/^#/, '')); }
@@ -31889,19 +31917,30 @@ P
 		return String(value || '').trim().replace(/[\r\n\t]+/g, ' ');
 	}
 
+	function normalizePsnContentDeepLinkDescriptor(value) {
+		if (!value || typeof value !== 'object') return null;
+		const descriptor = {
+			category: normalizePsnContentDeepLinkCategory(value.category || value.content),
+			titleId: normalizePsnContentDeepLinkText(value.titleId || value.tid).toUpperCase(),
+			contentId: normalizePsnContentDeepLinkText(value.contentId || value.cid),
+			version: normalizePsnContentDeepLinkText(value.version || value.ver).toLowerCase().replace(/^v\s*/i, ''),
+			region: normalizePsnContentDeepLinkText(value.region).toUpperCase(),
+			name: normalizePsnContentDeepLinkText(value.name)
+		};
+		if (!descriptor.category) return null;
+		return (descriptor.contentId || descriptor.titleId || descriptor.name) ? descriptor : null;
+	}
+
 	function getPsnContentDeepLinkDescriptorFromHash() {
 		const params = getPsnContentHashParams();
-		const category = normalizePsnContentDeepLinkCategory(params.get('content'));
-		if (!category) return null;
-		const descriptor = {
-			category,
-			titleId: normalizePsnContentDeepLinkText(params.get('tid')).toUpperCase(),
-			contentId: normalizePsnContentDeepLinkText(params.get('cid')),
-			version: normalizePsnContentDeepLinkText(params.get('ver')).toLowerCase().replace(/^v\s*/i, ''),
-			region: normalizePsnContentDeepLinkText(params.get('region')).toUpperCase(),
-			name: normalizePsnContentDeepLinkText(params.get('name'))
-		};
-		return (descriptor.contentId || descriptor.titleId || descriptor.name) ? descriptor : null;
+		return normalizePsnContentDeepLinkDescriptor({
+			category: params.get('content'),
+			titleId: params.get('tid'),
+			contentId: params.get('cid'),
+			version: params.get('ver'),
+			region: params.get('region'),
+			name: params.get('name')
+		});
 	}
 
 	function getPsnContentHashWithoutDeepLink() {
@@ -31911,12 +31950,53 @@ P
 		return next ? `#${next}` : '';
 	}
 
+	function storePendingSharedContentDescriptor(descriptor) {
+		const normalized = normalizePsnContentDeepLinkDescriptor(descriptor);
+		if (!normalized) return null;
+		psnContentSharedPendingMemory = normalized;
+		try { sessionStorage.setItem(PSN_CONTENT_SHARED_PENDING_KEY, JSON.stringify(normalized)); } catch (e) {}
+		return normalized;
+	}
+
+	function getPendingSharedContentDescriptor() {
+		if (psnContentSharedPendingMemory) return psnContentSharedPendingMemory;
+		try {
+			const raw = sessionStorage.getItem(PSN_CONTENT_SHARED_PENDING_KEY);
+			if (!raw) return null;
+			const normalized = normalizePsnContentDeepLinkDescriptor(JSON.parse(raw));
+			if (!normalized) sessionStorage.removeItem(PSN_CONTENT_SHARED_PENDING_KEY);
+			psnContentSharedPendingMemory = normalized;
+			return normalized;
+		} catch (e) { return null; }
+	}
+
+	function clearPendingSharedContentDescriptor() {
+		psnContentSharedPendingMemory = null;
+		try { sessionStorage.removeItem(PSN_CONTENT_SHARED_PENDING_KEY); } catch (e) {}
+	}
+
+	function cleanConsumedSharedContentUrl() {
+		try {
+			const url = new URL(window.location.href);
+			const cleanHash = getPsnContentHashWithoutDeepLink();
+			url.hash = cleanHash ? cleanHash.replace(/^#/, '') : '';
+			window.history.replaceState(window.history.state, '', url.toString());
+		} catch (e) {}
+	}
+
+	window.consumePsnContentSharedLink = function() {
+		const descriptor = getPsnContentDeepLinkDescriptorFromHash();
+		if (!descriptor) return null;
+		storePendingSharedContentDescriptor(descriptor);
+		cleanConsumedSharedContentUrl();
+		return descriptor;
+	};
+
 	window.buildPsnContentDeepLink = function(game = {}, category = '') {
 		const resolvedCategory = normalizePsnContentDeepLinkCategory(category || game.category || game.rawCategory || document.getElementById('cat-select')?.value || '');
-		if (!resolvedCategory) return window.location.href;
-		const url = new URL(window.location.href);
-		const params = new URLSearchParams(String(url.hash || '').replace(/^#/, ''));
-		PSN_CONTENT_DEEP_LINK_KEYS.forEach(key => params.delete(key));
+		if (!resolvedCategory) return `${window.location.origin}${window.location.pathname}${window.location.search}`;
+		const url = new URL(`${window.location.origin}${window.location.pathname}${window.location.search}`);
+		const params = new URLSearchParams();
 		params.set('content', resolvedCategory);
 		const titleId = normalizePsnContentDeepLinkText(game.id || game.titleId || game.titleid || '');
 		const contentId = normalizePsnContentDeepLinkText(game.contentId || game.contentID || '');
@@ -31930,31 +32010,6 @@ P
 		if (name) params.set('name', name);
 		url.hash = params.toString();
 		return url.toString();
-	};
-
-	window.syncGameModalContentDeepLink = function(game = {}, category = '') {
-		const modal = document.getElementById('game-modal');
-		if (!modal || !game) return '';
-		if (modal.dataset.contentDeepLinkActive !== '1') {
-			modal.dataset.contentDeepLinkRestoreHash = getPsnContentHashWithoutDeepLink();
-			modal.dataset.contentDeepLinkActive = '1';
-		}
-		const url = window.buildPsnContentDeepLink(game, category);
-		try { window.history.replaceState(window.history.state, '', url); } catch (e) {}
-		return url;
-	};
-
-	window.restoreContentDeepLinkAfterModalClose = function() {
-		const modal = document.getElementById('game-modal');
-		if (!modal || modal.dataset.contentDeepLinkActive !== '1') return;
-		const restoreHash = String(modal.dataset.contentDeepLinkRestoreHash || '');
-		try {
-			const url = new URL(window.location.href);
-			url.hash = restoreHash ? restoreHash.replace(/^#/, '') : '';
-			window.history.replaceState(window.history.state, '', url.toString());
-		} catch (e) {}
-		delete modal.dataset.contentDeepLinkActive;
-		delete modal.dataset.contentDeepLinkRestoreHash;
 	};
 
 	function copyPsnContentDeepLinkToClipboard(url) {
@@ -32054,35 +32109,139 @@ P
 		return bestIndex >= 0 ? { item: items[bestIndex], index: bestIndex, items } : null;
 	}
 
+	function escapePsnSharedContentHtml(value) {
+		return String(value === undefined || value === null ? '' : value).replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;' }[char]));
+	}
+
+	function getPsnSharedContentCategoryLabel(category) {
+		const select = document.getElementById('cat-select');
+		const option = select ? Array.from(select.options || []).find(entry => entry.value === category) : null;
+		return String(option?.textContent || category || 'Content').trim().replace(/_/g, ' ').replace(/\b\w/g, char => char.toUpperCase());
+	}
+
+	function removePsnSharedContentPrompt(options = {}) {
+		const modal = document.getElementById('modal-shared-content-link');
+		psnContentSharedPromptOpen = false;
+		if (!options.keepPending) clearPendingSharedContentDescriptor();
+		if (!modal) return;
+		modal.classList.remove('show');
+		setTimeout(() => { if (modal.isConnected) modal.remove(); }, 220);
+	}
+
+	window.declineSharedContentDeepLink = function(event) {
+		if (event) { event.preventDefault(); event.stopPropagation(); }
+		if (typeof playUiBack === 'function') playUiBack();
+		removePsnSharedContentPrompt();
+	};
+
+	window.acceptSharedContentDeepLink = function(event) {
+		if (event) { event.preventDefault(); event.stopPropagation(); }
+		if (psnContentSharedNavigationPromise) return psnContentSharedNavigationPromise;
+		const descriptor = getPendingSharedContentDescriptor();
+		if (!descriptor) {
+			removePsnSharedContentPrompt();
+			return Promise.resolve(false);
+		}
+		if (typeof playUiClick === 'function') playUiClick();
+		const modal = document.getElementById('modal-shared-content-link');
+		const goButton = modal?.querySelector('[data-shared-content-go]');
+		const errorNode = modal?.querySelector('[data-shared-content-error]');
+		if (goButton) {
+			goButton.disabled = true;
+			goButton.dataset.originalHtml = goButton.innerHTML;
+			goButton.innerHTML = '<i class="fas fa-spinner fa-spin"></i> OPENING...';
+		}
+		if (errorNode) errorNode.textContent = '';
+
+		psnContentSharedNavigationPromise = (async () => {
+			const resolved = await resolvePsnContentDeepLinkItem(descriptor);
+			if (!resolved || !resolved.item) {
+				if (errorNode) errorNode.textContent = 'This shared content could not be found in the current database.';
+				if (typeof playUiError === 'function') playUiError();
+				return false;
+			}
+
+			const item = resolved.item;
+			const titleId = String(item.id || item.titleId || descriptor.titleId || '').trim();
+			const contentId = String(item.contentId || descriptor.contentId || '').trim();
+			const title = String(item.cleanName || item.title || item.name || descriptor.name || '').trim();
+			clearPendingSharedContentDescriptor();
+			removePsnSharedContentPrompt({ keepPending: true });
+
+			if (typeof window.searchGameOnSite === 'function') {
+				window.searchGameOnSite(titleId, null, descriptor.category, title, contentId);
+				return true;
+			}
+			return false;
+		})().catch(() => {
+			if (errorNode) errorNode.textContent = 'Could not open this shared content right now.';
+			if (typeof playUiError === 'function') playUiError();
+			return false;
+		}).finally(() => {
+			psnContentSharedNavigationPromise = null;
+			const liveButton = document.querySelector('#modal-shared-content-link [data-shared-content-go]');
+			if (liveButton) {
+				liveButton.disabled = false;
+				liveButton.innerHTML = liveButton.dataset.originalHtml || '<i class="fas fa-arrow-right"></i> GO TO CONTENT';
+				delete liveButton.dataset.originalHtml;
+			}
+		});
+		return psnContentSharedNavigationPromise;
+	};
+
+	function showPsnSharedContentPrompt(descriptor) {
+		if (!descriptor || psnContentSharedPromptOpen || document.getElementById('modal-shared-content-link')) return false;
+		psnContentSharedPromptOpen = true;
+		const label = descriptor.name || descriptor.titleId || descriptor.contentId || 'Shared content';
+		const categoryLabel = getPsnSharedContentCategoryLabel(descriptor.category);
+		const meta = [categoryLabel, descriptor.titleId, descriptor.region, descriptor.version ? `v${descriptor.version}` : ''].filter(Boolean);
+		const overlay = document.createElement('div');
+		overlay.id = 'modal-shared-content-link';
+		overlay.className = 'sys-modal-overlay shared-content-link-modal';
+		overlay.innerHTML = `
+			<div class="sys-modal-content shared-content-link-card" role="dialog" aria-modal="true" aria-labelledby="shared-content-link-title" onclick="event.stopPropagation()">
+				<div class="sys-modal-header">
+					<h2 id="shared-content-link-title"><i class="fas fa-link" style="color:#66ccff"></i> Shared Content</h2>
+					<button class="sys-modal-close" type="button" title="Close" aria-label="Close" onclick="declineSharedContentDeepLink(event)"><i class="fas fa-times"></i></button>
+				</div>
+				<div class="sys-modal-body shared-content-link-body">
+					<div class="shared-content-link-icon"><i class="fas fa-share-nodes"></i></div>
+					<div class="shared-content-link-copy">
+						<div class="shared-content-link-kicker">SHARED PSN-CONTENT LINK</div>
+						<h3 data-no-translate="true" translate="no">${escapePsnSharedContentHtml(label)}</h3>
+						<p>You opened a shared content link. Would you like to go to its location in the Store?</p>
+						${meta.length ? `<div class="shared-content-link-meta" data-no-translate="true" translate="no">${meta.map(value => `<span>${escapePsnSharedContentHtml(value)}</span>`).join('')}</div>` : ''}
+						<div class="shared-content-link-error" data-shared-content-error aria-live="polite"></div>
+					</div>
+					<div class="shared-content-link-actions">
+						<button type="button" class="action-btn shared-content-link-cancel" onclick="declineSharedContentDeepLink(event)"><i class="fas fa-times"></i> NOT NOW</button>
+						<button type="button" class="action-btn shared-content-link-go" data-shared-content-go onclick="acceptSharedContentDeepLink(event)"><i class="fas fa-arrow-right"></i> GO TO CONTENT</button>
+					</div>
+				</div>
+			</div>`;
+		document.body.appendChild(overlay);
+		if (typeof playUiModal === 'function') playUiModal();
+		requestAnimationFrame(() => overlay.classList.add('show'));
+		return true;
+	}
+
 	window.tryOpenPendingContentDeepLink = function(options = {}) {
-		const descriptor = getPsnContentDeepLinkDescriptorFromHash();
+		if (typeof window.consumePsnContentSharedLink === 'function') window.consumePsnContentSharedLink();
+		const descriptor = getPendingSharedContentDescriptor();
 		if (!descriptor) return Promise.resolve(false);
 		if (window.isProfileLoaded !== true) return Promise.resolve(false);
 		const bootContainer = document.getElementById('ps5-boot-container');
 		if (bootContainer && bootContainer.style.display !== 'none') return Promise.resolve(false);
-		const signature = [descriptor.category, descriptor.titleId, descriptor.contentId, descriptor.version, descriptor.region, descriptor.name].join('|');
-		const openModalEl = document.getElementById('game-modal');
-		if (openModalEl && openModalEl.style.display !== 'none' && openModalEl.dataset.contentDeepLinkSignature === signature) return Promise.resolve(true);
-		if (psnContentDeepLinkOpenPromise) return psnContentDeepLinkOpenPromise;
-		psnContentDeepLinkOpenPromise = (async () => {
-			const resolved = await resolvePsnContentDeepLinkItem(descriptor);
-			if (!resolved) {
-				if (psnContentDeepLinkLastFailure !== signature) {
-					psnContentDeepLinkLastFailure = signature;
-					if (typeof showToastNotification === 'function') showToastNotification('Content Link', 'This content could not be found in the current database.');
-				}
-				return false;
-			}
-			psnContentDeepLinkLastFailure = '';
-			const modal = document.getElementById('game-modal');
-			if (modal) modal.dataset.contentDeepLinkSignature = signature;
-			window.openModal(resolved.index, '', false, null, { game: resolved.item, category: descriptor.category, deepLink: true });
-			return true;
-		})().finally(() => { psnContentDeepLinkOpenPromise = null; });
-		return psnContentDeepLinkOpenPromise;
+		if (document.getElementById('modal-shared-content-link') || psnContentSharedPromptOpen) return Promise.resolve(true);
+		return Promise.resolve(showPsnSharedContentPrompt(descriptor));
 	};
 
+	// Consume incoming shared links as soon as this script is ready so the address bar
+	// immediately returns to the normal clean PSN-Content URL, even before login.
+	window.consumePsnContentSharedLink();
+
 	window.addEventListener('hashchange', () => {
+		if (typeof window.consumePsnContentSharedLink === 'function') window.consumePsnContentSharedLink();
 		if (typeof window.tryOpenPendingContentDeepLink === 'function') window.tryOpenPendingContentDeepLink({ reason: 'hashchange' });
 	});
 	window.addEventListener('psnStorePrefetchReady', () => {
@@ -32122,7 +32281,6 @@ P
 		// Keep the old first-paint behavior: the accent is resolved before the modal is shown,
 		// so no border/glow appears one frame late.
 		if (modal && game && typeof window.syncGameModalTileAccent === 'function') window.syncGameModalTileAccent(originCard, game, currentCat);
-		if (!modalInfoOnly && modal && game && typeof window.syncGameModalContentDeepLink === 'function') window.syncGameModalContentDeepLink(game, currentCat);
 		
 		let iconClass = 'fas fa-gamepad';
 		let headerText = 'Game Details';
@@ -32435,8 +32593,6 @@ P
 			
 			if (options.silent !== true && typeof playUiBack === 'function') playUiBack();
 			modal.classList.remove('show');
-			if (typeof window.restoreContentDeepLinkAfterModalClose === 'function') window.restoreContentDeepLinkAfterModalClose();
-			delete modal.dataset.contentDeepLinkSignature;
 			delete modal.dataset.gamePlayersToken;
 			delete modal.dataset.openHydrationToken;
 			modalTrophyLookupToken++;
@@ -79889,10 +80045,6 @@ function getVisibleChatStackEl(id) {
 		const modal = document.getElementById(modalId);
 		const clickedClose = event && event.target && event.target.closest && event.target.closest('.sys-modal-close');
 		if (!event || clickedClose) {
-			if (modalId === 'game-modal' && typeof window.restoreContentDeepLinkAfterModalClose === 'function') {
-				window.restoreContentDeepLinkAfterModalClose();
-				if (modal) delete modal.dataset.contentDeepLinkSignature;
-			}
 			if (modalId === 'modal-sys-profile' && typeof stopProfilePlayTimeTicker === 'function') stopProfilePlayTimeTicker();
 			if (typeof cropperInstance !== 'undefined' && cropperInstance) { cropperInstance.destroy(); cropperInstance = null; }
 			if (typeof activeEditorCanvas !== 'undefined' && activeEditorCanvas) { activeEditorCanvas.dispose(); activeEditorCanvas = null; }
