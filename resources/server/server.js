@@ -110,7 +110,11 @@ function buildChatSpamCooldownPayload(state, now = Date.now(), extra = {}) {
 function emitChatSpamCooldownState(socket, state = null, extra = {}) {
   if (!socket || !socket.connected) return;
   const now = Date.now();
-  const current = state || getChatSpamCooldownState(socket.userName, now);
+  let current = state || getChatSpamCooldownState(socket.userName, now);
+  if (!current && socket.userName) {
+    const recovered = deriveChatSpamCooldownFromHistory(socket.userName, now);
+    if (recovered) current = setChatSpamCooldownState(socket.userName, recovered);
+  }
   socket.emit('chat_spam_cooldown', current
     ? buildChatSpamCooldownPayload(current, now, extra)
     : { active:false, cooldownSeconds:CHAT_SPAM_COOLDOWN_SECONDS, durationSeconds:Math.round(CHAT_SPAM_COOLDOWN_DURATION_MS / 1000), activeRemainingSeconds:0, waitSeconds:0, ...extra });
@@ -135,6 +139,98 @@ function countRecentRepeatedChatMessages(senderName, comparableText, now = Date.
     if (normalizeChatSpamComparableText(entry.text) === comparableText) count++;
   }
   return count;
+}
+
+function deriveChatSpamCooldownFromHistory(senderName, now = Date.now()) {
+  if (!senderName || !Array.isArray(messageHistory) || !messageHistory.length) return null;
+  const relevantSince = now - CHAT_SPAM_COOLDOWN_DURATION_MS - CHAT_SPAM_REPEAT_WINDOW_MS;
+  const repeatTimesByText = new Map();
+  let activeUntil = 0;
+  let lastAcceptedAt = 0;
+
+  for (let index = 0; index < messageHistory.length; index++) {
+    const entry = messageHistory[index];
+    if (!entry || typeof entry !== 'object' || String(entry.user || '') !== String(senderName)) continue;
+    const sentAt = Date.parse(entry.time || '') || 0;
+    if (!sentAt || sentAt < relevantSince) continue;
+
+    if (activeUntil && sentAt < activeUntil) {
+      lastAcceptedAt = Math.max(lastAcceptedAt, sentAt);
+      continue;
+    }
+    if (activeUntil && sentAt >= activeUntil) {
+      activeUntil = 0;
+      lastAcceptedAt = 0;
+      repeatTimesByText.clear();
+    }
+
+    if (String(entry.type || 'text').toLowerCase() !== 'text') continue;
+    const comparableText = normalizeChatSpamComparableText(entry.text);
+    if (!comparableText) continue;
+
+    const existing = repeatTimesByText.get(comparableText) || [];
+    const cutoff = sentAt - CHAT_SPAM_REPEAT_WINDOW_MS;
+    let start = 0;
+    while (start < existing.length && existing[start] < cutoff) start++;
+    const recent = start ? existing.slice(start) : existing;
+    recent.push(sentAt);
+    repeatTimesByText.set(comparableText, recent);
+
+    if (recent.length >= CHAT_SPAM_TRIGGER_COUNT) {
+      activeUntil = sentAt + CHAT_SPAM_COOLDOWN_DURATION_MS;
+      lastAcceptedAt = sentAt;
+      repeatTimesByText.clear();
+    }
+  }
+
+  if (!activeUntil || activeUntil <= now) return null;
+  return {
+    activeUntil,
+    nextAllowedAt: Math.min(activeUntil, Math.max(lastAcceptedAt, 0) + (CHAT_SPAM_COOLDOWN_SECONDS * 1000))
+  };
+}
+
+function recoverLocalChatSpamCooldownStates() {
+  const now = Date.now();
+  if (!(socketsByUserName instanceof Map) || !socketsByUserName.size) return 0;
+  let recoveredCount = 0;
+  for (const name of socketsByUserName.keys()) {
+    const derived = deriveChatSpamCooldownFromHistory(name, now);
+    if (!derived) continue;
+    const current = getChatSpamCooldownState(name, now);
+    const merged = current
+      ? {
+          activeUntil:Math.max(Number(current.activeUntil || 0), Number(derived.activeUntil || 0)),
+          nextAllowedAt:Math.max(Number(current.nextAllowedAt || 0), Number(derived.nextAllowedAt || 0))
+        }
+      : derived;
+    setChatSpamCooldownState(name, merged);
+    emitChatSpamCooldownStateToUser(name, merged, { recovered:true });
+    recoveredCount++;
+  }
+  return recoveredCount;
+}
+
+async function notifyChatSpamAcrossInstances(name, state, extra = {}) {
+  const userName = normalizeText(name, '').slice(0, 120);
+  const activeUntil = Math.max(0, Number(state && state.activeUntil) || 0);
+  if (!userName || !activeUntil) return;
+  const payload = {
+    instanceId: INSTANCE_ID,
+    reason: 'spam_state',
+    spam: {
+      name: userName,
+      activeUntil,
+      nextAllowedAt: Math.max(0, Number(state && state.nextAllowedAt) || 0),
+      activated: extra.activated === true,
+      continued: extra.continued === true
+    }
+  };
+  try {
+    await pool.query('SELECT pg_notify($1, $2)', ['chat_sync_notify', JSON.stringify(payload)]);
+  } catch (err) {
+    console.error('[CHAT SPAM NOTIFY ERROR]:', err && err.message ? err.message : err);
+  }
 }
 
 // ============================================================================
@@ -7721,6 +7817,26 @@ async function initProfileSyncNotifications() {
       if (data.instanceId === INSTANCE_ID) return;
 
       if (message.channel === 'chat_sync_notify') {
+        const spam = data.spam && typeof data.spam === 'object' ? data.spam : null;
+        if (spam && spam.name) {
+          const spamName = normalizeText(spam.name, '').slice(0, 120);
+          const now = Date.now();
+          const incomingActiveUntil = Math.max(0, Number(spam.activeUntil) || 0);
+          if (spamName && incomingActiveUntil > now) {
+            const currentSpam = getChatSpamCooldownState(spamName, now);
+            const mergedSpam = {
+              activeUntil: Math.max(Number(currentSpam && currentSpam.activeUntil || 0), incomingActiveUntil),
+              nextAllowedAt: Math.max(Number(currentSpam && currentSpam.nextAllowedAt || 0), Math.max(0, Number(spam.nextAllowedAt) || 0))
+            };
+            setChatSpamCooldownState(spamName, mergedSpam);
+            emitChatSpamCooldownStateToUser(spamName, mergedSpam, {
+              activated: spam.activated === true,
+              continued: spam.continued === true,
+              remote: true
+            });
+          }
+          if (data.reason === 'spam_state') return;
+        }
         chatSyncWakeRequested = true;
         scheduleImmediateChatSyncFromNotify();
         return;
@@ -8093,7 +8209,10 @@ async function initProfileSyncNotifications() {
     const shouldRecoverModerationSync = profileSyncListenerHadGap;
     profileSyncListenerHadGap = false;
     profileSyncListenReady = true;
-    if (shouldRecoverModerationSync) deferServerTask('MODERATION LISTEN RECOVERY', recoverModerationSyncAfterListenGap, 0);
+    if (shouldRecoverModerationSync) {
+      deferServerTask('MODERATION LISTEN RECOVERY', recoverModerationSyncAfterListenGap, 0);
+      deferServerTask('CHAT SPAM LISTEN RECOVERY', () => recoverLocalChatSpamCooldownStates(), 0);
+    }
     console.log('[PROFILE SYNC] Postgres LISTEN enabled.');
     console.log('[PRESENCE SYNC] Postgres LISTEN enabled.');
     console.log('[PS3 PLAYTIME SYNC] Postgres LISTEN enabled.');
@@ -11906,6 +12025,7 @@ io.on('connection', (socket) => {
         activeSpamCooldown.nextAllowedAt = spamNow + (CHAT_SPAM_COOLDOWN_SECONDS * 1000);
         setChatSpamCooldownState(senderName, activeSpamCooldown);
         emitChatSpamCooldownStateToUser(senderName, activeSpamCooldown, { continued:true });
+        deferServerTask('CHAT SPAM CONTINUE NOTIFY', () => notifyChatSpamAcrossInstances(senderName, activeSpamCooldown, { continued:true }), 0);
       }
     }
 
@@ -11974,6 +12094,7 @@ io.on('connection', (socket) => {
             nextAllowedAt: spamActivatedAt + (CHAT_SPAM_COOLDOWN_SECONDS * 1000)
           });
           emitChatSpamCooldownStateToUser(senderName, spamState, { activated:true, repeatCount:spamRepeatCount });
+          deferServerTask('CHAT SPAM ACTIVATE NOTIFY', () => notifyChatSpamAcrossInstances(senderName, spamState, { activated:true }), 0);
         }
       }
 
