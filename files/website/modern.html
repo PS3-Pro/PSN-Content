@@ -1905,6 +1905,15 @@ div[style*="display: flex"] { transition: opacity 0.3s ease,transform 0.3s ease;
 #online-users-list-container .online-user-avatar:is(.psn-primary-pressed,.mobile-pressed), #friends-list-grid .friend-avatar-level-wrap:is(.psn-primary-pressed,.mobile-pressed), #modal-sys-list .game-player-list .friend-avatar-level-wrap:is(.psn-primary-pressed,.mobile-pressed), #admin-online-list .admin-user-avatar-wrap:is(.psn-primary-pressed,.mobile-pressed), .friend-activity-avatar:is(.psn-primary-pressed,.mobile-pressed), .user-notification-item:not(.is-message-deleted) .user-notification-avatar[data-notification-profile]:is(.psn-primary-pressed,.mobile-pressed), .chat-avatar-clickable:is(.psn-primary-pressed,.mobile-pressed), .seen-user-avatar:is(.psn-primary-pressed,.mobile-pressed), .avatar-edit-wrapper.can-edit:is(.psn-primary-pressed,.mobile-pressed) { transform: translateY(1px) scale(.90) !important; filter: brightness(.82) !important; transition-duration: .06s !important; }
 .chat-avatar-status, .chat-avatar-clickable.chat-avatar-status { display: block !important; width: 34px !important; height: 34px !important; min-width: 34px !important; max-width: 34px !important; flex: 0 0 34px !important; aspect-ratio: 1 / 1; border-radius: 50% !important; object-fit: cover !important; overflow: hidden !important; background: rgba(255,255,255,0.045); box-sizing: border-box !important; align-self: flex-start; }
 .chat-avatar-status[src=""], .chat-avatar-status:not([src]) { background: rgba(255,255,255,0.075); }
+.chat-avatar-shell { position: relative; display: block; flex: 0 0 34px; width: 34px; min-width: 34px; height: 34px; align-self: flex-start; margin-top: 15px; overflow: visible; cursor: var(--psn-hand-cursor), pointer; }
+.chat-avatar-shell .chat-avatar-status { margin-top: 0 !important; }
+.chat-spam-clock-badge { position: absolute; right: -4px; bottom: -4px; width: 15px; height: 15px; border-radius: 50%; display: none; align-items: center; justify-content: center; background: rgba(239,143,0,.98); border: 1.5px solid rgba(12,17,27,.98); color: #fff; box-shadow: 0 2px 6px rgba(0,0,0,.72),0 0 8px rgba(255,166,0,.38); z-index: 6; pointer-events: none; box-sizing: border-box; }
+.chat-spam-clock-badge i { font-size: 7px; line-height: 1; }
+.chat-avatar-shell.has-chat-spam .chat-spam-clock-badge { display: inline-flex; }
+.profile-spam-protection-pill { display: none; width: fit-content; max-width: 100%; margin-top: 5px; padding: 3px 8px; border-radius: 999px; align-items: center; gap: 5px; color: #ffbd59; background: rgba(239,143,0,.10); border: 1px solid rgba(255,174,45,.30); box-shadow: 0 0 12px rgba(239,143,0,.10); font-size: 10px; font-weight: 800; line-height: 1.2; white-space: nowrap; }
+.profile-spam-protection-pill.is-active { display: inline-flex; }
+.profile-spam-protection-pill i { font-size: 9px; }
+
 
 #chat-input:hover { border-color: rgba(255,255,255,0.5) !important; }
 #chat-input:focus { border-color: #ffffff !important; background: rgba(0,0,0,0.8) !important; }
@@ -9303,6 +9312,7 @@ P
 							<i id="card-status-icon" class="fas fa-circle" style="font-size: 10px; vertical-align: middle; transform: translateY(1.7px);"></i> 
 							<span id="card-status-text">Status: Online</span>
 						</div>
+						<div id="card-spam-protection" class="profile-spam-protection-pill" data-no-translate="true" translate="no"><i class="fas fa-clock"></i><span>Spam Protection</span></div>
 						<div id="card-joined" style="font-size: 11px; color: var(--text-muted); margin-top: 3px;">Joined: 2026</div>
 						<div id="card-country" class="profile-country-row">
 							<span id="card-country-text" class="profile-country-label">Localization:</span>
@@ -39112,6 +39122,120 @@ P
 	};
 
 
+	window.__chatSpamPublicByUser = window.__chatSpamPublicByUser instanceof Map ? window.__chatSpamPublicByUser : new Map();
+
+	function getChatSpamPublicKey(name) {
+		return String(name || '').trim().toLowerCase();
+	}
+
+	window.getUserChatSpamProtectionState = function(name) {
+		const key = getChatSpamPublicKey(name);
+		if (!key) return null;
+		const state = window.__chatSpamPublicByUser.get(key) || null;
+		if (!state) return null;
+		if (Number(state.activeUntil || 0) <= Date.now()) {
+			window.__chatSpamPublicByUser.delete(key);
+			return null;
+		}
+		return state;
+	};
+
+	window.isUserChatSpamProtected = function(name) {
+		return !!window.getUserChatSpamProtectionState(name);
+	};
+
+	function formatChatSpamProtectionRemaining(ms) {
+		const totalSeconds = Math.max(0, Math.ceil((Number(ms) || 0) / 1000));
+		const minutes = Math.floor(totalSeconds / 60);
+		const seconds = totalSeconds % 60;
+		return minutes > 0 ? `${minutes}m ${String(seconds).padStart(2, '0')}s` : `${seconds}s`;
+	}
+
+	function refreshChatSpamBadgesForUser(name) {
+		const safeName = String(name || '').trim();
+		if (!safeName) return;
+		const active = !!window.getUserChatSpamProtectionState(safeName);
+		const escaped = (window.CSS && typeof CSS.escape === 'function') ? CSS.escape(safeName) : safeName.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+		document.querySelectorAll(`.chat-avatar-shell[data-user="${escaped}"]`).forEach(shell => {
+			shell.classList.toggle('has-chat-spam', active);
+			if (active) shell.setAttribute('title', 'Spam protection active');
+			else shell.removeAttribute('title');
+		});
+	}
+	window.refreshChatSpamBadgesForUser = refreshChatSpamBadgesForUser;
+
+	function updateOpenProfileSpamProtection(targetName = '') {
+		if (window.__profileSpamProtectionTimer) { clearTimeout(window.__profileSpamProtectionTimer); window.__profileSpamProtectionTimer = null; }
+		const modal = document.getElementById('modal-sys-profile');
+		const pill = document.getElementById('card-spam-protection');
+		if (!modal || !pill) return;
+		const name = String(targetName || modal.dataset.profileUsername || '').trim();
+		const state = window.getUserChatSpamProtectionState(name);
+		const visible = modal.style.display === 'flex' || modal.style.display === 'block' || modal.classList.contains('show');
+		if (!name || !state) {
+			pill.classList.remove('is-active');
+			pill.removeAttribute('title');
+			return;
+		}
+		const remaining = Math.max(0, Number(state.activeUntil || 0) - Date.now());
+		const compact = !!(window.matchMedia && window.matchMedia('(max-width: 420px)').matches);
+		const label = `${compact ? 'Spam' : 'Spam Protection'} · ${formatChatSpamProtectionRemaining(remaining)}`;
+		const text = pill.querySelector('span');
+		if (text && text.textContent !== label) text.textContent = label;
+		pill.classList.add('is-active');
+		pill.setAttribute('title', 'Repeated-message protection is active for this user');
+		if (visible && remaining > 0) window.__profileSpamProtectionTimer = setTimeout(() => updateOpenProfileSpamProtection(name), Math.min(1000, remaining + 40));
+	}
+	window.updateOpenProfileSpamProtection = updateOpenProfileSpamProtection;
+
+	function scheduleChatSpamPublicExpiry() {
+		if (window.__chatSpamPublicExpiryTimer) { clearTimeout(window.__chatSpamPublicExpiryTimer); window.__chatSpamPublicExpiryTimer = null; }
+		const now = Date.now();
+		let nextExpiry = 0;
+		for (const [key, state] of window.__chatSpamPublicByUser) {
+			const activeUntil = Number(state && state.activeUntil || 0);
+			if (!activeUntil || activeUntil <= now) {
+				const name = String(state && state.name || key);
+				window.__chatSpamPublicByUser.delete(key);
+				refreshChatSpamBadgesForUser(name);
+				continue;
+			}
+			if (!nextExpiry || activeUntil < nextExpiry) nextExpiry = activeUntil;
+		}
+		if (typeof updateOpenProfileSpamProtection === 'function') updateOpenProfileSpamProtection();
+		if (nextExpiry) window.__chatSpamPublicExpiryTimer = setTimeout(scheduleChatSpamPublicExpiry, Math.max(40, nextExpiry - now + 40));
+	}
+
+	window.applyChatSpamPublicState = function(payload = {}) {
+		const now = Date.now();
+		const touchedNames = new Set();
+		if (payload && payload.replace === true) {
+			for (const state of window.__chatSpamPublicByUser.values()) if (state && state.name) touchedNames.add(state.name);
+			window.__chatSpamPublicByUser.clear();
+			(Array.isArray(payload.states) ? payload.states : []).forEach(raw => {
+				const name = String(raw && raw.name || '').trim();
+				const seconds = Math.max(0, Number(raw && raw.activeRemainingSeconds) || 0);
+				if (!name || raw.active !== true || seconds <= 0) return;
+				window.__chatSpamPublicByUser.set(getChatSpamPublicKey(name), { name, activeUntil:now + seconds * 1000 });
+				touchedNames.add(name);
+			});
+		} else {
+			const raw = payload && payload.state && typeof payload.state === 'object' ? payload.state : payload;
+			const name = String(raw && raw.name || '').trim();
+			if (name) {
+				const key = getChatSpamPublicKey(name);
+				const seconds = Math.max(0, Number(raw.activeRemainingSeconds) || 0);
+				if (raw.active === true && seconds > 0) window.__chatSpamPublicByUser.set(key, { name, activeUntil:now + seconds * 1000 });
+				else window.__chatSpamPublicByUser.delete(key);
+				touchedNames.add(name);
+			}
+		}
+		touchedNames.forEach(refreshChatSpamBadgesForUser);
+		scheduleChatSpamPublicExpiry();
+		return window.__chatSpamPublicByUser.size;
+	};
+
+
 	function adminSetChatControlsSyncState(state) {
 		const clean = ['local', 'syncing', 'synced', 'live', 'offline'].includes(String(state || '').toLowerCase()) ? String(state).toLowerCase() : 'local';
 		window.adminChatControlsSyncState = clean;
@@ -42131,11 +42255,17 @@ P
 			const remaining = Math.max(1, triggerCount - count);
 			if (typeof showToastNotification === 'function') showToastNotification('Spam Warning', `Repeated messages may be considered spam. ${remaining} more ${remaining === 1 ? 'repeat' : 'repeats'} will activate a 10-second cooldown for 5 minutes.`);
 		});
+		socketChat.on('chat_spam_public_state', data => {
+			if (typeof window.applyChatSpamPublicState === 'function') window.applyChatSpamPublicState(data || {});
+		});
 		socketChat.on('chat_spam_cooldown', data => {
 			if (typeof window.setChatSpamCooldownState === 'function') window.setChatSpamCooldownState(data || {});
 			if (data && data.activated === true) {
 				if (typeof playUiError === 'function') playUiError();
 				if (typeof showToastNotification === 'function') showToastNotification('Spam Protection', '10-second message cooldown activated for 5 minutes.');
+			} else if (data && data.cleared === true) {
+				if (typeof playUiSuccess === 'function') playUiSuccess();
+				if (typeof showToastNotification === 'function') showToastNotification('Spam Protection Removed', 'Your chat spam cooldown and repeat counter were cleared.');
 			}
 		});
 		socketChat.on('chat_blocked', data => {
@@ -61218,6 +61348,7 @@ function getVisibleChatStackEl(id) {
 	
 	const ADMIN_COMMAND_LIST = [
 		{ cmd: 'kick', desc: 'Kick a user: /kick @Username', mod: true, needsTarget: true },
+		{ cmd: 'unspam', desc: 'Remove spam protection: /unspam @Username', mod: true, needsTarget: true },
 		{ cmd: 'ban', desc: 'Ban an account: /ban @Username', adminOnly: true, needsTarget: true },
 		{ cmd: 'unban', desc: 'Unban an account: /unban @Username', adminOnly: true, needsTarget: true, bannedOnly: true },
 		{ cmd: 'role', desc: 'Set role: /role @Username mod', adminOnly: true, needsTarget: true },
@@ -61533,6 +61664,7 @@ function getVisibleChatStackEl(id) {
 		const q = String(query || '').replace(/^@/, '').toLowerCase();
 		let users = getChatCommandKnownUsers().filter(u => String(u.name || '').toLowerCase() !== myName);
 		if (command === 'kick') users = users.filter(u => u.online === true || !!u.id);
+		if (command === 'unspam' && typeof window.canModerateChat === 'function') users = users.filter(u => window.canModerateChat(u.name, u));
 		if (command === 'ban') users = users.filter(u => !(typeof window.isPsnUserBanned === 'function' ? window.isPsnUserBanned(u.name, u) : (u.isBanned === true || u.banned === true)));
 		if (command === 'unban') users = users.filter(u => (typeof window.isPsnUserBanned === 'function' ? window.isPsnUserBanned(u.name, u) : (u.isBanned === true || u.banned === true)));
 		users = users.filter(u => String(u.name || '').toLowerCase().includes(q)).slice(0, 12);
@@ -65446,18 +65578,22 @@ function getVisibleChatStackEl(id) {
 			}
 		}
 	
+		const chatSpamProtected = typeof window.isUserChatSpamProtected === 'function' && window.isUserChatSpamProtected(userName);
 		const chatRenderSignature = getChatMessageRenderSignature(msg);
 		const isPinnedThisMsg = batchContext && batchContext.pinnedIdSet instanceof Set
 			? batchContext.pinnedIdSet.has(String(msgId))
 			: isChatMessagePinnedFast(msgId);
 		const msgHtml = `
 		<div id="msg-row-${msgId}"${renderIndexAttr} data-chat-msg-id="${msgId}" data-chat-render-signature="${chatRenderSignature}" data-chat-mention-me="${(isPersonalMention || isGlobal) ? '1' : '0'}" data-chat-author="${isAuthor ? '1' : '0'}" class="${messageEntryClass} ${msg.type === 'poll' ? 'msg-row-poll' : ''}" data-user="${encodedUser}" data-can-delete="${canDeleteThisMsg ? 'true' : 'false'}" onclick="if(window.chatSelectionMode && typeof toggleChatMessageSelection === 'function') toggleChatMessageSelection(event, '${msgId}')" style="display: flex; flex-direction: ${flexDir}; align-self: ${alignSelf}; max-width: min(85%, 450px); margin-bottom: 12px; gap: 10px; transition: all 0.3s ease;${outgoingEntryInitialStyle}">
-			<img src="${userAvatar}" class="chat-avatar-clickable chat-avatar-status" 
-				data-user="${userName}" 
-				onerror="this.onerror=null; this.src='https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/interface/modern/images/avatars/default.png';" 
-				onmouseenter="if(typeof playUiHover === 'function') playUiHover()" 
-				onclick="if(typeof playUiClick === 'function') playUiClick(); openProfileModal('${encodedUser}')" 
-				style="display:block; flex:0 0 34px; min-width:34px; max-width:34px; width:34px; height:34px; aspect-ratio:1/1; border-radius:50%; border:2px solid ${avatarBorderColor}; object-fit:cover; margin-top:15px; cursor:pointer; transition:border-color 0.3s ease; background:rgba(255,255,255,0.045); box-sizing:border-box; overflow:hidden;">
+			<span class="chat-avatar-shell${chatSpamProtected ? ' has-chat-spam' : ''}" data-user="${userName}"${chatSpamProtected ? ' title="Spam protection active"' : ''}>
+				<img src="${userAvatar}" class="chat-avatar-clickable chat-avatar-status" 
+					data-user="${userName}" 
+					onerror="this.onerror=null; this.src='https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/interface/modern/images/avatars/default.png';" 
+					onmouseenter="if(typeof playUiHover === 'function') playUiHover()" 
+					onclick="if(typeof playUiClick === 'function') playUiClick(); openProfileModal('${encodedUser}')" 
+					style="display:block; flex:0 0 34px; min-width:34px; max-width:34px; width:34px; height:34px; aspect-ratio:1/1; border-radius:50%; border:2px solid ${avatarBorderColor}; object-fit:cover; cursor:pointer; transition:border-color 0.3s ease; background:rgba(255,255,255,0.045); box-sizing:border-box; overflow:hidden;">
+				<span class="chat-spam-clock-badge" aria-hidden="true"><i class="fas fa-clock"></i></span>
+			</span>
 			
 			<div style="display: flex; flex-direction: column; align-items: ${alignSelf}; min-width: 60px; max-width: 100%;">
 				
@@ -71295,6 +71431,31 @@ function getVisibleChatStackEl(id) {
 			return; 
 		}
 	
+		if (plainText.toLowerCase() === '/unspam' || plainText.toLowerCase().startsWith('/unspam ')) {
+			if (canModerate) {
+				const targetName = plainText.split(' ').slice(1).join(' ').replace('@', '').trim();
+				if (!targetName) {
+					if (typeof playUiError === 'function') playUiError();
+					if (typeof showToastNotification === 'function') showToastNotification('Spam Protection', 'Use: /unspam @Username');
+				} else {
+					socketChat.emit('chat_message', { text: plainText, user: myName }, response => {
+						if (!response || response.success !== true) {
+							if (typeof playUiError === 'function') playUiError();
+							if (typeof showToastNotification === 'function') showToastNotification('Spam Protection', response?.message || 'Could not remove spam protection.');
+							return;
+						}
+						if (typeof playUiSuccess === 'function') playUiSuccess();
+						if (typeof showToastNotification === 'function') showToastNotification('Spam Protection Removed', `${response.targetName || targetName} can send normally again. Anti-spam counting was reset.`);
+					});
+				}
+			} else {
+				if (typeof playUiError === 'function') playUiError();
+				if (typeof showToastNotification === 'function') showToastNotification('Spam Protection', 'Only admins/moderators can use /unspam.');
+			}
+			input.innerHTML = '';
+			return;
+		}
+
 		if (plainText.toLowerCase().startsWith('/kick')) {
 			if (canModerate) {
 				let targetName = plainText.split(' ').slice(1).join(' ').replace('@', '').trim();
@@ -79104,6 +79265,7 @@ function getVisibleChatStackEl(id) {
 			profileModal.style.display = 'flex';
 			requestAnimationFrame(() => {
 				profileModal.classList.add('show');
+				if (typeof window.updateOpenProfileSpamProtection === 'function') window.updateOpenProfileSpamProtection(username);
 				if (isMe) prewarmProfileCardStyleOptions();
 				setTimeout(() => {
 					const modalContent = document.querySelector('#modal-sys-profile .modal-content');
@@ -85185,7 +85347,7 @@ function getVisibleChatStackEl(id) {
         // Technical fragments may appear inside otherwise translatable UI copy. Keep the
         // surrounding sentence translatable, but never send commands, paths, addresses,
         // IDs or measurement values to the translation service.
-        reserveMatcher(/\/(?:kick|ban|unban|role|resetpassword|clean|reload)\b/gi, 'CMD');
+        reserveMatcher(/\/(?:kick|unspam|ban|unban|role|resetpassword|clean|reload)\b/gi, 'CMD');
         reserveMatcher(/\/(?:dev_[A-Za-z0-9._-]+)(?:\/[A-Za-z0-9 ._~!$&'()+,;=@%\-\[\]]+)*\/?/gi, 'PATH');
         reserveMatcher(/\b(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?\b/g, 'IP');
         reserveMatcher(/\b(?:[0-9A-F]{2}[:-]){5}[0-9A-F]{2}\b/gi, 'MAC');
@@ -86349,6 +86511,8 @@ function getVisibleChatStackEl(id) {
         "You cannot kick this user.",
         "User not found or offline.",
         "Only admins/moderators can use the /kick command.",
+        "Only admins/moderators can use /unspam.",
+        "Use: /unspam @Username",
         "Use: /ban @Username",
         "Only admins can use the /ban command.",
         "Use: /unban @Username",
