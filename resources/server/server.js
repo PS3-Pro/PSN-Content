@@ -992,14 +992,25 @@ app.post('/api/site-visits', async (req, res) => {
 });
 
 // ============================================================================
-// Metadata proxy: IGDB / Steam
+// Metadata proxy: PS Store / RAWG / IGDB / Steam
 // ============================================================================
 const DEFAULT_IGDB_CLIENT_ID = String(process.env.IGDB_CLIENT_ID || process.env.TWITCH_CLIENT_ID || '').trim();
 const DEFAULT_IGDB_CLIENT_SECRET = String(process.env.IGDB_CLIENT_SECRET || process.env.TWITCH_CLIENT_SECRET || '').trim();
 const METADATA_PROXY_TIMEOUT_MS = Math.max(2500, parseInt(process.env.METADATA_PROXY_TIMEOUT_MS || '8000', 10) || 8000);
 const METADATA_PROXY_CACHE_MS = Math.max(60000, parseInt(process.env.METADATA_PROXY_CACHE_MS || '1800000', 10) || 1800000);
-const METADATA_PROXY_CACHE_MAX = Math.max(50, Math.min(1000, parseInt(process.env.METADATA_PROXY_CACHE_MAX || '300', 10) || 300));
+
+// Metadata cache tuning: change METADATA_CACHE_MAX_ITEMS in Render (or the fallback below)
+// to raise/lower the total number of cached metadata responses without touching the code path.
+const METADATA_CACHE_MAX_ITEMS = Math.max(50, Math.min(1000, parseInt(
+  process.env.METADATA_CACHE_MAX_ITEMS || process.env.METADATA_PROXY_CACHE_MAX || '300',
+  10
+) || 300));
+const METADATA_PROXY_CACHE_MAX = METADATA_CACHE_MAX_ITEMS;
+const METADATA_LIVE_SCHEMA_VERSION = 1;
+const METADATA_LIVE_PENDING_MAX = Math.max(2, Math.min(24, parseInt(process.env.METADATA_LIVE_PENDING_MAX || '8', 10) || 8));
+const RAWG_SERVER_KEYS = String(process.env.RAWG_KEYS || process.env.RAWG_API_KEYS || process.env.RAWG_KEY || '').split(/[\s,;]+/).map(value => value.trim()).filter(Boolean).slice(0, 16);
 const metadataProxyCache = new Map();
+const metadataLiveProviderPending = new Map();
 let igdbAccessToken = '';
 let igdbAccessTokenExpiresAt = 0;
 let igdbAccessTokenPromise = null;
@@ -1008,7 +1019,8 @@ let igdbAccessTokenClientId = '';
 function setMetadataCors(res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-IGDB-Client-ID, X-IGDB-Client-Secret');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-IGDB-Client-ID, X-IGDB-Client-Secret, X-RAWG-Key');
+  res.setHeader('Access-Control-Max-Age', '600');
   res.setHeader('Vary', 'Origin');
 }
 
@@ -1019,6 +1031,8 @@ function getMetadataProxyCache(key) {
     metadataProxyCache.delete(key);
     return null;
   }
+  metadataProxyCache.delete(key);
+  metadataProxyCache.set(key, entry);
   return entry.value;
 }
 
@@ -1080,6 +1094,270 @@ function requestMetadataJson(rawUrl, options = {}) {
     if (body) req.write(body);
     req.end();
   });
+}
+
+
+function getPsnStoreLocaleServer(region, contentId) {
+  const cleanRegion = String(region || '').trim().toUpperCase();
+  const cleanContentId = String(contentId || '').trim().toUpperCase();
+  if (cleanContentId.startsWith('JP') || cleanRegion === 'JP') return { country: 'JP', language: 'ja' };
+  if (cleanContentId.startsWith('KP') || cleanRegion === 'KR') return { country: 'KR', language: 'ko' };
+  if (cleanContentId.startsWith('HP') || cleanContentId.startsWith('AP') || cleanRegion === 'ASIA') return { country: 'HK', language: 'en' };
+  if (cleanContentId.startsWith('EP') || cleanRegion === 'EU') return { country: 'GB', language: 'en' };
+  return { country: 'US', language: 'en' };
+}
+
+function getPsnStoreMetadataUrlServer(titleId, contentId, region) {
+  const cleanContentId = String(contentId || '').trim();
+  const cleanTitleId = String(titleId || '').trim();
+  const identifier = cleanContentId && cleanContentId !== 'MISSING' ? cleanContentId : cleanTitleId;
+  if (!identifier) return '';
+  const locale = getPsnStoreLocaleServer(region, cleanContentId);
+  const endpoint = cleanContentId && cleanContentId !== 'MISSING' ? 'container' : 'titlecontainer';
+  return `https://store.playstation.com/store/api/chihiro/00_09_000/${endpoint}/${locale.country}/${locale.language}/19/${encodeURIComponent(identifier)}`;
+}
+
+function compactPsnStoreMetadataServer(data) {
+  if (!data || typeof data !== 'object') return null;
+  const descriptionKeys = new Set(['long_desc', 'longDesc', 'long_description', 'longDescription', 'description', 'short_desc', 'shortDesc', 'short_description', 'shortDescription']);
+  const providerKeys = new Set(['provider_name', 'providerName', 'publisher_name', 'publisherName']);
+  const releaseKeys = new Set(['release_date', 'releaseDate']);
+  const seen = new Set();
+  let description = '';
+  let provider = '';
+  let releaseDate = '';
+  let inspected = 0;
+  const walk = node => {
+    if (!node || typeof node !== 'object' || seen.has(node) || inspected >= 700) return;
+    seen.add(node);
+    inspected++;
+    if (Array.isArray(node)) { for (const item of node) walk(item); return; }
+    for (const [key, value] of Object.entries(node)) {
+      if (typeof value === 'string') {
+        const clean = value.trim();
+        if (descriptionKeys.has(key) && clean.length > description.length && !/^item\s+not\s+found\b/i.test(clean)) description = clean;
+        if (!provider && providerKeys.has(key) && clean) provider = clean;
+        if (!releaseDate && releaseKeys.has(key) && clean) releaseDate = clean;
+      }
+    }
+    if (description.length >= 120 && provider && releaseDate) return;
+    for (const value of Object.values(node)) if (value && typeof value === 'object') walk(value);
+  };
+  walk(data);
+  if (!description && !provider && !releaseDate) return null;
+  const compact = {};
+  if (description) compact.description = description.slice(0, 32768);
+  if (provider) compact.provider_name = provider.slice(0, 512);
+  if (releaseDate) compact.release_date = releaseDate.slice(0, 128);
+  return compact;
+}
+
+function normalizeLiveMetadataTitle(value) {
+  let text = String(value || '');
+  try { text = text.normalize('NFKD').replace(/[\u0300-\u036f]/g, ''); } catch (error) {}
+  const romanMap = { ii: '2', iii: '3', iv: '4', v: '5', vi: '6', vii: '7', viii: '8', ix: '9', x: '10' };
+  return text.replace(/[™®©]/g, ' ').replace(/&/g, ' and ').replace(/[’']/g, '').toLowerCase().replace(/\bgame of the year\b/g, ' goty ').replace(/[^a-z0-9]+/g, ' ').replace(/\s+/g, ' ').trim().split(' ').map(token => romanMap[token] || token).join(' ');
+}
+
+function cleanLiveMetadataCatalogTitle(value) {
+  let text = String(value || '').trim();
+  const trailingTags = /\s*\((?:trial(?: to full)?|demo|psx|ps1|ps2(?: classics?| classic)?|ps3|psp|mini(?:s)?|version[^)]*|download ver\.?|full game|russian[^)]*|uk english|english|french|german|italian|spanish|polish|japanese|korean|chinese|taiwanese)[^)]*\)\s*$/i;
+  for (let pass = 0; pass < 4; pass++) {
+    const next = text.replace(trailingTags, '').trim();
+    if (next === text) break;
+    text = next;
+  }
+  return text.replace(/\s+PlayStation\s*3\s+the\s+Best\s*$/i, '').trim();
+}
+
+const LIVE_METADATA_BUNDLE_SUFFIXES = ['digital deluxe edition','deluxe edition','complete edition','gold edition','game of the year edition','goty edition','goty','ultimate evil edition','ultimate edition','premium edition','limited edition','collectors edition','collector edition','all in one edition','templar edition','legion edition','victory edition','digital edition','the ultimate box','the complete tale','complete collection'];
+const LIVE_METADATA_VARIANT_SUFFIXES = ['hd edition','hd remaster','remastered','remaster','bfg edition','megaton edition','arcade edition','online edition','playstation 3 edition','playstation3 edition','move edition','anniversary edition','anniversary','directors cut','extended edition','special edition','alternative edition','addition edition','giant edition','multiplayer edition','home run derby edition','hd version','hd ver','hd remix','on fire edition','championship edition','trial edition','final edition','grand edition','party edition','converted edition','collected edition','hd'];
+function getLiveMetadataEditionPolicy(value) {
+  const normalized = normalizeLiveMetadataTitle(cleanLiveMetadataCatalogTitle(value));
+  if (!normalized) return { kind: 'none', normalized: '', baseTitle: '', suffix: '' };
+  for (const suffix of LIVE_METADATA_VARIANT_SUFFIXES) if (normalized.endsWith(` ${suffix}`)) return { kind: 'variant', normalized, baseTitle: '', suffix };
+  const numberedAnniversary = normalized.match(/^(.*)\s+\d+\s+anniversary(?:\s+edition)?$/);
+  if (numberedAnniversary) return { kind: 'variant', normalized, baseTitle: '', suffix: 'numbered anniversary' };
+  for (const suffix of LIVE_METADATA_BUNDLE_SUFFIXES) {
+    if (!normalized.endsWith(` ${suffix}`)) continue;
+    const baseTitle = normalized.slice(0, -(suffix.length + 1)).trim();
+    if (baseTitle) return { kind: 'bundle', normalized, baseTitle, suffix };
+  }
+  return { kind: 'none', normalized, baseTitle: '', suffix: '' };
+}
+
+const LIVE_METADATA_STOP_WORDS = new Set(['the','a','an','of','and','for','to','in','on','with','edition']);
+const getLiveMetadataTokens = value => normalizeLiveMetadataTitle(value).split(' ').filter(token => token && !LIVE_METADATA_STOP_WORDS.has(token));
+function getLiveMetadataCandidatePlatforms(candidate = {}) {
+  const direct = Array.isArray(candidate.platforms) ? candidate.platforms : [];
+  return direct.map(item => typeof item === 'string' ? item : (item && item.platform && item.platform.name ? item.platform.name : (item && item.name ? item.name : ''))).map(normalizeLiveMetadataTitle).filter(Boolean);
+}
+function scoreLiveMetadataCandidate(targetTitle, candidate = {}, releaseYear = '', platformHints = ['playstation 3','ps3']) {
+  const target = normalizeLiveMetadataTitle(cleanLiveMetadataCatalogTitle(targetTitle));
+  const candidateName = normalizeLiveMetadataTitle(candidate.name || '');
+  if (!target || !candidateName) return 0;
+  let score = 0;
+  if (target === candidateName) score = 100;
+  else {
+    const targetTokens = getLiveMetadataTokens(target);
+    const candidateTokens = getLiveMetadataTokens(candidateName);
+    const targetSet = new Set(targetTokens);
+    const candidateSet = new Set(candidateTokens);
+    const shared = [...targetSet].filter(token => candidateSet.has(token)).length;
+    if (targetSet.size && candidateSet.size) {
+      const targetCoverage = shared / targetSet.size;
+      const candidateCoverage = shared / candidateSet.size;
+      score = Math.round(((targetCoverage * 0.62) + (candidateCoverage * 0.38)) * 74);
+      if (targetCoverage === 1) score = Math.max(score, 82);
+      if (candidateCoverage === 1) score = Math.max(score, 66);
+    }
+    if (target.includes(candidateName) || candidateName.includes(target)) score = Math.max(score, 66);
+    if (targetTokens.length >= 2 && candidateTokens.length >= 2 && targetTokens[0] === candidateTokens[0] && targetTokens[1] === candidateTokens[1]) score += 6;
+    const targetNumbers = targetTokens.filter(token => /\d/.test(token));
+    const candidateNumbers = candidateTokens.filter(token => /\d/.test(token));
+    if (targetNumbers.length && candidateNumbers.length) {
+      const sharedNumbers = targetNumbers.filter(token => candidateNumbers.includes(token));
+      if (!sharedNumbers.length) score -= 45;
+      else if (new Set([...targetNumbers, ...candidateNumbers]).size > new Set(sharedNumbers).size) score -= 18;
+    }
+  }
+  const targetPolicy = getLiveMetadataEditionPolicy(targetTitle);
+  const candidatePolicy = getLiveMetadataEditionPolicy(candidate.name || '');
+  if (targetPolicy.kind === 'bundle' && candidatePolicy.kind === 'none' && targetPolicy.baseTitle === candidateName) score = Math.min(score, 74);
+  if (targetPolicy.kind === 'variant' && candidatePolicy.kind === 'none') score = Math.min(score, 64);
+  if (targetPolicy.kind === 'variant' && candidatePolicy.kind === 'variant' && targetPolicy.suffix && candidatePolicy.suffix && targetPolicy.suffix !== candidatePolicy.suffix) score -= 18;
+  const expectedYear = Number.parseInt(releaseYear, 10);
+  const candidateYearMatch = String(candidate.released || candidate.releaseDate || '').match(/\b(19|20)\d{2}\b/);
+  const candidateYear = candidateYearMatch ? Number.parseInt(candidateYearMatch[0], 10) : NaN;
+  if (Number.isFinite(expectedYear) && Number.isFinite(candidateYear)) {
+    const diff = Math.abs(expectedYear - candidateYear);
+    if (diff === 0) score += 6;
+    else if (diff === 1) score += 3;
+    else if (diff >= 5) score -= 10;
+    else if (diff >= 2) score -= 4;
+  }
+  const platforms = getLiveMetadataCandidatePlatforms(candidate);
+  if (platforms.length) {
+    const hints = (Array.isArray(platformHints) ? platformHints : [platformHints]).map(normalizeLiveMetadataTitle).filter(Boolean);
+    if (platforms.some(platform => hints.some(hint => platform === hint || platform.includes(hint) || hint.includes(platform)))) score += 8;
+  }
+  return Math.max(0, Math.min(100, Math.round(score)));
+}
+function pickLiveMetadataCandidate(results, targetTitle, minScore, releaseYear, platformHints) {
+  let best = null;
+  let bestScore = -1;
+  for (const candidate of Array.isArray(results) ? results : []) {
+    const score = scoreLiveMetadataCandidate(targetTitle, candidate, releaseYear, platformHints);
+    if (score > bestScore) { best = candidate; bestScore = score; }
+  }
+  return { candidate: bestScore >= minScore ? best : null, best, score: bestScore };
+}
+
+function normalizeRawgLiveDetails(details = {}, screenshots = []) {
+  const names = (items, limit) => (Array.isArray(items) ? items : []).map(item => String(item && item.name || '').trim().slice(0, 256)).filter(Boolean).slice(0, limit).map(name => ({ name }));
+  const platforms = (Array.isArray(details.platforms) ? details.platforms : []).map(item => String(item && item.platform && item.platform.name || item && item.name || '').trim()).filter(Boolean);
+  return {
+    id: details.id || null,
+    slug: String(details.slug || '').trim(),
+    name: String(details.name || '').trim(),
+    released: String(details.released || '').trim(),
+    description_raw: String(details.description_raw || details.description || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 32768),
+    metacritic: Number.isFinite(Number(details.metacritic)) ? Number(details.metacritic) : null,
+    playtime: Number.isFinite(Number(details.playtime)) ? Number(details.playtime) : 0,
+    developers: names(details.developers, 4),
+    publishers: names(details.publishers, 3),
+    genres: names(details.genres, 6),
+    tags: names(details.tags, 80),
+    platforms,
+    screenshots: (Array.isArray(screenshots) ? screenshots : []).map(value => String(value || '').trim()).filter(Boolean).slice(0, 8),
+    source: 'rawg'
+  };
+}
+
+function getRawgKeysForLiveRequest(req) {
+  const values = RAWG_SERVER_KEYS.slice();
+  const clientKey = String(req.get('x-rawg-key') || '').trim().slice(0, 128);
+  if (clientKey) values.push(clientKey);
+  return [...new Set(values)].slice(0, 4);
+}
+
+async function getOrLoadLiveMetadataProvider(cacheKey, loader) {
+  const cached = getMetadataProxyCache(cacheKey);
+  if (cached) return { value: cached, cached: true };
+  if (metadataLiveProviderPending.has(cacheKey)) return { value: await metadataLiveProviderPending.get(cacheKey), cached: false, shared: true };
+  if (metadataLiveProviderPending.size >= METADATA_LIVE_PENDING_MAX) {
+    const err = new Error('Metadata live provider queue is busy.');
+    err.code = 'METADATA_LIVE_BUSY';
+    throw err;
+  }
+  const pending = Promise.resolve().then(loader).then(value => {
+    if (value) setMetadataProxyCache(cacheKey, value);
+    return value;
+  }).finally(() => { metadataLiveProviderPending.delete(cacheKey); });
+  metadataLiveProviderPending.set(cacheKey, pending);
+  return { value: await pending, cached: false };
+}
+
+async function loadPsnStoreLiveMetadata(titleId, contentId, region) {
+  const url = getPsnStoreMetadataUrlServer(titleId, contentId, region);
+  if (!url) return null;
+  const cacheKey = `live-v${METADATA_LIVE_SCHEMA_VERSION}:psn:${url}`;
+  const loaded = await getOrLoadLiveMetadataProvider(cacheKey, async () => {
+    const response = await requestMetadataJson(url, { timeoutMs: Math.min(METADATA_PROXY_TIMEOUT_MS, 4000), headers: { 'User-Agent': 'PSN-Content-Metadata/1.0' } });
+    if (!response.ok || !response.data || typeof response.data !== 'object') {
+      const err = new Error(`PlayStation Store metadata failed (HTTP ${response.status || 0}).`);
+      err.status = response.status || 502;
+      throw err;
+    }
+    return compactPsnStoreMetadataServer(response.data);
+  });
+  return loaded.value;
+}
+
+async function loadRawgLiveMetadata(name, releaseYear, platformHints, rawgKeys) {
+  const lookupTitle = cleanLiveMetadataCatalogTitle(name) || String(name || '').trim();
+  if (!lookupTitle || !Array.isArray(rawgKeys) || !rawgKeys.length) return null;
+  const editionPolicy = getLiveMetadataEditionPolicy(lookupTitle);
+  const specs = [{ query: lookupTitle, target: lookupTitle, minScore: 80, kind: 'full-title' }];
+  if (editionPolicy.kind === 'bundle' && editionPolicy.baseTitle) specs.push({ query: editionPolicy.baseTitle, target: editionPolicy.baseTitle, minScore: 86, kind: 'bundle-base' });
+  const cacheKey = `live-v${METADATA_LIVE_SCHEMA_VERSION}:rawg:${normalizeLiveMetadataTitle(lookupTitle)}:${String(releaseYear || '')}:${(platformHints || []).join(',').toLowerCase()}`;
+  const loaded = await getOrLoadLiveMetadataProvider(cacheKey, async () => {
+    for (const spec of specs) {
+      for (const key of rawgKeys) {
+        const searchUrl = new URL('https://api.rawg.io/api/games');
+        searchUrl.searchParams.set('key', key);
+        searchUrl.searchParams.set('search', spec.query);
+        searchUrl.searchParams.set('page_size', '5');
+        let searchResponse;
+        try { searchResponse = await requestMetadataJson(searchUrl, { timeoutMs: Math.min(METADATA_PROXY_TIMEOUT_MS, 3500), headers: { 'User-Agent': 'PSN-Content-Metadata/1.0' } }); }
+        catch (error) { continue; }
+        if ([401, 403, 429].includes(Number(searchResponse.status || 0))) continue;
+        if (!searchResponse.ok || !searchResponse.data || !Array.isArray(searchResponse.data.results)) break;
+        const match = pickLiveMetadataCandidate(searchResponse.data.results, spec.target, spec.minScore, releaseYear, platformHints);
+        if (!match.candidate) break;
+        const slug = String(match.candidate.slug || '').trim();
+        if (!slug) break;
+        const detailsUrl = new URL(`https://api.rawg.io/api/games/${encodeURIComponent(slug)}`);
+        detailsUrl.searchParams.set('key', key);
+        const screenshotsUrl = new URL(`https://api.rawg.io/api/games/${encodeURIComponent(slug)}/screenshots`);
+        screenshotsUrl.searchParams.set('key', key);
+        const [detailsSettled, screensSettled] = await Promise.allSettled([
+          requestMetadataJson(detailsUrl, { timeoutMs: Math.min(METADATA_PROXY_TIMEOUT_MS, 3500), headers: { 'User-Agent': 'PSN-Content-Metadata/1.0' } }),
+          requestMetadataJson(screenshotsUrl, { timeoutMs: Math.min(METADATA_PROXY_TIMEOUT_MS, 3500), headers: { 'User-Agent': 'PSN-Content-Metadata/1.0' } })
+        ]);
+        if (detailsSettled.status !== 'fulfilled' || !detailsSettled.value.ok || !detailsSettled.value.data) continue;
+        if (screensSettled.status !== 'fulfilled' || !screensSettled.value.ok || !screensSettled.value.data || !Array.isArray(screensSettled.value.data.results)) continue;
+        const screenshots = screensSettled.value.data.results.map(item => String(item && item.image || '').trim()).filter(Boolean).slice(0, 8);
+        return {
+          details: normalizeRawgLiveDetails(detailsSettled.value.data, screenshots),
+          screenshots,
+          match: { kind: spec.kind, score: match.score, name: String(match.candidate.name || '').trim() }
+        };
+      }
+    }
+    return null;
+  });
+  return loaded.value;
 }
 
 async function getIgdbAccessToken(clientId = DEFAULT_IGDB_CLIENT_ID, clientSecret = DEFAULT_IGDB_CLIENT_SECRET, forceRefresh = false) {
@@ -1202,6 +1480,49 @@ function normalizeSteamDetails(appId, data = {}) {
     source: 'steam'
   };
 }
+
+app.options('/api/metadata/live', (req, res) => { setMetadataCors(res); res.status(204).end(); });
+app.get('/api/metadata/live', async (req, res) => {
+  setMetadataCors(res);
+  const include = ['all', 'psn', 'rawg'].includes(String(req.query && req.query.include || 'all').toLowerCase()) ? String(req.query && req.query.include || 'all').toLowerCase() : 'all';
+  const titleId = String(req.query && req.query.titleId || '').trim().slice(0, 64);
+  const contentId = String(req.query && req.query.contentId || '').trim().slice(0, 160);
+  const region = String(req.query && req.query.region || '').trim().slice(0, 16);
+  const name = String(req.query && req.query.name || '').trim().slice(0, 220);
+  const releaseYear = String(req.query && req.query.releaseYear || '').trim().slice(0, 8);
+  const platformHints = String(req.query && req.query.platform || '').split(',').map(value => value.trim()).filter(Boolean).slice(0, 4);
+  if (!titleId && !contentId && !name) return res.status(400).json({ ok: false, schemaVersion: METADATA_LIVE_SCHEMA_VERSION, error: 'Missing metadata identity.' });
+
+  const payload = { ok: true, schemaVersion: METADATA_LIVE_SCHEMA_VERSION, psnStore: null, rawg: null, providerStatus: {} };
+  const tasks = [];
+  if (include === 'all' || include === 'psn') {
+    tasks.push((async () => {
+      try {
+        payload.psnStore = await loadPsnStoreLiveMetadata(titleId, contentId, region);
+        payload.providerStatus.psn = payload.psnStore ? 'ok' : 'not-found';
+      } catch (err) {
+        payload.providerStatus.psn = err && err.code === 'METADATA_LIVE_BUSY' ? 'busy' : 'error';
+      }
+    })());
+  }
+  if (include === 'all' || include === 'rawg') {
+    tasks.push((async () => {
+      const keys = getRawgKeysForLiveRequest(req);
+      if (!keys.length || !name) {
+        payload.providerStatus.rawg = !name ? 'not-requested' : 'unconfigured';
+        return;
+      }
+      try {
+        payload.rawg = await loadRawgLiveMetadata(name, releaseYear, platformHints.length ? platformHints : ['playstation 3', 'ps3'], keys);
+        payload.providerStatus.rawg = payload.rawg ? 'ok' : 'not-found';
+      } catch (err) {
+        payload.providerStatus.rawg = err && err.code === 'METADATA_LIVE_BUSY' ? 'busy' : 'error';
+      }
+    })());
+  }
+  await Promise.all(tasks);
+  return res.json(payload);
+});
 
 app.options('/api/metadata/igdb', (req, res) => { setMetadataCors(res); res.status(204).end(); });
 app.options('/api/metadata/steam/search', (req, res) => { setMetadataCors(res); res.status(204).end(); });

@@ -25610,21 +25610,91 @@ P
 	};
 
 
-	window.fetchPsnStoreMetadata = async function(titleId, contentId, region) {
+
+	function getMetadataServerBaseCompat() {
+		try {
+			if (typeof serverUrls !== 'undefined' && Array.isArray(serverUrls) && serverUrls.length) {
+				const index = typeof currentServerIndex !== 'undefined' ? Math.max(0, Number(currentServerIndex) || 0) : 0;
+				return String(serverUrls[index] || serverUrls[0] || '').replace(/\/+$/, '');
+			}
+		} catch (error) {}
+		return '';
+	}
+
+	window.__psnLiveMetadataPending = window.__psnLiveMetadataPending instanceof Map ? window.__psnLiveMetadataPending : new Map();
+	window.fetchPsnLiveMetadata = async function(options = {}) {
+		const include = ['all', 'psn', 'rawg'].includes(String(options.include || 'all')) ? String(options.include || 'all') : 'all';
+		const titleId = String(options.titleId || '').trim();
+		const contentId = String(options.contentId || '').trim();
+		const region = String(options.region || '').trim();
+		const name = String(options.name || '').trim();
+		const releaseYear = String(options.releaseYear || '').trim();
+		const platformHints = Array.isArray(options.platformHints) ? options.platformHints.map(value => String(value || '').trim()).filter(Boolean).slice(0, 4) : [];
+		if (!titleId && !contentId && !name) return null;
+
+		const params = new URLSearchParams();
+		params.set('include', include);
+		if (titleId) params.set('titleId', titleId);
+		if (contentId) params.set('contentId', contentId);
+		if (region) params.set('region', region);
+		if (name) params.set('name', name);
+		if (releaseYear) params.set('releaseYear', releaseYear);
+		if (platformHints.length) params.set('platform', platformHints.join(','));
+		const base = getMetadataServerBaseCompat();
+		if (!base) return null;
+		const url = `${base}/api/metadata/live?${params.toString()}`;
+		if (window.__psnLiveMetadataPending.has(url)) return window.__psnLiveMetadataPending.get(url);
+
+		const pending = (async () => {
+			const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+			const timer = controller ? setTimeout(() => controller.abort(), include === 'psn' ? 5000 : 7500) : null;
+			const headers = {};
+			try {
+				if (typeof RAWG_KEYS !== 'undefined' && Array.isArray(RAWG_KEYS) && RAWG_KEYS.length && typeof currentRawgKeyIndex !== 'undefined') {
+					const rawgKey = String(RAWG_KEYS[Math.max(0, Number(currentRawgKeyIndex) || 0) % RAWG_KEYS.length] || '').trim();
+					if (rawgKey) headers['X-RAWG-Key'] = rawgKey;
+				}
+			} catch (error) {}
+			try {
+				const response = await fetch(url, { cache: 'no-store', headers, signal: controller ? controller.signal : undefined });
+				if (!response.ok) return null;
+				const payload = await response.json();
+				return payload && payload.ok === true ? payload : null;
+			} catch (error) {
+				return null;
+			} finally {
+				if (timer) clearTimeout(timer);
+			}
+		})();
+		window.__psnLiveMetadataPending.set(url, pending);
+		try { return await pending; }
+		finally { if (window.__psnLiveMetadataPending.get(url) === pending) window.__psnLiveMetadataPending.delete(url); }
+	};
+
+	window.fetchPsnStoreMetadata = async function(titleId, contentId, region, options = {}) {
 		const apiUrl = window.getPsnStoreApiUrl(titleId, contentId, region, false);
 		if (!apiUrl) return null;
 		if (Object.prototype.hasOwnProperty.call(window.__psnStoreMetadataCache, apiUrl)) return window.__psnStoreMetadataCache[apiUrl];
 		if (window.__psnStoreMetadataPending[apiUrl]) return window.__psnStoreMetadataPending[apiUrl];
 
 		const pending = (async () => {
+			let result = null;
+			if (!(options && options.skipLive === true)) {
+				try {
+					const live = typeof window.fetchPsnLiveMetadata === 'function'
+						? await window.fetchPsnLiveMetadata({ include: 'psn', titleId, contentId, region })
+						: null;
+					if (live && live.psnStore && typeof live.psnStore === 'object') result = live.psnStore;
+				} catch (error) {}
+			}
+
 			const encoded = encodeURIComponent(apiUrl);
 			const attempts = [
 				apiUrl,
 				`https://api.allorigins.win/raw?url=${encoded}`,
 				`https://corsproxy.io/?${encoded}`
 			];
-			let result = null;
-			for (const url of attempts) {
+			for (const url of result ? [] : attempts) {
 				const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
 				const timer = controller ? setTimeout(() => controller.abort(), 3500) : null;
 				try {
@@ -33921,23 +33991,16 @@ P
 		});
 		return { candidate: bestScore >= minScore ? best : null, best, score: bestScore };
 	};
-	const getMetadataServerBase = () => {
-		try {
-			if (typeof serverUrls !== 'undefined' && Array.isArray(serverUrls) && serverUrls.length) {
-				const index = typeof currentServerIndex !== 'undefined' ? Math.max(0, Number(currentServerIndex) || 0) : 0;
-				return String(serverUrls[index] || serverUrls[0] || '').replace(/\/+$/, '');
-			}
-		} catch (error) {}
-		return '';
-	};
+	const getMetadataServerBase = () => getMetadataServerBaseCompat();
 
 	/* GAME MODAL RESOLVED-DATA CACHE: keep the exact modal DOM presentation, but avoid
 	   repeating provider search/matching/parsing when the same game is reopened. */
+	const GAME_MODAL_RESOLVED_CACHE_SCHEMA = 2;
 	const GAME_MODAL_RESOLVED_CACHE_TTL = 30 * 60 * 1000;
 	const GAME_MODAL_RESOLVED_CACHE_MAX = 72;
 	const gameModalResolvedMetadataCache = new Map();
 	const GAME_MODAL_RESOLVED_IDB_NAME = 'psn_game_modal_metadata_cache';
-	const GAME_MODAL_RESOLVED_IDB_VERSION = 1;
+	const GAME_MODAL_RESOLVED_IDB_VERSION = 2;
 	const GAME_MODAL_RESOLVED_IDB_STORE = 'snapshots';
 	const GAME_MODAL_RESOLVED_IDB_MAX = 120;
 	let gameModalResolvedIdbPromise = null;
@@ -33954,11 +34017,11 @@ P
 		const tid = String(gameId || '').trim().toUpperCase();
 		const reg = String(region || '').trim().toUpperCase();
 		const name = normalizeMetadataMatchTitle(cleanMetadataCatalogTitle(gameName || ''));
-		return `${cid || tid || name}|${tid}|${reg}|${name}|meta:${String(metadataRevision || '')}`;
+		return `schema:${GAME_MODAL_RESOLVED_CACHE_SCHEMA}|${cid || tid || name}|${tid}|${reg}|${name}|meta:${String(metadataRevision || '')}`;
 	}
 
 	function rememberGameModalResolvedMetadataEntry(cacheKey, entry) {
-		if (!cacheKey || !entry || !entry.snapshot) return null;
+		if (!cacheKey || !entry || !entry.snapshot || Number(entry.schemaVersion || 0) !== GAME_MODAL_RESOLVED_CACHE_SCHEMA) return null;
 		gameModalResolvedMetadataCache.delete(cacheKey);
 		gameModalResolvedMetadataCache.set(cacheKey, entry);
 		while (gameModalResolvedMetadataCache.size > GAME_MODAL_RESOLVED_CACHE_MAX) gameModalResolvedMetadataCache.delete(gameModalResolvedMetadataCache.keys().next().value);
@@ -33968,6 +34031,10 @@ P
 	function getGameModalResolvedMetadataSnapshot(cacheKey) {
 		const entry = cacheKey ? gameModalResolvedMetadataCache.get(cacheKey) : null;
 		if (!entry) return null;
+		if (Number(entry.schemaVersion || 0) !== GAME_MODAL_RESOLVED_CACHE_SCHEMA) {
+			gameModalResolvedMetadataCache.delete(cacheKey);
+			return null;
+		}
 		if (Date.now() - Number(entry.at || 0) > GAME_MODAL_RESOLVED_CACHE_TTL) {
 			gameModalResolvedMetadataCache.delete(cacheKey);
 			return null;
@@ -33982,12 +34049,18 @@ P
 			let request;
 			try { request = indexedDB.open(GAME_MODAL_RESOLVED_IDB_NAME, GAME_MODAL_RESOLVED_IDB_VERSION); }
 			catch (error) { resolve(null); return; }
-			request.onupgradeneeded = () => {
+			request.onupgradeneeded = (event) => {
 				const db = request.result;
+				let store;
 				if (!db.objectStoreNames.contains(GAME_MODAL_RESOLVED_IDB_STORE)) {
-					const store = db.createObjectStore(GAME_MODAL_RESOLVED_IDB_STORE, { keyPath: 'key' });
-					store.createIndex('at', 'at', { unique: false });
+					store = db.createObjectStore(GAME_MODAL_RESOLVED_IDB_STORE, { keyPath: 'key' });
+				} else {
+					store = request.transaction.objectStore(GAME_MODAL_RESOLVED_IDB_STORE);
+					// This database contains only disposable provider snapshots. On an incompatible
+					// schema upgrade, clear just this cache instead of trying to reinterpret old DOM data.
+					if (Number(event.oldVersion || 0) < GAME_MODAL_RESOLVED_IDB_VERSION) store.clear();
 				}
+				if (!store.indexNames.contains('at')) store.createIndex('at', 'at', { unique: false });
 			};
 			request.onsuccess = () => resolve(request.result);
 			request.onerror = () => resolve(null);
@@ -34020,11 +34093,15 @@ P
 				} catch (error) { resolve(null); }
 			});
 			if (!entry || !entry.snapshot) return null;
+			if (Number(entry.schemaVersion || 0) !== GAME_MODAL_RESOLVED_CACHE_SCHEMA) {
+				deleteGameModalResolvedPersistentEntry(cacheKey);
+				return null;
+			}
 			if (Date.now() - Number(entry.at || 0) > GAME_MODAL_RESOLVED_CACHE_TTL) {
 				deleteGameModalResolvedPersistentEntry(cacheKey);
 				return null;
 			}
-			return rememberGameModalResolvedMetadataEntry(cacheKey, { at: Number(entry.at) || Date.now(), snapshot: entry.snapshot });
+			return rememberGameModalResolvedMetadataEntry(cacheKey, { schemaVersion: GAME_MODAL_RESOLVED_CACHE_SCHEMA, at: Number(entry.at) || Date.now(), snapshot: entry.snapshot });
 		})();
 		gameModalResolvedPersistentReads.set(cacheKey, pending);
 		try { return await pending; }
@@ -34064,7 +34141,7 @@ P
 						return;
 					}
 					const value = cursor.value || {};
-					if (now - Number(value.at || 0) > GAME_MODAL_RESOLVED_CACHE_TTL) cursor.delete();
+					if (Number(value.schemaVersion || 0) !== GAME_MODAL_RESOLVED_CACHE_SCHEMA || now - Number(value.at || 0) > GAME_MODAL_RESOLVED_CACHE_TTL) cursor.delete();
 					else rows.push({ key: value.key, at: Number(value.at || 0) });
 					cursor.continue();
 				};
@@ -34075,7 +34152,7 @@ P
 
 	function scheduleGameModalResolvedMetadataWrite(cacheKey, entry) {
 		if (!cacheKey || !entry || !entry.snapshot || typeof indexedDB === 'undefined') return;
-		gameModalResolvedPendingWrites.set(cacheKey, { key: cacheKey, at: Number(entry.at) || Date.now(), snapshot: entry.snapshot });
+		gameModalResolvedPendingWrites.set(cacheKey, { key: cacheKey, schemaVersion: GAME_MODAL_RESOLVED_CACHE_SCHEMA, at: Number(entry.at) || Date.now(), snapshot: entry.snapshot });
 		if (gameModalResolvedWriteHandle) return;
 		const run = () => { flushGameModalResolvedMetadataWrites().catch(() => {}); };
 		if (typeof requestIdleCallback === 'function') gameModalResolvedWriteHandle = requestIdleCallback(run, { timeout: 1200 });
@@ -34084,7 +34161,7 @@ P
 
 	function setGameModalResolvedMetadataSnapshot(cacheKey, snapshot) {
 		if (!cacheKey || !snapshot) return;
-		const entry = { at: Date.now(), snapshot };
+		const entry = { schemaVersion: GAME_MODAL_RESOLVED_CACHE_SCHEMA, at: Date.now(), snapshot };
 		rememberGameModalResolvedMetadataEntry(cacheKey, entry);
 		scheduleGameModalResolvedMetadataWrite(cacheKey, entry);
 	}
@@ -34404,13 +34481,29 @@ P
 		const editionPolicy = getMetadataEditionPolicy(metadataLookupTitle);
 		const metadataSearchSpecs = [{ query: metadataLookupTitle, target: metadataLookupTitle, minScore: 80, kind: 'full-title' }];
 		if (editionPolicy.kind === 'bundle' && editionPolicy.baseTitle) metadataSearchSpecs.push({ query: editionPolicy.baseTitle, target: editionPolicy.baseTitle, minScore: 86, kind: 'bundle-base' });
+		let liveMetadataPayload = null;
+		try {
+			liveMetadataPayload = typeof window.fetchPsnLiveMetadata === 'function'
+				? await window.fetchPsnLiveMetadata({
+					include: 'all',
+					titleId: gameId,
+					contentId,
+					region,
+					name: metadataLookupTitle,
+					releaseYear: contentMetadataOverride?.year || '',
+					platformHints: metadataPlatformHint
+				})
+				: null;
+			if (!isCurrentRequest()) return;
+		} catch (error) {}
+
 		let summaryTitleHtml = '<span style="font-size: 10px; color: var(--text-muted); font-weight: bold; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px; display: block;"><i class="fas fa-align-left" style="margin-right: 4px;"></i> Summary</span>';
 		let psnStoreSummary = String(contentMetadataOverride?.summary || '').trim();
 		if (psnStoreSummary && summaryContainer) summaryContainer.innerHTML = summaryTitleHtml + modalSafeText(psnStoreSummary).replace(/\n/g, '<br>');
 		let psnStoreMeta = { provider: '', releaseDate: '', releaseYear: '' };
 		let hasPsnStoreMeta = false;
 		try {
-			const psnStoreData = await window.fetchPsnStoreMetadata(gameId, contentId, region);
+			const psnStoreData = liveMetadataPayload?.psnStore || await window.fetchPsnStoreMetadata(gameId, contentId, region, { skipLive: !!liveMetadataPayload });
 			if (!isCurrentRequest()) return;
 			const providerSummary = window.extractPsnStoreDescription ? window.extractPsnStoreDescription(psnStoreData) : window.cleanPsnStoreDescription(psnStoreData?.long_desc || psnStoreData?.short_desc || '');
 			if (!psnStoreSummary) psnStoreSummary = providerSummary;
@@ -34445,7 +34538,8 @@ P
 		};
 		syncResolvedProviderMetadata();
 		const mergeMetadataDetails = (detailsData = {}) => {
-				const sourceDevelopers = getRawgNames(detailsData.developers || [], 2);
+			let changed = false;
+			const sourceDevelopers = getRawgNames(detailsData.developers || [], 2);
 			const sourcePublishers = getRawgNames(detailsData.publishers || [], 1);
 			if (!mergedMetadata.developers.length && !mergedMetadata.publishers.length) {
 				if (sourceDevelopers.length) { mergedMetadata.developers = sourceDevelopers.map(name => ({ name })); changed = true; }
@@ -34554,9 +34648,27 @@ P
 			return renderedScreenshots;
 		};
 
+		let rawgHandledByLiveEndpoint = false;
+		const liveRawg = liveMetadataPayload && liveMetadataPayload.rawg && typeof liveMetadataPayload.rawg === 'object' ? liveMetadataPayload.rawg : null;
+		if (liveRawg && liveRawg.details) {
+			const liveMatchKind = String(liveRawg.match?.kind || 'full-title');
+			const liveSearchSpec = metadataSearchSpecs.find(spec => spec.kind === liveMatchKind) || metadataSearchSpecs[0];
+			const verifiedLiveScore = scoreMetadataCandidate(liveSearchSpec.target, liveRawg.details, psnStoreMeta.releaseYear, metadataPlatformHint);
+			if (verifiedLiveScore >= liveSearchSpec.minScore) {
+				rawgHandledByLiveEndpoint = true;
+				console.debug(`[Metadata] Server RAWG ${liveSearchSpec.kind} match accepted for "${gameName}": "${liveRawg.details.name || ''}" (${verifiedLiveScore}/100).`);
+				const hasLiveRawgScreenshots = renderExternalMetadata(liveRawg.details, liveRawg.screenshots || liveRawg.details.screenshots || []);
+				if (hasLiveRawgScreenshots && metadataEnrichmentComplete()) {
+					setGameModalResolvedMetadataSnapshot(resolvedMetadataCacheKey, captureGameModalResolvedMetadataSnapshot(modalRoot));
+					return;
+				}
+			}
+		}
+
 		rawgSearchLoop:
 		for (const searchSpec of metadataSearchSpecs) {
 			if (!isCurrentRequest()) return;
+			if (rawgHandledByLiveEndpoint) break rawgSearchLoop;
 			for (let attempt = 0; attempt < RAWG_KEYS.length; attempt++) {
 				const activeKey = RAWG_KEYS[currentRawgKeyIndex];
 				try {
