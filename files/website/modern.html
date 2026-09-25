@@ -31993,7 +31993,15 @@ P
 		if (!token) return null;
 		const descriptor = normalizePsnContentDeepLinkDescriptor(value.descriptor);
 		const sharer = normalizePsnContentSharer(value.sharer);
-		return { token, descriptor, sharer, resolved: !!(descriptor && sharer) };
+		return {
+			token,
+			descriptor,
+			sharer,
+			resolved: !!(descriptor && sharer),
+			// A share opened during boot/login has no meaningful previous in-app view.
+			// Shares pasted into an already signed-in tab keep the normal navigation return path.
+			openedWhileLoggedIn: value.openedWhileLoggedIn === true
+		};
 	}
 
 	function storePendingSharedContent(value) {
@@ -32036,7 +32044,10 @@ P
 		const params = getPsnContentHashParams();
 		const token = normalizePsnContentShareToken(params.get(PSN_CONTENT_SHARE_HASH_KEY));
 		if (!token) return null;
-		storePendingSharedContent({ token });
+		storePendingSharedContent({
+			token,
+			openedWhileLoggedIn: window.isProfileLoaded === true
+		});
 		cleanConsumedSharedContentUrl();
 		return token;
 	};
@@ -32094,7 +32105,12 @@ P
 				const descriptor = normalizePsnContentDeepLinkDescriptor(response.descriptor);
 				const sharer = normalizePsnContentSharer(response.sharer);
 				if (!descriptor || !sharer) throw new Error('Shared link data is incomplete.');
-				return storePendingSharedContent({ token: pending.token, descriptor, sharer });
+				return storePendingSharedContent({
+					token: pending.token,
+					descriptor,
+					sharer,
+					openedWhileLoggedIn: pending.openedWhileLoggedIn === true
+				});
 			})
 			.catch(error => {
 				if (typeof showToastNotification === 'function') showToastNotification('Shared Content', error?.message || 'This shared link could not be opened.');
@@ -32377,10 +32393,14 @@ P
 			const titleId = String(item.id || item.titleId || descriptor.titleId || '').trim();
 			const contentId = String(item.contentId || descriptor.contentId || '').trim();
 			const title = String(item.cleanName || item.title || item.name || descriptor.name || '').trim();
+			// During boot/login there is no meaningful previous in-app destination, so the
+			// Store return bar must lead to Explore. In an already signed-in tab, let the
+			// existing navigation system capture the current view, filters and scroll state.
+			const sharedReturnPath = pending.openedWhileLoggedIn === true ? null : true;
 			clearPendingSharedContent();
 			removePsnSharedContentPrompt({ keepPending:true });
 			if (typeof window.searchGameOnSite === 'function') {
-				window.searchGameOnSite(titleId, null, descriptor.category, title, contentId);
+				window.searchGameOnSite(titleId, sharedReturnPath, descriptor.category, title, contentId);
 				return true;
 			}
 			return false;
