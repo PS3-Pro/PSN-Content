@@ -32599,7 +32599,7 @@ P
 					</div>
 					<div class="shared-content-sharer">
 						<button type="button" class="shared-content-sharer-main" data-no-translate="true" translate="no" title="View ${escapePsnSharedContentHtml(sharer.name)}'s profile" onmouseenter="if(typeof playUiHover === 'function') playUiHover()" onclick="openSharedContentSharerProfile(event)">
-							<span class="shared-content-sharer-avatar-wrap"><img class="shared-content-sharer-avatar" src="${escapePsnSharedContentHtml(avatar)}" alt=""><span class="shared-content-sharer-badge"><i class="fas fa-share-nodes"></i></span></span>
+							<span class="shared-content-sharer-avatar-wrap"><img class="shared-content-sharer-avatar" data-user="${escapePsnSharedContentHtml(sharer.name)}" src="${escapePsnSharedContentHtml(avatar)}" alt=""><span class="shared-content-sharer-badge"><i class="fas fa-share-nodes"></i></span></span>
 							<span class="shared-content-sharer-text"><span class="shared-content-sharer-label">SHARED BY</span><span class="shared-content-sharer-name-row"><span class="shared-content-sharer-name">${escapePsnSharedContentHtml(sharer.name)}</span>${roleLabel ? `<span class="shared-content-sharer-role">${escapePsnSharedContentHtml(roleLabel)}</span>` : ''}</span><span class="shared-content-sharer-hint">View profile</span></span>
 						</button>
 						${friendButton}
@@ -41427,6 +41427,7 @@ P
 	/* One bounded authority for user metadata + lookup throttles. Keep timestamps beside the
 	   snapshot so separate per-user maps cannot drift or grow forever. */
 	const PSN_USER_META_FRESH_MS = 60000;
+	const PSN_VISIBLE_AVATAR_FRESH_MS = 15000;
 	const PSN_USER_META_CACHE_MAX = 1024;
 	window.__freshPsnUserMetaByName = window.__freshPsnUserMetaByName instanceof Map ? window.__freshPsnUserMetaByName : new Map();
 	function touchPsnUserMetaCacheEntry(key, entry) {
@@ -41524,6 +41525,26 @@ P
 			window.refreshPsnUserMetaBatch(batch, options);
 		}, 40);
 		return true;
+	};
+
+	/* Keep every rendered user avatar on the same metadata path. This is intentionally
+	   scoped to visible/social DOM and batches usernames into one request, so Friends,
+	   Online Players, chat, Seen by, activity, notifications and player lists cannot
+	   drift into separate avatar caches. */
+	window.refreshVisiblePsnUserAvatars = function(root = document, options = {}) {
+		if (!root || typeof root.querySelectorAll !== 'function' || typeof window.queuePsnUserMetaRefresh !== 'function') return false;
+		const names = new Set();
+		root.querySelectorAll('img[data-user]').forEach(img => {
+			let name = String(img.getAttribute('data-user') || '').trim();
+			if (!name) return;
+			try { name = decodeURIComponent(name); } catch (e) {}
+			if (name && name !== 'Guest') names.add(name);
+		});
+		if (!names.size) return false;
+		return window.queuePsnUserMetaRefresh(Array.from(names), {
+			...options,
+			maxAge: Number.isFinite(Number(options.maxAge)) ? Math.max(0, Number(options.maxAge)) : PSN_VISIBLE_AVATAR_FRESH_MS
+		});
 	};
 
 	function adminGetUserRole(name, user = {}) {
@@ -59974,7 +59995,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
         if (event.reader && myName && String(event.reader) === myName && window.__chatSeenEmitPending instanceof Map) window.__chatSeenEmitPending.delete(msgId);
         if (changed) {
             if (semanticDataChanged && typeof markChatMessageSeenDataDirty === 'function') markChatMessageSeenDataDirty(msg);
-            if (semanticDataChanged && reader && typeof window.queuePsnUserMetaRefresh === 'function') window.queuePsnUserMetaRefresh(reader, { maxAge:PSN_USER_META_FRESH_MS });
+            if (semanticDataChanged && reader && typeof window.queuePsnUserMetaRefresh === 'function') window.queuePsnUserMetaRefresh(reader, { maxAge:PSN_VISIBLE_AVATAR_FRESH_MS });
             refreshChatSeenDomForMessage(msgId);
             scheduleChatPersistentCacheWrite();
         }
@@ -62624,8 +62645,9 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 		const source = raw.indexOf('<') === -1 ? raw : raw.replace(/<[^>]+>/g, ' ');
 		source.replace(/@([A-Za-z0-9][A-Za-z0-9_.-]{1,31})\b/g, function(match, name) {
 			if (!name) return match;
-			if (String(name).toLowerCase() === 'everyone') return match;
-			if (String(name).toLowerCase() === 'guest') return match;
+			const lowerName = String(name).toLowerCase();
+			if (lowerName === 'everyone' || lowerName === 'admin' || lowerName === 'moderator') return match;
+			if (lowerName === 'guest') return match;
 			names.push(name);
 			return match;
 		});
@@ -63041,6 +63063,24 @@ function getVisibleChatStackEl(id) {
 		});
 
 		const suggestionRows = [];
+
+		const roleSuggestionRows = [];
+		if ('admin'.includes(queryLower)) roleSuggestionRows.push(`
+			<div class="suggestion-item" data-value="admin" onmouseenter="clearChatSuggestionKeyboardActive(this)">
+				<i class="fas fa-shield-alt" style="color:#ff4444;font-size:10px;"></i>
+				<b style="color:#ff6b6b;margin-left:3px;" data-no-translate="true" translate="no">admin</b>
+				<span style="font-size:8px;opacity:.5;margin-left:5px;">(ALL ADMINS)</span>
+			</div>`);
+		if ('moderator'.includes(queryLower)) roleSuggestionRows.push(`
+			<div class="suggestion-item" data-value="moderator" onmouseenter="clearChatSuggestionKeyboardActive(this)">
+				<i class="fas fa-shield-alt" style="color:#8be8ff;font-size:10px;"></i>
+				<b style="color:#8be8ff;margin-left:3px;" data-no-translate="true" translate="no">moderator</b>
+				<span style="font-size:8px;opacity:.5;margin-left:5px;">(ALL MODERATORS)</span>
+			</div>`);
+		if (roleSuggestionRows.length) {
+			suggestionRows.push(`<div style="font-size:9px;color:#8b96a8;font-weight:bold;margin:6px 12px 2px 12px;letter-spacing:1px;">ROLES</div>`);
+			suggestionRows.push(...roleSuggestionRows);
+		}
 
 		if (canModerate && "everyone".includes(queryLower)) {
 			suggestionRows.push(`
@@ -66380,6 +66420,28 @@ function getVisibleChatStackEl(id) {
 		return /@everyone\b/i.test(String(text || ''));
 	}
 
+	function getChatRoleMentionTargets(text) {
+		const source = String(text || '');
+		if (source.indexOf('@') === -1) return [];
+		const roles = [];
+		if (/(^|[\s.,!?;:()\[\]{}<>\"'`])@admin\b/i.test(source)) roles.push('admin');
+		if (/(^|[\s.,!?;:()\[\]{}<>\"'`])@moderator\b/i.test(source)) roles.push('mod');
+		return roles;
+	}
+
+	function chatTextMentionsSessionRole(text) {
+		const roles = getChatRoleMentionTargets(text);
+		if (!roles.length) return false;
+		const sessionRole = typeof window.getPsnSessionRole === 'function' ? window.getPsnSessionRole() : (document.body.classList.contains('is-admin') ? 'admin' : (document.body.classList.contains('is-mod') ? 'mod' : 'user'));
+		return roles.includes(sessionRole);
+	}
+
+	function formatChatRoleMentionsForDisplay(messageText) {
+		return String(messageText || '')
+			.replace(/@admin\b(?![^<]*>)/gi, '<span class="chat-mention" data-chat-role-mention="admin" style="background:#ff4444;color:#fff;padding:2px 4px;border-radius:4px;font-weight:bold;font-size:10px;">@admin</span>')
+			.replace(/@moderator\b(?![^<]*>)/gi, '<span class="chat-mention" data-chat-role-mention="mod" style="background:#8be8ff;color:#07111d;padding:2px 4px;border-radius:4px;font-weight:bold;font-size:10px;">@moderator</span>');
+	}
+
 	function getChatGlobalPingRole(msg, fallbackUserName = '') {
 		const msgObj = (msg && typeof msg === 'object') ? msg : {};
 		const senderName = fallbackUserName || msgObj.user || '';
@@ -67515,6 +67577,7 @@ function getVisibleChatStackEl(id) {
 			}
 			registerChatMentionNames(mentionNames);
 			messageText = formatChatUserMentionsForDisplay(messageText);
+			messageText = formatChatRoleMentionsForDisplay(messageText);
 			if (isGlobal) messageText = formatEveryoneMentionForDisplay(messageText, globalPingVisual.role);
 		}
 		
@@ -71120,7 +71183,9 @@ function getVisibleChatStackEl(id) {
 			
 			const shouldPlayChatDotSound = !chatVisible && data.user !== myName;
 			if (!chatVisible && data.user !== myName && (typeof isChatNotificationSessionReady !== 'function' || isChatNotificationSessionReady())) {
-				const isMention = data.text && (typeof chatTextMentionsUser === 'function' ? chatTextMentionsUser(data.text, myName) : data.text.includes(`@${myName}`));
+				const directMention = data.text && (typeof chatTextMentionsUser === 'function' ? chatTextMentionsUser(data.text, myName) : data.text.includes(`@${myName}`));
+				const roleMention = data.text && typeof chatTextMentionsSessionRole === 'function' && chatTextMentionsSessionRole(data.text);
+				const isMention = !!(directMention || roleMention);
 				const isReply = data.replyTo && data.replyTo.user === myName;
 				if (isMention || isReply || data.isGlobalPing) showChatNotification(data.user, isMention, data.isGlobalPing, data.globalPingRole);
 			}
@@ -71429,7 +71494,10 @@ function getVisibleChatStackEl(id) {
 				if (formatted.indexOf('http') !== -1) formatted = typeof linkifyChatMessageText === 'function'
 					? linkifyChatMessageText(formatted).html
 					: formatted.replace(/(https?:\/\/[^\s]+)/g, url => `<a href="${url}" target="_blank" style="color: #ffffff; text-decoration: underline; word-break: break-all;">${url}</a>`);
-				if (formatted.indexOf('@') !== -1) formatted = formatChatUserMentionsForDisplay(formatted);
+				if (formatted.indexOf('@') !== -1) {
+					formatted = formatChatUserMentionsForDisplay(formatted);
+					formatted = formatChatRoleMentionsForDisplay(formatted);
+				}
 		
 				const badge = buildChatEditedTagHtml(data.editedByAdmin, data.editedByMod);
 				textContainer.innerHTML = formatted + badge;
@@ -71447,7 +71515,8 @@ function getVisibleChatStackEl(id) {
 				const myNameForMention = String(localStorage.getItem('psn_username') || '');
 				const replyMentionsMe = !!(editedHistoryMsg && editedHistoryMsg.replyTo && editedHistoryMsg.replyTo.user === myNameForMention);
 				const textMentionsMe = !!(myNameForMention && editedHistoryMsg && editedHistoryMsg.user !== myNameForMention && (typeof chatTextMentionsUser === 'function' ? chatTextMentionsUser(data.newText || '', myNameForMention) : String(data.newText || '').includes(`@${myNameForMention}`)));
-				const nextMentionMarker = (isGlobalAfterEdit || replyMentionsMe || textMentionsMe) ? '1' : '0';
+				const roleMentionsMe = !!(editedHistoryMsg && editedHistoryMsg.user !== myNameForMention && typeof chatTextMentionsSessionRole === 'function' && chatTextMentionsSessionRole(data.newText || ''));
+				const nextMentionMarker = (isGlobalAfterEdit || replyMentionsMe || textMentionsMe || roleMentionsMe) ? '1' : '0';
 				if (editedRow.dataset.chatMentionMe !== nextMentionMarker) editedRow.dataset.chatMentionMe = nextMentionMarker;
 			}
 			if (typeof syncRenderedChatMessageSignature === 'function') syncRenderedChatMessageSignature(data.msgId);
@@ -71750,7 +71819,7 @@ function getVisibleChatStackEl(id) {
 					}
 				}
 			}
-			if (changed && seenList.length && typeof window.queuePsnUserMetaRefresh === 'function') window.queuePsnUserMetaRefresh(seenList, { maxAge:PSN_USER_META_FRESH_MS });
+			if (changed && seenList.length && typeof window.queuePsnUserMetaRefresh === 'function') window.queuePsnUserMetaRefresh(seenList, { maxAge:PSN_VISIBLE_AVATAR_FRESH_MS });
 			if (changed && typeof scheduleChatPersistentCacheWrite === 'function') scheduleChatPersistentCacheWrite();
 		});
 	
@@ -75850,6 +75919,9 @@ function getVisibleChatStackEl(id) {
 		});
 
 		const orderedUsers = me ? [me, ...others] : others;
+		if (typeof window.queuePsnUserMetaRefresh === 'function') {
+			window.queuePsnUserMetaRefresh(orderedUsers.map(user => user && (user.name || user)), { maxAge:PSN_VISIBLE_AVATAR_FRESH_MS });
+		}
 		const onlineRenderContext = buildOnlineListRenderContext(orderedUsers, myName, friendNames);
 		const renderSignature = onlineRenderContext.renderSignature;
 		if (container.dataset.onlineRenderSignature === renderSignature && container.childElementCount > 0) return;
@@ -76078,9 +76150,10 @@ function getVisibleChatStackEl(id) {
 		popover.style.bottom = 'auto';
 		popover.style.zIndex = '2147483647';
 
-		/* v116: prime stale viewer metadata as one request. Live read receipts usually filled this
-		   cache already, so opening Seen by is normally zero-network and immediately current. */
-		if (typeof window.refreshPsnUserMetaBatch === 'function') window.refreshPsnUserMetaBatch(users, { maxAge:PSN_USER_META_FRESH_MS });
+		/* Seen by can outlive avatar changes in the shared metadata cache. Revalidate the viewers as
+		   one bounded batch when the popover opens; refreshPsnUserMetaBatch keeps its 5s per-user
+		   lookup guard, and syncPsnUserMetaBatch patches any rendered seen-user-avatar in place. */
+		if (typeof window.refreshPsnUserMetaBatch === 'function') window.refreshPsnUserMetaBatch(users, { maxAge:0 });
 
 		let itemsHtml = `<div class="seen-by-title">Seen by: ${users.length}</div>`;
 		users.forEach(user => {
@@ -76467,7 +76540,7 @@ function getVisibleChatStackEl(id) {
 		poll = getChatPollDisplayContentForTranslate(poll, msgId) || poll || {};
 		const pollOptions = Array.isArray(poll.options) ? poll.options : [];
 		if (currentView === 'voters' && typeof window.queuePsnUserMetaRefresh === 'function') {
-			window.queuePsnUserMetaRefresh(pollOptions.flatMap(opt => Array.isArray(opt && opt.voters) ? opt.voters : []), { maxAge:PSN_USER_META_FRESH_MS });
+			window.queuePsnUserMetaRefresh(pollOptions.flatMap(opt => Array.isArray(opt && opt.voters) ? opt.voters : []), { maxAge:PSN_VISIBLE_AVATAR_FRESH_MS });
 		}
 		const myName = localStorage.getItem('psn_username') || "Guest";
 		const totalVotes = poll.totalVotes || 0;
@@ -77740,7 +77813,7 @@ function getVisibleChatStackEl(id) {
 		const item = normalizeFriendActivityItem(rawItem);
 		const list = document.getElementById('friend-activity-list');
 		if (!item || !list || !window.isFriendActivityVisible()) return false;
-		if (typeof window.queuePsnUserMetaRefresh === 'function') window.queuePsnUserMetaRefresh(item.actor, { maxAge:PSN_USER_META_FRESH_MS });
+		if (typeof window.queuePsnUserMetaRefresh === 'function') window.queuePsnUserMetaRefresh(item.actor, { maxAge:PSN_VISIBLE_AVATAR_FRESH_MS });
 		if (getSocialFeedSortOrder('activity') === 'asc') { window.renderFriendActivity(true); return true; }
 		const visibleItems = getFilteredFriendActivityItems();
 		const authoritative = visibleItems.find(function(entry) { return String(entry && entry.id || '') === String(item.id || ''); });
@@ -77828,7 +77901,7 @@ function getVisibleChatStackEl(id) {
 		}
 		window.__friendActivityRenderLimit = Math.max(SOCIAL_FEED_RENDER_BATCH_SIZE, Math.min(Number(window.__friendActivityRenderLimit) || SOCIAL_FEED_RENDER_BATCH_SIZE, items.length || SOCIAL_FEED_RENDER_BATCH_SIZE));
 		const renderedItems = items.slice(0, window.__friendActivityRenderLimit);
-		if (window.isFriendActivityVisible() && typeof window.queuePsnUserMetaRefresh === 'function') window.queuePsnUserMetaRefresh(renderedItems.map(item => item && item.actor), { maxAge:PSN_USER_META_FRESH_MS });
+		if (window.isFriendActivityVisible() && typeof window.queuePsnUserMetaRefresh === 'function') window.queuePsnUserMetaRefresh(renderedItems.map(item => item && item.actor), { maxAge:PSN_VISIBLE_AVATAR_FRESH_MS });
 		const renderSignature = getRealtimeFeedRenderSignature('activity', renderedItems, renderedItems.length);
 		const canReuseDom = list.dataset.realtimeFeedRenderSignature === renderSignature && realtimeFeedDomMatchesState(list, '.friend-activity-item[data-activity-id]', 'data-activity-id', renderedItems);
 		if (canReuseDom) {
@@ -78854,7 +78927,7 @@ function getVisibleChatStackEl(id) {
 		const item = normalizeUserNotificationItem(rawItem);
 		const list = document.getElementById('notification-center-list');
 		if (!item || !list || !window.isNotificationCenterVisible()) return false;
-		if (typeof window.queuePsnUserMetaRefresh === 'function') window.queuePsnUserMetaRefresh(item.data && item.data.actor, { maxAge:PSN_USER_META_FRESH_MS });
+		if (typeof window.queuePsnUserMetaRefresh === 'function') window.queuePsnUserMetaRefresh(item.data && item.data.actor, { maxAge:PSN_VISIBLE_AVATAR_FRESH_MS });
 		if (getSocialFeedSortOrder('notifications') === 'asc') { window.renderNotificationCenter(true); return true; }
 		const visibleItems = getFilteredUserNotificationItems();
 		const authoritative = visibleItems.find(function(entry) { return String(entry && entry.id || '') === String(item.id || ''); });
@@ -79038,7 +79111,7 @@ function getVisibleChatStackEl(id) {
 		}
 		window.__userNotificationRenderLimit = Math.max(SOCIAL_FEED_RENDER_BATCH_SIZE, Math.min(Number(window.__userNotificationRenderLimit) || SOCIAL_FEED_RENDER_BATCH_SIZE, items.length || SOCIAL_FEED_RENDER_BATCH_SIZE));
 		const renderedItems = items.slice(0, window.__userNotificationRenderLimit);
-		if (window.isNotificationCenterVisible() && typeof window.queuePsnUserMetaRefresh === 'function') window.queuePsnUserMetaRefresh(renderedItems.map(item => item && item.data && item.data.actor), { maxAge:PSN_USER_META_FRESH_MS });
+		if (window.isNotificationCenterVisible() && typeof window.queuePsnUserMetaRefresh === 'function') window.queuePsnUserMetaRefresh(renderedItems.map(item => item && item.data && item.data.actor), { maxAge:PSN_VISIBLE_AVATAR_FRESH_MS });
 		const renderSignature = getRealtimeFeedRenderSignature('notifications', renderedItems, renderedItems.length);
 		const canReuseDom = list.dataset.realtimeFeedRenderSignature === renderSignature && realtimeFeedDomMatchesState(list, '.notification-swipe-row[data-notification-id]', 'data-notification-id', renderedItems);
 		if (canReuseDom) {
@@ -80322,6 +80395,7 @@ function getVisibleChatStackEl(id) {
 		const titleHeader = PSN_STATIC_NAV_DOM.friendsTitle;
 		
 		if (!grid) return;
+		if (typeof window.refreshVisiblePsnUserAvatars === 'function') window.refreshVisiblePsnUserAvatars(grid);
 	
 		if (titleHeader) {
 			const totalFriends = window.friendsList ? window.friendsList.length : 0;
@@ -80591,6 +80665,7 @@ function getVisibleChatStackEl(id) {
 			grid.dataset.friendsProgressiveRendered = String(renderEnd);
 			if (!isSilent && typeof setupRevealAnimations === 'function') setupRevealAnimations('friends-list-grid');
 			setupProgressiveGridObserver('friends-search', grid, renderEnd, friendsTotalMatches, () => window.renderFriendsList(searchTerm, true, 'append'));
+			if (typeof window.refreshVisiblePsnUserAvatars === 'function') window.refreshVisiblePsnUserAvatars(grid);
 			return;
 		}
 
@@ -80661,6 +80736,7 @@ function getVisibleChatStackEl(id) {
 		if (!isSilent && typeof setupRevealAnimations === 'function') {
 			setupRevealAnimations('friends-list-grid');
 		}
+		if (typeof window.refreshVisiblePsnUserAvatars === 'function') window.refreshVisiblePsnUserAvatars(grid);
 	};
 	
 	function createUserCardElement(name, avatar, statusColor, statusText, isOnline, isFriend, idx, isSilent = false, lookupContext = null) {

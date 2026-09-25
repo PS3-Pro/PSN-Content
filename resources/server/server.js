@@ -9746,6 +9746,23 @@ function getChatNotificationPreview(text) {
     .replace(/\s+/g, ' '), '').slice(0, 240);
 }
 
+function extractChatRoleMentionTargets(text, senderName) {
+  const source = String(text || '');
+  if (!source.includes('@')) return [];
+  const wantsAdmin = /(^|[\s.,!?;:()\[\]{}<>"'`])@admin\b/i.test(source);
+  const wantsModerator = /(^|[\s.,!?;:()\[\]{}<>"'`])@moderator\b/i.test(source);
+  if (!wantsAdmin && !wantsModerator) return [];
+
+  const senderLower = String(senderName || '').toLowerCase();
+  const targets = [];
+  Object.keys(userDatabase).forEach(name => {
+    if (!name || name.toLowerCase() === senderLower) return;
+    const role = getUserRole(name, userDatabase[name] || null);
+    if ((wantsAdmin && role === 'admin') || (wantsModerator && role === 'mod')) targets.push(name);
+  });
+  return targets;
+}
+
 function extractChatMentionTargets(text, senderName) {
   const source = String(text || '');
   if (!source.includes('@')) return [];
@@ -9789,6 +9806,10 @@ async function recordChatUserNotifications(message = {}) {
   const replyTarget = resolveKnownNotificationUserName(message.replyTo && message.replyTo.user);
   if (replyTarget && replyTarget.toLowerCase() !== sender.toLowerCase()) targets.set(replyTarget.toLowerCase(), { name: replyTarget, type: 'reply' });
   extractChatMentionTargets(message.text || '', sender).forEach(name => {
+    const key = name.toLowerCase();
+    if (!targets.has(key)) targets.set(key, { name, type: 'mention' });
+  });
+  extractChatRoleMentionTargets(message.text || '', sender).forEach(name => {
     const key = name.toLowerCase();
     if (!targets.has(key)) targets.set(key, { name, type: 'mention' });
   });
