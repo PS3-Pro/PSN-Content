@@ -657,6 +657,195 @@ function applyRealtimeRoleState(name, user = null, options = {}) {
   return payload;
 }
 
+const ROLE_NOTICE_RANK = Object.freeze({ user: 0, trusted: 1, mod: 2, admin: 3 });
+
+function normalizeRoleNoticeRole(value, fallback = 'user') {
+  const raw = normalizeText(value, fallback).toLowerCase();
+  const role = raw === 'moderator' ? 'mod' : raw;
+  return VALID_USER_ROLES.has(role) ? role : fallback;
+}
+
+function buildRoleChangeNotice(targetName, role, previousRole, changedBy, options = {}) {
+  const name = normalizeText(targetName, '').slice(0, 120);
+  const nextRole = normalizeRoleNoticeRole(role, 'user');
+  const priorRole = normalizeRoleNoticeRole(previousRole, 'user');
+  const by = normalizeText(changedBy, '').slice(0, 120);
+  if (!name || !by || nextRole === priorRole) return null;
+
+  const nextRank = ROLE_NOTICE_RANK[nextRole] || 0;
+  const priorRank = ROLE_NOTICE_RANK[priorRole] || 0;
+  const requestedKind = normalizeText(options.kind, '').toLowerCase();
+  const kind = requestedKind === 'promotion' || requestedKind === 'demotion'
+    ? requestedKind
+    : (nextRank > priorRank ? 'promotion' : 'demotion');
+
+  if (kind === 'promotion') {
+    if (nextRank <= priorRank || !['admin', 'mod'].includes(nextRole)) return null;
+  } else {
+    if (nextRank >= priorRank || !['admin', 'mod'].includes(priorRole)) return null;
+  }
+
+  return {
+    noticeId: normalizeText(options.noticeId, '').slice(0, 96) || crypto.randomUUID(),
+    kind,
+    targetName: name,
+    role: nextRole,
+    previousRole: priorRole,
+    changedBy: by,
+    changedAt: Math.max(0, Number(options.changedAt || options.promotedAt) || Date.now())
+  };
+}
+
+function normalizeStoredRoleChangeNotice(value, targetName = '') {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  return buildRoleChangeNotice(
+    targetName || value.targetName,
+    value.role,
+    value.previousRole,
+    value.changedBy || value.promotedBy,
+    {
+      noticeId: value.noticeId,
+      kind: value.kind,
+      changedAt: value.changedAt || value.promotedAt
+    }
+  );
+}
+
+function getPendingRoleChangeNotice(user = null, targetName = '') {
+  if (!user || typeof user !== 'object') return null;
+  return normalizeStoredRoleChangeNotice(
+    user.pendingRoleChangeNotice || user.pendingRolePromotionNotice,
+    targetName || user.name || ''
+  );
+}
+
+function getAcknowledgedRoleNoticeRole(user = null) {
+  if (!user || typeof user !== 'object') return '';
+  const raw = normalizeText(user.roleNoticeAcknowledgedRole, '').toLowerCase();
+  if (!raw) return '';
+  const role = raw === 'moderator' ? 'mod' : raw;
+  return VALID_USER_ROLES.has(role) ? role : '';
+}
+
+function buildRoleChangeNoticeForTransition(targetName, nextRole, immediatePreviousRole, changedBy, user = null) {
+  const source = user && typeof user === 'object' ? user : {};
+  const pending = getPendingRoleChangeNotice(source, targetName);
+  const acknowledgedRole = getAcknowledgedRoleNoticeRole(source);
+  const previousRole = normalizeRoleNoticeRole(immediatePreviousRole, 'user');
+  const normalizedNextRole = normalizeRoleNoticeRole(nextRole, 'user');
+
+  /* The user's last acknowledged role is the semantic baseline. If a role change is
+     reversed before its notice is acknowledged, the net state returns to that baseline
+     and no stale promotion/demotion notice should survive. */
+  const baselineRole = acknowledgedRole || (pending && pending.previousRole) || previousRole;
+  if (normalizedNextRole === baselineRole) return null;
+
+  const baselineRank = ROLE_NOTICE_RANK[baselineRole] || 0;
+  const nextRank = ROLE_NOTICE_RANK[normalizedNextRole] || 0;
+
+  if (nextRank > baselineRank && ['admin', 'mod'].includes(normalizedNextRole)) {
+    return buildRoleChangeNotice(targetName, normalizedNextRole, baselineRole, changedBy, { kind: 'promotion' });
+  }
+
+  /* A demotion is only meaningful if the user actually acknowledged the privileged
+     role first. Pending/unseen promotions are simply canceled when they are removed. */
+  if (
+    nextRank < baselineRank &&
+    acknowledgedRole &&
+    acknowledgedRole === baselineRole &&
+    ['admin', 'mod'].includes(baselineRole)
+  ) {
+    return buildRoleChangeNotice(targetName, normalizedNextRole, baselineRole, changedBy, { kind: 'demotion' });
+  }
+
+  return null;
+}
+
+function emitRoleChangeNoticeState(targetName, notice = null, options = {}) {
+  const name = normalizeText(targetName, '').slice(0, 120);
+  if (!name) return false;
+  const payload = notice ? normalizeStoredRoleChangeNotice(notice, name) : null;
+  const clearNoticeId = normalizeText(options.noticeId, '').slice(0, 96);
+  let sent = false;
+
+  getSocketsByUserName(name).forEach(client => {
+    if (!client || !client.connected) return;
+    client.emit('role_change_notice', payload || {
+      clear: true,
+      targetName: name,
+      ...(clearNoticeId ? { noticeId: clearNoticeId } : {})
+    });
+    sent = true;
+  });
+  return sent;
+}
+
+function emitPendingRoleChangeNoticeToSocket(socket, userData = null) {
+  if (!socket || !socket.connected || !socket.userName) return false;
+  const source = userData && typeof userData === 'object' ? userData : null;
+  const pending = getPendingRoleChangeNotice(source, socket.userName);
+  if (!pending) return false;
+
+  const currentRole = getUserRole(socket.userName, source || userDatabase[socket.userName] || null);
+  if (pending.role !== currentRole) return false;
+  socket.emit('role_change_notice', pending);
+  return true;
+}
+
+async function acknowledgeRoleChangeNotice(name, noticeId) {
+  const safeName = normalizeText(name, '').slice(0, 120);
+  const safeNoticeId = normalizeText(noticeId, '').slice(0, 96);
+  if (!safeName || !safeNoticeId) return false;
+
+  const currentUser = userDatabase[safeName] || null;
+  const memoryPending = getPendingRoleChangeNotice(currentUser, safeName);
+
+  const result = await queryDbWithRetry(
+    `UPDATE users
+     SET data = jsonb_set(
+       jsonb_set(
+         jsonb_set(
+           COALESCE(data, '{}'::jsonb),
+           '{roleNoticeAcknowledgedRole}',
+           to_jsonb(COALESCE(
+             data->'pendingRoleChangeNotice'->>'role',
+             data->'pendingRolePromotionNotice'->>'role',
+             'user'
+           )::text),
+           true
+         ),
+         '{pendingRoleChangeNotice}',
+         'null'::jsonb,
+         true
+       ),
+       '{pendingRolePromotionNotice}',
+       'null'::jsonb,
+       true
+     )
+     WHERE name = $1
+       AND (
+         COALESCE(data->'pendingRoleChangeNotice'->>'noticeId', '') = $2
+         OR COALESCE(data->'pendingRolePromotionNotice'->>'noticeId', '') = $2
+       )
+     RETURNING data->>'roleNoticeAcknowledgedRole' AS acknowledged_role`,
+    [safeName, safeNoticeId],
+    { attempts: 2, label: 'ROLE CHANGE NOTICE ACK' }
+  );
+
+  if (result.rows.length && currentUser) {
+    const acknowledgedRole = normalizeRoleNoticeRole(
+      result.rows[0] && result.rows[0].acknowledged_role
+        ? result.rows[0].acknowledged_role
+        : (memoryPending && memoryPending.role),
+      'user'
+    );
+    currentUser.roleNoticeAcknowledgedRole = acknowledgedRole;
+    currentUser.pendingRoleChangeNotice = null;
+    currentUser.pendingRolePromotionNotice = null;
+  }
+  return result.rows.length > 0;
+}
+
 function hasAdminSockets() {
   for (const client of adminSockets) {
     if (client && client.connected && client.isAdmin === true) return true;
@@ -8297,7 +8486,15 @@ async function notifyProfileSyncAcrossInstances(name, sourceSocketId = null, pro
       deleted: changes && changes.deleted === true,
       deleteReason: changes && changes.deleted === true ? normalizeText(changes.deleteReason, '').slice(0, 500) : '',
       deletedBy: changes && changes.deleted === true ? normalizeText(changes.deletedBy, '').slice(0, 120) : '',
-      keys: Array.isArray(changes && changes.keys) ? [...new Set(changes.keys.filter(key => PROFILE_SYNC_PATCH_KEYS.has(key)))] : []
+      keys: Array.isArray(changes && changes.keys) ? [...new Set(changes.keys.filter(key => PROFILE_SYNC_PATCH_KEYS.has(key)))] : [],
+      ...(changes && changes.roleChangedBy ? { roleChangedBy: normalizeText(changes.roleChangedBy, '').slice(0, 120) } : {}),
+      ...(changes && changes.previousRole ? { previousRole: normalizeText(changes.previousRole, '').toLowerCase().slice(0, 24) } : {}),
+      roleNoticeChanged: changes && changes.roleNoticeChanged === true,
+      roleNoticeOnly: changes && changes.roleNoticeOnly === true,
+      ...(changes && changes.roleNoticeAckId ? { roleNoticeAckId: normalizeText(changes.roleNoticeAckId, '').slice(0, 96) } : {}),
+      ...(changes && changes.roleChangeNotice && typeof changes.roleChangeNotice === 'object'
+        ? { roleChangeNotice: normalizeStoredRoleChangeNotice(changes.roleChangeNotice, name) }
+        : {})
     }
   };
 
@@ -8618,6 +8815,13 @@ async function initProfileSyncNotifications() {
       const name = normalizeText(data.name, '');
       if (!name) return;
 
+      /* A role-notice acknowledgement only needs to close the same notice on other
+         sessions/instances. Do not refresh the profile or rebroadcast role metadata. */
+      if (message.channel === 'profile_sync' && data.changes && data.changes.roleNoticeOnly === true) {
+        emitRoleChangeNoticeState(name, null, { noticeId: data.changes.roleNoticeAckId });
+        return;
+      }
+
       if (message.channel === 'ps3_playtime_sync') {
         const playTime = normalizePs3PlayTimeServer(data.playTime);
         if (!playTime) return;
@@ -8712,7 +8916,12 @@ async function initProfileSyncNotifications() {
         client && client.connected && (client.role !== expectedRolePayload.role || client.isAdmin !== expectedRolePayload.isAdmin)
       );
       const roleSyncRequested = changedKeys.some(key => key === 'role' || key === 'isAdmin' || key === 'isModerator' || key === 'banned') || localRoleStateMismatch;
-      if (roleSyncRequested) applyRealtimeRoleState(name, refreshedUser);
+      if (roleSyncRequested) {
+        applyRealtimeRoleState(name, refreshedUser);
+        if (data.changes && data.changes.roleNoticeChanged === true) {
+          emitRoleChangeNoticeState(name, data.changes.roleChangeNotice || null);
+        }
+      }
 
       if (data.changes && data.changes.trending === true) {
         invalidateTrendingCache();
@@ -10363,24 +10572,53 @@ async function setUserRole(targetName, role, adminName) {
     return { success: false, message: "Hardcoded admins cannot be demoted." };
   }
 
-  userDatabase[targetName].role = normalizedRole;
-  userDatabase[targetName].name = targetName;
+  const targetUser = userDatabase[targetName];
+  const previousRole = getUserRole(targetName, targetUser);
+  const roleChanged = normalizedRole !== previousRole;
+  const roleChangeNotice = roleChanged
+    ? buildRoleChangeNoticeForTransition(targetName, normalizedRole, previousRole, adminName, targetUser)
+    : getPendingRoleChangeNotice(targetUser, targetName);
+
+  targetUser.role = normalizedRole;
+  targetUser.name = targetName;
+
+  if (roleChanged) {
+    targetUser.pendingRoleChangeNotice = roleChangeNotice;
+    /* Clean up the old one-purpose field from earlier builds. The normalizer still reads it
+       during migration, but every new write uses the generic role-change state. */
+    targetUser.pendingRolePromotionNotice = null;
+  }
+
   /* Role changes only need a tiny cross-instance patch. Avoid the broad profile sync that
      saveUser() normally publishes, while still persisting the authoritative DB record. */
   await saveUser(targetName, { notify: false });
 
-  const rolePayload = applyRealtimeRoleState(targetName, userDatabase[targetName]);
+  const rolePayload = applyRealtimeRoleState(targetName, targetUser);
+  if (roleChanged) emitRoleChangeNoticeState(targetName, roleChangeNotice);
   invalidateOnlineListCache('role-update');
-  emitPresenceUpdate(targetName, userDatabase[targetName]);
+  emitPresenceUpdate(targetName, targetUser);
 
   deferServerTask('ROLE UPDATE PROFILE NOTIFY', () => notifyProfileSyncAcrossInstances(
     targetName,
     null,
-    normalizeTimestampValue(userDatabase[targetName] && userDatabase[targetName].profileUpdatedAt) || Date.now(),
-    { publicProfile: true, keys: ['role', 'isAdmin', 'isModerator'] }
+    normalizeTimestampValue(targetUser && targetUser.profileUpdatedAt) || Date.now(),
+    {
+      publicProfile: true,
+      keys: ['role', 'isAdmin', 'isModerator'],
+      roleChangedBy: normalizeText(adminName, '').slice(0, 120),
+      previousRole,
+      roleNoticeChanged: roleChanged,
+      ...(roleChangeNotice ? { roleChangeNotice } : {})
+    }
   ), 0);
 
-  return { success: true, role: rolePayload.role, banned: rolePayload.banned };
+  return {
+    success: true,
+    role: rolePayload.role,
+    previousRole,
+    banned: rolePayload.banned,
+    roleNotice: roleChangeNotice ? roleChangeNotice.kind : ''
+  };
 }
 
 function resolveCommandTarget(rawArgs = "", options = {}) {
@@ -10989,6 +11227,7 @@ io.on('connection', (socket) => {
           indexSocketUser(socket, name);
           setSocketAdminState(socket, isAdmin);
           socket.role = getUserRole(name, dbUser);
+          const pendingRoleChangeNoticeAtAuth = getPendingRoleChangeNotice(dbUser, name);
 
           const serverUser = buildCompactUserSummary(name, dbUser);
           const authCacheHadUser = Object.prototype.hasOwnProperty.call(userDatabase, name);
@@ -11051,6 +11290,12 @@ io.on('connection', (socket) => {
               serverAuthoritative: true,
               contentLimits: getClientContentLimits()
             });
+          }
+
+          if (pendingRoleChangeNoticeAtAuth) {
+            deferServerTask('AUTH PENDING ROLE CHANGE NOTICE', () => {
+              emitPendingRoleChangeNoticeToSocket(socket, { ...dbUser, pendingRoleChangeNotice: pendingRoleChangeNoticeAtAuth });
+            }, 90);
           }
 
           emitChatSpamCooldownState(socket);
@@ -13049,6 +13294,29 @@ io.on('connection', (socket) => {
     } catch (err) {
       console.error('[ADMIN ROLE ERROR]:', err);
       respond({ success: false, message: "Server error while changing role." });
+    }
+  });
+
+  socket.on('ack_role_change_notice', async (data = {}, callback) => {
+    const respond = typeof callback === 'function' ? callback : () => {};
+    try {
+      const name = normalizeText(socket.userName, '').slice(0, 120);
+      const noticeId = normalizeText(data && data.noticeId, '').slice(0, 96);
+      if (!name || !noticeId) return respond({ success: false });
+      const cleared = await acknowledgeRoleChangeNotice(name, noticeId);
+      if (cleared) {
+        emitRoleChangeNoticeState(name, null, { noticeId });
+        deferServerTask('ROLE NOTICE ACK SYNC', () => notifyProfileSyncAcrossInstances(
+          name,
+          socket.id,
+          Date.now(),
+          { roleNoticeOnly: true, roleNoticeAckId: noticeId }
+        ), 0);
+      }
+      respond({ success: true, cleared });
+    } catch (err) {
+      console.error('[ROLE CHANGE NOTICE ACK ERROR]:', err);
+      respond({ success: false });
     }
   });
 
