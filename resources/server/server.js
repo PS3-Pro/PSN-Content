@@ -1911,6 +1911,16 @@ async function initDb() {
       UNIQUE(submitted_by, metadata_key)
     );
     CREATE INDEX IF NOT EXISTS idx_content_metadata_suggestions_updated_at ON content_metadata_suggestions(updated_at DESC);
+    CREATE TABLE IF NOT EXISTS content_shares (
+      token TEXT PRIMARY KEY,
+      shared_by TEXT NOT NULL REFERENCES users(name) ON DELETE CASCADE,
+      share_key TEXT NOT NULL,
+      descriptor JSONB NOT NULL DEFAULT '{}'::jsonb,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE(shared_by, share_key)
+    );
+    CREATE INDEX IF NOT EXISTS idx_content_shares_shared_by_updated_at ON content_shares(shared_by, updated_at DESC);
     CREATE TABLE IF NOT EXISTS deleted_accounts (
       name TEXT PRIMARY KEY,
       data JSONB,
@@ -10310,6 +10320,116 @@ function startBackgroundTasks() {
 }
 
 // ============================================================================
+// Content share tokens
+// ============================================================================
+const CONTENT_SHARE_TOKEN_BYTES = 12;
+const CONTENT_SHARE_MAX_PER_USER = 250;
+const CONTENT_SHARE_CREATE_WINDOW_MS = 60 * 1000;
+const CONTENT_SHARE_CREATE_WINDOW_MAX = 20;
+
+function normalizeContentShareDescriptorServer(value) {
+  const source = value && typeof value === 'object' ? value : {};
+  const category = normalizeText(source.category || source.content, '').toLowerCase().replace(/[\s-]+/g, '_').replace(/[^a-z0-9_]/g, '').slice(0, 48);
+  const titleId = normalizeText(source.titleId || source.tid, '').toUpperCase().slice(0, 80);
+  const contentId = normalizeText(source.contentId || source.cid, '').slice(0, 256);
+  const version = normalizeText(source.version || source.ver, '').replace(/^v\s*/i, '').slice(0, 40);
+  const region = normalizeText(source.region, '').toUpperCase().slice(0, 40);
+  const name = normalizeText(source.name, '').replace(/[\r\n\t]+/g, ' ').slice(0, 300);
+  if (!category || (!titleId && !contentId && !name)) return null;
+  return { category, titleId, contentId, version, region, name };
+}
+
+function getContentShareKey(descriptor) {
+  return crypto.createHash('sha256').update(JSON.stringify(descriptor)).digest('hex').slice(0, 40);
+}
+
+function normalizeContentShareTokenServer(value) {
+  const token = normalizeText(value, '');
+  return /^[a-f0-9]{24,64}$/i.test(token) ? token.toLowerCase() : '';
+}
+
+function allowContentShareCreationForSocket(socket) {
+  const now = Date.now();
+  const previous = Array.isArray(socket.__contentShareCreatedAt) ? socket.__contentShareCreatedAt : [];
+  const recent = previous.filter(at => Number(at) > now - CONTENT_SHARE_CREATE_WINDOW_MS);
+  if (recent.length >= CONTENT_SHARE_CREATE_WINDOW_MAX) {
+    socket.__contentShareCreatedAt = recent;
+    return false;
+  }
+  recent.push(now);
+  socket.__contentShareCreatedAt = recent;
+  return true;
+}
+
+function buildContentShareSharerPayload(name, source = {}) {
+  const user = source && typeof source === 'object' ? source : {};
+  return {
+    name,
+    avatar: normalizeText(user.avatar, DEFAULT_AVATAR).slice(0, 4096),
+    role: getUserRole(name, user),
+    isAdmin: isUserAdmin(name, user),
+    isModerator: isUserModerator(name, user),
+    level: Math.max(1, Number(user.level) || 1),
+    joined: normalizeText(user.joined, '2026').slice(0, 32),
+    countryCode: getUserCountryCode(user)
+  };
+}
+
+async function createContentShareTokenForUser(userName, rawDescriptor) {
+  const descriptor = normalizeContentShareDescriptorServer(rawDescriptor);
+  if (!descriptor) return { success:false, message:'Invalid content share.' };
+  const shareKey = getContentShareKey(descriptor);
+  const candidateToken = crypto.randomBytes(CONTENT_SHARE_TOKEN_BYTES).toString('hex');
+  const result = await queryDbWithRetry(
+    `INSERT INTO content_shares (token, shared_by, share_key, descriptor, created_at, updated_at)
+     VALUES ($1, $2, $3, $4::jsonb, NOW(), NOW())
+     ON CONFLICT (shared_by, share_key) DO UPDATE
+       SET descriptor = EXCLUDED.descriptor, updated_at = NOW()
+     RETURNING token`,
+    [candidateToken, userName, shareKey, JSON.stringify(descriptor)],
+    { attempts:2, label:'CONTENT SHARE CREATE' }
+  );
+  const token = normalizeContentShareTokenServer(result.rows[0] && result.rows[0].token);
+  if (!token) return { success:false, message:'Share link could not be created.' };
+
+  // Keep the table bounded per account. Sharing is infrequent, so doing this only on
+  // creation avoids any timer/polling cost while keeping old rows under control.
+  deferServerTask('CONTENT SHARE PRUNE', () => queryDbWithRetry(
+    `DELETE FROM content_shares
+     WHERE shared_by = $1 AND token NOT IN (
+       SELECT token FROM content_shares WHERE shared_by = $1 ORDER BY updated_at DESC LIMIT $2
+     )`,
+    [userName, CONTENT_SHARE_MAX_PER_USER],
+    { attempts:1, label:'CONTENT SHARE PRUNE' }
+  ).catch(() => {}), 0);
+
+  return { success:true, token };
+}
+
+async function resolveContentShareTokenForUser(token) {
+  const safeToken = normalizeContentShareTokenServer(token);
+  if (!safeToken) return { success:false, message:'Invalid shared link.' };
+  const result = await queryDbWithRetry(
+    `SELECT cs.descriptor, cs.shared_by, u.data AS user_data
+       FROM content_shares cs
+       JOIN users u ON u.name = cs.shared_by
+      WHERE cs.token = $1
+      LIMIT 1`,
+    [safeToken],
+    { attempts:2, label:'CONTENT SHARE RESOLVE' }
+  );
+  if (!result.rows.length) return { success:false, message:'This shared link is no longer available.' };
+  const row = result.rows[0];
+  const descriptor = normalizeContentShareDescriptorServer(row.descriptor);
+  if (!descriptor) return { success:false, message:'This shared link is no longer available.' };
+  const sharedBy = normalizeText(row.shared_by, '').slice(0, 120);
+  const cachedUser = userDatabase[sharedBy] || {};
+  const dbUser = row.user_data && typeof row.user_data === 'object' ? row.user_data : {};
+  const sharer = buildContentShareSharerPayload(sharedBy, { ...dbUser, ...cachedUser });
+  return { success:true, descriptor, sharer };
+}
+
+// ============================================================================
 // Client connection & event handlers
 // ============================================================================
 io.on('connection', (socket) => {
@@ -10630,6 +10750,34 @@ io.on('connection', (socket) => {
     } catch (error) {
       console.error("[AUTH ERROR]:", error);
       socket.emit('auth_error', 'Server Error: Auth failed.');
+    }
+  });
+
+  // --------------------------------------------------------------------------
+  // Opaque content share links
+  // --------------------------------------------------------------------------
+  socket.on('create_content_share', async (payload = {}, ack) => {
+    const respond = response => { if (typeof ack === 'function' && socket.connected) { try { ack(response); } catch (e) {} } };
+    const name = normalizeText(socket.userName, '').slice(0, 120);
+    if (!name) { respond({ success:false, message:'Sign in before sharing content.' }); return; }
+    if (!allowContentShareCreationForSocket(socket)) { respond({ success:false, message:'Too many share links created. Try again in a minute.' }); return; }
+    try {
+      respond(await createContentShareTokenForUser(name, payload.descriptor));
+    } catch (error) {
+      console.error(`[CONTENT SHARE CREATE ERROR] ${name}:`, error);
+      respond({ success:false, message:'Share link could not be created.' });
+    }
+  });
+
+  socket.on('resolve_content_share', async (payload = {}, ack) => {
+    const respond = response => { if (typeof ack === 'function' && socket.connected) { try { ack(response); } catch (e) {} } };
+    const viewer = normalizeText(socket.userName, '').slice(0, 120);
+    if (!viewer) { respond({ success:false, message:'Sign in to open this shared link.' }); return; }
+    try {
+      respond(await resolveContentShareTokenForUser(payload.token));
+    } catch (error) {
+      console.error(`[CONTENT SHARE RESOLVE ERROR] viewer=${viewer}:`, error);
+      respond({ success:false, message:'This shared link could not be opened.' });
     }
   });
 
