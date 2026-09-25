@@ -617,6 +617,46 @@ function setSocketAdminState(socket, isAdmin) {
   return nextAdmin;
 }
 
+function buildRealtimeRolePayload(name, user = null) {
+  const targetName = normalizeText(name, '');
+  const source = user || userDatabase[targetName] || {};
+  const role = getUserRole(targetName, source);
+  const isAdmin = isUserAdmin(targetName, source);
+  const banned = isUserBanned(source);
+  return {
+    targetName,
+    name: targetName,
+    role,
+    isAdmin,
+    isModerator: role === 'mod',
+    banned,
+    isBanned: banned
+  };
+}
+
+function applyRealtimeRoleState(name, user = null, options = {}) {
+  const payload = buildRealtimeRolePayload(name, user);
+  if (!payload.targetName) return payload;
+
+  const promotedAdminSockets = [];
+  getSocketsByUserName(payload.targetName).forEach(client => {
+    if (!client || !client.connected) return;
+    const wasAdmin = client.isAdmin === true;
+    setSocketAdminState(client, payload.isAdmin);
+    client.role = payload.role;
+    if (!wasAdmin && client.isAdmin === true) promotedAdminSockets.push(client);
+  });
+
+  if (options.broadcast !== false) io.emit('role_updated', payload);
+
+  if (options.hydrateNewAdmins !== false && promotedAdminSockets.length) {
+    promotedAdminSockets.forEach(client => {
+      deferServerTask('ROLE PROMOTION ADMIN STATE', () => emitAdminState(client), 0);
+    });
+  }
+  return payload;
+}
+
 function hasAdminSockets() {
   for (const client of adminSockets) {
     if (client && client.connected && client.isAdmin === true) return true;
@@ -8665,6 +8705,15 @@ async function initProfileSyncNotifications() {
         }
       }
 
+      const changedKeys = data.changes && Array.isArray(data.changes.keys) ? data.changes.keys : [];
+      const legacyBroadProfileChange = changedKeys.length === 0;
+      const expectedRolePayload = buildRealtimeRolePayload(name, refreshedUser);
+      const localRoleStateMismatch = hasLocalSession && getSocketsByUserName(name).some(client =>
+        client && client.connected && (client.role !== expectedRolePayload.role || client.isAdmin !== expectedRolePayload.isAdmin)
+      );
+      const roleSyncRequested = changedKeys.some(key => key === 'role' || key === 'isAdmin' || key === 'isModerator' || key === 'banned') || localRoleStateMismatch;
+      if (roleSyncRequested) applyRealtimeRoleState(name, refreshedUser);
+
       if (data.changes && data.changes.trending === true) {
         invalidateTrendingCache();
         scheduleTrendingRefreshBroadcast(1200);
@@ -8674,8 +8723,6 @@ async function initProfileSyncNotifications() {
         scheduleTrophyStatsRefreshBroadcast(1200);
       }
       if (data.changes && data.changes.counts === true) emitProfileCountsUpdate(name, refreshedUser);
-      const changedKeys = data.changes && Array.isArray(data.changes.keys) ? data.changes.keys : [];
-      const legacyBroadProfileChange = changedKeys.length === 0;
       if (legacyBroadProfileChange || changedKeys.some(key => key === 'libraryData' || key === 'downloadsData' || key === 'friendsData')) {
         clearGamePlayersSummaryCache();
       }
@@ -10318,22 +10365,22 @@ async function setUserRole(targetName, role, adminName) {
 
   userDatabase[targetName].role = normalizedRole;
   userDatabase[targetName].name = targetName;
-  await saveUser(targetName);
+  /* Role changes only need a tiny cross-instance patch. Avoid the broad profile sync that
+     saveUser() normally publishes, while still persisting the authoritative DB record. */
+  await saveUser(targetName, { notify: false });
 
-  getSocketsByUserName(targetName).forEach(client => {
-    setSocketAdminState(client, isUserAdmin(targetName, userDatabase[targetName]));
-    client.role = getUserRole(targetName, userDatabase[targetName]);
-    client.emit('role_updated', {
-      role: client.role,
-      isAdmin: client.isAdmin,
-      isModerator: client.role === 'mod',
-      banned: isUserBanned(userDatabase[targetName])
-    });
-  });
-
+  const rolePayload = applyRealtimeRoleState(targetName, userDatabase[targetName]);
   invalidateOnlineListCache('role-update');
   emitPresenceUpdate(targetName, userDatabase[targetName]);
-  return { success: true, role: getUserRole(targetName, userDatabase[targetName]), banned: isUserBanned(userDatabase[targetName]) };
+
+  deferServerTask('ROLE UPDATE PROFILE NOTIFY', () => notifyProfileSyncAcrossInstances(
+    targetName,
+    null,
+    normalizeTimestampValue(userDatabase[targetName] && userDatabase[targetName].profileUpdatedAt) || Date.now(),
+    { publicProfile: true, keys: ['role', 'isAdmin', 'isModerator'] }
+  ), 0);
+
+  return { success: true, role: rolePayload.role, banned: rolePayload.banned };
 }
 
 function resolveCommandTarget(rawArgs = "", options = {}) {
