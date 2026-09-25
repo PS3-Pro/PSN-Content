@@ -2628,6 +2628,21 @@ body.is-admin #btn-toolbar-cmd, body.is-mod #btn-toolbar-cmd { display: flex !im
 /* --- FRIEND ACTIVITY --- */
 #view-chat.activity-mobile-scroll #subview-activity, #view-chat.play-together-mobile-scroll #subview-play-together { height: auto !important; min-height: 100% !important; overflow: visible !important; display: flex !important; }
 .friend-activity-container { padding: 10px var(--page-gutter) 40px; min-height: 0; width: 100%; box-sizing: border-box; }
+.social-history-limit-notice { margin:0 0 14px; padding:12px 14px; display:none; align-items:flex-start; gap:11px; border:1px solid rgba(255,204,0,.22); border-radius:10px; background:linear-gradient(135deg,rgba(255,204,0,.085),rgba(255,255,255,.025)); box-shadow:inset 0 1px 0 rgba(255,255,255,.035); color:rgba(255,255,255,.76); }
+.social-history-limit-notice.show { display:flex; animation:socialHistoryLimitNoticeIn .24s ease both; }
+.social-history-limit-notice-icon { flex:0 0 auto; width:27px; height:27px; border-radius:50%; display:flex; align-items:center; justify-content:center; border:1px solid rgba(255,204,0,.24); background:rgba(255,204,0,.08); color:#ffcc00; font-size:11px; box-shadow:0 0 14px rgba(255,204,0,.08); }
+.social-history-limit-notice-copy { min-width:0; display:flex; flex-direction:column; gap:3px; }
+.social-history-limit-notice-copy strong { color:#fff; font-size:11.5px; font-weight:850; line-height:1.3; }
+.social-history-limit-notice-copy span { color:rgba(255,255,255,.56); font-size:10px; line-height:1.45; }
+.social-history-limit-notice-count { color:#ffcc00 !important; font-weight:900; white-space:nowrap; }
+@keyframes socialHistoryLimitNoticeIn { from { opacity:0; transform:translateY(-4px); } to { opacity:1; transform:translateY(0); } }
+@media (max-width:600px) {
+  .social-history-limit-notice { padding:11px 12px; gap:9px; margin-bottom:12px; }
+  .social-history-limit-notice-icon { width:25px; height:25px; font-size:10px; }
+  .social-history-limit-notice-copy strong { font-size:11px; }
+  .social-history-limit-notice-copy span { font-size:9.5px; }
+}
+@media (prefers-reduced-motion:reduce) { .social-history-limit-notice.show { animation:none; } }
 .friend-activity-list { display: flex; flex-direction: column; gap: 9px; width: 100%; max-width: none; margin: 0; }
 .friend-activity-day { margin: 14px 0 2px; padding-bottom: 7px; border-bottom: 1px solid rgba(255,255,255,.08); color: var(--text-muted); font-size: 10px; font-weight: 800; letter-spacing: 1.4px; text-transform: uppercase; }
 .friend-activity-day:first-child { margin-top: 0; }
@@ -7742,6 +7757,13 @@ img { -webkit-user-drag: none !important; user-drag: none !important; }
 					</div>
 				</div>
 				<div id="notification-center-container" class="notification-center-container">
+					<div id="notifications-limit-notice" class="social-history-limit-notice" role="status" aria-live="polite" aria-hidden="true">
+						<div class="social-history-limit-notice-icon"><i class="fas fa-exclamation-triangle"></i></div>
+						<div class="social-history-limit-notice-copy">
+							<strong>Notification history is full <span id="notifications-limit-value" class="social-history-limit-notice-count"></span></strong>
+							<span>New notifications will keep appearing, but the oldest entries are removed automatically. Dismiss individual notifications or use Dismiss All above to clear the history.</span>
+						</div>
+					</div>
 					<div id="notification-center-loading" class="notification-center-state psn-page-empty-state" style="display:none;">
 						<i class="fas fa-circle-notch fa-spin"></i><strong>Loading notifications</strong><p>Syncing your latest activity.</p>
 					</div>
@@ -8434,6 +8456,13 @@ img { -webkit-user-drag: none !important; user-drag: none !important; }
 						</div>
 					</div>
 					<div id="friend-activity-container" class="friend-activity-container">
+						<div id="friend-activity-limit-notice" class="social-history-limit-notice" role="status" aria-live="polite" aria-hidden="true">
+							<div class="social-history-limit-notice-icon"><i class="fas fa-exclamation-triangle"></i></div>
+							<div class="social-history-limit-notice-copy">
+								<strong>Activity history is full <span id="friend-activity-limit-value" class="social-history-limit-notice-count"></span></strong>
+								<span>New activity will keep appearing, but the oldest entries are removed automatically. Dismiss individual entries or use Dismiss All above to clear the history.</span>
+							</div>
+						</div>
 						<div id="friend-activity-loading" class="friend-activity-loading psn-page-empty-state" style="display:none;">
 							<i class="fas fa-circle-notch fa-spin"></i><strong>Loading activity</strong><p>Getting the latest moments from your friends.</p>
 						</div>
@@ -44747,10 +44776,16 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 					if (changed) {
 						saveState('psn_user_trophies', JSON.stringify(window.userTrophies));
 						if (typeof markProfileSyncDirty === 'function') markProfileSyncDirty('trophies');
-						if (typeof broadcastProfileUpdate === 'function') broadcastProfileUpdate();
 						document.querySelectorAll('#trophy-grid-container .is-new').forEach(el => el.classList.remove('is-new'));
 					}
 				}
+				// Anything unlocked while the trophy screen was already open has already been seen.
+				// Clear both the local dot and its synced pending IDs before leaving the view.
+				saveState('psn_trophy_dot_items', '[]');
+				saveState('psn_trophy_dot', 'false');
+				const trophyDot = document.getElementById('trophy-dot');
+				if (trophyDot) trophyDot.style.display = 'none';
+				if (changed && typeof broadcastProfileUpdate === 'function') broadcastProfileUpdate();
 			} else if (currentView.id === 'view-downloads' && viewId !== 'view-downloads') {
 				if (typeof resetDownloadSwipeState === 'function') resetDownloadSwipeState(false, true);
 				if (dlAnimationTimer) {
@@ -58395,12 +58430,21 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 		showTrophyPopup(TROPHY_DATA['platinum']); 
 		saveState('psn_last_trophy_color', TROPHY_COLORS['platinum']);
 	
+		const trophyViewVisible = typeof psnIsViewVisible === 'function'
+			? psnIsViewVisible('view-trophies')
+			: document.getElementById('view-trophies')?.style.display === 'block';
 		const dot = document.getElementById('trophy-dot');
-		if (dot) {
-			dot.style.display = 'block';
-			dot.style.background = TROPHY_COLORS['platinum'];
+		if (trophyViewVisible) {
+			// The unlock happened in front of the user, so it must not create a sidebar alert.
+			if (dot) dot.style.display = 'none';
+			saveState('psn_trophy_dot', 'false');
+		} else {
+			if (dot) {
+				dot.style.display = 'block';
+				dot.style.background = TROPHY_COLORS['platinum'];
+			}
+			saveState('psn_trophy_dot', 'true');
 		}
-		saveState('psn_trophy_dot', 'true');
 	};
 	
 	// ==========================================================================
@@ -78240,6 +78284,20 @@ function getVisibleChatStackEl(id) {
 		});
 	}
 
+	function updateSocialHistoryLimitNotice(noticeId, valueId, items) {
+		const notice = document.getElementById(noticeId);
+		const value = document.getElementById(valueId);
+		const maxHistory = typeof window.getPsnServerContentLimit === 'function' ? window.getPsnServerContentLimit('socialHistory') : 0;
+		const itemCount = Array.isArray(items) ? items.length : 0;
+		const historyFull = maxHistory > 0 && itemCount >= maxHistory;
+		if (value && historyFull) value.textContent = '(' + itemCount.toLocaleString('en-US') + ' / ' + maxHistory.toLocaleString('en-US') + ')';
+		if (notice) {
+			notice.classList.toggle('show', historyFull);
+			notice.setAttribute('aria-hidden', historyFull ? 'false' : 'true');
+		}
+		return historyFull;
+	}
+
 	function updateFriendActivityChrome() {
 		const items = Array.isArray(window.friendActivityItems) ? window.friendActivityItems : [];
 		if (typeof window.setSidebarCountPill === 'function') window.setSidebarCountPill('activity', items.length);
@@ -78250,6 +78308,7 @@ function getVisibleChatStackEl(id) {
 		setSocialFeedToolbarVisibility('friend-activity-filter-toolbar', items.length > 0);
 		if (count) count.textContent = items.length ? '(' + items.length + ' ' + (items.length === 1 ? 'item' : 'items') + ')' : '';
 		if (dismissAll) { dismissAll.style.display = items.length ? 'inline-flex' : 'none'; dismissAll.disabled = window.__friendActivityClearBusy === true; }
+		updateSocialHistoryLimitNotice('friend-activity-limit-notice', 'friend-activity-limit-value', items);
 		if (items.length) {
 			if (loading) loading.style.display = 'none';
 			if (empty) empty.style.display = 'none';
@@ -79355,6 +79414,7 @@ function getVisibleChatStackEl(id) {
 		setSocialFeedToolbarVisibility('notification-filter-toolbar', items.length > 0);
 		if (count) count.textContent = items.length ? '(' + items.length + ' ' + (items.length === 1 ? 'item' : 'items') + ')' : '';
 		if (dismissAllButton) { dismissAllButton.style.display = items.length ? 'inline-flex' : 'none'; dismissAllButton.disabled = window.__userNotificationClearBusy === true; }
+		updateSocialHistoryLimitNotice('notifications-limit-notice', 'notifications-limit-value', items);
 		if (items.length) {
 			if (loading) loading.style.display = 'none';
 			if (empty) empty.style.display = 'none';
