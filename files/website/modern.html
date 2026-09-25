@@ -1318,6 +1318,16 @@ html.collection-memory-optimization-on #downloads-list > .download-swipe-row { c
 #online-users-list-container::-webkit-scrollbar { width: 5px; }
 #online-users-list-container::-webkit-scrollbar-track { background: rgba(8,18,33,0.5); border-radius: 10px; }
 #online-users-list-container::-webkit-scrollbar-thumb { background: #fff; border-radius: 10px; }
+#modal-sys-online .sys-modal-content.online-list-resizing { transition-property: transform !important; }
+#online-users-list-container .online-user-item.online-live-leaving { pointer-events: none !important; will-change: transform,opacity,filter; }
+#online-users-list-container .online-user-item.online-live-moving { will-change: transform; }
+#online-users-list-container .online-user-item.online-live-entering { will-change: transform,opacity; }
+@media (prefers-reduced-motion: reduce) {
+    #online-users-list-container .online-user-item.online-live-leaving,
+    #online-users-list-container .online-user-item.online-live-moving,
+    #online-users-list-container .online-user-item.online-live-entering { animation: none !important; transition: none !important; }
+}
+
 .online-user-item { position: relative !important; overflow: hidden !important; display: flex !important; align-items: center; justify-content: space-between; padding: 12px 18px; background: rgba(255,255,255,0.03); border-radius: 8px; border: 1px solid rgba(255,255,255,0.05); transition: all 0.3s ease; flex-shrink: 0; margin: 0 !important; width: 100% !important; max-width: none !important; }
 .online-user-item:is(:hover,.psn-hover-stable) { background: rgba(255,255,255,0.12) !important; border: 1px solid rgba(255,255,255,0.6) !important; transform: translateY(-4px) !important; box-shadow: 0 10px 30px rgba(0,0,0,0.5) !important; z-index: 10; }
 .online-user-item::before { content: ""; position: absolute; top: -50%; left: -150%; width: 60%; height: 200%; background: linear-gradient(to right,transparent,rgba(255,255,255,0.15),transparent); transform: rotate(25deg); pointer-events: none; z-index: 2; }
@@ -76374,6 +76384,151 @@ function getVisibleChatStackEl(id) {
 		return buildOnlineListRenderContext(users, myName, friendNames).renderSignature;
 	}
 
+
+	window.__onlineListRealtimeAnimation = window.__onlineListRealtimeAnimation || null;
+	window.__onlineListRenderPending = window.__onlineListRenderPending === true;
+
+	function isOnlinePlayersModalVisible() {
+		const modal = document.getElementById('modal-sys-online');
+		return !!(modal && modal.classList.contains('show') && modal.style.display !== 'none');
+	}
+
+	function finishOnlineListRealtimeAnimation(token) {
+		const active = window.__onlineListRealtimeAnimation;
+		if (!active || active.token !== token) return;
+		const content = active.content;
+		(active.animations || []).forEach(animation => { try { animation.cancel(); } catch (e) {} });
+		if (content) {
+			content.classList.remove('online-list-resizing');
+			content.style.height = '';
+		}
+		window.__onlineListRealtimeAnimation = null;
+		if (window.__onlineListRenderPending) {
+			window.__onlineListRenderPending = false;
+			requestAnimationFrame(() => renderOnlineList());
+		}
+	}
+
+	function reconcileOnlineListAnimated(container, fragment) {
+		const selector = ':scope > .online-user-item[data-live-render-key]';
+		const fallback = () => {
+			if (typeof window.reconcileLiveRenderFragment === 'function') {
+				return window.reconcileLiveRenderFragment(container, fragment, selector, { preserveScroll: true });
+			}
+			container.replaceChildren(fragment);
+			return { reused:0, inserted:0, removed:0 };
+		};
+
+		const modal = document.getElementById('modal-sys-online');
+		const content = modal ? modal.querySelector('.sys-modal-content') : null;
+		const reduceMotion = !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+		if (!content || !isOnlinePlayersModalVisible() || reduceMotion || typeof Element.prototype.animate !== 'function') return fallback();
+
+		const previousCards = typeof window.getLiveRenderMatches === 'function'
+			? window.getLiveRenderMatches(container, selector)
+			: Array.from(container.querySelectorAll('.online-user-item[data-live-render-key]')).filter(node => node.parentNode === container);
+		const nextCards = typeof window.getLiveRenderMatches === 'function'
+			? window.getLiveRenderMatches(fragment, selector)
+			: Array.from(fragment.querySelectorAll('.online-user-item[data-live-render-key]')).filter(node => node.parentNode === fragment);
+		const previousByKey = new Map(previousCards.map(card => [String(card.dataset.liveRenderKey || ''), card]).filter(([key]) => key));
+		const nextKeys = new Set(nextCards.map(card => String(card.dataset.liveRenderKey || '')).filter(Boolean));
+		const previousKeys = new Set(previousByKey.keys());
+		const removedCards = Array.from(previousByKey.entries()).filter(([key]) => !nextKeys.has(key)).map(([, card]) => card);
+		const insertedKeys = new Set(Array.from(nextKeys).filter(key => !previousKeys.has(key)));
+		if (!removedCards.length && !insertedKeys.size) return fallback();
+
+		if (window.__onlineListRealtimeAnimation) {
+			window.__onlineListRenderPending = true;
+			return { reused:0, inserted:0, removed:0, deferred:true };
+		}
+
+		const token = `${Date.now()}-${Math.random().toString(36).slice(2,8)}`;
+		const state = { token, content, animations:[] };
+		window.__onlineListRealtimeAnimation = state;
+		const startHeight = content.getBoundingClientRect().height;
+		const firstRects = new Map();
+		previousCards.forEach(card => {
+			const key = String(card.dataset.liveRenderKey || '');
+			if (key && nextKeys.has(key)) firstRects.set(key, card.getBoundingClientRect());
+		});
+
+		const commitNextState = () => {
+			if (!window.__onlineListRealtimeAnimation || window.__onlineListRealtimeAnimation.token !== token) return;
+			removedCards.forEach(card => card.classList.remove('online-live-leaving'));
+			fallback();
+			const targetHeight = content.getBoundingClientRect().height;
+			const nextLiveCards = typeof window.getLiveRenderMatches === 'function'
+				? window.getLiveRenderMatches(container, selector)
+				: Array.from(container.querySelectorAll('.online-user-item[data-live-render-key]')).filter(node => node.parentNode === container);
+
+			content.classList.add('online-list-resizing');
+			content.style.height = `${startHeight}px`;
+			void content.offsetHeight;
+
+			if (Math.abs(targetHeight - startHeight) >= 1) {
+				const modalResize = content.animate(
+					[{ height:`${startHeight}px` }, { height:`${targetHeight}px` }],
+					{ duration:280, easing:'cubic-bezier(.22,.8,.24,1)', fill:'forwards' }
+				);
+				state.animations.push(modalResize);
+			}
+
+			nextLiveCards.forEach(card => {
+				const key = String(card.dataset.liveRenderKey || '');
+				if (!key) return;
+				card.classList.remove('psn-hover-stable');
+				if (insertedKeys.has(key)) {
+					card.classList.add('online-live-entering');
+					const animation = card.animate(
+						[
+							{ opacity:0, transform:'translateY(9px) scale(.985)' },
+							{ opacity:1, transform:'translateY(0) scale(1)' }
+						],
+						{ duration:260, easing:'cubic-bezier(.22,.8,.24,1)', fill:'both' }
+					);
+					state.animations.push(animation);
+					animation.finished.finally(() => { if (card.isConnected) card.classList.remove('online-live-entering'); }).catch(() => {});
+					return;
+				}
+				const first = firstRects.get(key);
+				if (!first) return;
+				const last = card.getBoundingClientRect();
+				const deltaY = first.top - last.top;
+				if (Math.abs(deltaY) < .5) return;
+				card.classList.add('online-live-moving');
+				const animation = card.animate(
+					[{ transform:`translateY(${deltaY}px)` }, { transform:'translateY(0)' }],
+					{ duration:280, easing:'cubic-bezier(.22,.8,.24,1)' }
+				);
+				state.animations.push(animation);
+				animation.finished.finally(() => { if (card.isConnected) card.classList.remove('online-live-moving'); }).catch(() => {});
+			});
+
+			const finishDelay = state.animations.length ? 300 : 0;
+			setTimeout(() => finishOnlineListRealtimeAnimation(token), finishDelay);
+		};
+
+		if (removedCards.length) {
+			const departures = removedCards.map(card => {
+				card.classList.remove('psn-hover-stable');
+				card.classList.add('online-live-leaving');
+				const animation = card.animate(
+					[
+						{ opacity:1, transform:'translateX(0) scale(1)', filter:'blur(0)' },
+						{ opacity:0, transform:'translateX(-9px) scale(.985)', filter:'blur(.7px)' }
+					],
+					{ duration:170, easing:'cubic-bezier(.4,0,.6,1)', fill:'forwards' }
+				);
+				state.animations.push(animation);
+				return animation.finished.catch(() => {});
+			});
+			Promise.allSettled(departures).then(commitNextState);
+		} else {
+			commitNextState();
+		}
+		return { reused:previousCards.length - removedCards.length, inserted:insertedKeys.size, removed:removedCards.length, animated:true };
+	}
+
 	function renderOnlineList() {
 		const container = PSN_STATIC_NAV_DOM.onlineUsersContainer;
 		if (!container) return;
@@ -76428,21 +76583,24 @@ function getVisibleChatStackEl(id) {
 		}
 		const onlineRenderContext = buildOnlineListRenderContext(orderedUsers, myName, friendNames);
 		const renderSignature = onlineRenderContext.renderSignature;
-		if (container.dataset.onlineRenderSignature === renderSignature && container.childElementCount > 0) return;
-		container.dataset.onlineRenderSignature = renderSignature;
-	
-		if (orderedUsers.length === 0) {
-			container.innerHTML = '<div style="text-align:center; padding:20px; color:var(--text-muted);">No users online.</div>';
+		if (window.__onlineListRealtimeAnimation && isOnlinePlayersModalVisible()) {
+			if (container.dataset.onlineRenderSignature !== renderSignature) window.__onlineListRenderPending = true;
 			return;
 		}
+		if (container.dataset.onlineRenderSignature === renderSignature && container.childElementCount > 0) return;
+		container.dataset.onlineRenderSignature = renderSignature;
 
 		const nextOnlineFragment = document.createDocumentFragment();
-		for (const user of orderedUsers) renderUserItem(nextOnlineFragment, user, (user.name || user) === myName, friendNames, onlineRenderContext);
-		if (typeof window.reconcileLiveRenderFragment === 'function') {
-			window.reconcileLiveRenderFragment(container, nextOnlineFragment, ':scope > .online-user-item[data-live-render-key]', { preserveScroll: true });
+		if (orderedUsers.length === 0) {
+			const empty = document.createElement('div');
+			empty.className = 'online-users-empty-state';
+			empty.style.cssText = 'text-align:center; padding:20px; color:var(--text-muted);';
+			empty.textContent = 'No users online.';
+			nextOnlineFragment.appendChild(empty);
 		} else {
-			container.replaceChildren(nextOnlineFragment);
+			for (const user of orderedUsers) renderUserItem(nextOnlineFragment, user, (user.name || user) === myName, friendNames, onlineRenderContext);
 		}
+		reconcileOnlineListAnimated(container, nextOnlineFragment);
 	}
 		
 	function renderUserItem(container, userObj, isMe, friendNames = null, renderContext = null) {
