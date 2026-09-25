@@ -58770,7 +58770,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 			if (!m || m.user === myName) continue;
 			unreadCount++;
 			if (!hasGlobal && m.isGlobalPing) hasGlobal = true;
-			if (!hasMention && ((m.text && (typeof chatTextMentionsUser === 'function' ? chatTextMentionsUser(m.text, myName) : m.text.includes(`@${myName}`))) || (m.replyTo && m.replyTo.user === myName))) hasMention = true;
+			if (!hasMention && ((m.text && (typeof chatTextMentionsCurrentSession === 'function' ? chatTextMentionsCurrentSession(m.text, myName) : (typeof chatTextMentionsUser === 'function' ? chatTextMentionsUser(m.text, myName) : m.text.includes(`@${myName}`)))) || (m.replyTo && m.replyTo.user === myName))) hasMention = true;
 		}
 		const summary = { unreadCount, hasGlobal, hasMention };
 		window.__chatUnreadSummarySignature = signature;
@@ -66436,6 +66436,16 @@ function getVisibleChatStackEl(id) {
 		return roles.includes(sessionRole);
 	}
 
+	/* Keep every client-side mention surface on one decision path. A role mention must behave
+	   exactly like a direct @username mention for the matching logged-in role: bubble highlight,
+	   mention jump marker, unread-dot priority and popup notification. */
+	function chatTextMentionsCurrentSession(text, username, preparedRegex = null) {
+		const source = String(text || '');
+		if (source.indexOf('@') === -1) return false;
+		if (username && typeof chatTextMentionsUser === 'function' && chatTextMentionsUser(source, username, preparedRegex)) return true;
+		return chatTextMentionsSessionRole(source);
+	}
+
 	function formatChatRoleMentionsForDisplay(messageText) {
 		return String(messageText || '')
 			.replace(/@admin\b(?![^<]*>)/gi, '<span class="chat-mention" data-chat-role-mention="admin" style="background:#ff4444;color:#fff;padding:2px 4px;border-radius:4px;font-weight:bold;font-size:10px;">@admin</span>')
@@ -67633,7 +67643,7 @@ function getVisibleChatStackEl(id) {
 			: 'Moderators cannot delete messages from other moderators';
 		const canPinThisMsg = batchSenderDerived ? batchSenderDerived.canModerateTarget === true : (typeof window.canModerateChat === 'function' ? window.canModerateChat(userName, senderRoleSource) : isAdmin);
 		const senderRoleBadgeHtml = batchSenderDerived ? batchSenderDerived.roleBadgeHtml : (typeof window.buildPsnRoleBadge === 'function' ? window.buildPsnRoleBadge(userName, senderRoleSource, 'chat', senderRole) : '');
-		const isPersonalMention = !isAuthor && myName && ((hasMentionSyntax && (typeof chatTextMentionsUser === 'function' ? chatTextMentionsUser(cleanText, myName, batchContext ? batchContext.myMentionRegex : null) : cleanText.includes(`@${myName}`))) || (replyData && replyData.user === myName));
+		const isPersonalMention = !isAuthor && myName && ((hasMentionSyntax && (typeof chatTextMentionsCurrentSession === 'function' ? chatTextMentionsCurrentSession(cleanText, myName, batchContext ? batchContext.myMentionRegex : null) : (typeof chatTextMentionsUser === 'function' ? chatTextMentionsUser(cleanText, myName, batchContext ? batchContext.myMentionRegex : null) : cleanText.includes(`@${myName}`)))) || (replyData && replyData.user === myName));
 		const preferredMessageAvatar = (typeof msg === 'object' && msg.avatar) ? msg.avatar : '';
 		let userAvatar = '';
 		if (!preferredMessageAvatar && batchContext && batchContext.avatarByName instanceof Map && batchContext.avatarByName.has(userName)) {
@@ -71183,9 +71193,7 @@ function getVisibleChatStackEl(id) {
 			
 			const shouldPlayChatDotSound = !chatVisible && data.user !== myName;
 			if (!chatVisible && data.user !== myName && (typeof isChatNotificationSessionReady !== 'function' || isChatNotificationSessionReady())) {
-				const directMention = data.text && (typeof chatTextMentionsUser === 'function' ? chatTextMentionsUser(data.text, myName) : data.text.includes(`@${myName}`));
-				const roleMention = data.text && typeof chatTextMentionsSessionRole === 'function' && chatTextMentionsSessionRole(data.text);
-				const isMention = !!(directMention || roleMention);
+				const isMention = !!(data.text && (typeof chatTextMentionsCurrentSession === 'function' ? chatTextMentionsCurrentSession(data.text, myName) : (typeof chatTextMentionsUser === 'function' ? chatTextMentionsUser(data.text, myName) : data.text.includes(`@${myName}`))));
 				const isReply = data.replyTo && data.replyTo.user === myName;
 				if (isMention || isReply || data.isGlobalPing) showChatNotification(data.user, isMention, data.isGlobalPing, data.globalPingRole);
 			}
@@ -71514,9 +71522,8 @@ function getVisibleChatStackEl(id) {
 			if (editedRow) {
 				const myNameForMention = String(localStorage.getItem('psn_username') || '');
 				const replyMentionsMe = !!(editedHistoryMsg && editedHistoryMsg.replyTo && editedHistoryMsg.replyTo.user === myNameForMention);
-				const textMentionsMe = !!(myNameForMention && editedHistoryMsg && editedHistoryMsg.user !== myNameForMention && (typeof chatTextMentionsUser === 'function' ? chatTextMentionsUser(data.newText || '', myNameForMention) : String(data.newText || '').includes(`@${myNameForMention}`)));
-				const roleMentionsMe = !!(editedHistoryMsg && editedHistoryMsg.user !== myNameForMention && typeof chatTextMentionsSessionRole === 'function' && chatTextMentionsSessionRole(data.newText || ''));
-				const nextMentionMarker = (isGlobalAfterEdit || replyMentionsMe || textMentionsMe || roleMentionsMe) ? '1' : '0';
+				const textMentionsMe = !!(myNameForMention && editedHistoryMsg && editedHistoryMsg.user !== myNameForMention && (typeof chatTextMentionsCurrentSession === 'function' ? chatTextMentionsCurrentSession(data.newText || '', myNameForMention) : (typeof chatTextMentionsUser === 'function' ? chatTextMentionsUser(data.newText || '', myNameForMention) : String(data.newText || '').includes(`@${myNameForMention}`))));
+				const nextMentionMarker = (isGlobalAfterEdit || replyMentionsMe || textMentionsMe) ? '1' : '0';
 				if (editedRow.dataset.chatMentionMe !== nextMentionMarker) editedRow.dataset.chatMentionMe = nextMentionMarker;
 			}
 			if (typeof syncRenderedChatMessageSignature === 'function') syncRenderedChatMessageSignature(data.msgId);
