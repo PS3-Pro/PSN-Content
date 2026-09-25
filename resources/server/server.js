@@ -9749,8 +9749,8 @@ function getChatNotificationPreview(text) {
 function extractChatRoleMentionTargets(text, senderName) {
   const source = String(text || '');
   if (!source.includes('@')) return [];
-  const wantsAdmin = /(^|[\s.,!?;:()\[\]{}<>"'`])@admin\b/i.test(source);
-  const wantsModerator = /(^|[\s.,!?;:()\[\]{}<>"'`])@moderator\b/i.test(source);
+  const wantsAdmin = /(^|[\s.,!?;:()\[\]{}<>"'`])@admins?\b/i.test(source);
+  const wantsModerator = /(^|[\s.,!?;:()\[\]{}<>"'`])@moderators?\b/i.test(source);
   if (!wantsAdmin && !wantsModerator) return [];
 
   const senderLower = String(senderName || '').toLowerCase();
