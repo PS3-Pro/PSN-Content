@@ -3290,7 +3290,34 @@ div[id^="msg-row-"] { transition: opacity 0.4s ease,transform 0.4s cubic-bezier(
 
 /* ========================================================================== ADMIN PANEL ========================================================================== */
 #nav-admin-footer { display: none !important; }
-body.is-admin #nav-admin-footer { display: flex !important; }
+body.is-admin #nav-admin-footer,
+body:not(.is-admin) #nav-admin-footer.admin-role-transition { display: flex !important; }
+#nav-admin-footer.admin-role-transition {
+	box-sizing: border-box;
+	overflow: hidden;
+	transform-origin: left center;
+	will-change: max-height,padding,opacity,transform;
+	transition: max-height .28s cubic-bezier(.2,.8,.2,1),padding-top .28s cubic-bezier(.2,.8,.2,1),padding-bottom .28s cubic-bezier(.2,.8,.2,1),opacity .18s ease,transform .28s cubic-bezier(.2,.8,.2,1) !important;
+}
+#nav-admin-footer.admin-role-entering,
+#nav-admin-footer.admin-role-leaving {
+	max-height: 0 !important;
+	padding-top: 0 !important;
+	padding-bottom: 0 !important;
+	opacity: 0 !important;
+	transform: translateY(-6px) scale(.985);
+	pointer-events: none !important;
+}
+#nav-admin-footer.admin-role-expanded {
+	max-height: 52px !important;
+	padding-top: 12px !important;
+	padding-bottom: 12px !important;
+	opacity: 1 !important;
+	transform: translateY(0) scale(1);
+}
+@media (prefers-reduced-motion:reduce) {
+	#nav-admin-footer.admin-role-transition { transition-duration: .01ms !important; }
+}
 body:not(.is-admin) #view-admin { display: none !important; }
 .admin-panel-shell { position: relative; display: flex; flex-direction: column; gap: 18px; }
 .admin-hero-card { position: relative; overflow: hidden; isolation: isolate; padding: 24px; border-radius: 18px; border: 1px solid rgba(255,68,68,0.22); background: linear-gradient(135deg,rgba(255,68,68,0.12),rgba(0,112,204,0.08)),rgba(18,24,36,0.62); backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px); box-shadow: 0 18px 45px rgba(0,0,0,0.28); transition: transform .24s cubic-bezier(.2,.8,.2,1),border-color .24s ease,background .24s ease,box-shadow .24s ease; }
@@ -37736,6 +37763,58 @@ P
            recalculating them once on the outgoing screen and again on the destination. */
 	};
 
+	window.applyRealtimeAdminSidebarState = function(nextAdmin) {
+		const body = document.body;
+		const entry = document.getElementById('nav-admin-footer');
+		const shouldBeAdmin = nextAdmin === true;
+		const wasAdmin = body.classList.contains('is-admin');
+		if (!entry || wasAdmin === shouldBeAdmin) {
+			body.classList.toggle('is-admin', shouldBeAdmin);
+			return;
+		}
+
+		if (window.__adminRoleSidebarTransitionTimer) {
+			clearTimeout(window.__adminRoleSidebarTransitionTimer);
+			window.__adminRoleSidebarTransitionTimer = null;
+		}
+		entry.classList.remove('admin-role-transition', 'admin-role-entering', 'admin-role-expanded', 'admin-role-leaving');
+
+		const reduceMotion = !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+		if (reduceMotion) {
+			body.classList.toggle('is-admin', shouldBeAdmin);
+			return;
+		}
+
+		entry.classList.add('admin-role-transition');
+		if (shouldBeAdmin) {
+			/* Keep the new row collapsed for one frame, then grow it into the footer so
+			   Notifications/Settings slide smoothly instead of jumping downward. */
+			entry.classList.add('admin-role-entering');
+			body.classList.add('is-admin');
+			void entry.offsetHeight;
+			requestAnimationFrame(() => {
+				if (!document.body.classList.contains('is-admin')) return;
+				entry.classList.remove('admin-role-entering');
+				entry.classList.add('admin-role-expanded');
+			});
+		} else {
+			/* Revoke access immediately, but keep only the footer row renderable during
+			   its short collapse animation. The Admin view itself is hidden at once. */
+			entry.classList.add('admin-role-expanded');
+			void entry.offsetHeight;
+			body.classList.remove('is-admin');
+			requestAnimationFrame(() => {
+				entry.classList.remove('admin-role-expanded');
+				entry.classList.add('admin-role-leaving');
+			});
+		}
+
+		window.__adminRoleSidebarTransitionTimer = setTimeout(() => {
+			window.__adminRoleSidebarTransitionTimer = null;
+			entry.classList.remove('admin-role-transition', 'admin-role-entering', 'admin-role-expanded', 'admin-role-leaving');
+		}, 340);
+	};
+
 	window.updateAdminVisibility = function() {
 		const isAdmin = document.body.classList.contains('is-admin');
 		const currentAdminView = document.getElementById('view-admin');
@@ -69978,7 +70057,9 @@ function getVisibleChatStackEl(id) {
 				if (data.isAdmin === true || role === 'admin') safeLocalStorageSet(`${myName}_psn_isAdmin`, 'true');
 				else localStorage.removeItem(`${myName}_psn_isAdmin`);
 			}
-			document.body.classList.toggle('is-admin', data.isAdmin === true || role === 'admin');
+			const nextSessionIsAdmin = data.isAdmin === true || role === 'admin';
+			if (typeof window.applyRealtimeAdminSidebarState === 'function') window.applyRealtimeAdminSidebarState(nextSessionIsAdmin);
+			else document.body.classList.toggle('is-admin', nextSessionIsAdmin);
 			document.body.classList.toggle('is-mod', data.isModerator === true || role === 'mod');
 			if (typeof updateAdminVisibility === 'function') updateAdminVisibility();
 			document.body.classList.remove('admin-maintenance-login-bypass');
