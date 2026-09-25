@@ -3318,6 +3318,44 @@ body:not(.is-admin) #nav-admin-footer.admin-role-transition { display: flex !imp
 @media (prefers-reduced-motion:reduce) {
 	#nav-admin-footer.admin-role-transition { transition-duration: .01ms !important; }
 }
+
+/* Realtime role promotion notice. Kept independent from the Admin view so Moderator
+   promotions use the same lightweight modal without mounting any admin-only UI. */
+#role-promotion-modal { z-index: 12500; }
+#role-promotion-modal .role-promotion-card {
+	--role-promotion-color: #ff4444;
+	--role-promotion-glow: rgba(255,68,68,.34);
+	width: min(92vw, 430px);
+	max-width: 430px;
+	border-color: color-mix(in srgb,var(--role-promotion-color) 58%,rgba(255,255,255,.18));
+	box-shadow: 0 18px 60px rgba(0,0,0,.76),0 0 34px var(--role-promotion-glow);
+	background: linear-gradient(145deg,color-mix(in srgb,var(--role-promotion-color) 8%,transparent),rgba(18,24,36,.96));
+}
+#role-promotion-modal.role-mod .role-promotion-card { --role-promotion-color:#8be8ff; --role-promotion-glow:rgba(139,232,255,.28); }
+#role-promotion-modal .role-promotion-body { padding: 30px 28px 26px; text-align: center; display:flex; flex-direction:column; align-items:center; }
+#role-promotion-modal .role-promotion-icon {
+	width: 72px; height: 72px; border-radius: 22px; display:flex; align-items:center; justify-content:center;
+	font-size: 29px; color: var(--role-promotion-color); border:1px solid color-mix(in srgb,var(--role-promotion-color) 58%,transparent);
+	background: color-mix(in srgb,var(--role-promotion-color) 12%,rgba(10,15,25,.82));
+	box-shadow: inset 0 0 24px color-mix(in srgb,var(--role-promotion-color) 10%,transparent),0 0 30px var(--role-promotion-glow);
+	margin-bottom: 17px;
+}
+#role-promotion-modal .role-promotion-kicker { color:var(--role-promotion-color); font-size:9px; font-weight:900; letter-spacing:1.7px; text-transform:uppercase; margin-bottom:7px; }
+#role-promotion-modal .role-promotion-title { margin:0; color:#fff; font-size:24px; font-weight:300; letter-spacing:-.35px; }
+#role-promotion-modal .role-promotion-copy { margin:11px 0 0; max-width:340px; color:var(--text-muted); font-size:12px; line-height:1.6; }
+#role-promotion-modal .role-promotion-by { margin-top:19px; width:100%; display:flex; align-items:center; justify-content:center; gap:7px; padding:10px 13px; border-radius:10px; background:rgba(255,255,255,.045); border:1px solid rgba(255,255,255,.08); font-size:11px; color:var(--text-muted); }
+#role-promotion-modal .role-promotion-by strong { color:#fff; font-weight:700; }
+#role-promotion-modal .role-promotion-actions { width:100%; display:flex; gap:10px; margin-top:22px; }
+#role-promotion-modal .role-promotion-actions .action-btn { flex:1; min-height:40px; justify-content:center; margin:0; }
+#role-promotion-modal .role-promotion-primary { background:color-mix(in srgb,var(--role-promotion-color) 70%,#07111d) !important; border-color:var(--role-promotion-color) !important; color:#fff !important; }
+#role-promotion-modal.role-mod .role-promotion-primary { color:#07111d !important; }
+@media (max-width:520px) {
+	#role-promotion-modal .role-promotion-body { padding:26px 20px 22px; }
+	#role-promotion-modal .role-promotion-actions { flex-direction:column; }
+}
+@media (prefers-reduced-motion:reduce) {
+	#role-promotion-modal .sys-modal-content, #role-promotion-modal .sys-modal-body>* { animation:none !important; transition-duration:.01ms !important; }
+}
 body:not(.is-admin) #view-admin { display: none !important; }
 .admin-panel-shell { position: relative; display: flex; flex-direction: column; gap: 18px; }
 .admin-hero-card { position: relative; overflow: hidden; isolation: isolate; padding: 24px; border-radius: 18px; border: 1px solid rgba(255,68,68,0.22); background: linear-gradient(135deg,rgba(255,68,68,0.12),rgba(0,112,204,0.08)),rgba(18,24,36,0.62); backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px); box-shadow: 0 18px 45px rgba(0,0,0,0.28); transition: transform .24s cubic-bezier(.2,.8,.2,1),border-color .24s ease,background .24s ease,box-shadow .24s ease; }
@@ -32278,6 +32316,11 @@ P
 				const descriptor = normalizePsnContentDeepLinkDescriptor(response.descriptor);
 				const sharer = normalizePsnContentSharer(response.sharer);
 				if (!descriptor || !sharer) throw new Error('Shared link data is incomplete.');
+				const currentUserName = String(localStorage.getItem('psn_username') || '').trim().toLowerCase();
+				const sharerName = String(sharer.name || '').trim().toLowerCase();
+				if (currentUserName && sharerName && currentUserName !== sharerName && typeof window.checkTrophyProgress === 'function') {
+					window.checkTrophyProgress('shared_link_received', 1);
+				}
 				return storePendingSharedContent({
 					token: pending.token,
 					descriptor,
@@ -32338,12 +32381,14 @@ P
 			if (coarsePointer && navigator.share) {
 				try {
 					await navigator.share({ title, text: `${localStorage.getItem('psn_username') || 'Someone'} shared ${descriptor.name || 'PSN-Content content'} with you.`, url });
+					if (typeof window.checkTrophyProgress === 'function') window.checkTrophyProgress('shared_link_sent', 1);
 					return true;
 				} catch (e) {
 					if (e && e.name === 'AbortError') return false;
 				}
 			}
 			await copyPsnContentDeepLinkToClipboard(url);
+			if (typeof window.checkTrophyProgress === 'function') window.checkTrophyProgress('shared_link_sent', 1);
 			if (typeof playUiSuccess === 'function') playUiSuccess();
 			if (typeof showToastNotification === 'function') showToastNotification('Share', 'Private share link copied to clipboard.');
 			else if (typeof showNotification === 'function') showNotification('Private share link copied to clipboard.', 'success');
@@ -32431,6 +32476,10 @@ P
 
 	function isPsnSharedContentPromptBlocked() {
 		if (window.isProfileLoaded !== true) return true;
+		/* Modal priority is intentional: Disclaimer -> role promotion -> Shared Content.
+		   A pending promotion blocks Shared Content even before its modal mounts, so the
+		   share prompt can never win the race during login/reconnect. */
+		if (window.__pendingRolePromotionNotice || window.__rolePromotionShowTimer || document.querySelector('#role-promotion-modal.show, #role-promotion-modal.closing, #role-promotion-modal[style*="display: flex"]')) return true;
 		const bootContainer = document.getElementById('ps5-boot-container');
 		if (bootContainer && bootContainer.style.display !== 'none') return true;
 		try {
@@ -57724,6 +57773,9 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 		friend_10: { id: 'friend_10', title: 'Popular', desc: 'Have 10 friends on your list.', type: 'silver', max: 10, group: 'Social & Chat' },
 		friend_25: { id: 'friend_25', title: 'Networker', desc: 'Have 25 friends on your list.', type: 'gold', max: 25, group: 'Social & Chat' },
 		play_together: { id: 'play_together', title: 'Better Together', desc: 'Enable Play Together for a game.', type: 'bronze', max: 1, group: 'Social & Chat' },
+		shared_link_sent: { id: 'shared_link_sent', title: 'Spread the Word', desc: 'Share a Store item using a private content link.', type: 'bronze', max: 1, group: 'Social & Chat' },
+		shared_link_received: { id: 'shared_link_received', title: 'Special Delivery', desc: 'Open a private content link shared by another user.', type: 'bronze', max: 1, group: 'Social & Chat' },
+		profile_view_first: { id: 'profile_view_first', title: 'Curious Mind', desc: "View another player's profile for the first time.", type: 'bronze', max: 1, group: 'Social & Chat' },
 
 		wishlist_1: { id: 'wishlist_1', title: 'Window Shopper', desc: 'Add 1 game to your Wishlist.', type: 'bronze', max: 1, group: 'Store & Wishlist' },
 		wishlist_10: { id: 'wishlist_10', title: 'Wish Collector', desc: 'Have 10 games in your Wishlist simultaneously.', type: 'silver', max: 10, group: 'Store & Wishlist' },
@@ -68775,6 +68827,10 @@ function getVisibleChatStackEl(id) {
 					if (typeof psnMarkTrophyViewsDirty === 'function') psnMarkTrophyViewsDirty();
 				}
 				window.__trophiesHydrated = true;
+				if (window.__pendingOtherProfileVisitTrophy === true && typeof window.checkTrophyProgress === 'function') {
+					window.__pendingOtherProfileVisitTrophy = false;
+					setTimeout(() => window.checkTrophyProgress('profile_view_first', 1), 0);
+				}
 				if ((profileSyncChanges.trophies || window.__initialProfileSyncInProgress === true) && typeof window.refreshTrophyRewardSidebarCounts === 'function') window.refreshTrophyRewardSidebarCounts();
 			}
 			if (profileSyncChanges.wishlist && Array.isArray(userData.wishlistData)) { window.wishlist = userData.wishlistData; safeLocalStorageSet(`${name}_psn_wishlist_db`, JSON.stringify(userData.wishlistData)); applyProfileListUpdatedAtFromServer(name, 'wishlist', userData.wishlistUpdatedAt); }
@@ -70016,6 +70072,179 @@ function getVisibleChatStackEl(id) {
 			renderPinnedBar();
 		});
 		
+
+		window.acknowledgeRolePromotionNotice = function(noticeId) {
+			const id = String(noticeId || '').trim();
+			if (!id || window.__lastRolePromotionAckId === id) return false;
+			if (typeof socketChat === 'undefined' || !socketChat || !socketChat.connected) return false;
+			window.__lastRolePromotionAckId = id;
+			socketChat.emit('ack_role_promotion_notice', { noticeId:id }, response => {
+				if (!response || response.success !== true) {
+					if (window.__lastRolePromotionAckId === id) window.__lastRolePromotionAckId = '';
+				}
+			});
+			return true;
+		};
+
+		window.closeRolePromotionModal = function(options = {}) {
+			const modal = document.getElementById('role-promotion-modal');
+			if (!modal) return false;
+			if (window.__rolePromotionShowTimer) { clearTimeout(window.__rolePromotionShowTimer); window.__rolePromotionShowTimer = null; }
+			const noticeId = String(modal.dataset.noticeId || '').trim();
+			if (options.ack !== false && noticeId) window.acknowledgeRolePromotionNotice(noticeId);
+			if (options.silent !== true && typeof playUiBack === 'function') playUiBack();
+			modal.classList.remove('show');
+			modal.classList.add('closing');
+			setTimeout(() => {
+				if (modal && !modal.classList.contains('show')) modal.remove();
+			}, 320);
+			return true;
+		};
+
+		window.openRolePromotionAdminPanel = function() {
+			window.closeRolePromotionModal({ silent:true });
+			if (typeof playUiClick === 'function') playUiClick();
+			setTimeout(() => { if (document.body.classList.contains('is-admin') && typeof window.openAdminPanel === 'function') window.openAdminPanel(); }, 120);
+		};
+
+		window.isRolePromotionNoticeBlocked = function() {
+			if (window.isProfileLoaded !== true) return true;
+			const bootContainer = document.getElementById('ps5-boot-container');
+			if (bootContainer && bootContainer.style.display !== 'none') return true;
+
+			const myName = String(localStorage.getItem('psn_username') || '').trim();
+			try {
+				if (window.__siteDisclaimerOpening) return true;
+				if (typeof isSiteDisclaimerOpenOrOpening === 'function' && isSiteDisclaimerOpenOrOpening()) return true;
+				if (myName && typeof shouldShowSiteDisclaimerForUser === 'function' && shouldShowSiteDisclaimerForUser(myName)) return true;
+			} catch (e) {}
+
+			const disclaimer = document.getElementById('site-disclaimer-modal');
+			if (disclaimer && (
+				disclaimer.classList.contains('show') ||
+				disclaimer.classList.contains('closing') ||
+				disclaimer.classList.contains('is-visible') ||
+				disclaimer.style.display === 'flex'
+			)) return true;
+
+			/* Never stack the promotion over Shared Content. If Shared Content is already open,
+			   wait for it to close. When both are merely pending, Shared Content is held back
+			   by isPsnSharedContentPromptBlocked(), so promotion wins the queue. */
+			const shared = document.getElementById('modal-shared-content-link');
+			if (shared && (
+				shared.classList.contains('show') ||
+				shared.classList.contains('closing') ||
+				shared.style.display === 'flex'
+			)) return true;
+
+			const blocker = document.querySelector([
+				'.sys-modal-overlay.show:not(#role-promotion-modal):not(#modal-shared-content-link)',
+				'.sys-modal-overlay.closing:not(#role-promotion-modal):not(#modal-shared-content-link)',
+				'.sys-modal-overlay[style*="display: flex"]:not(#role-promotion-modal):not(#modal-shared-content-link)',
+				'.modal-overlay.show', '.modal-overlay.closing', '.modal-overlay.is-visible', '.modal-overlay[style*="display: flex"]',
+				'.ps5-overlay-screen.is-visible', '.ps5-overlay-screen.is-hiding', '.ps5-overlay-screen[style*="display: flex"]',
+				'#psn-image-modal.show', '#psn-image-modal[style*="display: flex"]', '.admin-color-picker-overlay.show'
+			].join(','));
+			return !!blocker;
+		};
+
+		window.showRolePromotionNotice = function(data = {}) {
+			const myName = String(localStorage.getItem('psn_username') || '').trim();
+			const targetName = String(data.targetName || data.name || '').trim();
+			let role = String(data.role || '').toLowerCase();
+			if (role === 'moderator') role = 'mod';
+			if (!myName || targetName !== myName || !['admin','mod'].includes(role)) return false;
+			const currentRole = typeof window.getPsnSessionRole === 'function' ? window.getPsnSessionRole() : (document.body.classList.contains('is-admin') ? 'admin' : (document.body.classList.contains('is-mod') ? 'mod' : 'user'));
+			if (currentRole !== role) return false;
+
+			const noticeId = String(data.noticeId || '').trim();
+			const existing = document.getElementById('role-promotion-modal');
+			if (existing && noticeId && existing.dataset.noticeId === noticeId) return true;
+			if (existing) existing.remove();
+
+			const escapeHtml = value => String(value ?? '').replace(/[&<>"']/g, ch => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[ch]));
+			const promotedBy = String(data.promotedBy || 'Administrator').trim() || 'Administrator';
+			const isAdminRole = role === 'admin';
+			const roleLabel = isAdminRole ? 'Admin' : 'Moderator';
+			const roleArticle = isAdminRole ? 'an' : 'a';
+			const icon = isAdminRole ? 'fa-crown' : 'fa-shield-alt';
+			const copy = isAdminRole
+				? 'You’ve been granted access to moderation tools and the Control Panel.'
+				: 'You’ve been granted access to chat moderation tools.';
+
+			const modal = document.createElement('div');
+			modal.id = 'role-promotion-modal';
+			modal.className = `sys-modal-overlay role-promotion-modal role-${role}`;
+			modal.dataset.noticeId = noticeId;
+			modal.setAttribute('aria-hidden', 'true');
+			modal.innerHTML = `
+				<div class="sys-modal-content role-promotion-card" role="dialog" aria-modal="true" aria-labelledby="role-promotion-title" onclick="event.stopPropagation()">
+					<div class="sys-modal-body role-promotion-body">
+						<div class="role-promotion-icon"><i class="fas ${icon}"></i></div>
+						<div class="role-promotion-kicker">NEW ROLE UNLOCKED</div>
+						<h2 id="role-promotion-title" class="role-promotion-title">You’re now ${roleArticle} ${roleLabel}</h2>
+						<p class="role-promotion-copy">${copy}</p>
+						<div class="role-promotion-by"><span>Promoted by</span><strong data-no-translate="true" translate="no">${escapeHtml(promotedBy)}</strong></div>
+						<div class="role-promotion-actions">
+							${isAdminRole ? '<button type="button" class="action-btn role-promotion-primary" onmouseenter="if(typeof playUiHover===\'function\') playUiHover()" onclick="window.openRolePromotionAdminPanel()"><i class="fas fa-sliders-h"></i> OPEN CONTROL PANEL</button>' : ''}
+							<button type="button" class="action-btn" onmouseenter="if(typeof playUiHover===\'function\') playUiHover()" onclick="window.closeRolePromotionModal()">GOT IT</button>
+						</div>
+					</div>
+				</div>`;
+			modal.addEventListener('click', event => { if (event.target === modal) window.closeRolePromotionModal(); });
+			document.body.appendChild(modal);
+			modal.style.display = 'flex';
+			requestAnimationFrame(() => requestAnimationFrame(() => {
+				modal.classList.add('show');
+				modal.setAttribute('aria-hidden', 'false');
+				if (typeof playUiSuccess === 'function') playUiSuccess();
+			}));
+			return true;
+		};
+
+		window.scheduleRolePromotionNotice = function(data = {}) {
+			const myName = String(localStorage.getItem('psn_username') || '').trim();
+			const targetName = String(data.targetName || data.name || '').trim();
+			if (!myName || targetName !== myName) return false;
+
+			const incomingNoticeId = String(data.noticeId || '').trim();
+			const mounted = document.getElementById('role-promotion-modal');
+			if (mounted && incomingNoticeId && mounted.dataset.noticeId === incomingNoticeId) return true;
+			if (window.__pendingRolePromotionNotice && incomingNoticeId && String(window.__pendingRolePromotionNotice.noticeId || '') === incomingNoticeId) return true;
+
+			window.__pendingRolePromotionNotice = { ...data };
+			if (window.__rolePromotionShowTimer) clearTimeout(window.__rolePromotionShowTimer);
+			const tryShow = () => {
+				window.__rolePromotionShowTimer = null;
+				const pending = window.__pendingRolePromotionNotice;
+				if (!pending) return;
+				/* During login the role notice can arrive before auth_success finishes applying the
+				   local role. Wait for the normal modal/session queue first, then validate the role. */
+				if (window.isRolePromotionNoticeBlocked()) {
+					window.__rolePromotionShowTimer = setTimeout(tryShow, 420);
+					return;
+				}
+				let pendingRole = String(pending.role || '').toLowerCase();
+				if (pendingRole === 'moderator') pendingRole = 'mod';
+				const liveRole = typeof window.getPsnSessionRole === 'function' ? window.getPsnSessionRole() : '';
+				if (liveRole && liveRole !== pendingRole) {
+					window.__pendingRolePromotionNotice = null;
+					return;
+				}
+				window.__pendingRolePromotionNotice = null;
+				window.showRolePromotionNotice(pending);
+			};
+			/* Admin sidebar reveal takes ~280ms. Let it finish first so the visual sequence is
+			   role unlock -> sidebar grows -> promotion modal. Disclaimer always has priority,
+			   then promotion, then Shared Content. */
+			window.__rolePromotionShowTimer = setTimeout(tryShow, 380);
+			return true;
+		};
+
+		socketChat.on('role_promotion_notice', (data = {}) => {
+			window.scheduleRolePromotionNotice(data);
+		});
+
 		socketChat.on('role_updated', (data) => {
 			data = data || {};
 			const myName = localStorage.getItem('psn_username') || '';
@@ -70170,6 +70399,10 @@ function getVisibleChatStackEl(id) {
 				window.userTrophies = userData.trophiesData;
 				safeLocalStorageSet(`${name}_psn_user_trophies`, JSON.stringify(userData.trophiesData));
 				window.__trophiesHydrated = true;
+				if (window.__pendingOtherProfileVisitTrophy === true && typeof window.checkTrophyProgress === 'function') {
+					window.__pendingOtherProfileVisitTrophy = false;
+					setTimeout(() => window.checkTrophyProgress('profile_view_first', 1), 0);
+				}
 				if (typeof window.refreshTrophyRewardSidebarCounts === 'function') window.refreshTrophyRewardSidebarCounts();
 			} else if (isLightAuthPayload) {
 				const localTrophies = localStorage.getItem(`${name}_psn_user_trophies`);
@@ -81366,6 +81599,13 @@ function getVisibleChatStackEl(id) {
 		const username = targetUser ? decodeURIComponent(targetUser) : myName;
 		if (profileModal) profileModal.dataset.profileUsername = username;
 		const isMe = (username === myName);
+		if (!isMe && targetUser) {
+			if (window.__trophiesHydrated === true && typeof window.checkTrophyProgress === 'function') {
+				window.checkTrophyProgress('profile_view_first', 1);
+			} else {
+				window.__pendingOtherProfileVisitTrophy = true;
+			}
+		}
 		const profileCardStyleBtn = document.getElementById('profile-card-style-btn');
 		if (profileCardStyleBtn) profileCardStyleBtn.classList.toggle('is-visible', isMe);
 		
