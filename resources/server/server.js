@@ -10409,23 +10409,38 @@ async function createContentShareTokenForUser(userName, rawDescriptor) {
 async function resolveContentShareTokenForUser(token) {
   const safeToken = normalizeContentShareTokenServer(token);
   if (!safeToken) return { success:false, message:'Invalid shared link.' };
+
+  // Resolve the small share row first. User data normally already lives in the
+  // in-memory account cache, so avoid pulling the full JSONB profile for every link.
   const result = await queryDbWithRetry(
-    `SELECT cs.descriptor, cs.shared_by, u.data AS user_data
-       FROM content_shares cs
-       JOIN users u ON u.name = cs.shared_by
-      WHERE cs.token = $1
+    `SELECT descriptor, shared_by
+       FROM content_shares
+      WHERE token = $1
       LIMIT 1`,
     [safeToken],
     { attempts:2, label:'CONTENT SHARE RESOLVE' }
   );
   if (!result.rows.length) return { success:false, message:'This shared link is no longer available.' };
+
   const row = result.rows[0];
   const descriptor = normalizeContentShareDescriptorServer(row.descriptor);
   if (!descriptor) return { success:false, message:'This shared link is no longer available.' };
   const sharedBy = normalizeText(row.shared_by, '').slice(0, 120);
-  const cachedUser = userDatabase[sharedBy] || {};
-  const dbUser = row.user_data && typeof row.user_data === 'object' ? row.user_data : {};
-  const sharer = buildContentShareSharerPayload(sharedBy, { ...dbUser, ...cachedUser });
+
+  let sharerSource = userDatabase[sharedBy];
+  if (!sharerSource || typeof sharerSource !== 'object') {
+    const userResult = await queryDbWithRetry(
+      `SELECT data FROM users WHERE name = $1 LIMIT 1`,
+      [sharedBy],
+      { attempts:1, label:'CONTENT SHARE USER FALLBACK' }
+    );
+    sharerSource = userResult.rows[0] && userResult.rows[0].data;
+  }
+  if (!sharerSource || typeof sharerSource !== 'object') {
+    return { success:false, message:'This shared link is no longer available.' };
+  }
+
+  const sharer = buildContentShareSharerPayload(sharedBy, sharerSource);
   return { success:true, descriptor, sharer };
 }
 
