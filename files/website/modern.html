@@ -690,6 +690,10 @@ html.collection-memory-optimization-on #downloads-list > .download-swipe-row { c
 .shared-content-sharer-name { min-width: 0; max-width: 230px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #fff; font-size: 13px; font-weight: 800; letter-spacing: .05px; }
 .shared-content-sharer-role { flex: 0 0 auto; padding: 2px 6px; border-radius: 999px; border: 1px solid rgba(102,204,255,.22); background: rgba(0,112,204,.11); color: #82c9ff; font-size: 7px; font-weight: 900; letter-spacing: .55px; text-transform: uppercase; }
 .shared-content-sharer-hint { color: rgba(255,255,255,.42); font-size: 9px; line-height: 1.25; }
+
+.chat-internal-share-link { color: var(--chat-share-color,#fff) !important; text-decoration-line: underline !important; text-decoration-thickness: 1px; text-underline-offset: 2px; font-weight: 750; word-break: break-word; cursor: pointer; transition: color .16s ease, opacity .16s ease, filter .16s ease; }
+.chat-internal-share-link:hover { color: var(--chat-share-hover,#fff) !important; filter: brightness(1.12); }
+.chat-internal-share-link:active { opacity: .72; }
 .shared-content-friend-btn { flex: 0 0 auto; min-width: 108px !important; width: auto; padding: 9px 13px !important; font-size: 10px !important; gap: 6px !important; }
 .shared-content-friend-btn.is-friend { border-color: rgba(102,204,255,.22) !important; background: rgba(102,204,255,.09) !important; color: #8ed2ff !important; opacity: 1 !important; }
 .shared-content-friend-btn.is-self { display: none !important; }
@@ -32616,7 +32620,7 @@ P
 			contentId: normalizePsnContentDeepLinkText(value.contentId || value.cid),
 			version: normalizePsnContentDeepLinkText(value.version || value.ver).toLowerCase().replace(/^v\s*/i, ''),
 			region: normalizePsnContentDeepLinkText(value.region).toUpperCase(),
-			name: normalizePsnContentDeepLinkText(value.name)
+			name: normalizePsnContentDeepLinkText(value.name || value.cleanName || value.title)
 		};
 		if (!descriptor.category) return null;
 		return (descriptor.contentId || descriptor.titleId || descriptor.name) ? descriptor : null;
@@ -32708,20 +32712,50 @@ P
 		return token;
 	};
 
-	window.buildPsnContentShareUrl = function(token) {
+	function isPsnContentShareSiteUrl(url) {
+		if (!url) return false;
+		try {
+			if (window.location.protocol !== 'file:' && url.origin === window.location.origin) return true;
+			const host = String(url.hostname || '').toLowerCase();
+			const path = String(url.pathname || '/');
+			// Official public PSN-Content deployment. Keeping this explicit also makes local/F12
+			// builds recognize links copied from the live site without treating arbitrary URLs as internal.
+			if (host === 'ps3-pro.github.io' && /^\/PSN-Content(?:\/|$)/i.test(path)) return true;
+			return false;
+		} catch (e) { return false; }
+	}
+
+	window.buildPsnContentShareUrl = function(token, descriptor = null) {
 		const safeToken = normalizePsnContentShareToken(token);
-		const url = new URL(`${window.location.origin}${window.location.pathname}${window.location.search}`);
-		if (safeToken) url.hash = `${PSN_CONTENT_SHARE_HASH_KEY}=${encodeURIComponent(safeToken)}`;
+		let url;
+		try {
+			if (window.location.protocol === 'file:' || String(window.location.origin || '') === 'null') {
+				url = new URL('https://ps3-pro.github.io/PSN-Content/files/website/modern.html');
+			} else {
+				url = new URL(`${window.location.origin}${window.location.pathname}${window.location.search}`);
+			}
+		} catch (e) {
+			url = new URL('https://ps3-pro.github.io/PSN-Content/files/website/modern.html');
+		}
+		const params = new URLSearchParams();
+		if (safeToken) params.set(PSN_CONTENT_SHARE_HASH_KEY, safeToken);
+		const normalizedDescriptor = typeof normalizePsnContentDeepLinkDescriptor === 'function'
+			? normalizePsnContentDeepLinkDescriptor(descriptor)
+			: null;
+		if (normalizedDescriptor) {
+			const shareName = String(normalizedDescriptor.name || '').trim().slice(0, 160);
+			const shareCategory = String(normalizedDescriptor.category || '').trim().slice(0, 40);
+			if (shareName) params.set('name', shareName);
+			if (shareCategory) params.set('category', shareCategory);
+		}
+		url.hash = params.toString();
 		return url.toString();
 	};
 
 	window.getPsnContentShareTokenFromUrl = function(value) {
 		try {
 			const url = new URL(String(value || ''), window.location.href);
-			if (url.origin !== window.location.origin) return '';
-			const currentPath = String(window.location.pathname || '/').replace(/\/+$/, '') || '/';
-			const targetPath = String(url.pathname || '/').replace(/\/+$/, '') || '/';
-			if (targetPath !== currentPath) return '';
+			if (!isPsnContentShareSiteUrl(url)) return '';
 			const params = new URLSearchParams(String(url.hash || '').replace(/^#/, ''));
 			return normalizePsnContentShareToken(params.get(PSN_CONTENT_SHARE_HASH_KEY));
 		} catch (e) {
@@ -32729,8 +32763,24 @@ P
 		}
 	};
 
+	window.getPsnContentShareDescriptorHintFromUrl = function(value) {
+		try {
+			const url = new URL(String(value || ''), window.location.href);
+			if (!isPsnContentShareSiteUrl(url)) return null;
+			const params = new URLSearchParams(String(url.hash || '').replace(/^#/, ''));
+			const token = normalizePsnContentShareToken(params.get(PSN_CONTENT_SHARE_HASH_KEY));
+			if (!token) return null;
+			const name = normalizePsnContentDeepLinkText(params.get('name')).slice(0, 160);
+			const category = normalizePsnContentDeepLinkCategory(params.get('category'));
+			if (!name || !category) return null;
+			return { token, name, category };
+		} catch (e) { return null; }
+	};
+
 	window.openPsnContentSharedLinkInApp = function(event, source) {
-		const href = typeof source === 'string' ? source : String(source?.href || source?.getAttribute?.('href') || '');
+		const href = typeof source === 'string'
+			? source
+			: String(source?.dataset?.psnShareUrl || source?.getAttribute?.('data-psn-share-url') || source?.href || source?.getAttribute?.('href') || '');
 		const token = window.getPsnContentShareTokenFromUrl(href);
 		if (!token) return true;
 		if (event) {
@@ -32866,7 +32916,7 @@ P
 		if (button) { button.dataset.shareBusy = '1'; button.disabled = true; }
 		try {
 			const token = await createPsnContentShareToken(descriptor);
-			const url = window.buildPsnContentShareUrl(token);
+			const url = window.buildPsnContentShareUrl(token, descriptor);
 			const title = descriptor.name ? `${descriptor.name} — PSN-Content` : 'PSN-Content';
 			const coarsePointer = !!(window.matchMedia && window.matchMedia('(hover: none), (pointer: coarse)').matches);
 			if (coarsePointer && navigator.share) {
@@ -45217,10 +45267,6 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 				}
 			}
 			
-			if (currentView.id === 'view-library' && viewId !== 'view-library' && typeof window.resetFileManagerSessionState === 'function') {
-				window.resetFileManagerSessionState();
-			}
-
 			if (currentView.id === 'view-trophies' && viewId !== 'view-trophies') {
 				let changed = false;
 				if (window.userTrophies) {
@@ -45297,6 +45343,9 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 			if (currentManagedView.style.display !== 'none') currentManagedView.style.display = 'none';
 		} else {
 			for (const el of PSN_STATIC_VIEW_SECTIONS) if (el && el.style.display !== 'none') el.style.display = 'none';
+		}
+		if (currentView?.id === 'view-library' && viewId !== 'view-library' && typeof window.resetFileManagerSessionState === 'function') {
+			window.resetFileManagerSessionState();
 		}
 		if (libToolbar && libToolbar.style.display !== 'none') libToolbar.style.display = 'none';
 		if (consoleFilters && consoleFilters.style.display !== 'none') consoleFilters.style.display = 'none';
@@ -67971,18 +68020,98 @@ function getVisibleChatStackEl(id) {
 		return String(value || '').replace(/[&"<>]/g, ch => ({ '&': '&amp;', '"': '&quot;', '<': '&lt;', '>': '&gt;' }[ch]));
 	}
 
+
+
+	function getChatInternalShareCategoryColor(category) {
+		const key = String(category || '').trim().toLowerCase().replace(/[\s-]+/g, '_');
+		return ({
+			games: '#9ed8ff', apps: '#8fffea', dlcs: '#e5b3ff', updates: '#ffd29b', avatars: '#99ffe8', themes: '#ffb6e8', demos: '#fff2a8',
+			homebrew_games: '#a7ffb5', ports: '#e8ff9f', soundtracks: '#ffb7a8', videos: '#cad5ff', guides: '#d9ffb0', prototypes: '#d8c2ff',
+			dev_tools: '#bdc8ff', backup_manager: '#c8d9e1', tools: '#ffd2b8', emulators: '#ffadb5', launchers: '#ffe09b', legacy: '#e0dc96', no_psn: '#f0f0f0'
+		})[key] || '#9ed8ff';
+	}
+
+	function getChatInternalShareLabel(descriptor) {
+		if (!descriptor || typeof descriptor !== 'object') return '';
+		return String(descriptor.name || '').trim();
+	}
+
+	function getChatInternalShareHint(value) {
+		if (typeof window.getPsnContentShareDescriptorHintFromUrl !== 'function') return null;
+		return window.getPsnContentShareDescriptorHintFromUrl(String(value || ''));
+	}
+
+	function prepareChatInternalShareAnchor(anchor) {
+		if (!anchor || anchor.nodeType !== 1) return null;
+		const storedUrl = String(anchor.dataset?.psnShareUrl || anchor.getAttribute('data-psn-share-url') || '');
+		const currentHref = String(anchor.getAttribute('href') || anchor.href || '');
+		const shareUrl = storedUrl || currentHref;
+		const token = typeof window.getPsnContentShareTokenFromUrl === 'function' ? window.getPsnContentShareTokenFromUrl(shareUrl) : '';
+		if (!token) return null;
+		anchor.classList.add('chat-internal-share-link');
+		anchor.dataset.psnShareToken = token;
+		anchor.dataset.psnShareUrl = shareUrl;
+		anchor.setAttribute('href', '#');
+		anchor.setAttribute('data-no-translate', 'true');
+		anchor.setAttribute('translate', 'no');
+		anchor.removeAttribute('target');
+		anchor.removeAttribute('rel');
+		anchor.onclick = function(event) { return openPsnContentSharedLinkInApp(event, this); };
+		return anchor;
+	}
+
+	function applyChatInternalShareDescriptor(anchor, descriptor) {
+		anchor = prepareChatInternalShareAnchor(anchor);
+		const label = getChatInternalShareLabel(descriptor);
+		if (!anchor || !label) return false;
+		const category = String(descriptor.category || '').trim().toLowerCase();
+		anchor.textContent = label;
+		anchor.style.setProperty('--chat-share-color', getChatInternalShareCategoryColor(category));
+		anchor.style.setProperty('--chat-share-hover', '#ffffff');
+		anchor.title = `${label} — Open shared content`;
+		return true;
+	}
+
+	function hydrateChatInternalShareLink(anchor) {
+		anchor = prepareChatInternalShareAnchor(anchor);
+		if (!anchor) return;
+		const hint = getChatInternalShareHint(anchor.dataset.psnShareUrl || anchor.getAttribute('data-psn-share-url') || anchor.getAttribute('href') || anchor.href || '');
+		if (hint && hint.name) {
+			applyChatInternalShareDescriptor(anchor, hint);
+			return;
+		}
+		anchor.textContent = 'Shared Content';
+		anchor.style.removeProperty('--chat-share-color');
+		anchor.style.removeProperty('--chat-share-hover');
+		anchor.title = 'Open shared content';
+	}
+
+	function hydrateChatInternalShareLinks(root = document) {
+		if (!root || typeof root.querySelectorAll !== 'function') return;
+		const links = new Set();
+		if (root.matches && root.matches('a')) links.add(root);
+		root.querySelectorAll('a.chat-internal-share-link, a[data-psn-share-url], a[href*="#share="]').forEach(link => links.add(link));
+		links.forEach(hydrateChatInternalShareLink);
+	}
+	window.hydrateChatInternalShareLinks = hydrateChatInternalShareLinks;
+
+
 	function linkifyChatMessageText(value) {
 		let firstLink = null;
 		const html = String(value || '').replace(/(https?:\/\/[^\s]+)/g, url => {
 			const safeUrl = escapeChatLinkAttribute(url);
-			const shareToken = typeof window.getPsnContentShareTokenFromUrl === 'function'
-				? window.getPsnContentShareTokenFromUrl(url)
-				: '';
+			const shareToken = typeof window.getPsnContentShareTokenFromUrl === 'function' ? window.getPsnContentShareTokenFromUrl(url) : '';
 			if (shareToken) {
-				return `<a href="${safeUrl}" class="chat-internal-share-link" data-psn-share-token="${shareToken}" onclick="return openPsnContentSharedLinkInApp(event,this)" style="color: #ffffff; text-decoration: underline; word-break: break-all;">${url}</a>`;
+				const hint = getChatInternalShareHint(url);
+				const label = getChatInternalShareLabel(hint);
+				if (label) {
+					const color = getChatInternalShareCategoryColor(hint.category);
+					return `<a href="#" data-psn-share-url="${safeUrl}" class="chat-internal-share-link" data-psn-share-token="${shareToken}" data-no-translate="true" translate="no" style="--chat-share-color:${color};--chat-share-hover:#ffffff" onclick="return openPsnContentSharedLinkInApp(event,this)">${escapeChatLinkAttribute(label)}</a>`;
+				}
+				return `<a href="#" data-psn-share-url="${safeUrl}" class="chat-internal-share-link" data-psn-share-token="${shareToken}" data-no-translate="true" translate="no" onclick="return openPsnContentSharedLinkInApp(event,this)">Shared Content</a>`;
 			}
 			if (!firstLink) firstLink = [url];
-			return `<a href="${safeUrl}" target="_blank" rel="noopener noreferrer" style="color: #ffffff; text-decoration: underline; word-break: break-all;">${url}</a>`;
+			return `<a href="${safeUrl}" target="_blank" rel="noopener noreferrer" style="color: #ffffff; text-decoration: underline; word-break: break-all;">${escapeChatLinkAttribute(url)}</a>`;
 		});
 		return { html, firstLink };
 	}
@@ -68717,6 +68846,7 @@ function getVisibleChatStackEl(id) {
 
 		if (cache.autoTranslatedHtml) {
 			textEl.innerHTML = appendChatTranslatedTagToHtml(cache.autoTranslatedHtml, cache.autoDetectedLang, getChatTranslateTargetLang());
+			if (typeof hydrateChatInternalShareLinks === 'function') hydrateChatInternalShareLinks(textEl);
 			textEl.setAttribute('data-translated', 'true');
 			textEl.setAttribute('data-auto-translated', 'true');
 			restoreActiveChatMediaAnchorForTranslate();
@@ -68732,6 +68862,7 @@ function getVisibleChatStackEl(id) {
 			cache.autoDetectedLang = result.detected || 'auto';
 			cache.autoTranslatedHtml = result.html;
 			textEl.innerHTML = appendChatTranslatedTagToHtml(cache.autoTranslatedHtml, cache.autoDetectedLang, targetLang);
+			if (typeof hydrateChatInternalShareLinks === 'function') hydrateChatInternalShareLinks(textEl);
 			textEl.setAttribute('data-translated', 'true');
 			textEl.setAttribute('data-auto-translated', 'true');
 			restoreActiveChatMediaAnchorForTranslate();
@@ -68754,6 +68885,7 @@ function getVisibleChatStackEl(id) {
 			const msgId = el.id.replace('msg-text-', '');
 			const cache = window.chatTranslationCache[String(msgId)] || {};
 			el.innerHTML = cache.originalHtml || el.getAttribute('data-original-html') || el.innerHTML;
+			if (typeof hydrateChatInternalShareLinks === 'function') hydrateChatInternalShareLinks(el);
 			el.setAttribute('data-translated', 'false');
 			el.removeAttribute('data-auto-translated');
 			restoreActiveChatMediaAnchorForTranslate();
@@ -68788,6 +68920,7 @@ function getVisibleChatStackEl(id) {
 
 		if (isTranslated) {
 			textEl.innerHTML = cache.originalHtml || textEl.getAttribute('data-original-html') || textEl.innerHTML;
+			if (typeof hydrateChatInternalShareLinks === 'function') hydrateChatInternalShareLinks(textEl);
 			textEl.setAttribute('data-translated', 'false');
 			textEl.removeAttribute('data-auto-translated');
 			restoreActiveChatMediaAnchorForTranslate();
@@ -68810,6 +68943,7 @@ function getVisibleChatStackEl(id) {
 
 		if (cache.translatedHtml) {
 			textEl.innerHTML = appendChatTranslatedTagToHtml(cache.translatedHtml, cache.detectedLang, getChatTranslateTargetLang());
+			if (typeof hydrateChatInternalShareLinks === 'function') hydrateChatInternalShareLinks(textEl);
 			textEl.setAttribute('data-translated', 'true');
 			restoreActiveChatMediaAnchorForTranslate();
 			if (btn) {
@@ -68833,6 +68967,7 @@ function getVisibleChatStackEl(id) {
 			cache.detectedLang = result.detected || 'auto';
 			cache.translatedHtml = result.html;
 			textEl.innerHTML = appendChatTranslatedTagToHtml(cache.translatedHtml, cache.detectedLang, targetLang);
+			if (typeof hydrateChatInternalShareLinks === 'function') hydrateChatInternalShareLinks(textEl);
 			textEl.setAttribute('data-translated', 'true');
 			restoreActiveChatMediaAnchorForTranslate();
 			if (btn) {
@@ -68843,6 +68978,7 @@ function getVisibleChatStackEl(id) {
 			}
 		}).catch(function() {
 			textEl.innerHTML = cache.originalHtml || textEl.innerHTML;
+			if (typeof hydrateChatInternalShareLinks === 'function') hydrateChatInternalShareLinks(textEl);
 			textEl.setAttribute('data-translated', 'false');
 			if (btn) {
 				btn.classList.remove('is-loading', 'is-translated');
@@ -69566,6 +69702,7 @@ function getVisibleChatStackEl(id) {
 	
 		box.insertAdjacentHTML('beforeend', msgHtml);
 		const insertedRow = box.lastElementChild;
+		if (insertedRow && typeof hydrateChatInternalShareLinks === 'function') hydrateChatInternalShareLinks(insertedRow);
 		const insertedEntry = insertedRow && insertedRow.matches && insertedRow.matches(`[data-chat-msg-id="${msgId}"]`) && typeof registerChatRenderedMessageRow === 'function'
 			? registerChatRenderedMessageRow(insertedRow, msgId)
 			: null;
@@ -73496,6 +73633,7 @@ function getVisibleChatStackEl(id) {
 		
 				const badge = buildChatEditedTagHtml(data.editedByAdmin, data.editedByMod);
 				textContainer.innerHTML = formatted + badge;
+				if (typeof hydrateChatInternalShareLinks === 'function') hydrateChatInternalShareLinks(textContainer);
 				textContainer.style.marginTop = (data.content || ytId) ? "10px" : "0px";
 		
 				if (firstLink && !data.content && !ytId) {
@@ -85939,6 +86077,10 @@ function getVisibleChatStackEl(id) {
 		/* Keep the custom I-beam authoritative even when editable controls live inside clickable labels. */
 		input:not(:disabled),textarea:not(:disabled),[contenteditable="true"],[contenteditable="true"] *,.psn-text-selectable,.psn-text-selectable *,[id^="msg-text-"],[id^="msg-text-"] * {
 			cursor: var(--psn-text-cursor), text !important;
+		}
+		/* Interactive share links inside selectable chat text keep the site pointer cursor. */
+		.chat-internal-share-link,.chat-internal-share-link * {
+			cursor: var(--psn-pointer-cursor), pointer !important;
 		}
 		input:disabled,textarea:disabled,[contenteditable="false"] {
 			cursor: not-allowed !important;
