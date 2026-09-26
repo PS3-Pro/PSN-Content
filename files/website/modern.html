@@ -1406,6 +1406,22 @@ html.collection-memory-optimization-on #downloads-list > .download-swipe-row { c
 .profile-list-search-status { color: var(--ps-blue); font-size: 9px; font-weight: 900; letter-spacing: 1px; line-height: 1.1; margin-top: 5px; text-align: right; text-transform: uppercase; white-space: nowrap; }
 .profile-list-search-status--missing { color: #ff4444; }
 .profile-list-search-id, .profile-list-search-missing, .profile-list-search-sep { display: inline; }
+#modal-sys-list .profile-common-play-together-btn { box-sizing:border-box; width:96px; max-width:100%; height:23px; margin-top:5px; padding:0 7px; display:inline-flex; align-items:center; justify-content:center; gap:5px; border:1px solid rgba(0,212,154,.28); border-radius:999px; background:rgba(0,212,154,.065); color:rgba(185,255,233,.82); font:inherit; font-size:7.5px; font-weight:900; line-height:1; letter-spacing:.42px; text-transform:uppercase; white-space:nowrap; cursor:pointer; box-shadow:inset 0 1px 0 rgba(255,255,255,.025),0 2px 8px rgba(0,0,0,.14); transition:background .2s ease,border-color .2s ease,color .2s ease,box-shadow .2s ease,transform .12s ease,filter .12s ease; }
+#modal-sys-list .profile-common-play-together-btn i { flex:0 0 auto; color:#00d49a; font-size:8px; line-height:1; }
+#modal-sys-list .profile-common-play-together-btn:is(:hover,.psn-hover-stable) { background:rgba(0,212,154,.13); border-color:rgba(0,212,154,.52); color:#d9fff4; box-shadow:0 0 13px rgba(0,212,154,.11),inset 0 1px 0 rgba(255,255,255,.04); transform:scale(1.035); }
+#modal-sys-list .profile-common-play-together-btn.is-active { background:rgba(0,212,154,.16); border-color:rgba(0,212,154,.62); color:#b9ffe9; box-shadow:inset 0 0 0 1px rgba(0,212,154,.06),0 0 13px rgba(0,212,154,.11); }
+#modal-sys-list .profile-common-play-together-btn.is-active i { filter:drop-shadow(0 0 4px rgba(0,212,154,.45)); }
+#modal-sys-list .profile-common-play-together-btn.is-pending { pointer-events:none; opacity:.72; }
+#modal-sys-list .profile-common-play-together-btn:is(.psn-primary-pressed,.mobile-pressed) { transform:scale(.94); filter:brightness(.88); transition-duration:.06s; }
+#modal-sys-list .profile-common-play-together-btn:disabled { cursor:default; }
+@media (max-width: 768px) {
+#modal-sys-list .profile-common-play-together-btn { width:100%; height:22px; padding:0 5px; gap:4px; font-size:6.8px; letter-spacing:.22px; }
+#modal-sys-list .profile-common-play-together-btn i { font-size:7.5px; }
+}
+@media (max-width: 480px) {
+#modal-sys-list .profile-common-play-together-btn { width:28px; min-width:28px; max-width:28px; height:22px; padding:0; margin-left:auto; }
+#modal-sys-list .profile-common-play-together-btn .profile-common-play-together-label { display:none; }
+}
 .dl-name, .online-user-name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; display: block; width: 100%; }
 
 /* ========================================================================== EXPLORE (HERO & PROMO CARDS) ========================================================================== */
@@ -30545,6 +30561,83 @@ P
         return !!titleId && window.__viewerPlayTogetherTitleIds.has(titleId);
     };
 
+
+    window.syncProfileCommonPlayTogetherButtons = function(root = document) {
+        const scope = root && typeof root.querySelectorAll === 'function' ? root : document;
+        scope.querySelectorAll('.profile-common-play-together-btn[data-title-id]').forEach(button => {
+            if (!button || button.dataset.playTogetherPending) return;
+            const titleId = normalizeGamePlayersTitleId(button.dataset.titleId || '');
+            if (!titleId) return;
+            const active = typeof window.isViewerPlayTogetherTitle === 'function' && window.isViewerPlayTogetherTitle(titleId);
+            const nextActive = active ? '1' : '0';
+            if (button.dataset.active !== nextActive) button.dataset.active = nextActive;
+            button.classList.toggle('is-active', active);
+            button.setAttribute('aria-pressed', active ? 'true' : 'false');
+            button.title = active ? 'Remove from Play Together' : 'Add to Play Together';
+            const icon = button.querySelector('i');
+            if (icon) {
+                icon.classList.remove('fa-handshake', 'fa-check', 'fa-circle-notch', 'fa-spin');
+                icon.classList.add(active ? 'fa-check' : 'fa-handshake');
+            }
+            const label = button.querySelector('.profile-common-play-together-label');
+            if (label && label.textContent !== 'Play Together') label.textContent = 'Play Together';
+            if (button.disabled) button.disabled = false;
+            button.classList.remove('is-pending');
+        });
+    };
+
+    window.toggleProfileCommonGamePlayTogether = function(button, event) {
+        if (event) {
+            event.preventDefault();
+            event.stopPropagation();
+        }
+        if (!button || button.disabled) return;
+        const titleId = normalizeGamePlayersTitleId(button.dataset.titleId || '');
+        const gameTitle = String(button.dataset.gameTitle || '').trim() || titleId;
+        if (!titleId) return;
+        if (typeof socketChat === 'undefined' || !socketChat || !socketChat.connected || window.isProfileLoaded !== true) {
+            if (typeof playUiError === 'function') playUiError();
+            if (typeof window.showToastNotification === 'function') window.showToastNotification('Play Together', 'Connect to the server to update your Play Together status.');
+            return;
+        }
+
+        const nextEnabled = button.dataset.active !== '1';
+        const previousActive = !nextEnabled;
+        const requestToken = `profile-common:${titleId}:${Date.now()}:${Math.random().toString(36).slice(2, 7)}`;
+        button.dataset.playTogetherPending = requestToken;
+        button.disabled = true;
+        button.classList.add('is-pending');
+        const icon = button.querySelector('i');
+        if (icon) {
+            icon.classList.remove('fa-handshake', 'fa-check');
+            icon.classList.add('fa-circle-notch', 'fa-spin');
+        }
+        const label = button.querySelector('.profile-common-play-together-label');
+        if (label) label.textContent = nextEnabled ? 'Enabling...' : 'Disabling...';
+        if (typeof playUiClick === 'function') playUiClick();
+
+        requestGamePlayers({ mode: 'playTogether', titleId, title: gameTitle, enabled: nextEnabled }, response => {
+            if (button.dataset.playTogetherPending !== requestToken) return;
+            delete button.dataset.playTogetherPending;
+            button.disabled = false;
+            button.classList.remove('is-pending');
+
+            if (!response || response.ok !== true || normalizeGamePlayersTitleId(response.titleId) !== titleId) {
+                button.dataset.active = previousActive ? '1' : '0';
+                if (typeof window.syncProfileCommonPlayTogetherButtons === 'function') window.syncProfileCommonPlayTogetherButtons(button.parentElement || document);
+                if (typeof playUiError === 'function') playUiError();
+                if (typeof window.showToastNotification === 'function') window.showToastNotification('Play Together', response && response.error ? response.error : 'Could not update your status.');
+                return;
+            }
+
+            const summary = normalizeGamePlayersMutationSummary(response);
+            setGamePlayersSummaryCacheEntry(titleId, summary);
+            if (typeof window.setViewerPlayTogetherTitleState === 'function') window.setViewerPlayTogetherTitleState(titleId, summary.viewerPlayTogether === true);
+            if (typeof window.syncProfileCommonPlayTogetherButtons === 'function') window.syncProfileCommonPlayTogetherButtons(document.getElementById('list-modal-body') || document);
+            if (typeof playUiSuccess === 'function') playUiSuccess();
+        });
+    };
+
     function getCollectionPlayTogetherMatchState(activeUser = '') {
         let state = window.__collectionPlayTogetherMatchState;
         const validSet = state && state.titleIds instanceof Set;
@@ -31081,6 +31174,7 @@ P
         if (isSocialPlayTogetherSubviewVisible() && window.__socialPlayTogetherFilter === 'me' && typeof window.renderPlayTogetherSocialPanel === 'function') window.renderPlayTogetherSocialPanel(false);
         if (isPsnDomSectionVisible('view-downloads') && typeof window.updateDownloadUI === 'function') window.updateDownloadUI(true, 'reset');
         if (isPsnDomSectionVisible('view-library') && isPsnDomSectionVisible('subview-games') && typeof window.applyLibraryFilters === 'function') window.applyLibraryFilters(true);
+        if (typeof window.syncProfileCommonPlayTogetherButtons === 'function') window.syncProfileCommonPlayTogetherButtons(document.getElementById('list-modal-body') || document);
     }
 
     window.setViewerPlayTogetherTitleState = function(rawTitleId, enabled, render = true) {
@@ -83288,6 +83382,10 @@ function getVisibleChatStackEl(id) {
 		const sharedGrouping = (!isMe && !isTrophyView && typeof window.decorateRemoteProfileListWithSharedGroups === 'function')
 			? window.decorateRemoteProfileListWithSharedGroups(targetUser, listType, dataArray)
 			: null;
+		const profileCommonLibraryOwnKeys = (!isMe && listType === 'library' && sharedGrouping && sharedGrouping.sharedCount > 0 && typeof window.getProfileListOwnComparableKeySet === 'function')
+			? window.getProfileListOwnComparableKeySet('library')
+			: null;
+		if (profileCommonLibraryOwnKeys && profileCommonLibraryOwnKeys.size && typeof window.refreshViewerPlayTogetherTitles === 'function') window.refreshViewerPlayTogetherTitles(false);
 		const renderItems = sharedGrouping && Array.isArray(sharedGrouping.items) ? sharedGrouping.items : dataArray;
 		const profileListBaseKeys = renderItems.map((item, index) => {
 			if (item && item.__profileListGroupDivider === true) return `group:${item.tone || 'other'}`;
@@ -83537,6 +83635,15 @@ function getVisibleChatStackEl(id) {
 						? `<span class="dl-download-count" title="Downloaded ${profileDownloadCount.toLocaleString('en-US')} times"><i class="fas fa-download"></i><span>${profileDownloadCount.toLocaleString('en-US')}</span></span>`
 						: '';
 					const itemTypeCategoryForDisplay = itemResolvedSearchCategory || itemFinalCategory || itemTypeCategory;
+					const profileCommonComparableKey = profileCommonLibraryOwnKeys && typeof window.getCachedComparableProfileListItemKey === 'function'
+						? window.getCachedComparableProfileListItemKey(item, 'library')
+						: '';
+					const profileCommonPlayTogetherTitleId = profileCommonComparableKey && profileCommonLibraryOwnKeys.has(profileCommonComparableKey)
+						? normalizeGamePlayersTitleId(realId || itemCoverData.titleId || matchedStoreId || effectiveSearchId)
+						: '';
+					const profileCommonPlayTogetherHtml = profileCommonPlayTogetherTitleId
+						? `<button type="button" class="profile-common-play-together-btn" data-title-id="${window.escapePlayerListText(profileCommonPlayTogetherTitleId)}" data-game-title="${window.escapePlayerListText(itemName)}" data-active="0" aria-pressed="false" title="Add to Play Together" onmouseenter="if(typeof playUiHover==='function') playUiHover()" onclick="if(typeof window.toggleProfileCommonGamePlayTogether==='function') window.toggleProfileCommonGamePlayTogether(this,event)"><i class="fas fa-handshake"></i><span class="profile-common-play-together-label">Play Together</span></button>`
+						: '';
 					const typeMeta = window.getDownloadTypeMeta(itemTypeCategoryForDisplay, itemCoverData || item);
 					const typeTagHtml = window.getDownloadTypeTagHtml(itemTypeCategoryForDisplay, itemCoverData || item);
 					const typeClass = `dl-kind-${typeMeta.cls || 'default'}`;
@@ -83556,7 +83663,7 @@ function getVisibleChatStackEl(id) {
 								</div>
 								<div class="dl-main-info"><div class="dl-title-row"><span class="dl-name profile-list-game-name" data-no-translate="true" translate="no" style="font-size: 14px; color: #fff; font-weight: 500;">${itemName}</span></div><div class="dl-meta-row"><span class="dl-date" style="font-size: 11px; color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; display: block;">${dateDisp}</span>${profileRemoteStatusHtml}${profileDownloadCountHtml}</div></div>
 							</div>
-							<div class="dl-side-info" style="text-align: right;"><span class="dl-size-tag" style="font-size: 12px; color: var(--text-muted);">${item.sizeText || item.size || ''}</span>${searchTagHtml}</div>
+							<div class="dl-side-info" style="text-align: right;"><span class="dl-size-tag" style="font-size: 12px; color: var(--text-muted);">${item.sizeText || item.size || ''}</span>${profileCommonPlayTogetherHtml}${searchTagHtml}</div>
 						</div>`;
 				}
 				const generatedProfileListRowHtml = html.slice(profileListRowHtmlStart);
@@ -83584,6 +83691,7 @@ function getVisibleChatStackEl(id) {
 		let html = buildProfileListItemsHtml(renderItems.slice(0, renderedProfileListCount), 0);
 
 		const finalizeProfileListContent = function() {
+			if (profileCommonLibraryOwnKeys && typeof window.syncProfileCommonPlayTogetherButtons === 'function') window.syncProfileCommonPlayTogetherButtons(body);
 			let profileListBatchSentinel = null;
 			const appendNextProfileListBatch = function() {
 				if (!shouldBatchProfileList || renderedProfileListCount >= renderItems.length) return false;
@@ -83592,6 +83700,7 @@ function getVisibleChatStackEl(id) {
 				const activeSentinel = profileListBatchSentinel && profileListBatchSentinel.isConnected ? profileListBatchSentinel : null;
 				if (activeSentinel) activeSentinel.insertAdjacentHTML('beforebegin', nextHtml);
 				else body.insertAdjacentHTML('beforeend', nextHtml);
+				if (profileCommonLibraryOwnKeys && typeof window.syncProfileCommonPlayTogetherButtons === 'function') window.syncProfileCommonPlayTogetherButtons(body);
 				renderedProfileListCount = nextCount;
 				return renderedProfileListCount < renderItems.length;
 			};
