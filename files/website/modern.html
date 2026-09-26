@@ -18685,6 +18685,26 @@ P
         }
         window.openLicensePackCatalogModal = openLicensePackCatalogModal;
 
+        window.openLicensePackCatalogForTitle = async function(rawTitleId) {
+            const titleId = String(rawTitleId || '').trim().toUpperCase();
+            if (!titleId) return false;
+            await openLicensePackCatalogModal();
+            if (!licensePackCatalog) return false;
+            const modal = document.getElementById('license-pack-catalog-modal');
+            if (!modal || modal.style.display === 'none') return false;
+            const search = document.getElementById('license-pack-catalog-search');
+            const categorySelect = document.getElementById('license-pack-catalog-category');
+            if (search) search.value = titleId;
+            if (categorySelect && Array.from(categorySelect.options || []).some(option => option.value === 'games')) categorySelect.value = 'games';
+            licensePackCatalogStatusFilter = 'available';
+            filterLicensePackCatalog({ animate:true });
+            requestAnimationFrame(() => {
+                const list = document.getElementById('license-pack-catalog-list');
+                if (list) list.scrollTop = 0;
+            });
+            return true;
+        };
+
         function closeLicensePackCatalogModal() {
             const modal = document.getElementById('license-pack-catalog-modal');
             if (!modal || !modal.classList.contains('show')) return;
@@ -78845,6 +78865,7 @@ function getVisibleChatStackEl(id) {
 		avatar: { path:'avatars', stateKey:'psn_catalog_avatar_notification_state_v1', fallbackName:'New Avatar' },
 		theme: { path:'themes', stateKey:'psn_catalog_theme_notification_state_v1', fallbackName:'New Theme' }
 	};
+	const LICENSE_NOTIFICATION_STATE_KEY = 'psn_catalog_license_notification_state_v1';
 	window.__catalogNotificationScanInFlight = null;
 	window.__catalogNotificationScanTimer = null;
 
@@ -78921,6 +78942,173 @@ function getVisibleChatStackEl(id) {
 		return owned;
 	}
 
+	function getLicenseNotificationOwnedGameMap() {
+		const owned = new Map();
+		const addOwnedGame = function(rawTitleId, title, source) {
+			const titleId = normalizeGamePlayersTitleId(rawTitleId);
+			if (!titleId) return;
+			const current = owned.get(titleId) || { titleId:titleId, title:String(title || titleId).trim() || titleId, downloaded:false, installed:false };
+			if (source === 'downloads') current.downloaded = true;
+			if (source === 'library') current.installed = true;
+			if (source === 'library' || !current.title || current.title === titleId) current.title = String(title || titleId).trim() || titleId;
+			owned.set(titleId, current);
+		};
+
+		(Array.isArray(window.downloadHistory) ? window.downloadHistory : []).forEach(function(item) {
+			if (!item || typeof item !== 'object') return;
+			const category = typeof resolveDownloadHistoryCategory === 'function' ? resolveDownloadHistoryCategory(item) : String(item.category || item.rawCategory || '').toLowerCase();
+			if (category !== 'games') return;
+			addOwnedGame(item.titleId || item.id, item.cleanName || item.name || item.title, 'downloads');
+		});
+
+		const library = Array.isArray(window.lastScannedGames) ? window.lastScannedGames : (typeof lastScannedGames !== 'undefined' && Array.isArray(lastScannedGames) ? lastScannedGames : []);
+		library.forEach(function(game) {
+			if (!game || typeof game !== 'object') return;
+			const titleId = typeof getLibraryGameTitleId === 'function' ? getLibraryGameTitleId(game) : normalizeGamePlayersTitleId(game.titleId || game.id || game.path);
+			addOwnedGame(titleId, game.title || game.name, 'library');
+		});
+		return owned;
+	}
+
+	function getLicenseNotificationOwnedSignature(ownedGames) {
+		const ids = Array.from(ownedGames instanceof Map ? ownedGames.keys() : []).sort();
+		let hash = 2166136261;
+		for (const id of ids) {
+			for (let i = 0; i < id.length; i++) {
+				hash ^= id.charCodeAt(i);
+				hash = Math.imul(hash, 16777619);
+			}
+		}
+		return `${ids.length}:${(hash >>> 0).toString(36)}`;
+	}
+
+	function readLicenseNotificationState() {
+		try {
+			const parsed = JSON.parse(loadState(LICENSE_NOTIFICATION_STATE_KEY) || '{}');
+			const statuses = parsed && parsed.statuses && typeof parsed.statuses === 'object' && !Array.isArray(parsed.statuses) ? parsed.statuses : {};
+			return {
+				initialized: parsed && parsed.initialized === true,
+				lastCheckedAt: Math.max(0, Number(parsed && parsed.lastCheckedAt) || 0),
+				catalogVersion: String(parsed && parsed.catalogVersion || ''),
+				ownedSignature: String(parsed && parsed.ownedSignature || ''),
+				statuses: statuses
+			};
+		} catch (err) {
+			return { initialized:false, lastCheckedAt:0, catalogVersion:'', ownedSignature:'', statuses:{} };
+		}
+	}
+
+	function writeLicenseNotificationState(state) {
+		try { saveState(LICENSE_NOTIFICATION_STATE_KEY, JSON.stringify(state || {})); } catch (err) {}
+	}
+
+	function getLicenseNotificationCatalogVersion(stats) {
+		if (!stats || typeof stats !== 'object') return '';
+		const updatedAt = String(stats.updated_at || stats.updatedAt || stats.date || '').trim();
+		const quantity = Math.max(0, Number(stats.quantity) || 0);
+		return updatedAt || quantity ? `${updatedAt}|${quantity}` : '';
+	}
+
+	async function fetchFreshLicenseNotificationCatalog() {
+		const controller = typeof AbortController === 'function' ? new AbortController() : null;
+		const timeoutId = setTimeout(function() { if (controller) controller.abort(); }, 12000);
+		try {
+			const requestUrl = `${LICENSE_PACK_CATALOG_URL}${LICENSE_PACK_CATALOG_URL.includes('?') ? '&' : '?'}v=${Date.now()}`;
+			const response = await fetch(requestUrl, { cache:'no-store', signal:controller ? controller.signal : undefined });
+			if (!response.ok) throw new Error('license catalog unavailable');
+			const payload = await response.json();
+			const sourceRows = Array.isArray(payload) ? payload : (Array.isArray(payload && payload.content) ? payload.content : []);
+			return sourceRows.map(normalizeLicensePackCatalogEntry).filter(Boolean);
+		} finally {
+			clearTimeout(timeoutId);
+		}
+	}
+
+	function buildLicenseNotificationSnapshot(rows, ownedGames) {
+		const snapshot = {};
+		if (!(ownedGames instanceof Map) || !ownedGames.size) return snapshot;
+		(Array.isArray(rows) ? rows : []).forEach(function(row) {
+			if (!row || row.browseCategory !== 'games') return;
+			const titleId = normalizeGamePlayersTitleId(row.titleId || row.contentId);
+			if (!titleId || !ownedGames.has(titleId)) return;
+			const effectiveStatus = row.status === 'available' && row.licenseFile ? 'available' : (row.status === 'not-required' ? 'not-required' : 'missing');
+			const next = {
+				status: effectiveStatus,
+				licenseFile: String(row.licenseFile || ''),
+				contentId: String(row.contentId || ''),
+				name: String(row.name || '')
+			};
+			const current = snapshot[titleId];
+			const rank = { missing:0, 'not-required':1, available:2 };
+			if (!current || (rank[next.status] || 0) > (rank[current.status] || 0)) snapshot[titleId] = next;
+		});
+		return snapshot;
+	}
+
+	async function scanLicenseAvailabilityNotifications(username, options = {}) {
+		const state = readLicenseNotificationState();
+		const now = Date.now();
+		if (options.force !== true && state.lastCheckedAt && now - state.lastCheckedAt < CATALOG_NOTIFICATION_CHECK_INTERVAL_MS) return true;
+		const ownedGames = getLicenseNotificationOwnedGameMap();
+		const ownedSignature = getLicenseNotificationOwnedSignature(ownedGames);
+
+		try {
+			let catalogVersion = '';
+			try {
+				const statsUrl = `${LICENSE_PACK_STATS_URL}${LICENSE_PACK_STATS_URL.includes('?') ? '&' : '?'}v=${Date.now()}`;
+				const statsResponse = await fetch(statsUrl, { cache:'no-store' });
+				if (statsResponse.ok) catalogVersion = getLicenseNotificationCatalogVersion(await statsResponse.json());
+			} catch (err) {}
+			if (String(localStorage.getItem('psn_username') || '').trim() !== username) return false;
+
+			if (!ownedGames.size) {
+				writeLicenseNotificationState({ initialized:true, lastCheckedAt:now, catalogVersion:catalogVersion || state.catalogVersion, ownedSignature:ownedSignature, statuses:{} });
+				return true;
+			}
+
+			if (options.force !== true && state.initialized && catalogVersion && state.catalogVersion === catalogVersion && state.ownedSignature === ownedSignature) {
+				state.lastCheckedAt = now;
+				writeLicenseNotificationState(state);
+				return true;
+			}
+
+			const rows = await fetchFreshLicenseNotificationCatalog();
+			if (String(localStorage.getItem('psn_username') || '').trim() !== username || !socketChat || !socketChat.connected) return false;
+			const currentStatuses = buildLicenseNotificationSnapshot(rows, ownedGames);
+
+			if (!state.initialized) {
+				writeLicenseNotificationState({ initialized:true, lastCheckedAt:now, catalogVersion:catalogVersion, ownedSignature:ownedSignature, statuses:currentStatuses });
+				return true;
+			}
+
+			for (const [titleId, current] of Object.entries(currentStatuses)) {
+				const previous = state.statuses && state.statuses[titleId];
+				if (!previous || previous.status !== 'missing' || current.status !== 'available') continue;
+				const ownedGame = ownedGames.get(titleId);
+				if (!ownedGame) continue;
+				const event = {
+					key:`license:${titleId}:${current.licenseFile || current.contentId || 'available'}`,
+					titleId:titleId,
+					contentId:current.contentId,
+					name:current.name ? `${current.name} License` : 'License Available',
+					addedAt:now
+				};
+				if (!(await submitCatalogNotificationCandidate('license', event, ownedGame))) return false;
+				if (String(localStorage.getItem('psn_username') || '').trim() !== username || !socketChat || !socketChat.connected) return false;
+			}
+
+			const nextStatuses = {};
+			ownedGames.forEach(function(_, titleId) {
+				if (currentStatuses[titleId]) nextStatuses[titleId] = currentStatuses[titleId];
+				else if (state.statuses && state.statuses[titleId]) nextStatuses[titleId] = state.statuses[titleId];
+			});
+			writeLicenseNotificationState({ initialized:true, lastCheckedAt:now, catalogVersion:catalogVersion || state.catalogVersion, ownedSignature:ownedSignature, statuses:nextStatuses });
+			return true;
+		} catch (err) {
+			return false;
+		}
+	}
+
 	function normalizeCatalogRelationName(value) {
 		if (typeof window.normalizePsnStoreLookupName === 'function') return window.normalizePsnStoreLookupName(value);
 		let text = String(value || '').trim().toLowerCase();
@@ -78961,7 +79149,7 @@ function getVisibleChatStackEl(id) {
 
 	function submitCatalogNotificationCandidate(catalogType, event, ownedGame) {
 		return new Promise(function(resolve) {
-			const config = CATALOG_EVENT_CONFIGS[catalogType];
+			const config = CATALOG_EVENT_CONFIGS[catalogType] || (catalogType === 'license' ? { fallbackName:'License Available' } : null);
 			if (!config || !socketChat || !socketChat.connected) { resolve(false); return; }
 			const payload = {
 				catalogType:catalogType,
@@ -79100,6 +79288,7 @@ function getVisibleChatStackEl(id) {
 				if (!(await scanCatalogNotificationType(plan.catalogType, ownedGames, username, options, plan.index))) ok = false;
 				if (String(localStorage.getItem('psn_username') || '').trim() !== username || !socketChat || !socketChat.connected) return false;
 			}
+			if (!(await scanLicenseAvailabilityNotifications(username, options))) ok = false;
 			return ok;
 		})().finally(function() {
 			window.__catalogNotificationScanInFlight = null;
@@ -79258,9 +79447,9 @@ function getVisibleChatStackEl(id) {
 		}
 		if (item.type === 'catalog') {
 			const catalogType = String(data.catalogType || '').toLowerCase();
-			if (CATALOG_EVENT_CONFIGS[catalogType]) {
+			if (CATALOG_EVENT_CONFIGS[catalogType] || catalogType === 'license') {
 				const gameTitle = String(data.gameTitle || 'your game').trim() || 'your game';
-				const fallbackName = catalogType === 'avatar' ? 'New Avatar' : (catalogType === 'theme' ? 'New Theme' : 'New downloadable content');
+				const fallbackName = catalogType === 'avatar' ? 'New Avatar' : (catalogType === 'theme' ? 'New Theme' : (catalogType === 'license' ? 'License Available' : 'New downloadable content'));
 				const contentName = String(data.contentName || fallbackName).trim() || fallbackName;
 				let ownershipType = String(data.ownershipType || '').toLowerCase();
 				if (ownershipType !== 'installed' && ownershipType !== 'downloaded') {
@@ -79270,6 +79459,7 @@ function getVisibleChatStackEl(id) {
 					else if (ownedGame && ownedGame.downloaded) ownershipType = 'downloaded';
 				}
 				const ownershipText = ownershipType === 'installed' ? 'a game you have installed' : (ownershipType === 'downloaded' ? 'a game you downloaded' : 'one of your games');
+				if (catalogType === 'license') return { badgeIcon:'fa-key', cls:'is-catalog is-license', title:'License now available', meta:'License Pack', preview:'A license is now available for ' + ownershipText + ': ' + gameTitle + '.' };
 				if (catalogType === 'avatar') return { badgeIcon:'fa-user-circle', cls:'is-catalog', title:'New Avatar you might like', meta:'Recently Added', preview:contentName + ' is now available and is related to ' + ownershipText + ': ' + gameTitle + '.' };
 				if (catalogType === 'theme') return { badgeIcon:'fa-palette', cls:'is-catalog', title:'New Theme you might like', meta:'Recently Added', preview:contentName + ' is now available and is related to ' + ownershipText + ': ' + gameTitle + '.' };
 				return { badgeIcon:'fa-puzzle-piece', cls:'is-catalog', title:'New DLC available', meta:'Recently Added', preview:contentName + ' is now available for ' + ownershipText + ': ' + gameTitle + '.' };
@@ -79593,8 +79783,12 @@ function getVisibleChatStackEl(id) {
 		}
 		if (item.type === 'catalog') {
 			const catalogType = String(data.catalogType || '').toLowerCase();
-			const category = catalogType === 'avatar' ? 'avatars' : (catalogType === 'theme' ? 'themes' : (catalogType === 'dlc' ? 'dlcs' : ''));
 			const titleId = normalizeGamePlayersTitleId(data.titleId || data.contentId);
+			if (catalogType === 'license') {
+				if (titleId && typeof window.openLicensePackCatalogForTitle === 'function') window.openLicensePackCatalogForTitle(titleId);
+				return;
+			}
+			const category = catalogType === 'avatar' ? 'avatars' : (catalogType === 'theme' ? 'themes' : (catalogType === 'dlc' ? 'dlcs' : ''));
 			if (category && titleId && typeof window.switchAndSearch === 'function') window.switchAndSearch(category, titleId, 'notifications', String(data.contentId || ''));
 		}
 	};

@@ -9569,9 +9569,9 @@ function normalizeUserNotificationData(type, rawData = {}) {
   }
   if (type === 'catalog') {
     const catalogTypeRaw = normalizeText(source.catalogType || source.type, '').toLowerCase();
-    const catalogType = ['dlc', 'avatar', 'theme'].includes(catalogTypeRaw) ? catalogTypeRaw : '';
+    const catalogType = ['dlc', 'avatar', 'theme', 'license'].includes(catalogTypeRaw) ? catalogTypeRaw : '';
     const ownershipType = normalizeText(source.ownershipType, '').toLowerCase();
-    const fallbackName = catalogType === 'avatar' ? 'New Avatar' : catalogType === 'theme' ? 'New Theme' : 'New DLC';
+    const fallbackName = catalogType === 'avatar' ? 'New Avatar' : catalogType === 'theme' ? 'New Theme' : catalogType === 'license' ? 'License Available' : 'New DLC';
     return {
       catalogType,
       eventKey: normalizeText(source.eventKey, '').slice(0, 180),
@@ -9871,7 +9871,7 @@ async function recordCatalogNotification(userName, rawData = {}) {
   if (!user) return null;
   const data = normalizeUserNotificationData('catalog', rawData);
   const eventIdentity = normalizeText(data.eventKey || data.contentId, '').slice(0, 180);
-  if (!['dlc', 'avatar', 'theme'].includes(data.catalogType) || !eventIdentity || !/^[A-Z]{4}\d{5}$/.test(data.titleId)) return null;
+  if (!['dlc', 'avatar', 'theme', 'license'].includes(data.catalogType) || !eventIdentity || !/^[A-Z]{4}\d{5}$/.test(data.titleId)) return null;
 
   const seenKey = `${data.catalogType}:${eventIdentity}`.toLowerCase();
   const dedupeKey = `${user.toLowerCase()}:notification:catalog:${seenKey}`;
@@ -11918,11 +11918,11 @@ io.on('connection', (socket) => {
     if (!name || !userDatabase[name]) { respond({ ok: false, created: false, error: 'Profile is not available.' }); return; }
 
     const catalogTypeRaw = normalizeText(data && data.catalogType, '').toLowerCase();
-    const catalogType = ['dlc', 'avatar', 'theme'].includes(catalogTypeRaw) ? catalogTypeRaw : '';
+    const catalogType = ['dlc', 'avatar', 'theme', 'license'].includes(catalogTypeRaw) ? catalogTypeRaw : '';
     const eventKey = normalizeText(data && data.eventKey, '').slice(0, 180);
     const titleId = normalizeText(data && data.titleId, '').toUpperCase().slice(0, 16);
     const contentId = normalizeText(data && data.contentId, '').slice(0, 180);
-    const fallbackName = catalogType === 'avatar' ? 'New Avatar' : catalogType === 'theme' ? 'New Theme' : 'New DLC';
+    const fallbackName = catalogType === 'avatar' ? 'New Avatar' : catalogType === 'theme' ? 'New Theme' : catalogType === 'license' ? 'License Available' : 'New DLC';
     const contentName = normalizeText(data && data.contentName, fallbackName).slice(0, 180);
     const gameTitle = normalizeText(data && data.gameTitle, 'your game').slice(0, 180);
     const gameTitleId = normalizeText(data && data.gameTitleId, '').toUpperCase().slice(0, 16);
