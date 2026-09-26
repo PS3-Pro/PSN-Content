@@ -3068,7 +3068,7 @@ function toLibraryPlayHistoryRecordServer(item = {}) {
 }
 
 function addLibraryPlayHistoryIndexEntryServer(index, candidate, itemIndex) {
-  if (!index || !candidate) return;
+  if (!index || !candidate || itemIndex < 0) return;
   const entry = {
     candidate,
     index: itemIndex,
@@ -3078,8 +3078,14 @@ function addLibraryPlayHistoryIndexEntryServer(index, candidate, itemIndex) {
   };
   const add = (map, key) => {
     if (!key) return;
-    if (!map.has(key)) map.set(key, []);
-    map.get(key).push(entry);
+    let entries = map.get(key);
+    if (!entries) {
+      entries = [];
+      map.set(key, entries);
+    } else if (entries.some(existingEntry => existingEntry.index === itemIndex)) {
+      return;
+    }
+    entries.push(entry);
   };
   add(index.byTitleId, entry.titleId);
   add(index.byPath, entry.path);
@@ -3089,6 +3095,7 @@ function addLibraryPlayHistoryIndexEntryServer(index, candidate, itemIndex) {
 function mergeLibraryPlayHistoryRecordsServer(...lists) {
   const history = [];
   const index = { byTitleId: new Map(), byPath: new Map(), byTitle: new Map() };
+  const positions = new WeakMap();
 
   lists.forEach(list => {
     (Array.isArray(list) ? list : []).forEach(item => {
@@ -3098,19 +3105,24 @@ function mergeLibraryPlayHistoryRecordsServer(...lists) {
       if (existing) {
         const existingTimestamp = getLibraryLastPlayedTimestampServer(existing);
         const incomingTimestamp = getLibraryLastPlayedTimestampServer(incoming);
+        let identityChanged = false;
         if (incomingTimestamp > existingTimestamp) {
           if (incoming.lastPlayed) existing.lastPlayed = incoming.lastPlayed;
           existing.lastPlayedAt = incomingTimestamp;
         }
-        if (!existing.title && incoming.title) existing.title = incoming.title;
-        if (!existing.titleId && incoming.titleId) existing.titleId = incoming.titleId;
-        if (!existing.id && incoming.id) existing.id = incoming.id;
-        if (!existing.path && incoming.path) existing.path = incoming.path;
-        addLibraryPlayHistoryIndexEntryServer(index, existing, history.indexOf(existing));
+        if (!existing.title && incoming.title) { existing.title = incoming.title; identityChanged = true; }
+        if (!existing.titleId && incoming.titleId) { existing.titleId = incoming.titleId; identityChanged = true; }
+        if (!existing.id && incoming.id) { existing.id = incoming.id; identityChanged = true; }
+        if (!existing.path && incoming.path) { existing.path = incoming.path; identityChanged = true; }
+        if (identityChanged) {
+          const existingIndex = positions.get(existing);
+          if (Number.isInteger(existingIndex)) addLibraryPlayHistoryIndexEntryServer(index, existing, existingIndex);
+        }
         return;
       }
       const nextIndex = history.length;
       history.push(incoming);
+      positions.set(incoming, nextIndex);
       addLibraryPlayHistoryIndexEntryServer(index, incoming, nextIndex);
     });
   });
