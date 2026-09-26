@@ -32715,6 +32715,52 @@ P
 		return url.toString();
 	};
 
+	window.getPsnContentShareTokenFromUrl = function(value) {
+		try {
+			const url = new URL(String(value || ''), window.location.href);
+			if (url.origin !== window.location.origin) return '';
+			const currentPath = String(window.location.pathname || '/').replace(/\/+$/, '') || '/';
+			const targetPath = String(url.pathname || '/').replace(/\/+$/, '') || '/';
+			if (targetPath !== currentPath) return '';
+			const params = new URLSearchParams(String(url.hash || '').replace(/^#/, ''));
+			return normalizePsnContentShareToken(params.get(PSN_CONTENT_SHARE_HASH_KEY));
+		} catch (e) {
+			return '';
+		}
+	};
+
+	window.openPsnContentSharedLinkInApp = function(event, source) {
+		const href = typeof source === 'string' ? source : String(source?.href || source?.getAttribute?.('href') || '');
+		const token = window.getPsnContentShareTokenFromUrl(href);
+		if (!token) return true;
+		if (event) {
+			event.preventDefault();
+			event.stopPropagation();
+		}
+		if (typeof playUiClick === 'function') playUiClick();
+
+		const existingModal = document.getElementById('modal-shared-content-link');
+		if (existingModal && typeof removePsnSharedContentPrompt === 'function') {
+			removePsnSharedContentPrompt({ keepPending: true });
+		}
+
+		storePendingSharedContent({
+			token,
+			openedWhileLoggedIn: window.isProfileLoaded === true
+		});
+
+		const openPending = () => {
+			if (typeof window.tryOpenPendingContentDeepLink === 'function') {
+				window.tryOpenPendingContentDeepLink({ reason: 'chat-share-link' });
+			} else if (typeof schedulePsnSharedContentPrompt === 'function') {
+				schedulePsnSharedContentPrompt();
+			}
+		};
+		if (existingModal) setTimeout(openPending, 280);
+		else openPending();
+		return false;
+	};
+
 	function emitPsnContentShareRequest(eventName, payload = {}, timeoutMs = 6000) {
 		return new Promise((resolve, reject) => {
 			if (typeof socketChat === 'undefined' || !socketChat || !socketChat.connected) {
@@ -45171,6 +45217,10 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 				}
 			}
 			
+			if (currentView.id === 'view-library' && viewId !== 'view-library' && typeof window.resetFileManagerSessionState === 'function') {
+				window.resetFileManagerSessionState();
+			}
+
 			if (currentView.id === 'view-trophies' && viewId !== 'view-trophies') {
 				let changed = false;
 				if (window.userTrophies) {
@@ -57535,6 +57585,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 	let fileManagerSuppressClickUntil = 0;
 	let fileManagerContextCloseTimer = 0;
 	let fileManagerDualPaneOpenedForTransfer = false;
+	let fileManagerResetPendingOnLibraryExit = false;
 
 	function normalizeFileManagerPath(path) {
 		let value = String(path || '/').trim() || '/';
@@ -57553,6 +57604,69 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 		const globalIcon = document.getElementById('global-status-icon');
 		return !!(globalIcon && (globalIcon.classList.contains('status-dot-connected') || globalIcon.style.color === 'rgb(76, 175, 80)'));
 	}
+
+	window.resetFileManagerSessionState = function(options = {}) {
+		// Do not interrupt an active webMAN copy/move command. Finish it, then reset invisibly.
+		if (fileManagerTransferBusy && options.force !== true) {
+			fileManagerResetPendingOnLibraryExit = true;
+			if (typeof closeFileManagerContextMenu === 'function') closeFileManagerContextMenu({ immediate: true });
+			if (typeof closeFileManagerInfoModal === 'function') closeFileManagerInfoModal({ immediate: true });
+			return false;
+		}
+
+		fileManagerResetPendingOnLibraryExit = false;
+		if (fileManagerContextLongPressTimer) { clearTimeout(fileManagerContextLongPressTimer); fileManagerContextLongPressTimer = 0; }
+		if (fileManagerContextCloseTimer) { clearTimeout(fileManagerContextCloseTimer); fileManagerContextCloseTimer = 0; }
+		fileManagerContextPointerStart = null;
+		fileManagerSuppressClickUntil = 0;
+
+		Object.values(fileManagerPaneRequests).forEach(request => {
+			if (request.controller) { try { request.controller.abort(); } catch (e) {} }
+			request.controller = null;
+			request.token++;
+		});
+
+		if (typeof closeFileManagerContextMenu === 'function') closeFileManagerContextMenu({ immediate: true });
+		if (typeof closeFileManagerInfoModal === 'function') closeFileManagerInfoModal({ immediate: true });
+
+		currentPath = '/';
+		fileManagerRightPath = '/dev_hdd0';
+		fileManagerLastReadAt = 0;
+		fileManagerLastReadPath = '';
+		fileManagerLastReadIp = '';
+		fileManagerRightLastReadAt = 0;
+		fileManagerRightLastReadPath = '';
+		fileManagerRightLastReadIp = '';
+		fileManagerSelection = null;
+		fileManagerTransferBusy = false;
+		fileManagerDualPaneOpenedForTransfer = false;
+		fileManagerDualPaneEnabled = false;
+		fileManagerMobilePane = 'left';
+
+		const left = getFileManagerPaneElements('left');
+		const right = getFileManagerPaneElements('right');
+		if (left.list) { left.list.replaceChildren(); left.list.scrollTop = 0; }
+		if (right.list) { right.list.replaceChildren(); right.list.scrollTop = 0; }
+		if (left.path) left.path.innerHTML = `<span onclick="openFileManagerPath('/')"><i class="fas fa-hdd"></i> Root</span>`;
+		if (right.path) right.path.innerHTML = `<span onclick="openFileManagerPathForPane('right','/dev_hdd0')"><i class="fas fa-hdd"></i> dev_hdd0</span>`;
+		if (left.status) { left.status.textContent = ''; left.status.style.color = ''; }
+		if (right.status) { right.status.textContent = ''; right.status.style.color = ''; }
+
+		const online = document.getElementById('fm-online-container');
+		const rightPane = document.getElementById('fm-pane-right');
+		const toggle = document.getElementById('fm-dual-pane-toggle');
+		if (online) online.classList.remove('fm-dual-enabled');
+		if (rightPane) rightPane.hidden = true;
+		if (toggle) {
+			toggle.classList.remove('is-active');
+			toggle.setAttribute('aria-pressed', 'false');
+			toggle.title = 'Dual Pane';
+		}
+		setFileManagerMobilePane('left');
+		applyFileManagerSelectionHighlight();
+		syncFileManagerTransferUi();
+		return true;
+	};
 
 	function getFileManagerPanePath(pane = 'left') {
 		return pane === 'right' ? fileManagerRightPath : currentPath;
@@ -58509,6 +58623,11 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 			fileManagerDualPaneOpenedForTransfer = false;
 			applyFileManagerSelectionHighlight();
 			syncFileManagerTransferUi();
+			if (fileManagerResetPendingOnLibraryExit) {
+				window.resetFileManagerSessionState({ force: true });
+				if (typeof showToastNotification === 'function') showToastNotification('File Manager', `${verb} complete: ${target.name}`);
+				return true;
+			}
 			await explorePath(destinationDirectory, destinationPane);
 			if (operation === 'move') await explorePath(sourceDirectory, sourcePane);
 			if (typeof showToastNotification === 'function') showToastNotification('File Manager', `${verb} complete: ${target.name}`);
@@ -58516,7 +58635,8 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 		} catch (error) {
 			console.error(`[File Manager] ${verb} failed:`, error);
 			fileManagerTransferBusy = false;
-			syncFileManagerTransferUi();
+			if (fileManagerResetPendingOnLibraryExit) window.resetFileManagerSessionState({ force: true });
+			else syncFileManagerTransferUi();
 			if (typeof playUiError === 'function') playUiError();
 			if (typeof showToastNotification === 'function') showToastNotification('File Manager', `${verb} failed. Check the console connection.`);
 			else alert(`${verb} failed.`);
@@ -64624,6 +64744,16 @@ function getVisibleChatStackEl(id) {
 
 		const suggestionRows = [];
 
+		if (canModerate && "everyone".includes(queryLower)) {
+			suggestionRows.push(`
+				<div class="suggestion-item" data-value="everyone" onmouseenter="clearChatSuggestionKeyboardActive(this)">
+					<i class="fas fa-bullhorn" style="color: #ff4444; font-size: 10px;"></i> 
+					<b style="color: #ff4444; margin-left: 3px;">everyone</b>
+					<span style="font-size: 8px; opacity: 0.5; margin-left: 5px;">(GLOBAL ALERT)</span>
+				</div>
+			`);
+		}
+
 		const roleSuggestionRows = [];
 		if ('admin'.includes(queryLower) || 'admins'.includes(queryLower)) {
 			const mentionValue = queryLower === 'admins' ? 'admins' : 'admin';
@@ -64646,16 +64776,6 @@ function getVisibleChatStackEl(id) {
 		if (roleSuggestionRows.length) {
 			suggestionRows.push(`<div style="font-size:9px;color:#8b96a8;font-weight:bold;margin:6px 12px 2px 12px;letter-spacing:1px;">ROLES</div>`);
 			suggestionRows.push(...roleSuggestionRows);
-		}
-
-		if (canModerate && "everyone".includes(queryLower)) {
-			suggestionRows.push(`
-				<div class="suggestion-item" data-value="everyone" onmouseenter="clearChatSuggestionKeyboardActive(this)">
-					<i class="fas fa-bullhorn" style="color: #ff4444; font-size: 10px;"></i> 
-					<b style="color: #ff4444; margin-left: 3px;">everyone</b>
-					<span style="font-size: 8px; opacity: 0.5; margin-left: 5px;">(GLOBAL ALERT)</span>
-				</div>
-			`);
 		}
 
 		if (onlineFiltered.length > 0) {
@@ -67847,13 +67967,22 @@ function getVisibleChatStackEl(id) {
 
 	/* v109: pure inline text analysis. Keep the exact formatting order, but avoid rescanning
 	   ordinary messages for features they do not contain. */
+	function escapeChatLinkAttribute(value) {
+		return String(value || '').replace(/[&"<>]/g, ch => ({ '&': '&amp;', '"': '&quot;', '<': '&lt;', '>': '&gt;' }[ch]));
+	}
+
 	function linkifyChatMessageText(value) {
 		let firstLink = null;
-		let changed = false;
 		const html = String(value || '').replace(/(https?:\/\/[^\s]+)/g, url => {
+			const safeUrl = escapeChatLinkAttribute(url);
+			const shareToken = typeof window.getPsnContentShareTokenFromUrl === 'function'
+				? window.getPsnContentShareTokenFromUrl(url)
+				: '';
+			if (shareToken) {
+				return `<a href="${safeUrl}" class="chat-internal-share-link" data-psn-share-token="${shareToken}" onclick="return openPsnContentSharedLinkInApp(event,this)" style="color: #ffffff; text-decoration: underline; word-break: break-all;">${url}</a>`;
+			}
 			if (!firstLink) firstLink = [url];
-			changed = true;
-			return `<a href="${url}" target="_blank" style="color: #ffffff; text-decoration: underline; word-break: break-all;">${url}</a>`;
+			return `<a href="${safeUrl}" target="_blank" rel="noopener noreferrer" style="color: #ffffff; text-decoration: underline; word-break: break-all;">${url}</a>`;
 		});
 		return { html, firstLink };
 	}
@@ -73330,7 +73459,9 @@ function getVisibleChatStackEl(id) {
 		
 				let videoHtml = '';
 				const editedRawText = String(data.newText || '');
-				const firstLink = editedRawText.indexOf('http') !== -1 ? editedRawText.match(/(https?:\/\/[^\s]+)/) : null;
+				const editedLinks = editedRawText.indexOf('http') !== -1 ? (editedRawText.match(/https?:\/\/[^\s]+/g) || []) : [];
+				const firstPreviewUrl = editedLinks.find(url => !(typeof window.getPsnContentShareTokenFromUrl === 'function' && window.getPsnContentShareTokenFromUrl(url))) || '';
+				const firstLink = firstPreviewUrl ? [firstPreviewUrl] : null;
 				const ytId = (firstLink && !data.content) ? getYoutubeId(firstLink[0]) : null;
 		
 				if (ytId) {
@@ -77599,6 +77730,7 @@ function getVisibleChatStackEl(id) {
 
 
     async function fetchLinkMetadata(url, elementId, renderRoot = null) {
+		if (typeof window.getPsnContentShareTokenFromUrl === 'function' && window.getPsnContentShareTokenFromUrl(url)) return;
 		if (url.match(/\.(jpeg|jpg|gif|png|bmp|webp)$/) != null) return;
 		if (window.__loginRevealBusy) return;
 		const chatView = document.getElementById('view-chat');
