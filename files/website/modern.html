@@ -51445,14 +51445,115 @@ function formatLibraryLastPlayedBadge(game = {}) {
 		return null;
 	}
 
+	const LIBRARY_PLAY_HISTORY_STORAGE_KEY = 'psn_library_play_history_v1';
+	const LIBRARY_PLAY_HISTORY_MAX = 4000;
+
+	function readLibraryPlayHistorySnapshot() {
+		try {
+			const raw = loadState(LIBRARY_PLAY_HISTORY_STORAGE_KEY);
+			const parsed = raw ? JSON.parse(raw) : [];
+			return Array.isArray(parsed) ? parsed.filter(item => item && typeof item === 'object' && !Array.isArray(item)) : [];
+		} catch (err) {
+			return [];
+		}
+	}
+
+	function toLibraryPlayHistoryRecord(item = {}) {
+		if (!item || typeof item !== 'object' || Array.isArray(item)) return null;
+		const timestamp = getLibraryLastPlayedTimestamp(item);
+		if (!timestamp) return null;
+		const titleId = getLibraryGameTitleId(item);
+		const title = String(item.title || item.name || '').trim();
+		const path = String(item.path || '').trim();
+		const lastPlayed = String(item.lastPlayed || '').trim();
+		return {
+			...(title ? { title } : {}),
+			...(titleId ? { titleId, id: titleId } : (item.id ? { id: item.id } : {})),
+			...(path ? { path } : {}),
+			...(lastPlayed ? { lastPlayed } : {}),
+			lastPlayedAt: timestamp
+		};
+	}
+
+	function addLibraryPlayHistoryIndexEntry(index, candidate, itemIndex) {
+		if (!index || !candidate) return;
+		const entry = {
+			candidate,
+			index: itemIndex,
+			titleId: getLibraryGameTitleId(candidate),
+			path: normalizeLibraryGamePath(candidate.path),
+			title: normalizeLibraryIdentityText(candidate.title || candidate.name)
+		};
+		const add = function(map, key) {
+			if (!key) return;
+			if (!map.has(key)) map.set(key, []);
+			map.get(key).push(entry);
+		};
+		add(index.byTitleId, entry.titleId);
+		add(index.byPath, entry.path);
+		add(index.byTitle, entry.title);
+	}
+
+	function mergeLibraryPlayHistorySnapshots(...lists) {
+		const history = [];
+		const index = { byTitleId: new Map(), byPath: new Map(), byTitle: new Map() };
+		lists.forEach(list => {
+			(Array.isArray(list) ? list : []).forEach(item => {
+				const incoming = toLibraryPlayHistoryRecord(item);
+				if (!incoming) return;
+				const existing = findLibraryRecordMatch(incoming, index);
+				if (existing) {
+					const existingTimestamp = getLibraryLastPlayedTimestamp(existing);
+					const incomingTimestamp = getLibraryLastPlayedTimestamp(incoming);
+					if (incomingTimestamp > existingTimestamp) {
+						if (incoming.lastPlayed) existing.lastPlayed = incoming.lastPlayed;
+						existing.lastPlayedAt = incomingTimestamp;
+					}
+					if (!existing.title && incoming.title) existing.title = incoming.title;
+					if (!existing.titleId && incoming.titleId) existing.titleId = incoming.titleId;
+					if (!existing.id && incoming.id) existing.id = incoming.id;
+					if (!existing.path && incoming.path) existing.path = incoming.path;
+					addLibraryPlayHistoryIndexEntry(index, existing, history.indexOf(existing));
+					return;
+				}
+				const nextIndex = history.length;
+				history.push(incoming);
+				addLibraryPlayHistoryIndexEntry(index, incoming, nextIndex);
+			});
+		});
+		history.sort((a, b) => getLibraryLastPlayedTimestamp(b) - getLibraryLastPlayedTimestamp(a));
+		return history.slice(0, LIBRARY_PLAY_HISTORY_MAX);
+	}
+
+	function rememberLibraryPlayHistory(...lists) {
+		const current = readLibraryPlayHistorySnapshot();
+		const merged = mergeLibraryPlayHistorySnapshots(current, ...lists);
+		try {
+			const nextJson = JSON.stringify(merged);
+			const currentJson = JSON.stringify(current);
+			if (nextJson !== currentJson) saveState(LIBRARY_PLAY_HISTORY_STORAGE_KEY, nextJson);
+		} catch (err) {}
+		return merged;
+	}
+	window.rememberLibraryPlayHistory = rememberLibraryPlayHistory;
+
 	function mergeLibraryLastPlayedLists(primaryList = [], fallbackList = []) {
 		const primary = Array.isArray(primaryList) ? primaryList : [];
 		const fallback = Array.isArray(fallbackList) ? fallbackList : [];
 		const firstSeenFallbackAt = Date.now();
 		const fallbackIndex = buildLibraryRecordMatchIndex(fallback);
-		return primary
+		let merged = primary
 			.filter(item => item && typeof item === 'object' && !Array.isArray(item))
 			.map(item => mergeLibraryLastPlayedRecord(item, findLibraryRecordMatch(item, fallbackIndex) || {}, firstSeenFallbackAt));
+
+		const history = readLibraryPlayHistorySnapshot();
+		if (history.length) {
+			const historyIndex = buildLibraryRecordMatchIndex(history);
+			merged = merged.map(item => mergeLibraryLastPlayedRecord(item, findLibraryRecordMatch(item, historyIndex) || {}, firstSeenFallbackAt));
+		}
+
+		rememberLibraryPlayHistory(fallback, merged);
+		return merged;
 	}
 
 	window.mergeLibraryLastPlayedLists = mergeLibraryLastPlayedLists;
@@ -51981,6 +52082,7 @@ function formatLibraryLastPlayedBadge(game = {}) {
 		if (matchedAny) window.__libraryLastPlayedAppliedSignature = touchSignature;
 	
 		if (updated) {
+			if (typeof window.rememberLibraryPlayHistory === 'function') window.rememberLibraryPlayHistory(lastScannedGames);
 			if (typeof window.bumpLibraryCollectionRevision === 'function') window.bumpLibraryCollectionRevision('library');
 			saveState('psn_local_library', JSON.stringify(lastScannedGames));
 			markProfileListChanged('library');

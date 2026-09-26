@@ -1872,7 +1872,7 @@ const fullUserCacheNames = new Set();
 let profileHydrationQueues = [Promise.resolve(), Promise.resolve()];
 let profileHydrationNextLane = 0;
 let chatHistoryEmitQueue = Promise.resolve();
-const USER_HEAVY_CACHE_KEYS = ['downloadsData', 'libraryData', 'wishlistData', 'favoritesData', 'trophiesData', 'friendsData'];
+const USER_HEAVY_CACHE_KEYS = ['downloadsData', 'libraryData', 'libraryPlayHistoryData', 'wishlistData', 'favoritesData', 'trophiesData', 'friendsData'];
 let trendingCache = null;
 let trendingCacheAt = 0;
 let trendingBuildInFlight = null;
@@ -3048,6 +3048,84 @@ function mergeLibraryRecordsServer(primaryList = [], fallbackList = []) {
     .map(item => mergeLibraryLastPlayedRecordServer(item, findLibraryRecordMatchServer(item, fallbackIndex) || {}));
 }
 
+const LIBRARY_PLAY_HISTORY_MAX = 4000;
+
+function toLibraryPlayHistoryRecordServer(item = {}) {
+  if (!item || typeof item !== 'object' || Array.isArray(item)) return null;
+  const timestamp = getLibraryLastPlayedTimestampServer(item);
+  if (!timestamp) return null;
+  const titleId = getLibraryGameTitleIdServer(item);
+  const title = normalizeText(item.title || item.name, '');
+  const path = normalizeText(item.path, '');
+  const lastPlayed = normalizeText(item.lastPlayed, '');
+  return {
+    ...(title ? { title } : {}),
+    ...(titleId ? { titleId, id: titleId } : (item.id ? { id: item.id } : {})),
+    ...(path ? { path } : {}),
+    ...(lastPlayed ? { lastPlayed } : {}),
+    lastPlayedAt: timestamp
+  };
+}
+
+function addLibraryPlayHistoryIndexEntryServer(index, candidate, itemIndex) {
+  if (!index || !candidate) return;
+  const entry = {
+    candidate,
+    index: itemIndex,
+    titleId: getLibraryGameTitleIdServer(candidate),
+    path: normalizeLibraryGamePathServer(candidate.path),
+    title: normalizeLibraryIdentityTextServer(candidate.title || candidate.name)
+  };
+  const add = (map, key) => {
+    if (!key) return;
+    if (!map.has(key)) map.set(key, []);
+    map.get(key).push(entry);
+  };
+  add(index.byTitleId, entry.titleId);
+  add(index.byPath, entry.path);
+  add(index.byTitle, entry.title);
+}
+
+function mergeLibraryPlayHistoryRecordsServer(...lists) {
+  const history = [];
+  const index = { byTitleId: new Map(), byPath: new Map(), byTitle: new Map() };
+
+  lists.forEach(list => {
+    (Array.isArray(list) ? list : []).forEach(item => {
+      const incoming = toLibraryPlayHistoryRecordServer(item);
+      if (!incoming) return;
+      const existing = findLibraryRecordMatchServer(incoming, index);
+      if (existing) {
+        const existingTimestamp = getLibraryLastPlayedTimestampServer(existing);
+        const incomingTimestamp = getLibraryLastPlayedTimestampServer(incoming);
+        if (incomingTimestamp > existingTimestamp) {
+          if (incoming.lastPlayed) existing.lastPlayed = incoming.lastPlayed;
+          existing.lastPlayedAt = incomingTimestamp;
+        }
+        if (!existing.title && incoming.title) existing.title = incoming.title;
+        if (!existing.titleId && incoming.titleId) existing.titleId = incoming.titleId;
+        if (!existing.id && incoming.id) existing.id = incoming.id;
+        if (!existing.path && incoming.path) existing.path = incoming.path;
+        addLibraryPlayHistoryIndexEntryServer(index, existing, history.indexOf(existing));
+        return;
+      }
+      const nextIndex = history.length;
+      history.push(incoming);
+      addLibraryPlayHistoryIndexEntryServer(index, incoming, nextIndex);
+    });
+  });
+
+  history.sort((a, b) => getLibraryLastPlayedTimestampServer(b) - getLibraryLastPlayedTimestampServer(a));
+  return history.slice(0, LIBRARY_PLAY_HISTORY_MAX);
+}
+
+function applyLibraryPlayHistoryServer(libraryData = [], historyData = []) {
+  return mergeLibraryRecordsServer(
+    Array.isArray(libraryData) ? libraryData : [],
+    Array.isArray(historyData) ? historyData : []
+  );
+}
+
 function normalizeProfileCountryCodeServer(value) {
   const code = normalizeText(value, "").toUpperCase();
   return VALID_PROFILE_COUNTRY_CODES.has(code) ? code : "";
@@ -4208,7 +4286,7 @@ async function refreshSingleUserSummaryFromDb(name, options = {}) {
   const userRes = await queryDbWithRetry(`
     SELECT
       name,
-      data - ARRAY['downloadsData','libraryData','wishlistData','favoritesData','trophiesData','friendsData','passwordHash','password']::text[] AS data,
+      data - ARRAY['downloadsData','libraryData','libraryPlayHistoryData','wishlistData','favoritesData','trophiesData','friendsData','passwordHash','password']::text[] AS data,
       CASE WHEN jsonb_typeof(data->'downloadsData') = 'array' THEN jsonb_array_length(data->'downloadsData') ELSE NULL END AS downloads_count,
       CASE WHEN jsonb_typeof(data->'wishlistData') = 'array' THEN jsonb_array_length(data->'wishlistData') ELSE NULL END AS wishlist_count,
       CASE WHEN jsonb_typeof(data->'favoritesData') = 'array' THEN jsonb_array_length(data->'favoritesData') ELSE NULL END AS favorites_count,
@@ -4259,7 +4337,7 @@ async function refreshAllUsersCacheFromDb(options = {}) {
     const usersRes = await queryDbWithRetry(`
       SELECT
         name,
-        data - ARRAY['downloadsData','libraryData','wishlistData','favoritesData','trophiesData','friendsData','passwordHash','password']::text[] AS data,
+        data - ARRAY['downloadsData','libraryData','libraryPlayHistoryData','wishlistData','favoritesData','trophiesData','friendsData','passwordHash','password']::text[] AS data,
         CASE WHEN jsonb_typeof(data->'downloadsData') = 'array' THEN jsonb_array_length(data->'downloadsData') ELSE NULL END AS downloads_count,
         CASE WHEN jsonb_typeof(data->'wishlistData') = 'array' THEN jsonb_array_length(data->'wishlistData') ELSE NULL END AS wishlist_count,
         CASE WHEN jsonb_typeof(data->'favoritesData') = 'array' THEN jsonb_array_length(data->'favoritesData') ELSE NULL END AS favorites_count,
@@ -4401,7 +4479,7 @@ function getUserDataPayloadFromCache(targetName, type) {
   const dataKey = keyMap[type] || `${type}Data`;
   const payload = targetUser[dataKey] || (dataKey === 'trophiesData' ? {} : []);
   if (dataKey === 'downloadsData') return normalizeDownloadHistoryRecordsServer(payload).history;
-  if (dataKey === 'libraryData') return mergeLibraryRecordsServer(payload, []);
+  if (dataKey === 'libraryData') return applyLibraryPlayHistoryServer(payload, targetUser.libraryPlayHistoryData || []);
   if (dataKey === 'recentlyVisitedData') return normalizeRecentlyVisitedRecordsServer(payload);
   return payload;
 }
@@ -5650,6 +5728,27 @@ async function searchUsersFromDb(query, includeAdminFields = false, includeAllMa
   return searchUsersFromCache(query, includeAdminFields, includeAllMatches);
 }
 
+async function getLibraryDataBundleFromDb(targetName) {
+  const safeTargetName = normalizeText(targetName, '');
+  if (!safeTargetName) return null;
+  const result = await queryDbWithRetry(
+    `SELECT data -> 'libraryData' AS library_data, data -> 'libraryPlayHistoryData' AS history_data
+     FROM users
+     WHERE name = $1`,
+    [safeTargetName],
+    { attempts: 3, label: 'USER LIBRARY DATA READ' }
+  );
+  if (!result.rows.length) return null;
+  const row = result.rows[0] || {};
+  const rawLibrary = Array.isArray(row.library_data) ? row.library_data : [];
+  const rawHistory = Array.isArray(row.history_data) ? row.history_data : [];
+  const history = mergeLibraryPlayHistoryRecordsServer(rawHistory, rawLibrary);
+  return {
+    libraryData: applyLibraryPlayHistoryServer(rawLibrary, history),
+    libraryPlayHistoryData: history
+  };
+}
+
 async function getUserDataPayloadFromDb(targetName, type) {
   const safeTargetName = normalizeText(targetName, '');
   if (!safeTargetName) return null;
@@ -5663,6 +5762,11 @@ async function getUserDataPayloadFromDb(targetName, type) {
     trophies: 'trophiesData'
   };
   const dataKey = keyMap[type] || `${type}Data`;
+  if (dataKey === 'libraryData') {
+    const bundle = await getLibraryDataBundleFromDb(safeTargetName);
+    return bundle ? bundle.libraryData : null;
+  }
+
   const result = await queryDbWithRetry('SELECT data -> $2 AS payload FROM users WHERE name = $1', [safeTargetName, dataKey], { attempts: 3, label: 'USER DATA READ' });
   if (!result.rows.length) return null;
 
@@ -5673,7 +5777,6 @@ async function getUserDataPayloadFromDb(targetName, type) {
   }
   if (!Array.isArray(payload)) payload = [];
   if (dataKey === 'downloadsData') return normalizeDownloadHistoryRecordsServer(payload).history;
-  if (dataKey === 'libraryData') return mergeLibraryRecordsServer(payload, []);
   if (dataKey === 'recentlyVisitedData') return normalizeRecentlyVisitedRecordsServer(payload);
   return payload;
 }
@@ -6750,7 +6853,7 @@ async function getAuthUserRecordFromDb(name) {
 
   const result = await queryDbWithRetry(`
     SELECT
-      data - ARRAY['downloadsData','libraryData','wishlistData','favoritesData','trophiesData','friendsData']::text[] AS data,
+      data - ARRAY['downloadsData','libraryData','libraryPlayHistoryData','wishlistData','favoritesData','trophiesData','friendsData']::text[] AS data,
       CASE WHEN jsonb_typeof(data->'downloadsData') = 'array' THEN jsonb_array_length(data->'downloadsData') ELSE NULL END AS downloads_count,
       CASE WHEN jsonb_typeof(data->'wishlistData') = 'array' THEN jsonb_array_length(data->'wishlistData') ELSE NULL END AS wishlist_count,
       CASE WHEN jsonb_typeof(data->'favoritesData') = 'array' THEN jsonb_array_length(data->'favoritesData') ELSE NULL END AS favorites_count,
@@ -6833,6 +6936,14 @@ async function buildWorkingUserForProfileUpdate(name, incoming = {}) {
   const base = { ...(userDatabase[name] || {}) };
   for (const [dataKey, meta] of Object.entries(PROFILE_HEAVY_SECTION_META)) {
     if (!incomingTouchesHeavyProfileSection(incoming, dataKey, meta)) continue;
+    if (dataKey === 'libraryData') {
+      const bundle = await getLibraryDataBundleFromDb(name);
+      if (bundle) {
+        base.libraryData = bundle.libraryData;
+        base.libraryPlayHistoryData = bundle.libraryPlayHistoryData;
+      }
+      continue;
+    }
     const payload = await getUserDataPayloadFromDb(name, meta.type);
     if (payload !== null) base[dataKey] = payload;
   }
@@ -8215,6 +8326,14 @@ async function getActivePresenceSessionsForName(name) {
 function buildFullProfileSyncPayload(name, user = {}, sourceSocketId = null, options = {}) {
   const safe = options.normalized === true ? user : normalizeUserRecord(name, user || {});
   const notificationState = getProfileNotificationStatePayloadServer(safe);
+  const safeLibraryHistory = mergeLibraryPlayHistoryRecordsServer(
+    Array.isArray(safe.libraryPlayHistoryData) ? safe.libraryPlayHistoryData : [],
+    Array.isArray(safe.libraryData) ? safe.libraryData : []
+  );
+  const safeLibraryData = applyLibraryPlayHistoryServer(
+    Array.isArray(safe.libraryData) ? safe.libraryData : [],
+    safeLibraryHistory
+  );
   return {
     name,
     sourceSocketId,
@@ -8238,7 +8357,7 @@ function buildFullProfileSyncPayload(name, user = {}, sourceSocketId = null, opt
       wishlist: Array.isArray(safe.wishlistData) ? safe.wishlistData.length : (safe.wishlist || 0),
       favorites: Array.isArray(safe.favoritesData) ? safe.favoritesData.length : (safe.favorites || 0),
       trophies: safe.trophies || 0,
-      library: Array.isArray(safe.libraryData) ? safe.libraryData.length : (safe.library || 0),
+      library: safeLibraryData.length,
       trophiesData: safe.trophiesData || {},
       downloadsData: Array.isArray(safe.downloadsData) ? safe.downloadsData : [],
       downloadsClearedAt: normalizeTimestampValue(safe.downloadsClearedAt),
@@ -8247,7 +8366,7 @@ function buildFullProfileSyncPayload(name, user = {}, sourceSocketId = null, opt
       wishlistUpdatedAt: normalizeTimestampValue(safe.wishlistUpdatedAt),
       favoritesData: Array.isArray(safe.favoritesData) ? safe.favoritesData : [],
       favoritesUpdatedAt: normalizeTimestampValue(safe.favoritesUpdatedAt),
-      libraryData: Array.isArray(safe.libraryData) ? safe.libraryData : [],
+      libraryData: safeLibraryData,
       libraryUpdatedAt: normalizeTimestampValue(safe.libraryUpdatedAt),
       friendsData: Array.isArray(safe.friendsData) ? safe.friendsData : [],
       friendsUpdatedAt: normalizeTimestampValue(safe.friendsUpdatedAt),
@@ -11733,6 +11852,18 @@ io.on('connection', (socket) => {
 
         userData = reconcileIncomingDownloads(workingUser, userData || {});
         userData = reconcileIncomingProfileArrays(workingUser, userData || {});
+
+        let nextLibraryPlayHistoryData = null;
+        if (Object.prototype.hasOwnProperty.call(userData, 'libraryData')) {
+          nextLibraryPlayHistoryData = mergeLibraryPlayHistoryRecordsServer(
+            workingUser.libraryPlayHistoryData || [],
+            workingUser.libraryData || [],
+            userData.libraryData || []
+          );
+          userData.libraryData = applyLibraryPlayHistoryServer(userData.libraryData || [], nextLibraryPlayHistoryData);
+          userData.library = userData.libraryData.length;
+        }
+
         let sharedGameAcquisitions = collectNewSharedGameAcquisitions(
           previousLibraryForSharedGameMatch,
           userData.libraryData,
@@ -11759,6 +11890,7 @@ io.on('connection', (socket) => {
         const publicCountsChanged = profileUpdateTouchesPublicCounts(userData);
 
         Object.assign(workingUser, userData);
+        if (nextLibraryPlayHistoryData) workingUser.libraryPlayHistoryData = nextLibraryPlayHistoryData;
         const currentCountryCode = getUserCountryCode(workingUser);
         if (currentCountryCode) {
             workingUser.countryCode = currentCountryCode;
@@ -11784,6 +11916,7 @@ io.on('connection', (socket) => {
         Object.keys(userData).forEach(key => {
             if (Object.prototype.hasOwnProperty.call(workingUser, key)) profileDbPatch[key] = workingUser[key];
         });
+        if (nextLibraryPlayHistoryData) profileDbPatch.libraryPlayHistoryData = nextLibraryPlayHistoryData;
         if (incomingSettingsData) profileDbPatch.settingsData = workingUser.settingsData;
         if (currentCountryCode && (countryChanged || Object.prototype.hasOwnProperty.call(userData, 'countryCode'))) {
             profileDbPatch.countryCode = currentCountryCode;
