@@ -6333,7 +6333,8 @@ img { -webkit-user-drag: none !important; user-drag: none !important; }
 .direct-message-list { flex:1; min-height:0; overflow-y:auto; padding:18px 16px 12px; display:flex; flex-direction:column; gap:8px; scroll-behavior:smooth; }
 .direct-message-row { display:flex; width:100%; }
 .direct-message-row.own { justify-content:flex-end; }
-.direct-message-bubble { max-width:min(72%,620px); padding:9px 11px 7px; border-radius:12px 12px 12px 4px; background:rgba(255,255,255,.075); border:1px solid rgba(255,255,255,.07); box-shadow:0 2px 8px rgba(0,0,0,.1); }
+.direct-message-stack { min-width:0; width:fit-content; max-width:min(78%,760px); }
+.direct-message-bubble { width:fit-content; max-width:100%; padding:9px 11px 7px; border-radius:12px 12px 12px 4px; background:rgba(255,255,255,.075); border:1px solid rgba(255,255,255,.07); box-shadow:0 2px 8px rgba(0,0,0,.1); }
 .direct-message-row.own .direct-message-bubble { border-radius:12px 12px 4px 12px; background:rgba(0,112,204,.22); border-color:rgba(0,112,204,.34); }
 .direct-message-text { color:#fff; font-size:13px; line-height:1.42; white-space:pre-wrap; overflow-wrap:anywhere; }
 .direct-message-meta { display:flex; align-items:center; justify-content:flex-end; gap:5px; margin-top:4px; font-size:9px; color:rgba(255,255,255,.38); }
@@ -6433,7 +6434,8 @@ img { -webkit-user-drag: none !important; user-drag: none !important; }
   .direct-chat-shell.thread-open .direct-conversations-panel { display:none; }
   .direct-chat-shell.thread-open .direct-thread-panel { display:flex; }
   .direct-thread-back { display:inline-flex; }
-  .direct-message-bubble { max-width:84%; }
+  .direct-message-stack { max-width:90%; }
+  .direct-message-bubble { max-width:100%; }
   .direct-format-toolbar { padding:5px 8px 3px; overflow-x:auto; scrollbar-width:none; }
   .direct-format-toolbar::-webkit-scrollbar { display:none; }
   .direct-format-toolbar .direct-format-btn { flex:0 0 30px; }
@@ -6924,7 +6926,7 @@ img { -webkit-user-drag: none !important; user-drag: none !important; }
 				</li>
 				<li id="nav-chat-messages" onclick="playUiClick(); showSocialSection('messages'); toggleSidebar(true)">
 					<i class="fas fa-envelope"></i> <span class="interface-compact-label sidebar-press-label" data-sidebar-press-label>Private Messages</span>
-					<span id="sidebar-count-messages" class="sidebar-count-pill is-empty" title="0 unread private messages" style="display:none;">0</span>
+					<span id="sidebar-count-messages" class="sidebar-count-pill is-empty" title="0 unread private messages" aria-live="polite" aria-label="0 unread private messages" style="display:none;">0</span>
 				</li>
 				<li id="nav-chat-friends" onclick="playUiClick(); showSocialSection('friends'); toggleSidebar(true)">
 					<i class="fas fa-user-friends"></i> <span class="interface-compact-label sidebar-press-label" data-sidebar-press-label>Friends List</span>
@@ -23998,7 +24000,8 @@ P
 			if(btnMessages) btnMessages.classList.add('active');
 			setPsnStyleIfChanged(searchBar, 'display', 'flex');
 			if (searchInput) {
-				if (searchInput.placeholder !== 'Search private messages') searchInput.placeholder = 'Search private messages';
+				const directSearchPlaceholder = window.__directChatState && window.__directChatState.activePeer ? 'Search messages' : 'Search conversations';
+				if (searchInput.placeholder !== directSearchPlaceholder) searchInput.placeholder = directSearchPlaceholder;
 				const directQuery = String(window.__directChatState && window.__directChatState.searchQuery || '');
 				if (searchInput.value !== directQuery) searchInput.value = directQuery;
 				setPsnAttributeIfChanged(searchInput, 'autocomplete', 'off');
@@ -72415,6 +72418,30 @@ function getVisibleChatStackEl(id) {
 		return best;
 	}
 
+	function directLatestPeerMessageActivity(peerName, messages = window.__directChatState.messages) {
+		const peer = String(peerName || '').trim();
+		if (!peer || !Array.isArray(messages)) return '';
+		for (let index = messages.length - 1; index >= 0; index--) {
+			const message = messages[index];
+			if (message && String(message.from || '') === peer && message.createdAt) return message.createdAt;
+		}
+		return '';
+	}
+
+	function directRememberPeerActivity(peerName, activityAt) {
+		const peer = String(peerName || '').trim();
+		const stamp = directLastSeenStamp(activityAt);
+		if (!peer || !stamp) return '';
+		window.__presenceLastSeenByUser = window.__presenceLastSeenByUser || {};
+		const current = directLastSeenStamp(window.__presenceLastSeenByUser[peer]);
+		if (stamp > current) window.__presenceLastSeenByUser[peer] = stamp;
+		const state = window.__directChatState;
+		const conversation = directFindConversation(peer);
+		if (conversation) conversation.lastSeen = directNewestLastSeen(conversation.lastSeen, stamp);
+		if (state.activePeer === peer && state.peer) state.peer.lastSeen = directNewestLastSeen(state.peer.lastSeen, stamp);
+		return stamp;
+	}
+
 	function directLivePresenceSnapshot(name, fallback = {}) {
 		const peer = String(name || fallback.name || fallback.peer || '').trim();
 		if (!peer) return { ...fallback };
@@ -72440,7 +72467,11 @@ function getVisibleChatStackEl(id) {
 		const count = Math.max(0, Number(total) || 0);
 		if (typeof window.setSidebarCountPill === 'function') window.setSidebarCountPill('messages', count || null);
 		const pill = document.getElementById('sidebar-count-messages');
-		if (pill) pill.title = `${count} unread private message${count === 1 ? '' : 's'}`;
+		if (pill) {
+			const label = `${count} unread private message${count === 1 ? '' : 's'}`;
+			pill.title = label;
+			pill.setAttribute('aria-label', label);
+		}
 	}
 
 	function updateDirectConversationPageCount(count = window.__directChatState.conversations.length) {
@@ -73074,6 +73105,14 @@ function getVisibleChatStackEl(id) {
 				changed = true;
 			}
 		}
+		if (String(message.from || '') === peer && message.createdAt) {
+			const activityAt = directRememberPeerActivity(peer, message.createdAt);
+			if (activityAt && directLastSeenStamp(conversation.lastSeen) < directLastSeenStamp(activityAt)) {
+				conversation.lastSeen = activityAt;
+				changed = true;
+			}
+			if (state.activePeer === peer) updateDirectThreadPresenceStatus();
+		}
 		if (message.to === me && messageId > previousLastId) {
 			if (options.readNow === true) {
 				if (Number(conversation.unread || 0) !== 0) changed = true;
@@ -73143,8 +73182,10 @@ function getVisibleChatStackEl(id) {
 		if (peerInfo) {
 			conversation.avatar = directResolveAvatar(peer, peerInfo.avatar || conversation.avatar);
 			conversation.online = peerInfo.online === true;
-			conversation.lastSeen = peerInfo.lastSeen || '';
+			conversation.lastSeen = directNewestLastSeen(peerInfo.lastSeen, conversation.lastSeen);
 		}
+		const peerActivity = directLatestPeerMessageActivity(peer, messages);
+		if (peerActivity) conversation.lastSeen = directNewestLastSeen(conversation.lastSeen, directRememberPeerActivity(peer, peerActivity));
 		if (latest) conversation.lastMessage = latest;
 		conversation.unread = 0;
 		conversation.myLastReadId = String(payload && payload.myLastReadId || conversation.myLastReadId || '0');
@@ -73329,7 +73370,7 @@ function getVisibleChatStackEl(id) {
 		const ytId = previewUrl && typeof getYoutubeId === 'function' ? getYoutubeId(previewUrl) : null;
 		const previewHtml = ytId ? `<div class="yt-video-card direct-message-youtube" onclick="playTrailerDirect('${directEscapeHtml(ytId)}')"><img src="https://img.youtube.com/vi/${directEscapeHtml(ytId)}/mqdefault.jpg" class="yt-thumb" loading="lazy" decoding="async"><div class="yt-play-overlay"><i class="fas fa-play"></i></div><div class="yt-card-info"><span>Watch Video</span><i class="fab fa-youtube"></i></div></div>` : (previewUrl ? `<div id="direct-lp-${directEscapeHtml(msg.id)}" class="direct-link-preview-host"></div>` : '');
 		const reactionsHtml = directReactionHtml(msg);
-		return `<div class="direct-message-row${own ? ' own' : ''}" data-direct-message-id="${directEscapeHtml(msg.id)}" data-direct-own="${own ? '1' : '0'}"><div><div class="direct-message-bubble">${replyHtml}${textHtml}${mediaHtml}${previewHtml}</div>${reactionsHtml ? `<div class="direct-message-reactions">${reactionsHtml}</div>` : ''}<div class="direct-message-actions"><span>${directEscapeHtml(directFormatTime(msg.createdAt))}</span>${msg.editedAt ? '<span class="direct-message-edited">Edited</span>' : ''}${directDeliveryHtml(msg)}<button type="button" class="direct-message-action reply" onclick="event.stopPropagation(); window.setDirectReply('${directEscapeHtml(msg.id)}')" onmouseenter="if(typeof playUiArrow==='function') playUiArrow()" title="Reply" aria-label="Reply"><i class="fas fa-reply"></i></button><button type="button" class="direct-message-action react" onclick="window.openDirectReactionPicker(event, '${directEscapeHtml(msg.id)}')" onmouseenter="if(typeof playUiArrow==='function') playUiArrow()" title="React" aria-label="React"><i class="fas fa-smile"></i></button>${own ? `<button type="button" class="direct-message-action edit" onclick="event.stopPropagation(); window.startDirectEdit('${directEscapeHtml(msg.id)}')" onmouseenter="if(typeof playUiArrow==='function') playUiArrow()" title="Edit" aria-label="Edit"><i class="fas fa-edit"></i></button><button type="button" class="direct-message-action delete" onclick="event.stopPropagation(); window.deleteDirectMessage('${directEscapeHtml(msg.id)}')" onmouseenter="if(typeof playUiArrow==='function') playUiArrow()" title="Delete" aria-label="Delete"><i class="fas fa-trash-alt"></i></button>` : ''}</div></div></div>`;
+		return `<div class="direct-message-row${own ? ' own' : ''}" data-direct-message-id="${directEscapeHtml(msg.id)}" data-direct-own="${own ? '1' : '0'}"><div class="direct-message-stack"><div class="direct-message-bubble">${replyHtml}${textHtml}${mediaHtml}${previewHtml}</div>${reactionsHtml ? `<div class="direct-message-reactions">${reactionsHtml}</div>` : ''}<div class="direct-message-actions"><span>${directEscapeHtml(directFormatTime(msg.createdAt))}</span>${msg.editedAt ? '<span class="direct-message-edited">Edited</span>' : ''}${directDeliveryHtml(msg)}<button type="button" class="direct-message-action reply" onclick="event.stopPropagation(); window.setDirectReply('${directEscapeHtml(msg.id)}')" onmouseenter="if(typeof playUiArrow==='function') playUiArrow()" title="Reply" aria-label="Reply"><i class="fas fa-reply"></i></button><button type="button" class="direct-message-action react" onclick="window.openDirectReactionPicker(event, '${directEscapeHtml(msg.id)}')" onmouseenter="if(typeof playUiArrow==='function') playUiArrow()" title="React" aria-label="React"><i class="fas fa-smile"></i></button>${own ? `<button type="button" class="direct-message-action edit" onclick="event.stopPropagation(); window.startDirectEdit('${directEscapeHtml(msg.id)}')" onmouseenter="if(typeof playUiArrow==='function') playUiArrow()" title="Edit" aria-label="Edit"><i class="fas fa-edit"></i></button><button type="button" class="direct-message-action delete" onclick="event.stopPropagation(); window.deleteDirectMessage('${directEscapeHtml(msg.id)}')" onmouseenter="if(typeof playUiArrow==='function') playUiArrow()" title="Delete" aria-label="Delete"><i class="fas fa-trash-alt"></i></button>` : ''}</div></div></div>`;
 	}
 
 	function applyDirectMessageUpdate(message) {
@@ -73399,7 +73440,7 @@ function getVisibleChatStackEl(id) {
 		if (input) input.dataset.placeholder = `Message ${peerName}`;
 		if (isDirectMessagesSubviewVisible()) {
 			const searchInput = document.getElementById('search-input');
-			if (searchInput) searchInput.placeholder = `Search messages with ${peerName}`;
+			if (searchInput) searchInput.placeholder = 'Search messages';
 		}
 		updateDirectThreadMessageCount(state.messageCount);
 		renderDirectComposerContext();
@@ -73589,7 +73630,13 @@ function getVisibleChatStackEl(id) {
 				clearTimeout(state.conversationRefreshWatchdog); state.conversationRefreshWatchdog = 0;
 				state.conversationRefreshInFlight = false;
 				if (payload && payload.success !== false) {
-					const next = Array.isArray(payload.conversations) ? payload.conversations : [];
+					const next = (Array.isArray(payload.conversations) ? payload.conversations : []).map(item => {
+						if (!item || !item.peer) return item;
+						const lastPeerMessageAt = item.lastMessage && item.lastMessage.from === item.peer ? item.lastMessage.createdAt : '';
+						const cachedLastSeen = window.__presenceLastSeenByUser && window.__presenceLastSeenByUser[item.peer];
+						item.lastSeen = directNewestLastSeen(item.lastSeen, cachedLastSeen, lastPeerMessageAt);
+						return item;
+					});
 					const signature = directConversationSignature(next);
 					const changed = signature !== state.conversationSignature;
 					state.conversations = next;
@@ -73669,8 +73716,12 @@ function getVisibleChatStackEl(id) {
 				renderDirectThread();
 				return;
 			}
-			state.peer = directLivePresenceSnapshot(peer, payload.peer || state.peer || { name:peer });
 			state.messages = Array.isArray(payload.messages) ? payload.messages : [];
+			const peerMessageActivity = directLatestPeerMessageActivity(peer, state.messages);
+			if (peerMessageActivity) directRememberPeerActivity(peer, peerMessageActivity);
+			const peerPayload = { ...(payload.peer || state.peer || { name:peer }) };
+			peerPayload.lastSeen = directNewestLastSeen(peerPayload.lastSeen, peerMessageActivity);
+			state.peer = directLivePresenceSnapshot(peer, peerPayload);
 			state.threadLoadedPeer = peer;
 			state.messageCount = Math.max(state.messages.length, Math.max(0, Number(payload.messageCount) || 0));
 			state.myLastReadId = String(payload.myLastReadId || '0');
@@ -73930,6 +73981,7 @@ function getVisibleChatStackEl(id) {
 			const me = directCurrentUser();
 			const peer = message.from === me ? message.to : message.from;
 			const state = window.__directChatState;
+			if (message.from === peer && message.createdAt) directRememberPeerActivity(peer, message.createdAt);
 			const readNow = message.to === me && state.activePeer === peer && directThreadVisible();
 			if (state.activePeer === peer) {
 				const keepBottom = directThreadNearBottom();
