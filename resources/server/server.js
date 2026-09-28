@@ -2419,6 +2419,15 @@ async function initDb() {
       CHECK (user_name <> peer_name)
     );
     CREATE INDEX IF NOT EXISTS idx_direct_message_read_peer ON direct_message_read_state(peer_name, user_name);
+    CREATE TABLE IF NOT EXISTS direct_conversation_delete_state (
+      user_name TEXT NOT NULL REFERENCES users(name) ON DELETE CASCADE,
+      peer_name TEXT NOT NULL REFERENCES users(name) ON DELETE CASCADE,
+      deleted_through_id BIGINT NOT NULL DEFAULT 0,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (user_name, peer_name),
+      CHECK (user_name <> peer_name)
+    );
+    CREATE INDEX IF NOT EXISTS idx_direct_conversation_delete_peer ON direct_conversation_delete_state(peer_name, user_name);
     CREATE TABLE IF NOT EXISTS pinned_messages (
       id SERIAL PRIMARY KEY,
       message_id TEXT UNIQUE,
@@ -8463,6 +8472,15 @@ function emitDirectMessageDeleteToLocalUsers(payload, excludeSocketId = '') {
   }
 }
 
+function emitDirectConversationDeleteToLocalUser(payload, excludeSocketId = '') {
+  const userName = normalizeDirectMessageUser(payload && payload.user);
+  if (!userName || !payload || !payload.peer) return;
+  for (const client of getSocketsByUserName(userName)) {
+    if (!client || !client.connected || client.id === excludeSocketId) continue;
+    client.emit('direct_conversation_deleted', payload);
+  }
+}
+
 async function notifyDirectMessageAcrossInstances(kind, payload) {
   if (!kind || !payload) return;
   const notifyPayload = (kind === 'message' || kind === 'update')
@@ -8485,11 +8503,18 @@ async function getDirectConversationPayload(userName) {
   if (!viewer) return { success:false, conversations:[], unreadTotal:0 };
 
   const result = await queryDbWithRetry(`
-    WITH relevant AS (
+    WITH delete_state AS (
+      SELECT peer_name, deleted_through_id
+      FROM direct_conversation_delete_state
+      WHERE user_name = $1
+    ), relevant AS (
       SELECT dm.id, dm.sender_name, dm.recipient_name, dm.text, dm.message_type, dm.content, dm.reply_to, dm.reactions, dm.edited_at, dm.created_at,
              CASE WHEN dm.sender_name = $1 THEN dm.recipient_name ELSE dm.sender_name END AS peer_name
       FROM direct_messages dm
-      WHERE dm.sender_name = $1 OR dm.recipient_name = $1
+      LEFT JOIN delete_state ds
+        ON ds.peer_name = CASE WHEN dm.sender_name = $1 THEN dm.recipient_name ELSE dm.sender_name END
+      WHERE (dm.sender_name = $1 OR dm.recipient_name = $1)
+        AND dm.id > COALESCE(ds.deleted_through_id, 0)
     ), latest AS (
       SELECT DISTINCT ON (peer_name)
              peer_name, id, sender_name, recipient_name, text, message_type, content, reply_to, reactions, edited_at, created_at
@@ -8500,8 +8525,11 @@ async function getDirectConversationPayload(userName) {
       FROM direct_messages dm
       LEFT JOIN direct_message_read_state rs
         ON rs.user_name = $1 AND rs.peer_name = dm.sender_name
+      LEFT JOIN delete_state ds
+        ON ds.peer_name = dm.sender_name
       WHERE dm.recipient_name = $1
         AND dm.id > COALESCE(rs.last_read_id, 0)
+        AND dm.id > COALESCE(ds.deleted_through_id, 0)
       GROUP BY dm.sender_name
     )
     SELECT l.peer_name, l.id, l.sender_name, l.recipient_name, l.text, l.message_type, l.content, l.reply_to, l.reactions, l.edited_at, l.created_at,
@@ -8589,7 +8617,13 @@ async function getDirectHistoryPayload(userName, peerName, options = {}) {
   if (!viewer || !peer || viewer === peer) return { success:false, message:'Invalid conversation.' };
 
   const result = await queryDbWithRetry(`
-    WITH peer AS (
+    WITH deletion AS (
+      SELECT COALESCE((
+        SELECT deleted_through_id
+        FROM direct_conversation_delete_state
+        WHERE user_name = $1 AND peer_name = $2
+      ), 0) AS deleted_through_id
+    ), peer AS (
       SELECT u.name AS peer_name,
              COALESCE(u.data->>'avatar', $4) AS peer_avatar,
              COALESCE(u.data->>'lastSeen', '') AS peer_last_seen,
@@ -8615,8 +8649,9 @@ async function getDirectHistoryPayload(userName, peerName, options = {}) {
       SELECT id, sender_name, recipient_name, text, message_type, content, reply_to, reactions, edited_at, created_at,
              COUNT(*) OVER () AS total_count
       FROM direct_messages
-      WHERE (sender_name = $1 AND recipient_name = $2)
-         OR (sender_name = $2 AND recipient_name = $1)
+      WHERE ((sender_name = $1 AND recipient_name = $2)
+         OR (sender_name = $2 AND recipient_name = $1))
+        AND id > (SELECT deleted_through_id FROM deletion)
       ORDER BY id DESC
       LIMIT $3
     )
@@ -9173,6 +9208,8 @@ async function initProfileSyncNotifications() {
           }
         } else if (data.kind === 'delete' && data.payload) {
           emitDirectMessageDeleteToLocalUsers(data.payload);
+        } else if (data.kind === 'conversation_delete' && data.payload) {
+          emitDirectConversationDeleteToLocalUser(data.payload);
         } else if (data.kind === 'read' && data.payload) {
           emitDirectReadToLocalUsers(data.payload);
         }
@@ -13650,6 +13687,85 @@ io.on('connection', (socket) => {
     } catch (err) {
       console.error('[DIRECT DELETE ERROR]:', err && err.message ? err.message : err);
       respond({ success:false, message:'Could not delete the message.' });
+    }
+  });
+
+
+  socket.on('direct_conversation_delete', async (data = {}, callback) => {
+    const respond = typeof callback === 'function' ? callback : () => {};
+    const viewer = normalizeDirectMessageUser(socket.userName);
+    const peer = normalizeDirectMessageUser(data.with || data.peer || data.user);
+    if (!viewer) return respond({ success:false, message:'Authentication required.' });
+    if (!peer || peer === viewer) return respond({ success:false, message:'Invalid conversation.' });
+
+    try {
+      const result = await queryDbWithRetry(`
+        WITH bounds AS (
+          SELECT COALESCE(MAX(id), 0) AS max_id
+          FROM direct_messages
+          WHERE (sender_name = $1 AND recipient_name = $2)
+             OR (sender_name = $2 AND recipient_name = $1)
+        ), hidden AS (
+          INSERT INTO direct_conversation_delete_state (user_name, peer_name, deleted_through_id, updated_at)
+          SELECT $1, $2, max_id, NOW()
+          FROM bounds
+          WHERE max_id > 0
+          ON CONFLICT (user_name, peer_name) DO UPDATE
+          SET deleted_through_id = GREATEST(direct_conversation_delete_state.deleted_through_id, EXCLUDED.deleted_through_id),
+              updated_at = NOW()
+          RETURNING deleted_through_id
+        ), read_state AS (
+          INSERT INTO direct_message_read_state (user_name, peer_name, last_read_id, updated_at)
+          SELECT $1, $2, max_id, NOW()
+          FROM bounds
+          WHERE max_id > 0
+          ON CONFLICT (user_name, peer_name) DO UPDATE
+          SET last_read_id = GREATEST(direct_message_read_state.last_read_id, EXCLUDED.last_read_id),
+              updated_at = NOW()
+          RETURNING last_read_id
+        )
+        SELECT b.max_id,
+               COALESCE(
+                 (SELECT deleted_through_id FROM hidden),
+                 (SELECT deleted_through_id FROM direct_conversation_delete_state WHERE user_name = $1 AND peer_name = $2),
+                 0
+               ) AS deleted_through_id
+        FROM bounds b
+      `, [viewer, peer], { attempts:2, label:'DIRECT CONVERSATION DELETE' });
+
+      const deletedThroughId = Math.max(0, Number(result.rows?.[0]?.deleted_through_id) || 0);
+      const payload = { user:viewer, peer, deletedThroughId:String(deletedThroughId), deletedAt:new Date().toISOString() };
+
+      emitDirectConversationDeleteToLocalUser(payload, socket.id);
+      deferServerTask('DIRECT CONVERSATION DELETE NOTIFY', () => notifyDirectMessageAcrossInstances('conversation_delete', payload), 0);
+
+      if (deletedThroughId > 0) {
+        deferServerTask('DIRECT CONVERSATION NOTIFICATION CLEANUP', async () => {
+          const removed = await queryDbWithRetry(
+            `DELETE FROM user_notifications
+             WHERE user_name = $1
+               AND event_type = 'private_message'
+               AND data->>'actor' = $2
+               AND data->>'messageId' ~ '^[0-9]+$'
+               AND (data->>'messageId')::bigint <= $3
+             RETURNING id`,
+            [viewer, peer, deletedThroughId],
+            { attempts:1, label:'DIRECT CONVERSATION NOTIFICATION CLEANUP' }
+          );
+          const ids = (removed.rows || []).map(row => String(row && row.id || '')).filter(Boolean);
+          if (!ids.length) return;
+          const unreadCount = await getUserNotificationUnreadCount(viewer);
+          for (const notificationId of ids) {
+            emitUserNotificationDeletedToLocalUser(viewer, notificationId, unreadCount);
+            await notifyUserNotificationDeletedAcrossInstances(viewer, notificationId, unreadCount);
+          }
+        }, 0);
+      }
+
+      respond({ success:true, ...payload });
+    } catch (err) {
+      console.error('[DIRECT CONVERSATION DELETE ERROR]:', err && err.message ? err.message : err);
+      respond({ success:false, message:'Could not delete this conversation.' });
     }
   });
 

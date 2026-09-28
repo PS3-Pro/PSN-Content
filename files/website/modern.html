@@ -6337,7 +6337,11 @@ img { -webkit-user-drag: none !important; user-drag: none !important; }
 .direct-message-row.own .direct-message-bubble { border-radius:12px 12px 4px 12px; background:rgba(0,112,204,.22); border-color:rgba(0,112,204,.34); }
 .direct-message-text { color:#fff; font-size:13px; line-height:1.42; white-space:pre-wrap; overflow-wrap:anywhere; }
 .direct-message-meta { display:flex; align-items:center; justify-content:flex-end; gap:5px; margin-top:4px; font-size:9px; color:rgba(255,255,255,.38); }
-.direct-message-seen { color:rgba(255,255,255,.52); }
+.direct-message-delivery { display:inline-flex; align-items:center; justify-content:center; min-width:13px; color:rgba(255,255,255,.38); font-size:9px; line-height:1; }
+.direct-message-delivery.is-seen { color:#66ccff; text-shadow:0 0 7px rgba(102,204,255,.28); }
+.direct-message-delivery i { font-size:9px; line-height:1; }
+.direct-conversation-item.direct-context-target { background:rgba(0,112,204,.16); outline:1px solid rgba(0,112,204,.28); }
+#direct-conversation-context-menu { width:220px; }
 .direct-message-edited { color:rgba(255,255,255,.34); font-style:italic; }
 .direct-message-actions { display:flex; align-items:center; gap:7px; margin-top:5px; color:var(--text-muted); font-size:11px; }
 .direct-message-row.own .direct-message-actions { justify-content:flex-end; }
@@ -11041,7 +11045,7 @@ P
 
 	function isPsnFileManagerInteractionTarget(target) {
 		const element = getPsnInteractionElement(target);
-		return !!(element && element.closest && element.closest('#fm-online-container'));
+		return !!(element && element.closest && element.closest('#fm-online-container, #direct-conversations-list .direct-conversation-item, #direct-conversation-context-menu'));
 	}
 
 	function blockSecondaryMouseInteraction(event) {
@@ -23823,6 +23827,9 @@ P
 
 	function applySocialSection(section) {
 		if (section !== 'chat' && typeof hideChatSuggestions === 'function') hideChatSuggestions();
+		if (section !== 'messages' && window.__directChatState && String(window.__directChatState.searchQuery || '').trim() && typeof window.clearDirectMessageSearch === 'function') {
+			window.clearDirectMessageSearch({ render:true, clearInput:false });
+		}
 
 		const chatView = PSN_STATIC_NAV_DOM.subviewChat;
 		const messagesView = PSN_STATIC_NAV_DOM.subviewMessages;
@@ -23989,8 +23996,14 @@ P
 				restartEntryAnimationWithoutReflow(messagesView);
 			}
 			if(btnMessages) btnMessages.classList.add('active');
-			setPsnStyleIfChanged(searchBar, 'display', 'none');
-			if (searchInput && searchInput.value !== '') searchInput.value = '';
+			setPsnStyleIfChanged(searchBar, 'display', 'flex');
+			if (searchInput) {
+				if (searchInput.placeholder !== 'Search private messages') searchInput.placeholder = 'Search private messages';
+				const directQuery = String(window.__directChatState && window.__directChatState.searchQuery || '');
+				if (searchInput.value !== directQuery) searchInput.value = directQuery;
+				setPsnAttributeIfChanged(searchInput, 'autocomplete', 'off');
+				setPsnAttributeIfChanged(searchInput, 'spellcheck', 'false');
+			}
 			if (typeof window.refreshDirectConversations === 'function' || typeof window.markActiveDirectConversationRead === 'function') {
 				runViewOpenWork('view-chat', () => {
 					if (typeof window.markActiveDirectConversationRead === 'function') window.markActiveDirectConversationRead();
@@ -30127,10 +30140,13 @@ P
 		
 		const isSocial = document.getElementById('view-chat').style.display === 'block' || document.getElementById('view-chat').style.display === 'flex';
 		const isChatActive = document.getElementById('subview-chat')?.style.display === 'flex';
+		const isMessagesActive = typeof isDirectMessagesSubviewVisible === 'function' && isDirectMessagesSubviewVisible();
 		const isLibraryActive = document.getElementById('view-library').style.display === 'block';
 		const isWishlistActive = document.getElementById('view-wishlist').style.display === 'block';
 	
-		if (isSocial && isChatActive) {
+		if (isSocial && isMessagesActive) {
+			if (typeof window.clearDirectMessageSearch === 'function') window.clearDirectMessageSearch({ clearInput:false, render:true, keepDropdown:true });
+		} else if (isSocial && isChatActive) {
 			const chatBox = document.getElementById('chat-messages');
 			if (chatBox) {
 				chatBox.style.setProperty('scroll-behavior', 'auto', 'important');
@@ -30226,14 +30242,17 @@ P
 				}
 			} 
 			else if (isChatContainerActive) {
-				const isFriendsTab = typeof isFriendsSubviewVisible === 'function'
+				const isMessagesTab = typeof isDirectMessagesSubviewVisible === 'function' && isDirectMessagesSubviewVisible();
+				const isFriendsTab = !isMessagesTab && (typeof isFriendsSubviewVisible === 'function'
 					? isFriendsSubviewVisible()
 					: (() => {
 						const friendsSubView = document.getElementById('subview-friends');
 						return !!(friendsSubView && (friendsSubView.style.display === 'block' || friendsSubView.style.display === 'flex'));
-					})();
+					})());
 	
-				if (isFriendsTab) {
+				if (isMessagesTab) {
+					if (typeof window.applyDirectMessageSearch === 'function') window.applyDirectMessageSearch(val);
+				} else if (isFriendsTab) {
 					cancelQueuedFriendsSearchRender();
 					const cleanVal = val.trim();
 					if ((cleanVal.length >= 2 || cleanVal === '@all' || cleanVal === '*') && socketChat) {
@@ -72139,9 +72158,9 @@ function getVisibleChatStackEl(id) {
 	window.__directChatState = window.__directChatState || {
 		owner: '', conversations: [], activePeer: '', messages: [], peer: null, messageCount: 0,
 		myLastReadId: '0', peerLastReadId: '0', loadingThread: false, pendingMedia: [], pendingUploads: 0, mediaToken: 0,
-		replyTo: null, editingMessageId: '', inputRange: null,
+		replyTo: null, editingMessageId: '', inputRange: null, searchQuery: '', searchResultCount: 0,
 		conversationRefreshInFlight: false, conversationRefreshQueued: false, conversationRefreshTimer: 0, conversationRefreshWatchdog: 0, conversationRefreshToken: 0, conversationSignature: '',
-		threadRequestToken: 0, threadRequestTimer: 0, sessionToken: 0, trimmedMessageIds: [], emptyConversationCloseTimer: 0, emptyConversationCloseToken: 0
+		threadRequestToken: 0, threadRequestTimer: 0, threadLoadedPeer: '', sessionToken: 0, trimmedMessageIds: [], deletedThroughByPeer: Object.create(null), emptyConversationCloseTimer: 0, emptyConversationCloseToken: 0
 	};
 
 	function directEscapeHtml(value) {
@@ -72377,6 +72396,46 @@ function getVisibleChatStackEl(id) {
 		return fallback || directDefaultAvatar();
 	}
 
+	function directLastSeenStamp(value) {
+		if (!value) return 0;
+		if (typeof value === 'number' && Number.isFinite(value)) return value;
+		const numeric = Number(value);
+		if (Number.isFinite(numeric) && numeric > 0) return numeric;
+		const parsed = Date.parse(String(value));
+		return Number.isFinite(parsed) ? parsed : 0;
+	}
+
+	function directNewestLastSeen(...values) {
+		let best = '';
+		let bestStamp = 0;
+		values.forEach(value => {
+			const stamp = directLastSeenStamp(value);
+			if (stamp > bestStamp) { bestStamp = stamp; best = value; }
+		});
+		return best;
+	}
+
+	function directLivePresenceSnapshot(name, fallback = {}) {
+		const peer = String(name || fallback.name || fallback.peer || '').trim();
+		if (!peer) return { ...fallback };
+		const live = window.__currentOnlineUserByName instanceof Map
+			? (window.__currentOnlineUserByName.get(peer) || null)
+			: (Array.isArray(window.currentOnlineList) ? window.currentOnlineList.find(item => item && String(item.name || item.user || '') === peer) || null : null);
+		const activeSet = window.__currentOnlineActiveNames instanceof Set ? window.__currentOnlineActiveNames : null;
+		const online = live
+			? live.online === true
+			: (activeSet && activeSet.has(peer) ? true : (window.__chatOnlineListReceived === true ? false : fallback.online === true));
+		const cachedLastSeen = window.__presenceLastSeenByUser && window.__presenceLastSeenByUser[peer];
+		return {
+			...fallback,
+			...(live && typeof live === 'object' ? live : {}),
+			name:peer,
+			online,
+			avatar:directResolveAvatar(peer, (live && live.avatar) || fallback.avatar),
+			lastSeen:directNewestLastSeen((live && live.lastSeen), cachedLastSeen, fallback.lastSeen)
+		};
+	}
+
 	function updateDirectUnreadBadge(total) {
 		const count = Math.max(0, Number(total) || 0);
 		if (typeof window.setSidebarCountPill === 'function') window.setSidebarCountPill('messages', count || null);
@@ -72409,6 +72468,159 @@ function getVisibleChatStackEl(id) {
 		return window.__directChatState.conversations.find(item => item && item.peer === peer) || null;
 	}
 
+	function isDirectMessagesSubviewVisible() {
+		const parent = document.getElementById('view-chat');
+		const view = document.getElementById('subview-messages');
+		return !!(parent && view && (parent.style.display === 'block' || parent.style.display === 'flex') && (view.style.display === 'block' || view.style.display === 'flex'));
+	}
+	window.isDirectMessagesSubviewVisible = isDirectMessagesSubviewVisible;
+
+	function directParseSearchQuery(query) {
+		const raw = String(query || '').trim();
+		const parsed = { raw, text:'', from:'', has:new Set(), flags:new Set() };
+		if (!raw) return parsed;
+		const textParts = [];
+		const tokens = raw.match(/"[^"]*"|\S+/g) || [];
+		tokens.forEach(token => {
+			const clean = String(token || '').trim();
+			const lower = clean.toLowerCase();
+			if (/^from:(me|them)$/.test(lower)) { parsed.from = lower.slice(5); return; }
+			const hasMatch = lower.match(/^has:(image|gif|reply|link|reaction)$/);
+			if (hasMatch) { parsed.has.add(hasMatch[1]); return; }
+			const flagMatch = lower.match(/^is:(edited|seen|unseen)$/);
+			if (flagMatch) { parsed.flags.add(flagMatch[1]); return; }
+			textParts.push(clean.replace(/^"|"$/g, ''));
+		});
+		parsed.text = textParts.join(' ').trim().toLowerCase();
+		return parsed;
+	}
+
+	function directMessageMatchesSearch(message, parsed = directParseSearchQuery(window.__directChatState.searchQuery)) {
+		if (!message || !message.id) return false;
+		if (!parsed || !parsed.raw) return true;
+		const me = directCurrentUser();
+		const own = String(message.from || '') === me;
+		if (parsed.from === 'me' && !own) return false;
+		if (parsed.from === 'them' && own) return false;
+		const media = Array.isArray(message.content) ? message.content : [];
+		for (const filter of parsed.has) {
+			if (filter === 'image' && !(String(message.type || '') === 'image' || (media.length > 0 && String(message.type || '') !== 'gif'))) return false;
+			if (filter === 'gif' && String(message.type || '') !== 'gif') return false;
+			if (filter === 'reply' && !(message.replyTo && message.replyTo.id)) return false;
+			if (filter === 'link' && !/https?:\/\//i.test(directMessagePlainText(message.text))) return false;
+			if (filter === 'reaction' && !(Array.isArray(message.reactions) && message.reactions.some(item => item && Array.isArray(item.users) && item.users.length))) return false;
+		}
+		if (parsed.flags.has('edited') && !message.editedAt) return false;
+		if (parsed.flags.has('seen') || parsed.flags.has('unseen')) {
+			if (!own) return false;
+			const seen = directMessageIdNumber(message.id) > 0 && directMessageIdNumber(message.id) <= directMessageIdNumber(window.__directChatState.peerLastReadId);
+			if (parsed.flags.has('seen') && !seen) return false;
+			if (parsed.flags.has('unseen') && seen) return false;
+		}
+		if (parsed.text) {
+			const reply = message.replyTo || {};
+			const haystack = [
+				directMessagePlainText(message.text),
+				directMessagePlainText(reply.text),
+				String(reply.from || ''),
+				String(message.from || ''),
+				String(message.type || '') === 'gif' ? 'gif' : '',
+				media.length ? 'image attachment' : ''
+			].join(' ').toLowerCase();
+			if (!haystack.includes(parsed.text)) return false;
+		}
+		return true;
+	}
+
+	function directGetVisibleMessages() {
+		const state = window.__directChatState;
+		const messages = Array.isArray(state.messages) ? state.messages : [];
+		const parsed = directParseSearchQuery(state.searchQuery);
+		if (!parsed.raw) { state.searchResultCount = messages.length; return messages; }
+		const filtered = messages.filter(message => directMessageMatchesSearch(message, parsed));
+		state.searchResultCount = filtered.length;
+		return filtered;
+	}
+
+	function directConversationMatchesSearch(item, query) {
+		const term = String(query || '').trim().toLowerCase();
+		if (!term) return true;
+		const last = item && item.lastMessage || {};
+		const haystack = [String(item && item.peer || ''), directMessagePlainText(last.text), last.type === 'gif' ? 'gif' : '', Array.isArray(last.content) && last.content.length ? 'image' : ''].join(' ').toLowerCase();
+		return haystack.includes(term);
+	}
+
+	function directSearchFilterItem(filter, icon, label, value) {
+		return `<div class="search-filter-item" onmousedown="window.insertDirectSearchFilter('${directEscapeHtml(filter)}', event)"><i class="fas ${directEscapeHtml(icon)}"></i><div class="filter-info"><span>${directEscapeHtml(label)}</span> ${directEscapeHtml(value)}</div></div>`;
+	}
+
+	function renderDirectSearchFilters() {
+		const dropdown = document.getElementById('chat-search-dropdown');
+		if (!dropdown || !isDirectMessagesSubviewVisible()) return false;
+		const state = window.__directChatState;
+		if (!state.activePeer) {
+			dropdown.innerHTML = `<div class="search-section-label">SEARCH CONVERSATIONS</div><div style="padding:14px 15px;font-size:11px;line-height:1.45;color:rgba(255,255,255,.45);"><i class="fas fa-user" style="margin-right:7px;color:var(--ps-blue);"></i>Type a player name or text from the latest message.</div>`;
+			return true;
+		}
+		const activeQuery = String(state.searchQuery || '').trim();
+		const resultLabel = activeQuery ? ` • ${Math.max(0, Number(state.searchResultCount) || 0)} RESULT${Number(state.searchResultCount) === 1 ? '' : 'S'}` : '';
+		dropdown.innerHTML = `<div class="search-section-label">SEARCH FILTERS${resultLabel}</div>` +
+			directSearchFilterItem('from:me','fa-user','from:','me') +
+			directSearchFilterItem('from:them','fa-user-friends','from:','them') +
+			directSearchFilterItem('has:image','fa-image','has:','image') +
+			directSearchFilterItem('has:gif','fa-film','has:','gif') +
+			directSearchFilterItem('has:reply','fa-reply','has:','reply') +
+			directSearchFilterItem('has:link','fa-link','has:','link') +
+			directSearchFilterItem('has:reaction','fa-smile','has:','reaction') +
+			directSearchFilterItem('is:edited','fa-edit','is:','edited') +
+			directSearchFilterItem('is:seen','fa-check-double','is:','seen') +
+			directSearchFilterItem('is:unseen','fa-check','is:','unseen');
+		return true;
+	}
+	window.renderDirectSearchFilters = renderDirectSearchFilters;
+
+	window.insertDirectSearchFilter = function(filter, event) {
+		if (event) event.preventDefault();
+		const input = document.getElementById('search-input');
+		if (!input || !isDirectMessagesSubviewVisible()) return false;
+		const wanted = String(filter || '').trim().toLowerCase();
+		let tokens = String(input.value || '').trim().match(/"[^"]*"|\S+/g) || [];
+		const hadExact = tokens.some(token => String(token || '').toLowerCase() === wanted);
+		tokens = tokens.filter(token => String(token || '').toLowerCase() !== wanted);
+		if (wanted.startsWith('from:')) tokens = tokens.filter(token => !/^from:(me|them)$/i.test(String(token || '')));
+		if (wanted === 'is:seen' || wanted === 'is:unseen') tokens = tokens.filter(token => !/^is:(seen|unseen)$/i.test(String(token || '')));
+		if (!hadExact) tokens.push(wanted);
+		input.value = tokens.join(' ').trim();
+		if (typeof focusSearchInputWithoutScroll === 'function') focusSearchInputWithoutScroll(input); else input.focus();
+		window.applyDirectMessageSearch(input.value, { keepDropdown:true });
+		if (typeof playUiClick === 'function') playUiClick();
+		return false;
+	};
+
+	window.applyDirectMessageSearch = function(query, options = {}) {
+		const state = window.__directChatState;
+		state.searchQuery = String(query || '').trim();
+		if (state.activePeer) renderDirectThread(state.searchQuery ? { searchUpdate:true } : { forceBottom:true });
+		else renderDirectConversations();
+		if (options.keepDropdown === true || document.getElementById('chat-search-dropdown')?.style.display === 'flex') renderDirectSearchFilters();
+	};
+
+	window.clearDirectMessageSearch = function(options = {}) {
+		const state = window.__directChatState;
+		const hadSearch = !!String(state.searchQuery || '').trim();
+		state.searchQuery = '';
+		state.searchResultCount = Array.isArray(state.messages) ? state.messages.length : 0;
+		if (options.clearInput !== false) {
+			const input = document.getElementById('search-input');
+			if (input && isDirectMessagesSubviewVisible()) input.value = '';
+		}
+		if (options.render !== false && hadSearch) {
+			if (state.activePeer) renderDirectThread({ forceBottom:true });
+			else renderDirectConversations();
+		}
+		if (options.keepDropdown === true) renderDirectSearchFilters();
+	};
+
 
 	function directMessageStateSignature(message) {
 		if (!message || !message.id) return '';
@@ -72437,12 +72649,18 @@ function getVisibleChatStackEl(id) {
 		if (!list) return;
 		const state = window.__directChatState;
 		const conversations = Array.isArray(state.conversations) ? state.conversations : [];
+		const conversationSearch = !state.activePeer ? String(state.searchQuery || '').trim() : '';
+		const visibleConversations = conversationSearch ? conversations.filter(item => directConversationMatchesSearch(item, conversationSearch)) : conversations;
 		updateDirectConversationPageCount(conversations.length);
 		if (!conversations.length) {
 			list.innerHTML = '<div class="direct-empty-conversations"><i class="fas fa-comment-slash"></i><div>No conversations yet.</div><small>Use the message button on a player to start one.</small><button type="button" class="action-btn" style="margin:8px 0 0;" onclick="if(typeof playUiClick===\'function\') playUiClick(); if(typeof openOnlineModal===\'function\') openOnlineModal();"><i class="fas fa-user-plus"></i> FIND PLAYERS</button></div>';
 			return;
 		}
-		list.innerHTML = conversations.map(item => {
+		if (!visibleConversations.length) {
+			list.innerHTML = '<div class="direct-empty-conversations"><i class="fas fa-search"></i><div>No conversations found.</div><small>Try another player name or message preview.</small><button type="button" class="action-btn" style="margin:8px 0 0;" onclick="if(typeof playUiBack===\'function\') playUiBack(); window.clearGlobalSearch();"><i class="fas fa-times"></i> CLEAR SEARCH</button></div>';
+			return;
+		}
+		list.innerHTML = visibleConversations.map(item => {
 			const peer = String(item.peer || '');
 			const avatar = directResolveAvatar(peer, item.avatar);
 			const last = item.lastMessage || {};
@@ -72460,6 +72678,218 @@ function getVisibleChatStackEl(id) {
 		}).join('');
 	}
 
+
+	let directConversationContextCloseTimer = 0;
+
+	function getDirectConversationContextMenu() {
+		let menu = document.getElementById('direct-conversation-context-menu');
+		if (menu) return menu;
+		menu = document.createElement('div');
+		menu.id = 'direct-conversation-context-menu';
+		menu.className = 'fm-context-menu';
+		menu.setAttribute('role', 'menu');
+		menu.setAttribute('aria-hidden', 'true');
+		document.body.appendChild(menu);
+		return menu;
+	}
+
+	function closeDirectConversationContextMenu(options = {}) {
+		const menu = document.getElementById('direct-conversation-context-menu');
+		clearTimeout(directConversationContextCloseTimer);
+		directConversationContextCloseTimer = 0;
+		document.querySelectorAll('#direct-conversations-list .direct-conversation-item.direct-context-target').forEach(item => item.classList.remove('direct-context-target'));
+		if (!menu) return;
+		const finish = () => {
+			menu.classList.remove('is-open', 'is-closing');
+			menu.setAttribute('aria-hidden', 'true');
+			menu.replaceChildren();
+			menu.dataset.peer = '';
+		};
+		if (!menu.classList.contains('is-open') || options.immediate === true || window.matchMedia?.('(prefers-reduced-motion: reduce)').matches) {
+			finish();
+			return;
+		}
+		menu.classList.remove('is-open');
+		menu.classList.add('is-closing');
+		menu.setAttribute('aria-hidden', 'true');
+		directConversationContextCloseTimer = setTimeout(finish, 110);
+	}
+
+	window.openDirectConversationContextMenu = function(peerName, clientX, clientY, sourceItem = null) {
+		const peer = String(peerName || '').trim();
+		if (!peer || !directFindConversation(peer)) return false;
+		closeDirectConversationContextMenu({ immediate:true });
+		const menu = getDirectConversationContextMenu();
+		menu.dataset.peer = peer;
+		menu.innerHTML = `<div class="fm-context-menu-title" data-no-translate="true" translate="no">${directEscapeHtml(peer)}</div><button type="button" class="fm-context-menu-item fm-danger" role="menuitem" data-direct-context-action="delete"><i class="fas fa-trash-alt"></i><span>Delete conversation</span></button>`;
+		if (sourceItem) sourceItem.classList.add('direct-context-target');
+		menu.style.left = '0px';
+		menu.style.top = '0px';
+		menu.classList.add('is-open');
+		menu.setAttribute('aria-hidden', 'false');
+		requestAnimationFrame(() => {
+			if (!menu.isConnected || !menu.classList.contains('is-open')) return;
+			const gap = 8;
+			const width = menu.offsetWidth || 220;
+			const height = menu.offsetHeight || 90;
+			const left = Math.max(gap, Math.min(Number(clientX) || gap, window.innerWidth - width - gap));
+			const top = Math.max(gap, Math.min(Number(clientY) || gap, window.innerHeight - height - gap));
+			menu.style.left = `${Math.round(left)}px`;
+			menu.style.top = `${Math.round(top)}px`;
+		});
+		menu.querySelector('[data-direct-context-action="delete"]')?.addEventListener('click', event => {
+			event.preventDefault();
+			event.stopPropagation();
+			closeDirectConversationContextMenu();
+			window.deleteDirectConversation(peer);
+		}, { once:true });
+		if (typeof playUiClick === 'function') playUiClick();
+		return true;
+	};
+
+	function directClearActiveConversation(peer) {
+		const state = window.__directChatState;
+		if (state.activePeer !== peer) return;
+		state.activePeer = ''; state.peer = null; state.messages = []; state.messageCount = 0; state.trimmedMessageIds = []; state.threadLoadedPeer = '';
+		state.myLastReadId = '0'; state.peerLastReadId = '0'; state.loadingThread = false;
+		state.pendingMedia = []; state.pendingUploads = 0; state.mediaToken = Number(state.mediaToken || 0) + 1;
+		state.replyTo = null; state.editingMessageId = ''; state.inputRange = null;
+		clearTimeout(state.threadRequestTimer); state.threadRequestTimer = 0; state.threadRequestToken = Number(state.threadRequestToken || 0) + 1;
+		if (typeof directClearComposer === 'function') directClearComposer();
+		renderDirectPendingMedia(); closeDirectPickers(); renderDirectComposerContext();
+		updateDirectThreadMessageCount(0);
+	}
+
+	function directApplyConversationDeletion(payload, options = {}) {
+		const state = window.__directChatState;
+		const me = directCurrentUser();
+		const peer = String(payload && payload.peer || '').trim();
+		const owner = String(payload && payload.user || me).trim();
+		const deletedThroughId = directMessageIdNumber(payload && payload.deletedThroughId);
+		if (!peer || owner !== me) return false;
+		if (!state.deletedThroughByPeer || typeof state.deletedThroughByPeer !== 'object') state.deletedThroughByPeer = Object.create(null);
+		state.deletedThroughByPeer[peer] = Math.max(directDeletedThroughId(peer), deletedThroughId);
+
+		const conversation = directFindConversation(peer);
+		const newestConversationId = directMessageIdNumber(conversation && conversation.lastMessage && conversation.lastMessage.id);
+		const hasNewerConversationMessage = newestConversationId > deletedThroughId;
+
+		if (state.activePeer === peer) {
+			state.messages = (Array.isArray(state.messages) ? state.messages : []).filter(message => directMessageIdNumber(message && message.id) > deletedThroughId);
+			if (state.messages.length) {
+				state.messageCount = state.messages.length;
+				state.threadLoadedPeer = peer;
+				updateDirectThreadMessageCount(state.messageCount);
+				renderDirectThread({ preserveScroll:true });
+			}
+		}
+
+		if (hasNewerConversationMessage) {
+			if (conversation) {
+				conversation.unread = Math.max(0, Number(conversation.unread) || 0);
+				conversation.myLastReadId = String(Math.max(directMessageIdNumber(conversation.myLastReadId), deletedThroughId));
+			}
+			directCommitConversationState(true);
+			if (state.activePeer === peer && !state.messages.length) {
+				state.threadLoadedPeer = '';
+				setTimeout(() => window.openDirectMessage(peer, { forceReload:true, silent:true }), 0);
+			}
+			return true;
+		}
+
+		const item = document.querySelector(`#direct-conversations-list .direct-conversation-item[data-direct-peer="${CSS.escape(encodeURIComponent(peer).replace(/'/g, '%27'))}"]`);
+		const thread = state.activePeer === peer ? document.getElementById('direct-thread-active') : null;
+		const finish = () => {
+			const latestConversation = directFindConversation(peer);
+			if (latestConversation && directMessageIdNumber(latestConversation.lastMessage && latestConversation.lastMessage.id) > deletedThroughId) {
+				item?.classList.remove('is-removing');
+				thread?.classList.remove('is-removing');
+				directCommitConversationState(true);
+				if (state.activePeer === peer) renderDirectThread({ preserveScroll:true });
+				return;
+			}
+			state.conversations = (state.conversations || []).filter(entry => entry && entry.peer !== peer);
+			if (state.activePeer === peer) directClearActiveConversation(peer);
+			directCommitConversationState(false);
+			renderDirectConversations();
+			if (thread) renderDirectThread();
+		};
+		const reducedMotion = !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+		if (options.animate === false || reducedMotion) {
+			finish();
+			return true;
+		}
+		item?.classList.add('is-removing');
+		thread?.classList.add('is-removing');
+		setTimeout(() => {
+			item?.classList.remove('is-removing');
+			thread?.classList.remove('is-removing');
+			finish();
+		}, 185);
+		return true;
+	}
+
+	window.deleteDirectConversation = function(peerName) {
+		const peer = String(peerName || '').trim();
+		const state = window.__directChatState;
+		if (!peer || !directFindConversation(peer) || !socketChat || !socketChat.connected) return false;
+		if (!confirm(`Delete your conversation with ${peer}?\n\nThis removes the current history from your Private Messages only. New messages will start the conversation again.`)) {
+			if (typeof playUiBack === 'function') playUiBack();
+			return false;
+		}
+		const sessionToken = Number(state.sessionToken || 0);
+		socketChat.emit('direct_conversation_delete', { with:peer }, response => {
+			if (Number(state.sessionToken || 0) !== sessionToken) return;
+			if (!response || response.success === false) {
+				if (typeof showToastNotification === 'function') showToastNotification('Private Messages', response?.message || 'Could not delete this conversation.');
+				return;
+			}
+			directApplyConversationDeletion(response, { animate:true });
+			if (typeof playUiRemove === 'function') playUiRemove();
+		});
+		return true;
+	};
+
+	if (!window.__directConversationContextMenuBound) {
+		window.__directConversationContextMenuBound = true;
+		document.addEventListener('contextmenu', event => {
+			const item = event.target && event.target.closest ? event.target.closest('#direct-conversations-list .direct-conversation-item') : null;
+			if (!item) return;
+			event.preventDefault();
+			event.stopPropagation();
+			const peer = decodeURIComponent(String(item.dataset.directPeer || ''));
+			window.openDirectConversationContextMenu(peer, event.clientX, event.clientY, item);
+		});
+		document.addEventListener('pointerdown', event => {
+			const menu = document.getElementById('direct-conversation-context-menu');
+			if (!menu || !menu.classList.contains('is-open')) return;
+			if (menu.contains(event.target)) return;
+			if (event.target && event.target.closest && event.target.closest('#direct-conversations-list .direct-conversation-item')) return;
+			closeDirectConversationContextMenu();
+		}, true);
+		document.addEventListener('keydown', event => {
+			const keyboardContext = event.key === 'ContextMenu' || (event.shiftKey && event.key === 'F10');
+			if (keyboardContext) {
+				const item = document.activeElement && document.activeElement.closest ? document.activeElement.closest('#direct-conversations-list .direct-conversation-item') : null;
+				if (item) {
+					event.preventDefault();
+					const rect = item.getBoundingClientRect();
+					window.openDirectConversationContextMenu(decodeURIComponent(String(item.dataset.directPeer || '')), rect.left + Math.min(40, rect.width / 2), rect.top + Math.min(36, rect.height));
+					return;
+				}
+			}
+			if (event.key === 'Escape' && document.getElementById('direct-conversation-context-menu')?.classList.contains('is-open')) {
+				event.preventDefault();
+				closeDirectConversationContextMenu();
+			}
+		});
+		window.addEventListener('blur', () => closeDirectConversationContextMenu({ immediate:true }));
+		window.addEventListener('resize', () => closeDirectConversationContextMenu({ immediate:true }));
+		document.addEventListener('scroll', event => {
+			if (document.getElementById('direct-conversation-context-menu')?.classList.contains('is-open') && !document.getElementById('direct-conversation-context-menu')?.contains(event.target)) closeDirectConversationContextMenu({ immediate:true });
+		}, true);
+	}
+
 	function directCommitConversationState(render = true) {
 		const state = window.__directChatState;
 		if (!Array.isArray(state.conversations)) state.conversations = [];
@@ -72474,13 +72904,12 @@ function getVisibleChatStackEl(id) {
 	function directConversationSeed(peer) {
 		const state = window.__directChatState;
 		const active = state.activePeer === peer && state.peer ? state.peer : null;
-		const onlineList = Array.isArray(window.currentOnlineList) ? window.currentOnlineList : [];
-		const online = onlineList.find(item => item && String(item.name || item.user || '') === peer) || null;
+		const presence = directLivePresenceSnapshot(peer, active || { name:peer, avatar:directDefaultAvatar() });
 		return {
 			peer,
-			avatar: directResolveAvatar(peer, (active && active.avatar) || (online && online.avatar) || directDefaultAvatar()),
-			online: active ? active.online === true : !!online,
-			lastSeen: (active && active.lastSeen) || (online && online.lastSeen) || '',
+			avatar: presence.avatar || directDefaultAvatar(),
+			online: presence.online === true,
+			lastSeen: presence.lastSeen || '',
 			unread: 0,
 			myLastReadId: '0',
 			peerLastReadId: '0',
@@ -72492,6 +72921,92 @@ function getVisibleChatStackEl(id) {
 		if (!message) return '';
 		const me = directCurrentUser();
 		return String(message.from === me ? message.to : message.from || '').trim();
+	}
+
+	function directDeletedThroughId(peerName) {
+		const state = window.__directChatState;
+		if (!state.deletedThroughByPeer || typeof state.deletedThroughByPeer !== 'object') state.deletedThroughByPeer = Object.create(null);
+		return directMessageIdNumber(state.deletedThroughByPeer[String(peerName || '')] || 0);
+	}
+
+	function directMessageHiddenByLocalDelete(message) {
+		if (!message || !message.id) return false;
+		const peer = directConversationPeerFromMessage(message);
+		return !!(peer && directMessageIdNumber(message.id) <= directDeletedThroughId(peer));
+	}
+
+	function patchDirectConversationPresenceDom(peer, conversation) {
+		if (!peer || !conversation) return;
+		const encoded = encodeURIComponent(peer).replace(/'/g, '%27');
+		const item = document.querySelector(`#direct-conversations-list .direct-conversation-item[data-direct-peer="${CSS.escape(encoded)}"]`);
+		if (!item) return;
+		const avatar = item.querySelector('.direct-conversation-avatar');
+		const dot = item.querySelector('.direct-presence-dot');
+		const resolved = directResolveAvatar(peer, conversation.avatar);
+		if (avatar && resolved && avatar.getAttribute('src') !== resolved) avatar.setAttribute('src', resolved);
+		if (dot) dot.classList.toggle('online', conversation.online === true);
+	}
+
+	function updateDirectThreadPresenceStatus() {
+		const state = window.__directChatState;
+		if (!state.activePeer) return;
+		const peerInfo = directLivePresenceSnapshot(state.activePeer, state.peer || directFindConversation(state.activePeer) || { peer:state.activePeer });
+		state.peer = peerInfo;
+		const presenceEl = document.getElementById('direct-thread-presence');
+		const statusEl = document.getElementById('direct-thread-status');
+		if (presenceEl) presenceEl.classList.toggle('online', peerInfo.online === true);
+		if (statusEl) statusEl.textContent = peerInfo.online === true
+			? 'Online'
+			: (peerInfo.lastSeen && typeof formatLastSeen === 'function' ? `Last seen ${formatLastSeen(peerInfo.lastSeen)}` : 'Offline');
+	}
+
+	window.applyDirectPresenceUpdate = function(userName, data = {}) {
+		const name = String(userName || data.name || '').trim();
+		if (!name) return false;
+		const state = window.__directChatState;
+		const conversation = directFindConversation(name);
+		const isActive = state.activePeer === name;
+		if (!conversation && !isActive) return false;
+
+		const online = data.online === true;
+		const cachedLastSeen = window.__presenceLastSeenByUser && window.__presenceLastSeenByUser[name];
+		const nextLastSeen = data.lastSeen || cachedLastSeen || (online ? '' : Date.now());
+		const nextAvatar = data.avatar ? directResolveAvatar(name, data.avatar) : '';
+		let changed = false;
+
+		if (conversation) {
+			if (conversation.online !== online) { conversation.online = online; changed = true; }
+			if (nextLastSeen && conversation.lastSeen !== nextLastSeen) { conversation.lastSeen = nextLastSeen; changed = true; }
+			if (nextAvatar && conversation.avatar !== nextAvatar) { conversation.avatar = nextAvatar; changed = true; }
+			if (changed) {
+				state.conversationSignature = directConversationSignature(state.conversations);
+				patchDirectConversationPresenceDom(name, conversation);
+			}
+		}
+
+		if (isActive) {
+			const peer = state.peer || { name };
+			let headerChanged = false;
+			if (peer.online !== online) { peer.online = online; headerChanged = true; }
+			if (nextLastSeen && peer.lastSeen !== nextLastSeen) { peer.lastSeen = nextLastSeen; headerChanged = true; }
+			if (nextAvatar && peer.avatar !== nextAvatar) { peer.avatar = nextAvatar; headerChanged = true; }
+			state.peer = peer;
+			if (headerChanged) {
+				const avatarEl = document.getElementById('direct-thread-avatar');
+				if (avatarEl && peer.avatar && avatarEl.getAttribute('src') !== peer.avatar) avatarEl.setAttribute('src', peer.avatar);
+			}
+			updateDirectThreadPresenceStatus();
+		}
+		return changed || isActive;
+	};
+
+	if (!window.__directLastSeenTicker) {
+		window.__directLastSeenTicker = setInterval(() => {
+			const state = window.__directChatState;
+			if (!state.activePeer || !state.peer || state.peer.online === true || !directThreadVisible()) return;
+			updateDirectThreadPresenceStatus();
+		}, 30000);
+		if (window.__directLastSeenTicker && typeof window.__directLastSeenTicker.unref === 'function') window.__directLastSeenTicker.unref();
 	}
 
 	function directCancelEmptyConversationClose() {
@@ -72516,7 +73031,7 @@ function getVisibleChatStackEl(id) {
 			if (Number(state.emptyConversationCloseToken || 0) !== token) return;
 			state.emptyConversationCloseTimer = 0;
 			if (state.activePeer === peer && (!Array.isArray(state.messages) || !state.messages.length)) {
-				state.activePeer = ''; state.peer = null; state.messages = []; state.messageCount = 0; state.trimmedMessageIds = [];
+				state.activePeer = ''; state.peer = null; state.messages = []; state.messageCount = 0; state.trimmedMessageIds = []; state.threadLoadedPeer = '';
 				state.myLastReadId = '0'; state.peerLastReadId = '0'; state.loadingThread = false;
 				state.pendingMedia = []; state.pendingUploads = 0; state.mediaToken = Number(state.mediaToken || 0) + 1;
 				state.replyTo = null; state.editingMessageId = ''; state.inputRange = null;
@@ -72538,7 +73053,7 @@ function getVisibleChatStackEl(id) {
 	}
 
 	function directApplyConversationMessage(message, options = {}) {
-		if (!message || !message.id) return { changed:false, created:false };
+		if (!message || !message.id || directMessageHiddenByLocalDelete(message)) return { changed:false, created:false };
 		const state = window.__directChatState;
 		const me = directCurrentUser();
 		const peer = directConversationPeerFromMessage(message);
@@ -72773,40 +73288,37 @@ function getVisibleChatStackEl(id) {
 		if (typeof playUiClick === 'function') playUiClick();
 	};
 
-	function directLastSeenOwnMessageId() {
-		const state = window.__directChatState;
-		const me = directCurrentUser();
-		const peerRead = directMessageIdNumber(state.peerLastReadId);
-		let lastSeenOwnId = 0;
-		for (const msg of state.messages || []) {
-			if (msg && msg.from === me && directMessageIdNumber(msg.id) <= peerRead) lastSeenOwnId = Math.max(lastSeenOwnId, directMessageIdNumber(msg.id));
-		}
-		return lastSeenOwnId;
+
+	function directDeliveryHtml(msg) {
+		if (!msg || msg.from !== directCurrentUser()) return '';
+		const seen = directMessageIdNumber(msg.id) > 0 && directMessageIdNumber(msg.id) <= directMessageIdNumber(window.__directChatState.peerLastReadId);
+		return `<span class="direct-message-delivery${seen ? ' is-seen' : ''}" title="${seen ? 'Seen' : 'Sent'}" aria-label="${seen ? 'Seen' : 'Sent'}"><i class="fas ${seen ? 'fa-check-double' : 'fa-check'}"></i></span>`;
 	}
 
 	function updateDirectSeenMarker() {
+		const state = window.__directChatState;
+		if (/\bis:(?:seen|unseen)\b/i.test(String(state.searchQuery || ''))) { renderDirectThread({ searchUpdate:true }); return; }
 		const list = document.getElementById('direct-message-list');
 		if (!list) return;
-		list.querySelectorAll('.direct-message-seen').forEach(marker => marker.remove());
-		const seenId = directLastSeenOwnMessageId();
-		if (!seenId) return;
-		const row = list.querySelector(`[data-direct-message-id="${CSS.escape(String(seenId))}"]`);
-		const actions = row && row.querySelector('.direct-message-actions');
-		if (!actions) return;
-		const marker = document.createElement('span');
-		marker.className = 'direct-message-seen';
-		marker.textContent = 'Seen';
-		const firstButton = actions.querySelector('button');
-		if (firstButton) actions.insertBefore(marker, firstButton);
-		else actions.appendChild(marker);
+		const peerRead = directMessageIdNumber(state.peerLastReadId);
+		list.querySelectorAll('.direct-message-row[data-direct-own="1"]').forEach(row => {
+			const id = directMessageIdNumber(row.dataset.directMessageId);
+			const delivery = row.querySelector('.direct-message-delivery');
+			if (!delivery) return;
+			const seen = id > 0 && id <= peerRead;
+			delivery.classList.toggle('is-seen', seen);
+			delivery.title = seen ? 'Seen' : 'Sent';
+			delivery.setAttribute('aria-label', seen ? 'Seen' : 'Sent');
+			const icon = delivery.querySelector('i');
+			if (icon) icon.className = `fas ${seen ? 'fa-check-double' : 'fa-check'}`;
+		});
 	}
 
-	function directMessageRowHtml(msg, lastSeenOwnId = directLastSeenOwnMessageId()) {
+	function directMessageRowHtml(msg) {
 		if (!msg || !msg.id) return '';
 		const me = directCurrentUser();
 		const own = msg.from === me;
 		const id = directMessageIdNumber(msg.id);
-		const seen = own && id === lastSeenOwnId;
 		const media = (Array.isArray(msg.content) ? msg.content : []).filter(url => /^https?:\/\//i.test(String(url || ''))).slice(0, 10);
 		const mediaHtml = media.length ? `<div class="direct-message-media${media.length === 1 ? ' single' : ''}">${media.map((url, index) => `<button type="button" class="direct-message-media-item" data-direct-media-index="${index}" aria-label="Open attached image"><img src="${directEscapeHtml(url)}" alt="" loading="lazy"></button>`).join('')}</div>` : '';
 		const textHtml = msg.text ? `<div class="direct-message-text" data-no-translate="true" translate="no">${directLinkifyMessageHtml(msg.text)}</div>` : '';
@@ -72817,7 +73329,7 @@ function getVisibleChatStackEl(id) {
 		const ytId = previewUrl && typeof getYoutubeId === 'function' ? getYoutubeId(previewUrl) : null;
 		const previewHtml = ytId ? `<div class="yt-video-card direct-message-youtube" onclick="playTrailerDirect('${directEscapeHtml(ytId)}')"><img src="https://img.youtube.com/vi/${directEscapeHtml(ytId)}/mqdefault.jpg" class="yt-thumb" loading="lazy" decoding="async"><div class="yt-play-overlay"><i class="fas fa-play"></i></div><div class="yt-card-info"><span>Watch Video</span><i class="fab fa-youtube"></i></div></div>` : (previewUrl ? `<div id="direct-lp-${directEscapeHtml(msg.id)}" class="direct-link-preview-host"></div>` : '');
 		const reactionsHtml = directReactionHtml(msg);
-		return `<div class="direct-message-row${own ? ' own' : ''}" data-direct-message-id="${directEscapeHtml(msg.id)}"><div><div class="direct-message-bubble">${replyHtml}${textHtml}${mediaHtml}${previewHtml}</div>${reactionsHtml ? `<div class="direct-message-reactions">${reactionsHtml}</div>` : ''}<div class="direct-message-actions"><span>${directEscapeHtml(directFormatTime(msg.createdAt))}</span>${msg.editedAt ? '<span class="direct-message-edited">Edited</span>' : ''}${seen ? '<span class="direct-message-seen">Seen</span>' : ''}<button type="button" class="direct-message-action reply" onclick="event.stopPropagation(); window.setDirectReply('${directEscapeHtml(msg.id)}')" onmouseenter="if(typeof playUiArrow==='function') playUiArrow()" title="Reply" aria-label="Reply"><i class="fas fa-reply"></i></button><button type="button" class="direct-message-action react" onclick="window.openDirectReactionPicker(event, '${directEscapeHtml(msg.id)}')" onmouseenter="if(typeof playUiArrow==='function') playUiArrow()" title="React" aria-label="React"><i class="fas fa-smile"></i></button>${own ? `<button type="button" class="direct-message-action edit" onclick="event.stopPropagation(); window.startDirectEdit('${directEscapeHtml(msg.id)}')" onmouseenter="if(typeof playUiArrow==='function') playUiArrow()" title="Edit" aria-label="Edit"><i class="fas fa-edit"></i></button><button type="button" class="direct-message-action delete" onclick="event.stopPropagation(); window.deleteDirectMessage('${directEscapeHtml(msg.id)}')" onmouseenter="if(typeof playUiArrow==='function') playUiArrow()" title="Delete" aria-label="Delete"><i class="fas fa-trash-alt"></i></button>` : ''}</div></div></div>`;
+		return `<div class="direct-message-row${own ? ' own' : ''}" data-direct-message-id="${directEscapeHtml(msg.id)}" data-direct-own="${own ? '1' : '0'}"><div><div class="direct-message-bubble">${replyHtml}${textHtml}${mediaHtml}${previewHtml}</div>${reactionsHtml ? `<div class="direct-message-reactions">${reactionsHtml}</div>` : ''}<div class="direct-message-actions"><span>${directEscapeHtml(directFormatTime(msg.createdAt))}</span>${msg.editedAt ? '<span class="direct-message-edited">Edited</span>' : ''}${directDeliveryHtml(msg)}<button type="button" class="direct-message-action reply" onclick="event.stopPropagation(); window.setDirectReply('${directEscapeHtml(msg.id)}')" onmouseenter="if(typeof playUiArrow==='function') playUiArrow()" title="Reply" aria-label="Reply"><i class="fas fa-reply"></i></button><button type="button" class="direct-message-action react" onclick="window.openDirectReactionPicker(event, '${directEscapeHtml(msg.id)}')" onmouseenter="if(typeof playUiArrow==='function') playUiArrow()" title="React" aria-label="React"><i class="fas fa-smile"></i></button>${own ? `<button type="button" class="direct-message-action edit" onclick="event.stopPropagation(); window.startDirectEdit('${directEscapeHtml(msg.id)}')" onmouseenter="if(typeof playUiArrow==='function') playUiArrow()" title="Edit" aria-label="Edit"><i class="fas fa-edit"></i></button><button type="button" class="direct-message-action delete" onclick="event.stopPropagation(); window.deleteDirectMessage('${directEscapeHtml(msg.id)}')" onmouseenter="if(typeof playUiArrow==='function') playUiArrow()" title="Delete" aria-label="Delete"><i class="fas fa-trash-alt"></i></button>` : ''}</div></div></div>`;
 	}
 
 	function applyDirectMessageUpdate(message) {
@@ -72827,6 +73339,7 @@ function getVisibleChatStackEl(id) {
 		if(index<0) return false;
 		if (directMessageStateSignature(state.messages[index]) === directMessageStateSignature(message)) return false;
 		state.messages[index]=message;
+		if (String(state.searchQuery || '').trim()) { renderDirectThread({ preserveScroll:true, searchUpdate:true }); return true; }
 		const list = document.getElementById('direct-message-list');
 		const row = list ? list.querySelector(`[data-direct-message-id="${CSS.escape(String(message.id))}"]`) : null;
 		if (!row || !list) { renderDirectThread({ preserveScroll:true }); return true; }
@@ -72865,7 +73378,8 @@ function getVisibleChatStackEl(id) {
 	function updateDirectThreadHeader() {
 		const state = window.__directChatState;
 		if (!state.activePeer) return;
-		const peerInfo = state.peer || directFindConversation(state.activePeer) || { peer:state.activePeer };
+		const peerInfo = directLivePresenceSnapshot(state.activePeer, state.peer || directFindConversation(state.activePeer) || { peer:state.activePeer });
+		state.peer = peerInfo;
 		const peerName = String(peerInfo.name || peerInfo.peer || state.activePeer);
 		const avatar = directResolveAvatar(peerName, peerInfo.avatar);
 		const nameEl = document.getElementById('direct-thread-name');
@@ -72883,6 +73397,10 @@ function getVisibleChatStackEl(id) {
 		if (avatarWrap) avatarWrap.onclick = openProfile;
 		const input = document.getElementById('direct-chat-input');
 		if (input) input.dataset.placeholder = `Message ${peerName}`;
+		if (isDirectMessagesSubviewVisible()) {
+			const searchInput = document.getElementById('search-input');
+			if (searchInput) searchInput.placeholder = `Search messages with ${peerName}`;
+		}
 		updateDirectThreadMessageCount(state.messageCount);
 		renderDirectComposerContext();
 	}
@@ -72895,6 +73413,7 @@ function getVisibleChatStackEl(id) {
 		if (!empty || !active) return;
 		if (!state.activePeer) {
 			empty.style.display = 'flex'; active.style.display = 'none'; shell?.classList.remove('thread-open');
+			if (isDirectMessagesSubviewVisible()) { const searchInput = document.getElementById('search-input'); if (searchInput) searchInput.placeholder = 'Search conversations'; }
 			updateDirectThreadMessageCount(0);
 			return;
 		}
@@ -72910,17 +73429,24 @@ function getVisibleChatStackEl(id) {
 			list.innerHTML = '<div class="direct-loading">Loading messages...</div>';
 			return;
 		}
-		const messages = Array.isArray(state.messages) ? state.messages : [];
-		const lastSeenOwnId = directLastSeenOwnMessageId();
-		if (!messages.length) {
+		const allMessages = Array.isArray(state.messages) ? state.messages : [];
+		const messages = directGetVisibleMessages();
+		if (!allMessages.length) {
 			list.innerHTML = '<div class="direct-thread-empty" style="min-height:100%;"><i class="fas fa-paper-plane"></i><div>No messages yet. Say hi.</div></div>';
 			return;
 		}
-		list.innerHTML = messages.map(msg => directMessageRowHtml(msg, lastSeenOwnId)).join('');
+		if (String(state.searchQuery || '').trim() && !messages.length) {
+			list.innerHTML = '<div class="direct-thread-empty" style="min-height:100%;"><i class="fas fa-search"></i><div>No messages found.</div><small>No messages match your search or filters.</small><button type="button" class="action-btn" style="margin-top:8px;" onclick="if(typeof playUiBack===\'function\') playUiBack(); window.clearGlobalSearch();"><i class="fas fa-times"></i> CLEAR SEARCH</button></div>';
+			if (document.getElementById('chat-search-dropdown')?.style.display === 'flex') renderDirectSearchFilters();
+			return;
+		}
+		list.innerHTML = messages.map(msg => directMessageRowHtml(msg)).join('');
 		state.trimmedMessageIds = [];
 		hydrateDirectLinkPreviews(messages);
+		if (document.getElementById('chat-search-dropdown')?.style.display === 'flex') renderDirectSearchFilters();
 		requestAnimationFrame(() => {
 			if (!list) return;
+			if (options.searchUpdate === true) { list.scrollTop = 0; return; }
 			if (options.forceBottom === true || (!options.preserveScroll && wasNearBottom)) {
 				list.scrollTop = list.scrollHeight;
 				return;
@@ -72934,6 +73460,7 @@ function getVisibleChatStackEl(id) {
 
 	function appendDirectMessageRow(message, options = {}) {
 		const state = window.__directChatState;
+		if (String(state.searchQuery || '').trim()) return false;
 		const list = document.getElementById('direct-message-list');
 		if (!list || !message || !message.id || state.loadingThread || !state.activePeer) return false;
 		const messages = Array.isArray(state.messages) ? state.messages : [];
@@ -72943,7 +73470,7 @@ function getVisibleChatStackEl(id) {
 		const keepBottom = options.forceBottom === true || directThreadNearBottom();
 		const previousScrollTop = list.scrollTop;
 		const holder = document.createElement('div');
-		holder.innerHTML = directMessageRowHtml(message, directLastSeenOwnMessageId());
+		holder.innerHTML = directMessageRowHtml(message);
 		const row = holder.firstElementChild;
 		if (!row) return false;
 		list.appendChild(row);
@@ -72966,6 +73493,7 @@ function getVisibleChatStackEl(id) {
 	}
 
 	function removeDirectMessageRow(messageId) {
+		if (String(window.__directChatState.searchQuery || '').trim()) return false;
 		const list = document.getElementById('direct-message-list');
 		if (!list) return false;
 		const row = list.querySelector(`[data-direct-message-id="${CSS.escape(String(messageId || ''))}"]`);
@@ -72991,7 +73519,7 @@ function getVisibleChatStackEl(id) {
 	}
 
 	function mergeDirectMessage(message) {
-		if (!message || !message.id) return false;
+		if (!message || !message.id || directMessageHiddenByLocalDelete(message)) return false;
 		const state = window.__directChatState;
 		if (state.messages.some(item => String(item.id) === String(message.id))) return false;
 		state.messages.push(message);
@@ -73013,7 +73541,8 @@ function getVisibleChatStackEl(id) {
 		if (state.owner === owner) return;
 		state.owner = owner;
 		state.sessionToken = Number(state.sessionToken || 0) + 1;
-		state.conversations = []; state.activePeer = ''; state.messages = []; state.peer = null; state.messageCount = 0; state.trimmedMessageIds = [];
+		state.conversations = []; state.activePeer = ''; state.messages = []; state.peer = null; state.messageCount = 0; state.trimmedMessageIds = []; state.threadLoadedPeer = ''; state.deletedThroughByPeer = Object.create(null);
+		state.searchQuery = ''; state.searchResultCount = 0;
 		state.myLastReadId = '0'; state.peerLastReadId = '0'; state.loadingThread = false; state.pendingMedia = []; state.pendingUploads = 0; state.mediaToken = Number(state.mediaToken || 0) + 1; state.replyTo = null; state.editingMessageId = '';
 		clearTimeout(state.emptyConversationCloseTimer); state.emptyConversationCloseTimer = 0; state.emptyConversationCloseToken = Number(state.emptyConversationCloseToken || 0) + 1;
 		clearTimeout(state.conversationRefreshTimer); state.conversationRefreshTimer = 0;
@@ -73101,12 +73630,21 @@ function getVisibleChatStackEl(id) {
 		const state = window.__directChatState;
 		if (state.emptyConversationCloseTimer) directCancelEmptyConversationClose();
 		const samePeer = state.activePeer === peer;
+		if (!samePeer && String(state.searchQuery || '').trim() && typeof window.clearDirectMessageSearch === 'function') {
+			window.clearDirectMessageSearch({ render:false, clearInput:true });
+		}
+		const alreadyLoaded = samePeer && state.threadLoadedPeer === peer && options.reconnect !== true && options.forceReload !== true;
+		if (alreadyLoaded) {
+			updateDirectThreadHeader();
+			if (typeof window.markActiveDirectConversationRead === 'function') window.markActiveDirectConversationRead();
+			return true;
+		}
 		const backgroundReconcile = options.reconnect === true && samePeer && Array.isArray(state.messages) && state.messages.length > 0;
-		if (state.activePeer && state.activePeer !== peer) { state.pendingMedia = []; state.pendingUploads = 0; state.mediaToken = Number(state.mediaToken || 0) + 1; state.replyTo = null; state.editingMessageId = ''; state.inputRange = null; renderDirectPendingMedia(); closeDirectPickers(); renderDirectComposerContext(); }
+		if (state.activePeer && state.activePeer !== peer) { state.pendingMedia = []; state.pendingUploads = 0; state.mediaToken = Number(state.mediaToken || 0) + 1; state.replyTo = null; state.editingMessageId = ''; state.inputRange = null; state.threadLoadedPeer = ''; renderDirectPendingMedia(); closeDirectPickers(); renderDirectComposerContext(); }
 		state.activePeer = peer; state.loadingThread = !backgroundReconcile;
-		if (!backgroundReconcile) { state.messages = []; state.messageCount = 0; state.peerLastReadId = '0'; updateDirectThreadMessageCount(0); }
+		if (!backgroundReconcile) { state.messages = []; state.messageCount = 0; state.peerLastReadId = '0'; state.threadLoadedPeer = ''; updateDirectThreadMessageCount(0); }
 		const existing = directFindConversation(peer);
-		state.peer = existing ? { ...(state.peer || {}), name:peer, avatar:existing.avatar, online:existing.online, lastSeen:existing.lastSeen } : (state.peer && samePeer ? state.peer : { name:peer, avatar:directResolveAvatar(peer), online:false, lastSeen:'' });
+		state.peer = directLivePresenceSnapshot(peer, existing ? { ...(state.peer || {}), name:peer, avatar:existing.avatar, online:existing.online, lastSeen:existing.lastSeen } : (state.peer && samePeer ? state.peer : { name:peer, avatar:directResolveAvatar(peer), online:false, lastSeen:'' }));
 		renderDirectConversations();
 		if (backgroundReconcile) updateDirectThreadHeader(); else renderDirectThread();
 		if (!socketChat || !socketChat.connected) return false;
@@ -73126,12 +73664,14 @@ function getVisibleChatStackEl(id) {
 			state.loadingThread = false;
 			if (!payload || payload.success === false) {
 				state.messages = [];
+				state.threadLoadedPeer = '';
 				if (typeof showToastNotification === 'function') showToastNotification('Private Messages', (payload && payload.message) || 'Could not load messages.');
 				renderDirectThread();
 				return;
 			}
-			state.peer = payload.peer || state.peer;
+			state.peer = directLivePresenceSnapshot(peer, payload.peer || state.peer || { name:peer });
 			state.messages = Array.isArray(payload.messages) ? payload.messages : [];
+			state.threadLoadedPeer = peer;
 			state.messageCount = Math.max(state.messages.length, Math.max(0, Number(payload.messageCount) || 0));
 			state.myLastReadId = String(payload.myLastReadId || '0');
 			state.peerLastReadId = String(payload.peerLastReadId || '0');
@@ -73386,7 +73926,7 @@ function getVisibleChatStackEl(id) {
 		if (!socket || socket.__directMessageListenersInstalled) return;
 		socket.__directMessageListenersInstalled = true;
 		socket.on('direct_message', message => {
-			if (!message || !message.id) return;
+			if (!message || !message.id || directMessageHiddenByLocalDelete(message)) return;
 			const me = directCurrentUser();
 			const peer = message.from === me ? message.to : message.from;
 			const state = window.__directChatState;
@@ -73428,6 +73968,10 @@ function getVisibleChatStackEl(id) {
 			if (String(state.editingMessageId||'')===String(payload.id) || (state.replyTo && String(state.replyTo.id||'')===String(payload.id))) window.cancelDirectComposeMode({silent:true,clearInput:String(state.editingMessageId||'')===String(payload.id)});
 			if (state.messages.length!==before && !removeDirectMessageRow(payload.id)) renderDirectThread({ preserveScroll:true });
 			if (!directApplyConversationDelete(payload)) window.refreshDirectConversations({ preserveThread:true });
+		});
+		socket.on('direct_conversation_deleted', payload => {
+			if (!payload || !payload.peer || String(payload.user || '') !== directCurrentUser()) return;
+			directApplyConversationDeletion(payload, { animate:true });
 		});
 		socket.on('direct_message_read', payload => {
 			if (!payload || !payload.reader || !payload.peer) return;
@@ -74739,6 +75283,16 @@ function getVisibleChatStackEl(id) {
 			window.currentOnlineList = users;
 			window.__currentOnlineUserByName = onlineUserByName;
 			window.__currentOnlineActiveNames = activeOnlineNames;
+			if (onlineSnapshotChanged && typeof window.applyDirectPresenceUpdate === 'function') {
+				changedPresenceNames.forEach(userName => {
+					const live = onlineUserByName.get(userName) || null;
+					window.applyDirectPresenceUpdate(userName, live || {
+						name:userName,
+						online:false,
+						lastSeen:(window.__presenceLastSeenByUser && window.__presenceLastSeenByUser[userName]) || Date.now()
+					});
+				});
+			}
 			if (window.__psnNamedPoolLookupCache) delete window.__psnNamedPoolLookupCache.online;
 			if (onlineSnapshotChanged && typeof invalidateChatMentionNameCaches === 'function') invalidateChatMentionNameCaches();
 			if (onlineSnapshotChanged) {
@@ -76393,6 +76947,7 @@ function getVisibleChatStackEl(id) {
 				window.__currentOnlineActiveNames = window.__currentOnlineActiveNames instanceof Set ? window.__currentOnlineActiveNames : new Set();
 				if (online) window.__currentOnlineActiveNames.add(name);
 				else window.__currentOnlineActiveNames.delete(name);
+				if (typeof window.applyDirectPresenceUpdate === 'function') window.applyDirectPresenceUpdate(name, { ...data, online, lastSeen });
 				if (wasOnline !== online && typeof invalidateChatMentionNameCaches === 'function') invalidateChatMentionNameCaches();
 
 				const searchUser = typeof window.getPsnNamedPoolUser === 'function' ? window.getPsnNamedPoolUser('search', window.globalSearchResults, name) : null;
@@ -80570,9 +81125,13 @@ function getVisibleChatStackEl(id) {
 		playUiTextField();
 		const chatView = document.getElementById('view-chat');
 		const subviewChat = document.getElementById('subview-chat');
-	
-		if (chatView.style.display === 'block' && subviewChat.style.display === 'flex') {
-			document.getElementById('chat-search-dropdown').style.display = 'flex';
+		const directVisible = typeof isDirectMessagesSubviewVisible === 'function' && isDirectMessagesSubviewVisible();
+		const chatVisible = !!(chatView && (chatView.style.display === 'block' || chatView.style.display === 'flex') && subviewChat && (subviewChat.style.display === 'flex' || subviewChat.style.display === 'block'));
+		if (directVisible && typeof renderDirectSearchFilters === 'function') renderDirectSearchFilters();
+		else if (chatVisible && typeof renderDefaultSearchFilters === 'function') renderDefaultSearchFilters();
+		if (directVisible || chatVisible) {
+			const dropdown = document.getElementById('chat-search-dropdown');
+			if (dropdown) dropdown.style.display = 'flex';
 		}
 		restoreChatSearchScrollSnapshot(snapshot);
 	}
@@ -80580,7 +81139,8 @@ function getVisibleChatStackEl(id) {
 	function hideChatSearchMenu(force = false) {
 		const chatView = document.getElementById('view-chat');
 		const chatSubview = document.getElementById('subview-chat');
-		const isChatSearchActive = !!(
+		const directVisible = typeof isDirectMessagesSubviewVisible === 'function' && isDirectMessagesSubviewVisible();
+		const isChatSearchActive = directVisible || !!(
 			chatView &&
 			(chatView.style.display === 'block' || chatView.style.display === 'flex') &&
 			chatSubview &&
@@ -80608,6 +81168,9 @@ function getVisibleChatStackEl(id) {
 	}
 	
 	function insertSearchFilter(filter, event) {
+		if (typeof isDirectMessagesSubviewVisible === 'function' && isDirectMessagesSubviewVisible() && typeof window.insertDirectSearchFilter === 'function') {
+			return window.insertDirectSearchFilter(filter, event);
+		}
 		if (event) event.preventDefault(); 
 		
 		const input = document.getElementById('search-input');
@@ -80744,6 +81307,10 @@ function getVisibleChatStackEl(id) {
 	}
 	
 	function renderDefaultSearchFilters() {
+		if (typeof isDirectMessagesSubviewVisible === 'function' && isDirectMessagesSubviewVisible() && typeof renderDirectSearchFilters === 'function') {
+			renderDirectSearchFilters();
+			return;
+		}
 		const dropdown = document.getElementById('chat-search-dropdown');
 		if (!dropdown) return;
 		
