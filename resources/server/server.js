@@ -40,6 +40,8 @@ const CHAT_POLL_VOTERS_MAX = 5000;
 
 // Private user-to-user messages stay independent from Global Chat history.
 const DIRECT_MESSAGE_TEXT_MAX = Math.max(256, Math.min(16000, parseInt(process.env.DIRECT_MESSAGE_TEXT_MAX || "4000", 10) || 4000));
+const DIRECT_MESSAGE_MEDIA_MAX = Math.max(1, Math.min(20, parseInt(process.env.DIRECT_MESSAGE_MEDIA_MAX || "10", 10) || 10));
+const DIRECT_MESSAGE_URL_MAX = 4096;
 const DIRECT_MESSAGE_HISTORY_MAX = Math.max(50, Math.min(500, parseInt(process.env.DIRECT_MESSAGE_HISTORY_MAX || "200", 10) || 200));
 const DIRECT_MESSAGE_RETENTION_MAX = Math.max(DIRECT_MESSAGE_HISTORY_MAX, Math.min(2000, parseInt(process.env.DIRECT_MESSAGE_RETENTION_MAX || "500", 10) || 500));
 const DIRECT_CONVERSATION_LIST_MAX = Math.max(20, Math.min(200, parseInt(process.env.DIRECT_CONVERSATION_LIST_MAX || "100", 10) || 100));
@@ -2389,9 +2391,13 @@ async function initDb() {
       sender_name TEXT NOT NULL REFERENCES users(name) ON DELETE CASCADE,
       recipient_name TEXT NOT NULL REFERENCES users(name) ON DELETE CASCADE,
       text TEXT NOT NULL,
+      message_type TEXT NOT NULL DEFAULT 'text',
+      content JSONB,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       CHECK (sender_name <> recipient_name)
     );
+    ALTER TABLE direct_messages ADD COLUMN IF NOT EXISTS message_type TEXT NOT NULL DEFAULT 'text';
+    ALTER TABLE direct_messages ADD COLUMN IF NOT EXISTS content JSONB;
     CREATE INDEX IF NOT EXISTS idx_direct_messages_sender_recipient_id ON direct_messages(sender_name, recipient_name, id DESC);
     CREATE INDEX IF NOT EXISTS idx_direct_messages_recipient_sender_id ON direct_messages(recipient_name, sender_name, id DESC);
     CREATE TABLE IF NOT EXISTS direct_message_read_state (
@@ -8308,13 +8314,30 @@ function normalizeDirectMessageText(value) {
   return text.slice(0, DIRECT_MESSAGE_TEXT_MAX);
 }
 
+function normalizeDirectMessageMedia(value) {
+  return (Array.isArray(value) ? value : [])
+    .slice(0, DIRECT_MESSAGE_MEDIA_MAX)
+    .map(item => normalizeText(item, '').slice(0, DIRECT_MESSAGE_URL_MAX))
+    .filter(item => /^https?:\/\//i.test(item));
+}
+
+function normalizeDirectMessageType(value, media = []) {
+  const type = normalizeText(value, 'text').toLowerCase();
+  if (!media.length) return 'text';
+  return type === 'gif' ? 'gif' : 'image';
+}
+
 function serializeDirectMessage(row) {
   if (!row) return null;
+  const content = normalizeDirectMessageMedia(row.content);
+  const type = normalizeDirectMessageType(row.message_type || row.type, content);
   return {
     id: String(row.id || ''),
     from: normalizeDirectMessageUser(row.sender_name || row.from),
     to: normalizeDirectMessageUser(row.recipient_name || row.to),
     text: String(row.text == null ? '' : row.text).slice(0, DIRECT_MESSAGE_TEXT_MAX),
+    type,
+    content: content.length ? content : null,
     createdAt: row.created_at ? new Date(row.created_at).toISOString() : (row.createdAt || new Date().toISOString())
   };
 }
@@ -8366,13 +8389,13 @@ async function getDirectConversationPayload(userName) {
 
   const result = await queryDbWithRetry(`
     WITH relevant AS (
-      SELECT dm.id, dm.sender_name, dm.recipient_name, dm.text, dm.created_at,
+      SELECT dm.id, dm.sender_name, dm.recipient_name, dm.text, dm.message_type, dm.content, dm.created_at,
              CASE WHEN dm.sender_name = $1 THEN dm.recipient_name ELSE dm.sender_name END AS peer_name
       FROM direct_messages dm
       WHERE dm.sender_name = $1 OR dm.recipient_name = $1
     ), latest AS (
       SELECT DISTINCT ON (peer_name)
-             peer_name, id, sender_name, recipient_name, text, created_at
+             peer_name, id, sender_name, recipient_name, text, message_type, content, created_at
       FROM relevant
       ORDER BY peer_name, id DESC
     ), unread AS (
@@ -8384,7 +8407,7 @@ async function getDirectConversationPayload(userName) {
         AND dm.id > COALESCE(rs.last_read_id, 0)
       GROUP BY dm.sender_name
     )
-    SELECT l.peer_name, l.id, l.sender_name, l.recipient_name, l.text, l.created_at,
+    SELECT l.peer_name, l.id, l.sender_name, l.recipient_name, l.text, l.message_type, l.content, l.created_at,
            COALESCE(u.unread_count, 0)::int AS unread_count,
            COALESCE(my_read.last_read_id, 0) AS my_last_read_id,
            COALESCE(peer_read.last_read_id, 0) AS peer_last_read_id,
@@ -8481,7 +8504,7 @@ async function getDirectHistoryPayload(userName, peerName, options = {}) {
   if (!peerSummary) return { success:false, message:'User not found.' };
 
   const result = await queryDbWithRetry(`
-    SELECT id, sender_name, recipient_name, text, created_at
+    SELECT id, sender_name, recipient_name, text, message_type, content, created_at
     FROM direct_messages
     WHERE (sender_name = $1 AND recipient_name = $2)
        OR (sender_name = $2 AND recipient_name = $1)
@@ -8963,7 +8986,7 @@ async function initProfileSyncNotifications() {
           if (!messageId || !from || !to) return;
           if (!getSocketsByUserName(from).length && !getSocketsByUserName(to).length) return;
           const directResult = await queryDbWithRetry(
-            'SELECT id, sender_name, recipient_name, text, created_at FROM direct_messages WHERE id = $1 LIMIT 1',
+            'SELECT id, sender_name, recipient_name, text, message_type, content, created_at FROM direct_messages WHERE id = $1 LIMIT 1',
             [messageId],
             { attempts:2, label:'DIRECT MESSAGE SYNC READ' }
           );
@@ -9923,7 +9946,7 @@ async function getFriendActivityHistoryForUser(userName, afterId = 0, resolvedFr
 // ============================================================================
 // User notifications & chat notification routing
 // ============================================================================
-const USER_NOTIFICATION_TYPES = new Set(['mention', 'reply', 'reaction', 'trophy', 'catalog', 'game_match', 'play_together']);
+const USER_NOTIFICATION_TYPES = new Set(['mention', 'reply', 'reaction', 'trophy', 'catalog', 'game_match', 'play_together', 'private_message']);
 
 function normalizeUserNotificationData(type, rawData = {}) {
   const source = rawData && typeof rawData === 'object' && !Array.isArray(rawData) ? rawData : {};
@@ -9958,6 +9981,15 @@ function normalizeUserNotificationData(type, rawData = {}) {
       actor: normalizeSocialUserName(source.actor),
       titleId: normalizeText(source.titleId, '').toUpperCase().slice(0, 32),
       title: normalizeText(source.title, source.titleId || 'a game').slice(0, 180)
+    };
+  }
+  if (type === 'private_message') {
+    const messageType = normalizeText(source.messageType, 'text').toLowerCase();
+    return {
+      actor: normalizeSocialUserName(source.actor),
+      messageId: normalizeText(source.messageId, '').slice(0, 100),
+      text: normalizeText(source.text, '').slice(0, 280),
+      messageType: ['text', 'image', 'gif'].includes(messageType) ? messageType : 'text'
     };
   }
   if (type === 'game_match') {
@@ -13237,11 +13269,13 @@ io.on('connection', (socket) => {
     const sender = normalizeDirectMessageUser(socket.userName);
     const recipient = normalizeDirectMessageUser(data.to || data.recipient || data.user);
     const text = normalizeDirectMessageText(data.text);
+    const content = normalizeDirectMessageMedia(data.content);
+    const messageType = normalizeDirectMessageType(data.type, content);
 
     if (socket.__passwordResetRevoked === true) return respond({ success:false, reason:'password_reset', message:'Your session has ended.' });
     if (!sender) return respond({ success:false, message:'Authentication required.' });
     if (!recipient || recipient === sender) return respond({ success:false, message:'Invalid recipient.' });
-    if (!text) return respond({ success:false, message:'Type a message first.' });
+    if (!text && !content.length) return respond({ success:false, message:'Type a message or attach media first.' });
 
     const directNow = Date.now();
     const directLastAt = Math.max(0, Number(socket.__directMessageLastAt) || 0);
@@ -13268,16 +13302,22 @@ io.on('connection', (socket) => {
       if (!recipientResult.rows.length) return respond({ success:false, message:'User not found.' });
 
       const inserted = await queryDbWithRetry(`
-        INSERT INTO direct_messages (sender_name, recipient_name, text)
-        VALUES ($1, $2, $3)
-        RETURNING id, sender_name, recipient_name, text, created_at
-      `, [sender, recipient, text], { attempts:2, label:'DIRECT MESSAGE INSERT' });
+        INSERT INTO direct_messages (sender_name, recipient_name, text, message_type, content)
+        VALUES ($1, $2, $3, $4, $5::jsonb)
+        RETURNING id, sender_name, recipient_name, text, message_type, content, created_at
+      `, [sender, recipient, text, messageType, content.length ? JSON.stringify(content) : null], { attempts:2, label:'DIRECT MESSAGE INSERT' });
       const message = serializeDirectMessage(inserted.rows[0]);
       if (!message) return respond({ success:false, message:'Could not save the message.' });
 
       emitDirectMessageToLocalUsers(message);
       deferServerTask('DIRECT MESSAGE NOTIFY', () => notifyDirectMessageAcrossInstances('message', message), 0);
       deferServerTask('DIRECT MESSAGE RETENTION', () => trimDirectConversation(sender, recipient), 0);
+      deferServerTask('DIRECT MESSAGE USER NOTIFICATION', () => recordUserNotification(recipient, 'private_message', {
+        actor: sender,
+        messageId: message.id,
+        text: message.text,
+        messageType: message.type
+      }, { dedupeKey:`${recipient.toLowerCase()}:private_message:${message.id}`, at:Date.parse(message.createdAt) || Date.now() }), 0);
       respond({ success:true, message });
     } catch (err) {
       console.error('[DIRECT MESSAGE ERROR]:', err && err.message ? err.message : err);
