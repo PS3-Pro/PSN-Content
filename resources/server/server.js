@@ -47,6 +47,7 @@ const DIRECT_MESSAGE_RETENTION_MAX = Math.max(DIRECT_MESSAGE_HISTORY_MAX, Math.m
 const DIRECT_MESSAGE_REACTION_MAX = 24;
 const DIRECT_MESSAGE_REPLY_TEXT_MAX = 600;
 const DIRECT_CONVERSATION_LIST_MAX = Math.max(20, Math.min(200, parseInt(process.env.DIRECT_CONVERSATION_LIST_MAX || "100", 10) || 100));
+const DIRECT_MESSAGE_SEARCH_MAX = Math.max(20, Math.min(200, parseInt(process.env.DIRECT_MESSAGE_SEARCH_MAX || "100", 10) || 100));
 const DIRECT_MESSAGE_ALLOWED_REACTIONS = new Set(['👍', '❤️', '😂', '😮', '😢', '🔥']);
 const DIRECT_MESSAGE_RETENTION_THROTTLE_MS = Math.max(5000, Math.min(5 * 60 * 1000, parseInt(process.env.DIRECT_MESSAGE_RETENTION_THROTTLE_MS || "30000", 10) || 30000));
 const DIRECT_MESSAGE_RETENTION_TRACK_MAX = 2048;
@@ -13459,6 +13460,65 @@ io.on('connection', (socket) => {
     } catch (err) {
       console.error('[DIRECT CONVERSATIONS ERROR]:', err && err.message ? err.message : err);
       respond({ success:false, conversations:[], unreadTotal:0, message:'Could not load conversations.' });
+    }
+  });
+
+  socket.on('search_direct_messages', async (data = {}, callback) => {
+    const respond = typeof callback === 'function' ? callback : payload => socket.emit('direct_message_search_results', payload);
+    const viewer = normalizeDirectMessageUser(socket.userName);
+    const query = String(data.query || data.q || '').replace(/\s+/g, ' ').trim().slice(0, 200);
+    if (!viewer) return respond({ success:false, query, results:[], message:'Authentication required.' });
+    if (query.length < 2) return respond({ success:true, query, results:[] });
+    try {
+      const pattern = `%${query}%`;
+      const result = await queryDbWithRetry(`
+        WITH delete_state AS (
+          SELECT peer_name, deleted_through_id
+          FROM direct_conversation_delete_state
+          WHERE user_name = $1
+        ), visible AS (
+          SELECT dm.id, dm.sender_name, dm.recipient_name, dm.text, dm.message_type, dm.content, dm.reply_to, dm.reactions, dm.edited_at, dm.created_at,
+                 CASE WHEN dm.sender_name = $1 THEN dm.recipient_name ELSE dm.sender_name END AS peer_name,
+                 ROW_NUMBER() OVER (
+                   PARTITION BY CASE WHEN dm.sender_name = $1 THEN dm.recipient_name ELSE dm.sender_name END
+                   ORDER BY dm.id DESC
+                 ) AS peer_rank
+          FROM direct_messages dm
+          LEFT JOIN delete_state ds
+            ON ds.peer_name = CASE WHEN dm.sender_name = $1 THEN dm.recipient_name ELSE dm.sender_name END
+          WHERE (dm.sender_name = $1 OR dm.recipient_name = $1)
+            AND dm.id > COALESCE(ds.deleted_through_id, 0)
+        ), recent AS (
+          SELECT * FROM visible WHERE peer_rank <= $3
+        )
+        SELECT r.id, r.sender_name, r.recipient_name, r.text, r.message_type, r.content, r.reply_to, r.reactions, r.edited_at, r.created_at,
+               r.peer_name,
+               COALESCE(u.data->>'avatar', $4) AS peer_avatar,
+               COALESCE(u.data->>'lastSeen', '') AS peer_last_seen,
+               EXISTS (
+                 SELECT 1 FROM presence_sessions ps
+                 WHERE ps.name = r.peer_name
+                   AND ps.last_seen >= NOW() - INTERVAL '${PRESENCE_TTL_SECONDS} seconds'
+               ) AS peer_online
+        FROM recent r
+        JOIN users u ON u.name = r.peer_name
+        WHERE r.peer_name ILIKE $2
+           OR regexp_replace(COALESCE(r.text, ''), '<[^>]+>', ' ', 'g') ILIKE $2
+           OR COALESCE(r.reply_to->>'text', '') ILIKE $2
+        ORDER BY r.id DESC
+        LIMIT $5
+      `, [viewer, pattern, DIRECT_MESSAGE_HISTORY_MAX, DEFAULT_AVATAR, DIRECT_MESSAGE_SEARCH_MAX], { attempts:2, label:'DIRECT MESSAGE GLOBAL SEARCH' });
+      const results = (result.rows || []).map(row => ({
+        peer: row.peer_name,
+        avatar: row.peer_avatar || DEFAULT_AVATAR,
+        online: row.peer_online === true,
+        lastSeen: row.peer_last_seen || '',
+        message: serializeDirectMessage(row)
+      })).filter(item => item.peer && item.message);
+      respond({ success:true, query, results });
+    } catch (err) {
+      console.error('[DIRECT MESSAGE GLOBAL SEARCH ERROR]:', err && err.message ? err.message : err);
+      respond({ success:false, query, results:[], message:'Could not search private messages.' });
     }
   });
 
