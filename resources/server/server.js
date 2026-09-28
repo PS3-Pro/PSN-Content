@@ -38,6 +38,12 @@ const CHAT_POLL_OPTIONS_MAX = 20;
 const CHAT_POLL_OPTION_TEXT_MAX = 4096;
 const CHAT_POLL_VOTERS_MAX = 5000;
 
+// Private user-to-user messages stay independent from Global Chat history.
+const DIRECT_MESSAGE_TEXT_MAX = Math.max(256, Math.min(16000, parseInt(process.env.DIRECT_MESSAGE_TEXT_MAX || "4000", 10) || 4000));
+const DIRECT_MESSAGE_HISTORY_MAX = Math.max(50, Math.min(500, parseInt(process.env.DIRECT_MESSAGE_HISTORY_MAX || "200", 10) || 200));
+const DIRECT_MESSAGE_RETENTION_MAX = Math.max(DIRECT_MESSAGE_HISTORY_MAX, Math.min(2000, parseInt(process.env.DIRECT_MESSAGE_RETENTION_MAX || "500", 10) || 500));
+const DIRECT_CONVERSATION_LIST_MAX = Math.max(20, Math.min(200, parseInt(process.env.DIRECT_CONVERSATION_LIST_MAX || "100", 10) || 100));
+
 // Per-user repeated-message protection. The repeat scan reuses the bounded in-memory
 // chat history; only active cooldowns need their own tiny runtime map.
 const CHAT_SPAM_REPEAT_WINDOW_MS = Math.max(10000, Math.min(5 * 60 * 1000, parseInt(process.env.CHAT_SPAM_REPEAT_WINDOW_MS || "60000", 10) || 60000));
@@ -2378,6 +2384,25 @@ async function initDb() {
     );
     CREATE INDEX IF NOT EXISTS idx_chat_seen_events_sender_id ON chat_seen_events(sender, id);
     CREATE INDEX IF NOT EXISTS idx_chat_seen_events_reader_id ON chat_seen_events(reader, id);
+    CREATE TABLE IF NOT EXISTS direct_messages (
+      id BIGSERIAL PRIMARY KEY,
+      sender_name TEXT NOT NULL REFERENCES users(name) ON DELETE CASCADE,
+      recipient_name TEXT NOT NULL REFERENCES users(name) ON DELETE CASCADE,
+      text TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      CHECK (sender_name <> recipient_name)
+    );
+    CREATE INDEX IF NOT EXISTS idx_direct_messages_sender_recipient_id ON direct_messages(sender_name, recipient_name, id DESC);
+    CREATE INDEX IF NOT EXISTS idx_direct_messages_recipient_sender_id ON direct_messages(recipient_name, sender_name, id DESC);
+    CREATE TABLE IF NOT EXISTS direct_message_read_state (
+      user_name TEXT NOT NULL REFERENCES users(name) ON DELETE CASCADE,
+      peer_name TEXT NOT NULL REFERENCES users(name) ON DELETE CASCADE,
+      last_read_id BIGINT NOT NULL DEFAULT 0,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (user_name, peer_name),
+      CHECK (user_name <> peer_name)
+    );
+    CREATE INDEX IF NOT EXISTS idx_direct_message_read_peer ON direct_message_read_state(peer_name, user_name);
     CREATE TABLE IF NOT EXISTS pinned_messages (
       id SERIAL PRIMARY KEY,
       message_id TEXT UNIQUE,
@@ -8268,6 +8293,245 @@ function getSocketsByUserName(name) {
   return sockets;
 }
 
+// ============================================================================
+// Direct messages (private user-to-user chat)
+// ============================================================================
+function normalizeDirectMessageUser(value) {
+  return normalizeText(value, '').slice(0, 120);
+}
+
+function normalizeDirectMessageText(value) {
+  const text = String(value == null ? '' : value)
+    .replace(/\r\n?/g, '\n')
+    .replace(/\u0000/g, '')
+    .trim();
+  return text.slice(0, DIRECT_MESSAGE_TEXT_MAX);
+}
+
+function serializeDirectMessage(row) {
+  if (!row) return null;
+  return {
+    id: String(row.id || ''),
+    from: normalizeDirectMessageUser(row.sender_name || row.from),
+    to: normalizeDirectMessageUser(row.recipient_name || row.to),
+    text: String(row.text == null ? '' : row.text).slice(0, DIRECT_MESSAGE_TEXT_MAX),
+    createdAt: row.created_at ? new Date(row.created_at).toISOString() : (row.createdAt || new Date().toISOString())
+  };
+}
+
+function emitDirectMessageToLocalUsers(message) {
+  if (!message || !message.from || !message.to) return;
+  const delivered = new Set();
+  for (const name of [message.from, message.to]) {
+    for (const client of getSocketsByUserName(name)) {
+      if (!client || !client.connected || delivered.has(client.id)) continue;
+      delivered.add(client.id);
+      client.emit('direct_message', message);
+    }
+  }
+}
+
+function emitDirectReadToLocalUsers(payload) {
+  if (!payload || !payload.reader || !payload.peer) return;
+  const delivered = new Set();
+  for (const name of [payload.reader, payload.peer]) {
+    for (const client of getSocketsByUserName(name)) {
+      if (!client || !client.connected || delivered.has(client.id)) continue;
+      delivered.add(client.id);
+      client.emit('direct_message_read', payload);
+    }
+  }
+}
+
+async function notifyDirectMessageAcrossInstances(kind, payload) {
+  if (!kind || !payload) return;
+  const notifyPayload = kind === 'message'
+    ? { id:String(payload.id || ''), from:normalizeDirectMessageUser(payload.from), to:normalizeDirectMessageUser(payload.to) }
+    : payload;
+  try {
+    await pool.query('SELECT pg_notify($1, $2)', ['direct_message_sync', JSON.stringify({
+      instanceId: INSTANCE_ID,
+      kind,
+      payload: notifyPayload,
+      at: Date.now()
+    })]);
+  } catch (err) {
+    console.error('[DIRECT MESSAGE NOTIFY ERROR]:', err && err.message ? err.message : err);
+  }
+}
+
+async function getDirectConversationPayload(userName) {
+  const viewer = normalizeDirectMessageUser(userName);
+  if (!viewer) return { success:false, conversations:[], unreadTotal:0 };
+
+  const result = await queryDbWithRetry(`
+    WITH relevant AS (
+      SELECT dm.id, dm.sender_name, dm.recipient_name, dm.text, dm.created_at,
+             CASE WHEN dm.sender_name = $1 THEN dm.recipient_name ELSE dm.sender_name END AS peer_name
+      FROM direct_messages dm
+      WHERE dm.sender_name = $1 OR dm.recipient_name = $1
+    ), latest AS (
+      SELECT DISTINCT ON (peer_name)
+             peer_name, id, sender_name, recipient_name, text, created_at
+      FROM relevant
+      ORDER BY peer_name, id DESC
+    ), unread AS (
+      SELECT dm.sender_name AS peer_name, COUNT(*)::int AS unread_count
+      FROM direct_messages dm
+      LEFT JOIN direct_message_read_state rs
+        ON rs.user_name = $1 AND rs.peer_name = dm.sender_name
+      WHERE dm.recipient_name = $1
+        AND dm.id > COALESCE(rs.last_read_id, 0)
+      GROUP BY dm.sender_name
+    )
+    SELECT l.peer_name, l.id, l.sender_name, l.recipient_name, l.text, l.created_at,
+           COALESCE(u.unread_count, 0)::int AS unread_count,
+           COALESCE(my_read.last_read_id, 0) AS my_last_read_id,
+           COALESCE(peer_read.last_read_id, 0) AS peer_last_read_id,
+           COALESCE(usr.data->>'avatar', $3) AS peer_avatar,
+           COALESCE(usr.data->>'lastSeen', '') AS peer_last_seen,
+           EXISTS (
+             SELECT 1 FROM presence_sessions ps
+             WHERE ps.name = l.peer_name
+               AND ps.last_seen >= NOW() - INTERVAL '${PRESENCE_TTL_SECONDS} seconds'
+           ) AS peer_online
+    FROM latest l
+    JOIN users usr ON usr.name = l.peer_name
+    LEFT JOIN unread u ON u.peer_name = l.peer_name
+    LEFT JOIN direct_message_read_state my_read
+      ON my_read.user_name = $1 AND my_read.peer_name = l.peer_name
+    LEFT JOIN direct_message_read_state peer_read
+      ON peer_read.user_name = l.peer_name AND peer_read.peer_name = $1
+    ORDER BY l.id DESC
+    LIMIT $2
+  `, [viewer, DIRECT_CONVERSATION_LIST_MAX, DEFAULT_AVATAR], { attempts:2, label:'DIRECT CONVERSATIONS READ' });
+
+  const conversations = (result.rows || []).map(row => ({
+    peer: row.peer_name,
+    avatar: row.peer_avatar || DEFAULT_AVATAR,
+    online: row.peer_online === true,
+    lastSeen: row.peer_last_seen || '',
+    unread: Math.max(0, Number(row.unread_count) || 0),
+    myLastReadId: String(row.my_last_read_id || '0'),
+    peerLastReadId: String(row.peer_last_read_id || '0'),
+    lastMessage: serializeDirectMessage(row)
+  }));
+
+  return {
+    success:true,
+    conversations,
+    unreadTotal: conversations.reduce((sum, item) => sum + (Math.max(0, Number(item.unread) || 0)), 0)
+  };
+}
+
+async function getDirectPeerSummary(peerName) {
+  const peer = normalizeDirectMessageUser(peerName);
+  if (!peer) return null;
+  const result = await queryDbWithRetry(`
+    SELECT u.name,
+           COALESCE(u.data->>'avatar', $2) AS avatar,
+           COALESCE(u.data->>'lastSeen', '') AS last_seen,
+           EXISTS (
+             SELECT 1 FROM presence_sessions ps
+             WHERE ps.name = u.name
+               AND ps.last_seen >= NOW() - INTERVAL '${PRESENCE_TTL_SECONDS} seconds'
+           ) AS online
+    FROM users u
+    WHERE u.name = $1
+    LIMIT 1
+  `, [peer, DEFAULT_AVATAR], { attempts:2, label:'DIRECT PEER READ' });
+  const row = result.rows && result.rows[0];
+  if (!row) return null;
+  return { name:row.name, avatar:row.avatar || DEFAULT_AVATAR, online:row.online === true, lastSeen:row.last_seen || '' };
+}
+
+async function markDirectConversationRead(userName, peerName, requestedLastId = 0) {
+  const viewer = normalizeDirectMessageUser(userName);
+  const peer = normalizeDirectMessageUser(peerName);
+  if (!viewer || !peer || viewer === peer) return 0;
+
+  const maxResult = await queryDbWithRetry(`
+    SELECT COALESCE(MAX(id), 0) AS max_id
+    FROM direct_messages
+    WHERE (sender_name = $1 AND recipient_name = $2)
+       OR (sender_name = $2 AND recipient_name = $1)
+  `, [viewer, peer], { attempts:2, label:'DIRECT READ MAX' });
+  const maxId = Math.max(0, Number(maxResult.rows?.[0]?.max_id) || 0);
+  if (!maxId) return 0;
+  const requested = Math.max(0, Number(requestedLastId) || 0);
+  const safeLastId = requested ? Math.min(requested, maxId) : maxId;
+
+  const result = await queryDbWithRetry(`
+    INSERT INTO direct_message_read_state (user_name, peer_name, last_read_id, updated_at)
+    VALUES ($1, $2, $3, NOW())
+    ON CONFLICT (user_name, peer_name) DO UPDATE
+    SET last_read_id = GREATEST(direct_message_read_state.last_read_id, EXCLUDED.last_read_id),
+        updated_at = NOW()
+    RETURNING last_read_id
+  `, [viewer, peer, safeLastId], { attempts:2, label:'DIRECT READ UPSERT' });
+  return Math.max(0, Number(result.rows?.[0]?.last_read_id) || safeLastId);
+}
+
+async function getDirectHistoryPayload(userName, peerName, options = {}) {
+  const viewer = normalizeDirectMessageUser(userName);
+  const peer = normalizeDirectMessageUser(peerName);
+  if (!viewer || !peer || viewer === peer) return { success:false, message:'Invalid conversation.' };
+
+  const peerSummary = await getDirectPeerSummary(peer);
+  if (!peerSummary) return { success:false, message:'User not found.' };
+
+  const result = await queryDbWithRetry(`
+    SELECT id, sender_name, recipient_name, text, created_at
+    FROM direct_messages
+    WHERE (sender_name = $1 AND recipient_name = $2)
+       OR (sender_name = $2 AND recipient_name = $1)
+    ORDER BY id DESC
+    LIMIT $3
+  `, [viewer, peer, DIRECT_MESSAGE_HISTORY_MAX], { attempts:2, label:'DIRECT HISTORY READ' });
+
+  const messages = (result.rows || []).slice().reverse().map(serializeDirectMessage).filter(Boolean);
+  let myLastReadId = 0;
+  if (options.markRead !== false && messages.length) {
+    myLastReadId = await markDirectConversationRead(viewer, peer, messages[messages.length - 1].id);
+  }
+
+  const reads = await queryDbWithRetry(`
+    SELECT user_name, last_read_id
+    FROM direct_message_read_state
+    WHERE (user_name = $1 AND peer_name = $2)
+       OR (user_name = $2 AND peer_name = $1)
+  `, [viewer, peer], { attempts:2, label:'DIRECT READ STATE' });
+  let peerLastReadId = 0;
+  for (const row of reads.rows || []) {
+    if (row.user_name === viewer) myLastReadId = Math.max(myLastReadId, Number(row.last_read_id) || 0);
+    else if (row.user_name === peer) peerLastReadId = Math.max(peerLastReadId, Number(row.last_read_id) || 0);
+  }
+
+  return {
+    success:true,
+    peer:peerSummary,
+    messages,
+    myLastReadId:String(myLastReadId || 0),
+    peerLastReadId:String(peerLastReadId || 0)
+  };
+}
+
+async function trimDirectConversation(senderName, recipientName) {
+  const a = normalizeDirectMessageUser(senderName);
+  const b = normalizeDirectMessageUser(recipientName);
+  if (!a || !b || a === b) return;
+  await queryDbWithRetry(`
+    DELETE FROM direct_messages
+    WHERE id IN (
+      SELECT id FROM direct_messages
+      WHERE (sender_name = $1 AND recipient_name = $2)
+         OR (sender_name = $2 AND recipient_name = $1)
+      ORDER BY id DESC
+      OFFSET $3
+    )
+  `, [a, b, DIRECT_MESSAGE_RETENTION_MAX], { attempts:1, label:'DIRECT MESSAGE RETENTION' });
+}
+
 async function getActivePresenceCountsForNames(names = []) {
   const cleanNames = [...new Set((Array.isArray(names) ? names : []).map(name => normalizeText(name, '')).filter(Boolean))];
   const counts = new Map();
@@ -8685,11 +8949,31 @@ async function initProfileSyncNotifications() {
   profileSyncNotifyClient = client;
 
   client.on('notification', async (message) => {
-    if (!message || !['profile_sync', 'presence_sync', 'ps3_playtime_sync', 'admin_state_sync', 'server_log_sync', 'friend_activity_sync', 'user_notification_sync', 'game_players_sync', 'content_download_counts_sync', 'chat_sync_notify'].includes(message.channel)) return;
+    if (!message || !['profile_sync', 'presence_sync', 'ps3_playtime_sync', 'admin_state_sync', 'server_log_sync', 'friend_activity_sync', 'user_notification_sync', 'game_players_sync', 'content_download_counts_sync', 'chat_sync_notify', 'direct_message_sync'].includes(message.channel)) return;
 
     try {
       const data = JSON.parse(message.payload || '{}');
       if (data.instanceId === INSTANCE_ID) return;
+
+      if (message.channel === 'direct_message_sync') {
+        if (data.kind === 'message' && data.payload) {
+          const messageId = Math.max(0, Number(data.payload.id) || 0);
+          const from = normalizeDirectMessageUser(data.payload.from);
+          const to = normalizeDirectMessageUser(data.payload.to);
+          if (!messageId || !from || !to) return;
+          if (!getSocketsByUserName(from).length && !getSocketsByUserName(to).length) return;
+          const directResult = await queryDbWithRetry(
+            'SELECT id, sender_name, recipient_name, text, created_at FROM direct_messages WHERE id = $1 LIMIT 1',
+            [messageId],
+            { attempts:2, label:'DIRECT MESSAGE SYNC READ' }
+          );
+          const directMessage = serializeDirectMessage(directResult.rows && directResult.rows[0]);
+          if (directMessage) emitDirectMessageToLocalUsers(directMessage);
+        } else if (data.kind === 'read' && data.payload) {
+          emitDirectReadToLocalUsers(data.payload);
+        }
+        return;
+      }
 
       if (message.channel === 'chat_sync_notify') {
         const spam = data.spam && typeof data.spam === 'object' ? data.spam : null;
@@ -9116,6 +9400,7 @@ async function initProfileSyncNotifications() {
     await client.query('LISTEN game_players_sync');
     await client.query('LISTEN content_download_counts_sync');
     await client.query('LISTEN chat_sync_notify');
+    await client.query('LISTEN direct_message_sync');
     const shouldRecoverModerationSync = profileSyncListenerHadGap;
     profileSyncListenerHadGap = false;
     profileSyncListenReady = true;
@@ -12910,6 +13195,111 @@ io.on('connection', (socket) => {
     if (cleanCode === "UNLOCKALLDB1") return callback({ success: true, type: 'SINGLE_TROPHY' });
 
     callback({ success: false, message: "Invalid code." });
+  });
+
+  // --------------------------------------------------------------------------
+  // Direct messages
+  // --------------------------------------------------------------------------
+  socket.on('request_direct_conversations', async (_data = {}, callback) => {
+    const respond = typeof callback === 'function' ? callback : payload => socket.emit('direct_conversations', payload);
+    const viewer = normalizeDirectMessageUser(socket.userName);
+    if (!viewer) return respond({ success:false, conversations:[], unreadTotal:0, message:'Authentication required.' });
+    try {
+      respond(await getDirectConversationPayload(viewer));
+    } catch (err) {
+      console.error('[DIRECT CONVERSATIONS ERROR]:', err && err.message ? err.message : err);
+      respond({ success:false, conversations:[], unreadTotal:0, message:'Could not load conversations.' });
+    }
+  });
+
+  socket.on('request_direct_history', async (data = {}, callback) => {
+    const respond = typeof callback === 'function' ? callback : payload => socket.emit('direct_history', payload);
+    const viewer = normalizeDirectMessageUser(socket.userName);
+    const peer = normalizeDirectMessageUser(data.with || data.peer || data.user);
+    if (!viewer) return respond({ success:false, message:'Authentication required.' });
+    if (!peer || peer === viewer) return respond({ success:false, message:'Invalid conversation.' });
+    try {
+      const payload = await getDirectHistoryPayload(viewer, peer, { markRead:true });
+      respond(payload);
+      if (payload.success && Number(payload.myLastReadId || 0) > 0) {
+        const readPayload = { reader:viewer, peer, lastReadId:String(payload.myLastReadId), readAt:new Date().toISOString() };
+        emitDirectReadToLocalUsers(readPayload);
+        deferServerTask('DIRECT READ NOTIFY', () => notifyDirectMessageAcrossInstances('read', readPayload), 0);
+      }
+    } catch (err) {
+      console.error('[DIRECT HISTORY ERROR]:', err && err.message ? err.message : err);
+      respond({ success:false, message:'Could not load this conversation.' });
+    }
+  });
+
+  socket.on('direct_message', async (data = {}, callback) => {
+    const respond = typeof callback === 'function' ? callback : () => {};
+    const sender = normalizeDirectMessageUser(socket.userName);
+    const recipient = normalizeDirectMessageUser(data.to || data.recipient || data.user);
+    const text = normalizeDirectMessageText(data.text);
+
+    if (socket.__passwordResetRevoked === true) return respond({ success:false, reason:'password_reset', message:'Your session has ended.' });
+    if (!sender) return respond({ success:false, message:'Authentication required.' });
+    if (!recipient || recipient === sender) return respond({ success:false, message:'Invalid recipient.' });
+    if (!text) return respond({ success:false, message:'Type a message first.' });
+
+    const directNow = Date.now();
+    const directLastAt = Math.max(0, Number(socket.__directMessageLastAt) || 0);
+    if (directLastAt && directNow - directLastAt < 350) {
+      return respond({ success:false, reason:'rate_limit', message:'You are sending messages too quickly.' });
+    }
+    const directWindow = Array.isArray(socket.__directMessageWindow)
+      ? socket.__directMessageWindow.filter(stamp => directNow - Number(stamp || 0) < 60000)
+      : [];
+    if (directWindow.length >= 60) {
+      socket.__directMessageWindow = directWindow;
+      return respond({ success:false, reason:'rate_limit', message:'Message limit reached. Try again in a moment.' });
+    }
+    directWindow.push(directNow);
+    socket.__directMessageWindow = directWindow;
+    socket.__directMessageLastAt = directNow;
+
+    if (userDatabase[sender] && isUserBanned(userDatabase[sender]) && !ADMIN_USERS.includes(sender)) {
+      return respond({ success:false, reason:'banned', message:'Your account is banned.' });
+    }
+
+    try {
+      const recipientResult = await queryDbWithRetry('SELECT name FROM users WHERE name = $1 LIMIT 1', [recipient], { attempts:2, label:'DIRECT RECIPIENT CHECK' });
+      if (!recipientResult.rows.length) return respond({ success:false, message:'User not found.' });
+
+      const inserted = await queryDbWithRetry(`
+        INSERT INTO direct_messages (sender_name, recipient_name, text)
+        VALUES ($1, $2, $3)
+        RETURNING id, sender_name, recipient_name, text, created_at
+      `, [sender, recipient, text], { attempts:2, label:'DIRECT MESSAGE INSERT' });
+      const message = serializeDirectMessage(inserted.rows[0]);
+      if (!message) return respond({ success:false, message:'Could not save the message.' });
+
+      emitDirectMessageToLocalUsers(message);
+      deferServerTask('DIRECT MESSAGE NOTIFY', () => notifyDirectMessageAcrossInstances('message', message), 0);
+      deferServerTask('DIRECT MESSAGE RETENTION', () => trimDirectConversation(sender, recipient), 0);
+      respond({ success:true, message });
+    } catch (err) {
+      console.error('[DIRECT MESSAGE ERROR]:', err && err.message ? err.message : err);
+      respond({ success:false, message:'Could not send the message.' });
+    }
+  });
+
+  socket.on('direct_message_mark_read', async (data = {}, callback) => {
+    const respond = typeof callback === 'function' ? callback : () => {};
+    const viewer = normalizeDirectMessageUser(socket.userName);
+    const peer = normalizeDirectMessageUser(data.with || data.peer || data.user);
+    if (!viewer || !peer || viewer === peer) return respond({ success:false, message:'Invalid conversation.' });
+    try {
+      const lastReadId = await markDirectConversationRead(viewer, peer, data.lastMessageId || data.lastReadId || 0);
+      const payload = { reader:viewer, peer, lastReadId:String(lastReadId || 0), readAt:new Date().toISOString() };
+      emitDirectReadToLocalUsers(payload);
+      deferServerTask('DIRECT READ NOTIFY', () => notifyDirectMessageAcrossInstances('read', payload), 0);
+      respond({ success:true, ...payload });
+    } catch (err) {
+      console.error('[DIRECT READ ERROR]:', err && err.message ? err.message : err);
+      respond({ success:false, message:'Could not update read state.' });
+    }
   });
 
   // --------------------------------------------------------------------------
