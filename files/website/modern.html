@@ -72448,16 +72448,6 @@ function getVisibleChatStackEl(id) {
 		return best;
 	}
 
-	function directLatestPeerMessageActivity(peerName, messages = window.__directChatState.messages) {
-		const peer = String(peerName || '').trim();
-		if (!peer || !Array.isArray(messages)) return '';
-		for (let index = messages.length - 1; index >= 0; index--) {
-			const message = messages[index];
-			if (message && String(message.from || '') === peer && message.createdAt) return message.createdAt;
-		}
-		return '';
-	}
-
 	function directRememberPeerActivity(peerName, activityAt) {
 		const peer = String(peerName || '').trim();
 		const stamp = directLastSeenStamp(activityAt);
@@ -73068,17 +73058,7 @@ function getVisibleChatStackEl(id) {
 		const peerName = String(state.activePeer || '').trim();
 		if (!peerName) return;
 		const conversation = directFindConversation(peerName);
-		const peerMessageActivity = directLatestPeerMessageActivity(peerName, state.messages);
-		const latestConversationPeerActivity = conversation && conversation.lastMessage && String(conversation.lastMessage.from || '') === peerName
-			? conversation.lastMessage.createdAt
-			: '';
-		const cachedLastSeen = window.__presenceLastSeenByUser && window.__presenceLastSeenByUser[peerName];
 		const peerInfo = directLivePresenceSnapshot(peerName, state.peer || conversation || { peer:peerName });
-		const activityLastSeen = directNewestLastSeen(peerInfo.lastSeen, cachedLastSeen, peerMessageActivity, latestConversationPeerActivity);
-		if (activityLastSeen) {
-			peerInfo.lastSeen = activityLastSeen;
-			directRememberPeerActivity(peerName, activityLastSeen);
-		}
 		state.peer = peerInfo;
 		const presenceEl = document.getElementById('direct-thread-presence');
 		const statusEl = document.getElementById('direct-thread-status');
@@ -73086,7 +73066,7 @@ function getVisibleChatStackEl(id) {
 		if (statusEl) {
 			if (peerInfo.online === true) statusEl.textContent = 'Online';
 			else {
-				const stamp = directLastSeenStamp(activityLastSeen);
+				const stamp = directLastSeenStamp(peerInfo.lastSeen);
 				statusEl.textContent = stamp && typeof formatLastSeen === 'function' ? `Last seen ${formatLastSeen(stamp)}` : 'Offline';
 			}
 		}
@@ -73207,11 +73187,9 @@ function getVisibleChatStackEl(id) {
 			}
 		}
 		if (String(message.from || '') === peer && message.createdAt) {
+			const previousActivity = directLastSeenStamp(conversation.lastSeen);
 			const activityAt = directRememberPeerActivity(peer, message.createdAt);
-			if (activityAt && directLastSeenStamp(conversation.lastSeen) < directLastSeenStamp(activityAt)) {
-				conversation.lastSeen = activityAt;
-				changed = true;
-			}
+			if (activityAt && directLastSeenStamp(activityAt) > previousActivity) changed = true;
 			if (state.activePeer === peer) updateDirectThreadPresenceStatus();
 		}
 		if (message.to === me && messageId > previousLastId) {
@@ -73285,8 +73263,6 @@ function getVisibleChatStackEl(id) {
 			conversation.online = peerInfo.online === true;
 			conversation.lastSeen = directNewestLastSeen(peerInfo.lastSeen, conversation.lastSeen);
 		}
-		const peerActivity = directLatestPeerMessageActivity(peer, messages);
-		if (peerActivity) conversation.lastSeen = directNewestLastSeen(conversation.lastSeen, directRememberPeerActivity(peer, peerActivity));
 		if (latest) conversation.lastMessage = latest;
 		conversation.unread = 0;
 		conversation.myLastReadId = String(payload && payload.myLastReadId || conversation.myLastReadId || '0');
@@ -73889,11 +73865,7 @@ function getVisibleChatStackEl(id) {
 				return;
 			}
 			state.messages = Array.isArray(payload.messages) ? payload.messages : [];
-			const peerMessageActivity = directLatestPeerMessageActivity(peer, state.messages);
-			if (peerMessageActivity) directRememberPeerActivity(peer, peerMessageActivity);
-			const peerPayload = { ...(payload.peer || state.peer || { name:peer }) };
-			peerPayload.lastSeen = directNewestLastSeen(peerPayload.lastSeen, peerPayload.activityAt, peerMessageActivity);
-			state.peer = directLivePresenceSnapshot(peer, peerPayload);
+			state.peer = directLivePresenceSnapshot(peer, payload.peer || state.peer || { name:peer });
 			state.threadLoadedPeer = peer;
 			state.messageCount = Math.max(state.messages.length, Math.max(0, Number(payload.messageCount) || 0));
 			state.myLastReadId = String(payload.myLastReadId || '0');

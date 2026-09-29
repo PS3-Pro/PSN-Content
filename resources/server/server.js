@@ -8559,6 +8559,13 @@ async function getDirectConversationPayload(userName) {
            COALESCE(peer_read.last_read_id, 0) AS peer_last_read_id,
            COALESCE(usr.data->>'avatar', $3) AS peer_avatar,
            COALESCE(usr.data->>'lastSeen', '') AS peer_last_seen,
+           (
+             SELECT MAX(r2.created_at)
+             FROM relevant r2
+             WHERE r2.peer_name = l.peer_name
+               AND r2.sender_name = l.peer_name
+               AND r2.recipient_name = $1
+           ) AS peer_message_activity_at,
            EXISTS (
              SELECT 1 FROM presence_sessions ps
              WHERE ps.name = l.peer_name
@@ -8579,7 +8586,7 @@ async function getDirectConversationPayload(userName) {
     peer: row.peer_name,
     avatar: row.peer_avatar || DEFAULT_AVATAR,
     online: row.peer_online === true,
-    lastSeen: row.peer_last_seen || '',
+    lastSeen: newestDirectActivityIso(row.peer_last_seen, row.peer_message_activity_at),
     unread: Math.max(0, Number(row.unread_count) || 0),
     myLastReadId: String(row.my_last_read_id || '0'),
     peerLastReadId: String(row.peer_last_read_id || '0'),
@@ -8711,8 +8718,7 @@ async function getDirectHistoryPayload(userName, peerName, options = {}) {
       name:first.peer_name,
       avatar:first.peer_avatar || DEFAULT_AVATAR,
       online:first.peer_online === true,
-      lastSeen:newestDirectActivityIso(first.peer_last_seen, first.peer_message_activity_at),
-      activityAt:first.peer_message_activity_at ? new Date(first.peer_message_activity_at).toISOString() : ''
+      lastSeen:newestDirectActivityIso(first.peer_last_seen, first.peer_message_activity_at)
     },
     messages,
     messageCount:Math.max(messages.length, Math.max(0, Number(first.total_count) || 0)),
@@ -13505,6 +13511,9 @@ io.on('connection', (socket) => {
         ), visible AS (
           SELECT dm.id, dm.sender_name, dm.recipient_name, dm.text, dm.message_type, dm.content, dm.reply_to, dm.reactions, dm.edited_at, dm.created_at,
                  CASE WHEN dm.sender_name = $1 THEN dm.recipient_name ELSE dm.sender_name END AS peer_name,
+                 MAX(CASE WHEN dm.recipient_name = $1 THEN dm.created_at END) OVER (
+                   PARTITION BY CASE WHEN dm.sender_name = $1 THEN dm.recipient_name ELSE dm.sender_name END
+                 ) AS peer_message_activity_at,
                  ROW_NUMBER() OVER (
                    PARTITION BY CASE WHEN dm.sender_name = $1 THEN dm.recipient_name ELSE dm.sender_name END
                    ORDER BY dm.id DESC
@@ -13521,6 +13530,7 @@ io.on('connection', (socket) => {
                r.peer_name,
                COALESCE(u.data->>'avatar', $4) AS peer_avatar,
                COALESCE(u.data->>'lastSeen', '') AS peer_last_seen,
+               r.peer_message_activity_at,
                EXISTS (
                  SELECT 1 FROM presence_sessions ps
                  WHERE ps.name = r.peer_name
@@ -13538,7 +13548,7 @@ io.on('connection', (socket) => {
         peer: row.peer_name,
         avatar: row.peer_avatar || DEFAULT_AVATAR,
         online: row.peer_online === true,
-        lastSeen: row.peer_last_seen || '',
+        lastSeen: newestDirectActivityIso(row.peer_last_seen, row.peer_message_activity_at),
         message: serializeDirectMessage(row)
       })).filter(item => item.peer && item.message);
       respond({ success:true, query, results });
