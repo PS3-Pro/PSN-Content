@@ -9574,7 +9574,8 @@ async function initProfileSyncNotifications() {
           clearDeletedUserRuntimeState(name);
           disconnectUserSessions(name, 'account_deleted', {
             reason: normalizeText(data.changes.deleteReason, '') || 'Account deleted by administrator.',
-            by: normalizeText(data.changes.deletedBy, '') || 'Admin'
+            by: normalizeText(data.changes.deletedBy, '') || 'Admin',
+            selfDeleted: data.changes.selfDeleted === true
           });
           invalidateOnlineListCache('account-deleted-profile-sync');
           deferServerTask('ACCOUNT DELETE ONLINE LIST', () => emitOnlineList(), 0);
@@ -11421,7 +11422,34 @@ async function resetUserPassword(targetName, adminName) {
   return { success: true, targetName, resetExpiresAt, expiresInMs: PASSWORD_RESET_WINDOW_MS };
 }
 
-async function deleteUserAccount(targetName, reason, adminName) {
+async function verifyUserPasswordForSensitiveAction(name, rawPassword) {
+  const userName = normalizeText(name, '');
+  const password = String(rawPassword || '');
+  if (!userName || !password || password.length > 256) return false;
+
+  const dbUser = await getAuthUserRecordFromDb(userName);
+  if (!dbUser) return false;
+
+  if (dbUser.passwordHash) {
+    try {
+      return await bcrypt.compare(password, String(dbUser.passwordHash));
+    } catch (err) {
+      return false;
+    }
+  }
+
+  const legacyPassword = typeof dbUser.password === 'string' ? dbUser.password : '';
+  if (!legacyPassword) return false;
+  try {
+    const left = Buffer.from(password);
+    const right = Buffer.from(legacyPassword);
+    return left.length === right.length && crypto.timingSafeEqual(left, right);
+  } catch (err) {
+    return false;
+  }
+}
+
+async function deleteUserAccount(targetName, reason, adminName, options = {}) {
   if (!targetName) return { success: false, message: "Missing target user." };
   await getUserFromDb(targetName);
   if (!userDatabase[targetName]) return { success: false, message: "User not found." };
@@ -11476,14 +11504,16 @@ async function deleteUserAccount(targetName, reason, adminName) {
 
   // Tell every server instance explicitly that this profile was deleted. Remote instances
   // must revoke any surviving admin/mod session immediately instead of merely dropping cache.
+  const selfDeleted = options && options.selfDeleted === true;
   await notifyProfileSyncAcrossInstances(targetName, null, Date.now(), {
     deleted: true,
     deleteReason,
-    deletedBy
+    deletedBy,
+    selfDeleted
   });
 
   clearDeletedUserRuntimeState(targetName);
-  disconnectUserSessions(targetName, 'account_deleted', { reason: deleteReason, by: deletedBy });
+  disconnectUserSessions(targetName, 'account_deleted', { reason: deleteReason, by: deletedBy, selfDeleted });
   await emitOnlineList();
 
   return { success: true, targetName, reason: deleteReason };
@@ -14352,6 +14382,48 @@ io.on('connection', (socket) => {
     } catch (err) {
       console.error('[ADMIN DELETE ACCOUNT ERROR]:', err);
       respond({ success: false, message: "Server error while deleting account." });
+    }
+  });
+
+  socket.on('delete_own_account', async (data, callback) => {
+    const respond = typeof callback === 'function' ? callback : () => {};
+    const now = Date.now();
+    if (socket.__selfDeleteAccountBusy === true) return respond({ success:false, message:'Account deletion is already in progress.' });
+    if (now - Math.max(0, Number(socket.__selfDeleteAccountLastAttemptAt) || 0) < 800) {
+      return respond({ success:false, message:'Please wait a moment before trying again.' });
+    }
+    socket.__selfDeleteAccountLastAttemptAt = now;
+    socket.__selfDeleteAccountBusy = true;
+
+    try {
+      const name = normalizeText(socket.userName, '');
+      if (!name) return respond({ success:false, message:'Sign in before deleting your account.' });
+      if (ADMIN_USERS.includes(name)) return respond({ success:false, message:'This protected administrator account cannot be deleted.' });
+
+      const confirmName = normalizeText(data && data.confirmName, '');
+      const confirmWord = String(data && data.confirmWord || '').trim();
+      const password = String(data && data.password || '');
+
+      if (confirmName !== name || confirmWord !== 'DELETE') {
+        return respond({ success:false, message:'The confirmation values do not match.' });
+      }
+      if (!password || password.length > 256) {
+        return respond({ success:false, message:'Enter your current password.' });
+      }
+
+      const passwordOk = await verifyUserPasswordForSensitiveAction(name, password);
+      if (!passwordOk) return respond({ success:false, message:'Incorrect password.' });
+
+      const result = await deleteUserAccount(name, 'Account deleted by user.', name, { selfDeleted:true });
+      if (result.success) {
+        await addServerLog('account_self_deleted', `${name} deleted their own account`, { targetName:name }, name);
+      }
+      respond(result);
+    } catch (err) {
+      console.error('[SELF DELETE ACCOUNT ERROR]:', err);
+      respond({ success:false, message:'Server error while deleting account.' });
+    } finally {
+      socket.__selfDeleteAccountBusy = false;
     }
   });
 
