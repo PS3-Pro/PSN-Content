@@ -73206,7 +73206,7 @@ function getVisibleChatStackEl(id) {
 	// ========================================================================
 	window.__directChatState = window.__directChatState || {
 		owner: '', conversations: [], activePeer: '', messages: [], peer: null, messageCount: 0,
-		myLastReadId: '0', peerLastReadId: '0', loadingThread: false, pendingMedia: [], pendingUploads: 0, mediaToken: 0,
+		myLastReadId: '0', peerLastReadId: '0', unreadDividerAfterId: '', loadingThread: false, pendingMedia: [], pendingUploads: 0, mediaToken: 0,
 		replyTo: null, editingMessageId: '', inputRange: null, searchQuery: '', searchResultCount: 0,
 		conversationRefreshInFlight: false, conversationRefreshQueued: false, conversationRefreshTimer: 0, conversationRefreshWatchdog: 0, conversationRefreshToken: 0, conversationSignature: '',
 		threadRequestToken: 0, threadRequestTimer: 0, threadLoadedPeer: '', sessionToken: 0, trimmedMessageIds: [], deletedThroughByPeer: Object.create(null), emptyConversationCloseTimer: 0, emptyConversationCloseToken: 0,
@@ -74344,7 +74344,7 @@ function getVisibleChatStackEl(id) {
 			state.emptyConversationCloseTimer = 0;
 			if (state.activePeer === peer && (!Array.isArray(state.messages) || !state.messages.length)) {
 				state.activePeer = ''; state.peer = null; state.messages = []; state.messageCount = 0; state.trimmedMessageIds = []; state.threadLoadedPeer = '';
-				state.myLastReadId = '0'; state.peerLastReadId = '0'; state.loadingThread = false;
+				state.myLastReadId = '0'; state.peerLastReadId = '0'; state.unreadDividerAfterId = ''; state.loadingThread = false;
 				state.pendingMedia = []; state.pendingUploads = 0; state.mediaToken = Number(state.mediaToken || 0) + 1;
 				state.replyTo = null; state.editingMessageId = ''; state.inputRange = null;
 				if (typeof directClearComposer === 'function') directClearComposer();
@@ -74673,16 +74673,54 @@ function getVisibleChatStackEl(id) {
 
 	function directMessagesWithDatePillsHtml(messages, options = {}) {
 		let lastDay = '';
+		let unreadDividerAdded = false;
+		const hasUnreadBoundary = options.unreadAfterId !== '' && options.unreadAfterId != null;
+		const unreadAfterId = hasUnreadBoundary ? directMessageIdNumber(options.unreadAfterId) : -1;
+		const me = directCurrentUser();
 		return (Array.isArray(messages) ? messages : []).map(message => {
 			const day = directMessageDateKey(message && message.createdAt);
-			let dividerHtml = '';
+			let prefixHtml = '';
 			if (day && day !== lastDay) {
 				const divider = directCreateDateDivider(message.createdAt);
-				if (divider) dividerHtml = divider.outerHTML;
+				if (divider) prefixHtml = divider.outerHTML;
 				lastDay = day;
 			}
-			return dividerHtml + directMessageRowHtml(message, options);
+			if (!unreadDividerAdded && hasUnreadBoundary && message && message.to === me && directMessageIdNumber(message.id) > unreadAfterId) {
+				prefixHtml += '<div id="direct-unread-divider" class="ps-new-messages-container"><div class="ps-line left"></div><span class="ps-unread-text">UNREAD MESSAGES</span><div class="ps-line right"></div></div>';
+				unreadDividerAdded = true;
+			}
+			return prefixHtml + directMessageRowHtml(message, options);
 		}).join('');
+	}
+
+	function setupDirectUnreadDividerAutoRemove() {
+		const divider = document.getElementById('direct-unread-divider');
+		const list = document.getElementById('direct-message-list');
+		if (!divider || !list || divider.dataset.observed === 'true' || typeof IntersectionObserver === 'undefined') return;
+		divider.dataset.observed = 'true';
+		const peer = String(window.__directChatState.activePeer || '');
+		const observer = new IntersectionObserver(entries => {
+			if (!entries[0] || !entries[0].isIntersecting) return;
+			observer.disconnect();
+			setTimeout(() => {
+				if (!divider.isConnected || window.__directChatState.activePeer !== peer) return;
+				divider.style.maxHeight = divider.scrollHeight + 'px';
+				setTimeout(() => {
+					if (!divider.isConnected) return;
+					divider.style.overflow = 'hidden';
+					divider.style.transition = 'all 0.5s ease-out';
+					divider.style.opacity = '0';
+					divider.style.maxHeight = '0px';
+					divider.style.margin = '0px';
+					divider.style.padding = '0px';
+				}, 50);
+				setTimeout(() => {
+					if (divider.isConnected) divider.remove();
+					if (window.__directChatState.activePeer === peer) window.__directChatState.unreadDividerAfterId = '';
+				}, 550);
+			}, 3000);
+		}, { root:list, threshold:0.1 });
+		observer.observe(divider);
 	}
 
 	function directCleanupDateDividers(list, viewportTop = -1) {
@@ -75129,11 +75167,13 @@ function getVisibleChatStackEl(id) {
 			if (document.getElementById('chat-search-dropdown')?.style.display === 'flex') renderDirectSearchFilters();
 			return;
 		}
-		list.innerHTML = directMessagesWithDatePillsHtml(messages, { animateMessages: options.animateMessages === true });
+		const unreadAfterId = String(state.searchQuery || '').trim() ? '' : state.unreadDividerAfterId;
+		list.innerHTML = directMessagesWithDatePillsHtml(messages, { animateMessages: options.animateMessages === true, unreadAfterId });
 		state.trimmedMessageIds = [];
 		hydrateDirectLinkPreviews(messages);
 		if (isDirectChatAutoTranslateEnabled()) requestAnimationFrame(() => autoTranslateVisibleDirectMessages(list));
 		if (document.getElementById('chat-search-dropdown')?.style.display === 'flex') renderDirectSearchFilters();
+		if (!String(state.searchQuery || '').trim()) requestAnimationFrame(setupDirectUnreadDividerAutoRemove);
 		requestAnimationFrame(() => {
 			if (!list) return;
 			if (options.searchUpdate === true) { list.scrollTop = 0; return; }
@@ -75243,7 +75283,7 @@ function getVisibleChatStackEl(id) {
 		state.sessionToken = Number(state.sessionToken || 0) + 1;
 		state.conversations = []; state.activePeer = ''; state.messages = []; state.peer = null; state.messageCount = 0; state.trimmedMessageIds = []; state.threadLoadedPeer = ''; state.deletedThroughByPeer = Object.create(null);
 		state.searchQuery = ''; state.searchResultCount = 0; state.globalSearchResults = []; state.globalSearchLoading = false; state.globalSearchToken = Number(state.globalSearchToken || 0) + 1; state.pendingHighlightMessageId = '';
-		state.myLastReadId = '0'; state.peerLastReadId = '0'; state.loadingThread = false; state.pendingMedia = []; state.pendingUploads = 0; state.mediaToken = Number(state.mediaToken || 0) + 1; state.replyTo = null; state.editingMessageId = '';
+		state.myLastReadId = '0'; state.peerLastReadId = '0'; state.unreadDividerAfterId = ''; state.loadingThread = false; state.pendingMedia = []; state.pendingUploads = 0; state.mediaToken = Number(state.mediaToken || 0) + 1; state.replyTo = null; state.editingMessageId = '';
 		clearTimeout(state.emptyConversationCloseTimer); state.emptyConversationCloseTimer = 0; state.emptyConversationCloseToken = Number(state.emptyConversationCloseToken || 0) + 1;
 		clearTimeout(state.conversationRefreshTimer); state.conversationRefreshTimer = 0;
 		clearTimeout(state.conversationRefreshWatchdog); state.conversationRefreshWatchdog = 0; state.conversationRefreshToken = Number(state.conversationRefreshToken || 0) + 1;
@@ -75432,7 +75472,7 @@ function getVisibleChatStackEl(id) {
 		const backgroundReconcile = options.reconnect === true && samePeer && Array.isArray(state.messages) && state.messages.length > 0;
 		if (state.activePeer && state.activePeer !== peer) { stopDirectTyping(); clearDirectPeerTyping(); state.pendingMedia = []; state.pendingUploads = 0; state.mediaToken = Number(state.mediaToken || 0) + 1; state.replyTo = null; state.editingMessageId = ''; state.inputRange = null; state.threadLoadedPeer = ''; renderDirectPendingMedia(); closeDirectPickers(); renderDirectComposerContext(); }
 		state.activePeer = peer; state.loadingThread = !backgroundReconcile;
-		if (!backgroundReconcile) { state.messages = []; state.messageCount = 0; state.peerLastReadId = '0'; state.threadLoadedPeer = ''; updateDirectThreadMessageCount(0); }
+		if (!backgroundReconcile) { state.messages = []; state.messageCount = 0; state.peerLastReadId = '0'; state.unreadDividerAfterId = ''; state.threadLoadedPeer = ''; updateDirectThreadMessageCount(0); }
 		const existing = directFindConversation(peer);
 		state.peer = directLivePresenceSnapshot(peer, existing ? { ...(state.peer || {}), name:peer, avatar:existing.avatar, online:existing.online, lastSeen:existing.lastSeen } : (state.peer && samePeer ? state.peer : { name:peer, avatar:directResolveAvatar(peer), online:false, lastSeen:'' }));
 		renderDirectConversations();
@@ -75465,6 +75505,11 @@ function getVisibleChatStackEl(id) {
 			state.messageCount = Math.max(state.messages.length, Math.max(0, Number(payload.messageCount) || 0));
 			state.myLastReadId = String(payload.myLastReadId || '0');
 			state.peerLastReadId = String(payload.peerLastReadId || '0');
+			if (!backgroundReconcile) {
+				const previousReadId = String(payload.previousMyLastReadId ?? payload.myLastReadId ?? '0');
+				const previousReadNumber = directMessageIdNumber(previousReadId);
+				state.unreadDividerAfterId = state.messages.some(message => message && message.to === me && directMessageIdNumber(message.id) > previousReadNumber) ? previousReadId : '';
+			}
 			renderDirectThread(backgroundReconcile ? { preserveScroll:true } : { forceBottom:true, animateMessages:true });
 			const highlightId = String(state.pendingHighlightMessageId || '');
 			if (highlightId) { state.pendingHighlightMessageId = ''; requestAnimationFrame(() => setTimeout(() => { if (typeof window.scrollToDirectMessage === 'function') window.scrollToDirectMessage(highlightId); }, 40)); }
@@ -75485,7 +75530,7 @@ function getVisibleChatStackEl(id) {
 		state.pendingMedia = []; state.pendingUploads = 0; state.mediaToken = Number(state.mediaToken || 0) + 1;
 		state.replyTo = null; state.editingMessageId = ''; state.inputRange = null;
 		state.activePeer = ''; state.peer = null; state.messages = []; state.messageCount = 0; state.trimmedMessageIds = []; state.threadLoadedPeer = '';
-		state.myLastReadId = '0'; state.peerLastReadId = '0'; state.loadingThread = false; state.pendingHighlightMessageId = '';
+		state.myLastReadId = '0'; state.peerLastReadId = '0'; state.unreadDividerAfterId = ''; state.loadingThread = false; state.pendingHighlightMessageId = '';
 		if (typeof directClearComposer === 'function') directClearComposer();
 		renderDirectPendingMedia(); closeDirectPickers(); renderDirectComposerContext();
 		window.clearDirectMessageSearch({ render:false, clearInput:true });

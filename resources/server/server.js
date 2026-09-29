@@ -8808,6 +8808,7 @@ async function getDirectHistoryPayload(userName, peerName, options = {}) {
 
   const messages = rows.filter(row => row && row.id != null).slice().reverse().map(serializeDirectMessage).filter(Boolean);
   let myLastReadId = Math.max(0, Number(first.my_last_read_id) || 0);
+  const previousMyLastReadId = myLastReadId;
   const peerLastReadId = Math.max(0, Number(first.peer_last_read_id) || 0);
   let readStateChanged = false;
   let readAt = '';
@@ -8832,6 +8833,7 @@ async function getDirectHistoryPayload(userName, peerName, options = {}) {
     messages,
     messageCount:Math.max(messages.length, Math.max(0, Number(first.total_count) || 0)),
     myLastReadId:String(myLastReadId || 0),
+    previousMyLastReadId:String(previousMyLastReadId || 0),
     peerLastReadId:String(peerLastReadId || 0),
     readStateChanged,
     readAt
