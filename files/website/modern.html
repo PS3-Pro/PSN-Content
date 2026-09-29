@@ -10998,9 +10998,8 @@ P
 		const modal = getSelfDeleteAccountModal();
 		if (!modal) return;
 
-		// .main-content uses CSS containment, which makes fixed descendants use that
-		// scrolling container as their containing block. Portal this overlay once so
-		// it stays fixed to the viewport regardless of the Settings scroll position.
+		// .main-content uses CSS containment, so keep this overlay at body level.
+		// The move happens once and keeps the modal fixed to the current viewport.
 		if (modal.parentNode !== document.body) document.body.appendChild(modal);
 		if (modal.dataset.bound === '1') return;
 		modal.dataset.bound = '1';
@@ -11426,13 +11425,38 @@ P
 		return !!(element && element.closest && element.closest(PSN_TEXT_SELECTION_ALLOWED_SELECTOR));
 	}
 
+	const PSN_IMAGE_CONTEXT_TARGET_SELECTOR = [
+		'#full-modal-img',
+		'.screenshot-item',
+		'.chat-gallery img',
+		'.msg-bubble img:not(.chat-avatar-clickable)',
+		'.direct-message-media-item img',
+		'.direct-message-bubble .link-preview-card img',
+		'.metadata-screenshot-preview img',
+		'.admin-metadata-suggestion-screenshot-strip img'
+	].join(',');
+
+	function getPsnImageContextTarget(target) {
+		const element = getPsnInteractionElement(target);
+		if (!element || !element.closest) return null;
+		const image = element.closest(PSN_IMAGE_CONTEXT_TARGET_SELECTOR);
+		if (image && image.tagName === 'IMG') return image;
+		const thumb = element.closest('#psn-image-modal .psn-image-thumb');
+		if (thumb) return thumb.querySelector('img');
+		const galleryTile = element.closest('.chat-gallery .gallery-tile');
+		if (galleryTile) return galleryTile.querySelector('img');
+		const directMedia = element.closest('.direct-message-media-item');
+		if (directMedia) return directMedia.querySelector('img');
+		return null;
+	}
+
 	function isPsnFileManagerInteractionTarget(target) {
 		const element = getPsnInteractionElement(target);
 		return !!(element && element.closest && element.closest('#fm-online-container, #direct-conversations-list .direct-conversation-item, #direct-conversation-context-menu'));
 	}
 
 	function blockSecondaryMouseInteraction(event) {
-		if (!event || event.button !== 2 || isPsnEditableTextTarget(event.target) || isPsnFileManagerInteractionTarget(event.target)) return;
+		if (!event || event.button !== 2 || isPsnEditableTextTarget(event.target) || isPsnFileManagerInteractionTarget(event.target) || getPsnImageContextTarget(event.target)) return;
 		event.preventDefault();
 		event.stopImmediatePropagation();
 	}
@@ -11443,10 +11467,200 @@ P
 	document.addEventListener('mouseup', blockSecondaryMouseInteraction, { capture: true });
 	document.addEventListener('auxclick', blockSecondaryMouseInteraction, { capture: true });
 	document.addEventListener('contextmenu', event => {
-		if (isPsnEditableTextTarget(event.target) || isPsnFileManagerInteractionTarget(event.target)) return;
+		if (isPsnEditableTextTarget(event.target) || isPsnFileManagerInteractionTarget(event.target) || getPsnImageContextTarget(event.target)) return;
 		event.preventDefault();
 		event.stopImmediatePropagation();
 	}, { capture: true });
+
+	(function installPsnImageContextMenu() {
+		if (window.__psnImageContextMenuInstalled) return;
+		window.__psnImageContextMenuInstalled = true;
+		let activeImage = null;
+		let menuTransientListenersBound = false;
+
+		function imageSource(image) {
+			return String((image && (image.currentSrc || image.src)) || '').trim();
+		}
+
+		function imageFileName(image, source) {
+			let name = '';
+			try {
+				const url = new URL(source, location.href);
+				name = decodeURIComponent(url.pathname.split('/').filter(Boolean).pop() || '');
+			} catch (e) {}
+			name = String(name || image?.getAttribute?.('alt') || 'image').replace(/[\\/:*?"<>|]+/g, '_').trim();
+			if (!name || !/\.[a-z0-9]{2,5}$/i.test(name)) name = (name || 'image') + '.png';
+			return name.slice(0, 160);
+		}
+
+		function getMenu() {
+			let menu = document.getElementById('image-context-menu');
+			if (menu) return menu;
+			menu = document.createElement('div');
+			menu.id = 'image-context-menu';
+			menu.className = 'fm-context-menu';
+			menu.setAttribute('role', 'menu');
+			menu.innerHTML = '<div class="fm-context-menu-title" data-no-translate="true" translate="no">IMAGE</div><button type="button" class="fm-context-menu-item" role="menuitem" data-image-context-action="copy"><i class="fas fa-copy"></i><span>Copy image</span></button><button type="button" class="fm-context-menu-item" role="menuitem" data-image-context-action="download"><i class="fas fa-download"></i><span>Download image</span></button>';
+			document.body.appendChild(menu);
+			menu.addEventListener('click', event => {
+				const action = event.target?.closest?.('[data-image-context-action]')?.dataset?.imageContextAction || '';
+				if (!action || !activeImage) return;
+				event.preventDefault();
+				event.stopPropagation();
+				const image = activeImage;
+				closeMenu();
+				if (action === 'copy') copyImage(image);
+				else if (action === 'download') downloadImage(image);
+			});
+			menu.querySelectorAll('.fm-context-menu-item').forEach(button => button.addEventListener('mouseenter', () => { if (typeof playUiHover === 'function') playUiHover(); }));
+			return menu;
+		}
+
+		function handleMenuPointerDown(event) {
+			const menu = document.getElementById('image-context-menu');
+			if (menu?.classList.contains('is-open') && !menu.contains(event.target)) closeMenu();
+		}
+
+		function handleMenuKeydown(event) {
+			if (event.key !== 'Escape') return;
+			event.preventDefault();
+			event.stopImmediatePropagation();
+			closeMenu();
+		}
+
+		function handleMenuViewportChange() {
+			closeMenu();
+		}
+
+		function bindMenuTransientListeners() {
+			if (menuTransientListenersBound) return;
+			menuTransientListenersBound = true;
+			document.addEventListener('pointerdown', handleMenuPointerDown, { capture:true });
+			document.addEventListener('keydown', handleMenuKeydown, { capture:true });
+			window.addEventListener('scroll', handleMenuViewportChange, { passive:true, capture:true });
+			window.addEventListener('resize', handleMenuViewportChange, { passive:true });
+		}
+
+		function unbindMenuTransientListeners() {
+			if (!menuTransientListenersBound) return;
+			menuTransientListenersBound = false;
+			document.removeEventListener('pointerdown', handleMenuPointerDown, { capture:true });
+			document.removeEventListener('keydown', handleMenuKeydown, { capture:true });
+			window.removeEventListener('scroll', handleMenuViewportChange, { capture:true });
+			window.removeEventListener('resize', handleMenuViewportChange);
+		}
+
+		function closeMenu() {
+			const menu = document.getElementById('image-context-menu');
+			activeImage = null;
+			unbindMenuTransientListeners();
+			if (!menu) return;
+			menu.classList.remove('is-open', 'is-closing');
+			menu.style.display = 'none';
+		}
+
+		function openMenu(event, image) {
+			const source = imageSource(image);
+			if (!source) return false;
+			const menu = getMenu();
+			activeImage = image;
+			const title = menu.querySelector('.fm-context-menu-title');
+			if (title) title.textContent = imageFileName(image, source);
+			menu.style.display = 'block';
+			menu.classList.remove('is-closing');
+			menu.classList.add('is-open');
+			const gap = 8;
+			const width = menu.offsetWidth;
+			const height = menu.offsetHeight;
+			menu.style.left = `${Math.round(Math.max(gap, Math.min(event.clientX, window.innerWidth - width - gap)))}px`;
+			menu.style.top = `${Math.round(Math.max(gap, Math.min(event.clientY, window.innerHeight - height - gap)))}px`;
+			bindMenuTransientListeners();
+			if (typeof playUiClick === 'function') playUiClick();
+			return true;
+		}
+
+		async function fetchImageBlob(source) {
+			const response = await fetch(source, { mode:'cors', credentials:'omit', cache:'force-cache' });
+			if (!response.ok) throw new Error('image-fetch-failed');
+			const blob = await response.blob();
+			if (!blob || !String(blob.type || '').startsWith('image/')) throw new Error('not-image');
+			return blob;
+		}
+
+		async function asPng(blob) {
+			if (blob.type === 'image/png') return blob;
+			const bitmap = await createImageBitmap(blob);
+			try {
+				const canvas = document.createElement('canvas');
+				canvas.width = bitmap.width;
+				canvas.height = bitmap.height;
+				canvas.getContext('2d', { alpha:true }).drawImage(bitmap, 0, 0);
+				return await new Promise((resolve, reject) => canvas.toBlob(result => result ? resolve(result) : reject(new Error('png-convert-failed')), 'image/png'));
+			} finally {
+				if (bitmap && typeof bitmap.close === 'function') bitmap.close();
+			}
+		}
+
+		async function copyImage(image) {
+			const source = imageSource(image);
+			if (!source) return;
+			try {
+				if (!navigator.clipboard || typeof navigator.clipboard.write !== 'function' || typeof ClipboardItem === 'undefined') throw new Error('clipboard-image-unavailable');
+				const png = await asPng(await fetchImageBlob(source));
+				await navigator.clipboard.write([new ClipboardItem({ 'image/png': png })]);
+				if (typeof playUiSuccess === 'function') playUiSuccess();
+				if (typeof showToastNotification === 'function') showToastNotification('Image', 'Image copied to clipboard.');
+			} catch (error) {
+				try {
+					if (!navigator.clipboard || typeof navigator.clipboard.writeText !== 'function') throw error;
+					await navigator.clipboard.writeText(source);
+					if (typeof playUiSuccess === 'function') playUiSuccess();
+					if (typeof showToastNotification === 'function') showToastNotification('Image', 'Image link copied.');
+				} catch (fallbackError) {
+					if (typeof playUiError === 'function') playUiError();
+					if (typeof showToastNotification === 'function') showToastNotification('Image', 'Could not copy this image.');
+				}
+			}
+		}
+
+		async function downloadImage(image) {
+			const source = imageSource(image);
+			if (!source) return;
+			const fileName = imageFileName(image, source);
+			let objectUrl = '';
+			try {
+				objectUrl = URL.createObjectURL(await fetchImageBlob(source));
+				const link = document.createElement('a');
+				link.href = objectUrl;
+				link.download = fileName;
+				link.style.display = 'none';
+				document.body.appendChild(link);
+				link.click();
+				link.remove();
+				if (typeof playUiSuccess === 'function') playUiSuccess();
+			} catch (error) {
+				const link = document.createElement('a');
+				link.href = source;
+				link.download = fileName;
+				link.target = '_blank';
+				link.rel = 'noopener';
+				link.style.display = 'none';
+				document.body.appendChild(link);
+				link.click();
+				link.remove();
+			} finally {
+				if (objectUrl) setTimeout(() => URL.revokeObjectURL(objectUrl), 1200);
+			}
+		}
+
+		document.addEventListener('contextmenu', event => {
+			const image = getPsnImageContextTarget(event.target);
+			if (!image || !imageSource(image)) return;
+			event.preventDefault();
+			event.stopImmediatePropagation();
+			openMenu(event, image);
+		}, { capture:true });
+	})();
 
 	if (!window.__psnBrowserInteractionGuardsBound) {
 		window.__psnBrowserInteractionGuardsBound = true;
@@ -11473,7 +11687,7 @@ P
 			}
 
 			const keyboardContextMenu = key === 'ContextMenu' || (event.shiftKey && key === 'F10');
-			if (keyboardContextMenu && !isPsnEditableTextTarget(event.target) && !isPsnFileManagerInteractionTarget(event.target)) {
+			if (keyboardContextMenu && !isPsnEditableTextTarget(event.target) && !isPsnFileManagerInteractionTarget(event.target) && !getPsnImageContextTarget(event.target)) {
 				event.preventDefault();
 				event.stopImmediatePropagation();
 			}
@@ -65511,204 +65725,6 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 		updateModalContent();
 	};
     
-
-	/* Shared image context menu for chat media, screenshots and the full image viewer. */
-	(function installPsnImageContextMenu(){
-		if (window.__psnImageContextMenuInstalled) return;
-		window.__psnImageContextMenuInstalled = true;
-
-		const IMAGE_CONTEXT_SELECTOR = [
-			'#psn-image-modal img',
-			'.screenshot-item',
-			'.chat-gallery img',
-			'.msg-bubble img:not(.chat-avatar-clickable)',
-			'.direct-message-media-item img',
-			'.direct-message-bubble .link-preview-card img',
-			'.metadata-screenshot-preview img',
-			'.admin-metadata-suggestion-screenshot-strip img'
-		].join(',');
-		let activeImage = null;
-
-		function imageContextSource(image) {
-			return String((image && (image.currentSrc || image.src)) || '').trim();
-		}
-
-		function imageContextFileName(image, source) {
-			let name = '';
-			try {
-				const url = new URL(source, location.href);
-				name = decodeURIComponent(url.pathname.split('/').filter(Boolean).pop() || '');
-			} catch (e) {}
-			name = String(name || image?.getAttribute?.('alt') || 'image').replace(/[\\/:*?"<>|]+/g, '_').trim();
-			if (!name || !/\.[a-z0-9]{2,5}$/i.test(name)) name = (name || 'image') + '.png';
-			return name.slice(0, 160);
-		}
-
-		function ensureImageContextMenu() {
-			let menu = document.getElementById('image-context-menu');
-			if (menu) return menu;
-			menu = document.createElement('div');
-			menu.id = 'image-context-menu';
-			menu.className = 'fm-context-menu';
-			menu.setAttribute('role', 'menu');
-			menu.innerHTML = '<div class="fm-context-menu-title">IMAGE</div><button type="button" class="fm-context-menu-item" role="menuitem" data-image-context-action="copy"><i class="fas fa-copy"></i><span>Copy image</span></button><button type="button" class="fm-context-menu-item" role="menuitem" data-image-context-action="download"><i class="fas fa-download"></i><span>Download image</span></button>';
-			document.body.appendChild(menu);
-			menu.addEventListener('click', event => {
-				const action = event.target?.closest?.('[data-image-context-action]')?.dataset?.imageContextAction || '';
-				if (!action || !activeImage) return;
-				event.preventDefault();
-				event.stopPropagation();
-				const image = activeImage;
-				closeImageContextMenu(true);
-				if (action === 'copy') copyPsnContextImage(image);
-				if (action === 'download') downloadPsnContextImage(image);
-			});
-			menu.querySelectorAll('.fm-context-menu-item').forEach(button => {
-				button.addEventListener('mouseenter', () => { if (typeof playUiHover === 'function') playUiHover(); });
-			});
-			return menu;
-		}
-
-		function closeImageContextMenu(immediate = false) {
-			const menu = document.getElementById('image-context-menu');
-			activeImage = null;
-			if (!menu) return;
-			menu.classList.remove('is-open');
-			if (immediate) {
-				menu.classList.remove('is-closing');
-				menu.style.display = 'none';
-				return;
-			}
-			menu.classList.add('is-closing');
-			setTimeout(() => {
-				if (!menu.classList.contains('is-open')) {
-					menu.classList.remove('is-closing');
-					menu.style.display = 'none';
-				}
-			}, 110);
-		}
-
-		function openImageContextMenu(event, image) {
-			const source = imageContextSource(image);
-			if (!source) return false;
-			const menu = ensureImageContextMenu();
-			activeImage = image;
-			const title = menu.querySelector('.fm-context-menu-title');
-			if (title) title.textContent = imageContextFileName(image, source);
-			menu.style.display = 'block';
-			menu.classList.remove('is-closing');
-			menu.classList.add('is-open');
-			const gap = 8;
-			const width = menu.offsetWidth;
-			const height = menu.offsetHeight;
-			const left = Math.max(gap, Math.min(event.clientX, window.innerWidth - width - gap));
-			const top = Math.max(gap, Math.min(event.clientY, window.innerHeight - height - gap));
-			menu.style.left = `${Math.round(left)}px`;
-			menu.style.top = `${Math.round(top)}px`;
-			if (typeof playUiClick === 'function') playUiClick();
-			return true;
-		}
-
-		async function fetchPsnContextImageBlob(source) {
-			const response = await fetch(source, { mode:'cors', credentials:'omit', cache:'force-cache' });
-			if (!response.ok) throw new Error('image-fetch-failed');
-			const blob = await response.blob();
-			if (!blob || !String(blob.type || '').startsWith('image/')) throw new Error('not-image');
-			return blob;
-		}
-
-		async function imageBlobAsPng(blob) {
-			if (blob.type === 'image/png') return blob;
-			const bitmap = await createImageBitmap(blob);
-			try {
-				const canvas = document.createElement('canvas');
-				canvas.width = bitmap.width;
-				canvas.height = bitmap.height;
-				const ctx = canvas.getContext('2d', { alpha:true });
-				ctx.drawImage(bitmap, 0, 0);
-				return await new Promise((resolve, reject) => canvas.toBlob(result => result ? resolve(result) : reject(new Error('png-convert-failed')), 'image/png'));
-			} finally {
-				if (bitmap && typeof bitmap.close === 'function') bitmap.close();
-			}
-		}
-
-		async function copyPsnContextImage(image) {
-			const source = imageContextSource(image);
-			if (!source) return;
-			try {
-				if (!navigator.clipboard || typeof navigator.clipboard.write !== 'function' || typeof ClipboardItem === 'undefined') throw new Error('image-clipboard-unavailable');
-				const blob = await fetchPsnContextImageBlob(source);
-				const png = await imageBlobAsPng(blob);
-				await navigator.clipboard.write([new ClipboardItem({ 'image/png': png })]);
-				if (typeof playUiSuccess === 'function') playUiSuccess();
-				if (typeof showToastNotification === 'function') showToastNotification('Image', 'Image copied to clipboard.');
-			} catch (error) {
-				try {
-					await navigator.clipboard.writeText(source);
-					if (typeof playUiSuccess === 'function') playUiSuccess();
-					if (typeof showToastNotification === 'function') showToastNotification('Image', 'Image link copied.');
-				} catch (fallbackError) {
-					if (typeof playUiError === 'function') playUiError();
-					if (typeof showToastNotification === 'function') showToastNotification('Image', 'Could not copy this image.');
-				}
-			}
-		}
-
-		async function downloadPsnContextImage(image) {
-			const source = imageContextSource(image);
-			if (!source) return;
-			const fileName = imageContextFileName(image, source);
-			let objectUrl = '';
-			try {
-				const blob = await fetchPsnContextImageBlob(source);
-				objectUrl = URL.createObjectURL(blob);
-				const link = document.createElement('a');
-				link.href = objectUrl;
-				link.download = fileName;
-				link.style.display = 'none';
-				document.body.appendChild(link);
-				link.click();
-				link.remove();
-				if (typeof playUiSuccess === 'function') playUiSuccess();
-			} catch (error) {
-				const link = document.createElement('a');
-				link.href = source;
-				link.download = fileName;
-				link.target = '_blank';
-				link.rel = 'noopener';
-				link.style.display = 'none';
-				document.body.appendChild(link);
-				link.click();
-				link.remove();
-			} finally {
-				if (objectUrl) setTimeout(() => URL.revokeObjectURL(objectUrl), 1200);
-			}
-		}
-
-		document.addEventListener('contextmenu', event => {
-			const image = event.target?.closest?.(IMAGE_CONTEXT_SELECTOR);
-			if (!image) return;
-			const source = imageContextSource(image);
-			if (!source) return;
-			event.preventDefault();
-			event.stopPropagation();
-			openImageContextMenu(event, image);
-		}, true);
-		document.addEventListener('pointerdown', event => {
-			const menu = document.getElementById('image-context-menu');
-			if (menu?.classList.contains('is-open') && !menu.contains(event.target)) closeImageContextMenu(true);
-		}, true);
-		document.addEventListener('keydown', event => {
-			if (event.key === 'Escape' && document.getElementById('image-context-menu')?.classList.contains('is-open')) {
-				event.preventDefault();
-				event.stopImmediatePropagation();
-				closeImageContextMenu(true);
-			}
-		}, true);
-		window.addEventListener('scroll', () => closeImageContextMenu(true), { passive:true, capture:true });
-		window.addEventListener('resize', () => closeImageContextMenu(true), { passive:true });
-	})();
-
     function trackUser(username) {
         if (!username || username === "Guest") return;
         const batchContext = window.__chatRenderBatchContext || null;
@@ -74462,8 +74478,7 @@ function getVisibleChatStackEl(id) {
 		const stamp = Date.parse(value || '');
 		if (!stamp) return 'Seen';
 		const date = new Date(stamp);
-		const age = Math.max(0, Date.now() - stamp);
-		if (age < 24 * 60 * 60 * 1000) {
+		if (Math.max(0, Date.now() - stamp) < 24 * 60 * 60 * 1000) {
 			return `Seen ${date.toLocaleTimeString([], { hour:'2-digit', minute:'2-digit' })}`;
 		}
 		return `Seen ${date.toLocaleDateString([], { day:'2-digit', month:'2-digit', year:'numeric' })}`;
@@ -75636,13 +75651,11 @@ function getVisibleChatStackEl(id) {
 				const peerReadId = directMessageIdNumber(state.peerLastReadId);
 				state.messages.forEach(message => {
 					if (!message || message.from !== me || message.seenAt) return;
-					if (directMessageIdNumber(message.id) > 0 && directMessageIdNumber(message.id) <= peerReadId) message.seenAt = readAt || new Date().toISOString();
+					const id = directMessageIdNumber(message.id);
+					if (id > 0 && id <= peerReadId) message.seenAt = readAt || new Date().toISOString();
 				});
 				const conversation = directFindConversation(payload.reader);
-				if (conversation) {
-					conversation.peerLastReadId = state.peerLastReadId;
-					if (conversation.lastMessage && conversation.lastMessage.from === me && !conversation.lastMessage.seenAt && directMessageIdNumber(conversation.lastMessage.id) <= peerReadId) conversation.lastMessage.seenAt = readAt || new Date().toISOString();
-				}
+				if (conversation) conversation.peerLastReadId = state.peerLastReadId;
 				updateDirectSeenMarker();
 				return;
 			}

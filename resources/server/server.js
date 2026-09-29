@@ -2409,7 +2409,6 @@ async function initDb() {
     ALTER TABLE direct_messages ADD COLUMN IF NOT EXISTS reply_to JSONB;
     ALTER TABLE direct_messages ADD COLUMN IF NOT EXISTS reactions JSONB NOT NULL DEFAULT '[]'::jsonb;
     ALTER TABLE direct_messages ADD COLUMN IF NOT EXISTS edited_at TIMESTAMPTZ;
-    ALTER TABLE direct_messages ADD COLUMN IF NOT EXISTS seen_at TIMESTAMPTZ;
     CREATE INDEX IF NOT EXISTS idx_direct_messages_sender_recipient_id ON direct_messages(sender_name, recipient_name, id DESC);
     CREATE INDEX IF NOT EXISTS idx_direct_messages_recipient_sender_id ON direct_messages(recipient_name, sender_name, id DESC);
     CREATE TABLE IF NOT EXISTS direct_message_read_state (
@@ -8531,7 +8530,7 @@ async function getDirectConversationPayload(userName) {
       FROM direct_conversation_delete_state
       WHERE user_name = $1
     ), relevant AS (
-      SELECT dm.id, dm.sender_name, dm.recipient_name, dm.text, dm.message_type, dm.content, dm.reply_to, dm.reactions, dm.edited_at, dm.seen_at, dm.created_at,
+      SELECT dm.id, dm.sender_name, dm.recipient_name, dm.text, dm.message_type, dm.content, dm.reply_to, dm.reactions, dm.edited_at, dm.created_at,
              CASE WHEN dm.sender_name = $1 THEN dm.recipient_name ELSE dm.sender_name END AS peer_name
       FROM direct_messages dm
       LEFT JOIN delete_state ds
@@ -8540,7 +8539,7 @@ async function getDirectConversationPayload(userName) {
         AND dm.id > COALESCE(ds.deleted_through_id, 0)
     ), latest AS (
       SELECT DISTINCT ON (peer_name)
-             peer_name, id, sender_name, recipient_name, text, message_type, content, reply_to, reactions, edited_at, seen_at, created_at
+             peer_name, id, sender_name, recipient_name, text, message_type, content, reply_to, reactions, edited_at, created_at
       FROM relevant
       ORDER BY peer_name, id DESC
     ), unread AS (
@@ -8555,7 +8554,7 @@ async function getDirectConversationPayload(userName) {
         AND dm.id > COALESCE(ds.deleted_through_id, 0)
       GROUP BY dm.sender_name
     )
-    SELECT l.peer_name, l.id, l.sender_name, l.recipient_name, l.text, l.message_type, l.content, l.reply_to, l.reactions, l.edited_at, l.seen_at, l.created_at,
+    SELECT l.peer_name, l.id, l.sender_name, l.recipient_name, l.text, l.message_type, l.content, l.reply_to, l.reactions, l.edited_at, l.created_at,
            COALESCE(u.unread_count, 0)::int AS unread_count,
            COALESCE(my_read.last_read_id, 0) AS my_last_read_id,
            COALESCE(peer_read.last_read_id, 0) AS peer_last_read_id,
@@ -8618,6 +8617,11 @@ async function markDirectConversationRead(userName, peerName, requestedLastId = 
     ), target AS (
       SELECT CASE WHEN $3 > 0 THEN requested_id ELSE max_id END AS safe_id
       FROM bounds
+    ), existing AS (
+      SELECT COALESCE((
+        SELECT last_read_id FROM direct_message_read_state
+        WHERE user_name = $1 AND peer_name = $2
+      ), 0) AS previous_last_read_id
     ), upserted AS (
       INSERT INTO direct_message_read_state (user_name, peer_name, last_read_id, updated_at)
       SELECT $1, $2, safe_id, NOW() FROM target WHERE safe_id > 0
@@ -8626,33 +8630,96 @@ async function markDirectConversationRead(userName, peerName, requestedLastId = 
           updated_at = NOW()
       WHERE direct_message_read_state.last_read_id < EXCLUDED.last_read_id
       RETURNING last_read_id
-    ), resolved AS (
-      SELECT COALESCE(
-               (SELECT last_read_id FROM upserted),
-               (SELECT last_read_id FROM direct_message_read_state WHERE user_name = $1 AND peer_name = $2),
-               0
-             ) AS last_read_id,
-             EXISTS (SELECT 1 FROM upserted) AS changed,
-             NOW() AS read_at
-    ), seen_stamped AS (
-      UPDATE direct_messages dm
-      SET seen_at = resolved.read_at
-      FROM resolved
-      WHERE dm.sender_name = $2
-        AND dm.recipient_name = $1
-        AND dm.id <= resolved.last_read_id
-        AND dm.seen_at IS NULL
-      RETURNING dm.id
     )
-    SELECT resolved.last_read_id, resolved.changed, resolved.read_at,
-           (SELECT COUNT(*) FROM seen_stamped)::int AS seen_stamped_count
-    FROM resolved
+    SELECT COALESCE(
+             (SELECT last_read_id FROM upserted),
+             (SELECT last_read_id FROM direct_message_read_state WHERE user_name = $1 AND peer_name = $2),
+             0
+           ) AS last_read_id,
+           EXISTS (SELECT 1 FROM upserted) AS changed,
+           (SELECT previous_last_read_id FROM existing) AS previous_last_read_id
   `, [viewer, peer, requested], { attempts:2, label:'DIRECT READ UPSERT' });
 
   const lastReadId = Math.max(0, Number(result.rows?.[0]?.last_read_id) || 0);
+  const previousLastReadId = Math.max(0, Number(result.rows?.[0]?.previous_last_read_id) || 0);
   const changed = result.rows?.[0]?.changed === true;
-  const readAt = result.rows?.[0]?.read_at ? new Date(result.rows[0].read_at).toISOString() : '';
+  const readAt = changed ? await stampDirectSeenEvents(viewer, peer, previousLastReadId, lastReadId) : '';
   return { lastReadId, changed, readAt };
+}
+
+let directSeenEventsTableReady = false;
+let directSeenEventsTablePromise = null;
+
+async function ensureDirectSeenEventsTable() {
+  if (directSeenEventsTableReady) return true;
+  if (directSeenEventsTablePromise) return directSeenEventsTablePromise;
+  directSeenEventsTablePromise = queryDbWithRetry(`
+    CREATE TABLE IF NOT EXISTS direct_message_seen_events (
+      message_id BIGINT PRIMARY KEY REFERENCES direct_messages(id) ON DELETE CASCADE,
+      seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `, [], { attempts:1, label:'DIRECT SEEN TABLE INIT' })
+    .then(() => { directSeenEventsTableReady = true; return true; })
+    .catch(err => {
+      console.warn('[DIRECT SEEN TABLE INIT] Skipped:', err && err.message ? err.message : err);
+      return false;
+    })
+    .finally(() => { directSeenEventsTablePromise = null; });
+  return directSeenEventsTablePromise;
+}
+
+async function stampDirectSeenEvents(readerName, peerName, previousLastReadId, lastReadId) {
+  const reader = normalizeDirectMessageUser(readerName);
+  const peer = normalizeDirectMessageUser(peerName);
+  const previous = Math.max(0, Number(previousLastReadId) || 0);
+  const current = Math.max(0, Number(lastReadId) || 0);
+  if (!reader || !peer || reader === peer || !current || current <= previous) return '';
+  if (!await ensureDirectSeenEventsTable()) return '';
+  try {
+    const result = await queryDbWithRetry(`
+      INSERT INTO direct_message_seen_events (message_id, seen_at)
+      SELECT dm.id, NOW()
+      FROM direct_messages dm
+      WHERE dm.sender_name = $2
+        AND dm.recipient_name = $1
+        AND dm.id > $3
+        AND dm.id <= $4
+      ON CONFLICT (message_id) DO NOTHING
+      RETURNING seen_at
+    `, [reader, peer, previous, current], { attempts:1, label:'DIRECT SEEN SAVE' });
+    const seenAt = result.rows && result.rows[0] && result.rows[0].seen_at;
+    return seenAt ? new Date(seenAt).toISOString() : '';
+  } catch (err) {
+    console.warn('[DIRECT SEEN SAVE] Skipped:', err && err.message ? err.message : err);
+    return '';
+  }
+}
+
+async function attachDirectSeenEvents(messages = [], senderName = '', maxSeenId = 0) {
+  const list = Array.isArray(messages) ? messages : [];
+  const sender = normalizeDirectMessageUser(senderName);
+  const seenThroughId = Math.max(0, Number(maxSeenId) || 0);
+  if (!sender || !seenThroughId) return list;
+  const ids = list
+    .filter(message => message && message.from === sender)
+    .map(message => Math.max(0, Number(message.id) || 0))
+    .filter(id => id > 0 && id <= seenThroughId);
+  if (!ids.length || !await ensureDirectSeenEventsTable()) return list;
+  try {
+    const result = await queryDbWithRetry(
+      'SELECT message_id, seen_at FROM direct_message_seen_events WHERE message_id = ANY($1::bigint[])',
+      [ids],
+      { attempts:1, label:'DIRECT SEEN READ' }
+    );
+    const seenById = new Map((result.rows || []).map(row => [String(row.message_id || ''), row.seen_at ? new Date(row.seen_at).toISOString() : '']));
+    list.forEach(message => {
+      const seenAt = seenById.get(String(message && message.id || ''));
+      if (message && seenAt) message.seenAt = seenAt;
+    });
+  } catch (err) {
+    console.warn('[DIRECT SEEN READ] Skipped:', err && err.message ? err.message : err);
+  }
+  return list;
 }
 
 async function getDirectHistoryPayload(userName, peerName, options = {}) {
@@ -8695,7 +8762,7 @@ async function getDirectHistoryPayload(userName, peerName, options = {}) {
       WHERE u.name = $2
       LIMIT 1
     ), history AS (
-      SELECT id, sender_name, recipient_name, text, message_type, content, reply_to, reactions, edited_at, seen_at, created_at,
+      SELECT id, sender_name, recipient_name, text, message_type, content, reply_to, reactions, edited_at, created_at,
              COUNT(*) OVER () AS total_count
       FROM direct_messages
       WHERE ((sender_name = $1 AND recipient_name = $2)
@@ -8729,6 +8796,8 @@ async function getDirectHistoryPayload(userName, peerName, options = {}) {
     readStateChanged = readState.changed === true;
     readAt = readState.readAt || '';
   }
+
+  await attachDirectSeenEvents(messages, viewer, peerLastReadId);
 
   return {
     success:true,
@@ -9249,7 +9318,7 @@ async function initProfileSyncNotifications() {
           if (!messageId || !from || !to) return;
           if (!getSocketsByUserName(from).length && !getSocketsByUserName(to).length) return;
           const directResult = await queryDbWithRetry(
-            'SELECT id, sender_name, recipient_name, text, message_type, content, reply_to, reactions, edited_at, seen_at, created_at FROM direct_messages WHERE id = $1 LIMIT 1',
+            'SELECT id, sender_name, recipient_name, text, message_type, content, reply_to, reactions, edited_at, created_at FROM direct_messages WHERE id = $1 LIMIT 1',
             [messageId],
             { attempts:2, label:'DIRECT MESSAGE SYNC READ' }
           );
@@ -13558,7 +13627,7 @@ io.on('connection', (socket) => {
           FROM direct_conversation_delete_state
           WHERE user_name = $1
         ), visible AS (
-          SELECT dm.id, dm.sender_name, dm.recipient_name, dm.text, dm.message_type, dm.content, dm.reply_to, dm.reactions, dm.edited_at, dm.seen_at, dm.created_at,
+          SELECT dm.id, dm.sender_name, dm.recipient_name, dm.text, dm.message_type, dm.content, dm.reply_to, dm.reactions, dm.edited_at, dm.created_at,
                  CASE WHEN dm.sender_name = $1 THEN dm.recipient_name ELSE dm.sender_name END AS peer_name,
                  MAX(CASE WHEN dm.recipient_name = $1 THEN dm.created_at END) OVER (
                    PARTITION BY CASE WHEN dm.sender_name = $1 THEN dm.recipient_name ELSE dm.sender_name END
@@ -13575,7 +13644,7 @@ io.on('connection', (socket) => {
         ), recent AS (
           SELECT * FROM visible WHERE peer_rank <= $3
         )
-        SELECT r.id, r.sender_name, r.recipient_name, r.text, r.message_type, r.content, r.reply_to, r.reactions, r.edited_at, r.seen_at, r.created_at,
+        SELECT r.id, r.sender_name, r.recipient_name, r.text, r.message_type, r.content, r.reply_to, r.reactions, r.edited_at, r.created_at,
                r.peer_name,
                COALESCE(u.data->>'avatar', $4) AS peer_avatar,
                COALESCE(u.data->>'lastSeen', '') AS peer_last_seen,
@@ -13666,7 +13735,7 @@ io.on('connection', (socket) => {
       const replyId = Math.max(0, Number(data && data.replyTo && typeof data.replyTo === 'object' ? data.replyTo.id : data.replyTo) || 0);
       if (replyId) {
         const replyResult = await queryDbWithRetry(`
-          SELECT id, sender_name, recipient_name, text, message_type, content, reply_to, reactions, edited_at, seen_at, created_at
+          SELECT id, sender_name, recipient_name, text, message_type, content, reply_to, reactions, edited_at, created_at
           FROM direct_messages
           WHERE id = $1
             AND ((sender_name = $2 AND recipient_name = $3) OR (sender_name = $3 AND recipient_name = $2))
@@ -13684,7 +13753,7 @@ io.on('connection', (socket) => {
       const inserted = await queryDbWithRetry(`
         INSERT INTO direct_messages (sender_name, recipient_name, text, message_type, content, reply_to)
         VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb)
-        RETURNING id, sender_name, recipient_name, text, message_type, content, reply_to, reactions, edited_at, seen_at, created_at
+        RETURNING id, sender_name, recipient_name, text, message_type, content, reply_to, reactions, edited_at, created_at
       `, [sender, recipient, text, messageType, content.length ? JSON.stringify(content) : null, replySnapshot ? JSON.stringify(replySnapshot) : null], { attempts:2, label:'DIRECT MESSAGE INSERT' });
       const message = serializeDirectMessage(inserted.rows[0]);
       if (!message) return respond({ success:false, message:'Could not save the message.' });
@@ -13717,7 +13786,7 @@ io.on('connection', (socket) => {
       client = await pool.connect();
       await client.query('BEGIN');
       const found = await client.query(`
-        SELECT id, sender_name, recipient_name, text, message_type, content, reply_to, reactions, edited_at, seen_at, created_at
+        SELECT id, sender_name, recipient_name, text, message_type, content, reply_to, reactions, edited_at, created_at
         FROM direct_messages
         WHERE id = $1 AND (sender_name = $2 OR recipient_name = $2)
         FOR UPDATE
@@ -13738,7 +13807,7 @@ io.on('connection', (socket) => {
       const next = reactions.filter(item => Array.isArray(item.users) && item.users.length);
       const updated = await client.query(`
         UPDATE direct_messages SET reactions = $2::jsonb WHERE id = $1
-        RETURNING id, sender_name, recipient_name, text, message_type, content, reply_to, reactions, edited_at, seen_at, created_at
+        RETURNING id, sender_name, recipient_name, text, message_type, content, reply_to, reactions, edited_at, created_at
       `, [messageId, JSON.stringify(next)]);
       await client.query('COMMIT');
       const message = serializeDirectMessage(updated.rows && updated.rows[0]);
@@ -13763,7 +13832,7 @@ io.on('connection', (socket) => {
     if (!actor || !messageId) return respond({ success:false, message:'Invalid message.' });
     try {
       const current = await queryDbWithRetry(`
-        SELECT id, sender_name, recipient_name, text, message_type, content, reply_to, reactions, edited_at, seen_at, created_at
+        SELECT id, sender_name, recipient_name, text, message_type, content, reply_to, reactions, edited_at, created_at
         FROM direct_messages WHERE id = $1 AND sender_name = $2 LIMIT 1
       `, [messageId, actor], { attempts:2, label:'DIRECT EDIT READ' });
       const existing = serializeDirectMessage(current.rows && current.rows[0]);
@@ -13772,7 +13841,7 @@ io.on('connection', (socket) => {
       const updated = await queryDbWithRetry(`
         UPDATE direct_messages SET text = $3, edited_at = NOW()
         WHERE id = $1 AND sender_name = $2
-        RETURNING id, sender_name, recipient_name, text, message_type, content, reply_to, reactions, edited_at, seen_at, created_at
+        RETURNING id, sender_name, recipient_name, text, message_type, content, reply_to, reactions, edited_at, created_at
       `, [messageId, actor, text], { attempts:2, label:'DIRECT EDIT UPDATE' });
       const message = serializeDirectMessage(updated.rows && updated.rows[0]);
       if (!message) return respond({ success:false, message:'Could not edit the message.' });
