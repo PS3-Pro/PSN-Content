@@ -10368,11 +10368,14 @@ function normalizeUserNotificationData(type, rawData = {}) {
   }
   if (type === 'private_message') {
     const messageType = normalizeText(source.messageType, 'text').toLowerCase();
+    const privateKindRaw = normalizeText(source.privateKind, 'message').toLowerCase();
     return {
       actor: normalizeSocialUserName(source.actor),
       messageId: normalizeText(source.messageId, '').slice(0, 100),
       text: normalizeText(source.text, '').slice(0, 280),
-      messageType: ['text', 'image', 'gif'].includes(messageType) ? messageType : 'text'
+      messageType: ['text', 'image', 'gif'].includes(messageType) ? messageType : 'text',
+      privateKind: ['message', 'reply', 'mention', 'reaction'].includes(privateKindRaw) ? privateKindRaw : 'message',
+      emoji: normalizeText(source.emoji, '').slice(0, 24)
     };
   }
   if (type === 'game_match') {
@@ -10656,6 +10659,40 @@ async function removeChatReactionNotification(messageOwner, messageId, actor, em
   }
 }
 
+function getDirectReactionNotificationDedupeKey(messageId, messageOwner, actor, emoji) {
+  const id = normalizeText(messageId, '').slice(0, 100);
+  const owner = normalizeSocialUserName(messageOwner).toLowerCase();
+  const reactingUser = normalizeSocialUserName(actor).toLowerCase();
+  const reactionEmoji = normalizeText(emoji, '').slice(0, 24);
+  if (!id || !owner || !reactingUser || !reactionEmoji) return '';
+  return `direct-reaction:${id}:${owner}:${reactingUser}:${reactionEmoji}`;
+}
+
+async function removeDirectReactionNotification(messageOwner, messageId, actor, emoji) {
+  const owner = normalizeSocialUserName(messageOwner);
+  const dedupeKey = getDirectReactionNotificationDedupeKey(messageId, owner, actor, emoji);
+  if (!owner || !dedupeKey) return false;
+  try {
+    const result = await queryDbWithRetry(
+      `DELETE FROM user_notifications
+       WHERE user_name = $1 AND event_type = 'private_message' AND dedupe_key = $2
+       RETURNING id`,
+      [owner, dedupeKey],
+      { attempts: 2, label: 'DIRECT REACTION NOTIFICATION REMOVE' }
+    );
+    const row = result.rows[0];
+    if (!row) return false;
+    const notificationId = String(row.id || '');
+    const unreadCount = await getUserNotificationUnreadCount(owner);
+    emitUserNotificationDeletedToLocalUser(owner, notificationId, unreadCount);
+    deferServerTask('DIRECT REACTION NOTIFICATION REMOVE SYNC', () => notifyUserNotificationDeletedAcrossInstances(owner, notificationId, unreadCount), 0);
+    return true;
+  } catch (err) {
+    console.error('[DIRECT REACTION NOTIFICATION REMOVE ERROR]:', err && err.message ? err.message : err);
+    return false;
+  }
+}
+
 async function markChatMessagesNotificationsDeleted(messageIds = []) {
   const ids = Array.from(new Set((Array.isArray(messageIds) ? messageIds : [messageIds])
     .map(id => normalizeText(id, '').slice(0, 100))
@@ -10848,6 +10885,23 @@ function extractChatRoleMentionTargets(text, senderName) {
     if ((wantsAdmin && role === 'admin') || (wantsModerator && role === 'mod')) targets.push(name);
   });
   return targets;
+}
+
+function chatNotificationTextMentionsUser(text, userName) {
+  const source = String(text || '').toLowerCase();
+  const target = normalizeSocialUserName(userName).toLowerCase();
+  if (!source || !target || !source.includes('@')) return false;
+  const needle = `@${target}`;
+  const isBoundary = ch => !ch || /[\s.,!?;:()\[\]{}<>"'`]/.test(ch);
+  let from = 0;
+  while (from < source.length) {
+    const index = source.indexOf(needle, from);
+    if (index < 0) return false;
+    const end = index + needle.length;
+    from = index + 1;
+    if (isBoundary(index > 0 ? source[index - 1] : '') && isBoundary(source[end] || '')) return true;
+  }
+  return false;
 }
 
 function extractChatMentionTargets(text, senderName) {
@@ -13829,11 +13883,15 @@ io.on('connection', (socket) => {
       emitDirectMessageToLocalUsers(message, socket.id);
       deferServerTask('DIRECT MESSAGE NOTIFY', () => notifyDirectMessageAcrossInstances('message', message), 0);
       scheduleDirectConversationRetention(sender, recipient);
+      const isDirectMention = chatNotificationTextMentionsUser(message.text || '', recipient);
+      const isDirectReply = !!(replySnapshot && String(replySnapshot.from || '').toLowerCase() === recipient.toLowerCase());
+      const privateKind = isDirectMention ? 'mention' : (isDirectReply ? 'reply' : 'message');
       deferServerTask('DIRECT MESSAGE USER NOTIFICATION', () => recordUserNotification(recipient, 'private_message', {
         actor: sender,
         messageId: message.id,
         text: directMessagePlainText(message.text).slice(0, 280),
-        messageType: message.type
+        messageType: message.type,
+        privateKind
       }, { dedupeKey:`${recipient.toLowerCase()}:private_message:${message.id}`, at:Date.parse(message.createdAt) || Date.now() }), 0);
       respond({ success:true, message });
     } catch (err) {
@@ -13862,15 +13920,23 @@ io.on('connection', (socket) => {
       const row = found.rows && found.rows[0];
       if (!row) { await client.query('ROLLBACK'); return respond({ success:false, message:'Message not found.' }); }
       const reactions = normalizeDirectMessageReactions(row.reactions);
+      let reactionAdded = false;
+      let reactionRemoved = false;
       let entry = reactions.find(item => item.emoji === emoji);
       if (entry) {
         const idx = entry.users.indexOf(actor);
-        if (idx >= 0) entry.users.splice(idx, 1);
-        else entry.users.push(actor);
+        if (idx >= 0) {
+          entry.users.splice(idx, 1);
+          reactionRemoved = true;
+        } else {
+          entry.users.push(actor);
+          reactionAdded = true;
+        }
         entry.users = Array.from(new Set(entry.users)).slice(0, 2);
         entry.count = entry.users.length;
       } else {
         reactions.push({ emoji, count:1, users:[actor] });
+        reactionAdded = true;
       }
       const next = reactions.filter(item => Array.isArray(item.users) && item.users.length);
       const updated = await client.query(`
@@ -13882,6 +13948,25 @@ io.on('connection', (socket) => {
       if (!message) return respond({ success:false, message:'Could not update reaction.' });
       emitDirectMessageUpdateToLocalUsers(message, socket.id);
       deferServerTask('DIRECT REACTION NOTIFY', () => notifyDirectMessageAcrossInstances('update', message), 0);
+      const messageOwner = normalizeSocialUserName(row.sender_name);
+      if (messageOwner && messageOwner.toLowerCase() !== actor.toLowerCase()) {
+        const reactionDedupeKey = getDirectReactionNotificationDedupeKey(message.id, messageOwner, actor, emoji);
+        if (reactionAdded && reactionDedupeKey) {
+          deferServerTask('DIRECT REACTION USER NOTIFICATION', () => runSerializedChatReactionNotificationMutation(reactionDedupeKey, () => recordUserNotification(messageOwner, 'private_message', {
+            actor,
+            messageId: message.id,
+            text: directMessagePlainText(message.text).slice(0, 280),
+            messageType: message.type,
+            privateKind: 'reaction',
+            emoji
+          }, {
+            dedupeKey: reactionDedupeKey,
+            at: Date.now()
+          })), 0);
+        } else if (reactionRemoved && reactionDedupeKey) {
+          deferServerTask('DIRECT REACTION USER NOTIFICATION REMOVE', () => runSerializedChatReactionNotificationMutation(reactionDedupeKey, () => removeDirectReactionNotification(messageOwner, message.id, actor, emoji)), 0);
+        }
+      }
       respond({ success:true, message });
     } catch (err) {
       if (client) { try { await client.query('ROLLBACK'); } catch (e) {} }
