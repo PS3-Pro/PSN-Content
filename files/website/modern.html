@@ -6497,6 +6497,8 @@ img { -webkit-user-drag: none !important; user-drag: none !important; }
 .direct-message-reply:hover { background:rgba(0,0,0,.3); }
 .direct-message-reply-user { display:block; color:#66ccff; font-size:10px; font-weight:700; margin-bottom:2px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 .direct-message-reply-text { display:block; color:rgba(255,255,255,.55); font-size:10px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.direct-typing-indicator { flex:0 0 auto; max-height:0; overflow:hidden; padding:0 14px; display:flex; align-items:center; gap:8px; opacity:0; transform:translateY(4px); pointer-events:none; transition:max-height .18s ease,padding .18s ease,opacity .18s ease,transform .18s ease; }
+.direct-typing-indicator.is-visible { max-height:42px; padding:6px 14px 4px; opacity:1; transform:translateY(0); }
 .direct-compose-context { flex:0 0 auto; margin:0; padding:8px 12px; border-top:1px solid rgba(255,255,255,.06); background:rgba(7,11,18,.58); align-items:center; justify-content:space-between; gap:10px; }
 .direct-compose-context-main { min-width:0; display:flex; align-items:center; gap:9px; }
 .direct-compose-context-icon { color:var(--ps-blue); font-size:11px; flex:0 0 auto; }
@@ -9072,6 +9074,7 @@ img { -webkit-user-drag: none !important; user-drag: none !important; }
 									<span id="direct-thread-message-count" class="direct-thread-message-count" title="0 messages" aria-label="0 messages">0</span>
 								</div>
 								<div id="direct-message-list" class="direct-message-list"></div>
+								<div id="direct-typing-indicator" class="direct-typing-indicator" aria-live="polite" aria-hidden="true"></div>
 								<div id="direct-media-preview" class="direct-media-preview" style="display:none;"></div>
 								<div id="direct-compose-context" class="direct-compose-context" style="display:none;"></div>
 								<div id="direct-format-toolbar" class="direct-format-toolbar" aria-label="Message formatting">
@@ -24430,8 +24433,12 @@ P
 
 	function applySocialSection(section) {
 		if (section !== 'chat' && typeof hideChatSuggestions === 'function') hideChatSuggestions();
-		if (section !== 'messages' && window.__directChatState && String(window.__directChatState.searchQuery || '').trim() && typeof window.clearDirectMessageSearch === 'function') {
-			window.clearDirectMessageSearch({ render:true, clearInput:false });
+		if (section !== 'messages' && window.__directChatState) {
+			if (typeof stopDirectTyping === 'function') stopDirectTyping();
+			if (typeof clearDirectPeerTyping === 'function') clearDirectPeerTyping();
+			if (String(window.__directChatState.searchQuery || '').trim() && typeof window.clearDirectMessageSearch === 'function') {
+				window.clearDirectMessageSearch({ render:true, clearInput:false });
+			}
 		}
 
 		const chatView = PSN_STATIC_NAV_DOM.subviewChat;
@@ -24597,7 +24604,10 @@ P
 			if(messagesView) {
 				setPsnStyleIfChanged(messagesView, 'display', 'flex');
 				restartEntryAnimationWithoutReflow(messagesView);
-				if (typeof window.animateDirectNewMessageFab === 'function') requestAnimationFrame(() => window.animateDirectNewMessageFab());
+				requestAnimationFrame(() => {
+					if (typeof window.resetDirectConversationListScroll === 'function') window.resetDirectConversationListScroll();
+					if (typeof window.animateDirectNewMessageFab === 'function') window.animateDirectNewMessageFab();
+				});
 			}
 			if(btnMessages) btnMessages.classList.add('active');
 			setPsnStyleIfChanged(searchBar, 'display', 'flex');
@@ -73178,6 +73188,7 @@ function getVisibleChatStackEl(id) {
 		replyTo: null, editingMessageId: '', inputRange: null, searchQuery: '', searchResultCount: 0,
 		conversationRefreshInFlight: false, conversationRefreshQueued: false, conversationRefreshTimer: 0, conversationRefreshWatchdog: 0, conversationRefreshToken: 0, conversationSignature: '',
 		threadRequestToken: 0, threadRequestTimer: 0, threadLoadedPeer: '', sessionToken: 0, trimmedMessageIds: [], deletedThroughByPeer: Object.create(null), emptyConversationCloseTimer: 0, emptyConversationCloseToken: 0,
+		typingEmitActive: false, typingEmitPeer: '', typingStopTimer: 0, peerTyping: false, peerTypingName: '', peerTypingAvatar: '', peerTypingTimer: 0,
 		globalSearchResults: [], globalSearchLoading: false, globalSearchToken: 0, pendingHighlightMessageId: ''
 	};
 
@@ -73187,6 +73198,121 @@ function getVisibleChatStackEl(id) {
 			.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 	}
 
+
+	function ensureSharedTypingIndicatorStyle() {
+		if (document.getElementById('typing-anim-style')) return;
+		const style = document.createElement('style');
+		style.id = 'typing-anim-style';
+		style.innerHTML = `
+			@keyframes typingBounce { 0%, 100% { transform: translateY(0); opacity: 0.4; } 50% { transform: translateY(-3px); opacity: 1; } }
+			.typing-dot { width: 4px; height: 4px; background: var(--ps-blue); border-radius: 50%; display: inline-block; animation: typingBounce 1s infinite; margin: 0 1px; }
+			.typing-dot:nth-child(2) { animation-delay: 0.2s; }
+			.typing-dot:nth-child(3) { animation-delay: 0.4s; }
+		`;
+		document.head.appendChild(style);
+	}
+
+	function buildSharedTypingIndicatorHtml(users) {
+		const usersArr = (Array.isArray(users) ? users : []).filter(item => Array.isArray(item) && item[0]);
+		if (!usersArr.length) return '';
+		ensureSharedTypingIndicatorStyle();
+		const avatarsHtml = usersArr.slice(0, 3).map(([name, avatar], i) =>
+			`<img src="${directEscapeHtml(avatar || directDefaultAvatar())}" alt="" style="width: 22px; height: 22px; border-radius: 50%; border: 2px solid #0a0f19; margin-left: ${i > 0 ? '-10px' : '0'}; position: relative; z-index: ${5 - i}; object-fit: cover;">`
+		).join('');
+		let textHtml = '';
+		if (usersArr.length === 1) textHtml = `<b data-no-translate="true" translate="no">${directEscapeHtml(usersArr[0][0])}</b> is typing`;
+		else if (usersArr.length === 2) textHtml = `<b data-no-translate="true" translate="no">${directEscapeHtml(usersArr[0][0])}</b> and <b data-no-translate="true" translate="no">${directEscapeHtml(usersArr[1][0])}</b> are typing`;
+		else textHtml = `<b data-no-translate="true" translate="no">${directEscapeHtml(usersArr[0][0])}</b> and ${usersArr.length - 1} others are typing`;
+		return `
+			<div style="display: flex;">${avatarsHtml}</div>
+			<div style="background: rgba(10, 15, 25, 0.8); border: 1px solid rgba(255,255,255,0.05); border-radius: 12px; padding: 4px 12px; font-size: 11px; color: #aaa; backdrop-filter: blur(5px); display: flex; align-items: center; gap: 6px; box-shadow: 0 4px 10px rgba(0,0,0,0.5);">
+				<span>${textHtml}</span>
+				<div style="display:flex; align-items:center; margin-bottom: 2px;">
+					<span class="typing-dot"></span><span class="typing-dot"></span><span class="typing-dot"></span>
+				</div>
+			</div>
+		`;
+	}
+
+	function renderDirectTypingIndicator() {
+		const state = window.__directChatState;
+		const container = document.getElementById('direct-typing-indicator');
+		if (!container) return;
+		const visible = state.peerTyping === true && state.peerTypingName && state.activePeer === state.peerTypingName && directThreadVisible();
+		if (!visible) {
+			container.classList.remove('is-visible');
+			container.setAttribute('aria-hidden', 'true');
+			if (container.innerHTML) container.innerHTML = '';
+			return;
+		}
+		container.innerHTML = buildSharedTypingIndicatorHtml([[state.peerTypingName, state.peerTypingAvatar || directResolveAvatar(state.peerTypingName)]]);
+		container.setAttribute('aria-hidden', 'false');
+		container.classList.add('is-visible');
+	}
+
+	function clearDirectPeerTyping(peerName = '') {
+		const state = window.__directChatState;
+		if (peerName && state.peerTypingName && state.peerTypingName !== String(peerName)) return false;
+		clearTimeout(state.peerTypingTimer); state.peerTypingTimer = 0;
+		const changed = state.peerTyping === true || !!state.peerTypingName;
+		state.peerTyping = false; state.peerTypingName = ''; state.peerTypingAvatar = '';
+		if (changed) renderDirectTypingIndicator();
+		return changed;
+	}
+
+	function setDirectPeerTyping(payload) {
+		const state = window.__directChatState;
+		const me = directCurrentUser();
+		const from = String(payload && payload.from || '').trim();
+		const to = String(payload && payload.to || '').trim();
+		if (!from || from !== state.activePeer || (to && to !== me)) return false;
+		state.peerTyping = true;
+		state.peerTypingName = from;
+		state.peerTypingAvatar = directResolveAvatar(from, payload && payload.avatar);
+		clearTimeout(state.peerTypingTimer);
+		state.peerTypingTimer = setTimeout(() => clearDirectPeerTyping(from), 5000);
+		renderDirectTypingIndicator();
+		return true;
+	}
+
+	function stopDirectTyping(options = {}) {
+		const state = window.__directChatState;
+		clearTimeout(state.typingStopTimer); state.typingStopTimer = 0;
+		const peer = String(state.typingEmitPeer || '').trim();
+		const wasActive = state.typingEmitActive === true && !!peer;
+		state.typingEmitActive = false; state.typingEmitPeer = '';
+		if (wasActive && options.emit !== false && typeof socketChat !== 'undefined' && socketChat && socketChat.connected) {
+			socketChat.emit('direct_typing_stop', { to:peer });
+		}
+		return wasActive;
+	}
+	window.stopDirectTyping = stopDirectTyping;
+
+	function updateDirectTypingFromComposer() {
+		const state = window.__directChatState;
+		const input = document.getElementById('direct-chat-input');
+		const peer = String(state.activePeer || '').trim();
+		const hasText = !!(input && directMessagePlainText(input.innerHTML));
+		if (!peer || !hasText || !socketChat || !socketChat.connected || !directThreadVisible()) {
+			stopDirectTyping();
+			return false;
+		}
+		if (!state.typingEmitActive || state.typingEmitPeer !== peer) {
+			if (state.typingEmitActive) stopDirectTyping();
+			state.typingEmitActive = true;
+			state.typingEmitPeer = peer;
+			socketChat.emit('direct_typing_start', { to:peer });
+		}
+		clearTimeout(state.typingStopTimer);
+		state.typingStopTimer = setTimeout(() => stopDirectTyping(), 2500);
+		return true;
+	}
+
+	window.resetDirectConversationListScroll = function() {
+		const list = document.getElementById('direct-conversations-list');
+		if (list && list.scrollTop) list.scrollTop = 0;
+		return !!list;
+	};
 
 	function directUnwrapElement(el) {
 		const parent = el && el.parentNode;
@@ -73231,6 +73357,7 @@ function getVisibleChatStackEl(id) {
 	function directClearComposer() {
 		const input = document.getElementById('direct-chat-input');
 		if (!input) return;
+		if (typeof stopDirectTyping === 'function') stopDirectTyping();
 		input.innerHTML = '';
 		window.__directChatState.inputRange = null;
 		directUpdateFormatState();
@@ -75215,6 +75342,7 @@ function getVisibleChatStackEl(id) {
 		const list = overlay.querySelector('#direct-new-message-list');
 		if (!list) return;
 		const friends = directNewMessageFriends(filter);
+		list.scrollTop = 0;
 		if (!friends.length) { list.innerHTML = '<div class="direct-empty-conversations" style="min-height:180px;"><i class="fas fa-user-friends"></i><div>No friends found.</div><small>Add friends first or try another name.</small></div>'; return; }
 		list.innerHTML = friends.map(friend => {
 			const encoded = encodeURIComponent(friend.name).replace(/'/g,'%27');
@@ -75235,14 +75363,18 @@ function getVisibleChatStackEl(id) {
 		const search = overlay.querySelector('#direct-new-message-search');
 		if (search) { search.value = ''; search.blur(); }
 		window.renderDirectNewMessageFriends('');
+		const list = overlay.querySelector('#direct-new-message-list');
+		if (list) list.scrollTop = 0;
 		overlay.style.display = 'flex';
-		requestAnimationFrame(() => overlay.classList.add('show'));
+		requestAnimationFrame(() => { if (list) list.scrollTop = 0; overlay.classList.add('show'); });
 		if (typeof playUiModal === 'function') playUiModal();
 	};
 
 	window.closeDirectNewMessagePicker = function() {
 		const overlay = document.getElementById('direct-new-message-overlay');
 		if (!overlay || !overlay.classList.contains('show')) return;
+		const list = overlay.querySelector('#direct-new-message-list');
+		if (list) list.scrollTop = 0;
 		overlay.classList.remove('show');
 		if (typeof playUiBack === 'function') playUiBack();
 		setTimeout(() => { if (!overlay.classList.contains('show')) overlay.style.display = 'none'; }, 300);
@@ -75275,7 +75407,7 @@ function getVisibleChatStackEl(id) {
 			return true;
 		}
 		const backgroundReconcile = options.reconnect === true && samePeer && Array.isArray(state.messages) && state.messages.length > 0;
-		if (state.activePeer && state.activePeer !== peer) { state.pendingMedia = []; state.pendingUploads = 0; state.mediaToken = Number(state.mediaToken || 0) + 1; state.replyTo = null; state.editingMessageId = ''; state.inputRange = null; state.threadLoadedPeer = ''; renderDirectPendingMedia(); closeDirectPickers(); renderDirectComposerContext(); }
+		if (state.activePeer && state.activePeer !== peer) { stopDirectTyping(); clearDirectPeerTyping(); state.pendingMedia = []; state.pendingUploads = 0; state.mediaToken = Number(state.mediaToken || 0) + 1; state.replyTo = null; state.editingMessageId = ''; state.inputRange = null; state.threadLoadedPeer = ''; renderDirectPendingMedia(); closeDirectPickers(); renderDirectComposerContext(); }
 		state.activePeer = peer; state.loadingThread = !backgroundReconcile;
 		if (!backgroundReconcile) { state.messages = []; state.messageCount = 0; state.peerLastReadId = '0'; state.threadLoadedPeer = ''; updateDirectThreadMessageCount(0); }
 		const existing = directFindConversation(peer);
@@ -75323,6 +75455,8 @@ function getVisibleChatStackEl(id) {
 	window.closeDirectMessageThread = function() {
 		const state = window.__directChatState;
 		if (!state.activePeer) return false;
+		stopDirectTyping();
+		clearDirectPeerTyping();
 		state.threadRequestToken = Number(state.threadRequestToken || 0) + 1;
 		clearTimeout(state.threadRequestTimer); state.threadRequestTimer = 0;
 		state.pendingMedia = []; state.pendingUploads = 0; state.mediaToken = Number(state.mediaToken || 0) + 1;
@@ -75334,6 +75468,7 @@ function getVisibleChatStackEl(id) {
 		window.clearDirectMessageSearch({ render:false, clearInput:true });
 		renderDirectConversations(); renderDirectThread();
 		requestAnimationFrame(() => {
+			if (typeof window.resetDirectConversationListScroll === 'function') window.resetDirectConversationListScroll();
 			animateDirectBackDestination();
 			if (typeof window.animateDirectNewMessageFab === 'function') window.animateDirectNewMessageFab();
 		});
@@ -75542,6 +75677,7 @@ function getVisibleChatStackEl(id) {
 			if (!socketChat || !socketChat.connected) return;
 			const original = directMessageById(state.editingMessageId);
 			if (!plainText && !(original && Array.isArray(original.content) && original.content.length)) return;
+			stopDirectTyping();
 			const button=document.getElementById('direct-send-btn'); if(button)button.disabled=true;
 			const editSessionToken = Number(state.sessionToken || 0);
 			socketChat.emit('direct_message_edit',{id:String(state.editingMessageId),text},response=>{
@@ -75563,6 +75699,7 @@ function getVisibleChatStackEl(id) {
 		const replyTo = state.replyTo && state.replyTo.id ? { id:String(state.replyTo.id) } : null;
 		const sendPeer = state.activePeer;
 		const sendSessionToken = Number(state.sessionToken || 0);
+		stopDirectTyping();
 		socketChat.emit('direct_message', { to:sendPeer, text, type, content, replyTo }, response => {
 			if (Number(state.sessionToken || 0) !== sendSessionToken) return;
 			if (button) button.disabled = false;
@@ -75591,6 +75728,7 @@ function getVisibleChatStackEl(id) {
 			const peer = message.from === me ? message.to : message.from;
 			const state = window.__directChatState;
 			if (message.from === peer && message.createdAt) directRememberPeerActivity(peer, message.createdAt);
+			if (message.from === peer) clearDirectPeerTyping(peer);
 			const readNow = message.to === me && state.activePeer === peer && directThreadVisible();
 			if (state.activePeer === peer) {
 				const keepBottom = directThreadNearBottom();
@@ -75635,6 +75773,14 @@ function getVisibleChatStackEl(id) {
 			if (!payload || !payload.peer || String(payload.user || '') !== directCurrentUser()) return;
 			directApplyConversationDeletion(payload, { animate:true });
 		});
+		socket.on('direct_user_typing', payload => {
+			setDirectPeerTyping(payload || {});
+		});
+		socket.on('direct_user_stopped_typing', payload => {
+			const from = String(payload && payload.from || '').trim();
+			if (!from || from !== window.__directChatState.activePeer) return;
+			clearDirectPeerTyping(from);
+		});
 		socket.on('direct_message_read', payload => {
 			if (!payload || !payload.reader || !payload.peer) return;
 			const me = directCurrentUser();
@@ -75678,6 +75824,8 @@ function getVisibleChatStackEl(id) {
 		});
 		socket.on('disconnect', () => {
 			const state = window.__directChatState;
+			stopDirectTyping({ emit:false });
+			clearDirectPeerTyping();
 			clearTimeout(state.conversationRefreshTimer); state.conversationRefreshTimer = 0;
 			clearTimeout(state.conversationRefreshWatchdog); state.conversationRefreshWatchdog = 0;
 			state.conversationRefreshToken = Number(state.conversationRefreshToken || 0) + 1;
@@ -75760,6 +75908,7 @@ function getVisibleChatStackEl(id) {
 		if (!input || input.id !== 'direct-chat-input') return;
 		directSaveInputRange();
 		directUpdateFormatState();
+		updateDirectTypingFromComposer();
 	});
 
 	function initChat(options = {}) {
@@ -79348,17 +79497,7 @@ function getVisibleChatStackEl(id) {
 			
 			container.style.cssText = "position: absolute; bottom: 100%; left: 15px; z-index: 50; display: flex; align-items: center; gap: 8px; transition: all 0.3s ease; opacity: 0; pointer-events: none; margin-bottom: 8px;";
 			
-			if (!document.getElementById('typing-anim-style')) {
-				const style = document.createElement('style');
-				style.id = 'typing-anim-style';
-				style.innerHTML = `
-					@keyframes typingBounce { 0%, 100% { transform: translateY(0); opacity: 0.4; } 50% { transform: translateY(-3px); opacity: 1; } }
-					.typing-dot { width: 4px; height: 4px; background: var(--ps-blue); border-radius: 50%; display: inline-block; animation: typingBounce 1s infinite; margin: 0 1px; }
-					.typing-dot:nth-child(2) { animation-delay: 0.2s; }
-					.typing-dot:nth-child(3) { animation-delay: 0.4s; }
-				`;
-				document.head.appendChild(style);
-			}
+			ensureSharedTypingIndicatorStyle();
 			chatInput.parentNode.insertBefore(container, chatInput);
 		}
 
@@ -79376,24 +79515,7 @@ function getVisibleChatStackEl(id) {
 		if (container.style.opacity !== '1') container.style.opacity = '1';
 		container.dataset.typingUsersSignature = typingSignature;
 		
-		let avatarsHtml = usersArr.slice(0, 3).map(([name, avatar], i) => 
-			`<img src="${avatar}" style="width: 22px; height: 22px; border-radius: 50%; border: 2px solid #0a0f19; margin-left: ${i > 0 ? '-10px' : '0'}; position: relative; z-index: ${5 - i}; object-fit: cover;">`
-		).join('');
-
-		let textHtml = '';
-		if (usersArr.length === 1) textHtml = `<b>${usersArr[0][0]}</b> is typing`;
-		else if (usersArr.length === 2) textHtml = `<b>${usersArr[0][0]}</b> and <b>${usersArr[1][0]}</b> are typing`;
-		else textHtml = `<b>${usersArr[0][0]}</b> and ${usersArr.length - 1} others are typing`;
-
-		container.innerHTML = `
-			<div style="display: flex;">${avatarsHtml}</div>
-			<div style="background: rgba(10, 15, 25, 0.8); border: 1px solid rgba(255,255,255,0.05); border-radius: 12px; padding: 4px 12px; font-size: 11px; color: #aaa; backdrop-filter: blur(5px); display: flex; align-items: center; gap: 6px; box-shadow: 0 4px 10px rgba(0,0,0,0.5);">
-				<span>${textHtml}</span>
-				<div style="display:flex; align-items:center; margin-bottom: 2px;">
-					<span class="typing-dot"></span><span class="typing-dot"></span><span class="typing-dot"></span>
-				</div>
-			</div>
-		`;
+		container.innerHTML = buildSharedTypingIndicatorHtml(usersArr);
 		
 		if (typeof updateJumpButtonPosition === 'function') updateJumpButtonPosition();
 	};

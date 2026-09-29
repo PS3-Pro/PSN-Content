@@ -8503,6 +8503,28 @@ function emitDirectConversationDeleteToLocalUser(payload, excludeSocketId = '') 
   }
 }
 
+function emitDirectTypingToLocalUser(payload, stopped = false, excludeSocketId = '') {
+  const from = normalizeDirectMessageUser(payload && payload.from);
+  const to = normalizeDirectMessageUser(payload && payload.to);
+  if (!from || !to || from === to) return;
+  const eventName = stopped ? 'direct_user_stopped_typing' : 'direct_user_typing';
+  for (const client of getSocketsByUserName(to)) {
+    if (!client || !client.connected || client.id === excludeSocketId) continue;
+    client.emit(eventName, payload);
+  }
+}
+
+function stopDirectTypingForSocket(socket, peerOverride = '') {
+  const actor = normalizeDirectMessageUser(socket && socket.userName);
+  const peer = normalizeDirectMessageUser(peerOverride || (socket && socket.__directTypingPeer));
+  if (!actor || !peer || actor === peer) { if (socket) socket.__directTypingPeer = ''; return false; }
+  if (socket) socket.__directTypingPeer = '';
+  const payload = { from:actor, to:peer };
+  emitDirectTypingToLocalUser(payload, true, socket && socket.id || '');
+  deferServerTask('DIRECT TYPING STOP NOTIFY', () => notifyDirectMessageAcrossInstances('typing_stop', payload), 0);
+  return true;
+}
+
 async function notifyDirectMessageAcrossInstances(kind, payload) {
   if (!kind || !payload) return;
   const notifyPayload = (kind === 'message' || kind === 'update')
@@ -9333,6 +9355,10 @@ async function initProfileSyncNotifications() {
           emitDirectConversationDeleteToLocalUser(data.payload);
         } else if (data.kind === 'read' && data.payload) {
           emitDirectReadToLocalUsers(data.payload);
+        } else if (data.kind === 'typing' && data.payload) {
+          emitDirectTypingToLocalUser(data.payload, false);
+        } else if (data.kind === 'typing_stop' && data.payload) {
+          emitDirectTypingToLocalUser(data.payload, true);
         }
         return;
       }
@@ -13696,10 +13722,34 @@ io.on('connection', (socket) => {
     }
   });
 
+  socket.on('direct_typing_start', (data = {}) => {
+    const actor = normalizeDirectMessageUser(socket.userName);
+    const peer = normalizeDirectMessageUser(data.to || data.with || data.peer || data.user);
+    if (!actor || !peer || actor === peer) return;
+    const previousPeer = normalizeDirectMessageUser(socket.__directTypingPeer);
+    if (previousPeer && previousPeer !== peer) stopDirectTypingForSocket(socket, previousPeer);
+    socket.__directTypingPeer = peer;
+    const payload = {
+      from: actor,
+      to: peer,
+      avatar: normalizeText(userDatabase[actor] && userDatabase[actor].avatar, DEFAULT_AVATAR)
+    };
+    emitDirectTypingToLocalUser(payload, false, socket.id);
+    deferServerTask('DIRECT TYPING START NOTIFY', () => notifyDirectMessageAcrossInstances('typing', payload), 0);
+  });
+
+  socket.on('direct_typing_stop', (data = {}) => {
+    const requestedPeer = normalizeDirectMessageUser(data.to || data.with || data.peer || data.user);
+    const activePeer = normalizeDirectMessageUser(socket.__directTypingPeer);
+    if (!activePeer || (requestedPeer && requestedPeer !== activePeer)) return;
+    stopDirectTypingForSocket(socket, activePeer);
+  });
+
   socket.on('direct_message', async (data = {}, callback) => {
     const respond = typeof callback === 'function' ? callback : () => {};
     const sender = normalizeDirectMessageUser(socket.userName);
     const recipient = normalizeDirectMessageUser(data.to || data.recipient || data.user);
+    if (sender && recipient && normalizeDirectMessageUser(socket.__directTypingPeer) === recipient) stopDirectTypingForSocket(socket, recipient);
     const text = normalizeDirectMessageText(data.text);
     const content = normalizeDirectMessageMedia(data.content);
     const messageType = normalizeDirectMessageType(data.type, content);
@@ -15993,6 +16043,7 @@ io.on('connection', (socket) => {
 
   socket.on('disconnect', async () => {
     clearFriendActivitySubscription(socket);
+    stopDirectTypingForSocket(socket);
     const name = socket.userName;
     if (!name || !userDatabase[name]) return;
 
