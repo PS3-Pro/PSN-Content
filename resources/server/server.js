@@ -3946,18 +3946,29 @@ function mergeProfileSettingsByTimestamp(currentSettings = {}, incomingSettings 
 function emitPublicProfileBannerUpdate(name, user = null) {
   if (!name || !user) return false;
   const settingsData = getPublicProfileSettings(user);
+  const publicUser = getPublicUserData(name, user, false);
   const publicSignature = stableStringifySmall([
+    publicUser.avatar || DEFAULT_AVATAR,
+    publicUser.joined || '2026',
+    publicUser.role || 'user',
+    publicUser.isAdmin === true,
+    Number(publicUser.level || 1),
+    publicUser.countryCode || '',
     settingsData.profileCardStyle || '',
     settingsData.profileCardEffect || '',
     normalizeTimestampValue(settingsData.profileCardStyleUpdatedAt) || 0,
     settingsData.themeColor || '',
-    normalizeTimestampValue(settingsData.themeColorUpdatedAt) || 0,
-    settingsData.countryCode || ''
+    normalizeTimestampValue(settingsData.themeColorUpdatedAt) || 0
   ]);
   if (lastPublicProfileSignatureByUser.get(name) === publicSignature) return false;
   lastPublicProfileSignatureByUser.set(name, publicSignature);
   io.emit("profile_public_update", {
     name,
+    avatar: publicUser.avatar || DEFAULT_AVATAR,
+    joined: publicUser.joined || '2026',
+    role: publicUser.role || 'user',
+    isAdmin: publicUser.isAdmin === true,
+    level: Number(publicUser.level || 1),
     profileUpdatedAt: normalizeTimestampValue(user.profileUpdatedAt) || Date.now(),
     settingsData,
     profileCardStyle: settingsData.profileCardStyle,
@@ -3965,7 +3976,7 @@ function emitPublicProfileBannerUpdate(name, user = null) {
     profileCardStyleUpdatedAt: settingsData.profileCardStyleUpdatedAt,
     themeColor: settingsData.themeColor,
     themeColorUpdatedAt: settingsData.themeColorUpdatedAt,
-    countryCode: settingsData.countryCode
+    countryCode: publicUser.countryCode || settingsData.countryCode || ''
   });
   return true;
 }
@@ -9046,8 +9057,12 @@ const PROFILE_SYNC_PATCH_KEYS = new Set([
 ]);
 
 const PROFILE_ONLINE_LIST_KEYS = new Set(['id', 'avatar', 'joined', 'countryCode', 'role', 'isAdmin', 'banned', 'level', 'ps3Status']);
+const PROFILE_PUBLIC_META_KEYS = new Set(['avatar', 'joined', 'countryCode', 'role', 'isAdmin', 'isModerator', 'banned', 'level']);
 function profileChangedKeysTouchOnlineList(changedKeys = []) {
   return Array.isArray(changedKeys) && changedKeys.some(key => PROFILE_ONLINE_LIST_KEYS.has(key));
+}
+function profileChangedKeysTouchPublicMeta(changedKeys = []) {
+  return Array.isArray(changedKeys) && changedKeys.some(key => PROFILE_PUBLIC_META_KEYS.has(key));
 }
 
 function buildProfileSyncPatchPayload(name, user = {}, changedKeys = [], sourceSocketId = null) {
@@ -12725,11 +12740,12 @@ io.on('connection', (socket) => {
         }
 
         const profileChangedKeys = Object.keys(profileDbPatch);
+        const publicProfileChanged = shouldBroadcastProfileBanner || profileChangedKeysTouchPublicMeta(profileChangedKeys);
         if (profileChangedKeysTouchOnlineList(profileChangedKeys)) {
           invalidateOnlineListCache('profile-update-save');
           emitPresenceUpdate(name, workingUser);
         }
-        if (shouldBroadcastProfileBanner) {
+        if (publicProfileChanged) {
             emitPublicProfileBannerUpdate(name, workingUser);
         }
         emitProfileSyncPatchFromUser(name, workingUser, profileChangedKeys, shouldForceProfileSyncToSource ? null : socket.id);
@@ -12738,7 +12754,7 @@ io.on('connection', (socket) => {
             name,
             shouldForceProfileSyncToSource ? null : socket.id,
             workingUser.profileUpdatedAt,
-            { trending: shouldEmitTrendingUpdate, trophies: trophiesChanged, counts: publicCountsChanged, publicProfile: shouldBroadcastProfileBanner, keys: profileChangedKeys }
+            { trending: shouldEmitTrendingUpdate, trophies: trophiesChanged, counts: publicCountsChanged, publicProfile: publicProfileChanged, keys: profileChangedKeys }
         ), 0);
 
         if (trophiesChanged) {
