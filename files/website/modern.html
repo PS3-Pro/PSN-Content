@@ -5074,7 +5074,6 @@ body.chat-selection-mode .chat-message-actions .chat-delete-action:hover { trans
 .chat-translate-btn.is-loading, .direct-chat-translate-btn.is-loading { pointer-events: none; opacity: 1; color: #ffdf73; border-color: rgba(255,204,0,.34); background: rgba(255,204,0,.10); box-shadow: 0 0 9px rgba(255,204,0,.14); }
 .chat-translate-btn.is-loading i, .direct-chat-translate-btn.is-loading i { font-size: 9px; animation: consoleStorageRefreshSpin .75s linear infinite; }
 .chat-translate-btn.is-translated, .direct-chat-translate-btn.is-translated { opacity: .92; color: #ffffff; border-color: rgba(255,255,255,.48); background: rgba(255,255,255,.105); box-shadow: 0 0 9px rgba(255,255,255,.16),0 0 14px rgba(0,112,204,.10); }
-.chat-translate-btn.is-same-language, .direct-chat-translate-btn.is-same-language { display:none !important; }
 .gt-translate-mark { display: block; gap: 0; font-family: Arial,Helvetica,sans-serif; font-weight: 900; letter-spacing: -1px; transform: translateY(-.2px); user-select: none; }
 .gt-translate-mark .gt-kanji { font-size: 10px; line-height: 1; font-weight: 900; }
 .gt-translate-mark .gt-a { font-size: 8px; line-height: 1; font-weight: 900; margin-left: -2px; margin-top: 5px; }
@@ -69427,25 +69426,10 @@ function getVisibleChatStackEl(id) {
 		return !!source && source !== 'auto' && !!destination && source === destination;
 	}
 
-	/* Local, conservative language gate used only to decide whether a translate button is useful.
-	   It never calls the network and only returns "same" on high-confidence signals. */
-	window.__chatLocalLanguageGateCache = window.__chatLocalLanguageGateCache instanceof Map ? window.__chatLocalLanguageGateCache : new Map();
-	const CHAT_LOCAL_LANGUAGE_UNIVERSAL = new Set(['ok','okay','lol','lmao','xd','gg','kk','kkk','kkkk','haha','hahaha']);
-	const CHAT_LOCAL_LANGUAGE_PROFILES = Object.freeze({
-		pt:{ strong:['não','você','vocês','obrigado','obrigada','olá','oi','também','então','isso','aqui','agora','estou','está','estão','tenho','temos','quero','pode','podemos','pra','né','tá','cadê','gato','sim','beleza','valeu','deixa','deixar','coloca','colocar','olha','vê','ve','mensagem','traduzir','funcionou','perfeito','legal','melhorou','tira','tirar','acho','gostei','faz','fazer','deveria','podia'], common:['que','para','com','uma','um','mais','mas','como','quando','onde','porque','muito','bom','dia','meu','minha','ficou','fica','tem','vai','vamos','eu','gente','só','já','ainda','mesmo','tudo','nada','certo','errado','melhor','antes','depois','dentro','fora','botão','bolinha'] },
-		en:{ strong:['hello','thanks','thank','please','you','your','this','that','with','from','have','has','should','would','could','message','translate','friend','online','yesterday','today','yes'], common:['the','and','is','are','was','were','for','not','good','morning','yes','now','here','there','my','we','they','can','will'] },
-		es:{ strong:['hola','gracias','usted','ustedes','ahora','aquí','también','entonces','quiero','puedes','puede','mensaje','traducir','estás','tengo','tiene','sí','bien'], common:['el','la','los','las','que','para','con','una','un','más','pero','como','cuando','donde','porque','buenos','días','si','mi'] },
-		fr:{ strong:['bonjour','merci','vous','votre','avec','pourquoi','maintenant','ici','très','message','traduire','salut','oui','non'], common:['le','la','les','des','une','un','est','pour','pas','plus','mais','comme','quand','où','aussi','mon','ma'] },
-		de:{ strong:['hallo','danke','bitte','nicht','jetzt','nachricht','übersetzen','warum','dein','deine','mein','meine','ja','nein'], common:['der','die','das','und','ist','mit','für','ein','eine','aber','wie','wenn','wo','auch','sehr','gut'] },
-		it:{ strong:['ciao','grazie','prego','adesso','messaggio','tradurre','perché','questo','questa','tuo','tua','sì'], common:['il','lo','la','gli','le','che','per','con','una','un','non','più','ma','come','quando','dove','anche','molto'] },
-		nl:{ strong:['hallo','bedankt','dankje','alsjeblieft','bericht','vertalen','waarom','jouw','mijn','ja','nee'], common:['de','het','een','en','is','met','voor','niet','maar','hoe','wanneer','waar','ook','goed'] },
-		pl:{ strong:['cześć','dziękuję','proszę','wiadomość','tłumaczyć','teraz','dlaczego','twoje','moja','tak'], common:['i','jest','nie','dla','ale','jak','kiedy','gdzie','też','bardzo','dobry'] },
-		ro:{ strong:['salut','mulțumesc','mesaj','traduce','acum','tău','mea','da'], common:['și','este','nu','pentru','dar','cum','când','unde','foarte','bună'] },
-		tr:{ strong:['merhaba','teşekkürler','lütfen','mesaj','çevir','şimdi','neden','senin','benim','evet','hayır'], common:['ve','bir','bu','ile','için','değil','ama','nasıl','ne','çok','iyi'] }
-	});
-
-	function getChatLocalLanguageDisposition(text, target = getChatTranslateTargetLang()) {
-		const lang = normalizeChatLanguageCode(target);
+	/* Keep translate controls predictable: only suppress the button when the message has no
+	   useful language content (for example emoji, a bare URL, or an @mention). Language equality
+	   is learned only from an existing translation result and never hides the control. */
+	function chatTextHasUsefulTranslatableContent(text = '') {
 		const raw = String(text || '')
 			.replace(/<[^>]*>/g, ' ')
 			.replace(/https?:\/\/[^\s<]+/gi, ' ')
@@ -69453,81 +69437,17 @@ function getVisibleChatStackEl(id) {
 			.replace(/&(?:amp|lt|gt|quot|#39);/gi, ' ')
 			.replace(/\s+/g, ' ')
 			.trim();
-		if (!lang || !raw || !/[\p{L}]/u.test(raw)) return 'none';
-
-		const key = `${lang}\u0000${raw.toLocaleLowerCase()}`;
-		const cache = window.__chatLocalLanguageGateCache;
-		if (cache.has(key)) return cache.get(key);
-
-		let result = 'unknown';
-		const setResult = value => {
-			cache.set(key, value);
-			if (cache.size > 512) {
-				const first = cache.keys().next().value;
-				if (first !== undefined) cache.delete(first);
-			}
-			return value;
-		};
-
-		/* Script-specific languages are cheap and reliable to classify without a translation request. */
-		if (/[\u3040-\u30ff]/u.test(raw)) return setResult(lang === 'ja' ? 'same' : 'different');
-		if (/[\uac00-\ud7af]/u.test(raw)) return setResult(lang === 'ko' ? 'same' : 'different');
-		if (/[\u0600-\u06ff]/u.test(raw)) return setResult(lang === 'ar' ? 'same' : 'different');
-		if (/[\u0590-\u05ff]/u.test(raw)) return setResult(lang === 'he' ? 'same' : 'different');
-		if (/[\u0900-\u097f]/u.test(raw)) return setResult(lang === 'hi' ? 'same' : 'different');
-		if (/[\u0370-\u03ff]/u.test(raw)) return setResult(lang === 'el' ? 'same' : 'different');
-		if (/[\u4e00-\u9fff]/u.test(raw) && !/[\u3040-\u30ff]/u.test(raw)) {
-			if (lang === 'zh') return setResult('same');
-			if (lang !== 'ja') return setResult('different');
-		}
-		if (/[\u0400-\u04ff]/u.test(raw)) {
-			if (!['ru','uk','bg'].includes(lang)) return setResult('different');
-			return setResult('unknown');
-		}
-		if (lang === 'pt' && /[ãõ]/i.test(raw)) return setResult('same');
-		if (lang === 'es' && /[ñ¿¡]/i.test(raw)) return setResult('same');
-		if (lang === 'de' && /[äöüß]/i.test(raw)) return setResult('same');
-		if (lang === 'pl' && /[ąćęłńóśźż]/i.test(raw)) return setResult('same');
-		if (lang === 'tr' && /[ğış]/i.test(raw)) return setResult('same');
-
-		const tokens = (raw.toLocaleLowerCase().match(/[\p{L}]+/gu) || []).filter(Boolean);
-		if (!tokens.length) return setResult('none');
-		if (tokens.every(token => CHAT_LOCAL_LANGUAGE_UNIVERSAL.has(token) || token.length === 1)) return setResult('none');
-
-		const profile = CHAT_LOCAL_LANGUAGE_PROFILES[lang];
-		if (!profile) return setResult(result);
-		const tokenSet = new Set(tokens);
-		let strongHits = 0;
-		let commonHits = 0;
-		for (const word of profile.strong) if (tokenSet.has(word)) strongHits++;
-		for (const word of profile.common) if (tokenSet.has(word)) commonHits++;
-		if (strongHits > 0) result = 'same';
-		else if (commonHits >= 2 && (tokens.length <= 7 || commonHits / Math.max(1, tokenSet.size) >= .28)) result = 'same';
-		return setResult(result);
+		return !!raw && /[\p{L}]/u.test(raw);
 	}
 
-	function chatTextShouldHideTranslateButton(text, target = getChatTranslateTargetLang()) {
-		const disposition = getChatLocalLanguageDisposition(text, target);
-		return disposition === 'same' || disposition === 'none';
-	}
-
-	function setChatMessageSameLanguageState(msgId, sameLanguage) {
+	function setChatTranslateButtonOriginalState(msgId) {
 		const btn = document.getElementById('translate-btn-' + String(msgId || ''));
 		if (!btn) return;
-		btn.classList.toggle('is-same-language', sameLanguage === true);
+		btn.classList.remove('is-loading', 'is-translated');
+		btn.title = 'Translate message';
+		btn.innerHTML = getChatTranslateIconHtml();
 		const bubble = btn.closest('.msg-bubble');
-		if (bubble) bubble.classList.toggle('has-translate', sameLanguage !== true);
-	}
-
-	function chatMessageKnownSameLanguage(msgId, sourceText = '') {
-		const key = String(msgId || '');
-		const target = normalizeChatLanguageCode(getChatTranslateTargetLang());
-		const cache = window.chatTranslationCache && window.chatTranslationCache[key];
-		if (cache && target && cache.sameLanguageTarget === target) return true;
-		if (!sourceText || !chatTextShouldHideTranslateButton(sourceText, target)) return false;
-		const nextCache = window.chatTranslationCache[key] || (window.chatTranslationCache[key] = {});
-		nextCache.sameLanguageTarget = target;
-		return true;
+		if (bubble) bubble.classList.add('has-translate');
 	}
 
 	function isChatAutoTranslateEnabled() {
@@ -69592,8 +69512,10 @@ function getVisibleChatStackEl(id) {
 			textEl.setAttribute('data-original-html', cache.originalHtml);
 		}
 
-		if (chatMessageKnownSameLanguage(msgId, originalText)) {
-			setChatMessageSameLanguageState(msgId, true);
+		if (!chatTextHasUsefulTranslatableContent(originalText || textEl.textContent || '')) return;
+
+		if (cache.sameLanguageTarget === normalizeChatLanguageCode(getChatTranslateTargetLang())) {
+			setChatTranslateButtonOriginalState(msgId);
 			return;
 		}
 
@@ -69618,7 +69540,7 @@ function getVisibleChatStackEl(id) {
 				textEl.innerHTML = cache.originalHtml || textEl.getAttribute('data-original-html') || textEl.innerHTML;
 				textEl.setAttribute('data-translated', 'false');
 				textEl.removeAttribute('data-auto-translated');
-				setChatMessageSameLanguageState(msgId, true);
+				setChatTranslateButtonOriginalState(msgId);
 				restoreActiveChatMediaAnchorForTranslate();
 				return;
 			}
@@ -69628,7 +69550,7 @@ function getVisibleChatStackEl(id) {
 			if (typeof hydrateChatInternalShareLinks === 'function') hydrateChatInternalShareLinks(textEl);
 			textEl.setAttribute('data-translated', 'true');
 			textEl.setAttribute('data-auto-translated', 'true');
-			setChatMessageSameLanguageState(msgId, false);
+			setChatTranslateButtonOriginalState(msgId);
 			restoreActiveChatMediaAnchorForTranslate();
 		}).catch(function() {
 			textEl.removeAttribute('data-translate-pending');
@@ -69706,7 +69628,7 @@ function getVisibleChatStackEl(id) {
 		}
 
 		if (cache.sameLanguageTarget === normalizeChatLanguageCode(getChatTranslateTargetLang())) {
-			setChatMessageSameLanguageState(msgId, true);
+			setChatTranslateButtonOriginalState(msgId);
 			restoreActiveChatMediaAnchorForTranslate();
 			return;
 		}
@@ -69740,7 +69662,7 @@ function getVisibleChatStackEl(id) {
 				textEl.innerHTML = cache.originalHtml || textEl.getAttribute('data-original-html') || textEl.innerHTML;
 				textEl.setAttribute('data-translated', 'false');
 				textEl.removeAttribute('data-auto-translated');
-				setChatMessageSameLanguageState(msgId, true);
+				setChatTranslateButtonOriginalState(msgId);
 				restoreActiveChatMediaAnchorForTranslate();
 				return;
 			}
@@ -70345,12 +70267,11 @@ function getVisibleChatStackEl(id) {
 		const avatarPresenceHtml = `<span class="psn-avatar-presence-dot chat-avatar-presence-dot${isUserCurrentlyOnline ? ' online' : ''}" data-user="${userName}" aria-hidden="true"></span>`;
 
 		const pollHasTranslatableText = !!(msg.type === 'poll' && msg.content && (String(msg.content.question || '').trim() || (Array.isArray(msg.content.options) && msg.content.options.some(opt => opt && String(opt.text || '').trim()))));
-		const textHasTranslatableText = !!(cleanText && String(cleanText).trim().length > 0 && msg.type !== 'poll');
-		const textKnownSameLanguage = textHasTranslatableText && chatMessageKnownSameLanguage(msgId, cleanText);
-		const hasTranslatableText = (textHasTranslatableText && !textKnownSameLanguage) || pollHasTranslatableText;
+		const textHasTranslatableText = msg.type !== 'poll' && chatTextHasUsefulTranslatableContent(cleanText);
+		const hasTranslatableText = textHasTranslatableText || pollHasTranslatableText;
 		const pollTranslationCache = pollHasTranslatableText && window.chatTranslationCache ? window.chatTranslationCache[String(msgId)] : null;
 		const pollTranslateActive = !!(pollTranslationCache && pollTranslationCache.pollManualTranslated && pollTranslationCache.pollTranslatedContent);
-		const translateBtnHtml = (textHasTranslatableText && !textKnownSameLanguage) ? `
+		const translateBtnHtml = textHasTranslatableText ? `
 			<button id="translate-btn-${msgId}" class="chat-translate-btn" type="button" title="Translate message"
 				onmouseenter="if(typeof playUiArrow === 'function') playUiArrow()"
 				onclick="event.stopPropagation(); toggleTranslateMessage('${msgId}', '${encodedText}')">
@@ -73804,18 +73725,6 @@ function getVisibleChatStackEl(id) {
 		return cache[key];
 	}
 
-	function directMessageKnownSameLanguage(messageId, sourceText = '') {
-		const key = String(messageId || '');
-		const target = normalizeChatLanguageCode(getChatTranslateTargetLang());
-		const cache = window.directChatTranslationCache && window.directChatTranslationCache[key];
-		if (cache && target && cache.sameLanguageTarget === target) return true;
-		if (!sourceText || !chatTextShouldHideTranslateButton(sourceText, target)) return false;
-		const nextCache = directChatTranslationCacheFor(key);
-		if (!nextCache) return false;
-		nextCache.sameLanguageTarget = target;
-		return true;
-	}
-
 	function isDirectChatAutoTranslateEnabled() {
 		try { return loadState(STORAGE_KEY_DIRECT_CHAT_AUTO_TRANSLATE) === '1'; } catch (e) { return false; }
 	}
@@ -73855,13 +73764,8 @@ function getVisibleChatStackEl(id) {
 	function setDirectTranslateButtonState(messageId, state) {
 		const btn = document.getElementById('direct-translate-btn-' + String(messageId || ''));
 		if (!btn) return;
-		btn.classList.remove('is-loading', 'is-translated', 'is-same-language');
+		btn.classList.remove('is-loading', 'is-translated');
 		const bubble = btn.closest('.direct-message-bubble');
-		if (state === 'same-language') {
-			btn.classList.add('is-same-language');
-			if (bubble) bubble.classList.remove('has-translate');
-			return;
-		}
 		if (bubble) bubble.classList.add('has-translate');
 		if (state === 'loading') {
 			btn.classList.add('is-loading');
@@ -73892,10 +73796,11 @@ function getVisibleChatStackEl(id) {
 		if (!textEl || textEl.getAttribute('data-translated') === 'true' || textEl.getAttribute('data-translate-pending') === 'true') return;
 		const cache = directChatTranslationCacheFor(messageId);
 		if (!cache) return;
+		if (!chatTextHasUsefulTranslatableContent(textEl.textContent || '')) return;
 		if (!cache.originalHtml) { cache.originalHtml = textEl.innerHTML; textEl.setAttribute('data-original-html', cache.originalHtml); }
 		const anchor = directTranslateAnchor();
 		if (cache.sameLanguageTarget === normalizeChatLanguageCode(getChatTranslateTargetLang())) {
-			setDirectTranslateButtonState(messageId, 'same-language');
+			setDirectTranslateButtonState(messageId, 'original');
 			return;
 		}
 		if (cache.autoTranslatedHtml) {
@@ -73915,7 +73820,7 @@ function getVisibleChatStackEl(id) {
 				textEl.innerHTML = cache.originalHtml || textEl.getAttribute('data-original-html') || textEl.innerHTML;
 				textEl.setAttribute('data-translated', 'false');
 				textEl.removeAttribute('data-auto-translated');
-				setDirectTranslateButtonState(messageId, 'same-language');
+				setDirectTranslateButtonState(messageId, 'original');
 				restoreDirectTranslateAnchor(anchor);
 				return;
 			}
@@ -73984,7 +73889,7 @@ function getVisibleChatStackEl(id) {
 		const textEl = document.getElementById('direct-msg-text-' + id);
 		if (!textEl || textEl.getAttribute('data-translate-pending') === 'true') return;
 		const cache = directChatTranslationCacheFor(id);
-		if (!cache) return;
+		if (!cache || !chatTextHasUsefulTranslatableContent(textEl.textContent || '')) return;
 		const anchor = directTranslateAnchor();
 		if (textEl.getAttribute('data-translated') === 'true') {
 			textEl.innerHTML = cache.originalHtml || textEl.getAttribute('data-original-html') || textEl.innerHTML;
@@ -73996,7 +73901,7 @@ function getVisibleChatStackEl(id) {
 		}
 		if (!cache.originalHtml) { cache.originalHtml = textEl.innerHTML; textEl.setAttribute('data-original-html', cache.originalHtml); }
 		if (cache.sameLanguageTarget === normalizeChatLanguageCode(getChatTranslateTargetLang())) {
-			setDirectTranslateButtonState(id, 'same-language');
+			setDirectTranslateButtonState(id, 'original');
 			restoreDirectTranslateAnchor(anchor);
 			return;
 		}
@@ -74018,7 +73923,7 @@ function getVisibleChatStackEl(id) {
 				textEl.innerHTML = cache.originalHtml || textEl.getAttribute('data-original-html') || textEl.innerHTML;
 				textEl.setAttribute('data-translated', 'false');
 				textEl.removeAttribute('data-auto-translated');
-				setDirectTranslateButtonState(id, 'same-language');
+				setDirectTranslateButtonState(id, 'original');
 				restoreDirectTranslateAnchor(anchor);
 				return;
 			}
@@ -74044,10 +73949,9 @@ function getVisibleChatStackEl(id) {
 		const media = (Array.isArray(msg.content) ? msg.content : []).filter(url => /^https?:\/\//i.test(String(url || ''))).slice(0, 10);
 		const mediaHtml = media.length ? `<div class="direct-message-media${media.length === 1 ? ' single' : ''}">${media.map((url, index) => `<button type="button" class="direct-message-media-item" data-direct-media-index="${index}" aria-label="Open attached image"><img src="${directEscapeHtml(url)}" alt="" loading="lazy"></button>`).join('')}</div>` : '';
 		const directTranslationPlainText = msg.text ? directMessagePlainText(msg.text).replace(/\s+/g, ' ').trim() : '';
-		const textHasTranslatableText = !!directTranslationPlainText;
-		const textKnownSameLanguage = textHasTranslatableText && directMessageKnownSameLanguage(msg.id, directTranslationPlainText);
+		const textHasTranslatableText = chatTextHasUsefulTranslatableContent(directTranslationPlainText);
 		const textHtml = msg.text ? `<div id="direct-msg-text-${directEscapeHtml(msg.id)}" class="direct-message-text" data-direct-message-id="${directEscapeHtml(msg.id)}" data-no-translate="true" translate="no">${directLinkifyMessageHtml(msg.text)}</div>` : '';
-		const translateBtnHtml = (textHasTranslatableText && !textKnownSameLanguage) ? `<button id="direct-translate-btn-${directEscapeHtml(msg.id)}" class="direct-chat-translate-btn" type="button" title="Translate message" onclick="event.stopPropagation(); window.toggleTranslateDirectMessage('${directEscapeHtml(msg.id)}')" onmouseenter="if(typeof playUiArrow==='function') playUiArrow()">${getChatTranslateIconHtml()}</button>` : '';
+		const translateBtnHtml = textHasTranslatableText ? `<button id="direct-translate-btn-${directEscapeHtml(msg.id)}" class="direct-chat-translate-btn" type="button" title="Translate message" onclick="event.stopPropagation(); window.toggleTranslateDirectMessage('${directEscapeHtml(msg.id)}')" onmouseenter="if(typeof playUiArrow==='function') playUiArrow()">${getChatTranslateIconHtml()}</button>` : '';
 		const reply = msg.replyTo && msg.replyTo.id ? msg.replyTo : null;
 		const replyPreview = reply ? (directMessagePlainText(reply.text).replace(/\s+/g,' ').trim() || (reply.type === 'gif' ? '[GIF]' : '[Image]')) : '';
 		const replyHtml = reply ? `<button type="button" class="direct-message-reply" onclick="event.stopPropagation(); window.scrollToDirectMessage('${directEscapeHtml(reply.id)}')"><span class="direct-message-reply-user" data-no-translate="true" translate="no">${directEscapeHtml(reply.from)}</span><span class="direct-message-reply-text" data-no-translate="true" translate="no">${directEscapeHtml(replyPreview)}</span></button>` : '';
@@ -74055,7 +73959,7 @@ function getVisibleChatStackEl(id) {
 		const ytId = previewUrl && typeof getYoutubeId === 'function' ? getYoutubeId(previewUrl) : null;
 		const previewHtml = ytId ? `<div class="yt-video-card direct-message-youtube" onclick="playTrailerDirect('${directEscapeHtml(ytId)}')"><img src="https://img.youtube.com/vi/${directEscapeHtml(ytId)}/mqdefault.jpg" class="yt-thumb" loading="lazy" decoding="async"><div class="yt-play-overlay"><i class="fas fa-play"></i></div><div class="yt-card-info"><span>Watch Video</span><i class="fab fa-youtube"></i></div></div>` : (previewUrl ? `<div id="direct-lp-${directEscapeHtml(msg.id)}" class="direct-link-preview-host"></div>` : '');
 		const reactionsHtml = directReactionHtml(msg);
-		return `<div class="direct-message-row${own ? ' own' : ''}" data-direct-message-id="${directEscapeHtml(msg.id)}" data-direct-own="${own ? '1' : '0'}"><div class="direct-message-stack"><div class="direct-message-bubble${(textHasTranslatableText && !textKnownSameLanguage) ? ' has-translate' : ''}">${translateBtnHtml}${replyHtml}${textHtml}${mediaHtml}${previewHtml}</div>${reactionsHtml ? `<div class="direct-message-reactions">${reactionsHtml}</div>` : ''}<div class="direct-message-actions"><span>${directEscapeHtml(directFormatMessageTime(msg.createdAt))}</span>${msg.editedAt ? '<span class="direct-message-edited">Edited</span>' : ''}${directDeliveryHtml(msg)}<button type="button" class="direct-message-action reply" onclick="event.stopPropagation(); window.setDirectReply('${directEscapeHtml(msg.id)}')" onmouseenter="if(typeof playUiArrow==='function') playUiArrow()" title="Reply" aria-label="Reply"><i class="fas fa-reply"></i></button><button type="button" class="direct-message-action react" onclick="window.openDirectReactionPicker(event, '${directEscapeHtml(msg.id)}')" onmouseenter="if(typeof playUiArrow==='function') playUiArrow()" title="React" aria-label="React"><i class="fas fa-smile"></i></button>${own ? `<button type="button" class="direct-message-action edit" onclick="event.stopPropagation(); window.startDirectEdit('${directEscapeHtml(msg.id)}')" onmouseenter="if(typeof playUiArrow==='function') playUiArrow()" title="Edit" aria-label="Edit"><i class="fas fa-edit"></i></button><button type="button" class="direct-message-action delete" onclick="event.stopPropagation(); window.deleteDirectMessage('${directEscapeHtml(msg.id)}')" onmouseenter="if(typeof playUiArrow==='function') playUiArrow()" title="Delete" aria-label="Delete"><i class="fas fa-trash-alt"></i></button>` : ''}</div></div></div>`;
+		return `<div class="direct-message-row${own ? ' own' : ''}" data-direct-message-id="${directEscapeHtml(msg.id)}" data-direct-own="${own ? '1' : '0'}"><div class="direct-message-stack"><div class="direct-message-bubble${textHasTranslatableText ? ' has-translate' : ''}">${translateBtnHtml}${replyHtml}${textHtml}${mediaHtml}${previewHtml}</div>${reactionsHtml ? `<div class="direct-message-reactions">${reactionsHtml}</div>` : ''}<div class="direct-message-actions"><span>${directEscapeHtml(directFormatMessageTime(msg.createdAt))}</span>${msg.editedAt ? '<span class="direct-message-edited">Edited</span>' : ''}${directDeliveryHtml(msg)}<button type="button" class="direct-message-action reply" onclick="event.stopPropagation(); window.setDirectReply('${directEscapeHtml(msg.id)}')" onmouseenter="if(typeof playUiArrow==='function') playUiArrow()" title="Reply" aria-label="Reply"><i class="fas fa-reply"></i></button><button type="button" class="direct-message-action react" onclick="window.openDirectReactionPicker(event, '${directEscapeHtml(msg.id)}')" onmouseenter="if(typeof playUiArrow==='function') playUiArrow()" title="React" aria-label="React"><i class="fas fa-smile"></i></button>${own ? `<button type="button" class="direct-message-action edit" onclick="event.stopPropagation(); window.startDirectEdit('${directEscapeHtml(msg.id)}')" onmouseenter="if(typeof playUiArrow==='function') playUiArrow()" title="Edit" aria-label="Edit"><i class="fas fa-edit"></i></button><button type="button" class="direct-message-action delete" onclick="event.stopPropagation(); window.deleteDirectMessage('${directEscapeHtml(msg.id)}')" onmouseenter="if(typeof playUiArrow==='function') playUiArrow()" title="Delete" aria-label="Delete"><i class="fas fa-trash-alt"></i></button>` : ''}</div></div></div>`;
 	}
 
 	function applyDirectMessageUpdate(message) {
