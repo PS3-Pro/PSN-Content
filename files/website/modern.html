@@ -24613,10 +24613,12 @@ P
 			if(activityView) { setPsnStyleIfChanged(activityView, 'display', 'none'); activityView.classList.remove('anim-up'); }
 			if(playTogetherView) { setPsnStyleIfChanged(playTogetherView, 'display', 'none'); playTogetherView.classList.remove('anim-up'); }
 			if(messagesView) {
+				const wasHidden = messagesView.style.display === 'none' || getComputedStyle(messagesView).display === 'none';
+				// Reset while the section is still hidden so there is no visible scroll jump.
+				if (wasHidden && typeof window.resetDirectConversationListScroll === 'function') window.resetDirectConversationListScroll();
 				setPsnStyleIfChanged(messagesView, 'display', 'flex');
 				restartEntryAnimationWithoutReflow(messagesView);
 				requestAnimationFrame(() => {
-					if (typeof window.resetDirectConversationListScroll === 'function') window.resetDirectConversationListScroll();
 					if (typeof window.animateDirectNewMessageFab === 'function') window.animateDirectNewMessageFab();
 				});
 			}
@@ -75430,22 +75432,24 @@ function getVisibleChatStackEl(id) {
 		const overlay = ensureDirectNewMessagePicker();
 		const search = overlay.querySelector('#direct-new-message-search');
 		if (search) { search.value = ''; search.blur(); }
+		// Render/reset before the overlay becomes visible, matching the site's modal pattern.
 		window.renderDirectNewMessageFriends('');
-		const list = overlay.querySelector('#direct-new-message-list');
-		if (list) list.scrollTop = 0;
 		overlay.style.display = 'flex';
-		requestAnimationFrame(() => { if (list) list.scrollTop = 0; overlay.classList.add('show'); });
+		requestAnimationFrame(() => overlay.classList.add('show'));
 		if (typeof playUiModal === 'function') playUiModal();
 	};
 
 	window.closeDirectNewMessagePicker = function() {
 		const overlay = document.getElementById('direct-new-message-overlay');
 		if (!overlay || !overlay.classList.contains('show')) return;
-		const list = overlay.querySelector('#direct-new-message-list');
-		if (list) list.scrollTop = 0;
 		overlay.classList.remove('show');
 		if (typeof playUiBack === 'function') playUiBack();
-		setTimeout(() => { if (!overlay.classList.contains('show')) overlay.style.display = 'none'; }, 300);
+		setTimeout(() => {
+			if (overlay.classList.contains('show')) return;
+			overlay.style.display = 'none';
+			const list = overlay.querySelector('#direct-new-message-list');
+			if (list) list.scrollTop = 0;
+		}, 300);
 	};
 
 	window.startDirectNewMessage = function(peer) {
@@ -75530,6 +75534,11 @@ function getVisibleChatStackEl(id) {
 		if (!state.activePeer) return false;
 		stopDirectTyping();
 		clearDirectPeerTyping();
+		// On mobile the conversation list is hidden behind the thread, so reset it
+		// before it is revealed. Desktop keeps the visible sidebar untouched.
+		if (window.matchMedia && window.matchMedia('(max-width: 760px)').matches && typeof window.resetDirectConversationListScroll === 'function') {
+			window.resetDirectConversationListScroll();
+		}
 		state.threadRequestToken = Number(state.threadRequestToken || 0) + 1;
 		clearTimeout(state.threadRequestTimer); state.threadRequestTimer = 0;
 		state.pendingMedia = []; state.pendingUploads = 0; state.mediaToken = Number(state.mediaToken || 0) + 1;
@@ -75541,7 +75550,6 @@ function getVisibleChatStackEl(id) {
 		window.clearDirectMessageSearch({ render:false, clearInput:true });
 		renderDirectConversations(); renderDirectThread();
 		requestAnimationFrame(() => {
-			if (typeof window.resetDirectConversationListScroll === 'function') window.resetDirectConversationListScroll();
 			animateDirectBackDestination();
 			if (typeof window.animateDirectNewMessageFab === 'function') window.animateDirectNewMessageFab();
 		});
