@@ -8407,6 +8407,26 @@ function normalizeDirectMessageReactions(value) {
   return output.slice(0, 12);
 }
 
+function newestDirectActivityIso(...values) {
+  let best = 0;
+  for (const value of values) {
+    if (value == null || value === '') continue;
+    let stamp = 0;
+    if (typeof value === 'number' && Number.isFinite(value)) stamp = value;
+    else {
+      const numeric = Number(value);
+      if (Number.isFinite(numeric) && numeric > 0) stamp = numeric;
+      else {
+        const parsed = Date.parse(String(value));
+        if (Number.isFinite(parsed)) stamp = parsed;
+      }
+    }
+    if (stamp > 0 && stamp < 1e12) stamp *= 1000;
+    if (stamp > best) best = stamp;
+  }
+  return best > 0 ? new Date(best).toISOString() : '';
+}
+
 function serializeDirectMessage(row) {
   if (!row) return null;
   const content = normalizeDirectMessageMedia(row.content);
@@ -8628,6 +8648,11 @@ async function getDirectHistoryPayload(userName, peerName, options = {}) {
       SELECT u.name AS peer_name,
              COALESCE(u.data->>'avatar', $4) AS peer_avatar,
              COALESCE(u.data->>'lastSeen', '') AS peer_last_seen,
+             (
+               SELECT MAX(dm.created_at)
+               FROM direct_messages dm
+               WHERE dm.sender_name = $2 AND dm.recipient_name = $1
+             ) AS peer_message_activity_at,
              EXISTS (
                SELECT 1 FROM presence_sessions ps
                WHERE ps.name = u.name
@@ -8656,7 +8681,7 @@ async function getDirectHistoryPayload(userName, peerName, options = {}) {
       ORDER BY id DESC
       LIMIT $3
     )
-    SELECT p.peer_name, p.peer_avatar, p.peer_last_seen, p.peer_online,
+    SELECT p.peer_name, p.peer_avatar, p.peer_last_seen, p.peer_message_activity_at, p.peer_online,
            p.my_last_read_id, p.peer_last_read_id,
            h.id, h.sender_name, h.recipient_name, h.text, h.message_type, h.content,
            h.reply_to, h.reactions, h.edited_at, h.created_at, h.total_count
@@ -8686,7 +8711,8 @@ async function getDirectHistoryPayload(userName, peerName, options = {}) {
       name:first.peer_name,
       avatar:first.peer_avatar || DEFAULT_AVATAR,
       online:first.peer_online === true,
-      lastSeen:first.peer_last_seen || ''
+      lastSeen:newestDirectActivityIso(first.peer_last_seen, first.peer_message_activity_at),
+      activityAt:first.peer_message_activity_at ? new Date(first.peer_message_activity_at).toISOString() : ''
     },
     messages,
     messageCount:Math.max(messages.length, Math.max(0, Number(first.total_count) || 0)),

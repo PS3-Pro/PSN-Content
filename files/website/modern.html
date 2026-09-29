@@ -73065,15 +73065,31 @@ function getVisibleChatStackEl(id) {
 
 	function updateDirectThreadPresenceStatus() {
 		const state = window.__directChatState;
-		if (!state.activePeer) return;
-		const peerInfo = directLivePresenceSnapshot(state.activePeer, state.peer || directFindConversation(state.activePeer) || { peer:state.activePeer });
+		const peerName = String(state.activePeer || '').trim();
+		if (!peerName) return;
+		const conversation = directFindConversation(peerName);
+		const peerMessageActivity = directLatestPeerMessageActivity(peerName, state.messages);
+		const latestConversationPeerActivity = conversation && conversation.lastMessage && String(conversation.lastMessage.from || '') === peerName
+			? conversation.lastMessage.createdAt
+			: '';
+		const cachedLastSeen = window.__presenceLastSeenByUser && window.__presenceLastSeenByUser[peerName];
+		const peerInfo = directLivePresenceSnapshot(peerName, state.peer || conversation || { peer:peerName });
+		const activityLastSeen = directNewestLastSeen(peerInfo.lastSeen, cachedLastSeen, peerMessageActivity, latestConversationPeerActivity);
+		if (activityLastSeen) {
+			peerInfo.lastSeen = activityLastSeen;
+			directRememberPeerActivity(peerName, activityLastSeen);
+		}
 		state.peer = peerInfo;
 		const presenceEl = document.getElementById('direct-thread-presence');
 		const statusEl = document.getElementById('direct-thread-status');
 		if (presenceEl) presenceEl.classList.toggle('online', peerInfo.online === true);
-		if (statusEl) statusEl.textContent = peerInfo.online === true
-			? 'Online'
-			: (peerInfo.lastSeen && typeof formatLastSeen === 'function' ? `Last seen ${formatLastSeen(peerInfo.lastSeen)}` : 'Offline');
+		if (statusEl) {
+			if (peerInfo.online === true) statusEl.textContent = 'Online';
+			else {
+				const stamp = directLastSeenStamp(activityLastSeen);
+				statusEl.textContent = stamp && typeof formatLastSeen === 'function' ? `Last seen ${formatLastSeen(stamp)}` : 'Offline';
+			}
+		}
 	}
 
 	window.applyDirectPresenceUpdate = function(userName, data = {}) {
@@ -73876,7 +73892,7 @@ function getVisibleChatStackEl(id) {
 			const peerMessageActivity = directLatestPeerMessageActivity(peer, state.messages);
 			if (peerMessageActivity) directRememberPeerActivity(peer, peerMessageActivity);
 			const peerPayload = { ...(payload.peer || state.peer || { name:peer }) };
-			peerPayload.lastSeen = directNewestLastSeen(peerPayload.lastSeen, peerMessageActivity);
+			peerPayload.lastSeen = directNewestLastSeen(peerPayload.lastSeen, peerPayload.activityAt, peerMessageActivity);
 			state.peer = directLivePresenceSnapshot(peer, peerPayload);
 			state.threadLoadedPeer = peer;
 			state.messageCount = Math.max(state.messages.length, Math.max(0, Number(payload.messageCount) || 0));
@@ -95221,6 +95237,8 @@ function getVisibleChatStackEl(id) {
         const edgeSelector = [
             '#online-users-list-container',
             '#chat-messages',
+            '#direct-message-list',
+            '#direct-conversations-list',
             '#admin-online-list',
             '.admin-metadata-list',
             '.admin-metadata-suggestion-list',
