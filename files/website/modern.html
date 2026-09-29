@@ -6480,7 +6480,7 @@ img { -webkit-user-drag: none !important; user-drag: none !important; }
 .direct-new-message-person:hover .direct-new-message-person-chevron { color:var(--ps-blue); transform:translateX(2px); }
 @media (max-width:520px) { #direct-new-message-overlay .direct-new-message-panel { width:calc(100vw - 18px); max-height:calc(100dvh - 18px); } .direct-new-message-body { padding:13px 12px 14px !important; } .direct-new-message-list { max-height:calc(100dvh - 190px); } }
 
-.direct-message-edited { color:rgba(255,255,255,.34); font-style:italic; }
+.direct-message-edited { margin-left:3px; }
 .direct-message-actions { display:flex; align-items:center; gap:7px; margin-top:5px; color:var(--text-muted); font-size:11px; }
 .direct-message-row.own .direct-message-actions { justify-content:flex-end; }
 .direct-message-action { width:auto; min-width:0; height:auto; padding:0; margin:0; border:0; border-radius:0; background:transparent; display:inline-flex; align-items:center; justify-content:center; opacity:.5; font-size:12px; line-height:1; transition:opacity .2s ease,transform .2s ease,filter .06s ease; }
@@ -65511,6 +65511,204 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 		updateModalContent();
 	};
     
+
+	/* Shared image context menu for chat media, screenshots and the full image viewer. */
+	(function installPsnImageContextMenu(){
+		if (window.__psnImageContextMenuInstalled) return;
+		window.__psnImageContextMenuInstalled = true;
+
+		const IMAGE_CONTEXT_SELECTOR = [
+			'#psn-image-modal img',
+			'.screenshot-item',
+			'.chat-gallery img',
+			'.msg-bubble img:not(.chat-avatar-clickable)',
+			'.direct-message-media-item img',
+			'.direct-message-bubble .link-preview-card img',
+			'.metadata-screenshot-preview img',
+			'.admin-metadata-suggestion-screenshot-strip img'
+		].join(',');
+		let activeImage = null;
+
+		function imageContextSource(image) {
+			return String((image && (image.currentSrc || image.src)) || '').trim();
+		}
+
+		function imageContextFileName(image, source) {
+			let name = '';
+			try {
+				const url = new URL(source, location.href);
+				name = decodeURIComponent(url.pathname.split('/').filter(Boolean).pop() || '');
+			} catch (e) {}
+			name = String(name || image?.getAttribute?.('alt') || 'image').replace(/[\\/:*?"<>|]+/g, '_').trim();
+			if (!name || !/\.[a-z0-9]{2,5}$/i.test(name)) name = (name || 'image') + '.png';
+			return name.slice(0, 160);
+		}
+
+		function ensureImageContextMenu() {
+			let menu = document.getElementById('image-context-menu');
+			if (menu) return menu;
+			menu = document.createElement('div');
+			menu.id = 'image-context-menu';
+			menu.className = 'fm-context-menu';
+			menu.setAttribute('role', 'menu');
+			menu.innerHTML = '<div class="fm-context-menu-title">IMAGE</div><button type="button" class="fm-context-menu-item" role="menuitem" data-image-context-action="copy"><i class="fas fa-copy"></i><span>Copy image</span></button><button type="button" class="fm-context-menu-item" role="menuitem" data-image-context-action="download"><i class="fas fa-download"></i><span>Download image</span></button>';
+			document.body.appendChild(menu);
+			menu.addEventListener('click', event => {
+				const action = event.target?.closest?.('[data-image-context-action]')?.dataset?.imageContextAction || '';
+				if (!action || !activeImage) return;
+				event.preventDefault();
+				event.stopPropagation();
+				const image = activeImage;
+				closeImageContextMenu(true);
+				if (action === 'copy') copyPsnContextImage(image);
+				if (action === 'download') downloadPsnContextImage(image);
+			});
+			menu.querySelectorAll('.fm-context-menu-item').forEach(button => {
+				button.addEventListener('mouseenter', () => { if (typeof playUiHover === 'function') playUiHover(); });
+			});
+			return menu;
+		}
+
+		function closeImageContextMenu(immediate = false) {
+			const menu = document.getElementById('image-context-menu');
+			activeImage = null;
+			if (!menu) return;
+			menu.classList.remove('is-open');
+			if (immediate) {
+				menu.classList.remove('is-closing');
+				menu.style.display = 'none';
+				return;
+			}
+			menu.classList.add('is-closing');
+			setTimeout(() => {
+				if (!menu.classList.contains('is-open')) {
+					menu.classList.remove('is-closing');
+					menu.style.display = 'none';
+				}
+			}, 110);
+		}
+
+		function openImageContextMenu(event, image) {
+			const source = imageContextSource(image);
+			if (!source) return false;
+			const menu = ensureImageContextMenu();
+			activeImage = image;
+			const title = menu.querySelector('.fm-context-menu-title');
+			if (title) title.textContent = imageContextFileName(image, source);
+			menu.style.display = 'block';
+			menu.classList.remove('is-closing');
+			menu.classList.add('is-open');
+			const gap = 8;
+			const width = menu.offsetWidth;
+			const height = menu.offsetHeight;
+			const left = Math.max(gap, Math.min(event.clientX, window.innerWidth - width - gap));
+			const top = Math.max(gap, Math.min(event.clientY, window.innerHeight - height - gap));
+			menu.style.left = `${Math.round(left)}px`;
+			menu.style.top = `${Math.round(top)}px`;
+			if (typeof playUiClick === 'function') playUiClick();
+			return true;
+		}
+
+		async function fetchPsnContextImageBlob(source) {
+			const response = await fetch(source, { mode:'cors', credentials:'omit', cache:'force-cache' });
+			if (!response.ok) throw new Error('image-fetch-failed');
+			const blob = await response.blob();
+			if (!blob || !String(blob.type || '').startsWith('image/')) throw new Error('not-image');
+			return blob;
+		}
+
+		async function imageBlobAsPng(blob) {
+			if (blob.type === 'image/png') return blob;
+			const bitmap = await createImageBitmap(blob);
+			try {
+				const canvas = document.createElement('canvas');
+				canvas.width = bitmap.width;
+				canvas.height = bitmap.height;
+				const ctx = canvas.getContext('2d', { alpha:true });
+				ctx.drawImage(bitmap, 0, 0);
+				return await new Promise((resolve, reject) => canvas.toBlob(result => result ? resolve(result) : reject(new Error('png-convert-failed')), 'image/png'));
+			} finally {
+				if (bitmap && typeof bitmap.close === 'function') bitmap.close();
+			}
+		}
+
+		async function copyPsnContextImage(image) {
+			const source = imageContextSource(image);
+			if (!source) return;
+			try {
+				if (!navigator.clipboard || typeof navigator.clipboard.write !== 'function' || typeof ClipboardItem === 'undefined') throw new Error('image-clipboard-unavailable');
+				const blob = await fetchPsnContextImageBlob(source);
+				const png = await imageBlobAsPng(blob);
+				await navigator.clipboard.write([new ClipboardItem({ 'image/png': png })]);
+				if (typeof playUiSuccess === 'function') playUiSuccess();
+				if (typeof showToastNotification === 'function') showToastNotification('Image', 'Image copied to clipboard.');
+			} catch (error) {
+				try {
+					await navigator.clipboard.writeText(source);
+					if (typeof playUiSuccess === 'function') playUiSuccess();
+					if (typeof showToastNotification === 'function') showToastNotification('Image', 'Image link copied.');
+				} catch (fallbackError) {
+					if (typeof playUiError === 'function') playUiError();
+					if (typeof showToastNotification === 'function') showToastNotification('Image', 'Could not copy this image.');
+				}
+			}
+		}
+
+		async function downloadPsnContextImage(image) {
+			const source = imageContextSource(image);
+			if (!source) return;
+			const fileName = imageContextFileName(image, source);
+			let objectUrl = '';
+			try {
+				const blob = await fetchPsnContextImageBlob(source);
+				objectUrl = URL.createObjectURL(blob);
+				const link = document.createElement('a');
+				link.href = objectUrl;
+				link.download = fileName;
+				link.style.display = 'none';
+				document.body.appendChild(link);
+				link.click();
+				link.remove();
+				if (typeof playUiSuccess === 'function') playUiSuccess();
+			} catch (error) {
+				const link = document.createElement('a');
+				link.href = source;
+				link.download = fileName;
+				link.target = '_blank';
+				link.rel = 'noopener';
+				link.style.display = 'none';
+				document.body.appendChild(link);
+				link.click();
+				link.remove();
+			} finally {
+				if (objectUrl) setTimeout(() => URL.revokeObjectURL(objectUrl), 1200);
+			}
+		}
+
+		document.addEventListener('contextmenu', event => {
+			const image = event.target?.closest?.(IMAGE_CONTEXT_SELECTOR);
+			if (!image) return;
+			const source = imageContextSource(image);
+			if (!source) return;
+			event.preventDefault();
+			event.stopPropagation();
+			openImageContextMenu(event, image);
+		}, true);
+		document.addEventListener('pointerdown', event => {
+			const menu = document.getElementById('image-context-menu');
+			if (menu?.classList.contains('is-open') && !menu.contains(event.target)) closeImageContextMenu(true);
+		}, true);
+		document.addEventListener('keydown', event => {
+			if (event.key === 'Escape' && document.getElementById('image-context-menu')?.classList.contains('is-open')) {
+				event.preventDefault();
+				event.stopImmediatePropagation();
+				closeImageContextMenu(true);
+			}
+		}, true);
+		window.addEventListener('scroll', () => closeImageContextMenu(true), { passive:true, capture:true });
+		window.addEventListener('resize', () => closeImageContextMenu(true), { passive:true });
+	})();
+
     function trackUser(username) {
         if (!username || username === "Guest") return;
         const batchContext = window.__chatRenderBatchContext || null;
@@ -73524,7 +73722,7 @@ function getVisibleChatStackEl(id) {
 
 	function directMessageStateSignature(message) {
 		if (!message || !message.id) return '';
-		return JSON.stringify([message.id, message.from, message.to, message.text || '', message.type || 'text', message.content || null, message.replyTo || null, message.reactions || [], message.editedAt || null]);
+		return JSON.stringify([message.id, message.from, message.to, message.text || '', message.type || 'text', message.content || null, message.replyTo || null, message.reactions || [], message.editedAt || null, message.seenAt || null]);
 	}
 
 	function directConversationMessageSignature(message) {
@@ -74260,10 +74458,22 @@ function getVisibleChatStackEl(id) {
 	};
 
 
+	function directSeenDisplayLabel(value) {
+		const stamp = Date.parse(value || '');
+		if (!stamp) return 'Seen';
+		const date = new Date(stamp);
+		const age = Math.max(0, Date.now() - stamp);
+		if (age < 24 * 60 * 60 * 1000) {
+			return `Seen ${date.toLocaleTimeString([], { hour:'2-digit', minute:'2-digit' })}`;
+		}
+		return `Seen ${date.toLocaleDateString([], { day:'2-digit', month:'2-digit', year:'numeric' })}`;
+	}
+
 	function directDeliveryHtml(msg) {
 		if (!msg || msg.from !== directCurrentUser()) return '';
 		const seen = directMessageIdNumber(msg.id) > 0 && directMessageIdNumber(msg.id) <= directMessageIdNumber(window.__directChatState.peerLastReadId);
-		return `<span class="direct-message-delivery${seen ? ' is-seen' : ''}" title="${seen ? 'Seen' : 'Sent'}" aria-label="${seen ? 'Seen' : 'Sent'}"><i class="fas ${seen ? 'fa-check-double' : 'fa-check'}"></i></span>`;
+		const label = seen ? directSeenDisplayLabel(msg.seenAt) : 'Sent';
+		return `<span class="direct-message-delivery${seen ? ' is-seen' : ''}" title="${directEscapeHtml(label)}" aria-label="${directEscapeHtml(label)}"><i class="fas ${seen ? 'fa-check-double' : 'fa-check'}"></i></span>`;
 	}
 
 	function updateDirectSeenMarker() {
@@ -74277,9 +74487,12 @@ function getVisibleChatStackEl(id) {
 			const delivery = row.querySelector('.direct-message-delivery');
 			if (!delivery) return;
 			const seen = id > 0 && id <= peerRead;
+			const message = state.messages.find(item => directMessageIdNumber(item && item.id) === id);
+			const label = seen ? directSeenDisplayLabel(message && message.seenAt) : 'Sent';
 			delivery.classList.toggle('is-seen', seen);
-			delivery.title = seen ? 'Seen' : 'Sent';
-			delivery.setAttribute('aria-label', seen ? 'Seen' : 'Sent');
+			delivery.title = label;
+			delivery.dataset.psnTooltipTitle = label;
+			delivery.setAttribute('aria-label', label);
 			const icon = delivery.querySelector('i');
 			if (icon) icon.className = `fas ${seen ? 'fa-check-double' : 'fa-check'}`;
 		});
@@ -74562,7 +74775,8 @@ function getVisibleChatStackEl(id) {
 		const mediaHtml = media.length ? `<div class="direct-message-media${media.length === 1 ? ' single' : ''}">${media.map((url, index) => `<button type="button" class="direct-message-media-item" data-direct-media-index="${index}" aria-label="Open attached image"><img src="${directEscapeHtml(url)}" alt="" loading="lazy"></button>`).join('')}</div>` : '';
 		const directTranslationPlainText = msg.text ? directMessagePlainText(msg.text).replace(/\s+/g, ' ').trim() : '';
 		const textHasTranslatableText = chatTextHasUsefulTranslatableContent(directTranslationPlainText);
-		const textHtml = msg.text ? `<div id="direct-msg-text-${directEscapeHtml(msg.id)}" class="direct-message-text" data-direct-message-id="${directEscapeHtml(msg.id)}" data-no-translate="true" translate="no">${directLinkifyMessageHtml(msg.text)}</div>` : '';
+		const editedTagHtml = msg.editedAt ? ' <span class="chat-edited-tag direct-message-edited" data-no-translate="true" translate="no">(Edited)</span>' : '';
+		const textHtml = msg.text ? `<div id="direct-msg-text-${directEscapeHtml(msg.id)}" class="direct-message-text" data-direct-message-id="${directEscapeHtml(msg.id)}" data-no-translate="true" translate="no">${directLinkifyMessageHtml(msg.text)}${editedTagHtml}</div>` : '';
 		const translateBtnHtml = textHasTranslatableText ? `<button id="direct-translate-btn-${directEscapeHtml(msg.id)}" class="direct-chat-translate-btn" type="button" title="Translate message" onclick="event.stopPropagation(); window.toggleTranslateDirectMessage('${directEscapeHtml(msg.id)}')" onmouseenter="if(typeof playUiArrow==='function') playUiArrow()">${getChatTranslateIconHtml()}</button>` : '';
 		const reply = msg.replyTo && msg.replyTo.id ? msg.replyTo : null;
 		const replyPreview = reply ? (directMessagePlainText(reply.text).replace(/\s+/g,' ').trim() || (reply.type === 'gif' ? '[GIF]' : '[Image]')) : '';
@@ -74571,7 +74785,7 @@ function getVisibleChatStackEl(id) {
 		const ytId = previewUrl && typeof getYoutubeId === 'function' ? getYoutubeId(previewUrl) : null;
 		const previewHtml = ytId ? `<div class="yt-video-card direct-message-youtube" onclick="playTrailerDirect('${directEscapeHtml(ytId)}')"><img src="https://img.youtube.com/vi/${directEscapeHtml(ytId)}/mqdefault.jpg" class="yt-thumb" loading="lazy" decoding="async"><div class="yt-play-overlay"><i class="fas fa-play"></i></div><div class="yt-card-info"><span>Watch Video</span><i class="fab fa-youtube"></i></div></div>` : (previewUrl ? `<div id="direct-lp-${directEscapeHtml(msg.id)}" class="direct-link-preview-host"></div>` : '');
 		const reactionsHtml = directReactionHtml(msg);
-		return `<div class="direct-message-row${own ? ' own' : ''}" data-direct-message-id="${directEscapeHtml(msg.id)}" data-direct-own="${own ? '1' : '0'}"><div class="direct-message-stack"><div class="direct-message-bubble${textHasTranslatableText ? ' has-translate' : ''}">${translateBtnHtml}${replyHtml}${textHtml}${mediaHtml}${previewHtml}</div>${reactionsHtml ? `<div class="direct-message-reactions">${reactionsHtml}</div>` : ''}<div class="direct-message-actions"><span>${directEscapeHtml(directFormatMessageTime(msg.createdAt))}</span>${msg.editedAt ? '<span class="direct-message-edited">Edited</span>' : ''}${directDeliveryHtml(msg)}<button type="button" class="direct-message-action reply" onclick="event.stopPropagation(); window.setDirectReply('${directEscapeHtml(msg.id)}')" onmouseenter="if(typeof playUiArrow==='function') playUiArrow()" title="Reply" aria-label="Reply"><i class="fas fa-reply"></i></button><button type="button" class="direct-message-action react" onclick="window.openDirectReactionPicker(event, '${directEscapeHtml(msg.id)}')" onmouseenter="if(typeof playUiArrow==='function') playUiArrow()" title="React" aria-label="React"><i class="fas fa-smile"></i></button>${own ? `<button type="button" class="direct-message-action edit" onclick="event.stopPropagation(); window.startDirectEdit('${directEscapeHtml(msg.id)}')" onmouseenter="if(typeof playUiArrow==='function') playUiArrow()" title="Edit" aria-label="Edit"><i class="fas fa-edit"></i></button><button type="button" class="direct-message-action delete" onclick="event.stopPropagation(); window.deleteDirectMessage('${directEscapeHtml(msg.id)}')" onmouseenter="if(typeof playUiArrow==='function') playUiArrow()" title="Delete" aria-label="Delete"><i class="fas fa-trash-alt"></i></button>` : ''}</div></div></div>`;
+		return `<div class="direct-message-row${own ? ' own' : ''}" data-direct-message-id="${directEscapeHtml(msg.id)}" data-direct-own="${own ? '1' : '0'}"><div class="direct-message-stack"><div class="direct-message-bubble${textHasTranslatableText ? ' has-translate' : ''}">${translateBtnHtml}${replyHtml}${textHtml}${mediaHtml}${previewHtml}</div>${reactionsHtml ? `<div class="direct-message-reactions">${reactionsHtml}</div>` : ''}<div class="direct-message-actions"><span>${directEscapeHtml(directFormatMessageTime(msg.createdAt))}</span>${directDeliveryHtml(msg)}<button type="button" class="direct-message-action reply" onclick="event.stopPropagation(); window.setDirectReply('${directEscapeHtml(msg.id)}')" onmouseenter="if(typeof playUiArrow==='function') playUiArrow()" title="Reply" aria-label="Reply"><i class="fas fa-reply"></i></button><button type="button" class="direct-message-action react" onclick="window.openDirectReactionPicker(event, '${directEscapeHtml(msg.id)}')" onmouseenter="if(typeof playUiArrow==='function') playUiArrow()" title="React" aria-label="React"><i class="fas fa-smile"></i></button>${own ? `<button type="button" class="direct-message-action edit" onclick="event.stopPropagation(); window.startDirectEdit('${directEscapeHtml(msg.id)}')" onmouseenter="if(typeof playUiArrow==='function') playUiArrow()" title="Edit" aria-label="Edit"><i class="fas fa-edit"></i></button><button type="button" class="direct-message-action delete" onclick="event.stopPropagation(); window.deleteDirectMessage('${directEscapeHtml(msg.id)}')" onmouseenter="if(typeof playUiArrow==='function') playUiArrow()" title="Delete" aria-label="Delete"><i class="fas fa-trash-alt"></i></button>` : ''}</div></div></div>`;
 	}
 
 	function applyDirectMessageUpdate(message) {
@@ -75418,8 +75632,17 @@ function getVisibleChatStackEl(id) {
 			const lastReadId = String(payload.lastReadId || '0');
 			if (payload.reader !== me && payload.peer === me && state.activePeer === payload.reader) {
 				state.peerLastReadId = String(lastReadId || state.peerLastReadId || '0');
+				const readAt = String(payload.readAt || '');
+				const peerReadId = directMessageIdNumber(state.peerLastReadId);
+				state.messages.forEach(message => {
+					if (!message || message.from !== me || message.seenAt) return;
+					if (directMessageIdNumber(message.id) > 0 && directMessageIdNumber(message.id) <= peerReadId) message.seenAt = readAt || new Date().toISOString();
+				});
 				const conversation = directFindConversation(payload.reader);
-				if (conversation) conversation.peerLastReadId = state.peerLastReadId;
+				if (conversation) {
+					conversation.peerLastReadId = state.peerLastReadId;
+					if (conversation.lastMessage && conversation.lastMessage.from === me && !conversation.lastMessage.seenAt && directMessageIdNumber(conversation.lastMessage.id) <= peerReadId) conversation.lastMessage.seenAt = readAt || new Date().toISOString();
+				}
 				updateDirectSeenMarker();
 				return;
 			}
