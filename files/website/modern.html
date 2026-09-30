@@ -509,8 +509,10 @@ select option { background-color: var(--bg-dark); }
 .horizontal-scroll .game-card:first-child { transform-origin: left center; }
 .horizontal-scroll .game-card:last-child { transform-origin: right center; }
 .horizontal-scroll>.game-card:only-child { transform-origin: left center; }
-.scroll-arrow { position: absolute; top: 40%; transform: translateY(-50%); width: 36px; height: 36px; background: rgba(18,24,36,0.95); color: white; border: 1px solid rgba(255,255,255,0.2); border-radius: 50%; font-size: 14px; cursor: pointer; z-index: 20; display: flex; align-items: center; justify-content: center; transition: 0.3s; box-shadow: 0 4px 10px rgba(0,0,0,0.6); }
+.scroll-arrow { position: absolute; top: 40%; transform: translateY(-50%); width: 36px; height: 36px; background: rgba(18,24,36,0.95); color: white; border: 1px solid rgba(255,255,255,0.2); border-radius: 50%; font-size: 14px; cursor: pointer; z-index: 20; display: flex; align-items: center; justify-content: center; opacity: 0; scale: .22; visibility: hidden; pointer-events: none; transform-origin: center; will-change: opacity,scale; transition: opacity .18s ease,scale .24s cubic-bezier(.2,.8,.2,1),visibility 0s linear .24s,transform .3s ease,background .3s ease,box-shadow .3s ease,color .3s ease,border-color .3s ease; box-shadow: 0 4px 10px rgba(0,0,0,0.6); }
+.scroll-arrow.carousel-arrow-visible { opacity: 1; scale: 1; visibility: visible; pointer-events: auto; transition-delay: 0s; }
 .scroll-arrow:hover { background: var(--ps-blue); box-shadow: 0 0 15px var(--ps-neon); transform: translateY(-50%) scale(1.1); }
+@media (prefers-reduced-motion: reduce) { .scroll-arrow { transition: none !important; } }
 .left-arrow { left: -15px; }
 .right-arrow { right: -15px; }
 
@@ -16747,14 +16749,21 @@ P
 
 	function syncRecentlyVisitedPlaceholders() {
 		const container = document.getElementById('recently-visited-grid');
-		if (!container) return;
+		if (!container) return false;
 		const realCount = Math.max(0, Number(container.dataset.recentlyVisitedRealCount || 0));
 		let placeholders = Array.from(container.querySelectorAll(':scope > .recently-visited-placeholder'));
 		if (!realCount) {
 			if (placeholders.length) placeholders.forEach(node => node.remove());
 			if (container.classList.contains('recently-visited-placeholder-filled')) container.classList.remove('recently-visited-placeholder-filled');
 			delete container.dataset.recentlyVisitedLayoutSignature;
-			return;
+			return true;
+		}
+
+		const exploreView = document.getElementById('view-explore');
+		const exploreVisible = !exploreView || getComputedStyle(exploreView).display !== 'none';
+		if (!exploreVisible || container.clientWidth <= 0) {
+			window.__recentlyVisitedLayoutDirty = true;
+			return false;
 		}
 
 		const style = getComputedStyle(container);
@@ -16763,8 +16772,7 @@ P
 		const cardWidth = isMobile ? EXPLORE_VIRTUAL_MOBILE_CARD_WIDTH : EXPLORE_VIRTUAL_DESKTOP_CARD_WIDTH;
 		const step = Math.max(1, cardWidth + gap);
 		const leftCol = container.closest('.explore-left-col');
-		const exploreView = document.getElementById('view-explore');
-		const measuredWidth = container.clientWidth || (leftCol && leftCol.clientWidth) || (exploreView && exploreView.clientWidth) || Math.max(cardWidth, (window.innerWidth || cardWidth) - 400);
+		const measuredWidth = container.clientWidth || (leftCol && leftCol.clientWidth) || (exploreView && exploreView.clientWidth) || cardWidth;
 		const visibleSlots = Math.max(1, Math.ceil((measuredWidth + gap) / step));
 		const placeholderCount = Math.max(0, visibleSlots - realCount);
 		const needsScroll = realCount > visibleSlots;
@@ -16780,21 +16788,54 @@ P
 
 		const shouldFill = !needsScroll;
 		if (container.classList.contains('recently-visited-placeholder-filled') !== shouldFill) container.classList.toggle('recently-visited-placeholder-filled', shouldFill);
+
+		/* Recently Visited already knows whether another full card exists before scrollWidth settles.
+		   Seed the animated edge state here, then let the shared carousel sync own it after scrolling. */
 		const wrapper = container.closest('.carousel-wrapper');
 		if (wrapper) {
-			wrapper.querySelectorAll('.scroll-arrow').forEach(arrow => {
-				if (needsScroll) {
-					if (arrow.style.display === 'none') arrow.style.removeProperty('display');
-				} else if (arrow.style.display !== 'none') arrow.style.display = 'none';
-			});
+			let leftArrow = null;
+			let rightArrow = null;
+			for (const child of wrapper.children) {
+				if (!child?.classList?.contains('scroll-arrow')) continue;
+				if (child.classList.contains('left-arrow')) leftArrow = child;
+				else if (child.classList.contains('right-arrow')) rightArrow = child;
+			}
+			const atStart = (Number(container.scrollLeft) || 0) <= 2;
+			if (atStart) {
+				if (leftArrow) {
+					leftArrow.classList.remove('carousel-arrow-visible');
+					leftArrow.setAttribute('aria-hidden', 'true');
+					leftArrow.tabIndex = -1;
+				}
+				if (rightArrow) {
+					rightArrow.classList.toggle('carousel-arrow-visible', needsScroll);
+					rightArrow.setAttribute('aria-hidden', needsScroll ? 'false' : 'true');
+					rightArrow.tabIndex = needsScroll ? 0 : -1;
+				}
+			}
 		}
+
 		if (container.dataset.recentlyVisitedLayoutSignature !== layoutSignature) container.dataset.recentlyVisitedLayoutSignature = layoutSignature;
+		return true;
 	}
 
 	function syncRecentlyVisitedLayout() {
-		syncRecentlyVisitedPlaceholders();
+		const layoutReady = syncRecentlyVisitedPlaceholders();
 		syncRecentlyVisitedDiscoverCards();
+		if (!layoutReady) {
+			window.__recentlyVisitedLayoutDirty = true;
+			return false;
+		}
 		window.__recentlyVisitedLayoutDirty = false;
+		const container = document.getElementById('recently-visited-grid');
+		/* At the initial edge the Recently Visited slot calculation is authoritative; a generic
+		   scrollWidth read in the same paint can still reflect the previously hidden layout. */
+		if (container && (Number(container.scrollLeft) || 0) > 2 && typeof window.syncCarouselArrowState === 'function') {
+			requestAnimationFrame(() => {
+				if (container.isConnected) window.syncCarouselArrowState(container);
+			});
+		}
+		return true;
 	}
 
 
@@ -17738,6 +17779,7 @@ P
 		delete container.dataset.exploreVirtualEnd;
 		attachExploreVirtualHandlers(container);
 		renderExploreVirtualWindow(container, true);
+		if (typeof window.scheduleCarouselArrowSync === 'function') window.scheduleCarouselArrowSync(container);
 	}
 
 
@@ -30477,6 +30519,7 @@ P
         const parentView = container.closest ? container.closest('.view-section') : null;
         if (parentView && window.getComputedStyle(parentView).display === 'none') return;
         if (window.getComputedStyle(container).display === 'none') return;
+        if (container.classList && container.classList.contains('horizontal-scroll') && typeof window.scheduleCarouselArrowSync === 'function') window.scheduleCarouselArrowSync(container);
 
         const animClass = options.animClass || 'anim-reveal';
         const selector = options.selector || '.game-card, .reward-card, .game-trophy-card, .online-user-item, .setting-item';
@@ -35980,10 +36023,12 @@ P
 			});
 			if (wrapper) wrapper.style.display = 'flex';
 			setGameModalNoScreenshots(modalRoot, false);
+			if (typeof window.scheduleCarouselArrowSync === 'function') window.scheduleCarouselArrowSync(screenshots);
 		} else {
 			if (screenshots) { disarmModalScreenshotSkeletonSizing(screenshots); screenshots.innerHTML = ''; }
 			if (wrapper) wrapper.style.display = 'none';
 			setGameModalNoScreenshots(modalRoot, snapshot.noScreenshots !== false);
+			if (screenshots && typeof window.scheduleCarouselArrowSync === 'function') window.scheduleCarouselArrowSync(screenshots);
 		}
 		return true;
 	}
@@ -36454,6 +36499,7 @@ P
 			Array.from(scrContainer.querySelectorAll('.screenshot-item')).forEach((image, index) => {
 				image.onclick = () => openImageModal(index, gallerySnapshot, { gallery:true });
 			});
+			if (typeof window.scheduleCarouselArrowSync === 'function') window.scheduleCarouselArrowSync(scrContainer);
 			return true;
 		};
 
@@ -36672,8 +36718,12 @@ P
 	window.moveModalScroll = function(direction) {
 		const container = document.getElementById('modal-screenshots');
 		if (container) {
+			if (typeof window.markCarouselArrowActivated === 'function') window.markCarouselArrowActivated(container, direction);
 			const scrollAmount = 380;
-			container.scrollBy({ left: direction * scrollAmount, behavior: 'smooth' });
+			const maxScroll = typeof window.getCarouselLogicalMaxScroll === 'function' ? window.getCarouselLogicalMaxScroll(container) : Math.max(0, container.scrollWidth - container.clientWidth);
+			const targetLeft = Math.min(maxScroll, Math.max(0, container.scrollLeft + (direction * scrollAmount)));
+			container.scrollTo({ left: targetLeft, behavior: 'smooth' });
+			if (typeof window.scheduleCarouselArrowSync === 'function') window.scheduleCarouselArrowSync(container);
 			if (typeof playUiArrow === 'function') playUiArrow();
 		}
 	};
@@ -46603,6 +46653,9 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 				window.syncBrowseSurpriseButtonState(preRevealCount);
 			}
 			target.style.display = 'block';
+			/* Recently Visited may have been hydrated/rendered while Explore was hidden. Re-run its
+			   tiny 10-item reconciler now that final geometry exists; unchanged DOM is reused. */
+			if (viewId === 'view-explore' && typeof window.renderRecentlyVisited === 'function') window.renderRecentlyVisited();
             psnCurrentViewCache = target;
 			if (viewId === 'view-explore' && typeof resumeExploreVirtualViewportObserver === 'function') resumeExploreVirtualViewportObserver();
             if (typeof window.refreshInterfaceTranslationContext === 'function') window.refreshInterfaceTranslationContext(target, { immediate: true, scan: true });
@@ -46827,11 +46880,9 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 				const exploreTarget = document.getElementById('view-explore');
 				const hasExploreCards = window.__explorePopulateReady === true || !!(exploreTarget && exploreTarget.querySelector('.horizontal-scroll .game-card'));
 				if (hasExploreCards) window.__explorePopulateReady = true;
-				const exploreNeedsLayout = window.__recentlyVisitedLayoutDirty === true || !document.getElementById('recently-visited-grid')?.dataset.recentlyVisitedLayoutSignature;
 				const exploreBlocksDirty = window.__exploreContentBlocksDirty === true;
-				if (!hasExploreCards || exploreNeedsLayout || exploreBlocksDirty) {
+				if (!hasExploreCards || exploreBlocksDirty) {
 					scheduleViewOpenWork('view-explore', () => {
-						if (exploreNeedsLayout && typeof syncRecentlyVisitedLayout === 'function') syncRecentlyVisitedLayout();
 						if (exploreBlocksDirty && typeof populateExploreTab === 'function') {
 							window.__exploreContentBlocksDirty = false;
 							Promise.resolve(populateExploreTab({ animateCards: false, reason: 'content-blocks-return' })).catch(err => { window.__exploreContentBlocksDirty = true; console.warn('Explore refresh failed:', err); });
@@ -47229,10 +47280,164 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 		switchView('view-explore', false, true);
 	});
     
+    (function installCarouselArrowStateSync() {
+        if (window.__psnCarouselArrowSyncInstalled) return;
+        window.__psnCarouselArrowSyncInstalled = true;
+        let syncFrame = 0;
+        const pending = new Set();
+        let clickGuard = null;
+
+        function carouselNow() {
+            return (window.performance && typeof performance.now === 'function') ? performance.now() : Date.now();
+        }
+
+        function getDirectCarouselArrow(wrapper, className) {
+            if (!wrapper) return null;
+            for (const child of wrapper.children) {
+                if (child && child.classList && child.classList.contains('scroll-arrow') && child.classList.contains(className)) return child;
+            }
+            return null;
+        }
+
+        function armCarouselArrowClickGuard(arrow) {
+            if (!arrow || !arrow.__psnCarouselLastRect) return;
+            const rect = arrow.__psnCarouselLastRect;
+            clickGuard = {
+                left: rect.left,
+                right: rect.right,
+                top: rect.top,
+                bottom: rect.bottom,
+                until: carouselNow() + 320
+            };
+        }
+
+        function consumeCarouselArrowClickThrough(event) {
+            const guard = clickGuard;
+            if (!guard) return;
+            const now = carouselNow();
+            if (now > guard.until) {
+                clickGuard = null;
+                return;
+            }
+            if (event.target && event.target.closest && event.target.closest('.scroll-arrow')) return;
+            const x = Number(event.clientX);
+            const y = Number(event.clientY);
+            if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+            if (x < guard.left || x > guard.right || y < guard.top || y > guard.bottom) return;
+            event.preventDefault();
+            event.stopImmediatePropagation();
+        }
+
+        window.markCarouselArrowActivated = function(containerOrId, direction) {
+            const container = typeof containerOrId === 'string' ? document.getElementById(containerOrId) : containerOrId;
+            if (!container) return false;
+            const wrapper = container.closest ? container.closest('.carousel-wrapper') : null;
+            const arrow = getDirectCarouselArrow(wrapper, Number(direction) < 0 ? 'left-arrow' : 'right-arrow');
+            if (!arrow) return false;
+            const rect = arrow.getBoundingClientRect();
+            arrow.__psnCarouselActivatedAt = carouselNow();
+            arrow.__psnCarouselLastRect = { left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom };
+            return true;
+        };
+
+        window.getCarouselLogicalMaxScroll = function(containerOrId) {
+            const container = typeof containerOrId === 'string' ? document.getElementById(containerOrId) : containerOrId;
+            if (!container) return 0;
+            if (container.id === 'recently-visited-grid' && container.classList.contains('recently-visited-placeholder-filled')) return 0;
+            return Math.max(0, (container.scrollWidth || 0) - (container.clientWidth || 0));
+        };
+
+        window.syncCarouselArrowState = function(containerOrId) {
+            const container = typeof containerOrId === 'string' ? document.getElementById(containerOrId) : containerOrId;
+            if (!container || !container.classList || !container.classList.contains('horizontal-scroll')) return false;
+            const wrapper = container.closest ? container.closest('.carousel-wrapper') : null;
+            if (!wrapper) return false;
+
+            const leftArrow = getDirectCarouselArrow(wrapper, 'left-arrow');
+            const rightArrow = getDirectCarouselArrow(wrapper, 'right-arrow');
+            if (!leftArrow && !rightArrow) return false;
+
+            const maxScroll = window.getCarouselLogicalMaxScroll(container);
+            const currentLeft = Math.max(0, Math.min(maxScroll, Number(container.scrollLeft) || 0));
+            const edgeThreshold = 2;
+            let hasOverflow = maxScroll > edgeThreshold;
+            let leftVisible = hasOverflow && currentLeft > edgeThreshold;
+            let rightVisible = hasOverflow && currentLeft < (maxScroll - edgeThreshold);
+
+            /* Recently Visited computes its initial need from full-card slots while visible. A generic
+               scrollWidth read can briefly lag after the hidden Explore view is revealed, so keep the
+               authoritative initial-edge state until the user actually moves the strip. */
+            if (container.id === 'recently-visited-grid' && (Number(container.scrollLeft) || 0) <= edgeThreshold) {
+                const parts = String(container.dataset.recentlyVisitedLayoutSignature || '').split('|');
+                const recentNeedsScroll = parts.length >= 4 && parts[parts.length - 1] === '1';
+                if (parts.length >= 4) {
+                    hasOverflow = recentNeedsScroll;
+                    leftVisible = false;
+                    rightVisible = recentNeedsScroll;
+                }
+            }
+
+            const apply = (arrow, visible) => {
+                if (!arrow) return;
+                const wasVisible = arrow.classList.contains('carousel-arrow-visible');
+                if (wasVisible && !visible) {
+                    const activatedAt = Number(arrow.__psnCarouselActivatedAt || 0);
+                    if (activatedAt > 0 && (carouselNow() - activatedAt) <= 1200) armCarouselArrowClickGuard(arrow);
+                    arrow.__psnCarouselActivatedAt = 0;
+                }
+                arrow.classList.toggle('carousel-arrow-visible', visible);
+                arrow.setAttribute('aria-hidden', visible ? 'false' : 'true');
+                arrow.tabIndex = visible ? 0 : -1;
+            };
+            apply(leftArrow, leftVisible);
+            apply(rightArrow, rightVisible);
+            return true;
+        };
+
+        window.scheduleCarouselArrowSync = function(container) {
+            if (!container || !container.isConnected) return false;
+            pending.add(container);
+            if (syncFrame) return true;
+            syncFrame = requestAnimationFrame(() => {
+                syncFrame = 0;
+                const queued = Array.from(pending);
+                pending.clear();
+                queued.forEach(item => window.syncCarouselArrowState(item));
+            });
+            return true;
+        };
+
+        window.syncAllCarouselArrows = function(root = document) {
+            const containers = [];
+            if (root && root.matches && root.matches('.horizontal-scroll')) containers.push(root);
+            if (root && root.querySelectorAll) root.querySelectorAll('.horizontal-scroll').forEach(container => containers.push(container));
+            containers.forEach(container => window.scheduleCarouselArrowSync(container));
+            return containers.length;
+        };
+
+        document.addEventListener('scroll', event => {
+            const target = event.target;
+            if (target && target.classList && target.classList.contains('horizontal-scroll')) window.scheduleCarouselArrowSync(target);
+        }, { passive:true, capture:true });
+        document.addEventListener('pointerdown', consumeCarouselArrowClickThrough, true);
+        document.addEventListener('click', consumeCarouselArrowClickThrough, true);
+
+        const syncInitial = () => requestAnimationFrame(() => window.syncAllCarouselArrows(document));
+        if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', syncInitial, { once:true });
+        else syncInitial();
+
+        if (typeof window.registerPsnResizeFrameTask === 'function') {
+            window.registerPsnResizeFrameTask(() => window.syncAllCarouselArrows(document));
+        } else {
+            window.addEventListener('resize', () => window.syncAllCarouselArrows(document), { passive:true });
+        }
+    })();
+
     window.scrollCarousel = function(id, direction) {
         playUiArrow();
         const container = document.getElementById(id);
         if (!container) return;
+        if (typeof window.markCarouselArrowActivated === 'function') window.markCarouselArrowActivated(container, direction);
 
         const isExploreVirtual = container.dataset && container.dataset.exploreVirtual === '1' && container.__exploreVirtualData && typeof getExploreVirtualMetrics === 'function';
         const virtualMetrics = isExploreVirtual ? getExploreVirtualMetrics(container) : null;
@@ -47253,7 +47458,10 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
         }
 
         const currentLeft = Math.max(0, container.scrollLeft || 0);
-        const targetLeft = Math.max(0, currentLeft + (scrollAmount * direction));
+        const logicalMaxScroll = typeof window.getCarouselLogicalMaxScroll === 'function'
+            ? window.getCarouselLogicalMaxScroll(container)
+            : Math.max(0, (container.scrollWidth || 0) - (container.clientWidth || 0));
+        const targetLeft = Math.min(logicalMaxScroll, Math.max(0, currentLeft + (scrollAmount * direction)));
 
         if (isExploreVirtual && typeof pinExploreVirtualRange === 'function') {
             const currentStart = Math.floor(Math.min(currentLeft, targetLeft) / Math.max(1, virtualMetrics.step));
@@ -47263,6 +47471,7 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
         }
 
         container.scrollTo({ left: Math.round(targetLeft), behavior: 'smooth' });
+        if (typeof window.scheduleCarouselArrowSync === 'function') window.scheduleCarouselArrowSync(container);
     };
     
     const bannerData = [
