@@ -6524,6 +6524,7 @@ img { -webkit-user-drag: none !important; user-drag: none !important; }
 .direct-format-divider { flex:0 0 auto; }
 .direct-composer { padding:7px 12px 10px; border-top:0; background:rgba(255,255,255,.025); display:flex; align-items:flex-end; gap:9px; }
 .direct-composer { position:relative; }
+#direct-mention-suggestions { position:absolute; left:12px; bottom:calc(100% + 8px); z-index:1300; width:min(235px,calc(100% - 24px)); max-height:min(200px,42dvh); overflow-x:hidden; overflow-y:auto; display:none; background:rgba(15,15,15,.95); border:1px solid var(--ps-blue); border-radius:8px; box-shadow:0 0 20px rgba(0,112,204,.4); backdrop-filter:blur(10px); box-sizing:border-box; overscroll-behavior:contain; }
 .direct-composer-action-btn { margin:0 !important; height:42px; padding:0 18px !important; background:rgba(0,0,0,.5) !important; border:1px solid rgba(255,255,255,.1) !important; color:var(--text-muted) !important; box-shadow:inset 0 2px 4px rgba(0,0,0,.3); flex:0 0 auto; justify-content:center; }
 #direct-attach-btn:hover { color:var(--ps-blue) !important; border-color:var(--ps-blue) !important; }
 #direct-gif-btn:hover,#direct-gif-btn.is-active { color:#e91e63 !important; border-color:rgba(233,30,99,.5) !important; }
@@ -73633,6 +73634,7 @@ function getVisibleChatStackEl(id) {
 		if (typeof stopDirectTyping === 'function') stopDirectTyping();
 		input.innerHTML = '';
 		window.__directChatState.inputRange = null;
+		if (typeof hideDirectMentionSuggestions === 'function') hideDirectMentionSuggestions();
 		directUpdateFormatState();
 	}
 
@@ -73673,6 +73675,158 @@ function getVisibleChatStackEl(id) {
 			btn.classList.toggle('active', !!active);
 		});
 	}
+
+
+	let directMentionSuggestionIndex = 0;
+	let directMentionSuggestionLastSource = null;
+	let directMentionSuggestionLastQuery = '';
+	let directMentionSuggestionLastMatches = null;
+	const directPendingMentionNames = new Set();
+
+	function ensureDirectMentionSuggestionBox() {
+		let box = document.getElementById('direct-mention-suggestions');
+		if (box) return box;
+		const composer = document.querySelector('#direct-thread-active .direct-composer') || document.querySelector('.direct-composer');
+		if (!composer) return null;
+		box = document.createElement('div');
+		box.id = 'direct-mention-suggestions';
+		box.setAttribute('role', 'listbox');
+		composer.appendChild(box);
+		return box;
+	}
+
+	function hideDirectMentionSuggestions() {
+		const box = document.getElementById('direct-mention-suggestions');
+		if (!box) return;
+		box.style.display = 'none';
+		box.innerHTML = '';
+		directMentionSuggestionIndex = 0;
+	}
+
+	function getDirectMentionContext(input) {
+		if (!input || typeof getChatCaretTextOffset !== 'function') return null;
+		const caretOffset = getChatCaretTextOffset(input);
+		const text = String(input.innerText || input.textContent || '');
+		const before = text.slice(0, caretOffset);
+		const match = before.match(/(^|\s)@([A-Za-z0-9_.-]*)$/);
+		if (!match) return null;
+		const atIndex = before.length - match[2].length - 1;
+		return { query:match[2], start:atIndex, end:caretOffset };
+	}
+
+	function getDirectMentionRows(query) {
+		if (typeof getChatMentionSuggestionIndex !== 'function') return [];
+		const normalizedQuery = String(query || '').trim();
+		const queryLower = normalizedQuery.toLowerCase();
+		if (typeof requestChatMentionDatabaseUsers === 'function') requestChatMentionDatabaseUsers(normalizedQuery.length >= 2 ? normalizedQuery : '*');
+		const source = getChatMentionSuggestionIndex();
+		let candidates = source;
+		if (directMentionSuggestionLastSource === source && directMentionSuggestionLastMatches && queryLower.startsWith(directMentionSuggestionLastQuery)) candidates = directMentionSuggestionLastMatches;
+		const matches = queryLower ? candidates.filter(record => record.lower.includes(queryLower)) : source;
+		directMentionSuggestionLastSource = source;
+		directMentionSuggestionLastQuery = queryLower;
+		directMentionSuggestionLastMatches = matches;
+		const me = String(directCurrentUser() || '').toLowerCase();
+		const online = new Set(((typeof currentOnlineList !== 'undefined' && Array.isArray(currentOnlineList)) ? currentOnlineList : [])
+			.filter(user => user && user.online === true)
+			.map(user => String(user.name || user).toLowerCase()));
+		const rows = matches.filter(record => record && record.name && record.lower !== me).map(record => ({ name:record.name, online:online.has(record.lower) }));
+		rows.sort((a,b) => Number(b.online) - Number(a.online) || String(a.name).localeCompare(String(b.name)));
+		return rows;
+	}
+
+	function renderDirectMentionSuggestions(query) {
+		const box = ensureDirectMentionSuggestionBox();
+		if (!box) return;
+		const rows = getDirectMentionRows(query).slice(0, 80);
+		if (!rows.length) { hideDirectMentionSuggestions(); return; }
+		let currentGroup = '';
+		const html = [];
+		rows.forEach(row => {
+			const group = row.online ? 'ONLINE' : 'OFFLINE';
+			if (group !== currentGroup) {
+				currentGroup = group;
+				html.push(`<div style="font-size:9px;color:${row.online ? '#4caf50' : '#8b96a8'};font-weight:bold;margin:6px 12px 2px;letter-spacing:1px;">${group}</div>`);
+			}
+			const safeName = directEscapeHtml(row.name);
+			html.push(`<div class="suggestion-item" role="option" data-direct-mention-value="${safeName}"><i class="fas fa-circle${row.online ? ' status-pulsing-soft' : ''}" style="color:${row.online ? '#4caf50' : 'rgba(255,255,255,.2)'};font-size:7px;margin-right:5px;vertical-align:middle;"></i><span class="chat-mention-user-name" data-no-translate="true" translate="no">${safeName}</span></div>`);
+		});
+		box.innerHTML = html.join('');
+		box.style.display = 'block';
+		box.scrollTop = 0;
+		directMentionSuggestionIndex = 0;
+		activateDirectMentionSuggestion(0);
+	}
+
+	function getDirectMentionSuggestionItems() {
+		const box = document.getElementById('direct-mention-suggestions');
+		return box ? Array.from(box.querySelectorAll('[data-direct-mention-value]')) : [];
+	}
+
+	function activateDirectMentionSuggestion(index) {
+		const items = getDirectMentionSuggestionItems();
+		if (!items.length) return null;
+		directMentionSuggestionIndex = (index + items.length) % items.length;
+		items.forEach((item, i) => item.classList.toggle('active', i === directMentionSuggestionIndex));
+		const active = items[directMentionSuggestionIndex];
+		active.scrollIntoView({ block:'nearest' });
+		return active;
+	}
+
+	function insertDirectMention(user) {
+		const input = document.getElementById('direct-chat-input');
+		if (!input || !user) return false;
+		directRestoreInputRange();
+		const context = getDirectMentionContext(input);
+		if (context && typeof replaceChatTextRange === 'function') replaceChatTextRange(input, context.start, context.end, `@${user} `);
+		else document.execCommand('insertText', false, `@${user} `);
+		hideDirectMentionSuggestions();
+		input.focus({ preventScroll:true });
+		directSaveInputRange();
+		input.dispatchEvent(new Event('input', { bubbles:true }));
+		if (typeof playUiClick === 'function') playUiClick();
+		return true;
+	}
+
+	function updateDirectMentionSuggestions(input) {
+		const context = getDirectMentionContext(input);
+		if (!context) { hideDirectMentionSuggestions(); return; }
+		renderDirectMentionSuggestions(context.query);
+	}
+
+	window.refreshDirectMentionSuggestionsFromCache = function() {
+		const box = document.getElementById('direct-mention-suggestions');
+		const input = document.getElementById('direct-chat-input');
+		if (!box || box.style.display !== 'block' || !input) return;
+		const context = getDirectMentionContext(input);
+		if (context) renderDirectMentionSuggestions(context.query);
+	};
+
+	function formatDirectUserMentionsForDisplay(messageText) {
+		if (typeof replaceChatMentionsOutsideHtmlTags !== 'function') return String(messageText || '');
+		return replaceChatMentionsOutsideHtmlTags(messageText, function(match, prefix, name) {
+			if (!name || String(name).toLowerCase() === 'everyone' || String(name).toLowerCase() === 'guest') return match;
+			if (typeof isKnownChatMentionName !== 'function' || !isKnownChatMentionName(name)) {
+				directPendingMentionNames.add(String(name).toLowerCase());
+				if (typeof requestChatMentionDatabaseUsers === 'function') requestChatMentionDatabaseUsers(name);
+				return match;
+			}
+			const canonicalName = typeof getCanonicalChatMentionName === 'function' ? getCanonicalChatMentionName(name) : name;
+			if (typeof trackUser === 'function') trackUser(canonicalName);
+			return `${prefix}<span class="chat-mention direct-chat-mention" data-no-translate="true" translate="no" style="cursor:pointer;text-decoration:underline;" onclick="event.stopPropagation(); openProfileModal('${encodeURIComponent(canonicalName)}')">@${directEscapeHtml(canonicalName)}</span>`;
+		});
+	}
+
+	window.handleDirectMentionUsersResults = function(results) {
+		if (typeof window.refreshDirectMentionSuggestionsFromCache === 'function') window.refreshDirectMentionSuggestionsFromCache();
+		if (!Array.isArray(results) || !directPendingMentionNames.size) return;
+		let resolved = false;
+		results.forEach(user => {
+			const name = String(user && (user.name || user.username || user.user || user.onlineId) || '').trim().toLowerCase();
+			if (name && directPendingMentionNames.delete(name)) resolved = true;
+		});
+		if (resolved && typeof directThreadVisible === 'function' && directThreadVisible() && typeof renderDirectThread === 'function') requestAnimationFrame(() => renderDirectThread({ preserveScroll:true }));
+	};
 
 	window.directFormatMessage = function(event, command) {
 		if (event) { event.preventDefault(); event.stopPropagation(); }
@@ -73715,7 +73869,7 @@ function getVisibleChatStackEl(id) {
 			if (last < source.length) frag.appendChild(document.createTextNode(source.slice(last)));
 			node.parentNode.replaceChild(frag, node);
 		});
-		return temp.innerHTML;
+		return formatDirectUserMentionsForDisplay(temp.innerHTML);
 	}
 
 	function directExtractFirstLink(value) {
@@ -76383,6 +76537,20 @@ function getVisibleChatStackEl(id) {
 	document.addEventListener('keydown', event => {
 		const input = event.target;
 		if (!input || input.id !== 'direct-chat-input') return;
+		const mentionBox = document.getElementById('direct-mention-suggestions');
+		const mentionOpen = !!(mentionBox && mentionBox.style.display === 'block' && getDirectMentionSuggestionItems().length);
+		if (mentionOpen && (event.key === 'ArrowDown' || event.key === 'ArrowUp')) {
+			event.preventDefault();
+			activateDirectMentionSuggestion(directMentionSuggestionIndex + (event.key === 'ArrowDown' ? 1 : -1));
+			return;
+		}
+		if (mentionOpen && (event.key === 'Enter' || event.key === 'Tab')) {
+			event.preventDefault();
+			const item = getDirectMentionSuggestionItems()[directMentionSuggestionIndex] || getDirectMentionSuggestionItems()[0];
+			if (item) insertDirectMention(item.dataset.directMentionValue || '');
+			return;
+		}
+		if (mentionOpen && event.key === 'Escape') { event.preventDefault(); hideDirectMentionSuggestions(); return; }
 		const modifier = event.ctrlKey || event.metaKey;
 		if (modifier && !event.altKey) {
 			const key = String(event.key || '').toLowerCase();
@@ -76403,8 +76571,21 @@ function getVisibleChatStackEl(id) {
 		if (!input || input.id !== 'direct-chat-input') return;
 		directSaveInputRange();
 		directUpdateFormatState();
+		updateDirectMentionSuggestions(input);
 		updateDirectTypingFromComposer();
 	});
+
+	document.addEventListener('pointerdown', event => {
+		const item = event.target && event.target.closest ? event.target.closest('#direct-mention-suggestions [data-direct-mention-value]') : null;
+		if (item) {
+			event.preventDefault();
+			event.stopPropagation();
+			insertDirectMention(item.dataset.directMentionValue || '');
+			return;
+		}
+		const box = document.getElementById('direct-mention-suggestions');
+		if (box && box.style.display === 'block' && !box.contains(event.target) && !document.getElementById('direct-chat-input')?.contains(event.target)) hideDirectMentionSuggestions();
+	}, true);
 
 	function initChat(options = {}) {
 		const preAuthMaintenance = options.preAuthMaintenance === true && window.isProfileLoaded !== true && !loginServerAttempt;
@@ -77665,6 +77846,7 @@ function getVisibleChatStackEl(id) {
 		
 		socketChat.on('mention_users_results', function(results) {
 			const mentionDbChanged = (typeof mergeChatMentionDatabaseUsers === 'function') ? mergeChatMentionDatabaseUsers(results) : false;
+			if (mentionDbChanged && typeof window.handleDirectMentionUsersResults === 'function') window.handleDirectMentionUsersResults(results);
 			const chatVisibleForMentionResults = typeof isChatScreenVisibleForRead === 'function' && isChatScreenVisibleForRead();
 			if (mentionDbChanged && typeof scheduleChatHistorySoftRerender === 'function' && !chatVisibleForMentionResults) {
 				scheduleChatHistorySoftRerender('mention-database-results', true);
