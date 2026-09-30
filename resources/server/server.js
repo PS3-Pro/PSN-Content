@@ -4204,7 +4204,7 @@ function getPublicUserData(username, user = {}, includeAdminFields = false) {
 
 const COMPACT_PROFILE_SETTING_KEYS = new Set([
   'audio', 'ux', 'hapticFeedback', 'haptics', 'cardBlur', 'cardBlurEnabled', 'gameCardBlur', 'recentlyVisitedVisible',
-  'chatSound', 'directChatSound', 'chatAutoTranslate', 'interfaceAutoTranslate', 'ps3Ip', 'companionPlugin',
+  'chatSound', 'directChatSound', 'chatAutoTranslate', 'directChatAutoTranslate', 'interfaceAutoTranslate', 'ps3Ip', 'companionPlugin',
   'fpsCounterPlugin', 'fpsCounter', 'consoleFanMode', 'consoleFanSpeed', 'consoleFanTarget',
   'performanceMode', 'performanceRsx', 'performanceVram', 'siteDisclaimerSkipToday',
   'settingsUpdatedAt', 'settingsSyncedAt', 'settingsVersion', 'themeColor', 'themeColorUpdatedAt',

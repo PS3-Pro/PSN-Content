@@ -1917,10 +1917,12 @@ input:checked+.slider:before { transform: translateX(20px); }
 .btn-shutdown { border-color: rgba(255,68,68,0.3); }
 .btn-shutdown:hover { background: rgba(255,68,68,0.15); border-color: #ff4444; animation: pulse-shutdown 1.5s infinite; }
 #btn-sync-db:disabled { opacity: 0.6; cursor: not-allowed; border-color: var(--text-muted); background: rgba(255,255,255,0.05); }
-.scroll-buttons { position: fixed; bottom: 30px; right: 30px; display: none; flex-direction: column; gap: 10px; z-index: 100; }
-.scroll-buttons button { width: 36px; height: 36px; background: rgba(18,24,36,0.95); color: white; border: 1px solid rgba(255,255,255,0.2); border-radius: 50%; font-size: 14px; cursor: pointer; display: flex; align-items: center; justify-content: center; transition: 0.3s; box-shadow: 0 4px 10px rgba(0,0,0,0.6); }
-.scroll-buttons button:hover { background: var(--ps-blue); box-shadow: 0 0 15px var(--ps-neon); transform: scale(1.1); color: white; border-color: rgba(255,255,255,0.2); }
-#btnScrollTop { display: none; }
+.scroll-buttons { position: fixed; bottom: 30px; right: 30px; display: none; flex-direction: column; gap: 0; z-index: 100; }
+.scroll-buttons button { width: 36px; height: 0; min-height: 0; padding: 0; overflow: hidden; background: rgba(18,24,36,0.95); color: white; border: 0 solid rgba(255,255,255,0.2); border-radius: 50%; font-size: 14px; cursor: pointer; display: flex; align-items: center; justify-content: center; opacity: 0; transform: scale(.22); transform-origin: center; pointer-events: none; box-shadow: 0 4px 10px rgba(0,0,0,0.6); transition: opacity .18s ease,transform .24s cubic-bezier(.2,.8,.2,1),height .24s cubic-bezier(.2,.8,.2,1),border-width .18s ease,margin-top .24s cubic-bezier(.2,.8,.2,1),background .3s ease,box-shadow .3s ease,color .3s ease,border-color .3s ease; }
+.scroll-buttons button.scroll-nav-visible { height: 36px; min-height: 36px; border-width: 1px; opacity: 1; transform: scale(1); pointer-events: auto; overflow: visible; }
+.scroll-buttons button.scroll-nav-visible + button.scroll-nav-visible { margin-top: 10px; }
+.scroll-buttons button.scroll-nav-visible:hover { background: var(--ps-blue); box-shadow: 0 0 15px var(--ps-neon); transform: scale(1.1); color: white; border-color: rgba(255,255,255,0.2); }
+@media (prefers-reduced-motion: reduce) { .scroll-buttons button { transition: none !important; } }
 #mobile-menu-btn { display: none !important; background: transparent; border: none; color: white; font-size: 22px; cursor: pointer; outline: none; }
 .file-thumb { width: 24px; height: 24px; object-fit: cover; border-radius: 4px; background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1); }
 .file-name span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -6409,6 +6411,7 @@ img { -webkit-user-drag: none !important; user-drag: none !important; }
 .direct-conversations-head { padding:14px 14px 12px; border-bottom:1px solid rgba(255,255,255,.07); display:flex; align-items:center; justify-content:space-between; gap:10px; }
 .direct-conversations-head strong { font-size:12px; letter-spacing:.35px; text-transform:uppercase; color:rgba(255,255,255,.72); }
 .direct-conversations-list { flex:1; min-height:0; overflow:auto; padding:7px 7px 76px; }
+.direct-conversations-list.direct-conversation-entry-prep > .direct-conversation-item { opacity:0; transform:translateY(14px); pointer-events:none; }
 .direct-conversation-item { width:100%; border:0; background:transparent; color:#fff; display:grid; grid-template-columns:40px minmax(0,1fr) auto; align-items:center; gap:10px; padding:10px; border-radius:8px; text-align:left; transition:background .18s ease,transform .06s ease,filter .06s ease; }
 .direct-conversation-item:hover,.direct-conversation-item.active { background:rgba(255,255,255,.07); }
 .psn-avatar-presence-wrap { position:relative; display:inline-flex; flex:0 0 auto; width:fit-content; height:fit-content; line-height:0; overflow:visible; }
@@ -24670,7 +24673,8 @@ P
 			if(messagesView) {
 				const wasHidden = messagesView.style.display === 'none' || getComputedStyle(messagesView).display === 'none';
 				animateConversationEntry = wasHidden;
-				if (animateConversationEntry && window.__directChatState) window.__directChatState.conversationEntryPending = true;
+				if (animateConversationEntry && typeof window.prepareDirectConversationListEntry === 'function') window.prepareDirectConversationListEntry();
+				else if (animateConversationEntry && window.__directChatState) window.__directChatState.conversationEntryPending = true;
 				// Reset while the section is still hidden so there is no visible scroll jump.
 				if (wasHidden && typeof window.resetDirectConversationListScroll === 'function') window.resetDirectConversationListScroll();
 				setPsnStyleIfChanged(messagesView, 'display', 'flex');
@@ -46981,6 +46985,7 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
     const btnTop = document.getElementById("btnScrollTop");
     const btnBottom = document.getElementById("btnScrollBottom");
     const scrollBtnsContainer = document.querySelector(".scroll-buttons");
+    [btnTop, btnBottom].forEach(button => { if (button) { button.setAttribute('aria-hidden', 'true'); button.tabIndex = -1; } });
     const scrollButtonViews = {
         browse: document.getElementById('view-browse'),
         wishlist: document.getElementById('view-wishlist'),
@@ -46999,6 +47004,17 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
         return isBrowse || isWishlist || isDownloads || (isConnected && (isFavorites || isGames));
    }
 
+   function setScrollNavigationButtonVisible(button, show) {
+        if (!button) return false;
+        const visible = show === true;
+        const changed = button.classList.contains('scroll-nav-visible') !== visible;
+        if (!changed) return false;
+        button.classList.toggle('scroll-nav-visible', visible);
+        button.setAttribute('aria-hidden', visible ? 'false' : 'true');
+        button.tabIndex = visible ? 0 : -1;
+        return true;
+   }
+
    function applyScrollButtonsVisibility() {
         if (!scrollArea || !scrollBtnsContainer || !btnTop || !btnBottom) return;
 
@@ -47015,25 +47031,27 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
         const isAllowedView = isBrowse || isWishlist || isDownloads || isLibraryAllowed;
 
         if (!isAllowedView) {
-            if (scrollBtnsContainer.style.display !== 'none') scrollBtnsContainer.style.display = 'none';
-            return;
-        }
-
-        const scrollTop = scrollArea.scrollTop;
-        const scrollHeight = scrollArea.scrollHeight;
-        const clientHeight = scrollArea.clientHeight;
-        if (scrollHeight <= clientHeight + 50) {
+            setScrollNavigationButtonVisible(btnTop, false);
+            setScrollNavigationButtonVisible(btnBottom, false);
             if (scrollBtnsContainer.style.display !== 'none') scrollBtnsContainer.style.display = 'none';
             return;
         }
 
         if (scrollBtnsContainer.style.display !== 'flex') scrollBtnsContainer.style.display = 'flex';
-        const nextTopDisplay = scrollTop > 300 ? 'flex' : 'none';
-        if (btnTop.style.display !== nextTopDisplay) btnTop.style.display = nextTopDisplay;
+
+        const scrollTop = scrollArea.scrollTop;
+        const scrollHeight = scrollArea.scrollHeight;
+        const clientHeight = scrollArea.clientHeight;
+        if (scrollHeight <= clientHeight + 50) {
+            setScrollNavigationButtonVisible(btnTop, false);
+            setScrollNavigationButtonVisible(btnBottom, false);
+            return;
+        }
+
+        setScrollNavigationButtonVisible(btnTop, scrollTop > 300);
 
         const distanceToBottom = scrollHeight - scrollTop - clientHeight;
-        const nextBottomDisplay = distanceToBottom > 300 ? 'flex' : 'none';
-        if (btnBottom.style.display !== nextBottomDisplay) btnBottom.style.display = nextBottomDisplay;
+        setScrollNavigationButtonVisible(btnBottom, distanceToBottom > 300);
     }
 
    let scrollButtonsVisibilityFrame = 0;
@@ -74451,14 +74469,33 @@ function getVisibleChatStackEl(id) {
 		return !list || (list.scrollHeight - list.scrollTop - list.clientHeight) <= threshold;
 	}
 
+	function prepareDirectConversationListEntry() {
+		const state = window.__directChatState;
+		const list = document.getElementById('direct-conversations-list');
+		if (!list || !state) return false;
+		state.conversationEntryPending = true;
+		list.classList.add('direct-conversation-entry-prep');
+		return true;
+	}
+	window.prepareDirectConversationListEntry = prepareDirectConversationListEntry;
+
 	function animateDirectConversationListEntry() {
 		const state = window.__directChatState;
 		const list = document.getElementById('direct-conversations-list');
 		if (!list || !state || state.conversationEntryPending !== true) return false;
 		const items = Array.from(list.querySelectorAll(':scope > .direct-conversation-item'));
-		if (!items.length || list.getClientRects().length === 0) return false;
+		if (!items.length) {
+			state.conversationEntryPending = false;
+			list.classList.remove('direct-conversation-entry-prep');
+			return false;
+		}
+		if (list.getClientRects().length === 0) return false;
 		state.conversationEntryPending = false;
-		if ((window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches) || typeof items[0].animate !== 'function') return false;
+		const reducedMotion = !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+		if (reducedMotion || typeof items[0].animate !== 'function') {
+			list.classList.remove('direct-conversation-entry-prep');
+			return false;
+		}
 		items.forEach((item, index) => {
 			if (item.__directConversationEntryAnimation) {
 				try { item.__directConversationEntryAnimation.cancel(); } catch (e) {}
@@ -74477,6 +74514,9 @@ function getVisibleChatStackEl(id) {
 				if (item.__directConversationEntryAnimation === animation) item.__directConversationEntryAnimation = null;
 			});
 		});
+		/* Every animation already owns its delayed first keyframe before this class is removed,
+		   so there is no paint where the rows are visible before their stagger begins. */
+		list.classList.remove('direct-conversation-entry-prep');
 		return true;
 	}
 	window.animateDirectConversationListEntry = animateDirectConversationListEntry;
@@ -74531,7 +74571,6 @@ function getVisibleChatStackEl(id) {
 				<div class="direct-conversation-side"><span class="direct-conversation-time">${directEscapeHtml(directFormatConversationTime(last.createdAt))}</span>${unread ? `<span class="direct-unread-badge">${unread > 99 ? '99+' : unread}</span>` : ''}</div>
 			</button>`;
 		}).join('');
-		if (state.conversationEntryPending) requestAnimationFrame(() => animateDirectConversationListEntry());
 	}
 
 
@@ -75981,6 +76020,7 @@ function getVisibleChatStackEl(id) {
 		clearTimeout(state.conversationRefreshWatchdog); state.conversationRefreshWatchdog = 0; state.conversationRefreshToken = Number(state.conversationRefreshToken || 0) + 1;
 		clearTimeout(state.threadRequestTimer); state.threadRequestTimer = 0; state.threadRequestToken = Number(state.threadRequestToken || 0) + 1;
 		state.conversationRefreshInFlight = false; state.conversationRefreshQueued = false; state.conversationSignature = ''; state.conversationEntryPending = false;
+		document.getElementById('direct-conversations-list')?.classList.remove('direct-conversation-entry-prep');
 		clearTimeout(directGifSearchTimer); directGifSearchTimer = 0; directGifRequestSeq = Number(directGifRequestSeq || 0) + 1;
 		if (directGifAbortController) { try { directGifAbortController.abort(); } catch (e) {} directGifAbortController = null; }
 		const reactionPicker = document.getElementById('active-direct-reaction-picker');
@@ -75998,13 +76038,21 @@ function getVisibleChatStackEl(id) {
 
 	window.refreshDirectConversations = function(options = {}) {
 		const state = window.__directChatState;
-		if (options.animateListEntry === true) state.conversationEntryPending = true;
+		if (options.animateListEntry === true) {
+			if (typeof window.prepareDirectConversationListEntry === 'function') window.prepareDirectConversationListEntry();
+			else state.conversationEntryPending = true;
+		}
 		if (!socketChat || !socketChat.connected) {
 			if (state.conversationEntryPending) requestAnimationFrame(() => animateDirectConversationListEntry());
 			return;
 		}
 		const delay = options.immediate === true ? 0 : 70;
-		if (state.conversationRefreshInFlight) { state.conversationRefreshQueued = true; return; }
+		if (state.conversationRefreshInFlight) {
+			/* Opening Private Chat can reuse the conversation request already in flight. Do not queue
+			   a second identical request just to play the entry animation after the first one returns. */
+			if (options.animateListEntry !== true) state.conversationRefreshQueued = true;
+			return;
+		}
 		clearTimeout(state.conversationRefreshTimer);
 		state.conversationRefreshTimer = setTimeout(() => {
 			if (!socketChat || !socketChat.connected) return;
