@@ -7111,8 +7111,8 @@ img { -webkit-user-drag: none !important; user-drag: none !important; }
 				</li>
 				<li id="nav-admin-footer" class="admin-sidebar-entry" onmouseenter="playUiHover()" onclick="playUiClick(); openAdminPanel('view-admin'); toggleSidebar(true)">
 					<i class="fas fa-shield-alt"></i> <span class="interface-compact-label sidebar-press-label" data-sidebar-press-label>Control Panel</span>
-					<span id="sidebar-count-admin" class="sidebar-count-pill is-empty" title="0 pending reports" style="display:none;">0</span>
-					<span id="admin-dot" class="notification-dot" title="New reports"></span>
+					<span id="sidebar-count-admin" class="sidebar-count-pill is-empty" title="0 pending admin items" style="display:none;">0</span>
+					<span id="admin-dot" class="notification-dot" title="Pending admin review"></span>
 				</li>
 				<li id="nav-notifications" onmouseenter="playUiHover()" onclick="playUiClick(); switchView('view-notifications'); toggleSidebar(true)">
 					<i class="fas fa-bell"></i> <span class="interface-compact-label sidebar-press-label" data-sidebar-press-label>Notifications</span>
@@ -15455,7 +15455,6 @@ P
                 'psn_chat_dot': 'chat-dot',
                 'psn_friend_activity_dot': 'activity-dot',
                 'psn_notifications_dot': 'notifications-dot',
-                'psn_admin_report_dot': 'admin-dot'
             };
 
             Object.keys(dotMap).forEach(key => {
@@ -39402,7 +39401,7 @@ P
 
 	window.openAdminPanel = function() {
 		if (!adminGuard()) return;
-		if (typeof window.clearAdminReportNotificationDot === 'function') window.clearAdminReportNotificationDot();
+		if (typeof window.refreshAdminPendingIndicator === 'function') window.refreshAdminPendingIndicator();
 		/* If an earlier exit cleanup is still pending, finish it before Admin becomes visible
 		   again so the same reset behavior is preserved. */
 		if (adminExitCleanupTimer || adminExitCleanupIdle) adminRunExitCleanup();
@@ -39474,7 +39473,7 @@ P
 	window.updateAdminVisibility = function() {
 		const isAdmin = document.body.classList.contains('is-admin');
 		const currentAdminView = document.getElementById('view-admin');
-		if (typeof window.updateAdminReportSidebarPill === 'function') window.updateAdminReportSidebarPill();
+		if (typeof window.refreshAdminPendingIndicator === 'function') window.refreshAdminPendingIndicator();
 		if (!isAdmin && currentAdminView && currentAdminView.style.display === 'block') {
 			switchTab('home', true);
 		}
@@ -43657,7 +43656,6 @@ P
 		adminReportsFallbackRaw = raw;
 		adminReportsFallbackCache = window.adminReports;
 		safeLocalStorageSet('psn_admin_reports', raw);
-		if (typeof window.updateAdminReportSidebarPill === 'function') window.updateAdminReportSidebarPill();
 	}
 
 	window.adminMetadataSuggestions = Array.isArray(window.adminMetadataSuggestions) ? window.adminMetadataSuggestions : [];
@@ -43697,6 +43695,7 @@ P
 		else if (activeEl && activeEl.textContent !== String(activeCount)) activeEl.textContent = String(activeCount);
 		if (pendingEl && typeof window.setLiveCountText === 'function') window.setLiveCountText(pendingEl, String(pendingCount), pendingCount, 'admin-metadata-pending');
 		else if (pendingEl && pendingEl.textContent !== String(pendingCount)) pendingEl.textContent = String(pendingCount);
+		if (typeof window.refreshAdminPendingIndicator === 'function') window.refreshAdminPendingIndicator();
 	}
 
 	function adminSetMetadataSuggestions(suggestions) {
@@ -44807,31 +44806,45 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 		}
 		window.__adminStoreReportCount = total;
 		window.adminContentReportsLastSyncAt = Date.now();
-		if (typeof window.updateAdminReportSidebarPill === 'function') window.updateAdminReportSidebarPill();
+		if (typeof window.refreshAdminPendingIndicator === 'function') window.refreshAdminPendingIndicator();
 	}
 
-	const ADMIN_REPORT_DOT_KEY = 'psn_admin_report_dot';
+	function getAdminPendingActionCounts() {
+		const contentReports = Number.isFinite(Number(window.__adminStoreReportCount))
+			? Math.max(0, Number(window.__adminStoreReportCount))
+			: 0;
+		const metadataSuggestions = typeof adminMetadataSuggestionList === 'function'
+			? adminMetadataSuggestionList().length
+			: (Array.isArray(window.adminMetadataSuggestions) ? window.adminMetadataSuggestions.length : 0);
+		return {
+			contentReports,
+			metadataSuggestions,
+			total: contentReports + metadataSuggestions
+		};
+	}
 
-	window.setAdminReportNotificationDot = function(show, persist = true) {
+	window.refreshAdminPendingIndicator = function() {
 		const dot = document.getElementById('admin-dot');
-		const visible = !!show && document.body.classList.contains('is-admin');
-		if (dot) dot.style.display = visible ? 'block' : 'none';
-		if (persist) { try { saveState(ADMIN_REPORT_DOT_KEY, visible ? 'true' : 'false'); } catch (err) {} }
+		const counts = getAdminPendingActionCounts();
+		const isAdmin = document.body.classList.contains('is-admin');
+		const visible = isAdmin && counts.total > 0;
+		if (dot) {
+			dot.style.display = visible ? 'block' : 'none';
+			if (counts.contentReports > 0 && counts.metadataSuggestions > 0) dot.title = 'Pending content reports and database corrections';
+			else if (counts.contentReports > 0) dot.title = 'Pending content reports';
+			else if (counts.metadataSuggestions > 0) dot.title = 'Pending database corrections';
+			else dot.title = 'No pending admin review';
+		}
+		if (typeof window.setSidebarCountPill === 'function') {
+			window.setSidebarCountPill('admin', isAdmin ? counts.total : null);
+			const pill = document.getElementById('sidebar-count-admin');
+			if (pill) {
+				pill.title = counts.total === 1 ? '1 pending admin item' : `${counts.total} pending admin items`;
+			}
+		}
 		return visible;
 	};
 
-	window.markAdminReportNotificationDot = function() {
-		if (!document.body.classList.contains('is-admin')) return false;
-		if (document.getElementById('view-admin')?.style.display === 'block') {
-			window.setAdminReportNotificationDot(false);
-			return false;
-		}
-		return window.setAdminReportNotificationDot(true);
-	};
-
-	window.clearAdminReportNotificationDot = function() {
-		return window.setAdminReportNotificationDot(false);
-	};
 
 	function adminAnimateResolvedReportRow(row) {
 		if (!row || !row.isConnected) return Promise.resolve();
@@ -44856,19 +44869,6 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 		return row.__adminResolveAnimationPromise;
 	}
 
-	window.updateAdminReportSidebarPill = function() {
-		if (typeof window.setSidebarCountPill !== 'function') return;
-		if (!document.body.classList.contains('is-admin')) {
-			window.setSidebarCountPill('admin', null);
-			if (typeof window.setAdminReportNotificationDot === 'function') window.setAdminReportNotificationDot(false, false);
-			return;
-		}
-		const messageReports = Number.isFinite(Number(window.__adminMessageReportCount)) ? Math.max(0, Number(window.__adminMessageReportCount)) : adminGetReports().length;
-		const storeReports = Number.isFinite(Number(window.__adminStoreReportCount)) ? Math.max(0, Number(window.__adminStoreReportCount)) : 0;
-		const total = messageReports + storeReports;
-		window.setSidebarCountPill('admin', total);
-		if (total < 1 && typeof window.setAdminReportNotificationDot === 'function') window.setAdminReportNotificationDot(false);
-	};
 
 	function adminGetContentBlocks() {
 		return Array.isArray(window.adminContentBlocks) ? window.adminContentBlocks : [];
@@ -45009,7 +45009,6 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 
 		const isNewReport = existingIndex < 0;
 		if (isNewReport && !silent && document.body.classList.contains('is-admin')) {
-			if (typeof window.markAdminReportNotificationDot === 'function') window.markAdminReportNotificationDot();
 			if (typeof showToastNotification === 'function') showToastNotification('New Report', `${incoming.reporter || 'Someone'} reported a message.`);
 			if (typeof playUiError === 'function') playUiError();
 		}
@@ -45671,7 +45670,6 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 				const reportKey = String(delta.reportKey || delta.group?.reportKey || '').trim();
 				if (!reportKey) return;
 				const shouldShowNotice = !!(delta.notice && document.body.classList.contains('is-admin') && (!delta.sourceSocketId || !socketChat || delta.sourceSocketId !== socketChat.id));
-				if (delta.notice && delta.notice.updated !== true && document.body.classList.contains('is-admin') && typeof window.markAdminReportNotificationDot === 'function') window.markAdminReportNotificationDot();
 				const current = adminGetContentReports();
 				const index = current.findIndex(item => String(item && item.reportKey || '') === reportKey);
 				let next = current;
@@ -76873,7 +76871,6 @@ function getVisibleChatStackEl(id) {
 			socketChat.on('admin_metadata_suggestion_delta', delta => {
 				if (!document.body.classList.contains('is-admin')) return;
 				if (typeof window.adminApplyMetadataSuggestionDelta === 'function') window.adminApplyMetadataSuggestionDelta(delta);
-				if (delta?.action === 'upsert' && typeof window.markAdminReportNotificationDot === 'function') window.markAdminReportNotificationDot();
 			});
 			socketChat.on('content_blocks_state', blocks => {
 				if (typeof window.applyStoreContentBlocks === 'function') window.applyStoreContentBlocks(blocks);
