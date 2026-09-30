@@ -38,7 +38,6 @@ const CHAT_POLL_OPTIONS_MAX = 20;
 const CHAT_POLL_OPTION_TEXT_MAX = 4096;
 const CHAT_POLL_VOTERS_MAX = 5000;
 
-// Private user-to-user messages stay independent from Global Chat history.
 const DIRECT_MESSAGE_TEXT_MAX = Math.max(256, Math.min(16000, parseInt(process.env.DIRECT_MESSAGE_TEXT_MAX || "4000", 10) || 4000));
 const DIRECT_MESSAGE_MEDIA_MAX = Math.max(1, Math.min(20, parseInt(process.env.DIRECT_MESSAGE_MEDIA_MAX || "10", 10) || 10));
 const DIRECT_MESSAGE_URL_MAX = 4096;
@@ -496,7 +495,6 @@ const PG_STATEMENT_TIMEOUT_MS = Math.max(5000, parseInt(process.env.PG_STATEMENT
 const PG_MAX_USES = Math.max(0, parseInt(process.env.PG_MAX_USES || "0", 10) || 0);
 const ONLINE_LIST_CACHE_MS = Math.max(250, parseInt(process.env.ONLINE_LIST_CACHE_MS || "1200", 10) || 1200);
 const ONLINE_LIST_UNCHANGED_SKIP_ENABLED = process.env.ONLINE_LIST_SKIP_UNCHANGED !== "0";
-// Server-owned content limits. Clients receive these values and never hardcode their own copies.
 const SOCIAL_HISTORY_MAX = 500;
 const TRENDING_MAX_ITEMS = 50;
 const ADMIN_REPORTS_HISTORY_MAX = 100;
@@ -763,8 +761,6 @@ function buildRoleChangeNoticeForTransition(targetName, nextRole, immediatePrevi
     return buildRoleChangeNotice(targetName, normalizedNextRole, baselineRole, changedBy, { kind: 'promotion' });
   }
 
-  /* A demotion is only meaningful if the user actually acknowledged the privileged
-     role first. Pending/unseen promotions are simply canceled when they are removed. */
   if (
     nextRank < baselineRank &&
     acknowledgedRole &&
@@ -1244,8 +1240,6 @@ const DEFAULT_IGDB_CLIENT_SECRET = String(process.env.IGDB_CLIENT_SECRET || proc
 const METADATA_PROXY_TIMEOUT_MS = Math.max(2500, parseInt(process.env.METADATA_PROXY_TIMEOUT_MS || '8000', 10) || 8000);
 const METADATA_PROXY_CACHE_MS = Math.max(60000, parseInt(process.env.METADATA_PROXY_CACHE_MS || '1800000', 10) || 1800000);
 
-// Metadata cache tuning: change METADATA_CACHE_MAX_ITEMS in Render (or the fallback below)
-// to raise/lower the total number of cached metadata responses without touching the code path.
 const METADATA_CACHE_MAX_ITEMS = Math.max(50, Math.min(1000, parseInt(
   process.env.METADATA_CACHE_MAX_ITEMS || process.env.METADATA_PROXY_CACHE_MAX || '300',
   10
@@ -2294,7 +2288,6 @@ let adminStateRefreshInFlight = null;
 let adminStateConnectionLimitWarnedAt = 0;
 let serverLogFallbackRefreshAt = 0;
 const SERVER_LOG_FALLBACK_REFRESH_MS = 120000;
-// Single source of truth for both admin log histories. Clients receive this from the server.
 const ADMIN_LOG_HISTORY_MAX = 100;
 const MODERATION_LOG_HISTORY_MAX = ADMIN_LOG_HISTORY_MAX;
 const SERVER_LOG_HISTORY_MAX = ADMIN_LOG_HISTORY_MAX;
@@ -3383,7 +3376,6 @@ function canModerateTarget(socket, targetName = "") {
   if (socket.isAdmin === true) return true;
   const targetUser = targetName ? (userDatabase[targetName] || null) : null;
   const targetRole = targetName ? getUserRole(targetName, targetUser) : "user";
-  // Moderators can moderate regular/trusted users, including banned accounts, but not admins or other mods.
   return !["admin", "mod"].includes(targetRole);
 }
 
@@ -4572,9 +4564,6 @@ function startUserCacheWarmup() {
     return;
   }
 
-  // One non-overlapping refresh cadence is enough. The old second "warmup" interval checked
-  // whether this same 30s task had refreshed within 120s, so it was redundant during healthy
-  // operation and could start another full users-table read while a slow refresh was still running.
   const refreshUserCacheTask = runNonOverlappingTask('USER CACHE REFRESH', refreshAllUsersCacheFromDb);
   setInterval(refreshUserCacheTask, USER_CACHE_REFRESH_INTERVAL_MS);
 }
@@ -5472,8 +5461,6 @@ async function refreshContentMetadataOverridesFromDb(options = {}) {
 function toPublicContentMetadataOverride(entry) {
   if (!entry) return null;
   if (entry.__publicContentMetadataOverride) return entry.__publicContentMetadataOverride;
-  // Socket payloads are intentionally sparse. Clients normalize missing optional fields back
-  // to their empty defaults, so there is no reason to resend empty strings/arrays on every sync.
   const out = {
     metadataKey: entry.metadataKey, category: entry.category, titleId: entry.titleId, contentId: entry.contentId,
     updatedAt: entry.updatedAt
@@ -5494,7 +5481,6 @@ function toPublicContentMetadataOverride(entry) {
 
 function getPublicContentMetadataOverrides() {
   if (contentMetadataOverridesPublicCache) return contentMetadataOverridesPublicCache;
-  // Keep server-only bookkeeping (hasValues / cached timestamps) off every socket payload.
   contentMetadataOverridesPublicCache = getOrderedContentMetadataOverrides().map(toPublicContentMetadataOverride);
   return contentMetadataOverridesPublicCache;
 }
@@ -8204,9 +8190,6 @@ async function syncChatAcrossInstances() {
     }
 
     if (messageHistory.length > 0) {
-      // We only need to know whether the table is empty or its highest id moved backwards
-      // (TRUNCATE/reset on another instance). An indexed top-id lookup is far cheaper than
-      // COUNT(*) + MAX(id) on every 3-second idle poll.
       const meta = await queryDbWithRetry('SELECT id AS max_id FROM chat ORDER BY id DESC LIMIT 1', [], { attempts: 2, label: 'CHAT SYNC META' });
       if (!meta.rows.length) {
         messageHistory = [];
@@ -8260,8 +8243,6 @@ async function emitAdminState(socket) {
       logLimits: getAdminLogLimits(),
       contentLimits: getClientContentLimits()
     });
-    // Modern clients consume the combined admin_state payload. Preserve the component
-    // events only for legacy clients that do not advertise profile-sync v2.
     if (socket.profileSyncV2 !== true) {
       socket.emit('admin_chat_controls_state', adminState.chatControls);
       socket.emit('reports_list', adminReports);
@@ -11785,8 +11766,6 @@ async function deleteUserAccount(targetName, reason, adminName, options = {}) {
     deferServerTask('CONTENT METADATA SUGGESTION DELETE USER NOTIFY', () => notifyAdminStateAcrossInstances(ADMIN_STATE_KEYS.metadataSuggestions, { changedAt: Date.now() }), 0);
   }
 
-  // Tell every server instance explicitly that this profile was deleted. Remote instances
-  // must revoke any surviving admin/mod session immediately instead of merely dropping cache.
   const selfDeleted = options && options.selfDeleted === true;
   await notifyProfileSyncAcrossInstances(targetName, null, Date.now(), {
     deleted: true,
@@ -11867,7 +11846,6 @@ async function syncAdminStateAcrossInstances() {
     if (JSON.stringify(serverLog) !== previousServerLog) emitToAdmins('admin_server_log_list', serverLog);
   }
 
-  // A server-log-only fallback cannot have changed admin state in this function.
   if (!shouldRefreshAdminState) return;
 
   const maintenanceChanged = JSON.stringify(normalizeMaintenanceState(adminState.maintenance || {})) !== previousMaintenance;
@@ -11948,8 +11926,6 @@ function startBackgroundTasks() {
   setInterval(syncAdminStateIntervalTask, 15000);
   setInterval(presenceHeartbeatIntervalTask, PRESENCE_HEARTBEAT_MS);
   setInterval(chatPollIntervalTask, CHAT_SYNC_INTERVAL_MS);
-  // Periodic pressure logs are already throttled to at most once every 30s. Checking at the
-  // same cadence avoids an extra process.memoryUsage() sample that can never produce a log.
   setInterval(() => logMemoryPressureIfNeeded('periodic'), 30000);
   if (ENABLE_PROFILE_PERIODIC_SYNC) {
     setInterval(profileSyncIntervalTask, PROFILE_SYNC_INTERVAL_MS);
@@ -12031,8 +12007,6 @@ async function createContentShareTokenForUser(userName, rawDescriptor) {
   const token = normalizeContentShareTokenServer(result.rows[0] && result.rows[0].token);
   if (!token) return { success:false, message:'Share link could not be created.' };
 
-  // Keep the table bounded per account. Sharing is infrequent, so doing this only on
-  // creation avoids any timer/polling cost while keeping old rows under control.
   deferServerTask('CONTENT SHARE PRUNE', () => queryDbWithRetry(
     `DELETE FROM content_shares
      WHERE shared_by = $1 AND token NOT IN (
@@ -12049,8 +12023,6 @@ async function resolveContentShareTokenForUser(token) {
   const safeToken = normalizeContentShareTokenServer(token);
   if (!safeToken) return { success:false, message:'Invalid shared link.' };
 
-  // Resolve the small share row first. User data normally already lives in the
-  // in-memory account cache, so avoid pulling the full JSONB profile for every link.
   const result = await queryDbWithRetry(
     `SELECT descriptor, shared_by
        FROM content_shares
@@ -13729,9 +13701,6 @@ io.on('connection', (socket) => {
         seen.add(key);
         uniqueNames.push({ name, key });
       });
-      // v31 already maintains a case-insensitive username index for mentions/admin search.
-      // Reuse it here instead of rebuilding a lowercase Map of every registered user for each
-      // friends-presence request.
       ensureUserNameIndexes();
 
       let users = [];
@@ -15014,8 +14983,6 @@ io.on('connection', (socket) => {
         logLimits: getAdminLogLimits()
       };
       socket.emit('admin_state', payload);
-      /* Modern clients can request the combined payload only. Keep the legacy component
-         events for older callers that do not advertise combinedOnly. */
       if (!(data && data.combinedOnly === true)) {
         socket.emit('maintenance_mode', adminState.maintenance);
         socket.emit('chat_controls', adminState.chatControls);
