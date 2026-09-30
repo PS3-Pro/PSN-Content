@@ -7112,7 +7112,7 @@ img { -webkit-user-drag: none !important; user-drag: none !important; }
 				<li id="nav-admin-footer" class="admin-sidebar-entry" onmouseenter="playUiHover()" onclick="playUiClick(); openAdminPanel('view-admin'); toggleSidebar(true)">
 					<i class="fas fa-shield-alt"></i> <span class="interface-compact-label sidebar-press-label" data-sidebar-press-label>Control Panel</span>
 					<span id="sidebar-count-admin" class="sidebar-count-pill is-empty" title="0 pending admin items" style="display:none;">0</span>
-					<span id="admin-dot" class="notification-dot" title="Pending admin review"></span>
+					<span id="admin-dot" class="notification-dot" title="New admin items"></span>
 				</li>
 				<li id="nav-notifications" onmouseenter="playUiHover()" onclick="playUiClick(); switchView('view-notifications'); toggleSidebar(true)">
 					<i class="fas fa-bell"></i> <span class="interface-compact-label sidebar-press-label" data-sidebar-press-label>Notifications</span>
@@ -39401,7 +39401,8 @@ P
 
 	window.openAdminPanel = function() {
 		if (!adminGuard()) return;
-		if (typeof window.refreshAdminPendingIndicator === 'function') window.refreshAdminPendingIndicator();
+		if (typeof window.markAdminPendingSeen === 'function') window.markAdminPendingSeen();
+		else if (typeof window.refreshAdminPendingIndicator === 'function') window.refreshAdminPendingIndicator();
 		/* If an earlier exit cleanup is still pending, finish it before Admin becomes visible
 		   again so the same reset behavior is preserved. */
 		if (adminExitCleanupTimer || adminExitCleanupIdle) adminRunExitCleanup();
@@ -39412,6 +39413,7 @@ P
 		switchView('view-admin', false, true, () => {
 			adminInstallSocketListeners();
 			adminResetUsersPanelState();
+			if (typeof window.markAdminPendingSeen === 'function') window.markAdminPendingSeen();
 		});
 
         /* switchView schedules the navigation lights after Admin is actually shown; avoid
@@ -44823,24 +44825,87 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 		};
 	}
 
+	const ADMIN_PENDING_SEEN_KEY = 'psn_admin_pending_seen';
+
+	function adminPendingContentReportToken(group) {
+		if (!group || typeof group !== 'object') return '';
+		const reportKey = String(group.reportKey || group.id || '').trim();
+		if (!reportKey) return '';
+		const reporters = Array.isArray(group.reporters) ? group.reporters.length : 0;
+		const reportCount = Math.max(1, Number(group.reportCount) || reporters || 1);
+		const updatedAt = String(group.updatedAt || group.reporters?.[0]?.time || '').trim();
+		return `content:${reportKey}:${reportCount}:${updatedAt}`;
+	}
+
+	function adminPendingMetadataSuggestionToken(item) {
+		if (!item || typeof item !== 'object') return '';
+		const id = Number(item.id || 0);
+		if (!id) return '';
+		return `metadata:${id}:${String(item.updatedAt || item.createdAt || '').trim()}`;
+	}
+
+	function getAdminPendingTokens() {
+		return {
+			content: adminGetContentReports().map(adminPendingContentReportToken).filter(Boolean),
+			metadata: adminMetadataSuggestionList().map(adminPendingMetadataSuggestionToken).filter(Boolean)
+		};
+	}
+
+	function readAdminPendingSeenTokens() {
+		try {
+			const parsed = JSON.parse(loadState(ADMIN_PENDING_SEEN_KEY) || '{}');
+			return {
+				content: new Set(Array.isArray(parsed.content) ? parsed.content.map(String) : []),
+				metadata: new Set(Array.isArray(parsed.metadata) ? parsed.metadata.map(String) : [])
+			};
+		} catch (err) {
+			return { content:new Set(), metadata:new Set() };
+		}
+	}
+
+	function writeAdminPendingSeenTokens(tokens = getAdminPendingTokens()) {
+		const payload = JSON.stringify({
+			content: Array.isArray(tokens.content) ? tokens.content : [],
+			metadata: Array.isArray(tokens.metadata) ? tokens.metadata : []
+		});
+		saveState(ADMIN_PENDING_SEEN_KEY, payload);
+		return tokens;
+	}
+
+	window.markAdminPendingSeen = function() {
+		if (!document.body.classList.contains('is-admin')) return false;
+		writeAdminPendingSeenTokens();
+		if (typeof window.refreshAdminPendingIndicator === 'function') window.refreshAdminPendingIndicator();
+		return true;
+	};
+
 	window.refreshAdminPendingIndicator = function() {
 		const dot = document.getElementById('admin-dot');
 		const counts = getAdminPendingActionCounts();
 		const isAdmin = document.body.classList.contains('is-admin');
-		const visible = isAdmin && counts.total > 0;
+		const adminVisible = isAdmin && document.getElementById('view-admin')?.style.display === 'block';
+		const tokens = getAdminPendingTokens();
+
+		/* The count pill tracks unresolved work. The dot tracks only work that has not been
+		   seen yet. Anything received while Control Panel is visible is already visible to
+		   the administrator and is therefore marked seen immediately. */
+		if (adminVisible) writeAdminPendingSeenTokens(tokens);
+		const seen = readAdminPendingSeenTokens();
+		const unseenContent = tokens.content.some(token => !seen.content.has(token));
+		const unseenMetadata = tokens.metadata.some(token => !seen.metadata.has(token));
+		const visible = isAdmin && !adminVisible && (unseenContent || unseenMetadata);
+
 		if (dot) {
 			dot.style.display = visible ? 'block' : 'none';
-			if (counts.contentReports > 0 && counts.metadataSuggestions > 0) dot.title = 'Pending content reports and database corrections';
-			else if (counts.contentReports > 0) dot.title = 'Pending content reports';
-			else if (counts.metadataSuggestions > 0) dot.title = 'Pending database corrections';
-			else dot.title = 'No pending admin review';
+			if (unseenContent && unseenMetadata) dot.title = 'New content reports and database corrections';
+			else if (unseenContent) dot.title = 'New content reports';
+			else if (unseenMetadata) dot.title = 'New database corrections';
+			else dot.title = counts.total > 0 ? 'Admin items already seen' : 'No pending admin review';
 		}
 		if (typeof window.setSidebarCountPill === 'function') {
 			window.setSidebarCountPill('admin', isAdmin ? counts.total : null);
 			const pill = document.getElementById('sidebar-count-admin');
-			if (pill) {
-				pill.title = counts.total === 1 ? '1 pending admin item' : `${counts.total} pending admin items`;
-			}
+			if (pill) pill.title = counts.total === 1 ? '1 pending admin item' : `${counts.total} pending admin items`;
 		}
 		return visible;
 	};
