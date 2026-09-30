@@ -43243,9 +43243,11 @@ P
 			return true;
 		};
 
+		const requestPayload = { names: targets };
+		if (options.authoritative === true) requestPayload.authoritative = true;
 		if (typeof socketChat.timeout === 'function') {
-			socketChat.timeout(5000).emit('request_friends_presence', { names: targets }, (err, response) => { if (!err) apply(response); });
-		} else socketChat.emit('request_friends_presence', { names: targets }, apply);
+			socketChat.timeout(5000).emit('request_friends_presence', requestPayload, (err, response) => { if (!err) apply(response); });
+		} else socketChat.emit('request_friends_presence', requestPayload, apply);
 		return true;
 	};
 	window.queuePsnUserMetaRefresh = function(names, options = {}) {
@@ -83347,11 +83349,6 @@ function getVisibleChatStackEl(id) {
 		popover.style.bottom = 'auto';
 		popover.style.zIndex = '2147483647';
 
-		/* Seen by can outlive avatar changes in the shared metadata cache. Revalidate the viewers as
-		   one bounded batch when the popover opens; refreshPsnUserMetaBatch keeps its 5s per-user
-		   lookup guard, and syncPsnUserMetaBatch patches any rendered seen-user-avatar in place. */
-		if (typeof window.refreshPsnUserMetaBatch === 'function') window.refreshPsnUserMetaBatch(users, { maxAge:0 });
-
 		let itemsHtml = `<div class="seen-by-title">Seen by: ${users.length}</div>`;
 		users.forEach(user => {
 			const freshMeta = typeof window.getFreshPsnUserMeta === 'function' ? window.getFreshPsnUserMeta(user) : null;
@@ -83391,6 +83388,15 @@ function getVisibleChatStackEl(id) {
 			});
 		});
 		document.body.appendChild(popover);
+
+		/* Seen By is user-triggered and must reflect the current profile avatar, not a stale
+		   presence/cache snapshot. Revalidate after the images exist so the shared DOM patcher
+		   can update this popover in place. The authoritative flag is intentionally scoped to
+		   this explicit action; normal Friends/Online refreshes keep the fast cached path. */
+		if (typeof window.refreshPsnUserMetaBatch === 'function') {
+			window.refreshPsnUserMetaBatch(users, { maxAge:0, force:true, authoritative:true });
+		}
+
 		popover.addEventListener('click', e => e.stopPropagation());
 		popover.addEventListener('pointerdown', e => e.stopPropagation());
 		popover.addEventListener('wheel', e => e.stopPropagation(), { passive: true });

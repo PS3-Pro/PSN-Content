@@ -13656,10 +13656,50 @@ io.on('connection', (socket) => {
       // Reuse it here instead of rebuilding a lowercase Map of every registered user for each
       // friends-presence request.
       ensureUserNameIndexes();
-      const users = uniqueNames.map(item => {
-        const exactName = userNameLookupLower.get(item.key);
-        return exactName ? getPublicUserData(exactName, userDatabase[exactName], false) : null;
-      }).filter(Boolean);
+
+      let users = [];
+      if (request && request.authoritative === true && socket.userName) {
+        // Seen By explicitly asks for current profile identity. Read all requested summaries in
+        // one DB query so a stale Render-process cache cannot return an old/default avatar. Keep
+        // live presence fields from memory; the DB read is only authoritative for profile data.
+        const requestedKeys = uniqueNames.map(item => item.key);
+        const result = requestedKeys.length ? await queryDbWithRetry(`
+          SELECT
+            name,
+            data - ARRAY['downloadsData','libraryData','libraryPlayHistoryData','wishlistData','favoritesData','trophiesData','friendsData','passwordHash','password']::text[] AS data,
+            CASE WHEN jsonb_typeof(data->'downloadsData') = 'array' THEN jsonb_array_length(data->'downloadsData') ELSE NULL END AS downloads_count,
+            CASE WHEN jsonb_typeof(data->'wishlistData') = 'array' THEN jsonb_array_length(data->'wishlistData') ELSE NULL END AS wishlist_count,
+            CASE WHEN jsonb_typeof(data->'favoritesData') = 'array' THEN jsonb_array_length(data->'favoritesData') ELSE NULL END AS favorites_count,
+            CASE WHEN jsonb_typeof(data->'libraryData') = 'array' THEN jsonb_array_length(data->'libraryData') ELSE NULL END AS library_count,
+            CASE WHEN jsonb_typeof(data->'friendsData') = 'array' THEN jsonb_array_length(data->'friendsData') ELSE NULL END AS friends_count
+          FROM users
+          WHERE LOWER(name) = ANY($1::text[])
+        `, [requestedKeys], { attempts: 2, label: 'AUTHORITATIVE FRIENDS PRESENCE READ' }) : { rows: [] };
+
+        const byLower = new Map();
+        for (const row of result.rows || []) {
+          const summaryData = { ...(row.data || {}) };
+          if (row.downloads_count !== null) summaryData.downloads = Number(row.downloads_count) || 0;
+          if (row.wishlist_count !== null) summaryData.wishlist = Number(row.wishlist_count) || 0;
+          if (row.favorites_count !== null) summaryData.favorites = Number(row.favorites_count) || 0;
+          if (row.library_count !== null) summaryData.library = Number(row.library_count) || 0;
+          if (row.friends_count !== null) summaryData.friends = Number(row.friends_count) || 0;
+
+          const compact = buildCompactUserSummary(row.name, summaryData);
+          const live = userDatabase[row.name] || {};
+          compact.online = live.online === true;
+          compact.id = live.id || compact.id || null;
+          compact.lastSeen = live.lastSeen || compact.lastSeen || null;
+          compact.ps3Status = live.ps3Status || compact.ps3Status || null;
+          byLower.set(String(row.name || '').toLowerCase(), getPublicUserData(row.name, compact, false));
+        }
+        users = uniqueNames.map(item => byLower.get(item.key) || null).filter(Boolean);
+      } else {
+        users = uniqueNames.map(item => {
+          const exactName = userNameLookupLower.get(item.key);
+          return exactName ? getPublicUserData(exactName, userDatabase[exactName], false) : null;
+        }).filter(Boolean);
+      }
       respond({ success: true, users, serverTime: Date.now() });
     } catch (err) {
       console.error('[FRIENDS PRESENCE ERROR]:', err);
