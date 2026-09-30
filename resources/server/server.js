@@ -4201,7 +4201,7 @@ function getPublicUserData(username, user = {}, includeAdminFields = false) {
 
 const COMPACT_PROFILE_SETTING_KEYS = new Set([
   'audio', 'ux', 'hapticFeedback', 'haptics', 'cardBlur', 'cardBlurEnabled', 'gameCardBlur', 'recentlyVisitedVisible',
-  'chatSound', 'chatAutoTranslate', 'interfaceAutoTranslate', 'ps3Ip', 'companionPlugin',
+  'chatSound', 'directChatSound', 'chatAutoTranslate', 'interfaceAutoTranslate', 'ps3Ip', 'companionPlugin',
   'fpsCounterPlugin', 'fpsCounter', 'consoleFanMode', 'consoleFanSpeed', 'consoleFanTarget',
   'performanceMode', 'performanceRsx', 'performanceVram', 'siteDisclaimerSkipToday',
   'settingsUpdatedAt', 'settingsSyncedAt', 'settingsVersion', 'themeColor', 'themeColorUpdatedAt',
@@ -12243,7 +12243,7 @@ io.on('connection', (socket) => {
           presenceRevision: deletedAccountPresenceRevision,
           avatar: safeUserData.avatar || DEFAULT_AVATAR,
           joined: safeUserData.joined || '2026',
-          settingsData: normalizeProfileRealtimeSettings(safeUserData.settingsData || { audio: "1", ux: "1", cardBlur: "0", chatSound: "1", settingsUpdatedAt: Date.now(), profileCardStyle: "default", profileCardEffect: "default", ps3Ip: "", companionPlugin: "1", fpsCounterPlugin: "0", consoleFanMode: "dynamic", consoleFanSpeed: "35", consoleFanTarget: "68", performanceMode: "balanced", performanceRsx: "650", performanceVram: "850" }),
+          settingsData: normalizeProfileRealtimeSettings(safeUserData.settingsData || { audio: "1", ux: "1", cardBlur: "0", chatSound: "1", directChatSound: "1", settingsUpdatedAt: Date.now(), profileCardStyle: "default", profileCardEffect: "default", ps3Ip: "", companionPlugin: "1", fpsCounterPlugin: "0", consoleFanMode: "dynamic", consoleFanSpeed: "35", consoleFanTarget: "68", performanceMode: "balanced", performanceRsx: "650", performanceVram: "850" }),
           trophiesData: safeUserData.trophiesData || {},
           wishlistData: safeUserData.wishlistData || [],
           favoritesData: safeUserData.favoritesData || [],
