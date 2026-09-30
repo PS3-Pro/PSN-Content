@@ -6555,6 +6555,9 @@ img { -webkit-user-drag: none !important; user-drag: none !important; }
 #direct-chat-input { flex:1; min-width:0; min-height:42px; max-height:120px; background:rgba(0,0,0,.38); border:1px solid rgba(255,255,255,.11); color:#fff; border-radius:8px; padding:11px 13px; outline:none; font:inherit; font-size:13px; line-height:1.35; overflow-y:auto; white-space:pre-wrap; overflow-wrap:anywhere; text-align:left; }
 #direct-chat-input:empty::before { content:attr(data-placeholder); color:rgba(255,255,255,.32); pointer-events:none; }
 #direct-chat-input:focus { border-color:rgba(102,204,255,.7); box-shadow:0 0 0 2px rgba(102,204,255,.08); }
+#direct-chat-input.direct-user-blocked { border-color:rgba(255,68,68,.58) !important; background:rgba(45,0,10,.24) !important; box-shadow:inset 0 0 0 1px rgba(255,68,68,.14),0 0 14px rgba(255,68,68,.12) !important; opacity:.72; filter:grayscale(.25); cursor:not-allowed !important; }
+#direct-chat-input.direct-user-blocked:empty::before { color:rgba(255,133,133,.55) !important; }
+.direct-send-btn:disabled { opacity:.28; pointer-events:none; filter:grayscale(1); }
 #direct-chat-input ul,#direct-chat-input ol { margin:0; padding-left:22px; }
 #direct-chat-input li { margin:0; padding-left:2px; }
 .direct-message-text a { color:#fff; text-decoration:underline; text-underline-offset:2px; overflow-wrap:anywhere; }
@@ -73465,7 +73468,7 @@ function getVisibleChatStackEl(id) {
 		conversationRefreshInFlight: false, conversationRefreshQueued: false, conversationRefreshTimer: 0, conversationRefreshWatchdog: 0, conversationRefreshToken: 0, conversationSignature: '', conversationEntryPending: false,
 		threadRequestToken: 0, threadRequestTimer: 0, threadLoadedPeer: '', sessionToken: 0, trimmedMessageIds: [], deletedThroughByPeer: Object.create(null), emptyConversationCloseTimer: 0, emptyConversationCloseToken: 0,
 		typingEmitActive: false, typingEmitPeer: '', typingStopTimer: 0, peerTyping: false, peerTypingName: '', peerTypingAvatar: '', peerTypingTimer: 0,
-		globalSearchResults: [], globalSearchLoading: false, globalSearchToken: 0, pendingHighlightMessageId: ''
+		globalSearchResults: [], globalSearchLoading: false, globalSearchToken: 0, pendingHighlightMessageId: '', viewerBlocked: false, blockedByPeer: false
 	};
 
 	function directEscapeHtml(value) {
@@ -73779,6 +73782,7 @@ function getVisibleChatStackEl(id) {
 	}
 
 	window.triggerDirectMentionBtn = function(event) {
+		if (window.__directChatState.viewerBlocked || window.__directChatState.blockedByPeer) return false;
 		if (typeof directSaveInputRange === 'function') directSaveInputRange();
 		if (event) { event.preventDefault(); event.stopPropagation(); }
 		const input = document.getElementById('direct-chat-input');
@@ -73863,6 +73867,7 @@ function getVisibleChatStackEl(id) {
 	};
 
 	window.directFormatMessage = function(event, command) {
+		if (window.__directChatState.viewerBlocked || window.__directChatState.blockedByPeer) return false;
 		if (event) { event.preventDefault(); event.stopPropagation(); }
 		const input = document.getElementById('direct-chat-input');
 		if (!input || !command) return false;
@@ -74334,7 +74339,7 @@ function getVisibleChatStackEl(id) {
 	function directConversationSignature(conversations) {
 		return (Array.isArray(conversations) ? conversations : []).map(item => {
 			const last = item && item.lastMessage || {};
-			return [item && item.peer || '', item && item.avatar || '', item && item.online === true ? 1 : 0, item && item.lastSeen || '', Number(item && item.unread || 0), String(item && item.myLastReadId || '0'), String(item && item.peerLastReadId || '0'), directConversationMessageSignature(last)].join('~');
+			return [item && item.peer || '', item && item.avatar || '', item && item.online === true ? 1 : 0, item && item.lastSeen || '', Number(item && item.unread || 0), String(item && item.myLastReadId || '0'), String(item && item.peerLastReadId || '0'), item && item.viewerBlocked === true ? 1 : 0, item && item.blockedByPeer === true ? 1 : 0, directConversationMessageSignature(last)].join('~');
 		}).join('|');
 	}
 
@@ -74484,11 +74489,13 @@ function getVisibleChatStackEl(id) {
 
 	window.openDirectConversationContextMenu = function(peerName, clientX, clientY, sourceItem = null) {
 		const peer = String(peerName || '').trim();
-		if (!peer || !directFindConversation(peer)) return false;
+		const conversation = directFindConversation(peer);
+		if (!peer || !conversation) return false;
 		closeDirectConversationContextMenu({ immediate:true });
 		const menu = getDirectConversationContextMenu();
+		const viewerBlocked = conversation.viewerBlocked === true;
 		menu.dataset.peer = peer;
-		menu.innerHTML = `<div class="fm-context-menu-title" data-no-translate="true" translate="no">${directEscapeHtml(peer)}</div><button type="button" class="fm-context-menu-item fm-danger" role="menuitem" data-direct-context-action="delete"><i class="fas fa-trash-alt"></i><span>Delete conversation</span></button>`;
+		menu.innerHTML = `<div class="fm-context-menu-title" data-no-translate="true" translate="no">${directEscapeHtml(peer)}</div><button type="button" class="fm-context-menu-item fm-warning" role="menuitem" data-direct-context-action="block"><i class="fas ${viewerBlocked ? 'fa-user-check' : 'fa-ban'}"></i><span>${viewerBlocked ? 'Unblock user' : 'Block user'}</span></button><div class="fm-context-menu-divider"></div><button type="button" class="fm-context-menu-item fm-danger" role="menuitem" data-direct-context-action="delete"><i class="fas fa-trash-alt"></i><span>Delete conversation</span></button>`;
 		if (sourceItem) sourceItem.classList.add('direct-context-target');
 		menu.style.left = '0px';
 		menu.style.top = '0px';
@@ -74504,6 +74511,12 @@ function getVisibleChatStackEl(id) {
 			menu.style.left = `${Math.round(left)}px`;
 			menu.style.top = `${Math.round(top)}px`;
 		});
+		menu.querySelector('[data-direct-context-action="block"]')?.addEventListener('click', event => {
+			event.preventDefault();
+			event.stopPropagation();
+			closeDirectConversationContextMenu();
+			window.setDirectUserBlocked(peer, !viewerBlocked);
+		}, { once:true });
 		menu.querySelector('[data-direct-context-action="delete"]')?.addEventListener('click', event => {
 			event.preventDefault();
 			event.stopPropagation();
@@ -74518,7 +74531,7 @@ function getVisibleChatStackEl(id) {
 		const state = window.__directChatState;
 		if (state.activePeer !== peer) return;
 		state.activePeer = ''; state.peer = null; state.messages = []; state.messageCount = 0; state.trimmedMessageIds = []; state.threadLoadedPeer = '';
-		state.myLastReadId = '0'; state.peerLastReadId = '0'; state.loadingThread = false;
+		state.myLastReadId = '0'; state.peerLastReadId = '0'; state.loadingThread = false; state.viewerBlocked = false; state.blockedByPeer = false;
 		state.pendingMedia = []; state.pendingUploads = 0; state.mediaToken = Number(state.mediaToken || 0) + 1;
 		state.replyTo = null; state.editingMessageId = ''; state.inputRange = null;
 		clearTimeout(state.threadRequestTimer); state.threadRequestTimer = 0; state.threadRequestToken = Number(state.threadRequestToken || 0) + 1;
@@ -74595,6 +74608,69 @@ function getVisibleChatStackEl(id) {
 		}, 185);
 		return true;
 	}
+
+
+	function applyDirectUserBlockState(peerName, viewerBlocked, blockedByPeer) {
+		const peer = String(peerName || '').trim();
+		if (!peer) return false;
+		const state = window.__directChatState;
+		const conversation = directFindConversation(peer);
+		let changed = false;
+		if (conversation) {
+			if (conversation.viewerBlocked !== !!viewerBlocked) { conversation.viewerBlocked = !!viewerBlocked; changed = true; }
+			if (conversation.blockedByPeer !== !!blockedByPeer) { conversation.blockedByPeer = !!blockedByPeer; changed = true; }
+			if (changed) state.conversationSignature = directConversationSignature(state.conversations);
+		}
+		if (state.activePeer === peer) {
+			const activeChanged = state.viewerBlocked !== !!viewerBlocked || state.blockedByPeer !== !!blockedByPeer;
+			state.viewerBlocked = !!viewerBlocked;
+			state.blockedByPeer = !!blockedByPeer;
+			if (activeChanged && (state.viewerBlocked || state.blockedByPeer)) {
+				stopDirectTyping();
+				clearDirectPeerTyping(peer);
+				state.replyTo = null;
+				state.editingMessageId = '';
+				state.pendingMedia = [];
+				state.pendingUploads = 0;
+				state.mediaToken = Number(state.mediaToken || 0) + 1;
+				directClearComposer();
+				renderDirectPendingMedia();
+				closeDirectPickers();
+			}
+			renderDirectComposerContext();
+		}
+		if (changed) renderDirectConversations();
+		return changed;
+	}
+
+	window.setDirectUserBlocked = function(peerName, blocked) {
+		const peer = String(peerName || '').trim();
+		const conversation = directFindConversation(peer);
+		if (!peer || !conversation || !socketChat || !socketChat.connected) {
+			if (typeof playUiError === 'function') playUiError();
+			if (typeof showToastNotification === 'function') showToastNotification('Private Chat', 'Reconnect before changing block status.');
+			return false;
+		}
+		const nextBlocked = blocked === true;
+		if (nextBlocked && !confirm(`Block ${peer}? You will both be unable to message or react in this conversation until you unblock them.`)) {
+			if (typeof playUiBack === 'function') playUiBack();
+			return false;
+		}
+		const sessionToken = Number(window.__directChatState.sessionToken || 0);
+		socketChat.emit('direct_user_block_set', { peer, blocked:nextBlocked }, response => {
+			if (Number(window.__directChatState.sessionToken || 0) !== sessionToken) return;
+			if (!response || response.success === false) {
+				if (typeof playUiError === 'function') playUiError();
+				if (typeof showToastNotification === 'function') showToastNotification('Private Chat', response?.message || 'Could not update block status.');
+				return;
+			}
+			applyDirectUserBlockState(peer, response.viewerBlocked === true, response.blockedByPeer === true);
+			if (!nextBlocked && typeof window.refreshDirectConversations === 'function') window.refreshDirectConversations({ preserveThread:true, immediate:true });
+			if (typeof showToastNotification === 'function') showToastNotification('Private Chat', nextBlocked ? `${peer} blocked.` : `${peer} unblocked.`);
+			if (typeof playUiSuccess === 'function') playUiSuccess();
+		});
+		return true;
+	};
 
 	window.deleteDirectConversation = function(peerName) {
 		const peer = String(peerName || '').trim();
@@ -74707,6 +74783,8 @@ function getVisibleChatStackEl(id) {
 			unread: 0,
 			myLastReadId: '0',
 			peerLastReadId: '0',
+			viewerBlocked: false,
+			blockedByPeer: false,
 			lastMessage: null
 		};
 	}
@@ -74941,7 +75019,8 @@ function getVisibleChatStackEl(id) {
 		let conversation = directFindConversation(peer);
 		const messages = Array.isArray(payload && payload.messages) ? payload.messages : [];
 		const latest = messages.length ? messages[messages.length - 1] : null;
-		if (!conversation && !latest) return;
+		const hasBlockState = payload && (payload.viewerBlocked === true || payload.blockedByPeer === true);
+		if (!conversation && !latest && !hasBlockState) return;
 		if (!conversation) {
 			conversation = directConversationSeed(peer);
 			state.conversations.push(conversation);
@@ -74956,6 +75035,8 @@ function getVisibleChatStackEl(id) {
 		conversation.unread = 0;
 		conversation.myLastReadId = String(payload && payload.myLastReadId || conversation.myLastReadId || '0');
 		conversation.peerLastReadId = String(payload && payload.peerLastReadId || conversation.peerLastReadId || '0');
+		conversation.viewerBlocked = payload && payload.viewerBlocked === true;
+		conversation.blockedByPeer = payload && payload.blockedByPeer === true;
 		directCommitConversationState(true);
 	}
 
@@ -75110,15 +75191,30 @@ function getVisibleChatStackEl(id) {
 		const input = document.getElementById('direct-chat-input');
 		const attach = document.getElementById('direct-attach-btn');
 		const gif = document.getElementById('direct-gif-btn');
+		const emoji = document.getElementById('direct-emoji-btn');
 		const send = document.getElementById('direct-send-btn');
-		const editing = state.editingMessageId ? directMessageById(state.editingMessageId) : null;
-		const reply = !editing && state.replyTo ? state.replyTo : null;
-		if (attach) attach.disabled = !!editing;
-		if (gif) gif.disabled = !!editing;
-		if (send) send.innerHTML = editing ? '<i class="fas fa-check"></i>' : '<i class="fas fa-paper-plane"></i>';
-		if (input) input.dataset.placeholder = editing ? 'Edit message' : (state.activePeer ? `Message ${state.activePeer}` : 'Type a message');
+		const fileInput = document.getElementById('direct-file-input');
+		const toolbar = document.getElementById('direct-format-toolbar');
+		const blocked = state.viewerBlocked === true || state.blockedByPeer === true;
+		const editing = !blocked && state.editingMessageId ? directMessageById(state.editingMessageId) : null;
+		const reply = !blocked && !editing && state.replyTo ? state.replyTo : null;
+		if (attach) attach.disabled = blocked || !!editing;
+		if (gif) gif.disabled = blocked || !!editing;
+		if (emoji) emoji.disabled = blocked;
+		if (send) { send.disabled = blocked; send.innerHTML = editing ? '<i class="fas fa-check"></i>' : '<i class="fas fa-paper-plane"></i>'; }
+		if (fileInput) fileInput.disabled = blocked || !!editing;
+		if (toolbar) {
+			toolbar.classList.toggle('chat-toolbar-locked', blocked);
+			toolbar.querySelectorAll('button').forEach(button => { button.disabled = blocked; button.setAttribute('aria-disabled', blocked ? 'true' : 'false'); });
+		}
+		if (input) {
+			input.classList.toggle('direct-user-blocked', blocked);
+			input.setAttribute('contenteditable', blocked ? 'false' : 'true');
+			input.setAttribute('aria-disabled', blocked ? 'true' : 'false');
+			input.dataset.placeholder = blocked ? (state.viewerBlocked ? 'You blocked this user' : 'This user blocked you') : (editing ? 'Edit message' : (state.activePeer ? `Message ${state.activePeer}` : 'Type a message'));
+		}
 		if (!box) return;
-		if (!editing && !reply) { box.style.display='none'; box.innerHTML=''; return; }
+		if (blocked || (!editing && !reply)) { box.style.display='none'; box.innerHTML=''; return; }
 		const source = editing || reply;
 		const title = editing ? 'Editing message' : `Replying to ${source.from === directCurrentUser() ? 'yourself' : source.from}`;
 		const preview = directMessagePlainText(source.text).replace(/\s+/g,' ').trim() || (source.type === 'gif' ? '[GIF]' : '[Image]');
@@ -75135,6 +75231,7 @@ function getVisibleChatStackEl(id) {
 	};
 
 	window.setDirectReply = function(messageId) {
+		if (window.__directChatState.viewerBlocked || window.__directChatState.blockedByPeer) return;
 		const message = directMessageById(messageId);
 		if (!message) return;
 		const state = window.__directChatState;
@@ -75146,6 +75243,7 @@ function getVisibleChatStackEl(id) {
 	};
 
 	window.startDirectEdit = function(messageId) {
+		if (window.__directChatState.viewerBlocked || window.__directChatState.blockedByPeer) return;
 		const message = directMessageById(messageId);
 		if (!message || message.from !== directCurrentUser()) return;
 		const state = window.__directChatState;
@@ -75176,6 +75274,7 @@ function getVisibleChatStackEl(id) {
 	}
 
 	window.toggleDirectReaction = function(messageId, emoji) {
+		if (window.__directChatState.viewerBlocked || window.__directChatState.blockedByPeer) return;
 		if (!socketChat || !socketChat.connected || !messageId || !emoji) return;
 		const currentMessage = directMessageById(messageId);
 		const me = directCurrentUser();
@@ -75886,7 +75985,7 @@ function getVisibleChatStackEl(id) {
 		state.sessionToken = Number(state.sessionToken || 0) + 1;
 		state.conversations = []; state.activePeer = ''; state.messages = []; state.peer = null; state.messageCount = 0; state.trimmedMessageIds = []; state.threadLoadedPeer = ''; state.deletedThroughByPeer = Object.create(null);
 		state.searchQuery = ''; state.searchResultCount = 0; state.globalSearchResults = []; state.globalSearchLoading = false; state.globalSearchToken = Number(state.globalSearchToken || 0) + 1; state.pendingHighlightMessageId = '';
-		state.myLastReadId = '0'; state.peerLastReadId = '0'; state.unreadDividerAfterId = ''; state.loadingThread = false; state.pendingMedia = []; state.pendingUploads = 0; state.mediaToken = Number(state.mediaToken || 0) + 1; state.replyTo = null; state.editingMessageId = '';
+		state.myLastReadId = '0'; state.peerLastReadId = '0'; state.unreadDividerAfterId = ''; state.loadingThread = false; state.viewerBlocked = false; state.blockedByPeer = false; state.pendingMedia = []; state.pendingUploads = 0; state.mediaToken = Number(state.mediaToken || 0) + 1; state.replyTo = null; state.editingMessageId = '';
 		clearTimeout(state.emptyConversationCloseTimer); state.emptyConversationCloseTimer = 0; state.emptyConversationCloseToken = Number(state.emptyConversationCloseToken || 0) + 1;
 		clearTimeout(state.conversationRefreshTimer); state.conversationRefreshTimer = 0;
 		clearTimeout(state.conversationRefreshWatchdog); state.conversationRefreshWatchdog = 0; state.conversationRefreshToken = Number(state.conversationRefreshToken || 0) + 1;
@@ -75968,8 +76067,13 @@ function getVisibleChatStackEl(id) {
 							const previousPeerReadId = String(state.peerLastReadId || '0');
 							state.peer = { ...(state.peer || {}), name:conversation.peer, avatar:conversation.avatar, online:conversation.online, lastSeen:conversation.lastSeen };
 							state.peerLastReadId = String(conversation.peerLastReadId || state.peerLastReadId || '0');
+							const previousViewerBlocked = state.viewerBlocked === true;
+							const previousBlockedByPeer = state.blockedByPeer === true;
+							state.viewerBlocked = conversation.viewerBlocked === true;
+							state.blockedByPeer = conversation.blockedByPeer === true;
 							const nextPeerInfo = JSON.stringify([state.peer?.name || '', state.peer?.avatar || '', state.peer?.online === true, state.peer?.lastSeen || '']);
 							if (previousPeerInfo !== nextPeerInfo) updateDirectThreadHeader();
+							if (previousViewerBlocked !== state.viewerBlocked || previousBlockedByPeer !== state.blockedByPeer) renderDirectComposerContext();
 							if (previousPeerReadId !== state.peerLastReadId) updateDirectSeenMarker();
 						}
 					}
@@ -76091,6 +76195,8 @@ function getVisibleChatStackEl(id) {
 		state.activePeer = peer; state.loadingThread = !backgroundReconcile;
 		if (!backgroundReconcile) { state.messages = []; state.messageCount = 0; state.peerLastReadId = '0'; state.unreadDividerAfterId = ''; state.threadLoadedPeer = ''; updateDirectThreadMessageCount(0); }
 		const existing = directFindConversation(peer);
+		state.viewerBlocked = existing && existing.viewerBlocked === true;
+		state.blockedByPeer = existing && existing.blockedByPeer === true;
 		state.peer = directLivePresenceSnapshot(peer, existing ? { ...(state.peer || {}), name:peer, avatar:existing.avatar, online:existing.online, lastSeen:existing.lastSeen } : (state.peer && samePeer ? state.peer : { name:peer, avatar:directResolveAvatar(peer), online:false, lastSeen:'' }));
 		renderDirectConversations();
 		if (backgroundReconcile) updateDirectThreadHeader(); else renderDirectThread();
@@ -76122,6 +76228,8 @@ function getVisibleChatStackEl(id) {
 			state.messageCount = Math.max(state.messages.length, Math.max(0, Number(payload.messageCount) || 0));
 			state.myLastReadId = String(payload.myLastReadId || '0');
 			state.peerLastReadId = String(payload.peerLastReadId || '0');
+			state.viewerBlocked = payload.viewerBlocked === true;
+			state.blockedByPeer = payload.blockedByPeer === true;
 			if (!backgroundReconcile) {
 				const previousReadId = String(payload.previousMyLastReadId ?? payload.myLastReadId ?? '0');
 				const previousReadNumber = directMessageIdNumber(previousReadId);
@@ -76132,7 +76240,7 @@ function getVisibleChatStackEl(id) {
 			if (highlightId) { state.pendingHighlightMessageId = ''; requestAnimationFrame(() => setTimeout(() => { if (typeof window.scrollToDirectMessage === 'function') window.scrollToDirectMessage(highlightId); }, 40)); }
 			directApplyHistoryConversation(peer, payload);
 			const input = document.getElementById('direct-chat-input');
-			if (input && window.matchMedia('(pointer:fine)').matches) setTimeout(() => input.focus({ preventScroll:true }), 0);
+			if (input && !state.viewerBlocked && !state.blockedByPeer && window.matchMedia('(pointer:fine)').matches) setTimeout(() => input.focus({ preventScroll:true }), 0);
 		});
 		return true;
 	};
@@ -76150,7 +76258,7 @@ function getVisibleChatStackEl(id) {
 		state.pendingMedia = []; state.pendingUploads = 0; state.mediaToken = Number(state.mediaToken || 0) + 1;
 		state.replyTo = null; state.editingMessageId = ''; state.inputRange = null;
 		state.activePeer = ''; state.peer = null; state.messages = []; state.messageCount = 0; state.trimmedMessageIds = []; state.threadLoadedPeer = '';
-		state.myLastReadId = '0'; state.peerLastReadId = '0'; state.unreadDividerAfterId = ''; state.loadingThread = false; state.pendingHighlightMessageId = '';
+		state.myLastReadId = '0'; state.peerLastReadId = '0'; state.unreadDividerAfterId = ''; state.loadingThread = false; state.pendingHighlightMessageId = ''; state.viewerBlocked = false; state.blockedByPeer = false;
 		if (typeof directClearComposer === 'function') directClearComposer();
 		renderDirectPendingMedia(); closeDirectPickers(); renderDirectComposerContext();
 		window.clearDirectMessageSearch({ render:false, clearInput:true });
@@ -76359,6 +76467,7 @@ function getVisibleChatStackEl(id) {
 
 	window.sendDirectMessage = function() {
 		const state = window.__directChatState;
+		if (state.viewerBlocked || state.blockedByPeer) return;
 		const input = document.getElementById('direct-chat-input');
 		const text = directGetComposerHtml();
 		const plainText = directMessagePlainText(text);
@@ -76411,6 +76520,21 @@ function getVisibleChatStackEl(id) {
 	window.installDirectMessageSocketListeners = function(socket) {
 		if (!socket || socket.__directMessageListenersInstalled) return;
 		socket.__directMessageListenersInstalled = true;
+		socket.on('direct_user_block_state', payload => {
+			const me = directCurrentUser();
+			const blocker = String(payload && payload.blocker || '').trim();
+			const blocked = String(payload && payload.blocked || '').trim();
+			const active = payload && payload.active === true;
+			if (!me || !blocker || !blocked || (me !== blocker && me !== blocked)) return;
+			const peer = me === blocker ? blocked : blocker;
+			const conversation = directFindConversation(peer);
+			const state = window.__directChatState;
+			const currentViewerBlocked = conversation ? conversation.viewerBlocked === true : (state.activePeer === peer && state.viewerBlocked === true);
+			const currentBlockedByPeer = conversation ? conversation.blockedByPeer === true : (state.activePeer === peer && state.blockedByPeer === true);
+			const viewerBlocked = me === blocker ? active : currentViewerBlocked;
+			const blockedByPeer = me === blocked ? active : currentBlockedByPeer;
+			applyDirectUserBlockState(peer, viewerBlocked, blockedByPeer);
+		});
 		socket.on('direct_message', message => {
 			if (!message || !message.id || directMessageHiddenByLocalDelete(message)) return;
 			const me = directCurrentUser();

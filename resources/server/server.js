@@ -2422,6 +2422,14 @@ async function initDb() {
       CHECK (user_name <> peer_name)
     );
     CREATE INDEX IF NOT EXISTS idx_direct_conversation_delete_peer ON direct_conversation_delete_state(peer_name, user_name);
+    CREATE TABLE IF NOT EXISTS direct_user_blocks (
+      blocker_name TEXT NOT NULL REFERENCES users(name) ON DELETE CASCADE,
+      blocked_name TEXT NOT NULL REFERENCES users(name) ON DELETE CASCADE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (blocker_name, blocked_name),
+      CHECK (blocker_name <> blocked_name)
+    );
+    CREATE INDEX IF NOT EXISTS idx_direct_user_blocks_blocked ON direct_user_blocks(blocked_name, blocker_name);
     CREATE TABLE IF NOT EXISTS pinned_messages (
       id SERIAL PRIMARY KEY,
       message_id TEXT UNIQUE,
@@ -8537,6 +8545,38 @@ function emitDirectConversationDeleteToLocalUser(payload, excludeSocketId = '') 
   }
 }
 
+function emitDirectBlockStateToLocalUsers(payload, excludeSocketId = '') {
+  const blocker = normalizeDirectMessageUser(payload && payload.blocker);
+  const blocked = normalizeDirectMessageUser(payload && payload.blocked);
+  if (!blocker || !blocked || blocker === blocked) return;
+  const delivered = new Set();
+  for (const name of [blocker, blocked]) {
+    for (const client of getSocketsByUserName(name)) {
+      if (!client || !client.connected || client.id === excludeSocketId || delivered.has(client.id)) continue;
+      delivered.add(client.id);
+      client.emit('direct_user_block_state', payload);
+    }
+  }
+}
+
+async function getDirectUserBlockState(viewerName, peerName) {
+  const viewer = normalizeDirectMessageUser(viewerName);
+  const peer = normalizeDirectMessageUser(peerName);
+  if (!viewer || !peer || viewer === peer) return { viewerBlocked:false, blockedByPeer:false };
+  const result = await queryDbWithRetry(`
+    SELECT EXISTS (
+             SELECT 1 FROM direct_user_blocks WHERE blocker_name = $1 AND blocked_name = $2
+           ) AS viewer_blocked,
+           EXISTS (
+             SELECT 1 FROM direct_user_blocks WHERE blocker_name = $2 AND blocked_name = $1
+           ) AS blocked_by_peer
+  `, [viewer, peer], { attempts:2, label:'DIRECT BLOCK STATE READ' });
+  return {
+    viewerBlocked: result.rows?.[0]?.viewer_blocked === true,
+    blockedByPeer: result.rows?.[0]?.blocked_by_peer === true
+  };
+}
+
 function emitDirectTypingToLocalUser(payload, stopped = false, excludeSocketId = '') {
   const from = normalizeDirectMessageUser(payload && payload.from);
   const to = normalizeDirectMessageUser(payload && payload.to);
@@ -8627,7 +8667,15 @@ async function getDirectConversationPayload(userName) {
              SELECT 1 FROM presence_sessions ps
              WHERE ps.name = l.peer_name
                AND ps.last_seen >= NOW() - INTERVAL '${PRESENCE_TTL_SECONDS} seconds'
-           ) AS peer_online
+           ) AS peer_online,
+           EXISTS (
+             SELECT 1 FROM direct_user_blocks b
+             WHERE b.blocker_name = $1 AND b.blocked_name = l.peer_name
+           ) AS viewer_blocked,
+           EXISTS (
+             SELECT 1 FROM direct_user_blocks b
+             WHERE b.blocker_name = l.peer_name AND b.blocked_name = $1
+           ) AS blocked_by_peer
     FROM latest l
     JOIN users usr ON usr.name = l.peer_name
     LEFT JOIN unread u ON u.peer_name = l.peer_name
@@ -8647,6 +8695,8 @@ async function getDirectConversationPayload(userName) {
     unread: Math.max(0, Number(row.unread_count) || 0),
     myLastReadId: String(row.my_last_read_id || '0'),
     peerLastReadId: String(row.peer_last_read_id || '0'),
+    viewerBlocked: row.viewer_blocked === true,
+    blockedByPeer: row.blocked_by_peer === true,
     lastMessage: serializeDirectMessage(row)
   }));
 
@@ -8813,7 +8863,15 @@ async function getDirectHistoryPayload(userName, peerName, options = {}) {
                SELECT rs.last_read_id
                FROM direct_message_read_state rs
                WHERE rs.user_name = $2 AND rs.peer_name = $1
-             ), 0) AS peer_last_read_id
+             ), 0) AS peer_last_read_id,
+             EXISTS (
+               SELECT 1 FROM direct_user_blocks b
+               WHERE b.blocker_name = $1 AND b.blocked_name = $2
+             ) AS viewer_blocked,
+             EXISTS (
+               SELECT 1 FROM direct_user_blocks b
+               WHERE b.blocker_name = $2 AND b.blocked_name = $1
+             ) AS blocked_by_peer
       FROM users u
       WHERE u.name = $2
       LIMIT 1
@@ -8828,7 +8886,7 @@ async function getDirectHistoryPayload(userName, peerName, options = {}) {
       LIMIT $3
     )
     SELECT p.peer_name, p.peer_avatar, p.peer_last_seen, p.peer_message_activity_at, p.peer_online,
-           p.my_last_read_id, p.peer_last_read_id,
+           p.my_last_read_id, p.peer_last_read_id, p.viewer_blocked, p.blocked_by_peer,
            h.id, h.sender_name, h.recipient_name, h.text, h.message_type, h.content,
            h.reply_to, h.reactions, h.edited_at, h.created_at, h.total_count
     FROM peer p
@@ -8869,6 +8927,8 @@ async function getDirectHistoryPayload(userName, peerName, options = {}) {
     myLastReadId:String(myLastReadId || 0),
     previousMyLastReadId:String(previousMyLastReadId || 0),
     peerLastReadId:String(peerLastReadId || 0),
+    viewerBlocked:first.viewer_blocked === true,
+    blockedByPeer:first.blocked_by_peer === true,
     readStateChanged,
     readAt
   };
@@ -9393,6 +9453,8 @@ async function initProfileSyncNotifications() {
           emitDirectMessageDeleteToLocalUsers(data.payload);
         } else if (data.kind === 'conversation_delete' && data.payload) {
           emitDirectConversationDeleteToLocalUser(data.payload);
+        } else if (data.kind === 'block' && data.payload) {
+          emitDirectBlockStateToLocalUsers(data.payload);
         } else if (data.kind === 'read' && data.payload) {
           emitDirectReadToLocalUsers(data.payload);
         } else if (data.kind === 'typing' && data.payload) {
@@ -13923,10 +13985,16 @@ io.on('connection', (socket) => {
     }
   });
 
-  socket.on('direct_typing_start', (data = {}) => {
+  socket.on('direct_typing_start', async (data = {}) => {
     const actor = normalizeDirectMessageUser(socket.userName);
     const peer = normalizeDirectMessageUser(data.to || data.with || data.peer || data.user);
     if (!actor || !peer || actor === peer) return;
+    try {
+      const blockState = await getDirectUserBlockState(actor, peer);
+      if (blockState.viewerBlocked || blockState.blockedByPeer) return;
+    } catch (err) {
+      return;
+    }
     const previousPeer = normalizeDirectMessageUser(socket.__directTypingPeer);
     if (previousPeer && previousPeer !== peer) stopDirectTypingForSocket(socket, previousPeer);
     socket.__directTypingPeer = peer;
@@ -14003,11 +14071,16 @@ io.on('connection', (socket) => {
 
       const inserted = await queryDbWithRetry(`
         INSERT INTO direct_messages (sender_name, recipient_name, text, message_type, content, reply_to)
-        VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb)
+        SELECT $1, $2, $3, $4, $5::jsonb, $6::jsonb
+        WHERE NOT EXISTS (
+          SELECT 1 FROM direct_user_blocks
+          WHERE (blocker_name = $1 AND blocked_name = $2)
+             OR (blocker_name = $2 AND blocked_name = $1)
+        )
         RETURNING id, sender_name, recipient_name, text, message_type, content, reply_to, reactions, edited_at, created_at
       `, [sender, recipient, text, messageType, content.length ? JSON.stringify(content) : null, replySnapshot ? JSON.stringify(replySnapshot) : null], { attempts:2, label:'DIRECT MESSAGE INSERT' });
       const message = serializeDirectMessage(inserted.rows[0]);
-      if (!message) return respond({ success:false, message:'Could not save the message.' });
+      if (!message) return respond({ success:false, reason:'blocked', message:'This Private Chat is blocked.' });
 
       emitDirectMessageToLocalUsers(message, socket.id);
       deferServerTask('DIRECT MESSAGE NOTIFY', () => notifyDirectMessageAcrossInstances('message', message), 0);
@@ -14042,12 +14115,17 @@ io.on('connection', (socket) => {
       await client.query('BEGIN');
       const found = await client.query(`
         SELECT id, sender_name, recipient_name, text, message_type, content, reply_to, reactions, edited_at, created_at
-        FROM direct_messages
+        FROM direct_messages dm
         WHERE id = $1 AND (sender_name = $2 OR recipient_name = $2)
+          AND NOT EXISTS (
+            SELECT 1 FROM direct_user_blocks b
+            WHERE (b.blocker_name = $2 AND b.blocked_name = CASE WHEN dm.sender_name = $2 THEN dm.recipient_name ELSE dm.sender_name END)
+               OR (b.blocked_name = $2 AND b.blocker_name = CASE WHEN dm.sender_name = $2 THEN dm.recipient_name ELSE dm.sender_name END)
+          )
         FOR UPDATE
       `, [messageId, actor]);
       const row = found.rows && found.rows[0];
-      if (!row) { await client.query('ROLLBACK'); return respond({ success:false, message:'Message not found.' }); }
+      if (!row) { await client.query('ROLLBACK'); return respond({ success:false, message:'Message not found or this Private Chat is blocked.' }); }
       const reactions = normalizeDirectMessageReactions(row.reactions);
       let reactionAdded = false;
       let reactionRemoved = false;
@@ -14114,11 +14192,18 @@ io.on('connection', (socket) => {
     if (!actor || !messageId) return respond({ success:false, message:'Invalid message.' });
     try {
       const current = await queryDbWithRetry(`
-        SELECT id, sender_name, recipient_name, text, message_type, content, reply_to, reactions, edited_at, created_at
-        FROM direct_messages WHERE id = $1 AND sender_name = $2 LIMIT 1
+        SELECT dm.id, dm.sender_name, dm.recipient_name, dm.text, dm.message_type, dm.content, dm.reply_to, dm.reactions, dm.edited_at, dm.created_at
+        FROM direct_messages dm
+        WHERE dm.id = $1 AND dm.sender_name = $2
+          AND NOT EXISTS (
+            SELECT 1 FROM direct_user_blocks b
+            WHERE (b.blocker_name = $2 AND b.blocked_name = dm.recipient_name)
+               OR (b.blocker_name = dm.recipient_name AND b.blocked_name = $2)
+          )
+        LIMIT 1
       `, [messageId, actor], { attempts:2, label:'DIRECT EDIT READ' });
       const existing = serializeDirectMessage(current.rows && current.rows[0]);
-      if (!existing) return respond({ success:false, message:'You can only edit your own messages.' });
+      if (!existing) return respond({ success:false, message:'You can only edit your own messages while the Private Chat is available.' });
       if (!directMessagePlainText(text) && !(Array.isArray(existing.content) && existing.content.length)) return respond({ success:false, message:'A message cannot be empty.' });
       const updated = await queryDbWithRetry(`
         UPDATE direct_messages SET text = $3, edited_at = NOW()
@@ -14183,6 +14268,40 @@ io.on('connection', (socket) => {
     } catch (err) {
       console.error('[DIRECT DELETE ERROR]:', err && err.message ? err.message : err);
       respond({ success:false, message:'Could not delete the message.' });
+    }
+  });
+
+
+  socket.on('direct_user_block_set', async (data = {}, callback) => {
+    const respond = typeof callback === 'function' ? callback : () => {};
+    const viewer = normalizeDirectMessageUser(socket.userName);
+    const peer = normalizeDirectMessageUser(data.peer || data.with || data.user);
+    const blocked = data.blocked !== false;
+    if (!viewer) return respond({ success:false, message:'Authentication required.' });
+    if (!peer || peer === viewer || !userDatabase[peer]) return respond({ success:false, message:'Invalid user.' });
+    try {
+      if (blocked) {
+        await queryDbWithRetry(`
+          INSERT INTO direct_user_blocks (blocker_name, blocked_name, created_at)
+          VALUES ($1, $2, NOW())
+          ON CONFLICT (blocker_name, blocked_name) DO NOTHING
+        `, [viewer, peer], { attempts:2, label:'DIRECT BLOCK UPSERT' });
+      } else {
+        await queryDbWithRetry(
+          'DELETE FROM direct_user_blocks WHERE blocker_name = $1 AND blocked_name = $2',
+          [viewer, peer],
+          { attempts:2, label:'DIRECT BLOCK DELETE' }
+        );
+      }
+      stopDirectTypingForSocket(socket, peer);
+      const state = await getDirectUserBlockState(viewer, peer);
+      const payload = { blocker:viewer, blocked:peer, active:state.viewerBlocked === true, changedAt:new Date().toISOString() };
+      emitDirectBlockStateToLocalUsers(payload, socket.id);
+      deferServerTask('DIRECT BLOCK NOTIFY', () => notifyDirectMessageAcrossInstances('block', payload), 0);
+      respond({ success:true, peer, viewerBlocked:state.viewerBlocked === true, blockedByPeer:state.blockedByPeer === true });
+    } catch (err) {
+      console.error('[DIRECT BLOCK ERROR]:', err && err.message ? err.message : err);
+      respond({ success:false, message:'Could not update block status.' });
     }
   });
 
