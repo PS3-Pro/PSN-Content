@@ -12424,7 +12424,7 @@ P
     const STORAGE_KEY_FAVS = "ps3_library_favs";
     const GLOBAL_USERS_KEY = 'psn_global_users';
 	const STORAGE_KEY_FRIENDS = "psn_friends_list";
-	const PROFILE_NOTIFICATION_STATE_VERSION = "1";
+	const PROFILE_NOTIFICATION_STATE_VERSION = "2";
 	const PROFILE_NOTIFICATION_SYNC_KEY_CATEGORY = {
 		psn_dl_dot: 'downloads', psn_dl_dot_items: 'downloads',
 		psn_wish_dot: 'wishlist', psn_wish_dot_items: 'wishlist',
@@ -14585,7 +14585,7 @@ P
 				favorites: ['psn_fav_dot_items', 'psn_fav_dot'],
 				trophies: ['psn_trophy_dot_items', 'psn_trophy_dot', 'psn_last_trophy_color']
 			};
-			const localMirrorMatches = ['downloads', 'wishlist', 'favorites', 'trophies'].every(category => {
+			let localMirrorMatches = ['downloads', 'wishlist', 'favorites', 'trophies'].every(category => {
 				const incoming = state[category];
 				if (!incoming || typeof incoming !== 'object' || Array.isArray(incoming)) return true;
 				const keys = storageKeys[category];
@@ -14601,6 +14601,12 @@ P
 				const incomingUpdatedAt = Math.max(0, Number(incoming.updatedAt || 0) || 0);
 				return !incomingUpdatedAt || localUpdatedAt === incomingUpdatedAt;
 			});
+			if (localMirrorMatches && state.admin && typeof state.admin === 'object' && !Array.isArray(state.admin)) {
+				const adminState = window.__adminPendingSeenState;
+				const incomingAdmin = normalizeProfileNotificationPendingValue(state.admin.pendingItems).slice().sort();
+				const localAdmin = adminState && adminState.ready === true && adminState.tokens instanceof Set ? Array.from(adminState.tokens).sort() : null;
+				localMirrorMatches = !!localAdmin && JSON.stringify(localAdmin) === JSON.stringify(incomingAdmin) && Number(adminState.updatedAt || 0) === Math.max(0, Number(state.admin.updatedAt || 0) || 0);
+			}
 			if (localMirrorMatches) return false;
 		}
 
@@ -14646,6 +14652,10 @@ P
 				}
 			});
 			writeSyncedSettingForUser(name, 'psn_category_dot_pending_schema', '2');
+
+			if (state.admin && typeof state.admin === 'object' && !Array.isArray(state.admin) && typeof window.applyAdminPendingSeenStateFromServer === 'function') {
+				window.applyAdminPendingSeenStateFromServer(name, state.admin);
+			}
 
 			if (active) {
 				const downloadPending = normalizeProfileNotificationPendingValue(loadState('psn_dl_dot_items'));
@@ -24652,12 +24662,15 @@ P
 			else startChatOpenWork();
 	
 		} else if (section === 'messages') {
+			let animateConversationEntry = false;
 			if(chatView) { setPsnStyleIfChanged(chatView, 'display', 'none'); chatView.classList.remove('anim-up'); }
 			if(friendsView) { setPsnStyleIfChanged(friendsView, 'display', 'none'); friendsView.classList.remove('anim-up'); }
 			if(activityView) { setPsnStyleIfChanged(activityView, 'display', 'none'); activityView.classList.remove('anim-up'); }
 			if(playTogetherView) { setPsnStyleIfChanged(playTogetherView, 'display', 'none'); playTogetherView.classList.remove('anim-up'); }
 			if(messagesView) {
 				const wasHidden = messagesView.style.display === 'none' || getComputedStyle(messagesView).display === 'none';
+				animateConversationEntry = wasHidden;
+				if (animateConversationEntry && window.__directChatState) window.__directChatState.conversationEntryPending = true;
 				// Reset while the section is still hidden so there is no visible scroll jump.
 				if (wasHidden && typeof window.resetDirectConversationListScroll === 'function') window.resetDirectConversationListScroll();
 				setPsnStyleIfChanged(messagesView, 'display', 'flex');
@@ -24679,7 +24692,8 @@ P
 			if (typeof window.refreshDirectConversations === 'function' || typeof window.markActiveDirectConversationRead === 'function') {
 				runViewOpenWork('view-chat', () => {
 					if (typeof window.markActiveDirectConversationRead === 'function') window.markActiveDirectConversationRead();
-					if (typeof window.refreshDirectConversations === 'function') window.refreshDirectConversations({ preserveThread:true });
+					if (typeof window.refreshDirectConversations === 'function') window.refreshDirectConversations({ preserveThread:true, animateListEntry:animateConversationEntry });
+					else if (animateConversationEntry && typeof window.animateDirectConversationListEntry === 'function') window.animateDirectConversationListEntry();
 				});
 			}
 
@@ -44827,8 +44841,6 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 		};
 	}
 
-	const ADMIN_PENDING_SEEN_KEY = 'psn_admin_pending_seen';
-
 	function adminPendingContentReportToken(group) {
 		if (!group || typeof group !== 'object') return '';
 		const reportKey = String(group.reportKey || group.id || '').trim();
@@ -44853,49 +44865,97 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 		};
 	}
 
-	function readAdminPendingSeenTokens() {
-		try {
-			const parsed = JSON.parse(loadState(ADMIN_PENDING_SEEN_KEY) || '{}');
-			return {
-				content: new Set(Array.isArray(parsed.content) ? parsed.content.map(String) : []),
-				metadata: new Set(Array.isArray(parsed.metadata) ? parsed.metadata.map(String) : [])
-			};
-		} catch (err) {
-			return { content:new Set(), metadata:new Set() };
+	function getAdminPendingTokenList(tokens = getAdminPendingTokens()) {
+		return [...new Set([...(Array.isArray(tokens.content) ? tokens.content : []), ...(Array.isArray(tokens.metadata) ? tokens.metadata : [])].map(String).filter(Boolean))].slice(0, 500);
+	}
+
+	function getAdminPendingSeenRuntime() {
+		if (!window.__adminPendingSeenState || typeof window.__adminPendingSeenState !== 'object') {
+			window.__adminPendingSeenState = { tokens:new Set(), ready:false, updatedAt:0, inFlight:false, queued:null, lastSentSignature:'', mutationSequence:0 };
 		}
+		const state = window.__adminPendingSeenState;
+		if (!(state.tokens instanceof Set)) state.tokens = new Set();
+		return state;
 	}
 
-	function writeAdminPendingSeenTokens(tokens = getAdminPendingTokens()) {
-		const payload = JSON.stringify({
-			content: Array.isArray(tokens.content) ? tokens.content : [],
-			metadata: Array.isArray(tokens.metadata) ? tokens.metadata : []
-		});
-		saveState(ADMIN_PENDING_SEEN_KEY, payload);
-		return tokens;
-	}
-
-	window.markAdminPendingSeen = function() {
-		if (!document.body.classList.contains('is-admin')) return false;
-		writeAdminPendingSeenTokens();
+	window.applyAdminPendingSeenStateFromServer = function(username, incoming = {}) {
+		const activeUser = String(localStorage.getItem('psn_username') || '').trim();
+		if (!activeUser || activeUser !== String(username || '').trim()) return false;
+		const state = getAdminPendingSeenRuntime();
+		const incomingUpdatedAt = Math.max(0, Number(incoming && incoming.updatedAt) || 0);
+		if (state.inFlight && incomingUpdatedAt && incomingUpdatedAt < Number(state.updatedAt || 0)) return false;
+		state.tokens = new Set(normalizeProfileNotificationPendingValue(incoming && incoming.pendingItems));
+		state.ready = true;
+		state.updatedAt = incomingUpdatedAt;
+		state.lastSentSignature = JSON.stringify(Array.from(state.tokens).sort());
+		/* Remove the obsolete local source-of-truth from V28-V31. Server profile state is authoritative. */
+		try { localStorage.removeItem(`${activeUser}_psn_admin_pending_seen`); } catch (err) {}
 		if (typeof window.refreshAdminPendingIndicator === 'function') window.refreshAdminPendingIndicator();
 		return true;
 	};
 
-	window.refreshAdminPendingIndicator = function() {
+	function flushAdminPendingSeenServerSync(tokens = null) {
+		const state = getAdminPendingSeenRuntime();
+		if (tokens) state.queued = getAdminPendingTokenList(tokens);
+		if (!state.ready || state.inFlight || !Array.isArray(state.queued)) return false;
+		if (!window.isProfileLoaded || typeof socketChat === 'undefined' || !socketChat || !socketChat.connected) return false;
+		const owner = String(localStorage.getItem('psn_username') || '').trim();
+		if (!owner || !document.body.classList.contains('is-admin')) return false;
+
+		const outgoing = state.queued.slice(0, 500);
+		state.queued = null;
+		const signature = JSON.stringify(outgoing.slice().sort());
+		if (signature === state.lastSentSignature && outgoing.every(token => state.tokens.has(token)) && state.tokens.size === outgoing.length) return true;
+		state.inFlight = true;
+		state.mutationSequence = Number(state.mutationSequence || 0) + 1;
+		const mutationId = `admin-seen-${Date.now().toString(36)}-${state.mutationSequence.toString(36)}`;
+		socketChat.emit('profile_notification_state_update', { category:'admin', mutationId, replacePending:true, pendingItems:outgoing, clientSentAt:Date.now() }, response => {
+			state.inFlight = false;
+			if (response && response.ok === true && response.notificationState && typeof window.applyProfileNotificationStateFromServer === 'function') {
+				window.applyProfileNotificationStateFromServer(owner, response.notificationState, null);
+			} else if (!Array.isArray(state.queued)) {
+				state.queued = outgoing;
+			}
+			if (Array.isArray(state.queued)) setTimeout(() => flushAdminPendingSeenServerSync(), 180);
+		});
+		return true;
+	}
+	window.flushAdminPendingSeenServerSync = flushAdminPendingSeenServerSync;
+
+	window.markAdminPendingSeen = function() {
+		if (!document.body.classList.contains('is-admin')) return false;
+		const state = getAdminPendingSeenRuntime();
+		if (!state.ready) return false;
+		const tokens = getAdminPendingTokens();
+		const list = getAdminPendingTokenList(tokens);
+		state.tokens = new Set(list);
+		state.queued = list;
+		if (typeof window.refreshAdminPendingIndicator === 'function') window.refreshAdminPendingIndicator({ skipAutoSeen:true });
+		flushAdminPendingSeenServerSync();
+		return true;
+	};
+
+	window.refreshAdminPendingIndicator = function(options = {}) {
 		const dot = document.getElementById('admin-dot');
 		const counts = getAdminPendingActionCounts();
 		const isAdmin = document.body.classList.contains('is-admin');
 		const adminVisible = isAdmin && document.getElementById('view-admin')?.style.display === 'block';
 		const tokens = getAdminPendingTokens();
+		const state = getAdminPendingSeenRuntime();
 
-		/* The count pill tracks unresolved work. The dot tracks only work that has not been
-		   seen yet. Anything received while Control Panel is visible is already visible to
-		   the administrator and is therefore marked seen immediately. */
-		if (adminVisible) writeAdminPendingSeenTokens(tokens);
-		const seen = readAdminPendingSeenTokens();
-		const unseenContent = tokens.content.some(token => !seen.content.has(token));
-		const unseenMetadata = tokens.metadata.some(token => !seen.metadata.has(token));
-		const visible = isAdmin && !adminVisible && (unseenContent || unseenMetadata);
+		/* The count pill tracks unresolved work. The dot tracks unseen server-backed work. */
+		if (adminVisible && state.ready && options.skipAutoSeen !== true) {
+			const current = getAdminPendingTokenList(tokens);
+			const hasUnseen = current.some(token => !state.tokens.has(token)) || state.tokens.size !== current.length;
+			if (hasUnseen) {
+				state.tokens = new Set(current);
+				state.queued = current;
+				flushAdminPendingSeenServerSync();
+			} else if (Array.isArray(state.queued)) flushAdminPendingSeenServerSync();
+		}
+		const unseenContent = state.ready && tokens.content.some(token => !state.tokens.has(token));
+		const unseenMetadata = state.ready && tokens.metadata.some(token => !state.tokens.has(token));
+		const visible = isAdmin && state.ready && !adminVisible && (unseenContent || unseenMetadata);
 
 		if (dot) {
 			dot.style.display = visible ? 'block' : 'none';
@@ -50762,6 +50822,7 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 			document.documentElement.style.setProperty('--ps-neon', '#0070cc66');
 			if (typeof updateDynamicCursor === 'function') updateDynamicCursor('#0070cc');
 	
+			window.__adminPendingSeenState = { tokens:new Set(), ready:false, updatedAt:0, inFlight:false, queued:null, lastSentSignature:'', mutationSequence:0 };
 			const notificationDots = ['chat-dot', 'trophy-dot', 'wish-dot', 'dl-dot', 'fav-dot', 'activity-dot', 'notifications-dot', 'admin-dot'];
 			notificationDots.forEach(id => {
 				const dot = document.getElementById(id);
@@ -50924,6 +50985,7 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 								if (typeof cancelPendingImage === 'function') cancelPendingImage();
 								if (typeof cancelEditMessage === 'function' && typeof editingMsgId !== 'undefined' && editingMsgId) cancelEditMessage();
 	
+								window.__adminPendingSeenState = { tokens:new Set(), ready:false, updatedAt:0, inFlight:false, queued:null, lastSentSignature:'', mutationSequence:0 };
 								const notificationDots = ['chat-dot', 'trophy-dot', 'wish-dot', 'dl-dot', 'fav-dot', 'activity-dot', 'notifications-dot', 'admin-dot'];
 								notificationDots.forEach(id => {
 									const dot = document.getElementById(id);
@@ -64522,6 +64584,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
             if (activeChatBox && batchContext.mentionRefreshNeeded && typeof refreshMentionJumpButton === 'function') refreshMentionJumpButton();
             batchContext.selectionRefreshNeeded = false;
             batchContext.mentionRefreshNeeded = false;
+            if (activeChatBox && typeof window.scheduleSeenChatNotificationConsumption === 'function') requestAnimationFrame(() => window.scheduleSeenChatNotificationConsumption('global'));
             return true;
         } finally {
             window.__chatDisableMessageEntryAnimation = previousEntryAnimationState;
@@ -73692,7 +73755,7 @@ function getVisibleChatStackEl(id) {
 		owner: '', conversations: [], activePeer: '', messages: [], peer: null, messageCount: 0,
 		myLastReadId: '0', peerLastReadId: '0', unreadDividerAfterId: '', loadingThread: false, pendingMedia: [], pendingUploads: 0, mediaToken: 0,
 		replyTo: null, editingMessageId: '', inputRange: null, searchQuery: '', searchResultCount: 0,
-		conversationRefreshInFlight: false, conversationRefreshQueued: false, conversationRefreshTimer: 0, conversationRefreshWatchdog: 0, conversationRefreshToken: 0, conversationSignature: '',
+		conversationRefreshInFlight: false, conversationRefreshQueued: false, conversationRefreshTimer: 0, conversationRefreshWatchdog: 0, conversationRefreshToken: 0, conversationSignature: '', conversationEntryPending: false,
 		threadRequestToken: 0, threadRequestTimer: 0, threadLoadedPeer: '', sessionToken: 0, trimmedMessageIds: [], deletedThroughByPeer: Object.create(null), emptyConversationCloseTimer: 0, emptyConversationCloseToken: 0,
 		typingEmitActive: false, typingEmitPeer: '', typingStopTimer: 0, peerTyping: false, peerTypingName: '', peerTypingAvatar: '', peerTypingTimer: 0,
 		globalSearchResults: [], globalSearchLoading: false, globalSearchToken: 0, pendingHighlightMessageId: ''
@@ -74388,6 +74451,36 @@ function getVisibleChatStackEl(id) {
 		return !list || (list.scrollHeight - list.scrollTop - list.clientHeight) <= threshold;
 	}
 
+	function animateDirectConversationListEntry() {
+		const state = window.__directChatState;
+		const list = document.getElementById('direct-conversations-list');
+		if (!list || !state || state.conversationEntryPending !== true) return false;
+		const items = Array.from(list.querySelectorAll(':scope > .direct-conversation-item'));
+		if (!items.length || list.getClientRects().length === 0) return false;
+		state.conversationEntryPending = false;
+		if ((window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches) || typeof items[0].animate !== 'function') return false;
+		items.forEach((item, index) => {
+			if (item.__directConversationEntryAnimation) {
+				try { item.__directConversationEntryAnimation.cancel(); } catch (e) {}
+			}
+			const animation = item.animate([
+				{ opacity:0, transform:'translateY(14px)' },
+				{ opacity:1, transform:'translateY(0)' }
+			], {
+				duration:440,
+				delay:Math.min(index, 10) * 46,
+				easing:'cubic-bezier(.2,.8,.2,1)',
+				fill:'backwards'
+			});
+			item.__directConversationEntryAnimation = animation;
+			animation.finished.catch(() => {}).then(() => {
+				if (item.__directConversationEntryAnimation === animation) item.__directConversationEntryAnimation = null;
+			});
+		});
+		return true;
+	}
+	window.animateDirectConversationListEntry = animateDirectConversationListEntry;
+
 	function renderDirectConversations() {
 		const list = document.getElementById('direct-conversations-list');
 		if (!list) return;
@@ -74438,6 +74531,7 @@ function getVisibleChatStackEl(id) {
 				<div class="direct-conversation-side"><span class="direct-conversation-time">${directEscapeHtml(directFormatConversationTime(last.createdAt))}</span>${unread ? `<span class="direct-unread-badge">${unread > 99 ? '99+' : unread}</span>` : ''}</div>
 			</button>`;
 		}).join('');
+		if (state.conversationEntryPending) requestAnimationFrame(() => animateDirectConversationListEntry());
 	}
 
 
@@ -74959,6 +75053,120 @@ function getVisibleChatStackEl(id) {
 		const active = document.getElementById('direct-thread-active');
 		return !!(subview && subview.style.display !== 'none' && active && active.style.display === 'flex');
 	}
+
+	function getChatNotificationTargetIds(scope) {
+		const safeScope = scope === 'private' ? 'private' : 'global';
+		const ids = new Set();
+		const items = Array.isArray(window.userNotificationItems) ? window.userNotificationItems : [];
+		for (const item of items) {
+			if (!item || !item.data) continue;
+			const type = String(item.type || '').toLowerCase();
+			if (safeScope === 'private') {
+				if (type !== 'private_message') continue;
+			} else if (type !== 'mention' && type !== 'reply' && type !== 'reaction') continue;
+			const id = String(item.data.messageId || '').trim();
+			if (id) ids.add(id);
+		}
+		return ids;
+	}
+
+	function chatNotificationRowIsVisible(row, rootRect) {
+		if (!row || !row.isConnected || !rootRect) return false;
+		const rect = row.getBoundingClientRect();
+		if (!rect.height || rect.bottom <= rootRect.top || rect.top >= rootRect.bottom) return false;
+		const visibleHeight = Math.max(0, Math.min(rect.bottom, rootRect.bottom) - Math.max(rect.top, rootRect.top));
+		const required = Math.min(24, Math.max(8, rect.height * 0.35));
+		return visibleHeight >= required;
+	}
+
+	window.applyConsumedUserNotifications = function(data = {}) {
+		const targetUser = String(data.userName || '').trim();
+		const activeUser = String(localStorage.getItem('psn_username') || '').trim();
+		if (targetUser && activeUser && targetUser.toLowerCase() !== activeUser.toLowerCase()) return false;
+		const ids = new Set((Array.isArray(data.notificationIds) ? data.notificationIds : []).map(id => String(id || '').trim()).filter(Boolean));
+		const messageIds = new Set((Array.isArray(data.messageIds) ? data.messageIds : []).map(id => String(id || '').trim()).filter(Boolean));
+		const scope = data.scope === 'private' ? 'private' : (data.scope === 'global' ? 'global' : '');
+		const previousItems = Array.isArray(window.userNotificationItems) ? window.userNotificationItems : [];
+		const nextItems = previousItems.filter(item => {
+			if (ids.has(String(item && item.id || ''))) return false;
+			if (!messageIds.size || !scope || !item || !item.data || !messageIds.has(String(item.data.messageId || ''))) return true;
+			const type = String(item.type || '').toLowerCase();
+			return scope === 'private' ? type !== 'private_message' : (type !== 'mention' && type !== 'reply' && type !== 'reaction');
+		});
+		const previousUnread = Math.max(0, Number(window.__userNotificationUnreadCount) || 0);
+		const nextUnread = Object.prototype.hasOwnProperty.call(data, 'unreadCount') ? Math.max(0, Number(data.unreadCount) || 0) : previousUnread;
+		if (nextItems.length === previousItems.length && nextUnread === previousUnread) return false;
+		const remainingIds = new Set(nextItems.map(item => String(item && item.id || '')).filter(Boolean));
+		const removedIds = new Set(previousItems.map(item => String(item && item.id || '')).filter(id => id && !remainingIds.has(id)));
+		window.userNotificationItems = nextItems;
+		window.__userNotificationUnreadCount = nextUnread;
+		if (typeof window.writeUserNotificationCache === 'function') window.writeUserNotificationCache();
+		if (typeof window.refreshNotificationCenterIndicators === 'function') window.refreshNotificationCenterIndicators();
+		if (removedIds.size && typeof window.isNotificationCenterVisible === 'function' && window.isNotificationCenterVisible()) {
+			const list = document.getElementById('notification-center-list');
+			const staleRows = list ? Array.from(list.querySelectorAll('.notification-swipe-row[data-notification-id]')).filter(row => removedIds.has(String(row.dataset.notificationId || ''))) : [];
+			if (staleRows.length && typeof window.animateUserNotificationCascadeOut === 'function') {
+				window.animateUserNotificationCascadeOut(staleRows, () => { if (typeof window.syncUserNotificationDomToState === 'function') window.syncUserNotificationDomToState(); });
+			} else if (typeof window.syncUserNotificationDomToState === 'function') window.syncUserNotificationDomToState();
+		}
+		return true;
+	};
+
+	window.scheduleSeenChatNotificationConsumption = function(scope, options = {}) {
+		const safeScope = scope === 'private' ? 'private' : 'global';
+		window.__chatNotificationConsumeTimer = window.__chatNotificationConsumeTimer || { global:0, private:0 };
+		if (window.__chatNotificationConsumeTimer[safeScope]) clearTimeout(window.__chatNotificationConsumeTimer[safeScope]);
+		window.__chatNotificationConsumeTimer[safeScope] = setTimeout(() => {
+			window.__chatNotificationConsumeTimer[safeScope] = 0;
+			if (!socketChat || !socketChat.connected) return;
+			const targets = getChatNotificationTargetIds(safeScope);
+			if (!targets.size) return;
+			let root = null;
+			if (safeScope === 'private') {
+				if (!directThreadVisible() || (typeof isDirectMessagesSubviewVisible === 'function' && !isDirectMessagesSubviewVisible())) return;
+				root = document.getElementById('direct-message-list');
+			} else {
+				if (typeof isChatScreenVisibleForRead === 'function' && !isChatScreenVisibleForRead()) return;
+				root = document.getElementById('chat-messages');
+			}
+			if (!root || !root.isConnected) return;
+			const rootRect = root.getBoundingClientRect();
+			const visibleIds = [];
+			for (const id of targets) {
+				const row = safeScope === 'private'
+					? root.querySelector(`[data-direct-message-id="${CSS.escape(id)}"]`)
+					: (typeof getRenderedChatMessageRow === 'function' ? getRenderedChatMessageRow(id) : document.getElementById(`msg-row-${id}`));
+				if (chatNotificationRowIsVisible(row, rootRect)) visibleIds.push(id);
+			}
+			if (!visibleIds.length) return;
+			visibleIds.sort();
+			window.__chatNotificationConsumeSignature = window.__chatNotificationConsumeSignature || { global:'', private:'' };
+			const signature = visibleIds.join('|');
+			if (options.force !== true && window.__chatNotificationConsumeSignature[safeScope] === signature) return;
+			window.__chatNotificationConsumeSignature[safeScope] = signature;
+			const payload = { scope:safeScope, messageIds:visibleIds.slice(0, 40) };
+			const applyAck = response => {
+				if (!response || response.ok !== true) { window.__chatNotificationConsumeSignature[safeScope] = ''; return; }
+				if (typeof window.applyConsumedUserNotifications === 'function') {
+					window.applyConsumedUserNotifications({ userName:activeUser, notificationIds:response.notificationIds || [], scope:safeScope, messageIds:payload.messageIds, unreadCount:response.unreadCount });
+				}
+			};
+			const activeUser = String(localStorage.getItem('psn_username') || '').trim();
+			if (typeof socketChat.timeout === 'function') socketChat.timeout(5000).emit('user_notifications_consume_chat', payload, (err, response) => { if (err) { window.__chatNotificationConsumeSignature[safeScope] = ''; return; } applyAck(response); });
+			else socketChat.emit('user_notifications_consume_chat', payload, applyAck);
+		}, options.force === true ? 45 : 90);
+		return true;
+	};
+
+	function bindSeenChatNotificationConsumption() {
+		const directList = document.getElementById('direct-message-list');
+		if (directList && directList.dataset.notificationConsumeBound !== '1') {
+			directList.dataset.notificationConsumeBound = '1';
+			directList.addEventListener('scroll', () => window.scheduleSeenChatNotificationConsumption('private'), { passive:true });
+		}
+	}
+	if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', bindSeenChatNotificationConsumption, { once:true });
+	else bindSeenChatNotificationConsumption();
 
 	window.markActiveDirectConversationRead = function() {
 		const state = window.__directChatState;
@@ -75661,15 +75869,13 @@ function getVisibleChatStackEl(id) {
 		if (!String(state.searchQuery || '').trim()) requestAnimationFrame(setupDirectUnreadDividerAutoRemove);
 		requestAnimationFrame(() => {
 			if (!list) return;
-			if (options.searchUpdate === true) { list.scrollTop = 0; return; }
-			if (options.forceBottom === true || (!options.preserveScroll && wasNearBottom)) {
-				list.scrollTop = list.scrollHeight;
-				return;
-			}
-			if (options.preserveScroll === true) {
+			if (options.searchUpdate === true) list.scrollTop = 0;
+			else if (options.forceBottom === true || (!options.preserveScroll && wasNearBottom)) list.scrollTop = list.scrollHeight;
+			else if (options.preserveScroll === true) {
 				const delta = list.scrollHeight - previousScrollHeight;
 				list.scrollTop = Math.max(0, previousScrollTop + delta);
 			}
+			if (typeof window.scheduleSeenChatNotificationConsumption === 'function') requestAnimationFrame(() => window.scheduleSeenChatNotificationConsumption('private'));
 		});
 	}
 
@@ -75710,6 +75916,7 @@ function getVisibleChatStackEl(id) {
 			if (!list.isConnected) return;
 			if (keepBottom) list.scrollTop = list.scrollHeight;
 			else list.scrollTop = Math.max(0, previousScrollTop - removedAboveHeight);
+			if (typeof window.scheduleSeenChatNotificationConsumption === 'function') requestAnimationFrame(() => window.scheduleSeenChatNotificationConsumption('private'));
 		});
 		return true;
 	}
@@ -75773,7 +75980,7 @@ function getVisibleChatStackEl(id) {
 		clearTimeout(state.conversationRefreshTimer); state.conversationRefreshTimer = 0;
 		clearTimeout(state.conversationRefreshWatchdog); state.conversationRefreshWatchdog = 0; state.conversationRefreshToken = Number(state.conversationRefreshToken || 0) + 1;
 		clearTimeout(state.threadRequestTimer); state.threadRequestTimer = 0; state.threadRequestToken = Number(state.threadRequestToken || 0) + 1;
-		state.conversationRefreshInFlight = false; state.conversationRefreshQueued = false; state.conversationSignature = '';
+		state.conversationRefreshInFlight = false; state.conversationRefreshQueued = false; state.conversationSignature = ''; state.conversationEntryPending = false;
 		clearTimeout(directGifSearchTimer); directGifSearchTimer = 0; directGifRequestSeq = Number(directGifRequestSeq || 0) + 1;
 		if (directGifAbortController) { try { directGifAbortController.abort(); } catch (e) {} directGifAbortController = null; }
 		const reactionPicker = document.getElementById('active-direct-reaction-picker');
@@ -75790,8 +75997,12 @@ function getVisibleChatStackEl(id) {
 	else setTimeout(updateDirectChatAutoTranslateUi, 0);
 
 	window.refreshDirectConversations = function(options = {}) {
-		if (!socketChat || !socketChat.connected) return;
 		const state = window.__directChatState;
+		if (options.animateListEntry === true) state.conversationEntryPending = true;
+		if (!socketChat || !socketChat.connected) {
+			if (state.conversationEntryPending) requestAnimationFrame(() => animateDirectConversationListEntry());
+			return;
+		}
 		const delay = options.immediate === true ? 0 : 70;
 		if (state.conversationRefreshInFlight) { state.conversationRefreshQueued = true; return; }
 		clearTimeout(state.conversationRefreshTimer);
@@ -75810,7 +76021,7 @@ function getVisibleChatStackEl(id) {
 				if (state.conversationRefreshQueued && socketChat && socketChat.connected) {
 					state.conversationRefreshQueued = false;
 					window.refreshDirectConversations({ preserveThread:true, immediate:true });
-				}
+				} else if (state.conversationEntryPending) requestAnimationFrame(() => animateDirectConversationListEntry());
 			}, 9000);
 			socketChat.emit('request_direct_conversations', {}, payload => {
 				if (Number(state.conversationRefreshToken || 0) !== refreshToken) return;
@@ -75846,7 +76057,7 @@ function getVisibleChatStackEl(id) {
 				if (state.conversationRefreshQueued) {
 					state.conversationRefreshQueued = false;
 					window.refreshDirectConversations({ preserveThread:true });
-				}
+				} else if (state.conversationEntryPending) requestAnimationFrame(() => animateDirectConversationListEntry());
 			});
 		}, delay);
 	};
@@ -79088,6 +79299,10 @@ function getVisibleChatStackEl(id) {
 						});
 					}
 				}
+				if (typeof window.scheduleSeenChatNotificationConsumption === 'function') {
+					if (item.type === 'private_message') window.scheduleSeenChatNotificationConsumption('private', { force:true });
+					else if (item.type === 'mention' || item.type === 'reply' || item.type === 'reaction') window.scheduleSeenChatNotificationConsumption('global', { force:true });
+				}
 				if (typeof window.isNotificationCenterVisible === 'function' && window.isNotificationCenterVisible() && window.__userNotificationClearBusy !== true) {
 					if (!known && typeof window.applyUserNotificationRealtimeDom === 'function') window.applyUserNotificationRealtimeDom(item);
 					if (typeof window.markUserNotificationsRead === 'function') window.markUserNotificationsRead();
@@ -79160,6 +79375,10 @@ function getVisibleChatStackEl(id) {
 			} else if (typeof window.refreshNotificationCenterIndicators === 'function') {
 				window.refreshNotificationCenterIndicators();
 			}
+		});
+
+		socketChat.on('user_notifications_consumed', function(data = {}) {
+			if (typeof window.applyConsumedUserNotifications === 'function') window.applyConsumedUserNotifications(data);
 		});
 
 		socketChat.on('user_notifications_cleared', function(data = {}) {
@@ -81436,6 +81655,7 @@ function getVisibleChatStackEl(id) {
         const activePicker = window.__activeReactionPicker;
         if (activePicker && activePicker.isConnected && typeof window.closeActivePicker === 'function') window.closeActivePicker();
         scheduleChatScrollUiFrame(chatMessagesScrollBox);
+        if (typeof window.scheduleSeenChatNotificationConsumption === 'function') window.scheduleSeenChatNotificationConsumption('global');
     }, { passive: true });
 
    document.addEventListener('visibilitychange', () => {
@@ -85765,6 +85985,10 @@ function getVisibleChatStackEl(id) {
 			merged.push(item);
 		});
 		window.userNotificationItems = window.trimPsnServerLimitedArray(merged, 'socialHistory');
+		if (typeof window.scheduleSeenChatNotificationConsumption === 'function') {
+			window.scheduleSeenChatNotificationConsumption('global', { force:true });
+			window.scheduleSeenChatNotificationConsumption('private', { force:true });
+		}
 		return window.userNotificationItems;
 	};
 

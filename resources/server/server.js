@@ -2611,6 +2611,9 @@ async function initDb() {
     CREATE INDEX IF NOT EXISTS idx_user_notifications_private_message_id
       ON user_notifications ((data->>'messageId'))
       WHERE event_type = 'private_message';
+    CREATE INDEX IF NOT EXISTS idx_user_notifications_chat_target
+      ON user_notifications (user_name, event_type, (data->>'messageId'))
+      WHERE event_type IN ('mention', 'reply', 'reaction', 'private_message');
     CREATE TABLE IF NOT EXISTS user_notification_read_state (
       user_name TEXT PRIMARY KEY,
       last_read_id BIGINT NOT NULL DEFAULT 0,
@@ -3468,8 +3471,8 @@ function normalizeUserRecord(name, userData = {}) {
   return normalized;
 }
 
-const PROFILE_NOTIFICATION_STATE_VERSION = 1;
-const PROFILE_NOTIFICATION_CATEGORIES = new Set(['downloads', 'wishlist', 'favorites', 'trophies']);
+const PROFILE_NOTIFICATION_STATE_VERSION = 2;
+const PROFILE_NOTIFICATION_CATEGORIES = new Set(['downloads', 'wishlist', 'favorites', 'trophies', 'admin']);
 
 function normalizeProfileNotificationPendingItemsServer(value) {
   const source = Array.isArray(value) ? value : [];
@@ -9508,6 +9511,9 @@ async function initProfileSyncNotifications() {
         if (data.deleted && data.deleted.userName) {
           emitUserNotificationDeletedToLocalUser(data.deleted.userName, data.deleted.notificationId, data.deleted.unreadCount);
         }
+        if (data.consumed && data.consumed.userName) {
+          emitUserNotificationsConsumedToLocalUser(data.consumed.userName, data.consumed.notificationIds, data.consumed.unreadCount);
+        }
         if (data.cleared && data.cleared.userName) {
           emitUserNotificationsClearedToLocalUser(data.cleared.userName, data.cleared.throughId, data.cleared.unreadCount);
         }
@@ -10507,6 +10513,19 @@ function emitUserNotificationDeletedToLocalUser(userName, notificationId, unread
   });
 }
 
+function emitUserNotificationsConsumedToLocalUser(userName, notificationIds, unreadCount = 0, excludeSocketId = '') {
+  const name = normalizeSocialUserName(userName);
+  const ids = Array.from(new Set((Array.isArray(notificationIds) ? notificationIds : [notificationIds])
+    .map(id => String(id || '').trim())
+    .filter(id => /^\d+$/.test(id))));
+  const excluded = String(excludeSocketId || '').trim();
+  if (!name || !ids.length) return;
+  const payload = { userName:name, notificationIds:ids, unreadCount:Math.max(0, Math.floor(Number(unreadCount) || 0)) };
+  getSocketsByUserName(name).forEach(client => {
+    if (client && client.connected && (!excluded || client.id !== excluded)) client.emit('user_notifications_consumed', payload);
+  });
+}
+
 function emitUserNotificationsClearedToLocalUser(userName, throughId = 0, unreadCount = 0, excludeSocketId = '') {
   const name = normalizeSocialUserName(userName);
   const excluded = String(excludeSocketId || '').trim();
@@ -10577,6 +10596,22 @@ async function notifyUserNotificationDeletedAcrossInstances(userName, notificati
     })]);
   } catch (err) {
     console.error('[NOTIFICATION DELETE SYNC ERROR]:', err);
+  }
+}
+
+async function notifyUserNotificationsConsumedAcrossInstances(userName, notificationIds, unreadCount = 0) {
+  const name = normalizeSocialUserName(userName);
+  const ids = Array.from(new Set((Array.isArray(notificationIds) ? notificationIds : [notificationIds])
+    .map(id => String(id || '').trim())
+    .filter(id => /^\d+$/.test(id))));
+  if (!name || !ids.length) return;
+  try {
+    await pool.query('SELECT pg_notify($1, $2)', ['user_notification_sync', JSON.stringify({
+      consumed: { userName:name, notificationIds:ids, unreadCount:Math.max(0, Number(unreadCount) || 0) },
+      instanceId: INSTANCE_ID
+    })]);
+  } catch (err) {
+    console.error('[NOTIFICATION CONSUME SYNC ERROR]:', err);
   }
 }
 
@@ -10858,6 +10893,30 @@ async function deleteUserNotification(userName, notificationId) {
   );
   const unreadCount = await getUserNotificationUnreadCount(name);
   return { deleted: !!result.rows[0], notificationId: id, unreadCount };
+}
+
+async function consumeUserChatNotifications(userName, scope, messageIds = []) {
+  const name = normalizeSocialUserName(userName);
+  const safeScope = normalizeText(scope, '').toLowerCase();
+  const ids = Array.from(new Set((Array.isArray(messageIds) ? messageIds : [messageIds])
+    .map(id => normalizeText(id, '').slice(0, 100))
+    .filter(Boolean))).slice(0, 40);
+  if (!name || !ids.length || !['global', 'private'].includes(safeScope)) return { notificationIds:[], unreadCount:await getUserNotificationUnreadCount(name) };
+  const typeClause = safeScope === 'private'
+    ? `event_type = 'private_message'`
+    : `event_type IN ('mention', 'reply', 'reaction')`;
+  const result = await queryDbWithRetry(
+    `DELETE FROM user_notifications
+     WHERE user_name = $1
+       AND ${typeClause}
+       AND data->>'messageId' = ANY($2::text[])
+     RETURNING id`,
+    [name, ids],
+    { attempts:2, label:'CHAT NOTIFICATION CONSUME' }
+  );
+  const notificationIds = (result.rows || []).map(row => String(row && row.id || '')).filter(Boolean);
+  const unreadCount = await getUserNotificationUnreadCount(name);
+  return { notificationIds, unreadCount };
 }
 
 async function clearUserNotifications(userName, throughId = 0) {
@@ -12396,6 +12455,7 @@ io.on('connection', (socket) => {
 
     const category = normalizeText(payload.category, '').toLowerCase();
     if (!PROFILE_NOTIFICATION_CATEGORIES.has(category)) { respond({ ok: false, error: 'Invalid notification category.' }); return; }
+    if (category === 'admin' && !isUserAdmin(name, userDatabase[name])) { respond({ ok: false, error: 'Admin notification state is not available.' }); return; }
 
     const categoryPatch = {
       mutationId: normalizeText(payload.mutationId, '').slice(0, 96),
@@ -12960,6 +13020,23 @@ io.on('connection', (socket) => {
     } catch (err) {
       console.error('[USER NOTIFICATION DELETE ERROR]:', err && err.message ? err.message : err);
       respond({ ok: false, unreadCount: 0, error: 'Could not delete the notification.' });
+    }
+  });
+
+  socket.on('user_notifications_consume_chat', async (data = {}, ack) => {
+    const respond = payload => { if (typeof ack === 'function' && socket.connected) { try { ack(payload); } catch (err) {} } };
+    const name = socket.userName;
+    if (!name || !userDatabase[name]) { respond({ ok:false, notificationIds:[], unreadCount:0 }); return; }
+    try {
+      const result = await consumeUserChatNotifications(name, data && data.scope, data && data.messageIds);
+      if (result.notificationIds.length) {
+        emitUserNotificationsConsumedToLocalUser(name, result.notificationIds, result.unreadCount, socket.id);
+        deferServerTask('CHAT NOTIFICATION CONSUME SYNC', () => notifyUserNotificationsConsumedAcrossInstances(name, result.notificationIds, result.unreadCount), 0);
+      }
+      respond({ ok:true, scope:String(data && data.scope || '').toLowerCase(), messageIds:Array.isArray(data && data.messageIds) ? data.messageIds.slice(0, 40) : [], notificationIds:result.notificationIds, unreadCount:result.unreadCount });
+    } catch (err) {
+      console.error('[CHAT NOTIFICATION CONSUME ERROR]:', err && err.message ? err.message : err);
+      respond({ ok:false, notificationIds:[], unreadCount:0 });
     }
   });
 
