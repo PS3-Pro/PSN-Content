@@ -4221,13 +4221,52 @@ function buildCompactSettingsData(user = {}) {
 
 function buildCompactCountersData(value = {}) {
   const source = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+  const rawDownloadStats = source.downloadStats && typeof source.downloadStats === 'object' && !Array.isArray(source.downloadStats) ? source.downloadStats : {};
+  const downloadRegions = Array.from(new Set((Array.isArray(rawDownloadStats.regions) ? rawDownloadStats.regions : [])
+    .map(region => normalizeText(region, '').toUpperCase())
+    .filter(region => ['US', 'EU', 'JP', 'ASIA'].includes(region))));
   return {
     msgs: source.msgs || '0',
     imgs: source.imgs || '0',
     reactions: source.reactions || '0',
     trailers: source.trailers || '0',
     days: source.days || '[]',
+    downloadStats: {
+      count: Math.max(0, Math.floor(Number(rawDownloadStats.count) || 0)),
+      bytes: Math.max(0, Number(rawDownloadStats.bytes) || 0),
+      regions: downloadRegions
+    },
     lastChatRead: source.lastChatRead || 0
+  };
+}
+
+function normalizeCounterDayList(value) {
+  if (Array.isArray(value)) return Array.from(new Set(value.map(day => normalizeText(day, '')).filter(Boolean)));
+  try {
+    const parsed = JSON.parse(String(value || '[]'));
+    return Array.isArray(parsed) ? Array.from(new Set(parsed.map(day => normalizeText(day, '')).filter(Boolean))) : [];
+  } catch (err) {
+    return [];
+  }
+}
+
+function mergeProfileCountersData(currentValue = {}, incomingValue = {}) {
+  const current = buildCompactCountersData(currentValue);
+  const incoming = buildCompactCountersData(incomingValue);
+  const regions = Array.from(new Set([...(current.downloadStats.regions || []), ...(incoming.downloadStats.regions || [])]));
+  const days = Array.from(new Set([...normalizeCounterDayList(current.days), ...normalizeCounterDayList(incoming.days)]));
+  return {
+    msgs: String(Math.max(0, Number(current.msgs) || 0, Number(incoming.msgs) || 0)),
+    imgs: String(Math.max(0, Number(current.imgs) || 0, Number(incoming.imgs) || 0)),
+    reactions: String(Math.max(0, Number(current.reactions) || 0, Number(incoming.reactions) || 0)),
+    trailers: String(Math.max(0, Number(current.trailers) || 0, Number(incoming.trailers) || 0)),
+    days: JSON.stringify(days),
+    downloadStats: {
+      count: Math.max(0, Number(current.downloadStats.count) || 0, Number(incoming.downloadStats.count) || 0),
+      bytes: Math.max(0, Number(current.downloadStats.bytes) || 0, Number(incoming.downloadStats.bytes) || 0),
+      regions
+    },
+    lastChatRead: Math.max(0, Number(current.lastChatRead) || 0, Number(incoming.lastChatRead) || 0)
   };
 }
 
@@ -9040,7 +9079,7 @@ function buildFullProfileSyncPayload(name, user = {}, sourceSocketId = null, opt
       recentlyVisitedData: normalizeRecentlyVisitedRecordsServer(safe.recentlyVisitedData),
       recentlyVisitedUpdatedAt: normalizeTimestampValue(safe.recentlyVisitedUpdatedAt),
       ...(notificationState ? { notificationState } : {}),
-      countersData: safe.countersData || {},
+      countersData: buildCompactCountersData(safe.countersData),
       themeColor: normalizeThemeColorServer(safe.themeColor || (safe.settingsData && safe.settingsData.themeColor) || '#0070cc'),
       themeColorUpdatedAt: getUserThemeColorUpdatedAt(safe),
       settingsData: { ...normalizeProfileRealtimeSettings(safe.settingsData || {}), ...getPublicProfileSettings(safe) }
@@ -9109,7 +9148,7 @@ function buildProfileSyncPatchPayload(name, user = {}, changedKeys = [], sourceS
     const notificationState = getProfileNotificationStatePayloadServer(user);
     if (notificationState) target.notificationState = notificationState;
   }
-  if (include('countersData')) target.countersData = user.countersData || {};
+  if (include('countersData')) target.countersData = buildCompactCountersData(user.countersData);
   if (include('themeColor')) target.themeColor = normalizeThemeColorServer(user.themeColor || (user.settingsData && user.settingsData.themeColor) || '#0070cc');
   if (include('themeColorUpdatedAt')) target.themeColorUpdatedAt = getUserThemeColorUpdatedAt(user);
   if (include('settingsData')) target.settingsData = { ...normalizeProfileRealtimeSettings(user.settingsData || {}), ...getPublicProfileSettings(user) };
@@ -12253,7 +12292,7 @@ io.on('connection', (socket) => {
           libraryData: safeUserData.libraryData || [],
           friendsData: safeUserData.friendsData || [],
           notificationState: normalizeProfileNotificationStateServer({}),
-          countersData: safeUserData.countersData || {},
+          countersData: buildCompactCountersData(safeUserData.countersData),
           themeColor: safeUserData.themeColor || '#0070cc',
           role: isAdmin ? "admin" : "user",
           banned: false,
@@ -12631,6 +12670,10 @@ io.on('connection', (socket) => {
             socket.emit('auth_error', 'This account is banned.');
             respond({ ok: false, requestId: syncRequestId, error: 'This account is banned.' });
             return;
+        }
+
+        if (userData.countersData && typeof userData.countersData === 'object' && !Array.isArray(userData.countersData)) {
+            userData.countersData = mergeProfileCountersData(workingUser.countersData || {}, userData.countersData);
         }
 
         if (hasObjectPayload(userData.trophiesData)) {

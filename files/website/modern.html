@@ -13048,7 +13048,7 @@ P
 	
 			const keysToClear = [
 				'psn_user_trophies', COOKIE_NAME_HISTORY, STORAGE_KEY_WISHLIST, 
-				'psn_accessed_days', STORAGE_KEY_FAVS, 'psn_trailers_watched', STORAGE_KEY_AUDIO, 
+				'psn_accessed_days', 'psn_download_trophy_stats', STORAGE_KEY_FAVS, 'psn_trailers_watched', STORAGE_KEY_AUDIO, 
 				STORAGE_KEY_UX, STORAGE_KEY_CHAT_SOUND, STORAGE_KEY_DIRECT_CHAT_SOUND, STORAGE_KEY_HAPTIC_FEEDBACK, STORAGE_KEY_CARD_BLUR, STORAGE_KEY_COLLECTION_MEMORY_OPTIMIZATION, 'psn_last_chat_read', 
 				'psn_chat_dot', 'psn_dl_dot', 'psn_wish_dot', 'psn_wish_dot_items', 'psn_trophy_dot', 'psn_fav_dot', 'psn_fav_dot_items',
 				'psn_avatar', 'psn_theme_color', STORAGE_KEY_THEME_COLOR_UPDATED_AT, STORAGE_KEY_PROFILE_COUNTRY
@@ -15236,7 +15236,7 @@ P
 			const existing = grouped[existingIndex];
 			existing.downloadCount = getDownloadHistoryItemCount(existing) + itemCount;
 
-			['titleId', 'contentId', 'cleanName', 'name', 'cTag', 'console', 'rawCategory', 'cover'].forEach(key => {
+			['titleId', 'contentId', 'cleanName', 'name', 'cTag', 'console', 'region', 'rawCategory', 'cover'].forEach(key => {
 				if (!existing[key] && item[key]) existing[key] = item[key];
 			});
 			if (item.noBingCover === true) existing.noBingCover = true;
@@ -36970,6 +36970,7 @@ P
 		saveState('psn_trailers_watched', watchedTrailers);
 		checkTrophyProgress('trailer_10', watchedTrailers);
 		checkTrophyProgress('trailer_50', watchedTrailers);
+		if (typeof window.queueTrophyCounterProfileSync === 'function') window.queueTrophyCounterProfileSync();
 
 		const safeName = gameName || 'Game';
 		trailerOpenShell(safeName);
@@ -37726,6 +37727,7 @@ P
     
         const resolvedCategory = (typeof window.getProfileListItemCategory === 'function' ? window.getProfileListItemCategory({ id: titleId, titleId, name: normalizedFileName, category, contentId }, 'downloads') : category);
         const storeItem = (typeof window.getDownloadCoverData === 'function') ? window.getDownloadCoverData({ id: titleId, titleId, name: normalizedFileName, category: resolvedCategory, contentId }, resolvedCategory, 'downloads') : null;
+        const sourceGame = (typeof currentData !== 'undefined' && Array.isArray(currentData)) ? currentData.find(item => item && item.id === titleId) : null;
         const downloadStartedAt = Date.now();
         const entry = {
             id: downloadStartedAt,
@@ -37737,6 +37739,7 @@ P
             cleanName: (storeItem && storeItem.cleanName) ? storeItem.cleanName : normalizedFileName,
             cTag: (storeItem && storeItem.cTag) ? storeItem.cTag : 'ps3',
             console: (storeItem && storeItem.cTag) ? storeItem.cTag : 'ps3',
+            region: String((storeItem && storeItem.region) || (sourceGame && sourceGame.region) || '').trim().toUpperCase(),
             name: normalizedFileName,
             sentToPs3: isRemoteDownload,
             sizeBytes: sizeBytes || 0,
@@ -37822,52 +37825,55 @@ P
             saveState('psn_dl_dot', 'true');
         }
         
-        const totalDownloads = downloadHistory.length; 
-        const totalBytes = downloadHistory.reduce((acc, item) => acc + (item.sizeBytes || 0), 0);
+        const downloadTrophyStats = typeof window.getDownloadTrophyStats === 'function'
+            ? window.getDownloadTrophyStats({ persist:true })
+            : {
+                count: downloadHistory.reduce((sum, item) => sum + (typeof getDownloadHistoryItemCount === 'function' ? getDownloadHistoryItemCount(item) : Math.max(1, Number(item && item.downloadCount) || 1)), 0),
+                bytes: downloadHistory.reduce((sum, item) => {
+                    const count = typeof getDownloadHistoryItemCount === 'function' ? getDownloadHistoryItemCount(item) : Math.max(1, Number(item && item.downloadCount) || 1);
+                    return sum + Math.max(0, Number(item && item.sizeBytes) || 0) * count;
+                }, 0),
+                regions: []
+            };
         
-        checkTrophyProgress('download_1', totalDownloads);
-        checkTrophyProgress('download_10', totalDownloads);
-        checkTrophyProgress('download_50', totalDownloads);
-        checkTrophyProgress('download_gb', totalBytes);
-        checkTrophyProgress('download_50gb', totalBytes);
-        checkTrophyProgress('download_500gb', totalBytes);
+        window.checkCumulativeTrophyProgress('download_1', downloadTrophyStats.count);
+        window.checkCumulativeTrophyProgress('download_10', downloadTrophyStats.count);
+        window.checkCumulativeTrophyProgress('download_50', downloadTrophyStats.count);
+        window.checkCumulativeTrophyProgress('download_50gb', downloadTrophyStats.bytes);
+        window.checkCumulativeTrophyProgress('download_500gb', downloadTrophyStats.bytes);
         
-        const game = currentData.find(g => g.id === titleId);
+        const game = sourceGame;
         if (game) {
             const consoleType = game.cTag;
-            if (consoleType === 'ps1' || consoleType === 'psx') checkTrophyProgress('dl_ps1', 1);
-            if (consoleType === 'ps2') checkTrophyProgress('dl_ps2', 1);
-            if (consoleType === 'psp') checkTrophyProgress('dl_psp', 1);
-            if (consoleType === 'minis') checkTrophyProgress('dl_minis', 1);
-            if (consoleType === 'neogeo') checkTrophyProgress('dl_neogeo', 1);
-            if (consoleType === 'pce') checkTrophyProgress('dl_pce', 1);
+            if (consoleType === 'ps1' || consoleType === 'psx') window.checkCumulativeTrophyProgress('dl_ps1', 1);
+            if (consoleType === 'ps2') window.checkCumulativeTrophyProgress('dl_ps2', 1);
+            if (consoleType === 'psp') window.checkCumulativeTrophyProgress('dl_psp', 1);
+            if (consoleType === 'minis') window.checkCumulativeTrophyProgress('dl_minis', 1);
+            if (consoleType === 'neogeo') window.checkCumulativeTrophyProgress('dl_neogeo', 1);
+            if (consoleType === 'pce') window.checkCumulativeTrophyProgress('dl_pce', 1);
         }
         
         if (category === 'dlcs') {
             const dlcCount = downloadHistory.filter(dl => dl.category === 'dlcs').length;
-            checkTrophyProgress('dl_dlc_10', dlcCount);
+            window.checkCumulativeTrophyProgress('dl_dlc_10', dlcCount);
         }
     
         if (category === 'avatars') {
             const avatarCount = downloadHistory.filter(dl => dl.category === 'avatars').length;
-            checkTrophyProgress('dl_avatar_10', avatarCount);
+            window.checkCumulativeTrophyProgress('dl_avatar_10', avatarCount);
         }
         
         if (category === 'homebrew_games' || category === 'ports') {
             const hbCount = downloadHistory.filter(dl => dl.category === 'homebrew_games' || dl.category === 'ports').length;
-            checkTrophyProgress('dl_homebrew', hbCount);
+            window.checkCumulativeTrophyProgress('dl_homebrew', hbCount);
         }
         
         if (category === 'themes') {
             const themeCount = downloadHistory.filter(dl => dl.category === 'themes').length;
-            checkTrophyProgress('dl_theme', themeCount);
+            window.checkCumulativeTrophyProgress('dl_theme', themeCount);
         }
         
-        const downloadedRegions = new Set(downloadHistory.map(dl => {
-            const g = currentData.find(item => item.id === dl.titleId);
-            return g ? g.region : null;
-        }).filter(r => ['US', 'EU', 'JP', 'ASIA'].includes(r)));
-        checkTrophyProgress('globe_trotter', downloadedRegions.size);
+        window.checkCumulativeTrophyProgress('globe_trotter', (downloadTrophyStats.regions || []).length);
     
         updateDownloadUI();
         if (isPsnDomSectionVisible('view-downloads')) scheduleDownloadNewStateClear(5000);
@@ -52561,7 +52567,8 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 				if (typeof window.refreshStoreInstalledChecks === 'function') window.refreshStoreInstalledChecks();
 				shouldRepaintLocalLibrary = previousSignature !== getLocalLibraryDataSignature(lastScannedGames);
 				if (shouldRepaintLocalLibrary) markProfileListChanged('library');
-			}
+				if (typeof window.checkLocalLibraryTrophyProgress === 'function') window.checkLocalLibraryTrophyProgress();
+				}
 	
 			if (!refreshStillCurrent()) return;
 			let shouldCommitLibraryDom = libraryGamesVisibleNow();
@@ -60824,7 +60831,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 		download_50: { id: 'download_50', title: 'Dedicated Server', desc: 'Download a total of 50 files.', type: 'gold', max: 50, group: 'Downloads & Content' },
 		download_50gb: { id: 'download_50gb', title: 'Heavyweight', desc: 'Download a total of 50 GB of data.', type: 'silver', max: 53687091200, group: 'Downloads & Content' },
 		download_500gb: { id: 'download_500gb', title: 'Extreme Broadband', desc: 'Download a total of 500 GB of data.', type: 'gold', max: 536870912000, group: 'Downloads & Content' },
-		globe_trotter: { id: 'globe_trotter', title: 'Globe Trotter', desc: 'Download at least one item from each region (US, EU, JP, ASIA).', type: 'gold', max: 3, group: 'Downloads & Content' },
+		globe_trotter: { id: 'globe_trotter', title: 'Globe Trotter', desc: 'Download at least one item from each region (US, EU, JP, ASIA).', type: 'gold', max: 4, group: 'Downloads & Content' },
 		dl_ps1: { id: 'dl_ps1', title: 'Retro Roots', desc: 'Download a PS1™ Classic.', type: 'bronze', max: 1, group: 'Downloads & Content' },
 		dl_ps2: { id: 'dl_ps2', title: 'The Golden Era', desc: 'Download a PS2™ Classic.', type: 'bronze', max: 1, group: 'Downloads & Content' },
 		dl_psp: { id: 'dl_psp', title: 'Portable Power', desc: 'Download a PSP™ game.', type: 'bronze', max: 1, group: 'Downloads & Content' },
@@ -61097,22 +61104,283 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 		}
 	};
 
+	const STORAGE_KEY_DOWNLOAD_TROPHY_STATS = 'psn_download_trophy_stats';
+	const DOWNLOAD_TROPHY_REGIONS = new Set(['US', 'EU', 'JP', 'ASIA']);
+
+	function normalizeTrophyCounter(value) {
+		const number = Number(value);
+		return Number.isFinite(number) && number > 0 ? Math.floor(number) : 0;
+	}
+
+	function parseAccessedTrophyDays(value) {
+		if (Array.isArray(value)) return Array.from(new Set(value.map(day => String(day || '').trim()).filter(Boolean)));
+		try {
+			const parsed = JSON.parse(String(value || '[]'));
+			return Array.isArray(parsed) ? Array.from(new Set(parsed.map(day => String(day || '').trim()).filter(Boolean))) : [];
+		} catch (e) {
+			return [];
+		}
+	}
+
+	function getLocalTrophyDayKey(date = new Date()) {
+		const year = date.getFullYear();
+		const month = String(date.getMonth() + 1).padStart(2, '0');
+		const day = String(date.getDate()).padStart(2, '0');
+		return `${year}-${month}-${day}`;
+	}
+	window.getLocalTrophyDayKey = getLocalTrophyDayKey;
+
+	function normalizeDownloadTrophyStats(value = {}) {
+		let source = value;
+		if (typeof source === 'string') {
+			try { source = JSON.parse(source); } catch (e) { source = {}; }
+		}
+		if (!source || typeof source !== 'object' || Array.isArray(source)) source = {};
+		const regions = Array.from(new Set((Array.isArray(source.regions) ? source.regions : [])
+			.map(region => String(region || '').trim().toUpperCase())
+			.filter(region => DOWNLOAD_TROPHY_REGIONS.has(region))));
+		return {
+			count: normalizeTrophyCounter(source.count),
+			bytes: Math.max(0, Number(source.bytes) || 0),
+			regions
+		};
+	}
+
+	function deriveDownloadTrophyStatsFromHistory(history = window.downloadHistory) {
+		const source = Array.isArray(history) ? history : [];
+		let count = 0;
+		let bytes = 0;
+		const regions = new Set();
+		for (const item of source) {
+			if (!item || typeof item !== 'object') continue;
+			const itemCount = typeof getDownloadHistoryItemCount === 'function' ? getDownloadHistoryItemCount(item) : Math.max(1, normalizeTrophyCounter(item.downloadCount));
+			const sizeBytes = Math.max(0, Number(item.sizeBytes) || 0);
+			count += itemCount;
+			bytes += sizeBytes * itemCount;
+			let region = String(item.region || '').trim().toUpperCase();
+			if (!DOWNLOAD_TROPHY_REGIONS.has(region) && typeof currentData !== 'undefined' && Array.isArray(currentData)) {
+				const titleId = String(item.titleId || item.id || '').trim();
+				const game = titleId ? currentData.find(entry => String(entry && entry.id || '').trim() === titleId) : null;
+				region = String(game && game.region || '').trim().toUpperCase();
+			}
+			if (DOWNLOAD_TROPHY_REGIONS.has(region)) regions.add(region);
+		}
+		return { count, bytes, regions:Array.from(regions) };
+	}
+
+	function mergeDownloadTrophyStats(...values) {
+		let count = 0;
+		let bytes = 0;
+		const regions = new Set();
+		for (const value of values) {
+			const stats = normalizeDownloadTrophyStats(value);
+			count = Math.max(count, stats.count);
+			bytes = Math.max(bytes, stats.bytes);
+			stats.regions.forEach(region => regions.add(region));
+		}
+		return { count, bytes, regions:Array.from(regions) };
+	}
+
+	window.getDownloadTrophyStats = function(options = {}) {
+		const stored = normalizeDownloadTrophyStats(loadState(STORAGE_KEY_DOWNLOAD_TROPHY_STATS) || '{}');
+		const derived = deriveDownloadTrophyStatsFromHistory();
+		const merged = mergeDownloadTrophyStats(stored, derived, options.extra || {});
+		const nextSerialized = JSON.stringify(merged);
+		if (options.persist !== false && loadState(STORAGE_KEY_DOWNLOAD_TROPHY_STATS) !== nextSerialized) saveState(STORAGE_KEY_DOWNLOAD_TROPHY_STATS, nextSerialized);
+		return merged;
+	};
+
+	window.mergeIncomingDownloadTrophyStats = function(username, incomingStats) {
+		const name = String(username || '').trim();
+		if (!name || name === 'null') return normalizeDownloadTrophyStats(incomingStats);
+		const storageKey = `${name}_${STORAGE_KEY_DOWNLOAD_TROPHY_STATS}`;
+		const localStats = normalizeDownloadTrophyStats(localStorage.getItem(storageKey) || '{}');
+		const derived = name === String(localStorage.getItem('psn_username') || '').trim() ? deriveDownloadTrophyStatsFromHistory() : {};
+		const merged = mergeDownloadTrophyStats(localStats, incomingStats, derived);
+		safeLocalStorageSet(storageKey, JSON.stringify(merged));
+		return merged;
+	};
+
+	window.mergeIncomingTrophyCountersForUser = function(username, counters = {}) {
+		const name = String(username || '').trim();
+		if (!name || name === 'null' || !counters || typeof counters !== 'object') return false;
+		let shouldSyncBack = false;
+		const mergeNumericCounter = (suffix, incomingValue) => {
+			const key = `${name}_${suffix}`;
+			const localValue = normalizeTrophyCounter(localStorage.getItem(key));
+			const incoming = normalizeTrophyCounter(incomingValue);
+			const merged = Math.max(localValue, incoming);
+			if (merged > incoming) shouldSyncBack = true;
+			safeLocalStorageSet(key, String(merged));
+		};
+		mergeNumericCounter('psn_chat_msgs_sent', counters.msgs);
+		mergeNumericCounter('psn_chat_imgs_sent', counters.imgs);
+		mergeNumericCounter('psn_chat_reactions_given', counters.reactions);
+		mergeNumericCounter('psn_trailers_watched', counters.trailers);
+		const dayKey = `${name}_psn_accessed_days`;
+		const localDays = parseAccessedTrophyDays(localStorage.getItem(dayKey));
+		const incomingDays = parseAccessedTrophyDays(counters.days);
+		const mergedDays = Array.from(new Set([...localDays, ...incomingDays]));
+		if (mergedDays.length > incomingDays.length) shouldSyncBack = true;
+		safeLocalStorageSet(dayKey, JSON.stringify(mergedDays));
+		if (typeof window.mergeIncomingDownloadTrophyStats === 'function') {
+			const incomingDownloadStats = normalizeDownloadTrophyStats(counters.downloadStats || {});
+			const mergedDownloadStats = window.mergeIncomingDownloadTrophyStats(name, incomingDownloadStats);
+			if (mergedDownloadStats.count > incomingDownloadStats.count || mergedDownloadStats.bytes > incomingDownloadStats.bytes || mergedDownloadStats.regions.some(region => !incomingDownloadStats.regions.includes(region))) shouldSyncBack = true;
+		}
+		if (counters.lastChatRead) {
+			const readKey = `${name}_psn_last_chat_read`;
+			const localRead = Math.max(0, Number(localStorage.getItem(readKey)) || 0);
+			const incomingRead = Math.max(0, Number(counters.lastChatRead) || 0);
+			const mergedRead = Math.max(localRead, incomingRead);
+			if (mergedRead > incomingRead) shouldSyncBack = true;
+			safeLocalStorageSet(readKey, String(mergedRead));
+		}
+		if (shouldSyncBack && name === String(localStorage.getItem('psn_username') || '').trim()) window.__pendingTrophyCounterSyncAfterHydration = true;
+		return true;
+	};
+
+	window.checkCumulativeTrophyProgress = function(trophyId, currentAmount) {
+		if (typeof window.checkTrophyProgress !== 'function') return false;
+		const existing = Math.max(0, Number(window.userTrophies && window.userTrophies[trophyId] && window.userTrophies[trophyId].progress) || 0);
+		window.checkTrophyProgress(trophyId, Math.max(existing, Math.max(0, Number(currentAmount) || 0)));
+		return true;
+	};
+
+	function getCurrentLibraryGamesForTrophies() {
+		return Array.isArray(window.lastScannedGames)
+			? window.lastScannedGames
+			: ((typeof lastScannedGames !== 'undefined' && Array.isArray(lastScannedGames)) ? lastScannedGames : []);
+	}
+
+	window.checkLocalLibraryTrophyProgress = function() {
+		if (window.__trophiesHydrated !== true || typeof window.checkTrophyProgress !== 'function') return false;
+		window.checkTrophyProgress('lib_50', getCurrentLibraryGamesForTrophies().length);
+		return true;
+	};
+
+	window.reconcileDeterministicTrophyProgress = function() {
+		if (window.__trophiesHydrated !== true || typeof window.checkTrophyProgress !== 'function') return false;
+		const myName = String(localStorage.getItem('psn_username') || '').trim();
+		if (!myName || myName === 'null') return false;
+
+		const wishlistCount = Array.isArray(window.wishlist) ? window.wishlist.length : 0;
+		window.checkTrophyProgress('wishlist_1', wishlistCount);
+		window.checkTrophyProgress('wishlist_10', wishlistCount);
+		window.checkTrophyProgress('wishlist_50', wishlistCount);
+
+		const favoriteCount = Array.isArray(window.favoritesLibrary) ? window.favoritesLibrary.length : 0;
+		window.checkTrophyProgress('fav_1', favoriteCount);
+		window.checkTrophyProgress('fav_10', favoriteCount);
+		window.checkTrophyProgress('lib_50', getCurrentLibraryGamesForTrophies().length);
+
+		const friendCount = Array.isArray(window.friendsList) ? window.friendsList.length : 0;
+		window.checkTrophyProgress('friend_1', friendCount);
+		window.checkTrophyProgress('friend_10', friendCount);
+		window.checkTrophyProgress('friend_25', friendCount);
+
+		const messageCount = normalizeTrophyCounter(localStorage.getItem(`${myName}_psn_chat_msgs_sent`));
+		const mediaCount = normalizeTrophyCounter(localStorage.getItem(`${myName}_psn_chat_imgs_sent`));
+		const reactionCount = normalizeTrophyCounter(localStorage.getItem(`${myName}_psn_chat_reactions_given`));
+		const trailerCount = normalizeTrophyCounter(localStorage.getItem(`${myName}_psn_trailers_watched`));
+		window.checkCumulativeTrophyProgress('chat_first', messageCount);
+		window.checkCumulativeTrophyProgress('chat_active', messageCount);
+		window.checkCumulativeTrophyProgress('chat_media', mediaCount);
+		window.checkCumulativeTrophyProgress('chat_reaction_first', reactionCount);
+		window.checkCumulativeTrophyProgress('chat_reaction', reactionCount);
+		window.checkCumulativeTrophyProgress('trailer_10', trailerCount);
+		window.checkCumulativeTrophyProgress('trailer_50', trailerCount);
+
+		const accessedDays = parseAccessedTrophyDays(localStorage.getItem(`${myName}_psn_accessed_days`));
+		window.checkCumulativeTrophyProgress('usage_1', accessedDays.length);
+		window.checkCumulativeTrophyProgress('usage_7', accessedDays.length);
+		window.checkCumulativeTrophyProgress('usage_14', accessedDays.length);
+
+		const downloadStats = window.getDownloadTrophyStats({ persist:true });
+		window.checkCumulativeTrophyProgress('download_1', downloadStats.count);
+		window.checkCumulativeTrophyProgress('download_10', downloadStats.count);
+		window.checkCumulativeTrophyProgress('download_50', downloadStats.count);
+		window.checkCumulativeTrophyProgress('download_50gb', downloadStats.bytes);
+		window.checkCumulativeTrophyProgress('download_500gb', downloadStats.bytes);
+		window.checkCumulativeTrophyProgress('globe_trotter', downloadStats.regions.length);
+
+		const history = Array.isArray(window.downloadHistory) ? window.downloadHistory : [];
+		const countCategory = category => history.filter(item => String(item && item.category || '').toLowerCase() === category).length;
+		window.checkCumulativeTrophyProgress('dl_dlc_10', countCategory('dlcs'));
+		window.checkCumulativeTrophyProgress('dl_avatar_10', countCategory('avatars'));
+		window.checkCumulativeTrophyProgress('dl_homebrew', history.filter(item => ['homebrew_games', 'ports'].includes(String(item && item.category || '').toLowerCase())).length);
+		window.checkCumulativeTrophyProgress('dl_theme', countCategory('themes'));
+
+		const downloadedConsoleTypes = new Set();
+		for (const item of history) {
+			if (!item) continue;
+			let type = String(item.cTag || item.console || '').trim().toLowerCase();
+			if (!['ps1', 'psx', 'ps2', 'psp', 'minis', 'neogeo', 'pce'].includes(type) && typeof currentData !== 'undefined' && Array.isArray(currentData)) {
+				const titleId = String(item.titleId || item.id || '').trim();
+				const game = titleId ? currentData.find(entry => String(entry && entry.id || '').trim() === titleId) : null;
+				type = String(game && game.cTag || '').trim().toLowerCase();
+			}
+			if (type) downloadedConsoleTypes.add(type);
+		}
+		if (downloadedConsoleTypes.has('ps1') || downloadedConsoleTypes.has('psx')) window.checkCumulativeTrophyProgress('dl_ps1', 1);
+		if (downloadedConsoleTypes.has('ps2')) window.checkCumulativeTrophyProgress('dl_ps2', 1);
+		if (downloadedConsoleTypes.has('psp')) window.checkCumulativeTrophyProgress('dl_psp', 1);
+		if (downloadedConsoleTypes.has('minis')) window.checkCumulativeTrophyProgress('dl_minis', 1);
+		if (downloadedConsoleTypes.has('neogeo')) window.checkCumulativeTrophyProgress('dl_neogeo', 1);
+		if (downloadedConsoleTypes.has('pce')) window.checkCumulativeTrophyProgress('dl_pce', 1);
+		return true;
+	};
+
+	window.scheduleDeterministicTrophyReconciliation = function(delay = 0) {
+		const expectedUser = String(localStorage.getItem('psn_username') || '').trim();
+		if (!expectedUser || expectedUser === 'null') return false;
+		if (window.__deterministicTrophyReconcileTimer) clearTimeout(window.__deterministicTrophyReconcileTimer);
+		window.__deterministicTrophyReconcileTimer = setTimeout(() => {
+			window.__deterministicTrophyReconcileTimer = null;
+			if (String(localStorage.getItem('psn_username') || '').trim() !== expectedUser) return;
+			window.reconcileDeterministicTrophyProgress();
+			if (window.__pendingTrophyCounterSyncAfterHydration === true) {
+				window.__pendingTrophyCounterSyncAfterHydration = false;
+				if (typeof window.queueTrophyCounterProfileSync === 'function') window.queueTrophyCounterProfileSync();
+			}
+		}, Math.max(0, Number(delay) || 0));
+		return true;
+	};
+
+	window.queueTrophyCounterProfileSync = function() {
+		if (window.__applyingRemoteProfileSync || window.__applyingRealtimeSettingsSync || window.__applyingSyncedProfileSettings) return false;
+		if (window.__trophyCounterProfileSyncTimer) clearTimeout(window.__trophyCounterProfileSyncTimer);
+		const expectedUser = String(localStorage.getItem('psn_username') || '').trim();
+		if (!expectedUser || expectedUser === 'null') return false;
+		window.__trophyCounterProfileSyncTimer = setTimeout(() => {
+			window.__trophyCounterProfileSyncTimer = null;
+			if (String(localStorage.getItem('psn_username') || '').trim() !== expectedUser) return;
+			if (typeof window.broadcastProfileUpdate === 'function') window.broadcastProfileUpdate();
+		}, 320);
+		return true;
+	};
+
 	/* Shared Social & Chat trophy progress for Global Chat and Private Chat. */
 	window.recordChatMessageTrophyProgress = function(options = {}) {
+		const myName = String(localStorage.getItem('psn_username') || '').trim();
+		if (!myName || myName === 'null') return 0;
 		const text = String(options.text || '');
 		const mediaCount = Math.max(0, Number(options.mediaCount) || 0);
-		const messagesSent = Math.max(0, parseInt(localStorage.getItem('psn_chat_msgs_sent') || '0', 10) || 0) + 1;
-		safeLocalStorageSet('psn_chat_msgs_sent', String(messagesSent));
+		const messageCounterKey = `${myName}_psn_chat_msgs_sent`;
+		const mediaCounterKey = `${myName}_psn_chat_imgs_sent`;
+		const messagesSent = normalizeTrophyCounter(localStorage.getItem(messageCounterKey)) + 1;
+		safeLocalStorageSet(messageCounterKey, String(messagesSent));
 		if (typeof checkTrophyProgress === 'function') {
 			checkTrophyProgress('chat_first', messagesSent);
 			checkTrophyProgress('chat_active', messagesSent);
 			if (options.mention === true && text.includes('@')) checkTrophyProgress('chat_mention', 1);
 		}
 		if (mediaCount > 0) {
-			const imagesSent = Math.max(0, parseInt(localStorage.getItem('psn_chat_imgs_sent') || '0', 10) || 0) + mediaCount;
-			safeLocalStorageSet('psn_chat_imgs_sent', String(imagesSent));
+			const imagesSent = normalizeTrophyCounter(localStorage.getItem(mediaCounterKey)) + mediaCount;
+			safeLocalStorageSet(mediaCounterKey, String(imagesSent));
 			if (typeof checkTrophyProgress === 'function') checkTrophyProgress('chat_media', imagesSent);
 		}
+		if (typeof window.queueTrophyCounterProfileSync === 'function') window.queueTrophyCounterProfileSync();
 		return messagesSent;
 	};
 
@@ -61126,6 +61394,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 			checkTrophyProgress('chat_reaction_first', reactionsGiven);
 			checkTrophyProgress('chat_reaction', reactionsGiven);
 		}
+		if (typeof window.queueTrophyCounterProfileSync === 'function') window.queueTrophyCounterProfileSync();
 		return reactionsGiven;
 	};
 
@@ -61176,17 +61445,16 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 		const expectedUser = localStorage.getItem('psn_username');
 		if (!expectedUser || expectedUser === "null") return;
 
-		const today = new Date().toISOString().split('T')[0]; 
-		let accessedDays = [];
-		try {
-			let savedDays = loadState('psn_accessed_days');
-			if (savedDays) accessedDays = JSON.parse(savedDays);
-		} catch (e) { accessedDays = []; }
+		const today = getLocalTrophyDayKey(new Date());
+		const accessedDays = parseAccessedTrophyDays(loadState('psn_accessed_days'));
+		let accessedDayAdded = false;
 	
 		if (!accessedDays.includes(today)) {
 			accessedDays.push(today);
 			saveState('psn_accessed_days', JSON.stringify(accessedDays));
+			accessedDayAdded = true;
 		}
+		if (accessedDayAdded && typeof window.queueTrophyCounterProfileSync === 'function') window.queueTrophyCounterProfileSync();
 	
 		const daysCount = accessedDays.length;
 		const hour = new Date().getHours();
@@ -61197,9 +61465,9 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 			const currentUser = localStorage.getItem('psn_username');
 			if (currentUser !== expectedUser) return;
 
-			window.checkTrophyProgress('usage_1', daysCount);
-			window.checkTrophyProgress('usage_7', daysCount);
-			window.checkTrophyProgress('usage_14', daysCount);
+			window.checkCumulativeTrophyProgress('usage_1', daysCount);
+			window.checkCumulativeTrophyProgress('usage_7', daysCount);
+			window.checkCumulativeTrophyProgress('usage_14', daysCount);
 			if (hour >= 0 && hour < 5) window.checkTrophyProgress('night_owl', 1);
 		}, 1500);
 	};
@@ -72246,7 +72514,7 @@ function getVisibleChatStackEl(id) {
 				if (typeof lastScannedGames !== 'undefined') { lastScannedGames = mergedLibraryData; window.lastScannedGames = lastScannedGames; if (typeof window.bumpLibraryCollectionRevision === 'function') window.bumpLibraryCollectionRevision('library'); }
 				safeLocalStorageSet(`${name}_psn_local_library`, JSON.stringify(mergedLibraryData));
 				applyProfileListUpdatedAtFromServer(name, 'library', userData.libraryUpdatedAt);
-			}
+				}
 			if (profileSyncChanges.friends && Array.isArray(userData.friendsData)) { window.friendsList = userData.friendsData; safeLocalStorageSet(`${name}_psn_friends_list`, JSON.stringify(userData.friendsData)); applyProfileListUpdatedAtFromServer(name, 'friends', userData.friendsUpdatedAt); }
 			if (profileSyncChanges.recentlyVisited && Array.isArray(userData.recentlyVisitedData)) {
 				window.recentlyVisitedGames = normalizeRecentlyVisitedGames(userData.recentlyVisitedData);
@@ -72276,14 +72544,8 @@ function getVisibleChatStackEl(id) {
 				if (name === (localStorage.getItem('psn_username') || '')) saveState(STORAGE_KEY_PROFILE_COUNTRY, incomingCountryCode);
 			}
 
-			if (userData.countersData) {
-				safeLocalStorageSet(`${name}_psn_chat_msgs_sent`, userData.countersData.msgs || '0');
-				safeLocalStorageSet(`${name}_psn_chat_imgs_sent`, userData.countersData.imgs || '0');
-				safeLocalStorageSet(`${name}_psn_chat_reactions_given`, userData.countersData.reactions || '0');
-				safeLocalStorageSet(`${name}_psn_trailers_watched`, userData.countersData.trailers || '0');
-				safeLocalStorageSet(`${name}_psn_accessed_days`, userData.countersData.days || '[]');
-				if (userData.countersData.lastChatRead) safeLocalStorageSet(`${name}_psn_last_chat_read`, userData.countersData.lastChatRead);
-			}
+			if (userData.countersData && typeof window.mergeIncomingTrophyCountersForUser === 'function') window.mergeIncomingTrophyCountersForUser(name, userData.countersData);
+			if (typeof window.scheduleDeterministicTrophyReconciliation === 'function') window.scheduleDeterministicTrophyReconciliation(0);
 
 
 			if (!userData.settingsData) {
@@ -76784,17 +77046,8 @@ function getVisibleChatStackEl(id) {
 			if (typeof window.setSidebarCountPill === 'function') window.setSidebarCountPill('friends', window.friendsList.length);
 			}
 
-			if (userData.countersData) {
-				safeLocalStorageSet(`${name}_psn_chat_msgs_sent`, userData.countersData.msgs || '0');
-				safeLocalStorageSet(`${name}_psn_chat_imgs_sent`, userData.countersData.imgs || '0');
-				safeLocalStorageSet(`${name}_psn_chat_reactions_given`, userData.countersData.reactions || '0');
-				safeLocalStorageSet(`${name}_psn_trailers_watched`, userData.countersData.trailers || '0');
-				safeLocalStorageSet(`${name}_psn_accessed_days`, userData.countersData.days || '[]');
-				
-				if (userData.countersData.lastChatRead) {
-					safeLocalStorageSet(`${name}_psn_last_chat_read`, userData.countersData.lastChatRead);
-				}
-			}
+			if (userData.countersData && typeof window.mergeIncomingTrophyCountersForUser === 'function') window.mergeIncomingTrophyCountersForUser(name, userData.countersData);
+			if (typeof window.scheduleDeterministicTrophyReconciliation === 'function') window.scheduleDeterministicTrophyReconciliation(0);
 			
 			
 			if (userData.settingsData) {
@@ -79638,16 +79891,18 @@ function getVisibleChatStackEl(id) {
 		const myAvatar = loadState('psn_avatar') || (typeof AVAILABLE_AVATARS !== 'undefined' ? AVAILABLE_AVATARS[0] : DEFAULT_URL);
 		const myJoined = loadState('joined_date') || "2026";
 		const myCountryCode = normalizeProfileCountryCode(loadState(STORAGE_KEY_PROFILE_COUNTRY));
+		const myDownloadTrophyStats = typeof window.getDownloadTrophyStats === 'function' ? window.getDownloadTrophyStats({ persist:true }) : normalizeDownloadTrophyStats(localStorage.getItem(`${myName}_${STORAGE_KEY_DOWNLOAD_TROPHY_STATS}`) || '{}');
 		const myCounters = {
 			msgs: localStorage.getItem(`${myName}_psn_chat_msgs_sent`) || '0',
 			imgs: localStorage.getItem(`${myName}_psn_chat_imgs_sent`) || '0',
 			reactions: localStorage.getItem(`${myName}_psn_chat_reactions_given`) || '0',
 			trailers: localStorage.getItem(`${myName}_psn_trailers_watched`) || '0',
 			days: localStorage.getItem(`${myName}_psn_accessed_days`) || '[]',
+			downloadStats: myDownloadTrophyStats,
 			lastChatRead: localStorage.getItem(`${myName}_psn_last_chat_read`) || '0'
 		};
 		const ps3Status = (typeof _lastConnectionState !== 'undefined' && _lastConnectionState) ? (window.myCurrentPS3Status || { status: 'idle' }) : null;
-		const baseSignature = JSON.stringify([myAvatar, myJoined, myCountryCode, ps3Status, myCounters.msgs, myCounters.imgs, myCounters.reactions, myCounters.trailers, myCounters.days, myCounters.lastChatRead]);
+		const baseSignature = JSON.stringify([myAvatar, myJoined, myCountryCode, ps3Status, myCounters.msgs, myCounters.imgs, myCounters.reactions, myCounters.trailers, myCounters.days, myCounters.downloadStats, myCounters.lastChatRead]);
 
 		const payload = {};
 		if (!syncState || syncState.lastBaseSignature !== baseSignature) {
