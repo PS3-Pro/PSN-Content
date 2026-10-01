@@ -53536,9 +53536,8 @@ function formatLibraryLastPlayedBadge(game = {}) {
 	}
 
 
-	const MY_GAMES_KNOWN_ITEMS_KEY = 'psn_my_games_known_items_v1';
 	const MY_GAMES_NEW_PENDING_KEY = 'psn_my_games_new_pending_v1';
-	const MY_GAMES_KNOWN_ITEMS_MAX = 5000;
+	const MY_GAMES_NEW_PENDING_MAX = 500;
 
 	function getMyGamesNoveltyKey(game = {}) {
 		const titleId = getLibraryGameTitleId(game);
@@ -53549,53 +53548,39 @@ function formatLibraryLastPlayedBadge(game = {}) {
 		return path ? `path:${path}` : (title ? `title:${title}` : '');
 	}
 
-	function readMyGamesNoveltyList(storageKey) {
+	function readMyGamesPendingNewKeys() {
 		try {
-			const parsed = JSON.parse(loadState(storageKey) || '[]');
+			const parsed = JSON.parse(loadState(MY_GAMES_NEW_PENDING_KEY) || '[]');
 			return Array.isArray(parsed) ? Array.from(new Set(parsed.map(String).filter(Boolean))) : [];
 		} catch (err) { return []; }
 	}
 
-	function writeMyGamesNoveltyList(storageKey, values, maxItems = MY_GAMES_KNOWN_ITEMS_MAX) {
+	function writeMyGamesPendingNewKeys(values) {
 		const clean = Array.from(new Set((values || []).map(String).filter(Boolean)));
-		const limited = clean.length > maxItems ? clean.slice(clean.length - maxItems) : clean;
+		const limited = clean.length > MY_GAMES_NEW_PENDING_MAX ? clean.slice(clean.length - MY_GAMES_NEW_PENDING_MAX) : clean;
 		const serialized = JSON.stringify(limited);
-		if ((loadState(storageKey) || '[]') !== serialized) saveState(storageKey, serialized);
+		if ((loadState(MY_GAMES_NEW_PENDING_KEY) || '[]') !== serialized) saveState(MY_GAMES_NEW_PENDING_KEY, serialized);
 		return limited;
 	}
 
 	function recordMyGamesScanNovelty(previousGames = [], nextGames = []) {
 		const previous = Array.isArray(previousGames) ? previousGames : [];
 		const next = Array.isArray(nextGames) ? nextGames : [];
-		const previousKeys = previous.map(getMyGamesNoveltyKey).filter(Boolean);
-		let known = readMyGamesNoveltyList(MY_GAMES_KNOWN_ITEMS_KEY);
-		const hadKnownHistory = known.length > 0;
-		const knownSet = new Set(known);
-
-		/* Existing cached/server library is the upgrade baseline. On a true first scan,
-		   seed the baseline instead of marking the whole collection as new. */
-		if (!hadKnownHistory) {
-			(previousKeys.length ? previousKeys : next.map(getMyGamesNoveltyKey).filter(Boolean)).forEach(key => knownSet.add(key));
-		}
-
+		const previousKeys = new Set(previous.map(getMyGamesNoveltyKey).filter(Boolean));
+		const liveKeys = new Set(next.map(getMyGamesNoveltyKey).filter(Boolean));
+		const hadCachedBaseline = previousKeys.size > 0 || loadState('psn_local_library') !== null;
 		const newlyDetected = [];
-		if (hadKnownHistory || previousKeys.length) {
+
+		if (hadCachedBaseline) {
 			for (const game of next) {
 				const key = getMyGamesNoveltyKey(game);
-				if (key && !knownSet.has(key)) newlyDetected.push(key);
+				if (key && !previousKeys.has(key)) newlyDetected.push(key);
 			}
 		}
 
-		for (const game of next) {
-			const key = getMyGamesNoveltyKey(game);
-			if (key) knownSet.add(key);
-		}
-		writeMyGamesNoveltyList(MY_GAMES_KNOWN_ITEMS_KEY, Array.from(knownSet));
-
-		const liveKeys = new Set(next.map(getMyGamesNoveltyKey).filter(Boolean));
-		const pending = new Set(readMyGamesNoveltyList(MY_GAMES_NEW_PENDING_KEY).filter(key => liveKeys.has(key)));
+		const pending = new Set(readMyGamesPendingNewKeys().filter(key => liveKeys.has(key)));
 		newlyDetected.forEach(key => pending.add(key));
-		writeMyGamesNoveltyList(MY_GAMES_NEW_PENDING_KEY, Array.from(pending), 500);
+		writeMyGamesPendingNewKeys(Array.from(pending));
 		return newlyDetected;
 	}
 	window.recordMyGamesScanNovelty = recordMyGamesScanNovelty;
@@ -53603,7 +53588,7 @@ function formatLibraryLastPlayedBadge(game = {}) {
 	function revealMyGamesPendingNewCards() {
 		const grid = document.getElementById('ps3-local-grid');
 		if (!grid || window.isRestoringHistory) return 0;
-		const pending = new Set(readMyGamesNoveltyList(MY_GAMES_NEW_PENDING_KEY));
+		const pending = new Set(readMyGamesPendingNewKeys());
 		if (!pending.size) return 0;
 		let scheduled = 0;
 
@@ -53623,8 +53608,8 @@ function formatLibraryLastPlayedBadge(game = {}) {
 				card.classList.add('category-new-highlight');
 				setTimeout(() => {
 					if (card.isConnected) card.classList.remove('category-new-highlight');
-					const remaining = readMyGamesNoveltyList(MY_GAMES_NEW_PENDING_KEY).filter(item => item !== key);
-					writeMyGamesNoveltyList(MY_GAMES_NEW_PENDING_KEY, remaining, 500);
+					const remaining = readMyGamesPendingNewKeys().filter(item => item !== key);
+					writeMyGamesPendingNewKeys(remaining);
 				}, 6500);
 			};
 
