@@ -3471,8 +3471,8 @@ function normalizeUserRecord(name, userData = {}) {
   return normalized;
 }
 
-const PROFILE_NOTIFICATION_STATE_VERSION = 2;
-const PROFILE_NOTIFICATION_CATEGORIES = new Set(['downloads', 'wishlist', 'favorites', 'trophies', 'admin']);
+const PROFILE_NOTIFICATION_STATE_VERSION = 3;
+const PROFILE_NOTIFICATION_CATEGORIES = new Set(['downloads', 'wishlist', 'favorites', 'playtogether', 'trophies', 'admin']);
 
 function normalizeProfileNotificationPendingItemsServer(value) {
   const source = Array.isArray(value) ? value : [];
