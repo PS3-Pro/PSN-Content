@@ -50721,6 +50721,9 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 			window.__userNotificationCacheUser = '';
 			window.__userNotificationRemoteReady = false;
 			window.__userNotificationUnreadCount = 0;
+			window.__userNotificationServerUnreadCount = 0;
+			window.__userNotificationSeenIds = new Set();
+			window.__userNotificationSurfaceTokens = new Map();
 			window.__userNotificationLastReadId = 0;
 	
 			localStorage.removeItem('psn_username');
@@ -61026,7 +61029,23 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 		return popup;
 	};
 
-	function showTrophyPopup(trophy) {
+	function showTrophyPopup(trophy, trophyId = '') {
+		const normalizedTrophyId = String(trophyId || '').trim();
+		const trophyType = String(trophy && trophy.type || '').trim().toLowerCase();
+		const trophyTitle = String(trophy && trophy.title || '').trim().toLowerCase();
+		if (typeof window.recordUserNotificationSurfaceToken === 'function') {
+			if (normalizedTrophyId) window.recordUserNotificationSurfaceToken('trophy:id:' + normalizedTrophyId);
+			if (trophyTitle) window.recordUserNotificationSurfaceToken('trophy:title:' + trophyType + '|' + trophyTitle);
+		}
+		if (isUserNotificationSurfaceActuallyVisible()) {
+			const matchingIds = (Array.isArray(window.userNotificationItems) ? window.userNotificationItems : []).filter(function(item) {
+				if (!item || item.type !== 'trophy') return false;
+				const data = item.data || {};
+				if (normalizedTrophyId && String(data.trophyId || '').trim() === normalizedTrophyId) return true;
+				return trophyTitle && String(data.title || '').trim().toLowerCase() === trophyTitle && String(data.trophyType || '').trim().toLowerCase() === trophyType;
+			}).map(function(item) { return String(item.id || ''); }).filter(Boolean);
+			if (matchingIds.length && typeof window.markUserNotificationsSeen === 'function') window.markUserNotificationsSeen(matchingIds);
+		}
 		if (trophy.type === 'platinum') {
 			playSystemSound('sound-trophy-platinum', 1.0);
 			if (typeof playNotificationHaptic === 'function') playNotificationHaptic('heavy');
@@ -61081,7 +61100,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 			setTimeout(() => {
 				if (!localStorage.getItem('psn_username') || localStorage.getItem('psn_username') === "null") return;
 
-				if (typeof showTrophyPopup === 'function') showTrophyPopup(trophy);
+				if (typeof showTrophyPopup === 'function') showTrophyPopup(trophy, trophyId);
 				
 				if (typeof window.refreshTrophiesWithMotion === 'function') window.refreshTrophiesWithMotion({ revealNew:false }); 
 				
@@ -61435,7 +61454,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 			if (typeof window.emitFriendTrophyActivity === 'function') window.emitFriendTrophyActivity('platinum', TROPHY_DATA['platinum']);
 	
 			saveState('psn_last_trophy_color', TROPHY_COLORS['platinum']);
-			showTrophyPopup(TROPHY_DATA['platinum']);
+			showTrophyPopup(TROPHY_DATA['platinum'], 'platinum');
 			saveTrophies();
 		}
 	}
@@ -61726,7 +61745,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 	
 		saveTrophies();
 		saveState('psn_trophy_dot_items', JSON.stringify(collectTrophyNotificationPendingItems()));
-		showTrophyPopup(TROPHY_DATA['platinum']); 
+		showTrophyPopup(TROPHY_DATA['platinum'], 'platinum'); 
 		saveState('psn_last_trophy_color', TROPHY_COLORS['platinum']);
 	
 		const trophyViewVisible = typeof psnIsViewVisible === 'function'
@@ -71834,6 +71853,10 @@ function getVisibleChatStackEl(id) {
                 lead: userName,
                 text: actionText
             });
+            if (typeof window.recordUserNotificationSurfaceToken === 'function' && isUserNotificationSurfaceActuallyVisible()) {
+                const kind = reactionEmoji ? 'reaction' : (isMention ? 'mention' : (!isGlobalPing ? 'reply' : ''));
+                if (kind) window.recordUserNotificationSurfaceToken('global:' + kind + ':' + String(userName || '').trim().toLowerCase());
+            }
         }
     }
 
@@ -75456,7 +75479,7 @@ function getVisibleChatStackEl(id) {
 		const ids = new Set();
 		const items = Array.isArray(window.userNotificationItems) ? window.userNotificationItems : [];
 		for (const item of items) {
-			if (!item || !item.data) continue;
+			if (!item || !item.data || (typeof isUserNotificationItemUnread === 'function' && !isUserNotificationItemUnread(item))) continue;
 			const type = String(item.type || '').toLowerCase();
 			if (safeScope === 'private') {
 				if (type !== 'private_message') continue;
@@ -75480,33 +75503,22 @@ function getVisibleChatStackEl(id) {
 		const targetUser = String(data.userName || '').trim();
 		const activeUser = String(localStorage.getItem('psn_username') || '').trim();
 		if (targetUser && activeUser && targetUser.toLowerCase() !== activeUser.toLowerCase()) return false;
-		const ids = new Set((Array.isArray(data.notificationIds) ? data.notificationIds : []).map(id => String(id || '').trim()).filter(Boolean));
-		const messageIds = new Set((Array.isArray(data.messageIds) ? data.messageIds : []).map(id => String(id || '').trim()).filter(Boolean));
+		const ids = new Set((Array.isArray(data.notificationIds) ? data.notificationIds : []).map(function(id) { return String(id || '').trim(); }).filter(Boolean));
+		const messageIds = new Set((Array.isArray(data.messageIds) ? data.messageIds : []).map(function(id) { return String(id || '').trim(); }).filter(Boolean));
 		const scope = data.scope === 'private' ? 'private' : (data.scope === 'global' ? 'global' : '');
-		const previousItems = Array.isArray(window.userNotificationItems) ? window.userNotificationItems : [];
-		const nextItems = previousItems.filter(item => {
-			if (ids.has(String(item && item.id || ''))) return false;
-			if (!messageIds.size || !scope || !item || !item.data || !messageIds.has(String(item.data.messageId || ''))) return true;
-			const type = String(item.type || '').toLowerCase();
-			return scope === 'private' ? type !== 'private_message' : (type !== 'mention' && type !== 'reply' && type !== 'reaction');
-		});
-		const previousUnread = Math.max(0, Number(window.__userNotificationUnreadCount) || 0);
-		const nextUnread = Object.prototype.hasOwnProperty.call(data, 'unreadCount') ? Math.max(0, Number(data.unreadCount) || 0) : previousUnread;
-		if (nextItems.length === previousItems.length && nextUnread === previousUnread) return false;
-		const remainingIds = new Set(nextItems.map(item => String(item && item.id || '')).filter(Boolean));
-		const removedIds = new Set(previousItems.map(item => String(item && item.id || '')).filter(id => id && !remainingIds.has(id)));
-		window.userNotificationItems = nextItems;
-		window.__userNotificationUnreadCount = nextUnread;
-		if (typeof window.writeUserNotificationCache === 'function') window.writeUserNotificationCache();
-		if (typeof window.refreshNotificationCenterIndicators === 'function') window.refreshNotificationCenterIndicators();
-		if (removedIds.size && typeof window.isNotificationCenterVisible === 'function' && window.isNotificationCenterVisible()) {
-			const list = document.getElementById('notification-center-list');
-			const staleRows = list ? Array.from(list.querySelectorAll('.notification-swipe-row[data-notification-id]')).filter(row => removedIds.has(String(row.dataset.notificationId || ''))) : [];
-			if (staleRows.length && typeof window.animateUserNotificationCascadeOut === 'function') {
-				window.animateUserNotificationCascadeOut(staleRows, () => { if (typeof window.syncUserNotificationDomToState === 'function') window.syncUserNotificationDomToState(); });
-			} else if (typeof window.syncUserNotificationDomToState === 'function') window.syncUserNotificationDomToState();
+		if (messageIds.size && scope) {
+			for (const item of (Array.isArray(window.userNotificationItems) ? window.userNotificationItems : [])) {
+				if (!item || !item.data || !messageIds.has(String(item.data.messageId || ''))) continue;
+				const type = String(item.type || '').toLowerCase();
+				if (scope === 'private' ? type === 'private_message' : (type === 'mention' || type === 'reply' || type === 'reaction')) ids.add(String(item.id || ''));
+			}
 		}
-		return true;
+		if (Object.prototype.hasOwnProperty.call(data, 'unreadCount')) window.__userNotificationServerUnreadCount = Math.max(0, Number(data.unreadCount) || 0);
+		const changed = ids.size && typeof window.markUserNotificationsSeen === 'function' ? window.markUserNotificationsSeen(Array.from(ids)) : false;
+		reconcileUserNotificationUnreadCount();
+		window.refreshNotificationCenterIndicators();
+		window.writeUserNotificationCache();
+		return !!changed;
 	};
 
 	window.scheduleSeenChatNotificationConsumption = function(scope, options = {}) {
@@ -75515,7 +75527,6 @@ function getVisibleChatStackEl(id) {
 		if (window.__chatNotificationConsumeTimer[safeScope]) clearTimeout(window.__chatNotificationConsumeTimer[safeScope]);
 		window.__chatNotificationConsumeTimer[safeScope] = setTimeout(() => {
 			window.__chatNotificationConsumeTimer[safeScope] = 0;
-			if (!socketChat || !socketChat.connected) return;
 			const targets = getChatNotificationTargetIds(safeScope);
 			if (!targets.size) return;
 			let root = null;
@@ -75528,29 +75539,27 @@ function getVisibleChatStackEl(id) {
 			}
 			if (!root || !root.isConnected) return;
 			const rootRect = root.getBoundingClientRect();
-			const visibleIds = [];
+			const visibleMessageIds = new Set();
 			for (const id of targets) {
 				const row = safeScope === 'private'
 					? root.querySelector(`[data-direct-message-id="${CSS.escape(id)}"]`)
 					: (typeof getRenderedChatMessageRow === 'function' ? getRenderedChatMessageRow(id) : document.getElementById(`msg-row-${id}`));
-				if (chatNotificationRowIsVisible(row, rootRect)) visibleIds.push(id);
+				if (chatNotificationRowIsVisible(row, rootRect)) visibleMessageIds.add(id);
 			}
-			if (!visibleIds.length) return;
-			visibleIds.sort();
+			if (!visibleMessageIds.size) return;
+			const notificationIds = [];
+			for (const item of (Array.isArray(window.userNotificationItems) ? window.userNotificationItems : [])) {
+				if (!item || !item.data || !visibleMessageIds.has(String(item.data.messageId || ''))) continue;
+				const type = String(item.type || '').toLowerCase();
+				if (safeScope === 'private' ? type === 'private_message' : (type === 'mention' || type === 'reply' || type === 'reaction')) notificationIds.push(String(item.id || ''));
+			}
+			if (!notificationIds.length) return;
+			notificationIds.sort();
 			window.__chatNotificationConsumeSignature = window.__chatNotificationConsumeSignature || { global:'', private:'' };
-			const signature = visibleIds.join('|');
+			const signature = notificationIds.join('|');
 			if (options.force !== true && window.__chatNotificationConsumeSignature[safeScope] === signature) return;
 			window.__chatNotificationConsumeSignature[safeScope] = signature;
-			const payload = { scope:safeScope, messageIds:visibleIds.slice(0, 40) };
-			const applyAck = response => {
-				if (!response || response.ok !== true) { window.__chatNotificationConsumeSignature[safeScope] = ''; return; }
-				if (typeof window.applyConsumedUserNotifications === 'function') {
-					window.applyConsumedUserNotifications({ userName:activeUser, notificationIds:response.notificationIds || [], scope:safeScope, messageIds:payload.messageIds, unreadCount:response.unreadCount });
-				}
-			};
-			const activeUser = String(localStorage.getItem('psn_username') || '').trim();
-			if (typeof socketChat.timeout === 'function') socketChat.timeout(5000).emit('user_notifications_consume_chat', payload, (err, response) => { if (err) { window.__chatNotificationConsumeSignature[safeScope] = ''; return; } applyAck(response); });
-			else socketChat.emit('user_notifications_consume_chat', payload, applyAck);
+			if (typeof window.markUserNotificationsSeen === 'function') window.markUserNotificationsSeen(notificationIds);
 		}, options.force === true ? 45 : 90);
 		return true;
 	};
@@ -79836,11 +79845,12 @@ function getVisibleChatStackEl(id) {
 					if (previousSignature === nextSignature) return;
 				}
 				const isFreshUnread = !known && Math.max(0, Number(item.id) || 0) > Math.max(0, Number(window.__userNotificationLastReadId) || 0);
+				const surfacedBeforeArrival = isFreshUnread && wasUserNotificationSurfaceRecentlySeen(item);
 				if (typeof window.insertRealtimeUserNotification === 'function') window.insertRealtimeUserNotification(item);
 				else if (typeof window.mergeUserNotificationItems === 'function') window.mergeUserNotificationItems([item], false);
-				if (isFreshUnread) {
-					window.__userNotificationUnreadCount = Math.max(0, Number(window.__userNotificationUnreadCount) || 0) + 1;
-				}
+				if (isFreshUnread) window.__userNotificationServerUnreadCount = Math.max(0, Number(window.__userNotificationServerUnreadCount) || 0) + 1;
+				if (surfacedBeforeArrival && typeof window.markUserNotificationsSeen === 'function') window.markUserNotificationsSeen([item.id], { compact:true });
+				reconcileUserNotificationUnreadCount();
 				if (isFreshUnread && item.type === 'private_message' && typeof showPrivateChatNotification === 'function') {
 					const actor = String(item.data && item.data.actor || '').trim();
 					const directState = window.__directChatState || null;
@@ -79848,6 +79858,7 @@ function getVisibleChatStackEl(id) {
 					if (!directVisible) {
 						if (typeof playDirectMessageSound === 'function') playDirectMessageSound();
 						showPrivateChatNotification(item);
+						if (isUserNotificationSurfaceActuallyVisible() && typeof window.markUserNotificationsSeen === 'function') window.markUserNotificationsSeen([item.id]);
 					}
 				}
 				if (isFreshUnread && item.type === 'reaction' && typeof showChatNotification === 'function') {
@@ -79857,6 +79868,7 @@ function getVisibleChatStackEl(id) {
 					if (!chatVisible) {
 						const reactionEmoji = String(item.data && item.data.emoji || '❤').trim() || '❤';
 						showChatNotification(String(item.data && item.data.actor || 'Someone').trim() || 'Someone', false, false, '', reactionEmoji);
+						if (isUserNotificationSurfaceActuallyVisible() && typeof window.markUserNotificationsSeen === 'function') window.markUserNotificationsSeen([item.id]);
 					}
 				}
 				if (isFreshUnread && (item.type === 'game_match' || item.type === 'play_together') && typeof window.showPsnTopPopup === 'function') {
@@ -79871,6 +79883,7 @@ function getVisibleChatStackEl(id) {
 							lead: String(item.data && item.data.actor || 'Someone').trim() || 'Someone',
 							text: presentation.title
 						});
+						if (isUserNotificationSurfaceActuallyVisible() && typeof window.markUserNotificationsSeen === 'function') window.markUserNotificationsSeen([item.id]);
 					}
 				}
 				if (typeof window.scheduleSeenChatNotificationConsumption === 'function') {
@@ -79912,12 +79925,14 @@ function getVisibleChatStackEl(id) {
 		socketChat.on('user_notification_read_state', function(data = {}) {
 			const incoming = Math.max(0, Number(data.lastReadId) || 0);
 			const previousReadId = Math.max(0, Number(window.__userNotificationLastReadId) || 0);
-			const previousUnread = Math.max(0, Number(window.__userNotificationUnreadCount) || 0);
+			const previousServerUnread = Math.max(0, Number(window.__userNotificationServerUnreadCount) || 0);
 			const nextReadId = Math.max(previousReadId, incoming);
-			const nextUnread = Object.prototype.hasOwnProperty.call(data, 'unreadCount') ? Math.max(0, Number(data.unreadCount) || 0) : previousUnread;
-			if (nextReadId === previousReadId && nextUnread === previousUnread) return;
+			const nextServerUnread = Object.prototype.hasOwnProperty.call(data, 'unreadCount') ? Math.max(0, Number(data.unreadCount) || 0) : previousServerUnread;
+			if (nextReadId === previousReadId && nextServerUnread === previousServerUnread) return;
 			window.__userNotificationLastReadId = nextReadId;
-			window.__userNotificationUnreadCount = nextUnread;
+			window.__userNotificationServerUnreadCount = nextServerUnread;
+			pruneUserNotificationSeenState();
+			reconcileUserNotificationUnreadCount();
 			if (typeof window.refreshNotificationCenterIndicators === 'function') window.refreshNotificationCenterIndicators();
 			if (typeof window.writeUserNotificationCache === 'function') window.writeUserNotificationCache();
 		});
@@ -79930,11 +79945,13 @@ function getVisibleChatStackEl(id) {
 			if (!id) return;
 			const previousItems = Array.isArray(window.userNotificationItems) ? window.userNotificationItems : [];
 			const nextItems = previousItems.filter(function(item) { return String(item && item.id || '') !== id; });
-			const previousUnread = Math.max(0, Number(window.__userNotificationUnreadCount) || 0);
-			const nextUnread = Object.prototype.hasOwnProperty.call(data, 'unreadCount') ? Math.max(0, Number(data.unreadCount) || 0) : previousUnread;
-			if (nextItems.length === previousItems.length && nextUnread === previousUnread) return;
+			const previousServerUnread = Math.max(0, Number(window.__userNotificationServerUnreadCount) || 0);
+			const nextServerUnread = Object.prototype.hasOwnProperty.call(data, 'unreadCount') ? Math.max(0, Number(data.unreadCount) || 0) : previousServerUnread;
+			if (nextItems.length === previousItems.length && nextServerUnread === previousServerUnread) return;
 			window.userNotificationItems = nextItems;
-			window.__userNotificationUnreadCount = nextUnread;
+			window.__userNotificationSeenIds.delete(id);
+			window.__userNotificationServerUnreadCount = nextServerUnread;
+			reconcileUserNotificationUnreadCount();
 			if (typeof window.writeUserNotificationCache === 'function') window.writeUserNotificationCache();
 			if (typeof window.isNotificationCenterVisible === 'function' && window.isNotificationCenterVisible()) {
 				const list = document.getElementById('notification-center-list');
@@ -79962,11 +79979,13 @@ function getVisibleChatStackEl(id) {
 			const throughId = Math.max(0, Number(data.throughId) || 0);
 			const previousItems = Array.isArray(window.userNotificationItems) ? window.userNotificationItems : [];
 			const nextItems = throughId ? previousItems.filter(function(item) { return Math.max(0, Number(item && item.id) || 0) > throughId; }) : [];
-			const previousUnread = Math.max(0, Number(window.__userNotificationUnreadCount) || 0);
-			const nextUnread = Object.prototype.hasOwnProperty.call(data, 'unreadCount') ? Math.max(0, Number(data.unreadCount) || 0) : previousUnread;
-			if (nextItems.length === previousItems.length && nextUnread === previousUnread) return;
+			const previousServerUnread = Math.max(0, Number(window.__userNotificationServerUnreadCount) || 0);
+			const nextServerUnread = Object.prototype.hasOwnProperty.call(data, 'unreadCount') ? Math.max(0, Number(data.unreadCount) || 0) : previousServerUnread;
+			if (nextItems.length === previousItems.length && nextServerUnread === previousServerUnread) return;
 			window.userNotificationItems = nextItems;
-			window.__userNotificationUnreadCount = nextUnread;
+			for (const seenId of Array.from(window.__userNotificationSeenIds || [])) { if (!nextItems.some(function(item) { return String(item && item.id || '') === String(seenId); })) window.__userNotificationSeenIds.delete(String(seenId)); }
+			window.__userNotificationServerUnreadCount = nextServerUnread;
+			reconcileUserNotificationUnreadCount();
 			if (typeof window.writeUserNotificationCache === 'function') window.writeUserNotificationCache();
 			if (typeof window.refreshNotificationCenterIndicators === 'function') window.refreshNotificationCenterIndicators();
 			if (typeof window.isNotificationCenterVisible === 'function' && window.isNotificationCenterVisible() && window.__userNotificationClearBusy !== true) {
@@ -86053,9 +86072,136 @@ function getVisibleChatStackEl(id) {
 	window.__userNotificationRequestToken = 0;
 	window.__userNotificationLastReadId = Math.max(0, Number(window.__userNotificationLastReadId) || 0);
 	window.__userNotificationUnreadCount = Math.max(0, Number(window.__userNotificationUnreadCount) || 0);
+	window.__userNotificationServerUnreadCount = Math.max(0, Number(window.__userNotificationServerUnreadCount) || window.__userNotificationUnreadCount || 0);
+	window.__userNotificationSeenIds = window.__userNotificationSeenIds instanceof Set ? window.__userNotificationSeenIds : new Set();
+	window.__userNotificationSurfaceTokens = window.__userNotificationSurfaceTokens instanceof Map ? window.__userNotificationSurfaceTokens : new Map();
 	window.__userNotificationReadSyncTimer = null;
 	window.__userNotificationRenderLimit = SOCIAL_FEED_RENDER_BATCH_SIZE;
+	const USER_NOTIFICATION_SURFACE_TOKEN_TTL_MS = 15000;
 
+	function isUserNotificationSurfaceActuallyVisible() {
+		if (document.visibilityState === 'hidden') return false;
+		try { return typeof document.hasFocus !== 'function' || document.hasFocus(); } catch (err) { return true; }
+	}
+
+	function pruneUserNotificationSeenState() {
+		const lastReadId = Math.max(0, Number(window.__userNotificationLastReadId) || 0);
+		const liveIds = new Set((Array.isArray(window.userNotificationItems) ? window.userNotificationItems : []).map(function(item) { return String(item && item.id || ''); }).filter(Boolean));
+		for (const id of Array.from(window.__userNotificationSeenIds || [])) {
+			const numericId = Math.max(0, Number(id) || 0);
+			if ((numericId && numericId <= lastReadId) || !liveIds.has(String(id))) window.__userNotificationSeenIds.delete(String(id));
+		}
+	}
+
+	function isUserNotificationItemUnread(item) {
+		if (!item) return false;
+		const id = String(item.id || '');
+		const numericId = Math.max(0, Number(id) || 0);
+		if (!id || !numericId || numericId <= Math.max(0, Number(window.__userNotificationLastReadId) || 0)) return false;
+		return !(window.__userNotificationSeenIds instanceof Set && window.__userNotificationSeenIds.has(id));
+	}
+	window.isUserNotificationItemUnread = isUserNotificationItemUnread;
+
+	function getUserNotificationEffectiveUnreadCount() {
+		const serverUnread = Math.max(0, Number(window.__userNotificationServerUnreadCount) || 0);
+		const lastReadId = Math.max(0, Number(window.__userNotificationLastReadId) || 0);
+		let locallySeenUnread = 0;
+		if (window.__userNotificationSeenIds instanceof Set && window.__userNotificationSeenIds.size) {
+			for (const item of (Array.isArray(window.userNotificationItems) ? window.userNotificationItems : [])) {
+				const id = String(item && item.id || '');
+				if (id && Math.max(0, Number(id) || 0) > lastReadId && window.__userNotificationSeenIds.has(id)) locallySeenUnread++;
+			}
+		}
+		return Math.max(0, serverUnread - locallySeenUnread);
+	}
+
+	function reconcileUserNotificationUnreadCount() {
+		pruneUserNotificationSeenState();
+		window.__userNotificationUnreadCount = getUserNotificationEffectiveUnreadCount();
+		return window.__userNotificationUnreadCount;
+	}
+	window.reconcileUserNotificationUnreadCount = reconcileUserNotificationUnreadCount;
+
+	function syncSeenUserNotificationDom(ids) {
+		const list = document.getElementById('notification-center-list');
+		if (!list || !(ids instanceof Set) || !ids.size) return;
+		ids.forEach(function(id) {
+			const row = list.querySelector('.notification-swipe-row[data-notification-id="' + CSS.escape(String(id)) + '"]');
+			if (!row) return;
+			row.querySelector('.user-notification-item')?.classList.remove('is-unread');
+			row.querySelector('.user-notification-unread-dot')?.remove();
+		});
+	}
+
+	function compactUserNotificationSeenFrontier() {
+		if (!(window.__userNotificationSeenIds instanceof Set) || !window.__userNotificationSeenIds.size) return 0;
+		const lastReadId = Math.max(0, Number(window.__userNotificationLastReadId) || 0);
+		const pending = (Array.isArray(window.userNotificationItems) ? window.userNotificationItems : [])
+			.filter(function(item) { return Math.max(0, Number(item && item.id) || 0) > lastReadId; })
+			.sort(function(a,b) { return (Number(a.id) || 0) - (Number(b.id) || 0); });
+		let candidate = lastReadId;
+		for (const item of pending) {
+			const id = String(item && item.id || '');
+			if (!id || !window.__userNotificationSeenIds.has(id)) break;
+			candidate = Math.max(candidate, Math.max(0, Number(id) || 0));
+		}
+		if (candidate > lastReadId && typeof pushUserNotificationReadState === 'function') pushUserNotificationReadState(candidate);
+		return candidate;
+	}
+
+	window.markUserNotificationsSeen = function(notificationIds, options = {}) {
+		const ids = new Set((Array.isArray(notificationIds) ? notificationIds : [notificationIds]).map(function(id) { return String(id || '').trim(); }).filter(Boolean));
+		if (!ids.size) return false;
+		const lastReadId = Math.max(0, Number(window.__userNotificationLastReadId) || 0);
+		let changed = false;
+		ids.forEach(function(id) {
+			if (Math.max(0, Number(id) || 0) <= lastReadId || window.__userNotificationSeenIds.has(id)) return;
+			window.__userNotificationSeenIds.add(id);
+			changed = true;
+		});
+		if (!changed) return false;
+		reconcileUserNotificationUnreadCount();
+		syncSeenUserNotificationDom(ids);
+		if (options.compact !== false) compactUserNotificationSeenFrontier();
+		if (typeof window.refreshNotificationCenterIndicators === 'function') window.refreshNotificationCenterIndicators();
+		if (typeof window.writeUserNotificationCache === 'function') window.writeUserNotificationCache();
+		return true;
+	};
+
+	function recordUserNotificationSurfaceToken(token) {
+		const key = String(token || '').trim();
+		if (!key || !isUserNotificationSurfaceActuallyVisible()) return false;
+		const now = Date.now();
+		window.__userNotificationSurfaceTokens.set(key, now);
+		for (const [storedKey, at] of Array.from(window.__userNotificationSurfaceTokens.entries())) {
+			if (now - Number(at || 0) > USER_NOTIFICATION_SURFACE_TOKEN_TTL_MS) window.__userNotificationSurfaceTokens.delete(storedKey);
+		}
+		return true;
+	}
+	window.recordUserNotificationSurfaceToken = recordUserNotificationSurfaceToken;
+
+	function userNotificationSurfaceTokensForItem(item) {
+		if (!item) return [];
+		const data = item.data || {};
+		const actor = String(data.actor || '').trim().toLowerCase();
+		if (item.type === 'trophy') {
+			const trophyId = String(data.trophyId || '').trim();
+			const trophyType = String(data.trophyType || '').trim().toLowerCase();
+			const title = String(data.title || '').trim().toLowerCase();
+			return [trophyId ? 'trophy:id:' + trophyId : '', title ? 'trophy:title:' + trophyType + '|' + title : ''].filter(Boolean);
+		}
+		if (item.type === 'mention' || item.type === 'reply' || item.type === 'reaction') return ['global:' + item.type + ':' + actor];
+		return [];
+	}
+
+	function wasUserNotificationSurfaceRecentlySeen(item) {
+		const now = Date.now();
+		for (const token of userNotificationSurfaceTokensForItem(item)) {
+			const at = Number(window.__userNotificationSurfaceTokens.get(token) || 0);
+			if (at && now - at <= USER_NOTIFICATION_SURFACE_TOKEN_TTL_MS) return true;
+		}
+		return false;
+	}
 
 	function normalizeUserNotificationItem(raw) {
 		if (!raw || typeof raw !== 'object') return null;
@@ -86533,6 +86679,8 @@ function getVisibleChatStackEl(id) {
 			merged.push(item);
 		});
 		window.userNotificationItems = window.trimPsnServerLimitedArray(merged, 'socialHistory');
+		pruneUserNotificationSeenState();
+		reconcileUserNotificationUnreadCount();
 		if (typeof window.scheduleSeenChatNotificationConsumption === 'function') {
 			window.scheduleSeenChatNotificationConsumption('global', { force:true });
 			window.scheduleSeenChatNotificationConsumption('private', { force:true });
@@ -86547,13 +86695,15 @@ function getVisibleChatStackEl(id) {
 				items:window.trimPsnServerLimitedArray(Array.isArray(window.userNotificationItems) ? window.userNotificationItems : [], 'socialHistory'),
 				lastReadId:Math.max(0, Number(window.__userNotificationLastReadId) || 0),
 				unreadCount:Math.max(0, Number(window.__userNotificationUnreadCount) || 0),
+				serverUnreadCount:Math.max(0, Number(window.__userNotificationServerUnreadCount) || 0),
+				seenIds:Array.from(window.__userNotificationSeenIds || []).slice(-250),
 				cachedAt:Date.now()
 			}));
 		} catch (err) {}
 	};
 
 	window.refreshNotificationCenterIndicators = function() {
-		const unread = Math.max(0, Number(window.__userNotificationUnreadCount) || 0);
+		const unread = typeof reconcileUserNotificationUnreadCount === 'function' ? reconcileUserNotificationUnreadCount() : Math.max(0, Number(window.__userNotificationUnreadCount) || 0);
 		if (typeof window.setSidebarCountPill === 'function') window.setSidebarCountPill('notifications', Array.isArray(window.userNotificationItems) ? window.userNotificationItems.length : 0);
 		const dot = document.getElementById('notifications-dot');
 		if (dot) dot.style.display = unread > 0 ? 'block' : 'none';
@@ -86573,14 +86723,18 @@ function getVisibleChatStackEl(id) {
 		window.__userNotificationRemoteError = '';
 		window.__userNotificationLastReadId = 0;
 		window.__userNotificationUnreadCount = 0;
+		window.__userNotificationServerUnreadCount = 0;
+		window.__userNotificationSeenIds = new Set();
 		try {
 			const raw = loadState(USER_NOTIFICATION_CACHE_KEY);
 			const cached = raw ? JSON.parse(raw) : null;
 			if (cached && typeof cached === 'object') {
 				window.userNotificationItems = Array.isArray(cached.items) ? cached.items : [];
 				window.__userNotificationLastReadId = Math.max(0, Number(cached.lastReadId) || 0);
-				window.__userNotificationUnreadCount = Math.max(0, Number(cached.unreadCount) || 0);
+				window.__userNotificationServerUnreadCount = Math.max(0, Number(cached.serverUnreadCount ?? cached.unreadCount) || 0);
+				window.__userNotificationSeenIds = new Set((Array.isArray(cached.seenIds) ? cached.seenIds : []).map(function(id) { return String(id || '').trim(); }).filter(Boolean));
 				window.mergeUserNotificationItems([], false);
+				reconcileUserNotificationUnreadCount();
 			}
 		} catch (err) {
 			window.userNotificationItems = [];
@@ -86598,7 +86752,9 @@ function getVisibleChatStackEl(id) {
 			socketChat.emit('user_notifications_mark_read', { lastReadId:safeId }, function(response) {
 				if (!response || response.ok !== true) return;
 				window.__userNotificationLastReadId = Math.max(window.__userNotificationLastReadId, Math.max(0, Number(response.lastReadId) || 0));
-				window.__userNotificationUnreadCount = Math.max(0, Number(response.unreadCount) || 0);
+				window.__userNotificationServerUnreadCount = Math.max(0, Number(response.unreadCount) || 0);
+				pruneUserNotificationSeenState();
+				reconcileUserNotificationUnreadCount();
 				window.refreshNotificationCenterIndicators();
 				window.writeUserNotificationCache();
 			});
@@ -86608,13 +86764,17 @@ function getVisibleChatStackEl(id) {
 	window.markUserNotificationsRead = function() {
 		const newestId = getRealtimeFeedMaxId(window.userNotificationItems);
 		if (!newestId) {
+			window.__userNotificationServerUnreadCount = 0;
 			window.__userNotificationUnreadCount = 0;
+			window.__userNotificationSeenIds.clear();
 			window.refreshNotificationCenterIndicators();
 			return;
 		}
 		const previousReadId = Math.max(0, Number(window.__userNotificationLastReadId) || 0);
 		if (newestId > previousReadId) window.__userNotificationLastReadId = newestId;
+		window.__userNotificationServerUnreadCount = 0;
 		window.__userNotificationUnreadCount = 0;
+		window.__userNotificationSeenIds.clear();
 		window.refreshNotificationCenterIndicators();
 		window.writeUserNotificationCache();
 		document.querySelectorAll('#notification-center-list .user-notification-item.is-unread').forEach(function(el) { el.classList.remove('is-unread'); });
@@ -87037,8 +87197,7 @@ function getVisibleChatStackEl(id) {
 
 	function buildUserNotificationRowHtml(item, index = 0, extraClass = '') {
 		const p = getUserNotificationPresentation(item);
-		const lastReadId = Math.max(0, Number(window.__userNotificationLastReadId) || 0);
-		const isUnread = Math.max(0, Number(item.id) || 0) > lastReadId;
+		const isUnread = typeof isUserNotificationItemUnread === 'function' ? isUserNotificationItemUnread(item) : Math.max(0, Number(item.id) || 0) > Math.max(0, Number(window.__userNotificationLastReadId) || 0);
 		const actor = String(item.data && item.data.actor || (item.type === 'trophy' ? localStorage.getItem('psn_username') || '' : '')).trim();
 		let avatar = typeof getResolvedUserAvatar === 'function' ? getResolvedUserAvatar(actor) : 'https://raw.githubusercontent.com/PS3-Pro/PSN-Content/main/resources/interface/modern/images/avatars/default.png';
 		if (item.type === 'catalog') {
@@ -87491,9 +87650,10 @@ function getVisibleChatStackEl(id) {
                 const liveIndex = (Array.isArray(window.userNotificationItems) ? window.userNotificationItems : []).findIndex(function(item) { return String(item && item.id || '') === id; });
                 if (liveIndex < 0) { window.__userNotificationDeleteBusy = false; return null; }
                 removed = window.userNotificationItems.splice(liveIndex, 1)[0];
-                if (Math.max(0, Number(removed && removed.id) || 0) > Math.max(0, Number(window.__userNotificationLastReadId) || 0)) {
-                    window.__userNotificationUnreadCount = Math.max(0, (Number(window.__userNotificationUnreadCount) || 0) - 1);
-                }
+                const removedWasUnread = typeof isUserNotificationItemUnread === 'function' ? isUserNotificationItemUnread(removed) : Math.max(0, Number(removed && removed.id) || 0) > Math.max(0, Number(window.__userNotificationLastReadId) || 0);
+                if (removedWasUnread) window.__userNotificationServerUnreadCount = Math.max(0, Number(window.__userNotificationServerUnreadCount) || 0) - 1;
+                window.__userNotificationSeenIds.delete(id);
+                reconcileUserNotificationUnreadCount();
                 window.writeUserNotificationCache();
                 window.refreshNotificationCenterIndicators();
                 if (typeof playUiRemove === 'function') playUiRemove();
@@ -87505,7 +87665,7 @@ function getVisibleChatStackEl(id) {
                 };
                 if (row && typeof window.animateUserNotificationRowOut === 'function') window.animateUserNotificationRowOut(row, finishLocalDelete);
                 else setTimeout(finishLocalDelete, 0);
-                return { removed, index:liveIndex };
+                return { removed, index:liveIndex, removedWasUnread };
             },
             undo:function(staged) {
                 if (!staged || !staged.removed) return;
@@ -87513,9 +87673,8 @@ function getVisibleChatStackEl(id) {
                 window.__userNotificationDeleteBusy = false;
                 if (typeof window.mergeUserNotificationItems === 'function') window.mergeUserNotificationItems([staged.removed], false);
                 else window.userNotificationItems.splice(Math.min(staged.index, window.userNotificationItems.length), 0, staged.removed);
-                window.__userNotificationUnreadCount = (Array.isArray(window.userNotificationItems) ? window.userNotificationItems : []).filter(function(item) {
-                    return Math.max(0, Number(item && item.id) || 0) > Math.max(0, Number(window.__userNotificationLastReadId) || 0);
-                }).length;
+                if (staged.removedWasUnread) window.__userNotificationServerUnreadCount = Math.max(0, Number(window.__userNotificationServerUnreadCount) || 0) + 1;
+                reconcileUserNotificationUnreadCount();
                 window.writeUserNotificationCache();
                 window.refreshNotificationCenterIndicators();
                 if (typeof window.renderNotificationCenter === 'function' && window.isNotificationCenterVisible()) window.renderNotificationCenter(true);
@@ -87526,9 +87685,8 @@ function getVisibleChatStackEl(id) {
                 if (!socketChat || !socketChat.connected) {
                     if (typeof window.mergeUserNotificationItems === 'function') window.mergeUserNotificationItems([staged.removed], false);
                     else window.userNotificationItems.splice(Math.min(staged.index, window.userNotificationItems.length), 0, staged.removed);
-                    window.__userNotificationUnreadCount = (Array.isArray(window.userNotificationItems) ? window.userNotificationItems : []).filter(function(item) {
-                        return Math.max(0, Number(item && item.id) || 0) > Math.max(0, Number(window.__userNotificationLastReadId) || 0);
-                    }).length;
+                    if (staged.removedWasUnread) window.__userNotificationServerUnreadCount = Math.max(0, Number(window.__userNotificationServerUnreadCount) || 0) + 1;
+                    reconcileUserNotificationUnreadCount();
                     window.writeUserNotificationCache();
                     window.refreshNotificationCenterIndicators();
                     if (window.isNotificationCenterVisible()) window.renderNotificationCenter(true);
@@ -87542,7 +87700,8 @@ function getVisibleChatStackEl(id) {
                         window.bootstrapNotificationCenterRealtime({ forceFull:true, reason:'delete-recovery' });
                         return;
                     }
-                    if (Object.prototype.hasOwnProperty.call(response, 'unreadCount')) window.__userNotificationUnreadCount = Math.max(0, Number(response.unreadCount) || 0);
+                    if (Object.prototype.hasOwnProperty.call(response, 'unreadCount')) window.__userNotificationServerUnreadCount = Math.max(0, Number(response.unreadCount) || 0);
+                    reconcileUserNotificationUnreadCount();
                     window.writeUserNotificationCache();
                     window.refreshNotificationCenterIndicators();
                 });
@@ -87554,7 +87713,7 @@ function getVisibleChatStackEl(id) {
         const name = String(userName || '').trim();
         if (!name || name === 'null') return;
         try {
-            safeLocalStorageSet(name + '_' + USER_NOTIFICATION_CACHE_KEY, JSON.stringify({ items:[], lastReadId:Math.max(0, Number(lastReadId) || 0), unreadCount:0, cachedAt:Date.now() }));
+            safeLocalStorageSet(name + '_' + USER_NOTIFICATION_CACHE_KEY, JSON.stringify({ items:[], lastReadId:Math.max(0, Number(lastReadId) || 0), unreadCount:0, serverUnreadCount:0, seenIds:[], cachedAt:Date.now() }));
             safeLocalStorageSet(name + '_psn_notifications_dot', 'false');
         } catch (err) {}
     }
@@ -87589,7 +87748,9 @@ function getVisibleChatStackEl(id) {
             const currentUser = String(localStorage.getItem('psn_username') || '').trim();
             if (currentUser.toLowerCase() === expectedUser.toLowerCase()) {
                 window.userNotificationItems = (Array.isArray(window.userNotificationItems) ? window.userNotificationItems : []).filter(function(item) { return Math.max(0, Number(item && item.id) || 0) > clearThroughId; });
-                window.__userNotificationUnreadCount = window.userNotificationItems.filter(function(item) { return Math.max(0, Number(item && item.id) || 0) > Math.max(0, Number(window.__userNotificationLastReadId) || 0); }).length;
+                for (const seenId of Array.from(window.__userNotificationSeenIds || [])) { if (Math.max(0, Number(seenId) || 0) <= clearThroughId) window.__userNotificationSeenIds.delete(String(seenId)); }
+                window.__userNotificationServerUnreadCount = window.userNotificationItems.filter(function(item) { return Math.max(0, Number(item && item.id) || 0) > Math.max(0, Number(window.__userNotificationLastReadId) || 0); }).length;
+                reconcileUserNotificationUnreadCount();
                 window.writeUserNotificationCache();
                 window.refreshNotificationCenterIndicators();
                 if (typeof window.isNotificationCenterVisible === 'function' && window.isNotificationCenterVisible() && window.userNotificationItems.length && typeof window.renderNotificationCenter === 'function') {
@@ -87619,7 +87780,8 @@ function getVisibleChatStackEl(id) {
                     setTimeout(function() { window.bootstrapNotificationCenterRealtime({ forceFull:true, reason:'clear-recovery' }); }, cascadeMs + 20);
                 }
             } else if (currentUser.toLowerCase() === expectedUser.toLowerCase()) {
-                if (Object.prototype.hasOwnProperty.call(response, 'unreadCount')) window.__userNotificationUnreadCount = Math.max(0, Number(response.unreadCount) || 0);
+                if (Object.prototype.hasOwnProperty.call(response, 'unreadCount')) window.__userNotificationServerUnreadCount = Math.max(0, Number(response.unreadCount) || 0);
+                reconcileUserNotificationUnreadCount();
                 window.writeUserNotificationCache();
                 window.refreshNotificationCenterIndicators();
             } else {
@@ -88319,12 +88481,15 @@ function getVisibleChatStackEl(id) {
 			window.__userNotificationRemoteError = '';
 			const serverReadId = Math.max(0, Number(response.lastReadId) || 0);
 			window.__userNotificationLastReadId = Math.max(localReadBeforeSync, serverReadId);
-			window.__userNotificationUnreadCount = Math.max(0, Number(response.unreadCount) || 0);
+			window.__userNotificationServerUnreadCount = Math.max(0, Number(response.unreadCount) || 0);
 
 			const previousIds = new Set((Array.isArray(window.userNotificationItems) ? window.userNotificationItems : []).map(function(item) { return String(item && item.id || ''); }).filter(Boolean));
 			const responseIsFull = response.delta !== true;
 			if (responseIsFull) window.__userNotificationRenderLimit = SOCIAL_FEED_RENDER_BATCH_SIZE;
 			window.mergeUserNotificationItems(Array.isArray(response.items) ? response.items : [], responseIsFull);
+			const surfacedIds = (Array.isArray(window.userNotificationItems) ? window.userNotificationItems : []).filter(function(item) { return isUserNotificationItemUnread(item) && wasUserNotificationSurfaceRecentlySeen(item); }).map(function(item) { return String(item.id || ''); }).filter(Boolean);
+			if (surfacedIds.length && typeof window.markUserNotificationsSeen === 'function') window.markUserNotificationsSeen(surfacedIds);
+			reconcileUserNotificationUnreadCount();
 			const addedItems = getRealtimeFeedAddedItems(previousIds, window.userNotificationItems);
 
 			window.writeUserNotificationCache();
