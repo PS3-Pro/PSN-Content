@@ -48747,6 +48747,54 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 		});
 	};
 
+	window.captureCategoryGridReflow = function(grid) {
+		if (!grid || document.hidden || typeof Element.prototype.animate !== 'function') return null;
+		if (window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches) return null;
+
+		const positions = new Map();
+		const viewportHeight = window.innerHeight || document.documentElement.clientHeight || 0;
+		const viewportMargin = Math.max(220, Math.round(viewportHeight * .22));
+		Array.from(grid.querySelectorAll(':scope > .game-card[data-live-render-key]')).forEach(card => {
+			const key = String(card.dataset.liveRenderKey || '');
+			if (!key) return;
+			const rect = card.getBoundingClientRect();
+			if (!rect.width || !rect.height) return;
+			if (rect.bottom < -viewportMargin || rect.top > viewportHeight + viewportMargin) return;
+			positions.set(key, { left:rect.left, top:rect.top });
+		});
+		return positions.size ? { grid, positions, viewportHeight, viewportMargin } : null;
+	};
+
+	window.animateCategoryGridReflow = function(snapshot, duration = 390) {
+		if (!snapshot || !snapshot.grid || !snapshot.grid.isConnected || !snapshot.positions || !snapshot.positions.size) return 0;
+		if (document.hidden || (window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches)) return 0;
+
+		let moved = 0;
+		Array.from(snapshot.grid.querySelectorAll(':scope > .game-card[data-live-render-key]')).forEach(card => {
+			const key = String(card.dataset.liveRenderKey || '');
+			const first = key ? snapshot.positions.get(key) : null;
+			if (!first) return;
+			const last = card.getBoundingClientRect();
+			if (!last.width || !last.height) return;
+			if (last.bottom < -snapshot.viewportMargin || last.top > snapshot.viewportHeight + snapshot.viewportMargin) return;
+
+			const dx = first.left - last.left;
+			const dy = first.top - last.top;
+			if (Math.abs(dx) < .5 && Math.abs(dy) < .5) return;
+
+			card.getAnimations().forEach(animation => {
+				if (animation.id === 'psn-category-grid-reflow') animation.cancel();
+			});
+			const animation = card.animate(
+				[{ translate:`${dx}px ${dy}px` }, { translate:'0px 0px' }],
+				{ duration, easing:'cubic-bezier(.22,1,.36,1)' }
+			);
+			animation.id = 'psn-category-grid-reflow';
+			moved++;
+		});
+		return moved;
+	};
+
 	window.animateCategoryRemoveCard = function(card, onComplete, duration = 720) {
 		let finished = false;
 		const finish = () => {
@@ -48878,11 +48926,15 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 						if (dot) dot.style.display = 'none';
 					});
 				} else {
+					const wishlistGridMotion = typeof window.captureCategoryGridReflow === 'function'
+						? window.captureCategoryGridReflow(card && card.parentElement)
+						: null;
 					window.animateCategoryRemoveCard(card, () => {
 						if (typeof window.updateWishlistTypeFilterAvailability === 'function') {
 							window.updateWishlistTypeFilterAvailability();
 						}
 						updateWishlistUI(true);
+						if (typeof window.animateCategoryGridReflow === 'function') window.animateCategoryGridReflow(wishlistGridMotion);
 					});
 				}
 			} else {
@@ -48971,6 +49023,9 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 				},
 				undo:staged => {
 					if (!staged || (expectedUser && String(localStorage.getItem('psn_username') || '').trim() !== expectedUser)) return;
+					const wishlistUndoGridMotion = isWishlistView && typeof window.captureCategoryGridReflow === 'function'
+						? window.captureCategoryGridReflow(document.getElementById('wishlist-grid'))
+						: null;
 					const alreadyThere = wishlist.some(item => window.getWishlistIdentityKey(item, item.rawCategory || item.category || 'games') === staged.identityKey);
 					if (!alreadyThere) wishlist.splice(Math.max(0, Math.min(staged.index, wishlist.length)), 0, staged.item);
 					if (card) card.classList.add('is-wishlisted');
@@ -48980,6 +49035,7 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 					markProfileListChanged('wishlist');
 					if (typeof window.applyOptimisticTrendingDelta === 'function') window.applyOptimisticTrendingDelta('wishlist', gameData.id || gameData.titleId || targetGameId, 1);
 					updateWishlistUI(true);
+					if (typeof window.animateCategoryGridReflow === 'function') window.animateCategoryGridReflow(wishlistUndoGridMotion);
 					if (typeof window.animatePsnUndoRestore === 'function') {
 						const restoredIdentityKey = String(staged.identityKey || '');
 						window.animatePsnUndoRestore(() => {
@@ -54768,11 +54824,15 @@ function formatLibraryLastPlayedBadge(game = {}) {
 			});
 		} else {
 			playUiRemove();
+			const favoritesGridMotion = typeof window.captureCategoryGridReflow === 'function'
+				? window.captureCategoryGridReflow(card && card.parentElement)
+				: null;
 			window.animateCategoryRemoveCard(card, () => {
 				if (card && card.parentNode) card.remove();
 				const countSpan = document.getElementById('fav-count');
 				if (countSpan) countSpan.innerText = `(${window.formatUiCount ? window.formatUiCount(remainingVisibleSource.length, 'item', 'items') : `${remainingVisibleSource.length} ${remainingVisibleSource.length === 1 ? 'item' : 'items'}`})`;
 				if (typeof window.updateFavoritesLibraryUI === 'function') window.updateFavoritesLibraryUI(true);
+				if (typeof window.animateCategoryGridReflow === 'function') window.animateCategoryGridReflow(favoritesGridMotion);
 			});
 		}
 
@@ -54789,12 +54849,16 @@ function formatLibraryLastPlayedBadge(game = {}) {
 				},
 				undo:staged => {
 					if (!staged || (expectedUser && String(localStorage.getItem('psn_username') || '').trim() !== expectedUser)) return;
+					const favoritesUndoGridMotion = typeof window.captureCategoryGridReflow === 'function'
+						? window.captureCategoryGridReflow(document.getElementById('ps3-favs-grid'))
+						: null;
 					if (!favoritesLibrary.some(item => item && item.path === staged.item.path)) favoritesLibrary.splice(Math.max(0, Math.min(staged.index, favoritesLibrary.length)), 0, staged.item);
 					if (typeof window.bumpLibraryCollectionRevision === 'function') window.bumpLibraryCollectionRevision('favorites');
 					if (typeof window.setSidebarCountPill === 'function') window.setSidebarCountPill('favorites', favoritesLibrary.length);
 					saveState(STORAGE_KEY_FAVS, JSON.stringify(favoritesLibrary));
 					markProfileListChanged('favorites');
 					updateFavoritesLibraryUI(true);
+					if (typeof window.animateCategoryGridReflow === 'function') window.animateCategoryGridReflow(favoritesUndoGridMotion);
 					if (lastScannedGames && lastScannedGames.length > 0) renderLocalLibrary(lastScannedGames);
 					if (typeof window.animatePsnUndoRestore === 'function') {
 						const restoredPath = String(staged.item && staged.item.path || '');
@@ -59224,6 +59288,13 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 	function snapshotPsnUndoRowStyle(row) {
 		if (!row || !row.style) return null;
 		const computed = window.getComputedStyle ? window.getComputedStyle(row) : null;
+		const parent = row.parentElement;
+		const parentComputed = parent && window.getComputedStyle ? window.getComputedStyle(parent) : null;
+		const layoutGap = parentComputed ? Math.max(0, parseFloat(parentComputed.rowGap || parentComputed.gap) || 0) : 0;
+		let previousVisible = row.previousElementSibling;
+		while (previousVisible && window.getComputedStyle && window.getComputedStyle(previousVisible).display === 'none') previousVisible = previousVisible.previousElementSibling;
+		let nextVisible = row.nextElementSibling;
+		while (nextVisible && window.getComputedStyle && window.getComputedStyle(nextVisible).display === 'none') nextVisible = nextVisible.nextElementSibling;
 		return {
 			row,
 			height:row.style.height,
@@ -59238,7 +59309,9 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 			expandedHeight:Math.max(0, row.getBoundingClientRect().height),
 			computedOpacity:computed ? computed.opacity : '1',
 			computedMarginTop:computed ? computed.marginTop : '0px',
-			computedMarginBottom:computed ? computed.marginBottom : '0px'
+			computedMarginBottom:computed ? computed.marginBottom : '0px',
+			layoutGap,
+			gapSide:layoutGap > 0 ? (previousVisible ? 'top' : (nextVisible ? 'bottom' : '')) : ''
 		};
 	}
 
@@ -59246,6 +59319,8 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 		const snapshot = snapshotPsnUndoRowStyle(row);
 		if (!snapshot || !row.isConnected) return snapshot;
 		const height = Math.max(0, row.getBoundingClientRect().height);
+		const collapsedMarginTop = snapshot.gapSide === 'top' ? `-${snapshot.layoutGap}px` : '0px';
+		const collapsedMarginBottom = snapshot.gapSide === 'bottom' ? `-${snapshot.layoutGap}px` : '0px';
 		row.classList.add('psn-undo-delete-pending');
 		row.style.height = `${height}px`;
 		row.style.overflow = 'hidden';
@@ -59255,8 +59330,8 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 			if (!row.isConnected || !row.classList.contains('psn-undo-delete-pending')) return;
 			row.style.height = '0px';
 			row.style.opacity = '0';
-			row.style.marginTop = '0';
-			row.style.marginBottom = '0';
+			row.style.marginTop = collapsedMarginTop;
+			row.style.marginBottom = collapsedMarginBottom;
 			row.style.transform = 'scale(.985)';
 			row.style.filter = 'brightness(.86)';
 		});
@@ -59298,8 +59373,8 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 		row.style.transition = 'none';
 		row.style.height = '0px';
 		row.style.opacity = '0';
-		row.style.marginTop = '0px';
-		row.style.marginBottom = '0px';
+		row.style.marginTop = snapshot.gapSide === 'top' ? `-${Math.max(0, Number(snapshot.layoutGap) || 0)}px` : '0px';
+		row.style.marginBottom = snapshot.gapSide === 'bottom' ? `-${Math.max(0, Number(snapshot.layoutGap) || 0)}px` : '0px';
 		row.style.transform = 'scale(.985)';
 		row.style.filter = 'brightness(.86)';
 		row.style.overflow = 'hidden';
@@ -59328,6 +59403,33 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 			row.style.transition = snapshot.transition || '';
 		}, 310);
 		return true;
+	};
+	
+
+	window.stagePsnUndoChatMessageCollapse = function(row) {
+		if (!row || !row.isConnected) return { row:null, divider:null };
+		let divider = null;
+		if (!row.nextElementSibling) {
+			let cursor = row.previousElementSibling;
+			while (cursor) {
+				const isMessageRow = (cursor.id && String(cursor.id).indexOf('msg-row-') === 0) || cursor.classList.contains('direct-message-row');
+				if (isMessageRow) break;
+				if (cursor.classList.contains('date-divider')) { divider = cursor; break; }
+				cursor = cursor.previousElementSibling;
+			}
+		}
+		return {
+			row:window.stagePsnUndoRowCollapse(row),
+			divider:divider ? window.stagePsnUndoRowCollapse(divider) : null
+		};
+	};
+
+	window.restorePsnUndoChatMessageCollapse = function(snapshot) {
+		if (!snapshot) return false;
+		let restored = false;
+		if (snapshot.divider) restored = window.restorePsnUndoRow(snapshot.divider) || restored;
+		if (snapshot.row) restored = window.restorePsnUndoRow(snapshot.row) || restored;
+		return restored;
 	};
 	
 	function clearIPMemory() {
@@ -76608,17 +76710,17 @@ function getVisibleChatStackEl(id) {
 			duration:5200,
 			stage:function() {
 				if (typeof playUiRemove === 'function') playUiRemove();
-				return window.stagePsnUndoRowCollapse(row);
+				return window.stagePsnUndoChatMessageCollapse(row);
 			},
 			undo:function(snapshot) {
 				if (Number(window.__directChatState.sessionToken || 0) !== sessionToken) return;
 				if (directMessageById(messageId)) {
-					if (!window.restorePsnUndoRow(snapshot)) renderDirectThread({ preserveScroll:true });
+					if (!window.restorePsnUndoChatMessageCollapse(snapshot)) renderDirectThread({ preserveScroll:true });
 				}
 			},
 			commit:function(snapshot) {
 				if (Number(window.__directChatState.sessionToken || 0) !== sessionToken || !socketChat || !socketChat.connected) {
-					if (directMessageById(messageId)) window.restorePsnUndoRow(snapshot);
+					if (directMessageById(messageId)) window.restorePsnUndoChatMessageCollapse(snapshot);
 					if (typeof showToastNotification === 'function') showToastNotification('Private Chat', 'Delete was cancelled because the session changed or the server disconnected.');
 					return;
 				}
@@ -82307,12 +82409,14 @@ function getVisibleChatStackEl(id) {
 				duration:5200,
 				stage:function() {
 					if (typeof playUiRemove === 'function') playUiRemove();
-					return window.stagePsnUndoRowCollapse(row);
+					const snapshot = window.stagePsnUndoChatMessageCollapse(row);
+					if (typeof refreshMentionJumpButton === 'function') requestAnimationFrame(() => refreshMentionJumpButton());
+					return snapshot;
 				},
-				undo:function(snapshot) { window.restorePsnUndoRow(snapshot); },
+				undo:function(snapshot) { window.restorePsnUndoChatMessageCollapse(snapshot); },
 				commit:function(snapshot) {
 					if (!socketChat || !socketChat.connected) {
-						window.restorePsnUndoRow(snapshot);
+						window.restorePsnUndoChatMessageCollapse(snapshot);
 						if (typeof showToastNotification === 'function') showToastNotification('Global Chat', 'Delete was cancelled because the server disconnected.');
 						return;
 					}
@@ -82375,7 +82479,7 @@ function getVisibleChatStackEl(id) {
         const visibleBottom = metricScrollTop + metricClientHeight - 24;
 
         if (window.__chatSearchActive) {
-            const rows = Array.from(box.querySelectorAll('[data-chat-mention-me="1"]'));
+            const rows = Array.from(box.querySelectorAll('[data-chat-mention-me="1"]:not(.psn-undo-delete-pending)'));
             let low = 0;
             let high = rows.length;
             while (low < high) {
@@ -82391,7 +82495,7 @@ function getVisibleChatStackEl(id) {
 
         const history = Array.isArray(window.messageHistory) ? window.messageHistory : [];
         if (!history.length) return { count:0, target:null, targetIndex:-1, targetId:'' };
-        const rows = Array.from(box.querySelectorAll('[id^="msg-row-"]'));
+        const rows = Array.from(box.querySelectorAll('[id^="msg-row-"]:not(.psn-undo-delete-pending)'));
         let rowLow = 0;
         let rowHigh = rows.length;
         while (rowLow < rowHigh) {
@@ -82406,7 +82510,13 @@ function getVisibleChatStackEl(id) {
             if (resolved > -1) visibleThroughIndex = resolved;
         }
 
-        const indices = getChatMentionHistoryIndices();
+        const pendingDeleteIds = new Set(Array.from(box.querySelectorAll('[id^="msg-row-"].psn-undo-delete-pending')).map(row => String(row.getAttribute('data-chat-msg-id') || row.id || '').replace(/^msg-row-/, '')));
+        const indices = pendingDeleteIds.size
+            ? getChatMentionHistoryIndices().filter(index => {
+                const message = history[index];
+                return !message || !pendingDeleteIds.has(getChatMessageTimeKey(message));
+            })
+            : getChatMentionHistoryIndices();
         let low = 0;
         let high = indices.length;
         while (low < high) {
