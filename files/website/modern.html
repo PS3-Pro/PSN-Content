@@ -48814,6 +48814,8 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 		const cardWishIcon = cardWishBtn ? cardWishBtn.querySelector('i') : null;
 		const wishlistView = document.getElementById('view-wishlist');
 		const isWishlistView = wishlistView && wishlistView.style.display === 'block';
+		const browseView = document.getElementById('view-browse');
+		const isBrowseView = !!(browseView && (browseView.style.display === 'block' || browseView.style.display === 'flex'));
 
 		const animateModalWishlist = (remove) => {
 			if (!modalWishAnimTarget) return;
@@ -48844,11 +48846,12 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 
 		let wishlistUndo = null;
 		if (index > -1) {
-			if (window.__psnPendingUndoAction && typeof window.finalizePsnUndoAction === 'function') window.finalizePsnUndoAction('commit', window.__psnPendingUndoAction.token);
+			if (!isBrowseView && window.__psnPendingUndoAction && typeof window.finalizePsnUndoAction === 'function') window.finalizePsnUndoAction('commit', window.__psnPendingUndoAction.token);
 			playUiRemove();
 			const removedWishlistItem = wishlist[index] || gameData;
 			wishlist.splice(index, 1);
 			wishlistUndo = { item:removedWishlistItem, index, identityKey, itemKey };
+			if (isBrowseView && typeof window.emitFriendActivityContentAction === 'function') window.emitFriendActivityContentAction('wishlist', removedWishlistItem, 'remove');
 
 			if (card) card.classList.remove('is-wishlisted');
 			if (isModalTitleWishBtn) {
@@ -48954,7 +48957,7 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 		checkTrophyProgress('wishlist_50', wishlist.length);
 		window.broadcastProfileUpdate();
 
-		if (wishlistUndo && typeof window.schedulePsnUndoAction === 'function') {
+		if (wishlistUndo && !isBrowseView && typeof window.schedulePsnUndoAction === 'function') {
 			const expectedUser = String(localStorage.getItem('psn_username') || '').trim();
 			const removedLabel = String(wishlistUndo.item && (wishlistUndo.item.cleanName || wishlistUndo.item.name || wishlistUndo.item.title || wishlistUndo.item.id) || 'Item');
 			window.schedulePsnUndoAction({
@@ -54615,7 +54618,6 @@ function formatLibraryLastPlayedBadge(game = {}) {
 	
 		const favIndex = favoritesLibrary.findIndex(f => f.path === game.path);
 		const removingFavorite = favIndex > -1;
-		let favoriteUndo = null;
 		const icon = btn.querySelector('i');
 	
 		if (favIndex > -1) {
@@ -54624,7 +54626,7 @@ function formatLibraryLastPlayedBadge(game = {}) {
 			const removedFavoriteItem = favoritesLibrary[favIndex] || game;
 			favoritesLibrary.splice(favIndex, 1);
 			if (typeof window.bumpLibraryCollectionRevision === 'function') window.bumpLibraryCollectionRevision('favorites');
-			favoriteUndo = { item:removedFavoriteItem, index:favIndex, activityItem:favoriteActivityItem(removedFavoriteItem) };
+			if (typeof window.emitFriendActivityContentAction === 'function') window.emitFriendActivityContentAction('favorite', favoriteActivityItem(removedFavoriteItem), 'remove');
 			if (typeof window.setSidebarCountPill === 'function') window.setSidebarCountPill('favorites', favoritesLibrary.length);
 			btn.style.pointerEvents = 'none';
 			btn.title = "Add to Favorites";
@@ -54707,42 +54709,6 @@ function formatLibraryLastPlayedBadge(game = {}) {
 		if (!removingFavorite) updateFavoritesLibraryUI(true);
 		window.broadcastProfileUpdate();
 
-		if (favoriteUndo && typeof window.schedulePsnUndoAction === 'function') {
-			const expectedUser = String(localStorage.getItem('psn_username') || '').trim();
-			const removedLabel = String(favoriteUndo.item && (favoriteUndo.item.title || favoriteUndo.item.cleanName || favoriteUndo.item.name || favoriteUndo.item.id) || 'Game');
-			window.schedulePsnUndoAction({
-				title:'Removed from Favorites',
-				description:`${removedLabel} was removed.`,
-				duration:5200,
-				stage:() => favoriteUndo,
-				commit:staged => {
-					if (!staged || (expectedUser && String(localStorage.getItem('psn_username') || '').trim() !== expectedUser)) return;
-					if (typeof window.emitFriendActivityContentAction === 'function') window.emitFriendActivityContentAction('favorite', staged.activityItem, 'remove');
-				},
-				undo:staged => {
-					if (!staged || (expectedUser && String(localStorage.getItem('psn_username') || '').trim() !== expectedUser)) return;
-					if (!favoritesLibrary.some(item => item && item.path === staged.item.path)) favoritesLibrary.splice(Math.max(0, Math.min(staged.index, favoritesLibrary.length)), 0, staged.item);
-					if (typeof window.bumpLibraryCollectionRevision === 'function') window.bumpLibraryCollectionRevision('favorites');
-					if (typeof window.setSidebarCountPill === 'function') window.setSidebarCountPill('favorites', favoritesLibrary.length);
-					if (card) card.classList.add('is-favorited');
-					if (icon) { icon.className = 'fas fa-star'; icon.style.color = '#ffcc00'; }
-					btn.title = 'Remove from Favorites';
-					saveState(STORAGE_KEY_FAVS, JSON.stringify(favoritesLibrary));
-					markProfileListChanged('favorites');
-					updateFavoritesLibraryUI(true);
-					if (typeof window.animatePsnUndoRestore === 'function') {
-						const restoredPath = String(staged.item && staged.item.path || '');
-						window.animatePsnUndoRestore(() => {
-							const grid = document.getElementById('ps3-favs-grid');
-							const restored = grid ? Array.from(grid.querySelectorAll('.game-card')).find(node => String(node.querySelector('.game-img')?.dataset.libPath || '') === restoredPath) : null;
-							return restored || (card && card.isConnected ? card : null);
-						}, 'card');
-					}
-					setTimeout(() => updateFavoritesLibraryUI(true), 500);
-					window.broadcastProfileUpdate();
-				}
-			});
-		}
 	};
 	
 	window.removeFromFavsOnly = async function(event, index, buttonOverride = null) {
