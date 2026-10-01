@@ -73592,7 +73592,8 @@ function getVisibleChatStackEl(id) {
 		conversationRefreshInFlight: false, conversationRefreshQueued: false, conversationRefreshTimer: 0, conversationRefreshWatchdog: 0, conversationRefreshToken: 0, conversationSignature: '', conversationEntryPending: false,
 		threadRequestToken: 0, threadRequestTimer: 0, threadLoadedPeer: '', sessionToken: 0, trimmedMessageIds: [], deletedThroughByPeer: Object.create(null), emptyConversationCloseTimer: 0, emptyConversationCloseToken: 0,
 		typingEmitActive: false, typingEmitPeer: '', typingStopTimer: 0, peerTyping: false, peerTypingName: '', peerTypingAvatar: '', peerTypingTimer: 0,
-		globalSearchResults: [], globalSearchLoading: false, globalSearchToken: 0, pendingHighlightMessageId: '', viewerBlocked: false, blockedByPeer: false
+		globalSearchResults: [], globalSearchLoading: false, globalSearchToken: 0, pendingHighlightMessageId: '', viewerBlocked: false, blockedByPeer: false,
+		virtualStart: 0, virtualEnd: 0, virtualBusy: false, virtualScrollFrame: 0
 	};
 
 	function directEscapeHtml(value) {
@@ -74472,6 +74473,275 @@ function getVisibleChatStackEl(id) {
 		return !list || (list.scrollHeight - list.scrollTop - list.clientHeight) <= threshold;
 	}
 
+	function getDirectVirtualInitialLimit() { return 50; }
+	function getDirectVirtualChunkSize() { return 50; }
+	function getDirectVirtualDomLimit() { return 80; }
+
+	function directVirtualizationEnabled() {
+		const state = window.__directChatState;
+		return !!(state && state.activePeer && !state.loadingThread && !String(state.searchQuery || '').trim());
+	}
+
+	function cancelDirectVirtualScrollFrame() {
+		const state = window.__directChatState;
+		if (!state) return;
+		if (state.virtualScrollFrame) {
+			try { cancelAnimationFrame(state.virtualScrollFrame); } catch (e) {}
+		}
+		state.virtualScrollFrame = 0;
+		state.virtualBusy = false;
+	}
+
+	function directMessageIndexById(messageId, messages = window.__directChatState.messages) {
+		const id = String(messageId || '');
+		if (!id || !Array.isArray(messages) || !messages.length) return -1;
+		const numericId = directMessageIdNumber(id);
+		if (numericId > 0) {
+			let low = 0;
+			let high = messages.length - 1;
+			while (low <= high) {
+				const mid = (low + high) >> 1;
+				const midId = directMessageIdNumber(messages[mid] && messages[mid].id);
+				if (midId === numericId && String(messages[mid] && messages[mid].id || '') === id) return mid;
+				if (midId > 0 && midId < numericId) low = mid + 1;
+				else if (midId > numericId) high = mid - 1;
+				else break;
+			}
+		}
+		for (let i = 0; i < messages.length; i++) {
+			if (String(messages[i] && messages[i].id || '') === id) return i;
+		}
+		return -1;
+	}
+
+	function directRenderedRowIndex(row, messages = window.__directChatState.messages) {
+		if (!row || !Array.isArray(messages)) return -1;
+		const id = String(row.dataset.directMessageId || '');
+		let index = Number(row.dataset.directIndex);
+		if (Number.isInteger(index) && index >= 0 && index < messages.length && String(messages[index] && messages[index].id || '') === id) return index;
+		index = directMessageIndexById(id, messages);
+		if (index >= 0) row.dataset.directIndex = String(index);
+		return index;
+	}
+
+	function captureDirectScrollAnchor(list) {
+		if (!list) return null;
+		const rows = list.querySelectorAll('.direct-message-row');
+		const viewportTop = list.scrollTop;
+		for (const row of rows) {
+			if (row.offsetTop + row.offsetHeight >= viewportTop + 1) {
+				return { id:String(row.dataset.directMessageId || ''), offset:row.offsetTop - viewportTop, scrollTop:viewportTop };
+			}
+		}
+		return { id:'', offset:0, scrollTop:viewportTop };
+	}
+
+	function restoreDirectScrollAnchor(list, anchor) {
+		if (!list || !anchor) return false;
+		const row = anchor.id ? list.querySelector(`[data-direct-message-id="${CSS.escape(anchor.id)}"]`) : null;
+		const previousBehavior = list.style.getPropertyValue('scroll-behavior');
+		const previousPriority = list.style.getPropertyPriority('scroll-behavior');
+		list.style.setProperty('scroll-behavior', 'auto', 'important');
+		if (row) list.scrollTop = Math.max(0, row.offsetTop - anchor.offset);
+		else if (Number.isFinite(anchor.scrollTop)) list.scrollTop = Math.max(0, anchor.scrollTop);
+		requestAnimationFrame(() => {
+			if (!list.isConnected) return;
+			if (previousBehavior) list.style.setProperty('scroll-behavior', previousBehavior, previousPriority);
+			else list.style.removeProperty('scroll-behavior');
+		});
+		return !!row;
+	}
+
+	function clearDirectVirtualDecorators(list) {
+		if (!list) return;
+		list.querySelectorAll('.date-divider.direct-date-divider,#direct-unread-divider').forEach(node => {
+			if (node.__directUnreadObserver) {
+				try { node.__directUnreadObserver.disconnect(); } catch (e) {}
+				node.__directUnreadObserver = null;
+			}
+			node.remove();
+		});
+	}
+
+	function rebuildDirectVirtualDecorators(list) {
+		if (!list || !directVirtualizationEnabled()) return false;
+		const state = window.__directChatState;
+		const messages = Array.isArray(state.messages) ? state.messages : [];
+		clearDirectVirtualDecorators(list);
+		const me = directCurrentUser();
+		const hasUnreadBoundary = state.unreadDividerAfterId !== '' && state.unreadDividerAfterId != null;
+		const unreadAfterId = hasUnreadBoundary ? directMessageIdNumber(state.unreadDividerAfterId) : -1;
+		let lastDay = '';
+		let unreadAdded = false;
+		Array.from(list.querySelectorAll('.direct-message-row')).forEach(row => {
+			const index = directRenderedRowIndex(row, messages);
+			if (index < 0) return;
+			const message = messages[index];
+			const day = directMessageDateKey(message && message.createdAt);
+			if (day && day !== lastDay) {
+				const divider = directCreateDateDivider(message.createdAt);
+				if (divider) row.before(divider);
+				lastDay = day;
+			}
+			if (!unreadAdded && hasUnreadBoundary && message && message.to === me && directMessageIdNumber(message.id) > unreadAfterId) {
+				const divider = document.createElement('div');
+				divider.id = 'direct-unread-divider';
+				divider.className = 'ps-new-messages-container';
+				divider.innerHTML = '<div class="ps-line left"></div><span class="ps-unread-text">UNREAD MESSAGES</span><div class="ps-line right"></div>';
+				row.before(divider);
+				unreadAdded = true;
+			}
+		});
+		if (unreadAdded) requestAnimationFrame(setupDirectUnreadDividerAutoRemove);
+		return true;
+	}
+
+	function directRowsHtml(messages, startIndex = 0, options = {}) {
+		return (Array.isArray(messages) ? messages : []).map((message, offset) =>
+			directMessageRowHtml(message, { animateMessages:options.animateMessages === true, messageIndex:startIndex + offset })
+		).join('');
+	}
+
+	function hydrateDirectVirtualMessages(messages, list) {
+		const items = Array.isArray(messages) ? messages : [];
+		if (!items.length || !list) return;
+		hydrateDirectLinkPreviews(items);
+		if (isDirectChatAutoTranslateEnabled()) {
+			items.forEach(message => {
+				if (message && message.id) autoTranslateDirectMessage(message.id, list);
+			});
+		}
+	}
+
+	function directResolveVirtualRange(messages, options = {}) {
+		const state = window.__directChatState;
+		const total = Array.isArray(messages) ? messages.length : 0;
+		if (!total) return { start:0, end:0 };
+		const explicitStart = Number(options.virtualStart);
+		const explicitEnd = Number(options.virtualEnd);
+		if (Number.isInteger(explicitStart) || Number.isInteger(explicitEnd)) {
+			const start = Math.max(0, Math.min(total - 1, Number.isInteger(explicitStart) ? explicitStart : 0));
+			const end = Math.max(start + 1, Math.min(total, Number.isInteger(explicitEnd) ? explicitEnd : start + getDirectVirtualInitialLimit()));
+			return { start, end };
+		}
+		if (options.forceBottom === true || state.virtualEnd <= state.virtualStart || state.virtualEnd > total) {
+			const end = total;
+			return { start:Math.max(0, end - getDirectVirtualInitialLimit()), end };
+		}
+		const span = Math.max(1, Math.min(getDirectVirtualDomLimit(), state.virtualEnd - state.virtualStart));
+		const start = Math.max(0, Math.min(state.virtualStart, Math.max(0, total - 1)));
+		return { start, end:Math.min(total, start + span) };
+	}
+
+	function trimDirectVirtualRows(list, keepStart, keepEnd) {
+		if (!list) return 0;
+		const messages = window.__directChatState.messages || [];
+		let removed = 0;
+		Array.from(list.querySelectorAll('.direct-message-row')).forEach(row => {
+			const index = directRenderedRowIndex(row, messages);
+			if (index < keepStart || index >= keepEnd) {
+				row.remove();
+				removed++;
+			}
+		});
+		return removed;
+	}
+
+	function loadOlderDirectMessages() {
+		const state = window.__directChatState;
+		const list = document.getElementById('direct-message-list');
+		const messages = Array.isArray(state.messages) ? state.messages : [];
+		if (!list || !directVirtualizationEnabled() || state.virtualBusy || state.virtualStart <= 0) return false;
+		const currentStart = Math.max(0, state.virtualStart);
+		const currentEnd = Math.max(currentStart, Math.min(messages.length, state.virtualEnd));
+		const nextStart = Math.max(0, currentStart - getDirectVirtualChunkSize());
+		if (nextStart >= currentStart) return false;
+		state.virtualBusy = true;
+		const anchor = captureDirectScrollAnchor(list);
+		const previousOverflowAnchor = list.style.getPropertyValue('overflow-anchor');
+		const previousOverflowPriority = list.style.getPropertyPriority('overflow-anchor');
+		list.style.setProperty('overflow-anchor', 'none', 'important');
+		try {
+			clearDirectVirtualDecorators(list);
+			const template = document.createElement('template');
+			template.innerHTML = directRowsHtml(messages.slice(nextStart, currentStart), nextStart);
+			list.insertBefore(template.content, list.firstChild);
+			const keepStart = nextStart;
+			const keepEnd = Math.min(currentEnd, keepStart + getDirectVirtualDomLimit());
+			trimDirectVirtualRows(list, keepStart, keepEnd);
+			state.virtualStart = keepStart;
+			state.virtualEnd = keepEnd;
+			rebuildDirectVirtualDecorators(list);
+			hydrateDirectVirtualMessages(messages.slice(nextStart, Math.min(currentStart, keepEnd)), list);
+			updateDirectSeenMarker();
+			restoreDirectScrollAnchor(list, anchor);
+			if (typeof window.scheduleSeenChatNotificationConsumption === 'function') requestAnimationFrame(() => window.scheduleSeenChatNotificationConsumption('private'));
+			return true;
+		} finally {
+			state.virtualBusy = false;
+			requestAnimationFrame(() => {
+				if (!list.isConnected) return;
+				if (previousOverflowAnchor) list.style.setProperty('overflow-anchor', previousOverflowAnchor, previousOverflowPriority);
+				else list.style.removeProperty('overflow-anchor');
+			});
+		}
+	}
+
+	function loadNewerDirectMessages() {
+		const state = window.__directChatState;
+		const list = document.getElementById('direct-message-list');
+		const messages = Array.isArray(state.messages) ? state.messages : [];
+		if (!list || !directVirtualizationEnabled() || state.virtualBusy || state.virtualEnd <= 0 || state.virtualEnd >= messages.length) return false;
+		const currentStart = Math.max(0, state.virtualStart);
+		const currentEnd = Math.max(currentStart, Math.min(messages.length, state.virtualEnd));
+		const nextEnd = Math.min(messages.length, currentEnd + getDirectVirtualChunkSize());
+		if (nextEnd <= currentEnd) return false;
+		state.virtualBusy = true;
+		const anchor = captureDirectScrollAnchor(list);
+		const previousOverflowAnchor = list.style.getPropertyValue('overflow-anchor');
+		const previousOverflowPriority = list.style.getPropertyPriority('overflow-anchor');
+		list.style.setProperty('overflow-anchor', 'none', 'important');
+		try {
+			clearDirectVirtualDecorators(list);
+			const template = document.createElement('template');
+			template.innerHTML = directRowsHtml(messages.slice(currentEnd, nextEnd), currentEnd);
+			list.appendChild(template.content);
+			const keepEnd = nextEnd;
+			const keepStart = Math.max(currentStart, keepEnd - getDirectVirtualDomLimit());
+			trimDirectVirtualRows(list, keepStart, keepEnd);
+			state.virtualStart = keepStart;
+			state.virtualEnd = keepEnd;
+			rebuildDirectVirtualDecorators(list);
+			hydrateDirectVirtualMessages(messages.slice(Math.max(currentEnd, keepStart), nextEnd), list);
+			updateDirectSeenMarker();
+			restoreDirectScrollAnchor(list, anchor);
+			if (typeof window.scheduleSeenChatNotificationConsumption === 'function') requestAnimationFrame(() => window.scheduleSeenChatNotificationConsumption('private'));
+			return true;
+		} finally {
+			state.virtualBusy = false;
+			requestAnimationFrame(() => {
+				if (!list.isConnected) return;
+				if (previousOverflowAnchor) list.style.setProperty('overflow-anchor', previousOverflowAnchor, previousOverflowPriority);
+				else list.style.removeProperty('overflow-anchor');
+			});
+		}
+	}
+
+	function scheduleDirectVirtualScroll(list = document.getElementById('direct-message-list')) {
+		const state = window.__directChatState;
+		if (!list || !list.isConnected || !directVirtualizationEnabled()) return;
+		if (state.virtualScrollFrame) return;
+		const peer = String(state.activePeer || '');
+		const sessionToken = Number(state.sessionToken || 0);
+		state.virtualScrollFrame = requestAnimationFrame(() => {
+			state.virtualScrollFrame = 0;
+			if (!list.isConnected || String(state.activePeer || '') !== peer || Number(state.sessionToken || 0) !== sessionToken || !directVirtualizationEnabled() || state.virtualBusy) return;
+			const threshold = Math.max(120, Math.floor(list.clientHeight * 0.18));
+			if (list.scrollTop < threshold && state.virtualStart > 0) loadOlderDirectMessages();
+			else if ((list.scrollHeight - list.scrollTop - list.clientHeight) < threshold && state.virtualEnd < state.messages.length) loadNewerDirectMessages();
+		});
+	}
+
 	function prepareDirectConversationListEntry() {
 		const state = window.__directChatState;
 		const list = document.getElementById('direct-conversations-list');
@@ -74655,7 +74925,9 @@ function getVisibleChatStackEl(id) {
 	function directClearActiveConversation(peer) {
 		const state = window.__directChatState;
 		if (state.activePeer !== peer) return;
-		state.activePeer = ''; state.peer = null; state.messages = []; state.messageCount = 0; state.trimmedMessageIds = []; state.threadLoadedPeer = '';
+		cancelDirectVirtualScrollFrame();
+		state.activePeer = ''; state.peer = null; state.messages = []; state.messageCount = 0; state.trimmedMessageIds = []; state.threadLoadedPeer = ''; state.virtualStart = 0; state.virtualEnd = 0; state.virtualBusy = false;
+		clearDirectChatTranslationCache();
 		state.myLastReadId = '0'; state.peerLastReadId = '0'; state.loadingThread = false; state.viewerBlocked = false; state.blockedByPeer = false;
 		state.pendingMedia = []; state.pendingUploads = 0; state.mediaToken = Number(state.mediaToken || 0) + 1;
 		state.replyTo = null; state.editingMessageId = ''; state.inputRange = null;
@@ -74680,7 +74952,14 @@ function getVisibleChatStackEl(id) {
 		const hasNewerConversationMessage = newestConversationId > deletedThroughId;
 
 		if (state.activePeer === peer) {
-			state.messages = (Array.isArray(state.messages) ? state.messages : []).filter(message => directMessageIdNumber(message && message.id) > deletedThroughId);
+			const beforeMessages = Array.isArray(state.messages) ? state.messages : [];
+			const previousLength = beforeMessages.length;
+			state.messages = beforeMessages.filter(message => directMessageIdNumber(message && message.id) > deletedThroughId);
+			const removedPrefixCount = Math.max(0, previousLength - state.messages.length);
+			if (removedPrefixCount) {
+				state.virtualStart = Math.max(0, Number(state.virtualStart || 0) - removedPrefixCount);
+				state.virtualEnd = Math.max(state.virtualStart, Number(state.virtualEnd || 0) - removedPrefixCount);
+			}
 			if (state.messages.length) {
 				state.messageCount = state.messages.length;
 				state.threadLoadedPeer = peer;
@@ -75035,7 +75314,8 @@ function getVisibleChatStackEl(id) {
 			if (Number(state.emptyConversationCloseToken || 0) !== token) return;
 			state.emptyConversationCloseTimer = 0;
 			if (state.activePeer === peer && (!Array.isArray(state.messages) || !state.messages.length)) {
-				state.activePeer = ''; state.peer = null; state.messages = []; state.messageCount = 0; state.trimmedMessageIds = []; state.threadLoadedPeer = '';
+				state.activePeer = ''; state.peer = null; state.messages = []; state.messageCount = 0; state.trimmedMessageIds = []; state.threadLoadedPeer = ''; state.virtualStart = 0; state.virtualEnd = 0; state.virtualBusy = false;
+				clearDirectChatTranslationCache();
 				state.myLastReadId = '0'; state.peerLastReadId = '0'; state.unreadDividerAfterId = ''; state.loadingThread = false;
 				state.pendingMedia = []; state.pendingUploads = 0; state.mediaToken = Number(state.mediaToken || 0) + 1;
 				state.replyTo = null; state.editingMessageId = ''; state.inputRange = null;
@@ -75279,7 +75559,10 @@ function getVisibleChatStackEl(id) {
 		const directList = document.getElementById('direct-message-list');
 		if (directList && directList.dataset.notificationConsumeBound !== '1') {
 			directList.dataset.notificationConsumeBound = '1';
-			directList.addEventListener('scroll', () => window.scheduleSeenChatNotificationConsumption('private'), { passive:true });
+			directList.addEventListener('scroll', () => {
+				window.scheduleSeenChatNotificationConsumption('private');
+				scheduleDirectVirtualScroll(directList);
+			}, { passive:true });
 		}
 	}
 	if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', bindSeenChatNotificationConsumption, { once:true });
@@ -75307,7 +75590,26 @@ function getVisibleChatStackEl(id) {
 	};
 
 	function directMessageById(id) {
-		return (window.__directChatState.messages || []).find(item => String(item && item.id || '') === String(id || '')) || null;
+		const messages = window.__directChatState.messages || [];
+		const index = directMessageIndexById(id, messages);
+		return index >= 0 ? messages[index] || null : null;
+	}
+
+	function clearDirectChatTranslationCache() {
+		window.directChatTranslationCache = Object.create(null);
+	}
+
+	function pruneDirectChatTranslationCache(messages = window.__directChatState.messages) {
+		const cache = window.directChatTranslationCache;
+		if (!cache || typeof cache !== 'object') return 0;
+		const keep = new Set((Array.isArray(messages) ? messages : []).map(message => String(message && message.id || '')).filter(Boolean));
+		let removed = 0;
+		Object.keys(cache).forEach(id => {
+			if (keep.has(String(id))) return;
+			delete cache[id];
+			removed++;
+		});
+		return removed;
 	}
 
 	function renderDirectComposerContext() {
@@ -75383,10 +75685,22 @@ function getVisibleChatStackEl(id) {
 	};
 
 	window.scrollToDirectMessage = function(messageId) {
-		const list=document.getElementById('direct-message-list');
-		const row=list ? Array.from(list.querySelectorAll('[data-direct-message-id]')).find(el => String(el.dataset.directMessageId || '') === String(messageId || '')) : null;
+		const state = window.__directChatState;
+		const list = document.getElementById('direct-message-list');
+		const id = String(messageId || '');
+		let row = list ? list.querySelector(`[data-direct-message-id="${CSS.escape(id)}"]`) : null;
+		if (!row && list && directVirtualizationEnabled()) {
+			const index = directMessageIndexById(id, state.messages);
+			if (index >= 0) {
+				const limit = getDirectVirtualInitialLimit();
+				const start = Math.max(0, Math.min(Math.max(0, state.messages.length - limit), index - Math.floor(limit / 2)));
+				renderDirectThread({ virtualStart:start, virtualEnd:Math.min(state.messages.length, start + limit) });
+				row = list.querySelector(`[data-direct-message-id="${CSS.escape(id)}"]`);
+			}
+		}
 		if (!row) return false;
-		row.scrollIntoView({behavior:'smooth',block:'center'}); row.classList.remove('direct-message-highlight'); void row.offsetWidth; row.classList.add('direct-message-highlight');
+		row.scrollIntoView({behavior:'smooth',block:'center'});
+		row.classList.remove('direct-message-highlight'); void row.offsetWidth; row.classList.add('direct-message-highlight');
 		setTimeout(() => row && row.classList.remove('direct-message-highlight'), 1800);
 		if (typeof playUiClick === 'function') playUiClick();
 		return true;
@@ -75533,6 +75847,7 @@ function getVisibleChatStackEl(id) {
 		const observer = new IntersectionObserver(entries => {
 			if (!entries[0] || !entries[0].isIntersecting) return;
 			observer.disconnect();
+			divider.__directUnreadObserver = null;
 			setTimeout(() => {
 				if (!divider.isConnected || window.__directChatState.activePeer !== peer) return;
 				divider.style.maxHeight = divider.scrollHeight + 'px';
@@ -75551,6 +75866,7 @@ function getVisibleChatStackEl(id) {
 				}, 550);
 			}, 3000);
 		}, { root:list, threshold:0.1 });
+		divider.__directUnreadObserver = observer;
 		observer.observe(divider);
 	}
 
@@ -75799,6 +76115,7 @@ function getVisibleChatStackEl(id) {
 		const me = directCurrentUser();
 		const own = msg.from === me;
 		const messageEntryClass = options.animateMessages === true ? ' msg-anim' : '';
+		const messageIndexAttr = Number.isInteger(options.messageIndex) ? ` data-direct-index="${options.messageIndex}"` : '';
 		const id = directMessageIdNumber(msg.id);
 		const media = (Array.isArray(msg.content) ? msg.content : []).filter(url => /^https?:\/\//i.test(String(url || ''))).slice(0, 10);
 		const mediaHtml = media.length ? `<div class="direct-message-media${media.length === 1 ? ' single' : ''}">${media.map((url, index) => `<button type="button" class="direct-message-media-item" data-direct-media-index="${index}" aria-label="Open attached image"><img src="${directEscapeHtml(url)}" alt="" loading="lazy"></button>`).join('')}</div>` : '';
@@ -75814,13 +76131,13 @@ function getVisibleChatStackEl(id) {
 		const ytId = previewUrl && typeof getYoutubeId === 'function' ? getYoutubeId(previewUrl) : null;
 		const previewHtml = ytId ? `<div class="yt-video-card direct-message-youtube" onclick="playTrailerDirect('${directEscapeHtml(ytId)}')"><img src="https://img.youtube.com/vi/${directEscapeHtml(ytId)}/mqdefault.jpg" class="yt-thumb" loading="lazy" decoding="async"><div class="yt-play-overlay"><i class="fas fa-play"></i></div><div class="yt-card-info"><span>Watch Video</span><i class="fab fa-youtube"></i></div></div>` : (previewUrl ? `<div id="direct-lp-${directEscapeHtml(msg.id)}" class="direct-link-preview-host"></div>` : '');
 		const reactionsHtml = directReactionHtml(msg);
-		return `<div class="direct-message-row${own ? ' own' : ''}${messageEntryClass}" data-direct-message-id="${directEscapeHtml(msg.id)}" data-direct-own="${own ? '1' : '0'}"><div class="direct-message-stack"><div class="direct-message-bubble${textHasTranslatableText ? ' has-translate' : ''}">${translateBtnHtml}${replyHtml}${textHtml}${mediaHtml}${previewHtml}</div>${reactionsHtml ? `<div class="reactions-container">${reactionsHtml}</div>` : ''}<div class="direct-message-actions"><span>${directEscapeHtml(directFormatMessageTime(msg.createdAt))}</span>${directDeliveryHtml(msg)}<button type="button" class="direct-message-action reply" onclick="event.stopPropagation(); window.setDirectReply('${directEscapeHtml(msg.id)}')" onmouseenter="if(typeof playUiArrow==='function') playUiArrow()" title="Reply" aria-label="Reply"><i class="fas fa-reply"></i></button><button type="button" class="direct-message-action react" onclick="window.openDirectReactionPicker(event, '${directEscapeHtml(msg.id)}')" onmouseenter="if(typeof playUiArrow==='function') playUiArrow()" title="React" aria-label="React"><i class="fas fa-smile"></i></button>${own ? `<button type="button" class="direct-message-action edit" onclick="event.stopPropagation(); window.startDirectEdit('${directEscapeHtml(msg.id)}')" onmouseenter="if(typeof playUiArrow==='function') playUiArrow()" title="Edit" aria-label="Edit"><i class="fas fa-edit"></i></button><button type="button" class="direct-message-action delete" onclick="event.stopPropagation(); window.deleteDirectMessage('${directEscapeHtml(msg.id)}')" onmouseenter="if(typeof playUiArrow==='function') playUiArrow()" title="Delete" aria-label="Delete"><i class="fas fa-trash-alt"></i></button>` : ''}</div></div></div>`;
+		return `<div class="direct-message-row${own ? ' own' : ''}${messageEntryClass}" data-direct-message-id="${directEscapeHtml(msg.id)}" data-direct-own="${own ? '1' : '0'}"${messageIndexAttr}><div class="direct-message-stack"><div class="direct-message-bubble${textHasTranslatableText ? ' has-translate' : ''}">${translateBtnHtml}${replyHtml}${textHtml}${mediaHtml}${previewHtml}</div>${reactionsHtml ? `<div class="reactions-container">${reactionsHtml}</div>` : ''}<div class="direct-message-actions"><span>${directEscapeHtml(directFormatMessageTime(msg.createdAt))}</span>${directDeliveryHtml(msg)}<button type="button" class="direct-message-action reply" onclick="event.stopPropagation(); window.setDirectReply('${directEscapeHtml(msg.id)}')" onmouseenter="if(typeof playUiArrow==='function') playUiArrow()" title="Reply" aria-label="Reply"><i class="fas fa-reply"></i></button><button type="button" class="direct-message-action react" onclick="window.openDirectReactionPicker(event, '${directEscapeHtml(msg.id)}')" onmouseenter="if(typeof playUiArrow==='function') playUiArrow()" title="React" aria-label="React"><i class="fas fa-smile"></i></button>${own ? `<button type="button" class="direct-message-action edit" onclick="event.stopPropagation(); window.startDirectEdit('${directEscapeHtml(msg.id)}')" onmouseenter="if(typeof playUiArrow==='function') playUiArrow()" title="Edit" aria-label="Edit"><i class="fas fa-edit"></i></button><button type="button" class="direct-message-action delete" onclick="event.stopPropagation(); window.deleteDirectMessage('${directEscapeHtml(msg.id)}')" onmouseenter="if(typeof playUiArrow==='function') playUiArrow()" title="Delete" aria-label="Delete"><i class="fas fa-trash-alt"></i></button>` : ''}</div></div></div>`;
 	}
 
 	function applyDirectMessageUpdate(message) {
 		if (!message || !message.id) return false;
 		const state=window.__directChatState;
-		const index=state.messages.findIndex(item=>String(item&&item.id||'')===String(message.id));
+		const index=directMessageIndexById(message.id, state.messages);
 		if(index<0) return false;
 		if (directMessageStateSignature(state.messages[index]) === directMessageStateSignature(message)) return false;
 		state.messages[index]=message;
@@ -75828,12 +76145,14 @@ function getVisibleChatStackEl(id) {
 		if (String(state.searchQuery || '').trim()) { renderDirectThread({ preserveScroll:true, searchUpdate:true }); return true; }
 		const list = document.getElementById('direct-message-list');
 		const row = list ? list.querySelector(`[data-direct-message-id="${CSS.escape(String(message.id))}"]`) : null;
-		if (!row || !list) { renderDirectThread({ preserveScroll:true }); return true; }
+		if (!list) return true;
+		if (!row && directVirtualizationEnabled()) return true;
+		if (!row) { renderDirectThread({ preserveScroll:true }); return true; }
 		const keepBottom = directThreadNearBottom();
 		const previousScrollTop = list.scrollTop;
 		const previousScrollHeight = list.scrollHeight;
 		const rowWasAboveViewport = (row.offsetTop + row.offsetHeight) <= previousScrollTop;
-		row.outerHTML = directMessageRowHtml(message);
+		row.outerHTML = directMessageRowHtml(message, { messageIndex:index });
 		hydrateDirectLinkPreviews([message]);
 		if (isDirectChatAutoTranslateEnabled()) autoTranslateDirectMessage(message.id, list);
 		requestAnimationFrame(() => {
@@ -75878,9 +76197,15 @@ function getVisibleChatStackEl(id) {
 						return;
 					}
 					const state = window.__directChatState;
+					const removedIndex = directMessageIndexById(messageId, state.messages);
 					const beforeCount = state.messages.length;
 					state.messages = state.messages.filter(item => String(item && item.id || '') !== String(messageId));
-					if (state.messages.length !== beforeCount) { state.messageCount = Math.max(0, Math.max(state.messages.length, Number(state.messageCount || 0) - 1)); updateDirectThreadMessageCount(state.messageCount); }
+					if (state.messages.length !== beforeCount) {
+						if (removedIndex >= 0 && removedIndex < state.virtualStart) { state.virtualStart = Math.max(0, state.virtualStart - 1); state.virtualEnd = Math.max(state.virtualStart, state.virtualEnd - 1); }
+						else if (removedIndex >= 0 && removedIndex < state.virtualEnd) state.virtualEnd = Math.max(state.virtualStart, state.virtualEnd - 1);
+						state.messageCount = Math.max(0, Math.max(state.messages.length, Number(state.messageCount || 0) - 1));
+						updateDirectThreadMessageCount(state.messageCount);
+					}
 					if (String(state.editingMessageId || '') === String(messageId) || (state.replyTo && String(state.replyTo.id || '') === String(messageId))) window.cancelDirectComposeMode({ silent:true, clearInput:String(state.editingMessageId || '') === String(messageId) });
 					if (!removeDirectMessageRow(messageId)) renderDirectThread({ preserveScroll:true });
 					if (!directApplyConversationDelete(response)) window.refreshDirectConversations({ preserveThread:true });
@@ -75984,6 +76309,7 @@ function getVisibleChatStackEl(id) {
 		const wasNearBottom = directThreadNearBottom();
 		const previousScrollTop = list.scrollTop;
 		const previousScrollHeight = list.scrollHeight;
+		const anchor = options.preserveScroll === true ? captureDirectScrollAnchor(list) : null;
 		if (state.loadingThread) {
 			showDirectHistoryLoading(list, 'Preparing messages');
 			return;
@@ -75991,28 +76317,43 @@ function getVisibleChatStackEl(id) {
 		const allMessages = Array.isArray(state.messages) ? state.messages : [];
 		const messages = directGetVisibleMessages();
 		if (!allMessages.length) {
+			state.virtualStart = 0; state.virtualEnd = 0;
 			list.innerHTML = '<div class="direct-thread-empty" style="min-height:100%;"><i class="fas fa-paper-plane"></i><div>No messages yet. Say hi.</div></div>';
 			return;
 		}
-		if (String(state.searchQuery || '').trim() && !messages.length) {
+		const searching = !!String(state.searchQuery || '').trim();
+		if (searching && !messages.length) {
 			list.innerHTML = '<div class="direct-thread-empty" style="min-height:100%;"><i class="fas fa-search"></i><div>No messages found.</div><small>No messages match your search or filters.</small><button type="button" class="action-btn" style="margin-top:8px;" onclick="if(typeof playUiBack===\'function\') playUiBack(); window.clearGlobalSearch();"><i class="fas fa-times"></i> CLEAR SEARCH</button></div>';
 			if (document.getElementById('chat-search-dropdown')?.style.display === 'flex') renderDirectSearchFilters();
 			return;
 		}
-		const unreadAfterId = String(state.searchQuery || '').trim() ? '' : state.unreadDividerAfterId;
-		list.innerHTML = directMessagesWithDatePillsHtml(messages, { animateMessages: options.animateMessages === true, unreadAfterId });
+
+		let renderedMessages = messages;
+		if (searching) {
+			const unreadAfterId = '';
+			list.innerHTML = directMessagesWithDatePillsHtml(messages, { animateMessages:options.animateMessages === true, unreadAfterId });
+		} else {
+			const range = directResolveVirtualRange(allMessages, options);
+			state.virtualStart = range.start;
+			state.virtualEnd = range.end;
+			renderedMessages = allMessages.slice(range.start, range.end);
+			list.innerHTML = directRowsHtml(renderedMessages, range.start, { animateMessages:options.animateMessages === true });
+			rebuildDirectVirtualDecorators(list);
+		}
 		state.trimmedMessageIds = [];
-		hydrateDirectLinkPreviews(messages);
+		hydrateDirectLinkPreviews(renderedMessages);
 		if (isDirectChatAutoTranslateEnabled()) requestAnimationFrame(() => autoTranslateVisibleDirectMessages(list));
 		if (document.getElementById('chat-search-dropdown')?.style.display === 'flex') renderDirectSearchFilters();
-		if (!String(state.searchQuery || '').trim()) requestAnimationFrame(setupDirectUnreadDividerAutoRemove);
+		if (searching) requestAnimationFrame(setupDirectUnreadDividerAutoRemove);
 		requestAnimationFrame(() => {
-			if (!list) return;
+			if (!list.isConnected) return;
 			if (options.searchUpdate === true) list.scrollTop = 0;
-			else if (options.forceBottom === true || (!options.preserveScroll && wasNearBottom)) list.scrollTop = list.scrollHeight;
+			else if (options.forceBottom === true || (!options.preserveScroll && wasNearBottom && !Number.isInteger(Number(options.virtualStart)))) list.scrollTop = list.scrollHeight;
 			else if (options.preserveScroll === true) {
-				const delta = list.scrollHeight - previousScrollHeight;
-				list.scrollTop = Math.max(0, previousScrollTop + delta);
+				if (!restoreDirectScrollAnchor(list, anchor)) {
+					const delta = list.scrollHeight - previousScrollHeight;
+					list.scrollTop = Math.max(0, previousScrollTop + delta);
+				}
 			}
 			if (typeof window.scheduleSeenChatNotificationConsumption === 'function') requestAnimationFrame(() => window.scheduleSeenChatNotificationConsumption('private'));
 		});
@@ -76026,35 +76367,41 @@ function getVisibleChatStackEl(id) {
 		const messages = Array.isArray(state.messages) ? state.messages : [];
 		const last = messages[messages.length - 1];
 		if (!last || String(last.id || '') !== String(message.id || '')) return false;
-		if (list.querySelector('.direct-loading,.direct-thread-empty,#direct-history-loading') || list.querySelector(`[data-direct-message-id="${CSS.escape(String(message.id))}"]`)) return false;
-		const keepBottom = options.forceBottom === true || directThreadNearBottom();
-		const previousScrollTop = list.scrollTop;
-		const previousMessage = messages.length > 1 ? messages[messages.length - 2] : null;
-		if (!previousMessage || directMessageDateKey(previousMessage.createdAt) !== directMessageDateKey(message.createdAt)) {
-			const divider = directCreateDateDivider(message.createdAt);
-			if (divider) list.appendChild(divider);
-		}
-		const holder = document.createElement('div');
-		holder.innerHTML = directMessageRowHtml(message, { animateMessages:true });
-		const row = holder.firstElementChild;
-		if (!row) return false;
-		list.appendChild(row);
-		let removedAboveHeight = 0;
+		const newIndex = messages.length - 1;
+		const previousLength = newIndex;
 		const trimmedIds = Array.isArray(state.trimmedMessageIds) ? state.trimmedMessageIds.splice(0) : [];
-		trimmedIds.forEach(trimmedId => {
-			const trimmedRow = list.querySelector(`[data-direct-message-id="${CSS.escape(String(trimmedId))}"]`);
-			if (!trimmedRow) return;
-			if ((trimmedRow.offsetTop + trimmedRow.offsetHeight) <= previousScrollTop) removedAboveHeight += trimmedRow.offsetHeight;
-			trimmedRow.remove();
-		});
-		if (trimmedIds.length) removedAboveHeight += directCleanupDateDividers(list, previousScrollTop);
-		hydrateDirectLinkPreviews([message]);
-		if (isDirectChatAutoTranslateEnabled()) autoTranslateDirectMessage(message.id, list);
+		if (trimmedIds.length) {
+			const trimAnchor = captureDirectScrollAnchor(list);
+			clearDirectVirtualDecorators(list);
+			trimmedIds.forEach(trimmedId => {
+				list.querySelector(`[data-direct-message-id="${CSS.escape(String(trimmedId))}"]`)?.remove();
+			});
+			rebuildDirectVirtualDecorators(list);
+			restoreDirectScrollAnchor(list, trimAnchor);
+		}
+		const windowAtTail = state.virtualEnd >= previousLength || state.virtualEnd <= state.virtualStart;
+		if (!windowAtTail && options.forceBottom !== true) return true;
+		if (options.forceBottom === true && !windowAtTail) return false;
+		if (list.querySelector('.direct-loading,.direct-thread-empty,#direct-history-loading') || list.querySelector(`[data-direct-message-id="${CSS.escape(String(message.id))}"]`)) return false;
+
+		const keepBottom = options.forceBottom === true || directThreadNearBottom();
+		const anchor = keepBottom ? null : captureDirectScrollAnchor(list);
+		clearDirectVirtualDecorators(list);
+		const template = document.createElement('template');
+		template.innerHTML = directRowsHtml([message], newIndex, { animateMessages:true });
+		list.appendChild(template.content);
+
+		state.virtualEnd = messages.length;
+		state.virtualStart = Math.max(0, Math.min(state.virtualStart, state.virtualEnd - 1));
+		if (state.virtualEnd - state.virtualStart > getDirectVirtualDomLimit()) state.virtualStart = state.virtualEnd - getDirectVirtualDomLimit();
+		trimDirectVirtualRows(list, state.virtualStart, state.virtualEnd);
+		rebuildDirectVirtualDecorators(list);
+		hydrateDirectVirtualMessages([message], list);
 		updateDirectSeenMarker();
 		requestAnimationFrame(() => {
 			if (!list.isConnected) return;
 			if (keepBottom) list.scrollTop = list.scrollHeight;
-			else list.scrollTop = Math.max(0, previousScrollTop - removedAboveHeight);
+			else restoreDirectScrollAnchor(list, anchor);
 			if (typeof window.scheduleSeenChatNotificationConsumption === 'function') requestAnimationFrame(() => window.scheduleSeenChatNotificationConsumption('private'));
 		});
 		return true;
@@ -76066,14 +76413,16 @@ function getVisibleChatStackEl(id) {
 		const list = document.getElementById('direct-message-list');
 		if (!list) return false;
 		const row = list.querySelector(`[data-direct-message-id="${CSS.escape(String(messageId || ''))}"]`);
-		if (!row) return false;
+		if (!row) return directVirtualizationEnabled();
 		const keepBottom = directThreadNearBottom();
 		const previousScrollTop = list.scrollTop;
 		const rowHeight = row.offsetHeight;
 		const rowWasAboveViewport = (row.offsetTop + rowHeight) <= previousScrollTop;
 		const finish = () => {
 			if (row.isConnected) row.remove();
-			const removedDividerAboveHeight = directCleanupDateDividers(list, previousScrollTop);
+			let removedDividerAboveHeight = 0;
+			if (directVirtualizationEnabled()) rebuildDirectVirtualDecorators(list);
+			else removedDividerAboveHeight = directCleanupDateDividers(list, previousScrollTop);
 			updateDirectSeenMarker();
 			requestAnimationFrame(() => {
 				if (!list.isConnected) return;
@@ -76091,16 +76440,49 @@ function getVisibleChatStackEl(id) {
 	function mergeDirectMessage(message) {
 		if (!message || !message.id || directMessageHiddenByLocalDelete(message)) return false;
 		const state = window.__directChatState;
-		if (state.messages.some(item => String(item.id) === String(message.id))) return false;
-		state.messages.push(message);
-		state.messages.sort((a,b) => directMessageIdNumber(a.id) - directMessageIdNumber(b.id));
+		const messages = Array.isArray(state.messages) ? state.messages : (state.messages = []);
+		if (directMessageIndexById(message.id, messages) >= 0) return false;
+
+		const numericId = directMessageIdNumber(message.id);
+		const lastNumericId = messages.length ? directMessageIdNumber(messages[messages.length - 1] && messages[messages.length - 1].id) : 0;
+		let insertedIndex = messages.length;
+		if (!messages.length || (numericId > 0 && lastNumericId > 0 && numericId > lastNumericId)) {
+			messages.push(message);
+		} else if (numericId > 0) {
+			let low = 0;
+			let high = messages.length;
+			while (low < high) {
+				const mid = (low + high) >> 1;
+				const midId = directMessageIdNumber(messages[mid] && messages[mid].id);
+				if (midId > 0 && midId <= numericId) low = mid + 1;
+				else high = mid;
+			}
+			insertedIndex = low;
+			messages.splice(insertedIndex, 0, message);
+		} else {
+			messages.push(message);
+			messages.sort((a,b) => directMessageIdNumber(a.id) - directMessageIdNumber(b.id));
+			insertedIndex = directMessageIndexById(message.id, messages);
+		}
+
+		if (insertedIndex >= 0 && insertedIndex < state.virtualStart) {
+			state.virtualStart += 1;
+			state.virtualEnd += 1;
+		} else if (insertedIndex >= 0 && insertedIndex < state.virtualEnd) {
+			state.virtualEnd += 1;
+		}
+
 		const retentionLimit = typeof window.getPsnServerContentLimit === 'function' ? Math.max(0, Number(window.getPsnServerContentLimit('directMessages')) || 0) : 0;
-		const nextMessageCount = Math.max(state.messages.length, Math.max(0, Number(state.messageCount) || 0) + 1);
+		const nextMessageCount = Math.max(messages.length, Math.max(0, Number(state.messageCount) || 0) + 1);
 		state.messageCount = retentionLimit > 0 ? Math.min(retentionLimit, nextMessageCount) : nextMessageCount;
 		updateDirectThreadMessageCount(state.messageCount);
 		state.trimmedMessageIds = [];
-		if (state.messages.length > 250) {
-			state.trimmedMessageIds = state.messages.splice(0, state.messages.length - 250).map(item => String(item && item.id || '')).filter(Boolean);
+		if (messages.length > 250) {
+			const trimCount = messages.length - 250;
+			state.trimmedMessageIds = messages.splice(0, trimCount).map(item => String(item && item.id || '')).filter(Boolean);
+			state.trimmedMessageIds.forEach(id => { if (window.directChatTranslationCache) delete window.directChatTranslationCache[id]; });
+			state.virtualStart = Math.max(0, Number(state.virtualStart || 0) - trimCount);
+			state.virtualEnd = Math.max(0, Number(state.virtualEnd || 0) - trimCount);
 		}
 		return true;
 	}
@@ -76109,10 +76491,11 @@ function getVisibleChatStackEl(id) {
 		const owner = String(userName || '').trim();
 		const state = window.__directChatState;
 		if (state.owner === owner) return;
+		cancelDirectVirtualScrollFrame();
 		state.owner = owner;
-		window.directChatTranslationCache = Object.create(null);
+		clearDirectChatTranslationCache();
 		state.sessionToken = Number(state.sessionToken || 0) + 1;
-		state.conversations = []; state.activePeer = ''; state.messages = []; state.peer = null; state.messageCount = 0; state.trimmedMessageIds = []; state.threadLoadedPeer = ''; state.deletedThroughByPeer = Object.create(null);
+		state.conversations = []; state.activePeer = ''; state.messages = []; state.peer = null; state.messageCount = 0; state.trimmedMessageIds = []; state.threadLoadedPeer = ''; state.deletedThroughByPeer = Object.create(null); state.virtualStart = 0; state.virtualEnd = 0; state.virtualBusy = false;
 		state.searchQuery = ''; state.searchResultCount = 0; state.globalSearchResults = []; state.globalSearchLoading = false; state.globalSearchToken = Number(state.globalSearchToken || 0) + 1; state.pendingHighlightMessageId = '';
 		state.myLastReadId = '0'; state.peerLastReadId = '0'; state.unreadDividerAfterId = ''; state.loadingThread = false; state.viewerBlocked = false; state.blockedByPeer = false; state.pendingMedia = []; state.pendingUploads = 0; state.mediaToken = Number(state.mediaToken || 0) + 1; state.replyTo = null; state.editingMessageId = '';
 		clearTimeout(state.emptyConversationCloseTimer); state.emptyConversationCloseTimer = 0; state.emptyConversationCloseToken = Number(state.emptyConversationCloseToken || 0) + 1;
@@ -76320,9 +76703,9 @@ function getVisibleChatStackEl(id) {
 			return true;
 		}
 		const backgroundReconcile = options.reconnect === true && samePeer && Array.isArray(state.messages) && state.messages.length > 0;
-		if (state.activePeer && state.activePeer !== peer) { stopDirectTyping(); clearDirectPeerTyping(); state.pendingMedia = []; state.pendingUploads = 0; state.mediaToken = Number(state.mediaToken || 0) + 1; state.replyTo = null; state.editingMessageId = ''; state.inputRange = null; state.threadLoadedPeer = ''; renderDirectPendingMedia(); closeDirectPickers(); renderDirectComposerContext(); }
+		if (state.activePeer && state.activePeer !== peer) { cancelDirectVirtualScrollFrame(); stopDirectTyping(); clearDirectPeerTyping(); state.pendingMedia = []; state.pendingUploads = 0; state.mediaToken = Number(state.mediaToken || 0) + 1; state.replyTo = null; state.editingMessageId = ''; state.inputRange = null; state.threadLoadedPeer = ''; clearDirectChatTranslationCache(); renderDirectPendingMedia(); closeDirectPickers(); renderDirectComposerContext(); }
 		state.activePeer = peer; state.loadingThread = !backgroundReconcile;
-		if (!backgroundReconcile) { state.messages = []; state.messageCount = 0; state.peerLastReadId = '0'; state.unreadDividerAfterId = ''; state.threadLoadedPeer = ''; updateDirectThreadMessageCount(0); }
+		if (!backgroundReconcile) { state.messages = []; state.messageCount = 0; state.peerLastReadId = '0'; state.unreadDividerAfterId = ''; state.threadLoadedPeer = ''; state.virtualStart = 0; state.virtualEnd = 0; state.virtualBusy = false; updateDirectThreadMessageCount(0); }
 		const existing = directFindConversation(peer);
 		state.viewerBlocked = existing && existing.viewerBlocked === true;
 		state.blockedByPeer = existing && existing.blockedByPeer === true;
@@ -76346,12 +76729,19 @@ function getVisibleChatStackEl(id) {
 			state.loadingThread = false;
 			if (!payload || payload.success === false) {
 				state.messages = [];
+				clearDirectChatTranslationCache();
 				state.threadLoadedPeer = '';
 				if (typeof showToastNotification === 'function') showToastNotification('Private Chat', (payload && payload.message) || 'Could not load messages.');
 				renderDirectThread();
 				return;
 			}
 			state.messages = Array.isArray(payload.messages) ? payload.messages : [];
+			pruneDirectChatTranslationCache(state.messages);
+			if (!backgroundReconcile) { state.virtualStart = 0; state.virtualEnd = 0; }
+			else {
+				state.virtualStart = Math.max(0, Math.min(Number(state.virtualStart || 0), Math.max(0, state.messages.length - 1)));
+				state.virtualEnd = Math.max(state.virtualStart, Math.min(Number(state.virtualEnd || 0), state.messages.length));
+			}
 			state.peer = directLivePresenceSnapshot(peer, payload.peer || state.peer || { name:peer });
 			state.threadLoadedPeer = peer;
 			state.messageCount = Math.max(state.messages.length, Math.max(0, Number(payload.messageCount) || 0));
@@ -76377,6 +76767,7 @@ function getVisibleChatStackEl(id) {
 	window.closeDirectMessageThread = function() {
 		const state = window.__directChatState;
 		if (!state.activePeer) return false;
+		cancelDirectVirtualScrollFrame();
 		stopDirectTyping();
 		clearDirectPeerTyping();
 		if (window.matchMedia && window.matchMedia('(max-width: 760px)').matches && typeof window.resetDirectConversationListScroll === 'function') {
@@ -76386,7 +76777,8 @@ function getVisibleChatStackEl(id) {
 		clearTimeout(state.threadRequestTimer); state.threadRequestTimer = 0;
 		state.pendingMedia = []; state.pendingUploads = 0; state.mediaToken = Number(state.mediaToken || 0) + 1;
 		state.replyTo = null; state.editingMessageId = ''; state.inputRange = null;
-		state.activePeer = ''; state.peer = null; state.messages = []; state.messageCount = 0; state.trimmedMessageIds = []; state.threadLoadedPeer = '';
+		state.activePeer = ''; state.peer = null; state.messages = []; state.messageCount = 0; state.trimmedMessageIds = []; state.threadLoadedPeer = ''; state.virtualStart = 0; state.virtualEnd = 0; state.virtualBusy = false;
+		clearDirectChatTranslationCache();
 		state.myLastReadId = '0'; state.peerLastReadId = '0'; state.unreadDividerAfterId = ''; state.loadingThread = false; state.pendingHighlightMessageId = ''; state.viewerBlocked = false; state.blockedByPeer = false;
 		if (typeof directClearComposer === 'function') directClearComposer();
 		renderDirectPendingMedia(); closeDirectPickers(); renderDirectComposerContext();
@@ -76703,8 +77095,14 @@ function getVisibleChatStackEl(id) {
 		socket.on('direct_message_deleted', payload => {
 			if (!payload || !payload.id) return;
 			const state=window.__directChatState;
+			const removedIndex = directMessageIndexById(payload.id, state.messages);
 			const before=state.messages.length; state.messages=state.messages.filter(item=>String(item&&item.id||'')!==String(payload.id));
-			if (state.messages.length !== before) { state.messageCount = Math.max(0, Math.max(state.messages.length, Number(state.messageCount || 0) - 1)); updateDirectThreadMessageCount(state.messageCount); }
+			if (state.messages.length !== before) {
+				if (removedIndex >= 0 && removedIndex < state.virtualStart) { state.virtualStart = Math.max(0, state.virtualStart - 1); state.virtualEnd = Math.max(state.virtualStart, state.virtualEnd - 1); }
+				else if (removedIndex >= 0 && removedIndex < state.virtualEnd) state.virtualEnd = Math.max(state.virtualStart, state.virtualEnd - 1);
+				state.messageCount = Math.max(0, Math.max(state.messages.length, Number(state.messageCount || 0) - 1));
+				updateDirectThreadMessageCount(state.messageCount);
+			}
 			if (String(state.editingMessageId||'')===String(payload.id) || (state.replyTo && String(state.replyTo.id||'')===String(payload.id))) window.cancelDirectComposeMode({silent:true,clearInput:String(state.editingMessageId||'')===String(payload.id)});
 			if (state.messages.length!==before && !removeDirectMessageRow(payload.id)) renderDirectThread({ preserveScroll:true });
 			if (!directApplyConversationDelete(payload)) window.refreshDirectConversations({ preserveThread:true });
