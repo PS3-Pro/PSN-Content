@@ -32823,6 +32823,7 @@ P
         const gameTitle = String(rawTitle || '').trim() || titleId;
         if (!button || !titleId || button.disabled || window.__socialPlayTogetherFilter !== 'me') return;
 
+        const expectedUser = String(localStorage.getItem('psn_username') || '').trim();
         const requestToken = `${titleId}:${Date.now()}:${Math.random().toString(36).slice(2, 7)}`;
         button.dataset.playTogetherPending = requestToken;
         button.disabled = true;
@@ -32850,6 +32851,52 @@ P
                 window.renderPlayTogetherSocialPanel(true);
             }
             if (typeof playUiSuccess === 'function') playUiSuccess();
+
+            if (typeof window.schedulePsnUndoAction === 'function') {
+                window.schedulePsnUndoAction({
+                    title:'Removed from Play Together',
+                    description:`${gameTitle} was removed.`,
+                    duration:5200,
+                    stage:() => ({ titleId, gameTitle, disabledSummary:summary }),
+                    commit:() => null,
+                    undo:staged => {
+                        if (!staged || (expectedUser && String(localStorage.getItem('psn_username') || '').trim() !== expectedUser)) return;
+                        if (!socketChat || !socketChat.connected) {
+                            if (typeof playUiError === 'function') playUiError();
+                            if (typeof window.showToastNotification === 'function') window.showToastNotification('Play Together', 'Could not undo because the server is disconnected.');
+                            return;
+                        }
+
+                        if (typeof window.setViewerPlayTogetherTitleState === 'function') window.setViewerPlayTogetherTitleState(staged.titleId, true, true);
+                        if (typeof window.animatePsnUndoRestore === 'function') {
+                            const restoredTitleId = String(staged.titleId || '');
+                            window.animatePsnUndoRestore(() => {
+                                const list = document.getElementById('social-play-together-list');
+                                return list ? Array.from(list.querySelectorAll('.play-together-social-item[data-play-together-title-id]')).find(row => String(row.dataset.playTogetherTitleId || '') === restoredTitleId) || null : null;
+                            }, 'row');
+                        }
+
+                        return new Promise(resolve => {
+                            requestGamePlayers({ mode:'playTogether', titleId:staged.titleId, title:staged.gameTitle, enabled:true }, undoResponse => {
+                                if (expectedUser && String(localStorage.getItem('psn_username') || '').trim() !== expectedUser) { resolve(false); return; }
+                                if (!undoResponse || undoResponse.ok !== true || normalizeGamePlayersTitleId(undoResponse.titleId) !== staged.titleId) {
+                                    if (staged.disabledSummary) setGamePlayersSummaryCacheEntry(staged.titleId, staged.disabledSummary);
+                                    if (typeof window.setViewerPlayTogetherTitleState === 'function') window.setViewerPlayTogetherTitleState(staged.titleId, false, true);
+                                    if (typeof playUiError === 'function') playUiError();
+                                    if (typeof window.showToastNotification === 'function') window.showToastNotification('Play Together', undoResponse && undoResponse.error ? undoResponse.error : 'Could not restore Play Together.');
+                                    resolve(false);
+                                    return;
+                                }
+                                const restoredSummary = normalizeGamePlayersMutationSummary(undoResponse);
+                                setGamePlayersSummaryCacheEntry(staged.titleId, restoredSummary);
+                                if (typeof window.setViewerPlayTogetherTitleState === 'function') window.setViewerPlayTogetherTitleState(staged.titleId, true, false);
+                                if (typeof window.syncProfileCommonPlayTogetherButtons === 'function') window.syncProfileCommonPlayTogetherButtons(document.getElementById('list-modal-body') || document);
+                                resolve(true);
+                            });
+                        });
+                    }
+                });
+            }
         });
     };
 
