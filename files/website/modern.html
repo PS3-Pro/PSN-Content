@@ -38874,34 +38874,99 @@ P
         if (window.__downloadHistoryClearBusy) return false;
         if (!Array.isArray(window.downloadHistory) || !window.downloadHistory.length) return false;
         if (!confirm("Do you want to clear all history and statistics?")) return false;
+        if (typeof window.schedulePsnUndoAction !== 'function') return false;
 
-        window.__downloadHistoryClearBusy = true;
-        cancelDownloadSwipeHintPreview(true);
-        closeDownloadSwipeRows();
-        const button = document.querySelector('#view-downloads .btn-clear-history');
-        if (button) button.disabled = true;
-        if (typeof playUiRemove === "function") playUiRemove();
+        const expectedUser = String(localStorage.getItem('psn_username') || '').trim();
+        if (!expectedUser) return false;
 
+        const originalItems = window.downloadHistory.slice();
         const list = document.getElementById('downloads-list');
-        const rows = list ? Array.from(list.querySelectorAll('.download-swipe-row')) : [];
-        const cascadeMs = (typeof window.animateDownloadHistoryCascadeOut === 'function')
-            ? window.animateDownloadHistoryCascadeOut(rows)
-            : 0;
 
-        setTimeout(function() {
-            window.downloadHistory = [];
-            saveState(COOKIE_NAME_HISTORY, JSON.stringify([]));
-            saveState('psn_dl_dot', 'false');
-            saveState('psn_dl_dot_items', '[]');
-            const clearStamp = markDownloadHistoryClearPending();
-            markProfileListChanged('downloads', clearStamp);
-            updateDownloadUI(true);
-            window.__downloadHistoryClearBusy = false;
-            const currentButton = document.querySelector('#view-downloads .btn-clear-history');
-            if (currentButton) currentButton.disabled = false;
-            window.broadcastProfileUpdate();
-        }, cascadeMs);
-        return true;
+        return !!window.schedulePsnUndoAction({
+            title:'Download History cleared',
+            description:`${originalItems.length} ${originalItems.length === 1 ? 'item was' : 'items were'} removed.`,
+            duration:5200,
+            stage:function() {
+                window.__downloadHistoryClearBusy = true;
+                cancelDownloadSwipeHintPreview(true);
+                closeDownloadSwipeRows();
+                const button = document.querySelector('#view-downloads .btn-clear-history');
+                if (button) button.disabled = true;
+                if (typeof playUiRemove === 'function') playUiRemove();
+
+                window.downloadHistory = [];
+                if (typeof window.refreshDownloadSummaryUI === 'function') window.refreshDownloadSummaryUI();
+
+                const rows = list ? Array.from(list.querySelectorAll('.download-swipe-row')) : [];
+                const cascadeMs = (typeof window.animateDownloadHistoryCascadeOut === 'function')
+                    ? window.animateDownloadHistoryCascadeOut(rows)
+                    : 0;
+                const finishTimer = setTimeout(function() {
+                    if (expectedUser !== String(localStorage.getItem('psn_username') || '').trim()) return;
+                    updateDownloadUI(true);
+                    window.__downloadHistoryClearBusy = false;
+                    const currentButton = document.querySelector('#view-downloads .btn-clear-history');
+                    if (currentButton) currentButton.disabled = false;
+                }, cascadeMs);
+
+                return { items:originalItems, rows, finishTimer };
+            },
+            undo:function(staged) {
+                if (!staged || !Array.isArray(staged.items)) return;
+                if (expectedUser !== String(localStorage.getItem('psn_username') || '').trim()) return;
+                clearTimeout(staged.finishTimer);
+
+                const currentItems = Array.isArray(window.downloadHistory) ? window.downloadHistory.slice() : [];
+                const normalized = typeof normalizeDownloadHistoryRecords === 'function'
+                    ? normalizeDownloadHistoryRecords(currentItems.concat(staged.items))
+                    : { history:currentItems.concat(staged.items) };
+                window.downloadHistory = Array.isArray(normalized.history) ? normalized.history : currentItems.concat(staged.items);
+
+                (Array.isArray(staged.rows) ? staged.rows : []).forEach(row => {
+                    if (!row || !row.isConnected) return;
+                    row.classList.remove('is-dismiss-all');
+                    row.style.removeProperty('--notification-dismiss-delay');
+                });
+
+                saveState(COOKIE_NAME_HISTORY, JSON.stringify(window.downloadHistory));
+                if (typeof clearDownloadHistoryPendingFlag === 'function') clearDownloadHistoryPendingFlag(expectedUser);
+                if (typeof window.refreshDownloadSummaryUI === 'function') window.refreshDownloadSummaryUI();
+                window.__downloadHistoryClearBusy = false;
+                const currentButton = document.querySelector('#view-downloads .btn-clear-history');
+                if (currentButton) currentButton.disabled = false;
+                updateDownloadUI(true);
+
+                requestAnimationFrame(() => {
+                    const currentList = document.getElementById('downloads-list');
+                    if (!currentList || typeof window.animatePsnUndoRestore !== 'function') return;
+                    const visibleRows = Array.from(currentList.querySelectorAll('.download-swipe-row')).filter(row => {
+                        const rect = row.getBoundingClientRect();
+                        return rect.bottom > 0 && rect.top < (window.visualViewport ? window.visualViewport.height : window.innerHeight);
+                    });
+                    visibleRows.slice(0, 14).forEach((row, index) => {
+                        setTimeout(() => window.animatePsnUndoRestore(row, 'row'), Math.min(index, 10) * 32);
+                    });
+                });
+            },
+            commit:function(staged) {
+                if (!staged || !Array.isArray(staged.items)) return;
+                clearTimeout(staged.finishTimer);
+                if (expectedUser !== String(localStorage.getItem('psn_username') || '').trim()) return;
+
+                window.__downloadHistoryClearBusy = false;
+                const currentButton = document.querySelector('#view-downloads .btn-clear-history');
+                if (currentButton) currentButton.disabled = false;
+
+                saveState(COOKIE_NAME_HISTORY, JSON.stringify(Array.isArray(window.downloadHistory) ? window.downloadHistory : []));
+                if (!window.downloadHistory.length) {
+                    saveState('psn_dl_dot', 'false');
+                    saveState('psn_dl_dot_items', '[]');
+                }
+                const clearStamp = markDownloadHistoryClearPending();
+                markProfileListChanged('downloads', clearStamp);
+                if (typeof window.broadcastProfileUpdate === 'function') window.broadcastProfileUpdate();
+            }
+        });
     };
 
     window.updateDownloadUI = function(isSilent = false, progressiveMode = 'reset') {
@@ -72352,31 +72417,125 @@ function getVisibleChatStackEl(id) {
 		}
 	}
 	
+	window.__psnPendingUnpinIds = window.__psnPendingUnpinIds instanceof Set ? window.__psnPendingUnpinIds : new Set();
+	window.__psnPendingUnpinTimers = window.__psnPendingUnpinTimers instanceof Map ? window.__psnPendingUnpinTimers : new Map();
+
+	function clearPendingPinnedUnpin(id) {
+		const key = String(id || '').trim();
+		if (!key) return;
+		window.__psnPendingUnpinIds.delete(key);
+		const timer = window.__psnPendingUnpinTimers.get(key);
+		if (timer) clearTimeout(timer);
+		window.__psnPendingUnpinTimers.delete(key);
+	}
+
+	function armPendingPinnedUnpinExpiry(id, delayMs = 10000) {
+		const key = String(id || '').trim();
+		if (!key) return;
+		const oldTimer = window.__psnPendingUnpinTimers.get(key);
+		if (oldTimer) clearTimeout(oldTimer);
+		window.__psnPendingUnpinTimers.set(key, setTimeout(() => {
+			window.__psnPendingUnpinTimers.delete(key);
+			window.__psnPendingUnpinIds.delete(key);
+		}, Math.max(4000, Number(delayMs) || 10000)));
+	}
+
+	function schedulePinnedMessageUnpin(msgId, confirmText = 'Unpin this message?') {
+		const id = String(msgId || '').trim();
+		if (!id || !isChatMessagePinnedFast(id)) return false;
+		if (!socketChat || !socketChat.connected) return false;
+		if (!(typeof window.canModerateSession === 'function' ? window.canModerateSession() : document.body.classList.contains('is-admin'))) return false;
+		if (confirmText && !confirm(confirmText)) return false;
+
+		const myName = localStorage.getItem('psn_username');
+		const expectedUser = String(myName || '').trim();
+		const index = pinnedMessages.findIndex(message => String(message && (message.id || message.time) || '') === id);
+		if (index < 0) return false;
+		const pinnedItem = pinnedMessages[index];
+
+		if (typeof window.schedulePsnUndoAction !== 'function') {
+			socketChat.emit('unpin_message', { msgId:id, user:myName });
+			if (typeof playUiRemove === 'function') playUiRemove();
+			return true;
+		}
+
+		return !!window.schedulePsnUndoAction({
+			title:'Message unpinned',
+			description:'The pinned message was removed.',
+			duration:5200,
+			stage:function() {
+				const liveIndex = pinnedMessages.findIndex(message => String(message && (message.id || message.time) || '') === id);
+				if (liveIndex < 0) return null;
+				const removed = pinnedMessages.splice(liveIndex, 1)[0];
+				window.__psnPendingUnpinIds.add(id);
+				rebuildChatPinnedIdIndex(pinnedMessages);
+				if (currentPinIndex >= pinnedMessages.length) currentPinIndex = Math.max(0, pinnedMessages.length - 1);
+				renderPinnedBar();
+				updateAllPinIcons();
+				if (typeof playUiRemove === 'function') playUiRemove();
+				return { removed:removed || pinnedItem, index:liveIndex };
+			},
+			undo:function(staged) {
+				if (!staged || !staged.removed) return;
+				if (expectedUser && String(localStorage.getItem('psn_username') || '').trim() !== expectedUser) {
+					clearPendingPinnedUnpin(id);
+					return;
+				}
+				clearPendingPinnedUnpin(id);
+				if (!pinnedMessages.some(message => String(message && (message.id || message.time) || '') === id)) {
+					pinnedMessages.splice(Math.max(0, Math.min(staged.index, pinnedMessages.length)), 0, staged.removed);
+				}
+				rebuildChatPinnedIdIndex(pinnedMessages);
+				currentPinIndex = Math.max(0, pinnedMessages.findIndex(message => String(message && (message.id || message.time) || '') === id));
+				renderPinnedBar();
+				updateAllPinIcons();
+				if (typeof window.animatePsnUndoRestore === 'function') {
+					window.animatePsnUndoRestore(document.getElementById('pinned-messages-container'), 'surface');
+					window.animatePsnUndoRestore(document.getElementById('pin-icon-' + id), 'row');
+				}
+			},
+			commit:function(staged) {
+				if (!staged || !staged.removed) return;
+				if (expectedUser && String(localStorage.getItem('psn_username') || '').trim() !== expectedUser) {
+					clearPendingPinnedUnpin(id);
+					return;
+				}
+				if (!socketChat || !socketChat.connected) {
+					clearPendingPinnedUnpin(id);
+					if (!pinnedMessages.some(message => String(message && (message.id || message.time) || '') === id)) {
+						pinnedMessages.splice(Math.max(0, Math.min(staged.index, pinnedMessages.length)), 0, staged.removed);
+					}
+					rebuildChatPinnedIdIndex(pinnedMessages);
+					currentPinIndex = Math.max(0, pinnedMessages.findIndex(message => String(message && (message.id || message.time) || '') === id));
+					renderPinnedBar();
+					updateAllPinIcons();
+					if (typeof showToastNotification === 'function') showToastNotification('Pinned Message', 'Unpin was cancelled because the server disconnected.');
+					return;
+				}
+				socketChat.emit('unpin_message', { msgId:id, user:myName });
+				armPendingPinnedUnpinExpiry(id);
+			}
+		});
+	}
+
 	function togglePinMessage(msgId) {
 		if (!socketChat || !(typeof window.canModerateSession === 'function' ? window.canModerateSession() : document.body.classList.contains('is-admin'))) return;
-		
+
 		const myName = localStorage.getItem('psn_username');
 		const isPinned = isChatMessagePinnedFast(msgId);
-	
+
 		if (isPinned) {
-			if (confirm("Unpin this message?")) {
-				socketChat.emit('unpin_message', { msgId: msgId, user: myName });
-				if (typeof playUiRemove === 'function') playUiRemove();
-			}
+			schedulePinnedMessageUnpin(msgId, 'Unpin this message?');
 		} else {
-			socketChat.emit('pin_message', { msgId: msgId, user: myName });
+			socketChat.emit('pin_message', { msgId:msgId, user:myName });
 			if (typeof playUiSuccess === 'function') playUiSuccess();
 		}
 	}
-	
+
 	function requestUnpin() {
 		if (!pinnedMessages[currentPinIndex]) return;
 		const msgId = pinnedMessages[currentPinIndex].id;
-		const myName = localStorage.getItem('psn_username');
-		if (confirm("Unpin this message for everyone?")) {
-			socketChat.emit('unpin_message', { msgId: msgId, user: myName });
-			if (typeof playUiRemove === 'function') playUiRemove();
-		}
+		schedulePinnedMessageUnpin(msgId, 'Unpin this message for everyone?');
 	}
 
     function showChatNotification(userName, isMention, isGlobalPing, globalPingRole = '', reactionEmoji = '') {
@@ -78050,7 +78209,15 @@ function getVisibleChatStackEl(id) {
 		});
 		
 		socketChat.on('pinned_list', (list) => {
-			const nextPinned = Array.isArray(list) ? list : [];
+			const incomingPinned = Array.isArray(list) ? list : [];
+			const pendingUnpins = window.__psnPendingUnpinIds instanceof Set ? window.__psnPendingUnpinIds : null;
+			if (pendingUnpins && pendingUnpins.size) {
+				const incomingIds = new Set(incomingPinned.map(message => String(message && (message.id || message.time) || '')));
+				Array.from(pendingUnpins).forEach(id => { if (!incomingIds.has(String(id))) clearPendingPinnedUnpin(id); });
+			}
+			const nextPinned = pendingUnpins && pendingUnpins.size
+				? incomingPinned.filter(message => !pendingUnpins.has(String(message && (message.id || message.time) || '')))
+				: incomingPinned;
 			const previousSignature = typeof window.getLiveRenderSignature === 'function' ? window.getLiveRenderSignature(Array.isArray(pinnedMessages) ? pinnedMessages : []) : JSON.stringify(Array.isArray(pinnedMessages) ? pinnedMessages : []);
 			const nextSignature = typeof window.getLiveRenderSignature === 'function' ? window.getLiveRenderSignature(nextPinned) : JSON.stringify(nextPinned);
 			if (previousSignature === nextSignature) {
@@ -88389,15 +88556,6 @@ function getVisibleChatStackEl(id) {
         });
     };
 
-    function writeClearedNotificationCacheForUser(userName, lastReadId = 0) {
-        const name = String(userName || '').trim();
-        if (!name || name === 'null') return;
-        try {
-            safeLocalStorageSet(name + '_' + USER_NOTIFICATION_CACHE_KEY, JSON.stringify({ items:[], lastReadId:Math.max(0, Number(lastReadId) || 0), unreadCount:0, serverUnreadCount:0, seenIds:[], cachedAt:Date.now() }));
-            safeLocalStorageSet(name + '_psn_notifications_dot', 'false');
-        } catch (err) {}
-    }
-
     window.dismissAllUserNotifications = function() {
         if (window.__userNotificationClearBusy) return false;
         const items = Array.isArray(window.userNotificationItems) ? window.userNotificationItems : [];
@@ -88407,69 +88565,127 @@ function getVisibleChatStackEl(id) {
             if (typeof showToastNotification === 'function') showToastNotification('Notifications', 'Reconnect to dismiss notifications.');
             return false;
         }
+        if (typeof window.schedulePsnUndoAction !== 'function') return false;
+
         const expectedUser = String(localStorage.getItem('psn_username') || '').trim();
         if (!expectedUser) return false;
-
-        const clearThroughId = getRealtimeFeedMaxId(window.userNotificationItems);
+        const clearThroughId = getRealtimeFeedMaxId(items);
         if (!clearThroughId) return false;
-        window.__userNotificationClearBusy = true;
-        cancelNotificationSwipeHintPreview(true);
-        closeNotificationSwipeRows();
-        const button = document.getElementById('notifications-dismiss-all');
-        if (button) button.disabled = true;
-        if (typeof playUiRemove === 'function') playUiRemove();
 
-        const list = document.getElementById('notification-center-list');
-        const rows = list ? Array.from(list.querySelectorAll('.notification-swipe-row')) : [];
-        const cascadeMs = (typeof window.animateUserNotificationCascadeOut === 'function')
-            ? window.animateUserNotificationCascadeOut(rows)
-            : 0;
-        const finishLocalClear = function() {
-            const currentUser = String(localStorage.getItem('psn_username') || '').trim();
-            if (currentUser.toLowerCase() === expectedUser.toLowerCase()) {
-                window.userNotificationItems = (Array.isArray(window.userNotificationItems) ? window.userNotificationItems : []).filter(function(item) { return Math.max(0, Number(item && item.id) || 0) > clearThroughId; });
-                for (const seenId of Array.from(window.__userNotificationSeenIds || [])) { if (Math.max(0, Number(seenId) || 0) <= clearThroughId) window.__userNotificationSeenIds.delete(String(seenId)); }
-                window.__userNotificationServerUnreadCount = window.userNotificationItems.filter(function(item) { return Math.max(0, Number(item && item.id) || 0) > Math.max(0, Number(window.__userNotificationLastReadId) || 0); }).length;
-                reconcileUserNotificationUnreadCount();
-                window.writeUserNotificationCache();
-                window.refreshNotificationCenterIndicators();
-                if (typeof window.isNotificationCenterVisible === 'function' && window.isNotificationCenterVisible() && window.userNotificationItems.length && typeof window.renderNotificationCenter === 'function') {
-                    window.renderNotificationCenter(true);
-                    if (typeof window.markUserNotificationsRead === 'function') window.markUserNotificationsRead();
-                } else if (typeof window.syncUserNotificationDomToState === 'function') {
-                    window.syncUserNotificationDomToState();
-                }
-            } else {
-                writeClearedNotificationCacheForUser(expectedUser, window.__userNotificationLastReadId);
+        const removedItems = items.filter(item => Math.max(0, Number(item && item.id) || 0) <= clearThroughId);
+        const previousSeenIds = new Set(Array.from(window.__userNotificationSeenIds || []));
+        const previousServerUnreadCount = Math.max(0, Number(window.__userNotificationServerUnreadCount) || 0);
+        const removedUnreadCount = removedItems.reduce((count, item) => {
+            const unread = typeof isUserNotificationItemUnread === 'function'
+                ? isUserNotificationItemUnread(item)
+                : Math.max(0, Number(item && item.id) || 0) > Math.max(0, Number(window.__userNotificationLastReadId) || 0);
+            return count + (unread ? 1 : 0);
+        }, 0);
+
+        const restoreBatch = function(staged, animate = true) {
+            if (!staged || !Array.isArray(staged.removedItems)) return;
+            if (expectedUser !== String(localStorage.getItem('psn_username') || '').trim()) return;
+            if (typeof window.mergeUserNotificationItems === 'function') window.mergeUserNotificationItems(staged.removedItems, false);
+            else {
+                const currentIds = new Set((window.userNotificationItems || []).map(item => String(item && item.id || '')));
+                staged.removedItems.forEach(item => {
+                    const id = String(item && item.id || '');
+                    if (id && !currentIds.has(id)) window.userNotificationItems.push(item);
+                });
             }
-        };
-        setTimeout(finishLocalClear, cascadeMs);
-
-        const releaseClearBusy = function() {
+            const mergedSeenIds = new Set(Array.from(window.__userNotificationSeenIds || []));
+            (staged.previousSeenIds || []).forEach(id => mergedSeenIds.add(String(id)));
+            window.__userNotificationSeenIds = mergedSeenIds;
+            window.__userNotificationServerUnreadCount = Math.max(0, Number(window.__userNotificationServerUnreadCount) || 0) + Math.max(0, Number(staged.removedUnreadCount) || 0);
+            reconcileUserNotificationUnreadCount();
+            window.writeUserNotificationCache();
+            window.refreshNotificationCenterIndicators();
             window.__userNotificationClearBusy = false;
-            const currentButton = document.getElementById('notifications-dismiss-all');
-            if (currentButton) currentButton.disabled = false;
+            const button = document.getElementById('notifications-dismiss-all');
+            if (button) button.disabled = false;
+            if (typeof window.applyCollectionToolbarFilterChange === 'function' && window.isNotificationCenterVisible()) {
+                window.applyCollectionToolbarFilterChange('notifications', { revealNew:animate });
+            } else if (typeof window.renderNotificationCenter === 'function' && window.isNotificationCenterVisible()) {
+                window.renderNotificationCenter(true);
+            }
         };
-        const clearFallbackTimer = setTimeout(releaseClearBusy, cascadeMs + 5200);
-        socketChat.emit('user_notifications_clear', { throughId:clearThroughId }, function(response) {
-            clearTimeout(clearFallbackTimer);
-            const currentUser = String(localStorage.getItem('psn_username') || '').trim();
-            if (!response || response.ok !== true) {
-                if (currentUser.toLowerCase() === expectedUser.toLowerCase()) {
-                    if (typeof showToastNotification === 'function') showToastNotification('Notifications', 'Could not dismiss notifications. Refreshing…');
-                    setTimeout(function() { window.bootstrapNotificationCenterRealtime({ forceFull:true, reason:'clear-recovery' }); }, cascadeMs + 20);
+
+        return !!window.schedulePsnUndoAction({
+            title:'Notifications cleared',
+            description:`${removedItems.length} ${removedItems.length === 1 ? 'notification was' : 'notifications were'} removed.`,
+            duration:5200,
+            stage:function() {
+                window.__userNotificationClearBusy = true;
+                cancelNotificationSwipeHintPreview(true);
+                closeNotificationSwipeRows();
+                const button = document.getElementById('notifications-dismiss-all');
+                if (button) button.disabled = true;
+                if (typeof playUiRemove === 'function') playUiRemove();
+
+                window.userNotificationItems = (Array.isArray(window.userNotificationItems) ? window.userNotificationItems : []).filter(item => Math.max(0, Number(item && item.id) || 0) > clearThroughId);
+                for (const seenId of Array.from(window.__userNotificationSeenIds || [])) {
+                    if (Math.max(0, Number(seenId) || 0) <= clearThroughId) window.__userNotificationSeenIds.delete(String(seenId));
                 }
-            } else if (currentUser.toLowerCase() === expectedUser.toLowerCase()) {
-                if (Object.prototype.hasOwnProperty.call(response, 'unreadCount')) window.__userNotificationServerUnreadCount = Math.max(0, Number(response.unreadCount) || 0);
+                window.__userNotificationServerUnreadCount = Math.max(0, previousServerUnreadCount - removedUnreadCount);
                 reconcileUserNotificationUnreadCount();
                 window.writeUserNotificationCache();
                 window.refreshNotificationCenterIndicators();
-            } else {
-                writeClearedNotificationCacheForUser(expectedUser, window.__userNotificationLastReadId);
+
+                const list = document.getElementById('notification-center-list');
+                const rows = list ? Array.from(list.querySelectorAll('.notification-swipe-row')) : [];
+                const cascadeMs = (typeof window.animateUserNotificationCascadeOut === 'function') ? window.animateUserNotificationCascadeOut(rows) : 0;
+                const finishTimer = setTimeout(() => {
+                    if (expectedUser !== String(localStorage.getItem('psn_username') || '').trim()) return;
+                    if (typeof window.syncUserNotificationDomToState === 'function') window.syncUserNotificationDomToState();
+                    window.__userNotificationClearBusy = false;
+                    const currentButton = document.getElementById('notifications-dismiss-all');
+                    if (currentButton) currentButton.disabled = false;
+                }, cascadeMs);
+
+                return { removedItems, previousSeenIds:Array.from(previousSeenIds), removedUnreadCount, clearThroughId, rows, finishTimer };
+            },
+            undo:function(staged) {
+                if (!staged) return;
+                clearTimeout(staged.finishTimer);
+                (Array.isArray(staged.rows) ? staged.rows : []).forEach(row => {
+                    if (!row || !row.isConnected) return;
+                    row.classList.remove('is-dismiss-all');
+                    row.style.removeProperty('--notification-dismiss-delay');
+                });
+                document.querySelectorAll('#notification-center-list .notification-center-day.is-dismiss-all').forEach(day => {
+                    day.classList.remove('is-dismiss-all');
+                    day.style.removeProperty('--notification-dismiss-delay');
+                });
+                restoreBatch(staged, true);
+            },
+            commit:function(staged) {
+                if (!staged || !staged.removedItems || !staged.removedItems.length) return;
+                clearTimeout(staged.finishTimer);
+                if (expectedUser !== String(localStorage.getItem('psn_username') || '').trim()) return;
+                window.__userNotificationClearBusy = false;
+                const button = document.getElementById('notifications-dismiss-all');
+                if (button) button.disabled = false;
+
+                if (!socketChat || !socketChat.connected) {
+                    restoreBatch(staged, true);
+                    if (typeof showToastNotification === 'function') showToastNotification('Notifications', 'Clear was cancelled because the server disconnected.');
+                    return;
+                }
+
+                socketChat.emit('user_notifications_clear', { throughId:staged.clearThroughId }, function(response) {
+                    if (expectedUser !== String(localStorage.getItem('psn_username') || '').trim()) return;
+                    if (!response || response.ok !== true) {
+                        restoreBatch(staged, true);
+                        if (typeof showToastNotification === 'function') showToastNotification('Notifications', 'Could not dismiss notifications. They were restored.');
+                        return;
+                    }
+                    if (Object.prototype.hasOwnProperty.call(response, 'unreadCount')) window.__userNotificationServerUnreadCount = Math.max(0, Number(response.unreadCount) || 0);
+                    reconcileUserNotificationUnreadCount();
+                    window.writeUserNotificationCache();
+                    window.refreshNotificationCenterIndicators();
+                });
             }
-            setTimeout(releaseClearBusy, cascadeMs + 40);
         });
-        return true;
     };
 
     function setupNotificationSwipeInteractions() {
@@ -88919,57 +89135,120 @@ function getVisibleChatStackEl(id) {
 			if (typeof showToastNotification === 'function') showToastNotification('Friend Activity', 'Reconnect to dismiss friend activity.');
 			return false;
 		}
+		if (typeof window.schedulePsnUndoAction !== 'function') return false;
+
 		const expectedUser = String(localStorage.getItem('psn_username') || '').trim();
 		if (!expectedUser) return false;
 		const clearThroughId = getRealtimeFeedMaxId(items);
 		if (!clearThroughId) return false;
-		const previousDismissedThroughId = Math.max(0, Number(window.__friendActivityDismissedThroughId) || 0);
 
-		window.__friendActivityClearBusy = true;
-		cancelFriendActivitySwipeHintPreview(true);
-		closeFriendActivitySwipeRows();
-		const button = document.getElementById('friend-activity-dismiss-all');
-		if (button) button.disabled = true;
-		if (typeof playUiRemove === 'function') playUiRemove();
-		const list = document.getElementById('friend-activity-list');
-		const rows = list ? Array.from(list.querySelectorAll('.friend-activity-swipe-row')) : [];
-		const cascadeMs = window.animateFriendActivityCascadeOut(rows);
-		const finishLocalClear = function() {
-			if (String(localStorage.getItem('psn_username') || '').trim().toLowerCase() !== expectedUser.toLowerCase()) return;
-			window.__friendActivityDismissedThroughId = Math.max(previousDismissedThroughId, clearThroughId);
-			window.__friendActivityLastReadId = Math.max(Math.max(0, Number(window.__friendActivityLastReadId) || 0), clearThroughId);
-			window.friendActivityItems = (Array.isArray(window.friendActivityItems) ? window.friendActivityItems : []).filter(function(item) { return Math.max(0, Number(item && item.id) || 0) > clearThroughId; });
+		const removedItems = items.filter(item => Math.max(0, Number(item && item.id) || 0) <= clearThroughId);
+		const previousDismissedThroughId = Math.max(0, Number(window.__friendActivityDismissedThroughId) || 0);
+		const previousLastReadId = Math.max(0, Number(window.__friendActivityLastReadId) || 0);
+
+		const restoreBatch = function(staged, animate = true) {
+			if (!staged || !Array.isArray(staged.removedItems)) return;
+			if (expectedUser !== String(localStorage.getItem('psn_username') || '').trim()) return;
+			window.__friendActivityDismissedThroughId = Math.max(0, Number(staged.previousDismissedThroughId) || 0);
+			const currentLastReadId = Math.max(0, Number(window.__friendActivityLastReadId) || 0);
+			window.__friendActivityLastReadId = currentLastReadId > Math.max(0, Number(staged.clearThroughId) || 0)
+				? currentLastReadId
+				: Math.max(0, Number(staged.previousLastReadId) || 0);
+			if (typeof window.mergeFriendActivityItems === 'function') window.mergeFriendActivityItems(staged.removedItems, false);
+			else {
+				const currentIds = new Set((window.friendActivityItems || []).map(item => String(item && item.id || '')));
+				staged.removedItems.forEach(item => {
+					const id = String(item && item.id || '');
+					if (id && !currentIds.has(id)) window.friendActivityItems.push(item);
+				});
+			}
 			window.writeFriendActivityCache();
 			window.refreshFriendActivityIndicators();
-			window.syncFriendActivityDomToState();
-		};
-		setTimeout(finishLocalClear, cascadeMs);
-
-		const releaseClearBusy = function() {
 			window.__friendActivityClearBusy = false;
-			const currentButton = document.getElementById('friend-activity-dismiss-all');
-			if (currentButton) currentButton.disabled = false;
+			const button = document.getElementById('friend-activity-dismiss-all');
+			if (button) button.disabled = false;
+			if (typeof window.applyCollectionToolbarFilterChange === 'function' && window.isFriendActivityVisible()) {
+				window.applyCollectionToolbarFilterChange('activity', { revealNew:animate });
+			} else if (typeof window.renderFriendActivity === 'function' && window.isFriendActivityVisible()) {
+				window.renderFriendActivity(true);
+			}
 			updateFriendActivityChrome();
 		};
-		const clearFallbackTimer = setTimeout(releaseClearBusy, cascadeMs + 5200);
-		socketChat.emit('friend_activity_clear', { throughId:clearThroughId }, function(response) {
-			clearTimeout(clearFallbackTimer);
-			const currentUser = String(localStorage.getItem('psn_username') || '').trim();
-			if (!response || response.ok !== true) {
-				if (currentUser.toLowerCase() === expectedUser.toLowerCase()) {
-					window.__friendActivityDismissedThroughId = previousDismissedThroughId;
-					if (typeof showToastNotification === 'function') showToastNotification('Friend Activity', 'Could not dismiss friend activity. Refreshing…');
-					setTimeout(function() { window.bootstrapFriendActivityRealtime({ forceFull:true, reason:'clear-recovery' }); }, cascadeMs + 20);
-				}
-			} else if (currentUser.toLowerCase() === expectedUser.toLowerCase()) {
-				window.__friendActivityDismissedThroughId = Math.max(Math.max(0, Number(response.dismissedThroughId) || 0), clearThroughId);
-				window.__friendActivityLastReadId = Math.max(Math.max(0, Number(window.__friendActivityLastReadId) || 0), Math.max(0, Number(response.lastReadId) || clearThroughId));
+
+		return !!window.schedulePsnUndoAction({
+			title:'Friend Activity cleared',
+			description:`${removedItems.length} ${removedItems.length === 1 ? 'activity was' : 'activities were'} removed.`,
+			duration:5200,
+			stage:function() {
+				window.__friendActivityClearBusy = true;
+				cancelFriendActivitySwipeHintPreview(true);
+				closeFriendActivitySwipeRows();
+				const button = document.getElementById('friend-activity-dismiss-all');
+				if (button) button.disabled = true;
+				if (typeof playUiRemove === 'function') playUiRemove();
+
+				window.__friendActivityDismissedThroughId = Math.max(previousDismissedThroughId, clearThroughId);
+				window.__friendActivityLastReadId = Math.max(previousLastReadId, clearThroughId);
+				window.friendActivityItems = (Array.isArray(window.friendActivityItems) ? window.friendActivityItems : []).filter(item => Math.max(0, Number(item && item.id) || 0) > clearThroughId);
 				window.writeFriendActivityCache();
 				window.refreshFriendActivityIndicators();
+
+				const list = document.getElementById('friend-activity-list');
+				const rows = list ? Array.from(list.querySelectorAll('.friend-activity-swipe-row')) : [];
+				const cascadeMs = typeof window.animateFriendActivityCascadeOut === 'function' ? window.animateFriendActivityCascadeOut(rows) : 0;
+				const finishTimer = setTimeout(() => {
+					if (expectedUser !== String(localStorage.getItem('psn_username') || '').trim()) return;
+					window.syncFriendActivityDomToState();
+					window.__friendActivityClearBusy = false;
+					const currentButton = document.getElementById('friend-activity-dismiss-all');
+					if (currentButton) currentButton.disabled = false;
+					updateFriendActivityChrome();
+				}, cascadeMs);
+
+				return { removedItems, previousDismissedThroughId, previousLastReadId, clearThroughId, rows, finishTimer };
+			},
+			undo:function(staged) {
+				if (!staged) return;
+				clearTimeout(staged.finishTimer);
+				(Array.isArray(staged.rows) ? staged.rows : []).forEach(row => {
+					if (!row || !row.isConnected) return;
+					row.classList.remove('is-dismiss-all');
+					row.style.removeProperty('--notification-dismiss-delay');
+				});
+				document.querySelectorAll('#friend-activity-list .friend-activity-day.is-dismiss-all').forEach(day => {
+					day.classList.remove('is-dismiss-all');
+					day.style.removeProperty('--notification-dismiss-delay');
+				});
+				restoreBatch(staged, true);
+			},
+			commit:function(staged) {
+				if (!staged || !staged.removedItems || !staged.removedItems.length) return;
+				clearTimeout(staged.finishTimer);
+				if (expectedUser !== String(localStorage.getItem('psn_username') || '').trim()) return;
+				window.__friendActivityClearBusy = false;
+				const button = document.getElementById('friend-activity-dismiss-all');
+				if (button) button.disabled = false;
+
+				if (!socketChat || !socketChat.connected) {
+					restoreBatch(staged, true);
+					if (typeof showToastNotification === 'function') showToastNotification('Friend Activity', 'Clear was cancelled because the server disconnected.');
+					return;
+				}
+
+				socketChat.emit('friend_activity_clear', { throughId:staged.clearThroughId }, function(response) {
+					if (expectedUser !== String(localStorage.getItem('psn_username') || '').trim()) return;
+					if (!response || response.ok !== true) {
+						restoreBatch(staged, true);
+						if (typeof showToastNotification === 'function') showToastNotification('Friend Activity', 'Could not dismiss friend activity. It was restored.');
+						return;
+					}
+					window.__friendActivityDismissedThroughId = Math.max(Math.max(0, Number(response.dismissedThroughId) || 0), staged.clearThroughId);
+					window.__friendActivityLastReadId = Math.max(Math.max(0, Number(window.__friendActivityLastReadId) || 0), Math.max(0, Number(response.lastReadId) || staged.clearThroughId));
+					window.writeFriendActivityCache();
+					window.refreshFriendActivityIndicators();
+				});
 			}
-			setTimeout(releaseClearBusy, cascadeMs + 40);
 		});
-		return true;
 	};
 
 	function setupFriendActivitySwipeInteractions() {
@@ -89266,33 +89545,75 @@ function getVisibleChatStackEl(id) {
 		const resolvedAvatar = getResolvedUserAvatar(name, avatar);
 		const index = window.friendsList.findIndex(f => f.name === name);
 
-		const finishFriendChange = () => {
+		const finishFriendChange = (options = {}) => {
 			saveState(STORAGE_KEY_FRIENDS, JSON.stringify(window.friendsList));
 			markProfileListChanged('friends');
 			checkTrophyProgress('friend_1', window.friendsList.length);
 			checkTrophyProgress('friend_10', window.friendsList.length);
 			checkTrophyProgress('friend_25', window.friendsList.length);
 
-			const searchInput = document.getElementById('search-input');
-			const currentSearch = searchInput ? searchInput.value : '';
-			if (typeof window.applyCollectionToolbarFilterChange === 'function') window.applyCollectionToolbarFilterChange('friends', { revealNew:false });
-			else if (window.renderFriendsList) window.renderFriendsList(currentSearch, true);
-			if (window.broadcastProfileUpdate) window.broadcastProfileUpdate();
+			if (options.render !== false) {
+				const searchInput = document.getElementById('search-input');
+				const currentSearch = searchInput ? searchInput.value : '';
+				if (typeof window.applyCollectionToolbarFilterChange === 'function') window.applyCollectionToolbarFilterChange('friends', { revealNew:options.revealNew !== false });
+				else if (window.renderFriendsList) window.renderFriendsList(currentSearch, true);
+			}
+			if (options.broadcast !== false && window.broadcastProfileUpdate) window.broadcastProfileUpdate();
 			if (typeof window.updateDirectThreadFriendButton === 'function') window.updateDirectThreadFriendButton();
 		};
-		
+
 		if (index > -1) {
 			const card = triggerElement && typeof triggerElement.closest === 'function' ? triggerElement.closest('#friends-list-grid .online-user-item') : null;
-			if (card && !card.classList.contains('friend-removing')) {
-				card.classList.remove('anim-reveal', 'no-anim');
-				card.classList.add('friend-removing');
-				if (typeof playUiRemove === 'function') playUiRemove();
-				setTimeout(() => {
-					const liveIndex = window.friendsList.findIndex(f => f.name === name);
-					if (liveIndex > -1) window.friendsList.splice(liveIndex, 1);
-					finishFriendChange();
-				}, 800);
-				return;
+			const canUndoHere = !!(card && typeof window.schedulePsnUndoAction === 'function');
+			if (canUndoHere) {
+				const expectedUser = String(localStorage.getItem('psn_username') || '').trim();
+				const removedItem = window.friendsList[index];
+				return !!window.schedulePsnUndoAction({
+					title:'Friend removed',
+					description:`${name} was removed from Friends.`,
+					duration:5200,
+					stage:function() {
+						const liveIndex = window.friendsList.findIndex(f => f && f.name === name);
+						if (liveIndex < 0) return null;
+						const removed = window.friendsList.splice(liveIndex, 1)[0];
+						card.classList.remove('anim-reveal', 'friend-adding', 'no-anim');
+						card.classList.add('friend-removing');
+						if (typeof playUiRemove === 'function') playUiRemove();
+						finishFriendChange({ render:false, broadcast:false });
+						const renderTimer = setTimeout(() => {
+							if (expectedUser !== String(localStorage.getItem('psn_username') || '').trim()) return;
+							if (typeof window.applyCollectionToolbarFilterChange === 'function') window.applyCollectionToolbarFilterChange('friends', { revealNew:false });
+							else if (window.renderFriendsList) window.renderFriendsList(document.getElementById('search-input')?.value || '', true);
+						}, 780);
+						return { removed:removed || removedItem, index:liveIndex, renderTimer, card };
+					},
+					undo:function(staged) {
+						if (!staged || !staged.removed) return;
+						if (expectedUser !== String(localStorage.getItem('psn_username') || '').trim()) return;
+						clearTimeout(staged.renderTimer);
+						if (!window.friendsList.some(friend => friend && friend.name === name)) {
+							window.friendsList.splice(Math.max(0, Math.min(staged.index, window.friendsList.length)), 0, staged.removed);
+						}
+						window.__friendAddingName = name;
+						if (staged.card && staged.card.isConnected) {
+							staged.card.classList.remove('friend-removing', 'no-anim', 'anim-reveal');
+							void staged.card.offsetWidth;
+							staged.card.classList.add('friend-adding');
+						}
+						finishFriendChange({ broadcast:false, revealNew:false });
+						setTimeout(() => {
+							if (window.__friendAddingName === name) window.__friendAddingName = '';
+						}, 820);
+					},
+					commit:function(staged) {
+						if (!staged || !staged.removed) return;
+						clearTimeout(staged.renderTimer);
+						if (expectedUser !== String(localStorage.getItem('psn_username') || '').trim()) return;
+						if (typeof window.applyCollectionToolbarFilterChange === 'function') window.applyCollectionToolbarFilterChange('friends', { revealNew:false });
+						else if (window.renderFriendsList) window.renderFriendsList(document.getElementById('search-input')?.value || '', true);
+						if (window.broadcastProfileUpdate) window.broadcastProfileUpdate();
+					}
+				});
 			}
 
 			window.friendsList.splice(index, 1);
@@ -89309,7 +89630,7 @@ function getVisibleChatStackEl(id) {
 			});
 			if (typeof playUiSuccess === 'function') playUiSuccess();
 		}
-		
+
 		finishFriendChange();
 		if (window.__friendAddingName === name) {
 			setTimeout(() => {
