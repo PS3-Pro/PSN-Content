@@ -64077,6 +64077,117 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
     }
     window.syncChatVirtualBoundsFromRendered = syncChatVirtualBoundsFromRendered;
 
+    function getChatVirtualDomLimit() {
+        return 80;
+    }
+
+    function getChatVirtualRowIndex(row, history = window.messageHistory) {
+        if (!row || !Array.isArray(history) || !history.length) return -1;
+        const rowMsgId = String(row.getAttribute('data-chat-msg-id') || row.id || '').replace(/^msg-row-/, '');
+        let index = parseInt(row.getAttribute('data-chat-index'), 10);
+        if (Number.isFinite(index) && index >= 0 && index < history.length && (!rowMsgId || getChatMessageTimeKey(history[index]) === rowMsgId)) return index;
+        index = rowMsgId ? getChatMessageIndexById(rowMsgId) : -1;
+        if (index > -1) row.setAttribute('data-chat-index', String(index));
+        return index;
+    }
+
+    function rebuildChatVirtualDecorators(box, history = window.messageHistory) {
+        if (!box || !Array.isArray(history) || !history.length) return false;
+        const bounds = syncChatVirtualBoundsFromRendered(history, box);
+        if (!bounds) return false;
+
+        Array.from(box.children).forEach(child => {
+            if (!child || !child.classList) return;
+            if (child.classList.contains('date-divider') || child.id === 'unread-divider' || child.id === 'welcome-banner-scroll') child.remove();
+        });
+
+        if (bounds.start <= 0 && typeof getChatWelcomeBannerHtml === 'function') box.insertAdjacentHTML('afterbegin', getChatWelcomeBannerHtml());
+
+        const myName = localStorage.getItem('psn_username') || 'Guest';
+        const lastReadTime = parseInt(loadState('psn_last_chat_read') || 0) || 0;
+        const firstUnreadIndex = getChatFirstUnreadIndex(history, lastReadTime, myName);
+        let unreadAdded = false;
+        let lastDay = '';
+        const rows = Array.from(box.querySelectorAll('[id^="msg-row-"]'));
+
+        rows.forEach(row => {
+            const index = getChatVirtualRowIndex(row, history);
+            if (index < 0 || index >= history.length) return;
+            const data = history[index];
+            if (!data) return;
+            const day = new Date(data.time).toDateString();
+            if (day !== lastDay) {
+                row.before(createChatDateDivider(data.time));
+                lastDay = day;
+            }
+            const msgTime = new Date(data.time).getTime();
+            if (!unreadAdded && firstUnreadIndex > -1 && index >= firstUnreadIndex && data.user !== myName && lastReadTime > 0 && Number.isFinite(msgTime) && msgTime > lastReadTime) {
+                const unread = document.createElement('div');
+                unread.id = 'unread-divider';
+                unread.className = 'ps-new-messages-container';
+                unread.innerHTML = '<div class="ps-line left"></div><span class="ps-unread-text">UNREAD MESSAGES</span><div class="ps-line right"></div>';
+                row.before(unread);
+                unreadAdded = true;
+            }
+        });
+
+        refreshChatLastRawDateFromRendered();
+        if (typeof setupDividerAutoRemove === 'function') setupDividerAutoRemove();
+        return true;
+    }
+
+    function trimChatVirtualDomWindow(direction = '') {
+        const box = document.getElementById('chat-messages');
+        const history = Array.isArray(window.messageHistory) ? window.messageHistory : [];
+        if (!box || !history.length || window.__chatSearchActive || window.__chatVirtualWindowRendering || window.__chatLazyRenderPromise || window.__chatDetachedRenderingActive) return false;
+        if (window.chatSelectionMode || (window.selectedChatMessageIds && window.selectedChatMessageIds.size)) return false;
+
+        const bounds = syncChatVirtualBoundsFromRendered(history, box);
+        const limit = getChatVirtualDomLimit();
+        if (!bounds || bounds.end - bounds.start <= limit) return false;
+
+        let keepStart = bounds.start;
+        let keepEnd = bounds.end;
+        if (direction === 'older') keepEnd = Math.min(bounds.end, bounds.start + limit);
+        else if (direction === 'newer') keepStart = Math.max(bounds.start, bounds.end - limit);
+        else if (isChatNearBottom(box, Math.max(120, Math.floor(box.clientHeight * 0.2)))) keepStart = Math.max(bounds.start, bounds.end - limit);
+        else keepEnd = Math.min(bounds.end, bounds.start + limit);
+
+        const rows = Array.from(box.querySelectorAll('[id^="msg-row-"]'));
+        const viewportTop = box.scrollTop;
+        const anchor = rows.find(row => row.offsetTop + row.offsetHeight >= viewportTop + 1) || rows[0] || null;
+        const anchorId = anchor ? String(anchor.getAttribute('data-chat-msg-id') || anchor.id || '').replace(/^msg-row-/, '') : '';
+        const anchorIndex = anchor ? getChatVirtualRowIndex(anchor, history) : -1;
+        const anchorOffset = anchor ? anchor.offsetTop - viewportTop : 0;
+
+        let removed = 0;
+        rows.forEach(row => {
+            const index = getChatVirtualRowIndex(row, history);
+            if (index < 0 || index < keepStart || index >= keepEnd) {
+                const id = String(row.getAttribute('data-chat-msg-id') || row.id || '').replace(/^msg-row-/, '');
+                if (id && typeof forgetChatRenderedMessage === 'function') forgetChatRenderedMessage(id, row);
+                row.remove();
+                removed++;
+            }
+        });
+        if (!removed) return false;
+
+        rebuildChatVirtualDecorators(box, history);
+        const nextBounds = syncChatVirtualBoundsFromRendered(history, box);
+        if (nextBounds) {
+            window.__chatVirtualStartIndex = nextBounds.start;
+            window.__chatVirtualEndIndex = nextBounds.end;
+        }
+
+        const liveAnchor = anchorId ? getRenderedChatMessageRow(anchorId, anchorIndex) : null;
+        if (liveAnchor && box.contains(liveAnchor)) box.scrollTop = Math.max(0, liveAnchor.offsetTop - anchorOffset);
+        if (typeof window.invalidateChatJumpAvatarGeometry === 'function') window.invalidateChatJumpAvatarGeometry();
+        if (typeof updateChatSelectionUi === 'function') updateChatSelectionUi();
+        return true;
+    }
+    window.getChatVirtualDomLimit = getChatVirtualDomLimit;
+    window.trimChatVirtualDomWindow = trimChatVirtualDomWindow;
+
 
     function centerChatMessageRow(row, behavior = 'auto') {
         const chatBox = document.getElementById('chat-messages');
@@ -64468,6 +64579,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
                     if (!renderedBounds && typeof syncChatVirtualBoundsFromRendered === 'function') syncChatVirtualBoundsFromRendered(history, box);
                     refreshChatLastRawDateFromRendered();
                     box.scrollTop = previousScrollTop + Math.max(0, box.scrollHeight - previousScrollHeight);
+                    trimChatVirtualDomWindow('older');
                     refreshChatSelectionAfterAttach();
                     requestAnimationFrame(() => {
                         if (!box.isConnected) return;
@@ -64746,7 +64858,8 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
         const scrollMetrics = options && options.scrollMetrics && typeof options.scrollMetrics === 'object' ? options.scrollMetrics : null;
         if (!box || !history.length || window.__chatVirtualLoadingNewer || window.__chatVirtualWindowRendering || window.__chatLazyRenderPromise || window.__chatDetachedRenderingActive || window.__chatSearchActive) return Promise.resolve(false);
 
-        const currentEnd = Math.max(0, Number(window.__chatVirtualEndIndex || 0));
+        const renderedBounds = typeof syncChatVirtualBoundsFromRendered === 'function' ? syncChatVirtualBoundsFromRendered(history, box) : null;
+        const currentEnd = Math.max(0, Number(renderedBounds ? renderedBounds.end : window.__chatVirtualEndIndex || 0));
         if (!currentEnd || currentEnd >= history.length) return Promise.resolve(false);
 
         const nextEnd = Math.min(history.length, currentEnd + getChatVirtualOlderChunkSize());
@@ -64785,8 +64898,9 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
                     window.__chatVirtualEndIndex = nextEnd;
                     if (!Number.isFinite(Number(window.__chatVirtualStartIndex))) window.__chatVirtualStartIndex = 0;
                     refreshChatLastRawDateFromRendered();
+                    if (!options.stickToBottom) box.scrollTop = previousScrollTop;
+                    trimChatVirtualDomWindow('newer');
                     if (options.stickToBottom) box.scrollTop = box.scrollHeight;
-                    else box.scrollTop = previousScrollTop;
                     refreshChatSelectionAfterAttach();
                     if (typeof initDateStickyLogic === 'function') initDateStickyLogic();
                     if (typeof setupDividerAutoRemove === 'function') setupDividerAutoRemove();
@@ -64884,6 +64998,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
         const lastIndex = history.findIndex(msg => getChatMessageTimeKey(msg) === String(lastRenderedTime));
         if (lastIndex > -1) window.__chatVirtualEndIndex = history.length;
         if (!Number.isFinite(Number(window.__chatVirtualStartIndex))) window.__chatVirtualStartIndex = 0;
+        trimChatVirtualDomWindow(wasNearBottom ? 'newer' : '');
 
         window.__chatHistoryDomRendered = true;
         if (typeof updateChatHistoryRenderSignature === 'function') updateChatHistoryRenderSignature();
@@ -71493,7 +71608,6 @@ function getVisibleChatStackEl(id) {
 		if (firstLink && !isImage && !ytId && chatViewVisibleForPreview && !window.__loginRevealBusy) {
 			setTimeout(() => fetchLinkMetadata(firstLink[0], `lp-${msgId}`, box), 350);
 		}
-		if (box.children.length > getChatHistoryLimit()) box.removeChild(box.children[1]);
 		if (batchContext) batchContext.mentionRefreshNeeded = true;
 		else if (typeof refreshMentionJumpButton === 'function') refreshMentionJumpButton();
 	}
@@ -78514,9 +78628,13 @@ function getVisibleChatStackEl(id) {
 			if (matches) {
 				const box = document.getElementById('chat-messages');
 				const shouldAutoScroll = data.user === myName || (chatVisible && (typeof isChatNearBottom === 'function' ? isChatNearBottom(box, 120) : true));
-				checkAndInsertDivider();
-				maybeInsertUnreadDivider(shouldAutoScroll);
-				appendMessageToChat(data, data.user === myName, data.time);
+				const appendToCurrentWindow = !!query || virtualWindowWasAtTail;
+				if (appendToCurrentWindow) {
+					checkAndInsertDivider();
+					maybeInsertUnreadDivider(shouldAutoScroll);
+					appendMessageToChat(data, data.user === myName, data.time);
+					if (!query) trimChatVirtualDomWindow(shouldAutoScroll ? 'newer' : '');
+				}
 				if (shouldAutoScroll && typeof jumpToBottom === 'function') jumpToBottom();
 				else if (typeof setJumpBottomButtonVisible === 'function') setJumpBottomButtonVisible(true);
 			}
@@ -78527,6 +78645,7 @@ function getVisibleChatStackEl(id) {
 		});
 	
 		socketChat.on('message_edited', function(data) {
+			invalidateChatMentionHistoryIndexCache();
 			const renderedEntry = data && typeof getChatRenderedMessageEntry === 'function' ? getChatRenderedMessageEntry(data.msgId) : null;
 			const existingEditedMsg = typeof getChatMessageByIdFast === 'function' ? getChatMessageByIdFast(data.msgId) : (Array.isArray(window.messageHistory) ? window.messageHistory.find(m => String(new Date(m && m.time).getTime()) === String(data.msgId)) : null);
 			const sameChatPayload = (left, right) => {
@@ -81153,8 +81272,10 @@ function getVisibleChatStackEl(id) {
 
 		const count = ids.size;
 		const nextSelectionMode = count > 0;
-		if (window.chatSelectionMode !== nextSelectionMode) window.chatSelectionMode = nextSelectionMode;
+		const selectionModeChanged = window.chatSelectionMode !== nextSelectionMode;
+		if (selectionModeChanged) window.chatSelectionMode = nextSelectionMode;
 		if (document.body && document.body.classList.contains('chat-selection-mode') !== nextSelectionMode) document.body.classList.toggle('chat-selection-mode', nextSelectionMode);
+		if (selectionModeChanged && !nextSelectionMode && typeof trimChatVirtualDomWindow === 'function') requestAnimationFrame(() => trimChatVirtualDomWindow());
 
 		let preview = document.getElementById('chat-selection-preview');
 		const chatInput = document.getElementById('chat-input');
@@ -81333,74 +81454,89 @@ function getVisibleChatStackEl(id) {
 	window.deleteMyMessage = deleteMyMessage;
     
 
-    let chatMentionJumpRowsCache = null;
-    let chatMentionJumpRowsCacheBox = null;
-    let chatMentionJumpRowsObserverActive = false;
+    let chatMentionHistoryIndexCache = { revision:-1, historyLength:-1, user:'', role:'', indices:[] };
 
-    function invalidateChatMentionJumpRowsCache() {
-        chatMentionJumpRowsCache = null;
-        chatMentionJumpRowsCacheBox = null;
+    function getChatMentionHistoryIndices() {
+        const history = Array.isArray(window.messageHistory) ? window.messageHistory : [];
+        const myName = String(localStorage.getItem('psn_username') || '');
+        const role = typeof window.getPsnSessionRole === 'function' ? window.getPsnSessionRole() : (document.body.classList.contains('is-admin') ? 'admin' : (document.body.classList.contains('is-mod') ? 'mod' : 'user'));
+        const revision = Math.max(0, Number(window.__chatHistoryContentRevision) || 0);
+        const cached = chatMentionHistoryIndexCache;
+        if (cached.revision === revision && cached.historyLength === history.length && cached.user === myName && cached.role === role) return cached.indices;
+
+        const preparedRegex = myName && typeof buildChatTextMentionRegex === 'function' ? buildChatTextMentionRegex(myName) : null;
+        const indices = [];
+        for (let index = 0; index < history.length; index++) {
+            const message = history[index];
+            if (!message || !myName || message.user === myName) continue;
+            const text = String(message.text || '');
+            const isMention = !!(text && (typeof chatTextMentionsCurrentSession === 'function'
+                ? chatTextMentionsCurrentSession(text, myName, preparedRegex)
+                : (typeof chatTextMentionsUser === 'function' ? chatTextMentionsUser(text, myName, preparedRegex) : text.includes(`@${myName}`))));
+            const isReply = !!(message.replyTo && message.replyTo.user === myName);
+            const isGlobal = message.isGlobalPing === true || (!!text && typeof chatTextHasEveryoneMention === 'function' && chatTextHasEveryoneMention(text) && typeof getChatGlobalPingRole === 'function' && !!getChatGlobalPingRole(message, message.user));
+            if (isMention || isReply || isGlobal) indices.push(index);
+        }
+        chatMentionHistoryIndexCache = { revision, historyLength:history.length, user:myName, role, indices };
+        return indices;
     }
 
-    function getChatMentionJumpRows() {
-        const box = document.getElementById('chat-messages');
-        if (!box) return [];
-        if (chatMentionJumpRowsObserverActive && chatMentionJumpRowsCacheBox === box && Array.isArray(chatMentionJumpRowsCache)) return chatMentionJumpRowsCache;
-        chatMentionJumpRowsCacheBox = box;
-        chatMentionJumpRowsCache = Array.from(box.querySelectorAll('[data-chat-mention-me="1"]'));
-        return chatMentionJumpRowsCache;
-    }
-
-    const chatMentionCacheBox = document.getElementById('chat-messages');
-    let chatMentionCacheObserver = null;
-    function syncChatMentionCacheObserverActivity() {
-        if (!chatMentionCacheBox || !chatMentionCacheObserver) return;
-        try { chatMentionCacheObserver.disconnect(); } catch (e) {}
-        chatMentionJumpRowsObserverActive = false;
-        invalidateChatMentionJumpRowsCache();
-        if (typeof window.invalidateChatJumpAvatarGeometry === 'function') window.invalidateChatJumpAvatarGeometry();
-        if (document.hidden) return;
-        chatMentionCacheObserver.observe(chatMentionCacheBox, { childList:true, subtree:true, attributes:true, attributeFilter:['data-chat-mention-me'] });
-        chatMentionJumpRowsObserverActive = true;
-    }
-    if (chatMentionCacheBox && typeof MutationObserver === 'function') {
-        chatMentionCacheObserver = new MutationObserver(mutations => {
-            let mentionCacheChanged = false;
-            let layoutMayHaveChanged = false;
-            for (const mutation of mutations) {
-                if (mutation.type === 'attributes') {
-                    mentionCacheChanged = true;
-                    continue;
-                }
-                if (mutation.addedNodes.length || mutation.removedNodes.length) {
-                    mentionCacheChanged = true;
-                    layoutMayHaveChanged = true;
-                }
-            }
-            if (mentionCacheChanged) invalidateChatMentionJumpRowsCache();
-            if (layoutMayHaveChanged && typeof window.invalidateChatJumpAvatarGeometry === 'function') window.invalidateChatJumpAvatarGeometry();
-        });
-        syncChatMentionCacheObserverActivity();
-        document.addEventListener('visibilitychange', syncChatMentionCacheObserverActivity, { passive:true });
+    function invalidateChatMentionHistoryIndexCache() {
+        chatMentionHistoryIndexCache.revision = -1;
     }
 
     function getPendingChatMentionState(scrollMetrics = null) {
         const box = document.getElementById('chat-messages');
-        if (!box) return { count: 0, target: null };
+        if (!box) return { count:0, target:null, targetIndex:-1, targetId:'' };
         const metricScrollTop = scrollMetrics && Number.isFinite(Number(scrollMetrics.scrollTop)) ? Number(scrollMetrics.scrollTop) : box.scrollTop;
         const metricClientHeight = scrollMetrics && Number.isFinite(Number(scrollMetrics.clientHeight)) ? Number(scrollMetrics.clientHeight) : box.clientHeight;
         const visibleBottom = metricScrollTop + metricClientHeight - 24;
-        const rows = getChatMentionJumpRows();
-        /* Mention rows are DOM ordered and offsetTop is monotonic. The old loop read every passed
-           mention on every scroll frame; binary search preserves the exact boundary with O(log n) reads. */
+
+        if (window.__chatSearchActive) {
+            const rows = Array.from(box.querySelectorAll('[data-chat-mention-me="1"]'));
+            let low = 0;
+            let high = rows.length;
+            while (low < high) {
+                const mid = (low + high) >> 1;
+                if (rows[mid].offsetTop <= visibleBottom) low = mid + 1;
+                else high = mid;
+            }
+            const target = rows[low] || null;
+            const targetIndex = target ? getChatVirtualRowIndex(target) : -1;
+            const targetId = target ? String(target.getAttribute('data-chat-msg-id') || target.id || '').replace(/^msg-row-/, '') : '';
+            return { count:rows.length - low, target, targetIndex, targetId };
+        }
+
+        const history = Array.isArray(window.messageHistory) ? window.messageHistory : [];
+        if (!history.length) return { count:0, target:null, targetIndex:-1, targetId:'' };
+        const rows = Array.from(box.querySelectorAll('[id^="msg-row-"]'));
+        let rowLow = 0;
+        let rowHigh = rows.length;
+        while (rowLow < rowHigh) {
+            const mid = (rowLow + rowHigh) >> 1;
+            if (rows[mid].offsetTop <= visibleBottom) rowLow = mid + 1;
+            else rowHigh = mid;
+        }
+
+        let visibleThroughIndex = Math.max(-1, Number(window.__chatVirtualStartIndex || 0) - 1);
+        if (rowLow > 0) {
+            const resolved = getChatVirtualRowIndex(rows[rowLow - 1], history);
+            if (resolved > -1) visibleThroughIndex = resolved;
+        }
+
+        const indices = getChatMentionHistoryIndices();
         let low = 0;
-        let high = rows.length;
+        let high = indices.length;
         while (low < high) {
             const mid = (low + high) >> 1;
-            if (rows[mid].offsetTop <= visibleBottom) low = mid + 1;
+            if (indices[mid] <= visibleThroughIndex) low = mid + 1;
             else high = mid;
         }
-        return { count: rows.length - low, target: rows[low] || null };
+        const targetIndex = low < indices.length ? indices[low] : -1;
+        const targetMessage = targetIndex > -1 ? history[targetIndex] : null;
+        const targetId = targetMessage ? getChatMessageTimeKey(targetMessage) : '';
+        const target = targetId ? getRenderedChatMessageRow(targetId, targetIndex) : null;
+        return { count:indices.length - low, target, targetIndex, targetId };
     }
 
     function isChatPreparingMessages() {
@@ -81469,6 +81605,15 @@ function getVisibleChatStackEl(id) {
         const pending = getPendingChatMentionState();
         const target = pending.target;
         if (!target) {
+            if (pending.targetIndex > -1 && pending.targetId && typeof scrollToMessage === 'function') {
+                scrollToMessage(pending.targetId, {
+                    targetIndex:pending.targetIndex,
+                    loadingText:'Loading mention',
+                    manualJumpGuardMs:3600,
+                    anchorLockMs:4200
+                });
+                return;
+            }
             refreshMentionJumpButton();
             return;
         }
@@ -81487,23 +81632,9 @@ function getVisibleChatStackEl(id) {
     }
 
     function getChatUnreadMessageCount() {
-        const box = document.getElementById('chat-messages');
         const myName = localStorage.getItem('psn_username') || "Guest";
-        const divider = document.getElementById('unread-divider');
-
-        if (box && divider) {
-            let count = 0;
-            let node = divider.nextElementSibling;
-            while (node) {
-                if (node.id && node.id.startsWith('msg-row-')) count++;
-                node = node.nextElementSibling;
-            }
-            return count;
-        }
-
         const lastReadTime = parseInt(loadState('psn_last_chat_read') || '0');
         if (!lastReadTime) return 0;
-
         const history = Array.isArray(window.messageHistory) ? window.messageHistory : [];
         return getChatUnreadSummaryCached(history, myName, lastReadTime).unreadCount;
     }
@@ -81582,7 +81713,21 @@ function getVisibleChatStackEl(id) {
         }
 
         const history = Array.isArray(window.messageHistory) ? window.messageHistory : [];
-        const virtualEnd = Number(window.__chatVirtualEndIndex || 0);
+        const virtualStart = Math.max(0, Number(window.__chatVirtualStartIndex || 0));
+        const virtualEnd = Math.max(0, Number(window.__chatVirtualEndIndex || 0));
+        if (isManualClick && history.length && typeof renderChatWindowAroundIndex === 'function') {
+            const myName = localStorage.getItem('psn_username') || 'Guest';
+            const lastReadTime = parseInt(loadState('psn_last_chat_read') || '0') || 0;
+            const firstUnreadIndex = getChatFirstUnreadIndex(history, lastReadTime, myName);
+            if (firstUnreadIndex > -1 && (firstUnreadIndex < virtualStart || firstUnreadIndex >= virtualEnd)) {
+                renderChatWindowAroundIndex(firstUnreadIndex, { loadingText:'Loading unread messages' }).then(ok => {
+                    if (!ok) return;
+                    const currentDivider = document.getElementById('unread-divider');
+                    if (currentDivider) jumpToUnreadDivider();
+                });
+                return;
+            }
+        }
         if (history.length && virtualEnd > 0 && virtualEnd < history.length && typeof renderChatWindowAroundIndex === 'function') {
             renderChatWindowAroundIndex(history.length - 1, { align: 'end', loadingText: 'Loading latest messages', scrollToBottom: true }).then(() => {
                 const latestBox = document.getElementById('chat-messages');
