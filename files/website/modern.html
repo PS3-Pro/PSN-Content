@@ -32690,9 +32690,19 @@ P
 
     function refreshViewerPlayTogetherVisibleCollections() {
         if (typeof window.setSidebarCountPill === 'function') window.setSidebarCountPill('playTogether', window.__viewerPlayTogetherTitleIds.size);
-        if (isSocialPlayTogetherSubviewVisible() && window.__socialPlayTogetherFilter === 'me' && typeof window.renderPlayTogetherSocialPanel === 'function') window.renderPlayTogetherSocialPanel(false);
+        if (isSocialPlayTogetherSubviewVisible() && window.__socialPlayTogetherFilter === 'me') {
+            if (typeof window.applyCollectionToolbarFilterChange === 'function') window.applyCollectionToolbarFilterChange('playTogether', { revealNew:false });
+            else if (typeof window.renderPlayTogetherSocialPanel === 'function') window.renderPlayTogetherSocialPanel(false);
+        }
         if (isPsnDomSectionVisible('view-downloads') && typeof window.updateDownloadUI === 'function') window.updateDownloadUI(true, 'reset');
-        if (isPsnDomSectionVisible('view-library') && isPsnDomSectionVisible('subview-games') && typeof window.applyLibraryFilters === 'function') window.applyLibraryFilters(true);
+        if (isPsnDomSectionVisible('view-library') && isPsnDomSectionVisible('subview-games')) {
+            if (typeof window.applyCollectionToolbarFilterChange === 'function') window.applyCollectionToolbarFilterChange('library', { revealNew:false });
+            else if (typeof window.applyLibraryFilters === 'function') window.applyLibraryFilters(true);
+        }
+        if (isPsnDomSectionVisible('view-library') && isPsnDomSectionVisible('subview-favs')) {
+            if (typeof window.applyCollectionToolbarFilterChange === 'function') window.applyCollectionToolbarFilterChange('favorites', { revealNew:false });
+            else if (typeof window.updateFavoritesLibraryUI === 'function') window.updateFavoritesLibraryUI(true);
+        }
         if (typeof window.syncProfileCommonPlayTogetherButtons === 'function') window.syncProfileCommonPlayTogetherButtons(document.getElementById('list-modal-body') || document);
     }
 
@@ -75337,6 +75347,44 @@ function getVisibleChatStackEl(id) {
 	}
 	window.animateDirectConversationListEntry = animateDirectConversationListEntry;
 
+	function captureDirectConversationListReflow() {
+		const list = document.getElementById('direct-conversations-list');
+		if (!list || document.hidden || typeof Element.prototype.animate !== 'function') return null;
+		if (window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches) return null;
+		const positions = new Map();
+		const viewportHeight = window.innerHeight || document.documentElement.clientHeight || 0;
+		Array.from(list.querySelectorAll(':scope > .direct-conversation-item[data-direct-peer]')).forEach(item => {
+			const key = String(item.dataset.directPeer || '');
+			if (!key) return;
+			const rect = item.getBoundingClientRect();
+			if (!rect.width || !rect.height || rect.bottom < -160 || rect.top > viewportHeight + 160) return;
+			positions.set(key, { left:rect.left, top:rect.top });
+		});
+		return positions.size ? { list, positions, viewportHeight } : null;
+	}
+
+	function animateDirectConversationListReflow(snapshot, duration = 340) {
+		if (!snapshot || !snapshot.list || !snapshot.list.isConnected || !snapshot.positions || !snapshot.positions.size) return 0;
+		let moved = 0;
+		Array.from(snapshot.list.querySelectorAll(':scope > .direct-conversation-item[data-direct-peer]')).forEach(item => {
+			const first = snapshot.positions.get(String(item.dataset.directPeer || ''));
+			if (!first) return;
+			const last = item.getBoundingClientRect();
+			if (!last.width || !last.height || last.bottom < -160 || last.top > snapshot.viewportHeight + 160) return;
+			const dx = first.left - last.left;
+			const dy = first.top - last.top;
+			if (Math.abs(dx) < .5 && Math.abs(dy) < .5) return;
+			item.getAnimations().forEach(animation => { if (animation.id === 'psn-direct-conversation-reflow') animation.cancel(); });
+			const animation = item.animate(
+				[{ translate:`${dx}px ${dy}px` }, { translate:'0px 0px' }],
+				{ duration, easing:'cubic-bezier(.22,1,.36,1)' }
+			);
+			animation.id = 'psn-direct-conversation-reflow';
+			moved++;
+		});
+		return moved;
+	}
+
 	function renderDirectConversations() {
 		const list = document.getElementById('direct-conversations-list');
 		if (!list) return;
@@ -75529,6 +75577,7 @@ function getVisibleChatStackEl(id) {
 		const item = document.querySelector(`#direct-conversations-list .direct-conversation-item[data-direct-peer="${CSS.escape(encodeURIComponent(peer).replace(/'/g, '%27'))}"]`);
 		const thread = state.activePeer === peer ? document.getElementById('direct-thread-active') : null;
 		const finish = () => {
+			const conversationListMotion = captureDirectConversationListReflow();
 			const latestConversation = directFindConversation(peer);
 			if (latestConversation && directMessageIdNumber(latestConversation.lastMessage && latestConversation.lastMessage.id) > deletedThroughId) {
 				item?.classList.remove('is-removing');
@@ -75541,6 +75590,7 @@ function getVisibleChatStackEl(id) {
 			if (state.activePeer === peer) directClearActiveConversation(peer);
 			directCommitConversationState(false);
 			renderDirectConversations();
+			animateDirectConversationListReflow(conversationListMotion);
 			if (thread) renderDirectThread();
 		};
 		const reducedMotion = !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
@@ -75861,6 +75911,7 @@ function getVisibleChatStackEl(id) {
 		const conversationItem = document.querySelector(`#direct-conversations-list .direct-conversation-item[data-direct-peer="${CSS.escape(encodedPeer)}"]`);
 		const finish = () => {
 			if (Number(state.emptyConversationCloseToken || 0) !== token) return;
+			const conversationListMotion = captureDirectConversationListReflow();
 			state.emptyConversationCloseTimer = 0;
 			if (state.activePeer === peer && (!Array.isArray(state.messages) || !state.messages.length)) {
 				state.activePeer = ''; state.peer = null; state.messages = []; state.messageCount = 0; state.trimmedMessageIds = []; state.threadLoadedPeer = ''; state.virtualStart = 0; state.virtualEnd = 0; state.virtualBusy = false;
@@ -75875,6 +75926,7 @@ function getVisibleChatStackEl(id) {
 			thread?.classList.remove('is-removing');
 			conversationItem?.classList.remove('is-removing');
 			renderDirectConversations();
+			animateDirectConversationListReflow(conversationListMotion);
 			renderDirectThread();
 		};
 		const reducedMotion = !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
