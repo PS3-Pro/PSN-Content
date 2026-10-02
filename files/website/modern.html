@@ -1989,6 +1989,7 @@ input:checked+.slider:before { transform: translateX(20px); }
 #fm-online-container .fm-root-device-icon.is-network { color: #70d7c7; }
 #fm-online-container .fm-root-device-icon.is-package { color: #ffb45a; }
 #fm-online-container .file-row.fm-context-target { background: rgba(0,112,204,.13) !important; box-shadow: inset 3px 0 0 rgba(0,112,204,.85); }
+#fm-online-container .file-row.fm-row-collapse { overflow: hidden; pointer-events: none; transition: opacity .18s ease, transform .22s cubic-bezier(.4,0,.2,1), height .24s cubic-bezier(.4,0,.2,1), padding-top .24s cubic-bezier(.4,0,.2,1), padding-bottom .24s cubic-bezier(.4,0,.2,1), border-bottom-width .24s cubic-bezier(.4,0,.2,1) !important; opacity: 0 !important; transform: translateX(-10px) scale(.988); height: 0 !important; min-height: 0 !important; padding-top: 0 !important; padding-bottom: 0 !important; border-bottom-width: 0 !important; }
 #fm-online-container .file-row.anim-reveal { opacity: 0; animation: fmFileRowReveal .24s cubic-bezier(.2,.78,.24,1) both; animation-delay: calc(var(--fm-row-idx,0) * 13ms); }
 #fm-online-container .fm-empty-state.anim-reveal { opacity: 0; animation: fmEmptyStateIn .34s cubic-bezier(.16,.84,.28,1) both; }
 #fm-online-container .fm-empty-state.anim-reveal .fm-empty-icon { animation: fmEmptyIconIn .42s cubic-bezier(.16,1,.3,1) .06s both; }
@@ -2040,6 +2041,7 @@ input:checked+.slider:before { transform: translateX(20px); }
 @media (max-width: 520px) { .fm-info-modal .sys-modal-content { width: calc(100vw - 18px); } .fm-info-value.is-hash { font-size: 11px; letter-spacing: .2px; } }
 @media (max-width: 640px) { .fm-context-menu { width: min(270px,calc(100vw - 16px)); } .fm-context-menu-item { min-height: 38px; font-size: 11px; } .fm-context-menu-title { font-size: 13px; } }
 @media (prefers-reduced-motion:reduce) {
+	#fm-online-container .file-row.fm-row-collapse { transition-duration:.01ms !important; }
 	#fm-online-container .file-row.anim-reveal,#fm-online-container .fm-empty-state.anim-reveal,#fm-online-container .fm-empty-state.anim-reveal .fm-empty-icon,#fm-online-container .fm-empty-state.anim-reveal .fm-empty-title,#fm-online-container .fm-empty-state.anim-reveal .fm-empty-desc,.fm-context-menu.is-open,.fm-context-menu.is-closing,.fm-info-loading,.fm-info-value-wrap,.fm-info-error,.fm-info-copy.is-copied { animation-duration:.01ms !important; animation-delay:0ms !important; }
 }
 
@@ -60780,7 +60782,11 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 			await fetch(`http://${ip}${endpoint}${encodeWebmanFilePath(path)}`, { mode: 'no-cors', cache: 'no-store' });
 			if (typeof playUiSuccess === 'function') playUiSuccess();
 			if (typeof showToastNotification === 'function') showToastNotification('File Manager', `${label} command sent.`);
-			if (options.refresh === true) setTimeout(() => explorePath(getFileManagerPanePath(options.pane || 'left'), options.pane || 'left'), Number(options.refreshDelay || 650));
+			if (options.refresh === true) {
+				const refreshPane = options.pane === 'right' ? 'right' : 'left';
+				const refreshOptions = options.refreshOptions && typeof options.refreshOptions === 'object' ? options.refreshOptions : {};
+				setTimeout(() => explorePath(getFileManagerPanePath(refreshPane), refreshPane, refreshOptions), Number(options.refreshDelay || 650));
+			}
 			return true;
 		} catch (error) {
 			console.error(`[File Manager] ${label} failed:`, error);
@@ -60797,7 +60803,12 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 		if (!name) return false;
 		if (/[\\/:*?"<>|]/.test(name)) { alert('Folder name contains invalid characters.'); return false; }
 		const fullPath = normalizeFileManagerPath((parent === '/' ? '' : parent) + '/' + name);
-		return sendFileManagerWebmanCommand('/mkdir.ps3', fullPath, { label: 'New folder', refresh: true, pane: cleanPane });
+		return sendFileManagerWebmanCommand('/mkdir.ps3', fullPath, {
+			label: 'New folder',
+			refresh: true,
+			pane: cleanPane,
+			refreshOptions: { reveal: false, preserveScroll: true, quiet: true, revealPaths: [fullPath], reconcileRows: true }
+		});
 	}
 
 	function focusFileManagerTransferWorkspace() {
@@ -60998,8 +61009,17 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 				if (typeof showToastNotification === 'function') showToastNotification('File Manager', `${verb} complete: ${target.name}`);
 				return true;
 			}
-			await explorePath(destinationDirectory, destinationPane);
-			if (operation === 'move') await explorePath(sourceDirectory, sourcePane);
+			if (operation === 'move') await animateFileManagerRemovedRow(target.sourcePath, sourcePane);
+			await explorePath(destinationDirectory, destinationPane, {
+				reveal: false,
+				preserveScroll: true,
+				quiet: true,
+				revealPaths: [target.destinationPath],
+				reconcileRows: true
+			});
+			if (operation === 'move') {
+				await explorePath(sourceDirectory, sourcePane, { reveal: false, preserveScroll: true, quiet: true, reuseEquivalentDom: true });
+			}
 			if (typeof showToastNotification === 'function') showToastNotification('File Manager', `${verb} complete: ${target.name}`);
 			return true;
 		} catch (error) {
@@ -61014,6 +61034,28 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 		}
 	};
 
+	function animateFileManagerRemovedRow(path, pane = 'left') {
+		const normalizedPath = normalizeFileManagerPath(path);
+		const list = getFileManagerPaneElements(pane === 'right' ? 'right' : 'left').list;
+		if (!list) return Promise.resolve(false);
+		const row = Array.from(list.querySelectorAll('.file-row')).find(candidate =>
+			normalizeFileManagerPath(candidate.dataset.fmPath || '') === normalizedPath
+		);
+		if (!row) return Promise.resolve(false);
+		row.classList.remove('anim-reveal', 'fm-context-target', 'fm-selected');
+		row.style.animation = 'none';
+		row.style.height = `${row.getBoundingClientRect().height}px`;
+		row.style.boxSizing = 'border-box';
+		void row.offsetHeight;
+		return new Promise(resolve => {
+			requestAnimationFrame(() => row.classList.add('fm-row-collapse'));
+			setTimeout(() => {
+				if (row.isConnected) row.remove();
+				resolve(true);
+			}, 250);
+		});
+	}
+
 	async function deleteFile(path, pane = 'left') {
 		const ip = document.getElementById('ps3-ip').value;
 		if (!ip) { alert("Please enter the PS3™ IP address first!"); return; }
@@ -61026,14 +61068,15 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 			const response = await fetch(url, { cache: 'no-store' });
 			if (!response.ok) throw new Error(`HTTP ${response.status}`);
 			if (fileManagerSelection?.path === normalizeFileManagerPath(cleanPath)) clearFileManagerSelection({ silent: true });
-			explorePath(getFileManagerPanePath(pane), pane);
+			await animateFileManagerRemovedRow(cleanPath, pane);
+			await explorePath(getFileManagerPanePath(pane), pane, { reveal: false, preserveScroll: true, quiet: true, reuseEquivalentDom: true });
 		} catch (e) {
 			alert("Delete failed: " + e.message);
 			console.error("[deleteFile]", e);
 		}
 	}
 
-	async function explorePath(path, pane = 'left') {
+	async function explorePath(path, pane = 'left', options = {}) {
 		const paneKey = pane === 'right' ? 'right' : 'left';
 		path = normalizeFileManagerPath(path);
 		const previousPanePath = getFileManagerPanePath(paneKey);
@@ -61050,6 +61093,11 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 		const paneElements = getFileManagerPaneElements(paneKey);
 		const status = paneElements.status;
 		const listContainer = paneElements.list;
+		const preservedScrollTop = options.preserveScroll === true && listContainer ? listContainer.scrollTop : null;
+		const revealRows = options.reveal !== false;
+		const operationRevealPaths = new Set((Array.isArray(options.revealPaths) ? options.revealPaths : [])
+			.map(value => normalizeFileManagerPath(value))
+			.filter(Boolean));
 		const offlineMsg = document.getElementById('fm-offline-msg');
 		const onlineContainer = document.getElementById('fm-online-container');
 		const pathContainer = paneElements.path;
@@ -61084,7 +61132,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 	
 		if (offlineMsg) offlineMsg.style.display = 'none';
 		if (onlineContainer) onlineContainer.style.display = 'flex';
-		if (status) { status.innerText = "(Reading files...)"; status.style.color = "orange"; }
+		if (status && options.quiet !== true) { status.innerText = "(Reading files...)"; status.style.color = "orange"; }
 	
 		const controller = new AbortController();
 		requestState.controller = controller;
@@ -61121,6 +61169,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 			if (pathContainer.innerHTML !== breadcrumbHtml) pathContainer.innerHTML = breadcrumbHtml;
 	
 			const listFragment = document.createDocumentFragment();
+			const revealClass = revealRows ? ' anim-reveal' : '';
 			if (status) { status.innerText = `(${path})`; status.style.color = "var(--ps-blue)"; }
 	
 			const fileTable = doc.querySelector('table#files');
@@ -61143,7 +61192,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 					sizeText = rawContent.toLowerCase().includes('<dir>') ? "&lt;dir&gt;" : (rawContent.match(/([\d,.]+\s*(?:KB|MB|GB|bytes|b))/i)?.[1].trim() || "--");
 				}
 				const row = document.createElement('div');
-				row.className = "file-row anim-reveal";
+				row.className = `file-row${revealClass}`;
 				row.dataset.fmPane = paneKey;
 				row.dataset.fmPath = fullPath;
 				row.dataset.fmName = name;
@@ -61213,7 +61262,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 				if (webmanNativeIcon && !(isImage && !isBmp)) iconHtml = webmanNativeIcon;
 	
 				const row = document.createElement('div');
-				row.className = "file-row anim-reveal";
+				row.className = `file-row${revealClass}`;
 				row.dataset.fmPane = paneKey;
 				row.dataset.fmPath = fullPath;
 				row.dataset.fmName = name;
@@ -61232,7 +61281,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 			});
 			if (!listFragment.childNodes.length) {
 				const emptyState = document.createElement('div');
-				emptyState.className = 'fm-empty-state anim-reveal';
+				emptyState.className = `fm-empty-state${revealClass}`;
 				emptyState.innerHTML = `
 					<div class="fm-empty-icon"><i class="far fa-folder-open"></i></div>
 					<div class="fm-empty-title">This folder is empty</div>
@@ -61243,8 +61292,49 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 				row.style.setProperty('--fm-row-idx', String(Math.min(index, 10)));
 			});
 			if (!requestStillCurrent()) return;
-			listContainer.replaceChildren(listFragment);
-			if (previousPanePath !== path) listContainer.scrollTop = 0;
+			const nextRows = Array.from(listFragment.querySelectorAll('.file-row'));
+			const currentRows = Array.from(listContainer.querySelectorAll(':scope > .file-row'));
+			const nextPaths = nextRows.map(row => normalizeFileManagerPath(row.dataset.fmPath || ''));
+			const currentPaths = currentRows.map(row => normalizeFileManagerPath(row.dataset.fmPath || ''));
+			const equivalentRows = options.reuseEquivalentDom === true
+				&& nextRows.length > 0
+				&& nextPaths.length === currentPaths.length
+				&& nextPaths.every((value, index) => value === currentPaths[index]);
+			if (!equivalentRows) {
+				if (options.reconcileRows === true && nextRows.length && currentRows.length) {
+					const currentByPath = new Map();
+					currentRows.forEach(row => {
+						const rowPath = normalizeFileManagerPath(row.dataset.fmPath || '');
+						if (rowPath && !currentByPath.has(rowPath)) currentByPath.set(rowPath, row);
+					});
+					const reconciled = document.createDocumentFragment();
+					nextRows.forEach(nextRow => {
+						const rowPath = normalizeFileManagerPath(nextRow.dataset.fmPath || '');
+						const currentRow = rowPath ? currentByPath.get(rowPath) : null;
+						const canReuse = currentRow
+							&& currentRow.dataset.fmName === nextRow.dataset.fmName
+							&& currentRow.dataset.fmDirectory === nextRow.dataset.fmDirectory
+							&& currentRow.innerHTML === nextRow.innerHTML;
+						reconciled.appendChild(canReuse ? currentRow : nextRow);
+					});
+					listContainer.replaceChildren(reconciled);
+				} else {
+					listContainer.replaceChildren(listFragment);
+				}
+			}
+			if (preservedScrollTop !== null) listContainer.scrollTop = preservedScrollTop;
+			else if (previousPanePath !== path) listContainer.scrollTop = 0;
+			if (operationRevealPaths.size) {
+				Array.from(listContainer.querySelectorAll(':scope > .file-row')).forEach(row => {
+					const rowPath = normalizeFileManagerPath(row.dataset.fmPath || '');
+					if (!operationRevealPaths.has(rowPath)) return;
+					row.classList.remove('anim-reveal');
+					row.style.setProperty('--fm-row-idx', '0');
+					void row.offsetWidth;
+					row.classList.add('anim-reveal');
+					row.addEventListener('animationend', () => row.classList.remove('anim-reveal'), { once: true });
+				});
+			}
 			applyFileManagerSelectionHighlight();
 			if (fileManagerDualPaneEnabled) syncFileManagerTransferUi();
 	
@@ -61571,14 +61661,15 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 		if (!row) return;
 		const nameSpan = row.querySelector('.name-text');
 		if (!nameSpan) return;
-	
+
 		const originalName = nameSpan.innerText.trim();
 		const currentFontSize = window.getComputedStyle(nameSpan).fontSize;
-		
+		let renameCommitted = false;
+
 		const input = document.createElement('input');
 		input.type = 'text';
 		input.value = originalName;
-		
+
 		input.style = `
 			background: rgba(255,255,255,0.1);
 			border: 1px solid #00a2ff;
@@ -61590,40 +61681,63 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 			outline: none;
 			min-width: 150px;
 		`;
-		
+
 		input.onclick = (e) => e.stopPropagation();
-		
+
 		nameSpan.replaceWith(input);
 		input.focus();
 		input.select();
-	
+
+		const restoreOriginalName = () => {
+			if (input.isConnected) input.replaceWith(nameSpan);
+		};
+
 		const confirmRename = async () => {
+			if (renameCommitted) return;
+			renameCommitted = true;
 			const newName = input.value.trim();
-			if (newName && newName !== originalName) {
-				const pathParts = oldPath.split('/');
-				pathParts.pop();
-				const newPath = pathParts.join('/') + '/' + newName;
-				const ip = document.getElementById('ps3-ip').value;
-				try {
-					await fetch(`http://${ip}/rename.ps3${oldPath}|${newPath}`, { mode: 'no-cors' });
-					if (fileManagerSelection?.path === normalizeFileManagerPath(oldPath)) clearFileManagerSelection({ silent: true });
-					explorePath(getFileManagerPanePath(pane), pane);
-				} catch (e) { 
-					explorePath(getFileManagerPanePath(pane), pane); 
+			if (!newName || newName === originalName) {
+				restoreOriginalName();
+				return;
+			}
+
+			const pathParts = oldPath.split('/');
+			pathParts.pop();
+			const newPath = normalizeFileManagerPath(pathParts.join('/') + '/' + newName);
+			const ip = document.getElementById('ps3-ip').value;
+			try {
+				await fetch(`http://${ip}/rename.ps3${oldPath}|${newPath}`, { mode: 'no-cors' });
+				if (fileManagerSelection?.path === normalizeFileManagerPath(oldPath)) clearFileManagerSelection({ silent: true });
+				if (input.isConnected) {
+					const replacement = nameSpan.cloneNode(true);
+					replacement.textContent = newName;
+					replacement.style.opacity = '0';
+					replacement.style.transform = 'translateY(3px)';
+					replacement.style.transition = 'opacity .16s ease, transform .18s cubic-bezier(.2,.78,.24,1)';
+					input.replaceWith(replacement);
+					requestAnimationFrame(() => {
+						replacement.style.opacity = '1';
+						replacement.style.transform = 'translateY(0)';
+					});
+					await new Promise(resolve => setTimeout(resolve, 190));
 				}
-			} else { 
-				input.replaceWith(nameSpan); 
+				await explorePath(getFileManagerPanePath(pane), pane, { reveal: false, preserveScroll: true, quiet: true, reconcileRows: true });
+			} catch (e) {
+				await explorePath(getFileManagerPanePath(pane), pane, { reveal: false, preserveScroll: true, quiet: true, reconcileRows: true });
 			}
 		};
-	
+
 		input.onkeydown = (e) => {
 			e.stopPropagation();
-			if (e.key === 'Enter') confirmRename();
-			if (e.key === 'Escape') input.replaceWith(nameSpan);
+			if (e.key === 'Enter') { e.preventDefault(); confirmRename(); }
+			if (e.key === 'Escape') {
+				renameCommitted = true;
+				restoreOriginalName();
+			}
 		};
 		input.onblur = confirmRename;
 	}
-	
+
 	function downloadPS3File(url, filename) {
 		const a = document.createElement('a');
 		a.href = url;
