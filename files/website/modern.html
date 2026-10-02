@@ -13733,6 +13733,8 @@ P
 	window.resetProfileClientSyncRuntime = function() {
 		if (window.__profileHydratedSections instanceof Set) window.__profileHydratedSections.clear();
 		window.__profileSectionRequests = {};
+		if (window.__pendingFriendUndoRemovals instanceof Set) window.__pendingFriendUndoRemovals.clear();
+		window.__pendingFriendsMutation = null;
 		window.__profileBaseSyncPending = false;
 		window.__profileUpdateQueued = false;
 		window.__profileUpdateInFlight = false;
@@ -13973,6 +13975,10 @@ P
 				if (!socketChat || !socketChat.connected) break;
 				const payload = buildPersistentProfileSyncReplayPayload(username, section);
 				if (!payload) continue;
+				if (section === 'friends' && typeof readCommittedFriendsMutation === 'function') {
+					const mutation = readCommittedFriendsMutation(username);
+					if (mutation && normalizeProfileListTimestamp(mutation.updatedAt) === normalizeProfileListTimestamp(payload.friendsUpdatedAt) && Number(mutation.nextCount) === payload.friendsData.length) payload._friendsMutation = { ...mutation };
+				}
 				const response = await emitPersistentProfileUpdateWithAck(payload);
 				if (!response || response.ok !== true) {
 					console.warn(`[PROFILE SYNC] Offline replay for ${section} was not acknowledged:`, response && response.error ? response.error : 'Unknown error');
@@ -13982,6 +13988,7 @@ P
 				const accepted = Array.isArray(response.acceptedSections) && response.acceptedSections.includes(section);
 				if (accepted || wasRejected) {
 					clearPersistentProfileSyncPending(section, username);
+					if (section === 'friends' && typeof clearCommittedFriendsMutation === 'function') clearCommittedFriendsMutation('', username);
 					const syncState = getProfileSyncDirtyState();
 					if (syncState && syncState.dirty && Object.prototype.hasOwnProperty.call(syncState.dirty, section)) syncState.dirty[section] = false;
 				}
@@ -73465,7 +73472,7 @@ function getVisibleChatStackEl(id) {
 
 	window.ensureMutableProfileSectionReady = async function(section, reason = 'mutation') {
 		const key = String(section || '').toLowerCase();
-		if (!['downloads','wishlist','favorites','library'].includes(key)) return true;
+		if (!['downloads','wishlist','favorites','library','friends'].includes(key)) return true;
 		if (window.__psnOfflineModeActive === true || !socketChat || !socketChat.connected) return true;
 		if (!window.isProfileLoaded || typeof window.ensureProfileSectionHydrated !== 'function') return false;
 		const owner = String(localStorage.getItem('psn_username') || '').trim();
@@ -82002,13 +82009,26 @@ function getVisibleChatStackEl(id) {
 			payload.libraryData = typeof lastScannedGames !== 'undefined' ? lastScannedGames : [];
 			payload.libraryUpdatedAt = normalizeProfileListTimestamp(loadState(getProfileListTimestampStorageKey('library')));
 		}
+		let friendsSyncDeferred = false;
+		let sentFriendsMutationId = '';
 		if (dirty.friends) {
-			payload.friendsData = window.friendsList || [];
-			payload.friendsUpdatedAt = normalizeProfileListTimestamp(loadState(getProfileListTimestampStorageKey('friends')));
+			const hydrationKey = typeof window.getProfileHydrationKey === 'function' ? window.getProfileHydrationKey('friends', myName) : '';
+			const friendsHydrated = !!(hydrationKey && window.__profileHydratedSections instanceof Set && window.__profileHydratedSections.has(hydrationKey));
+			const mutation = typeof readCommittedFriendsMutation === 'function' ? readCommittedFriendsMutation(myName) : (window.__pendingFriendsMutation && window.__pendingFriendsMutation.user === myName ? window.__pendingFriendsMutation : null);
+			if (!friendsHydrated && !mutation) {
+				friendsSyncDeferred = true;
+			} else {
+				payload.friendsData = window.friendsList || [];
+				payload.friendsUpdatedAt = normalizeProfileListTimestamp(loadState(getProfileListTimestampStorageKey('friends')));
+				if (mutation) {
+					payload._friendsMutation = { ...mutation };
+					sentFriendsMutationId = mutation.id;
+				}
+			}
 		}
 
 		if (!Object.keys(payload).length) return;
-		const sentDirtyKeys = syncState ? Object.keys(syncState.dirty).filter(key => dirty[key]) : [];
+		const sentDirtyKeys = syncState ? Object.keys(syncState.dirty).filter(key => dirty[key] && !(key === 'friends' && friendsSyncDeferred)) : [];
 		const sentBaseProfile = Object.prototype.hasOwnProperty.call(payload, 'avatar') || Object.prototype.hasOwnProperty.call(payload, 'joined') || Object.prototype.hasOwnProperty.call(payload, 'countryCode') || Object.prototype.hasOwnProperty.call(payload, 'ps3Status') || Object.prototype.hasOwnProperty.call(payload, 'countersData');
 		const sentProfileUser = myName;
 		if (syncState) sentDirtyKeys.forEach(key => { syncState.dirty[key] = false; });
@@ -82026,10 +82046,14 @@ function getVisibleChatStackEl(id) {
 				if (showSyncIndicator && typeof window.endProfileSyncIndicator === 'function') window.endProfileSyncIndicator(ok);
 				return;
 			}
+			const rejectedSections = new Set(response && Array.isArray(response.rejectedSections) ? response.rejectedSections : []);
 			if (syncState) {
 				if (ok && sentBaseProfile) syncState.lastBaseSignature = baseSignature;
 				else if (!ok) sentDirtyKeys.forEach(key => { syncState.dirty[key] = true; });
+				if (friendsSyncDeferred) syncState.dirty.friends = true;
 			}
+			if (sentFriendsMutationId && ok && typeof clearCommittedFriendsMutation === 'function') clearCommittedFriendsMutation(sentFriendsMutationId, sentProfileUser);
+			if (rejectedSections.has('friends') && syncState) syncState.dirty.friends = false;
 			if (sentBaseProfile) window.__profileBaseSyncPending = !ok;
 			if (!ok && typeof window.persistCurrentProfileSyncDirtyState === 'function') window.persistCurrentProfileSyncDirtyState();
 			if (showSyncIndicator && typeof window.endProfileSyncIndicator === 'function') window.endProfileSyncIndicator(ok);
@@ -89949,16 +89973,78 @@ function getVisibleChatStackEl(id) {
 
 	window.getResolvedUserAvatar = getResolvedUserAvatar;
 
-	window.toggleFriend = function(name, avatar, triggerElement = null) {
+	window.__pendingFriendUndoRemovals = window.__pendingFriendUndoRemovals instanceof Set ? window.__pendingFriendUndoRemovals : new Set();
+	window.__pendingFriendsMutation = window.__pendingFriendsMutation || null;
+	const FRIENDS_MUTATION_PENDING_SUFFIX = 'psn_friends_mutation_pending_v1';
+
+	function getPendingFriendRemovalKey(name) {
+		return String(name || '').trim().toLowerCase();
+	}
+
+	function getFriendsMutationStorageKey(user = localStorage.getItem('psn_username') || '') {
+		const name = String(user || '').trim();
+		return name ? `${name}_${FRIENDS_MUTATION_PENDING_SUFFIX}` : '';
+	}
+
+	function readCommittedFriendsMutation(user = localStorage.getItem('psn_username') || '') {
+		const name = String(user || '').trim();
+		if (!name) return null;
+		if (window.__pendingFriendsMutation && window.__pendingFriendsMutation.user === name) return window.__pendingFriendsMutation;
+		const key = getFriendsMutationStorageKey(name);
+		try {
+			const parsed = JSON.parse(key ? localStorage.getItem(key) || 'null' : 'null');
+			if (!parsed || typeof parsed !== 'object' || parsed.user !== name || !parsed.id) return null;
+			window.__pendingFriendsMutation = parsed;
+			return parsed;
+		} catch (err) { return null; }
+	}
+
+	function clearCommittedFriendsMutation(id = '', user = localStorage.getItem('psn_username') || '') {
+		const name = String(user || '').trim();
+		const current = readCommittedFriendsMutation(name);
+		if (id && current && current.id !== id) return false;
+		window.__pendingFriendsMutation = null;
+		const key = getFriendsMutationStorageKey(name);
+		if (key) localStorage.removeItem(key);
+		return true;
+	}
+
+	function setCommittedFriendsMutation(kind, previousCount, nextCount, updatedAt) {
+		const user = String(localStorage.getItem('psn_username') || '').trim();
+		const stamp = normalizeProfileListTimestamp(updatedAt) || Date.now();
+		window.__pendingFriendsMutation = {
+			id:`friends-${stamp}-${Math.random().toString(36).slice(2, 9)}`,
+			kind:String(kind || 'change'),
+			previousCount:Math.max(0, Number(previousCount) || 0),
+			nextCount:Math.max(0, Number(nextCount) || 0),
+			updatedAt:stamp,
+			user
+		};
+		const key = getFriendsMutationStorageKey(user);
+		if (key) safeLocalStorageSet(key, JSON.stringify(window.__pendingFriendsMutation));
+		return window.__pendingFriendsMutation;
+	}
+
+	window.toggleFriend = async function(name, avatar, triggerElement = null) {
+		const expectedUser = String(localStorage.getItem('psn_username') || '').trim();
+		if (!expectedUser) return false;
+		if (typeof window.ensureMutableProfileSectionReady === 'function') {
+			const ready = await window.ensureMutableProfileSectionReady('friends', 'toggle-friend');
+			if (!ready || expectedUser !== String(localStorage.getItem('psn_username') || '').trim()) return false;
+		}
+
 		const resolvedAvatar = getResolvedUserAvatar(name, avatar);
-		const index = window.friendsList.findIndex(f => f.name === name);
+		const index = window.friendsList.findIndex(f => String(f && (f.name || f) || '') === name);
 
 		const finishFriendChange = (options = {}) => {
+			const previousCount = Math.max(0, Number(options.previousCount) || 0);
+			const nextCount = window.friendsList.length;
 			saveState(STORAGE_KEY_FRIENDS, JSON.stringify(window.friendsList));
-			markProfileListChanged('friends');
-			checkTrophyProgress('friend_1', window.friendsList.length);
-			checkTrophyProgress('friend_10', window.friendsList.length);
-			checkTrophyProgress('friend_25', window.friendsList.length);
+			const updatedAt = markProfileListChanged('friends');
+			setCommittedFriendsMutation(options.kind || (nextCount < previousCount ? 'remove' : 'add'), previousCount, nextCount, updatedAt);
+			checkTrophyProgress('friend_1', nextCount);
+			checkTrophyProgress('friend_10', nextCount);
+			checkTrophyProgress('friend_25', nextCount);
 
 			if (options.render !== false) {
 				const searchInput = document.getElementById('search-input');
@@ -89974,41 +90060,40 @@ function getVisibleChatStackEl(id) {
 			const card = triggerElement && typeof triggerElement.closest === 'function' ? triggerElement.closest('#friends-list-grid .online-user-item') : null;
 			const canUndoHere = !!(card && typeof window.schedulePsnUndoAction === 'function');
 			if (canUndoHere) {
-				const expectedUser = String(localStorage.getItem('psn_username') || '').trim();
 				const removedItem = window.friendsList[index];
+				const pendingKey = getPendingFriendRemovalKey(name);
 				return !!window.schedulePsnUndoAction({
 					title:'Friend removed',
 					description:`${name} was removed from Friends.`,
 					duration:5200,
 					stage:function() {
-						const liveIndex = window.friendsList.findIndex(f => f && f.name === name);
-						if (liveIndex < 0) return null;
-						const removed = window.friendsList.splice(liveIndex, 1)[0];
+						const liveIndex = window.friendsList.findIndex(f => String(f && (f.name || f) || '') === name);
+						if (liveIndex < 0 || window.__pendingFriendUndoRemovals.has(pendingKey)) return null;
+						window.__pendingFriendUndoRemovals.add(pendingKey);
 						card.classList.remove('anim-reveal', 'friend-adding', 'no-anim');
 						card.classList.add('friend-removing');
 						if (typeof playUiRemove === 'function') playUiRemove();
-						finishFriendChange({ render:false, broadcast:false });
 						const renderTimer = setTimeout(() => {
 							if (expectedUser !== String(localStorage.getItem('psn_username') || '').trim()) return;
 							if (typeof window.applyCollectionToolbarFilterChange === 'function') window.applyCollectionToolbarFilterChange('friends', { revealNew:false });
 							else if (window.renderFriendsList) window.renderFriendsList(document.getElementById('search-input')?.value || '', true);
 						}, 780);
-						return { removed:removed || removedItem, index:liveIndex, renderTimer, card };
+						return { removed:removedItem, index:liveIndex, pendingKey, renderTimer, card, previousCount:window.friendsList.length };
 					},
 					undo:function(staged) {
 						if (!staged || !staged.removed) return;
+						window.__pendingFriendUndoRemovals.delete(staged.pendingKey);
 						if (expectedUser !== String(localStorage.getItem('psn_username') || '').trim()) return;
 						clearTimeout(staged.renderTimer);
-						if (!window.friendsList.some(friend => friend && friend.name === name)) {
-							window.friendsList.splice(Math.max(0, Math.min(staged.index, window.friendsList.length)), 0, staged.removed);
-						}
 						window.__friendAddingName = name;
 						if (staged.card && staged.card.isConnected) {
 							staged.card.classList.remove('friend-removing', 'no-anim', 'anim-reveal');
 							void staged.card.offsetWidth;
 							staged.card.classList.add('friend-adding');
 						}
-						finishFriendChange({ broadcast:false, revealNew:false });
+						if (typeof window.applyCollectionToolbarFilterChange === 'function') window.applyCollectionToolbarFilterChange('friends', { revealNew:false });
+						else if (window.renderFriendsList) window.renderFriendsList(document.getElementById('search-input')?.value || '', true);
+						if (typeof window.updateDirectThreadFriendButton === 'function') window.updateDirectThreadFriendButton();
 						setTimeout(() => {
 							if (window.__friendAddingName === name) window.__friendAddingName = '';
 						}, 820);
@@ -90016,37 +90101,48 @@ function getVisibleChatStackEl(id) {
 					commit:function(staged) {
 						if (!staged || !staged.removed) return;
 						clearTimeout(staged.renderTimer);
+						window.__pendingFriendUndoRemovals.delete(staged.pendingKey);
 						if (expectedUser !== String(localStorage.getItem('psn_username') || '').trim()) return;
-						if (typeof window.applyCollectionToolbarFilterChange === 'function') window.applyCollectionToolbarFilterChange('friends', { revealNew:false });
-						else if (window.renderFriendsList) window.renderFriendsList(document.getElementById('search-input')?.value || '', true);
-						if (window.broadcastProfileUpdate) window.broadcastProfileUpdate();
+						const liveIndex = window.friendsList.findIndex(f => String(f && (f.name || f) || '') === name);
+						if (liveIndex > -1) {
+							const previousCount = window.friendsList.length;
+							window.friendsList.splice(liveIndex, 1);
+							finishFriendChange({ previousCount, kind:'remove', revealNew:false });
+						} else {
+							if (typeof window.applyCollectionToolbarFilterChange === 'function') window.applyCollectionToolbarFilterChange('friends', { revealNew:false });
+							else if (window.renderFriendsList) window.renderFriendsList(document.getElementById('search-input')?.value || '', true);
+						}
 					}
 				});
 			}
 
+			const previousCount = window.friendsList.length;
 			window.friendsList.splice(index, 1);
 			if (typeof playUiRemove === 'function') playUiRemove();
-		} else {
-			const card = triggerElement && typeof triggerElement.closest === 'function' ? triggerElement.closest('#friends-list-grid .online-user-item') : null;
-			if (card) window.__friendAddingName = name;
-			const addedAt = Date.now();
-			window.friendsList.push({
-				name: name,
-				avatar: resolvedAvatar,
-				dateAdded: new Date(addedAt).toLocaleDateString(),
-				addedAt: addedAt
-			});
-			if (typeof playUiSuccess === 'function') playUiSuccess();
+			finishFriendChange({ previousCount, kind:'remove' });
+			return true;
 		}
 
-		finishFriendChange();
+		const card = triggerElement && typeof triggerElement.closest === 'function' ? triggerElement.closest('#friends-list-grid .online-user-item') : null;
+		if (card) window.__friendAddingName = name;
+		const previousCount = window.friendsList.length;
+		const addedAt = Date.now();
+		window.friendsList.push({
+			name: name,
+			avatar: resolvedAvatar,
+			dateAdded: new Date(addedAt).toLocaleDateString(),
+			addedAt: addedAt
+		});
+		if (typeof playUiSuccess === 'function') playUiSuccess();
+		finishFriendChange({ previousCount, kind:'add' });
 		if (window.__friendAddingName === name) {
 			setTimeout(() => {
 				if (window.__friendAddingName === name) window.__friendAddingName = '';
 			}, 820);
 		}
+		return true;
 	};
-	
+
 	window.refreshFriendsPresenceMetadata = function(force = false) {
 		if (typeof socketChat === 'undefined' || !socketChat || !socketChat.connected || !Array.isArray(window.friendsList) || window.friendsList.length === 0) return false;
 		const now = Date.now();
@@ -90218,7 +90314,10 @@ function getVisibleChatStackEl(id) {
 
 
 	function getFriendsOnlineCount() {
-		const friends = Array.isArray(window.friendsList) ? window.friendsList : [];
+		const pending = window.__pendingFriendUndoRemovals instanceof Set ? window.__pendingFriendUndoRemovals : null;
+		const friends = Array.isArray(window.friendsList)
+			? (pending && pending.size ? window.friendsList.filter(friend => !pending.has(getPendingFriendRemovalKey(friend && (friend.name || friend)))) : window.friendsList)
+			: [];
 		if (!friends.length) return 0;
 		const onlineList = Array.isArray(window.currentOnlineList) ? window.currentOnlineList : (typeof currentOnlineList !== 'undefined' && Array.isArray(currentOnlineList) ? currentOnlineList : []);
 		const onlineByName = window.__currentOnlineUserByName instanceof Map
@@ -90253,8 +90352,12 @@ function getVisibleChatStackEl(id) {
 	};
 
 	window.renderFriendsList = function(filter = '', isSilent = false, progressiveMode = 'reset') {
+		const pendingFriendRemovals = window.__pendingFriendUndoRemovals instanceof Set ? window.__pendingFriendUndoRemovals : null;
+		const visibleFriendList = Array.isArray(window.friendsList)
+			? (pendingFriendRemovals && pendingFriendRemovals.size ? window.friendsList.filter(friend => !pendingFriendRemovals.has(getPendingFriendRemovalKey(friend && (friend.name || friend)))) : window.friendsList)
+			: [];
 		if (typeof window.updateFriendsOnlineCount === 'function') window.updateFriendsOnlineCount();
-		if (typeof window.setSidebarCountPill === 'function') window.setSidebarCountPill('friends', Array.isArray(window.friendsList) ? window.friendsList.length : 0);
+		if (typeof window.setSidebarCountPill === 'function') window.setSidebarCountPill('friends', visibleFriendList.length);
 		isSilent = isSilent || !!window.isRestoringHistory;
 		const friendsParentView = PSN_STATIC_NAV_DOM.chatView;
 		const friendsSubview = PSN_STATIC_NAV_DOM.subviewFriends;
@@ -90272,7 +90375,7 @@ function getVisibleChatStackEl(id) {
 		if (typeof window.refreshVisiblePsnUserAvatars === 'function') window.refreshVisiblePsnUserAvatars(grid);
 	
 		if (titleHeader) {
-			const totalFriends = window.friendsList ? window.friendsList.length : 0;
+			const totalFriends = visibleFriendList.length;
 			const friendsLabel = totalFriends === 1 ? 'Friend' : 'Friends';
 			const playersLabel = totalFriends === 1 ? 'player' : 'players';
 			const nextTitleCount = String(totalFriends);
@@ -90294,7 +90397,8 @@ function getVisibleChatStackEl(id) {
 		const isSearching = searchTerm !== '';
 		const isAllCommand = (searchTerm === '@all' || searchTerm === '*');
 		const onlineList = Array.isArray(currentOnlineList) ? currentOnlineList : [];
-		const friendList = Array.isArray(window.friendsList) ? window.friendsList : [];
+		const friendList = visibleFriendList;
+		const committedFriendList = Array.isArray(window.friendsList) ? window.friendsList : [];
 		const globalSearchList = Array.isArray(window.globalSearchResults) ? window.globalSearchResults : [];
 		const onlineByName = window.__currentOnlineUserByName instanceof Map
 			? window.__currentOnlineUserByName
@@ -90302,9 +90406,7 @@ function getVisibleChatStackEl(id) {
 		const friendByName = typeof window.getPsnNamedPoolMap === 'function'
 			? window.getPsnNamedPoolMap('friends', friendList)
 			: new Map(friendList.map(friend => [String(friend && (friend.name || friend) || ''), friend]).filter(entry => entry[0]));
-		const friendNames = window.__friendsNameSetSource === friendList && window.__friendsNameSetLength === friendList.length && window.__friendsNameSet instanceof Set
-			? window.__friendsNameSet
-			: (window.__friendsNameSetSource = friendList, window.__friendsNameSetLength = friendList.length, window.__friendsNameSet = new Set(friendByName.keys()));
+		const friendNames = new Set(committedFriendList.map(friend => String(friend && (friend.name || friend) || '')).filter(Boolean));
 		const onlineNames = window.__currentOnlineActiveNames instanceof Set
 			? window.__currentOnlineActiveNames
 			: new Set(Array.from(onlineByName).filter(([, user]) => user && typeof user === 'object' && user.online === true).map(([name]) => name));
@@ -90356,7 +90458,7 @@ function getVisibleChatStackEl(id) {
 			}
 		}
 	
-		if (window.friendsList.length === 0 && !isSearching) {
+		if (visibleFriendList.length === 0 && !isSearching) {
 			if (typeof window.syncAlphabeticalSortButtonState === 'function') window.syncAlphabeticalSortButtonState('friends', 0);
 			if (emptyMsg) emptyMsg.style.display = 'block';
 			if (container) {

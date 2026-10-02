@@ -4041,6 +4041,7 @@ function normalizeProfileArrayPayloads(target = {}) {
 }
 
 function reconcileIncomingProfileArrays(currentUser = {}, incomingUser = {}) {
+  incomingUser.__friendsSafetyRejected = false;
   Object.keys(PROFILE_ARRAY_SYNC_KEYS).forEach(key => {
     const sync = PROFILE_ARRAY_SYNC_KEYS[key];
     const hasIncomingArray = hasOwnPayload(incomingUser, key);
@@ -4064,6 +4065,24 @@ function reconcileIncomingProfileArrays(currentUser = {}, incomingUser = {}) {
       acceptIncoming = true;
     } else if (!currentVersion && !incomingVersion && !currentHasItems && hasIncomingArray) {
       acceptIncoming = true;
+    }
+
+    if (key === 'friendsData' && acceptIncoming && currentHasItems && !incomingHasItems && hasIncomingArray) {
+      const marker = incomingUser._friendsMutation && typeof incomingUser._friendsMutation === 'object' && !Array.isArray(incomingUser._friendsMutation)
+        ? incomingUser._friendsMutation
+        : null;
+      const markerKind = normalizeText(marker && marker.kind, '').toLowerCase();
+      const markerPreviousCount = Math.max(0, Number(marker && marker.previousCount) || 0);
+      const markerNextCount = Math.max(0, Number(marker && marker.nextCount) || 0);
+      const markerUpdatedAt = normalizeTimestampValue(marker && marker.updatedAt);
+      const validExplicitClear = !!(
+        marker && markerKind === 'remove' && markerPreviousCount > 0 && markerNextCount === 0 &&
+        incomingVersion && markerUpdatedAt === incomingVersion
+      );
+      if (!validExplicitClear) {
+        acceptIncoming = false;
+        incomingUser.__friendsSafetyRejected = true;
+      }
     }
 
     currentUser[key] = currentList;
@@ -12784,6 +12803,10 @@ io.on('connection', (socket) => {
 
         userData = reconcileIncomingDownloads(workingUser, userData || {});
         userData = reconcileIncomingProfileArrays(workingUser, userData || {});
+        const friendsSafetyRejected = userData.__friendsSafetyRejected === true;
+        delete userData.__friendsSafetyRejected;
+        delete userData._friendsMutation;
+        if (friendsSafetyRejected) shouldForceProfileSyncToSource = true;
 
         let nextLibraryPlayHistoryData = null;
         if (Object.prototype.hasOwnProperty.call(userData, 'libraryData')) {
@@ -12940,6 +12963,7 @@ io.on('connection', (socket) => {
             emitPublicProfileBannerUpdate(name, workingUser);
         }
         emitProfileSyncPatchFromUser(name, workingUser, profileChangedKeys, shouldForceProfileSyncToSource ? null : socket.id);
+        if (friendsSafetyRejected) emitProfileSyncPatchFromUser(name, workingUser, ['friendsData', 'friendsUpdatedAt'], null);
         const trophiesChanged = !!userData.trophiesData;
         deferServerTask('PROFILE NOTIFY', () => notifyProfileSyncAcrossInstances(
             name,
@@ -12955,6 +12979,7 @@ io.on('connection', (socket) => {
 
         const acceptedSections = requestedSyncSections.filter(section => replaySectionStatus[section] === 'accepted');
         const rejectedSections = requestedSyncSections.filter(section => replaySectionStatus[section] === 'rejected');
+        if (friendsSafetyRejected && !rejectedSections.includes('friends')) rejectedSections.push('friends');
         respond({
           ok: true,
           requestId: syncRequestId,
