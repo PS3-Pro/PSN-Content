@@ -82857,11 +82857,12 @@ function getVisibleChatStackEl(id) {
 		return !!myName && rowUser === myName;
 	}
 
-	function emitDeleteChatMessage(msgId) {
+	function emitDeleteChatMessage(msgId, callback) {
 		const myName = localStorage.getItem('psn_username');
 		const row = typeof getRenderedChatMessageRow === 'function' ? getRenderedChatMessageRow(msgId) : document.getElementById(`msg-row-${msgId}`);
 		if (row && !canCurrentUserDeleteChatRow(row)) {
 			if (typeof playUiError === 'function') playUiError();
+			if (typeof callback === 'function') callback({ success:false, message:'You cannot delete this message.' });
 			return false;
 		}
 
@@ -82873,7 +82874,7 @@ function getVisibleChatStackEl(id) {
 			if (typeof cancelReply === 'function') cancelReply();
 		}
 
-		if (socketChat) {
+		if (socketChat && socketChat.connected) {
 			const liveMessage = typeof getChatMessageByIdFast === 'function' ? getChatMessageByIdFast(msgId) : null;
 			let msgTime = liveMessage && liveMessage.time ? String(liveMessage.time) : '';
 			if (!msgTime) {
@@ -82882,10 +82883,26 @@ function getVisibleChatStackEl(id) {
 					try { msgTime = new Date(numericId).toISOString(); } catch (err) {}
 				}
 			}
-			socketChat.emit('delete_message', { msgId: msgId, msgTime, user: myName });
+			let settled = false;
+			const finish = response => {
+				if (settled) return;
+				settled = true;
+				if (typeof callback === 'function') callback(response || null);
+			};
+			try {
+				if (typeof socketChat.timeout === 'function') {
+					socketChat.timeout(10000).emit('delete_message', { msgId:msgId, msgTime, user:myName }, (err, response) => finish(err ? null : response));
+				} else {
+					socketChat.emit('delete_message', { msgId:msgId, msgTime, user:myName }, response => finish(response));
+					setTimeout(() => finish(null), 10000);
+				}
+			} catch (err) {
+				finish(null);
+			}
 			return true;
 		}
 
+		if (typeof callback === 'function') callback(null);
 		return false;
 	}
 
@@ -83004,10 +83021,94 @@ function getVisibleChatStackEl(id) {
 		if (typeof editingMsgId !== 'undefined' && editingMsgId && selectedSet.has(String(editingMsgId)) && typeof cancelEditMessage === 'function') cancelEditMessage();
 		if (typeof currentReply !== 'undefined' && currentReply && selectedSet.has(String(currentReply.id)) && typeof cancelReply === 'function') cancelReply();
 
-		let settled = false;
-		const finish = response => {
-			if (settled) return;
-			settled = true;
+		const restoreSnapshots = (snapshots, idsToRestore = null) => {
+			const entries = Array.isArray(snapshots) ? snapshots : [];
+			const restoreSet = idsToRestore instanceof Set ? idsToRestore : null;
+			let restored = false;
+			for (let index = entries.length - 1; index >= 0; index--) {
+				const entry = entries[index];
+				if (!entry || !entry.snapshot || (restoreSet && !restoreSet.has(String(entry.id)))) continue;
+				restored = window.restorePsnUndoChatMessageCollapse(entry.snapshot) || restored;
+			}
+			if (restored && typeof refreshMentionJumpButton === 'function') requestAnimationFrame(() => refreshMentionJumpButton());
+			return restored;
+		};
+
+		const emitBatchDelete = (onDone) => {
+			let settled = false;
+			const finish = response => {
+				if (settled) return;
+				settled = true;
+				if (typeof onDone === 'function') onDone(response || null);
+			};
+			try {
+				const messages = validIds.map(id => {
+					const liveMessage = typeof getChatMessageByIdFast === 'function' ? getChatMessageByIdFast(id) : null;
+					let time = liveMessage && liveMessage.time ? String(liveMessage.time) : '';
+					if (!time) {
+						const numericId = Number(id);
+						if (Number.isFinite(numericId) && numericId > 0) {
+							try { time = new Date(numericId).toISOString(); } catch (err) {}
+						}
+					}
+					return { id:String(id), time };
+				});
+				const payload = { msgIds:validIds, messages, user:localStorage.getItem('psn_username') || '' };
+				if (typeof socketChat.timeout === 'function') {
+					socketChat.timeout(10000).emit('delete_messages', payload, (err, response) => finish(err ? null : response));
+				} else {
+					socketChat.emit('delete_messages', payload, response => finish(response));
+					setTimeout(() => finish(null), 10000);
+				}
+			} catch (err) {
+				finish(null);
+			}
+		};
+
+		if (typeof window.schedulePsnUndoAction === 'function') {
+			window.schedulePsnUndoAction({
+				title:validIds.length === 1 ? 'Message deleted' : `${validIds.length} messages deleted`,
+				description:validIds.length === 1 ? 'The Global Chat message will be deleted.' : 'The selected Global Chat messages will be deleted.',
+				duration:5200,
+				stage:function() {
+					if (typeof playUiRemove === 'function') playUiRemove();
+					const snapshots = validIds.map(id => {
+						const row = typeof getRenderedChatMessageRow === 'function' ? getRenderedChatMessageRow(id) : document.getElementById(`msg-row-${id}`);
+						return { id:String(id), snapshot:window.stagePsnUndoChatMessageCollapse(row) };
+					});
+					clearChatMessageSelection();
+					if (typeof refreshMentionJumpButton === 'function') requestAnimationFrame(() => refreshMentionJumpButton());
+					return snapshots;
+				},
+				undo:function(snapshots) { restoreSnapshots(snapshots); },
+				commit:function(snapshots) {
+					if (!socketChat || !socketChat.connected) {
+						restoreSnapshots(snapshots);
+						if (typeof showToastNotification === 'function') showToastNotification('Global Chat', 'Delete was cancelled because the server disconnected.');
+						return;
+					}
+					emitBatchDelete(response => {
+						if (response && response.success === true) {
+							const deniedIds = new Set((Array.isArray(response.deniedIds) ? response.deniedIds : []).map(String));
+							if (deniedIds.size) {
+								restoreSnapshots(snapshots, deniedIds);
+								if (typeof playUiError === 'function') playUiError();
+								if (typeof showToastNotification === 'function') showToastNotification('Global Chat', `${deniedIds.size} selected message${deniedIds.size === 1 ? '' : 's'} could not be deleted.`);
+							}
+							return;
+						}
+						const stillPresent = new Set(validIds.filter(id => typeof getChatMessageByIdFast !== 'function' || !!getChatMessageByIdFast(id)).map(String));
+						if (!stillPresent.size) return;
+						restoreSnapshots(snapshots, stillPresent);
+						if (typeof playUiError === 'function') playUiError();
+						if (typeof showToastNotification === 'function') showToastNotification('Global Chat', response?.message || 'Could not delete the selected messages.');
+					});
+				}
+			});
+			return;
+		}
+
+		emitBatchDelete(response => {
 			if (!response || response.success !== true) {
 				if (typeof playUiError === 'function') playUiError();
 				if (response && response.message && typeof window.showToastNotification === 'function') window.showToastNotification('Delete messages', response.message);
@@ -83015,30 +83116,7 @@ function getVisibleChatStackEl(id) {
 			}
 			if (typeof playUiRemove === 'function') playUiRemove();
 			clearChatMessageSelection();
-		};
-
-		try {
-			const messages = validIds.map(id => {
-				const liveMessage = typeof getChatMessageByIdFast === 'function' ? getChatMessageByIdFast(id) : null;
-				let time = liveMessage && liveMessage.time ? String(liveMessage.time) : '';
-				if (!time) {
-					const numericId = Number(id);
-					if (Number.isFinite(numericId) && numericId > 0) {
-						try { time = new Date(numericId).toISOString(); } catch (err) {}
-					}
-				}
-				return { id: String(id), time };
-			});
-			const payload = { msgIds: validIds, messages, user: localStorage.getItem('psn_username') || '' };
-			if (typeof socketChat.timeout === 'function') {
-				socketChat.timeout(10000).emit('delete_messages', payload, (err, response) => finish(err ? null : response));
-			} else {
-				socketChat.emit('delete_messages', payload, response => finish(response));
-				setTimeout(() => finish(null), 10000);
-			}
-		} catch (err) {
-			finish(null);
-		}
+		});
 	}
 
 	function deleteMyMessage(msgId) {
@@ -83051,10 +83129,10 @@ function getVisibleChatStackEl(id) {
 		let rowUser = '';
 		try { rowUser = decodeURIComponent(row?.getAttribute('data-user') || ''); } catch (err) { rowUser = String(row?.getAttribute('data-user') || ''); }
 		const ownMessage = !!myName && rowUser === myName;
-		if (ownMessage && typeof window.schedulePsnUndoAction === 'function') {
+		if (typeof window.schedulePsnUndoAction === 'function') {
 			window.schedulePsnUndoAction({
-				title:'Message deleted',
-				description:'The Global Chat message will be deleted.',
+				title:ownMessage ? 'Message deleted' : 'Message removed',
+				description:ownMessage ? 'The Global Chat message will be deleted.' : `The message from ${rowUser || 'this user'} will be removed from Global Chat.`,
 				duration:5200,
 				stage:function() {
 					if (typeof playUiRemove === 'function') playUiRemove();
@@ -83069,7 +83147,14 @@ function getVisibleChatStackEl(id) {
 						if (typeof showToastNotification === 'function') showToastNotification('Global Chat', 'Delete was cancelled because the server disconnected.');
 						return;
 					}
-					emitDeleteChatMessage(msgId);
+					emitDeleteChatMessage(msgId, response => {
+						if (response && response.success === true) return;
+						const stillPresent = typeof getChatMessageByIdFast !== 'function' || !!getChatMessageByIdFast(msgId);
+						if (!stillPresent) return;
+						window.restorePsnUndoChatMessageCollapse(snapshot);
+						if (typeof playUiError === 'function') playUiError();
+						if (typeof showToastNotification === 'function') showToastNotification('Global Chat', response?.message || 'Could not delete the message.');
+					});
 				}
 			});
 			return;
