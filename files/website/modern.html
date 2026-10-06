@@ -6810,7 +6810,13 @@ img { -webkit-user-drag: none !important; user-drag: none !important; }
 .direct-conversation-main { min-width:0; }
 .direct-conversation-name-row { display:flex; align-items:center; gap:7px; min-width:0; }
 .direct-conversation-name { font-size:13px; font-weight:600; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
-.direct-conversation-preview { margin-top:3px; font-size:11px; color:rgba(255,255,255,.46); overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
+.direct-conversation-preview { margin-top:3px; min-width:0; display:flex; align-items:center; gap:4px; font-size:11px; color:rgba(255,255,255,.46); }
+.direct-conversation-preview-text { min-width:0; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
+.direct-conversation-delivery { display:inline-flex; align-items:center; width:13px; height:11px; position:relative; flex:0 0 13px; line-height:1; }
+.direct-conversation-delivery i { position:absolute; left:0; color:rgba(255,255,255,.30); font-size:10px; line-height:1; }
+.direct-conversation-delivery .direct-conversation-delivery-second { left:4px; display:none; }
+.direct-conversation-delivery.is-seen i { color:#4caf50; }
+.direct-conversation-delivery.is-seen .direct-conversation-delivery-second { display:block; }
 .direct-conversation-side { align-self:stretch; display:flex; flex-direction:column; align-items:flex-end; justify-content:center; gap:5px; }
 .direct-conversation-time { font-size:9px; color:rgba(255,255,255,.36); white-space:nowrap; }
 .direct-unread-badge { min-width:18px; height:18px; padding:0 5px; border-radius:999px; background:var(--ps-blue); color:#fff; display:inline-flex; align-items:center; justify-content:center; font-size:9px; font-weight:800; }
@@ -78939,6 +78945,14 @@ function getVisibleChatStackEl(id) {
 		});
 	}
 
+	function directConversationDeliveryHtml(conversation, message) {
+		if (!message || message.from !== directCurrentUser()) return '';
+		const messageId = directMessageIdNumber(message.id);
+		const seen = messageId > 0 && messageId <= directMessageIdNumber(conversation && conversation.peerLastReadId);
+		const label = seen ? directSeenDisplayLabel(message.seenAt) : 'Sent';
+		return `<span class="direct-conversation-delivery${seen ? ' is-seen' : ''}" title="${directEscapeHtml(label)}" aria-label="${directEscapeHtml(label)}"><i class="fas fa-check"></i><i class="fas fa-check direct-conversation-delivery-second"></i></span>`;
+	}
+
 	function directGetComposerHtml() {
 		const input = document.getElementById('direct-chat-input');
 		return input ? directSanitizeMessageHtml(input.innerHTML) : '';
@@ -80137,12 +80151,13 @@ function getVisibleChatStackEl(id) {
 			const mediaLabel = last.type === 'gif' ? '[GIF]' : (Array.isArray(last.content) && last.content.length ? '[Image]' : '');
 			const previewBody = directConversationPreviewText(last.text) || mediaLabel;
 			const preview = `${mine ? 'You: ' : ''}${previewBody}`;
+			const delivery = directConversationDeliveryHtml(item, last);
 			const unread = Math.max(0, Number(item.unread) || 0);
 			const blocked = item.viewerBlocked === true || item.blockedByPeer === true;
 			const encoded = encodeURIComponent(peer).replace(/'/g, '%27');
 			return `<button type="button" class="direct-conversation-item${state.activePeer === peer ? ' active' : ''}${blocked ? ' direct-user-blocked-conversation' : ''}" data-direct-peer="${directEscapeHtml(encoded)}" onclick="window.openDirectMessage(decodeURIComponent(this.dataset.directPeer), { fromList:true })" onmouseenter="if(typeof playUiHover==='function') playUiHover()">
 				<div class="direct-conversation-avatar-wrap" data-haptic="light" title="View profile" onclick="event.stopPropagation(); if(typeof playUiClick==='function') playUiClick(); if(typeof openProfileModal==='function') openProfileModal(decodeURIComponent('${directEscapeHtml(encoded)}'))" onmouseenter="if(typeof playUiHover==='function') playUiHover()"><img class="direct-conversation-avatar" data-user="${directEscapeHtml(peer)}" src="${directEscapeHtml(avatar)}" alt=""><span class="psn-avatar-presence-dot${item.online ? ' online' : ''}" data-user="${directEscapeHtml(peer)}" aria-hidden="true"></span></div>
-				<div class="direct-conversation-main"><div class="direct-conversation-name-row"><span class="direct-conversation-name" data-no-translate="true" translate="no">${directEscapeHtml(peer)}</span></div><div class="direct-conversation-preview" data-no-translate="true" translate="no">${directEscapeHtml(preview || 'Conversation')}</div></div>
+				<div class="direct-conversation-main"><div class="direct-conversation-name-row"><span class="direct-conversation-name" data-no-translate="true" translate="no">${directEscapeHtml(peer)}</span></div><div class="direct-conversation-preview" data-no-translate="true" translate="no">${delivery}<span class="direct-conversation-preview-text">${directEscapeHtml(preview || 'Conversation')}</span></div></div>
 				<div class="direct-conversation-side"><span class="direct-conversation-time">${directEscapeHtml(directFormatConversationTime(last.createdAt))}</span>${unread ? `<span class="direct-unread-badge">${unread > 99 ? '99+' : unread}</span>` : ''}</div>
 			</button>`;
 		}).join('');
@@ -82580,18 +82595,32 @@ function getVisibleChatStackEl(id) {
 			const me = directCurrentUser();
 			const state = window.__directChatState;
 			const lastReadId = String(payload.lastReadId || '0');
-			if (payload.reader !== me && payload.peer === me && state.activePeer === payload.reader) {
-				state.peerLastReadId = String(lastReadId || state.peerLastReadId || '0');
+			if (payload.reader !== me && payload.peer === me) {
+				const peer = String(payload.reader || '');
 				const readAt = String(payload.readAt || '');
-				const peerReadId = directMessageIdNumber(state.peerLastReadId);
-				state.messages.forEach(message => {
-					if (!message || message.from !== me || message.seenAt) return;
-					const id = directMessageIdNumber(message.id);
-					if (id > 0 && id <= peerReadId) message.seenAt = readAt || new Date().toISOString();
-				});
-				const conversation = directFindConversation(payload.reader);
-				if (conversation) conversation.peerLastReadId = state.peerLastReadId;
-				updateDirectSeenMarker();
+				const incomingReadId = directMessageIdNumber(lastReadId);
+				const conversation = directFindConversation(peer);
+				let conversationChanged = false;
+				if (conversation && incomingReadId > directMessageIdNumber(conversation.peerLastReadId)) {
+					conversation.peerLastReadId = String(lastReadId);
+					const latest = conversation.lastMessage;
+					if (latest && latest.from === me && directMessageIdNumber(latest.id) <= incomingReadId && !latest.seenAt) latest.seenAt = readAt || new Date().toISOString();
+					conversationChanged = true;
+				}
+				if (state.activePeer === peer) {
+					if (incomingReadId > directMessageIdNumber(state.peerLastReadId)) state.peerLastReadId = String(lastReadId);
+					const peerReadId = directMessageIdNumber(state.peerLastReadId);
+					state.messages.forEach(message => {
+						if (!message || message.from !== me || message.seenAt) return;
+						const id = directMessageIdNumber(message.id);
+						if (id > 0 && id <= peerReadId) message.seenAt = readAt || new Date().toISOString();
+					});
+					updateDirectSeenMarker();
+				}
+				if (conversationChanged) {
+					state.conversationSignature = directConversationSignature(state.conversations);
+					renderDirectConversations();
+				}
 				return;
 			}
 			if (payload.reader === me) {
