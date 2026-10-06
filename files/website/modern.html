@@ -14058,6 +14058,25 @@ P
 			if (!normalizeProfileListTimestamp(pendingSections[section])) return;
 			if (protectPendingProfileSectionFromIncoming(name, section, userData, payload, pending)) protectedSections.push(section);
 		});
+
+		if (Array.isArray(userData.wishlistData) && userData.wishlistData.length === 0 && !protectedSections.includes('wishlist')) {
+			const cachedWishlist = parsePersistentLocalJson(`${name}_psn_wishlist_db`, []);
+			if (Array.isArray(cachedWishlist) && cachedWishlist.length) {
+				const localVersion = getLocalProfileSectionVersion(name, 'wishlist', pending);
+				const incomingVersion = getIncomingProfileSectionVersion('wishlist', userData, payload);
+				if (!incomingVersion || incomingVersion <= localVersion) {
+					window.wishlist = cachedWishlist;
+					delete userData.wishlistData;
+					delete userData.wishlist;
+					delete userData.wishlistUpdatedAt;
+					const recoveryStamp = localVersion || Date.now();
+					markPersistentProfileSyncPending('wishlist', recoveryStamp, name);
+					const syncState = getProfileSyncDirtyState();
+					if (syncState && syncState.dirty) syncState.dirty.wishlist = true;
+					protectedSections.push('wishlist');
+				}
+			}
+		}
 		return protectedSections;
 	};
 
@@ -77647,6 +77666,14 @@ function getVisibleChatStackEl(id) {
 				if (name === (localStorage.getItem('psn_username') || '')) saveState(STORAGE_KEY_PROFILE_COUNTRY, incomingCountryCode);
 			}
 
+			if (typeof window.markProfileSectionHydrated === 'function') {
+				if (Array.isArray(userData.downloadsData)) window.markProfileSectionHydrated('downloads');
+				if (Array.isArray(userData.wishlistData)) window.markProfileSectionHydrated('wishlist');
+				if (Array.isArray(userData.favoritesData)) window.markProfileSectionHydrated('favorites');
+				if (Array.isArray(userData.libraryData)) window.markProfileSectionHydrated('library');
+				if (Array.isArray(userData.friendsData)) window.markProfileSectionHydrated('friends');
+			}
+
 			if (userData.countersData && typeof window.mergeIncomingTrophyCountersForUser === 'function') window.mergeIncomingTrophyCountersForUser(name, userData.countersData);
 			if (typeof window.scheduleDeterministicTrophyReconciliation === 'function') window.scheduleDeterministicTrophyReconciliation(0);
 
@@ -83284,7 +83311,8 @@ function getVisibleChatStackEl(id) {
 				safeLocalStorageSet(`${name}_psn_wishlist_db`, JSON.stringify(userData.wishlistData));
 				applyProfileListUpdatedAtFromServer(name, 'wishlist', userData.wishlistUpdatedAt);
 			} else if (isLightAuthPayload) {
-				if (!Array.isArray(window.wishlist)) window.wishlist = [];
+				const cachedWishlist = parsePersistentLocalJson(`${name}_psn_wishlist_db`, []);
+				if (!Array.isArray(window.wishlist) || window.wishlist.length === 0) window.wishlist = Array.isArray(cachedWishlist) ? cachedWishlist : [];
 			} else {
 				const localWishlist = localStorage.getItem(`${name}_psn_wishlist_db`);
 				window.wishlist = localWishlist ? JSON.parse(localWishlist) : [];
@@ -83293,7 +83321,8 @@ function getVisibleChatStackEl(id) {
 			if (Array.isArray(userData.downloadsData)) {
 				applyIncomingDownloadHistoryForProfile(name, userData, data || {});
 			} else if (isLightAuthPayload) {
-				if (!Array.isArray(window.downloadHistory)) window.downloadHistory = [];
+				const cachedDownloads = parsePersistentLocalJson(`${name}_${COOKIE_NAME_HISTORY}`, []);
+				if (!Array.isArray(window.downloadHistory) || window.downloadHistory.length === 0) window.downloadHistory = Array.isArray(cachedDownloads) ? cachedDownloads : [];
 			} else {
 				const localDl = localStorage.getItem(`${name}_psn_dl_history`);
 				const localHistory = localDl ? JSON.parse(localDl) : [];
@@ -83306,7 +83335,8 @@ function getVisibleChatStackEl(id) {
 				safeLocalStorageSet(`${name}_ps3_library_favs`, JSON.stringify(userData.favoritesData));
 				applyProfileListUpdatedAtFromServer(name, 'favorites', userData.favoritesUpdatedAt);
 			} else if (isLightAuthPayload) {
-				if (!Array.isArray(window.favoritesLibrary)) { window.favoritesLibrary = []; if (typeof window.bumpLibraryCollectionRevision === 'function') window.bumpLibraryCollectionRevision('favorites'); }
+				const cachedFavorites = parsePersistentLocalJson(`${name}_ps3_library_favs`, []);
+				if (!Array.isArray(window.favoritesLibrary) || window.favoritesLibrary.length === 0) { window.favoritesLibrary = Array.isArray(cachedFavorites) ? cachedFavorites : []; if (typeof window.bumpLibraryCollectionRevision === 'function') window.bumpLibraryCollectionRevision('favorites'); }
 			} else {
 				const localFavs = localStorage.getItem(`${name}_ps3_library_favs`);
 				window.favoritesLibrary = localFavs ? JSON.parse(localFavs) : [];
@@ -83320,7 +83350,8 @@ function getVisibleChatStackEl(id) {
 				safeLocalStorageSet(`${name}_psn_local_library`, JSON.stringify(mergedLibraryData));
 				applyProfileListUpdatedAtFromServer(name, 'library', userData.libraryUpdatedAt);
 			} else if (isLightAuthPayload) {
-				if (typeof lastScannedGames !== 'undefined' && !Array.isArray(lastScannedGames)) { lastScannedGames = []; window.lastScannedGames = lastScannedGames; if (typeof window.bumpLibraryCollectionRevision === 'function') window.bumpLibraryCollectionRevision('library'); }
+				const cachedLibrary = parsePersistentLocalJson(`${name}_psn_local_library`, []);
+				if (typeof lastScannedGames !== 'undefined' && (!Array.isArray(lastScannedGames) || lastScannedGames.length === 0)) { lastScannedGames = mergeLibraryLastPlayedLists(Array.isArray(cachedLibrary) ? cachedLibrary : [], []); window.lastScannedGames = lastScannedGames; if (typeof window.bumpLibraryCollectionRevision === 'function') window.bumpLibraryCollectionRevision('library'); }
 			} else {
 				const localLib = localStorage.getItem(`${name}_psn_local_library`);
 				if (typeof lastScannedGames !== 'undefined') { lastScannedGames = mergeLibraryLastPlayedLists(localLib ? JSON.parse(localLib) : [], []); window.lastScannedGames = lastScannedGames; if (typeof window.bumpLibraryCollectionRevision === 'function') window.bumpLibraryCollectionRevision('library'); }
@@ -83340,7 +83371,8 @@ function getVisibleChatStackEl(id) {
 				safeLocalStorageSet(`${name}_psn_friends_list`, JSON.stringify(userData.friendsData));
 				applyProfileListUpdatedAtFromServer(name, 'friends', userData.friendsUpdatedAt);
 			} else if (isLightAuthPayload) {
-				if (!Array.isArray(window.friendsList)) window.friendsList = [];
+				const cachedFriends = parsePersistentLocalJson(`${name}_psn_friends_list`, []);
+				if (!Array.isArray(window.friendsList) || window.friendsList.length === 0) window.friendsList = Array.isArray(cachedFriends) ? cachedFriends : [];
 			if (typeof window.setSidebarCountPill === 'function') window.setSidebarCountPill('friends', window.friendsList.length);
 			} else {
 				const localFriends = localStorage.getItem(`${name}_psn_friends_list`);
@@ -85854,6 +85886,9 @@ function getVisibleChatStackEl(id) {
 			const unchangedProfileSync = payload.unchanged === true;
 			const shouldRunProfileCompletionWork = wasInitialProfileSync || !unchangedProfileSync;
 			window.__initialProfileSyncInProgress = false;
+			if (typeof window.markProfileSectionHydrated === 'function') {
+				['downloads','wishlist','favorites','library','friends'].forEach(section => window.markProfileSectionHydrated(section));
+			}
 			const pendingIdentityRepair = window.__pendingNewAccountIdentityRepair;
 			if (pendingIdentityRepair && pendingIdentityRepair.name === myName) {
 				/* If an older/stale server ever returned generic identity fields during signup, repair the
@@ -86181,6 +86216,23 @@ function getVisibleChatStackEl(id) {
 
 		const syncState = (typeof getProfileSyncDirtyState === 'function') ? getProfileSyncDirtyState() : null;
 		const dirty = syncState ? syncState.dirty : { trophies: true, downloads: true, wishlist: true, favorites: true, library: true, friends: true };
+		const deferredListSections = new Set();
+		const profileListHydratedForSync = section => {
+			const hydrationKey = typeof window.getProfileHydrationKey === 'function' ? window.getProfileHydrationKey(section, myName) : '';
+			return !!(hydrationKey && window.__profileHydratedSections instanceof Set && window.__profileHydratedSections.has(hydrationKey));
+		};
+		const deferProfileListUntilHydrated = section => {
+			if (!dirty[section] || profileListHydratedForSync(section)) return false;
+			deferredListSections.add(section);
+			if (typeof window.ensureProfileSectionHydrated === 'function') {
+				Promise.resolve(window.ensureProfileSectionHydrated(section, { reason:`sync-guard-${section}` })).then(ok => {
+					if (ok && window.isProfileLoaded && socketChat && socketChat.connected && typeof window.broadcastProfileUpdate === 'function') {
+						setTimeout(() => window.broadcastProfileUpdate({ silentIndicator:true }), 0);
+					}
+				}).catch(() => {});
+			}
+			return true;
+		};
 	
 		let totalXp = 0;
 		let totalTrophies = 0;
@@ -86226,23 +86278,23 @@ function getVisibleChatStackEl(id) {
 			payload.trophies = totalTrophies;
 			payload.trophiesData = window.userTrophies || {};
 		}
-		if (dirty.downloads) {
+		if (dirty.downloads && !deferProfileListUntilHydrated('downloads')) {
 			payload.downloads = window.downloadHistory ? window.downloadHistory.length : 0;
 			payload.downloadsData = window.downloadHistory || [];
 			payload.downloadsClearedAt = Number(loadState(STORAGE_KEY_DOWNLOAD_CLEAR_PENDING) || 0) || 0;
 			payload.downloadsUpdatedAt = normalizeProfileListTimestamp(loadState(getProfileListTimestampStorageKey('downloads')));
 		}
-		if (dirty.wishlist) {
+		if (dirty.wishlist && !deferProfileListUntilHydrated('wishlist')) {
 			payload.wishlist = window.wishlist ? window.wishlist.length : 0;
 			payload.wishlistData = window.wishlist || [];
 			payload.wishlistUpdatedAt = normalizeProfileListTimestamp(loadState(getProfileListTimestampStorageKey('wishlist')));
 		}
-		if (dirty.favorites) {
+		if (dirty.favorites && !deferProfileListUntilHydrated('favorites')) {
 			payload.favorites = window.favoritesLibrary ? window.favoritesLibrary.length : 0;
 			payload.favoritesData = window.favoritesLibrary || [];
 			payload.favoritesUpdatedAt = normalizeProfileListTimestamp(loadState(getProfileListTimestampStorageKey('favorites')));
 		}
-		if (dirty.library) {
+		if (dirty.library && !deferProfileListUntilHydrated('library')) {
 			payload.library = typeof lastScannedGames !== 'undefined' ? lastScannedGames.length : 0;
 			payload.libraryData = typeof lastScannedGames !== 'undefined' ? lastScannedGames : [];
 			payload.libraryUpdatedAt = normalizeProfileListTimestamp(loadState(getProfileListTimestampStorageKey('library')));
@@ -86255,6 +86307,12 @@ function getVisibleChatStackEl(id) {
 			const mutation = typeof readCommittedFriendsMutation === 'function' ? readCommittedFriendsMutation(myName) : (window.__pendingFriendsMutation && window.__pendingFriendsMutation.user === myName ? window.__pendingFriendsMutation : null);
 			if (!friendsHydrated && !mutation) {
 				friendsSyncDeferred = true;
+				deferredListSections.add('friends');
+				if (typeof window.ensureProfileSectionHydrated === 'function') {
+					Promise.resolve(window.ensureProfileSectionHydrated('friends', { reason:'sync-guard-friends' })).then(ok => {
+						if (ok && window.isProfileLoaded && socketChat && socketChat.connected && typeof window.broadcastProfileUpdate === 'function') setTimeout(() => window.broadcastProfileUpdate({ silentIndicator:true }), 0);
+					}).catch(() => {});
+				}
 			} else {
 				payload.friendsData = window.friendsList || [];
 				payload.friendsUpdatedAt = normalizeProfileListTimestamp(loadState(getProfileListTimestampStorageKey('friends')));
@@ -86266,7 +86324,7 @@ function getVisibleChatStackEl(id) {
 		}
 
 		if (!Object.keys(payload).length) return;
-		const sentDirtyKeys = syncState ? Object.keys(syncState.dirty).filter(key => dirty[key] && !(key === 'friends' && friendsSyncDeferred)) : [];
+		const sentDirtyKeys = syncState ? Object.keys(syncState.dirty).filter(key => dirty[key] && !deferredListSections.has(key) && !(key === 'friends' && friendsSyncDeferred)) : [];
 		const sentBaseProfile = Object.prototype.hasOwnProperty.call(payload, 'avatar') || Object.prototype.hasOwnProperty.call(payload, 'joined') || Object.prototype.hasOwnProperty.call(payload, 'countryCode') || Object.prototype.hasOwnProperty.call(payload, 'ps3Status') || Object.prototype.hasOwnProperty.call(payload, 'countersData');
 		const sentProfileUser = myName;
 		if (syncState) sentDirtyKeys.forEach(key => { syncState.dirty[key] = false; });
@@ -86296,7 +86354,8 @@ function getVisibleChatStackEl(id) {
 			if (!ok && typeof window.persistCurrentProfileSyncDirtyState === 'function') window.persistCurrentProfileSyncDirtyState();
 			if (showSyncIndicator && typeof window.endProfileSyncIndicator === 'function') window.endProfileSyncIndicator(ok);
 			if (ok && sentDirtyKeys.includes('friends') && typeof window.friendActivityFriendsChanged === 'function') window.friendActivityFriendsChanged();
-			const shouldReplay = window.__profileUpdateQueued || window.__profileBaseSyncPending === true || (syncState && Object.values(syncState.dirty).some(Boolean));
+			const hasReplayableDirty = syncState && Object.entries(syncState.dirty).some(([key,value]) => value && !deferredListSections.has(key));
+			const shouldReplay = window.__profileUpdateQueued || window.__profileBaseSyncPending === true || hasReplayableDirty;
 			window.__profileUpdateQueued = false;
 			if (shouldReplay && socketChat && socketChat.connected) setTimeout(() => window.broadcastProfileUpdate({ silentIndicator: syncOptions.silentIndicator === true || !showSyncIndicator }), ok ? 45 : 900);
 		};
