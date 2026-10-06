@@ -17,7 +17,12 @@
 			}
 		})();
 	</script>
-	<script>(function(){if(/SamsungBrowser|Samsung/i.test(navigator.userAgent||''))document.documentElement.classList.add('samsung-browser');})();</script>
+	<script>(function(){
+		var ua=navigator.userAgent||'';
+		if(/SamsungBrowser|Samsung/i.test(ua))document.documentElement.classList.add('samsung-browser');
+		var isIOS=/iPad|iPhone|iPod/i.test(ua)||(navigator.platform==='MacIntel'&&navigator.maxTouchPoints>1);
+		if(isIOS)document.documentElement.classList.add('ios-webkit');
+	})();</script>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, minimum-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>NoPayStation™ Network Database</title>
@@ -609,6 +614,18 @@ select option { background-color: var(--bg-dark); }
 /* --- LARGE COLLECTION MEMORY / PAINT OPTIMIZATION (PC) --- */
 html.collection-memory-optimization-on #database-grid > .game-card, html.collection-memory-optimization-on #wishlist-grid > .game-card, html.collection-memory-optimization-on #ps3-local-grid > .game-card, html.collection-memory-optimization-on #ps3-favs-grid > .game-card { content-visibility: auto; contain-intrinsic-size: auto 280px; }
 html.collection-memory-optimization-on #downloads-list > .download-swipe-row:not(:hover):not(.is-open):not(.is-swiping) { content-visibility: auto; contain-intrinsic-size: auto 76px; }
+/* iOS WebKit performance: preserve visuals while skipping offscreen paint work. */
+html.ios-webkit #database-grid > .game-card,
+html.ios-webkit #wishlist-grid > .game-card,
+html.ios-webkit #ps3-local-grid > .game-card,
+html.ios-webkit #ps3-favs-grid > .game-card { content-visibility:auto; contain-intrinsic-size:auto 280px; }
+html.ios-webkit #downloads-list > .download-swipe-row:not(:hover):not(.is-open):not(.is-swiping),
+html.ios-webkit #notification-center-list > .notification-swipe-row:not(.is-open):not(.is-swiping):not(.is-removing),
+html.ios-webkit #friend-activity-list > .friend-activity-swipe-row:not(.is-open):not(.is-swiping):not(.is-removing) { content-visibility:auto; contain-intrinsic-size:auto 76px; }
+html.ios-webkit #direct-conversations-list > .direct-conversation-item:not(.is-removing),
+html.ios-webkit #online-users-list-container > .online-user-item:not(.online-live-leaving):not(.online-live-moving):not(.online-live-entering),
+html.ios-webkit #friends-list-grid > .online-user-item:not(.friend-removing):not(.friend-adding) { content-visibility:auto; contain-intrinsic-size:auto 68px; }
+html.ios-webkit #object-particles { contain:strict; }
 .game-card { --card-glow-x: 50%; --card-glow-y: 38%; background-color: var(--card-surface-bg); border: 1px solid var(--psn-surface-border); border-radius: var(--psn-radius-card); overflow: hidden; cursor: pointer; display: flex; flex-direction: column; transform: translateY(0) translateZ(0); backface-visibility: hidden; transition: transform 0.3s ease-out,box-shadow 0.3s ease-out,border-color .22s ease; box-shadow: inset 0 1px 0 var(--psn-surface-highlight),0 4px 12px rgba(0,0,0,.08); backdrop-filter: var(--card-surface-blur); -webkit-backdrop-filter: var(--card-surface-blur); }
 .game-card.anim-reveal { opacity: 0; animation: tileReveal 0.4s ease-out forwards; animation-delay: calc(var(--tile-idx,0) * 0.04s); }
 #view-explore.explore-return-reveal-prep .horizontal-scroll:not([data-explore-skip-next-return-reveal="1"]) .game-card { opacity:0 !important; animation:none !important; }
@@ -98015,6 +98032,7 @@ function getVisibleChatStackEl(id) {
 	});
 	</script>
 	<script>
+    const psnIosWebkitPerformance = document.documentElement.classList.contains('ios-webkit');
     const particleConfig = {
         "particles": {
         "number": {
@@ -98049,22 +98067,62 @@ function getVisibleChatStackEl(id) {
         "events": {
             "onhover": { "enable": false },
             "onclick": { "enable": false },
-            "resize": true
+            "resize": !psnIosWebkitPerformance
         }
         },
-        "retina_detect": true
+        "retina_detect": !psnIosWebkitPerformance
     };
     
     function initMyParticles() {
         if (window.particlesJS) {
-        particlesJS('object-particles', particleConfig);
+            particlesJS('object-particles', particleConfig);
         }
+    }
+
+    function setupIosParticleViewportRefresh() {
+        if (!psnIosWebkitPerformance) return;
+        let lastWidth = Math.round(window.innerWidth || 0);
+        let refreshTimer = 0;
+        window.addEventListener('resize', () => {
+            const nextWidth = Math.round(window.innerWidth || 0);
+            if (Math.abs(nextWidth - lastWidth) < 3) return;
+            lastWidth = nextWidth;
+            clearTimeout(refreshTimer);
+            refreshTimer = setTimeout(() => {
+                const pJS = window.pJSDom?.[0]?.pJS;
+                if (!pJS) return;
+                try {
+                    pJS.fn?.canvasSize?.();
+                    pJS.fn?.particlesRefresh?.();
+                } catch (e) {}
+            }, 260);
+        }, { passive:true });
+    }
+
+    function setupIosAsyncImageDecoding() {
+        if (!psnIosWebkitPerformance || typeof MutationObserver !== 'function') return;
+        const apply = node => {
+            if (!node || node.nodeType !== 1) return;
+            if (node.tagName === 'IMG' && !node.hasAttribute('decoding')) node.decoding = 'async';
+            node.querySelectorAll?.('img:not([decoding])').forEach(img => { img.decoding = 'async'; });
+        };
+        apply(document.documentElement);
+        const observer = new MutationObserver(records => {
+            for (const record of records) for (const node of record.addedNodes) apply(node);
+        });
+        observer.observe(document.documentElement, { childList:true, subtree:true });
     }
     
     if (document.readyState === 'complete' || document.readyState === 'interactive') {
         initMyParticles();
+        setupIosParticleViewportRefresh();
+        setupIosAsyncImageDecoding();
     } else {
-        document.addEventListener('DOMContentLoaded', initMyParticles);
+        document.addEventListener('DOMContentLoaded', () => {
+            initMyParticles();
+            setupIosParticleViewportRefresh();
+            setupIosAsyncImageDecoding();
+        }, { once:true });
     }
     
     </script>
