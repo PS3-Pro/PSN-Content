@@ -6804,6 +6804,7 @@ img { -webkit-user-drag: none !important; user-drag: none !important; }
 .direct-global-search-snippet { margin-top:3px; font-size:11px; line-height:1.35; color:rgba(255,255,255,.58); overflow:hidden; display:-webkit-box; -webkit-box-orient:vertical; -webkit-line-clamp:2; }
 .direct-global-search-from { color:var(--ps-blue); font-size:9px; font-weight:800; margin-left:5px; }
 #direct-new-message-overlay { z-index:100500; }
+#direct-new-message-overlay.direct-profile-behind { z-index:9999 !important; pointer-events:none !important; }
 #direct-new-message-overlay .direct-new-message-panel { width:min(92vw,500px); max-width:500px; max-height:min(82dvh,650px); display:flex; flex-direction:column; overflow:hidden; }
 #direct-new-message-overlay .sys-modal-header { flex:0 0 auto; }
 #direct-new-message-overlay .sys-modal-header h2 { font-size:16px; }
@@ -23668,6 +23669,7 @@ P
 		if (typeof closeDirectConversationContextMenu === 'function') closeDirectConversationContextMenu({ immediate:true });
 		if (typeof hideDirectMentionSuggestions === 'function') hideDirectMentionSuggestions();
 		if (typeof window.releasePsnProfileAvatarOrigin === 'function') window.releasePsnProfileAvatarOrigin();
+		if (typeof window.resumeDirectNewMessagePickerAfterProfile === 'function') window.resumeDirectNewMessagePickerAfterProfile();
 		if (typeof window.releaseGameModalCardMorphOrigin === 'function') window.releaseGameModalCardMorphOrigin();
 	};
 
@@ -23678,8 +23680,9 @@ P
 			profileModal.style.display !== 'none' &&
 			profileModal.classList.contains('show')
 		);
-		if (!profileOwnsOrigin && typeof window.releasePsnProfileAvatarOrigin === 'function') {
-			window.releasePsnProfileAvatarOrigin(profileModal);
+		if (!profileOwnsOrigin) {
+			if (typeof window.releasePsnProfileAvatarOrigin === 'function') window.releasePsnProfileAvatarOrigin(profileModal);
+			if (typeof window.resumeDirectNewMessagePickerAfterProfile === 'function') window.resumeDirectNewMessagePickerAfterProfile();
 		}
 
 		const gameModal = document.getElementById('game-modal');
@@ -78745,6 +78748,26 @@ function getVisibleChatStackEl(id) {
 		return String(temp.innerText || temp.textContent || '').replace(/\u00a0/g,' ').replace(/\n{3,}/g,'\n\n').trim();
 	}
 
+	function directConversationPreviewText(value) {
+		const plain = directMessagePlainText(value).replace(/\s+/g, ' ').trim();
+		if (!plain) return '';
+		return plain.replace(/https?:\/\/[^\s<>]+/gi, raw => {
+			let url = raw;
+			let trailing = '';
+			while (/[.,!?;:)\]}]$/.test(url)) {
+				trailing = url.slice(-1) + trailing;
+				url = url.slice(0, -1);
+			}
+			const token = typeof window.getPsnContentShareTokenFromUrl === 'function'
+				? window.getPsnContentShareTokenFromUrl(url)
+				: '';
+			if (!token) return raw;
+			const hint = typeof getChatInternalShareHint === 'function' ? getChatInternalShareHint(url) : null;
+			const label = typeof getChatInternalShareLabel === 'function' ? getChatInternalShareLabel(hint) : '';
+			return `${label || 'Shared Content'}${trailing}`;
+		});
+	}
+
 	function directGetComposerHtml() {
 		const input = document.getElementById('direct-chat-input');
 		return input ? directSanitizeMessageHtml(input.innerHTML) : '';
@@ -79941,7 +79964,7 @@ function getVisibleChatStackEl(id) {
 			const last = item.lastMessage || {};
 			const mine = last.from === directCurrentUser();
 			const mediaLabel = last.type === 'gif' ? '[GIF]' : (Array.isArray(last.content) && last.content.length ? '[Image]' : '');
-			const previewBody = directMessagePlainText(last.text).replace(/\s+/g, ' ').trim() || mediaLabel;
+			const previewBody = directConversationPreviewText(last.text) || mediaLabel;
 			const preview = `${mine ? 'You: ' : ''}${previewBody}`;
 			const unread = Math.max(0, Number(item.unread) || 0);
 			const blocked = item.viewerBlocked === true || item.blockedByPeer === true;
@@ -81775,7 +81798,8 @@ function getVisibleChatStackEl(id) {
 		if (!window.__directNewMessageEscapeBound) {
 			window.__directNewMessageEscapeBound = true;
 			document.addEventListener('keydown', event => {
-				if (event.key !== 'Escape' || !document.getElementById('direct-new-message-overlay')?.classList.contains('show')) return;
+				const directOverlay = document.getElementById('direct-new-message-overlay');
+				if (event.key !== 'Escape' || !directOverlay?.classList.contains('show') || directOverlay.dataset.profileSuspended === '1') return;
 				event.preventDefault();
 				event.stopImmediatePropagation();
 				window.closeDirectNewMessagePicker();
@@ -81798,6 +81822,34 @@ function getVisibleChatStackEl(id) {
 		}).join('');
 	};
 
+	window.suspendDirectNewMessagePickerForProfile = function() {
+		const overlay = document.getElementById('direct-new-message-overlay');
+		if (!overlay?.classList.contains('show') || overlay.dataset.profileSuspended === '1') return false;
+		overlay.dataset.profileSuspended = '1';
+		overlay.dataset.profilePrevAriaHidden = overlay.hasAttribute('aria-hidden') ? (overlay.getAttribute('aria-hidden') || '') : '__none__';
+		overlay.dataset.profilePrevInert = overlay.inert ? '1' : '0';
+		overlay.classList.add('direct-profile-behind');
+		overlay.setAttribute('aria-hidden', 'true');
+		overlay.inert = true;
+		const active = document.activeElement;
+		if (active && overlay.contains(active) && typeof active.blur === 'function') active.blur();
+		return true;
+	};
+
+	window.resumeDirectNewMessagePickerAfterProfile = function() {
+		const overlay = document.getElementById('direct-new-message-overlay');
+		if (!overlay || overlay.dataset.profileSuspended !== '1') return false;
+		overlay.classList.remove('direct-profile-behind');
+		overlay.inert = overlay.dataset.profilePrevInert === '1';
+		const previousAriaHidden = overlay.dataset.profilePrevAriaHidden;
+		if (previousAriaHidden === '__none__') overlay.removeAttribute('aria-hidden');
+		else if (previousAriaHidden !== undefined) overlay.setAttribute('aria-hidden', previousAriaHidden);
+		delete overlay.dataset.profileSuspended;
+		delete overlay.dataset.profilePrevAriaHidden;
+		delete overlay.dataset.profilePrevInert;
+		return true;
+	};
+
 	window.openDirectNewMessageProfile = function(event, peer) {
 		if (event) {
 			event.preventDefault();
@@ -81806,15 +81858,14 @@ function getVisibleChatStackEl(id) {
 		const username = String(peer || '').trim();
 		if (!username || typeof openProfileModal !== 'function') return false;
 
-		const overlay = document.getElementById('direct-new-message-overlay');
-		if (overlay) {
-			overlay.classList.remove('show');
-			overlay.style.display = 'none';
-			const list = overlay.querySelector('#direct-new-message-list');
-			if (list) list.scrollTop = 0;
-		}
+		const suspended = window.suspendDirectNewMessagePickerForProfile();
 		if (typeof playUiClick === 'function') playUiClick();
-		openProfileModal(username);
+		try {
+			openProfileModal(username);
+		} catch (error) {
+			if (suspended) window.resumeDirectNewMessagePickerAfterProfile();
+			throw error;
+		}
 		return false;
 	};
 
@@ -81827,6 +81878,9 @@ function getVisibleChatStackEl(id) {
 
 	window.openDirectNewMessagePicker = function() {
 		const overlay = ensureDirectNewMessagePicker();
+		const profileModal = document.getElementById('modal-sys-profile');
+		const profileOpen = !!(profileModal && profileModal.classList.contains('show') && profileModal.style.display !== 'none');
+		if (!profileOpen && overlay.dataset.profileSuspended === '1') window.resumeDirectNewMessagePickerAfterProfile();
 		const search = overlay.querySelector('#direct-new-message-search');
 		if (search) { search.value = ''; search.blur(); }
 		window.renderDirectNewMessageFriends('');
@@ -95518,6 +95572,9 @@ function getVisibleChatStackEl(id) {
 			if (modalId === 'modal-sys-profile' && modal.dataset.returnToGamePlayers === "true") {
 				modal.dataset.returnToGamePlayers = "false";
 				if (typeof window.restoreGamePlayersModalAfterProfile === 'function') window.restoreGamePlayersModalAfterProfile();
+			}
+			if (modalId === 'modal-sys-profile' && typeof window.resumeDirectNewMessagePickerAfterProfile === 'function') {
+				window.resumeDirectNewMessagePickerAfterProfile();
 			}
 		}, modalCloseDelay);
 	}
