@@ -779,6 +779,7 @@ html.collection-memory-optimization-on #downloads-list > .download-swipe-row:not
 	will-change: transform,opacity,filter;
 	z-index: 22053;
 }
+#trophy-dot.psn-trophy-arrival-hold { display: none !important; }
 #profile-sidebar .profile-item.psn-trophy-transfer-hit>i,
 #nav-trophies-sidebar.psn-trophy-transfer-hit>i {
 	animation: psnTrophyTransferHit .48s cubic-bezier(.16,.84,.28,1);
@@ -23349,6 +23350,31 @@ P
 		})[String(type || '').toLowerCase()] || '#ffcc00';
 	}
 
+	function holdPsnTrophyDotVisual(color = '') {
+		const dot = document.getElementById('trophy-dot');
+		if (!dot) return;
+		if (color) dot.dataset.pendingArrivalColor = String(color);
+		dot.classList.add('psn-trophy-arrival-hold');
+	}
+
+	function releasePsnTrophyDotVisual(color = '') {
+		const dot = document.getElementById('trophy-dot');
+		if (!dot) return;
+		const trophyViewVisible = typeof psnIsViewVisible === 'function'
+			? psnIsViewVisible('view-trophies')
+			: document.getElementById('view-trophies')?.style.display === 'block';
+		const resolvedColor = String(color || dot.dataset.pendingArrivalColor || loadState('psn_last_trophy_color') || '');
+		delete dot.dataset.pendingArrivalColor;
+		dot.classList.remove('psn-trophy-arrival-hold');
+
+		if (trophyViewVisible || loadState('psn_trophy_dot') !== 'true') {
+			if (trophyViewVisible) dot.style.display = 'none';
+			return;
+		}
+		if (resolvedColor) dot.style.background = resolvedColor;
+		dot.style.display = 'block';
+	}
+
 	function getPsnTrophyTransferTarget(trophyId) {
 		const view = document.getElementById('view-trophies');
 		if (view?.style.display === 'block' && trophyId) {
@@ -23426,13 +23452,17 @@ P
 
 	window.runTrophyTransferMotion = async function(sourceElement, trophyId, trophyType) {
 		const target = getPsnTrophyTransferTarget(trophyId);
-		if (!target) return false;
+		if (!target) {
+			releasePsnTrophyDotVisual(getPsnTrophyTransferColor(trophyType));
+			return false;
+		}
 		const ok = await animatePsnSharedElement(sourceElement, target.rect, {
 			duration:460,
 			arc:true,
 			easing:'cubic-bezier(.16,.84,.24,1)'
 		});
 		if (ok) pulsePsnTrophyTransferTarget(target, trophyType);
+		releasePsnTrophyDotVisual(getPsnTrophyTransferColor(trophyType));
 		return ok;
 	};
 
@@ -64749,7 +64779,12 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 			setTimeout(() => {
 				const icon = popup.querySelector('.trophy-popup-icon');
 				if (icon?.isConnected) window.runTrophyTransferMotion(icon, normalizedTrophyId, trophy.type);
+				else releasePsnTrophyDotVisual(getPsnTrophyTransferColor(trophy.type));
 			}, trophyPopupDuration - 500);
+		} else if (popup) {
+			setTimeout(() => releasePsnTrophyDotVisual(getPsnTrophyTransferColor(trophy.type)), trophyPopupDuration - 40);
+		} else {
+			releasePsnTrophyDotVisual(getPsnTrophyTransferColor(trophy.type));
 		}
 	}
 	
@@ -64780,7 +64815,10 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 			saveState('psn_user_trophies', JSON.stringify(window.userTrophies));
 			saveState('psn_trophy_dot_items', JSON.stringify(collectTrophyNotificationPendingItems()));
 			const trophyViewAlreadyVisible = document.getElementById('view-trophies')?.style.display === 'block';
-			if (!trophyViewAlreadyVisible) saveState('psn_trophy_dot', 'true');
+			if (!trophyViewAlreadyVisible) {
+				holdPsnTrophyDotVisual(TROPHY_COLORS[trophy.type]);
+				saveState('psn_trophy_dot', 'true');
+			}
 			if (typeof window.refreshTrophyRewardSidebarCounts === 'function') window.refreshTrophyRewardSidebarCounts();
 			
 			if (typeof markProfileSyncDirty === 'function') markProfileSyncDirty('trophies');
@@ -65141,7 +65179,10 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 				unlockDate: `${datePart} - ${timePart}`
 			};
 			saveState('psn_trophy_dot_items', JSON.stringify(collectTrophyNotificationPendingItems()));
-			if (document.getElementById('view-trophies')?.style.display !== 'block') saveState('psn_trophy_dot', 'true');
+			if (document.getElementById('view-trophies')?.style.display !== 'block') {
+				holdPsnTrophyDotVisual(TROPHY_COLORS['platinum']);
+				saveState('psn_trophy_dot', 'true');
+			}
 	
 			if (typeof window.emitFriendTrophyActivity === 'function') window.emitFriendTrophyActivity('platinum', TROPHY_DATA['platinum']);
 	
@@ -65437,6 +65478,10 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 	
 		saveTrophies();
 		saveState('psn_trophy_dot_items', JSON.stringify(collectTrophyNotificationPendingItems()));
+		const trophyBulkViewVisible = typeof psnIsViewVisible === 'function'
+			? psnIsViewVisible('view-trophies')
+			: document.getElementById('view-trophies')?.style.display === 'block';
+		if (!trophyBulkViewVisible) holdPsnTrophyDotVisual(TROPHY_COLORS['platinum']);
 		showTrophyPopup(TROPHY_DATA['platinum'], 'platinum'); 
 		saveState('psn_last_trophy_color', TROPHY_COLORS['platinum']);
 	
