@@ -761,6 +761,47 @@ html.collection-memory-optimization-on #downloads-list > .download-swipe-row:not
 .chat-internal-share-link { color: var(--chat-share-color,#fff) !important; text-decoration-line: underline !important; text-decoration-thickness: 1px; text-underline-offset: 2px; font-weight: 750; word-break: break-word; cursor: pointer; transition: color .16s ease, opacity .16s ease, filter .16s ease; }
 .chat-internal-share-link:hover { color: var(--chat-share-color,#fff) !important; filter: brightness(1.16) saturate(1.06); text-decoration-thickness: 1.5px; }
 .chat-internal-share-link:active { opacity: .72; }
+
+.chat-internal-share-link.psn-shared-link-opening {
+	animation: psnSharedLinkOpen .24s cubic-bezier(.16,.84,.28,1);
+}
+.psn-shared-element-flight {
+	position: fixed;
+	left: 0;
+	top: 0;
+	margin: 0 !important;
+	padding: 0 !important;
+	pointer-events: none !important;
+	user-select: none !important;
+	transform-origin: 0 0 !important;
+	backface-visibility: hidden;
+	-webkit-backface-visibility: hidden;
+	will-change: transform,opacity,filter;
+	z-index: 22053;
+}
+#profile-sidebar .profile-item.psn-trophy-transfer-hit>i,
+#nav-trophies-sidebar.psn-trophy-transfer-hit>i {
+	animation: psnTrophyTransferHit .48s cubic-bezier(.16,.84,.28,1);
+}
+#view-trophies .trophy-card.psn-trophy-transfer-hit .trophy-card-icon {
+	animation: psnTrophyCardTransferHit .48s cubic-bezier(.16,.84,.28,1);
+}
+@keyframes psnSharedLinkOpen {
+	0% { transform:scale(1); filter:brightness(1); text-shadow:none; }
+	42% { transform:scale(.965); filter:brightness(1.34); text-shadow:0 0 8px currentColor; }
+	72% { transform:scale(1.025); filter:brightness(1.16); text-shadow:0 0 5px currentColor; }
+	100% { transform:scale(1); filter:brightness(1); text-shadow:none; }
+}
+@keyframes psnTrophyTransferHit {
+	0%,100% { transform:translateY(0) scale(1); filter:brightness(1); }
+	38% { transform:translateY(-1px) scale(1.24); filter:brightness(1.5) drop-shadow(0 0 9px var(--psn-trophy-transfer-color,#ffcc00)); }
+	68% { transform:translateY(0) scale(.94); filter:brightness(1.08); }
+}
+@keyframes psnTrophyCardTransferHit {
+	0%,100% { transform:scale(1); filter:brightness(1); }
+	42% { transform:scale(1.06); filter:brightness(1.22); box-shadow:0 0 18px color-mix(in srgb,var(--psn-trophy-transfer-color,#ffcc00) 34%,transparent); }
+}
+
 .shared-content-friend-btn { flex: 0 0 auto; min-width: 108px !important; width: auto; padding: 9px 13px !important; font-size: 10px !important; gap: 6px !important; }
 .shared-content-friend-btn.is-friend { border-color: rgba(102,204,255,.22) !important; background: rgba(102,204,255,.09) !important; color: #8ed2ff !important; opacity: 1 !important; }
 .shared-content-friend-btn.is-self { display: none !important; }
@@ -23248,6 +23289,153 @@ P
 		return true;
 	}
 
+
+	async function animatePsnSharedElement(sourceElement, destination, options = {}) {
+		if (!sourceElement?.isConnected || isPsnSharedMotionReduced() || document.hidden) return false;
+		const sourceRect = sourceElement.getBoundingClientRect();
+		const destRect = getPsnMotionRect(destination);
+		if (!destRect || sourceRect.width < 4 || sourceRect.height < 4 || destRect.width < 4 || destRect.height < 4) return false;
+
+		const clone = sourceElement.cloneNode(true);
+		clone.classList.add('psn-shared-element-flight');
+		clone.setAttribute('aria-hidden', 'true');
+		clone.removeAttribute('id');
+		clone.style.left = `${sourceRect.left}px`;
+		clone.style.top = `${sourceRect.top}px`;
+		clone.style.width = `${sourceRect.width}px`;
+		clone.style.height = `${sourceRect.height}px`;
+
+		const sourceStyle = window.getComputedStyle(sourceElement);
+		clone.style.color = sourceStyle.color;
+		clone.style.fontSize = sourceStyle.fontSize;
+		clone.style.lineHeight = sourceStyle.lineHeight;
+		clone.style.filter = sourceStyle.filter === 'none' ? '' : sourceStyle.filter;
+		document.body.appendChild(clone);
+
+		const dx = destRect.left - sourceRect.left;
+		const dy = destRect.top - sourceRect.top;
+		const sx = destRect.width / sourceRect.width;
+		const sy = destRect.height / sourceRect.height;
+		const distance = Math.hypot(dx, dy);
+		const arc = options.arc === false ? 0 : Math.min(58, Math.max(18, distance * .07));
+		const duration = Math.max(180, Number(options.duration) || 450);
+		const end = `translate3d(${dx}px,${dy}px,0) scale(${sx},${sy})`;
+
+		try {
+			const animation = clone.animate([
+				{ offset:0, transform:'translate3d(0,0,0) scale(1)', opacity:1, filter:'brightness(1)' },
+				{ offset:.56, transform:`translate3d(${dx * .56}px,${dy * .50 - arc}px,0) scale(${1 + (sx - 1) * .56},${1 + (sy - 1) * .56})`, opacity:1, filter:'brightness(1.18)' },
+				{ offset:.88, transform:end, opacity:1, filter:'brightness(1.34)' },
+				{ offset:1, transform:end, opacity:.06, filter:'brightness(1.22)' }
+			], {
+				duration,
+				easing:options.easing || 'cubic-bezier(.16,.84,.24,1)',
+				fill:'forwards'
+			});
+			await animation.finished.catch(() => {});
+		} finally {
+			clone.remove();
+		}
+		return true;
+	}
+	window.animatePsnSharedElement = animatePsnSharedElement;
+
+	function getPsnTrophyTransferColor(type) {
+		return ({
+			bronze:'#cd7f32',
+			silver:'#d7d7d7',
+			gold:'#ffcc00',
+			platinum:'#00f0ff'
+		})[String(type || '').toLowerCase()] || '#ffcc00';
+	}
+
+	function getPsnTrophyTransferTarget(trophyId) {
+		const view = document.getElementById('view-trophies');
+		if (view?.style.display === 'block' && trophyId) {
+			const card = document.getElementById(`trophy-card-${String(trophyId)}`);
+			const icon = card?.querySelector('.trophy-card-icon .ps-trophy-icon');
+			const rect = icon?.getBoundingClientRect?.();
+			if (icon && rect && rect.width > 6 && rect.height > 6 &&
+				rect.right > 0 && rect.bottom > 0 && rect.left < window.innerWidth && rect.top < window.innerHeight) {
+				return {
+					element:icon,
+					card,
+					rect:{ left:rect.left, top:rect.top, width:rect.width, height:rect.height }
+				};
+			}
+		}
+
+		const dot = document.getElementById('trophy-dot');
+		const button = dot?.closest?.('.profile-item') || null;
+		const icon = button?.querySelector?.(':scope > i') || null;
+		const rect = icon?.getBoundingClientRect?.();
+		if (button && icon && rect && rect.width > 6 && rect.height > 6) {
+			const style = window.getComputedStyle(button);
+			if (style.display !== 'none' && style.visibility !== 'hidden' &&
+				rect.right > 0 && rect.bottom > 0 && rect.left < window.innerWidth && rect.top < window.innerHeight) {
+				const size = Math.max(22, Math.min(30, Math.max(rect.width, rect.height) * 1.12));
+				return {
+					element:button,
+					icon,
+					rect:{
+						left:rect.left + (rect.width - size) / 2,
+						top:rect.top + (rect.height - size) / 2,
+						width:size,
+						height:size
+					}
+				};
+			}
+		}
+		return null;
+	}
+
+	function pulsePsnTrophyTransferTarget(target, trophyType) {
+		const color = getPsnTrophyTransferColor(trophyType);
+		const rect = getPsnMotionRect(target?.rect || target?.element);
+		if (rect) {
+			const ripple = document.createElement('span');
+			ripple.className = 'psn-collection-motion-ripple';
+			ripple.style.left = `${rect.left - 4}px`;
+			ripple.style.top = `${rect.top - 4}px`;
+			ripple.style.width = `${rect.width + 8}px`;
+			ripple.style.height = `${rect.height + 8}px`;
+			ripple.style.setProperty('--psn-collection-motion-color', color);
+			ripple.style.setProperty('--psn-collection-motion-glow', color);
+			ripple.style.setProperty('--psn-collection-motion-soft', 'rgba(255,255,255,.10)');
+			document.body.appendChild(ripple);
+			setTimeout(() => ripple.remove(), 470);
+		}
+
+		const hit = target?.card || target?.element;
+		if (hit) {
+			hit.style.setProperty('--psn-trophy-transfer-color', color);
+			hit.classList.remove('psn-trophy-transfer-hit');
+			void hit.offsetWidth;
+			hit.classList.add('psn-trophy-transfer-hit');
+			setTimeout(() => {
+				hit.classList.remove('psn-trophy-transfer-hit');
+				hit.style.removeProperty('--psn-trophy-transfer-color');
+			}, 540);
+		}
+
+		if (!target?.card) {
+			const pill = document.getElementById('sidebar-count-trophies');
+			if (pill && typeof window.animateCountPillFeedback === 'function') window.animateCountPillFeedback(pill);
+		}
+	}
+
+	window.runTrophyTransferMotion = async function(sourceElement, trophyId, trophyType) {
+		const target = getPsnTrophyTransferTarget(trophyId);
+		if (!target) return false;
+		const ok = await animatePsnSharedElement(sourceElement, target.rect, {
+			duration:460,
+			arc:true,
+			easing:'cubic-bezier(.16,.84,.24,1)'
+		});
+		if (ok) pulsePsnTrophyTransferTarget(target, trophyType);
+		return ok;
+	};
+
 	function makePsnCardMorphTitle(sourceTitle, destinationTitle) {
 		if (!sourceTitle?.text || !sourceTitle.rect || !destinationTitle) return null;
 		let dest = null;
@@ -24262,33 +24450,44 @@ P
 				}
 			}
 		}
-		const nav = document.getElementById('nav-downloads');
-		if (!nav || !nav.isConnected) return null;
-		const navStyle = window.getComputedStyle(nav);
-		const navRect = nav.getBoundingClientRect();
-		if (navStyle.display === 'none' || navStyle.visibility === 'hidden' || navRect.width < 8 || navRect.height < 8 || navRect.right <= 0 || navRect.bottom <= 0 || navRect.left >= window.innerWidth || navRect.top >= window.innerHeight) return null;
-		const icon = nav.querySelector(':scope > i');
-		const iconRect = icon?.getBoundingClientRect?.() || navRect;
-		const targetHeight = Math.max(24, Math.min(34, navRect.height * .72));
-		const targetWidth = targetHeight * .70;
-		return {
-			element:nav,
-			rect:{ left:iconRect.left + (iconRect.width - targetWidth) / 2, top:iconRect.top + (iconRect.height - targetHeight) / 2, width:targetWidth, height:targetHeight }
-		};
+		return getPsnCollectionNavMotionTarget('nav-downloads');
 	}
 
-	window.runDownloadCoverTransferMotion = async function(source, entry) {
+	async function runPsnCoverTransferMotion(source, options = {}) {
 		if (!source || isPsnSharedMotionReduced()) return false;
+		const resolveTarget = typeof options.resolveTarget === 'function' ? options.resolveTarget : null;
+		if (!resolveTarget) return false;
+
 		await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
-		const target = getPsnDownloadMotionTarget(entry);
+		const target = resolveTarget(options.entry);
 		if (!target) return false;
-		let destRadius = '6px';
-		if (target.row && target.element) {
+
+		let destRadius = String(options.destRadius || '6px');
+		if (options.useTargetRadius === true && target.element) {
 			try { destRadius = window.getComputedStyle(target.element).borderRadius || destRadius; } catch (e) {}
 		}
-		const result = await animatePsnSharedCover(source, target.rect, { kind:'download', duration:470, destRadius, arc:true, easing:'cubic-bezier(.16,.84,.24,1)' });
-		if (result) pulsePsnDownloadMotionTarget(target);
+
+		const result = await animatePsnSharedCover(source, target.rect, {
+			kind:String(options.kind || 'generic'),
+			duration:Math.max(180, Number(options.duration) || 470),
+			destRadius,
+			arc:options.arc !== false,
+			easing:options.easing || 'cubic-bezier(.16,.84,.24,1)'
+		});
+
+		if (result && typeof options.onHit === 'function') options.onHit(target, options.entry);
 		return result;
+	}
+	window.runPsnCoverTransferMotion = runPsnCoverTransferMotion;
+
+	window.runDownloadCoverTransferMotion = function(source, entry) {
+		return runPsnCoverTransferMotion(source, {
+			kind:'download',
+			entry,
+			resolveTarget:getPsnDownloadMotionTarget,
+			useTargetRadius:true,
+			onHit:pulsePsnDownloadMotionTarget
+		});
 	};
 
 
@@ -24394,44 +24593,24 @@ P
 		if (!target?.card && pill && typeof window.animateCountPillFeedback === 'function') window.animateCountPillFeedback(pill);
 	}
 
-	window.runWishlistCoverTransferMotion = async function(source, entry) {
-		if (!source || isPsnSharedMotionReduced()) return false;
-		await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
-		const target = getPsnWishlistMotionTarget(entry);
-		if (!target) return false;
-		let destRadius = '6px';
-		if (target.card && target.element) {
-			try { destRadius = window.getComputedStyle(target.element).borderRadius || destRadius; } catch (e) {}
-		}
-		const result = await animatePsnSharedCover(source, target.rect, {
+	window.runWishlistCoverTransferMotion = function(source, entry) {
+		return runPsnCoverTransferMotion(source, {
 			kind:'wishlist',
-			duration:470,
-			destRadius,
-			arc:true,
-			easing:'cubic-bezier(.16,.84,.24,1)'
+			entry,
+			resolveTarget:getPsnWishlistMotionTarget,
+			useTargetRadius:true,
+			onHit:target => pulsePsnCollectionMotionTarget(target, 'wishlist')
 		});
-		if (result) pulsePsnCollectionMotionTarget(target, 'wishlist');
-		return result;
 	};
 
-	window.runFavoriteCoverTransferMotion = async function(source, entry) {
-		if (!source || isPsnSharedMotionReduced()) return false;
-		await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
-		const target = getPsnFavoriteMotionTarget(entry);
-		if (!target) return false;
-		let destRadius = '6px';
-		if (target.card && target.element) {
-			try { destRadius = window.getComputedStyle(target.element).borderRadius || destRadius; } catch (e) {}
-		}
-		const result = await animatePsnSharedCover(source, target.rect, {
+	window.runFavoriteCoverTransferMotion = function(source, entry) {
+		return runPsnCoverTransferMotion(source, {
 			kind:'favorite',
-			duration:470,
-			destRadius,
-			arc:true,
-			easing:'cubic-bezier(.16,.84,.24,1)'
+			entry,
+			resolveTarget:getPsnFavoriteMotionTarget,
+			useTargetRadius:true,
+			onHit:target => pulsePsnCollectionMotionTarget(target, 'favorite')
 		});
-		if (result) pulsePsnCollectionMotionTarget(target, 'favorite');
-		return result;
 	};
 
 
@@ -36073,6 +36252,16 @@ P
 		} catch (e) { return null; }
 	};
 
+	function triggerPsnSharedLinkOpenFeedback(source) {
+		const element = typeof source === 'string' ? null : source;
+		if (!element?.classList || isPsnSharedMotionReduced()) return 0;
+		element.classList.remove('psn-shared-link-opening');
+		void element.offsetWidth;
+		element.classList.add('psn-shared-link-opening');
+		setTimeout(() => element.classList.remove('psn-shared-link-opening'), 280);
+		return 105;
+	}
+
 	window.openPsnContentSharedLinkInApp = function(event, source) {
 		const href = typeof source === 'string'
 			? source
@@ -36084,6 +36273,7 @@ P
 			event.stopPropagation();
 		}
 		if (typeof playUiClick === 'function') playUiClick();
+		const feedbackDelay = triggerPsnSharedLinkOpenFeedback(source);
 
 		const existingModal = document.getElementById('modal-shared-content-link');
 		if (existingModal && typeof removePsnSharedContentPrompt === 'function') {
@@ -36103,6 +36293,7 @@ P
 			}
 		};
 		if (existingModal) setTimeout(openPending, 280);
+		else if (feedbackDelay > 0) setTimeout(openPending, feedbackDelay);
 		else openPending();
 		return false;
 	};
@@ -64546,12 +64737,20 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 			playSystemSound('sound-trophy-standard', 1);
 			if (typeof playNotificationHaptic === 'function') playNotificationHaptic('success');
 		}
-		window.showPsnTopPopup({
+		const trophyPopupDuration = 4000;
+		const popup = window.showPsnTopPopup({
 			iconTag: 'span',
 			iconClass: `ps-trophy-icon ps-trophy-${trophy.type}`,
 			title: 'Trophy Earned!',
-			text: trophy.title
+			text: trophy.title,
+			duration:trophyPopupDuration
 		});
+		if (popup && typeof window.runTrophyTransferMotion === 'function' && !isPsnSharedMotionReduced()) {
+			setTimeout(() => {
+				const icon = popup.querySelector('.trophy-popup-icon');
+				if (icon?.isConnected) window.runTrophyTransferMotion(icon, normalizedTrophyId, trophy.type);
+			}, trophyPopupDuration - 500);
+		}
 	}
 	
 	window.checkTrophyProgress = function(trophyId, currentAmount) {
