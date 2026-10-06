@@ -779,6 +779,32 @@ html.collection-memory-optimization-on #downloads-list > .download-swipe-row:not
 	will-change: transform,opacity,filter;
 	z-index: 22053;
 }
+.psn-profile-avatar-flight {
+	position: fixed;
+	pointer-events: none !important;
+	user-select: none !important;
+	border-radius: 50% !important;
+	object-fit: cover !important;
+	overflow: hidden !important;
+	transform-origin: center center !important;
+	backface-visibility: hidden;
+	-webkit-backface-visibility: hidden;
+	will-change: transform,opacity;
+	box-shadow: 0 12px 28px rgba(0,0,0,.34),0 0 16px rgba(0,112,204,.16);
+	z-index: 22054;
+}
+#modal-sys-profile.psn-profile-avatar-motion-opening .sys-modal-content {
+	transform: translateY(0) scale(1) !important;
+	transition: none !important;
+}
+#modal-sys-profile.psn-profile-avatar-motion-opening.show>.sys-modal-content>.sys-modal-body>.profile-card-top-row,
+#modal-sys-profile.psn-profile-avatar-motion-settled.show>.sys-modal-content>.sys-modal-body>.profile-card-top-row { animation: none !important; }
+#profile-avatar-container.psn-profile-avatar-motion-hit { animation: psnProfileAvatarArrival .36s cubic-bezier(.22,1,.36,1); }
+@keyframes psnProfileAvatarArrival {
+	0%,100% { transform: scale(1); }
+	46% { transform: scale(1.055); }
+	76% { transform: scale(.992); }
+}
 #trophy-dot.psn-trophy-arrival-hold { display: none !important; }
 #profile-sidebar .profile-item.psn-trophy-transfer-hit>i,
 #nav-trophies-sidebar.psn-trophy-transfer-hit>i {
@@ -23301,26 +23327,55 @@ P
 	}
 
 
-	async function animatePsnSharedElement(sourceElement, destination, options = {}) {
-		if (!sourceElement?.isConnected || isPsnSharedMotionReduced() || document.hidden) return false;
-		const sourceRect = sourceElement.getBoundingClientRect();
+	function capturePsnSharedElementSnapshot(sourceElement) {
+		if (!sourceElement?.isConnected) return null;
+		const rect = sourceElement.getBoundingClientRect();
+		if (rect.width < 4 || rect.height < 4) return null;
+		const sourceStyle = window.getComputedStyle(sourceElement);
+		const clone = sourceElement.cloneNode(true);
+		if (sourceElement.tagName === 'IMG' && sourceElement.currentSrc) clone.src = sourceElement.currentSrc;
+		return {
+			clone,
+			rect:{ left:rect.left, top:rect.top, width:rect.width, height:rect.height },
+			style:{
+				color:sourceStyle.color,
+				fontSize:sourceStyle.fontSize,
+				lineHeight:sourceStyle.lineHeight,
+				filter:sourceStyle.filter === 'none' ? '' : sourceStyle.filter,
+				borderRadius:sourceStyle.borderRadius,
+				objectFit:sourceStyle.objectFit,
+				objectPosition:sourceStyle.objectPosition,
+				border:sourceStyle.border,
+				background:sourceStyle.background
+			}
+		};
+	}
+	window.capturePsnSharedElementSnapshot = capturePsnSharedElementSnapshot;
+
+	async function animatePsnSharedElementSnapshot(snapshot, destination, options = {}) {
+		if (!snapshot?.clone || isPsnSharedMotionReduced() || document.hidden) return false;
+		const sourceRect = snapshot.rect;
 		const destRect = getPsnMotionRect(destination);
 		if (!destRect || sourceRect.width < 4 || sourceRect.height < 4 || destRect.width < 4 || destRect.height < 4) return false;
 
-		const clone = sourceElement.cloneNode(true);
+		const clone = snapshot.clone.cloneNode(true);
 		clone.classList.add('psn-shared-element-flight');
+		if (options.className) String(options.className).split(/\s+/).filter(Boolean).forEach(name => clone.classList.add(name));
 		clone.setAttribute('aria-hidden', 'true');
 		clone.removeAttribute('id');
 		clone.style.left = `${sourceRect.left}px`;
 		clone.style.top = `${sourceRect.top}px`;
 		clone.style.width = `${sourceRect.width}px`;
 		clone.style.height = `${sourceRect.height}px`;
-
-		const sourceStyle = window.getComputedStyle(sourceElement);
-		clone.style.color = sourceStyle.color;
-		clone.style.fontSize = sourceStyle.fontSize;
-		clone.style.lineHeight = sourceStyle.lineHeight;
-		clone.style.filter = sourceStyle.filter === 'none' ? '' : sourceStyle.filter;
+		clone.style.color = snapshot.style?.color || '';
+		clone.style.fontSize = snapshot.style?.fontSize || '';
+		clone.style.lineHeight = snapshot.style?.lineHeight || '';
+		clone.style.filter = snapshot.style?.filter || '';
+		clone.style.borderRadius = options.borderRadius || snapshot.style?.borderRadius || '';
+		clone.style.objectFit = snapshot.style?.objectFit || '';
+		clone.style.objectPosition = snapshot.style?.objectPosition || '';
+		clone.style.border = snapshot.style?.border || '';
+		clone.style.background = snapshot.style?.background || '';
 		document.body.appendChild(clone);
 
 		const dx = destRect.left - sourceRect.left;
@@ -23349,7 +23404,186 @@ P
 		}
 		return true;
 	}
+	window.animatePsnSharedElementSnapshot = animatePsnSharedElementSnapshot;
+
+	async function animatePsnSharedElement(sourceElement, destination, options = {}) {
+		const snapshot = capturePsnSharedElementSnapshot(sourceElement);
+		if (!snapshot) return false;
+		return animatePsnSharedElementSnapshot(snapshot, destination, options);
+	}
 	window.animatePsnSharedElement = animatePsnSharedElement;
+
+
+	function getPsnProfileMotionAvatarFromTarget(target) {
+		if (!target?.closest) return null;
+		let trigger = target.closest(
+			'.chat-avatar-clickable,.seen-user-item,.friend-activity-avatar,.friend-activity-user,' +
+			'.user-notification-avatar[data-notification-profile],.user-notification-profile-link[data-notification-profile],' +
+			'.direct-conversation-avatar-wrap,.direct-thread-avatar-wrap,' +
+			'#online-users-list-container .online-user-avatar,' +
+			'#friends-list-grid .friend-avatar-level-wrap,' +
+			'#modal-sys-list .game-player-list .friend-avatar-level-wrap,' +
+			'#admin-online-list .admin-user-avatar-wrap'
+		);
+
+		if (!trigger && !target.closest('button,.btn-mini-round,.online-user-actions,.admin-user-actions')) {
+			const row = target.closest(
+				'#online-users-list-container .online-user-item,' +
+				'#friends-list-grid .online-user-item,' +
+				'#modal-sys-list .game-player-list .online-user-item,' +
+				'#admin-online-list .admin-user-row'
+			);
+			if (row) trigger = row;
+		}
+		if (!trigger || trigger.closest('#modal-sys-profile')) return null;
+
+		let avatar = trigger.matches('img') ? trigger : trigger.querySelector('img');
+		if (!avatar) {
+			const row = trigger.closest('.online-user-item,.admin-user-row,.friend-activity-item,.user-notification-item,.seen-user-item,.direct-global-search-result,.direct-conversation-item');
+			avatar = row?.querySelector?.('.online-user-avatar,.friend-activity-avatar,.user-notification-avatar,.seen-user-avatar,.direct-conversation-avatar,img') || null;
+		}
+		if (!avatar?.isConnected) return null;
+
+		let username = String(
+			avatar.dataset?.user ||
+			trigger.dataset?.user ||
+			trigger.dataset?.notificationProfile ||
+			trigger.closest?.('[data-user]')?.dataset?.user ||
+			''
+		);
+		try { username = decodeURIComponent(username); } catch (e) {}
+		return { avatar, username:String(username || '').trim() };
+	}
+
+	function queuePsnProfileAvatarMotion(target) {
+		const resolved = getPsnProfileMotionAvatarFromTarget(target);
+		if (!resolved) return;
+		const snapshot = window.capturePsnSharedElementSnapshot?.(resolved.avatar);
+		if (!snapshot) return;
+		window.__psnPendingProfileAvatarMotion = {
+			username:resolved.username,
+			snapshot,
+			sourceElement:resolved.avatar,
+			sourceVisibility:resolved.avatar.style.visibility || '',
+			capturedAt:Date.now()
+		};
+	}
+
+	function consumePsnProfileAvatarMotion(username) {
+		const pending = window.__psnPendingProfileAvatarMotion;
+		window.__psnPendingProfileAvatarMotion = null;
+		if (!pending || Date.now() - Number(pending.capturedAt || 0) > 1200) return null;
+		const expected = String(username || '').trim().toLowerCase();
+		const actual = String(pending.username || '').trim().toLowerCase();
+		if (expected && actual && expected !== actual) return null;
+		return pending;
+	}
+
+	window.cancelPsnProfileAvatarMotion = function() {
+		window.__psnProfileAvatarMotionGeneration = (Number(window.__psnProfileAvatarMotionGeneration) || 0) + 1;
+		document.querySelectorAll('.psn-profile-avatar-flight').forEach(node => {
+			try { node.getAnimations().forEach(animation => animation.cancel()); } catch (e) {}
+			node.remove();
+		});
+		const active = window.__psnActiveProfileAvatarMotion;
+		if (active?.sourceElement?.isConnected) active.sourceElement.style.visibility = active.sourceVisibility || '';
+		const modal = document.getElementById('modal-sys-profile');
+		if (modal) modal.classList.remove('psn-profile-avatar-motion-opening');
+		window.__psnActiveProfileAvatarMotion = null;
+	};
+
+	window.runPsnProfileAvatarMotion = async function(pending, modal, destination) {
+		if (!pending?.snapshot || !modal || !destination || isPsnSharedMotionReduced()) return false;
+
+		const destinationRect = destination.getBoundingClientRect();
+		const sourceRect = pending.snapshot.rect;
+		if (
+			sourceRect.width < 4 || sourceRect.height < 4 ||
+			destinationRect.width < 4 || destinationRect.height < 4
+		) return false;
+
+		const generation = (Number(window.__psnProfileAvatarMotionGeneration) || 0) + 1;
+		window.__psnProfileAvatarMotionGeneration = generation;
+		window.__psnActiveProfileAvatarMotion = {
+			generation,
+			sourceElement:pending.sourceElement || null,
+			sourceVisibility:pending.sourceVisibility || ''
+		};
+
+		if (pending.sourceElement?.isConnected) pending.sourceElement.style.visibility = 'hidden';
+
+		const sourceClone = pending.snapshot.clone;
+		const flight = document.createElement('img');
+		const sourceSrc = sourceClone?.currentSrc || sourceClone?.src || sourceClone?.getAttribute?.('src') || '';
+		if (!sourceSrc) {
+			if (pending.sourceElement?.isConnected) pending.sourceElement.style.visibility = pending.sourceVisibility || '';
+			modal.classList.remove('psn-profile-avatar-motion-opening');
+			window.__psnActiveProfileAvatarMotion = null;
+			return false;
+		}
+
+		flight.className = 'psn-profile-avatar-flight';
+		flight.alt = '';
+		flight.setAttribute('aria-hidden', 'true');
+		flight.src = sourceSrc;
+		flight.style.left = `${sourceRect.left}px`;
+		flight.style.top = `${sourceRect.top}px`;
+		flight.style.width = `${sourceRect.width}px`;
+		flight.style.height = `${sourceRect.height}px`;
+		document.body.appendChild(flight);
+
+		const sourceCx = sourceRect.left + sourceRect.width / 2;
+		const sourceCy = sourceRect.top + sourceRect.height / 2;
+		const destCx = destinationRect.left + destinationRect.width / 2;
+		const destCy = destinationRect.top + destinationRect.height / 2;
+		const dx = destCx - sourceCx;
+		const dy = destCy - sourceCy;
+		const scale = Math.max(.01, destinationRect.width / sourceRect.width);
+		const distance = Math.hypot(dx, dy);
+		const arc = Math.min(24, Math.max(6, distance * .028));
+		const endTransform = `translate3d(${dx}px,${dy}px,0) scale(${scale})`;
+		let ok = false;
+
+		try {
+			const animation = flight.animate([
+				{ offset:0, transform:'translate3d(0,0,0) scale(1)', opacity:1 },
+				{ offset:.58, transform:`translate3d(${dx * .58}px,${dy * .58 - arc}px,0) scale(${1 + (scale - 1) * .58})`, opacity:1 },
+				{ offset:.86, transform:endTransform, opacity:1 },
+				{ offset:1, transform:endTransform, opacity:0 }
+			], {
+				duration:380,
+				easing:'cubic-bezier(.22,1,.36,1)',
+				fill:'forwards'
+			});
+			await animation.finished.catch(() => {});
+			ok = true;
+		} finally {
+			flight.remove();
+			if (pending.sourceElement?.isConnected) pending.sourceElement.style.visibility = pending.sourceVisibility || '';
+
+			if (generation === Number(window.__psnProfileAvatarMotionGeneration || 0)) {
+				modal.classList.remove('psn-profile-avatar-motion-opening');
+				modal.classList.add('psn-profile-avatar-motion-settled');
+
+				const container = document.getElementById('profile-avatar-container');
+				if (ok && container) {
+					container.classList.remove('psn-profile-avatar-motion-hit');
+					void container.offsetWidth;
+					container.classList.add('psn-profile-avatar-motion-hit');
+					setTimeout(() => container.classList.remove('psn-profile-avatar-motion-hit'), 430);
+				}
+				window.__psnActiveProfileAvatarMotion = null;
+			}
+		}
+		return ok;
+	};
+
+	if (!window.__psnProfileAvatarMotionCaptureBound) {
+		window.__psnProfileAvatarMotionCaptureBound = true;
+		document.addEventListener('click', function(event) {
+			queuePsnProfileAvatarMotion(event.target);
+		}, true);
+	}
 
 	function getPsnTrophyTransferColor(type) {
 		return ({
@@ -94130,7 +94364,11 @@ function getVisibleChatStackEl(id) {
 				});
 				return;
 			}
-			if (modalId === 'modal-sys-profile' && typeof stopProfilePlayTimeTicker === 'function') stopProfilePlayTimeTicker();
+			if (modalId === 'modal-sys-profile') {
+				if (typeof stopProfilePlayTimeTicker === 'function') stopProfilePlayTimeTicker();
+				if (typeof window.cancelPsnProfileAvatarMotion === 'function') window.cancelPsnProfileAvatarMotion();
+				modal?.classList.remove('psn-profile-avatar-motion-opening', 'psn-profile-avatar-motion-settled');
+			}
 			if (typeof cropperInstance !== 'undefined' && cropperInstance) { cropperInstance.destroy(); cropperInstance = null; }
 			if (typeof activeEditorCanvas !== 'undefined' && activeEditorCanvas) { activeEditorCanvas.dispose(); activeEditorCanvas = null; }
 			if (modalId === 'modal-sys-crop') {
@@ -94217,13 +94455,17 @@ function getVisibleChatStackEl(id) {
 	}
 
     function openProfileModal(targetUser = null, seedMeta = null) {
+		const profileMotionUsername = targetUser ? decodeURIComponent(targetUser) : (localStorage.getItem('psn_username') || "Guest");
+		const profileAvatarMotion = consumePsnProfileAvatarMotion(profileMotionUsername);
+		if (typeof window.cancelPsnProfileAvatarMotion === 'function') window.cancelPsnProfileAvatarMotion();
 		closeDropdownMenu();
 		if (typeof stopProfilePlayTimeTicker === 'function') stopProfilePlayTimeTicker();
 		if (typeof window.closeMobileSidebarIfOpen === 'function') window.closeMobileSidebarIfOpen();
-	
+
 		const onlineModal = document.getElementById('modal-sys-online');
 		const profileModal = document.getElementById('modal-sys-profile');
-		
+		if (profileModal) profileModal.classList.remove('psn-profile-avatar-motion-opening', 'psn-profile-avatar-motion-settled');
+
 		if (onlineModal && (onlineModal.style.display === 'flex' || onlineModal.style.display === 'block') && onlineModal.style.opacity !== '0') {
 			if (profileModal) profileModal.dataset.returnToOnline = "true";
 			onlineModal.style.opacity = '0';
@@ -94232,7 +94474,7 @@ function getVisibleChatStackEl(id) {
 		}
 		
 		const myName = localStorage.getItem('psn_username') || "Guest";
-		const username = targetUser ? decodeURIComponent(targetUser) : myName;
+		const username = profileMotionUsername;
 		if (profileModal) profileModal.dataset.profileUsername = username;
 		const isMe = (username === myName);
 		if (!isMe && targetUser) {
@@ -94432,11 +94674,35 @@ function getVisibleChatStackEl(id) {
 		setProfileStatCount('card-library', countLibrary);
 	
 		if (profileModal) {
+			const profileAvatarDestination = document.getElementById('card-avatar');
+			const canRunAvatarMotion = !!(
+				profileAvatarMotion?.snapshot &&
+				profileAvatarDestination &&
+				typeof window.runPsnProfileAvatarMotion === 'function' &&
+				!isPsnSharedMotionReduced()
+			);
+
+			if (canRunAvatarMotion) profileModal.classList.add('psn-profile-avatar-motion-opening');
 			profileModal.style.display = 'flex';
+
 			requestAnimationFrame(() => {
 				profileModal.classList.add('show');
 				if (typeof window.updateOpenProfileSpamProtection === 'function') window.updateOpenProfileSpamProtection(username);
 				if (isMe) prewarmProfileCardStyleOptions();
+
+				if (canRunAvatarMotion) {
+					requestAnimationFrame(() => {
+						requestAnimationFrame(() => {
+							if (!profileModal.classList.contains('show')) {
+								if (typeof window.cancelPsnProfileAvatarMotion === 'function') window.cancelPsnProfileAvatarMotion();
+								return;
+							}
+							const finalAvatar = document.getElementById('card-avatar');
+							if (finalAvatar) window.runPsnProfileAvatarMotion(profileAvatarMotion, profileModal, finalAvatar);
+						});
+					});
+				}
+
 				setTimeout(() => {
 					const modalContent = document.querySelector('#modal-sys-profile .modal-content');
 					if (modalContent) modalContent.scrollTop = 0;
