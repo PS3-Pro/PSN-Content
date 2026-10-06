@@ -797,6 +797,13 @@ html.collection-memory-optimization-on #downloads-list > .download-swipe-row:not
 	transform: translateY(0) scale(1) !important;
 	transition: none !important;
 }
+#modal-sys-profile.psn-profile-avatar-motion-closing {
+	transition: none !important;
+}
+#modal-sys-profile.psn-profile-avatar-motion-closing #card-avatar { visibility: hidden !important; }
+#modal-sys-profile.psn-profile-avatar-motion-closing .sys-modal-content {
+	transition: none !important;
+}
 #modal-sys-profile.psn-profile-avatar-motion-opening.show>.sys-modal-content>.sys-modal-body>.profile-card-top-row,
 #modal-sys-profile.psn-profile-avatar-motion-settled.show>.sys-modal-content>.sys-modal-body>.profile-card-top-row { animation: none !important; }
 #profile-avatar-container.psn-profile-avatar-motion-hit { animation: psnProfileAvatarArrival .36s cubic-bezier(.22,1,.36,1); }
@@ -23201,6 +23208,30 @@ P
 	};
 	window.captureDownloadCoverMotionSource = window.capturePsnCollectionCoverMotionSource;
 
+	function getPsnBackgroundMotionLayerZIndex() {
+		let topModalZ = 0;
+		const overlays = document.querySelectorAll('.sys-modal-overlay, .modal-overlay');
+		overlays.forEach(overlay => {
+			if (!overlay?.isConnected) return;
+			const style = window.getComputedStyle(overlay);
+			if (style.display === 'none' || style.visibility === 'hidden') return;
+			const rect = overlay.getBoundingClientRect();
+			if (rect.width < 4 || rect.height < 4) return;
+			const opacity = Number(style.opacity);
+			if (Number.isFinite(opacity) && opacity <= .01) return;
+			const z = Number.parseInt(style.zIndex, 10);
+			if (Number.isFinite(z) && z > topModalZ) topModalZ = z;
+		});
+		return topModalZ > 1 ? topModalZ - 1 : 22050;
+	}
+
+	function applyPsnBackgroundMotionLayer(element, fallbackZ = 22050) {
+		if (!element?.style) return element;
+		const z = getPsnBackgroundMotionLayerZIndex();
+		element.style.zIndex = String(Number.isFinite(z) ? z : fallbackZ);
+		return element;
+	}
+
 	window.__psnSharedMotionFlights = window.__psnSharedMotionFlights instanceof Set ? window.__psnSharedMotionFlights : new Set();
 	window.cancelPsnSharedCoverMotions = function(kind = '') {
 		for (const clone of Array.from(window.__psnSharedMotionFlights)) {
@@ -23229,6 +23260,7 @@ P
 		clone.style.objectFit = source.objectFit || 'cover';
 		clone.style.objectPosition = source.objectPosition || '50% 50%';
 		clone.style.boxShadow = '0 10px 28px rgba(0,0,0,.36),0 0 0 1px rgba(255,255,255,.055)';
+		applyPsnBackgroundMotionLayer(clone, 22050);
 		document.body.appendChild(clone);
 		window.__psnSharedMotionFlights.add(clone);
 		return clone;
@@ -23253,6 +23285,7 @@ P
 			ripple.style.top = `${rect.top - 3}px`;
 			ripple.style.width = `${rect.width + 6}px`;
 			ripple.style.height = `${rect.height + 6}px`;
+			applyPsnBackgroundMotionLayer(ripple, 22049);
 			document.body.appendChild(ripple);
 			setTimeout(() => ripple.remove(), 470);
 		}
@@ -23479,7 +23512,7 @@ P
 		return pending;
 	}
 
-	window.cancelPsnProfileAvatarMotion = function() {
+	window.cancelPsnProfileAvatarMotion = function(options = {}) {
 		window.__psnProfileAvatarMotionGeneration = (Number(window.__psnProfileAvatarMotionGeneration) || 0) + 1;
 		document.querySelectorAll('.psn-profile-avatar-flight').forEach(node => {
 			try { node.getAnimations().forEach(animation => animation.cancel()); } catch (e) {}
@@ -23487,9 +23520,78 @@ P
 		});
 		const active = window.__psnActiveProfileAvatarMotion;
 		if (active?.sourceElement?.isConnected) active.sourceElement.style.visibility = active.sourceVisibility || '';
+		if (active?.destinationElement?.isConnected) {
+			active.destinationElement.style.opacity = active.destinationOpacity || '';
+			delete active.destinationElement.__psnProfileMotionOriginalOpacity;
+		}
+		const heldDestination = document.getElementById('card-avatar');
+		if (heldDestination && typeof heldDestination.__psnProfileMotionOriginalOpacity === 'string') {
+			heldDestination.style.opacity = heldDestination.__psnProfileMotionOriginalOpacity;
+			delete heldDestination.__psnProfileMotionOriginalOpacity;
+		}
 		const modal = document.getElementById('modal-sys-profile');
-		if (modal) modal.classList.remove('psn-profile-avatar-motion-opening');
+		if (modal) {
+			const origin = modal.__psnProfileAvatarOrigin;
+			if (origin?.sourceElement?.isConnected && options.keepSourceHidden !== true) {
+				origin.sourceElement.style.visibility = origin.sourceVisibility || '';
+			}
+			const closeAnimations = Array.isArray(modal.__psnProfileAvatarCloseAnimations)
+				? modal.__psnProfileAvatarCloseAnimations
+				: [];
+			closeAnimations.forEach(animation => {
+				try { animation.cancel(); } catch (e) {}
+			});
+			modal.__psnProfileAvatarCloseAnimations = null;
+			const content = modal.querySelector('.sys-modal-content');
+			if (content) {
+				content.style.opacity = '';
+				content.style.transform = '';
+			}
+			modal.style.pointerEvents = '';
+			modal.style.opacity = '';
+			modal.classList.remove('psn-profile-avatar-motion-opening', 'psn-profile-avatar-motion-closing');
+			if (options.keepOrigin !== true) modal.__psnProfileAvatarOrigin = null;
+		}
 		window.__psnActiveProfileAvatarMotion = null;
+	};
+
+	window.releasePsnProfileAvatarOrigin = function(modal = document.getElementById('modal-sys-profile')) {
+		if (!modal) return false;
+		const hadOrigin = !!(
+			modal.__psnProfileAvatarOrigin ||
+			window.__psnActiveProfileAvatarMotion ||
+			window.__psnPendingProfileAvatarMotion
+		);
+		if (typeof window.cancelPsnProfileAvatarMotion === 'function') window.cancelPsnProfileAvatarMotion();
+		window.__psnPendingProfileAvatarMotion = null;
+		return hadOrigin;
+	};
+
+	window.releasePsnModalMotionOriginsForNavigation = function() {
+		if (typeof window.releasePsnProfileAvatarOrigin === 'function') window.releasePsnProfileAvatarOrigin();
+		if (typeof window.releaseGameModalCardMorphOrigin === 'function') window.releaseGameModalCardMorphOrigin();
+	};
+
+	window.reconcilePsnModalMotionOrigins = function() {
+		const profileModal = document.getElementById('modal-sys-profile');
+		const profileOwnsOrigin = !!(
+			profileModal &&
+			profileModal.style.display !== 'none' &&
+			profileModal.classList.contains('show')
+		);
+		if (!profileOwnsOrigin && typeof window.releasePsnProfileAvatarOrigin === 'function') {
+			window.releasePsnProfileAvatarOrigin(profileModal);
+		}
+
+		const gameModal = document.getElementById('game-modal');
+		const gameOwnsOrigin = !!(
+			gameModal &&
+			gameModal.style.display !== 'none' &&
+			gameModal.classList.contains('show')
+		);
+		if (!gameOwnsOrigin && typeof window.releaseGameModalCardMorphOrigin === 'function') {
+			window.releaseGameModalCardMorphOrigin(gameModal);
+		}
 	};
 
 	window.runPsnProfileAvatarMotion = async function(pending, modal, destination) {
@@ -23504,19 +23606,27 @@ P
 
 		const generation = (Number(window.__psnProfileAvatarMotionGeneration) || 0) + 1;
 		window.__psnProfileAvatarMotionGeneration = generation;
+		const destinationOpacity = typeof destination.__psnProfileMotionOriginalOpacity === 'string'
+			? destination.__psnProfileMotionOriginalOpacity
+			: (destination.style.opacity || '');
 		window.__psnActiveProfileAvatarMotion = {
 			generation,
 			sourceElement:pending.sourceElement || null,
-			sourceVisibility:pending.sourceVisibility || ''
+			sourceVisibility:pending.sourceVisibility || '',
+			destinationElement:destination,
+			destinationOpacity
 		};
 
 		if (pending.sourceElement?.isConnected) pending.sourceElement.style.visibility = 'hidden';
+		destination.style.opacity = '0';
 
 		const sourceClone = pending.snapshot.clone;
 		const flight = document.createElement('img');
 		const sourceSrc = sourceClone?.currentSrc || sourceClone?.src || sourceClone?.getAttribute?.('src') || '';
 		if (!sourceSrc) {
 			if (pending.sourceElement?.isConnected) pending.sourceElement.style.visibility = pending.sourceVisibility || '';
+			destination.style.opacity = destinationOpacity;
+			delete destination.__psnProfileMotionOriginalOpacity;
 			modal.classList.remove('psn-profile-avatar-motion-opening');
 			window.__psnActiveProfileAvatarMotion = null;
 			return false;
@@ -23548,8 +23658,8 @@ P
 			const animation = flight.animate([
 				{ offset:0, transform:'translate3d(0,0,0) scale(1)', opacity:1 },
 				{ offset:.58, transform:`translate3d(${dx * .58}px,${dy * .58 - arc}px,0) scale(${1 + (scale - 1) * .58})`, opacity:1 },
-				{ offset:.86, transform:endTransform, opacity:1 },
-				{ offset:1, transform:endTransform, opacity:0 }
+				{ offset:.88, transform:endTransform, opacity:1 },
+				{ offset:1, transform:endTransform, opacity:1 }
 			], {
 				duration:380,
 				easing:'cubic-bezier(.22,1,.36,1)',
@@ -23558,10 +23668,13 @@ P
 			await animation.finished.catch(() => {});
 			ok = true;
 		} finally {
-			flight.remove();
-			if (pending.sourceElement?.isConnected) pending.sourceElement.style.visibility = pending.sourceVisibility || '';
-
 			if (generation === Number(window.__psnProfileAvatarMotionGeneration || 0)) {
+				// Reveal the real avatar under the still-opaque flight, then remove
+				// the flight on the next paint so there is no blank/flicker frame.
+				destination.style.opacity = destinationOpacity;
+				delete destination.__psnProfileMotionOriginalOpacity;
+				await new Promise(resolve => requestAnimationFrame(resolve));
+				flight.remove();
 				modal.classList.remove('psn-profile-avatar-motion-opening');
 				modal.classList.add('psn-profile-avatar-motion-settled');
 
@@ -23572,7 +23685,182 @@ P
 					container.classList.add('psn-profile-avatar-motion-hit');
 					setTimeout(() => container.classList.remove('psn-profile-avatar-motion-hit'), 430);
 				}
+				if (ok && pending.sourceElement?.isConnected) {
+					pending.sourceElement.style.visibility = 'hidden';
+					modal.__psnProfileAvatarOrigin = {
+						username:String(modal.dataset.profileUsername || pending.username || ''),
+						sourceElement:pending.sourceElement,
+						sourceVisibility:pending.sourceVisibility || '',
+						capturedAt:Date.now()
+					};
+				} else if (pending.sourceElement?.isConnected) {
+					pending.sourceElement.style.visibility = pending.sourceVisibility || '';
+				}
 				window.__psnActiveProfileAvatarMotion = null;
+			} else {
+				flight.remove();
+				if (pending.sourceElement?.isConnected) pending.sourceElement.style.visibility = pending.sourceVisibility || '';
+			}
+		}
+		return ok;
+	};
+
+
+	function getPsnProfileAvatarReverseTarget(modal) {
+		const origin = modal?.__psnProfileAvatarOrigin;
+		const source = origin?.sourceElement;
+		if (!source?.isConnected) return null;
+
+		const modalUser = String(modal?.dataset?.profileUsername || '').trim().toLowerCase();
+		const originUser = String(origin?.username || source.dataset?.user || '').trim().toLowerCase();
+		if (modalUser && originUser && modalUser !== originUser) return null;
+
+		const style = window.getComputedStyle(source);
+		const opacity = Number(style.opacity);
+		if (
+			style.display === 'none' ||
+			(Number.isFinite(opacity) && opacity <= .05)
+		) return null;
+
+		// The source avatar itself stays hidden while Profile is open.
+		// If an ancestor was hidden (for example Online Players / Game Players),
+		// closing falls back to the normal modal animation instead of targeting stale geometry.
+		let parent = source.parentElement;
+		while (parent && parent !== document.body) {
+			const parentStyle = window.getComputedStyle(parent);
+			const parentOpacity = Number(parentStyle.opacity);
+			if (
+				parentStyle.display === 'none' ||
+				parentStyle.visibility === 'hidden' ||
+				(Number.isFinite(parentOpacity) && parentOpacity <= .05)
+			) return null;
+			parent = parent.parentElement;
+		}
+
+		const rect = source.getBoundingClientRect();
+		if (
+			rect.width < 4 || rect.height < 4 ||
+			rect.right <= 0 || rect.bottom <= 0 ||
+			rect.left >= window.innerWidth || rect.top >= window.innerHeight
+		) return null;
+
+		return { origin, source, rect };
+	}
+
+	window.canRunPsnProfileAvatarMotionClose = function(modal) {
+		if (
+			!modal ||
+			!modal.classList.contains('show') ||
+			modal.classList.contains('psn-profile-avatar-motion-closing') ||
+			isPsnSharedMotionReduced() ||
+			document.hidden
+		) return false;
+
+		const destination = document.getElementById('card-avatar');
+		if (!destination?.isConnected) return false;
+		const destinationRect = destination.getBoundingClientRect();
+		if (destinationRect.width < 4 || destinationRect.height < 4) return false;
+		return !!getPsnProfileAvatarReverseTarget(modal);
+	};
+
+	window.runPsnProfileAvatarMotionClose = async function(modal) {
+		const target = getPsnProfileAvatarReverseTarget(modal);
+		const destination = document.getElementById('card-avatar');
+		const modalContent = modal?.querySelector?.('.sys-modal-content');
+		if (!target || !destination?.isConnected || !modalContent) return false;
+
+		const sourceRect = destination.getBoundingClientRect();
+		const destRect = target.source.getBoundingClientRect();
+		if (
+			sourceRect.width < 4 || sourceRect.height < 4 ||
+			destRect.width < 4 || destRect.height < 4
+		) return false;
+
+		const generation = (Number(window.__psnProfileAvatarMotionGeneration) || 0) + 1;
+		window.__psnProfileAvatarMotionGeneration = generation;
+		modal.classList.remove('psn-profile-avatar-motion-settled');
+		modal.classList.add('psn-profile-avatar-motion-closing');
+		modal.style.pointerEvents = 'none';
+
+		const flight = document.createElement('img');
+		const avatarSrc = destination.currentSrc || destination.src || destination.getAttribute('src') || '';
+		if (!avatarSrc) {
+			modal.classList.remove('psn-profile-avatar-motion-closing');
+			modal.style.pointerEvents = '';
+			return false;
+		}
+
+		const originalSourceVisibility = target.origin?.sourceVisibility || '';
+		target.source.style.visibility = 'hidden';
+
+		flight.className = 'psn-profile-avatar-flight';
+		flight.alt = '';
+		flight.setAttribute('aria-hidden', 'true');
+		flight.src = avatarSrc;
+		flight.style.left = `${sourceRect.left}px`;
+		flight.style.top = `${sourceRect.top}px`;
+		flight.style.width = `${sourceRect.width}px`;
+		flight.style.height = `${sourceRect.height}px`;
+		document.body.appendChild(flight);
+
+		const sourceCx = sourceRect.left + sourceRect.width / 2;
+		const sourceCy = sourceRect.top + sourceRect.height / 2;
+		const destCx = destRect.left + destRect.width / 2;
+		const destCy = destRect.top + destRect.height / 2;
+		const dx = destCx - sourceCx;
+		const dy = destCy - sourceCy;
+		const scale = Math.max(.01, destRect.width / sourceRect.width);
+		const distance = Math.hypot(dx, dy);
+		const arc = Math.min(18, Math.max(4, distance * .022));
+		const endTransform = `translate3d(${dx}px,${dy}px,0) scale(${scale})`;
+		const duration = 300;
+		const easing = 'cubic-bezier(.22,1,.36,1)';
+		let ok = false;
+
+		const flightAnimation = flight.animate([
+			{ offset:0, transform:'translate3d(0,0,0) scale(1)', opacity:1 },
+			{ offset:.60, transform:`translate3d(${dx * .60}px,${dy * .60 - arc}px,0) scale(${1 + (scale - 1) * .60})`, opacity:1 },
+			{ offset:.88, transform:endTransform, opacity:1 },
+			{ offset:1, transform:endTransform, opacity:0 }
+		], {
+			duration,
+			easing,
+			fill:'forwards'
+		});
+
+		const overlayAnimation = modal.animate([
+			{ opacity:1 },
+			{ opacity:0 }
+		], {
+			duration,
+			easing:'cubic-bezier(.4,0,.2,1)',
+			fill:'forwards'
+		});
+
+		const contentAnimation = modalContent.animate([
+			{ transform:'translateY(0) scale(1)' },
+			{ transform:'translateY(20px) scale(.95)' }
+		], {
+			duration,
+			easing:'cubic-bezier(.4,0,.2,1)',
+			fill:'forwards'
+		});
+
+		modal.__psnProfileAvatarCloseAnimations = [overlayAnimation, contentAnimation];
+
+		try {
+			await Promise.all([
+				flightAnimation.finished.catch(() => {}),
+				overlayAnimation.finished.catch(() => {}),
+				contentAnimation.finished.catch(() => {})
+			]);
+			ok = true;
+		} finally {
+			flight.remove();
+			if (target.source?.isConnected) target.source.style.visibility = originalSourceVisibility;
+			if (generation === Number(window.__psnProfileAvatarMotionGeneration || 0)) {
+				// Source avatar becomes real again only after the reverse handoff lands.
+				modal.__psnProfileAvatarOrigin = null;
 			}
 		}
 		return ok;
@@ -23672,6 +23960,7 @@ P
 			ripple.style.setProperty('--psn-collection-motion-color', color);
 			ripple.style.setProperty('--psn-collection-motion-glow', color);
 			ripple.style.setProperty('--psn-collection-motion-soft', 'rgba(255,255,255,.10)');
+			applyPsnBackgroundMotionLayer(ripple, 22049);
 			document.body.appendChild(ripple);
 			setTimeout(() => ripple.remove(), 470);
 		}
@@ -24449,6 +24738,28 @@ P
 		return destination;
 	}
 
+	window.releaseGameModalCardMorphOrigin = function(modal = document.getElementById('game-modal')) {
+		if (!modal) return false;
+		if (typeof window.cancelPsnSharedCoverMotions === 'function') window.cancelPsnSharedCoverMotions('modal');
+
+		const originCard = modal.__psnCardMorphOriginCard;
+		const originVisibility = Object.prototype.hasOwnProperty.call(modal, '__psnCardMorphOriginVisibility')
+			? modal.__psnCardMorphOriginVisibility
+			: '';
+
+		if (originCard?.isConnected) originCard.style.visibility = originVisibility || '';
+
+		modal.__psnCardMorphOriginCard = null;
+		modal.__psnCardMorphOriginSnapshot = null;
+		modal.__psnCardMorphOriginIdentity = '';
+		delete modal.__psnCardMorphOriginVisibility;
+
+		if (typeof window.resetGameModalCardMorphStyles === 'function') {
+			window.resetGameModalCardMorphStyles(modal);
+		}
+		return !!originCard;
+	};
+
 	window.canRunGameModalCardMorphClose = function(modal) {
 		if (!modal || modal.style.display !== 'flex' || !modal.classList.contains('show') || modal.classList.contains('psn-card-morph-opening') || modal.classList.contains('psn-card-morph-closing')) return false;
 		if (isPsnSharedMotionReduced() || document.hidden) return false;
@@ -24850,6 +25161,7 @@ P
 				ripple.style.setProperty('--psn-collection-motion-glow', 'rgba(255,204,0,.40)');
 				ripple.style.setProperty('--psn-collection-motion-soft', 'rgba(255,220,75,.12)');
 			}
+			applyPsnBackgroundMotionLayer(ripple, 22049);
 			document.body.appendChild(ripple);
 			setTimeout(() => ripple.remove(), 470);
 		}
@@ -24904,6 +25216,7 @@ P
 			ripple.style.setProperty('--psn-collection-motion-color', 'rgba(80,255,198,.84)');
 			ripple.style.setProperty('--psn-collection-motion-glow', 'rgba(0,212,154,.42)');
 			ripple.style.setProperty('--psn-collection-motion-soft', 'rgba(80,255,198,.12)');
+			applyPsnBackgroundMotionLayer(ripple, 22049);
 			document.body.appendChild(ripple);
 			setTimeout(() => ripple.remove(), 470);
 		}
@@ -55546,6 +55859,9 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 			(stackedGameModal.style.display === 'flex' || stackedGameModal.classList.contains('show'))
 		);
 
+		if (typeof window.releasePsnModalMotionOriginsForNavigation === 'function') {
+			window.releasePsnModalMotionOriginsForNavigation();
+		}
 		document.querySelectorAll('.sys-modal-overlay.show, .modal-overlay.show, .show').forEach(el => el.classList.remove('show'));
 		document.querySelectorAll('.modal-overlay, .sys-modal-overlay').forEach(modal => modal.style.display = 'none');
 	
@@ -86836,6 +87152,9 @@ function getVisibleChatStackEl(id) {
 				return;
 			}
 			if (profileModal && profileModal.style.display === 'flex') {
+				e.preventDefault();
+				e.stopPropagation();
+				if (typeof e.stopImmediatePropagation === 'function') e.stopImmediatePropagation();
 				closeSysModal(null, 'modal-sys-profile');
 				return;
 			}
@@ -94357,6 +94676,22 @@ function getVisibleChatStackEl(id) {
 		const clickedClose = event && event.target && event.target.closest && event.target.closest('.sys-modal-close');
 		if (!event || clickedClose) {
 			if (modalId === 'game-modal' && modal?.classList.contains('psn-card-morph-closing') && options.skipCardMorph !== true) return;
+			if (modalId === 'modal-sys-profile' && modal?.classList.contains('psn-profile-avatar-motion-closing') && options.skipProfileAvatarMotion !== true) return;
+			if (
+				modalId === 'modal-sys-profile' &&
+				options.skipProfileAvatarMotion !== true &&
+				modal &&
+				typeof window.canRunPsnProfileAvatarMotionClose === 'function' &&
+				window.canRunPsnProfileAvatarMotionClose(modal) &&
+				typeof window.runPsnProfileAvatarMotionClose === 'function'
+			) {
+				if (options.silent !== true && typeof playUiBack === 'function') playUiBack();
+				window.runPsnProfileAvatarMotionClose(modal).catch(() => false).then(() => {
+					// Reverse already faded the overlay; this pass only finalizes cleanup.
+					closeSysModal(null, modalId, { ...options, silent:true, skipProfileAvatarMotion:true });
+				});
+				return;
+			}
 			if (modalId === 'game-modal' && options.skipCardMorph !== true && modal && typeof window.canRunGameModalCardMorphClose === 'function' && window.canRunGameModalCardMorphClose(modal) && typeof window.runGameModalCardMorphClose === 'function') {
 				if (options.silent !== true && typeof playUiBack === 'function') playUiBack();
 				window.runGameModalCardMorphClose(modal).catch(() => false).then(() => {
@@ -94365,9 +94700,11 @@ function getVisibleChatStackEl(id) {
 				return;
 			}
 			if (modalId === 'modal-sys-profile') {
+				if (options.skipProfileAvatarMotion === true && modal) modal.style.display = 'none';
 				if (typeof stopProfilePlayTimeTicker === 'function') stopProfilePlayTimeTicker();
 				if (typeof window.cancelPsnProfileAvatarMotion === 'function') window.cancelPsnProfileAvatarMotion();
-				modal?.classList.remove('psn-profile-avatar-motion-opening', 'psn-profile-avatar-motion-settled');
+				modal?.classList.remove('psn-profile-avatar-motion-opening', 'psn-profile-avatar-motion-closing', 'psn-profile-avatar-motion-settled');
+				if (modal) modal.__psnProfileAvatarOrigin = null;
 			}
 			if (typeof cropperInstance !== 'undefined' && cropperInstance) { cropperInstance.destroy(); cropperInstance = null; }
 			if (typeof activeEditorCanvas !== 'undefined' && activeEditorCanvas) { activeEditorCanvas.dispose(); activeEditorCanvas = null; }
@@ -94408,7 +94745,11 @@ function getVisibleChatStackEl(id) {
 			modal.style.opacity = ''; 
 			
 			modal.classList.remove('show');
-			const modalCloseDelay = modalId === 'game-modal' && options.skipCardMorph === true ? 0 : 300;
+			const modalCloseDelay =
+				(modalId === 'game-modal' && options.skipCardMorph === true) ||
+				(modalId === 'modal-sys-profile' && options.skipProfileAvatarMotion === true)
+					? 0
+					: 300;
 			
 			setTimeout(() => { 
 				if (modalId === 'game-modal' && Number(modal.__psnGameModalCloseGeneration) !== gameModalCloseGeneration) return;
@@ -94424,6 +94765,11 @@ function getVisibleChatStackEl(id) {
 					const listBody = document.getElementById('list-modal-body');
 					if (listBody) listBody.innerHTML = '';
 					window.__lastProfileListRender = null;
+					requestAnimationFrame(() => {
+						if (typeof window.reconcilePsnModalMotionOrigins === 'function') {
+							window.reconcilePsnModalMotionOrigins();
+						}
+					});
 				}
 				if (modalId === 'modal-sys-theme') {
 					delete modal.dataset.themeOriginal;
@@ -94682,7 +95028,11 @@ function getVisibleChatStackEl(id) {
 				!isPsnSharedMotionReduced()
 			);
 
-			if (canRunAvatarMotion) profileModal.classList.add('psn-profile-avatar-motion-opening');
+			if (canRunAvatarMotion) {
+				profileModal.classList.add('psn-profile-avatar-motion-opening');
+				profileAvatarDestination.__psnProfileMotionOriginalOpacity = profileAvatarDestination.style.opacity || '';
+				profileAvatarDestination.style.opacity = '0';
+			}
 			profileModal.style.display = 'flex';
 
 			requestAnimationFrame(() => {
