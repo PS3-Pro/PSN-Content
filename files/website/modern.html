@@ -23233,15 +23233,81 @@ P
 	}
 
 	window.__psnSharedMotionFlights = window.__psnSharedMotionFlights instanceof Set ? window.__psnSharedMotionFlights : new Set();
-	window.cancelPsnSharedCoverMotions = function(kind = '') {
-		for (const clone of Array.from(window.__psnSharedMotionFlights)) {
-			if (!clone || !clone.isConnected) { window.__psnSharedMotionFlights.delete(clone); continue; }
-			if (kind && clone.dataset.psnMotionKind !== kind) continue;
-			try { clone.getAnimations?.().forEach(animation => animation.cancel()); } catch (e) {}
-			clone.remove();
-			window.__psnSharedMotionFlights.delete(clone);
+	window.__psnMotionTransientNodes = window.__psnMotionTransientNodes instanceof Set ? window.__psnMotionTransientNodes : new Set();
+
+	function registerPsnMotionFlight(node, kind = '') {
+		if (!node) return node;
+		if (kind) node.dataset.psnMotionKind = kind;
+		window.__psnSharedMotionFlights.add(node);
+		return node;
+	}
+
+	function registerPsnMotionTransientNode(node, kind = '') {
+		if (!node) return node;
+		if (kind) node.dataset.psnMotionKind = kind;
+		window.__psnMotionTransientNodes.add(node);
+		return node;
+	}
+
+	function cleanupPsnMotionNode(node) {
+		if (!node) return;
+		if (node.__psnMotionRemoveTimer) {
+			clearTimeout(node.__psnMotionRemoveTimer);
+			node.__psnMotionRemoveTimer = null;
 		}
+		try { node.getAnimations?.().forEach(animation => animation.cancel()); } catch (e) {}
+		if (node.isConnected) node.remove();
+		window.__psnSharedMotionFlights.delete(node);
+		window.__psnMotionTransientNodes.delete(node);
+	}
+
+	function schedulePsnMotionNodeRemoval(node, delay) {
+		if (!node) return;
+		if (node.__psnMotionRemoveTimer) clearTimeout(node.__psnMotionRemoveTimer);
+		registerPsnMotionTransientNode(node, node.dataset?.psnMotionKind || 'feedback');
+		node.__psnMotionRemoveTimer = setTimeout(() => {
+			node.__psnMotionRemoveTimer = null;
+			cleanupPsnMotionNode(node);
+		}, Math.max(0, Number(delay) || 0));
+	}
+
+	function schedulePsnMotionClassCleanup(element, className, delay, cleanup) {
+		if (!element?.classList || !className) return;
+		const timers = element.__psnMotionClassTimers || (element.__psnMotionClassTimers = Object.create(null));
+		if (timers[className]) clearTimeout(timers[className]);
+		const timer = setTimeout(() => {
+			if (timers[className] !== timer) return;
+			delete timers[className];
+			element.classList.remove(className);
+			if (typeof cleanup === 'function') cleanup(element);
+		}, Math.max(0, Number(delay) || 0));
+		timers[className] = timer;
+	}
+
+	window.cancelPsnSharedMotions = function(kind = '') {
+		const nodes = new Set([
+			...Array.from(window.__psnSharedMotionFlights),
+			...Array.from(window.__psnMotionTransientNodes)
+		]);
+		nodes.forEach(node => {
+			if (!node) return;
+			if (kind && node.dataset?.psnMotionKind !== kind) return;
+			cleanupPsnMotionNode(node);
+		});
 	};
+	window.cancelPsnSharedCoverMotions = window.cancelPsnSharedMotions;
+
+	if (!window.__psnMotionVisibilityCleanupBound) {
+		window.__psnMotionVisibilityCleanupBound = true;
+		document.addEventListener('visibilitychange', () => {
+			if (document.hidden && typeof window.cancelPsnSharedMotions === 'function') {
+				window.cancelPsnSharedMotions();
+			}
+		});
+		window.addEventListener('pagehide', () => {
+			if (typeof window.cancelPsnSharedMotions === 'function') window.cancelPsnSharedMotions();
+		});
+	}
 
 	function makePsnSharedCoverClone(source, kind) {
 		if (!source || !source.src || !source.rect) return null;
@@ -23262,7 +23328,7 @@ P
 		clone.style.boxShadow = '0 10px 28px rgba(0,0,0,.36),0 0 0 1px rgba(255,255,255,.055)';
 		applyPsnBackgroundMotionLayer(clone, 22050);
 		document.body.appendChild(clone);
-		window.__psnSharedMotionFlights.add(clone);
+		registerPsnMotionFlight(clone, kind || 'generic');
 		return clone;
 	}
 
@@ -23286,8 +23352,9 @@ P
 			ripple.style.width = `${rect.width + 6}px`;
 			ripple.style.height = `${rect.height + 6}px`;
 			applyPsnBackgroundMotionLayer(ripple, 22049);
+			ripple.dataset.psnMotionKind = 'feedback';
 			document.body.appendChild(ripple);
-			setTimeout(() => ripple.remove(), 470);
+			schedulePsnMotionNodeRemoval(ripple, 470);
 		}
 		if (target?.row) {
 			const item = target.row.querySelector('.download-item');
@@ -23295,7 +23362,7 @@ P
 				item.classList.remove('psn-download-motion-hit');
 				void item.offsetWidth;
 				item.classList.add('psn-download-motion-hit');
-				setTimeout(() => item.classList.remove('psn-download-motion-hit'), 520);
+				schedulePsnMotionClassCleanup(item, 'psn-download-motion-hit', 520);
 			}
 		} else {
 			const nav = document.getElementById('nav-downloads');
@@ -23303,7 +23370,7 @@ P
 				nav.classList.remove('psn-download-motion-hit');
 				void nav.offsetWidth;
 				nav.classList.add('psn-download-motion-hit');
-				setTimeout(() => nav.classList.remove('psn-download-motion-hit'), 520);
+				schedulePsnMotionClassCleanup(nav, 'psn-download-motion-hit', 520);
 			}
 			const pill = document.getElementById('sidebar-count-downloads');
 			if (pill && typeof window.animateCountPillFeedback === 'function') window.animateCountPillFeedback(pill);
@@ -23353,8 +23420,7 @@ P
 				await new Promise(resolve => setTimeout(resolve, duration + 24));
 			}
 		} finally {
-			clone.remove();
-			window.__psnSharedMotionFlights.delete(clone);
+			cleanupPsnMotionNode(clone);
 		}
 		return true;
 	}
@@ -23410,6 +23476,7 @@ P
 		clone.style.border = snapshot.style?.border || '';
 		clone.style.background = snapshot.style?.background || '';
 		document.body.appendChild(clone);
+		registerPsnMotionFlight(clone, String(options.kind || 'element'));
 
 		const dx = destRect.left - sourceRect.left;
 		const dy = destRect.top - sourceRect.top;
@@ -23433,7 +23500,7 @@ P
 			});
 			await animation.finished.catch(() => {});
 		} finally {
-			clone.remove();
+			cleanupPsnMotionNode(clone);
 		}
 		return true;
 	}
@@ -23568,6 +23635,7 @@ P
 	};
 
 	window.releasePsnModalMotionOriginsForNavigation = function() {
+		if (typeof window.cancelPsnSharedMotions === 'function') window.cancelPsnSharedMotions();
 		if (typeof window.releasePsnProfileAvatarOrigin === 'function') window.releasePsnProfileAvatarOrigin();
 		if (typeof window.releaseGameModalCardMorphOrigin === 'function') window.releaseGameModalCardMorphOrigin();
 	};
@@ -23683,7 +23751,7 @@ P
 					container.classList.remove('psn-profile-avatar-motion-hit');
 					void container.offsetWidth;
 					container.classList.add('psn-profile-avatar-motion-hit');
-					setTimeout(() => container.classList.remove('psn-profile-avatar-motion-hit'), 430);
+					schedulePsnMotionClassCleanup(container, 'psn-profile-avatar-motion-hit', 430);
 				}
 				if (ok && pending.sourceElement?.isConnected) {
 					pending.sourceElement.style.visibility = 'hidden';
@@ -23961,8 +24029,9 @@ P
 			ripple.style.setProperty('--psn-collection-motion-glow', color);
 			ripple.style.setProperty('--psn-collection-motion-soft', 'rgba(255,255,255,.10)');
 			applyPsnBackgroundMotionLayer(ripple, 22049);
+			ripple.dataset.psnMotionKind = 'feedback';
 			document.body.appendChild(ripple);
-			setTimeout(() => ripple.remove(), 470);
+			schedulePsnMotionNodeRemoval(ripple, 470);
 		}
 
 		const hit = target?.card || target?.element;
@@ -23971,10 +24040,9 @@ P
 			hit.classList.remove('psn-trophy-transfer-hit');
 			void hit.offsetWidth;
 			hit.classList.add('psn-trophy-transfer-hit');
-			setTimeout(() => {
-				hit.classList.remove('psn-trophy-transfer-hit');
-				hit.style.removeProperty('--psn-trophy-transfer-color');
-			}, 540);
+			schedulePsnMotionClassCleanup(hit, 'psn-trophy-transfer-hit', 540, node => {
+				node.style.removeProperty('--psn-trophy-transfer-color');
+			});
 		}
 
 		if (!target?.card) {
@@ -23990,6 +24058,7 @@ P
 			return false;
 		}
 		const ok = await animatePsnSharedElement(sourceElement, target.rect, {
+			kind:'trophy',
 			duration:460,
 			arc:true,
 			easing:'cubic-bezier(.16,.84,.24,1)'
@@ -25162,8 +25231,9 @@ P
 				ripple.style.setProperty('--psn-collection-motion-soft', 'rgba(255,220,75,.12)');
 			}
 			applyPsnBackgroundMotionLayer(ripple, 22049);
+			ripple.dataset.psnMotionKind = 'feedback';
 			document.body.appendChild(ripple);
-			setTimeout(() => ripple.remove(), 470);
+			schedulePsnMotionNodeRemoval(ripple, 470);
 		}
 
 		const hitTarget = target?.card || target?.element;
@@ -25171,7 +25241,7 @@ P
 			hitTarget.classList.remove('psn-collection-motion-hit');
 			void hitTarget.offsetWidth;
 			hitTarget.classList.add('psn-collection-motion-hit');
-			setTimeout(() => hitTarget.classList.remove('psn-collection-motion-hit'), 520);
+			schedulePsnMotionClassCleanup(hitTarget, 'psn-collection-motion-hit', 520);
 		}
 
 		const pillId = kind === 'wishlist' ? 'sidebar-count-wishlist' : 'sidebar-count-favorites';
@@ -25217,8 +25287,9 @@ P
 			ripple.style.setProperty('--psn-collection-motion-glow', 'rgba(0,212,154,.42)');
 			ripple.style.setProperty('--psn-collection-motion-soft', 'rgba(80,255,198,.12)');
 			applyPsnBackgroundMotionLayer(ripple, 22049);
+			ripple.dataset.psnMotionKind = 'feedback';
 			document.body.appendChild(ripple);
-			setTimeout(() => ripple.remove(), 470);
+			schedulePsnMotionNodeRemoval(ripple, 470);
 		}
 
 		const hitTarget = target?.element;
@@ -25226,27 +25297,21 @@ P
 			hitTarget.classList.remove('psn-collection-motion-hit');
 			void hitTarget.offsetWidth;
 			hitTarget.classList.add('psn-collection-motion-hit');
-			setTimeout(() => hitTarget.classList.remove('psn-collection-motion-hit'), 520);
+			schedulePsnMotionClassCleanup(hitTarget, 'psn-collection-motion-hit', 520);
 		}
 
 		const pill = document.getElementById('sidebar-count-play-together');
 		if (pill && typeof window.animateCountPillFeedback === 'function') window.animateCountPillFeedback(pill);
 	}
 
-	window.runPlayTogetherCoverTransferMotion = async function(source, titleId) {
-		if (!source || isPsnSharedMotionReduced()) return false;
-		await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
-		const target = getPsnPlayTogetherMotionTarget(titleId);
-		if (!target) return false;
-		const result = await animatePsnSharedCover(source, target.rect, {
+	window.runPlayTogetherCoverTransferMotion = function(source, titleId) {
+		return runPsnCoverTransferMotion(source, {
 			kind:'play-together',
-			duration:470,
+			entry:titleId,
+			resolveTarget:getPsnPlayTogetherMotionTarget,
 			destRadius:'6px',
-			arc:true,
-			easing:'cubic-bezier(.16,.84,.24,1)'
+			onHit:pulsePsnPlayTogetherMotionTarget
 		});
-		if (result) pulsePsnPlayTogetherMotionTarget(target);
-		return result;
 	};
 
 
