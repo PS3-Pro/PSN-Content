@@ -37367,7 +37367,7 @@ P
 			event.stopPropagation();
 		}
 		if (typeof playUiClick === 'function') playUiClick();
-		const feedbackDelay = triggerPsnSharedLinkOpenFeedback(source);
+		triggerPsnSharedLinkOpenFeedback(source);
 
 		const existingModal = document.getElementById('modal-shared-content-link');
 		if (existingModal && typeof removePsnSharedContentPrompt === 'function') {
@@ -37381,13 +37381,12 @@ P
 
 		const openPending = () => {
 			if (typeof window.tryOpenPendingContentDeepLink === 'function') {
-				window.tryOpenPendingContentDeepLink({ reason: 'chat-share-link' });
+				window.tryOpenPendingContentDeepLink({ reason: 'chat-share-link', immediate: true });
 			} else if (typeof schedulePsnSharedContentPrompt === 'function') {
-				schedulePsnSharedContentPrompt();
+				schedulePsnSharedContentPrompt({ immediate: true });
 			}
 		};
 		if (existingModal) setTimeout(openPending, 280);
-		else if (feedbackDelay > 0) setTimeout(openPending, feedbackDelay);
 		else openPending();
 		return false;
 	};
@@ -37631,9 +37630,10 @@ P
 		return !!document.querySelector(blockingSelector);
 	}
 
-	function schedulePsnSharedContentPrompt() {
+	function schedulePsnSharedContentPrompt(options = {}) {
 		if (psnContentSharedPromptOpen || document.getElementById('modal-shared-content-link')) return true;
 		if (psnContentSharedPromptTimer) return true;
+		let fastPath = options.immediate === true;
 		psnContentSharedPromptClearSince = 0;
 		const check = async () => {
 			psnContentSharedPromptTimer = null;
@@ -37647,21 +37647,24 @@ P
 				}
 			}
 			if (isPsnSharedContentPromptBlocked()) {
+				fastPath = false;
 				psnContentSharedPromptClearSince = 0;
 				psnContentSharedPromptTimer = setTimeout(check, PSN_SHARED_PROMPT_RETRY_MS);
 				return;
 			}
-			const now = Date.now();
-			if (!psnContentSharedPromptClearSince) psnContentSharedPromptClearSince = now;
-			const clearFor = now - psnContentSharedPromptClearSince;
-			if (clearFor < PSN_SHARED_PROMPT_STABLE_CLEAR_MS) {
-				psnContentSharedPromptTimer = setTimeout(check, Math.min(PSN_SHARED_PROMPT_RETRY_MS, PSN_SHARED_PROMPT_STABLE_CLEAR_MS - clearFor));
-				return;
+			if (!fastPath) {
+				const now = Date.now();
+				if (!psnContentSharedPromptClearSince) psnContentSharedPromptClearSince = now;
+				const clearFor = now - psnContentSharedPromptClearSince;
+				if (clearFor < PSN_SHARED_PROMPT_STABLE_CLEAR_MS) {
+					psnContentSharedPromptTimer = setTimeout(check, Math.min(PSN_SHARED_PROMPT_RETRY_MS, PSN_SHARED_PROMPT_STABLE_CLEAR_MS - clearFor));
+					return;
+				}
 			}
 			psnContentSharedPromptClearSince = 0;
 			showPsnSharedContentPrompt(pending);
 		};
-		psnContentSharedPromptTimer = setTimeout(check, PSN_SHARED_PROMPT_RETRY_MS);
+		psnContentSharedPromptTimer = setTimeout(check, fastPath ? 0 : PSN_SHARED_PROMPT_RETRY_MS);
 		return true;
 	}
 
@@ -37834,7 +37837,7 @@ P
 		const pending = getPendingSharedContent();
 		if (!pending) { cancelPsnSharedContentPromptSchedule(); return Promise.resolve(false); }
 		if (document.getElementById('modal-shared-content-link') || psnContentSharedPromptOpen) return Promise.resolve(true);
-		return Promise.resolve(schedulePsnSharedContentPrompt());
+		return Promise.resolve(schedulePsnSharedContentPrompt(options));
 	};
 
 	window.consumePsnContentSharedLink();
