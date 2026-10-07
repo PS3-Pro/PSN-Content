@@ -3550,13 +3550,8 @@ html.samsung-browser .particle-core-mark, html.samsung-browser .particle-core-ma
 #game-modal.psn-card-morph-opening .modal-game-title,
 #game-modal.psn-card-morph-closing .modal-cover-wrapper,
 #game-modal.psn-card-morph-closing .modal-game-title { visibility: hidden !important; }
-@media (max-width:768px) {
-	#game-modal.psn-card-morph-mobile-title.psn-card-morph-opening .modal-game-title,
-	#game-modal.psn-card-morph-mobile-title.psn-card-morph-closing .modal-game-title { visibility: visible !important; }
-}
-@media (max-width:768px) {
-	#game-modal.psn-card-morph-closing .modal-game-title { visibility: visible !important; }
-}
+#game-modal.psn-card-morph-contained-title.psn-card-morph-opening .modal-game-title,
+#game-modal.psn-card-morph-contained-title.psn-card-morph-closing .modal-game-title { visibility: visible !important; }
 .psn-card-morph-cover-unit {
 	position: fixed;
 	margin: 0 !important;
@@ -16667,6 +16662,64 @@ P
 	}
 
 
+	function preparePendingNewUserLoginCard(username, avatarUrl) {
+		const grid = document.getElementById('ps5-user-grid');
+		const safeName = String(username || '').trim();
+		if (!grid || !safeName) return null;
+
+		grid.querySelectorAll('.psn-pending-new-user-login-card').forEach(card => card.remove());
+
+		const card = document.createElement('div');
+		card.className = 'user-profile-card psn-pending-new-user-login-card';
+		card.setAttribute('aria-hidden', 'true');
+
+		const inner = document.createElement('div');
+		inner.style.position = 'relative';
+		inner.style.display = 'flex';
+		inner.style.flexDirection = 'column';
+		inner.style.alignItems = 'center';
+
+		const avatar = document.createElement('div');
+		avatar.className = 'user-avatar-ps5';
+
+		const image = document.createElement('img');
+		image.alt = '';
+		image.src = String(avatarUrl || AVAILABLE_AVATARS[0] || '');
+
+		const name = document.createElement('p');
+		name.className = 'profile-login-username';
+		name.setAttribute('data-no-translate', 'true');
+		name.setAttribute('translate', 'no');
+		name.style.marginTop = '15px';
+		name.style.fontWeight = 'bold';
+		name.style.transition = '0.3s';
+		name.style.color = 'white';
+		name.textContent = safeName;
+
+		avatar.appendChild(image);
+		inner.appendChild(avatar);
+		inner.appendChild(name);
+		card.appendChild(inner);
+
+		const addCard = grid.querySelector('.new-user-card');
+		if (addCard) addCard.replaceWith(card);
+		else grid.appendChild(card);
+
+		return card;
+	}
+
+	function clearPendingNewUserLoginCard(refreshGrid = false) {
+		const grid = document.getElementById('ps5-user-grid');
+		if (!grid) return false;
+		const cards = Array.from(grid.querySelectorAll('.psn-pending-new-user-login-card'));
+		if (!cards.length) return false;
+		cards.forEach(card => card.remove());
+		if (refreshGrid && typeof loadUserGrid === 'function') loadUserGrid();
+		return true;
+	}
+
+
+
      async function confirmNewUser() {
 		const inputId = document.getElementById('new-psn-id');
 		const inputPass = document.getElementById('new-psn-pass');
@@ -16773,6 +16826,13 @@ P
 				}
 			}
 		};
+
+		isLoggingIn = true;
+		const nameOverlay = document.getElementById('name-input-overlay');
+		if (nameOverlay) closePs5AuthOverlayInstant(nameOverlay);
+		preparePendingNewUserLoginCard(name, accountAvatar);
+		setUserSelectAuthHidden(false);
+		playLoginAnimation(name);
 
 		if (typeof window.sendLoginAuthentication === 'function') {
 			window.sendLoginAuthentication(authPayload);
@@ -19074,6 +19134,7 @@ P
 					const av = c.querySelector('.user-avatar-ps5');
 					if (av) av.classList.remove('loading-spin');
 				});
+				if (typeof clearPendingNewUserLoginCard === 'function') clearPendingNewUserLoginCard(false);
 	
 				const welcomeMsg = document.getElementById('welcome-msg');
 				if (welcomeMsg) {
@@ -24437,7 +24498,7 @@ P
 	function resetGameModalCardMorphStyles(modal) {
 		if (!modal) return;
 		clearGameModalCardMorphPrepareWatchdog(modal);
-		modal.classList.remove('psn-card-morph-opening', 'psn-card-morph-opened', 'psn-card-morph-closing', 'psn-card-morph-locked', 'psn-card-morph-mobile-title');
+		modal.classList.remove('psn-card-morph-opening', 'psn-card-morph-opened', 'psn-card-morph-closing', 'psn-card-morph-locked', 'psn-card-morph-contained-title');
 		const content = modal.querySelector('.sys-modal-content');
 		const header = modal.querySelector('.sys-modal-header');
 		const body = modal.querySelector('.sys-modal-body');
@@ -24588,6 +24649,23 @@ P
 	};
 
 
+	function shouldUseContainedGameModalTitleMorph(modalTitle) {
+		const viewportWidth = Math.max(
+			Number(document.documentElement?.clientWidth) || 0,
+			Number(window.innerWidth) || 0
+		);
+		if (viewportWidth <= 520) return true;
+		if (!modalTitle?.getBoundingClientRect) return false;
+
+		const rect = modalTitle.getBoundingClientRect();
+		if (rect.width < 8 || rect.height < 8) return false;
+		const style = window.getComputedStyle(modalTitle);
+		const fontSize = parseFloat(style.fontSize) || 20;
+		const lineHeight = parseFloat(style.lineHeight) || fontSize * 1.2;
+		const canWrap = String(style.whiteSpace || '').toLowerCase() !== 'nowrap';
+		return canWrap && rect.height > lineHeight * 1.45;
+	}
+
 	window.runGameModalCardMorph = async function(modal, source) {
 		clearGameModalCardMorphPrepareWatchdog(modal);
 		armGameModalCardMorphPrepareWatchdog(modal, 1600);
@@ -24606,15 +24684,15 @@ P
 		const header = modal.querySelector('.sys-modal-header');
 		const body = modal.querySelector('.sys-modal-body');
 		const modalTitle = modal.querySelector('.modal-game-title');
-		const mobileContainedTitle = window.innerWidth <= 768;
+		const containedTitleMorph = shouldUseContainedGameModalTitleMorph(modalTitle);
 		if (!geometry?.content?.rect || !geometry.cover?.rect || !content || !header || !body) {
 			clearOpening();
 			resetGameModalCardMorphStyles(modal);
 			return false;
 		}
 
-		if (mobileContainedTitle) {
-			modal.classList.add('psn-card-morph-mobile-title');
+		if (containedTitleMorph) {
+			modal.classList.add('psn-card-morph-contained-title');
 			if (modalTitle) {
 				modalTitle.style.opacity = '0';
 				modalTitle.style.transform = 'translateY(4px) scale(.97)';
@@ -24624,7 +24702,7 @@ P
 		}
 
 		const coverUnit = makePsnCardMorphCoverUnit(source.cover, geometry.trailer, source.cover.rect, { trailerVisible:false, borderRadius:source.cover.borderRadius || '6px' });
-		const titleClone = !mobileContainedTitle && source.title && geometry.title ? makePsnCardMorphTitle(source.title, geometry.title) : null;
+		const titleClone = !containedTitleMorph && source.title && geometry.title ? makePsnCardMorphTitle(source.title, geometry.title) : null;
 		const topOcclusionBottom = getPsnCardMorphTopOcclusionBottom(source.card.element);
 		const nearTopOcclusion = topOcclusionBottom > 0 && source.card.rect.top < topOcclusionBottom + 28;
 		const initialCoverClip = nearTopOcclusion ? getPsnMorphClipInset(topOcclusionBottom, source.cover.rect.top, 1) : 'inset(0px 0px 0px 0px)';
@@ -24836,7 +24914,7 @@ P
 				{ opacity:1, transform:'translateY(0)' }
 			], { duration:135, delay:295, easing:'cubic-bezier(.16,.84,.28,1)', fill:'forwards' });
 
-			const mobileTitleAnimation = mobileContainedTitle && modalTitle?.isConnected
+			const containedTitleAnimation = containedTitleMorph && modalTitle?.isConnected
 				? modalTitle.animate([
 					{ opacity:0, transform:'translateY(4px) scale(.97)' },
 					{ offset:.72, opacity:1, transform:'translateY(-.35px) scale(1.006)' },
@@ -24853,7 +24931,7 @@ P
 				titleAnimation?.finished?.catch(() => {}),
 				headerAnimation.finished.catch(() => {}),
 				bodyAnimation.finished.catch(() => {}),
-				mobileTitleAnimation?.finished?.catch(() => {})
+				containedTitleAnimation?.finished?.catch(() => {})
 			]);
 
 			if (!modal.isConnected || !modal.classList.contains('psn-card-morph-opening') || !modal.classList.contains('show') || modal.style.display !== 'flex') return false;
@@ -24893,10 +24971,10 @@ P
 				titleHandoffClone = wrappedTitleClone;
 			}
 
-			if (mobileTitleAnimation) {
-				try { mobileTitleAnimation.cancel(); } catch (e) {}
+			if (containedTitleAnimation) {
+				try { containedTitleAnimation.cancel(); } catch (e) {}
 			}
-			if (mobileContainedTitle && modalTitle) {
+			if (containedTitleMorph && modalTitle) {
 				modalTitle.style.opacity = '';
 				modalTitle.style.transform = '';
 				modalTitle.style.transformOrigin = '';
@@ -24940,7 +25018,7 @@ P
 			return true;
 		} finally {
 			clearGameModalCardMorphPrepareWatchdog(modal);
-			if (mobileContainedTitle) modal.classList.remove('psn-card-morph-mobile-title');
+			if (containedTitleMorph) modal.classList.remove('psn-card-morph-contained-title');
 			if (modalTitle) {
 				try { modalTitle.getAnimations?.().forEach(animation => animation.cancel()); } catch (e) {}
 				modalTitle.style.opacity = '';
@@ -25150,9 +25228,9 @@ P
 		if (contentRect.width < 120 || contentRect.height < 120) return false;
 
 		const contentStyle = window.getComputedStyle(content);
-		const mobileContainedTitle = window.innerWidth <= 768;
+		const containedTitleMorph = shouldUseContainedGameModalTitleMorph(modalTitle);
 		const coverUnit = makePsnCardMorphCoverUnit(coverSource, trailerSource, coverStartRect, { trailerVisible:!!trailerSource, borderRadius:trailerSource?.frame?.borderRadius || coverSource.borderRadius || '7px', boxShadow:trailerSource?.frame?.boxShadow || '0 8px 22px rgba(0,0,0,.30)' });
-		const titleClone = !mobileContainedTitle && modalTitle && destination.title ? makePsnReverseTitleClone(modalTitle, destination.title) : null;
+		const titleClone = !containedTitleMorph && modalTitle && destination.title ? makePsnReverseTitleClone(modalTitle, destination.title) : null;
 		const cleanupElement = element => {
 			if (!element) return;
 			try { element.getAnimations?.().forEach(animation => animation.cancel()); } catch (e) {}
@@ -25172,7 +25250,7 @@ P
 		modal.style.setProperty('--psn-card-morph-lock-height', `${contentRect.height}px`);
 		modal.classList.add('psn-card-morph-locked');
 		modal.classList.remove('psn-card-morph-opened');
-		if (mobileContainedTitle) modal.classList.add('psn-card-morph-mobile-title');
+		if (containedTitleMorph) modal.classList.add('psn-card-morph-contained-title');
 		modal.classList.add('psn-card-morph-closing');
 
 		content.style.transformOrigin = '0 0';
@@ -25261,7 +25339,7 @@ P
 				{ offset:1, opacity:0, transform:'translateY(4px)' }
 			], { duration:130, easing:'cubic-bezier(.4,0,1,1)', fill:'forwards' });
 
-			const mobileTitleAnimation = mobileContainedTitle && modalTitle?.isConnected
+			const containedTitleAnimation = containedTitleMorph && modalTitle?.isConnected
 				? modalTitle.animate([
 					{ opacity:1, transform:'translateY(0) scale(1)' },
 					{ opacity:0, transform:'translateY(3px) scale(.985)' }
@@ -25370,7 +25448,7 @@ P
 				trailerFrameAnimation?.finished?.catch(() => {}),
 				trailerLabelAnimation?.finished?.catch(() => {}),
 				titleAnimation?.finished?.catch(() => {}),
-				mobileTitleAnimation?.finished?.catch(() => {})
+				containedTitleAnimation?.finished?.catch(() => {})
 			]);
 
 			/* Handoff at identical geometry: card appears under the contracted live modal. */
@@ -25385,7 +25463,7 @@ P
 			completed = true;
 			return true;
 		} finally {
-			if (mobileContainedTitle) modal.classList.remove('psn-card-morph-mobile-title');
+			if (containedTitleMorph) modal.classList.remove('psn-card-morph-contained-title');
 			if (modalTitle) {
 				try { modalTitle.getAnimations?.().forEach(animation => animation.cancel()); } catch (e) {}
 				modalTitle.style.opacity = '';
@@ -83895,6 +83973,8 @@ function getVisibleChatStackEl(id) {
 				}
 			}
 			
+			if (typeof clearPendingNewUserLoginCard === 'function') clearPendingNewUserLoginCard(true);
+
 			const btnCreate = document.getElementById('btn-create-profile');
 			const btnLogin = document.getElementById('btn-login-profile');
 			const passInput = document.getElementById('login-psn-pass');
@@ -86626,6 +86706,8 @@ function getVisibleChatStackEl(id) {
 
 			const userGrid = document.getElementById('ps5-user-grid');
 			if (userGrid) userGrid.style.pointerEvents = 'auto';
+
+			if (typeof clearPendingNewUserLoginCard === 'function') clearPendingNewUserLoginCard(true);
 
 			document.querySelectorAll('.user-profile-card').forEach(card => {
 				card.classList.remove('logging-in', 'fade-out');
