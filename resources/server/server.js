@@ -2402,6 +2402,8 @@ async function initDb() {
     ALTER TABLE direct_messages ADD COLUMN IF NOT EXISTS reply_to JSONB;
     ALTER TABLE direct_messages ADD COLUMN IF NOT EXISTS reactions JSONB NOT NULL DEFAULT '[]'::jsonb;
     ALTER TABLE direct_messages ADD COLUMN IF NOT EXISTS edited_at TIMESTAMPTZ;
+    ALTER TABLE direct_messages ADD COLUMN IF NOT EXISTS pinned_at TIMESTAMPTZ;
+    CREATE INDEX IF NOT EXISTS idx_direct_message_pins ON direct_messages(sender_name, recipient_name, pinned_at DESC) WHERE pinned_at IS NOT NULL;
     CREATE INDEX IF NOT EXISTS idx_direct_messages_sender_recipient_id ON direct_messages(sender_name, recipient_name, id DESC);
     CREATE INDEX IF NOT EXISTS idx_direct_messages_recipient_sender_id ON direct_messages(recipient_name, sender_name, id DESC);
     CREATE TABLE IF NOT EXISTS direct_message_read_state (
@@ -8439,8 +8441,27 @@ function normalizeDirectMessageMedia(value) {
 
 function normalizeDirectMessageType(value, media = []) {
   const type = normalizeText(value, 'text').toLowerCase();
+  if (type === 'poll') return 'poll';
   if (!media.length) return 'text';
   return type === 'gif' ? 'gif' : 'image';
+}
+
+function normalizeDirectPoll(value, allowVoters = false) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const question = normalizeText(value.question, '').trim().slice(0, CHAT_POLL_QUESTION_MAX);
+  const source = Array.isArray(value.options) ? value.options : [];
+  if (!question || source.length < 2 || source.length > 4) return null;
+  const options = source.map(option => {
+    const text = normalizeText(option && option.text, '').trim().slice(0, CHAT_POLL_OPTION_TEXT_MAX);
+    const voters = allowVoters && Array.isArray(option && option.voters)
+      ? [...new Set(option.voters.map(normalizeDirectMessageUser).filter(Boolean))].slice(0, 2)
+      : [];
+    return { text, voters };
+  });
+  if (options.some(option => !option.text)) return null;
+  const voted = new Set();
+  options.forEach(option => { option.voters = option.voters.filter(name => { if (voted.has(name)) return false; voted.add(name); return true; }); });
+  return { question, options, totalVotes:voted.size };
 }
 
 function normalizeDirectMessageReply(value) {
@@ -8448,7 +8469,7 @@ function normalizeDirectMessageReply(value) {
   const id = String(value.id || '').slice(0, 40);
   const from = normalizeDirectMessageUser(value.from || value.user);
   const text = String(value.text == null ? '' : value.text).slice(0, DIRECT_MESSAGE_REPLY_TEXT_MAX);
-  const type = normalizeText(value.type, 'text').toLowerCase() === 'gif' ? 'gif' : (normalizeText(value.type, 'text').toLowerCase() === 'image' ? 'image' : 'text');
+  const type = normalizeText(value.type, 'text').toLowerCase() === 'poll' ? 'poll' : (normalizeText(value.type, 'text').toLowerCase() === 'gif' ? 'gif' : (normalizeText(value.type, 'text').toLowerCase() === 'image' ? 'image' : 'text'));
   if (!id || !from) return null;
   return { id, from, text, type };
 }
@@ -8490,19 +8511,21 @@ function newestDirectActivityIso(...values) {
 
 function serializeDirectMessage(row) {
   if (!row) return null;
-  const content = normalizeDirectMessageMedia(row.content);
-  const type = normalizeDirectMessageType(row.message_type || row.type, content);
+  const pollType = String(row.message_type || row.type || '') === 'poll';
+  const content = pollType ? normalizeDirectPoll(row.content, true) : normalizeDirectMessageMedia(row.content);
+  const type = pollType ? 'poll' : normalizeDirectMessageType(row.message_type || row.type, content);
   return {
     id: String(row.id || ''),
     from: normalizeDirectMessageUser(row.sender_name || row.from),
     to: normalizeDirectMessageUser(row.recipient_name || row.to),
     text: String(row.text == null ? '' : row.text).slice(0, DIRECT_MESSAGE_TEXT_MAX),
     type,
-    content: content.length ? content : null,
+    content: type === 'poll' ? content : (content.length ? content : null),
     replyTo: normalizeDirectMessageReply(row.reply_to || row.replyTo),
     reactions: normalizeDirectMessageReactions(row.reactions),
     createdAt: row.created_at ? new Date(row.created_at).toISOString() : (row.createdAt || new Date().toISOString()),
     editedAt: row.edited_at ? new Date(row.edited_at).toISOString() : (row.editedAt || null),
+    pinnedAt: row.pinned_at ? new Date(row.pinned_at).toISOString() : (row.pinnedAt || null),
     seenAt: row.seen_at ? new Date(row.seen_at).toISOString() : (row.seenAt || null)
   };
 }
@@ -8645,7 +8668,7 @@ async function getDirectConversationPayload(userName) {
       FROM direct_conversation_delete_state
       WHERE user_name = $1
     ), relevant AS (
-      SELECT dm.id, dm.sender_name, dm.recipient_name, dm.text, dm.message_type, dm.content, dm.reply_to, dm.reactions, dm.edited_at, dm.created_at,
+      SELECT dm.id, dm.sender_name, dm.recipient_name, dm.text, dm.message_type, dm.content, dm.reply_to, dm.reactions, dm.pinned_at, dm.edited_at, dm.created_at,
              CASE WHEN dm.sender_name = $1 THEN dm.recipient_name ELSE dm.sender_name END AS peer_name
       FROM direct_messages dm
       LEFT JOIN delete_state ds
@@ -8654,7 +8677,7 @@ async function getDirectConversationPayload(userName) {
         AND dm.id > COALESCE(ds.deleted_through_id, 0)
     ), latest AS (
       SELECT DISTINCT ON (peer_name)
-             peer_name, id, sender_name, recipient_name, text, message_type, content, reply_to, reactions, edited_at, created_at
+             peer_name, id, sender_name, recipient_name, text, message_type, content, reply_to, reactions, pinned_at, edited_at, created_at
       FROM relevant
       ORDER BY peer_name, id DESC
     ), unread AS (
@@ -8895,7 +8918,7 @@ async function getDirectHistoryPayload(userName, peerName, options = {}) {
       WHERE u.name = $2
       LIMIT 1
     ), history AS (
-      SELECT id, sender_name, recipient_name, text, message_type, content, reply_to, reactions, edited_at, created_at,
+      SELECT id, sender_name, recipient_name, text, message_type, content, reply_to, reactions, pinned_at, edited_at, created_at,
              COUNT(*) OVER () AS total_count
       FROM direct_messages
       WHERE ((sender_name = $1 AND recipient_name = $2)
@@ -8907,7 +8930,7 @@ async function getDirectHistoryPayload(userName, peerName, options = {}) {
     SELECT p.peer_name, p.peer_avatar, p.peer_last_seen, p.peer_message_activity_at, p.peer_online,
            p.my_last_read_id, p.peer_last_read_id, p.viewer_blocked, p.blocked_by_peer,
            h.id, h.sender_name, h.recipient_name, h.text, h.message_type, h.content,
-           h.reply_to, h.reactions, h.edited_at, h.created_at, h.total_count
+           h.reply_to, h.reactions, h.pinned_at, h.edited_at, h.created_at, h.total_count
     FROM peer p
     LEFT JOIN history h ON TRUE
     ORDER BY h.id DESC NULLS LAST
@@ -8932,6 +8955,20 @@ async function getDirectHistoryPayload(userName, peerName, options = {}) {
   }
 
   await attachDirectSeenEvents(messages, viewer, peerLastReadId);
+  let pinnedMessages = [];
+  try {
+    const pinnedResult = await queryDbWithRetry(`
+      SELECT id, sender_name, recipient_name, text, message_type, content, reply_to, reactions, pinned_at, edited_at, created_at
+      FROM direct_messages
+      WHERE pinned_at IS NOT NULL
+        AND ((sender_name = $1 AND recipient_name = $2) OR (sender_name = $2 AND recipient_name = $1))
+        AND id > COALESCE((SELECT deleted_through_id FROM direct_conversation_delete_state WHERE user_name = $1 AND peer_name = $2), 0)
+      ORDER BY pinned_at DESC LIMIT 10
+    `, [viewer, peer], { attempts:2, label:'DIRECT PINNED HISTORY' });
+    pinnedMessages = (pinnedResult.rows || []).map(serializeDirectMessage).filter(Boolean);
+  } catch (err) {
+    console.warn('[DIRECT PINNED HISTORY]:', err && err.message || err);
+  }
 
   return {
     success:true,
@@ -8942,6 +8979,7 @@ async function getDirectHistoryPayload(userName, peerName, options = {}) {
       lastSeen:newestDirectActivityIso(first.peer_last_seen, first.peer_message_activity_at)
     },
     messages,
+    pinnedMessages,
     messageCount:Math.max(messages.length, Math.max(0, Number(first.total_count) || 0)),
     myLastReadId:String(myLastReadId || 0),
     previousMyLastReadId:String(previousMyLastReadId || 0),
@@ -9459,7 +9497,7 @@ async function initProfileSyncNotifications() {
           if (!messageId || !from || !to) return;
           if (!getSocketsByUserName(from).length && !getSocketsByUserName(to).length) return;
           const directResult = await queryDbWithRetry(
-            'SELECT id, sender_name, recipient_name, text, message_type, content, reply_to, reactions, edited_at, created_at FROM direct_messages WHERE id = $1 LIMIT 1',
+            'SELECT id, sender_name, recipient_name, text, message_type, content, reply_to, reactions, pinned_at, edited_at, created_at FROM direct_messages WHERE id = $1 LIMIT 1',
             [messageId],
             { attempts:2, label:'DIRECT MESSAGE SYNC READ' }
           );
@@ -13941,7 +13979,7 @@ io.on('connection', (socket) => {
           FROM direct_conversation_delete_state
           WHERE user_name = $1
         ), visible AS (
-          SELECT dm.id, dm.sender_name, dm.recipient_name, dm.text, dm.message_type, dm.content, dm.reply_to, dm.reactions, dm.edited_at, dm.created_at,
+          SELECT dm.id, dm.sender_name, dm.recipient_name, dm.text, dm.message_type, dm.content, dm.reply_to, dm.reactions, dm.pinned_at, dm.edited_at, dm.created_at,
                  CASE WHEN dm.sender_name = $1 THEN dm.recipient_name ELSE dm.sender_name END AS peer_name,
                  MAX(CASE WHEN dm.recipient_name = $1 THEN dm.created_at END) OVER (
                    PARTITION BY CASE WHEN dm.sender_name = $1 THEN dm.recipient_name ELSE dm.sender_name END
@@ -14045,13 +14083,16 @@ io.on('connection', (socket) => {
     const recipient = normalizeDirectMessageUser(data.to || data.recipient || data.user);
     if (sender && recipient && normalizeDirectMessageUser(socket.__directTypingPeer) === recipient) stopDirectTypingForSocket(socket, recipient);
     const text = normalizeDirectMessageText(data.text);
-    const content = normalizeDirectMessageMedia(data.content);
-    const messageType = normalizeDirectMessageType(data.type, content);
+    const isPoll = String(data.type || '') === 'poll';
+    const poll = isPoll ? normalizeDirectPoll(data.content) : null;
+    const content = isPoll ? [] : normalizeDirectMessageMedia(data.content);
+    const messageType = isPoll ? 'poll' : normalizeDirectMessageType(data.type, content);
 
     if (socket.__passwordResetRevoked === true) return respond({ success:false, reason:'password_reset', message:'Your session has ended.' });
     if (!sender) return respond({ success:false, message:'Authentication required.' });
     if (!recipient || recipient === sender) return respond({ success:false, message:'Invalid recipient.' });
-    if (!directMessagePlainText(text) && !content.length) return respond({ success:false, message:'Type a message or attach media first.' });
+    if (isPoll && !poll) return respond({ success:false, message:'Enter a question and 2–4 valid options.' });
+    if (!isPoll && !directMessagePlainText(text) && !content.length) return respond({ success:false, message:'Type a message or attach media first.' });
 
     const directNow = Date.now();
     const directLastAt = Math.max(0, Number(socket.__directMessageLastAt) || 0);
@@ -14079,7 +14120,7 @@ io.on('connection', (socket) => {
       const replyId = Math.max(0, Number(data && data.replyTo && typeof data.replyTo === 'object' ? data.replyTo.id : data.replyTo) || 0);
       if (replyId) {
         const replyResult = await queryDbWithRetry(`
-          SELECT id, sender_name, recipient_name, text, message_type, content, reply_to, reactions, edited_at, created_at
+          SELECT id, sender_name, recipient_name, text, message_type, content, reply_to, reactions, pinned_at, edited_at, created_at
           FROM direct_messages
           WHERE id = $1
             AND ((sender_name = $2 AND recipient_name = $3) OR (sender_name = $3 AND recipient_name = $2))
@@ -14089,7 +14130,7 @@ io.on('connection', (socket) => {
         if (replyMessage) replySnapshot = {
           id:replyMessage.id,
           from:replyMessage.from,
-          text:directMessagePlainText(replyMessage.text).slice(0, DIRECT_MESSAGE_REPLY_TEXT_MAX),
+          text:(replyMessage.type === 'poll' ? String(replyMessage.content?.question || '') : directMessagePlainText(replyMessage.text)).slice(0, DIRECT_MESSAGE_REPLY_TEXT_MAX),
           type:replyMessage.type || 'text'
         };
       }
@@ -14102,8 +14143,8 @@ io.on('connection', (socket) => {
           WHERE (blocker_name = $1 AND blocked_name = $2)
              OR (blocker_name = $2 AND blocked_name = $1)
         )
-        RETURNING id, sender_name, recipient_name, text, message_type, content, reply_to, reactions, edited_at, created_at
-      `, [sender, recipient, text, messageType, content.length ? JSON.stringify(content) : null, replySnapshot ? JSON.stringify(replySnapshot) : null], { attempts:2, label:'DIRECT MESSAGE INSERT' });
+        RETURNING id, sender_name, recipient_name, text, message_type, content, reply_to, reactions, pinned_at, edited_at, created_at
+      `, [sender, recipient, isPoll ? '📊 Created a poll.' : text, messageType, isPoll ? JSON.stringify(poll) : (content.length ? JSON.stringify(content) : null), replySnapshot ? JSON.stringify(replySnapshot) : null], { attempts:2, label:'DIRECT MESSAGE INSERT' });
       const message = serializeDirectMessage(inserted.rows[0]);
       if (!message) return respond({ success:false, reason:'blocked', message:'This Private Chat is blocked.' });
 
@@ -14127,6 +14168,97 @@ io.on('connection', (socket) => {
     }
   });
 
+  socket.on('direct_message_poll_edit', async (data = {}, callback) => {
+    const respond = typeof callback === 'function' ? callback : () => {};
+    const actor = normalizeDirectMessageUser(socket.userName);
+    const id = Math.max(0, Number(data.id || data.messageId) || 0);
+    const input = normalizeDirectPoll(data.content);
+    if (!actor || !id || !input) return respond({ success:false, message:'Invalid poll.' });
+    let db = null;
+    try {
+      db = await pool.connect();
+      await db.query('BEGIN');
+      const found = await db.query(`
+        SELECT id, sender_name, recipient_name, message_type, content
+        FROM direct_messages dm
+        WHERE id=$1 AND sender_name=$2 AND message_type='poll'
+          AND NOT EXISTS (SELECT 1 FROM direct_user_blocks b WHERE (b.blocker_name=dm.sender_name AND b.blocked_name=dm.recipient_name) OR (b.blocker_name=dm.recipient_name AND b.blocked_name=dm.sender_name))
+        FOR UPDATE
+      `, [id, actor]);
+      const previous = normalizeDirectPoll(found.rows[0] && found.rows[0].content, true);
+      if (!previous) { await db.query('ROLLBACK'); return respond({ success:false, message:'You can only edit your own poll.' }); }
+      input.options.forEach((option, index) => { option.voters = previous.options[index] ? previous.options[index].voters.slice() : []; });
+      input.totalVotes = input.options.reduce((sum, option) => sum + option.voters.length, 0);
+      const updated = await db.query(`UPDATE direct_messages SET content=$2::jsonb, edited_at=NOW() WHERE id=$1 RETURNING id, sender_name, recipient_name, text, message_type, content, reply_to, reactions, pinned_at, edited_at, created_at`, [id, JSON.stringify(input)]);
+      await db.query('COMMIT'); db.release(); db = null;
+      const message = serializeDirectMessage(updated.rows[0]);
+      emitDirectMessageUpdateToLocalUsers(message, socket.id);
+      deferServerTask('DIRECT POLL EDIT NOTIFY', () => notifyDirectMessageAcrossInstances('update', message), 0);
+      respond({ success:true, message });
+    } catch (err) {
+      if (db) { try { await db.query('ROLLBACK'); } catch (_) {} }
+      console.error('[DIRECT POLL EDIT ERROR]', err && err.message || err);
+      respond({ success:false, message:'Could not edit poll.' });
+    } finally { if (db) db.release(); }
+  });
+
+  socket.on('direct_message_poll_vote', async (data = {}, callback) => {
+    const respond = typeof callback === 'function' ? callback : () => {};
+    const actor = normalizeDirectMessageUser(socket.userName);
+    const id = Math.max(0, Number(data.id || data.messageId) || 0);
+    const index = Number(data.optionIndex);
+    if (!actor || !id || !Number.isInteger(index) || index < 0 || index >= 4) return respond({ success:false, message:'Invalid vote.' });
+    let db = null;
+    try {
+      db = await pool.connect();
+      await db.query('BEGIN');
+      const found = await db.query(`SELECT id, sender_name, recipient_name, text, message_type, content, reply_to, reactions, pinned_at, edited_at, created_at FROM direct_messages WHERE id=$1 AND (sender_name=$2 OR recipient_name=$2) AND NOT EXISTS (SELECT 1 FROM direct_user_blocks b WHERE (b.blocker_name=sender_name AND b.blocked_name=recipient_name) OR (b.blocker_name=recipient_name AND b.blocked_name=sender_name)) FOR UPDATE`, [id, actor]);
+      const row = found.rows[0];
+      const poll = row && row.message_type === 'poll' ? normalizeDirectPoll(row.content, true) : null;
+      if (!poll || !poll.options[index]) { await db.query('ROLLBACK'); return respond({ success:false, message:'Poll unavailable.' }); }
+      const previous = poll.options.findIndex(option => option.voters.includes(actor));
+      if (previous === index) { await db.query('COMMIT'); return respond({ success:true, message:serializeDirectMessage(row) }); }
+      poll.options.forEach(option => { option.voters = option.voters.filter(voter => voter !== actor); });
+      poll.options[index].voters.push(actor);
+      poll.totalVotes = poll.options.reduce((total, option) => total + option.voters.length, 0);
+      const updated = await db.query(`UPDATE direct_messages SET content=$2::jsonb WHERE id=$1 RETURNING id, sender_name, recipient_name, text, message_type, content, reply_to, reactions, pinned_at, edited_at, created_at`, [id, JSON.stringify(poll)]);
+      await db.query('COMMIT'); db.release(); db = null;
+      const message = serializeDirectMessage(updated.rows[0]);
+      emitDirectMessageUpdateToLocalUsers(message, socket.id);
+      deferServerTask('DIRECT POLL NOTIFY', () => notifyDirectMessageAcrossInstances('update', message), 0);
+      respond({ success:true, message });
+    } catch (err) {
+      if (db) { try { await db.query('ROLLBACK'); } catch (_) {} }
+      console.error('[DIRECT POLL VOTE ERROR]', err && err.message || err);
+      respond({ success:false, message:'Could not register the vote.' });
+    } finally { if (db) db.release(); }
+  });
+
+  socket.on('direct_message_pin', async (data = {}, callback) => {
+    const respond = typeof callback === 'function' ? callback : () => {};
+    const actor = normalizeDirectMessageUser(socket.userName);
+    const id = Math.max(0, Number(data.id || data.messageId) || 0);
+    const pinned = data.pinned === true;
+    if (!actor || !id) return respond({ success:false, message:'Invalid message.' });
+    try {
+      const result = await queryDbWithRetry(`
+        UPDATE direct_messages dm SET pinned_at = CASE WHEN $3 THEN NOW() ELSE NULL END
+        WHERE dm.id = $1 AND (dm.sender_name = $2 OR dm.recipient_name = $2)
+          AND NOT EXISTS (SELECT 1 FROM direct_user_blocks b WHERE (b.blocker_name=dm.sender_name AND b.blocked_name=dm.recipient_name) OR (b.blocker_name=dm.recipient_name AND b.blocked_name=dm.sender_name))
+          AND (NOT $3 OR dm.pinned_at IS NOT NULL OR (SELECT COUNT(*) FROM direct_messages dm2 WHERE dm2.pinned_at IS NOT NULL AND ((dm2.sender_name=dm.sender_name AND dm2.recipient_name=dm.recipient_name) OR (dm2.sender_name=dm.recipient_name AND dm2.recipient_name=dm.sender_name))) < 10)
+        RETURNING id, sender_name, recipient_name, text, message_type, content, reply_to, reactions, pinned_at, edited_at, created_at
+      `, [id, actor, pinned], { attempts:2, label:'DIRECT PIN UPDATE' });
+      const message = serializeDirectMessage(result.rows[0]);
+      if (!message) return respond({ success:false, message:'Message unavailable, blocked or maximum 10 pins reached.' });
+      emitDirectMessageUpdateToLocalUsers(message, socket.id);
+      deferServerTask('DIRECT PIN NOTIFY', () => notifyDirectMessageAcrossInstances('update', message), 0);
+      respond({ success:true, message });
+    } catch (err) {
+      console.error('[DIRECT PIN ERROR]', err && err.message || err);
+      respond({ success:false, message:'Could not update the pinned message.' });
+    }
+  });
+
   socket.on('direct_message_reaction', async (data = {}, callback) => {
     const respond = typeof callback === 'function' ? callback : () => {};
     const actor = normalizeDirectMessageUser(socket.userName);
@@ -14139,7 +14271,7 @@ io.on('connection', (socket) => {
       client = await pool.connect();
       await client.query('BEGIN');
       const found = await client.query(`
-        SELECT id, sender_name, recipient_name, text, message_type, content, reply_to, reactions, edited_at, created_at
+        SELECT id, sender_name, recipient_name, text, message_type, content, reply_to, reactions, pinned_at, edited_at, created_at
         FROM direct_messages dm
         WHERE id = $1 AND (sender_name = $2 OR recipient_name = $2)
           AND NOT EXISTS (
@@ -14173,7 +14305,7 @@ io.on('connection', (socket) => {
       const next = reactions.filter(item => Array.isArray(item.users) && item.users.length);
       const updated = await client.query(`
         UPDATE direct_messages SET reactions = $2::jsonb WHERE id = $1
-        RETURNING id, sender_name, recipient_name, text, message_type, content, reply_to, reactions, edited_at, created_at
+        RETURNING id, sender_name, recipient_name, text, message_type, content, reply_to, reactions, pinned_at, edited_at, created_at
       `, [messageId, JSON.stringify(next)]);
       await client.query('COMMIT');
       const message = serializeDirectMessage(updated.rows && updated.rows[0]);
@@ -14217,7 +14349,7 @@ io.on('connection', (socket) => {
     if (!actor || !messageId) return respond({ success:false, message:'Invalid message.' });
     try {
       const current = await queryDbWithRetry(`
-        SELECT dm.id, dm.sender_name, dm.recipient_name, dm.text, dm.message_type, dm.content, dm.reply_to, dm.reactions, dm.edited_at, dm.created_at
+        SELECT dm.id, dm.sender_name, dm.recipient_name, dm.text, dm.message_type, dm.content, dm.reply_to, dm.reactions, dm.pinned_at, dm.edited_at, dm.created_at
         FROM direct_messages dm
         WHERE dm.id = $1 AND dm.sender_name = $2
           AND NOT EXISTS (
@@ -14229,11 +14361,12 @@ io.on('connection', (socket) => {
       `, [messageId, actor], { attempts:2, label:'DIRECT EDIT READ' });
       const existing = serializeDirectMessage(current.rows && current.rows[0]);
       if (!existing) return respond({ success:false, message:'You can only edit your own messages while the Private Chat is available.' });
+      if (existing.type === 'poll') return respond({ success:false, message:'Poll questions cannot be edited after voting begins.' });
       if (!directMessagePlainText(text) && !(Array.isArray(existing.content) && existing.content.length)) return respond({ success:false, message:'A message cannot be empty.' });
       const updated = await queryDbWithRetry(`
         UPDATE direct_messages SET text = $3, edited_at = NOW()
         WHERE id = $1 AND sender_name = $2
-        RETURNING id, sender_name, recipient_name, text, message_type, content, reply_to, reactions, edited_at, created_at
+        RETURNING id, sender_name, recipient_name, text, message_type, content, reply_to, reactions, pinned_at, edited_at, created_at
       `, [messageId, actor, text], { attempts:2, label:'DIRECT EDIT UPDATE' });
       const message = serializeDirectMessage(updated.rows && updated.rows[0]);
       if (!message) return respond({ success:false, message:'Could not edit the message.' });
