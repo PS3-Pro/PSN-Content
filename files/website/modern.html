@@ -672,6 +672,8 @@ html.ios-webkit #friends-list-grid > .online-user-item:not(.friend-removing):not
 html.ios-webkit #object-particles { contain:strict; }
 .game-card { --card-glow-x: 50%; --card-glow-y: 38%; background-color: var(--card-surface-bg); border: 1px solid var(--psn-surface-border); border-radius: var(--psn-radius-card); overflow: hidden; cursor: pointer; display: flex; flex-direction: column; transform: translateY(0) translateZ(0); backface-visibility: hidden; transition: transform 0.3s ease-out,box-shadow 0.3s ease-out,border-color .22s ease; box-shadow: inset 0 1px 0 var(--psn-surface-highlight),0 4px 12px rgba(0,0,0,.08); backdrop-filter: var(--card-surface-blur); -webkit-backdrop-filter: var(--card-surface-blur); }
 .game-card.anim-reveal { opacity: 0; animation: tileReveal 0.4s ease-out forwards; animation-delay: calc(var(--tile-idx,0) * 0.04s); }
+#view-trending.trending-entry-reveal-prep #trending-dl-grid > .game-card,
+#view-trending.trending-entry-reveal-prep #trending-wish-grid > .game-card { opacity:0 !important; animation:none !important; }
 #view-explore.explore-return-reveal-prep .horizontal-scroll:not([data-explore-skip-next-return-reveal="1"]) .game-card { opacity:0 !important; animation:none !important; }
 #subview-games.collection-entry-reveal-prep #ps3-local-grid>.game-card, #subview-favs.collection-entry-reveal-prep #ps3-favs-grid>.game-card { opacity:0 !important; animation:none !important; }
 .game-card.no-anim { opacity: 1; animation: none; transform: none; }
@@ -23357,7 +23359,11 @@ P
 			const replacingTrendingSkeletons = !!container.querySelector('.skeleton-card, .pulse-skeleton');
 			container.innerHTML = html;
 			container.dataset.trendingPrewarmed = prewarmOnly ? '1' : '0';
-			if (!prewarmOnly && typeof setupRevealAnimations === 'function') setupRevealAnimations(containerId, { immediate: replacingTrendingSkeletons, selector: ':scope > .game-card:nth-child(-n+8)' });
+			const entryRevealDone = container.dataset.trendingEntryRevealDone === '1' && isTrendingViewVisible();
+			if (!prewarmOnly && !entryRevealDone && typeof setupRevealAnimations === 'function') {
+				setupRevealAnimations(containerId, { immediate: replacingTrendingSkeletons, selector: ':scope > .game-card:nth-child(-n+8)' });
+				if (isTrendingViewVisible()) container.dataset.trendingEntryRevealDone = '1';
+			}
 		}
 	};
     
@@ -50155,6 +50161,7 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 		if (window.trophyAnimationTimer) { clearTimeout(window.trophyAnimationTimer); window.trophyAnimationTimer = null; }
 	
 		const target = PSN_VIEW_BY_ID.get(viewId) || document.getElementById(viewId);
+		if (viewId !== 'view-trending') document.getElementById('view-trending')?.classList.remove('trending-entry-reveal-prep');
 		const currentManagedView = getCurrentPsnViewElement();
 		if (currentManagedView && currentManagedView.isConnected) {
 			if (currentManagedView.style.display !== 'none') currentManagedView.style.display = 'none';
@@ -50173,8 +50180,7 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 		}
 
 		let preArmedWishlistReveal = false;
-		let preArmedTrendingDlReveal = false;
-		let preArmedTrendingWishReveal = false;
+		let trendingEntryRevealPrepared = false;
 		let preArmedExploreReveal = false;
 		if (!window.isRestoringHistory && viewId === 'view-wishlist') {
 			const wishlistGrid = document.getElementById('wishlist-grid');
@@ -50184,15 +50190,26 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 				preArmedWishlistReveal = preArmCachedCardReveal(wishlistGrid, ':scope > .game-card:nth-child(-n+18)');
 			}
 		}
-		if (!window.isRestoringHistory && viewId === 'view-trending' && window.__pendingTrendingData) {
+		if (!window.isRestoringHistory && viewId === 'view-trending') {
+			const trendingView = document.getElementById('view-trending');
 			const dlGrid = document.getElementById('trending-dl-grid');
 			const wishGrid = document.getElementById('trending-wish-grid');
-			const dlKey = getTrendingListSignature(window.__pendingTrendingData.topDownloads || []);
-			const wishKey = getTrendingListSignature(window.__pendingTrendingData.topWishlist || []);
-			const canReuseDl = !!(dlGrid && window.trendingCache && window.trendingCache['trending-dl-grid'] === dlKey && dlGrid.querySelector(':scope > .game-card'));
-			const canReuseWish = !!(wishGrid && window.trendingCache && window.trendingCache['trending-wish-grid'] === wishKey && wishGrid.querySelector(':scope > .game-card'));
-			if (canReuseDl) preArmedTrendingDlReveal = preArmCachedCardReveal(dlGrid, ':scope > .game-card:nth-child(-n+8)');
-			if (canReuseWish) preArmedTrendingWishReveal = preArmCachedCardReveal(wishGrid, ':scope > .game-card:nth-child(-n+8)');
+			if (trendingView) {
+				trendingView.classList.add('trending-entry-reveal-prep');
+				trendingEntryRevealPrepared = true;
+			}
+			for (const grid of [dlGrid, wishGrid]) {
+				if (grid) grid.dataset.trendingEntryRevealDone = '0';
+			}
+			if (window.__pendingTrendingData && typeof renderTrendingCarousel === 'function') {
+				renderTrendingCarousel('trending-dl-grid', window.__pendingTrendingData.topDownloads, 'fas fa-download', { prewarm:true });
+				renderTrendingCarousel('trending-wish-grid', window.__pendingTrendingData.topWishlist, 'fas fa-heart', { prewarm:true });
+			} else {
+				for (const grid of [dlGrid, wishGrid]) {
+					if (!grid || grid.querySelector(':scope > .game-card, :scope > .skeleton-card')) continue;
+					grid.innerHTML = getCardSkeletonHTML(5);
+				}
+			}
 		}
 		const exploreReturnRevealView = document.getElementById('view-explore');
 		if (viewId !== 'view-explore' && exploreReturnRevealView) {
@@ -50235,9 +50252,20 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 			if (preArmedWishlistReveal && typeof setupRevealAnimations === 'function') {
 				setupRevealAnimations('wishlist-grid', { selector: ':scope > .game-card:nth-child(-n+18)', immediate: true });
 			}
-			if (typeof setupRevealAnimations === 'function') {
-				if (preArmedTrendingDlReveal) setupRevealAnimations('trending-dl-grid', { selector: ':scope > .game-card:nth-child(-n+8)', immediate: true });
-				if (preArmedTrendingWishReveal) setupRevealAnimations('trending-wish-grid', { selector: ':scope > .game-card:nth-child(-n+8)', immediate: true });
+			if (trendingEntryRevealPrepared) {
+				for (const id of ['trending-dl-grid', 'trending-wish-grid']) {
+					const grid = document.getElementById(id);
+					if (!grid) continue;
+					if (grid.querySelector(':scope > .game-card')) {
+						if (typeof setupRevealAnimations === 'function') {
+							setupRevealAnimations(id, { selector: ':scope > .game-card:nth-child(-n+8)', immediate: true });
+						}
+						grid.dataset.trendingEntryRevealDone = '1';
+					} else if (typeof setupSkeletonAnimations === 'function') {
+						setupSkeletonAnimations(id);
+					}
+				}
+				target.classList.remove('trending-entry-reveal-prep');
 			}
 			
 			if (!window.isRestoringHistory) {
