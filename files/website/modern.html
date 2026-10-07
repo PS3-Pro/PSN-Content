@@ -574,7 +574,7 @@ select option { background-color: var(--bg-dark); }
 .browse-nav-actions { display: flex; align-items: center; justify-content: flex-end; gap: 8px; margin-left: 10px; }
 .browse-nav-return-bar.has-back-button { padding: 0 12px 0 0 !important; }
 .browse-nav-return-bar.has-back-button .back-btn { align-self: stretch; margin: 0; padding: 0 15px; border-radius: 8px; }
-.browse-nav-return-bar.has-back-button .back-btn:hover { transform: none; }
+.browse-nav-return-bar.has-back-button .back-btn:hover, .browse-nav-return-bar.has-back-button .back-btn:focus-visible { transform:none; background:color-mix(in srgb,var(--ps-blue) 72%,#000 28%); color:#fff; box-shadow:inset 0 0 0 1px rgba(255,255,255,.28),inset 0 1px 0 rgba(255,255,255,.10); }
 .browse-nav-return-bar .back-btn-label { display: block; flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .browse-title-main { display: inline-flex; align-items: baseline; flex-wrap: nowrap; gap: 0; min-width: 0; }
 .browse-title-text { flex: 0 0 auto; white-space: nowrap; }
@@ -41613,12 +41613,13 @@ P
 		return pill;
 	};
 
-	window.setSidebarCountPill = function(type, rawCount) {
+	window.setSidebarCountPill = function(type, rawCount, options = {}) {
 		const pillId = String(type || '').replace(/[A-Z]/g, letter => `-${letter.toLowerCase()}`);
 		const pill = document.getElementById(`sidebar-count-${pillId}`);
 		if (!pill) return;
 		const activeUser = String(localStorage.getItem('psn_username') || '');
 		const previousRawCount = pill.dataset.rawCount ?? '';
+		const previousDisplayedText = String(pill.textContent || '');
 		const hadInitialized = pill.dataset.countInitialized === '1' && (pill.dataset.countOwner || '') === activeUser;
 		const nextRawCount = (rawCount === null || rawCount === undefined) ? '' : String(Math.max(0, Number(rawCount) || 0));
 		const labels = { browse:'database item', wishlist:'wishlist item', playTogether:'Play Together game', downloads:'download', revived:'server', chat:'chat message', messages:'conversation', friends:'friend', activity:'activity', notifications:'notification', trophies:'trophy', rewards:'reward', games:'game', favorites:'favorite', admin:'pending report' };
@@ -41657,7 +41658,8 @@ P
 		const nextTitle = `${count.toLocaleString('en-US')} ${label}${suffix}`;
 		if (pill.title !== nextTitle) pill.title = nextTitle;
 		if (pill.getAttribute('aria-label') !== nextTitle) pill.setAttribute('aria-label', nextTitle);
-		if (hadInitialized && previousRawCount !== nextRawCount && typeof window.animateCountPillFeedback === 'function') {
+		const countChanged = type === 'admin' ? previousDisplayedText !== nextPillText : previousRawCount !== nextRawCount;
+		if (hadInitialized && countChanged && options.suppressAnimation !== true && typeof window.animateCountPillFeedback === 'function') {
 			window.animateCountPillFeedback(pill);
 		}
 		pill.dataset.countInitialized = '1';
@@ -47352,6 +47354,7 @@ P
 			.sort((a, b) => Date.parse(b.updatedAt || '') - Date.parse(a.updatedAt || ''))
 			.slice(0, 200);
 		window.adminMetadataSuggestionsLastSyncAt = Date.now();
+		if (typeof window.adminMarkPendingSidebarSourceReady === 'function') window.adminMarkPendingSidebarSourceReady('metadata');
 		adminUpdateMetadataCorrectionCount();
 		if (document.getElementById('view-admin')?.style.display === 'block') adminRenderMetadataSuggestions();
 	}
@@ -48446,6 +48449,41 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 		if (typeof window.refreshAdminPendingIndicator === 'function') window.refreshAdminPendingIndicator();
 	}
 
+
+	function adminPendingSidebarHydration() {
+		const owner = String(localStorage.getItem('psn_username') || '');
+		const connectionId = typeof socketChat !== 'undefined' && socketChat && socketChat.connected ? String(socketChat.id || '') : '';
+		let state = window.__adminPendingSidebarHydration;
+		if (!state || state.owner !== owner || (connectionId && state.connectionId && connectionId !== state.connectionId)) {
+			state = { owner, connectionId, contentReady:false, metadataReady:false, published:!!(state && state.owner === owner && state.published) };
+			window.__adminPendingSidebarHydration = state;
+		} else if (connectionId && !state.connectionId) state.connectionId = connectionId;
+		return state;
+	}
+
+	function adminEnsurePendingSidebarHydration(state) {
+		if (state.contentReady && state.metadataReady || state.requested || state.requestTimer) return;
+		state.requestTimer = setTimeout(() => {
+			state.requestTimer = null;
+			if (adminPendingSidebarHydration() !== state || !document.body.classList.contains('is-admin')) return;
+			if (typeof socketChat === 'undefined' || !socketChat || !socketChat.connected || !window.isProfileLoaded) {
+				if ((state.retries || 0) < 6) { state.retries = (state.retries || 0) + 1; adminEnsurePendingSidebarHydration(state); }
+				return;
+			}
+			state.requested = true;
+			if (!state.contentReady && typeof window.adminRequestContentReports === 'function') window.adminRequestContentReports(true, true);
+			if (!state.metadataReady && typeof window.adminRequestMetadataSuggestions === 'function') window.adminRequestMetadataSuggestions(true, true);
+		}, state.retries ? 450 : 1200);
+	}
+
+	window.adminMarkPendingSidebarSourceReady = function(source) {
+		const state = adminPendingSidebarHydration();
+		if (source === 'content') state.contentReady = true;
+		else if (source === 'metadata') state.metadataReady = true;
+		if (state.contentReady && state.metadataReady && state.requestTimer) { clearTimeout(state.requestTimer); state.requestTimer = null; }
+		if (typeof window.refreshAdminPendingIndicator === 'function') window.refreshAdminPendingIndicator();
+	};
+
 	function getAdminPendingActionCounts() {
 		const contentReports = Number.isFinite(Number(window.__adminStoreReportCount))
 			? Math.max(0, Number(window.__adminStoreReportCount))
@@ -48555,8 +48593,16 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 
 	window.refreshAdminPendingIndicator = function(options = {}) {
 		const dot = document.getElementById('admin-dot');
-		const counts = getAdminPendingActionCounts();
 		const isAdmin = document.body.classList.contains('is-admin');
+		const hydration = adminPendingSidebarHydration();
+		if (isAdmin && (!hydration.contentReady || !hydration.metadataReady)) {
+			if (dot) dot.style.display = 'none';
+			const pill = document.getElementById('sidebar-count-admin');
+			if (pill && (pill.dataset.countOwner || '') !== hydration.owner && typeof window.setSidebarCountPill === 'function') window.setSidebarCountPill('admin', null, { suppressAnimation:true });
+			adminEnsurePendingSidebarHydration(hydration);
+			return false;
+		}
+		const counts = getAdminPendingActionCounts();
 		const adminVisible = isAdmin && document.getElementById('view-admin')?.style.display === 'block';
 		const tokens = getAdminPendingTokens();
 		const state = getAdminPendingSeenRuntime();
@@ -48582,7 +48628,8 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 			else dot.title = counts.total > 0 ? 'Admin items already seen' : 'No pending admin review';
 		}
 		if (typeof window.setSidebarCountPill === 'function') {
-			window.setSidebarCountPill('admin', isAdmin ? counts.total : null);
+			window.setSidebarCountPill('admin', isAdmin ? counts.total : null, { suppressAnimation:!hydration.published });
+			if (isAdmin) hydration.published = true;
 			const pill = document.getElementById('sidebar-count-admin');
 			if (pill) pill.title = counts.total === 1 ? '1 pending admin item' : `${counts.total} pending admin items`;
 		}
@@ -48627,9 +48674,9 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 		return CONTENT_REPORT_REASON_LABELS[String(reason || '')] || String(reason || 'Unknown problem').replace(/_/g, ' ');
 	}
 
-	window.adminRequestContentReports = function(silent = false) {
+	window.adminRequestContentReports = function(silent = false, force = false) {
 		if (!adminGuard(!silent)) return;
-		if (silent && Date.now() - Number(window.adminContentReportsLastSyncAt || 0) < 30000) return true;
+		if (silent && !force && Date.now() - Number(window.adminContentReportsLastSyncAt || 0) < 30000) return true;
 		if (typeof socketChat === 'undefined' || !socketChat || !socketChat.connected) {
 			if (!silent) {
 				if (typeof playUiError === 'function') playUiError();
@@ -48645,7 +48692,10 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 				}
 				return;
 			}
-			if (Array.isArray(response.reports)) adminSetContentReports(response.reports);
+			if (Array.isArray(response.reports)) {
+				adminSetContentReports(response.reports);
+				if (typeof window.adminMarkPendingSidebarSourceReady === 'function') window.adminMarkPendingSidebarSourceReady('content');
+			}
 			if (Array.isArray(response.blockedContent)) adminSetContentBlocks(response.blockedContent);
 			if (document.getElementById('view-admin')?.style.display === 'block') adminRenderContentReportPanels();
 			if (!silent) {
@@ -49357,6 +49407,7 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 				const currentContentReports = adminGetContentReports();
 				const sameContentReports = typeof window.getLiveRenderSignature === 'function' ? window.getLiveRenderSignature(currentContentReports) === window.getLiveRenderSignature(data.contentReports) : JSON.stringify(currentContentReports) === JSON.stringify(data.contentReports);
 				if (!sameContentReports) { adminSetContentReports(data.contentReports); contentPanelChanged = true; }
+				if (typeof window.adminMarkPendingSidebarSourceReady === 'function') window.adminMarkPendingSidebarSourceReady('content');
 			}
 			if (Array.isArray(data.metadataOverrides)) adminSetMetadataOverrides(data.metadataOverrides, { metadataInstanceId:data.metadataOverridesInstanceId, metadataRevision:data.metadataOverridesRevision });
 			if (Array.isArray(data.blockedContent)) {
@@ -49403,6 +49454,7 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 				const nextReports = Array.isArray(reports) ? reports.slice(0, 100) : [];
 				const current = adminGetContentReports();
 				const unchanged = typeof window.getLiveRenderSignature === 'function' ? window.getLiveRenderSignature(current) === window.getLiveRenderSignature(nextReports) : JSON.stringify(current) === JSON.stringify(nextReports);
+				if (typeof window.adminMarkPendingSidebarSourceReady === 'function') window.adminMarkPendingSidebarSourceReady('content');
 				if (unchanged) return;
 				adminSetContentReports(nextReports);
 				if (document.getElementById('view-admin')?.style.display === 'block') adminRenderContentReportPanels();
