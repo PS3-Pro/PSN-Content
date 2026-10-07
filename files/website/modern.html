@@ -22506,7 +22506,9 @@ P
     window.__bootStorePrefetchHighPriority = true;
 
     function startBootPreloads(reason = 'boot') {
-        const preLogin = window.__psnSessionEntryStarted !== true &&
+        const iosFrameFriendly = document.documentElement.classList.contains('ios-webkit');
+        const preLogin = iosFrameFriendly &&
+            window.__psnSessionEntryStarted !== true &&
             window.isProfileLoaded !== true &&
             !document.body?.classList.contains('psn-home-interactive');
         if (preLogin) {
@@ -22523,7 +22525,7 @@ P
         }
         if (window.__bootPreloadsStarted) return window.__bootPreloadsReadyPromise || Promise.resolve(window.psnStoreCache || {});
         window.__bootPreloadsStarted = true;
-        const cooperative = reason === 'authentication-start' || isBootLoginVisualActive();
+        const cooperative = iosFrameFriendly && (reason === 'authentication-start' || isBootLoginVisualActive());
         window.__bootStorePrefetchHighPriority = !cooperative;
         console.log(`[System] Boot preloads started (${reason}, ${cooperative ? 'frame-friendly' : 'full speed'}).`);
 
@@ -31077,7 +31079,7 @@ P
 
 	async function ensureStorePrefetchBeforeLogin(username = '') {
 		if (window.psnStorePrefetchReady) return window.psnStoreCache;
-		const cooperative = isBootLoginVisualActive();
+		const cooperative = document.documentElement.classList.contains('ios-webkit') && isBootLoginVisualActive();
 		if (!cooperative) window.__bootStorePrefetchHighPriority = true;
 		const welcomeMsg = document.getElementById('welcome-msg');
 		if (welcomeMsg) welcomeMsg.classList.remove('logging-text');
@@ -68484,8 +68486,14 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
         window.__chatHistoryRequestWatchdog = setTimeout(() => {
             if (window.__chatHistoryReceived === true || window.__chatHistoryRequesting !== true) return;
             window.__chatHistoryRequesting = false;
+            window.__chatSyncRequestPromise = null;
+            window.__chatCacheHydratePromise = null;
+            window.__chatCacheDbPromise = null;
+            window.__lastChatHistoryRequestAt = 0;
             window.__chatHistoryRequestRetries = Math.min(2, Number(window.__chatHistoryRequestRetries || 0) + 1);
-            if (window.__chatHistoryRequestRetries <= 2 && typeof isChatScreenVisibleForRead === 'function' && isChatScreenVisibleForRead()) requestChatHistoryNow('history-timeout-retry');
+            if (window.__chatHistoryRequestRetries <= 2 && typeof isChatScreenVisibleForRead === 'function' && isChatScreenVisibleForRead()) {
+                setTimeout(() => requestChatHistoryNow('history-timeout-retry'), 0);
+            }
         }, 35000);
         return true;
     }
@@ -68557,19 +68565,45 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
     function openChatPersistentCacheDb() {
         if (!('indexedDB' in window)) return Promise.resolve(null);
         if (window.__chatCacheDbPromise) return window.__chatCacheDbPromise;
-        window.__chatCacheDbPromise = new Promise(resolve => {
-            let request;
+
+        const openPromise = new Promise(resolve => {
+            let request = null;
+            let settled = false;
+            let timeout = 0;
+            const finish = value => {
+                if (settled) return;
+                settled = true;
+                if (timeout) clearTimeout(timeout);
+                resolve(value || null);
+            };
+            timeout = setTimeout(() => finish(null), 1800);
+
             try { request = indexedDB.open(CHAT_CACHE_DB_NAME, CHAT_CACHE_DB_VERSION); }
-            catch (err) { resolve(null); return; }
+            catch (err) { finish(null); return; }
+
             request.onupgradeneeded = () => {
                 const db = request.result;
                 if (!db.objectStoreNames.contains(CHAT_CACHE_STORE)) db.createObjectStore(CHAT_CACHE_STORE, { keyPath: 'user' });
             };
-            request.onsuccess = () => resolve(request.result);
-            request.onerror = () => resolve(null);
-            request.onblocked = () => resolve(null);
+            request.onsuccess = () => {
+                const db = request.result;
+                db.onversionchange = () => {
+                    try { db.close(); } catch (err) {}
+                    if (window.__chatCacheDbPromise === openPromise) window.__chatCacheDbPromise = null;
+                };
+                finish(db);
+            };
+            request.onerror = () => finish(null);
+            request.onblocked = () => finish(null);
         });
-        return window.__chatCacheDbPromise;
+
+        window.__chatCacheDbPromise = openPromise;
+        openPromise.then(db => {
+            if (!db && window.__chatCacheDbPromise === openPromise) window.__chatCacheDbPromise = null;
+        }).catch(() => {
+            if (window.__chatCacheDbPromise === openPromise) window.__chatCacheDbPromise = null;
+        });
+        return openPromise;
     }
 
     async function readChatPersistentCache(userName = getChatCacheUserName()) {
@@ -68577,12 +68611,33 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
         const db = await openChatPersistentCacheDb();
         if (!db) return null;
         return new Promise(resolve => {
+            let tx = null;
+            let settled = false;
+            let timeout = 0;
+            const finish = value => {
+                if (settled) return;
+                settled = true;
+                if (timeout) clearTimeout(timeout);
+                resolve(value || null);
+            };
+            timeout = setTimeout(() => {
+                try { if (tx) tx.abort(); } catch (err) {}
+                try { db.close(); } catch (err) {}
+                window.__chatCacheDbPromise = null;
+                finish(null);
+            }, 1800);
+
             try {
-                const tx = db.transaction(CHAT_CACHE_STORE, 'readonly');
+                tx = db.transaction(CHAT_CACHE_STORE, 'readonly');
                 const req = tx.objectStore(CHAT_CACHE_STORE).get(userName);
-                req.onsuccess = () => resolve(req.result || null);
-                req.onerror = () => resolve(null);
-            } catch (err) { resolve(null); }
+                req.onsuccess = () => finish(req.result || null);
+                req.onerror = () => finish(null);
+                tx.onabort = () => finish(null);
+                tx.onerror = () => finish(null);
+            } catch (err) {
+                window.__chatCacheDbPromise = null;
+                finish(null);
+            }
         });
     }
 
@@ -68819,7 +68874,18 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
                 Promise.resolve(renderDeferredChatHistory({ reason: 'chat-cache', force: true, forceBottom: false, showLoading: false })).catch(() => {});
             }
             return { hydrated: true, cached: true, messages: cachedHistory.length };
-        })().finally(() => { window.__chatCacheHydratePromise = null; });
+        })().catch(() => {
+            window.__chatCacheHydratedUser = userName;
+            window.__chatCacheHydratedHasCache = false;
+            window.__chatCacheEpoch = '';
+            window.__chatCacheRevision = 0;
+            window.__chatSeenCursor = 0;
+            window.__chatPersistentCacheAvailable = false;
+            window.__chatCacheReadyForWrite = false;
+            window.__chatInitialSnapshotPending = true;
+            window.__chatCacheDbPromise = null;
+            return { hydrated: true, cached: false };
+        }).finally(() => { window.__chatCacheHydratePromise = null; });
         return window.__chatCacheHydratePromise;
     }
     window.hydrateChatHistoryFromPersistentCache = hydrateChatHistoryFromPersistentCache;
@@ -83825,13 +83891,18 @@ function getVisibleChatStackEl(id) {
 			if (isLightAuthPayload && typeof socketChat !== 'undefined' && socketChat && socketChat.connected) {
 				const initialProfileSyncTimeoutMs = 90000;
 				initialProfileSyncOk = await new Promise(resolve => {
-					const request = {
+					const iosFrameFriendlyLogin = document.documentElement.classList.contains('ios-webkit');
+					const request = iosFrameFriendlyLogin ? {
 						reason: shouldFinishInteractiveBoot ? 'pre_boot' : 'post_light_auth',
 						forceRefresh: false,
 						lazyHydrate: false,
 						sections: PROFILE_SYNC_PERSISTENT_SECTIONS.filter(section => section !== 'settings'),
 						includeCore: true,
-						criticalReadyAck: false
+						criticalReadyAck: true
+					} : {
+						reason: shouldFinishInteractiveBoot ? 'pre_boot' : 'post_light_auth',
+						forceRefresh: false,
+						criticalReadyAck: true
 					};
 					if (typeof socketChat.timeout === 'function') {
 						socketChat.timeout(initialProfileSyncTimeoutMs).emit('request_profile_sync', request, (err, response) => {
@@ -83909,15 +83980,32 @@ function getVisibleChatStackEl(id) {
 			}, 250);
 
 			if (shouldFinishInteractiveBoot) {
-				await storePrefetchPromise;
-				if (typeof window.ensureWishlistCanonicalDataInBackground === 'function') {
-					try { await window.ensureWishlistCanonicalDataInBackground(); } catch (e) {}
-				}
+				const iosFrameFriendlyLogin = document.documentElement.classList.contains('ios-webkit');
+				if (!iosFrameFriendlyLogin) await storePrefetchPromise;
+
 				finishBoot(name);
 				if (window.__postAuthChatGate && window.__postAuthChatGate.name === name) {
 					window.__postAuthChatGate.homeReleased = true;
 				}
 				if (typeof window.tryStartPostAuthChatRealtime === 'function') window.tryStartPostAuthChatRealtime();
+
+				const finishPostLoginCanonicalData = () => {
+					if ((localStorage.getItem('psn_username') || '') !== name) return;
+					const afterStore = iosFrameFriendlyLogin ? Promise.resolve(storePrefetchPromise) : Promise.resolve();
+					afterStore.then(() => {
+						if ((localStorage.getItem('psn_username') || '') !== name) return;
+						if (typeof window.ensureWishlistCanonicalDataInBackground === 'function') {
+							return window.ensureWishlistCanonicalDataInBackground();
+						}
+					}).catch(e => console.warn('[System] Post-login canonical preload skipped.', e));
+				};
+				if (typeof runWhenBootVisualSettled === 'function') {
+					runWhenBootVisualSettled(finishPostLoginCanonicalData, iosFrameFriendlyLogin ? 180 : 80);
+				} else if (typeof window.runPsnAfterHomeInteractive === 'function') {
+					window.runPsnAfterHomeInteractive(finishPostLoginCanonicalData);
+				} else {
+					setTimeout(finishPostLoginCanonicalData, iosFrameFriendlyLogin ? 220 : 100);
+				}
 			} else {
 				if (window.__postAuthChatGate && window.__postAuthChatGate.name === name) {
 					window.__postAuthChatGate.homeReleased = true;
