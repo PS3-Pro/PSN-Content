@@ -3660,6 +3660,13 @@ html.samsung-browser .particle-core-mark, html.samsung-browser .particle-core-ma
 	contain: layout paint style;
 	z-index: 22050;
 }
+.psn-shared-cover-behind-layer {
+	position: fixed;
+	inset: 0;
+	pointer-events: none;
+	user-select: none;
+	z-index: 22050;
+}
 .psn-download-motion-ripple { position: fixed; pointer-events: none; z-index: 22049; border: 1px solid rgba(102,204,255,.78); border-radius: 9px; box-shadow: 0 0 16px rgba(0,112,204,.44), inset 0 0 12px rgba(102,204,255,.12); animation: psnDownloadMotionRipple .42s cubic-bezier(.16,.84,.28,1) forwards; }
 #nav-downloads.psn-download-motion-hit>i { animation: psnDownloadNavHit .46s cubic-bezier(.16,.84,.28,1); }
 #nav-chat-play-together.psn-collection-motion-hit>i { animation: psnPlayTogetherNavHit .46s cubic-bezier(.16,.84,.28,1); }
@@ -3777,7 +3784,7 @@ body.chat-selection-mode .chat-message-actions .chat-delete-action:not(.chat-del
 #mobile-menu-btn:is(.psn-primary-pressed,.mobile-pressed) { transform: translateY(1px) scale(.88) !important; filter: brightness(.82) !important; transition-duration: .06s !important; }
 
 @media (prefers-reduced-motion:reduce) {
-	.psn-card-pointer-light, .psn-card-morph-title, .psn-card-morph-cover-unit, .psn-shared-cover-flight, .psn-download-motion-ripple { display: none !important; }
+	.psn-card-pointer-light, .psn-card-morph-title, .psn-card-morph-cover-unit, .psn-shared-cover-flight, .psn-shared-cover-behind-layer, .psn-download-motion-ripple { display: none !important; }
 	#game-modal.show .modal-cover-wrapper,
 	#game-modal.show .modal-game-title,
 	#game-modal.show .modal-info-card,
@@ -23568,19 +23575,30 @@ P
 
 	function capturePsnCoverMotionImage(img) {
 		if (!img || !img.isConnected || !img.getBoundingClientRect || isPsnSharedMotionReduced()) return null;
-		const rect = img.getBoundingClientRect();
+		const imageRect = img.getBoundingClientRect();
+		const card = img.closest('.game-card');
+		const clippingParent = img.closest('.game-img-container, .modal-cover-wrapper, .compact-cover');
+		const clippedCover = card && clippingParent?.classList.contains('game-img-container') && window.getComputedStyle(clippingParent).overflow === 'hidden';
+		const rect = clippedCover ? clippingParent.getBoundingClientRect() : imageRect;
 		if (rect.width < 28 || rect.height < 36 || rect.right <= 0 || rect.bottom <= 0 || rect.left >= window.innerWidth || rect.top >= window.innerHeight) return null;
 		const placeholder = String(window.__collectionImageRecyclePlaceholder || '');
 		const src = String(img.currentSrc || img.getAttribute('src') || '').trim();
 		if (!src || src === placeholder) return null;
 		const style = window.getComputedStyle(img);
 		if (!style || style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity || 1) < .08) return null;
+		let borderRadius = style.borderRadius || '0px';
+		if (card && clippingParent && window.getComputedStyle(card).overflow === 'hidden') {
+			const corners = window.getComputedStyle(card);
+			borderRadius = `${corners.borderTopLeftRadius} ${corners.borderTopRightRadius} 0px 0px`;
+		} else if (clippingParent && window.getComputedStyle(clippingParent).overflow === 'hidden') {
+			borderRadius = window.getComputedStyle(clippingParent).borderRadius;
+		}
 		return {
 			element: img,
 			src,
 			rect: { left:rect.left, top:rect.top, width:rect.width, height:rect.height },
-			borderRadius: style.borderRadius || '6px',
-			objectFit: style.objectFit && style.objectFit !== 'fill' ? style.objectFit : 'cover',
+			borderRadius,
+			objectFit: style.objectFit || 'cover',
 			objectPosition: style.objectPosition || '50% 50%'
 		};
 	}
@@ -23764,6 +23782,73 @@ P
 		return clone;
 	}
 
+	function makePsnSharedCoverBehindLayer(source, flight) {
+		if (!flight) return null;
+		const card = source?.element?.closest?.('.game-card, .promo-card, .recently-visited-discover-card');
+		const view = source?.element?.closest?.('.view-section') ||
+			(typeof getCurrentPsnViewElement === 'function' ? getCurrentPsnViewElement() : null) ||
+			Array.from(document.querySelectorAll('#scroll-area .view-section')).find(element => {
+				const rect = element.getBoundingClientRect();
+				return rect.width > 40 && rect.height > 40 && window.getComputedStyle(element).display !== 'none';
+			});
+		const width = window.innerWidth;
+		const height = window.innerHeight;
+		const holes = [];
+		const addHole = (element, padding = 0) => {
+			if (!element?.isConnected) return;
+			const style = window.getComputedStyle(element);
+			if (style.display === 'none' || style.visibility === 'hidden') return;
+			const rect = element.getBoundingClientRect();
+			const left = Math.max(0, rect.left - padding);
+			const top = Math.max(0, rect.top - padding);
+			const right = Math.min(width, rect.right + padding);
+			const bottom = Math.min(height, rect.bottom + padding);
+			if (right - left < 4 || bottom - top < 4) return;
+			holes.push({ left, top, right, bottom });
+		};
+		addHole(card, 2);
+		const toolbar = view?.querySelector('.browse-toolbar');
+		if (toolbar?.classList.contains('scrolled')) {
+			addHole(toolbar);
+			const position = window.getComputedStyle(toolbar).position;
+			if (position === 'sticky' || position === 'fixed') {
+				const rect = toolbar.getBoundingClientRect();
+				if (rect.bottom > 0 && rect.top < height) {
+					holes.push({ left:0, top:0, right:width, bottom:Math.min(height, Math.ceil(rect.bottom + 1)) });
+				}
+			}
+		}
+		if (!holes.length) return null;
+		const outline = `M0 0 H${width} V${height} H0 Z`;
+		const edges = [...new Set(holes.flatMap(rect => [rect.left, rect.right]))].sort((a, b) => a - b);
+		const paths = [];
+		for (let i = 1; i < edges.length; i++) {
+			const left = edges[i - 1], right = edges[i];
+			const intervals = holes.filter(rect => rect.left < right && rect.right > left)
+				.map(rect => [rect.top, rect.bottom]).sort((a, b) => a[0] - b[0]);
+			let top = -1, bottom = -1;
+			for (const [start, end] of intervals) {
+				if (top < 0) { top = start; bottom = end; }
+				else if (start <= bottom) bottom = Math.max(bottom, end);
+				else { paths.push(`M${left} ${top} H${right} V${bottom} H${left} Z`); top = start; bottom = end; }
+			}
+			if (top >= 0) paths.push(`M${left} ${top} H${right} V${bottom} H${left} Z`);
+		}
+		const masks = paths.join(' ');
+		const layer = document.createElement('div');
+		layer.className = 'psn-shared-cover-behind-layer';
+		layer.dataset.psnMotionKind = flight.dataset.psnMotionKind;
+		layer.setAttribute('aria-hidden', 'true');
+		layer.style.zIndex = flight.style.zIndex;
+		const clip = `path(evenodd, "${outline} ${masks}")`;
+		layer.style.clipPath = clip;
+		layer.style.webkitClipPath = clip;
+		document.body.appendChild(layer);
+		layer.appendChild(flight);
+		registerPsnMotionTransientNode(layer, layer.dataset.psnMotionKind);
+		return layer;
+	}
+
 	function getPsnMotionRect(value) {
 		if (!value) return null;
 		if (typeof value.getBoundingClientRect === 'function') {
@@ -23815,6 +23900,7 @@ P
 		if (!destRect || destRect.width < 4 || destRect.height < 4) return false;
 		const clone = makePsnSharedCoverClone(source, options.kind || 'generic');
 		if (!clone) return false;
+		const originLayer = makePsnSharedCoverBehindLayer(source, clone);
 		const dx = destRect.left - source.rect.left;
 		const dy = destRect.top - source.rect.top;
 		const sx = destRect.width / source.rect.width;
@@ -23853,6 +23939,7 @@ P
 			}
 		} finally {
 			cleanupPsnMotionNode(clone);
+			cleanupPsnMotionNode(originLayer);
 		}
 		return true;
 	}
