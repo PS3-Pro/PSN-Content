@@ -2406,6 +2406,35 @@ async function initDb() {
     CREATE INDEX IF NOT EXISTS idx_direct_message_pins ON direct_messages(sender_name, recipient_name, pinned_at DESC) WHERE pinned_at IS NOT NULL;
     CREATE INDEX IF NOT EXISTS idx_direct_messages_sender_recipient_id ON direct_messages(sender_name, recipient_name, id DESC);
     CREATE INDEX IF NOT EXISTS idx_direct_messages_recipient_sender_id ON direct_messages(recipient_name, sender_name, id DESC);
+    CREATE TABLE IF NOT EXISTS direct_groups (
+      id UUID PRIMARY KEY,
+      title VARCHAR(80) NOT NULL,
+      created_by TEXT NOT NULL REFERENCES users(name) ON DELETE CASCADE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS direct_group_members (
+      group_id UUID NOT NULL REFERENCES direct_groups(id) ON DELETE CASCADE,
+      user_name TEXT NOT NULL REFERENCES users(name) ON DELETE CASCADE,
+      joined_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      last_read_id BIGINT NOT NULL DEFAULT 0,
+      PRIMARY KEY (group_id, user_name)
+    );
+    CREATE INDEX IF NOT EXISTS idx_direct_group_members_user ON direct_group_members(user_name, group_id);
+    CREATE TABLE IF NOT EXISTS direct_group_messages (
+      id BIGSERIAL PRIMARY KEY,
+      group_id UUID NOT NULL REFERENCES direct_groups(id) ON DELETE CASCADE,
+      sender_name TEXT NOT NULL REFERENCES users(name) ON DELETE CASCADE,
+      text TEXT NOT NULL,
+      message_type TEXT NOT NULL DEFAULT 'text',
+      content JSONB,
+      reply_to JSONB,
+      reactions JSONB NOT NULL DEFAULT '[]'::jsonb,
+      pinned_at TIMESTAMPTZ,
+      edited_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_direct_group_messages_group ON direct_group_messages(group_id,id DESC);
+    CREATE INDEX IF NOT EXISTS idx_direct_group_messages_pins ON direct_group_messages(group_id,pinned_at DESC) WHERE pinned_at IS NOT NULL;
     CREATE TABLE IF NOT EXISTS direct_message_read_state (
       user_name TEXT NOT NULL REFERENCES users(name) ON DELETE CASCADE,
       peer_name TEXT NOT NULL REFERENCES users(name) ON DELETE CASCADE,
@@ -8417,6 +8446,65 @@ function normalizeDirectMessageText(value) {
   return text.slice(0, DIRECT_MESSAGE_TEXT_MAX);
 }
 
+// Private group conversations are isolated from two-person direct-message history.
+const DIRECT_GROUP_MAX_MEMBERS = 16;
+const DIRECT_GROUP_HISTORY_MAX = 200;
+function directGroupId(value) { const id = String(value || '').trim().toLowerCase(); return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(id) ? id : ''; }
+function serializeDirectGroupMessage(row) {
+  if (!row) return null;
+  const type = row.message_type === 'poll' ? 'poll' : normalizeDirectMessageType(row.message_type, normalizeDirectMessageMedia(row.content));
+  return { id:String(row.id), groupId:String(row.group_id), from:normalizeDirectMessageUser(row.sender_name), text:String(row.text || '').slice(0,DIRECT_MESSAGE_TEXT_MAX), type, content:type === 'poll' ? normalizeDirectGroupPoll(row.content,true) : normalizeDirectMessageMedia(row.content), replyTo:normalizeDirectMessageReply(row.reply_to), reactions:normalizeDirectMessageReactions(row.reactions,DIRECT_GROUP_MAX_MEMBERS), pinnedAt:row.pinned_at ? new Date(row.pinned_at).toISOString():null, editedAt:row.edited_at ? new Date(row.edited_at).toISOString():null, createdAt:new Date(row.created_at).toISOString() };
+}
+function normalizeDirectGroupPoll(value, allowVoters = false) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const question = normalizeText(value.question,'').trim().slice(0,CHAT_POLL_QUESTION_MAX);
+  const source = Array.isArray(value.options) ? value.options : [];
+  if (!question || source.length < 2 || source.length > 4) return null;
+  const options = source.map(option => ({ text:normalizeText(option && option.text,'').trim().slice(0,CHAT_POLL_OPTION_TEXT_MAX), voters:allowVoters && Array.isArray(option?.voters) ? [...new Set(option.voters.map(normalizeDirectMessageUser).filter(Boolean))].slice(0,DIRECT_GROUP_MAX_MEMBERS):[] }));
+  if (options.some(option => !option.text)) return null;
+  const seen=new Set(); for(const option of options) option.voters=option.voters.filter(name=>{if(seen.has(name))return false; seen.add(name);return true;});
+  return { question, options, totalVotes:seen.size };
+}
+async function getDirectGroupMember(groupId,userName,db=pool) {
+  const result=await db.query('SELECT gm.joined_at,gm.last_read_id,g.title,g.created_by FROM direct_group_members gm JOIN direct_groups g ON g.id=gm.group_id WHERE gm.group_id=$1 AND gm.user_name=$2',[groupId,userName]);
+  return result.rows?.[0] || null;
+}
+async function getDirectGroupMembers(groupId,db=pool) {
+  const result=await db.query('SELECT user_name,joined_at FROM direct_group_members WHERE group_id=$1 ORDER BY joined_at,user_name',[groupId]);
+  return result.rows || [];
+}
+async function emitDirectGroupLocal(groupId,kind,payload) {
+  const members=await getDirectGroupMembers(groupId);
+  for (const member of members) for(const client of getSocketsByUserName(member.user_name)) {
+    if (!client || !client.connected) continue;
+    if ((kind==='message'||kind==='update') && payload?.createdAt && new Date(member.joined_at).getTime()>Date.parse(payload.createdAt)) continue;
+    client.emit(kind==='refresh'?'direct_group_changed':'direct_group_event',{ kind, groupId, ...(kind==='refresh'?{}:{message:kind==='message'||kind==='update'?payload:undefined,id:kind==='delete'?payload.id:undefined}) });
+  }
+}
+async function notifyDirectGroupChange(groupId,kind,id=0) {
+  try { await pool.query('SELECT pg_notify($1,$2)',['direct_group_sync',JSON.stringify({instanceId:INSTANCE_ID,groupId,kind,id})]); } catch(err) { console.error('[GROUP NOTIFY]',err?.message||err); }
+}
+async function getDirectGroupList(viewer) {
+  const result=await queryDbWithRetry(`SELECT g.id,g.title,g.created_by,g.created_at,
+    (SELECT COUNT(*)::int FROM direct_group_members mm WHERE mm.group_id=g.id) AS member_count,
+    (SELECT row_to_json(x) FROM (SELECT m.id,m.sender_name,m.text,m.message_type,m.created_at FROM direct_group_messages m WHERE m.group_id=g.id AND m.created_at>=gm.joined_at ORDER BY m.id DESC LIMIT 1) x) AS latest,
+    (SELECT COUNT(*)::int FROM direct_group_messages m WHERE m.group_id=g.id AND m.created_at>=gm.joined_at AND m.id>gm.last_read_id AND m.sender_name<>$1) AS unread
+    FROM direct_groups g JOIN direct_group_members gm ON gm.group_id=g.id AND gm.user_name=$1 ORDER BY COALESCE((SELECT m.created_at FROM direct_group_messages m WHERE m.group_id=g.id ORDER BY m.id DESC LIMIT 1),g.created_at) DESC LIMIT 100`,[viewer],{attempts:2,label:'GROUP LIST'});
+  return result.rows.map(row=>({id:row.id,title:row.title,createdBy:row.created_by,memberCount:Number(row.member_count)||0,createdAt:row.created_at,unread:Number(row.unread)||0,lastMessage:row.latest?{id:String(row.latest.id),from:row.latest.sender_name,text:row.latest.message_type==='poll'?'📊 Created a poll.':row.latest.text,createdAt:row.latest.created_at}:null}));
+}
+async function getDirectGroupHistory(groupId,viewer) {
+  const member=await getDirectGroupMember(groupId,viewer);
+  if(!member)return {success:false,message:'You are not a member of this group.'};
+  const [result,members]=await Promise.all([
+    queryDbWithRetry('SELECT * FROM (SELECT * FROM direct_group_messages WHERE group_id=$1 AND created_at >= $2 ORDER BY id DESC LIMIT $3) x ORDER BY id',[groupId,member.joined_at,DIRECT_GROUP_HISTORY_MAX],{attempts:2,label:'GROUP HISTORY'}),
+    getDirectGroupMembers(groupId)
+  ]);
+  const messages=result.rows.map(serializeDirectGroupMessage);
+  const lastId=messages.length?Number(messages[messages.length-1].id):Number(member.last_read_id)||0;
+  await pool.query('UPDATE direct_group_members SET last_read_id=GREATEST(last_read_id,$3) WHERE group_id=$1 AND user_name=$2',[groupId,viewer,lastId]);
+  return {success:true,group:{id:groupId,title:member.title,createdBy:member.created_by,members:members.map(m=>m.user_name)},messages,pinnedMessages:messages.filter(m=>m.pinnedAt).slice(-10),lastReadId:String(lastId)};
+}
+
 function directMessagePlainText(value) {
   return String(value == null ? '' : value)
     .replace(/<br\s*\/?\s*>/gi, '\n')
@@ -8474,7 +8562,7 @@ function normalizeDirectMessageReply(value) {
   return { id, from, text, type };
 }
 
-function normalizeDirectMessageReactions(value) {
+function normalizeDirectMessageReactions(value, maxUsers = 2) {
   const list = Array.isArray(value) ? value : [];
   const output = [];
   for (const entry of list) {
@@ -8482,7 +8570,7 @@ function normalizeDirectMessageReactions(value) {
     const emoji = normalizeText(entry.emoji, '').slice(0, DIRECT_MESSAGE_REACTION_MAX);
     if (!emoji || !DIRECT_MESSAGE_ALLOWED_REACTIONS.has(emoji)) continue;
     const users = Array.from(new Set((Array.isArray(entry.users) ? entry.users : [])
-      .map(normalizeDirectMessageUser).filter(Boolean))).slice(0, 2);
+      .map(normalizeDirectMessageUser).filter(Boolean))).slice(0, maxUsers);
     if (!users.length) continue;
     output.push({ emoji, count:users.length, users });
   }
@@ -9483,12 +9571,24 @@ async function initProfileSyncNotifications() {
   profileSyncNotifyClient = client;
 
   client.on('notification', async (message) => {
-    if (!message || !['profile_sync', 'presence_sync', 'ps3_playtime_sync', 'admin_state_sync', 'server_log_sync', 'friend_activity_sync', 'user_notification_sync', 'game_players_sync', 'content_download_counts_sync', 'chat_sync_notify', 'direct_message_sync'].includes(message.channel)) return;
+    if (!message || !['profile_sync', 'presence_sync', 'ps3_playtime_sync', 'admin_state_sync', 'server_log_sync', 'friend_activity_sync', 'user_notification_sync', 'game_players_sync', 'content_download_counts_sync', 'chat_sync_notify', 'direct_message_sync', 'direct_group_sync'].includes(message.channel)) return;
 
     try {
       const data = JSON.parse(message.payload || '{}');
       if (data.instanceId === INSTANCE_ID) return;
 
+      if (message.channel === 'direct_group_sync') {
+        const gid=directGroupId(data.groupId);
+        if (!gid) return;
+        if(data.kind==='left'){for(const sock of getSocketsByUserName(String(data.id||'')))if(sock.connected)sock.emit('direct_group_changed',{groupId:gid,left:true});await emitDirectGroupLocal(gid,'refresh');return;}
+        if (data.kind==='message'||data.kind==='update') {
+          const result=await pool.query('SELECT * FROM direct_group_messages WHERE group_id=$1 AND id=$2',[gid,Number(data.id)||0]);
+          const msg=serializeDirectGroupMessage(result.rows?.[0]);
+          if (msg) await emitDirectGroupLocal(gid,data.kind,msg);
+        } else if(data.kind==='delete') await emitDirectGroupLocal(gid,'delete',{id:String(data.id)});
+        else await emitDirectGroupLocal(gid,'refresh');
+        return;
+      }
       if (message.channel === 'direct_message_sync') {
         if ((data.kind === 'message' || data.kind === 'update') && data.payload) {
           const messageId = Math.max(0, Number(data.payload.id) || 0);
@@ -9952,6 +10052,7 @@ async function initProfileSyncNotifications() {
     await client.query('LISTEN content_download_counts_sync');
     await client.query('LISTEN chat_sync_notify');
     await client.query('LISTEN direct_message_sync');
+    await client.query('LISTEN direct_group_sync');
     const shouldRecoverModerationSync = profileSyncListenerHadGap;
     profileSyncListenerHadGap = false;
     profileSyncListenReady = true;
@@ -13953,6 +14054,183 @@ io.on('connection', (socket) => {
   // --------------------------------------------------------------------------
   // Direct messages
   // --------------------------------------------------------------------------
+  // Group chats: never import private 1:1 message history into a group.
+  socket.on('direct_group_list',async (_data={},callback)=>{
+    const reply=typeof callback==='function'?callback:()=>{};
+    const viewer=normalizeDirectMessageUser(socket.userName);
+    if(!viewer)return reply({success:false,groups:[]});
+    try { reply({success:true,groups:await getDirectGroupList(viewer)}); }catch(err){console.error('[GROUP LIST]',err?.message||err);reply({success:false,groups:[]});}
+  });
+  socket.on('direct_group_create',async (data={},callback)=>{
+    data=data&&typeof data==='object'&&!Array.isArray(data)?data:{};
+    const reply=typeof callback==='function'?callback:()=>{};
+    const viewer=normalizeDirectMessageUser(socket.userName);
+    const members=[...new Set((Array.isArray(data.members)?data.members:[]).map(normalizeDirectMessageUser).filter(name=>name&&name!==viewer))];
+    const title=normalizeText(data.title,'').trim().slice(0,80) || members.join(', ').slice(0,80);
+    if(!viewer||members.length<2||members.length>=DIRECT_GROUP_MAX_MEMBERS)return reply({success:false,message:'Select at least two other people (maximum 15).'});
+    let db;
+    try {
+      db=await pool.connect();
+      await db.query('BEGIN');
+      const known=await db.query('SELECT name FROM users WHERE name=ANY($1::text[])',[members]);
+      if(known.rows.length!==members.length)throw Error('One or more users do not exist.');
+      const involved=[viewer,...members];
+      const blocks=await db.query('SELECT 1 FROM direct_user_blocks WHERE blocker_name=ANY($1::text[]) AND blocked_name=ANY($1::text[]) LIMIT 1',[involved]);
+      if(blocks.rowCount)throw Error('A blocked user cannot be added to this group.');
+      const id=crypto.randomUUID();
+      await db.query('INSERT INTO direct_groups (id,title,created_by) VALUES ($1,$2,$3)',[id,title,viewer]);
+      await db.query('INSERT INTO direct_group_members(group_id,user_name) SELECT $1,unnest($2::text[])',[id,involved]);
+      await db.query('COMMIT');
+      try {await emitDirectGroupLocal(id,'refresh');} catch(err) {console.error('[GROUP CREATE EMIT]',err?.message||err);}
+      deferServerTask('GROUP CREATE NOTIFY',()=>notifyDirectGroupChange(id,'refresh'),0);
+      reply({success:true,groupId:id});
+    }catch(err){if(db)await db.query('ROLLBACK').catch(()=>{});console.error('[GROUP CREATE]',err?.message||err);reply({success:false,message:err.message||'Could not create group.'});}
+    finally{if(db)db.release();}
+  });
+  socket.on('direct_group_add',async (data={},callback)=>{
+    data=data&&typeof data==='object'&&!Array.isArray(data)?data:{};
+    const reply=typeof callback==='function'?callback:()=>{};
+    const id=directGroupId(data.groupId), viewer=normalizeDirectMessageUser(socket.userName);
+    const names=[...new Set((Array.isArray(data.members)?data.members:[]).map(normalizeDirectMessageUser).filter(Boolean))];
+    if(!viewer||!id||!names.length||names.length>=DIRECT_GROUP_MAX_MEMBERS)return reply({success:false,message:'Select users to add.'});
+    let db;
+    try {
+      db=await pool.connect();
+      await db.query('BEGIN');
+      await db.query('SELECT id FROM direct_groups WHERE id=$1 FOR UPDATE',[id]);
+      const member=await getDirectGroupMember(id,viewer,db);
+      if(!member)throw Error('You are not in this group.');
+      const existing=await getDirectGroupMembers(id,db);
+      const fresh=names.filter(name=>!existing.some(row=>row.user_name===name));
+      if(!fresh.length)throw Error('These users are already in the group.');
+      if(existing.length+fresh.length>DIRECT_GROUP_MAX_MEMBERS)throw Error('Groups support up to 16 people.');
+      const valid=await db.query('SELECT name FROM users WHERE name=ANY($1::text[])',[fresh]);
+      if(valid.rows.length!==fresh.length)throw Error('One or more users do not exist.');
+      const everyone=[...existing.map(row=>row.user_name),...fresh];
+      const blocks=await db.query('SELECT 1 FROM direct_user_blocks WHERE blocker_name=ANY($1::text[]) AND blocked_name=ANY($1::text[]) LIMIT 1',[everyone]);
+      if(blocks.rowCount)throw Error('A blocked user cannot be added to this group.');
+      await db.query('INSERT INTO direct_group_members (group_id,user_name) SELECT $1,unnest($2::text[]) ON CONFLICT DO NOTHING',[id,fresh]);
+      await db.query('COMMIT');
+      try {await emitDirectGroupLocal(id,'refresh');} catch(err) {console.error('[GROUP MEMBERS EMIT]',err?.message||err);}
+      deferServerTask('GROUP MEMBERS NOTIFY',()=>notifyDirectGroupChange(id,'refresh'),0);
+      reply({success:true,added:fresh});
+    }catch(err){if(db)await db.query('ROLLBACK').catch(()=>{});reply({success:false,message:err.message||'Could not add participants.'});}
+    finally{if(db)db.release();}
+  });
+  socket.on('direct_group_leave',async (data={},callback)=>{
+    data=data&&typeof data==='object'&&!Array.isArray(data)?data:{};
+    const reply=typeof callback==='function'?callback:()=>{};
+    const id=directGroupId(data.groupId),viewer=normalizeDirectMessageUser(socket.userName);
+    if(!id||!viewer)return reply({success:false});
+    try {
+      const result=await pool.query('DELETE FROM direct_group_members WHERE group_id=$1 AND user_name=$2 RETURNING user_name',[id,viewer]);
+      if(!result.rowCount)return reply({success:false,message:'Not a group member.'});
+      for(const client of getSocketsByUserName(viewer))if(client.connected)client.emit('direct_group_changed',{groupId:id,left:true});
+      try {await emitDirectGroupLocal(id,'refresh');} catch(err) {console.error('[GROUP LEAVE EMIT]',err?.message||err);}
+      deferServerTask('GROUP LEAVE NOTIFY',()=>notifyDirectGroupChange(id,'left',viewer),0);
+      reply({success:true});
+    }catch(err){reply({success:false,message:'Could not leave group.'});}
+  });
+  socket.on('direct_group_history',async (data={},callback)=>{
+    data=data&&typeof data==='object'&&!Array.isArray(data)?data:{};
+    const reply=typeof callback==='function'?callback:()=>{};
+    const id=directGroupId(data.groupId),viewer=normalizeDirectMessageUser(socket.userName);
+    if(!id||!viewer)return reply({success:false,message:'Invalid group.'});
+    try {reply(await getDirectGroupHistory(id,viewer));}catch(err){console.error('[GROUP HISTORY]',err?.message||err);reply({success:false,message:'Could not load group.'});}
+  });
+  socket.on('direct_group_send',async (data={},callback)=>{
+    data=data&&typeof data==='object'&&!Array.isArray(data)?data:{};
+    const reply=typeof callback==='function'?callback:()=>{};
+    const id=directGroupId(data.groupId),sender=normalizeDirectMessageUser(socket.userName);
+    const text=normalizeDirectMessageText(data.text);
+    const isPoll=String(data.type||'')==='poll';
+    const poll=isPoll?normalizeDirectGroupPoll(data.content):null;
+    const media=isPoll?[]:normalizeDirectMessageMedia(data.content);
+    const type=isPoll?'poll':normalizeDirectMessageType(data.type,media);
+    if(!id||!sender||(!isPoll&&!directMessagePlainText(text)&&!media.length)||(isPoll&&!poll))return reply({success:false,message:'Enter a message or valid poll.'});
+    const now=Date.now(),last=Number(socket.__groupLastSentAt)||0;
+    if(last&&now-last<350)return reply({success:false,message:'You are sending too quickly.'});
+    const sends=Array.isArray(socket.__groupSendWindow)?socket.__groupSendWindow.filter(t=>now-t<60000):[];if(sends.length>=60)return reply({success:false,message:'Too many messages. Try again shortly.'});sends.push(now);socket.__groupSendWindow=sends;socket.__groupLastSentAt=now;
+    try {
+      if(userDatabase[sender] && isUserBanned(userDatabase[sender]) && !ADMIN_USERS.includes(sender))return reply({success:false,message:'Your account is banned.'});
+      const member=await getDirectGroupMember(id,sender);
+      if(!member)return reply({success:false,message:'You are not a member of this group.'});
+      let replyTo=null;
+      const replyId=Math.max(0,Number(data.replyTo?.id||data.replyTo)||0);
+      if(replyId){const found=await pool.query('SELECT * FROM direct_group_messages WHERE group_id=$1 AND id=$2 AND created_at>=$3',[id,replyId,member.joined_at]);const m=serializeDirectGroupMessage(found.rows?.[0]);if(m)replyTo={id:m.id,from:m.from,text:(m.type==='poll'?m.content?.question:directMessagePlainText(m.text)||'[Image]').slice(0,DIRECT_MESSAGE_REPLY_TEXT_MAX),type:m.type};}
+      const result=await pool.query('INSERT INTO direct_group_messages (group_id,sender_name,text,message_type,content,reply_to) VALUES ($1,$2,$3,$4,$5::jsonb,$6::jsonb) RETURNING *',[id,sender,isPoll?'📊 Created a poll.':text,type,isPoll?JSON.stringify(poll):media.length?JSON.stringify(media):null,replyTo?JSON.stringify(replyTo):null]);
+      const message=serializeDirectGroupMessage(result.rows[0]);
+      await pool.query('UPDATE direct_group_members SET last_read_id=GREATEST(last_read_id,$3) WHERE group_id=$1 AND user_name=$2',[id,sender,Number(message.id)]);
+      try {await emitDirectGroupLocal(id,'message',message);} catch(err) {console.error('[GROUP MESSAGE EMIT]',err?.message||err);}
+      deferServerTask('GROUP MESSAGE NOTIFY',()=>notifyDirectGroupChange(id,'message',Number(message.id)),0);
+      reply({success:true,message});
+    }catch(err){console.error('[GROUP MESSAGE]',err?.message||err);reply({success:false,message:'Could not send group message.'});}
+  });
+  socket.on('direct_group_action',async (data={},callback)=>{
+    data=data&&typeof data==='object'&&!Array.isArray(data)?data:{};
+    const reply=typeof callback==='function'?callback:()=>{};
+    const id=directGroupId(data.groupId),viewer=normalizeDirectMessageUser(socket.userName),messageId=Math.max(0,Number(data.id)||0),action=String(data.action||'');
+    if(!id||!viewer||!messageId||!['edit','delete','react','pin','vote','poll_edit'].includes(action))return reply({success:false,message:'Invalid action.'});
+    let db;
+    try {
+      db=await pool.connect();
+      await db.query('BEGIN');
+      if(action==='pin')await db.query('SELECT id FROM direct_groups WHERE id=$1 FOR UPDATE',[id]);
+      const member=await getDirectGroupMember(id,viewer,db);
+      if(!member)throw Error('Not a group member.');
+      const existing=await db.query('SELECT * FROM direct_group_messages WHERE group_id=$1 AND id=$2 AND created_at>=$3 FOR UPDATE',[id,messageId,member.joined_at]);
+      const row=existing.rows?.[0];
+      if(!row)throw Error('Message unavailable.');
+      let kind='update';
+      if(action==='delete'){
+        if(row.sender_name!==viewer)throw Error('Only the author can delete this message.');
+        await db.query('DELETE FROM direct_group_messages WHERE id=$1',[messageId]);
+        kind='delete';
+      } else if(action==='edit') {
+        if(row.sender_name!==viewer||row.message_type==='poll')throw Error('Cannot edit this message.');
+        const text=normalizeDirectMessageText(data.text);
+        if(!directMessagePlainText(text)&&!normalizeDirectMessageMedia(row.content).length)throw Error('Message cannot be empty.');
+        await db.query('UPDATE direct_group_messages SET text=$2,edited_at=NOW() WHERE id=$1',[messageId,text]);
+      } else if(action==='react') {
+        const emoji=normalizeText(data.emoji,'');
+        if(!DIRECT_MESSAGE_ALLOWED_REACTIONS.has(emoji))throw Error('Invalid reaction.');
+        const reactions=normalizeDirectMessageReactions(row.reactions,DIRECT_GROUP_MAX_MEMBERS).map(r=>({emoji:r.emoji,users:[...r.users]}));
+        let react=reactions.find(r=>r.emoji===emoji);
+        if(!react){react={emoji,users:[]};reactions.push(react);}
+        react.users=react.users.includes(viewer)?react.users.filter(n=>n!==viewer):[...react.users,viewer];
+        await db.query('UPDATE direct_group_messages SET reactions=$2::jsonb WHERE id=$1',[messageId,JSON.stringify(reactions.filter(r=>r.users.length))]);
+      } else if(action==='pin') {
+        const next=data.pinned===true;
+        if(next&&!row.pinned_at){const count=await db.query('SELECT COUNT(*)::int AS n FROM direct_group_messages WHERE group_id=$1 AND pinned_at IS NOT NULL',[id]);if(Number(count.rows?.[0]?.n)>=10)throw Error('Only 10 pins per group.');}
+        await db.query('UPDATE direct_group_messages SET pinned_at=CASE WHEN $2 THEN NOW() ELSE NULL END WHERE id=$1',[messageId,next]);
+      } else if(action==='vote') {
+        if(row.message_type!=='poll')throw Error('Not a poll.');
+        const poll=normalizeDirectGroupPoll(row.content,true);
+        const option=Number(data.optionIndex);
+        if(!poll||!Number.isInteger(option)||option<0||option>=poll.options.length)throw Error('Invalid option.');
+        const voted=poll.options[option].voters.includes(viewer);
+        poll.options.forEach(o=>{o.voters=o.voters.filter(name=>name!==viewer);});
+        if(!voted)poll.options[option].voters.push(viewer);
+        poll.totalVotes=poll.options.reduce((n,o)=>n+o.voters.length,0);
+        await db.query('UPDATE direct_group_messages SET content=$2::jsonb WHERE id=$1',[messageId,JSON.stringify(poll)]);
+      } else if(action==='poll_edit') {
+        if(row.sender_name!==viewer||row.message_type!=='poll')throw Error('Only the author can edit this poll.');
+        const input=normalizeDirectGroupPoll(data.content);
+        const poll=normalizeDirectGroupPoll(row.content,true);
+        if(!input||!poll||input.options.length!==poll.options.length)throw Error('Keep the same poll options.');
+        poll.question=input.question;poll.options.forEach((o,i)=>{o.text=input.options[i].text;});
+        await db.query('UPDATE direct_group_messages SET content=$2::jsonb,edited_at=NOW() WHERE id=$1',[messageId,JSON.stringify(poll)]);
+      }
+      const updated=kind==='delete'?null:(await db.query('SELECT * FROM direct_group_messages WHERE id=$1',[messageId])).rows?.[0];
+      await db.query('COMMIT');
+      const message=serializeDirectGroupMessage(updated);
+      try {await emitDirectGroupLocal(id,kind,kind==='delete'?{id:String(messageId)}:message);} catch(err) {console.error('[GROUP ACTION EMIT]',err?.message||err);}
+      deferServerTask('GROUP ACTION NOTIFY',()=>notifyDirectGroupChange(id,kind,messageId),0);
+      reply({success:true,message});
+    }catch(err){if(db)await db.query('ROLLBACK').catch(()=>{});reply({success:false,message:err.message||'Could not update group message.'});}
+    finally{if(db)db.release();}
+  });
+
   socket.on('request_direct_conversations', async (_data = {}, callback) => {
     const respond = typeof callback === 'function' ? callback : payload => socket.emit('direct_conversations', payload);
     const viewer = normalizeDirectMessageUser(socket.userName);
