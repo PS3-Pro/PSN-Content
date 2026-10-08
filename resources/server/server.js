@@ -1245,6 +1245,8 @@ const METADATA_CACHE_MAX_ITEMS = Math.max(50, Math.min(1000, parseInt(
   10
 ) || 300));
 const METADATA_PROXY_CACHE_MAX = METADATA_CACHE_MAX_ITEMS;
+const METADATA_SHARED_CACHE_MS = 14 * 24 * 60 * 60 * 1000;
+let metadataSharedCachePrunedAt = 0;
 const METADATA_LIVE_SCHEMA_VERSION = 1;
 const METADATA_LIVE_PENDING_MAX = Math.max(2, Math.min(24, parseInt(process.env.METADATA_LIVE_PENDING_MAX || '8', 10) || 8));
 const RAWG_SERVER_KEYS = String(process.env.RAWG_KEYS || process.env.RAWG_API_KEYS || process.env.RAWG_KEY || '').split(/[\s,;]+/).map(value => value.trim()).filter(Boolean).slice(0, 16);
@@ -1281,6 +1283,39 @@ function setMetadataProxyCache(key, value) {
     const oldestKey = metadataProxyCache.keys().next().value;
     if (oldestKey === undefined) break;
     metadataProxyCache.delete(oldestKey);
+  }
+}
+
+async function readSharedMetadataProviderCache(cacheKey) {
+  if (!cacheKey) return null;
+  try {
+    const result = await pool.query({
+      text: 'SELECT payload FROM metadata_provider_cache WHERE cache_key=$1 AND expires_at>NOW() LIMIT 1',
+      values: [cacheKey],
+      query_timeout: 1200
+    });
+    return result.rows[0]?.payload || null;
+  } catch (err) { return null; }
+}
+
+function saveSharedMetadataProviderCache(cacheKey, payload) {
+  if (!cacheKey || !payload) return;
+  const serialized = JSON.stringify(payload);
+  if (Buffer.byteLength(serialized) > 150000) return;
+  pool.query({
+    text: `INSERT INTO metadata_provider_cache(cache_key,payload,expires_at)
+      VALUES($1,$2::jsonb,NOW()+INTERVAL '14 days')
+      ON CONFLICT(cache_key) DO UPDATE SET payload=EXCLUDED.payload,expires_at=EXCLUDED.expires_at`,
+    values: [cacheKey, serialized],
+    query_timeout: 1800
+  }).catch(() => {});
+  if (Date.now() - metadataSharedCachePrunedAt > 6 * 60 * 60 * 1000) {
+    metadataSharedCachePrunedAt = Date.now();
+    pool.query({
+      text: `DELETE FROM metadata_provider_cache WHERE ctid IN
+        (SELECT ctid FROM metadata_provider_cache WHERE expires_at<=NOW() LIMIT 300)`,
+      query_timeout: 1800
+    }).catch(() => {});
   }
 }
 
@@ -1529,10 +1564,19 @@ async function getOrLoadLiveMetadataProvider(cacheKey, loader) {
     err.code = 'METADATA_LIVE_BUSY';
     throw err;
   }
-  const pending = Promise.resolve().then(loader).then(value => {
-    if (value) setMetadataProxyCache(cacheKey, value);
+  const pending = (async () => {
+    const persisted = await readSharedMetadataProviderCache(cacheKey);
+    if (persisted) {
+      setMetadataProxyCache(cacheKey, persisted);
+      return persisted;
+    }
+    const value = await loader();
+    if (value) {
+      setMetadataProxyCache(cacheKey, value);
+      saveSharedMetadataProviderCache(cacheKey, value);
+    }
     return value;
-  }).finally(() => { metadataLiveProviderPending.delete(cacheKey); });
+  })().finally(() => { metadataLiveProviderPending.delete(cacheKey); });
   metadataLiveProviderPending.set(cacheKey, pending);
   return { value: await pending, cached: false };
 }
@@ -1777,10 +1821,16 @@ app.get('/api/metadata/igdb', async (req, res) => {
   const cacheKey = `igdb:${query.toLowerCase()}`;
   const cached = getMetadataProxyCache(cacheKey);
   if (cached) return res.json({ ...cached, cached: true });
+  const persisted = await readSharedMetadataProviderCache(`proxy:${cacheKey}`);
+  if (persisted) {
+    setMetadataProxyCache(cacheKey, persisted);
+    return res.json({ ...persisted, cached: true });
+  }
   try {
     const results = await queryIgdbGames(query, clientId, clientSecret);
     const payload = { ok: true, provider: 'igdb', configured: true, results };
     setMetadataProxyCache(cacheKey, payload);
+    saveSharedMetadataProviderCache(`proxy:${cacheKey}`, payload);
     return res.json(payload);
   } catch (err) {
     const status = Number(err && err.status || 502);
@@ -1796,6 +1846,11 @@ app.get('/api/metadata/steam/search', async (req, res) => {
   const cacheKey = `steam-search:${query.toLowerCase()}`;
   const cached = getMetadataProxyCache(cacheKey);
   if (cached) return res.json({ ...cached, cached: true });
+  const persisted = await readSharedMetadataProviderCache(`proxy:${cacheKey}`);
+  if (persisted) {
+    setMetadataProxyCache(cacheKey, persisted);
+    return res.json({ ...persisted, cached: true });
+  }
   try {
     const url = new URL('https://store.steampowered.com/api/storesearch/');
     url.searchParams.set('term', query);
@@ -1814,6 +1869,7 @@ app.get('/api/metadata/steam/search', async (req, res) => {
     })).filter(item => item.id && item.name);
     const payload = { ok: true, provider: 'steam', results };
     setMetadataProxyCache(cacheKey, payload);
+    saveSharedMetadataProviderCache(`proxy:${cacheKey}`, payload);
     return res.json(payload);
   } catch (err) {
     console.warn(`[METADATA STEAM SEARCH] ${query}: ${err && err.message ? err.message : err}`);
@@ -1828,6 +1884,11 @@ app.get('/api/metadata/steam/details', async (req, res) => {
   const cacheKey = `steam-details:${appId}`;
   const cached = getMetadataProxyCache(cacheKey);
   if (cached) return res.json({ ...cached, cached: true });
+  const persisted = await readSharedMetadataProviderCache(`proxy:${cacheKey}`);
+  if (persisted) {
+    setMetadataProxyCache(cacheKey, persisted);
+    return res.json({ ...persisted, cached: true });
+  }
   try {
     const url = new URL('https://store.steampowered.com/api/appdetails');
     url.searchParams.set('appids', appId);
@@ -1840,6 +1901,7 @@ app.get('/api/metadata/steam/details', async (req, res) => {
     }
     const payload = { ok: true, provider: 'steam', details: normalizeSteamDetails(appId, entry.data) };
     setMetadataProxyCache(cacheKey, payload);
+    saveSharedMetadataProviderCache(`proxy:${cacheKey}`, payload);
     return res.json(payload);
   } catch (err) {
     console.warn(`[METADATA STEAM DETAILS] ${appId}: ${err && err.message ? err.message : err}`);
@@ -2528,6 +2590,12 @@ async function initDb() {
     );
     CREATE INDEX IF NOT EXISTS idx_content_metadata_overrides_title_id ON content_metadata_overrides(title_id);
     CREATE INDEX IF NOT EXISTS idx_content_metadata_overrides_updated_at ON content_metadata_overrides(updated_at DESC);
+    CREATE TABLE IF NOT EXISTS metadata_provider_cache (
+      cache_key TEXT PRIMARY KEY,
+      payload JSONB NOT NULL,
+      expires_at TIMESTAMPTZ NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_metadata_provider_cache_expires ON metadata_provider_cache(expires_at);
     CREATE TABLE IF NOT EXISTS content_metadata_suggestions (
       id BIGSERIAL PRIMARY KEY,
       metadata_key TEXT NOT NULL,
