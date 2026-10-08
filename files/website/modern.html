@@ -1401,6 +1401,18 @@ html.ios-webkit #object-particles { contain:strict; }
 .sys-modal-close:hover { color:#ff4444; }
 .sys-modal-body { padding: 20px; }
 
+/* --- SCROLL EDGE FADES (VERTICAL / HORIZONTAL) --- */
+.psn-scroll-fade-y { --psn-scroll-fade-top:#000; --psn-scroll-fade-bottom:#000; -webkit-mask-image:linear-gradient(to bottom,var(--psn-scroll-fade-top) 0,#000 min(20px,15%),#000 calc(100% - min(20px,15%)),var(--psn-scroll-fade-bottom) 100%); mask-image:linear-gradient(to bottom,var(--psn-scroll-fade-top) 0,#000 min(20px,15%),#000 calc(100% - min(20px,15%)),var(--psn-scroll-fade-bottom) 100%); }
+.psn-scroll-fade-y.psn-scroll-edge-top { --psn-scroll-fade-top:transparent; }
+.psn-scroll-fade-y.psn-scroll-edge-bottom { --psn-scroll-fade-bottom:transparent; }
+.psn-scroll-fade-x { --psn-scroll-fade-left:#000; --psn-scroll-fade-right:#000; -webkit-mask-image:linear-gradient(to right,var(--psn-scroll-fade-left) 0,#000 min(26px,15%),#000 calc(100% - min(26px,15%)),var(--psn-scroll-fade-right) 100%); mask-image:linear-gradient(to right,var(--psn-scroll-fade-left) 0,#000 min(26px,15%),#000 calc(100% - min(26px,15%)),var(--psn-scroll-fade-right) 100%); scrollbar-width:none; -ms-overflow-style:none; }
+.psn-scroll-fade-x::-webkit-scrollbar { display:none; width:0; height:0; }
+.psn-scroll-fade-x.psn-scroll-edge-left { --psn-scroll-fade-left:transparent; }
+.psn-scroll-fade-x.psn-scroll-edge-right { --psn-scroll-fade-right:transparent; }
+.psn-page-scroll-fade { position:fixed; height:22px; pointer-events:none; z-index:18; opacity:0; visibility:hidden; transition:opacity .16s ease; }
+.psn-page-scroll-fade.is-visible { opacity:1; visibility:visible; }
+.psn-page-scroll-fade.psn-page-scroll-fade-top { background:linear-gradient(to bottom,rgba(7,12,22,.76),rgba(7,12,22,0)); }
+.psn-page-scroll-fade.psn-page-scroll-fade-bottom { background:linear-gradient(to top,rgba(5,9,18,.83),rgba(5,9,18,0)); }
 .psn-scroll-edge-polish { --psn-scroll-top-shadow:rgba(0,0,0,0); --psn-scroll-bottom-shadow:rgba(0,0,0,0); box-shadow:inset 0 12px 12px -14px var(--psn-scroll-top-shadow),inset 0 -12px 12px -14px var(--psn-scroll-bottom-shadow); transition:box-shadow .18s ease; }
 .psn-scroll-edge-polish.psn-scroll-edge-top { --psn-scroll-top-shadow:rgba(0,0,0,.72); }
 .psn-scroll-edge-polish.psn-scroll-edge-bottom { --psn-scroll-bottom-shadow:rgba(0,0,0,.72); }
@@ -105928,23 +105940,98 @@ function getVisibleChatStackEl(id) {
             '.profile-card-style-scroll',
             '.avatar-picker-scroll',
             '.ps3-pad-controller-info-card',
-            '.ps3-pad-keyboard-settings-grid'
+            '.ps3-pad-keyboard-settings-grid',
+            '.ps3-console-popover-list',
+            '.artemis-cheats-list',
+            '#direct-group-list',
+            '#direct-mention-suggestions',
+            '#avatar-selection-grid',
+            '#editor-emoji-panel'
         ].join(',');
+        const horizontalSelector = [
+            '.letter-filter',
+            '.horizontal-scroll',
+            '.screenshot-gallery',
+            '#modal-screenshots',
+            '.metadata-screenshot-preview',
+            '.admin-metadata-suggestion-screenshot-strip',
+            '#psn-image-modal .psn-image-thumb-strip',
+            '#view-browse .browse-toolbar > .toolbar-group:nth-of-type(2)',
+            '.rawg-alt2-tagline',
+            '.admin-maintenance-days',
+            '.direct-format-toolbar',
+            '.direct-media-preview'
+        ].join(',');
+        const allEdgeSelector = edgeSelector + ',' + horizontalSelector;
         const edgeBound = new WeakSet();
         const activityBound = new WeakSet();
+        const pendingEdges = new WeakSet();
+        let pageFadeTop = null;
+        let pageFadeBottom = null;
+        let pageFadeGeometry = '';
         const resizeObserver = typeof ResizeObserver === 'function'
             ? new ResizeObserver(entries => {
                 for (const entry of entries) updateEdge(entry.target);
             })
             : null;
 
+        function updatePageFade(main, showTop, showBottom) {
+            if (!document.body || !document.body.classList.contains('psn-home-interactive')) return;
+            if (!pageFadeTop) {
+                pageFadeTop = document.createElement('div');
+                pageFadeBottom = document.createElement('div');
+                pageFadeTop.className = 'psn-page-scroll-fade psn-page-scroll-fade-top';
+                pageFadeBottom.className = 'psn-page-scroll-fade psn-page-scroll-fade-bottom';
+                pageFadeTop.setAttribute('aria-hidden', 'true');
+                pageFadeBottom.setAttribute('aria-hidden', 'true');
+                document.body.append(pageFadeTop, pageFadeBottom);
+            }
+            const rect = main.getBoundingClientRect();
+            let fadeTop = rect.top;
+            if (showTop) {
+                const sticky = main.querySelectorAll('.browse-toolbar.scrolled');
+                for (const toolbar of sticky) {
+                    const stickyRect = toolbar.getBoundingClientRect();
+                    if (stickyRect.height && stickyRect.top <= rect.top + 5 && stickyRect.bottom > fadeTop && stickyRect.bottom < rect.bottom) fadeTop = stickyRect.bottom;
+                }
+            }
+            const geometry = [Math.round(rect.left),Math.round(rect.width),Math.round(fadeTop),Math.round(rect.bottom)].join(',');
+            if (pageFadeGeometry !== geometry) {
+                pageFadeGeometry = geometry;
+                const left = rect.left + 'px';
+                const width = rect.width + 'px';
+                pageFadeTop.style.left = pageFadeBottom.style.left = left;
+                pageFadeTop.style.width = pageFadeBottom.style.width = width;
+                pageFadeTop.style.top = fadeTop + 'px';
+                pageFadeBottom.style.top = Math.max(fadeTop, rect.bottom - 22) + 'px';
+            }
+            pageFadeTop.classList.toggle('is-visible', showTop && fadeTop + 22 < rect.bottom);
+            pageFadeBottom.classList.toggle('is-visible', showBottom && rect.height > 40);
+        }
+
         function updateEdge(el) {
             if (!el || !el.isConnected) return;
-            const max = Math.max(0, el.scrollHeight - el.clientHeight);
-            const scrollable = max > 4;
-            el.classList.toggle('psn-scroll-edge-polish', scrollable);
-            el.classList.toggle('psn-scroll-edge-top', scrollable && el.scrollTop > 3);
-            el.classList.toggle('psn-scroll-edge-bottom', scrollable && el.scrollTop < max - 3);
+            const vertical = el.matches(edgeSelector);
+            const horizontal = el.matches(horizontalSelector);
+            const visible = el.clientWidth > 0 && el.clientHeight > 0;
+            const maxY = vertical && visible ? Math.max(0,el.scrollHeight - el.clientHeight) : 0;
+            const maxX = horizontal && visible ? Math.max(0,el.scrollWidth - el.clientWidth) : 0;
+            const hasY = maxY > 4;
+            const hasX = maxX > 4;
+            el.classList.toggle('psn-scroll-edge-polish', hasY);
+            el.classList.toggle('psn-scroll-edge-top', hasY && el.scrollTop > 3);
+            el.classList.toggle('psn-scroll-edge-bottom', hasY && el.scrollTop < maxY - 3);
+            el.classList.toggle('psn-scroll-edge-left', hasX && el.scrollLeft > 3);
+            el.classList.toggle('psn-scroll-edge-right', hasX && el.scrollLeft < maxX - 3);
+            el.classList.toggle('psn-scroll-fade-y', hasY && !el.classList.contains('main-content') && !el.classList.contains('sidebar'));
+            el.classList.toggle('psn-scroll-fade-x', hasX);
+            if (el.classList.contains('main-content')) updatePageFade(el,hasY && el.scrollTop > 3,hasY && el.scrollTop < maxY - 3);
+        }
+
+        function scheduleEdge(el) {
+            if (!el || pendingEdges.has(el)) return;
+            pendingEdges.add(el);
+            requestAnimationFrame(() => { pendingEdges.delete(el); updateEdge(el); });
         }
 
         function markScrolling(el) {
@@ -105960,10 +106047,11 @@ function getVisibleChatStackEl(id) {
         function bindActivity(el) {
             if (!el || activityBound.has(el)) return;
             activityBound.add(el);
-            el.classList.add('psn-scrollbar-polished');
+            const horizontal = el.matches(horizontalSelector);
+            if (!horizontal) el.classList.add('psn-scrollbar-polished');
             el.addEventListener('scroll', () => {
-                markScrolling(el);
-                if (edgeBound.has(el)) updateEdge(el);
+                if (!horizontal) markScrolling(el);
+                if (edgeBound.has(el)) scheduleEdge(el);
             }, { passive:true });
         }
 
@@ -105976,13 +106064,13 @@ function getVisibleChatStackEl(id) {
             }
             edgeBound.add(el);
             if (resizeObserver) resizeObserver.observe(el);
-            requestAnimationFrame(() => updateEdge(el));
+            scheduleEdge(el);
         }
 
         function scan(root) {
             const scope = root && root.querySelectorAll ? root : document;
-            if (scope.matches && scope.matches(edgeSelector)) bindEdge(scope);
-            scope.querySelectorAll(edgeSelector).forEach(bindEdge);
+            if (scope.matches && scope.matches(allEdgeSelector)) bindEdge(scope);
+            scope.querySelectorAll(allEdgeSelector).forEach(bindEdge);
         }
 
         if (document.readyState === 'loading') {
@@ -105991,7 +106079,8 @@ function getVisibleChatStackEl(id) {
             scan(document);
         }
 
-        window.addEventListener('resize', () => requestAnimationFrame(() => scan(document)), { passive:true });
+        window.addEventListener('resize', () => { pageFadeGeometry = ''; requestAnimationFrame(() => scan(document)); }, { passive:true });
+        if (typeof window.runPsnAfterHomeInteractive === 'function') window.runPsnAfterHomeInteractive(() => scheduleEdge(document.querySelector('.main-content')));
 
         const pendingRoots = new Set();
         let pendingScanFrame = 0;
@@ -106009,7 +106098,7 @@ function getVisibleChatStackEl(id) {
         function refreshEdgeAncestors(node) {
             let current = node && node.nodeType === 1 ? node : node?.parentElement;
             while (current && current !== document.documentElement) {
-                if (current.matches && current.matches(edgeSelector)) updateEdge(current);
+                if (current.matches && current.matches(allEdgeSelector)) scheduleEdge(current);
                 current = current.parentElement;
             }
         }
