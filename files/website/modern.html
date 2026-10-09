@@ -3683,6 +3683,10 @@ html.samsung-browser .particle-core-mark, html.samsung-browser .particle-core-ma
 .psn-download-motion-ripple { position: fixed; pointer-events: none; z-index: 22049; border: 1px solid rgba(102,204,255,.78); border-radius: 9px; box-shadow: 0 0 16px rgba(0,112,204,.44), inset 0 0 12px rgba(102,204,255,.12); animation: psnDownloadMotionRipple .42s cubic-bezier(.16,.84,.28,1) forwards; }
 #nav-downloads.psn-download-motion-hit>i { animation: psnDownloadNavHit .46s cubic-bezier(.16,.84,.28,1); }
 #nav-chat-play-together.psn-collection-motion-hit>i { animation: psnPlayTogetherNavHit .46s cubic-bezier(.16,.84,.28,1); }
+#nav-chat-friends.psn-collection-motion-hit>i { animation: psnFriendNavHit .46s cubic-bezier(.16,.84,.28,1); }
+#friends-list-grid .online-user-item.psn-collection-motion-hit .online-user-avatar { animation: psnFriendAvatarHit .46s cubic-bezier(.16,.84,.28,1); }
+@keyframes psnFriendNavHit { 0%,100%{transform:translateY(0) scale(1);filter:brightness(1);}38%{transform:translateY(-1px) scale(1.24);filter:brightness(1.36) drop-shadow(0 0 9px rgba(172,145,255,.8));}68%{transform:translateY(0) scale(.94);filter:brightness(1.08);} }
+@keyframes psnFriendAvatarHit { 0%,100%{transform:scale(1);filter:brightness(1);}42%{transform:scale(1.055);filter:brightness(1.2);box-shadow:0 0 18px rgba(172,145,255,.32);} }
 .direct-message-row.psn-direct-share-arrival .direct-message-bubble { animation: psnDirectShareBubbleArrival .52s cubic-bezier(.16,.84,.28,1); }
 .direct-message-row.psn-direct-share-arrival .chat-internal-share-link { animation: psnDirectShareLinkArrival .52s cubic-bezier(.16,.84,.28,1); }
 @keyframes psnPlayTogetherNavHit { 0%,100%{transform:translateY(0) scale(1);filter:brightness(1);}38%{transform:translateY(-1px) scale(1.24);filter:brightness(1.42) drop-shadow(0 0 9px rgba(0,212,154,.78));}68%{transform:translateY(0) scale(.94);filter:brightness(1.08);} }
@@ -24062,13 +24066,14 @@ P
 		const arc = options.arc === false ? 0 : Math.min(58, Math.max(18, distance * .07));
 		const duration = Math.max(180, Number(options.duration) || 450);
 		const end = `translate3d(${dx}px,${dy}px,0) scale(${sx},${sy})`;
+		const fadeIntoModalBlur = options.fadeIntoModalBlur === true;
 
 		try {
 			const animation = clone.animate([
 				{ offset:0, transform:'translate3d(0,0,0) scale(1)', opacity:1, filter:'brightness(1)' },
-				{ offset:.56, transform:`translate3d(${dx * .56}px,${dy * .50 - arc}px,0) scale(${1 + (sx - 1) * .56},${1 + (sy - 1) * .56})`, opacity:1, filter:'brightness(1.18)' },
-				{ offset:.88, transform:end, opacity:1, filter:'brightness(1.34)' },
-				{ offset:1, transform:end, opacity:.06, filter:'brightness(1.22)' }
+				{ offset:.56, transform:`translate3d(${dx * .56}px,${dy * .50 - arc}px,0) scale(${1 + (sx - 1) * .56},${1 + (sy - 1) * .56})`, opacity:1, filter:fadeIntoModalBlur ? 'blur(1px) brightness(1.08)' : 'brightness(1.18)' },
+				{ offset:.88, transform:end, opacity:fadeIntoModalBlur ? .65 : 1, filter:fadeIntoModalBlur ? 'blur(5px) brightness(.94)' : 'brightness(1.34)' },
+				{ offset:1, transform:end, opacity:.06, filter:fadeIntoModalBlur ? 'blur(8px) brightness(.86)' : 'brightness(1.22)' }
 			], {
 				duration,
 				easing:options.easing || 'cubic-bezier(.16,.84,.24,1)',
@@ -26081,6 +26086,10 @@ P
 				ripple.style.setProperty('--psn-collection-motion-color', 'rgba(255,220,75,.84)');
 				ripple.style.setProperty('--psn-collection-motion-glow', 'rgba(255,204,0,.40)');
 				ripple.style.setProperty('--psn-collection-motion-soft', 'rgba(255,220,75,.12)');
+			} else if (kind === 'friend') {
+				ripple.style.setProperty('--psn-collection-motion-color', 'rgba(172,145,255,.84)');
+				ripple.style.setProperty('--psn-collection-motion-glow', 'rgba(145,104,255,.40)');
+				ripple.style.setProperty('--psn-collection-motion-soft', 'rgba(172,145,255,.12)');
 			}
 			applyPsnBackgroundMotionLayer(ripple, 22049);
 			ripple.dataset.psnMotionKind = 'feedback';
@@ -26096,7 +26105,7 @@ P
 			schedulePsnMotionClassCleanup(hitTarget, 'psn-collection-motion-hit', 520);
 		}
 
-		const pillId = kind === 'wishlist' ? 'sidebar-count-wishlist' : 'sidebar-count-favorites';
+		const pillId = kind === 'wishlist' ? 'sidebar-count-wishlist' : kind === 'friend' ? 'sidebar-count-friends' : 'sidebar-count-favorites';
 		const pill = document.getElementById(pillId);
 		if (!target?.card && pill && typeof window.animateCountPillFeedback === 'function') window.animateCountPillFeedback(pill);
 	}
@@ -26164,6 +26173,76 @@ P
 			destRadius:'6px',
 			onHit:pulsePsnPlayTogetherMotionTarget
 		});
+	};
+
+	function isPsnFriendMotionAvatarVisible(img) {
+		if (!img?.isConnected) return false;
+		const rect = img.getBoundingClientRect();
+		if (rect.width < 12 || rect.height < 12 || rect.right <= 0 || rect.bottom <= 0 ||
+			rect.left >= window.innerWidth || rect.top >= window.innerHeight) return false;
+		const style = window.getComputedStyle(img);
+		return style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity) !== 0;
+	}
+
+	function isPsnFriendsSubviewVisible() {
+		const view = document.getElementById('subview-friends');
+		const rect = view?.getBoundingClientRect?.();
+		return !!(rect && rect.width > 0 && rect.height > 0 && window.getComputedStyle(view).display !== 'none');
+	}
+
+	function getPsnFriendMotionTarget(name) {
+		if (isPsnFriendsSubviewVisible()) {
+			const key = String(name || '').trim().toLowerCase();
+			const cards = document.querySelectorAll('#friends-list-grid .online-user-item');
+			for (const card of cards) {
+				const avatar = card.querySelector('img.online-user-avatar');
+				if (!avatar || String(avatar.dataset.user || '').trim().toLowerCase() !== key ||
+					!isPsnFriendMotionAvatarVisible(avatar)) continue;
+				const r = avatar.getBoundingClientRect();
+				return { element:avatar, card, rect:{ left:r.left, top:r.top, width:r.width, height:r.height } };
+			}
+		}
+		return getPsnCollectionNavMotionTarget('nav-chat-friends');
+	}
+
+	window.capturePsnFriendAvatarMotionSource = function(name, triggerElement) {
+		if (document.hidden || isPsnSharedMotionReduced() ||
+			(!getPsnCollectionNavMotionTarget('nav-chat-friends') && !isPsnFriendsSubviewVisible())) return null;
+		const key = String(name || '').trim().toLowerCase();
+		if (!key) return null;
+		if (triggerElement?.id === 'direct-thread-friend-add' && String(triggerElement.dataset.peer || '').trim().toLowerCase() === key) {
+			const avatar = document.getElementById('direct-thread-avatar');
+			if (isPsnFriendMotionAvatarVisible(avatar)) return capturePsnSharedElementSnapshot(avatar);
+		}
+		const row = triggerElement?.closest?.('.online-user-item,.direct-conversation-item,.user-notification-item,.admin-user-row,.friend-activity-item,.direct-new-message-person');
+		const rowAvatar = row?.querySelector?.('img.online-user-avatar,img.direct-conversation-avatar,img.user-notification-avatar,img.friend-activity-avatar,img[data-user],img') || null;
+		if (isPsnFriendMotionAvatarVisible(rowAvatar)) return capturePsnSharedElementSnapshot(rowAvatar);
+		const modal = document.getElementById('modal-sys-profile');
+		if (modal?.classList.contains('show') && String(document.getElementById('card-username')?.textContent || '').trim().toLowerCase() === key) {
+			const avatar = document.getElementById('card-avatar');
+			if (isPsnFriendMotionAvatarVisible(avatar)) return capturePsnSharedElementSnapshot(avatar);
+		}
+		for (const img of document.querySelectorAll('img[data-user]')) {
+			if (String(img.dataset.user || '').trim().toLowerCase() === key && isPsnFriendMotionAvatarVisible(img))
+				return capturePsnSharedElementSnapshot(img);
+		}
+		return null;
+	};
+
+	window.runFriendAvatarTransferMotion = async function(source, name, expectedUser) {
+		const stillFriend = () => Array.isArray(window.friendsList) && window.friendsList.some(friend =>
+			String(friend && (friend.name || friend) || '').trim().toLowerCase() === String(name || '').trim().toLowerCase());
+		if (!source || !expectedUser || String(localStorage.getItem('psn_username') || '').trim() !== expectedUser || !stillFriend()) return false;
+		await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+		const target = getPsnFriendMotionTarget(name);
+		if (!target || String(localStorage.getItem('psn_username') || '').trim() !== expectedUser || !stillFriend()) return false;
+		const arrived = await animatePsnSharedElementSnapshot(source, target.rect, {
+			kind:'friend', duration:470, borderRadius:'50%', easing:'cubic-bezier(.16,.84,.24,1)',
+			fadeIntoModalBlur:getPsnBackgroundMotionLayerZIndex() < 22050
+		});
+		if (arrived && String(localStorage.getItem('psn_username') || '').trim() === expectedUser && stillFriend())
+			pulsePsnCollectionMotionTarget(target, 'friend');
+		return arrived;
 	};
 
 
@@ -91576,7 +91655,7 @@ function getVisibleChatStackEl(id) {
 					<button class="btn-mini-round ${isFriend ? 'btn-friend-remove' : 'btn-friend-add'}" 
 							onmouseenter="if(typeof playUiArrow === 'function') playUiArrow()"
 							title="${isFriend ? 'Remove Friend' : 'Add Friend'}" 
-							onclick="event.stopPropagation(); toggleFriend('${username}', '${userAvatar}'); updateSpecificUserRow('${targetSocketId}', '${username}');">
+							onclick="event.stopPropagation(); toggleFriend('${username}', '${userAvatar}', this); updateSpecificUserRow('${targetSocketId}', '${username}');">
 						<i class="fas ${isFriend ? 'fa-user-minus' : 'fa-user-plus'}"></i>
 					</button>
 					${((typeof window.canModerateChat === 'function' ? window.canModerateChat(username, userObj) : isAdmin) && targetSocketId) ? `
@@ -96457,6 +96536,10 @@ function getVisibleChatStackEl(id) {
 	window.toggleFriend = async function(name, avatar, triggerElement = null) {
 		const expectedUser = String(localStorage.getItem('psn_username') || '').trim();
 		if (!expectedUser) return false;
+		const mightAddFriend = !Array.isArray(window.friendsList) || !window.friendsList.some(friend =>
+			String(friend && (friend.name || friend) || '') === name);
+		const friendFlightSource = mightAddFriend && typeof window.capturePsnFriendAvatarMotionSource === 'function'
+			? window.capturePsnFriendAvatarMotionSource(name, triggerElement) : null;
 		if (typeof window.ensureMutableProfileSectionReady === 'function') {
 			const ready = await window.ensureMutableProfileSectionReady('friends', 'toggle-friend');
 			if (!ready || expectedUser !== String(localStorage.getItem('psn_username') || '').trim()) return false;
@@ -96564,6 +96647,8 @@ function getVisibleChatStackEl(id) {
 		});
 		if (typeof playUiSuccess === 'function') playUiSuccess();
 		finishFriendChange({ previousCount, kind:'add' });
+		if (friendFlightSource && typeof window.runFriendAvatarTransferMotion === 'function')
+			void window.runFriendAvatarTransferMotion(friendFlightSource, name, expectedUser).catch(() => false);
 		if (window.__friendAddingName === name) {
 			setTimeout(() => {
 				if (window.__friendAddingName === name) window.__friendAddingName = '';
