@@ -6997,6 +6997,21 @@ img { -webkit-user-drag: none !important; user-drag: none !important; }
 #direct-group-input:empty::before { content:attr(data-placeholder); color:rgba(255,255,255,.32); pointer-events:none; }
 #direct-group-input:focus { border-color:rgba(102,204,255,.7); box-shadow:0 0 0 2px rgba(102,204,255,.08); }
 .direct-group-author { font-size:11px; font-weight:700; color:#66ccff; margin-bottom:5px; }
+.direct-group-read-indicator { position:relative; display:inline-flex; width:20px; height:20px; flex:0 0 20px; padding:0; align-items:center; justify-content:center; border:0; border-radius:6px; background:transparent; color:rgba(255,255,255,.42); cursor:pointer; transition:color .16s ease,background .16s ease,transform .12s ease; }
+.direct-group-read-indicator i { position:absolute; font-size:10px; left:3px; }
+.direct-group-read-indicator i+ i { left:8px; }
+.direct-group-read-indicator.is-all-seen { color:#4caf50; }
+.direct-group-read-indicator:not(:disabled):hover { background:rgba(255,255,255,.08); }
+.direct-group-read-indicator:not(:disabled):active { transform:scale(.91); }
+.direct-group-read-indicator:disabled { cursor:default; }
+.direct-group-read-details { position:fixed; z-index:100504; width:min(270px,calc(100vw - 24px)); max-height:min(320px,60dvh); overflow-y:auto; padding:12px; border:1px solid rgba(255,255,255,.16); border-radius:10px; color:#fff; background:rgba(16,23,35,.97); box-shadow:0 14px 40px rgba(0,0,0,.45); backdrop-filter:blur(14px); }
+.direct-group-read-details-title { font-weight:700; font-size:12px; margin-bottom:9px; }
+.direct-group-read-person { display:flex; align-items:center; gap:8px; min-height:29px; font-size:11px; color:rgba(255,255,255,.7); }
+.direct-group-read-person i { width:15px; text-align:center; color:rgba(255,255,255,.28); }
+.direct-group-read-person.is-seen i { color:#4caf50; }
+.direct-group-read-person span { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.direct-group-read-unavailable { color:rgba(255,255,255,.52); font-size:11px; line-height:1.5; }
+.direct-conversation-delivery.is-partial .direct-conversation-delivery-second { display:block; }
 .direct-group-member-picker { position:fixed; inset:0; z-index:100501; display:none; align-items:center; justify-content:center; padding:18px; background:rgba(0,0,0,.7); backdrop-filter:blur(10px); -webkit-backdrop-filter:blur(10px); }
 .direct-group-member-picker.is-open { display:flex; }
 .direct-group-member-picker.direct-profile-behind { z-index:9999 !important; pointer-events:none !important; }
@@ -33273,6 +33288,58 @@ P
 		scrollObserver_Infinite.observe(sentinel);
 	};
 	
+	function reconcileBrowseGroupTitleCards(grid, backButtonHtml, cardsHtml) {
+		const fragment = document.createElement('template');
+		fragment.innerHTML = backButtonHtml + cardsHtml;
+		const oldCards = Array.from(grid.querySelectorAll(':scope > .game-card'));
+		const available = new Map();
+		for (const card of oldCards) {
+			const family = card.getAttribute('data-browse-motion-family') || '';
+			const image = card.querySelector('.game-img-container > .game-img');
+			const src = image?.getAttribute('src') || '';
+			if (!family || !src) continue;
+			const key = family + '\n' + src;
+			if (!available.has(key)) available.set(key, []);
+			available.get(key).push(card);
+		}
+		const desired = [];
+		for (const fresh of Array.from(fragment.content.children)) {
+			if (!fresh.classList.contains('game-card')) { desired.push(fresh); continue; }
+			const freshImage = fresh.querySelector('.game-img-container > .game-img');
+			const key = (fresh.getAttribute('data-browse-motion-family') || '') + '\n' + (freshImage?.getAttribute('src') || '');
+			const matches = available.get(key);
+			const retained = matches?.shift();
+			if (!retained) { desired.push(fresh); continue; }
+
+			const oldImage = retained.querySelector('.game-img-container > .game-img');
+			const oldCover = oldImage?.parentElement;
+			const nextCover = freshImage?.parentElement;
+			const nextInfo = fresh.querySelector(':scope > .game-info');
+			const oldInfo = retained.querySelector(':scope > .game-info');
+			if (!oldCover || !nextCover || !oldInfo || !nextInfo) { desired.push(fresh); continue; }
+
+			for (const attr of Array.from(retained.attributes)) if (!fresh.hasAttribute(attr.name)) retained.removeAttribute(attr.name);
+			for (const attr of Array.from(fresh.attributes)) if (retained.getAttribute(attr.name) !== attr.value) retained.setAttribute(attr.name, attr.value);
+			for (const attr of Array.from(oldCover.attributes)) if (!nextCover.hasAttribute(attr.name)) oldCover.removeAttribute(attr.name);
+			for (const attr of Array.from(nextCover.attributes)) if (oldCover.getAttribute(attr.name) !== attr.value) oldCover.setAttribute(attr.name, attr.value);
+			for (const attr of Array.from(oldImage.attributes)) if (attr.name !== 'data-loaded' && !freshImage.hasAttribute(attr.name)) oldImage.removeAttribute(attr.name);
+			for (const attr of Array.from(freshImage.attributes)) if (attr.name !== 'src' && attr.name !== 'data-loaded') if (oldImage.getAttribute(attr.name) !== attr.value) oldImage.setAttribute(attr.name, attr.value);
+			for (const child of Array.from(oldCover.children)) if (child !== oldImage) child.remove();
+			let pastImage = false;
+			for (const child of Array.from(nextCover.children)) {
+				if (child === freshImage) { pastImage = true; continue; }
+				oldCover.insertBefore(child, pastImage ? null : oldImage);
+			}
+			oldInfo.replaceWith(nextInfo);
+			desired.push(retained);
+		}
+		for (let i = 0; i < desired.length; i++) {
+			const at = grid.children[i];
+			if (at !== desired[i]) grid.insertBefore(desired[i], at || null);
+		}
+		while (grid.children.length > desired.length) grid.lastElementChild.remove();
+	}
+
 	window.renderGrid = function(isAppending = false, options = {}) {
 		const grid = document.getElementById('database-grid');
 		const replacingBrowseSkeletons = !isAppending && !!(grid && grid.querySelector('.skeleton-card'));
@@ -33438,7 +33505,7 @@ P
 				renderLimit = typeof getBrowseInitialRenderLimit === 'function' ? getBrowseInitialRenderLimit() : DEFAULT_RENDER_LIMIT;
 			}
 			
-			grid.innerHTML = backButtonHtml;
+			if (!suppressGroupTitleTransitionReveal || !renderItems.length || !filteredData.length) grid.innerHTML = backButtonHtml;
 			
 			if (filteredData.length === 0 || renderItems.length === 0) {
 				let emptyTitle = '';
@@ -33697,7 +33764,8 @@ P
 				appendedNode = appendedNode.nextElementSibling;
 			}
 		} else {
-			grid.insertAdjacentHTML('beforeend', htmlChunks.join(''));
+			if (suppressGroupTitleTransitionReveal) reconcileBrowseGroupTitleCards(grid, backButtonHtml, htmlChunks.join(''));
+			else grid.insertAdjacentHTML('beforeend', htmlChunks.join(''));
 
 			if (requestedScrollTop !== null) {
 				const scrollArea = document.getElementById('scroll-area') || document.querySelector('.content');
@@ -79861,6 +79929,50 @@ function getVisibleChatStackEl(id) {
   function directGroupNote(text) { if(typeof showToastNotification==='function')showToastNotification('Private Chat',text); }
   function directGroupTime(value) { return typeof directFormatMessageTime==='function'?directFormatMessageTime(value):new Date(value).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}); }
   function directGroupMyName() { return directCurrentUser(); }
+  function directGroupReceiptInfo(message) {
+    const user=directGroupMyName(),from=String(message?.from||'');
+    if(!message||from!==user)return null;
+    const recipientNames=Array.isArray(message.recipients)?message.recipients:(Array.isArray(message.recipientNames)?message.recipientNames:null);
+    const readNames=Array.isArray(message.readBy)?message.readBy:(Array.isArray(message.seenBy)?message.seenBy:null);
+    const recipients=recipientNames?Array.from(new Set(recipientNames.map(value=>String(value?.name||value||'').trim()).filter(name=>name&&name!==from))):[];
+    const read=readNames?new Set(readNames.map(value=>String(value?.name||value||'').trim()).filter(Boolean)):new Set();
+    const known=Array.isArray(recipientNames)&&Array.isArray(readNames)&&recipients.length>0;
+    return {known,recipients,read,complete:known&&recipients.every(name=>read.has(name)),partial:known&&recipients.some(name=>read.has(name))};
+  }
+  function directGroupPreviewReceiptHtml(message) {
+    const receipt=directGroupReceiptInfo(message);
+    if(!receipt)return '';
+    const seen=receipt.complete,partial=receipt.partial&&!seen;
+    const label=seen?'Seen by everyone':partial?'Seen by some members':'Sent';
+    return `<span class="direct-conversation-delivery${seen?' is-seen':partial?' is-partial':''}" title="${label}" aria-label="${label}"><i class="fas fa-check"></i><i class="fas fa-check direct-conversation-delivery-second"></i></span>`;
+  }
+  function directGroupReceiptHtml(message) {
+    const receipt=directGroupReceiptInfo(message);
+    if(!receipt)return '';
+    const label=receipt.complete?'Seen by everyone':receipt.partial?'Seen by some members':'Read details';
+    return `<button type="button" class="direct-group-read-indicator${receipt.complete?' is-all-seen':''}" title="${label}" aria-label="${label}" onclick="event.stopPropagation();window.showDirectGroupReadDetails(event,'${directGroupEscape(message.id)}')"><i class="fas fa-check"></i>${receipt.complete||receipt.partial?'<i class="fas fa-check"></i>':''}</button>`;
+  }
+  window.showDirectGroupReadDetails=function(event,id){
+    const old=document.getElementById('direct-group-read-details');if(old){old.remove();if(old.dataset.messageId===String(id))return;}
+    const message=window.__directGroupState.messages.find(item=>String(item.id)===String(id));if(!message)return;
+    const receipt=directGroupReceiptInfo(message);if(!receipt)return;
+    const detail=document.createElement('div');detail.id='direct-group-read-details';detail.dataset.messageId=String(id);detail.className='direct-group-read-details psn-scrollbar-polished';
+    const people=receipt.known?receipt.recipients.map(name=>`<div class="direct-group-read-person${receipt.read.has(name)?' is-seen':''}"><i class="fas fa-${receipt.read.has(name)?'check-double':'clock'}"></i><span data-no-translate="true" translate="no">${directGroupEscape(name)}</span></div>`).join(''):'<div class="direct-group-read-unavailable">Read receipts are not available yet. Group members’ views must be confirmed by the server.</div>';
+    detail.innerHTML=`<div class="direct-group-read-details-title">${receipt.complete?'Seen by everyone':'Message views'}</div>${people}`;
+    document.body.appendChild(detail);
+    const rect=event.currentTarget.getBoundingClientRect();detail.style.left=Math.max(12,Math.min(window.innerWidth-detail.offsetWidth-12,rect.left-28))+'px';detail.style.top=(rect.bottom+detail.offsetHeight+8<window.innerHeight?rect.bottom+6:Math.max(8,rect.top-detail.offsetHeight-6))+'px';
+    const close=e=>{if(detail.contains(e.target)||event.currentTarget.contains(e.target))return;detail.remove();document.removeEventListener('pointerdown',close,true);};
+    setTimeout(()=>document.addEventListener('pointerdown',close,true),0);
+  };
+  function directGroupMarkRead(){
+    const state=window.__directGroupState,groupId=state.activeId;
+    if(!groupId||!state.group||!socketChat?.connected||!document.getElementById('direct-group-thread')?.classList.contains('is-open')||document.visibilityState==='hidden')return;
+    const last=(state.messages||[]).filter(m=>m.from!==directGroupMyName()).slice(-1)[0];
+    if(!last)return;
+    const key=groupId+'|'+String(last.id);if(state.lastReadSent===key)return;
+    state.lastReadSent=key;
+    socketChat.emit('direct_group_mark_read',{groupId,lastMessageId:last.id},ack=>{if(ack?.success===false&&state.lastReadSent===key)state.lastReadSent='';});
+  }
   function renderDirectGroupList() {
     const container=document.getElementById('direct-group-list');
     if(!container)return;
@@ -79869,7 +79981,9 @@ function getVisibleChatStackEl(id) {
     container.innerHTML='<div class="direct-group-header-label">Groups</div>'+s.groups.map(g=>{
       const id=directGroupEscape(g.id),title=directGroupEscape(g.title),unread=Math.max(0,Number(g.unread)||0),last=g.lastMessage||{};
       const body=last.text?directGroupEscape(directMessagePlainText(last.text).slice(0,110)):'New group conversation';
-      return `<button class="direct-conversation-item${s.activeId===g.id?' active':''}" type="button" data-direct-group="${id}" onclick="window.openDirectGroup('${id}')" onmouseenter="if(typeof playUiHover==='function')playUiHover()"><span class="direct-group-avatar"><i class="fas fa-users"></i></span><span class="direct-conversation-main"><span class="direct-conversation-name-row"><span class="direct-conversation-name" data-no-translate="true" translate="no">${title}</span></span><span class="direct-conversation-preview"><span class="direct-conversation-preview-text">${body}</span></span></span><span class="direct-conversation-side"><span class="direct-conversation-time">${last.createdAt?directGroupEscape(directFormatConversationTime(last.createdAt)):''}</span>${unread?`<span class="direct-unread-badge">${unread>99?'99+':unread}</span>`:''}</span></button>`;
+      const mine=last.from===directGroupMyName(),prefix=last.from?directGroupEscape(mine?'You':last.from)+': ':'';
+      const receipt=directGroupPreviewReceiptHtml(last);
+      return `<button class="direct-conversation-item${s.activeId===g.id?' active':''}" type="button" data-direct-group="${id}" onclick="window.openDirectGroup('${id}')" onmouseenter="if(typeof playUiHover==='function')playUiHover()"><span class="direct-group-avatar"><i class="fas fa-users"></i></span><span class="direct-conversation-main"><span class="direct-conversation-name-row"><span class="direct-conversation-name" data-no-translate="true" translate="no">${title}</span></span><span class="direct-conversation-preview">${receipt}<span class="direct-conversation-preview-text">${prefix}${body}</span></span></span><span class="direct-conversation-side"><span class="direct-conversation-time">${last.createdAt?directGroupEscape(directFormatConversationTime(last.createdAt)):''}</span>${unread?`<span class="direct-unread-badge">${unread>99?'99+':unread}</span>`:''}</span></button>`;
     }).join('');
   }
   window.refreshDirectGroupList=function(){
@@ -79879,7 +79993,7 @@ function getVisibleChatStackEl(id) {
     if(s.owner!==viewer){s.owner=viewer;s.groups=[];s.activeId='';s.group=null;renderDirectGroupList();document.getElementById('direct-group-thread')?.classList.remove('is-open');}
     directGroupSocketEmit('direct_group_list',{},response=>{
       if(directGroupMyName()!==viewer||!response||!response.success)return;
-      const changed=JSON.stringify((s.groups||[]).map(g=>[g.id,g.title,g.memberCount,g.unread,g.lastMessage?.id]))!==JSON.stringify((response.groups||[]).map(g=>[g.id,g.title,g.memberCount,g.unread,g.lastMessage?.id]));
+      const changed=JSON.stringify((s.groups||[]).map(g=>[g.id,g.title,g.memberCount,g.unread,g.lastMessage?.id,g.lastMessage?.text,g.lastMessage?.readBy,g.lastMessage?.recipients]))!==JSON.stringify((response.groups||[]).map(g=>[g.id,g.title,g.memberCount,g.unread,g.lastMessage?.id,g.lastMessage?.text,g.lastMessage?.readBy,g.lastMessage?.recipients]));
       s.groups=response.groups||[];
       if(changed)renderDirectGroupList();
     });
@@ -79982,7 +80096,7 @@ function getVisibleChatStackEl(id) {
     if(!id)return;
     if(s.activeId===id&&s.group&&!options.forceReload)return;
     if(window.__directChatState.activePeer)window.closeDirectMessageThread();
-    s.activeId=id;s.group=null;s.messages=[];s.pins=[];s.pinSignature='';s.pinIndex=0;s.replyTo=null;s.editId='';s.pendingImages=[];s.pollViews={};
+    s.activeId=id;s.group=null;s.messages=[];s.pins=[];s.pinSignature='';s.pinIndex=0;s.replyTo=null;s.editId='';s.pendingImages=[];s.pollViews={};s.lastReadSent='';
     const token=++s.token;
     document.getElementById('direct-thread-empty').style.display='none';
     document.getElementById('direct-thread-active').style.display='none';
@@ -79995,7 +80109,7 @@ function getVisibleChatStackEl(id) {
       if(token!==s.token||s.activeId!==id)return;
       if(!response?.success){directGroupNote(response?.message||'Could not load group.');window.closeDirectGroup({silent:true});return;}
       s.group=response.group;s.messages=response.messages||[];s.pins=response.pinnedMessages||[];
-      renderDirectGroupMessages({forceBottom:true});window.refreshDirectGroupList();
+      renderDirectGroupMessages({forceBottom:true});directGroupMarkRead();window.refreshDirectGroupList();
     });
   };
   function renderDirectGroupPins(){
@@ -80037,7 +80151,7 @@ function getVisibleChatStackEl(id) {
     const reactions=(m.reactions||[]).map(r=>`<button class="direct-group-toolbar-btn" style="width:auto;height:23px;padding:0 7px;font-size:11px" onclick="window.directGroupAction('react','${id}',{emoji:'${directGroupEscape(r.emoji)}'})" title="${directGroupEscape((r.users||[]).join(', '))}">${directGroupEscape(r.emoji)} ${Number(r.count||r.users?.length||0)}</button>`).join('');
     const reply=m.replyTo?.id?`<button class="direct-message-reply" type="button" onclick="window.jumpDirectGroupMessage('${directGroupEscape(m.replyTo.id)}')"><span class="direct-message-reply-user">${directGroupEscape(m.replyTo.from)}</span><span class="direct-message-reply-text">${directGroupEscape(directMessagePlainText(m.replyTo.text).slice(0,90))}</span></button>`:'';
     const mediaHtml=media.length?`<div class="direct-message-media${media.length===1?' single':''}">${media.filter(u=>/^https?:\/\//i.test(u)).map(url=>`<a class="direct-message-media-item" href="${directGroupEscape(url)}" target="_blank" rel="noopener noreferrer"><img src="${directGroupEscape(url)}" loading="lazy" alt="Attached image"></a>`).join('')}</div>`:'';
-    return `<div class="direct-message-row${own?' own':''}" data-direct-group-message="${id}"><div class="direct-message-stack"><div class="direct-message-bubble${poll?' has-poll':''}">${!own?`<div class="direct-group-author" data-no-translate="true" translate="no">${directGroupEscape(m.from)}</div>`:''}${reply}${poll?directGroupPollHtml(m):`<div class="direct-message-text" data-no-translate="true" translate="no">${directLinkifyMessageHtml(m.text||'')}${m.editedAt?' <span class="chat-edited-tag">(Edited)</span>':''}</div>`}${mediaHtml}</div>${reactions?`<div class="reactions-container" style="display:flex;gap:4px;margin-top:5px">${reactions}</div>`:''}<div class="direct-message-actions"><span>${directGroupEscape(directGroupTime(m.createdAt))}</span><button type="button" class="direct-message-action reply" title="Reply" onclick="window.setDirectGroupReply('${id}')"><i class="fas fa-reply"></i></button><button type="button" class="direct-message-action react" title="React" onclick="window.reactDirectGroup('${id}')"><i class="fas fa-smile"></i></button>${own?`<button type="button" class="direct-message-action edit" title="Edit" onclick="window.editDirectGroupMessage('${id}')"><i class="fas fa-edit"></i></button>`:''}<button type="button" class="direct-message-action pin${m.pinnedAt?' is-pinned':''}" onclick="window.directGroupAction('pin','${id}',{pinned:${!m.pinnedAt}})" title="${m.pinnedAt?'Unpin':'Pin'}"><i class="fas fa-thumbtack"></i></button>${own?`<button type="button" class="direct-message-action delete" onclick="window.deleteDirectGroupMessage('${id}')" title="Delete"><i class="fas fa-trash-alt"></i></button>`:''}</div></div></div>`;
+    return `<div class="direct-message-row${own?' own':''}" data-direct-group-message="${id}"><div class="direct-message-stack"><div class="direct-message-bubble${poll?' has-poll':''}">${!own?`<div class="direct-group-author" data-no-translate="true" translate="no">${directGroupEscape(m.from)}</div>`:''}${reply}${poll?directGroupPollHtml(m):`<div class="direct-message-text" data-no-translate="true" translate="no">${directLinkifyMessageHtml(m.text||'')}${m.editedAt?' <span class="chat-edited-tag">(Edited)</span>':''}</div>`}${mediaHtml}</div>${reactions?`<div class="reactions-container" style="display:flex;gap:4px;margin-top:5px">${reactions}</div>`:''}<div class="direct-message-actions"><span>${directGroupEscape(directGroupTime(m.createdAt))}</span>${directGroupReceiptHtml(m)}<button type="button" class="direct-message-action reply" title="Reply" onclick="window.setDirectGroupReply('${id}')"><i class="fas fa-reply"></i></button><button type="button" class="direct-message-action react" title="React" onclick="window.reactDirectGroup('${id}')"><i class="fas fa-smile"></i></button>${own?`<button type="button" class="direct-message-action edit" title="Edit" onclick="window.editDirectGroupMessage('${id}')"><i class="fas fa-edit"></i></button>`:''}<button type="button" class="direct-message-action pin${m.pinnedAt?' is-pinned':''}" onclick="window.directGroupAction('pin','${id}',{pinned:${!m.pinnedAt}})" title="${m.pinnedAt?'Unpin':'Pin'}"><i class="fas fa-thumbtack"></i></button>${own?`<button type="button" class="direct-message-action delete" onclick="window.deleteDirectGroupMessage('${id}')" title="Delete"><i class="fas fa-trash-alt"></i></button>`:''}</div></div></div>`;
   }
   function renderDirectGroupMessages(options={}){
     const s=window.__directGroupState,list=document.getElementById('direct-group-messages');if(!list)return;
@@ -80157,7 +80271,18 @@ function getVisibleChatStackEl(id) {
         else renderDirectGroupMessages({forceBottom:true});
         document.getElementById('direct-group-count').textContent=s.messages.length;renderDirectGroupPins();
       }else renderDirectGroupMessages();
-      window.refreshDirectGroupList();
+      directGroupMarkRead();window.refreshDirectGroupList();
+    });
+    socket.on('direct_group_read',payload=>{
+      const s=window.__directGroupState,groupId=String(payload?.groupId||''),reader=String(payload?.user||payload?.reader||'').trim(),lastId=Number(payload?.lastMessageId||payload?.lastReadId||0);
+      if(!groupId||!reader||!Number.isSafeInteger(lastId)||lastId<=0)return;
+      if(s.activeId===groupId){
+        for(const m of s.messages){if(m.from===reader||Number(m.id)>lastId||!Array.isArray(m.readBy)||!Array.isArray(m.recipients))continue;if(m.recipients.includes(reader)&&!m.readBy.includes(reader))m.readBy.push(reader);}
+        const list=document.getElementById('direct-group-messages');if(list)list.querySelectorAll('.direct-message-row.own').forEach(row=>{const m=s.messages.find(item=>String(item.id)===row.dataset.directGroupMessage);if(!m)return;const prior=row.querySelector('.direct-message-actions .direct-group-read-indicator');if(!prior)return;const replacement=document.createElement('span');replacement.innerHTML=directGroupReceiptHtml(m);prior.replaceWith(replacement.firstElementChild);});
+      }
+      const summary=s.groups.find(g=>String(g.id)===groupId);
+      const last=summary?.lastMessage;
+      if(last&&Number(last.id)<=lastId&&Array.isArray(last.readBy)&&Array.isArray(last.recipients)&&last.recipients.includes(reader)&&!last.readBy.includes(reader)){last.readBy.push(reader);renderDirectGroupList();}
     });
     socket.on('connect',()=>{window.refreshDirectGroupList();const id=window.__directGroupState.activeId;if(id)window.openDirectGroup(id,{forceReload:true});});
   }

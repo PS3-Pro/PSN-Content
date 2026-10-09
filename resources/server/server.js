@@ -8538,15 +8538,27 @@ async function getDirectGroupMember(groupId,userName,db=pool) {
   return result.rows?.[0] || null;
 }
 async function getDirectGroupMembers(groupId,db=pool) {
-  const result=await db.query('SELECT user_name,joined_at FROM direct_group_members WHERE group_id=$1 ORDER BY joined_at,user_name',[groupId]);
+  const result=await db.query('SELECT user_name,joined_at,last_read_id FROM direct_group_members WHERE group_id=$1 ORDER BY joined_at,user_name',[groupId]);
   return result.rows || [];
+}
+function addDirectGroupReadReceipts(message,members) {
+  if(!message)return message;
+  const postedAt=Date.parse(message.createdAt||'')||0;
+  const recipients=(members||[]).filter(m=>m.user_name!==message.from&&Date.parse(m.joined_at)<=postedAt);
+  return {...message,recipients:recipients.map(m=>m.user_name),readBy:recipients.filter(m=>Number(m.last_read_id)>=Number(message.id)).map(m=>m.user_name)};
+}
+async function emitDirectGroupReadLocal(groupId,reader,lastMessageId) {
+  const members=await getDirectGroupMembers(groupId);
+  const event={groupId,user:reader,lastMessageId:String(lastMessageId)};
+  for(const member of members)for(const client of getSocketsByUserName(member.user_name))if(client?.connected)client.emit('direct_group_read',event);
 }
 async function emitDirectGroupLocal(groupId,kind,payload) {
   const members=await getDirectGroupMembers(groupId);
+  const messagePayload=(kind==='message'||kind==='update')?addDirectGroupReadReceipts(payload,members):payload;
   for (const member of members) for(const client of getSocketsByUserName(member.user_name)) {
     if (!client || !client.connected) continue;
     if ((kind==='message'||kind==='update') && payload?.createdAt && new Date(member.joined_at).getTime()>Date.parse(payload.createdAt)) continue;
-    client.emit(kind==='refresh'?'direct_group_changed':'direct_group_event',{ kind, groupId, ...(kind==='refresh'?{}:{message:kind==='message'||kind==='update'?payload:undefined,id:kind==='delete'?payload.id:undefined}) });
+    client.emit(kind==='refresh'?'direct_group_changed':'direct_group_event',{ kind, groupId, ...(kind==='refresh'?{}:{message:kind==='message'||kind==='update'?messagePayload:undefined,id:kind==='delete'?payload.id:undefined}) });
   }
 }
 async function notifyDirectGroupChange(groupId,kind,id=0) {
@@ -8558,7 +8570,15 @@ async function getDirectGroupList(viewer) {
     (SELECT row_to_json(x) FROM (SELECT m.id,m.sender_name,m.text,m.message_type,m.created_at FROM direct_group_messages m WHERE m.group_id=g.id AND m.created_at>=gm.joined_at ORDER BY m.id DESC LIMIT 1) x) AS latest,
     (SELECT COUNT(*)::int FROM direct_group_messages m WHERE m.group_id=g.id AND m.created_at>=gm.joined_at AND m.id>gm.last_read_id AND m.sender_name<>$1) AS unread
     FROM direct_groups g JOIN direct_group_members gm ON gm.group_id=g.id AND gm.user_name=$1 ORDER BY COALESCE((SELECT m.created_at FROM direct_group_messages m WHERE m.group_id=g.id ORDER BY m.id DESC LIMIT 1),g.created_at) DESC LIMIT 100`,[viewer],{attempts:2,label:'GROUP LIST'});
-  return result.rows.map(row=>({id:row.id,title:row.title,createdBy:row.created_by,memberCount:Number(row.member_count)||0,createdAt:row.created_at,unread:Number(row.unread)||0,lastMessage:row.latest?{id:String(row.latest.id),from:row.latest.sender_name,text:row.latest.message_type==='poll'?'📊 Created a poll.':row.latest.text,createdAt:row.latest.created_at}:null}));
+  const groups=result.rows.map(row=>({id:row.id,title:row.title,createdBy:row.created_by,memberCount:Number(row.member_count)||0,createdAt:row.created_at,unread:Number(row.unread)||0,lastMessage:row.latest?{id:String(row.latest.id),from:row.latest.sender_name,text:row.latest.message_type==='poll'?'📊 Created a poll.':row.latest.text,createdAt:row.latest.created_at}:null}));
+  const own=groups.filter(g=>g.lastMessage?.from===viewer);
+  if(own.length){
+    const members=await pool.query('SELECT group_id,user_name,joined_at,last_read_id FROM direct_group_members WHERE group_id=ANY($1::uuid[])',[own.map(g=>g.id)]);
+    const byGroup=new Map();
+    for(const row of members.rows){if(!byGroup.has(row.group_id))byGroup.set(row.group_id,[]);byGroup.get(row.group_id).push(row);}
+    for(const group of own)group.lastMessage=addDirectGroupReadReceipts(group.lastMessage,byGroup.get(group.id)||[]);
+  }
+  return groups;
 }
 async function getDirectGroupHistory(groupId,viewer) {
   const member=await getDirectGroupMember(groupId,viewer);
@@ -8569,8 +8589,14 @@ async function getDirectGroupHistory(groupId,viewer) {
   ]);
   const messages=result.rows.map(serializeDirectGroupMessage);
   const lastId=messages.length?Number(messages[messages.length-1].id):Number(member.last_read_id)||0;
-  await pool.query('UPDATE direct_group_members SET last_read_id=GREATEST(last_read_id,$3) WHERE group_id=$1 AND user_name=$2',[groupId,viewer,lastId]);
-  return {success:true,group:{id:groupId,title:member.title,createdBy:member.created_by,members:members.map(m=>m.user_name)},messages,pinnedMessages:messages.filter(m=>m.pinnedAt).slice(-10),lastReadId:String(lastId)};
+  if(lastId>Number(member.last_read_id)){
+    await pool.query('UPDATE direct_group_members SET last_read_id=GREATEST(last_read_id,$3) WHERE group_id=$1 AND user_name=$2',[groupId,viewer,lastId]);
+    const own=members.find(m=>m.user_name===viewer);if(own)own.last_read_id=lastId;
+    try{await emitDirectGroupReadLocal(groupId,viewer,lastId);}catch(err){console.error('[GROUP READ EMIT]',err?.message||err);}
+    deferServerTask('GROUP READ SYNC',()=>notifyDirectGroupChange(groupId,'read',{user:viewer,lastMessageId:lastId}),0);
+  }
+  const withReceipts=messages.map(m=>addDirectGroupReadReceipts(m,members));
+  return {success:true,group:{id:groupId,title:member.title,createdBy:member.created_by,members:members.map(m=>m.user_name)},messages:withReceipts,pinnedMessages:withReceipts.filter(m=>m.pinnedAt).slice(-10),lastReadId:String(lastId)};
 }
 
 function directMessagePlainText(value) {
@@ -9648,6 +9674,7 @@ async function initProfileSyncNotifications() {
       if (message.channel === 'direct_group_sync') {
         const gid=directGroupId(data.groupId);
         if (!gid) return;
+        if(data.kind==='read'){const reader=normalizeDirectMessageUser(data.id?.user),lastId=Number(data.id?.lastMessageId)||0;if(reader&&lastId)await emitDirectGroupReadLocal(gid,reader,lastId);return;}
         if(data.kind==='left'){for(const sock of getSocketsByUserName(String(data.id||'')))if(sock.connected)sock.emit('direct_group_changed',{groupId:gid,left:true});await emitDirectGroupLocal(gid,'refresh');return;}
         if (data.kind==='message'||data.kind==='update') {
           const result=await pool.query('SELECT * FROM direct_group_messages WHERE group_id=$1 AND id=$2',[gid,Number(data.id)||0]);
@@ -14205,6 +14232,24 @@ io.on('connection', (socket) => {
     const id=directGroupId(data.groupId),viewer=normalizeDirectMessageUser(socket.userName);
     if(!id||!viewer)return reply({success:false,message:'Invalid group.'});
     try {reply(await getDirectGroupHistory(id,viewer));}catch(err){console.error('[GROUP HISTORY]',err?.message||err);reply({success:false,message:'Could not load group.'});}
+  });
+  socket.on('direct_group_mark_read',async (data={},callback)=>{
+    const reply=typeof callback==='function'?callback:()=>{};
+    const id=directGroupId(data?.groupId),viewer=normalizeDirectMessageUser(socket.userName),requested=Number(data?.lastMessageId)||0;
+    if(!id||!viewer||!Number.isSafeInteger(requested)||requested<1)return reply({success:false,message:'Invalid read request.'});
+    try{
+      const member=await getDirectGroupMember(id,viewer);
+      if(!member)return reply({success:false,message:'Not a group member.'});
+      const last=await pool.query('SELECT COALESCE(MAX(id),0) AS id FROM direct_group_messages WHERE group_id=$1 AND created_at>=$2 AND id<=$3',[id,member.joined_at,requested]);
+      const lastId=Number(last.rows?.[0]?.id)||0;
+      if(!lastId)return reply({success:true});
+      if(lastId>Number(member.last_read_id)){
+        await pool.query('UPDATE direct_group_members SET last_read_id=GREATEST(last_read_id,$3) WHERE group_id=$1 AND user_name=$2',[id,viewer,lastId]);
+        try{await emitDirectGroupReadLocal(id,viewer,lastId);}catch(err){console.error('[GROUP READ EMIT]',err?.message||err);}
+        deferServerTask('GROUP READ SYNC',()=>notifyDirectGroupChange(id,'read',{user:viewer,lastMessageId:lastId}),0);
+      }
+      reply({success:true,lastMessageId:String(lastId)});
+    }catch(err){console.error('[GROUP MARK READ]',err?.message||err);reply({success:false,message:'Could not mark group as read.'});}
   });
   socket.on('direct_group_send',async (data={},callback)=>{
     data=data&&typeof data==='object'&&!Array.isArray(data)?data:{};
