@@ -2719,6 +2719,20 @@ async function initDb() {
       last_read_id BIGINT NOT NULL DEFAULT 0,
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
+    CREATE TABLE IF NOT EXISTS user_reward_notices (
+      user_name TEXT NOT NULL,
+      reward_id TEXT NOT NULL,
+      trophy_id TEXT NOT NULL DEFAULT '',
+      title TEXT NOT NULL DEFAULT '',
+      kind TEXT NOT NULL DEFAULT 'avatar',
+      image_url TEXT NOT NULL DEFAULT '',
+      created_at BIGINT NOT NULL,
+      seen BOOLEAN NOT NULL DEFAULT FALSE,
+      visited BOOLEAN NOT NULL DEFAULT FALSE,
+      dismissed BOOLEAN NOT NULL DEFAULT FALSE,
+      PRIMARY KEY (user_name, reward_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_user_reward_notices_user_date ON user_reward_notices (user_name, created_at DESC);
     CREATE TABLE IF NOT EXISTS user_catalog_notification_seen (
       user_name TEXT NOT NULL,
       event_key TEXT NOT NULL,
@@ -9798,6 +9812,7 @@ async function initProfileSyncNotifications() {
       }
 
       if (message.channel === 'user_notification_sync') {
+        if (data.rewardNoticeUser) emitRewardNoticeChange(data.rewardNoticeUser);
         if (data.event) emitUserNotificationToLocalUser(data.event);
         if (Array.isArray(data.updatedEvents)) data.updatedEvents.forEach(event => emitUserNotificationToLocalUser(event, 'user_notification_updated'));
         if (data.readState && data.readState.userName) {
@@ -11248,6 +11263,109 @@ async function getUserNotificationHistory(userName, afterId = 0) {
   return { items: result.rows.map(serializeUserNotificationRow).filter(Boolean), lastReadId, unreadCount, delta: safeAfterId > 0 };
 }
 
+function serializeUserRewardNoticeRow(row) {
+  return {
+    id: `reward:${row.reward_id}`,
+    type: 'reward',
+    user: row.user_name,
+    createdAt: Number(row.created_at) || Date.now(),
+    seen: row.seen === true,
+    visited: row.visited === true,
+    data: { rewardId: row.reward_id, trophyId: row.trophy_id, title: row.title, kind: row.kind, img: row.image_url }
+  };
+}
+
+async function getUserRewardNotices(userName) {
+  const result = await queryDbWithRetry(
+    `SELECT user_name, reward_id, trophy_id, title, kind, image_url, created_at, seen, visited
+     FROM user_reward_notices WHERE user_name = $1 AND dismissed = FALSE ORDER BY created_at DESC LIMIT 100`,
+    [userName], { attempts: 2, label: 'REWARD NOTICE READ' }
+  );
+  return result.rows.map(serializeUserRewardNoticeRow);
+}
+
+async function mutateUserRewardNotices(userName, raw = {}) {
+  const op = String(raw.op || '').toLowerCase();
+  const ids = Array.isArray(raw.ids) ? Array.from(new Set(raw.ids.map(v => String(v || '').replace(/^reward:/, '')).filter(id => /^rew_(?:[0-9]{1,3}|banner_[0-9]{1,3})$/.test(id)))).slice(0, 100) : [];
+  if (op === 'unlock' || op === 'import' || op === 'unlock_batch') {
+    const items = (op === 'unlock' ? [raw.item] : raw.items);
+    if (!Array.isArray(items) || items.length > 100) return { ok:false, changed:false };
+    const clean = items.map(entry => {
+      const data = entry && entry.data && typeof entry.data === 'object' ? entry.data : {};
+      const rewardId = String(data.rewardId || '').trim();
+      if (!/^rew_(?:[0-9]{1,3}|banner_[0-9]{1,3})$/.test(rewardId)) return null;
+      const createdAt = Number(entry.createdAt);
+      return {
+        reward_id: rewardId,
+        trophy_id: normalizeText(data.trophyId, '').slice(0, 80),
+        title: normalizeText(data.title, 'Reward').slice(0, 140),
+        kind: data.kind === 'banner' ? 'banner' : 'avatar',
+        image_url: normalizeText(data.img, '').slice(0, 512),
+        created_at: Number.isFinite(createdAt) && createdAt > 0 && createdAt < Date.now() + 60000 ? Math.floor(createdAt) : Date.now(),
+        seen: entry.seen === true,
+        visited: entry.visited === true
+      };
+    }).filter(Boolean);
+    const byRewardId = new Map();
+    for (const item of clean) {
+      const existing = byRewardId.get(item.reward_id);
+      if (existing) {
+        existing.seen = existing.seen || item.seen;
+        existing.visited = existing.visited || item.visited;
+      } else byRewardId.set(item.reward_id, item);
+    }
+    const unique = Array.from(byRewardId.values());
+    if (!unique.length) return { ok:op === 'import', changed:false };
+    const result = await queryDbWithRetry(
+      `INSERT INTO user_reward_notices (user_name, reward_id, trophy_id, title, kind, image_url, created_at, seen, visited)
+       SELECT $1, r.reward_id, r.trophy_id, r.title, r.kind, r.image_url, r.created_at, r.seen, r.visited
+       FROM jsonb_to_recordset($2::jsonb) AS r(reward_id text, trophy_id text, title text, kind text, image_url text, created_at bigint, seen boolean, visited boolean)
+       WHERE TRUE
+       ON CONFLICT (user_name, reward_id) DO UPDATE
+         SET seen = user_reward_notices.seen OR EXCLUDED.seen,
+             visited = user_reward_notices.visited OR EXCLUDED.visited
+       WHERE (NOT user_reward_notices.seen AND EXCLUDED.seen)
+          OR (NOT user_reward_notices.visited AND EXCLUDED.visited)`,
+      [userName, JSON.stringify(unique)], { attempts: 2, label: 'REWARD NOTICE UNLOCK' }
+    );
+    return { ok:true, changed:(Number(result.rowCount) || 0) > 0 };
+  }
+  if (op === 'mark') {
+    if (raw.all !== true && !ids.length) return { ok:false, changed:false };
+    if (raw.seen !== true && raw.visited !== true) return { ok:false, changed:false };
+    const result = await queryDbWithRetry(
+      `UPDATE user_reward_notices SET seen = seen OR $2, visited = visited OR $3
+       WHERE user_name = $1 AND ($4::boolean OR reward_id = ANY($5::text[])) AND dismissed = FALSE
+         AND ((NOT seen AND $2) OR (NOT visited AND $3))`,
+      [userName, raw.seen === true || raw.visited === true, raw.visited === true, raw.all === true, ids],
+      { attempts: 2, label: 'REWARD NOTICE READ STATE' }
+    );
+    return { ok:true, changed:(Number(result.rowCount) || 0) > 0 };
+  }
+  if (op === 'dismiss' || op === 'restore' || op === 'clear') {
+    if (op !== 'clear' && !ids.length) return { ok:false, changed:false };
+    const result = await queryDbWithRetry(
+      `UPDATE user_reward_notices SET dismissed = $2 WHERE user_name = $1 AND ($3::boolean OR reward_id = ANY($4::text[]))
+         AND dismissed IS DISTINCT FROM $2`,
+      [userName, op !== 'restore', op === 'clear', ids],
+      { attempts: 2, label: 'REWARD NOTICE DISMISS' }
+    );
+    return { ok:true, changed:(Number(result.rowCount) || 0) > 0 };
+  }
+  return { ok:false, changed:false };
+}
+
+function emitRewardNoticeChange(userName, excludeSocketId = '') {
+  getSocketsByUserName(userName).forEach(client => {
+    if (client && client.connected && client.id !== excludeSocketId) client.emit('reward_notices_changed');
+  });
+}
+
+async function notifyRewardNoticeChange(userName) {
+  try {
+    await pool.query('SELECT pg_notify($1, $2)', ['user_notification_sync', JSON.stringify({ rewardNoticeUser:userName, instanceId:INSTANCE_ID })]);
+  } catch (err) { console.error('[REWARD NOTICE SYNC ERROR]:', err && err.message || err); }
+}
 function resolveKnownNotificationUserName(value) {
   const requested = normalizeSocialUserName(value);
   if (!requested) return '';
@@ -13277,6 +13395,28 @@ io.on('connection', (socket) => {
     } catch (err) {
       console.error('[CATALOG NOTIFICATION ERROR]:', err && err.message ? err.message : err);
       respond({ ok: false, created: false, error: 'Could not save the catalog notification.' });
+    }
+  });
+
+  socket.on('reward_notices_sync', async (data = {}, ack) => {
+    const respond = result => { if (typeof ack === 'function' && socket.connected) { try { ack(result); } catch (err) {} } };
+    const owner = socket.userName;
+    if (!owner || !userDatabase[owner]) { respond({ ok:false, error:'Profile is not available.' }); return; }
+    try {
+      const op = String(data && data.op || 'load').toLowerCase();
+      if (op !== 'load') {
+        const result = await mutateUserRewardNotices(owner, data);
+        if (!result.ok) { respond({ ok:false, error:'Invalid reward operation.' }); return; }
+        if (result.changed) {
+          emitRewardNoticeChange(owner, socket.id);
+          deferServerTask('REWARD NOTICE SYNC', () => notifyRewardNoticeChange(owner), 0);
+        }
+      }
+      if (op === 'load') respond({ ok:true, items:await getUserRewardNotices(owner) });
+      else respond({ ok:true });
+    } catch (err) {
+      console.error('[REWARD NOTICES ERROR]:', err && err.message || err);
+      respond({ ok:false, error:'Could not synchronize rewards.' });
     }
   });
 
