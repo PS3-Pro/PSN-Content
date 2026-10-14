@@ -32770,7 +32770,7 @@ P
 				duration,
 				delay: Math.min(movedIndex++, 8) * delayStep,
 				easing: 'cubic-bezier(.2,.8,.2,1)',
-				fill: 'none'
+				fill: 'backwards'
 			}));
 			animation.id = 'psn-collection-filter-relayout';
 		}
@@ -32783,6 +32783,36 @@ P
 		const config = getCollectionFilterMotionConfig(snapshot.scope);
 		const grid = document.getElementById(snapshot.gridId);
 		if (!config || !grid) return 0;
+
+		if (!document.hidden && !browseMotionReduced() && typeof Element.prototype.animate === 'function' &&
+			typeof CSS !== 'undefined' && CSS.supports('scale', '0.96')) {
+			const cards = Array.from(grid.querySelectorAll(config.itemSelector));
+			const viewport = snapshot.viewport || getBrowseMotionViewportRect();
+			const range = getBrowseMotionViewportCandidateRange(grid, cards, viewport, 24);
+			let revealed = 0;
+			for (let index = range.start; index < range.end; index++) {
+				const card = cards[index];
+				const key = getCollectionFilterMotionCardKey(card);
+				if (!key || snapshot.existingKeys.has(key) || (config.pendingClass && card.classList.contains(config.pendingClass))) continue;
+				const rect = range.rectCache.get(card) || card.getBoundingClientRect();
+				if (!rect.width || !rect.height || !browseMotionRectVisible(rect, viewport, 24)) continue;
+				const target = typeof config.revealTarget === 'function' ? config.revealTarget(card) : card;
+				if (!target) continue;
+				const animation = trackCollectionFilterMotionAnimation(grid, target.animate([
+					{ opacity: 0, scale: '0.96' },
+					{ opacity: 1, scale: '1' }
+				], {
+					duration: 410,
+					delay: Math.min(revealed, 4) * 18,
+					easing: 'cubic-bezier(.2,.8,.2,1)',
+					fill: 'backwards'
+				}));
+				animation.id = 'psn-collection-filter-reentry';
+				revealed++;
+			}
+			return revealed;
+		}
+
 		const markedTargets = [];
 
 		Array.from(grid.querySelectorAll(config.itemSelector)).forEach(card => {
@@ -33207,6 +33237,58 @@ P
 		return !!(grid && grid.dataset.browseStateReady === '1' && window.__browseLastAppliedDataRef === currentData && window.__browseLastAppliedStateSignature === getBrowseAppliedStateSignature());
 	}
 
+	function getBrowseGroupRenderFingerprint(item, category) {
+		if (!item || !item.isGroup) return '';
+		const meta = item.renderMeta || {};
+		const representative = item.game || {};
+		return hashBrowseMotionIdentity([
+			category, item.groupKey, representative.cleanName, representative.id, representative.contentId,
+			representative.url, representative.cTag, meta.titleIds, meta.regionLabel,
+			meta.regionActionLabel, meta.titleIdLabel, meta.sizeLabel,
+			(item.items || []).map(entry => getBrowseMotionItemKey(entry.game, category)).join('|')
+		].join('\u001f'));
+	}
+
+	function canRetainBrowseFilterCards(items, category, limit) {
+		const grid = document.getElementById('database-grid');
+		if (!grid || grid.dataset.browseStateReady !== '1' || window.__browseLastAppliedDataRef !== currentData || !items.length || browseExpandedGroupTitle || window.__browseGroupTitleOverlayTransitionActive) return false;
+		const cards = grid.querySelectorAll(':scope > .game-card');
+		const count = Math.min(limit, items.length);
+		if (cards.length !== count || !!grid.querySelector(':scope > #infinite-scroll-sentinel') !== (items.length > limit)) return false;
+		for (let index = 0; index < count; index++) {
+			const item = items[index];
+			const key = item.isGroup ? `group:${category}:${item.groupKey}` : getBrowseMotionItemKey(item.game, category);
+			if (cards[index].dataset.browseMotionKey !== encodeURIComponent(key) || cards[index].dataset.storeCategory !== category) return false;
+			if (item.isGroup && cards[index].dataset.browseGroupFingerprint !== getBrowseGroupRenderFingerprint(item, category)) return false;
+		}
+		return true;
+	}
+
+	function refreshUnchangedBrowseFilterDisplay(items, category) {
+		const cards = document.getElementById('database-grid')?.querySelectorAll(':scope > .game-card') || [];
+		for (let i = 0; i < cards.length; i++) {
+			const item = items[i];
+			if (!item || item.isGroup) continue;
+			const nextIndex = Number.isInteger(item.sourceIndex) ? item.sourceIndex : i;
+			if (cards[i].dataset.browseSourceIndex !== String(nextIndex)) {
+				cards[i].dataset.browseSourceIndex = String(nextIndex);
+				cards[i].setAttribute('onclick', `openModal(${nextIndex}, '', false, this)`);
+			}
+		}
+		window.__browseRenderDataLength = items.length;
+		if (typeof window.syncBrowseSurpriseButtonState === 'function') window.syncBrowseSurpriseButtonState(items.length);
+		if (typeof syncBrowseSortButtonState === 'function') syncBrowseSortButtonState(items.length);
+		if (typeof updateBrowseTypeFilterVisibility === 'function') updateBrowseTypeFilterVisibility(category);
+		if (typeof syncBrowseRegionSelectState === 'function') syncBrowseRegionSelectState(category);
+		if (typeof renderLetterFilter === 'function') renderLetterFilter();
+		const missingStats = browseExpandedGroupTitle && typeof getBrowseRegionsMissingRapStats === 'function' ? getBrowseRegionsMissingRapStats() : null;
+		const hidden = missingStats ? missingStats.hidden : (document.getElementById('show-missing-rap-toggle')?.checked ? 0 : Number(window.__browseHiddenMissingRapCount) || 0);
+		const grouped = items[0]?.isGroup === true;
+		const countEl = document.getElementById('item-count');
+		if (countEl) countEl.innerText = grouped ? formatBrowseGroupedTitleItemCount(items.length, getBrowseGroupedTitleChildCount(items), hidden) : formatBrowseItemCount(items.length, hidden);
+		if (typeof updateBrowseContextualCategoryTitle === 'function') updateBrowseContextualCategoryTitle(items.length);
+	}
+
 	window.applyBrowseToolbarFilterChange = function() {
 		const scrollArea = document.getElementById('scroll-area') || document.querySelector('.content');
 		window.__browsePreserveScrollOnNextFilter = true;
@@ -33221,7 +33303,8 @@ P
         const browseViewVisible = typeof isPsnDomSectionVisible === 'function' ? isPsnDomSectionVisible('view-browse') : true;
         const skipMotionCapture = !!window.__browseSkipMotionCaptureOnce || !!window.isRestoringHistory || !browseViewVisible;
         window.__browseSkipMotionCaptureOnce = false;
-		window.__browseMotionSnapshot = skipMotionCapture ? null : captureBrowseMotionLayout();
+		const previousBrowseFilteredData = filteredData;
+		window.__browseMotionSnapshot = null;
 		browseFilteredDataVersion++;
 		browseGroupedItemsIndex = new Map();
 		browseMissingRapByGroup = new Map();
@@ -33372,6 +33455,16 @@ P
 			pendingStoreFocusIndex = findFocusIndex(true);
 			if (pendingStoreFocusIndex < 0) pendingStoreFocusIndex = findFocusIndex(false);
 		}
+
+		if (preserveBrowseRenderLimitOnThisFilter && !forceBrowseTopOnThisFilter && pendingStoreFocusIndex < 0 && !skipMotionCapture && !window.__browseGroupTitleOverlayTransitionActive && Array.isArray(previousBrowseFilteredData)) {
+			const nextItems = getBrowseRenderItems();
+			if (canRetainBrowseFilterCards(nextItems, currentCat, previousBrowseRenderLimit)) {
+				refreshUnchangedBrowseFilterDisplay(nextItems, currentCat);
+				markBrowseAppliedState();
+				return;
+			}
+		}
+		window.__browseMotionSnapshot = skipMotionCapture ? null : captureBrowseMotionLayout();
 
 		if (!window.isRestoringHistory) {
 			renderLimit = preserveBrowseRenderLimitOnThisFilter
@@ -33831,7 +33924,7 @@ P
 				const consoleName = cardStatic ? cardStatic.consoleName : String(game.cTag || '').toUpperCase();
 
 				htmlChunks.push(`
-			<div class="game-card grouped-title-card ${animClass} ${groupedWishlistClass} ${groupedFavoriteClass}" data-browse-motion-key="${browseMotionKey}" data-browse-motion-family="${browseMotionFamily}" data-group-title-key="${encodedGroupKey}" data-store-category="${currentCat}"${groupedSingleTitleId ? ` data-group-single-title-id="${groupedSingleTitleId}"` : ''}${groupedTitleIds ? ` data-group-title-ids="${groupedTitleIds.replace(/"/g, '&quot;')}"` : ''} ${animStyle} onclick="openBrowseTitleGroupFromCard(this)" onmouseenter="playUiHover(); this.classList.remove('anim-reveal'); this.classList.add('no-anim');">
+			<div class="game-card grouped-title-card ${animClass} ${groupedWishlistClass} ${groupedFavoriteClass}" data-browse-motion-key="${browseMotionKey}" data-browse-motion-family="${browseMotionFamily}" data-browse-group-fingerprint="${getBrowseGroupRenderFingerprint(renderItem, currentCat)}" data-group-title-key="${encodedGroupKey}" data-store-category="${currentCat}"${groupedSingleTitleId ? ` data-group-single-title-id="${groupedSingleTitleId}"` : ''}${groupedTitleIds ? ` data-group-title-ids="${groupedTitleIds.replace(/"/g, '&quot;')}"` : ''} ${animStyle} onclick="openBrowseTitleGroupFromCard(this)" onmouseenter="playUiHover(); this.classList.remove('anim-reveal'); this.classList.add('no-anim');">
 				<div class="game-img-container">
 					<div class="console-tag ${tagClass}">${consoleName}</div>
 					<div class="region-tag">${regionLabel}</div>
@@ -33899,7 +33992,7 @@ P
 			const versionTagHtml = cardStatic ? cardStatic.versionTagHtml : (displayVersion ? ` <span style="color:#FF1493; font-size:11px; vertical-align: middle;">[v${displayVersion}]</span>` : '');
 		
 			htmlChunks.push(`
-			<div class="game-card ${animClass} ${wishlistClass} ${favoriteClass}" data-browse-motion-key="${browseMotionKey}" data-browse-motion-family="${browseMotionFamily}" data-title-id="${game.id || ''}" data-content-id="${game.contentId || ''}" data-store-category="${currentCat}" ${animStyle} onclick="openModal(${sourceIndex}, '', false, this)" onmouseenter="const __hoverTarget = document.elementFromPoint(event.clientX, event.clientY); if(!__hoverTarget || !__hoverTarget.closest('.btn-mini,.btn-mini-round,.fav-btn,.wish-btn,.action-btn,button,a')) playUiHover(); this.classList.remove('anim-reveal'); this.classList.add('no-anim');">
+			<div class="game-card ${animClass} ${wishlistClass} ${favoriteClass}" data-browse-motion-key="${browseMotionKey}" data-browse-motion-family="${browseMotionFamily}" data-browse-source-index="${sourceIndex}" data-title-id="${game.id || ''}" data-content-id="${game.contentId || ''}" data-store-category="${currentCat}" ${animStyle} onclick="openModal(${sourceIndex}, '', false, this)" onmouseenter="const __hoverTarget = document.elementFromPoint(event.clientX, event.clientY); if(!__hoverTarget || !__hoverTarget.closest('.btn-mini,.btn-mini-round,.fav-btn,.wish-btn,.action-btn,button,a')) playUiHover(); this.classList.remove('anim-reveal'); this.classList.add('no-anim');">
 				<div class="game-img-container">
 					<div class="console-tag ${tagClass}">${consoleName}</div>
 					<div class="region-tag">${game.region}</div>
@@ -53557,6 +53650,20 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 		return items;
 	}
 
+	function getWishlistVisiblePrefixSignature(items, count, showTypeTags) {
+		return getProgressiveGridSignature([
+			Number(window.__contentMetadataOverridesRevision || 0),
+			window.__wishlistCanonicalReady === true ? 1 : 0,
+			showTypeTags ? 1 : 0,
+			JSON.stringify(items.slice(0, count).map(game => [
+				getWishlistDotKey(game), game.__wishlistIdentityKey || '',
+				game.id || '', game.contentId || '', game.cleanName || '', game.title || '',
+				game.cTag || '', game.region || '', game.size || '', game.cover || '',
+				game.__storeUnavailable === true ? 1 : 0, game.category || '', game.version || ''
+			]))
+		]);
+	}
+
 	window.updateWishlistUI = async function(isSilent = false, progressiveMode = 'reset') {
 		if (typeof window.setSidebarCountPill === 'function') window.setSidebarCountPill('wishlist', Array.isArray(window.wishlist) ? window.wishlist.length : 0);
 		isSilent = isSilent || !!window.isRestoringHistory;
@@ -53594,6 +53701,7 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 		}
 	
 		if (window.wishlist.length === 0) {
+			grid.__wishlistVisiblePrefixSignature = '';
 			if (typeof window.syncAlphabeticalSortButtonState === 'function') window.syncAlphabeticalSortButtonState('wishlist', 0);
 			clearProgressiveGridObserver('wishlist', grid);
 			delete grid.dataset.progressiveGridSignature;
@@ -53767,10 +53875,18 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 			filteredWishlist.map(game => getWishlistDotKey(game)).join('|')
 		]);
 		const wishlistCanAppend = appendProgressive && grid.dataset.progressiveGridSignature === wishlistProgressiveSignature;
-		const wishlistCanReuseExisting = !appendProgressive && grid.dataset.progressiveGridSignature === wishlistProgressiveSignature && wishlistPreviouslyRendered > 0 && !!grid.querySelector('.game-card') && !(pendingWishlistRevealKeys && pendingWishlistRevealKeys.length);
+		const wishlistVisibleCount = Math.min(wishlistPreviouslyRendered, filteredWishlist.length);
+		const wishlistPrefixSignature = wishlistVisibleCount > 0
+			? getWishlistVisiblePrefixSignature(filteredWishlist, wishlistVisibleCount, catFilter === 'ALL') : '';
+		const wishlistCanReuseExisting = !appendProgressive && wishlistPreviouslyRendered > 0 &&
+			filteredWishlist.length >= wishlistPreviouslyRendered &&
+			grid.querySelectorAll(':scope > .game-card').length === wishlistPreviouslyRendered &&
+			!(pendingWishlistRevealKeys && pendingWishlistRevealKeys.length) &&
+			grid.__wishlistVisiblePrefixSignature === wishlistPrefixSignature;
 		clearProgressiveGridObserver('wishlist', grid);
 		if (wishlistCanReuseExisting) {
-			const reusedRenderEnd = Math.min(wishlistPreviouslyRendered, filteredWishlist.length);
+			const reusedRenderEnd = wishlistVisibleCount;
+			grid.dataset.progressiveGridSignature = wishlistProgressiveSignature;
 			grid.dataset.progressiveGridRendered = String(reusedRenderEnd);
 			if (typeof window.refreshStoreInstalledChecks === 'function') window.refreshStoreInstalledChecks();
 			if (typeof renderWishLetterFilter === 'function') renderWishLetterFilter();
@@ -53785,6 +53901,7 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 		}
 	
 		if (filteredWishlist.length === 0) {
+			grid.__wishlistVisiblePrefixSignature = '';
 			grid.dataset.progressiveGridRendered = '0';
 			let emptyTitle = 'No Items Found';
 			let emptyDesc = 'No items match your filters in Wishlist.';
@@ -53932,6 +54049,7 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 			if (wishlistLiveSnapshot && typeof window.restoreLiveRenderNodes === 'function') window.restoreLiveRenderNodes(grid, wishlistLiveSnapshot, ':scope > .game-card[data-live-render-key]', { preserveScroll: true, markReused: true });
 		}
 		grid.dataset.progressiveGridRendered = String(wishlistRenderEnd);
+		grid.__wishlistVisiblePrefixSignature = getWishlistVisiblePrefixSignature(filteredWishlist, wishlistRenderEnd, catFilter === 'ALL');
 		if (typeof window.refreshStoreInstalledChecks === 'function') window.refreshStoreInstalledChecks();
 	
 		if (typeof renderWishLetterFilter === 'function') {
@@ -58216,6 +58334,24 @@ function formatLibraryLastPlayedBadge(game = {}) {
 		return changed;
 	};
 
+	function getLocalLibraryVisiblePrefixSignature(games, count) {
+		const visible = (games || []).slice(0, count);
+		const favoritePaths = new Set((favoritesLibrary || []).map(item => item && item.path).filter(Boolean));
+		const sourceIndexes = new Map((lastScannedGames || []).map((game, index) => [game, index]));
+		const playing = window.myCurrentPS3Status || {};
+		return getProgressiveGridSignature([
+			getLocalLibraryDataSignature(visible),
+			visible.map(game => sourceIndexes.has(game) ? sourceIndexes.get(game) : -1).join(','),
+			visible.map(game => favoritePaths.has(game.path) ? '1' : '0').join(''),
+			visible.map(game => {
+				const id = normalizeGamePlayersTitleId(getLibraryGameTitleId(game));
+				return id && typeof window.isViewerPlayTogetherTitle === 'function' && window.isViewerPlayTogetherTitle(id) ? '1' : '0';
+			}).join(''),
+			String(playing.status || ''), String(playing.titleId || ''), String(playing.title || ''),
+			Number(window.__contentMetadataOverridesRevision || 0)
+		]);
+	}
+
 	function renderLocalLibrary(games, isFiltering = false, isSilent = false, progressiveMode = 'reset') {
 		isSilent = isSilent || !!window.isRestoringHistory;
 		const appendProgressive = progressiveMode === 'append';
@@ -58228,7 +58364,13 @@ function formatLibraryLastPlayedBadge(game = {}) {
 		const hasRenderedCards = !!grid.querySelector('.game-card');
 		const sameSignature = grid.dataset.localLibraryRenderSignature === renderSignature;
 		const canAppend = appendProgressive && sameSignature;
-		if (!appendProgressive && hasRenderedCards && sameSignature) {
+		const libraryVisibleCount = Math.max(0, Number(grid.dataset.progressiveGridRendered || 0));
+		const canRetainLibraryCards = isFiltering && !appendProgressive && hasRenderedCards &&
+			!replacingLibrarySkeletons && libraryVisibleCount > 0 && (games || []).length >= libraryVisibleCount &&
+			grid.querySelectorAll(':scope > .game-card').length === libraryVisibleCount &&
+			grid.__localLibraryVisiblePrefixSignature === getLocalLibraryVisiblePrefixSignature(games, libraryVisibleCount);
+		if (!appendProgressive && hasRenderedCards && (isFiltering ? canRetainLibraryCards : sameSignature)) {
+			grid.dataset.localLibraryRenderSignature = renderSignature;
 			if (typeof updateConsoleLibraryStatusUI === 'function') updateConsoleLibraryStatusUI(lastScannedGames);
 			const renderedCount = Number(grid.dataset.progressiveGridRendered || grid.querySelectorAll(':scope > .game-card').length);
 			setupProgressiveGridObserver('my-games', grid, renderedCount, (games || []).length, () => renderLocalLibrary(games, isFiltering, true, 'append'));
@@ -58482,6 +58624,7 @@ function formatLibraryLastPlayedBadge(game = {}) {
 		}
 		if (libraryRenderTarget.childNodes.length) grid.appendChild(libraryRenderTarget);
 		grid.dataset.progressiveGridRendered = String(libraryRenderEnd);
+		grid.__localLibraryVisiblePrefixSignature = getLocalLibraryVisiblePrefixSignature(games, libraryRenderEnd);
 	
 		if (!isSilent || replacingLibrarySkeletons) {
 			if (replacingLibrarySkeletons) window.__pendingMyGamesScanReveal = false;
@@ -59386,6 +59529,22 @@ function formatLibraryLastPlayedBadge(game = {}) {
 		}
 	};
 	
+	function getFavoritesVisiblePrefixSignature(items, count) {
+		const visible = items.slice(0, count);
+		const playing = window.myCurrentPS3Status || {};
+		return getProgressiveGridSignature([
+			getLocalLibraryDataSignature(visible),
+			Number(window.__contentMetadataOverridesRevision || 0),
+			String(playing.status || ''), String(playing.titleId || ''), String(playing.title || ''),
+			visible.map(game => [
+				game.__favoriteInstalled === true ? 1 : 0,
+				game.cover || '', game.githubCover || '', game.webmanCover || '',
+				game.contentId || '', game.version || '',
+				(typeof window.isViewerPlayTogetherTitle === 'function' && window.isViewerPlayTogetherTitle(normalizeGamePlayersTitleId(getLibraryGameTitleId(game)))) ? 1 : 0
+			].join('~')).join('|')
+		]);
+	}
+
 	window.updateFavoritesLibraryUI = function(isSilent = false, progressiveMode = 'reset') {
 		if (typeof window.setSidebarCountPill === 'function') window.setSidebarCountPill('favorites', Array.isArray(window.favoritesLibrary) ? window.favoritesLibrary.length : 0);
 		isSilent = isSilent || !!window.isRestoringHistory;
@@ -59488,6 +59647,7 @@ function formatLibraryLastPlayedBadge(game = {}) {
 			: (installFilter === 'all' ? favoriteInstallSources.all : favoriteInstallSources.installed);
 	
 		if (favoriteInstallSources.all.length === 0) {
+			grid.__favoritesVisiblePrefixSignature = '';
 			if (typeof window.syncAlphabeticalSortButtonState === 'function') window.syncAlphabeticalSortButtonState('fav', 0);
 			clearProgressiveGridObserver('favorites', grid);
 			grid.dataset.progressiveGridRendered = '0';
@@ -59634,8 +59794,14 @@ function formatLibraryLastPlayedBadge(game = {}) {
 		const favoritesSameSignature = grid.dataset.progressiveGridSignature === favoritesProgressiveSignature;
 		const favoritesCanAppend = appendProgressive && favoritesSameSignature;
 		const favoritesHasRenderedCards = !!grid.querySelector(':scope > .game-card');
+		const favoritesVisibleCount = Math.max(0, Number(grid.dataset.progressiveGridRendered || 0));
+		const favoritesCanRetain = !appendProgressive && favoritesHasRenderedCards &&
+			favoritesVisibleCount > 0 && filteredFavs.length >= favoritesVisibleCount &&
+			grid.querySelectorAll(':scope > .game-card').length === favoritesVisibleCount &&
+			grid.__favoritesVisiblePrefixSignature === getFavoritesVisiblePrefixSignature(filteredFavs, favoritesVisibleCount);
 		clearProgressiveGridObserver('favorites', grid);
-		if (!appendProgressive && favoritesHasRenderedCards && favoritesSameSignature && !favoritesHasPendingReveal) {
+		if (!appendProgressive && favoritesHasRenderedCards && favoritesCanRetain && !favoritesHasPendingReveal) {
+			grid.dataset.progressiveGridSignature = favoritesProgressiveSignature;
 			const renderedCount = Number(grid.dataset.progressiveGridRendered || grid.querySelectorAll(':scope > .game-card').length);
 			setupProgressiveGridObserver('favorites', grid, renderedCount, filteredFavs.length, () => window.updateFavoritesLibraryUI(true, 'append'));
 			return;
@@ -59647,6 +59813,7 @@ function formatLibraryLastPlayedBadge(game = {}) {
 		}
 
 		if (filteredFavs.length === 0) {
+			grid.__favoritesVisiblePrefixSignature = '';
 			let emptyTitle = '';
 			let emptyDesc = '';
 			let emptyIcon = '';
@@ -59845,6 +60012,7 @@ function formatLibraryLastPlayedBadge(game = {}) {
 			}
 		}
 		grid.dataset.progressiveGridRendered = String(favoritesRenderEnd);
+		grid.__favoritesVisiblePrefixSignature = getFavoritesVisiblePrefixSignature(filteredFavs, favoritesRenderEnd);
 	
 		if (!isSilent && !favoritesHasRenderedCards) {
 			setupRevealAnimations('ps3-favs-grid', { selector: '.game-card:not(.category-favorites-entry):not([data-live-render-reused="1"])' });
@@ -67802,7 +67970,8 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 		const sortMultiplier = currentOrder === 'asc' ? -1 : 1;
 
 		const renderSignature = (typeof psnTrophyRenderSignature === 'function') ? psnTrophyRenderSignature() : '';
-		if (!options.force && grid.dataset.rendered === '1' && !window.__trophyViewsDirty && window.__lastTrophyRenderSignature === renderSignature) {
+		const trophyWasDirty = !!window.__trophyViewsDirty;
+		if (!options.force && grid.dataset.rendered === '1' && !trophyWasDirty && window.__lastTrophyRenderSignature === renderSignature) {
 			if (!isSilent && options.replayEntry !== false && typeof setupRevealAnimations === 'function') {
 				setupRevealAnimations('trophy-grid-container', { selector: '.trophy-card' });
 			}
@@ -67854,6 +68023,17 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 			else result = aMeta.groupWeight !== bMeta.groupWeight ? aMeta.groupWeight - bMeta.groupWeight : aMeta.gradeWeight - bMeta.gradeWeight;
 			return result * sortMultiplier;
 		});
+		const trophyVisibleSignature = getProgressiveGridSignature([
+			sortedIds.join('|'),
+			JSON.stringify(window.userTrophies || {}),
+			JSON.stringify(window.globalTrophyStats || {}),
+			psnGetRewardDefinitionSignature()
+		]);
+		if (!options.force && !trophyWasDirty && grid.dataset.rendered === '1' &&
+			grid.querySelectorAll(':scope > .trophy-card').length === sortedIds.length &&
+			grid.__trophyVisibleSignature === trophyVisibleSignature) {
+			return;
+		}
 		const rewardByRequirement = psnGetRewardByRequirementMap();
 		
 		let html = '';
@@ -67945,6 +68125,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 		grid.innerHTML = html;
 		if (grid.firstElementChild?.classList.contains('psn-page-empty-state') && typeof window.registerPsnPageEmptyStates === 'function') window.registerPsnPageEmptyStates(grid.firstElementChild);
 		grid.dataset.rendered = '1';
+		grid.__trophyVisibleSignature = trophyVisibleSignature;
 		if (!isSilent && options.replayEntry !== false && typeof setupRevealAnimations === 'function') {
 			setupRevealAnimations('trophy-grid-container', { selector: '.trophy-card' });
 		}
