@@ -32788,13 +32788,11 @@ P
 			typeof CSS !== 'undefined' && CSS.supports('scale', '0.96')) {
 			const cards = Array.from(grid.querySelectorAll(config.itemSelector));
 			const viewport = snapshot.viewport || getBrowseMotionViewportRect();
-			const range = getBrowseMotionViewportCandidateRange(grid, cards, viewport, 24);
 			let revealed = 0;
-			for (let index = range.start; index < range.end; index++) {
-				const card = cards[index];
+			for (const card of cards) {
 				const key = getCollectionFilterMotionCardKey(card);
 				if (!key || snapshot.existingKeys.has(key) || (config.pendingClass && card.classList.contains(config.pendingClass))) continue;
-				const rect = range.rectCache.get(card) || card.getBoundingClientRect();
+				const rect = card.getBoundingClientRect();
 				if (!rect.width || !rect.height || !browseMotionRectVisible(rect, viewport, 24)) continue;
 				const target = typeof config.revealTarget === 'function' ? config.revealTarget(card) : card;
 				if (!target) continue;
@@ -32802,7 +32800,7 @@ P
 					{ opacity: 0, scale: '0.96' },
 					{ opacity: 1, scale: '1' }
 				], {
-					duration: 410,
+					duration: 500,
 					delay: Math.min(revealed, 4) * 18,
 					easing: 'cubic-bezier(.2,.8,.2,1)',
 					fill: 'backwards'
@@ -40884,7 +40882,6 @@ P
 			const verifiedLiveScore = scoreMetadataCandidate(liveSearchSpec.target, liveRawg.details, psnStoreMeta.releaseYear, metadataPlatformHint);
 			if (verifiedLiveScore >= liveSearchSpec.minScore) {
 				rawgHandledByLiveEndpoint = true;
-				console.debug(`[Metadata] Server RAWG ${liveSearchSpec.kind} match accepted for "${gameName}": "${liveRawg.details.name || ''}" (${verifiedLiveScore}/100).`);
 				const hasLiveRawgScreenshots = renderExternalMetadata(liveRawg.details, liveRawg.screenshots || liveRawg.details.screenshots || [], { source:'RAWG' });
 				if (!collectSummaryCandidates && hasLiveRawgScreenshots && metadataEnrichmentComplete()) {
 					setGameModalResolvedMetadataSnapshot(resolvedMetadataCacheKey, captureGameModalResolvedMetadataSnapshot(modalRoot));
@@ -40912,7 +40909,6 @@ P
 					if (!match.candidate) { console.warn(`[Metadata] RAWG rejected low-confidence ${searchSpec.kind} match for "${gameName}" (closest: "${match.best?.name || 'none'}", score ${match.score}/${searchSpec.minScore}).`); break; }
 					const slug = match.candidate.slug;
 					if (!slug) break;
-					console.debug(`[Metadata] RAWG ${searchSpec.kind} match accepted for "${gameName}": "${match.candidate.name}" (${match.score}/100).`);
 					const safeRawgFetch = (url, timeout) => fetchWithTimeout(url, timeout).then(response => ({ response })).catch(error => ({ error }));
 					const [detailsResult, screensResult] = await Promise.all([
 						safeRawgFetch(`https://api.rawg.io/api/games/${slug}?key=${activeKey}`, 3500),
@@ -40933,8 +40929,6 @@ P
 						setGameModalResolvedMetadataSnapshot(resolvedMetadataCacheKey, captureGameModalResolvedMetadataSnapshot(modalRoot));
 						return;
 					}
-					if (!hasRawgScreenshots) console.debug(`[Metadata] RAWG metadata accepted for "${gameName}", but no screenshots were returned. Trying IGDB screenshots.`);
-					else console.debug(`[Metadata] RAWG metadata accepted for "${gameName}", but some metadata fields are still missing. Trying IGDB enrichment.`);
 					break rawgSearchLoop;
 				} catch (error) {
 					console.warn(`[Metadata] RAWG network failure for "${gameName}". Falling back.`);
@@ -40965,14 +40959,11 @@ P
 				}
 				const match = pickMetadataCandidate(data.results, searchSpec.target, searchSpec.minScore, psnStoreMeta.releaseYear, metadataPlatformHint);
 				if (!match.candidate) { console.warn(`[Metadata] IGDB rejected low-confidence ${searchSpec.kind} match for "${gameName}" (closest: "${match.best?.name || 'none'}", score ${match.score}/${searchSpec.minScore}).`); continue; }
-				console.debug(`[Metadata] IGDB ${searchSpec.kind} match accepted for "${gameName}": "${match.candidate.name}" (${match.score}/100).`);
 				const hasIgdbScreenshots = renderExternalMetadata(match.candidate, match.candidate.screenshots || [], { source:'IGDB' });
 				if (!collectSummaryCandidates && hasIgdbScreenshots && metadataEnrichmentComplete()) {
 					setGameModalResolvedMetadataSnapshot(resolvedMetadataCacheKey, captureGameModalResolvedMetadataSnapshot(modalRoot));
 					return;
 				}
-				if (!hasIgdbScreenshots) console.debug(`[Metadata] IGDB match for "${gameName}" had no screenshots. Trying the next screenshot fallback.`);
-				else console.debug(`[Metadata] IGDB added data for "${gameName}", but some metadata fields are still missing. Trying Steam enrichment.`);
 			} catch (error) {
 				console.warn('[Metadata] IGDB proxy unavailable. Falling back to Steam.');
 				break igdbSearchLoop;
@@ -40998,14 +40989,11 @@ P
 				if (!detailsResponse.ok || !detailsPayload.details) continue;
 				const verifiedScore = scoreMetadataCandidate(searchSpec.target, detailsPayload.details, psnStoreMeta.releaseYear, metadataPlatformHint);
 				if (verifiedScore < searchSpec.minScore) { console.warn(`[Metadata] Steam details no longer meet confidence threshold for "${gameName}" (${verifiedScore}/${searchSpec.minScore}).`); continue; }
-				console.debug(`[Metadata] Steam ${searchSpec.kind} match accepted for "${gameName}": "${detailsPayload.details.name}" (${verifiedScore}/100).`);
 				const hasSteamScreenshots = renderExternalMetadata(detailsPayload.details, detailsPayload.details.screenshots || [], { source:'Steam' });
 				if (!collectSummaryCandidates && hasSteamScreenshots && metadataEnrichmentComplete()) {
 					setGameModalResolvedMetadataSnapshot(resolvedMetadataCacheKey, captureGameModalResolvedMetadataSnapshot(modalRoot));
 					return;
 				}
-				if (!hasSteamScreenshots) console.debug(`[Metadata] Steam match for "${gameName}" had no screenshots.`);
-				else if (!metadataEnrichmentComplete()) console.debug(`[Metadata] Steam added data for "${gameName}", but some metadata fields are still missing.`);
 			} catch (error) {
 				console.warn('[Metadata] Steam fallback unavailable. Falling back to Wikipedia.');
 				break steamSearchLoop;
@@ -53879,6 +53867,7 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 		const wishlistPrefixSignature = wishlistVisibleCount > 0
 			? getWishlistVisiblePrefixSignature(filteredWishlist, wishlistVisibleCount, catFilter === 'ALL') : '';
 		const wishlistCanReuseExisting = !appendProgressive && wishlistPreviouslyRendered > 0 &&
+			wishlistPreviouslyRendered >= Math.min(filteredWishlist.length, getProgressiveGridInitialLimit()) &&
 			filteredWishlist.length >= wishlistPreviouslyRendered &&
 			grid.querySelectorAll(':scope > .game-card').length === wishlistPreviouslyRendered &&
 			!(pendingWishlistRevealKeys && pendingWishlistRevealKeys.length) &&
@@ -58366,7 +58355,9 @@ function formatLibraryLastPlayedBadge(game = {}) {
 		const canAppend = appendProgressive && sameSignature;
 		const libraryVisibleCount = Math.max(0, Number(grid.dataset.progressiveGridRendered || 0));
 		const canRetainLibraryCards = isFiltering && !appendProgressive && hasRenderedCards &&
-			!replacingLibrarySkeletons && libraryVisibleCount > 0 && (games || []).length >= libraryVisibleCount &&
+			!replacingLibrarySkeletons && libraryVisibleCount > 0 &&
+			libraryVisibleCount >= Math.min((games || []).length, getProgressiveGridInitialLimit()) &&
+			(games || []).length >= libraryVisibleCount &&
 			grid.querySelectorAll(':scope > .game-card').length === libraryVisibleCount &&
 			grid.__localLibraryVisiblePrefixSignature === getLocalLibraryVisiblePrefixSignature(games, libraryVisibleCount);
 		if (!appendProgressive && hasRenderedCards && (isFiltering ? canRetainLibraryCards : sameSignature)) {
@@ -59796,7 +59787,9 @@ function formatLibraryLastPlayedBadge(game = {}) {
 		const favoritesHasRenderedCards = !!grid.querySelector(':scope > .game-card');
 		const favoritesVisibleCount = Math.max(0, Number(grid.dataset.progressiveGridRendered || 0));
 		const favoritesCanRetain = !appendProgressive && favoritesHasRenderedCards &&
-			favoritesVisibleCount > 0 && filteredFavs.length >= favoritesVisibleCount &&
+			favoritesVisibleCount > 0 &&
+			favoritesVisibleCount >= Math.min(filteredFavs.length, getProgressiveGridInitialLimit()) &&
+			filteredFavs.length >= favoritesVisibleCount &&
 			grid.querySelectorAll(':scope > .game-card').length === favoritesVisibleCount &&
 			grid.__favoritesVisiblePrefixSignature === getFavoritesVisiblePrefixSignature(filteredFavs, favoritesVisibleCount);
 		clearProgressiveGridObserver('favorites', grid);
