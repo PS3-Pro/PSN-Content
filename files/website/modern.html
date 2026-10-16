@@ -1773,14 +1773,16 @@ html.ios-webkit #object-particles { contain:strict; }
 .section-header a { color: var(--text-muted); text-decoration: none; font-size: 12px; font-weight: bold; transition: 0.2s; }
 .section-header a:hover { color: #fff; }
 .section-header-meta { display:inline-flex; align-items:center; gap:8px; flex-wrap:nowrap; justify-content:flex-end; min-width:0; margin-left:auto; }
-.explore-visit-filter-host { flex:0 0 auto; margin-top:0; }
-.explore-visit-filter-host .explore-visit-pill { padding:2px 8px; border-radius:10px; font-size:9px; line-height:1.15; white-space:nowrap; }
-.explore-visit-pill-compact { display:none; }
-.explore-visit-pill.is-hidden { display:none; }
-.explore-section.show-visit-highlights .game-card.explore-card-new-since-visit { outline:2px solid rgba(255,255,255,.88); outline-offset:2px; box-shadow:0 0 0 1px rgba(0,0,0,.20),0 0 22px rgba(255,255,255,.18); filter:brightness(1.04); }
-.explore-section.show-visit-highlights .game-card.explore-card-new-since-visit .game-img { filter:brightness(1.06); }
+.explore-update-filter-host { flex:0 0 auto; margin-top:0; }
+.explore-update-filter-host .explore-update-pill { padding:2px 8px; border-radius:10px; font-size:9px; line-height:1.15; white-space:nowrap; }
+.explore-update-pill-compact { display:none; }
+.explore-update-pill.is-hidden { display:none; }
+.explore-update-pill > input[disabled] { pointer-events:none; }
+.explore-section.show-update-highlights .game-card.explore-card-new-since-update { outline:2px solid rgba(255,255,255,.88); outline-offset:2px; border-color:rgba(255,255,255,.6) !important; background-color:rgba(0,112,204,.05) !important; box-shadow:0 0 0 1px rgba(0,0,0,.20),0 0 22px rgba(255,255,255,.18); filter:brightness(1.04); position:relative; }
+.explore-section.show-update-highlights .game-card.explore-card-new-since-update .game-img { filter:brightness(1.06); }
+.explore-section.show-update-highlights .game-card.explore-card-new-since-update::before { content:""; position:absolute; inset:0; border-radius:inherit; background-image:linear-gradient(120deg,transparent 30%,rgba(255,255,255,.1) 50%,transparent 70%); background-size:200% 100%; animation:shine-move 2s infinite linear; pointer-events:none; z-index:2; }
 @media (max-width: 768px) { .explore-section .section-header:has(.section-header-meta) { align-items:flex-end; gap:8px; flex-wrap:nowrap; } .explore-section .section-header:has(.section-header-meta) h2 { min-width:0; white-space:nowrap; } .explore-section .section-header-meta { width:auto; flex:0 0 auto; margin-left:auto; justify-content:flex-end; flex-wrap:nowrap; } }
-@media (max-width: 430px), (min-width: 1025px) and (max-width: 1220px) { .explore-visit-pill-full { display:none; } .explore-visit-pill-compact { display:inline; } }
+@media (max-width: 430px), (min-width: 1025px) and (max-width: 1220px) { .explore-update-pill-full { display:none; } .explore-update-pill-compact { display:inline; } }
 .promo-card { background: linear-gradient(135deg,#bf953f 0%,#fcf6ba 45%,#b38728 100%); border-radius: 12px; padding: 25px; display: flex; flex-direction: column; justify-content: center; transition: all 0.4s cubic-bezier(0.175,0.885,0.32,1.275); position: relative; overflow: hidden; box-shadow: 0 5px 15px rgba(0,0,0,0.3); min-height: 160px; }
 .promo-card:is(:hover,.psn-hover-stable) { transform: translateY(-6px) scale(1.02); box-shadow: 0 12px 25px rgba(184,134,11,0.5); }
 .promo-card:is(:hover,.psn-hover-stable) .promo-icon { transform: scale(1.2) rotate(-5deg); color: rgba(0,0,0,0.15); }
@@ -3829,6 +3831,13 @@ body.chat-selection-mode .chat-message-actions .chat-delete-action:not(.chat-del
 .clear-btn:is(.psn-primary-pressed,.mobile-pressed) { transform: translateY(1px) scale(.70) !important; filter: brightness(.78) !important; transition-duration: .06s !important; }
 .chat-selection-clear-btn:is(.psn-primary-pressed,.mobile-pressed) { transform: translateY(1px) scale(.90) !important; filter: brightness(.80) !important; transition-duration: .06s !important; }
 #mobile-menu-btn:is(.psn-primary-pressed,.mobile-pressed) { transform: translateY(1px) scale(.88) !important; filter: brightness(.82) !important; transition-duration: .06s !important; }
+
+/* Keep the press feedback inside the control while its original clickable area stays fixed. */
+.psn-press-hitbox-stable:is(.psn-primary-pressed,.mobile-pressed) > :is(i,svg,.fas,.far,.fab) {
+	translate: 0 1px;
+	scale: .88;
+	transition: translate .06s ease, scale .06s ease;
+}
 
 @media (prefers-reduced-motion:reduce) {
 	.psn-card-pointer-light, .psn-card-morph-title, .psn-card-morph-cover-unit, .psn-shared-cover-flight, .psn-shared-cover-behind-layer, .psn-download-motion-ripple { display: none !important; }
@@ -12751,11 +12760,39 @@ P
 	let mobilePressedElement = null;
 	let mobilePressReleaseTimer = 0;
 	let primaryPressedElement = null;
+	const psnPressHitboxOriginal = new WeakMap();
+
+	function lockPsnPressHitbox(element) {
+		if (!element || !element.style || psnPressHitboxOriginal.has(element) || !element.matches('button, a[href], [role="button"], [onclick]')) return;
+		const rect = element.getBoundingClientRect();
+		if (!rect.width || !rect.height || rect.height > 70) return;
+		const style = element.style;
+		psnPressHitboxOriginal.set(element, {
+			value: style.getPropertyValue('transform'),
+			priority: style.getPropertyPriority('transform')
+		});
+		// Preserve hover placement and the entire hit area until pointerup.
+		style.setProperty('transform', getComputedStyle(element).transform, 'important');
+		element.classList.add('psn-press-hitbox-stable');
+	}
+
+	function unlockPsnPressHitbox(element) {
+		if (!element || !psnPressHitboxOriginal.has(element)) return;
+		if (element.classList.contains('psn-primary-pressed') || element.classList.contains('mobile-pressed')) return;
+		const original = psnPressHitboxOriginal.get(element);
+		psnPressHitboxOriginal.delete(element);
+		element.classList.remove('psn-press-hitbox-stable');
+		if (original.value) element.style.setProperty('transform', original.value, original.priority);
+		else element.style.removeProperty('transform');
+	}
 
 	function clearPrimaryPressed() {
 		const pressed = primaryPressedElement;
 		primaryPressedElement = null;
-		if (pressed && pressed.classList) pressed.classList.remove('psn-primary-pressed');
+		if (pressed && pressed.classList) {
+			pressed.classList.remove('psn-primary-pressed');
+			unlockPsnPressHitbox(pressed);
+		}
 	}
 
 	function markPrimaryPressed(target) {
@@ -12764,6 +12801,7 @@ P
 		if (!pressed || pressed.matches(':disabled,[aria-disabled="true"]')) return;
 		clearPrimaryPressed();
 		primaryPressedElement = pressed;
+		lockPsnPressHitbox(pressed);
 		pressed.classList.add('psn-primary-pressed');
 	}
 
@@ -12792,6 +12830,7 @@ P
 		if (!pressed) return;
 		const release = () => {
 			try { pressed.classList.remove('mobile-pressed'); } catch (e) {}
+			unlockPsnPressHitbox(pressed);
 			if (mobilePressedElement === pressed) mobilePressedElement = null;
 		};
 		if (immediate) release();
@@ -12803,8 +12842,12 @@ P
 			const pressed = target && target.closest ? target.closest(PSN_PRESS_TARGET_SELECTOR) : null;
 			if (!pressed || pressed.matches(':disabled,[aria-disabled="true"]')) return;
 			clearTimeout(mobilePressReleaseTimer);
-			if (mobilePressedElement && mobilePressedElement !== pressed) mobilePressedElement.classList.remove('mobile-pressed');
+			if (mobilePressedElement && mobilePressedElement !== pressed) {
+				mobilePressedElement.classList.remove('mobile-pressed');
+				unlockPsnPressHitbox(mobilePressedElement);
+			}
 			mobilePressedElement = pressed;
+			lockPsnPressHitbox(pressed);
 			pressed.classList.add('mobile-pressed');
 		} catch (e) {}
 	}
@@ -18118,79 +18161,56 @@ P
 		return `${n} ${n === 1 ? singular : plural}`;
 	};
 
-	const STORAGE_KEY_EXPLORE_LAST_VISIT_AT = 'psn_explore_last_visit_at';
+	const EXPLORE_UPDATE_DAY_MS = 24 * 60 * 60 * 1000;
+	let exploreLatestUpdateDay = 0;
 
-	function primeExploreVisitSession() {
-		const activeUser = String(localStorage.getItem('psn_username') || '');
-		if (window.__exploreVisitSessionPrimed === true && window.__exploreVisitSessionOwner === activeUser) return;
-		const previousVisitAt = normalizeProfileListTimestamp(loadState(STORAGE_KEY_EXPLORE_LAST_VISIT_AT));
-		window.__explorePreviousVisitAt = previousVisitAt;
-		window.__exploreCurrentVisitAt = Date.now();
-		window.__exploreVisitSessionPrimed = true;
-		window.__exploreVisitSessionOwner = activeUser;
-		window.__exploreVisitServerSynced = false;
-		window.__exploreVisitSyncPromise = null;
-		saveState(STORAGE_KEY_EXPLORE_LAST_VISIT_AT, String(window.__exploreCurrentVisitAt));
+	function getExploreUpdateDay(value) {
+		const timestamp = Number(value) || 0;
+		return Number.isFinite(timestamp) && timestamp > 0 ? Math.floor(timestamp / EXPLORE_UPDATE_DAY_MS) : 0;
 	}
 
-	function refreshExploreVisitPillsFromCurrentData() {
+	function syncExploreUpdateCardClasses(container) {
+		const data = container && container.__exploreVirtualData;
+		if (!data || !Array.isArray(data.items)) return;
+		const update = card => {
+			if (!card) return;
+			const index = Number(card.dataset.exploreIndex);
+			const isNew = Number.isInteger(index) && index >= 0 && index < data.items.length && !!data.items[index].__newSinceUpdate;
+			card.classList.toggle('explore-card-new-since-update', isNew);
+			if (isNew) card.dataset.newSinceUpdate = '1';
+			else delete card.dataset.newSinceUpdate;
+		};
+		container.querySelectorAll('.game-card[data-explore-index]').forEach(update);
+		if (data.cardCache) data.cardCache.forEach(update);
+	}
+
+	function refreshExploreUpdatePillsFromCurrentData() {
 		['latest-games-grid', 'latest-dlcs-grid', 'latest-avatars-grid', 'latest-demos-grid'].forEach(containerId => {
 			const container = document.getElementById(containerId);
-			const items = container && container.__exploreVirtualData && Array.isArray(container.__exploreVirtualData.items)
-				? container.__exploreVirtualData.items
-				: null;
-			if (!items || typeof window.updateExploreVisitPill !== 'function') return;
-			window.updateExploreVisitPill(containerId, items);
-			if (container.__exploreVirtualData) {
-				container.__exploreVirtualData.cardCache = new Map();
-				delete container.dataset.exploreVirtualStart;
-				delete container.dataset.exploreVirtualEnd;
-				renderExploreVirtualWindow(container, true);
-			}
+			const data = container && container.__exploreVirtualData;
+			if (!data || !Array.isArray(data.items)) return;
+			window.updateExploreUpdatePill(containerId, data.items);
 		});
 	}
 
-	window.syncExploreVisitSession = function(reason = 'explore') {
-		primeExploreVisitSession();
-		const activeUser = String(localStorage.getItem('psn_username') || '');
-		if (!activeUser || activeUser === 'null' || activeUser === 'undefined') return Promise.resolve(false);
-		if (window.__exploreVisitServerSynced === true && window.__exploreVisitSessionOwner === activeUser) return Promise.resolve(true);
-		if (window.__exploreVisitSyncPromise && window.__exploreVisitSessionOwner === activeUser) return window.__exploreVisitSyncPromise;
-		if (!window.isProfileLoaded || typeof socketChat === 'undefined' || !socketChat || !socketChat.connected) return Promise.resolve(false);
-
-		const localFallbackPrevious = normalizeProfileListTimestamp(window.__explorePreviousVisitAt || 0);
-		window.__exploreVisitSyncPromise = new Promise(resolve => {
-			let settled = false;
-			const finish = response => {
-				if (settled) return;
-				settled = true;
-				window.__exploreVisitSyncPromise = null;
-				if (!response || response.ok !== true || String(localStorage.getItem('psn_username') || '') !== activeUser) { resolve(false); return; }
-				const serverPrevious = normalizeProfileListTimestamp(response.previousVisitAt);
-				const visitAt = normalizeProfileListTimestamp(response.visitAt) || Date.now();
-				window.__explorePreviousVisitAt = serverPrevious || localFallbackPrevious;
-				window.__exploreCurrentVisitAt = visitAt;
-				window.__exploreVisitServerSynced = true;
-				saveState(STORAGE_KEY_EXPLORE_LAST_VISIT_AT, String(visitAt));
-				refreshExploreVisitPillsFromCurrentData();
-				resolve(true);
-			};
-			try {
-				const payload = { reason, clientSentAt: Date.now() };
-				if (typeof socketChat.timeout === 'function') {
-					socketChat.timeout(5000).emit('record_explore_visit', payload, (err, response) => finish(err ? null : response));
-				} else {
-					const timer = setTimeout(() => finish(null), 5000);
-					socketChat.emit('record_explore_visit', payload, response => { clearTimeout(timer); finish(response); });
-				}
-			} catch (err) {
-				finish(null);
+	function syncExploreLatestUpdateDay() {
+		let newestDay = 0;
+		for (const containerId of ['latest-games-grid', 'latest-dlcs-grid', 'latest-avatars-grid', 'latest-demos-grid']) {
+			const container = document.getElementById(containerId);
+			const items = container && container.__exploreVirtualData && container.__exploreVirtualData.items;
+			if (!Array.isArray(items)) continue;
+			for (const item of items) {
+				const day = getExploreUpdateDay(item && item.dateValue);
+				if (day > newestDay) newestDay = day;
 			}
-		});
-		return window.__exploreVisitSyncPromise;
-	};
+		}
+		if (exploreLatestUpdateDay === newestDay) return false;
+		exploreLatestUpdateDay = newestDay;
+		refreshExploreUpdatePillsFromCurrentData();
+		return true;
+	}
 
-	function getExploreVisitPillElement(containerId) {
+	function getExploreUpdatePillElement(containerId) {
 		const container = document.getElementById(containerId);
 		if (!container) return null;
 		const section = container.closest('.explore-section');
@@ -18202,38 +18222,40 @@ P
 			meta.className = 'section-header-meta';
 			header.appendChild(meta);
 		}
-		let pill = meta.querySelector(`.explore-visit-pill[data-container-id="${containerId}"]`);
+		let pill = meta.querySelector(`.explore-update-pill[data-container-id="${containerId}"]`);
 		if (!pill) {
-			let host = meta.querySelector('.explore-visit-filter-host');
+			let host = meta.querySelector('.explore-update-filter-host');
 			if (!host) {
 				host = document.createElement('span');
-				host.className = 'explore-visit-filter-host filter-checkboxes';
+				host.className = 'explore-update-filter-host filter-checkboxes';
 				meta.appendChild(host);
 			}
 			pill = document.createElement('label');
-			pill.className = 'explore-visit-pill is-hidden';
+			pill.className = 'explore-update-pill is-hidden';
 			pill.dataset.containerId = containerId;
 			pill.setAttribute('role', 'button');
 			pill.setAttribute('tabindex', '0');
 			pill.setAttribute('aria-pressed', 'false');
-			pill.innerHTML = '<input type="checkbox" checked disabled aria-hidden="true"><span class="explore-visit-pill-value"><span class="explore-visit-pill-full">0 NEW SINCE LAST VISIT</span><span class="explore-visit-pill-compact" data-no-translate="true" translate="no">0 NEW</span></span>';
-			pill.onclick = event => { event.preventDefault(); window.toggleExploreVisitHighlights(containerId); };
-			pill.onkeydown = event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); window.toggleExploreVisitHighlights(containerId); } };
+			pill.innerHTML = '<input type="checkbox" disabled aria-hidden="true"><span class="explore-update-pill-value"><span class="explore-update-pill-full">0 NEW SINCE LAST UPDATE</span><span class="explore-update-pill-compact" data-no-translate="true" translate="no">0 NEW</span></span>';
+			pill.onclick = event => { event.preventDefault(); window.toggleExploreUpdateHighlights(containerId); };
+			pill.onkeydown = event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); window.toggleExploreUpdateHighlights(containerId); } };
 			host.appendChild(pill);
 		}
 		return pill;
 	}
 
-	window.toggleExploreVisitHighlights = function(containerId, forceState = null) {
+	window.toggleExploreUpdateHighlights = function(containerId, forceState = null) {
 		const container = document.getElementById(containerId);
 		if (!container) return false;
 		const section = container.closest('.explore-section');
-		const pill = getExploreVisitPillElement(containerId);
-		if (!section || !pill || pill.classList.contains('is-hidden')) return false;
-		const shouldActivate = forceState === null ? !section.classList.contains('show-visit-highlights') : !!forceState;
-		section.classList.toggle('show-visit-highlights', shouldActivate);
+		const pill = getExploreUpdatePillElement(containerId);
+		if (!section || !pill || pill.classList.contains('is-hidden') || Number(container.dataset.newSinceUpdateCount || 0) < 1) return false;
+		const shouldActivate = forceState === null ? !section.classList.contains('show-update-highlights') : !!forceState;
+		section.classList.toggle('show-update-highlights', shouldActivate);
 		pill.classList.toggle('is-active', shouldActivate);
 		pill.setAttribute('aria-pressed', shouldActivate ? 'true' : 'false');
+		const checkbox = pill.querySelector('input[type="checkbox"]');
+		if (checkbox) checkbox.checked = shouldActivate;
 		if (!shouldActivate) return true;
 		if (container.__exploreVirtualData) {
 			delete container.dataset.exploreReturnResetting;
@@ -18246,45 +18268,41 @@ P
 		return true;
 	};
 
-	window.updateExploreVisitPill = function(containerId, items = []) {
-		primeExploreVisitSession();
-		const pill = getExploreVisitPillElement(containerId);
+	window.updateExploreUpdatePill = function(containerId, items = []) {
+		const pill = getExploreUpdatePillElement(containerId);
 		const container = document.getElementById(containerId);
 		const section = container ? container.closest('.explore-section') : null;
 		if (!pill || !container || !section) return 0;
-		const previousVisitAt = Number(window.__explorePreviousVisitAt || 0) || 0;
+		const latestUpdateDay = exploreLatestUpdateDay;
 		let count = 0;
-		if (previousVisitAt > 0 && Array.isArray(items) && items.length) {
+		if (Array.isArray(items)) {
 			items.forEach(item => {
-				const dateValue = Number(item && item.dateValue || 0) || 0;
-				const isNewSinceVisit = previousVisitAt > 0 && dateValue > previousVisitAt;
-				if (item) item.__newSinceVisit = isNewSinceVisit;
-				if (isNewSinceVisit) count++;
+				const isNew = latestUpdateDay > 0 && getExploreUpdateDay(item && item.dateValue) === latestUpdateDay;
+				if (item) item.__newSinceUpdate = isNew;
+				if (isNew) count++;
 			});
-		} else if (Array.isArray(items)) {
-			items.forEach(item => { if (item) item.__newSinceVisit = false; });
 		}
-		container.dataset.newSinceVisitCount = String(count);
+		container.dataset.newSinceUpdateCount = String(count);
+		syncExploreUpdateCardClasses(container);
 		if (count < 1) {
-			pill.classList.add('is-hidden');
 			pill.classList.remove('is-active');
 			pill.setAttribute('aria-pressed', 'false');
-			section.classList.remove('show-visit-highlights');
-			pill.title = '';
-			pill.setAttribute('aria-label', '');
-			return 0;
+			const checkbox = pill.querySelector('input[type="checkbox"]');
+			if (checkbox) checkbox.checked = false;
+			section.classList.remove('show-update-highlights');
 		}
-		const text = `${count} NEW SINCE LAST VISIT`;
-		const label = `${count} ${count === 1 ? 'new item' : 'new items'} since your last visit`;
-		const valueNode = pill.querySelector('.explore-visit-pill-value');
+		const text = `${count} NEW SINCE LAST UPDATE`;
+		const label = `${count} ${count === 1 ? 'new item' : 'new items'} from the latest catalog update`;
+		const valueNode = pill.querySelector('.explore-update-pill-value');
 		if (valueNode) {
-			const fullNode = valueNode.querySelector('.explore-visit-pill-full');
-			const compactNode = valueNode.querySelector('.explore-visit-pill-compact');
+			const fullNode = valueNode.querySelector('.explore-update-pill-full');
+			const compactNode = valueNode.querySelector('.explore-update-pill-compact');
 			if (fullNode) fullNode.textContent = text;
 			if (compactNode) compactNode.textContent = `${count} NEW`;
 		}
-		pill.title = label + '. Click to highlight.';
+		pill.title = count > 0 ? label + '. Click to highlight.' : 'No new items in this category from the latest catalog update.';
 		pill.setAttribute('aria-label', pill.title);
+		pill.setAttribute('aria-disabled', count > 0 ? 'false' : 'true');
 		pill.classList.remove('is-hidden');
 		return count;
 	};
@@ -18449,9 +18467,9 @@ P
 		const template = document.createElement('template');
 		template.innerHTML = buildExploreCardHTML(game, cat, idx, animateCards).trim();
 		const card = template.content.firstElementChild;
-		if (card && game && game.__newSinceVisit) {
-			card.classList.add('explore-card-new-since-visit');
-			card.dataset.newSinceVisit = '1';
+		if (card && game && game.__newSinceUpdate) {
+			card.classList.add('explore-card-new-since-update');
+			card.dataset.newSinceUpdate = '1';
 		}
 		const img = card ? card.querySelector('.game-img') : null;
 		if (img && img.complete && img.naturalWidth > 0) {
@@ -18776,7 +18794,7 @@ P
 		container.dataset.exploreCat = cat;
 		container.dataset.countAwareTotal = String(visibleItems.length);
 		if (typeof window.updateCountAwareSectionTitle === 'function') window.updateCountAwareSectionTitle(container.id, visibleItems.length);
-		if (typeof window.updateExploreVisitPill === 'function') window.updateExploreVisitPill(container.id, visibleItems);
+		if (typeof window.updateExploreUpdatePill === 'function') window.updateExploreUpdatePill(container.id, visibleItems);
 		container.dataset.exploreVirtual = '1';
 		delete container.dataset.exploreVirtualStart;
 		delete container.dataset.exploreVirtualEnd;
@@ -23247,8 +23265,6 @@ P
 	}
 
     async function populateExploreTab(options = {}) {
-		if (typeof primeExploreVisitSession === 'function') primeExploreVisitSession();
-		if (typeof window.syncExploreVisitSession === 'function') window.syncExploreVisitSession('explore').catch(() => {});
 		if (typeof window.renderRecentlyVisited === 'function') window.renderRecentlyVisited();
 		if (typeof loadBackgroundIndexes === 'function') {
 			loadBackgroundIndexes('high').catch(e => console.warn('[System] Cover indexes unavailable for Explore.', e));
@@ -23272,6 +23288,7 @@ P
             } else {
                 await Promise.all(exploreJobs.map(([cat, containerId]) => fetchLatestForExplore(cat, containerId, options)));
             }
+			syncExploreLatestUpdateDay();
 			window.__explorePopulateReady = true;
 		} finally {
 			window.__explorePopulateAnimateCards = previousExplorePopulateAnimate;
@@ -52490,6 +52507,7 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 		}
 	
 		exploreCache = { games: null, dlcs: null, avatars: null, demos: null };
+		exploreLatestUpdateDay = 0;
 		currentData = []; 
 		navHistory = null;
 		bootExploreWarmPromise = null;
@@ -86225,7 +86243,6 @@ function getVisibleChatStackEl(id) {
 			if (isLightAuthPayload && initialProfileSyncOk && !profileWasAlreadyLoaded) {
 				window.isProfileLoaded = true;
 			}
-			if (typeof window.syncExploreVisitSession === 'function') window.syncExploreVisitSession('auth-success').catch(() => {});
 			if (typeof window.refreshViewerPlayTogetherTitles === 'function') window.refreshViewerPlayTogetherTitles(true);
 
 			if (typeof window.bootstrapFriendActivityRealtime === 'function') {
@@ -104196,7 +104213,7 @@ function getVisibleChatStackEl(id) {
     const INTERFACE_TRANSLATE_EXPLORE_SLICE_MAX_NODES = 110;
     const INTERFACE_TRANSLATE_EXPLORE_PRIORITY_SELECTOR = [
         '.hero-content', '.section-header h2', '.section-header h3', '.explore-right-col',
-        '.explore-visit-pill', '.explore-section > h2', '.explore-section > h3'
+        '.explore-update-pill', '.explore-section > h2', '.explore-section > h3'
     ].join(',');
     const INTERFACE_TRANSLATE_VISIBILITY_HOST_SELECTOR = [
         '[id^="view-"]', '[id^="subview-"]', '.sys-modal-overlay', '.modal-overlay',
