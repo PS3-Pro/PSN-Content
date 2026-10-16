@@ -79615,6 +79615,8 @@ function getVisibleChatStackEl(id) {
 				if (profileSyncVisibleUiState.favorites !== true && typeof updateFavoritesLibraryUI === 'function' && isPsnDomSectionVisible('view-library') && isPsnDomSectionVisible('subview-favs')) updateFavoritesLibraryUI(true);
 			}
 			if (profileSyncChanges.friends) {
+				const openProfile = document.getElementById('modal-sys-profile');
+				if (openProfile && typeof window.syncOpenProfileFriendButton === 'function') window.syncOpenProfileFriendButton(openProfile.dataset.profileUsername);
 				if (typeof isFriendsSubviewVisible === 'function' && isFriendsSubviewVisible()) {
 					if (typeof window.applyCollectionToolbarFilterChange === 'function') window.applyCollectionToolbarFilterChange('friends', { revealNew:true });
 					else if (typeof renderFriendsList === 'function') renderFriendsList(document.getElementById('search-input')?.value || '', true);
@@ -97297,9 +97299,38 @@ function getVisibleChatStackEl(id) {
 		return window.__pendingFriendsMutation;
 	}
 
-	window.toggleFriend = async function(name, avatar, triggerElement = null) {
+	window.__friendMutationsInFlight = window.__friendMutationsInFlight instanceof Set ? window.__friendMutationsInFlight : new Set();
+	function getFriendMutationKey(owner, target) {
+		return `${String(owner || '').trim().toLowerCase()}|${String(target || '').trim().toLowerCase()}`;
+	}
+
+	window.syncOpenProfileFriendButton = function(targetName) {
+		const modal = document.getElementById('modal-sys-profile');
+		if (!modal || String(modal.dataset.profileUsername || '').toLowerCase() !== String(targetName || '').toLowerCase()) return;
+		const button = modal.querySelector('#card-username .btn-profile-friend:not(.btn-profile-message)');
+		if (!button) return;
+		const owner = localStorage.getItem('psn_username') || '';
+		const pending = window.__friendMutationsInFlight.has(getFriendMutationKey(owner, targetName));
+		const isFriend = Array.isArray(window.friendsList) && window.friendsList.some(friend =>
+			String(friend && (friend.name || friend) || '').toLowerCase() === String(targetName || '').toLowerCase());
+		button.classList.toggle('is-friend', isFriend);
+		button.classList.toggle('not-friend', !isFriend);
+		button.disabled = pending;
+		button.title = pending ? 'Updating friendship...' : (isFriend ? 'Remove Friend' : 'Add Friend');
+		button.setAttribute('aria-label', button.title);
+		const icon = button.querySelector('i');
+		if (icon) icon.className = pending ? 'fas fa-spinner fa-spin' : `fas ${isFriend ? 'fa-user-minus' : 'fa-user-plus'}`;
+	};
+
+	window.toggleFriend = async function(name, avatar, triggerElement = null, options = {}) {
 		const expectedUser = String(localStorage.getItem('psn_username') || '').trim();
-		if (!expectedUser) return false;
+		if (!expectedUser || !String(name || '').trim() || expectedUser === name) return false;
+		const mutationKey = getFriendMutationKey(expectedUser, name);
+		if (window.__friendMutationsInFlight.has(mutationKey)) return false;
+		window.__friendMutationsInFlight.add(mutationKey);
+		window.syncOpenProfileFriendButton(name);
+		try {
+		const desiredFriendState = options && typeof options.desiredFriendState === 'boolean' ? options.desiredFriendState : null;
 		const mightAddFriend = !Array.isArray(window.friendsList) || !window.friendsList.some(friend =>
 			String(friend && (friend.name || friend) || '') === name);
 		const friendFlightSource = mightAddFriend && typeof window.capturePsnFriendAvatarMotionSource === 'function'
@@ -97311,6 +97342,7 @@ function getVisibleChatStackEl(id) {
 
 		const resolvedAvatar = getResolvedUserAvatar(name, avatar);
 		const index = window.friendsList.findIndex(f => String(f && (f.name || f) || '') === name);
+		if (desiredFriendState !== null && (index > -1) === desiredFriendState) return true;
 
 		const finishFriendChange = (options = {}) => {
 			const previousCount = Math.max(0, Number(options.previousCount) || 0);
@@ -97419,6 +97451,10 @@ function getVisibleChatStackEl(id) {
 			}, 820);
 		}
 		return true;
+		} finally {
+			window.__friendMutationsInFlight.delete(mutationKey);
+			if (expectedUser === String(localStorage.getItem('psn_username') || '').trim()) window.syncOpenProfileFriendButton(name);
+		}
 	};
 
 	window.refreshFriendsPresenceMetadata = function(force = false) {
@@ -98664,7 +98700,8 @@ function getVisibleChatStackEl(id) {
 		let messageIconHtml = '';
 		if (!isMe) {
 			messageIconHtml = `<button class="btn-profile-friend btn-profile-message" title="Private Chat" aria-label="Private Chat with ${username}" onclick="event.stopPropagation(); if(typeof playUiClick === 'function') playUiClick(); window.openProfileDirectMessage(decodeURIComponent('${encodeURIComponent(username)}'));"><i class="fas fa-comment-dots"></i></button>`;
-			friendIconHtml = `<button class="btn-profile-friend ${isFriend ? 'is-friend' : 'not-friend'}" onclick="event.stopPropagation(); toggleFriend('${username}', '${avatarUrl}'); openProfileModal('${encodeURIComponent(username)}');"><i class="fas ${isFriend ? 'fa-user-minus' : 'fa-user-plus'}"></i></button>`;
+			const friendMutationPending = window.__friendMutationsInFlight instanceof Set && window.__friendMutationsInFlight.has(getFriendMutationKey(myName, username));
+			friendIconHtml = `<button class="btn-profile-friend ${isFriend ? 'is-friend' : 'not-friend'}" ${friendMutationPending ? 'disabled' : ''} title="${friendMutationPending ? 'Updating friendship...' : (isFriend ? 'Remove Friend' : 'Add Friend')}" aria-label="${friendMutationPending ? 'Updating friendship...' : (isFriend ? 'Remove Friend' : 'Add Friend')}" onclick="event.stopPropagation(); window.toggleFriend('${username}', '${avatarUrl}', null, { desiredFriendState: this.classList.contains('not-friend') });"><i class="fas ${friendMutationPending ? 'fa-spinner fa-spin' : (isFriend ? 'fa-user-minus' : 'fa-user-plus')}"></i></button>`;
 		}
 		const profileHeaderActionsHtml = (messageIconHtml || friendIconHtml) ? `<span class="profile-header-actions">${messageIconHtml}${friendIconHtml}</span>` : '';
 		
