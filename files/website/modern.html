@@ -26440,6 +26440,7 @@ P
 	/* ========================================================================== PS3 DOWNLOAD QUEUE ========================================================================== */
 	(function () {
 		const PREFIX = 'psn_ps3_download_queue_v1_';
+		const MAX_QUEUE_ITEMS = 350;
 		const INSTALL_CANCEL_RETRY_MS = 5000;
 		const instanceId = (Date.now().toString(36) + Math.random().toString(36).slice(2));
 		let scope = '', jobs = [], paused = false, monitoring = false, message = '', detailsExpanded = false;
@@ -26453,16 +26454,20 @@ P
 		function load() {
 			try {
 				const raw = JSON.parse(loadState(storeKey()) || '{}');
-				jobs = Array.isArray(raw.jobs) ? raw.jobs.filter(x => x && /^[a-zA-Z0-9-]+$/.test(String(x.id || '')) && x.ip && x.status && !['done','skipped'].includes(x.status)).slice(-350) : [];
-			jobs.forEach(job => {
-				if (job.status === 'committing') { job.status = 'review'; job.note = 'History update interrupted — verify history before continuing'; }
-				if (job.dismissRequestedAt && !job.cancelSentAt) job.cancelSentAt = Number(job.dismissRequestedAt) || 0;
-			});
+				jobs = Array.isArray(raw.jobs) ? raw.jobs.filter(x => x && /^[a-zA-Z0-9-]+$/.test(String(x.id || '')) && x.ip && ['queued','running','review','committing'].includes(x.status)).slice(0, MAX_QUEUE_ITEMS) : [];
+				jobs.forEach(job => {
+					if (job.status === 'committing') { job.status = 'review'; job.note = 'History update interrupted — verify history before continuing'; }
+					// Restore queued work from pre-automatic-Cancel versions without resending the PKG.
+					if (job.dismissRequestedAt && !job.cancelSentAt) job.cancelSentAt = Number(job.dismissRequestedAt) || 0;
+					delete job.dismissRequestedAt;
+					delete job.nasFirstSeenAt;
+					delete job.cancelAttempts;
+				});
 				paused = raw.paused === true;
 			} catch (_) { jobs = []; paused = false; }
 		}
 		function save() {
-			saveState(storeKey(), JSON.stringify({ jobs:jobs.slice(-350), paused }));
+			saveState(storeKey(), JSON.stringify({ jobs, paused }));
 			render();
 		}
 		function syncScope() {
@@ -26694,7 +26699,6 @@ P
 				await fetch('http://' + ip + '/pad.ps3?cancel', { mode:'no-cors', cache:'no-store' });
 				if (scope !== scopeAtStart || currentScope() !== scopeAtStart || getIp() !== ip) return;
 				job.cancelSentAt = Date.now();
-				job.cancelAttempts = (Number(job.cancelAttempts) || 0) + 1;
 			} catch (_) {
 				job.note = 'Could not send completion check — retrying';
 			}
@@ -26702,7 +26706,6 @@ P
 		async function observeActive(job, state, ip, scopeAtStart) {
 			if (state.download) { job.seenDownload = true; job.stage = 'downloading'; job.idleSamples = 0; }
 			if (state.install) {
-				if (!job.nasFirstSeenAt) job.nasFirstSeenAt = Date.now();
 				job.seenInstall = true; job.stage = 'installing'; job.idleSamples = 0;
 			}
 			if (state.download || state.install) {
@@ -26756,7 +26759,7 @@ P
 				// Persist before dispatch. A reload must never automatically resend an uncertain command.
 				next.status = 'running'; next.stage = 'starting'; next.startedAt = Date.now(); next.idleSamples = 0;
 				next.seenDownload = false; next.seenInstall = false; next.note = '';
-				next.nasFirstSeenAt = 0; next.cancelLastAttemptAt = 0; next.cancelSentAt = 0; next.cancelAttempts = 0;
+				next.cancelLastAttemptAt = 0; next.cancelSentAt = 0;
 				save();
 				const url = next.kind === 'rap'
 					? `http://${ip}/xmb.ps3/download.ps3?to=/dev_hdd0/exdata/&url=${encodeURIComponent(next.url)}`
@@ -26789,6 +26792,11 @@ P
 			if (!isConnected() || !getIp() || !Array.isArray(rawJobs)) return 0;
 			const next = normalizeJobs(rawJobs, getIp());
 			if (!next.length) return 0;
+			// Refuse whole batches instead of silently losing older FIFO entries on reload.
+			if (jobs.length + next.length > MAX_QUEUE_ITEMS) {
+				if (typeof showToastNotification === 'function') showToastNotification('PS3™ Queue Full', 'There is not enough space for this batch. Remove completed or queued files and try again.');
+				return 0;
+			}
 			jobs.push(...next); save();
 			message = 'Queued — waiting for the PS3 on XMB'; render();
 			if (!monitoring) tick();
@@ -27638,15 +27646,17 @@ P
 		const ip = ipInput ? ipInput.value.trim() : '';
 		const globalIcon = document.getElementById('global-status-icon');
 		const isConnected = globalIcon && globalIcon.classList.contains('status-dot-connected');
-		const hasRemoteBlockedLink = items.some(game => /dropbox\.com|dropboxusercontent\.com/i.test(String(game.url || '')));
+		const isRemoteBlocked = url => /dropbox\.com|dropboxusercontent\.com/i.test(String(url || ''));
+		const blockedRemoteCount = items.filter(game => isRemoteBlocked(game.url)).length;
 		let target = 'pc';
 
-		if (isConnected && ip && !hasRemoteBlockedLink) {
-			if (confirm('PS3™ is connected!\n\nSend this Download All queue directly to the console?\n\n[OK] = Download on PS3™\n[Cancel] = Download on this device')) {
+		if (isConnected && ip && blockedRemoteCount < items.length) {
+			const warning = blockedRemoteCount ? '\n\n' + blockedRemoteCount + ' Dropbox item(s) cannot be sent to PS3™ and will be skipped.' : '';
+			if (confirm('PS3™ is connected!\n\nSend this Download All queue directly to the console?\n\n[OK] = Download on PS3™\n[Cancel] = Download on this device' + warning)) {
 				target = 'ps3';
 			}
-		} else if (isConnected && hasRemoteBlockedLink && typeof showNotification === 'function') {
-			showNotification('Some links cannot be sent remotely. Downloading on this device instead.', 'info');
+		} else if (isConnected && ip && blockedRemoteCount === items.length && typeof showNotification === 'function') {
+			showNotification('These Dropbox links cannot be sent to PS3™. Downloading on this device instead.', 'info');
 		}
 
 		const originalHtml = btnElement ? btnElement.innerHTML : '';
@@ -27661,10 +27671,12 @@ P
 			let queuedRaps = 0;
 			let failedPkgs = 0;
 			if (target === 'ps3') {
-				const results = await Promise.allSettled(items.map(game => buildPs3QueueItemsForGame(game, currentCat, true)));
+				const results = await Promise.allSettled(items.map(game => isRemoteBlocked(game.url)
+					? Promise.resolve([]) : buildPs3QueueItemsForGame(game, currentCat, true)));
 				const pending = [];
-				results.forEach((result) => {
-					if (result.status !== 'fulfilled' || !result.value.some(job => job.kind === 'pkg')) { failedPkgs++; return; }
+				results.forEach(result => {
+					if (result.status !== 'fulfilled' || !result.value.some(job => job.kind === 'pkg') ||
+						result.value.some(job => isRemoteBlocked(job.url))) { failedPkgs++; return; }
 					queuedPkgs++;
 					if (result.value.some(job => job.kind === 'rap')) queuedRaps++;
 					pending.push(...result.value);
@@ -27672,7 +27684,7 @@ P
 				const queuedFiles = window.enqueuePs3DownloadQueue(pending);
 				if (typeof showToastNotification === 'function') {
 					showToastNotification(queuedFiles ? 'PS3™ Queue Updated' : 'PS3™ Queue Error',
-						queuedFiles + ' file' + (queuedFiles === 1 ? '' : 's') + ' queued for XMB' + (failedPkgs ? ' · ' + failedPkgs + ' package(s) could not be resolved' : '') + '.');
+						queuedFiles + ' file' + (queuedFiles === 1 ? '' : 's') + ' queued for XMB' + (failedPkgs ? ' · ' + failedPkgs + ' item(s) skipped (unsupported PS3 links or unresolved packages)' : '') + '.');
 				}
 				if (queuedFiles && typeof playUiSuccess === 'function') playUiSuccess();
 			} else {
