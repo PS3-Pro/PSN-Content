@@ -2105,6 +2105,8 @@ input:checked+.slider:before { transform: translateX(20px); }
 #ps3-download-queue-items:empty { display:none; }
 #sidebar-ps3-queue-signal { display:none; flex:0 0 14px; width:14px; height:14px; align-items:center; justify-content:center; margin-left:-8px; margin-right:-5px; color:#6cc6ff; font-size:11px; line-height:0; }
 #sidebar-ps3-queue-signal.show { display:inline-flex; }
+#sidebar-ps3-queue-signal { pointer-events:none; transition:transform .06s ease,filter .06s ease; }
+#nav-downloads:is(.psn-primary-pressed,.mobile-pressed)>#sidebar-ps3-queue-signal { transform:translateY(2px) scale(.94) !important; filter:brightness(.82) !important; }
 #sidebar-ps3-queue-signal i { display:inline-flex; align-items:center; justify-content:center; font-size:11px; line-height:1; }
 #sidebar-ps3-queue-signal:is(.is-running,.is-installing) i { width:12px; height:12px; flex:0 0 12px; box-sizing:border-box; border:1.5px solid currentColor; border-right-color:transparent; border-radius:50%; font-size:0; line-height:0; transform-origin:center center; animation:psnOfflineModeReconnectSpin 1.15s linear infinite; }
 #sidebar-ps3-queue-signal.is-installing { color:#ffc46c; }
@@ -26438,25 +26440,56 @@ P
 
 
 	/* ========================================================================== PS3 DOWNLOAD QUEUE ========================================================================== */
+	function isPs3QueueTargetConnected() {
+		const ip = typeof getCurrentPs3Ip === 'function' ? getCurrentPs3Ip() : (document.getElementById('ps3-ip')?.value || '').trim();
+		if (!ip) return false;
+		if (typeof isPs3CurrentlyConnected === 'function' && isPs3CurrentlyConnected()) return true;
+		const dot = document.getElementById('global-status-icon');
+		if (dot?.classList.contains('status-dot-connected')) return true;
+		const ping = window.__ps3QueueHealthPing;
+		if (ping && ping.ip === ip && ping.at > 0 && Date.now() >= ping.at && Date.now() - ping.at < 8000 && typeof ping.xmb === 'boolean') return true;
+		// The console presence UI can remain authoritative between health pings.
+		const liveStatus = window.myCurrentPS3Status;
+		return !!(ping && ping.ip === ip && typeof _lastConnectionState !== 'undefined' && _lastConnectionState === true &&
+			liveStatus && (liveStatus.status === 'idle' || liveStatus.status === 'playing'));
+	}
+
+
 	(function () {
 		const PREFIX = 'psn_ps3_download_queue_v1_';
 		const MAX_QUEUE_ITEMS = 350;
 		const INSTALL_CANCEL_RETRY_MS = 5000;
+		const REVIEW_SCAN_INTERVAL_MS = 15000;
+		const GAME_EXIT_SETTLE_MS = 8000;
 		const instanceId = (Date.now().toString(36) + Math.random().toString(36).slice(2));
 		let scope = '', jobs = [], paused = false, monitoring = false, message = '', detailsExpanded = false;
+		let checkingFolders = false, lastFolderScanAt = 0;
+		let lastPingIp = '', lastPingXmb = null, xmbSettlesAt = 0, settleTimer = null;
+		function clearSettleTimer() {
+			if (settleTimer !== null) { clearTimeout(settleTimer); settleTimer = null; }
+		}
+		function scheduleSettleCheck() {
+			if (settleTimer !== null || !jobs.some(j => j.status === 'queued')) return;
+			const delay = Math.max(0, xmbSettlesAt - Date.now());
+			if (!delay) return;
+			settleTimer = setTimeout(() => {
+				settleTimer = null;
+				if (jobs.some(j => j.status === 'queued')) void tick();
+			}, delay + 50);
+		}
 		const lockKey = () => getUserKey(scope + '_driver');
 		const storeKey = () => PREFIX + scope;
-		const busyStatus = job => job && (job.status === 'running' || job.status === 'review' || job.status === 'committing');
+		const busyStatus = job => job && (job.status === 'running' || (job.status === 'committing' && !job.reviewVerified));
 		const escape = value => String(value ?? '').replace(/[&<>"']/g, c => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]));
 		const getIp = () => typeof getCurrentPs3Ip === 'function' ? getCurrentPs3Ip() : (document.getElementById('ps3-ip')?.value || '').trim();
-		const isConnected = () => typeof isPs3CurrentlyConnected === 'function' ? isPs3CurrentlyConnected() : !!document.querySelector('#global-status-icon.status-dot-connected');
+		const isConnected = () => isPs3QueueTargetConnected();
 		const currentScope = () => (localStorage.getItem('psn_username') || 'Guest') + '__' + getIp();
 		function load() {
 			try {
 				const raw = JSON.parse(loadState(storeKey()) || '{}');
 				jobs = Array.isArray(raw.jobs) ? raw.jobs.filter(x => x && /^[a-zA-Z0-9-]+$/.test(String(x.id || '')) && x.ip && ['queued','running','review','committing'].includes(x.status)).slice(0, MAX_QUEUE_ITEMS) : [];
 				jobs.forEach(job => {
-					if (job.status === 'committing') { job.status = 'review'; job.note = 'History update interrupted — verify history before continuing'; }
+					if (job.status === 'committing') { job.status = 'review'; job.note = 'History update interrupted — verify history before continuing'; job.reviewVerified = false; }
 					// Restore queued work from pre-automatic-Cancel versions without resending the PKG.
 					if (job.dismissRequestedAt && !job.cancelSentAt) job.cancelSentAt = Number(job.dismissRequestedAt) || 0;
 					delete job.dismissRequestedAt;
@@ -26477,6 +26510,9 @@ P
 			load();
 			detailsExpanded = false;
 			message = '';
+			lastFolderScanAt = 0;
+			lastPingIp = ''; lastPingXmb = null; xmbSettlesAt = 0;
+			clearSettleTimer();
 			render();
 		}
 		function driverAllowed() {
@@ -26523,22 +26559,24 @@ P
 				el.innerHTML = '<span class="ps3-queue-presence-dot"></span><i class="ps3-queue-presence-icon" aria-hidden="true"></i><strong class="ps3-queue-presence-title"></strong><span class="ps3-queue-presence-detail"></span>';
 				document.body.appendChild(el);
 			}
-			const visible = remaining > 0;
+			const reviewCount = jobs.filter(j => j.status === 'review').length;
+			const visible = remaining > 0 || reviewCount > 0;
 			if (signal) signal.classList.toggle('show',visible);
 			if (!visible) {
 				if (el) el.classList.remove('show');
 				return;
 			}
 			let type = 'waiting', label = 'Queued', detail = remaining + ' pending';
+			if (reviewCount && !remaining) { type = 'review'; label = 'Needs checking'; detail = reviewCount + ' file(s) to review'; }
 			const onXmb = freshConsolePing()?.xmb === true;
-			if (!isConnected() || /disconnected|monitoring unavailable|queue held/i.test(message)) {
+			if ((!isConnected() || /disconnected|monitoring unavailable|queue held/i.test(message)) && remaining) {
 				label = 'Waiting for PS3';
 			} else if (active?.status === 'committing') {
 				label = 'Saving history'; detail = active.title;
-			} else if (active?.status === 'review') {
-				type = 'review'; label = 'Needs checking'; detail = active.title;
-			} else if (!onXmb && /return to XMB|must be on XMB/i.test(message)) {
+			} else if (!onXmb && remaining && /return to XMB|must be on XMB/i.test(message)) {
 				label = 'Waiting for XMB'; detail = active?.title || detail;
+			} else if (!active && remaining && onXmb && /XMB settling/i.test(message)) {
+				label = 'XMB settling'; detail = 'Waiting after leaving a game';
 			} else if (active?.status === 'running') {
 				if (active.stage === 'downloading') { type = 'active'; label = 'Downloading'; }
 				else if (active.stage === 'installing') { type = 'installing'; label = 'Installing'; }
@@ -26546,7 +26584,7 @@ P
 				else if (active.stage === 'finishing') { label = 'Finishing'; }
 				else { label = 'Starting'; type = 'active'; }
 				detail = active.title;
-			} else if (paused) {
+			} else if (paused && remaining) {
 				label = 'Paused';
 			} else if (/installing another/i.test(message)) {
 				label = 'PS3 busy'; detail = 'Installing another file';
@@ -26554,7 +26592,7 @@ P
 				label = 'PS3 busy'; detail = 'Downloading another file';
 			} else if (/another tab/i.test(message)) {
 				label = 'Queue in another tab';
-			} else if (!onXmb && /XMB/i.test(message)) {
+			} else if (!onXmb && remaining && /XMB/i.test(message)) {
 				label = 'Waiting for XMB';
 			}
 			if (signal) {
@@ -26565,7 +26603,7 @@ P
 					const nextIcon = 'fas ' + (type === 'active' || type === 'installing' ? 'fa-circle-notch' : type === 'review' ? 'fa-exclamation-circle' : 'fa-circle');
 					if (icon.className !== nextIcon) icon.className = nextIcon;
 				}
-				const tooltip = 'PS3 queue: ' + label + (active ? ' — ' + active.title : ' — ' + remaining + ' pending');
+				const tooltip = 'PS3 queue: ' + label + (active ? ' — ' + active.title : ' — ' + remaining + ' pending') + (reviewCount ? ' · ' + reviewCount + ' need checking' : '');
 				if (signal.title !== tooltip) signal.title = tooltip;
 			}
 			if (!el) return;
@@ -26592,12 +26630,13 @@ P
 			}
 			const active = getActive();
 			const queued = jobs.filter(j => j.status === 'queued').length;
+			const reviewCount = jobs.filter(j => j.status === 'review').length;
 			const remaining = queued + (active ? 1 : 0);
 			renderQueuePresence(active, remaining);
 			const count = document.getElementById('ps3-download-queue-count');
-			if (count) count.textContent = remaining + ' remaining';
+			if (count) count.textContent = remaining + ' pending' + (reviewCount ? ' · ' + reviewCount + ' to check' : '');
 			const status = document.getElementById('ps3-download-queue-status');
-			if (status) status.textContent = message || (active?.status === 'review' ? 'Check the PS3 before continuing.' : paused ? 'Queue paused' : !isConnected() ? 'Connect the PS3 to continue' : 'Waiting for the PS3 on XMB');
+			if (status) status.textContent = message || (remaining ? (paused ? 'Queue paused' : !isConnected() ? 'Connect the PS3 to continue' : 'Waiting for the PS3 on XMB') : reviewCount ? 'Needs checking — does not block other downloads' : '');
 			const pause = document.getElementById('ps3-download-queue-pause');
 			if (pause) { pause.innerHTML = paused ? '<i class="fas fa-play"></i> Resume' : '<i class="fas fa-pause"></i> Pause'; pause.disabled = !remaining; }
 			const current = document.getElementById('ps3-download-queue-current');
@@ -26605,7 +26644,7 @@ P
 			const expand = document.getElementById('ps3-download-queue-expand');
 			const detail = document.getElementById('ps3-download-queue-details');
 			if (!current || !body || !expand || !detail) return;
-			const items = jobs.filter(j => !['done','skipped'].includes(j.status));
+			const items = [...jobs.filter(j => busyStatus(j)), ...jobs.filter(j => j.status === 'queued'), ...jobs.filter(j => j.status === 'review' || (j.status === 'committing' && j.reviewVerified))];
 			const other = items.slice(1);
 			document.getElementById('view-downloads')?.classList.toggle('ps3-queue-page-scroll', detailsExpanded && other.length > 0);
 			expand.hidden = !other.length;
@@ -26615,11 +26654,11 @@ P
 			if (caption) caption.textContent = detailsExpanded && other.length ? 'Hide queue' : 'Show queue (' + other.length + ')';
 			const itemMarkup = j => {
 				const action = j.status === 'queued' ? `<button type="button" class="ps3-queue-action" onclick="removePs3QueueItem('${j.id}')" title="Remove queued file" aria-label="Remove ${escape(j.title)}"><i class="fas fa-times"></i></button>` :
-					j.status === 'review' ? `<button type="button" class="ps3-queue-action" onclick="recheckPs3QueueItem('${j.id}')" title="Recheck console" aria-label="Recheck ${escape(j.title)}"><i class="fas fa-rotate"></i></button><button type="button" class="ps3-queue-action" onclick="skipPs3QueueItem('${j.id}')" title="Skip this item after verifying it on the console" aria-label="Skip ${escape(j.title)}"><i class="fas fa-forward-step"></i></button>` :
+					j.status === 'review' ? `<button type="button" class="ps3-queue-action" onclick="recheckPs3QueueItem('${j.id}')" title="Check the installed Title ID folder" aria-label="Check installation of ${escape(j.title)}"><i class="fas fa-rotate"></i></button><button type="button" class="ps3-queue-action" onclick="removeReviewedPs3QueueItem('${j.id}')" title="Remove from queue without adding to history" aria-label="Remove ${escape(j.title)}"><i class="fas fa-times"></i></button>` :
 					'';
-				return `<div class="ps3-queue-item ${escape(j.status)}"><div class="ps3-queue-file"><strong title="${escape(j.title)}">${escape(j.title)}</strong><span>${escape(j.kind === 'rap' ? 'RAP' : 'PKG')}${j.partCount > 1 ? ` · Part ${Number(j.part)}/${Number(j.partCount)}` : ''}${j.note ? ' · ' + escape(j.note) : ''}</span></div><span class="ps3-queue-stage">${escape(statusText(j))}</span><div class="ps3-queue-actions">${action}</div></div>`;
+				return `<div class="ps3-queue-item ${escape(j.status)}"><div class="ps3-queue-file"><strong title="${escape(j.title)}">${escape(j.title)}</strong><span>${escape(j.kind === 'rap' ? 'RAP' : 'PKG')}${j.partCount > 1 ? ` · Part ${Number(j.part)}/${Number(j.partCount)}` : ''}${j.note ? ' · ' + escape(j.note) : ''}${j.folderNote ? ' · ' + escape(j.folderNote) : ''}</span></div><span class="ps3-queue-stage">${escape(statusText(j))}</span><div class="ps3-queue-actions">${action}</div></div>`;
 			};
-			const signatureOf = arr => JSON.stringify(arr.map(j => [j.id,j.status,j.stage,j.note,j.idleSamples]));
+			const signatureOf = arr => JSON.stringify(arr.map(j => [j.id,j.status,j.stage,j.note,j.folderNote,j.idleSamples]));
 			const primary = items.slice(0,1);
 			const primarySignature = signatureOf(primary);
 			if (current.dataset.queueSignature !== primarySignature) {
@@ -26688,10 +26727,61 @@ P
 				}
 			}
 			jobs = jobs.filter(item => item.id !== job.id);
-			message = jobs.length ? 'Installation completed — preparing next file' : '';
+			message = jobs.some(j => j.status === 'queued') ? 'Installation completed — preparing next file' : jobs.some(j => j.status === 'review') ? 'Other downloads completed — pending items need checking' : '';
 			save();
 			if (!jobs.length && typeof showToastNotification === 'function')
 				showToastNotification('PS3™ Queue Finished', 'All queued files have completed.');
+		}
+		function folderEligible(job) {
+			const titleId = String(job?.titleId || '').trim().toUpperCase();
+			return job?.status === 'review' && job.kind === 'pkg' && Number(job.partCount || 1) === 1 &&
+				/^[A-Z]{4}[0-9]{5}$/.test(titleId) && !['dlcs','avatars','themes'].includes(String(job.category || '').toLowerCase());
+		}
+		function parseInstalledTitleIds(html, ip) {
+			const doc = new DOMParser().parseFromString(String(html || ''), 'text/html');
+			const ids = new Set();
+			let recognized = false;
+			for (const anchor of doc.querySelectorAll('a[href]')) {
+				let path;
+				try {
+					const href = new URL(anchor.getAttribute('href'), `http://${ip}/dev_hdd0/game/`);
+					if (href.host !== ip) continue;
+					path = decodeURIComponent(href.pathname);
+				} catch (_) { continue; }
+				if (/^\/dev_hdd0\/game\/?$/i.test(path)) recognized = true;
+				const match = /^\/dev_hdd0\/game\/([A-Z]{4}[0-9]{5})\/?$/i.exec(path);
+				if (match) { recognized = true; ids.add(match[1].toUpperCase()); }
+			}
+			// Do not interpret an error page or an unrecognizable listing as an empty directory.
+			if (!recognized || !/dev_hdd0\/game/i.test(String(html || ''))) return null;
+			return ids;
+		}
+		async function checkReviewedFolders(ip, scopeAtStart, force = false) {
+			if (checkingFolders || !isConnected() || getIp() !== ip ||
+				scope !== scopeAtStart || currentScope() !== scopeAtStart || !driverAllowed()) return;
+			const reviewItems = jobs.filter(folderEligible);
+			if (!reviewItems.length) return;
+			const now = Date.now();
+			if (!force && now - lastFolderScanAt < REVIEW_SCAN_INTERVAL_MS) return;
+			lastFolderScanAt = now;
+			checkingFolders = true;
+			try {
+				const html = await fetchConsoleReadableText('/dev_hdd0/game/', 8000, ip);
+				const installed = parseInstalledTitleIds(html, ip);
+				if (!installed || ip !== getIp() || scope !== scopeAtStart || currentScope() !== scopeAtStart || !isConnected() || !driverAllowed()) return;
+				for (const job of reviewItems) {
+					if (!jobs.includes(job) || job.status !== 'review') continue;
+					if (installed.has(String(job.titleId).toUpperCase())) {
+						job.folderNote = 'Title ID folder found on PS3';
+						job.reviewVerified = true;
+						await complete(job);
+					} else {
+						job.folderNote = 'Title ID folder not found';
+					}
+				}
+				save();
+			} catch (_) { /* Keep unchecked entries visible when webMAN cannot list the folder. */ }
+			finally { checkingFolders = false; }
 		}
 		async function probeCompletedInstallation(job, state, ip, scopeAtStart) {
 			const now = Date.now();
@@ -26741,7 +26831,7 @@ P
 		}
 		async function tick() {
 			syncScope();
-			if (monitoring || !jobs.some(j => j.status === 'queued' || busyStatus(j))) return;
+			if (monitoring || !jobs.some(j => j.status === 'queued' || j.status === 'review' || busyStatus(j))) return;
 			if (!driverAllowed()) { message = 'Queue is controlled in another tab'; render(); return; }
 			monitoring = true;
 			const keyAtStart = scope;
@@ -26751,18 +26841,30 @@ P
 				const state = await readConsole(ip);
 				if (currentScope() !== keyAtStart || scope !== keyAtStart || ip !== getIp()) return;
 				const active = getActive();
-				if (active?.status === 'review' || active?.status === 'committing') { message = active.status === 'committing' ? 'Saving completed download to history' : 'PS3 state is uncertain — check the active item'; render(); return; }
+				if (active?.status === 'committing') { message = 'Saving completed download to history'; render(); return; }
+				if (!active && !jobs.some(j => j.status === 'queued') && state.xmb && !state.download && !state.install && jobs.some(folderEligible))
+					void checkReviewedFolders(ip, keyAtStart);
 				if (active) {
 					await observeActive(active, state, ip, keyAtStart);
-					message = !state.xmb ? 'Return to XMB — queue suspended' : active.status === 'review' ? 'Manual check required before next download' : jobs.includes(active) ? statusText(active) : (jobs.length ? 'Installation completed — preparing next file' : '');
+					message = !state.xmb ? 'Return to XMB — queue suspended' : jobs.includes(active) ? statusText(active) : (jobs.length ? 'Installation completed — preparing next file' : '');
 					save();
 					return;
 				}
 				if (paused) { message = 'Queue paused'; render(); return; }
 				if (!state.xmb) { message = 'PS3 must be on XMB'; render(); return; }
 				if (state.download || state.install) { message = state.install ? 'PS3 installing another package' : 'PS3 downloading another file'; render(); return; }
+				if (Date.now() < xmbSettlesAt) {
+					message = 'XMB settling — waiting 8 seconds after leaving a game';
+					scheduleSettleCheck();
+					render();
+					return;
+				}
 				const next = jobs.find(j => j.status === 'queued');
-				if (!next || next.ip !== ip) return;
+				if (!next || next.ip !== ip) {
+					message = jobs.some(j => j.status === 'review') ? 'Needs checking — other downloads can continue' : '';
+					render();
+					return;
+				}
 				// Persist before dispatch. A reload must never automatically resend an uncertain command.
 				next.status = 'running'; next.stage = 'starting'; next.startedAt = Date.now(); next.idleSamples = 0;
 					next.seenDownload = false; next.seenInstall = false; next.note = '';
@@ -26816,28 +26918,53 @@ P
 		};
 		window.pausePs3DownloadQueue = function() { syncScope(); paused = !paused; message = paused ? 'Queue paused after the current item' : 'Queue resumed'; save(); if (!paused) tick(); };
 		window.removePs3QueueItem = function(id) { syncScope(); const j = jobs.find(x => x.id === id); if (!j || j.status !== 'queued') return; jobs = jobs.filter(x => x.id !== id); save(); };
-		window.recheckPs3QueueItem = function(id) {
-			syncScope(); const j = jobs.find(x => x.id === id); if (!j || j.status !== 'review') return;
-			j.status = 'running'; j.note = ''; j.startedAt = Math.min(Number(j.startedAt) || Date.now(), Date.now() - 20000);
-			message = 'Rechecking modules — no command will be resent'; save(); tick();
+		window.recheckPs3QueueItem = async function(id) {
+			syncScope();
+			const job = jobs.find(x => x.id === id && x.status === 'review');
+			if (!job) return;
+			if (!folderEligible(job)) {
+				job.folderNote = 'Folder check unavailable for this package'; save(); return;
+			}
+			const ip = getIp(), originalScope = scope;
+			if (!isConnected()) { message = 'Connect PS3 to check the Title ID folder'; render(); return; }
+			try {
+				const state = await readConsole(ip);
+				if (!state.xmb || state.download || state.install) { message = 'PS3 busy — folder check will resume when idle'; render(); return; }
+				await checkReviewedFolders(ip, originalScope, true);
+			} catch (error) { message = 'Folder check unavailable: ' + (error?.message || 'console error'); render(); }
 		};
-		window.skipPs3QueueItem = function(id) {
-			syncScope(); const j = jobs.find(x => x.id === id); if (!j || j.status !== 'review') return;
-			if (!confirm('Only continue after checking the PS3. This will NOT cancel an active installation. Skip this file and allow the next one?')) return;
-			jobs = jobs.filter(item => item.id !== id); message = 'File skipped manually'; save(); tick();
+		window.removeReviewedPs3QueueItem = function(id) {
+			syncScope();
+			const job = jobs.find(x => x.id === id && x.status === 'review');
+			if (!job || !confirm('Remove this unverified file from the queue without adding it to download history?')) return;
+			jobs = jobs.filter(x => x.id !== id);
+			message = 'Unverified file removed manually'; save();
 		};
 		window.showPs3DownloadQueue = function() { if (typeof switchView === 'function') switchView('view-downloads'); };
 		window.getPs3DownloadQueueSnapshot = () => { syncScope(); return jobs.map(j => ({ ...j })); };
 		window.addEventListener('storage', event => {
 			if (event.key === getUserKey(storeKey()) && !monitoring) { load(); render(); }
 		});
-		window.addEventListener('beforeunload', releaseDriver);
+		window.addEventListener('beforeunload', () => { clearSettleTimer(); releaseDriver(); });
 		// The existing 5-second console health ping drives queue monitoring.
 		window.ps3DownloadQueueOnConsolePing = function (ping) {
 			syncScope();
-			if (ping?.ip !== getIp() || !jobs.length) return;
+			if (!ping || ping.ip !== getIp() || typeof ping.xmb !== 'boolean') return;
+			if (lastPingIp !== ping.ip) {
+				lastPingIp = ping.ip; lastPingXmb = null; xmbSettlesAt = 0;
+				clearSettleTimer();
+			}
+			if (lastPingXmb === false && ping.xmb === true) {
+				xmbSettlesAt = Date.now() + GAME_EXIT_SETTLE_MS;
+				clearSettleTimer();
+			} else if (ping.xmb === false) {
+				xmbSettlesAt = 0;
+				clearSettleTimer();
+			}
+			lastPingXmb = ping.xmb;
+			if (!jobs.length) return;
 			if (ping.xmb === true && /(?:waiting for (?:the PS3 on |)XMB|return to XMB|must be on XMB)/i.test(message)) {
-				message = 'XMB detected — checking PS3';
+				message = xmbSettlesAt > Date.now() ? 'XMB settling — waiting 8 seconds after leaving a game' : 'XMB detected — checking PS3';
 				render();
 			}
 			return tick();
@@ -26868,18 +26995,19 @@ P
 		}
 		if (btnElement?.dataset.ps3QueuePreparing === '1') return;
 	
-		const ip = document.getElementById('ps3-ip').value;
-		const globalIcon = document.getElementById('global-status-icon');
-		const isConnected = globalIcon && globalIcon.classList.contains('status-dot-connected');
+		const ip = typeof getCurrentPs3Ip === 'function' ? getCurrentPs3Ip() : (document.getElementById('ps3-ip')?.value || '').trim();
+		const isConnected = isPs3QueueTargetConnected();
 	
 		const isDropboxRemoteBlocked = type !== 'xml' && /dropbox\.com|dropboxusercontent\.com/i.test(String(url || ''));
 		
 		let target = 'pc';
 	
-		if (isConnected && ip && !isDropboxRemoteBlocked) {
+		// XML packages must offer a destination when a PS3 IP is configured,
+		// even if the status indicator is between pings; never silently force PC.
+		if (ip && !isDropboxRemoteBlocked && (isConnected || type === 'xml')) {
 			const msgName = (type === 'rap') ? `${safeName} RAP file` : safeName;
-			
-			if (confirm(`PS3™ is connected!\n\nDo you want to send "${msgName}" directly to the console?\n\n[OK] = Download on PS3™\n[Cancel] = Download on this device`)) {
+			const connectionLabel = isConnected ? 'PS3™ is connected!' : 'PS3™ connection is not confirmed yet.';
+			if (confirm(`${connectionLabel}\n\nDo you want to send "${msgName}" directly to the console?\n\n[OK] = Download on PS3™\n[Cancel] = Download on this device`)) {
 				target = 'ps3';
 			} else if (btnElement) {
 				const originalText = btnElement.innerHTML;
@@ -27675,8 +27803,7 @@ P
 
 		const ipInput = document.getElementById('ps3-ip');
 		const ip = ipInput ? ipInput.value.trim() : '';
-		const globalIcon = document.getElementById('global-status-icon');
-		const isConnected = globalIcon && globalIcon.classList.contains('status-dot-connected');
+		const isConnected = isPs3QueueTargetConnected();
 		const isRemoteBlocked = url => /dropbox\.com|dropboxusercontent\.com/i.test(String(url || ''));
 		const isBlockedBulkItem = game => getBulkPkgDownloadType(game) !== 'xml' && isRemoteBlocked(game.url);
 		const blockedRemoteCount = items.filter(isBlockedBulkItem).length;
@@ -27805,14 +27932,15 @@ P
 	};
 
     window.handleXmlDownload = async function(xmlUrl, safeName, version, btnElement, sizeBytes, titleId, category, contentId) {
+		const originalText = btnElement?.innerHTML || '';
+		const pointerEvents = btnElement?.style.pointerEvents || '';
 		try {
-			const originalText = btnElement.innerHTML;
 			btnElement.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Reading...';
 			btnElement.style.pointerEvents = 'none';
 	
 			const pkgUrls = await resolvePsnPkgManifestUrls(xmlUrl);
 			btnElement.innerHTML = originalText;
-			btnElement.style.pointerEvents = 'auto';
+			btnElement.style.pointerEvents = pointerEvents;
 	
 			if (pkgUrls.length === 0) {
 				alert("No PKG files found inside this XML manifest.");
@@ -27837,7 +27965,7 @@ P
 			console.error("Failed to read the XML:", err);
 			alert("Failed to process the XML.");
 			btnElement.innerHTML = originalText;
-			btnElement.style.pointerEvents = 'auto';
+			btnElement.style.pointerEvents = pointerEvents;
 		}
 	};
 
