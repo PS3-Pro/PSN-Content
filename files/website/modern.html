@@ -21365,7 +21365,7 @@ P
         const githubCoverAttr = String(githubCoverUrl || '').replace(/"/g, '&quot;');
         const modalGameUrl = String(game.url || '');
         let pkgButtonHtml = '';
-        if (modalGameUrl.toLowerCase().endsWith('.xml')) {
+        if (/\.xml(?:[?#]|$)/i.test(modalGameUrl)) {
             pkgButtonHtml = `<a style="cursor: pointer;" title="Download PKG (XML)" class="btn-mini btn-pkg btn-multi" onclick="smartDownload(event, 'xml', '${game.url}', '${escapedName}', '${game.version}', this, ${game.sizeBytes || 0}, '${game.id}', '${cat}', '${game.contentId || ''}')"><i class="fas fa-layer-group"></i> PKG</a>`;
         } else if (modalGameUrl.includes('|')) {
             const partsCount = modalGameUrl.split('|').length;
@@ -26507,6 +26507,11 @@ P
 				default: return 'Waiting';
 			}
 		}
+		function freshConsolePing(ip = getIp()) {
+			const ping = window.__ps3QueueHealthPing;
+			return ping && ping.ip === ip && typeof ping.xmb === 'boolean' &&
+				ping.at > 0 && Date.now() >= ping.at && Date.now() - ping.at < 8000 ? ping : null;
+		}
 		function renderQueuePresence(active, remaining) {
 			const signal = document.getElementById('sidebar-ps3-queue-signal');
 			let el = document.getElementById('ps3-queue-presence');
@@ -26525,13 +26530,14 @@ P
 				return;
 			}
 			let type = 'waiting', label = 'Queued', detail = remaining + ' pending';
+			const onXmb = freshConsolePing()?.xmb === true;
 			if (!isConnected() || /disconnected|monitoring unavailable|queue held/i.test(message)) {
 				label = 'Waiting for PS3';
 			} else if (active?.status === 'committing') {
 				label = 'Saving history'; detail = active.title;
 			} else if (active?.status === 'review') {
 				type = 'review'; label = 'Needs checking'; detail = active.title;
-			} else if (/return to XMB|must be on XMB/i.test(message)) {
+			} else if (!onXmb && /return to XMB|must be on XMB/i.test(message)) {
 				label = 'Waiting for XMB'; detail = active?.title || detail;
 			} else if (active?.status === 'running') {
 				if (active.stage === 'downloading') { type = 'active'; label = 'Downloading'; }
@@ -26548,7 +26554,7 @@ P
 				label = 'PS3 busy'; detail = 'Downloading another file';
 			} else if (/another tab/i.test(message)) {
 				label = 'Queue in another tab';
-			} else if (/XMB/i.test(message)) {
+			} else if (!onXmb && /XMB/i.test(message)) {
 				label = 'Waiting for XMB';
 			}
 			if (signal) {
@@ -26643,15 +26649,16 @@ P
 		async function readConsole(ip) {
 			if (ip !== getIp() || !isConnected()) throw new Error('PS3 disconnected or IP changed');
 			if (typeof fetchConsoleReadableText !== 'function') throw new Error('PS3MAPI page reader unavailable');
-			const ping = window.__ps3QueueHealthPing;
-			const fresh = ping && ping.ip === ip && ping.at > 0 && Date.now() - ping.at < 8000 && Date.now() >= ping.at;
 			const [pluginHtml, xmbHtml] = await Promise.all([
 				fetchConsoleReadableText('/gameplugin.ps3mapi?proc=0x1000300', 8000, ip),
-				fresh ? Promise.resolve(null) : fetchConsoleReadableText('/cpursx.ps3', 8000, ip)
+				freshConsolePing(ip) ? Promise.resolve(null) : fetchConsoleReadableText('/cpursx.ps3', 8000, ip)
 			]);
 			const state = parsePluginSnapshot(pluginHtml);
 			if (ip !== getIp() || !isConnected()) throw new Error('PS3 disconnected or IP changed');
-			if (fresh) return { ...state, xmb:ping.xmb };
+			// A game may close while PS3MAPI is loading; always use the newest health ping.
+			const latestPing = freshConsolePing(ip);
+			if (latestPing) return { ...state, xmb:latestPing.xmb };
+			if (xmbHtml === null) throw new Error('Waiting for a fresh PS3 connection check');
 			if (!/CPU|RSX|Temperature|FAN|webMAN/i.test(xmbHtml) || !/<(?:html|body|div|table|font)\b/i.test(xmbHtml)) throw new Error('Cannot confirm XMB status');
 			const playing = typeof parseCurrentPs3GameFromWebmanHtml === 'function' ? parseCurrentPs3GameFromWebmanHtml(xmbHtml) : null;
 			return { ...state, xmb:!playing };
@@ -26758,18 +26765,23 @@ P
 				if (!next || next.ip !== ip) return;
 				// Persist before dispatch. A reload must never automatically resend an uncertain command.
 				next.status = 'running'; next.stage = 'starting'; next.startedAt = Date.now(); next.idleSamples = 0;
-				next.seenDownload = false; next.seenInstall = false; next.note = '';
+					next.seenDownload = false; next.seenInstall = false; next.note = '';
 				next.cancelLastAttemptAt = 0; next.cancelSentAt = 0;
+				message = 'Starting download — contacting PS3';
 				save();
 				const url = next.kind === 'rap'
 					? `http://${ip}/xmb.ps3/download.ps3?to=/dev_hdd0/exdata/&url=${encodeURIComponent(next.url)}`
 					: `http://${ip}/browser.ps3?https://ps3-pro.github.io/PSN-Content/resources/interface/classic/images/backgrounds/transparent.html;/install.ps3?url=${encodeURIComponent(next.url)}`;
+				const controller = new AbortController();
+				const commandTimeout = setTimeout(() => controller.abort(), 8000);
 				try {
-					await fetch(url, { mode:'no-cors', cache:'no-store' });
+					await fetch(url, { mode:'no-cors', cache:'no-store', signal:controller.signal });
 					message = 'Command sent — monitoring PS3 modules';
 				} catch (e) {
-					next.status = 'review'; next.note = 'Command could not be confirmed: ' + (e?.message || 'network error');
+					next.status = 'review'; next.note = 'Command could not be confirmed: ' + (e?.name === 'AbortError' ? 'PS3 request timed out' : e?.message || 'network error');
 					message = 'Command uncertain — check console before proceeding';
+				} finally {
+					clearTimeout(commandTimeout);
 				}
 				save();
 			} catch (error) {
@@ -26822,8 +26834,12 @@ P
 		window.addEventListener('beforeunload', releaseDriver);
 		// The existing 5-second console health ping drives queue monitoring.
 		window.ps3DownloadQueueOnConsolePing = function (ping) {
-			if (ping?.ip !== getIp()) return;
-			if (!jobs.length) { syncScope(); if (!jobs.length) return; }
+			syncScope();
+			if (ping?.ip !== getIp() || !jobs.length) return;
+			if (ping.xmb === true && /(?:waiting for (?:the PS3 on |)XMB|return to XMB|must be on XMB)/i.test(message)) {
+				message = 'XMB detected — checking PS3';
+				render();
+			}
 			return tick();
 		};
 		window.runPsnAfterHomeInteractive?.(() => { syncScope(); tick(); });
@@ -26837,6 +26853,9 @@ P
 		if (type === 'xml') parts = await resolvePsnPkgManifestUrls(game.url);
 		else if (type === 'multi') parts = String(game.url || '').split('|').map(x => x.trim()).filter(Boolean);
 		else if (type === 'single') parts = [game.url];
+		if (!parts.length) throw new Error(type === 'xml' ? 'No PKG links found inside this XML.' : 'No PKG links found.');
+		const unsupported = parts.find(link => !/^https?:\/\//i.test(link) || /dropbox\.com|dropboxusercontent\.com/i.test(link));
+		if (unsupported) throw new Error('This package contains a link that cannot be sent to PS3. No parts were queued.');
 		const jobs = parts.map((url,i) => ({ ...common, kind:'pkg', url, part:i+1, partCount:parts.length, history:i === parts.length - 1 }));
 		if (withRap && hasValidRapDownload(game)) jobs.push({ ...common, kind:'rap', url:LICENSE_REPO_RAP_BASE_URL + game.contentId + '.rap', history:false });
 		return jobs;
@@ -26847,12 +26866,13 @@ P
 			event.preventDefault();
 			event.stopPropagation();
 		}
+		if (btnElement?.dataset.ps3QueuePreparing === '1') return;
 	
 		const ip = document.getElementById('ps3-ip').value;
 		const globalIcon = document.getElementById('global-status-icon');
 		const isConnected = globalIcon && globalIcon.classList.contains('status-dot-connected');
 	
-		const isDropboxRemoteBlocked = /dropbox\.com|dropboxusercontent\.com/i.test(String(url || ''));
+		const isDropboxRemoteBlocked = type !== 'xml' && /dropbox\.com|dropboxusercontent\.com/i.test(String(url || ''));
 		
 		let target = 'pc';
 	
@@ -26888,6 +26908,14 @@ P
 		}
 
 		if (target === 'ps3') {
+			const preparationLabel = btnElement?.innerHTML;
+			const preparationPointerEvents = btnElement?.style.pointerEvents;
+			if (type === 'xml' && btnElement) {
+				btnElement.dataset.ps3QueuePreparing = '1';
+				btnElement.style.pointerEvents = 'none';
+				btnElement.setAttribute('aria-busy', 'true');
+				btnElement.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Reading XML...';
+			}
 			try {
 				let pending;
 				if (type === 'rap') {
@@ -26901,14 +26929,21 @@ P
 				if (typeof showToastNotification === 'function') showToastNotification('PS3™ Queue Updated', queued + ' file' + (queued === 1 ? '' : 's') + ' added. Downloads start only when the PS3 is on XMB.');
 				if (typeof playUiSuccess === 'function') playUiSuccess();
 				if (btnElement) {
-					const originalText = btnElement.innerHTML;
+					const originalText = type === 'xml' ? preparationLabel : btnElement.innerHTML;
 					btnElement.innerHTML = '<i class="fas fa-list-ol"></i> Queued';
-					setTimeout(() => { if (btnElement.isConnected) btnElement.innerHTML = originalText; }, 2000);
+					setTimeout(() => { if (btnElement.isConnected && btnElement.dataset.ps3QueuePreparing !== '1') btnElement.innerHTML = originalText; }, 2000);
 				}
 			} catch (error) {
 					console.warn('[PS3 Queue] Could not prepare remote downloads:', error);
 					if (typeof showToastNotification === 'function') showToastNotification('PS3™ Queue Error', error?.message || 'Could not prepare the download.');
 					if (typeof playUiError === 'function') playUiError();
+			} finally {
+				if (type === 'xml' && btnElement) {
+					delete btnElement.dataset.ps3QueuePreparing;
+					btnElement.style.pointerEvents = preparationPointerEvents;
+					btnElement.removeAttribute('aria-busy');
+					if (btnElement.isConnected && btnElement.innerHTML.includes('Reading XML')) btnElement.innerHTML = preparationLabel;
+				}
 			}
 		}
 		else {
@@ -26956,7 +26991,7 @@ P
 	function getBulkPkgDownloadType(game) {
 		const url = String((game && game.url) || '').trim();
 		if (!url || url === 'MISSING') return '';
-		if (url.toLowerCase().endsWith('.xml')) return 'xml';
+		if (/\.xml(?:[?#]|$)/i.test(url)) return 'xml';
 		if (url.indexOf('|') !== -1) return 'multi';
 		return 'single';
 	}
@@ -27524,11 +27559,16 @@ P
 			}
 
 			const xmlDoc = new DOMParser().parseFromString(xmlText, 'text/xml');
+			if (xmlDoc.querySelector('parsererror')) throw new Error('Invalid XML manifest');
 			const pkgUrls = [];
 			const allElements = xmlDoc.getElementsByTagName('*');
 			for (let i = 0; i < allElements.length; i++) {
-				const url = allElements[i].getAttribute('url');
-				if (url && url.toLowerCase().includes('.pkg')) pkgUrls.push(url);
+				const raw = String(allElements[i].getAttribute('url') || '').trim();
+				if (!raw || !/\.pkg(?:[?#&]|$)/i.test(raw)) continue;
+				try {
+					const resolved = new URL(raw, cleanUrl);
+					if (/^https?:$/.test(resolved.protocol)) pkgUrls.push(resolved.href);
+				} catch (_) {}
 			}
 			const uniqueUrls = [...new Set(pkgUrls)];
 			psnPkgManifestParseCache.set(cleanUrl, { text: xmlText, urls: uniqueUrls });
@@ -27638,7 +27678,8 @@ P
 		const globalIcon = document.getElementById('global-status-icon');
 		const isConnected = globalIcon && globalIcon.classList.contains('status-dot-connected');
 		const isRemoteBlocked = url => /dropbox\.com|dropboxusercontent\.com/i.test(String(url || ''));
-		const blockedRemoteCount = items.filter(game => isRemoteBlocked(game.url)).length;
+		const isBlockedBulkItem = game => getBulkPkgDownloadType(game) !== 'xml' && isRemoteBlocked(game.url);
+		const blockedRemoteCount = items.filter(isBlockedBulkItem).length;
 		let target = 'pc';
 
 		if (isConnected && ip && blockedRemoteCount < items.length) {
@@ -27650,7 +27691,7 @@ P
 			showNotification('These Dropbox links cannot be sent to PS3™. Downloading on this device instead.', 'info');
 		}
 
-		const selectedItems = target === 'ps3' ? items.filter(game => !isRemoteBlocked(game.url)) : items;
+		const selectedItems = target === 'ps3' ? items.filter(game => !isBlockedBulkItem(game)) : items;
 		const pkgCount = selectedItems.length;
 		const rapCount = selectedItems.filter(hasValidRapDownload).length;
 		const pkgLabel = pkgCount + ' PKG' + (pkgCount === 1 ? '' : 's');
@@ -27675,7 +27716,7 @@ P
 			let queuedRaps = 0;
 			let failedPkgs = 0;
 			if (target === 'ps3') {
-				const results = await Promise.allSettled(items.map(game => isRemoteBlocked(game.url)
+				const results = await Promise.allSettled(items.map(game => isBlockedBulkItem(game)
 					? Promise.resolve([]) : buildPs3QueueItemsForGame(game, currentCat, true)));
 				const pending = [];
 				results.forEach(result => {
@@ -39304,7 +39345,7 @@ P
 		const modalGameUrl = String(game.url || '');
 		
 		if (!modalInfoOnly) {
-			if (modalGameUrl.toLowerCase().endsWith('.xml')) {
+			if (/\.xml(?:[?#]|$)/i.test(modalGameUrl)) {
 				actionsHtml += `<a style="cursor: pointer;" title="Download PKG (XML)" class="btn-mini btn-pkg btn-multi" onmouseenter="playUiArrow()" onclick="smartDownload(event, 'xml', '${game.url}', '${safeName}', '${game.version}', this, ${game.sizeBytes || 0}, '${game.id}', '${currentCat}', '${game.contentId || ''}')"><i class="fas fa-layer-group"></i> <span data-no-translate="true" translate="no">PKG (XML)</span></a>`;
 			} else if (modalGameUrl.includes('|')) {
 				const parts = modalGameUrl.split('|').length;
