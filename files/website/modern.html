@@ -2100,8 +2100,9 @@ input:checked+.slider:before { transform: translateX(20px); }
 #ps3-download-queue-expand:active { transform:scale(.995); }
 #ps3-download-queue-expand i { transition:transform .18s; }
 #ps3-download-queue-expand[aria-expanded="true"] i { transform:rotate(180deg); }
-#ps3-download-queue-details { min-width:0; margin-top:6px; }
-#ps3-download-queue-items { display:flex; flex-direction:column; gap:5px; max-height:min(185px,25vh); overflow-y:auto; overscroll-behavior:contain; scrollbar-width:thin; scrollbar-color:var(--ps-blue) transparent; padding-right:2px; }
+#ps3-download-queue-details { display:grid; grid-template-rows:0fr; min-width:0; margin-top:0; opacity:0; overflow:hidden; pointer-events:none; transition:grid-template-rows .42s cubic-bezier(.22,1,.36,1),opacity .28s ease,margin-top .42s cubic-bezier(.22,1,.36,1); }
+#ps3-download-queue-details.is-expanded { grid-template-rows:1fr; margin-top:6px; opacity:1; pointer-events:auto; }
+#ps3-download-queue-items { display:flex; flex-direction:column; gap:5px; min-height:0; max-height:min(185px,25vh); overflow-y:auto; overscroll-behavior:contain; scrollbar-width:thin; scrollbar-color:var(--ps-blue) transparent; padding-right:2px; }
 #ps3-download-queue-items:empty { display:none; }
 #sidebar-ps3-queue-signal { display:none; flex:0 0 14px; width:14px; height:14px; align-items:center; justify-content:center; margin-left:-8px; margin-right:-5px; color:#6cc6ff; font-size:11px; line-height:0; }
 #sidebar-ps3-queue-signal.show { display:inline-flex; }
@@ -2128,6 +2129,7 @@ body:has(#profile-sync-indicator.show) #ps3-queue-presence, body:has(#psn-offlin
 @media(max-width:560px) { #ps3-queue-presence { right:12px; bottom:max(12px,env(safe-area-inset-bottom)); max-width:calc(100vw - 24px); } #ps3-queue-presence .ps3-queue-presence-detail { max-width:35vw; } body:has(#profile-sync-indicator.show) #ps3-queue-presence, body:has(#psn-offline-mode-badge.show) #ps3-queue-presence { bottom:calc(max(12px,env(safe-area-inset-bottom)) + 46px); } }
 @media(prefers-reduced-motion:reduce) { #sidebar-ps3-queue-signal i,#ps3-queue-presence,#ps3-queue-presence .ps3-queue-presence-dot,#ps3-queue-presence .ps3-queue-presence-icon { animation:none !important; transition-duration:.01ms !important; } }
 
+@media(prefers-reduced-motion:reduce) { #ps3-download-queue-details { transition:none; } #ps3-download-queue-expand i { transition:none; } }
 #view-downloads.ps3-queue-page-scroll { height:auto !important; min-height:100% !important; overflow:visible !important; }
 #view-downloads.ps3-queue-page-scroll #ps3-download-queue-items { max-height:none; overflow-y:visible; overscroll-behavior:auto; padding-right:0; }
 #view-downloads.ps3-queue-page-scroll .downloads-list { flex:0 0 auto !important; max-height:none !important; overflow-y:visible !important; }
@@ -26654,10 +26656,31 @@ P
 			if (!current || !body || !expand || !detail) return;
 			const items = [...jobs.filter(j => busyStatus(j)), ...jobs.filter(j => j.status === 'queued'), ...jobs.filter(j => j.status === 'review' || (j.status === 'committing' && j.reviewVerified))];
 			const other = items.slice(1);
-			document.getElementById('view-downloads')?.classList.toggle('ps3-queue-page-scroll', detailsExpanded && other.length > 0);
+			const expanded = detailsExpanded && other.length > 0;
+			if (!detail.dataset.queueTransitionBound) {
+				detail.dataset.queueTransitionBound = '1';
+				detail.addEventListener('transitionend', event => {
+					if (event.target !== detail || event.propertyName !== 'grid-template-rows' || detail.classList.contains('is-expanded')) return;
+					delete detail.dataset.queueClosing;
+					if (!detailsExpanded) {
+						body.replaceChildren();
+						delete body.dataset.queueSignature;
+						document.getElementById('view-downloads')?.classList.remove('ps3-queue-page-scroll');
+					}
+				});
+			}
+			if (!expanded && detail.classList.contains('is-expanded')) detail.dataset.queueClosing = '1';
+			if (expanded) delete detail.dataset.queueClosing;
+			const closing = detail.dataset.queueClosing === '1';
+			const reduceMotion = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+			if ((!other.length || reduceMotion) && !expanded) delete detail.dataset.queueClosing;
+			document.getElementById('view-downloads')?.classList.toggle('ps3-queue-page-scroll', expanded || (closing && !reduceMotion));
 			expand.hidden = !other.length;
-			expand.setAttribute('aria-expanded', String(detailsExpanded && !!other.length));
-			detail.hidden = !detailsExpanded || !other.length;
+			expand.setAttribute('aria-expanded', String(expanded));
+			detail.hidden = !other.length;
+			detail.classList.toggle('is-expanded', expanded && detail.dataset.queueOpening !== '1');
+			detail.setAttribute('aria-hidden', String(!expanded));
+			detail.inert = !expanded;
 			const caption = document.getElementById('ps3-download-queue-expand-label');
 			if (caption) caption.textContent = detailsExpanded && other.length ? 'Hide queue' : 'Show queue (' + other.length + ')';
 			const itemMarkup = j => {
@@ -26673,7 +26696,7 @@ P
 				current.dataset.queueSignature = primarySignature;
 				current.innerHTML = primary.map(itemMarkup).join('');
 			}
-			const visibleOther = detailsExpanded ? other : [];
+			const visibleOther = (expanded || (closing && !reduceMotion)) ? other : [];
 			const otherSignature = signatureOf(visibleOther);
 			if (body.dataset.queueSignature !== otherSignature) {
 				const scrollTop = body.scrollTop;
@@ -26684,6 +26707,13 @@ P
 		}
 		window.togglePs3DownloadQueueDetails = function () {
 			detailsExpanded = !detailsExpanded;
+			const detail = document.getElementById('ps3-download-queue-details');
+			if (detailsExpanded && detail) {
+				detail.dataset.queueOpening = '1';
+				render();
+				void detail.offsetHeight;
+				delete detail.dataset.queueOpening;
+			}
 			render();
 		};
 		function parsePluginSnapshot(html) {
