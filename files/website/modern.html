@@ -26449,6 +26449,8 @@ P
 		const PREFIX = 'psn_ps3_download_queue_v1_';
 		const MAX_QUEUE_ITEMS = 350;
 		const INSTALL_CANCEL_RETRY_MS = 5000;
+		const INSTALL_HANDOFF_GRACE_MS = 15000;
+		const INSTALL_IDLE_SAMPLE_MAX_GAP_MS = 9000;
 		const REVIEW_SCAN_INTERVAL_MS = 15000;
 		const GAME_EXIT_SETTLE_MS = 8000;
 		const instanceId = (Date.now().toString(36) + Math.random().toString(36).slice(2));
@@ -26479,6 +26481,9 @@ P
 				const raw = JSON.parse(loadState(storeKey()) || '{}');
 				jobs = Array.isArray(raw.jobs) ? raw.jobs.filter(x => x && /^[a-zA-Z0-9-]+$/.test(String(x.id || '')) && x.ip && ['queued','running','review','committing'].includes(x.status)).slice(0, MAX_QUEUE_ITEMS) : [];
 				jobs.forEach(job => {
+					if (job.status === 'running' && job.stage === 'waiting-install') {
+						job.idleSamples = 0; job.waitingInstallSince = 0; job.waitingInstallLastSampleAt = 0;
+					}
 					if (job.status === 'committing') { job.status = 'review'; job.note = 'History update interrupted — verify history before continuing'; job.reviewVerified = false; }
 					// Restore queued work from pre-automatic-Cancel versions without resending the PKG.
 					if (job.dismissRequestedAt && !job.cancelSentAt) job.cancelSentAt = Number(job.dismissRequestedAt) || 0;
@@ -26522,6 +26527,19 @@ P
 			} catch (_) {}
 		}
 		function getActive() { return jobs.find(busyStatus); }
+		function removeStoppedDownload(job, manuallyConfirmed = false) {
+			if (!jobs.includes(job) || job.status !== 'running' || job.seenInstall || !job.seenDownload || job.stage !== 'waiting-install') return false;
+			if (!manuallyConfirmed && !(Number(job.lastActiveAt) > 0)) return false;
+			jobs = jobs.filter(item => item.id !== job.id);
+			const label = manuallyConfirmed ? 'Download canceled' : 'Download interrupted';
+			message = label + ' — ' + job.title;
+			save();
+			if (typeof showToastNotification === 'function')
+				showToastNotification('PS3™ ' + label, manuallyConfirmed
+					? job.title + ' was canceled on the console.'
+					: job.title + ' stopped without starting installation. No history entry was added.');
+			return true;
+		}
 		function statusText(job) {
 			switch (job.status) {
 				case 'queued': return 'Waiting';
@@ -26643,7 +26661,7 @@ P
 			const caption = document.getElementById('ps3-download-queue-expand-label');
 			if (caption) caption.textContent = detailsExpanded && other.length ? 'Hide queue' : 'Show queue (' + other.length + ')';
 			const itemMarkup = j => {
-				const action = j.status === 'queued' ? `<button type="button" class="ps3-queue-action" onclick="removePs3QueueItem('${j.id}')" title="Remove queued file" aria-label="Remove ${escape(j.title)}"><i class="fas fa-times"></i></button>` :
+				const action = j.status === 'running' && j.stage === 'waiting-install' ? `<button type="button" class="ps3-queue-action" onclick="confirmCanceledPs3QueueItem('${j.id}')" title="I canceled this download on the PS3" aria-label="Mark ${escape(j.title)} canceled"><i class="fas fa-ban"></i></button>` : j.status === 'queued' ? `<button type="button" class="ps3-queue-action" onclick="removePs3QueueItem('${j.id}')" title="Remove queued file" aria-label="Remove ${escape(j.title)}"><i class="fas fa-times"></i></button>` :
 					j.status === 'review' ? `<button type="button" class="ps3-queue-action" onclick="recheckPs3QueueItem('${j.id}')" title="Check the installed Title ID folder" aria-label="Check installation of ${escape(j.title)}"><i class="fas fa-rotate"></i></button><button type="button" class="ps3-queue-action" onclick="removeReviewedPs3QueueItem('${j.id}')" title="Remove from queue without adding to history" aria-label="Remove ${escape(j.title)}"><i class="fas fa-times"></i></button>` :
 					'';
 				return `<div class="ps3-queue-item ${escape(j.status)}"><div class="ps3-queue-file"><strong title="${escape(j.title)}">${escape(j.title)}</strong><span>${escape(j.kind === 'rap' ? 'RAP' : j.manifest ? 'PKG · XML' : 'PKG')}${j.partCount > 1 ? ` · Part ${Number(j.part)}/${Number(j.partCount)}` : ''}${j.note ? ' · ' + escape(j.note) : ''}${j.folderNote ? ' · ' + escape(j.folderNote) : ''}</span></div><span class="ps3-queue-stage">${escape(statusText(j))}</span><div class="ps3-queue-actions">${action}</div></div>`;
@@ -26791,9 +26809,13 @@ P
 			}
 		}
 		async function observeActive(job, state, ip, scopeAtStart) {
-			if (state.download) { job.seenDownload = true; job.stage = 'downloading'; job.idleSamples = 0; }
+			if (state.download) {
+				job.seenDownload = true; job.stage = 'downloading'; job.idleSamples = 0;
+				job.waitingInstallSince = 0; job.waitingInstallLastSampleAt = 0;
+			}
 			if (state.install) {
 				job.seenInstall = true; job.stage = 'installing'; job.idleSamples = 0;
+				job.waitingInstallSince = 0; job.waitingInstallLastSampleAt = 0;
 			}
 			if (state.download || state.install) {
 				job.lastActiveAt = Date.now(); job.note = '';
@@ -26801,7 +26823,7 @@ P
 					await probeCompletedInstallation(job, state, ip, scopeAtStart);
 				return;
 			}
-			if (!state.xmb) { job.note = 'Return to XMB'; job.idleSamples = 0; return; }
+			if (!state.xmb) { job.note = 'Return to XMB'; job.idleSamples = 0; job.waitingInstallSince = 0; job.waitingInstallLastSampleAt = 0; return; }
 			if (job.seenInstall || (job.kind === 'rap' && job.seenDownload)) {
 				// For PKG, require NAS to disappear AFTER a completion-screen Cancel was sent.
 				if (job.kind !== 'rap' && !job.cancelSentAt) {
@@ -26813,8 +26835,18 @@ P
 				return;
 			}
 			if (job.seenDownload) {
+				const now = Date.now();
+				if (job.stage !== 'waiting-install' || !job.waitingInstallLastSampleAt || now - job.waitingInstallLastSampleAt > INSTALL_IDLE_SAMPLE_MAX_GAP_MS) {
+					job.waitingInstallSince = now;
+					job.idleSamples = 0;
+				}
 				job.stage = 'waiting-install';
-				if (Date.now() - job.lastActiveAt > 120000) { job.status = 'review'; job.note = 'Install plugin not observed'; }
+				job.waitingInstallLastSampleAt = now;
+				job.idleSamples = (job.idleSamples || 0) + 1;
+				// Only infer interruption after three consecutive valid idle readings following observed download activity.
+				if (job.idleSamples >= 3 && now - job.waitingInstallSince >= 9000 &&
+					Number(job.lastActiveAt) > 0 && now - job.lastActiveAt >= INSTALL_HANDOFF_GRACE_MS)
+					removeStoppedDownload(job);
 			} else if (Date.now() - job.startedAt > 60000) {
 				job.status = 'review'; job.note = 'No download activity detected';
 			}
@@ -26827,7 +26859,14 @@ P
 			const keyAtStart = scope;
 			const ip = getIp();
 			try {
-				if (!isConnected()) { message = 'PS3 disconnected — queue waiting'; render(); return; }
+				if (!isConnected()) {
+					const active = getActive();
+					if (active?.stage === 'waiting-install') {
+						active.idleSamples = 0; active.waitingInstallSince = 0; active.waitingInstallLastSampleAt = 0;
+						save();
+					}
+					message = 'PS3 disconnected — queue waiting'; render(); return;
+				}
 				const state = await readConsole(ip);
 				if (currentScope() !== keyAtStart || scope !== keyAtStart || ip !== getIp()) return;
 				const active = getActive();
@@ -26836,7 +26875,7 @@ P
 					void checkReviewedFolders(ip, keyAtStart);
 				if (active) {
 					await observeActive(active, state, ip, keyAtStart);
-					message = !state.xmb ? 'Return to XMB — queue suspended' : jobs.includes(active) ? statusText(active) : (jobs.length ? 'Installation completed — preparing next file' : '');
+					message = !state.xmb ? 'Return to XMB — queue suspended' : jobs.includes(active) ? statusText(active) : message;
 					save();
 					return;
 				}
@@ -26858,7 +26897,7 @@ P
 				// Persist before dispatch. A reload must never automatically resend an uncertain command.
 				next.status = 'running'; next.stage = 'starting'; next.startedAt = Date.now(); next.idleSamples = 0;
 					next.seenDownload = false; next.seenInstall = false; next.note = '';
-				next.cancelLastAttemptAt = 0; next.cancelSentAt = 0;
+				next.cancelLastAttemptAt = 0; next.cancelSentAt = 0; next.waitingInstallSince = 0; next.waitingInstallLastSampleAt = 0;
 				message = 'Starting download — contacting PS3';
 				save();
 				const url = next.kind === 'rap'
@@ -26879,6 +26918,14 @@ P
 				}
 				save();
 			} catch (error) {
+				// An unsuccessful PS3MAPI poll breaks the consecutive-idle evidence.
+				if (scope === keyAtStart && currentScope() === keyAtStart) {
+					const active = getActive();
+					if (active?.stage === 'waiting-install') {
+						active.idleSamples = 0; active.waitingInstallSince = 0; active.waitingInstallLastSampleAt = 0;
+						save();
+					}
+				}
 				message = 'Monitoring unavailable: ' + (error?.message || 'network error') + ' — queue held';
 				render();
 			} finally { monitoring = false; }
@@ -26910,6 +26957,13 @@ P
 			return next.length;
 		};
 		window.pausePs3DownloadQueue = function() { syncScope(); paused = !paused; message = paused ? 'Queue paused after the current item' : 'Queue resumed'; save(); if (!paused) tick(); };
+		window.confirmCanceledPs3QueueItem = function(id) {
+			syncScope();
+			const job = jobs.find(j => j.id === id);
+			if (!job || job.status !== 'running' || job.stage !== 'waiting-install' || job.seenInstall) return;
+			if (!confirm('Did you cancel this download on the PS3?\n\nIt will be removed from the Queue without entering download history.')) return;
+			removeStoppedDownload(job, true);
+		};
 		window.removePs3QueueItem = function(id) { syncScope(); const j = jobs.find(x => x.id === id); if (!j || j.status !== 'queued') return; jobs = jobs.filter(x => x.id !== id); save(); };
 		window.recheckPs3QueueItem = async function(id) {
 			syncScope();
