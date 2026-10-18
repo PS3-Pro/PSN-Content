@@ -26441,17 +26441,7 @@ P
 
 	/* ========================================================================== PS3 DOWNLOAD QUEUE ========================================================================== */
 	function isPs3QueueTargetConnected() {
-		const ip = typeof getCurrentPs3Ip === 'function' ? getCurrentPs3Ip() : (document.getElementById('ps3-ip')?.value || '').trim();
-		if (!ip) return false;
-		if (typeof isPs3CurrentlyConnected === 'function' && isPs3CurrentlyConnected()) return true;
-		const dot = document.getElementById('global-status-icon');
-		if (dot?.classList.contains('status-dot-connected')) return true;
-		const ping = window.__ps3QueueHealthPing;
-		if (ping && ping.ip === ip && ping.at > 0 && Date.now() >= ping.at && Date.now() - ping.at < 8000 && typeof ping.xmb === 'boolean') return true;
-		// The console presence UI can remain authoritative between health pings.
-		const liveStatus = window.myCurrentPS3Status;
-		return !!(ping && ping.ip === ip && typeof _lastConnectionState !== 'undefined' && _lastConnectionState === true &&
-			liveStatus && (liveStatus.status === 'idle' || liveStatus.status === 'playing'));
+		return typeof isPs3CurrentlyConnected === 'function' && isPs3CurrentlyConnected();
 	}
 
 
@@ -26979,9 +26969,8 @@ P
 		return /dropbox\.com|dropboxusercontent\.com/i.test(String(url || ''));
 	}
 
-	function confirmPsnDropboxPcDownload(title, isConnected) {
-		const connection = isConnected ? 'PS3™ is connected!' : 'A PS3™ is configured.';
-		return confirm(`${connection}\n\n"${title}" uses a Dropbox link, which does not work for direct PS3™ downloads.\n\nThis game can only be downloaded on this device (PC).\n\nDo you want to download it on your PC?\n\n[OK] = Yes, download on PC\n[Cancel] = No, cancel download`);
+	function confirmPsnDropboxPcDownload(title) {
+		return confirm(`PS3™ is connected!\n\n"${title}" uses a Dropbox link, which does not work for direct PS3™ downloads.\n\nThis game can only be downloaded on this device (PC).\n\nDo you want to download it on your PC?\n\n[OK] = Yes, download on PC\n[Cancel] = No, cancel download`);
 	}
 
 	async function buildPs3QueueItemsForGame(game, category, withRap = false) {
@@ -27016,25 +27005,22 @@ P
 			event.preventDefault();
 			event.stopPropagation();
 		}
-		if (btnElement?.dataset.ps3QueuePreparing === '1') return;
 	
-		const ip = typeof getCurrentPs3Ip === 'function' ? getCurrentPs3Ip() : (document.getElementById('ps3-ip')?.value || '').trim();
 		const isConnected = isPs3QueueTargetConnected();
 	
 		const isDropboxRemoteBlocked = isPsnDropboxLink(url);
 		let target = 'pc';
 		let dropboxPcApproved = false;
 
-		if (ip && isDropboxRemoteBlocked) {
-			if (!confirmPsnDropboxPcDownload(safeName, isConnected)) {
+		if (isConnected && isDropboxRemoteBlocked) {
+			if (!confirmPsnDropboxPcDownload(safeName)) {
 				if (typeof playUiBack === 'function') playUiBack();
 				return;
 			}
 			dropboxPcApproved = true;
-		} else if (ip && (type === 'xml' || type === 'multi' || isConnected)) {
+		} else if (isConnected) {
 			const msgName = (type === 'rap') ? `${safeName} RAP file` : safeName;
-			const connectionLabel = isConnected ? 'PS3™ is connected!' : 'PS3™ connection is not confirmed yet.';
-			if (confirm(`${connectionLabel}\n\nDo you want to send "${msgName}" directly to the console?\n\n[OK] = Download on PS3™\n[Cancel] = Download on this device`)) {
+			if (confirm(`PS3™ is connected!\n\nDo you want to send "${msgName}" directly to the console?\n\n[OK] = Download on PS3™\n[Cancel] = Download on this device`)) {
 				target = 'ps3';
 			} else if (btnElement) {
 				const originalText = btnElement.innerHTML;
@@ -27668,18 +27654,19 @@ P
 					return /(?:^|\.)dl\.playstation\.net$/i.test(parsed.hostname) && /\.pkg\.xml$/i.test(parsed.pathname);
 				} catch (_) { return false; }
 			})();
-			const sources = [
-				...(sonyManifest ? [sonyReader + '?url=' + encoded] : []),
-				cleanUrl,
-				'https://api.allorigins.win/raw?url=' + encoded,
-				'https://api.codetabs.com/v1/proxy?quest=' + encoded
-			];
+			const sources = sonyManifest
+				? [{ url:sonyReader + '?url=' + encoded, timeout:16000 }, { url:cleanUrl, timeout:6000 }]
+				: [
+					{ url:cleanUrl, timeout:6000 },
+					{ url:'https://api.allorigins.win/raw?url=' + encoded, timeout:6000 },
+					{ url:'https://api.codetabs.com/v1/proxy?quest=' + encoded, timeout:6000 }
+				];
 			let lastError = null;
 			for (const source of sources) {
 				const controller = new AbortController();
-				const timeout = setTimeout(() => controller.abort(), 6000);
+				const timeout = setTimeout(() => controller.abort(), source.timeout);
 				try {
-					const response = await fetch(source, { signal:controller.signal });
+					const response = await fetch(source.url, { signal:controller.signal });
 					if (!response.ok) throw new Error('HTTP ' + response.status);
 					const xmlText = await response.text();
 					if (!xmlText.trim()) throw new Error('Empty response');
