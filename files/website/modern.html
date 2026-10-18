@@ -26903,7 +26903,7 @@ P
 		}
 		window.enqueuePs3DownloadQueue = function(rawJobs) {
 			syncScope();
-			if (!isConnected() || !getIp() || !Array.isArray(rawJobs)) return 0;
+			if (!getIp() || !Array.isArray(rawJobs)) return 0;
 			const next = normalizeJobs(rawJobs, getIp());
 			if (!next.length) return 0;
 			// Refuse whole batches instead of silently losing older FIFO entries on reload.
@@ -26972,16 +26972,25 @@ P
 		window.runPsnAfterHomeInteractive?.(() => { syncScope(); tick(); });
 	})();
 
-	async function buildPs3QueueItemsForGame(game, category, withRap = false) {
+	function isPsnDropboxLink(url) {
+		return /dropbox\.com|dropboxusercontent\.com/i.test(String(url || ''));
+	}
+
+	function confirmPsnDropboxPcDownload(title, isConnected) {
+		const connection = isConnected ? 'PS3™ is connected!' : 'A PS3™ is configured.';
+		return confirm(`${connection}\n\n"${title}" uses a Dropbox link, which does not work for direct PS3™ downloads.\n\nThis game can only be downloaded on this device (PC).\n\nDo you want to download it on your PC?\n\n[OK] = Yes, download on PC\n[Cancel] = No, cancel download`);
+	}
+
+	async function buildPs3QueueItemsForGame(game, category, withRap = false, resolvedXmlParts = null) {
 		const type = game.ps3Type || getBulkPkgDownloadType(game);
 		const title = getBulkDownloadSafeName(game);
 		const common = { title, category, titleId:game.id || game.titleId || '', contentId:game.contentId || '', sizeBytes:game.sizeBytes || 0 };
 		let parts = [];
-		if (type === 'xml') parts = await resolvePsnPkgManifestUrls(game.url);
+		if (type === 'xml') parts = Array.isArray(resolvedXmlParts) ? resolvedXmlParts : await resolvePsnPkgManifestUrls(game.url);
 		else if (type === 'multi') parts = String(game.url || '').split('|').map(x => x.trim()).filter(Boolean);
 		else if (type === 'single') parts = [game.url];
 		if (!parts.length) throw new Error(type === 'xml' ? 'No PKG links found inside this XML.' : 'No PKG links found.');
-		const unsupported = parts.find(link => !/^https?:\/\//i.test(link) || /dropbox\.com|dropboxusercontent\.com/i.test(link));
+		const unsupported = parts.find(link => !/^https?:\/\//i.test(link) || isPsnDropboxLink(link));
 		if (unsupported) throw new Error('This package contains a link that cannot be sent to PS3. No parts were queued.');
 		const jobs = parts.map((url,i) => ({ ...common, kind:'pkg', url, part:i+1, partCount:parts.length, history:i === parts.length - 1 }));
 		if (withRap && hasValidRapDownload(game)) jobs.push({ ...common, kind:'rap', url:LICENSE_REPO_RAP_BASE_URL + game.contentId + '.rap', history:false });
@@ -26998,13 +27007,45 @@ P
 		const ip = typeof getCurrentPs3Ip === 'function' ? getCurrentPs3Ip() : (document.getElementById('ps3-ip')?.value || '').trim();
 		const isConnected = isPs3QueueTargetConnected();
 	
-		const isDropboxRemoteBlocked = type !== 'xml' && /dropbox\.com|dropboxusercontent\.com/i.test(String(url || ''));
-		
+		let resolvedXmlParts = null;
+		if (type === 'xml' && ip) {
+			const oldLabel = btnElement?.innerHTML;
+			const oldPointer = btnElement?.style.pointerEvents;
+			if (btnElement) {
+				btnElement.dataset.ps3QueuePreparing = '1';
+				btnElement.style.pointerEvents = 'none';
+				btnElement.setAttribute('aria-busy', 'true');
+				btnElement.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Reading XML...';
+			}
+			try {
+				resolvedXmlParts = await resolvePsnPkgManifestUrls(url);
+				if (!resolvedXmlParts.length) throw new Error('No PKG links found inside this XML.');
+			} catch (error) {
+				if (typeof showToastNotification === 'function') showToastNotification('XML Download Error', error?.message || 'Could not read the package list.');
+				if (typeof playUiError === 'function') playUiError();
+				return;
+			} finally {
+				if (btnElement) {
+					delete btnElement.dataset.ps3QueuePreparing;
+					btnElement.style.pointerEvents = oldPointer;
+					btnElement.removeAttribute('aria-busy');
+					btnElement.innerHTML = oldLabel;
+				}
+			}
+		}
+
+		const isDropboxRemoteBlocked = (type === 'xml' && resolvedXmlParts
+			? resolvedXmlParts.some(isPsnDropboxLink) : isPsnDropboxLink(url));
 		let target = 'pc';
-	
-		// XML packages must offer a destination when a PS3 IP is configured,
-		// even if the status indicator is between pings; never silently force PC.
-		if (ip && !isDropboxRemoteBlocked && (isConnected || type === 'xml')) {
+		let dropboxPcApproved = false;
+
+		if (ip && isDropboxRemoteBlocked) {
+			if (!confirmPsnDropboxPcDownload(safeName, isConnected)) {
+				if (typeof playUiBack === 'function') playUiBack();
+				return;
+			}
+			dropboxPcApproved = true;
+		} else if (ip && (type === 'xml' || type === 'multi' || isConnected)) {
 			const msgName = (type === 'rap') ? `${safeName} RAP file` : safeName;
 			const connectionLabel = isConnected ? 'PS3™ is connected!' : 'PS3™ connection is not confirmed yet.';
 			if (confirm(`${connectionLabel}\n\nDo you want to send "${msgName}" directly to the console?\n\n[OK] = Download on PS3™\n[Cancel] = Download on this device`)) {
@@ -27012,26 +27053,7 @@ P
 			} else if (btnElement) {
 				const originalText = btnElement.innerHTML;
 				btnElement.innerHTML = '<i class="fas fa-desktop"></i> PC';
-				setTimeout(() => { btnElement.innerHTML = originalText; }, 1800);
-			}
-		} 
-		else if (isDropboxRemoteBlocked && isConnected) {
-			console.log("Dropbox link detected. Remote PS3 install skipped; downloading on this device instead.");
-			if (typeof showNotification === 'function') {
-				showNotification("Dropbox links can only be downloaded on this device.", "info");
-			}
-			if (typeof playUiBack === 'function') playUiBack();
-			if (btnElement) {
-				const originalText = btnElement.innerHTML;
-				btnElement.innerHTML = '<i class="fas fa-desktop"></i> PC Only';
-				setTimeout(() => { btnElement.innerHTML = originalText; }, 1800);
-			}
-		}
-	
-		if (target === 'ps3') {
-			if (isDropboxRemoteBlocked) {
-				console.log("Blocked Dropbox remote PS3 command as a safety guard.");
-				target = 'pc';
+				setTimeout(() => { if (btnElement.isConnected) btnElement.innerHTML = originalText; }, 1800);
 			}
 		}
 
@@ -27049,7 +27071,7 @@ P
 				if (type === 'rap') {
 					pending = [{ title:safeName, kind:'rap', url:LICENSE_REPO_RAP_BASE_URL + contentId + '.rap', titleId:id, contentId, category, history:false }];
 				} else {
-					pending = await buildPs3QueueItemsForGame({ url, id, titleId:id, cleanName:safeName, contentId, sizeBytes, ps3Type:type }, category);
+					pending = await buildPs3QueueItemsForGame({ url, id, titleId:id, cleanName:safeName, contentId, sizeBytes, ps3Type:type }, category, false, resolvedXmlParts);
 					if (type === 'promo') pending.forEach(job => { job.history = false; });
 				}
 				const queued = window.enqueuePs3DownloadQueue(pending);
@@ -27076,10 +27098,10 @@ P
 		}
 		else {
 			if (type === 'xml') {
-				handleXmlDownload(url, safeName, version, btnElement, sizeBytes, id, category, contentId);
+				handleXmlDownload(url, safeName, version, btnElement, sizeBytes, id, category, contentId, dropboxPcApproved, resolvedXmlParts);
 			} 
 			else if (type === 'multi') {
-				if (downloadAllParts(url, safeName, version)) {
+				if (downloadAllParts(url, safeName, version, dropboxPcApproved)) {
 					window.addToDownloadManager(safeName, sizeBytes, id, category, contentId, false, btnElement);
 				}
 			} 
@@ -27814,8 +27836,11 @@ P
 			if (confirm('PS3™ is connected!\n\nSend this Download All queue directly to the console?\n\n[OK] = Download on PS3™\n[Cancel] = Download on this device' + warning)) {
 				target = 'ps3';
 			}
-		} else if (isConnected && ip && blockedRemoteCount === items.length && typeof showNotification === 'function') {
-			showNotification('These Dropbox links cannot be sent to PS3™. Downloading on this device instead.', 'info');
+		} else if (isConnected && ip && blockedRemoteCount === items.length) {
+			if (!confirm(`PS3™ is connected!\n\nAll ${blockedRemoteCount} selected items use Dropbox links, which do not work for direct PS3™ downloads.\n\nThese files can only be downloaded on this device (PC).\n\nDo you want to download them on your PC?\n\n[OK] = Yes, download on PC\n[Cancel] = No, cancel download`)) {
+				if (typeof playUiBack === 'function') playUiBack();
+				return;
+			}
 		}
 
 		const selectedItems = target === 'ps3' ? items.filter(game => !isBlockedBulkItem(game)) : items;
@@ -27884,7 +27909,7 @@ P
 	};
 
 
-    window.downloadAllParts = function(urls, safeName, version) {
+    window.downloadAllParts = function(urls, safeName, version, skipConfirmation = false) {
 		const parts = urls.split('|');
 		const cleanVer = (version && version !== "N/A") ? version.replace(/v/gi, '').replace(/\s/g, '') : "";
 		
@@ -27899,7 +27924,7 @@ P
 				   "Would you like to start the download queue?\n\n" +
 				   "Note: If the browser asks to 'Download multiple files', please click 'Allow'.";
 
-		if (!confirm(confirmMsg)) {
+		if (!skipConfirmation && !confirm(confirmMsg)) {
 			if (typeof playUiBack === 'function') playUiBack();
 			return false;
 		}
@@ -27931,14 +27956,14 @@ P
 		return true;
 	};
 
-    window.handleXmlDownload = async function(xmlUrl, safeName, version, btnElement, sizeBytes, titleId, category, contentId) {
+    window.handleXmlDownload = async function(xmlUrl, safeName, version, btnElement, sizeBytes, titleId, category, contentId, skipConfirmation = false, resolvedParts = null) {
 		const originalText = btnElement?.innerHTML || '';
 		const pointerEvents = btnElement?.style.pointerEvents || '';
 		try {
 			btnElement.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Reading...';
 			btnElement.style.pointerEvents = 'none';
 	
-			const pkgUrls = await resolvePsnPkgManifestUrls(xmlUrl);
+			const pkgUrls = Array.isArray(resolvedParts) ? resolvedParts : await resolvePsnPkgManifestUrls(xmlUrl);
 			btnElement.innerHTML = originalText;
 			btnElement.style.pointerEvents = pointerEvents;
 	
@@ -27957,7 +27982,7 @@ P
 				a.click();
 				setTimeout(() => { if (document.body.contains(a)) document.body.removeChild(a); }, 2000);
 			} else {
-				if (downloadAllParts(pkgUrls.join('|'), safeName, version, true)) {
+				if (downloadAllParts(pkgUrls.join('|'), safeName, version, skipConfirmation)) {
 					window.addToDownloadManager(safeName, sizeBytes || 0, titleId, category, contentId, false, btnElement);
 				}
 			}
