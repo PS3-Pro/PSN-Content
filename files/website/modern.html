@@ -26656,7 +26656,7 @@ P
 				const action = j.status === 'queued' ? `<button type="button" class="ps3-queue-action" onclick="removePs3QueueItem('${j.id}')" title="Remove queued file" aria-label="Remove ${escape(j.title)}"><i class="fas fa-times"></i></button>` :
 					j.status === 'review' ? `<button type="button" class="ps3-queue-action" onclick="recheckPs3QueueItem('${j.id}')" title="Check the installed Title ID folder" aria-label="Check installation of ${escape(j.title)}"><i class="fas fa-rotate"></i></button><button type="button" class="ps3-queue-action" onclick="removeReviewedPs3QueueItem('${j.id}')" title="Remove from queue without adding to history" aria-label="Remove ${escape(j.title)}"><i class="fas fa-times"></i></button>` :
 					'';
-				return `<div class="ps3-queue-item ${escape(j.status)}"><div class="ps3-queue-file"><strong title="${escape(j.title)}">${escape(j.title)}</strong><span>${escape(j.kind === 'rap' ? 'RAP' : 'PKG')}${j.partCount > 1 ? ` · Part ${Number(j.part)}/${Number(j.partCount)}` : ''}${j.note ? ' · ' + escape(j.note) : ''}${j.folderNote ? ' · ' + escape(j.folderNote) : ''}</span></div><span class="ps3-queue-stage">${escape(statusText(j))}</span><div class="ps3-queue-actions">${action}</div></div>`;
+				return `<div class="ps3-queue-item ${escape(j.status)}"><div class="ps3-queue-file"><strong title="${escape(j.title)}">${escape(j.title)}</strong><span>${escape(j.kind === 'rap' ? 'RAP' : j.manifest ? 'PKG · XML' : 'PKG')}${j.partCount > 1 ? ` · Part ${Number(j.part)}/${Number(j.partCount)}` : ''}${j.note ? ' · ' + escape(j.note) : ''}${j.folderNote ? ' · ' + escape(j.folderNote) : ''}</span></div><span class="ps3-queue-stage">${escape(statusText(j))}</span><div class="ps3-queue-actions">${action}</div></div>`;
 			};
 			const signatureOf = arr => JSON.stringify(arr.map(j => [j.id,j.status,j.stage,j.note,j.folderNote,j.idleSamples]));
 			const primary = items.slice(0,1);
@@ -26734,7 +26734,7 @@ P
 		}
 		function folderEligible(job) {
 			const titleId = String(job?.titleId || '').trim().toUpperCase();
-			return job?.status === 'review' && job.kind === 'pkg' && Number(job.partCount || 1) === 1 &&
+			return job?.status === 'review' && job.kind === 'pkg' && !job.manifest && Number(job.partCount || 1) === 1 &&
 				/^[A-Z]{4}[0-9]{5}$/.test(titleId) && !['dlcs','avatars','themes'].includes(String(job.category || '').toLowerCase());
 		}
 		function parseInstalledTitleIds(html, ip) {
@@ -26873,7 +26873,9 @@ P
 				save();
 				const url = next.kind === 'rap'
 					? `http://${ip}/xmb.ps3/download.ps3?to=/dev_hdd0/exdata/&url=${encodeURIComponent(next.url)}`
-					: `http://${ip}/browser.ps3?https://ps3-pro.github.io/PSN-Content/resources/interface/classic/images/backgrounds/transparent.html;/install.ps3?url=${encodeURIComponent(next.url)}`;
+					: next.manifest
+						? `http://${ip}/xmb.ps3/install.ps3?url=${encodeURIComponent(next.url)}`
+						: `http://${ip}/browser.ps3?https://ps3-pro.github.io/PSN-Content/resources/interface/classic/images/backgrounds/transparent.html;/install.ps3?url=${encodeURIComponent(next.url)}`;
 				const controller = new AbortController();
 				const commandTimeout = setTimeout(() => controller.abort(), 8000);
 				try {
@@ -26897,6 +26899,7 @@ P
 				id:now.toString(36) + '-' + i + '-' + Math.random().toString(36).slice(2,8),
 				ip, title:String(j.title || 'Download').slice(0,220), kind:j.kind === 'rap' ? 'rap' : 'pkg',
 				url:j.url, titleId:j.titleId || '', category:j.category || '', contentId:j.contentId || '',
+				manifest:j.manifest === true,
 				sizeBytes:Number(j.sizeBytes) || 0, part:Number(j.part) || 1, partCount:Number(j.partCount) || 1,
 				history:j.history === true, createdAt:now, status:'queued', stage:'', note:''
 			}));
@@ -26981,18 +26984,29 @@ P
 		return confirm(`${connection}\n\n"${title}" uses a Dropbox link, which does not work for direct PS3™ downloads.\n\nThis game can only be downloaded on this device (PC).\n\nDo you want to download it on your PC?\n\n[OK] = Yes, download on PC\n[Cancel] = No, cancel download`);
 	}
 
-	async function buildPs3QueueItemsForGame(game, category, withRap = false, resolvedXmlParts = null) {
+	async function buildPs3QueueItemsForGame(game, category, withRap = false) {
 		const type = game.ps3Type || getBulkPkgDownloadType(game);
 		const title = getBulkDownloadSafeName(game);
 		const common = { title, category, titleId:game.id || game.titleId || '', contentId:game.contentId || '', sizeBytes:game.sizeBytes || 0 };
-		let parts = [];
-		if (type === 'xml') parts = Array.isArray(resolvedXmlParts) ? resolvedXmlParts : await resolvePsnPkgManifestUrls(game.url);
-		else if (type === 'multi') parts = String(game.url || '').split('|').map(x => x.trim()).filter(Boolean);
-		else if (type === 'single') parts = [game.url];
-		if (!parts.length) throw new Error(type === 'xml' ? 'No PKG links found inside this XML.' : 'No PKG links found.');
-		const unsupported = parts.find(link => !/^https?:\/\//i.test(link) || isPsnDropboxLink(link));
-		if (unsupported) throw new Error('This package contains a link that cannot be sent to PS3. No parts were queued.');
-		const jobs = parts.map((url,i) => ({ ...common, kind:'pkg', url, part:i+1, partCount:parts.length, history:i === parts.length - 1 }));
+		let jobs;
+		if (type === 'xml') {
+			const manifestUrl = String(game.url || '').trim();
+			let validManifest = false;
+			try {
+				const parsed = new URL(manifestUrl);
+				validManifest = /^https?:$/.test(parsed.protocol) && /\.xml$/i.test(parsed.pathname);
+			} catch (_) {}
+			if (!validManifest || isPsnDropboxLink(manifestUrl)) throw new Error('Unsupported PS3 XML link. Nothing was queued.');
+			// PS3/webMAN handles the HFS parts from one original manifest URL.
+			jobs = [{ ...common, kind:'pkg', url:manifestUrl, manifest:true, part:1, partCount:1, history:true }];
+		} else {
+			const parts = type === 'multi' ? String(game.url || '').split('|').map(x => x.trim()).filter(Boolean)
+				: type === 'single' ? [game.url] : [];
+			if (!parts.length) throw new Error('No PKG links found.');
+			if (parts.some(link => !/^https?:\/\//i.test(link) || isPsnDropboxLink(link)))
+				throw new Error('This package contains a link that cannot be sent to PS3. No parts were queued.');
+			jobs = parts.map((url,i) => ({ ...common, kind:'pkg', url, part:i+1, partCount:parts.length, history:i === parts.length - 1 }));
+		}
 		if (withRap && hasValidRapDownload(game)) jobs.push({ ...common, kind:'rap', url:LICENSE_REPO_RAP_BASE_URL + game.contentId + '.rap', history:false });
 		return jobs;
 	}
@@ -27007,35 +27021,7 @@ P
 		const ip = typeof getCurrentPs3Ip === 'function' ? getCurrentPs3Ip() : (document.getElementById('ps3-ip')?.value || '').trim();
 		const isConnected = isPs3QueueTargetConnected();
 	
-		let resolvedXmlParts = null;
-		if (type === 'xml' && ip) {
-			const oldLabel = btnElement?.innerHTML;
-			const oldPointer = btnElement?.style.pointerEvents;
-			if (btnElement) {
-				btnElement.dataset.ps3QueuePreparing = '1';
-				btnElement.style.pointerEvents = 'none';
-				btnElement.setAttribute('aria-busy', 'true');
-				btnElement.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Reading XML...';
-			}
-			try {
-				resolvedXmlParts = await resolvePsnPkgManifestUrls(url);
-				if (!resolvedXmlParts.length) throw new Error('No PKG links found inside this XML.');
-			} catch (error) {
-				if (typeof showToastNotification === 'function') showToastNotification('XML Download Error', error?.message || 'Could not read the package list.');
-				if (typeof playUiError === 'function') playUiError();
-				return;
-			} finally {
-				if (btnElement) {
-					delete btnElement.dataset.ps3QueuePreparing;
-					btnElement.style.pointerEvents = oldPointer;
-					btnElement.removeAttribute('aria-busy');
-					btnElement.innerHTML = oldLabel;
-				}
-			}
-		}
-
-		const isDropboxRemoteBlocked = (type === 'xml' && resolvedXmlParts
-			? resolvedXmlParts.some(isPsnDropboxLink) : isPsnDropboxLink(url));
+		const isDropboxRemoteBlocked = isPsnDropboxLink(url);
 		let target = 'pc';
 		let dropboxPcApproved = false;
 
@@ -27058,20 +27044,12 @@ P
 		}
 
 		if (target === 'ps3') {
-			const preparationLabel = btnElement?.innerHTML;
-			const preparationPointerEvents = btnElement?.style.pointerEvents;
-			if (type === 'xml' && btnElement) {
-				btnElement.dataset.ps3QueuePreparing = '1';
-				btnElement.style.pointerEvents = 'none';
-				btnElement.setAttribute('aria-busy', 'true');
-				btnElement.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Reading XML...';
-			}
 			try {
 				let pending;
 				if (type === 'rap') {
 					pending = [{ title:safeName, kind:'rap', url:LICENSE_REPO_RAP_BASE_URL + contentId + '.rap', titleId:id, contentId, category, history:false }];
 				} else {
-					pending = await buildPs3QueueItemsForGame({ url, id, titleId:id, cleanName:safeName, contentId, sizeBytes, ps3Type:type }, category, false, resolvedXmlParts);
+					pending = await buildPs3QueueItemsForGame({ url, id, titleId:id, cleanName:safeName, contentId, sizeBytes, ps3Type:type }, category);
 					if (type === 'promo') pending.forEach(job => { job.history = false; });
 				}
 				const queued = window.enqueuePs3DownloadQueue(pending);
@@ -27079,26 +27057,19 @@ P
 				if (typeof showToastNotification === 'function') showToastNotification('PS3™ Queue Updated', queued + ' file' + (queued === 1 ? '' : 's') + ' added. Downloads start only when the PS3 is on XMB.');
 				if (typeof playUiSuccess === 'function') playUiSuccess();
 				if (btnElement) {
-					const originalText = type === 'xml' ? preparationLabel : btnElement.innerHTML;
+					const originalText = btnElement.innerHTML;
 					btnElement.innerHTML = '<i class="fas fa-list-ol"></i> Queued';
-					setTimeout(() => { if (btnElement.isConnected && btnElement.dataset.ps3QueuePreparing !== '1') btnElement.innerHTML = originalText; }, 2000);
+					setTimeout(() => { if (btnElement.isConnected) btnElement.innerHTML = originalText; }, 2000);
 				}
 			} catch (error) {
-					console.warn('[PS3 Queue] Could not prepare remote downloads:', error);
-					if (typeof showToastNotification === 'function') showToastNotification('PS3™ Queue Error', error?.message || 'Could not prepare the download.');
-					if (typeof playUiError === 'function') playUiError();
-			} finally {
-				if (type === 'xml' && btnElement) {
-					delete btnElement.dataset.ps3QueuePreparing;
-					btnElement.style.pointerEvents = preparationPointerEvents;
-					btnElement.removeAttribute('aria-busy');
-					if (btnElement.isConnected && btnElement.innerHTML.includes('Reading XML')) btnElement.innerHTML = preparationLabel;
-				}
+				console.warn('[PS3 Queue] Could not prepare remote downloads:', error);
+				if (typeof showToastNotification === 'function') showToastNotification('PS3™ Queue Error', error?.message || 'Could not prepare the download.');
+				if (typeof playUiError === 'function') playUiError();
 			}
 		}
 		else {
 			if (type === 'xml') {
-				handleXmlDownload(url, safeName, version, btnElement, sizeBytes, id, category, contentId, dropboxPcApproved, resolvedXmlParts);
+				handleXmlDownload(url, safeName, version, btnElement, sizeBytes, id, category, contentId, dropboxPcApproved);
 			} 
 			else if (type === 'multi') {
 				if (downloadAllParts(url, safeName, version, dropboxPcApproved)) {
@@ -27685,45 +27656,64 @@ P
 
 	async function resolvePsnPkgManifestUrls(xmlUrl) {
 		const cleanUrl = String(xmlUrl || '').trim();
-		if (!cleanUrl) return [];
+		if (!/^https?:\/\//i.test(cleanUrl)) throw new Error('Invalid XML URL.');
 		if (psnPkgManifestPending.has(cleanUrl)) return (await psnPkgManifestPending.get(cleanUrl)).slice();
 
 		const pending = (async () => {
-			const proxyBypassUrl = 'https://corsproxy.io/?' + encodeURIComponent(cleanUrl);
-			let xmlText = '';
-			if (typeof window.fetchPsnSharedStaticText === 'function') {
-				const resource = await window.fetchPsnSharedStaticText(proxyBypassUrl);
-				if (!resource.ok) throw new Error('Error accessing XML');
-				xmlText = resource.text;
-			} else {
-				const response = await fetch(proxyBypassUrl);
-				if (!response.ok) throw new Error('Error accessing XML');
-				xmlText = await response.text();
-			}
-
-			const parsedCached = psnPkgManifestParseCache.get(cleanUrl);
-			if (parsedCached && parsedCached.text === xmlText) {
-				psnPkgManifestParseCache.delete(cleanUrl);
-				psnPkgManifestParseCache.set(cleanUrl, parsedCached);
-				return parsedCached.urls;
-			}
-
-			const xmlDoc = new DOMParser().parseFromString(xmlText, 'text/xml');
-			if (xmlDoc.querySelector('parsererror')) throw new Error('Invalid XML manifest');
-			const pkgUrls = [];
-			const allElements = xmlDoc.getElementsByTagName('*');
-			for (let i = 0; i < allElements.length; i++) {
-				const raw = String(allElements[i].getAttribute('url') || '').trim();
-				if (!raw || !/\.pkg(?:[?#&]|$)/i.test(raw)) continue;
+			const encoded = encodeURIComponent(cleanUrl);
+			const sonyReader = 'https://sony-xml-reader.ps3-pro.workers.dev/manifest';
+			const sonyManifest = (() => {
 				try {
-					const resolved = new URL(raw, cleanUrl);
-					if (/^https?:$/.test(resolved.protocol)) pkgUrls.push(resolved.href);
-				} catch (_) {}
+					const parsed = new URL(cleanUrl);
+					return /(?:^|\.)dl\.playstation\.net$/i.test(parsed.hostname) && /\.pkg\.xml$/i.test(parsed.pathname);
+				} catch (_) { return false; }
+			})();
+			const sources = [
+				...(sonyManifest ? [sonyReader + '?url=' + encoded] : []),
+				cleanUrl,
+				'https://api.allorigins.win/raw?url=' + encoded,
+				'https://api.codetabs.com/v1/proxy?quest=' + encoded
+			];
+			let lastError = null;
+			for (const source of sources) {
+				const controller = new AbortController();
+				const timeout = setTimeout(() => controller.abort(), 6000);
+				try {
+					const response = await fetch(source, { signal:controller.signal });
+					if (!response.ok) throw new Error('HTTP ' + response.status);
+					const xmlText = await response.text();
+					if (!xmlText.trim()) throw new Error('Empty response');
+					const xmlDoc = new DOMParser().parseFromString(xmlText, 'text/xml');
+					if (xmlDoc.querySelector('parsererror')) throw new Error('Invalid XML response');
+
+					const parsedCached = psnPkgManifestParseCache.get(cleanUrl);
+					if (parsedCached && parsedCached.text === xmlText) {
+						psnPkgManifestParseCache.delete(cleanUrl);
+						psnPkgManifestParseCache.set(cleanUrl, parsedCached);
+						return parsedCached.urls;
+					}
+
+					const pkgUrls = [];
+					const allElements = xmlDoc.getElementsByTagName('*');
+					for (let i = 0; i < allElements.length; i++) {
+						const raw = String(allElements[i].getAttribute('url') || '').trim();
+						if (!raw || !/\.pkg(?:[?#&]|$)/i.test(raw)) continue;
+						try {
+							const resolved = new URL(raw, cleanUrl);
+							if (/^https?:$/.test(resolved.protocol)) pkgUrls.push(resolved.href);
+						} catch (_) {}
+					}
+					const uniqueUrls = [...new Set(pkgUrls)];
+					psnPkgManifestParseCache.set(cleanUrl, { text:xmlText, urls:uniqueUrls });
+					while (psnPkgManifestParseCache.size > PSN_PKG_MANIFEST_PARSE_CACHE_MAX) psnPkgManifestParseCache.delete(psnPkgManifestParseCache.keys().next().value);
+					return uniqueUrls;
+				} catch (error) {
+					lastError = error;
+				} finally {
+					clearTimeout(timeout);
+				}
 			}
-			const uniqueUrls = [...new Set(pkgUrls)];
-			psnPkgManifestParseCache.set(cleanUrl, { text: xmlText, urls: uniqueUrls });
-			while (psnPkgManifestParseCache.size > PSN_PKG_MANIFEST_PARSE_CACHE_MAX) psnPkgManifestParseCache.delete(psnPkgManifestParseCache.keys().next().value);
-			return uniqueUrls;
+			throw new Error('Could not read the XML. The original address and alternate readers failed.' + (lastError ? ' (' + (lastError.name === 'AbortError' ? 'timeout' : lastError.message) + ')' : ''));
 		})();
 		psnPkgManifestPending.set(cleanUrl, pending);
 		try {
@@ -27827,7 +27817,7 @@ P
 		const ip = ipInput ? ipInput.value.trim() : '';
 		const isConnected = isPs3QueueTargetConnected();
 		const isRemoteBlocked = url => /dropbox\.com|dropboxusercontent\.com/i.test(String(url || ''));
-		const isBlockedBulkItem = game => getBulkPkgDownloadType(game) !== 'xml' && isRemoteBlocked(game.url);
+		const isBlockedBulkItem = game => isRemoteBlocked(game.url);
 		const blockedRemoteCount = items.filter(isBlockedBulkItem).length;
 		let target = 'pc';
 
