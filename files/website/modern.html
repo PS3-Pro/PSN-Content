@@ -58104,6 +58104,33 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 	let ps3LibraryRefreshToken = 0;
 	window.invalidatePS3LibraryRefresh = function() { ps3LibraryRefreshToken++; };
 
+	window.commitDeferredConsoleLibraryScan = function() {
+		const pending = window.__pendingConsoleLibraryScan;
+		if (!pending) return false;
+		const username = String(localStorage.getItem('psn_username') || '');
+		const ip = String(document.getElementById('ps3-ip')?.value || '').trim();
+		if (username !== pending.username || ip !== pending.ip) {
+			window.__pendingConsoleLibraryScan = null;
+			return false;
+		}
+		const hydrationKey = typeof window.getProfileHydrationKey === 'function' ? window.getProfileHydrationKey('library', username) : '';
+		if (!hydrationKey || !(window.__profileHydratedSections instanceof Set) || !window.__profileHydratedSections.has(hydrationKey)) return false;
+		window.__pendingConsoleLibraryScan = null;
+		const prior = Array.isArray(lastScannedGames) ? lastScannedGames : [];
+		const merged = mergeLibraryLastPlayedLists(pending.games, prior);
+		if (getLocalLibraryDataSignature(prior) === getLocalLibraryDataSignature(merged)) return true;
+		lastScannedGames = merged;
+		window.lastScannedGames = merged;
+		if (typeof window.bumpLibraryCollectionRevision === 'function') window.bumpLibraryCollectionRevision('library');
+		saveState('psn_local_library', JSON.stringify(merged));
+		markProfileListChanged('library');
+		const libraryVisible = document.getElementById('view-library')?.style.display === 'block' && ['block','flex'].includes(document.getElementById('subview-games')?.style.display || '');
+		if (libraryVisible) renderLocalLibrary(merged, true, true);
+		if (typeof window.refreshStoreInstalledChecks === 'function') window.refreshStoreInstalledChecks();
+		if (typeof window.broadcastProfileUpdate === 'function') window.broadcastProfileUpdate({ silentIndicator:true });
+		return true;
+	};
+
 	async function refreshPS3Library() {
 		const refreshToken = ++ps3LibraryRefreshToken;
 		const ip = document.getElementById('ps3-ip').value;
@@ -58142,8 +58169,11 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 			return;
 		}
 	
-		if (typeof window.ensureMutableProfileSectionReady === 'function' && !(await window.ensureMutableProfileSectionReady('library', 'library-refresh'))) return;
-		if (!refreshStillCurrent()) return;
+		if (typeof window.ensureProfileSectionHydrated === 'function') {
+			window.ensureProfileSectionHydrated('library', { reason:'library-refresh' }).then(ok => {
+				if (ok && typeof window.commitDeferredConsoleLibraryScan === 'function') window.commitDeferredConsoleLibraryScan();
+			}).catch(() => {});
+		}
 
 		if (subviewGames && libraryGamesVisibleNow()) subviewGames.classList.remove('my-games-offline');
 		const hasRenderedLocalCards = !!(grid && grid.querySelector('.game-card'));
@@ -58233,7 +58263,15 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 				if (typeof window.bumpLibraryCollectionRevision === 'function') window.bumpLibraryCollectionRevision('library');
 				if (typeof window.refreshStoreInstalledChecks === 'function') window.refreshStoreInstalledChecks();
 				shouldRepaintLocalLibrary = previousSignature !== getLocalLibraryDataSignature(lastScannedGames);
-				if (shouldRepaintLocalLibrary) markProfileListChanged('library');
+				const hydrationKey = typeof window.getProfileHydrationKey === 'function' ? window.getProfileHydrationKey('library', refreshUser) : '';
+				const profileLibraryReady = !!(hydrationKey && window.__profileHydratedSections instanceof Set && window.__profileHydratedSections.has(hydrationKey));
+				if (profileLibraryReady) {
+					window.__pendingConsoleLibraryScan = null;
+					if (shouldRepaintLocalLibrary) markProfileListChanged('library');
+				} else {
+					window.__pendingConsoleLibraryScan = { username:refreshUser, ip, games:discoveredGames };
+				}
+				if (shouldRepaintLocalLibrary) saveState('psn_local_library', JSON.stringify(lastScannedGames));
 				if (typeof window.checkLocalLibraryTrophyProgress === 'function') window.checkLocalLibraryTrophyProgress();
 				}
 	
@@ -80072,22 +80110,33 @@ function getVisibleChatStackEl(id) {
 		if (!options.force && window.__profileHydratedSections.has(hydrationKey)) return Promise.resolve(true);
 		if (!socketChat || !socketChat.connected || !window.isProfileLoaded) return Promise.resolve(false);
 		if (window.__profileSectionRequests[hydrationKey]) return window.__profileSectionRequests[hydrationKey];
+		const request = { reason:options.reason || `lazy-${key}`, forceRefresh:false, lazyHydrate:true, sections:[key] };
 		const requestPromise = new Promise(resolve => {
-			const request = { reason:options.reason || `lazy-${key}`, forceRefresh:false, lazyHydrate:true, sections:[key] };
-			const done = response => {
-				if (window.__profileSectionRequests[hydrationKey] === requestPromise) delete window.__profileSectionRequests[hydrationKey];
-				if (String(localStorage.getItem('psn_username') || '').trim() !== owner) { resolve(false); return; }
-				const ok = !!(response && response.ok !== false);
-				if (ok && !window.__profileHydratedSections.has(hydrationKey) && socketChat && socketChat.connected) {
-					setTimeout(() => window.ensureProfileSectionHydrated(key, { ...options, force:true, reason:`${request.reason}-retry` }).then(resolve), 80);
-					return;
-				}
-				resolve(ok && window.__profileHydratedSections.has(hydrationKey));
+			let attempt = 0;
+			const run = () => {
+				if (String(localStorage.getItem('psn_username') || '').trim() !== owner || !socketChat || !socketChat.connected) { resolve(false); return; }
+				if (window.__profileHydratedSections.has(hydrationKey)) { resolve(true); return; }
+				attempt++;
+				const done = response => {
+					if (String(localStorage.getItem('psn_username') || '').trim() !== owner) { resolve(false); return; }
+					if (window.__profileHydratedSections.has(hydrationKey)) { resolve(true); return; }
+					if (response && response.ok !== false && attempt < 3 && socketChat && socketChat.connected) {
+						setTimeout(run, attempt * 1000);
+						return;
+					}
+					resolve(false);
+				};
+				try {
+					if (typeof socketChat.timeout === 'function') socketChat.timeout(12000).emit('request_profile_sync', request, (err,response) => done(err ? {ok:false} : response));
+					else socketChat.emit('request_profile_sync', request, done);
+				} catch (err) { resolve(false); }
 			};
-			if (typeof socketChat.timeout === 'function') socketChat.timeout(12000).emit('request_profile_sync', request, (err,response)=>done(err?{ok:false}:response));
-			else socketChat.emit('request_profile_sync', request, done);
+			run();
 		});
 		window.__profileSectionRequests[hydrationKey] = requestPromise;
+		requestPromise.finally(() => {
+			if (window.__profileSectionRequests[hydrationKey] === requestPromise) delete window.__profileSectionRequests[hydrationKey];
+		});
 		return requestPromise;
 	};
 
@@ -80394,6 +80443,7 @@ function getVisibleChatStackEl(id) {
 		} finally {
 			setTimeout(() => {
 				window.__applyingRemoteProfileSync = false;
+				if (typeof window.commitDeferredConsoleLibraryScan === 'function') window.commitDeferredConsoleLibraryScan();
 			}, 0);
 		}
 	};
