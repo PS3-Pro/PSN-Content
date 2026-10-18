@@ -103690,12 +103690,16 @@ function getVisibleChatStackEl(id) {
         let showTimer = null;
         let hideTimer = null;
         let resizeFrame = null;
+        let hoverTimer = null;
+        let hoverVisible = false;
+        let hoverSuppressed = false;
+        const autoHintText = hint.textContent;
 
-        function launcherCanShowHint() {
+        function launcherIsAvailable() {
             const body = document.body;
             return !!(
-                !alreadySeen &&
                 !button.classList.contains('psn-pad-drag-positioning') &&
+                !button.classList.contains('ps3-pad-dragging') &&
                 body &&
                 body.classList.contains('ps3-pad-user-logged') &&
                 body.classList.contains('ps3-pad-console-connected') &&
@@ -103703,6 +103707,10 @@ function getVisibleChatStackEl(id) {
                 !body.classList.contains('ps3-pad-disclaimer-pending') &&
                 !body.classList.contains('ps3-pad-session-exiting')
             );
+        }
+
+        function launcherCanShowHint() {
+            return !alreadySeen && launcherIsAvailable();
         }
 
         function positionHint() {
@@ -103737,20 +103745,24 @@ function getVisibleChatStackEl(id) {
         function hideHint() {
             clearTimeout(showTimer);
             clearTimeout(hideTimer);
+            clearTimeout(hoverTimer);
             showTimer = null;
             hideTimer = null;
+            hoverTimer = null;
+            hoverVisible = false;
             hint.classList.remove('is-visible');
         }
 
         function showHint() {
             showTimer = null;
-            if (!launcherCanShowHint()) return;
+            if (!launcherCanShowHint() || hoverVisible) return;
 
+            hint.textContent = autoHintText;
             positionHint();
 
             requestAnimationFrame(function () {
                 requestAnimationFrame(function () {
-                    if (!launcherCanShowHint()) return;
+                    if (!launcherCanShowHint() || hoverVisible) return;
 
                     hint.classList.add('is-visible');
                     alreadySeen = true;
@@ -103777,7 +103789,36 @@ function getVisibleChatStackEl(id) {
             });
         }
 
-        button.hidePs3PadDragHint = hideHint;
+        button.hidePs3PadDragHint = function () {
+            hoverSuppressed = true;
+            hideHint();
+        };
+
+        button.addEventListener('pointerenter', function (event) {
+            if (event.pointerType && event.pointerType !== 'mouse' && event.pointerType !== 'pen') return;
+            if (hoverSuppressed || hoverTimer || !launcherIsAvailable()) return;
+            hoverTimer = setTimeout(function () {
+                hoverTimer = null;
+                if (hoverSuppressed || !launcherIsAvailable()) return;
+                hoverVisible = true;
+                clearTimeout(hideTimer);
+                hideTimer = null;
+                hint.textContent = 'Drag to reposition • Click to open';
+                positionHint();
+                hint.classList.add('is-visible');
+            }, 550);
+        });
+
+        button.addEventListener('pointerleave', function () {
+            hoverSuppressed = false;
+            clearTimeout(hoverTimer);
+            hoverTimer = null;
+            if (hoverVisible) {
+                hideHint();
+                hint.textContent = autoHintText;
+                scheduleHint();
+            }
+        });
 
         const bodyObserver = new MutationObserver(function () {
             const body = document.body;
