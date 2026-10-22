@@ -2811,7 +2811,11 @@ body.is-admin #btn-toolbar-cmd, body.is-mod #btn-toolbar-cmd { display: flex !im
 .chat-gif-slot > img { position:absolute; inset:0; width:100%; height:100%; object-fit:cover; opacity:0; z-index:2; transition:opacity .2s ease; }
 .chat-gif-slot.is-loaded > .chat-gif-skeleton { opacity:0; }
 .chat-gif-slot.is-loaded > img { opacity:1; }
-.chat-gif-slot:hover { transform:scale(1.025); border-color:var(--ps-blue); box-shadow:0 5px 15px rgba(0,0,0,.42); z-index:3; }
+.chat-gif-slot:hover { border-color:var(--ps-blue); z-index:3; }
+.chat-gif-slot::after { content:""; position:absolute; inset:0; border:1px solid var(--ps-blue); border-radius:inherit; opacity:0; pointer-events:none; z-index:4; transition:opacity .2s ease; }
+.chat-gif-slot:hover::after { opacity:1; }
+.chat-gif-slot > img { transition:opacity .2s ease,transform .2s cubic-bezier(.22,.61,.36,1); }
+.chat-gif-slot:hover > img { transform:scale(1.025); }
 .chat-search-popover { position: absolute; top: calc(100% + 12px); right: 0; width: 260px; max-height: 300px; background: rgba(15,20,30,0.98); backdrop-filter: blur(25px); border: 1px solid var(--ps-blue); border-radius: 8px; box-shadow: 0 15px 40px rgba(0,0,0,0.9),0 0 20px var(--ps-neon); display: none; flex-direction: column; z-index: 9999; overflow-y: auto; scrollbar-width: thin; scrollbar-color: #fff transparent; animation: psFadeIn 0.2s ease-out; }
 .search-section-label { font-size: 9px; font-weight: 800; color: var(--ps-blue); padding: 12px 15px 5px 15px; letter-spacing: 1.5px; opacity: 0.7; text-transform: uppercase; }
 .search-filter-item { display: flex; align-items: center; gap: 12px; padding: 10px 18px; cursor: pointer; transition: background 0.2s; }
@@ -13012,7 +13016,7 @@ P
 	const psnPressHitboxOriginal = new WeakMap();
 
 	function lockPsnPressHitbox(element) {
-		if (!element || !element.style || psnPressHitboxOriginal.has(element) || !element.matches('button, a[href], [role="button"], [onclick]')) return;
+		if (!element || !element.style || psnPressHitboxOriginal.has(element) || element.matches('.top-nav a') || !element.matches('button, a[href], [role="button"], [onclick]')) return;
 		const rect = element.getBoundingClientRect();
 		if (!rect.width || !rect.height || rect.height > 70) return;
 		const style = element.style;
@@ -15101,6 +15105,11 @@ P
 		return id;
 	}
 
+	function normalizePs3IdentityHash(value) {
+		const hash = String(value || '').trim().toLowerCase();
+		return /^[0-9a-f]{64}$/.test(hash) ? hash : '';
+	}
+
 	function normalizeSavedPs3ConsoleName(value, fallback = 'PS3') {
 		const name = String(value || '').replace(/\s+/g, ' ').trim().slice(0, 32);
 		return name || fallback;
@@ -15123,7 +15132,8 @@ P
 			if (seenIds.has(id)) id = `${id}-${i + 1}`.slice(0, 72);
 			if (seenIds.has(id)) continue;
 			const fallbackName = result.length ? `PS3 ${result.length + 1}` : 'My PS3';
-			result.push({ id, name: normalizeSavedPs3ConsoleName(entry.name || entry.label, fallbackName), ip });
+			const psidHash = normalizePs3IdentityHash(entry.psidHash);
+			result.push({ id, name: normalizeSavedPs3ConsoleName(entry.name || entry.label, fallbackName), ip, ...(psidHash ? { psidHash } : {}) });
 			seenIds.add(id);
 			seenIps.add(ip);
 		}
@@ -15176,8 +15186,9 @@ P
 	function getSavedPs3ConsolesForUser(username = null, options = {}) {
 		const activeUser = String(localStorage.getItem('psn_username') || '').trim();
 		const user = String(username || activeUser || '').trim();
-		let consoles = normalizeSavedPs3Consoles(readSavedPs3ConsoleStorage(user, STORAGE_KEY_SAVED_PS3_CONSOLES));
-		if (!consoles.length && options.migrateLegacy !== false) {
+		const savedValue = readSavedPs3ConsoleStorage(user, STORAGE_KEY_SAVED_PS3_CONSOLES);
+		let consoles = normalizeSavedPs3Consoles(savedValue);
+		if (!savedValue && !consoles.length && options.migrateLegacy !== false) {
 			const legacyIp = getLegacyPs3IpForUser(user);
 			if (legacyIp) {
 				consoles = [{ id: normalizeSavedPs3ConsoleId('', legacyIp, 0), name: 'My PS3', ip: legacyIp }];
@@ -15991,7 +16002,7 @@ P
 				: previous.countryCode
 		};
 
-		if (!next.savedPs3Consoles.length) {
+		if (!next.savedPs3Consoles.length && !Object.prototype.hasOwnProperty.call(incomingSettings, 'savedPs3Consoles') && !readSavedPs3ConsoleStorage(name, STORAGE_KEY_SAVED_PS3_CONSOLES)) {
 			const migrationIp = normalizeSavedPs3ConsoleIp(next.ps3Ip);
 			if (migrationIp) next.savedPs3Consoles = [{ id: normalizeSavedPs3ConsoleId('', migrationIp, 0), name: 'My PS3', ip: migrationIp }];
 		}
@@ -18413,6 +18424,45 @@ P
 
 	const EXPLORE_UPDATE_DAY_MS = 24 * 60 * 60 * 1000;
 	let exploreLatestUpdateDay = 0;
+	let exploreCatalogCommitDate = null;
+	let exploreCatalogCommitRequested = false;
+
+	function getExploreUpdateTooltip(count, isActive) {
+		const date = exploreCatalogCommitDate;
+		const latestItemDate = exploreLatestUpdateDay > 0
+			? new Date(exploreLatestUpdateDay * EXPLORE_UPDATE_DAY_MS).toLocaleDateString()
+			: '';
+		const stamp = date ? `Last catalog update: ${date}. `
+			: (latestItemDate ? `Latest item added: ${latestItemDate}. ` : '');
+		return `${stamp}${count > 0
+			? `${count} new ${count === 1 ? 'item' : 'items'}. Click to ${isActive ? 'remove' : 'show'} highlights.`
+			: 'No new items in this category from the latest catalog update.'}`;
+	}
+
+	function setExploreUpdateTooltip(pill, text) {
+		if (pill.hasAttribute('title') || !pill.hasAttribute('data-psn-tooltip-title')) pill.title = text;
+		if (pill.hasAttribute('data-psn-tooltip-title')) pill.dataset.psnTooltipTitle = text;
+		pill.setAttribute('aria-label', text);
+	}
+
+	function loadExploreCatalogCommitDate() {
+		if (exploreCatalogCommitRequested) return;
+		exploreCatalogCommitRequested = true;
+		fetch('https://api.github.com/repos/PS3-Pro/PSN-Content/commits?path=resources/database/content/latest&per_page=1')
+			.then(response => response.ok ? response.json() : null)
+			.then(commits => {
+				const raw = Array.isArray(commits) ? (commits[0]?.commit?.committer?.date || commits[0]?.commit?.author?.date) : null;
+				const timestamp = raw ? Date.parse(raw) : NaN;
+				if (!Number.isFinite(timestamp)) return;
+				exploreCatalogCommitDate = new Date(timestamp).toLocaleDateString(undefined, { dateStyle:'medium' });
+				document.querySelectorAll('.explore-update-pill[data-container-id]').forEach(pill => {
+					const section = pill.closest('.explore-section');
+					const container = document.getElementById(pill.dataset.containerId);
+					if (!container || !section) return;
+					setExploreUpdateTooltip(pill, getExploreUpdateTooltip(Number(container.dataset.newSinceUpdateCount || 0), section.classList.contains('show-update-highlights')));
+				});
+			}).catch(() => {});
+	}
 
 	function getExploreUpdateDay(value) {
 		const timestamp = Number(value) || 0;
@@ -18490,6 +18540,7 @@ P
 			pill.onclick = event => { event.preventDefault(); window.toggleExploreUpdateHighlights(containerId); };
 			pill.onkeydown = event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); window.toggleExploreUpdateHighlights(containerId); } };
 			host.appendChild(pill);
+			loadExploreCatalogCommitDate();
 		}
 		return pill;
 	}
@@ -18506,8 +18557,7 @@ P
 		pill.setAttribute('aria-pressed', shouldActivate ? 'true' : 'false');
 		const checkbox = pill.querySelector('input[type="checkbox"]');
 		if (checkbox) checkbox.checked = shouldActivate;
-		pill.title = `${container.dataset.newSinceUpdateCount} new items from the latest catalog update. Click to ${shouldActivate ? 'remove' : 'show'} highlights.`;
-		pill.setAttribute('aria-label', pill.title);
+		setExploreUpdateTooltip(pill, getExploreUpdateTooltip(Number(container.dataset.newSinceUpdateCount || 0), shouldActivate));
 		if (!shouldActivate) return true;
 		if (container.__exploreVirtualData) {
 			delete container.dataset.exploreReturnResetting;
@@ -18551,7 +18601,6 @@ P
 		const checkbox = pill.querySelector('input[type="checkbox"]');
 		if (checkbox) checkbox.checked = isActive;
 		const text = `${count} NEW SINCE LAST UPDATE`;
-		const label = `${count} ${count === 1 ? 'new item' : 'new items'} from the latest catalog update`;
 		const valueNode = pill.querySelector('.explore-update-pill-value');
 		if (valueNode) {
 			const fullNode = valueNode.querySelector('.explore-update-pill-full');
@@ -18559,8 +18608,7 @@ P
 			if (fullNode) fullNode.textContent = text;
 			if (compactNode) compactNode.textContent = `${count} NEW`;
 		}
-		pill.title = count > 0 ? `${label}. Click to ${isActive ? 'remove' : 'show'} highlights.` : 'No new items in this category from the latest catalog update.';
-		pill.setAttribute('aria-label', pill.title);
+		setExploreUpdateTooltip(pill, getExploreUpdateTooltip(count, isActive));
 		pill.setAttribute('aria-disabled', count > 0 ? 'false' : 'true');
 		pill.tabIndex = count > 0 ? 0 : -1;
 		pill.classList.remove('is-hidden');
@@ -45719,7 +45767,6 @@ P
 			<div style="font-size:9px; color:var(--text-muted); text-align:right; margin:-2px 3px 7px 0; opacity:.65; font-weight:900;">POWERED BY GIPHY</div>
 			<div id="admin-gif-grid" class="admin-gif-grid"></div>`;
 		adminFetchBroadcastGifs('');
-		setTimeout(() => document.getElementById('admin-gif-search-input')?.focus(), 30);
 	};
 
 	window.adminFetchBroadcastGifs = async function(query = '') {
@@ -64670,6 +64717,8 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 		if (typeof isUserSessionReadyForConsole === 'function' && !isUserSessionReadyForConsole()) return;
 		if (window.ps3ConnectInProgress) return;
 		window.ps3ConnectInProgress = true;
+		window.__ps3ConnectedIdentity = null;
+		window.__ps3ConsoleIdentityRevision = (window.__ps3ConsoleIdentityRevision || 0) + 1;
 		const ip = document.getElementById('ps3-ip').value;
 		if (!ip) {
 			window.ps3ConnectInProgress = false;
@@ -64681,6 +64730,8 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 			if (!silent) alert("Invalid IP format. Please enter a valid IP (e.g. 192.168.1.100).");
 			return;
 		}
+		const consolesBeforeConnect = getSavedPs3ConsolesForUser();
+		if (!readSavedPs3ConsoleStorage(null, STORAGE_KEY_SAVED_PS3_CONSOLES)) writeSavedPs3ConsolesForUser(null, consolesBeforeConnect);
 	
 		const globalIcon = document.getElementById('global-status-icon');
 		if (globalIcon) {
@@ -64700,7 +64751,6 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 				const activeUserForIpSync = localStorage.getItem('psn_username');
 				if (activeUserForIpSync) safeLocalStorageSet(`${activeUserForIpSync}_ps3_ip`, ip);
 				safeLocalStorageSet('ps3_ip', ip);
-				if (typeof syncSavedPs3ConsoleFromConnectedIp === 'function') syncSavedPs3ConsoleFromConnectedIp(ip);
 				if (typeof markProfileSettingsChanged === 'function') markProfileSettingsChanged();
 			} catch (ipSyncErr) { console.warn('[PS3 IP Sync] Could not sync connected IP:', ipSyncErr); }
 			_lastConnectionState = true; 
@@ -64747,6 +64797,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 			}
 	
 			startConnectionMonitor();
+			void reconcileConnectedPs3Console(ip, { promptIfNew: !silent && !suppressSuccess }).catch(error => console.warn('[PS3 Console Identity]', error));
 	
 		} catch (err) {
 			if (!silent) console.warn("Connection failed:", err);
@@ -64958,6 +65009,8 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 		}
 		const overlay = ensurePs3ConsoleEditorModal();
 		overlay.dataset.consoleId = existing?.id || '';
+		overlay.dataset.psidHash = normalizePs3IdentityHash(options.psidHash || '');
+		overlay.dataset.identityIp = normalizeSavedPs3ConsoleIp(document.getElementById('ps3-ip')?.value || '');
 		const title = document.getElementById('ps3-console-editor-title');
 		const nameInput = document.getElementById('ps3-console-name-input');
 		const ipInput = document.getElementById('ps3-console-ip-input');
@@ -64988,7 +65041,11 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 
 		const previous = existingIndex >= 0 ? { ...consoles[existingIndex] } : null;
 		const id = previous?.id || getUniquePs3ConsoleId(consoles, ip);
-		const nextEntry = { id, name, ip };
+		const connectedIdentity = window.__ps3ConnectedIdentity;
+		const connectedHash = _lastConnectionState === true && connectedIdentity?.ip === ip && connectedIdentity?.username === String(localStorage.getItem('psn_username') || '') ? normalizePs3IdentityHash(connectedIdentity.psidHash) : '';
+		const oldHash = previous?.ip === ip ? normalizePs3IdentityHash(previous.psidHash) : '';
+		const psidHash = connectedHash || (overlay.dataset.identityIp === ip ? normalizePs3IdentityHash(overlay.dataset.psidHash) : '') || oldHash;
+		const nextEntry = { id, name, ip, ...(psidHash ? { psidHash } : {}) };
 		if (existingIndex >= 0) consoles[existingIndex] = nextEntry;
 		else consoles.push(nextEntry);
 		writeSavedPs3ConsolesForUser(null, consoles);
@@ -64998,7 +65055,15 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 		const activeId = getActivePs3ConsoleIdForUser(null, consoles);
 		const shouldSelect = existingIndex < 0 || activeId === id;
 		if (shouldSelect) {
-			selectSavedPs3Console(id, { forceReconnect: !!(previous && previous.ip !== ip) || existingIndex < 0 });
+			const inputIp = normalizeSavedPs3ConsoleIp(document.getElementById('ps3-ip')?.value || '');
+			const connected = _lastConnectionState === true && inputIp === ip;
+			if (connected) {
+				persistCurrentPs3ConsoleSelection(id, ip, { sync:false });
+				updatePs3ConsoleHeaderUi();
+				if (typeof showToastNotification === 'function') showToastNotification('Console Saved', `${name} was saved.`);
+			} else {
+				selectSavedPs3Console(id, { forceReconnect: !!(previous && previous.ip !== ip) || existingIndex < 0 });
+			}
 		} else {
 			updatePs3ConsoleHeaderUi();
 			renderPs3ConsolePopover();
@@ -65066,28 +65131,60 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 		return _lastConnectionState === true;
 	};
 
-	function syncSavedPs3ConsoleFromConnectedIp(ip) {
-		const cleanIp = normalizeSavedPs3ConsoleIp(ip);
-		if (!cleanIp) return false;
+	async function getConnectedPs3IdentityHash(ip) {
+		if (!window.crypto?.subtle || typeof TextEncoder === 'undefined') return '';
+		try {
+			const html = await fetchConsoleReadableText('/cpursx.ps3', 4000, ip);
+			const psid = String(parseConsoleSystemInfoFromWebmanHtml(html).psid || '').replace(/\s+/g, '').toUpperCase();
+			if (!/^[0-9A-F]{32}$/.test(psid) || /^0{32}$/.test(psid) || /^F{32}$/.test(psid)) return '';
+			const user = String(localStorage.getItem('psn_username') || '');
+			const bytes = new TextEncoder().encode(`psn-console:${user}:${psid}`);
+			const digest = await window.crypto.subtle.digest('SHA-256', bytes);
+			return Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join('');
+		} catch (error) { return ''; }
+	}
+
+	async function reconcileConnectedPs3Console(ip, options = {}) {
+		const username = String(localStorage.getItem('psn_username') || '');
+		const revision = (window.__ps3ConsoleIdentityRevision || 0) + 1;
+		window.__ps3ConsoleIdentityRevision = revision;
+		const psidHash = await getConnectedPs3IdentityHash(ip);
+		if (revision !== window.__ps3ConsoleIdentityRevision ||
+			String(localStorage.getItem('psn_username') || '') !== username ||
+			normalizeSavedPs3ConsoleIp(document.getElementById('ps3-ip')?.value || '') !== ip ||
+			_lastConnectionState !== true) return;
+		window.__ps3ConnectedIdentity = { ip, psidHash, username };
 		const consoles = getSavedPs3ConsolesForUser(null, { migrateLegacy:false });
-		let activeId = getActivePs3ConsoleIdForUser(null, consoles);
-		const matching = consoles.find(item => item.ip === cleanIp) || null;
-		let changed = false;
-		if (matching) {
-			if (activeId !== matching.id) { activeId = matching.id; changed = true; }
-		} else if (activeId) {
-			const index = consoles.findIndex(item => item.id === activeId);
-			if (index >= 0 && consoles[index].ip !== cleanIp) { consoles[index] = { ...consoles[index], ip:cleanIp }; changed = true; }
-		} else if (!consoles.length) {
-			const entry = { id:getUniquePs3ConsoleId(consoles, cleanIp), name:'My PS3', ip:cleanIp };
-			consoles.push(entry);
-			activeId = entry.id;
-			changed = true;
+		const byIdentity = psidHash ? consoles.find(item => item.psidHash === psidHash) : null;
+		const byIp = consoles.find(item => item.ip === ip) || null;
+		const match = byIdentity || (byIp && (!psidHash || !byIp.psidHash || byIp.psidHash === psidHash) ? byIp : null);
+		if (match) {
+			const conflict = byIdentity && byIp && byIdentity.id !== byIp.id;
+			if (conflict) {
+				if (options.promptIfNew && typeof showToastNotification === 'function') showToastNotification('Console IP Conflict', 'This IP belongs to another saved console. Please review the saved consoles.');
+				return;
+			}
+			const changed = match.ip !== ip || (!!psidHash && match.psidHash !== psidHash);
+			if (changed) {
+				const index = consoles.findIndex(item => item.id === match.id);
+				consoles[index] = { ...match, ip, ...(psidHash ? { psidHash } : {}) };
+				writeSavedPs3ConsolesForUser(null, consoles);
+			}
+			const active = getActivePs3ConsoleIdForUser(null, consoles);
+			if (active !== match.id || changed) {
+				persistCurrentPs3ConsoleSelection(match.id, ip, { sync:false });
+				if (typeof markProfileSettingsChanged === 'function') markProfileSettingsChanged();
+			}
+			updatePs3ConsoleHeaderUi();
+			return;
 		}
-		if (changed) writeSavedPs3ConsolesForUser(null, consoles);
-		writeActivePs3ConsoleIdForUser(null, activeId);
-		updatePs3ConsoleHeaderUi();
-		return changed;
+		if (byIp && psidHash && byIp.psidHash && byIp.psidHash !== psidHash) {
+			if (options.promptIfNew && typeof showToastNotification === 'function') showToastNotification('Different Console Detected', 'This IP is saved to another PS3. Review your saved consoles before making changes.');
+			return;
+		}
+		if (options.promptIfNew && typeof openPs3ConsoleEditor === 'function') {
+			openPs3ConsoleEditor('', { useCurrentIp:true, psidHash });
+		}
 	}
 
 	function initializePs3ConsoleSelector() {
@@ -77884,7 +77981,6 @@ function getVisibleChatStackEl(id) {
 			if (searchInput.value === "") {
 				fetchGiphyGifs("");
 			}
-			searchInput.focus();
 		} else {
 			if (typeof playUiBack === 'function') playUiBack();
 		}
