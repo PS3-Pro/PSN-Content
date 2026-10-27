@@ -7940,6 +7940,53 @@ async function recordChatSyncChangeSafe(changeType, messageId = '', message = nu
   }
 }
 
+async function saveChatMessageWithSync(messageData) {
+  const savedMessage = cleanChatMessage(messageData);
+  const messageId = String(new Date(messageData.time).getTime());
+  const result = await runDbTransactionWithRetry('CHAT MESSAGE SAVE', async client => {
+    const saved = await client.query('INSERT INTO chat (message) VALUES ($1) RETURNING id', [savedMessage]);
+    const sync = await client.query(`
+      WITH next_state AS (
+        UPDATE chat_sync_state
+        SET revision = revision + 1, updated_at = NOW()
+        WHERE id = 1
+        RETURNING epoch, revision
+      )
+      INSERT INTO chat_changes (revision, epoch, change_type, message_id, message)
+      SELECT revision, epoch, 'upsert', $1, $2::jsonb FROM next_state
+      RETURNING epoch, revision
+    `, [messageId, savedMessage]);
+    if (!sync.rows.length) throw new Error('Chat sync state is unavailable.');
+    await client.query('SELECT pg_notify($1, $2)', [
+      'chat_sync_notify',
+      JSON.stringify({ instanceId: INSTANCE_ID, reason: 'upsert' })
+    ]);
+    return {
+      dbId: Number(saved.rows[0]?.id) || 0,
+      epoch: String(sync.rows[0].epoch || ''),
+      revision: Math.max(0, Number(sync.rows[0].revision) || 0)
+    };
+  }, { attempts: 3, lockTimeoutMs: 2000 });
+
+  chatSyncState = { epoch: result.epoch, revision: result.revision };
+  const pruneBefore = result.revision - CHAT_SYNC_CHANGE_LOG_MAX;
+  if (pruneBefore > 0) {
+    pool.query('DELETE FROM chat_changes WHERE epoch = $1 AND revision <= $2', [result.epoch, pruneBefore]).catch(err => {
+      if (process.env.DEBUG_CHAT_SYNC === '1') console.warn('[CHAT SYNC PRUNE ERROR]:', err && err.message ? err.message : err);
+    });
+  }
+  return {
+    dbId: result.dbId,
+    change: {
+      epoch: result.epoch,
+      revision: result.revision,
+      type: 'upsert',
+      msgId: messageId,
+      message: savedMessage
+    }
+  };
+}
+
 async function resolveChatDeleteTargetsForSocket(socket, rawTargets = []) {
   const targets = [];
   const seenIds = new Set();
@@ -14008,6 +14055,21 @@ io.on('connection', (socket) => {
         }
 
         if (clientRevision === state.revision) {
+          if (request && Object.prototype.hasOwnProperty.call(request, 'lastMessageTime')) {
+            const clientTail = normalizeText(request.lastMessageTime, '').slice(0, 80);
+            const clientTailUser = normalizeText(request.lastMessageUser, '').slice(0, 120);
+            const tailResult = await queryDbWithRetry(
+              "SELECT message->>'time' AS msg_time, message->>'user' AS msg_user FROM chat ORDER BY id DESC LIMIT 1",
+              [],
+              { attempts: 2, label: 'CHAT SYNC TAIL CHECK' }
+            );
+            const serverTail = tailResult.rows[0] || null;
+            const serverTailTime = normalizeText(serverTail && serverTail.msg_time, '');
+            const serverTailUser = normalizeText(serverTail && serverTail.msg_user, '');
+            if (clientTail !== serverTailTime || (serverTailTime && clientTailUser !== serverTailUser)) {
+              return sendSnapshot('cache-tail-mismatch');
+            }
+          }
           return withSeenSync({
             success: true,
             syncV1: true,
@@ -15393,9 +15455,9 @@ io.on('connection', (socket) => {
     try {
       const savedMessage = cleanChatMessage(messageData);
       chatTrace.stage('before_db_insert', CHAT_MEMORY_TRACE_ENABLED ? { savedPayload:summarizeChatTracePayload(savedMessage).payload } : {});
-      const savedRes = await pool.query('INSERT INTO chat (message) VALUES ($1) RETURNING id', [savedMessage]);
+      const saved = await saveChatMessageWithSync(messageData);
       chatTrace.stage('after_db_insert');
-      attachChatDbId(messageData, savedRes.rows[0]?.id);
+      attachChatDbId(messageData, saved.dbId);
       lastChatDbId = Math.max(lastChatDbId, messageData._dbId || 0);
 
       messageHistory.push(messageData);
@@ -15404,8 +15466,7 @@ io.on('connection', (socket) => {
 
       const publicMessage = cleanChatMessage(messageData);
       deferServerTask('CHAT USER NOTIFICATIONS', () => recordChatUserNotifications(publicMessage), 0);
-      chatTrace.stage('before_sync_change');
-      const syncChange = await recordChatSyncChangeSafe('upsert', String(new Date(messageData.time).getTime()), publicMessage);
+      const syncChange = saved.change;
       chatTrace.stage('after_sync_change', { revision:Number(syncChange && syncChange.revision)||0 });
       let liveRecipients = 0;
       chatTrace.stage('before_chat_broadcast');
