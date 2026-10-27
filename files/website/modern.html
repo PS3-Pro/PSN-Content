@@ -4149,6 +4149,7 @@ div[id^="msg-row-"] { transition: opacity 0.4s ease,transform 0.4s cubic-bezier(
 #view-browse #missing-rap-filter.is-unavailable label:hover { background: rgba(255,68,68,.07) !important; border-color: rgba(255,68,68,.20) !important; color: rgba(255,135,135,.60) !important; opacity: .75 !important; box-shadow: none !important; transform: none !important; filter: none !important; cursor: not-allowed !important; }
 #view-browse #group-titles-filter.is-unavailable label i,
 #view-browse #missing-rap-filter.is-unavailable label i { color: inherit !important; }
+#view-browse #group-titles-filter.is-hidden, #view-browse #missing-rap-filter.is-hidden { display: none !important; }
 /* ========================================================================== RIPPLE EFFECT ========================================================================== */
 .global-click-pulse { position: fixed; width: 40px; height: 40px; border-radius: 50%; background: rgba(255,255,255,0.1); border: 2px solid #ffffff; box-shadow: 0 0 15px 4px var(--ps-blue,#00bcff),inset 0 0 10px #ffffff; pointer-events: none; z-index: 9999999; transform: translate(-50%,-50%) scale(0); animation: pulse-bright-anim 450ms ease-out forwards; }
 
@@ -6693,7 +6694,7 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 #view-browse #group-titles-filter.group-titles-separated { margin-left: 2px !important; padding-left: 9px !important; border-left: 1px solid rgba(255,255,255,.16) !important; }
 #view-browse #missing-rap-filter.license-filter-separated { flex: 0 0 auto !important; margin-left: 0 !important; padding-left: 0 !important; border-left: 0 !important; }
 #view-browse #missing-rap-filter.license-filter-separated.has-filter-separator { margin-left: 2px !important; padding-left: 9px !important; border-left: 1px solid rgba(255,255,255,.16) !important; }
-#view-browse #missing-rap-filter.license-filter-separated { display: inline-flex !important; }
+#view-browse #missing-rap-filter.license-filter-separated:not(.is-hidden) { display: inline-flex !important; }
 #view-browse #missing-rap-filter.license-filter-separated label { height: 28px !important; padding: 0 10px !important; font-size: 9.5px !important; letter-spacing: .35px !important; }
 #view-browse .section-title { width: 100% !important; justify-content: space-between !important; align-items: baseline !important; flex-wrap: nowrap !important; gap: 10px !important; line-height: 1.1 !important; }
 #view-browse #display-title { flex: 0 1 auto !important; min-width: 0 !important; }
@@ -22938,8 +22939,11 @@ P
         const isMainBrowsePage = !browseExpandedGroupTitle && !navHistory;
         const filterSelector = category === 'games' ? '#console-filters input:checked' : (category === 'apps' ? '#app-filters input:checked' : null);
         const hasSelectedTypes = !filterSelector || !!document.querySelector(filterSelector);
-        const enabled = allowedHere && isMainBrowsePage && hasSelectedTypes;
+        const visible = allowedHere && isMainBrowsePage;
+        const enabled = visible && hasSelectedTypes;
 
+        wrap.classList.toggle('is-hidden', !visible);
+        wrap.setAttribute('aria-hidden', String(!visible));
         if (toggle) {
             if (toggle.dataset.defaultReady !== '1') {
                 toggle.checked = true;
@@ -22948,8 +22952,9 @@ P
             toggle.disabled = !enabled;
             toggle.dataset.groupCategory = category;
         }
-        wrap.classList.toggle('is-unavailable', !enabled);
-        wrap.classList.toggle('group-titles-separated', category === 'games' || category === 'apps');
+        wrap.classList.toggle('is-unavailable', visible && !enabled);
+        const typeFilter = document.getElementById(category === 'games' ? 'console-filters' : 'app-filters');
+        wrap.classList.toggle('group-titles-separated', visible && (category === 'games' || category === 'apps') && !!typeFilter && typeFilter.style.display !== 'none');
         wrap.setAttribute('aria-disabled', String(!enabled));
         const label = wrap.querySelector('label');
         if (label) label.title = enabled ? 'Group same-title items while browsing all regions' : (!isMainBrowsePage ? 'Not available in this view' : (!allowedHere ? 'Available when browsing all regions of supported categories' : 'Select at least one type to group titles'));
@@ -32991,8 +32996,6 @@ P
 	}
 
 	function hasVisibleBrowseFilterGroupBeforeLicense(categoryOverride = null) {
-		if (typeof browseExpandedGroupTitle !== 'undefined' && browseExpandedGroupTitle) return false;
-
 		const cat = categoryOverride || (document.getElementById('cat-select') ? document.getElementById('cat-select').value : '');
 		const typeGroup = cat === 'games'
 			? document.getElementById('console-filters')
@@ -33000,8 +33003,8 @@ P
 		const groupTitles = getBrowseGroupTitleWrap ? getBrowseGroupTitleWrap() : document.getElementById('group-titles-filter');
 
 		return !!(
-			(typeGroup && typeGroup.style.display !== 'none' && typeGroup.querySelector('label')) ||
-			(groupTitles && groupTitles.style.display !== 'none')
+			(isBrowseMainListScreen() && typeGroup && typeGroup.style.display !== 'none' && typeGroup.querySelector('label')) ||
+			(groupTitles && !groupTitles.classList.contains('is-hidden') && groupTitles.style.display !== 'none')
 		);
 	}
 
@@ -33009,8 +33012,11 @@ P
 		const wrap = document.getElementById('missing-rap-filter');
 		if (!wrap) return;
 
-		wrap.classList.toggle('has-filter-separator', hasVisibleBrowseFilterGroupBeforeLicense());
-		wrap.classList.add('is-unavailable');
+		const mainGames = document.getElementById('cat-select')?.value === 'games' && isBrowseMainListScreen();
+		wrap.classList.toggle('is-hidden', !mainGames);
+		wrap.classList.toggle('has-filter-separator', mainGames && hasVisibleBrowseFilterGroupBeforeLicense());
+		wrap.classList.toggle('is-unavailable', mainGames);
+		wrap.setAttribute('aria-hidden', String(!mainGames));
 		wrap.setAttribute('aria-disabled', 'true');
 		const input = wrap.querySelector('input');
 		if (input) input.disabled = true;
@@ -33034,8 +33040,13 @@ P
 		const searchCandidateCount = Number(window.__browseMissingRapSearchCandidateCount || 0);
 		const shouldHideSingleSearchFilter = isSearching && searchCandidateCount <= 1;
 		const canShowFilter = hasMissingLicenses && (!isSearching || (searchCanUseMissingFilter && !shouldHideSingleSearchFilter));
-		wrap.classList.toggle('has-filter-separator', hasVisibleBrowseFilterGroupBeforeLicense(categoryOverride));
-		wrap.classList.toggle('is-unavailable', !canShowFilter);
+		const category = categoryOverride || document.getElementById('cat-select')?.value || '';
+		const keepDisabledSlot = category === 'games' && isBrowseMainListScreen();
+		const visible = canShowFilter || keepDisabledSlot;
+		wrap.classList.toggle('is-hidden', !visible);
+		wrap.classList.toggle('has-filter-separator', visible && hasVisibleBrowseFilterGroupBeforeLicense(category));
+		wrap.classList.toggle('is-unavailable', visible && !canShowFilter);
+		wrap.setAttribute('aria-hidden', String(!visible));
 		wrap.setAttribute('aria-disabled', String(!canShowFilter));
 		const input = wrap.querySelector('input');
 		if (input) input.disabled = !canShowFilter;
