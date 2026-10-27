@@ -71478,6 +71478,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
                 initialFullSync: needsStableFullSnapshot,
                 lastMessageTime: latestMessage ? String(latestMessage.time || '') : '',
                 lastMessageUser: latestMessage ? String(latestMessage.user || '') : '',
+                cachedCount: currentHistory.length,
                 reason,
                 at: Date.now()
             };
@@ -71606,6 +71607,8 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
     const CHAT_CACHE_DB_NAME = 'psn-chat-history-cache-v1';
     const CHAT_CACHE_DB_VERSION = 1;
     const CHAT_CACHE_STORE = 'history';
+    const CHAT_CACHE_FORMAT_VERSION = 2;
+    const CHAT_CACHE_MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000;
 
     function getChatCacheUserName() {
         const value = localStorage.getItem('psn_username') || '';
@@ -71697,6 +71700,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
         if (!userName || window.__chatCacheReadyForWrite !== true || window.__chatCacheHydratedUser !== userName) return false;
         const record = {
             user: userName,
+            formatVersion: CHAT_CACHE_FORMAT_VERSION,
             epoch: String(window.__chatCacheEpoch || ''),
             revision: Math.max(0, Number(window.__chatCacheRevision) || 0),
             seenCursor: Math.max(0, Number(window.__chatSeenCursor) || 0),
@@ -71901,7 +71905,8 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
                 return { hydrated: true, cached: true };
             }
             window.__chatCacheHydratedUser = userName;
-            const hasUsableRecord = !!(record && record.user === userName && record.complete === true && Array.isArray(record.messages) && String(record.epoch || ''));
+            const savedAt = Number(record && record.savedAt) || 0;
+            const hasUsableRecord = !!(record && record.user === userName && record.complete === true && record.formatVersion === CHAT_CACHE_FORMAT_VERSION && Array.isArray(record.messages) && String(record.epoch || '') && savedAt > 0 && Date.now() - savedAt >= 0 && Date.now() - savedAt < CHAT_CACHE_MAX_AGE_MS);
             window.__chatCacheHydratedHasCache = hasUsableRecord;
             if (!hasUsableRecord) {
                 window.__chatCacheEpoch = '';
@@ -71917,7 +71922,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
             window.__chatCacheRevision = Math.max(0, Number(record.revision) || 0);
             window.__chatSeenCursor = Math.max(0, Number(record.seenCursor) || 0);
             window.__chatPersistentCacheAvailable = true;
-            window.__chatCacheReadyForWrite = true;
+            window.__chatCacheReadyForWrite = false;
             window.__chatInitialSnapshotPending = holdForServer;
             window.messageHistory = cachedHistory;
             window.__chatHistoryContentRevision = Math.max(0, Number(window.__chatHistoryContentRevision) || 0) + 1;
@@ -71966,6 +71971,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
         const previousEpoch = String(window.__chatCacheEpoch || '');
         const previousRevision = Math.max(0, Number(window.__chatCacheRevision) || 0);
         const previousSeenCursor = Math.max(0, Number(window.__chatSeenCursor) || 0);
+        const cacheWasUnverified = window.__chatCacheReadyForWrite !== true;
         const previousHistory = Array.isArray(window.messageHistory) ? window.messageHistory : [];
         const wasInitialSyncPending = window.__chatInitialSnapshotPending === true;
         const pendingSyncChanges = wasInitialSyncPending && Array.isArray(window.__chatInitialPendingSyncChanges)
@@ -72037,8 +72043,9 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
         if (wasInitialSyncPending && typeof isChatScreenVisibleForRead === 'function' && isChatScreenVisibleForRead() && window.__chatHistoryDomRendered !== true && typeof renderDeferredChatHistory === 'function') {
             Promise.resolve(renderDeferredChatHistory({ reason: 'chat-sync-ready', force: true, forceBottom: false, showLoading: false })).catch(() => {});
         }
+        window.__chatCacheReadyForWrite = true;
         const syncMetaChanged = previousEpoch !== String(window.__chatCacheEpoch || '') || previousRevision !== Math.max(0, Number(window.__chatCacheRevision) || 0) || previousSeenCursor !== Math.max(0, Number(window.__chatSeenCursor) || 0);
-        if (historyDataChanged || syncMetaChanged || wasInitialSyncPending) scheduleChatPersistentCacheWrite(0);
+        if (historyDataChanged || syncMetaChanged || wasInitialSyncPending || cacheWasUnverified) scheduleChatPersistentCacheWrite(0);
         return true;
     }
     window.applyChatSyncResponse = applyChatSyncResponse;

@@ -14059,15 +14059,17 @@ io.on('connection', (socket) => {
             const clientTail = normalizeText(request.lastMessageTime, '').slice(0, 80);
             const clientTailUser = normalizeText(request.lastMessageUser, '').slice(0, 120);
             const tailResult = await queryDbWithRetry(
-              "SELECT message->>'time' AS msg_time, message->>'user' AS msg_user FROM chat ORDER BY id DESC LIMIT 1",
-              [],
+              "SELECT message->>'time' AS msg_time, message->>'user' AS msg_user, (SELECT LEAST(COUNT(*), $1) FROM chat) AS message_count FROM chat ORDER BY id DESC LIMIT 1",
+              [MAX_CHAT_HISTORY],
               { attempts: 2, label: 'CHAT SYNC TAIL CHECK' }
             );
             const serverTail = tailResult.rows[0] || null;
             const serverTailTime = normalizeText(serverTail && serverTail.msg_time, '');
             const serverTailUser = normalizeText(serverTail && serverTail.msg_user, '');
-            if (clientTail !== serverTailTime || (serverTailTime && clientTailUser !== serverTailUser)) {
-              return sendSnapshot('cache-tail-mismatch');
+            const hasClientCount = request && Number.isInteger(request.cachedCount) && request.cachedCount >= 0;
+            const serverCount = serverTail ? Math.max(0, Number(serverTail.message_count) || 0) : 0;
+            if (clientTail !== serverTailTime || (serverTailTime && clientTailUser !== serverTailUser) || (hasClientCount && request.cachedCount !== serverCount)) {
+              return sendSnapshot('cache-integrity-mismatch');
             }
           }
           return withSeenSync({
