@@ -5639,6 +5639,21 @@ body.ps3-pad-user-logged.ps3-pad-console-connected:not(.ps3-pad-page-active):not
 #game-modal #modal-badges.rawg-badge-row { margin-bottom: 3px !important; }
 #game-modal #modal-badges.rawg-badge-row .rawg-alt2-panel { margin: -2px 0 1px 0 !important; }
 
+
+/* --- GAME MODAL / GAME LANGUAGE METADATA --- */
+#game-modal .game-modal-languages { display:flex; flex-direction:column; gap:6px; min-width:0; margin:0 0 11px; }
+#game-modal .game-modal-languages-header { display:flex; align-items:center; justify-content:space-between; gap:10px; min-width:0; }
+#game-modal .game-modal-languages-label { display:inline-flex; align-items:center; gap:5px; min-height:16px; color:var(--text-muted); font-size:10px; font-weight:750; line-height:16px; letter-spacing:.15px; }
+#game-modal .game-modal-languages-label i { color:#66ccff; font-size:10px; line-height:1; }
+#game-modal .game-modal-languages-items { display:flex; align-items:center; flex-wrap:wrap; gap:5px; min-width:0; }
+#game-modal .game-modal-language-chip { display:inline-flex; align-items:center; min-height:22px; height:22px; max-width:100%; padding:0 8px; font-size:10px; font-weight:700; border:1px solid rgba(102,204,255,.22); background:rgba(102,204,255,.065); color:rgba(223,241,255,.91); overflow-wrap:anywhere; white-space:normal; }
+#game-modal .game-modal-languages-source { flex:0 0 auto; font-size:9px; line-height:16px; color:rgba(255,255,255,.37); text-decoration:none; white-space:nowrap; }
+#game-modal .game-modal-languages-source:hover { color:#66ccff; }
+#game-modal #modal-badges.has-game-modal-languages { margin-bottom:5px !important; }
+@media (max-width:559px) {
+  #game-modal .game-modal-languages { order:3 !important; width:100%; }
+}
+
 /* ========================================================================== METADATA CHIP ALIGNMENT ========================================================================== */
 
 #game-modal .rawg-chip { height: 22px; min-height: 22px; align-items: center; justify-content: center; line-height: 1 !important; padding-top: 0 !important; padding-bottom: 0 !important; }
@@ -39806,6 +39821,151 @@ P
 		if (typeof window.tryOpenPendingContentDeepLink === 'function') window.tryOpenPendingContentDeepLink({ reason: 'prefetch' });
 	});
 
+
+	const GAME_DB_LANGUAGE_CACHE_KEY = 'psn_gamedb_languages_v3_';
+	const GAME_DB_LANGUAGE_TTL = 30 * 24 * 60 * 60 * 1000;
+	const gameDbLanguageMemory = new Map();
+	const gameDbLanguagePending = new Map();
+	const gameDbLanguageNames = {
+		en:'English',eng:'English',english:'English',fr:'French',fra:'French',fre:'French',french:'French',
+		de:'German',deu:'German',ger:'German',german:'German',es:'Spanish',spa:'Spanish',spanish:'Spanish',
+		it:'Italian',ita:'Italian',italian:'Italian',pt:'Portuguese',por:'Portuguese',portuguese:'Portuguese',
+		'pt-br':'Portuguese (Brazil)','pt-pt':'Portuguese (Portugal)',ja:'Japanese',jp:'Japanese',jpn:'Japanese',japanese:'Japanese',
+		ko:'Korean',kor:'Korean',korean:'Korean',zh:'Chinese',zho:'Chinese',chi:'Chinese',chinese:'Chinese',
+		'zh-cn':'Chinese (Simplified)','zh-tw':'Chinese (Traditional)',ru:'Russian',rus:'Russian',russian:'Russian',
+		nl:'Dutch',nld:'Dutch',dut:'Dutch',dutch:'Dutch',pl:'Polish',pol:'Polish',polish:'Polish',
+		sv:'Swedish',se:'Swedish',swe:'Swedish',swedish:'Swedish',fi:'Finnish',fin:'Finnish',finnish:'Finnish',
+		no:'Norwegian',nor:'Norwegian',norwegian:'Norwegian',da:'Danish',dk:'Danish',dan:'Danish',danish:'Danish',
+		el:'Greek',gr:'Greek',greek:'Greek',tr:'Turkish',tur:'Turkish',turkish:'Turkish',
+		ar:'Arabic',ara:'Arabic',arabic:'Arabic',cs:'Czech',cz:'Czech',cze:'Czech',czech:'Czech',
+		hu:'Hungarian',hun:'Hungarian',hungarian:'Hungarian',sk:'Slovak',slk:'Slovak',slovak:'Slovak',
+		th:'Thai',tha:'Thai',thai:'Thai',id:'Indonesian',ind:'Indonesian',indonesian:'Indonesian',
+		vi:'Vietnamese',vie:'Vietnamese',vietnamese:'Vietnamese',he:'Hebrew',heb:'Hebrew',hebrew:'Hebrew'
+	};
+
+	function normalizeGameDbLanguage(value) {
+		const input = String(value == null ? '' : value).trim().replace(/_/g, '-');
+		if (!input || input.length > 50 || /^(?:unknown|none|n\/a|multi(?:ple)?languages?|undetermined|all)$/i.test(input)) return '';
+		const key = input.toLowerCase().replace(/\s+/g, ' ').replace(/\s*\((?:us|uk)\)$/g, '');
+		const mapped = gameDbLanguageNames[key];
+		if (mapped) return mapped;
+		if (/^portugu[eê]s\s*\(?brasil\)?$/i.test(input)) return 'Portuguese (Brazil)';
+		if (/^portugu[eê]s\s*\(?portugal\)?$/i.test(input)) return 'Portuguese (Portugal)';
+		if (/^portugu[eê]s$/i.test(input)) return 'Portuguese';
+		if (/^[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ ()-]{2,39}$/.test(input) && !/^(?:language|languages|text|audio|subtitle|subtitles)$/i.test(input)) return input;
+		return '';
+	}
+
+	function extractGameDbLanguages(data, filename = '') {
+		const values = [];
+		const seen = new Set();
+		const add = raw => {
+			if (typeof raw !== 'string') return;
+			raw.split(/[,;|\n/]+/).forEach(entry => {
+				const name = normalizeGameDbLanguage(entry);
+				if (name && !seen.has(name.toLowerCase()) && values.length < 32) { seen.add(name.toLowerCase()); values.push(name); }
+			});
+		};
+		const visit = (value, depth = 0, explicitLanguage = false) => {
+			if (depth > 6 || values.length >= 32 || value == null) return;
+			if (typeof value === 'string') { if (explicitLanguage) add(value); return; }
+			if (Array.isArray(value)) { value.slice(0, 100).forEach(item => visit(item, depth + 1, explicitLanguage)); return; }
+			if (typeof value !== 'object') return;
+			if (explicitLanguage) {
+				const direct = value.value ?? value.values ?? value.name ?? value.names ?? value.code ?? value.codes ?? value.list;
+				if (direct != null) visit(direct, depth + 1, true);
+				else Object.entries(value).slice(0, 50).forEach(([key, item]) => {
+					if (item === true || item === 1) add(key);
+					else if (typeof item === 'string' || Array.isArray(item)) visit(item, depth + 1, true);
+				});
+				return;
+			}
+			Object.entries(value).slice(0, 150).forEach(([key, item]) => {
+				if (/^languages?$/i.test(key)) visit(item, depth + 1, true);
+				else if (item && typeof item === 'object') visit(item, depth + 1, false);
+			});
+		};
+		visit(data, 0, /(?:^|[._-])languages?(?:[._-]|$)/i.test(filename));
+		return values;
+	}
+
+	function getGameDbPlatform(tag) {
+		return ({ ps3:'PS3', ps2:'PS2', psx:'PSX', ps1:'PSX', psone:'PSX', psp:'PSP' })[String(tag || '').trim().toLowerCase()] || '';
+	}
+
+	function getGameDbIdentity(game) {
+		if (!game) return null;
+		const classifiedTag = String(game.cTag || game.console || '').trim().toLowerCase();
+		const platform = getGameDbPlatform(classifiedTag || (typeof processGameInfo === 'function'
+			? processGameInfo(game.cleanName || game.name || game.title || '', 'games', game.id || game.titleId || '', game.contentId || '').cTag : ''));
+		if (!platform) return null;
+		const format = value => {
+			const raw = String(value || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+			return /^[A-Z]{4}\d{5}$/.test(raw) ? `${raw.slice(0, 4)}-${raw.slice(4)}` : '';
+		};
+		let serial = format(game.id) || format(game.titleId);
+		if (!serial) {
+			const contentId = String(game.contentId || '').toUpperCase();
+			const embedded = contentId.match(/(?:^|[^A-Z0-9])([A-Z]{4}\d{5})(?=[^A-Z0-9]|$)/);
+			if (embedded) serial = format(embedded[1]);
+		}
+		return serial ? { platform, serial } : null;
+	}
+
+	async function loadGameDbLanguages(platform, serial) {
+		if (!['PS3', 'PS2', 'PSX', 'PSP'].includes(platform)) return [];
+		const key = `${platform}:${serial}`;
+		const cached = gameDbLanguageMemory.get(key);
+		if (cached && Date.now() - cached.at < (cached.failed ? 2 * 60 * 1000 : cached.languages.length ? GAME_DB_LANGUAGE_TTL : 24 * 60 * 60 * 1000)) return cached.languages;
+		try {
+			const stored = JSON.parse(localStorage.getItem(GAME_DB_LANGUAGE_CACHE_KEY + key) || 'null');
+			if (stored && Array.isArray(stored.languages) && Date.now() - Number(stored.at) < (stored.languages.length ? GAME_DB_LANGUAGE_TTL : 24 * 60 * 60 * 1000)) {
+				gameDbLanguageMemory.set(key, stored);
+				return stored.languages;
+			}
+		} catch (e) {}
+		if (gameDbLanguagePending.has(key)) return gameDbLanguagePending.get(key);
+		const pending = (async () => {
+			const response = await fetch(`https://raw.githubusercontent.com/niemasd/GameDB-${platform}/main/games/${serial}/language.txt`, { cache:'force-cache' });
+			if (!response.ok && response.status !== 404) throw new Error('GameDB language lookup unavailable');
+			const languages = response.ok ? extractGameDbLanguages(await response.text(), 'language.txt') : [];
+			const record = { at:Date.now(), languages };
+			gameDbLanguageMemory.set(key, record);
+			while (gameDbLanguageMemory.size > 140) gameDbLanguageMemory.delete(gameDbLanguageMemory.keys().next().value);
+			try { localStorage.setItem(GAME_DB_LANGUAGE_CACHE_KEY + key, JSON.stringify(record)); } catch (e) {}
+			return languages;
+		})();
+		gameDbLanguagePending.set(key, pending);
+		try { return await pending; }
+		catch (error) {
+			gameDbLanguageMemory.set(key, { at: Date.now(), languages: [], failed: true });
+			throw error;
+		} finally { gameDbLanguagePending.delete(key); }
+	}
+
+	function startGameDbLanguageLookup(game, category, modal, hydrationToken) {
+		if (category !== 'games' || !modal) return;
+		const identity = getGameDbIdentity(game);
+		if (!identity) return;
+		loadGameDbLanguages(identity.platform, identity.serial).then(languages => {
+			if (!languages.length || !modal.isConnected || String(modal.dataset.openHydrationToken || '') !== String(hydrationToken)) return;
+			if (String(modal.dataset.storeCategory || '') !== category || String(modal.dataset.titleId || '') !== String(game.id || game.titleId || '')) return;
+			const details = modal.querySelector('.modal-details');
+			const badges = details?.querySelector('#modal-badges');
+			if (!badges) return;
+			let row = details.querySelector('.game-modal-languages');
+			if (!row) {
+				row = document.createElement('div');
+				row.className = 'game-modal-languages';
+				badges.insertAdjacentElement('afterend', row);
+			}
+			const escape = value => String(value).replace(/[&<>"']/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
+			row.innerHTML = `<div class="game-modal-languages-header"><span class="game-modal-languages-label"><i class="fas fa-language" aria-hidden="true"></i>Languages</span><a class="game-modal-languages-source" href="https://github.com/niemasd/GameDB-${identity.platform}" title="Language source: GameDB-${identity.platform}" target="_blank" rel="noopener noreferrer">GameDB</a></div><div class="game-modal-languages-items" data-no-translate="true" translate="no">${languages.map(name => `<span class="rawg-chip game-modal-language-chip">${escape(name)}</span>`).join('')}</div>`;
+			badges.classList.add('has-game-modal-languages');
+			if (typeof window.scheduleInterfaceTranslationAfterUiChange === 'function') window.scheduleInterfaceTranslationAfterUiChange(row);
+		}).catch(() => {});
+	}
+
     window.openModal = function(index, forcedPsnStoreSummary = '', forceCompactDlc = false, originCard = null, modalOptions = null) {
 		const modalOpts = modalOptions && typeof modalOptions === 'object' ? modalOptions : {};
 		const modalInfoOnly = modalOpts.infoOnly === true;
@@ -40032,6 +40192,7 @@ P
 				</div>
 				${modalInfoOnly ? '' : `<div class="modal-divider" style="margin: 15px 0;"></div><div class="btn-group" id="modal-links-actions" style="margin-top: 0;">${actionsHtml}</div>`}
 			`;
+			startGameDbLanguageLookup(game, currentCat, modal, hydrationToken);
 			if (isPsnStoreSummaryCat) {
 				const summaryEl = document.getElementById('modal-summary');
 				const badgesEl = document.getElementById('modal-badges');
@@ -56337,44 +56498,104 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 	};
 	
 	window.gameNameCache = window.gameNameCache || {};
-
-	async function getGameName(id) {
-		id = id.toUpperCase();
-	
-		if (window.gameNameCache[id]) {
-			return window.gameNameCache[id];
-		}
-	
-		try {
-			const response = await fetch(`https://r.jina.ai/http://www.gametdb.com/PS3/${id}`);
-			const text = await response.text();
-	
-			let title = null;
-			let match = text.match(/title\s*\(EN\)\s*([^\n\r]+)/i);
-	
-			if (match) {
-				title = match[1].trim();
-			}
-	
-			if (!title) {
-				match = text.match(new RegExp(`#\\s*${id}\\s*-\\s*([^\\n\\r]+)`, "i"));
-				if (match) {
-					title = match[1].trim();
+	const revivedGameNamePending = new Map();
+	const revivedGameNameMisses = new Map();
+	const revivedGameNamePlatformCache = new Map();
+	const revivedGameNameQueue = [];
+	let revivedGameNameActive = 0;
+	function enqueueRevivedGameNameLookup(task) {
+		return new Promise((resolve, reject) => {
+			revivedGameNameQueue.push({ task, resolve, reject });
+			const drain = () => {
+				while (revivedGameNameActive < 6 && revivedGameNameQueue.length) {
+					const next = revivedGameNameQueue.shift();
+					revivedGameNameActive++;
+					Promise.resolve().then(next.task).then(next.resolve, next.reject).finally(() => {
+						revivedGameNameActive--;
+						drain();
+					});
 				}
-			}
-	
-			if (title) {
-				title = title.replace(/developer.*/i, "").trim();
-				window.gameNameCache[id] = title;
-				return title;
-			}
-		} catch (err) {
-			console.error("Game lookup failed:", id);
-		}
-	
-		return id;
+			};
+			drain();
+		});
 	}
-	
+
+	function isValidRevivedGameName(value, id = '') {
+		const name = String(value || '').replace(/\s+/g, ' ').trim();
+		return name.length > 1 && name.length <= 180
+			&& !/^(?:unknown(?:\s*(?:title|game|name|\([^)]*\)))?|missing|n\/?a|undefined|no\s+title|untitled)$/i.test(name)
+			&& name.toUpperCase() !== id
+			&& !/[<>\x00-\x1f]/.test(name);
+	}
+
+	function getRevivedGameDbPlatform(id, consoleTag = '', sourceName = '') {
+		const supplied = getGameDbPlatform(consoleTag);
+		if (supplied) return supplied;
+		const classified = typeof processGameInfo === 'function'
+			? processGameInfo(sourceName, 'games', id, '').cTag : '';
+		return getGameDbPlatform(classified);
+	}
+
+	async function getGameName(id, consoleTag = '', sourceName = '', hasCatalogMatch = false) {
+		id = String(id || '').trim().toUpperCase();
+		const compactId = id.replace(/-/g, '');
+		if (!/^[A-Z]{4}\d{5}$/.test(compactId)) return id;
+		const platform = getRevivedGameDbPlatform(compactId, consoleTag, sourceName);
+		if (!platform) return id;
+		const requestKey = `${platform}:${compactId}`;
+		const cachedName = window.gameNameCache[requestKey];
+		if (isValidRevivedGameName(cachedName, compactId)) return cachedName;
+		if (revivedGameNamePending.has(requestKey)) return revivedGameNamePending.get(requestKey);
+		if ((revivedGameNameMisses.get(requestKey) || 0) > Date.now()) return id;
+
+		const pending = enqueueRevivedGameNameLookup(async () => {
+			const serial = `${compactId.slice(0, 4)}-${compactId.slice(4)}`;
+			const fetchTitle = async db => {
+				try {
+					const response = await fetch(`https://raw.githubusercontent.com/niemasd/GameDB-${db}/main/games/${serial}/title.txt`, { cache: 'force-cache' });
+					if (!response.ok) return '';
+					const name = (await response.text()).replace(/^\uFEFF/, '').split(/\r?\n/, 1)[0].trim();
+					return isValidRevivedGameName(name, compactId) ? name : '';
+				} catch (error) { return ''; }
+			};
+
+			let name = await fetchTitle(platform);
+			let resolvedPlatform = platform;
+			if (!name && !hasCatalogMatch && platform === 'PS2' && /^[SC][A-Z]{3}\d{5}$/.test(compactId)) {
+				name = await fetchTitle('PSX');
+				if (name) resolvedPlatform = 'PSX';
+			}
+			if (name) {
+				window.gameNameCache[requestKey] = name;
+				revivedGameNamePlatformCache.set(requestKey, resolvedPlatform);
+				return name;
+			}
+
+			if (platform === 'PS3') {
+				try {
+					const response = await fetch(`https://r.jina.ai/http://www.gametdb.com/PS3/${compactId}`);
+					if (response.ok) {
+						const text = await response.text();
+						let match = text.match(/title\s*\(EN\)\s*([^\n\r]+)/i);
+						if (!match) match = text.match(new RegExp(`#\\s*${compactId}\\s*-\\s*([^\\n\\r]+)`, 'i'));
+						if (match) {
+							name = match[1].replace(/developer.*/i, '').trim();
+							if (isValidRevivedGameName(name, compactId)) {
+								window.gameNameCache[requestKey] = name;
+								return name;
+							}
+						}
+					}
+				} catch (error) {}
+			}
+			revivedGameNameMisses.set(requestKey, Date.now() + 10 * 60 * 1000);
+			return id;
+		});
+		revivedGameNamePending.set(requestKey, pending);
+		try { return await pending; }
+		finally { revivedGameNamePending.delete(requestKey); }
+	}
+
 	window.renderServerGamesCards = async function (containerId, idsArray, isSilent = false, options = {}) {
 		isSilent = isSilent || !!window.isRestoringHistory;
 		const container = document.getElementById(containerId);
@@ -56434,12 +56655,10 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 				}
 			}
 
-			const rawDisplayName =
-				gameData?.cleanName ||
-				gameData?.title ||
-				gameData?.name ||
-				window.gameNameCache?.[id] ||
-				`Unknown (${id})`;
+			const platform = getRevivedGameDbPlatform(id, gameData?.cTag, gameData?.cleanName || gameData?.name || gameData?.title || '');
+			const knownName = [gameData?.cleanName, gameData?.title, gameData?.name, window.gameNameCache?.[`${platform}:${id.replace(/-/g, '')}`]]
+				.find(name => isValidRevivedGameName(name, id));
+			const rawDisplayName = knownName || `Unknown (${id})`;
 			const displayIdentity = gameData || { id, titleId:id, category:'games' };
 			const displayName = typeof window.getEffectiveContentTitle === 'function'
 				? (window.getEffectiveContentTitle(displayIdentity, 'games', rawDisplayName) || rawDisplayName)
@@ -56450,7 +56669,9 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 				gameData,
 				isInStore,
 				displayName,
-				needsNameLookup: !gameData?.cleanName && !gameData?.title && !gameData?.name && !window.gameNameCache?.[id]
+				consoleTag: gameData?.cTag || '',
+				gameDbPlatform: platform,
+				needsNameLookup: !knownName
 			});
 		});
 	
@@ -56471,7 +56692,7 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 		processedItems.forEach((item, idx) => {
 			const id = item.id;
 			const isMissing = !item.isInStore;
-			const consoleTag = item.gameData?.cTag || "ps3";
+			const consoleTag = item.consoleTag || (item.gameDbPlatform === 'PSX' ? 'psx' : (item.gameDbPlatform || 'ps3').toLowerCase());
 			const contentId = item.gameData?.contentId || item.gameData?.contentID || '';
 			const region = item.gameData?.region || '';
 			const githubCoverUrl = getOptimizedCover(id);
@@ -56558,7 +56779,7 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 		processedItems
 			.filter(item => item.needsNameLookup)
 			.forEach(async (item) => {
-				const fetchedName = await getGameName(item.id);
+				const fetchedName = await getGameName(item.id, item.consoleTag, item.gameData?.cleanName || '', !!item.consoleTag);
 				if (isCurrentRender && !isCurrentRender()) return;
 	
 				if (!fetchedName || fetchedName === item.id) return;
@@ -56576,6 +56797,10 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 	
 				if (imgEl) {
 					imgEl.dataset.name = fetchedName;
+					if (!item.consoleTag) {
+						const foundPlatform = revivedGameNamePlatformCache.get(`${item.gameDbPlatform}:${item.id.replace(/-/g, '')}`);
+						if (foundPlatform) imgEl.dataset.console = foundPlatform.toLowerCase();
+					}
 				}
 			});
 	};
