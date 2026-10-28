@@ -9421,6 +9421,16 @@ html.psn-scroll-nav-active #psn-floating-status-dock {--psn-status-right:82px;}
 					</button>
 				</div>
 
+				<div class="setting-item" id="repair-cached-data-setting" onmouseenter="playUiHover()">
+					<div>
+						<div style="font-size: 18px; color: #fff; font-weight: 500;">Repair Cached Data</div>
+						<div style="font-size: 13px; color: var(--text-muted); margin-top: 6px;">Rebuild locally cached chat, covers, game details and languages. Keeps your account, collections, downloads and settings.</div>
+					</div>
+					<button type="button" class="ps5-pill-btn ps5-pill-secondary ps5-pill-compact" id="btn-repair-cached-data" onmouseenter="if(typeof playUiHover === 'function') playUiHover()" onclick="if(typeof playUiClick === 'function') playUiClick(); repairPsnCachedData()">
+						<i class="fas fa-tools"></i> REPAIR
+					</button>
+				</div>
+
 				<div class="settings-section-label">Console</div>
 				<div class="setting-item" id="companion-plugin-setting" onmouseenter="playUiHover()">
 					<div>
@@ -41717,6 +41727,7 @@ P
 	}
 
 	function scheduleGameModalResolvedMetadataWrite(cacheKey, entry) {
+		if (window.__psnCacheRepairInProgress) return;
 		if (!cacheKey || !entry || !entry.snapshot || typeof indexedDB === 'undefined') return;
 		gameModalResolvedPendingWrites.set(cacheKey, { key: cacheKey, schemaVersion: GAME_MODAL_RESOLVED_CACHE_SCHEMA, at: Number(entry.at) || Date.now(), snapshot: entry.snapshot });
 		if (gameModalResolvedWriteHandle) return;
@@ -53923,6 +53934,100 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 	document.addEventListener('DOMContentLoaded', initCarouselWhenReady);
 	document.addEventListener('visibilitychange', handleHeroVisibilityChange);
 	
+
+	async function clearPsnRepairCacheStore(openDatabase, storeName, key) {
+		if (typeof indexedDB === 'undefined') return true;
+		let db = null;
+		try {
+			let openTimeout = 0;
+			try {
+				db = await Promise.race([
+					Promise.resolve().then(openDatabase),
+					new Promise(resolve => { openTimeout = setTimeout(() => resolve(null), 3000); })
+				]);
+			} finally { clearTimeout(openTimeout); }
+		} catch (error) { return false; }
+		if (!db) return false;
+		if (!db.objectStoreNames.contains(storeName)) return true;
+		return new Promise(resolve => {
+			let finished = false;
+			let tx = null;
+			const finish = ok => {
+				if (finished) return;
+				finished = true;
+				clearTimeout(timeout);
+				resolve(ok);
+			};
+			const timeout = setTimeout(() => {
+				try { if (tx) tx.abort(); } catch (error) {}
+				finish(false);
+			}, 3500);
+			try {
+				tx = db.transaction(storeName, 'readwrite');
+				const store = tx.objectStore(storeName);
+				if (key) store.delete(key);
+				else store.clear();
+				tx.oncomplete = () => finish(true);
+				tx.onerror = () => finish(false);
+				tx.onabort = () => finish(false);
+			} catch (error) { finish(false); }
+		});
+	}
+
+	async function repairPsnCachedData() {
+		const button = document.getElementById('btn-repair-cached-data');
+		if (!button || window.__psnCacheRepairInProgress) return false;
+		if (!confirm('Repair locally cached data on this device?\n\nThe chat history, covers, game details and languages will be downloaded again. Your account, messages on the server, lists, downloads and settings will be kept.\n\nThe site will reload when the repair finishes.')) return false;
+
+		window.__psnCacheRepairInProgress = true;
+		const original = button.innerHTML;
+		button.disabled = true;
+		button.innerHTML = '<i class="fas fa-sync-alt fa-spin"></i> REPAIRING...';
+		try {
+			clearTimeout(window.__chatCacheWriteTimer);
+			window.__chatCacheWriteTimer = null;
+			window.__chatCacheReadyForWrite = false;
+			window.__chatCacheSessionToken = Number(window.__chatCacheSessionToken || 0) + 1;
+			if (typeof gameModalResolvedWriteHandle !== 'undefined' && gameModalResolvedWriteHandle) {
+				if (typeof requestIdleCallback === 'function' && typeof cancelIdleCallback === 'function') cancelIdleCallback(gameModalResolvedWriteHandle);
+				else clearTimeout(gameModalResolvedWriteHandle);
+				gameModalResolvedWriteHandle = 0;
+			}
+			if (typeof gameModalResolvedPendingWrites !== 'undefined') gameModalResolvedPendingWrites.clear();
+			clearTimeout(window.__cardCoverSrcCacheSaveTimer);
+			window.__cardCoverSrcCacheSaveTimer = null;
+
+			const results = await Promise.all([
+				clearPsnRepairCacheStore(
+					() => openGameModalResolvedMetadataDb(), GAME_MODAL_RESOLVED_IDB_STORE
+				),
+				getChatCacheUserName()
+					? clearPsnRepairCacheStore(() => openChatPersistentCacheDb(), CHAT_CACHE_STORE, getChatCacheUserName())
+					: Promise.resolve(true)
+			]);
+			if (results.some(ok => !ok)) throw new Error('Could not clear one or more local cache databases.');
+
+			const cacheKeys = /^(?:psn_card_cover_src_cache_v\d+|psn_server_content_limits_v\d+|psn_global_content_download_counts_v\d+)$/i;
+			for (let i = localStorage.length - 1; i >= 0; i--) {
+				const key = localStorage.key(i);
+				if (key && (cacheKeys.test(key) || /^psn_gamedb_languages_v\d+_/i.test(key))) localStorage.removeItem(key);
+			}
+			button.innerHTML = '<i class="fas fa-check"></i> REPAIRED';
+			if (typeof playUiSuccess === 'function') playUiSuccess();
+			window.location.reload();
+			return true;
+		} catch (error) {
+			console.error('[CACHE REPAIR]', error);
+			button.innerHTML = '<i class="fas fa-exclamation-triangle"></i> RETRY';
+			if (typeof playUiError === 'function') playUiError();
+			setTimeout(() => {
+				button.disabled = false;
+				button.innerHTML = original;
+				window.__psnCacheRepairInProgress = false;
+			}, 2500);
+			return false;
+		}
+	}
 
 	async function clearAppCache() {
 		const btn = document.getElementById('btn-sync-db');
@@ -71834,6 +71939,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
     }
 
     async function writeChatPersistentCacheNow() {
+        if (window.__psnCacheRepairInProgress) return false;
         const userName = getChatCacheUserName();
         const sessionToken = Number(window.__chatCacheSessionToken || 0);
         if (!userName || window.__chatCacheReadyForWrite !== true || window.__chatCacheHydratedUser !== userName) return false;
