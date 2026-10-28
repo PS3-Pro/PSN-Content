@@ -5260,6 +5260,22 @@ function normalizeContentMetadataUrlList(value, maxItems = 8, maxLength = 1600) 
   return out;
 }
 
+function normalizeContentMetadataLanguages(value, max = 24) {
+  const parts = Array.isArray(value) ? value : String(value == null ? '' : value).split(/[,;|\r\n/]+/);
+  const seen = new Set();
+  const result = [];
+  for (const part of parts) {
+    const name = String(part == null ? '' : part).trim().slice(0, 50);
+    if (!name || !/^[\p{L}][\p{L}\p{M} ()-]*$/u.test(name)) continue;
+    const key = name.toLocaleLowerCase('en');
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push(name);
+    if (result.length >= max) break;
+  }
+  return result;
+}
+
 function normalizeContentMetadataOverride(data = {}) {
   const identity = normalizeStoreContentIdentity(data);
   if (!identity.reportKey) return null;
@@ -5275,6 +5291,7 @@ function normalizeContentMetadataOverride(data = {}) {
   if (coverUrl && !/^https?:\/\//i.test(coverUrl)) coverUrl = '';
   const hasScreenshotsOverride = Object.prototype.hasOwnProperty.call(data, 'screenshots') && data.screenshots !== null && data.screenshots !== undefined;
   const screenshots = hasScreenshotsOverride ? normalizeContentMetadataUrlList(data.screenshots, 8, 1600) : null;
+  const languages = Array.isArray(data.languages) ? normalizeContentMetadataLanguages(data.languages) : null;
   const entry = {
     metadataKey: identity.reportKey,
     category: identity.category,
@@ -5288,11 +5305,12 @@ function normalizeContentMetadataOverride(data = {}) {
     genres: normalizeContentMetadataList(data.genres, 8, 60),
     tags: normalizeContentMetadataList(data.tags, 16, 60),
     screenshots,
+    languages,
     director: normalizeContentMetadataString(data.director, 160).replace(/[\r\n\t]+/g, ' '),
     updatedBy: normalizeText(data.updatedBy || data.updated_by, '').slice(0, 120),
     updatedAt: data.updatedAt || data.updated_at || new Date().toISOString()
   };
-  entry.hasValues = !!(entry.title || entry.summary || entry.coverUrl || entry.score !== null || entry.year || entry.genres.length || entry.tags.length || entry.director || Array.isArray(entry.screenshots));
+  entry.hasValues = !!(entry.title || entry.summary || entry.coverUrl || entry.score !== null || entry.year || entry.genres.length || entry.tags.length || entry.director || Array.isArray(entry.screenshots) || Array.isArray(entry.languages));
   const updatedAtMs = Date.parse(entry.updatedAt || '');
   Object.defineProperty(entry, '__metadataUpdatedAtMs', { value: Number.isFinite(updatedAtMs) ? updatedAtMs : 0, configurable: true });
   return entry;
@@ -5311,9 +5329,17 @@ function normalizeContentMetadataOverrideRow(row = {}) {
 }
 
 
-const CONTENT_METADATA_EDIT_FIELDS = Object.freeze(['title','coverUrl','summary','score','year','director','genres','tags','screenshots']);
+const CONTENT_METADATA_EDIT_FIELDS = Object.freeze(['title','coverUrl','summary','score','year','director','genres','tags','screenshots','languages']);
 
 function normalizeContentMetadataSuggestionField(field, rawValue, strict = false) {
+  if (field === 'languages') {
+    const raw = Array.isArray(rawValue) ? rawValue : String(rawValue == null ? '' : rawValue).split(/[,;|\r\n/]+/);
+    const pieces = raw.map(part => String(part == null ? '' : part).trim()).filter(Boolean);
+    if (strict && (pieces.length > 24 || pieces.some(part => part.length > 50 || !/^[\p{L}][\p{L}\p{M} ()-]*$/u.test(part)))) {
+      return { ok:false, message:'Use up to 24 valid language names separated by commas.' };
+    }
+    return { ok:true, value:normalizeContentMetadataLanguages(pieces) };
+  }
   if (field === 'genres') return { ok: true, value: normalizeContentMetadataList(rawValue, 8, 60) };
   if (field === 'tags') return { ok: true, value: normalizeContentMetadataList(rawValue, 16, 60) };
   if (field === 'screenshots') {
@@ -5503,7 +5529,8 @@ function contentMetadataOverrideEntryEquals(a, b) {
       || a.title !== b.title || a.summary !== b.summary || a.coverUrl !== b.coverUrl || a.score !== b.score || a.year !== b.year
       || a.director !== b.director || a.updatedBy !== b.updatedBy || a.updatedAt !== b.updatedAt) return false;
   const screenshotsEqual = (a.screenshots === null && b.screenshots === null) || contentMetadataOverrideArrayEquals(a.screenshots, b.screenshots);
-  return screenshotsEqual
+  const languagesEqual = (a.languages === null && b.languages === null) || contentMetadataOverrideArrayEquals(a.languages, b.languages);
+  return screenshotsEqual && languagesEqual
       && contentMetadataOverrideArrayEquals(a.genres, b.genres)
       && contentMetadataOverrideArrayEquals(a.tags, b.tags);
 }
@@ -5613,6 +5640,7 @@ function toPublicContentMetadataOverride(entry) {
   if (Array.isArray(entry.genres) && entry.genres.length) out.genres = entry.genres;
   if (Array.isArray(entry.tags) && entry.tags.length) out.tags = entry.tags;
   if (Array.isArray(entry.screenshots)) out.screenshots = entry.screenshots;
+  if (Array.isArray(entry.languages)) out.languages = entry.languages;
   if (entry.director) out.director = entry.director;
   if (entry.updatedBy) out.updatedBy = entry.updatedBy;
   try { Object.defineProperty(entry, '__publicContentMetadataOverride', { value: out, configurable: true }); } catch (e) {}
@@ -5639,6 +5667,7 @@ async function saveContentMetadataOverrideToDb(normalized, updatedBy, client = n
     genres: normalized.genres, tags: normalized.tags, director: normalized.director
   };
   if (Array.isArray(normalized.screenshots)) payload.screenshots = normalized.screenshots;
+  if (Array.isArray(normalized.languages)) payload.languages = normalized.languages;
   const sql = `INSERT INTO content_metadata_overrides (metadata_key, category, title_id, content_id, data, updated_by, created_at, updated_at)
      VALUES ($1,$2,$3,$4,$5::jsonb,$6,NOW(),NOW())
      ON CONFLICT (metadata_key)
