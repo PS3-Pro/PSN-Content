@@ -1,4 +1,4 @@
-FROM node:24-slim
+FROM node:26-slim
 
 ENV NODE_ENV=production
 ENV PORT=8080
