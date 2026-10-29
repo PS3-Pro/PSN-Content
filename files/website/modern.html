@@ -439,6 +439,11 @@ body.psn-keyboard-nav-active .promo-card.psn-keyboard-focused, body.psn-keyboard
 body.psn-keyboard-nav-active .friend-activity-item.psn-keyboard-focused, body.psn-keyboard-nav-active .user-notification-item.psn-keyboard-focused, body.psn-keyboard-nav-active .download-item.psn-keyboard-focused, body.psn-keyboard-nav-active .social-list-item.psn-keyboard-focused, body.psn-keyboard-nav-active .trophy-card.psn-keyboard-focused, body.psn-keyboard-nav-active .setting-item.psn-keyboard-focused, body.psn-keyboard-nav-active .player-stat-box.psn-keyboard-focused { transform: translateY(-2px); border-color: rgba(255,255,255,.38) !important; box-shadow: 0 8px 24px rgba(0,0,0,.32) !important; }
 body.psn-keyboard-nav-active button.psn-keyboard-focused, body.psn-keyboard-nav-active a.psn-keyboard-focused, body.psn-keyboard-nav-active select.psn-keyboard-focused, body.psn-keyboard-nav-active input.psn-keyboard-focused, body.psn-keyboard-nav-active label.psn-keyboard-focused, body.psn-keyboard-nav-active [role="button"].psn-keyboard-focused { outline-offset: 3px; }
 body:not(.psn-keyboard-nav-active) .psn-keyboard-focused { outline: none !important; }
+body.psn-keyboard-nav-active .psn-keyboard-focused.psn-keyboard-travel-arriving { outline-color: transparent !important; }
+body.psn-keyboard-nav-active .psn-keyboard-focused.psn-keyboard-travel-settling { transition: none !important; }
+#psn-keyboard-focus-traveler { position: fixed; inset: 0 auto auto 0; width: 0; height: 0; z-index: 2147480000; pointer-events: none; box-sizing: border-box; outline: 2px solid transparent; opacity: 0; visibility: hidden; transform: translate3d(0,0,0); }
+#psn-keyboard-focus-traveler.is-visible { opacity: 1; visibility: visible; }
+@media (prefers-reduced-motion: reduce) { #psn-keyboard-focus-traveler { display: none !important; } }
 
 /* ========================================================================== PROFILE DROPDOWN MENU ========================================================================== */
 #user-profile-trigger:hover { background: rgba(255,255,255,0.05); }
@@ -53639,12 +53644,14 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
         const fallback = document.getElementById('psn-ambient-cover-fallback');
         if (!layer || !fallback) return;
         window.__psnAmbientHoverReady = true;
-        if (!window.matchMedia('(hover: hover) and (pointer: fine)').matches) return;
 
         const colorCache = new Map();
         let activeCard = null;
         let activeToken = 0;
         let resetTimer = null;
+        let touchPointer = null;
+        let touchStartX = 0;
+        let touchStartY = 0;
         const selector = '.game-card, .promo-card, .recently-visited-discover-card';
         const clamp = value => Math.max(0, Math.min(255, Math.round(value)));
 
@@ -53768,13 +53775,58 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
             if (card && !(event.relatedTarget && card.contains(event.relatedTarget))) activate(card);
         },{passive:true});
         document.addEventListener('pointerout',event=>{
+            if (event.pointerType==='touch') return;
             const card=event.target.closest && event.target.closest(selector);
             if (!card || card!==activeCard || event.relatedTarget && card.contains(event.relatedTarget)) return;
             clearTimeout(resetTimer);
             resetTimer=setTimeout(reset,100);
         },{passive:true});
-        const hovered=document.querySelector('.game-card:hover, .promo-card:hover, .recently-visited-discover-card:hover');
-        if (hovered) activate(hovered);
+        document.addEventListener('focusin',event=>{
+            const card=event.target.closest && event.target.closest(selector);
+            if (!card) return;
+            if (document.body.classList.contains('psn-keyboard-nav-active') || event.target.matches(':focus-visible')) activate(card);
+        });
+        document.addEventListener('focusout',event=>{
+            const card=event.target.closest && event.target.closest(selector);
+            if (!card || card!==activeCard || card.contains(event.relatedTarget) || touchPointer!==null) return;
+            clearTimeout(resetTimer);
+            resetTimer=setTimeout(()=>{
+                if (card===activeCard && !card.contains(document.activeElement)) reset();
+            },100);
+        });
+        document.addEventListener('pointerdown',event=>{
+            if (event.pointerType!=='touch') return;
+            const card=event.target.closest && event.target.closest(selector);
+            if (!card) { reset(); return; }
+            touchPointer=event.pointerId;
+            touchStartX=event.clientX;
+            touchStartY=event.clientY;
+            activate(card);
+        },{passive:true});
+        document.addEventListener('pointermove',event=>{
+            if (event.pointerType!=='touch' || event.pointerId!==touchPointer) return;
+            if (Math.hypot(event.clientX-touchStartX,event.clientY-touchStartY)>14) {
+                touchPointer=null;
+                reset();
+            }
+        },{passive:true});
+        document.addEventListener('pointerup',event=>{
+            if (event.pointerType!=='touch' || event.pointerId!==touchPointer) return;
+            touchPointer=null;
+            clearTimeout(resetTimer);
+            resetTimer=setTimeout(reset,1300);
+        },{passive:true});
+        document.addEventListener('pointercancel',event=>{
+            if (event.pointerId!==touchPointer) return;
+            touchPointer=null;
+            reset();
+        },{passive:true});
+        if (window.matchMedia('(hover: hover)').matches) {
+            const hovered=document.querySelector('.game-card:hover, .promo-card:hover, .recently-visited-discover-card:hover');
+            if (hovered) activate(hovered);
+        }
+        const keyboardCard=document.querySelector('.game-card.psn-keyboard-focused, .promo-card.psn-keyboard-focused, .recently-visited-discover-card.psn-keyboard-focused');
+        if (keyboardCard && document.body.classList.contains('psn-keyboard-nav-active')) activate(keyboardCard);
     }
     window.runPsnAfterHomeInteractive(initPsnAmbientCoverHover,{beforeReveal:true});
 
@@ -109017,6 +109069,127 @@ function getVisibleChatStackEl(id) {
 		var lastKeyboardAt = 0;
 		var lastMoveSoundAt = 0;
 
+		var keyboardRing = null;
+		var keyboardRingAnimation = null;
+		var keyboardRingTarget = null;
+		var keyboardRingStart = null;
+		var keyboardRingEnd = null;
+		var keyboardRingFrame = 0;
+
+		function getKeyboardRing() {
+		    if (!keyboardRing) {
+		        keyboardRing = document.createElement('div');
+		        keyboardRing.id = 'psn-keyboard-focus-traveler';
+		        keyboardRing.setAttribute('aria-hidden', 'true');
+		        document.body.appendChild(keyboardRing);
+		    }
+		    return keyboardRing;
+		}
+
+		function readKeyboardRingState(element) {
+		    if (!element || !element.isConnected) return null;
+		    const rect = element.getBoundingClientRect();
+		    if (rect.width < 4 || rect.height < 4) return null;
+		    const style = getComputedStyle(element);
+		    return {
+		        x:rect.left, y:rect.top, w:rect.width, h:rect.height,
+		        radius:style.borderRadius, offset:style.outlineOffset,
+		        color:style.outlineColor, width:style.outlineWidth, type:style.outlineStyle
+		    };
+		}
+
+		function readMovingKeyboardRing() {
+		    if (!keyboardRingAnimation || !keyboardRing) return null;
+		    var rect = keyboardRing.getBoundingClientRect();
+		    var style = getComputedStyle(keyboardRing);
+		    return {
+		        x:rect.left, y:rect.top, w:rect.width, h:rect.height,
+		        radius:style.borderRadius, offset:style.outlineOffset,
+		        color:style.outlineColor, width:style.outlineWidth, type:style.outlineStyle
+		    };
+		}
+
+		function hideKeyboardRing() {
+		    if (keyboardRingFrame) cancelAnimationFrame(keyboardRingFrame);
+		    keyboardRingFrame = 0;
+		    if (keyboardRingAnimation) {
+		        keyboardRingAnimation.onfinish = null;
+		        keyboardRingAnimation.oncancel = null;
+		        keyboardRingAnimation.cancel();
+		        keyboardRingAnimation = null;
+		    }
+		    if (keyboardRingTarget) {
+		        var arrival = keyboardRingTarget;
+		        arrival.classList.remove('psn-keyboard-travel-arriving');
+		        if (arrival === keyboardTarget && document.body.classList.contains('psn-keyboard-nav-active')) {
+		            arrival.classList.add('psn-keyboard-travel-settling');
+		            getComputedStyle(arrival).outlineColor;
+		            requestAnimationFrame(function(){ arrival.classList.remove('psn-keyboard-travel-settling'); });
+		        }
+		    }
+		    keyboardRingTarget = null;
+		    keyboardRingStart = null;
+		    keyboardRingEnd = null;
+		    if (keyboardRing) keyboardRing.classList.remove('is-visible');
+		}
+
+		function keyboardRingKeyframe(state) {
+		    return {
+		        transform:'translate3d(' + state.x + 'px,' + state.y + 'px,0)',
+		        width:state.w + 'px', height:state.h + 'px',
+		        borderRadius:state.radius, outlineOffset:state.offset,
+		        outlineWidth:state.width, outlineColor:state.color
+		    };
+		}
+
+		function moveKeyboardRing(from, to, element) {
+		    hideKeyboardRing();
+		    if (!from || !to || !element || !element.isConnected ||
+		        window.matchMedia('(prefers-reduced-motion: reduce)').matches ||
+		        typeof Element.prototype.animate !== 'function') return;
+		    var ring = getKeyboardRing();
+		    ring.style.outline = to.width + ' ' + to.type + ' ' + to.color;
+		    ring.style.outlineOffset = to.offset;
+		    ring.style.borderRadius = to.radius;
+		    ring.style.width = to.w + 'px';
+		    ring.style.height = to.h + 'px';
+		    ring.style.transform = 'translate3d(' + to.x + 'px,' + to.y + 'px,0)';
+		    keyboardRingTarget = element;
+		    keyboardRingStart = from;
+		    keyboardRingEnd = to;
+		    element.classList.add('psn-keyboard-travel-arriving');
+		    ring.classList.add('is-visible');
+		    var animation = ring.animate([keyboardRingKeyframe(from), keyboardRingKeyframe(to)], {
+		        duration:300, easing:'cubic-bezier(.22,1,.36,1)', fill:'both'
+		    });
+		    keyboardRingAnimation = animation;
+		    var finish = function() {
+		        if (keyboardRingAnimation !== animation) return;
+		        hideKeyboardRing();
+		    };
+		    animation.onfinish = finish;
+		    animation.oncancel = finish;
+		    refreshKeyboardRing();
+		}
+
+		function refreshKeyboardRing() {
+		    if (!keyboardRingAnimation || keyboardRingFrame) return;
+		    keyboardRingFrame = requestAnimationFrame(function() {
+		        keyboardRingFrame = 0;
+		        if (!keyboardRingAnimation || !keyboardRingTarget || keyboardRingTarget !== keyboardTarget || !keyboardRingTarget.isConnected) {
+		            hideKeyboardRing();
+		            return;
+		        }
+		        var rect = keyboardRingTarget.getBoundingClientRect();
+		        var end = keyboardRingEnd;
+		        if (Math.abs(end.x - rect.left) > .1 || Math.abs(end.y - rect.top) > .1 || Math.abs(end.w - rect.width) > .1 || Math.abs(end.h - rect.height) > .1) {
+		            keyboardRingEnd = { ...end, x:rect.left, y:rect.top, w:rect.width, h:rect.height };
+		            keyboardRingAnimation.effect.setKeyframes([keyboardRingKeyframe(keyboardRingStart), keyboardRingKeyframe(keyboardRingEnd)]);
+		        }
+		        refreshKeyboardRing();
+		    });
+		}
+
 		function isKeyboardNativeControl(element) {
 			if (!element || !element.closest) return false;
 			var editable = element.closest('textarea,select,[contenteditable="true"],input');
@@ -109083,6 +109256,7 @@ function getVisibleChatStackEl(id) {
 			keyboardTarget = null;
 			window.__psnKeyboardNavTarget = null;
 			document.body.classList.remove('psn-keyboard-nav-active');
+			hideKeyboardRing();
 			if (!old) return;
 			old.classList.remove('psn-keyboard-focused');
 			if (blurCustom && document.activeElement === old && old.dataset && old.dataset.psnKeyboardTabindexAdded === '1' && typeof old.blur === 'function') old.blur();
@@ -109100,6 +109274,7 @@ function getVisibleChatStackEl(id) {
 		function setKeyboardTarget(element, playSound) {
 			if (!element || !isElementVisibleForKeyboard(element)) return false;
 			var old = keyboardTarget;
+			var from = old && old !== element ? (readMovingKeyboardRing() || readKeyboardRingState(old)) : null;
 			if (old && old !== element) {
 				old.classList.remove('psn-keyboard-focused');
 				removeKeyboardTabIndex(old);
@@ -109116,6 +109291,9 @@ function getVisibleChatStackEl(id) {
 			try { element.scrollIntoView({ block:'nearest', inline:'nearest', behavior:'auto' }); } catch (e) { try { element.scrollIntoView(false); } catch (ignore) {} }
 			var horizontalScroll = element.closest ? element.closest('.horizontal-scroll') : null;
 			if (horizontalScroll) horizontalScroll.scrollTop = 0;
+			if (old === element) hideKeyboardRing();
+			var to = readKeyboardRingState(element);
+			moveKeyboardRing(from, to, element);
 			if (playSound !== false) keyboardMoveSound();
 			return true;
 		}
@@ -109204,6 +109382,12 @@ function getVisibleChatStackEl(id) {
 			}
 			pulseKeyboardPress(element);
 			if (typeof element.click === 'function') element.click();
+			requestAnimationFrame(function(){
+				if (!keyboardTarget) return;
+				var overlay = getKeyboardOverlayScope();
+				if (!isElementVisibleForKeyboard(keyboardTarget) || overlay && !overlay.contains(keyboardTarget)) clearKeyboardTarget(false);
+				else refreshKeyboardRing();
+			});
 			return true;
 		}
 
