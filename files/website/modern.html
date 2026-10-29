@@ -1472,6 +1472,7 @@ html.ios-webkit #object-particles { contain:strict; }
 #psn-image-modal .psn-image-zoom-level:is(.psn-primary-pressed,.mobile-pressed) { transform:scale(.94); }
 #psn-image-modal { transition:opacity .28s ease !important; }
 #psn-image-modal.psn-image-closing { opacity:0 !important; pointer-events:none; animation:none !important; }
+#psn-image-modal.psn-image-morph-returning { transition:opacity .52s cubic-bezier(.4,0,.2,1) !important; }
 #psn-image-modal.psn-image-morph-opening { animation:psnImageViewerBackdropIn .24s ease-out both !important; }
 #psn-image-modal.psn-image-morph-ready { animation:none !important; }
 @keyframes psnImageViewerBackdropIn { from { opacity:0; } to { opacity:1; } }
@@ -25738,6 +25739,10 @@ P
 
 	function resetGameModalCardMorphStyles(modal) {
 		if (!modal) return;
+		if (modal.__psnCardMorphCloseOverlayAnimation) {
+			try { modal.__psnCardMorphCloseOverlayAnimation.cancel(); } catch (e) {}
+			delete modal.__psnCardMorphCloseOverlayAnimation;
+		}
 		if (modal.__psnCardMorphSettlingAnimation) {
 			try { modal.__psnCardMorphSettlingAnimation.cancel(); } catch (e) {}
 			delete modal.__psnCardMorphSettlingAnimation;
@@ -26569,6 +26574,7 @@ P
 		const coverEndClip = nearTopOcclusion ? getPsnMorphClipInset(topOcclusionBottom, destination.cover.rect.top, 1) : coverStartClip;
 
 		let completed = false;
+		let closeOverlayAnimation = null;
 		try {
 			const overlayAnimation = modal.animate([
 				{ backgroundColor:'rgba(0,0,0,.4)', backdropFilter:'blur(8px)' },
@@ -26576,6 +26582,8 @@ P
 				{ offset:.76, backgroundColor:'rgba(0,0,0,.04)', backdropFilter:'blur(.5px)' },
 				{ backgroundColor:'rgba(0,0,0,0)', backdropFilter:'blur(0px)' }
 			], { duration, easing:'cubic-bezier(.32,.02,.24,1)', fill:'forwards' });
+			closeOverlayAnimation = overlayAnimation;
+			modal.__psnCardMorphCloseOverlayAnimation = overlayAnimation;
 
 			const contentAnimation = content.animate([
 				{
@@ -26755,9 +26763,11 @@ P
 				containedTitleAnimation?.finished?.catch(() => {})
 			]);
 
+			if (modal.__psnCardMorphCloseOverlayAnimation !== overlayAnimation) return false;
 			/* Handoff at identical geometry: card appears under the contracted live modal. */
 			if (originCard.isConnected) originCard.style.visibility = originVisibility;
 			await new Promise(resolve => requestAnimationFrame(resolve));
+			if (modal.__psnCardMorphCloseOverlayAnimation !== overlayAnimation) return false;
 			content.style.opacity = '0';
 			cleanupElement(coverUnit);
 			cleanupElement(titleClone);
@@ -26778,7 +26788,7 @@ P
 			cleanupElement(coverUnit);
 			cleanupElement(titleClone);
 						if (originCard.isConnected) originCard.style.visibility = originVisibility;
-			if (!completed) {
+			if (!completed && (!closeOverlayAnimation || modal.__psnCardMorphCloseOverlayAnimation === closeOverlayAnimation)) {
 				resetGameModalCardMorphStyles(modal);
 				modal.classList.remove('psn-card-morph-closing');
 			}
@@ -28261,14 +28271,12 @@ P
 			const dlc = await resolveLicenseDlcForGame(baseGame);
 			const focusContentId = String(dlc && dlc.contentId || '').trim();
 
-			if (typeof closeModal === 'function') closeModal();
 			if (typeof switchAndSearch === 'function') {
 				switchAndSearch('dlcs', String(titleId || ''), false, focusContentId);
 			}
 			return !!dlc;
 		} catch (error) {
 			console.error('[License DLC] Could not open unlock DLC:', error);
-			if (typeof closeModal === 'function') closeModal();
 			if (typeof switchAndSearch === 'function') switchAndSearch('dlcs', String(titleId || ''));
 			return false;
 		} finally {
@@ -29145,9 +29153,32 @@ P
 		}
 	
 		const gameModal = document.getElementById('game-modal');
-		if (gameModal && (gameModal.style.display === 'flex' || gameModal.classList.contains('show'))) {
-			finalFromWhere = `gamemodal|${titleId}|${bgView}`;
-			if (typeof closeModal === 'function') closeModal();
+		const fromOpenGameModal = !!(gameModal && (gameModal.style.display === 'flex' || gameModal.classList.contains('show')));
+		const gameModalReturnState = fromOpenGameModal ? {
+			gameModal: true,
+			game: gameModal.__psnLastOpenedGame || null,
+			category: gameModal.dataset.storeCategory || '',
+			titleId: gameModal.dataset.titleId || '',
+			contentId: gameModal.dataset.contentId || '',
+			index: Number(gameModal.dataset.modalIndex || 0),
+			originCard: gameModal.__psnCardMorphOriginCard || null
+		} : null;
+		let modalCloseBeforeNavigation = null;
+		if (fromOpenGameModal) {
+			finalFromWhere = `gamemodal|${gameModalReturnState.titleId || titleId}|${bgView}|${encodeURIComponent(gameModalReturnState.contentId)}`;
+			if (typeof window.canRunGameModalCardMorphClose === 'function' &&
+				window.canRunGameModalCardMorphClose(gameModal) &&
+				typeof window.runGameModalCardMorphClose === 'function') {
+				modalCloseBeforeNavigation = window.runGameModalCardMorphClose(gameModal)
+					.catch(() => false)
+					.then(() => {
+						window.closeModal(null, { silent:true, skipCardMorph:true });
+						return new Promise(resolve => setTimeout(resolve, 0));
+					});
+			} else if (typeof window.closeModal === 'function') {
+				window.closeModal(null, { silent:true, skipCardMorph:true });
+				modalCloseBeforeNavigation = new Promise(resolve => setTimeout(resolve, 0));
+			}
 		} else if (!finalFromWhere) {
 			finalFromWhere = bgView;
 		}
@@ -29181,7 +29212,7 @@ P
 			savedTopNav: activeTopNav,
 			savedSideGroup: activeSideGroup,
 			originState: (typeof window.captureNavigationReturnState === 'function') ? window.captureNavigationReturnState(finalFromWhere, safeScroll) : null,
-			modalReturnState: navigationContext && navigationContext.restoreGameModal === true ? { gameModal: true } : null
+			modalReturnState: gameModalReturnState || (navigationContext && navigationContext.restoreGameModal === true ? { gameModal: true } : null)
 		};
 
 		if (typeof browseExpandedGroupTitle !== 'undefined' && browseExpandedGroupTitle && typeof clearBrowseExpandedGroupTitle === 'function') {
@@ -29230,13 +29261,14 @@ P
 			});
 		};
 
-		const browseView = document.getElementById('view-browse');
-		const isBrowseVisible = browseView && (browseView.style.display === 'block' || browseView.style.display === 'flex');
-		if (isBrowseVisible) {
-			runBrowseContextTransition(openSearchInBrowse);
-		} else {
-			switchView('view-browse', false, true, openSearchInBrowse);
-		}
+		const navigateToRelatedContent = () => {
+			const browseView = document.getElementById('view-browse');
+			const isBrowseVisible = browseView && (browseView.style.display === 'block' || browseView.style.display === 'flex');
+			if (isBrowseVisible) runBrowseContextTransition(openSearchInBrowse);
+			else switchView('view-browse', false, true, openSearchInBrowse);
+		};
+		if (modalCloseBeforeNavigation) modalCloseBeforeNavigation.then(navigateToRelatedContent);
+		else navigateToRelatedContent();
 	};
     
 	const PSN_MAIN_VIEW_IDS = new Set(['view-explore', 'view-browse', 'view-wishlist', 'view-downloads', 'view-library', 'view-trending', 'view-online']);
@@ -30214,6 +30246,39 @@ P
 			}
 		};
 	
+		const reopenGameModalFromHistory = (history, fallbackIndex = -1) => {
+			const state = history.modalReturnState;
+			if (!state?.gameModal || typeof window.openModal !== 'function') {
+				if (fallbackIndex >= 0 && typeof window.openModal === 'function') window.openModal(fallbackIndex);
+				return;
+			}
+			const expectedView = getHistoryReturnViewId(history);
+			requestAnimationFrame(() => requestAnimationFrame(() => {
+				if (getCurrentPsnViewElement()?.id !== expectedView || navHistory !== currentParent) return;
+				const root = document.getElementById(expectedView);
+				const wantedId = String(state.titleId || '').toUpperCase();
+				const wantedContentId = String(state.contentId || '').toUpperCase();
+				const cardMatches = card => {
+					if (!card || !root?.contains(card)) return false;
+					const img = card.querySelector('.game-img[data-title-id], img[data-title-id]');
+					const id = String(card.dataset.titleId || card.dataset.wishlistTitleId || img?.dataset.titleId || '').toUpperCase();
+					const contentId = String(card.dataset.contentId || img?.dataset.contentId || '').toUpperCase();
+					const category = String(card.dataset.storeCategory || img?.dataset.coverCategory || '');
+					return id === wantedId && (!wantedContentId || contentId === wantedContentId) && (!state.category || !category || category === state.category);
+				};
+				let card = cardMatches(state.originCard) ? state.originCard : null;
+				if (!card && root) card = Array.from(root.querySelectorAll('.game-card:not(.grouped-title-card)')).find(cardMatches) || null;
+				let idx = fallbackIndex;
+				if (idx < 0 && Array.isArray(filteredData) && document.getElementById('cat-select')?.value === state.category) {
+					idx = filteredData.findIndex(item => String(item?.id || item?.titleId || '').toUpperCase() === wantedId &&
+						(!wantedContentId || String(item?.contentId || '').toUpperCase() === wantedContentId));
+				}
+				if (idx < 0) idx = Number.isFinite(state.index) ? state.index : 0;
+				const opts = state.game ? { game: state.game, category: state.category } : null;
+				if (opts || fallbackIndex >= 0) window.openModal(idx, '', false, card, opts);
+			}));
+		};
+
 		if (typeof from === 'string' && from.startsWith('gamemodal|')) {
 			const parts = from.split('|');
 			const gameId = parts[1];
@@ -30237,6 +30302,7 @@ P
 				else if (bgView === 'library_favs' && typeof showLibrarySection === 'function') showLibrarySection('favorites', true);
 				else if (bgView === 'library_files' && typeof showLibrarySection === 'function') showLibrarySection('files', true);
 				restoreOriginScroll();
+				reopenGameModalFromHistory(oldHistory);
 			}
 			return;
 		}
@@ -30526,7 +30592,7 @@ P
                     });
                 }
                 if (idx < 0) idx = filteredData.findIndex(g => String(g.id || g.titleId || '').toUpperCase().trim() === wantedId);
-                if (idx > -1 && typeof openModal === 'function') openModal(idx);
+                if (idx > -1 || history.modalReturnState?.gameModal) reopenGameModalFromHistory(history, idx);
             };
 
             const canFastRestoreRoot =
@@ -40331,6 +40397,7 @@ P
 		let hydrationToken = '';
 		let modalOpenIdentity = null;
 		if (modal && game) {
+			modal.__psnLastOpenedGame = game;
 			modal.dataset.titleId = game.id || game.titleId || '';
 			modal.dataset.contentId = game.contentId || '';
 			modal.dataset.storeCategory = currentCat || '';
@@ -40463,17 +40530,17 @@ P
 		
 			if (currentCat === 'games' || currentCat === 'apps') {
 				if (sysData.updates.has(game.id)) {
-					actionsHtml += `<a style="cursor: pointer;" title="Find Updates" class="btn-mini btn-upd" onmouseenter="playUiArrow()" onclick="playUiClick(); closeModal(); switchAndSearch('updates', '${game.id}')"><i class="fas fa-sync-alt"></i> <span class="modal-action-label modal-action-label-upper">Update</span></a>`;
+					actionsHtml += `<a style="cursor: pointer;" title="Find Updates" class="btn-mini btn-upd" onmouseenter="playUiArrow()" onclick="playUiClick(); switchAndSearch('updates', '${game.id}')"><i class="fas fa-sync-alt"></i> <span class="modal-action-label modal-action-label-upper">Update</span></a>`;
 				}
 				if (currentCat === 'games') {
 					if (sysData.dlcs.has(game.id)) {
-						actionsHtml += `<a style="cursor: pointer;" title="Find DLCs" class="btn-mini btn-dlc" onmouseenter="playUiArrow()" onclick="playUiClick(); closeModal(); switchAndSearch('dlcs', '${game.id}')"><i class="fas fa-puzzle-piece"></i> DLC</a>`;
+						actionsHtml += `<a style="cursor: pointer;" title="Find DLCs" class="btn-mini btn-dlc" onmouseenter="playUiArrow()" onclick="playUiClick(); switchAndSearch('dlcs', '${game.id}')"><i class="fas fa-puzzle-piece"></i> DLC</a>`;
 					}
 					if (sysData.avatars.has(game.id)) {
-						actionsHtml += `<a style="cursor: pointer;" title="Find Avatars" class="btn-mini btn-avt" onmouseenter="playUiArrow()" onclick="playUiClick(); closeModal(); switchAndSearch('avatars', '${game.id}')"><i class="fas fa-user-circle"></i> <span class="modal-action-label">Avatar</span></a>`;
+						actionsHtml += `<a style="cursor: pointer;" title="Find Avatars" class="btn-mini btn-avt" onmouseenter="playUiArrow()" onclick="playUiClick(); switchAndSearch('avatars', '${game.id}')"><i class="fas fa-user-circle"></i> <span class="modal-action-label">Avatar</span></a>`;
 					}
 					if (sysData.themes.has(game.id)) {
-						actionsHtml += `<a style="cursor: pointer;" title="Find Themes" class="btn-mini btn-thm" onmouseenter="playUiArrow()" onclick="playUiClick(); closeModal(); switchAndSearch('themes', '${game.id}')"><i class="fas fa-palette"></i> <span class="modal-action-label modal-action-label-upper">Theme</span></a>`;
+						actionsHtml += `<a style="cursor: pointer;" title="Find Themes" class="btn-mini btn-thm" onmouseenter="playUiArrow()" onclick="playUiClick(); switchAndSearch('themes', '${game.id}')"><i class="fas fa-palette"></i> <span class="modal-action-label modal-action-label-upper">Theme</span></a>`;
 					}
 				}
 			}
@@ -40699,7 +40766,7 @@ P
 			if (options.skipCardMorph !== true && typeof window.canRunGameModalCardMorphClose === 'function' && window.canRunGameModalCardMorphClose(modal) && typeof window.runGameModalCardMorphClose === 'function') {
 				if (options.silent !== true && typeof playUiBack === 'function') playUiBack();
 				window.runGameModalCardMorphClose(modal).catch(() => false).then(() => {
-					window.closeModal(null, { ...options, silent:true, skipCardMorph:true });
+					if (modal.classList.contains('psn-card-morph-closing')) window.closeModal(null, { ...options, silent:true, skipCardMorph:true });
 				});
 				return;
 			}
@@ -75122,11 +75189,11 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 						flight = flightImage.animate([
 							{ left:`${start.left}px`, top:`${start.top}px`, width:`${start.width}px`, height:`${start.height}px` },
 							{ left:`${left}px`, top:`${top}px`, width:`${width}px`, height:`${height}px` }
-						], { duration:390, easing:'cubic-bezier(.2,.78,.18,1)', fill:'forwards' });
+						], { duration:520, easing:'cubic-bezier(.22,.72,.24,1)', fill:'forwards' });
 					} catch (_) { flightImage.remove(); }
 					if (flight) {
 						preview.image.style.setProperty('visibility', 'hidden', 'important');
-						content.style.visibility = 'hidden';
+						img.style.visibility = 'hidden';
 						let finished = false;
 						const endFlight = () => {
 							if (finished) return;
@@ -75140,8 +75207,8 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 						};
 						flight.onfinish = endFlight;
 						flight.oncancel = endFlight;
-						setTimeout(endFlight, 470);
-						overlay.classList.add('psn-image-closing');
+						setTimeout(endFlight, 620);
+						overlay.classList.add('psn-image-morph-returning', 'psn-image-closing');
 						return;
 					}
 				}
