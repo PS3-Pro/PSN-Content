@@ -109150,12 +109150,14 @@ function getVisibleChatStackEl(id) {
 			'.ps5-avatar-arrow',
 			'.chat-avatar-clickable', '.modal-cover-wrapper', '.wish-btn', '.fav-btn', '.action-btn', '.btn-mini', '.btn-mini-round', '.admin-action-btn',
 			'button:not([disabled])', 'a[href]', 'select:not([disabled])',
-			'input[type="checkbox"]:not([disabled])', 'input[type="radio"]:not([disabled])', '[role="button"]', '[onclick]'
+			'input:not([type="hidden"]):not([disabled])', 'textarea:not([disabled])', '[contenteditable="true"]', '[contenteditable="plaintext-only"]',
+			'[role="button"]', '[onclick]'
 		].join(',');
 
 		var KB_NAV_OVERLAY_SELECTOR = '.sys-modal-overlay,.modal-overlay,.ps5-overlay-screen,.site-disclaimer-overlay,#psn-image-modal,.admin-color-picker-overlay,.direct-group-member-picker.is-open,.reaction-picker.show,.seen-by-popover.show,.ps3-console-popover.show';
 		var KB_NAV_EXCLUDED_SELECTOR = '.sidebar-overlay,.sys-modal-overlay,.modal-overlay,.ps5-overlay-screen,.site-disclaimer-overlay,.profile-dropdown-menu,.horizontal-scroll,.browse-toolbar,.toolbar-group,.main-content,.view-section,[data-keyboard-nav="off"]';
 		var keyboardTarget = null;
+		var keyboardEditingTarget = null;
 		var lastKeyboardAt = 0;
 		var lastMoveSoundAt = 0;
 
@@ -109284,6 +109286,14 @@ function getVisibleChatStackEl(id) {
 		    });
 		}
 
+		function isKeyboardEditableField(element) {
+			if (!element || !element.matches) return false;
+			if (element.matches('textarea,[contenteditable="true"],[contenteditable="plaintext-only"]')) return true;
+			if (!element.matches('input')) return false;
+			var type = String(element.type || 'text').toLowerCase();
+			return /^(text|search|password|email|number|tel|url|date|datetime-local|month|week|time|range)$/.test(type);
+		}
+
 		function isKeyboardNativeControl(element) {
 			if (!element || !element.closest) return false;
 			var editable = element.closest('textarea,select,[contenteditable="true"],input');
@@ -109295,7 +109305,8 @@ function getVisibleChatStackEl(id) {
 
 		function isElementVisibleForKeyboard(element) {
 			if (!element || !element.isConnected || !element.getBoundingClientRect) return false;
-			if (element.matches(':disabled,[aria-disabled="true"],[hidden]')) return false;
+			if (element.matches(':disabled,[aria-disabled="true"],[hidden],input[type="hidden"],input[type="file"]')) return false;
+			if (element.matches('[contenteditable="false"]')) return false;
 			if (element.matches('.filter-checkboxes label,#missing-rap-filter label') && element.querySelector('input:disabled')) return false;
 			if (element.closest('[aria-hidden="true"],[inert],[data-keyboard-nav="off"]')) return false;
 			if (element.matches(KB_NAV_EXCLUDED_SELECTOR) || !element.getClientRects().length) return false;
@@ -109361,6 +109372,7 @@ function getVisibleChatStackEl(id) {
 
 		function clearKeyboardTarget(blurCustom) {
 			var old = keyboardTarget;
+			keyboardEditingTarget = null;
 			keyboardTarget = null;
 			window.__psnKeyboardNavTarget = null;
 			document.body.classList.remove('psn-keyboard-nav-active');
@@ -109395,7 +109407,13 @@ function getVisibleChatStackEl(id) {
 				element.setAttribute('tabindex','-1');
 				element.dataset.psnKeyboardTabindexAdded = '1';
 			}
-			try { element.focus({ preventScroll:true }); } catch (e) { try { element.focus(); } catch (ignore) {} }
+			if (isKeyboardEditableField(element) && keyboardEditingTarget !== element) {
+				// Highlight the field first; Enter grants actual typing focus.
+				var focused = document.activeElement;
+				if (focused && focused !== element && isKeyboardNativeControl(focused) && typeof focused.blur === 'function') focused.blur();
+			} else {
+				try { element.focus({ preventScroll:true }); } catch (e) { try { element.focus(); } catch (ignore) {} }
+			}
 			try { element.scrollIntoView({ block:'nearest', inline:'nearest', behavior:'auto' }); } catch (e) { try { element.scrollIntoView(false); } catch (ignore) {} }
 			var horizontalScroll = element.closest ? element.closest('.horizontal-scroll') : null;
 			if (horizontalScroll) horizontalScroll.scrollTop = 0;
@@ -109486,6 +109504,12 @@ function getVisibleChatStackEl(id) {
 
 		function activateKeyboardTarget(element) {
 			if (!element || !isElementVisibleForKeyboard(element)) return false;
+			if (isKeyboardEditableField(element)) {
+				if (element.hasAttribute('readonly') || element.getAttribute('aria-readonly') === 'true') return true;
+				keyboardEditingTarget = element;
+				try { element.focus({ preventScroll:true }); } catch (e) { element.focus(); }
+				return true;
+			}
 			if (element.matches('select')) {
 				try { if (typeof element.showPicker === 'function') element.showPicker(); else element.click(); } catch (e) { element.click(); }
 				return true;
@@ -109522,18 +109546,36 @@ function getVisibleChatStackEl(id) {
 			}
 			var key = event.key || '';
 			if (key === 'Tab') { clearKeyboardTarget(false); return; }
+			if (keyboardEditingTarget && (keyboardEditingTarget !== document.activeElement || !isElementVisibleForKeyboard(keyboardEditingTarget))) keyboardEditingTarget = null;
+			if (key === 'Escape' && keyboardEditingTarget) {
+				event.preventDefault();
+				event.stopImmediatePropagation();
+				var field = keyboardEditingTarget;
+				keyboardEditingTarget = null;
+				field.blur();
+				if (isElementVisibleForKeyboard(field)) setKeyboardTarget(field, false, false);
+				else clearKeyboardTarget(false);
+				return;
+			}
 			if (key === 'Escape') {
 				setTimeout(function(){ if (keyboardTarget && !isElementVisibleForKeyboard(keyboardTarget)) clearKeyboardTarget(false); },0);
 				return;
 			}
 			if (event.ctrlKey || event.metaKey || event.altKey || event.shiftKey) return;
+			if (keyboardTarget && isKeyboardEditableField(keyboardTarget) && !keyboardEditingTarget &&
+				(key.length === 1 || key === 'Backspace' || key === 'Delete')) {
+				event.preventDefault();
+				event.stopPropagation();
+				return;
+			}
 			var isArrow = key === 'ArrowLeft' || key === 'ArrowRight' || key === 'ArrowUp' || key === 'ArrowDown';
 			if (!isArrow && key !== 'Enter') return;
+			if (keyboardEditingTarget) return;
 			var active = document.activeElement;
 			var navSelect = active && active.matches && active.matches('select') &&
 				keyboardTarget === active && document.body.classList.contains('psn-keyboard-nav-active');
 			if (isKeyboardNativeControl(event.target) || isKeyboardNativeControl(active)) {
-				if (!navSelect) return;
+				if (!navSelect && !(keyboardTarget && isKeyboardEditableField(keyboardTarget) && document.body.classList.contains('psn-keyboard-nav-active'))) return;
 				try { if (active.matches(':open')) return; } catch (e) { return; }
 			}
 			lastKeyboardAt = Date.now();
@@ -109565,7 +109607,7 @@ function getVisibleChatStackEl(id) {
 			}
 			var next = findKeyboardTargetInDirection(current, candidates, direction);
 			if (next) setKeyboardTarget(next, true, !event.repeat);
-		}, false);
+		}, true);
 
 		var bootNode = document.getElementById('ps5-boot-container');
 		if (bootNode && typeof MutationObserver === 'function') {
