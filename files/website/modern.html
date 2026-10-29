@@ -5645,6 +5645,7 @@ body.ps3-pad-user-logged.ps3-pad-console-connected:not(.ps3-pad-page-active):not
 .rawg-alt2-top { display: flex; flex-direction: column; gap: 7px; min-width: 0; }
 .rawg-alt2-studio { width: 100%; min-width: 0; color: rgba(255,255,255,.78); font-size: 11.5px; font-weight: 800; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; line-height: 1.15; }
 .rawg-alt2-studio i { color: #66ccff; margin-right: 6px; }
+#game-modal .psn-unofficial-creator { flex-shrink: 0; margin: -2px 0 8px; }
 .rawg-alt2-tagline { width: 100%; min-width: 0; display: flex; flex-wrap: nowrap; align-items: center; justify-content: flex-start; gap: 6px; overflow: hidden; }
 .rawg-alt2-tagline .rawg-chip { flex: 0 0 auto; }
 .rawg-alt2-placeholder { visibility: hidden !important; pointer-events: none !important; }
@@ -6896,6 +6897,7 @@ button[onclick="sendChatMessage()"] i { margin-right: 4px !important; }
 #ps5-boot-container { justify-content: center !important; align-items: center !important; padding: max(18px,env(safe-area-inset-top,0px)) 18px max(22px,env(safe-area-inset-bottom,0px)) 18px !important; box-sizing: border-box !important; }
 #user-select-screen { width: 100% !important; max-width: 430px !important; margin: 0 auto !important; align-items: center !important; justify-content: center !important; transform: none !important; }
 #ps5-boot-container.boot-intro-pending #user-select-screen { transform: translateY(14px) scale(.99) !important; }
+#psn-login-welcome-symbol { top: -51px; }
 #welcome-msg { width: 100% !important; max-width: 390px !important; min-height: 66px !important; text-align: center !important; justify-content: center !important; font-size: clamp(20px,5.4vw,28px) !important; line-height: 1.18 !important; margin: 0 0 8px 0 !important; }
 #user-select-screen>p { width: 100% !important; max-width: 340px !important; text-align: center !important; margin-left: auto !important; margin-right: auto !important; }
 .user-grid-ps5 { width: 100% !important; max-width: 390px !important; justify-content: center !important; align-items: center !important; gap: 24px 22px !important; margin: 32px auto 0 auto !important; }
@@ -32576,17 +32578,22 @@ P
         return rows;
     }
 
-    function buildStoreRowAnalysis(line, parts, sourceIsExplicitDemo = false) {
+    function buildStoreRowAnalysis(line, parts, sourceIsExplicitDemo = false, sourceIsUnofficial = false) {
         if (!line || line.trim().length < 15) return { valid: false };
         const id = parts[0] ? parts[0].trim() : '';
         if (!id || id === 'Title ID' || id === 'TitleID') return { valid: false };
 
         const region = parts[1] ? parts[1].trim() : '';
         const rawName = parts[2] ? parts[2].trim() : '';
-        const pkgUrl = parts[3] ? parts[3].trim() : '';
-        const rap = parts[4] ? parts[4].trim() : '';
-        const contentId = parts[5] ? parts[5].trim() : '';
-        const version = parts[10] ? parts[10].trim() : '';
+        const hasCreatorColumn = sourceIsUnofficial && parts.length >= 8 &&
+            /^https?:\/\//i.test(String(parts[4] || '').trim()) &&
+            !/^https?:\/\//i.test(String(parts[3] || '').trim());
+        const creator = hasCreatorColumn ? String(parts[3] || '').trim() : '';
+        const columnOffset = hasCreatorColumn ? 1 : 0;
+        const pkgUrl = parts[3 + columnOffset] ? parts[3 + columnOffset].trim() : '';
+        const rap = parts[4 + columnOffset] ? parts[4 + columnOffset].trim() : '';
+        const contentId = parts[5 + columnOffset] ? parts[5 + columnOffset].trim() : '';
+        const version = parts[10 + columnOffset] ? parts[10 + columnOffset].trim() : '';
         if (id.length !== 9 || !pkgUrl || pkgUrl === 'MISSING' || !rawName || rawName.length < 2) return { valid: false };
 
         const upperName = rawName.toUpperCase();
@@ -32601,7 +32608,7 @@ P
 
         return {
             valid: true,
-            id, region, rawName, pkgUrl, rap, contentId, version,
+            id, region, rawName, pkgUrl, rap, contentId, version, creator,
             isGuide, isSoundtrack, isVideo, isTrialToFull, isDemoLike,
             isTestVersion: sourceIsExplicitDemo ? !isTrialToFull : isDemoLike,
             appTag,
@@ -32611,11 +32618,12 @@ P
         };
     }
 
-    function getStoreRowAnalysis(row, line, parts, sourceIsExplicitDemo = false) {
-        if (!row || typeof row !== 'object') return buildStoreRowAnalysis(line, parts, sourceIsExplicitDemo);
+    function getStoreRowAnalysis(row, line, parts, sourceIsExplicitDemo = false, sourceIsUnofficial = false) {
+        if (!row || typeof row !== 'object') return buildStoreRowAnalysis(line, parts, sourceIsExplicitDemo, sourceIsUnofficial);
         const cached = row.analysis;
-        if (cached && cached.sourceIsExplicitDemo === sourceIsExplicitDemo) return cached;
-        const analysis = buildStoreRowAnalysis(line, parts, sourceIsExplicitDemo);
+        if (cached && cached.sourceIsExplicitDemo === sourceIsExplicitDemo && cached.sourceIsUnofficial === sourceIsUnofficial) return cached;
+        const analysis = buildStoreRowAnalysis(line, parts, sourceIsExplicitDemo, sourceIsUnofficial);
+        analysis.sourceIsUnofficial = sourceIsUnofficial;
         analysis.sourceIsExplicitDemo = sourceIsExplicitDemo;
         row.analysis = analysis;
         return analysis;
@@ -32655,6 +32663,7 @@ P
 			if (!text) continue;
 			const sourceUrl = String(sourcePaths[textIndex] || '');
 			const sourceIsExplicitDemo = /(?:^|\/)(?:pending\/)?demos\.tsv(?:[?#]|$)/i.test(sourceUrl);
+			const sourceIsUnofficial = sourceUrl.startsWith(BASE_UNOFFICIAL + '/');
 			const sourceIsExternal = /\/resources\/database\/content\/external\//i.test(sourceUrl);
 			const sharedRows = getSharedStoreTsvRows(sourceUrl, text);
 			const lines = sharedRows || text.split('\n');
@@ -32663,10 +32672,10 @@ P
 				const row = lines[lineIndex];
 				const line = sharedRows ? row.line : row;
 				const parts = sharedRows ? row.parts : (line ? line.split('\t') : []);
-				const analysis = getStoreRowAnalysis(sharedRows ? row : null, line, parts, sourceIsExplicitDemo);
+				const analysis = getStoreRowAnalysis(sharedRows ? row : null, line, parts, sourceIsExplicitDemo, sourceIsUnofficial);
 				if (!analysis.valid) continue;
 
-				const { id, region, pkgUrl, rap, contentId, version } = analysis;
+				const { id, region, pkgUrl, rap, contentId, version, creator } = analysis;
 				const storeRap = sourceIsExternal ? 'NOT REQUIRED' : rap;
 				let rawName = analysis.rawName;
 				let isGuide = analysis.isGuide;
@@ -32717,8 +32726,10 @@ P
 						cTag, aTag, url: pkgUrl, rap: storeRap, contentId, isExternalSource: sourceIsExternal,
 						sizeBytes: rawSizeBytes, version, isSplit
 					};
+					if (creator) tempGroupMap[uniqueKey].creator = creator;
 				} else {
 					let existing = tempGroupMap[uniqueKey];
+					if (creator && !existing.creator) existing.creator = creator;
 
 					if (cat === "games" || cat === "guides" || cat === "soundtracks") {
 						if (existing.isSplit) {
@@ -40243,6 +40254,10 @@ P
 		const hasPsnAppCoverEntry = currentCat === 'apps' && window.hasPsnStoreCoverEntry && window.hasPsnStoreCoverEntry(game.id || '', game.contentId || '', game.region || '');
 		const hasForcedPsnStoreSummary = isPsnStoreSummaryCat && forcedPsnStoreSummaryText;
 		const modalSafeText = (value) => String(value === undefined || value === null ? '' : value).replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;' }[char]));
+		const unofficialCreator = ['backup_manager', 'emulators', 'homebrew_games', 'launchers', 'legacy', 'no_psn', 'ports', 'tools'].includes(currentCat)
+			? String(game.creator || '').trim() : '';
+		const unofficialCreatorHtml = unofficialCreator
+			? `<div class="rawg-alt2-studio psn-unofficial-creator" data-no-translate="true" translate="no" title="${modalSafeText(unofficialCreator)}"><i class="fas fa-code" aria-hidden="true"></i>${modalSafeText(unofficialCreator)}</div>` : '';
 
 		if (modalHeader) {
 			modalHeader.style.cssText = "display: flex !important; align-items: center !important; gap: 10px; margin: 0 !important; flex: 1 1 auto !important; min-width: 0 !important;";
@@ -40347,6 +40362,7 @@ P
 					</div>
 					<div class="modal-details" style="flex: 1; display: flex; flex-direction: column; min-width: 0;">
 						<h2 class="modal-game-title" data-no-translate="true" translate="no" style="margin-top: 0; margin-bottom: 8px; color: #fff; font-size: 20px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">${titleHtml}</h2>
+						${unofficialCreatorHtml}
 						<div id="modal-extra-meta"></div>
 						<div id="modal-badges" style="display: flex; gap: 10px; margin-bottom: 12px; flex-wrap: wrap; min-height: 24px;"></div>
 						<div id="modal-summary" class="modal-summary" style="flex-grow: 1; max-height: 150px; margin-bottom: 5px; font-size: 12.5px; color: #ccc; line-height: 1.5;"></div>                    
@@ -40451,7 +40467,8 @@ P
 					<div class="modal-details" style="flex: 1; display: flex; flex-direction: column; min-width: 0;">
 						
 						<h2 class="compact-title modal-game-title" data-no-translate="true" translate="no" style="margin-top: 0; margin-bottom: 8px; color: #fff; font-size: 20px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">${titleHtml}</h2>
-						
+						${unofficialCreatorHtml}
+
 						<div class="modal-divider compact-divider-top" style="margin: 15px 0;"></div>
 						
 						<div class="compact-info" style="background: rgba(0,0,0,0.2); border-radius: 6px; border: 1px solid rgba(255,255,255,0.05); padding: 15px; display: flex; flex-direction: column; gap: 10px;">
