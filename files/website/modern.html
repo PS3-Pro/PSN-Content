@@ -23790,22 +23790,27 @@ P
         return Math.min(totalItems, visibleCount + 1);
     }
 
-    function getExploreCoverUrlsForContainer(container) {
+    function getExploreCoverUrlsForContainer(container, limit = Infinity) {
         const urls = [];
-        container.querySelectorAll('.game-img').forEach(img => {
-            if (img && img.src) urls.push(img.src);
-        });
+        const seen = new Set();
+        const addUrl = url => {
+            if (!url || seen.has(url)) return;
+            seen.add(url);
+            urls.push(url);
+        };
+        for (const img of container.querySelectorAll('.game-img')) {
+            if (urls.length >= limit) break;
+            if (img) addUrl(img.src);
+        }
 
         const data = container.__exploreVirtualData;
         if (data && Array.isArray(data.items)) {
-            data.items.forEach(item => {
-                try {
-                    const url = getItemCover(item, data.cat);
-                    if (url) urls.push(url);
-                } catch(e) {}
-            });
+            for (const item of data.items) {
+                if (urls.length >= limit) break;
+                try { addUrl(getItemCover(item, data.cat)); } catch(e) {}
+            }
         }
-        return Array.from(new Set(urls));
+        return urls;
     }
 
     async function preloadExploreCoverImages(options = {}) {
@@ -23818,9 +23823,8 @@ P
         const urls = [];
 
         exploreView.querySelectorAll('.horizontal-scroll').forEach(container => {
-            const containerUrls = getExploreCoverUrlsForContainer(container);
-            const takeCount = visibleOnly ? getExploreBootCoverPreloadCount(container) : containerUrls.length;
-            containerUrls.slice(0, takeCount).forEach(url => {
+            const takeCount = visibleOnly ? getExploreBootCoverPreloadCount(container) : Infinity;
+            getExploreCoverUrlsForContainer(container, takeCount).forEach(url => {
                 if (!url || bootExplorePreloadedCoverUrls.has(url)) return;
                 bootExplorePreloadedCoverUrls.add(url);
                 urls.push(url);
@@ -110718,12 +110722,23 @@ function getVisibleChatStackEl(id) {
 
         function markScrolling(el) {
             if (!el || !el.isConnected) return;
-            el.classList.add('psn-is-scrolling');
-            clearTimeout(el.__psnScrollActivityTimer);
-            el.__psnScrollActivityTimer = setTimeout(() => {
+            if (!el.classList.contains('psn-is-scrolling')) el.classList.add('psn-is-scrolling');
+            el.__psnLastScrollActivityAt = performance.now();
+            if (el.__psnScrollActivityTimer) return;
+            const settle = () => {
+                if (!el.isConnected) {
+                    el.__psnScrollActivityTimer = 0;
+                    return;
+                }
+                const remaining = 220 - (performance.now() - el.__psnLastScrollActivityAt);
+                if (remaining > 0) {
+                    el.__psnScrollActivityTimer = setTimeout(settle, remaining);
+                    return;
+                }
                 el.classList.remove('psn-is-scrolling');
                 el.__psnScrollActivityTimer = 0;
-            }, 220);
+            };
+            el.__psnScrollActivityTimer = setTimeout(settle, 220);
         }
 
         function bindActivity(el) {
@@ -110788,8 +110803,12 @@ function getVisibleChatStackEl(id) {
         /* One document observer handles dynamic list content and discovery. This replaces the old
            per-list MutationObserver fan-out while still refreshing every affected scroll surface. */
         const rootObserver = new MutationObserver(records => {
+            const refreshedTargets = new Set();
             for (const record of records) {
-                refreshEdgeAncestors(record.target);
+                if (!refreshedTargets.has(record.target)) {
+                    refreshedTargets.add(record.target);
+                    refreshEdgeAncestors(record.target);
+                }
                 if (!record.addedNodes || !record.addedNodes.length) continue;
                 record.addedNodes.forEach(queueAddedRoot);
             }
