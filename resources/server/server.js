@@ -8134,6 +8134,7 @@ async function deleteChatMessagesWithSyncBatch(entries = [], trace = null) {
     if (!deletedEntries.length) return { epoch: '', startRevision: 0, endRevision: 0, deletedEntries: [], ids: [] };
 
     const ids = deletedEntries.map(entry => entry.id);
+    await client.query('DELETE FROM pinned_messages WHERE message_id = ANY($1::text[])', [ids]);
     const stateResult = await client.query(
       `UPDATE chat_sync_state
        SET revision = revision + $1::bigint, updated_at = NOW()
@@ -9860,6 +9861,16 @@ async function initProfileSyncNotifications() {
             emitChatSpamPublicDelta(spamName, mergedSpam, { remote:true });
           }
           if (data.reason === 'spam_state') return;
+        }
+        if (data.reason === 'delete_batch') {
+          deferServerTask('CHAT REMOTE PIN DELETE SYNC', async () => {
+            const rows = await queryDbWithRetry('SELECT data FROM pinned_messages ORDER BY id ASC', [], { attempts: 2, label:'CHAT REMOTE PINS READ' });
+            const next = rows.rows.map(row => row.data);
+            if (stableStringifySmall(next) !== stableStringifySmall(pinnedMessages)) {
+              pinnedMessages = next;
+              io.emit('pinned_list', pinnedMessages);
+            }
+          }, 0);
         }
         chatSyncWakeRequested = true;
         scheduleImmediateChatSyncFromNotify();
@@ -17069,11 +17080,6 @@ io.on('connection', (socket) => {
         if (hadPinned) {
           pinnedMessages = pinnedMessages.filter(pin => !pin || !pinnedIds.has(String(pin.id)));
           io.emit('pinned_list', pinnedMessages);
-          deferServerTask('PINNED MESSAGE BATCH DELETE', () => queryDbWithRetry(
-            'DELETE FROM pinned_messages WHERE message_id = ANY($1::text[])',
-            [deletedIds],
-            { attempts: 2, label: 'PINNED MESSAGE BATCH DELETE' }
-          ), 0);
         }
 
         const moderatedEntries = deletedEntries.filter(entry => !entry.isOwner);
@@ -17166,7 +17172,6 @@ io.on('connection', (socket) => {
       const isPinned = pinnedMessages.find(p => p && String(p.id) === msgId);
       if (isPinned) {
         pinnedMessages = pinnedMessages.filter(p => !p || String(p.id) !== msgId);
-        deferServerTask('PINNED MESSAGE DELETE', () => queryDbWithRetry('DELETE FROM pinned_messages WHERE message_id = $1', [msgId], { attempts: 2, label: 'PINNED MESSAGE DELETE' }), 0);
         io.emit('pinned_list', pinnedMessages);
       }
       deleteTrace.finish({ deleted:1, moderated:deletedEntry.isOwner === true ? 0 : 1 });

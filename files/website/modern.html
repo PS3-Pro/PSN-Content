@@ -71983,6 +71983,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 	window.__psnPreAuthMaintenanceSocket = false;
 	let currentOnlineList = [];
 	let pinnedMessages = [];
+	window.__psnPendingChatDeletePinIds = window.__psnPendingChatDeletePinIds instanceof Set ? window.__psnPendingChatDeletePinIds : new Set();
 	window.__chatPinnedIdSet = window.__chatPinnedIdSet instanceof Set ? window.__chatPinnedIdSet : new Set();
 	function rebuildChatPinnedIdIndex(list = pinnedMessages) {
 		const index = window.__chatPinnedIdSet;
@@ -73733,6 +73734,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
             return false;
         }
         if (incomingRevision <= currentRevision) return true;
+        if (change.type === 'delete' && change.msgId) removeConfirmedChatPinnedMessages(change.msgId);
         window.messageHistory = mergeChatSyncChanges(window.messageHistory || [], [change]);
         window.__chatHistoryContentRevision = Math.max(0, Number(window.__chatHistoryContentRevision) || 0) + 1;
         rebuildChatMessageIndexes(window.messageHistory);
@@ -82428,6 +82430,54 @@ function getVisibleChatStackEl(id) {
 		}
 	}
 	
+	function removeConfirmedChatPinnedMessages(rawIds) {
+		const ids = new Set((Array.isArray(rawIds) ? rawIds : [rawIds]).map(String));
+		if (!ids.size) return false;
+		const previousLength = pinnedMessages.length;
+		pinnedMessages = pinnedMessages.filter(message => !ids.has(String(message && (message.id || message.time) || '')));
+		for (const id of ids) window.__psnPendingChatDeletePinIds.delete(id);
+		if (pinnedMessages.length === previousLength) return false;
+		currentPinIndex = Math.min(currentPinIndex, Math.max(0, pinnedMessages.length - 1));
+		rebuildChatPinnedIdIndex(pinnedMessages);
+		renderPinnedBar();
+		return true;
+	}
+
+	function stageChatPinnedMessageDeletes(rawIds) {
+		const ids = new Set((Array.isArray(rawIds) ? rawIds : [rawIds]).map(String));
+		const staged = [];
+		pinnedMessages = pinnedMessages.filter((message, index) => {
+			const id = String(message && (message.id || message.time) || '');
+			if (!ids.has(id)) return true;
+			staged.push({ id, index, message });
+			window.__psnPendingChatDeletePinIds.add(id);
+			return false;
+		});
+		if (staged.length) {
+			currentPinIndex = Math.min(currentPinIndex, Math.max(0, pinnedMessages.length - 1));
+			rebuildChatPinnedIdIndex(pinnedMessages);
+			renderPinnedBar();
+		}
+		return staged;
+	}
+
+	function restoreChatPinnedMessageDeletes(staged, onlyIds = null) {
+		const allowed = onlyIds instanceof Set ? onlyIds : null;
+		let changed = false;
+		for (const entry of Array.isArray(staged) ? staged : []) {
+			if (!entry || (allowed && !allowed.has(entry.id))) continue;
+			if (!window.__psnPendingChatDeletePinIds.delete(entry.id)) continue;
+			if (pinnedMessages.some(message => String(message && (message.id || message.time) || '') === entry.id)) continue;
+			pinnedMessages.splice(Math.min(entry.index, pinnedMessages.length), 0, entry.message);
+			changed = true;
+		}
+		if (changed) {
+			rebuildChatPinnedIdIndex(pinnedMessages);
+			renderPinnedBar();
+			if (typeof window.animatePsnUndoRestore === 'function') window.animatePsnUndoRestore(document.getElementById('pinned-messages-container'), 'surface');
+		}
+	}
+
 	window.__psnPendingUnpinIds = window.__psnPendingUnpinIds instanceof Set ? window.__psnPendingUnpinIds : new Set();
 	window.__psnPendingUnpinTimers = window.__psnPendingUnpinTimers instanceof Map ? window.__psnPendingUnpinTimers : new Map();
 
@@ -84646,6 +84696,7 @@ function getVisibleChatStackEl(id) {
     };
 
   window.__directGroupState = window.__directGroupState || { owner:'', groups:[], loaded:false, activeId:'', group:null, messages:[], pins:[], replyTo:null, editId:'', pendingImages:[], token:0, fetchToken:0, listWatchdog:0, timer:0 };
+  const pendingDirectGroupPinDeletes = new Set();
   function directGroupEscape(value) { return directEscapeHtml(value); }
   function directGroupSocketEmit(name,data,done) { if(!socketChat||!socketChat.connected){if(typeof showToastNotification==='function')showToastNotification('Private Chat','Connect to the server first.');return false;}socketChat.emit(name,data,done);return true; }
   function directGroupNote(text) { if(typeof showToastNotification==='function')showToastNotification('Private Chat',text); }
@@ -84867,7 +84918,7 @@ function getVisibleChatStackEl(id) {
   function renderDirectGroupPins(){
     const s=window.__directGroupState,bar=document.getElementById('direct-group-pin'),view=document.getElementById('direct-group-viewport');
     if(!bar||!view)return;
-    const previousPins=s.pins||[];s.pins=s.messages.filter(m=>m.pinnedAt).slice(-10);
+    const previousPins=s.pins||[];s.pins=s.messages.filter(m=>m.pinnedAt&&!pendingDirectGroupPinDeletes.has(s.activeId+':'+m.id)).slice(-10);
     if(!s.pins.length){
       s.pinSignature='';s.pinIndex=0;
       if(bar.classList.contains('is-visible')){bar.classList.add('is-exiting');setTimeout(()=>{if(s.pins.length)return;bar.classList.remove('is-visible','is-exiting');bar.innerHTML='';view.classList.remove('has-pins');},180);}else view.classList.remove('has-pins');
@@ -84948,11 +84999,15 @@ function getVisibleChatStackEl(id) {
     if(m.type==='poll')return window.createDirectGroupPoll(id);
     s.editId=id;s.replyTo=null;document.getElementById('direct-group-input').innerHTML=directSanitizeMessageHtml(m.text);renderDirectGroupReply();};
   window.deleteDirectGroupMessage=function(id){if(typeof window.schedulePsnUndoAction==='function'){
-    const groupId=window.__directGroupState.activeId;
+    const groupId=window.__directGroupState.activeId,key=groupId+':'+id;
     return window.schedulePsnUndoAction({title:'Message deleted',description:'Remove this message from the group.',duration:5200,
-      stage:()=>{if(typeof playUiRemove==='function')playUiRemove();const row=document.querySelector(`#direct-group-messages [data-direct-group-message="${CSS.escape(String(id))}"]`);return window.stagePsnUndoChatMessageCollapse(row);},
-      undo:snapshot=>{if(window.__directGroupState.activeId===groupId){if(!window.restorePsnUndoChatMessageCollapse(snapshot))renderDirectGroupMessages();}},
-      commit:snapshot=>{directGroupSocketEmit('direct_group_action',{groupId,id,action:'delete'},response=>{if(!response?.success){directGroupNote(response?.message||'Could not delete message.');if(window.__directGroupState.activeId===groupId){if(!window.restorePsnUndoChatMessageCollapse(snapshot))renderDirectGroupMessages();}}});}});
+      stage:()=>{if(typeof playUiRemove==='function')playUiRemove();const row=document.querySelector(`#direct-group-messages [data-direct-group-message="${CSS.escape(String(id))}"]`);const snapshot=window.stagePsnUndoChatMessageCollapse(row);pendingDirectGroupPinDeletes.add(key);renderDirectGroupPins();return snapshot;},
+      undo:snapshot=>{pendingDirectGroupPinDeletes.delete(key);if(window.__directGroupState.activeId===groupId){renderDirectGroupPins();if(!window.restorePsnUndoChatMessageCollapse(snapshot))renderDirectGroupMessages();}},
+      commit:snapshot=>{if(!directGroupSocketEmit('direct_group_action',{groupId,id,action:'delete'},response=>{
+        pendingDirectGroupPinDeletes.delete(key);
+        if(!response?.success){directGroupNote(response?.message||'Could not delete message.');if(window.__directGroupState.activeId===groupId){renderDirectGroupPins();if(!window.restorePsnUndoChatMessageCollapse(snapshot))renderDirectGroupMessages();}}
+        else if(window.__directGroupState.activeId===groupId){const state=window.__directGroupState;state.messages=state.messages.filter(m=>String(m.id)!==String(id));renderDirectGroupPins();}
+      })){pendingDirectGroupPinDeletes.delete(key);if(window.__directGroupState.activeId===groupId){renderDirectGroupPins();window.restorePsnUndoChatMessageCollapse(snapshot);}}}});
   }window.directGroupAction('delete',id);};
   window.formatDirectGroup=function(event,command){event.preventDefault();event.stopPropagation();const input=document.getElementById('direct-group-input');if(document.activeElement!==input)input.focus({preventScroll:true});document.execCommand(command,false,null);};
   window.sendDirectGroupMessage=function(poll=null){
@@ -85024,7 +85079,7 @@ function getVisibleChatStackEl(id) {
       const previousMessage = payload.message ? s.messages.find(m=>String(m.id)===String(payload.message.id)) : null;
       const groupEdited = !!(previousMessage && payload.message?.editedAt && (String(previousMessage.text||'')!==String(payload.message.text||'') || String(previousMessage.editedAt||'')!==String(payload.message.editedAt||'')));
       const groupPinned = !!(previousMessage && payload.message && (!!previousMessage.pinnedAt !== !!payload.message.pinnedAt));
-      if(payload.kind==='delete')s.messages=s.messages.filter(m=>String(m.id)!==String(payload.id));
+      if(payload.kind==='delete'){pendingDirectGroupPinDeletes.delete(s.activeId+':'+payload.id);s.messages=s.messages.filter(m=>String(m.id)!==String(payload.id));}
       else if(payload.message){const idx=s.messages.findIndex(m=>String(m.id)===String(payload.message.id));if(idx>=0)s.messages[idx]=payload.message;else s.messages.push(payload.message);}
       let groupMessagesOrdered = true;
       let previousGroupMessageId = -Infinity;
@@ -88001,17 +88056,31 @@ function getVisibleChatStackEl(id) {
 			duration:5200,
 			stage:function() {
 				if (typeof playUiRemove === 'function') playUiRemove();
-				return window.stagePsnUndoChatMessageCollapse(row);
+				const state = window.__directChatState;
+				const pinIndex = state.pinnedMessages.findIndex(item => String(item.id) === String(messageId));
+				const pin = pinIndex >= 0 ? state.pinnedMessages.splice(pinIndex, 1)[0] : null;
+				if (pin) renderDirectPinnedBar();
+				return { row:window.stagePsnUndoChatMessageCollapse(row), pin, pinIndex };
 			},
 			undo:function(snapshot) {
 				if (Number(window.__directChatState.sessionToken || 0) !== sessionToken) return;
 				if (directMessageById(messageId)) {
-					if (!window.restorePsnUndoChatMessageCollapse(snapshot)) renderDirectThread({ preserveScroll:true });
+					if (snapshot.pin && !window.__directChatState.pinnedMessages.some(item => String(item.id) === String(messageId))) {
+						window.__directChatState.pinnedMessages.splice(Math.min(snapshot.pinIndex, window.__directChatState.pinnedMessages.length), 0, snapshot.pin);
+						renderDirectPinnedBar();
+					}
+					if (!window.restorePsnUndoChatMessageCollapse(snapshot.row)) renderDirectThread({ preserveScroll:true });
 				}
 			},
 			commit:function(snapshot) {
 				if (Number(window.__directChatState.sessionToken || 0) !== sessionToken || !socketChat || !socketChat.connected) {
-					if (directMessageById(messageId)) window.restorePsnUndoChatMessageCollapse(snapshot);
+					if (directMessageById(messageId)) {
+						if (snapshot.pin && !window.__directChatState.pinnedMessages.some(item => String(item.id) === String(messageId))) {
+							window.__directChatState.pinnedMessages.splice(Math.min(snapshot.pinIndex, window.__directChatState.pinnedMessages.length), 0, snapshot.pin);
+							renderDirectPinnedBar();
+						}
+						window.restorePsnUndoChatMessageCollapse(snapshot.row);
+					}
 					if (typeof showToastNotification === 'function') showToastNotification('Private Chat', 'Delete was cancelled because the session changed or the server disconnected.');
 					return;
 				}
@@ -88019,10 +88088,16 @@ function getVisibleChatStackEl(id) {
 					if (Number(window.__directChatState.sessionToken || 0) !== sessionToken) return;
 					if (!response || response.success === false) {
 						if (typeof showToastNotification === 'function') showToastNotification('Private Chat', response?.message || 'Could not delete message.');
+						if (snapshot.pin && directMessageById(messageId) && !window.__directChatState.pinnedMessages.some(item => String(item.id) === String(messageId))) {
+							window.__directChatState.pinnedMessages.splice(Math.min(snapshot.pinIndex, window.__directChatState.pinnedMessages.length), 0, snapshot.pin);
+							renderDirectPinnedBar();
+						}
 						renderDirectThread({ preserveScroll:true });
 						return;
 					}
 					const state = window.__directChatState;
+					const remainingPins = state.pinnedMessages.filter(item => String(item.id) !== String(messageId));
+					if (remainingPins.length !== state.pinnedMessages.length) { state.pinnedMessages = remainingPins; renderDirectPinnedBar(); }
 					const removedIndex = directMessageIndexById(messageId, state.messages);
 					const beforeCount = state.messages.length;
 					state.messages = state.messages.filter(item => String(item && item.id || '') !== String(messageId));
@@ -89499,8 +89574,16 @@ function getVisibleChatStackEl(id) {
 				const incomingIds = new Set(incomingPinned.map(message => String(message && (message.id || message.time) || '')));
 				Array.from(pendingUnpins).forEach(id => { if (!incomingIds.has(String(id))) clearPendingPinnedUnpin(id); });
 			}
-			const nextPinned = pendingUnpins && pendingUnpins.size
-				? incomingPinned.filter(message => !pendingUnpins.has(String(message && (message.id || message.time) || '')))
+			const pendingDeletes = window.__psnPendingChatDeletePinIds;
+			if (pendingDeletes.size) {
+				const incomingIds = new Set(incomingPinned.map(message => String(message && (message.id || message.time) || '')));
+				for (const id of pendingDeletes) if (!incomingIds.has(id)) pendingDeletes.delete(id);
+			}
+			const nextPinned = pendingUnpins && pendingUnpins.size || pendingDeletes.size
+				? incomingPinned.filter(message => {
+					const id = String(message && (message.id || message.time) || '');
+					return !(pendingUnpins && pendingUnpins.has(id)) && !pendingDeletes.has(id);
+				})
 				: incomingPinned;
 			const previousSignature = typeof window.getLiveRenderSignature === 'function' ? window.getLiveRenderSignature(Array.isArray(pinnedMessages) ? pinnedMessages : []) : JSON.stringify(Array.isArray(pinnedMessages) ? pinnedMessages : []);
 			const nextSignature = typeof window.getLiveRenderSignature === 'function' ? window.getLiveRenderSignature(nextPinned) : JSON.stringify(nextPinned);
@@ -91487,6 +91570,8 @@ function getVisibleChatStackEl(id) {
                     if (typeof window.setSidebarCountPill === 'function') window.setSidebarCountPill('chat', history.length);
                 }
             }
+
+            if (removeConfirmedChatPinnedMessages(msgIds)) relevant = true;
 
             for (const msgId of msgIds) {
                 if (typeof deleteChatAuxMessageCaches === 'function') deleteChatAuxMessageCaches(msgId);
@@ -94070,14 +94155,20 @@ function getVisibleChatStackEl(id) {
 						const row = typeof getRenderedChatMessageRow === 'function' ? getRenderedChatMessageRow(id) : document.getElementById(`msg-row-${id}`);
 						return { id:String(id), snapshot:window.stagePsnUndoChatMessageCollapse(row) };
 					});
+					const pins = stageChatPinnedMessageDeletes(validIds);
 					clearChatMessageSelection();
 					if (typeof refreshMentionJumpButton === 'function') requestAnimationFrame(() => refreshMentionJumpButton());
-					return snapshots;
+					return { snapshots, pins };
 				},
-				undo:function(snapshots) { restoreSnapshots(snapshots); },
-				commit:function(snapshots) {
+				undo:function(staged) {
+					restoreSnapshots(staged.snapshots);
+					restoreChatPinnedMessageDeletes(staged.pins);
+				},
+				commit:function(staged) {
+					const { snapshots, pins } = staged;
 					if (!socketChat || !socketChat.connected) {
 						restoreSnapshots(snapshots);
+						restoreChatPinnedMessageDeletes(pins);
 						if (typeof showToastNotification === 'function') showToastNotification('Global Chat', 'Delete was cancelled because the server disconnected.');
 						return;
 					}
@@ -94086,6 +94177,7 @@ function getVisibleChatStackEl(id) {
 							const deniedIds = new Set((Array.isArray(response.deniedIds) ? response.deniedIds : []).map(String));
 							if (deniedIds.size) {
 								restoreSnapshots(snapshots, deniedIds);
+								restoreChatPinnedMessageDeletes(pins, deniedIds);
 								if (typeof playUiError === 'function') playUiError();
 								if (typeof showToastNotification === 'function') showToastNotification('Global Chat', `${deniedIds.size} selected message${deniedIds.size === 1 ? '' : 's'} could not be deleted.`);
 							}
@@ -94094,6 +94186,7 @@ function getVisibleChatStackEl(id) {
 						const stillPresent = new Set(validIds.filter(id => typeof getChatMessageByIdFast !== 'function' || !!getChatMessageByIdFast(id)).map(String));
 						if (!stillPresent.size) return;
 						restoreSnapshots(snapshots, stillPresent);
+						restoreChatPinnedMessageDeletes(pins, stillPresent);
 						if (typeof playUiError === 'function') playUiError();
 						if (typeof showToastNotification === 'function') showToastNotification('Global Chat', response?.message || 'Could not delete the selected messages.');
 					});
@@ -94131,13 +94224,19 @@ function getVisibleChatStackEl(id) {
 				stage:function() {
 					if (typeof playUiRemove === 'function') playUiRemove();
 					const snapshot = window.stagePsnUndoChatMessageCollapse(row);
+					const pins = stageChatPinnedMessageDeletes(msgId);
 					if (typeof refreshMentionJumpButton === 'function') requestAnimationFrame(() => refreshMentionJumpButton());
-					return snapshot;
+					return { snapshot, pins };
 				},
-				undo:function(snapshot) { window.restorePsnUndoChatMessageCollapse(snapshot); },
-				commit:function(snapshot) {
+				undo:function(staged) {
+					window.restorePsnUndoChatMessageCollapse(staged.snapshot);
+					restoreChatPinnedMessageDeletes(staged.pins);
+				},
+				commit:function(staged) {
+					const { snapshot, pins } = staged;
 					if (!socketChat || !socketChat.connected) {
 						window.restorePsnUndoChatMessageCollapse(snapshot);
+						restoreChatPinnedMessageDeletes(pins);
 						if (typeof showToastNotification === 'function') showToastNotification('Global Chat', 'Delete was cancelled because the server disconnected.');
 						return;
 					}
@@ -94146,6 +94245,7 @@ function getVisibleChatStackEl(id) {
 						const stillPresent = typeof getChatMessageByIdFast !== 'function' || !!getChatMessageByIdFast(msgId);
 						if (!stillPresent) return;
 						window.restorePsnUndoChatMessageCollapse(snapshot);
+						restoreChatPinnedMessageDeletes(pins);
 						if (typeof playUiError === 'function') playUiError();
 						if (typeof showToastNotification === 'function') showToastNotification('Global Chat', response?.message || 'Could not delete the message.');
 					});
