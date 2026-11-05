@@ -3948,6 +3948,23 @@ function normalizeProfileRealtimeSettings(settings = {}) {
     clean.themeColor = normalizeThemeColorServer(settings.themeColor, "#0070cc");
   }
   if (themeUpdatedAt) clean[PROFILE_THEME_COLOR_UPDATED_AT_KEY] = themeUpdatedAt;
+  if (Object.prototype.hasOwnProperty.call(clean, 'savedPs3Consoles')) {
+    const roster = Array.isArray(clean.savedPs3Consoles) ? clean.savedPs3Consoles : [];
+    const usedIps = new Set();
+    clean.savedPs3Consoles = roster.slice(0, 12).flatMap((entry, index) => {
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return [];
+      const ip = String(entry.ip || '').trim();
+      const parts = ip.split('.');
+      if (parts.length !== 4 || parts.some(part => !/^\d{1,3}$/.test(part) || Number(part) > 255) || usedIps.has(ip)) return [];
+      const id = String(entry.id || '').trim().replace(/[^a-zA-Z0-9_-]/g, '').slice(0,72) || `ps3-${ip.replace(/\./g, '-')}`;
+      const name = String(entry.name || '').replace(/\s+/g,' ').trim().slice(0,32) || `PS3 ${index + 1}`;
+      const hash = String(entry.psidHash || '').trim().toLowerCase();
+      usedIps.add(ip);
+      return [{ id, name, ip, ...(/^[0-9a-f]{64}$/.test(hash) ? { psidHash:hash } : {}) }];
+    });
+    const activeId = String(clean.activePs3ConsoleId || '');
+    if (activeId && !clean.savedPs3Consoles.some(entry => entry.id === activeId)) clean.activePs3ConsoleId = '';
+  }
   if (updatedAt) clean[PROFILE_SETTINGS_UPDATED_AT_KEY] = updatedAt;
   PROFILE_SETTINGS_TIMESTAMP_ALIASES.forEach(key => {
     if (key !== PROFILE_SETTINGS_UPDATED_AT_KEY) delete clean[key];
@@ -13029,6 +13046,83 @@ io.on('connection', (socket) => {
     } catch (err) {
       console.error('[EXPLORE VISIT SAVE ERROR]:', err && err.message ? err.message : err);
       respond({ ok: false, error: 'Explore visit could not be saved.' });
+    }
+  });
+
+  socket.on('ps3_consoles_save', async (payload = {}, ack) => {
+    const respond = response => {
+      if (typeof ack === 'function' && socket.connected) {
+        try { ack(response); } catch (err) {}
+      }
+    };
+    const name = socket.userName;
+    if (!name || !userDatabase[name]) { respond({ ok:false, error:'Sign in to save consoles.' }); return; }
+    if (!payload || !Array.isArray(payload.consoles) || payload.consoles.length > 12) {
+      respond({ ok:false, error:'Invalid console list (maximum 12).' }); return;
+    }
+
+    const ids = new Set();
+    const ips = new Set();
+    const hashes = new Set();
+    const consoles = [];
+    for (const entry of payload.consoles) {
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+        respond({ ok:false, error:'Invalid console entry.' }); return;
+      }
+      const id = String(entry.id || '').trim();
+      const ip = String(entry.ip || '').trim();
+      const consoleName = String(entry.name || '').replace(/\s+/g, ' ').trim();
+      const psidHash = String(entry.psidHash || '').trim().toLowerCase();
+      const ipParts = ip.split('.');
+      if (!/^[a-zA-Z0-9_-]{1,72}$/.test(id) || !consoleName || consoleName.length > 32 ||
+          ipParts.length !== 4 || ipParts.some(part => !/^\d{1,3}$/.test(part) || Number(part) > 255) ||
+          (psidHash && !/^[0-9a-f]{64}$/.test(psidHash)) || ids.has(id) || ips.has(ip) || (psidHash && hashes.has(psidHash))) {
+        respond({ ok:false, error:'Invalid or duplicated console details.' }); return;
+      }
+      ids.add(id); ips.add(ip);
+      if (psidHash) hashes.add(psidHash);
+      consoles.push({ id, name:consoleName, ip, ...(psidHash ? { psidHash } : {}) });
+    }
+    const activeId = String(payload.activeId || '').trim();
+    if (activeId && !ids.has(activeId)) { respond({ ok:false, error:'Active console is not in the saved list.' }); return; }
+    const activeConsole = consoles.find(entry => entry.id === activeId) || null;
+    const currentIp = activeConsole ? activeConsole.ip : '';
+    const updatedAt = Math.max(Date.now(), getProfileSettingsUpdatedAt(userDatabase[name].settingsData || {}) + 1);
+    const profileUpdatedAt = Date.now();
+    try {
+      const result = await queryDbWithRetry(
+        `UPDATE users
+         SET data = jsonb_set(
+           COALESCE(data, '{}'::jsonb) || jsonb_build_object('profileUpdatedAt', $5::bigint),
+           '{settingsData}',
+           (CASE WHEN jsonb_typeof(data->'settingsData') = 'object' THEN data->'settingsData' ELSE '{}'::jsonb END)
+             || jsonb_build_object(
+               'savedPs3Consoles', $2::jsonb,
+               'activePs3ConsoleId', $3::text,
+               'ps3Ip', $4::text,
+               'settingsUpdatedAt', GREATEST($6::bigint, COALESCE(NULLIF(data->'settingsData'->>'settingsUpdatedAt', '')::bigint, 0) + 1)
+             ),
+           true
+         )
+         WHERE name = $1
+         RETURNING data->'settingsData' AS settings_data, data->>'profileUpdatedAt' AS profile_updated_at`,
+        [name, JSON.stringify(consoles), activeId, currentIp, profileUpdatedAt, updatedAt],
+        { attempts:3, label:'PS3 CONSOLES SAVE' }
+      );
+      if (!result.rows.length) { respond({ ok:false, error:'Account not found.' }); return; }
+      const savedSettings = result.rows[0].settings_data || {};
+      const safeProfile = userDatabase[name];
+      safeProfile.settingsData = normalizeProfileRealtimeSettings(savedSettings);
+      safeProfile.profileUpdatedAt = Number(result.rows[0].profile_updated_at) || profileUpdatedAt;
+      userCacheMeta[name] = Date.now();
+      emitSettingsRealtimeSync(name, socket.id, { reason:'ps3_consoles_save' });
+      deferServerTask('PS3 CONSOLES NOTIFY', () => notifyProfileSyncAcrossInstances(
+        name, socket.id, safeProfile.profileUpdatedAt, { keys:['settingsData', 'profileUpdatedAt'] }
+      ), 0);
+      respond({ ok:true, consoles, activeId, settingsUpdatedAt:getProfileSettingsUpdatedAt(savedSettings) });
+    } catch (err) {
+      console.error('[PS3 CONSOLES SAVE ERROR]:', err && err.message ? err.message : err);
+      respond({ ok:false, error:'Could not save consoles to the server. Try again.' });
     }
   });
 
