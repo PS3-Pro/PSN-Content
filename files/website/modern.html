@@ -21095,11 +21095,22 @@ P
 		}
 	}
 
-	function setupProgressiveGridObserver(key, grid, renderedCount, totalCount, loadMore, rootOverride = null, rootMarginOverride = '') {
-		clearProgressiveGridObserver(key, grid);
-		if (!grid || renderedCount >= totalCount || typeof loadMore !== 'function') return;
+	function setupProgressiveGridObserver(key, grid, renderedCount, totalCount, loadMore, rootOverride = null, rootMarginOverride = '', reuseSignature = null) {
+		if (!grid || renderedCount >= totalCount || typeof loadMore !== 'function') {
+			clearProgressiveGridObserver(key, grid);
+			return;
+		}
 
 		const root = rootOverride || document.getElementById('scroll-area') || document.querySelector('.main-content') || document.querySelector('.content');
+		const rootMargin = rootMarginOverride || (rootOverride ? '400px' : ((typeof getBrowseInfiniteRootMargin === 'function') ? getBrowseInfiniteRootMargin() : '1200px'));
+		const existing = progressiveGridObservers[key];
+		const previous = existing && existing.__psnProgressiveReuse;
+		const sentinelSelector = `[data-progressive-grid-sentinel="${key}"]`;
+		if (reuseSignature != null && previous && previous.grid === grid && previous.root === root &&
+			previous.rootMargin === rootMargin && previous.renderedCount === renderedCount &&
+			previous.totalCount === totalCount && previous.signature === reuseSignature &&
+			grid.querySelector(sentinelSelector)) return;
+		clearProgressiveGridObserver(key, grid);
 		const sentinel = document.createElement('div');
 		sentinel.dataset.progressiveGridSentinel = key;
 		sentinel.style.cssText = 'height:20px;grid-column:1/-1;opacity:0;pointer-events:none;';
@@ -21109,13 +21120,13 @@ P
 			requestAnimationFrame(() => loadMore());
 			return;
 		}
-		const rootMargin = rootMarginOverride || (rootOverride ? '400px' : ((typeof getBrowseInfiniteRootMargin === 'function') ? getBrowseInfiniteRootMargin() : '1200px'));
 		const observer = new IntersectionObserver(entries => {
 			if (!entries[0] || !entries[0].isIntersecting) return;
 			try { observer.disconnect(); } catch (e) {}
 			delete progressiveGridObservers[key];
 			requestAnimationFrame(() => loadMore());
 		}, { root, rootMargin });
+		if (reuseSignature != null) observer.__psnProgressiveReuse = { grid, root, rootMargin, renderedCount, totalCount, signature:reuseSignature };
 		progressiveGridObservers[key] = observer;
 		observer.observe(sentinel);
 	}
@@ -61620,9 +61631,30 @@ function formatLibraryLastPlayedBadge(game = {}) {
 			id: image?.dataset.titleId || '',
 			title: card.querySelector('.game-title')?.textContent || image?.dataset.name || ''
 		};
-		const installed = (lastScannedGames || []).find(game => game && isSameLibraryGameRecord(game, rendered));
-		if (installed) return installed;
-		return (favoritesLibrary || []).find(game => game && isSameLibraryGameRecord(game, rendered)) || null;
+		const id = getLibraryGameTitleId(rendered);
+		const path = normalizeLibraryGamePath(rendered.path);
+		const title = normalizeLibraryIdentityText(rendered.title);
+		const { installed, favorites } = getLibraryRecordMatchLookups();
+		const resolve = maps => {
+			const candidates = [
+				id ? maps.byId.get(id) : null,
+				path ? maps.byPath.get(path) : null,
+				title ? (id ? maps.byTitleWithoutId.get(title) : maps.byTitle.get(title)) : null
+			];
+			let earliest = null;
+			for (const entry of candidates) {
+				if (!entry || (earliest && earliest.index <= entry.index)) continue;
+				if (isSameLibraryGameRecord(entry.game, rendered)) earliest = entry;
+			}
+			return earliest?.game || null;
+		};
+		const installedMatch = resolve(installed);
+		if (installedMatch) return installedMatch;
+		const favoriteMatch = resolve(favorites);
+		if (favoriteMatch) return favoriteMatch;
+		// Retain the existing fallback if a legacy record lacks a complete identity.
+		return (lastScannedGames || []).find(game => game && isSameLibraryGameRecord(game, rendered)) ||
+			(favoritesLibrary || []).find(game => game && isSameLibraryGameRecord(game, rendered)) || null;
 	}
 
 	function isPhysicalPs3TitleId(value) {
@@ -61783,7 +61815,32 @@ function formatLibraryLastPlayedBadge(game = {}) {
 		return libraryCardLookups;
 	}
 
-	function getLocalLibraryVisiblePrefixSignature(games, count) {
+	function getLibraryRecordMatchLookups() {
+		const cache = getLibraryCardLookups();
+		if (cache.recordMatchLookups) return cache.recordMatchLookups;
+		const createMaps = () => ({ byId:new Map(), byPath:new Map(), byTitle:new Map(), byTitleWithoutId:new Map() });
+		const installed = createMaps();
+		const favorites = createMaps();
+		const indexList = (items, maps) => {
+			items.forEach((game, index) => {
+				if (!game) return;
+				const id = getLibraryGameTitleId(game);
+				const path = normalizeLibraryGamePath(game.path);
+				const title = normalizeLibraryIdentityText(game.title || game.name);
+				const entry = { game, index };
+				if (id && !maps.byId.has(id)) maps.byId.set(id, entry);
+				if (path && !maps.byPath.has(path)) maps.byPath.set(path, entry);
+				if (title && !maps.byTitle.has(title)) maps.byTitle.set(title, entry);
+				if (title && !id && !maps.byTitleWithoutId.has(title)) maps.byTitleWithoutId.set(title, entry);
+			});
+		};
+		indexList(cache.source, installed);
+		indexList(cache.favorites, favorites);
+		cache.recordMatchLookups = { installed, favorites };
+		return cache.recordMatchLookups;
+	}
+
+	function getLocalLibraryVisiblePrefixSignatures(games, count) {
 		const visible = (games || []).slice(0, count);
 		const { favoritePaths, sourceIndexByObject } = getLibraryCardLookups();
 		const playing = window.myCurrentPS3Status || {};
@@ -61797,12 +61854,33 @@ function formatLibraryLastPlayedBadge(game = {}) {
 			const id = normalizeGamePlayersTitleId(getLibraryGameTitleId(game));
 			playTogetherFlags.push(id && typeof window.isViewerPlayTogetherTitle === 'function' && window.isViewerPlayTogetherTitle(id) ? '1' : '0');
 		}
-		return getProgressiveGridSignature([
-			dataSignature,
-			sourcePositions.join(','), favoriteFlags.join(''), playTogetherFlags.join(''),
+		const commonParts = [
+			dataSignature, sourcePositions.join(','), playTogetherFlags.join(''),
 			String(playing.status || ''), String(playing.titleId || ''), String(playing.title || ''),
 			Number(window.__contentMetadataOverridesRevision || 0)
-		]);
+		];
+		return {
+			full: getProgressiveGridSignature([commonParts[0], commonParts[1], favoriteFlags.join(''), ...commonParts.slice(2)]),
+			withoutFavorites: getProgressiveGridSignature(commonParts)
+		};
+	}
+
+	function syncRetainedLibraryFavoriteButtons(cards, games) {
+		const { favoritePaths } = getLibraryCardLookups();
+		for (let i = 0; i < cards.length; i++) {
+			const card = cards[i];
+			const isFav = favoritePaths.has(games[i]?.path);
+			if (card.classList.contains('is-favorited') === isFav) continue;
+			card.classList.toggle('is-favorited', isFav);
+			const button = card.querySelector('.fav-btn');
+			if (!button) continue;
+			button.title = isFav ? 'Remove from Favorites' : 'Add to Favorites';
+			const icon = button.querySelector('i');
+			if (icon) {
+				icon.className = isFav ? 'fas fa-star' : 'far fa-star';
+				icon.style.color = isFav ? '#ffcc00' : 'rgba(255,255,255,0.6)';
+			}
+		}
 	}
 
 	function renderLocalLibrary(games, isFiltering = false, isSilent = false, progressiveMode = 'reset') {
@@ -61818,13 +61896,22 @@ function formatLibraryLastPlayedBadge(game = {}) {
 		const sameSignature = grid.dataset.localLibraryRenderSignature === renderSignature;
 		const canAppend = appendProgressive && sameSignature;
 		const libraryVisibleCount = Math.max(0, Number(grid.dataset.progressiveGridRendered || 0));
-		const canRetainLibraryCards = isFiltering && !appendProgressive && hasRenderedCards &&
-			!replacingLibrarySkeletons && libraryVisibleCount > 0 &&
+		const renderedLibraryCards = isFiltering && !appendProgressive && hasRenderedCards
+			? grid.querySelectorAll(':scope > .game-card') : null;
+		const canCheckLibraryCards = !!renderedLibraryCards && !replacingLibrarySkeletons && libraryVisibleCount > 0 &&
 			libraryVisibleCount >= Math.min((games || []).length, getProgressiveGridInitialLimit()) &&
-			(games || []).length >= libraryVisibleCount &&
-			grid.querySelectorAll(':scope > .game-card').length === libraryVisibleCount &&
-			grid.__localLibraryVisiblePrefixSignature === getLocalLibraryVisiblePrefixSignature(games, libraryVisibleCount);
+			(games || []).length >= libraryVisibleCount && renderedLibraryCards.length === libraryVisibleCount;
+		const currentLibraryPrefix = canCheckLibraryCards ? getLocalLibraryVisiblePrefixSignatures(games, libraryVisibleCount) : null;
+		const sameVisiblePrefix = !!currentLibraryPrefix && grid.__localLibraryVisiblePrefixSignature === currentLibraryPrefix.full;
+		const favoritesOnlyChange = !sameVisiblePrefix && !!currentLibraryPrefix &&
+			grid.__localLibraryVisiblePrefixSignatureNoFavorites === currentLibraryPrefix.withoutFavorites;
+		const canRetainLibraryCards = canCheckLibraryCards && (sameVisiblePrefix || favoritesOnlyChange);
 		if (!appendProgressive && hasRenderedCards && (isFiltering ? canRetainLibraryCards : sameSignature)) {
+			if (favoritesOnlyChange) syncRetainedLibraryFavoriteButtons(renderedLibraryCards, games);
+			if (currentLibraryPrefix) {
+				grid.__localLibraryVisiblePrefixSignature = currentLibraryPrefix.full;
+				grid.__localLibraryVisiblePrefixSignatureNoFavorites = currentLibraryPrefix.withoutFavorites;
+			}
 			grid.dataset.localLibraryRenderSignature = renderSignature;
 			if (typeof updateConsoleLibraryStatusUI === 'function') updateConsoleLibraryStatusUI(lastScannedGames);
 			const renderedCount = Number(grid.dataset.progressiveGridRendered || grid.querySelectorAll(':scope > .game-card').length);
@@ -62073,7 +62160,9 @@ function formatLibraryLastPlayedBadge(game = {}) {
 		}
 		if (libraryRenderTarget.childNodes.length) grid.appendChild(libraryRenderTarget);
 		grid.dataset.progressiveGridRendered = String(libraryRenderEnd);
-		grid.__localLibraryVisiblePrefixSignature = getLocalLibraryVisiblePrefixSignature(games, libraryRenderEnd);
+		const libraryPrefixSignatures = getLocalLibraryVisiblePrefixSignatures(games, libraryRenderEnd);
+		grid.__localLibraryVisiblePrefixSignature = libraryPrefixSignatures.full;
+		grid.__localLibraryVisiblePrefixSignatureNoFavorites = libraryPrefixSignatures.withoutFavorites;
 	
 		if (!isSilent || replacingLibrarySkeletons) {
 			if (replacingLibrarySkeletons) window.__pendingMyGamesScanReveal = false;
@@ -62856,13 +62945,10 @@ function formatLibraryLastPlayedBadge(game = {}) {
 		checkTrophyProgress('fav_1', favoritesLibrary.length);
 		checkTrophyProgress('fav_10', favoritesLibrary.length);
 	
-		const activeFavs = favoritesLibrary.map(fav => {
-			const installed = lastScannedGames.find(item => item.path === fav.path);
-			if (!installed) return null;
-			return { ...fav, ...installed, date: fav.date || installed.date || '' };
-		}).filter(Boolean);
+		const installedFavoritePaths = new Set((lastScannedGames || []).map(item => item?.path).filter(Boolean));
+		const hasInstalledFavorites = favoritesLibrary.some(fav => fav?.path && installedFavoritePaths.has(fav.path));
 		
-		if (activeFavs.length === 0) {
+		if (!hasInstalledFavorites) {
 			if (typeof window.clearCategoryDotPending === 'function') {
 				window.clearCategoryDotPending('favorites');
 			} else {
@@ -82109,8 +82195,10 @@ function getVisibleChatStackEl(id) {
 	}
 	function markChatMediaState(img, failed = false) {
 		if (!img || img.tagName !== 'IMG') return;
-		const frame = img.closest('.chat-image-frame, .chat-gallery .gallery-tile, .direct-message-media-item');
-		if (!frame) return;
+		// Chat media images are direct children of their frame. Avoid walking up the DOM
+		// for the thousands of unrelated cover/avatar load events elsewhere on the site.
+		const frame = img.parentElement;
+		if (!frame || !(frame.classList.contains('chat-image-frame') || frame.classList.contains('direct-message-media-item') || (frame.classList.contains('gallery-tile') && frame.parentElement?.classList.contains('chat-gallery')))) return;
 		if (!failed && img.naturalWidth > 0 && img.naturalHeight > 0) {
 			rememberChatMediaDimensions(img.getAttribute('src'), img.naturalWidth, img.naturalHeight);
 			frame.classList.add('chat-media-loaded');
@@ -85649,9 +85737,38 @@ function getVisibleChatStackEl(id) {
     const views=s.pollViews||(s.pollViews={});views[id]=views[id]==='voters'?'options':'voters';
     const target=document.getElementById('poll-container-group-'+id);if(target){const temp=document.createElement('template');temp.innerHTML=directGroupPollHtml(m);target.replaceWith(temp.content);}
   };
+  function directGroupReactionsHtml(m){
+    const id=directGroupEscape(m.id);
+    return (m.reactions||[]).map(r=>`<button class="direct-group-toolbar-btn" style="width:auto;height:23px;padding:0 7px;font-size:11px" onclick="window.directGroupAction('react','${id}',{emoji:'${directGroupEscape(r.emoji)}'})" title="${directGroupEscape((r.users||[]).join(', '))}">${directGroupEscape(r.emoji)} ${Number(r.count||r.users?.length||0)}</button>`).join('');
+  }
+  function directGroupAckState(m){
+    if(!m)return '';
+    const withoutReceipts={...m};
+    delete withoutReceipts.recipients;
+    delete withoutReceipts.readBy;
+    return JSON.stringify(withoutReceipts);
+  }
+  function directGroupNonReactionState(m){
+    if(!m)return '';
+    const withoutReactions={...m};
+    delete withoutReactions.reactions;
+    return JSON.stringify(withoutReactions);
+  }
+  function patchDirectGroupReactions(row,prior,message){
+    if(!row||!prior||directGroupNonReactionState(prior)!==directGroupNonReactionState(message))return false;
+    const stack=row.querySelector(':scope > .direct-message-stack');
+    const bubble=stack?.querySelector(':scope > .direct-message-bubble');
+    if(!stack||!bubble)return false;
+    const html=directGroupReactionsHtml(message),existing=stack.querySelector(':scope > .reactions-container');
+    if(existing){
+      if(!html)existing.remove();
+      else if(JSON.stringify(prior.reactions||[])!==JSON.stringify(message.reactions||[]))existing.innerHTML=html;
+    }else if(html)bubble.insertAdjacentHTML('afterend',`<div class="reactions-container" style="display:flex;gap:4px;margin-top:5px">${html}</div>`);
+    return true;
+  }
   function directGroupMessageHtml(m){
     const own=String(m.from||'').trim()===directGroupMyName(),id=directGroupEscape(m.id),media=Array.isArray(m.content)?m.content:[],poll=m.type==='poll';
-    const reactions=(m.reactions||[]).map(r=>`<button class="direct-group-toolbar-btn" style="width:auto;height:23px;padding:0 7px;font-size:11px" onclick="window.directGroupAction('react','${id}',{emoji:'${directGroupEscape(r.emoji)}'})" title="${directGroupEscape((r.users||[]).join(', '))}">${directGroupEscape(r.emoji)} ${Number(r.count||r.users?.length||0)}</button>`).join('');
+    const reactions=directGroupReactionsHtml(m);
     const reply=m.replyTo?.id?`<button class="direct-message-reply" type="button" onclick="window.jumpDirectGroupMessage('${directGroupEscape(m.replyTo.id)}')"><span class="direct-message-reply-user">${directGroupEscape(m.replyTo.from)}</span><span class="direct-message-reply-text">${directGroupEscape(directMessagePlainText(m.replyTo.text).slice(0,90))}</span></button>`:'';
     const imageUrls=media.filter(u=>/^https?:\/\//i.test(u));
     const mediaHtml=imageUrls.length?`<div class="direct-message-media${imageUrls.length===1?' single':''}">${imageUrls.map(url=>`<a class="direct-message-media-item"${imageUrls.length===1?getChatMediaFrameAttributes(url):''} href="${directGroupEscape(url)}" target="_blank" rel="noopener noreferrer"><img src="${directGroupEscape(url)}" loading="lazy" decoding="async" alt="Attached image"></a>`).join('')}</div>`:'';
@@ -85720,7 +85837,17 @@ function getVisibleChatStackEl(id) {
       if(button)button.disabled=false;if(!response?.success)return directGroupNote(response?.message||'Could not send message.');
       if(s.activeId!==id)return;
       input.innerHTML='';s.pendingImages=[];renderDirectGroupAttachments();window.cancelDirectGroupReply();
-      if(response.message){const i=s.messages.findIndex(m=>m.id===response.message.id);if(i>=0)s.messages[i]=response.message;else s.messages.push(response.message);renderDirectGroupMessages({forceBottom:!editing});if(editing)window.flashPsnChatMessageAction(() => document.querySelector(`#direct-group-messages [data-direct-group-message="${CSS.escape(String(editing))}"]`),'edit',`group:${id}:${editing}`);}
+      if(response.message){
+        const i=s.messages.findIndex(m=>String(m.id)===String(response.message.id));
+        const prior=i>=0?s.messages[i]:null;
+        // Event payloads contain authoritative recipient/readBy lists, while send
+        // acknowledgments omit them. A matching ack must not erase those receipts.
+        const alreadyReceived=!!(prior&&directGroupAckState(prior)===directGroupAckState(response.message));
+        if(i>=0){if(!alreadyReceived)s.messages[i]=response.message;}else s.messages.push(response.message);
+        const rendered=document.getElementById('direct-group-messages')?.querySelector(`[data-direct-group-message="${CSS.escape(String(response.message.id))}"]`);
+        if(!rendered||!alreadyReceived)renderDirectGroupMessages({forceBottom:!editing});
+        if(editing)window.flashPsnChatMessageAction(() => document.querySelector(`#direct-group-messages [data-direct-group-message="${CSS.escape(String(editing))}"]`),'edit',`group:${id}:${editing}`);
+      }
       scheduleDirectGroupListRefresh();
     });
   };
@@ -85811,10 +85938,20 @@ function getVisibleChatStackEl(id) {
       if(s.messages.length>200)s.messages.splice(0,s.messages.length-200);
       if(list&&payload.kind!=='delete'&&payload.message){
         const msg=payload.message,row=list.querySelector(`[data-direct-group-message="${CSS.escape(String(msg.id))}"]`);
-        if(row){const before=list.scrollHeight,top=list.scrollTop;row.outerHTML=directGroupMessageHtml(msg);if(typeof hydrateChatInternalShareLinks==='function')hydrateChatInternalShareLinks(list.querySelector(`[data-direct-group-message="${CSS.escape(String(msg.id))}"]`));if(!nearBottom)list.scrollTop=top+(list.scrollHeight-before);}
+        let reactionsPatched=false;
+        if(row){
+          reactionsPatched=patchDirectGroupReactions(row,previousMessage,msg);
+          if(!reactionsPatched){
+            const before=list.scrollHeight,top=list.scrollTop;
+            row.outerHTML=directGroupMessageHtml(msg);
+            if(typeof hydrateChatInternalShareLinks==='function')hydrateChatInternalShareLinks(list.querySelector(`[data-direct-group-message="${CSS.escape(String(msg.id))}"]`));
+            if(!nearBottom)list.scrollTop=top+(list.scrollHeight-before);
+          }
+        }
         else if(s.messages.length>1){list.insertAdjacentHTML('beforeend',directGroupMessageHtml(msg));if(typeof hydrateChatInternalShareLinks==='function')hydrateChatInternalShareLinks(list.lastElementChild);if(nearBottom)list.scrollTop=list.scrollHeight;}
         else renderDirectGroupMessages({forceBottom:true});
-        document.getElementById('direct-group-count').textContent=s.messages.length;renderDirectGroupPins();
+        document.getElementById('direct-group-count').textContent=s.messages.length;
+        if(!reactionsPatched)renderDirectGroupPins();
       }else if(list&&payload.kind==='delete'){
         const row=list.querySelector(`[data-direct-group-message="${CSS.escape(String(payload.id))}"]`);
         if(row){
@@ -85831,17 +85968,23 @@ function getVisibleChatStackEl(id) {
       const s=window.__directGroupState,groupId=String(payload?.groupId||''),reader=String(payload?.user||payload?.reader||'').trim(),lastId=Number(payload?.lastMessageId||payload?.lastReadId||0);
       if(!groupId||!reader||!Number.isSafeInteger(lastId)||lastId<=0)return;
       if(s.activeId===groupId){
-        for(const m of s.messages){if(m.from===reader||Number(m.id)>lastId||!Array.isArray(m.readBy)||!Array.isArray(m.recipients))continue;if(m.recipients.includes(reader)&&!m.readBy.includes(reader))m.readBy.push(reader);}
+        const changedOwnMessages=[];
+        const me=directGroupMyName();
+        for(const m of s.messages){
+          if(m.from===reader||Number(m.id)>lastId||!Array.isArray(m.readBy)||!Array.isArray(m.recipients))continue;
+          if(m.recipients.includes(reader)&&!m.readBy.includes(reader)){
+            m.readBy.push(reader);
+            if(m.from===me)changedOwnMessages.push(m);
+          }
+        }
         const list=document.getElementById('direct-group-messages');
-        if(list){
-          const rows = list.querySelectorAll('.direct-message-row.own');
-          if (rows.length) {
-            const messagesById = new Map();
-            for (const message of s.messages) {
-              const id = String(message.id);
-              if (!messagesById.has(id)) messagesById.set(id, message);
-            }
-            rows.forEach(row=>{const m=messagesById.get(row.dataset.directGroupMessage);if(!m)return;const prior=row.querySelector('.direct-message-actions .direct-group-read-indicator');if(!prior)return;const replacement=document.createElement('span');replacement.innerHTML=directGroupReceiptHtml(m);prior.replaceWith(replacement.firstElementChild);});
+        if(list)for(const m of changedOwnMessages){
+          const row=list.querySelector(`[data-direct-group-message="${CSS.escape(String(m.id))}"]`);
+          const prior=row?.querySelector('.direct-message-actions .direct-group-read-indicator');
+          if(prior){
+            const replacement=document.createElement('span');
+            replacement.innerHTML=directGroupReceiptHtml(m);
+            if(replacement.firstElementChild)prior.replaceWith(replacement.firstElementChild);
           }
         }
       }
@@ -89030,16 +89173,40 @@ function getVisibleChatStackEl(id) {
 		const anchor = updates.length ? captureDirectScrollAnchor(list) : null;
 		const previousTop = list.scrollTop;
 		const previousHeight = list.scrollHeight;
+		const replaced = [];
 		for (const update of updates) {
-			if (window.directChatTranslationCache) delete window.directChatTranslationCache[String(update.message.id)];
-			update.row.outerHTML = directMessageRowHtml(update.message, { messageIndex:update.index, currentUser:snapshot.user });
+			let onlyReactions = false;
+			try {
+				const prior = JSON.parse(snapshot.entries[update.offset].value);
+				if (String(prior.createdAt || '') === String(update.message.createdAt || '') && directMessageStateSignature(prior, false) === directMessageStateSignature(update.message, false)) {
+					const stack = update.row.querySelector(':scope > .direct-message-stack');
+					const bubble = stack?.querySelector(':scope > .direct-message-bubble');
+					if (bubble) {
+						const html = directReactionHtml(update.message);
+						const container = stack.querySelector(':scope > .reactions-container');
+						if (container) { if (html) container.innerHTML = html; else container.remove(); }
+						else if (html) bubble.insertAdjacentHTML('afterend', `<div class="reactions-container">${html}</div>`);
+						onlyReactions = true;
+					}
+				}
+			} catch (_) {}
+			if (!onlyReactions) {
+				if (window.directChatTranslationCache) delete window.directChatTranslationCache[String(update.message.id)];
+				update.row.outerHTML = directMessageRowHtml(update.message, { messageIndex:update.index, currentUser:snapshot.user });
+				replaced.push(update.message);
+			}
 			snapshot.entries[update.offset].value = update.value;
 		}
 		if (updates.length) {
-			if (typeof hydrateChatInternalShareLinks === 'function') hydrateChatInternalShareLinks(list);
-			hydrateDirectLinkPreviews(updates.map(update => update.message));
-			if (typeof hydrateChatMediaImages === 'function') hydrateChatMediaImages(list);
-			if (isDirectChatAutoTranslateEnabled()) requestAnimationFrame(() => updates.forEach(update => autoTranslateDirectMessage(update.message.id, list)));
+			if (replaced.length) {
+				if (typeof hydrateChatInternalShareLinks === 'function') hydrateChatInternalShareLinks(list);
+				hydrateDirectLinkPreviews(replaced);
+				if (typeof hydrateChatMediaImages === 'function') replaced.forEach(message => {
+					const row = list.querySelector(`[data-direct-message-id="${CSS.escape(String(message.id))}"]`);
+					if (row) hydrateChatMediaImages(row);
+				});
+				if (isDirectChatAutoTranslateEnabled()) requestAnimationFrame(() => replaced.forEach(message => autoTranslateDirectMessage(message.id, list)));
+			}
 			requestAnimationFrame(() => {
 				if (!list.isConnected) return;
 				if (keepBottom) list.scrollTop = list.scrollHeight;
@@ -91735,7 +91902,15 @@ function getVisibleChatStackEl(id) {
 			const container = renderedEntry && typeof getChatRenderedMessagePart === 'function'
 				? getChatRenderedMessagePart(data.msgId, 'reactions', renderedEntry)
 				: document.getElementById(`reactions-${data && data.msgId}`);
-			if (!container || !data || !data.emoji) return;
+			if (!container || !data || !data.emoji) {
+				// A reaction on a virtualized message updates the history, not the DOM.
+				// Leave the rendered signature stale so later rendering picks it up.
+				if (storedChanged && typeof markChatMessageRenderDirty === 'function') {
+					const storedMsg = typeof getChatMessageByIdFast === 'function' ? getChatMessageByIdFast(data.msgId) : null;
+					markChatMessageRenderDirty(storedMsg);
+				}
+				return;
+			}
 			let pill = renderedEntry && typeof getChatRenderedReactionPill === 'function'
 				? getChatRenderedReactionPill(data.msgId, data.emoji, renderedEntry, container)
 				: container.querySelector(`[data-emoji="${data.emoji}"]`);
@@ -102776,7 +102951,10 @@ function getVisibleChatStackEl(id) {
 		const friendsViewVisible = !!(friendsParentView && friendsSubview
 			&& friendsParentView.style.display !== 'none'
 			&& friendsSubview.style.display !== 'none');
-		if (!friendsViewVisible && !window.isRestoringHistory) return;
+		if (!friendsViewVisible && !window.isRestoringHistory) {
+			if (PSN_STATIC_NAV_DOM.friendsGrid) clearProgressiveGridObserver('friends-search', PSN_STATIC_NAV_DOM.friendsGrid);
+			return;
+		}
 		const grid = PSN_STATIC_NAV_DOM.friendsGrid;
 		const emptyMsg = PSN_STATIC_NAV_DOM.friendsEmptyMsg;
 		const container = PSN_STATIC_NAV_DOM.friendsContainer;
@@ -102829,14 +103007,20 @@ function getVisibleChatStackEl(id) {
 			? window.getPsnNamedPoolMap('search', globalSearchList)
 			: new Map(globalSearchList.map(user => [String(user && (user.name || user) || ''), user]).filter(entry => entry[0]));
 		const friendLookupContext = { onlineByName, friendByName, globalSearchByName, preferFriendData: true };
+		const storedFriendLastSeen = new Map();
 		const getKnownFriendLastSeen = (name, friendRecord = null, networkRecord = null) => {
 			const searchRecord = globalSearchByName.get(name) || null;
+			let persistedLastSeen = storedFriendLastSeen.get(name);
+			if (persistedLastSeen === undefined) {
+				persistedLastSeen = Number(localStorage.getItem(`${name}_psn_lastSeen`)) || 0;
+				storedFriendLastSeen.set(name, persistedLastSeen);
+			}
 			return Math.max(
 				Number(networkRecord && (networkRecord.lastSeen || networkRecord.last_seen)) || 0,
 				Number(window.__presenceLastSeenByUser && window.__presenceLastSeenByUser[name]) || 0,
 				Number(searchRecord && (searchRecord.lastSeen || searchRecord.last_seen)) || 0,
 				Number(friendRecord && (friendRecord.lastSeen || friendRecord.last_seen)) || 0,
-				Number(localStorage.getItem(`${name}_psn_lastSeen`)) || 0
+				persistedLastSeen
 			);
 		};
 	
@@ -102874,6 +103058,7 @@ function getVisibleChatStackEl(id) {
 		}
 	
 		if (visibleFriendList.length === 0 && !isSearching) {
+			clearProgressiveGridObserver('friends-search', grid);
 			if (typeof window.syncAlphabeticalSortButtonState === 'function') window.syncAlphabeticalSortButtonState('friends', 0);
 			if (emptyMsg) emptyMsg.style.display = 'block';
 			if (container) {
@@ -103020,17 +103205,17 @@ function getVisibleChatStackEl(id) {
 		]);
 		const friendsSameSignature = grid.dataset.friendsRenderSignature === friendsRenderSignature;
 		const friendsSameProgressiveSignature = grid.dataset.friendsProgressiveSignature === friendsProgressiveSignature;
-		clearProgressiveGridObserver('friends-search', grid);
 
 		if (friendsUseProgressiveSearch) {
 			if (!friendsAppendProgressive && friendsSameSignature && friendsSameProgressiveSignature && grid.childElementCount > 0) {
 				const renderedCount = Math.min(friendsTotalMatches, friendsPreviouslyRendered || friendsProgressiveInitial);
 				grid.dataset.friendsProgressiveRendered = String(renderedCount);
 				if (!isSilent && typeof setupRevealAnimations === 'function') setupRevealAnimations('friends-list-grid');
-				setupProgressiveGridObserver('friends-search', grid, renderedCount, friendsTotalMatches, () => window.renderFriendsList(searchTerm, true, 'append'));
+				setupProgressiveGridObserver('friends-search', grid, renderedCount, friendsTotalMatches, () => window.renderFriendsList(searchTerm, true, 'append'), null, '', friendsProgressiveSignature);
 				return;
 			}
 
+			clearProgressiveGridObserver('friends-search', grid);
 			const canAppendSearch = friendsAppendProgressive && friendsSameProgressiveSignature && friendsPreviouslyRendered > 0 && grid.childElementCount > 0;
 			const renderStart = canAppendSearch ? friendsPreviouslyRendered : 0;
 			const resetTarget = (!canAppendSearch && friendsSameProgressiveSignature && friendsPreviouslyRendered > 0)
@@ -103081,11 +103266,12 @@ function getVisibleChatStackEl(id) {
 			}
 			grid.dataset.friendsProgressiveRendered = String(renderEnd);
 			if (!isSilent && typeof setupRevealAnimations === 'function') setupRevealAnimations('friends-list-grid');
-			setupProgressiveGridObserver('friends-search', grid, renderEnd, friendsTotalMatches, () => window.renderFriendsList(searchTerm, true, 'append'));
+			setupProgressiveGridObserver('friends-search', grid, renderEnd, friendsTotalMatches, () => window.renderFriendsList(searchTerm, true, 'append'), null, '', friendsProgressiveSignature);
 			if (typeof window.refreshVisiblePsnUserAvatars === 'function') window.refreshVisiblePsnUserAvatars(grid);
 			return;
 		}
 
+		clearProgressiveGridObserver('friends-search', grid);
 		delete grid.dataset.friendsProgressiveRendered;
 		delete grid.dataset.friendsProgressiveSignature;
 		if (grid.dataset.friendsRenderSignature === friendsRenderSignature && grid.childElementCount > 0) {
@@ -113813,6 +113999,12 @@ function getVisibleChatStackEl(id) {
     if(state.postRefreshTimers.has(id))clearTimeout(state.postRefreshTimers.get(id));
     state.postRefreshTimers.set(id,setTimeout(()=>{state.postRefreshTimers.delete(id);if(visible())refreshPost(id);},220));
   }
+  function socialPostReactionSignature(post){
+    const counts=(Array.isArray(post?.reactions)?post.reactions:[])
+      .map(row=>[s(row?.emoji),Math.max(0,Number(row?.count)||0)])
+      .sort((left,right)=>left[0]<right[0]?-1:left[0]>right[0]?1:0);
+    return JSON.stringify([s(post?.myReaction),counts]);
+  }
   async function refreshPost(id){
     const target=idOf(id);
     if(!target||!state.posts.some(post=>post.id===target))return;
@@ -113832,19 +114024,41 @@ function getVisibleChatStackEl(id) {
     if(post.id!==target)return;
     const index=state.posts.findIndex(item=>item.id===target);
     if(index<0)return;
+    const previous=state.posts[index];
+    const reactionsChanged=socialPostReactionSignature(previous)!==socialPostReactionSignature(post);
+    const commentsChanged=Number(previous?.comments||0)!==Number(post.comments||0);
+    const textChanged=s(previous?.text)!==s(post.text);
     state.posts[index]=post;
-    const card=document.querySelector(`[data-social-post="${target}"]`);
+    const card=feed()?.querySelector(`[data-social-post="${target}"]`);
     if(!card)return;
     const bar=card.querySelector(':scope > .psn-social-actionbar');
-    if(bar){const wrapper=document.createElement('div');wrapper.innerHTML=postActionbar(post);bar.replaceWith(wrapper.firstElementChild);}
+    if(bar&&reactionsChanged){
+      const wrapper=document.createElement('div');wrapper.innerHTML=postActionbar(post);
+      bar.replaceWith(wrapper.firstElementChild);
+    }else if(bar&&commentsChanged){
+      const counter=bar.querySelector('[data-social-action="comments"] .psn-social-action-count');
+      if(counter)counter.textContent=String(Number(post.comments)||0);
+      else {const wrapper=document.createElement('div');wrapper.innerHTML=postActionbar(post);bar.replaceWith(wrapper.firstElementChild);}
+    }
     const count=document.getElementById('psn-social-modal-count');
-    if(count&&state.modalPostId===target)count.textContent=String(post.comments||0);
+    if(count&&state.modalPostId===target){
+      const nextCount=String(post.comments||0);
+      if(count.textContent!==nextCount)count.textContent=nextCount;
+    }
     const age=card.querySelector('.psn-social-age[data-social-post-age]');
-    if(age)age.innerHTML=esc(timeLabel(post.createdAt))+' · Public'+(post.editedAt?'<span class="psn-social-edited" title="Edited after publishing">Edited</span>':'');
-    if(state.editId!==target){
+    if(age){
+      const nextAge=esc(timeLabel(post.createdAt))+' · Public'+(post.editedAt?'<span class="psn-social-edited" title="Edited after publishing">Edited</span>':'');
+      if(age.innerHTML!==nextAge)age.innerHTML=nextAge;
+    }
+    if(textChanged&&state.editId!==target){
       const body=card.querySelector('.psn-social-body');
-      if(body){ if(post.text){body.innerHTML=socialSafeHtml(post.text);body.classList.toggle('is-rich',s(post.text).startsWith(SOCIAL_RICH_PREFIX));}else body.remove(); }
-      else if(post.text){const element=document.createElement('div');element.className='psn-social-body'+(s(post.text).startsWith(SOCIAL_RICH_PREFIX)?' is-rich':'');element.innerHTML=socialSafeHtml(post.text);card.querySelector('.psn-social-head')?.after(element);}
+      if(body){
+        if(post.text){body.innerHTML=socialSafeHtml(post.text);body.classList.toggle('is-rich',s(post.text).startsWith(SOCIAL_RICH_PREFIX));}
+        else body.remove();
+      }else if(post.text){
+        const element=document.createElement('div');element.className='psn-social-body'+(s(post.text).startsWith(SOCIAL_RICH_PREFIX)?' is-rich':'');
+        element.innerHTML=socialSafeHtml(post.text);card.querySelector('.psn-social-head')?.after(element);
+      }
     }
   }
   function cardReactions(reactions,myReaction,postId,commentId){
