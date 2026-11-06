@@ -7901,7 +7901,22 @@ body.psn-home-interactive.psn-sidebar-tab-switched .sidebar > .sidebar-menu[clas
 .psn-social-reactors-name { flex:1; min-width:0; font-size:13px; font-weight:650; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .psn-social-reactors-emoji { font-size:23px; flex:none; }
 .psn-social-reactors-empty { padding:32px 10px; text-align:center; color:var(--text-muted); font-size:13px; }
-.psn-social-reactors-more { display:block; width:calc(100% - 34px); margin:8px 17px 17px; }
+.psn-social-reactors-more { display:flex; width:calc(100% - 34px); margin:8px 17px 17px; position:relative; overflow:hidden; }
+.psn-social-reactors-filter,.psn-social-reactors-more { position:relative; overflow:hidden; isolation:isolate; }
+.psn-social-reactors-filter::after,.psn-social-reactors-more::after { content:''; position:absolute; top:0; bottom:0; left:-120%; width:48%; pointer-events:none; background:linear-gradient(90deg,transparent,rgba(255,255,255,.20),transparent); transform:skewX(-22deg); }
+.psn-social-reactors-filter:hover::after,.psn-social-reactors-more:hover:not(:disabled)::after { animation:btn-shine .65s ease-out forwards; }
+.psn-social-reactors-filter:is(.psn-primary-pressed,.mobile-pressed),.psn-social-reactors-more:is(.psn-primary-pressed,.mobile-pressed) { transform:translateY(1px) scale(.94) !important; filter:brightness(.85) !important; box-shadow:inset 0 3px 7px rgba(0,0,0,.34) !important; transition-duration:.06s !important; }
+.psn-social-reactors-filter.is-selected { box-shadow:inset 0 1px 0 rgba(255,255,255,.12),0 0 10px rgba(0,112,204,.16); }
+.psn-social-reactors-filter:focus-visible,.psn-social-reactors-more:focus-visible,.psn-social-reactors-person:focus-visible { outline:2px solid var(--psn-focus-ring); outline-offset:2px; }
+.psn-social-reactors-more.is-loading { opacity:.82; cursor:progress; }
+.psn-social-reactors-more.is-loading i { animation:consoleStorageRefreshSpin .85s linear infinite; }
+.psn-social-reactors-placeholder { display:flex; align-items:center; gap:12px; padding:11px 4px; border-bottom:1px solid rgba(255,255,255,.055); }
+.psn-social-reactors-placeholder-avatar { width:42px; height:42px; border-radius:50%; flex:none; }
+.psn-social-reactors-placeholder-text { display:grid; gap:9px; flex:1; }
+.psn-social-reactors-placeholder-line { display:block; height:10px; border-radius:6px; width:66%; }
+.psn-social-reactors-placeholder-line.short { width:37%; height:8px; }
+.psn-social-reactors-placeholder-avatar,.psn-social-reactors-placeholder-line { background:rgba(255,255,255,.065); animation:pulse-skeleton 1.55s ease-in-out infinite; }
+@media(prefers-reduced-motion:reduce) { .psn-social-reactors-placeholder-avatar,.psn-social-reactors-placeholder-line { animation:none; } .psn-social-reactors-filter::after,.psn-social-reactors-more::after { animation:none !important; } }
 @media(max-width:768px) { #psn-social-reactors-modal { padding:9px; } .psn-social-reactors-dialog { max-height:calc(100dvh - 22px); } .psn-social-reactors-filters { padding:10px 13px; } .psn-social-reactors-list { padding:5px 13px; } .psn-social-reactors-more { width:calc(100% - 26px); margin:8px 13px 13px; } }
 @media(prefers-reduced-motion:reduce) { .psn-social-reactors-dialog { animation:none; } }
 
@@ -90762,6 +90777,7 @@ function getVisibleChatStackEl(id) {
 			if (((window.__chatCacheHydratedUser && window.__chatCacheHydratedUser !== name) || (localStorage.getItem('psn_username') && localStorage.getItem('psn_username') !== name)) && typeof window.resetChatSessionForAccountChange === 'function') window.resetChatSessionForAccountChange();
 			safeLocalStorageSet('psn_username', name);
 			socketChat.__psnGlobalAuthenticatedName = name;
+			if (typeof window.psnSocialWarmFeed === 'function') window.psnSocialWarmFeed();
 			if (typeof window.restoreContentReportMineCache === 'function') window.restoreContentReportMineCache(name);
 			if (typeof socketChat !== 'undefined' && socketChat && socketChat.connected) {
 				socketChat.emit('content_report_request_mine', { callbackOnly: true }, response => {
@@ -113249,6 +113265,30 @@ function getVisibleChatStackEl(id) {
     socket:null, refreshTimer:0, requestSerial:0, infiniteObserver:null, scrollFallback:null, editId:null,
     modalPostId:null, modalOpener:null, modalRequest:0, pendingReactions:new Set(), postRefreshTimers:new Map(), postRefreshInFlight:new Set(), postRefreshDirty:new Set(), removingPosts:new Map(), removingComments:new Map(), focusReportedCommentId:null };
   const unseen={socket:null,seen:'0',newest:'0',active:false,ready:false};
+  // One user-scoped first-page prefetch during the global post-login Preparing phase.
+  // Never initialize the feed UI here; Home remains the boot priority.
+  const warmFeed={owner:'',socket:null,token:0,promise:null,ready:null};
+  function invalidateWarmFeed(){
+    warmFeed.token++;warmFeed.ready=null;warmFeed.promise=null;
+  }
+  function primeSocialFeed(){
+    if(!socialSessionReady()||visible())return null;
+    const owner=identity(),socket=socketChat;
+    if(warmFeed.owner!==owner||warmFeed.socket!==socket){
+      invalidateWarmFeed();warmFeed.owner=owner;warmFeed.socket=socket;
+    }
+    if(warmFeed.ready&&Date.now()-warmFeed.ready.at<30000)return Promise.resolve(warmFeed.ready.response);
+    if(warmFeed.promise)return warmFeed.promise;
+    const token=++warmFeed.token;
+    const request=call('social_feed_list',{filter:'all',friendsOnly:false,before:null}).then(response=>{
+      if(token!==warmFeed.token||warmFeed.owner!==identity()||warmFeed.socket!==socket||!socialSessionReady())return null;
+      if(response?.success){warmFeed.ready={at:Date.now(),response};return response;}
+      return null;
+    }).catch(()=>null).finally(()=>{if(token===warmFeed.token)warmFeed.promise=null;});
+    warmFeed.promise=request;
+    return request;
+  }
+  window.psnSocialWarmFeed=primeSocialFeed;
   function socialSessionReady(){
     const socket=typeof socketChat==='undefined'?null:socketChat;
     const name=identity();
@@ -113279,6 +113319,7 @@ function getVisibleChatStackEl(id) {
     if(!data?.name)return;
     setTimeout(()=>{
       if(!socialSessionReady()||data.name!==identity())return;
+      if(!visible())primeSocialFeed();
       if(visible()&&state.owner!==identity()){window.psnSocialOpen();return;}
       refreshUnseen();
       if(!visible())return;
@@ -113288,6 +113329,7 @@ function getVisibleChatStackEl(id) {
     },0);
   }
   function onUnseenPost(data){
+    if(data?.kind==='post')invalidateWarmFeed();
     if(data?.kind!=='post'||!data.id||data.author===identity())return;
     if(!unseen.ready)return;
     if(newer(data.id,unseen.newest))unseen.newest=s(data.id);
@@ -113450,7 +113492,7 @@ function getVisibleChatStackEl(id) {
     socketChat.on('social_feed_changed',onChanged);
     socketChat.on('social_activity_notice',onNotice);
   }
-  function onDisconnect(){state.stale=true;}
+  function onDisconnect(){state.stale=true;invalidateWarmFeed();}
   function onNotice(data){
     if(!data||!data.actor||!visible())return;
     if(typeof showToastNotification==='function')showToastNotification('Social',`${data.actor} ${data.activity==='comment'?'commented on':'reacted to'} your post.`);
@@ -113656,7 +113698,7 @@ function getVisibleChatStackEl(id) {
       <div class="psn-social-modal-head"><div class="psn-social-modal-heading" id="psn-social-reactors-title"><i class="far fa-heart"></i> Reactions <span class="psn-social-action-count" id="psn-social-reactors-total"></span></div><button type="button" class="psn-social-modal-close" data-reactors-close aria-label="Close reactions"><i class="fas fa-times"></i></button></div>
       <div class="psn-social-reactors-filters" id="psn-social-reactors-filters" role="group" aria-label="Filter reactions"></div>
       <div class="psn-social-reactors-list" id="psn-social-reactors-list" aria-live="polite"></div>
-      <button type="button" class="psn-social-btn psn-social-reactors-more" data-reactors-more hidden>Load more</button>
+      <button type="button" class="psn-social-btn psn-social-reactors-more" data-reactors-more hidden><i class="fas fa-chevron-down" aria-hidden="true"></i><span>Load more</span></button>
     </section>`;
     overlay.addEventListener('click',event=>{
       if(event.target===overlay||event.target.closest('[data-reactors-close]')){closeSocialReactors();return;}
@@ -113692,6 +113734,7 @@ function getVisibleChatStackEl(id) {
   function closeSocialReactors(){
     const overlay=socialReactors.overlay;if(!overlay||overlay.hidden)return;
     overlay.hidden=true;socialReactors.serial++;socialReactors.busy=false;clearTimeout(socialReactors.refreshTimer);
+    overlay.querySelector('#psn-social-reactors-list')?.removeAttribute('aria-busy');
     const opener=socialReactors.opener;
     socialReactors.id='';socialReactors.opener=null;socialReactors.after=null;
     if(opener?.isConnected)opener.focus({preventScroll:true});
@@ -113708,6 +113751,9 @@ function getVisibleChatStackEl(id) {
     overlay.querySelector('[data-reactors-close]')?.focus({preventScroll:true});
     loadSocialReactors(false);
   }
+  function socialReactorSkeleton(count=4){
+    return '<div class="psn-social-reactors-placeholder" aria-hidden="true"><span class="psn-social-reactors-placeholder-avatar"></span><span class="psn-social-reactors-placeholder-text"><span class="psn-social-reactors-placeholder-line"></span><span class="psn-social-reactors-placeholder-line short"></span></span></div>'.repeat(count);
+  }
   async function loadSocialReactors(more){
     const overlay=socialReactors.overlay;if(!overlay||overlay.hidden)return;
     if(more&&(socialReactors.busy||!socialReactors.after))return;
@@ -113715,18 +113761,20 @@ function getVisibleChatStackEl(id) {
     const serial=++socialReactors.serial;socialReactors.busy=true;
     const list=overlay.querySelector('#psn-social-reactors-list');
     const moreButton=overlay.querySelector('[data-reactors-more]');
-    if(!more){socialReactors.after=null;list.innerHTML='<div class="psn-social-reactors-empty">Loading reactions…</div>';}
-    moreButton.hidden=true;
+    if(!more){socialReactors.after=null;list.innerHTML=socialReactorSkeleton();list.setAttribute('aria-busy','true');moreButton.hidden=true;}
+    else {moreButton.disabled=true;moreButton.classList.add('is-loading');moreButton.innerHTML='<i class="fas fa-spinner" aria-hidden="true"></i><span>Loading...</span>';}
     const result=await call('social_reactors_list',{kind,id,emoji,after:more?socialReactors.after:''});
     if(serial!==socialReactors.serial||overlay.hidden)return;
     socialReactors.busy=false;
+    list.removeAttribute('aria-busy');
+    moreButton.disabled=false;moreButton.classList.remove('is-loading');
     if(!result.success){
       if(!more)list.innerHTML=`<div class="psn-social-reactors-empty">${esc(result.message||'Could not load reactions.')}</div>`;
       else notify(result.message||'Could not load reactions.',true);
-      moreButton.hidden=false;moreButton.textContent='Try again';moreButton.dataset.reactorsRetry=more?'more':'first';
+      moreButton.hidden=false;moreButton.innerHTML='<i class="fas fa-redo-alt" aria-hidden="true"></i><span>Try again</span>';moreButton.dataset.reactorsRetry=more?'more':'first';
       return;
     }
-    moreButton.dataset.reactorsRetry='more';moreButton.textContent='Load more';
+    moreButton.dataset.reactorsRetry='more';moreButton.innerHTML='<i class="fas fa-chevron-down" aria-hidden="true"></i><span>Load more</span>';
     const users=Array.isArray(result.users)?result.users:[];
     const markup=users.map(user=>`<button type="button" class="psn-social-reactors-person" data-reactors-user="${esc(user.name)}" aria-label="View ${esc(user.name)} profile"><span>${socialAvatar(user.name,user.avatar)}</span><span class="psn-social-reactors-name">${esc(user.name)}</span><span class="psn-social-reactors-emoji" aria-label="${esc(user.emoji)}">${esc(user.emoji)}</span></button>`).join('');
     if(!more)list.innerHTML=markup||'<div class="psn-social-reactors-empty">No reactions yet.</div>';
@@ -113855,13 +113903,18 @@ function getVisibleChatStackEl(id) {
     const serial=state.requestSerial;
     const mode=state.filter;
     const requestId=++state.activeRequest;
-    if(!more&&!silent){el.innerHTML=skeletonMarkup();el.setAttribute('aria-busy','true');}
+    const warmAvailable=!more&&!silent&&mode==='all'&&!state.stale&&warmFeed.owner===identity()&&warmFeed.socket===socketChat;
+    const warmReady=warmAvailable&&warmFeed.ready&&Date.now()-warmFeed.ready.at<30000?warmFeed.ready.response:null;
+    const warmPending=warmAvailable&&!warmReady?warmFeed.promise:null;
+    if(!more&&!silent&&!warmReady){el.innerHTML=skeletonMarkup();el.setAttribute('aria-busy','true');}
     const moreLoading=document.getElementById('psn-social-loading-more');
     if(more&&moreLoading){moreLoading.innerHTML=skeletonMarkup(1);moreLoading.hidden=false;}
     state.loading=true;
     state.inflightMode=mode;
     state.inflightOwner=identity();
-    const res=await call('social_feed_list',{filter:mode,friendsOnly:mode==='friends',before:more?state.before:null});
+    // Reuse an in-flight Preparing request instead of issuing a second query.
+    const res=warmReady||(warmPending&&await warmPending)||await call('social_feed_list',{filter:mode,friendsOnly:mode==='friends',before:more?state.before:null});
+    if(warmAvailable&&warmFeed.owner===identity())warmFeed.ready=null;
     if(requestId!==state.activeRequest||mode!==state.filter||serial!==state.requestSerial||state.inflightOwner!==identity())return;
     state.loading=false;
     el.removeAttribute('aria-busy');
@@ -114358,6 +114411,7 @@ function getVisibleChatStackEl(id) {
       state.requestSerial++;
       state.activeRequest++;
       state.loading=false;
+      if(warmFeed.owner&&warmFeed.owner!==current){invalidateWarmFeed();warmFeed.owner='';warmFeed.socket=null;}
       state.filter='all';syncSocialFeedFilter();
       closeSocialReactors();closeCommentModal();closeSocialGifPicker();
       state.pendingImages.forEach(photo=>{if(photo.file)URL.revokeObjectURL(photo.preview);});state.pendingImages=[];
@@ -114396,6 +114450,8 @@ function getVisibleChatStackEl(id) {
     } else notify('This publication is no longer available.',true);
   };
   window.psnSocialRefresh=function(){if(visible())loadFeed(false,true);};
+  // If authentication completed before the Social bundle registered its hook.
+  if(socialSessionReady())queueMicrotask(primeSocialFeed);
   function openSocialDeepLink(){
     const match=location.hash.match(/^#social-post-(\d{1,18})$/);
     if(match){history.replaceState(null,'',location.pathname+location.search);window.psnSocialOpenPost(match[1]);}
