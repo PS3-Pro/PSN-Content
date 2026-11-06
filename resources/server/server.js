@@ -9810,7 +9810,7 @@ async function initProfileSyncNotifications() {
       if (data.instanceId === INSTANCE_ID) return;
 
       if (message.channel === 'social_feed_sync') {
-        io.emit('social_feed_changed', {kind:data.kind,id:String(data.id || ''),at:data.at});
+        io.emit('social_feed_changed', {kind:data.kind,id:String(data.id || ''),commentId:data.commentId ? String(data.commentId) : null,at:data.at});
         return;
       }
       if (message.channel === 'direct_group_sync') {
@@ -12736,8 +12736,8 @@ async function socialReadComments(actor, postId) {
   return (result.rows||[]).map(serializeSocialComment);
 }
 
-function socialPublish(kind, id) {
-  const payload = { kind, id: String(id || ''), at: Date.now() };
+function socialPublish(kind, id, extra = null) {
+  const payload = { kind, id: String(id || ''), ...(extra && typeof extra === 'object' ? extra : {}), at: Date.now() };
   io.emit('social_feed_changed', payload);
   deferServerTask('SOCIAL FEED NOTIFY', () => pool.query('SELECT pg_notify($1,$2)',[
     'social_feed_sync',JSON.stringify({ ...payload, instanceId: INSTANCE_ID })
@@ -12820,7 +12820,7 @@ io.on('connection', (socket) => {
         : await queryDbWithRetry('SELECT author_name,body,id AS post_id FROM social_posts WHERE id=$1',[id],{attempts:2,label:'SOCIAL POST REPORT LOOKUP'});
       const target = result.rows[0];
       if (!target) return reply({success:false,message:'This publication is no longer available.'});
-      const msgId=`social-${kind}-${id}`;
+      const msgId=kind==='comment' ? `social-comment-${target.post_id}-${id}` : `social-post-${id}`;
       const duplicate = await queryDbWithRetry("SELECT 1 FROM reports WHERE resolved=false AND data->>'reporter'=$1 AND data->>'msgId'=$2 LIMIT 1",
         [actor,msgId],{attempts:2,label:'SOCIAL REPORT DEDUPE'});
       if(duplicate.rows.length)return reply({success:true,unchanged:true});
@@ -12865,6 +12865,7 @@ io.on('connection', (socket) => {
       const deleted = await queryDbWithRetry('DELETE FROM social_posts WHERE id=$1 RETURNING id',[id],{attempts:2,label:'SOCIAL POST DELETE'});
       if (!deleted.rowCount) return reply({success:false,message:'Post no longer exists.'});
       socialPublish('delete',id);
+      if(owner!==actor)deferServerTask('SOCIAL POST MODERATION LOG',()=>addModerationLog('social_post_delete',`Deleted Social post #${id} by ${owner}`,{postId:id,targetUser:owner},actor),0);
       reply({ success:true });
     } catch (err) {
       console.error('[SOCIAL POST DELETE ERROR]:',err && err.message || err);
@@ -12953,7 +12954,8 @@ io.on('connection', (socket) => {
       if (!row || (row.author_name !== actor && !(canModerateSocket(socket) && canModerateTarget(socket,row.author_name)))) return reply({success:false,message:'Not allowed.'});
       const deleted = await queryDbWithRetry('DELETE FROM social_comments WHERE id=$1 RETURNING id',[id],{attempts:2,label:'SOCIAL COMMENT DELETE'});
       if (!deleted.rowCount) return reply({success:false,message:'Comment not found.'});
-      socialPublish('comment',row.post_id);
+      socialPublish('comment-delete',row.post_id,{commentId:id});
+      if(row.author_name!==actor)deferServerTask('SOCIAL COMMENT MODERATION LOG',()=>addModerationLog('social_comment_delete',`Deleted Social comment #${id} by ${row.author_name}`,{commentId:id,postId:String(row.post_id),targetUser:row.author_name},actor),0);
       reply({success:true});
     } catch (err) {console.error('[SOCIAL COMMENT DELETE ERROR]:',err && err.message || err);reply({success:false,message:'Could not delete comment.'});}
   });

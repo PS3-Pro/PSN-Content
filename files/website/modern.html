@@ -7762,7 +7762,10 @@ body.psn-home-interactive.psn-sidebar-tab-switched .sidebar > .sidebar-menu[clas
 .psn-social-identity { display:flex; align-items:center; gap:11px; min-width:0; }
 .psn-social-avatar { width:42px; height:42px; border-radius:50%; flex:none; object-fit:cover; background:#1a2637; border:1px solid rgba(255,255,255,.13); }
 .psn-social-author { color:#fff; font-weight:700; font-size:14px; word-break:break-word; }
-.psn-social-age { font-size:11px; margin-top:4px; color:var(--text-muted); }
+.psn-social-age { display:block; margin-top:3px; color:var(--text-muted); font-size:11px; line-height:1.35; white-space:nowrap; }
+.psn-social-profile > span { display:flex; flex-direction:column; align-items:flex-start; min-width:0; gap:2px; }
+.psn-social-comment-byline { display:flex; flex-direction:column; align-items:flex-start; min-width:0; gap:2px; }
+.psn-social-comment-byline .psn-social-age { margin-top:0; }
 .psn-social-head { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; }
 .psn-social-body { margin:16px 0 0; font-size:14px; white-space:pre-wrap; overflow-wrap:anywhere; color:#e7edf7; line-height:1.65; }
 .psn-social-textarea { width:100%; min-height:92px; resize:vertical; display:block; outline:none; border:1px solid rgba(255,255,255,.10); background:rgba(0,0,0,.18); color:#fff; padding:12px 14px; border-radius:10px; font:inherit; font-size:14px; line-height:1.55; transition:border-color .2s; }
@@ -8082,6 +8085,9 @@ html.psn-scroll-nav-active #psn-floating-status-dock {--psn-status-right:82px;}
 .psn-social-edit-actions { display:flex; justify-content:flex-end; gap:8px; }
 .psn-social-edited { margin-left:5px; opacity:.8; font-style:italic; }
 .psn-social-card.is-new-post { animation:psnSocialNewPost .55s cubic-bezier(.22,1,.36,1) both; }
+.psn-social-card.is-removing, .psn-social-comment.is-removing { pointer-events:none; transform-origin:top center; }
+.psn-social-comment.is-report-target { background:rgba(0,112,204,.12); border-radius:9px; box-shadow:inset 0 0 0 1px rgba(102,204,255,.48); }
+.psn-social-retry { margin-top:13px; }
 @keyframes psnSocialNewPost { from { opacity:0; transform:translateY(-15px) scale(.985); filter:brightness(1.22); } to { opacity:1; transform:translateY(0) scale(1); filter:brightness(1); } }
 #psn-social-sentinel { width:100%; height:1px; pointer-events:none; }
 @media(max-width:768px){ .psn-social-shell { padding:20px var(--page-gutter) 120px; } .psn-social-heading h1{ font-size:var(--primary-page-title-size); } }
@@ -29941,6 +29947,24 @@ P
 	}
 
 
+	let psnSidebarRevealTimer = null;
+	function revealSidebarOnlyOnGroupChange(targetGroup) {
+		const body = document.body;
+		if (!body) return;
+		const changed = !!targetGroup && PSN_STATIC_MENU_GROUP_LIST.some(group => group !== targetGroup && group.style.display !== 'none');
+		if (psnSidebarRevealTimer) { clearTimeout(psnSidebarRevealTimer); psnSidebarRevealTimer = null; }
+		body.classList.remove('psn-sidebar-tab-switched');
+		if (changed && body.classList.contains('psn-home-interactive')) {
+			// Restart only when changing sidebar groups, not when selecting another item inside Social.
+			void body.offsetWidth;
+			body.classList.add('psn-sidebar-tab-switched');
+			psnSidebarRevealTimer = setTimeout(() => {
+				body.classList.remove('psn-sidebar-tab-switched');
+				psnSidebarRevealTimer = null;
+			}, 520);
+		}
+	}
+
 	window.switchTab = function(tab, skipDelay = false) {
 		const navItem = PSN_TOP_NAV_BY_TAB[tab] || document.getElementById(`top-nav-${tab}`);
 		
@@ -29998,10 +30022,7 @@ P
 	
 		PSN_STATIC_TOP_NAV_LINKS.forEach(a => { if (a.classList.contains('active')) a.classList.remove('active'); });
 		const groups = PSN_MENU_GROUP_BY_TAB;
-		if (document.body.classList.contains('psn-home-interactive') && groups[tab] &&
-			PSN_STATIC_MENU_GROUP_LIST.some(group => group !== groups[tab] && group.style.display !== 'none')) {
-			document.body.classList.add('psn-sidebar-tab-switched');
-		}
+		revealSidebarOnlyOnGroupChange(groups[tab]);
 		PSN_STATIC_MENU_GROUP_LIST.forEach(m => { if (m.style.display !== 'none') m.style.display = 'none'; });
 	
 		if (tab === 'home') {
@@ -30531,6 +30552,9 @@ P
 
 	window.openSocialCommunitySection = function(section) {
 		if (!['friends', 'activity', 'playTogether'].includes(section)) return;
+		// Switching items inside the same Social sidebar must not replay the group's entrance.
+		if (psnSidebarRevealTimer) { clearTimeout(psnSidebarRevealTimer); psnSidebarRevealTimer = null; }
+		document.body.classList.remove('psn-sidebar-tab-switched');
 		window.__psnSocialSectionNavigation = section;
 		window.showSocialSection(section);
 	};
@@ -51983,7 +52007,7 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 			if ([unseenContent, unseenMetadata, unseenMessage].filter(Boolean).length > 1) dot.title = 'New admin reports and corrections';
 			else if (unseenContent) dot.title = 'New content reports';
 			else if (unseenMetadata) dot.title = 'New database corrections';
-			else if (unseenMessage) dot.title = 'New message reports';
+			else if (unseenMessage) dot.title = 'New chat or Social reports';
 			else dot.title = counts.total > 0 ? 'Admin items already seen' : 'No pending admin review';
 		}
 		if (typeof window.setSidebarCountPill === 'function') {
@@ -52162,7 +52186,9 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 
 		const isNewReport = existingIndex < 0;
 		if (isNewReport && !silent && document.body.classList.contains('is-admin')) {
-			if (typeof showToastNotification === 'function') showToastNotification('New Report', `${incoming.reporter || 'Someone'} reported a message.`);
+			const socialKind = /^social-(post|comment)-/.exec(String(incoming.msgId || ''));
+			const reportKind = socialKind ? `a Social ${socialKind[1]}` : 'a message';
+			if (typeof showToastNotification === 'function') showToastNotification(socialKind ? 'New Social Report' : 'New Report', `${incoming.reporter || 'Someone'} reported ${reportKind}.`);
 			if (typeof playUiError === 'function') playUiError();
 		}
 		if (document.getElementById('view-admin')?.style.display === 'block') adminRenderMessageReportCenter();
@@ -52257,6 +52283,18 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 
 	window.adminJumpToReportedMessage = function(msgId, sourceLabel = 'Admin Panel') {
 		if (!msgId) return;
+		const key = String(msgId);
+		const postMatch = /^social-post-(\d{1,18})$/.exec(key);
+		const commentMatch = /^social-comment-(\d{1,18})(?:-(\d{1,18}))?$/.exec(key);
+		if (postMatch || commentMatch) {
+			const report = typeof adminGetReports === 'function' ? adminGetReports().find(item => item && String(item.msgId) === key) : null;
+			const legacyPostId = /\[Social comment in post #(\d{1,18})\]/.exec(String(report?.reason || ''));
+			const postId = postMatch ? postMatch[1] : (commentMatch[2] ? commentMatch[1] : legacyPostId?.[1]);
+			const commentId = commentMatch ? (commentMatch[2] || commentMatch[1]) : null;
+			if(postId && typeof window.psnSocialOpenPost === 'function')window.psnSocialOpenPost(postId,commentId);
+			else if(typeof showToastNotification === 'function')showToastNotification(sourceLabel,'The reported publication is unavailable.');
+			return;
+		}
 		if (typeof playUiClick === 'function') playUiClick();
 		const searchInput = document.getElementById('search-input');
 		if (searchInput) searchInput.value = '';
@@ -52376,7 +52414,7 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 		reportsEl.__adminReportsSource = reports;
 
 		if (!reports.length) {
-			setAdminHtmlIfChanged(reportsEl, '<div class="admin-empty"><i class="fas fa-flag" style="color:#ffcc00;margin-right:6px;"></i>No reports yet. Users can report messages with the flag icon in chat. Refresh asks the server for pending reports.</div>');
+			setAdminHtmlIfChanged(reportsEl, '<div class="admin-empty"><i class="fas fa-flag" style="color:#ffcc00;margin-right:6px;"></i>No reports yet. Users can report chat messages, Social posts and comments. Refresh asks the server for pending reports.</div>');
 			return;
 		}
 
@@ -52393,7 +52431,7 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 				? `<b class="admin-log-user-link" onclick="event.stopPropagation(); adminOpenUserProfile('${encodeURIComponent(targetUser)}')">${adminEscapeHtml(targetUser)}</b>`
 				: '<b>message</b>';
 			const bodyJump = r.msgId ? ` onclick="adminJumpToReportedMessage('${adminEscapeAttr(r.msgId)}', 'Report Center')"` : '';
-			const jumpBtn = r.msgId ? `<button class="btn-mini-round report-jump" onclick="event.stopPropagation(); adminJumpToReportedMessage('${adminEscapeAttr(r.msgId)}', 'Report Center')" title="Jump to message"><i class="fas fa-location-arrow"></i></button>` : '';
+			const jumpBtn = r.msgId ? `<button class="btn-mini-round report-jump" onclick="event.stopPropagation(); adminJumpToReportedMessage('${adminEscapeAttr(r.msgId)}', 'Report Center')" title="Open reported content"><i class="fas fa-location-arrow"></i></button>` : '';
 			return `<div class="admin-report-item" data-report-id="${adminEscapeHtml(id)}"><i class="fas fa-flag"></i><div class="admin-report-body"${bodyJump}>${reporterHtml} reported ${targetHtml}<br><span data-no-translate="true" translate="no">${adminEscapeHtml(r.reason || 'No reason provided.')}</span><br>${reportText ? `<span data-no-translate="true" translate="no" style="opacity:.82;">${adminEscapeHtml(String(reportText).slice(0, 140))}</span><br>` : ''}<span style="opacity:.65;">${adminEscapeHtml(time)}</span></div><div class="admin-report-actions">${jumpBtn}<button class="btn-mini-round report-resolve" data-report-id="${adminEscapeHtml(id)}" onclick="event.stopPropagation(); adminResolveReport(this.dataset.reportId, this)" title="Resolve"><i class="fas fa-check"></i></button></div></div>`;
 		}).join(''));
 	}
@@ -112878,7 +112916,7 @@ function getVisibleChatStackEl(id) {
   const state = { posts:[], before:null, friendsOnly:false, loaded:false, loading:false, reloadPending:false, stale:false,
     owner:'', openComments:new Set(), comments:new Map(), pendingImages:[], uploading:false,
     socket:null, refreshTimer:0, requestSerial:0, infiniteObserver:null, scrollFallback:null, editId:null,
-    modalPostId:null, modalOpener:null, modalRequest:0, serverReadyFor:null, serverCheck:null, pendingReactions:new Set(), postRefreshTimers:new Map() };
+    modalPostId:null, modalOpener:null, modalRequest:0, serverReadyFor:null, serverCheck:null, pendingReactions:new Set(), postRefreshTimers:new Map(), removingPosts:new Map(), removingComments:new Map(), focusReportedCommentId:null };
   const view = () => document.getElementById('view-social');
   const feed = () => document.getElementById('psn-social-feed');
   const identity = () => String(localStorage.getItem('psn_username') || '').trim();
@@ -112928,7 +112966,7 @@ function getVisibleChatStackEl(id) {
     const ready=await verifySocialServer(socket);
     if(!ready.success)return ready;
     if(!socket.connected)return {success:false,message:'Server disconnected.'};
-    return emitAcknowledged(socket,event,data,event==='social_feed_list'||event==='social_comments_list'?35000:32000);
+    return emitAcknowledged(socket,event,data,event==='social_feed_list'||event==='social_comments_list'?18000:22000);
   }
   function observeSocket(){
     if(typeof socketChat==='undefined'||!socketChat||!socketChat.connected)return;
@@ -112946,15 +112984,60 @@ function getVisibleChatStackEl(id) {
     if(!data||!data.actor||!visible())return;
     if(typeof showToastNotification==='function')showToastNotification('Social',`${data.actor} ${data.activity==='comment'?'commented on':'reacted to'} your post.`);
   }
+  function animateSocialRemoval(element){
+    if(!element||!element.isConnected)return Promise.resolve();
+    if(element.__psnSocialRemoval)return element.__psnSocialRemoval;
+    element.classList.add('is-removing');
+    const reduced=window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
+    if(reduced||typeof element.animate!=='function'){
+      element.remove();return Promise.resolve();
+    }
+    const size=element.getBoundingClientRect();
+    const style=getComputedStyle(element);
+    const px=name=>Math.max(0,parseFloat(style[name])||0)+'px';
+    const animation=element.animate([
+      {height:size.height+'px',marginTop:px('marginTop'),marginBottom:px('marginBottom'),opacity:1,transform:'translateY(0) scale(1)'},
+      {height:'0px',marginTop:'0px',marginBottom:'0px',paddingTop:'0px',paddingBottom:'0px',borderWidth:'0px',opacity:0,transform:'translateY(-8px) scale(.985)'}
+    ],{duration:290,easing:'cubic-bezier(.4,0,.2,1)',fill:'forwards'});
+    element.__psnSocialRemoval=animation.finished.catch(()=>{}).then(()=>element.remove());
+    return element.__psnSocialRemoval;
+  }
+  function removeSocialPost(id){
+    if(state.removingPosts.has(id))return state.removingPosts.get(id);
+    state.posts=state.posts.filter(post=>post.id!==id);
+    state.comments.delete(id);state.openComments.delete(id);
+    if(state.modalPostId===id)closeCommentModal();
+    const element=feed()?.querySelector(`[data-social-post="${id}"]`);
+    const pending=animateSocialRemoval(element).then(()=>{
+      if(!state.posts.length&&!feed()?.querySelector('[data-social-post]'))renderFeed();
+    }).finally(()=>state.removingPosts.delete(id));
+    state.removingPosts.set(id,pending);
+    return pending;
+  }
+  function removeSocialComment(id,postId){
+    if(state.removingComments.has(id))return state.removingComments.get(id);
+    const existing=state.comments.get(postId);
+    if(Array.isArray(existing))state.comments.set(postId,existing.filter(item=>item.id!==id));
+    const element=document.getElementById('psn-social-comments-modal')?.querySelector(`[data-social-comment="${id}"]`);
+    const pending=animateSocialRemoval(element).then(async()=>{
+      if(state.modalPostId===postId)await loadComments(postId);
+      schedulePostRefresh(postId);
+    }).finally(()=>state.removingComments.delete(id));
+    state.removingComments.set(id,pending);
+    return pending;
+  }
   function onChanged(data){
     if(!visible()){state.stale=true;return;}
     const id=idOf(data&&data.id);
     if(data&&data.kind==='delete'&&id){
-      state.posts=state.posts.filter(post=>post.id!==id);
-      state.comments.delete(id);state.openComments.delete(id);
-      if(state.modalPostId===id)closeCommentModal();
-      document.querySelector(`[data-social-post="${id}"]`)?.remove();
-      if (!state.posts.length) renderFeed();
+      removeSocialPost(id);
+      return;
+    }
+    if(data&&data.kind==='comment-delete'&&id){
+      const commentId=idOf(data.commentId);
+      if(commentId)removeSocialComment(commentId,id);
+      else if(state.modalPostId===id)loadComments(id);
+      if(state.posts.some(post=>post.id===id))schedulePostRefresh(id);
       return;
     }
     if(data&&['react','comment','edit'].includes(data.kind)&&id){
@@ -113032,7 +113115,7 @@ function getVisibleChatStackEl(id) {
     const profile=`<button type="button" class="psn-social-profile" data-social-action="profile" data-user="${esc(post.author)}" aria-label="View ${esc(post.author)} profile" onmouseenter="if(typeof playUiHover==='function')playUiHover()"><img class="psn-social-avatar" alt="" loading="lazy" src="${esc(safeImage(post.avatar)||'https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/interface/modern/images/avatars/default.png')}"><span><span class="psn-social-author">${esc(post.author)}</span><span class="psn-social-age" data-social-post-age>${esc(timeLabel(post.createdAt))} · Public${post.editedAt?'<span class="psn-social-edited" title="Edited after publishing">Edited</span>':''}</span></span></button>`;
     return `<article class="psn-social-card" data-social-post="${id}">
       <div class="psn-social-head"><div class="psn-social-identity">${profile}</div>
-      <div class="psn-social-actions">${canEdit?`<button type="button" class="psn-social-btn" data-social-action="edit" data-id="${id}" title="Edit post" aria-label="Edit post"><i class="fas fa-pen"></i></button>`:''}${canDelete?`<button type="button" class="psn-social-btn danger" data-social-action="delete" data-id="${id}" title="Delete post" aria-label="Delete post"><i class="fas fa-trash-alt"></i></button>`:`<button type="button" class="psn-social-btn" data-social-action="report" data-id="${id}" title="Report post" aria-label="Report post"><i class="far fa-flag"></i></button>`}</div></div>
+      <div class="psn-social-actions">${canEdit?`<button type="button" class="psn-social-btn" data-social-action="edit" data-id="${id}" title="Edit post" aria-label="Edit post"><i class="fas fa-pen"></i></button>`:''}${canDelete?`<button type="button" class="psn-social-btn danger" data-social-action="delete" data-id="${id}" title="Delete post" aria-label="Delete post"><i class="fas fa-trash-alt"></i></button>`:''}${post.author!==identity()?`<button type="button" class="psn-social-btn" data-social-action="report" data-id="${id}" title="Report post" aria-label="Report post"><i class="far fa-flag"></i></button>`:''}</div></div>
       ${editing?`<div class="psn-social-edit-panel"><textarea class="psn-social-textarea" maxlength="3000" data-social-edit-input="${id}" aria-label="Edit publication">${esc(post.text)}</textarea><div class="psn-social-edit-actions"><button type="button" class="psn-social-btn" data-social-action="edit-cancel" data-id="${id}">Cancel</button><button type="button" class="psn-social-btn primary" data-social-action="edit-save" data-id="${id}"><i class="fas fa-check"></i> Save</button></div></div>`:(post.text?`<p class="psn-social-body">${esc(post.text)}</p>`:'')}${mediaMarkup(post.images)}
       ${postActionbar(post)}
     </article>`;
@@ -113042,7 +113125,7 @@ function getVisibleChatStackEl(id) {
     const comments=Array.isArray(list)?list.map(c=>{
       const cid=idOf(c.id);if(!cid)return '';
       const canDelete=c.author===identity()||(typeof window.canModerateSession==='function'&&window.canModerateSession());
-      return `<div class="psn-social-comment"><button type="button" class="psn-social-profile" data-social-action="profile" data-user="${esc(c.author)}" aria-label="View ${esc(c.author)} profile"><img class="psn-social-avatar" loading="lazy" alt="" src="${esc(safeImage(c.avatar)||'https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/interface/modern/images/avatars/default.png')}"></button><div class="psn-social-comment-content"><div class="psn-social-head"><div><button type="button" class="psn-social-profile" data-social-action="profile" data-user="${esc(c.author)}"><span class="psn-social-author">${esc(c.author)}</span></button><span class="psn-social-age"> · ${esc(timeLabel(c.createdAt))}</span></div>${canDelete?`<button class="psn-social-btn danger" data-social-action="comment-delete" data-id="${cid}" data-post="${postId}" aria-label="Delete comment"><i class="fas fa-trash-alt"></i></button>`:`<button type="button" class="psn-social-btn" data-social-action="comment-report" data-id="${cid}" aria-label="Report comment"><i class="far fa-flag"></i></button>`}</div><p class="psn-social-comment-text">${esc(c.text)}</p>${commentActionbar(c,postId)}</div></div>`;
+      return `<div class="psn-social-comment" data-social-comment="${cid}"><button type="button" class="psn-social-profile" data-social-action="profile" data-user="${esc(c.author)}" aria-label="View ${esc(c.author)} profile"><img class="psn-social-avatar" loading="lazy" alt="" src="${esc(safeImage(c.avatar)||'https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/interface/modern/images/avatars/default.png')}"></button><div class="psn-social-comment-content"><div class="psn-social-head"><div class="psn-social-comment-byline"><button type="button" class="psn-social-profile" data-social-action="profile" data-user="${esc(c.author)}"><span class="psn-social-author">${esc(c.author)}</span></button><span class="psn-social-age">${esc(timeLabel(c.createdAt))}</span></div><div class="psn-social-actions">${canDelete?`<button type="button" class="psn-social-btn danger" data-social-action="comment-delete" data-id="${cid}" data-post="${postId}" aria-label="Delete comment"><i class="fas fa-trash-alt"></i></button>`:''}${c.author!==identity()?`<button type="button" class="psn-social-btn" data-social-action="comment-report" data-id="${cid}" aria-label="Report comment"><i class="far fa-flag"></i></button>`:''}</div></div><p class="psn-social-comment-text">${esc(c.text)}</p>${commentActionbar(c,postId)}</div></div>`;
     }).join(''):'<p class="psn-social-muted">Loading comments…</p>';
     return `<div class="psn-social-comments-list">${comments||'<p class="psn-social-muted">No comments yet. Start the conversation!</p>'}</div><form class="psn-social-comment-form" data-post="${postId}"><div class="psn-social-toolbar"><input class="psn-social-comment-input" maxlength="1200" required aria-label="Write a comment" placeholder="Write a comment…"><button type="submit" class="psn-social-btn primary"><i class="fas fa-paper-plane"></i> Send</button></div></form>${Array.isArray(list)&&list.length===30?'<div class="psn-social-muted">Showing the 30 latest comments.</div>':''}`;
   }
@@ -113123,8 +113206,16 @@ function getVisibleChatStackEl(id) {
     const res=await call('social_feed_list',{friendsOnly:mode,before:more?state.before:null});
     state.loading=false;
     if(state.reloadPending){state.reloadPending=false;return loadFeed(false,silent);}
-    if(serial!==state.requestSerial||mode!==state.friendsOnly||!visible())return;
-    if(!res.success){notify(res.message||'Could not load feed.',true);if(!more&&!state.posts.length)el.innerHTML='<div class="psn-social-empty">Unable to load posts right now.</div>';return;}
+    if(serial!==state.requestSerial||mode!==state.friendsOnly)return;
+    if(!visible()){state.stale=true;return;}
+    if(!res.success){
+      notify(res.message||'Could not load feed.',true);
+      if(!more&&!state.posts.length){
+        state.loaded=false;
+        el.innerHTML='<div class="psn-social-empty"><div>Could not load community posts.</div><button type="button" class="psn-social-btn psn-social-retry" data-social-action="retry">Try again</button></div>';
+      }
+      return;
+    }
     const incoming=Array.isArray(res.posts)?res.posts:[];
     const hadPosts=state.posts.length>0;
     if(more){
@@ -113134,6 +113225,11 @@ function getVisibleChatStackEl(id) {
       state.before=res.nextBefore||null;
       if(hadPosts&&appended.length)el.insertAdjacentHTML('beforeend',appended.map(postMarkup).join(''));
       else if(!hadPosts)renderFeed();
+    } else if(silent&&state.loaded&&hadPosts&&incoming.length===0&&!res.nextBefore){
+      // A fresh, successful empty first page must clear old cards (not leave stale posts).
+      state.posts=[];
+      state.before=null;
+      renderFeed();
     } else if(silent&&state.loaded&&hadPosts){
       const known=new Set(state.posts.map(post=>post.id));
       const added=incoming.filter(post=>!known.has(post.id));
@@ -113216,6 +113312,15 @@ function getVisibleChatStackEl(id) {
     const markup=commentAreaMarkup(postId),tmp=document.createElement('div');tmp.innerHTML=markup;
     const next=tmp.querySelector('.psn-social-comments-list');
     if(next)list.replaceChildren(...next.childNodes);
+    if(state.focusReportedCommentId){
+      const row=list.querySelector(`[data-social-comment="${state.focusReportedCommentId}"]`);
+      if(row){
+        state.focusReportedCommentId=null;
+        row.classList.add('is-report-target');
+        row.scrollIntoView({behavior:'smooth',block:'nearest'});
+        setTimeout(()=>{if(row.isConnected)row.classList.remove('is-report-target');},3200);
+      }
+    }
   }
   function renderAttachments(){
     const el=document.getElementById('psn-social-attachments');if(!el)return;
@@ -113260,6 +113365,7 @@ function getVisibleChatStackEl(id) {
   }
   async function performAction(action,btn){
     const id=idOf(btn.dataset.id);const postId=idOf(btn.dataset.post||id);
+    if(action==='retry'){loadFeed(false);return;}
     if(action==='image'){
       const card=btn.closest('[data-social-post]');const post=state.posts.find(p=>p.id===card?.dataset.socialPost);
       const list=Array.isArray(post?.images)?post.images.filter(safeImage):[];
@@ -113320,14 +113426,14 @@ function getVisibleChatStackEl(id) {
     if(action==='delete'){
       if(!confirm('Delete this publication and its comments?'))return;
       const res=await call('social_post_delete',{id});
-      if(res.success){state.posts=state.posts.filter(x=>x.id!==id);state.openComments.delete(id);if(state.modalPostId===id)closeCommentModal();renderFeed();}
+      if(res.success)await removeSocialPost(id);
       else notify(res.message||'Delete failed.',true);
       return;
     }
     if(action==='comment-delete'){
       if(!confirm('Delete this comment?'))return;
       const res=await call('social_comment_delete',{id});
-      if(res.success){await loadComments(postId);await refreshPost(postId);} else notify(res.message||'Delete failed.',true);
+      if(res.success)await removeSocialComment(id,postId);else notify(res.message||'Delete failed.',true);
       return;
     }
     if(action==='like'||action==='react'||action==='comment-react'){
@@ -113393,7 +113499,7 @@ function getVisibleChatStackEl(id) {
     if(!state.loaded||state.stale)loadFeed(false,state.loaded);
     else updateInfiniteFeed();
   };
-  window.psnSocialOpenPost=async function(postId){
+  window.psnSocialOpenPost=async function(postId,commentId=null){
     const target=idOf(postId);if(!target)return;
     if(typeof window.switchTab==='function')window.switchTab('social');
     await new Promise(resolve=>setTimeout(resolve,480));
@@ -113403,7 +113509,15 @@ function getVisibleChatStackEl(id) {
       state.posts=[post,...state.posts.filter(p=>p.id!==post.id)];
       renderFeed();
       const card=document.querySelector(`[data-social-post="${target}"]`);
-      if(card){card.scrollIntoView({behavior:'smooth',block:'center'});card.style.borderColor='rgba(76,190,255,.8)';setTimeout(()=>{if(card.isConnected)card.style.borderColor='';},2600);}
+      if(card){
+        card.scrollIntoView({behavior:'smooth',block:'center'});
+        card.style.borderColor='rgba(76,190,255,.8)';
+        setTimeout(()=>{if(card.isConnected)card.style.borderColor='';},2600);
+        if(idOf(commentId)){
+          state.focusReportedCommentId=idOf(commentId);
+          openCommentModal(target,card.querySelector('[data-social-action="comments"]'));
+        }
+      }
     } else notify('This publication is no longer available.',true);
   };
   window.psnSocialRefresh=function(){if(visible())loadFeed(false,true);};
