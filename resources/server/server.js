@@ -2523,6 +2523,34 @@ async function initDb() {
       CHECK (blocker_name <> blocked_name)
     );
     CREATE INDEX IF NOT EXISTS idx_direct_user_blocks_blocked ON direct_user_blocks(blocked_name, blocker_name);
+    CREATE TABLE IF NOT EXISTS social_posts (
+      id BIGSERIAL PRIMARY KEY,
+      author_name TEXT NOT NULL REFERENCES users(name) ON DELETE CASCADE,
+      body TEXT NOT NULL DEFAULT '',
+      images JSONB NOT NULL DEFAULT '[]'::jsonb,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_social_posts_newest ON social_posts(id DESC);
+    CREATE TABLE IF NOT EXISTS social_post_reactions (
+      post_id BIGINT NOT NULL REFERENCES social_posts(id) ON DELETE CASCADE,
+      user_name TEXT NOT NULL REFERENCES users(name) ON DELETE CASCADE,
+      emoji TEXT NOT NULL,
+      PRIMARY KEY (post_id,user_name)
+    );
+    CREATE TABLE IF NOT EXISTS social_comments (
+      id BIGSERIAL PRIMARY KEY,
+      post_id BIGINT NOT NULL REFERENCES social_posts(id) ON DELETE CASCADE,
+      author_name TEXT NOT NULL REFERENCES users(name) ON DELETE CASCADE,
+      body TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_social_comments_post ON social_comments(post_id,id DESC);
+    CREATE TABLE IF NOT EXISTS social_comment_reactions (
+      comment_id BIGINT NOT NULL REFERENCES social_comments(id) ON DELETE CASCADE,
+      user_name TEXT NOT NULL REFERENCES users(name) ON DELETE CASCADE,
+      emoji TEXT NOT NULL,
+      PRIMARY KEY (comment_id,user_name)
+    );
     CREATE TABLE IF NOT EXISTS pinned_messages (
       id SERIAL PRIMARY KEY,
       message_id TEXT UNIQUE,
@@ -9773,12 +9801,16 @@ async function initProfileSyncNotifications() {
   profileSyncNotifyClient = client;
 
   client.on('notification', async (message) => {
-    if (!message || !['profile_sync', 'presence_sync', 'ps3_playtime_sync', 'admin_state_sync', 'server_log_sync', 'friend_activity_sync', 'user_notification_sync', 'game_players_sync', 'content_download_counts_sync', 'chat_sync_notify', 'direct_message_sync', 'direct_group_sync'].includes(message.channel)) return;
+    if (!message || !['profile_sync', 'presence_sync', 'ps3_playtime_sync', 'admin_state_sync', 'server_log_sync', 'friend_activity_sync', 'user_notification_sync', 'game_players_sync', 'content_download_counts_sync', 'chat_sync_notify', 'direct_message_sync', 'direct_group_sync', 'social_feed_sync'].includes(message.channel)) return;
 
     try {
       const data = JSON.parse(message.payload || '{}');
       if (data.instanceId === INSTANCE_ID) return;
 
+      if (message.channel === 'social_feed_sync') {
+        io.emit('social_feed_changed', {kind:data.kind,id:String(data.id || ''),at:data.at});
+        return;
+      }
       if (message.channel === 'direct_group_sync') {
         const gid=directGroupId(data.groupId);
         if (!gid) return;
@@ -10267,6 +10299,7 @@ async function initProfileSyncNotifications() {
     await client.query('LISTEN chat_sync_notify');
     await client.query('LISTEN direct_message_sync');
     await client.query('LISTEN direct_group_sync');
+    await client.query('LISTEN social_feed_sync');
     const shouldRecoverModerationSync = profileSyncListenerHadGap;
     profileSyncListenerHadGap = false;
     profileSyncListenReady = true;
@@ -10789,10 +10822,19 @@ async function getFriendActivityHistoryForUser(userName, afterId = 0, resolvedFr
 // ============================================================================
 // User notifications & chat notification routing
 // ============================================================================
-const USER_NOTIFICATION_TYPES = new Set(['mention', 'reply', 'reaction', 'trophy', 'catalog', 'game_match', 'play_together', 'private_message']);
+const USER_NOTIFICATION_TYPES = new Set(['mention', 'reply', 'reaction', 'trophy', 'catalog', 'game_match', 'play_together', 'private_message', 'social']);
 
 function normalizeUserNotificationData(type, rawData = {}) {
   const source = rawData && typeof rawData === 'object' && !Array.isArray(rawData) ? rawData : {};
+  if (type === 'social') {
+    return {
+      actor: normalizeSocialUserName(source.actor),
+      postId: normalizeText(source.postId, '').slice(0, 24),
+      activity: source.activity === 'comment' ? 'comment' : 'reaction',
+      emoji: normalizeText(source.emoji, '').slice(0, 12),
+      text: normalizeText(source.text, '').slice(0, 160)
+    };
+  }
   if (type === 'mention' || type === 'reply') {
     return {
       actor: normalizeSocialUserName(source.actor),
@@ -12593,6 +12635,121 @@ async function resolveContentShareTokenForUser(token) {
 }
 
 // ============================================================================
+// Social — public community feed
+// ============================================================================
+const SOCIAL_POST_LIMIT = 15;
+const SOCIAL_EMOJI = new Set(['👍', '❤️', '😂', '😮', '😢', '🔥']);
+const socialActionLimits = new Map();
+
+function normalizeSocialMedia(raw) {
+  const images = Array.isArray(raw) ? raw : [];
+  if (images.length > 4) return null;
+  const filtered = [];
+  for (const entry of images) {
+    if (typeof entry !== 'string' || entry.length > 700) return null;
+    try {
+      const url = new URL(entry);
+      if (url.protocol !== 'https:' || url.hostname !== 'res.cloudinary.com' || !/^\/[^/]+\/image\/upload\//.test(url.pathname)) return null;
+      filtered.push(url.href);
+    } catch (err) { return null; }
+  }
+  return [...new Set(filtered)];
+}
+
+function socialRateLimit(actor, action, cooldownMs) {
+  const now = Date.now();
+  const key = `${actor}:${action}`;
+  const last = socialActionLimits.get(key) || 0;
+  if (now - last < cooldownMs) return false;
+  socialActionLimits.set(key, now);
+  if (socialActionLimits.size > 4000) {
+    for (const [id, at] of socialActionLimits) if (now - at > 120000) socialActionLimits.delete(id);
+    while (socialActionLimits.size > 4000) socialActionLimits.delete(socialActionLimits.keys().next().value);
+  }
+  return true;
+}
+
+function socialPublicReactions(raw) {
+  return Array.isArray(raw) ? raw.filter(x => x && SOCIAL_EMOJI.has(x.emoji)).map(x => ({ emoji:x.emoji, count:Number(x.count)||0 })).filter(x=>x.count>0) : [];
+}
+
+function serializeSocialPost(row) {
+  if (!row) return null;
+  return {
+    id: String(row.id), author: row.author_name, avatar: row.author_avatar || DEFAULT_AVATAR,
+    text: row.body || '', images: Array.isArray(row.images) ? row.images : [],
+    createdAt: row.created_at, reactions: socialPublicReactions(row.reactions),
+    myReaction: row.my_reaction || '', comments: Number(row.comment_count) || 0
+  };
+}
+
+function serializeSocialComment(row) {
+  if (!row) return null;
+  return {
+    id: String(row.id), postId: String(row.post_id), author: row.author_name,
+    avatar: row.author_avatar || DEFAULT_AVATAR, text: row.body || '',
+    createdAt: row.created_at, reactions: socialPublicReactions(row.reactions), myReaction: row.my_reaction || ''
+  };
+}
+
+async function socialReadFeed(actor, friendsOnly, before, focusId = null) {
+  const result = await queryDbWithRetry(`
+    SELECT p.id, p.author_name, p.body, p.images, p.created_at,
+      COALESCE(NULLIF(author.data->>'avatar',''), $4) AS author_avatar,
+      COALESCE((SELECT jsonb_agg(jsonb_build_object('emoji',r.emoji,'count',r.cnt))
+        FROM (SELECT emoji, COUNT(*) AS cnt FROM social_post_reactions WHERE post_id=p.id GROUP BY emoji) r), '[]'::jsonb) AS reactions,
+      (SELECT emoji FROM social_post_reactions WHERE post_id=p.id AND user_name=$1) AS my_reaction,
+      (SELECT COUNT(*) FROM social_comments WHERE post_id=p.id) AS comment_count
+    FROM social_posts p
+    JOIN users author ON author.name = p.author_name
+    WHERE ($3::bigint IS NULL OR p.id < $3::bigint) AND ($5::bigint IS NULL OR p.id=$5::bigint)
+      AND (NOT $2::boolean OR p.author_name=$1 OR EXISTS (
+        SELECT 1 FROM users viewer
+        CROSS JOIN LATERAL jsonb_array_elements(
+          CASE WHEN jsonb_typeof(viewer.data->'friendsData')='array' THEN viewer.data->'friendsData' ELSE '[]'::jsonb END
+        ) friend(value)
+        WHERE viewer.name=$1
+          AND CASE WHEN jsonb_typeof(friend.value)='object' THEN friend.value->>'name'
+                   WHEN jsonb_typeof(friend.value)='string' THEN friend.value#>>'{}' ELSE NULL END = p.author_name
+      ))
+    ORDER BY p.id DESC LIMIT ${SOCIAL_POST_LIMIT + 1}
+  `, [actor, friendsOnly, before, DEFAULT_AVATAR, focusId], { attempts:2, label:'SOCIAL FEED' });
+  const rows = result.rows || [];
+  return {
+    posts: rows.slice(0, SOCIAL_POST_LIMIT).map(serializeSocialPost),
+    nextBefore: rows.length > SOCIAL_POST_LIMIT ? String(rows[SOCIAL_POST_LIMIT - 1].id) : null
+  };
+}
+
+async function socialReadComments(actor, postId) {
+  const result = await queryDbWithRetry(`
+    SELECT c.id,c.post_id,c.author_name,c.body,c.created_at,
+      COALESCE(NULLIF(u.data->>'avatar',''),$3) AS author_avatar,
+      COALESCE((SELECT jsonb_agg(jsonb_build_object('emoji',r.emoji,'count',r.cnt)) FROM
+        (SELECT emoji,COUNT(*) AS cnt FROM social_comment_reactions WHERE comment_id=c.id GROUP BY emoji) r),'[]'::jsonb) AS reactions,
+      (SELECT emoji FROM social_comment_reactions WHERE comment_id=c.id AND user_name=$1) AS my_reaction
+    FROM (SELECT * FROM social_comments WHERE post_id=$2 ORDER BY id DESC LIMIT 30) c
+    JOIN users u ON u.name=c.author_name ORDER BY c.id ASC
+  `,[actor,postId,DEFAULT_AVATAR],{attempts:2,label:'SOCIAL COMMENTS'});
+  return (result.rows||[]).map(serializeSocialComment);
+}
+
+function socialPublish(kind, id) {
+  const payload = { kind, id: String(id || ''), at: Date.now() };
+  io.emit('social_feed_changed', payload);
+  deferServerTask('SOCIAL FEED NOTIFY', () => pool.query('SELECT pg_notify($1,$2)',[
+    'social_feed_sync',JSON.stringify({ ...payload, instanceId: INSTANCE_ID })
+  ]), 0);
+}
+
+function socialNotifyAuthor(author, actor, postId, activity) {
+  if (!author || author === actor) return;
+  for (const client of getSocketsByUserName(author)) {
+    if (client && client.connected) client.emit('social_activity_notice', { actor, postId: String(postId), activity });
+  }
+}
+
+// ============================================================================
 // Client connection & event handlers
 // ============================================================================
 io.on('connection', (socket) => {
@@ -12604,6 +12761,196 @@ io.on('connection', (socket) => {
   // --------------------------------------------------------------------------
   // Authentication & account session
   // --------------------------------------------------------------------------
+  // --------------------------------------------------------------------------
+  // Social public feed
+  // --------------------------------------------------------------------------
+  socket.on('social_feed_list', async (data = {}, callback) => {
+    const reply = typeof callback === 'function' ? callback : () => {};
+    const actor = normalizeSocialUserName(socket.userName);
+    if (!actor) return reply({ success:false, message:'Sign in to view Social.' });
+    const rawBefore = String(data.before || '');
+    const before = /^\d{1,18}$/.test(rawBefore) && Number(rawBefore) > 0 ? rawBefore : null;
+    try {
+      const focusId = /^\d{1,18}$/.test(String(data.focusId || '')) ? String(data.focusId) : null;
+      const feed = await socialReadFeed(actor, data.friendsOnly === true, before, focusId);
+      reply({ success:true, ...feed });
+    } catch (err) {
+      console.error('[SOCIAL FEED ERROR]:', err && err.message || err);
+      reply({ success:false, message:'Could not load Social posts.' });
+    }
+  });
+
+  socket.on('social_post_create', async (data = {}, callback) => {
+    const reply = typeof callback === 'function' ? callback : () => {};
+    const actor = normalizeSocialUserName(socket.userName);
+    const body = typeof data.text === 'string' ? data.text.trim().slice(0,3001) : '';
+    const images = normalizeSocialMedia(data.images);
+    if (!actor) return reply({ success:false, message:'Sign in first.' });
+    if (body.length > 3000 || !images || (!body && !images.length)) return reply({ success:false, message:'Add text or up to four photos.' });
+    if (!socialRateLimit(actor,'post',8000)) return reply({ success:false, message:'Wait a moment before posting again.' });
+    try {
+      const result = await queryDbWithRetry(
+        'INSERT INTO social_posts (author_name,body,images) VALUES ($1,$2,$3::jsonb) RETURNING id',
+        [actor,body,JSON.stringify(images)],{attempts:2,label:'SOCIAL POST CREATE'});
+      const id = String(result.rows[0].id);
+      socialPublish('post',id);
+      reply({ success:true, id });
+    } catch (err) {
+      console.error('[SOCIAL POST CREATE ERROR]:',err && err.message || err);
+      reply({ success:false, message:'Could not publish this post.' });
+    }
+  });
+
+  socket.on('social_report', async (data = {}, callback) => {
+    const reply = typeof callback === 'function' ? callback : () => {};
+    const actor = normalizeSocialUserName(socket.userName);
+    const id = String(data.id || '');
+    const kind = data.kind === 'comment' ? 'comment' : 'post';
+    const reason = typeof data.reason === 'string' ? data.reason.trim().slice(0,501) : '';
+    if (!actor || !/^\d{1,18}$/.test(id) || !reason || reason.length > 500) return reply({success:false,message:'Enter a reason to report.'});
+    if (!socialRateLimit(actor,'report',2500)) return reply({success:false,message:'Wait a moment before reporting again.'});
+    try {
+      const result = kind === 'comment'
+        ? await queryDbWithRetry('SELECT author_name,body,post_id FROM social_comments WHERE id=$1',[id],{attempts:2,label:'SOCIAL COMMENT REPORT LOOKUP'})
+        : await queryDbWithRetry('SELECT author_name,body,id AS post_id FROM social_posts WHERE id=$1',[id],{attempts:2,label:'SOCIAL POST REPORT LOOKUP'});
+      const target = result.rows[0];
+      if (!target) return reply({success:false,message:'This publication is no longer available.'});
+      const msgId=`social-${kind}-${id}`;
+      const duplicate = await queryDbWithRetry("SELECT 1 FROM reports WHERE resolved=false AND data->>'reporter'=$1 AND data->>'msgId'=$2 LIMIT 1",
+        [actor,msgId],{attempts:2,label:'SOCIAL REPORT DEDUPE'});
+      if(duplicate.rows.length)return reply({success:true,unchanged:true});
+      await createReport({msgId,targetUser:target.author_name,messageText:target.body,reason:`[Social ${kind} in post #${target.post_id}] ${reason}`},actor);
+      reply({success:true});
+    } catch (err) {console.error('[SOCIAL REPORT ERROR]:',err && err.message || err);reply({success:false,message:'Could not submit report.'});}
+  });
+
+  socket.on('social_post_delete', async (data = {}, callback) => {
+    const reply = typeof callback === 'function' ? callback : () => {};
+    const actor = normalizeSocialUserName(socket.userName);
+    const id = String(data.id || '');
+    if (!actor || !/^\d{1,18}$/.test(id)) return reply({ success:false });
+    try {
+      const found = await queryDbWithRetry('SELECT author_name FROM social_posts WHERE id=$1',[id],{attempts:2,label:'SOCIAL POST OWNER'});
+      const owner = found.rows[0]?.author_name;
+      if (!owner || (owner !== actor && !(canModerateSocket(socket) && canModerateTarget(socket,owner)))) return reply({ success:false, message:'Not allowed.' });
+      const deleted = await queryDbWithRetry('DELETE FROM social_posts WHERE id=$1 RETURNING id',[id],{attempts:2,label:'SOCIAL POST DELETE'});
+      if (!deleted.rowCount) return reply({success:false,message:'Post no longer exists.'});
+      socialPublish('delete',id);
+      reply({ success:true });
+    } catch (err) {
+      console.error('[SOCIAL POST DELETE ERROR]:',err && err.message || err);
+      reply({success:false,message:'Could not delete post.'});
+    }
+  });
+
+  socket.on('social_post_react', async (data = {}, callback) => {
+    const reply = typeof callback === 'function' ? callback : () => {};
+    const actor = normalizeSocialUserName(socket.userName);
+    const id = String(data.id || '');
+    const emoji = String(data.emoji || '');
+    if (!actor || !/^\d{1,18}$/.test(id) || !SOCIAL_EMOJI.has(emoji)) return reply({success:false,message:'Invalid reaction.'});
+    if (!socialRateLimit(actor,'react:'+id,300)) return reply({success:false,message:'Please wait.'});
+    try {
+      const result = await queryDbWithRetry(`
+        INSERT INTO social_post_reactions (post_id,user_name,emoji)
+        SELECT id,$2,$3 FROM social_posts WHERE id=$1
+        ON CONFLICT (post_id,user_name) DO UPDATE
+        SET emoji=EXCLUDED.emoji WHERE social_post_reactions.emoji IS DISTINCT FROM EXCLUDED.emoji
+        RETURNING post_id
+      `,[id,actor,emoji],{attempts:2,label:'SOCIAL POST REACTION'});
+      if (!result.rowCount) {
+        await queryDbWithRetry('DELETE FROM social_post_reactions WHERE post_id=$1 AND user_name=$2 AND emoji=$3',[id,actor,emoji],{attempts:2,label:'SOCIAL REACTION REMOVE'});
+      }
+      const ownerResult = await queryDbWithRetry('SELECT author_name FROM social_posts WHERE id=$1',[id],{attempts:2,label:'SOCIAL POST REACTION OWNER'});
+      if (!ownerResult.rows.length) return reply({success:false,message:'Post not found.'});
+      socialPublish('react',id);
+      if (result.rowCount) {
+        const owner=ownerResult.rows[0].author_name;
+        socialNotifyAuthor(owner,actor,id,'reaction');
+        if (owner!==actor) deferServerTask('SOCIAL REACTION NOTICE', () => recordUserNotification(owner,'social', {
+          actor,postId:id,activity:'reaction',emoji
+        },{dedupeKey:`social:react:${id}:${actor}`}),0);
+      }
+      reply({success:true});
+    } catch (err) {
+      console.error('[SOCIAL REACTION ERROR]:',err && err.message || err);
+      reply({success:false,message:'Could not react.'});
+    }
+  });
+
+  socket.on('social_comments_list', async (data = {}, callback) => {
+    const reply = typeof callback === 'function' ? callback : () => {};
+    const actor = normalizeSocialUserName(socket.userName);
+    const id = String(data.postId || '');
+    if (!actor || !/^\d{1,18}$/.test(id)) return reply({success:false,message:'Invalid post.'});
+    try { reply({success:true, comments:await socialReadComments(actor,id)}); }
+    catch (err) { console.error('[SOCIAL COMMENTS ERROR]:',err && err.message || err); reply({success:false,message:'Could not load comments.'}); }
+  });
+
+  socket.on('social_comment_create', async (data = {}, callback) => {
+    const reply = typeof callback === 'function' ? callback : () => {};
+    const actor = normalizeSocialUserName(socket.userName);
+    const id = String(data.postId || '');
+    const body = typeof data.text === 'string' ? data.text.trim() : '';
+    if (!actor || !/^\d{1,18}$/.test(id) || !body || body.length > 1200) return reply({success:false,message:'A comment must contain 1–1200 characters.'});
+    if (!socialRateLimit(actor,'comment',2000)) return reply({success:false,message:'Wait a moment before commenting again.'});
+    try {
+      const added = await queryDbWithRetry(`INSERT INTO social_comments (post_id,author_name,body)
+        SELECT id,$2,$3 FROM social_posts WHERE id=$1 RETURNING id`,[id,actor,body],{attempts:2,label:'SOCIAL COMMENT CREATE'});
+      if (!added.rows.length) return reply({success:false,message:'Post not found.'});
+      const ownerResult = await queryDbWithRetry('SELECT author_name FROM social_posts WHERE id=$1',[id],{attempts:2,label:'SOCIAL COMMENT OWNER'});
+      socialPublish('comment',id);
+      socialNotifyAuthor(ownerResult.rows[0]?.author_name,actor,id,'comment');
+      if (ownerResult.rows[0]?.author_name && ownerResult.rows[0].author_name!==actor) {
+        deferServerTask('SOCIAL COMMENT NOTICE',()=>recordUserNotification(ownerResult.rows[0].author_name,'social',{
+          actor,postId:id,activity:'comment',text:body.slice(0,160)
+        },{dedupeKey:`social:comment:${added.rows[0].id}:${actor}`}),0);
+      }
+      reply({success:true,id:String(added.rows[0].id)});
+    } catch (err) {
+      console.error('[SOCIAL COMMENT ERROR]:',err && err.message || err);
+      reply({success:false,message:'Could not add comment.'});
+    }
+  });
+
+  socket.on('social_comment_delete', async (data = {}, callback) => {
+    const reply = typeof callback === 'function' ? callback : () => {};
+    const actor = normalizeSocialUserName(socket.userName);
+    const id = String(data.id || '');
+    if (!actor || !/^\d{1,18}$/.test(id)) return reply({success:false});
+    try {
+      const found = await queryDbWithRetry('SELECT post_id,author_name FROM social_comments WHERE id=$1',[id],{attempts:2,label:'SOCIAL COMMENT OWNER'});
+      const row = found.rows[0];
+      if (!row || (row.author_name !== actor && !(canModerateSocket(socket) && canModerateTarget(socket,row.author_name)))) return reply({success:false,message:'Not allowed.'});
+      const deleted = await queryDbWithRetry('DELETE FROM social_comments WHERE id=$1 RETURNING id',[id],{attempts:2,label:'SOCIAL COMMENT DELETE'});
+      if (!deleted.rowCount) return reply({success:false,message:'Comment not found.'});
+      socialPublish('comment',row.post_id);
+      reply({success:true});
+    } catch (err) {console.error('[SOCIAL COMMENT DELETE ERROR]:',err && err.message || err);reply({success:false,message:'Could not delete comment.'});}
+  });
+
+  socket.on('social_comment_react', async (data = {}, callback) => {
+    const reply = typeof callback === 'function' ? callback : () => {};
+    const actor = normalizeSocialUserName(socket.userName);
+    const id = String(data.id || '');
+    const emoji = String(data.emoji || '');
+    if (!actor || !/^\d{1,18}$/.test(id) || !SOCIAL_EMOJI.has(emoji)) return reply({success:false,message:'Invalid reaction.'});
+    if (!socialRateLimit(actor,'comment-react:'+id,300)) return reply({success:false,message:'Please wait.'});
+    try {
+      const result = await queryDbWithRetry(`INSERT INTO social_comment_reactions (comment_id,user_name,emoji)
+        SELECT id,$2,$3 FROM social_comments WHERE id=$1
+        ON CONFLICT (comment_id,user_name) DO UPDATE SET emoji=EXCLUDED.emoji
+          WHERE social_comment_reactions.emoji IS DISTINCT FROM EXCLUDED.emoji
+        RETURNING comment_id`,[id,actor,emoji],{attempts:2,label:'SOCIAL COMMENT REACT'});
+      if (!result.rowCount) await queryDbWithRetry('DELETE FROM social_comment_reactions WHERE comment_id=$1 AND user_name=$2 AND emoji=$3',[id,actor,emoji],{attempts:2,label:'SOCIAL COMMENT UNREACT'});
+      const owner = await queryDbWithRetry('SELECT post_id,author_name FROM social_comments WHERE id=$1',[id],{attempts:2,label:'SOCIAL COMMENT REACT POST'});
+      if (!owner.rows.length) return reply({success:false,message:'Comment not found.'});
+      socialPublish('comment',owner.rows[0].post_id);
+      reply({success:true});
+    } catch (err) {console.error('[SOCIAL COMMENT REACT ERROR]:',err && err.message || err);reply({success:false,message:'Could not react to comment.'});}
+  });
+
+
   socket.on('authenticate_user', async (data = {}) => {
     try {
       const { name, password, isNewAccount, adminMaintenanceBypass, passwordResetSubmission } = data;
