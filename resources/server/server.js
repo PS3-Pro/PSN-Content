@@ -12766,6 +12766,9 @@ io.on('connection', (socket) => {
   // --------------------------------------------------------------------------
   // Social public feed
   // --------------------------------------------------------------------------
+  socket.on('social_capabilities', (_data, callback) => {
+    if(typeof callback==='function')callback({success:true,api:2});
+  });
   socket.on('social_feed_list', async (data = {}, callback) => {
     const reply = typeof callback === 'function' ? callback : () => {};
     const actor = normalizeSocialUserName(socket.userName);
