@@ -27964,6 +27964,8 @@ P
 			const reconcileQueueRows = (container, entries) => {
 				const signature = signatureOf(entries);
 				if (container.dataset.queueSignature === signature) return;
+				const focused = container.contains(document.activeElement) ? document.activeElement : null;
+				const previousScrollTop = container.scrollTop;
 				const previous = new Map();
 				for (const row of container.children) {
 					if (row.classList.contains('ps3-queue-item')) previous.set(row.dataset.ps3QueueId, row);
@@ -28005,6 +28007,8 @@ P
 					successor = row;
 				}
 				container.dataset.queueSignature = signature;
+				if (container.scrollTop !== previousScrollTop) container.scrollTop = previousScrollTop;
+				if (focused?.isConnected && document.activeElement !== focused) focused.focus({ preventScroll:true });
 			};
 			reconcileQueueRows(current, items.slice(0,1));
 			const visibleOther = (expanded || (closing && !reduceMotion)) ? other : [];
@@ -70500,6 +70504,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 	// Reconcile only changed rows after file operations; moving every existing row
 	// through a DocumentFragment would detach controls and thumbnails unnecessarily.
 	function reconcileFileManagerPaneRows(list, existingRows, nextRows) {
+		const focused = list.contains(document.activeElement) ? document.activeElement : null;
 		const existingByPath = new Map();
 		for (const row of existingRows) {
 			const path = normalizeFileManagerPath(row.dataset.fmPath || '');
@@ -70527,6 +70532,8 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 			if (row === cursor) cursor = cursor.nextElementSibling;
 			else list.insertBefore(row, cursor);
 		}
+		// Moving an existing DOM node detaches keyboard focus in Chromium.
+		if (focused?.isConnected && document.activeElement !== focused) focused.focus({ preventScroll:true });
 	}
 
 	function explorePath(path, pane = 'left', options = {}) {
@@ -71796,11 +71803,28 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 		}
 	}
 	
+	// User names alone cannot distinguish two login sessions of the same account.
+	// Invalidate callbacks left behind by a previous session before they can mutate
+	// trophies, apply profile rewards or show delayed unlock notifications.
+	window.__psnAccountSessionGeneration = Number(window.__psnAccountSessionGeneration || 0);
+	function capturePsnAccountSession() {
+		return { name:String(localStorage.getItem('psn_username') || ''), generation:window.__psnAccountSessionGeneration };
+	}
+	function isPsnAccountSessionCurrent(session) {
+		return !!session?.name && session.name !== 'null' && session.generation === window.__psnAccountSessionGeneration &&
+			String(localStorage.getItem('psn_username') || '') === session.name;
+	}
+	window.invalidatePsnAccountSessionCallbacks = function() {
+		window.__psnAccountSessionGeneration++;
+		pendingTrophyUnlockVisualRefresh = false;
+		trophyUnlockVisualToken++;
+	};
 	let pendingTrophyUnlockVisualRefresh = false;
 	let trophyUnlockVisualOwner = '';
 	let trophyUnlockVisualToken = 0;
 	function scheduleTrophyUnlockVisualRefresh() {
-		const owner = String(localStorage.getItem('psn_username') || '');
+		const session = capturePsnAccountSession();
+		const owner = session.name;
 		if (pendingTrophyUnlockVisualRefresh && trophyUnlockVisualOwner === owner) return;
 		pendingTrophyUnlockVisualRefresh = true;
 		trophyUnlockVisualOwner = owner;
@@ -71808,7 +71832,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 		const flush = () => {
 			if (!pendingTrophyUnlockVisualRefresh || token !== trophyUnlockVisualToken) return;
 			pendingTrophyUnlockVisualRefresh = false;
-			if (String(localStorage.getItem('psn_username') || '') !== owner) return;
+			if (!isPsnAccountSessionCurrent(session)) return;
 			if (typeof window.refreshTrophiesWithMotion === 'function') window.refreshTrophiesWithMotion({ revealNew:false });
 			if (typeof checkPlatinum === 'function') checkPlatinum();
 		};
@@ -71822,7 +71846,8 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 	}
 
 	window.checkTrophyProgress = function(trophyId, currentAmount) {
-		if (!localStorage.getItem('psn_username') || localStorage.getItem('psn_username') === "null" || !window.userTrophies || window.__trophiesHydrated !== true) return;
+		const trophySession = capturePsnAccountSession();
+		if (!isPsnAccountSessionCurrent(trophySession) || !window.userTrophies || window.__trophiesHydrated !== true) return;
 		const trophy = TROPHY_DATA[trophyId];
 		if (!trophy) return;
 		
@@ -71864,7 +71889,8 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 			}
 	
 			setTimeout(() => {
-				if (!localStorage.getItem('psn_username') || localStorage.getItem('psn_username') === "null") return;
+				// A logout/relogin invalidates the callback even when the same user logs in again.
+				if (!isPsnAccountSessionCurrent(trophySession)) return;
 
 				if (typeof showTrophyPopup === 'function') showTrophyPopup(trophy, trophyId);
 				
@@ -73024,6 +73050,10 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 	};
 	
 	window.applyRewardAvatar = function(btnElement, avatarUrl, event) {
+		const session = capturePsnAccountSession();
+		if (!isPsnAccountSessionCurrent(session)) return;
+		// pointer-events alone does not block repeated Enter/Space activations.
+		if (btnElement.style.pointerEvents === 'none') return;
 		if (event) event.stopPropagation();
 		if (typeof playUiClick === 'function') playUiClick();
 		
@@ -73037,14 +73067,16 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 		btnElement.style.borderColor = '#ffa500';
 		
 		setTimeout(() => {
+			if (!isPsnAccountSessionCurrent(session)) return;
 			if (typeof updateMyAvatar === 'function') updateMyAvatar(avatarUrl);
-					if (typeof playUiSuccess === 'function') playUiSuccess();
+			if (typeof playUiSuccess === 'function') playUiSuccess();
 			
 			btnElement.innerHTML = '<i class="fas fa-check-double"></i> APPLIED!';
 			btnElement.style.background = '#4caf50';
 			btnElement.style.borderColor = '#4caf50';
 			
 			setTimeout(() => {
+				if (!isPsnAccountSessionCurrent(session)) return;
 				btnElement.innerHTML = originalHtml;
 				btnElement.style.background = originalBg;
 				btnElement.style.borderColor = originalBorder;
@@ -73055,6 +73087,10 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 	};
 
 	window.applyRewardProfileBanner = function(btnElement, styleId, event) {
+		const session = capturePsnAccountSession();
+		if (!isPsnAccountSessionCurrent(session)) return;
+		// pointer-events alone does not block repeated Enter/Space activations.
+		if (btnElement.style.pointerEvents === 'none') return;
 		if (event) event.stopPropagation();
 		if (typeof playUiClick === 'function') playUiClick();
 		const originalHtml = btnElement.innerHTML;
@@ -73065,12 +73101,14 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 		btnElement.style.background = '#ffa500';
 		btnElement.style.borderColor = '#ffa500';
 		setTimeout(() => {
+			if (!isPsnAccountSessionCurrent(session)) return;
 			if (typeof setProfileCardStyle === 'function') setProfileCardStyle(styleId);
 			if (typeof playUiSuccess === 'function') playUiSuccess();
 			btnElement.innerHTML = '<i class="fas fa-check-double"></i> APPLIED!';
 			btnElement.style.background = '#4caf50';
 			btnElement.style.borderColor = '#4caf50';
 			setTimeout(() => {
+				if (!isPsnAccountSessionCurrent(session)) return;
 				btnElement.innerHTML = originalHtml;
 				btnElement.style.background = originalBg;
 				btnElement.style.borderColor = originalBorder;
@@ -95004,6 +95042,7 @@ function getVisibleChatStackEl(id) {
 	};
 
 	window.resetPsnSessionRuntimeState = function(options = {}) {
+		if (typeof window.invalidatePsnAccountSessionCallbacks === 'function') window.invalidatePsnAccountSessionCallbacks();
 		const runtimeName = String(options.username || localStorage.getItem('psn_username') || (typeof currentLoginUser !== 'undefined' ? currentLoginUser : '') || '').trim();
 		if (runtimeName) {
 			if (window.__freshPsnUserMetaByName instanceof Map) window.__freshPsnUserMetaByName.delete(runtimeName.toLowerCase());
@@ -114913,7 +114952,7 @@ function getVisibleChatStackEl(id) {
     socketChat.on('social_feed_changed',onChanged);
     socketChat.on('social_activity_notice',onNotice);
   }
-  function onDisconnect(){state.stale=true;invalidateWarmFeed();}
+  function onDisconnect(){state.stale=true;invalidateWarmFeed();socialReactorsPages.clear();socialReactorCacheGeneration++;}
   function onNotice(data){
     if(!data||!data.actor||!visible())return;
     if(typeof showToastNotification==='function')showToastNotification('Social',`${data.actor} ${data.activity==='comment'?'commented on':'reacted to'} your post.`);
@@ -114974,6 +115013,9 @@ function getVisibleChatStackEl(id) {
     },110);
   }
   function onChanged(data){
+    if(data?.kind==='react')invalidateSocialReactorPages(data.commentId?'comment':'post',idOf(data.commentId||data.id));
+    else if(data?.kind==='delete'){socialReactorsPages.clear();socialReactorCacheGeneration++;}
+    else if(data?.kind==='comment-delete')invalidateSocialReactorPages('comment',idOf(data.commentId));
     if(!visible()){state.stale=true;return;}
     const id=idOf(data&&data.id);
     if(data&&data.kind==='delete'&&id){
@@ -114989,7 +115031,25 @@ function getVisibleChatStackEl(id) {
       if(state.posts.some(post=>post.id===id))schedulePostRefresh(id);
       return;
     }
-    if(data&&data.kind==='react'&&id)refreshOpenSocialReactors(data.commentId?'comment':'post',idOf(data.commentId||id));
+    if(data&&data.kind==='react'&&id){
+      const commentId=idOf(data.commentId);
+      refreshOpenSocialReactors(commentId?'comment':'post',commentId||id);
+      const after=typeof data.emoji==='string'?data.emoji:null;
+      const before=typeof data.oldEmoji==='string'?data.oldEmoji:null;
+      if(typeof data.actor==='string'&&data.actor&&(before===''||emojis.includes(before))&&(after===''||emojis.includes(after))){
+        // The initiating tab has already applied this reaction optimistically.
+        if(data.originSocketId&&data.originSocketId===state.socket?.id)return;
+        const target=commentId||id;
+        const pendingKey=(commentId?'comment:':'post:')+target;
+        if(state.pendingReactions.has(pendingKey))return;
+        const item=commentId?state.comments.get(id)?.find(row=>row.id===commentId):state.posts.find(row=>row.id===id);
+        if(item){
+          socialApplyReactionDelta(item,before,after,data.actor===identity());
+          socialPaintReaction(id,commentId||'');
+          return;
+        }
+      }
+    }
     if(data&&['react','comment','edit'].includes(data.kind)&&id){
       if((data.kind==='react'||data.kind==='comment')&&data.originSocketId&&data.originSocketId===state.socket?.id)return;
       if(data.kind==='react'&&data.commentId&&state.modalPostId===id)scheduleOpenSocialCommentsRefresh(id);
@@ -115205,6 +115265,23 @@ function getVisibleChatStackEl(id) {
   }
 
   const socialReactors = { overlay:null, kind:'post', id:'', postId:'', emoji:'', after:null, busy:false, serial:0, opener:null, count:0, refreshTimer:0, resizeAnimation:null, skipNextResize:false };
+  // Session-only cache: reopening a reaction list or switching filters avoids
+  // another round trip. Realtime invalidation keeps posts/comments fresh.
+  const socialReactorsPages=new Map();
+  let socialReactorCacheGeneration=0;
+  const socialReactorPageKey=(kind,id,emoji,after)=>`${kind}:${id}:${emoji}:${after}`;
+  function invalidateSocialReactorPages(kind,id){
+    if(!id)return;
+    socialReactorCacheGeneration++;
+    const prefix=`${kind}:${id}:`;
+    for(const key of socialReactorsPages.keys())if(key.startsWith(prefix))socialReactorsPages.delete(key);
+  }
+  function cacheSocialReactorPage(key,result){
+    if(!result?.success)return;
+    socialReactorsPages.delete(key);
+    socialReactorsPages.set(key,{result,expires:Date.now()+8000});
+    while(socialReactorsPages.size>50)socialReactorsPages.delete(socialReactorsPages.keys().next().value);
+  }
   function animateSocialReactorsHeight(update, immediate = false){
     const overlay=socialReactors.overlay;
     const dialog=overlay?.querySelector('.psn-social-reactors-dialog');
@@ -115304,16 +115381,22 @@ function getVisibleChatStackEl(id) {
     if(more&&(socialReactors.busy||!socialReactors.after))return;
     const id=socialReactors.id,kind=socialReactors.kind,emoji=socialReactors.emoji;
     const serial=++socialReactors.serial;socialReactors.busy=true;
+    const after=more?socialReactors.after:'';
+    const cacheKey=socialReactorPageKey(kind,id,emoji,after);
+    const cacheGeneration=socialReactorCacheGeneration;
+    const cached=socialReactorsPages.get(cacheKey);
+    const cacheHit=cached&&cached.expires>Date.now();
     const list=overlay.querySelector('#psn-social-reactors-list');
     const moreButton=overlay.querySelector('[data-reactors-more]');
     if(!more){
       const immediate=socialReactors.skipNextResize;
       socialReactors.skipNextResize=false;
-      animateSocialReactorsHeight(()=>{
+      if(!cacheHit)animateSocialReactorsHeight(()=>{
         socialReactors.after=null;list.innerHTML=socialReactorSkeleton();list.setAttribute('aria-busy','true');moreButton.hidden=true;
       },immediate);
-    }else {moreButton.disabled=true;moreButton.classList.add('is-loading');moreButton.innerHTML='<i class="fas fa-spinner" aria-hidden="true"></i><span>Loading...</span>';}
-    const result=await call('social_reactors_list',{kind,id,emoji,after:more?socialReactors.after:''});
+    }else if(!cacheHit){moreButton.disabled=true;moreButton.classList.add('is-loading');moreButton.innerHTML='<i class="fas fa-spinner" aria-hidden="true"></i><span>Loading...</span>';}
+    const result=cacheHit?cached.result:await call('social_reactors_list',{kind,id,emoji,after});
+    if(!cacheHit&&cacheGeneration===socialReactorCacheGeneration)cacheSocialReactorPage(cacheKey,result);
     if(serial!==socialReactors.serial||overlay.hidden)return;
     socialReactors.busy=false;
     list.removeAttribute('aria-busy');
@@ -115826,16 +115909,19 @@ function getVisibleChatStackEl(id) {
       const saved={myReaction:entry.myReaction,reactions:(entry.reactions||[]).map(row=>({...row}))};
       state.pendingReactions.add(reactKey);
       socialApplyReaction(entry,emoji);
+      invalidateSocialReactorPages(isComment?'comment':'post',target);
       socialPaintReaction(postId,isComment?target:'');
       const current=isComment?document.querySelector(`#psn-social-comments-modal [data-social-comment="${target}"]`):feed()?.querySelector(`[data-social-post="${target}"]`);
       const active=current?.querySelector(`[data-social-action="${isComment?'comment-react':'like'}"]`);
       if(active){active.classList.add('reaction-bump');}
       try {
-        const res=await call(isComment?'social_comment_react':'social_post_react',{id:target,emoji});
+        const res=await call(isComment?'social_comment_react':'social_post_react',{id:target,emoji,desiredEmoji:entry.myReaction});
         if(!res.success){
-          entry.myReaction=saved.myReaction;entry.reactions=saved.reactions;
-          socialPaintReaction(postId,isComment?target:'');
-          notify(res.message||'Could not react.',true);
+          if(res.code!=='timeout'){
+            entry.myReaction=saved.myReaction;entry.reactions=saved.reactions;
+            socialPaintReaction(postId,isComment?target:'');
+          }
+          notify(res.code==='timeout'?'Reaction confirmation delayed. Refreshing the result...':(res.message||'Could not react.'),true);
           if(res.code==='timeout'){
             if(isComment&&state.modalPostId===postId)loadComments(postId);
             else schedulePostRefresh(postId);
@@ -115848,6 +115934,14 @@ function getVisibleChatStackEl(id) {
       return;
     }
 
+  }
+  function socialApplyReactionDelta(entry,before,after,own){
+    if(before===after)return;
+    const counts=new Map((Array.isArray(entry.reactions)?entry.reactions:[]).map(x=>[x.emoji,Math.max(0,Number(x.count)||0)]));
+    if(before)counts.set(before,Math.max(0,(counts.get(before)||0)-1));
+    if(after)counts.set(after,(counts.get(after)||0)+1);
+    entry.reactions=[...counts].filter(([,count])=>count>0).map(([emoji,count])=>({emoji,count}));
+    if(own)entry.myReaction=after;
   }
   function socialApplyReaction(entry,emoji){
     const before=String(entry.myReaction||'');

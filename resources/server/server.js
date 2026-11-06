@@ -485,9 +485,12 @@ const ADMIN_STATE_KEYS = {
 // ============================================================================
 // PostgreSQL pool & shared server limits
 // ============================================================================
-// Aiven PostgreSQL Free has a small connection budget; keep the app pool at 5 max.
-// One additional dedicated PostgreSQL Client is used for LISTEN/NOTIFY outside this pool.
-const PG_POOL_MAX = Math.max(1, Math.min(5, parseInt(process.env.PG_POOL_MAX || process.env.DB_POOL_MAX || "5", 10) || 5));
+// Aiven PostgreSQL Free defaults to 20 connections; some are reserved by Aiven.
+// This pool is per server instance, and each instance also holds one dedicated
+// LISTEN/NOTIFY connection. Default 10 is intended for ONE running app instance.
+// If running several instances or other DB clients, lower PG_POOL_MAX to fit the
+// shared PostgreSQL connection budget (e.g. keep 5 with two instances).
+const PG_POOL_MAX = Math.max(1, Math.min(10, parseInt(process.env.PG_POOL_MAX || process.env.DB_POOL_MAX || "10", 10) || 10));
 const PG_CONNECTION_TIMEOUT_MS = Math.max(3000, parseInt(process.env.PG_CONNECTION_TIMEOUT_MS || "10000", 10) || 10000);
 const PG_IDLE_TIMEOUT_MS = Math.max(30000, parseInt(process.env.PG_IDLE_TIMEOUT_MS || "120000", 10) || 120000);
 const PG_QUERY_TIMEOUT_MS = Math.max(5000, parseInt(process.env.PG_QUERY_TIMEOUT_MS || "25000", 10) || 25000);
@@ -10177,7 +10180,15 @@ async function initProfileSyncNotifications() {
 
       if (message.channel === 'social_feed_sync') {
         socialFeedPending.clear();
-        io.emit('social_feed_changed', {kind:data.kind,id:String(data.id || ''),commentId:data.commentId ? String(data.commentId) : null,at:data.at});
+        invalidateSocialReactorsForChange(data.kind,String(data.id || ''),data);
+        if (data.kind === 'comment' || data.kind === 'comment-delete' || (data.kind === 'react' && data.commentId)) {
+          const suffix = `\u0000${String(data.id || '')}`;
+          for (const key of socialCommentsPending.keys()) if (key.endsWith(suffix)) socialCommentsPending.delete(key);
+        }
+        io.emit('social_feed_changed', {
+          kind:data.kind,id:String(data.id || ''),commentId:data.commentId ? String(data.commentId) : null,
+          actor:data.actor||'',oldEmoji:data.oldEmoji||'',emoji:data.emoji||'',at:data.at
+        });
         return;
       }
       if (message.channel === 'direct_group_sync') {
@@ -13343,8 +13354,77 @@ function readSocialCommentsShared(actor, postId) {
   return pending;
 }
 
+// Small, short-lived per-instance cache for public reactor pages. A concurrent
+// request shares the same database query; mutations/NOTIFY invalidate immediately.
+// This stays in RAM only, never in localStorage or the database.
+const socialReactorsCache = new Map();
+const SOCIAL_REACTORS_CACHE_MS = 6000;
+const SOCIAL_REACTORS_CACHE_MAX = 120;
+function invalidateSocialReactors(kind, id) {
+  const prefix = `${kind}:${id}:`;
+  for (const key of socialReactorsCache.keys()) {
+    if (key.startsWith(prefix)) socialReactorsCache.delete(key);
+  }
+}
+async function readSocialReactorsShared(kind, id, emoji, after) {
+  const key = `${kind}:${id}:${emoji}:${after}`;
+  const now = Date.now();
+  const cached = socialReactorsCache.get(key);
+  if (cached && (cached.promise || cached.expires > now)) return cached.promise || cached.value;
+  if (cached) socialReactorsCache.delete(key);
+  // The existing reaction PK (target_id, user_name) supports this ordering;
+  // selecting only 31 users before looking up avatars avoids a large join.
+  const table = kind === 'comment' ? 'social_comment_reactions' : 'social_post_reactions';
+  const target = kind === 'comment' ? 'comment_id' : 'post_id';
+  const conditions = [`r.${target} = $1::bigint`];
+  const params = [id];
+  if (emoji) {params.push(emoji);conditions.push(`r.emoji = $${params.length}`);}
+  if (after) {params.push(after);conditions.push(`r.user_name > $${params.length}`);}
+  params.push(DEFAULT_AVATAR);
+  const avatarParam = `$${params.length}`;
+  const entry = {promise:null, value:null, expires:0};
+  const pending = queryDbWithRetry(`
+    WITH selected AS MATERIALIZED (
+      SELECT r.user_name, r.emoji FROM ${table} r
+      WHERE ${conditions.join(' AND ')}
+      ORDER BY r.user_name LIMIT 31
+    )
+    SELECT s.user_name,s.emoji,COALESCE(NULLIF(u.data->>'avatar',''),${avatarParam}) AS avatar
+    FROM selected s JOIN users u ON u.name=s.user_name
+    ORDER BY s.user_name
+  `,params,{attempts:2,label:'SOCIAL REACTORS'}).then(result => {
+    const rows = result.rows || [];
+    const visible = rows.slice(0,30);
+    const value = {success:true,users:visible.map(row=>({
+      name:row.user_name,avatar:row.avatar,emoji:row.emoji
+    })),nextAfter:rows.length>30 ? visible[visible.length-1].user_name : null};
+    if (socialReactorsCache.get(key)===entry) {
+      entry.value=value;entry.promise=null;entry.expires=Date.now()+SOCIAL_REACTORS_CACHE_MS;
+    }
+    return value;
+  }).catch(err => {
+    if (socialReactorsCache.get(key)===entry) socialReactorsCache.delete(key);
+    throw err;
+  });
+  entry.promise=pending;
+  socialReactorsCache.set(key,entry);
+  while (socialReactorsCache.size>SOCIAL_REACTORS_CACHE_MAX)
+    socialReactorsCache.delete(socialReactorsCache.keys().next().value);
+  return pending;
+}
+function invalidateSocialReactorsForChange(kind, id, extra = null) {
+  if (kind === 'delete') {socialReactorsCache.clear();return;}
+  if (kind === 'react') {
+    if (extra && extra.commentId) invalidateSocialReactors('comment',String(extra.commentId));
+    else invalidateSocialReactors('post',String(id));
+  } else if (kind === 'comment-delete' && extra && extra.commentId) {
+    invalidateSocialReactors('comment',String(extra.commentId));
+  }
+}
+
 function socialPublish(kind, id, extra = null) {
   socialFeedPending.clear();
+  invalidateSocialReactorsForChange(kind,id,extra);
   if (kind === 'comment' || kind === 'comment-delete' || (kind === 'react' && extra && extra.commentId)) {
     const suffix = `\u0000${String(id || '')}`;
     for (const key of socialCommentsPending.keys()) {
@@ -13556,10 +13636,30 @@ io.on('connection', (socket) => {
     const actor = normalizeSocialUserName(socket.userName);
     const id = String(data.id || '');
     const emoji = String(data.emoji || '');
-    if (!actor || !/^\d{1,18}$/.test(id) || !SOCIAL_EMOJI.has(emoji)) return reply({success:false,message:'Invalid reaction.'});
+    const hasDesired = Object.prototype.hasOwnProperty.call(data,'desiredEmoji');
+    const desired = hasDesired ? String(data.desiredEmoji) : emoji;
+    if (!actor || !/^\d{1,18}$/.test(id) || !SOCIAL_EMOJI.has(emoji) || (hasDesired && desired!=='' && !SOCIAL_EMOJI.has(desired))) return reply({success:false,message:'Invalid reaction.'});
     if (!socialRateLimit(actor,'react:'+id,300)) return reply({success:false,message:'Please wait.'});
     try {
-      const result = await queryDbWithRetry(`
+      const result = hasDesired ? await queryDbWithRetry(desired ? `
+        WITH target AS MATERIALIZED (SELECT id,author_name FROM social_posts WHERE id=$1),
+        prior AS MATERIALIZED (SELECT emoji FROM social_post_reactions WHERE post_id=$1 AND user_name=$2),
+        applied AS (
+          INSERT INTO social_post_reactions (post_id,user_name,emoji)
+          SELECT id,$2,$3 FROM target WHERE true
+          ON CONFLICT (post_id,user_name) DO UPDATE SET emoji=EXCLUDED.emoji
+            WHERE social_post_reactions.emoji IS DISTINCT FROM EXCLUDED.emoji
+          RETURNING post_id
+        )
+        SELECT target.author_name,true AS reacted,EXISTS(SELECT 1 FROM applied) AS changed,
+          COALESCE((SELECT emoji FROM prior),'') AS previous_emoji FROM target
+      ` : `
+        WITH target AS MATERIALIZED (SELECT id,author_name FROM social_posts WHERE id=$1),
+        prior AS MATERIALIZED (SELECT emoji FROM social_post_reactions WHERE post_id=$1 AND user_name=$2),
+        removed AS (DELETE FROM social_post_reactions WHERE post_id=$1 AND user_name=$2 RETURNING post_id)
+        SELECT target.author_name,false AS reacted,EXISTS(SELECT 1 FROM removed) AS changed,
+          COALESCE((SELECT emoji FROM prior),'') AS previous_emoji FROM target
+      `,desired?[id,actor,desired]:[id,actor],{attempts:2,label:'SOCIAL POST REACTION SET'}) : await queryDbWithRetry(`
         WITH target AS MATERIALIZED (SELECT id,author_name FROM social_posts WHERE id=$1),
         removed AS (
           DELETE FROM social_post_reactions WHERE post_id=$1 AND user_name=$2 AND emoji=$3
@@ -13576,7 +13676,11 @@ io.on('connection', (socket) => {
       `,[id,actor,emoji],{attempts:2,label:'SOCIAL POST REACTION'});
       const reaction=result.rows[0];
       if (!reaction) return reply({success:false,message:'Post not found.'});
-      socialPublish('react',id,{originSocketId:socket.id});
+      reply({success:true,reacted:reaction.reacted===true});
+      if (hasDesired && !reaction.changed) return;
+      socialPublish('react',id,{originSocketId:socket.id,...(hasDesired?{
+        actor,oldEmoji:reaction.previous_emoji||'',emoji:desired
+      }:{})});
       if (reaction.reacted) {
         const owner=reaction.author_name;
         socialNotifyAuthor(owner,actor,id,'reaction');
@@ -13584,7 +13688,6 @@ io.on('connection', (socket) => {
           actor,postId:id,activity:'reaction',emoji
         },{dedupeKey:`social:react:${id}:${actor}`}),0);
       }
-      reply({success:true,reacted:reaction.reacted===true});
     } catch (err) {
       console.error('[SOCIAL REACTION ERROR]:',err && err.message || err);
       reply({success:false,message:'Could not react.'});
@@ -13604,25 +13707,8 @@ io.on('connection', (socket) => {
     if (!/^\d{1,18}$/.test(id) || (emoji && !SOCIAL_EMOJI.has(emoji)) || after.length > 120) {
       return reply({ success:false, message:'Invalid reaction request.' });
     }
-    const table = kind === 'comment' ? 'social_comment_reactions' : 'social_post_reactions';
-    const key = kind === 'comment' ? 'comment_id' : 'post_id';
     try {
-      const result = await queryDbWithRetry(`
-        SELECT r.user_name, r.emoji,
-          COALESCE(NULLIF(u.data->>'avatar',''),$3) AS avatar
-        FROM ${table} r
-        JOIN users u ON u.name = r.user_name
-        WHERE r.${key} = $1::bigint
-          AND ($2::text = '' OR r.emoji = $2)
-          AND ($4::text = '' OR r.user_name > $4)
-        ORDER BY r.user_name
-        LIMIT 31
-      `, [id,emoji,DEFAULT_AVATAR,after], {attempts:2,label:'SOCIAL REACTORS'});
-      const rows = result.rows || [];
-      const visible = rows.slice(0,30);
-      reply({success:true, users:visible.map(row => ({
-        name:row.user_name, avatar:row.avatar, emoji:row.emoji
-      })), nextAfter:rows.length > 30 ? visible[visible.length - 1].user_name : null});
+      reply(await readSocialReactorsShared(kind,id,emoji,after));
     } catch (err) {
       console.error('[SOCIAL REACTORS ERROR]:',err && err.message || err);
       reply({success:false,message:'Could not load reactions.'});
@@ -13691,10 +13777,30 @@ io.on('connection', (socket) => {
     const actor = normalizeSocialUserName(socket.userName);
     const id = String(data.id || '');
     const emoji = String(data.emoji || '');
-    if (!actor || !/^\d{1,18}$/.test(id) || !SOCIAL_EMOJI.has(emoji)) return reply({success:false,message:'Invalid reaction.'});
+    const hasDesired = Object.prototype.hasOwnProperty.call(data,'desiredEmoji');
+    const desired = hasDesired ? String(data.desiredEmoji) : emoji;
+    if (!actor || !/^\d{1,18}$/.test(id) || !SOCIAL_EMOJI.has(emoji) || (hasDesired && desired!=='' && !SOCIAL_EMOJI.has(desired))) return reply({success:false,message:'Invalid reaction.'});
     if (!socialRateLimit(actor,'comment-react:'+id,300)) return reply({success:false,message:'Please wait.'});
     try {
-      const result = await queryDbWithRetry(`
+      const result = hasDesired ? await queryDbWithRetry(desired ? `
+        WITH target AS MATERIALIZED (SELECT id,post_id FROM social_comments WHERE id=$1),
+        prior AS MATERIALIZED (SELECT emoji FROM social_comment_reactions WHERE comment_id=$1 AND user_name=$2),
+        applied AS (
+          INSERT INTO social_comment_reactions (comment_id,user_name,emoji)
+          SELECT id,$2,$3 FROM target WHERE true
+          ON CONFLICT (comment_id,user_name) DO UPDATE SET emoji=EXCLUDED.emoji
+            WHERE social_comment_reactions.emoji IS DISTINCT FROM EXCLUDED.emoji
+          RETURNING comment_id
+        )
+        SELECT target.post_id,true AS reacted,EXISTS(SELECT 1 FROM applied) AS changed,
+          COALESCE((SELECT emoji FROM prior),'') AS previous_emoji FROM target
+      ` : `
+        WITH target AS MATERIALIZED (SELECT id,post_id FROM social_comments WHERE id=$1),
+        prior AS MATERIALIZED (SELECT emoji FROM social_comment_reactions WHERE comment_id=$1 AND user_name=$2),
+        removed AS (DELETE FROM social_comment_reactions WHERE comment_id=$1 AND user_name=$2 RETURNING comment_id)
+        SELECT target.post_id,false AS reacted,EXISTS(SELECT 1 FROM removed) AS changed,
+          COALESCE((SELECT emoji FROM prior),'') AS previous_emoji FROM target
+      `,desired?[id,actor,desired]:[id,actor],{attempts:2,label:'SOCIAL COMMENT REACTION SET'}) : await queryDbWithRetry(`
         WITH target AS MATERIALIZED (SELECT id,post_id FROM social_comments WHERE id=$1),
         removed AS (
           DELETE FROM social_comment_reactions WHERE comment_id=$1 AND user_name=$2 AND emoji=$3
@@ -13711,8 +13817,11 @@ io.on('connection', (socket) => {
       `,[id,actor,emoji],{attempts:2,label:'SOCIAL COMMENT REACT'});
       const reaction=result.rows[0];
       if (!reaction) return reply({success:false,message:'Comment not found.'});
-      socialPublish('react',reaction.post_id,{originSocketId:socket.id,commentId:id});
       reply({success:true,reacted:reaction.reacted===true});
+      if (hasDesired && !reaction.changed) return;
+      socialPublish('react',reaction.post_id,{originSocketId:socket.id,commentId:id,...(hasDesired?{
+        actor,oldEmoji:reaction.previous_emoji||'',emoji:desired
+      }:{})});
     } catch (err) {console.error('[SOCIAL COMMENT REACT ERROR]:',err && err.message || err);reply({success:false,message:'Could not react to comment.'});}
   });
 
