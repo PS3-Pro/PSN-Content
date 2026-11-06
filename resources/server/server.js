@@ -3827,6 +3827,29 @@ function countUnlockedTrophiesPayload(value) {
   }, 0);
 }
 
+function unlockedTrophyIdsChanged(previous, next) {
+  const isUnlocked = state => {
+    if (!state || typeof state !== 'object' || Array.isArray(state)) return false;
+    const value = String(state.unlocked ?? '').toLowerCase();
+    return value === 'true' || value === '1' || value === 'yes';
+  };
+  const prior = previous && typeof previous === 'object' && !Array.isArray(previous) ? previous : {};
+  const incoming = next && typeof next === 'object' && !Array.isArray(next) ? next : {};
+  let previousCount = 0;
+  let nextCount = 0;
+  for (const [id, state] of Object.entries(prior)) {
+    if (!isUnlocked(state)) continue;
+    previousCount++;
+    if (!isUnlocked(incoming[id])) return true;
+  }
+  for (const [id, state] of Object.entries(incoming)) {
+    if (!isUnlocked(state)) continue;
+    nextCount++;
+    if (!isUnlocked(prior[id])) return true;
+  }
+  return previousCount !== nextCount;
+}
+
 function shouldAcceptIncomingTrophies(currentUser = {}, incomingUser = {}) {
   if (!incomingUser || !hasObjectPayload(incomingUser.trophiesData)) return false;
   const currentUnlocked = countUnlockedTrophiesPayload(currentUser.trophiesData);
@@ -8027,6 +8050,42 @@ async function refreshChatSyncStateFromDb() {
   return chatSyncState;
 }
 
+const CHAT_SYNC_PRUNE_DELAY_MS = 1500;
+const pendingChatSyncPrunes = new Map();
+
+function scheduleChatSyncChangesPrune(epoch, revision) {
+  const key = String(epoch || '');
+  const cutoff = Math.floor(Number(revision) || 0) - CHAT_SYNC_CHANGE_LOG_MAX;
+  if (!key || cutoff <= 0) return;
+  let state = pendingChatSyncPrunes.get(key);
+  if (!state) {
+    state = { cutoff:0, timer:null, running:false };
+    pendingChatSyncPrunes.set(key, state);
+  }
+  state.cutoff = Math.max(state.cutoff, cutoff);
+  if (state.timer || state.running) return;
+  const schedule = (delay) => {
+    state.timer = setTimeout(async () => {
+      state.timer = null;
+      state.running = true;
+      const target = state.cutoff;
+      try {
+        await pool.query('DELETE FROM chat_changes WHERE epoch = $1 AND revision <= $2', [key, target]);
+      } catch (err) {
+        if (process.env.DEBUG_CHAT_SYNC === '1') console.warn('[CHAT SYNC PRUNE ERROR]:', err && err.message ? err.message : err);
+        state.running = false;
+        pendingChatSyncPrunes.delete(key);
+        return;
+      }
+      state.running = false;
+      if (state.cutoff > target) schedule(CHAT_SYNC_PRUNE_DELAY_MS);
+      else pendingChatSyncPrunes.delete(key);
+    }, delay);
+    if (typeof state.timer.unref === 'function') state.timer.unref();
+  };
+  schedule(CHAT_SYNC_PRUNE_DELAY_MS);
+}
+
 async function recordChatSyncChange(changeType, messageId = '', message = null) {
   const type = String(changeType || '').toLowerCase();
   if (!['upsert', 'delete'].includes(type)) throw new Error(`Unsupported chat sync change: ${type}`);
@@ -8058,12 +8117,7 @@ async function recordChatSyncChange(changeType, messageId = '', message = null) 
   };
   chatSyncState = { epoch: change.epoch, revision: change.revision };
 
-  const pruneBefore = change.revision - CHAT_SYNC_CHANGE_LOG_MAX;
-  if (pruneBefore > 0) {
-    pool.query('DELETE FROM chat_changes WHERE epoch = $1 AND revision <= $2', [change.epoch, pruneBefore]).catch(err => {
-      if (process.env.DEBUG_CHAT_SYNC === '1') console.warn('[CHAT SYNC PRUNE ERROR]:', err && err.message ? err.message : err);
-    });
-  }
+  scheduleChatSyncChangesPrune(change.epoch, change.revision);
   return change;
 }
 
@@ -8105,12 +8159,7 @@ async function saveChatMessageWithSync(messageData) {
   }, { attempts: 3, lockTimeoutMs: 2000 });
 
   chatSyncState = { epoch: result.epoch, revision: result.revision };
-  const pruneBefore = result.revision - CHAT_SYNC_CHANGE_LOG_MAX;
-  if (pruneBefore > 0) {
-    pool.query('DELETE FROM chat_changes WHERE epoch = $1 AND revision <= $2', [result.epoch, pruneBefore]).catch(err => {
-      if (process.env.DEBUG_CHAT_SYNC === '1') console.warn('[CHAT SYNC PRUNE ERROR]:', err && err.message ? err.message : err);
-    });
-  }
+  scheduleChatSyncChangesPrune(result.epoch, result.revision);
   return {
     dbId: result.dbId,
     change: {
@@ -8268,12 +8317,7 @@ async function deleteChatMessagesWithSyncBatch(entries = [], trace = null) {
 
   if (epoch && endRevision) {
     chatSyncState = { epoch, revision: endRevision };
-    const pruneBefore = chatSyncState.revision - CHAT_SYNC_CHANGE_LOG_MAX;
-    if (pruneBefore > 0) {
-      pool.query('DELETE FROM chat_changes WHERE epoch = $1 AND revision <= $2', [chatSyncState.epoch, pruneBefore]).catch(err => {
-        if (process.env.DEBUG_CHAT_SYNC === '1') console.warn('[CHAT SYNC PRUNE ERROR]:', err && err.message ? err.message : err);
-      });
-    }
+    scheduleChatSyncChangesPrune(chatSyncState.epoch, chatSyncState.revision);
   }
 
   return {
@@ -8752,10 +8796,19 @@ async function emitDirectGroupReadLocal(groupId,reader,lastMessageId,knownMember
   const event={groupId,user:reader,lastMessageId:String(lastMessageId)};
   for(const member of members)for(const client of getSocketsByUserName(member.user_name))if(client?.connected)client.emit('direct_group_read',event);
 }
-async function emitDirectGroupLocal(groupId,kind,payload) {
-  directGroupListPending.clear();
-  directGroupPreviewPending.clear();
-  const members=await getDirectGroupMembers(groupId);
+function invalidateDirectGroupListsForMembers(members) {
+  // Other viewers' in-flight group lists are unrelated to this group change.
+  // Retain their pending reads rather than starting redundant PostgreSQL queries.
+  for (const member of members || []) {
+    const name = normalizeDirectMessageUser(member && member.user_name);
+    if (!name) continue;
+    directGroupListPending.delete(name);
+    directGroupPreviewPending.delete(name);
+  }
+}
+async function emitDirectGroupLocal(groupId,kind,payload,knownMembers=null) {
+  const members=knownMembers || await getDirectGroupMembers(groupId);
+  invalidateDirectGroupListsForMembers(members);
   const messagePayload=(kind==='message'||kind==='update')?addDirectGroupReadReceipts(payload,members):payload;
   for (const member of members) for(const client of getSocketsByUserName(member.user_name)) {
     if (!client || !client.connected) continue;
@@ -8865,20 +8918,54 @@ function readDirectGroupListShared(viewer){
   pending.finally(()=>{if(directGroupListPending.get(viewer)===pending)directGroupListPending.delete(viewer);}).catch(()=>{});
   return pending;
 }
-async function getDirectGroupHistory(groupId,viewer) {
-  const member=await getDirectGroupMember(groupId,viewer);
-  if(!member)return {success:false,message:'You are not a member of this group.'};
-  const [result,members]=await Promise.all([
-    queryDbWithRetry('SELECT * FROM (SELECT * FROM direct_group_messages WHERE group_id=$1 AND created_at >= $2 ORDER BY id DESC LIMIT $3) x ORDER BY id',[groupId,member.joined_at,DIRECT_GROUP_HISTORY_MAX],{attempts:2,label:'GROUP HISTORY'}),
-    getDirectGroupMembers(groupId)
+// Multiple tabs opening the same group share only the in-flight history read.
+// Settled requests are never cached, so new group messages remain visible.
+const directGroupHistoryPending = new Map();
+function getDirectGroupHistory(groupId, viewer) {
+  const key = `${groupId}\u0000${viewer}`;
+  let pending = directGroupHistoryPending.get(key);
+  if (pending) return pending;
+  pending = loadDirectGroupHistory(groupId, viewer);
+  directGroupHistoryPending.set(key, pending);
+  pending.finally(() => {
+    if (directGroupHistoryPending.get(key) === pending) directGroupHistoryPending.delete(key);
+  }).catch(() => {});
+  return pending;
+}
+async function loadDirectGroupHistory(groupId,viewer) {
+  // Read membership and the group roster together. The history query also
+  // verifies membership, so parallel requests cannot expose a group to a stranger.
+  // This removes one round trip for every group opened, including concurrent tabs.
+  const [snapshot,result]=await Promise.all([
+    queryDbWithRetry(`SELECT self.joined_at,self.last_read_id,g.title,g.created_by,
+      member.user_name AS member_name,member.joined_at AS member_joined_at,
+      member.last_read_id AS member_last_read_id
+      FROM direct_group_members self
+      JOIN direct_groups g ON g.id=self.group_id
+      JOIN direct_group_members member ON member.group_id=self.group_id
+      WHERE self.group_id=$1 AND self.user_name=$2
+      ORDER BY member.joined_at,member.user_name`,[groupId,viewer],{attempts:2,label:'GROUP ROSTER'}),
+    queryDbWithRetry(`SELECT * FROM (
+      SELECT message.* FROM direct_group_messages message
+      JOIN direct_group_members viewer_member ON viewer_member.group_id=message.group_id
+        AND viewer_member.user_name=$2
+      WHERE message.group_id=$1 AND message.created_at>=viewer_member.joined_at
+      ORDER BY message.id DESC LIMIT $3
+    ) recent ORDER BY id`,[groupId,viewer,DIRECT_GROUP_HISTORY_MAX],{attempts:2,label:'GROUP HISTORY'})
   ]);
+  const member=snapshot.rows?.[0];
+  if(!member)return {success:false,message:'You are not a member of this group.'};
+  const members=snapshot.rows.map(row=>({user_name:row.member_name,joined_at:row.member_joined_at,last_read_id:row.member_last_read_id}));
   const messages=result.rows.map(serializeDirectGroupMessage);
   const lastId=messages.length?Number(messages[messages.length-1].id):Number(member.last_read_id)||0;
   if(lastId>Number(member.last_read_id)){
-    await pool.query('UPDATE direct_group_members SET last_read_id=GREATEST(last_read_id,$3) WHERE group_id=$1 AND user_name=$2',[groupId,viewer,lastId]);
-    const own=members.find(m=>m.user_name===viewer);if(own)own.last_read_id=lastId;
-    try{await emitDirectGroupReadLocal(groupId,viewer,lastId,members);}catch(err){console.error('[GROUP READ EMIT]',err?.message||err);}
-    deferServerTask('GROUP READ SYNC',()=>notifyDirectGroupChange(groupId,'read',{user:viewer,lastMessageId:lastId}),0);
+    const advance=await pool.query('UPDATE direct_group_members SET last_read_id=$3 WHERE group_id=$1 AND user_name=$2 AND last_read_id<$3 RETURNING last_read_id',[groupId,viewer,lastId]);
+    const own=members.find(m=>m.user_name===viewer);
+    if(own)own.last_read_id=Math.max(Number(own.last_read_id)||0,lastId);
+    if(advance.rowCount){
+      try{await emitDirectGroupReadLocal(groupId,viewer,lastId,members);}catch(err){console.error('[GROUP READ EMIT]',err?.message||err);}
+      deferServerTask('GROUP READ SYNC',()=>notifyDirectGroupChange(groupId,'read',{user:viewer,lastMessageId:lastId}),0);
+    }
   }
   const withReceipts=messages.map(m=>addDirectGroupReadReceipts(m,members));
   return {success:true,group:{id:groupId,title:member.title,createdBy:member.created_by,members:members.map(m=>m.user_name)},messages:withReceipts,pinnedMessages:withReceipts.filter(m=>m.pinnedAt).slice(-10),lastReadId:String(lastId)};
@@ -9123,6 +9210,44 @@ async function notifyDirectMessageAcrossInstances(kind, payload) {
   } catch (err) {
     console.error('[DIRECT MESSAGE NOTIFY ERROR]:', err && err.message ? err.message : err);
   }
+}
+
+// PostgreSQL can deliver several reaction/edit/pin notifications for one private
+// message while the same row is still being read. Share that in-flight work and
+// perform one final read if another change arrived during it. Completed reads
+// are never cached, so subsequent independent updates remain immediately visible.
+const directRemoteMessageSyncPending=new Map();
+async function syncRemoteDirectMessage(kind,payload) {
+  const messageId=Math.max(0,Number(payload && payload.id)||0);
+  const from=normalizeDirectMessageUser(payload && payload.from);
+  const to=normalizeDirectMessageUser(payload && payload.to);
+  if (!messageId || !from || !to) return;
+  if (!getSocketsByUserName(from).some(sock=>sock.connected) && !getSocketsByUserName(to).some(sock=>sock.connected)) return;
+  const key=`${kind}:${messageId}`;
+  const previous=directRemoteMessageSyncPending.get(key);
+  if (previous) {previous.dirty=true;return previous.promise;}
+  const state={dirty:false,promise:null};
+  directRemoteMessageSyncPending.set(key,state);
+  state.promise=(async()=>{
+    let lastEmitted='';
+    do {
+      state.dirty=false;
+      const result=await queryDbWithRetry(
+        'SELECT id, sender_name, recipient_name, text, message_type, content, reply_to, reactions, pinned_at, edited_at, created_at FROM direct_messages WHERE id = $1 LIMIT 1',
+        [messageId],{attempts:2,label:'DIRECT MESSAGE SYNC READ'}
+      );
+      const message=serializeDirectMessage(result.rows && result.rows[0]);
+      if (!message) continue;
+      const signature=JSON.stringify(message);
+      if (signature===lastEmitted) continue;
+      lastEmitted=signature;
+      if (kind==='update') emitDirectMessageUpdateToLocalUsers(message);
+      else emitDirectMessageToLocalUsers(message);
+    } while(state.dirty);
+  })().finally(()=>{
+    if (directRemoteMessageSyncPending.get(key)===state)directRemoteMessageSyncPending.delete(key);
+  });
+  return state.promise;
 }
 
 async function queryDirectConversationPayload(userName) {
@@ -9516,6 +9641,68 @@ function getDirectRetentionKey(senderName, recipientName) {
   return a < b ? `${a}\u0000${b}` : `${b}\u0000${a}`;
 }
 
+// Maintenance never consumes more than one database connection at once.
+// Each conversation has one queued cleanup; the rest of the pool remains
+// available to live messages, group events and presence updates.
+const directRetentionQueued = new Map();
+const directRetentionRunning = new Set();
+const directRetentionRerun = new Map();
+let directRetentionDrainTimer = null;
+
+function scheduleDirectRetentionDrain(delayMs = 0) {
+  if (directRetentionDrainTimer !== null) return;
+  directRetentionDrainTimer = setTimeout(() => {
+    directRetentionDrainTimer = null;
+    drainDirectRetentionQueue();
+  }, delayMs);
+  if (typeof directRetentionDrainTimer.unref === 'function') directRetentionDrainTimer.unref();
+}
+
+function drainDirectRetentionQueue() {
+  if (directRetentionRunning.size || !directRetentionQueued.size) return;
+  const [key, entry] = directRetentionQueued.entries().next().value;
+  // Give active user requests priority, but bound the wait so maintenance
+  // cannot be starved indefinitely by a busy server.
+  if (pool.waitingCount > 0 && Date.now() - entry.enqueuedAt < 5000) {
+    scheduleDirectRetentionDrain(250);
+    return;
+  }
+  directRetentionQueued.delete(key);
+  directRetentionRunning.add(key);
+  Promise.resolve()
+    .then(() => trimDirectConversation(entry.sender, entry.recipient))
+    .catch(err => {
+      if (directMessageRetentionLastRun.get(key) === entry.runAt) directMessageRetentionLastRun.delete(key);
+      console.error('[DIRECT MESSAGE RETENTION DEFERRED ERROR]:', err && err.message ? err.message : err);
+    })
+    .finally(() => {
+      directRetentionRunning.delete(key);
+      const newer = directRetentionRerun.get(key);
+      if (newer) {
+        directRetentionRerun.delete(key);
+        directRetentionQueued.set(key, newer);
+      }
+      scheduleDirectRetentionDrain();
+    });
+}
+
+function queueDirectConversationRetention(key, sender, recipient, runAt) {
+  const entry = { sender, recipient, runAt, enqueuedAt:Date.now() };
+  if (directRetentionRunning.has(key)) {
+    directRetentionRerun.set(key, entry);
+    return true;
+  }
+  if (directRetentionQueued.has(key)) {
+    // A later scheduled trim supersedes an earlier one for the same pair.
+    directRetentionQueued.set(key, { ...entry, enqueuedAt:directRetentionQueued.get(key).enqueuedAt });
+    return true;
+  }
+  if (directRetentionQueued.size >= DIRECT_MESSAGE_RETENTION_TRACK_MAX) return false;
+  directRetentionQueued.set(key, entry);
+  scheduleDirectRetentionDrain();
+  return true;
+}
+
 function scheduleDirectConversationRetention(senderName, recipientName, force = false) {
   const key = getDirectRetentionKey(senderName, recipientName);
   if (!key) return false;
@@ -9553,14 +9740,11 @@ function scheduleDirectConversationRetention(senderName, recipientName, force = 
     }
   }
 
-  deferServerTask('DIRECT MESSAGE RETENTION', async () => {
-    try {
-      await trimDirectConversation(senderName, recipientName);
-    } catch (err) {
-      directMessageRetentionLastRun.delete(key);
-      throw err;
-    }
-  }, 0);
+  if (!queueDirectConversationRetention(key, senderName, recipientName, now)) {
+    // A saturated maintenance queue must not mark this pair as cleaned.
+    directMessageRetentionLastRun.delete(key);
+    return false;
+  }
   return true;
 }
 
@@ -9997,37 +10181,41 @@ async function initProfileSyncNotifications() {
         return;
       }
       if (message.channel === 'direct_group_sync') {
-        directGroupListPending.clear();
-        directGroupPreviewPending.clear();
         const gid=directGroupId(data.groupId);
         if (!gid) return;
-        if(data.kind==='read'){const reader=normalizeDirectMessageUser(data.id?.user),lastId=Number(data.id?.lastMessageId)||0;if(reader&&lastId)await emitDirectGroupReadLocal(gid,reader,lastId);return;}
-        if(data.kind==='left'){for(const sock of getSocketsByUserName(String(data.id||'')))if(sock.connected)sock.emit('direct_group_changed',{groupId:gid,left:true});await emitDirectGroupLocal(gid,'refresh');return;}
+        // A departing member must receive its leave event even if it is no
+        // longer in the group's membership table.
+        if (data.kind==='left') {
+          invalidateDirectGroupListsForMembers([{ user_name:data.id }]);
+          for (const sock of getSocketsByUserName(String(data.id||''))) {
+            if (sock.connected) sock.emit('direct_group_changed',{groupId:gid,left:true});
+          }
+        }
+        // Every instance receives NOTIFY, but most instances have no connected
+        // member of this group. Check membership before reading message bodies.
+        // Reuse these fresh member rows for receipts and fanout, avoiding a
+        // second membership query on instances that do have recipients.
+        if (!socketsByUserName.size) return;
+        const members=await getDirectGroupMembers(gid);
+        invalidateDirectGroupListsForMembers(members);
+        if (!members.some(member=>getSocketsByUserName(member.user_name).some(sock=>sock.connected))) return;
+        if (data.kind==='read') {
+          const reader=normalizeDirectMessageUser(data.id?.user),lastId=Number(data.id?.lastMessageId)||0;
+          if(reader&&lastId)await emitDirectGroupReadLocal(gid,reader,lastId,members);
+          return;
+        }
+        if(data.kind==='left') {await emitDirectGroupLocal(gid,'refresh',null,members);return;}
         if (data.kind==='message'||data.kind==='update') {
           const result=await pool.query('SELECT * FROM direct_group_messages WHERE group_id=$1 AND id=$2',[gid,Number(data.id)||0]);
           const msg=serializeDirectGroupMessage(result.rows?.[0]);
-          if (msg) await emitDirectGroupLocal(gid,data.kind,msg);
-        } else if(data.kind==='delete') await emitDirectGroupLocal(gid,'delete',{id:String(data.id)});
-        else await emitDirectGroupLocal(gid,'refresh');
+          if (msg) await emitDirectGroupLocal(gid,data.kind,msg,members);
+        } else if(data.kind==='delete') await emitDirectGroupLocal(gid,'delete',{id:String(data.id)},members);
+        else await emitDirectGroupLocal(gid,'refresh',null,members);
         return;
       }
       if (message.channel === 'direct_message_sync') {
         if ((data.kind === 'message' || data.kind === 'update') && data.payload) {
-          const messageId = Math.max(0, Number(data.payload.id) || 0);
-          const from = normalizeDirectMessageUser(data.payload.from);
-          const to = normalizeDirectMessageUser(data.payload.to);
-          if (!messageId || !from || !to) return;
-          if (!getSocketsByUserName(from).length && !getSocketsByUserName(to).length) return;
-          const directResult = await queryDbWithRetry(
-            'SELECT id, sender_name, recipient_name, text, message_type, content, reply_to, reactions, pinned_at, edited_at, created_at FROM direct_messages WHERE id = $1 LIMIT 1',
-            [messageId],
-            { attempts:2, label:'DIRECT MESSAGE SYNC READ' }
-          );
-          const directMessage = serializeDirectMessage(directResult.rows && directResult.rows[0]);
-          if (directMessage) {
-            if (data.kind === 'update') emitDirectMessageUpdateToLocalUsers(directMessage);
-            else emitDirectMessageToLocalUsers(directMessage);
-          }
+          await syncRemoteDirectMessage(data.kind,data.payload);
         } else if (data.kind === 'delete' && data.payload) {
           emitDirectMessageDeleteToLocalUsers(data.payload);
         } else if (data.kind === 'conversation_delete' && data.payload) {
@@ -10381,6 +10569,8 @@ async function initProfileSyncNotifications() {
       const refreshedUser = await refreshSingleUserSummaryFromDb(name, { invalidateOnlineList: false });
       if (!refreshedUser) {
         if (data.changes && data.changes.deleted === true) {
+          invalidateGlobalTrophyStatsCache();
+          scheduleTrophyStatsRefreshBroadcast(1200);
           clearDeletedUserRuntimeState(name);
           disconnectUserSessions(name, 'account_deleted', {
             reason: normalizeText(data.changes.deleteReason, '') || 'Account deleted by administrator.',
@@ -10752,6 +10942,54 @@ async function notifyFriendActivityClearedAcrossInstances(userName, throughId = 
   }
 }
 
+const FRIEND_ACTIVITY_RETENTION_DELAY_MS = 1800;
+const pendingFriendActivityRetention = new Map();
+
+function scheduleFriendActivityRetention(actorName) {
+  const actor = normalizeSocialUserName(actorName);
+  if (!actor) return;
+  let state = pendingFriendActivityRetention.get(actor);
+  if (!state) {
+    state = { version:0, timer:null, running:false };
+    pendingFriendActivityRetention.set(actor, state);
+  }
+  state.version++;
+  if (state.timer || state.running) return;
+  const schedule = () => {
+    state.timer = setTimeout(async () => {
+      state.timer = null;
+      state.running = true;
+      const version = state.version;
+      try {
+        await queryDbWithRetry(
+          `DELETE FROM friend_activity
+           WHERE actor_name = $1
+             AND id < COALESCE((
+               SELECT id
+               FROM friend_activity
+               WHERE actor_name = $1
+               ORDER BY id DESC
+               OFFSET $2
+               LIMIT 1
+             ), 0)`,
+          [actor, SOCIAL_HISTORY_MAX - 1],
+          { attempts:2, label:'FRIEND ACTIVITY RETENTION' }
+        );
+      } catch (err) {
+        console.error('[FRIEND ACTIVITY RETENTION DEFERRED ERROR]:', err && err.message ? err.message : err);
+        state.running = false;
+        pendingFriendActivityRetention.delete(actor);
+        return;
+      }
+      state.running = false;
+      if (state.version > version) schedule();
+      else pendingFriendActivityRetention.delete(actor);
+    }, FRIEND_ACTIVITY_RETENTION_DELAY_MS);
+    if (typeof state.timer.unref === 'function') state.timer.unref();
+  };
+  schedule();
+}
+
 async function recordFriendActivity(actorName, type, rawData = {}, options = {}) {
   const actor = normalizeSocialUserName(actorName);
   const eventType = normalizeText(type, '').toLowerCase();
@@ -10788,22 +11026,7 @@ async function recordFriendActivity(actorName, type, rawData = {}, options = {})
     if (!result.rows[0]) return null;
     const event = serializeFriendActivityRow(result.rows[0]);
     if (!event) return null;
-    deferServerTask('FRIEND ACTIVITY RETENTION', async () => {
-      await queryDbWithRetry(
-        `DELETE FROM friend_activity
-         WHERE actor_name = $1
-           AND id < COALESCE((
-             SELECT id
-             FROM friend_activity
-             WHERE actor_name = $1
-             ORDER BY id DESC
-             OFFSET $2
-             LIMIT 1
-           ), 0)`,
-        [actor, SOCIAL_HISTORY_MAX - 1],
-        { attempts: 2, label: 'FRIEND ACTIVITY RETENTION' }
-      );
-    }, 0);
+    scheduleFriendActivityRetention(actor);
     emitFriendActivityToLocalSubscribers(event);
     deferServerTask('FRIEND ACTIVITY NOTIFY', () => notifyFriendActivityAcrossInstances(event), 0);
     return event;
@@ -10879,22 +11102,7 @@ async function recordAggregatedFriendActivity(actorName, type, rawData = {}, opt
   }
 
   if (!event) return null;
-  deferServerTask('FRIEND ACTIVITY RETENTION', async () => {
-    await queryDbWithRetry(
-      `DELETE FROM friend_activity
-       WHERE actor_name = $1
-         AND id < COALESCE((
-           SELECT id
-           FROM friend_activity
-           WHERE actor_name = $1
-           ORDER BY id DESC
-           OFFSET $2
-           LIMIT 1
-         ), 0)`,
-      [actor, SOCIAL_HISTORY_MAX - 1],
-      { attempts: 2, label: 'FRIEND ACTIVITY RETENTION' }
-    );
-  }, 0);
+  scheduleFriendActivityRetention(actor);
   emitFriendActivityToLocalSubscribers(event);
   deferServerTask('FRIEND ACTIVITY NOTIFY', () => notifyFriendActivityAcrossInstances(event), 0);
   return event;
@@ -10987,29 +11195,52 @@ async function getFriendActivityHistoryForUser(userName, afterId = 0, resolvedFr
   const friendNames = relationships.map(friend => friend.name);
   const friendAddedAt = relationships.map(friend => Math.max(0, Math.floor(Number(friend.addedAt) || 0)));
   const safeAfterId = Math.max(0, Math.floor(Number(afterId) || 0));
-  const state = await getFriendActivityState(name);
-  if (!friendNames.length) return { friendNames, items: [], lastReadId: state.lastReadId, dismissedThroughId: state.dismissedThroughId, delta: safeAfterId > 0 };
+  if (!friendNames.length) {
+    const state = await getFriendActivityState(name);
+    return { friendNames, items: [], lastReadId: state.lastReadId, dismissedThroughId: state.dismissedThroughId, delta: safeAfterId > 0 };
+  }
 
+  // Read the cursor and the visible activity page in one database round trip.
+  // LEFT JOIN LATERAL returns the cursor even if the filtered page is empty.
   const result = await queryDbWithRetry(
     `WITH friend_since(name, added_at_ms) AS (
        SELECT * FROM unnest($1::text[], $2::bigint[])
+     ), read_cursor AS MATERIALIZED (
+       SELECT COALESCE(state.last_read_id, 0) AS last_read_id,
+              COALESCE(state.dismissed_through_id, 0) AS dismissed_through_id
+       FROM (SELECT 1) single
+       LEFT JOIN friend_activity_read_state state ON state.user_name = $3
      )
-     SELECT fa.id, fa.actor_name, fa.event_type, fa.data, fa.created_at
-     FROM friend_activity fa
-     JOIN friend_since fs ON fs.name = fa.actor_name
-     WHERE ($4::bigint = 0 OR fa.id > $4::bigint)
-       AND fa.id > $5::bigint
-       AND NOT EXISTS (
-         SELECT 1 FROM friend_activity_dismissed fad
-         WHERE fad.user_name = $3 AND fad.activity_id = fa.id
-       )
-       AND (fs.added_at_ms <= 0 OR fa.created_at >= to_timestamp(fs.added_at_ms::double precision / 1000.0))
-     ORDER BY fa.id DESC
-     LIMIT $6`,
-    [friendNames, friendAddedAt, name, safeAfterId, state.dismissedThroughId, SOCIAL_HISTORY_MAX],
+     SELECT fa.id, fa.actor_name, fa.event_type, fa.data, fa.created_at,
+            cursor.last_read_id, cursor.dismissed_through_id
+     FROM read_cursor cursor
+     LEFT JOIN LATERAL (
+       SELECT fa.id, fa.actor_name, fa.event_type, fa.data, fa.created_at
+       FROM friend_activity fa
+       JOIN friend_since fs ON fs.name = fa.actor_name
+       WHERE ($4::bigint = 0 OR fa.id > $4::bigint)
+         AND fa.id > cursor.dismissed_through_id
+         AND NOT EXISTS (
+           SELECT 1 FROM friend_activity_dismissed fad
+           WHERE fad.user_name = $3 AND fad.activity_id = fa.id
+         )
+         AND (fs.added_at_ms <= 0 OR fa.created_at >= to_timestamp(fs.added_at_ms::double precision / 1000.0))
+       ORDER BY fa.id DESC
+       LIMIT $5
+     ) fa ON TRUE
+     ORDER BY fa.id DESC`,
+    [friendNames, friendAddedAt, name, safeAfterId, SOCIAL_HISTORY_MAX],
     { attempts: 2, label: safeAfterId > 0 ? 'FRIEND ACTIVITY DELTA' : 'FRIEND ACTIVITY READ' }
   );
-  return { friendNames, items: result.rows.map(serializeFriendActivityRow).filter(Boolean), lastReadId: state.lastReadId, dismissedThroughId: state.dismissedThroughId, delta: safeAfterId > 0 };
+  const rows = result.rows || [];
+  const stateRow = rows[0] || {};
+  return {
+    friendNames,
+    items: rows.filter(row => row && row.id != null).map(serializeFriendActivityRow).filter(Boolean),
+    lastReadId: Math.max(0, Number(stateRow.last_read_id) || 0),
+    dismissedThroughId: Math.max(0, Number(stateRow.dismissed_through_id) || 0),
+    delta: safeAfterId > 0
+  };
 }
 
 // ============================================================================
@@ -11249,6 +11480,26 @@ async function notifyUserNotificationDeletedAcrossInstances(userName, notificati
   }
 }
 
+async function notifyUserNotificationsDeletedAcrossInstances(userName, notificationIds, unreadCount = 0) {
+  const name=normalizeSocialUserName(userName);
+  const ids=Array.from(new Set((Array.isArray(notificationIds)?notificationIds:[notificationIds])
+    .map(id=>String(id||'').trim()).filter(id=>/^\d+$/.test(id))));
+  if (!name || !ids.length) return;
+  const count=Math.max(0,Math.floor(Number(unreadCount)||0));
+  // Do not introduce a new cross-instance event type: older server instances
+  // and the existing browser continue receiving one standard deletion event
+  // per notification. Only the database roundtrips are grouped.
+  for (let offset=0;offset<ids.length;offset+=100) {
+    const payloads=ids.slice(offset,offset+100).map(notificationId=>JSON.stringify({
+      deleted:{userName:name,notificationId,unreadCount:count},instanceId:INSTANCE_ID
+    }));
+    try {
+      await pool.query('SELECT pg_notify($1,payload) FROM unnest($2::text[]) AS changes(payload)',
+        ['user_notification_sync',payloads]);
+    } catch(err) { console.error('[NOTIFICATION BATCH DELETE SYNC ERROR]:',err); }
+  }
+}
+
 async function notifyUserNotificationsConsumedAcrossInstances(userName, notificationIds, unreadCount = 0) {
   const name = normalizeSocialUserName(userName);
   const ids = Array.from(new Set((Array.isArray(notificationIds) ? notificationIds : [notificationIds])
@@ -11285,16 +11536,21 @@ async function notifyUserNotificationsClearedAcrossInstances(userName, throughId
 async function notifyUserNotificationsCreatedAcrossInstances(events) {
   const items = (Array.isArray(events) ? events : []).map(serializeUserNotificationRow).filter(Boolean);
   if (!items.length) return;
+  const emptyBatchBytes = Buffer.byteLength(JSON.stringify({createdEvents:[],instanceId:INSTANCE_ID}), 'utf8');
   let batch = [];
+  let batchBytes = emptyBatchBytes;
   for (const item of items) {
-    const candidate = [...batch, item];
-    if (batch.length && Buffer.byteLength(JSON.stringify({createdEvents:candidate,instanceId:INSTANCE_ID}), 'utf8') > 7000) {
+    const itemBytes = Buffer.byteLength(JSON.stringify(item), 'utf8');
+    const nextBytes = batchBytes + itemBytes + (batch.length ? 1 : 0);
+    if (batch.length && nextBytes > 7000) {
       await pool.query('SELECT pg_notify($1, $2)', [
         'user_notification_sync', JSON.stringify({createdEvents:batch,instanceId:INSTANCE_ID})
       ]);
       batch = [item];
+      batchBytes = emptyBatchBytes + itemBytes;
     } else {
-      batch = candidate;
+      batch.push(item);
+      batchBytes = nextBytes;
     }
   }
   if (batch.length) await pool.query('SELECT pg_notify($1, $2)', [
@@ -11564,10 +11820,15 @@ async function setUserNotificationReadId(userName, lastReadId) {
 async function getUserNotificationUnreadCount(userName, lastReadId = null) {
   const name = normalizeSocialUserName(userName);
   if (!name) return 0;
-  const readId = lastReadId === null ? await getUserNotificationReadId(name) : Math.max(0, Number(lastReadId) || 0);
+  const suppliedCursor = lastReadId !== null;
+  const readId = suppliedCursor ? Math.max(0, Number(lastReadId) || 0) : null;
   const result = await queryDbWithRetry(
-    'SELECT COUNT(*)::int AS count FROM user_notifications WHERE user_name = $1 AND id > $2',
-    [name, readId],
+    suppliedCursor
+      ? 'SELECT COUNT(*)::int AS count FROM user_notifications WHERE user_name = $1 AND id > $2'
+      : `SELECT COUNT(*)::int AS count FROM user_notifications
+         WHERE user_name = $1 AND id > COALESCE(
+           (SELECT last_read_id FROM user_notification_read_state WHERE user_name = $1 LIMIT 1), 0)`,
+    suppliedCursor ? [name, readId] : [name],
     { attempts: 2, label: 'USER NOTIFICATION UNREAD COUNT' }
   );
   return Math.max(0, Number(result.rows[0] && result.rows[0].count) || 0);
@@ -12590,6 +12851,9 @@ async function deleteUserAccount(targetName, reason, adminName, options = {}) {
   }, { advisoryLockKey: `content-report-user:${targetName.toLowerCase()}` });
 
   if (dbDelete && dbDelete.missing) return { success: false, message: "User not found." };
+  // Removing a player changes global rarity even if no trophy was unlocked.
+  invalidateGlobalTrophyStatsCache();
+  scheduleTrophyStatsRefreshBroadcast(1200);
   if (dbDelete && dbDelete.deletedReportCount > 0) await publishContentReportsChanged();
   if (dbDelete && Array.isArray(dbDelete.deletedMetadataSuggestionIds) && dbDelete.deletedMetadataSuggestionIds.length) {
     dbDelete.deletedMetadataSuggestionIds.forEach(id => emitToAdmins('admin_metadata_suggestion_delta', { action: 'remove', id }));
@@ -12601,7 +12865,8 @@ async function deleteUserAccount(targetName, reason, adminName, options = {}) {
     deleted: true,
     deleteReason,
     deletedBy,
-    selfDeleted
+    selfDeleted,
+    trophies: true
   });
 
   clearDeletedUserRuntimeState(targetName);
@@ -13733,8 +13998,11 @@ io.on('connection', (socket) => {
           'INSERT INTO users (name, data) VALUES ($1, $2)',
           [name, userDatabase[name]]
         );
+        // Adding a player changes the denominator for global trophy rarity.
+        invalidateGlobalTrophyStatsCache();
+        scheduleTrophyStatsRefreshBroadcast(1200);
         invalidateOnlineListCache('auth-new-user');
-        deferServerTask('AUTH NEW NOTIFY', () => notifyProfileSyncAcrossInstances(name, socket.id, userDatabase[name].profileUpdatedAt), 0);
+        deferServerTask('AUTH NEW NOTIFY', () => notifyProfileSyncAcrossInstances(name, socket.id, userDatabase[name].profileUpdatedAt, { trophies: true }), 0);
         deferServerTask('AUTH NEW PRESENCE', () => upsertPresenceForSocket(socket, name), 0);
         if (wasDeletedAccount) {
           await pool.query('DELETE FROM deleted_accounts WHERE name = $1', [name]);
@@ -14224,6 +14492,10 @@ io.on('connection', (socket) => {
         });
         if (requestedSyncSections.some(section => replaySectionStatus[section] === 'rejected')) shouldForceProfileSyncToSource = true;
         const publicCountsChanged = profileUpdateTouchesPublicCounts(userData);
+        // Global rarity depends only on which IDs are unlocked, not on XP,
+        // progress or unlock-date changes in an otherwise identical trophy set.
+        const trophiesChanged = Object.prototype.hasOwnProperty.call(userData, 'trophiesData') &&
+          unlockedTrophyIdsChanged(workingUser.trophiesData, userData.trophiesData);
 
         Object.assign(workingUser, userData);
         if (nextLibraryPlayHistoryData) workingUser.libraryPlayHistoryData = nextLibraryPlayHistoryData;
@@ -14345,7 +14617,6 @@ io.on('connection', (socket) => {
         }
         emitProfileSyncPatchFromUser(name, workingUser, profileChangedKeys, shouldForceProfileSyncToSource ? null : socket.id);
         if (friendsSafetyRejected) emitProfileSyncPatchFromUser(name, workingUser, ['friendsData', 'friendsUpdatedAt'], null);
-        const trophiesChanged = !!userData.trophiesData;
         deferServerTask('PROFILE NOTIFY', () => notifyProfileSyncAcrossInstances(
             name,
             shouldForceProfileSyncToSource ? null : socket.id,
@@ -15430,6 +15701,7 @@ io.on('connection', (socket) => {
     try {
       const result=await pool.query('DELETE FROM direct_group_members WHERE group_id=$1 AND user_name=$2 RETURNING user_name',[id,viewer]);
       if(!result.rowCount)return reply({success:false,message:'Not a group member.'});
+      invalidateDirectGroupListsForMembers([{user_name:viewer}]);
       for(const client of getSocketsByUserName(viewer))if(client.connected)client.emit('direct_group_changed',{groupId:id,left:true});
       try {await emitDirectGroupLocal(id,'refresh');} catch(err) {console.error('[GROUP LEAVE EMIT]',err?.message||err);}
       deferServerTask('GROUP LEAVE NOTIFY',()=>notifyDirectGroupChange(id,'left',viewer),0);
@@ -15448,20 +15720,28 @@ io.on('connection', (socket) => {
     const id=directGroupId(data?.groupId),viewer=normalizeDirectMessageUser(socket.userName),requested=Number(data?.lastMessageId)||0;
     if(!id||!viewer||!Number.isSafeInteger(requested)||requested<1)return reply({success:false,message:'Invalid read request.'});
     try{
-      const member=await getDirectGroupMember(id,viewer);
+      // Membership and the newest eligible message are resolved in one indexed
+      // read. Duplicate receipts skip the LATERAL lookup entirely.
+      const status=await pool.query(`SELECT member.last_read_id,newest.id AS newest_id
+        FROM direct_group_members member
+        LEFT JOIN LATERAL (
+          SELECT message.id FROM direct_group_messages message
+          WHERE message.group_id=member.group_id AND message.id<=$3
+            AND message.created_at>=member.joined_at AND member.last_read_id<$3
+          ORDER BY message.id DESC LIMIT 1
+        ) newest ON TRUE
+        WHERE member.group_id=$1 AND member.user_name=$2`,[id,viewer,requested]);
+      const member=status.rows?.[0];
       if(!member)return reply({success:false,message:'Not a group member.'});
-      // A repeated read receipt is already acknowledged; skip a redundant DB lookup.
-      if (requested<=Number(member.last_read_id)) {
-        return reply({success:true,lastMessageId:String(member.last_read_id)});
-      }
-      // A backward index seek finds the newest valid message without aggregating the history.
-      const last=await pool.query('SELECT id FROM direct_group_messages WHERE group_id=$1 AND id<=$3 AND created_at>=$2 ORDER BY id DESC LIMIT 1',[id,member.joined_at,requested]);
-      const lastId=Number(last.rows?.[0]?.id)||0;
+      if(requested<=Number(member.last_read_id))return reply({success:true,lastMessageId:String(member.last_read_id)});
+      const lastId=Number(member.newest_id)||0;
       if(!lastId)return reply({success:true});
       if(lastId>Number(member.last_read_id)){
-        await pool.query('UPDATE direct_group_members SET last_read_id=GREATEST(last_read_id,$3) WHERE group_id=$1 AND user_name=$2',[id,viewer,lastId]);
-        try{await emitDirectGroupReadLocal(id,viewer,lastId);}catch(err){console.error('[GROUP READ EMIT]',err?.message||err);}
-        deferServerTask('GROUP READ SYNC',()=>notifyDirectGroupChange(id,'read',{user:viewer,lastMessageId:lastId}),0);
+        const advance=await pool.query('UPDATE direct_group_members SET last_read_id=$3 WHERE group_id=$1 AND user_name=$2 AND last_read_id<$3 RETURNING last_read_id',[id,viewer,lastId]);
+        if(advance.rowCount){
+          try{await emitDirectGroupReadLocal(id,viewer,lastId);}catch(err){console.error('[GROUP READ EMIT]',err?.message||err);}
+          deferServerTask('GROUP READ SYNC',()=>notifyDirectGroupChange(id,'read',{user:viewer,lastMessageId:lastId}),0);
+        }
       }
       reply({success:true,lastMessageId:String(lastId)});
     }catch(err){console.error('[GROUP MARK READ]',err?.message||err);reply({success:false,message:'Could not mark group as read.'});}
@@ -15509,7 +15789,7 @@ io.on('connection', (socket) => {
       const existing=await db.query('SELECT * FROM direct_group_messages WHERE group_id=$1 AND id=$2 AND created_at>=$3 FOR UPDATE',[id,messageId,member.joined_at]);
       const row=existing.rows?.[0];
       if(!row)throw Error('Message unavailable.');
-      let kind='update';
+      let kind='update',updated=null;
       if(action==='delete'){
         if(row.sender_name!==viewer)throw Error('Only the author can delete this message.');
         await db.query('DELETE FROM direct_group_messages WHERE id=$1',[messageId]);
@@ -15518,7 +15798,7 @@ io.on('connection', (socket) => {
         if(row.sender_name!==viewer||row.message_type==='poll')throw Error('Cannot edit this message.');
         const text=normalizeDirectMessageText(data.text);
         if(!directMessagePlainText(text)&&!normalizeDirectMessageMedia(row.content).length)throw Error('Message cannot be empty.');
-        await db.query('UPDATE direct_group_messages SET text=$2,edited_at=NOW() WHERE id=$1',[messageId,text]);
+        updated=(await db.query('UPDATE direct_group_messages SET text=$2,edited_at=NOW() WHERE id=$1 RETURNING *',[messageId,text])).rows?.[0];
       } else if(action==='react') {
         const emoji=normalizeText(data.emoji,'');
         if(!DIRECT_MESSAGE_ALLOWED_REACTIONS.has(emoji))throw Error('Invalid reaction.');
@@ -15526,11 +15806,11 @@ io.on('connection', (socket) => {
         let react=reactions.find(r=>r.emoji===emoji);
         if(!react){react={emoji,users:[]};reactions.push(react);}
         react.users=react.users.includes(viewer)?react.users.filter(n=>n!==viewer):[...react.users,viewer];
-        await db.query('UPDATE direct_group_messages SET reactions=$2::jsonb WHERE id=$1',[messageId,JSON.stringify(reactions.filter(r=>r.users.length))]);
+        updated=(await db.query('UPDATE direct_group_messages SET reactions=$2::jsonb WHERE id=$1 RETURNING *',[messageId,JSON.stringify(reactions.filter(r=>r.users.length))])).rows?.[0];
       } else if(action==='pin') {
         const next=data.pinned===true;
         if(next&&!row.pinned_at){const count=await db.query('SELECT COUNT(*)::int AS n FROM direct_group_messages WHERE group_id=$1 AND pinned_at IS NOT NULL',[id]);if(Number(count.rows?.[0]?.n)>=10)throw Error('Only 10 pins per group.');}
-        await db.query('UPDATE direct_group_messages SET pinned_at=CASE WHEN $2 THEN NOW() ELSE NULL END WHERE id=$1',[messageId,next]);
+        updated=(await db.query('UPDATE direct_group_messages SET pinned_at=CASE WHEN $2 THEN NOW() ELSE NULL END WHERE id=$1 RETURNING *',[messageId,next])).rows?.[0];
       } else if(action==='vote') {
         if(row.message_type!=='poll')throw Error('Not a poll.');
         const poll=normalizeDirectGroupPoll(row.content,true);
@@ -15540,16 +15820,16 @@ io.on('connection', (socket) => {
         poll.options.forEach(o=>{o.voters=o.voters.filter(name=>name!==viewer);});
         if(!voted)poll.options[option].voters.push(viewer);
         poll.totalVotes=poll.options.reduce((n,o)=>n+o.voters.length,0);
-        await db.query('UPDATE direct_group_messages SET content=$2::jsonb WHERE id=$1',[messageId,JSON.stringify(poll)]);
+        updated=(await db.query('UPDATE direct_group_messages SET content=$2::jsonb WHERE id=$1 RETURNING *',[messageId,JSON.stringify(poll)])).rows?.[0];
       } else if(action==='poll_edit') {
         if(row.sender_name!==viewer||row.message_type!=='poll')throw Error('Only the author can edit this poll.');
         const input=normalizeDirectGroupPoll(data.content);
         const poll=normalizeDirectGroupPoll(row.content,true);
         if(!input||!poll||input.options.length!==poll.options.length)throw Error('Keep the same poll options.');
         poll.question=input.question;poll.options.forEach((o,i)=>{o.text=input.options[i].text;});
-        await db.query('UPDATE direct_group_messages SET content=$2::jsonb,edited_at=NOW() WHERE id=$1',[messageId,JSON.stringify(poll)]);
+        updated=(await db.query('UPDATE direct_group_messages SET content=$2::jsonb,edited_at=NOW() WHERE id=$1 RETURNING *',[messageId,JSON.stringify(poll)])).rows?.[0];
       }
-      const updated=kind==='delete'?null:(await db.query('SELECT * FROM direct_group_messages WHERE id=$1',[messageId])).rows?.[0];
+      // RETURNING already has the committed message fields; no extra SELECT.
       await db.query('COMMIT');
       const message=serializeDirectGroupMessage(updated);
       try {await emitDirectGroupLocal(id,kind,kind==='delete'?{id:String(messageId)}:message);} catch(err) {console.error('[GROUP ACTION EMIT]',err?.message||err);}
@@ -16023,13 +16303,18 @@ io.on('connection', (socket) => {
           `DELETE FROM user_notifications WHERE event_type = 'private_message' AND data->>'messageId' = $1 RETURNING id, user_name`,
           [String(row.id)], { attempts:1, label:'DIRECT DELETE NOTIFICATION CLEANUP' }
         );
+        const idsByUser=new Map();
         for (const notification of removed.rows || []) {
-          const userName = normalizeSocialUserName(notification.user_name);
-          const notificationId = String(notification.id || '');
-          if (!userName || !notificationId) continue;
-          const unreadCount = await getUserNotificationUnreadCount(userName);
-          emitUserNotificationDeletedToLocalUser(userName, notificationId, unreadCount);
-          await notifyUserNotificationDeletedAcrossInstances(userName, notificationId, unreadCount);
+          const userName=normalizeSocialUserName(notification.user_name);
+          const notificationId=String(notification.id||'');
+          if (!userName || !/^\d+$/.test(notificationId)) continue;
+          if (!idsByUser.has(userName)) idsByUser.set(userName,[]);
+          idsByUser.get(userName).push(notificationId);
+        }
+        for (const [userName,ids] of idsByUser) {
+          const unreadCount=await getUserNotificationUnreadCount(userName);
+          for (const notificationId of ids) emitUserNotificationDeletedToLocalUser(userName,notificationId,unreadCount);
+          await notifyUserNotificationsDeletedAcrossInstances(userName,ids,unreadCount);
         }
       }, 0);
       respond({ success:true, ...payload });
@@ -16138,10 +16423,8 @@ io.on('connection', (socket) => {
           const ids = (removed.rows || []).map(row => String(row && row.id || '')).filter(Boolean);
           if (!ids.length) return;
           const unreadCount = await getUserNotificationUnreadCount(viewer);
-          for (const notificationId of ids) {
-            emitUserNotificationDeletedToLocalUser(viewer, notificationId, unreadCount);
-            await notifyUserNotificationDeletedAcrossInstances(viewer, notificationId, unreadCount);
-          }
+          for (const notificationId of ids) emitUserNotificationDeletedToLocalUser(viewer,notificationId,unreadCount);
+          await notifyUserNotificationsDeletedAcrossInstances(viewer,ids,unreadCount);
         }, 0);
       }
 

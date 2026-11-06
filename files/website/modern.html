@@ -27955,23 +27955,60 @@ P
 				const action = j.status === 'running' && j.stage === 'waiting-install' ? `<button type="button" class="ps3-queue-action" onclick="confirmCanceledPs3QueueItem('${j.id}')" title="I canceled this download on the PS3" aria-label="Mark ${escape(j.title)} canceled"><i class="fas fa-ban"></i></button>` : j.status === 'queued' ? `<button type="button" class="ps3-queue-action" onclick="removePs3QueueItem('${j.id}')" title="Remove queued file" aria-label="Remove ${escape(j.title)}"><i class="fas fa-times"></i></button>` :
 					j.status === 'review' ? `<button type="button" class="ps3-queue-action" onclick="recheckPs3QueueItem('${j.id}')" title="Check the installed Title ID folder" aria-label="Check installation of ${escape(j.title)}"><i class="fas fa-rotate"></i></button><button type="button" class="ps3-queue-action" onclick="removeReviewedPs3QueueItem('${j.id}')" title="Remove from queue without adding to history" aria-label="Remove ${escape(j.title)}"><i class="fas fa-times"></i></button>` :
 					'';
-				return `<div class="ps3-queue-item ${escape(j.status)}"><div class="ps3-queue-file"><strong title="${escape(j.title)}">${escape(j.title)}</strong><span>${escape(j.kind === 'rap' ? 'RAP' : j.manifest ? 'PKG · XML' : 'PKG')}${j.partCount > 1 ? ` · Part ${Number(j.part)}/${Number(j.partCount)}` : ''}${j.note ? ' · ' + escape(j.note) : ''}${j.folderNote ? ' · ' + escape(j.folderNote) : ''}</span></div><span class="ps3-queue-stage">${escape(statusText(j))}</span><div class="ps3-queue-actions">${action}</div></div>`;
+				return `<div class="ps3-queue-item ${escape(j.status)}" data-ps3-queue-id="${escape(j.id)}"><div class="ps3-queue-file"><strong title="${escape(j.title)}">${escape(j.title)}</strong><span>${escape(j.kind === 'rap' ? 'RAP' : j.manifest ? 'PKG · XML' : 'PKG')}${j.partCount > 1 ? ` · Part ${Number(j.part)}/${Number(j.partCount)}` : ''}${j.note ? ' · ' + escape(j.note) : ''}${j.folderNote ? ' · ' + escape(j.folderNote) : ''}</span></div><span class="ps3-queue-stage">${escape(statusText(j))}</span><div class="ps3-queue-actions">${action}</div></div>`;
 			};
-			const signatureOf = arr => JSON.stringify(arr.map(j => [j.id,j.status,j.stage,j.note,j.folderNote,j.idleSamples]));
-			const primary = items.slice(0,1);
-			const primarySignature = signatureOf(primary);
-			if (current.dataset.queueSignature !== primarySignature) {
-				current.dataset.queueSignature = primarySignature;
-				current.innerHTML = primary.map(itemMarkup).join('');
-			}
+			// The PS3 poll updates internal idle counters every five seconds. Only fields
+			// shown in the queue belong in its DOM signature.
+			const queueJobFields = j => [j.id,j.status,j.stage,j.title,j.kind,j.manifest,j.part,j.partCount,j.note,j.folderNote];
+			const signatureOf = arr => JSON.stringify(arr.map(queueJobFields));
+			const reconcileQueueRows = (container, entries) => {
+				const signature = signatureOf(entries);
+				if (container.dataset.queueSignature === signature) return;
+				const previous = new Map();
+				for (const row of container.children) {
+					if (row.classList.contains('ps3-queue-item')) previous.set(row.dataset.ps3QueueId, row);
+				}
+				const wanted = new Set(entries.map(job => String(job.id)));
+				// Corrupt/legacy queue snapshots can contain duplicate IDs. Preserve every
+				// row in that rare case rather than merging two downloads into one card.
+				if (wanted.size !== entries.length) {
+					container.innerHTML = entries.map(itemMarkup).join('');
+					container.dataset.queueSignature = signature;
+					return;
+				}
+				for (const [key, row] of previous) {
+					if (!wanted.has(key)) { row.remove(); previous.delete(key); }
+				}
+				// Work backwards: moving a queued item to the end normally moves just
+				// that item, not every row that previously followed it.
+				let successor = null;
+				for (let index = entries.length - 1; index >= 0; index--) {
+					const job = entries[index];
+					const key = String(job.id);
+					const rowSignature = JSON.stringify(queueJobFields(job));
+					let row = previous.get(key);
+					if (!row || row.dataset.queueItemSignature !== rowSignature) {
+						const template = document.createElement('template');
+						template.innerHTML = itemMarkup(job);
+						const updated = template.content.firstElementChild;
+						if (!row) row = updated;
+						else {
+							if (row.className !== updated.className) row.className = updated.className;
+							for (const selector of ['.ps3-queue-file', '.ps3-queue-stage', '.ps3-queue-actions']) {
+								const target = row.querySelector(selector), replacement = updated.querySelector(selector);
+								if (target && replacement && target.innerHTML !== replacement.innerHTML) target.innerHTML = replacement.innerHTML;
+							}
+						}
+						row.dataset.queueItemSignature = rowSignature;
+					}
+					if (row.parentElement !== container || row.nextElementSibling !== successor) container.insertBefore(row, successor);
+					successor = row;
+				}
+				container.dataset.queueSignature = signature;
+			};
+			reconcileQueueRows(current, items.slice(0,1));
 			const visibleOther = (expanded || (closing && !reduceMotion)) ? other : [];
-			const otherSignature = signatureOf(visibleOther);
-			if (body.dataset.queueSignature !== otherSignature) {
-				const scrollTop = body.scrollTop;
-				body.dataset.queueSignature = otherSignature;
-				body.innerHTML = visibleOther.map(itemMarkup).join('');
-				body.scrollTop = scrollTop;
-			}
+			reconcileQueueRows(body, visibleOther);
 		}
 		window.togglePs3DownloadQueueDetails = function () {
 			detailsExpanded = !detailsExpanded;
@@ -38251,15 +38288,31 @@ P
         return String(value === undefined || value === null ? '' : value).replace(/[&<>"']/g, char => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#039;' }[char]));
     }
 
-    function getFreshGamePlayer(owner, titleId) {
+    function getGamePlayersOnlineLookup() {
+        // Build this per displayed page, never across realtime updates: presence and
+        // avatars must always reflect the current online roster.
+        const online = Array.isArray(window.currentOnlineList)
+            ? window.currentOnlineList
+            : (typeof currentOnlineList !== 'undefined' && Array.isArray(currentOnlineList) ? currentOnlineList : []);
+        const byName = new Map();
+        for (const user of online) {
+            const name = String(user && (user.name || user) || '');
+            if (!byName.has(name)) byName.set(name, user);
+        }
+        return byName;
+    }
+
+    function getFreshGamePlayer(owner, titleId, onlineLookup = null) {
         const source = owner && typeof owner === 'object' ? { ...owner } : { name: String(owner || '') };
         const name = String(source.name || '').trim();
         if (!name) return null;
-        const onlineRecord = Array.isArray(window.currentOnlineList)
-            ? window.currentOnlineList.find(user => String(user && (user.name || user) || '') === name)
-            : (typeof currentOnlineList !== 'undefined' && Array.isArray(currentOnlineList)
-                ? currentOnlineList.find(user => String(user && (user.name || user) || '') === name)
-                : null);
+        const onlineRecord = onlineLookup instanceof Map
+            ? onlineLookup.get(name)
+            : (Array.isArray(window.currentOnlineList)
+                ? window.currentOnlineList.find(user => String(user && (user.name || user) || '') === name)
+                : (typeof currentOnlineList !== 'undefined' && Array.isArray(currentOnlineList)
+                    ? currentOnlineList.find(user => String(user && (user.name || user) || '') === name)
+                    : null));
         if (onlineRecord && typeof onlineRecord === 'object') {
             source.online = onlineRecord.online === true;
             source.lastSeen = Math.max(Number(source.lastSeen || 0), Number(onlineRecord.lastSeen || onlineRecord.last_seen || 0));
@@ -38576,18 +38629,20 @@ P
             const active = typeof window.isViewerPlayTogetherTitle === 'function' && window.isViewerPlayTogetherTitle(titleId);
             const nextActive = active ? '1' : '0';
             if (button.dataset.active !== nextActive) button.dataset.active = nextActive;
-            button.classList.toggle('is-active', active);
-            button.setAttribute('aria-pressed', active ? 'true' : 'false');
-            button.title = active ? 'Remove from Play Together' : 'Add to Play Together';
+            if (button.classList.contains('is-active') !== active) button.classList.toggle('is-active', active);
+            const nextPressed = active ? 'true' : 'false';
+            if (button.getAttribute('aria-pressed') !== nextPressed) button.setAttribute('aria-pressed', nextPressed);
+            const nextTitle = active ? 'Remove from Play Together' : 'Add to Play Together';
+            if (button.title !== nextTitle) button.title = nextTitle;
             const icon = button.querySelector('i');
-            if (icon) {
+            if (icon && (!icon.classList.contains(active ? 'fa-check' : 'fa-handshake') || icon.classList.contains('fa-circle-notch') || icon.classList.contains('fa-spin') || icon.classList.contains(active ? 'fa-handshake' : 'fa-check'))) {
                 icon.classList.remove('fa-handshake', 'fa-check', 'fa-circle-notch', 'fa-spin');
                 icon.classList.add(active ? 'fa-check' : 'fa-handshake');
             }
             const label = button.querySelector('.profile-common-play-together-label');
             if (label && label.textContent !== 'Play Together') label.textContent = 'Play Together';
             if (button.disabled) button.disabled = false;
-            button.classList.remove('is-pending');
+            if (button.classList.contains('is-pending')) button.classList.remove('is-pending');
         });
     };
 
@@ -39650,7 +39705,9 @@ P
 
     function appendGamePlayerCards(list, owners, titleId, startIndex = 0) {
         if (!list) return 0;
-        const players = (Array.isArray(owners) ? owners : []).map(rawOwner => getFreshGamePlayer(rawOwner, titleId)).filter(Boolean);
+        const ownersList = Array.isArray(owners) ? owners : [];
+        const onlineLookup = ownersList.length > 3 ? getGamePlayersOnlineLookup() : null;
+        const players = ownersList.map(rawOwner => getFreshGamePlayer(rawOwner, titleId, onlineLookup)).filter(Boolean);
         if (!players.length) return 0;
 
         const onlineByName = new Map();
@@ -39833,15 +39890,17 @@ P
         const modal = document.getElementById('modal-sys-list');
         const scrollRoot = document.getElementById('list-modal-body');
         const observerKey = `game-players-${group}`;
-        clearProgressiveGridObserver(observerKey, list);
-        if (!state || !modal || !list || !groupState || !scrollRoot || state.token !== modal.dataset.gamePlayersToken || modal.dataset.profileTarget !== '__game_players__') return;
-        if (!groupState.hasMore || groupState.loading || groupState.offset >= groupState.total) return;
+        if (!state || !modal || !list || !groupState || !scrollRoot || state.token !== modal.dataset.gamePlayersToken || modal.dataset.profileTarget !== '__game_players__' ||
+            !groupState.hasMore || groupState.loading || groupState.offset >= groupState.total) {
+            clearProgressiveGridObserver(observerKey, list);
+            return;
+        }
         setupProgressiveGridObserver(observerKey, list, groupState.offset, groupState.total, () => {
             const activeState = window.__gamePlayersModalState;
             const activeModal = document.getElementById('modal-sys-list');
             if (!activeState || activeState.token !== state.token || !activeModal || activeModal.dataset.gamePlayersToken !== state.token || activeModal.dataset.profileTarget !== '__game_players__') return;
             loadGamePlayersGroup(group, true);
-        }, scrollRoot, '600px 0px');
+        }, scrollRoot, '600px 0px', state.token);
     }
 
     function finishGamePlayersInitialLoad(state) {
@@ -40077,6 +40136,34 @@ P
         return desired.length;
     }
 
+    function animateGamePlayersLiveUpdate(body, update) {
+        const modal = document.getElementById('modal-sys-list');
+        if (!body || !modal || !modal.classList.contains('show') ||
+            modal.dataset.profileTarget !== '__game_players__' ||
+            typeof body.animate !== 'function' ||
+            window.matchMedia?.('(prefers-reduced-motion: reduce)').matches) {
+            update();
+            return;
+        }
+        const previous = body.__gamePlayersLiveHeightAnimation;
+        const start = body.getBoundingClientRect().height;
+        if (previous) {
+            previous.cancel();
+            body.__gamePlayersLiveHeightAnimation = null;
+        }
+        update();
+        const end = body.getBoundingClientRect().height;
+        if (!start || !end || Math.abs(start - end) < 1) return;
+        const animation = body.animate(
+            [{ height: `${start}px` }, { height: `${end}px` }],
+            { duration: 280, easing: 'cubic-bezier(.22,.8,.24,1)' }
+        );
+        body.__gamePlayersLiveHeightAnimation = animation;
+        animation.finished.then(() => {
+            if (body.__gamePlayersLiveHeightAnimation === animation) body.__gamePlayersLiveHeightAnimation = null;
+        }).catch(() => {});
+    }
+
     window.refreshOpenGamePlayersModalLive = function(summary) {
         const state = window.__gamePlayersModalState;
         const modal = document.getElementById('modal-sys-list');
@@ -40097,6 +40184,7 @@ P
             others: { total: metrics.others, label: metrics.otherSectionLabel, showHeader: metrics.showOtherHeader }
         };
 
+        animateGamePlayersLiveUpdate(body, () => {
         Object.entries(config).forEach(([group, meta]) => {
             const groupState = state.groups[group] || (state.groups[group] = { total: 0, offset: 0, loading: false, loaded: true, hasMore: false, initialDone: true, initialOwners: [], error: false });
             const previousList = body.querySelector(`[data-game-player-list="${group}"]`);
@@ -40113,23 +40201,30 @@ P
             const list = section.querySelector(`[data-game-player-list="${group}"]`);
             const serverPageSize = getGamePlayersPageSize();
             const wanted = Math.min(meta.total, Math.max(renderedCount, serverPageSize > 0 ? Math.min(meta.total, serverPageSize) : renderedCount));
+            state.liveGroupRevisions = state.liveGroupRevisions || Object.create(null);
+            const revision = (state.liveGroupRevisions[group] || 0) + 1;
+            state.liveGroupRevisions[group] = revision;
             fetchGamePlayersLoadedRange(state, group, wanted, result => {
+                if (state.liveGroupRevisions[group] !== revision) return;
                 const activeState = window.__gamePlayersModalState;
                 const activeModal = document.getElementById('modal-sys-list');
                 if (!result || activeState !== state || !activeModal || activeModal.dataset.gamePlayersToken !== state.token || activeModal.dataset.profileTarget !== '__game_players__') return;
                 const liveSection = activeModal.querySelector(`.game-player-section[data-game-player-group="${group}"]`);
                 const liveList = liveSection ? liveSection.querySelector(`[data-game-player-list="${group}"]`) : null;
                 if (!liveList) return;
-                const rendered = reconcileGamePlayersLiveList(liveList, result.owners, state.titleId);
-                groupState.total = Math.max(0, Number(result.total) || meta.total);
-                groupState.offset = rendered;
-                groupState.loaded = true;
-                groupState.initialDone = true;
-                groupState.loading = false;
-                groupState.error = false;
-                groupState.hasMore = rendered < groupState.total;
-                setupGamePlayersGroupPaging(group, liveList, groupState);
+                animateGamePlayersLiveUpdate(body, () => {
+                    const rendered = reconcileGamePlayersLiveList(liveList, result.owners, state.titleId);
+                    groupState.total = Math.max(0, Number(result.total) || meta.total);
+                    groupState.offset = rendered;
+                    groupState.loaded = true;
+                    groupState.initialDone = true;
+                    groupState.loading = false;
+                    groupState.error = false;
+                    groupState.hasMore = rendered < groupState.total;
+                    setupGamePlayersGroupPaging(group, liveList, groupState);
+                });
             });
+        });
         });
         if (typeof window.scheduleInterfaceTranslationAfterUiChange === 'function') window.scheduleInterfaceTranslationAfterUiChange(modal);
         return true;
@@ -44854,23 +44949,6 @@ P
             isNew: true
         };
 
-        const optimisticDownloadKey = (typeof window.getContentDownloadCountKey === 'function')
-            ? window.getContentDownloadCountKey(resolvedCategory, titleId, entry.contentId, entry.cleanName || entry.name)
-            : '';
-        const hadGlobalDownloadCount = !!(optimisticDownloadKey && Array.isArray(window.downloadHistory) && window.downloadHistory.some(item => {
-            const itemCategory = (typeof window.getProfileListItemCategory === 'function') ? window.getProfileListItemCategory(item, 'downloads') : item.category;
-            const itemKey = (typeof window.getContentDownloadCountKey === 'function')
-                ? window.getContentDownloadCountKey(itemCategory, item.titleId || item.id, item.contentId, item.cleanName || item.name || item.title)
-                : '';
-            return itemKey === optimisticDownloadKey;
-        }));
-        const normalizedTrendingTitleId = String(titleId || '').trim().toUpperCase();
-        const hadTrendingGameDownload = !!(normalizedTrendingTitleId && Array.isArray(window.downloadHistory) && window.downloadHistory.some(item => {
-            const itemCategory = (typeof window.normalizeDownloadCountCategory === 'function') ? window.normalizeDownloadCountCategory(item.category || item.rawCategory) : String(item.category || item.rawCategory || '').trim().toLowerCase();
-            const itemTitleId = String(item.titleId || item.id || '').trim().toUpperCase();
-            return itemCategory === 'games' && itemTitleId === normalizedTrendingTitleId;
-        }));
-
         const previousDownload = Array.isArray(window.downloadHistory) ? window.downloadHistory[0] : null;
         if (isSameDownloadHistoryItem(previousDownload, entry) && Boolean(previousDownload.sentToPs3) === isRemoteDownload) {
             if (downloadMotionSource && typeof window.runDownloadCoverTransferMotion === 'function') window.runDownloadCoverTransferMotion(downloadMotionSource, previousDownload);
@@ -44878,8 +44956,35 @@ P
             return;
         }
 
+        const optimisticDownloadKey = (typeof window.getContentDownloadCountKey === 'function')
+            ? window.getContentDownloadCountKey(resolvedCategory, titleId, entry.contentId, entry.cleanName || entry.name)
+            : '';
+        const normalizedTrendingTitleId = String(titleId || '').trim().toUpperCase();
+        let hadGlobalDownloadCount = false;
+        let hadTrendingGameDownload = false;
+        let existingIndex = -1;
+        // All three checks use the same history snapshot. A burst of finished PKGs
+        // should not walk the complete Downloads history separately for each check.
+        for (let i = 0; i < downloadHistory.length; i++) {
+            const item = downloadHistory[i];
+            if (!item) continue;
+            if (existingIndex < 0 && isSameDownloadHistoryItem(item, entry)) existingIndex = i;
+            if (optimisticDownloadKey && !hadGlobalDownloadCount) {
+                const itemCategory = (typeof window.getProfileListItemCategory === 'function') ? window.getProfileListItemCategory(item, 'downloads') : item.category;
+                const itemKey = (typeof window.getContentDownloadCountKey === 'function')
+                    ? window.getContentDownloadCountKey(itemCategory, item.titleId || item.id, item.contentId, item.cleanName || item.name || item.title)
+                    : '';
+                hadGlobalDownloadCount = itemKey === optimisticDownloadKey;
+            }
+            if (normalizedTrendingTitleId && !hadTrendingGameDownload) {
+                const itemCategory = (typeof window.normalizeDownloadCountCategory === 'function') ? window.normalizeDownloadCountCategory(item.category || item.rawCategory) : String(item.category || item.rawCategory || '').trim().toLowerCase();
+                const itemTitleId = String(item.titleId || item.id || '').trim().toUpperCase();
+                hadTrendingGameDownload = itemCategory === 'games' && itemTitleId === normalizedTrendingTitleId;
+            }
+            if (existingIndex >= 0 && (!optimisticDownloadKey || hadGlobalDownloadCount) && (!normalizedTrendingTitleId || hadTrendingGameDownload)) break;
+        }
+
         let finalDownloadEntry = entry;
-        const existingIndex = downloadHistory.findIndex(item => isSameDownloadHistoryItem(item, entry));
         if (existingIndex >= 0) {
             const existingEntry = downloadHistory.splice(existingIndex, 1)[0];
             const previousCount = Number(existingEntry.downloadCount);
@@ -45896,7 +46001,11 @@ P
 			const titleId = normalizeGamePlayersTitleId(item && (item.titleId || item.id || item.contentId || item.contentID));
 			return { category:String(category || '').toLowerCase(), titleId };
 		};
-		const downloadRenderEntries = window.downloadHistory.map((item, sourceIndex) => ({ item, sourceIndex }));
+		const downloadRenderEntries = window.downloadHistory.map((item, sourceIndex) => ({
+			item, sourceIndex,
+			key:String(getDownloadNotificationItemKey(item) || ''),
+			identity:getDownloadPlayTogetherIdentity(item)
+		}));
 		listContainer.classList.remove('has-open-swipe');
 		listContainer.style.marginTop = downloadRenderEntries.length === 0 ? '0px' : '10px';
 	
@@ -45937,24 +46046,25 @@ P
 		if(globalCount) globalCount.innerText = `(${window.formatUiCount ? window.formatUiCount(window.downloadHistory.length, 'item', 'items') : `${window.downloadHistory.length} ${window.downloadHistory.length === 1 ? 'item' : 'items'}`})`;
 
 		const metadataOverrideRevision = Number(window.__contentMetadataOverridesRevision || 0);
-		const downloadRenderSignature = metadataOverrideRevision + '|' + downloadRenderEntries.map(entry => {
+		const downloadRenderParts = [];
+		const downloadStructureParts = [];
+		for (const entry of downloadRenderEntries) {
 			const dl = entry.item;
-			const identity = getDownloadPlayTogetherIdentity(dl);
-			return [
-				getDownloadNotificationItemKey(dl), dl.date || '', dl.sizeText || '', Number(dl.downloadCount) || 1,
-				dl.sentToPs3 === true ? 1 : 0, dl.cleanName || dl.name || '', dl.category || '', dl.contentId || '',
-				identity.titleId && typeof window.isViewerPlayTogetherTitle === 'function' && window.isViewerPlayTogetherTitle(identity.titleId) ? 1 : 0
-			].join('~');
-		}).join('|');
-		const downloadStructureSignature = metadataOverrideRevision + '|' + downloadRenderEntries.map(entry => {
-			const dl = entry.item;
-			const identity = getDownloadPlayTogetherIdentity(dl);
-			return [
-				getDownloadNotificationItemKey(dl), dl.sizeText || '', dl.sentToPs3 === true ? 1 : 0,
-				dl.cleanName || dl.name || '', dl.category || '', dl.contentId || '',
-				identity.titleId && typeof window.isViewerPlayTogetherTitle === 'function' && window.isViewerPlayTogetherTitle(identity.titleId) ? 1 : 0
-			].join('~');
-		}).join('|');
+			const playTogether = entry.identity.titleId && typeof window.isViewerPlayTogetherTitle === 'function' && window.isViewerPlayTogetherTitle(entry.identity.titleId) ? 1 : 0;
+			const remote = dl.sentToPs3 === true ? 1 : 0;
+			const name = dl.cleanName || dl.name || '';
+			const category = dl.category || '';
+			const contentId = dl.contentId || '';
+			downloadRenderParts.push([
+				entry.key, dl.date || '', dl.sizeText || '', Number(dl.downloadCount) || 1,
+				remote, name, category, contentId, playTogether
+			].join('~'));
+			downloadStructureParts.push([
+				entry.key, dl.sizeText || '', remote, name, category, contentId, playTogether
+			].join('~'));
+		}
+		const downloadRenderSignature = metadataOverrideRevision + '|' + downloadRenderParts.join('|');
+		const downloadStructureSignature = metadataOverrideRevision + '|' + downloadStructureParts.join('|');
 		const appendProgressive = progressiveMode === 'append';
 		const downloadPreviouslyRendered = Number(listContainer.dataset.progressiveGridRendered || 0);
 		const downloadSameSignature = listContainer.dataset.downloadRenderSignature === downloadRenderSignature;
@@ -45963,10 +46073,9 @@ P
 			&& listContainer.dataset.downloadStructureSignature === downloadStructureSignature;
 		const downloadInitialLimit = Math.max(1, Math.min(60, getProgressiveGridInitialLimit()));
 		const downloadLoadAmount = Math.max(1, Math.min(100, getProgressiveGridLoadAmount()));
-		clearProgressiveGridObserver('downloads', listContainer);
 
 		if (downloadCountOnlyRefresh) {
-			const byKey = new Map(downloadRenderEntries.map(entry => [String(getDownloadNotificationItemKey(entry.item) || ''), entry.item]).filter(([key]) => key));
+			const byKey = new Map(downloadRenderEntries.filter(entry => entry.key).map(entry => [entry.key, entry.item]));
 			listContainer.querySelectorAll('.download-swipe-row[data-download-key]').forEach(row => {
 				const key = String(row.getAttribute('data-download-key') || '');
 				const dl = byKey.get(key);
@@ -45974,7 +46083,7 @@ P
 				const countValue = typeof getDownloadHistoryItemCount === 'function' ? getDownloadHistoryItemCount(dl) : Math.max(1, Number(dl.downloadCount) || 1);
 				const dateText = countValue > 1 ? `Last download: ${dl.date || ''}` : String(dl.date || '');
 				const dateNode = row.querySelector('.dl-date');
-				if (dateNode) {
+				if (dateNode && dateNode.textContent !== dateText) {
 					const icon = dateNode.querySelector('i');
 					dateNode.textContent = '';
 					if (icon) dateNode.appendChild(icon);
@@ -45986,7 +46095,7 @@ P
 			listContainer.dataset.downloadStructureSignature = downloadStructureSignature;
 			const renderedCount = Math.min(downloadRenderEntries.length, downloadPreviouslyRendered || listContainer.querySelectorAll('.download-swipe-row').length);
 			listContainer.dataset.progressiveGridRendered = String(renderedCount);
-			setupProgressiveGridObserver('downloads', listContainer, renderedCount, downloadRenderEntries.length, () => window.updateDownloadUI(true, 'append'), listContainer);
+			setupProgressiveGridObserver('downloads', listContainer, renderedCount, downloadRenderEntries.length, () => window.updateDownloadUI(true, 'append'), listContainer, '', downloadStructureSignature);
 			scheduleDownloadSwipeHint();
 			return;
 		}
@@ -45997,7 +46106,7 @@ P
 			if (isEntryRender && !isSilentRender && typeof setupRevealAnimations === 'function') {
 				setupRevealAnimations(listContainer, { selector:'.download-item', root:listContainer, margin:18, immediate:true });
 			}
-			setupProgressiveGridObserver('downloads', listContainer, renderedCount, downloadRenderEntries.length, () => window.updateDownloadUI(true, 'append'), listContainer);
+			setupProgressiveGridObserver('downloads', listContainer, renderedCount, downloadRenderEntries.length, () => window.updateDownloadUI(true, 'append'), listContainer, '', downloadStructureSignature);
 			scheduleDownloadSwipeHint();
 			return;
 		}
@@ -46117,6 +46226,9 @@ P
 		if (downloadCanAppend) {
 			listContainer.insertAdjacentHTML('beforeend', downloadRowsHtml);
 		} else if (typeof window.reconcileLiveRenderHtml === 'function') {
+			// Preserve the former first-match behavior without scanning the entire history for every reused row.
+			const downloadEntryByKey = new Map();
+			for (const entry of downloadRenderEntries) if (!downloadEntryByKey.has(entry.key)) downloadEntryByKey.set(entry.key, entry.item);
 			window.reconcileLiveRenderHtml(listContainer, downloadRowsHtml, ':scope > .download-swipe-row[data-live-render-key]', {
 				preserveScroll: true,
 				markReused: true,
@@ -46125,14 +46237,17 @@ P
 					previousRow.dataset.downloadIndex = nextRow.dataset.downloadIndex || previousRow.dataset.downloadIndex || '';
 					const previousItem = previousRow.querySelector('.download-item');
 					const nextItem = nextRow.querySelector('.download-item');
-					if (previousItem && nextItem) previousItem.style.setProperty('--tile-idx', nextItem.style.getPropertyValue('--tile-idx') || '0');
+					if (previousItem && nextItem) {
+						const nextIndex = nextItem.style.getPropertyValue('--tile-idx') || '0';
+						if (previousItem.style.getPropertyValue('--tile-idx') !== nextIndex) previousItem.style.setProperty('--tile-idx', nextIndex);
+					}
 					const recordKey = String(previousRow.dataset.downloadKey || '').trim();
-					const record = downloadRenderEntries.find(entry => String(getDownloadNotificationItemKey(entry.item) || '') === recordKey)?.item || null;
+					const record = downloadEntryByKey.get(recordKey) || null;
 					if (record) {
 						const countValue = typeof getDownloadHistoryItemCount === 'function' ? getDownloadHistoryItemCount(record) : Math.max(1, Number(record.downloadCount) || 1);
 						const dateText = countValue > 1 ? `Last download: ${record.date || ''}` : String(record.date || '');
 						const dateNode = previousRow.querySelector('.dl-date');
-						if (dateNode) {
+						if (dateNode && dateNode.textContent !== dateText) {
 							const icon = dateNode.querySelector('i');
 							dateNode.textContent = '';
 							if (icon) dateNode.appendChild(icon);
@@ -46153,7 +46268,7 @@ P
 			setupRevealAnimations(listContainer, { selector:'.download-swipe-row:not([data-live-render-reused="1"]) .download-item', root:listContainer, margin:18, immediate:isEntryRender, animClass:'anim-reveal' });
 		}
 		if (typeof window.clearLiveRenderReuseMarks === 'function') window.clearLiveRenderReuseMarks(listContainer);
-		setupProgressiveGridObserver('downloads', listContainer, downloadRenderEnd, downloadRenderEntries.length, () => window.updateDownloadUI(true, 'append'), listContainer);
+		setupProgressiveGridObserver('downloads', listContainer, downloadRenderEnd, downloadRenderEntries.length, () => window.updateDownloadUI(true, 'append'), listContainer, '', downloadStructureSignature);
 		scheduleDownloadSwipeHint();
 	};
 
@@ -46163,20 +46278,32 @@ P
 		const list = document.getElementById('downloads-list');
 		if (!list) return 0;
 		if (!(window.__downloadRealtimeAnimatedVersions instanceof Map)) window.__downloadRealtimeAnimatedVersions = new Map();
+		const matchingRows = [];
+		const visibleKeys = new Set();
+		for (const row of list.querySelectorAll('.download-swipe-row')) {
+			const key = String(row.getAttribute('data-download-key') || '');
+			if (!keySet.has(key)) continue;
+			matchingRows.push([row, key]);
+			visibleKeys.add(key);
+		}
+		if (!matchingRows.length) return 0;
+
+		const recordByKey = new Map();
+		if (Array.isArray(window.downloadHistory)) for (const entry of window.downloadHistory) {
+			const key = String(getDownloadNotificationItemKey(entry) || '');
+			if (visibleKeys.has(key) && !recordByKey.has(key)) recordByKey.set(key, entry);
+			if (recordByKey.size === visibleKeys.size) break;
+		}
 
 		let animated = 0;
-		list.querySelectorAll('.download-swipe-row').forEach(row => {
-			const key = String(row.getAttribute('data-download-key') || '');
-			if (!keySet.has(key)) return;
-			const record = Array.isArray(window.downloadHistory)
-				? window.downloadHistory.find(entry => String(getDownloadNotificationItemKey(entry) || '') === key)
-				: null;
+		for (const [row, key] of matchingRows) {
+			const record = recordByKey.get(key) || null;
 			const version = [key, Number(record?.lastDownloadedAt || 0), Number(record?.downloadCount || 1), String(record?.date || '')].join('|');
-			if (window.__downloadRealtimeAnimatedVersions.get(key) === version) return;
+			if (window.__downloadRealtimeAnimatedVersions.get(key) === version) continue;
 			window.__downloadRealtimeAnimatedVersions.set(key, version);
 
 			const item = row.querySelector('.download-item');
-			if (!item) return;
+			if (!item) continue;
 			const hasPersistentNewState = item.classList.contains('is-new');
 			animated++;
 			item.classList.remove('no-anim', 'anim-reveal', 'is-realtime-new');
@@ -46192,7 +46319,7 @@ P
 			setTimeout(() => {
 				if (item.isConnected) item.classList.remove('is-realtime-new');
 			}, 5000);
-		});
+		}
 		return animated;
 	};
 	
@@ -50493,53 +50620,185 @@ P
 		touchPsnUserMetaCacheEntry(key, previous);
 		return merged;
 	};
+	const PSN_USER_META_REQUEST_BATCH_MAX = 500;
+	const PSN_USER_META_TAB_FIELDS = ['avatar', 'profileUpdatedAt', 'level', 'joined', 'countryCode', 'library', 'downloads', 'wishlist', 'favorites', 'trophies'];
+	const PSN_USER_META_TAB_MAX_AGE_MS = 10000;
+	const psnUserMetaTabId = Math.random().toString(36).slice(2);
+	const psnUserMetaPendingRequests = new Map();
+	let psnUserMetaTabChannel = null;
+	function psnUserMetaTabOwner() {
+		if (window.isProfileLoaded !== true) return '';
+		const login = typeof currentLoginUser !== 'undefined' ? String(currentLoginUser || '').trim().toLowerCase() : '';
+		const stored = String(localStorage.getItem('psn_username') || '').trim().toLowerCase();
+		return login && stored && login === stored ? login : '';
+	}
+	function psnCompactSharedUser(user) {
+		if (!user || typeof user !== 'object') return null;
+		const name = String(user.name || user.user || user.username || user.onlineId || '').trim();
+		if (!name || name.length > 120) return null;
+		const result = { name };
+		for (const field of PSN_USER_META_TAB_FIELDS) {
+			const value = user[field];
+			if ((typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') && String(value).length <= 4096) result[field] = value;
+		}
+		return Object.keys(result).length > 1 ? result : null;
+	}
+	function applyPsnSharedUserMetadata(packet) {
+		const owner = psnUserMetaTabOwner();
+		if (!owner || !packet || packet.v !== 1 || packet.from === psnUserMetaTabId || packet.owner !== owner || !Array.isArray(packet.users)) return 0;
+		const now = Date.now(), sentAt = Number(packet.at) || 0;
+		if (!sentAt || Math.abs(now - sentAt) > PSN_USER_META_TAB_MAX_AGE_MS || packet.users.length > PSN_USER_META_REQUEST_BATCH_MAX) return 0;
+		const accepted = [], seen = new Set();
+		for (const raw of packet.users) {
+			const user = psnCompactSharedUser(raw);
+			if (!user) continue;
+			const key = user.name.toLowerCase();
+			if (seen.has(key)) continue;
+			seen.add(key);
+			const pending = psnUserMetaPendingRequests.get(key);
+			if (pending && pending.force) continue;
+			const existing = window.__freshPsnUserMetaByName.get(key);
+			const current = existing && existing.user;
+			const currentVersion = Number(current && current.profileUpdatedAt || 0);
+			const incomingVersion = Number(user.profileUpdatedAt || 0);
+			if (current && currentVersion > 0 && (!incomingVersion || incomingVersion < currentVersion)) continue;
+			if (current && Number(existing.freshAt || 0) >= sentAt) continue;
+			if (current && currentVersion === incomingVersion && now - Number(existing.freshAt || 0) < 5000) continue;
+			const merged = window.cacheFreshPsnUserMeta(user, sentAt);
+			if (!merged) continue;
+			// A newer tab result supersedes an ordinary in-flight lookup; never
+			// invalidate a forced/authoritative fetch (e.g. Seen by).
+			if (pending) {
+				psnUserMetaPendingRequests.delete(key);
+				const serial = (Number(window.__psnUserMetaRequestSerial) || 0) + 1;
+				window.__psnUserMetaRequestSerial = serial;
+				if (window.__psnUserMetaLatestRequests instanceof Map) window.__psnUserMetaLatestRequests.set(key, serial);
+			}
+			accepted.push(merged);
+		}
+		if (accepted.length && typeof window.syncPsnUserMetaBatch === 'function') window.syncPsnUserMetaBatch(accepted, { forceAvatarDomSync:true });
+		return accepted.length;
+	}
+	function ensurePsnUserMetaTabChannel() {
+		if (psnUserMetaTabChannel || typeof BroadcastChannel !== 'function') return psnUserMetaTabChannel;
+		try {
+			psnUserMetaTabChannel = new BroadcastChannel('psn-content-profile-metadata-v1');
+			psnUserMetaTabChannel.onmessage = event => { try { applyPsnSharedUserMetadata(event.data); } catch (_) {} };
+		} catch (_) { psnUserMetaTabChannel = null; }
+		return psnUserMetaTabChannel;
+	}
+	function publishPsnUserMetaToTabs(users, freshAt = Date.now()) {
+		const owner = psnUserMetaTabOwner(), channel = owner ? ensurePsnUserMetaTabChannel() : null;
+		if (!channel || !Array.isArray(users) || !users.length) return;
+		const at = Number(freshAt) || Date.now();
+		for (let offset = 0; offset < users.length; offset += PSN_USER_META_REQUEST_BATCH_MAX) {
+			const compact = users.slice(offset, offset + PSN_USER_META_REQUEST_BATCH_MAX).map(psnCompactSharedUser).filter(Boolean);
+			if (!compact.length) continue;
+			try { channel.postMessage({ v:1, from:psnUserMetaTabId, owner, at, users:compact }); } catch (_) {}
+		}
+	}
+	window.publishPsnUserMetaToTabs = publishPsnUserMetaToTabs;
+	ensurePsnUserMetaTabChannel();
 	window.refreshPsnUserMetaBatch = function(names, options = {}) {
 		if (typeof socketChat === 'undefined' || !socketChat || !socketChat.connected) return false;
-		const unique = Array.from(new Set((Array.isArray(names) ? names : [names]).map(name => String(name || '').trim()).filter(Boolean)));
-		if (!unique.length) return false;
+		const unique = new Map();
+		(Array.isArray(names) ? names : [names]).forEach(value => {
+			const name = String(value || '').trim();
+			if (name && !unique.has(name.toLowerCase())) unique.set(name.toLowerCase(), name);
+		});
+		if (!unique.size) return false;
 		const now = Date.now();
 		const maxAge = Number.isFinite(Number(options.maxAge)) ? Math.max(0, Number(options.maxAge)) : PSN_USER_META_FRESH_MS;
 		const force = options.force === true;
-		const targets = unique.filter(name => {
-			const key = name.toLowerCase();
+		const targets = [];
+		for (const [key, name] of unique) {
 			let entry = window.__freshPsnUserMetaByName.get(key);
 			const freshAt = Number(entry && entry.freshAt) || 0;
 			const lookupAt = Number(entry && entry.batchLookupAt) || 0;
-			if (!force && freshAt && now - freshAt <= maxAge) return false;
-			if (!force && lookupAt && now - lookupAt < 5000) return false;
+			if (!force && freshAt && now - freshAt <= maxAge) continue;
+			if (!force && lookupAt && now - lookupAt < 5000) continue;
 			entry = entry && typeof entry === 'object' ? entry : { user:null, freshAt:0, syncedSignature:'' };
 			entry.batchLookupAt = now;
 			touchPsnUserMetaCacheEntry(key, entry);
-			return true;
-		});
+			targets.push(name);
+		}
 		if (!targets.length) return false;
+		const requestSerial = (Number(window.__psnUserMetaRequestSerial) || 0) + 1;
+		window.__psnUserMetaRequestSerial = requestSerial;
+		const latestRequests = window.__psnUserMetaLatestRequests instanceof Map ? window.__psnUserMetaLatestRequests : new Map();
+		window.__psnUserMetaLatestRequests = latestRequests;
+		for (const name of targets) {
+			const key = name.toLowerCase();
+			latestRequests.delete(key);
+			latestRequests.set(key, requestSerial);
+			psnUserMetaPendingRequests.set(key, { serial:requestSerial, force:options.force === true || options.authoritative === true });
+		}
+		// In-flight request identities are separate from the bounded 1024-user metadata
+		// cache: a large list must not evict its own pending responses.
+		while (latestRequests.size > 8192) latestRequests.delete(latestRequests.keys().next().value);
 
 		const apply = response => {
 			const users = response && response.success === true && Array.isArray(response.users) ? response.users : [];
 			if (!users.length) return false;
-			const freshAt = Date.now();
-			for (let i = 0; i < users.length; i++) window.cacheFreshPsnUserMeta(users[i], freshAt);
-			if (typeof window.syncPsnUserMetaBatch === 'function') window.syncPsnUserMetaBatch(users, { forceAvatarDomSync:true });
-			else if (typeof window.syncPsnUserMeta === 'function') users.forEach(user => window.syncPsnUserMeta(user));
+			const freshAt = Date.now(), accepted = [];
+			for (const user of users) {
+				const name = String(user && (user.name || user.user || user.username || user.onlineId) || '').trim();
+				if (latestRequests.get(name.toLowerCase()) !== requestSerial) continue;
+				const merged = window.cacheFreshPsnUserMeta(user, freshAt);
+				if (merged) accepted.push(merged);
+			}
+			if (!accepted.length) return false;
+			if (typeof window.syncPsnUserMetaBatch === 'function') window.syncPsnUserMetaBatch(accepted, { forceAvatarDomSync:true });
+			else if (typeof window.syncPsnUserMeta === 'function') accepted.forEach(user => window.syncPsnUserMeta(user));
+			publishPsnUserMetaToTabs(accepted, freshAt);
 			return true;
 		};
 
-		const requestPayload = { names: targets };
-		if (options.authoritative === true) requestPayload.authoritative = true;
-		if (typeof socketChat.timeout === 'function') {
-			socketChat.timeout(5000).emit('request_friends_presence', requestPayload, (err, response) => { if (!err) apply(response); });
-		} else socketChat.emit('request_friends_presence', requestPayload, apply);
+		for (let offset = 0; offset < targets.length; offset += PSN_USER_META_REQUEST_BATCH_MAX) {
+			const requestPayload = { names:targets.slice(offset, offset + PSN_USER_META_REQUEST_BATCH_MAX) };
+			if (options.authoritative === true) requestPayload.authoritative = true;
+			const settle = (err, response) => {
+				for (const name of requestPayload.names) {
+					const key = name.toLowerCase();
+					if (psnUserMetaPendingRequests.get(key)?.serial === requestSerial) psnUserMetaPendingRequests.delete(key);
+				}
+				if (!err) apply(response);
+			};
+			if (typeof socketChat.timeout === 'function') socketChat.timeout(5000).emit('request_friends_presence', requestPayload, settle);
+			else socketChat.emit('request_friends_presence', requestPayload, response => settle(null, response));
+		}
 		return true;
 	};
 	window.queuePsnUserMetaRefresh = function(names, options = {}) {
-		window.__psnUserMetaRefreshQueue = window.__psnUserMetaRefreshQueue instanceof Set ? window.__psnUserMetaRefreshQueue : new Set();
-		(Array.isArray(names) ? names : [names]).forEach(name => { name = String(name || '').trim(); if (name) window.__psnUserMetaRefreshQueue.add(name); });
-		if (!window.__psnUserMetaRefreshQueue.size || window.__psnUserMetaRefreshTimer) return false;
+		window.__psnUserMetaRefreshQueue = window.__psnUserMetaRefreshQueue instanceof Map ? window.__psnUserMetaRefreshQueue : new Map();
+		const queue = window.__psnUserMetaRefreshQueue;
+		const maxAge = Number.isFinite(Number(options.maxAge)) ? Math.max(0, Number(options.maxAge)) : PSN_USER_META_FRESH_MS;
+		(Array.isArray(names) ? names : [names]).forEach(value => {
+			const name = String(value || '').trim();
+			if (!name) return;
+			const key = name.toLowerCase(), prior = queue.get(key);
+			queue.set(key, {
+				name:prior ? prior.name : name,
+				maxAge:prior ? Math.min(prior.maxAge, maxAge) : maxAge,
+				force:options.force === true || !!(prior && prior.force),
+				authoritative:options.authoritative === true || !!(prior && prior.authoritative)
+			});
+		});
+		if (!queue.size || window.__psnUserMetaRefreshTimer) return false;
 		window.__psnUserMetaRefreshTimer = setTimeout(() => {
 			window.__psnUserMetaRefreshTimer = null;
-			const batch = Array.from(window.__psnUserMetaRefreshQueue);
-			window.__psnUserMetaRefreshQueue.clear();
-			window.refreshPsnUserMetaBatch(batch, options);
+			const batch = Array.from(queue.values());
+			queue.clear();
+			// Keep strong consistency requests separate without losing their priority
+			// when several independent lists enqueue users during the same frame.
+			const groups = new Map();
+			for (const item of batch) {
+				const key = `${item.maxAge}|${item.force ? 1 : 0}|${item.authoritative ? 1 : 0}`;
+				let group = groups.get(key);
+				if (!group) { group = { names:[], options:{ maxAge:item.maxAge, force:item.force, authoritative:item.authoritative } }; groups.set(key, group); }
+				group.names.push(item.name);
+			}
+			for (const group of groups.values()) window.refreshPsnUserMetaBatch(group.names, group.options);
 		}, 40);
 		return true;
 	};
@@ -56774,14 +57033,29 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 		});
 	};
 
+	let wishlistTypeAvailabilityCache = null;
 	window.updateWishlistTypeFilterAvailability = function() {
 		const select = document.getElementById('wish-cat-select');
-		if (!select || !Array.isArray(window.wishlist) || typeof window.getPsnTypeAvailability !== 'function' || typeof window.syncPsnTypeSelectAvailability !== 'function') return;
-		const counts = window.getPsnTypeAvailability(window.wishlist, item => (
-			typeof window.getWishlistItemCategoryKey === 'function'
-				? window.getWishlistItemCategoryKey(item)
-				: (item.category || 'games')
-		));
+		const items = window.wishlist;
+		if (!select || !Array.isArray(items) || typeof window.getPsnTypeAvailability !== 'function' || typeof window.syncPsnTypeSelectAvailability !== 'function') return;
+		const revision = typeof getWishlistSourceRevision === 'function' ? getWishlistSourceRevision() : '';
+		const storeRevision = Number(window.__psnStoreCacheRevision || 0);
+		const metadataRevision = Number(window.__contentMetadataOverridesRevision || 0);
+		const cached = wishlistTypeAvailabilityCache;
+		if (!cached || cached.items !== items || cached.length !== items.length ||
+			cached.first !== items[0] || cached.last !== items[items.length - 1] ||
+			cached.revision !== revision || cached.storeRevision !== storeRevision || cached.metadataRevision !== metadataRevision) {
+			wishlistTypeAvailabilityCache = {
+				items, length:items.length, first:items[0], last:items[items.length - 1],
+				revision, storeRevision, metadataRevision,
+				counts:window.getPsnTypeAvailability(items, item => (
+					typeof window.getWishlistItemCategoryKey === 'function'
+						? window.getWishlistItemCategoryKey(item)
+						: (item.category || 'games')
+				))
+			};
+		}
+		const counts = wishlistTypeAvailabilityCache.counts;
 		window.syncPsnTypeSelectAvailability(select, counts, {
 			unavailableClass: 'wish-type-unavailable',
 			allTitle: 'Show every wishlist type',
@@ -60776,12 +61050,30 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 		markProfileListChanged('library');
 		const libraryVisible = document.getElementById('view-library')?.style.display === 'block' && ['block','flex'].includes(document.getElementById('subview-games')?.style.display || '');
 		if (libraryVisible) renderLocalLibrary(merged, true, true);
-		if (typeof window.refreshStoreInstalledChecks === 'function') window.refreshStoreInstalledChecks();
+		if (typeof window.refreshInstalledCardsForLibraryChange === 'function') window.refreshInstalledCardsForLibraryChange(prior, merged);
+		else if (typeof window.refreshStoreInstalledChecks === 'function') window.refreshStoreInstalledChecks();
 		if (typeof window.broadcastProfileUpdate === 'function') window.broadcastProfileUpdate({ silentIndicator:true });
 		return true;
 	};
 
-	async function refreshPS3Library() {
+	let ps3LibraryRefreshPending = null;
+	function refreshPS3Library(options = {}) {
+		const ip = String(document.getElementById('ps3-ip')?.value || '').trim();
+		const username = String(localStorage.getItem('psn_username') || '');
+		const pending = ps3LibraryRefreshPending;
+		if (options.force !== true && pending && pending.ip === ip && pending.username === username && pending.token === ps3LibraryRefreshToken) {
+			return pending.promise;
+		}
+		const promise = refreshPS3LibraryImpl();
+		const request = { ip, username, token:ps3LibraryRefreshToken, promise };
+		ps3LibraryRefreshPending = request;
+		promise.finally(() => {
+			if (ps3LibraryRefreshPending === request) ps3LibraryRefreshPending = null;
+		}).catch(() => {});
+		return promise;
+	}
+
+	async function refreshPS3LibraryImpl() {
 		const refreshToken = ++ps3LibraryRefreshToken;
 		const ip = document.getElementById('ps3-ip').value;
 		const refreshUser = String(localStorage.getItem('psn_username') || '');
@@ -60892,15 +61184,19 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 	
 			let shouldRepaintLocalLibrary = false;
 			if (typeof lastScannedGames !== 'undefined') {
-				const previousScannedGames = Array.isArray(lastScannedGames) ? lastScannedGames.slice() : [];
-				const previousSignature = getLocalLibraryDataSignature(lastScannedGames);
-				const historyFallback = mergeLibraryLastPlayedLists(lastScannedGames, favoritesLibrary || []);
+				const previousScannedGames = Array.isArray(lastScannedGames) ? lastScannedGames : [];
+				const previousSignature = getLocalLibraryDataSignature(previousScannedGames);
+				const historyFallback = mergeLibraryLastPlayedLists(previousScannedGames, favoritesLibrary || []);
 				const mergedGames = mergeLibraryLastPlayedLists(discoveredGames, historyFallback).map(game => {
 					if (!game.titleId) game.titleId = getLibraryGameTitleId(game) || null;
 					return game;
 				});
-	
-				lastScannedGames = mergedGames;
+				const nextSignature = getLocalLibraryDataSignature(mergedGames);
+				shouldRepaintLocalLibrary = previousSignature !== nextSignature;
+				// The render signature intentionally ignores some metadata. Only retain
+				// the old array if all records are identical, so hidden fields never go stale.
+				const recordsUnchanged = !shouldRepaintLocalLibrary && JSON.stringify(previousScannedGames) === JSON.stringify(mergedGames);
+				if (!recordsUnchanged) lastScannedGames = mergedGames;
 				window.lastScannedGames = lastScannedGames;
 				if (typeof recordMyGamesScanNovelty === 'function') recordMyGamesScanNovelty(previousScannedGames, mergedGames);
 				/* A successful webMAN scan is authoritative for installed paths. Keep favorite paths too,
@@ -60910,9 +61206,11 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 					(Array.isArray(favoritesLibrary) ? favoritesLibrary : []).forEach(game => { const path = String(game && game.path || ''); if (path) liveLibraryCoverPaths.add(path); });
 					Object.keys(window.libCoverCache).forEach(path => { if (!liveLibraryCoverPaths.has(path)) delete window.libCoverCache[path]; });
 				}
-				if (typeof window.bumpLibraryCollectionRevision === 'function') window.bumpLibraryCollectionRevision('library');
-				if (typeof window.refreshStoreInstalledChecks === 'function') window.refreshStoreInstalledChecks();
-				shouldRepaintLocalLibrary = previousSignature !== getLocalLibraryDataSignature(lastScannedGames);
+				if (shouldRepaintLocalLibrary) {
+					if (typeof window.bumpLibraryCollectionRevision === 'function') window.bumpLibraryCollectionRevision('library');
+					if (typeof window.refreshInstalledCardsForLibraryChange === 'function') window.refreshInstalledCardsForLibraryChange(previousScannedGames, mergedGames);
+					else if (typeof window.refreshStoreInstalledChecks === 'function') window.refreshStoreInstalledChecks();
+				}
 				const hydrationKey = typeof window.getProfileHydrationKey === 'function' ? window.getProfileHydrationKey('library', refreshUser) : '';
 				const profileLibraryReady = !!(hydrationKey && window.__profileHydratedSections instanceof Set && window.__profileHydratedSections.has(hydrationKey));
 				if (profileLibraryReady) {
@@ -62228,7 +62526,7 @@ function formatLibraryLastPlayedBadge(game = {}) {
 	async function reloadLocalLibrary() {
 		if (typeof playUiClick === "function") playUiClick();
 		try {
-			await refreshPS3Library();
+			await refreshPS3Library({ force:true });
 		} catch (error) {
 			console.error("Fail to synchronize UI:", error);
 		}
@@ -64405,13 +64703,16 @@ function formatLibraryLastPlayedBadge(game = {}) {
 
 
 	let consoleStorageReadBusy = false;
+	let consoleStorageReadIp = '';
+	let consoleStorageReadToken = 0;
 	let consoleStorageLastReadAt = 0;
+	let consoleStorageLastReadIp = '';
 
-	async function fetchConsoleDeviceStorageInfo(path, icon = 'fa-hard-drive') {
+	async function fetchConsoleDeviceStorageInfo(path, icon = 'fa-hard-drive', ipOverride = '') {
 		try {
 			const cleanPath = String(path || '').replace(/^\/+/, '');
 			if (!cleanPath) return null;
-			const html = await fetchConsoleReadableText(`/${cleanPath}`, 9000);
+			const html = await fetchConsoleReadableText(`/${cleanPath}`, 9000, ipOverride);
 			const doc = new DOMParser().parseFromString(String(html || ''), 'text/html');
 			const text = `${doc.body?.textContent || ''} ${String(html || '')}`;
 			const pair = parseConsoleStoragePairFromText(text);
@@ -64424,27 +64725,38 @@ function formatLibraryLastPlayedBadge(game = {}) {
 
 	async function refreshConsoleStorageFromFileManager(force = false) {
 		if (typeof isUserSessionReadyForConsole === 'function' && !isUserSessionReadyForConsole()) return false;
-		if (consoleStorageReadBusy) return false;
+		const ip = String(getCurrentPs3Ip() || '').trim();
+		if (!ip || (consoleStorageReadBusy && consoleStorageReadIp === ip)) return false;
 		const now = Date.now();
-		if (!force && (now - consoleStorageLastReadAt) < 30000) return false;
+		if (!force && consoleStorageLastReadIp === ip && (now - consoleStorageLastReadAt) < 30000) return false;
+		const token = ++consoleStorageReadToken;
 		consoleStorageReadBusy = true;
+		consoleStorageReadIp = ip;
+		const stillCurrent = () => token === consoleStorageReadToken && String(getCurrentPs3Ip() || '').trim() === ip;
 		try {
-			const html = await fetchConsoleReadableText('/', 9000);
+			const html = await fetchConsoleReadableText('/', 9000, ip);
+			if (!stillCurrent()) return false;
 			const storage = parseConsoleStorageFromFileManagerHtml(html);
 			if (storage && storage.freeGb && storage.totalGb) {
 				let storageDevices = sortConsoleStorageDevices(storage.devices || []);
 				if (!storageDevices.some(device => String(device.id || '').toLowerCase() === 'dev_flash')) {
-					const flashDevice = await fetchConsoleDeviceStorageInfo('/dev_flash', 'fa-microchip');
+					const flashDevice = await fetchConsoleDeviceStorageInfo('/dev_flash', 'fa-microchip', ip);
+					if (!stillCurrent()) return false;
 					if (flashDevice) storageDevices = sortConsoleStorageDevices([flashDevice, ...storageDevices]);
 				}
+				if (!stillCurrent()) return false;
 				updateConsoleStorageUI(storage.freeGb, storage.totalGb, storageDevices);
-				consoleStorageLastReadAt = now;
+				consoleStorageLastReadAt = Date.now();
+				consoleStorageLastReadIp = ip;
 				return true;
 			}
 		} catch (err) {
-			console.warn('[Console Dashboard] Could not read storage from File Manager:', err);
+			if (stillCurrent()) console.warn('[Console Dashboard] Could not read storage from File Manager:', err);
 		} finally {
-			consoleStorageReadBusy = false;
+			if (token === consoleStorageReadToken) {
+				consoleStorageReadBusy = false;
+				consoleStorageReadIp = '';
+			}
 		}
 		return false;
 	}
@@ -64453,7 +64765,7 @@ function formatLibraryLastPlayedBadge(game = {}) {
 	window.refreshConsoleStorageManual = async function(btnElement = null) {
 		const btn = btnElement || document.getElementById('console-storage-refresh-btn');
 		if (typeof playUiClick === 'function') playUiClick();
-		if (consoleStorageReadBusy) {
+		if (consoleStorageReadBusy && consoleStorageReadIp === String(getCurrentPs3Ip() || '').trim()) {
 			if (typeof showToastNotification === 'function') showToastNotification('Console Storage', 'Storage refresh already running.');
 			return false;
 		}
@@ -66182,7 +66494,11 @@ function formatLibraryLastPlayedBadge(game = {}) {
 
 
 	let consoleTaskManagerReadBusy = false;
+	let consoleTaskManagerReadIp = '';
+	let consoleTaskManagerReadToken = 0;
 	let consoleTaskManagerLastReadAt = 0;
+	let consoleTaskManagerLastReadIp = '';
+	let consolePluginPreferredPage = null;
 
 	window.refreshConsoleTaskManager = async function(force = false) {
 		if (typeof isUserSessionReadyForConsole === 'function' && !isUserSessionReadyForConsole()) {
@@ -66191,45 +66507,62 @@ function formatLibraryLastPlayedBadge(game = {}) {
 			setConsoleTaskStatus('Log in to read PS3™ VSH plugins.', '#ffcc00');
 			return false;
 		}
-		if (consoleTaskManagerReadBusy) return false;
-		if (!force && consoleTaskManagerLastReadAt > 0 && (Date.now() - consoleTaskManagerLastReadAt) < 30000) return false;
+		const readIp = String(getCurrentPs3Ip() || '').trim();
+		if (!readIp || (consoleTaskManagerReadBusy && consoleTaskManagerReadIp === readIp)) return false;
+		if (!force && consoleTaskManagerLastReadIp === readIp && consoleTaskManagerLastReadAt > 0 && (Date.now() - consoleTaskManagerLastReadAt) < 30000) return false;
+		const token = ++consoleTaskManagerReadToken;
+		const stillCurrent = () => token === consoleTaskManagerReadToken && String(getCurrentPs3Ip() || '').trim() === readIp;
 		consoleTaskManagerReadBusy = true;
+		consoleTaskManagerReadIp = readIp;
 		try {
 			setConsoleTaskPill('webMAN', true);
 			setConsoleTaskStatus('Reading VSH plugin table from webMAN...', '#ffcc00', 'fa-circle-notch fa-spin');
 			const pluginPages = ['/home.ps3mapi/sman.ps3', '/home.ps3mapi', '/sman.ps3?', '/ps3mapi.ps3'];
+			if (consolePluginPreferredPage?.ip === readIp && pluginPages.includes(consolePluginPreferredPage.page)) {
+				pluginPages.splice(pluginPages.indexOf(consolePluginPreferredPage.page), 1);
+				pluginPages.unshift(consolePluginPreferredPage.page);
+			}
 			let plugins = [];
 			let lastHtml = '';
+			let workingPage = '';
 			for (const page of pluginPages) {
 				try {
-					lastHtml = await fetchConsoleReadableText(page, 12000);
+					lastHtml = await fetchConsoleReadableText(page, 12000, readIp);
+					if (!stillCurrent()) return false;
 					plugins = parseConsolePluginListFromWebmanHtml(lastHtml);
-					if (plugins.length) break;
+					if (plugins.length) { workingPage = page; break; }
 				} catch (pageErr) {
 					console.warn(`[Console Plugins Manager] Plugin page failed: ${page}`, pageErr);
 				}
 			}
+			if (!stillCurrent()) return false;
 			if (!plugins.length) throw new Error(`No VSH plugin rows found in webMAN table. HTML length: ${lastHtml.length}`);
+			consolePluginPreferredPage = { ip: readIp, page: workingPage };
 			renderConsolePluginList(plugins, false);
 			if (typeof syncFpsCounterFromPluginList === 'function') syncFpsCounterFromPluginList(plugins, (typeof fpsCounterDetectionChecked !== 'undefined' && fpsCounterDetectionChecked) ? fpsCounterPluginDetected : null);
 			consoleTaskManagerLastReadAt = Date.now();
+			consoleTaskManagerLastReadIp = readIp;
 			setConsoleTaskStatus('VSH plugin list updated from webMAN.', '#4caf50', 'fa-circle-check');
 		} catch (err) {
+			if (!stillCurrent()) return false;
 			console.warn('[Console Plugins Manager] webMAN table read failed, trying PS3MAPI commands:', err);
 			try {
 				setConsoleTaskPill('PS3MAPI', true);
 				const plugins = [];
 				for (const slot of CONSOLE_VSH_PLUGIN_SLOTS) {
 					try {
-						const raw = await fetchConsoleReadableText(buildPs3MapiCommand(`MODULE GETVSHPLUGINFO ${slot}`), 7000);
+						const raw = await fetchConsoleReadableText(buildPs3MapiCommand(`MODULE GETVSHPLUGINFO ${slot}`), 7000, readIp);
+						if (!stillCurrent()) return false;
 						plugins.push(parseConsolePluginInfo(raw, slot));
 					} catch (_) {
 						plugins.push({ slot, name: `Empty slot ${slot}`, path: 'Could not read this slot', active: false });
 					}
 				}
+				if (!stillCurrent()) return false;
 				renderConsolePluginList(plugins, false);
 				if (typeof syncFpsCounterFromPluginList === 'function') syncFpsCounterFromPluginList(plugins, (typeof fpsCounterDetectionChecked !== 'undefined' && fpsCounterDetectionChecked) ? fpsCounterPluginDetected : null);
 				consoleTaskManagerLastReadAt = Date.now();
+				consoleTaskManagerLastReadIp = readIp;
 				setConsoleTaskStatus('VSH plugin list updated.', '#4caf50', 'fa-circle-check');
 			} catch (fallbackErr) {
 				console.warn('[Console Plugins Manager] Could not read plugins:', fallbackErr);
@@ -66237,7 +66570,10 @@ function formatLibraryLastPlayedBadge(game = {}) {
 				setConsoleTaskStatus('Could not read plugins. Check webMAN MOD / PS3MAPI.', '#ff7777', 'fa-triangle-exclamation');
 			}
 		} finally {
-			consoleTaskManagerReadBusy = false;
+			if (token === consoleTaskManagerReadToken) {
+				consoleTaskManagerReadBusy = false;
+				consoleTaskManagerReadIp = '';
+			}
 		}
 		return true;
 	};
@@ -68416,14 +68752,17 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 	let fileManagerRightLastReadPath = '';
 	let fileManagerRightLastReadIp = '';
 	const fileManagerPaneRequests = {
-		left: { token: 0, controller: null },
-		right: { token: 0, controller: null }
+		left: { token: 0, controller: null, inFlight: null },
+		right: { token: 0, controller: null, inFlight: null }
 	};
 	window.__psnFileManagerImageLists = { left: [], right: [] };
 	let fileManagerDualPaneEnabled = false;
 	let fileManagerMobilePane = 'left';
 	let fileManagerSelection = null;
 	let fileManagerTransferBusy = false;
+	let fileManagerTransferPreparing = false;
+	let fileManagerTransferActiveIp = '';
+	let fileManagerTransferActiveTarget = null;
 	let fileManagerTransferOperation = '';
 	let fileManagerTransferCancelRequested = false;
 	let fileManagerTransferCancelPending = false;
@@ -68470,7 +68809,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 	}
 
 	window.resetFileManagerSessionState = function(options = {}) {
-		if (fileManagerTransferBusy && options.force !== true) {
+		if ((fileManagerTransferBusy || fileManagerTransferPreparing) && options.force !== true) {
 			fileManagerResetPendingOnLibraryExit = true;
 			if (typeof closeFileManagerContextMenu === 'function') closeFileManagerContextMenu({ immediate: true });
 			if (typeof closeFileManagerInfoModal === 'function') closeFileManagerInfoModal({ immediate: true });
@@ -68486,6 +68825,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 		Object.values(fileManagerPaneRequests).forEach(request => {
 			if (request.controller) { try { request.controller.abort(); } catch (e) {} }
 			request.controller = null;
+			request.inFlight = null;
 			request.token++;
 		});
 
@@ -68502,6 +68842,9 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 		fileManagerRightLastReadIp = '';
 		fileManagerSelection = null;
 		fileManagerTransferBusy = false;
+		fileManagerTransferPreparing = false;
+		fileManagerTransferActiveIp = '';
+		fileManagerTransferActiveTarget = null;
 		fileManagerTransferOperation = '';
 		fileManagerTransferCancelRequested = false;
 		fileManagerTransferCancelPending = false;
@@ -68572,7 +68915,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 
 	window.refreshFileManagerPane = function(pane = 'left') {
 		if (typeof playUiClick === 'function') playUiClick();
-		return explorePath(getFileManagerPanePath(pane), pane);
+		return explorePath(getFileManagerPanePath(pane), pane, { forceReload: true });
 	};
 
 	function openFileManagerPath(path) {
@@ -68643,7 +68986,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 	}
 
 	window.toggleFileManagerDualPane = function(force, options = {}) {
-		if (fileManagerTransferBusy) return false;
+		if (fileManagerTransferBusy || fileManagerTransferPreparing) return false;
 		const next = typeof force === 'boolean' ? force : !fileManagerDualPaneEnabled;
 		if (next === fileManagerDualPaneEnabled) return next;
 		if (!options.silent && typeof playUiClick === 'function') playUiClick();
@@ -68673,12 +69016,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 	function applyFileManagerSelectionHighlight() {
 		document.querySelectorAll('#fm-online-container .file-row.fm-selected').forEach(row => row.classList.remove('fm-selected'));
 		if (!fileManagerSelection) return;
-		for (const row of document.querySelectorAll('#fm-online-container .file-row')) {
-			if (row.dataset.fmPane !== fileManagerSelection.pane
-				|| normalizeFileManagerPath(row.dataset.fmPath || '') !== fileManagerSelection.path) continue;
-			row.classList.add('fm-selected');
-			break;
-		}
+		getFileManagerRowByPath(fileManagerSelection.path, fileManagerSelection.pane)?.classList.add('fm-selected');
 	}
 
 	window.clearFileManagerSelection = function(options = {}) {
@@ -68700,9 +69038,9 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 
 	window.cancelFileManagerCopy = async function() {
 		if (!fileManagerTransferBusy || fileManagerTransferOperation !== 'copy' || fileManagerTransferCancelPending || fileManagerTransferCancelRequested) return false;
-		const ip = String(document.getElementById('ps3-ip')?.value || '').trim();
+		const ip = fileManagerTransferActiveIp;
 		if (!ip) return false;
-		const target = getFileManagerTransferTarget();
+		const target = fileManagerTransferActiveTarget;
 		if (!confirm(`Cancel the current copy${target?.name ? ` of ${target.name}` : ''}?`)) return false;
 
 		fileManagerTransferCancelRequested = true;
@@ -68777,10 +69115,10 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 		if (moveText && moveText.textContent !== moveLabel) moveText.textContent = moveLabel;
 		const invalid = !target || target.sourcePath === target.destinationPath || target.recursiveDirectoryTarget === true;
 		const canCancelCopy = fileManagerTransferBusy && fileManagerTransferOperation === 'copy';
-		if (copyButton) copyButton.disabled = fileManagerTransferBusy || invalid;
-		if (moveButton) moveButton.disabled = fileManagerTransferBusy || invalid;
+		if (copyButton) copyButton.disabled = fileManagerTransferBusy || fileManagerTransferPreparing || invalid;
+		if (moveButton) moveButton.disabled = fileManagerTransferBusy || fileManagerTransferPreparing || invalid;
 		if (clearButton) {
-			clearButton.disabled = fileManagerTransferBusy ? (!canCancelCopy || fileManagerTransferCancelPending || fileManagerTransferCancelRequested) : !target;
+			clearButton.disabled = fileManagerTransferBusy ? (!canCancelCopy || fileManagerTransferCancelPending || fileManagerTransferCancelRequested) : (fileManagerTransferPreparing || !target);
 			clearButton.classList.toggle('is-cancel-copy', canCancelCopy);
 			clearButton.title = canCancelCopy ? ((fileManagerTransferCancelPending || fileManagerTransferCancelRequested) ? 'Cancelling copy…' : 'Cancel Copy') : 'Clear selection';
 			clearButton.setAttribute('aria-label', clearButton.title);
@@ -69423,7 +69761,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 		closeFileManagerContextMenu();
 		if (typeof playUiClick === 'function') playUiClick();
 		switch (action) {
-			case 'refresh': return explorePath(getFileManagerPanePath(pane), pane);
+			case 'refresh': return explorePath(getFileManagerPanePath(pane), pane, { forceReload: true });
 			case 'new-folder': return createFileManagerFolder(pane);
 			case 'open': return item?.row?.querySelector('.file-name')?.click();
 			case 'download': {
@@ -69685,13 +70023,9 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 	}
 
 	function getFileManagerRowByPath(path, pane = 'left') {
-		const normalizedPath = normalizeFileManagerPath(path);
 		const list = getFileManagerPaneElements(pane === 'right' ? 'right' : 'left').list;
 		if (!list) return null;
-		for (const row of list.querySelectorAll(':scope > .file-row')) {
-			if (normalizeFileManagerPath(row.dataset.fmPath || '') === normalizedPath) return row;
-		}
-		return null;
+		return list.querySelector(`:scope > .file-row[data-fm-path="${CSS.escape(normalizeFileManagerPath(path))}"]`);
 	}
 
 	function isFileManagerTransferPaneVisible(pane = 'left') {
@@ -69810,20 +70144,39 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 
 	window.runFileManagerTransfer = async function(mode) {
 		const operation = mode === 'move' ? 'move' : 'copy';
-		if (!fileManagerDualPaneEnabled || fileManagerTransferBusy) return false;
+		if (!fileManagerDualPaneEnabled || fileManagerTransferBusy || fileManagerTransferPreparing) return false;
 		const target = getFileManagerTransferTarget();
 		if (!target || target.sourcePath === target.destinationPath || target.recursiveDirectoryTarget === true) return false;
 		const ip = String(document.getElementById('ps3-ip')?.value || '').trim();
 		if (!ip) { alert("Please enter the PS3™ IP address first!"); return false; }
 
 		const verb = operation === 'move' ? 'Move' : 'Copy';
-		if (!(await validateFileManagerTransferSpace(operation, target, ip))) return false;
-		if (!confirm(`${verb} this ${target.isDirectory ? 'folder' : 'file'}?\n\n${target.sourcePath}\n→\n${target.destinationPath}`)) {
-			clearFileManagerSelection();
-			return false;
+		const stillSameTransfer = () => {
+			const current = getFileManagerTransferTarget();
+			return !fileManagerResetPendingOnLibraryExit && fileManagerDualPaneEnabled
+				&& String(document.getElementById('ps3-ip')?.value || '').trim() === ip
+				&& current?.sourcePath === target.sourcePath
+				&& current?.destinationPath === target.destinationPath
+				&& current?.sourcePane === target.sourcePane;
+		};
+		fileManagerTransferPreparing = true;
+		syncFileManagerTransferUi();
+		try {
+			if (!(await validateFileManagerTransferSpace(operation, target, ip)) || !stillSameTransfer()) return false;
+			if (!confirm(`${verb} this ${target.isDirectory ? 'folder' : 'file'}?\n\n${target.sourcePath}\n→\n${target.destinationPath}`)) {
+				clearFileManagerSelection();
+				return false;
+			}
+			if (!stillSameTransfer()) return false;
+		} finally {
+			fileManagerTransferPreparing = false;
+			if (fileManagerResetPendingOnLibraryExit) window.resetFileManagerSessionState({ force:true });
+			else syncFileManagerTransferUi();
 		}
 
 		fileManagerTransferBusy = true;
+		fileManagerTransferActiveIp = ip;
+		fileManagerTransferActiveTarget = target;
 		fileManagerTransferOperation = operation;
 		fileManagerTransferCancelRequested = false;
 		fileManagerTransferCancelPending = false;
@@ -69838,6 +70191,8 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 
 		const finishCancelledCopy = async () => {
 			fileManagerTransferBusy = false;
+			fileManagerTransferActiveIp = '';
+			fileManagerTransferActiveTarget = null;
 			fileManagerTransferOperation = '';
 			fileManagerTransferCancelRequested = false;
 			fileManagerTransferCancelPending = false;
@@ -69845,7 +70200,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 			syncFileManagerTransferUi();
 			if (fileManagerResetPendingOnLibraryExit) {
 				window.resetFileManagerSessionState({ force: true });
-			} else {
+			} else if (String(document.getElementById('ps3-ip')?.value || '').trim() === ip && getFileManagerPanePath(destinationPane) === destinationDirectory) {
 				await explorePath(destinationDirectory, destinationPane, { reveal: false, preserveScroll: true, quiet: true, reuseEquivalentDom: true });
 			}
 			if (typeof showToastNotification === 'function') showToastNotification('File Manager', `Copy cancelled: ${target.name}`);
@@ -69860,6 +70215,8 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 			const transferMotionSource = captureFileManagerTransferSource(target);
 			fileManagerSelection = null;
 			fileManagerTransferBusy = false;
+			fileManagerTransferActiveIp = '';
+			fileManagerTransferActiveTarget = null;
 			fileManagerTransferOperation = '';
 			fileManagerTransferCancelRequested = false;
 			fileManagerTransferCancelPending = false;
@@ -69868,6 +70225,12 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 			syncFileManagerTransferUi();
 			if (fileManagerResetPendingOnLibraryExit) {
 				window.resetFileManagerSessionState({ force: true });
+				if (typeof showToastNotification === 'function') showToastNotification('File Manager', `${verb} complete: ${target.name}`);
+				return true;
+			}
+			// Never repaint the current console with results from another IP or a pane
+			// the user has navigated away from while the webMAN command was running.
+			if (String(document.getElementById('ps3-ip')?.value || '').trim() !== ip || getFileManagerPanePath(destinationPane) !== destinationDirectory) {
 				if (typeof showToastNotification === 'function') showToastNotification('File Manager', `${verb} complete: ${target.name}`);
 				return true;
 			}
@@ -69900,7 +70263,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 
 			if (sourceCollapsePromise) await sourceCollapsePromise;
 
-			if (operation === 'move') {
+			if (operation === 'move' && getFileManagerPanePath(sourcePane) === sourceDirectory) {
 				await explorePath(sourceDirectory, sourcePane, { reveal: false, preserveScroll: true, quiet: true, reuseEquivalentDom: true });
 			}
 			if (typeof showToastNotification === 'function') showToastNotification('File Manager', `${verb} complete: ${target.name}`);
@@ -69909,6 +70272,8 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 			if (operation === 'copy' && fileManagerTransferCancelRequested) return await finishCancelledCopy();
 			console.error(`[File Manager] ${verb} failed:`, error);
 			fileManagerTransferBusy = false;
+			fileManagerTransferActiveIp = '';
+			fileManagerTransferActiveTarget = null;
 			fileManagerTransferOperation = '';
 			fileManagerTransferCancelRequested = false;
 			fileManagerTransferCancelPending = false;
@@ -69922,12 +70287,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 	};
 
 	function animateFileManagerRemovedRow(path, pane = 'left') {
-		const normalizedPath = normalizeFileManagerPath(path);
-		const list = getFileManagerPaneElements(pane === 'right' ? 'right' : 'left').list;
-		if (!list) return Promise.resolve(false);
-		const row = Array.from(list.querySelectorAll('.file-row')).find(candidate =>
-			normalizeFileManagerPath(candidate.dataset.fmPath || '') === normalizedPath
-		);
+		const row = getFileManagerRowByPath(path, pane);
 		if (!row) return Promise.resolve(false);
 		row.classList.remove('anim-reveal', 'fm-context-target', 'fm-selected');
 		row.style.animation = 'none';
@@ -70137,7 +70497,56 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 		return !!token;
 	}
 
-	async function explorePath(path, pane = 'left', options = {}) {
+	// Reconcile only changed rows after file operations; moving every existing row
+	// through a DocumentFragment would detach controls and thumbnails unnecessarily.
+	function reconcileFileManagerPaneRows(list, existingRows, nextRows) {
+		const existingByPath = new Map();
+		for (const row of existingRows) {
+			const path = normalizeFileManagerPath(row.dataset.fmPath || '');
+			if (path && !existingByPath.has(path)) existingByPath.set(path, row);
+		}
+		const retained = new Set();
+		const orderedRows = nextRows.map(nextRow => {
+			const path = normalizeFileManagerPath(nextRow.dataset.fmPath || '');
+			const current = existingByPath.get(path);
+			const unchanged = current && !retained.has(current)
+				&& current.dataset.fmName === nextRow.dataset.fmName
+				&& current.dataset.fmDirectory === nextRow.dataset.fmDirectory
+				&& current.innerHTML === nextRow.innerHTML;
+			const row = unchanged ? current : nextRow;
+			retained.add(row);
+			return row;
+		});
+		// Remove obsolete rows first, so a deleted item never becomes a cursor
+		// that would force every following unchanged row to move.
+		for (const child of Array.from(list.children)) {
+			if (!retained.has(child)) child.remove();
+		}
+		let cursor = list.firstElementChild;
+		for (const row of orderedRows) {
+			if (row === cursor) cursor = cursor.nextElementSibling;
+			else list.insertBefore(row, cursor);
+		}
+	}
+
+	function explorePath(path, pane = 'left', options = {}) {
+		const paneKey = pane === 'right' ? 'right' : 'left';
+		const cleanPath = normalizeFileManagerPath(path);
+		const ip = String(document.getElementById('ps3-ip')?.value || '').trim();
+		const requestState = fileManagerPaneRequests[paneKey];
+		const shareable = !options || Object.keys(options).length === 0;
+		const active = requestState.inFlight;
+		if (shareable && active && active.shareable && active.ip === ip && active.path === cleanPath) return active.promise;
+		const promise = exploreFileManagerPath(cleanPath, paneKey, options);
+		const entry = { ip, path: cleanPath, shareable, promise };
+		requestState.inFlight = entry;
+		promise.finally(() => {
+			if (requestState.inFlight === entry) requestState.inFlight = null;
+		}).catch(() => {});
+		return promise;
+	}
+
+	async function exploreFileManagerPath(path, pane = 'left', options = {}) {
 		const paneKey = pane === 'right' ? 'right' : 'left';
 		path = normalizeFileManagerPath(path);
 		const previousPanePath = getFileManagerPanePath(paneKey);
@@ -70323,7 +70732,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 				}
 				
 				let iconHtml = `<i class="far fa-file file-type"></i>`;
-				if (isImage && !isBmp) iconHtml = `<img src="${fileUrl}" class="file-thumb" onerror="this.onerror=null; this.outerHTML='<i class=\\'far fa-file file-type\\'></i>';">`;
+				if (isImage && !isBmp) iconHtml = `<img src="${fileUrl}" class="file-thumb" loading="lazy" decoding="async" onerror="this.onerror=null; this.outerHTML='<i class=\\'far fa-file file-type\\'></i>';">`;
 				else if (isBmp) iconHtml = `<i class="fas fa-image file-type" style="color: #4caf50;"></i>`;
 				else if (isPkg) iconHtml = `<i class="fas fa-box file-type" style="color: #ff9800;"></i>`;
 				else if (isHtml) iconHtml = `<i class="fas fa-code file-type" style="color: #ff9800;"></i>`;
@@ -70382,22 +70791,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 				&& nextPaths.every((value, index) => value === currentPaths[index]);
 			if (!equivalentRows) {
 				if (options.reconcileRows === true && nextRows.length && currentRows.length) {
-					const currentByPath = new Map();
-					currentRows.forEach(row => {
-						const rowPath = normalizeFileManagerPath(row.dataset.fmPath || '');
-						if (rowPath && !currentByPath.has(rowPath)) currentByPath.set(rowPath, row);
-					});
-					const reconciled = document.createDocumentFragment();
-					nextRows.forEach(nextRow => {
-						const rowPath = normalizeFileManagerPath(nextRow.dataset.fmPath || '');
-						const currentRow = rowPath ? currentByPath.get(rowPath) : null;
-						const canReuse = currentRow
-							&& currentRow.dataset.fmName === nextRow.dataset.fmName
-							&& currentRow.dataset.fmDirectory === nextRow.dataset.fmDirectory
-							&& currentRow.innerHTML === nextRow.innerHTML;
-						reconciled.appendChild(canReuse ? currentRow : nextRow);
-					});
-					listContainer.replaceChildren(reconciled);
+					reconcileFileManagerPaneRows(listContainer, currentRows, nextRows);
 				} else {
 					listContainer.replaceChildren(listFragment);
 				}
@@ -70417,23 +70811,23 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 			}
 
 			if (operationRevealPaths.size) {
-				listContainer.querySelectorAll(':scope > .file-row').forEach(row => {
-					const rowPath = normalizeFileManagerPath(row.dataset.fmPath || '');
-					if (!operationRevealPaths.has(rowPath)) return;
+				for (const rowPath of operationRevealPaths) {
+					const row = getFileManagerRowByPath(rowPath, paneKey);
+					if (!row) continue;
 					row.classList.remove('anim-reveal');
 					row.style.setProperty('--fm-row-idx', '0');
 					if (options.holdRevealPaths === true) {
 						row.classList.add('fm-transfer-arrival-hold');
-						return;
+						continue;
 					}
 					if (options.operationRevealStyle === 'new-folder') {
 						pulseFileManagerOperationRow(rowPath, paneKey, 'new-folder');
-						return;
+						continue;
 					}
 					void row.offsetWidth;
 					row.classList.add('anim-reveal');
 					row.addEventListener('animationend', () => row.classList.remove('anim-reveal'), { once: true });
-				});
+				}
 			}
 			if (options.focusOperationPath) {
 				pulseFileManagerOperationRow(
@@ -70762,23 +71156,45 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 		try { localStorage.setItem(fileManagerPkgStorageKey(fileManagerPkgInstall.ip), JSON.stringify(fileManagerPkgInstall)); } catch (_) {}
 	}
 
+	// Only the installed PKG can change status. Keep its visible rows (one per
+	// pane) instead of traversing every PKG in a large directory on each poll.
+	let fileManagerPkgIndicatorRows = new Set();
+	const fileManagerPkgRowClasses = ['fm-pkg-install-active','fm-pkg-installing','fm-pkg-finished','fm-pkg-review'];
+
 	function renderFileManagerPkgInstall() {
 		const task = fileManagerPkgInstall && fileManagerPkgInstall.ip === fileManagerPkgCurrentIp() ? fileManagerPkgInstall : null;
 		const pending = fileManagerPkgIsPending(task);
 		const names = { checking:'CHECKING', sending:'STARTING', waiting:'WAITING', installing:'INSTALLING', finished:'FINISHED', review:'CHECK PS3' };
-		for (const row of document.querySelectorAll('#fm-online-container .file-row[data-fm-pkg="1"]')) {
-			const match = task && normalizeFileManagerPath(row.dataset.fmPath || '') === task.path;
-			const active = !!match;
-			row.classList.toggle('fm-pkg-install-active', active);
-			row.classList.toggle('fm-pkg-installing', active && task.stage === 'installing');
-			row.classList.toggle('fm-pkg-finished', active && task.stage === 'finished');
-			row.classList.toggle('fm-pkg-review', active && task.stage === 'review');
-			const label = row.querySelector('.fm-pkg-status-label');
-			if (label && active) label.textContent = names[task.stage] || 'WAITING';
+		const visibleRows = new Set();
+		if (task) for (const pane of ['left','right']) {
+			const list = getFileManagerPaneElements(pane).list;
+			let row = null;
+			for (const tracked of fileManagerPkgIndicatorRows) {
+				if (tracked.parentElement === list && tracked.dataset.fmPath === task.path) { row = tracked; break; }
+			}
+			if (!row) row = getFileManagerRowByPath(task.path, pane);
+			if (row?.isConnected && row.dataset.fmPkg === '1' && row.closest('#fm-online-container')) visibleRows.add(row);
 		}
+		for (const row of fileManagerPkgIndicatorRows) {
+			if (row.isConnected && !visibleRows.has(row)) row.classList.remove(...fileManagerPkgRowClasses);
+		}
+		for (const row of visibleRows) {
+			row.classList.add('fm-pkg-install-active');
+			row.classList.toggle('fm-pkg-installing', task.stage === 'installing');
+			row.classList.toggle('fm-pkg-finished', task.stage === 'finished');
+			row.classList.toggle('fm-pkg-review', task.stage === 'review');
+			const label = row.querySelector('.fm-pkg-status-label');
+			const text = names[task.stage] || 'WAITING';
+			if (label && label.textContent !== text) label.textContent = text;
+		}
+		fileManagerPkgIndicatorRows = visibleRows;
 		let pill = document.getElementById('fm-pkg-install-presence');
 		if (!task) {
-			if (pill) { pill.classList.remove('show'); window.psnResetCompactStatusPill?.(pill); }
+			if (pill && pill.classList.contains('show')) {
+				pill.classList.remove('show');
+				delete pill.dataset.fmPkgStatusSignature;
+				window.psnResetCompactStatusPill?.(pill);
+			}
 			return;
 		}
 		if (!pill) {
@@ -70792,8 +71208,11 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 		const labels = { checking:'Checking PS3', sending:'Starting PKG', waiting:'Waiting to install', installing:'Installing', finished:'Installation ended', review:'Check PS3' };
 		const types = { checking:'is-active', sending:'is-active', waiting:'is-waiting', installing:'is-installing', finished:'is-finished', review:'is-review' };
 		const nextType = types[task.stage] || 'is-waiting';
-		pill.classList.remove('is-active','is-waiting','is-installing','is-finished','is-review');
-		pill.classList.add('show',nextType);
+		if (!pill.classList.contains(nextType)) {
+			pill.classList.remove('is-active','is-waiting','is-installing','is-finished','is-review');
+			pill.classList.add(nextType);
+		}
+		pill.classList.add('show');
 		const icon = pill.querySelector('.ps3-queue-presence-icon');
 		const iconClass = 'ps3-queue-presence-icon' + (pending && task.stage !== 'waiting' ? '' : ' fas ' + (task.stage === 'finished' ? 'fa-check' : task.stage === 'review' ? 'fa-exclamation-triangle' : 'fa-clock'));
 		if (icon && icon.className !== iconClass) icon.className = iconClass;
@@ -70802,8 +71221,13 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 		const status = labels[task.stage] || 'Installing';
 		if (title && title.textContent !== status) title.textContent = status;
 		if (detail && detail.textContent !== task.name) detail.textContent = task.name;
-		pill.title = 'File Manager: ' + status + ' — ' + task.name;
-		window.psnUpdateCompactStatusPill?.(pill, status + '|' + task.name);
+		const tooltip = 'File Manager: ' + status + ' — ' + task.name;
+		if (pill.title !== tooltip) pill.title = tooltip;
+		const signature = status + '|' + task.name;
+		if (pill.dataset.fmPkgStatusSignature !== signature) {
+			pill.dataset.fmPkgStatusSignature = signature;
+			window.psnUpdateCompactStatusPill?.(pill, signature);
+		}
 	}
 
 	function clearFileManagerPkgInstall(task) {
@@ -71372,6 +71796,31 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 		}
 	}
 	
+	let pendingTrophyUnlockVisualRefresh = false;
+	let trophyUnlockVisualOwner = '';
+	let trophyUnlockVisualToken = 0;
+	function scheduleTrophyUnlockVisualRefresh() {
+		const owner = String(localStorage.getItem('psn_username') || '');
+		if (pendingTrophyUnlockVisualRefresh && trophyUnlockVisualOwner === owner) return;
+		pendingTrophyUnlockVisualRefresh = true;
+		trophyUnlockVisualOwner = owner;
+		const token = ++trophyUnlockVisualToken;
+		const flush = () => {
+			if (!pendingTrophyUnlockVisualRefresh || token !== trophyUnlockVisualToken) return;
+			pendingTrophyUnlockVisualRefresh = false;
+			if (String(localStorage.getItem('psn_username') || '') !== owner) return;
+			if (typeof window.refreshTrophiesWithMotion === 'function') window.refreshTrophiesWithMotion({ revealNew:false });
+			if (typeof checkPlatinum === 'function') checkPlatinum();
+		};
+		// requestAnimationFrame pauses in hidden tabs. Platinum and reward checks must
+		// still complete even if the user backgrounds the site after unlocking.
+		if (document.hidden) setTimeout(flush, 32);
+		else {
+			requestAnimationFrame(flush);
+			setTimeout(flush, 80);
+		}
+	}
+
 	window.checkTrophyProgress = function(trophyId, currentAmount) {
 		if (!localStorage.getItem('psn_username') || localStorage.getItem('psn_username') === "null" || !window.userTrophies || window.__trophiesHydrated !== true) return;
 		const trophy = TROPHY_DATA[trophyId];
@@ -71381,11 +71830,13 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 			return; 
 		}
 		
-		if (!window.userTrophies[trophyId]) {
-			window.userTrophies[trophyId] = { unlocked: false, progress: 0, isNew: false };
-		}
-		
-		window.userTrophies[trophyId].progress = Math.min(currentAmount, trophy.max);
+		const priorProgress = window.userTrophies[trophyId];
+		const nextProgress = Math.min(currentAmount, trophy.max);
+		// Pollers can report the same progress many times. Avoid reserializing the
+		// entire trophy state when neither the progress nor unlock status changes.
+		if (priorProgress && Object.is(priorProgress.progress, nextProgress) && !(nextProgress >= trophy.max)) return;
+		if (!priorProgress) window.userTrophies[trophyId] = { unlocked: false, progress: 0, isNew: false };
+		window.userTrophies[trophyId].progress = nextProgress;
 		
 		if (window.userTrophies[trophyId].progress >= trophy.max) {
 			window.userTrophies[trophyId].unlocked = true;
@@ -71417,7 +71868,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 
 				if (typeof showTrophyPopup === 'function') showTrophyPopup(trophy, trophyId);
 				
-				if (typeof window.refreshTrophiesWithMotion === 'function') window.refreshTrophiesWithMotion({ revealNew:false }); 
+				scheduleTrophyUnlockVisualRefresh();
 				
 				saveState('psn_last_trophy_color', TROPHY_COLORS[trophy.type]);
 				
@@ -71430,7 +71881,6 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 					}
 				}
 				
-				if (typeof checkPlatinum === 'function') checkPlatinum();
 			}, 800);
 			
 		} else {
@@ -71943,10 +72393,11 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 			else result = aMeta.groupWeight !== bMeta.groupWeight ? aMeta.groupWeight - bMeta.groupWeight : aMeta.gradeWeight - bMeta.gradeWeight;
 			return result * sortMultiplier;
 		});
+		// renderSignature already includes trophies, rarity, filters and order.
+		// Reuse it instead of serializing both full state objects a second time.
 		const trophyVisibleSignature = getProgressiveGridSignature([
 			sortedIds.join('|'),
-			JSON.stringify(window.userTrophies || {}),
-			JSON.stringify(window.globalTrophyStats || {}),
+			renderSignature,
 			psnGetRewardDefinitionSignature()
 		]);
 		if (!options.force && !trophyWasDirty && grid.dataset.rendered === '1' &&
@@ -72341,11 +72792,13 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 		const matching = (window.REWARDS_DATA || []).filter(reward => reward && ids.has(reward.req));
 		if (!matching.length) return;
 		const stored = getPsnRewardNotices();
+		const knownIds = new Set(stored.map(item => item.id));
 		let changed = false;
 		const added = [];
 		for (const reward of matching) {
 			const id = 'reward:' + String(reward.id || '').replace(/[^a-zA-Z0-9_-]/g, '');
-			if (id === 'reward:' || stored.some(item => item.id === id)) continue;
+			if (id === 'reward:' || knownIds.has(id)) continue;
+			knownIds.add(id);
 			const visiting = psnIsViewVisible('view-rewards');
 			const notificationsVisible = typeof window.isNotificationCenterVisible === 'function' && window.isNotificationCenterVisible() &&
 				(typeof isUserNotificationSurfaceActuallyVisible !== 'function' || isUserNotificationSurfaceActuallyVisible());
@@ -72409,6 +72862,15 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 	if (typeof window.refreshTrophyRewardSidebarCounts === 'function') window.refreshTrophyRewardSidebarCounts();
 	
 
+	function psnRewardCardStateSignature(reward) {
+		const trophy = typeof TROPHY_DATA !== 'undefined' ? TROPHY_DATA[reward.req] : null;
+		const state = window.userTrophies && window.userTrophies[reward.req] || {};
+		return JSON.stringify([
+			state.unlocked === true, Number(state.progress) || 0,
+			trophy && trophy.max, trophy && trophy.title, trophy && trophy.type
+		]);
+	}
+
 	let rewardsRevealPrepToken = 0;
 	function replayRewardsEntryAnimation() {
 		const rewardsView = document.getElementById('view-rewards');
@@ -72462,15 +72924,29 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 			if (aKind === bKind) return 0;
 			return aKind === 'avatar' ? -1 : 1;
 		});
+		const definitionSignature = psnGetRewardDefinitionSignature();
+		const previousCards = Array.from(grid.querySelectorAll(':scope > .reward-card'));
+		const previousStates = grid.__psnRewardCardStates;
+		const canReuseCards = !options.force && grid.dataset.rendered === '1' &&
+			grid.__psnRewardDefinitionSignature === definitionSignature && previousStates instanceof Map &&
+			previousCards.length === groupedRewards.length &&
+			groupedRewards.every((reward, index) => previousCards[index].id === 'reward-card-' + reward.id);
+		const nextStates = new Map();
 		let currentRewardGroup = '';
 		
 		groupedRewards.forEach((reward, index) => {
+			const rewardId = String(reward.id);
+			const nextState = psnRewardCardStateSignature(reward);
+			nextStates.set(rewardId, nextState);
 			const rewardKindForGroup = reward.kind || 'avatar';
 			if (rewardKindForGroup !== currentRewardGroup) {
 				currentRewardGroup = rewardKindForGroup;
-				const isBannerGroup = currentRewardGroup === 'banner';
-				html += `<div class="reward-group-title"><i class="fas ${isBannerGroup ? 'fa-panorama' : 'fa-user-circle'}"></i> ${isBannerGroup ? 'Profile Banner Rewards' : 'Avatar Rewards'} <span>${isBannerGroup ? 'Exclusive profile banners' : 'Exclusive profile avatars'}</span></div>`;
+				if (!canReuseCards) {
+					const isBannerGroup = currentRewardGroup === 'banner';
+					html += `<div class="reward-group-title"><i class="fas ${isBannerGroup ? 'fa-panorama' : 'fa-user-circle'}"></i> ${isBannerGroup ? 'Profile Banner Rewards' : 'Avatar Rewards'} <span>${isBannerGroup ? 'Exclusive profile banners' : 'Exclusive profile avatars'}</span></div>`;
+				}
 			}
+			if (canReuseCards && previousStates.get(rewardId) === nextState) return;
 			const trophy = typeof TROPHY_DATA !== 'undefined' ? TROPHY_DATA[reward.req] : null;
 			const state = (window.userTrophies && window.userTrophies[reward.req]) ? window.userTrophies[reward.req] : { unlocked: false, progress: 0 };
 			const isUnlocked = state.unlocked;
@@ -72521,7 +72997,27 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 			`;
 		});
 	
-		grid.innerHTML = html;
+		if (canReuseCards) {
+			if (html) {
+				const template = document.createElement('template');
+				template.innerHTML = html;
+				const changedCards = Array.from(template.content.children);
+				const existingById = new Map(previousCards.map(card => [card.id, card]));
+				for (const nextCard of changedCards) {
+					const prior = existingById.get(nextCard.id);
+					if (!prior) continue;
+					const focused = prior.contains(document.activeElement) ? document.activeElement : null;
+					const focusClass = focused && focused.closest('.reward-status-link') ? '.reward-status-link' : '.reward-apply-btn, .reward-locked-btn';
+					prior.replaceWith(nextCard);
+					if (focused) {
+						const target = nextCard.querySelector(focusClass);
+						if (target && typeof target.focus === 'function') target.focus({ preventScroll:true });
+					}
+				}
+			}
+		} else grid.innerHTML = html;
+		grid.__psnRewardCardStates = nextStates;
+		grid.__psnRewardDefinitionSignature = definitionSignature;
 		grid.dataset.rendered = '1';
 		
 		if (options.replayEntry !== false) replayRewardsEntryAnimation();
@@ -81055,11 +81551,16 @@ function getVisibleChatStackEl(id) {
 		}
 	}
 	
-	let cachedTrendingGifs = null;
+    let cachedTrendingGifs = null;
+    let gifPickerRequestController = null;
+    let gifPickerRequestVersion = 0;
 	
 	async function fetchGiphyGifs(query) {
 		const grid = document.getElementById('gif-results-grid');
 		if (!grid) return;
+        const version = ++gifPickerRequestVersion;
+        if (gifPickerRequestController) gifPickerRequestController.abort();
+        gifPickerRequestController = null;
 	
 		if (!query && cachedTrendingGifs) {
 			grid.innerHTML = cachedTrendingGifs;
@@ -81072,9 +81573,12 @@ function getVisibleChatStackEl(id) {
 			? `https://api.giphy.com/v1/gifs/search?api_key=${GIPHY_API_KEY}&q=${encodeURIComponent(query)}&limit=20&rating=g`
 			: `https://api.giphy.com/v1/gifs/trending?api_key=${GIPHY_API_KEY}&limit=20&rating=g`;
 	
+        const controller = new AbortController();
+        gifPickerRequestController = controller;
 		try {
-			const response = await fetch(url);
+			const response = await fetch(url, { signal: controller.signal });
 			const json = await response.json();
+            if (version !== gifPickerRequestVersion || controller.signal.aborted || !grid.isConnected) return;
 	
 			if (json.data && json.data.length > 0) {
 				const htmlFormatado = json.data.map(gif => {
@@ -81094,9 +81598,12 @@ function getVisibleChatStackEl(id) {
 				grid.innerHTML = '<div style="grid-column: 1/-1; text-align: center; font-size: 11px; color: #888; padding: 20px;">No GIFs found.</div>';
 			}
 		} catch (err) {
+            if (version !== gifPickerRequestVersion || controller.signal.aborted) return;
 			console.error("GIPHY API Error:", err);
 			grid.innerHTML = '<div style="grid-column: 1/-1; text-align: center; font-size: 11px; color: #ff4444; padding: 20px;"><i class="fas fa-exclamation-triangle"></i> Failed to load GIFs.</div>';
-		}
+		} finally {
+            if (gifPickerRequestController === controller) gifPickerRequestController = null;
+        }
 	}
 	
 	function sendChatGif(gifUrl) {
@@ -83551,11 +84058,12 @@ function getVisibleChatStackEl(id) {
 		return roots.length ? roots : [document];
 	};
 
-	window.refreshVisibleWishlistCardsFromProfileSync = function() {
+	window.refreshVisibleWishlistCardsFromProfileSync = function(sharedRoots = null) {
 		try {
 			const seenCards = new Set();
+			let fallbackGroupIndex = null;
 
-			window.getProfileSyncVisibleCardRoots().forEach(root => {
+			(sharedRoots || window.getProfileSyncVisibleCardRoots()).forEach(root => {
 				root.querySelectorAll('.game-card[data-title-id], .game-card[data-group-title-key]').forEach(card => {
 					if (seenCards.has(card)) return;
 					seenCards.add(card);
@@ -83570,11 +84078,22 @@ function getVisibleChatStackEl(id) {
 						let groupKey = encodedGroupKey;
 						try { groupKey = decodeURIComponent(encodedGroupKey); } catch (err) {}
 						const indexedGroup = browseGroupedItemsIndex.get(groupKey);
-						const groupItems = indexedGroup && indexedGroup.version === browseFilteredDataVersion && Array.isArray(indexedGroup.items)
-							? indexedGroup.items
-							: (Array.isArray(filteredData) ? filteredData : [])
-								.map((game, sourceIndex) => ({ game, sourceIndex }))
-								.filter(item => getBrowseGroupTitleKey(item.game) === groupKey);
+						let groupItems;
+						if (indexedGroup && indexedGroup.version === browseFilteredDataVersion && Array.isArray(indexedGroup.items)) {
+							groupItems = indexedGroup.items;
+						} else {
+							// A stale browse index used to scan the entire Store for every visible grouped card.
+							// Build the fallback once per refresh and preserve each item's source index.
+							if (!fallbackGroupIndex) {
+								fallbackGroupIndex = new Map();
+								(Array.isArray(filteredData) ? filteredData : []).forEach((game, sourceIndex) => {
+									const key = getBrowseGroupTitleKey(game);
+									if (!fallbackGroupIndex.has(key)) fallbackGroupIndex.set(key, []);
+									fallbackGroupIndex.get(key).push({ game, sourceIndex });
+								});
+							}
+							groupItems = fallbackGroupIndex.get(groupKey) || [];
+						}
 						isWished = groupItems.some(item => window.isWishlistItemSaved(item.game || item, category));
 					} else {
 						isWished = window.isWishlistItemSaved({ id: titleId, titleId, contentId, category }, category);
@@ -83625,13 +84144,13 @@ function getVisibleChatStackEl(id) {
 		}
 	};
 
-	window.refreshVisibleFavoriteCardsFromProfileSync = function() {
+	window.refreshVisibleFavoriteCardsFromProfileSync = function(sharedRoots = null) {
 		try {
 			const favoriteKeys = window.makeProfileSyncKeySet(window.favoritesLibrary || [], 'favorites', true);
 			const browseFavoriteHighlightActive = typeof isPs3CurrentlyConnected === 'function' && isPs3CurrentlyConnected();
 			const seenCards = new Set();
 
-			window.getProfileSyncVisibleCardRoots().forEach(root => {
+			(sharedRoots || window.getProfileSyncVisibleCardRoots()).forEach(root => {
 				root.querySelectorAll('#ps3-local-grid .game-card, .game-card').forEach(card => {
 					if (seenCards.has(card)) return;
 					seenCards.add(card);
@@ -83668,6 +84187,8 @@ function getVisibleChatStackEl(id) {
 		const changes = profileSyncChanges || (typeof window.getRemoteProfileSyncChanges === 'function' ? window.getRemoteProfileSyncChanges(userData, previousState) : { wishlist: true, favorites: true });
 		const peerRealtime = syncContext && syncContext.peerRealtime === true;
 		const handled = { wishlist: false, downloads: false, favorites: false };
+		// A combined wishlist/favorites packet needs the same visible card roots twice.
+		const sharedCardRoots = changes.wishlist && changes.favorites ? window.getProfileSyncVisibleCardRoots() : null;
 
 		if (changes.wishlist) {
 			const wishlistVisible = isPsnDomSectionVisible('view-wishlist');
@@ -83704,7 +84225,7 @@ function getVisibleChatStackEl(id) {
 				}
 			}
 
-			if (typeof window.refreshVisibleWishlistCardsFromProfileSync === 'function') window.refreshVisibleWishlistCardsFromProfileSync();
+			if (typeof window.refreshVisibleWishlistCardsFromProfileSync === 'function') window.refreshVisibleWishlistCardsFromProfileSync(sharedCardRoots);
 			if (typeof window.refreshGameModalWishlistButtonFromProfileSync === 'function') window.refreshGameModalWishlistButtonFromProfileSync();
 		}
 
@@ -83810,7 +84331,7 @@ function getVisibleChatStackEl(id) {
 				}
 			}
 
-			if (typeof window.refreshVisibleFavoriteCardsFromProfileSync === 'function') window.refreshVisibleFavoriteCardsFromProfileSync();
+			if (typeof window.refreshVisibleFavoriteCardsFromProfileSync === 'function') window.refreshVisibleFavoriteCardsFromProfileSync(sharedCardRoots);
 		}
 		if ((changes.wishlist || changes.downloads || changes.favorites || changes.trophies) && typeof window.applyProfileSyncNotificationDots === 'function') window.applyProfileSyncNotificationDots(previousState, userData);
 		return handled;
@@ -84070,7 +84591,9 @@ function getVisibleChatStackEl(id) {
 			}
 
 			if (userData.countersData && typeof window.mergeIncomingTrophyCountersForUser === 'function') window.mergeIncomingTrophyCountersForUser(name, userData.countersData);
-			if (typeof window.scheduleDeterministicTrophyReconciliation === 'function') window.scheduleDeterministicTrophyReconciliation(0);
+			// Pure settings/avatar packets cannot affect deterministic trophy progress.
+			// Keep the reconciliation for relevant collections, trophy counters and hydration.
+			if ((profileSyncChanges.anyList || userData.countersData || window.__pendingTrophyCounterSyncAfterHydration === true || window.__initialProfileSyncInProgress === true) && typeof window.scheduleDeterministicTrophyReconciliation === 'function') window.scheduleDeterministicTrophyReconciliation(0);
 
 
 			if (!userData.settingsData) {
@@ -84160,9 +84683,11 @@ function getVisibleChatStackEl(id) {
 				if (typeof window.friendActivityFriendsChanged === 'function') window.friendActivityFriendsChanged();
 			}
 			if ((window.__initialProfileSyncInProgress === true || profileRoleVisualChanged) && typeof updateAdminVisibility === 'function') updateAdminVisibility();
+			// The summary helpers already refresh their category dots. Only use the
+			// direct fallback when a summary helper is unavailable.
 			if (typeof window.refreshCategoryDot === 'function') {
-				if (profileSyncChanges.wishlist) window.refreshCategoryDot('wishlist');
-				if (profileSyncChanges.favorites) window.refreshCategoryDot('favorites');
+				if (profileSyncChanges.wishlist && typeof window.refreshWishlistSummaryUI !== 'function') window.refreshCategoryDot('wishlist');
+				if (profileSyncChanges.favorites && typeof window.refreshFavoritesSummaryUI !== 'function') window.refreshCategoryDot('favorites');
 			}
 			if (profileSyncChanges.wishlist && (wishlistGridRefreshedAfterSync || typeof window.refreshProfileSyncVisibleUI !== 'function') && typeof window.refreshVisibleWishlistCardsFromProfileSync === 'function') window.refreshVisibleWishlistCardsFromProfileSync();
 			if (profileSyncChanges.favorites && (favoritesGridRefreshedAfterSync || typeof window.refreshProfileSyncVisibleUI !== 'function') && typeof window.refreshVisibleFavoriteCardsFromProfileSync === 'function') window.refreshVisibleFavoriteCardsFromProfileSync();
@@ -85553,6 +86078,14 @@ function getVisibleChatStackEl(id) {
       window.refreshDirectGroupList({afterCurrent:true});
     },wait);
   }
+  let directGroupSummaryRenderFrame=0;
+  function scheduleDirectGroupSummaryRender(){
+    if(directGroupSummaryRenderFrame)return;
+    directGroupSummaryRenderFrame=requestAnimationFrame(()=>{
+      directGroupSummaryRenderFrame=0;
+      renderDirectGroupList();
+    });
+  }
   function applyDirectGroupSummaryEvent(payload){
     const s=window.__directGroupState,groupId=String(payload?.groupId||'');
     const group=s.groups.find(item=>String(item.id)===groupId);
@@ -85584,7 +86117,7 @@ function getVisibleChatStackEl(id) {
       group.lastMessage=null;
       changed=true;
     }
-    if(changed)renderDirectGroupList();
+    if(changed)scheduleDirectGroupSummaryRender();
   }
   function directGroupEventNeedsListRefresh(payload,groups){
     const group=(groups||[]).find(item=>String(item.id)===String(payload?.groupId||''));
@@ -86092,11 +86625,13 @@ function getVisibleChatStackEl(id) {
         }
       }
       const summary=s.groups.find(g=>String(g.id)===groupId);
+      let listChanged=false;
       if(summary&&reader===directGroupMyName()&&Number(summary.unread)>0){
-        if(Number(summary.lastMessage?.id||0)<=lastId){summary.unread=0;renderDirectGroupList();}
+        if(Number(summary.lastMessage?.id||0)<=lastId){summary.unread=0;listChanged=true;}
       }
       const last=summary?.lastMessage;
-      if(last&&Number(last.id)<=lastId&&Array.isArray(last.readBy)&&Array.isArray(last.recipients)&&last.recipients.includes(reader)&&!last.readBy.includes(reader)){last.readBy.push(reader);renderDirectGroupList();}
+      if(last&&Number(last.id)<=lastId&&Array.isArray(last.readBy)&&Array.isArray(last.recipients)&&last.recipients.includes(reader)&&!last.readBy.includes(reader)){last.readBy.push(reader);listChanged=true;}
+      if(listChanged)scheduleDirectGroupSummaryRender();
     });
     const scheduleAuthenticatedGroupPrefetch=()=>{
       const run=()=>{
@@ -87557,6 +88092,66 @@ function getVisibleChatStackEl(id) {
 		return { signature:JSON.stringify(parts), avatarByPeer, dynamicPreview };
 	}
 
+	function patchDirectConversationRow(row, replacement) {
+		if (!row || !replacement || row.children.length !== replacement.children.length) return false;
+		const retained = ['is-removing', 'direct-context-target'].filter(name => row.classList.contains(name));
+		row.className = replacement.className;
+		for (const name of retained) row.classList.add(name);
+		// Keep avatars and their live presence dots mounted while the preview/count changes.
+		const avatar = row.querySelector(':scope > .direct-conversation-avatar-wrap');
+		const nextAvatar = replacement.querySelector(':scope > .direct-conversation-avatar-wrap');
+		if (avatar && nextAvatar) {
+			const image = avatar.querySelector('img');
+			const nextImage = nextAvatar.querySelector('img');
+			if (image && nextImage && image.getAttribute('src') !== nextImage.getAttribute('src')) image.setAttribute('src', nextImage.getAttribute('src'));
+			const dot = avatar.querySelector('.psn-avatar-presence-dot');
+			const nextDot = nextAvatar.querySelector('.psn-avatar-presence-dot');
+			if (dot && nextDot && dot.className !== nextDot.className) dot.className = nextDot.className;
+		}
+		for (const selector of [':scope > .direct-conversation-main', ':scope > .direct-conversation-side']) {
+			const current = row.querySelector(selector), fresh = replacement.querySelector(selector);
+			if (!current || !fresh) return false;
+			if (current.innerHTML !== fresh.innerHTML) current.innerHTML = fresh.innerHTML;
+		}
+		return true;
+	}
+
+	function reconcileDirectConversationRows(list, conversations, markup) {
+		const existing = Array.from(list.children);
+		if (!existing.length || existing.some(row => !row.classList.contains('direct-conversation-item'))) return false;
+		const keys = conversations.map(entry => entry.type === 'group'
+			? `group:${String(entry.item.id || '')}`
+			: `peer:${encodeURIComponent(String(entry.item.peer || '')).replace(/'/g, '%27')}`);
+		if (new Set(keys).size !== keys.length) return false;
+		const byKey = new Map();
+		for (const row of existing) {
+			const key = row.hasAttribute('data-direct-group') ? `group:${row.dataset.directGroup}` :
+				row.hasAttribute('data-direct-peer') ? `peer:${row.dataset.directPeer}` : '';
+			if (!key || byKey.has(key)) return false;
+			byKey.set(key, row);
+		}
+		const template = document.createElement('template');
+		const desired = [];
+		for (let index = 0; index < keys.length; index++) {
+			let row = byKey.get(keys[index]);
+			if (!row || row.__directConversationMarkup !== markup[index]) {
+				template.innerHTML = markup[index];
+				const replacement = template.content.firstElementChild;
+				if (!replacement) return false;
+				if (!row) row = replacement;
+				else if (!patchDirectConversationRow(row, replacement)) row = replacement;
+				row.__directConversationMarkup = markup[index];
+			}
+			desired.push(row);
+		}
+		const keep = new Set(desired);
+		for (let index = 0; index < desired.length; index++) {
+			if (list.children[index] !== desired[index]) list.insertBefore(desired[index], list.children[index] || null);
+		}
+		for (const row of existing) if (!keep.has(row) && row.parentElement === list) row.remove();
+		return true;
+	}
+
 	function renderDirectConversations() {
 		const list = document.getElementById('direct-conversations-list');
 		if (!list) return;
@@ -87609,7 +88204,7 @@ function getVisibleChatStackEl(id) {
 			...conversations.map(item => ({type:'peer',item,time:Date.parse(item?.lastMessage?.createdAt || item?.createdAt || '') || 0})),
 			...groups.map(item => ({type:'group',item,time:Date.parse(item?.lastMessage?.createdAt || item?.createdAt || '') || 0}))
 		].sort((a,b) => b.time - a.time || String(a.item.peer || a.item.id || '').localeCompare(String(b.item.peer || b.item.id || '')));
-		const html = allConversations.map(entry => {
+		const rowMarkup = allConversations.map(entry => {
 			if (entry.type === 'group') return directGroupConversationHtml(entry.item);
 			const item = entry.item;
 			const peer = String(item.peer || '');
@@ -87628,11 +88223,15 @@ function getVisibleChatStackEl(id) {
 				<div class="direct-conversation-main"><div class="direct-conversation-name-row"><span class="direct-conversation-name" data-no-translate="true" translate="no">${directEscapeHtml(peer)}</span></div><div class="direct-conversation-preview" data-no-translate="true" translate="no">${delivery}<span class="direct-conversation-preview-text">${directEscapeHtml(preview || 'Conversation')}</span></div></div>
 				<div class="direct-conversation-side"><span class="direct-conversation-time">${directEscapeHtml(directFormatConversationTime(last.createdAt))}</span>${unread ? `<span class="direct-unread-badge">${unread > 99 ? '99+' : unread}</span>` : ''}</div>
 			</button>`;
-		}).join('');
+		});
+		const html = rowMarkup.join('');
 		list.__directConversationViewSignature = renderView.signature;
 		if (list.__directRenderedMarkup === html && list.children.length === allConversations.length && list.firstElementChild?.classList.contains('direct-conversation-item')) return;
 		const previousScrollTop = list.scrollTop;
-		list.innerHTML = html;
+		if (!reconcileDirectConversationRows(list, allConversations, rowMarkup)) {
+			list.innerHTML = html;
+			Array.from(list.children).forEach((row, index) => { row.__directConversationMarkup = rowMarkup[index]; });
+		}
 		list.__directRenderedMarkup = html;
 		if (previousScrollTop) list.scrollTop = previousScrollTop;
 	}
@@ -88033,11 +88632,11 @@ function getVisibleChatStackEl(id) {
 		const statusEl = document.getElementById('direct-thread-status');
 		if (presenceEl) { presenceEl.classList.toggle('online', peerInfo.online === true); presenceEl.classList.remove('connecting'); if (presenceEl.getAttribute('data-user') !== peerName) presenceEl.setAttribute('data-user', peerName); }
 		if (statusEl) {
-			if (peerInfo.online === true) statusEl.textContent = 'Online';
-			else {
+			const label = peerInfo.online === true ? 'Online' : (() => {
 				const stamp = directLastSeenStamp(peerInfo.lastSeen);
-				statusEl.textContent = stamp && typeof formatLastSeen === 'function' ? `Last seen ${formatLastSeen(stamp)}` : 'Offline';
-			}
+				return stamp && typeof formatLastSeen === 'function' ? `Last seen ${formatLastSeen(stamp)}` : 'Offline';
+			})();
+			if (statusEl.textContent !== label) statusEl.textContent = label;
 		}
 	}
 
@@ -88054,6 +88653,7 @@ function getVisibleChatStackEl(id) {
 		const nextLastSeen = data.lastSeen || cachedLastSeen || (online ? '' : Date.now());
 		const nextAvatar = data.avatar ? directResolveAvatar(name, data.avatar) : '';
 		let changed = false;
+		const wasOnline = conversation && conversation.online === true;
 
 		if (conversation) {
 			if (conversation.online !== online) { conversation.online = online; changed = true; }
@@ -88062,7 +88662,7 @@ function getVisibleChatStackEl(id) {
 			if (changed) {
 				state.conversationSignature = directConversationSignature(state.conversations);
 				patchDirectConversationPresenceDom(name, conversation);
-				updateDirectConversationOnlineCount();
+				if (wasOnline !== online) updateDirectConversationOnlineCount();
 			}
 		}
 
@@ -91792,8 +92392,8 @@ function getVisibleChatStackEl(id) {
 		
 			if (deferChatPresenceUi) {
 				if (typeof scheduleChatPresenceUiRefresh === 'function') {
-					if (onlineSnapshotChanged && changedPresenceNames.size && changedPresenceNames.size <= 12) scheduleChatPresenceUiRefresh(changedPresenceNames);
-					else scheduleChatPresenceUiRefresh();
+					if (onlineSnapshotChanged && changedPresenceNames.size <= 12) scheduleChatPresenceUiRefresh(changedPresenceNames);
+					else if (onlineSnapshotChanged || !window.__pendingChatPresenceUiRefresh) scheduleChatPresenceUiRefresh();
 				}
 			} else if (onlineSnapshotChanged && typeof applyChatPresenceUiRefresh === 'function') {
 				applyChatPresenceUiRefresh(users, changedPresenceNames);
@@ -93005,6 +93605,81 @@ function getVisibleChatStackEl(id) {
 			return true;
 		};
 
+		// Socket bursts may update both histories many times in one frame. Persist the
+		// latest state once; badges, notifications and visible rows stay synchronous.
+		const realtimeFeedCacheWrites = new Map();
+		const realtimeFeedPersistedSnapshots = new Map();
+		const realtimeFeedPersistedDots = new Map();
+		function persistRealtimeFeedDot(key, enabled) {
+			const owner = String(localStorage.getItem('psn_username') || '').trim();
+			const cacheId = `${owner}:${key}`;
+			const value = enabled ? 'true' : 'false';
+			if (realtimeFeedPersistedDots.get(cacheId) === value) return;
+			try {
+				if (loadState(key) !== value) saveState(key, value);
+				if (loadState(key) === value) realtimeFeedPersistedDots.set(cacheId, value);
+			} catch (err) { realtimeFeedPersistedDots.delete(cacheId); }
+			while (realtimeFeedPersistedDots.size > 4) realtimeFeedPersistedDots.delete(realtimeFeedPersistedDots.keys().next().value);
+		}
+		window.persistRealtimeFeedDot = persistRealtimeFeedDot;
+		let realtimeFeedCacheFrame = 0;
+		let realtimeFeedCacheTimer = 0;
+		function persistRealtimeFeedSnapshot(kind, key, data) {
+			const owner = String(localStorage.getItem('psn_username') || '').trim();
+			if (!owner) return;
+			const signature = JSON.stringify(data);
+			const cacheId = `${owner}:${kind}`;
+			if (realtimeFeedPersistedSnapshots.get(cacheId) === signature) return;
+			const payload = JSON.stringify({ ...data, cachedAt:Date.now() });
+			try {
+				saveState(key, payload);
+				if (loadState(key) === payload) realtimeFeedPersistedSnapshots.set(cacheId, signature);
+				else realtimeFeedPersistedSnapshots.delete(cacheId);
+			} catch (err) { realtimeFeedPersistedSnapshots.delete(cacheId); }
+			while (realtimeFeedPersistedSnapshots.size > 2) realtimeFeedPersistedSnapshots.delete(realtimeFeedPersistedSnapshots.keys().next().value);
+		}
+		function flushRealtimeFeedCacheWrites() {
+			if (realtimeFeedCacheFrame) cancelAnimationFrame(realtimeFeedCacheFrame);
+			if (realtimeFeedCacheTimer) clearTimeout(realtimeFeedCacheTimer);
+			realtimeFeedCacheFrame = realtimeFeedCacheTimer = 0;
+			if (!realtimeFeedCacheWrites.size) return;
+			const owner = String(localStorage.getItem('psn_username') || '').trim();
+			const scheduled = Array.from(realtimeFeedCacheWrites);
+			realtimeFeedCacheWrites.clear();
+			for (const [kind, requestedOwner] of scheduled) {
+				if (!owner || owner !== requestedOwner) continue;
+				const writer = kind === 'activity' ? window.persistFriendActivityCache : window.persistUserNotificationCache;
+				if (typeof writer === 'function') writer();
+			}
+		}
+		function scheduleRealtimeFeedCacheWrite(kind) {
+			const owner = String(localStorage.getItem('psn_username') || '').trim();
+			if (!owner) return;
+			realtimeFeedCacheWrites.set(kind, owner);
+			if (realtimeFeedCacheFrame || realtimeFeedCacheTimer) return;
+			if (document.hidden || typeof requestAnimationFrame !== 'function')
+				realtimeFeedCacheTimer = setTimeout(flushRealtimeFeedCacheWrites, 0);
+			else realtimeFeedCacheFrame = requestAnimationFrame(flushRealtimeFeedCacheWrites);
+		}
+		window.scheduleRealtimeFeedCacheWrite = scheduleRealtimeFeedCacheWrite;
+		window.flushRealtimeFeedCacheWrites = flushRealtimeFeedCacheWrites;
+		window.addEventListener('storage', event => {
+			const key = String(event.key || '');
+			if (!key) { realtimeFeedPersistedDots.clear(); realtimeFeedPersistedSnapshots.clear(); return; }
+			if (key.endsWith('_psn_friend_activity_dot') || key.endsWith('_psn_notifications_dot')) realtimeFeedPersistedDots.clear();
+			// A newer snapshot written by another tab should not be overwritten by this
+			// tab's unchanged in-memory copy. Only reset the signature on removal.
+			if (event.newValue === null && key.endsWith('_psn_friend_activity_cache_v1')) {
+				for (const cacheId of realtimeFeedPersistedSnapshots.keys()) if (cacheId.endsWith(':activity')) realtimeFeedPersistedSnapshots.delete(cacheId);
+			} else if (event.newValue === null && key.endsWith('_psn_notification_center_cache_v1')) {
+				for (const cacheId of realtimeFeedPersistedSnapshots.keys()) if (cacheId.endsWith(':notifications')) realtimeFeedPersistedSnapshots.delete(cacheId);
+			}
+		});
+		window.addEventListener('pagehide', flushRealtimeFeedCacheWrites);
+		document.addEventListener('visibilitychange', () => {
+			if (document.hidden) flushRealtimeFeedCacheWrites();
+		});
+
 		socketChat.on('friend_activity_event', function(rawEvent = {}) {
 			try {
 				const item = normalizeFriendActivityItem(rawEvent);
@@ -93031,7 +93706,11 @@ function getVisibleChatStackEl(id) {
 				if (!changed) return;
 				if (typeof window.isFriendActivityVisible === 'function' && window.isFriendActivityVisible()) {
 					const matchesVisibleFilter = typeof friendActivityMatchesFilter === 'function' ? friendActivityMatchesFilter(item) : true;
-					if (result && result.requiresFullDomSync) {
+					if (result && result.repeatOnly && matchesVisibleFilter) {
+						if (typeof window.applyFriendActivityRepeatOnlyDom === 'function') window.applyFriendActivityRepeatOnlyDom(result.authoritativeItem, result.previousRepeatCount);
+						if (typeof updateFriendActivityChrome === 'function') updateFriendActivityChrome();
+						if (typeof window.refreshFriendActivityIndicators === 'function') window.refreshFriendActivityIndicators();
+					} else if (result && result.requiresFullDomSync) {
 						if (typeof window.renderFriendActivity === 'function') window.renderFriendActivity(true);
 					} else if ((!result || result.incomingVisible !== false) && matchesVisibleFilter && typeof window.applyFriendActivityRealtimeDom === 'function') {
 						window.applyFriendActivityRealtimeDom(item, true);
@@ -93043,7 +93722,7 @@ function getVisibleChatStackEl(id) {
 				} else if (typeof window.refreshFriendActivityIndicators === 'function') {
 					window.refreshFriendActivityIndicators();
 				}
-				if (typeof window.writeFriendActivityCache === 'function') window.writeFriendActivityCache();
+				scheduleRealtimeFeedCacheWrite('activity');
 			} catch (err) { console.warn('[FRIEND ACTIVITY] Could not apply realtime event:', err); }
 		});
 
@@ -93055,7 +93734,7 @@ function getVisibleChatStackEl(id) {
 				if (Math.max(0, Number(row.dataset.activityId) || 0) <= incoming && !(typeof isStandardIsNewHighlightArmed === 'function' && isStandardIsNewHighlightArmed(row))) row.classList.remove('is-new');
 			});
 			if (typeof window.refreshFriendActivityIndicators === 'function') window.refreshFriendActivityIndicators();
-			if (typeof window.writeFriendActivityCache === 'function') window.writeFriendActivityCache();
+			scheduleRealtimeFeedCacheWrite('activity');
 		});
 
 		socketChat.on('friend_activity_dismissed', function(data = {}) {
@@ -93068,7 +93747,7 @@ function getVisibleChatStackEl(id) {
 			const nextItems = previousItems.filter(function(item) { return String(item && item.id || '') !== id; });
 			if (nextItems.length === previousItems.length) return;
 			window.friendActivityItems = nextItems;
-			if (typeof window.writeFriendActivityCache === 'function') window.writeFriendActivityCache();
+			scheduleRealtimeFeedCacheWrite('activity');
 			if (typeof window.refreshFriendActivityIndicators === 'function') window.refreshFriendActivityIndicators();
 			if (typeof window.isFriendActivityVisible === 'function' && window.isFriendActivityVisible()) {
 				const list = document.getElementById('friend-activity-list');
@@ -93095,7 +93774,7 @@ function getVisibleChatStackEl(id) {
 			window.__friendActivityDismissedThroughId = nextDismissedThroughId;
 			window.__friendActivityLastReadId = nextLastReadId;
 			window.friendActivityItems = nextItems;
-			if (typeof window.writeFriendActivityCache === 'function') window.writeFriendActivityCache();
+			scheduleRealtimeFeedCacheWrite('activity');
 			if (typeof window.refreshFriendActivityIndicators === 'function') window.refreshFriendActivityIndicators();
 			if (typeof window.isFriendActivityVisible === 'function' && window.isFriendActivityVisible() && window.__friendActivityClearBusy !== true) {
 				const list = document.getElementById('friend-activity-list');
@@ -93172,7 +93851,7 @@ function getVisibleChatStackEl(id) {
 				} else if (typeof window.refreshNotificationCenterIndicators === 'function') {
 					window.refreshNotificationCenterIndicators();
 				}
-				if (typeof window.writeUserNotificationCache === 'function') window.writeUserNotificationCache();
+				scheduleRealtimeFeedCacheWrite('notifications');
 			} catch (err) { console.warn('[NOTIFICATIONS] Could not apply realtime event:', err); }
 		});
 
@@ -93190,7 +93869,7 @@ function getVisibleChatStackEl(id) {
 				if (previousItemSignature === nextItemSignature) return;
 				window.userNotificationItems[index] = item;
 				if (typeof window.invalidateUserNotificationMergeCache === 'function') window.invalidateUserNotificationMergeCache();
-				if (typeof window.writeUserNotificationCache === 'function') window.writeUserNotificationCache();
+				scheduleRealtimeFeedCacheWrite('notifications');
 				if (typeof window.isNotificationCenterVisible === 'function' && window.isNotificationCenterVisible() && window.__userNotificationClearBusy !== true) {
 					if (typeof window.applyUserNotificationUpdatedDom === 'function') window.applyUserNotificationUpdatedDom(item);
 				} else if (typeof window.refreshNotificationCenterIndicators === 'function') {
@@ -93210,7 +93889,7 @@ function getVisibleChatStackEl(id) {
 			window.__userNotificationServerUnreadCount = nextServerUnread;
 			reconcileUserNotificationUnreadCount();
 			if (typeof window.refreshNotificationCenterIndicators === 'function') window.refreshNotificationCenterIndicators();
-			if (typeof window.writeUserNotificationCache === 'function') window.writeUserNotificationCache();
+			scheduleRealtimeFeedCacheWrite('notifications');
 		});
 
 		socketChat.on('user_notification_deleted', function(data = {}) {
@@ -93228,7 +93907,7 @@ function getVisibleChatStackEl(id) {
 			window.__userNotificationSeenIds.delete(id);
 			window.__userNotificationServerUnreadCount = nextServerUnread;
 			reconcileUserNotificationUnreadCount();
-			if (typeof window.writeUserNotificationCache === 'function') window.writeUserNotificationCache();
+			scheduleRealtimeFeedCacheWrite('notifications');
 			if (typeof window.isNotificationCenterVisible === 'function' && window.isNotificationCenterVisible()) {
 				const list = document.getElementById('notification-center-list');
 				const row = list ? list.querySelector('.notification-swipe-row[data-notification-id="' + CSS.escape(id) + '"]') : null;
@@ -93265,7 +93944,7 @@ function getVisibleChatStackEl(id) {
 			}
 			window.__userNotificationServerUnreadCount = nextServerUnread;
 			reconcileUserNotificationUnreadCount();
-			if (typeof window.writeUserNotificationCache === 'function') window.writeUserNotificationCache();
+			scheduleRealtimeFeedCacheWrite('notifications');
 			if (typeof window.refreshNotificationCenterIndicators === 'function') window.refreshNotificationCenterIndicators();
 			if (typeof window.isNotificationCenterVisible === 'function' && window.isNotificationCenterVisible() && window.__userNotificationClearBusy !== true) {
 				const list = document.getElementById('notification-center-list');
@@ -93582,18 +94261,7 @@ function getVisibleChatStackEl(id) {
 							delete window.__profileRealtimeListRefreshTimers[timerKey];
 							const activeModal = document.getElementById('modal-sys-list');
 							if (!activeModal || activeModal.dataset.profileTarget !== name || activeModal.dataset.profileListType !== listType || !socketChat || !socketChat.connected) return;
-							const requestId = `plist-live-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-							if (window.__activeProfileListRequest && window.__activeProfileListRequest.timeoutId) clearTimeout(window.__activeProfileListRequest.timeoutId);
-							window.__activeProfileListRequest = {
-								requestId,
-								targetUser: name,
-								listType,
-								timeoutId: setTimeout(() => {
-									const active = window.__activeProfileListRequest;
-									if (active && active.requestId === requestId) window.__activeProfileListRequest = null;
-								}, 12000)
-							};
-							socketChat.emit('request_user_data', { targetName: name, type: listType, requestId });
+							if (typeof window.requestLiveProfileListRefresh === 'function') window.requestLiveProfileListRefresh(name, listType);
 						}, 250);
 				}
 			} catch (err) {
@@ -93817,6 +94485,38 @@ function getVisibleChatStackEl(id) {
 			}
 		});
 
+        function reorderTrophyCardsMinimally(grid, sortedCards, previousPositions) {
+            // Keep the longest already-ordered subsequence mounted. Only cards
+            // outside it need to move; their focus and event handlers are preserved.
+            const tails = [];
+            const tailIndexes = [];
+            const previous = new Array(sortedCards.length).fill(-1);
+            for (let i = 0; i < sortedCards.length; i++) {
+                const position = previousPositions.get(sortedCards[i]);
+                let low = 0, high = tails.length;
+                while (low < high) {
+                    const mid = (low + high) >> 1;
+                    if (tails[mid] < position) low = mid + 1;
+                    else high = mid;
+                }
+                if (low) previous[i] = tailIndexes[low - 1];
+                tails[low] = position;
+                tailIndexes[low] = i;
+            }
+            const unchanged = new Set();
+            let index = tailIndexes[tails.length - 1] ?? -1;
+            while (index >= 0) {
+                unchanged.add(sortedCards[index]);
+                index = previous[index];
+            }
+            let next = null;
+            for (let i = sortedCards.length - 1; i >= 0; i--) {
+                const card = sortedCards[i];
+                if (!unchanged.has(card)) grid.insertBefore(card, next);
+                next = card;
+            }
+        }
+
         window.applyTrophyRarityStatsIncremental = function(stats, changedIds = []) {
             const view = document.getElementById('view-trophies');
             const grid = document.getElementById('trophy-grid-container');
@@ -93824,38 +94524,42 @@ function getVisibleChatStackEl(id) {
             const cards = Array.from(grid.querySelectorAll(':scope > .trophy-card[data-trophy-id]'));
             if (!cards.length) return false;
             const changedSet = new Set((Array.isArray(changedIds) ? changedIds : []).map(String));
-            for (let i = 0; i < cards.length; i++) {
-                const card = cards[i];
-                const id = String(card.dataset.trophyId || '');
-                if (!id || (changedSet.size && !changedSet.has(id))) continue;
+            const byId = new Map(cards.map(card => [String(card.dataset.trophyId || ''), card]));
+            const affected = changedSet.size ? Array.from(changedSet, id => byId.get(id)).filter(Boolean) : cards;
+            for (const card of affected) {
                 const rarity = card.querySelector('.trophy-rarity-meta');
                 if (!rarity) continue;
-                const nextHtml = getTrophyRarityHtml(Number(stats && stats[id] || 0.1));
+                const nextHtml = getTrophyRarityHtml(Number(stats && stats[card.dataset.trophyId] || 0.1));
                 if (rarity.innerHTML !== nextHtml) rarity.innerHTML = nextHtml;
             }
 
             const sortSelect = document.getElementById('trophy-sort-select');
-            if (!sortSelect || sortSelect.value !== 'rarity') {
-                window.__trophyViewsDirty = false;
-                window.__lastTrophyRenderSignature = typeof psnTrophyRenderSignature === 'function' ? psnTrophyRenderSignature() : window.__lastTrophyRenderSignature;
-                return true;
-            }
-            const snapshot = typeof captureCollectionFilterMotion === 'function' ? captureCollectionFilterMotion('trophies', { orderFlip:true }) : null;
-            const currentIndex = new Map(cards.map((card, index) => [card, index]));
-            const multiplier = ((window.sortOrders && window.sortOrders.trophy) || 'desc') === 'asc' ? -1 : 1;
-            cards.sort((a, b) => {
-                const aPct = Number(stats && stats[a.dataset.trophyId] || 0.1);
-                const bPct = Number(stats && stats[b.dataset.trophyId] || 0.1);
-                const diff = (aPct - bPct) * multiplier;
-                return diff || (currentIndex.get(a) - currentIndex.get(b));
-            });
-            const fragment = document.createDocumentFragment();
-            cards.forEach(card => fragment.appendChild(card));
-            grid.appendChild(fragment);
-            if (snapshot) {
-                if (typeof restoreCollectionFilterScroll === 'function') restoreCollectionFilterScroll(snapshot);
-                if (typeof animateCollectionFilterMotion === 'function') animateCollectionFilterMotion(snapshot);
-                requestAnimationFrame(() => { if (typeof restoreCollectionFilterScroll === 'function') restoreCollectionFilterScroll(snapshot); });
+            if (sortSelect && sortSelect.value === 'rarity') {
+                const previousPositions = new Map(cards.map((card, index) => [card, index]));
+                const multiplier = ((window.sortOrders && window.sortOrders.trophy) || 'desc') === 'asc' ? -1 : 1;
+                cards.sort((a, b) => {
+                    const aPct = Number(stats && stats[a.dataset.trophyId] || 0.1);
+                    const bPct = Number(stats && stats[b.dataset.trophyId] || 0.1);
+                    const diff = (aPct - bPct) * multiplier;
+                    return diff || (previousPositions.get(a) - previousPositions.get(b));
+                });
+                const orderChanged = cards.some((card, index) => previousPositions.get(card) !== index);
+                if (orderChanged) {
+                    const snapshot = typeof captureCollectionFilterMotion === 'function' ? captureCollectionFilterMotion('trophies', { orderFlip:true }) : null;
+                    const focused = grid.contains(document.activeElement) ? document.activeElement : null;
+                    if (grid.children.length === cards.length) reorderTrophyCardsMinimally(grid, cards, previousPositions);
+                    else {
+                        const fragment = document.createDocumentFragment();
+                        cards.forEach(card => fragment.appendChild(card));
+                        grid.appendChild(fragment);
+                    }
+                    if (focused && focused.isConnected && document.activeElement !== focused) focused.focus({ preventScroll:true });
+                    if (snapshot) {
+                        if (typeof restoreCollectionFilterScroll === 'function') restoreCollectionFilterScroll(snapshot);
+                        if (typeof animateCollectionFilterMotion === 'function') animateCollectionFilterMotion(snapshot);
+                        requestAnimationFrame(() => { if (typeof restoreCollectionFilterScroll === 'function') restoreCollectionFilterScroll(snapshot); });
+                    }
+                }
             }
             window.__trophyViewsDirty = false;
             window.__lastTrophyRenderSignature = typeof psnTrophyRenderSignature === 'function' ? psnTrophyRenderSignature() : window.__lastTrophyRenderSignature;
@@ -93871,7 +94575,7 @@ function getVisibleChatStackEl(id) {
             keySet.forEach(id => { if (Number(previousStats[id] || 0.1) !== Number(stats[id] || 0.1)) changedTrophyStatIds.push(id); });
             window.globalTrophyStats = stats;
             if (changedTrophyStatIds.length === 0) return;
-            if (document.getElementById('view-trophies')?.style.display === 'block') {
+            if (['block', 'flex'].includes(document.getElementById('view-trophies')?.style.display)) {
                 const appliedIncrementally = typeof window.applyTrophyRarityStatsIncremental === 'function' && window.applyTrophyRarityStatsIncremental(stats, changedTrophyStatIds);
                 if (!appliedIncrementally && typeof window.refreshTrophiesWithMotion === 'function') window.refreshTrophiesWithMotion({ revealNew:false });
             } else window.__trophyViewsDirty = true;
@@ -94310,7 +95014,9 @@ function getVisibleChatStackEl(id) {
 		}
 		if (window.__psnUserMetaRefreshTimer) clearTimeout(window.__psnUserMetaRefreshTimer);
 		window.__psnUserMetaRefreshTimer = null;
-		if (window.__psnUserMetaRefreshQueue instanceof Set) window.__psnUserMetaRefreshQueue.clear();
+		if (window.__psnUserMetaRefreshQueue instanceof Map) window.__psnUserMetaRefreshQueue.clear();
+		if (window.__psnUserMetaLatestRequests instanceof Map) window.__psnUserMetaLatestRequests.clear();
+		if (typeof psnUserMetaPendingRequests !== 'undefined') psnUserMetaPendingRequests.clear();
 		if (window.__presenceMetaSyncFrame) cancelAnimationFrame(window.__presenceMetaSyncFrame);
 		window.__presenceMetaSyncFrame = 0;
 		if (window.__presenceMetaPendingByName instanceof Map) window.__presenceMetaPendingByName.clear();
@@ -97430,12 +98136,49 @@ function getVisibleChatStackEl(id) {
 		}
 		const onlineRenderContext = buildOnlineListRenderContext(orderedUsers, myName, friendNames, sortRoleByUser);
 		const renderSignature = onlineRenderContext.renderSignature;
+		const previousCanModerate = container.dataset.onlineRenderCanModerate;
 		if (window.__onlineListRealtimeAnimation && isOnlinePlayersModalVisible()) {
 			if (container.dataset.onlineRenderSignature !== renderSignature) window.__onlineListRenderPending = true;
 			return;
 		}
-		if (container.dataset.onlineRenderSignature === renderSignature && container.childElementCount > 0) return;
+		if (container.dataset.onlineRenderSignature === renderSignature && container.childElementCount > 0 && previousCanModerate === String(onlineRenderContext.canModerate)) return;
 		container.dataset.onlineRenderSignature = renderSignature;
+		container.dataset.onlineRenderCanModerate = onlineRenderContext.canModerate;
+
+		const existingRows = Array.from(container.children);
+		if (previousCanModerate === String(onlineRenderContext.canModerate)
+			&& existingRows.length === orderedUsers.length
+			&& orderedUsers.length > 0
+			&& orderedUsers.every((user, index) => existingRows[index].dataset.liveRenderKey === `online:${user.name || user}`)) {
+			for (let i = 0; i < orderedUsers.length; i++) {
+				const user = orderedUsers[i];
+				const name = String(user.name || user);
+				const currentRow = existingRows[i];
+				const rawSignature = onlineRenderContext.itemSignatureByName.get(name) || '';
+				const nextSignature = typeof window.getLiveRenderSignature === 'function' ? window.getLiveRenderSignature(rawSignature) : rawSignature;
+				if (currentRow.dataset.liveRenderSignature === nextSignature) continue;
+				const nextRow = renderUserItem(null, user, name === myName, friendNames, onlineRenderContext);
+				const oldAvatar = currentRow.querySelector('.online-user-avatar');
+				const newAvatar = nextRow.querySelector('.online-user-avatar');
+				if (oldAvatar && newAvatar && oldAvatar.getAttribute('src') === newAvatar.getAttribute('src')) {
+					oldAvatar.style.borderColor = newAvatar.style.borderColor;
+					oldAvatar.style.borderWidth = newAvatar.style.borderWidth;
+					oldAvatar.style.borderStyle = newAvatar.style.borderStyle;
+					newAvatar.replaceWith(oldAvatar);
+				}
+				const oldDot = currentRow.querySelector('.psn-avatar-presence-dot');
+				const newDot = nextRow.querySelector('.psn-avatar-presence-dot');
+				if (oldDot && newDot && oldDot.className === newDot.className && oldDot.getAttribute('data-user') === newDot.getAttribute('data-user')) newDot.replaceWith(oldDot);
+				const focusedButton = currentRow.contains(document.activeElement) ? document.activeElement.closest('button') : null;
+				const focusTitle = focusedButton && focusedButton.title;
+				currentRow.replaceWith(nextRow);
+				if (focusTitle) {
+					const replacement = Array.from(nextRow.querySelectorAll('button')).find(button => button.title === focusTitle);
+					if (replacement) replacement.focus({ preventScroll:true });
+				}
+			}
+			return;
+		}
 
 		const nextOnlineFragment = document.createDocumentFragment();
 		if (orderedUsers.length === 0) {
@@ -98830,26 +99573,38 @@ function getVisibleChatStackEl(id) {
 		}
 	};
 
-	function setupRealtimeFeedDomPaging(feedKey) {
+	const realtimeFeedPagingState = {};
+	function setupRealtimeFeedDomPaging(feedKey, knownCount = null) {
 		const config = REALTIME_FEED_DOM_CONFIG[feedKey];
 		const list = config ? document.getElementById(config.listId) : null;
 		if (!config || !list) return;
 		const observers = window.__realtimeFeedOlderObservers || (window.__realtimeFeedOlderObservers = {});
-		if (observers[feedKey]) { try { observers[feedKey].disconnect(); } catch (err) {} delete observers[feedKey]; }
-		const oldSentinel = list.querySelector('.' + config.sentinelClass);
-		if (oldSentinel) oldSentinel.remove();
-		const items = typeof config.getItems === 'function' ? config.getItems() : (Array.isArray(window[config.itemsKey]) ? window[config.itemsKey] : []);
-		const rendered = Math.min(items.length, Number(window[config.renderLimitKey]) || SOCIAL_FEED_RENDER_BATCH_SIZE);
-		if (!items.length || rendered >= items.length || typeof IntersectionObserver !== 'function') return;
-		const sentinel = document.createElement('div');
-		sentinel.className = config.sentinelClass;
-		sentinel.style.cssText = 'height:1px;width:100%;pointer-events:none;opacity:0;';
-		list.appendChild(sentinel);
+		const previous = realtimeFeedPagingState[feedKey];
+		const itemsCount = Number.isFinite(knownCount) && knownCount >= 0 ? knownCount :
+			(typeof config.getItems === 'function' ? config.getItems().length : (Array.isArray(window[config.itemsKey]) ? window[config.itemsKey].length : 0));
+		const rendered = Math.min(itemsCount, Number(window[config.renderLimitKey]) || SOCIAL_FEED_RENDER_BATCH_SIZE);
+		const sentinel = list.querySelector(':scope > .' + config.sentinelClass);
+		if (!itemsCount || rendered >= itemsCount || typeof IntersectionObserver !== 'function') {
+			if (previous) { previous.observer.disconnect(); delete realtimeFeedPagingState[feedKey]; }
+			if (sentinel) sentinel.remove();
+			delete observers[feedKey];
+			return;
+		}
 		const root = getRealtimeFeedScrollRoot(list);
-		observers[feedKey] = new IntersectionObserver(function(entries) {
+		if (previous && previous.list === list && previous.sentinel === sentinel && previous.root === root && sentinel.isConnected) return;
+		if (previous) previous.observer.disconnect();
+		const target = sentinel || document.createElement('div');
+		if (!sentinel) {
+			target.className = config.sentinelClass;
+			target.style.cssText = 'height:1px;width:100%;pointer-events:none;opacity:0;';
+			list.appendChild(target);
+		}
+		const observer = new IntersectionObserver(function(entries) {
 			if (entries[0] && entries[0].isIntersecting) loadMoreRealtimeFeedDom(feedKey);
 		}, { root:root, rootMargin:'600px 0px' });
-		observers[feedKey].observe(sentinel);
+		observer.observe(target);
+		realtimeFeedPagingState[feedKey] = { list, sentinel:target, root, observer };
+		observers[feedKey] = observer;
 	}
 
 	function loadMoreRealtimeFeedDom(feedKey) {
@@ -98885,7 +99640,7 @@ function getVisibleChatStackEl(id) {
 		}
 		window[config.renderLimitKey] = nextLimit;
 		list.dataset.realtimeFeedRenderSignature = getRealtimeFeedRenderSignature(feedKey, items, nextLimit);
-		setupRealtimeFeedDomPaging(feedKey);
+		setupRealtimeFeedDomPaging(feedKey, items.length);
 		requestAnimationFrame(function() { config.animate(list, revealIds); });
 		return true;
 	}
@@ -99179,6 +99934,8 @@ function getVisibleChatStackEl(id) {
 		let incomingVisible = true;
 		let authoritativeItem = item;
 		let insertAt = -1;
+		let repeatOnly = false;
+		let previousRepeatCount = 0;
 
 		if (isFriendActivityRepeatableItem(item) && semanticKey) {
 			let groupedIndex = -1;
@@ -99199,6 +99956,8 @@ function getVisibleChatStackEl(id) {
 					list[groupedIndex] = authoritativeItem;
 					incomingVisible = false;
 					insertAt = groupedIndex;
+					repeatOnly = true;
+					previousRepeatCount = getFriendActivityRepeatCount(existing);
 				}
 				structuralChange = true;
 			} else {
@@ -99231,23 +99990,25 @@ function getVisibleChatStackEl(id) {
 			changed:structuralChange,
 			incomingVisible:incomingVisible,
 			authoritativeItem:authoritativeItem,
-			requiresFullDomSync:!incomingVisible || insertAt > 0,
+			requiresFullDomSync:!repeatOnly && (!incomingVisible || insertAt > 0),
+			repeatOnly,
+			previousRepeatCount,
 			fast:true
 		};
 	};
 
-	window.writeFriendActivityCache = function() {
+	window.persistFriendActivityCache = function() {
 		if (!localStorage.getItem('psn_username')) return;
-		try {
-			saveState(FRIEND_ACTIVITY_CACHE_KEY, JSON.stringify({
-				items: window.trimPsnServerLimitedArray(Array.isArray(window.friendActivityItems) ? window.friendActivityItems : [], 'socialHistory'),
-				lastReadId: Math.max(0, Number(window.__friendActivityLastReadId) || 0),
-				dismissedThroughId: Math.max(0, Number(window.__friendActivityDismissedThroughId) || 0),
-				friendSignature: String(window.__friendActivityFriendSignature || ''),
-				friendCount: Math.max(0, Number(window.__friendActivityFriendCount) || 0),
-				cachedAt: Date.now()
-			}));
-		} catch (err) {}
+		persistRealtimeFeedSnapshot('activity', FRIEND_ACTIVITY_CACHE_KEY, {
+			items: window.trimPsnServerLimitedArray(Array.isArray(window.friendActivityItems) ? window.friendActivityItems : [], 'socialHistory'),
+			lastReadId: Math.max(0, Number(window.__friendActivityLastReadId) || 0),
+			dismissedThroughId: Math.max(0, Number(window.__friendActivityDismissedThroughId) || 0),
+			friendSignature: String(window.__friendActivityFriendSignature || ''),
+			friendCount: Math.max(0, Number(window.__friendActivityFriendCount) || 0)
+		});
+	};
+	window.writeFriendActivityCache = function() {
+		scheduleRealtimeFeedCacheWrite('activity');
 	};
 
 	window.refreshFriendActivityIndicators = function() {
@@ -99258,8 +100019,9 @@ function getVisibleChatStackEl(id) {
 		/* mergeFriendActivityItems keeps the feed newest-first, so unread detection is O(1). */
 		const newestId = items.length ? Math.max(0, Number(items[0] && items[0].id) || 0) : 0;
 		const unread = newestId > lastReadId;
-		if (dot) dot.style.display = unread ? 'block' : 'none';
-		try { saveState('psn_friend_activity_dot', unread ? 'true' : 'false'); } catch (err) {}
+		const dotDisplay = unread ? 'block' : 'none';
+		if (dot && dot.style.display !== dotDisplay) dot.style.display = dotDisplay;
+		if (typeof window.persistRealtimeFeedDot === 'function') window.persistRealtimeFeedDot('psn_friend_activity_dot', unread);
 	};
 
 	window.restoreFriendActivityCache = function(username) {
@@ -99524,6 +100286,39 @@ function getVisibleChatStackEl(id) {
 			'<div class="friend-activity-time" title="' + escapeRealtimeFeedHtml(new Date(item.createdAt).toLocaleString()) + '">' + escapeRealtimeFeedHtml(realtimeFeedTimeLabel(item.createdAt)) + '</div></div></div></div>';
 	}
 
+	window.applyFriendActivityRepeatOnlyDom = function(item, previousCount) {
+		const list = document.getElementById('friend-activity-list');
+		if (!list || !item) return false;
+		const row = list.querySelector('.friend-activity-item[data-activity-id="' + CSS.escape(String(item.id || '')) + '"]');
+		if (!row) return false;
+		const count = getFriendActivityRepeatCount(item);
+		if (count <= 1) return true;
+		let meta = row.querySelector('.friend-activity-meta');
+		if (!meta) {
+			const main = row.querySelector('.friend-activity-main');
+			if (!main) return false;
+			meta = document.createElement('div');
+			meta.className = 'friend-activity-meta';
+			main.appendChild(meta);
+		}
+		let pill = meta.querySelector('.friend-activity-repeat-count');
+		if (!pill) {
+			pill = document.createElement('span');
+			pill.className = 'friend-activity-repeat-count';
+			meta.appendChild(pill);
+		}
+		const formatted = count.toLocaleString('en-US');
+		pill.title = 'This activity happened ' + formatted + ' times';
+		const context = 'friend-activity-repeat:' + getFriendActivitySemanticKey(item);
+		if (typeof window.setLiveCountText === 'function') {
+			pill.dataset.liveCountValue = String(Math.max(1, Number(previousCount) || 1));
+			pill.dataset.liveCountOwner = context;
+			pill.dataset.liveCountInitialized = '1';
+			window.setLiveCountText(pill, '×' + formatted, count, context);
+		} else pill.textContent = '×' + formatted;
+		return true;
+	};
+
 	function cleanupFriendActivityDayHeaders(list) {
 		if (!list) return;
 		list.querySelectorAll('.friend-activity-day').forEach(function(header) {
@@ -99625,7 +100420,7 @@ function getVisibleChatStackEl(id) {
 				armStandardIsNewHighlight(row, 5000);
 			}
 		}
-		setupRealtimeFeedDomPaging('activity');
+		setupRealtimeFeedDomPaging('activity', visibleItems.length);
 		return true;
 	};
 
@@ -99650,6 +100445,7 @@ function getVisibleChatStackEl(id) {
 		if (!items.length) {
 			list.innerHTML = '';
 			delete list.dataset.realtimeFeedRenderSignature;
+			setupRealtimeFeedDomPaging('activity', 0);
 			cancelFriendActivitySwipeHintPreview(true);
 			if (!allItems.length && !window.__friendActivityRemoteReady && !window.__friendActivityRemoteError) {
 				if (loading) loading.style.display = 'block';
@@ -99688,7 +100484,7 @@ function getVisibleChatStackEl(id) {
 			closeFriendActivitySwipeRows();
 			if (!isSilent) animateVisibleRealtimeFeedRows(list, '.friend-activity-item');
 			markRealtimeFeedRowsIsNew(list, '.friend-activity-item[data-activity-id]', 'data-activity-id', friendActivityNewIds, 5000);
-			setupRealtimeFeedDomPaging('activity');
+			setupRealtimeFeedDomPaging('activity', items.length);
 			window.refreshFriendActivityIndicators();
 			scheduleFriendActivitySwipeHint();
 			if (window.isFriendActivityVisible()) window.markFriendActivityRead();
@@ -99708,7 +100504,7 @@ function getVisibleChatStackEl(id) {
 		list.dataset.realtimeFeedRenderSignature = renderSignature;
 		if (!isSilent) animateVisibleRealtimeFeedRows(list, '.friend-activity-item');
 		markRealtimeFeedRowsIsNew(list, '.friend-activity-item[data-activity-id]', 'data-activity-id', friendActivityNewIds, 5000);
-		setupRealtimeFeedDomPaging('activity');
+		setupRealtimeFeedDomPaging('activity', items.length);
 		window.refreshFriendActivityIndicators();
 		scheduleFriendActivitySwipeHint();
 		if (window.isFriendActivityVisible()) window.markFriendActivityRead();
@@ -100496,18 +101292,18 @@ function getVisibleChatStackEl(id) {
 		return window.userNotificationItems;
 	};
 
-	window.writeUserNotificationCache = function() {
+	window.persistUserNotificationCache = function() {
 		if (!localStorage.getItem('psn_username')) return;
-		try {
-			saveState(USER_NOTIFICATION_CACHE_KEY, JSON.stringify({
-				items:window.trimPsnServerLimitedArray(Array.isArray(window.userNotificationItems) ? window.userNotificationItems : [], 'socialHistory'),
-				lastReadId:Math.max(0, Number(window.__userNotificationLastReadId) || 0),
-				unreadCount:Math.max(0, Number(window.__userNotificationUnreadCount) || 0),
-				serverUnreadCount:Math.max(0, Number(window.__userNotificationServerUnreadCount) || 0),
-				seenIds:Array.from(window.__userNotificationSeenIds || []).slice(-250),
-				cachedAt:Date.now()
-			}));
-		} catch (err) {}
+		persistRealtimeFeedSnapshot('notifications', USER_NOTIFICATION_CACHE_KEY, {
+			items:window.trimPsnServerLimitedArray(Array.isArray(window.userNotificationItems) ? window.userNotificationItems : [], 'socialHistory'),
+			lastReadId:Math.max(0, Number(window.__userNotificationLastReadId) || 0),
+			unreadCount:Math.max(0, Number(window.__userNotificationUnreadCount) || 0),
+			serverUnreadCount:Math.max(0, Number(window.__userNotificationServerUnreadCount) || 0),
+			seenIds:Array.from(window.__userNotificationSeenIds || []).slice(-250)
+		});
+	};
+	window.writeUserNotificationCache = function() {
+		scheduleRealtimeFeedCacheWrite('notifications');
 	};
 
 	window.refreshNotificationCenterIndicators = function() {
@@ -100520,7 +101316,7 @@ function getVisibleChatStackEl(id) {
 			const nextDisplay = unread > 0 ? 'block' : 'none';
 			if (dot.style.display !== nextDisplay) dot.style.display = nextDisplay;
 		}
-		try { saveState('psn_notifications_dot', unread > 0 ? 'true' : 'false'); } catch (err) {}
+		if (typeof window.persistRealtimeFeedDot === 'function') window.persistRealtimeFeedDot('psn_notifications_dot', unread > 0);
 	};
 
 	window.restoreUserNotificationCache = function(username) {
@@ -101160,7 +101956,7 @@ function getVisibleChatStackEl(id) {
 		cleanupUserNotificationDayHeaders(list);
 		animateUserNotificationRowsByIds(list, new Set([String(authoritative.id || '')]));
 		armStandardIsNewHighlights(list, '.user-notification-item.is-new', 5000);
-		setupRealtimeFeedDomPaging('notifications');
+		setupRealtimeFeedDomPaging('notifications', visibleItems.length);
 		scheduleNotificationSwipeHint();
 		return true;
 	};
@@ -101297,6 +102093,7 @@ function getVisibleChatStackEl(id) {
 		if (!items.length) {
 			list.innerHTML = '';
 			delete list.dataset.realtimeFeedRenderSignature;
+			setupRealtimeFeedDomPaging('notifications', 0);
 			cancelNotificationSwipeHintPreview(true);
 			if (!allItems.length && !window.__userNotificationRemoteReady && !window.__userNotificationRemoteError) {
 				if (loading) loading.style.display = 'block';
@@ -101332,7 +102129,7 @@ function getVisibleChatStackEl(id) {
 			closeNotificationSwipeRows();
 			if (!isSilent) animateVisibleRealtimeFeedRows(list, '.user-notification-item');
 			armStandardIsNewHighlights(list, '.user-notification-item.is-new', 5000);
-			setupRealtimeFeedDomPaging('notifications');
+			setupRealtimeFeedDomPaging('notifications', items.length);
 			window.refreshNotificationCenterIndicators();
 			scheduleNotificationSwipeHint();
 			return;
@@ -101351,7 +102148,7 @@ function getVisibleChatStackEl(id) {
 		list.dataset.realtimeFeedRenderSignature = renderSignature;
 		if (!isSilent) animateVisibleRealtimeFeedRows(list, '.user-notification-item');
 		armStandardIsNewHighlights(list, '.user-notification-item.is-new', 5000);
-		setupRealtimeFeedDomPaging('notifications');
+		setupRealtimeFeedDomPaging('notifications', items.length);
 		window.refreshNotificationCenterIndicators();
 		scheduleNotificationSwipeHint();
 	};
@@ -102859,6 +103656,7 @@ function getVisibleChatStackEl(id) {
 			const users = response && response.success === true && Array.isArray(response.users) ? response.users : [];
 			let changed = false;
 
+			if (users.length && typeof window.publishPsnUserMetaToTabs === 'function') window.publishPsnUserMetaToTabs(users);
 			users.forEach(user => {
 				const name = String(user && (user.name || user.username || user.user || user.onlineId) || '').trim();
 				if (!name) return;
@@ -104694,8 +105492,39 @@ function getVisibleChatStackEl(id) {
 			window.__profileListResizeAnimation = null;
 		}
 		if (!body) return;
+		if (body.__profileListLiveResizeAnimation) {
+			try { body.__profileListLiveResizeAnimation.cancel(); } catch (e) {}
+			body.__profileListLiveResizeAnimation = null;
+		}
 		body.classList.remove('profile-list-resizing');
 		body.style.height = '';
+	};
+
+	window.animateProfileListLiveUpdate = function(body, update) {
+		if (typeof update !== 'function') return false;
+		const modal = document.getElementById('modal-sys-list');
+		const visible = !!(body && modal && modal.classList.contains('show') && modal.style.display !== 'none');
+		const reduceMotion = !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+		const canAnimate = visible && typeof body.animate === 'function' && !reduceMotion && !body.querySelector('.profile-ps-list-loader');
+		const startHeight = canAnimate ? body.getBoundingClientRect().height : 0;
+		const wasScrolled = canAnimate && (body.scrollTop > 1 || (!body.__profileListLiveResizeAnimation && body.scrollHeight > body.clientHeight + 2));
+		if (body && body.__profileListLiveResizeAnimation) {
+			try { body.__profileListLiveResizeAnimation.cancel(); } catch (e) {}
+			body.__profileListLiveResizeAnimation = null;
+		}
+		const result = update();
+		if (!canAnimate || !body.isConnected || !modal.classList.contains('show') || wasScrolled || body.scrollTop > 1) return result;
+		const endHeight = body.getBoundingClientRect().height;
+		if (!startHeight || !endHeight || Math.abs(endHeight - startHeight) < 2 || body.scrollHeight > body.clientHeight + 2) return result;
+		const animation = body.animate(
+			[{ height:`${startHeight}px` }, { height:`${endHeight}px` }],
+			{ duration:280, easing:'cubic-bezier(.22,.8,.24,1)' }
+		);
+		body.__profileListLiveResizeAnimation = animation;
+		animation.finished.then(() => {
+			if (body.__profileListLiveResizeAnimation === animation) body.__profileListLiveResizeAnimation = null;
+		}).catch(() => {});
+		return result;
 	};
 
 	window.measureProfileListVisualHeight = function(body, html) {
@@ -104817,6 +105646,28 @@ function getVisibleChatStackEl(id) {
 
 	window.__activeProfileListRequest = null;
 
+	window.requestLiveProfileListRefresh = function(targetUser, listType) {
+		const modal = document.getElementById('modal-sys-list');
+		if (!modal || modal.style.display === 'none' ||
+			modal.dataset.profileTarget !== targetUser || modal.dataset.profileListType !== listType ||
+			!socketChat || !socketChat.connected) return false;
+		const active = window.__activeProfileListRequest;
+		if (active && active.targetUser === targetUser && active.listType === listType) {
+			active.refreshAfterResponse = true;
+			return true;
+		}
+		if (active && active.timeoutId) clearTimeout(active.timeoutId);
+		const requestId = `plist-live-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+		window.__activeProfileListRequest = {
+			requestId, targetUser, listType,
+			timeoutId: setTimeout(() => {
+				if (window.__activeProfileListRequest?.requestId === requestId) window.__activeProfileListRequest = null;
+			}, 12000)
+		};
+		socketChat.emit('request_user_data', { targetName:targetUser, type:listType, requestId });
+		return true;
+	};
+
 	window.clearProfileListRequestTimeout = function(requestId) {
 		const active = window.__activeProfileListRequest;
 		if (!active) return;
@@ -104843,15 +105694,14 @@ function getVisibleChatStackEl(id) {
 		const modal = document.getElementById('modal-sys-list');
 		const modalCurrentTarget = modal ? String(modal.dataset.profileTarget || '') : '';
 		const modalCurrentType = modal ? String(modal.dataset.profileListType || '') : '';
-		const modalIsOpen = !!(modal && modal.style.display !== 'none');
-
-		if (active) {
-			if (responseRequestId && active.requestId !== responseRequestId) return;
-			if (!responseRequestId && (active.targetUser !== responseTarget || active.listType !== responseType)) return;
-			window.clearProfileListRequestTimeout(active.requestId);
-		} else if (modalIsOpen && (modalCurrentTarget || modalCurrentType)) {
-			if (modalCurrentTarget !== responseTarget || modalCurrentType !== responseType) return;
-		}
+		const modalIsOpen = !!(modal && modal.style.display !== 'none' && (modal.classList.contains('show') || modal.style.display === 'flex' || modal.style.display === 'block'));
+		// A tagged response must still belong to the active request. Never let a
+		// superseded or closed view repaint another list with an older response.
+		if (responseRequestId && (!active || active.requestId !== responseRequestId)) return;
+		if (!modalIsOpen || modalCurrentTarget !== responseTarget || modalCurrentType !== responseType) return;
+		if (active && !responseRequestId && (active.targetUser !== responseTarget || active.listType !== responseType)) return;
+		const refreshAfterResponse = !!active?.refreshAfterResponse;
+		if (active) window.clearProfileListRequestTimeout(active.requestId);
 
 		if (data.error) {
 			window.showProfileListFetchError(responseTarget, responseType, data.error);
@@ -104861,8 +105711,11 @@ function getVisibleChatStackEl(id) {
 		if (responseType === 'downloads' && Array.isArray(data.rawData) && window.__profileListNormalizedDownloadSources) {
 			window.__profileListNormalizedDownloadSources.add(data.rawData);
 		}
-		if (typeof renderFetchedList === 'function') {
-			renderFetchedList(responseTarget, responseType, data.rawData);
+		if (typeof renderFetchedList === 'function') renderFetchedList(responseTarget, responseType, data.rawData);
+		if (refreshAfterResponse) {
+			setTimeout(() => {
+				if (typeof window.requestLiveProfileListRefresh === 'function') window.requestLiveProfileListRefresh(responseTarget, responseType);
+			}, 0);
 		}
 	};
 
@@ -104885,11 +105738,14 @@ function getVisibleChatStackEl(id) {
 			modal.style.pointerEvents = '';
 		}
 
-		if (window.__activeProfileListRequest && window.__activeProfileListRequest.timeoutId) {
-			clearTimeout(window.__activeProfileListRequest.timeoutId);
+		const previousRequest = window.__activeProfileListRequest;
+		const reusePendingRequest = !isMe && socketChat?.connected && previousRequest &&
+			previousRequest.targetUser === targetUser && previousRequest.listType === listType;
+		if (!reusePendingRequest) {
+			if (previousRequest?.timeoutId) clearTimeout(previousRequest.timeoutId);
+			window.__activeProfileListRequest = null;
 		}
-		window.__activeProfileListRequest = null;
-	
+
 		const listMeta = window.getPlayerListMeta(listType);
 		const safeTargetUser = window.escapePlayerListText(targetUser || 'Player');
 		window.cancelProfileListResize(body);
@@ -104950,6 +105806,7 @@ function getVisibleChatStackEl(id) {
 			} 
 			else {
 				if (socketChat && socketChat.connected) {
+					if (reusePendingRequest) return;
 					const requestId = `plist-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 					if (window.__activeProfileListRequest && window.__activeProfileListRequest.timeoutId) clearTimeout(window.__activeProfileListRequest.timeoutId);
 					window.__activeProfileListRequest = {
@@ -105450,7 +106307,9 @@ function getVisibleChatStackEl(id) {
 		if (dataArray.length === 0) {
 			if (window.__profileListRowHtmlCaches instanceof Map) window.__profileListRowHtmlCaches.delete(`${targetUser}|${listType}`);
 			const emptyHtml = `<div style="text-align:center; padding: 40px; color: var(--text-muted); font-size: 13px;">No items in this ${listMeta.title.toLowerCase()} yet.</div>`;
-			window.swapProfileListLoaderToContent(body, emptyHtml, targetUser, listType);
+			if (isLiveProfileListRefresh) {
+				window.animateProfileListLiveUpdate(body, () => window.swapProfileListLoaderToContent(body, emptyHtml, targetUser, listType));
+			} else window.swapProfileListLoaderToContent(body, emptyHtml, targetUser, listType);
 			return;
 		}
 	
@@ -105840,9 +106699,13 @@ function getVisibleChatStackEl(id) {
 			}
 		};
 
-		if (isLiveProfileListRefresh && typeof window.reconcileProfileListHtml === 'function' && window.reconcileProfileListHtml(body, html, { targetUser, listType })) {
-			finalizeProfileListContent();
-			return;
+		if (isLiveProfileListRefresh && typeof window.reconcileProfileListHtml === 'function') {
+			const reconciled = window.animateProfileListLiveUpdate(body, () => {
+				if (!window.reconcileProfileListHtml(body, html, { targetUser, listType })) return false;
+				finalizeProfileListContent();
+				return true;
+			});
+			if (reconciled) return;
 		}
 
 		window.swapProfileListLoaderToContent(body, html, targetUser, listType, finalizeProfileListContent);
@@ -108887,6 +109750,19 @@ function getVisibleChatStackEl(id) {
 		return match ? match[0] : '';
 	}
 
+	function getInstalledTitleIdsFromGames(games){
+		var ids = new Set();
+		for (var i = 0; i < games.length; i++) {
+			var game = games[i] || {};
+			var candidates = [game.titleId, game.id, game.path, game.title];
+			for (var c = 0; c < candidates.length; c++) {
+				var id = normalizeInstalledTitleId(candidates[c]);
+				if (id) { ids.add(id); break; }
+			}
+		}
+		return ids;
+	}
+
 	function getConnectedInstalledTitleIds(){
 		var statusIcon = document.getElementById('global-status-icon');
 		if (!statusIcon || !statusIcon.classList.contains('status-dot-connected')) return null;
@@ -108898,17 +109774,7 @@ function getVisibleChatStackEl(id) {
 			return cached.ids;
 		}
 
-		var ids = new Set();
-		for (var i = 0; i < games.length; i++) {
-			var game = games[i] || {};
-			var candidates = [game.titleId, game.id, game.path, game.title];
-			for (var c = 0; c < candidates.length; c++) {
-				var id = normalizeInstalledTitleId(candidates[c]);
-				if (!id) continue;
-				ids.add(id);
-				break;
-			}
-		}
+		var ids = getInstalledTitleIdsFromGames(games);
 		window.__connectedInstalledTitleIdsCache = { games: games, revision: revision, length: games.length, ids: ids };
 		return ids;
 	}
@@ -109298,11 +110164,12 @@ function getVisibleChatStackEl(id) {
 				var titleId = normalizeInstalledTitleId(candidate);
 				return !!titleId && installedTitleIds.has(titleId);
 			});
-			if (groupedCard.classList.contains('is-installed-on-ps3') !== groupedInstalled) groupedCard.classList.toggle('is-installed-on-ps3', groupedInstalled);
 			if (groupedId) {
 				var groupedCat = String(groupedCard.getAttribute('data-store-category') || getCurrentCategory() || '').trim();
 				applyInstalledCardState(groupedCard, groupedId, groupedCat, installedTitleIds, false);
 			}
+			// A grouped card represents any installed edition, not only its primary ID.
+			if (groupedCard.classList.contains('is-installed-on-ps3') !== groupedInstalled) groupedCard.classList.toggle('is-installed-on-ps3', groupedInstalled);
 		}
 
 		var wishlistCards = getScopedDecoratorNodes(scope, '.game-card[data-wishlist-title-id]');
@@ -109454,6 +110321,45 @@ function getVisibleChatStackEl(id) {
 		queueDecoratorScope(scopeRoot);
 		scheduleDecoratorRunner();
 	}
+
+	// Small My Games changes need only the affected installed badges. Browse card
+	// links/copy controls and unrelated cards are left untouched; the existing full
+	// decorator remains in place for initial scans and large changes.
+	window.refreshInstalledCardsForLibraryChange = function(previousGames, nextGames){
+		var currentIds = getConnectedInstalledTitleIds();
+		if (!currentIds) { processUiSoon(); return; }
+		var oldIds = getInstalledTitleIdsFromGames(Array.isArray(previousGames) ? previousGames : []);
+		var newIds = getInstalledTitleIdsFromGames(Array.isArray(nextGames) ? nextGames : []);
+		var changedIds = [];
+		oldIds.forEach(function(id){ if (!newIds.has(id)) changedIds.push(id); });
+		newIds.forEach(function(id){ if (!oldIds.has(id)) changedIds.push(id); });
+		if (!changedIds.length) return;
+		if (!oldIds.size || changedIds.length > 8) { processUiSoon(); return; }
+
+		var affected = new Set();
+		for (var i = 0; i < changedIds.length; i++) {
+			var titleId = changedIds[i];
+			// An installed ID can appear inside a full content/title ID or in a
+			// grouped card's pipe-separated list; selector matching is case-insensitive.
+			var match = '[data-title-id*="' + titleId + '" i], [data-wishlist-title-id*="' + titleId + '" i], [data-group-title-ids*="' + titleId + '" i], [data-group-single-title-id*="' + titleId + '" i]';
+			document.querySelectorAll(match).forEach(function(card){ affected.add(card); });
+		}
+		affected.forEach(function(card){
+			if (card.classList.contains('grouped-title-card')) {
+				var singleId = cleanId(card.getAttribute('data-group-single-title-id'));
+				var ids = String(card.getAttribute('data-group-title-ids') || singleId || '').split('|');
+				var installed = ids.some(function(id){ var normalized = normalizeInstalledTitleId(id); return !!normalized && currentIds.has(normalized); });
+				if (singleId) applyInstalledCardState(card, singleId, card.getAttribute('data-store-category') || '', currentIds, false);
+				if (card.classList.contains('is-installed-on-ps3') !== installed) card.classList.toggle('is-installed-on-ps3', installed);
+			} else if (card.classList.contains('game-card')) {
+				var wishlistId = card.getAttribute('data-wishlist-title-id');
+				var id = wishlistId || card.getAttribute('data-title-id') || '';
+				if (!id) return;
+				var cat = wishlistId ? (card.getAttribute('data-wishlist-category') || '') : (card.getAttribute('data-store-category') || '');
+				applyInstalledCardState(card, id, cat, currentIds, false);
+			}
+		});
+	};
 
 	window.refreshStoreInstalledChecks = processUiSoon;
 
@@ -113810,7 +114716,7 @@ function getVisibleChatStackEl(id) {
     return !!(name&&socket?.connected&&socket.__psnGlobalAuthenticatedName===name);
   }
   const newer=(a,b)=>{try{return BigInt(s(a||'0'))>BigInt(s(b||'0'));}catch(e){return false;}};
-  function paintUnseen(){document.querySelectorAll('.psn-social-unseen-dot').forEach(dot=>{dot.hidden=!unseen.active;});}
+  function paintUnseen(){const hidden=!unseen.active;document.querySelectorAll('.psn-social-unseen-dot').forEach(dot=>{if(dot.hidden!==hidden)dot.hidden=hidden;});}
   function refreshUnseen(){
     const socket=typeof socketChat==='undefined'?null:socketChat;
     if(!socialSessionReady())return;
@@ -114207,15 +115113,69 @@ function getVisibleChatStackEl(id) {
       ${postActionbar(post)}
     </article>`;
   }
+  function socialCommentMarkup(c,postId){
+    const cid=idOf(c.id);if(!cid)return '';
+    const canDelete=c.author===identity()||(typeof window.canModerateSession==='function'&&window.canModerateSession());
+    return `<div class="psn-social-comment" data-social-comment="${cid}"><button type="button" class="psn-social-profile avatar-link" data-social-action="profile" data-user="${esc(c.author)}" aria-label="View ${esc(c.author)} profile" title="${esc(c.author)}">${socialAvatar(c.author,c.avatar,true)}</button><div class="psn-social-comment-content"><div class="psn-social-head"><div class="psn-social-comment-byline"><button type="button" class="psn-social-profile" data-social-action="profile" data-user="${esc(c.author)}"><span class="psn-social-author">${esc(c.author)}</span></button><span class="psn-social-age">${esc(timeLabel(c.createdAt))}</span></div><div class="psn-social-actions">${canDelete?`<button type="button" class="psn-social-btn danger" data-social-action="comment-delete" data-id="${cid}" data-post="${postId}" aria-label="Delete comment"><i class="fas fa-trash-alt"></i></button>`:''}${c.author!==identity()?`<button type="button" class="psn-social-btn" data-social-action="comment-report" data-id="${cid}" aria-label="Report comment"><i class="far fa-flag"></i></button>`:''}</div></div><p class="psn-social-comment-text">${esc(c.text)}</p>${commentActionbar(c,postId)}</div></div>`;
+  }
   function commentAreaMarkup(postId){
     const list=state.comments.get(postId);
-    const comments=Array.isArray(list)?list.map(c=>{
-      const cid=idOf(c.id);if(!cid)return '';
-      const canDelete=c.author===identity()||(typeof window.canModerateSession==='function'&&window.canModerateSession());
-      return `<div class="psn-social-comment" data-social-comment="${cid}"><button type="button" class="psn-social-profile avatar-link" data-social-action="profile" data-user="${esc(c.author)}" aria-label="View ${esc(c.author)} profile" title="${esc(c.author)}">${socialAvatar(c.author,c.avatar,true)}</button><div class="psn-social-comment-content"><div class="psn-social-head"><div class="psn-social-comment-byline"><button type="button" class="psn-social-profile" data-social-action="profile" data-user="${esc(c.author)}"><span class="psn-social-author">${esc(c.author)}</span></button><span class="psn-social-age">${esc(timeLabel(c.createdAt))}</span></div><div class="psn-social-actions">${canDelete?`<button type="button" class="psn-social-btn danger" data-social-action="comment-delete" data-id="${cid}" data-post="${postId}" aria-label="Delete comment"><i class="fas fa-trash-alt"></i></button>`:''}${c.author!==identity()?`<button type="button" class="psn-social-btn" data-social-action="comment-report" data-id="${cid}" aria-label="Report comment"><i class="far fa-flag"></i></button>`:''}</div></div><p class="psn-social-comment-text">${esc(c.text)}</p>${commentActionbar(c,postId)}</div></div>`;
-    }).join(''):'<p class="psn-social-muted">Loading comments…</p>';
+    const comments=Array.isArray(list)?list.map(c=>socialCommentMarkup(c,postId)).join(''):'<p class="psn-social-muted">Loading comments…</p>';
     return `<div class="psn-social-comments-list">${comments||'<p class="psn-social-muted">No comments yet. Start the conversation!</p>'}</div><form class="psn-social-comment-form" data-post="${postId}"><div class="psn-social-toolbar"><input class="psn-social-comment-input" maxlength="1200" required aria-label="Write a comment" placeholder="Write a comment…"><button type="submit" class="psn-social-btn primary"><i class="fas fa-paper-plane"></i> Send</button></div></form>${Array.isArray(list)&&list.length===30?'<div class="psn-social-muted">Showing the 30 latest comments.</div>':''}`;
   }
+
+  function socialCommentNonReactionSignature(comment){
+    if(!comment)return '';
+    const {reactions,myReaction,...rest}=comment;
+    return JSON.stringify(rest);
+  }
+  function reconcileSocialCommentRows(list,postId,previous,comments,signature){
+    if(list.__psnSocialCommentsSignature===signature)return;
+    if(list.__psnSocialCommentsPostId!==postId||!Array.isArray(previous)){
+      const temp=document.createElement('div');temp.innerHTML=commentAreaMarkup(postId);
+      const next=temp.querySelector('.psn-social-comments-list');
+      if(next)list.replaceChildren(...next.childNodes);
+    }else{
+      const priorById=new Map(previous.map(comment=>[String(comment.id),comment]));
+      const rows=new Map(Array.from(list.querySelectorAll(':scope > [data-social-comment]')).map(row=>[row.dataset.socialComment,row]));
+      const kept=new Set();
+      for(let index=0;index<comments.length;index++){
+        const comment=comments[index];
+        const id=String(comment.id);
+        const prior=priorById.get(id);
+        let row=rows.get(id);
+        if(row&&prior){
+          if(JSON.stringify(prior)!==JSON.stringify(comment)){
+            if(socialCommentNonReactionSignature(prior)===socialCommentNonReactionSignature(comment)){
+              const current=row.querySelector('.psn-social-comment-actions');
+              if(current){
+                const fragment=document.createElement('div');fragment.innerHTML=commentActionbar(comment,postId);
+                if(fragment.firstElementChild)current.replaceWith(fragment.firstElementChild);
+              }else{
+                const fragment=document.createElement('div');fragment.innerHTML=socialCommentMarkup(comment,postId);
+                const next=fragment.firstElementChild;if(next){row.replaceWith(next);row=next;}
+              }
+            }else{
+              const fragment=document.createElement('div');fragment.innerHTML=socialCommentMarkup(comment,postId);
+              const next=fragment.firstElementChild;if(next){row.replaceWith(next);row=next;}
+            }
+          }
+        }else{
+          const fragment=document.createElement('div');fragment.innerHTML=socialCommentMarkup(comment,postId);
+          row=fragment.firstElementChild;
+        }
+        if(!row)continue;
+        kept.add(row);
+        const atIndex=list.children[index]||null;
+        if(row!==atIndex)list.insertBefore(row,atIndex);
+      }
+      for(const child of Array.from(list.children))if(!kept.has(child))child.remove();
+      if(!comments.length)list.innerHTML='<p class="psn-social-muted">No comments yet. Start the conversation!</p>';
+    }
+    list.__psnSocialCommentsPostId=postId;
+    list.__psnSocialCommentsSignature=signature;
+  }
+
   function ensureCommentModal(){
     let overlay=document.getElementById('psn-social-comments-modal');if(overlay)return overlay;
     overlay=document.createElement('div');
@@ -114299,8 +115259,20 @@ function getVisibleChatStackEl(id) {
     const host=socialReactors.overlay?.querySelector('#psn-social-reactors-filters');if(!host)return;
     const total=counts.reduce((n,r)=>n+(Number(r.count)||0),0);
     socialReactors.count=total;
-    const label=socialReactors.overlay.querySelector('#psn-social-reactors-total');if(label)label.textContent=String(total);
-    host.innerHTML=[{emoji:'',label:`All ${total}`},...counts.map(row=>({emoji:row.emoji,label:`${row.emoji} ${Number(row.count)}`}))].map(item=>`<button type="button" class="psn-social-reactors-filter${socialReactors.emoji===item.emoji?' is-selected':''}" data-reactors-emoji="${esc(item.emoji)}" aria-pressed="${socialReactors.emoji===item.emoji}">${esc(item.label)}</button>`).join('');
+    const label=socialReactors.overlay.querySelector('#psn-social-reactors-total');
+    if(label&&label.textContent!==String(total))label.textContent=String(total);
+    const items=[{emoji:'',label:`All ${total}`},...counts.map(row=>({emoji:row.emoji,label:`${row.emoji} ${Number(row.count)}`}))];
+    const signature=JSON.stringify(items);
+    if(host.__psnSocialReactorFiltersSignature!==signature){
+      const active=host.contains(document.activeElement)?document.activeElement.dataset.reactorsEmoji:null;
+      host.innerHTML=items.map(item=>`<button type="button" class="psn-social-reactors-filter${socialReactors.emoji===item.emoji?' is-selected':''}" data-reactors-emoji="${esc(item.emoji)}" aria-pressed="${socialReactors.emoji===item.emoji}">${esc(item.label)}</button>`).join('');
+      host.__psnSocialReactorFiltersSignature=signature;
+      if(active!=null)Array.from(host.children).find(button=>button.dataset.reactorsEmoji===active)?.focus({preventScroll:true});
+    }else for(const button of host.children){
+      const selected=button.dataset.reactorsEmoji===socialReactors.emoji;
+      button.classList.toggle('is-selected',selected);
+      if(button.getAttribute('aria-pressed')!==String(selected))button.setAttribute('aria-pressed',String(selected));
+    }
   }
   function closeSocialReactors(){
     const overlay=socialReactors.overlay;if(!overlay||overlay.hidden)return;
@@ -114615,18 +115587,11 @@ function getVisibleChatStackEl(id) {
     if(!res.success){if(status)status.textContent=res.message||'Could not load comments.';return;}
     if(status)status.textContent='';
     const comments=Array.isArray(res.comments)?res.comments:[];
+    const previous=state.comments.get(postId);
     state.comments.set(postId,comments);
     const list=document.querySelector('#psn-social-modal-body .psn-social-comments-list');
     if(!list)return;
-    // Realtime events can report the same settled state more than once. Keep
-    // the existing comment rows (and their hover/focus/scroll) when unchanged.
-    // A new modal gets a new list node, so it always renders its first result.
-    const signature=JSON.stringify(comments);
-    if(list.__psnSocialCommentsSignature!==signature||state.focusReportedCommentId){
-      const markup=commentAreaMarkup(postId),tmp=document.createElement('div');tmp.innerHTML=markup;
-      const next=tmp.querySelector('.psn-social-comments-list');
-      if(next){list.replaceChildren(...next.childNodes);list.__psnSocialCommentsSignature=signature;}
-    }
+    reconcileSocialCommentRows(list,postId,previous,comments,JSON.stringify(comments));
     if(state.focusReportedCommentId){
       const row=list.querySelector(`[data-social-comment="${state.focusReportedCommentId}"]`);
       if(row){
