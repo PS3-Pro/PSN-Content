@@ -2528,8 +2528,10 @@ async function initDb() {
       author_name TEXT NOT NULL REFERENCES users(name) ON DELETE CASCADE,
       body TEXT NOT NULL DEFAULT '',
       images JSONB NOT NULL DEFAULT '[]'::jsonb,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      edited_at TIMESTAMPTZ
     );
+    ALTER TABLE social_posts ADD COLUMN IF NOT EXISTS edited_at TIMESTAMPTZ;
     CREATE INDEX IF NOT EXISTS idx_social_posts_newest ON social_posts(id DESC);
     CREATE TABLE IF NOT EXISTS social_post_reactions (
       post_id BIGINT NOT NULL REFERENCES social_posts(id) ON DELETE CASCADE,
@@ -12678,7 +12680,7 @@ function serializeSocialPost(row) {
   return {
     id: String(row.id), author: row.author_name, avatar: row.author_avatar || DEFAULT_AVATAR,
     text: row.body || '', images: Array.isArray(row.images) ? row.images : [],
-    createdAt: row.created_at, reactions: socialPublicReactions(row.reactions),
+    createdAt: row.created_at, editedAt: row.edited_at || null, reactions: socialPublicReactions(row.reactions),
     myReaction: row.my_reaction || '', comments: Number(row.comment_count) || 0
   };
 }
@@ -12694,7 +12696,7 @@ function serializeSocialComment(row) {
 
 async function socialReadFeed(actor, friendsOnly, before, focusId = null) {
   const result = await queryDbWithRetry(`
-    SELECT p.id, p.author_name, p.body, p.images, p.created_at,
+    SELECT p.id, p.author_name, p.body, p.images, p.created_at, p.edited_at,
       COALESCE(NULLIF(author.data->>'avatar',''), $4) AS author_avatar,
       COALESCE((SELECT jsonb_agg(jsonb_build_object('emoji',r.emoji,'count',r.cnt))
         FROM (SELECT emoji, COUNT(*) AS cnt FROM social_post_reactions WHERE post_id=p.id GROUP BY emoji) r), '[]'::jsonb) AS reactions,
@@ -12822,6 +12824,30 @@ io.on('connection', (socket) => {
       await createReport({msgId,targetUser:target.author_name,messageText:target.body,reason:`[Social ${kind} in post #${target.post_id}] ${reason}`},actor);
       reply({success:true});
     } catch (err) {console.error('[SOCIAL REPORT ERROR]:',err && err.message || err);reply({success:false,message:'Could not submit report.'});}
+  });
+
+  socket.on('social_post_edit', async (data = {}, callback) => {
+    const reply = typeof callback === 'function' ? callback : () => {};
+    const actor = normalizeSocialUserName(socket.userName);
+    const id = String(data.id || '');
+    const body = typeof data.text === 'string' ? data.text.trim() : '';
+    if (!actor || !/^\d{1,18}$/.test(id) || body.length > 3000)
+      return reply({success:false,message:'Invalid publication.'});
+    if (!socialRateLimit(actor, 'edit:'+id, 1500))
+      return reply({success:false,message:'Please wait before editing again.'});
+    try {
+      const result = await queryDbWithRetry(`
+        UPDATE social_posts SET body=$3, edited_at=NOW()
+        WHERE id=$1 AND author_name=$2 AND ($3<>'' OR jsonb_array_length(images)>0)
+        RETURNING id, body, edited_at
+      `, [id,actor,body], {attempts:2,label:'SOCIAL POST EDIT'});
+      if (!result.rows.length) return reply({success:false,message:'You cannot edit this publication, or its text cannot be empty.'});
+      socialPublish('edit',id);
+      reply({success:true,id,editedAt:result.rows[0].edited_at});
+    } catch(err) {
+      console.error('[SOCIAL POST EDIT ERROR]:',err && err.message || err);
+      reply({success:false,message:'Could not save the edit.'});
+    }
   });
 
   socket.on('social_post_delete', async (data = {}, callback) => {
