@@ -887,16 +887,62 @@ function waitMs(ms) {
   return new Promise(resolve => setTimeout(resolve, Math.max(0, Number(ms) || 0)));
 }
 
+// Lightweight, bounded PostgreSQL timing summaries. Disable with DB_PERF_ENABLED=0.
+// Only labels and timings are logged; SQL and private user data are never logged.
+const DB_PERF_ENABLED = process.env.DB_PERF_ENABLED !== '0';
+const DB_PERF_SLOW_MS = Math.max(300, Math.min(10000, parseInt(process.env.DB_PERF_SLOW_MS || '1200', 10) || 1200));
+const DB_PERF_INTERVAL_MS = Math.max(60000, Math.min(600000, parseInt(process.env.DB_PERF_INTERVAL_MS || '300000', 10) || 300000));
+const dbQueryPerf = new Map();
+function recordDbQueryPerformance(label, elapsedMs, attempts = 1, failed = false) {
+  if (!DB_PERF_ENABLED) return;
+  const key = dbQueryPerf.has(label) || dbQueryPerf.size < 80 ? label : 'OTHER';
+  let stats = dbQueryPerf.get(key);
+  if (!stats) {
+    stats = { calls:0, total:0, max:0, slow:0, errors:0, retries:0, samples:[], next:0, lastSlowLogAt:0 };
+    dbQueryPerf.set(key, stats);
+  }
+  stats.calls++;
+  stats.total += elapsedMs;
+  stats.max = Math.max(stats.max, elapsedMs);
+  if (failed) stats.errors++;
+  if (attempts > 1) stats.retries += attempts - 1;
+  stats.samples[stats.next++ % 64] = elapsedMs;
+  if (elapsedMs >= DB_PERF_SLOW_MS) {
+    stats.slow++;
+    if (Date.now() - stats.lastSlowLogAt >= 30000) {
+      stats.lastSlowLogAt = Date.now();
+      console.warn(`[DB SLOW] ${key}: ${elapsedMs}ms (${attempts} attempt(s), queue=${pool.waitingCount})`);
+    }
+  }
+}
+function flushDbQueryPerformance() {
+  if (!dbQueryPerf.size) return;
+  const summary = [...dbQueryPerf.entries()].map(([label, stats]) => {
+    const samples = stats.samples.slice().sort((a,b) => a-b);
+    return { label, calls:stats.calls, avgMs:Math.round(stats.total / stats.calls),
+      p95Ms:Math.round(samples[Math.ceil(samples.length * .95) - 1] || 0),
+      maxMs:stats.max, slow:stats.slow, errors:stats.errors, retries:stats.retries, totalMs:stats.total };
+  }).sort((a,b) => b.totalMs-a.totalMs).slice(0,8);
+  dbQueryPerf.clear();
+  console.log('[DB PERF 5MIN]', JSON.stringify({topQueries:summary, pool:{total:pool.totalCount, idle:pool.idleCount, waiting:pool.waitingCount}}));
+}
+
 async function queryDbWithRetry(text, params = [], options = {}) {
   const attempts = Math.max(1, Math.min(4, Number(options.attempts) || 2));
   const label = String(options.label || 'DB QUERY');
   let lastError = null;
+  const startedAt = DB_PERF_ENABLED ? Date.now() : 0;
   for (let attempt = 1; attempt <= attempts; attempt++) {
     try {
-      return await pool.query(text, params);
+      const result = await pool.query(text, params);
+      if (DB_PERF_ENABLED) recordDbQueryPerformance(label, Date.now() - startedAt, attempt);
+      return result;
     } catch (err) {
       lastError = err;
-      if (!isPgTransientConnectionError(err) || attempt >= attempts) throw err;
+      if (!isPgTransientConnectionError(err) || attempt >= attempts) {
+        if (DB_PERF_ENABLED) recordDbQueryPerformance(label, Date.now() - startedAt, attempt, true);
+        throw err;
+      }
       const delayMs = attempt === 1 ? 180 : 650;
       console.warn(`[${label}] Temporary PostgreSQL connection failure. Retrying ${attempt + 1}/${attempts} in ${delayMs}ms.`);
       await waitMs(delayMs);
@@ -2363,7 +2409,11 @@ function getAdminLogLimits() {
 
 async function refreshAdminStateFromDb() {
   try {
-    const stateRes = await queryDbWithRetry('SELECT state_key, data FROM admin_state', [], { attempts: 2, label: 'ADMIN STATE READ' });
+    const stateRes = await queryDbWithRetry(
+      'SELECT state_key, data FROM admin_state WHERE state_key = ANY($1::text[])',
+      [[ADMIN_STATE_KEYS.maintenance, ADMIN_STATE_KEYS.chatControls, ADMIN_STATE_KEYS.pinnedAnnouncement]],
+      { attempts: 2, label: 'ADMIN STATE READ' }
+    );
     stateRes.rows.forEach(row => {
       if (row.state_key === ADMIN_STATE_KEYS.maintenance) {
         adminState.maintenance = normalizeMaintenanceState(row.data || {});
@@ -8325,16 +8375,18 @@ async function resetChatSyncEpoch() {
 }
 
 async function getChatSyncSnapshotForUser(userName = '') {
+  // A single LIMITed query already returns the complete visible window. The
+  // sync epoch/revision checks around this snapshot detect concurrent writes.
+  // COUNT(*) OVER() would scan the entire chat table before LIMIT can apply.
   const result = await queryDbWithRetry(
-    "SELECT id, message - 'seenBy' - 'seenAt' AS message, (COUNT(*) OVER())::int AS total_count FROM chat ORDER BY id DESC LIMIT $1",
+    "SELECT id, message - 'seenBy' - 'seenAt' AS message FROM chat ORDER BY id DESC LIMIT $1",
     [MAX_CHAT_HISTORY],
     { attempts: 2, label: 'CHAT SYNC SNAPSHOT READ' }
   );
   const rows = result.rows.reverse();
-  const totalCount = rows.length ? Math.max(0, Number(rows[0].total_count) || 0) : 0;
   return {
     messages: rows.map(row => getPublicChatMessageForUser(attachChatDbId({ ...(row.message || {}) }, row.id), userName)),
-    expectedCount: Math.min(MAX_CHAT_HISTORY, totalCount)
+    expectedCount: rows.length
   };
 }
 
@@ -9122,12 +9174,13 @@ async function queryDirectConversationPayload(userName) {
            COALESCE(peer_read.last_read_id, 0) AS peer_last_read_id,
            COALESCE(usr.data->>'avatar', $3) AS peer_avatar,
            COALESCE(usr.data->>'lastSeen', '') AS peer_last_seen,
-           (
+           CASE WHEN l.sender_name = l.peer_name THEN l.created_at
+           ELSE (
              SELECT recent.created_at FROM direct_messages recent
              WHERE recent.sender_name=l.peer_name AND recent.recipient_name=$1
                AND recent.id>COALESCE(deleted.deleted_through_id,0)
              ORDER BY recent.id DESC LIMIT 1
-           ) AS peer_message_activity_at,
+           ) END AS peer_message_activity_at,
            EXISTS (
              SELECT 1 FROM presence_sessions ps
              WHERE ps.name = l.peer_name
@@ -9199,15 +9252,21 @@ async function markDirectConversationRead(userName, peerName, requestedLastId = 
   const requested = Math.max(0, Number(requestedLastId) || 0);
 
   const result = await queryDbWithRetry(`
-    WITH bounds AS (
-      SELECT COALESCE(MAX(id), 0) AS max_id,
-             COALESCE(MAX(id) FILTER (WHERE id = $3), 0) AS requested_id
-      FROM direct_messages
-      WHERE (sender_name = $1 AND recipient_name = $2)
-         OR (sender_name = $2 AND recipient_name = $1)
-    ), target AS (
-      SELECT CASE WHEN $3 > 0 THEN requested_id ELSE max_id END AS safe_id
-      FROM bounds
+    WITH target AS (
+      SELECT CASE WHEN $3::bigint > 0 THEN
+        COALESCE((SELECT id FROM direct_messages
+          WHERE id = $3::bigint
+            AND ((sender_name = $1 AND recipient_name = $2)
+              OR (sender_name = $2 AND recipient_name = $1))
+          LIMIT 1), 0)
+      ELSE GREATEST(
+        COALESCE((SELECT id FROM direct_messages
+          WHERE sender_name = $1 AND recipient_name = $2
+          ORDER BY id DESC LIMIT 1), 0),
+        COALESCE((SELECT id FROM direct_messages
+          WHERE sender_name = $2 AND recipient_name = $1
+          ORDER BY id DESC LIMIT 1), 0)
+      ) END AS safe_id
     ), existing AS (
       SELECT COALESCE((
         SELECT last_read_id FROM direct_message_read_state
@@ -10078,6 +10137,7 @@ async function initProfileSyncNotifications() {
       if (message.channel === 'user_notification_sync') {
         if (data.rewardNoticeUser) emitRewardNoticeChange(data.rewardNoticeUser);
         if (data.event) emitUserNotificationToLocalUser(data.event);
+        if (Array.isArray(data.createdEvents)) data.createdEvents.forEach(event => emitUserNotificationToLocalUser(event));
         if (Array.isArray(data.updatedEvents)) data.updatedEvents.forEach(event => emitUserNotificationToLocalUser(event, 'user_notification_updated'));
         if (data.readState && data.readState.userName) {
           emitUserNotificationReadStateToLocalUser(data.readState.userName, data.readState.lastReadId, data.readState.unreadCount);
@@ -11219,6 +11279,47 @@ async function notifyUserNotificationsClearedAcrossInstances(userName, throughId
   }
 }
 
+// Batch the notifications generated by one Social post. This avoids one
+// PostgreSQL retention query + one NOTIFY per friend while keeping the same
+// individual live event for each recipient on each server instance.
+async function notifyUserNotificationsCreatedAcrossInstances(events) {
+  const items = (Array.isArray(events) ? events : []).map(serializeUserNotificationRow).filter(Boolean);
+  if (!items.length) return;
+  let batch = [];
+  for (const item of items) {
+    const candidate = [...batch, item];
+    if (batch.length && Buffer.byteLength(JSON.stringify({createdEvents:candidate,instanceId:INSTANCE_ID}), 'utf8') > 7000) {
+      await pool.query('SELECT pg_notify($1, $2)', [
+        'user_notification_sync', JSON.stringify({createdEvents:batch,instanceId:INSTANCE_ID})
+      ]);
+      batch = [item];
+    } else {
+      batch = candidate;
+    }
+  }
+  if (batch.length) await pool.query('SELECT pg_notify($1, $2)', [
+    'user_notification_sync', JSON.stringify({createdEvents:batch,instanceId:INSTANCE_ID})
+  ]);
+}
+function publishStoredUserNotificationsBatch(rows) {
+  const events = (Array.isArray(rows) ? rows : []).map(serializeUserNotificationRow).filter(Boolean);
+  if (!events.length) return [];
+  const users = [...new Set(events.map(event => normalizeSocialUserName(event.user)).filter(Boolean))];
+  for (const event of events) emitUserNotificationToLocalUser(event);
+  if (users.length) deferServerTask('USER NOTIFICATION BATCH RETENTION', () => queryDbWithRetry(`
+    WITH cutoffs AS MATERIALIZED (
+      SELECT target.user_name,
+        (SELECT n.id FROM user_notifications n WHERE n.user_name=target.user_name
+         ORDER BY n.id DESC OFFSET $2 LIMIT 1) AS cutoff
+      FROM unnest($1::text[]) AS target(user_name)
+    )
+    DELETE FROM user_notifications n USING cutoffs c
+    WHERE n.user_name=c.user_name AND c.cutoff IS NOT NULL AND n.id<c.cutoff
+  `, [users, SOCIAL_HISTORY_MAX - 1], {attempts:2,label:'USER NOTIFICATION BATCH RETENTION'}), 0);
+  deferServerTask('USER NOTIFICATION BATCH SYNC', () => notifyUserNotificationsCreatedAcrossInstances(events), 0);
+  return events;
+}
+
 async function publishStoredUserNotification(row) {
   const event = serializeUserNotificationRow(row);
   if (!event) return null;
@@ -11526,20 +11627,37 @@ async function getUserNotificationHistory(userName, afterId = 0) {
   const name = normalizeSocialUserName(userName);
   const safeAfterId = Math.max(0, Math.floor(Number(afterId) || 0));
   if (!name) return { items: [], lastReadId: 0, unreadCount: 0, delta: safeAfterId > 0 };
-  const result = safeAfterId > 0
-    ? await queryDbWithRetry(
-        'SELECT id, user_name, event_type, data, created_at FROM user_notifications WHERE user_name = $1 AND id > $2 ORDER BY id DESC',
-        [name, safeAfterId],
-        { attempts: 2, label: 'USER NOTIFICATION DELTA' }
-      )
-    : await queryDbWithRetry(
-        'SELECT id, user_name, event_type, data, created_at FROM user_notifications WHERE user_name = $1 ORDER BY id DESC',
-        [name],
-        { attempts: 2, label: 'USER NOTIFICATION READ' }
-      );
-  const lastReadId = await getUserNotificationReadId(name);
-  const unreadCount = await getUserNotificationUnreadCount(name, lastReadId);
-  return { items: result.rows.map(serializeUserNotificationRow).filter(Boolean), lastReadId, unreadCount, delta: safeAfterId > 0 };
+  // A single round trip reads the history, read cursor and unread count.
+  // Both the list and unread counter continue to use the (user_name,id) index.
+  const deltaClause = safeAfterId > 0 ? 'AND n.id > $2::bigint' : '';
+  const result = await queryDbWithRetry(`
+    WITH read_cursor AS MATERIALIZED (
+      SELECT COALESCE((SELECT last_read_id FROM user_notification_read_state
+                       WHERE user_name=$1 LIMIT 1),0) AS last_read_id
+    ), unread AS (
+      SELECT COUNT(*)::int AS unread_count
+      FROM user_notifications unread_item CROSS JOIN read_cursor c
+      WHERE unread_item.user_name=$1 AND unread_item.id>c.last_read_id
+    )
+    SELECT n.id,n.user_name,n.event_type,n.data,n.created_at,
+      cursor.last_read_id, unread.unread_count
+    FROM read_cursor cursor CROSS JOIN unread
+    LEFT JOIN LATERAL (
+      SELECT n.id,n.user_name,n.event_type,n.data,n.created_at
+      FROM user_notifications n WHERE n.user_name=$1 ${deltaClause}
+      ORDER BY n.id DESC
+    ) n ON TRUE
+    ORDER BY n.id DESC
+  `, safeAfterId > 0 ? [name,safeAfterId] : [name],
+    { attempts:2, label: safeAfterId > 0 ? 'USER NOTIFICATION DELTA' : 'USER NOTIFICATION READ' });
+  const rows = result.rows || [];
+  const meta = rows[0] || {};
+  return {
+    items: rows.filter(row => row && row.id != null).map(serializeUserNotificationRow).filter(Boolean),
+    lastReadId: Math.max(0, Number(meta.last_read_id) || 0),
+    unreadCount: Math.max(0, Number(meta.unread_count) || 0),
+    delta: safeAfterId > 0
+  };
 }
 
 function serializeUserRewardNoticeRow(row) {
@@ -12639,6 +12757,10 @@ function startBackgroundTasks() {
   setInterval(presenceHeartbeatIntervalTask, PRESENCE_HEARTBEAT_MS);
   setInterval(chatPollIntervalTask, CHAT_SYNC_INTERVAL_MS);
   setInterval(() => logMemoryPressureIfNeeded('periodic'), 30000);
+  if (DB_PERF_ENABLED) {
+    const dbPerfTimer = setInterval(flushDbQueryPerformance, DB_PERF_INTERVAL_MS);
+    if (typeof dbPerfTimer.unref === 'function') dbPerfTimer.unref();
+  }
   if (ENABLE_PROFILE_PERIODIC_SYNC) {
     setInterval(profileSyncIntervalTask, PROFILE_SYNC_INTERVAL_MS);
   } else {
@@ -12911,20 +13033,59 @@ function readSocialFeedShared(actor, filter, before, focusId){
 }
 
 async function socialReadComments(actor, postId) {
+  // Aggregate the reactions for the latest 30 comments together, not in a
+  // separate correlated subquery for every comment in the modal.
   const result = await queryDbWithRetry(`
+    WITH comment_page AS MATERIALIZED (
+      SELECT id,post_id,author_name,body,created_at
+      FROM social_comments WHERE post_id=$2
+      ORDER BY id DESC LIMIT 30
+    ), reaction_counts AS (
+      SELECT r.comment_id,jsonb_agg(jsonb_build_object('emoji',r.emoji,'count',r.cnt)) AS reactions
+      FROM (
+        SELECT comment_id,emoji,COUNT(*)::int AS cnt
+        FROM social_comment_reactions
+        WHERE comment_id IN (SELECT id FROM comment_page)
+        GROUP BY comment_id,emoji
+      ) r GROUP BY r.comment_id
+    )
     SELECT c.id,c.post_id,c.author_name,c.body,c.created_at,
       COALESCE(NULLIF(u.data->>'avatar',''),$3) AS author_avatar,
-      COALESCE((SELECT jsonb_agg(jsonb_build_object('emoji',r.emoji,'count',r.cnt)) FROM
-        (SELECT emoji,COUNT(*) AS cnt FROM social_comment_reactions WHERE comment_id=c.id GROUP BY emoji) r),'[]'::jsonb) AS reactions,
-      (SELECT emoji FROM social_comment_reactions WHERE comment_id=c.id AND user_name=$1) AS my_reaction
-    FROM (SELECT * FROM social_comments WHERE post_id=$2 ORDER BY id DESC LIMIT 30) c
-    JOIN users u ON u.name=c.author_name ORDER BY c.id ASC
+      COALESCE(rc.reactions,'[]'::jsonb) AS reactions,
+      mine.emoji AS my_reaction
+    FROM comment_page c
+    JOIN users u ON u.name=c.author_name
+    LEFT JOIN reaction_counts rc ON rc.comment_id=c.id
+    LEFT JOIN social_comment_reactions mine ON mine.comment_id=c.id AND mine.user_name=$1
+    ORDER BY c.id ASC
   `,[actor,postId,DEFAULT_AVATAR],{attempts:2,label:'SOCIAL COMMENTS'});
   return (result.rows||[]).map(serializeSocialComment);
 }
 
+// Several tabs or a burst of realtime events can ask for the same modal
+// contents at once. Share only in-flight reads: a confirmed mutation always
+// invalidates them so the next request can see the newest comments/reactions.
+const socialCommentsPending = new Map();
+function readSocialCommentsShared(actor, postId) {
+  const key = `${actor}\u0000${postId}`;
+  let pending = socialCommentsPending.get(key);
+  if (pending) return pending;
+  pending = socialReadComments(actor, postId);
+  socialCommentsPending.set(key, pending);
+  pending.finally(() => {
+    if (socialCommentsPending.get(key) === pending) socialCommentsPending.delete(key);
+  }).catch(() => {});
+  return pending;
+}
+
 function socialPublish(kind, id, extra = null) {
   socialFeedPending.clear();
+  if (kind === 'comment' || kind === 'comment-delete' || (kind === 'react' && extra && extra.commentId)) {
+    const suffix = `\u0000${String(id || '')}`;
+    for (const key of socialCommentsPending.keys()) {
+      if (key.endsWith(suffix)) socialCommentsPending.delete(key);
+    }
+  }
   const payload = { kind, id: String(id || ''), ...(extra && typeof extra === 'object' ? extra : {}), at: Date.now() };
   io.emit('social_feed_changed', payload);
   deferServerTask('SOCIAL FEED NOTIFY', () => pool.query('SELECT pg_notify($1,$2)',[
@@ -12952,7 +13113,7 @@ async function socialAnnounceNewPost(actor, id, text) {
     ON CONFLICT (dedupe_key) DO NOTHING
     RETURNING id,user_name,event_type,data,created_at
   `,[actor,String(id),preview],{attempts:2,label:'SOCIAL FRIEND POST NOTIFICATIONS'});
-  for (const row of result.rows || []) await publishStoredUserNotification(row);
+  publishStoredUserNotificationsBatch(result.rows || []);
 }
 
 function socialNotifyAuthor(author, actor, postId, activity) {
@@ -13208,7 +13369,7 @@ io.on('connection', (socket) => {
     const actor = normalizeSocialUserName(socket.userName);
     const id = String(data.postId || '');
     if (!actor || !/^\d{1,18}$/.test(id)) return reply({success:false,message:'Invalid post.'});
-    try { reply({success:true, comments:await socialReadComments(actor,id)}); }
+    try { reply({success:true, comments:await readSocialCommentsShared(actor,id)}); }
     catch (err) { console.error('[SOCIAL COMMENTS ERROR]:',err && err.message || err); reply({success:false,message:'Could not load comments.'}); }
   });
 
@@ -14880,7 +15041,7 @@ io.on('connection', (socket) => {
             const clientTail = normalizeText(request.lastMessageTime, '').slice(0, 80);
             const clientTailUser = normalizeText(request.lastMessageUser, '').slice(0, 120);
             const tailResult = await queryDbWithRetry(
-              "SELECT message->>'time' AS msg_time, message->>'user' AS msg_user, (SELECT LEAST(COUNT(*), $1) FROM chat) AS message_count FROM chat ORDER BY id DESC LIMIT 1",
+              "SELECT message->>'time' AS msg_time, message->>'user' AS msg_user, (SELECT COUNT(*) FROM (SELECT 1 FROM chat ORDER BY id DESC LIMIT $1) AS recent) AS message_count FROM chat ORDER BY id DESC LIMIT 1",
               [MAX_CHAT_HISTORY],
               { attempts: 2, label: 'CHAT SYNC TAIL CHECK' }
             );
@@ -15182,17 +15343,21 @@ io.on('connection', (socket) => {
     try {
       const startedAt = Date.now();
       const requestId = Math.max(0, Math.floor(Number(_data && _data.requestId) || 0));
+      // Start the authoritative list immediately. A preview may arrive first to
+      // populate the UI, but must never overwrite a finished full list.
+      const listPromise = readDirectGroupListShared(viewer);
+      let fullListReady = false;
+      listPromise.then(() => { fullListReady = true; }, () => { fullListReady = true; });
       if (_data && _data.preview === true && requestId > 0) {
-        try {
-          const preview = await readDirectGroupPreviewShared(viewer);
-          if (socket.connected && socket.userName === viewer) {
+        readDirectGroupPreviewShared(viewer).then(preview => {
+          if (!fullListReady && socket.connected && socket.userName === viewer) {
             socket.emit('direct_group_list_preview', { requestId, groups:preview });
           }
-        } catch (previewError) {
-          console.warn('[GROUP PREVIEW] Falling back to complete list:', previewError && previewError.message || previewError);
-        }
+        }).catch(previewError => {
+          console.warn('[GROUP PREVIEW] Using complete list:', previewError && previewError.message || previewError);
+        });
       }
-      const groups = await readDirectGroupListShared(viewer);
+      const groups = await listPromise;
       const durationMs = Date.now() - startedAt;
       if (durationMs > 1200) console.warn(`[GROUP LIST SLOW] ${durationMs}ms, ${groups.length} group(s)`);
       reply({success:true,groups});
@@ -15285,7 +15450,12 @@ io.on('connection', (socket) => {
     try{
       const member=await getDirectGroupMember(id,viewer);
       if(!member)return reply({success:false,message:'Not a group member.'});
-      const last=await pool.query('SELECT COALESCE(MAX(id),0) AS id FROM direct_group_messages WHERE group_id=$1 AND created_at>=$2 AND id<=$3',[id,member.joined_at,requested]);
+      // A repeated read receipt is already acknowledged; skip a redundant DB lookup.
+      if (requested<=Number(member.last_read_id)) {
+        return reply({success:true,lastMessageId:String(member.last_read_id)});
+      }
+      // A backward index seek finds the newest valid message without aggregating the history.
+      const last=await pool.query('SELECT id FROM direct_group_messages WHERE group_id=$1 AND id<=$3 AND created_at>=$2 ORDER BY id DESC LIMIT 1',[id,member.joined_at,requested]);
       const lastId=Number(last.rows?.[0]?.id)||0;
       if(!lastId)return reply({success:true});
       if(lastId>Number(member.last_read_id)){

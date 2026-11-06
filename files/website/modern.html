@@ -20970,6 +20970,10 @@ P
     const DEFAULT_RENDER_LIMIT = 56; 
     let renderLimit = DEFAULT_RENDER_LIMIT;
 	let scrollObserver_Infinite = null;
+	let scrollObserverInfiniteRoot = null;
+	let scrollObserverInfiniteRootMargin = "";
+	let scrollObserverInfiniteSentinel = null;
+	let browseInfiniteLoading = false;
 	const LOAD_AMOUNT = 100;
 
 	let g_browseViewportCache = null;
@@ -24240,13 +24244,35 @@ P
         return urls;
     }
 
+    async function waitForExploreBackgroundCoverWindow() {
+        while (!navigator.connection?.saveData) {
+            if (document.hidden) {
+                await new Promise(resolve => {
+                    const onVisible = () => {
+                        if (document.hidden) return;
+                        document.removeEventListener('visibilitychange', onVisible);
+                        resolve();
+                    };
+                    document.addEventListener('visibilitychange', onVisible, { passive: true });
+                    if (!document.hidden) onVisible();
+                });
+            }
+            await bootLowPriorityPause(0, 'low');
+            if (!document.hidden) return !navigator.connection?.saveData;
+        }
+        return false;
+    }
+
     async function preloadExploreCoverImages(options = {}) {
         const exploreView = document.getElementById('view-explore');
         if (!exploreView) return;
 
         const visibleOnly = options.visibleOnly !== false;
+        if (!visibleOnly && navigator.connection?.saveData) return;
         const timeout = Math.max(0, Number(options.timeout) || (visibleOnly ? 1800 : 0));
-        const batchSize = Math.max(1, Number(options.batchSize) || 16);
+        const requestedBatchSize = Math.max(1, Number(options.batchSize) || 16);
+        const slowNetwork = /^(?:slow-2g|2g|3g)$/i.test(String(navigator.connection?.effectiveType || ''));
+        const batchSize = visibleOnly ? requestedBatchSize : Math.min(requestedBatchSize, slowNetwork ? 3 : 6);
         const urls = [];
         const queuedUrls = new Set();
 
@@ -24292,8 +24318,8 @@ P
         }
 
         for (let i = 0; i < urls.length; i += batchSize) {
+            if (!await waitForExploreBackgroundCoverWindow()) return;
             await Promise.allSettled(urls.slice(i, i + batchSize).map(loadUrl));
-            if (i + batchSize < urls.length) await bootLowPriorityPause(0, 'low');
         }
     }
 
@@ -24308,7 +24334,9 @@ P
             else setTimeout(warm, 600);
         };
 
-        if (document.readyState === 'complete') run();
+        if (typeof window.runPsnAfterHomeInteractive === 'function') {
+            window.runPsnAfterHomeInteractive(run);
+        } else if (document.readyState === 'complete') run();
         else window.addEventListener('load', run, { once: true });
     }
 
@@ -35913,39 +35941,56 @@ P
 		}
 	}
 
+	function stopBrowseInfiniteScroll(grid = document.getElementById('database-grid')) {
+		if (scrollObserver_Infinite) scrollObserver_Infinite.disconnect();
+		scrollObserver_Infinite = null;
+		scrollObserverInfiniteRoot = null;
+		scrollObserverInfiniteRootMargin = '';
+		scrollObserverInfiniteSentinel = null;
+		const sentinel = grid && grid.querySelector(':scope > #infinite-scroll-sentinel');
+		if (sentinel) sentinel.remove();
+	}
+
 	window.setupInfiniteScroll = function() {
 		const grid = document.getElementById('database-grid');
-		const scrollArea = document.getElementById('scroll-area') || document.querySelector('.content'); 
-		
+		const scrollArea = document.getElementById('scroll-area') || document.querySelector('.content');
 		if (!grid || !scrollArea) return;
 
-		const rootMargin = (typeof getBrowseInfiniteRootMargin === 'function') ? getBrowseInfiniteRootMargin() : '900px';
-		if (scrollObserver_Infinite) {
-			try { scrollObserver_Infinite.disconnect(); } catch(e) {}
+		const rootMargin = typeof getBrowseInfiniteRootMargin === 'function' ? getBrowseInfiniteRootMargin() : '900px';
+		let sentinel = grid.querySelector(':scope > #infinite-scroll-sentinel');
+		if (!sentinel) {
+			sentinel = document.createElement('div');
+			sentinel.id = 'infinite-scroll-sentinel';
+			sentinel.style.cssText = 'height: 20px; grid-column: 1/-1; opacity: 0; pointer-events: none;';
+			grid.appendChild(sentinel);
+		} else if (sentinel !== grid.lastElementChild) {
+			grid.appendChild(sentinel);
 		}
-		scrollObserver_Infinite = new IntersectionObserver((entries) => {
-			if (entries[0].isIntersecting) {
-				if (typeof filteredData !== 'undefined' && (window.__browseRenderDataLength || filteredData.length) > renderLimit) {
-					renderLimit += (typeof getBrowseLoadAmount === 'function' ? getBrowseLoadAmount() : LOAD_AMOUNT);
+
+		if (!scrollObserver_Infinite || scrollObserverInfiniteRoot !== scrollArea || scrollObserverInfiniteRootMargin !== rootMargin) {
+			if (scrollObserver_Infinite) scrollObserver_Infinite.disconnect();
+			scrollObserver_Infinite = new IntersectionObserver(entries => {
+				if (browseInfiniteLoading || !entries.some(entry => entry.isIntersecting && entry.target === scrollObserverInfiniteSentinel && entry.target.isConnected)) return;
+				if (typeof filteredData === 'undefined' || (window.__browseRenderDataLength || filteredData.length) <= renderLimit) return;
+				browseInfiniteLoading = true;
+				try {
+					renderLimit += typeof getBrowseLoadAmount === 'function' ? getBrowseLoadAmount() : LOAD_AMOUNT;
 					window.renderGrid(true);
+				} finally {
+					browseInfiniteLoading = false;
 				}
-			}
-		}, { 
-			root: scrollArea,
-			rootMargin
-		});
-	
-		const oldSentinel = document.getElementById('infinite-scroll-sentinel');
-		if (oldSentinel) oldSentinel.remove();
-	
-		const sentinel = document.createElement('div');
-		sentinel.id = 'infinite-scroll-sentinel';
-		sentinel.style.cssText = "height: 20px; grid-column: 1/-1; opacity: 0; pointer-events: none;";
-		grid.appendChild(sentinel);
-	
-		scrollObserver_Infinite.observe(sentinel);
+			}, { root: scrollArea, rootMargin });
+			scrollObserverInfiniteRoot = scrollArea;
+			scrollObserverInfiniteRootMargin = rootMargin;
+			scrollObserverInfiniteSentinel = null;
+		}
+		if (scrollObserverInfiniteSentinel !== sentinel) {
+			if (scrollObserverInfiniteSentinel) scrollObserver_Infinite.unobserve(scrollObserverInfiniteSentinel);
+			scrollObserverInfiniteSentinel = sentinel;
+			scrollObserver_Infinite.observe(sentinel);
+		}
 	};
-	
+
 	function reconcileBrowseGroupTitleCards(grid, backButtonHtml, cardsHtml) {
 		const fragment = document.createElement('template');
 		fragment.innerHTML = backButtonHtml + cardsHtml;
@@ -36155,6 +36200,8 @@ P
 			}
 			
 			if (!renderItems.length || !filteredData.length) {
+				stopBrowseInfiniteScroll(grid);
+				grid.dataset.browseRenderedCount = '0';
 				unregisterContentDownloadCountElements(grid);
 				grid.innerHTML = backButtonHtml;
 			}
@@ -36247,11 +36294,16 @@ P
 			}
 		}
 		
-		const currentLoadAmount = typeof getBrowseLoadAmount === 'function' ? getBrowseLoadAmount() : LOAD_AMOUNT;
-		const startIndex = isAppending ? Math.max(0, renderLimit - currentLoadAmount) : 0;
+		const previouslyRendered = Number(grid.dataset.browseRenderedCount);
+		const startIndex = isAppending
+			? (Number.isFinite(previouslyRendered) && previouslyRendered >= 0
+				? Math.min(previouslyRendered, renderItems.length)
+				: Math.max(0, renderLimit - (typeof getBrowseLoadAmount === 'function' ? getBrowseLoadAmount() : LOAD_AMOUNT)))
+			: 0;
 		const limit = Math.min(renderLimit, renderItems.length);
 		
 		if (startIndex >= limit) {
+			if (renderItems.length <= limit) stopBrowseInfiniteScroll(grid);
 			if (!isAppending && !suppressGroupTitleTransitionReveal) {
 				unregisterContentDownloadCountElements(grid);
 				grid.innerHTML = backButtonHtml;
@@ -36412,13 +36464,13 @@ P
 		
 		let appendedDownloadCountElements = null;
 		if (isAppending) {
-			const oldSentinel = document.getElementById('infinite-scroll-sentinel');
-			if (oldSentinel) oldSentinel.remove();
-			const previousLastChild = grid.lastElementChild;
-			grid.insertAdjacentHTML('beforeend', htmlChunks.join(''));
+			const sentinel = grid.querySelector(':scope > #infinite-scroll-sentinel');
+			const previousLastChild = sentinel ? sentinel.previousElementSibling : grid.lastElementChild;
+			if (sentinel) sentinel.insertAdjacentHTML('beforebegin', htmlChunks.join(''));
+			else grid.insertAdjacentHTML('beforeend', htmlChunks.join(''));
 			appendedDownloadCountElements = [];
 			let appendedNode = previousLastChild ? previousLastChild.nextElementSibling : grid.firstElementChild;
-			while (appendedNode) {
+			while (appendedNode && appendedNode !== sentinel) {
 				if (appendedNode.querySelectorAll) appendedDownloadCountElements.push(...appendedNode.querySelectorAll('.content-download-card-count'));
 				appendedNode = appendedNode.nextElementSibling;
 			}
@@ -36481,10 +36533,9 @@ P
 			window.applyContentDownloadCountsToCards(grid, isAppending ? { elements: appendedDownloadCountElements || [] } : {});
 		}
 
-		if (renderItems.length > limit) {
-			setupInfiniteScroll();
-		}
-		
+		grid.dataset.browseRenderedCount = String(limit);
+		if (renderItems.length > limit) setupInfiniteScroll();
+		else stopBrowseInfiniteScroll(grid);
 	};
     
     function getVisibleRevealRootRect(explicitRoot = null) {
@@ -56663,20 +56714,28 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 				return;
 			}
 
+			// Wait for the finite entry effects without scanning all cover animations every frame.
+			// A bounded wait also handles CSS classes that remain after their animations finish.
+			const waitStartedAt = performance.now();
 			const refreshAfterEntryAnimations = () => {
 				if (!isPsnDomSectionVisible('view-wishlist')) return;
 				const grid = document.getElementById('wishlist-grid');
 				if (!grid) return;
 
-				const revealRunning = !!grid.querySelector('.anim-reveal');
-				const categoryRevealRunning = !!grid.querySelector('.category-wishlist-entry, .category-new-highlight');
-				const imageFadeRunning = Array.from(grid.querySelectorAll('.game-img')).some(img => {
-					if (typeof img.getAnimations !== 'function') return false;
-					return img.getAnimations().some(animation => animation.playState === 'running');
-				});
+				const revealRunning = !!grid.querySelector('.anim-reveal, .category-wishlist-entry, .category-new-highlight');
+				let imageFadeRunning = false;
+				if (!revealRunning) for (const img of grid.querySelectorAll('.game-img')) {
+					if (typeof img.getAnimations !== 'function') continue;
+					if (img.getAnimations().some(animation => {
+						if (animation.playState !== 'running') return false;
+						const timing = animation.effect && typeof animation.effect.getComputedTiming === 'function'
+							? animation.effect.getComputedTiming() : null;
+						return !timing || (timing.iterations !== Infinity && timing.endTime !== Infinity);
+					})) { imageFadeRunning = true; break; }
+				}
 
-				if (revealRunning || categoryRevealRunning || imageFadeRunning) {
-					requestAnimationFrame(refreshAfterEntryAnimations);
+				if ((revealRunning || imageFadeRunning) && performance.now() - waitStartedAt < 12000) {
+					setTimeout(refreshAfterEntryAnimations, 100);
 					return;
 				}
 
@@ -61477,7 +61536,10 @@ function formatLibraryLastPlayedBadge(game = {}) {
 	}
 	
 	function getLocalLibraryFavoritesSignature() {
-		return (favoritesLibrary || []).map(f => f.path || '').sort().join('|');
+		const lookups = getLibraryCardLookups();
+		if (typeof lookups.favoritesSignature === 'string') return lookups.favoritesSignature;
+		lookups.favoritesSignature = (favoritesLibrary || []).map(f => f.path || '').sort().join('|');
+		return lookups.favoritesSignature;
 	}
 	
 	function getLocalLibraryRenderSignature(games) {
@@ -61693,19 +61755,44 @@ function formatLibraryLastPlayedBadge(game = {}) {
 		return changed;
 	};
 
+	// Reuse the same membership/index lookups across progressive My Games batches.
+	// The existing collection revisions invalidate these maps on real data changes.
+	let libraryCardLookups = null;
+	function getLibraryCardLookups() {
+		const source = lastScannedGames || [];
+		const favorites = favoritesLibrary || [];
+		const libraryRevision = Number(window.__libraryDataRevision || 0);
+		const favoritesRevision = Number(window.__favoritesDataRevision || 0);
+		const cached = libraryCardLookups;
+		if (cached && cached.source === source && cached.favorites === favorites &&
+			cached.sourceLength === source.length && cached.favoritesLength === favorites.length &&
+			cached.sourceFirst === source[0] && cached.sourceLast === source[source.length - 1] &&
+			cached.favoritesFirst === favorites[0] && cached.favoritesLast === favorites[favorites.length - 1] &&
+			cached.libraryRevision === libraryRevision && cached.favoritesRevision === favoritesRevision) return cached;
+
+		const favoritePaths = new Set();
+		for (const item of favorites) if (item && item.path) favoritePaths.add(item.path);
+		const sourceIndexByObject = new Map();
+		source.forEach((game, index) => sourceIndexByObject.set(game, index));
+		libraryCardLookups = {
+			source, favorites, sourceLength:source.length, favoritesLength:favorites.length,
+			sourceFirst:source[0], sourceLast:source[source.length - 1],
+			favoritesFirst:favorites[0], favoritesLast:favorites[favorites.length - 1],
+			libraryRevision, favoritesRevision, favoritePaths, sourceIndexByObject
+		};
+		return libraryCardLookups;
+	}
+
 	function getLocalLibraryVisiblePrefixSignature(games, count) {
 		const visible = (games || []).slice(0, count);
-		const favoritePaths = new Set();
-		for (const item of (favoritesLibrary || [])) if (item && item.path) favoritePaths.add(item.path);
-		const sourceIndexes = new Map();
-		(lastScannedGames || []).forEach((game, index) => sourceIndexes.set(game, index));
+		const { favoritePaths, sourceIndexByObject } = getLibraryCardLookups();
 		const playing = window.myCurrentPS3Status || {};
 		const dataSignature = getLocalLibraryDataSignature(visible);
 		const sourcePositions = [];
 		const favoriteFlags = [];
 		const playTogetherFlags = [];
 		for (const game of visible) {
-			sourcePositions.push(sourceIndexes.has(game) ? sourceIndexes.get(game) : -1);
+			sourcePositions.push(sourceIndexByObject.has(game) ? sourceIndexByObject.get(game) : -1);
 			favoriteFlags.push(favoritePaths.has(game.path) ? '1' : '0');
 			const id = normalizeGamePlayersTitleId(getLibraryGameTitleId(game));
 			playTogetherFlags.push(id && typeof window.isViewerPlayTogetherTitle === 'function' && window.isViewerPlayTogetherTitle(id) ? '1' : '0');
@@ -61854,13 +61941,7 @@ function formatLibraryLastPlayedBadge(game = {}) {
 	
 		const currentPlaying = window.myCurrentPS3Status || { status: 'idle' };
 		const ip = PSN_STATIC_NAV_DOM.ps3Ip?.value || '';
-		const favoriteLibraryPaths = new Set();
-		for (const fav of (favoritesLibrary || [])) if (fav && fav.path) favoriteLibraryPaths.add(fav.path);
-		const lastScannedIndexByObject = new WeakMap();
-		for (let index = 0; index < (lastScannedGames || []).length; index++) {
-			const item = lastScannedGames[index];
-			if (item && typeof item === 'object') lastScannedIndexByObject.set(item, index);
-		}
+		const { favoritePaths:favoriteLibraryPaths, sourceIndexByObject:lastScannedIndexByObject } = getLibraryCardLookups();
 
 		const libraryRenderedBefore = canAppend ? Number(grid.dataset.progressiveGridRendered || 0) : 0;
 		const libraryResetTarget = (!canAppend && isSilent && libraryPreviouslyRendered > 0)
@@ -85337,6 +85418,7 @@ function getVisibleChatStackEl(id) {
       const prior=group.lastMessage;
       const newer=!prior||Number(message.id)>Number(prior.id);
       if(newer||String(prior.id)===String(message.id)){
+        const previousSummary=JSON.stringify([prior?.id,prior?.from,prior?.text,prior?.createdAt,prior?.recipients,prior?.readBy,group.unread]);
         group.lastMessage={
           id:String(message.id),from:message.from,
           text:message.type==='poll'?'📊 Created a poll.':message.text,
@@ -85350,7 +85432,8 @@ function getVisibleChatStackEl(id) {
             chat?.style.display!=='none'&&document.getElementById('direct-group-thread')?.classList.contains('is-open');
           if(!inThread)group.unread=Math.max(0,Number(group.unread)||0)+1;
         }
-        changed=true;
+        const current=group.lastMessage;
+        changed=previousSummary!==JSON.stringify([current?.id,current?.from,current?.text,current?.createdAt,current?.recipients,current?.readBy,group.unread]);
       }
     }else if(kind==='delete'&&String(group.lastMessage?.id||'')===String(payload.id||'')){
       group.lastMessage=null;
@@ -112371,6 +112454,7 @@ function getVisibleChatStackEl(id) {
 			record.animations.clear();
 			records.delete(el);
 			try { el.removeAttribute(INFINITE_ANIMATION_HOST_ATTR); } catch (e) {}
+			if (!records.size) syncAnimationCleanupObserverActivity();
 		}
 
 		function unregisterAnimation(animation) {
@@ -112440,6 +112524,7 @@ function getVisibleChatStackEl(id) {
 				records.set(host, record);
 				try { host.setAttribute(INFINITE_ANIMATION_HOST_ATTR, '1'); } catch (e) {}
 				try { viewportObserver.observe(host); } catch (e) { records.delete(host); try { host.removeAttribute(INFINITE_ANIMATION_HOST_ATTR); } catch (err) {} return; }
+				if (records.size === 1) syncAnimationCleanupObserverActivity();
 			}
 
 			let sourceSet = sourceAnimations.get(sourceTarget);
@@ -112494,9 +112579,13 @@ function getVisibleChatStackEl(id) {
 			});
 		}
 
-		function discoverCurrentInfiniteAnimations() {
+		function discoverCurrentInfiniteAnimations(scope = null) {
 			let animations = [];
-			try { animations = document.getAnimations() || []; } catch (e) { return; }
+			try {
+				animations = scope && typeof scope.getAnimations === 'function'
+					? scope.getAnimations({ subtree:true }) || []
+					: document.getAnimations() || [];
+			} catch (e) { return; }
 			animations.forEach(registerAnimation);
 		}
 
@@ -112510,7 +112599,7 @@ function getVisibleChatStackEl(id) {
 		function syncAnimationCleanupObserverActivity() {
 			if (!animationCleanupObserver || !document.body) return;
 			try { animationCleanupObserver.disconnect(); } catch (e) {}
-			if (!document.hidden) animationCleanupObserver.observe(document.body, { subtree: true, childList: true });
+			if (!document.hidden && records.size) animationCleanupObserver.observe(document.body, { subtree: true, childList: true });
 		}
 		if (document.body && typeof MutationObserver === 'function') {
 			animationCleanupObserver = new MutationObserver(mutations => {
@@ -112558,7 +112647,19 @@ function getVisibleChatStackEl(id) {
 			});
 		}, { passive: true });
 
-		discoverCurrentInfiniteAnimations();
+		// During login, only the boot layer is visible. Discover its animations now;
+		// scan the full app once Home is ready, not on the critical Starting path.
+		const bootLayer = document.getElementById('ps5-boot-container');
+		if (bootLayer && !document.body?.classList.contains('psn-home-interactive') && typeof bootLayer.getAnimations === 'function') {
+			discoverCurrentInfiniteAnimations(bootLayer);
+			if (typeof window.runPsnAfterHomeInteractive === 'function') {
+				window.runPsnAfterHomeInteractive(discoverCurrentInfiniteAnimations);
+			} else {
+				window.addEventListener('load', discoverCurrentInfiniteAnimations, { once:true });
+			}
+		} else {
+			discoverCurrentInfiniteAnimations();
+		}
 	})();
 	</script>
 
@@ -113003,10 +113104,24 @@ function getVisibleChatStackEl(id) {
             if (scope.nodeType !== 1 || scope.firstElementChild) scope.querySelectorAll(allEdgeSelector).forEach(bindEdge);
         }
 
-        if (document.readyState === 'loading') {
-            document.addEventListener('DOMContentLoaded', () => scan(document), { once:true });
-        } else {
+        // Run the initial full-tree scan during an idle slot in Preparing. Ensure
+        // scroll edges are initialized before Home becomes interactive.
+        let initialEdgeScanDone = false;
+        const scanInitialEdges = () => {
+            if (initialEdgeScanDone) return;
+            initialEdgeScanDone = true;
             scan(document);
+        };
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', () => {
+                if (typeof requestIdleCallback === 'function') requestIdleCallback(scanInitialEdges, { timeout:1500 });
+                else setTimeout(scanInitialEdges, 0);
+            }, { once:true });
+        } else {
+            scanInitialEdges();
+        }
+        if (typeof window.runPsnAfterHomeInteractive === 'function') {
+            window.runPsnAfterHomeInteractive(scanInitialEdges, { beforeReveal:true });
         }
 
         window.addEventListener('resize', () => {
@@ -113047,9 +113162,14 @@ function getVisibleChatStackEl(id) {
         function queueEdgeChange(root, removed = false) {
             if (!root || (root.nodeType !== 1 && root.nodeType !== 11)) return;
             if (removed) {
-                if (!observedEdges.size) return;
+                if (!observedEdges.size || (root.nodeType === 1 && !root.firstElementChild && !edgeBound.has(root))) return;
                 pendingEdgeRemoval = true;
-            } else pendingRoots.add(root);
+            } else {
+                // Frequent text-only chat/reaction leaves cannot contain a scroll container;
+                // avoid scheduling a full selector scan for them on every DOM update.
+                if (root.nodeType === 1 && !root.firstElementChild && !root.matches(allEdgeSelector)) return;
+                pendingRoots.add(root);
+            }
             if (!pendingScanFrame) pendingScanFrame = requestAnimationFrame(flushEdgeChanges);
         }
 
@@ -113071,7 +113191,28 @@ function getVisibleChatStackEl(id) {
                 record.removedNodes?.forEach(node => queueEdgeChange(node, true));
             }
         });
-        if (document.documentElement) rootObserver.observe(document.documentElement, { childList:true, subtree:true });
+        const observeRootWhenVisible = () => {
+            rootObserver.disconnect();
+            if (!document.hidden && document.documentElement) {
+                rootObserver.observe(document.documentElement, { childList:true, subtree:true });
+            }
+        };
+        observeRootWhenVisible();
+        document.addEventListener('visibilitychange', () => {
+            observeRootWhenVisible();
+            if (document.hidden) {
+                // Hidden views do not need scroll gradients. A complete scan on return
+                // reconciles nodes added or removed while the tab was in background.
+                if (pendingScanFrame) cancelAnimationFrame(pendingScanFrame);
+                pendingScanFrame = 0;
+                pendingRoots.clear();
+                pendingEdgeRemoval = false;
+                return;
+            }
+            pendingEdgeRemoval = true;
+            queueEdgeChange(document.documentElement);
+            for (const el of observedEdges) if (el.isConnected) scheduleEdge(el);
+        }, { passive:true });
     })();
 
     (function initPsnUiPolish(){
@@ -114129,12 +114270,19 @@ function getVisibleChatStackEl(id) {
     const status=document.getElementById('psn-social-modal-status');
     if(!res.success){if(status)status.textContent=res.message||'Could not load comments.';return;}
     if(status)status.textContent='';
-    state.comments.set(postId,res.comments||[]);
+    const comments=Array.isArray(res.comments)?res.comments:[];
+    state.comments.set(postId,comments);
     const list=document.querySelector('#psn-social-modal-body .psn-social-comments-list');
     if(!list)return;
-    const markup=commentAreaMarkup(postId),tmp=document.createElement('div');tmp.innerHTML=markup;
-    const next=tmp.querySelector('.psn-social-comments-list');
-    if(next)list.replaceChildren(...next.childNodes);
+    // Realtime events can report the same settled state more than once. Keep
+    // the existing comment rows (and their hover/focus/scroll) when unchanged.
+    // A new modal gets a new list node, so it always renders its first result.
+    const signature=JSON.stringify(comments);
+    if(list.__psnSocialCommentsSignature!==signature||state.focusReportedCommentId){
+      const markup=commentAreaMarkup(postId),tmp=document.createElement('div');tmp.innerHTML=markup;
+      const next=tmp.querySelector('.psn-social-comments-list');
+      if(next){list.replaceChildren(...next.childNodes);list.__psnSocialCommentsSignature=signature;}
+    }
     if(state.focusReportedCommentId){
       const row=list.querySelector(`[data-social-comment="${state.focusReportedCommentId}"]`);
       if(row){
