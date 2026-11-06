@@ -13099,6 +13099,44 @@ io.on('connection', (socket) => {
     }
   });
 
+
+  // Reaction details are loaded only when someone opens a post/comment reaction list.
+  socket.on('social_reactors_list', async (data = {}, callback) => {
+    const reply = typeof callback === 'function' ? callback : () => {};
+    const actor = normalizeSocialUserName(socket.userName);
+    if (!actor) return reply({ success:false, code:'session_pending' });
+    const id = String(data.id || '');
+    const kind = data.kind === 'comment' ? 'comment' : 'post';
+    const emoji = String(data.emoji || '');
+    const after = String(data.after || '');
+    if (!/^\d{1,18}$/.test(id) || (emoji && !SOCIAL_EMOJI.has(emoji)) || after.length > 120) {
+      return reply({ success:false, message:'Invalid reaction request.' });
+    }
+    const table = kind === 'comment' ? 'social_comment_reactions' : 'social_post_reactions';
+    const key = kind === 'comment' ? 'comment_id' : 'post_id';
+    try {
+      const result = await queryDbWithRetry(`
+        SELECT r.user_name, r.emoji,
+          COALESCE(NULLIF(u.data->>'avatar',''),$3) AS avatar
+        FROM ${table} r
+        JOIN users u ON u.name = r.user_name
+        WHERE r.${key} = $1::bigint
+          AND ($2::text = '' OR r.emoji = $2)
+          AND ($4::text = '' OR r.user_name > $4)
+        ORDER BY r.user_name
+        LIMIT 31
+      `, [id,emoji,DEFAULT_AVATAR,after], {attempts:2,label:'SOCIAL REACTORS'});
+      const rows = result.rows || [];
+      const visible = rows.slice(0,30);
+      reply({success:true, users:visible.map(row => ({
+        name:row.user_name, avatar:row.avatar, emoji:row.emoji
+      })), nextAfter:rows.length > 30 ? visible[visible.length - 1].user_name : null});
+    } catch (err) {
+      console.error('[SOCIAL REACTORS ERROR]:',err && err.message || err);
+      reply({success:false,message:'Could not load reactions.'});
+    }
+  });
+
   socket.on('social_comments_list', async (data = {}, callback) => {
     const reply = typeof callback === 'function' ? callback : () => {};
     const actor = normalizeSocialUserName(socket.userName);
