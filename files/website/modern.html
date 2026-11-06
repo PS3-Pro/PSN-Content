@@ -85211,6 +85211,24 @@ function getVisibleChatStackEl(id) {
     };
 
   window.__directGroupState = window.__directGroupState || { owner:'', groups:[], loaded:false, activeId:'', group:null, messages:[], pins:[], replyTo:null, editId:'', pendingImages:[], token:0, fetchToken:0, listWatchdog:0, timer:0 };
+  // Preserve a recent per-account group snapshot for instant list display when returning.
+  // A live server refresh remains authoritative; never share cached groups across accounts.
+  const DIRECT_GROUP_SNAPSHOT_TTL = 90000;
+  function directGroupSnapshotKey(user) { return 'psn_direct_groups_session:' + encodeURIComponent(user); }
+  function readDirectGroupSnapshot(user) {
+    if (!user) return null;
+    try {
+      const raw = sessionStorage.getItem(directGroupSnapshotKey(user));
+      if (!raw) return null;
+      const saved = JSON.parse(raw);
+      if (!saved || Date.now() - Number(saved.at || 0) > DIRECT_GROUP_SNAPSHOT_TTL || !Array.isArray(saved.groups)) return null;
+      return saved.groups.slice(0, 100);
+    } catch (_) { return null; }
+  }
+  function saveDirectGroupSnapshot(user, groups) {
+    if (!user || !Array.isArray(groups)) return;
+    try { sessionStorage.setItem(directGroupSnapshotKey(user), JSON.stringify({at:Date.now(),groups:groups.slice(0,100)})); } catch (_) {}
+  }
   const pendingDirectGroupPinDeletes = new Set();
   function directGroupEscape(value) { return directEscapeHtml(value); }
   function directGroupSocketEmit(name,data,done) { if(!socketChat||!socketChat.connected){if(typeof showToastNotification==='function')showToastNotification('Private Chat','Connect to the server first.');return false;}socketChat.emit(name,data,done);return true; }
@@ -85340,11 +85358,22 @@ function getVisibleChatStackEl(id) {
     }
     if(changed)renderDirectGroupList();
   }
+  function directGroupEventNeedsListRefresh(payload,groups){
+    const group=(groups||[]).find(item=>String(item.id)===String(payload?.groupId||''));
+    if(!group)return true;
+    if(payload?.kind==='message'||payload?.kind==='update')return false;
+    // Deletion can also change unread counts even when the preview is unchanged.
+    if(payload?.kind==='delete')return true;
+    return true;
+  }
   window.refreshDirectGroupList=function(options={}){
     const s=window.__directGroupState;
     const socket=typeof socketChat!=='undefined'?socketChat:null;
     if(!socket?.connected||!directGroupMyName())return;
     const viewer=directGroupMyName();
+    // The global connection can precede auth_success; never request group data
+    // from an unauthenticated socket and mistake its empty reply for no groups.
+    if(socket.__psnGlobalAuthenticatedName!==viewer)return;
     if(s.owner!==viewer){
       s.owner=viewer;s.groups=[];s.loaded=false;s.activeId='';s.group=null;
       s.listInFlight=false;s.listSocket=null;s.fetchToken++;
@@ -85367,7 +85396,7 @@ function getVisibleChatStackEl(id) {
       if(!s.loaded){s.loaded=true;renderDirectGroupList();}
       if(s.listRefreshQueued){s.listRefreshQueued=false;scheduleDirectGroupListRefresh(120);}
     },10000);
-    socket.emit('direct_group_list',{},response=>{
+    socket.emit('direct_group_list',{preview:!s.loaded&&!s.groups.length,requestId:fetchToken},response=>{
       if(directGroupMyName()!==viewer||s.owner!==viewer||fetchToken!==s.fetchToken)return;
       clearTimeout(s.listWatchdog);s.listWatchdog=0;
       s.listInFlight=false;s.listSocket=null;
@@ -85375,6 +85404,9 @@ function getVisibleChatStackEl(id) {
       s.listRefreshQueued=false;
       if(queued)scheduleDirectGroupListRefresh(120);
       if(!response||!response.success){
+        // A reconnect may reach the socket before the site's global auth finishes.
+        // Keep the existing groups and retry after auth_success; never cache a fake empty list.
+        if(response?.reason==='auth_required')return;
         if(!s.loaded){s.loaded=true;renderDirectGroupList();}
         return;
       }
@@ -85382,6 +85414,7 @@ function getVisibleChatStackEl(id) {
       const changed=JSON.stringify((s.groups||[]).map(g=>[g.id,g.title,g.memberCount,g.unread,g.lastMessage?.id,g.lastMessage?.text,g.lastMessage?.readBy,g.lastMessage?.recipients]))!==JSON.stringify(next.map(g=>[g.id,g.title,g.memberCount,g.unread,g.lastMessage?.id,g.lastMessage?.text,g.lastMessage?.readBy,g.lastMessage?.recipients]));
       const wasLoaded=s.loaded===true;
       s.groups=next;s.loaded=true;
+      saveDirectGroupSnapshot(viewer,next);
       if(changed||!wasLoaded){renderDirectGroupList();if(window.__directChatState?.conversationEntryPending)requestAnimationFrame(()=>animateDirectConversationListEntry());}
     });
   };
@@ -85650,11 +85683,21 @@ function getVisibleChatStackEl(id) {
     directGroupSocketEmit('direct_group_leave',{groupId:id},response=>{if(!response?.success)return directGroupNote(response?.message||'Could not leave group.');window.closeDirectGroup({silent:true});window.refreshDirectGroupList();});};
   function installDirectGroupListeners(socket){
     if(socket.__directGroupInstalled)return;socket.__directGroupInstalled=true;
+    socket.on('direct_group_list_preview',payload=>{
+      const s=window.__directGroupState;
+      if(!s.listInFlight||s.loaded||s.groups.length||s.owner!==directGroupMyName()||Number(payload?.requestId)!==s.fetchToken)return;
+      const groups=Array.isArray(payload?.groups)?payload.groups:[];
+      if(!groups.length)return;
+      s.groups=groups;
+      renderDirectGroupList();
+      if(window.__directChatState?.conversationEntryPending)requestAnimationFrame(()=>animateDirectConversationListEntry());
+    });
     socket.on('direct_group_changed',payload=>{
       const s=window.__directGroupState;
       if(payload?.left&&s.activeId===payload.groupId)window.closeDirectGroup({silent:true});
       if(payload?.left){
         s.groups=s.groups.filter(group=>String(group.id)!==String(payload.groupId));
+        saveDirectGroupSnapshot(s.owner,s.groups);
         renderDirectGroupList();
       }
       window.refreshDirectGroupList({afterCurrent:true});
@@ -85662,8 +85705,12 @@ function getVisibleChatStackEl(id) {
     });
     socket.on('direct_group_event',payload=>{
       const s=window.__directGroupState;
+      const requiresListRefresh=directGroupEventNeedsListRefresh(payload,s.groups);
       applyDirectGroupSummaryEvent(payload);
-      if(payload?.groupId!==s.activeId||!s.group){scheduleDirectGroupListRefresh();return;}
+      // A list query started before this event may return an older preview. Recheck
+      // only in that race; normal realtime events need no additional database read.
+      if(s.listInFlight&&!requiresListRefresh)s.listRefreshQueued=true;
+      if(payload?.groupId!==s.activeId||!s.group){if(requiresListRefresh)scheduleDirectGroupListRefresh();return;}
       const list=document.getElementById('direct-group-messages'),nearBottom=list?list.scrollHeight-list.scrollTop-list.clientHeight<75:false;
       const previousMessage = payload.message ? s.messages.find(m=>String(m.id)===String(payload.message.id)) : null;
       const groupEdited = !!(previousMessage && payload.message?.editedAt && (String(previousMessage.text||'')!==String(payload.message.text||'') || String(previousMessage.editedAt||'')!==String(payload.message.editedAt||'')));
@@ -85694,7 +85741,8 @@ function getVisibleChatStackEl(id) {
         document.getElementById('direct-group-count').textContent=s.messages.length;renderDirectGroupPins();
       }else renderDirectGroupMessages();
       if((groupEdited||groupPinned)&&payload.message)window.flashPsnChatMessageAction(() => document.querySelector(`#direct-group-messages [data-direct-group-message="${CSS.escape(String(payload.message.id))}"]`),groupEdited?'edit':'pin',`group:${s.activeId}:${payload.message.id}`);
-      directGroupMarkRead();scheduleDirectGroupListRefresh();
+      directGroupMarkRead();
+      if(requiresListRefresh)scheduleDirectGroupListRefresh();
     });
     socket.on('direct_group_read',payload=>{
       const s=window.__directGroupState,groupId=String(payload?.groupId||''),reader=String(payload?.user||payload?.reader||'').trim(),lastId=Number(payload?.lastMessageId||payload?.lastReadId||0);
@@ -85721,7 +85769,35 @@ function getVisibleChatStackEl(id) {
       const last=summary?.lastMessage;
       if(last&&Number(last.id)<=lastId&&Array.isArray(last.readBy)&&Array.isArray(last.recipients)&&last.recipients.includes(reader)&&!last.readBy.includes(reader)){last.readBy.push(reader);renderDirectGroupList();}
     });
-    socket.on('connect',()=>{const s=window.__directGroupState;s.listInFlight=false;s.listSocket=null;s.fetchToken++;clearTimeout(s.listWatchdog);s.listWatchdog=0;window.refreshDirectGroupList();const id=s.activeId;if(id)window.openDirectGroup(id,{forceReload:true});});
+    const scheduleAuthenticatedGroupPrefetch=()=>{
+      const run=()=>{
+        const s=window.__directGroupState;
+        if(!socket.connected||socket.__psnGlobalAuthenticatedName!==directGroupMyName()||s.listInFlight)return;
+        // During reconnect always refresh the visible Private Chat, even when a
+        // recent snapshot is already displayed; offscreen data can wait.
+        const privateVisible=document.getElementById('subview-messages')?.style.display==='flex';
+        if(s.loaded&&!privateVisible)return;
+        window.refreshDirectGroupList();
+      };
+      if(document.body?.classList.contains('psn-home-interactive')){
+        if('requestIdleCallback' in window)window.requestIdleCallback(run,{timeout:1400});
+        else setTimeout(run,350);
+      }else if(typeof window.runPsnAfterHomeInteractive==='function'){
+        window.runPsnAfterHomeInteractive(run);
+      }
+    };
+    socket.on('auth_success',()=>{
+      // The site's auth_success listener sets the authenticated name later in
+      // this same event dispatch; defer our lightweight prefetch until then.
+      setTimeout(scheduleAuthenticatedGroupPrefetch,0);
+    });
+    socket.on('connect',()=>{
+      const s=window.__directGroupState;
+      s.listInFlight=false;s.listSocket=null;s.fetchToken++;
+      clearTimeout(s.listWatchdog);s.listWatchdog=0;
+      if(socket.__psnGlobalAuthenticatedName===directGroupMyName())window.refreshDirectGroupList();
+      const id=s.activeId;if(id)window.openDirectGroup(id,{forceReload:true});
+    });
   }
   document.addEventListener('keydown',event=>{
     const input=event.target;
@@ -87051,7 +87127,7 @@ function getVisibleChatStackEl(id) {
 		const state = window.__directChatState;
 		const list = document.getElementById('direct-conversations-list');
 		if (!list || !state || state.conversationEntryPending !== true) return false;
-		if (socketChat?.connected && (state.conversationsLoaded !== true || window.__directGroupState?.loaded !== true)) return false;
+		if (socketChat?.connected && state.conversationsLoaded !== true && window.__directGroupState?.loaded !== true && !(state.conversations?.length || window.__directGroupState?.groups?.length)) return false;
 		const items = Array.from(list.querySelectorAll(':scope > .direct-conversation-item'));
 		if (!items.length) {
 			state.conversationEntryPending = false;
@@ -89115,7 +89191,7 @@ function getVisibleChatStackEl(id) {
 	}
 
 	window.resetDirectMessagesForUser = function(userName) {
-        if(window.__directGroupState && window.__directGroupState.owner !== String(userName||'').trim()){window.closeDirectGroup({silent:true});window.__directGroupState.owner=String(userName||'').trim();window.__directGroupState.groups=[];window.__directGroupState.loaded=false;window.__directGroupState.fetchToken++;clearTimeout(window.__directGroupState.listWatchdog);window.__directGroupState.listWatchdog=0;window.__directGroupState.listInFlight=false;window.__directGroupState.listSocket=null;renderDirectGroupList();}
+        if(window.__directGroupState && window.__directGroupState.owner !== String(userName||'').trim()){window.closeDirectGroup({silent:true});window.__directGroupState.owner=String(userName||'').trim();const savedGroups=readDirectGroupSnapshot(window.__directGroupState.owner);window.__directGroupState.groups=savedGroups||[];window.__directGroupState.loaded=!!savedGroups;window.__directGroupState.fetchToken++;clearTimeout(window.__directGroupState.listWatchdog);window.__directGroupState.listWatchdog=0;window.__directGroupState.listInFlight=false;window.__directGroupState.listSocket=null;renderDirectGroupList();}
 		const owner = String(userName || '').trim();
 		const state = window.__directChatState;
 		if (state.owner === owner) return;
@@ -113288,7 +113364,17 @@ function getVisibleChatStackEl(id) {
     warmFeed.promise=request;
     return request;
   }
-  window.psnSocialWarmFeed=primeSocialFeed;
+  let warmFeedIdleHandle=0;
+  function scheduleSocialWarmFeed(){
+    if(!socialSessionReady()||visible()||warmFeed.promise||warmFeed.ready||warmFeedIdleHandle)return;
+    const run=()=>{warmFeedIdleHandle=0;if(socialSessionReady()&&!visible())primeSocialFeed();};
+    // An idle slot often occurs during Preparing. The timeout is only a fallback;
+    // it must never delay the Home reveal or force a second request.
+    warmFeedIdleHandle=typeof requestIdleCallback==='function'
+      ? requestIdleCallback(run,{timeout:1600})
+      : setTimeout(run,500);
+  }
+  window.psnSocialWarmFeed=scheduleSocialWarmFeed;
   function socialSessionReady(){
     const socket=typeof socketChat==='undefined'?null:socketChat;
     const name=identity();
@@ -113319,7 +113405,7 @@ function getVisibleChatStackEl(id) {
     if(!data?.name)return;
     setTimeout(()=>{
       if(!socialSessionReady()||data.name!==identity())return;
-      if(!visible())primeSocialFeed();
+      if(!visible())scheduleSocialWarmFeed();
       if(visible()&&state.owner!==identity()){window.psnSocialOpen();return;}
       refreshUnseen();
       if(!visible())return;
@@ -113541,6 +113627,17 @@ function getVisibleChatStackEl(id) {
     state.removingComments.set(id,pending);
     return pending;
   }
+  // Coalesce bursts of comment/reaction events while the comments modal is open.
+  // Direct post/comment actions still refresh immediately after their acknowledgement.
+  let socialCommentsRefreshTimer=0;
+  function scheduleOpenSocialCommentsRefresh(postId){
+    if(state.modalPostId!==postId)return;
+    clearTimeout(socialCommentsRefreshTimer);
+    socialCommentsRefreshTimer=setTimeout(()=>{
+      socialCommentsRefreshTimer=0;
+      if(state.modalPostId===postId)loadComments(postId);
+    },110);
+  }
   function onChanged(data){
     if(!visible()){state.stale=true;return;}
     const id=idOf(data&&data.id);
@@ -113553,15 +113650,15 @@ function getVisibleChatStackEl(id) {
     if(data&&data.kind==='comment-delete'&&id){
       const commentId=idOf(data.commentId);
       if(commentId)removeSocialComment(commentId,id);
-      else if(state.modalPostId===id)loadComments(id);
+      else if(state.modalPostId===id)scheduleOpenSocialCommentsRefresh(id);
       if(state.posts.some(post=>post.id===id))schedulePostRefresh(id);
       return;
     }
     if(data&&data.kind==='react'&&id)refreshOpenSocialReactors(data.commentId?'comment':'post',idOf(data.commentId||id));
     if(data&&['react','comment','edit'].includes(data.kind)&&id){
       if((data.kind==='react'||data.kind==='comment')&&data.originSocketId&&data.originSocketId===state.socket?.id)return;
-      if(data.kind==='react'&&data.commentId&&state.modalPostId===id)loadComments(id);
-      if(data.kind==='comment'&&state.modalPostId===id)loadComments(id);
+      if(data.kind==='react'&&data.commentId&&state.modalPostId===id)scheduleOpenSocialCommentsRefresh(id);
+      if(data.kind==='comment'&&state.modalPostId===id)scheduleOpenSocialCommentsRefresh(id);
       if(state.posts.some(post=>post.id===id))schedulePostRefresh(id);
       return;
     }
@@ -113850,6 +113947,7 @@ function getVisibleChatStackEl(id) {
   }
   function closeCommentModal(){
     const overlay=document.getElementById('psn-social-comments-modal');if(!overlay||overlay.hidden)return;
+    clearTimeout(socialCommentsRefreshTimer);socialCommentsRefreshTimer=0;
     overlay.hidden=true;state.modalRequest++;state.modalPostId=null;state.openComments.clear();
     if(state.modalOpener?.isConnected)state.modalOpener.focus({preventScroll:true});
     state.modalOpener=null;

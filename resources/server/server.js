@@ -1943,7 +1943,10 @@ const userProfileWriteInFlight = new Set();
 const fullUserCacheNames = new Set();
 let profileHydrationQueues = [Promise.resolve(), Promise.resolve()];
 let profileHydrationNextLane = 0;
-let chatHistoryEmitQueue = Promise.resolve();
+// Keep history transfers bounded, but do not let one slow user's ACK block everyone.
+// Two lanes keep memory/socket pressure low on the small Render instance.
+const chatHistoryEmitQueues = [Promise.resolve(), Promise.resolve()];
+let chatHistoryNextLane = 0;
 const USER_HEAVY_CACHE_KEYS = ['downloadsData', 'libraryData', 'libraryPlayHistoryData', 'wishlistData', 'favoritesData', 'trophiesData', 'friendsData'];
 let trendingCache = null;
 let trendingCacheAt = 0;
@@ -7508,7 +7511,8 @@ function emitChatHistoryToSocket(socket) {
   if (!socket) return Promise.resolve();
   if (socket.__chatHistoryInFlight) return socket.__chatHistoryInFlight;
 
-  const run = chatHistoryEmitQueue.catch(() => null).then(async () => {
+  const lane = chatHistoryNextLane++ % chatHistoryEmitQueues.length;
+  const run = chatHistoryEmitQueues[lane].catch(() => null).then(async () => {
     if (!socket.connected) return;
     const history = await getPublicChatHistoryWithSeenForUser(socket.userName || '');
     const requiresAck = socket.chatHistoryAckV1 === true;
@@ -7577,7 +7581,7 @@ function emitChatHistoryToSocket(socket) {
   socket.__chatHistoryInFlight = run.finally(() => {
     socket.__chatHistoryInFlight = null;
   });
-  chatHistoryEmitQueue = socket.__chatHistoryInFlight.then(() => null, () => null);
+  chatHistoryEmitQueues[lane] = socket.__chatHistoryInFlight.then(() => null, () => null);
   return socket.__chatHistoryInFlight;
 }
 
@@ -8691,13 +8695,14 @@ function addDirectGroupReadReceipts(message,members) {
   const recipients=(members||[]).filter(m=>m.user_name!==message.from&&Date.parse(m.joined_at)<=postedAt);
   return {...message,recipients:recipients.map(m=>m.user_name),readBy:recipients.filter(m=>Number(m.last_read_id)>=Number(message.id)).map(m=>m.user_name)};
 }
-async function emitDirectGroupReadLocal(groupId,reader,lastMessageId) {
-  const members=await getDirectGroupMembers(groupId);
+async function emitDirectGroupReadLocal(groupId,reader,lastMessageId,knownMembers=null) {
+  const members=knownMembers || await getDirectGroupMembers(groupId);
   const event={groupId,user:reader,lastMessageId:String(lastMessageId)};
   for(const member of members)for(const client of getSocketsByUserName(member.user_name))if(client?.connected)client.emit('direct_group_read',event);
 }
 async function emitDirectGroupLocal(groupId,kind,payload) {
   directGroupListPending.clear();
+  directGroupPreviewPending.clear();
   const members=await getDirectGroupMembers(groupId);
   const messagePayload=(kind==='message'||kind==='update')?addDirectGroupReadReceipts(payload,members):payload;
   for (const member of members) for(const client of getSocketsByUserName(member.user_name)) {
@@ -8729,9 +8734,11 @@ async function getDirectGroupList(viewer) {
     )
     SELECT page.*,
       members.member_count,members.receipt_members,
-      (SELECT COUNT(*)::int FROM direct_group_messages unread
-        WHERE unread.group_id=page.id AND unread.id>page.last_read_id
-          AND unread.created_at>=page.joined_at AND unread.sender_name<>$1) AS unread
+      CASE WHEN page.last_id IS NULL OR page.last_id<=page.last_read_id THEN 0
+           ELSE (SELECT COUNT(*)::int FROM direct_group_messages unread
+             WHERE unread.group_id=page.id AND unread.id>page.last_read_id
+               AND unread.created_at>=page.joined_at AND unread.sender_name<>$1)
+      END AS unread
     FROM group_page page
     LEFT JOIN LATERAL (
       SELECT COUNT(*)::int AS member_count,
@@ -8752,6 +8759,48 @@ async function getDirectGroupList(viewer) {
       memberCount:Number(row.member_count)||0,createdAt:row.created_at,
       unread:Number(row.unread)||0,lastMessage};
   });
+}
+
+// Fast group summaries render first; the full list still provides authoritative unread counts
+// and read receipts. Uses the existing membership and message indexes.
+async function getDirectGroupPreview(viewer) {
+  const result = await queryDbWithRetry(`
+    SELECT g.id, g.title, g.created_by, g.created_at,
+      latest.id AS last_id, latest.sender_name AS last_sender,
+      latest.text AS last_text, latest.message_type AS last_type,
+      latest.created_at AS last_created
+    FROM direct_group_members gm
+    JOIN direct_groups g ON g.id = gm.group_id
+    LEFT JOIN LATERAL (
+      SELECT id, sender_name, text, message_type, created_at
+      FROM direct_group_messages
+      WHERE group_id = gm.group_id AND created_at >= gm.joined_at
+      ORDER BY id DESC LIMIT 1
+    ) latest ON TRUE
+    WHERE gm.user_name = $1
+    ORDER BY COALESCE(latest.created_at, g.created_at) DESC
+    LIMIT 100
+  `, [viewer], { attempts:2, label:'GROUP PREVIEW' });
+  return (result.rows || []).map(row => ({
+    id:row.id, title:row.title, createdBy:row.created_by,
+    createdAt:row.created_at, memberCount:null, unread:null,
+    lastMessage:row.last_id ? {
+      id:String(row.last_id), from:row.last_sender,
+      text:row.last_type === 'poll' ? '📊 Created a poll.' : row.last_text,
+      createdAt:row.last_created
+    } : null
+  }));
+}
+const directGroupPreviewPending = new Map();
+function readDirectGroupPreviewShared(viewer) {
+  let pending = directGroupPreviewPending.get(viewer);
+  if (pending) return pending;
+  pending = getDirectGroupPreview(viewer);
+  directGroupPreviewPending.set(viewer, pending);
+  pending.finally(() => {
+    if (directGroupPreviewPending.get(viewer) === pending) directGroupPreviewPending.delete(viewer);
+  }).catch(() => {});
+  return pending;
 }
 
 // Concurrent tabs for the same account share one pending query, never a stale result.
@@ -8776,7 +8825,7 @@ async function getDirectGroupHistory(groupId,viewer) {
   if(lastId>Number(member.last_read_id)){
     await pool.query('UPDATE direct_group_members SET last_read_id=GREATEST(last_read_id,$3) WHERE group_id=$1 AND user_name=$2',[groupId,viewer,lastId]);
     const own=members.find(m=>m.user_name===viewer);if(own)own.last_read_id=lastId;
-    try{await emitDirectGroupReadLocal(groupId,viewer,lastId);}catch(err){console.error('[GROUP READ EMIT]',err?.message||err);}
+    try{await emitDirectGroupReadLocal(groupId,viewer,lastId,members);}catch(err){console.error('[GROUP READ EMIT]',err?.message||err);}
     deferServerTask('GROUP READ SYNC',()=>notifyDirectGroupChange(groupId,'read',{user:viewer,lastMessageId:lastId}),0);
   }
   const withReceipts=messages.map(m=>addDirectGroupReadReceipts(m,members));
@@ -9029,37 +9078,46 @@ async function queryDirectConversationPayload(userName) {
   if (!viewer) return { success:false, conversations:[], unreadTotal:0 };
 
   const result = await queryDbWithRetry(`
-    WITH delete_state AS (
-      SELECT peer_name, deleted_through_id
-      FROM direct_conversation_delete_state
-      WHERE user_name = $1
-    ), relevant AS (
-      SELECT dm.id, dm.sender_name, dm.recipient_name, dm.text, dm.message_type, dm.content, dm.reply_to, dm.reactions, dm.pinned_at, dm.edited_at, dm.created_at,
-             CASE WHEN dm.sender_name = $1 THEN dm.recipient_name ELSE dm.sender_name END AS peer_name
-      FROM direct_messages dm
-      LEFT JOIN delete_state ds
-        ON ds.peer_name = CASE WHEN dm.sender_name = $1 THEN dm.recipient_name ELSE dm.sender_name END
-      WHERE (dm.sender_name = $1 OR dm.recipient_name = $1)
-        AND dm.id > COALESCE(ds.deleted_through_id, 0)
+    WITH potential_peers AS (
+      -- Both sides use compact indexed columns, never scan message bodies or JSON.
+      SELECT recipient_name AS peer_name FROM direct_messages
+      WHERE sender_name = $1 GROUP BY recipient_name
+      UNION
+      SELECT sender_name AS peer_name FROM direct_messages
+      WHERE recipient_name = $1 GROUP BY sender_name
+    ), latest_ids AS (
+      SELECT peers.peer_name, last_visible.id
+      FROM potential_peers peers
+      LEFT JOIN direct_conversation_delete_state ds
+        ON ds.user_name = $1 AND ds.peer_name = peers.peer_name
+      JOIN LATERAL (
+        -- Two index seeks per peer replace sorting every historical message ID.
+        SELECT GREATEST(
+          COALESCE((
+            SELECT id FROM direct_messages
+            WHERE sender_name = $1 AND recipient_name = peers.peer_name
+              AND id > COALESCE(ds.deleted_through_id, 0)
+            ORDER BY id DESC LIMIT 1
+          ), 0),
+          COALESCE((
+            SELECT id FROM direct_messages
+            WHERE sender_name = peers.peer_name AND recipient_name = $1
+              AND id > COALESCE(ds.deleted_through_id, 0)
+            ORDER BY id DESC LIMIT 1
+          ), 0)
+        ) AS id
+      ) last_visible ON last_visible.id > 0
     ), latest AS (
-      SELECT DISTINCT ON (peer_name)
-             peer_name, id, sender_name, recipient_name, text, message_type, content, reply_to, reactions, pinned_at, edited_at, created_at
-      FROM relevant
-      ORDER BY peer_name, id DESC
-    ), unread AS (
-      SELECT dm.sender_name AS peer_name, COUNT(*)::int AS unread_count
-      FROM direct_messages dm
-      LEFT JOIN direct_message_read_state rs
-        ON rs.user_name = $1 AND rs.peer_name = dm.sender_name
-      LEFT JOIN delete_state ds
-        ON ds.peer_name = dm.sender_name
-      WHERE dm.recipient_name = $1
-        AND dm.id > COALESCE(rs.last_read_id, 0)
-        AND dm.id > COALESCE(ds.deleted_through_id, 0)
-      GROUP BY dm.sender_name
+      SELECT ids.peer_name, dm.id, dm.sender_name, dm.recipient_name,
+             dm.text, dm.message_type, dm.content, dm.reply_to, dm.reactions,
+             dm.edited_at, dm.created_at
+      FROM (
+        SELECT peer_name, id FROM latest_ids ORDER BY id DESC LIMIT $2
+      ) ids
+      JOIN direct_messages dm ON dm.id = ids.id
     )
     SELECT l.peer_name, l.id, l.sender_name, l.recipient_name, l.text, l.message_type, l.content, l.reply_to, l.reactions, l.edited_at, l.created_at,
-           COALESCE(u.unread_count, 0)::int AS unread_count,
+           COALESCE(unread.unread_count, 0)::int AS unread_count,
            COALESCE(my_read.last_read_id, 0) AS my_last_read_id,
            COALESCE(peer_read.last_read_id, 0) AS peer_last_read_id,
            COALESCE(usr.data->>'avatar', $3) AS peer_avatar,
@@ -9067,7 +9125,7 @@ async function queryDirectConversationPayload(userName) {
            (
              SELECT recent.created_at FROM direct_messages recent
              WHERE recent.sender_name=l.peer_name AND recent.recipient_name=$1
-               AND recent.id>COALESCE((SELECT ds.deleted_through_id FROM delete_state ds WHERE ds.peer_name=l.peer_name),0)
+               AND recent.id>COALESCE(deleted.deleted_through_id,0)
              ORDER BY recent.id DESC LIMIT 1
            ) AS peer_message_activity_at,
            EXISTS (
@@ -9085,14 +9143,21 @@ async function queryDirectConversationPayload(userName) {
            ) AS blocked_by_peer
     FROM latest l
     JOIN users usr ON usr.name = l.peer_name
-    LEFT JOIN unread u ON u.peer_name = l.peer_name
     LEFT JOIN direct_message_read_state my_read
       ON my_read.user_name = $1 AND my_read.peer_name = l.peer_name
     LEFT JOIN direct_message_read_state peer_read
       ON peer_read.user_name = l.peer_name AND peer_read.peer_name = $1
+    LEFT JOIN direct_conversation_delete_state deleted
+      ON deleted.user_name = $1 AND deleted.peer_name = l.peer_name
+    LEFT JOIN LATERAL (
+      -- Count only this peer's unread tail using (recipient_name, sender_name, id).
+      SELECT COUNT(*)::int AS unread_count
+      FROM direct_messages inbox
+      WHERE inbox.recipient_name = $1 AND inbox.sender_name = l.peer_name
+        AND inbox.id > GREATEST(COALESCE(my_read.last_read_id, 0), COALESCE(deleted.deleted_through_id, 0))
+    ) unread ON TRUE
     ORDER BY l.id DESC
-    LIMIT $2
-  `, [viewer, DIRECT_CONVERSATION_LIST_MAX, DEFAULT_AVATAR], { attempts:2, label:'DIRECT CONVERSATIONS READ' });
+    `, [viewer, DIRECT_CONVERSATION_LIST_MAX, DEFAULT_AVATAR], { attempts:2, label:'DIRECT CONVERSATIONS READ' });
 
   const conversations = (result.rows || []).map(row => ({
     peer: row.peer_name,
@@ -9874,6 +9939,7 @@ async function initProfileSyncNotifications() {
       }
       if (message.channel === 'direct_group_sync') {
         directGroupListPending.clear();
+        directGroupPreviewPending.clear();
         const gid=directGroupId(data.groupId);
         if (!gid) return;
         if(data.kind==='read'){const reader=normalizeDirectMessageUser(data.id?.user),lastId=Number(data.id?.lastMessageId)||0;if(reader&&lastId)await emitDirectGroupReadLocal(gid,reader,lastId);return;}
@@ -15112,9 +15178,20 @@ io.on('connection', (socket) => {
   socket.on('direct_group_list',async (_data={},callback)=>{
     const reply=typeof callback==='function'?callback:()=>{};
     const viewer=normalizeDirectMessageUser(socket.userName);
-    if(!viewer)return reply({success:false,groups:[]});
+    if(!viewer)return reply({success:false,groups:[],reason:'auth_required'});
     try {
       const startedAt = Date.now();
+      const requestId = Math.max(0, Math.floor(Number(_data && _data.requestId) || 0));
+      if (_data && _data.preview === true && requestId > 0) {
+        try {
+          const preview = await readDirectGroupPreviewShared(viewer);
+          if (socket.connected && socket.userName === viewer) {
+            socket.emit('direct_group_list_preview', { requestId, groups:preview });
+          }
+        } catch (previewError) {
+          console.warn('[GROUP PREVIEW] Falling back to complete list:', previewError && previewError.message || previewError);
+        }
+      }
       const groups = await readDirectGroupListShared(viewer);
       const durationMs = Date.now() - startedAt;
       if (durationMs > 1200) console.warn(`[GROUP LIST SLOW] ${durationMs}ms, ${groups.length} group(s)`);
