@@ -4872,7 +4872,7 @@ async function calculateTrendingFromDb() {
 
 const CONTENT_DOWNLOAD_COUNT_CACHE_TTL_MS = Math.max(30000, parseInt(process.env.CONTENT_DOWNLOAD_COUNT_CACHE_TTL_MS || '300000', 10) || 300000);
 const CONTENT_DOWNLOAD_COUNT_CACHE_MAX = Math.max(250, parseInt(process.env.CONTENT_DOWNLOAD_COUNT_CACHE_MAX || '4000', 10) || 4000);
-const CONTENT_DOWNLOAD_COUNT_REQUEST_MAX = Math.max(25, Math.min(500, parseInt(process.env.CONTENT_DOWNLOAD_COUNT_REQUEST_MAX || '200', 10) || 200));
+const CONTENT_DOWNLOAD_COUNT_REQUEST_MAX = Math.max(25, Math.min(500, parseInt(process.env.CONTENT_DOWNLOAD_COUNT_REQUEST_MAX || '400', 10) || 200));
 const contentDownloadCountCache = new Map();
 let contentDownloadCountQueryQueue = Promise.resolve();
 
@@ -9024,7 +9024,7 @@ async function notifyDirectMessageAcrossInstances(kind, payload) {
   }
 }
 
-async function getDirectConversationPayload(userName) {
+async function queryDirectConversationPayload(userName) {
   const viewer = normalizeDirectMessageUser(userName);
   if (!viewer) return { success:false, conversations:[], unreadTotal:0 };
 
@@ -9065,11 +9065,10 @@ async function getDirectConversationPayload(userName) {
            COALESCE(usr.data->>'avatar', $3) AS peer_avatar,
            COALESCE(usr.data->>'lastSeen', '') AS peer_last_seen,
            (
-             SELECT MAX(r2.created_at)
-             FROM relevant r2
-             WHERE r2.peer_name = l.peer_name
-               AND r2.sender_name = l.peer_name
-               AND r2.recipient_name = $1
+             SELECT recent.created_at FROM direct_messages recent
+             WHERE recent.sender_name=l.peer_name AND recent.recipient_name=$1
+               AND recent.id>COALESCE((SELECT ds.deleted_through_id FROM delete_state ds WHERE ds.peer_name=l.peer_name),0)
+             ORDER BY recent.id DESC LIMIT 1
            ) AS peer_message_activity_at,
            EXISTS (
              SELECT 1 FROM presence_sessions ps
@@ -9113,6 +9112,19 @@ async function getDirectConversationPayload(userName) {
     conversations,
     unreadTotal: conversations.reduce((sum, item) => sum + (Math.max(0, Number(item.unread) || 0)), 0)
   };
+}
+
+// Concurrent sessions share an in-flight read; messages still update through realtime events.
+const directConversationReads=new Map();
+function getDirectConversationPayload(userName){
+  const viewer=normalizeDirectMessageUser(userName);
+  if(!viewer)return Promise.resolve({success:false,conversations:[],unreadTotal:0});
+  let pending=directConversationReads.get(viewer);
+  if(pending)return pending;
+  pending=queryDirectConversationPayload(viewer);
+  directConversationReads.set(viewer,pending);
+  pending.finally(()=>{if(directConversationReads.get(viewer)===pending)directConversationReads.delete(viewer);}).catch(()=>{});
+  return pending;
 }
 
 async function markDirectConversationRead(userName, peerName, requestedLastId = 0) {
@@ -12795,15 +12807,23 @@ async function socialReadFeed(actor, filter, before, focusId = null) {
         AND ($4::bigint IS NULL OR p.id = $4::bigint)
         ${scope}
       ORDER BY p.id DESC LIMIT ${SOCIAL_POST_LIMIT + 1}
+    ), reaction_counts AS (
+      SELECT r.post_id,jsonb_agg(jsonb_build_object('emoji',r.emoji,'count',r.cnt)) AS reactions
+      FROM (SELECT post_id,emoji,COUNT(*)::int AS cnt FROM social_post_reactions
+        WHERE post_id IN (SELECT id FROM page) GROUP BY post_id,emoji) r GROUP BY r.post_id
+    ), comment_counts AS (
+      SELECT post_id,COUNT(*)::int AS cnt FROM social_comments
+      WHERE post_id IN (SELECT id FROM page) GROUP BY post_id
     )
     SELECT p.id,p.author_name,p.body,p.images,p.created_at,p.edited_at,
       COALESCE(NULLIF(author.data->>'avatar',''),$3) AS author_avatar,
-      COALESCE((SELECT jsonb_agg(jsonb_build_object('emoji',r.emoji,'count',r.cnt))
-        FROM (SELECT emoji,COUNT(*) AS cnt FROM social_post_reactions WHERE post_id=p.id GROUP BY emoji) r), '[]'::jsonb) AS reactions,
-      (SELECT emoji FROM social_post_reactions WHERE post_id=p.id AND user_name=$1) AS my_reaction,
-      (SELECT COUNT(*) FROM social_comments WHERE post_id=p.id) AS comment_count
+      COALESCE(rc.reactions,'[]'::jsonb) AS reactions,
+      mine.emoji AS my_reaction,COALESCE(cc.cnt,0) AS comment_count
     FROM page p
     JOIN users author ON author.name = p.author_name
+    LEFT JOIN reaction_counts rc ON rc.post_id=p.id
+    LEFT JOIN comment_counts cc ON cc.post_id=p.id
+    LEFT JOIN social_post_reactions mine ON mine.post_id=p.id AND mine.user_name=$1
     ORDER BY p.id DESC
   `,[actor,before,DEFAULT_AVATAR,focusId],{attempts:2,label:'SOCIAL FEED'});
   const rows=result.rows||[];
@@ -13049,9 +13069,13 @@ io.on('connection', (socket) => {
     try {
       const result = await queryDbWithRetry(`
         WITH target AS MATERIALIZED (SELECT id,author_name FROM social_posts WHERE id=$1),
+        removed AS (
+          DELETE FROM social_post_reactions WHERE post_id=$1 AND user_name=$2 AND emoji=$3
+          RETURNING post_id
+        ),
         applied AS (
           INSERT INTO social_post_reactions (post_id,user_name,emoji)
-          SELECT id,$2,$3 FROM target
+          SELECT id,$2,$3 FROM target WHERE NOT EXISTS(SELECT 1 FROM removed)
           ON CONFLICT (post_id,user_name) DO UPDATE SET emoji=EXCLUDED.emoji
             WHERE social_post_reactions.emoji IS DISTINCT FROM EXCLUDED.emoji
           RETURNING post_id
@@ -13060,10 +13084,7 @@ io.on('connection', (socket) => {
       `,[id,actor,emoji],{attempts:2,label:'SOCIAL POST REACTION'});
       const reaction=result.rows[0];
       if (!reaction) return reply({success:false,message:'Post not found.'});
-      if (!reaction.reacted) {
-        await queryDbWithRetry('DELETE FROM social_post_reactions WHERE post_id=$1 AND user_name=$2 AND emoji=$3',[id,actor,emoji],{attempts:2,label:'SOCIAL REACTION REMOVE'});
-      }
-      socialPublish('react',id);
+      socialPublish('react',id,{originSocketId:socket.id});
       if (reaction.reacted) {
         const owner=reaction.author_name;
         socialNotifyAuthor(owner,actor,id,'reaction');
@@ -13071,7 +13092,7 @@ io.on('connection', (socket) => {
           actor,postId:id,activity:'reaction',emoji
         },{dedupeKey:`social:react:${id}:${actor}`}),0);
       }
-      reply({success:true});
+      reply({success:true,reacted:reaction.reacted===true});
     } catch (err) {
       console.error('[SOCIAL REACTION ERROR]:',err && err.message || err);
       reply({success:false,message:'Could not react.'});
@@ -13104,7 +13125,7 @@ io.on('connection', (socket) => {
       `,[id,actor,body],{attempts:2,label:'SOCIAL COMMENT CREATE'});
       if (!added.rows.length) return reply({success:false,message:'Post not found.'});
       const owner=added.rows[0].post_author;
-      socialPublish('comment',id);
+      socialPublish('comment',id,{originSocketId:socket.id});
       socialNotifyAuthor(owner,actor,id,'comment');
       if (owner && owner!==actor) {
         deferServerTask('SOCIAL COMMENT NOTICE',()=>recordUserNotification(owner,'social',{
@@ -13145,9 +13166,13 @@ io.on('connection', (socket) => {
     try {
       const result = await queryDbWithRetry(`
         WITH target AS MATERIALIZED (SELECT id,post_id FROM social_comments WHERE id=$1),
+        removed AS (
+          DELETE FROM social_comment_reactions WHERE comment_id=$1 AND user_name=$2 AND emoji=$3
+          RETURNING comment_id
+        ),
         applied AS (
           INSERT INTO social_comment_reactions (comment_id,user_name,emoji)
-          SELECT id,$2,$3 FROM target
+          SELECT id,$2,$3 FROM target WHERE NOT EXISTS(SELECT 1 FROM removed)
           ON CONFLICT (comment_id,user_name) DO UPDATE SET emoji=EXCLUDED.emoji
             WHERE social_comment_reactions.emoji IS DISTINCT FROM EXCLUDED.emoji
           RETURNING comment_id
@@ -13156,9 +13181,8 @@ io.on('connection', (socket) => {
       `,[id,actor,emoji],{attempts:2,label:'SOCIAL COMMENT REACT'});
       const reaction=result.rows[0];
       if (!reaction) return reply({success:false,message:'Comment not found.'});
-      if (!reaction.reacted) await queryDbWithRetry('DELETE FROM social_comment_reactions WHERE comment_id=$1 AND user_name=$2 AND emoji=$3',[id,actor,emoji],{attempts:2,label:'SOCIAL COMMENT UNREACT'});
-      socialPublish('comment',reaction.post_id);
-      reply({success:true});
+      socialPublish('react',reaction.post_id,{originSocketId:socket.id,commentId:id});
+      reply({success:true,reacted:reaction.reacted===true});
     } catch (err) {console.error('[SOCIAL COMMENT REACT ERROR]:',err && err.message || err);reply({success:false,message:'Could not react to comment.'});}
   });
 
@@ -15255,7 +15279,11 @@ io.on('connection', (socket) => {
     const viewer = normalizeDirectMessageUser(socket.userName);
     if (!viewer) return respond({ success:false, conversations:[], unreadTotal:0, message:'Authentication required.' });
     try {
-      respond(await getDirectConversationPayload(viewer));
+      const startedAt = Date.now();
+      const result = await getDirectConversationPayload(viewer);
+      const durationMs = Date.now() - startedAt;
+      if (durationMs > 1200) console.warn(`[DIRECT CONVERSATIONS SLOW] ${durationMs}ms, ${result.conversations?.length || 0} conversation(s)`);
+      respond(result);
     } catch (err) {
       console.error('[DIRECT CONVERSATIONS ERROR]:', err && err.message ? err.message : err);
       respond({ success:false, conversations:[], unreadTotal:0, message:'Could not load conversations.' });
