@@ -2533,6 +2533,12 @@ async function initDb() {
     );
     ALTER TABLE social_posts ADD COLUMN IF NOT EXISTS edited_at TIMESTAMPTZ;
     CREATE INDEX IF NOT EXISTS idx_social_posts_newest ON social_posts(id DESC);
+    CREATE INDEX IF NOT EXISTS idx_social_posts_author_newest ON social_posts(author_name, id DESC);
+    CREATE TABLE IF NOT EXISTS social_feed_read_state (
+      user_name TEXT PRIMARY KEY REFERENCES users(name) ON DELETE CASCADE,
+      last_seen_post_id BIGINT NOT NULL DEFAULT 0,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
     CREATE TABLE IF NOT EXISTS social_post_reactions (
       post_id BIGINT NOT NULL REFERENCES social_posts(id) ON DELETE CASCADE,
       user_name TEXT NOT NULL REFERENCES users(name) ON DELETE CASCADE,
@@ -8691,6 +8697,7 @@ async function emitDirectGroupReadLocal(groupId,reader,lastMessageId) {
   for(const member of members)for(const client of getSocketsByUserName(member.user_name))if(client?.connected)client.emit('direct_group_read',event);
 }
 async function emitDirectGroupLocal(groupId,kind,payload) {
+  directGroupListPending.clear();
   const members=await getDirectGroupMembers(groupId);
   const messagePayload=(kind==='message'||kind==='update')?addDirectGroupReadReceipts(payload,members):payload;
   for (const member of members) for(const client of getSocketsByUserName(member.user_name)) {
@@ -8703,20 +8710,59 @@ async function notifyDirectGroupChange(groupId,kind,id=0) {
   try { await pool.query('SELECT pg_notify($1,$2)',['direct_group_sync',JSON.stringify({instanceId:INSTANCE_ID,groupId,kind,id})]); } catch(err) { console.error('[GROUP NOTIFY]',err?.message||err); }
 }
 async function getDirectGroupList(viewer) {
-  const result=await queryDbWithRetry(`SELECT g.id,g.title,g.created_by,g.created_at,
-    (SELECT COUNT(*)::int FROM direct_group_members mm WHERE mm.group_id=g.id) AS member_count,
-    (SELECT row_to_json(x) FROM (SELECT m.id,m.sender_name,m.text,m.message_type,m.created_at FROM direct_group_messages m WHERE m.group_id=g.id AND m.created_at>=gm.joined_at ORDER BY m.id DESC LIMIT 1) x) AS latest,
-    (SELECT COUNT(*)::int FROM direct_group_messages m WHERE m.group_id=g.id AND m.created_at>=gm.joined_at AND m.id>gm.last_read_id AND m.sender_name<>$1) AS unread
-    FROM direct_groups g JOIN direct_group_members gm ON gm.group_id=g.id AND gm.user_name=$1 ORDER BY COALESCE((SELECT m.created_at FROM direct_group_messages m WHERE m.group_id=g.id ORDER BY m.id DESC LIMIT 1),g.created_at) DESC LIMIT 100`,[viewer],{attempts:2,label:'GROUP LIST'});
-  const groups=result.rows.map(row=>({id:row.id,title:row.title,createdBy:row.created_by,memberCount:Number(row.member_count)||0,createdAt:row.created_at,unread:Number(row.unread)||0,lastMessage:row.latest?{id:String(row.latest.id),from:row.latest.sender_name,text:row.latest.message_type==='poll'?'📊 Created a poll.':row.latest.text,createdAt:row.latest.created_at}:null}));
-  const own=groups.filter(g=>g.lastMessage?.from===viewer);
-  if(own.length){
-    const members=await pool.query('SELECT group_id,user_name,joined_at,last_read_id FROM direct_group_members WHERE group_id=ANY($1::uuid[])',[own.map(g=>g.id)]);
-    const byGroup=new Map();
-    for(const row of members.rows){if(!byGroup.has(row.group_id))byGroup.set(row.group_id,[]);byGroup.get(row.group_id).push(row);}
-    for(const group of own)group.lastMessage=addDirectGroupReadReceipts(group.lastMessage,byGroup.get(group.id)||[]);
-  }
-  return groups;
+  const result=await queryDbWithRetry(`
+    WITH group_page AS MATERIALIZED (
+      SELECT g.id,g.title,g.created_by,g.created_at,gm.joined_at,gm.last_read_id,
+        latest.id AS last_id,latest.sender_name AS last_sender,
+        latest.text AS last_text,latest.message_type AS last_type,latest.created_at AS last_created
+      FROM direct_group_members gm
+      JOIN direct_groups g ON g.id=gm.group_id
+      LEFT JOIN LATERAL (
+        SELECT id,sender_name,text,message_type,created_at
+        FROM direct_group_messages
+        WHERE group_id=g.id AND created_at>=gm.joined_at
+        ORDER BY id DESC LIMIT 1
+      ) latest ON TRUE
+      WHERE gm.user_name=$1
+      ORDER BY COALESCE(latest.created_at,g.created_at) DESC
+      LIMIT 100
+    )
+    SELECT page.*,
+      members.member_count,members.receipt_members,
+      (SELECT COUNT(*)::int FROM direct_group_messages unread
+        WHERE unread.group_id=page.id AND unread.id>page.last_read_id
+          AND unread.created_at>=page.joined_at AND unread.sender_name<>$1) AS unread
+    FROM group_page page
+    LEFT JOIN LATERAL (
+      SELECT COUNT(*)::int AS member_count,
+        jsonb_agg(jsonb_build_object('user_name',m.user_name,'joined_at',m.joined_at,'last_read_id',m.last_read_id))
+          FILTER (WHERE page.last_sender=$1) AS receipt_members
+      FROM direct_group_members m WHERE m.group_id=page.id
+    ) members ON TRUE
+    ORDER BY COALESCE(page.last_created,page.created_at) DESC
+  `,[viewer],{attempts:2,label:'GROUP LIST'});
+  return (result.rows||[]).map(row=>{
+    let lastMessage=row.last_id?{
+      id:String(row.last_id),from:row.last_sender,
+      text:row.last_type==='poll'?'📊 Created a poll.':row.last_text,
+      createdAt:row.last_created
+    }:null;
+    if(lastMessage&&lastMessage.from===viewer)lastMessage=addDirectGroupReadReceipts(lastMessage,Array.isArray(row.receipt_members)?row.receipt_members:[]);
+    return {id:row.id,title:row.title,createdBy:row.created_by,
+      memberCount:Number(row.member_count)||0,createdAt:row.created_at,
+      unread:Number(row.unread)||0,lastMessage};
+  });
+}
+
+// Concurrent tabs for the same account share one pending query, never a stale result.
+const directGroupListPending=new Map();
+function readDirectGroupListShared(viewer){
+  let pending=directGroupListPending.get(viewer);
+  if(pending)return pending;
+  pending=getDirectGroupList(viewer);
+  directGroupListPending.set(viewer,pending);
+  pending.finally(()=>{if(directGroupListPending.get(viewer)===pending)directGroupListPending.delete(viewer);}).catch(()=>{});
+  return pending;
 }
 async function getDirectGroupHistory(groupId,viewer) {
   const member=await getDirectGroupMember(groupId,viewer);
@@ -9810,10 +9856,12 @@ async function initProfileSyncNotifications() {
       if (data.instanceId === INSTANCE_ID) return;
 
       if (message.channel === 'social_feed_sync') {
+        socialFeedPending.clear();
         io.emit('social_feed_changed', {kind:data.kind,id:String(data.id || ''),commentId:data.commentId ? String(data.commentId) : null,at:data.at});
         return;
       }
       if (message.channel === 'direct_group_sync') {
+        directGroupListPending.clear();
         const gid=directGroupId(data.groupId);
         if (!gid) return;
         if(data.kind==='read'){const reader=normalizeDirectMessageUser(data.id?.user),lastId=Number(data.id?.lastMessageId)||0;if(reader&&lastId)await emitDirectGroupReadLocal(gid,reader,lastId);return;}
@@ -10332,7 +10380,7 @@ async function initProfileSyncNotifications() {
 // ============================================================================
 // Friend activity
 // ============================================================================
-const FRIEND_ACTIVITY_TYPES = new Set(['online', 'offline', 'playing', 'played', 'xmb', 'trophy', 'download', 'library', 'wishlist', 'favorite', 'cheat']);
+const FRIEND_ACTIVITY_TYPES = new Set(['online', 'offline', 'playing', 'played', 'xmb', 'trophy', 'download', 'library', 'wishlist', 'favorite', 'cheat', 'post']);
 const FRIEND_ACTIVITY_REPLACED_IDS_LIMIT = 60;
 const FRIEND_ACTIVITY_ROOM_PREFIX = 'friend-activity:';
 
@@ -10402,6 +10450,10 @@ function normalizeFriendActivityData(type, rawData = {}) {
       replacesIds
     };
   }
+  if (type === 'post') {
+    return { postId: normalizeText(source.postId, '').replace(/[^0-9]/g, '').slice(0, 18),
+      preview: normalizeText(source.preview, '').slice(0, 140) };
+  }
   if (type === 'trophy') {
     const trophyType = normalizeText(source.trophyType, '').toLowerCase();
     return {
@@ -10428,6 +10480,7 @@ function getFriendActivitySemanticKey(type, data = {}) {
   if (eventType === 'playing' || eventType === 'played' || eventType === 'xmb') {
     return [eventType, source.titleId || source.title || ''].map(value => String(value || '').toLowerCase()).join(':');
   }
+  if (eventType === 'post') return [eventType, source.postId || ''].map(value => String(value || '').toLowerCase()).join(':');
   if (eventType === 'trophy') return [eventType, source.trophyId || source.title || ''].map(value => String(value || '').toLowerCase()).join(':');
   return eventType;
 }
@@ -10832,7 +10885,7 @@ function normalizeUserNotificationData(type, rawData = {}) {
     return {
       actor: normalizeSocialUserName(source.actor),
       postId: normalizeText(source.postId, '').slice(0, 24),
-      activity: source.activity === 'comment' ? 'comment' : 'reaction',
+      activity: source.activity === 'comment' ? 'comment' : (source.activity === 'post' ? 'post' : 'reaction'),
       emoji: normalizeText(source.emoji, '').slice(0, 12),
       text: normalizeText(source.text, '').slice(0, 160)
     };
@@ -12640,6 +12693,27 @@ async function resolveContentShareTokenForUser(token) {
 // Social — public community feed
 // ============================================================================
 const SOCIAL_POST_LIMIT = 15;
+const SOCIAL_RICH_PREFIX = '[PSN_SOCIAL_RICH_V1]';
+function normalizeSocialPostBody(value) {
+  const raw = String(value == null ? '' : value).trim();
+  if (!raw.startsWith(SOCIAL_RICH_PREFIX)) return raw;
+  const html = raw.slice(SOCIAL_RICH_PREFIX.length).replace(/<[^>]*>/g, token => {
+    const match = /^<\s*(\/?)\s*(b|strong|i|em|u|s|strike|del|ul|ol|li|br)\s*\/?\s*>$/i.exec(token);
+    if (!match) return token.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    const tag = match[2].toLowerCase();
+    return tag === 'br' ? '<br>' : `<${match[1] ? '/' : ''}${tag}>`;
+  });
+  return SOCIAL_RICH_PREFIX + html;
+}
+function socialPostPlainText(value) {
+  const raw = String(value == null ? '' : value);
+  if (!raw.startsWith(SOCIAL_RICH_PREFIX)) return raw;
+  return raw.slice(SOCIAL_RICH_PREFIX.length).replace(/<br\s*\/?>/gi, ' ')
+    .replace(/<[^>]*>/g, ' ').replace(/&(?:nbsp|#160);/gi, ' ')
+    .replace(/&(?:amp|#38);/gi, '&').replace(/&(?:lt|#60);/gi, '<')
+    .replace(/&(?:gt|#62);/gi, '>').replace(/&(?:quot|#34);/gi, '"')
+    .replace(/\s+/g, ' ').trim();
+}
 const SOCIAL_EMOJI = new Set(['👍', '❤️', '😂', '😮', '😢', '🔥']);
 const socialActionLimits = new Map();
 
@@ -12651,7 +12725,10 @@ function normalizeSocialMedia(raw) {
     if (typeof entry !== 'string' || entry.length > 700) return null;
     try {
       const url = new URL(entry);
-      if (url.protocol !== 'https:' || url.hostname !== 'res.cloudinary.com' || !/^\/[^/]+\/image\/upload\//.test(url.pathname)) return null;
+      if (url.protocol !== 'https:') return null;
+      const cloudinary = url.hostname === 'res.cloudinary.com' && /^\/[^/]+\/image\/upload\//.test(url.pathname);
+      const giphy = /^media\d*\.giphy\.com$/i.test(url.hostname) && /^\/media\//.test(url.pathname);
+      if (!cloudinary && !giphy) return null;
       filtered.push(url.href);
     } catch (err) { return null; }
   }
@@ -12694,27 +12771,33 @@ function serializeSocialComment(row) {
   };
 }
 
-async function socialReadFeed(actor, friendsOnly, before, focusId = null) {
-  // Pick the requested page first; aggregate reactions/comments only for those rows.
-  const result = await queryDbWithRetry(`
-    WITH page AS MATERIALIZED (
+async function socialReadFeed(actor, filter, before, focusId = null) {
+  // Only join friend names when explicitly requested. My Activity uses the author/id index.
+  const audience=['all','friends','mine'].includes(filter)?filter:'all';
+  const friendNames=audience==='friends'?`friend_names AS MATERIALIZED (
+      SELECT CASE WHEN jsonb_typeof(friend.value)='object' THEN friend.value->>'name'
+                  WHEN jsonb_typeof(friend.value)='string' THEN friend.value#>>'{}' ELSE NULL END AS name
+      FROM users viewer
+      CROSS JOIN LATERAL jsonb_array_elements(
+        CASE WHEN jsonb_typeof(viewer.data->'friendsData')='array' THEN viewer.data->'friendsData' ELSE '[]'::jsonb END
+      ) friend(value)
+      WHERE viewer.name=$1
+    ), `:'';
+  const audienceCondition=audience==='mine'?'AND p.author_name=$1':
+    audience==='friends'?'AND p.author_name IN (SELECT name FROM friend_names)':'';
+  // The requested post ID bypasses the filter for reports, notifications and shared links.
+  const scope=focusId?'':audienceCondition;
+  const result=await queryDbWithRetry(`
+    WITH ${friendNames}page AS MATERIALIZED (
       SELECT p.id,p.author_name,p.body,p.images,p.created_at,p.edited_at
       FROM social_posts p
-      WHERE ($3::bigint IS NULL OR p.id < $3::bigint)
-        AND ($5::bigint IS NULL OR p.id = $5::bigint)
-        AND (NOT $2::boolean OR p.author_name=$1 OR EXISTS (
-          SELECT 1 FROM users viewer
-          CROSS JOIN LATERAL jsonb_array_elements(
-            CASE WHEN jsonb_typeof(viewer.data->'friendsData')='array' THEN viewer.data->'friendsData' ELSE '[]'::jsonb END
-          ) friend(value)
-          WHERE viewer.name=$1
-            AND CASE WHEN jsonb_typeof(friend.value)='object' THEN friend.value->>'name'
-                     WHEN jsonb_typeof(friend.value)='string' THEN friend.value#>>'{}' ELSE NULL END = p.author_name
-        ))
+      WHERE ($2::bigint IS NULL OR p.id < $2::bigint)
+        AND ($4::bigint IS NULL OR p.id = $4::bigint)
+        ${scope}
       ORDER BY p.id DESC LIMIT ${SOCIAL_POST_LIMIT + 1}
     )
     SELECT p.id,p.author_name,p.body,p.images,p.created_at,p.edited_at,
-      COALESCE(NULLIF(author.data->>'avatar',''),$4) AS author_avatar,
+      COALESCE(NULLIF(author.data->>'avatar',''),$3) AS author_avatar,
       COALESCE((SELECT jsonb_agg(jsonb_build_object('emoji',r.emoji,'count',r.cnt))
         FROM (SELECT emoji,COUNT(*) AS cnt FROM social_post_reactions WHERE post_id=p.id GROUP BY emoji) r), '[]'::jsonb) AS reactions,
       (SELECT emoji FROM social_post_reactions WHERE post_id=p.id AND user_name=$1) AS my_reaction,
@@ -12722,12 +12805,23 @@ async function socialReadFeed(actor, friendsOnly, before, focusId = null) {
     FROM page p
     JOIN users author ON author.name = p.author_name
     ORDER BY p.id DESC
-  `, [actor, friendsOnly, before, DEFAULT_AVATAR, focusId], { attempts:2, label:'SOCIAL FEED' });
-  const rows = result.rows || [];
+  `,[actor,before,DEFAULT_AVATAR,focusId],{attempts:2,label:'SOCIAL FEED'});
+  const rows=result.rows||[];
   return {
-    posts: rows.slice(0, SOCIAL_POST_LIMIT).map(serializeSocialPost),
-    nextBefore: rows.length > SOCIAL_POST_LIMIT ? String(rows[SOCIAL_POST_LIMIT - 1].id) : null
+    posts:rows.slice(0,SOCIAL_POST_LIMIT).map(serializeSocialPost),
+    nextBefore:rows.length>SOCIAL_POST_LIMIT?String(rows[SOCIAL_POST_LIMIT-1].id):null
   };
+}
+
+const socialFeedPending=new Map();
+function readSocialFeedShared(actor, filter, before, focusId){
+  const key=JSON.stringify([actor,filter,before,focusId]);
+  let pending=socialFeedPending.get(key);
+  if(pending)return pending;
+  pending=socialReadFeed(actor,filter,before,focusId);
+  socialFeedPending.set(key,pending);
+  pending.finally(()=>{if(socialFeedPending.get(key)===pending)socialFeedPending.delete(key);}).catch(()=>{});
+  return pending;
 }
 
 async function socialReadComments(actor, postId) {
@@ -12744,11 +12838,35 @@ async function socialReadComments(actor, postId) {
 }
 
 function socialPublish(kind, id, extra = null) {
+  socialFeedPending.clear();
   const payload = { kind, id: String(id || ''), ...(extra && typeof extra === 'object' ? extra : {}), at: Date.now() };
   io.emit('social_feed_changed', payload);
   deferServerTask('SOCIAL FEED NOTIFY', () => pool.query('SELECT pg_notify($1,$2)',[
     'social_feed_sync',JSON.stringify({ ...payload, instanceId: INSTANCE_ID })
   ]), 0);
+}
+
+async function socialAnnounceNewPost(actor, id, text) {
+  const preview = normalizeText(socialPostPlainText(text), '').slice(0, 140);
+  // Friend Activity already supplies live subscription fanout and cross-instance notifications.
+  await recordFriendActivity(actor, 'post', { postId:id, preview }, { dedupeKey:`social-post:${id}` });
+  const result = await queryDbWithRetry(`
+    INSERT INTO user_notifications (user_name,event_type,data,dedupe_key,created_at)
+    SELECT viewer.name, 'social', jsonb_build_object(
+      'actor',$1::text,'postId',$2::text,'activity','post','text',$3::text),
+      CONCAT('social-friend-post:', $2::text, ':', viewer.name), NOW()
+    FROM users viewer
+    WHERE viewer.name <> $1
+      AND jsonb_typeof(viewer.data->'friendsData')='array'
+      AND EXISTS (
+        SELECT 1 FROM jsonb_array_elements(viewer.data->'friendsData') friend(value)
+        WHERE lower(CASE WHEN jsonb_typeof(friend.value)='object' THEN COALESCE(friend.value->>'name','')
+          WHEN jsonb_typeof(friend.value)='string' THEN friend.value#>>'{}' ELSE '' END)=lower($1)
+      )
+    ON CONFLICT (dedupe_key) DO NOTHING
+    RETURNING id,user_name,event_type,data,created_at
+  `,[actor,String(id),preview],{attempts:2,label:'SOCIAL FRIEND POST NOTIFICATIONS'});
+  for (const row of result.rows || []) await publishStoredUserNotification(row);
 }
 
 function socialNotifyAuthor(author, actor, postId, activity) {
@@ -12773,18 +12891,56 @@ io.on('connection', (socket) => {
   // --------------------------------------------------------------------------
   // Social public feed
   // --------------------------------------------------------------------------
+  socket.on('social_unseen_get', async (_data = {}, callback) => {
+    const reply = typeof callback === 'function' ? callback : () => {};
+    const actor = normalizeSocialUserName(socket.userName);
+    if (!actor) return reply({success:false});
+    try {
+      const result = await queryDbWithRetry(`
+        WITH latest AS (SELECT COALESCE(MAX(id),0)::bigint AS id FROM social_posts),
+        saved AS (
+          INSERT INTO social_feed_read_state(user_name,last_seen_post_id)
+          SELECT $1,latest.id FROM latest
+          ON CONFLICT (user_name) DO NOTHING RETURNING last_seen_post_id
+        )
+        SELECT latest.id AS newest, COALESCE((SELECT last_seen_post_id FROM saved),
+          (SELECT last_seen_post_id FROM social_feed_read_state WHERE user_name=$1),0) AS last_seen
+        FROM latest
+      `,[actor],{attempts:2,label:'SOCIAL UNSEEN READ'});
+      const row = result.rows[0] || {};
+      reply({success:true,newest:String(row.newest||0),lastSeen:String(row.last_seen||0),unseen:Number(row.newest||0)>Number(row.last_seen||0)});
+    } catch(err){console.error('[SOCIAL UNSEEN ERROR]',err && err.message||err);reply({success:false});}
+  });
+
+  socket.on('social_unseen_mark', async (data = {}, callback) => {
+    const reply = typeof callback === 'function' ? callback : () => {};
+    const actor = normalizeSocialUserName(socket.userName);
+    const upTo = String(data.upTo||'');
+    if(!actor||!/^\d{1,18}$/.test(upTo))return reply({success:false});
+    try {
+      const result = await queryDbWithRetry(`
+        INSERT INTO social_feed_read_state(user_name,last_seen_post_id,updated_at)
+        VALUES ($1,LEAST($2::bigint,COALESCE((SELECT MAX(id) FROM social_posts),0)),NOW())
+        ON CONFLICT (user_name) DO UPDATE SET last_seen_post_id=GREATEST(social_feed_read_state.last_seen_post_id,EXCLUDED.last_seen_post_id),updated_at=NOW()
+        RETURNING last_seen_post_id
+      `,[actor,upTo],{attempts:2,label:'SOCIAL UNSEEN MARK'});
+      reply({success:true,lastSeen:String(result.rows[0]?.last_seen_post_id||0)});
+    } catch(err){console.error('[SOCIAL UNSEEN MARK ERROR]',err && err.message||err);reply({success:false});}
+  });
+
   socket.on('social_feed_list', async (data = {}, callback) => {
     const reply = typeof callback === 'function' ? callback : () => {};
     const actor = normalizeSocialUserName(socket.userName);
-    if (!actor) return reply({ success:false, message:'Sign in to view Social.' });
+    if (!actor) return reply({ success:false, code:'session_pending' });
     const rawBefore = String(data.before || '');
     const before = /^\d{1,18}$/.test(rawBefore) && Number(rawBefore) > 0 ? rawBefore : null;
     try {
       const focusId = /^\d{1,18}$/.test(String(data.focusId || '')) ? String(data.focusId) : null;
       const startedAt = Date.now();
-      const feed = await socialReadFeed(actor, data.friendsOnly === true, before, focusId);
+      const filter = ['all','friends','mine'].includes(data.filter) ? data.filter : (data.friendsOnly===true?'friends':'all');
+      const feed = await readSocialFeedShared(actor,filter,before,focusId);
       const elapsedMs = Date.now() - startedAt;
-      if (elapsedMs > 1200) console.warn(`[SOCIAL FEED SLOW] ${elapsedMs}ms, ${feed.posts.length} posts, friendsOnly=${data.friendsOnly === true}`);
+      if (elapsedMs > 1200) console.warn(`[SOCIAL FEED SLOW] ${elapsedMs}ms, ${feed.posts.length} posts, filter=${filter}`);
       reply({ success:true, ...feed });
     } catch (err) {
       console.error('[SOCIAL FEED ERROR]:', err && err.message || err);
@@ -12795,17 +12951,18 @@ io.on('connection', (socket) => {
   socket.on('social_post_create', async (data = {}, callback) => {
     const reply = typeof callback === 'function' ? callback : () => {};
     const actor = normalizeSocialUserName(socket.userName);
-    const body = typeof data.text === 'string' ? data.text.trim().slice(0,3001) : '';
+    const body = typeof data.text === 'string' ? normalizeSocialPostBody(data.text.slice(0,3001)) : '';
     const images = normalizeSocialMedia(data.images);
-    if (!actor) return reply({ success:false, message:'Sign in first.' });
-    if (body.length > 3000 || !images || (!body && !images.length)) return reply({ success:false, message:'Add text or up to four photos.' });
+    if (!actor) return reply({ success:false, code:'session_pending' });
+    if (body.length > 3000 || !images || (!socialPostPlainText(body).trim() && !images.length)) return reply({ success:false, message:'Add text or up to four photos.' });
     if (!socialRateLimit(actor,'post',8000)) return reply({ success:false, message:'Wait a moment before posting again.' });
     try {
       const result = await queryDbWithRetry(
         'INSERT INTO social_posts (author_name,body,images) VALUES ($1,$2,$3::jsonb) RETURNING id',
         [actor,body,JSON.stringify(images)],{attempts:2,label:'SOCIAL POST CREATE'});
       const id = String(result.rows[0].id);
-      socialPublish('post',id);
+      socialPublish('post',id,{author:actor});
+      deferServerTask('SOCIAL NEW POST ACTIVITY',()=>socialAnnounceNewPost(actor,id,body),0);
       reply({ success:true, id });
     } catch (err) {
       console.error('[SOCIAL POST CREATE ERROR]:',err && err.message || err);
@@ -12831,7 +12988,7 @@ io.on('connection', (socket) => {
       const duplicate = await queryDbWithRetry("SELECT 1 FROM reports WHERE resolved=false AND data->>'reporter'=$1 AND data->>'msgId'=$2 LIMIT 1",
         [actor,msgId],{attempts:2,label:'SOCIAL REPORT DEDUPE'});
       if(duplicate.rows.length)return reply({success:true,unchanged:true});
-      await createReport({msgId,targetUser:target.author_name,messageText:target.body,reason:`[Social ${kind} in post #${target.post_id}] ${reason}`},actor);
+      await createReport({msgId,targetUser:target.author_name,messageText:socialPostPlainText(target.body),reason:`[Social ${kind} in post #${target.post_id}] ${reason}`},actor);
       reply({success:true});
     } catch (err) {console.error('[SOCIAL REPORT ERROR]:',err && err.message || err);reply({success:false,message:'Could not submit report.'});}
   });
@@ -12840,17 +12997,19 @@ io.on('connection', (socket) => {
     const reply = typeof callback === 'function' ? callback : () => {};
     const actor = normalizeSocialUserName(socket.userName);
     const id = String(data.id || '');
-    const body = typeof data.text === 'string' ? data.text.trim() : '';
-    if (!actor || !/^\d{1,18}$/.test(id) || body.length > 3000)
+    const body = typeof data.text === 'string' ? normalizeSocialPostBody(data.text) : '';
+    const updateImages = Object.prototype.hasOwnProperty.call(data,'images');
+    const images = updateImages ? normalizeSocialMedia(data.images) : null;
+    if (!actor || !/^\d{1,18}$/.test(id) || body.length > 3000 || (updateImages && !images))
       return reply({success:false,message:'Invalid publication.'});
     if (!socialRateLimit(actor, 'edit:'+id, 1500))
       return reply({success:false,message:'Please wait before editing again.'});
     try {
       const result = await queryDbWithRetry(`
-        UPDATE social_posts SET body=$3, edited_at=NOW()
-        WHERE id=$1 AND author_name=$2 AND ($3<>'' OR jsonb_array_length(images)>0)
+        UPDATE social_posts SET body=$3, images=COALESCE($4::jsonb, images), edited_at=NOW()
+        WHERE id=$1 AND author_name=$2 AND ($3<>'' OR jsonb_array_length(COALESCE($4::jsonb, images))>0)
         RETURNING id, body, edited_at
-      `, [id,actor,body], {attempts:2,label:'SOCIAL POST EDIT'});
+      `, [id,actor,socialPostPlainText(body).trim() ? body : '',updateImages ? JSON.stringify(images) : null], {attempts:2,label:'SOCIAL POST EDIT'});
       if (!result.rows.length) return reply({success:false,message:'You cannot edit this publication, or its text cannot be empty.'});
       socialPublish('edit',id);
       reply({success:true,id,editedAt:result.rows[0].edited_at});
@@ -12889,20 +13048,24 @@ io.on('connection', (socket) => {
     if (!socialRateLimit(actor,'react:'+id,300)) return reply({success:false,message:'Please wait.'});
     try {
       const result = await queryDbWithRetry(`
-        INSERT INTO social_post_reactions (post_id,user_name,emoji)
-        SELECT id,$2,$3 FROM social_posts WHERE id=$1
-        ON CONFLICT (post_id,user_name) DO UPDATE
-        SET emoji=EXCLUDED.emoji WHERE social_post_reactions.emoji IS DISTINCT FROM EXCLUDED.emoji
-        RETURNING post_id
+        WITH target AS MATERIALIZED (SELECT id,author_name FROM social_posts WHERE id=$1),
+        applied AS (
+          INSERT INTO social_post_reactions (post_id,user_name,emoji)
+          SELECT id,$2,$3 FROM target
+          ON CONFLICT (post_id,user_name) DO UPDATE SET emoji=EXCLUDED.emoji
+            WHERE social_post_reactions.emoji IS DISTINCT FROM EXCLUDED.emoji
+          RETURNING post_id
+        )
+        SELECT target.author_name,EXISTS(SELECT 1 FROM applied) AS reacted FROM target
       `,[id,actor,emoji],{attempts:2,label:'SOCIAL POST REACTION'});
-      if (!result.rowCount) {
+      const reaction=result.rows[0];
+      if (!reaction) return reply({success:false,message:'Post not found.'});
+      if (!reaction.reacted) {
         await queryDbWithRetry('DELETE FROM social_post_reactions WHERE post_id=$1 AND user_name=$2 AND emoji=$3',[id,actor,emoji],{attempts:2,label:'SOCIAL REACTION REMOVE'});
       }
-      const ownerResult = await queryDbWithRetry('SELECT author_name FROM social_posts WHERE id=$1',[id],{attempts:2,label:'SOCIAL POST REACTION OWNER'});
-      if (!ownerResult.rows.length) return reply({success:false,message:'Post not found.'});
       socialPublish('react',id);
-      if (result.rowCount) {
-        const owner=ownerResult.rows[0].author_name;
+      if (reaction.reacted) {
+        const owner=reaction.author_name;
         socialNotifyAuthor(owner,actor,id,'reaction');
         if (owner!==actor) deferServerTask('SOCIAL REACTION NOTICE', () => recordUserNotification(owner,'social', {
           actor,postId:id,activity:'reaction',emoji
@@ -12932,14 +13095,19 @@ io.on('connection', (socket) => {
     if (!actor || !/^\d{1,18}$/.test(id) || !body || body.length > 1200) return reply({success:false,message:'A comment must contain 1–1200 characters.'});
     if (!socialRateLimit(actor,'comment',2000)) return reply({success:false,message:'Wait a moment before commenting again.'});
     try {
-      const added = await queryDbWithRetry(`INSERT INTO social_comments (post_id,author_name,body)
-        SELECT id,$2,$3 FROM social_posts WHERE id=$1 RETURNING id`,[id,actor,body],{attempts:2,label:'SOCIAL COMMENT CREATE'});
+      const added = await queryDbWithRetry(`
+        WITH target AS MATERIALIZED (SELECT id,author_name FROM social_posts WHERE id=$1),
+        inserted AS (INSERT INTO social_comments (post_id,author_name,body)
+          SELECT id,$2,$3 FROM target RETURNING id,post_id)
+        SELECT inserted.id,target.author_name AS post_author
+        FROM inserted JOIN target ON target.id=inserted.post_id
+      `,[id,actor,body],{attempts:2,label:'SOCIAL COMMENT CREATE'});
       if (!added.rows.length) return reply({success:false,message:'Post not found.'});
-      const ownerResult = await queryDbWithRetry('SELECT author_name FROM social_posts WHERE id=$1',[id],{attempts:2,label:'SOCIAL COMMENT OWNER'});
+      const owner=added.rows[0].post_author;
       socialPublish('comment',id);
-      socialNotifyAuthor(ownerResult.rows[0]?.author_name,actor,id,'comment');
-      if (ownerResult.rows[0]?.author_name && ownerResult.rows[0].author_name!==actor) {
-        deferServerTask('SOCIAL COMMENT NOTICE',()=>recordUserNotification(ownerResult.rows[0].author_name,'social',{
+      socialNotifyAuthor(owner,actor,id,'comment');
+      if (owner && owner!==actor) {
+        deferServerTask('SOCIAL COMMENT NOTICE',()=>recordUserNotification(owner,'social',{
           actor,postId:id,activity:'comment',text:body.slice(0,160)
         },{dedupeKey:`social:comment:${added.rows[0].id}:${actor}`}),0);
       }
@@ -12975,15 +13143,21 @@ io.on('connection', (socket) => {
     if (!actor || !/^\d{1,18}$/.test(id) || !SOCIAL_EMOJI.has(emoji)) return reply({success:false,message:'Invalid reaction.'});
     if (!socialRateLimit(actor,'comment-react:'+id,300)) return reply({success:false,message:'Please wait.'});
     try {
-      const result = await queryDbWithRetry(`INSERT INTO social_comment_reactions (comment_id,user_name,emoji)
-        SELECT id,$2,$3 FROM social_comments WHERE id=$1
-        ON CONFLICT (comment_id,user_name) DO UPDATE SET emoji=EXCLUDED.emoji
-          WHERE social_comment_reactions.emoji IS DISTINCT FROM EXCLUDED.emoji
-        RETURNING comment_id`,[id,actor,emoji],{attempts:2,label:'SOCIAL COMMENT REACT'});
-      if (!result.rowCount) await queryDbWithRetry('DELETE FROM social_comment_reactions WHERE comment_id=$1 AND user_name=$2 AND emoji=$3',[id,actor,emoji],{attempts:2,label:'SOCIAL COMMENT UNREACT'});
-      const owner = await queryDbWithRetry('SELECT post_id,author_name FROM social_comments WHERE id=$1',[id],{attempts:2,label:'SOCIAL COMMENT REACT POST'});
-      if (!owner.rows.length) return reply({success:false,message:'Comment not found.'});
-      socialPublish('comment',owner.rows[0].post_id);
+      const result = await queryDbWithRetry(`
+        WITH target AS MATERIALIZED (SELECT id,post_id FROM social_comments WHERE id=$1),
+        applied AS (
+          INSERT INTO social_comment_reactions (comment_id,user_name,emoji)
+          SELECT id,$2,$3 FROM target
+          ON CONFLICT (comment_id,user_name) DO UPDATE SET emoji=EXCLUDED.emoji
+            WHERE social_comment_reactions.emoji IS DISTINCT FROM EXCLUDED.emoji
+          RETURNING comment_id
+        )
+        SELECT target.post_id,EXISTS(SELECT 1 FROM applied) AS reacted FROM target
+      `,[id,actor,emoji],{attempts:2,label:'SOCIAL COMMENT REACT'});
+      const reaction=result.rows[0];
+      if (!reaction) return reply({success:false,message:'Comment not found.'});
+      if (!reaction.reacted) await queryDbWithRetry('DELETE FROM social_comment_reactions WHERE comment_id=$1 AND user_name=$2 AND emoji=$3',[id,actor,emoji],{attempts:2,label:'SOCIAL COMMENT UNREACT'});
+      socialPublish('comment',reaction.post_id);
       reply({success:true});
     } catch (err) {console.error('[SOCIAL COMMENT REACT ERROR]:',err && err.message || err);reply({success:false,message:'Could not react to comment.'});}
   });
@@ -14879,7 +15053,7 @@ io.on('connection', (socket) => {
     if(!viewer)return reply({success:false,groups:[]});
     try {
       const startedAt = Date.now();
-      const groups = await getDirectGroupList(viewer);
+      const groups = await readDirectGroupListShared(viewer);
       const durationMs = Date.now() - startedAt;
       if (durationMs > 1200) console.warn(`[GROUP LIST SLOW] ${durationMs}ms, ${groups.length} group(s)`);
       reply({success:true,groups});
