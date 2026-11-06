@@ -12695,26 +12695,33 @@ function serializeSocialComment(row) {
 }
 
 async function socialReadFeed(actor, friendsOnly, before, focusId = null) {
+  // Pick the requested page first; aggregate reactions/comments only for those rows.
   const result = await queryDbWithRetry(`
-    SELECT p.id, p.author_name, p.body, p.images, p.created_at, p.edited_at,
-      COALESCE(NULLIF(author.data->>'avatar',''), $4) AS author_avatar,
+    WITH page AS MATERIALIZED (
+      SELECT p.id,p.author_name,p.body,p.images,p.created_at,p.edited_at
+      FROM social_posts p
+      WHERE ($3::bigint IS NULL OR p.id < $3::bigint)
+        AND ($5::bigint IS NULL OR p.id = $5::bigint)
+        AND (NOT $2::boolean OR p.author_name=$1 OR EXISTS (
+          SELECT 1 FROM users viewer
+          CROSS JOIN LATERAL jsonb_array_elements(
+            CASE WHEN jsonb_typeof(viewer.data->'friendsData')='array' THEN viewer.data->'friendsData' ELSE '[]'::jsonb END
+          ) friend(value)
+          WHERE viewer.name=$1
+            AND CASE WHEN jsonb_typeof(friend.value)='object' THEN friend.value->>'name'
+                     WHEN jsonb_typeof(friend.value)='string' THEN friend.value#>>'{}' ELSE NULL END = p.author_name
+        ))
+      ORDER BY p.id DESC LIMIT ${SOCIAL_POST_LIMIT + 1}
+    )
+    SELECT p.id,p.author_name,p.body,p.images,p.created_at,p.edited_at,
+      COALESCE(NULLIF(author.data->>'avatar',''),$4) AS author_avatar,
       COALESCE((SELECT jsonb_agg(jsonb_build_object('emoji',r.emoji,'count',r.cnt))
-        FROM (SELECT emoji, COUNT(*) AS cnt FROM social_post_reactions WHERE post_id=p.id GROUP BY emoji) r), '[]'::jsonb) AS reactions,
+        FROM (SELECT emoji,COUNT(*) AS cnt FROM social_post_reactions WHERE post_id=p.id GROUP BY emoji) r), '[]'::jsonb) AS reactions,
       (SELECT emoji FROM social_post_reactions WHERE post_id=p.id AND user_name=$1) AS my_reaction,
       (SELECT COUNT(*) FROM social_comments WHERE post_id=p.id) AS comment_count
-    FROM social_posts p
+    FROM page p
     JOIN users author ON author.name = p.author_name
-    WHERE ($3::bigint IS NULL OR p.id < $3::bigint) AND ($5::bigint IS NULL OR p.id=$5::bigint)
-      AND (NOT $2::boolean OR p.author_name=$1 OR EXISTS (
-        SELECT 1 FROM users viewer
-        CROSS JOIN LATERAL jsonb_array_elements(
-          CASE WHEN jsonb_typeof(viewer.data->'friendsData')='array' THEN viewer.data->'friendsData' ELSE '[]'::jsonb END
-        ) friend(value)
-        WHERE viewer.name=$1
-          AND CASE WHEN jsonb_typeof(friend.value)='object' THEN friend.value->>'name'
-                   WHEN jsonb_typeof(friend.value)='string' THEN friend.value#>>'{}' ELSE NULL END = p.author_name
-      ))
-    ORDER BY p.id DESC LIMIT ${SOCIAL_POST_LIMIT + 1}
+    ORDER BY p.id DESC
   `, [actor, friendsOnly, before, DEFAULT_AVATAR, focusId], { attempts:2, label:'SOCIAL FEED' });
   const rows = result.rows || [];
   return {
@@ -12766,9 +12773,6 @@ io.on('connection', (socket) => {
   // --------------------------------------------------------------------------
   // Social public feed
   // --------------------------------------------------------------------------
-  socket.on('social_capabilities', (_data, callback) => {
-    if(typeof callback==='function')callback({success:true,api:2});
-  });
   socket.on('social_feed_list', async (data = {}, callback) => {
     const reply = typeof callback === 'function' ? callback : () => {};
     const actor = normalizeSocialUserName(socket.userName);
@@ -12777,7 +12781,10 @@ io.on('connection', (socket) => {
     const before = /^\d{1,18}$/.test(rawBefore) && Number(rawBefore) > 0 ? rawBefore : null;
     try {
       const focusId = /^\d{1,18}$/.test(String(data.focusId || '')) ? String(data.focusId) : null;
+      const startedAt = Date.now();
       const feed = await socialReadFeed(actor, data.friendsOnly === true, before, focusId);
+      const elapsedMs = Date.now() - startedAt;
+      if (elapsedMs > 1200) console.warn(`[SOCIAL FEED SLOW] ${elapsedMs}ms, ${feed.posts.length} posts, friendsOnly=${data.friendsOnly === true}`);
       reply({ success:true, ...feed });
     } catch (err) {
       console.error('[SOCIAL FEED ERROR]:', err && err.message || err);
@@ -14870,7 +14877,16 @@ io.on('connection', (socket) => {
     const reply=typeof callback==='function'?callback:()=>{};
     const viewer=normalizeDirectMessageUser(socket.userName);
     if(!viewer)return reply({success:false,groups:[]});
-    try { reply({success:true,groups:await getDirectGroupList(viewer)}); }catch(err){console.error('[GROUP LIST]',err?.message||err);reply({success:false,groups:[]});}
+    try {
+      const startedAt = Date.now();
+      const groups = await getDirectGroupList(viewer);
+      const durationMs = Date.now() - startedAt;
+      if (durationMs > 1200) console.warn(`[GROUP LIST SLOW] ${durationMs}ms, ${groups.length} group(s)`);
+      reply({success:true,groups});
+    } catch(err) {
+      console.error('[GROUP LIST]',err?.message||err);
+      reply({success:false,groups:[]});
+    }
   });
   socket.on('direct_group_create',async (data={},callback)=>{
     data=data&&typeof data==='object'&&!Array.isArray(data)?data:{};
