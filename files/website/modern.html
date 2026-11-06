@@ -82949,6 +82949,63 @@ function getVisibleChatStackEl(id) {
 		else if (typeof refreshMentionJumpButton === 'function') refreshMentionJumpButton();
 	}
 	
+	// Reuse chat sender/formatting caches for messages delivered within the same
+	// paint frame. Each message is inserted immediately; only follow-up UI work
+	// (selection, mentions, virtual window cleanup) is coalesced.
+	let liveChatAppendContext = null;
+	let liveChatFollowUpFrame = 0;
+	let liveChatNeedsTrim = false;
+	let liveChatTrimDirection = '';
+	let liveChatNeedsSelection = false;
+	let liveChatNeedsMentions = false;
+	let liveChatNeedsBadges = false;
+	function flushLiveChatAppendFollowUp() {
+		liveChatFollowUpFrame = 0;
+		liveChatAppendContext = null;
+		const shouldTrim = liveChatNeedsTrim;
+		const trimDirection = liveChatTrimDirection;
+		const updateSelection = liveChatNeedsSelection;
+		const updateMentions = liveChatNeedsMentions;
+		const updateBadges = liveChatNeedsBadges;
+		liveChatNeedsTrim = false;
+		liveChatTrimDirection = '';
+		liveChatNeedsSelection = false;
+		liveChatNeedsMentions = false;
+		liveChatNeedsBadges = false;
+		// A view change can occur before paint. Skip expensive offscreen chat DOM
+		// updates, but still refresh unread and sidebar badges for the new view.
+		const chatVisible = typeof isChatScreenVisibleForRead !== 'function' || isChatScreenVisibleForRead();
+		if (chatVisible) {
+			if (shouldTrim && typeof trimChatVirtualDomWindow === 'function') trimChatVirtualDomWindow(trimDirection);
+			if (updateSelection && typeof updateChatSelectionUi === 'function') updateChatSelectionUi();
+			if (updateMentions && typeof refreshMentionJumpButton === 'function') refreshMentionJumpButton();
+		}
+		if (updateBadges) {
+			if (typeof refreshChatNotificationDot === 'function') refreshChatNotificationDot();
+			if (typeof updateJumpBottomUnreadBadge === 'function') updateJumpBottomUnreadBadge();
+		}
+	}
+	function scheduleLiveChatFollowUp(options = {}) {
+		if (options.trim) {
+			liveChatNeedsTrim = true;
+			if (options.direction === 'newer') liveChatTrimDirection = 'newer';
+		}
+		if (options.badges !== false) liveChatNeedsBadges = true;
+		if (!liveChatFollowUpFrame) liveChatFollowUpFrame = requestAnimationFrame(flushLiveChatAppendFollowUp);
+	}
+	function appendLiveChatMessage(data, myName) {
+		const previousContext = window.__chatRenderBatchContext || null;
+		try {
+			liveChatAppendContext = refreshChatWindowRenderContext(liveChatAppendContext, myName);
+			window.__chatRenderBatchContext = liveChatAppendContext;
+			appendMessageToChat(data, data.user === myName, data.time);
+			liveChatNeedsSelection ||= liveChatAppendContext.selectionRefreshNeeded;
+			liveChatNeedsMentions ||= liveChatAppendContext.mentionRefreshNeeded;
+		} finally {
+			window.__chatRenderBatchContext = previousContext;
+		}
+	}
+
 	function escapePinnedChatPreviewText(value) {
 		return String(value || '')
 			.replace(/&/g, '&amp;')
@@ -85766,6 +85823,21 @@ function getVisibleChatStackEl(id) {
     }else if(html)bubble.insertAdjacentHTML('afterend',`<div class="reactions-container" style="display:flex;gap:4px;margin-top:5px">${html}</div>`);
     return true;
   }
+  function hydrateDirectGroupMessageRow(row){
+    if(!row)return;
+    if(typeof hydrateChatInternalShareLinks==='function')hydrateChatInternalShareLinks(row);
+    if(typeof hydrateChatMediaImages==='function')hydrateChatMediaImages(row);
+  }
+  function pruneRenderedDirectGroupRows(list, removedIds, keepBottom){
+    if(!list||!removedIds.length)return;
+    const beforeHeight=list.scrollHeight, beforeTop=list.scrollTop;
+    for(const id of removedIds){
+      const row=list.querySelector(`[data-direct-group-message="${CSS.escape(String(id))}"]`);
+      if(row)row.remove();
+    }
+    if(keepBottom)list.scrollTop=list.scrollHeight;
+    else list.scrollTop=Math.max(0,beforeTop-(beforeHeight-list.scrollHeight));
+  }
   function directGroupMessageHtml(m){
     const own=String(m.from||'').trim()===directGroupMyName(),id=directGroupEscape(m.id),media=Array.isArray(m.content)?m.content:[],poll=m.type==='poll';
     const reactions=directGroupReactionsHtml(m);
@@ -85782,6 +85854,7 @@ function getVisibleChatStackEl(id) {
     document.getElementById('direct-group-count').textContent=s.messages.length;
     list.innerHTML=s.messages.length?s.messages.map(directGroupMessageHtml).join(''):'<div class="direct-thread-empty" style="min-height:100%"><i class="fas fa-comments"></i><div>No messages yet. Say hi.</div></div>';
     if(typeof hydrateChatInternalShareLinks==='function')hydrateChatInternalShareLinks(list);
+    if(typeof hydrateChatMediaImages==='function')hydrateChatMediaImages(list);
     renderDirectGroupPins();
     requestAnimationFrame(()=>{if(!list.isConnected)return;if(options.forceBottom||nearBottom)list.scrollTop=list.scrollHeight;else list.scrollTop=top;});
   }
@@ -85885,7 +85958,14 @@ function getVisibleChatStackEl(id) {
       if(button)button.disabled=false;
       if(!response?.success)return directGroupNote(response?.message||'Could not create poll.');
       window.closePollModal({silent:true});
-      if(s.activeId===id&&response.message){const i=s.messages.findIndex(m=>String(m.id)===String(response.message.id));if(i>=0)s.messages[i]=response.message;else s.messages.push(response.message);renderDirectGroupMessages({forceBottom:!editId});}
+      if(s.activeId===id&&response.message){
+        const i=s.messages.findIndex(m=>String(m.id)===String(response.message.id));
+        const prior=i>=0?s.messages[i]:null;
+        const alreadyReceived=!!(prior&&directGroupAckState(prior)===directGroupAckState(response.message));
+        if(i>=0){if(!alreadyReceived)s.messages[i]=response.message;}else s.messages.push(response.message);
+        const row=document.getElementById('direct-group-messages')?.querySelector(`[data-direct-group-message="${CSS.escape(String(response.message.id))}"]`);
+        if(!row||!alreadyReceived)renderDirectGroupMessages({forceBottom:!editId});
+      }
       scheduleDirectGroupListRefresh();
     });
   };
@@ -85922,43 +86002,66 @@ function getVisibleChatStackEl(id) {
       if(s.listInFlight&&!requiresListRefresh)s.listRefreshQueued=true;
       if(payload?.groupId!==s.activeId||!s.group){if(requiresListRefresh)scheduleDirectGroupListRefresh();return;}
       const list=document.getElementById('direct-group-messages'),nearBottom=list?list.scrollHeight-list.scrollTop-list.clientHeight<75:false;
-      const previousMessage = payload.message ? s.messages.find(m=>String(m.id)===String(payload.message.id)) : null;
-      const groupEdited = !!(previousMessage && payload.message?.editedAt && (String(previousMessage.text||'')!==String(payload.message.text||'') || String(previousMessage.editedAt||'')!==String(payload.message.editedAt||'')));
-      const groupPinned = !!(previousMessage && payload.message && (!!previousMessage.pinnedAt !== !!payload.message.pinnedAt));
-      if(payload.kind==='delete'){pendingDirectGroupPinDeletes.delete(s.activeId+':'+payload.id);s.messages=s.messages.filter(m=>String(m.id)!==String(payload.id));}
-      else if(payload.message){const idx=s.messages.findIndex(m=>String(m.id)===String(payload.message.id));if(idx>=0)s.messages[idx]=payload.message;else s.messages.push(payload.message);}
-      let groupMessagesOrdered = true;
-      let previousGroupMessageId = -Infinity;
-      for (const message of s.messages) {
-        const messageId = Number(message.id);
-        if (!Number.isFinite(messageId) || messageId < previousGroupMessageId) { groupMessagesOrdered = false; break; }
-        previousGroupMessageId = messageId;
-      }
-      if (!groupMessagesOrdered) s.messages.sort((a,b)=>Number(a.id)-Number(b.id));
-      if(s.messages.length>200)s.messages.splice(0,s.messages.length-200);
-      if(list&&payload.kind!=='delete'&&payload.message){
-        const msg=payload.message,row=list.querySelector(`[data-direct-group-message="${CSS.escape(String(msg.id))}"]`);
-        let reactionsPatched=false;
-        if(row){
-          reactionsPatched=patchDirectGroupReactions(row,previousMessage,msg);
-          if(!reactionsPatched){
-            const before=list.scrollHeight,top=list.scrollTop;
-            row.outerHTML=directGroupMessageHtml(msg);
-            if(typeof hydrateChatInternalShareLinks==='function')hydrateChatInternalShareLinks(list.querySelector(`[data-direct-group-message="${CSS.escape(String(msg.id))}"]`));
-            if(!nearBottom)list.scrollTop=top+(list.scrollHeight-before);
+      const previousIndex=payload.message?s.messages.findIndex(m=>String(m.id)===String(payload.message.id)):-1;
+      const previousMessage=previousIndex>=0?s.messages[previousIndex]:null;
+      const removedMessage=payload.kind==='delete'?s.messages.find(m=>String(m.id)===String(payload.id)):null;
+      const groupEdited=!!(previousMessage&&payload.message?.editedAt&&(String(previousMessage.text||'')!==String(payload.message.text||'')||String(previousMessage.editedAt||'')!==String(payload.message.editedAt||'')));
+      const groupPinned=!!(previousMessage&&payload.message&&(!!previousMessage.pinnedAt!==!!payload.message.pinnedAt));
+      const lastExistingId=s.messages.length?Number(s.messages[s.messages.length-1].id):-Infinity;
+      let groupMessagesReordered=false;
+      if(payload.kind==='delete'){
+        pendingDirectGroupPinDeletes.delete(s.activeId+':'+payload.id);
+        s.messages=s.messages.filter(m=>String(m.id)!==String(payload.id));
+      }else if(payload.message){
+        if(previousIndex>=0)s.messages[previousIndex]=payload.message;
+        else {
+          s.messages.push(payload.message);
+          if(Number(payload.message.id)<lastExistingId){
+            s.messages.sort((a,b)=>Number(a.id)-Number(b.id));
+            groupMessagesReordered=true;
           }
         }
-        else if(s.messages.length>1){list.insertAdjacentHTML('beforeend',directGroupMessageHtml(msg));if(typeof hydrateChatInternalShareLinks==='function')hydrateChatInternalShareLinks(list.lastElementChild);if(nearBottom)list.scrollTop=list.scrollHeight;}
-        else renderDirectGroupMessages({forceBottom:true});
-        document.getElementById('direct-group-count').textContent=s.messages.length;
-        if(!reactionsPatched)renderDirectGroupPins();
+      }
+      const prunedIds=s.messages.length>200?s.messages.splice(0,s.messages.length-200).map(m=>String(m.id)):[];
+      const pinsAffected=!!(groupPinned||payload.message?.pinnedAt||previousMessage?.pinnedAt||removedMessage?.pinnedAt);
+      if(list&&payload.kind!=='delete'&&payload.message){
+        const msg=payload.message,row=list.querySelector(`[data-direct-group-message="${CSS.escape(String(msg.id))}"]`);
+        let renderedAll=false;
+        if(groupMessagesReordered || (prunedIds.includes(String(msg.id))&& !row)){
+          renderDirectGroupMessages({forceBottom:nearBottom});
+          renderedAll=true;
+        }else if(row){
+          if(!patchDirectGroupReactions(row,previousMessage,msg)){
+            const before=list.scrollHeight,top=list.scrollTop;
+            row.outerHTML=directGroupMessageHtml(msg);
+            hydrateDirectGroupMessageRow(list.querySelector(`[data-direct-group-message="${CSS.escape(String(msg.id))}"]`));
+            if(!nearBottom)list.scrollTop=top+(list.scrollHeight-before);
+          }
+        }else if(s.messages.length>1){
+          list.insertAdjacentHTML('beforeend',directGroupMessageHtml(msg));
+          hydrateDirectGroupMessageRow(list.lastElementChild);
+          if(nearBottom)list.scrollTop=list.scrollHeight;
+        }else{
+          renderDirectGroupMessages({forceBottom:true});
+          renderedAll=true;
+        }
+        if(!renderedAll){
+          pruneRenderedDirectGroupRows(list,prunedIds,nearBottom);
+          if(pinsAffected)renderDirectGroupPins();
+        }
+        const count=document.getElementById('direct-group-count');if(count)count.textContent=s.messages.length;
       }else if(list&&payload.kind==='delete'){
         const row=list.querySelector(`[data-direct-group-message="${CSS.escape(String(payload.id))}"]`);
+        let renderedAll=false;
         if(row){
           if(!row.classList.contains('psn-undo-delete-pending'))window.stagePsnUndoChatMessageCollapse(row);
           setTimeout(()=>{if(row.isConnected)row.remove();},410);
-        }else renderDirectGroupMessages();
-        document.getElementById('direct-group-count').textContent=s.messages.length;renderDirectGroupPins();
+        }else{renderDirectGroupMessages();renderedAll=true;}
+        if(!renderedAll){
+          pruneRenderedDirectGroupRows(list,prunedIds,nearBottom);
+          if(pinsAffected)renderDirectGroupPins();
+        }
+        const count=document.getElementById('direct-group-count');if(count)count.textContent=s.messages.length;
       }else renderDirectGroupMessages();
       if((groupEdited||groupPinned)&&payload.message)window.flashPsnChatMessageAction(() => document.querySelector(`#direct-group-messages [data-direct-group-message="${CSS.escape(String(payload.message.id))}"]`),groupEdited?'edit':'pin',`group:${s.activeId}:${payload.message.id}`);
       directGroupMarkRead();
@@ -92207,16 +92310,15 @@ function getVisibleChatStackEl(id) {
 				if (appendToCurrentWindow) {
 					checkAndInsertDivider();
 					maybeInsertUnreadDivider(shouldAutoScroll);
-					appendMessageToChat(data, data.user === myName, data.time);
-					if (!query) trimChatVirtualDomWindow(shouldAutoScroll ? 'newer' : '');
+					appendLiveChatMessage(data, myName);
+					scheduleLiveChatFollowUp({ trim: !query, direction: shouldAutoScroll ? 'newer' : '' });
 				}
 				if (shouldAutoScroll && typeof jumpToBottom === 'function') jumpToBottom();
 				else if (typeof setJumpBottomButtonVisible === 'function') setJumpBottomButtonVisible(true);
 			}
 		
 			updateChatHistoryRenderSignature();
-			if (typeof refreshChatNotificationDot === 'function') refreshChatNotificationDot();
-			if (typeof updateJumpBottomUnreadBadge === 'function') updateJumpBottomUnreadBadge();
+			scheduleLiveChatFollowUp({ badges: true });
 		});
 	
 		socketChat.on('message_edited', function(data) {
@@ -114142,7 +114244,24 @@ function getVisibleChatStackEl(id) {
     return overlay;
   }
 
-  const socialReactors = { overlay:null, kind:'post', id:'', postId:'', emoji:'', after:null, busy:false, serial:0, opener:null, count:0, refreshTimer:0 };
+  const socialReactors = { overlay:null, kind:'post', id:'', postId:'', emoji:'', after:null, busy:false, serial:0, opener:null, count:0, refreshTimer:0, resizeAnimation:null, skipNextResize:false };
+  function animateSocialReactorsHeight(update, immediate = false){
+    const overlay=socialReactors.overlay;
+    const dialog=overlay?.querySelector('.psn-social-reactors-dialog');
+    if(!dialog||overlay.hidden){update();return;}
+    const start=dialog.offsetHeight;
+    if(socialReactors.resizeAnimation){socialReactors.resizeAnimation.cancel();socialReactors.resizeAnimation=null;}
+    update();
+    if(immediate||typeof dialog.animate!=='function'||window.matchMedia('(prefers-reduced-motion: reduce)').matches)return;
+    const end=dialog.offsetHeight;
+    if(Math.abs(end-start)<2)return;
+    const animation=dialog.animate(
+      [{height:`${start}px`},{height:`${end}px`}],
+      {duration:280,easing:'cubic-bezier(.22,.8,.24,1)'}
+    );
+    socialReactors.resizeAnimation=animation;
+    animation.finished.then(()=>{if(socialReactors.resizeAnimation===animation)socialReactors.resizeAnimation=null;}).catch(()=>{});
+  }
   function ensureSocialReactorsModal(){
     if(socialReactors.overlay)return socialReactors.overlay;
     const overlay=document.createElement('div');overlay.id='psn-social-reactors-modal';overlay.hidden=true;
@@ -114186,6 +114305,8 @@ function getVisibleChatStackEl(id) {
   function closeSocialReactors(){
     const overlay=socialReactors.overlay;if(!overlay||overlay.hidden)return;
     overlay.hidden=true;socialReactors.serial++;socialReactors.busy=false;clearTimeout(socialReactors.refreshTimer);
+    socialReactors.skipNextResize=false;
+    if(socialReactors.resizeAnimation){socialReactors.resizeAnimation.cancel();socialReactors.resizeAnimation=null;}
     overlay.querySelector('#psn-social-reactors-list')?.removeAttribute('aria-busy');
     const opener=socialReactors.opener;
     socialReactors.id='';socialReactors.opener=null;socialReactors.after=null;
@@ -114198,7 +114319,7 @@ function getVisibleChatStackEl(id) {
     const overlay=ensureSocialReactorsModal();
     socialReactors.kind=kind;socialReactors.id=id;socialReactors.postId=postId;
     socialReactors.emoji='';socialReactors.after=null;socialReactors.opener=btn;
-    socialReactors.serial++;socialReactors.busy=false;
+    socialReactors.serial++;socialReactors.busy=false;socialReactors.skipNextResize=true;
     overlay.hidden=false;renderSocialReactorsFilters();
     overlay.querySelector('[data-reactors-close]')?.focus({preventScroll:true});
     loadSocialReactors(false);
@@ -114213,26 +114334,35 @@ function getVisibleChatStackEl(id) {
     const serial=++socialReactors.serial;socialReactors.busy=true;
     const list=overlay.querySelector('#psn-social-reactors-list');
     const moreButton=overlay.querySelector('[data-reactors-more]');
-    if(!more){socialReactors.after=null;list.innerHTML=socialReactorSkeleton();list.setAttribute('aria-busy','true');moreButton.hidden=true;}
-    else {moreButton.disabled=true;moreButton.classList.add('is-loading');moreButton.innerHTML='<i class="fas fa-spinner" aria-hidden="true"></i><span>Loading...</span>';}
+    if(!more){
+      const immediate=socialReactors.skipNextResize;
+      socialReactors.skipNextResize=false;
+      animateSocialReactorsHeight(()=>{
+        socialReactors.after=null;list.innerHTML=socialReactorSkeleton();list.setAttribute('aria-busy','true');moreButton.hidden=true;
+      },immediate);
+    }else {moreButton.disabled=true;moreButton.classList.add('is-loading');moreButton.innerHTML='<i class="fas fa-spinner" aria-hidden="true"></i><span>Loading...</span>';}
     const result=await call('social_reactors_list',{kind,id,emoji,after:more?socialReactors.after:''});
     if(serial!==socialReactors.serial||overlay.hidden)return;
     socialReactors.busy=false;
     list.removeAttribute('aria-busy');
     moreButton.disabled=false;moreButton.classList.remove('is-loading');
     if(!result.success){
-      if(!more)list.innerHTML=`<div class="psn-social-reactors-empty">${esc(result.message||'Could not load reactions.')}</div>`;
-      else notify(result.message||'Could not load reactions.',true);
-      moreButton.hidden=false;moreButton.innerHTML='<i class="fas fa-redo-alt" aria-hidden="true"></i><span>Try again</span>';moreButton.dataset.reactorsRetry=more?'more':'first';
+      animateSocialReactorsHeight(()=>{
+        if(!more)list.innerHTML=`<div class="psn-social-reactors-empty">${esc(result.message||'Could not load reactions.')}</div>`;
+        else notify(result.message||'Could not load reactions.',true);
+        moreButton.hidden=false;moreButton.innerHTML='<i class="fas fa-redo-alt" aria-hidden="true"></i><span>Try again</span>';moreButton.dataset.reactorsRetry=more?'more':'first';
+      });
       return;
     }
     moreButton.dataset.reactorsRetry='more';moreButton.innerHTML='<i class="fas fa-chevron-down" aria-hidden="true"></i><span>Load more</span>';
     const users=Array.isArray(result.users)?result.users:[];
     const markup=users.map(user=>`<button type="button" class="psn-social-reactors-person" data-reactors-user="${esc(user.name)}" aria-label="View ${esc(user.name)} profile"><span>${socialAvatar(user.name,user.avatar)}</span><span class="psn-social-reactors-name">${esc(user.name)}</span><span class="psn-social-reactors-emoji" aria-label="${esc(user.emoji)}">${esc(user.emoji)}</span></button>`).join('');
-    if(!more)list.innerHTML=markup||'<div class="psn-social-reactors-empty">No reactions yet.</div>';
-    else list.insertAdjacentHTML('beforeend',markup);
-    socialReactors.after=result.nextAfter||null;
-    moreButton.hidden=!socialReactors.after;
+    animateSocialReactorsHeight(()=>{
+      if(!more)list.innerHTML=markup||'<div class="psn-social-reactors-empty">No reactions yet.</div>';
+      else list.insertAdjacentHTML('beforeend',markup);
+      socialReactors.after=result.nextAfter||null;
+      moreButton.hidden=!socialReactors.after;
+    });
   }
   function refreshOpenSocialReactors(kind,id){
     if(socialReactors.overlay?.hidden!==false||socialReactors.kind!==kind||socialReactors.id!==id)return;
