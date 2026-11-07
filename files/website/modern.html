@@ -7923,6 +7923,12 @@ body.psn-home-interactive.psn-sidebar-tab-switched .sidebar > .sidebar-menu[clas
 .psn-social-preview-eyebrow { font-size:10px; font-weight:700; letter-spacing:.075em; text-transform:uppercase; color:#91a7c7; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
 .psn-social-preview-title { font-size:13px; font-weight:700; color:#edf3fc; line-height:1.4; overflow:hidden; display:-webkit-box; -webkit-box-orient:vertical; -webkit-line-clamp:2; overflow-wrap:anywhere; }
 .psn-social-preview-description { color:var(--text-muted); font-size:11px; line-height:1.45; display:-webkit-box; -webkit-box-orient:vertical; -webkit-line-clamp:2; overflow:hidden; overflow-wrap:anywhere; }
+.psn-social-youtube-card.yt-video-card { display:block; width:100%; max-width:570px; margin:0; padding:0; text-align:left; color:#fff; font:inherit; height:auto; aspect-ratio:16 / 9; border-radius:12px; background:#080d15; border:1px solid rgba(255,255,255,.12); transition:border-color .2s ease,transform .18s ease; }
+.psn-social-youtube-card.yt-video-card:hover { border-color:rgba(91,161,245,.48); }
+.psn-social-youtube-card.yt-video-card:active { transform:scale(.988); }
+.psn-social-youtube-card.yt-video-card:focus-visible { outline:2px solid var(--psn-focus-ring); outline-offset:2px; }
+.psn-social-youtube-card .yt-thumb { display:block; width:100%; height:100%; object-fit:cover; opacity:.82; }
+.psn-social-youtube-card .yt-card-info { font-size:12px; }
 .psn-social-preview-skeleton { pointer-events:none; }
 .psn-social-preview-skeleton .psn-social-preview-art { animation:psnSocialSkeletonPulse 1.55s ease-in-out infinite; }
 .psn-social-preview-skeleton .psn-social-preview-data { gap:11px; }
@@ -115064,6 +115070,26 @@ function getVisibleChatStackEl(id) {
       return target.origin===location.origin&&target.pathname===location.pathname&&/^#social-post-(\d{1,18})$/.test(target.hash)?target.hash.slice(13):'';
     }catch(err){return '';}
   }
+  // Use the same modal playback as Global and Private Chat; do not fetch page metadata for YouTube.
+  function socialYoutubeId(rawUrl){
+    try {
+      const parsed=new URL(rawUrl);
+      if(parsed.protocol!=='https:'&&parsed.protocol!=='http:')return '';
+      const hostname=parsed.hostname.toLowerCase();
+      const isShort=hostname==='youtu.be'||hostname==='www.youtu.be';
+      const isYoutube=['youtube.com','www.youtube.com','m.youtube.com','music.youtube.com','youtube-nocookie.com','www.youtube-nocookie.com'].includes(hostname);
+      if(!isShort&&!isYoutube)return '';
+      const segments=parsed.pathname.split('/').filter(Boolean);
+      let id='';
+      if(isShort)id=segments[0]||'';
+      else if(segments[0]==='watch')id=parsed.searchParams.get('v')||'';
+      else if(['shorts','embed','live','v'].includes(segments[0]))id=segments[1]||'';
+      return /^[A-Za-z0-9_-]{11}$/.test(id)?id:'';
+    }catch(e){return '';}
+  }
+  function socialYoutubePreview(url,id){
+    return `<div class="psn-social-preview-host" data-social-preview-url="${esc(url)}" data-social-preview-type="youtube"><button type="button" class="yt-video-card psn-social-youtube-card" data-social-youtube-id="${esc(id)}" aria-label="Watch YouTube video" title="Watch Video"><img class="yt-thumb" src="https://img.youtube.com/vi/${esc(id)}/mqdefault.jpg" alt="" loading="lazy" decoding="async"><span class="yt-play-overlay" aria-hidden="true"><i class="fas fa-play"></i></span><span class="yt-card-info"><span>Watch Video</span><i class="fab fa-youtube"></i></span></button></div>`;
+  }
   function socialLinkedHtml(raw){
     const template=document.createElement('template');template.innerHTML=socialSafeHtml(raw);
     const walker=document.createTreeWalker(template.content,NodeFilter.SHOW_TEXT);
@@ -115115,6 +115141,8 @@ function getVisibleChatStackEl(id) {
   function socialPreviewMarkup(raw){
     const url=socialFirstUrl(raw);if(!url)return '';
     const share=socialShareInfo(url),postId=socialPostLinkId(url);
+    const ytId=socialYoutubeId(url);
+    if(ytId)return socialYoutubePreview(url,ytId);
     if(share){
       const hint=share.hint;
       let cover='';
@@ -115178,7 +115206,7 @@ function getVisibleChatStackEl(id) {
     if(!host?.isConnected)return;
     const url=host.dataset.socialPreviewUrl;
     const type=host.dataset.socialPreviewType;
-    if(!url||type==='post')return;
+    if(!url||type==='post'||type==='youtube')return;
     if(type==='shared'){
       const share=socialShareInfo(url);if(!share)return;
       // New shares include public title/content IDs; preview them locally, with zero DB reads.
@@ -116608,6 +116636,16 @@ function getVisibleChatStackEl(id) {
     document.getElementById('psn-social-publish')?.addEventListener('click',publish);
     document.getElementById('psn-social-more')?.addEventListener('click',()=>loadFeed(true));
     root.addEventListener('click',e=>{
+      const youtube=e.target.closest('[data-social-youtube-id]');
+      if(youtube){
+        e.preventDefault();
+        const videoId=youtube.dataset.socialYoutubeId||'';
+        if(/^[A-Za-z0-9_-]{11}$/.test(videoId)&&typeof window.playTrailerDirect==='function'){
+          if(typeof playUiClick==='function')playUiClick();
+          window.playTrailerDirect(videoId);
+        }
+        return;
+      }
       const shared=e.target.closest('[data-social-shared-url],.psn-social-body a.psn-social-text-link,.psn-social-comment-text a.psn-social-text-link');
       if(shared){
         const href=shared.dataset.socialSharedUrl||shared.href;
