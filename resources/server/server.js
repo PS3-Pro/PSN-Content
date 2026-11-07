@@ -10184,6 +10184,7 @@ async function initProfileSyncNotifications() {
 
       if (message.channel === 'social_feed_sync') {
         socialFeedPending.clear();
+        if(data.kind==='post'||data.kind==='delete')socialFeedCountCache.clear();
         invalidateSocialReactorsForChange(data.kind,String(data.id || ''),data);
         if (data.kind === 'comment' || data.kind === 'comment-delete' || (data.kind === 'react' && data.commentId)) {
           const suffix = `\u0000${String(data.id || '')}`;
@@ -13313,6 +13314,42 @@ async function socialReadFeed(actor, filter, before, focusId = null) {
   };
 }
 
+const socialFeedCountCache=new Map();
+async function socialReadPostCounts(actor){
+  const result=await queryDbWithRetry(`
+    WITH friend_names AS MATERIALIZED (
+      SELECT CASE WHEN jsonb_typeof(friend.value)='object' THEN friend.value->>'name'
+                  WHEN jsonb_typeof(friend.value)='string' THEN friend.value#>>'{}' ELSE NULL END AS name
+      FROM users viewer
+      CROSS JOIN LATERAL jsonb_array_elements(
+        CASE WHEN jsonb_typeof(viewer.data->'friendsData')='array' THEN viewer.data->'friendsData' ELSE '[]'::jsonb END
+      ) friend(value)
+      WHERE viewer.name=$1
+    )
+    SELECT COUNT(*)::int AS all_count,
+      COUNT(*) FILTER (WHERE p.author_name=$1)::int AS mine_count,
+      COUNT(*) FILTER (WHERE p.author_name IN (SELECT name FROM friend_names))::int AS friends_count
+    FROM social_posts p
+  `,[actor],{attempts:2,label:'SOCIAL POST COUNTS'});
+  const row=result.rows[0]||{};
+  return {all:Number(row.all_count)||0,friends:Number(row.friends_count)||0,mine:Number(row.mine_count)||0};
+}
+function readSocialPostCountsShared(actor){
+  const now=Date.now();
+  const cached=socialFeedCountCache.get(actor);
+  if(cached&&(cached.promise||cached.expires>now))return cached.promise||Promise.resolve(cached.value);
+  const entry={promise:null,value:null,expires:0};
+  entry.promise=socialReadPostCounts(actor).then(value=>{
+    if(socialFeedCountCache.get(actor)===entry){entry.value=value;entry.promise=null;entry.expires=Date.now()+15000;}
+    return value;
+  }).catch(err=>{
+    if(socialFeedCountCache.get(actor)===entry)socialFeedCountCache.delete(actor);
+    throw err;
+  });
+  socialFeedCountCache.set(actor,entry);
+  while(socialFeedCountCache.size>120)socialFeedCountCache.delete(socialFeedCountCache.keys().next().value);
+  return entry.promise;
+}
 const socialFeedPending=new Map();
 function readSocialFeedShared(actor, filter, before, focusId){
   const key=JSON.stringify([actor,filter,before,focusId]);
@@ -13440,6 +13477,7 @@ function invalidateSocialReactorsForChange(kind, id, extra = null) {
 
 function socialPublish(kind, id, extra = null) {
   socialFeedPending.clear();
+  if(kind==='post'||kind==='delete')socialFeedCountCache.clear();
   invalidateSocialReactorsForChange(kind,id,extra);
   if (kind === 'comment' || kind === 'comment-delete' || (kind === 'react' && extra && extra.commentId)) {
     const suffix = `\u0000${String(id || '')}`;
@@ -13547,14 +13585,25 @@ io.on('connection', (socket) => {
       const focusId = /^\d{1,18}$/.test(String(data.focusId || '')) ? String(data.focusId) : null;
       const startedAt = Date.now();
       const filter = ['all','friends','mine'].includes(data.filter) ? data.filter : (data.friendsOnly===true?'friends':'all');
-      const feed = await readSocialFeedShared(actor,filter,before,focusId);
+      const [feed,counts] = await Promise.all([
+        readSocialFeedShared(actor,filter,before,focusId),
+        !before&&!focusId?readSocialPostCountsShared(actor).catch(()=>null):Promise.resolve(null)
+      ]);
       const elapsedMs = Date.now() - startedAt;
       if (elapsedMs > 1200) console.warn(`[SOCIAL FEED SLOW] ${elapsedMs}ms, ${feed.posts.length} posts, filter=${filter}`);
-      reply({ success:true, ...feed });
+      reply({ success:true, ...feed, ...(counts?{counts}:{}) });
     } catch (err) {
       console.error('[SOCIAL FEED ERROR]:', err && err.message || err);
       reply({ success:false, message:'Could not load Social posts.' });
     }
+  });
+
+  socket.on('social_feed_counts', async (_data = {}, callback) => {
+    const reply=typeof callback==='function'?callback:()=>{};
+    const actor=normalizeSocialUserName(socket.userName);
+    if(!actor)return reply({success:false,code:'session_pending'});
+    try {reply({success:true,counts:await readSocialPostCountsShared(actor)});}
+    catch(err){console.error('[SOCIAL POST COUNTS ERROR]',err && err.message||err);reply({success:false});}
   });
 
   socket.on('social_post_create', async (data = {}, callback) => {
