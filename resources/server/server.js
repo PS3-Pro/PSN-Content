@@ -2606,9 +2606,15 @@ async function initDb() {
       post_id BIGINT NOT NULL REFERENCES social_posts(id) ON DELETE CASCADE,
       author_name TEXT NOT NULL REFERENCES users(name) ON DELETE CASCADE,
       body TEXT NOT NULL,
+      parent_id BIGINT REFERENCES social_comments(id) ON DELETE SET NULL,
+      images JSONB NOT NULL DEFAULT '[]'::jsonb,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
+    ALTER TABLE social_comments ADD COLUMN IF NOT EXISTS parent_id BIGINT REFERENCES social_comments(id) ON DELETE SET NULL;
+    ALTER TABLE social_comments ADD COLUMN IF NOT EXISTS images JSONB NOT NULL DEFAULT '[]'::jsonb;
     CREATE INDEX IF NOT EXISTS idx_social_comments_post ON social_comments(post_id,id DESC);
+    CREATE INDEX IF NOT EXISTS idx_social_comments_parent ON social_comments(parent_id,id);
+    CREATE INDEX IF NOT EXISTS idx_social_comments_roots ON social_comments(post_id,id DESC) WHERE parent_id IS NULL;
     CREATE TABLE IF NOT EXISTS social_comment_reactions (
       comment_id BIGINT NOT NULL REFERENCES social_comments(id) ON DELETE CASCADE,
       user_name TEXT NOT NULL REFERENCES users(name) ON DELETE CASCADE,
@@ -10187,8 +10193,8 @@ async function initProfileSyncNotifications() {
         if(data.kind==='post'||data.kind==='delete')socialFeedCountCache.clear();
         invalidateSocialReactorsForChange(data.kind,String(data.id || ''),data);
         if (data.kind === 'comment' || data.kind === 'comment-delete' || (data.kind === 'react' && data.commentId)) {
-          const suffix = `\u0000${String(data.id || '')}`;
-          for (const key of socialCommentsPending.keys()) if (key.endsWith(suffix)) socialCommentsPending.delete(key);
+          const segment = `\u0000${String(data.id || '')}\u0000`;
+          for (const key of socialCommentsPending.keys()) if (key.includes(segment)) socialCommentsPending.delete(key);
         }
         io.emit('social_feed_changed', {
           kind:data.kind,id:String(data.id || ''),commentId:data.commentId ? String(data.commentId) : null,
@@ -11272,7 +11278,9 @@ function normalizeUserNotificationData(type, rawData = {}) {
     return {
       actor: normalizeSocialUserName(source.actor),
       postId: normalizeText(source.postId, '').slice(0, 24),
-      activity: source.activity === 'comment' ? 'comment' : (source.activity === 'post' ? 'post' : 'reaction'),
+      commentId: /^\d{1,18}$/.test(String(source.commentId || '')) ? String(source.commentId) : '',
+      parentCommentId: /^\d{1,18}$/.test(String(source.parentCommentId || '')) ? String(source.parentCommentId) : '',
+      activity: source.activity === 'reply' ? 'reply' : (source.activity === 'comment' ? 'comment' : (source.activity === 'post' ? 'post' : 'reaction')),
       emoji: normalizeText(source.emoji, '').slice(0, 12),
       text: normalizeText(source.text, '').slice(0, 160)
     };
@@ -13260,6 +13268,9 @@ function serializeSocialComment(row) {
   return {
     id: String(row.id), postId: String(row.post_id), author: row.author_name,
     avatar: row.author_avatar || DEFAULT_AVATAR, text: row.body || '',
+    parentId: row.parent_id ? String(row.parent_id) : null,
+    parentAuthor: row.parent_author || '', replyCount: Number(row.reply_count) || 0,
+    images: Array.isArray(row.images) ? row.images : [],
     createdAt: row.created_at, reactions: socialPublicReactions(row.reactions), myReaction: row.my_reaction || ''
   };
 }
@@ -13361,14 +13372,20 @@ function readSocialFeedShared(actor, filter, before, focusId){
   return pending;
 }
 
-async function socialReadComments(actor, postId) {
-  // Aggregate the reactions for the latest 30 comments together, not in a
-  // separate correlated subquery for every comment in the modal.
+async function socialReadComments(actor, postId, focusCommentId = '') {
   const result = await queryDbWithRetry(`
-    WITH comment_page AS MATERIALIZED (
-      SELECT id,post_id,author_name,body,created_at
-      FROM social_comments WHERE post_id=$2
+    WITH RECURSIVE recent_roots AS MATERIALIZED (
+      SELECT id,post_id,author_name,body,parent_id,images,created_at
+      FROM social_comments WHERE post_id=$2 AND parent_id IS NULL
       ORDER BY id DESC LIMIT 30
+    ), focus_path AS (
+      SELECT id,post_id,author_name,body,parent_id,images,created_at
+      FROM social_comments WHERE post_id=$2 AND id=NULLIF($4,'')::bigint
+      UNION ALL
+      SELECT parent.id,parent.post_id,parent.author_name,parent.body,parent.parent_id,parent.images,parent.created_at
+      FROM social_comments parent JOIN focus_path child ON child.parent_id=parent.id AND child.post_id=parent.post_id
+    ), comment_page AS MATERIALIZED (
+      SELECT * FROM recent_roots UNION SELECT * FROM focus_path
     ), reaction_counts AS (
       SELECT r.comment_id,jsonb_agg(jsonb_build_object('emoji',r.emoji,'count',r.cnt)) AS reactions
       FROM (
@@ -13377,29 +13394,67 @@ async function socialReadComments(actor, postId) {
         WHERE comment_id IN (SELECT id FROM comment_page)
         GROUP BY comment_id,emoji
       ) r GROUP BY r.comment_id
+    ), reply_counts AS (
+      SELECT parent_id,COUNT(*)::int AS reply_count FROM social_comments
+      WHERE post_id=$2 AND parent_id IN (SELECT id FROM comment_page)
+      GROUP BY parent_id
     )
-    SELECT c.id,c.post_id,c.author_name,c.body,c.created_at,
+    SELECT c.id,c.post_id,c.author_name,c.body,c.parent_id,c.images,c.created_at,
+      parent.author_name AS parent_author,
       COALESCE(NULLIF(u.data->>'avatar',''),$3) AS author_avatar,
       COALESCE(rc.reactions,'[]'::jsonb) AS reactions,
+      COALESCE(reply_counts.reply_count,0) AS reply_count,
       mine.emoji AS my_reaction
     FROM comment_page c
     JOIN users u ON u.name=c.author_name
+    LEFT JOIN social_comments parent ON parent.id=c.parent_id AND parent.post_id=c.post_id
+    LEFT JOIN reaction_counts rc ON rc.comment_id=c.id
+    LEFT JOIN reply_counts ON reply_counts.parent_id=c.id
+    LEFT JOIN social_comment_reactions mine ON mine.comment_id=c.id AND mine.user_name=$1
+    ORDER BY c.id ASC
+  `,[actor,postId,DEFAULT_AVATAR,focusCommentId],{attempts:2,label:'SOCIAL COMMENTS'});
+  return (result.rows||[]).map(serializeSocialComment);
+}
+
+async function socialReadCommentReplies(actor, postId, parentId, after = '') {
+  const result = await queryDbWithRetry(`
+    WITH page AS MATERIALIZED (
+      SELECT id,post_id,author_name,body,parent_id,images,created_at
+      FROM social_comments
+      WHERE post_id=$2 AND parent_id=$4::bigint AND id>COALESCE(NULLIF($5,'')::bigint,0)
+      ORDER BY id ASC LIMIT 21
+    ), reaction_counts AS (
+      SELECT comment_id,jsonb_agg(jsonb_build_object('emoji',emoji,'count',cnt)) AS reactions
+      FROM (SELECT comment_id,emoji,COUNT(*)::int AS cnt FROM social_comment_reactions
+            WHERE comment_id IN (SELECT id FROM page) GROUP BY comment_id,emoji) counts
+      GROUP BY comment_id
+    )
+    SELECT c.id,c.post_id,c.author_name,c.body,c.parent_id,c.images,c.created_at,
+      parent.author_name AS parent_author,
+      COALESCE(NULLIF(u.data->>'avatar',''),$3) AS author_avatar,
+      COALESCE(rc.reactions,'[]'::jsonb) AS reactions,
+      (SELECT COUNT(*)::int FROM social_comments nested WHERE nested.parent_id=c.id) AS reply_count,
+      mine.emoji AS my_reaction
+    FROM page c JOIN users u ON u.name=c.author_name
+    JOIN social_comments parent ON parent.id=c.parent_id AND parent.post_id=c.post_id
     LEFT JOIN reaction_counts rc ON rc.comment_id=c.id
     LEFT JOIN social_comment_reactions mine ON mine.comment_id=c.id AND mine.user_name=$1
     ORDER BY c.id ASC
-  `,[actor,postId,DEFAULT_AVATAR],{attempts:2,label:'SOCIAL COMMENTS'});
-  return (result.rows||[]).map(serializeSocialComment);
+  `,[actor,postId,DEFAULT_AVATAR,parentId,after],{attempts:2,label:'SOCIAL COMMENT REPLIES'});
+  const rows=result.rows||[];
+  const page=rows.slice(0,20);
+  return {success:true,comments:page.map(serializeSocialComment),after:rows.length>20?String(page[page.length-1].id):null};
 }
 
 // Several tabs or a burst of realtime events can ask for the same modal
 // contents at once. Share only in-flight reads: a confirmed mutation always
 // invalidates them so the next request can see the newest comments/reactions.
 const socialCommentsPending = new Map();
-function readSocialCommentsShared(actor, postId) {
-  const key = `${actor}\u0000${postId}`;
+function readSocialCommentsShared(actor, postId, focusCommentId = '') {
+  const key = `${actor}\u0000${postId}\u0000${focusCommentId}`;
   let pending = socialCommentsPending.get(key);
   if (pending) return pending;
-  pending = socialReadComments(actor, postId);
+  pending = socialReadComments(actor, postId, focusCommentId);
   socialCommentsPending.set(key, pending);
   pending.finally(() => {
     if (socialCommentsPending.get(key) === pending) socialCommentsPending.delete(key);
@@ -13480,9 +13535,9 @@ function socialPublish(kind, id, extra = null) {
   if(kind==='post'||kind==='delete')socialFeedCountCache.clear();
   invalidateSocialReactorsForChange(kind,id,extra);
   if (kind === 'comment' || kind === 'comment-delete' || (kind === 'react' && extra && extra.commentId)) {
-    const suffix = `\u0000${String(id || '')}`;
+    const segment = `\u0000${String(id || '')}\u0000`;
     for (const key of socialCommentsPending.keys()) {
-      if (key.endsWith(suffix)) socialCommentsPending.delete(key);
+      if (key.includes(segment)) socialCommentsPending.delete(key);
     }
   }
   const payload = { kind, id: String(id || ''), ...(extra && typeof extra === 'object' ? extra : {}), at: Date.now() };
@@ -13516,10 +13571,10 @@ async function socialAnnounceNewPost(actor, id, text) {
   publishStoredUserNotificationsBatch(result.rows || []);
 }
 
-function socialNotifyAuthor(author, actor, postId, activity) {
+function socialNotifyAuthor(author, actor, postId, activity, commentId = '') {
   if (!author || author === actor) return;
   for (const client of getSocketsByUserName(author)) {
-    if (client && client.connected) client.emit('social_activity_notice', { actor, postId: String(postId), activity });
+    if (client && client.connected) client.emit('social_activity_notice', { actor, postId: String(postId), activity, commentId: String(commentId || '') });
   }
 }
 
@@ -13826,33 +13881,65 @@ io.on('connection', (socket) => {
     const reply = typeof callback === 'function' ? callback : () => {};
     const actor = normalizeSocialUserName(socket.userName);
     const id = String(data.postId || '');
-    if (!actor || !/^\d{1,18}$/.test(id)) return reply({success:false,message:'Invalid post.'});
-    try { reply({success:true, comments:await readSocialCommentsShared(actor,id)}); }
+    const focusCommentId = data.focusCommentId == null ? '' : String(data.focusCommentId);
+    if (!actor || !/^\d{1,18}$/.test(id) || (focusCommentId && !/^\d{1,18}$/.test(focusCommentId))) return reply({success:false,message:'Invalid comment request.'});
+    try { reply({success:true, comments:await readSocialCommentsShared(actor,id,focusCommentId)}); }
     catch (err) { console.error('[SOCIAL COMMENTS ERROR]:',err && err.message || err); reply({success:false,message:'Could not load comments.'}); }
+  });
+
+  socket.on('social_comment_replies_list', async (data = {}, callback) => {
+    const reply = typeof callback === 'function' ? callback : () => {};
+    const actor = normalizeSocialUserName(socket.userName);
+    const id = String(data.postId || '');
+    const parentId = String(data.parentId || '');
+    const after = data.after == null ? '' : String(data.after);
+    if (!actor || !/^\d{1,18}$/.test(id) || !/^\d{1,18}$/.test(parentId) || (after && !/^\d{1,18}$/.test(after)))
+      return reply({success:false,message:'Invalid reply request.'});
+    try { reply(await socialReadCommentReplies(actor,id,parentId,after)); }
+    catch (err) { console.error('[SOCIAL COMMENT REPLIES ERROR]:',err && err.message || err); reply({success:false,message:'Could not load replies.'}); }
   });
 
   socket.on('social_comment_create', async (data = {}, callback) => {
     const reply = typeof callback === 'function' ? callback : () => {};
     const actor = normalizeSocialUserName(socket.userName);
     const id = String(data.postId || '');
+    const parentId = data.parentId == null || data.parentId === '' ? null : String(data.parentId);
     const body = typeof data.text === 'string' ? data.text.trim() : '';
-    if (!actor || !/^\d{1,18}$/.test(id) || !body || body.length > 1200) return reply({success:false,message:'A comment must contain 1–1200 characters.'});
+    const images = normalizeSocialMedia(data.images);
+    if (!actor || !/^\d{1,18}$/.test(id) || (parentId !== null && !/^\d{1,18}$/.test(parentId)) ||
+        !images || images.length > 1 || (!body && !images.length) || body.length > 1200)
+      return reply({success:false,message:'Add up to 1200 characters or one photo/GIF.'});
     if (!socialRateLimit(actor,'comment',2000)) return reply({success:false,message:'Wait a moment before commenting again.'});
     try {
       const added = await queryDbWithRetry(`
         WITH target AS MATERIALIZED (SELECT id,author_name FROM social_posts WHERE id=$1),
-        inserted AS (INSERT INTO social_comments (post_id,author_name,body)
-          SELECT id,$2,$3 FROM target RETURNING id,post_id)
-        SELECT inserted.id,target.author_name AS post_author
+        parent AS MATERIALIZED (
+          SELECT id,author_name FROM social_comments WHERE id=$5::bigint AND post_id=$1::bigint
+        ),
+        inserted AS (
+          INSERT INTO social_comments (post_id,author_name,body,parent_id,images)
+          SELECT target.id,$2,$3,(SELECT id FROM parent),$4::jsonb FROM target
+          WHERE $5::bigint IS NULL OR EXISTS (SELECT 1 FROM parent)
+          RETURNING id,post_id
+        )
+        SELECT inserted.id,target.author_name AS post_author,(SELECT author_name FROM parent) AS reply_author
         FROM inserted JOIN target ON target.id=inserted.post_id
-      `,[id,actor,body],{attempts:2,label:'SOCIAL COMMENT CREATE'});
-      if (!added.rows.length) return reply({success:false,message:'Post not found.'});
+      `,[id,actor,body,JSON.stringify(images),parentId],{attempts:2,label:'SOCIAL COMMENT CREATE'});
+      if (!added.rows.length) return reply({success:false,message:parentId?'Comment to reply to was removed.':'Post not found.'});
       const owner=added.rows[0].post_author;
-      socialPublish('comment',id,{originSocketId:socket.id});
-      socialNotifyAuthor(owner,actor,id,'comment');
-      if (owner && owner!==actor) {
+      const replyAuthor=added.rows[0].reply_author;
+      socialPublish('comment',id,{originSocketId:socket.id,commentId:String(added.rows[0].id),...(parentId?{parentId}:{})});
+      if (replyAuthor && replyAuthor!==actor) {
+        socialNotifyAuthor(replyAuthor,actor,id,'reply',String(added.rows[0].id));
+        deferServerTask('SOCIAL REPLY NOTICE',()=>recordUserNotification(replyAuthor,'social',{
+          actor,postId:id,commentId:String(added.rows[0].id),parentCommentId:parentId,
+          activity:'reply',text:body.slice(0,160)||(images.length?'Replied with a photo or GIF.':'')
+        },{dedupeKey:`social:reply:${added.rows[0].id}:${actor}`}),0);
+      }
+      if (owner && owner!==actor && owner!==replyAuthor) {
+        socialNotifyAuthor(owner,actor,id,'comment');
         deferServerTask('SOCIAL COMMENT NOTICE',()=>recordUserNotification(owner,'social',{
-          actor,postId:id,activity:'comment',text:body.slice(0,160)
+          actor,postId:id,commentId:String(added.rows[0].id),activity:'comment',text:body.slice(0,160)||(images.length?'Shared a photo or GIF.':'')
         },{dedupeKey:`social:comment:${added.rows[0].id}:${actor}`}),0);
       }
       reply({success:true,id:String(added.rows[0].id)});
@@ -13868,12 +13955,12 @@ io.on('connection', (socket) => {
     const id = String(data.id || '');
     if (!actor || !/^\d{1,18}$/.test(id)) return reply({success:false});
     try {
-      const found = await queryDbWithRetry('SELECT post_id,author_name FROM social_comments WHERE id=$1',[id],{attempts:2,label:'SOCIAL COMMENT OWNER'});
+      const found = await queryDbWithRetry('SELECT post_id,author_name,parent_id FROM social_comments WHERE id=$1',[id],{attempts:2,label:'SOCIAL COMMENT OWNER'});
       const row = found.rows[0];
       if (!row || (row.author_name !== actor && !(canModerateSocket(socket) && canModerateTarget(socket,row.author_name)))) return reply({success:false,message:'Not allowed.'});
       const deleted = await queryDbWithRetry('DELETE FROM social_comments WHERE id=$1 RETURNING id',[id],{attempts:2,label:'SOCIAL COMMENT DELETE'});
       if (!deleted.rowCount) return reply({success:false,message:'Comment not found.'});
-      socialPublish('comment-delete',row.post_id,{commentId:id});
+      socialPublish('comment-delete',row.post_id,{commentId:id,parentId:row.parent_id?String(row.parent_id):null});
       if(row.author_name!==actor)deferServerTask('SOCIAL COMMENT MODERATION LOG',()=>addModerationLog('social_comment_delete',`Deleted Social comment #${id} by ${row.author_name}`,{commentId:id,postId:String(row.post_id),targetUser:row.author_name},actor),0);
       reply({success:true});
     } catch (err) {console.error('[SOCIAL COMMENT DELETE ERROR]:',err && err.message || err);reply({success:false,message:'Could not delete comment.'});}
