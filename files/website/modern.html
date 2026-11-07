@@ -8120,6 +8120,14 @@ body.psn-home-interactive.psn-sidebar-tab-switched .sidebar > .sidebar-menu[clas
 .psn-social-comment-emoji-picker button:hover,.psn-social-comment-emoji-picker button:focus-visible { background:rgba(255,255,255,.10); }
 .psn-social-comment-reply-btn { background:transparent; border:0; border-radius:6px; padding:2px 5px; font:inherit; font-size:11px; color:var(--text-muted); font-weight:650; cursor:pointer; }
 .psn-social-comment-reply-btn:hover,.psn-social-comment-reply-btn:focus-visible { color:#fff; background:rgba(255,255,255,.075); }
+.psn-social-modal-body .psn-social-comments-list .psn-social-comment-form.is-inline-reply { position:relative; margin:4px 0 8px 40px; padding:2px 0 2px 0; border:0; background:transparent; width:calc(100% - 40px); animation:psnSocialReplyComposerIn .2s ease-out both; }
+.psn-social-comments-list .psn-social-comment-form.is-inline-reply::before { content:''; position:absolute; left:-19px; top:0; width:13px; height:22px; border-left:1px solid rgba(170,192,217,.24); border-bottom:1px solid rgba(170,192,217,.24); border-bottom-left-radius:11px; pointer-events:none; }
+.psn-social-comments-list .is-inline-reply .psn-social-comment-compose-panel { background:rgba(255,255,255,.055); }
+.psn-social-comments-list .is-inline-reply .psn-social-comment-compose-avatar,.psn-social-comments-list .is-inline-reply .psn-social-comment-compose-avatar .psn-social-avatar { width:30px; height:30px; flex-basis:30px; }
+.psn-social-comments-list .is-inline-reply .psn-social-comment-reply-context { font-size:10px; }
+@keyframes psnSocialReplyComposerIn { from { opacity:0; transform:translateY(-4px); } to { opacity:1; transform:translateY(0); } }
+@media(max-width:480px) { .psn-social-modal-body .psn-social-comments-list .psn-social-comment-form.is-inline-reply { margin-left:24px; width:calc(100% - 24px); } .psn-social-comments-list .psn-social-comment-form.is-inline-reply::before { left:-12px; width:8px; } }
+@media(prefers-reduced-motion:reduce) { .psn-social-modal-body .psn-social-comments-list .psn-social-comment-form.is-inline-reply { animation:none; } }
 @media (max-width:420px) { .psn-social-comment-emoji-picker { grid-template-columns:repeat(6,30px); } .psn-social-comment-compose-row { gap:7px; } .psn-social-comment-compose-tools button { width:25px;height:25px; } }
 @media (max-width:360px) { .psn-social-comment-compose-inputline { flex-wrap:wrap; } .psn-social-comment-compose-inputline textarea { flex:1 1 100%; } .psn-social-comment-compose-tools { margin-left:auto; } }
 .psn-social-comment-actions { display:flex; align-items:center; gap:5px; margin-top:1px; min-height:23px; }
@@ -115686,6 +115694,7 @@ function getVisibleChatStackEl(id) {
     }
     return thread;
   }
+  let socialInlineReplyId='';
   function socialCommentListMarkup(postId){
     const base=state.comments.get(postId);
     if(!Array.isArray(base))return '<p class="psn-social-muted">Loading comments…</p>';
@@ -115725,8 +115734,18 @@ function getVisibleChatStackEl(id) {
     const active=document.activeElement;
     const activeThread=active?.dataset?.socialThreadToggle||active?.dataset?.socialThreadMore;
     const activeMode=active?.dataset?.socialThreadToggle?'toggle':'more';
+    // Preserve the live reply form; rebuilding it discards unsent text and attachments.
+    const replyForm=list.querySelector('.psn-social-comment-form.is-inline-reply');
+    const focusedReply=replyForm?.contains(active)?active:null;
+    if(replyForm)replyForm.remove();
     list.innerHTML=socialCommentListMarkup(postId);
+    if(replyForm&&socialInlineReplyId){
+      const node=list.querySelector(`[data-social-thread-id="${socialInlineReplyId}"]`);
+      if(node)node.appendChild(replyForm);
+      else {clearSocialCommentAttachment(replyForm);if(socialGifCommentForm===replyForm)closeSocialGifPicker();socialInlineReplyId='';}
+    }
     list.scrollTop=previousScroll;
+    if(focusedReply?.isConnected)focusedReply.focus({preventScroll:true});
     if(activeThread){
       const focus=list.querySelector(`[data-social-thread-${activeMode}="${activeThread}"]`)||list.querySelector(`[data-social-thread-toggle="${activeThread}"]`);
       focus?.focus({preventScroll:true});
@@ -115751,6 +115770,11 @@ function getVisibleChatStackEl(id) {
   }
   async function toggleSocialCommentThread(postId,parentId){
     const thread=socialThreadState(postId,parentId);
+    if(thread.expanded){
+      const node=document.querySelector(`#psn-social-comments-modal [data-social-thread-id="${parentId}"]`);
+      const current=node?.querySelector('.psn-social-comment-form.is-inline-reply');
+      if(current&&socialInlineReplyId!==String(parentId))setSocialCommentReply(null);
+    }
     thread.expanded=!thread.expanded;
     renderSocialCommentThreads(postId);
     if(thread.expanded&&!thread.loaded&&!thread.loading)await loadSocialCommentReplies(postId,parentId);
@@ -115790,7 +115814,7 @@ function getVisibleChatStackEl(id) {
     document.body.appendChild(overlay);
     overlay.addEventListener('click',event=>{
       if(event.target===overlay||event.target.closest('[data-social-close-comments]')){closeCommentModal();return;}
-      const form=overlay.querySelector('.psn-social-comment-form');
+      const form=event.target.closest('.psn-social-comment-form')||overlay.querySelector('#psn-social-modal-body > .psn-social-comment-form');
       const threadToggle=event.target.closest('[data-social-thread-toggle]');
       if(threadToggle){toggleSocialCommentThread(state.modalPostId,threadToggle.dataset.socialThreadToggle);return;}
       const threadMore=event.target.closest('[data-social-thread-more]');
@@ -115826,6 +115850,9 @@ function getVisibleChatStackEl(id) {
     });
     document.addEventListener('keydown',event=>{
       if(overlay.hidden||document.querySelector('.psn-social-action-overlay')||socialReactors.overlay?.hidden===false)return;
+      if(event.key==='Escape'&&socialInlineReplyId&&event.target.closest('.psn-social-comment-form.is-inline-reply')){
+        event.preventDefault();event.stopImmediatePropagation();setSocialCommentReply(null);return;
+      }
       if(event.key==='Escape'){event.preventDefault();event.stopImmediatePropagation();closeCommentModal();return;}
       if(event.key==='Tab'){
         const items=[...overlay.querySelectorAll('button:not(:disabled),input:not(:disabled),textarea:not(:disabled)')].filter(el=>el.getClientRects().length);
@@ -116077,6 +116104,8 @@ function getVisibleChatStackEl(id) {
     const post=state.posts.find(x=>x.id===postId);
     if(!post)return;
     const overlay=ensureCommentModal();
+    if(socialInlineReplyId)setSocialCommentReply(null);
+    socialInlineReplyId='';
     state.modalPostId=postId;state.modalOpener=opener||null;state.replyThreads.clear();state.openComments.clear();state.openComments.add(postId);
     const name=document.getElementById('psn-social-modal-post');
     if(name){name.textContent='';const strong=document.createElement('strong');strong.textContent=post.author;name.append(strong,document.createTextNode((socialPlainText(post.text)||'Photo publication').slice(0,170)));}
@@ -116091,18 +116120,45 @@ function getVisibleChatStackEl(id) {
     const overlay=document.getElementById('psn-social-comments-modal');if(!overlay||overlay.hidden)return;
     clearTimeout(socialCommentsRefreshTimer);socialCommentsRefreshTimer=0;
     closeSocialGifPicker();socialGifCommentForm=null;
-    clearSocialCommentAttachment(overlay.querySelector('.psn-social-comment-form'));
+    setSocialCommentReply(null);
+    clearSocialCommentAttachment(overlay.querySelector('#psn-social-modal-body > .psn-social-comment-form'));
     overlay.hidden=true;state.modalRequest++;state.modalPostId=null;state.replyThreads.clear();state.openComments.clear();
     if(state.modalOpener?.isConnected)state.modalOpener.focus({preventScroll:true});
     state.modalOpener=null;
   }
   function setSocialCommentReply(comment){
-    const form=document.querySelector('#psn-social-comments-modal .psn-social-comment-form');if(!form)return;
+    const overlay=document.getElementById('psn-social-comments-modal');
+    const list=overlay?.querySelector('.psn-social-comments-list');
+    if(!list)return;
+    let form=list.querySelector('.psn-social-comment-form.is-inline-reply');
+    const id=comment?idOf(comment.id):'';
+    if(!id){
+      if(form){if(socialGifCommentForm===form)closeSocialGifPicker();clearSocialCommentAttachment(form);form.remove();}
+      socialInlineReplyId='';
+      return;
+    }
+    const node=list.querySelector(`[data-social-thread-id="${id}"]`);
+    if(!node)return;
+    if(form&&socialInlineReplyId===id){form.querySelector('textarea')?.focus({preventScroll:true});return;}
+    if(form){if(socialGifCommentForm===form)closeSocialGifPicker();clearSocialCommentAttachment(form);form.remove();}
+    const main=overlay.querySelector('#psn-social-modal-body > .psn-social-comment-form');
+    if(!main)return;
+    form=main.cloneNode(true);
+    form.classList.add('is-inline-reply');
+    form.dataset.parentId=id;
+    const attachmentPreview=form.querySelector('.psn-social-comment-attachment');
+    if(attachmentPreview){attachmentPreview.replaceChildren();attachmentPreview.hidden=true;}
+    const emojiPicker=form.querySelector('.psn-social-comment-emoji-picker');
+    if(emojiPicker)emojiPicker.hidden=true;
     const context=form.querySelector('.psn-social-comment-reply-context');
-    if(comment){form.dataset.parentId=comment.id;context.querySelector('[data-social-reply-label]').textContent='Replying to '+comment.author;context.hidden=false;}
-    else {delete form.dataset.parentId;context.hidden=true;}
+    if(context){context.hidden=false;context.querySelector('[data-social-reply-label]').textContent='Replying to '+comment.author;}
     const input=form.querySelector('textarea');
-    if(input)input.focus({preventScroll:true});
+    if(input){input.value='';input.placeholder='Write a public reply…';input.setAttribute('aria-label','Reply to '+comment.author);}
+    socialInlineReplyId=id;
+    const thread=socialThreadState(state.modalPostId,id);
+    if(Number(comment.replyCount)>0&&!thread.expanded){thread.expanded=true;renderSocialCommentThreads(state.modalPostId);if(!thread.loaded&&!thread.loading)loadSocialCommentReplies(state.modalPostId,id);}
+    (list.querySelector(`[data-social-thread-id="${id}"]`)||node).appendChild(form);
+    input?.focus({preventScroll:true});
   }
   function clearSocialCommentAttachment(form){
     if(!form)return;
@@ -116128,7 +116184,7 @@ function getVisibleChatStackEl(id) {
     event.preventDefault();
     const postId=idOf(form.dataset.post),input=form.querySelector('textarea');
     const text=input?.value.trim(),attachment=form.__socialCommentAttachment;
-    const parentId=form.dataset.parentId||null;
+    const parentId=form.classList.contains('is-inline-reply')?form.dataset.parentId||null:null;
     if(!postId||(!text&&!attachment)||postId!==state.modalPostId||form.dataset.sending==='1')return;
     form.dataset.sending='1';
     const submit=form.querySelector('button[type="submit"]');if(submit)submit.disabled=true;
@@ -116146,7 +116202,7 @@ function getVisibleChatStackEl(id) {
       if(!res.success)throw Error(res.message||'Could not comment.');
       if(input){input.value='';input.style.height='25px';}
       clearSocialCommentAttachment(form);
-      setSocialCommentReply(null);
+      if(parentId)setSocialCommentReply(null);
       if(status)status.textContent='';
       if(parentId&&state.modalPostId===postId){
         const parent=socialFindComment(postId,parentId);
