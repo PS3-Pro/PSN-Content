@@ -7908,6 +7908,31 @@ body.psn-home-interactive.psn-sidebar-tab-switched .sidebar > .sidebar-menu[clas
 .psn-social-attach-item { position:relative; height:72px; width:72px; border:1px solid rgba(255,255,255,.16); border-radius:9px; overflow:hidden; }
 .psn-social-attach-item img { width:100%; height:100%; object-fit:cover; }
 .psn-social-attach-item button { position:absolute; top:3px; right:3px; border:0; border-radius:50%; background:rgba(0,0,0,.8); color:#fff; width:22px; height:22px; cursor:pointer; }
+
+/* Social link previews: native content shares and external links reuse the site's dark panels. */
+.psn-social-body .psn-social-text-link,.psn-social-comment-text .psn-social-text-link { color:var(--ps-blue);text-decoration:none;overflow-wrap:anywhere; }
+.psn-social-body .psn-social-text-link:hover,.psn-social-comment-text .psn-social-text-link:hover { text-decoration:underline; }
+.psn-social-preview-host { display:block; margin-top:12px; max-width:570px; min-width:0; }
+.psn-social-preview-card { display:flex; align-items:stretch; width:100%; min-height:106px; padding:0; overflow:hidden; border:1px solid rgba(255,255,255,.12); border-radius:12px; background:rgba(23,30,42,.66); color:inherit; text-align:left; text-decoration:none !important; box-shadow:0 5px 16px rgba(0,0,0,.11); transition:border-color .2s ease,background .2s ease,transform .18s ease; cursor:pointer; }
+.psn-social-preview-card:hover { border-color:rgba(91,161,245,.48); background:rgba(29,38,53,.77); }
+.psn-social-preview-card:active { transform:scale(.988); }
+.psn-social-preview-card:focus-visible { outline:2px solid var(--psn-focus-ring) !important; outline-offset:2px; }
+.psn-social-preview-art { position:relative; width:106px; min-width:106px; min-height:106px; flex:0 0 106px; display:flex; align-items:center; justify-content:center; background:rgba(7,13,24,.35); color:rgba(180,204,239,.68); font-size:29px; overflow:hidden; }
+.psn-social-preview-art img { position:absolute;inset:0;display:block;width:100%;height:100%;object-fit:cover; }
+.psn-social-preview-data { min-width:0; flex:1; display:flex; flex-direction:column; justify-content:center; gap:5px; padding:12px 14px; }
+.psn-social-preview-eyebrow { font-size:10px; font-weight:700; letter-spacing:.075em; text-transform:uppercase; color:#91a7c7; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
+.psn-social-preview-title { font-size:13px; font-weight:700; color:#edf3fc; line-height:1.4; overflow:hidden; display:-webkit-box; -webkit-box-orient:vertical; -webkit-line-clamp:2; overflow-wrap:anywhere; }
+.psn-social-preview-description { color:var(--text-muted); font-size:11px; line-height:1.45; display:-webkit-box; -webkit-box-orient:vertical; -webkit-line-clamp:2; overflow:hidden; overflow-wrap:anywhere; }
+.psn-social-preview-skeleton { pointer-events:none; }
+.psn-social-preview-skeleton .psn-social-preview-art { animation:psnSocialSkeletonPulse 1.55s ease-in-out infinite; }
+.psn-social-preview-skeleton .psn-social-preview-data { gap:11px; }
+.psn-social-preview-skeleton .psn-social-skeleton-bar { height:10px; }
+.psn-social-preview-skeleton .psn-social-skeleton-bar:first-child { width:40%; }
+.psn-social-preview-skeleton .psn-social-skeleton-bar:nth-child(2) { width:82%; }
+.psn-social-preview-skeleton .psn-social-skeleton-bar:nth-child(3) { width:58%; }
+@media (max-width:390px) { .psn-social-preview-art { width:85px;min-width:85px;flex-basis:85px;min-height:94px; } .psn-social-preview-art img {height:94px;} .psn-social-preview-card {min-height:94px;} .psn-social-preview-data {padding:9px 11px;} }
+@media (prefers-reduced-motion:reduce) { .psn-social-preview-card {transition:none;} .psn-social-preview-skeleton .psn-social-preview-art {animation:none;} }
+
 .psn-social-reaction-row { display:flex; align-items:center; gap:6px; margin-top:15px; flex-wrap:wrap; }
 .psn-social-emoji { display:inline-flex; align-items:center; gap:5px; padding:5px 8px; border:1px solid rgba(255,255,255,.10); background:rgba(255,255,255,.04); color:#eaf4ff; border-radius:99px; font-size:13px; min-height:30px; cursor:pointer; transition:background .2s,border-color .2s; }
 .psn-social-emoji.selected { background:rgba(0,112,204,.23); border-color:rgba(48,169,250,.62); }
@@ -40749,6 +40774,8 @@ P
 			const shareCategory = String(normalizedDescriptor.category || '').trim().slice(0, 40);
 			if (shareName) params.set('name', shareName);
 			if (shareCategory) params.set('category', shareCategory);
+			if (normalizedDescriptor.titleId) params.set('tid', String(normalizedDescriptor.titleId).slice(0, 40));
+			if (normalizedDescriptor.contentId) params.set('cid', String(normalizedDescriptor.contentId).slice(0, 130));
 		}
 		url.hash = params.toString();
 		return url.toString();
@@ -40782,7 +40809,7 @@ P
 			const name = normalizePsnContentDeepLinkText(params.get('name')).slice(0, 160);
 			const category = normalizePsnContentDeepLinkCategory(params.get('category'));
 			if (!name || !category) return null;
-			return { token, name, category };
+			return { token, name, category, titleId:normalizePsnContentDeepLinkText(params.get('tid')).slice(0,40), contentId:normalizePsnContentDeepLinkText(params.get('cid')).slice(0,130) };
 		} catch (e) { return null; }
 	};
 
@@ -115016,6 +115043,179 @@ function getVisibleChatStackEl(id) {
     const span=document.createElement('div');span.innerHTML=socialSafeHtml(source);
     return (span.textContent||'').trim();
   }
+
+  // Keep URLs stored only as post text. No new DB columns or server-side URL fetching.
+  const socialPreviewResults=new Map();
+  const socialPreviewPending=new Map();
+  const socialPreviewQueue=[];
+  let socialPreviewRequests=0;
+  let socialPreviewObserver=null;
+  function socialFirstUrl(raw){
+    const match=/https?:\/\/[^\s<>"']+/i.exec(socialPlainText(raw));
+    if(!match)return '';
+    let candidate=match[0].replace(/[.,!?;:]+$/g,'');
+    while(candidate.endsWith(')') && (candidate.match(/\(/g)||[]).length<(candidate.match(/\)/g)||[]).length)candidate=candidate.slice(0,-1);
+    while(candidate.endsWith(']') && (candidate.match(/\[/g)||[]).length<(candidate.match(/\]/g)||[]).length)candidate=candidate.slice(0,-1);
+    try {const parsed=new URL(candidate);return /^(https?:)$/.test(parsed.protocol)&&candidate.length<=2048?parsed.href:'';}catch(e){return '';}
+  }
+  function socialPostLinkId(url){
+    try {
+      const target=new URL(url);
+      return target.origin===location.origin&&target.pathname===location.pathname&&/^#social-post-(\d{1,18})$/.test(target.hash)?target.hash.slice(13):'';
+    }catch(err){return '';}
+  }
+  function socialLinkedHtml(raw){
+    const template=document.createElement('template');template.innerHTML=socialSafeHtml(raw);
+    const walker=document.createTreeWalker(template.content,NodeFilter.SHOW_TEXT);
+    const nodes=[];while(walker.nextNode())nodes.push(walker.currentNode);
+    for(const node of nodes){
+      const value=node.textContent;const matcher=/https?:\/\/[^\s<>"']+/ig;
+      let match,last=0,changed=false;const fragment=document.createDocumentFragment();
+      while((match=matcher.exec(value))){
+        const trimmed=socialFirstUrl(match[0]);
+        if(!trimmed)continue;
+        const candidate=match[0];
+        let rawUrl=candidate.replace(/[.,!?;:]+$/g,'');
+        while(rawUrl.endsWith(')')&&(rawUrl.match(/\(/g)||[]).length<(rawUrl.match(/\)/g)||[]).length)rawUrl=rawUrl.slice(0,-1);
+        while(rawUrl.endsWith(']')&&(rawUrl.match(/\[/g)||[]).length<(rawUrl.match(/\]/g)||[]).length)rawUrl=rawUrl.slice(0,-1);
+        const suffix=candidate.slice(rawUrl.length);
+        fragment.appendChild(document.createTextNode(value.slice(last,match.index)));
+        const anchor=document.createElement('a');anchor.href=trimmed;
+        anchor.className='psn-social-text-link';anchor.rel='noopener noreferrer nofollow';anchor.target='_blank';anchor.textContent=rawUrl;
+        fragment.appendChild(anchor);
+        if(suffix)fragment.appendChild(document.createTextNode(suffix));
+        last=match.index+candidate.length;changed=true;
+      }
+      if(changed){fragment.appendChild(document.createTextNode(value.slice(last)));node.replaceWith(fragment);}
+    }
+    return template.innerHTML;
+  }
+  function socialShareInfo(url){
+    const token=typeof window.getPsnContentShareTokenFromUrl==='function'?window.getPsnContentShareTokenFromUrl(url):'';
+    if(!token)return null;
+    const hint=typeof window.getPsnContentShareDescriptorHintFromUrl==='function'?window.getPsnContentShareDescriptorHintFromUrl(url):null;
+    return {token,hint};
+  }
+  function socialPreviewCard(url,info){
+    const isShare=info?.kind==='shared',isPost=info?.kind==='post';
+    const title=s(info?.title||(isShare?'Shared PlayStation content':isPost?'Community publication':'Website link')).slice(0,170);
+    const desc=s(info?.description||(isShare?'Open Shared Content in PSN-Content.':'')).slice(0,220);
+    const site=s(info?.site||(isShare?'Shared Content':isPost?'PSN-Content':'External link')).slice(0,90);
+    const art=safeImage(info?.image);
+    const icon=isShare?'fab fa-playstation':isPost?'far fa-comments':'fas fa-link';
+    const linkAttr=isShare?'data-social-shared-url':isPost?'data-social-post-url':'';
+    return `<a href="${esc(url)}" class="psn-social-preview-card" target="_blank" rel="noopener noreferrer nofollow"${linkAttr?` ${linkAttr}="${esc(url)}"`:''}>
+      <span class="psn-social-preview-art"><i class="${icon}" aria-hidden="true"></i>${art?`<img src="${esc(art)}" alt="" loading="lazy" decoding="async" onerror="this.remove()">`:''}</span>
+      <span class="psn-social-preview-data"><span class="psn-social-preview-eyebrow">${esc(site)}</span><span class="psn-social-preview-title">${esc(title)}</span>${desc?`<span class="psn-social-preview-description">${esc(desc)}</span>`:''}</span>
+    </a>`;
+  }
+  function socialPreviewSkeleton(){
+    return '<div class="psn-social-preview-card psn-social-preview-skeleton" aria-hidden="true"><span class="psn-social-preview-art"></span><span class="psn-social-preview-data"><span class="psn-social-skeleton-bar"></span><span class="psn-social-skeleton-bar"></span><span class="psn-social-skeleton-bar"></span></span></div>';
+  }
+  function socialPreviewMarkup(raw){
+    const url=socialFirstUrl(raw);if(!url)return '';
+    const share=socialShareInfo(url),postId=socialPostLinkId(url);
+    if(share){
+      const hint=share.hint;
+      let cover='';
+      if(hint&&(hint.titleId||hint.contentId)){
+        try {if(typeof getItemCover==='function')cover=getItemCover({id:hint.titleId,titleId:hint.titleId,contentId:hint.contentId},hint.category)||'';}catch(e){}
+      }
+      return `<div class="psn-social-preview-host" data-social-preview-url="${esc(url)}" data-social-preview-type="shared">${socialPreviewCard(url,{kind:'shared',title:hint?.name||'',description:hint?.titleId||hint?.contentId||'',site:'Shared Content · '+s(hint?.category||'PSN-Content').replace(/_/g,' '),image:cover})}</div>`;
+    }
+    if(postId)return `<div class="psn-social-preview-host" data-social-preview-url="${esc(url)}" data-social-preview-type="post">${socialPreviewCard(url,{kind:'post',title:'View community publication',site:'PSN-Content · Social'})}</div>`;
+    return `<div class="psn-social-preview-host" data-social-preview-url="${esc(url)}" data-social-preview-type="external">${socialPreviewSkeleton()}</div>`;
+  }
+  function socialPreviewMemo(key,value){
+    socialPreviewResults.delete(key);
+    socialPreviewResults.set(key,{value,at:Date.now()});
+    while(socialPreviewResults.size>110)socialPreviewResults.delete(socialPreviewResults.keys().next().value);
+  }
+  function socialPreviewEnqueue(task){
+    return new Promise(resolve=>{
+      socialPreviewQueue.push({task,resolve});
+      const pump=()=>{
+        while(socialPreviewRequests<2&&socialPreviewQueue.length){
+          const next=socialPreviewQueue.shift();socialPreviewRequests++;
+          Promise.resolve().then(next.task).then(next.resolve,()=>next.resolve(null)).finally(()=>{socialPreviewRequests--;pump();});
+        }
+      };
+      pump();
+    });
+  }
+  async function socialPreviewMetadata(url){
+    const cached=socialPreviewResults.get('web:'+url);
+    if(cached&&Date.now()-cached.at<(cached.value?10*60*1000:60*1000))return cached.value;
+    const existing=socialPreviewPending.get('web:'+url);if(existing)return existing;
+    const pending=socialPreviewEnqueue(async()=>{
+      try {
+        const hostname=new URL(url).hostname.toLowerCase().replace(/^\[|\]$/g,'');
+        if(hostname==='localhost'||hostname.endsWith('.local')||hostname.endsWith('.internal')||/^127\./.test(hostname)||/^10\./.test(hostname)||/^192\.168\./.test(hostname)||/^172\.(1[6-9]|2\d|3[01])\./.test(hostname)||/^169\.254\./.test(hostname)||hostname==='::1'||hostname==='0.0.0.0')return null;
+      }catch(e){return null;}
+      const controller=new AbortController();const timer=setTimeout(()=>controller.abort(),7000);
+      try {
+        const response=await fetch('https://api.microlink.io/?url='+encodeURIComponent(url),{signal:controller.signal});
+        if(!response.ok)return null;
+        const result=await response.json();
+        return result?.status==='success'&&result.data?result.data:null;
+      }catch(err){return null;}finally{clearTimeout(timer);}
+    }).then(value=>{socialPreviewMemo('web:'+url,value);return value;}).finally(()=>socialPreviewPending.delete('web:'+url));
+    socialPreviewPending.set('web:'+url,pending);return pending;
+  }
+  async function socialPreviewSharedDescriptor(share){
+    const key='share:'+share.token;
+    const cached=socialPreviewResults.get(key);
+    if(cached&&Date.now()-cached.at<10*60*1000)return cached.value;
+    if(socialPreviewPending.has(key))return socialPreviewPending.get(key);
+    if(!socialSessionReady())return null;
+    const pending=socialPreviewEnqueue(async()=>{
+      const result=await emitAcknowledged(typeof socketChat==='undefined'?null:socketChat,'resolve_content_share',{token:share.token},6500);
+      return result?.success?result.descriptor:null;
+    }).then(value=>{if(value)socialPreviewMemo(key,value);return value;}).finally(()=>socialPreviewPending.delete(key));
+    socialPreviewPending.set(key,pending);return pending;
+  }
+  async function hydrateSocialPreview(host){
+    if(!host?.isConnected)return;
+    const url=host.dataset.socialPreviewUrl;
+    const type=host.dataset.socialPreviewType;
+    if(!url||type==='post')return;
+    if(type==='shared'){
+      const share=socialShareInfo(url);if(!share)return;
+      // New shares include public title/content IDs; preview them locally, with zero DB reads.
+      if(share.hint?.name&&(share.hint.titleId||share.hint.contentId))return;
+      const descriptor=await socialPreviewSharedDescriptor(share);
+      if(!host.isConnected||host.dataset.socialPreviewUrl!==url||!descriptor)return;
+      const category=s(descriptor.category||share.hint?.category||'').replace(/_/g,' ');
+      let image='';
+      if(descriptor.titleId||descriptor.contentId){
+        try {if(typeof getItemCover==='function')image=getItemCover({id:descriptor.titleId,titleId:descriptor.titleId,contentId:descriptor.contentId,region:descriptor.region},descriptor.category)||'';}catch(e){}
+      }
+      host.innerHTML=socialPreviewCard(url,{kind:'shared',title:descriptor.name||share.hint?.name,description:descriptor.titleId||descriptor.contentId||'Open this content in PSN-Content',site:'Shared Content · '+category,image});
+      return;
+    }
+    const metadata=await socialPreviewMetadata(url);
+    if(!host.isConnected||host.dataset.socialPreviewUrl!==url)return;
+    const hostname=(()=>{try{return new URL(url).hostname.replace(/^www\./,'');}catch(e){return 'External link';}})();
+    host.innerHTML=socialPreviewCard(url,{kind:'external',site:hostname,title:metadata?.title||hostname,description:metadata?.description||'',image:metadata?.image?.url});
+  }
+  function hydrateSocialLinkPreviews(scope){
+    const root=scope||feed();if(!root)return;
+    if(!socialPreviewObserver&&typeof IntersectionObserver==='function'){
+      socialPreviewObserver=new IntersectionObserver(entries=>{
+        for(const entry of entries){if(!entry.isIntersecting)continue;socialPreviewObserver.unobserve(entry.target);hydrateSocialPreview(entry.target);}
+      },{root:document.getElementById('scroll-area'),rootMargin:'350px 0px',threshold:0});
+    }
+    const hosts=[];
+    if(root.matches?.('.psn-social-preview-host'))hosts.push(root);
+    root.querySelectorAll?.('.psn-social-preview-host:not([data-social-preview-wired])').forEach(host=>hosts.push(host));
+    hosts.forEach(host=>{
+      if(host.dataset.socialPreviewWired)return;
+      host.dataset.socialPreviewWired='1';
+      if(socialPreviewObserver)socialPreviewObserver.observe(host);
+      else hydrateSocialPreview(host);
+    });
+  }
+
   function socialEditorFor(button){
     return button.closest('.psn-social-edit-panel')?.querySelector('.psn-social-rich-editor')||document.getElementById('psn-social-new-text');
   }
@@ -115299,12 +115499,18 @@ function getVisibleChatStackEl(id) {
     if(textChanged&&state.editId!==target){
       const body=card.querySelector('.psn-social-body');
       if(body){
-        if(post.text){body.innerHTML=socialSafeHtml(post.text);body.classList.toggle('is-rich',s(post.text).startsWith(SOCIAL_RICH_PREFIX));}
+        if(post.text){body.innerHTML=socialLinkedHtml(post.text);body.classList.toggle('is-rich',s(post.text).startsWith(SOCIAL_RICH_PREFIX));}
         else body.remove();
       }else if(post.text){
         const element=document.createElement('div');element.className='psn-social-body'+(s(post.text).startsWith(SOCIAL_RICH_PREFIX)?' is-rich':'');
-        element.innerHTML=socialSafeHtml(post.text);card.querySelector('.psn-social-head')?.after(element);
+        element.innerHTML=socialLinkedHtml(post.text);card.querySelector('.psn-social-head')?.after(element);
       }
+      const oldPreview=card.querySelector(':scope > .psn-social-preview-host');
+      const holder=document.createElement('div');holder.innerHTML=socialPreviewMarkup(post.text);
+      const newPreview=holder.firstElementChild;
+      if(oldPreview){if(newPreview)oldPreview.replaceWith(newPreview);else oldPreview.remove();}
+      else if(newPreview)(card.querySelector(':scope > .psn-social-body')||card.querySelector(':scope > .psn-social-head'))?.after(newPreview);
+      if(newPreview)hydrateSocialLinkPreviews(newPreview);
     }
   }
   function cardReactions(reactions,myReaction,postId,commentId){
@@ -115349,14 +115555,14 @@ function getVisibleChatStackEl(id) {
     return `<article class="psn-social-card" data-social-post="${id}">
       <div class="psn-social-head"><div class="psn-social-identity">${profile}</div>
       <div class="psn-social-actions">${canEdit?`<button type="button" class="psn-social-btn" data-social-action="edit" data-id="${id}" title="Edit post" aria-label="Edit post"><i class="fas fa-pen"></i></button>`:''}${canDelete?`<button type="button" class="psn-social-btn danger" data-social-action="delete" data-id="${id}" title="Delete post" aria-label="Delete post"><i class="fas fa-trash-alt"></i></button>`:''}${post.author!==identity()?`<button type="button" class="psn-social-btn" data-social-action="report" data-id="${id}" title="Report post" aria-label="Report post"><i class="far fa-flag"></i></button>`:''}</div></div>
-      ${editing?`<div class="psn-social-edit-panel"><div class="psn-social-textarea psn-social-rich-editor" contenteditable="true" role="textbox" aria-multiline="true" data-social-edit-input="${id}" aria-label="Edit publication">${socialSafeHtml(post.text)}</div>${socialFormatToolbar()}<div class="psn-social-attach-list" data-social-edit-attachments="${id}"></div><div class="psn-social-edit-actions"><button type="button" class="psn-social-btn" data-social-action="edit-cancel" data-id="${id}">Cancel</button><button type="button" class="psn-social-btn primary" data-social-action="edit-save" data-id="${id}"><i class="fas fa-check"></i> Save</button></div></div>`:(post.text?`<div class="psn-social-body${s(post.text).startsWith(SOCIAL_RICH_PREFIX)?' is-rich':''}">${socialSafeHtml(post.text)}</div>`:'')}${mediaMarkup(post.images)}
+      ${editing?`<div class="psn-social-edit-panel"><div class="psn-social-textarea psn-social-rich-editor" contenteditable="true" role="textbox" aria-multiline="true" data-social-edit-input="${id}" aria-label="Edit publication">${socialSafeHtml(post.text)}</div>${socialFormatToolbar()}<div class="psn-social-attach-list" data-social-edit-attachments="${id}"></div><div class="psn-social-edit-actions"><button type="button" class="psn-social-btn" data-social-action="edit-cancel" data-id="${id}">Cancel</button><button type="button" class="psn-social-btn primary" data-social-action="edit-save" data-id="${id}"><i class="fas fa-check"></i> Save</button></div></div>`:(post.text?`<div class="psn-social-body${s(post.text).startsWith(SOCIAL_RICH_PREFIX)?' is-rich':''}">${socialLinkedHtml(post.text)}</div>`:'')}${socialPreviewMarkup(post.text)}${mediaMarkup(post.images)}
       ${postActionbar(post)}
     </article>`;
   }
   function socialCommentMarkup(c,postId){
     const cid=idOf(c.id);if(!cid)return '';
     const canDelete=c.author===identity()||(typeof window.canModerateSession==='function'&&window.canModerateSession());
-    return `<div class="psn-social-comment" data-social-comment="${cid}"><button type="button" class="psn-social-profile avatar-link" data-social-action="profile" data-user="${esc(c.author)}" aria-label="View ${esc(c.author)} profile" title="${esc(c.author)}">${socialAvatar(c.author,c.avatar,true)}</button><div class="psn-social-comment-content"><div class="psn-social-head"><div class="psn-social-comment-byline"><button type="button" class="psn-social-profile" data-social-action="profile" data-user="${esc(c.author)}"><span class="psn-social-author">${esc(c.author)}</span></button><span class="psn-social-comment-separator" aria-hidden="true">·</span><span class="psn-social-age">${esc(timeLabel(c.createdAt))}</span></div><div class="psn-social-actions">${canDelete?`<button type="button" class="psn-social-btn danger" data-social-action="comment-delete" data-id="${cid}" data-post="${postId}" aria-label="Delete comment"><i class="fas fa-trash-alt"></i></button>`:''}${c.author!==identity()?`<button type="button" class="psn-social-btn" data-social-action="comment-report" data-id="${cid}" aria-label="Report comment"><i class="far fa-flag"></i></button>`:''}</div></div><p class="psn-social-comment-text">${esc(c.text)}</p>${commentActionbar(c,postId)}</div></div>`;
+    return `<div class="psn-social-comment" data-social-comment="${cid}"><button type="button" class="psn-social-profile avatar-link" data-social-action="profile" data-user="${esc(c.author)}" aria-label="View ${esc(c.author)} profile" title="${esc(c.author)}">${socialAvatar(c.author,c.avatar,true)}</button><div class="psn-social-comment-content"><div class="psn-social-head"><div class="psn-social-comment-byline"><button type="button" class="psn-social-profile" data-social-action="profile" data-user="${esc(c.author)}"><span class="psn-social-author">${esc(c.author)}</span></button><span class="psn-social-comment-separator" aria-hidden="true">·</span><span class="psn-social-age">${esc(timeLabel(c.createdAt))}</span></div><div class="psn-social-actions">${canDelete?`<button type="button" class="psn-social-btn danger" data-social-action="comment-delete" data-id="${cid}" data-post="${postId}" aria-label="Delete comment"><i class="fas fa-trash-alt"></i></button>`:''}${c.author!==identity()?`<button type="button" class="psn-social-btn" data-social-action="comment-report" data-id="${cid}" aria-label="Report comment"><i class="far fa-flag"></i></button>`:''}</div></div><p class="psn-social-comment-text">${socialLinkedHtml(c.text)}</p>${commentActionbar(c,postId)}</div></div>`;
   }
   function commentAreaMarkup(postId){
     const list=state.comments.get(postId);
@@ -115725,8 +115931,10 @@ function getVisibleChatStackEl(id) {
       : state.filter==='friends'
       ? ['No friends have posted yet.','Switch to All to see the community.']
       : ['No publications here yet.','Be the first to share something!'];
+    if(socialPreviewObserver)socialPreviewObserver.disconnect();
     el.innerHTML=state.posts.length?state.posts.map(postMarkup).join(''):
       `<div class="friend-activity-empty psn-page-empty-state psn-social-empty"><i class="far fa-comments" aria-hidden="true"></i><strong>${empty[0]}</strong><p>${empty[1]}</p></div>`;
+    hydrateSocialLinkPreviews(el);
     if(!state.posts.length&&typeof window.registerPsnPageEmptyStates==='function')window.registerPsnPageEmptyStates(el.firstElementChild);
     const more=document.getElementById('psn-social-more');if(more)more.hidden=!state.before;
     if(typeof window.updateScrollButtonsVisibility==='function')window.updateScrollButtonsVisibility(false);
@@ -115815,6 +116023,7 @@ function getVisibleChatStackEl(id) {
       state.before=res.nextBefore||null;
       renderFeed();
     }
+    hydrateSocialLinkPreviews(el);
     state.loaded=true;
     if(!more)state.stale=false;
     if(!more&&state.filter==='all')markUnseenRead();
@@ -115859,6 +116068,7 @@ function getVisibleChatStackEl(id) {
     if(!card||!post)return;
     const wrap=document.createElement('div');wrap.innerHTML=postMarkup(post);
     card.replaceWith(wrap.firstElementChild);
+    hydrateSocialLinkPreviews(feed());
   }
   async function insertPublishedPost(postId){
     const id=idOf(postId);
@@ -115871,6 +116081,7 @@ function getVisibleChatStackEl(id) {
     el.querySelector(`[data-social-post="${id}"]`)?.remove();
     el.insertAdjacentHTML('afterbegin',postMarkup(post));
     el.querySelector(`[data-social-post="${id}"]`)?.classList.add('is-new-post');
+    hydrateSocialLinkPreviews(el);
     state.loaded=true;
     updateInfiniteFeed();
   }
@@ -116397,6 +116608,18 @@ function getVisibleChatStackEl(id) {
     document.getElementById('psn-social-publish')?.addEventListener('click',publish);
     document.getElementById('psn-social-more')?.addEventListener('click',()=>loadFeed(true));
     root.addEventListener('click',e=>{
+      const shared=e.target.closest('[data-social-shared-url],.psn-social-body a.psn-social-text-link,.psn-social-comment-text a.psn-social-text-link');
+      if(shared){
+        const href=shared.dataset.socialSharedUrl||shared.href;
+        const share=socialShareInfo(href);
+        if(share&&typeof window.openPsnContentSharedLinkInApp==='function'){
+          window.openPsnContentSharedLinkInApp(e,href);return;
+        }
+        const internalId=socialPostLinkId(href);
+        if(internalId){e.preventDefault();window.psnSocialOpenPost(internalId);return;}
+      }
+      const localPost=e.target.closest('[data-social-post-url]');
+      if(localPost){const id=socialPostLinkId(localPost.dataset.socialPostUrl);if(id){e.preventDefault();window.psnSocialOpenPost(id);return;}}
       const btn=e.target.closest('[data-social-action]');if(!btn)return;
       if(typeof playUiClick==='function')playUiClick();
       performAction(btn.dataset.socialAction,btn);
