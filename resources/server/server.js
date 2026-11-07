@@ -2806,6 +2806,10 @@ async function initDb() {
     CREATE INDEX IF NOT EXISTS idx_user_notifications_chat_target
       ON user_notifications (user_name, event_type, (data->>'messageId'))
       WHERE event_type IN ('mention', 'reply', 'reaction', 'private_message');
+    CREATE INDEX IF NOT EXISTS idx_user_notifications_social_post
+      ON user_notifications ((data->>'postId')) WHERE event_type = 'social';
+    CREATE INDEX IF NOT EXISTS idx_friend_activity_social_post
+      ON friend_activity ((data->>'postId')) WHERE event_type = 'post';
     CREATE TABLE IF NOT EXISTS user_notification_read_state (
       user_name TEXT PRIMARY KEY,
       last_read_id BIGINT NOT NULL DEFAULT 0,
@@ -10338,6 +10342,7 @@ async function initProfileSyncNotifications() {
         if (data.event) emitUserNotificationToLocalUser(data.event);
         if (Array.isArray(data.createdEvents)) data.createdEvents.forEach(event => emitUserNotificationToLocalUser(event));
         if (Array.isArray(data.updatedEvents)) data.updatedEvents.forEach(event => emitUserNotificationToLocalUser(event, 'user_notification_updated'));
+        if (Array.isArray(data.socialPostRemoved)) data.socialPostRemoved.forEach(emitSocialDeletedPostNoticesToLocalUser);
         if (data.readState && data.readState.userName) {
           emitUserNotificationReadStateToLocalUser(data.readState.userName, data.readState.lastReadId, data.readState.unreadCount);
         }
@@ -11028,10 +11033,11 @@ async function recordFriendActivity(actorName, type, rawData = {}, options = {})
 
     const result = await queryDbWithRetry(
       `INSERT INTO friend_activity (actor_name, event_type, data, dedupe_key, created_at)
-       VALUES ($1, $2, $3::jsonb, $4, to_timestamp($5::double precision / 1000.0))
+       SELECT $1, $2, $3::jsonb, $4, to_timestamp($5::double precision / 1000.0)
+       WHERE $2::text <> 'post' OR EXISTS (SELECT 1 FROM social_posts WHERE id=$6::bigint)
        ON CONFLICT (dedupe_key) DO NOTHING
        RETURNING id, actor_name, event_type, data, created_at`,
-      [actor, eventType, JSON.stringify(data), dedupeKey, at],
+      [actor, eventType, JSON.stringify(data), dedupeKey, at, eventType === 'post' ? data.postId || '0' : '0'],
       { attempts: 2, label: 'FRIEND ACTIVITY INSERT' }
     );
     if (!result.rows[0]) return null;
@@ -11391,6 +11397,16 @@ function emitUserNotificationReadStateToLocalUser(userName, lastReadId, unreadCo
   };
   getSocketsByUserName(name).forEach(client => {
     if (client && client.connected) client.emit('user_notification_read_state', payload);
+  });
+}
+
+function emitSocialDeletedPostNoticesToLocalUser(update) {
+  const name=normalizeSocialUserName(update && update.userName);
+  const postId=String(update && update.postId || '');
+  if (!name || !/^\d{1,18}$/.test(postId)) return;
+  const payload={postId,unreadCount:Math.max(0,Number(update.unreadCount)||0)};
+  getSocketsByUserName(name).forEach(client => {
+    if (client && client.connected) client.emit('user_notification_social_post_removed',payload);
   });
 }
 
@@ -13449,6 +13465,7 @@ async function socialAnnounceNewPost(actor, id, text) {
       CONCAT('social-friend-post:', $2::text, ':', viewer.name), NOW()
     FROM users viewer
     WHERE viewer.name <> $1
+      AND EXISTS (SELECT 1 FROM social_posts published WHERE published.id=$2::bigint)
       AND jsonb_typeof(viewer.data->'friendsData')='array'
       AND EXISTS (
         SELECT 1 FROM jsonb_array_elements(viewer.data->'friendsData') friend(value)
@@ -13620,9 +13637,50 @@ io.on('connection', (socket) => {
       const found = await queryDbWithRetry('SELECT author_name FROM social_posts WHERE id=$1',[id],{attempts:2,label:'SOCIAL POST OWNER'});
       const owner = found.rows[0]?.author_name;
       if (!owner || (owner !== actor && !(canModerateSocket(socket) && canModerateTarget(socket,owner)))) return reply({ success:false, message:'Not allowed.' });
-      const deleted = await queryDbWithRetry('DELETE FROM social_posts WHERE id=$1 RETURNING id',[id],{attempts:2,label:'SOCIAL POST DELETE'});
-      if (!deleted.rowCount) return reply({success:false,message:'Post no longer exists.'});
+      // A deleted publication must not leave linked Social notifications or friend activity.
+      // Keep all three deletions in one database statement, so retries cannot leave ghosts.
+      const deleted = await queryDbWithRetry(`
+        WITH removed_post AS (
+          DELETE FROM social_posts WHERE id=$1 AND author_name=$2 RETURNING id
+        ), removed_notifications AS (
+          DELETE FROM user_notifications n
+          WHERE n.event_type='social' AND n.data->>'postId'=$1
+            AND EXISTS (SELECT 1 FROM removed_post)
+          RETURNING n.user_name
+        ), removed_activity AS (
+          DELETE FROM friend_activity f
+          WHERE f.event_type='post' AND f.data->>'postId'=$1
+            AND EXISTS (SELECT 1 FROM removed_post)
+          RETURNING f.id
+        )
+        SELECT (SELECT COUNT(*)::int FROM removed_post) AS removed,
+          COALESCE((SELECT jsonb_agg(DISTINCT user_name) FROM removed_notifications),'[]'::jsonb) AS recipients
+      `,[id,owner],{attempts:2,label:'SOCIAL POST DELETE + RELATED ITEMS'});
+      const deletedRow = deleted.rows[0] || {};
+      if (!deletedRow.removed) return reply({success:false,message:'Post no longer exists.'});
       socialPublish('delete',id);
+      const recipients = Array.isArray(deletedRow.recipients) ? deletedRow.recipients.filter(Boolean) : [];
+      if (recipients.length) deferServerTask('SOCIAL POST NOTIFICATION CLEANUP SYNC', async () => {
+        // Recalculate badge totals in one query, rather than one round trip per friend.
+        const counts = await queryDbWithRetry(`
+          SELECT t.user_name,COUNT(n.id)::int AS unread_count
+          FROM unnest($1::text[]) t(user_name)
+          LEFT JOIN user_notification_read_state state ON state.user_name=t.user_name
+          LEFT JOIN user_notifications n ON n.user_name=t.user_name
+            AND n.id>COALESCE(state.last_read_id,0)
+          GROUP BY t.user_name
+        `,[recipients],{attempts:2,label:'SOCIAL DELETED NOTIFICATION COUNTS'});
+        const updates = (counts.rows || []).map(row => ({
+          userName:row.user_name,postId:id,unreadCount:Math.max(0,Number(row.unread_count)||0)
+        }));
+        for (const update of updates) emitSocialDeletedPostNoticesToLocalUser(update);
+        for (let offset=0;offset<updates.length;offset+=20) {
+          const batch=updates.slice(offset,offset+20);
+          await pool.query('SELECT pg_notify($1,$2)', ['user_notification_sync',JSON.stringify({
+            socialPostRemoved:batch,instanceId:INSTANCE_ID
+          })]);
+        }
+      },0);
       if(owner!==actor)deferServerTask('SOCIAL POST MODERATION LOG',()=>addModerationLog('social_post_delete',`Deleted Social post #${id} by ${owner}`,{postId:id,targetUser:owner},actor),0);
       reply({ success:true });
     } catch (err) {
