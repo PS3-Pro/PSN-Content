@@ -8839,11 +8839,11 @@ async function getDirectGroupList(viewer) {
     WITH group_page AS MATERIALIZED (
       SELECT g.id,g.title,g.created_by,g.created_at,gm.joined_at,gm.last_read_id,
         latest.id AS last_id,latest.sender_name AS last_sender,
-        latest.text AS last_text,latest.message_type AS last_type,latest.created_at AS last_created
+        latest.text AS last_text,latest.message_type AS last_type,latest.playing_title AS last_playing_title,latest.created_at AS last_created
       FROM direct_group_members gm
       JOIN direct_groups g ON g.id=gm.group_id
       LEFT JOIN LATERAL (
-        SELECT id,sender_name,text,message_type,created_at
+        SELECT id,sender_name,text,message_type,content->>'title' AS playing_title,created_at
         FROM direct_group_messages
         WHERE group_id=g.id AND created_at>=gm.joined_at
         ORDER BY id DESC LIMIT 1
@@ -8871,7 +8871,7 @@ async function getDirectGroupList(viewer) {
   return (result.rows||[]).map(row=>{
     let lastMessage=row.last_id?{
       id:String(row.last_id),from:row.last_sender,
-      text:row.last_type==='poll'?'📊 Created a poll.':(row.last_type==='playing'?'🎮 Playing on PS3'+(row.last_text?' · '+row.last_text:''):row.last_text),
+      text:row.last_type==='poll'?'📊 Created a poll.':(row.last_type==='playing'?directMessagePreviewText({type:'playing',content:{title:row.last_playing_title},text:row.last_text}):row.last_text),
       createdAt:row.last_created
     }:null;
     if(lastMessage&&lastMessage.from===viewer)lastMessage=addDirectGroupReadReceipts(lastMessage,Array.isArray(row.receipt_members)?row.receipt_members:[]);
@@ -8888,11 +8888,11 @@ async function getDirectGroupPreview(viewer) {
     SELECT g.id, g.title, g.created_by, g.created_at,
       latest.id AS last_id, latest.sender_name AS last_sender,
       latest.text AS last_text, latest.message_type AS last_type,
-      latest.created_at AS last_created
+      latest.playing_title AS last_playing_title,latest.created_at AS last_created
     FROM direct_group_members gm
     JOIN direct_groups g ON g.id = gm.group_id
     LEFT JOIN LATERAL (
-      SELECT id, sender_name, text, message_type, created_at
+      SELECT id, sender_name, text, message_type, content->>'title' AS playing_title, created_at
       FROM direct_group_messages
       WHERE group_id = gm.group_id AND created_at >= gm.joined_at
       ORDER BY id DESC LIMIT 1
@@ -8906,7 +8906,7 @@ async function getDirectGroupPreview(viewer) {
     createdAt:row.created_at, memberCount:null, unread:null,
     lastMessage:row.last_id ? {
       id:String(row.last_id), from:row.last_sender,
-      text:row.last_type === 'poll' ? '📊 Created a poll.' : (row.last_type === 'playing' ? '🎮 Playing on PS3'+(row.last_text ? ' · '+row.last_text : '') : row.last_text),
+      text:row.last_type === 'poll' ? '📊 Created a poll.' : (row.last_type === 'playing' ? directMessagePreviewText({type:'playing',content:{title:row.last_playing_title},text:row.last_text}) : row.last_text),
       createdAt:row.last_created
     } : null
   }));
@@ -8986,6 +8986,14 @@ async function loadDirectGroupHistory(groupId,viewer) {
   return {success:true,group:{id:groupId,title:member.title,createdBy:member.created_by,members:members.map(m=>m.user_name)},messages:withReceipts,pinnedMessages:withReceipts.filter(m=>m.pinnedAt).slice(-10),lastReadId:String(lastId)};
 }
 
+// Preview just the game name + optional caption; no new database queries.
+function directMessagePreviewText(message, maxLength=280) {
+  const caption=directMessagePlainText(message?.text).slice(0,maxLength);
+  if(message?.type!=='playing')return caption;
+  const title=String(message?.content?.title||'').trim().slice(0,180);
+  return ('🎮 Playing on PS3'+(title?': '+title:'')+(caption?' · '+caption:'')).slice(0,maxLength);
+}
+
 function directMessagePlainText(value) {
   return String(value == null ? '' : value)
     .replace(/<br\s*\/?\s*>/gi, '\n')
@@ -9038,7 +9046,8 @@ function normalizeDirectMessageReply(value) {
   const id = String(value.id || '').slice(0, 40);
   const from = normalizeDirectMessageUser(value.from || value.user);
   const text = String(value.text == null ? '' : value.text).slice(0, DIRECT_MESSAGE_REPLY_TEXT_MAX);
-  const type = normalizeText(value.type, 'text').toLowerCase() === 'poll' ? 'poll' : (normalizeText(value.type, 'text').toLowerCase() === 'gif' ? 'gif' : (normalizeText(value.type, 'text').toLowerCase() === 'image' ? 'image' : 'text'));
+  const rawType = normalizeText(value.type, 'text').toLowerCase();
+  const type = ['poll','gif','image','playing'].includes(rawType) ? rawType : 'text';
   if (!id || !from) return null;
   return { id, from, text, type };
 }
@@ -16122,7 +16131,7 @@ io.on('connection', (socket) => {
       } else if(action==='edit') {
         if(row.sender_name!==viewer||row.message_type==='poll')throw Error('Cannot edit this message.');
         const text=normalizeDirectMessageText(data.text);
-        if(!directMessagePlainText(text)&&!normalizeDirectMessageMedia(row.content).length)throw Error('Message cannot be empty.');
+        if(!directMessagePlainText(text)&&!normalizeDirectMessageMedia(row.content).length&&!(row.message_type==='playing'&&normalizeSocialPlaying(row.content)))throw Error('Message cannot be empty.');
         updated=(await db.query('UPDATE direct_group_messages SET text=$2,edited_at=NOW() WHERE id=$1 RETURNING *',[messageId,text])).rows?.[0];
       } else if(action==='react') {
         const emoji=normalizeText(data.emoji,'');
@@ -16375,7 +16384,7 @@ io.on('connection', (socket) => {
       deferServerTask('DIRECT MESSAGE USER NOTIFICATION', () => recordUserNotification(recipient, 'private_message', {
         actor: sender,
         messageId: message.id,
-        text: directMessagePlainText(message.text).slice(0, 280),
+        text: directMessagePreviewText(message),
         messageType: message.type,
         privateKind
       }, { dedupeKey:`${recipient.toLowerCase()}:private_message:${message.id}`, at:Date.parse(message.createdAt) || Date.now() }), 0);
@@ -16537,7 +16546,7 @@ io.on('connection', (socket) => {
           deferServerTask('DIRECT REACTION USER NOTIFICATION', () => runSerializedChatReactionNotificationMutation(reactionDedupeKey, () => recordUserNotification(messageOwner, 'private_message', {
             actor,
             messageId: message.id,
-            text: directMessagePlainText(message.text).slice(0, 280),
+            text: directMessagePreviewText(message),
             messageType: message.type,
             privateKind: 'reaction',
             emoji
@@ -16580,7 +16589,7 @@ io.on('connection', (socket) => {
       const existing = serializeDirectMessage(current.rows && current.rows[0]);
       if (!existing) return respond({ success:false, message:'You can only edit your own messages while the Private Chat is available.' });
       if (existing.type === 'poll') return respond({ success:false, message:'Poll questions cannot be edited after voting begins.' });
-      if (!directMessagePlainText(text) && !(Array.isArray(existing.content) && existing.content.length)) return respond({ success:false, message:'A message cannot be empty.' });
+      if (!directMessagePlainText(text) && !(Array.isArray(existing.content) && existing.content.length) && !(existing.type==='playing' && existing.content?.title)) return respond({ success:false, message:'A message cannot be empty.' });
       const updated = await queryDbWithRetry(`
         UPDATE direct_messages SET text = $3, edited_at = NOW()
         WHERE id = $1 AND sender_name = $2
@@ -16596,7 +16605,7 @@ io.on('connection', (socket) => {
            SET data = data || jsonb_build_object('text', $2::text, 'messageType', $3::text)
            WHERE event_type = 'private_message' AND data->>'messageId' = $1
            RETURNING id, user_name, event_type, data, created_at`,
-          [String(message.id), directMessagePlainText(message.text).slice(0, 280), message.type || 'text'],
+          [String(message.id), directMessagePreviewText(message), message.type || 'text'],
           { attempts:1, label:'DIRECT EDIT NOTIFICATION UPDATE' }
         );
         const events = (result.rows || []).map(serializeUserNotificationRow).filter(Boolean);
