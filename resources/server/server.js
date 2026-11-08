@@ -436,7 +436,7 @@ const CHAT_SYNC_INTERVAL_MS = 3000;
 const KEEP_ALIVE_INTERVAL_MS = Math.max(60000, parseInt(process.env.KEEP_ALIVE_INTERVAL_MS || "600000", 10) || 600000);
 const KEEP_ALIVE_TIMEOUT_MS = Math.max(1000, parseInt(process.env.KEEP_ALIVE_TIMEOUT_MS || "10000", 10) || 10000);
 const KEEP_ALIVE_URLS = [
-  "https://psn-content-35hq.onrender.com",
+  "https://psn-content-ok3c.onrender.com",
 ];
 const PROFILE_SYNC_INTERVAL_MS = Math.max(10000, parseInt(process.env.PROFILE_SYNC_INTERVAL_MS || "15000", 10) || 15000);
 const ENABLE_PROFILE_PERIODIC_SYNC = process.env.ENABLE_PROFILE_PERIODIC_SYNC === "1";
@@ -2584,10 +2584,12 @@ async function initDb() {
       author_name TEXT NOT NULL REFERENCES users(name) ON DELETE CASCADE,
       body TEXT NOT NULL DEFAULT '',
       images JSONB NOT NULL DEFAULT '[]'::jsonb,
+      playing JSONB,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       edited_at TIMESTAMPTZ
     );
     ALTER TABLE social_posts ADD COLUMN IF NOT EXISTS edited_at TIMESTAMPTZ;
+    ALTER TABLE social_posts ADD COLUMN IF NOT EXISTS playing JSONB;
     CREATE INDEX IF NOT EXISTS idx_social_posts_newest ON social_posts(id DESC);
     CREATE INDEX IF NOT EXISTS idx_social_posts_author_newest ON social_posts(author_name, id DESC);
     CREATE TABLE IF NOT EXISTS social_feed_read_state (
@@ -13215,6 +13217,19 @@ function socialPostPlainText(value) {
     .replace(/&(?:gt|#62);/gi, '>').replace(/&(?:quot|#34);/gi, '"')
     .replace(/\s+/g, ' ').trim();
 }
+function normalizeSocialPlaying(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const title = String(value.title || '').replace(/[\r\n\t<>]/g, ' ').trim().slice(0,180);
+  const rawId = String(value.titleId || '').trim().toUpperCase();
+  const titleId = /^[A-Z0-9_-]{4,32}$/.test(rawId) ? rawId : '';
+  const rawCover = String(value.cover || '').trim();
+  let cover = '';
+  try {
+    const url = new URL(rawCover);
+    if (url.protocol === 'https:' && url.href.length <= 1000 && !/^(?:localhost|127\.|10\.|192\.168\.|172\.(?:1[6-9]|2\d|3[01])\.|169\.254\.)/i.test(url.hostname)) cover = url.href;
+  } catch (err) {}
+  return title ? { title, titleId, cover } : null;
+}
 const SOCIAL_EMOJI = new Set(['👍', '❤️', '😂', '😮', '😢', '🔥']);
 const socialActionLimits = new Map();
 
@@ -13258,6 +13273,7 @@ function serializeSocialPost(row) {
   return {
     id: String(row.id), author: row.author_name, avatar: row.author_avatar || DEFAULT_AVATAR,
     text: row.body || '', images: Array.isArray(row.images) ? row.images : [],
+    playing: normalizeSocialPlaying(row.playing),
     createdAt: row.created_at, editedAt: row.edited_at || null, reactions: socialPublicReactions(row.reactions),
     myReaction: row.my_reaction || '', comments: Number(row.comment_count) || 0
   };
@@ -13293,7 +13309,7 @@ async function socialReadFeed(actor, filter, before, focusId = null) {
   const scope=focusId?'':audienceCondition;
   const result=await queryDbWithRetry(`
     WITH ${friendNames}page AS MATERIALIZED (
-      SELECT p.id,p.author_name,p.body,p.images,p.created_at,p.edited_at
+      SELECT p.id,p.author_name,p.body,p.images,p.playing,p.created_at,p.edited_at
       FROM social_posts p
       WHERE ($2::bigint IS NULL OR p.id < $2::bigint)
         AND ($4::bigint IS NULL OR p.id = $4::bigint)
@@ -13307,7 +13323,7 @@ async function socialReadFeed(actor, filter, before, focusId = null) {
       SELECT post_id,COUNT(*)::int AS cnt FROM social_comments
       WHERE post_id IN (SELECT id FROM page) GROUP BY post_id
     )
-    SELECT p.id,p.author_name,p.body,p.images,p.created_at,p.edited_at,
+    SELECT p.id,p.author_name,p.body,p.images,p.playing,p.created_at,p.edited_at,
       COALESCE(NULLIF(author.data->>'avatar',''),$3) AS author_avatar,
       COALESCE(rc.reactions,'[]'::jsonb) AS reactions,
       mine.emoji AS my_reaction,COALESCE(cc.cnt,0) AS comment_count
@@ -13547,8 +13563,9 @@ function socialPublish(kind, id, extra = null) {
   ]), 0);
 }
 
-async function socialAnnounceNewPost(actor, id, text) {
-  const preview = normalizeText(socialPostPlainText(text), '').slice(0, 140);
+async function socialAnnounceNewPost(actor, id, text, playing = null) {
+  const caption = normalizeText(socialPostPlainText(text), '').slice(0, 140);
+  const preview = caption || (playing?.title ? `Playing ${playing.title}`.slice(0,140) : '');
   // Friend Activity already supplies live subscription fanout and cross-instance notifications.
   await recordFriendActivity(actor, 'post', { postId:id, preview }, { dedupeKey:`social-post:${id}` });
   const result = await queryDbWithRetry(`
@@ -13666,16 +13683,17 @@ io.on('connection', (socket) => {
     const actor = normalizeSocialUserName(socket.userName);
     const body = typeof data.text === 'string' ? normalizeSocialPostBody(data.text.slice(0,3001)) : '';
     const images = normalizeSocialMedia(data.images);
+    const playing = normalizeSocialPlaying(data.playing);
     if (!actor) return reply({ success:false, code:'session_pending' });
-    if (body.length > 3000 || !images || (!socialPostPlainText(body).trim() && !images.length)) return reply({ success:false, message:'Add text or up to four photos.' });
+    if (body.length > 3000 || !images || (!socialPostPlainText(body).trim() && !images.length && !playing)) return reply({ success:false, message:'Add text or up to four photos.' });
     if (!socialRateLimit(actor,'post',8000)) return reply({ success:false, message:'Wait a moment before posting again.' });
     try {
       const result = await queryDbWithRetry(
-        'INSERT INTO social_posts (author_name,body,images) VALUES ($1,$2,$3::jsonb) RETURNING id',
-        [actor,body,JSON.stringify(images)],{attempts:2,label:'SOCIAL POST CREATE'});
+        'INSERT INTO social_posts (author_name,body,images,playing) VALUES ($1,$2,$3::jsonb,$4::jsonb) RETURNING id',
+        [actor,body,JSON.stringify(images),playing ? JSON.stringify(playing) : null],{attempts:2,label:'SOCIAL POST CREATE'});
       const id = String(result.rows[0].id);
       socialPublish('post',id,{author:actor});
-      deferServerTask('SOCIAL NEW POST ACTIVITY',()=>socialAnnounceNewPost(actor,id,body),0);
+      deferServerTask('SOCIAL NEW POST ACTIVITY',()=>socialAnnounceNewPost(actor,id,body,playing),0);
       reply({ success:true, id });
     } catch (err) {
       console.error('[SOCIAL POST CREATE ERROR]:',err && err.message || err);
@@ -13720,7 +13738,7 @@ io.on('connection', (socket) => {
     try {
       const result = await queryDbWithRetry(`
         UPDATE social_posts SET body=$3, images=COALESCE($4::jsonb, images), edited_at=NOW()
-        WHERE id=$1 AND author_name=$2 AND ($3<>'' OR jsonb_array_length(COALESCE($4::jsonb, images))>0)
+        WHERE id=$1 AND author_name=$2 AND ($3<>'' OR jsonb_array_length(COALESCE($4::jsonb, images))>0 OR playing IS NOT NULL)
         RETURNING id, body, edited_at
       `, [id,actor,socialPostPlainText(body).trim() ? body : '',updateImages ? JSON.stringify(images) : null], {attempts:2,label:'SOCIAL POST EDIT'});
       if (!result.rows.length) return reply({success:false,message:'You cannot edit this publication, or its text cannot be empty.'});
