@@ -7977,7 +7977,9 @@ body.psn-home-interactive.psn-sidebar-tab-switched .sidebar > .sidebar-menu[clas
 .psn-social-comment:hover .psn-social-actions .psn-social-btn,.psn-social-comment .psn-social-actions .psn-social-btn:focus-visible { opacity:1; }
 .psn-social-comment-content { min-width:0; flex:1; }
 .psn-social-comment-text { margin:3px 0 0; white-space:pre-wrap; overflow-wrap:anywhere; font-size:13px; line-height:1.42; color:#dee8f6; }
-.psn-social-status { min-height:16px; font-size:12px; color:var(--text-muted); margin:6px 0 15px; }
+.psn-social-status { min-height:16px; font-size:12px; color:var(--text-muted); margin:6px 0 15px; opacity:0; transition:opacity .22s ease; }
+.psn-social-status.is-visible { opacity:1; }
+@media (prefers-reduced-motion:reduce) { .psn-social-status { transition:none; } }
 .psn-social-empty .psn-social-retry { margin-top:15px; }
 .psn-social-load { width:100%; margin-top:3px; }
 .psn-social-skeleton { pointer-events:none; }
@@ -54224,6 +54226,7 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 		const currentView = getCurrentPsnViewElement();
 		const browseContextViews = PSN_BROWSE_CONTEXT_VIEW_IDS;
 		const currentViewId = currentView ? currentView.id : '';
+		if (currentViewId === 'view-social' && viewId !== 'view-social') window.psnSocialDismissStatus?.();
 		if (currentViewId === 'view-chat' && viewId !== 'view-chat' && typeof hideChatSuggestions === 'function') hideChatSuggestions();
 		if (currentViewId === 'view-library' && viewId !== 'view-library' && typeof hideConsoleSensitiveValues === 'function') hideConsoleSensitiveValues();
 		const movingWithinBrowseContext = !!(currentViewId && browseContextViews.has(currentViewId) && browseContextViews.has(viewId));
@@ -115589,9 +115592,28 @@ function getVisibleChatStackEl(id) {
     return `<span class="psn-social-avatar-wrap"><img class="psn-social-avatar chat-avatar-status" style="border-color:${ring}" data-presence-border="${ring}" data-user="${esc(user)}" loading="lazy" decoding="async" alt="${esc(user)} avatar" src="${avatar}" onerror="this.onerror=null;this.src='https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/interface/modern/images/avatars/default.png';"><span class="psn-avatar-presence-dot${online?' online':''}" data-user="${esc(user)}" aria-hidden="true"></span></span>`;
   }
   const timeLabel = date => {const age=Date.now()-Date.parse(s(date));if(!Number.isFinite(age)||age<0)return 'Just now'; if(age<60000)return 'Just now';if(age<3600000)return Math.floor(age/60000)+' min ago';if(age<86400000)return Math.floor(age/3600000)+' hr ago';return new Date(date).toLocaleDateString(undefined,{year:'numeric',month:'short',day:'numeric'});};
+  let socialStatusHideTimer=0;
+  let socialStatusClearTimer=0;
   function notify(message,failed){
-    const el=document.getElementById('psn-social-status');if(el) {el.textContent=message||'';el.style.color=failed?'#ff9999':'';}
+    const el=document.getElementById('psn-social-status');if(!el)return;
+    clearTimeout(socialStatusHideTimer);
+    clearTimeout(socialStatusClearTimer);
+    socialStatusHideTimer=0;
+    socialStatusClearTimer=0;
+    if(!message||!visible()){
+      el.classList.remove('is-visible');
+      if(!message&&el.textContent){
+        socialStatusClearTimer=setTimeout(()=>{if(!el.classList.contains('is-visible'))el.textContent='';socialStatusClearTimer=0;},220);
+      }else el.textContent='';
+      return;
+    }
+    el.textContent=message;
+    el.style.color=failed?'#ff9999':'';
+    el.classList.add('is-visible');
+    if(message==='Publishing…'||message==='Uploading photos…')return;
+    socialStatusHideTimer=setTimeout(()=>notify(''),failed?6500:3200);
   }
+  window.psnSocialDismissStatus=()=>notify('');
   function emitAcknowledged(socket,event,data,timeoutMs){
     return new Promise(resolve=>{
       if(!socket||!socket.connected)return resolve({success:false,code:'session_pending'});
@@ -116221,6 +116243,7 @@ function getVisibleChatStackEl(id) {
   }
   function openSocialReactors(btn){
     const id=idOf(btn.dataset.id);if(!id)return;
+    notify('');
     const kind=btn.dataset.kind==='comment'?'comment':'post';
     const postId=idOf(btn.dataset.post||id);
     const overlay=ensureSocialReactorsModal();
@@ -116336,6 +116359,7 @@ function getVisibleChatStackEl(id) {
   function openCommentModal(postId,opener){
     const post=state.posts.find(x=>x.id===postId);
     if(!post)return;
+    notify('');
     const overlay=ensureCommentModal();
     if(socialInlineReplyId)setSocialCommentReply(null);
     socialInlineReplyId='';
@@ -117149,6 +117173,10 @@ function getVisibleChatStackEl(id) {
   function init(){
     const root=view();if(!root||root.dataset.socialWired)return;
     root.dataset.socialWired='1';
+    if(typeof MutationObserver==='function'){
+      const navigationObserver=new MutationObserver(()=>{if(!visible())notify('');});
+      navigationObserver.observe(root,{attributes:true,attributeFilter:['style','class']});
+    }
     root.querySelector('#psn-social-compose-toggle')?.addEventListener('click',()=>{
       const isCollapsed=!!root.querySelector('.psn-social-composer.is-collapsed');
       if(isCollapsed)setSocialComposerExpanded(true,true);
@@ -117298,6 +117326,7 @@ function getVisibleChatStackEl(id) {
   let socialPendingOpenPost=null;
   window.psnSocialOpenPost=async function(postId,commentId=null){
     const target=idOf(postId);if(!target)return;
+    notify('');
     if(typeof window.switchTab==='function')window.switchTab('social');
     await new Promise(resolve=>requestAnimationFrame(resolve));
     if(!socialSessionReady()){socialPendingOpenPost={id:target,commentId};return;}
